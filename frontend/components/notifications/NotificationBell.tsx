@@ -1,66 +1,78 @@
 import { ActionIcon, Indicator, Tooltip } from "@mantine/core";
 import { IconBell } from "@tabler/icons-react";
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { NotificationCenterDrawer } from "./NotificationCenterDrawer";
-import { formatUnreadBadge } from "./types";
+import { loadedHumanAttentionItems, useHumanAttention } from "../../hooks/useHumanAttention";
+import { formatUnreadBadge, type NotificationCenterTab } from "./types";
 import { useNotificationUnreadCounts } from "./useNotificationCenter";
 
-/**
- * Header bell + unread badge + drawer entry (spec §6.2).
- *
- * Mounted once in `AppRootLayout` AppShell.Header. Owns the live WS
- * subscription for the badge (via `useNotificationUnreadCounts`), so the
- * drawer need not be open for counts to stay fresh.
- *
- * Opening the drawer does **not** re-fire PWA/toast paths — this component
- * only touches notification queries; transient toasts stay in
- * `frontend/lib/notification.ts`.
- */
+const NotificationCenterDrawer = lazy(() =>
+	import("./NotificationCenterDrawer").then((module) => ({
+		default: module.NotificationCenterDrawer,
+	})),
+);
+
 export function NotificationBell() {
 	const { t } = useTranslation("nav");
 	const [opened, setOpened] = useState(false);
-	const counts = useNotificationUnreadCounts(true);
-	const total = counts.data?.total ?? 0;
-	const label = formatUnreadBadge(total, counts.data?.lowerBound);
-	const badgeAria =
-		label != null
-			? counts.data?.lowerBound || total > 99
-				? t("notificationUnreadBadgeCap", { defaultValue: "99+ unread notifications" })
-				: t("notificationUnreadBadge", {
-						count: total,
-						defaultValue: "{{count}} unread notifications",
-					})
-			: t("notificationCenterTooltip", { defaultValue: "Open notifications" });
-
+	const [initialTab, setInitialTab] = useState<NotificationCenterTab>("activity");
+	const counts = useNotificationUnreadCounts();
+	const attention = useHumanAttention();
+	const items = loadedHumanAttentionItems(attention.data?.pages);
+	const hasAttention = items.length > 0 || attention.hasNextPage;
+	const unknown = attention.isError || counts.isError;
+	const label = hasAttention
+		? formatUnreadBadge(items.length, attention.hasNextPage)
+		: attention.isPending || attention.isError
+			? null
+			: formatUnreadBadge(counts.data?.unreadConversations, counts.data?.conversationsLowerBound);
+	const badgeAria = [
+		label
+			? t(hasAttention ? "notificationAttentionBadge" : "notificationConversationBadge", {
+					count: label,
+				})
+			: t("notificationCenterTooltip"),
+		unknown ? t("notificationCountUnknown") : null,
+	]
+		.filter(Boolean)
+		.join(" · ");
 	return (
 		<>
-			<Tooltip
-				label={label != null ? badgeAria : t("notificationCenterTooltip", "Open notifications")}
-				position="bottom"
-				withArrow
-			>
+			<Tooltip label={badgeAria} position="bottom" withArrow>
 				<Indicator
-					disabled={!label}
-					label={label ?? undefined}
+					disabled={!label && !unknown}
+					label={label ?? (unknown ? "?" : undefined)}
 					size={16}
-					color="red"
+					color={hasAttention ? "yellow" : "gray"}
 					offset={2}
 					withBorder
 					data-testid="notification-bell-badge"
 				>
 					<ActionIcon
 						variant="subtle"
-						color="gray"
+						color={hasAttention ? "yellow" : "gray"}
 						aria-label={badgeAria}
 						data-testid="notification-bell"
-						onClick={() => setOpened(true)}
+						onClick={() => {
+							setInitialTab(hasAttention || attention.isError ? "attention" : "activity");
+							setOpened(true);
+						}}
 					>
 						<IconBell size={20} />
 					</ActionIcon>
 				</Indicator>
 			</Tooltip>
-			<NotificationCenterDrawer opened={opened} onClose={() => setOpened(false)} />
+			{opened && (
+				<Suspense fallback={null}>
+					<NotificationCenterDrawer
+						opened
+						onClose={() => setOpened(false)}
+						initialTab={initialTab}
+						summaryError={counts.isError}
+						onRetrySummary={() => void counts.refetch()}
+					/>
+				</Suspense>
+			)}
 		</>
 	);
 }

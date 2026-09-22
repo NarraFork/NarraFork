@@ -28,7 +28,9 @@ import { readSession, resetSessionStoreForTest, writeSession } from "../../lib/s
 import commonEn from "../../locales/en/common.json";
 import dashboardEn from "../../locales/en/dashboard.json";
 import narratorEn from "../../locales/en/narrator.json";
+import navEn from "../../locales/en/nav.json";
 import { NeedsAttention } from "../dashboard/NeedsAttention";
+import { NotificationCenterDrawer } from "../notifications/NotificationCenterDrawer";
 import {
 	HumanAttentionInboxButton,
 	HumanAttentionInboxDrawer,
@@ -43,7 +45,7 @@ await i18n.init({
 	// Mirror frontend/lib/i18n.ts: React already escapes, so the app does not.
 	// Escaping here would make interpolated paths (`/remote/original`) unmatchable.
 	interpolation: { escapeValue: false },
-	resources: { en: { narrator: narratorEn, dashboard: dashboardEn, common: commonEn } },
+	resources: { en: { narrator: narratorEn, dashboard: dashboardEn, common: commonEn, nav: navEn } },
 });
 
 function item(id: string, overrides: Partial<HumanAttentionItem> = {}): HumanAttentionItem {
@@ -438,6 +440,8 @@ describe("child async questions from the parent attention entry", () => {
 			to: "/narrators/$narratorId",
 			params: { narratorId: "actual-child" },
 		});
+		expect(document.querySelector("[data-attention-id]")).toBeNull();
+		await click("pending");
 		await click("Review decision", row(child.id));
 		expect(row(child.id).textContent).toContain("Decision owner: actual-child");
 		expect(row(child.id).querySelector("textarea")?.value).toBe("Keep this answer");
@@ -489,6 +493,95 @@ describe("child async questions from the parent attention entry", () => {
 		expect(answer).not.toHaveBeenCalled();
 		expect(dismiss).not.toHaveBeenCalled();
 	});
+});
+
+test("notification pending panel reuses decision form, draft recovery and keyboard isolation without nested drawer", async () => {
+	const child = item("notification-question", {
+		source: "question",
+		kind: "async_question",
+		toolName: "AskUserQuestion",
+		narratorId: "actual-child",
+	});
+	const value = question(child);
+	listPage = { items: [child], nextCursor: null };
+	details.set(child.id, { item: child, question: value });
+	writeSession("ask-draft", child.toolCallId, draft);
+	let shortcutEvents = 0;
+	let rejectAnswer: (error: Error) => void = () => {};
+	track(
+		spyOn(api, "listNotifications").mockResolvedValue({ items: [], nextCursor: null, asOf: 123 }),
+	);
+	const answer = track(
+		spyOn(api, "answerAsyncQuestion").mockImplementation(
+			() =>
+				new Promise((_resolve, reject) => {
+					rejectAnswer = reject;
+				}),
+		),
+	);
+	await render(
+		// biome-ignore lint/a11y/noStaticElementInteractions: Probe portal event propagation to the owning composer.
+		<div onKeyDown={() => shortcutEvents++}>
+			<NotificationCenterDrawer opened initialTab="attention" onClose={() => {}} />
+		</div>,
+	);
+	expect(document.querySelectorAll('[role="dialog"]')).toHaveLength(1);
+	await click("Review decision", row(child.id));
+	const input = row(child.id).querySelector("textarea");
+	expect(input?.value).toBe("Keep this answer");
+	const assertIsolated = async (target: Element) => {
+		for (const value of ["Enter", "ArrowLeft", "ArrowRight"]) {
+			const key = new Event("keydown", { bubbles: true });
+			Object.defineProperty(key, "key", { value });
+			await act(async () => target.dispatchEvent(key));
+		}
+		expect(shortcutEvents).toBe(0);
+	};
+	await assertIsolated(row(child.id));
+	await assertIsolated(document.querySelector('[role="dialog"] button') as Element);
+	await click(narratorEn.submitAnswer, row(child.id));
+	expect(answer).toHaveBeenCalledWith("actual-child", child.requestId, {
+		answers: { notes: "Keep this answer" },
+	});
+	await click(navEn.notificationTabActivity);
+	await assertIsolated(
+		document.querySelector('[data-testid="notification-filter-control"] button') as Element,
+	);
+	await assertIsolated(
+		document.querySelector('[data-testid="notification-mark-all-read"]') as Element,
+	);
+	// Failure arrives while the pending panel is hidden; its mutation and draft owner must survive.
+	await act(async () => rejectAnswer(new Error("Retry answer")));
+	await settle();
+	await click(navEn.notificationTabAttention);
+	expect(row(child.id).querySelector("textarea")).toBe(input);
+	expect(row(child.id).textContent).toContain("Retry answer");
+	expect(readSession("ask-draft", child.toolCallId)).not.toBeNull();
+	await assertIsolated(button(navEn.notificationTabActivity));
+});
+
+test("notification tab switches retain the expanded plan editor and unsubmitted draft", async () => {
+	const plan = item("tab-plan", { toolName: "ExitPlanMode", kind: "plan_approval" });
+	addPermission(plan, { plan: "Original plan" });
+	writeSession(
+		"permission-draft",
+		plan.requestId,
+		JSON.stringify({ feedback: "Unsubmitted feedback", editedPlan: "Unsubmitted edited plan" }),
+	);
+	track(
+		spyOn(api, "listNotifications").mockResolvedValue({ items: [], nextCursor: null, asOf: 123 }),
+	);
+	await render(<NotificationCenterDrawer opened initialTab="attention" onClose={() => {}} />);
+	await click("Review decision", row(plan.id));
+	const expanded = row(plan.id);
+	expect(expanded.textContent).toContain("Unsubmitted edited plan");
+	const editor = button(narratorEn.planEditDone, expanded);
+	await click(navEn.notificationTabActivity);
+	await click(navEn.notificationTabAttention);
+	expect(row(plan.id)).toBe(expanded);
+	expect(button(narratorEn.planEditDone, row(plan.id))).toBe(editor);
+	expect(row(plan.id).textContent).toContain("Unsubmitted edited plan");
+	expect(readSession("permission-draft", plan.requestId)).toContain("Unsubmitted feedback");
 });
 
 describe("human attention decisions", () => {

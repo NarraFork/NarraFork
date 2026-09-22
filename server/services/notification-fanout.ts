@@ -1,27 +1,8 @@
 /**
- * notification-fanout.ts — source systems → notification-center projections.
- *
- * Task package C of notification-center Phase 1. This module decides WHO should
- * get a notification-center row for a chat DM or a pending permission offer, and
- * what bounded title/preview those rows carry. Persistence itself lives behind
- * `notification-center-service.recordNotifications` (task package B); failures
- * here are logged and dropped — they must never roll back a committed chat write
- * or a permission offer.
- *
- * Hard rules (spec §5):
- *   - eventBus events carry ids/scalars only; body text is read here on the
- *     already-authorized service path, truncated, then handed to B.
- *   - Permission previews use toolName + a short path hint — never full tool
- *     input (secrets / large payloads).
- *   - Dedup is `(userId, kind, sourceKey)`: chat uses `chat_messages.id`,
- *     permission uses `toolCallId`. Re-offers may call `recordNotifications`
- *     again; B's unique index ignores the second insert.
- *   - Orthogonal to IM webhooks (notification-service): in-app history is
- *     attempted for every eligible recipient regardless of notifyOnWaiting.
- *
- * Persistence is B's `notification-center-service.recordNotifications`. Tests
- * inject a recording writer via {@link setRecordNotifications} so fan-out
- * eligibility can be asserted without the notifications table.
+ * Source events → bounded activity projections. This consumer is independent of
+ * WebSocket delivery: a missing socket must not prevent durable history.
+ * Failures are logged without rolling back the source write. Human Attention
+ * remains authoritative for decisions even if an activity projection is lost.
  */
 
 import { db } from "@server/db";
@@ -35,6 +16,7 @@ import {
 	users,
 } from "@server/db/schema";
 import { eventBus } from "@server/lib/event-bus";
+import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
 import {
 	NOTIFICATION_FANOUT_MAX_RECIPIENTS,
@@ -42,12 +24,13 @@ import {
 	type NotificationKind,
 	type NotificationLink,
 } from "@shared/notification-center";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { CHAT_MEMBER_FANOUT_LIMIT } from "./chat-service";
 import { canReadNarrator, listNarratorAudience, type NarratorAclRow } from "./narrator-acl";
 import {
 	type RecordNotificationInput,
 	recordNotifications as recordNotificationsImpl,
+	syncChatNotificationReads,
 } from "./notification-center-service";
 import { getRecentTabUserIdsForNarrator } from "./recent-tabs-service";
 
@@ -80,13 +63,22 @@ function clampPreview(text: string): string {
 	return `${flat.slice(0, max - 1)}…`;
 }
 
+const pendingFanouts = new Set<Promise<void>>();
+const MAX_PENDING_FANOUTS = 256;
+
 function guard(label: string, run: () => Promise<void>): void {
-	run().catch((err) => {
+	if (pendingFanouts.size >= MAX_PENDING_FANOUTS) {
+		logger.warn("Notification projection backlog full", { handler: label });
+		return;
+	}
+	const work = run().catch((err) => {
 		logger.error("Notification fan-out failed", {
 			handler: label,
 			error: err instanceof Error ? err.message : String(err),
 		});
 	});
+	pendingFanouts.add(work);
+	void work.finally(() => pendingFanouts.delete(work));
 }
 
 // ─── Chat DM fan-out ───
@@ -113,10 +105,20 @@ export interface ChatMessageFanoutEvent {
  */
 export async function fanoutChatMessageNotifications(event: ChatMessageFanoutEvent): Promise<void> {
 	const record = await resolveRecordNotifications();
-	const message = await db.query.chatMessages.findFirst({
-		where: eq(chatMessages.id, event.messageId),
-	});
-	if (!message || message.deletedAt) return;
+	const [message] = await db
+		.select({
+			id: chatMessages.id,
+			roomId: chatMessages.roomId,
+			seq: chatMessages.seq,
+			senderUserId: chatMessages.senderUserId,
+			senderGuestName: chatMessages.senderGuestName,
+			deletedAt: chatMessages.deletedAt,
+			contentText: sql<string>`substr(${chatMessages.contentText}, 1, ${NOTIFICATION_PREVIEW_MAX_LENGTH * 4})`,
+		})
+		.from(chatMessages)
+		.where(eq(chatMessages.id, event.messageId))
+		.limit(1);
+	if (!message || message.deletedAt || message.roomId !== event.roomId) return;
 
 	const room = await db.query.chatRooms.findFirst({
 		where: eq(chatRooms.id, event.roomId),
@@ -152,7 +154,7 @@ export async function fanoutChatMessageNotifications(event: ChatMessageFanoutEve
 		});
 	}
 
-	let title = "New message";
+	let title = "";
 	if (senderId) {
 		const sender = await db.query.users.findFirst({
 			where: eq(users.id, senderId),
@@ -223,19 +225,20 @@ async function resolvePermissionRecipients(row: NarratorAclRow): Promise<string[
 	const candidates = new Set<string>();
 	if (row.ownerUserId) candidates.add(row.ownerUserId);
 
-	const audience = await listNarratorAudience(row);
+	const audience = await listNarratorAudience(row, NOTIFICATION_FANOUT_MAX_RECIPIENTS);
 	if (!audience.everyone) {
 		for (const id of audience.userIds) candidates.add(id);
 	}
 
 	// Union recent tabs: a grantee/tab-holder is still a legitimate recipient.
 	// The set is usage-bounded; the explicit cap below is the hard stop.
-	const tabs = await getRecentTabUserIdsForNarrator(row.id);
+	const tabs = await getRecentTabUserIdsForNarrator(row.id, NOTIFICATION_FANOUT_MAX_RECIPIENTS);
 	for (const id of tabs) candidates.add(id);
 
 	if (candidates.size === 0) return [];
 
-	const ids = [...candidates];
+	// Bound the candidate lookup itself, not merely the eventual allowed rows.
+	const ids = [...candidates].slice(0, NOTIFICATION_FANOUT_MAX_RECIPIENTS);
 	const adminIds = new Set(
 		(
 			await db
@@ -270,14 +273,34 @@ export async function fanoutPermissionRequestNotifications(
 ): Promise<void> {
 	const toolCall = await db.query.narratorToolCalls.findFirst({
 		where: eq(narratorToolCalls.id, event.requestId),
+		columns: {
+			id: true,
+			narratorId: true,
+			status: true,
+			permissionDecidedAt: true,
+			toolName: true,
+			canonicalFilePath: true,
+			resolvedFilePath: true,
+		},
 	});
-	if (!toolCall) return;
+	if (!toolCall || toolCall.narratorId !== event.narratorId) return;
 	if (toolCall.permissionDecidedAt) return;
 	// Only live offers — not success/fail historical rows replayed through events.
 	if (toolCall.status !== "pending" && toolCall.status !== "initializing") return;
 
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, event.narratorId),
+		columns: {
+			id: true,
+			title: true,
+			ownerUserId: true,
+			visibility: true,
+			writeAudience: true,
+			type: true,
+			aclRootNarratorId: true,
+			chapterId: true,
+			contextProjectId: true,
+		},
 	});
 	if (!narrator) return;
 
@@ -296,7 +319,7 @@ export async function fanoutPermissionRequestNotifications(
 	if (recipients.length === 0) return;
 
 	const chapterId: string | null = narrator.chapterId ?? null;
-	let projectId: string | null = null;
+	let projectId: string | null = narrator.contextProjectId ?? null;
 	if (chapterId) {
 		const chapter = await db.query.chapters.findFirst({
 			where: eq(chapters.id, chapterId),
@@ -307,7 +330,7 @@ export async function fanoutPermissionRequestNotifications(
 
 	// Short summary: prefer a path column; never inputJson/outputJson.
 	const pathHint = toolCall.canonicalFilePath || toolCall.resolvedFilePath || null;
-	const title = narrator.title || "Permission request";
+	const title = narrator.title || "";
 	const preview = buildPermissionPreview(toolCall.toolName, pathHint);
 
 	const record = await resolveRecordNotifications();
@@ -334,33 +357,69 @@ export async function fanoutPermissionRequestNotifications(
 	}
 }
 
-// ─── Registration ───
+// ─── Source subscriptions ───
 
-let registered = false;
+const subscriptions = hotSafe("narrafork.notificationFanout.subscriptions", () => ({
+	dispose: null as (() => void) | null,
+}));
 
-/**
- * Register permission fan-out on the event bus. Idempotent.
- *
- * Chat fan-out is invoked from `chat-notify.onMessageCreated` (the write-path
- * consumer that already holds the message row) rather than a second eventBus
- * listener, so one posted message does not load the body twice.
- */
+/** Replace old closures on hot reload instead of installing duplicate listeners. */
 export function initNotificationFanout(): void {
-	if (registered) return;
-	registered = true;
-
-	eventBus.on("narrator:permission_request", (event) => {
-		guard("narrator:permission_request", () =>
-			fanoutPermissionRequestNotifications({
-				narratorId: event.narratorId,
-				requestId: event.requestId,
-			}),
-		);
-	});
+	void stopNotificationFanout();
+	const created = (event: ChatMessageFanoutEvent) => {
+		guard("chat:message_created", () => fanoutChatMessageNotifications(event));
+	};
+	const permission = (event: PermissionFanoutEvent) => {
+		guard("narrator:permission_request", () => fanoutPermissionRequestNotifications(event));
+	};
+	const read = (event: { roomId: string; userId: string; lastReadSeq: number }) => {
+		guard("chat:room_read", async () => {
+			await syncChatNotificationReads(event.roomId, event.userId, event.lastReadSeq);
+			// Source-derived unread can change even if no stored row needed an update.
+			eventBus.emit({
+				type: "notification_center_changed",
+				userId: event.userId,
+				kinds: ["chat_message"],
+			});
+		});
+	};
+	const deleted = (event: { roomId: string }) => {
+		guard("chat:message_deleted", async () => {
+			const members = await db
+				.select({ userId: chatRoomMembers.userId })
+				.from(chatRoomMembers)
+				.where(eq(chatRoomMembers.roomId, event.roomId))
+				.limit(NOTIFICATION_FANOUT_MAX_RECIPIENTS);
+			for (const member of members) {
+				eventBus.emit({
+					type: "notification_center_changed",
+					userId: member.userId,
+					kinds: ["chat_message"],
+				});
+			}
+		});
+	};
+	eventBus.on("chat:message_created", created);
+	eventBus.on("chat:room_read", read);
+	eventBus.on("chat:message_deleted", deleted);
+	eventBus.on("narrator:permission_request", permission);
+	subscriptions.dispose = () => {
+		eventBus.off("chat:message_created", created);
+		eventBus.off("chat:room_read", read);
+		eventBus.off("chat:message_deleted", deleted);
+		eventBus.off("narrator:permission_request", permission);
+	};
 }
 
-/** Tests only — invoke handlers without racing eventBus. */
+export async function stopNotificationFanout(): Promise<void> {
+	subscriptions.dispose?.();
+	subscriptions.dispose = null;
+	await Promise.all([...pendingFanouts]);
+}
+
+/** Await real asynchronous event consumers in integration tests. */
 export const notificationFanoutTesting = {
 	fanoutChatMessageNotifications,
 	fanoutPermissionRequestNotifications,
+	drain: () => Promise.all([...pendingFanouts]),
 };

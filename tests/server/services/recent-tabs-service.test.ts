@@ -137,6 +137,8 @@ describe("recent-tabs indexed side paths", () => {
 			"user-1",
 			"user-2",
 		]);
+		expect(await recentTabs.getRecentTabUserIdsForNarrator("n-title", 1)).toEqual(["user-1"]);
+		expect(await recentTabs.getRecentTabUserIdsForNarrator("n-title", 0)).toEqual([]);
 		await recentTabs.syncNarratorTitleToRecentTabs("n-title", "New title");
 		const titleRows = db
 			.select({ title: userRecentTabs.title })

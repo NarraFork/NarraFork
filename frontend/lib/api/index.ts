@@ -140,12 +140,12 @@ export type {
 export type { WorkspaceDetail } from "./misc";
 export { isWorkspaceLayoutConflict, WORKSPACE_LAYOUT_CONFLICT_CODE } from "./misc";
 export type {
-	NotificationDisplayStatus,
 	NotificationKind,
 	NotificationLink,
 	NotificationListItem,
 	NotificationListPage,
 	NotificationPersistentStatus,
+	NotificationSourceState,
 	NotificationUnreadCounts,
 } from "./notifications";
 export { notificationsApi } from "./notifications";

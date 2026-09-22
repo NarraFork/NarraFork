@@ -117,15 +117,15 @@ describe("DM fan-out → recordNotifications → listNotifications (real service
 		expect(row.sourceKey).toBe(posted.id);
 		expect(row.link).toEqual({ type: "chat_room", roomId: room.id });
 		expect(row.preview).toContain("integration hello body");
-		expect(row.status).toBe("unread");
+		expect(row.readAt).toBeNull();
 		expect(row.title.length).toBeGreaterThan(0);
 
 		const senderPage = await listNotifications({ userId: sender, status: "all" });
 		expect(senderPage.items).toHaveLength(0);
 
 		const counts = await getUnreadCounts(peer);
-		expect(counts.chat_message).toBe(1);
-		expect(counts.total).toBeGreaterThanOrEqual(1);
+		expect(counts.unreadConversations).toBe(1);
+		expect(counts.unreadActivities).toBeGreaterThanOrEqual(1);
 	});
 
 	test("long preview is truncated at write time to the shared max", async () => {
@@ -209,18 +209,18 @@ describe("DM fan-out → recordNotifications → listNotifications (real service
 
 		const events: Array<{ userId: string; kinds?: string[] }> = [];
 		const off = onNotificationCenterChanged((e) => events.push(e));
-		const result = await markNotificationsRead({ userId: peer });
+		const result = await markNotificationsRead({ userId: peer, scope: "all", before: Date.now() });
 		off();
 
 		expect(result.updated).toBe(1);
 		expect(events.some((e) => e.userId === peer)).toBe(true);
 
 		const peerPage = await listNotifications({ userId: peer, status: "all" });
-		expect(peerPage.items[0].status).toBe("read");
+		expect(peerPage.items[0].sourceState).toBe("active");
 		expect(peerPage.items[0].readAt).not.toBeNull();
 
 		const outsiderPage = await listNotifications({ userId: outsider, status: "all" });
-		expect(outsiderPage.items[0].status).toBe("unread");
+		expect(outsiderPage.items[0].readAt).toBeNull();
 	});
 });
 
@@ -300,10 +300,8 @@ describe("permission fan-out → recordNotifications → listNotifications (real
 		expect(row.link).toEqual({ type: "narrator", narratorId });
 		expect(row.preview).toContain("Write");
 		expect(row.preview).toContain("feature.ts");
-		expect(row.status).toBe("unread");
-		// M1: still pending → sourceAlive true for navigation.
-		expect(row.displayStatus).toBe("unread");
-		expect(row.sourceAlive).toBe(true);
+		expect(row.readAt).toBeNull();
+		expect(row.sourceState).toBe("active");
 
 		const strangerPage = await listNotifications({ userId: stranger, status: "all" });
 		expect(strangerPage.items).toHaveLength(0);
@@ -319,10 +317,11 @@ describe("permission fan-out → recordNotifications → listNotifications (real
 
 		// List derivation: decided tool → resolved but still navigable (M1).
 		const derived = after.items[0];
-		expect(derived.displayStatus).toBe("resolved");
-		expect(derived.sourceAlive).toBe(true);
+		expect(derived.sourceState).toBe("resolved");
+		expect(derived.link.type).toBe("narrator");
 
 		const counts = await getUnreadCounts(owner);
-		expect(counts.permission_request).toBe(1);
+		expect(counts.unreadActivities).toBe(1);
+		expect(counts.unreadConversations).toBe(0);
 	});
 });

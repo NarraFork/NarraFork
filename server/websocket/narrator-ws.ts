@@ -1,5 +1,6 @@
 import { HUMAN_ATTENTION_CHANGED_WS_TYPE } from "@shared/human-attention";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
 import {
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
 	NARRATOR_WS_SUBSCRIPTION_LIMIT_ERROR_CODE,
@@ -66,7 +67,6 @@ import {
 	toBufferSummary,
 	updateBufferedMessage,
 } from "../services/narrator-session";
-import { onNotificationCenterChanged } from "../services/notification-center-service";
 import { addStatsSubscriber, removeStatsSubscriber } from "../services/output-stats";
 import { assertChapterProjectAccess, canReadProject } from "../services/project-acl";
 import {
@@ -997,8 +997,11 @@ function flushNotificationCenterBroadcast(userId: string): void {
 	if (!pending) return;
 	notificationCenterPending.delete(userId);
 	if (pending.timer !== undefined) clearTimeout(pending.timer);
-	const frame: Extract<NarratorServerMessage, { type: "notification_center_changed" }> = {
-		type: "notification_center_changed",
+	const frame: Extract<
+		NarratorServerMessage,
+		{ type: typeof NOTIFICATION_CENTER_CHANGED_WS_TYPE }
+	> = {
+		type: NOTIFICATION_CENTER_CHANGED_WS_TYPE,
 	};
 	if (pending.kinds && pending.kinds.size > 0) {
 		frame.kinds = [...pending.kinds];
@@ -1027,23 +1030,8 @@ function scheduleNotificationCenterBroadcast(
 }
 
 if (hotOnce("narrafork.notificationCenterWs.listenersRegistered")) {
-	eventBus.on("notification_center_changed", (event) => {
+	eventBus.on(NOTIFICATION_CENTER_CHANGED_WS_TYPE, (event) => {
 		scheduleNotificationCenterBroadcast(event.userId, event.kinds);
-	});
-	/**
-	 * Bridge package B's service pub/sub onto the event bus.
-	 *
-	 * `notification-center-service` exposes `onNotificationCenterChanged` for
-	 * mark-read / delete / record success. The WS layer listens on eventBus only;
-	 * without this hop the service can mutate rows while clients never hear a
-	 * frame. Payload stays body-free (userId + optional kinds).
-	 */
-	onNotificationCenterChanged((event) => {
-		eventBus.emit({
-			type: "notification_center_changed",
-			userId: event.userId,
-			kinds: event.kinds,
-		});
 	});
 }
 

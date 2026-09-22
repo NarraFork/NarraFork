@@ -26,10 +26,12 @@ import { IconClockPause, IconInbox } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
+	createContext,
 	lazy,
 	type ReactNode,
 	Suspense,
 	useCallback,
+	useContext,
 	useEffect,
 	useMemo,
 	useRef,
@@ -176,6 +178,7 @@ export function HumanAttentionInboxButton({
 }
 
 const noop = () => {};
+const CloseAttentionContext = createContext<() => void>(noop);
 const isolatedPermissionKeys = {
 	focusIndex: null,
 	setFocusIndex: noop,
@@ -195,14 +198,8 @@ export function HumanAttentionInboxDrawer({
 	currentNarratorId?: string;
 }) {
 	const { t } = useTranslation("narrator");
-	const client = useQueryClient();
 	const query = useHumanAttention(opened);
 	const items = loadedHumanAttentionItems(query.data?.pages);
-	const { current, others } = groupHumanAttentionByScope(items, currentNarratorId);
-	useEffect(() => {
-		if (opened)
-			void client.invalidateQueries({ queryKey: humanAttentionListKey }, { cancelRefetch: false });
-	}, [client, opened]);
 	useMobileDrawerHistory(opened, onClose);
 	return (
 		<Drawer
@@ -210,6 +207,9 @@ export function HumanAttentionInboxDrawer({
 			onClose={onClose}
 			position="right"
 			size="lg"
+			onKeyDown={(event) => {
+				if (["Enter", "ArrowLeft", "ArrowRight"].includes(event.key)) event.stopPropagation();
+			}}
 			title={
 				<Group gap="xs">
 					<IconInbox size={18} />
@@ -223,6 +223,31 @@ export function HumanAttentionInboxDrawer({
 				</Group>
 			}
 		>
+			{opened && (
+				<HumanAttentionInboxContent onClose={onClose} currentNarratorId={currentNarratorId} />
+			)}
+		</Drawer>
+	);
+}
+
+/** Shared decision surface. Both drawers use the same authority and private forms. */
+export function HumanAttentionInboxContent({
+	onClose,
+	currentNarratorId,
+}: {
+	onClose: () => void;
+	currentNarratorId?: string;
+}) {
+	const { t } = useTranslation("narrator");
+	const client = useQueryClient();
+	const query = useHumanAttention();
+	const items = loadedHumanAttentionItems(query.data?.pages);
+	const { current, others } = groupHumanAttentionByScope(items, currentNarratorId);
+	useEffect(() => {
+		void client.invalidateQueries({ queryKey: humanAttentionListKey }, { cancelRefetch: false });
+	}, [client]);
+	return (
+		<CloseAttentionContext.Provider value={onClose}>
 			<PermEnterHintCtx.Provider value={isolatedPermissionKeys}>
 				{/* Stop portal events before they reach the session's composer shortcuts. */}
 				<Stack
@@ -281,7 +306,7 @@ export function HumanAttentionInboxDrawer({
 					)}
 				</Stack>
 			</PermEnterHintCtx.Provider>
-		</Drawer>
+		</CloseAttentionContext.Provider>
 	);
 }
 
@@ -308,11 +333,13 @@ function RetryNotice({
 function OwnerLink({ item }: { item: HumanAttentionItem }) {
 	const { t } = useTranslation("narrator");
 	const navigate = useNavigate();
+	const onClose = useContext(CloseAttentionContext);
 	return (
 		<Button
-			onClick={() =>
-				void navigate({ to: "/narrators/$narratorId", params: { narratorId: item.narratorId } })
-			}
+			onClick={() => {
+				void navigate({ to: "/narrators/$narratorId", params: { narratorId: item.narratorId } });
+				onClose();
+			}}
 			size="compact-xs"
 			variant="subtle"
 		>
@@ -781,6 +808,7 @@ function ReviewMarkdown({ label, value }: { label: string; value: string }) {
 function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
 	const { t } = useTranslation("narrator");
 	const navigate = useNavigate();
+	const onClose = useContext(CloseAttentionContext);
 	const client = useQueryClient();
 	const query = useHumanAttentionDetail(summary.id);
 	const item = query.data?.item ?? summary;
@@ -837,10 +865,12 @@ function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
 	const fileDrawer = useMemo(
 		() => ({
 			// The inbox has no workspace file drawer; open the ACTUAL owner rather than a noop or parent.
-			openForApproval: () =>
-				void navigate({ to: "/narrators/$narratorId", params: { narratorId: item.narratorId } }),
+			openForApproval: () => {
+				void navigate({ to: "/narrators/$narratorId", params: { narratorId: item.narratorId } });
+				onClose();
+			},
 		}),
-		[item.narratorId, navigate],
+		[item.narratorId, navigate, onClose],
 	);
 
 	if (query.isLoading) return <Text size="sm">{t("humanAttentionLoading")}</Text>;

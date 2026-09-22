@@ -679,6 +679,8 @@ export async function filterReadableNarrators<T extends NarratorAclRow>(
  */
 export async function listNarratorAudience(
 	row: NarratorAclRow,
+	/** Optional hard candidate budget for notification fan-out; ACL broadcasts omit it. */
+	limit?: number,
 ): Promise<{ everyone: true } | { everyone: false; userIds: string[] }> {
 	const judged = await resolveJudgedRow(row);
 	if (!judged) return { everyone: false, userIds: [] };
@@ -689,7 +691,7 @@ export async function listNarratorAudience(
 	) {
 		return { everyone: true };
 	}
-	const grants = await db
+	const grantQuery = db
 		.select({ principalId: aclGrants.principalId })
 		.from(aclGrants)
 		.where(
@@ -700,9 +702,10 @@ export async function listNarratorAudience(
 				sql`${aclGrants.domainKind} is null`,
 			),
 		);
-	const userIds = new Set(grants.map((grant) => grant.principalId));
-	if (judged.ownerUserId) userIds.add(judged.ownerUserId);
-	return { everyone: false, userIds: [...userIds] };
+	const grants = await (limit === undefined ? grantQuery : grantQuery.limit(limit));
+	const userIds = new Set<string>(judged.ownerUserId ? [judged.ownerUserId] : []);
+	for (const grant of grants) userIds.add(grant.principalId);
+	return { everyone: false, userIds: [...userIds].slice(0, limit) };
 }
 
 /**

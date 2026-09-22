@@ -5404,9 +5404,8 @@ export const oauthAccessTokens = sqliteTable(
 );
 
 // === notifications ===
-// In-app notification center (Phase 1): event history + unread flag only.
-// Source systems stay authoritative for actionable state (chat unread watermark,
-// permission pending). `displayStatus` resolved/gone is derived at list time.
+// Activity history and acknowledgement. Human Attention owns actionable state;
+// sourceState and effective readAt are derived against current source/ACL data.
 // Dedup key: unique (user_id, kind, source_key) so reconnects/WS resubscribe
 // never create a second row for the same source event.
 export const notifications = sqliteTable(
@@ -5436,7 +5435,12 @@ export const notifications = sqliteTable(
 	},
 	(table) => [
 		uniqueIndex("idx_notifications_user_kind_source").on(table.userId, table.kind, table.sourceKey),
-		index("idx_notifications_user_created").on(table.userId, table.createdAt),
-		index("idx_notifications_user_status_created").on(table.userId, table.status, table.createdAt),
+		index("idx_notifications_user_created").on(table.userId, table.createdAt, table.id),
+		index("idx_notifications_user_status_created").on(
+			table.userId,
+			table.status,
+			table.createdAt,
+			table.id,
+		),
 	],
 );

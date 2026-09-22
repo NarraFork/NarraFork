@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
+import type { HumanAttentionPage } from "@shared/human-attention";
 import type { NotificationListPage, NotificationUnreadCounts } from "@shared/notification-center";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
@@ -15,6 +17,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
 import { api } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import narratorEn from "../../locales/en/narrator.json";
 import navEn from "../../locales/en/nav.json";
 import navZh from "../../locales/zh-CN/nav.json";
 import { NotificationBell } from "./NotificationBell";
@@ -27,7 +30,7 @@ await i18n.init({
 	initImmediate: false,
 	interpolation: { escapeValue: false },
 	resources: {
-		en: { nav: navEn },
+		en: { nav: navEn, narrator: narratorEn },
 		"zh-CN": { nav: navZh },
 	},
 });
@@ -121,10 +124,12 @@ function installDom(): () => void {
 }
 
 async function settle() {
-	for (let turn = 0; turn < 4; turn++) {
-		for (let i = 0; i < 6; i++) await Promise.resolve();
-		await new Promise((resolve) => setTimeout(resolve, 0));
-	}
+	await act(async () => {
+		for (let turn = 0; turn < 4; turn++) {
+			for (let i = 0; i < 6; i++) await Promise.resolve();
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		}
+	});
 }
 
 function sampleItem(overrides: Partial<NotificationListPage["items"][number]> = {}) {
@@ -138,14 +143,20 @@ function sampleItem(overrides: Partial<NotificationListPage["items"][number]> = 
 		preview: "Hey there",
 		link: { type: "chat_room" as const, roomId: "room-42" },
 		sourceKey: "msg-42",
-		status: "unread" as const,
-		displayStatus: "unread" as const,
+		groupKey: overrides.id ?? "n-chat",
+		notificationIds: [overrides.id ?? "n-chat"],
+		groupSize: 1,
+		projectTitle: null,
+		chapterTitle: null,
+		sourceState: "active" as const,
 		createdAt: Date.now() - 60_000,
 		readAt: null,
 		...overrides,
 	};
 }
 
+const originalAttention = api.getHumanAttention;
+let attentionPayload: HumanAttentionPage = { items: [], nextCursor: null };
 const originalUnread = api.getNotificationUnreadCounts;
 const originalList = api.listNotifications;
 const originalMarkRead = api.markNotificationsRead;
@@ -155,11 +166,12 @@ let queryClient: QueryClient | null = null;
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 let navigations: unknown[] = [];
-let listPayload: NotificationListPage = { items: [], nextCursor: null };
+let listPayload: NotificationListPage = { items: [], nextCursor: null, asOf: 1234 };
 let unreadPayload: NotificationUnreadCounts = {
-	total: 0,
-	chat_message: 0,
-	permission_request: 0,
+	unreadConversations: 0,
+	unreadActivities: 0,
+	conversationsLowerBound: false,
+	activitiesLowerBound: false,
 };
 
 type TestRouter = ReturnType<typeof testRouter>;
@@ -197,12 +209,21 @@ async function renderWithProviders(ui: ReactNode) {
 beforeEach(async () => {
 	restoreDom = installDom();
 	navigations = [];
-	listPayload = { items: [], nextCursor: null };
-	unreadPayload = { total: 0, chat_message: 0, permission_request: 0 };
+	listPayload = { items: [], nextCursor: null, asOf: 1234 };
+	unreadPayload = {
+		unreadConversations: 0,
+		unreadActivities: 0,
+		conversationsLowerBound: false,
+		activitiesLowerBound: false,
+	};
 
+	attentionPayload = { items: [], nextCursor: null };
+	api.getHumanAttention = async () => attentionPayload;
 	api.getNotificationUnreadCounts = async () => unreadPayload;
 	api.listNotifications = async () => listPayload;
-	api.markNotificationsRead = async (body) => ({ updated: body.ids?.length ?? 0 });
+	api.markNotificationsRead = async (body) => ({
+		updated: body.scope === "items" ? body.ids.length : 0,
+	});
 
 	spyOn(narratorWSManager, "addListener").mockImplementation((() => ({
 		_id: 1,
@@ -226,10 +247,11 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	await settle();
-	root?.unmount();
+	await act(async () => root?.unmount());
 	await settle();
 	container?.remove();
 	queryClient?.clear();
+	api.getHumanAttention = originalAttention;
 	api.getNotificationUnreadCounts = originalUnread;
 	api.listNotifications = originalList;
 	api.markNotificationsRead = originalMarkRead;
@@ -241,48 +263,292 @@ function textOf(sel: string): string {
 	return container?.querySelector(sel)?.textContent ?? "";
 }
 
+function pendingItem(id: string, question = false): HumanAttentionPage["items"][number] {
+	return {
+		id,
+		kind: question ? "async_question" : "permission",
+		source: question ? "question" : "permission",
+		requestId: id,
+		toolCallId: id,
+		toolName: question ? "AskUserQuestion" : "Bash",
+		narratorId: `owner-${id}`,
+		narratorTitle: "Actual owner",
+		parentNarratorId: null,
+		rootNarratorId: null,
+		chapterId: null,
+		createdAt: new Date().toISOString(),
+		blocking: !question,
+		canAct: false,
+		summary: `Review ${id}`,
+	};
+}
+
+async function clickElement(selector: string) {
+	const element = document.querySelector<HTMLElement>(selector);
+	expect(element).not.toBeNull();
+	await act(async () => element?.click());
+	await settle();
+}
+
+async function clickText(text: string) {
+	const element = [...document.querySelectorAll("button")].find(
+		(button) => button.textContent === text,
+	);
+	expect(element).toBeDefined();
+	await act(async () => element?.click());
+	await settle();
+}
+
+describe("new center integration", () => {
+	test("pending authority wins over unread history, reuses rows and closes on actual owner navigation", async () => {
+		attentionPayload = {
+			items: [pendingItem("question", true), pendingItem("permission")],
+			nextCursor: "more",
+		};
+		unreadPayload = {
+			unreadConversations: 8,
+			unreadActivities: 99,
+			conversationsLowerBound: false,
+			activitiesLowerBound: false,
+		};
+		await renderWithProviders(<NotificationBell />);
+		expect(textOf('[data-testid="notification-bell-badge"]')).toContain("2+");
+		expect(
+			document.querySelector('[data-testid="notification-bell"]')?.getAttribute("aria-label"),
+		).toContain("pending items");
+		await clickElement('[data-testid="notification-bell"]');
+		expect(document.querySelectorAll('[role="dialog"]')).toHaveLength(1);
+		expect(
+			[...document.querySelectorAll("[data-attention-id]")].map((row) =>
+				row.getAttribute("data-attention-id"),
+			),
+		).toEqual(["permission", "question"]);
+		expect(document.querySelector('[data-testid="notification-mark-all-read"]')).toBeNull();
+		expect(document.body.textContent).toContain(narratorEn.humanAttentionReadOnly);
+		const owner = document.querySelector(
+			'[data-attention-id="question"] button:last-child',
+		) as HTMLElement;
+		await act(async () => owner.click());
+		await settle();
+		expect(JSON.stringify(navigations)).toContain("owner-question");
+		expect(document.querySelector('[role="dialog"]')).toBeNull();
+	});
+
+	test("0+ pending lower bound opens loadable empty candidate page", async () => {
+		attentionPayload = { items: [], nextCursor: "candidate-next" };
+		await renderWithProviders(<NotificationBell />);
+		expect(textOf('[data-testid="notification-bell-badge"]')).toContain("0+");
+		await clickElement('[data-testid="notification-bell"]');
+		expect(document.body.textContent).toContain(narratorEn.humanAttentionLoadMore);
+		expect(document.body.textContent).not.toContain(narratorEn.humanAttentionEmpty);
+	});
+
+	test("both failed queries remain unknown and offer visible retries", async () => {
+		api.getNotificationUnreadCounts = async () => {
+			throw new Error("summary unavailable");
+		};
+		api.getHumanAttention = async () => {
+			throw new Error("attention unavailable");
+		};
+		await renderWithProviders(<NotificationBell />);
+		expect(textOf('[data-testid="notification-bell-badge"]')).toContain("?");
+		await clickElement('[data-testid="notification-bell"]');
+		expect(document.body.textContent).toContain(navEn.notificationCountUnknown);
+		expect(document.body.textContent).toContain(narratorEn.humanAttentionLoadError);
+		expect(document.body.textContent).not.toContain(narratorEn.humanAttentionEmpty);
+	});
+
+	test("activity bulk read uses server boundary/current kind, preserves pending authority and shows errors", async () => {
+		attentionPayload = { items: [pendingItem("still-pending")], nextCursor: null };
+		listPayload = {
+			items: [sampleItem({ kind: "permission_request", sourceState: "resolved" })],
+			nextCursor: null,
+			asOf: 777,
+		};
+		const calls: unknown[] = [];
+		api.markNotificationsRead = async (body) => {
+			calls.push(body);
+			throw new Error("read failed");
+		};
+		await renderWithProviders(<NotificationCenterDrawer opened onClose={() => {}} />);
+		await clickElement('[data-filter="permissions"]');
+		await clickElement('[data-testid="notification-mark-all-read"]');
+		expect(calls).toEqual([{ scope: "all", before: 777, kind: "permission_request" }]);
+		expect(document.querySelector('[role="alert"]')?.textContent).toContain(
+			navEn.notificationMarkReadFailed,
+		);
+		await clickText(navEn.notificationTabAttention);
+		expect(document.querySelector('[data-attention-id="still-pending"]')).not.toBeNull();
+		expect(document.querySelector('[data-testid="notification-mark-all-read"]')).toBeNull();
+	});
+
+	test("activity empty candidate page keeps load more and requests the cursor", async () => {
+		const cursors: unknown[] = [];
+		api.listNotifications = async (params) => {
+			cursors.push(params?.cursor);
+			return params?.cursor
+				? { items: [sampleItem()], nextCursor: null, asOf: 1234 }
+				: { items: [], nextCursor: "next", asOf: 1234 };
+		};
+		await renderWithProviders(<NotificationCenterDrawer opened onClose={() => {}} />);
+		expect(document.querySelector('[data-testid="notification-empty"]')).toBeNull();
+		await clickText(navEn.notificationLoadMore);
+		expect(cursors).toEqual([null, "next"]);
+		expect(document.querySelectorAll('[data-testid="notification-list-item"]')).toHaveLength(1);
+	});
+
+	test("group activation acknowledges only captured IDs, navigates and closes despite read failure", async () => {
+		const calls: unknown[] = [];
+		let closes = 0;
+		listPayload = {
+			items: [sampleItem({ notificationIds: ["old-a", "old-b"], groupSize: 2 })],
+			nextCursor: null,
+			asOf: 1234,
+		};
+		api.markNotificationsRead = async (body) => {
+			calls.push(body);
+			throw new Error("read failed");
+		};
+		await renderWithProviders(<NotificationCenterDrawer opened onClose={() => closes++} />);
+		expect(document.body.textContent).toContain("2 messages");
+		await clickElement('[data-testid="notification-list-item"]');
+		expect(calls).toEqual([{ scope: "items", ids: ["old-a", "old-b"] }]);
+		expect(JSON.stringify(navigations)).toContain("room-42");
+		expect(closes).toBe(1);
+		expect(document.body.textContent).toContain(navEn.notificationMarkReadFailed);
+	});
+
+	test("read failure stays visible even after navigation unmounts the drawer", async () => {
+		let rejectRead: (error: Error) => void = () => {};
+		api.markNotificationsRead = () =>
+			new Promise((_resolve, reject) => {
+				rejectRead = reject;
+			});
+		listPayload = { items: [sampleItem()], nextCursor: null, asOf: 1234 };
+		const toast = spyOn(notifications, "show").mockImplementation(() => "test-toast");
+		try {
+			await renderWithProviders(<NotificationBell />);
+			await clickElement('[data-testid="notification-bell"]');
+			await clickElement('[data-testid="notification-list-item"]');
+			expect(document.querySelector('[role="dialog"]')).toBeNull();
+			await act(async () => rejectRead(new Error("late read failure")));
+			await settle();
+			expect(toast).toHaveBeenCalledWith({
+				color: "red",
+				message: navEn.notificationMarkReadFailed,
+			});
+		} finally {
+			toast.mockRestore();
+		}
+	});
+
+	test("gone rows never reveal stale private context and remain markable without navigation", async () => {
+		const calls: unknown[] = [];
+		listPayload = {
+			items: [
+				sampleItem({
+					sourceState: "gone",
+					title: "secret",
+					preview: "secret-body",
+					projectTitle: "secret-project",
+					chapterTitle: "secret-chapter",
+				}),
+			],
+			nextCursor: null,
+			asOf: 1234,
+		};
+		api.markNotificationsRead = async (body) => {
+			calls.push(body);
+			return { updated: 1 };
+		};
+		await renderWithProviders(<NotificationCenterDrawer opened onClose={() => {}} />);
+		expect(document.body.textContent).not.toContain("secret");
+		await clickText(navEn.notificationMarkRead);
+		expect(calls).toEqual([{ scope: "items", ids: ["n-chat"] }]);
+		expect(navigations).toHaveLength(0);
+	});
+
+	test("English and Chinese notification keys stay symmetric", () => {
+		const keys = (object: Record<string, string>) =>
+			Object.keys(object)
+				.filter((key) => key.startsWith("notification"))
+				.sort();
+		expect(keys(navEn)).toEqual(keys(navZh));
+	});
+});
+
 describe("NotificationBell badge", () => {
 	test("hides numeric badge when unread is zero", async () => {
-		unreadPayload = { total: 0, chat_message: 0, permission_request: 0 };
+		unreadPayload = {
+			unreadConversations: 0,
+			unreadActivities: 0,
+			conversationsLowerBound: false,
+			activitiesLowerBound: false,
+		};
 		await renderWithProviders(<NotificationBell />);
 		expect(container?.querySelector('[data-testid="notification-bell"]')).not.toBeNull();
 		expect(textOf('[data-testid="notification-bell-badge"]')).not.toContain("0");
 	});
 
+	test("permission activity cap does not turn an exact DM count into a lower bound", async () => {
+		unreadPayload = {
+			unreadConversations: 3,
+			unreadActivities: 99,
+			conversationsLowerBound: false,
+			activitiesLowerBound: true,
+		};
+		await renderWithProviders(<NotificationBell />);
+		expect(textOf('[data-testid="notification-bell-badge"]')).toContain("3");
+		expect(textOf('[data-testid="notification-bell-badge"]')).not.toContain("3+");
+		expect(
+			document.querySelector('[data-testid="notification-bell"]')?.getAttribute("aria-label"),
+		).toContain("3 unread conversations");
+	});
+
 	test("shows numeric badge under cap", async () => {
-		unreadPayload = { total: 7, chat_message: 5, permission_request: 2 };
+		unreadPayload = {
+			unreadConversations: 7,
+			unreadActivities: 25,
+			conversationsLowerBound: false,
+			activitiesLowerBound: false,
+		};
 		await renderWithProviders(<NotificationBell />);
 		expect(textOf('[data-testid="notification-bell-badge"]')).toContain("7");
 	});
 
 	test("shows 99+ when lowerBound/capped", async () => {
-		unreadPayload = { total: 99, chat_message: 50, permission_request: 49, lowerBound: true };
+		unreadPayload = {
+			unreadConversations: 99,
+			unreadActivities: 99,
+			conversationsLowerBound: true,
+			activitiesLowerBound: true,
+		};
 		await renderWithProviders(<NotificationBell />);
 		expect(textOf('[data-testid="notification-bell-badge"]')).toContain("99+");
 	});
 });
 
 describe("NotificationCenterDrawer", () => {
-	test("empty state + filters + no Approve/Deny in Phase 1", async () => {
-		listPayload = { items: [], nextCursor: null };
+	test("activity empty state has source filters, not duplicate approval forms", async () => {
+		listPayload = { items: [], nextCursor: null, asOf: 1234 };
 		await renderWithProviders(<NotificationCenterDrawer opened onClose={() => {}} />);
 		expect(textOf('[data-testid="notification-empty"]')).toContain("No notifications");
 		expect(container?.querySelector('[data-testid="notification-filter-control"]')).not.toBeNull();
-		expect(textOf('[data-testid="notification-mark-all-read"]')).toContain("Mark all as read");
+		expect(textOf('[data-testid="notification-mark-all-read"]')).toContain("Mark activity as read");
 		expect(container?.innerHTML ?? "").not.toMatch(/Approve|Deny/i);
 	});
 
 	test("gone rows gray and not navigable; chat rows navigate to /messages?room=", async () => {
 		const markReadIds: string[] = [];
 		api.markNotificationsRead = async (body) => {
-			if (body.ids) markReadIds.push(...body.ids);
-			return { updated: body.ids?.length ?? 0 };
+			if (body.scope === "items") markReadIds.push(...body.ids);
+			return { updated: body.scope === "items" ? body.ids.length : 0 };
 		};
 		listPayload = {
 			items: [
 				sampleItem({
 					id: "gone-1",
-					displayStatus: "gone",
+					sourceState: "gone",
 					title: "Expired perm",
 					kind: "permission_request",
 					link: { type: "narrator", narratorId: "nar-gone" },
@@ -294,6 +560,7 @@ describe("NotificationCenterDrawer", () => {
 				}),
 			],
 			nextCursor: null,
+			asOf: 1234,
 		};
 		await renderWithProviders(<NotificationCenterDrawer opened onClose={() => {}} />);
 
@@ -302,7 +569,7 @@ describe("NotificationCenterDrawer", () => {
 		const goneRow = rows.find((r) => r.getAttribute("data-notification-id") === "gone-1");
 		const chatRow = rows.find((r) => r.getAttribute("data-notification-id") === "chat-1");
 		expect(goneRow?.getAttribute("data-notification-gone")).toBe("true");
-		expect(goneRow?.textContent ?? "").toContain("Expired");
+		expect(goneRow?.textContent ?? "").toContain("Source unavailable");
 
 		await act(async () => {
 			(goneRow as HTMLElement).click();
@@ -328,10 +595,11 @@ describe("NotificationCenterDrawer", () => {
 					kind: "permission_request",
 					title: "Need permission",
 					link: { type: "narrator", narratorId: "nar-77" },
-					displayStatus: "unread",
+					sourceState: "active",
 				}),
 			],
 			nextCursor: null,
+			asOf: 1234,
 		};
 		await renderWithProviders(<NotificationCenterDrawer opened onClose={() => {}} />);
 		const row = container?.querySelector('[data-testid="notification-list-item"]') as HTMLElement;

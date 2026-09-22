@@ -25,7 +25,7 @@ import { users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import type { NarratorServerMessage } from "../../websocket/narrator-ws-types";
 import { chatNotifyTesting, setChatNotifyChannel } from "../chat-notify";
-import { postMessage, resolveDmRoom } from "../chat-service";
+import { markRead, postMessage, resolveDmRoom } from "../chat-service";
 
 interface Recorded {
 	roomBroadcasts: Array<{ roomId: string; message: NarratorServerMessage }>;
@@ -284,14 +284,15 @@ describe("read receipts", () => {
 	test("the room hears the receipt and the reader's own badge clears", async () => {
 		const room = await resolveDmRoom(alice, bob);
 		const recorded = record();
-		await chatNotifyTesting.onRoomRead({ roomId: room.id, userId: bob, lastReadSeq: 3 });
+		const lastReadSeq = await markRead(room.id, bob, Number.MAX_SAFE_INTEGER);
+		await chatNotifyTesting.onRoomRead({ roomId: room.id, userId: bob, lastReadSeq });
 
 		expect(recorded.roomBroadcasts).toHaveLength(1);
 		const receipt = recorded.roomBroadcasts[0].message;
 		expect(receipt.type).toBe("chat:read");
 		if (receipt.type === "chat:read") {
 			expect(receipt.userId).toBe(bob);
-			expect(receipt.lastReadSeq).toBe(3);
+			expect(receipt.lastReadSeq).toBe(lastReadSeq);
 		}
 
 		// The reader may be reading in another tab that does not have this room
@@ -300,5 +301,18 @@ describe("read receipts", () => {
 		expect(recorded.userBroadcasts[0].userId).toBe(bob);
 		const cleared = recorded.userBroadcasts[0].message;
 		if (cleared.type === "chat:unread_changed") expect(cleared.unread).toBe(0);
+	});
+	test("a partial read receipt preserves the remaining unread badge", async () => {
+		const sender = await makeUser("partial-sender");
+		const reader = await makeUser("partial-reader");
+		const room = await resolveDmRoom(sender, reader);
+		const first = await postMessage({ roomId: room.id, senderUserId: sender, text: "first" });
+		await postMessage({ roomId: room.id, senderUserId: sender, text: "second" });
+		const lastReadSeq = await markRead(room.id, reader, first.seq);
+		const recorded = record();
+		await chatNotifyTesting.onRoomRead({ roomId: room.id, userId: reader, lastReadSeq });
+		const badge = recorded.userBroadcasts[0]?.message;
+		expect(badge?.type).toBe("chat:unread_changed");
+		if (badge?.type === "chat:unread_changed") expect(badge.unread).toBe(1);
 	});
 });

@@ -1,16 +1,9 @@
-/**
- * Notification center data hooks.
- *
- * WS contract (spec §6.1): event `notification_center_changed` is data-free.
- * The client marks queries stale once per coalesced frame — never a full
- * list storm — and only refetches unread-count (and the open drawer's page).
- */
-
-import type {
-	NotificationKind,
-	NotificationListItem,
-	NotificationListPage,
-	NotificationUnreadCounts,
+import { HUMAN_ATTENTION_CHANGED_WS_TYPE } from "@shared/human-attention";
+import {
+	type MarkNotificationsReadBody,
+	NOTIFICATION_CENTER_CHANGED_WS_TYPE,
+	type NotificationListItem,
+	type NotificationListPage,
 } from "@shared/notification-center";
 import {
 	type QueryClient,
@@ -19,231 +12,114 @@ import {
 	useQuery,
 	useQueryClient,
 } from "@tanstack/react-query";
-import { useCallback, useEffect } from "react";
+import { useEffect } from "react";
 import { api } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
-import {
-	filterItemsForDisplay,
-	listQueryParams,
-	NOTIFICATION_CENTER_CHANGED_WS_TYPE,
-	type NotificationCenterFilter,
-	type NotificationNavigateTarget,
-	notificationNavigateTarget,
-	notificationQueryKeys,
-} from "./types";
+import { listQueryParams, type NotificationCenterFilter, notificationQueryKeys } from "./types";
 
-const SUMMARY_STALE_TIME_MS = 30_000;
-const LIST_STALE_TIME_MS = 10_000;
+export { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
 
-export type {
-	NotificationCenterFilter,
-	NotificationKind,
-	NotificationListItem,
-	NotificationListPage,
-	NotificationNavigateTarget,
-};
-export {
-	filterItemsForDisplay,
-	listQueryParams,
-	NOTIFICATION_CENTER_CHANGED_WS_TYPE,
-	notificationNavigateTarget,
-	notificationQueryKeys,
-};
-
-/** Flatten infinite pages for rendering. */
+/** Prefer the newest page's version when live pagination shifts a group across page boundaries. */
 export function flattenNotificationPages(
 	pages: NotificationListPage[] | undefined,
 ): NotificationListItem[] {
-	if (!pages) return [];
-	return pages.flatMap((page) => page.items);
+	const groups = new Map<string, NotificationListItem>();
+	for (const page of pages ?? []) {
+		for (const item of page.items) if (!groups.has(item.groupKey)) groups.set(item.groupKey, item);
+	}
+	return [...groups.values()];
 }
 
-/**
- * Coalesced invalidation of the notification-center query family.
- * One microtask flush per burst, regardless of how many frames arrived.
- */
 export function markNotificationCenterStale(client: QueryClient): void {
 	void client.invalidateQueries({ queryKey: notificationQueryKeys.root });
 }
 
-/**
- * Subscribe to `notification_center_changed`.
- *
- * Mounted from the Header bell so the badge stays live without the drawer
- * being open. Reconnect also invalidates once (dropped frames are invisible).
- */
+const changeTypes = [
+	NOTIFICATION_CENTER_CHANGED_WS_TYPE,
+	HUMAN_ATTENTION_CHANGED_WS_TYPE,
+	"narrator_access_changed",
+	"project_access_changed",
+	"narrator_deleted",
+	"narrators_deleted",
+	"chapter_deleted",
+	"project_deleted",
+	"chat:message",
+	"chat:message_deleted",
+	"chat:read",
+	"chat:unread_changed",
+];
+
 export function useNotificationCenterLive(enabled = true): void {
-	const qc = useQueryClient();
+	const client = useQueryClient();
 	useEffect(() => {
 		if (!enabled) return;
 		let queued = false;
+		let disposed = false;
 		const flush = () => {
-			if (queued) return;
+			if (queued || disposed) return;
 			queued = true;
 			queueMicrotask(() => {
 				queued = false;
-				markNotificationCenterStale(qc);
+				if (!disposed) markNotificationCenterStale(client);
 			});
 		};
-		const listener = narratorWSManager.addListener(
-			{ types: [NOTIFICATION_CENTER_CHANGED_WS_TYPE] },
-			flush,
-		);
-		const offConnection = narratorWSManager.onConnectionChange((connected, isReconnect) => {
-			if (connected && isReconnect) flush();
+		const listener = narratorWSManager.addListener({ types: changeTypes }, flush);
+		const offConnection = narratorWSManager.onConnectionChange((connected) => {
+			if (connected) flush();
 		});
 		return () => {
+			disposed = true;
 			offConnection();
 			narratorWSManager.removeListener(listener);
 		};
-	}, [enabled, qc]);
+	}, [enabled, client]);
 }
 
-/** Aggregated unread badge source. */
 export function useNotificationUnreadCounts(enabled = true) {
 	useNotificationCenterLive(enabled);
 	return useQuery({
 		queryKey: notificationQueryKeys.unreadCount(),
-		queryFn: () => api.getNotificationUnreadCounts(),
+		queryFn: ({ signal }) => api.getNotificationUnreadCounts(signal),
 		enabled,
-		staleTime: SUMMARY_STALE_TIME_MS,
-		// Badge is updated by WS + mutation paths; focus remount is not a reason
-		// to re-hit SQLite every Alt-Tab (same reasoning as chat unread).
+		staleTime: 30_000,
+		retry: false,
 		refetchOnWindowFocus: false,
 	});
 }
 
-/** Infinite list for the drawer. Cursor pagination; no unbounded COUNT. */
 export function useNotificationList(filter: NotificationCenterFilter, enabled = true) {
 	const params = listQueryParams(filter);
 	const query = useInfiniteQuery({
 		queryKey: notificationQueryKeys.list(params),
-		queryFn: ({ pageParam }) =>
-			api.listNotifications({
-				...params,
-				cursor: pageParam ?? null,
-				limit: 30,
-			}),
+		queryFn: ({ pageParam, signal }) =>
+			api.listNotifications({ ...params, cursor: pageParam, limit: 30 }, signal),
 		initialPageParam: null as string | null,
 		getNextPageParam: (last: NotificationListPage) => last.nextCursor ?? undefined,
 		enabled,
-		staleTime: LIST_STALE_TIME_MS,
+		staleTime: 10_000,
+		retry: false,
 		refetchOnWindowFocus: false,
 	});
-	const items = filterItemsForDisplay(filter, flattenNotificationPages(query.data?.pages));
-	return { ...query, items };
+	return { ...query, items: flattenNotificationPages(query.data?.pages) };
 }
 
-function patchUnreadAfterRead(
-	client: QueryClient,
-	kind: NotificationKind | undefined,
-	ids: string[] | undefined,
-): void {
-	client.setQueryData(
-		notificationQueryKeys.unreadCount(),
-		(prev: NotificationUnreadCounts | undefined) => {
-			if (!prev) return prev;
-			const n = ids?.length ?? 0;
-			if (n === 0 && !kind) {
-				return {
-					total: 0,
-					chat_message: 0,
-					permission_request: 0,
-					lowerBound: false,
-				};
-			}
-			// Without per-row kind in the optimistic path, clamp totals and let the
-			// next unread-count fetch reconcile exact per-kind numbers.
-			const total = Math.max(0, prev.total - n);
-			let chat = prev.chat_message;
-			let perm = prev.permission_request;
-			if (kind === "chat_message") chat = Math.max(0, chat - n);
-			else if (kind === "permission_request") perm = Math.max(0, perm - n);
-			return {
-				...prev,
-				total,
-				chat_message: chat,
-				permission_request: perm,
-				lowerBound: prev.lowerBound && total > 0 ? prev.lowerBound : false,
-			};
-		},
-	);
-}
-
-/** Mark selected notifications read (row click or bulk). */
+/** Counts are source-derived conversation counts; never subtract notification IDs optimistically. */
 export function useMarkNotificationsRead() {
-	const qc = useQueryClient();
+	const client = useQueryClient();
 	return useMutation({
-		mutationFn: (body: { ids?: string[]; before?: number; kind?: NotificationKind }) =>
-			api.markNotificationsRead(body),
-		onSuccess: (_data, body) => {
-			if (body.ids?.length) {
-				patchUnreadAfterRead(qc, body.kind, body.ids);
-			} else {
-				patchUnreadAfterRead(qc, body.kind, undefined);
-			}
-			// Refresh lists so display status settles without waiting for a WS round-trip.
-			void qc.invalidateQueries({ queryKey: notificationQueryKeys.root });
-		},
+		mutationFn: (body: MarkNotificationsReadBody) => api.markNotificationsRead(body),
+		onSuccess: () => markNotificationCenterStale(client),
 	});
 }
 
-/** Delete one notification row (API present; UI chrome may come later). */
 export function useDeleteNotification() {
-	const qc = useQueryClient();
+	const client = useQueryClient();
 	return useMutation({
 		mutationFn: (id: string) => api.deleteNotification(id),
-		onSuccess: () => {
-			void qc.invalidateQueries({ queryKey: notificationQueryKeys.root });
-		},
+		onSuccess: () => markNotificationCenterStale(client),
 	});
 }
 
-export interface NotificationActivateResult {
-	navigated: boolean;
-	markedRead: boolean;
-	target: NotificationNavigateTarget | null;
-}
-
-/**
- * Row click: mark read + navigate (unless gone).
- * Navigation is the caller's job (router); this returns the target.
- *
- * `resolved` permission rows still mark read and still navigate when the
- * narrator/link target exists — only true `gone` is inert (review M1).
- */
-export function useActivateNotification() {
-	const markRead = useMarkNotificationsRead();
-	return useCallback(
-		(item: NotificationListItem): NotificationActivateResult => {
-			const target = notificationNavigateTarget(item);
-			const alreadyRead = item.status === "read";
-			// gone is inert: no navigation, no read mutation (spec §6.2.4).
-			const gone = item.displayStatus === "gone";
-			if (!alreadyRead && !gone) {
-				void markRead.mutateAsync({ ids: [item.id], kind: item.kind }).catch(() => {
-					// Read failure must not block navigation; WS/invalidate will reconcile.
-				});
-			}
-			return {
-				navigated: target != null,
-				markedRead: !alreadyRead && !gone,
-				target,
-			};
-		},
-		[markRead],
-	);
-}
-
-/** Pure helper for tests / drawer header label. */
 export function notificationFilterFromValue(value: string): NotificationCenterFilter {
-	switch (value) {
-		case "actionable":
-		case "messages":
-		case "permissions":
-		case "all":
-			return value;
-		default:
-			return "all";
-	}
+	return value === "messages" || value === "permissions" ? value : "all";
 }

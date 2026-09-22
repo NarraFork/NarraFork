@@ -781,6 +781,14 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 		roomKind: access.room.kind,
 		narratorId: access.room.narratorId,
 	});
+	// Sending also commits a read watermark. Every consumer must hear the same
+	// receipt as explicit reading, including activity history in another tab.
+	eventBus.emit({
+		type: "chat:room_read",
+		roomId: input.roomId,
+		userId: input.senderUserId,
+		lastReadSeq: seq,
+	});
 
 	return row;
 }

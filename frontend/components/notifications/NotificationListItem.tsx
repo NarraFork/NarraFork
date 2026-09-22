@@ -1,6 +1,5 @@
-import { Badge, Group, Stack, Text, ThemeIcon, UnstyledButton } from "@mantine/core";
+import { Badge, Box, Button, Group, Stack, Text, UnstyledButton } from "@mantine/core";
 import type { NotificationListItem as NotificationListItemData } from "@shared/notification-center";
-import { IconBell, IconMessage, IconShieldLock } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import { formatRelativeTime } from "../../lib/format";
 
@@ -9,84 +8,93 @@ export interface NotificationListItemProps {
 	onActivate?: (item: NotificationListItemData) => void;
 }
 
-function kindIcon(kind: NotificationListItemData["kind"]) {
-	if (kind === "chat_message") return IconMessage;
-	if (kind === "permission_request") return IconShieldLock;
-	return IconBell;
-}
-
 export function NotificationListItem({ item, onActivate }: NotificationListItemProps) {
 	const { t } = useTranslation("nav");
-	const gone = item.displayStatus === "gone";
-	// Resolved stays clickable: click marks read and may open the session (M1).
-	const resolved = item.displayStatus === "resolved";
-	const Icon = kindIcon(item.kind);
-	const kindLabel =
-		item.kind === "chat_message"
-			? t("notificationKindChat", "Message")
-			: t("notificationKindPermission", "Permission");
-
+	const gone = item.sourceState === "gone";
+	const resolved = item.sourceState === "resolved";
+	const unread = item.readAt === null;
+	if (gone)
+		return (
+			<Box
+				p="sm"
+				data-testid="notification-list-item"
+				data-notification-id={item.id}
+				data-notification-gone="true"
+			>
+				<Group justify="space-between" wrap="wrap">
+					<Text size="sm" c="dimmed">
+						{t("notificationGone")}
+					</Text>
+					{unread && (
+						<Button size="compact-xs" variant="subtle" onClick={() => onActivate?.(item)}>
+							{t("notificationMarkRead")}
+						</Button>
+					)}
+				</Group>
+			</Box>
+		);
 	return (
 		<UnstyledButton
 			data-notification-id={item.id}
-			data-notification-gone={gone ? "true" : undefined}
-			data-notification-resolved={resolved && !gone ? "true" : undefined}
-			data-notification-kind={item.kind}
+			data-notification-resolved={resolved ? "true" : undefined}
 			data-testid="notification-list-item"
 			onClick={() => onActivate?.(item)}
-			style={{
-				width: "100%",
-				textAlign: "left",
-				padding: "10px 12px",
-				borderRadius: 8,
-				opacity: gone ? 0.55 : 1,
-				cursor: gone ? "default" : "pointer",
-			}}
-			aria-disabled={gone || undefined}
+			style={{ width: "100%", textAlign: "left", padding: "10px 12px", borderRadius: 8 }}
 		>
-			<Group wrap="nowrap" align="flex-start" gap="sm">
-				<ThemeIcon
-					variant="light"
-					color={gone ? "gray" : item.kind === "chat_message" ? "blue" : "orange"}
-					size="md"
-				>
-					<Icon size={16} />
-				</ThemeIcon>
-				<Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
-					<Group justify="space-between" wrap="nowrap" gap="xs">
-						<Text size="sm" fw={item.status === "unread" ? 600 : 400} lineClamp={1}>
-							{item.title || kindLabel}
+			<Stack gap={4} style={{ minWidth: 0, overflowWrap: "anywhere" }}>
+				<Group gap="xs" wrap="nowrap">
+					{unread && (
+						<Box
+							aria-label={t("notificationUnread")}
+							style={{
+								width: 6,
+								height: 6,
+								borderRadius: "50%",
+								flexShrink: 0,
+								background: "var(--mantine-color-blue-5)",
+							}}
+						/>
+					)}
+					<Text size="sm" fw={unread ? 600 : 400} lineClamp={1}>
+						{item.title ||
+							t(
+								item.kind === "chat_message"
+									? "notificationKindChat"
+									: "notificationKindPermission",
+							)}
+					</Text>
+				</Group>
+				{item.preview && (
+					<Text size="sm" c="dimmed" lineClamp={2}>
+						{item.preview}
+					</Text>
+				)}
+				<Group gap="xs" wrap="wrap">
+					{item.projectTitle && (
+						<Text size="xs" c="dimmed">
+							{item.projectTitle}
 						</Text>
-						<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-							{formatRelativeTime(new Date(item.createdAt).toISOString())}
+					)}
+					{item.chapterTitle && (
+						<Text size="xs" c="dimmed">
+							{item.chapterTitle}
 						</Text>
-					</Group>
-					{item.preview ? (
-						<Text size="xs" c="dimmed" lineClamp={2}>
-							{item.preview}
+					)}
+					<Text size="xs" c="dimmed">
+						{formatRelativeTime(new Date(item.createdAt).toISOString())}
+					</Text>
+					{item.groupSize > 1 && (
+						<Text size="xs" c="dimmed">
+							{t("notificationGroupSize", { count: item.groupSize })}
 						</Text>
-					) : null}
-					<Group gap="xs">
-						<Badge size="xs" variant="outline" color="gray">
-							{kindLabel}
+					)}
+					{resolved && (
+						<Badge size="xs" variant="light" color="gray" data-testid="notification-resolved-badge">
+							{t("notificationResolved")}
 						</Badge>
-						{gone ? (
-							<Badge size="xs" variant="light" color="gray" data-testid="notification-gone-badge">
-								{t("notificationGone", "Expired")}
-							</Badge>
-						) : resolved ? (
-							<Badge
-								size="xs"
-								variant="light"
-								color="teal"
-								data-testid="notification-resolved-badge"
-							>
-								{t("notificationResolved", "Resolved")}
-							</Badge>
-						) : null}
-					</Group>
-				</Stack>
-			</Group>
+					)}
+				</Group>
+			</Stack>
 		</UnstyledButton>
 	);
 }

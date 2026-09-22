@@ -1681,11 +1681,15 @@ export async function getRecentTabUserIds(type: RecentTabType, id: string): Prom
 	return userIds;
 }
 
-export async function getRecentTabUserIdsForNarrator(narratorId: string): Promise<string[]> {
+export async function getRecentTabUserIdsForNarrator(
+	narratorId: string,
+	/** Notification consumers use a fixed budget; access-change broadcasts still visit everyone. */
+	limit = Number.POSITIVE_INFINITY,
+): Promise<string[]> {
 	await ensureAllRecentTabsMigrated();
 	const userIds: string[] = [];
 	let cursor: string | undefined;
-	while (true) {
+	while (userIds.length < limit) {
 		const rows = await db
 			.selectDistinct({ userId: userRecentTabs.userId })
 			.from(userRecentTabs)
@@ -1696,7 +1700,7 @@ export async function getRecentTabUserIdsForNarrator(narratorId: string): Promis
 				),
 			)
 			.orderBy(asc(userRecentTabs.userId))
-			.limit(MIGRATION_BATCH_SIZE);
+			.limit(Math.min(MIGRATION_BATCH_SIZE, limit - userIds.length));
 		if (rows.length === 0) break;
 		userIds.push(...rows.map((row) => row.userId));
 		cursor = rows.at(-1)?.userId;

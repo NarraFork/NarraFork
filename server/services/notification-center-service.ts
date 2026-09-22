@@ -1,59 +1,37 @@
-/**
- * Notification center — service layer (Phase 1 / task package B).
- *
- * The notification table is a durable projection of events, not a replica of
- * source-system state. Persistent status is only `unread|read`; `resolved` and
- * `gone` are derived at list time from the authoritative source (tool call /
- * chat room ACL).
- *
- * Hard rules this module enforces (docs/plans/notification-center-phase1.md §4):
- * 1. `recordNotifications` is bounded, dedupes on `(userId, kind, sourceKey)`,
- *    and never throws back into the caller's transaction.
- * 2. List selects notification columns only — never message `contentJson` or
- *    tool `inputJson`/`outputJson`.
- * 3. Unread counts use `LIMIT cap+1` probes, never unbounded `COUNT(*)`.
- * 4. `markRead` is owner-scoped and monotonic (already-read rows keep `readAt`).
- * 5. Delete is owner-scoped; anything else is 404 (do not confirm existence).
- *
- * Shared contract lives in `shared/notification-center.ts` (package A) — this
- * module re-exports those types/constants so existing service/route call sites
- * keep a single import surface. Physical SQL uses column names from
- * `server/db/schema.ts` `notifications` (snake_case); raw SQL is intentional so
- * list/count paths stay explicitly bounded and never pull large JSON fields.
- *
- * Fan-out (package C) resolves this module via dynamic import of
- * `recordNotifications`; do not rename that export without updating C.
- */
-
+/** Bounded event history. Source ACL and read watermarks are authoritative, not the projection. */
 import {
+	type MarkNotificationsReadBody,
+	NOTIFICATION_CENTER_CHANGED_WS_TYPE,
 	NOTIFICATION_FANOUT_MAX_RECIPIENTS,
 	NOTIFICATION_LIST_DEFAULT_LIMIT,
 	NOTIFICATION_LIST_MAX_LIMIT,
 	NOTIFICATION_PREVIEW_MAX_LENGTH,
+	NOTIFICATION_RETENTION_MAX_AGE_MS,
+	NOTIFICATION_RETENTION_MAX_ROWS,
 	NOTIFICATION_UNREAD_COUNT_CAP,
 	type NotificationKind,
 	type NotificationLink,
 	type NotificationListItem,
 	type NotificationListPage,
-	type NotificationPersistentStatus,
 	type NotificationUnreadCounts,
 } from "@shared/notification-center";
-import { and, eq, inArray, type SQL, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
-import { chatRoomMembers, chatRooms, narrators, narratorToolCalls, users } from "../db/schema";
+import { chapters, narrators, projects, users } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { canReadNarrator } from "./narrator-acl";
+import { notificationMarkReadSchema } from "../lib/validators/notifications";
+import { narratorReadableWhere } from "./narrator-acl";
 
-// Re-export the shared contract so routes/tests can import from this service.
 export type {
-	NotificationDisplayStatus,
 	NotificationKind,
 	NotificationLink,
 	NotificationListItem,
 	NotificationListPage,
 	NotificationPersistentStatus,
+	NotificationSourceState,
 	NotificationUnreadCounts,
 } from "@shared/notification-center";
 export {
@@ -61,137 +39,111 @@ export {
 	NOTIFICATION_LIST_DEFAULT_LIMIT,
 	NOTIFICATION_LIST_MAX_LIMIT,
 	NOTIFICATION_PREVIEW_MAX_LENGTH,
+	NOTIFICATION_RETENTION_MAX_AGE_MS,
+	NOTIFICATION_RETENTION_MAX_ROWS,
 	NOTIFICATION_UNREAD_COUNT_CAP,
 } from "@shared/notification-center";
 
-/** Title clamp at write time (bounded display string; not in shared §3.4). */
 export const NOTIFICATION_TITLE_MAX_LENGTH = 200;
-
-/**
- * Retention constants (§4.1). Cleanup is intentionally NOT run on the request
- * path — background job TODO when the surrounding job infrastructure is chosen.
- */
-export const NOTIFICATION_RETENTION_MAX_ROWS = 500;
-export const NOTIFICATION_RETENTION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
-
-// ─── Change hook (package D / WS) ───────────────────────────────────────────
-//
-// event-bus is not in this package's file ownership. D (or a later integration
-// pass) can subscribe here; payload stays empty of titles/previews by design.
+export const NOTIFICATION_SQL_BATCH_SIZE = 200;
 
 export interface NotificationCenterChangeEvent {
 	userId: string;
 	kinds?: NotificationKind[];
 }
 
-type NotificationCenterChangeListener = (event: NotificationCenterChangeEvent) => void;
-const changeListeners = new Set<NotificationCenterChangeListener>();
-
-/** Subscribe to notification-center mutations. Returns an unsubscribe fn. */
+/** Compatibility subscription, backed exclusively by the existing event bus. */
 export function onNotificationCenterChanged(
-	listener: NotificationCenterChangeListener,
+	listener: (event: NotificationCenterChangeEvent) => void,
 ): () => void {
-	changeListeners.add(listener);
-	return () => changeListeners.delete(listener);
+	eventBus.on(NOTIFICATION_CENTER_CHANGED_WS_TYPE, listener);
+	return () => eventBus.off(NOTIFICATION_CENTER_CHANGED_WS_TYPE, listener);
 }
 
-function notifyChanged(userId: string, kinds?: NotificationKind[]): void {
-	for (const listener of changeListeners) {
-		try {
-			listener({ userId, kinds });
-		} catch (err) {
-			logger.warn("notification-center: change listener failed", {
-				userId,
-				error: String(err),
-			});
-		}
-	}
+export function notifyNotificationCenterChanged(userId: string, kinds?: NotificationKind[]): void {
+	eventBus.emit({ type: NOTIFICATION_CENTER_CHANGED_WS_TYPE, userId, kinds });
 }
-
-// ─── Pure helpers (exported for unit tests) ─────────────────────────────────
 
 export function clampNotificationText(value: string | null | undefined, maxLength: number): string {
 	const text = typeof value === "string" ? value : "";
 	if (maxLength <= 0) return "";
-	if (text.length <= maxLength) return text;
-	// Keep a visible ellipsis when truncating so UI previews stay honest
-	// (fan-out may already have produced a max-length string ending in `…`).
-	if (maxLength === 1) return "…";
-	return `${text.slice(0, maxLength - 1)}…`;
+	return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
 }
 
-export function encodeNotificationCursor(createdAt: number, id: string): string {
-	return Buffer.from(`${createdAt}:${id}`, "utf8").toString("base64url");
+interface NotificationCursor {
+	createdAt: number;
+	id: string;
+	kind: NotificationKind | null;
+	status: "unread" | "all";
 }
 
-export function decodeNotificationCursor(cursor: string): { createdAt: number; id: string } {
-	if (!cursor || cursor.length > 512 || !/^[A-Za-z0-9_-]+$/.test(cursor)) {
-		throw new ValidationError("Invalid notification cursor");
-	}
-	let raw: string;
+export function encodeNotificationCursor(
+	createdAt: number,
+	id: string,
+	kind: NotificationKind | null = null,
+	status: "unread" | "all" = "all",
+): string {
+	return Buffer.from(JSON.stringify({ createdAt, id, kind, status })).toString("base64url");
+}
+
+export function decodeNotificationCursor(cursor: string): NotificationCursor {
 	try {
-		raw = Buffer.from(cursor, "base64url").toString("utf8");
+		if (!cursor || cursor.length > 512 || !/^[A-Za-z0-9_-]+$/.test(cursor)) throw new Error();
+		const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+		if (
+			!value ||
+			Object.keys(value).sort().join(",") !== "createdAt,id,kind,status" ||
+			!Number.isSafeInteger(value.createdAt) ||
+			value.createdAt < 0 ||
+			!isId(value.id) ||
+			(value.kind !== null && !isNotificationKind(value.kind)) ||
+			(value.status !== "all" && value.status !== "unread")
+		)
+			throw new Error();
+		return value;
 	} catch {
 		throw new ValidationError("Invalid notification cursor");
 	}
-	const sep = raw.indexOf(":");
-	if (sep <= 0 || sep === raw.length - 1) {
-		throw new ValidationError("Invalid notification cursor");
-	}
-	const createdAt = Number(raw.slice(0, sep));
-	const id = raw.slice(sep + 1);
-	if (!Number.isFinite(createdAt) || !Number.isInteger(createdAt) || createdAt < 0 || !id) {
-		throw new ValidationError("Invalid notification cursor");
-	}
-	return { createdAt, id };
+}
+
+function isId(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && value.length <= 64;
 }
 
 export function parseNotificationLink(raw: unknown): NotificationLink {
-	if (!raw || typeof raw !== "object") {
-		return { type: "narrator" };
+	if (!raw || typeof raw !== "object") return { type: "unavailable" };
+	const value = raw as Record<string, unknown>;
+	if (value.type === "chat_room" && isId(value.roomId)) {
+		return { type: "chat_room", roomId: value.roomId };
 	}
-	const obj = raw as Record<string, unknown>;
-	if (obj.type === "chat_room" && typeof obj.roomId === "string") {
-		return { type: "chat_room", roomId: obj.roomId };
+	if (value.type === "narrator" && isId(value.narratorId)) {
+		return { type: "narrator", narratorId: value.narratorId };
 	}
-	if (obj.type === "narrator" && typeof obj.narratorId === "string") {
-		return { type: "narrator", narratorId: obj.narratorId };
-	}
-	if (typeof obj.roomId === "string" && obj.roomId) {
-		return { type: "chat_room", roomId: obj.roomId };
-	}
-	if (typeof obj.narratorId === "string" && obj.narratorId) {
-		return { type: "narrator", narratorId: obj.narratorId };
-	}
-	return { type: "narrator" };
+	return { type: "unavailable" };
 }
 
 function isNotificationKind(value: unknown): value is NotificationKind {
 	return value === "chat_message" || value === "permission_request";
 }
 
-function isPersistentStatus(value: unknown): value is NotificationPersistentStatus {
-	return value === "unread" || value === "read";
+function chunks<T>(items: T[]): T[][] {
+	const result: T[][] = [];
+	for (let offset = 0; offset < items.length; offset += NOTIFICATION_SQL_BATCH_SIZE) {
+		result.push(items.slice(offset, offset + NOTIFICATION_SQL_BATCH_SIZE));
+	}
+	return result;
 }
 
-function andAll(parts: SQL[]): SQL {
-	if (parts.length === 1) return parts[0];
-	return parts.reduce((acc, part) => sql`${acc} AND ${part}`);
+function boundIds(ids: string[]) {
+	return sql.join(
+		ids.map((id) => sql`${id}`),
+		sql`, `,
+	);
 }
-
-function inIds(ids: string[]): SQL {
-	return sql`id IN (${ids.map((id) => sql`${id}`).reduce((acc, part) => sql`${acc}, ${part}`)})`;
-}
-
-// ─── Row shapes (physical columns) ──────────────────────────────────────────
 
 interface NotificationRow {
 	id: string;
-	user_id: string;
-	kind: string;
-	project_id: string | null;
-	chapter_id: string | null;
-	narrator_id: string | null;
+	kind: NotificationKind;
 	title: string;
 	preview: string;
 	link_json: string;
@@ -201,36 +153,37 @@ interface NotificationRow {
 	read_at: number | null;
 }
 
-function rowToListBase(row: NotificationRow): NotificationListItem {
-	let link: NotificationLink = { type: "narrator" };
-	try {
-		link = parseNotificationLink(JSON.parse(row.link_json));
-	} catch {
-		link = { type: "narrator" };
-	}
-	const kind: NotificationKind = isNotificationKind(row.kind) ? row.kind : "chat_message";
-	const status: NotificationPersistentStatus = isPersistentStatus(row.status)
-		? row.status
-		: "unread";
-	return {
-		id: row.id,
-		kind,
-		projectId: row.project_id ?? null,
-		chapterId: row.chapter_id ?? null,
-		narratorId: row.narrator_id ?? null,
-		title: row.title ?? "",
-		preview: row.preview ?? "",
-		link,
-		sourceKey: row.source_key,
-		status,
-		// Overwritten by resolveDisplayStatus for each page item.
-		displayStatus: status,
-		createdAt: Number(row.created_at) || 0,
-		readAt: row.read_at == null ? null : Number(row.read_at),
-	};
+/** Always select the event window BEFORE kind/status filters. No request catches up old backlog. */
+async function loadWindow(userId: string, now: number): Promise<NotificationRow[]> {
+	return db.all<NotificationRow>(sql`
+		SELECT id, kind, title, preview, link_json, source_key, status, created_at, read_at
+		FROM notifications WHERE user_id = ${userId}
+		AND created_at >= ${now - NOTIFICATION_RETENTION_MAX_AGE_MS}
+		ORDER BY created_at DESC, id DESC LIMIT ${NOTIFICATION_RETENTION_MAX_ROWS}
+	`);
 }
 
-// ─── recordNotifications ────────────────────────────────────────────────────
+function rowBase(row: NotificationRow): NotificationListItem {
+	return {
+		id: row.id,
+		groupKey: `notification:${row.id}`,
+		notificationIds: [row.id],
+		kind: row.kind,
+		projectId: null,
+		chapterId: null,
+		narratorId: null,
+		projectTitle: null,
+		chapterTitle: null,
+		title: "",
+		preview: "",
+		link: { type: "unavailable" },
+		sourceKey: null,
+		sourceState: "gone",
+		createdAt: row.created_at,
+		readAt: row.read_at ?? (row.status === "read" ? row.created_at : null),
+		groupSize: 1,
+	};
+}
 
 export interface RecordNotificationInput {
 	userId: string;
@@ -245,369 +198,238 @@ export interface RecordNotificationInput {
 	createdAt?: number;
 }
 
-/**
- * Bounded fan-out insert. Duplicate `(userId, kind, sourceKey)` rows are
- * ignored. Failures are logged and swallowed so a notification write can never
- * roll back the source chat/permission transaction.
- */
+/** Best-effort projection: storage or downstream listener failures never undo the source write. */
 export async function recordNotifications(inputs: RecordNotificationInput[]): Promise<void> {
 	if (!Array.isArray(inputs) || inputs.length === 0) return;
-
-	const bounded = inputs.slice(0, NOTIFICATION_FANOUT_MAX_RECIPIENTS);
 	if (inputs.length > NOTIFICATION_FANOUT_MAX_RECIPIENTS) {
-		logger.warn("notification-center: fan-out truncated", {
-			requested: inputs.length,
-			limit: NOTIFICATION_FANOUT_MAX_RECIPIENTS,
-		});
+		logger.warn("notification-center: fan-out truncated", { requested: inputs.length });
 	}
-
-	const touchedUsers = new Map<string, Set<NotificationKind>>();
-
-	for (const input of bounded) {
-		if (!input?.userId || !input.sourceKey || !isNotificationKind(input.kind)) continue;
+	const touched = new Map<string, Set<NotificationKind>>();
+	for (const input of inputs.slice(0, NOTIFICATION_FANOUT_MAX_RECIPIENTS)) {
+		if (!input || !isId(input.userId) || !isId(input.sourceKey) || !isNotificationKind(input.kind))
+			continue;
 		try {
-			const id = generateId();
-			const createdAt = Number.isFinite(input.createdAt)
-				? Math.floor(input.createdAt as number)
-				: Date.now();
-			const title = clampNotificationText(input.title, NOTIFICATION_TITLE_MAX_LENGTH);
-			const preview = clampNotificationText(input.preview, NOTIFICATION_PREVIEW_MAX_LENGTH);
-			const linkJson = JSON.stringify(
-				input.link && typeof input.link === "object" ? input.link : { type: "narrator" },
-			);
-			const narratorId =
-				input.narratorId ??
-				(input.link && input.link.type === "narrator" ? input.link.narratorId : null) ??
-				null;
-
-			const insertResult = await db.run(sql`
+			const link = parseNotificationLink(input.link);
+			const createdAt =
+				Number.isSafeInteger(input.createdAt) && (input.createdAt as number) >= 0
+					? (input.createdAt as number)
+					: Date.now();
+			db.run(sql`
 				INSERT INTO notifications (
 					id, user_id, kind, project_id, chapter_id, narrator_id,
 					title, preview, link_json, source_key, status, created_at, read_at
 				) VALUES (
-					${id},
-					${input.userId},
-					${input.kind},
-					${input.projectId ?? null},
-					${input.chapterId ?? null},
-					${narratorId},
-					${title},
-					${preview},
-					${linkJson},
-					${input.sourceKey},
-					'unread',
-					${createdAt},
-					NULL
-				)
-				ON CONFLICT (user_id, kind, source_key) DO NOTHING
+					${generateId()}, ${input.userId}, ${input.kind},
+					${isId(input.projectId) ? input.projectId : null},
+					${isId(input.chapterId) ? input.chapterId : null},
+					${link.type === "narrator" ? link.narratorId : null},
+					${clampNotificationText(input.title, NOTIFICATION_TITLE_MAX_LENGTH)},
+					${clampNotificationText(input.preview, NOTIFICATION_PREVIEW_MAX_LENGTH)},
+					${JSON.stringify(link)}, ${input.sourceKey}, 'unread', ${createdAt}, NULL
+				) ON CONFLICT (user_id, kind, source_key) DO NOTHING
 			`);
-
-			// Dedup replay must not wake clients: only a real insert changes unread.
-			const inserted = typeof insertResult?.changes === "number" ? insertResult.changes > 0 : true;
-			if (!inserted) continue;
-
-			let kinds = touchedUsers.get(input.userId);
-			if (!kinds) {
-				kinds = new Set();
-				touchedUsers.set(input.userId, kinds);
+			if ((db.all<{ count: number }>(sql`SELECT changes() AS count`)[0]?.count ?? 0) > 0) {
+				const kinds = touched.get(input.userId) ?? new Set<NotificationKind>();
+				kinds.add(input.kind);
+				touched.set(input.userId, kinds);
 			}
-			kinds.add(input.kind);
-		} catch (err) {
-			// Never rethrow: fan-out must not fail the source write.
+		} catch (error) {
 			logger.warn("notification-center: record failed", {
 				userId: input.userId,
-				kind: input.kind,
-				sourceKey: input.sourceKey,
-				error: err instanceof Error ? err.message : String(err),
+				error: String(error),
 			});
 		}
 	}
-
-	for (const [userId, kinds] of touchedUsers) {
-		notifyChanged(userId, [...kinds]);
-	}
+	for (const [userId, kinds] of touched) notifyNotificationCenterChanged(userId, [...kinds]);
 }
 
-// ─── displayStatus derivation ───────────────────────────────────────────────
-
-async function resolvePrincipalFor(userId: string): Promise<{ userId: string; isAdmin: boolean }> {
-	try {
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { role: true },
-		});
-		return { userId, isAdmin: row?.role === "admin" };
-	} catch {
-		return { userId, isAdmin: false };
-	}
+interface MessageSource {
+	id: string;
+	roomId: string;
+	seq: number;
+	deletedAt: string | null;
+	roomKind: string;
+	lastReadSeq: number | null;
+	lastReadAt: string | null;
 }
 
-async function canUserReadNarratorId(
-	userId: string,
-	narratorId: string,
-	isAdmin: boolean,
-): Promise<boolean> {
-	if (!narratorId) return false;
-	try {
-		const row = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-		});
-		if (!row) return false;
-		return await canReadNarrator(row, { userId, isAdmin });
-	} catch {
-		return false;
+/** PK lookups with membership joined by (room_id,user_id); never reads message bodies. */
+async function loadMessageSources(rows: NotificationRow[], userId: string) {
+	const result = new Map<string, MessageSource>();
+	const ids = rows.filter((row) => row.kind === "chat_message").map((row) => row.source_key);
+	for (const batch of chunks([...new Set(ids)])) {
+		const found = db.all<MessageSource>(sql`
+			SELECT m.id, m.room_id AS roomId, m.seq, m.deleted_at AS deletedAt,
+			       r.kind AS roomKind, member.last_read_seq AS lastReadSeq,
+			       member.last_read_at AS lastReadAt
+			FROM chat_messages m INNER JOIN chat_rooms r ON r.id = m.room_id
+			LEFT JOIN chat_room_members member ON member.room_id = r.id AND member.user_id = ${userId}
+			WHERE m.id IN (${boundIds(batch)}) LIMIT ${NOTIFICATION_SQL_BATCH_SIZE}
+		`);
+		for (const row of found) result.set(row.id, row);
 	}
+	return result;
 }
 
-async function canUserReadChatRoomId(
-	userId: string,
-	roomId: string,
-	isAdmin: boolean,
-): Promise<boolean> {
-	if (!roomId) return false;
-	try {
-		const room = await db.query.chatRooms.findFirst({
-			where: eq(chatRooms.id, roomId),
-		});
-		if (!room) return false;
-		if (room.kind === "dm") {
-			const membership = await db.query.chatRoomMembers.findFirst({
-				where: sql`${chatRoomMembers.roomId} = ${roomId} AND ${chatRoomMembers.userId} = ${userId}`,
-			});
-			return Boolean(membership);
-		}
-		if (!room.narratorId) return false;
-		return canUserReadNarratorId(userId, room.narratorId, isAdmin);
-	} catch {
-		return false;
-	}
+interface PermissionSource {
+	id: string;
+	narratorId: string;
+	status: string;
+	decidedBy: string | null;
+	decidedAt: string | null;
 }
 
-/**
- * Derive display status for one row against its source system.
- * Bounded: at most a handful of point lookups per list item.
- */
-async function resolveDisplayStatus(
-	base: NotificationListItem,
-	principal: { userId: string; isAdmin: boolean },
-): Promise<NotificationListItem> {
-	const dbStatus = base.status;
+async function deriveActivities(userId: string, now: number): Promise<NotificationListItem[]> {
+	const started = performance.now();
+	const rows = await loadWindow(userId, now);
+	const messages = await loadMessageSources(rows, userId);
+	const tools = new Map<string, PermissionSource>();
+	const toolIds = rows
+		.filter((row) => row.kind === "permission_request")
+		.map((row) => row.source_key);
+	for (const batch of chunks([...new Set(toolIds)])) {
+		const found = db.all<PermissionSource>(sql`
+			SELECT id, narrator_id AS narratorId, status,
+			permission_decided_by AS decidedBy, permission_decided_at AS decidedAt
+			FROM narrator_tool_calls WHERE id IN (${boundIds(batch)}) LIMIT ${NOTIFICATION_SQL_BATCH_SIZE}
+		`);
+		for (const tool of found) tools.set(tool.id, tool);
+	}
 
-	if (base.kind === "permission_request") {
-		const sourceKey = base.sourceKey;
-		let tool: {
-			id: string;
+	const principal = await db.query.users.findFirst({
+		where: eq(users.id, userId),
+		columns: { role: true },
+	});
+	const contexts = new Map<
+		string,
+		{
 			narratorId: string;
-			status: string;
-			permissionDecidedBy: string | null;
-		} | null = null;
-		try {
-			const found = await db.query.narratorToolCalls.findFirst({
-				where: eq(narratorToolCalls.id, sourceKey),
-				columns: {
-					id: true,
-					narratorId: true,
-					status: true,
-					permissionDecidedBy: true,
-				},
-			});
-			tool = found ?? null;
-		} catch {
-			tool = null;
+			chapterId: string | null;
+			chapterTitle: string | null;
+			projectId: string | null;
+			projectTitle: string | null;
 		}
-
-		if (!tool) {
-			return { ...base, displayStatus: "gone", sourceAlive: false };
-		}
-
-		const narratorId = base.narratorId ?? tool.narratorId;
-		const readable = await canUserReadNarratorId(principal.userId, narratorId, principal.isAdmin);
-		if (!readable) {
-			return { ...base, displayStatus: "gone", sourceAlive: false };
-		}
-
-		// "Still pending" = persisted status pending and no decision recorded.
-		// Live in-memory pendingPermissions are covered when C hooks offer-time
-		// insert; list-time derivation stays on the durable tool-call row.
-		const stillPending = tool.status === "pending" && !tool.permissionDecidedBy;
-		if (!stillPending) {
-			// Narrator is still readable (checked above). Resolved ≠ gone: keep the
-			// row navigable so click can open the session and clear unread (review M1).
-			return { ...base, displayStatus: "resolved", sourceAlive: true };
-		}
-		return { ...base, displayStatus: dbStatus, sourceAlive: true };
+	>();
+	for (const batch of chunks([...new Set([...tools.values()].map((tool) => tool.narratorId))])) {
+		const found = await db
+			.select({
+				narratorId: narrators.id,
+				chapterId: chapters.id,
+				chapterTitle: sql<
+					string | null
+				>`substr(${chapters.title}, 1, ${NOTIFICATION_TITLE_MAX_LENGTH})`,
+				projectId: projects.id,
+				projectTitle: sql<
+					string | null
+				>`substr(${projects.name}, 1, ${NOTIFICATION_TITLE_MAX_LENGTH})`,
+			})
+			.from(narrators)
+			.leftJoin(chapters, eq(chapters.id, narrators.chapterId))
+			.leftJoin(
+				projects,
+				eq(projects.id, sql`coalesce(${chapters.projectId}, ${narrators.contextProjectId})`),
+			)
+			.where(
+				and(
+					inArray(narrators.id, batch),
+					narratorReadableWhere({ userId, isAdmin: principal?.role === "admin" }),
+				),
+			)
+			.limit(NOTIFICATION_SQL_BATCH_SIZE);
+		for (const context of found) contexts.set(context.narratorId, context);
 	}
 
-	// chat_message
-	const roomId = base.link.type === "chat_room" && base.link.roomId ? base.link.roomId : null;
-	if (!roomId) {
-		return { ...base, displayStatus: "gone", sourceAlive: false };
-	}
-	const readable = await canUserReadChatRoomId(principal.userId, roomId, principal.isAdmin);
-	if (!readable) {
-		return { ...base, displayStatus: "gone", sourceAlive: false };
-	}
-	return { ...base, displayStatus: dbStatus };
-}
-
-/**
- * Derive display status for a whole list page with bounded batch lookups.
- *
- * Review M3: a page of up to 50 rows used to issue 2–4 point queries each.
- * We preload tool calls / narrators / chat rooms / DM memberships for the
- * unique ids on the page, then derive in memory. ACL still goes through
- * `canReadNarrator` per unique narrator (same authorization code path).
- * Falls back to per-row resolution if a batch query fails.
- */
-async function resolveDisplayStatusBatch(
-	bases: NotificationListItem[],
-	principal: { userId: string; isAdmin: boolean },
-): Promise<NotificationListItem[]> {
-	if (bases.length === 0) return [];
-
-	try {
-		const toolIds = [
-			...new Set(bases.filter((b) => b.kind === "permission_request").map((b) => b.sourceKey)),
-		];
-		const toolById = new Map<
-			string,
-			{
-				id: string;
-				narratorId: string;
-				status: string;
-				permissionDecidedBy: string | null;
-			}
-		>();
-		if (toolIds.length > 0) {
-			const found = await db
-				.select({
-					id: narratorToolCalls.id,
-					narratorId: narratorToolCalls.narratorId,
-					status: narratorToolCalls.status,
-					permissionDecidedBy: narratorToolCalls.permissionDecidedBy,
-				})
-				.from(narratorToolCalls)
-				.where(inArray(narratorToolCalls.id, toolIds));
-			for (const row of found) toolById.set(row.id, row);
-		}
-
-		const roomIds = new Set<string>();
-		for (const base of bases) {
-			if (base.kind === "chat_message" && base.link.type === "chat_room" && base.link.roomId) {
-				roomIds.add(base.link.roomId);
-			}
-		}
-
-		const roomById = new Map<string, { id: string; kind: string; narratorId: string | null }>();
-		const narratorIdSet = new Set<string>();
-		for (const base of bases) {
-			if (base.narratorId) narratorIdSet.add(base.narratorId);
-		}
-		for (const tool of toolById.values()) {
-			if (tool.narratorId) narratorIdSet.add(tool.narratorId);
-		}
-		if (roomIds.size > 0) {
-			const rooms = await db
-				.select({
-					id: chatRooms.id,
-					kind: chatRooms.kind,
-					narratorId: chatRooms.narratorId,
-				})
-				.from(chatRooms)
-				.where(inArray(chatRooms.id, [...roomIds]));
-			for (const room of rooms) {
-				roomById.set(room.id, room);
-				if (room.narratorId) narratorIdSet.add(room.narratorId);
-			}
-		}
-
-		const narratorById = new Map<string, Parameters<typeof canReadNarrator>[0]>();
-		if (narratorIdSet.size > 0) {
-			const rows = await db
-				.select()
-				.from(narrators)
-				.where(inArray(narrators.id, [...narratorIdSet]));
-			for (const row of rows) narratorById.set(row.id, row);
-		}
-
-		const readableNarrator = new Map<string, boolean>();
-		for (const [id, row] of narratorById) {
+	// Internal room identity is never serialized for inaccessible/deleted sources.
+	const grouped = new Map<string, NotificationListItem[]>();
+	for (const row of rows) {
+		const item = rowBase(row);
+		let key = item.groupKey;
+		if (row.kind === "chat_message") {
+			const source = messages.get(row.source_key);
+			let storedLink: NotificationLink = { type: "unavailable" };
 			try {
-				readableNarrator.set(id, await canReadNarrator(row, principal));
+				storedLink = parseNotificationLink(JSON.parse(row.link_json));
 			} catch {
-				readableNarrator.set(id, false);
+				/* fail closed */
+			}
+			if (
+				source?.roomKind === "dm" &&
+				source.lastReadSeq !== null &&
+				storedLink.type === "chat_room" &&
+				storedLink.roomId === source.roomId
+			) {
+				key = `chat_room:${source.roomId}`;
+				if (!source.deletedAt) {
+					Object.assign(item, {
+						title: row.title,
+						preview: row.preview,
+						sourceKey: row.source_key,
+						sourceState: "active",
+						link: { type: "chat_room", roomId: source.roomId },
+						groupKey: key,
+					});
+					if (item.readAt === null && source.seq <= source.lastReadSeq) {
+						const readAt = source.lastReadAt ? Date.parse(source.lastReadAt) : NaN;
+						item.readAt = Number.isFinite(readAt) ? readAt : row.created_at;
+					}
+				}
+			}
+		} else if (row.kind === "permission_request") {
+			const tool = tools.get(row.source_key);
+			const context = tool && contexts.get(tool.narratorId);
+			if (tool && context) {
+				Object.assign(item, context, {
+					title: row.title,
+					preview: row.preview,
+					sourceKey: row.source_key,
+					sourceState:
+						tool.status === "pending" && !tool.decidedBy && !tool.decidedAt ? "active" : "resolved",
+					link: { type: "narrator", narratorId: tool.narratorId },
+				});
 			}
 		}
-
-		const memberRoomIds = new Set<string>();
-		if (roomIds.size > 0) {
-			const memberships = await db
-				.select({ roomId: chatRoomMembers.roomId })
-				.from(chatRoomMembers)
-				.where(
-					and(
-						eq(chatRoomMembers.userId, principal.userId),
-						inArray(chatRoomMembers.roomId, [...roomIds]),
-					),
-				);
-			for (const m of memberships) memberRoomIds.add(m.roomId);
-		}
-
-		const isNarratorReadable = (narratorId: string | null | undefined): boolean => {
-			if (!narratorId) return false;
-			return readableNarrator.get(narratorId) ?? false;
-		};
-
-		return bases.map((base) => {
-			if (base.kind === "permission_request") {
-				const tool = toolById.get(base.sourceKey);
-				if (!tool) {
-					return { ...base, displayStatus: "gone" as const, sourceAlive: false };
-				}
-				const narratorId = base.narratorId ?? tool.narratorId;
-				if (!isNarratorReadable(narratorId)) {
-					return { ...base, displayStatus: "gone" as const, sourceAlive: false };
-				}
-				const stillPending = tool.status === "pending" && !tool.permissionDecidedBy;
-				if (!stillPending) {
-					return { ...base, displayStatus: "resolved" as const, sourceAlive: true };
-				}
-				return { ...base, displayStatus: base.status, sourceAlive: true };
-			}
-
-			const roomId = base.link.type === "chat_room" && base.link.roomId ? base.link.roomId : null;
-			if (!roomId) {
-				return { ...base, displayStatus: "gone" as const, sourceAlive: false };
-			}
-			const room = roomById.get(roomId);
-			if (!room) {
-				return { ...base, displayStatus: "gone" as const, sourceAlive: false };
-			}
-			if (room.kind === "dm") {
-				if (!memberRoomIds.has(roomId)) {
-					return { ...base, displayStatus: "gone" as const, sourceAlive: false };
-				}
-			} else {
-				if (!room.narratorId || !isNarratorReadable(room.narratorId)) {
-					return { ...base, displayStatus: "gone" as const, sourceAlive: false };
-				}
-			}
-			return { ...base, displayStatus: base.status };
-		});
-	} catch (err) {
-		logger.warn("notification-center: batch displayStatus failed, falling back", {
-			error: err instanceof Error ? err.message : String(err),
-			size: bases.length,
-		});
-		const out: NotificationListItem[] = [];
-		for (const base of bases) {
-			out.push(await resolveDisplayStatus(base, principal));
-		}
-		return out;
+		const members = grouped.get(key) ?? [];
+		members.push(item);
+		grouped.set(key, members);
 	}
+	const activities = [...grouped.values()].map((members) => {
+		const valid = members.filter((item) => item.sourceState !== "gone");
+		const visible = valid.length ? valid : members;
+		// Preview order is the source sequence, not notification insertion order: projections
+		// may arrive out of order. Keep the event ordering anchor separate for pagination.
+		const representative = visible.reduce((latest, item) => {
+			const seq = item.sourceKey ? (messages.get(item.sourceKey)?.seq ?? 0) : 0;
+			const latestSeq = latest.sourceKey ? (messages.get(latest.sourceKey)?.seq ?? 0) : 0;
+			return seq > latestSeq ? item : latest;
+		});
+		const anchor = members[0];
+		return {
+			...representative,
+			id: anchor.id,
+			createdAt: anchor.createdAt,
+			groupKey:
+				representative.sourceState === "gone"
+					? `notification:${anchor.id}`
+					: representative.groupKey,
+			notificationIds: members.flatMap((item) => item.notificationIds),
+			groupSize: members.length,
+			readAt: visible.some((item) => item.readAt === null)
+				? null
+				: Math.max(...visible.map((item) => item.readAt as number)),
+		};
+	});
+	const elapsedMs = performance.now() - started;
+	if (elapsedMs > 25)
+		logger.warn("notification-center: slow activity projection", {
+			userId,
+			elapsedMs,
+			events: rows.length,
+			groups: activities.length,
+		});
+	return activities.sort(
+		(a, b) => b.createdAt - a.createdAt || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
+	);
 }
-
-// ─── listNotifications ──────────────────────────────────────────────────────
 
 export async function listNotifications(params: {
 	userId: string;
@@ -616,211 +438,138 @@ export async function listNotifications(params: {
 	cursor?: string | null;
 	limit?: number;
 }): Promise<NotificationListPage> {
-	const userId = params.userId;
-	if (!userId) throw new ValidationError("userId is required");
-
+	if (!isId(params.userId)) throw new ValidationError("userId is required");
+	if (params.kind !== undefined && !isNotificationKind(params.kind))
+		throw new ValidationError("Invalid notification kind");
+	if (params.status !== undefined && params.status !== "all" && params.status !== "unread")
+		throw new ValidationError("Invalid notification status");
 	const limit = Math.min(
-		Math.max(1, Math.floor(params.limit ?? NOTIFICATION_LIST_DEFAULT_LIMIT)),
 		NOTIFICATION_LIST_MAX_LIMIT,
+		Math.max(1, Math.floor(params.limit ?? NOTIFICATION_LIST_DEFAULT_LIMIT)),
 	);
-	const kindFilter = isNotificationKind(params.kind) ? params.kind : null;
-	const unreadOnly = params.status === "unread";
-	const cursor = params.cursor ? decodeNotificationCursor(params.cursor) : null;
-
-	// Keyset pagination on (created_at DESC, id DESC). Fetch limit+1 to learn
-	// whether another page exists without a COUNT.
-	const fetchLimit = limit + 1;
-
-	const filters: SQL[] = [sql`user_id = ${userId}`];
-	if (kindFilter) filters.push(sql`kind = ${kindFilter}`);
-	if (unreadOnly) filters.push(sql`status = 'unread'`);
-	if (cursor) {
-		filters.push(
-			sql`(created_at < ${cursor.createdAt} OR (created_at = ${cursor.createdAt} AND id < ${cursor.id}))`,
-		);
-	}
-	const where = andAll(filters);
-
-	const result = await db.all(sql`
-		SELECT id, user_id, kind, project_id, chapter_id, narrator_id,
-		       title, preview, link_json, source_key, status, created_at, read_at
-		FROM notifications
-		WHERE ${where}
-		ORDER BY created_at DESC, id DESC
-		LIMIT ${fetchLimit}
-	`);
-	const rows = ((result as unknown as NotificationRow[]) ?? []).filter(
-		(r) => r && typeof r.id === "string",
+	if (!Number.isFinite(limit)) throw new ValidationError("Invalid notification limit");
+	const kind = params.kind ?? null;
+	const status = params.status ?? "all";
+	const cursor = params.cursor != null ? decodeNotificationCursor(params.cursor) : null;
+	if (cursor && (cursor.kind !== kind || cursor.status !== status))
+		throw new ValidationError("Notification cursor filter mismatch");
+	const asOf = Date.now();
+	const activities = (await deriveActivities(params.userId, asOf)).filter(
+		(item) =>
+			(!kind || item.kind === kind) &&
+			(status !== "unread" || item.readAt === null) &&
+			(!cursor ||
+				item.createdAt < cursor.createdAt ||
+				(item.createdAt === cursor.createdAt && item.id < cursor.id)),
 	);
-
-	const hasMore = rows.length > limit;
-	const pageRows = hasMore ? rows.slice(0, limit) : rows;
-
-	const principal = await resolvePrincipalFor(userId);
-	const bases = pageRows.map((row) => rowToListBase(row));
-	const items = await resolveDisplayStatusBatch(bases, principal);
-
-	const last = pageRows[pageRows.length - 1];
-	const nextCursor =
-		hasMore && last ? encodeNotificationCursor(Number(last.created_at), last.id) : null;
-
-	return { items, nextCursor };
-}
-
-// ─── getUnreadCounts ────────────────────────────────────────────────────────
-
-async function probeUnreadCount(
-	userId: string,
-	kind: NotificationKind | null,
-): Promise<{ count: number; capped: boolean }> {
-	const cap = NOTIFICATION_UNREAD_COUNT_CAP;
-	const limit = cap + 1;
-	const filters: SQL[] = [sql`user_id = ${userId}`, sql`status = 'unread'`];
-	if (kind) filters.push(sql`kind = ${kind}`);
-	const where = andAll(filters);
-
-	const rows = await db.all(sql`
-		SELECT id FROM notifications
-		WHERE ${where}
-		ORDER BY created_at DESC, id DESC
-		LIMIT ${limit}
-	`);
-	const n = Array.isArray(rows) ? rows.length : 0;
-	return { count: Math.min(n, cap), capped: n > cap };
-}
-
-export async function getUnreadCounts(userId: string): Promise<NotificationUnreadCounts> {
-	if (!userId) throw new ValidationError("userId is required");
-
-	const totalProbe = await probeUnreadCount(userId, null);
-	const chatProbe = await probeUnreadCount(userId, "chat_message");
-	const permProbe = await probeUnreadCount(userId, "permission_request");
-
-	const lowerBound = totalProbe.capped || chatProbe.capped || permProbe.capped;
+	const items = activities.slice(0, limit);
+	const last = items.at(-1);
 	return {
-		total: totalProbe.count,
-		chat_message: chatProbe.count,
-		permission_request: permProbe.count,
-		...(lowerBound ? { lowerBound: true } : {}),
+		items,
+		asOf,
+		nextCursor:
+			activities.length > limit && last
+				? encodeNotificationCursor(last.createdAt, last.id, kind, status)
+				: null,
 	};
 }
 
-// ─── markNotificationsRead ──────────────────────────────────────────────────
+export async function getUnreadCounts(userId: string): Promise<NotificationUnreadCounts> {
+	if (!isId(userId)) throw new ValidationError("userId is required");
+	const unread = (await deriveActivities(userId, Date.now())).filter(
+		(item) => item.readAt === null && item.sourceState !== "gone",
+	);
+	const conversations = unread.filter(
+		(item) => item.kind === "chat_message" && item.sourceState === "active",
+	).length;
+	return {
+		unreadConversations: Math.min(conversations, NOTIFICATION_UNREAD_COUNT_CAP),
+		unreadActivities: Math.min(unread.length, NOTIFICATION_UNREAD_COUNT_CAP),
+		conversationsLowerBound: conversations > NOTIFICATION_UNREAD_COUNT_CAP,
+		activitiesLowerBound: unread.length > NOTIFICATION_UNREAD_COUNT_CAP,
+	};
+}
 
-/**
- * Owner-scoped, monotonic mark-read.
- * - `ids` present (including `[]`): only those ids; empty array updates nothing.
- * - otherwise optional `before` / `kind` filter over unread rows.
- * Already-read rows are not touched (`status = 'unread'` in the WHERE), so
- * `readAt` stays at the first mark.
- *
- * Uses `RETURNING id` for the updated count so we never run an unbounded
- * `COUNT(*)` after the write (main-thread SQLite rule).
- */
-export async function markNotificationsRead(params: {
-	userId: string;
-	ids?: string[];
-	before?: number;
-	kind?: NotificationKind;
-}): Promise<{ updated: number }> {
-	const userId = params.userId;
-	if (!userId) throw new ValidationError("userId is required");
-
+async function updateReadIds(userId: string, ids: string[]): Promise<{ updated: number }> {
+	let updated = 0;
 	const now = Date.now();
-	const filters: SQL[] = [sql`user_id = ${userId}`, sql`status = 'unread'`];
-
-	if (params.ids !== undefined) {
-		if (!Array.isArray(params.ids) || params.ids.length === 0) {
-			return { updated: 0 };
-		}
-		const idList = params.ids.filter((id) => typeof id === "string" && id.length > 0);
-		if (idList.length === 0) return { updated: 0 };
-		filters.push(inIds(idList));
-	} else {
-		if (params.before !== undefined) {
-			const before = Math.floor(params.before);
-			if (!Number.isFinite(before) || before < 0) {
-				throw new ValidationError("Invalid before timestamp");
-			}
-			filters.push(sql`created_at <= ${before}`);
-		}
-		if (params.kind !== undefined) {
-			if (!isNotificationKind(params.kind)) {
-				throw new ValidationError("Invalid notification kind");
-			}
-			filters.push(sql`kind = ${params.kind}`);
-		}
+	for (const batch of chunks([...new Set(ids)])) {
+		db.run(sql`
+			UPDATE notifications SET status = 'read', read_at = coalesce(read_at, ${now})
+			WHERE user_id = ${userId} AND status = 'unread' AND id IN (${boundIds(batch)})
+		`);
+		updated += db.all<{ count: number }>(sql`SELECT changes() AS count`)[0]?.count ?? 0;
 	}
-
-	const where = andAll(filters);
-	const result = await db.all(sql`
-		UPDATE notifications
-		SET status = 'read', read_at = ${now}
-		WHERE ${where}
-		RETURNING id
-	`);
-	const updated = Array.isArray(result) ? result.length : 0;
-	if (updated > 0) notifyChanged(userId);
+	if (updated > 0) notifyNotificationCenterChanged(userId);
 	return { updated };
 }
 
-// ─── deleteNotification ─────────────────────────────────────────────────────
-
-export async function deleteNotification(userId: string, id: string): Promise<void> {
-	if (!userId || !id) throw new ValidationError("Notification id is required");
-
-	const existing = await db.all(sql`
-		SELECT id, user_id FROM notifications
-		WHERE id = ${id}
-		LIMIT 1
-	`);
-	const row = Array.isArray(existing)
-		? (existing[0] as { id: string; user_id: string } | undefined)
-		: undefined;
-	// Non-owner and missing are both 404 — never confirm existence.
-	if (!row || row.user_id !== userId) {
-		throw new NotFoundError("Notification", id);
-	}
-
-	await db.run(sql`DELETE FROM notifications WHERE id = ${id} AND user_id = ${userId}`);
-	notifyChanged(userId);
+export async function markNotificationsRead(
+	params: MarkNotificationsReadBody & { userId: string },
+): Promise<{ updated: number }> {
+	const { userId, ...body } = params;
+	if (!isId(userId)) throw new ValidationError("userId is required");
+	const parsed = notificationMarkReadSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	if (parsed.data.scope === "items") return updateReadIds(userId, parsed.data.ids);
+	const { before, kind } = parsed.data;
+	const rows = await loadWindow(userId, Date.now());
+	return updateReadIds(
+		userId,
+		rows
+			.filter((row) => row.created_at <= before && (!kind || row.kind === kind))
+			.map((row) => row.id),
+	);
 }
 
-// ─── test helper: ensure physical table ─────────────────────────────────────
+/** Called after source read commits. Query-time derivation still closes insert/read races. */
+export async function syncChatNotificationReads(
+	roomId: string,
+	userId: string,
+	lastReadSeq: number,
+): Promise<{ updated: number }> {
+	if (!isId(roomId) || !isId(userId) || !Number.isSafeInteger(lastReadSeq) || lastReadSeq < 0) {
+		throw new ValidationError("Invalid chat read watermark");
+	}
+	const rows = await loadWindow(userId, Date.now());
+	const messages = await loadMessageSources(rows, userId);
+	return updateReadIds(
+		userId,
+		rows
+			.filter((row) => {
+				const source = messages.get(row.source_key);
+				return (
+					row.kind === "chat_message" && source?.roomId === roomId && source.seq <= lastReadSeq
+				);
+			})
+			.map((row) => row.id),
+	);
+}
 
-/**
- * Create the physical `notifications` table + indexes if missing.
- * Used by unit tests while package A has not yet generated the Drizzle
- * migration. Production migrate path (A) is the long-term source of DDL.
- */
+export async function deleteNotification(userId: string, id: string): Promise<void> {
+	if (!isId(userId) || !isId(id)) throw new ValidationError("Notification id is required");
+	db.run(sql`DELETE FROM notifications WHERE id = ${id} AND user_id = ${userId}`);
+	if (!db.all<{ count: number }>(sql`SELECT changes() AS count`)[0]?.count)
+		throw new NotFoundError("Notification", id);
+	notifyNotificationCenterChanged(userId);
+}
+
+/** Test fixtures only; production DDL is generated from schema.ts. */
 export function ensureNotificationsTableForTests(sqlite: { run(query: string): unknown }): void {
-	sqlite.run(`
-		CREATE TABLE IF NOT EXISTS notifications (
-			id TEXT PRIMARY KEY,
-			user_id TEXT NOT NULL,
-			kind TEXT NOT NULL,
-			project_id TEXT,
-			chapter_id TEXT,
-			narrator_id TEXT,
-			title TEXT NOT NULL DEFAULT '',
-			preview TEXT NOT NULL DEFAULT '',
-			link_json TEXT NOT NULL DEFAULT '{}',
-			source_key TEXT NOT NULL,
-			status TEXT NOT NULL DEFAULT 'unread',
-			created_at INTEGER NOT NULL,
-			read_at INTEGER
-		)
-	`);
-	sqlite.run(`
-		CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_user_kind_source
-		ON notifications(user_id, kind, source_key)
-	`);
-	sqlite.run(`
-		CREATE INDEX IF NOT EXISTS idx_notifications_user_created
-		ON notifications(user_id, created_at)
-	`);
-	sqlite.run(`
-		CREATE INDEX IF NOT EXISTS idx_notifications_user_status_created
-		ON notifications(user_id, status, created_at)
-	`);
+	sqlite.run(`CREATE TABLE IF NOT EXISTS notifications (
+		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, kind TEXT NOT NULL,
+		project_id TEXT, chapter_id TEXT, narrator_id TEXT,
+		title TEXT NOT NULL DEFAULT '', preview TEXT NOT NULL DEFAULT '',
+		link_json TEXT NOT NULL DEFAULT '{}', source_key TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'unread', created_at INTEGER NOT NULL, read_at INTEGER
+	)`);
+	sqlite.run(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_user_kind_source ON notifications(user_id, kind, source_key)`,
+	);
+	sqlite.run(
+		`CREATE INDEX IF NOT EXISTS idx_notifications_user_created_id ON notifications(user_id, created_at, id)`,
+	);
+	sqlite.run(
+		`CREATE INDEX IF NOT EXISTS idx_notifications_user_status_created_id ON notifications(user_id, status, created_at, id)`,
+	);
 }

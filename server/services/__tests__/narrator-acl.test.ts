@@ -366,4 +366,14 @@ describe("listNarratorAudience", () => {
 		if (audience.everyone) throw new Error("unreachable");
 		expect(audience.userIds).toEqual([friendId]);
 	});
+	test("notification audience budget retains the owner without widening default broadcasts", async () => {
+		const id = await makeNarrator({ ownerUserId: ownerId });
+		await grant(id, friendId, "read");
+		await grant(id, strangerId, "read");
+		const row = await rowOf(id);
+		expect(await listNarratorAudience(row, 1)).toEqual({ everyone: false, userIds: [ownerId] });
+		const full = await listNarratorAudience(row);
+		if (full.everyone) throw new Error("private audience widened");
+		expect(new Set(full.userIds)).toEqual(new Set([ownerId, friendId, strangerId]));
+	});
 });

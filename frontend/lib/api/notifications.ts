@@ -1,11 +1,5 @@
-/**
- * Notification Center HTTP client (task package D).
- *
- * Types come from package A's `@shared/notification-center`.
- * Endpoints: list / unread-count / read / delete (spec §4.2).
- */
-
 import type {
+	MarkNotificationsReadBody,
 	NotificationKind,
 	NotificationListPage,
 	NotificationUnreadCounts,
@@ -13,12 +7,13 @@ import type {
 import { request } from "./client";
 
 export type {
-	NotificationDisplayStatus,
+	MarkNotificationsReadBody,
 	NotificationKind,
 	NotificationLink,
 	NotificationListItem,
 	NotificationListPage,
 	NotificationPersistentStatus,
+	NotificationSourceState,
 	NotificationUnreadCounts,
 } from "@shared/notification-center";
 
@@ -29,32 +24,25 @@ export interface ListNotificationsParams {
 	limit?: number;
 }
 
-export interface MarkNotificationsReadBody {
-	ids?: string[];
-	before?: number;
-	kind?: NotificationKind;
-}
-
 export const notificationsApi = {
-	listNotifications: (params?: ListNotificationsParams) => {
+	listNotifications: (params?: ListNotificationsParams, signal?: AbortSignal) => {
 		const search = new URLSearchParams();
 		if (params?.kind) search.set("kind", params.kind);
 		if (params?.status) search.set("status", params.status);
 		if (params?.cursor) search.set("cursor", params.cursor);
 		if (params?.limit != null) search.set("limit", String(params.limit));
 		const query = search.toString();
-		return request<NotificationListPage>(query ? `/notifications?${query}` : "/notifications");
+		return request<NotificationListPage>(query ? `/notifications?${query}` : "/notifications", {
+			signal,
+		});
 	},
-
-	getNotificationUnreadCounts: () =>
-		request<NotificationUnreadCounts>("/notifications/unread-count"),
-
+	getNotificationUnreadCounts: (signal?: AbortSignal) =>
+		request<NotificationUnreadCounts>("/notifications/unread-count", { signal }),
 	markNotificationsRead: (body: MarkNotificationsReadBody) =>
 		request<{ updated: number }>("/notifications/read", {
 			method: "POST",
 			body: JSON.stringify(body),
 		}),
-
 	deleteNotification: (id: string) =>
 		request<void>(`/notifications/${encodeURIComponent(id)}/delete`, { method: "POST" }),
 };

@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { BackgroundTaskType } from "@shared/background-task-list";
+import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
 import type { ApiRequestDiagnostics } from "./agent/types";
 import type { PublicCodexQuotaOverview } from "./codex-manager";
@@ -154,7 +155,7 @@ export type NarraForkEvent =
 	 * would wake every client into a useless empty-list refetch.
 	 */
 	| {
-			type: "notification_center_changed";
+			type: typeof NOTIFICATION_CENTER_CHANGED_WS_TYPE;
 			userId: string;
 			/** Optional kind hints only; never titles/previews/ids of rows. */
 			kinds?: Array<"chat_message" | "permission_request">;

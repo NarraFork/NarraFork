@@ -9,6 +9,7 @@ import type {
 	BackgroundTaskProgressFrame,
 } from "@shared/background-task-list";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
 import type { ProgressPhase } from "@shared/progress-phase";
 import type { NarratorWsSubscriptionLimitError, RecentTabsDelta } from "@shared/recent-tabs";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
@@ -58,14 +59,9 @@ export interface RecentTabsSnapshotMessage {
 export type NarratorServerMessage =
 	/** No narrator identifiers or payloads; clients re-fetch their ACL-filtered inbox. */
 	| { type: "human_attention_changed" }
-	/**
-	 * Per-user notification-center invalidation. Body-free by design (spec §6.1):
-	 * the client marks queries stale / refetches unread-count. String must stay
-	 * aligned with frontend `NOTIFICATION_CENTER_CHANGED_WS_TYPE` until package A
-	 * owns `@shared/notification-center`.
-	 */
+	/** Per-user activity invalidation; no titles, previews or source identifiers. */
 	| {
-			type: "notification_center_changed";
+			type: typeof NOTIFICATION_CENTER_CHANGED_WS_TYPE;
 			kinds?: Array<"chat_message" | "permission_request">;
 	  }
 	| RecentTabsDelta
