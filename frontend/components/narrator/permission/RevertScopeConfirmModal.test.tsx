@@ -1169,5 +1169,36 @@ for (const [language, locale] of Object.entries({ en, "zh-CN": zh })) {
 				expect(confirmations).toEqual([{ skipRevert: true }]);
 			});
 		}
+
+		test("pending_operations names the blocking tool call and keeps file revert disabled", async () => {
+			await i18n.changeLanguage(language);
+			await render({
+				data: completePreview({
+					narratorScope: {
+						available: false,
+						reason: "pending_operations",
+						files: [],
+						conflicts: [],
+					},
+					blockers: [
+						{
+							kind: "running_tool",
+							toolCallId: "tool-call-abcdef12",
+							toolName: "Bash",
+							detail: "bun test --isolate",
+						},
+					],
+				}),
+			});
+			assertUnavailable(locale);
+			expect(document.body.textContent).toContain(locale.revertScopePendingOperations);
+			expect(document.body.textContent).toContain(locale.revertBlockersTitle);
+			expect(document.body.textContent).toContain(locale.revertBlockerKind.running_tool);
+			expect(document.body.textContent).toContain("Bash (tool-cal");
+			expect(document.body.textContent).toContain("bun test --isolate");
+			expect(document.body.textContent).toContain(locale.revertBlockersStopRunning);
+			await click(button(locale.revertScopeUnavailableTitle));
+			expect(confirmations).toEqual([]);
+		});
 	});
 }

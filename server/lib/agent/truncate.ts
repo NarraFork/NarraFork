@@ -128,7 +128,7 @@ function cleanup(): void {
 	}
 	const cutoff = Date.now() - RETENTION_MS;
 	for (const entry of entries) {
-		if (!entry.startsWith("tool_")) continue;
+		if (!entry.startsWith("tool_") && !entry.startsWith("toolcall_")) continue;
 		try {
 			const filepath = join(OUTPUT_DIR, entry);
 			const stat = statSync(filepath);

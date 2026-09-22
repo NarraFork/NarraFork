@@ -1,3 +1,4 @@
+import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, projects } from "../db/schema";
@@ -15,6 +16,7 @@ import {
 import { resolveNarratorSessionCwd } from "./narrator-cwd";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import { narratorService } from "./narrator-service";
+import { resolveSubagentModelForRun } from "./subagent-model";
 
 export interface NarratorHistoryTokenEstimate {
 	promptTokens: number;
@@ -70,10 +72,10 @@ export async function estimateNarratorBuildHistoryTokens(
 		? rawMessages.map((message) => ({ ...message, parentToolUseId: null }))
 		: rawMessages;
 
-	const effectiveModel = resolveEffectiveModel(
-		narrator.model,
-		resolveProvider(narrator.model ?? undefined),
-	);
+	const effectiveModel =
+		narrator.model === FOLLOW_PARENT_MODEL
+			? (await resolveSubagentModelForRun(narrator, narrator.ownerUserId)).model
+			: resolveEffectiveModel(narrator.model, resolveProvider(narrator.model ?? undefined));
 	const resolved = resolveProviderAndModel(effectiveModel, resolveProvider(effectiveModel));
 	const { history } = await buildHistory(dbMessages, resolved.model, resolved.provider, narratorId);
 	const cwd = await resolvePromptCwd({ chapterId: narrator.chapterId, cwd: narrator.cwd });

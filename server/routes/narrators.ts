@@ -8,6 +8,7 @@ import {
 	fileReferenceMessageForDisplay,
 } from "@shared/file-reference";
 import { formatOriginLabel } from "@shared/message-origin";
+import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
@@ -428,6 +429,7 @@ import {
 import { broadcastSpecChanged } from "../services/spec-broadcast";
 import { appendProtectedSpecTask } from "../services/spec-vfs-service";
 import { resolveStandaloneNarratorCwd } from "../services/standalone-narrator-cwd";
+import { resolveSubagentModelForRun } from "../services/subagent-model";
 import { resumeSubagent, withSubagentResumeLock } from "../services/subagent-resume";
 import { TAKEN_OVER_SUBSTATUS } from "../services/subagent-takeover";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
@@ -2107,9 +2109,13 @@ narratorRoutes.post("/:id/messages", async (c) => {
 
 		if (queuedNewCommand && !narratorBusy) {
 			const currentCwd = narrator.cwd ?? undefined;
+			const newModel =
+				narrator.model === FOLLOW_PARENT_MODEL
+					? (await resolveSubagentModelForRun(narrator, userId)).model
+					: (narrator.model ?? undefined);
 			const newNarrator = await narratorService.create({
 				chapterId: null,
-				model: narrator.model ?? undefined,
+				model: newModel,
 				systemPrompt: narrator.systemPrompt ?? undefined,
 				permissionMode: narrator.permissionMode ?? undefined,
 				reasoningEffort: narrator.reasoningEffort ?? undefined,
@@ -3183,6 +3189,18 @@ narratorRoutes.get("/:id/message-location/:messageId", async (c) => {
 	const messageId = c.req.param("messageId");
 	const location = await narratorService.getMessageLocation(id, messageId);
 	return c.json(location);
+});
+
+/**
+ * Bounded recovery scan for sessions whose timeline cannot paginate because one
+ * message exceeded the history-aggregation budget. Lists oversized messages with
+ * metadata only so the client can offer "delete this message and after" without
+ * ever loading the broken aggregate.
+ */
+narratorRoutes.get("/:id/history-recovery", async (c) => {
+	const id = c.req.param("id");
+	const recovery = await narratorService.getHistoryRecovery(id);
+	return c.json(recovery);
 });
 
 // Full-text search within this narrator's own conversation history.
@@ -4444,7 +4462,16 @@ narratorRoutes.patch("/:id/model", async (c) => {
 	const id = c.req.param("id");
 	const parsed = updateNarratorModelSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	await narratorService.getById(id); // ensure exists
+	const narrator = await narratorService.getById(id);
+	if (parsed.data.model === FOLLOW_PARENT_MODEL) {
+		if (!isSubagentVariant(narrator.variant)) {
+			throw new ValidationError("Only subagents can follow a parent model");
+		}
+		await resolveSubagentModelForRun(
+			{ ...narrator, model: FOLLOW_PARENT_MODEL },
+			c.get("user").sub,
+		);
+	}
 	await narratorService.updateModel(id, parsed.data.model);
 	await updateNarratorModel(id, parsed.data.model);
 	return c.json({ ok: true });
@@ -5591,6 +5618,7 @@ narratorRoutes.post("/:id/suggest-answers", async (c) => {
 	const answers = await generateAskUserQuestionAnswers(id, questions, {
 		locale,
 		model: narrator.model,
+		actingUserId: userId,
 		mode: "suggest",
 	});
 

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	buildAggModelValue,
 	FOLLOW_DEFAULT_MODEL,
+	FOLLOW_PARENT_MODEL,
 	FOLLOW_SUMMARY_MODEL,
 	type ModelAggregation,
 } from "../../../lib/constants";
@@ -25,7 +26,7 @@ describe("model menu selection", () => {
 		expect(modelMenuSelection(value, aggregations).targetValue).toBe(FOLLOW_DEFAULT_MODEL);
 	});
 	test("keeps ordinary and summary model values", () => {
-		for (const value of ["a:model", "__summary__", "removed:model"]) {
+		for (const value of ["a:model", "__summary__", FOLLOW_PARENT_MODEL, "removed:model"]) {
 			expect(modelMenuSelection(value, aggregations).targetValue).toBe(value);
 		}
 	});
@@ -53,6 +54,7 @@ describe("global model role assignment", () => {
 		expect(canAssignGlobalModelRole("")).toBe(false);
 		expect(canAssignGlobalModelRole(FOLLOW_DEFAULT_MODEL)).toBe(false);
 		expect(canAssignGlobalModelRole(FOLLOW_SUMMARY_MODEL)).toBe(false);
+		expect(canAssignGlobalModelRole(FOLLOW_PARENT_MODEL)).toBe(false);
 	});
 	test("allows concrete models and aggregation roots", () => {
 		expect(canAssignGlobalModelRole("xiaomi:mimo-x-pro-preview")).toBe(true);

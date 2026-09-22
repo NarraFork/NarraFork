@@ -1,3 +1,5 @@
+export { FOLLOW_PARENT_MODEL } from "../../shared/model-inheritance";
+
 export {
 	CHAPTER_ROLE_ICONS,
 	CHAPTER_STATUS_COLORS,

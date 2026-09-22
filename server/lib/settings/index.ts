@@ -11,7 +11,7 @@ import { migrateLegacyCodexOAuth } from "../codex-manager";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
 import { invalidateModelCardCache } from "../model-cards";
-import { bindModelCatalogSettings, startModelCatalogDailyCheck, reconcileLegacyWindowSettings, markLegacyWindowSettingsSaved } from "../model-catalog";
+import { bindModelCatalogSettings, startModelCatalogDailyCheck, reconcileLegacyWindowSettings, markLegacyWindowSettingsSaved, settingsWithRawModelCatalog } from "../model-catalog";
 import { getNarraforkHome } from "../narrafork-home";
 import {
 	normalizeDefaultNarratorVisibility,
@@ -748,7 +748,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
 	try {
-		writeFileSync(tempPath, JSON.stringify(newSettings, null, 2), { mode: 0o600 });
+		writeFileSync(tempPath, JSON.stringify(settingsWithRawModelCatalog(newSettings), null, 2), { mode: 0o600 });
 		renameSync(tempPath, settingsPath);
 	} catch (error) {
 		rmSync(tempPath, { force: true });

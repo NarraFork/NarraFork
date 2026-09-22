@@ -51,6 +51,7 @@ import {
 } from "./agent-runtime/publication";
 import { resolveRuntimeQueueBackend } from "./agent-runtime/runtime-queue-port";
 import { runAtomicWrite } from "./agent-runtime/runtime-write";
+import { discardBackgroundBashResult, prepareBackgroundBashResult } from "./background-bash-result";
 import { TRANSFER_RESTART_PAUSE_NOTICE } from "./device-transfer-task-store";
 
 // === Types ===
@@ -1016,13 +1017,62 @@ class BackgroundTaskService {
 
 	// ── Status updates ──────────────────────────────────────────────────
 
-	/**
-	 * Unified terminal-task transition: routes between SQLite (sync tx) and PG
-	 * (async CAS + terminal commit composite). The `setFields` are the Drizzle
-	 * column values for the CAS update; the `fullOutput` is the uncapped text
-	 * for the publication result snapshot.
-	 */
+	/** Spill captured Bash output before the row budget or terminal transaction applies. */
+	private async prepareTerminalBashOutput(taskId: string, output?: string | null) {
+		const current =
+			resolveRuntimeQueueBackend() === "postgres"
+				? await getRuntimePublicationService().readBackgroundTask(taskId)
+				: db
+						.select({ type: backgroundTasks.type, status: backgroundTasks.status })
+						.from(backgroundTasks)
+						.where(eq(backgroundTasks.id, taskId))
+						.get();
+		if (current?.type !== "bash" || current.status !== "running") return undefined;
+		return prepareBackgroundBashResult(taskId, output ?? "");
+	}
+
+	/** A failed response need not mean the terminal commit rolled back. */
+	private async discardUnpublishedBashOutput(taskId: string, outputPath?: string) {
+		if (!outputPath) return;
+		try {
+			const task = await this.getById(taskId);
+			if (task?.output?.includes(outputPath)) return;
+			await discardBackgroundBashResult(outputPath);
+		} catch {
+			// If commit state cannot be established, keep the file for timed cleanup.
+		}
+	}
 	private async transitionTerminalTask(
+		taskId: string,
+		setFields: Record<string, unknown>,
+		fullOutput?: string | null,
+		deferPublication = false,
+	): Promise<BackgroundTaskRecord | undefined> {
+		const prepared = await this.prepareTerminalBashOutput(
+			taskId,
+			fullOutput ?? (setFields.output as string | null | undefined),
+		);
+		// On spill failure retain the bounded original row so Await remains a fallback.
+		const fields = prepared?.outputPath
+			? { ...setFields, output: prepared.content, outputTruncated: true }
+			: prepared && setFields.output == null
+				? { ...setFields, output: prepared.content }
+				: setFields;
+		try {
+			const task = await this.commitPreparedTerminalTask(
+				taskId,
+				fields,
+				fullOutput,
+				deferPublication,
+			);
+			if (!task) await this.discardUnpublishedBashOutput(taskId, prepared?.outputPath);
+			return task;
+		} catch (error) {
+			await this.discardUnpublishedBashOutput(taskId, prepared?.outputPath);
+			throw error;
+		}
+	}
+	private async commitPreparedTerminalTask(
 		taskId: string,
 		setFields: Record<string, unknown>,
 		fullOutput?: string | null,
@@ -1324,13 +1374,21 @@ class BackgroundTaskService {
 		if (resolveRuntimeQueueBackend() === "postgres") {
 			// PG path: named cancel composite — CAS + publication intent in one section.
 			const pub = getRuntimePublicationService();
-			const task = await pub.cancelTask({
-				taskId,
-				capturedOutput: storedOutput,
-				capturedOutputBytes: outputBytes,
-				capturedTruncated: truncated,
-				now,
-			});
+			const prepared = await this.prepareTerminalBashOutput(taskId, output);
+			let task: Awaited<ReturnType<typeof pub.cancelTask>>;
+			try {
+				task = await pub.cancelTask({
+					taskId,
+					capturedOutput: prepared?.outputPath ? prepared.content : storedOutput,
+					capturedOutputBytes: outputBytes,
+					capturedTruncated: !!prepared?.outputPath || truncated,
+					now,
+				});
+			} catch (error) {
+				await this.discardUnpublishedBashOutput(taskId, prepared?.outputPath);
+				throw error;
+			}
+			if (!task) await this.discardUnpublishedBashOutput(taskId, prepared?.outputPath);
 			if (!task) {
 				this.cleanupRuntime(taskId, expectedAbortController);
 				return false;
@@ -1363,7 +1421,7 @@ class BackgroundTaskService {
 			setFields.outputBytes = outputBytes;
 			setFields.outputTruncated = truncated;
 		}
-		const task = await this.transitionTerminalTask(taskId, setFields);
+		const task = await this.transitionTerminalTask(taskId, setFields, output);
 
 		if (!task) {
 			this.cleanupRuntime(taskId, expectedAbortController);

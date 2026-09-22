@@ -35,6 +35,7 @@ import {
 	ThemeIcon,
 	UnstyledButton,
 } from "@mantine/core";
+import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 // The row height comes from the shared row metrics, resolved at RENDER time, so it
 // tracks the reader's typography exactly as the measure side does.
 import { bareRowMetrics } from "@shared/pretext-layout/row-metrics";
@@ -115,6 +116,8 @@ export interface SubagentLabels {
 	backgroundBadge?: string;
 	/** "Taken over by user" badge label. */
 	takenOverBadge?: string;
+	/** The model follows the parent's live selection, not a concrete snapshot. */
+	followParent?: string;
 	/** File-changes section title ("Changed files"). */
 	fileChanges?: string;
 	/** Suffix for a file whose line counts are unknown. */
@@ -158,6 +161,7 @@ const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing">> = {
 	waitingBadge: "Awaiting permission",
 	backgroundBadge: "Background",
 	takenOverBadge: "Taken over by user",
+	followParent: "Follow parent",
 	fileChanges: "Changed files",
 	linesNotMeasured: "lines not measured",
 	moreFiles: "{count} more files",
@@ -536,7 +540,7 @@ function SubagentInner({
 				) : null}
 				{model ? (
 					<Badge data-testid="subagent-model" size="xs" variant="light" color="violet">
-						{model}
+						{model === FOLLOW_PARENT_MODEL ? labels.followParent : model}
 					</Badge>
 				) : null}
 				{reasoningEffort ? (

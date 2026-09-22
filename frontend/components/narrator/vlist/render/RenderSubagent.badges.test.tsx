@@ -12,6 +12,9 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
+import { FOLLOW_PARENT_MODEL } from "../../../../lib/constants";
+import narratorEn from "../../../../locales/en/narrator.json";
+import narratorZh from "../../../../locales/zh-CN/narrator.json";
 import { measureSubagentCard, type SubagentCardData } from "../measure/measure-subagent";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 import { RenderSubagent } from "./RenderSubagent";
@@ -39,6 +42,7 @@ function renderCard(badges: {
 	model?: string;
 	reasoningEffort?: string;
 	isTakenOver?: boolean;
+	followParentLabel?: string;
 }): Element {
 	const measured = measureSubagentCard({ ...DATA, ...badges }, WIDTH, 5, {});
 	return parse(
@@ -49,6 +53,7 @@ function renderCard(badges: {
 					description={DATA.description}
 					agentType={DATA.agentType}
 					model={badges.model}
+					labels={badges.followParentLabel ? { followParent: badges.followParentLabel } : undefined}
 					reasoningEffort={badges.reasoningEffort}
 					isTakenOver={badges.isTakenOver}
 					isActive={false}
@@ -62,6 +67,21 @@ const badgeText = (root: Element, testId: string) =>
 	root.querySelector(`[data-testid="${testId}"]`)?.textContent;
 
 describe("RenderSubagent — header badges", () => {
+	it.each([
+		narratorEn.followParent,
+		narratorZh.followParent,
+	])("localizes the live parent reference as %s", (followParentLabel) => {
+		const root = renderCard({ model: FOLLOW_PARENT_MODEL, followParentLabel });
+		expect(badgeText(root, "subagent-model")).toBe(followParentLabel);
+		expect(root.textContent).not.toContain(FOLLOW_PARENT_MODEL);
+	});
+
+	it("has an English fallback for the parent reference", () => {
+		expect(badgeText(renderCard({ model: FOLLOW_PARENT_MODEL }), "subagent-model")).toBe(
+			"Follow parent",
+		);
+	});
+
 	it("paints the reasoning-effort badge alongside the model badge", () => {
 		const root = renderCard({ model: "sonnet", reasoningEffort: "high" });
 		expect(badgeText(root, "subagent-model")).toBe("sonnet");

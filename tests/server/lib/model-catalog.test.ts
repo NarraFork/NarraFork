@@ -10,6 +10,7 @@ import {
 	applyModelCatalogUpdate,
 	bindModelCatalogSettings,
 	checkModelCatalogUpdate,
+	getEffectiveModelCard,
 	getEffectiveModelMetadata,
 	getModelCatalogSnapshot,
 	markLegacyWindowSettingsSaved,
@@ -17,11 +18,13 @@ import {
 	previewModelCatalogDowngrade,
 	reconcileLegacyWindowSettings,
 	rollbackModelCatalog,
+	saveLegacyModelCard,
 	setModelCatalogUpdateSettings,
 	withModelMetadataSnapshot,
 	withModelMetadataSnapshotIterator,
 } from "../../../server/lib/model-catalog";
 import {
+	deleteNugCachedModels,
 	getNugCachedModelsByProvider,
 	resolveNugModelMeta,
 } from "../../../server/lib/nug-model-cache";
@@ -63,6 +66,8 @@ afterEach(() => {
 	globalThis.fetch = originalFetch;
 	if (restoreVersion && getModelCatalogSnapshot().catalog.catalogVersion !== restoreVersion)
 		rollbackModelCatalog(restoreVersion);
+	deleteNugCachedModels("nug-test");
+	deleteNugCachedModels("nug-card-test");
 	bindModelCatalogSettings(settings, () => saveSettings(settings));
 	_bindSettings(settings);
 });
@@ -472,7 +477,10 @@ describe("unified metadata storage and runtime", () => {
 		expect(result.metadata.limits).toEqual({ contextWindow: 350000, maxOutputTokens: 1234 });
 		expect(result.metadata.referencePricing?.input).toBe("3");
 		const migrated = getModelCatalogSnapshot().local;
-		expect(migrated.overrides?.filter((o) => o.targetId === "claude-opus-4-6")).toHaveLength(1);
+		expect(migrated.overrides?.filter((o) => o.targetId === "claude-opus-4-6")).toHaveLength(0);
+		expect(
+			migrated.models?.find((m) => m.id === "claude-opus-4-6")?.metadata.referencePricing?.input,
+		).toBe("3");
 		expect(migrated.models?.filter((m) => m.id === "claude-opus-4-6")).toHaveLength(1);
 		expect(migrated.models?.find((m) => m.id === "claude-opus-4-6")?.name).toBe("Canonical");
 		mutate({ action: "patch", target: "model", targetId: "claude-opus-4-6", patch: {} });
@@ -583,6 +591,75 @@ describe("unified metadata storage and runtime", () => {
 		expect(
 			getEffectiveModelMetadata("gateway:channel:gpt-5.5").metadata.limits?.contextWindow,
 		).toBe(444444);
+	});
+	test("NUG modelCard is returned on resolve and rejects operational metadata", () => {
+		const config = {
+			id: "nug-card-test",
+			name: "NUG",
+			prefix: "gw",
+			baseUrl: "https://example.invalid",
+			apiKey: "unused",
+			defaultModel: "",
+		};
+		local.nugProviders = [config];
+		const card = {
+			schemaVersion: 2 as const,
+			catalogVersion: "v2:gateway-v1",
+			localRevision: 0,
+			matchedVia: "exact" as const,
+			metadata: { max_input_tokens: 128000, max_output_tokens: 32000 },
+			provenance: {},
+			view: {
+				mode: "chat",
+				category: "text",
+				limits: {},
+				fields: [],
+				prices: [],
+				pricingBasis: null,
+				attributes: {},
+			},
+		};
+		applyNugModelCatalogUpdate(
+			config,
+			[{ id: "ch:m", model: "m", channel: "ch", channelType: "openai", modelCard: card }],
+			"hash-card",
+			{ saveCache: false },
+		);
+		const meta = resolveNugModelMeta(config.id, config.prefix, "gw:ch:m");
+		expect(meta.modelCard).toEqual(card);
+		// queryForModel projects the card into v1 when no envelope is present.
+		expect(getEffectiveModelMetadata("gw:ch:m").metadata.limits?.maxOutputTokens).toBe(32000);
+
+		applyNugModelCatalogUpdate(
+			config,
+			[
+				{
+					id: "ch:m",
+					model: "m",
+					channel: "ch",
+					channelType: "openai",
+					metadata: {
+						schemaVersion: 1 as const,
+						catalogVersion: "g",
+						localRevision: 0,
+						matchedVia: "exact" as const,
+						metadata: { limits: { contextWindow: 333333 } },
+						provenance: {},
+					},
+					modelCard: {
+						...card,
+						metadata: { credentials: { apiKey: "leak" }, billingMultiplier: 2 },
+					},
+				},
+			],
+			"hash-unsafe",
+			{ saveCache: false },
+		);
+		const rejected = resolveNugModelMeta(config.id, config.prefix, "gw:ch:m");
+		expect(rejected.modelCard).toBeUndefined();
+		// The v1 projection remains usable when the card is discarded.
+		expect(rejected.metadata?.metadata.limits?.contextWindow).toBe(333333);
+		expect(getNugCachedModelsByProvider(config.id)[0]?.modelCard).toBeUndefined();
 	});
 	test("downgrade preflight rejects unknown metadata without writing and representable export re-upgrades losslessly", () => {
 		mutate({
@@ -716,7 +793,7 @@ describe("catalog update and API boundary", () => {
 		const checked = await checkModelCatalogUpdate();
 		expect(checked.update.lastError).toBeUndefined();
 		expect(checked.catalog.catalogVersion).toBe(initial.catalog.catalogVersion);
-		expect(checked.update.pendingVersion).toBe(updateVersion);
+		expect(checked.update.pendingVersion).toBe(`v2:${updateVersion}`);
 		expect(
 			(checked.update as typeof checked.update & { protectedFieldCount: number })
 				.protectedFieldCount,
@@ -731,8 +808,10 @@ describe("catalog update and API boundary", () => {
 		).toBe(true);
 		setModelCatalogUpdateSettings({ pinnedVersion: "different" });
 		expect(() => applyModelCatalogUpdate()).toThrow();
+		setModelCatalogUpdateSettings({ pinnedVersion: updateVersion });
+		applyModelCatalogUpdate(updateVersion);
+		expect(getModelCatalogSnapshot().update.pinnedVersion).toBe(updateVersion);
 		setModelCatalogUpdateSettings({ pinnedVersion: null });
-		applyModelCatalogUpdate();
 		expect(getEffectiveModelMetadata("codex:gpt-5.5").metadata.referencePricing?.input).toBe("0");
 		mutate({
 			action: "patch",
@@ -757,6 +836,46 @@ describe("catalog update and API boundary", () => {
 		expect(calls).toBe(1);
 		expect(getModelCatalogSnapshot().catalog.catalogVersion).toBe(initial);
 		expect(getModelCatalogSnapshot().update.lastError).toBeDefined();
+	});
+	test("lastError and non-AppError bodies never contain host absolute paths", async () => {
+		const home = "/home/someone-private/.narrafork/model-catalog/snapshots.json";
+		globalThis.fetch = (async () => {
+			throw new Error(`ENOENT: no such file or directory, open '${home}'`);
+		}) as unknown as typeof fetch;
+		const checked = await checkModelCatalogUpdate();
+		expect(checked.update.lastError).toBeDefined();
+		expect(checked.update.lastError).not.toContain("/home/someone-private");
+		expect(checked.update.lastError).not.toContain(".narrafork");
+		// Basename is retained so the failure stays diagnosable without the host path.
+		expect(checked.update.lastError).toContain("snapshots.json");
+		const member = await app("user").request("/api/model-catalog");
+		const body = await member.json();
+		expect(JSON.stringify(body.update.lastError)).not.toContain("/home/someone-private");
+		expect(JSON.stringify(body)).not.toContain("someone-private");
+
+		bindModelCatalogSettings(local, () => {
+			throw new Error("EACCES: permission denied, open '/home/someone-private/.narrafork/x'");
+		});
+		const failed = await app().request("/api/model-catalog/mutate", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				action: "patch",
+				target: "model",
+				targetId: "gpt-5.5",
+				patch: { set: { "referencePricing.input": "0" } },
+				baseRevision: getModelCatalogSnapshot().local.revision,
+			}),
+		});
+		expect(failed.status).toBe(400);
+		const errorBody = await failed.json();
+		expect(errorBody.code).toBe("CATALOG_IO_ERROR");
+		expect(errorBody.error).toBe("Model catalog operation failed");
+		expect(JSON.stringify(errorBody)).not.toContain("someone-private");
+		// Intentional validation prose without paths is preserved.
+		const missing = await app().request("/api/model-catalog/resolve");
+		expect(missing.status).toBe(400);
+		expect((await missing.json()).error).toContain("model is required");
 	});
 	test("invalid revisions, corrupt archives, oversized responses and redirects retain last good", async () => {
 		const version = getModelCatalogSnapshot().catalog.catalogVersion;
@@ -805,8 +924,43 @@ describe("catalog update and API boundary", () => {
 		expect(getModelCatalogSnapshot().local).toEqual(before);
 		expect(({} as Record<string, unknown>).polluted).toBeUndefined();
 	});
+	test("legacy identity edits never turn complete preset metadata into local overrides", () => {
+		saveLegacyModelCard("gpt-5.5", { modelKey: "gpt-5.5", displayName: "Local label" });
+		expect(
+			getModelCatalogSnapshot().local.models?.find((m) => m.id === "gpt-5.5")?.rawMetadata,
+		).toEqual({});
+		expect(getEffectiveModelCard("codex:gpt-5.5").provenance.input_cost_per_token?.layer).not.toBe(
+			"local-model",
+		);
+		const migrated = getDefaults();
+		delete migrated.agent.modelCatalog;
+		migrated.agent.modelCards = [{ modelKey: "gpt-5.5", displayName: "Migrated label" }];
+		bindModelCatalogSettings(migrated, () => {});
+		expect(
+			getModelCatalogSnapshot().local.models?.find((m) => m.id === "gpt-5.5")?.rawMetadata,
+		).toEqual({});
+		expect(getEffectiveModelCard("codex:gpt-5.5").provenance.input_cost_per_token?.layer).not.toBe(
+			"local-model",
+		);
+	});
 	test("API allows member reads, denies writes, reports conflicts and returns actual scope", async () => {
 		expect((await app("user").request("/api/model-catalog")).status).toBe(200);
+		const v2 = await app("user").request("/api/model-catalog/v2");
+		expect(v2.status).toBe(200);
+		const snapshot = await v2.json();
+		expect(snapshot.schemaVersion).toBe(2);
+		expect(snapshot.catalog.sourceVersion).toBe(
+			snapshot.catalog.catalogVersion.replace(/^v2:/, ""),
+		);
+		const cardResponse = await app("user").request(
+			"/api/model-catalog/v2/resolve?model=codex:gpt-5.5",
+		);
+		expect(cardResponse.status).toBe(200);
+		const card = await cardResponse.json();
+		expect(card.schemaVersion).toBe(2);
+		expect(card.metadata).toHaveProperty("input_cost_per_token");
+		expect(card.view.prices.length).toBeGreaterThan(0);
+		expect(card.resolvedQuery.providerKey).toBe("codex");
 		const body = JSON.stringify({
 			action: "patch",
 			target: "model",

@@ -4,8 +4,8 @@ import type {
 	ApiRequestDiagnosticSource,
 	ApiRequestDiagnostics,
 	KnowledgeInjectionRecord,
-	ReferencePricingSnapshot,
 	ReasoningProviderMetadata,
+	ReferencePricingSnapshot,
 } from "@shared/agent-protocol/types";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { z } from "zod/v4";
@@ -1143,11 +1143,14 @@ export interface AgentConfig {
 	/** Called whenever the completed-tool counter advances, so the caller can persist it. */
 	onCompletedToolCount?: (completedToolCount: number) => void;
 	/**
-	 * Called before each non-first turn/retry to check if runtime settings should be switched.
-	 * Changes are applied at the safe point before the next provider API request, so running
-	 * tools are not interrupted while the next model request uses fresh settings.
+	 * Called at request boundaries (including the first request and retries) to check
+	 * whether runtime settings should switch. May await policy/model inheritance
+	 * resolution; synchronous callers remain supported. Never aborts in-flight work.
 	 */
-	getRuntimeSettingsOverride?: () => RuntimeSettingsOverride | null;
+	getRuntimeSettingsOverride?: () =>
+		| RuntimeSettingsOverride
+		| null
+		| Promise<RuntimeSettingsOverride | null>;
 	/**
 	 * Legacy model-only override hook. Prefer getRuntimeSettingsOverride for new callers.
 	 * Returns the new model string (e.g. "nug:claude-opus-4.6") or null to keep current.

@@ -31,7 +31,7 @@ function filterSubagentModels(models: string[]): string[] {
 }
 
 const MODEL_PARAM_BASE =
-	"Override the model for this subagent. If omitted, uses the per-type model preference from settings (or the parent narrator's model as fallback).";
+	"Override the model for this subagent. An explicit model or a selected per-type/custom model preference pins the child independently. Otherwise it follows the parent narrator's current model, including later switches when resumed or before the next model request. Allowed model pools still apply.";
 
 function getModelParameterDescription(config?: AgentConfig): string {
 	// Per-narrator custom restriction trait takes precedence and already describes the pools.

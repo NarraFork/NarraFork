@@ -1,4 +1,5 @@
 import schema from '../schema/catalog.schema.json';
+import { validateRawMetadata } from '../card';
 import type { CatalogDocument, ModelMetadata } from '../schema/catalog';
 type Schema = { $ref?: string; anyOf?: Schema[]; enum?: unknown[]; type?: string; properties?: Record<string, Schema>; additionalProperties?: boolean | Schema; required?: string[]; items?: Schema; uniqueItems?: boolean; minLength?: number; pattern?: string; minimum?: number; maximum?: number; format?: string };
 export function fail(message: string): never { throw new Error(message); }
@@ -69,6 +70,7 @@ export function validateCatalog(value: unknown): CatalogDocument {
       if (ids.has(entry.id)) fail(`Duplicate id ${entry.id}`);
       ids.add(entry.id);
       validateMetadata(entry.metadata);
+      if (entry.rawMetadata !== undefined) validateRawMetadata(entry.rawMetadata);
       for (const path of entry.matches?.fields ?? []) if (!validField(path)) fail(`Invalid match field ${path}`);
       for (const source of entry.sources ?? []) for (const path of source.fields ?? []) if (!validField(path)) fail(`Invalid source field ${path}`);
       if (entry.status === 'verified' && !entry.sources?.some(s => s.url && s.verifiedAt)) fail(`Verified entry lacks verified source: ${entry.id}`);

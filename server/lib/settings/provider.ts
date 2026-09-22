@@ -6,8 +6,9 @@ import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import { ERROR_CATALOG } from "@shared/error-catalog";
 import type { ModelCard } from "@shared/model-card";
 import { parseModelId } from "@shared/model-id";
+import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { getCodexManager } from "../codex-manager";
-import { AppError } from "../errors";
+import { AppError, ValidationError } from "../errors";
 import { modelCardContextWindow, modelCardMaxCompletionTokens } from "../model-cards";
 import { getEffectiveModelMetadata } from "../model-catalog";
 import { isNugCachedModelAvailable, resolveNugModelMeta } from "../nug-model-cache";
@@ -412,6 +413,7 @@ function normalizeModelReference(model: string | null | undefined): string | nul
 
 function isMetaModelReference(model: string): boolean {
 	return (
+		model === FOLLOW_PARENT_MODEL ||
 		isFollowDefaultModelValue(model) ||
 		isFollowSummaryModelValue(model) ||
 		!!parseAggModelValue(model)
@@ -559,6 +561,9 @@ export function resolveEffectiveModel(
 	stickyProvider?: string,
 ): string {
 	const raw = model?.trim();
+	if (raw === FOLLOW_PARENT_MODEL) {
+		throw new ValidationError("Follow-parent model must be resolved in a subagent context");
+	}
 	if (!raw || isFollowDefaultModelValue(raw)) return resolveConfiguredDefaultModel(stickyProvider);
 	if (isFollowSummaryModelValue(raw)) return resolveConfiguredSummaryModel(stickyProvider);
 

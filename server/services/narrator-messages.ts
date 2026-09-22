@@ -2330,6 +2330,11 @@ async function buildSubagentActivities(
 
 const AGGREGATE_METADATA_LIMIT = 500;
 const AGGREGATE_BODY_BYTE_LIMIT = 4 * 1024 * 1024;
+// Recovery scan thresholds: a message is "oversized" when it alone is likely to
+// break the aggregate budget above. Aligned with the per-response tool-call cap.
+const HISTORY_RECOVERY_TOOL_COUNT = 32;
+const HISTORY_RECOVERY_BYTE_SIZE = 1024 * 1024;
+const HISTORY_RECOVERY_CANDIDATES = 10;
 
 function assertAggregateBudget(rows: number, bytes = 0): void {
 	if (rows > AGGREGATE_METADATA_LIMIT || bytes > AGGREGATE_BODY_BYTE_LIMIT) {
@@ -3580,6 +3585,80 @@ const narratorMessageQueriesUnlocked = {
 		const summary = typeof compactBlock?.summary === "string" ? compactBlock.summary : "";
 		if (!summary.trim()) return null;
 		return { id: row.id, summary };
+	},
+
+	/**
+	 * Bounded recovery scan for timelines that cannot paginate because one message
+	 * blew past the history-aggregation budget. Deliberately SQL-level only: no
+	 * content_json parse, no tool I/O, and never through resolveAggregateScopeTx —
+	 * that is the very path which is already throwing.
+	 */
+	async getHistoryRecovery(narratorId: string): Promise<{
+		candidates: Array<{
+			messageId: string;
+			seq: number;
+			role: string;
+			createdAt: string;
+			toolCount: number;
+			byteSize: number;
+			preview: string | null;
+			latest: boolean;
+		}>;
+		thresholds: { toolCount: number; byteSize: number };
+	}> {
+		const toolCount = sql<number>`(
+			SELECT COUNT(*) FROM narrator_tool_calls
+			WHERE narrator_tool_calls.message_id = ${narratorMessages.id}
+				AND narrator_tool_calls.is_file_history_checkpoint = 0
+		)`;
+		const byteSize = sql<number>`length(CAST(${narratorMessages.contentJson} AS BLOB))`;
+		const rows = await db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+				role: narratorMessages.role,
+				createdAt: narratorMessages.createdAt,
+				toolCount,
+				byteSize,
+				preview: sql<string | null>`substr(COALESCE(${narratorMessages.contentText}, ''), 1, 160)`,
+			})
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					isNull(narratorMessageRefs.segmentCompactId),
+					sql`(
+						(SELECT COUNT(*) FROM narrator_tool_calls
+						 WHERE narrator_tool_calls.message_id = ${narratorMessages.id}
+						   AND narrator_tool_calls.is_file_history_checkpoint = 0)
+						> ${HISTORY_RECOVERY_TOOL_COUNT}
+						OR length(CAST(${narratorMessages.contentJson} AS BLOB)) > ${HISTORY_RECOVERY_BYTE_SIZE}
+					)`,
+				),
+			)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(HISTORY_RECOVERY_CANDIDATES);
+		const maxSeqRow = await db
+			.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					isNull(narratorMessageRefs.segmentCompactId),
+				),
+			);
+		const maxSeq = maxSeqRow[0]?.maxSeq ?? null;
+		return {
+			candidates: rows.map((row) => ({
+				...row,
+				latest: row.seq === maxSeq,
+			})),
+			thresholds: {
+				toolCount: HISTORY_RECOVERY_TOOL_COUNT,
+				byteSize: HISTORY_RECOVERY_BYTE_SIZE,
+			},
+		};
 	},
 
 	async isSubagentNarrator(narratorId: string): Promise<boolean> {

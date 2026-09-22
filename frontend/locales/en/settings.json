@@ -131,6 +131,128 @@
 			"referencePricing_longContext_cacheWrite": "Long context cache write $/M"
 		}
 	},
+	"card": {
+		"unknown": "Explicitly unknown",
+		"unreported": "Not reported / inherited",
+		"emptyList": "[] (explicitly empty)",
+		"free": "0 (free)",
+		"localOverride": "Local override",
+		"prices": "Reference prices",
+		"noPrices": "This model declares no parseable reference price field.",
+		"priceNote": "Source reference rates in their original units; token rates are shown per 1M. This is not the gateway's actual billing.",
+		"price_component": "Item",
+		"price_modality": "Modality",
+		"price_threshold": "Context threshold",
+		"price_cache": "Cache duration",
+		"price_rate": "Rate",
+		"noThreshold": "No tier",
+		"derived": "Derived from multiplier",
+		"perTokens": "{{count}}M tokens",
+		"resolvedVia": "Matched: {{via}} · catalog {{version}} · local revision {{revision}}",
+		"attributes": "Source attributes",
+		"attributeNote": "Source fields not registered as a control or price row. Kept verbatim and never forwarded upstream.",
+		"groups": {
+			"identity": "Identity & source",
+			"limits": "Limits",
+			"modalities": "Modalities",
+			"capabilities": "Capabilities",
+			"reasoning": "Reasoning"
+		},
+		"limits": {
+			"maxInputTokens": "Max input",
+			"maxOutputTokens": "Max output",
+			"totalContextTokens": "Total context",
+			"workingContextTokens": "NF working window"
+		},
+		"limitHints": {
+			"maxInputTokens": "Vendor-declared input ceiling; it may be larger or smaller than the output ceiling.",
+			"maxOutputTokens": "Vendor-declared ceiling for a single response.",
+			"totalContextTokens": "Present only when the source declares it; never inferred from input/output.",
+			"workingContextTokens": "This instance's history budget, not a vendor specification."
+		},
+		"tiers": {
+			"standard": "Standard",
+			"batch": "Batch",
+			"flex": "Flex",
+			"priority": "Priority"
+		},
+		"basis": {
+			"full": "Above the threshold the whole request is charged at this tier",
+			"marginal": "Only the portion above the threshold is charged at this tier"
+		},
+		"components": {
+			"input": "Input",
+			"output": "Output",
+			"cacheRead": "Cache read",
+			"cacheWrite": "Cache write",
+			"search": "Search request"
+		},
+		"modalities": {
+			"text": "Text",
+			"image": "Image",
+			"audio": "Audio",
+			"video": "Video",
+			"media": "Media",
+			"search_context_size_low": "Low search context",
+			"search_context_size_medium": "Medium search context",
+			"search_context_size_high": "High search context"
+		},
+		"cache": {
+			"default": "Default",
+			"1h": "1 hour"
+		},
+		"units": {
+			"token": "token",
+			"image": "image",
+			"second": "second",
+			"character": "character",
+			"request": "request"
+		},
+		"categories": {
+			"text": "Text generation",
+			"image": "Image",
+			"audio": "Audio",
+			"embedding": "Embedding",
+			"rerank": "Rerank",
+			"moderation": "Moderation",
+			"unknown": "Unlabeled type"
+		},
+		"via": {
+			"binding": "Local binding",
+			"exact": "Exact id",
+			"alias": "Alias",
+			"suffix": "Volatile suffix",
+			"prefix": "Prefix",
+			"none": "No match"
+		},
+		"values": {
+			"true": "Supported",
+			"false": "Not supported"
+		},
+		"fields": {
+			"mode": "Source mode",
+			"litellm_provider": "Source provider",
+			"deprecation_date": "Deprecation date",
+			"supported_endpoints": "Supported endpoints",
+			"max_input_tokens": "Max input (tokens)",
+			"max_output_tokens": "Max output (tokens)",
+			"context_window": "Total context (tokens)",
+			"working_context_tokens": "NF working window (tokens)",
+			"legacy_context_window": "Legacy window setting (tokens)",
+			"output_vector_size": "Output vector size",
+			"max_images_per_prompt": "Max images per prompt",
+			"max_audio_per_prompt": "Max audio per prompt",
+			"max_videos_per_prompt": "Max videos per prompt",
+			"max_audio_length_hours": "Max audio length (hours)",
+			"max_pdf_size_mb": "Max PDF size (MB)",
+			"supported_modalities": "Input modalities",
+			"supported_output_modalities": "Output modalities",
+			"reasoning_mode": "Reasoning mode",
+			"reasoning_effort_levels": "Ordered reasoning tiers",
+			"default_reasoning_effort": "Default reasoning tier",
+			"can_disable_reasoning": "Reasoning can be disabled"
+		}
+	},
 	"subagentPoolReasoningEffortHelp": "Only affects newly created subagents. A specified tier overrides the agent's input and is adapted to model support. Not specified applies no pool override; it is not none (thinking off).",
 	"personalGroup": "Personal",
 	"enhancementsGroup": "Enhancements",

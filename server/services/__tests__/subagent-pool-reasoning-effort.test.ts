@@ -1,5 +1,6 @@
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { resolve } from "node:path";
+import { FOLLOW_PARENT_MODEL } from "../../../shared/model-inheritance";
 import type { ReasoningEffort } from "../../../shared/reasoning-effort";
 import type { AgentConfig } from "../../lib/agent";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
@@ -14,7 +15,7 @@ if (process.env[CHILD_ENV] !== "1") {
 		const env: NodeJS.ProcessEnv = { ...process.env, [CHILD_ENV]: "1" };
 		// Let tests/preload.ts allocate the child's own HOME and database directory.
 		delete env.NARRAFORK_HOME;
-		const child = Bun.spawn([process.execPath, "test", import.meta.path], {
+		const child = Bun.spawn([process.execPath, "test", "--isolate", import.meta.path], {
 			cwd: resolve(import.meta.dir, "../../.."),
 			env,
 			stdout: "pipe",
@@ -55,7 +56,7 @@ if (process.env[CHILD_ENV] !== "1") {
 	const { eq } = await import("drizzle-orm");
 	const { getTestDb, cleanDb } = await import("../../../tests/setup");
 	const { db, sqlite } = getTestDb();
-	mock.module("../../db", () => ({ db, sqlite }));
+	mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 	const configs: AgentConfig[] = [];
 	const broadcasts: Array<{ target: string; event: Record<string, unknown> }> = [];
@@ -162,7 +163,7 @@ if (process.env[CHILD_ENV] !== "1") {
 		});
 	}
 
-	async function run(effort?: ReasoningEffort, background = false) {
+	async function run(effort?: ReasoningEffort, background = false, model: string | null = MODEL) {
 		const result = await runSubagent({
 			parentNarratorId: PARENT,
 			toolUseId: TOOL,
@@ -172,7 +173,7 @@ if (process.env[CHILD_ENV] !== "1") {
 			title: "reasoning effort worker",
 			signal: new AbortController().signal,
 			locale: "en",
-			model: MODEL,
+			model: model ?? undefined,
 			reasoningEffort: effort,
 			background,
 		});
@@ -225,8 +226,11 @@ if (process.env[CHILD_ENV] !== "1") {
 			where: eq(narratorMessages.narratorId, child.id),
 			limit: 10,
 		});
-		expect(messages.filter((message) => message.role === "user")).toHaveLength(runs);
-		expect(messages[0].parentToolUseId).toBe(TOOL);
+		const userMessages = messages.filter((message) => message.role === "user");
+		expect(userMessages).toHaveLength(runs);
+		// Background bookkeeping may insert a system message before the user row
+		// in SQLite's query order; only user messages carry this transport link.
+		for (const message of userMessages) expect(message.parentToolUseId).toBe(TOOL);
 		expect(activeSubagentSettings.has(child.id)).toBe(false);
 		expect(network).not.toHaveBeenCalled();
 	}
@@ -307,6 +311,55 @@ if (process.env[CHILD_ENV] !== "1") {
 				});
 				expect(await continued.terminalCompletion).toContain("isolated model result");
 				await assertChain(await narratorService.getById(child.id), "high", "high", 2);
+			});
+		}
+
+		for (const background of [false, true]) {
+			test(`${background ? "background" : "foreground"} inherited model uses the newly selected pool entry's fixed effort`, async () => {
+				const nextModel = "anthropic:claude-opus-4-20250514";
+				await seedParent("xhigh");
+				settings.agent.subagentAllowedModels.general = [MODEL, nextModel];
+				settings.agent.subagentModelReasoningEfforts = {
+					general: { [MODEL]: "high", [nextModel]: "none" },
+				};
+				const child = await run("medium", background, null);
+				expect(child.model).toBe(FOLLOW_PARENT_MODEL);
+				expect(child.reasoningEffort).toBe("high");
+				expect(creationInputs[0]).toMatchObject({
+					model: FOLLOW_PARENT_MODEL,
+					reasoningEffort: "high",
+				});
+				expect(configs.at(-1)).toMatchObject({ model: MODEL, reasoningEffort: "high" });
+				await narratorService.updateModel(PARENT, nextModel);
+				const continued = await startContinuedSubagent({
+					subagentId: child.id,
+					parentNarratorId: PARENT,
+					toolUseId: TOOL,
+					prompt: "Continue with the new parent's model and its fixed pool effort.",
+					signal: new AbortController().signal,
+					locale: "en",
+					preserveBackground: background,
+				});
+				expect(await continued.terminalCompletion).toContain("isolated model result");
+				const childConfigs = configs.filter((config) => config.narratorId === child.id);
+				expect(childConfigs).toHaveLength(2);
+				expect(childConfigs.at(-1)?.model).toBe(nextModel);
+				expect(childConfigs.at(-1)?.reasoningEffort).toBe("none");
+				const starts = broadcasts.filter(
+					({ event }) => event.type === "subagent_started" && event.subagentNarratorId === child.id,
+				);
+				expect(starts).toHaveLength(2);
+				expect(starts[0]?.event).toMatchObject({
+					model: FOLLOW_PARENT_MODEL,
+					reasoningEffort: "high",
+				});
+				expect(starts.at(-1)?.event).toMatchObject({
+					model: FOLLOW_PARENT_MODEL,
+					reasoningEffort: "none",
+				});
+				expect((await narratorService.getById(child.id)).model).toBe(FOLLOW_PARENT_MODEL);
+				expect(activeSubagentSettings.has(child.id)).toBe(false);
+				expect(network).not.toHaveBeenCalled();
 			});
 		}
 

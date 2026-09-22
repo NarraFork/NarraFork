@@ -20,6 +20,7 @@ import type { SpecTaskItem } from "../../../lib/api/spec";
 import {
 	AGG_MODEL_PREFIX,
 	FOLLOW_DEFAULT_MODEL,
+	FOLLOW_PARENT_MODEL,
 	type ModelOption,
 	parseAggModelValue,
 	statusRegistry,
@@ -542,7 +543,13 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 									<NarratorStatusToolbar
 										leading={
 											<Group gap={6} wrap="nowrap">
-												<Tooltip label={t("modelTooltip")}>
+												<Tooltip
+													label={
+														narrator.model === FOLLOW_PARENT_MODEL
+															? t("followParent")
+															: t("modelTooltip")
+													}
+												>
 													<Menu
 														position="top-end"
 														opened={menuOpenDesktop}
@@ -557,25 +564,32 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																size="xs"
 																// The menu renders the full catalog; the trigger only needs
 																// the selected option so native sizing ignores longer models.
-																data={model.allModels
-																	.filter((m) => {
-																		const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
-																		const agg = parseAggModelValue(raw);
-																		return (
-																			m.value === (agg ? `${AGG_MODEL_PREFIX}${agg.aggId}` : raw)
-																		);
-																	})
-																	.map((m) => ({
-																		value: m.value,
-																		label:
-																			m.value === FOLLOW_DEFAULT_MODEL
-																				? t("followDefault", { model: model.defaultModelValue })
-																				: m.provider === "__agg__"
-																					? `⚡ ${m.label}`
-																					: m.provider
-																						? `${m.provider}:${m.label}`
-																						: m.label,
-																	}))}
+																data={
+																	narrator.model === FOLLOW_PARENT_MODEL
+																		? [{ value: FOLLOW_PARENT_MODEL, label: t("followParent") }]
+																		: model.allModels
+																				.filter((m) => {
+																					const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
+																					const agg = parseAggModelValue(raw);
+																					return (
+																						m.value ===
+																						(agg ? `${AGG_MODEL_PREFIX}${agg.aggId}` : raw)
+																					);
+																				})
+																				.map((m) => ({
+																					value: m.value,
+																					label:
+																						m.value === FOLLOW_DEFAULT_MODEL
+																							? t("followDefault", {
+																									model: model.defaultModelValue,
+																								})
+																							: m.provider === "__agg__"
+																								? `⚡ ${m.label}`
+																								: m.provider
+																									? `${m.provider}:${m.label}`
+																									: m.label,
+																				}))
+																}
 																value={(() => {
 																	const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
 																	const agg = parseAggModelValue(raw);
@@ -822,7 +836,13 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 								<NarratorStatusToolbar
 									leading={
 										<>
-											<Tooltip label={t("modelTooltip")}>
+											<Tooltip
+												label={
+													narrator.model === FOLLOW_PARENT_MODEL
+														? t("followParent")
+														: t("modelTooltip")
+												}
+											>
 												<Menu
 													position="bottom-end"
 													withinPortal
@@ -837,10 +857,16 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															variant="subtle"
 															color="gray"
 															size="sm"
-															aria-label={t("modelTooltip")}
+															aria-label={
+																narrator.model === FOLLOW_PARENT_MODEL
+																	? t("followParent")
+																	: t("modelTooltip")
+															}
 														>
 															<Text size="xs" fw={600}>
 																{(() => {
+																	if (narrator.model === FOLLOW_PARENT_MODEL)
+																		return t("followParent").charAt(0);
 																	if (narrator.model === FOLLOW_DEFAULT_MODEL || !narrator.model)
 																		return "D";
 																	const m = model.allModels.find((x) => x.value === narrator.model);

@@ -82,7 +82,11 @@ import type {
 	WhitelistDir,
 } from "../../../lib/api";
 import { api } from "../../../lib/api";
-import { FOLLOW_DEFAULT_MODEL, NARRATOR_STATUS_COLORS } from "../../../lib/constants";
+import {
+	FOLLOW_DEFAULT_MODEL,
+	FOLLOW_PARENT_MODEL,
+	NARRATOR_STATUS_COLORS,
+} from "../../../lib/constants";
 import {
 	SAFE_AREA_DRAWER_BODY_STYLE,
 	safeAreaDrawerBodyHeight,
@@ -429,9 +433,11 @@ function NarratorDetailsContent({
 	const refreshNarratorSkillsMutation = useRefreshNarratorSkills();
 
 	const resolvedModel =
-		narrator?.model && narrator.model !== FOLLOW_DEFAULT_MODEL
-			? narrator.model
-			: defaultModelValue || narrator?.model || t("details.notAvailable");
+		narrator?.model === FOLLOW_PARENT_MODEL
+			? t("followParent")
+			: narrator?.model && narrator.model !== FOLLOW_DEFAULT_MODEL
+				? narrator.model
+				: defaultModelValue || narrator?.model || t("details.notAvailable");
 
 	const activeTerminalCount = useMemo(
 		() => (terminals ?? []).filter((terminal) => terminal.status === "running").length,

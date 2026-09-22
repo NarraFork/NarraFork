@@ -53,8 +53,7 @@ import {
 	encodeFileBytes,
 	normalizeLineEndings,
 } from "../encoding";
-import { replacementLineStats } from "../file-diff-stats";
-import { applyCommand, diffMetadata, previewRegion } from "./apply";
+import { applyCommand, changeLineStats, diffMetadata, previewRegion } from "./apply";
 import { COMMANDS, MAX_BATCH_OPERATIONS, MAX_FILE_BYTES } from "./commands";
 import { resolveToRange, type ValidatedSpec, validateSpec } from "./resolve";
 
@@ -604,11 +603,6 @@ export const structSedTool: ToolDefinition = {
 
 		const range = first.range;
 		const command = first.spec.command;
-		const oldRegion = normalized
-			.split("\n")
-			.slice(range.startLine - 1, range.endLine)
-			.join("\n");
-		const stats = replacementLineStats(oldRegion, first.spec.content ?? "");
 
 		/** One operation's replayable record: selector for readability, range for replay. */
 		const recordOne = (op: (typeof resolvedOps)[number]): Record<string, unknown> => ({
@@ -735,7 +729,9 @@ export const structSedTool: ToolDefinition = {
 					const ending = detectLineEnding(before.bytes === null ? appliedText : decoded.text);
 					return {
 						nextBytes: encodeFileBytes(applyLineEnding(appliedText, ending), decoded.encoding),
-						lineStats: stats,
+						// Measured from the bytes under the write lock, not the earlier read:
+						// the figure must describe what was actually written.
+						lineStats: changeLineStats(current, appliedText),
 						result: {
 							output:
 								`${command} applied to ${filePath} → ${addressLabel}` +

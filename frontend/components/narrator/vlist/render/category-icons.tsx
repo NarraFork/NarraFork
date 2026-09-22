@@ -21,6 +21,7 @@ import {
 	IconFilter,
 	IconGavel,
 	IconGitFork,
+	IconHelpCircle,
 	IconHistory,
 	IconListCheck,
 	IconMap,
@@ -117,6 +118,11 @@ export function categoryIcon(cat: ToolCategory, toolName?: string): ComponentTyp
 			return IconWorldWww;
 		case "knowledge":
 			return knowledgeIcon(toolName);
+		// Help-circle, not send's IconMessageQuestion: ContextAsk queries another
+		// session's context rather than delivering a message, and the two sit next
+		// to each other in multi-agent runs.
+		case "contextAsk":
+			return IconHelpCircle;
 		default:
 			return IconCode;
 	}

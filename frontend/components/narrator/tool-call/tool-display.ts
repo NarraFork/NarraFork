@@ -31,6 +31,7 @@ export type ToolCategory =
 	| "browser"
 	| "knowledge"
 	| "schedule"
+	| "contextAsk"
 	| "generic";
 
 const READ_TOOLS = new Set(["Read"]);
@@ -99,6 +100,13 @@ const RECALL_TOOLS = new Set(["Recall"]);
 const SCHEDULE_TOOLS = new Set(["ScheduledTask"]);
 const SKILL_TOOLS = new Set(["Skill"]);
 const BROWSER_TOOLS = new Set(["Browser"]);
+/**
+ * ContextAsk reads another subagent's persisted context through the summary
+ * model. Its input (`id` + `questions[]`) overlaps with neither Send's message
+ * nor AskUserQuestion's option cards, so the generic JSON dump made a collapsed
+ * row read `ContextAsk · ContextAsk` and an expanded one show raw arguments.
+ */
+const CONTEXT_ASK_TOOLS = new Set(["ContextAsk"]);
 const KNOWLEDGE_TOOLS = new Set([
 	"KnowledgeSearch",
 	"KnowledgeRead",
@@ -135,6 +143,7 @@ export function getCategory(name: string, input?: unknown): ToolCategory {
 	if (SKILL_TOOLS.has(name)) return "skill";
 	if (BROWSER_TOOLS.has(name)) return "browser";
 	if (KNOWLEDGE_TOOLS.has(name)) return "knowledge";
+	if (CONTEXT_ASK_TOOLS.has(name)) return "contextAsk";
 	return "generic";
 }
 
@@ -190,6 +199,10 @@ export function getCategoryColor(cat: ToolCategory): ToolDisplayColor {
 			return "blue";
 		case "taskOutput":
 		case "await":
+		// Same indigo: both fetch information from another session / auxiliary model
+		// rather than mutating files or talking to the user. Send/ask's blue stays
+		// with the communication pair.
+		case "contextAsk":
 			return "indigo";
 		case "agent":
 			return "pink";
@@ -275,6 +288,49 @@ function extractStringArrayField(val: unknown, key: string): string[] {
 	if (!val || isTruncated(val) || typeof val !== "object") return [];
 	const raw = (val as Record<string, unknown>)[key];
 	return Array.isArray(raw) ? raw.filter((item): item is string => typeof item === "string") : [];
+}
+
+/** True when `value` is the cumulative-char payload ContextAsk streams via emitOutput. */
+function isNumericOutputString(value: unknown): value is string {
+	return typeof value === "string" && /^\d+$/.test(value.trim());
+}
+
+/**
+ * Live character count for a running ContextAsk, or null.
+ *
+ * The tool reuses `tool_output` to stream a bare cumulative count (see
+ * context-ask.ts `onProgress`); the reader wants that as a counter, not as a
+ * streaming body of digits.
+ */
+function contextAskLiveOutputChars(metadata: Record<string, unknown> | undefined): number | null {
+	const raw = metadata?._streamingOutput;
+	if (!isNumericOutputString(raw)) return null;
+	const n = Number(raw.trim());
+	return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/** Resolved target label for a ContextAsk call (metadata title wins over input.id). */
+function contextAskTargetLabel(
+	input: unknown,
+	metadata: Record<string, unknown> | undefined,
+): string {
+	const target = metadata?.target;
+	const title =
+		target && typeof target === "object" && !isTruncated(target)
+			? readLeafText((target as Record<string, unknown>).title)
+			: undefined;
+	return agentTargetDisplay(title, extractField(input, "id"));
+}
+
+/** Question count for a ContextAsk call, or null when the input is a status summary. */
+function contextAskQuestionCount(
+	input: unknown,
+	metadata: Record<string, unknown> | undefined,
+): number | null {
+	const fromMeta = Array.isArray(metadata?.questions) ? metadata.questions.length : undefined;
+	const fromInput = extractStringArrayField(input, "questions").length;
+	const count = fromMeta ?? (fromInput > 0 ? fromInput : undefined);
+	return count != null && count > 0 ? count : null;
 }
 
 export function getFilePath(input: unknown): string {
@@ -579,6 +635,34 @@ export function getSummary(
 		}
 		case "knowledge":
 			return knowledgeSummary(toolName, input, metadata);
+		case "contextAsk": {
+			const target = contextAskTargetLabel(input, metadata);
+			const questionCount = contextAskQuestionCount(input, metadata);
+			const liveChars = contextAskLiveOutputChars(metadata);
+			const parts: string[] = [];
+			if (target) parts.push(target);
+			// Live char count beats the static question tally: the reader scanning a
+			// running card cares that the answer is growing, not how many questions
+			// were already visible in the header a second ago.
+			if (liveChars != null) {
+				parts.push(
+					labels?.contextAskOutputChars
+						? labels.contextAskOutputChars.replace("{count}", String(liveChars))
+						: `${liveChars} chars`,
+				);
+			} else if (questionCount != null) {
+				parts.push(
+					labels?.contextAskQuestions
+						? labels.contextAskQuestions.replace("{count}", String(questionCount))
+						: `${questionCount} questions`,
+				);
+			} else {
+				parts.push(labels?.contextAskStatusSummary ?? "status summary");
+			}
+			// Never fall through to `toolName` — that is what produced
+			// `ContextAsk · ContextAsk` in the folded row.
+			return parts.join(" · ");
+		}
 		case "schedule": {
 			const action = extractField(input, "action");
 			// The task NAME is the only useful identifier here; a bare nanoid id tells the

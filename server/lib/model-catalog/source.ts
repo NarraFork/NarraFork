@@ -5,6 +5,14 @@ import { resolve } from "node:path";
 import { gunzipSync } from "node:zlib";
 import type { CatalogDocument } from "@shared/model-catalog/schema/catalog";
 import { validateCatalog } from "@shared/model-catalog/src/index";
+import {
+	decimalValue,
+	multiplyDecimal,
+	rawCatalogFromModelFiles,
+	validateRawMetadata,
+	type RawCatalog,
+} from "@shared/model-catalog/card";
+import { legacyMetadataToRaw } from "@shared/model-catalog/card-resolver";
 
 export const CATALOG_REVISION_URL =
 	"https://api.github.com/repos/NarraFork/narrafork-model-catalog/commits/main";
@@ -35,31 +43,11 @@ const sourcePrices = {
 } as const;
 
 function sourcePrice(value: unknown, multiplier = 1): string | null {
-	if (value === null) return null;
-	if (
-		typeof value !== "number" ||
-		!Number.isFinite(value) ||
-		value < 0 ||
-		!Number.isFinite(multiplier) ||
-		multiplier < 0
-	)
-		throw new Error("Invalid per-token reference price");
-	const parts = (number: number) => {
-		const [mantissa, exponent = "0"] = String(number).toLowerCase().split("e");
-		const [whole, fraction = ""] = mantissa!.split(".");
-		return { digits: BigInt(whole! + fraction), scale: Number(exponent) - fraction.length };
-	};
-	const a = parts(value),
-		b = parts(multiplier);
-	let digits = String(a.digits * b.digits);
-	const scale = a.scale + b.scale + 6;
-	if (scale >= 0) return (digits + "0".repeat(scale)).replace(/^0+(?=\d)/, "");
-	digits = digits.padStart(1 - scale, "0");
-	return `${digits.slice(0, scale)}.${digits.slice(scale)}`.replace(/0+$/, "").replace(/\.$/, "");
+	return value === null ? null : decimalValue(multiplyDecimal(value, multiplier), 6);
 }
 
 /** Consume LiteLLM/sub2api fields locally; the public catalog retains the complete source row. */
-function sourceMetadata(value: unknown): unknown {
+export function sourceMetadata(value: unknown): unknown {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return value;
 	const raw = value as Record<string, unknown>;
 	// Existing application snapshots/API fixtures remain in the application's own format.
@@ -67,15 +55,6 @@ function sourceMetadata(value: unknown): unknown {
 		!Object.keys(raw).length ||
 		["limits", "modalities", "nativeSearch", "reasoning", "referencePricing"].some(
 			(key) => key in raw,
-		)
-	)
-		return value;
-	if (
-		!("litellm_provider" in raw) &&
-		!Object.keys(raw).some((key) =>
-			/^(max_|supported_|supports_|reasoning_|default_reasoning_|can_disable_reasoning|reference_pricing_|.*_cost_per_token|cache_.*_token_cost)/.test(
-				key,
-			),
 		)
 	)
 		return value;
@@ -160,57 +139,96 @@ function sourceMetadata(value: unknown): unknown {
 		(metadata.referencePricing ??= {}).longContext = raw.reference_pricing_long_context;
 	return metadata;
 }
-/** The public repository is data only. This conversion belongs to NarraFork. */
 export function catalogFromModelFiles(
 	files: Map<string, string>,
 	version: string,
 	publishedAt: string,
 ): CatalogDocument {
-	const models: unknown[] = [];
-	const variants: unknown[] = [];
-	for (const [filename, text] of [...files].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
-		if (!/^[a-z0-9][a-z0-9._-]*\.json$/.test(filename)) throw new Error("Invalid model filename");
-		const value = JSON.parse(text);
-		if (
-			!value ||
-			Array.isArray(value) ||
-			value.id !== filename.slice(0, -5) ||
-			!Array.isArray(value.variants)
-		) {
-			throw new Error(`Expected one model and its variants in ${filename}`);
-		}
-		const { variants: nested, status = "unverified", ...model } = value;
-		const internalStatus = status === "unverified" ? "legacy-unverified" : status;
-		models.push({ ...model, metadata: sourceMetadata(model.metadata), status: internalStatus });
-		for (const variant of nested) {
-			if (
-				!variant ||
-				typeof variant !== "object" ||
-				Array.isArray(variant) ||
-				"modelId" in variant
-			) {
-				throw new Error(`Variant parent must be its containing model in ${filename}`);
-			}
-			variants.push({
-				...variant,
-				metadata: sourceMetadata(variant.metadata),
-				modelId: model.id,
-				status:
-					variant.status === "unverified"
-						? "legacy-unverified"
-						: (variant.status ?? internalStatus),
-			});
-		}
-	}
-	if (!models.length || models.length + variants.length > 20_000)
-		throw new Error("Invalid catalog model count");
+	return catalogFromRaw(
+		rawCatalogFromModelFiles(files, catalogSourceVersion(version), publishedAt),
+	);
+}
+
+export function catalogSourceVersion(version: string): string {
+	return version.startsWith("v2:") ? version.slice(3) : version;
+}
+
+/** In-memory v1 compatibility values are derived; persistence uses the original v2 metadata. */
+export function catalogFromRaw(value: RawCatalog): CatalogDocument {
+	if (
+		value.schemaVersion !== 2 ||
+		typeof value.sourceVersion !== "string" ||
+		!value.sourceVersion ||
+		value.catalogVersion !== `v2:${value.sourceVersion}` ||
+		!Array.isArray(value.models) ||
+		!Array.isArray(value.variants) ||
+		!value.models.length ||
+		value.models.length + value.variants.length > 20000
+	)
+		throw new Error("Invalid raw catalog snapshot");
+	const entry = (model: RawCatalog["models"][number]) => {
+		const rawMetadata = validateRawMetadata(model.metadata);
+		return {
+			...model,
+			rawMetadata,
+			metadata: sourceMetadata(rawMetadata),
+			status:
+				model.status === "unverified" ? "legacy-unverified" : (model.status ?? "legacy-unverified"),
+		};
+	};
 	return validateCatalog({
 		schemaVersion: 1,
-		catalogVersion: version,
-		publishedAt,
-		models,
-		variants,
+		catalogVersion: value.catalogVersion,
+		publishedAt: value.publishedAt,
+		models: value.models.map(entry),
+		variants: value.variants.map((variant) => ({
+			...entry(variant),
+			modelId: variant.modelId,
+			providerKey: variant.providerKey,
+			upstreamModelIds: variant.upstreamModelIds,
+		})),
 	});
+}
+
+export function catalogToRaw(catalog: CatalogDocument): RawCatalog {
+	const entry = (model: CatalogDocument["models"][number]) => {
+		const { rawMetadata, metadata, ...identity } = model;
+		return {
+			...identity,
+			metadata:
+				rawMetadata === undefined
+					? legacyMetadataToRaw(metadata)
+					: validateRawMetadata(rawMetadata),
+		};
+	};
+	const sourceVersion = catalogSourceVersion(catalog.catalogVersion);
+	return {
+		schemaVersion: 2,
+		catalogVersion: `v2:${sourceVersion}`,
+		sourceVersion,
+		publishedAt: catalog.publishedAt,
+		models: catalog.models.map(entry),
+		variants: catalog.variants.map((variant) => ({
+			...entry(variant),
+			modelId: variant.modelId,
+			providerKey: variant.providerKey,
+			upstreamModelIds: variant.upstreamModelIds,
+		})),
+	};
+}
+
+export function decodeCatalog(value: unknown): CatalogDocument {
+	if (value && typeof value === "object" && "schemaVersion" in value && value.schemaVersion === 2)
+		return catalogFromRaw(value as RawCatalog);
+	return validateCatalog(value);
+}
+
+export function encodeCatalog(catalog: CatalogDocument): RawCatalog | CatalogDocument {
+	const entries = [...catalog.models, ...catalog.variants];
+	const count = entries.filter((entry) => entry.rawMetadata !== undefined).length;
+	if (!count) return catalog; // Do not fabricate source fields for old pinned/offline snapshots.
+	if (count !== entries.length) throw new Error("Cannot persist a partially raw catalog");
+	return catalogToRaw(catalog);
 }
 
 export async function catalogFromArchive(
@@ -252,7 +270,7 @@ if (import.meta.main) {
 	const catalog = catalogFromModelFiles(files, `bundled-${hash.digest("hex")}`, publishedAt);
 	writeFileSync(
 		new URL("../../../shared/model-catalog/dist/catalog.json", import.meta.url),
-		`${JSON.stringify(catalog, null, 2)}\n`,
+		`${JSON.stringify(encodeCatalog(catalog), null, 2)}\n`,
 	);
 	console.log(`${catalog.models.length} models, ${catalog.variants.length} variants`);
 }

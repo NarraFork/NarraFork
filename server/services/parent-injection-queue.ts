@@ -1,4 +1,4 @@
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
 import { hotSafe } from "../lib/hot-safe";
@@ -176,7 +176,36 @@ export function projectPendingInjection(
 			.where(eq(backgroundTasks.id, metadata.taskId))
 			.get();
 		const status = metadata.eventKind === "timed_out" ? "timeout" : metadata.eventKind;
-		if (metadata.producerKind === "bash")
+		if (metadata.producerKind === "bash") {
+			// Read only the bounded terminal presentation for this exact attempt.
+			// Legacy rows can still contain 512KiB; never load them in full here.
+			const result =
+				metadata.resultRef === `background_task:${metadata.taskId}:${metadata.logicalRunId}`
+					? db
+							.select({
+								output: sql<string | null>`substr(${backgroundTasks.output}, 1, 5121)`,
+								exitCode: backgroundTasks.exitCode,
+							})
+							.from(backgroundTasks)
+							.where(
+								and(
+									eq(backgroundTasks.id, metadata.taskId),
+									eq(backgroundTasks.logicalRunId, metadata.logicalRunId),
+									eq(backgroundTasks.parentNarratorId, row.narratorId),
+								),
+							)
+							.get()
+					: undefined;
+			const ref = task?.alias ?? metadata.taskId;
+			let output = result?.output;
+			if (output != null && Buffer.byteLength(output, "utf8") >= 5120) {
+				// Old tasks (or a failed spill) retain their bounded original for Await.
+				output = `${output.slice(0, 256)}\n[Output preview truncated; captured output file unavailable. Use Await({ type: "bash", id: ${JSON.stringify(ref)} }) to inspect the stored result.]`;
+			}
+			const outputPreview =
+				output == null
+					? `${row.text}\n[Result snapshot unavailable. Use Await({ type: "bash", id: ${JSON.stringify(ref)} }) to inspect the stored result.]`
+					: `${output || "(empty output)"}${result?.exitCode != null ? `\n[exit code: ${result.exitCode}]` : ""}`;
 			return {
 				kind: "bg_bash",
 				task: {
@@ -185,10 +214,11 @@ export function projectPendingInjection(
 					title: task?.title ?? null,
 					alias: task?.alias ?? null,
 					status,
-					outputPreview: row.text,
+					outputPreview,
 					userId: metadata.userId ?? peekTaskNoticeUser(metadata.taskId),
 				},
 			};
+		}
 		const narrator = db
 			.select({ title: narrators.title })
 			.from(narrators)

@@ -1,4 +1,5 @@
 import type { FileReferenceSnapshot } from "@shared/file-reference";
+import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, narratorToolCalls } from "../db/schema";
@@ -29,7 +30,6 @@ import {
 	expandAllowedPoolForDisplay,
 	FOLLOW_DEFAULT_MODEL,
 	resolveDefaultReasoningEffort,
-	resolveEffectiveModel,
 	resolveProvider,
 	settings,
 } from "../lib/settings";
@@ -77,6 +77,7 @@ import {
 } from "./subagent-executor";
 import { appendSubagentFileChanges } from "./subagent-file-changes";
 import { agentLabelFromNarrator, agentResultTag, resolveAgentLabel } from "./subagent-label";
+import { resolveSubagentModelForRun, subagentStoredModelReference } from "./subagent-model";
 import {
 	clearTakenOver,
 	consumePendingBackgroundFinalize,
@@ -1954,6 +1955,21 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		candidates: candidateModels,
 	});
 	const resolvedModelInput = modelSelection?.model;
+	// A preference only pins the child if it actually won selection. A preference
+	// rejected by the pool must not turn a parent/pool fallback into a frozen pin.
+	const preferenceSelection =
+		!explicitModel && subagentPref
+			? resolveSubagentModelSelectionFromPolicy({
+					policy: modelPolicy,
+					explicitModel: subagentPref,
+					candidates: [],
+				})
+			: undefined;
+	const storedModelInput = subagentStoredModelReference({
+		explicitModel,
+		preferenceSelection,
+		selection: modelSelection,
+	});
 	// No configured tier means the original explicit/parent/global inheritance stays intact.
 	const configuredReasoningEffort = modelSelection?.poolEntry?.reasoningEffort ?? reasoningEffort;
 	if (modelPolicy.source !== "none" && !resolvedModelInput) {
@@ -2003,7 +2019,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			title,
 			cwd,
 			systemPrompt,
-			model: resolvedModelInput,
+			model: storedModelInput,
 			reasoningEffort: configuredReasoningEffort,
 			inheritedTraits,
 		});
@@ -2014,7 +2030,13 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 
 	const subagentId = subagent.id;
 	updateLease.setNarratorId(subagentId);
-	const model = resolveEffectiveModel(subagent.model);
+	const { model, reasoningEffort: fixedPoolEffort } = await resolveSubagentModelForRun(
+		subagent,
+		userId,
+	).catch((error) => {
+		updateLease.release();
+		throw error;
+	});
 	const provider = resolveProvider(model);
 	let aliasRegistration: { alias: string; conflicted: boolean };
 	try {
@@ -2045,8 +2067,8 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		parentNarratorId,
 		toolUseId,
 		subagentType,
-		model,
-		subagent.reasoningEffort ?? resolveDefaultReasoningEffort(provider, model),
+		subagent.model === FOLLOW_PARENT_MODEL ? FOLLOW_PARENT_MODEL : model,
+		fixedPoolEffort ?? subagent.reasoningEffort ?? resolveDefaultReasoningEffort(provider, model),
 	);
 
 	if (background) {
@@ -2201,6 +2223,8 @@ export interface ContinueSubagentInput {
 	/** Prebuilt history for retry/tool-result continuation. */
 	initialHistory?: unknown[];
 	initialTrailingToolResults?: unknown[];
+	/** Effective model used to build the prepared history; never reuse it after a switch. */
+	initialHistoryModel?: string;
 	allowRunningRestart?: boolean;
 	skipStaleAttach?: boolean;
 	preserveBackground?: boolean;
@@ -2362,7 +2386,10 @@ async function startContinuedSubagentUnlocked(
 	const priorTaskVersion = getBackgroundTaskTerminalVersion(priorTask);
 
 	const subagentType = getSubagentType(original.variant) ?? original.subagentType ?? "general";
-	const model = resolveEffectiveModel(original.model);
+	const { model, reasoningEffort: fixedPoolEffort } = await resolveSubagentModelForRun(
+		original,
+		input.userId,
+	);
 	const provider = resolveProvider(model);
 	const cwd = original.cwd ?? ".";
 
@@ -2465,8 +2492,8 @@ async function startContinuedSubagentUnlocked(
 			parentNarratorId,
 			toolUseId,
 			subagentType,
-			model,
-			original.reasoningEffort ?? resolveDefaultReasoningEffort(provider, model),
+			original.model === FOLLOW_PARENT_MODEL ? FOLLOW_PARENT_MODEL : model,
+			fixedPoolEffort ?? original.reasoningEffort ?? resolveDefaultReasoningEffort(provider, model),
 		);
 
 		const mailboxInput = input.mailboxInput
@@ -2491,7 +2518,11 @@ async function startContinuedSubagentUnlocked(
 		// 5. Load full subagent history unless the resume service already prepared it.
 		const rebuilt =
 			mailboxInput ??
-			(input.initialHistory && input.initialTrailingToolResults
+			(input.initialHistory &&
+			input.initialTrailingToolResults &&
+			(input.initialHistoryModel === undefined
+				? original.model !== FOLLOW_PARENT_MODEL
+				: input.initialHistoryModel === model)
 				? {
 						history: input.initialHistory,
 						trailingToolResults: input.initialTrailingToolResults,

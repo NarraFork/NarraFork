@@ -222,6 +222,122 @@ describe("dry run is the default", () => {
 	});
 });
 
+describe("line statistics", () => {
+	/**
+	 * The header `+N -N` must describe what actually changed in the file, not the size of
+	 * the addressed range. An earlier version compared `selected region` vs
+	 * `content ?? ""`, so a one-token substitute across an 89-line symbol reported `-89`
+	 * while the card showed a single edited line.
+	 */
+	test("substitute counts the lines it rewrote, not the whole selected range", async () => {
+		const target = join(workDir, "stats-substitute.txt");
+		// Ten lines in the selection; only one token on one line changes.
+		writeFileSync(
+			target,
+			`${Array.from({ length: 10 }, (_, i) => `line ${i + 1} const local = ${i};`).join("\n")}\n`,
+			"utf8",
+		);
+		const result = await run({
+			file_path: target,
+			command: "substitute",
+			address: "1,10",
+			pattern: "const local",
+			replacement: "let local",
+			flags: "g",
+		});
+		expect(result.isError).toBeFalsy();
+		expect(result.metadata?.replacements).toBe(10);
+		// Every line is rewritten in place: 10 removed + 10 added, NOT 0/10 or 0/10-range.
+		expect(result.metadata?.linesAdded).toBe(10);
+		expect(result.metadata?.linesRemoved).toBe(10);
+	});
+
+	test("a single-token substitute reports one added and one removed", async () => {
+		const target = join(workDir, "stats-substitute-one.txt");
+		writeFileSync(
+			target,
+			"header\nconst local = structuredClone(cfg.local);\nfooter\nmore\nlines\nhere\n",
+			"utf8",
+		);
+		const result = await run({
+			file_path: target,
+			command: "substitute",
+			address: "2",
+			pattern: "const local",
+			replacement: "let local",
+		});
+		expect(result.isError).toBeFalsy();
+		expect(result.metadata?.replacements).toBe(1);
+		expect(result.metadata?.linesAdded).toBe(1);
+		expect(result.metadata?.linesRemoved).toBe(1);
+	});
+
+	test("insert reports additions only, not a rewrite of the kept region", async () => {
+		const target = join(workDir, "stats-insert.txt");
+		writeFileSync(target, "alpha\nbeta\ngamma\n", "utf8");
+		const result = await run({
+			file_path: target,
+			command: "insert",
+			address: "2,3",
+			content: "new line\n",
+		});
+		expect(result.isError).toBeFalsy();
+		expect(result.metadata?.linesAdded).toBe(1);
+		expect(result.metadata?.linesRemoved).toBe(0);
+	});
+
+	test("delete reports removals only", async () => {
+		const target = join(workDir, "stats-delete.txt");
+		writeFileSync(target, "alpha\nbeta\ngamma\ndelta\n", "utf8");
+		const result = await run({
+			file_path: target,
+			command: "delete",
+			address: "2,3",
+		});
+		expect(result.isError).toBeFalsy();
+		expect(result.metadata?.linesAdded).toBe(0);
+		expect(result.metadata?.linesRemoved).toBe(2);
+	});
+
+	test("replace diffs the region against its replacement", async () => {
+		const target = join(workDir, "stats-replace.txt");
+		writeFileSync(target, "alpha\nbeta\ngamma\ndelta\n", "utf8");
+		const result = await run({
+			file_path: target,
+			command: "replace",
+			address: "2",
+			content: "BETA",
+		});
+		expect(result.isError).toBeFalsy();
+		expect(result.metadata?.linesAdded).toBe(1);
+		expect(result.metadata?.linesRemoved).toBe(1);
+	});
+
+	test("a surgical substitute in a file past the whole-file budget still counts the real change", async () => {
+		// Past `MAX_WHOLE_FILE_STATS_CHARS`, the whole-file diff is dropped. The window
+		// fallback must still answer — otherwise a one-line fix in a large module would
+		// either vanish or (worse) report the entire addressed range as deleted.
+		const target = join(workDir, "stats-large.txt");
+		// ~100KB of padding so whole-file stats refuse the input budget.
+		const filler = Array.from(
+			{ length: 500 },
+			(_, i) => `padding line ${i} ${"x".repeat(100)}`,
+		).join("\n");
+		writeFileSync(target, `${filler}\nconst local = 1;\n${filler}\n`, "utf8");
+		const result = await run({
+			file_path: target,
+			command: "substitute",
+			address: "1,$",
+			pattern: "const local",
+			replacement: "let local",
+		});
+		expect(result.isError).toBeFalsy();
+		expect(result.metadata?.replacements).toBe(1);
+		expect(result.metadata?.linesAdded).toBe(1);
+		expect(result.metadata?.linesRemoved).toBe(1);
+	});
+});
+
 describe("cross-file destinations", () => {
 	test("refuses to_file instead of silently ignoring it", async () => {
 		// Ignoring it resolved the destination inside the SOURCE file, so a same-line

@@ -1578,6 +1578,7 @@ export async function reflectPendingAskUserQuestion(
 		const answers = await generateAskUserQuestionAnswers(pending.narratorId, questions, {
 			locale: pending.locale,
 			model: narrator?.model,
+			actingUserId: activeNarrators.get(pending.narratorId)?._currentUserId ?? null,
 			mode: "reflection",
 			signal: abort.signal,
 			onProgress: (snapshot) => broadcastQuestionReflectionProgress(requestId, snapshot),

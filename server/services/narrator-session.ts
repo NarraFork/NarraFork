@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
 import type { MessageOriginOptions } from "@shared/message-origin";
+import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { isDanglingReasoningOnlyAssistantMessage } from "@shared/reasoning-content";
 import {
 	isPreloadedMode,
@@ -112,6 +113,7 @@ import {
 	wakeInboxIfEligible,
 	withInboxOwner,
 } from "./agent-runtime/inbox";
+import { createInheritedModelRuntime } from "./agent-runtime/inherited-model";
 import { MAILBOX_LIMITS } from "./agent-runtime/limits";
 import { runAgentLoopUnlocked } from "./agent-runtime/orchestrator";
 import {
@@ -172,6 +174,7 @@ import {
 	registerConclusionWatcher,
 	resolveManualOverride,
 } from "./subagent-manual-override";
+import { resolveSubagentModelForRun } from "./subagent-model";
 import { isTakenOver } from "./subagent-takeover";
 import { resolveEffectiveTraits } from "./trait-layer-service";
 import { worktreeWatcher } from "./worktree-watcher";
@@ -567,9 +570,21 @@ export async function executeQueuedNewCommand(
 	initialMessage: string,
 ): Promise<string> {
 	const sourceNarrator = await narratorService.getById(active.narratorId);
+	// `/new` spawns an independent primary session, so it must never inherit the
+	// `__parent__` sentinel (prepareNarratorCreation rejects it: only subagents may
+	// follow). Materialize the currently effective model, matching the idle route path.
+	const newModel =
+		sourceNarrator.model === FOLLOW_PARENT_MODEL
+			? (
+					await resolveSubagentModelForRun(
+						sourceNarrator,
+						buffered.createdBy ?? sourceNarrator.ownerUserId,
+					)
+				).model
+			: (sourceNarrator.model ?? undefined);
 	const newNarrator = await narratorService.create({
 		chapterId: null,
-		model: sourceNarrator.model ?? undefined,
+		model: newModel,
 		systemPrompt: sourceNarrator.systemPrompt ?? undefined,
 		permissionMode: sourceNarrator.permissionMode ?? undefined,
 		reasoningEffort: sourceNarrator.reasoningEffort ?? undefined,
@@ -1203,8 +1218,10 @@ async function createNarrator(
 	const events = new EventEmitter();
 	events.setMaxListeners(20);
 
-	const narratorModelRef = narrator.model ?? FOLLOW_DEFAULT_MODEL;
-	const narratorModel = resolveEffectiveModel(narratorModelRef);
+	const inheritedModel =
+		narrator.model === FOLLOW_PARENT_MODEL ? await resolveSubagentModelForRun(narrator) : null;
+	const narratorModelRef = inheritedModel?.modelRef ?? narrator.model ?? FOLLOW_DEFAULT_MODEL;
+	const narratorModel = inheritedModel?.model ?? resolveEffectiveModel(narratorModelRef);
 	const narratorProvider = resolveProvider(narratorModel);
 
 	const active: ActiveNarrator = {
@@ -1215,11 +1232,16 @@ async function createNarrator(
 		_persistedConversationId: effectiveConversationId ?? null,
 		cwd: narratorCwd,
 		_modelRef: narratorModelRef,
+		_modelSelectionRef: narrator.model ?? FOLLOW_DEFAULT_MODEL,
+		_followParentNarratorId:
+			narrator.model === FOLLOW_PARENT_MODEL ? narrator.parentNarratorId : undefined,
+		_inheritedReasoningEffort: inheritedModel?.reasoningEffort,
 		_settingsRevision: getSettingsRevision(),
 		model: narratorModel,
 		provider: narratorProvider,
 		_reasoningEffortRef: narrator.reasoningEffort ?? null,
 		reasoningEffort:
+			inheritedModel?.reasoningEffort ??
 			narrator.reasoningEffort ??
 			resolveDefaultReasoningEffort(narratorProvider, narratorModel) ??
 			null,
@@ -7004,9 +7026,78 @@ export function resolveRuntimeReasoningEffort(
 	return reasoningEffort ?? resolveDefaultReasoningEffort(provider, model) ?? null;
 }
 
+export const inheritedModelRuntime = createInheritedModelRuntime({
+	getActive: (id) => activeNarrators.get(id),
+	activeValues: () => activeNarrators.values(),
+	readNarrator: (id) =>
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, id),
+			columns: { model: true, parentNarratorId: true, subagentType: true, reasoningEffort: true },
+		}),
+	resolve: async (narrator, actingUserId, stickyProvider) => {
+		const settingsRevision = getSettingsRevision();
+		return {
+			...(await resolveSubagentModelForRun(narrator, actingUserId, stickyProvider)),
+			settingsRevision,
+		};
+	},
+	apply: (active, resolved) => {
+		active._modelRef = resolved.modelRef;
+		active.model = resolved.model;
+		active.provider = resolveProvider(resolved.model);
+		active._settingsRevision = resolved.settingsRevision;
+		active._inheritedReasoningEffort = resolved.reasoningEffort;
+		active.reasoningEffort = resolveRuntimeReasoningEffort(
+			active.provider,
+			active.model,
+			resolved.reasoningEffort ?? active._reasoningEffortRef,
+		);
+		broadcastToNarrator(active.narratorId, {
+			type: "model_changed",
+			narratorId: active.narratorId,
+			model: FOLLOW_PARENT_MODEL,
+		});
+		broadcastToNarrator(active.narratorId, {
+			type: "model_settings_changed",
+			narratorId: active.narratorId,
+			model: active.model,
+			reasoningEffort: active.reasoningEffort ?? null,
+			status: active._loopRunning ? "pending" : "updated",
+			applyAt: active._loopRunning ? "next_model_request" : "next_request",
+		});
+	},
+	reportError: (active, error) => {
+		logger.warn("Failed to refresh inherited runtime model", {
+			narratorId: active.narratorId,
+			error: String(error),
+		});
+	},
+});
+
+/** Await only at request boundaries, never cancel an already-running provider request. */
+export async function settleNarratorRuntimeModel(active: ActiveNarrator): Promise<void> {
+	await inheritedModelRuntime.settle(active);
+	while (
+		active.alive &&
+		active._modelSelectionRef === FOLLOW_PARENT_MODEL &&
+		active._settingsRevision !== getSettingsRevision()
+	) {
+		// A default/aggregation change must go through pool policy again, not the
+		// ordinary resolveEffectiveModel shortcut (which knows nothing about ACL).
+		inheritedModelRuntime.refresh(active);
+		await inheritedModelRuntime.settle(active);
+	}
+}
+
 export function updateNarratorModel(narratorId: string, model: string): void {
 	const active = activeNarrators.get(narratorId);
 	if (active?.alive) {
+		inheritedModelRuntime.select(active, model || FOLLOW_DEFAULT_MODEL);
+		if (model === FOLLOW_PARENT_MODEL) {
+			inheritedModelRuntime.refresh(active);
+			inheritedModelRuntime.parentChanged(narratorId);
+			return;
+		}
 		active._modelRef = model || FOLLOW_DEFAULT_MODEL;
 		active._settingsRevision = getSettingsRevision();
 		const effectiveModel = resolveEffectiveModel(active._modelRef, active.provider);
@@ -7031,7 +7122,10 @@ export function updateNarratorModel(narratorId: string, model: string): void {
 			status: active._loopRunning ? "pending" : "updated",
 			applyAt: active._loopRunning ? "next_model_request" : "next_request",
 		});
-	} else if (updateActiveSubagentModel(narratorId, resolveEffectiveModel(model))) {
+	} else if (
+		model !== FOLLOW_PARENT_MODEL &&
+		updateActiveSubagentModel(narratorId, resolveEffectiveModel(model))
+	) {
 		// Subagent: update lightweight settings map; loop picks it up via getRuntimeSettingsOverride
 		const effectiveModel = resolveEffectiveModel(model);
 		const sa = activeSubagentSettings.get(narratorId);
@@ -7044,6 +7138,7 @@ export function updateNarratorModel(narratorId: string, model: string): void {
 			applyAt: "next_model_request",
 		});
 	}
+	inheritedModelRuntime.parentChanged(narratorId);
 }
 
 export function updateNarratorReasoningEffort(
@@ -7056,7 +7151,7 @@ export function updateNarratorReasoningEffort(
 		active.reasoningEffort = resolveRuntimeReasoningEffort(
 			active.provider,
 			active.model,
-			active._reasoningEffortRef,
+			active._inheritedReasoningEffort ?? reasoningEffort,
 		);
 		broadcastToNarrator(narratorId, {
 			type: "model_settings_changed",

@@ -36,6 +36,7 @@ import { resolveNarratorProjectId } from "./narrator-project";
 import type { ScopedRevertUnavailableReason } from "./narrator-scoped-revert";
 import { invalidateWorkspaceTreeCache, resetActiveUpstreamSession } from "./narrator-session-state";
 import { assertProjectAccess } from "./project-acl";
+import { boundedDetail, collectRevertBlockers } from "./revert-blockers";
 import {
 	type RevertPlanFileCursor,
 	type RevertPlanOwner,
@@ -602,12 +603,33 @@ export async function prepareLocalRevertAction(
 		else if (/BUDGET|TOO_LARGE/.test(code)) unavailable = "window_too_large";
 		else if (/ACTIVE_WRITER|BUSY/.test(code)) unavailable = "pending_operations";
 		else if (/NAMESPACE|BLOB|CATALOG|MANIFEST/.test(code)) unavailable = "snapshot_missing";
+		// Name the actual holders instead of only the coarse reason. Diagnostics are
+		// advisory: they never widen the refused plan or soften the safety gate.
+		let blockers =
+			unavailable === "pending_operations" || unavailable === "incomplete_coverage"
+				? collectRevertBlockers(narratorId, code)
+				: undefined;
+		if (unavailable === "pending_operations" && (!blockers || blockers.length === 0)) {
+			// In-memory coordinator activity (write lease / registerActivity) has no
+			// durable tool row. Prefer a stable short label over error.message: that
+			// prose can embed absolute paths. Only error.code is a safe extra signal.
+			const busy = /BUSY/.test(code);
+			blockers = [
+				{
+					kind: busy ? "narrator_busy" : "uncoordinated_activity",
+					detail: boundedDetail(
+						busy ? "Narrator runtime is busy" : "Workspace write activity is still open",
+					),
+				},
+			];
+		}
 		return {
 			action: input.action,
 			plan: null,
 			executable: false as const,
 			unavailable,
 			historySummary: null,
+			...(blockers && blockers.length > 0 ? { blockers } : {}),
 		};
 	}
 }

@@ -15,7 +15,7 @@ import { resolveRuntimePolicy } from "../agent-runtime/policy";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
 const { extractSubagentToPrimary } = await import("../subagent-extract");
 const { narratorService } = await import("../narrator-service");
@@ -105,6 +105,30 @@ afterAll(() => {
 });
 
 describe("extractSubagentToPrimary", () => {
+	test("materializes a following child's current model before dropping the parent", async () => {
+		seedSubagent("following-sub");
+		await db
+			.update(narrators)
+			.set({ model: "__parent__" })
+			.where(eq(narrators.id, "following-sub"));
+		await db
+			.update(narrators)
+			.set({ model: "openai:parent-new" })
+			.where(eq(narrators.id, "parent"));
+		const extracted = await extractSubagentToPrimary("following-sub");
+		expect(extracted.model).toBe("openai:parent-new");
+		expect(extracted.parentNarratorId).toBeNull();
+		const source = await db.query.narrators.findFirst({ where: eq(narrators.id, "following-sub") });
+		expect(source?.model).toBe("__parent__");
+		await db
+			.update(narrators)
+			.set({ model: "openai:parent-later" })
+			.where(eq(narrators.id, "parent"));
+		const independent = await db.query.narrators.findFirst({
+			where: eq(narrators.id, extracted.id),
+		});
+		expect(independent?.model).toBe("openai:parent-new");
+	});
 	test("preserves partial reference cost coverage when materializing messages", async () => {
 		seedSubagent("sub");
 		seedSourceMessage("cost-message", "sub", 0, "answer");

@@ -14,6 +14,7 @@
  * - `narrator_tool_calls` are intentionally not copied (tool_use blocks remain in contentJson).
  * - `aclRootNarratorId = null` — primary narrators are judged on their own columns.
  */
+import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { asc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
@@ -33,6 +34,7 @@ import {
 	initializeRefSeqFloor,
 	withSeqFloorRaiseScope,
 } from "./narrator-refs/seq-store";
+import { resolveSubagentModelForRun } from "./subagent-model";
 
 /** Soft cap: above this, full materialization falls back to compressed context. */
 export const EXTRACT_FULL_MAX_MESSAGES = 2000;
@@ -150,6 +152,11 @@ export async function extractSubagentToPrimary(
 		}
 	}
 
+	// The extracted primary has no parent: materialize its current effective model.
+	const storedModel =
+		source.model === FOLLOW_PARENT_MODEL
+			? (await resolveSubagentModelForRun(source, source.ownerUserId)).model
+			: (source.model ?? FOLLOW_DEFAULT_MODEL);
 	const audiences = await resolveExtractAudiences(source);
 	const now = new Date().toISOString();
 	const id = generateId();
@@ -166,7 +173,7 @@ export async function extractSubagentToPrimary(
 					variant: "primary",
 					subagentType: null,
 					traits: ["standalone", "extracted-from-subagent"],
-					model: source.model ?? FOLLOW_DEFAULT_MODEL,
+					model: storedModel,
 					// Never inherit the subagent system prompt — primary control plane.
 					systemPrompt: null,
 					// Do not inherit explore/plan readOnly lockdown.

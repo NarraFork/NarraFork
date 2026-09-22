@@ -2,11 +2,16 @@ import { Alert, Badge, Button, Divider, Group, Loader, Modal, Stack, Text } from
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../../hooks/useAuth";
-import { useActualResolvedModel, useModelCatalog } from "../../../hooks/useModelCatalog";
+import {
+	useActualResolvedModel,
+	useActualResolvedModelCard,
+	useModelCatalog,
+} from "../../../hooks/useModelCatalog";
 import type { ModelOption } from "../../../lib/constants";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import { resolveCatalogEntry } from "../../../lib/model-catalog-view";
 import { Z } from "../../../lib/z-index";
+import { ModelCardDetails } from "../../settings/ModelCardDetails";
 import {
 	type CatalogEditorTarget,
 	CatalogMetadataFields,
@@ -62,6 +67,7 @@ export function ModelPriceModal({
 	const { data: user } = useCurrentUser();
 	const catalog = useModelCatalog(opened);
 	const actual = useActualResolvedModel(opened ? model?.value : undefined);
+	const card = useActualResolvedModelCard(opened ? model?.value : undefined);
 	const [editor, setEditor] = useState<CatalogEditorTarget | null>(null);
 	const readOnly = user?.role !== "admin";
 	const pricing = model?.pricing;
@@ -127,7 +133,18 @@ export function ModelPriceModal({
 							{referencePrice(actual.data.metadata.referencePricing?.input)} /{" "}
 							{referencePrice(actual.data.metadata.referencePricing?.output)}
 						</Text>
-						<CatalogMetadataFields resolved={actual.data} edits={{}} onChange={() => {}} readOnly />
+						{/* Complete v2 card when available; the v1 field list stays the fallback
+						    so a model whose card cannot resolve is still inspectable. */}
+						{card.data ? (
+							<ModelCardDetails card={card.data} />
+						) : (
+							<CatalogMetadataFields
+								resolved={actual.data}
+								edits={{}}
+								onChange={() => {}}
+								readOnly
+							/>
+						)}
 						<Group>
 							<Button
 								size="xs"

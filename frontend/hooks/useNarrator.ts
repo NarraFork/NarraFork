@@ -447,6 +447,7 @@ export function useRevertActionPreview(
 			affectedFiles: files,
 			previewIssue: issue,
 			previewError: current?.error,
+			blockers: response?.blockers,
 			narratorScope: {
 				available: !!plan && !issue && current?.filesComplete === true,
 				reason: response?.unavailable,

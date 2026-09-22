@@ -218,8 +218,10 @@ describe("real task producers use publication outbox", () => {
 		await startBash("large");
 		await tasks.markCompleted("large", "x".repeat(2 * 1024 * 1024));
 		const task = await tasks.getById("large");
-		expect(Buffer.byteLength(task?.output ?? "")).toBe(512 * 1024);
+		expect(Buffer.byteLength(task?.output ?? "")).toBeLessThan(5120);
+		expect(task?.output).toContain("toolcall_");
 		expect(task?.outputTruncated).toBe(true);
+		expect(task?.output).toContain("No Await is needed");
 		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
 	});
 

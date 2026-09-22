@@ -439,15 +439,41 @@ async function actionPrepared(
 	return plan;
 }
 async function actionUnavailable(response: Response, action: RevertAction) {
-	const body = await boundedJson(response);
+	const body = (await boundedJson(response)) as {
+		action: RevertAction;
+		plan: null;
+		executable: false;
+		unavailable: string;
+		historySummary: null;
+		blockers?: Array<{
+			kind: string;
+			toolCallId?: string;
+			toolName?: string;
+			operationId?: string;
+			leaseId?: string;
+			detail?: string;
+		}>;
+	};
 	expect(response.headers.get("cache-control")).toBe("no-store");
-	expect(body).toEqual({
+	const { blockers, ...rest } = body;
+	expect(rest).toEqual({
 		action,
 		plan: null,
 		executable: false,
 		unavailable: expect.any(String),
 		historySummary: null,
 	});
+	if (blockers !== undefined) {
+		expect(Array.isArray(blockers)).toBe(true);
+		expect(blockers.length).toBeGreaterThan(0);
+		for (const item of blockers) {
+			if (item.detail === undefined) continue;
+			// Fallback and collector details must stay bounded and free of raw paths.
+			expect(item.detail.length).toBeLessThanOrEqual(160);
+			expect(item.detail).not.toContain(workspace);
+			expect(item.detail).not.toMatch(/(^|[\s:"])(\/|\\|[A-Za-z]:[\\/])/);
+		}
+	}
 	expect(body.unavailable.length).toBeGreaterThan(0);
 	expect(ownPlans().filter((plan) => plan.status === "prepared")).toHaveLength(0);
 	return body;
@@ -2016,6 +2042,60 @@ describe("live/durable coordinator checks and unchanged state", () => {
 		try {
 			await refused(await prepare(), "REVERT_PLANNER_ACTIVE_WRITER");
 			expect(runtime.coordinator.capture(ownScope).externalFilesystemQuiescence).toBe("unknown");
+			const body = await actionUnavailable(await actionPreview("revert_files"), "revert_files");
+			expect(body.unavailable).toBe("pending_operations");
+			expect(body.blockers?.length).toBeGreaterThan(0);
+			// In-memory registerActivity has no durable tool row. Accept either the
+			// fallback marker or whatever live holder the collector could name.
+			expect(
+				body.blockers?.some((item) =>
+					[
+						"uncoordinated_activity",
+						"write_lease",
+						"pending_mutation",
+						"recovery_hold",
+						"scope_not_active",
+						"narrator_busy",
+						"pending_operation",
+					].includes(item.kind),
+				),
+				JSON.stringify(body.blockers),
+			).toBe(true);
+			// Fallback detail must be a stable short label, never error.message with paths.
+			for (const item of body.blockers ?? []) {
+				if (item.detail === undefined) continue;
+				expect(item.detail.length).toBeLessThanOrEqual(160);
+				expect(item.detail).not.toContain(workspace);
+			}
+		} finally {
+			runtime.coordinator.endActivity(activity);
+		}
+	});
+	test("a running tool call is named in blockers while ACTIVE_WRITER holds the workspace", async () => {
+		await fixture();
+		const ownScope = scope();
+		const binding = localFileChangeRuntimeBinding();
+		if (!binding) throw new Error("Missing runtime");
+		const call = await toolContext("Write", join(workspace, "busy.txt"), {
+			file_path: join(workspace, "busy.txt"),
+			content: "busy\n",
+		});
+		db.update(schema.narratorToolCalls)
+			.set({
+				status: "running",
+				inputJson: { file_path: "busy.txt", description: "fixture write" },
+			})
+			.where(eq(schema.narratorToolCalls.id, call.toolCallId))
+			.run();
+		const activity = runtime.coordinator.registerActivity({ scope: ownScope, runtime: binding });
+		try {
+			const body = await actionUnavailable(await actionPreview("revert_files"), "revert_files");
+			expect(body.unavailable).toBe("pending_operations");
+			const named = body.blockers?.find((item) => item.toolCallId === call.toolCallId);
+			expect(named).toMatchObject({ kind: "running_tool", toolName: "Write" });
+			expect(named?.detail).toContain("fixture write");
+			expect(named?.detail ?? "").not.toContain("busy.txt");
+			expect(named?.detail ?? "").not.toContain(workspace);
 		} finally {
 			runtime.coordinator.endActivity(activity);
 		}

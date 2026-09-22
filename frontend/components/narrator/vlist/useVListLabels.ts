@@ -170,6 +170,7 @@ export interface VListRenderLabels {
 		backgroundBadge: string;
 		/** "Taken over by user" badge on a card whose child the user is driving. */
 		takenOverBadge: string;
+		followParent: string;
 		/** File-changes section title. */
 		fileChanges: string;
 		/** Suffix for a file whose line counts are unknown. */
@@ -581,6 +582,7 @@ export function useVListLabels(): VListLabels {
 				waitingBadge: t("subagentWaitingPermissionTitle"),
 				backgroundBadge: t("backgroundBadge"),
 				takenOverBadge: t("subagentTakenOver"),
+				followParent: t("followParent"),
 				fileChanges: t("subagentChangedFiles"),
 				linesNotMeasured: t("subagentLinesNotMeasured"),
 				moreFiles: t("subagentMoreFiles"),

@@ -1,8 +1,17 @@
 /** NarraFork-owned model metadata storage and runtime integration. */
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { ModelCard } from "@shared/model-card";
+import { type ModelCardMutation, mutateRawLocal } from "@shared/model-catalog/card-local";
+import {
+	createModelCardResolver,
+	legacyLocalToRaw,
+	legacyMetadataToRaw,
+	type RawLocalState,
+} from "@shared/model-catalog/card-resolver";
 import bundledJSON from "@shared/model-catalog/dist/catalog.json";
 import type {
 	CatalogUpdateStatus,
@@ -26,17 +35,29 @@ import {
 import { getNarraforkHome } from "../narrafork-home";
 import { resolveNugModelMeta } from "../nug-model-cache";
 import type { NarraForkSettings } from "../settings/types";
+import { sanitizeCatalogErrorText } from "./error-text";
+import {
+	legacyScopeMetadata,
+	projectLocalMetadata,
+	projectResolvedCard,
+	rawLocalToLegacy,
+	reconcileLegacyLocal,
+} from "./local";
 import {
 	CATALOG_ARCHIVE_BASE,
 	CATALOG_REVISION_URL,
 	catalogFromArchive,
+	catalogSourceVersion,
+	catalogToRaw,
+	decodeCatalog,
+	encodeCatalog,
 	MAX_CATALOG_BYTES,
 	parseCatalogRevision,
 } from "./source";
 
 export interface ModelCatalogSettings {
 	schemaVersion: 1;
-	migrationVersion: 1;
+	migrationVersion: 1 | 2;
 	local: LocalCatalogState;
 	autoApply: boolean;
 	pinnedVersion: string | null;
@@ -47,7 +68,7 @@ export interface ModelCatalogSettings {
 		pricingOverrides: unknown;
 	};
 }
-const bundled = validateCatalog(bundledJSON);
+const bundled = decodeCatalog(bundledJSON);
 const directory = resolve(getNarraforkHome(), "model-catalog");
 const cachePath = resolve(directory, "snapshots.json");
 let active = bundled;
@@ -74,9 +95,9 @@ function atomicJSON(path: string, value: unknown): void {
 }
 function saveCache(next = active, nextHistory = history): void {
 	atomicJSON(cachePath, {
-		active: next,
-		history: nextHistory,
-		pending,
+		active: encodeCatalog(next),
+		history: nextHistory.map(encodeCatalog),
+		pending: pending ? encodeCatalog(pending) : undefined,
 		lastCheckedAt,
 		lastError,
 		etag,
@@ -85,14 +106,15 @@ function saveCache(next = active, nextHistory = history): void {
 try {
 	if (existsSync(cachePath)) {
 		const value = JSON.parse(readFileSync(cachePath, "utf8"));
-		active = validateCatalog(value.active);
-		history = (value.history ?? []).map(validateCatalog).slice(0, 5);
-		if (value.pending) pending = validateCatalog(value.pending);
+		active = decodeCatalog(value.active);
+		history = (value.history ?? []).map(decodeCatalog).slice(0, 5);
+		if (value.pending) pending = decodeCatalog(value.pending);
 		lastCheckedAt = value.lastCheckedAt;
 		etag = value.etag;
 	}
 } catch (error) {
-	lastError = `Cached catalog rejected; using bundled snapshot: ${String(error)}`;
+	// Snapshot `lastError` is visible to every session via GET / and GET /v2; scrub host paths.
+	lastError = `Cached catalog rejected; using bundled snapshot: ${sanitizeCatalogErrorText(error)}`;
 }
 
 export function legacyCardMetadata(card: ModelCard): ModelMetadata {
@@ -149,12 +171,19 @@ export function queryForModel(model: string): { query: ModelQuery; discovered?: 
 			query.channelId = info.channel;
 			query.providerKey = info.channelType;
 			query.upstreamModelId = info.bareModel;
-			const discovered: ModelMetadata = info.metadata?.metadata ?? {
-				...(info.contextWindow ? { limits: { contextWindow: info.contextWindow } } : {}),
-				...(info.effortLevels
-					? { reasoning: { levels: info.effortLevels, mode: "levels" as const } }
-					: {}),
-			};
+			// Prefer the v1 envelope when present; otherwise project the complete v2 card.
+			// The card path never replaces an existing envelope, so v1 projections that
+			// already consume `info.metadata` stay unchanged.
+			const discovered: ModelMetadata =
+				info.metadata?.metadata ??
+				(info.modelCard
+					? projectLocalMetadata(info.modelCard.metadata)
+					: {
+							...(info.contextWindow ? { limits: { contextWindow: info.contextWindow } } : {}),
+							...(info.effortLevels
+								? { reasoning: { levels: info.effortLevels, mode: "levels" as const } }
+								: {}),
+						});
 			return { query, discovered };
 		} catch {
 			/* Old gateway without cache: keep opaque upstream identity. */
@@ -163,21 +192,66 @@ export function queryForModel(model: string): { query: ModelQuery; discovered?: 
 	return { query };
 }
 
+/** Serialize one raw local document. In-memory schema-v1 fields are compatibility views only. */
+export function encodeModelCatalogSettings(value: ModelCatalogSettings) {
+	return {
+		...value,
+		schemaVersion: 2 as const,
+		migrationVersion: 2 as const,
+		local: legacyLocalToRaw(value.local),
+	};
+}
+export function settingsWithRawModelCatalog(value: NarraForkSettings) {
+	const cfg = value.agent.modelCatalog;
+	return cfg
+		? { ...value, agent: { ...value.agent, modelCatalog: encodeModelCatalogSettings(cfg) } }
+		: value;
+}
+function upgradeLocalSettings(settings: NarraForkSettings, save: () => void): void {
+	const previous = settings.agent.modelCatalog!;
+	const stored = previous as unknown as {
+		schemaVersion: number;
+		migrationVersion?: number;
+		local: RawLocalState;
+	};
+	if (stored.schemaVersion === 2) {
+		validateRawLocal(stored.local);
+		const local = rawLocalToLegacy(stored.local);
+		settings.agent.modelCatalog = { ...previous, schemaVersion: 1, migrationVersion: 2, local };
+		return;
+	}
+	if (stored.schemaVersion !== 1)
+		throw new Error("Unsupported model catalog storage schema; refusing downgrade");
+	if (previous.migrationVersion === 2) return;
+	const local = rawLocalToLegacy(legacyLocalToRaw(previous.local));
+	validateLocal(local);
+	const hash = createHash("sha256").update(JSON.stringify(previous)).digest("hex").slice(0, 20);
+	const backup = resolve(directory, `local-v1-${hash}.json`);
+	if (!existsSync(backup)) atomicJSON(backup, { modelCatalog: previous });
+	settings.agent.modelCatalog = { ...previous, migrationVersion: 2, local };
+	try {
+		save();
+	} catch (error) {
+		settings.agent.modelCatalog = previous;
+		throw error;
+	}
+}
 /** Conservative, idempotent migration. Old values are archived before any write. */
 export function bindModelCatalogSettings(settings: NarraForkSettings, save: () => void): void {
 	settingsRef = settings;
 	persistSettings = save;
 	observedLegacyWindows = structuredClone(settings.agent.modelContextWindows ?? {});
-	if (settings.agent.modelCatalog && settings.agent.modelCatalog.schemaVersion !== 1)
-		throw new Error("Unsupported model catalog storage schema; refusing downgrade");
-	if (settings.agent.modelCatalog) return;
+	if (settings.agent.modelCatalog) {
+		upgradeLocalSettings(settings, save);
+		return;
+	}
 	const legacyArchive = {
 		modelCards: structuredClone(settings.agent.modelCards ?? []),
 		modelContextWindows: structuredClone(settings.agent.modelContextWindows ?? {}),
 		pricingOverrides: structuredClone(settings.pricing?.overrides ?? {}),
 	};
 	atomicJSON(resolve(directory, "legacy-settings-backup.json"), settings);
-	const local: Required<LocalCatalogState> = {
+	const local: Required<Omit<LocalCatalogState, "legacyFields">> = {
 		revision: 0,
 		models: [],
 		variants: [],
@@ -230,6 +304,7 @@ export function bindModelCatalogSettings(settings: NarraForkSettings, save: () =
 			local.models.push({
 				...(base ?? { id }),
 				metadata: {},
+				rawMetadata: undefined, // Identity edits must not pin the preset's complete source.
 				name: card.displayName ?? base?.name,
 				family: card.family ?? base?.family,
 				notes: card.notes ?? base?.notes,
@@ -313,19 +388,28 @@ export function bindModelCatalogSettings(settings: NarraForkSettings, save: () =
 		pinnedVersion: null,
 		legacyArchive,
 	};
-	save();
+	upgradeLocalSettings(settings, save);
 }
 /** Adapt the remaining legacy per-model window settings editor to binding patches.
  * Only changed inputs are considered; untouched legacy values never re-pin reset fields. */
 export function reconcileLegacyWindowSettings(nextSettings: NarraForkSettings): void {
 	const cfg = nextSettings.agent.modelCatalog;
 	if (!cfg) return;
+	// Startup migrations call saveSettings before bindModelCatalogSettings has
+	// upgraded the stored document into its in-memory schema-v1 view, so the local
+	// layer here may still be the raw v2 source read from disk. Its source fields
+	// are not v1 metadata paths, and reconciling them through that view rejects
+	// them as unknown. Before the bind, observedLegacyWindows is also still empty,
+	// which would mark every already-persisted window as freshly changed and
+	// rewrite bindings the user never touched. Either way this editor has nothing
+	// to adapt yet: the windows on disk are exactly the ones the bindings encode.
+	if (!settingsRef || (cfg as { schemaVersion: number }).schemaVersion !== 1) return;
 	const windows = nextSettings.agent.modelContextWindows ?? {};
 	const changed = [
 		...new Set([...Object.keys(observedLegacyWindows), ...Object.keys(windows)]),
 	].filter((key) => observedLegacyWindows[key] !== windows[key]);
 	if (!changed.length) return;
-	const local = structuredClone(cfg.local);
+	let local = structuredClone(cfg.local);
 	const oldSettings = settingsRef;
 	settingsRef = nextSettings;
 	try {
@@ -335,9 +419,14 @@ export function reconcileLegacyWindowSettings(nextSettings: NarraForkSettings): 
 			local.bindings ??= [];
 			local.overrides ??= [];
 			const old = local.overrides.find((o) => o.target === "binding" && o.targetId === id);
-			const metadata = applyMetadataPatch(old?.metadata ?? {}, {
+			const metadata = applyMetadataPatch(legacyScopeMetadata(local, "binding", id), {
 				reset: ["limits.contextWindow", "limits.maxOutputTokens"],
 			});
+			const binding = local.bindings.find((b) => b.id === id);
+			if (binding?.overrides)
+				binding.overrides = applyMetadataPatch(binding.overrides, {
+					reset: ["limits.contextWindow", "limits.maxOutputTokens"],
+				});
 			if (value !== undefined) {
 				if (!Number.isInteger(value) || value <= 0)
 					throw new Error("Context window must be a positive integer");
@@ -367,6 +456,7 @@ export function reconcileLegacyWindowSettings(nextSettings: NarraForkSettings): 
 				local.overrides.push({ target: "binding", targetId: id, metadata, source: "user" });
 			else local.bindings = local.bindings.filter((b) => b.id !== id);
 		}
+		local = reconcileLegacyLocal(cfg.local, local);
 		validateLocal(local);
 		cfg.local = { ...local, revision: cfg.local.revision + 1 };
 	} finally {
@@ -397,12 +487,18 @@ export function resolveEffectiveMetadata(
 	discovered?: ModelMetadata,
 ): ResolvedModelMetadata {
 	const snapshot = requestSnapshots.getStore();
-	return resolveModelMetadata({
-		catalog: snapshot?.catalog ?? active,
-		local: snapshot?.local ?? settingsRef?.agent.modelCatalog?.local,
-		query,
-		discovered,
-	});
+	try {
+		return resolveModelMetadata({
+			catalog: snapshot?.catalog ?? active,
+			local: snapshot?.local ?? settingsRef?.agent.modelCatalog?.local,
+			query,
+			discovered,
+		});
+	} catch {
+		// Valid v2 limits can be impossible to express in v1's input-plus-output window.
+		// The raw resolver still rejects ambiguous identities and invalid original data.
+		return projectResolvedCard(resolveEffectiveModelCard(query, discovered));
+	}
 }
 /** Immutable request-local snapshot, including local overlays. */
 export function withModelMetadataSnapshot<T>(work: () => T): T {
@@ -600,6 +696,46 @@ export function getModelCatalogSnapshot(): ModelCatalogSnapshot {
 	};
 	return structuredClone({ catalog: active, local: cfg.local, update });
 }
+
+/** Complete v2 view. Existing v1 routes remain compatibility projections. */
+export function getModelCardSnapshot() {
+	const snapshot = getModelCatalogSnapshot();
+	return {
+		schemaVersion: 2 as const,
+		catalog: catalogToRaw(active),
+		local: legacyLocalToRaw(snapshot.local),
+		update: snapshot.update,
+	};
+}
+
+let cardResolverCache:
+	| {
+			catalog: CatalogDocument;
+			localKey: string;
+			resolve: ReturnType<typeof createModelCardResolver>;
+	  }
+	| undefined;
+export function resolveEffectiveModelCard(query: ModelQuery, discovered?: ModelMetadata) {
+	const scope = requestSnapshots.getStore();
+	const catalog = scope?.catalog ?? active;
+	const local = scope?.local ?? settingsRef?.agent.modelCatalog?.local ?? { revision: 0 };
+	const localKey = JSON.stringify(local);
+	if (cardResolverCache?.catalog !== catalog || cardResolverCache.localKey !== localKey) {
+		cardResolverCache = {
+			catalog,
+			localKey,
+			resolve: createModelCardResolver(catalogToRaw(catalog), legacyLocalToRaw(local)),
+		};
+	}
+	return cardResolverCache.resolve(
+		query,
+		discovered === undefined ? undefined : legacyMetadataToRaw(discovered),
+	);
+}
+export function getEffectiveModelCard(model: string) {
+	const { query, discovered } = queryForModel(model);
+	return { ...resolveEffectiveModelCard(query, discovered), resolvedQuery: query };
+}
 export class CatalogRevisionConflict extends Error {}
 
 /** Compatibility view only: never used for metadata resolution or cost matching. */
@@ -651,7 +787,7 @@ export function getLegacyModelCards(): {
 /** Old clients can edit only old leaves; all new capability fields survive. */
 export function saveLegacyModelCard(key: string, card: ModelCard | null, reset = false): void {
 	const cfg = state();
-	const local = structuredClone(cfg.local);
+	let local = structuredClone(cfg.local);
 	const id =
 		resolveModelMetadata({ catalog: active, query: { upstreamModelId: key } }).modelId ?? key;
 	if (!card && !reset) {
@@ -675,7 +811,9 @@ export function saveLegacyModelCard(key: string, card: ModelCard | null, reset =
 			"referencePricing.cacheRead",
 			"referencePricing.cacheWrite",
 		];
-		let metadata = applyMetadataPatch(old?.metadata ?? {}, { reset: legacyPaths });
+		let metadata = applyMetadataPatch(legacyScopeMetadata(local, "model", id), {
+			reset: legacyPaths,
+		});
 		if (card) {
 			const incoming = legacyCardMetadata(card);
 			// Legacy forms allowed shrinking context independently of the displayed output.
@@ -700,7 +838,8 @@ export function saveLegacyModelCard(key: string, card: ModelCard | null, reset =
 				...(local.models ?? []).filter((m) => m.id !== id),
 				{
 					...(base ?? existing ?? { id }),
-					metadata: existing?.metadata ?? {},
+					metadata: applyMetadataPatch(existing?.metadata ?? {}, { reset: legacyPaths }),
+					rawMetadata: existing?.rawMetadata,
 					name: card.displayName,
 					family: card.family,
 					notes: card.notes,
@@ -720,6 +859,9 @@ export function saveLegacyModelCard(key: string, card: ModelCard | null, reset =
 		if (Object.keys(metadata).length)
 			local.overrides.push({ target: "model", targetId: id, metadata, source: "user" });
 	}
+	local = reconcileLegacyLocal(cfg.local, local, {
+		deleted: !card && !reset ? new Set([`model:${id}`]) : undefined,
+	});
 	validateLocal(local);
 	local.revision++;
 	const previous = cfg.local;
@@ -767,11 +909,11 @@ export function mutateModelCatalog(mutation: ModelCatalogMutation): ModelCatalog
 	const cfg = state();
 	if (mutation.baseRevision !== cfg.local.revision)
 		throw new CatalogRevisionConflict("Model metadata changed; reload before saving");
-	const local = structuredClone(cfg.local);
-	const upsert = <T extends { id: string }>(items: T[] | undefined, item: T): T[] => [
-		...(items ?? []).filter((v) => v.id !== item.id),
-		item,
-	];
+	let local = structuredClone(cfg.local);
+	const upsert = <T extends { id: string }>(items: T[] | undefined, item: T): T[] =>
+		items?.some((v) => v.id === item.id)
+			? items.map((v) => (v.id === item.id ? item : v))
+			: [...(items ?? []), item];
 	switch (mutation.action) {
 		case "upsert-model":
 			local.models = upsert(local.models, mutation.model);
@@ -840,6 +982,13 @@ export function mutateModelCatalog(mutation: ModelCatalogMutation): ModelCatalog
 			throw new Error("Unknown catalog mutation");
 	}
 	validateLocal(local);
+	local = reconcileLegacyLocal(cfg.local, local, {
+		deleted:
+			mutation.action === "delete"
+				? new Set([`${mutation.target}:${mutation.targetId}`])
+				: undefined,
+	});
+	validateLocal(local);
 	if (JSON.stringify(local) === JSON.stringify(cfg.local)) return getModelCatalogSnapshot();
 	local.revision++;
 	const previous = cfg.local;
@@ -851,6 +1000,64 @@ export function mutateModelCatalog(mutation: ModelCatalogMutation): ModelCatalog
 		throw error;
 	}
 	return getModelCatalogSnapshot();
+}
+
+function validateRawLocal(local: RawLocalState, document = active): void {
+	const catalog = catalogToRaw(document);
+	const models = new Map(catalog.models.map((m) => [m.id, m]));
+	const variants = new Map(catalog.variants.map((v) => [v.id, v]));
+	for (const m of local.models ?? []) models.set(m.id, m);
+	for (const v of local.variants ?? []) variants.set(v.id, v);
+	const resolve = createModelCardResolver(catalog, local);
+	for (const override of local.overrides ?? []) {
+		if (
+			override.target === "model"
+				? !models.has(override.targetId)
+				: override.target === "variant"
+					? !variants.has(override.targetId)
+					: !local.bindings?.some((b) => b.id === override.targetId)
+		)
+			throw new Error("Unknown override target");
+	}
+	for (const m of models.values())
+		if (!local.hiddenModelIds?.includes(m.id)) resolve({ upstreamModelId: m.id, modelId: m.id });
+	for (const v of variants.values())
+		if (!local.hiddenModelIds?.includes(v.modelId) && !local.hiddenVariantIds?.includes(v.id))
+			resolve({
+				upstreamModelId: v.upstreamModelIds[0] ?? v.id,
+				variantId: v.id,
+				providerKey: v.providerKey,
+			});
+	for (const b of local.bindings ?? [])
+		resolve({
+			upstreamModelId: b.upstreamModelId,
+			providerId: b.providerId,
+			channelId: b.channelId,
+		});
+}
+
+export function mutateModelCard(mutation: ModelCardMutation) {
+	const cfg = state();
+	if (!Number.isSafeInteger(mutation.baseRevision) || mutation.baseRevision < 0)
+		throw new Error("baseRevision is required");
+	if (mutation.baseRevision !== cfg.local.revision)
+		throw new CatalogRevisionConflict("Model metadata changed; reload before saving");
+	const original = legacyLocalToRaw(cfg.local);
+	const next = mutateRawLocal(catalogToRaw(active), original, mutation);
+	validateRawLocal(next);
+	if (isDeepStrictEqual(original, next)) return getModelCardSnapshot();
+	if (next.revision === Number.MAX_SAFE_INTEGER)
+		throw new Error("Metadata revision limit exceeded");
+	next.revision++;
+	const previous = cfg.local;
+	cfg.local = rawLocalToLegacy(next);
+	try {
+		persistSettings?.();
+	} catch (error) {
+		cfg.local = previous;
+		throw error;
+	}
+	return getModelCardSnapshot();
 }
 async function boundedDownload(
 	url: string,
@@ -913,7 +1120,10 @@ export function checkModelCatalogUpdate(): Promise<ModelCatalogSnapshot> {
 					revision.version,
 					revision.publishedAt,
 				);
-				validateLocal(archiveReferencedDefinitions(state().local, candidate), candidate);
+				validateRawLocal(
+					legacyLocalToRaw(archiveReferencedDefinitions(state().local, candidate)),
+					candidate,
+				);
 				pending = candidate.catalogVersion === active.catalogVersion ? undefined : candidate;
 				etag = revisionDownload.etag;
 			}
@@ -922,11 +1132,13 @@ export function checkModelCatalogUpdate(): Promise<ModelCatalogSnapshot> {
 			if (
 				pending &&
 				state().autoApply &&
-				(!state().pinnedVersion || state().pinnedVersion === pending.catalogVersion)
+				(!state().pinnedVersion ||
+					catalogSourceVersion(state().pinnedVersion!) ===
+						catalogSourceVersion(pending.catalogVersion))
 			)
 				applyModelCatalogUpdate(pending.catalogVersion);
 		} catch (error) {
-			lastError = String(error);
+			lastError = sanitizeCatalogErrorText(error);
 			saveCache();
 		}
 		return getModelCatalogSnapshot();
@@ -979,7 +1191,7 @@ function archiveReferencedDefinitions(
 function activate(next: CatalogDocument): ModelCatalogSnapshot {
 	const cfg = state();
 	const nextLocal = archiveReferencedDefinitions(cfg.local, next);
-	validateLocal(nextLocal, next);
+	validateRawLocal(legacyLocalToRaw(nextLocal), next);
 	const nextHistory = [
 		active,
 		...history.filter(
@@ -1010,9 +1222,15 @@ function activate(next: CatalogDocument): ModelCatalogSnapshot {
 	return getModelCatalogSnapshot();
 }
 export function applyModelCatalogUpdate(version?: string): ModelCatalogSnapshot {
-	if (!pending || (version && pending.catalogVersion !== version))
+	if (
+		!pending ||
+		(version && catalogSourceVersion(pending.catalogVersion) !== catalogSourceVersion(version))
+	)
 		throw new Error("No checked catalog with this version");
-	if (state().pinnedVersion && state().pinnedVersion !== pending.catalogVersion)
+	if (
+		state().pinnedVersion &&
+		catalogSourceVersion(state().pinnedVersion!) !== catalogSourceVersion(pending.catalogVersion)
+	)
 		throw new Error("Catalog is pinned to a different version");
 	return activate(pending);
 }

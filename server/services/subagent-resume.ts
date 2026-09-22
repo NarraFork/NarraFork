@@ -12,7 +12,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { isSubagentVariant, parseSubstatus } from "../lib/narrator-utils";
 import { getToolMessage, type Locale } from "../lib/prompt-i18n";
-import { resolveEffectiveModel, resolveProvider } from "../lib/settings";
+import { resolveProvider } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { classifyRuntimeWriteError, runAtomicWrite } from "./agent-runtime/runtime-write";
@@ -31,6 +31,7 @@ import {
 	releaseManualOverrideClaim,
 	settleManualOverrideClaim,
 } from "./subagent-manual-override";
+import { resolveSubagentModelForRun } from "./subagent-model";
 import {
 	announceResumedBackgroundTask,
 	combineSubagentAbortSignals,
@@ -178,8 +179,10 @@ function extractPromptText(contentText: string | null | undefined): string {
 
 async function prepareResumeTurn(input: ResumeSubagentInput) {
 	const narrator = await narratorService.getById(input.subagentId);
-	const model = narrator.model ?? undefined;
-	const effectiveModel = resolveEffectiveModel(model);
+	const { model: effectiveModel } = await resolveSubagentModelForRun(
+		narrator,
+		input.executionPrincipal ? input.executionPrincipal.userId : (input.createdBy ?? null),
+	);
 	const provider = resolveProvider(effectiveModel);
 
 	let prompt = input.prompt ?? "";
@@ -252,6 +255,8 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 
 	return {
 		narrator,
+		effectiveModel,
+		provider,
 		prompt,
 		persistPrompt,
 		initialHistory,
@@ -595,8 +600,8 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 							}
 						: await loadSubagentHistory(
 								input.subagentId,
-								resolveEffectiveModel(prepared.narrator.model),
-								resolveProvider(resolveEffectiveModel(prepared.narrator.model)),
+								prepared.effectiveModel,
+								prepared.provider,
 								currentInput,
 							);
 
@@ -672,6 +677,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 				mailboxInput: input.mailboxInput,
 				initialHistory: prepared.initialHistory,
 				initialTrailingToolResults: prepared.initialTrailingToolResults,
+				initialHistoryModel: prepared.effectiveModel,
 				allowRunningRestart: input.allowRunningRestart || neverStarted,
 				skipStaleAttach: input.skipStaleAttach,
 				preserveBackground: input.preserveBackground,

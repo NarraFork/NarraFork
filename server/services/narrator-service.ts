@@ -1,6 +1,7 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import type { MessageOriginOptions } from "@shared/message-origin";
+import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { foldHandle } from "@shared/narrator-handle";
 import { and, desc, eq, inArray, isNotNull, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../db";
@@ -1227,6 +1228,9 @@ export async function prepareNarratorCreation(
 	const startInPlanMode = input.startInPlanMode ?? settings.agent.defaultStartInPlanMode;
 	const previousPermissionMode = startInPlanMode ? resolvedPermMode : null;
 	const planFileId = startInPlanMode ? generateWordSlug() : null;
+	if (input.model === FOLLOW_PARENT_MODEL) {
+		throw new ValidationError("Only subagents can follow a parent model");
+	}
 	const storedModel = input.model ?? FOLLOW_DEFAULT_MODEL;
 	// Do not固化 the global default: store null unless an explicit effort was
 	// passed. A null reasoningEffort means "follow the global default", which
@@ -1450,7 +1454,11 @@ export const narratorService = {
 			defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
 		});
 
-		const resolvedModel = resolveEffectiveModel(input.model ?? parent.model);
+		// Preserve inheritance instead of freezing the parent's current model at creation.
+		const storedModel =
+			!input.model || input.model === FOLLOW_PARENT_MODEL
+				? FOLLOW_PARENT_MODEL
+				: resolveEffectiveModel(input.model);
 		// Inherit the parent's explicit override if any; otherwise store null
 		// (follow the global default). Never固化 the resolved default here.
 		const resolvedReasoningEffort = input.reasoningEffort ?? parent.reasoningEffort ?? null;
@@ -1471,7 +1479,7 @@ export const narratorService = {
 				variant: subagentVariant(input.subagentType),
 				traits: subTraits,
 				title: input.title ?? null,
-				model: resolvedModel,
+				model: storedModel,
 				systemPrompt: input.systemPrompt ?? null,
 				permissionMode: resolvedPermMode,
 				reasoningEffort: resolvedReasoningEffort,
@@ -2813,6 +2821,7 @@ export const narratorService = {
 	getMessageVersion: narratorMessageQueries.getMessageVersion.bind(narratorMessageQueries),
 	getMessageLocation: narratorMessageQueries.getMessageLocation.bind(narratorMessageQueries),
 	getMessagesAfter: narratorMessageQueries.getMessagesAfter.bind(narratorMessageQueries),
+	getHistoryRecovery: narratorMessageQueries.getHistoryRecovery.bind(narratorMessageQueries),
 	getToolCallDetail: narratorMessageQueries.getToolCallDetail.bind(narratorMessageQueries),
 	getToolCallPreviewMetadata:
 		narratorMessageQueries.getToolCallPreviewMetadata.bind(narratorMessageQueries),

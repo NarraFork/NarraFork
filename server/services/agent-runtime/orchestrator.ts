@@ -4,6 +4,7 @@ import { KIMI_QUOTA_EXHAUSTED } from "@shared/agent-protocol/quota-exhausted";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
 import { formatOriginLabel } from "@shared/message-origin";
+import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import { narrators } from "../../db/schema";
@@ -145,6 +146,7 @@ import {
 	getSubagentFinalText,
 	getSubagentResultMessageId,
 	hasPendingBufferedWork,
+	inheritedModelRuntime,
 	maybeStartContinuation,
 	parseQueuedGoalCommand,
 	parseQueuedNewCommand,
@@ -154,6 +156,8 @@ import {
 	resolveRuntimeReasoningEffort,
 	resolveSessionDevices,
 	setNarratorDefaultDevice,
+	settleNarratorRuntimeModel,
+	updateNarratorModel,
 	updateToolCallConclusion,
 } from "../narrator-session";
 import type { ActiveNarrator, BufferedMessage } from "../narrator-session-state";
@@ -492,6 +496,7 @@ export async function runAgentLoopUnlocked(
 			clearActiveHistoryCompactPending(narratorId);
 
 			// Rebuild system prompt each iteration so AGENTS.md/CLAUDE.md changes are picked up.
+			const modelVersionBeforeLoad = active._modelRefreshVersion;
 			const freshNarrator = await narratorService.getById(narratorId);
 			const oauthRuntime = await assertOAuthNarratorRuntimeActive(
 				narratorId,
@@ -517,27 +522,43 @@ export async function runAgentLoopUnlocked(
 				? rawMessages.map((m) => ({ ...m, parentToolUseId: null }))
 				: rawMessages;
 
-			active._modelRef =
-				!runState.initialSettingsApplied && profile.kind === "subagent"
-					? (profile.initialModel ?? freshNarrator.model ?? FOLLOW_DEFAULT_MODEL)
-					: (freshNarrator.model ?? FOLLOW_DEFAULT_MODEL);
+			// The row is authoritative, including a pin made after the executor built
+			// its one-time snapshot. initialModel only identifies the initial history.
+			const modelSelectionRef = freshNarrator.model ?? FOLLOW_DEFAULT_MODEL;
+			if (
+				active._modelRefreshVersion !== modelVersionBeforeLoad &&
+				active._modelSelectionRef !== undefined
+			) {
+				// A live update landed while the DB/OAuth/device snapshot was awaited.
+				// That newer selection must not be replaced by the pass's older row.
+				await settleNarratorRuntimeModel(active);
+			} else {
+				inheritedModelRuntime.select(active, modelSelectionRef, freshNarrator.parentNarratorId);
+				active._reasoningEffortRef = freshNarrator.reasoningEffort ?? null;
+				if (modelSelectionRef === FOLLOW_PARENT_MODEL) {
+					inheritedModelRuntime.refresh(active);
+					await settleNarratorRuntimeModel(active);
+				} else {
+					active._modelRef = modelSelectionRef;
+					active._settingsRevision = getSettingsRevision();
+					active.model = resolveEffectiveModel(modelSelectionRef, active.provider);
+					active.provider = resolveProvider(active.model);
+					active.reasoningEffort = resolveRuntimeReasoningEffort(
+						active.provider,
+						active.model,
+						active._reasoningEffortRef,
+					);
+				}
+			}
 			runState.initialSettingsApplied = true;
-			active._settingsRevision = getSettingsRevision();
-			active.model = resolveEffectiveModel(active._modelRef, active.provider);
 			const turnModelRef = active._modelRef;
 			const turnEffectiveModel = active.model;
-			active.provider = resolveProvider(active.model);
-			active._reasoningEffortRef = freshNarrator.reasoningEffort ?? null;
-			active.reasoningEffort = resolveRuntimeReasoningEffort(
-				active.provider,
-				active.model,
-				active._reasoningEffortRef,
-			);
+			const turnModelRefreshVersion = active._modelRefreshVersion;
 			const resolved = resolveProviderAndModel(active.model, active.provider);
 			active.provider = resolved.provider;
 			recordNarratorRuntimeModel(
 				narratorId,
-				active._modelRef ?? FOLLOW_DEFAULT_MODEL,
+				active._modelSelectionRef ?? active._modelRef ?? FOLLOW_DEFAULT_MODEL,
 				resolved.provider,
 				resolved.model,
 			);
@@ -579,7 +600,15 @@ export async function runAgentLoopUnlocked(
 				currentInput: runState.input.text,
 			});
 			let { history, trailingToolResults } = preparedHistory;
-			const usesInitialHistory = runState.firstPass && profile.kind === "subagent";
+			// The caller's history was formatted using its initial model. A parent or
+			// manual change can select another protocol before this first pass starts.
+			// Never overwrite the freshly rebuilt history with that obsolete snapshot.
+			const usesInitialHistory =
+				runState.firstPass &&
+				profile.kind === "subagent" &&
+				active._modelSelectionRef !== FOLLOW_PARENT_MODEL &&
+				(profile.initialModel === active.model ||
+					(!profile.initialModel && profile.initialHistory?.length === 0));
 			if (usesInitialHistory && profile.kind === "subagent") {
 				history = profile.initialHistory;
 				trailingToolResults = profile.initialTrailingToolResults ?? [];
@@ -999,9 +1028,7 @@ export async function runAgentLoopUnlocked(
 				},
 			};
 
-			const resolvedReasoningEffort =
-				freshNarrator.reasoningEffort ||
-				resolveDefaultReasoningEffort(resolved.provider, resolved.model);
+			const resolvedReasoningEffort = active.reasoningEffort ?? undefined;
 
 			// Resolved per turn, not frozen at creation: an "inherit" override follows
 			// the acting user's fastModeDefault preference, so flipping that default
@@ -1285,13 +1312,17 @@ export async function runAgentLoopUnlocked(
 					}
 					return turnText ?? "";
 				},
-				getRuntimeSettingsOverride: () => {
+				getRuntimeSettingsOverride: async () => {
+					await settleNarratorRuntimeModel(active);
 					// active.model/reasoningEffort are updated in real time by narrator routes.
 					// For raw refs that follow settings (__default__ / __agg__), also re-resolve
 					// when global settings change so the next API request picks up default-model
 					// or aggregation membership/routing updates, including retry attempts.
 					const revision = getSettingsRevision();
-					if (active._settingsRevision !== revision) {
+					if (
+						active._modelSelectionRef !== FOLLOW_PARENT_MODEL &&
+						active._settingsRevision !== revision
+					) {
 						active._settingsRevision = revision;
 						const modelRef = active._modelRef ?? FOLLOW_DEFAULT_MODEL;
 						const resolvedModel = resolveEffectiveModel(modelRef, active.provider);
@@ -1544,8 +1575,11 @@ export async function runAgentLoopUnlocked(
 					target: active,
 					isCurrent: () => active.alive && owner.isCurrent(),
 					hasModelChanged: () =>
+						active._modelRefreshVersion !== turnModelRefreshVersion ||
 						active._modelRef !== turnModelRef ||
 						active.model !== turnEffectiveModel ||
+						(active._modelSelectionRef === FOLLOW_PARENT_MODEL &&
+							active._settingsRevision !== getSettingsRevision()) ||
 						(turnModelRef === FOLLOW_DEFAULT_MODEL &&
 							resolveEffectiveModel(turnModelRef, active.provider) !== turnEffectiveModel),
 					subscribe: subscribeSettingsChanges,
@@ -2873,6 +2907,9 @@ export async function runAgentLoopUnlocked(
 								updatedAt: new Date().toISOString(),
 							})
 							.where(eq(narrators.id, narratorId));
+						updateNarratorModel(narratorId, restoreModel);
+						// The primary active is already marked dead above, so the live
+						// updater only propagates to followers; still publish this DB restore.
 						broadcastToNarrator(narratorId, {
 							type: "model_changed",
 							narratorId,

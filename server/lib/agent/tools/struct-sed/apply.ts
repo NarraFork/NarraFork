@@ -6,6 +6,7 @@
  * both the dry-run preview and the applied write.
  */
 
+import { countDiffLineStats, type DiffLineStats } from "@shared/pretext-layout/diff-core";
 import {
 	appendAfter,
 	deleteRange,
@@ -18,6 +19,7 @@ import {
 	substituteInRange,
 } from "../../structural/edit-ops";
 import { normalizeLineEndings } from "../encoding";
+import { lineStatsMetadata, wholeFileLineStats } from "../file-diff-stats";
 import {
 	type Command,
 	DIFF_CONTEXT_LINES,
@@ -127,20 +129,54 @@ export function diffWindow(
 }
 
 /**
+ * Added/removed line counts for an actual before → after rewrite.
+ *
+ * MUST compare the real two texts. An earlier version passed `selected region` vs
+ * `content ?? ""`, which is only right for `replace`/`delete`: `substitute` has no
+ * `content`, so an 89-line selection with one token rewritten reported `-89` — the
+ * whole range looked deleted while the card showed a one-line edit. `insert`/`append`
+ * have the mirror-image bug (region vs inserted text pretends the kept lines vanished),
+ * and `copy`/`move` have no single "replacement text" at all.
+ *
+ * Whole-file first (same budget Edit uses on the main thread). When that exceeds the
+ * budget, fall back to the changed window alone — the common case for a surgical
+ * substitute in a large file, which is exactly when the wrong figure used to appear.
+ */
+export function changeLineStats(
+	before: string,
+	after: string,
+	window?: ReturnType<typeof diffWindow>,
+): DiffLineStats | null {
+	const whole = wholeFileLineStats(before, after);
+	if (whole) return whole;
+	const win = window ?? diffWindow(before, after);
+	if (!win) return null;
+	return countDiffLineStats(win.oldText, win.newText);
+}
+
+/**
  * The card's diff metadata for a change, or `{}` when it should not carry one.
  *
  * Shared by the preview and the applied write so BOTH show a diff. Before this, only the
  * dry run carried diff fields, so a preview rendered a rich red/green diff while the actual
  * write showed a one-line summary — the preview looked more "done" than the real edit. Now
  * the two differ only by the preview banner, not by whether a diff appears at all.
+ *
+ * Also carries `linesAdded`/`linesRemoved` from the same before/after pair, so the header
+ * figure cannot drift from the painted diff. Absent (not zero) when the count cannot be
+ * established — see `changeLineStats`.
  */
 export function diffMetadata(before: string, after: string): Record<string, string | number> {
 	const window = diffWindow(before, after);
-	if (!window) return {};
 	return {
-		diffBefore: window.oldText,
-		diffAfter: window.newText,
-		diffStartLine: window.startLine,
+		...(window
+			? {
+					diffBefore: window.oldText,
+					diffAfter: window.newText,
+					diffStartLine: window.startLine,
+				}
+			: {}),
+		...lineStatsMetadata(changeLineStats(before, after, window)),
 	};
 }
 

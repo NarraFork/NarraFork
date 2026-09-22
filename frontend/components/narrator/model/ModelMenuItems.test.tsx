@@ -5,9 +5,15 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
-import type { ModelAggregation, ModelOption } from "../../../lib/constants";
+import {
+	FOLLOW_PARENT_MODEL,
+	type ModelAggregation,
+	type ModelOption,
+	resolveDisplayModel,
+} from "../../../lib/constants";
 import narratorLocale from "../../../locales/en/narrator.json";
 import settingsLocale from "../../../locales/en/settings.json";
+import narratorZhLocale from "../../../locales/zh-CN/narrator.json";
 import { ModelMenuItems } from "./ModelMenuItems";
 
 const aggregations: ModelAggregation[] = [
@@ -68,7 +74,10 @@ beforeEach(async () => {
 	instance = i18next.createInstance();
 	await instance.use(initReactI18next).init({
 		lng: "en",
-		resources: { en: { narrator: narratorLocale, settings: settingsLocale } },
+		resources: {
+			en: { narrator: narratorLocale, settings: settingsLocale },
+			"zh-CN": { narrator: narratorZhLocale },
+		},
 		react: { useSuspense: false },
 	});
 	host = document.createElement("div");
@@ -175,6 +184,38 @@ async function flushFrames() {
 		for (const callback of callbacks) callback(0);
 	});
 }
+
+describe("follow parent selection", () => {
+	test.each([
+		["en", "Follow parent"],
+		["zh-CN", "跟随主代理"],
+	])("shows an honest follow label in %s and keeps concrete selection working", async (language, label) => {
+		await instance.changeLanguage(language);
+		await render(FOLLOW_PARENT_MODEL, models, true, true, {
+			withGlobalRoleActions: true,
+			onShowPrice: () => {
+				throw new Error("Parent has no resolved price metadata");
+			},
+		});
+		const follow = button(label);
+		expect(follow.disabled).toBe(true);
+		expect(follow.querySelector('[role="button"]')).toBeNull();
+		expect(host.textContent).not.toContain(FOLLOW_PARENT_MODEL);
+		await act(async () => button("One").click());
+		expect(selected).toEqual(["a:one"]);
+	});
+
+	test("does not invent a concrete model from the global default", () => {
+		expect(
+			resolveDisplayModel(FOLLOW_PARENT_MODEL, { defaultModelValue: "a:one", aggregations }),
+		).toBe(FOLLOW_PARENT_MODEL);
+	});
+
+	test("does not offer follow-parent for a concrete or primary selection", async () => {
+		await render("a:one");
+		expect(host.textContent).not.toContain("Follow parent");
+	});
+});
 
 describe("catalog details access", () => {
 	test("metadata details work without billing prices and resolve follow-default to the actual model", async () => {

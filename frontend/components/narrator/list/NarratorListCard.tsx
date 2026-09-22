@@ -20,7 +20,7 @@ import { Link } from "@tanstack/react-router";
 import type { MouseEvent, PointerEvent } from "react";
 import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
-import { FOLLOW_DEFAULT_MODEL } from "../../../lib/constants";
+import { FOLLOW_DEFAULT_MODEL, FOLLOW_PARENT_MODEL } from "../../../lib/constants";
 import { formatSmartTime } from "../../../lib/format";
 import { startPointerDrag } from "../../../lib/panel-drag";
 import { highlightSearchText } from "../../../lib/search-utils";
@@ -171,11 +171,13 @@ function NarratorMeta({
 }) {
 	const { t } = useTranslation("narrators");
 	const modelLabel = clampNarratorListText(
-		narrator.model === FOLLOW_DEFAULT_MODEL
-			? t("followDefault", {
-					model: clampNarratorListText(defaultModelValue, MAX_NARRATOR_LIST_META_CHARS),
-				})
-			: narrator.model,
+		narrator.model === FOLLOW_PARENT_MODEL
+			? t("narrator:followParent")
+			: narrator.model === FOLLOW_DEFAULT_MODEL
+				? t("followDefault", {
+						model: clampNarratorListText(defaultModelValue, MAX_NARRATOR_LIST_META_CHARS),
+					})
+				: narrator.model,
 		MAX_NARRATOR_LIST_META_CHARS,
 	);
 	return (

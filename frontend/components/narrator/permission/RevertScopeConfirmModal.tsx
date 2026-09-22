@@ -227,6 +227,7 @@ export function RevertScopeConfirmModal({
 				(revertBlocked && conflicts.length === 0 ? "revertScopeUnavailable" : null));
 	const unavailableKey = planUnavailable ?? scopeUnavailable;
 	const workspaceWarningText = formatRevertWarnings(t, workspaceScope?.warnings);
+	const blockers = data?.blockers ?? [];
 	const subagentWarningText = narratorScope?.subagentWarning
 		? formatRevertWarning(t, {
 				code: "SUBAGENT_CHANGES_REVERTED",
@@ -302,6 +303,40 @@ export function RevertScopeConfirmModal({
 							<Alert color="yellow" variant="light" title={t("revertScopeUnavailableTitle")}>
 								<Text size="xs">{t(unavailableKey)}</Text>
 								{data?.previewError && <Text size="xs">{data.previewError}</Text>}
+								{blockers.length > 0 && (
+									<Stack gap={4} mt="xs">
+										<Text size="xs" fw={500}>
+											{t("revertBlockersTitle")}
+										</Text>
+										{blockers.map((blocker, index) => {
+											const kindLabel = t(`revertBlockerKind.${blocker.kind}`, {
+												defaultValue: t("revertBlockerKind.unknown"),
+											});
+											const who = blocker.toolName
+												? `${blocker.toolName}${blocker.toolCallId ? ` (${blocker.toolCallId.slice(0, 8)})` : ""}`
+												: blocker.leaseId
+													? blocker.leaseId.slice(0, 12)
+													: blocker.operationId
+														? blocker.operationId.slice(0, 12)
+														: null;
+											return (
+												<Text
+													key={`${blocker.kind}-${blocker.toolCallId ?? blocker.operationId ?? blocker.leaseId ?? index}`}
+													size="xs"
+												>
+													• {kindLabel}
+													{who ? ` — ${who}` : ""}
+													{blocker.detail ? `: ${blocker.detail}` : ""}
+												</Text>
+											);
+										})}
+										<Text size="xs" c="dimmed">
+											{blockers.some((blocker) => blocker.kind === "running_tool")
+												? t("revertBlockersStopRunning")
+												: t("revertBlockersLeftover")}
+										</Text>
+									</Stack>
+								)}
 								<Text size="xs">{t("revertScopeKeepFiles")}</Text>
 							</Alert>
 						)}

@@ -1,1153 +1,1011 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:narrafork:model-metadata",
-  "$comment": "v1: missing leaf inherits; null is explicit unknown; false, [] and canonical decimal string 0 are real values. Arrays replace. Objects merge by leaf. Priority: binding local > variant local > model local > discovered > preset variant > preset model > adapter defaults. Identity: explicit binding/query, then scope, exact, alias, declared suffix, longest prefix; ties reject. Weak fields filters apply to inherited model/variant layers; prefix prices require explicit referencePricing field permission. Runtime validation additionally checks references, conflicts, merged maxOutputTokens/contextWindow and reasoning default membership. No actual billing or instance connection configuration belongs in this document.",
-  "$ref": "#/$defs/CatalogDocument",
-  "$defs": {
-    "Modality": {
-      "enum": [
-        "text",
-        "image",
-        "audio",
-        "video"
-      ]
-    },
-    "ReferencePrices": {
-      "type": "object",
-      "properties": {
-        "input": {
-          "anyOf": [
-            {
-              "type": "string",
-              "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "output": {
-          "anyOf": [
-            {
-              "type": "string",
-              "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "cacheRead": {
-          "anyOf": [
-            {
-              "type": "string",
-              "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "cacheWrite": {
-          "anyOf": [
-            {
-              "type": "string",
-              "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false
-    },
-    "ModelMetadata": {
-      "type": "object",
-      "properties": {
-        "limits": {
-          "type": "object",
-          "properties": {
-            "contextWindow": {
-              "anyOf": [
-                {
-                  "type": "integer",
-                  "minimum": 1,
-                  "maximum": 9007199254740991
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "maxOutputTokens": {
-              "anyOf": [
-                {
-                  "type": "integer",
-                  "minimum": 1,
-                  "maximum": 9007199254740991
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "additionalProperties": false
-        },
-        "modalities": {
-          "type": "object",
-          "properties": {
-            "input": {
-              "anyOf": [
-                {
-                  "type": "array",
-                  "items": {
-                    "enum": [
-                      "text",
-                      "image",
-                      "audio",
-                      "video"
-                    ]
-                  },
-                  "uniqueItems": true
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "output": {
-              "anyOf": [
-                {
-                  "type": "array",
-                  "items": {
-                    "enum": [
-                      "text",
-                      "image",
-                      "audio",
-                      "video"
-                    ]
-                  },
-                  "uniqueItems": true
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "additionalProperties": false
-        },
-        "nativeSearch": {
-          "type": "object",
-          "properties": {
-            "supported": {
-              "anyOf": [
-                {
-                  "type": "boolean"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "additionalProperties": false
-        },
-        "reasoning": {
-          "type": "object",
-          "properties": {
-            "supported": {
-              "anyOf": [
-                {
-                  "type": "boolean"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "mode": {
-              "anyOf": [
-                {
-                  "enum": [
-                    "levels",
-                    "fixed",
-                    "budget",
-                    "unknown"
-                  ]
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "levels": {
-              "anyOf": [
-                {
-                  "type": "array",
-                  "items": {
-                    "type": "string",
-                    "minLength": 1
-                  },
-                  "uniqueItems": true
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "canDisable": {
-              "anyOf": [
-                {
-                  "type": "boolean"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "defaultLevel": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "minLength": 1
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "additionalProperties": false
-        },
-        "referencePricing": {
-          "type": "object",
-          "properties": {
-            "input": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "output": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "cacheRead": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "cacheWrite": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "currency": {
-              "enum": [
-                "USD"
-              ]
-            },
-            "unit": {
-              "enum": [
-                "perMillionTokens"
-              ]
-            },
-            "longContext": {
-              "type": "object",
-              "properties": {
-                "input": {
-                  "anyOf": [
-                    {
-                      "type": "string",
-                      "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                },
-                "output": {
-                  "anyOf": [
-                    {
-                      "type": "string",
-                      "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                },
-                "cacheRead": {
-                  "anyOf": [
-                    {
-                      "type": "string",
-                      "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                },
-                "cacheWrite": {
-                  "anyOf": [
-                    {
-                      "type": "string",
-                      "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                },
-                "thresholdTokens": {
-                  "anyOf": [
-                    {
-                      "type": "integer",
-                      "minimum": 1,
-                      "maximum": 9007199254740991
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                },
-                "basis": {
-                  "enum": [
-                    "promptTokens"
-                  ]
-                },
-                "mode": {
-                  "anyOf": [
-                    {
-                      "enum": [
-                        "full",
-                        "marginal"
-                      ]
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                }
-              },
-              "additionalProperties": false
-            }
-          },
-          "additionalProperties": false
-        }
-      },
-      "additionalProperties": false
-    },
-    "MetadataSource": {
-      "type": "object",
-      "properties": {
-        "label": {
-          "type": "string",
-          "minLength": 1
-        },
-        "url": {
-          "type": "string",
-          "format": "uri"
-        },
-        "fields": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1
-          },
-          "uniqueItems": true
-        },
-        "verifiedAt": {
-          "type": "string",
-          "format": "date-time"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "label"
-      ]
-    },
-    "MatchRules": {
-      "type": "object",
-      "properties": {
-        "ids": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1
-          },
-          "uniqueItems": true
-        },
-        "aliases": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1
-          },
-          "uniqueItems": true
-        },
-        "prefixes": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1
-          },
-          "uniqueItems": true
-        },
-        "volatileSuffixes": {
-          "type": "boolean"
-        },
-        "fields": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1
-          },
-          "uniqueItems": true
-        }
-      },
-      "additionalProperties": false
-    },
-    "ModelDefinition": {
-      "type": "object",
-      "properties": {
-        "id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "name": {
-          "type": "string",
-          "minLength": 1
-        },
-        "vendor": {
-          "type": "string",
-          "minLength": 1
-        },
-        "family": {
-          "type": "string",
-          "minLength": 1
-        },
-        "notes": {
-          "type": "string",
-          "minLength": 1
-        },
-        "matches": {
-          "$ref": "#/$defs/MatchRules"
-        },
-        "metadata": {
-          "$ref": "#/$defs/ModelMetadata"
-        },
-        "status": {
-          "enum": [
-            "verified",
-            "legacy-unverified",
-            "deprecated"
-          ]
-        },
-        "sources": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/MetadataSource"
-          }
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "id",
-        "metadata"
-      ]
-    },
-    "ModelVariant": {
-      "type": "object",
-      "properties": {
-        "id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "modelId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "providerKey": {
-          "type": "string",
-          "minLength": 1
-        },
-        "upstreamModelIds": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1
-          },
-          "uniqueItems": true
-        },
-        "name": {
-          "type": "string",
-          "minLength": 1
-        },
-        "matches": {
-          "$ref": "#/$defs/MatchRules"
-        },
-        "metadata": {
-          "$ref": "#/$defs/ModelMetadata"
-        },
-        "status": {
-          "enum": [
-            "verified",
-            "legacy-unverified",
-            "deprecated"
-          ]
-        },
-        "sources": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/MetadataSource"
-          }
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "id",
-        "modelId",
-        "providerKey",
-        "upstreamModelIds",
-        "metadata"
-      ]
-    },
-    "CatalogDocument": {
-      "type": "object",
-      "properties": {
-        "schemaVersion": {
-          "enum": [
-            1
-          ]
-        },
-        "catalogVersion": {
-          "type": "string",
-          "minLength": 1
-        },
-        "publishedAt": {
-          "type": "string",
-          "format": "date-time"
-        },
-        "models": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ModelDefinition"
-          }
-        },
-        "variants": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ModelVariant"
-          }
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "schemaVersion",
-        "catalogVersion",
-        "publishedAt",
-        "models",
-        "variants"
-      ]
-    },
-    "ModelBinding": {
-      "type": "object",
-      "properties": {
-        "id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "providerId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "channelId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "upstreamModelId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "modelId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "variantId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "overrides": {
-          "$ref": "#/$defs/ModelMetadata"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "id",
-        "upstreamModelId"
-      ]
-    },
-    "ModelOverride": {
-      "type": "object",
-      "properties": {
-        "target": {
-          "enum": [
-            "model",
-            "variant",
-            "binding"
-          ]
-        },
-        "targetId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "metadata": {
-          "$ref": "#/$defs/ModelMetadata"
-        },
-        "source": {
-          "enum": [
-            "user",
-            "legacy-local"
-          ]
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "target",
-        "targetId",
-        "metadata"
-      ]
-    },
-    "LocalCatalogState": {
-      "type": "object",
-      "properties": {
-        "revision": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991
-        },
-        "models": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ModelDefinition"
-          }
-        },
-        "variants": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ModelVariant"
-          }
-        },
-        "bindings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ModelBinding"
-          }
-        },
-        "overrides": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ModelOverride"
-          }
-        },
-        "hiddenModelIds": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1
-          },
-          "uniqueItems": true
-        },
-        "hiddenVariantIds": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1
-          },
-          "uniqueItems": true
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "revision"
-      ]
-    },
-    "ModelQuery": {
-      "type": "object",
-      "properties": {
-        "upstreamModelId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "providerKey": {
-          "type": "string",
-          "minLength": 1
-        },
-        "providerId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "channelId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "modelId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "variantId": {
-          "type": "string",
-          "minLength": 1
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "upstreamModelId"
-      ]
-    },
-    "FieldSource": {
-      "type": "object",
-      "properties": {
-        "layer": {
-          "enum": [
-            "default",
-            "preset-model",
-            "preset-variant",
-            "discovered",
-            "local-model",
-            "local-variant",
-            "local-binding"
-          ]
-        },
-        "id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "catalogVersion": {
-          "type": "string",
-          "minLength": 1
-        },
-        "explicit": {
-          "type": "boolean"
-        },
-        "legacy": {
-          "type": "boolean"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "layer"
-      ]
-    },
-    "ResolvedModelMetadata": {
-      "type": "object",
-      "properties": {
-        "schemaVersion": {
-          "enum": [
-            1
-          ]
-        },
-        "catalogVersion": {
-          "type": "string",
-          "minLength": 1
-        },
-        "localRevision": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "modelId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "variantId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "bindingId": {
-          "type": "string",
-          "minLength": 1
-        },
-        "matchedVia": {
-          "enum": [
-            "binding",
-            "exact",
-            "alias",
-            "suffix",
-            "prefix",
-            "none"
-          ]
-        },
-        "metadata": {
-          "$ref": "#/$defs/ModelMetadata"
-        },
-        "provenance": {
-          "type": "object",
-          "additionalProperties": {
-            "$ref": "#/$defs/FieldSource"
-          }
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "schemaVersion",
-        "catalogVersion",
-        "localRevision",
-        "matchedVia",
-        "metadata",
-        "provenance"
-      ]
-    },
-    "ResolveModelMetadataInput": {
-      "type": "object",
-      "properties": {
-        "catalog": {
-          "$ref": "#/$defs/CatalogDocument"
-        },
-        "query": {
-          "$ref": "#/$defs/ModelQuery"
-        },
-        "local": {
-          "$ref": "#/$defs/LocalCatalogState"
-        },
-        "discovered": {
-          "$ref": "#/$defs/ModelMetadata"
-        },
-        "defaults": {
-          "$ref": "#/$defs/ModelMetadata"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "catalog",
-        "query"
-      ]
-    },
-    "MetadataPatch": {
-      "type": "object",
-      "properties": {
-        "set": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "reset": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1
-          },
-          "uniqueItems": true
-        }
-      },
-      "additionalProperties": false
-    },
-    "CatalogUpdateStatus": {
-      "type": "object",
-      "properties": {
-        "activeVersion": {
-          "type": "string",
-          "minLength": 1
-        },
-        "bundledVersion": {
-          "type": "string",
-          "minLength": 1
-        },
-        "lastCheckedAt": {
-          "type": "string",
-          "format": "date-time"
-        },
-        "pendingVersion": {
-          "type": "string",
-          "minLength": 1
-        },
-        "lastError": {
-          "type": "string",
-          "minLength": 1
-        },
-        "autoApply": {
-          "type": "boolean"
-        },
-        "pinnedVersion": {
-          "anyOf": [
-            {
-              "type": "string",
-              "minLength": 1
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "history": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "properties": {
-              "catalogVersion": {
-                "type": "string",
-                "minLength": 1
-              },
-              "publishedAt": {
-                "type": "string",
-                "format": "date-time"
-              }
-            },
-            "additionalProperties": false,
-            "required": [
-              "catalogVersion",
-              "publishedAt"
-            ]
-          }
-        },
-        "pendingDiff": {
-          "type": "object",
-          "properties": {
-            "added": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "minLength": 1
-              },
-              "uniqueItems": true
-            },
-            "changed": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "minLength": 1
-              },
-              "uniqueItems": true
-            },
-            "removed": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "minLength": 1
-              },
-              "uniqueItems": true
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "added",
-            "changed",
-            "removed"
-          ]
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "activeVersion",
-        "bundledVersion",
-        "autoApply",
-        "pinnedVersion",
-        "history"
-      ]
-    },
-    "ModelCatalogSnapshot": {
-      "type": "object",
-      "properties": {
-        "catalog": {
-          "$ref": "#/$defs/CatalogDocument"
-        },
-        "local": {
-          "$ref": "#/$defs/LocalCatalogState"
-        },
-        "update": {
-          "$ref": "#/$defs/CatalogUpdateStatus"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "catalog",
-        "local",
-        "update"
-      ]
-    },
-    "ModelCatalogMutation": {
-      "anyOf": [
-        {
-          "type": "object",
-          "properties": {
-            "baseRevision": {
-              "type": "integer",
-              "minimum": 0
-            },
-            "action": {
-              "enum": [
-                "upsert-model"
-              ]
-            },
-            "model": {
-              "$ref": "#/$defs/ModelDefinition"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "baseRevision",
-            "action",
-            "model"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "baseRevision": {
-              "type": "integer",
-              "minimum": 0
-            },
-            "action": {
-              "enum": [
-                "upsert-variant"
-              ]
-            },
-            "variant": {
-              "$ref": "#/$defs/ModelVariant"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "baseRevision",
-            "action",
-            "variant"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "baseRevision": {
-              "type": "integer",
-              "minimum": 0
-            },
-            "action": {
-              "enum": [
-                "upsert-binding"
-              ]
-            },
-            "binding": {
-              "$ref": "#/$defs/ModelBinding"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "baseRevision",
-            "action",
-            "binding"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "baseRevision": {
-              "type": "integer",
-              "minimum": 0
-            },
-            "action": {
-              "enum": [
-                "patch"
-              ]
-            },
-            "target": {
-              "enum": [
-                "model",
-                "variant",
-                "binding"
-              ]
-            },
-            "targetId": {
-              "type": "string",
-              "minLength": 1
-            },
-            "patch": {
-              "$ref": "#/$defs/MetadataPatch"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "baseRevision",
-            "action",
-            "target",
-            "targetId",
-            "patch"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "baseRevision": {
-              "type": "integer",
-              "minimum": 0
-            },
-            "action": {
-              "enum": [
-                "hide",
-                "restore",
-                "delete"
-              ]
-            },
-            "target": {
-              "enum": [
-                "model",
-                "variant",
-                "binding"
-              ]
-            },
-            "targetId": {
-              "type": "string",
-              "minLength": 1
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "baseRevision",
-            "action",
-            "target",
-            "targetId"
-          ]
-        }
-      ]
-    },
-    "ModelCatalogResolveRequest": {
-      "type": "object",
-      "properties": {
-        "query": {
-          "$ref": "#/$defs/ModelQuery"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "query"
-      ]
-    },
-    "ModelCatalogResolveResponse": {
-      "$ref": "#/$defs/ResolvedModelMetadata"
-    }
-  }
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "urn:narrafork:model-metadata",
+	"$comment": "v1: missing leaf inherits; null is explicit unknown; false, [] and canonical decimal string 0 are real values. Arrays replace. Objects merge by leaf. Priority: binding local > variant local > model local > discovered > preset variant > preset model > adapter defaults. Identity: explicit binding/query, then scope, exact, alias, declared suffix, longest prefix; ties reject. Weak fields filters apply to inherited model/variant layers; prefix prices require explicit referencePricing field permission. Runtime validation additionally checks references, conflicts, merged maxOutputTokens/contextWindow and reasoning default membership. No actual billing or instance connection configuration belongs in this document.",
+	"$ref": "#/$defs/CatalogDocument",
+	"$defs": {
+		"Modality": {
+			"enum": ["text", "image", "audio", "video"]
+		},
+		"ReferencePrices": {
+			"type": "object",
+			"properties": {
+				"input": {
+					"anyOf": [
+						{
+							"type": "string",
+							"pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"output": {
+					"anyOf": [
+						{
+							"type": "string",
+							"pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"cacheRead": {
+					"anyOf": [
+						{
+							"type": "string",
+							"pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"cacheWrite": {
+					"anyOf": [
+						{
+							"type": "string",
+							"pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
+						},
+						{
+							"type": "null"
+						}
+					]
+				}
+			},
+			"additionalProperties": false
+		},
+		"ModelMetadata": {
+			"type": "object",
+			"properties": {
+				"limits": {
+					"type": "object",
+					"properties": {
+						"contextWindow": {
+							"anyOf": [
+								{
+									"type": "integer",
+									"minimum": 1,
+									"maximum": 9007199254740991
+								},
+								{
+									"type": "null"
+								}
+							]
+						},
+						"maxOutputTokens": {
+							"anyOf": [
+								{
+									"type": "integer",
+									"minimum": 1,
+									"maximum": 9007199254740991
+								},
+								{
+									"type": "null"
+								}
+							]
+						}
+					},
+					"additionalProperties": false
+				},
+				"modalities": {
+					"type": "object",
+					"properties": {
+						"input": {
+							"anyOf": [
+								{
+									"type": "array",
+									"items": {
+										"enum": ["text", "image", "audio", "video"]
+									},
+									"uniqueItems": true
+								},
+								{
+									"type": "null"
+								}
+							]
+						},
+						"output": {
+							"anyOf": [
+								{
+									"type": "array",
+									"items": {
+										"enum": ["text", "image", "audio", "video"]
+									},
+									"uniqueItems": true
+								},
+								{
+									"type": "null"
+								}
+							]
+						}
+					},
+					"additionalProperties": false
+				},
+				"nativeSearch": {
+					"type": "object",
+					"properties": {
+						"supported": {
+							"anyOf": [
+								{
+									"type": "boolean"
+								},
+								{
+									"type": "null"
+								}
+							]
+						}
+					},
+					"additionalProperties": false
+				},
+				"reasoning": {
+					"type": "object",
+					"properties": {
+						"supported": {
+							"anyOf": [
+								{
+									"type": "boolean"
+								},
+								{
+									"type": "null"
+								}
+							]
+						},
+						"mode": {
+							"anyOf": [
+								{
+									"enum": ["levels", "fixed", "budget", "unknown"]
+								},
+								{
+									"type": "null"
+								}
+							]
+						},
+						"levels": {
+							"anyOf": [
+								{
+									"type": "array",
+									"items": {
+										"type": "string",
+										"minLength": 1
+									},
+									"uniqueItems": true
+								},
+								{
+									"type": "null"
+								}
+							]
+						},
+						"canDisable": {
+							"anyOf": [
+								{
+									"type": "boolean"
+								},
+								{
+									"type": "null"
+								}
+							]
+						},
+						"defaultLevel": {
+							"anyOf": [
+								{
+									"type": "string",
+									"minLength": 1
+								},
+								{
+									"type": "null"
+								}
+							]
+						}
+					},
+					"additionalProperties": false
+				},
+				"referencePricing": {
+					"type": "object",
+					"properties": {
+						"input": {
+							"anyOf": [
+								{
+									"type": "string",
+									"pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
+								},
+								{
+									"type": "null"
+								}
+							]
+						},
+						"output": {
+							"anyOf": [
+								{
+									"type": "string",
+									"pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
+								},
+								{
+									"type": "null"
+								}
+							]
+						},
+						"cacheRead": {
+							"anyOf": [
+								{
+									"type": "string",
+									"pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
+								},
+								{
+									"type": "null"
+								}
+							]
+						},
+						"cacheWrite": {
+							"anyOf": [
+								{
+									"type": "string",
+									"pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
+								},
+								{
+									"type": "null"
+								}
+							]
+						},
+						"currency": {
+							"enum": ["USD"]
+						},
+						"unit": {
+							"enum": ["perMillionTokens"]
+						},
+						"longContext": {
+							"type": "object",
+							"properties": {
+								"input": {
+									"anyOf": [
+										{
+											"type": "string",
+											"pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
+										},
+										{
+											"type": "null"
+										}
+									]
+								},
+								"output": {
+									"anyOf": [
+										{
+											"type": "string",
+											"pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
+										},
+										{
+											"type": "null"
+										}
+									]
+								},
+								"cacheRead": {
+									"anyOf": [
+										{
+											"type": "string",
+											"pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
+										},
+										{
+											"type": "null"
+										}
+									]
+								},
+								"cacheWrite": {
+									"anyOf": [
+										{
+											"type": "string",
+											"pattern": "^(0|[1-9][0-9]*)(\\.[0-9]*[1-9])?$"
+										},
+										{
+											"type": "null"
+										}
+									]
+								},
+								"thresholdTokens": {
+									"anyOf": [
+										{
+											"type": "integer",
+											"minimum": 1,
+											"maximum": 9007199254740991
+										},
+										{
+											"type": "null"
+										}
+									]
+								},
+								"basis": {
+									"enum": ["promptTokens"]
+								},
+								"mode": {
+									"anyOf": [
+										{
+											"enum": ["full", "marginal"]
+										},
+										{
+											"type": "null"
+										}
+									]
+								}
+							},
+							"additionalProperties": false
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"MetadataSource": {
+			"type": "object",
+			"properties": {
+				"label": {
+					"type": "string",
+					"minLength": 1
+				},
+				"url": {
+					"type": "string",
+					"format": "uri"
+				},
+				"fields": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"minLength": 1
+					},
+					"uniqueItems": true
+				},
+				"verifiedAt": {
+					"type": "string",
+					"format": "date-time"
+				}
+			},
+			"additionalProperties": false,
+			"required": ["label"]
+		},
+		"MatchRules": {
+			"type": "object",
+			"properties": {
+				"ids": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"minLength": 1
+					},
+					"uniqueItems": true
+				},
+				"aliases": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"minLength": 1
+					},
+					"uniqueItems": true
+				},
+				"prefixes": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"minLength": 1
+					},
+					"uniqueItems": true
+				},
+				"volatileSuffixes": {
+					"type": "boolean"
+				},
+				"fields": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"minLength": 1
+					},
+					"uniqueItems": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"ModelDefinition": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string",
+					"minLength": 1
+				},
+				"name": {
+					"type": "string",
+					"minLength": 1
+				},
+				"vendor": {
+					"type": "string",
+					"minLength": 1
+				},
+				"family": {
+					"type": "string",
+					"minLength": 1
+				},
+				"notes": {
+					"type": "string",
+					"minLength": 1
+				},
+				"matches": {
+					"$ref": "#/$defs/MatchRules"
+				},
+				"metadata": {
+					"$ref": "#/$defs/ModelMetadata"
+				},
+				"rawMetadata": { "type": "object" },
+				"status": {
+					"enum": ["verified", "legacy-unverified", "deprecated"]
+				},
+				"sources": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/MetadataSource"
+					}
+				}
+			},
+			"additionalProperties": false,
+			"required": ["id", "metadata"]
+		},
+		"ModelVariant": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string",
+					"minLength": 1
+				},
+				"modelId": {
+					"type": "string",
+					"minLength": 1
+				},
+				"providerKey": {
+					"type": "string",
+					"minLength": 1
+				},
+				"upstreamModelIds": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"minLength": 1
+					},
+					"uniqueItems": true
+				},
+				"name": {
+					"type": "string",
+					"minLength": 1
+				},
+				"matches": {
+					"$ref": "#/$defs/MatchRules"
+				},
+				"metadata": {
+					"$ref": "#/$defs/ModelMetadata"
+				},
+				"rawMetadata": { "type": "object" },
+				"status": {
+					"enum": ["verified", "legacy-unverified", "deprecated"]
+				},
+				"sources": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/MetadataSource"
+					}
+				}
+			},
+			"additionalProperties": false,
+			"required": ["id", "modelId", "providerKey", "upstreamModelIds", "metadata"]
+		},
+		"CatalogDocument": {
+			"type": "object",
+			"properties": {
+				"schemaVersion": {
+					"enum": [1]
+				},
+				"catalogVersion": {
+					"type": "string",
+					"minLength": 1
+				},
+				"publishedAt": {
+					"type": "string",
+					"format": "date-time"
+				},
+				"models": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ModelDefinition"
+					}
+				},
+				"variants": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ModelVariant"
+					}
+				}
+			},
+			"additionalProperties": false,
+			"required": ["schemaVersion", "catalogVersion", "publishedAt", "models", "variants"]
+		},
+		"ModelBinding": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string",
+					"minLength": 1
+				},
+				"providerId": {
+					"type": "string",
+					"minLength": 1
+				},
+				"channelId": {
+					"type": "string",
+					"minLength": 1
+				},
+				"upstreamModelId": {
+					"type": "string",
+					"minLength": 1
+				},
+				"modelId": {
+					"type": "string",
+					"minLength": 1
+				},
+				"variantId": {
+					"type": "string",
+					"minLength": 1
+				},
+				"overrides": {
+					"$ref": "#/$defs/ModelMetadata"
+				},
+				"rawMetadata": { "type": "object" }
+			},
+			"additionalProperties": false,
+			"required": ["id", "upstreamModelId"]
+		},
+		"ModelOverride": {
+			"type": "object",
+			"properties": {
+				"target": {
+					"enum": ["model", "variant", "binding"]
+				},
+				"targetId": {
+					"type": "string",
+					"minLength": 1
+				},
+				"metadata": {
+					"$ref": "#/$defs/ModelMetadata"
+				},
+				"rawMetadata": { "type": "object" },
+				"source": {
+					"enum": ["user", "legacy-local"]
+				}
+			},
+			"additionalProperties": false,
+			"required": ["target", "targetId", "metadata"]
+		},
+		"LocalCatalogState": {
+			"type": "object",
+			"properties": {
+				"legacyFields": {
+					"type": "object",
+					"additionalProperties": { "type": "array", "items": { "type": "string" } }
+				},
+				"revision": {
+					"type": "integer",
+					"minimum": 0,
+					"maximum": 9007199254740991
+				},
+				"models": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ModelDefinition"
+					}
+				},
+				"variants": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ModelVariant"
+					}
+				},
+				"bindings": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ModelBinding"
+					}
+				},
+				"overrides": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ModelOverride"
+					}
+				},
+				"hiddenModelIds": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"minLength": 1
+					},
+					"uniqueItems": true
+				},
+				"hiddenVariantIds": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"minLength": 1
+					},
+					"uniqueItems": true
+				}
+			},
+			"additionalProperties": false,
+			"required": ["revision"]
+		},
+		"ModelQuery": {
+			"type": "object",
+			"properties": {
+				"upstreamModelId": {
+					"type": "string",
+					"minLength": 1
+				},
+				"providerKey": {
+					"type": "string",
+					"minLength": 1
+				},
+				"providerId": {
+					"type": "string",
+					"minLength": 1
+				},
+				"channelId": {
+					"type": "string",
+					"minLength": 1
+				},
+				"modelId": {
+					"type": "string",
+					"minLength": 1
+				},
+				"variantId": {
+					"type": "string",
+					"minLength": 1
+				}
+			},
+			"additionalProperties": false,
+			"required": ["upstreamModelId"]
+		},
+		"FieldSource": {
+			"type": "object",
+			"properties": {
+				"layer": {
+					"enum": [
+						"default",
+						"preset-model",
+						"preset-variant",
+						"discovered",
+						"local-model",
+						"local-variant",
+						"local-binding"
+					]
+				},
+				"id": {
+					"type": "string",
+					"minLength": 1
+				},
+				"catalogVersion": {
+					"type": "string",
+					"minLength": 1
+				},
+				"explicit": {
+					"type": "boolean"
+				},
+				"legacy": {
+					"type": "boolean"
+				}
+			},
+			"additionalProperties": false,
+			"required": ["layer"]
+		},
+		"ResolvedModelMetadata": {
+			"type": "object",
+			"properties": {
+				"schemaVersion": {
+					"enum": [1]
+				},
+				"catalogVersion": {
+					"type": "string",
+					"minLength": 1
+				},
+				"localRevision": {
+					"type": "integer",
+					"minimum": 0
+				},
+				"modelId": {
+					"type": "string",
+					"minLength": 1
+				},
+				"variantId": {
+					"type": "string",
+					"minLength": 1
+				},
+				"bindingId": {
+					"type": "string",
+					"minLength": 1
+				},
+				"matchedVia": {
+					"enum": ["binding", "exact", "alias", "suffix", "prefix", "none"]
+				},
+				"metadata": {
+					"$ref": "#/$defs/ModelMetadata"
+				},
+				"provenance": {
+					"type": "object",
+					"additionalProperties": {
+						"$ref": "#/$defs/FieldSource"
+					}
+				}
+			},
+			"additionalProperties": false,
+			"required": [
+				"schemaVersion",
+				"catalogVersion",
+				"localRevision",
+				"matchedVia",
+				"metadata",
+				"provenance"
+			]
+		},
+		"ResolveModelMetadataInput": {
+			"type": "object",
+			"properties": {
+				"catalog": {
+					"$ref": "#/$defs/CatalogDocument"
+				},
+				"query": {
+					"$ref": "#/$defs/ModelQuery"
+				},
+				"local": {
+					"$ref": "#/$defs/LocalCatalogState"
+				},
+				"discovered": {
+					"$ref": "#/$defs/ModelMetadata"
+				},
+				"defaults": {
+					"$ref": "#/$defs/ModelMetadata"
+				}
+			},
+			"additionalProperties": false,
+			"required": ["catalog", "query"]
+		},
+		"MetadataPatch": {
+			"type": "object",
+			"properties": {
+				"set": {
+					"type": "object",
+					"additionalProperties": true
+				},
+				"reset": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"minLength": 1
+					},
+					"uniqueItems": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"CatalogUpdateStatus": {
+			"type": "object",
+			"properties": {
+				"activeVersion": {
+					"type": "string",
+					"minLength": 1
+				},
+				"bundledVersion": {
+					"type": "string",
+					"minLength": 1
+				},
+				"lastCheckedAt": {
+					"type": "string",
+					"format": "date-time"
+				},
+				"pendingVersion": {
+					"type": "string",
+					"minLength": 1
+				},
+				"lastError": {
+					"type": "string",
+					"minLength": 1
+				},
+				"autoApply": {
+					"type": "boolean"
+				},
+				"pinnedVersion": {
+					"anyOf": [
+						{
+							"type": "string",
+							"minLength": 1
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"history": {
+					"type": "array",
+					"items": {
+						"type": "object",
+						"properties": {
+							"catalogVersion": {
+								"type": "string",
+								"minLength": 1
+							},
+							"publishedAt": {
+								"type": "string",
+								"format": "date-time"
+							}
+						},
+						"additionalProperties": false,
+						"required": ["catalogVersion", "publishedAt"]
+					}
+				},
+				"pendingDiff": {
+					"type": "object",
+					"properties": {
+						"added": {
+							"type": "array",
+							"items": {
+								"type": "string",
+								"minLength": 1
+							},
+							"uniqueItems": true
+						},
+						"changed": {
+							"type": "array",
+							"items": {
+								"type": "string",
+								"minLength": 1
+							},
+							"uniqueItems": true
+						},
+						"removed": {
+							"type": "array",
+							"items": {
+								"type": "string",
+								"minLength": 1
+							},
+							"uniqueItems": true
+						}
+					},
+					"additionalProperties": false,
+					"required": ["added", "changed", "removed"]
+				}
+			},
+			"additionalProperties": false,
+			"required": ["activeVersion", "bundledVersion", "autoApply", "pinnedVersion", "history"]
+		},
+		"ModelCatalogSnapshot": {
+			"type": "object",
+			"properties": {
+				"catalog": {
+					"$ref": "#/$defs/CatalogDocument"
+				},
+				"local": {
+					"$ref": "#/$defs/LocalCatalogState"
+				},
+				"update": {
+					"$ref": "#/$defs/CatalogUpdateStatus"
+				}
+			},
+			"additionalProperties": false,
+			"required": ["catalog", "local", "update"]
+		},
+		"ModelCatalogMutation": {
+			"anyOf": [
+				{
+					"type": "object",
+					"properties": {
+						"baseRevision": {
+							"type": "integer",
+							"minimum": 0
+						},
+						"action": {
+							"enum": ["upsert-model"]
+						},
+						"model": {
+							"$ref": "#/$defs/ModelDefinition"
+						}
+					},
+					"additionalProperties": false,
+					"required": ["baseRevision", "action", "model"]
+				},
+				{
+					"type": "object",
+					"properties": {
+						"baseRevision": {
+							"type": "integer",
+							"minimum": 0
+						},
+						"action": {
+							"enum": ["upsert-variant"]
+						},
+						"variant": {
+							"$ref": "#/$defs/ModelVariant"
+						}
+					},
+					"additionalProperties": false,
+					"required": ["baseRevision", "action", "variant"]
+				},
+				{
+					"type": "object",
+					"properties": {
+						"baseRevision": {
+							"type": "integer",
+							"minimum": 0
+						},
+						"action": {
+							"enum": ["upsert-binding"]
+						},
+						"binding": {
+							"$ref": "#/$defs/ModelBinding"
+						}
+					},
+					"additionalProperties": false,
+					"required": ["baseRevision", "action", "binding"]
+				},
+				{
+					"type": "object",
+					"properties": {
+						"baseRevision": {
+							"type": "integer",
+							"minimum": 0
+						},
+						"action": {
+							"enum": ["patch"]
+						},
+						"target": {
+							"enum": ["model", "variant", "binding"]
+						},
+						"targetId": {
+							"type": "string",
+							"minLength": 1
+						},
+						"patch": {
+							"$ref": "#/$defs/MetadataPatch"
+						}
+					},
+					"additionalProperties": false,
+					"required": ["baseRevision", "action", "target", "targetId", "patch"]
+				},
+				{
+					"type": "object",
+					"properties": {
+						"baseRevision": {
+							"type": "integer",
+							"minimum": 0
+						},
+						"action": {
+							"enum": ["hide", "restore", "delete"]
+						},
+						"target": {
+							"enum": ["model", "variant", "binding"]
+						},
+						"targetId": {
+							"type": "string",
+							"minLength": 1
+						}
+					},
+					"additionalProperties": false,
+					"required": ["baseRevision", "action", "target", "targetId"]
+				}
+			]
+		},
+		"ModelCatalogResolveRequest": {
+			"type": "object",
+			"properties": {
+				"query": {
+					"$ref": "#/$defs/ModelQuery"
+				}
+			},
+			"additionalProperties": false,
+			"required": ["query"]
+		},
+		"ModelCatalogResolveResponse": {
+			"$ref": "#/$defs/ResolvedModelMetadata"
+		}
+	}
 }

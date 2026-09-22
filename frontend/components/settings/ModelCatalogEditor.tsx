@@ -20,9 +20,14 @@ import type {
 import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { invalidateModelCatalog, useCatalogMutation } from "../../hooks/useModelCatalog";
+import {
+	invalidateModelCatalog,
+	useCatalogMutation,
+	useResolvedModelCard,
+} from "../../hooks/useModelCatalog";
 import { ApiError } from "../../lib/api/client";
 import { Z } from "../../lib/z-index";
+import { ModelCardDetails } from "./ModelCardDetails";
 import {
 	buildCatalogPatch,
 	type CatalogEdits,
@@ -195,6 +200,15 @@ export function ModelCatalogEditor({
 	// a stale effective view with the newer revision from the other query.
 	const [baseRevision] = useState(
 		Math.min(snapshot.local.revision, target.resolved?.localRevision ?? snapshot.local.revision),
+	);
+	// A new entry has no stored identity to resolve a card for yet.
+	const card = useResolvedModelCard(
+		target.isNew
+			? undefined
+			: (target.query ??
+					(target.kind === "variant"
+						? { upstreamModelId: target.id, variantId: target.id, modelId: target.modelId }
+						: { upstreamModelId: target.id, modelId: target.id })),
 	);
 	const [edits, setEdits] = useState<CatalogEdits>({});
 	const [id, setId] = useState(target.id);
@@ -402,6 +416,18 @@ export function ModelCatalogEditor({
 					onChange={setEdits}
 					readOnly={readOnly || mutation.isPending || conflict}
 				/>
+				{/* Read-only complete card next to the editable v1 fields: the editor writes
+				    only what v1 can express, so the full source view must not look editable. */}
+				{card.data && (
+					<Accordion>
+						<Accordion.Item value="card">
+							<Accordion.Control>{t("catalog.details")}</Accordion.Control>
+							<Accordion.Panel>
+								<ModelCardDetails card={card.data} />
+							</Accordion.Panel>
+						</Accordion.Item>
+					</Accordion>
+				)}
 				<Accordion>
 					<Accordion.Item value="advanced">
 						<Accordion.Control>{t("catalog.advanced")}</Accordion.Control>

@@ -1004,6 +1004,22 @@ export interface PretextDocumentPageResult {
 	messageVersion: number;
 }
 
+export interface HistoryRecoveryCandidate {
+	messageId: string;
+	seq: number;
+	role: string;
+	createdAt: string;
+	toolCount: number;
+	byteSize: number;
+	preview: string | null;
+	latest: boolean;
+}
+
+export interface HistoryRecoveryResult {
+	candidates: HistoryRecoveryCandidate[];
+	thresholds: { toolCount: number; byteSize: number };
+}
+
 export interface MessageLocationResult {
 	messageId: string;
 	topLevelMessageId: string;

@@ -57,6 +57,7 @@ import {
 	useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { HistoryRecoveryPanel } from "../HistoryRecoveryPanel";
 import { ManualOlderHistoryLoad } from "../history/ManualOlderHistoryLoad";
 import {
 	resolveOlderHistoryAutoLoad,
@@ -853,6 +854,7 @@ export const PretextExactMessageList = memo(
 						status?: string;
 						_sendDeliveryTargets?: unknown;
 						_sendDeliveryTargetCount?: number;
+						_streamingOutput?: unknown;
 					};
 					if (typeof call.toolName !== "string") return "";
 					const outputMetadata =
@@ -866,15 +868,28 @@ export const PretextExactMessageList = memo(
 						sourceMetadata && typeof sourceMetadata === "object"
 							? (sourceMetadata as Record<string, unknown>)
 							: undefined;
+					// Lift `_streamingOutput` the same way segment-adapter's resolveToolMetadata
+					// does: ContextAsk's live char counter (and any other streaming body) lives
+					// on the call record, not inside `_metadata`.
+					const baseMetadata =
+						metadata || call._streamingOutput != null
+							? {
+									...metadata,
+									...(call._streamingOutput != null &&
+									(metadata as Record<string, unknown> | undefined)?._streamingOutput === undefined
+										? { _streamingOutput: call._streamingOutput }
+										: {}),
+								}
+							: undefined;
 					const summaryMetadata =
 						call.toolName === "Send"
 							? {
-									...metadata,
+									...baseMetadata,
 									status: call.status,
 									_sendDeliveryTargets: call._sendDeliveryTargets,
 									targetCount: call._sendDeliveryTargetCount ?? metadata?.targetCount,
 								}
-							: metadata;
+							: baseMetadata;
 					return getSummary(call.toolName, call.inputJson, summaryMetadata, {
 						communicationRunning: t("communicationRunning"),
 						communicationNoRecipients: t("communicationNoRecipients"),
@@ -885,6 +900,9 @@ export const PretextExactMessageList = memo(
 						communicationTimeout: t("communicationTimeout"),
 						communicationCancelled: t("communicationCancelled"),
 						communicationError: t("communicationError"),
+						contextAskOutputChars: t("contextAskOutputChars", { count: "{count}" }),
+						contextAskQuestions: t("contextAskQuestions", { count: "{count}" }),
+						contextAskStatusSummary: t("contextAskStatusSummary"),
 					});
 				},
 				[t],
@@ -4840,6 +4858,15 @@ export const PretextExactMessageList = memo(
 								}}
 							>
 								{pretextDocument.error ? (
+									<HistoryRecoveryPanel
+										narratorId={narratorId}
+										loadError={pretextDocument.error}
+										onRecovered={() => pretextDocument.reload()}
+									/>
+								) : null}
+								{pretextDocument.error &&
+								(pretextDocument.error as { data?: { code?: string } }).data?.code !==
+									"HISTORY_AGGREGATE_UNAVAILABLE" ? (
 									<Group gap="xs" align="center">
 										<Text size="sm" c="red">
 											{pretextDocument.error.message || tCommon("unknownError")}
@@ -4853,9 +4880,8 @@ export const PretextExactMessageList = memo(
 											{tCommon("retry")}
 										</Anchor>
 									</Group>
-								) : (
-									<NarratorMessageListSkeleton />
-								)}
+								) : null}
+								{!pretextDocument.error ? <NarratorMessageListSkeleton /> : null}
 							</div>
 						)}
 						{tailFooter ? (

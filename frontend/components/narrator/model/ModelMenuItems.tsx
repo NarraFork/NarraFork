@@ -13,6 +13,7 @@ import { useTranslation } from "react-i18next";
 import {
 	AGG_MODEL_PREFIX,
 	buildAggModelValue,
+	FOLLOW_PARENT_MODEL,
 	type ModelAggregation,
 	type ModelOption,
 	parseAggModelValue,
@@ -181,6 +182,12 @@ export function ModelMenuItems({
 	const currentAgg = currentModel ? parseAggModelValue(currentModel) : null;
 	return (
 		<>
+			{/* Inheritance is a current-state label, not a catalog model or a global role. */}
+			{currentModel === FOLLOW_PARENT_MODEL && (
+				<Menu.Item disabled ref={selectedItemRef} rightSection={<IconCheck size={14} />}>
+					{t("followParent")}
+				</Menu.Item>
+			)}
 			{totalCostUsd != null && totalCostUsd > 0 && (
 				<>
 					<Menu.Label ta="right">${totalCostUsd.toFixed(4)}</Menu.Label>

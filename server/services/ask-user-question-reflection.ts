@@ -1,5 +1,6 @@
 import { agentGenerateWithHistory, withAuxiliaryRetry } from "@server/lib/agent";
 import { getToolMessage, type Locale } from "@server/lib/prompt-i18n";
+import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import {
 	type AskQuestionInput,
@@ -7,6 +8,7 @@ import {
 	coerceAskQuestions,
 } from "./ask-user-question-coerce";
 import { narratorService } from "./narrator-service";
+import { resolveSubagentModelForRun } from "./subagent-model";
 
 export type { AskQuestionInput, AskQuestionOption };
 // Re-export the pure coercion module's public API so existing import paths
@@ -106,6 +108,7 @@ export async function generateAskUserQuestionAnswers(
 	options: {
 		locale?: Locale;
 		model?: string | null;
+		actingUserId?: string | null;
 		mode?: "suggest" | "reflection";
 		signal?: AbortSignal;
 		/**
@@ -118,6 +121,15 @@ export async function generateAskUserQuestionAnswers(
 ): Promise<Record<string, string>> {
 	const locale = options.locale ?? "en";
 	const mode = options.mode ?? "reflection";
+	const model =
+		options.model === FOLLOW_PARENT_MODEL
+			? (
+					await resolveSubagentModelForRun(
+						await narratorService.getById(narratorId),
+						options.actingUserId,
+					)
+				).model
+			: (options.model ?? undefined);
 	const conversationContext = await buildConversationContext(narratorId);
 	const questionsText = buildQuestionsText(questions);
 	const userMessage = conversationContext
@@ -132,7 +144,7 @@ export async function generateAskUserQuestionAnswers(
 	try {
 		raw = await withAuxiliaryRetry(
 			() =>
-				agentGenerateWithHistory(systemPrompt, userMessage, options.model ?? undefined, locale, {
+				agentGenerateWithHistory(systemPrompt, userMessage, model, locale, {
 					reasoningEffort: "none",
 					...(options.signal ? { signal: options.signal } : {}),
 					...(options.onProgress

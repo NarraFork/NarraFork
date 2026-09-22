@@ -133,6 +133,128 @@
 			"referencePricing_longContext_cacheWrite": "长上下文缓存写入 $/M"
 		}
 	},
+	"card": {
+		"unknown": "明确未知",
+		"unreported": "未报告 / 跟随继承",
+		"emptyList": "[]（明确空列表）",
+		"free": "0（免费）",
+		"localOverride": "本地覆盖",
+		"prices": "参考价格",
+		"noPrices": "该模型没有可解析的参考价格字段。",
+		"priceNote": "来源参考价，保留源字段单位；token 价格按百万 token 展示。这不是渠道实际计费。",
+		"price_component": "计费项",
+		"price_modality": "模态",
+		"price_threshold": "上下文阈值",
+		"price_cache": "缓存时长",
+		"price_rate": "单价",
+		"noThreshold": "不分档",
+		"derived": "按倍率推导",
+		"perTokens": "{{count}}M token",
+		"resolvedVia": "匹配：{{via}} · 目录 {{version}} · 本地修订 {{revision}}",
+		"attributes": "原始属性",
+		"attributeNote": "未登记为控件或价格行的来源字段。完整保留，不透传到上游请求。",
+		"groups": {
+			"identity": "身份与来源",
+			"limits": "限制",
+			"modalities": "模态",
+			"capabilities": "能力",
+			"reasoning": "思考"
+		},
+		"limits": {
+			"maxInputTokens": "最大输入",
+			"maxOutputTokens": "最大输出",
+			"totalContextTokens": "总上下文",
+			"workingContextTokens": "NF 工作窗口"
+		},
+		"limitHints": {
+			"maxInputTokens": "厂商声明的输入上限，可以大于或小于输出上限。",
+			"maxOutputTokens": "厂商声明的单次输出上限。",
+			"totalContextTokens": "仅在来源明确声明时存在，不由输入/输出反推。",
+			"workingContextTokens": "本实例的历史组装预算，不是厂商规格。"
+		},
+		"tiers": {
+			"standard": "标准",
+			"batch": "批处理",
+			"flex": "Flex",
+			"priority": "Priority"
+		},
+		"basis": {
+			"full": "超阈值后整次请求按该档计价",
+			"marginal": "仅超出部分按该档计价"
+		},
+		"components": {
+			"input": "输入",
+			"output": "输出",
+			"cacheRead": "缓存读取",
+			"cacheWrite": "缓存写入",
+			"search": "搜索请求"
+		},
+		"modalities": {
+			"text": "文本",
+			"image": "图像",
+			"audio": "音频",
+			"video": "视频",
+			"media": "媒体",
+			"search_context_size_low": "低搜索上下文",
+			"search_context_size_medium": "中搜索上下文",
+			"search_context_size_high": "高搜索上下文"
+		},
+		"cache": {
+			"default": "默认",
+			"1h": "1 小时"
+		},
+		"units": {
+			"token": "token",
+			"image": "张",
+			"second": "秒",
+			"character": "字符",
+			"request": "次"
+		},
+		"categories": {
+			"text": "文本生成",
+			"image": "图像",
+			"audio": "音频",
+			"embedding": "向量",
+			"rerank": "重排序",
+			"moderation": "内容审核",
+			"unknown": "未标注类型"
+		},
+		"via": {
+			"binding": "本地绑定",
+			"exact": "精确 ID",
+			"alias": "别名",
+			"suffix": "易变后缀",
+			"prefix": "前缀",
+			"none": "未匹配"
+		},
+		"values": {
+			"true": "支持",
+			"false": "不支持"
+		},
+		"fields": {
+			"mode": "来源 mode",
+			"litellm_provider": "来源提供方",
+			"deprecation_date": "弃用日期",
+			"supported_endpoints": "支持的接口",
+			"max_input_tokens": "最大输入（token）",
+			"max_output_tokens": "最大输出（token）",
+			"context_window": "总上下文（token）",
+			"working_context_tokens": "NF 工作窗口（token）",
+			"legacy_context_window": "旧窗口配置（token）",
+			"output_vector_size": "输出向量维度",
+			"max_images_per_prompt": "单次最多图片数",
+			"max_audio_per_prompt": "单次最多音频数",
+			"max_videos_per_prompt": "单次最多视频数",
+			"max_audio_length_hours": "音频最长时长（小时）",
+			"max_pdf_size_mb": "PDF 最大体积（MB）",
+			"supported_modalities": "输入模态",
+			"supported_output_modalities": "输出模态",
+			"reasoning_mode": "思考模式",
+			"reasoning_effort_levels": "有序思考档位",
+			"default_reasoning_effort": "默认思考档位",
+			"can_disable_reasoning": "可关闭思考"
+		}
+	},
 	"subagentPoolReasoningEffortHelp": "只影响之后新建的子代理；指定后覆盖主代理传入的等级，实际请求按模型支持情况适配。不指定表示不施加池级覆盖，不等于 none（关闭思考）。",
 	"personalGroup": "个人设置",
 	"enhancementsGroup": "增强功能",

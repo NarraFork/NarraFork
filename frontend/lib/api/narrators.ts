@@ -26,6 +26,7 @@ import type {
 	CompactMessageDetail,
 	DirectoryBlacklistRuleInput,
 	DirectoryWhitelistRuleInput,
+	HistoryRecoveryResult,
 	MessageLocationResult,
 	NarratorAccess,
 	NarratorGrant,
@@ -198,12 +199,37 @@ export interface RevertHistorySummary {
 	deletedBlockCount: number;
 }
 
+/**
+ * One concrete holder that is currently refusing a safe file rollback.
+ * Advisory only: listing a blocker never authorizes a wider plan.
+ */
+export interface RevertBlocker {
+	kind:
+		| "running_tool"
+		| "uncoordinated_activity"
+		| "write_lease"
+		| "pending_mutation"
+		| "recovery_hold"
+		| "narrator_busy"
+		| "planner_busy"
+		| "scope_not_active"
+		| "pending_operation";
+	toolCallId?: string;
+	toolName?: string;
+	operationId?: string;
+	messageId?: string;
+	leaseId?: string;
+	detail?: string;
+}
+
 export interface RevertActionPreview {
 	action: RevertAction;
 	plan: RevertActionPlan | null;
 	executable: false;
 	historySummary: RevertHistorySummary | null;
 	unavailable?: ScopedRevertUnavailableReason;
+	/** Present when the server could name the running/unfinished holders. */
+	blockers?: RevertBlocker[];
 }
 
 /** Bounded metadata only; snapshots and file contents are not loaded by this UI. */
@@ -294,6 +320,7 @@ export interface RevertScopePreviews<F extends RevertPreviewFile = RevertPreview
 	revertPlan?: RevertPlanReview;
 	previewIssue?: RevertPlanPreviewIssue;
 	previewError?: string;
+	blockers?: RevertBlocker[];
 	scope?: RevertScope;
 	affectedFiles: F[];
 	narratorScope?: {
@@ -686,6 +713,9 @@ export const narratorsApi = {
 			`/narrators/${id}/message-location/${encodeURIComponent(messageId)}`,
 			{ signal },
 		),
+	// Bounded oversized-message scan used when the timeline cannot paginate.
+	getHistoryRecovery: (id: string, signal?: AbortSignal) =>
+		request<HistoryRecoveryResult>(`/narrators/${id}/history-recovery`, { signal }),
 	// Full-text search within a single narrator's own conversation history.
 	searchNarratorMessages: (id: string, q: string, limit?: number) => {
 		const params = new URLSearchParams({ q });
