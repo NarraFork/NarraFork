@@ -15,6 +15,71 @@ const createdAt = "2026-07-17T12:00:00.000Z";
 
 afterEach(() => cleanDb(sqlite));
 
+test("reference cost coverage survives detail, totals, series and breakdown without repricing history", async () => {
+	db.insert(apiRequests)
+		.values([
+			{ id: "legacy", createdAt, costUsd: 99, provider: "legacy" },
+			{
+				id: "partial",
+				createdAt,
+				costUsd: 0.5,
+				costStatus: "partial",
+				costMissingFields: ["cacheRead"],
+				provider: "fixture",
+			},
+			{
+				id: "unknown",
+				createdAt,
+				costUsd: null,
+				costStatus: "unknown",
+				costMissingFields: ["input"],
+				provider: "fixture",
+			},
+			{
+				id: "free",
+				createdAt,
+				costUsd: 0,
+				costStatus: "complete",
+				costMissingFields: [],
+				provider: "free",
+			},
+		])
+		.run();
+	expect(await service.getUsageRecord("legacy")).toMatchObject({
+		costUsd: 99,
+		costStatus: null,
+		costMissingFields: null,
+	});
+	expect(await service.getUsageRecord("partial")).toMatchObject({
+		costUsd: 0.5,
+		costStatus: "partial",
+		costMissingFields: ["cacheRead"],
+	});
+	expect(await service.getUsageStats({})).toMatchObject({
+		totalCost: 99.5,
+		costStatus: "partial",
+		unpricedRequestCount: 2,
+		partialRequestCount: 1,
+	});
+	expect(await service.getUsageStats({ provider: "free" })).toMatchObject({
+		totalCost: 0,
+		costStatus: "complete",
+	});
+	const filters = { startDate: "2026-07-17T00:00:00.000Z", endDate: "2026-07-17T23:59:59.999Z" };
+	const series = await service.getUsageTimeSeries(filters);
+	expect(series.points[0]).toMatchObject({
+		totalCost: 99.5,
+		costStatus: "partial",
+		partialRequestCount: 1,
+	});
+	expect(
+		await service.getUsageBreakdown(filters, { dimension: "provider", metric: "cost" }),
+	).toMatchObject({ costStatus: "partial", partialRequestCount: 1 });
+	expect(
+		await service.getUsageTimeSeriesStacked(filters, { dimension: "provider", metric: "cost" }),
+	).toMatchObject({ costStatus: "partial", partialRequestCount: 1 });
+});
+
 function seedUsers() {
 	db.insert(users)
 		.values([

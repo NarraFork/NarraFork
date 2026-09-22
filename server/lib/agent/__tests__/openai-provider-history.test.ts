@@ -11,7 +11,9 @@ import {
 	OpenAIProvider,
 	parseResponsesAPIEvent,
 } from "../openai-provider";
+import { OutputContentAccumulator } from "../output-content";
 import type { DbMessage } from "../provider";
+import type { ReasoningProviderMetadata } from "../types";
 
 const TEST_PROVIDER: OpenAIProviderConfig = {
 	id: "test-openai",
@@ -73,6 +75,381 @@ function makeUserMessage(overrides: Partial<DbMessage> = {}): DbMessage {
 		...overrides,
 	};
 }
+
+describe("native Responses reasoning continuation", () => {
+	test("mock SSE round trip preserves metadata through aggregation, storage and the next request", async () => {
+		const provider = new OpenAIProvider({ ...TEST_PROVIDER, defaultModel: "deepseek-v4.1-flash" });
+		const raw = "  inspect\nthen call  ";
+		const item = {
+			type: "reasoning",
+			id: "rs_mock",
+			content: [{ type: "reasoning_text", text: raw }],
+		};
+		const call = {
+			type: "function_call",
+			id: "fc_mock",
+			call_id: "call_mock",
+			name: "Read",
+			arguments: "{}",
+		};
+		const requests: Array<{ input: Array<Record<string, unknown>> }> = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (_input, init) => {
+			requests.push(JSON.parse(String(init?.body)));
+			const payload = requests.length === 1 ? [item, call] : [];
+			return new Response(
+				`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: payload } })}\n\n`,
+				{ headers: { "Content-Type": "text/event-stream" } },
+			);
+		}) as typeof fetch;
+		try {
+			const params = {
+				conversationId: "native-mock",
+				content: "inspect",
+				model: "deepseek-v4.1-flash",
+				cwd: ".",
+				history: [],
+				tools: [],
+				toolResults: [],
+				signal: new AbortController().signal,
+			};
+			const content = new OutputContentAccumulator();
+			for await (const event of provider.chat(params)) {
+				const lane = { blockId: event.reasoningBlockId, outputIndex: event.reasoningOutputIndex };
+				if (event.reasoning != null)
+					content.append("reasoning", event.reasoning, lane, event.reasoningMetadata);
+				else if (event.reasoningMetadata)
+					[...content.reasoningMetadata(event.reasoningMetadata, lane)];
+				if (event.contentBoundary) [...content.boundary(event.contentBoundary)];
+			}
+			const blocks = content.orderedContent();
+			expect(blocks).toHaveLength(1);
+			expect(blocks[0]).toMatchObject({
+				text: raw,
+				providerMetadata: {
+					openai: { textFormat: "reasoning_text" },
+					signatureSource: provider.getActiveReasoningSource(),
+				},
+			});
+			const tool = {
+				type: "tool_use" as const,
+				toolUseId: call.call_id,
+				name: call.name,
+				input: {},
+				outputIndex: 1,
+			};
+			const history: unknown[] = [];
+			provider.pushAssistantTurn(
+				history,
+				"",
+				[{ toolUseId: call.call_id, name: call.name, input: {} }],
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				[...blocks, tool],
+			);
+			const stored = await provider.buildHistory(
+				[
+					makeAssistantMessage({
+						contentJson: JSON.parse(
+							JSON.stringify([
+								...blocks,
+								{ type: "tool_use", id: call.call_id, name: call.name, input: {} },
+							]),
+						),
+						toolCalls: [
+							{
+								toolUseId: call.call_id,
+								toolName: call.name,
+								inputJson: {},
+								outputJson: "ok",
+								status: "success",
+							},
+						],
+					}),
+				],
+				params.model,
+			);
+			expect(stored.history).toEqual(history);
+			for (const replay of [history, stored.history]) {
+				for await (const _event of provider.chat({
+					...params,
+					content: "",
+					history: replay,
+					toolResults: [provider.formatToolResult(call.call_id, "ok", false)],
+				})) {
+					/* consume mocked stream */
+				}
+			}
+			for (const request of requests.slice(1)) {
+				expect(request.input.map((entry) => entry.type)).toEqual([
+					"reasoning",
+					"function_call",
+					"function_call_output",
+				]);
+				expect(request.input[0]).toEqual(item);
+				expect(JSON.stringify(request.input).split(JSON.stringify(raw)).length - 1).toBe(1);
+			}
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test("only marked same-source native text replays; ambiguous legacy, summaries and foreign text do not", async () => {
+		const provider = new OpenAIProvider({ ...TEST_PROVIDER, defaultModel: "deepseek-v4.1-flash" });
+		provider.noteActiveModel("deepseek-v4.1-flash");
+		const source = provider.getActiveReasoningSource();
+		for (const [format, signatureSource] of [
+			[undefined, source],
+			["summary_text", source],
+			["mixed", source],
+			["reasoning_text", undefined],
+			["reasoning_text", "foreign"],
+			["reasoning_text", source],
+		] as const) {
+			const block = {
+				text: "thought",
+				providerMetadata: {
+					signatureSource,
+					openai: { itemId: "rs_policy", textFormat: format },
+				} satisfies ReasoningProviderMetadata,
+			};
+			const native = format === "reasoning_text" && signatureSource === source;
+			const stored = await provider.buildHistory(
+				[makeAssistantMessage({ contentJson: [{ type: "reasoning", ...block }] })],
+				"deepseek-v4.1-flash",
+			);
+			const converted = convertHistoryToResponsesApi(
+				[{ role: "assistant", content: null, _reasoningBlocks: [block] }],
+				{ strict: false, currentSource: source },
+			);
+			for (const replay of [stored.history, converted]) {
+				expect(replay[0]).toMatchObject(native ? { type: "reasoning" } : { role: "assistant" });
+			}
+			expect(
+				convertHistoryToResponsesApi(
+					[{ role: "assistant", content: null, _reasoningBlocks: [block] }],
+					{ strict: true, currentSource: source },
+				),
+			).toEqual([]);
+		}
+	});
+
+	test("native done-only and partial deltas recover exact suffixes with stable item identity", () => {
+		const tools = new Map();
+		const reasoning = new Map();
+		const events = [
+			...parseResponsesAPIEvent(
+				{
+					type: "response.reasoning_text.delta",
+					item_id: "rs_partial",
+					output_index: 2,
+					content_index: 0,
+					delta: "  pre",
+				},
+				tools,
+				reasoning,
+			),
+			...parseResponsesAPIEvent(
+				{
+					type: "response.reasoning_text.done",
+					item_id: "rs_partial",
+					content_index: 0,
+					text: "  prefix\n",
+				},
+				tools,
+				reasoning,
+			),
+			...parseResponsesAPIEvent(
+				{
+					type: "response.reasoning_text.done",
+					item_id: "rs_partial",
+					content_index: 1,
+					text: "tail  ",
+				},
+				tools,
+				reasoning,
+			),
+			...parseResponsesAPIEvent(
+				{
+					type: "response.output_item.done",
+					output_index: 2,
+					item: {
+						type: "reasoning",
+						id: "rs_partial",
+						content: [
+							{ type: "reasoning_text", text: "  prefix\n" },
+							{ type: "reasoning_text", text: "tail  " },
+						],
+					},
+				},
+				tools,
+				reasoning,
+			),
+		];
+		expect(events.map((event) => event.reasoning ?? "").join("")).toBe("  prefix\ntail  ");
+		for (const event of events.filter((event) => event.reasoning != null)) {
+			expect(event.reasoningBlockId).toBe("responses:2:reasoning");
+			expect(event.reasoningOutputIndex).toBe(2);
+			expect(event.reasoningMetadata?.openai?.textFormat).toBe("reasoning_text");
+		}
+	});
+
+	test("native and summary text in one item remains ambiguous, and encrypted replay wins", () => {
+		const tools = new Map();
+		const reasoning = new Map();
+		const events = parseResponsesAPIEvent(
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: {
+					type: "reasoning",
+					id: "rs_mixed",
+					summary: [{ type: "summary_text", text: "summary" }],
+					content: [{ type: "reasoning_text", text: "raw" }],
+				},
+			},
+			tools,
+			reasoning,
+		);
+		expect(
+			events.filter((event) => event.reasoningMetadata).at(-1)?.reasoningMetadata?.openai
+				?.textFormat,
+		).toBe("mixed");
+		const block = {
+			text: "raw",
+			providerMetadata: {
+				signatureSource: "same",
+				openai: {
+					textFormat: "reasoning_text" as const,
+					itemId: "rs_encrypted",
+					reasoningEncryptedContent: "cipher",
+				},
+			},
+		};
+		for (const strict of [true, false]) {
+			const replay = convertHistoryToResponsesApi(
+				[{ role: "assistant", content: null, _reasoningBlocks: [block] }],
+				{ strict, currentSource: "same" },
+			);
+			expect<unknown>(replay).toEqual([
+				{
+					type: "reasoning",
+					id: "rs_encrypted",
+					encrypted_content: "cipher",
+					summary: [{ type: "summary_text", text: "raw" }],
+				},
+			]);
+		}
+	});
+
+	for (const terminal of ["done", "completed", "stream"] as const) {
+		test(`${terminal} preserves native reasoning bytes and replays before tools`, async () => {
+			const provider = new OpenAIProvider({
+				...TEST_PROVIDER,
+				defaultModel: "deepseek-v4.1-flash",
+			});
+			provider.noteActiveModel("deepseek-v4.1-flash");
+			const tools = new Map();
+			const reasoning = new Map();
+			const raw = "  first\nsecond  ";
+			const item = {
+				type: "reasoning",
+				id: "rs_native",
+				content: [
+					{ type: "reasoning_text", text: "  first\n" },
+					{ type: "reasoning_text", text: "second  " },
+				],
+			};
+			const events = [];
+			if (terminal === "stream") {
+				for (const [content_index, part] of item.content.entries()) {
+					events.push(
+						...parseResponsesAPIEvent(
+							{
+								type: "response.reasoning_text.delta",
+								output_index: 0,
+								item_id: item.id,
+								content_index,
+								delta: part.text,
+							},
+							tools,
+							reasoning,
+						),
+					);
+					events.push(
+						...parseResponsesAPIEvent(
+							{
+								type: "response.reasoning_text.done",
+								output_index: 0,
+								item_id: item.id,
+								content_index,
+								text: part.text,
+							},
+							tools,
+							reasoning,
+						),
+					);
+				}
+			}
+			if (terminal !== "completed")
+				events.push(
+					...parseResponsesAPIEvent(
+						{ type: "response.output_item.done", output_index: 0, item },
+						tools,
+						reasoning,
+					),
+				);
+			events.push(
+				...parseResponsesAPIEvent(
+					{ type: "response.completed", response: { output: [item] } },
+					tools,
+					reasoning,
+				),
+			);
+			const text = events.map((event) => event.reasoning ?? "").join("");
+			expect(text).toBe(raw);
+			const metadata = Object.assign({}, ...events.map((event) => event.reasoningMetadata?.openai));
+			expect(metadata.textFormat).toBe("reasoning_text");
+			const block = {
+				text,
+				providerMetadata: {
+					openai: metadata,
+					signatureSource: provider.getActiveReasoningSource(),
+				},
+				outputIndex: 0,
+			};
+			const history: unknown[] = [];
+			provider.pushAssistantTurn(
+				history,
+				"",
+				[{ toolUseId: "call_native", name: "Read", input: {} }],
+				[block],
+			);
+			const expected = {
+				type: "reasoning",
+				id: item.id,
+				content: [{ type: "reasoning_text", text: raw }],
+			};
+			expect(history[0]).toEqual(expected);
+			expect(history[1]).toMatchObject({ type: "function_call" });
+			const stored = await provider.buildHistory(
+				[makeAssistantMessage({ contentJson: [{ type: "reasoning", ...block }] })],
+				"deepseek-v4.1-flash",
+			);
+			expect(stored.history[0]).toEqual(expected);
+			expect<unknown>(
+				convertHistoryToResponsesApi(
+					[{ role: "assistant", content: null, _reasoningBlocks: [block] }],
+					{ strict: false, currentSource: provider.getActiveReasoningSource() },
+				)[0],
+			).toEqual(expected);
+		});
+	}
+});
 
 describe("OpenAIProvider Responses history reasoning continuation", () => {
 	test("buildHistory includes reasoning items with encrypted_content for continuation", async () => {

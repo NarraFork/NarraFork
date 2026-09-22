@@ -2817,6 +2817,7 @@ export async function processEvent(
 					provider: event.provider,
 					model: event.model,
 					credentialId: event.credentialId,
+					referencePricingSnapshot: event.referencePricingSnapshot,
 					kind: "narrator",
 				}),
 			);

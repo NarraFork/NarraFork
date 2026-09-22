@@ -1,6 +1,11 @@
 import { MarkdownContentListItem } from "@frontend/components/common/MarkdownListMarker";
 import { MD_HEADING_SLUG_ATTR } from "@frontend/lib/markdown-anchor-scroll";
 import { Code, Divider, Table, Text } from "@mantine/core";
+import {
+	prepareMarkdownEmphasis,
+	remarkStripEmphasisSentinel,
+	stripEmphasisSentinel,
+} from "@shared/markdown-emphasis-compat";
 import { reactChildrenToHeadingText, slugifyHeading } from "@shared/pretext-layout/markdown-anchor";
 import {
 	Children,
@@ -95,7 +100,8 @@ function MermaidOrCode({ code }: { code: string }) {
 /** Recursively extract plain text from React children */
 export function extractText(node: ReactNode): string {
 	if (node == null || typeof node === "boolean") return "";
-	if (typeof node === "string" || typeof node === "number") return String(node);
+	if (typeof node === "string" || typeof node === "number")
+		return stripEmphasisSentinel(String(node));
 	if (Array.isArray(node)) return node.map(extractText).join("");
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	if (typeof node === "object" && "props" in node) return extractText((node as any).props.children);
@@ -532,7 +538,7 @@ function AnimatedMarkdownTree({
 			rehypePlugins={rehypePlugins}
 			components={animatedComponents}
 		>
-			{source}
+			{prepareMarkdownEmphasis(source)}
 		</Markdown>
 	);
 }
@@ -593,13 +599,16 @@ function StaticMarkdownTree({
 	rehypePlugins: PluggableList;
 	sourceLines?: boolean;
 }) {
+	// Prepare here (not on the whole streaming message) so `splitStableAndTail`
+	// sees append-only source text: an open-side flank insert must not rewrite
+	// bytes a sealed prefix already matched against.
 	return (
 		<Markdown
 			remarkPlugins={remarkPlugins}
 			rehypePlugins={rehypePlugins}
 			components={sourceLines ? staticSourceLineComponents : staticComponents}
 		>
-			{source}
+			{prepareMarkdownEmphasis(source)}
 		</Markdown>
 	);
 }
@@ -778,6 +787,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 		const plugins: PluggableList = supportsLookbehind ? [remarkGfm] : [];
 		if (mathPlugins) plugins.push(mathPlugins.remarkMath);
 		plugins.push(remarkLocalFileLinks);
+		plugins.push(remarkStripEmphasisSentinel);
 		return plugins;
 	}, [mathPlugins]);
 	const rehypePlugins = useMemo<PluggableList>(() => {
@@ -787,6 +797,11 @@ export const MarkdownContent = memo(function MarkdownContent({
 	// Rewrite `\(...\)` / `\[...\]` to `$...$` / `$$...$$` so remark-math can
 	// parse formulas emitted by models that use backslash-delimited LaTeX.
 	// Only run when math plugins are active to avoid touching non-math content.
+	//
+	// Emphasis flanking (`prepareMarkdownEmphasis`) is applied per parse tree in
+	// Static/AnimatedMarkdownTree, NOT here: the streaming split must see
+	// append-only source, and an open-side flank insert would rewrite history.
+	// The remark plugin above strips the flank sentinels from text nodes.
 	const markdownSource = useMemo(
 		() => (mathPlugins ? normalizeMathDelimiters(trimmed) : trimmed),
 		[mathPlugins, trimmed],

@@ -55,3 +55,25 @@ describe("usage CSV ownership", () => {
 		expect(usageHistoryCsv([record({})], "Unattributed")).toContain(",,Unattributed,");
 	});
 });
+
+test("CSV preserves unknown and partial reference cost instead of exporting free usage", () => {
+	const unknown = {
+		...record({}),
+		costUsd: 0,
+		costStatus: "unknown" as const,
+		costMissingFields: ["input", "output"],
+	};
+	const partial = { ...record({}), costUsd: 0.25, costStatus: "partial" as const };
+	const free = { ...record({}), costUsd: 0, costStatus: "complete" as const };
+	const [headers, ...rows] = usageHistoryCsv([unknown, partial, free], "Unattributed")
+		.split("\n")
+		.map((row) => row.split(","));
+	const costIndex = headers.indexOf("Known Reference Cost (USD)");
+	const statusIndex = headers.indexOf("Cost Status");
+	expect(rows[0][costIndex]).toBe("");
+	expect(rows[0][statusIndex]).toBe("unknown");
+	expect(rows[1][costIndex]).toBe("0.25");
+	expect(rows[1][statusIndex]).toBe("partial");
+	expect(rows[2][costIndex]).toBe("0");
+	expect(rows[2][statusIndex]).toBe("complete");
+});

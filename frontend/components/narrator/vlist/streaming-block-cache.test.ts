@@ -27,11 +27,13 @@ beforeAll(() => {
 const WIDTH = 800;
 
 async function load() {
-	const [{ measureMarkdown }, cache] = await Promise.all([
+	const [{ measureMarkdown }, cache, parser, { markdownMathSupport }] = await Promise.all([
 		import("./measure/measure-markdown"),
 		import("./streaming-block-cache"),
+		import("@shared/pretext-layout/parse-markdown"),
+		import("./measure/math-support"),
 	]);
-	return { measureMarkdown, ...cache };
+	return { measureMarkdown, ...cache, ...parser, markdownMathSupport };
 }
 
 /**
@@ -39,6 +41,11 @@ async function load() {
  * offset-guessing scheme can handle.
  */
 const FIXTURES: Record<string, string> = {
+	"CJK emphasis source offsets":
+		"**注意：**说明 **结果：**说明 **结论：**说明\n\n第二段完整内容\n\n第三段内容继续",
+	"emphasis with CRLF": "**注意：**说明\r\n\r\n第二段完整内容\r\n\r\n第三段内容继续",
+	"protected code and URL":
+		"**注意：**说明\n\n``**代码：**原样``\n\n[x](https://example.com/?q=**注意：**说明)\n\n尾段",
 	"plain paragraphs": Array.from({ length: 6 }, (_, i) => `段落${i} ${"词".repeat(60)}`).join(
 		"\n\n",
 	),
@@ -74,16 +81,25 @@ const FIXTURES: Record<string, string> = {
 describe("getStreamingPreparedBlocks — byte-exact at every prefix", () => {
 	for (const [name, text] of Object.entries(FIXTURES)) {
 		it(`matches a full parse while streaming: ${name}`, async () => {
-			const { measureMarkdown, getStreamingPreparedBlocks, resetStreamingBlockCache } =
-				await load();
+			const {
+				measureMarkdown,
+				getStreamingPreparedBlocks,
+				resetStreamingBlockCache,
+				parseMarkdownToPreparedBlocks,
+				markdownMathSupport,
+			} = await load();
 			const key = `exact-${name}`;
 			resetStreamingBlockCache(key);
 			const mismatches: string[] = [];
 			for (let end = 1; end <= text.length; end++) {
 				const prefix = text.slice(0, end);
-				const viaCache = measureMarkdown(prefix, WIDTH, {
-					preparedBlocks: getStreamingPreparedBlocks(key, prefix),
-				}).height;
+				const blocks = getStreamingPreparedBlocks(key, prefix);
+				// Height equality misses dropped characters on the same line. Compare
+				// the complete prepared tree, including segments, marks, hrefs and math.
+				expect(blocks, `${name}: prefix ${end}`).toEqual(
+					parseMarkdownToPreparedBlocks(prefix, markdownMathSupport()),
+				);
+				const viaCache = measureMarkdown(prefix, WIDTH, { preparedBlocks: blocks }).height;
 				const viaFullParse = measureMarkdown(prefix, WIDTH).height;
 				if (Math.abs(viaCache - viaFullParse) > 0.001) {
 					mismatches.push(`len=${end} cache=${viaCache} full=${viaFullParse}`);
@@ -92,6 +108,85 @@ describe("getStreamingPreparedBlocks — byte-exact at every prefix", () => {
 			expect(mismatches).toEqual([]);
 		});
 	}
+});
+
+describe("source offsets survive Markdown preprocessing", () => {
+	it("does not drop the first character of the second block on a two-frame append", async () => {
+		const {
+			getStreamingPreparedBlocks,
+			resetStreamingBlockCache,
+			parseMarkdownToPreparedBlocks,
+			parseMarkdownUnits,
+		} = await load();
+		const source = "**注意：**说明 **结果：**说明 **结论：**说明\n\n第二段完整内容\n\n第三段内容";
+		resetStreamingBlockCache("emphasis-two-frames");
+		expect(getStreamingPreparedBlocks("emphasis-two-frames", source)).toEqual(
+			parseMarkdownToPreparedBlocks(source),
+		);
+		const next = getStreamingPreparedBlocks("emphasis-two-frames", `${source}继续`);
+		expect(next).toEqual(parseMarkdownToPreparedBlocks(`${source}继续`));
+		const second = next[1];
+		expect(second?.kind).toBe("inline");
+		if (second?.kind === "inline") {
+			// Pretext's public handle is opaque; inspect the text payload for this
+			// regression, not just its line count or resulting height.
+			const flow = second.flow as unknown as { items: { prepared: { segments: string[] } }[] };
+			expect(flow.items[0]?.prepared.segments.join("")).toBe("第二段完整内容");
+		}
+		const units = parseMarkdownUnits(source);
+		expect(units[0]?.raw).toBe(source.split("\n\n")[0] as string);
+		expect(source.slice(units[0]?.consumedLength)).toBe("\n\n第二段完整内容\n\n第三段内容");
+	});
+
+	it("maps normalized/trimmed math to original offsets and original memo keys", async () => {
+		const runtime = await import("./katex-runtime");
+		await runtime.ensureKatexLoaded("$a$");
+		const {
+			getStreamingPreparedBlocks,
+			resetStreamingBlockCache,
+			parseMarkdownToPreparedBlocks,
+			parseMarkdownUnits,
+			markdownMathSupport,
+		} = await load();
+		try {
+			const math = markdownMathSupport();
+			expect(math).toBeDefined();
+			for (const formula of [
+				"$long_variable + 1$",
+				"\\(x + 1\\)",
+				"$$  x + 1  $$",
+				"\\[\n x + 1 \n\\]",
+			]) {
+				const first = `**注意：**说明 ${formula}`;
+				const source = `${first}\n\n第二段 $y$ 完整内容\n\n第三段 $z$ 内容\n\n第四段继续`;
+				const units = parseMarkdownUnits(source, math);
+				expect(units[0]?.raw).toBe(first);
+				expect(units[0]?.consumedLength).toBe(first.length);
+				resetStreamingBlockCache("math-offsets");
+				for (let end = 1; end <= source.length; end++) {
+					const prefix = source.slice(0, end);
+					expect(getStreamingPreparedBlocks("math-offsets", prefix), `${formula}: ${end}`).toEqual(
+						parseMarkdownToPreparedBlocks(prefix, math),
+					);
+				}
+				resetStreamingBlockCache("math-two-frames");
+				getStreamingPreparedBlocks("math-two-frames", source);
+				expect(getStreamingPreparedBlocks("math-two-frames", `${source}新增`)).toEqual(
+					parseMarkdownToPreparedBlocks(`${source}新增`, math),
+				);
+			}
+			// Different formulas can both lift to E0000E001. Raw source must not
+			// collide in the unit memo when those units become the live tail.
+			const a = parseMarkdownUnits("$alpha$", math)[0];
+			const b = parseMarkdownUnits("$beta$", math, {
+				reuse: (raw) => (raw === a?.raw ? a.blocks : undefined),
+			})[0];
+			expect(b?.blocks).toEqual(parseMarkdownToPreparedBlocks("$beta$", math));
+		} finally {
+			runtime.resetKatexRuntimeForTest();
+			resetStreamingBlockCache();
+		}
+	});
 });
 
 describe("getStreamingPreparedBlocks — reuse actually happens", () => {

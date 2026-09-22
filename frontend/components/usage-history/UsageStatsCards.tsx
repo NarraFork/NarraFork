@@ -4,6 +4,7 @@ import {
 	formatDuration,
 	formatExactDuration,
 } from "@frontend/lib/compact-number";
+import { formatReferenceCost, referenceCostStatus } from "@frontend/lib/usage-cost";
 import type { UsageHistoryStats } from "@frontend/types/usage-history";
 import { Card, Group, SimpleGrid, Stack, Text } from "@mantine/core";
 import {
@@ -116,8 +117,22 @@ export function UsageStatsCards({ stats }: { stats: UsageHistoryStats }) {
 			<StatCard
 				icon={<IconCoin size={18} />}
 				label={t("usageHistoryStatTotalCost")}
-				value={totalCost.compact}
-				exactValue={exactLine(t, totalCost)}
+				value={formatReferenceCost(
+					stats,
+					stats.totalCost,
+					{ unknown: t("usageCostUnknown"), partial: t("usageCostPartial") },
+					totalCost.compact,
+				)}
+				exactValue={
+					referenceCostStatus(stats, stats.totalCost) === "complete"
+						? exactLine(t, totalCost)
+						: undefined
+				}
+				subtitle={
+					referenceCostStatus(stats, stats.totalCost) !== "complete"
+						? t("usageCostIncompleteNote")
+						: undefined
+				}
 			/>
 			<StatCard
 				icon={<IconBrain size={18} />}

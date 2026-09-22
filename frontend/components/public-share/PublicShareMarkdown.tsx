@@ -1,3 +1,7 @@
+import {
+	prepareMarkdownEmphasis,
+	remarkStripEmphasisSentinel,
+} from "@shared/markdown-emphasis-compat";
 import { useTranslation } from "react-i18next";
 import ReactMarkdown from "react-markdown";
 import { publicShareExternalHref } from "../../lib/public-share-api";
@@ -10,6 +14,7 @@ export function PublicShareMarkdown({ text }: { text: string }) {
 		<div className="public-share-markdown">
 			<ReactMarkdown
 				skipHtml
+				remarkPlugins={[remarkStripEmphasisSentinel]}
 				components={{
 					img: () => <span className="public-share-placeholder">{t("mediaOmitted")}</span>,
 					a: ({ href, children }) => {
@@ -29,7 +34,7 @@ export function PublicShareMarkdown({ text }: { text: string }) {
 					},
 				}}
 			>
-				{text}
+				{prepareMarkdownEmphasis(text)}
 			</ReactMarkdown>
 		</div>
 	);

@@ -1,3 +1,4 @@
+import { formatReferenceCost } from "@frontend/lib/usage-cost";
 import { usageHistoryApi } from "@frontend/lib/usage-history-api";
 import {
 	advanceUsageHistoryCursor,
@@ -78,7 +79,12 @@ export function UserUsageTotalsSection() {
 										<Table.Td>{record.cachedInputTokens}</Table.Td>
 										<Table.Td>{record.cacheCreationTokens}</Table.Td>
 										<Table.Td>{record.reasoningTokens}</Table.Td>
-										<Table.Td>${record.costUsd.toFixed(6)}</Table.Td>
+										<Table.Td>
+											{formatReferenceCost(record, record.costUsd, {
+												unknown: t("usageCostUnknown"),
+												partial: t("usageCostPartial"),
+											})}
+										</Table.Td>
 										<Table.Td>{record.unpricedRequestCount}</Table.Td>
 									</Table.Tr>
 								))}

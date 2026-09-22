@@ -1,5 +1,9 @@
 node_modules/
 dist/
+# Required bundled model metadata, imported directly by the runtime.
+!shared/model-catalog/dist/
+shared/model-catalog/dist/*
+!shared/model-catalog/dist/catalog.json
 drizzle/
 # NOTE: `drizzle-postgres/` is deliberately NOT ignored. The generated PG migration and its
 # meta/ snapshot are tracked so the PostgreSQL test suite runs in a fresh clone without a

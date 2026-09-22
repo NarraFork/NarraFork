@@ -3,6 +3,7 @@ import {
 	formatDuration,
 	formatExactDuration,
 } from "@frontend/lib/compact-number";
+import { formatReferenceCost, referenceCostStatus } from "@frontend/lib/usage-cost";
 import type { UsageHistoryStats } from "@frontend/types/usage-history";
 import { Card, Grid, Group, Stack, Text, Tooltip } from "@mantine/core";
 import {
@@ -93,13 +94,24 @@ export function UsageStatsSummary({ stats }: { stats: UsageHistoryStats }) {
 									</Text>
 								</Group>
 								<Text fw={700} size="lg">
-									{totalCost.compact}
+									{formatReferenceCost(
+										stats,
+										stats.totalCost,
+										{ unknown: t("usageCostUnknown"), partial: t("usageCostPartial") },
+										totalCost.compact,
+									)}
 								</Text>
-								{totalCost.isCompact && (
-									<Text size="xs" c="dimmed">
-										{totalCost.exact}
+								{referenceCostStatus(stats, stats.totalCost) !== "complete" && (
+									<Text size="xs" c="orange">
+										{t("usageCostIncompleteNote")}
 									</Text>
 								)}
+								{totalCost.isCompact &&
+									referenceCostStatus(stats, stats.totalCost) === "complete" && (
+										<Text size="xs" c="dimmed">
+											{totalCost.exact}
+										</Text>
+									)}
 							</Stack>
 						</Group>
 

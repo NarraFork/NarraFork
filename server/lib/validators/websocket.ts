@@ -22,6 +22,21 @@ const catchUpCursorSchema = z
 
 // Narrator client → server
 export const narratorWsMessageSchema = z.discriminatedUnion("type", [
+	z
+		.object({
+			type: z.literal("git_workspace_subscribe"),
+			subscriptionId: z.string().min(1).max(128),
+			narratorId: z.string().min(1).max(128).optional(),
+			chapterId: z.string().min(1).max(128).optional(),
+			workspaceKey: z.string().min(1).max(128).optional(),
+		})
+		.strict(),
+	z
+		.object({
+			type: z.literal("git_workspace_unsubscribe"),
+			subscriptionId: z.string().min(1).max(128),
+		})
+		.strict(),
 	z.object({ type: z.literal("pong") }),
 	z
 		.object({

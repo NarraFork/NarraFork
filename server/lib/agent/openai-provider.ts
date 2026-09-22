@@ -8,7 +8,6 @@ import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-ef
 import { mapGenericReasoningEffort } from "@shared/reasoning-effort-support";
 import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
-import { modelCardEffortLevels } from "../model-cards";
 import { applyProxyExemptions, resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import { isNativeSearchChannelFirstEnabled } from "../search/native";
@@ -43,6 +42,12 @@ import type {
 	ProviderAdapter,
 	ProviderTextCitation,
 } from "./provider";
+import {
+	assertModelInputModalities,
+	effectiveProviderMetadata,
+	resolveMetadataReasoning,
+	resolveOutputTokenLimit,
+} from "./provider-model-metadata";
 import { BoundedUtf8Capture, captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
 import { resolveToolJsonSchema } from "./tool-registry";
@@ -55,6 +60,37 @@ import {
 } from "./types";
 
 export type OpenAIApiMode = "responses" | "completions" | "codex";
+
+export function applyOpenAIModelMetadata(
+	body: Record<string, unknown>,
+	model: string,
+	apiMode: OpenAIApiMode,
+	requested?: number,
+): void {
+	const metadata = effectiveProviderMetadata(model);
+	const limit = resolveOutputTokenLimit(metadata, requested);
+	if (limit !== undefined)
+		body[apiMode === "completions" ? "max_tokens" : "max_output_tokens"] = limit;
+	if (metadata.reasoning?.supported === false) {
+		delete body.reasoning;
+		delete body.reasoning_effort;
+		delete body.thinking;
+	}
+	if (
+		metadata.reasoning?.mode === "fixed" &&
+		body.reasoning &&
+		typeof body.reasoning === "object" &&
+		(body.reasoning as { effort?: string }).effort !== "none"
+	) {
+		delete (body.reasoning as Record<string, unknown>).effort;
+	} else if (
+		metadata.reasoning?.canDisable === false &&
+		(body.reasoning as { effort?: string } | undefined)?.effort === "none"
+	) {
+		delete (body.reasoning as Record<string, unknown>).effort;
+	}
+	assertModelInputModalities(model, body, metadata);
+}
 
 function parsedUsageToUsageData(usage: unknown): GenerateMetaResult["usage"] {
 	if (typeof usage !== "object" || usage === null) return null;
@@ -117,50 +153,11 @@ function defaultBaseUrl(mode: OpenAIApiMode): string {
 	return "https://api.openai.com/v1";
 }
 
-const CODEX_MODEL_REASONING_LEVELS: Record<string, readonly ReasoningEffort[]> = {
-	// Extracted from the Codex model catalog (supported_reasoning_levels).
-	// "none" is omitted because it disables reasoning entirely. GPT-6 Astra
-	// explicitly rejects it, while older Codex models retain their existing
-	// compatibility behavior below.
-	// The upstream catalog also lists "ultra" for Sol/Terra, but NarraFork's UI
-	// enum stops at "max", so ultra is intentionally not surfaced here.
-	"gpt-6-astra": ["low", "medium", "high", "xhigh", "max"],
-	"gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max"],
-	"gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max"],
-	"gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
-	"gpt-5.3-codex-spark": ["low", "medium", "high", "xhigh"],
-	"gpt-5.3-codex": ["low", "medium", "high", "xhigh"],
-	"gpt-5.2-codex": ["low", "medium", "high", "xhigh"],
-	"gpt-5.1-codex-max": ["low", "medium", "high", "xhigh"],
-	"gpt-5.1-codex": ["low", "medium", "high"],
-	"gpt-5.1-codex-mini": ["medium", "high"],
-	"gpt-5.2": ["low", "medium", "high", "xhigh"],
-	"gpt-5.5": ["low", "medium", "high", "xhigh"],
-	"gpt-5.4": ["low", "medium", "high", "xhigh"],
-	"gpt-5.4-mini": ["low", "medium", "high", "xhigh"],
-};
-
-type CodexInputModality = "text" | "image";
-
 export const CODEX_IMAGE_GENERATION_PARTIAL_IMAGES = 2;
-const DEFAULT_CODEX_INPUT_MODALITIES: readonly CodexInputModality[] = ["text", "image"];
-
-const CODEX_MODEL_INPUT_MODALITIES: Record<string, readonly CodexInputModality[]> = {
-	"gpt-6-astra": ["text", "image"],
-	"gpt-5.6-sol": ["text", "image"],
-	"gpt-5.6-terra": ["text", "image"],
-	"gpt-5.6-luna": ["text", "image"],
-	"gpt-5.5": ["text", "image"],
-	"gpt-5.4": ["text", "image"],
-	"gpt-5.4-mini": ["text", "image"],
-	"gpt-5.3-codex-spark": ["text"],
-	"gpt-5.3-codex": ["text", "image"],
-	"gpt-5.2-codex": ["text", "image"],
-	"gpt-5.2": ["text", "image"],
-	"gpt-5.1-codex-max": ["text", "image"],
-	"gpt-5.1-codex": ["text", "image"],
-	"gpt-5.1-codex-mini": ["text", "image"],
-};
+// Existing Codex server-tool compatibility, NOT model input/output modalities.
+// The image_generation tool delegates generation; text-only model output does
+// not mean that tool is unavailable, and image input does not prove it exists.
+const CODEX_MODELS_WITHOUT_IMAGE_GENERATION_TOOL = new Set(["gpt-5.3-codex-spark"]);
 
 function hasNativeTool(tools: unknown[], type: string): boolean {
 	return tools.some((tool) => {
@@ -191,9 +188,7 @@ function applyCodexImageGenerationDefaults(tools: unknown[]): void {
 }
 
 export function supportsCodexImageGeneration(model: string): boolean {
-	const bareModel = parseModelId(model).model;
-	const inputModalities = CODEX_MODEL_INPUT_MODALITIES[bareModel] ?? DEFAULT_CODEX_INPUT_MODALITIES;
-	return inputModalities.includes("image");
+	return !CODEX_MODELS_WITHOUT_IMAGE_GENERATION_TOOL.has(parseModelId(model).model);
 }
 
 export function appendCodexNativeTools(
@@ -201,7 +196,10 @@ export function appendCodexNativeTools(
 	model: string,
 	options?: { webSearch?: boolean; imageGeneration?: boolean },
 ): void {
-	if (options?.webSearch === false) {
+	if (
+		options?.webSearch === false ||
+		effectiveProviderMetadata(model).nativeSearch?.supported === false
+	) {
 		removeNativeTool(tools, "web_search");
 	} else if (!hasNativeTool(tools, "web_search")) {
 		tools.push({ type: "web_search" });
@@ -223,8 +221,8 @@ export function appendCodexNativeTools(
 }
 
 /**
- * Fallback reasoning tiers for Codex models not present in
- * CODEX_MODEL_REASONING_LEVELS. Most codex models expose low..xhigh but no
+ * Fallback reasoning tiers when the effective metadata has no declared levels.
+ * Most codex models expose low..xhigh but no
  * "max" tier, so an unknown model clamps "max" down to "xhigh".
  */
 const DEFAULT_CODEX_REASONING_LEVELS: readonly ReasoningEffort[] = [
@@ -234,27 +232,16 @@ const DEFAULT_CODEX_REASONING_LEVELS: readonly ReasoningEffort[] = [
 	"xhigh",
 ];
 
-/** Codex models whose upstream requires reasoning on every request. */
-const CODEX_MODELS_WITH_MANDATORY_REASONING = new Set(["gpt-6-astra"]);
-
 export function normalizeCodexReasoningEffort(
 	model: string,
 	reasoningEffort: string | undefined,
 ): string | undefined {
-	if (!reasoningEffort) return undefined;
-	const bareModel = parseModelId(model).model;
-	// Astra rejects `none`, including on internal title/summary requests that do
-	// not originate from the narrator UI. Route it to the lowest accepted tier.
-	if (reasoningEffort === "none") {
-		return CODEX_MODELS_WITH_MANDATORY_REASONING.has(bareModel) ? "low" : "none";
-	}
-	// Model cards first — they are what the hardcoded table became, and a user can
-	// correct a model's tiers there without waiting for a release.
-	const supported =
-		modelCardEffortLevels(bareModel, settings.agent.modelCards ?? []) ??
-		CODEX_MODEL_REASONING_LEVELS[bareModel] ??
-		DEFAULT_CODEX_REASONING_LEVELS;
-	return clampReasoningEffort(reasoningEffort as ReasoningEffort, supported);
+	const metadata = effectiveProviderMetadata(model);
+	const effort = resolveMetadataReasoning(metadata, reasoningEffort);
+	if (!effort) return undefined;
+	if (metadata.reasoning?.levels?.length || metadata.reasoning?.canDisable != null) return effort;
+	if (effort === "none") return "none";
+	return clampReasoningEffort(effort as ReasoningEffort, DEFAULT_CODEX_REASONING_LEVELS);
 }
 
 /**
@@ -269,7 +256,10 @@ export function resolveCodexRequestReasoningEffort(
 	return (
 		normalizeCodexReasoningEffort(
 			model,
-			reasoningEffort ?? settings.agent.defaultReasoningEffort ?? "max",
+			reasoningEffort ??
+				effectiveProviderMetadata(model).reasoning?.defaultLevel ??
+				settings.agent.defaultReasoningEffort ??
+				"max",
 		) ?? "none"
 	);
 }
@@ -295,6 +285,8 @@ function applyGenericReasoningEffort(
 	model: string,
 	reasoningEffort: string | undefined,
 ): void {
+	const metadata = effectiveProviderMetadata(model);
+	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort);
 	if (!reasoningEffort) return;
 	const bareModel = parseModelId(model).model;
 
@@ -310,11 +302,9 @@ function applyGenericReasoningEffort(
 		return;
 	}
 
-	const effort = mapGenericReasoningEffort(
-		bareModel,
-		reasoningEffort,
-		getReasoningEffortBlocklist(),
-	);
+	const effort = metadata.reasoning?.levels?.length
+		? reasoningEffort
+		: mapGenericReasoningEffort(bareModel, reasoningEffort, getReasoningEffortBlocklist());
 	if (!effort) return;
 	if (usesResponsesEndpoint(apiMode)) {
 		body.reasoning = { effort, summary: "auto" };
@@ -336,10 +326,7 @@ function applyGenerateReasoningOptions(
 	model: string,
 	options?: GenerateOptions,
 ): void {
-	const reasoningEffort = options?.reasoningEffort;
-	if (reasoningEffort === undefined) return;
-
-	applyGenericReasoningEffort(body, apiMode, model, reasoningEffort);
+	applyGenericReasoningEffort(body, apiMode, model, options?.reasoningEffort);
 }
 
 // === OpenAI identity prompt ===
@@ -834,7 +821,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			// Codex: inject native server-side tools only when the selected model supports them.
 			if (this.apiMode === "codex") {
 				const toolsArr = (body.tools ?? []) as unknown[];
-				appendCodexNativeTools(toolsArr, model, {
+				appendCodexNativeTools(toolsArr, params.model, {
 					webSearch: this.codexWebSearchEnabled && isNativeSearchChannelFirstEnabled(),
 					imageGeneration: this.codexImageGenerationEnabled,
 				});
@@ -843,7 +830,7 @@ export class OpenAIProvider implements ProviderAdapter {
 
 			const normalizedCodexReasoningEffort =
 				this.apiMode === "codex"
-					? resolveCodexRequestReasoningEffort(model, params.reasoningEffort)
+					? resolveCodexRequestReasoningEffort(params.model, params.reasoningEffort)
 					: params.reasoningEffort;
 			if (this.apiMode === "codex") {
 				applyCodexStableRequestFields(body, {
@@ -853,7 +840,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			} else {
 				// Plain responses-compatible relays: send the effort hint too. These
 				// used to get nothing at all, so their tier menu was dead weight.
-				applyGenericReasoningEffort(body, this.apiMode, model, params.reasoningEffort);
+				applyGenericReasoningEffort(body, this.apiMode, params.model, params.reasoningEffort);
 			}
 
 			// Add service_tier for Codex fast mode (priority processing).
@@ -885,9 +872,10 @@ export class OpenAIProvider implements ProviderAdapter {
 			// other model gets the plain `reasoning_effort` field. Previously only
 			// DeepSeek was handled here, so GLM/Kimi/MiniMax and friends behind a
 			// completions-compatible relay never received the tier the user picked.
-			applyGenericReasoningEffort(body, this.apiMode, model, params.reasoningEffort);
+			applyGenericReasoningEffort(body, this.apiMode, params.model, params.reasoningEffort);
 		}
 
+		applyOpenAIModelMetadata(body, params.model, this.apiMode, params.maxOutputTokens);
 		const requestHeaders = this.buildHeaders(apiKey, params.conversationId);
 		params.requestDump?.beginResponseAttempt(
 			{
@@ -1163,11 +1151,12 @@ export class OpenAIProvider implements ProviderAdapter {
 			if (codexIdentity) {
 				applyCodexStableRequestFields(body, {
 					identity: codexIdentity,
-					reasoningEffort: resolveCodexRequestReasoningEffort(bareModel, options?.reasoningEffort),
+					reasoningEffort: resolveCodexRequestReasoningEffort(model, options?.reasoningEffort),
 				});
 			} else {
-				applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
+				applyGenerateReasoningOptions(body, this.apiMode, model, options);
 			}
+			applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
 			const conversationId = codexIdentity?.conversationId;
 			return this.requestResponsesTextWithMeta(
 				baseUrl,
@@ -1191,7 +1180,8 @@ export class OpenAIProvider implements ProviderAdapter {
 			stream: true,
 			stream_options: { include_usage: true },
 		};
-		applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
+		applyGenerateReasoningOptions(body, this.apiMode, model, options);
+		applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
 		return this.requestChatCompletionsTextWithMeta(baseUrl, apiKey, body, options?.signal, options);
 	}
 
@@ -1242,11 +1232,12 @@ export class OpenAIProvider implements ProviderAdapter {
 			if (codexIdentity) {
 				applyCodexStableRequestFields(body, {
 					identity: codexIdentity,
-					reasoningEffort: resolveCodexRequestReasoningEffort(bareModel, options?.reasoningEffort),
+					reasoningEffort: resolveCodexRequestReasoningEffort(model, options?.reasoningEffort),
 				});
 			} else {
-				applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
+				applyGenerateReasoningOptions(body, this.apiMode, model, options);
 			}
+			applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
 			const conversationId = codexIdentity?.conversationId;
 			return this.requestResponsesTextWithMeta(
 				baseUrl,
@@ -1268,7 +1259,8 @@ export class OpenAIProvider implements ProviderAdapter {
 			stream: true,
 			stream_options: { include_usage: true },
 		};
-		applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
+		applyGenerateReasoningOptions(body, this.apiMode, model, options);
+		applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
 		return this.requestChatCompletionsTextWithMeta(baseUrl, apiKey, body, options?.signal, options);
 	}
 
@@ -1637,7 +1629,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
-		appendCodexNativeTools(tools, model, {
+		appendCodexNativeTools(tools, params.model, {
 			webSearch: this.codexWebSearchEnabled && isNativeSearchChannelFirstEnabled(),
 			imageGeneration: this.codexImageGenerationEnabled,
 		});
@@ -1645,12 +1637,13 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		applyCodexStableRequestFields(request, {
 			identity: createCodexRequestIdentity(params.conversationId),
-			reasoningEffort: resolveCodexRequestReasoningEffort(model, params.reasoningEffort),
+			reasoningEffort: resolveCodexRequestReasoningEffort(params.model, params.reasoningEffort),
 		});
 		if (params.serviceTier) {
 			request.service_tier = params.serviceTier;
 		}
 
+		applyOpenAIModelMetadata(request, params.model, "codex", params.maxOutputTokens);
 		return request;
 	}
 
@@ -2082,6 +2075,9 @@ export interface ResponsesReasoningAccum {
 	lastSummaryIndex?: number;
 	/** Track each summary separately: a later done-only part must not be dropped. */
 	emittedParts?: Set<string>;
+	/** Exact bytes seen per native content part, including partial delta recovery. */
+	nativeParts?: Map<number, string>;
+	textFormat?: "reasoning_text" | "summary_text" | "mixed";
 	completed?: boolean;
 }
 
@@ -2129,8 +2125,24 @@ function pushReasoningTextEvent(
 		acc = { itemId: chunk.item_id ?? "", emittedText: "" };
 		reasoningAccum.set(chunk.output_index ?? -(reasoningAccum.size + 1), acc);
 	}
-	const partKey = `${chunk.summary_index == null ? "content" : "summary"}:${chunk.summary_index ?? chunk.content_index ?? 0}`;
-	if (options.emitOnlyIfAccumulatorEmpty && acc.emittedParts?.has(partKey)) return;
+	const native =
+		chunk.type === "response.reasoning_text.delta" || chunk.type === "response.reasoning_text.done";
+	const format = native ? "reasoning_text" : "summary_text";
+	acc.textFormat = acc.textFormat && acc.textFormat !== format ? "mixed" : format;
+	const partKey = `${native ? "content" : "summary"}:${chunk.summary_index ?? chunk.content_index ?? 0}`;
+	if (native) {
+		acc.nativeParts ??= new Map();
+		const index = chunk.content_index ?? 0;
+		const previous = acc.nativeParts.get(index) ?? "";
+		if (options.emitOnlyIfAccumulatorEmpty) {
+			if (!text.startsWith(previous)) return;
+			acc.nativeParts.set(index, text);
+			text = text.slice(previous.length);
+			if (!text) return;
+		} else {
+			acc.nativeParts.set(index, previous + text);
+		}
+	} else if (options.emitOnlyIfAccumulatorEmpty && acc.emittedParts?.has(partKey)) return;
 	acc.emittedParts ??= new Set();
 	acc.emittedParts.add(partKey);
 
@@ -2140,7 +2152,7 @@ function pushReasoningTextEvent(
 	// this lets the frontend seal completed parts and re-parse only the active
 	// tail, instead of re-parsing the whole (unbounded) reasoning every frame.
 	let emitText = text;
-	if (acc && typeof chunk.summary_index === "number") {
+	if (!native && typeof chunk.summary_index === "number") {
 		if (
 			acc.lastSummaryIndex != null &&
 			chunk.summary_index > acc.lastSummaryIndex &&
@@ -2162,6 +2174,7 @@ function pushReasoningTextEvent(
 				openai: {
 					itemId: acc.itemId,
 					reasoningEncryptedContent: acc.encryptedContent,
+					textFormat: acc.textFormat,
 				},
 			},
 			reasoningOutputIndex: chunk.output_index,
@@ -2596,12 +2609,31 @@ export function parseResponsesAPIEvent(
 				);
 			}
 		}
+		for (const [contentIndex, part] of (chunk.item.content ?? []).entries()) {
+			if (part?.type === "reasoning_text" && typeof part.text === "string") {
+				pushReasoningTextEvent(
+					results,
+					{
+						...itemChunk,
+						type: "response.reasoning_text.done",
+						content_index: contentIndex,
+					},
+					reasoningAccum,
+					part.text,
+					{ emitOnlyIfAccumulatorEmpty: true },
+				);
+			}
+		}
 		const finalEncrypted = chunk.item.encrypted_content ?? acc.encryptedContent;
 		acc.encryptedContent = finalEncrypted;
 		acc.completed = true;
 		results.push({
 			reasoningMetadata: {
-				openai: { itemId: chunk.item.id ?? acc?.itemId, reasoningEncryptedContent: finalEncrypted },
+				openai: {
+					itemId: chunk.item.id ?? acc?.itemId,
+					reasoningEncryptedContent: finalEncrypted,
+					textFormat: acc.textFormat,
+				},
 			},
 			reasoningBlockId: responsesBlockId(itemChunk, "reasoning"),
 			reasoningOutputIndex: chunk.output_index,
@@ -3465,6 +3497,34 @@ async function buildResponsesUserMessageFromDbMessage(
 	return null;
 }
 
+/** Legacy unmarked text may be a summary, even on DeepSeek; never infer native bytes. */
+function serializeResponsesReasoning(
+	block: ResponsesReasoningBlock,
+	options: ReasoningReplayOptions,
+	trustedCurrentTurn = false,
+): OAIMessage | undefined {
+	const metadata = block.providerMetadata?.openai;
+	const sameSource =
+		trustedCurrentTurn ||
+		signatureSourcesCompatible(block.providerMetadata?.signatureSource, options.currentSource);
+	if (metadata?.reasoningEncryptedContent && sameSource) {
+		return {
+			type: "reasoning",
+			id: metadata.itemId,
+			summary: block.text.trim() ? [{ type: "summary_text", text: block.text.trim() }] : [],
+			encrypted_content: metadata.reasoningEncryptedContent,
+		} as unknown as OAIMessage;
+	}
+	if (!options.strict && sameSource && metadata?.textFormat === "reasoning_text" && block.text) {
+		return {
+			type: "reasoning",
+			id: metadata.itemId,
+			content: [{ type: "reasoning_text", text: block.text }],
+		} as unknown as OAIMessage;
+	}
+	return undefined;
+}
+
 function buildResponsesPreludeItems(
 	reasoningBlocks?: ResponsesReasoningBlock[],
 	webSearchBlocks?: ResponsesWebSearchBlock[],
@@ -3479,22 +3539,12 @@ function buildResponsesPreludeItems(
 	let sourceIndex = 0;
 	for (const block of reasoningBlocks ?? []) {
 		const text = block.text?.trim() ?? "";
-		const metadata = block.providerMetadata?.openai;
-		if (metadata?.reasoningEncryptedContent) {
-			// Credential-bound reasoning: replay the item verbatim. These blocks
-			// come from the current in-memory turn, so the credential was minted by
-			// this same upstream — no source check is needed. This applies even when
-			// the model name would classify as a plain-text relay: some Codex-style
-			// gateways (e.g. Console Go) mint encrypted_content for every model and
-			// reject a follow-up turn that drops the reasoning item
-			// ("reasoning_text in the thinking mode must be passed back").
+		const nativeItem = serializeResponsesReasoning(block, { strict }, true);
+		if (nativeItem) {
+			// These blocks belong to the current in-memory upstream turn. Preserve
+			// its encrypted credential or explicitly identified native plaintext.
 			entries.push({
-				item: {
-					type: "reasoning",
-					id: metadata.itemId,
-					summary: text ? [{ type: "summary_text", text }] : [],
-					encrypted_content: metadata.reasoningEncryptedContent,
-				} as unknown as OAIMessage,
+				item: nativeItem,
 				outputIndex: block.outputIndex,
 				sourceIndex: sourceIndex++,
 			});
@@ -3694,47 +3744,13 @@ function buildResponsesAssistantItemsFromStoredContent(
 			flushTextBuffer();
 			const reasoningBlock = block as Extract<StoredAssistantBlock, { type: "reasoning" }>;
 			const text = typeof reasoningBlock.text === "string" ? reasoningBlock.text.trim() : "";
-			const metadata = reasoningBlock.providerMetadata?.openai;
-			const canReplayEncrypted =
-				!!metadata?.reasoningEncryptedContent &&
-				signatureSourcesCompatible(
-					reasoningBlock.providerMetadata?.signatureSource,
-					options.currentSource,
-				);
-			if (options.strict) {
-				// Credential-bound model: replay the encrypted item only when we can
-				// prove the credential was minted by the upstream handling this
-				// request. Anything else is dropped — the official API rejects
-				// unsigned/foreign reasoning replay, and the block would wedge the
-				// conversation if echoed with a blanked credential.
-				if (canReplayEncrypted) {
-					items.push({
-						type: "reasoning",
-						id: metadata.itemId,
-						summary: text ? [{ type: "summary_text", text }] : [],
-						encrypted_content: metadata.reasoningEncryptedContent,
-					} as unknown as OAIMessage);
-				} else {
-					logger.debug("Dropping unreplayable reasoning item (strict model)", {
-						itemId: metadata?.itemId,
-						hasEncrypted: !!metadata?.reasoningEncryptedContent,
-						hasSource: !!reasoningBlock.providerMetadata?.signatureSource,
-					});
-				}
-			} else if (canReplayEncrypted) {
-				// Model name classifies as a plain-text relay, but the block carries an
-				// encrypted_content minted by this same gateway (e.g. Console Go-style
-				// Codex-compatible endpoints mint credentials for relay models too).
-				// Those gateways reject a follow-up turn that drops the reasoning item
-				// ("reasoning_text in the thinking mode must be passed back"), so the
-				// item must be replayed verbatim rather than degraded to assistant text.
-				items.push({
-					type: "reasoning",
-					id: metadata.itemId,
-					summary: text ? [{ type: "summary_text", text }] : [],
-					encrypted_content: metadata.reasoningEncryptedContent,
-				} as unknown as OAIMessage);
-			} else if (text) {
+			const nativeItem = serializeResponsesReasoning(
+				{ ...reasoningBlock, text: reasoningBlock.text ?? "" },
+				options,
+			);
+			if (nativeItem) {
+				items.push(nativeItem);
+			} else if (!options.strict && text) {
 				// Genuine plain-text relay (or foreign encrypted block we must not echo
 				// to this upstream): degrade to an assistant message so the model still
 				// sees its own prior thoughts.
@@ -4153,16 +4169,16 @@ function buildReasoningTextFallback(
  *   - { role: "assistant", tool_calls } → separate { type: "function_call" } items + text
  *
  * `options` carries the reasoning replay policy (see {@link ReasoningReplayOptions}).
- * Strict models replay only source-matching `encrypted_content` items and drop the
- * rest; relay models never send `encrypted_content` and fold the reasoning text
- * into the assistant message instead.
+ * Strict models replay only source-matching encrypted items. Non-strict models
+ * also replay explicitly marked, same-source native plaintext; other reasoning
+ * falls back to assistant text, without forwarding foreign credentials.
  */
 export function convertHistoryToResponsesApi(
 	messages: OAIMessage[],
 	options: ReasoningReplayOptions = { strict: true },
 ): OAIMessage[] {
-	/** Replay reasoning items whose encrypted_content was minted by the current upstream. */
-	const pushStrictReasoningItems = (m: {
+	/** Apply the same replay policy as live turns and stored Responses history. */
+	const pushReasoningItems = (m: {
 		_reasoningBlocks?: Array<{
 			text: string;
 			providerMetadata?: import("./types").ReasoningProviderMetadata;
@@ -4170,18 +4186,8 @@ export function convertHistoryToResponsesApi(
 	}) => {
 		if (!m._reasoningBlocks?.length) return;
 		for (const rb of m._reasoningBlocks) {
-			const metadata = rb.providerMetadata?.openai;
-			if (
-				metadata?.reasoningEncryptedContent &&
-				signatureSourcesCompatible(rb.providerMetadata?.signatureSource, options.currentSource)
-			) {
-				result.push({
-					type: "reasoning",
-					id: metadata.itemId,
-					summary: [{ type: "summary_text", text: rb.text }],
-					encrypted_content: metadata.reasoningEncryptedContent,
-				} as unknown as OAIMessage);
-			}
+			const item = serializeResponsesReasoning(rb, options);
+			if (item) result.push(item);
 			// No credential or a foreign one: dropped — echoing it would fail
 			// verification upstream and wedge the conversation.
 		}
@@ -4223,17 +4229,19 @@ export function convertHistoryToResponsesApi(
 			} as unknown as OAIMessage);
 		} else if (m.role === "assistant" && m.tool_calls?.length) {
 			// Split assistant message with tool_calls into:
-			// 1. strict models: reasoning items carrying a source-matching
-			//    encrypted_content; relay models: the reasoning text degrades to a
-			//    leading assistant message (encrypted_content never crosses to a
-			//    non-OpenAI upstream)
+			// 1. source-matching encrypted/native reasoning items; non-strict
+			//    models retain other reasoning as a leading assistant message
 			// 2. assistant text
 			// 3. separate function_call items
 
-			if (options.strict) {
-				pushStrictReasoningItems(m);
-			} else {
-				const fallback = relayReasoningText(m);
+			pushReasoningItems(m);
+			if (!options.strict) {
+				const fallback = relayReasoningText({
+					...m,
+					_reasoningBlocks: m._reasoningBlocks?.filter(
+						(block: ResponsesReasoningBlock) => !serializeResponsesReasoning(block, options),
+					),
+				});
 				if (fallback) {
 					result.push({
 						role: "assistant",
@@ -4263,11 +4271,16 @@ export function convertHistoryToResponsesApi(
 			// Skip null/empty content because Responses API rejects role messages
 			// whose content is null.
 
-			if (options.strict) {
-				pushStrictReasoningItems(m);
-			}
-			// Relay models fold their reasoning text into the assistant message.
-			const fallback = options.strict ? "" : relayReasoningText(m);
+			pushReasoningItems(m);
+			// Only non-replayable relay text falls back to an assistant message.
+			const fallback = options.strict
+				? ""
+				: relayReasoningText({
+						...m,
+						_reasoningBlocks: m._reasoningBlocks?.filter(
+							(block: ResponsesReasoningBlock) => !serializeResponsesReasoning(block, options),
+						),
+					});
 
 			const content = m.content;
 			if (typeof content === "string") {

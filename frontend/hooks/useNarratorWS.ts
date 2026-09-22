@@ -16,6 +16,7 @@ import type {
 	SubagentToolCallTiming,
 	TreeMessage,
 } from "../lib/api";
+import type { SubagentFileChanges } from "../lib/api/types";
 import {
 	type ListenerHandle,
 	type NarratorMessageSnapshot,
@@ -100,6 +101,100 @@ function normalizeSubagentActivityHeader(value: unknown): SubagentToolCallHeader
 	};
 }
 
+// Keep in sync with MAX_AGGREGATED_FILES in server/services/subagent-file-changes.ts.
+// Activity snapshots forward the complete aggregate, not the five-row card preview.
+const SUBAGENT_FILE_CHANGES_MAX = 2000;
+
+function isFileChangeCount(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isNullableString(value: unknown): value is string | null {
+	return value === null || typeof value === "string";
+}
+
+function normalizeSubagentFileChanges(value: unknown): SubagentFileChanges | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	if (
+		!Array.isArray(record.files) ||
+		record.files.length > SUBAGENT_FILE_CHANGES_MAX ||
+		!isFileChangeCount(record.totalFiles) ||
+		!isFileChangeCount(record.totalUnmeasured) ||
+		!isFileChangeCount(record.bashTouchedCount) ||
+		typeof record.countsTruncated !== "boolean"
+	) {
+		return undefined;
+	}
+	const files: SubagentFileChanges["files"] = [];
+	for (const rawFile of record.files) {
+		if (!rawFile || typeof rawFile !== "object" || Array.isArray(rawFile)) return undefined;
+		const file = rawFile as Record<string, unknown>;
+		// Reject the whole aggregate rather than drop bad rows: a fabricated empty
+		// snapshot would erase the valid file changes already held by the card.
+		if (
+			typeof file.filePath !== "string" ||
+			!file.filePath.trim() ||
+			(file.linesAdded !== null && !isFileChangeCount(file.linesAdded)) ||
+			(file.linesRemoved !== null && !isFileChangeCount(file.linesRemoved)) ||
+			!isFileChangeCount(file.editCount) ||
+			(file.unmeasuredCount !== undefined && !isFileChangeCount(file.unmeasuredCount)) ||
+			(file.outsideParentWorkspace !== undefined &&
+				file.outsideParentWorkspace !== null &&
+				typeof file.outsideParentWorkspace !== "boolean")
+		) {
+			return undefined;
+		}
+		const normalized: SubagentFileChanges["files"][number] = {
+			filePath: file.filePath,
+			linesAdded: file.linesAdded,
+			linesRemoved: file.linesRemoved,
+			editCount: file.editCount,
+			...(file.unmeasuredCount !== undefined ? { unmeasuredCount: file.unmeasuredCount } : {}),
+			...(file.outsideParentWorkspace !== undefined
+				? { outsideParentWorkspace: file.outsideParentWorkspace }
+				: {}),
+		};
+		for (const key of ["subagentNarratorId", "deviceId", "workspacePath"] as const) {
+			if (file[key] === undefined) continue;
+			if (!isNullableString(file[key])) return undefined;
+			normalized[key] = file[key];
+		}
+		files.push(normalized);
+	}
+	const normalized: SubagentFileChanges = {
+		files,
+		totalFiles: record.totalFiles,
+		totalUnmeasured: record.totalUnmeasured,
+		bashTouchedCount: record.bashTouchedCount,
+		countsTruncated: record.countsTruncated,
+	};
+	if (record.attributionScope !== undefined) {
+		if (
+			record.attributionScope !== "exact_attempt" &&
+			record.attributionScope !== "mixed" &&
+			record.attributionScope !== "legacy_unscoped"
+		) {
+			return undefined;
+		}
+		normalized.attributionScope = record.attributionScope;
+	}
+	if (record.scope !== undefined) {
+		if (!record.scope || typeof record.scope !== "object" || Array.isArray(record.scope)) {
+			return undefined;
+		}
+		const scope = record.scope as Record<string, unknown>;
+		if (!isNullableString(scope.sourceToolUseId)) return undefined;
+		normalized.scope = { sourceToolUseId: scope.sourceToolUseId };
+		for (const key of ["startedAt", "completedAt"] as const) {
+			if (scope[key] === undefined) continue;
+			if (!isNullableString(scope[key])) return undefined;
+			normalized.scope[key] = scope[key];
+		}
+	}
+	return normalized;
+}
+
 function normalizeSubagentActivitySummary(value: unknown): SubagentActivitySummary | null {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 	const record = value as Record<string, unknown>;
@@ -110,11 +205,14 @@ function normalizeSubagentActivitySummary(value: unknown): SubagentActivitySumma
 				.slice(-3)
 		: [];
 	const reasoningEffort = nonEmptyString(record.reasoningEffort);
+	const fileChanges = normalizeSubagentFileChanges(record.fileChanges);
 	return {
 		subagentNarratorId:
 			typeof record.subagentNarratorId === "string" ? record.subagentNarratorId : null,
 		model: nonEmptyString(record.model),
 		...(reasoningEffort ? { reasoningEffort } : {}),
+		...(fileChanges ? { fileChanges } : {}),
+		...(record.takenOver === true ? { takenOver: true } : {}),
 		latestToolCalls,
 	};
 }

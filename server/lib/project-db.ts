@@ -33,6 +33,8 @@ const PROJECT_DB_SCHEMA_PATCHES: Array<{
 	{
 		table: "narrator_messages",
 		columns: [
+			{ name: "cost_status", type: "TEXT" },
+			{ name: "cost_missing_fields", type: "TEXT" },
 			{ name: "provider", type: "TEXT" },
 			{ name: "model", type: "TEXT" },
 			{ name: "output_tokens", type: "INTEGER" },
@@ -243,6 +245,8 @@ CREATE TABLE IF NOT EXISTS narrator_messages (
 	content_text TEXT,
 	tokens_in INTEGER,
 	cost_usd REAL,
+	cost_status TEXT,
+	cost_missing_fields TEXT,
 	turn_usage_json TEXT,
 	provider TEXT,
 	model TEXT,

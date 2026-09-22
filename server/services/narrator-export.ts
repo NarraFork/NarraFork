@@ -198,6 +198,8 @@ interface ExportMessageRow {
 	tokensIn: number | null;
 	outputTokens: number | null;
 	costUsd: number | null;
+	costStatus?: "complete" | "partial" | "unknown" | null;
+	costMissingFields?: string[] | null;
 	parentToolUseId: string | null;
 	/**
 	 * Only set on child (subagent) rows: their content is clamped in SQL, so a
@@ -448,6 +450,8 @@ const MESSAGE_COLUMNS = {
 	tokensIn: narratorMessages.tokensIn,
 	outputTokens: narratorMessages.outputTokens,
 	costUsd: narratorMessages.costUsd,
+	costStatus: narratorMessages.costStatus,
+	costMissingFields: narratorMessages.costMissingFields,
 	parentToolUseId: narratorMessages.parentToolUseId,
 } as const;
 
@@ -646,6 +650,8 @@ const CHILD_MESSAGE_COLUMNS = {
 	tokensIn: narratorMessages.tokensIn,
 	outputTokens: narratorMessages.outputTokens,
 	costUsd: narratorMessages.costUsd,
+	costStatus: narratorMessages.costStatus,
+	costMissingFields: narratorMessages.costMissingFields,
 	parentToolUseId: narratorMessages.parentToolUseId,
 } as const;
 
@@ -1151,6 +1157,8 @@ function jsonMessage(message: ExportMessage, includeToolIO: boolean) {
 		tokensIn: message.row.tokensIn,
 		outputTokens: message.row.outputTokens,
 		costUsd: message.row.costUsd,
+		costStatus: message.row.costStatus ?? null,
+		costMissingFields: message.row.costMissingFields ?? null,
 		isCompactMarker: message.isCompactMarker,
 		folded: message.folded,
 		content: contentBlocks(message.row.contentJson),

@@ -9,6 +9,7 @@ import {
 	formatLocaleDateTime,
 	formatLocaleNumber,
 } from "@frontend/lib/intl-format";
+import { referenceCostStatus } from "@frontend/lib/usage-cost";
 import type {
 	UsageHistoryGranularity,
 	UsageHistoryTimeSeriesPoint,
@@ -370,6 +371,12 @@ export function UsageHistoryChart({
 					</Group>
 				</Group>
 
+				{(metric === "totalCost" || compareMetric === "totalCost") &&
+					points.some((point) => referenceCostStatus(point, point.totalCost) !== "complete") && (
+						<Text size="xs" c="orange">
+							{t("usageCostIncompleteNote")}
+						</Text>
+					)}
 				{loading ? (
 					<Group justify="center" py="xl">
 						<Loader size="sm" />

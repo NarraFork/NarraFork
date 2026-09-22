@@ -9,6 +9,7 @@ import { parseModelId } from "@shared/model-id";
 import { getCodexManager } from "../codex-manager";
 import { AppError } from "../errors";
 import { modelCardContextWindow, modelCardMaxCompletionTokens } from "../model-cards";
+import { getEffectiveModelMetadata } from "../model-catalog";
 import { isNugCachedModelAvailable, resolveNugModelMeta } from "../nug-model-cache";
 import type {
 	AnthropicProviderConfig,
@@ -982,10 +983,10 @@ export function getBuiltinModelContextWindows(
 /**
  * Where an effective context window came from, in descending priority.
  *
- * - `user`: a per-model override typed in settings (agent.modelContextWindows)
- * - `card`: a model card field the USER set (an edited or newly created card)
- * - `provider`: the provider's own `defaultContextWindow` field
+ * - `user`: an explicit binding/per-model override (including migrated settings)
+ * - `card`: model/variant metadata the USER set (an edited or newly created card)
  * - `catalog`: model metadata reported by a gateway (NUG model catalog)
+ * - `provider`: the provider's own `defaultContextWindow` field
  * - `builtin`: a model card field seeded by NarraFork and left untouched
  * - `fallback`: nothing matched, the 128k default
  *
@@ -1041,6 +1042,31 @@ export function resolveModelContextWindow(
 
 	const bareModel = parseModelId(model).model;
 	const fullModelValue = provider ? `${provider}:${bareModel}` : model;
+
+	if (s().agent.modelCatalog) {
+		const metadataModel =
+			provider && !model.startsWith(`${provider}:`) ? `${provider}:${model}` : model;
+		const resolved = getEffectiveModelMetadata(metadataModel);
+		const window = resolved.metadata.limits?.contextWindow;
+		const layer = resolved.provenance["limits.contextWindow"]?.layer;
+		// Explicit unknown blocks fallback to stale legacy model cards.
+		if (window === null) return { contextWindow: 128_000, source: "fallback" };
+		if (window !== undefined && (layer?.startsWith("local-") || layer === "discovered"))
+			return {
+				contextWindow: window,
+				source: layer === "local-binding" ? "user" : layer === "discovered" ? "catalog" : "card",
+			};
+		// A provider's explicit budget outranks presets, but not local model/binding
+		// decisions or the gateway's discovered window (the legacy NUG precedence).
+		const configured =
+			getOpenaiProviderConfig(provider)?.defaultContextWindow ??
+			getAnthropicProviderConfig(provider)?.defaultContextWindow ??
+			getGeminiProviderConfig(provider)?.defaultContextWindow;
+		if (configured) return { contextWindow: configured, source: "provider" };
+		return window !== undefined
+			? { contextWindow: window, source: "builtin" }
+			: { contextWindow: 128_000, source: "fallback" };
+	}
 
 	// 0. Check per-model user overrides (highest priority)
 	const userOverrides = s().agent.modelContextWindows ?? {};
@@ -1138,6 +1164,10 @@ export function getQueueDuringCompaction(): boolean {
 }
 
 export function getModelMaxCompletionTokens(model: string, _provider: string): number | null {
+	if (s().agent.modelCatalog) {
+		const full = _provider && !model.startsWith(`${_provider}:`) ? `${_provider}:${model}` : model;
+		return getEffectiveModelMetadata(full).metadata.limits?.maxOutputTokens ?? null;
+	}
 	const bareModel = parseModelId(model).model;
 	const cards = userModelCards();
 	const stripped = stripChannelSegment(bareModel);

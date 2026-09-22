@@ -41,6 +41,109 @@ function toolMessage(
 	};
 }
 
+describe("upsertLoadedMessage preserves subagent file evidence", () => {
+	const fileChanges = {
+		files: [{ filePath: "src/file.ts", linesAdded: 3, linesRemoved: 1, editCount: 2 }],
+		totalFiles: 1,
+		totalUnmeasured: 0,
+		bashTouchedCount: 0,
+		countsTruncated: false,
+	};
+	const activity = {
+		subagentNarratorId: "child",
+		model: "model",
+		latestToolCalls: [],
+		fileChanges,
+	};
+	function activities(message: AppendCandidate) {
+		return [
+			...(message.contentJson as Array<{ _subagentActivity?: typeof activity | null }>),
+			...(message.toolCalls as Array<{ _subagentActivity?: typeof activity | null }>),
+		].map((row) => row._subagentActivity);
+	}
+	it.each([
+		{},
+		{ _subagentActivity: { subagentNarratorId: "child", model: null, latestToolCalls: [] } },
+	])("retains the aggregate in both carriers when a projection omits it: %j", (extra) => {
+		const previous = toolMessage("m1", "running", { _subagentActivity: activity });
+		const result = upsertLoadedMessage([previous], toolMessage("m1", "running", extra), false);
+		for (const next of activities(result.messages[0]))
+			expect(next?.fileChanges).toEqual(fileChanges);
+		expect(activities(previous)).toEqual([activity, activity]);
+	});
+	it("accepts explicit aggregate clearing and activity removal", () => {
+		const previous = toolMessage("m1", "running", { _subagentActivity: activity });
+		const empty = { ...fileChanges, files: [], totalFiles: 0 };
+		for (const nextActivity of [{ ...activity, fileChanges: empty }, null, undefined]) {
+			const result = upsertLoadedMessage(
+				[previous],
+				toolMessage("m1", "running", { _subagentActivity: nextActivity }),
+				false,
+			);
+			expect(activities(result.messages[0])).toEqual([nextActivity, nextActivity]);
+		}
+	});
+	it("does not copy files to a different child", () => {
+		const previous = toolMessage("m1", "running", { _subagentActivity: activity });
+		const { fileChanges: _files, ...omitted } = activity;
+		const nextActivity = { ...omitted, subagentNarratorId: "new-child" };
+		const result = upsertLoadedMessage(
+			[previous],
+			toolMessage("m1", "running", { _subagentActivity: nextActivity }),
+			false,
+		);
+		for (const next of activities(result.messages[0])) {
+			expect(next?.subagentNarratorId).toBe("new-child");
+			expect(next?.fileChanges).toBeUndefined();
+		}
+	});
+	it.each([
+		{},
+		{ _subagentActivity: { subagentNarratorId: "child", model: null, latestToolCalls: [] } },
+	])("does not inherit the previous attempt on retry: %j", (extra) => {
+		const previous = toolMessage("m1", "fail", {
+			executionAttempt: 1,
+			_subagentActivity: activity,
+		});
+		const result = upsertLoadedMessage(
+			[previous],
+			toolMessage("m1", "initializing", { executionAttempt: 2, ...extra }),
+			false,
+		);
+		for (const next of activities(result.messages[0])) expect(next?.fileChanges).toBeUndefined();
+	});
+	it.each([
+		{},
+		{ executionAttempt: null },
+	])("keeps attempt ownership across sparse updates before retry: %j", (sparseExtra) => {
+		const previous = toolMessage("m1", "fail", {
+			executionAttempt: 1,
+			_subagentActivity: activity,
+		});
+		const sparse = upsertLoadedMessage(
+			[previous],
+			toolMessage("m1", "running", sparseExtra),
+			false,
+		);
+		for (const summary of activities(sparse.messages[0]))
+			expect(summary?.fileChanges).toEqual(fileChanges);
+		const retry = upsertLoadedMessage(
+			sparse.messages,
+			toolMessage("m1", "initializing", { executionAttempt: 2 }),
+			false,
+		);
+		for (const summary of activities(retry.messages[0])) expect(summary).toBeUndefined();
+	});
+	it("does not restore a tool block removed by an authoritative edit", () => {
+		const previous = toolMessage("m1", "running", { _subagentActivity: activity });
+		const incoming = {
+			...toolMessage("m1", "running"),
+			contentJson: [{ type: "text", text: "edited" }],
+		};
+		const result = upsertLoadedMessage([previous], incoming, false);
+		expect(result.messages[0].contentJson).toEqual(incoming.contentJson);
+	});
+});
 describe("upsertLoadedMessage preserves live tool lifecycle", () => {
 	it("does not overwrite success with a stale running snapshot", () => {
 		const previous = toolMessage("m1", "success", {

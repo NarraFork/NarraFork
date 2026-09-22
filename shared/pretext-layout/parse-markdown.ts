@@ -28,6 +28,7 @@ import { prepareWithSegments } from "@chenglou/pretext";
 import type { RichInlineItem } from "@chenglou/pretext/rich-inline";
 import { measureRichInlineStats, prepareRichInline } from "@chenglou/pretext/rich-inline";
 import { marked, type Token, type Tokens } from "marked";
+import { prepareMarkdownEmphasis, stripEmphasisSentinel } from "../markdown-emphasis-compat";
 import { fileLinkLineSuffix, localFileHref, parseLocalFilePath } from "../markdown-file-path";
 import type { GlyphVerticalResolver, GlyphWidthResolver, KatexRuntime } from "./katex-geometry";
 import { measureKatex } from "./katex-geometry";
@@ -165,19 +166,42 @@ const MATH_SENTINEL_RE = /\uE000(\d+)\uE001/g;
  * Replace inline math with sentinels, leaving display math (`$$…$$`) in place for
  * the paragraph splitter and code regions untouched.
  */
-function extractInlineMath(source: string): { text: string; formulas: string[] } {
+function extractInlineMath(
+	source: string,
+	sourceOffsets?: number[],
+): { text: string; formulas: string[] } {
 	if (!source.includes("$")) return { text: source, formulas: [] };
 	const formulas: string[] = [];
-	let text = "";
-	for (const segment of splitMathOutsideCode(source)) {
+	const chunks: string[] = [];
+	const mapped: number[] = [];
+	splitMathOutsideCode(source, (segment, start, end) => {
 		if (segment.kind === "inline-math") {
-			text += `${MATH_SENTINEL_OPEN}${formulas.length}${MATH_SENTINEL_CLOSE}`;
+			const sentinel = `${MATH_SENTINEL_OPEN}${formulas.length}${MATH_SENTINEL_CLOSE}`;
+			chunks.push(sentinel);
 			formulas.push(segment.latex);
-			continue;
+			if (sourceOffsets)
+				for (let i = 0; i < sentinel.length; i++) mapped.push(sourceOffsets[start] as number);
+			return;
 		}
-		text += segment.kind === "text" ? segment.text : `$$${segment.latex}$$`;
+		chunks.push(segment.kind === "text" ? segment.text : `$$${segment.latex}$$`);
+		if (!sourceOffsets) return;
+		if (segment.kind === "text") {
+			for (let i = start; i < end; i++) mapped.push(sourceOffsets[i] as number);
+		} else {
+			mapped.push(sourceOffsets[start] as number, sourceOffsets[start + 1] as number);
+			const body = source.slice(start + 2, end - 2);
+			const bodyStart = start + 2 + body.length - body.trimStart().length;
+			for (let i = 0; i < segment.latex.length; i++)
+				mapped.push(sourceOffsets[bodyStart + i] as number);
+			mapped.push(sourceOffsets[end - 2] as number, sourceOffsets[end - 1] as number);
+		}
+	});
+	if (sourceOffsets) {
+		mapped.push(sourceOffsets[source.length] as number);
+		sourceOffsets.length = 0;
+		for (const offset of mapped) sourceOffsets.push(offset);
 	}
-	return { text, formulas };
+	return { text: chunks.join(""), formulas };
 }
 
 /**
@@ -237,8 +261,10 @@ export function parseMarkdownToPreparedBlocks(
 	markdown: string,
 	math?: MathSupport,
 ): PreparedBlock[] {
+	// `prepareMarkdownEmphasis` only rewrites pairs CommonMark would refuse
+	// (`**注意：**说明`); legal `**bold**` is byte-identical.
 	if (!math) {
-		const tokens = marked.lexer(markdown, { gfm: true });
+		const tokens = marked.lexer(prepareMarkdownEmphasis(markdown), { gfm: true });
 		return parseBlockTokens(tokens, { listDepth: 0, quoteDepth: 0 });
 	}
 	// Normalize `\(...\)` / `\[...\]` to the dollar forms so one code path handles
@@ -246,7 +272,7 @@ export function parseMarkdownToPreparedBlocks(
 	// marked's inline lexer (see MATH_SENTINEL_OPEN).
 	const normalized = normalizeMathDelimiters(markdown);
 	const { text, formulas } = extractInlineMath(normalized);
-	const tokens = marked.lexer(text, { gfm: true });
+	const tokens = marked.lexer(prepareMarkdownEmphasis(text), { gfm: true });
 	return parseBlockTokens(tokens, { listDepth: 0, quoteDepth: 0, math, formulas });
 }
 
@@ -319,7 +345,7 @@ function marginSeedBlockCount(): number {
 
 /** One top-level markdown block: its source text plus its prepared blocks. */
 export interface PreparedMarkdownUnit {
-	/** Exact source slice this unit was produced from (`token.raw`). */
+	/** Exact ORIGINAL source slice, before math/emphasis/newline preprocessing. */
 	raw: string;
 	/** True when this unit is the document's first rendered block (marginTop 0). */
 	isFirst: boolean;
@@ -370,27 +396,50 @@ export function parseMarkdownUnits(
 	options: ParseMarkdownUnitsOptions = {},
 ): PreparedMarkdownUnit[] {
 	const { continuation = false, reuse } = options;
-	// Math lifting rewrites the source before lexing, so the units' `raw` values are
-	// slices of the REWRITTEN text. That is internally consistent (they are only ever
-	// compared against each other and re-parsed through this same path), and it keeps
-	// formula handling identical to the whole-document parse.
-	const source = math ? extractInlineMath(normalizeMathDelimiters(markdown)) : undefined;
-	const text = source?.text ?? markdown;
+	// Lexer offsets belong to transformed text, but the streaming cache slices the
+	// ORIGINAL input. Carry boundaries through math lifting, inserted emphasis
+	// sentinels and marked's CRLF normalization. No second Markdown parse is needed.
+	const sourceOffsets = math ? Array.from({ length: markdown.length + 1 }, (_, i) => i) : undefined;
+	const source = math
+		? extractInlineMath(normalizeMathDelimiters(markdown, sourceOffsets), sourceOffsets)
+		: undefined;
+	const insertions: number[] = [];
+	const text = prepareMarkdownEmphasis(source?.text ?? markdown, (offset) =>
+		insertions.push(offset + insertions.length),
+	);
+	let lexerOffsets: number[] | undefined;
+	if (text.includes("\r")) {
+		lexerOffsets = [];
+		for (let i = 0; i < text.length; i++) {
+			lexerOffsets.push(i);
+			if (text[i] === "\r" && text[i + 1] === "\n") i++;
+		}
+		lexerOffsets.push(text.length);
+	}
+	let inserted = 0;
+	const originalOffset = (offset: number): number => {
+		const boundary = lexerOffsets?.[offset] ?? offset;
+		while ((insertions[inserted] ?? Infinity) < boundary) inserted++;
+		const beforeEmphasis = boundary - inserted;
+		return sourceOffsets?.[beforeEmphasis] ?? beforeEmphasis;
+	};
 	const formulas = source?.formulas;
 	const tokens = marked.lexer(text, { gfm: true });
 	const units: PreparedMarkdownUnit[] = [];
 	let isFirst = !continuation;
 	let consumed = 0;
 	for (const token of tokens) {
+		const start = originalOffset(consumed);
 		consumed += token.raw.length;
+		const end = originalOffset(consumed);
 		// `space` / `def` produce no blocks; skipping them here keeps unit identity
 		// aligned with what parseBlockTokens would emit. Their length is still counted
 		// above so `consumedLength` tracks the real source offset.
 		if (token.type === "space" || token.type === "def") continue;
-		const raw = token.raw;
+		const raw = markdown.slice(start, end);
 		const cached = reuse?.(raw, isFirst);
 		const blocks = cached ?? prepareSingleToken(token, isFirst, math, formulas);
-		units.push({ raw, isFirst, blocks, consumedLength: consumed });
+		units.push({ raw, isFirst, blocks, consumedLength: end });
 		isFirst = false;
 	}
 	return units;
@@ -900,9 +949,11 @@ function collectInlineLines(
 }
 
 function textPiece(text: string, marks: MarkState, variant: InlineVariant): InlinePiece | null {
-	if (text.length === 0) return null;
+	// Flank sentinels (see markdown-emphasis-compat) must never reach measure or paint.
+	const visible = stripEmphasisSentinel(text);
+	if (visible.length === 0) return null;
 	return {
-		text,
+		text: visible,
 		font: resolveFont(variant, marks),
 		className: resolveClassName(variant, marks),
 		href: marks.href,

@@ -94,6 +94,7 @@ async function render(
 	options?: {
 		withGlobalRoleActions?: boolean;
 		withRoleEditors?: boolean;
+		onShowPrice?: (model: ModelOption) => void;
 		defaultModelValue?: string | null;
 		summaryModelValue?: string | null;
 	},
@@ -115,6 +116,7 @@ async function render(
 									aggregations={aggregations}
 									providerLabels={{ a: "Provider A", xiaomi: "Xiaomi" }}
 									onSelect={(value) => selected.push(value)}
+									onShowPrice={options?.onShowPrice}
 									onPickerOpened={() => {
 										refreshed++;
 									}}
@@ -173,6 +175,25 @@ async function flushFrames() {
 		for (const callback of callbacks) callback(0);
 	});
 }
+
+describe("catalog details access", () => {
+	test("metadata details work without billing prices and resolve follow-default to the actual model", async () => {
+		const details: ModelOption[] = [];
+		await render("a:one", models, true, true, {
+			defaultModelValue: "a:two:opaque",
+			onShowPrice: (model) => details.push(model),
+		});
+		const controls = [
+			...host.querySelectorAll<HTMLElement>('[aria-label="Model metadata and prices"]'),
+		];
+		expect(controls).toHaveLength(3);
+		await act(async () => {
+			for (const control of controls) control.click();
+		});
+		expect(details.map((model) => model.value)).toEqual(["a:two:opaque", "a:one", "a:two"]);
+		expect(selected).toEqual([]);
+	});
+});
 
 describe("per-model global role actions", () => {
 	test("hides the three-dot control when handlers are not provided", async () => {

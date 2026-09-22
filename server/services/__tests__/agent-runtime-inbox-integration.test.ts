@@ -10,7 +10,7 @@ import {
 } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 let failBroadcast = false;
 mock.module("../../websocket/narrator-ws", () => ({
@@ -396,7 +396,8 @@ test("real parent after-tools notice callback is the adoption boundary, includin
 		"en",
 	);
 	failBroadcast = false;
-	expect(projected.text).toContain("ready");
+	expect(projected.text).toContain("Result snapshot unavailable.");
+	expect(projected.text).toContain("Await(");
 	expect(state(row.id)).toMatchObject({ state: "materialized", adoptedAt: null });
 	projected.onConsumed();
 	await new Promise<void>((resolve) => setImmediate(resolve));
@@ -436,6 +437,12 @@ test("immutable bounded notice snapshot ignores later edits and never parses ove
 	let projected = projectPendingInjection(row);
 	if (projected.kind !== "bg_agent") throw new Error("wrong kind");
 	expect(projected.task.result).toBe("original result");
+	for (const mode of ["busy", "idle"] as const) {
+		const text = await deliverPendingInjection("parent", "en", mode, "none", projected);
+		expect(text).toContain("Result:\noriginal result");
+		expect(text).not.toContain("Await(");
+	}
+
 	db.update(narratorMessages)
 		.set({ originalContentJson: [{ type: "text", text: "x".repeat(100000) }] })
 		.where(eq(narratorMessages.id, "bounded-snapshot"))

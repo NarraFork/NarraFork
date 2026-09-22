@@ -165,7 +165,8 @@ export function inlineTokensToPlainText(
 		}
 		if (typeof token.text === "string") out += token.text;
 	}
-	return out;
+	// Drop emphasis-flank sentinels so `**注意：**标题` slugs like `注意：标题`.
+	return out.replaceAll("\uE002", "");
 }
 
 /**

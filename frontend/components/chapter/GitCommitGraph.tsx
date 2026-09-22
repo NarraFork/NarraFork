@@ -2,7 +2,7 @@ import { ActionIcon, Badge, Box, Button, Group, Loader, ScrollArea, Text } from 
 import { IconChevronDown, IconChevronRight, IconRefresh } from "@tabler/icons-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useGitStatus } from "../../hooks/useGit";
+import { useGitLog, useGitStatus } from "../../hooks/useGit";
 import { useGitGraphCollapsed } from "../../hooks/useGitGraphCollapsed";
 import {
 	GIT_GRAPH_HEIGHT_MAX,
@@ -46,9 +46,8 @@ const GRAPH_HEADER_HEIGHT = 34;
 /**
  * Collapsible repository commit-graph strip under the Git changes list.
  *
- * Fetch is local (`api.getGitLog` + local pagination state) so the graph never
- * races GitCommitsTab for the same React Query `skip` key. Data loads only
- * while expanded; collapse hides the list without dropping the cached page.
+ * The first page shares React Query invalidation with other Git views. Extra
+ * pages are local and belong to one first-page revision and workspace only.
  */
 export function GitCommitGraph({
 	target,
@@ -77,55 +76,48 @@ export function GitCommitGraph({
 	 * loaded count made the button vanish or persist by arithmetic coincidence.
 	 */
 	const [lastPageFull, setLastPageFull] = useState(false);
-	const [loading, setLoading] = useState(false);
-	const [error, setError] = useState<string | null>(null);
-	const [reloadToken, setReloadToken] = useState(0);
-	/** Which workspace the state above belongs to, so a switch cannot serve stale pages. */
+	const logQuery = useGitLog(target, GRAPH_PAGE_SIZE, 0, !collapsed);
+	const [paginationLoading, setPaginationLoading] = useState(false);
+	const [manualRefreshing, setManualRefreshing] = useState(false);
+	const [pageError, setPageError] = useState<string | null>(null);
+	const generation = useRef(0);
+	const pageRequest = useRef<AbortController | null>(null);
+	const manualRequest = useRef<object | null>(null);
 	const loadedWorkspaceRef = useRef<string | null>(null);
 	/** Height available to this whole strip, measured from the flex parent. */
 	const [availableHeight, setAvailableHeight] = useState<number | null>(null);
 	const rootRef = useRef<HTMLDivElement | null>(null);
 
-	// ONE effect owns both the workspace reset and the fetch, so the two cannot be
-	// ordered wrongly: a switch drops the previous repo's pages synchronously, in the
-	// same commit that starts the new request. Splitting them across two effects made
-	// correctness depend on declaration order and on a state flush that does not happen
-	// until the next render.
+	// Identity, not the target object's reference, owns requests. A refreshed first
+	// page also invalidates offsets from the previous history, even if equal by value.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: Request lifecycle boundaries invalidate local pagination.
 	useEffect(() => {
-		// `reloadToken` is a refresh TRIGGER, not a value the body reads.
-		void reloadToken;
-		if (!target || !workspaceKey) return;
+		generation.current += 1;
+		pageRequest.current?.abort();
+		pageRequest.current = null;
+		setPaginationLoading(false);
+		setPageError(null);
+		return () => {
+			generation.current += 1;
+			pageRequest.current?.abort();
+			pageRequest.current = null;
+		};
+	}, [workspaceKey, collapsed, logQuery.dataUpdatedAt, logQuery.isFetching]);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: Equal first pages still reset pagination after a successful refresh.
+	useEffect(() => {
 		if (loadedWorkspaceRef.current !== workspaceKey) {
 			loadedWorkspaceRef.current = workspaceKey;
-			setCommits([]);
-			setLastPageFull(false);
-			setError(null);
+			manualRequest.current = null;
+			setManualRefreshing(false);
 		}
-		if (collapsed) return;
-		let cancelled = false;
-		(async () => {
-			setLoading(true);
-			setError(null);
-			try {
-				const page = await api.getGitLog(target, GRAPH_PAGE_SIZE, 0);
-				if (cancelled) return;
-				const rows = Array.isArray(page) ? page : [];
-				setCommits(rows);
-				setLastPageFull(rows.length >= GRAPH_PAGE_SIZE);
-			} catch (err) {
-				if (!cancelled) {
-					setError(err instanceof Error ? err.message : String(err));
-					setCommits([]);
-					setLastPageFull(false);
-				}
-			} finally {
-				if (!cancelled) setLoading(false);
-			}
-		})();
-		return () => {
-			cancelled = true;
-		};
-	}, [collapsed, target, workspaceKey, reloadToken]);
+		const firstPage = logQuery.data ?? [];
+		setCommits(firstPage);
+		setLastPageFull(firstPage.length >= GRAPH_PAGE_SIZE);
+	}, [workspaceKey, logQuery.data, logQuery.dataUpdatedAt]);
+
+	const loading = logQuery.isFetching || paginationLoading;
+	const error = pageError ?? (logQuery.error ? String(logQuery.error.message) : null);
 
 	// The strip sits in a flex column next to the changes list, and the persisted
 	// height is a plain number with no knowledge of the host. Measure the parent so a
@@ -141,27 +133,50 @@ export function GitCommitGraph({
 	}, []);
 
 	const loadMore = useCallback(async () => {
-		if (!target || !workspaceKey || loading) return;
+		if (!target || !workspaceKey || collapsed || loading || pageRequest.current) return;
 		const offset = commits.length;
 		if (offset >= GRAPH_COMMIT_CAP) return;
-		setLoading(true);
-		setError(null);
+		const request = new AbortController();
+		const requestGeneration = generation.current;
+		pageRequest.current = request;
+		const isCurrent = () =>
+			pageRequest.current === request && generation.current === requestGeneration;
+		setPaginationLoading(true);
+		setPageError(null);
 		try {
-			const page = await api.getGitLog(target, GRAPH_PAGE_SIZE, offset);
+			const page = await api.getGitLog(target, GRAPH_PAGE_SIZE, offset, request.signal);
+			if (!isCurrent()) return;
 			const rows = Array.isArray(page) ? page : [];
 			setCommits((prev) => [...prev, ...rows]);
 			setLastPageFull(rows.length >= GRAPH_PAGE_SIZE);
 		} catch (err) {
-			setError(err instanceof Error ? err.message : String(err));
+			if (isCurrent()) setPageError(err instanceof Error ? err.message : String(err));
 		} finally {
-			setLoading(false);
+			if (isCurrent()) {
+				pageRequest.current = null;
+				setPaginationLoading(false);
+			}
 		}
-	}, [commits.length, loading, target, workspaceKey]);
+	}, [commits.length, loading, target, workspaceKey, collapsed]);
 
-	const refresh = useCallback(() => {
-		if (!target || !workspaceKey || loading) return;
-		setReloadToken((n) => n + 1);
-	}, [target, workspaceKey, loading]);
+	const refresh = useCallback(async () => {
+		if (!target || !workspaceKey || collapsed || manualRequest.current) return;
+		const request = {};
+		manualRequest.current = request;
+		generation.current += 1;
+		pageRequest.current?.abort();
+		pageRequest.current = null;
+		setPaginationLoading(false);
+		setManualRefreshing(true);
+		try {
+			await logQuery.refetch();
+		} finally {
+			if (manualRequest.current === request) {
+				manualRequest.current = null;
+				setManualRefreshing(false);
+			}
+		}
+	}, [target, workspaceKey, collapsed, logQuery.refetch]);
 
 	const rows = useMemo(() => layoutCommitGraph(commits, headSha), [commits, headSha]);
 	const topologyUnknown = useMemo(
@@ -277,8 +292,8 @@ export function GitCommitGraph({
 					// is disabled while it runs: the body keeps the previous page on screen
 					// (deliberately — blanking it makes the strip jump), so without this the
 					// click had no observable effect at all.
-					loading={loading}
-					disabled={loading}
+					loading={manualRefreshing}
+					disabled={manualRefreshing}
 					onClick={(event) => {
 						event.stopPropagation();
 						refresh();

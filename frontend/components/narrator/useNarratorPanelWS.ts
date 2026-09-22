@@ -1279,9 +1279,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					linesAdded: data.linesAdded,
 					linesRemoved: data.linesRemoved,
 				});
-				// Attribution moves with status: a commit pushed by the narrator resets each
-				// file's per-path boundary, so the badges must refetch alongside the diff.
-				invalidateWorkspaceQueries(qc, data.chapterId);
+				// Open Git panels have a workspace-scoped subscription. The legacy status
+				// event updates the chapter badge only; it must not reload every Git log.
 			},
 			onCommitSyncError: (event) => {
 				qc.invalidateQueries({ queryKey: ["chapterGitStatus", event.chapterId] });

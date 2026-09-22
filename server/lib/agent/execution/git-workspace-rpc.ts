@@ -1,5 +1,6 @@
 /** Additive, shell-free Git management contract, mirrored by the Go executor. */
 export const FEATURE_GIT_WORKSPACE_V1 = "git.workspace.v1";
+export const FEATURE_GIT_WORKSPACE_WATCH_V1 = "git.workspace.watch.v1";
 export const GIT_WORKSPACE_TIMEOUT_MS = 30_000;
 export const GIT_WORKSPACE_WRITE_TIMEOUT_MS = 120_000;
 export const GIT_WORKSPACE_MAX_BYTES = 2 * 1024 * 1024;
@@ -7,6 +8,7 @@ export const GIT_WORKSPACE_AI_DIFF_BYTES = 100_000;
 
 export type GitWorkspaceOperation =
 	| "probe"
+	| "watch"
 	| "status"
 	| "diff"
 	| "fullDiff"
@@ -53,7 +55,11 @@ export interface GitWorkspaceResult {
 	repositoryPath?: string;
 	reason?: string;
 	stdout?: string;
-	/** Named bounded raw Git outputs (porcelain and numstat use NUL delimiters). */
+	/** Named bounded raw Git outputs (porcelain and numstat use NUL delimiters).
+	 * watch returns SHA-256 worktree/index/head/stash fingerprints; uncertainWorktree="true"
+	 * means the consumer must conservatively invalidate worktree data on every poll.
+	 * A truncated watch result requires invalidating all categories, not trusting prefix hashes.
+	 */
 	outputs?: Record<string, string>;
 	truncated?: boolean;
 	hasConflicts?: boolean;

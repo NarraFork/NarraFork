@@ -174,7 +174,31 @@ describe("publication commit → flush → mailbox delivery", () => {
 	});
 });
 
-describe("formatBackgroundCompletionNotifications (display logic, unchanged)", () => {
+describe("formatBackgroundCompletionNotifications", () => {
+	it("includes the result by default without requiring another Await", () => {
+		const text = formatBackgroundCompletionNotifications([notification()]);
+		expect(text).toContain("listed with line numbers");
+		expect(text).not.toContain("Await(");
+	});
+
+	it("does not mistake the completion summary for a missing result", () => {
+		const text = formatBackgroundCompletionNotifications([
+			notification({ result: undefined, resultPreview: "completed. Use Await" }),
+		]);
+		expect(text).toContain("Result snapshot unavailable.");
+		expect(text).not.toContain("Result:\ncompleted");
+		expect(text).toContain("Await(");
+	});
+
+	it("bounds long results even when the producer omitted the truncation flag", () => {
+		const text = formatBackgroundCompletionNotifications([
+			notification({ result: "x".repeat(12001) }),
+		]);
+		expect(text).toContain("x".repeat(12000));
+		expect(text).not.toContain("x".repeat(12001));
+		expect(text).toContain("truncated");
+		expect(text).toContain("Await(");
+	});
 	it("busy: a preview, because the full output is one Await away", () => {
 		const text = formatBackgroundCompletionNotifications([notification()], {
 			includeResult: false,

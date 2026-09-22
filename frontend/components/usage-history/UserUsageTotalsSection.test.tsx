@@ -190,7 +190,17 @@ describe("durable user totals", () => {
 		expect(container.textContent).toContain(locale.usageUserTotalsDescription);
 		expect(container.textContent).toContain(locale.usageUserTotalsCostNote);
 		const cells = [...container.querySelectorAll("tbody td")].map((cell) => cell.textContent);
-		expect(cells).toEqual(["Alicealice-id", "3", "100", "20", "60", "15", "5", "$0.250000", "2"]);
+		expect(cells).toEqual([
+			"Alicealice-id",
+			"3",
+			"100",
+			"20",
+			"60",
+			"15",
+			"5",
+			`$0.250000 (${locale.usageCostPartial})`,
+			"2",
+		]);
 		expect(container.querySelectorAll("thead th")).toHaveLength(9);
 		expect(totalsSpy.mock.calls[0]?.[0]?.limit).toBe(50);
 		expect(Object.keys(totalsSpy.mock.calls[0]?.[0] ?? {}).sort()).toEqual([

@@ -452,6 +452,213 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 });
 
 describe("normalizeSubagentActivityCatchUp", () => {
+	const changedFile = {
+		filePath: "/repo/a.ts",
+		linesAdded: 2,
+		linesRemoved: 1,
+		editCount: 1,
+	};
+	const fileChanges = {
+		files: [changedFile],
+		totalFiles: 1,
+		totalUnmeasured: 0,
+		bashTouchedCount: 2,
+		countsTruncated: false,
+	};
+	function normalizeActivity(fields: Record<string, unknown>) {
+		return normalizeSubagentActivityCatchUp([
+			{ parentToolUseId: "parent-tool", activity: { latestToolCalls: [], ...fields } },
+		])[0].activity;
+	}
+
+	test("preserves nonempty legacy file changes without inventing optional metadata", () => {
+		expect(normalizeActivity({ fileChanges }).fileChanges).toEqual(fileChanges);
+	});
+
+	test("forwards an explicitly empty file-change aggregate", () => {
+		const empty = { ...fileChanges, files: [], totalFiles: 0, bashTouchedCount: 0 };
+		expect(normalizeActivity({ fileChanges: empty }).fileChanges).toEqual(empty);
+	});
+
+	test("omits absent file changes rather than synthesizing an empty aggregate", () => {
+		for (const fields of [{}, { fileChanges: undefined }]) {
+			expect(normalizeActivity(fields)).not.toHaveProperty("fileChanges");
+		}
+	});
+
+	test("preserves file lists beyond the card preview up to the actual aggregate limit", () => {
+		// queryChanges forwards all files up to MAX_AGGREGATED_FILES (2000), not
+		// just CARD_FILE_LIST_MAX (5). A ten-file reconnect must keep all ten rows.
+		for (const length of [5, 10, 2000]) {
+			const projection = {
+				...fileChanges,
+				files: Array.from({ length }, (_, index) => ({
+					...changedFile,
+					filePath: `/repo/${index}.ts`,
+				})),
+				totalFiles: length,
+				countsTruncated: length === 2000,
+			};
+			expect(normalizeActivity({ fileChanges: projection }).fileChanges).toEqual(projection);
+		}
+	});
+
+	test("omits oversized aggregates without forwarding a silently truncated list", () => {
+		const files = Array.from({ length: 2001 }, (_, index) => ({
+			...changedFile,
+			filePath: `/repo/${index}.ts`,
+		}));
+		expect(
+			normalizeActivity({ fileChanges: { ...fileChanges, files, totalFiles: files.length } }),
+		).not.toHaveProperty("fileChanges");
+	});
+
+	test("preserves optional attribution, nullable measurements and workspace metadata", () => {
+		for (const attributionScope of ["exact_attempt", "mixed", "legacy_unscoped"] as const) {
+			for (const outsideParentWorkspace of [true, false, null]) {
+				const projection = {
+					...fileChanges,
+					files: [
+						{
+							...changedFile,
+							linesAdded: null,
+							linesRemoved: null,
+							unmeasuredCount: 1,
+							subagentNarratorId: "subagent-1",
+							deviceId: "local",
+							workspacePath: "/repo",
+							outsideParentWorkspace,
+						},
+					],
+					totalUnmeasured: 1,
+					attributionScope,
+					scope: {
+						sourceToolUseId: "parent-tool",
+						startedAt: "2026-09-01T00:00:00.000Z",
+						completedAt: null,
+					},
+				};
+				expect(normalizeActivity({ fileChanges: projection }).fileChanges).toEqual(projection);
+			}
+		}
+		const nullable = {
+			...fileChanges,
+			files: [{ ...changedFile, subagentNarratorId: null, deviceId: null, workspacePath: null }],
+			scope: { sourceToolUseId: null },
+		};
+		expect(normalizeActivity({ fileChanges: nullable }).fileChanges).toEqual(nullable);
+	});
+
+	test("rejects malformed aggregate shapes and counts without replacing previous data", () => {
+		const malformed: unknown[] = [
+			null,
+			false,
+			"changes",
+			[],
+			{},
+			{ ...fileChanges, files: null },
+			{ ...fileChanges, files: {} },
+			{ ...fileChanges, countsTruncated: "false" },
+			{ ...fileChanges, countsTruncated: undefined },
+		];
+		for (const key of ["totalFiles", "totalUnmeasured", "bashTouchedCount"]) {
+			for (const invalid of [
+				undefined,
+				null,
+				"1",
+				-1,
+				0.5,
+				Number.MAX_SAFE_INTEGER + 1,
+				Number.NaN,
+				Infinity,
+				-Infinity,
+			]) {
+				malformed.push({ ...fileChanges, [key]: invalid });
+			}
+		}
+		for (const value of malformed) {
+			const activity = normalizeActivity({ fileChanges: value });
+			expect(activity).not.toHaveProperty("fileChanges");
+			expect({ fileChanges, ...activity }.fileChanges).toEqual(fileChanges);
+		}
+	});
+
+	test("rejects the entire file-change snapshot if any file row is malformed", () => {
+		const malformed: unknown[] = [
+			null,
+			[],
+			"file",
+			{},
+			{ ...changedFile, filePath: " " },
+			{ ...changedFile, filePath: 42 },
+			{ ...changedFile, filePath: undefined },
+			{ ...changedFile, outsideParentWorkspace: "false" },
+		];
+		for (const key of ["linesAdded", "linesRemoved", "editCount", "unmeasuredCount"]) {
+			for (const invalid of [
+				"1",
+				-1,
+				0.5,
+				Number.MAX_SAFE_INTEGER + 1,
+				Number.NaN,
+				Infinity,
+				-Infinity,
+			]) {
+				malformed.push({ ...changedFile, [key]: invalid });
+			}
+		}
+		for (const key of ["linesAdded", "linesRemoved", "editCount"]) {
+			malformed.push({ ...changedFile, [key]: undefined });
+		}
+		malformed.push({ ...changedFile, editCount: null });
+		malformed.push({ ...changedFile, unmeasuredCount: null });
+		for (const key of ["subagentNarratorId", "deviceId", "workspacePath"]) {
+			malformed.push({ ...changedFile, [key]: 42 });
+		}
+		for (const invalid of malformed) {
+			// Neither a sole bad row nor a mixed valid/invalid list may be filtered.
+			for (const files of [[invalid], [changedFile, invalid]]) {
+				expect(
+					normalizeActivity({ fileChanges: { ...fileChanges, files, totalFiles: files.length } }),
+				).not.toHaveProperty("fileChanges");
+			}
+		}
+	});
+
+	test("rejects invalid optional scope metadata and strips unknown fields", () => {
+		for (const metadata of [
+			{ attributionScope: "unknown" },
+			{ attributionScope: null },
+			{ scope: null },
+			{ scope: [] },
+			{ scope: {} },
+			{ scope: { sourceToolUseId: 42 } },
+			{ scope: { sourceToolUseId: null, startedAt: 42 } },
+			{ scope: { sourceToolUseId: null, completedAt: false } },
+		]) {
+			expect(
+				normalizeActivity({ fileChanges: { ...fileChanges, ...metadata } }),
+			).not.toHaveProperty("fileChanges");
+		}
+		expect(
+			normalizeActivity({
+				fileChanges: {
+					...fileChanges,
+					unknown: "ignored",
+					files: [{ ...changedFile, unknown: "ignored" }],
+					scope: { sourceToolUseId: null, unknown: "ignored" },
+				},
+			}).fileChanges,
+		).toEqual({ ...fileChanges, scope: { sourceToolUseId: null } });
+	});
+
+	test("preserves only explicit true takeover state on reconnect", () => {
+		expect(normalizeActivity({ takenOver: true }).takenOver).toBe(true);
+		for (const takenOver of [undefined, null, false, "true", 1]) {
+			expect(normalizeActivity({ takenOver })).not.toHaveProperty("takenOver");
+		}
+	});
+
 	test("normalizes the canonical array contract", () => {
 		const activity = {
 			subagentNarratorId: "subagent-1",

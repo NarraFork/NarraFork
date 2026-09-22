@@ -1324,6 +1324,9 @@ export const narratorMessages = sqliteTable(
 		contentText: text("content_text"),
 		tokensIn: integer("tokens_in"),
 		costUsd: real("cost_usd"),
+		/** Null marks an untouched historical record. */
+		costStatus: text("cost_status", { enum: ["complete", "partial", "unknown"] }),
+		costMissingFields: text("cost_missing_fields", { mode: "json" }).$type<string[]>(),
 		turnUsageJson: text("turn_usage_json", { mode: "json" }),
 		provider: text("provider"),
 		credentialId: text("credential_id"),
@@ -1576,6 +1579,8 @@ export const narratorToolCalls = sqliteTable(
 		cacheCreationCost: real("cache_creation_cost").notNull().default(0),
 		cacheReadCost: real("cache_read_cost").notNull().default(0),
 		totalCost: real("total_cost").notNull().default(0),
+		costStatus: text("cost_status", { enum: ["complete", "partial", "unknown"] }),
+		costMissingFields: text("cost_missing_fields", { mode: "json" }).$type<string[]>(),
 		// Provider and model info
 		provider: text("provider"), // anthropic, openai, codex, nug, gemini
 		model: text("model"), // claude-3-5-sonnet-20241022, gpt-4o, etc.
@@ -3131,6 +3136,9 @@ export const apiRequests = sqliteTable(
 		durationMs: integer("duration_ms"), // 总耗时
 		// 成本
 		costUsd: real("cost_usd"),
+		/** Null marks an untouched historical record. */
+		costStatus: text("cost_status", { enum: ["complete", "partial", "unknown"] }),
+		costMissingFields: text("cost_missing_fields", { mode: "json" }).$type<string[]>(),
 		// 上下文使用率
 		contextPercent: real("context_percent"),
 		// Metering（NUG）
@@ -3169,6 +3177,7 @@ export const userUsageTotals = sqliteTable("user_usage_totals", {
 	reasoningTokens: integer("reasoning_tokens").notNull().default(0),
 	costUsd: real("cost_usd").notNull().default(0),
 	unpricedRequestCount: integer("unpriced_request_count").notNull().default(0),
+	partialRequestCount: integer("partial_request_count").notNull().default(0),
 	firstUsedAt: text("first_used_at").notNull(),
 	lastUsedAt: text("last_used_at").notNull(),
 });
@@ -3216,6 +3225,7 @@ export const credentialUsageTotals = sqliteTable(
 		 * "cost covers N of M requests" instead of presenting a silent undercount.
 		 */
 		unpricedRequestCount: integer("unpriced_request_count").notNull().default(0),
+		partialRequestCount: integer("partial_request_count").notNull().default(0),
 		firstSeenAt: text("first_seen_at").notNull(),
 		lastSeenAt: text("last_seen_at").notNull(),
 	},

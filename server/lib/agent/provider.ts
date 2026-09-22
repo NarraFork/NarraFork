@@ -70,6 +70,8 @@ export interface ChatParams extends ProtocolChatParams {
 	stickySessionKey?: string;
 	/** Reasoning effort level — maps to thinking config (Anthropic), reasoning config (Codex), or provider-specific effort ("max" may be provider-specific) */
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
+	/** Optional output ceiling; effective model metadata may lower, never raise it. */
+	maxOutputTokens?: number;
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
 	serviceTier?: string;
 	/** Metadata to include in the request body (e.g. user_id for Anthropic) */

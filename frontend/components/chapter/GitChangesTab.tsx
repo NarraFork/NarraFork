@@ -373,13 +373,7 @@ export function GitChangesTab({
 				</Button>
 			</Stack>
 
-			<Group
-				gap={6}
-				px="xs"
-				py={6}
-				wrap="nowrap"
-				style={{ flexShrink: 0, borderBottom: "1px solid var(--mantine-color-default-border)" }}
-			>
+			<Group gap={6} px="xs" py={6} wrap="nowrap" style={{ flexShrink: 0 }}>
 				{/* Counts live on the section headers below; this title is just the panel name. */}
 				<Text size="sm" fw={600} style={{ flex: 1, minWidth: 0 }}>
 					{t("panel.changes")}

@@ -10,7 +10,11 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import type { SubagentToolCallHeader, TreeMessage } from "@frontend/lib/api";
+import type {
+	SubagentActivitySummary,
+	SubagentToolCallHeader,
+	TreeMessage,
+} from "@frontend/lib/api";
 import {
 	composeLivePatches,
 	patchReflection,
@@ -586,6 +590,139 @@ describe("patchSubagentActivitySnapshots", () => {
 // composeLivePatches
 // ─────────────────────────────────────────────────────────────────────────────
 
+describe("subagent file changes survive live updates", () => {
+	const fileChanges: NonNullable<SubagentActivitySummary["fileChanges"]> = {
+		files: [{ filePath: "src/a.ts", linesAdded: 1, linesRemoved: 0, editCount: 1 }],
+		totalFiles: 1,
+		totalUnmeasured: 0,
+		bashTouchedCount: 0,
+		countsTruncated: false,
+		attributionScope: "exact_attempt",
+		scope: { sourceToolUseId: "tu-parent", startedAt: "2026-01-01T00:00:00Z" },
+	};
+	const activity: SubagentActivitySummary = {
+		subagentNarratorId: "sub-1",
+		model: "model",
+		latestToolCalls: [header("child-first", "success")],
+		fileChanges,
+	};
+	function seed() {
+		return patchSubagentActivitySnapshots(
+			[assistantWithTools("m1", [{ toolUseId: "tu-parent", toolName: "Agent" }])],
+			[{ parentToolUseId: "tu-parent", activity }],
+		).messages;
+	}
+	function read(messages: readonly TreeMessage[]) {
+		return findBlock(messages, "tu-parent")?._subagentActivity as SubagentActivitySummary;
+	}
+
+	it("keeps files and their measured height through tools, sparse refresh and reconnect", async () => {
+		const { upsertLoadedMessage } = await import("./vlist-message-append");
+		const { normalizeSubagentActivityCatchUp } = await import("@frontend/hooks/useNarratorWS");
+		const { measureSubagentCard } = await import("./measure/measure-subagent");
+		const { installCanvasStub } = await import("./measure/test-canvas-stub");
+		const dispose = installCanvasStub();
+		try {
+			let messages = seed();
+			const height = (summary: SubagentActivitySummary) =>
+				measureSubagentCard(
+					{ agentType: "general", description: "child", fileChanges: summary.fileChanges },
+					600,
+					5,
+				).fileChangesHeight;
+			const initialHeight = height(read(messages));
+			expect(initialHeight).toBeGreaterThan(0);
+			const assertStable = () => {
+				const summary = read(messages);
+				expect(summary.fileChanges).toEqual(fileChanges);
+				expect(messages[0].toolCalls[0]._subagentActivity).toEqual(summary);
+				expect(height(summary)).toBe(initialHeight);
+			};
+			assertStable();
+			for (let i = 0; i < 4; i++) {
+				for (const status of ["running", "success"]) {
+					messages = patchSubagentActivity(
+						messages,
+						"tu-parent",
+						header(`child-${i}`, status),
+					).messages;
+					assertStable();
+				}
+			}
+			expect(read(messages).latestToolCalls).toHaveLength(3);
+			const sparse = assistantWithTools("m1", [{ toolUseId: "tu-parent", toolName: "Agent" }]);
+			messages = upsertLoadedMessage(messages, sparse, false).messages;
+			assertStable();
+			const { fileChanges: _files, ...omitted } = activity;
+			messages = patchSubagentActivitySnapshots(
+				messages,
+				normalizeSubagentActivityCatchUp([{ parentToolUseId: "tu-parent", activity: omitted }]),
+			).messages;
+			assertStable();
+			const updated = { ...fileChanges, files: [{ ...fileChanges.files[0], linesAdded: 9 }] };
+			messages = patchSubagentActivitySnapshots(
+				messages,
+				normalizeSubagentActivityCatchUp([
+					{ parentToolUseId: "tu-parent", activity: { ...activity, fileChanges: updated } },
+				]),
+			).messages;
+			expect(read(messages).fileChanges).toEqual(updated);
+			expect(height(read(messages))).toBe(initialHeight);
+		} finally {
+			dispose();
+		}
+	});
+
+	it("honors an empty aggregate even with nonempty recent calls", () => {
+		const empty = { ...fileChanges, files: [], totalFiles: 0 };
+		const cleared = patchSubagentActivitySnapshots(seed(), [
+			{ parentToolUseId: "tu-parent", activity: { ...activity, fileChanges: empty } },
+		]);
+		expect(read(cleared.messages).fileChanges).toEqual(empty);
+	});
+
+	it("replaces execution scopes, while completion updates retain their files", () => {
+		const completed = {
+			...fileChanges,
+			scope: {
+				sourceToolUseId: "tu-parent",
+				startedAt: "2026-01-01T00:00:00Z",
+				completedAt: "2026-01-01T00:01:00Z",
+			},
+		};
+		const result = patchSubagentActivitySnapshots(seed(), [
+			{ parentToolUseId: "tu-parent", activity: { ...activity, fileChanges: completed } },
+		]);
+		expect(read(result.messages).fileChanges).toEqual(completed);
+		const nextScope = {
+			...fileChanges,
+			scope: { sourceToolUseId: "next", startedAt: "2026-01-02T00:00:00Z" },
+			files: [],
+			totalFiles: 0,
+		};
+		const next = patchSubagentActivitySnapshots(result.messages, [
+			{ parentToolUseId: "tu-parent", activity: { ...activity, fileChanges: nextScope } },
+		]);
+		expect(read(next.messages).fileChanges).toEqual(nextScope);
+	});
+
+	it("does not carry files into a different child on identity, tool or snapshot events", async () => {
+		const { patchSubagentIdentity } = await import("./vlist-live-patch");
+		const identity = { subagentNarratorId: "sub-2" };
+		const { fileChanges: _files, ...omitted } = activity;
+		const results = [
+			patchSubagentIdentity(seed(), "tu-parent", identity),
+			patchSubagentActivity(seed(), "tu-parent", header("new-child", "running"), identity),
+			patchSubagentActivitySnapshots(seed(), [
+				{ parentToolUseId: "tu-parent", activity: { ...omitted, ...identity } },
+			]),
+		];
+		for (const result of results) {
+			expect(read(result.messages).subagentNarratorId).toBe("sub-2");
+			expect(read(result.messages).fileChanges).toBeUndefined();
+		}
+	});
+});
 describe("composeLivePatches", () => {
 	it("threads several patches into one result so a batch rebuilds once", () => {
 		const messages = [

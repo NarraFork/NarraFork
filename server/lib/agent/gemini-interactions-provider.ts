@@ -17,6 +17,12 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
+import {
+	assertModelInputModalities,
+	effectiveProviderMetadata,
+	resolveMetadataReasoning,
+	resolveOutputTokenLimit,
+} from "./provider-model-metadata";
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
@@ -270,7 +276,8 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		appendCurrentUserInput(steps, params.content, params.images);
 
 		const body = this.buildRequestBody({
-			model,
+			model: params.model,
+			maxOutputTokens: params.maxOutputTokens,
 			steps,
 			tools: params.tools as GeminiFunctionDeclaration[],
 			systemInstruction,
@@ -504,6 +511,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			userText: text,
 			signal: options?.signal,
 			reasoningEffort: options?.reasoningEffort,
+			maxOutputTokens: options?.maxOutputTokens,
 			onTextDelta: options?.onTextDelta,
 			onReasoningDelta: options?.onReasoningDelta,
 		});
@@ -535,6 +543,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			userText: `${reminder}\n\n${content}`,
 			signal: options?.signal,
 			reasoningEffort: options?.reasoningEffort,
+			maxOutputTokens: options?.maxOutputTokens,
 			onTextDelta: options?.onTextDelta,
 			onReasoningDelta: options?.onReasoningDelta,
 		});
@@ -555,23 +564,46 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		tools?: GeminiFunctionDeclaration[];
 		systemInstruction?: string;
 		reasoningEffort?: ChatParams["reasoningEffort"];
+		maxOutputTokens?: number;
 		stream: boolean;
 	}): Record<string, unknown> {
 		const body: Record<string, unknown> = {
-			model: options.model,
+			model: parseModelId(options.model).model,
 			input: options.steps,
 			stream: options.stream,
 			store: false,
 		};
 		if (options.systemInstruction) body.system_instruction = options.systemInstruction;
 		if (options.tools?.length) body.tools = options.tools;
-		const thinkingLevel = mapReasoningEffortToThinking(options.model, options.reasoningEffort);
-		if (supportsThinkingConfig(options.model)) {
-			body.generation_config = {
-				thinking_summaries: "auto",
-				...(thinkingLevel ? { thinking_level: thinkingLevel } : {}),
-			};
+		const metadata = effectiveProviderMetadata(options.model);
+		const effort = resolveMetadataReasoning(metadata, options.reasoningEffort);
+		// This adapter has no verified Interactions disable mapping. Do not silently
+		// turn an explicit, supported disable request into low/minimal thinking.
+		if (effort === "none" && metadata.reasoning?.canDisable === true) {
+			throw new Error(
+				"Gemini Interactions cannot disable thinking; use the generateContent transport for this model.",
+			);
 		}
+		const thinkingLevel = metadata.reasoning?.levels?.length
+			? effort === "xhigh" || effort === "max"
+				? "high"
+				: effort === "none"
+					? "minimal"
+					: effort
+			: mapReasoningEffortToThinking(parseModelId(options.model).model, effort);
+		const generationConfig: Record<string, unknown> = {};
+		if (
+			metadata.reasoning?.supported !== false &&
+			(metadata.reasoning?.supported === true ||
+				supportsThinkingConfig(parseModelId(options.model).model))
+		) {
+			generationConfig.thinking_summaries = "auto";
+			if (thinkingLevel) generationConfig.thinking_level = thinkingLevel;
+		}
+		const maxOutputTokens = resolveOutputTokenLimit(metadata, options.maxOutputTokens);
+		if (maxOutputTokens !== undefined) generationConfig.max_output_tokens = maxOutputTokens;
+		if (Object.keys(generationConfig).length) body.generation_config = generationConfig;
+		assertModelInputModalities(options.model, body, metadata);
 		return body;
 	}
 
@@ -581,12 +613,14 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		userText: string;
 		signal?: AbortSignal;
 		reasoningEffort?: ChatParams["reasoningEffort"];
+		maxOutputTokens?: number;
 		onTextDelta?: GenerateOptions["onTextDelta"];
 		onReasoningDelta?: GenerateOptions["onReasoningDelta"];
 	}): Promise<GenerateMetaResult> {
 		const model = parseModelId(options.model).model;
 		const body = this.buildRequestBody({
-			model,
+			model: options.model,
+			maxOutputTokens: options.maxOutputTokens,
 			steps: [{ type: "user_input", content: options.userText }],
 			systemInstruction: options.systemInstruction,
 			reasoningEffort: options.reasoningEffort,
@@ -901,7 +935,7 @@ function supportsThinkingConfig(model: string): boolean {
 
 function mapReasoningEffortToThinking(
 	model: string,
-	effort: ChatParams["reasoningEffort"] | undefined,
+	effort: string | undefined,
 ): "minimal" | "low" | "medium" | "high" | undefined {
 	if (!effort) return undefined;
 	const tiers = getThinkingTiers(model);

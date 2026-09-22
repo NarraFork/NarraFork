@@ -17,6 +17,7 @@
 
 import { db as defaultDb } from "@server/db";
 import { credentialUsageTotals } from "@server/db/schema";
+import { aggregateCostStatus, type CostStatus } from "@server/lib/cost-estimate";
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { and, desc, eq, sql } from "drizzle-orm";
@@ -36,6 +37,7 @@ export interface CredentialUsageDelta {
 	reasoningTokens?: number;
 	/** USD cost, or null when the model has no reference price. */
 	costUsd?: number | null;
+	costStatus?: CostStatus;
 	/** Timestamp for first/last seen bookkeeping. Defaults to now. */
 	at?: string;
 }
@@ -53,6 +55,8 @@ export interface CredentialUsageTotalRow {
 	totalTokens: number;
 	costUsd: number;
 	unpricedRequestCount: number;
+	partialRequestCount: number;
+	costStatus: CostStatus;
 	firstSeenAt: string;
 	lastSeenAt: string;
 }
@@ -70,6 +74,8 @@ export interface CredentialUsageSummary {
 	totalTokens: number;
 	costUsd: number;
 	unpricedRequestCount: number;
+	partialRequestCount: number;
+	costStatus: CostStatus;
 	/** True when at least one request could not be priced. */
 	costIsPartial: boolean;
 	firstSeenAt: string | null;
@@ -141,7 +147,13 @@ export function recordCredentialUsage(delta: CredentialUsageDelta, db: Db = defa
 		const cachedInputTokens = nonNegativeInt(delta.cachedInputTokens);
 		const cacheCreationTokens = nonNegativeInt(delta.cacheCreationTokens);
 		const reasoningTokens = nonNegativeInt(delta.reasoningTokens);
-		const priced = isPricedCost(delta.costUsd);
+		const priced =
+			delta.costStatus === "complete"
+				? typeof delta.costUsd === "number" && Number.isFinite(delta.costUsd) && delta.costUsd >= 0
+				: delta.costStatus
+					? false
+					: isPricedCost(delta.costUsd);
+		const partial = delta.costStatus === "partial" ? 1 : 0;
 		const costUsd = nonNegativeCost(delta.costUsd);
 
 		db.insert(credentialUsageTotals)
@@ -158,6 +170,7 @@ export function recordCredentialUsage(delta: CredentialUsageDelta, db: Db = defa
 				reasoningTokens,
 				costUsd,
 				unpricedRequestCount: priced ? 0 : 1,
+				partialRequestCount: partial,
 				firstSeenAt: at,
 				lastSeenAt: at,
 			})
@@ -176,6 +189,7 @@ export function recordCredentialUsage(delta: CredentialUsageDelta, db: Db = defa
 					reasoningTokens: sql`${credentialUsageTotals.reasoningTokens} + ${reasoningTokens}`,
 					costUsd: sql`${credentialUsageTotals.costUsd} + ${costUsd}`,
 					unpricedRequestCount: sql`${credentialUsageTotals.unpricedRequestCount} + ${priced ? 0 : 1}`,
+					partialRequestCount: sql`${credentialUsageTotals.partialRequestCount} + ${partial}`,
 					// firstSeenAt is intentionally left alone: it is the earliest sighting.
 					lastSeenAt: at,
 				},
@@ -213,6 +227,12 @@ function toRow(row: typeof credentialUsageTotals.$inferSelect): CredentialUsageT
 			row.inputTokens + row.outputTokens + row.cachedInputTokens + row.cacheCreationTokens,
 		costUsd: row.costUsd,
 		unpricedRequestCount: row.unpricedRequestCount,
+		partialRequestCount: row.partialRequestCount,
+		costStatus: aggregateCostStatus(
+			row.requestCount,
+			row.unpricedRequestCount,
+			row.partialRequestCount,
+		),
 		firstSeenAt: row.firstSeenAt,
 		lastSeenAt: row.lastSeenAt,
 	};
@@ -256,6 +276,7 @@ export function getCredentialUsageTotals(
 			reasoningTokens: sql<number>`sum(${credentialUsageTotals.reasoningTokens})`,
 			costUsd: sql<number>`sum(${credentialUsageTotals.costUsd})`,
 			unpricedRequestCount: sql<number>`sum(${credentialUsageTotals.unpricedRequestCount})`,
+			partialRequestCount: sql<number>`sum(${credentialUsageTotals.partialRequestCount})`,
 			firstSeenAt: sql<string | null>`min(${credentialUsageTotals.firstSeenAt})`,
 			lastSeenAt: sql<string | null>`max(${credentialUsageTotals.lastSeenAt})`,
 		})
@@ -293,6 +314,12 @@ export function getCredentialUsageTotals(
 		totalTokens: inputTokens + outputTokens + cachedInputTokens + cacheCreationTokens,
 		costUsd: Number(aggregate?.costUsd ?? 0),
 		unpricedRequestCount,
+		partialRequestCount: Number(aggregate?.partialRequestCount ?? 0),
+		costStatus: aggregateCostStatus(
+			Number(aggregate?.requestCount ?? 0),
+			unpricedRequestCount,
+			Number(aggregate?.partialRequestCount ?? 0),
+		),
 		costIsPartial: unpricedRequestCount > 0,
 		firstSeenAt: aggregate?.firstSeenAt ?? null,
 		lastSeenAt: aggregate?.lastSeenAt ?? null,
@@ -323,6 +350,7 @@ export function listProviderCredentialTotals(
 			reasoningTokens: sql<number>`sum(${credentialUsageTotals.reasoningTokens})`,
 			costUsd: sql<number>`sum(${credentialUsageTotals.costUsd})`,
 			unpricedRequestCount: sql<number>`sum(${credentialUsageTotals.unpricedRequestCount})`,
+			partialRequestCount: sql<number>`sum(${credentialUsageTotals.partialRequestCount})`,
 			firstSeenAt: sql<string>`min(${credentialUsageTotals.firstSeenAt})`,
 			lastSeenAt: sql<string>`max(${credentialUsageTotals.lastSeenAt})`,
 		})
@@ -349,6 +377,12 @@ export function listProviderCredentialTotals(
 			Number(row.cacheCreationTokens ?? 0),
 		costUsd: Number(row.costUsd ?? 0),
 		unpricedRequestCount: Number(row.unpricedRequestCount ?? 0),
+		partialRequestCount: Number(row.partialRequestCount ?? 0),
+		costStatus: aggregateCostStatus(
+			Number(row.requestCount ?? 0),
+			Number(row.unpricedRequestCount ?? 0),
+			Number(row.partialRequestCount ?? 0),
+		),
 		costIsPartial: Number(row.unpricedRequestCount ?? 0) > 0,
 		firstSeenAt: row.firstSeenAt ?? null,
 		lastSeenAt: row.lastSeenAt ?? null,

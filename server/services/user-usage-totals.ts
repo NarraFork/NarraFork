@@ -1,5 +1,6 @@
 import { db as defaultDb } from "@server/db";
 import { apiRequests, users, userUsageTotals } from "@server/db/schema";
+import { aggregateCostStatus } from "@server/lib/cost-estimate";
 import { asc, eq, gt, sql } from "drizzle-orm";
 
 type Db = typeof defaultDb;
@@ -35,7 +36,11 @@ export function insertApiRequestWithUserUsage(
 		const cacheCreationTokens = Math.round(nonNegative(record.cacheCreationInputTokens));
 		const reasoningTokens = Math.round(nonNegative(record.reasoningTokens));
 		const priced =
-			typeof record.costUsd === "number" && Number.isFinite(record.costUsd) && record.costUsd >= 0;
+			(record.costStatus == null || record.costStatus === "complete") &&
+			typeof record.costUsd === "number" &&
+			Number.isFinite(record.costUsd) &&
+			record.costUsd >= 0;
+		const partial = record.costStatus === "partial" ? 1 : 0;
 		const costUsd = nonNegative(record.costUsd);
 		const at = record.createdAt;
 		tx.insert(userUsageTotals)
@@ -49,6 +54,7 @@ export function insertApiRequestWithUserUsage(
 				reasoningTokens,
 				costUsd,
 				unpricedRequestCount: priced ? 0 : 1,
+				partialRequestCount: partial,
 				firstUsedAt: at,
 				lastUsedAt: at,
 			})
@@ -63,6 +69,7 @@ export function insertApiRequestWithUserUsage(
 					reasoningTokens: sql`${userUsageTotals.reasoningTokens} + ${reasoningTokens}`,
 					costUsd: sql`${userUsageTotals.costUsd} + ${costUsd}`,
 					unpricedRequestCount: sql`${userUsageTotals.unpricedRequestCount} + ${priced ? 0 : 1}`,
+					partialRequestCount: sql`${userUsageTotals.partialRequestCount} + ${partial}`,
 					firstUsedAt: sql`min(${userUsageTotals.firstUsedAt}, ${at})`,
 					lastUsedAt: sql`max(${userUsageTotals.lastUsedAt}, ${at})`,
 				},
@@ -87,6 +94,7 @@ export function listUserUsageTotals(limit = 50, cursor?: string, database: Db = 
 			reasoningTokens: userUsageTotals.reasoningTokens,
 			costUsd: userUsageTotals.costUsd,
 			unpricedRequestCount: userUsageTotals.unpricedRequestCount,
+			partialRequestCount: userUsageTotals.partialRequestCount,
 			firstUsedAt: userUsageTotals.firstUsedAt,
 			lastUsedAt: userUsageTotals.lastUsedAt,
 		})
@@ -97,9 +105,16 @@ export function listUserUsageTotals(limit = 50, cursor?: string, database: Db = 
 		.limit(boundedLimit + 1)
 		.all();
 	const hasMore = rows.length > boundedLimit;
-	const records = rows
-		.slice(0, boundedLimit)
-		.map((row) => ({ ...row, costUsd: Number(row.costUsd.toFixed(6)) }));
+	const records = rows.slice(0, boundedLimit).map((row) => ({
+		...row,
+		costUsd: Number(row.costUsd.toFixed(6)),
+		costStatus: aggregateCostStatus(
+			row.requestCount,
+			row.unpricedRequestCount,
+			row.partialRequestCount,
+		),
+		costIsPartial: row.unpricedRequestCount > 0,
+	}));
 	return {
 		records,
 		hasMore,

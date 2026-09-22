@@ -8,10 +8,12 @@ import {
 	mergeModelCards,
 } from "../lib/model-cards";
 import { saveSettings, settings } from "../lib/settings";
+import { getEffectiveModelMetadata, saveLegacyModelCard } from "../lib/model-catalog";
 import { modelCardSchema } from "../lib/validators";
 import { requireAdmin } from "../middleware/auth";
 
 export const modelCardRoutes = new Hono();
+modelCardRoutes.get("/resolve", c => c.json(getEffectiveModelMetadata(c.req.query("model") ?? "")));
 
 /**
  * Read the effective cards.
@@ -72,6 +74,8 @@ modelCardRoutes.put("/:key", requireAdmin, async (c) => {
 	const next = current.filter((card) => card.modelKey !== key);
 	next.push(incoming);
 
+	const delta = diffModelCards(next).find(card => card.modelKey === key);
+	if (settings.agent.modelCatalog) saveLegacyModelCard(key, delta ?? null, !delta);
 	const effective = persistEffectiveCards(next);
 	const saved = effective.find((card) => card.modelKey === key);
 	return c.json({ card: saved ?? incoming });
@@ -94,6 +98,7 @@ modelCardRoutes.delete("/:key", requireAdmin, (c) => {
 	if (next.length === current.length) {
 		return c.json({ ok: true, deleted: false });
 	}
+	if (settings.agent.modelCatalog) saveLegacyModelCard(key, null);
 	persistEffectiveCards(next);
 	return c.json({ ok: true, deleted: true });
 });
@@ -110,6 +115,7 @@ modelCardRoutes.post("/:key/reset", requireAdmin, (c) => {
 		.trim()
 		.toLowerCase();
 	if (!key) throw new ValidationError("model key is required");
+	if (settings.agent.modelCatalog) saveLegacyModelCard(key, null, true);
 	const deltas = (settings.agent.modelCards ?? []).filter((card) => card.modelKey !== key);
 	settings.agent.modelCards = deltas;
 	saveSettings(settings);

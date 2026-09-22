@@ -1,496 +1,582 @@
 import {
-	ActionIcon,
+	Accordion,
+	Alert,
 	Badge,
 	Button,
-	Code,
-	Divider,
+	Checkbox,
 	Group,
-	Modal,
-	NumberInput,
+	Loader,
+	Pagination,
 	Paper,
-	ScrollArea,
 	Select,
 	Stack,
 	Table,
-	TagsInput,
 	Text,
-	Textarea,
 	TextInput,
-	Tooltip,
 } from "@mantine/core";
-import { useDisclosure } from "@mantine/hooks";
-import { notifications } from "@mantine/notifications";
-import type { ModelCard } from "@shared/model-card";
-import { IconPlus, IconRestore, IconTrash } from "@tabler/icons-react";
+import {
+	type ModelDefinition,
+	type ModelVariant,
+	type ResolvedModelMetadata,
+	resolveModelMetadata,
+} from "@shared/model-catalog";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import {
-	useDeleteModelCard,
-	useModelCards,
-	useResetModelCard,
-	useUpsertModelCard,
-} from "../../hooks/useModelCards";
-import { formatLocaleNumber } from "../../lib/intl-format";
+import { useCurrentUser } from "../../hooks/useAuth";
+import { useCatalogMutation, useCatalogUpdate, useModelCatalog } from "../../hooks/useModelCatalog";
+import { resolveCatalogEntry } from "../../lib/model-catalog-view";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
-
-/** Tiers a card may declare. `none` is deliberately absent — see ModelCard docs. */
-const EFFORT_TIER_OPTIONS = ["low", "medium", "high", "xhigh", "max"] as const;
-
-type EffortTier = (typeof EFFORT_TIER_OPTIONS)[number];
-
-interface CardForm {
-	modelKey: string;
-	displayName: string;
-	family: string;
-	notes: string;
-	aliases: string[];
-	matchPrefixes: string[];
-	contextWindow: number;
-	maxCompletionTokens: number;
-	effortLevels: string[];
-	inputUsd: number;
-	outputUsd: number;
-	cacheReadUsd: number;
-	cacheWriteUsd: number;
-}
-
-function emptyForm(): CardForm {
-	return {
-		modelKey: "",
-		displayName: "",
-		family: "",
-		notes: "",
-		aliases: [],
-		matchPrefixes: [],
-		contextWindow: 0,
-		maxCompletionTokens: 0,
-		effortLevels: [],
-		inputUsd: 0,
-		outputUsd: 0,
-		cacheReadUsd: 0,
-		cacheWriteUsd: 0,
-	};
-}
-
-function toForm(card: ModelCard): CardForm {
-	return {
-		modelKey: card.modelKey,
-		displayName: card.displayName ?? "",
-		family: card.family ?? "",
-		notes: card.notes ?? "",
-		aliases: [...(card.aliases ?? [])],
-		matchPrefixes: [...(card.matchPrefixes ?? [])],
-		contextWindow: card.contextWindow ?? 0,
-		maxCompletionTokens: card.maxCompletionTokens ?? 0,
-		effortLevels: [...(card.effortLevels ?? [])],
-		inputUsd: card.officialPricing?.input ?? 0,
-		outputUsd: card.officialPricing?.output ?? 0,
-		cacheReadUsd: card.officialPricing?.cacheRead ?? 0,
-		cacheWriteUsd: card.officialPricing?.cacheWrite ?? 0,
-	};
-}
-
-/**
- * Build the payload sent to the server.
- *
- * Zero/empty fields are sent as-is rather than omitted: the server diffs against
- * the builtin card, so an explicit 0 is how "clear this field" is expressed. It
- * decides what is worth storing, not this form.
- */
-function fromForm(form: CardForm): ModelCard {
-	return {
-		modelKey: form.modelKey.trim().toLowerCase(),
-		displayName: form.displayName.trim(),
-		family: form.family.trim().toLowerCase(),
-		notes: form.notes.trim(),
-		aliases: form.aliases.map((a) => a.trim().toLowerCase()).filter(Boolean),
-		matchPrefixes: form.matchPrefixes.map((p) => p.trim().toLowerCase()).filter(Boolean),
-		contextWindow: Math.max(0, Math.trunc(form.contextWindow || 0)),
-		maxCompletionTokens: Math.max(0, Math.trunc(form.maxCompletionTokens || 0)),
-		effortLevels: EFFORT_TIER_OPTIONS.filter((tier) =>
-			form.effortLevels.includes(tier),
-		) as EffortTier[],
-		officialPricing: {
-			input: Math.max(0, form.inputUsd || 0),
-			output: Math.max(0, form.outputUsd || 0),
-			cacheRead: Math.max(0, form.cacheReadUsd || 0),
-			cacheWrite: Math.max(0, form.cacheWriteUsd || 0),
-		},
-	};
-}
-
-function formatTokens(value: number | undefined, notSetLabel: string): string {
-	// Must go through intl-format: a bare toLocaleString() follows the SYSTEM locale,
-	// so a zh-CN UI could render token counts in the OS's grouping instead of its own.
-	return value && value > 0 ? formatLocaleNumber(value) : notSetLabel;
-}
+import { type CatalogEditorTarget, ModelCatalogEditor } from "./ModelCatalogEditor";
 
 export function ModelCardsSection() {
 	const { t } = useTranslation("settings");
-	const { data, isLoading } = useModelCards();
-	const upsert = useUpsertModelCard();
-	const remove = useDeleteModelCard();
-	const reset = useResetModelCard();
+	const { data: user } = useCurrentUser();
+	const readOnly = user?.role !== "admin";
+	const query = useModelCatalog();
+	const mutation = useCatalogMutation();
+	const update = useCatalogUpdate();
 	const confirm = useConfirmDialog();
-
 	const [search, setSearch] = useState("");
-	const [familyFilter, setFamilyFilter] = useState<string | null>(null);
-	const [opened, { open, close }] = useDisclosure(false);
-	const [form, setForm] = useState<CardForm>(emptyForm());
-	const [isNew, setIsNew] = useState(true);
-
-	const cards = data?.cards ?? [];
-	const provenance = data?.provenance ?? {};
-
-	const families = useMemo(() => {
-		const set = new Set(cards.map((c) => c.family).filter((f): f is string => Boolean(f)));
-		return [...set].sort();
-	}, [cards]);
-
-	const rows = useMemo(() => {
-		const needle = search.trim().toLowerCase();
-		return cards.filter((card) => {
-			if (familyFilter && card.family !== familyFilter) return false;
-			if (!needle) return true;
-			return (
-				card.modelKey.includes(needle) ||
-				(card.displayName ?? "").toLowerCase().includes(needle) ||
-				(card.aliases ?? []).some((a) => a.includes(needle)) ||
-				(card.matchPrefixes ?? []).some((p) => p.includes(needle))
-			);
+	const [page, setPage] = useState(1);
+	const [source, setSource] = useState<string | null>(null);
+	const [provider, setProvider] = useState<string | null>(null);
+	const [configured, setConfigured] = useState(false);
+	const [editor, setEditor] = useState<CatalogEditorTarget | null>(null);
+	const [rollbackVersion, setRollbackVersion] = useState<string | null>(null);
+	const data = query.data;
+	const resolvedCache = useMemo(
+		() => ({ data, entries: new Map<string, ResolvedModelMetadata | undefined>() }),
+		[data],
+	);
+	const models = useMemo(
+		() => [
+			...new Map(
+				[...(data?.catalog.models ?? []), ...(data?.local.models ?? [])].map((m) => [m.id, m]),
+			).values(),
+		],
+		[data],
+	);
+	const variants = useMemo(
+		() => [
+			...new Map(
+				[...(data?.catalog.variants ?? []), ...(data?.local.variants ?? [])].map((v) => [v.id, v]),
+			).values(),
+		],
+		[data],
+	);
+	const providers = [...new Set(variants.map((v) => v.providerKey))].sort();
+	const isLocal = (kind: "model" | "variant", id: string) =>
+		(kind === "model" ? data?.local.models : data?.local.variants)?.some(
+			(entry) => entry.id === id,
+		) ?? false;
+	const isHidden = (entry: ModelDefinition | ModelVariant) =>
+		"modelId" in entry
+			? !!data?.local.hiddenVariantIds?.includes(entry.id) ||
+				!!data?.local.hiddenModelIds?.includes(entry.modelId)
+			: !!data?.local.hiddenModelIds?.includes(entry.id);
+	const hasBinding = (entry: ModelDefinition | ModelVariant) =>
+		data?.local.bindings?.some((b) =>
+			"modelId" in entry
+				? b.variantId === entry.id
+				: b.modelId === entry.id ||
+					variants.some((v) => v.modelId === entry.id && v.id === b.variantId),
+		);
+	const matches = (entry: ModelDefinition | ModelVariant) => {
+		const kind = "modelId" in entry ? "variant" : "model";
+		if (source === "hidden" ? !isHidden(entry) : isHidden(entry)) return false;
+		if (source === "local" && !isLocal(kind, entry.id)) return false;
+		if (source === "preset" && isLocal(kind, entry.id)) return false;
+		if (configured && !hasBinding(entry)) return false;
+		if (provider && (!("providerKey" in entry) || entry.providerKey !== provider)) return false;
+		return (
+			!search.trim() || JSON.stringify(entry).toLowerCase().includes(search.trim().toLowerCase())
+		);
+	};
+	const groups = models
+		.map((model) => ({
+			model,
+			children: variants.filter((v) => v.modelId === model.id && matches(v)),
+		}))
+		.filter(({ model, children }) => matches(model) || children.length);
+	const totalPages = Math.max(1, Math.ceil(groups.length / 30));
+	const currentPage = Math.min(page, totalPages);
+	const safeResolved = (entry: ModelDefinition | ModelVariant) => {
+		if (!resolvedCache.data) return undefined;
+		const key = `${"modelId" in entry ? "variant" : "model"}:${entry.id}`;
+		if (resolvedCache.entries.has(key)) return resolvedCache.entries.get(key);
+		let resolved: ResolvedModelMetadata | undefined;
+		try {
+			resolved = resolveCatalogEntry(resolvedCache.data, entry);
+		} catch {
+			/* Keep malformed/archived records inspectable. */
+		}
+		resolvedCache.entries.set(key, resolved);
+		return resolved;
+	};
+	const openEntry = (entry: ModelDefinition | ModelVariant) =>
+		setEditor({
+			kind: "modelId" in entry ? "variant" : "model",
+			id: entry.id,
+			resolved: safeResolved(entry),
 		});
-	}, [cards, search, familyFilter]);
-
-	const patch = (next: Partial<CardForm>) => setForm((prev) => ({ ...prev, ...next }));
-
-	function openCreate() {
-		setForm(emptyForm());
-		setIsNew(true);
-		open();
+	async function remove(entry: ModelDefinition | ModelVariant) {
+		if (!data) return;
+		const target = "modelId" in entry ? "variant" : "model";
+		const action = isLocal(target, entry.id) ? "delete" : isHidden(entry) ? "restore" : "hide";
+		if (
+			action !== "restore" &&
+			!(await confirm({
+				message: t("catalog.deleteConfirm", { id: entry.id }),
+				confirmLabel: t(`catalog.${action}`),
+				confirmColor: "red",
+			}))
+		)
+			return;
+		mutation.mutate({ baseRevision: data.local.revision, action, target, targetId: entry.id });
 	}
-
-	function openEdit(card: ModelCard) {
-		setForm(toForm(card));
-		setIsNew(false);
-		open();
+	const display = (value: unknown) =>
+		value === undefined
+			? t("catalog.unreported")
+			: value === null
+				? t("catalog.unknown")
+				: typeof value === "boolean"
+					? t(`catalog.values.${value}`)
+					: Array.isArray(value)
+						? value.join(", ") || t("catalog.emptyList")
+						: value === "0"
+							? t("catalog.free")
+							: String(value);
+	function row(entry: ModelDefinition | ModelVariant) {
+		const variant = "modelId" in entry;
+		const resolved = safeResolved(entry);
+		const metadata = resolved?.metadata;
+		const hiddenByParent =
+			variant &&
+			!!data?.local.hiddenModelIds?.includes(entry.modelId) &&
+			!isLocal("variant", entry.id);
+		return (
+			<Table.Tr key={entry.id}>
+				<Table.Td>
+					<Button
+						variant="subtle"
+						size="compact-sm"
+						onClick={() => openEntry(entry)}
+						styles={{
+							label: { whiteSpace: "normal", textAlign: "left" },
+							root: { height: "auto", padding: 4 },
+						}}
+					>
+						{variant ? "↳ " : ""}
+						{entry.name ?? entry.id}
+					</Button>
+					<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+						{variant ? entry.providerKey : entry.id}
+					</Text>
+					{!hasBinding(entry) && (
+						<Text size="xs" c="dimmed">
+							{t("catalog.metadataOnly")}
+						</Text>
+					)}
+				</Table.Td>
+				<Table.Td>
+					<Badge size="xs" variant="light">
+						{isLocal(variant ? "variant" : "model", entry.id)
+							? t("catalog.local")
+							: t("catalog.preset")}
+					</Badge>
+					{data?.local.overrides?.some(
+						(override) =>
+							override.target === (variant ? "variant" : "model") && override.targetId === entry.id,
+					) && (
+						<Badge size="xs" variant="outline">
+							{t("catalog.localPatch")}
+						</Badge>
+					)}
+					{!resolved && (
+						<Text size="xs" c="red">
+							{t("catalog.invalid")}
+						</Text>
+					)}
+					<Text size="xs" c="dimmed">
+						{entry.status === "verified" ? t("catalog.verified") : t("catalog.unverified")}
+					</Text>
+				</Table.Td>
+				<Table.Td>{display(metadata?.limits?.contextWindow)}</Table.Td>
+				<Table.Td>{display(metadata?.modalities?.input)}</Table.Td>
+				<Table.Td>{display(metadata?.nativeSearch?.supported)}</Table.Td>
+				<Table.Td>
+					{metadata?.reasoning?.supported === false
+						? display(false)
+						: metadata?.reasoning?.levels
+							? display(metadata.reasoning.levels)
+							: display(metadata?.reasoning?.mode)}
+				</Table.Td>
+				<Table.Td>
+					{display(metadata?.referencePricing?.input)} /{" "}
+					{display(metadata?.referencePricing?.output)}
+				</Table.Td>
+				<Table.Td>
+					{!readOnly && (
+						<Button
+							variant="subtle"
+							color={isHidden(entry) ? "blue" : "red"}
+							size="compact-xs"
+							loading={mutation.isPending}
+							disabled={hiddenByParent}
+							onClick={() => void remove(entry)}
+						>
+							{hiddenByParent
+								? t("catalog.hiddenByModel")
+								: t(
+										`catalog.${isLocal(variant ? "variant" : "model", entry.id) ? "delete" : isHidden(entry) ? "restore" : "hide"}`,
+									)}
+						</Button>
+					)}
+				</Table.Td>
+			</Table.Tr>
+		);
 	}
-
-	/**
-	 * Both destructive paths are confirmed: the buttons sit next to Edit in a dense
-	 * table row, and a stray click otherwise discards hand-entered pricing, context
-	 * window and prefix data with no undo.
-	 */
-	async function confirmRemove(card: ModelCard) {
-		const ok = await confirm({
-			message: t("modelCardDeleteConfirm", { model: card.modelKey }),
-			confirmLabel: t("modelCardDelete"),
-			confirmColor: "red",
-		});
-		if (ok) remove.mutate(card.modelKey);
-	}
-
-	async function confirmReset(card: ModelCard) {
-		const ok = await confirm({
-			message: t("modelCardResetConfirm", { model: card.modelKey }),
-			confirmLabel: t("modelCardReset"),
-		});
-		if (ok) reset.mutate(card.modelKey);
-	}
-
-	function save() {
-		upsert.mutate(fromForm(form), {
-			onSuccess: () => {
-				close();
-				notifications.show({ message: t("modelCardSaved"), color: "green" });
-			},
-			onError: (err: Error) =>
-				notifications.show({ title: t("modelCardSaveFailed"), message: err.message, color: "red" }),
-		});
-	}
-
 	return (
 		<Stack>
-			<Group justify="space-between" align="flex-start">
+			<Group justify="space-between">
 				<div>
-					<Text fw={600}>{t("modelCardsTitle")}</Text>
+					<Text fw={600}>{t("catalog.title")}</Text>
 					<Text size="sm" c="dimmed">
-						{t("modelCardsDesc")}
+						{t("catalog.description")}
 					</Text>
 				</div>
-				<Button leftSection={<IconPlus size={16} />} onClick={openCreate}>
-					{t("modelCardAdd")}
-				</Button>
+				{!readOnly && (
+					<Group gap="xs">
+						{(["model", "variant", "binding"] as const).map((kind) => (
+							<Button
+								key={kind}
+								variant="light"
+								size="xs"
+								disabled={!data}
+								onClick={() => setEditor({ kind, id: "", isNew: true })}
+							>
+								{t(`catalog.new_${kind}`)}
+							</Button>
+						))}
+					</Group>
+				)}
 			</Group>
-
-			<Paper withBorder p="sm">
-				<Stack gap="sm">
-					<Group>
+			{readOnly && <Alert>{t("catalog.readOnly")}</Alert>}
+			{query.isPending && <Loader size="sm" />}
+			{query.error && (
+				<Alert color="red">
+					{query.error.message}
+					<Button onClick={() => void query.refetch()} variant="subtle">
+						{t("catalog.reload")}
+					</Button>
+				</Alert>
+			)}
+			{mutation.error && (
+				<Alert color="red">
+					{t("catalog.operationFailed")}: {mutation.error.message}
+				</Alert>
+			)}
+			{data && (
+				<>
+					<Accordion>
+						<Accordion.Item value="updates">
+							<Accordion.Control>
+								{t("catalog.updates")} · {data.update.activeVersion}
+							</Accordion.Control>
+							<Accordion.Panel>
+								<Stack gap="sm">
+									<Text size="sm">
+										{t("catalog.version", {
+											active: data.update.activeVersion,
+											bundled: data.update.bundledVersion,
+										})}
+									</Text>
+									<Text size="xs" c="dimmed">
+										{t("catalog.checked")}: {data.update.lastCheckedAt ?? t("catalog.unknown")}
+									</Text>
+									<Text size="xs">
+										{t("catalog.protected", { count: data.local.overrides?.length ?? 0 })}
+									</Text>
+									{(data.update.lastError || update.error) && (
+										<Alert color="red">{update.error?.message ?? data.update.lastError}</Alert>
+									)}
+									{data.update.pendingVersion && (
+										<Alert>
+											{t("catalog.pending")}: {data.update.pendingVersion}
+										</Alert>
+									)}
+									{data.update.pendingDiff &&
+										(["added", "changed", "removed"] as const).map((kind) => (
+											<Text key={kind} size="xs" style={{ overflowWrap: "anywhere" }}>
+												{t(`catalog.${kind}`)} ({data.update.pendingDiff?.[kind].length}):{" "}
+												{data.update.pendingDiff?.[kind].join(", ") || "—"}
+											</Text>
+										))}
+									{!!data.update.pendingDiff?.fields?.length && (
+										<Stack gap={4} mah={260} style={{ overflowY: "auto" }}>
+											<Text size="sm" fw={500}>
+												{t("catalog.fieldDiff")}
+											</Text>
+											{data.update.pendingDiff.fields.map((change) => (
+												<Text
+													key={`${change.target}:${change.id}:${change.path}`}
+													size="xs"
+													style={{ overflowWrap: "anywhere" }}
+												>
+													{change.id} ·{" "}
+													{t(`catalog.fields.${change.path.replaceAll(".", "_")}`, {
+														defaultValue: change.path,
+													})}
+													: {display(change.before)} → {display(change.after)}
+												</Text>
+											))}
+										</Stack>
+									)}
+									<Group>
+										<Button
+											disabled={readOnly}
+											loading={update.isPending}
+											onClick={() => update.mutate({ action: "check" })}
+										>
+											{t("catalog.check")}
+										</Button>
+										<Button
+											disabled={readOnly || !data.update.pendingVersion}
+											loading={update.isPending}
+											onClick={() =>
+												update.mutate({ action: "apply", version: data.update.pendingVersion })
+											}
+										>
+											{t("catalog.apply")}
+										</Button>
+									</Group>
+									<Checkbox
+										label={t("catalog.autoApply")}
+										checked={data.update.autoApply}
+										disabled={readOnly || update.isPending}
+										onChange={(e) =>
+											update.mutate({ settings: { autoApply: e.currentTarget.checked } })
+										}
+									/>
+									<Checkbox
+										label={`${t("catalog.pin")} · ${data.update.pinnedVersion ?? data.update.activeVersion}`}
+										checked={data.update.pinnedVersion !== null}
+										disabled={readOnly || update.isPending}
+										onChange={(e) =>
+											update.mutate({
+												settings: {
+													pinnedVersion: e.currentTarget.checked ? data.update.activeVersion : null,
+												},
+											})
+										}
+									/>
+									<Group align="end">
+										<Select
+											label={t("catalog.history")}
+											data={[...new Set(data.update.history.map((h) => h.catalogVersion))]}
+											value={rollbackVersion}
+											onChange={setRollbackVersion}
+										/>
+										<Button
+											disabled={readOnly || !rollbackVersion}
+											loading={update.isPending}
+											onClick={() => {
+												if (rollbackVersion)
+													update.mutate({ action: "rollback", version: rollbackVersion });
+											}}
+										>
+											{t("catalog.rollback")}
+										</Button>
+									</Group>
+								</Stack>
+							</Accordion.Panel>
+						</Accordion.Item>
+					</Accordion>
+					<Group align="end">
 						<TextInput
-							placeholder={t("modelCardSearchPlaceholder")}
+							label={t("catalog.search")}
 							value={search}
 							onChange={(e) => setSearch(e.currentTarget.value)}
-							w={280}
+							style={{ flex: "1 1 200px" }}
 						/>
 						<Select
-							placeholder={t("modelCardAllFamilies")}
+							label={t("catalog.source")}
 							clearable
-							data={families}
-							value={familyFilter}
-							onChange={setFamilyFilter}
-							w={180}
+							data={["preset", "local", "hidden"].map((value) => ({
+								value,
+								label: t(`catalog.${value}`),
+							}))}
+							value={source}
+							onChange={setSource}
 						/>
-						<Text size="xs" c="dimmed">
-							{t("modelCardCount", { shown: rows.length, total: cards.length })}
-						</Text>
+						<Select
+							label={t("catalog.providerKey")}
+							clearable
+							searchable
+							data={providers}
+							value={provider}
+							onChange={setProvider}
+						/>
+						<Checkbox
+							label={t("catalog.configured")}
+							checked={configured}
+							onChange={(e) => setConfigured(e.currentTarget.checked)}
+						/>
 					</Group>
-
-					<ScrollArea.Autosize mah={520}>
-						<Table striped highlightOnHover withTableBorder={false}>
-							<Table.Thead>
-								<Table.Tr>
-									<Table.Th>{t("modelCardKey")}</Table.Th>
-									<Table.Th>{t("modelCardFamily")}</Table.Th>
-									<Table.Th>{t("modelCardContextWindow")}</Table.Th>
-									<Table.Th>{t("modelCardEffortLevels")}</Table.Th>
-									<Table.Th>{t("modelCardOfficialPrice")}</Table.Th>
-									<Table.Th>{t("modelCardActions")}</Table.Th>
-								</Table.Tr>
-							</Table.Thead>
-							<Table.Tbody>
-								{isLoading && (
-									<Table.Tr>
-										<Table.Td colSpan={6}>
-											<Text size="sm" c="dimmed">
-												{t("modelCardLoading")}
-											</Text>
-										</Table.Td>
-									</Table.Tr>
-								)}
-								{!isLoading && rows.length === 0 && (
-									<Table.Tr>
-										<Table.Td colSpan={6}>
-											<Text size="sm" c="dimmed">
-												{t("modelCardEmpty")}
-											</Text>
-										</Table.Td>
-									</Table.Tr>
-								)}
-								{rows.map((card) => {
-									const edited = provenance[card.modelKey] ?? [];
-									return (
-										<Table.Tr key={card.modelKey}>
-											<Table.Td>
-												<Group gap="xs" wrap="nowrap">
-													<Code>{card.modelKey}</Code>
-													{card.builtin && (
-														<Badge size="xs" variant="light" color="gray">
-															{t("modelCardBuiltin")}
-														</Badge>
-													)}
-													{edited.length > 0 && (
-														<Tooltip label={edited.join(", ")}>
-															<Badge size="xs" variant="light" color="indigo">
-																{t("modelCardEdited")}
-															</Badge>
-														</Tooltip>
-													)}
-												</Group>
-											</Table.Td>
-											<Table.Td>
-												<Text size="sm">{card.family || "-"}</Text>
-											</Table.Td>
-											<Table.Td>
-												<Text size="sm">
-													{formatTokens(card.contextWindow, t("modelCardNotSet"))}
-												</Text>
-											</Table.Td>
-											<Table.Td>
-												{card.effortLevels?.length ? (
-													<Group gap={4} wrap="nowrap">
-														{card.effortLevels.map((level) => (
-															<Badge key={level} size="xs" variant="light">
-																{level}
-															</Badge>
-														))}
-													</Group>
-												) : (
-													<Text size="xs" c="dimmed">
-														{t("modelCardNotSet")}
-													</Text>
-												)}
-											</Table.Td>
-											<Table.Td>
-												<Text size="sm">
-													{(card.officialPricing?.input ?? 0) > 0 ||
-													(card.officialPricing?.output ?? 0) > 0
-														? `$${(card.officialPricing?.input ?? 0).toFixed(2)} / $${(
-																card.officialPricing?.output ?? 0
-															).toFixed(2)}`
-														: t("modelCardNotSet")}
-												</Text>
-											</Table.Td>
-											<Table.Td>
-												<Group gap="xs" wrap="nowrap">
-													<Button size="compact-xs" variant="subtle" onClick={() => openEdit(card)}>
-														{t("modelCardEdit")}
-													</Button>
-													{edited.length > 0 && (
-														<Tooltip label={t("modelCardResetTooltip")}>
-															<ActionIcon variant="subtle" onClick={() => void confirmReset(card)}>
-																<IconRestore size={16} />
-															</ActionIcon>
-														</Tooltip>
-													)}
-													<Tooltip label={t("modelCardDelete")}>
-														<ActionIcon
-															variant="subtle"
-															color="red"
-															onClick={() => void confirmRemove(card)}
-														>
-															<IconTrash size={16} />
-														</ActionIcon>
-													</Tooltip>
-												</Group>
-											</Table.Td>
+					{!groups.length ? (
+						<Text c="dimmed">{t("catalog.empty")}</Text>
+					) : (
+						<Paper withBorder p="xs">
+							<Table.ScrollContainer minWidth={750}>
+								<Table verticalSpacing="xs">
+									<Table.Thead>
+										<Table.Tr>
+											{[
+												"name",
+												"source",
+												"window",
+												"inputModalities",
+												"searchSupport",
+												"reasoning",
+												"reference",
+												"actions",
+											].map((key) => (
+												<Table.Th key={key}>{t(`catalog.${key}`)}</Table.Th>
+											))}
 										</Table.Tr>
-									);
-								})}
-							</Table.Tbody>
-						</Table>
-					</ScrollArea.Autosize>
-				</Stack>
-			</Paper>
-
-			<Modal
-				opened={opened}
-				onClose={close}
-				title={isNew ? t("modelCardAdd") : `${t("modelCardEdit")} ${form.modelKey}`}
-				size="xl"
-			>
-				<Stack gap="sm">
-					<Group grow>
-						<TextInput
-							label={t("modelCardKey")}
-							description={t("modelCardKeyDesc")}
-							value={form.modelKey}
-							disabled={!isNew}
-							onChange={(e) => patch({ modelKey: e.currentTarget.value })}
-						/>
-						<TextInput
-							label={t("modelCardFamily")}
-							placeholder={t("modelCardFamilyPlaceholder")}
-							value={form.family}
-							onChange={(e) => patch({ family: e.currentTarget.value })}
-						/>
-					</Group>
-					<TextInput
-						label={t("modelCardDisplayName")}
-						value={form.displayName}
-						onChange={(e) => patch({ displayName: e.currentTarget.value })}
-					/>
-					<Textarea
-						label={t("modelCardNotes")}
-						autosize
-						minRows={1}
-						value={form.notes}
-						onChange={(e) => patch({ notes: e.currentTarget.value })}
-					/>
-
-					<Divider label={t("modelCardMatchRules")} labelPosition="left" />
-					<Text size="xs" c="dimmed">
-						{t("modelCardMatchRulesDesc")}
-					</Text>
-					<Group grow align="flex-start">
-						<TagsInput
-							label={t("modelCardAliases")}
-							description={t("modelCardAliasesDesc")}
-							value={form.aliases}
-							onChange={(v) => patch({ aliases: v })}
-						/>
-						<TagsInput
-							label={t("modelCardMatchPrefixes")}
-							description={t("modelCardMatchPrefixesDesc")}
-							value={form.matchPrefixes}
-							onChange={(v) => patch({ matchPrefixes: v })}
-						/>
-					</Group>
-
-					<Divider label={t("modelCardCapabilities")} labelPosition="left" />
-					<Group grow>
-						<NumberInput
-							label={t("modelCardContextWindow")}
-							description={t("modelCardZeroMeansInherit")}
-							value={form.contextWindow}
-							min={0}
-							step={1000}
-							decimalScale={0}
-							thousandSeparator=","
-							onChange={(v) => patch({ contextWindow: Number(v) || 0 })}
-						/>
-						<NumberInput
-							label={t("modelCardMaxCompletionTokens")}
-							description={t("modelCardZeroMeansInherit")}
-							value={form.maxCompletionTokens}
-							min={0}
-							step={1000}
-							decimalScale={0}
-							thousandSeparator=","
-							onChange={(v) => patch({ maxCompletionTokens: Number(v) || 0 })}
-						/>
-					</Group>
-					<TagsInput
-						label={t("modelCardEffortLevels")}
-						description={t("modelCardEffortLevelsDesc")}
-						data={[...EFFORT_TIER_OPTIONS]}
-						value={form.effortLevels}
-						onChange={(v) => patch({ effortLevels: v })}
-					/>
-
-					<Divider label={t("modelCardOfficialPriceSection")} labelPosition="left" />
-					<Group grow>
-						<NumberInput
-							label={t("modelCardPriceInput")}
-							value={form.inputUsd}
-							min={0}
-							decimalScale={4}
-							onChange={(v) => patch({ inputUsd: Number(v) || 0 })}
-						/>
-						<NumberInput
-							label={t("modelCardPriceOutput")}
-							value={form.outputUsd}
-							min={0}
-							decimalScale={4}
-							onChange={(v) => patch({ outputUsd: Number(v) || 0 })}
-						/>
-					</Group>
-					<Group grow>
-						<NumberInput
-							label={t("modelCardPriceCacheRead")}
-							value={form.cacheReadUsd}
-							min={0}
-							decimalScale={4}
-							onChange={(v) => patch({ cacheReadUsd: Number(v) || 0 })}
-						/>
-						<NumberInput
-							label={t("modelCardPriceCacheWrite")}
-							description={t("modelCardPriceCacheWriteDesc")}
-							value={form.cacheWriteUsd}
-							min={0}
-							decimalScale={4}
-							onChange={(v) => patch({ cacheWriteUsd: Number(v) || 0 })}
-						/>
-					</Group>
-
-					<Group justify="flex-end">
-						<Button variant="default" onClick={close}>
-							{t("cancel")}
-						</Button>
-						<Button loading={upsert.isPending} disabled={!form.modelKey.trim()} onClick={save}>
-							{t("save")}
-						</Button>
-					</Group>
-				</Stack>
-			</Modal>
+									</Table.Thead>
+									<Table.Tbody>
+										{groups
+											.slice((currentPage - 1) * 30, currentPage * 30)
+											.map(({ model, children }) => (
+												<CatalogGroup
+													key={model.id}
+													model={model}
+													variants={children}
+													renderRow={row}
+													forceExpanded={!!search.trim() || !!provider || source === "hidden"}
+												/>
+											))}
+									</Table.Tbody>
+								</Table>
+							</Table.ScrollContainer>
+						</Paper>
+					)}
+					{totalPages > 1 && (
+						<Pagination total={totalPages} value={currentPage} onChange={setPage} size="sm" />
+					)}
+					{!!data.local.bindings?.length && (
+						<Accordion>
+							<Accordion.Item value="bindings">
+								<Accordion.Control>
+									{t("catalog.bindings")} ({data.local.bindings.length})
+								</Accordion.Control>
+								<Accordion.Panel>
+									<Stack gap="xs">
+										{data.local.bindings.map((binding) => (
+											<Group key={binding.id} justify="space-between">
+												<Button
+													variant="subtle"
+													onClick={() => {
+														let resolved: ResolvedModelMetadata | undefined;
+														try {
+															resolved = resolveModelMetadata({
+																catalog: data.catalog,
+																local: data.local,
+																query: binding,
+															});
+														} catch {
+															/* Archived/hidden identities remain inspectable. */
+														}
+														setEditor({
+															kind: "binding",
+															id: binding.id,
+															resolved,
+															query: binding,
+														});
+													}}
+												>
+													{binding.id} · {binding.providerId ?? binding.channelId} ·{" "}
+													{binding.upstreamModelId}
+												</Button>
+												{!readOnly && (
+													<Button
+														color="red"
+														variant="subtle"
+														size="compact-xs"
+														onClick={async () => {
+															if (
+																await confirm({
+																	message: t("catalog.deleteConfirm", { id: binding.id }),
+																	confirmLabel: t("catalog.delete"),
+																	confirmColor: "red",
+																})
+															)
+																mutation.mutate({
+																	baseRevision: data.local.revision,
+																	action: "delete",
+																	target: "binding",
+																	targetId: binding.id,
+																});
+														}}
+													>
+														{t("catalog.delete")}
+													</Button>
+												)}
+											</Group>
+										))}
+									</Stack>
+								</Accordion.Panel>
+							</Accordion.Item>
+						</Accordion>
+					)}
+				</>
+			)}
+			{editor && data && (
+				<ModelCatalogEditor
+					key={`${editor.kind}:${editor.id}:${editor.isNew}`}
+					target={editor}
+					snapshot={data}
+					readOnly={readOnly}
+					onClose={() => setEditor(null)}
+				/>
+			)}
 		</Stack>
+	);
+}
+
+function CatalogGroup({
+	model,
+	variants,
+	renderRow,
+	forceExpanded,
+}: {
+	model: ModelDefinition;
+	variants: ModelVariant[];
+	renderRow: (entry: ModelDefinition | ModelVariant) => React.ReactNode;
+	forceExpanded: boolean;
+}) {
+	const { t } = useTranslation("settings");
+	const [expanded, setExpanded] = useState(false);
+	return (
+		<>
+			{renderRow(model)}
+			{variants.length > 0 && (
+				<Table.Tr>
+					<Table.Td colSpan={8}>
+						<Button
+							size="compact-xs"
+							variant="subtle"
+							disabled={forceExpanded}
+							onClick={() => setExpanded(!expanded)}
+						>
+							{expanded || forceExpanded ? "−" : "+"}{" "}
+							{t("catalog.variants", { count: variants.length })}
+						</Button>
+					</Table.Td>
+				</Table.Tr>
+			)}
+			{(expanded || forceExpanded) && variants.map(renderRow)}
+		</>
 	);
 }

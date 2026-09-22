@@ -225,6 +225,8 @@ export async function extractSubagentToPrimary(
 							contentText: msg.contentText,
 							tokensIn: msg.tokensIn,
 							costUsd: msg.costUsd,
+							costStatus: msg.costStatus,
+							costMissingFields: msg.costMissingFields,
 							turnUsageJson: msg.turnUsageJson,
 							provider: msg.provider,
 							credentialId: msg.credentialId,

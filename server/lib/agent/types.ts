@@ -4,6 +4,7 @@ import type {
 	ApiRequestDiagnosticSource,
 	ApiRequestDiagnostics,
 	KnowledgeInjectionRecord,
+	ReferencePricingSnapshot,
 	ReasoningProviderMetadata,
 } from "@shared/agent-protocol/types";
 import type { ToolProgressPayload } from "@shared/tool-progress";
@@ -735,6 +736,7 @@ export type AgentEvent =
 			provider: string;
 			model: string;
 			credentialId?: string;
+			referencePricingSnapshot?: ReferencePricingSnapshot;
 	  }
 	| {
 			type: "api_request_end";

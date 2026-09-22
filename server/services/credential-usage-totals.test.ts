@@ -38,6 +38,36 @@ function record(overrides: Partial<Parameters<typeof recordCredentialUsage>[0]> 
 }
 
 describe("credential usage totals", () => {
+	test("explicit free and partial zero costs remain distinguishable in durable totals", () => {
+		record({ costUsd: 0, costStatus: "complete" });
+		expect(getCredentialUsageTotals("codex", "cred-a", 50, db)).toMatchObject({
+			costStatus: "complete",
+			costUsd: 0,
+			unpricedRequestCount: 0,
+		});
+		record({ costUsd: 0, costStatus: "partial" });
+		record({ costUsd: null, costStatus: "unknown" });
+		const summary = getCredentialUsageTotals("codex", "cred-a", 50, db);
+		expect(summary).toMatchObject({
+			costStatus: "partial",
+			costUsd: 0,
+			partialRequestCount: 1,
+			unpricedRequestCount: 2,
+			costIsPartial: true,
+		});
+		expect(summary.byModel[0]?.costStatus).toBe("partial");
+		expect(listProviderCredentialTotals("codex", 50, db)[0]?.costStatus).toBe("partial");
+	});
+	test("partial amounts contribute known cost without increasing complete coverage", () => {
+		record({ costUsd: 0.03, costStatus: "partial" });
+		expect(getCredentialUsageTotals("codex", "cred-a", 50, db)).toMatchObject({
+			costStatus: "partial",
+			costUsd: 0.03,
+			unpricedRequestCount: 1,
+			partialRequestCount: 1,
+		});
+	});
+
 	test("首次记录建立行，后续记录累加", () => {
 		record({ at: "2026-07-01T00:00:00.000Z" });
 		record({ at: "2026-07-02T00:00:00.000Z" });
@@ -330,6 +360,7 @@ describe("recordCredentialUsage 在写锁占用时不抛错", () => {
 				reasoning_tokens integer DEFAULT 0 NOT NULL,
 				cost_usd real DEFAULT 0 NOT NULL,
 				unpriced_request_count integer DEFAULT 0 NOT NULL,
+				partial_request_count integer DEFAULT 0 NOT NULL,
 				first_seen_at text NOT NULL,
 				last_seen_at text NOT NULL
 			)`);

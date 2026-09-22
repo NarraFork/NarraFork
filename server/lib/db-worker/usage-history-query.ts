@@ -22,7 +22,7 @@ export function runUsageHistoryQuery(sqlite: Database, input: UsageHistoryQueryP
 		input.maxRows < 1 ||
 		input.maxRows > USAGE_QUERY_MAX_ROWS ||
 		input.columns.length < 1 ||
-		input.columns.length > 32 ||
+		input.columns.length > 40 ||
 		input.columns.some((column) => !/^[a-zA-Z][a-zA-Z0-9]{0,63}$/.test(column)) ||
 		new Set(input.columns).size !== input.columns.length
 	)

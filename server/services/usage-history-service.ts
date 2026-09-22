@@ -2,6 +2,7 @@ import { db } from "@server/db";
 import { getDbPath } from "@server/db/connection";
 import { apiRequests, chapters, narrators, users } from "@server/db/schema";
 import { redactSpillPointerPaths } from "@server/lib/api-request-dump-store";
+import { aggregateCostStatus, type CostStatus } from "@server/lib/cost-estimate";
 import { resolveCredentialDisplayName } from "@server/lib/credential-display-name";
 import { runReadTask } from "@server/lib/db-worker/pool";
 import { AppError } from "@server/lib/errors";
@@ -11,6 +12,38 @@ import {
 	type UsageHistoryCursor,
 } from "@server/lib/usage-history-cursor";
 import { normalizeModelFamily } from "@shared/model-id";
+
+const costCoverageSelection = {
+	unpricedRequestCount: sql<number>`coalesce(sum(case when ${apiRequests.costStatus} in ('partial','unknown') or (${apiRequests.costStatus} is null and ${apiRequests.costUsd} is null) then 1 else 0 end), 0)`,
+	partialRequestCount: sql<number>`coalesce(sum(case when ${apiRequests.costStatus} = 'partial' then 1 else 0 end), 0)`,
+};
+function costCoverage(row?: {
+	totalRequests?: number;
+	requestCount?: number;
+	count?: number;
+	unpricedRequestCount?: number;
+	partialRequestCount?: number;
+}) {
+	const unpricedRequestCount = Number(row?.unpricedRequestCount ?? 0);
+	const partialRequestCount = Number(row?.partialRequestCount ?? 0);
+	return {
+		unpricedRequestCount,
+		partialRequestCount,
+		costStatus: aggregateCostStatus(
+			Number(row?.totalRequests ?? row?.requestCount ?? row?.count ?? 0),
+			unpricedRequestCount,
+			partialRequestCount,
+		),
+		costIsPartial: unpricedRequestCount > 0,
+	};
+}
+interface CostCoverage {
+	costStatus: CostStatus;
+	costIsPartial: boolean;
+	unpricedRequestCount: number;
+	partialRequestCount: number;
+}
+
 import { and, desc, eq, gte, lte, or, sql } from "drizzle-orm";
 
 export interface UsageHistoryFilters {
@@ -29,7 +62,7 @@ export interface UsageHistoryFilters {
 	includeSubagents?: boolean;
 }
 
-export interface UsageHistoryStats {
+export interface UsageHistoryStats extends CostCoverage {
 	totalRequests: number;
 	totalInputTokens: number;
 	totalOutputTokens: number;
@@ -46,7 +79,7 @@ export interface UsageHistoryStats {
 
 export type UsageHistoryGranularity = "hour" | "day" | "month";
 
-export interface UsageHistoryTimeSeriesPoint {
+export interface UsageHistoryTimeSeriesPoint extends CostCoverage {
 	timestamp: string;
 	requestCount: number;
 	totalInputTokens: number;
@@ -99,14 +132,14 @@ export interface UsageBreakdownEntry {
 	count: number;
 }
 
-export interface UsageBreakdownResponse {
+export interface UsageBreakdownResponse extends CostCoverage {
 	dimension: UsageBreakdownDimension;
 	metric: UsageBreakdownMetric;
 	entries: UsageBreakdownEntry[];
 	total: number;
 }
 
-export interface UsageStackedTimeSeriesResponse {
+export interface UsageStackedTimeSeriesResponse extends CostCoverage {
 	granularity: UsageHistoryGranularity;
 	dimension: UsageBreakdownDimension;
 	metric: UsageBreakdownMetric;
@@ -289,6 +322,8 @@ export interface UsageHistoryRecord {
 	ttftMs: number | null;
 	durationMs: number | null;
 	costUsd: number | null;
+	costStatus: CostStatus | null;
+	costMissingFields: string[] | null;
 	contextPercent: number | null;
 	meterUsage: number | null;
 	meterUnit: string | null;
@@ -347,6 +382,8 @@ interface UsageHistoryListRow {
 	ttftMs: number | null;
 	durationMs: number | null;
 	costUsd: number | null;
+	costStatus: CostStatus | null;
+	costMissingFields: string[] | null;
 	contextPercent: number | null;
 	meterUsage: number | null;
 	meterUnit: string | null;
@@ -423,6 +460,10 @@ export class UsageHistoryService {
 	private mapListRecord(row: UsageHistoryListRow): UsageHistoryRecord {
 		return {
 			...row,
+			costMissingFields:
+				typeof row.costMissingFields === "string"
+					? JSON.parse(row.costMissingFields)
+					: row.costMissingFields,
 			credentialName: this.getCredentialName(row.provider, row.credentialId),
 			inputTokens: row.inputTokens ?? 0,
 			outputTokens: row.outputTokens ?? 0,
@@ -502,6 +543,8 @@ export class UsageHistoryService {
 				ttftMs: apiRequests.ttftMs,
 				durationMs: apiRequests.durationMs,
 				costUsd: apiRequests.costUsd,
+				costStatus: apiRequests.costStatus,
+				costMissingFields: apiRequests.costMissingFields,
 				contextPercent: apiRequests.contextPercent,
 				meterUsage: apiRequests.meterUsage,
 				meterUnit: apiRequests.meterUnit,
@@ -568,6 +611,8 @@ export class UsageHistoryService {
 				ttftMs: apiRequests.ttftMs,
 				durationMs: apiRequests.durationMs,
 				costUsd: apiRequests.costUsd,
+				costStatus: apiRequests.costStatus,
+				costMissingFields: apiRequests.costMissingFields,
 				contextPercent: apiRequests.contextPercent,
 				meterUsage: apiRequests.meterUsage,
 				meterUnit: apiRequests.meterUnit,
@@ -621,6 +666,7 @@ export class UsageHistoryService {
 				totalCacheCreation1hTokens: sql<number>`coalesce(sum(${apiRequests.cacheCreation1hTokens}), 0)`,
 				totalReasoningTokens: sql<number>`coalesce(sum(${apiRequests.reasoningTokens}), 0)`,
 				totalCost: sql<number>`coalesce(sum(${apiRequests.costUsd}), 0)`,
+				...costCoverageSelection,
 				averageDurationMs: sql<number>`coalesce(avg(${apiRequests.durationMs}), 0)`,
 				averageTtftMs: sql<number>`coalesce(avg(${apiRequests.ttftMs}), 0)`,
 			})
@@ -649,6 +695,7 @@ export class UsageHistoryService {
 			totalTokens:
 				totalInputTokens + totalOutputTokens + totalCacheCreationTokens + totalCacheReadTokens,
 			totalCost: stats?.totalCost ?? 0,
+			...costCoverage(stats),
 			averageDurationMs: stats?.averageDurationMs ?? 0,
 			averageTtftMs: stats?.averageTtftMs ?? 0,
 		};
@@ -681,6 +728,7 @@ export class UsageHistoryService {
 				totalCacheCreation1hTokens: sql<number>`coalesce(sum(${apiRequests.cacheCreation1hTokens}), 0)`,
 				totalReasoningTokens: sql<number>`coalesce(sum(${apiRequests.reasoningTokens}), 0)`,
 				totalCost: sql<number>`coalesce(sum(${apiRequests.costUsd}), 0)`,
+				...costCoverageSelection,
 				averageDurationMs: sql<number>`coalesce(avg(${apiRequests.durationMs}), 0)`,
 				averageTtftMs: sql<number>`coalesce(avg(${apiRequests.ttftMs}), 0)`,
 				errorCount: sql<number>`coalesce(sum(case when ${apiRequests.errorMessage} is not null and trim(${apiRequests.errorMessage}) <> '' then 1 else 0 end), 0)`,
@@ -722,6 +770,7 @@ export class UsageHistoryService {
 				totalTokens:
 					totalInputTokens + totalOutputTokens + totalCacheCreationTokens + totalCacheReadTokens,
 				totalCost: toNumber(row?.totalCost),
+				...costCoverage(row),
 				averageDurationMs: toNumber(row?.averageDurationMs),
 				averageTtftMs: toNumber(row?.averageTtftMs),
 				errorCount: toNumber(row?.errorCount),
@@ -807,6 +856,8 @@ export class UsageHistoryService {
 				ttftMs: apiRequests.ttftMs,
 				durationMs: apiRequests.durationMs,
 				costUsd: apiRequests.costUsd,
+				costStatus: apiRequests.costStatus,
+				costMissingFields: apiRequests.costMissingFields,
 				contextPercent: apiRequests.contextPercent,
 				meterUsage: apiRequests.meterUsage,
 				meterUnit: apiRequests.meterUnit,
@@ -923,7 +974,9 @@ export class UsageHistoryService {
 			entry.percentage = total > 0 ? Math.round((entry.value / total) * 10000) / 100 : 0;
 		}
 
-		return { dimension, metric, entries, total };
+		// Coverage is over the whole filter, not merely the visible top-N slice.
+		const coverage = await this.getUsageStats(filters, execution);
+		return { dimension, metric, entries, total, ...costCoverage(coverage) };
 	}
 
 	async getUsageTimeSeriesStacked(
@@ -997,7 +1050,13 @@ export class UsageHistoryService {
 					)}) then ${dimensionColumn} else null end`
 				: sql<string | null>`null`;
 		const bucketQuery = this.database
-			.select({ bucket, label: groupedLabel, value: metricAgg })
+			.select({
+				bucket,
+				label: groupedLabel,
+				value: metricAgg,
+				requestCount: sql<number>`count(*)`,
+				...costCoverageSelection,
+			})
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
@@ -1082,6 +1141,16 @@ export class UsageHistoryService {
 			dimension,
 			metric,
 			series,
+			...costCoverage(
+				rows.reduce(
+					(sum, row) => ({
+						requestCount: sum.requestCount + toNumber(row.requestCount),
+						unpricedRequestCount: sum.unpricedRequestCount + toNumber(row.unpricedRequestCount),
+						partialRequestCount: sum.partialRequestCount + toNumber(row.partialRequestCount),
+					}),
+					{ requestCount: 0, unpricedRequestCount: 0, partialRequestCount: 0 },
+				),
+			),
 			timestamps,
 			truncated: range.truncated,
 			effectiveStartDate: range.effectiveStartDate,

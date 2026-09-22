@@ -6,9 +6,8 @@ import { chapters, projects, remoteDevices } from "../db/schema";
 import { AppError } from "../lib/errors";
 import { isSecretPlatformPath, isSecretUserPath } from "../lib/fs-secret-paths";
 import { logger } from "../lib/logger";
-import { narratorPrincipalOf, requireNarratorAccess } from "../lib/narrator-access";
+import { narratorPrincipalOf } from "../lib/narrator-access";
 import { getHome } from "../lib/platform";
-import { requireChapterAccess } from "../lib/project-access";
 import { narraforkDir } from "../lib/settings";
 import { isDeviceAuthorized } from "./device-service";
 import type { CompiledExecutionPolicy } from "./execution-policy/compiler";
@@ -21,10 +20,10 @@ import {
 } from "./git-workspace";
 import { ACCESS_PAGE_SIZE, GitAccessScan } from "./git-workspace-access-scan";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
-import { canWriteNarrator } from "./narrator-acl";
+import { canWriteNarrator, loadNarratorForAccess, type NarratorPrincipal } from "./narrator-acl";
 import { resolveOAuthDeviceRuntimeAuthorization } from "./oauth-device-runtime-policy";
 import { resolveOAuthNarratorRuntimePolicy } from "./oauth-narrator-runtime-policy";
-import { hasProjectAccess, loadProjectForAccess } from "./project-acl";
+import { assertChapterProjectAccess, hasProjectAccess, loadProjectForAccess } from "./project-acl";
 
 const denied = () =>
 	new AppError("Git workspace access denied", 403, "GIT_WORKSPACE_ACCESS_DENIED");
@@ -189,8 +188,16 @@ export async function authorizeGitTarget(
 	source: { narratorId: string } | { chapterId: string },
 	need: "read" | "write",
 ): Promise<GitWorkspaceTarget> {
-	const principal = narratorPrincipalOf(c);
-	const signal = c.req.raw.signal;
+	return authorizeGitTargetForPrincipal(narratorPrincipalOf(c), source, need, c.req.raw.signal);
+}
+
+/** Shared by HTTP and authenticated workspace WebSocket subscriptions. */
+export async function authorizeGitTargetForPrincipal(
+	principal: NarratorPrincipal,
+	source: { narratorId: string } | { chapterId: string },
+	need: "read" | "write",
+	signal: AbortSignal,
+): Promise<GitWorkspaceTarget> {
 	let canWrite = true;
 	let policy: Awaited<ReturnType<typeof resolveOAuthNarratorRuntimePolicy>> = null;
 	let deviceClass: ExecutionDeviceClass | null = null;
@@ -200,7 +207,7 @@ export async function authorizeGitTarget(
 	} = { context: null, policy: null };
 	let target: GitWorkspaceTarget;
 	if ("narratorId" in source) {
-		const narrator = await requireNarratorAccess(c, source.narratorId, need);
+		const narrator = await loadNarratorForAccess(source.narratorId, principal, need);
 		canWrite = await canWriteNarrator(narrator, principal);
 		policy = await resolveOAuthNarratorRuntimePolicy(source.narratorId);
 		target = await resolveNarratorGitTarget(
@@ -289,7 +296,7 @@ export async function authorizeGitTarget(
 			},
 		);
 	} else {
-		await requireChapterAccess(c, source.chapterId, need);
+		await assertChapterProjectAccess(source.chapterId, principal, need);
 		target = await resolveChapterGitTarget(source.chapterId, signal);
 		if (target.contextProjectId)
 			canWrite = await hasProjectAccess(

@@ -5,6 +5,7 @@
 
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
 import type { ModelCard } from "@shared/model-card";
+import type { ModelCatalogSettings } from "../model-catalog";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
@@ -659,6 +660,8 @@ export interface NarraForkSettings {
 		 * map force-overrides one exact `provider:model` value.
 		 */
 		modelCards?: ModelCard[];
+		/** Versioned public metadata overlays; never stores the public catalog itself. */
+		modelCatalog?: ModelCatalogSettings;
 		/** Translate reasoning/thinking blocks via translationModel after each block completes. */
 		translateReasoning: boolean;
 		/** Default value for the relaxed plan toggle on new narrators. */

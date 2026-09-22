@@ -3,8 +3,13 @@ import {
 	getAnthropicEffectiveContextWindow,
 	supportsAnthropic1mContext,
 } from "../../../server/lib/agent/anthropic-provider";
+import {
+	bindModelCatalogSettings,
+	getModelCatalogSnapshot,
+	mutateModelCatalog,
+} from "../../../server/lib/model-catalog";
 import type { AnthropicProviderConfig } from "../../../server/lib/settings";
-import { resolveModelContextWindow, settings } from "../../../server/lib/settings";
+import { resolveModelContextWindow, saveSettings, settings } from "../../../server/lib/settings";
 
 /**
  * Regression tests for the "custom context window has no effect" report.
@@ -27,6 +32,29 @@ function restoreFromSnapshot(snapshot: ReturnType<typeof cloneSettingsSnapshot>)
 		// biome-ignore lint/suspicious/noExplicitAny: generic key/value restoration in test helper
 		(settings as any)[key] = snapshot[key];
 	}
+	bindModelCatalogSettings(settings, () => saveSettings(settings));
+	saveSettings(settings);
+}
+
+function resetCatalog(): void {
+	// These fixtures configure the legacy provider projection. Let saveSettings
+	// derive its canonical provider list instead of overwriting it with stale data.
+	delete settings.customApiProviders;
+	settings.agent.modelCatalog = {
+		schemaVersion: 1,
+		migrationVersion: 1,
+		local: { revision: 0 },
+		autoApply: false,
+		pinnedVersion: null,
+	};
+	bindModelCatalogSettings(settings, () => saveSettings(settings));
+}
+
+function saveWindow(value: number): void {
+	settings.agent.modelContextWindows = { "relay:claude-opus-5": value };
+	// Exercise the same legacy-editor adapter as production, rather than mutating
+	// archived settings behind the catalog's back and skipping its save migration.
+	saveSettings(settings);
 }
 
 function anthropicConfig(
@@ -52,6 +80,7 @@ describe("Anthropic effective context window respects explicit configuration", (
 		settings.anthropicProviders = [anthropicConfig()];
 		settings.agent.modelContextWindows = {};
 		settings.agent.modelAggregations = [];
+		resetCatalog();
 	});
 
 	afterEach(() => {
@@ -59,7 +88,7 @@ describe("Anthropic effective context window respects explicit configuration", (
 	});
 
 	test("per-model user override wins over the official 1M floor", () => {
-		settings.agent.modelContextWindows = { "relay:claude-opus-5": 500_000 };
+		saveWindow(500_000);
 		// Sanity: this model is on the 1M capability list, so the floor would apply.
 		expect(supportsAnthropic1mContext("claude-opus-5")).toBe(true);
 		expect(getAnthropicEffectiveContextWindow("claude-opus-5", anthropicConfig())).toBe(500_000);
@@ -71,8 +100,37 @@ describe("Anthropic effective context window respects explicit configuration", (
 		expect(getAnthropicEffectiveContextWindow("claude-opus-5", config)).toBe(400_000);
 	});
 
+	test("local model and saved binding windows outrank provider defaults; reset never re-pins archived values", () => {
+		const config = anthropicConfig({ defaultContextWindow: 400_000 });
+		settings.anthropicProviders = [config];
+		const patch = (target: "model" | "binding", targetId: string, value?: number) =>
+			mutateModelCatalog({
+				action: "patch",
+				baseRevision: getModelCatalogSnapshot().local.revision,
+				target,
+				targetId,
+				patch:
+					value === undefined
+						? { reset: ["limits.contextWindow"] }
+						: { set: { "limits.contextWindow": value } },
+			});
+		patch("model", "claude-opus-5", 600_000);
+		expect(resolveModelContextWindow("claude-opus-5", "relay")).toEqual({
+			contextWindow: 600_000,
+			source: "card",
+		});
+		saveWindow(300_000);
+		expect(getAnthropicEffectiveContextWindow("claude-opus-5", config)).toBe(300_000);
+		patch("binding", "legacy-window:relay:claude-opus-5");
+		expect(getAnthropicEffectiveContextWindow("claude-opus-5", config)).toBe(600_000);
+		patch("model", "claude-opus-5");
+		saveSettings(settings);
+		expect(getAnthropicEffectiveContextWindow("claude-opus-5", config)).toBe(400_000);
+		expect(settings.agent.modelContextWindows["relay:claude-opus-5"]).toBe(300_000);
+	});
+
 	test("a user override larger than 1M is kept as-is", () => {
-		settings.agent.modelContextWindows = { "relay:claude-opus-5": 2_000_000 };
+		saveWindow(2_000_000);
 		expect(getAnthropicEffectiveContextWindow("claude-opus-5", anthropicConfig())).toBe(2_000_000);
 	});
 
@@ -92,7 +150,7 @@ describe("Anthropic effective context window respects explicit configuration", (
 	});
 
 	test("prefixed override keys resolve for the provider prefix", () => {
-		settings.agent.modelContextWindows = { "relay:claude-opus-5": 300_000 };
+		saveWindow(300_000);
 		expect(getAnthropicEffectiveContextWindow("relay:claude-opus-5", anthropicConfig())).toBe(
 			300_000,
 		);
@@ -110,6 +168,7 @@ describe("resolveModelContextWindow reports where the value came from", () => {
 		settings.nugProviders = [];
 		settings.agent.modelContextWindows = {};
 		settings.agent.modelAggregations = [];
+		resetCatalog();
 	});
 
 	afterEach(() => {
@@ -117,7 +176,7 @@ describe("resolveModelContextWindow reports where the value came from", () => {
 	});
 
 	test("user override is reported as user", () => {
-		settings.agent.modelContextWindows = { "relay:claude-opus-5": 500_000 };
+		saveWindow(500_000);
 		expect(resolveModelContextWindow("claude-opus-5", "relay")).toEqual({
 			contextWindow: 500_000,
 			source: "user",

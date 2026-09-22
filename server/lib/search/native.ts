@@ -1,9 +1,11 @@
 import {
 	getAnthropicProviderConfig,
+	getOpenaiProviderConfig,
 	isAnthropicProvider,
 	settings,
 	usesCodexModel,
 } from "../settings";
+import { getEffectiveModelMetadata } from "../model-catalog";
 import type { NarraForkSettings } from "../settings/types";
 import { getNormalizedSearchChannels, SEARCH_NATIVE_CHANNEL_ID } from "./settings";
 
@@ -30,7 +32,12 @@ export function isNativeSearchEnabled(config: NarraForkSettings = settings): boo
  * toggled, not a permanent regression.
  */
 export function usesInlineNativeSearch(provider: string, model: string): boolean {
-	return usesCodexModel(provider, model);
+	if (provider === "codex" && settings.codex?.useWebSearch === false) return false;
+	if (getOpenaiProviderConfig(provider)?.codexWebSearch === false) return false;
+	return (
+		getEffectiveModelMetadata(model.startsWith(`${provider}:`) ? model : `${provider}:${model}`)
+			.metadata.nativeSearch?.supported !== false && usesCodexModel(provider, model)
+	);
 }
 
 /**
@@ -57,7 +64,13 @@ export function usesInlineNativeSearch(provider: string, model: string): boolean
  * it fails the side request cleanly — the router then falls through to the
  * next configured channel. Non-official providers never qualify.
  */
-export function usesSideRequestNativeSearch(provider: string): boolean {
+export function usesSideRequestNativeSearch(provider: string, model?: string): boolean {
+	if (
+		model &&
+		getEffectiveModelMetadata(model.startsWith(`${provider}:`) ? model : `${provider}:${model}`)
+			.metadata.nativeSearch?.supported === false
+	)
+		return false;
 	if (!isAnthropicProvider(provider)) return false;
 	const config = getAnthropicProviderConfig(provider);
 	return !!config?.officialApi && config.nativeSearch !== false;
@@ -79,7 +92,7 @@ export function hasSideRequestNativeSearchProvider(config: NarraForkSettings = s
 
 /** Whether this provider/model can perform provider-side web search at all. */
 export function supportsNativeSearch(provider: string, model: string): boolean {
-	return usesInlineNativeSearch(provider, model) || usesSideRequestNativeSearch(provider);
+	return usesInlineNativeSearch(provider, model) || usesSideRequestNativeSearch(provider, model);
 }
 
 /**

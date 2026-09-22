@@ -18,7 +18,9 @@ export function usageHistoryCsv(records: UsageHistoryRecord[], unattributedLabel
 		"Reasoning Tokens",
 		"TTFT (ms)",
 		"Duration (ms)",
-		"Cost (USD)",
+		"Known Reference Cost (USD)",
+		"Cost Status",
+		"Missing Price Fields",
 		"Error",
 	];
 	const rows = records.map((r) => [
@@ -36,7 +38,9 @@ export function usageHistoryCsv(records: UsageHistoryRecord[], unattributedLabel
 		r.reasoningTokens,
 		r.ttftMs ?? "",
 		r.durationMs ?? "",
-		r.costUsd ?? "",
+		r.costStatus === "unknown" ? "" : (r.costUsd ?? ""),
+		r.costStatus ?? "legacy",
+		(r.costMissingFields ?? []).join("; "),
 		r.errorMessage ?? "",
 	]);
 	const escapeCsv = (value: unknown) => {

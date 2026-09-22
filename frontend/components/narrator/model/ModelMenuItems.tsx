@@ -358,7 +358,7 @@ export function ModelMenuItems({
 															×{m.rateMultiplier}
 														</Badge>
 													)}
-													{m.pricing && (
+													{onShowPrice && !m.value.startsWith(AGG_MODEL_PREFIX) && (
 														<ActionIcon
 															component="div"
 															role="button"
@@ -366,11 +366,23 @@ export function ModelMenuItems({
 															variant="subtle"
 															color="gray"
 															size="sm"
-															aria-label={t("viewModelPrice")}
+															aria-label={ts("catalog.details")}
 															onClick={(e) => {
 																e.stopPropagation();
 																e.preventDefault();
-																onShowPrice?.(m);
+																const actualValue =
+																	m.provider === "__default__"
+																		? defaultModelValue
+																		: m.provider === "__summary__"
+																			? summaryModelValue
+																			: m.value;
+																onShowPrice?.(actualValue ? { ...m, value: actualValue } : m);
+															}}
+															onKeyDown={(event) => {
+																if (event.key !== "Enter" && event.key !== " ") return;
+																event.preventDefault();
+																event.stopPropagation();
+																event.currentTarget.click();
 															}}
 														>
 															<IconInfoCircle size={14} />

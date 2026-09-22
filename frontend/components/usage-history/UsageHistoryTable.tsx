@@ -1,6 +1,7 @@
 import { formatCompactNumber, formatDuration } from "@frontend/lib/compact-number";
 import { formatLocaleDateTime } from "@frontend/lib/intl-format";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
+import { formatReferenceCost } from "@frontend/lib/usage-cost";
 import { usageHistoryApi } from "@frontend/lib/usage-history-api";
 import { usageUserLabel } from "@frontend/lib/usage-history-user";
 import type { UsageHistoryRawDumpSpill, UsageHistoryRecord } from "@frontend/types/usage-history";
@@ -805,9 +806,10 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 									value={
 										record.meterUsage != null
 											? `${record.meterUsage.toFixed(2)} ${record.meterUnit || "credits"}`
-											: record.costUsd != null
-												? `$${record.costUsd.toFixed(6)}`
-												: "-"
+											: formatReferenceCost(record, record.costUsd, {
+													unknown: t("usageCostUnknown"),
+													partial: t("usageCostPartial"),
+												})
 									}
 									compact
 								/>
@@ -986,7 +988,10 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 											</Text>
 										) : (
 											<Text size="sm" fw={500} c={record.costUsd ? "green" : "dimmed"}>
-												{record.costUsd != null ? `$${record.costUsd.toFixed(6)}` : "-"}
+												{formatReferenceCost(record, record.costUsd, {
+													unknown: t("usageCostUnknown"),
+													partial: t("usageCostPartial"),
+												})}
 											</Text>
 										)}
 									</Table.Td>

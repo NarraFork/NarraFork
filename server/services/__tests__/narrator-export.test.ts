@@ -613,6 +613,21 @@ describe("markdown rendering", () => {
 });
 
 describe("json completeness", () => {
+	test("partial reference cost metadata is exported with its known amount", async () => {
+		seedNarrator("n1");
+		await seedMessage({ id: "m1", narratorId: "n1", seq: 1 });
+		sqlite
+			.prepare(
+				"UPDATE narrator_messages SET cost_usd=0, cost_status='partial', cost_missing_fields='[\"output\"]' WHERE id='m1'",
+			)
+			.run();
+		const parsed = JSON.parse(await collect("n1", { format: "json" }));
+		expect(parsed.messages[0]).toMatchObject({
+			costUsd: 0,
+			costStatus: "partial",
+			costMissingFields: ["output"],
+		});
+	});
 	test("a successful export parses and ends with the sentinel", async () => {
 		seedNarrator("n1", { title: "My session" });
 		await seedMessage({ id: "m1", narratorId: "n1", seq: 1, role: "user", contentText: "hello" });

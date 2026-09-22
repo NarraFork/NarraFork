@@ -903,6 +903,23 @@ describe("GitPanel", () => {
 		};
 	}
 
+	test("mounted Git queries do not schedule interval polling", async () => {
+		const { queryClient } = await renderNarratorWorkspace(readyWorkspace());
+		const queries = queryClient
+			.getQueryCache()
+			.getAll()
+			.filter((query) => String(query.queryKey[0]).startsWith("git"));
+		expect(queries.length).toBeGreaterThan(0);
+		for (const query of queries) {
+			for (const observer of query.observers) {
+				const interval = observer.options.refetchInterval;
+				if (typeof interval === "function") expect(interval(query)).toBe(false);
+				else expect(interval).toBeUndefined();
+			}
+		}
+		queryClient.clear();
+	});
+
 	test("standalone narrator with context project exposes the full workspace panel", async () => {
 		const { container, queryClient, calls } = await renderNarratorWorkspace(readyWorkspace());
 		// The compact SCM layout no longer spends permanent vertical space on device,

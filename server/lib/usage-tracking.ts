@@ -1,7 +1,11 @@
 import { db } from "@server/db";
 import { narratorMessages, narratorToolCalls } from "@server/db/schema";
 import { eq } from "drizzle-orm";
-import { resolveModelPricing } from "./model-pricing";
+import type { CostEstimate } from "./cost-estimate";
+import type { ReferencePricingSnapshot } from "@shared/agent-protocol/types";
+import { type PriceField, referencePriceNumber, resolveModelPricing, pricingFromReferenceSnapshot } from "./model-pricing";
+
+export type { CostData, CostEstimate, CostStatus } from "./cost-estimate";
 
 export interface UsageData {
 	inputTokens: number;
@@ -11,14 +15,6 @@ export interface UsageData {
 	cacheCreation5mInputTokens?: number;
 	cacheCreation1hInputTokens?: number;
 	reasoningTokens?: number;
-}
-
-export interface CostData {
-	inputCost: number;
-	outputCost: number;
-	cacheCreationCost: number;
-	cacheReadCost: number;
-	totalCost: number;
 }
 
 export function buildUsageDataFromSnapshot(snapshot?: {
@@ -60,18 +56,10 @@ export function buildUsageDataFromSnapshot(snapshot?: {
  * `cache_read_input_tokens` and `cache_creation_input_tokens`, so subtracting
  * would undercount.
  *
- * This set describes token *semantics*, not price coverage: `gemini` and
- * `nug` are listed because that is how they report usage, even though
- * `model-pricing.ts` only ships rows for the gpt/claude families. Until an
- * operator adds overrides those requests resolve to no price at all and this
- * subtraction never runs for them — which is intended, not an oversight.
+ * This set describes token semantics, not price coverage. Every provider's
+ * reference price comes from the effective catalog; NUG actual billing stays separate.
  */
-const PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT = new Set([
-	"openai",
-	"codex",
-	"nug",
-	"gemini",
-]);
+const PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT = new Set(["openai", "codex", "nug", "gemini"]);
 
 /**
  * Attribute a USD cost to one request's token usage using the official
@@ -82,28 +70,93 @@ const PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT = new Set([
  * ChatGPT plan) the figure is what the same tokens would have
  * cost through the metered API, not an amount actually billed.
  */
-export function calculateCost(usage: UsageData, provider: string, model: string): CostData | null {
-	const pricing = resolveModelPricing(model);
-	if (!pricing) return null;
+export function calculateCost(
+	usage: UsageData,
+	provider: string,
+	model: string,
+): CostEstimate | null {
+	const estimate = calculateCostDetailed(usage, provider, model);
+	// Compatibility callers cannot accidentally present a partial amount as the whole cost.
+	return estimate.status === "complete" ? estimate : null;
+}
 
-	const cachedInputTokens = Math.max(0, usage.cachedInputTokens || 0);
-	const cacheCreationTokens = Math.max(0, usage.cacheCreationInputTokens || 0);
-	const reportedInput = Math.max(0, usage.inputTokens || 0);
-	const uncachedInputTokens = PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT.has(provider.toLowerCase())
-		? Math.max(0, reportedInput - cachedInputTokens)
-		: reportedInput;
-
-	const inputCost = (uncachedInputTokens / 1_000_000) * pricing.input;
-	const outputCost = (Math.max(0, usage.outputTokens || 0) / 1_000_000) * pricing.output;
-	const cacheReadCost = (cachedInputTokens / 1_000_000) * pricing.cacheRead;
-	const cacheCreationCost = (cacheCreationTokens / 1_000_000) * pricing.cacheWrite;
-
+export function calculateCostDetailed(
+	usage: UsageData,
+	provider: string,
+	model: string,
+	snapshot?: ReferencePricingSnapshot,
+): CostEstimate {
+	// An explicit unknown snapshot must never fall back to a newly published price.
+	const pricing = snapshot === undefined ? resolveModelPricing(model) : pricingFromReferenceSnapshot(snapshot);
+	const tokens = (value?: number) =>
+		typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
+	const cacheRead = tokens(usage.cachedInputTokens);
+	const cacheWrite = Math.max(
+		tokens(usage.cacheCreationInputTokens),
+		tokens(usage.cacheCreation5mInputTokens) + tokens(usage.cacheCreation1hInputTokens),
+	);
+	const reportedInput = tokens(usage.inputTokens);
+	const inclusive = PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT.has(provider.toLowerCase());
+	const input = inclusive ? Math.max(0, reportedInput - cacheRead) : reportedInput;
+	const promptTokens = inclusive
+		? reportedInput + cacheWrite
+		: reportedInput + cacheRead + cacheWrite;
+	const counts: Record<PriceField, number> = {
+		input,
+		output: tokens(usage.outputTokens),
+		cacheRead,
+		cacheWrite,
+	};
+	const missingFields: string[] = [];
+	let knownComponents = 0;
+	const tier = pricing?.longContext;
+	const threshold = tier?.thresholdTokens;
+	const above = typeof threshold === "number" && promptTokens > threshold;
+	const costs: Record<PriceField, number> = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+	const add = (field: PriceField, count: number, price: number | null | undefined, prefix = "") => {
+		if (count <= 0) return;
+		if (price == null) missingFields.push(`${prefix}${field}`);
+		else {
+			costs[field] += (count * price) / 1_000_000;
+			knownComponents++;
+		}
+	};
+	for (const field of Object.keys(counts) as PriceField[]) {
+		if (tier && typeof threshold !== "number") {
+			add(field, counts[field], null, "longContext.");
+			if (counts[field] > 0) missingFields.push("longContext.thresholdTokens");
+		} else if (!above) add(field, counts[field], pricing?.[field]);
+		else if (!tier?.mode || tier.basis !== "promptTokens") {
+			// An unspecified tier rule cannot silently fall back to cheaper base prices.
+			add(field, counts[field], null, "longContext.");
+		} else if (tier.mode === "full") {
+			// Only absence inherits the base tier: explicit null stays unknown and zero stays free.
+			const rate = tier[field] === undefined ? pricing?.[field] : referencePriceNumber(tier[field]);
+			add(field, counts[field], rate, "longContext.");
+		} else {
+			// Marginal output allocation is a gateway operator policy, not a verified
+			// vendor reference rule. Do not fabricate a complete estimate from it.
+			add(field, counts[field], null, "longContext.");
+			if (counts[field] > 0) missingFields.push("longContext.mode");
+		}
+	}
+	// Zero usage alone is not evidence that an unknown model is free.
+	if (!Object.values(counts).some((value) => value > 0)) {
+		for (const field of Object.keys(counts) as PriceField[]) {
+			if (pricing?.[field] == null) missingFields.push(field);
+			else knownComponents++;
+		}
+	}
+	const knownCost = Object.values(costs).reduce((sum, amount) => sum + amount, 0);
 	return {
-		inputCost,
-		outputCost,
-		cacheCreationCost,
-		cacheReadCost,
-		totalCost: inputCost + outputCost + cacheCreationCost + cacheReadCost,
+		status: missingFields.length ? (knownComponents ? "partial" : "unknown") : "complete",
+		knownCost,
+		missingFields: [...new Set(missingFields)],
+		inputCost: costs.input,
+		outputCost: costs.output,
+		cacheReadCost: costs.cacheRead,
+		cacheCreationCost: costs.cacheWrite,
+		totalCost: knownCost,
 	};
 }
 
@@ -116,7 +169,7 @@ export async function updateToolCallUsage(
 	provider: string,
 	model: string,
 ): Promise<void> {
-	const cost = calculateCost(usage, provider, model);
+	const cost = calculateCostDetailed(usage, provider, model);
 
 	const updateData: Record<string, unknown> = {
 		inputTokens: usage.inputTokens,
@@ -127,6 +180,8 @@ export async function updateToolCallUsage(
 		cacheCreation1hTokens: usage.cacheCreation1hInputTokens || 0,
 		provider,
 		model,
+		costStatus: cost.status,
+		costMissingFields: cost.missingFields,
 	};
 
 	if (cost) {
@@ -146,7 +201,7 @@ export async function updateMessageUsage(
 	provider: string,
 	model: string,
 ): Promise<void> {
-	const cost = calculateCost(usage, provider, model);
+	const cost = calculateCostDetailed(usage, provider, model);
 	await db
 		.update(narratorMessages)
 		.set({
@@ -159,7 +214,9 @@ export async function updateMessageUsage(
 			cacheCreation5mTokens: usage.cacheCreation5mInputTokens ?? 0,
 			cacheCreation1hTokens: usage.cacheCreation1hInputTokens ?? 0,
 			reasoningTokens: usage.reasoningTokens ?? 0,
-			...(cost ? { costUsd: cost.totalCost } : {}),
+			costUsd: cost.status === "unknown" ? null : cost.knownCost,
+			costStatus: cost.status,
+			costMissingFields: cost.missingFields,
 		})
 		.where(eq(narratorMessages.id, messageId));
 }

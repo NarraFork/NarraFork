@@ -287,6 +287,7 @@ export interface GitDiffParams {
 export interface ExecutionBackend {
 	/** Feature-negotiated structured remote Git; absent on local/legacy backends. */
 	readonly supportsGitWorkspace?: boolean;
+	readonly supportsGitWorkspaceWatch?: boolean;
 	gitWorkspace?(request: GitWorkspaceRequest, signal?: AbortSignal): Promise<GitWorkspaceResult>;
 	readonly deviceId: string;
 	readonly kind: "local" | "remote";

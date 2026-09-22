@@ -88,6 +88,7 @@ import {
 	ToolTimingArea,
 	type ToolTimingLabels,
 } from "./RenderToolCall";
+import { subagentFilePathDisplays } from "./subagent-file-paths";
 import {
 	hasToolRowStatusMark,
 	isTerminalToolRowStatus,
@@ -949,6 +950,7 @@ function SubagentBody({
 	// File changes: what the child wrote to disk. Rows reuse the recent-call geometry
 	// (one truncating xs mono line each), so the measured height is row count × line.
 	if (measured.fileChangesHeight > 0 && fileChanges) {
+		const fileDisplays = subagentFilePathDisplays(fileChanges.files, labels);
 		const rows = fileChanges.files.slice(0, measured.fileChangeRowCount);
 		const hidden = Math.max(0, fileChanges.totalFiles - rows.length);
 		const canToggle = fileChanges.files.length > FILE_CHANGE_MAX_ROWS && !!onToggleFileChanges;
@@ -1011,36 +1013,39 @@ function SubagentBody({
 					</Text>
 				) : null}
 				<div style={{ display: "flex", flexDirection: "column", gap: FILE_CHANGE_STACK_GAP }}>
-					{rows.map((file) => (
+					{rows.map((file, index) => (
 						<Group
 							key={subagentFileChangeIdentityKey(file)}
 							data-testid="subagent-file-change"
 							data-file-identity={subagentFileChangeIdentityKey(file)}
+							title={fileDisplays[index].title}
 							gap={6}
 							wrap="nowrap"
 							style={{ ...rowStyle, overflow: "hidden" }}
 						>
+							{fileDisplays[index].location ? (
+								<Text
+									data-testid="subagent-file-location"
+									size="xs"
+									c="dimmed"
+									truncate
+									ff="monospace"
+									style={{ flex: "0 1 auto", minWidth: 0, maxWidth: "40%" }}
+									title={fileDisplays[index].title}
+								>
+									{fileDisplays[index].location}
+								</Text>
+							) : null}
 							<Text
-								data-testid="subagent-file-location"
-								size="xs"
-								c="dimmed"
-								truncate
-								ff="monospace"
-								style={{ flex: "0 1 auto", minWidth: 0, maxWidth: "40%" }}
-								title={`${file.deviceId || labels.unknownDevice} · ${file.workspacePath || labels.unknownWorkspace}`}
-							>
-								{file.deviceId || labels.unknownDevice} ·{" "}
-								{file.workspacePath || labels.unknownWorkspace}
-							</Text>
-							<Text
+								data-testid="subagent-file-path"
 								size="xs"
 								c="dimmed"
 								truncate
 								ff="monospace"
 								style={{ flex: "0 1 auto", minWidth: 0 }}
-								title={file.filePath}
+								title={fileDisplays[index].title}
 							>
-								{file.filePath}
+								{fileDisplays[index].path}
 							</Text>
 							{/* Same green/red plain text the tool cards use, so one file reads
 						    identically wherever it appears. */}

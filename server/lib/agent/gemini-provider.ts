@@ -17,6 +17,12 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
+import {
+	assertModelInputModalities,
+	effectiveProviderMetadata,
+	resolveMetadataReasoning,
+	resolveOutputTokenLimit,
+} from "./provider-model-metadata";
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
@@ -260,7 +266,13 @@ export class GeminiProvider implements ProviderAdapter {
 		const tools = params.tools as Array<{ functionDeclarations: GeminiFunctionDeclaration[] }>;
 
 		const generationConfig: Record<string, unknown> = {};
-		const thinkingConfig = mapReasoningEffortToThinking(params.reasoningEffort);
+		const metadata = effectiveProviderMetadata(params.model);
+		const maxOutputTokens = resolveOutputTokenLimit(metadata, params.maxOutputTokens);
+		if (maxOutputTokens !== undefined) generationConfig.maxOutputTokens = maxOutputTokens;
+		const thinkingConfig = mapReasoningEffortToThinking(
+			resolveMetadataReasoning(metadata, params.reasoningEffort),
+			metadata.reasoning?.mode,
+		);
 		if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
 
 		const body: Record<string, unknown> = { contents };
@@ -274,6 +286,7 @@ export class GeminiProvider implements ProviderAdapter {
 			body.generationConfig = generationConfig;
 		}
 
+		assertModelInputModalities(params.model, body, metadata);
 		const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
 		const headers: Record<string, string> = {
 			"Content-Type": "application/json",
@@ -502,6 +515,7 @@ export class GeminiProvider implements ProviderAdapter {
 			userText: text,
 			signal: options?.signal,
 			reasoningEffort: options?.reasoningEffort,
+			maxOutputTokens: options?.maxOutputTokens,
 			onTextDelta: options?.onTextDelta,
 			onReasoningDelta: options?.onReasoningDelta,
 		});
@@ -538,6 +552,7 @@ export class GeminiProvider implements ProviderAdapter {
 			userText: `${reminder}\n\n${content}`,
 			signal: options?.signal,
 			reasoningEffort: options?.reasoningEffort,
+			maxOutputTokens: options?.maxOutputTokens,
 			onTextDelta: options?.onTextDelta,
 			onReasoningDelta: options?.onReasoningDelta,
 		});
@@ -551,6 +566,7 @@ export class GeminiProvider implements ProviderAdapter {
 		userText: string;
 		signal?: AbortSignal;
 		reasoningEffort?: ChatParams["reasoningEffort"];
+		maxOutputTokens?: number;
 		onTextDelta?: GenerateOptions["onTextDelta"];
 		onReasoningDelta?: GenerateOptions["onReasoningDelta"];
 	}): Promise<GenerateMetaResult> {
@@ -564,8 +580,17 @@ export class GeminiProvider implements ProviderAdapter {
 		if (opts.systemInstruction) {
 			body.systemInstruction = { parts: [{ text: opts.systemInstruction }] };
 		}
-		const thinkingConfig = mapReasoningEffortToThinking(opts.reasoningEffort);
-		if (thinkingConfig) body.generationConfig = { thinkingConfig };
+		const metadata = effectiveProviderMetadata(opts.model);
+		const thinkingConfig = mapReasoningEffortToThinking(
+			resolveMetadataReasoning(metadata, opts.reasoningEffort),
+			metadata.reasoning?.mode,
+		);
+		const maxOutputTokens = resolveOutputTokenLimit(metadata, opts.maxOutputTokens);
+		if (thinkingConfig || maxOutputTokens !== undefined)
+			body.generationConfig = {
+				...(thinkingConfig && { thinkingConfig }),
+				...(maxOutputTokens !== undefined && { maxOutputTokens }),
+			};
 
 		const bodyText = JSON.stringify(body);
 		assertByteLimit(bodyText, GEMINI_GENERATE_MAX_STREAM_BYTES, "request body");
@@ -1140,11 +1165,16 @@ function splitSystemAndContents(history: GeminiHistoryItem[]): {
  * - undefined        → let the model decide (omit config)
  */
 function mapReasoningEffortToThinking(
-	effort: ChatParams["reasoningEffort"] | undefined,
+	effort: string | undefined,
+	mode?: string | null,
 ): { includeThoughts?: boolean; thinkingLevel?: string; thinkingBudget?: number } | undefined {
 	if (!effort) return undefined;
 	if (effort === "none") return { thinkingBudget: 0 };
-	const levelMap: Record<string, "low" | "medium" | "high"> = {
+	// Budget-only models do not accept thinkingLevel. Retain their upstream
+	// budget default instead of inventing numeric budgets from semantic levels.
+	if (mode === "budget") return { includeThoughts: true };
+	const levelMap: Record<string, "minimal" | "low" | "medium" | "high"> = {
+		minimal: "minimal",
 		low: "low",
 		medium: "medium",
 		high: "high",

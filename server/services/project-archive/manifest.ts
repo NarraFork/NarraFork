@@ -194,6 +194,8 @@ export const ARCHIVE_COLUMNS: Readonly<Record<ArchiveTable, readonly string[]>> 
 		"content_text",
 		"tokens_in",
 		"cost_usd",
+		"cost_status",
+		"cost_missing_fields",
 		"turn_usage_json",
 		"provider",
 		"model",

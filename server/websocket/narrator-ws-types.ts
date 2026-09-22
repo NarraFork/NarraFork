@@ -57,6 +57,7 @@ export interface RecentTabsSnapshotMessage {
 
 // Server → Client messages
 export type NarratorServerMessage =
+	| import("@shared/git-workspace-events").GitWorkspaceServerMessage
 	/** No narrator identifiers or payloads; clients re-fetch their ACL-filtered inbox. */
 	| { type: "human_attention_changed" }
 	/** Per-user activity invalidation; no titles, previews or source identifiers. */

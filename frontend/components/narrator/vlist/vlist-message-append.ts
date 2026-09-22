@@ -27,7 +27,7 @@
  * Pure: no React, no DOM, no network.
  */
 
-import { mergeToolLifecycleRecord } from "@shared/tool-row-status";
+import { mergeToolRecordWithSubagentActivity } from "../message/message-tree-utils";
 import { contentBlockIdentity } from "../streaming/streaming-block-supersede";
 
 /** The subset of a message this module reads. */
@@ -198,7 +198,7 @@ export function upsertLoadedMessage<T extends AppendCandidate>(
 				if (candidate?.type === "tool_use" && typeof candidate.id === "string") {
 					const prior = previousTools.get(candidate.id);
 					if (prior) {
-						return mergeToolLifecycleRecord(prior, block);
+						return mergeToolRecordWithSubagentActivity(prior, block);
 					}
 				}
 				return block;
@@ -216,7 +216,7 @@ export function upsertLoadedMessage<T extends AppendCandidate>(
 					const id = (call as { toolUseId?: unknown } | null)?.toolUseId;
 					const prior = typeof id === "string" ? previousToolCalls.get(id) : undefined;
 					if (!prior) return call;
-					return mergeToolLifecycleRecord(prior, call);
+					return mergeToolRecordWithSubagentActivity(prior, call);
 				})
 			: previous.toolCalls;
 		const messages = [...loaded];

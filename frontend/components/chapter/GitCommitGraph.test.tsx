@@ -25,7 +25,7 @@ import {
 	GIT_GRAPH_HEIGHT_MIN,
 } from "../../hooks/useGitGraphHeight";
 import { api } from "../../lib/api";
-import type { GitLogEntry } from "../../lib/api/git";
+import type { GitLogEntry, GitTarget } from "../../lib/api/git";
 import commonLocale from "../../locales/en/common.json";
 import gitLocale from "../../locales/en/git.json";
 import { GRAPH_PAGE_SIZE } from "./git-graph-layout";
@@ -225,7 +225,7 @@ function textOf(container: HTMLElement): string {
 	return container.textContent ?? "";
 }
 
-function renderGraph(target: string, queryClient?: QueryClient) {
+function renderGraph(target: GitTarget, queryClient?: QueryClient) {
 	const qc =
 		queryClient ??
 		new QueryClient({
@@ -237,16 +237,18 @@ function renderGraph(target: string, queryClient?: QueryClient) {
 	const container = document.createElement("div");
 	document.body.appendChild(container);
 	root = createRoot(container);
-	root.render(
-		<I18nextProvider i18n={i18n}>
-			<MantineProvider>
-				<QueryClientProvider client={qc}>
-					<GitCommitGraph target={target} />
-				</QueryClientProvider>
-			</MantineProvider>
-		</I18nextProvider>,
-	);
-	return { container, queryClient: qc };
+	const rerender = (nextTarget: GitTarget) =>
+		root?.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider>
+					<QueryClientProvider client={qc}>
+						<GitCommitGraph target={nextTarget} />
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+	rerender(target);
+	return { container, queryClient: qc, rerender };
 }
 
 function makeQueryClient(chapterId: string) {
@@ -791,5 +793,153 @@ describe("GitCommitGraph workspace switch", () => {
 		expect(textOf(container)).not.toContain("only in repo A");
 
 		qc.clear();
+	});
+});
+
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	let reject!: (reason: Error) => void;
+	const promise = new Promise<T>((res, rej) => {
+		resolve = res;
+		reject = rej;
+	});
+	return { promise, resolve, reject };
+}
+
+describe("GitCommitGraph query lifecycle", () => {
+	beforeEach(async () => {
+		installDom();
+		__resetGitGraphCollapsedCache();
+		__resetGitGraphHeightCache();
+		await initTestI18n();
+	});
+
+	afterEach(() => {
+		root?.unmount();
+		root = undefined;
+		restoreGitApi?.();
+		restoreGitApi = undefined;
+	});
+
+	test("equivalent target objects do not refetch on parent renders", async () => {
+		const target = { narratorId: "n", workspaceKey: "workspace", canWrite: true };
+		const calls = stubGitApi();
+		const { container, queryClient, rerender } = renderGraph(target);
+		await waitFor(() => textOf(container).includes("feat: stage commit graph"));
+		for (let i = 0; i < 5; i++) {
+			rerender({ ...target });
+			await flushRender();
+		}
+		expect(calls).toHaveLength(1);
+		queryClient.clear();
+	});
+
+	test("background invalidation leaves refresh idle; manual refresh spins and disables", async () => {
+		stubGitApi();
+		const { container, queryClient } = renderGraph("refresh-states");
+		await waitFor(() => textOf(container).includes("feat: stage commit graph"));
+		const background = deferred<GitLogEntry[]>();
+		api.getGitLog = async () => background.promise;
+		const invalidation = queryClient.invalidateQueries({ queryKey: ["gitLog"] });
+		await waitFor(() => queryClient.isFetching({ queryKey: ["gitLog"] }) === 1);
+		await flushRender();
+		const button = () => container.querySelector('[aria-label="Refresh graph"]');
+		expect(button()?.hasAttribute("disabled")).toBe(false);
+		expect(button()?.hasAttribute("data-loading")).toBe(false);
+		expect(textOf(container)).toContain("feat: stage commit graph");
+		background.resolve(makeCommits());
+		await invalidation;
+		await flushRender();
+
+		const manual = deferred<GitLogEntry[]>();
+		api.getGitLog = async () => manual.promise;
+		button()?.dispatchEvent(new Event("click", { bubbles: true }));
+		await waitFor(() => button()?.hasAttribute("data-loading") === true);
+		expect(button()?.hasAttribute("disabled")).toBe(true);
+		manual.resolve(makeCommits());
+		await waitFor(() => !button()?.hasAttribute("data-loading"));
+		queryClient.clear();
+	});
+
+	test("initially collapsed graph never starts a log request", async () => {
+		localStorageRef?.set(GIT_GRAPH_COLLAPSED_KEY, JSON.stringify({ "starts-collapsed": true }));
+		__resetGitGraphCollapsedCache();
+		const calls = stubGitApi();
+		const { container, queryClient } = renderGraph("starts-collapsed");
+		await waitFor(() => !!container.querySelector('[aria-label="Expand graph"]'));
+		await queryClient.invalidateQueries({ queryKey: ["gitLog"] });
+		await flushRender();
+		expect(calls).toHaveLength(0);
+		queryClient.clear();
+	});
+
+	test("collapsed graph defers invalidation until expanded", async () => {
+		const calls = stubGitApi();
+		const { container, queryClient } = renderGraph("collapsed-invalidations");
+		await waitFor(() => textOf(container).includes("feat: stage commit graph"));
+		headerByLabel(container, "Collapse graph").click();
+		await waitFor(() => !!container.querySelector('[aria-label="Expand graph"]'));
+		await queryClient.invalidateQueries({ queryKey: ["gitLog"] });
+		await flushRender();
+		expect(calls).toHaveLength(1);
+		headerByLabel(container, "Expand graph").click();
+		await waitFor(() => calls.length === 2);
+		queryClient.clear();
+	});
+
+	for (const outcome of ["resolve", "reject"] as const) {
+		test(`ignores old pagination ${outcome} after workspace switch`, async () => {
+			stubGitApi({ commits: makeLongHistory(GRAPH_PAGE_SIZE + 1) });
+			const pending = deferred<GitLogEntry[]>();
+			const originalLog = api.getGitLog;
+			let signal: AbortSignal | undefined;
+			api.getGitLog = async (target, limit, skip, requestSignal) => {
+				if (skip) {
+					signal = requestSignal;
+					return pending.promise;
+				}
+				return target === "old-workspace" ? originalLog(target, limit, skip) : makeCommits();
+			};
+			const { container, queryClient, rerender } = renderGraph("old-workspace");
+			await waitFor(() => hasButton(container, "Load More"));
+			buttonByText(container, "Load More").click();
+			await waitFor(() => !!signal);
+			await flushRender();
+			const refresh = container.querySelector('[aria-label="Refresh graph"]');
+			expect(refresh?.hasAttribute("data-loading")).toBe(false);
+			expect(refresh?.hasAttribute("disabled")).toBe(false);
+			rerender("new-workspace");
+			await waitFor(() => textOf(container).includes("feat: stage commit graph"));
+			expect(signal?.aborted).toBe(true);
+			if (outcome === "resolve") pending.resolve(makeLongHistory(GRAPH_PAGE_SIZE + 1).slice(-1));
+			else pending.reject(new Error("old pagination failed"));
+			await flushRender();
+			await flushRender();
+			expect(textOf(container)).not.toContain(`commit ${GRAPH_PAGE_SIZE}`);
+			expect(textOf(container)).not.toContain("old pagination failed");
+			expect(textOf(container)).toContain("feat: stage commit graph");
+			queryClient.clear();
+		});
+	}
+
+	test("first-page invalidation discards pending and loaded older pages", async () => {
+		stubGitApi({ commits: makeLongHistory(GRAPH_PAGE_SIZE * 3) });
+		const { container, queryClient } = renderGraph("pagination-refresh");
+		await waitFor(() => hasButton(container, "Load More"));
+		buttonByText(container, "Load More").click();
+		await waitFor(() => textOf(container).includes(`commit ${GRAPH_PAGE_SIZE}`));
+		const pending = deferred<GitLogEntry[]>();
+		api.getGitLog = async (_target, _limit, skip) => (skip ? pending.promise : makeCommits());
+		buttonByText(container, "Load More").click();
+		await flushRender();
+		await queryClient.invalidateQueries({ queryKey: ["gitLog"] });
+		await waitFor(() => textOf(container).includes("feat: stage commit graph"));
+		pending.resolve(makeLongHistory(GRAPH_PAGE_SIZE * 3).slice(GRAPH_PAGE_SIZE * 2));
+		await flushRender();
+		await flushRender();
+		expect(textOf(container)).not.toContain(`commit ${GRAPH_PAGE_SIZE}`);
+		expect(textOf(container)).not.toContain(`commit ${GRAPH_PAGE_SIZE * 2}`);
+		expect(hasButton(container, "Load More")).toBe(false);
+		queryClient.clear();
 	});
 });

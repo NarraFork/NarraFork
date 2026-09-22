@@ -102,6 +102,85 @@ function expectHeightParity(root: HTMLElement, height: number) {
 }
 
 describe("subagent file-change rendering", () => {
+	it("shows only relative paths in one known workspace, with full location in titles", () => {
+		const workspacePath = "/home/user/project";
+		const files = ["src/relative.ts", `${workspacePath}/src/absolute.ts`].map((filePath) => ({
+			...FILE,
+			deviceId: "local",
+			workspacePath,
+			filePath,
+		}));
+		const { root, measured } = render(changes({ files, totalFiles: files.length }));
+		expect(root.querySelector('[data-testid="subagent-file-location"]')).toBeNull();
+		const rows = [...root.querySelectorAll<HTMLElement>('[data-testid="subagent-file-change"]')];
+		expect(
+			rows.map((row) => row.querySelector('[data-testid="subagent-file-path"]')?.textContent),
+		).toEqual(["src/relative.ts", "src/absolute.ts"]);
+		for (const [index, row] of rows.entries()) {
+			const path = row.querySelector('[data-testid="subagent-file-path"]');
+			if (!path) throw new Error("missing file path");
+			expect(path.getAttribute("title")).toBe(
+				`local · ${workspacePath} · ${workspacePath}/${path.textContent}`,
+			);
+			expect(row.getAttribute("title")).toBe(path.getAttribute("title"));
+			expect(row.textContent).not.toContain(workspacePath);
+			expect(row.textContent).not.toContain("local");
+			expect(row.textContent).toContain("+3");
+			expect(row.textContent).toContain("-1");
+			expect(row.textContent).toContain("2 edits");
+			expect(JSON.parse(row.getAttribute("data-file-identity") ?? "[]")).toEqual([
+				"child",
+				"local",
+				workspacePath,
+				files[index].filePath,
+			]);
+			expect(Number.parseFloat(row.style.height)).toBe(measured.fileChangeRowHeight);
+			expect(row.getAttribute("style")).toContain("overflow:hidden");
+			expect(row.getAttribute("style")).toContain("--group-wrap:nowrap");
+			expect(path.getAttribute("data-truncate")).toBe("end");
+		}
+		expectHeightParity(root, measured.fileChangesHeight);
+	});
+
+	it("disambiguates against hidden workspaces before expansion without renaming visible rows", () => {
+		const files = Array.from({ length: 7 }, (_, index) => ({
+			...FILE,
+			deviceId: index === 6 ? "remote-b" : "remote-a",
+			workspacePath: index < 5 ? "/home/alice/project" : "/home/bob/project",
+			filePath: `src/${index}.ts`,
+		}));
+		const payload = changes({ files, totalFiles: files.length });
+		const closed = render(payload);
+		const open = render(payload, true);
+		const locations = (root: HTMLElement) =>
+			[...root.querySelectorAll('[data-testid="subagent-file-location"]')].map(
+				(row) => row.textContent,
+			);
+		expect(locations(closed.root)).toEqual(Array(5).fill("remote-a · alice/project"));
+		expect(locations(open.root).slice(0, 5)).toEqual(locations(closed.root));
+		expect(locations(open.root).slice(5)).toEqual([
+			"remote-a · bob/project",
+			"remote-b · bob/project",
+		]);
+		expect(closed.measured.fileChangeRowCount).toBe(FILE_CHANGE_MAX_ROWS);
+		expect(open.measured.fileChangeRowCount).toBe(7);
+		expectHeightParity(closed.root, closed.measured.fileChangesHeight);
+		expectHeightParity(open.root, open.measured.fileChangesHeight);
+	});
+
+	it("does not shorten an outside look-alike directory or suppress its warning", () => {
+		const filePath = "/repo-copy/src/file.ts";
+		const { root, measured } = render(
+			changes({ files: [{ ...FILE, filePath, outsideParentWorkspace: true }] }),
+		);
+		expect(root.querySelector('[data-testid="subagent-file-path"]')?.textContent).toBe(filePath);
+		expect(root.textContent).toContain("outside this workspace");
+		expect(root.querySelector('[data-testid="subagent-file-change"]')?.getAttribute("title")).toBe(
+			`remote-a · /repo · ${filePath}`,
+		);
+		expectHeightParity(root, measured.fileChangesHeight);
+	});
+
 	it("keeps same-path rows on different devices/workspaces independent", () => {
 		const files = [FILE, { ...FILE, deviceId: "remote-b" }, { ...FILE, workspacePath: "/other" }];
 		const { root, measured } = render(changes({ files, totalFiles: files.length }));
@@ -110,7 +189,7 @@ describe("subagent file-change rendering", () => {
 		expect(new Set(rows.map((row) => row.getAttribute("data-file-identity"))).size).toBe(3);
 		expect(
 			rows.map((row) => row.querySelector('[data-testid="subagent-file-location"]')?.textContent),
-		).toEqual(["remote-a · /repo", "remote-b · /repo", "remote-a · /other"]);
+		).toEqual(["remote-a · repo", "remote-b · repo", "remote-a · other"]);
 		expectHeightParity(root, measured.fileChangesHeight);
 	});
 

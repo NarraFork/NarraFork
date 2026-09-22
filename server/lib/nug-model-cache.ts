@@ -2,6 +2,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { getNarraforkHome } from "./narrafork-home";
 import type { NUGProviderConfig } from "./settings/types";
+import type { ResolvedModelMetadata } from "@shared/model-catalog/schema/catalog";
+import { validateMetadata } from "@shared/model-catalog/src/index";
 
 const cacheDir = getNarraforkHome();
 const cachePath = resolve(cacheDir, "nug-models-providers.json");
@@ -18,6 +20,7 @@ export interface NugModelInfo extends Record<string, unknown> {
 	contextLength?: number;
 	contextWindow?: number;
 	effortLevels?: string[];
+	metadata?: ResolvedModelMetadata;
 }
 
 export interface ResolvedNugModelMeta {
@@ -32,6 +35,7 @@ export interface ResolvedNugModelMeta {
 	available?: boolean;
 	contextWindow?: number;
 	effortLevels?: string[];
+	metadata?: ResolvedModelMetadata;
 }
 
 export interface NugModelsGroup {
@@ -73,6 +77,14 @@ function toNugModelInfo(raw: Record<string, unknown>): NugModelInfo | null {
 	const id = String(raw.id ?? "").trim();
 	if (!id) return null;
 	const info: NugModelInfo = { ...raw, id };
+	// A malformed or future envelope must not turn missing capabilities into false.
+	delete info.metadata;
+	if (raw.metadata && typeof raw.metadata === "object") {
+		const envelope = raw.metadata as ResolvedModelMetadata;
+		if (envelope.schemaVersion === 1) {
+			try { info.metadata = { ...envelope, metadata: validateMetadata(envelope.metadata) }; } catch { /* compatibility projection remains usable */ }
+		}
+	}
 	if (raw.model != null) info.model = String(raw.model);
 	if (raw.name != null) info.name = String(raw.name);
 	if (raw.channel != null) info.channel = String(raw.channel);
@@ -440,6 +452,7 @@ export function resolveNugModelMeta(
 			available: hit.available,
 			contextWindow: hit.contextWindow ?? hit.contextLength,
 			effortLevels: hit.effortLevels,
+			metadata: hit.metadata,
 		};
 	}
 

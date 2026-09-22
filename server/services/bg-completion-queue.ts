@@ -23,7 +23,7 @@ export interface CompletedBgSubagentNotification {
 	title: string;
 	status: string;
 	resultPreview: string;
-	/** Capped full result used when waking an idle parent narrator. */
+	/** Capped result included for both busy and idle parent narrators. */
 	result?: string;
 	resultTruncated?: boolean;
 	/**
@@ -55,21 +55,27 @@ export function formatBackgroundCompletionNotifications(
 	notifications: CompletedBgSubagentNotification[],
 	options: { includeResult?: boolean } = {},
 ): string {
-	const includeResult = options.includeResult === true;
+	const includeResult = options.includeResult !== false;
 	const lines = notifications.map((task) => {
 		// The id slot doubles as the selector the model is told to reuse, so it must
 		// be the alias whenever one exists.
 		const ref = task.alias ?? task.id;
 		const header = `[System] Background agent "${task.title}" (ID: ${ref}) ${task.status}.`;
-		const fullResult = task.result ?? task.resultPreview;
+		const missing = task.result == null;
+		const truncated =
+			task.resultTruncated || (task.result?.length ?? 0) > MAX_BACKGROUND_RESULT_CHARS;
 		const resultText = includeResult
-			? `Result:\n${fullResult || "(empty)"}${
-					task.resultTruncated
-						? `\n[Result truncated to ${MAX_BACKGROUND_RESULT_CHARS} characters. Use Await({ type: "agent", id: "${ref}" }) to see the stored result.]`
-						: ""
-				}`
+			? missing
+				? "Result snapshot unavailable."
+				: `Result:\n${task.result?.slice(0, MAX_BACKGROUND_RESULT_CHARS) || "(empty)"}${
+						truncated ? `\n[Result truncated to ${MAX_BACKGROUND_RESULT_CHARS} characters.]` : ""
+					}`
 			: `Result preview: ${task.resultPreview || "(empty)"}`;
-		return `${header}\n${resultText}\nUse Await({ type: "agent", id: "${ref}" }) to see the full result, or Send({ id: "${ref}", message }) to continue.`;
+		const supplement =
+			!includeResult || missing || truncated
+				? `\nUse Await({ type: "agent", id: "${ref}" }) to see the stored result.`
+				: "";
+		return `${header}\n${resultText}${supplement}\nUse Send({ id: "${ref}", message }) to continue.`;
 	});
 	return lines.join("\n\n");
 }

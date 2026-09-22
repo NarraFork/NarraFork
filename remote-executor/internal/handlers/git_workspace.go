@@ -184,6 +184,18 @@ func (h *Handlers) checkGitEntryPath(root, path string) (string, error) {
 	return joined, nil
 }
 
+func validateGitFilePath(path string) error {
+	if path == "" || len(path) > 4096 || strings.ContainsAny(path, "\x00\\:") || strings.HasPrefix(path, "/") {
+		return fmt.Errorf("invalid relative Git file path")
+	}
+	for _, part := range strings.Split(path, "/") {
+		if part == ".." || strings.EqualFold(part, ".git") || part == "" || (filepath.Separator == '\\' && (strings.HasSuffix(part, ".") || strings.HasSuffix(part, " "))) {
+			return fmt.Errorf("unsafe relative Git file path")
+		}
+	}
+	return nil
+}
+
 func (h *Handlers) gitFilePaths(g *workspaceGit, root string, params map[string]any) ([]string, error) {
 	raw, present := params["files"]
 	if !present {
@@ -196,13 +208,11 @@ func (h *Handlers) gitFilePaths(g *workspaceGit, root string, params map[string]
 	files := make([]string, 0, len(items))
 	for _, item := range items {
 		path, ok := item.(string)
-		if !ok || path == "" || len(path) > 4096 || strings.ContainsAny(path, "\x00\\:") || strings.HasPrefix(path, "/") {
+		if !ok {
 			return nil, fmt.Errorf("invalid relative Git file path")
 		}
-		for _, part := range strings.Split(path, "/") {
-			if part == ".." || strings.EqualFold(part, ".git") || part == "" || (filepath.Separator == '\\' && (strings.HasSuffix(part, ".") || strings.HasSuffix(part, " "))) {
-				return nil, fmt.Errorf("unsafe relative Git file path")
-			}
+		if err := validateGitFilePath(path); err != nil {
+			return nil, err
 		}
 		joined, err := h.checkGitEntryPath(root, path)
 		if err != nil {
@@ -406,6 +416,10 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 		return nil, fmt.Errorf("Git workspace changed; refresh before retrying")
 	}
 	g.remaining, g.truncated = maxBytes, false
+	// Watch is whole-worktree only; do not let supplied file actions add per-file processes.
+	if _, present := params["files"]; op == "watch" && present {
+		return nil, fmt.Errorf("watch does not accept files")
+	}
 	files, err := h.gitFilePaths(g, root, params)
 	if err != nil {
 		return nil, err
@@ -414,7 +428,7 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 	switch op {
 	case "stage", "unstage", "commit", "discard", "stashPush", "stashPop", "stashDrop", "reset":
 		write = true
-	case "status", "diff", "fullDiff", "log", "stashList":
+	case "watch", "status", "diff", "fullDiff", "log", "stashList":
 	default:
 		return nil, fmt.Errorf("unknown Git workspace operation")
 	}
@@ -464,6 +478,8 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 	g.remaining, g.truncated = maxBytes, false // metadata isn't part of the user-visible output budget
 	var out string
 	switch op {
+	case "watch":
+		return h.gitWorkspaceWatch(g, head)
 	case "status":
 		outputs := map[string]string{"head": strings.TrimSpace(head)}
 		g.remaining = 4096

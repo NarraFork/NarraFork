@@ -25,6 +25,7 @@ import type {
 } from "../lib/agent/execution/backend";
 import {
 	FEATURE_GIT_WORKSPACE_V1,
+	FEATURE_GIT_WORKSPACE_WATCH_V1,
 	GIT_WORKSPACE_MAX_BYTES,
 	GIT_WORKSPACE_TIMEOUT_MS,
 	type GitWorkspaceRequest,
@@ -386,6 +387,13 @@ export class RemoteBackend implements ExecutionBackend {
 
 	get supportsGitWorkspace(): boolean {
 		return hasDeviceProtocolFeature(this.deviceId, FEATURE_GIT_WORKSPACE_V1);
+	}
+
+	get supportsGitWorkspaceWatch(): boolean {
+		return (
+			this.supportsGitWorkspace &&
+			hasDeviceProtocolFeature(this.deviceId, FEATURE_GIT_WORKSPACE_WATCH_V1)
+		);
 	}
 
 	async gitWorkspace(

@@ -19,6 +19,27 @@ function record(
 }
 
 describe("durable user usage", () => {
+	test("unknown, partial, and explicit free costs survive rollup", () => {
+		record("unknown", "alice", { costStatus: "unknown", costUsd: null });
+		expect(listUserUsageTotals(50, undefined, db).records[0]?.costStatus).toBe("unknown");
+		record("partial", "alice", {
+			costStatus: "partial",
+			costUsd: 0.02,
+			costMissingFields: ["output"],
+		});
+		expect(listUserUsageTotals(50, undefined, db).records[0]).toMatchObject({
+			costStatus: "partial",
+			costUsd: 0.02,
+			unpricedRequestCount: 2,
+			partialRequestCount: 1,
+		});
+		record("free", "bob", { costStatus: "complete", costUsd: 0 });
+		expect(listUserUsageTotals(50, undefined, db).records[1]).toMatchObject({
+			costStatus: "complete",
+			costUsd: 0,
+			unpricedRequestCount: 0,
+		});
+	});
 	test("all providers and models roll into the initiating user, never the shared narrator", () => {
 		record("one", "alice", { provider: "openai" });
 		record("two", "alice", {

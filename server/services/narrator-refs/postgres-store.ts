@@ -230,7 +230,16 @@ export async function persistPgMessageWithRef(
 		messageId: created.id,
 		refId,
 		seq,
-		message: { ...created, role: message.role, origin: message.origin ?? null, seq },
+		message: {
+			...created,
+			costStatus: created.costStatus as "complete" | "partial" | "unknown" | null,
+			costMissingFields: Array.isArray(created.costMissingFields)
+				? created.costMissingFields.filter((field): field is string => typeof field === "string")
+				: null,
+			role: message.role,
+			origin: message.origin ?? null,
+			seq,
+		},
 		/** Caller must mark healed only after this section's transaction commits. */
 		needsSeqFloorMark: needsFloor,
 	};

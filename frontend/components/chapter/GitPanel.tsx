@@ -1,13 +1,14 @@
 import { ActionIcon, Alert, Box, Button, Group, Loader, Stack, Text } from "@mantine/core";
 import { IconArrowLeft, IconRefresh } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	type GitTarget,
 	gitWorkspaceTarget,
 	invalidateWorkspaceQueries,
 	useGitWorkspace,
+	useGitWorkspaceSubscription,
 } from "../../hooks/useGit";
 import { gitTargetKey } from "../../lib/api/git";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
@@ -36,7 +37,10 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 	const qc = useQueryClient();
 	const workspaceQuery = useGitWorkspace(narratorId);
 	const workspace = workspaceQuery.data;
-	const target = !workspaceQuery.isError ? gitWorkspaceTarget(narratorId, workspace) : null;
+	const target = useMemo(
+		() => (!workspaceQuery.isError ? gitWorkspaceTarget(narratorId, workspace) : null),
+		[narratorId, workspace, workspaceQuery.isError],
+	);
 
 	if (workspaceQuery.isPending) return <Loader size="sm" />;
 
@@ -91,6 +95,7 @@ function GitPanelContent({
 	const { t } = useTranslation("git");
 	const qc = useQueryClient();
 	const [view, setView] = useState<GitPanelView>("changes");
+	useGitWorkspaceSubscription(target);
 
 	const refresh = () => {
 		if (onRefresh) onRefresh();

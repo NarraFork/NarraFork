@@ -1,3 +1,4 @@
+import type { ReferenceCostSummary } from "../lib/usage-cost";
 /**
  * Pointer left on the dump when the complete copy was written to a file.
  *
@@ -54,7 +55,7 @@ export interface UsageHistoryRawDump {
 	};
 }
 
-export interface UsageHistoryRecord {
+export interface UsageHistoryRecord extends ReferenceCostSummary {
 	id: string;
 	userId?: string | null;
 	username?: string | null;
@@ -89,7 +90,7 @@ export interface UsageHistoryRecord {
 	rawDump?: UsageHistoryRawDump | null;
 }
 
-export interface UsageHistoryStats {
+export interface UsageHistoryStats extends ReferenceCostSummary {
 	totalRequests: number;
 	totalInputTokens: number;
 	totalOutputTokens: number;
@@ -106,7 +107,7 @@ export interface UsageHistoryStats {
 
 export type UsageHistoryGranularity = "hour" | "day" | "month";
 
-export interface UsageHistoryTimeSeriesPoint {
+export interface UsageHistoryTimeSeriesPoint extends ReferenceCostSummary {
 	timestamp: string;
 	requestCount: number;
 	totalInputTokens: number;
@@ -162,7 +163,7 @@ export interface UsageHistoryFilters {
  * consumption, not an amount billed, and `costIsPartial` marks that some
  * requests had no known price.
  */
-export interface CredentialUsageTotals {
+export interface CredentialUsageTotals extends ReferenceCostSummary {
 	provider: string;
 	credentialId: string;
 	requestCount: number;
@@ -219,7 +220,7 @@ export interface UsageHistoryProvidersResponse {
 	providers: string[];
 }
 
-export interface UserUsageTotals {
+export interface UserUsageTotals extends ReferenceCostSummary {
 	userId: string;
 	username: string | null;
 	requestCount: number;

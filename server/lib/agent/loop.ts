@@ -18,6 +18,8 @@ import {
 } from "../boolean-override";
 import { resolveKimiQuotaWait } from "../kimi-quota-wait";
 import { logger } from "../logger";
+import { withModelMetadataSnapshotIterator } from "../model-catalog";
+import { captureReferencePricingSnapshot } from "../model-pricing";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
@@ -2338,7 +2340,13 @@ async function executeToolAfterReflections(
  * Core agent loop. Delegates all provider-specific logic to a ProviderAdapter.
  * Yields AgentEvent objects for the caller to consume.
  */
-export async function* agentLoop(
+export function agentLoop(
+	...args: Parameters<typeof agentLoopInMetadataSnapshot>
+): ReturnType<typeof agentLoopInMetadataSnapshot> {
+	return withModelMetadataSnapshotIterator(() => agentLoopInMetadataSnapshot(...args));
+}
+
+async function* agentLoopInMetadataSnapshot(
 	config: AgentConfig,
 	userText: string,
 	history: unknown[],
@@ -3387,6 +3395,7 @@ export async function* agentLoop(
 					provider: effectiveProvider,
 					model: effectiveModel,
 					credentialId,
+					referencePricingSnapshot: captureReferencePricingSnapshot(effectiveModel),
 				};
 			}
 

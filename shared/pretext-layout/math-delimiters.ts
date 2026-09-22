@@ -51,20 +51,69 @@ const CODE_SEGMENT_PATTERN =
  * remark-math parses. Without this conversion those formulas render as literal
  * backslash-parens. We rewrite them to dollar-delimited math while skipping
  * code blocks and inline code so real code containing `\(` is left untouched.
+ *
+ * Optional `sourceOffsets` maps UTF-16 boundaries to original-source boundaries
+ * (initially 0..text.length). It is updated in place for incremental consumers;
+ * ordinary renderers pay no per-character mapping cost.
  */
-export function normalizeMathDelimiters(text: string): string {
+export function normalizeMathDelimiters(text: string, sourceOffsets?: number[]): string {
 	if (!text.includes("\\(") && !text.includes("\\[")) return text;
 
-	return text
+	let consumed = 0;
+	const mapped: number[] = [];
+	const result = text
 		.split(CODE_SEGMENT_PATTERN)
 		.map((segment, index) => {
+			const offsets = sourceOffsets?.slice(consumed, consumed + segment.length + 1);
+			consumed += segment.length;
 			// Odd indices are captured code segments — leave them verbatim.
-			if (index % 2 === 1) return segment;
-			return segment
-				.replace(/\\\[([\s\S]+?)\\\]/g, (_match, body: string) => `$$${body}$$`)
-				.replace(/\\\(([\s\S]+?)\\\)/g, (_match, body: string) => `$${body}$`);
+			const normalized =
+				index % 2 === 1
+					? segment
+					: replaceMathDelimiters(
+							replaceMathDelimiters(segment, /\\\[([\s\S]+?)\\\]/g, "$$", offsets),
+							/\\\(([\s\S]+?)\\\)/g,
+							"$",
+							offsets,
+						);
+			if (offsets) for (let i = 0; i < offsets.length - 1; i++) mapped.push(offsets[i] as number);
+			return normalized;
 		})
 		.join("");
+	if (sourceOffsets) {
+		mapped.push(sourceOffsets[text.length] as number);
+		sourceOffsets.length = 0;
+		for (const offset of mapped) sourceOffsets.push(offset);
+	}
+	return result;
+}
+
+/** Carry UTF-16 source boundaries through delimiter rewriting, only on request. */
+function replaceMathDelimiters(
+	text: string,
+	pattern: RegExp,
+	delimiter: string,
+	offsets?: number[],
+): string {
+	const mapped: number[] = [];
+	let consumed = 0;
+	const result = text.replace(pattern, (match: string, body: string, start: number) => {
+		if (offsets) {
+			for (let i = consumed; i < start; i++) mapped.push(offsets[i] as number);
+			for (let i = 0; i < delimiter.length; i++) mapped.push(offsets[start + i] as number);
+			for (let i = 0; i < body.length; i++) mapped.push(offsets[start + 2 + i] as number);
+			for (let i = 0; i < delimiter.length; i++)
+				mapped.push(offsets[start + match.length - 2 + i] as number);
+		}
+		consumed = start + match.length;
+		return `${delimiter}${body}${delimiter}`;
+	});
+	if (offsets) {
+		for (let i = consumed; i <= text.length; i++) mapped.push(offsets[i] as number);
+		offsets.length = 0;
+		for (const offset of mapped) offsets.push(offset);
+	}
+	return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -78,6 +127,9 @@ export type MathSegment =
 	/** `$$...$$` — its own centered block. */
 	| { kind: "display-math"; latex: string };
 
+/** A segment's untrimmed UTF-16 source range, before any formula replacement. */
+type MathSegmentVisitor = (segment: MathSegment, start: number, end: number) => void;
+
 /**
  * Split text into literal and math segments.
  *
@@ -88,14 +140,16 @@ export type MathSegment =
  * Unterminated math (a `$` with no closing partner — common mid-stream) stays
  * literal text, so a half-written formula never renders as broken math.
  */
-export function splitMathSegments(text: string): MathSegment[] {
+export function splitMathSegments(text: string, visit?: MathSegmentVisitor): MathSegment[] {
 	const segments: MathSegment[] = [];
 	let literal = "";
 	let index = 0;
 
 	const flushLiteral = () => {
 		if (literal.length > 0) {
-			segments.push({ kind: "text", text: literal });
+			const segment: MathSegment = { kind: "text", text: literal };
+			segments.push(segment);
+			visit?.(segment, index - literal.length, index);
 			literal = "";
 		}
 	};
@@ -118,9 +172,11 @@ export function splitMathSegments(text: string): MathSegment[] {
 				const latex = text.slice(index + open.length, close).trim();
 				if (latex.length > 0) {
 					flushLiteral();
-					segments.push(
-						isDisplay ? { kind: "display-math", latex } : { kind: "inline-math", latex },
-					);
+					const segment: MathSegment = isDisplay
+						? { kind: "display-math", latex }
+						: { kind: "inline-math", latex };
+					segments.push(segment);
+					visit?.(segment, index, close + open.length);
 					index = close + open.length;
 					continue;
 				}
@@ -146,18 +202,27 @@ export function splitMathSegments(text: string): MathSegment[] {
  * shell script containing `$VAR` or a regex containing `\(` is left alone. This
  * is the entry point the markdown parsers should use.
  */
-export function splitMathOutsideCode(text: string): MathSegment[] {
+export function splitMathOutsideCode(text: string, visit?: MathSegmentVisitor): MathSegment[] {
 	const segments: MathSegment[] = [];
 	const parts = text.split(CODE_SEGMENT_PATTERN);
+	let consumed = 0;
 	for (let i = 0; i < parts.length; i++) {
 		const part = parts[i];
 		if (part === undefined || part.length === 0) continue;
+		const start = consumed;
+		consumed += part.length;
 		// Odd indices are captured code segments — always literal.
 		if (i % 2 === 1) {
-			segments.push({ kind: "text", text: part });
+			const segment: MathSegment = { kind: "text", text: part };
+			segments.push(segment);
+			visit?.(segment, start, consumed);
 			continue;
 		}
-		for (const segment of splitMathSegments(part)) segments.push(segment);
+		for (const segment of splitMathSegments(
+			part,
+			visit ? (segment, from, to) => visit(segment, start + from, start + to) : undefined,
+		))
+			segments.push(segment);
 	}
 	return segments;
 }

@@ -60,6 +60,7 @@ import {
 	getPermissionReflectionSuggestion,
 } from "@shared/pretext-layout/reflection";
 import {
+	activityForSubagent,
 	getNewestReflectionToolOccurrenceInTree,
 	mergeFieldsIntoNewestToolOccurrenceInTree,
 	mergeToolCallFieldsInTree,
@@ -419,7 +420,8 @@ export function patchSubagentActivity(
 	const result = updateSubagentActivityInMessages(
 		messages as TreeMessage[],
 		parentToolUseId,
-		(current) => {
+		(existing) => {
+			const current = activityForSubagent(existing, meta?.subagentNarratorId);
 			const next = upsertSubagentToolCallHeader(current, header);
 			// Same "never erase a known value" rule as the model: a tool event that
 			// omits the tier must keep the one the card already shows.
@@ -464,7 +466,8 @@ export function patchSubagentIdentity(
 	const result = updateSubagentActivityInMessages(
 		messages as TreeMessage[],
 		parentToolUseId,
-		(current) => {
+		(existing) => {
+			const current = activityForSubagent(existing, nextNarratorId);
 			const resolvedNarratorId = nextNarratorId ?? current?.subagentNarratorId ?? null;
 			const resolvedModel = nextModel ?? normalizeModel(current?.model);
 			const resolvedReasoningEffort =

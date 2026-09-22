@@ -35,6 +35,9 @@ const FeatureFsReadBoundedV1 = "fs.read.bounded.v1"
 // FeatureGitWorkspaceV1 covers structured, bounded, cancellable full Git management.
 const FeatureGitWorkspaceV1 = "git.workspace.v1"
 
+// FeatureGitWorkspaceWatchV1 adds bounded metadata-only workspace fingerprints.
+const FeatureGitWorkspaceWatchV1 = "git.workspace.watch.v1"
+
 // ── Frame envelope ────────────────────────────────────────────────────────────
 
 // Frame is the common shape used to peek at a message's type before decoding
@@ -98,6 +101,7 @@ func (c Capabilities) MarshalJSON() ([]byte, error) {
 		FeatureGlobBoundedV1,
 		FeatureFsReadBoundedV1,
 		FeatureGitWorkspaceV1,
+		FeatureGitWorkspaceWatchV1,
 	} {
 		seen := false
 		for _, feature := range features {

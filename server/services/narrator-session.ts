@@ -2050,7 +2050,7 @@ export async function deliverPendingInjection(
 							alias: task.alias ?? null,
 							title: task.title,
 							status: task.status,
-							preview: task.resultPreview ?? "",
+							preview: task.result ?? "Result snapshot unavailable.",
 							...(task.resultTruncated ? { truncated: true } : {}),
 							// Reader-only navigation target (the agent's own message that produced
 							// this result). Omitted rather than stored as null when absent, so a
@@ -2062,13 +2062,9 @@ export async function deliverPendingInjection(
 				},
 				locale,
 			);
-			// The idle path keeps its own longer wording (full result + how to Await it),
-			// which is what that path has always sent and is asserted elsewhere; the
-			// structured body rides along either way for the reader.
-			const content =
-				mode === "idle"
-					? formatBackgroundCompletionNotifications([task], { includeResult: true })
-					: projected.content;
+			// Completion is useful at either boundary only when it includes the result.
+			// Keep the bounded snapshot in the injected history, not just the UI sidecar.
+			const content = formatBackgroundCompletionNotifications([task], { includeResult: true });
 			const { turnText } = await deliverInjection(narratorId, {
 				...placement,
 				content,

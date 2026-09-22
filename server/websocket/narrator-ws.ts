@@ -12,6 +12,7 @@ import type { ServerWebSocket } from "bun";
 export const MAX_NARRATOR_SUBSCRIPTIONS_PER_CONNECTION =
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION;
 
+import type { GitWorkspaceClientMessage } from "@shared/git-workspace-events";
 import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -76,6 +77,7 @@ import {
 	createCatchUpBuffer,
 	drainCatchUpBuffer,
 } from "./catch-up-buffer";
+import { handleGitWorkspaceMessage, releaseGitWorkspaceSubscriptions } from "./git-workspace-ws";
 import {
 	createCodexQuotaOverviewWsMessage,
 	type NarratorListStateSnapshotItem,
@@ -120,6 +122,7 @@ type NarratorSubscriptionKind = "list" | "panel" | "messages";
 
 // Client → Server messages
 export type NarratorClientMessage =
+	| GitWorkspaceClientMessage
 	| { type: "pong" }
 	| {
 			type: "subscribe";
@@ -192,6 +195,7 @@ function addConnection(ws: NarratorWS): void {
 }
 
 function removeConnection(ws: NarratorWS): void {
+	releaseGitWorkspaceSubscriptions(ws);
 	connections.delete(ws);
 	const userId = ws.data.userId;
 	if (!userId) return;
@@ -1558,6 +1562,10 @@ export const handleNarratorWS = {
 		if (!(await authorizeNarratorFrame(ws, msg))) return;
 
 		switch (msg.type) {
+			case "git_workspace_subscribe":
+			case "git_workspace_unsubscribe":
+				await handleGitWorkspaceMessage(ws, msg);
+				break;
 			case "pong":
 				// Heartbeat response — lastPongAt already updated above
 				break;

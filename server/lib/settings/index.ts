@@ -11,7 +11,7 @@ import { migrateLegacyCodexOAuth } from "../codex-manager";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
 import { invalidateModelCardCache } from "../model-cards";
-import { type ModelPricing, setModelPricingOverrides } from "../model-pricing";
+import { bindModelCatalogSettings, startModelCatalogDailyCheck, reconcileLegacyWindowSettings, markLegacyWindowSettingsSaved } from "../model-catalog";
 import { getNarraforkHome } from "../narrafork-home";
 import {
 	normalizeDefaultNarratorVisibility,
@@ -463,7 +463,7 @@ function loadSettingsFromDisk(): NarraForkSettings {
 
 	// Pricing lives in its own module so cost attribution does not have to pull in
 	// the settings module graph; push the operator overrides into it on load.
-	applyPricingOverridesFromSettings(merged);
+
 
 	return merged;
 }
@@ -482,22 +482,8 @@ function loadSettingsFromDisk(): NarraForkSettings {
  * revert a correction they cannot see being reverted. New edits go through cards
  * and land in the same place.
  */
-function applyPricingOverridesFromSettings(current: NarraForkSettings): void {
-	const fromCards: Record<string, Partial<ModelPricing>> = {};
-	for (const card of current.agent.modelCards ?? []) {
-		const pricing = card.officialPricing;
-		if (!card.modelKey || !pricing || card.deleted) continue;
-		const entry: Partial<ModelPricing> = {};
-		// 0 means "not set" here as everywhere else on a card, so it must not be
-		// forwarded: an override of 0 would price real usage as free.
-		if ((pricing.input ?? 0) > 0) entry.input = pricing.input;
-		if ((pricing.output ?? 0) > 0) entry.output = pricing.output;
-		if ((pricing.cacheRead ?? 0) > 0) entry.cacheRead = pricing.cacheRead;
-		if ((pricing.cacheWrite ?? 0) > 0) entry.cacheWrite = pricing.cacheWrite;
-		if (Object.keys(entry).length > 0) fromCards[card.modelKey] = entry;
-	}
-	setModelPricingOverrides({ ...fromCards, ...(current.pricing?.overrides ?? {}) });
-}
+// Legacy pricing is migrated once by bindModelCatalogSettings. New estimates
+// read the same effective metadata as request construction, never a projection.
 
 /** Simple 8-char random ID for migration (avoids importing nanoid at this level). */
 function generateMigrationId(): string {
@@ -758,6 +744,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	normalizeSettingsProxyUrls(newSettings);
 	normalizeSearchSettings(newSettings);
 	normalizeMcpServerIds(newSettings);
+	reconcileLegacyWindowSettings(newSettings);
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
 	try {
@@ -767,8 +754,9 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 		rmSync(tempPath, { force: true });
 		throw error;
 	}
+	markLegacyWindowSettingsSaved(newSettings);
 	settingsRevision++;
-	applyPricingOverridesFromSettings(newSettings);
+
 	// The card index is memoized on the identity of the cards array. A save that
 	// mutated the existing array in place would keep that identity, so the cache
 	// is dropped explicitly rather than relying on a new reference arriving.
@@ -793,6 +781,8 @@ export const settings: NarraForkSettings = loadSettings();
 _cache.current = settings;
 // Bind settings to provider module so it can access the singleton
 _bindSettings(settings);
+bindModelCatalogSettings(settings, () => saveSettings(settings));
+if (process.env.NODE_ENV !== "test") startModelCatalogDailyCheck();
 
 /** Returns a copy of the default settings (for reset / comparison). */
 export function getDefaults(): NarraForkSettings {

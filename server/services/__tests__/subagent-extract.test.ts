@@ -105,6 +105,26 @@ afterAll(() => {
 });
 
 describe("extractSubagentToPrimary", () => {
+	test("preserves partial reference cost coverage when materializing messages", async () => {
+		seedSubagent("sub");
+		seedSourceMessage("cost-message", "sub", 0, "answer");
+		sqlite
+			.prepare(
+				"UPDATE narrator_messages SET cost_usd=0, cost_status='partial', cost_missing_fields='[\"output\"]' WHERE id='cost-message'",
+			)
+			.run();
+		const extracted = await extractSubagentToPrimary("sub", { title: "Cost coverage" });
+		const row = sqlite
+			.prepare(
+				"SELECT cost_usd, cost_status, cost_missing_fields FROM narrator_messages WHERE narrator_id=?",
+			)
+			.get(extracted.id);
+		expect(row).toMatchObject({
+			cost_usd: 0,
+			cost_status: "partial",
+			cost_missing_fields: '["output"]',
+		});
+	});
 	test("creates an independent primary with materialized history and full ask policy", async () => {
 		seedPrimary("parent");
 		seedSubagent("sub", { parentNarratorId: "parent" });

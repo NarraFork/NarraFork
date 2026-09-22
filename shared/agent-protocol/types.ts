@@ -10,6 +10,17 @@
  * the host's `types.ts`.
  */
 
+import type { ModelMetadata } from "../model-catalog/schema/catalog";
+
+/** Immutable reference-rate snapshot captured when the upstream request starts.
+ * null means captured unknown, never permission to consult a later catalog. */
+export interface ReferencePricingSnapshot {
+	referencePricing: NonNullable<ModelMetadata["referencePricing"]> | null;
+	catalogVersion: string;
+	localRevision: number;
+	modelId?: string;
+}
+
 // === API error and bounded diagnostics ===
 
 export type ApiRequestDiagnosticSource =
@@ -60,6 +71,8 @@ export interface ReasoningProviderMetadata {
 		itemId?: string;
 		/** Encrypted reasoning content for continuation across turns */
 		reasoningEncryptedContent?: string | null;
+		/** Native plaintext is replayable; summaries and unmarked legacy text are not. */
+		textFormat?: "reasoning_text" | "summary_text" | "mixed";
 	};
 	anthropic?: {
 		/** Provider-native content block index for this thinking block. */

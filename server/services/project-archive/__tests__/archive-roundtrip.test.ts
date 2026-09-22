@@ -175,6 +175,9 @@ async function createFixture(prefix: string): Promise<Fixture> {
 			role: "assistant",
 			contentJson: [{ type: "tool_use", id: toolUseId, name: "Task", input: {} }],
 			outputTokens: 42,
+			costUsd: 0.5,
+			costStatus: "partial",
+			costMissingFields: ["output"],
 			createdAt: now,
 		},
 		{
@@ -510,6 +513,11 @@ describe("import reads the archive back into the main database", () => {
 			{ type: "tool_use", id: fixture.toolUseId, name: "Task", input: {} },
 		]);
 		expect(assistant?.outputTokens).toBe(42);
+		expect(assistant).toMatchObject({
+			costUsd: 0.5,
+			costStatus: "partial",
+			costMissingFields: ["output"],
+		});
 
 		const toolCalls = await db
 			.select()
