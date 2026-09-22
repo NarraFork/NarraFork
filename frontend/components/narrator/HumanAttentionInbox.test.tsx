@@ -454,7 +454,7 @@ describe("child async questions from the parent attention entry", () => {
 		for (const [url, init] of fetchSpy.mock.calls) {
 			expect(url).toBe("/api/narrators/actual-child/questions/child-question/answer");
 			expect(init?.method).toBe("POST");
-			expect(JSON.parse(String(init?.body))).toEqual({ answers: { notes: "Keep this answer" } });
+			expect(JSON.parse(String(init?.body))).toEqual({ answers: { "Notes?": "Keep this answer" } });
 		}
 		expect(document.querySelector("[data-attention-id]")).toBeNull();
 		expect(qc.getQueryData<typeof parentQuestions>(["async-questions", "parent"])).toEqual(
@@ -541,7 +541,7 @@ test("notification pending panel reuses decision form, draft recovery and keyboa
 	await assertIsolated(document.querySelector('[role="dialog"] button') as Element);
 	await click(narratorEn.submitAnswer, row(child.id));
 	expect(answer).toHaveBeenCalledWith("actual-child", child.requestId, {
-		answers: { notes: "Keep this answer" },
+		answers: { "Notes?": "Keep this answer" },
 	});
 	await click(navEn.notificationTabActivity);
 	await assertIsolated(
@@ -858,10 +858,10 @@ describe("human attention decisions", () => {
 		expect(defer).toHaveBeenCalledWith("block");
 		expect(readSession("ask-draft", blocking.toolCallId)).not.toBeNull();
 		await click(narratorEn.submitAnswer, row(blocking.id));
-		expect(approve).toHaveBeenCalledWith("block", { answers: { notes: "Keep this answer" } });
+		expect(approve).toHaveBeenCalledWith("block", { answers: { "Notes?": "Keep this answer" } });
 		await click(narratorEn.submitAnswer, row(asyncRow.id));
 		expect(answer).toHaveBeenCalledWith(asyncRow.narratorId, "async", {
-			answers: { notes: "Keep this answer" },
+			answers: { "Notes?": "Keep this answer" },
 			annotations: asyncQuestion.annotations,
 		});
 		expect(readSession("ask-draft", asyncRow.toolCallId)).not.toBeNull();
