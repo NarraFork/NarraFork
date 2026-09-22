@@ -1036,15 +1036,9 @@ async function parseAnthropicGenerateResponse(
 	if (invalidReason && !outputTruncated) {
 		const message =
 			json.error?.message ??
-			(invalidReason === "max_tokens"
-				? "Response truncated: model reached maximum token limit."
-				: invalidReason === "model_context_window_exceeded"
-					? "The model has reached its context window limit."
-					: invalidReason === "refusal"
-						? "Claude refused to provide this response."
-						: invalidReason === "content_filter"
-							? "Response blocked by content filter."
-							: "Anthropic API error");
+			(json.error
+				? `Upstream returned error ${invalidReason} (no error message provided).`
+				: `Upstream returned stop_reason=${stopReason} (no error message provided).`);
 		const diagnostics = parseErrorDiagnostics(
 			{ reason: invalidReason, message, error: json.error },
 			{ source: "provider", phase: "json_response", reason: invalidReason, message },
@@ -2336,8 +2330,9 @@ async function collectWebSearchStream(
 	let stopReason: string | undefined;
 
 	const handleEvent = (event: AnthropicStreamEvent): void => {
-		if (event.type === "error") {
-			throw new Error(`Anthropic web search error: ${event.error?.message ?? "unknown error"}`);
+		const streamError = extractAnthropicStreamError(event);
+		if (streamError) {
+			throw new Error(`Anthropic web search error: ${streamError.message}`);
 		}
 		if (event.type === "message_delta" && event.delta?.stop_reason) {
 			stopReason = event.delta.stop_reason;
@@ -2632,7 +2627,7 @@ export function extractAnthropicStreamError(
 	const message =
 		nestedMessage ??
 		(topMessageIsString ? (raw.message as string) : undefined) ??
-		"Anthropic API error";
+		`Upstream returned error ${reason || "api_error"} (no error message provided).`;
 
 	return {
 		reason: reason || "api_error",
@@ -2990,7 +2985,7 @@ export function parseAnthropicEvent(
 
 			// Critical stop reasons → invalidState for special handling
 			if (stopReason === "max_tokens") {
-				const message = "Response truncated: model reached maximum token limit.";
+				const message = "Upstream returned stop_reason=max_tokens (no error message provided).";
 				results.push({
 					invalidState: {
 						reason: "max_tokens",
@@ -3002,7 +2997,8 @@ export function parseAnthropicEvent(
 					},
 				});
 			} else if (stopReason === "model_context_window_exceeded") {
-				const message = "The model has reached its context window limit.";
+				const message =
+					"Upstream returned stop_reason=model_context_window_exceeded (no error message provided).";
 				results.push({
 					invalidState: {
 						reason: "model_context_window_exceeded",
@@ -3014,8 +3010,7 @@ export function parseAnthropicEvent(
 					},
 				});
 			} else if (stopReason === "refusal") {
-				const message =
-					"Claude is unable to respond to this request, which appears to violate the Usage Policy.";
+				const message = "Upstream returned stop_reason=refusal (no error message provided).";
 				results.push({
 					invalidState: {
 						reason: "refusal",

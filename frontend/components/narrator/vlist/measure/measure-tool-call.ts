@@ -1552,13 +1552,29 @@ function askQuestionBlocks(question: ToolAskQuestion, marginTop: number): Prepar
 		nextMargin = QUESTION_STACK_GAP;
 	}
 
+	if (question.description?.trim()) {
+		push(
+			makeInline(
+				question.description,
+				OPTION_DESC_FONT,
+				OPTION_DESC_LINE_HEIGHT,
+				0,
+				nextMargin,
+				"vlist-tc-ask-description",
+				{ role: "ask-description" },
+			),
+		);
+		nextMargin = QUESTION_STACK_GAP;
+	}
+
 	const control = question.multiSelect === true ? "checkbox" : "radio";
 	question.options.slice(0, ASK_OPTIONS_MAX).forEach((option, index) => {
 		// The first option is separated from the header by the question gap; later
 		// options by the tighter options gap.
+		const optionTitle = option.header.length > 0 ? option.header : " ";
 		push(
 			makeInline(
-				option.label.length > 0 ? option.label : " ",
+				optionTitle,
 				OPTION_LABEL_FONT,
 				OPTION_LABEL_LINE_HEIGHT,
 				OPTION_INDENT,

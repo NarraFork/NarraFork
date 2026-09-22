@@ -131,14 +131,14 @@ describe("selectHeaderToolbarEntries", () => {
 		}
 	});
 
-	test("a phone-sized row keeps the entries the reader put first", () => {
+	test("a narrow capacity keeps the entries the reader put first", () => {
 		/*
 		 * The regression this replaces the old "self-contained controls leave last"
 		 * rule with. That rule existed because the overflow menu could only show those
 		 * controls as a dead "header only" row; the menu now expands their options
-		 * inline, and keeping the rule meant a phone (MOBILE_TOOLBAR_VISIBLE_LIMIT = 2)
-		 * surfaced `lodlevel` + `device` — the two entries at the END of the default
-		 * order — while background tasks, terminal, git and search all collapsed.
+		 * inline. A measured capacity of 2 (narrow phone, short title floor leftover)
+		 * must surface the first two layout entries — background tasks, filemod —
+		 * not `lodlevel` + `device` at the end of the default order.
 		 */
 		const { visible } = selectHeaderToolbarEntries(NARRATOR_TOOLBAR_ITEMS, 2);
 		expect(visible.map((def) => def.id)).toEqual(

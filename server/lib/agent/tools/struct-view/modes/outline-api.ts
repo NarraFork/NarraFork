@@ -166,9 +166,11 @@ export async function runExtract(
 	if (matches.length === 0) {
 		const available = await suggestSymbols(doc, resolved);
 		return {
-			output:
-				`No symbol matching "${rawSymbol}" in ${filePath}.` +
-				(available ? `\n\nDeclarations present:\n${available}` : ""),
+			output: withFooter(
+				`No symbol matching "${rawSymbol}" in ${filePath}.`,
+				available ? `Declarations present:\n${available}` : "",
+				notes,
+			),
 			isError: true,
 			title: filePath,
 		};
@@ -181,9 +183,11 @@ export async function runExtract(
 			.map((m, i) => `  #${i + 1}  L${m.startLine}-${m.endLine}  ${m.kind} ${m.symbolPath}`)
 			.join("\n");
 		return {
-			output:
-				`"${rawSymbol}" matches ${matches.length} declarations in ${filePath}:\n${list}\n\n` +
-				`Re-run with symbol="${parsed.symbol}#N" (or a fuller path like "Class.method") to pick one.`,
+			output: withFooter(
+				`"${rawSymbol}" matches ${matches.length} declarations in ${filePath}:`,
+				`${list}\n\nRe-run with symbol="${parsed.symbol}#N" (or a fuller path like "Class.method") to pick one.`,
+				notes,
+			),
 			title: filePath,
 			metadata: { mode: "extract", ambiguous: true, matches: matches.length },
 		};

@@ -19,7 +19,12 @@
  * everything-is-a-call model). Those are labelled in the manifest rather than papered
  * over: a near-empty outline the user was warned about is honest, a fabricated one is not.
  */
-import type { RichOutlineNode, SyntaxNode } from "./outline";
+import {
+	MAX_TRAVERSAL_DEPTH,
+	MAX_VISITED_NODES,
+	type RichOutlineNode,
+	type SyntaxNode,
+} from "./outline";
 import type { StructKind } from "./provider";
 
 /** Node types that name a declaration, by suffix (`class_declaration`, `type_spec`…). */
@@ -100,10 +105,11 @@ export function buildGenericOutline(
 ): GenericOutlineResult {
 	const maxDepth = options.maxDepth ?? MAX_DEPTH;
 	const maxNodes = options.maxNodes ?? MAX_NODES;
-	const state = { emitted: 0, truncated: false };
+	const state = { emitted: 0, visited: 0, truncated: false };
 
 	const nodes = walk(root, {
 		depth: 0,
+		frame: 0,
 		symbolPrefix: "",
 		maxDepth,
 		maxNodes,
@@ -115,35 +121,44 @@ export function buildGenericOutline(
 
 interface WalkOptions {
 	depth: number;
+	/**
+	 * Recursion depth of the walk itself, which `depth` is not: an unnameable
+	 * declaration and any non-declaration node both recurse with `depth` deliberately
+	 * unchanged, so `maxDepth` cannot bound them. See `MAX_TRAVERSAL_DEPTH`.
+	 */
+	frame: number;
 	symbolPrefix: string;
 	maxDepth: number;
 	maxNodes: number;
-	state: { emitted: number; truncated: boolean };
+	state: { emitted: number; visited: number; truncated: boolean };
 	signal?: AbortSignal;
 }
 
 function walk(node: SyntaxNode, opts: WalkOptions): RichOutlineNode[] {
 	if (opts.signal?.aborted) return [];
-	if (opts.depth > opts.maxDepth) {
+	if (opts.depth > opts.maxDepth || opts.frame > MAX_TRAVERSAL_DEPTH) {
 		opts.state.truncated = true;
 		return [];
 	}
 
 	const results: RichOutlineNode[] = [];
 	for (let i = 0; i < node.childCount; i++) {
-		if (opts.state.emitted >= opts.maxNodes) {
+		// `emitted` bounds the OUTPUT and `visited` bounds the WORK; a file with no
+		// declarations at all can never trip the first one.
+		if (opts.state.emitted >= opts.maxNodes || opts.state.visited >= MAX_VISITED_NODES) {
 			opts.state.truncated = true;
 			break;
 		}
 		const child = node.child(i);
 		if (!child?.isNamed) continue;
+		opts.state.visited++;
 
 		if (isDeclaration(child)) {
 			const name = readAnyName(child);
 			if (!name) {
 				// A declaration shape we cannot name is not worth an anonymous row; its
 				// children may still be nameable.
-				results.push(...walk(child, { ...opts, depth: opts.depth }));
+				results.push(...walk(child, { ...opts, depth: opts.depth, frame: opts.frame + 1 }));
 				continue;
 			}
 			const symbolPath = opts.symbolPrefix ? `${opts.symbolPrefix}.${name}` : name;
@@ -163,6 +178,7 @@ function walk(node: SyntaxNode, opts: WalkOptions): RichOutlineNode[] {
 			const children = walk(child, {
 				...opts,
 				depth: opts.depth + 1,
+				frame: opts.frame + 1,
 				symbolPrefix: symbolPath,
 			});
 			if (children.length > 0) entry.children = children;
@@ -174,7 +190,7 @@ function walk(node: SyntaxNode, opts: WalkOptions): RichOutlineNode[] {
 		// Descending into statements would report a function's locals as though they
 		// were members of the enclosing type.
 		if (STATEMENT_BODY_TYPES.has(child.type)) continue;
-		results.push(...walk(child, { ...opts, depth: opts.depth }));
+		results.push(...walk(child, { ...opts, depth: opts.depth, frame: opts.frame + 1 }));
 	}
 	return results;
 }

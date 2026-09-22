@@ -75,7 +75,12 @@ Commands:
 - delete: remove the selected node/range (whole lines)
 - insert: put \`content\` immediately before the selection
 - append: put \`content\` immediately after the selection
-- substitute: regex-replace inside the selection only (\`pattern\` + \`replacement\`, flags g/i)
+- substitute: regex-replace inside the selection only (\`pattern\` + \`replacement\`, flags g/i).
+  Runs one line at a time, so \`^\`/\`$\` anchor per line and no pattern can span a line break.
+  Refused before anything is written, with nothing changed: a pattern that matches between
+  characters (\`x*\`, \`\\b\`) more than once on a line, and a \`replacement\` referencing a
+  capture group the pattern does not have — JS writes such a reference through as literal
+  text, or expands an unknown \`$<name>\` to nothing, neither of which reports an error.
 - copy: duplicate the selection to another position in the SAME file
 - move: relocate the selection to another position in the SAME file
 
@@ -165,11 +170,15 @@ const rawJsonSchema = {
 			type: "string",
 		},
 		replacement: {
-			description: "For substitute: the replacement text ($1 for capture groups).",
+			description:
+				"For substitute: the replacement text ($1 / $<name> for capture groups, $& for the " +
+				"whole match). A reference the pattern does not declare is rejected, not guessed.",
 			type: "string",
 		},
 		flags: {
-			description: 'For substitute: regex flags. Only "g" and "i" are supported.',
+			description:
+				'For substitute: regex flags. Only "g" and "i" are supported; "m" and "s" are ' +
+				"rejected because the substitution is already per-line.",
 			type: "string",
 		},
 		dry_run: {

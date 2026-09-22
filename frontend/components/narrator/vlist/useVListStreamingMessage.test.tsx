@@ -242,6 +242,44 @@ async function withStream(
 }
 
 describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
+	it("restores a name-only tool after switching back without another live event", async () => {
+		await withStream(async (h) => {
+			const chunk = { toolUseId: "quiet-write", toolName: "Write", inputCharsTotal: 0 };
+			await h.frame({ type: "tool_use_chunk", ...chunk });
+			await h.raf();
+			expect(h.live()?.toolCalls?.some((call) => call.toolUseId === chunk.toolUseId)).toBe(true);
+			await h.switchNarrator("other");
+			await h.switchNarrator("handoff-n");
+			await h.frame({ type: "streaming_snapshot", streamingBlocks: [], toolChunks: [chunk] });
+			await h.raf();
+			expect(h.live()?.toolCalls?.some((call) => call.toolUseId === chunk.toolUseId)).toBe(true);
+			expect(h.text()).toContain("Write");
+		});
+	});
+
+	it("ignores child and persisted tools in snapshots but restores tools on their own page", async () => {
+		await withStream(async (h) => {
+			const chunk = {
+				toolUseId: "child-write",
+				toolName: "Write",
+				inputCharsTotal: 0,
+				parentToolUseId: "agent",
+			};
+			await h.frame({ type: "streaming_snapshot", streamingBlocks: [], toolChunks: [chunk] });
+			await h.raf();
+			expect(h.live()).toBeNull();
+			await h.switchNarrator("child", true);
+			await h.frame({ type: "streaming_snapshot", streamingBlocks: [], toolChunks: [chunk] });
+			await h.raf();
+			expect(h.live()?.toolCalls?.some((call) => call.toolUseId === chunk.toolUseId)).toBe(true);
+			await h.commit([tool(chunk.toolUseId)]);
+			await h.frame({ type: "streaming_snapshot", streamingBlocks: [], toolChunks: [chunk] });
+			await h.raf();
+			expect(h.live()?.toolCalls?.some((call) => call.toolUseId === chunk.toolUseId) ?? false).toBe(
+				false,
+			);
+		});
+	});
 	it("keeps global content ownership when a user interjects before checkpoint delivery", async () => {
 		await withStream(async (h) => {
 			const block = content("text", "interrupted-b", "ORIGINAL", 1, 0);
@@ -444,6 +482,36 @@ describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
 			expect(h.text()).toContain("NEW");
 		});
 	});
+	for (const type of ["text", "reasoning"] as const) {
+		for (const deltaFirst of [true, false]) {
+			it(`restores ${type} after switching back (${deltaFirst ? "delta" : "snapshot"} first)`, async () => {
+				await withStream(async (h) => {
+					await h.delta(content(type, "active-block", "PREFIX", 1, 0));
+					await h.raf();
+					await h.switchNarrator("other");
+					await h.switchNarrator("handoff-n");
+					const delta = () => h.delta(content(type, "active-block", "+TAIL", 2, 6));
+					if (deltaFirst) await delta();
+					await h.frame({
+						type: "streaming_snapshot",
+						streamingBlocks: [content(type, "active-block", "PREFIX", 1, 0)],
+						toolChunks: [],
+					});
+					if (!deltaFirst) await delta();
+					await h.raf();
+					expect(h.live()?.contentJson).toEqual([
+						expect.objectContaining({ type, text: "PREFIX+TAIL", textOffset: 0 }),
+					]);
+					await h.commit([content(type, "active-block", "PREFIX+TAIL", 2, 0)]);
+					await h.delta(content(type, "active-block", "+NEXT", 3, 11));
+					await h.raf();
+					expect(h.live()?.contentJson).toEqual([
+						expect.objectContaining({ type, text: "PREFIX+TAIL+NEXT", textOffset: 0 }),
+					]);
+				});
+			});
+		}
+	}
 	it("delta-first reconnect recovers its raw prefix from an older snapshot", async () => {
 		await withStream(async (h) => {
 			await h.delta(content("text", "t", "+TAIL", 8, 6));

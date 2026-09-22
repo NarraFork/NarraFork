@@ -128,7 +128,7 @@ async function question(
 	narratorId: string,
 	id = `question-${++sequence}`,
 	questions: unknown = [
-		{ header: "Secret question body", question: "key", options: [{ label: "yes" }] },
+		{ header: "Secret question body", id: "key", options: [{ header: "yes" }] },
 	],
 ) {
 	const row = await call(narratorId, { toolName: "AskUserQuestion", status: "success" });
@@ -570,7 +570,7 @@ describe("bounded paging and detail", () => {
 		await narrator("n");
 		const marker = "HUGE-BODY-NEVER-PARSED";
 		const id = await question("n", undefined, [
-			{ question: "key", header: marker + "x".repeat(HUMAN_ATTENTION_DETAIL_MAX_BYTES) },
+			{ id: "key", header: marker + "x".repeat(HUMAN_ATTENTION_DETAIL_MAX_BYTES) },
 		]);
 		const p = await permission("n");
 		await db

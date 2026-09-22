@@ -1706,6 +1706,7 @@ function AskDetailBlocks({
 /** Text colour per ask-replay row role (mirrors the classic banner's tints). */
 function askRoleColor(role: string, selected: boolean): string | undefined {
 	switch (role) {
+		case "ask-description":
 		case "ask-option-desc":
 			return "var(--mantine-color-dimmed)";
 		case "ask-answer":

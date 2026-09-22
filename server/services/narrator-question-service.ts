@@ -51,18 +51,24 @@ import {
 	type RuntimePolicy,
 	resolveRuntimePolicy,
 } from "./agent-runtime/policy";
+import { coerceAskQuestions } from "./ask-user-question-coerce";
 import { customSubagentService } from "./custom-subagent-service";
 import { notifyHumanAttentionChanged } from "./human-attention-events";
 import { type DeliverInjectionOptions, deliverInjection } from "./narrator-injection";
 
-/** One question as the tool defined it. Structurally the tool's own input shape. */
+/** One question as the tool defined it. Header + description only. */
 export interface AsyncQuestionDefinition {
-	/** Stable answer key the model chose (`auth-method`). */
-	question: string;
-	/** The prompt the user actually reads. */
+	/**
+	 * Internal draft/React key. Not advertised to models; model-facing answers
+	 * are keyed by the (uniquified) `header`.
+	 */
+	id: string;
+	/** SHORT title shown as the heading; also the model-facing answers key. */
 	header: string;
+	/** Optional FULL prompt / extra context under the header. */
+	description?: string;
 	multiSelect?: boolean;
-	options?: { label: string; description?: string; preview?: string }[];
+	options?: { header: string; description?: string; preview?: string }[];
 }
 
 export interface AsyncQuestionAnnotation {
@@ -191,40 +197,11 @@ export function listAwaitedAsyncQuestionIds(): string[] {
  * Read `questions_json` back defensively.
  *
  * The column is written from validated tool input, but a row can also be older than a
- * shape change. A malformed payload must not throw inside a list request that other,
- * healthy questions are part of, so the bad row degrades to "no questions" (the UI
- * shows it as unanswerable) rather than failing the whole page.
+ * shape change (legacy `question` / `content` / option `label`). Uses the shared coerce
+ * path so stored rows and live tool input normalize the same way.
  */
 function coerceDefinitions(value: unknown): AsyncQuestionDefinition[] {
-	if (!Array.isArray(value)) return [];
-	const out: AsyncQuestionDefinition[] = [];
-	for (const raw of value) {
-		if (!raw || typeof raw !== "object") continue;
-		const item = raw as Record<string, unknown>;
-		const key = typeof item.question === "string" ? item.question : "";
-		const header = typeof item.header === "string" ? item.header : "";
-		if (!key || !header) continue;
-		out.push({
-			question: key,
-			header,
-			...(typeof item.multiSelect === "boolean" ? { multiSelect: item.multiSelect } : {}),
-			options: Array.isArray(item.options)
-				? item.options.flatMap((opt) => {
-						if (!opt || typeof opt !== "object") return [];
-						const o = opt as Record<string, unknown>;
-						if (typeof o.label !== "string" || !o.label) return [];
-						return [
-							{
-								label: o.label,
-								...(typeof o.description === "string" ? { description: o.description } : {}),
-								...(typeof o.preview === "string" ? { preview: o.preview } : {}),
-							},
-						];
-					})
-				: [],
-		});
-	}
-	return out;
+	return coerceAskQuestions(value);
 }
 
 function coerceAnswers(value: unknown): Record<string, string> | null {
@@ -698,16 +675,33 @@ async function mirrorAnswersToToolCall(
 function buildAnswerItems(record: AsyncQuestionRecord): SideCarAsyncQuestionAnswer[] {
 	const answers = record.answers ?? {};
 	const items: SideCarAsyncQuestionAnswer[] = [];
+	const matchedKeys = new Set<string>();
 	for (const question of record.questions) {
-		const answer = answers[question.question];
+		// Model-facing key is `header`; internal `id` and legacy `question` still
+		// appear in older rows / draft mirrors.
+		const answer =
+			answers[question.header] ??
+			answers[question.id] ??
+			answers[(question as { question?: string }).question ?? ""];
 		if (answer === undefined) continue;
-		const notes = record.annotations?.[question.question]?.notes ?? null;
-		items.push({ header: question.header, answer, ...(notes ? { notes } : {}) });
+		const notes =
+			record.annotations?.[question.header]?.notes ??
+			record.annotations?.[question.id]?.notes ??
+			null;
+		matchedKeys.add(question.header);
+		matchedKeys.add(question.id);
+		const legacyKey = (question as { question?: string }).question;
+		if (legacyKey) matchedKeys.add(legacyKey);
+		const description = question.description?.trim();
+		const header = description ? `${question.header}\n${description}` : question.header;
+		items.push({ header, answer, ...(notes ? { notes } : {}) });
 	}
 	// Answers whose key matches no known question (a repaired/renamed key) still have
 	// to reach the model: dropping them would silently discard something the user typed.
 	for (const [key, answer] of Object.entries(answers)) {
-		if (record.questions.some((q) => q.question === key)) continue;
+		if (matchedKeys.has(key) || record.questions.some((q) => q.header === key || q.id === key)) {
+			continue;
+		}
 		items.push({ header: key, answer });
 	}
 	return items;
@@ -738,7 +732,10 @@ async function deliverDecision(
 		items:
 			outcome === "answered"
 				? buildAnswerItems(record)
-				: record.questions.map((q) => ({ header: q.header, answer: "" })),
+				: record.questions.map((q) => ({
+						header: q.description?.trim() ? `${q.header}\n${q.description}` : q.header,
+						answer: "",
+					})),
 	};
 	const { content } = sideCarBodyWithText("async_question", body, locale);
 	const executionPrincipal = await getAsyncQuestionExecutionPrincipal(record.id, record.narratorId);

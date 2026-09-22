@@ -30,7 +30,7 @@ import {
 
 const { buildAsyncQuestionNode } = await import("../vlist/vlist-permission-bridge");
 
-const questions = [{ question: "notes", header: "Notes?", options: [] }];
+const questions = [{ id: "notes", header: "Notes?", options: [] }];
 const deferredQuestion: GlobalQuestion = {
 	id: "async-record-id",
 	narratorId: "n1",
@@ -310,7 +310,8 @@ describe("AskUserQuestion draft identity", () => {
 				});
 			}
 			expect(answer).toHaveBeenCalledWith("n1", deferredQuestion.id, {
-				answers: { notes: "Keep this unfinished answer" },
+				// Model-facing answers are keyed by question header.
+				answers: { "Notes?": "Keep this unfinished answer" },
 			});
 			expect(readSession("ask-draft", deferredQuestion.toolCallId)).toBeNull();
 		} finally {
@@ -372,13 +373,10 @@ describe("AskUserQuestion draft identity", () => {
 				draftId="multi-draft"
 				questions={[
 					{
-						question: "targets",
+						id: "targets",
 						header: "Targets?",
 						multiSelect: true,
-						options: [
-							{ label: "web", description: "" },
-							{ label: "api", description: "" },
-						],
+						options: [{ header: "web" }, { header: "api" }],
 					},
 				]}
 			/>,

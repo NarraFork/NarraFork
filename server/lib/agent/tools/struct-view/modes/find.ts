@@ -156,6 +156,7 @@ export async function runFind(
 	const declarations: Declaration[] = [];
 	let unparsed = 0;
 	let skipped = 0;
+	let truncatedOutlines = 0;
 	for (const relPath of candidatePaths) {
 		if (io.signal?.aborted) break;
 		try {
@@ -184,7 +185,9 @@ export async function runFind(
 			// exists on the tree-sitter provider's richer node type, not on the OutlineNode
 			// contract every provider implements, so relying on it would make the heuristic
 			// provider's hits print as `undefined`.
-			for (const found of collectMatches(await resolved.provider.outline(doc), name, [])) {
+			const outline = await resolved.provider.outline(doc);
+			if (await resolved.provider.isOutlineTruncated?.(doc)) truncatedOutlines++;
+			for (const found of collectMatches(outline, name, [])) {
 				declarations.push({ path: relPath, ...found });
 			}
 		} catch {
@@ -193,6 +196,12 @@ export async function runFind(
 	}
 
 	const notes: string[] = [FIND_PRECISION_NOTE];
+	if (truncatedOutlines > 0) {
+		notes.push(
+			`Outline truncated in ${truncatedOutlines} candidate file(s) by a traversal/output budget; ` +
+				"declarations may be missing, so the results are a lower bound.",
+		);
+	}
 	if (candidatesCapped) {
 		notes.push(
 			`Only the first ${MAX_USAGE_CANDIDATES} candidate files were parsed, so this list is a lower bound.`,
@@ -218,7 +227,13 @@ export async function runFind(
 				notes,
 			),
 			title: `find ${name}`,
-			metadata: { mode: "find", symbol: name, declarations: 0, precision: "structural" },
+			metadata: {
+				mode: "find",
+				symbol: name,
+				declarations: 0,
+				precision: "structural",
+				...(truncatedOutlines > 0 ? { truncatedOutlines } : {}),
+			},
 		};
 	}
 
@@ -257,6 +272,7 @@ export async function runFind(
 			candidates: candidatePaths.length,
 			precision: "structural",
 			...(candidatesCapped ? { candidatesCapped: true } : {}),
+			...(truncatedOutlines > 0 ? { truncatedOutlines } : {}),
 		},
 	};
 }

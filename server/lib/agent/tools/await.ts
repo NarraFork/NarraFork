@@ -416,14 +416,19 @@ export function formatQuestionResult(
 	questionId: string,
 	status: string,
 	record: {
-		questions: { question: string; header: string }[];
+		questions: { id?: string; question?: string; header: string }[];
 		answers: Record<string, string> | null;
 	},
 ): string {
 	switch (status) {
 		case "answered": {
 			const lines = record.questions.map((q) => {
-				const answer = record.answers?.[q.question];
+				// Model-facing key is header; internal id / legacy question still appear
+				// in older stored rows.
+				const answer =
+					record.answers?.[q.header] ??
+					(q.id ? record.answers?.[q.id] : undefined) ??
+					(q.question ? record.answers?.[q.question] : undefined);
 				return `- ${q.header}\n  ${answer ?? "(no answer recorded)"}`;
 			});
 			return `The user answered question ${questionId}:\n\n${lines.join("\n")}`;

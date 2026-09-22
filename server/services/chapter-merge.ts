@@ -10,6 +10,7 @@ import { requireCompleteMergeTree, requireMarkerResolvableTree } from "../lib/gi
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getPrompt, type Locale } from "../lib/prompt-i18n";
+import { safeSpawn } from "../lib/spawn";
 import { chapterEdgeService } from "./chapter-edge-service";
 import {
 	abortSnapshotMerge,
@@ -99,6 +100,97 @@ export interface InteractiveMergeResult extends MergeResult {
 	 * hand it back to complete or abort the merge.
 	 */
 	snapshotState?: Omit<InteractiveSnapshotState, "conflictFiles">;
+}
+
+/**
+ * Coordinates an *explicit* interactive snapshot-merge cancel must present.
+ *
+ * The guard is user-confirmed scope protection, not a generic safety rail:
+ * startup recovery and other automatic paths must not call
+ * {@link chapterMerge.abortInteractiveSnapshotMerge} at all. Those paths used to
+ * replay a stale `preMergeTree` over work the user had already done after an
+ * expired session — the root cause this type exists to close.
+ *
+ * Callers read the merge-start coordinates from the server-owned session row
+ * (`conflictTree`, `preMergeTargetSha`). They are not a fresh confirmation of
+ * arbitrary later edits: any drift must refuse the old cancel request.
+ */
+export interface InteractiveSnapshotMergeGuard {
+	/**
+	 * Tree the cancel was confirmed against — typically the conflicted tree written
+	 * when the merge started (`merge_sessions.conflictTree`). Forwarded to
+	 * `materializeTree` as `expectedCurrentTree`; `restoreUnlocked` re-reads the
+	 * real tree immediately before writing, so a post-decision edit fails the abort
+	 * instead of being overwritten.
+	 */
+	expectedCurrentTree: string;
+	/**
+	 * Git HEAD recorded when the merge began.
+	 * `null` means "empty repository" only — never "I failed to read HEAD".
+	 */
+	expectedHeadSha: string | null;
+}
+
+/** Compare full object IDs; only an explicit null represents an unborn HEAD. */
+function normalizeHeadSha(sha: string | null): string | null {
+	if (sha === null) return null;
+	if (typeof sha !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sha.trim())) {
+		throw new ValidationError("Cannot abort snapshot merge: missing or invalid HEAD guard");
+	}
+	return sha.trim().toLowerCase();
+}
+
+/**
+ * Whether HEAD is unborn (empty repository): the same probe git-service's private
+ * `hasNoCommits` uses — `rev-parse --verify --quiet HEAD` exits 1 with empty stdout
+ * only for an unresolvable HEAD; exit 128 / spawn failure means git could not answer
+ * and must NOT be treated as empty-repo.
+ */
+async function isUnbornHead(targetWorktree: string): Promise<boolean> {
+	try {
+		const result = await safeSpawn({
+			cmd: ["git", "--no-optional-locks", "rev-parse", "--verify", "--quiet", "HEAD"],
+			cwd: targetWorktree,
+			timeout: 15_000,
+			maxOutputBytes: 4_096,
+		});
+		return (
+			result.exitCode === 1 &&
+			!result.stdoutTruncated &&
+			!result.stderrTruncated &&
+			!result.stdout.trim() &&
+			!result.stderr.trim()
+		);
+	} catch {
+		// Spawn failure is not empty-repo semantics.
+		return false;
+	}
+}
+
+/**
+ * Read the worktree's *real* git HEAD for a guarded abort.
+ *
+ * Reuses {@link gitService.getHeadCommit} (bounded `rev-parse HEAD` via `execRead`).
+ * That method throws for every non-zero exit, which conflates unborn HEAD with a
+ * broken worktree; the secondary probe above separates them. Only an unborn HEAD
+ * yields `null`. Any other failure throws — a guard must never interpret "git is
+ * broken" as "empty repository, expectedHeadSha null, restore anyway".
+ */
+async function readRealHeadShaForGuard(targetWorktree: string): Promise<string | null> {
+	try {
+		const sha = normalizeHeadSha(await gitService.getHeadCommit(targetWorktree));
+		if (sha) return sha;
+		// Resolved to empty: treat as unreadable, not as empty-repo.
+	} catch (err) {
+		if (await isUnbornHead(targetWorktree)) return null;
+		throw new ValidationError(
+			`Cannot abort snapshot merge: failed to read HEAD in ${targetWorktree}: ` +
+				`${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+	throw new ValidationError(
+		`Cannot abort snapshot merge: git returned an empty HEAD sha in ${targetWorktree}`,
+	);
 }
 
 export interface AiResolveResult {
@@ -851,9 +943,7 @@ export const chapterMerge = {
 			// Recorded even though snapshot mode does not use it to undo: it keeps
 			// `preMergeTargetSha` meaning "the target's HEAD before this merge" in both
 			// modes, which several readers rely on.
-			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree))
-				.trim()
-				.slice(0, 40);
+			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
 			const plan = await planSnapshotMerge(source, target);
 			requireCompleteMergeTree(plan);
 
@@ -1190,9 +1280,7 @@ export const chapterMerge = {
 		);
 
 		return worktreeLock.acquire(targetWorktree, async () => {
-			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree))
-				.trim()
-				.slice(0, 40);
+			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
 			const plan = await planSnapshotMerge(source, target);
 			requireCompleteMergeTree(plan);
 
@@ -1351,10 +1439,46 @@ export const chapterMerge = {
 		);
 	},
 
-	/** Discard an in-flight interactive snapshot merge, restoring the pre-merge bytes. */
-	async abortInteractiveSnapshotMerge(targetWorktree: string, preMergeTree: string): Promise<void> {
+	/**
+	 * Discard an in-flight interactive snapshot merge, restoring the pre-merge bytes.
+	 *
+	 * **Explicit user cancel only.** `guard` is required: callers must present the
+	 * tree and HEAD the cancel was confirmed against. Startup recovery, expired
+	 * session sweeps, and any other automatic path must not call this method —
+	 * replaying a stale `preMergeTree` over later user work is the bug this guard
+	 * exists to prevent. Batch cancel passes `merge_sessions.conflictTree` +
+	 * `preMergeTargetSha`; when those are missing the cancel must refuse to restore
+	 * rather than fall back to an unguarded write.
+	 *
+	 * Inside the existing `worktreeLock`:
+	 *   1. Read real HEAD (`gitService.getHeadCommit`, empty-repo → null only).
+	 *   2. Compare with `guard.expectedHeadSha`; mismatch → ValidationError, no restore.
+	 *   3. Forward `guard.expectedCurrentTree` into `abortSnapshotMerge` →
+	 *      `materializeTree`'s 4th parameter; `restoreUnlocked` re-checks the tree
+	 *      immediately before writing (TOCTOU closed at the write).
+	 */
+	async abortInteractiveSnapshotMerge(
+		targetWorktree: string,
+		preMergeTree: string,
+		guard: InteractiveSnapshotMergeGuard,
+	): Promise<void> {
+		if (!guard?.expectedCurrentTree) {
+			throw new ValidationError(
+				"Interactive snapshot-merge abort requires a guard (expectedCurrentTree + " +
+					"expectedHeadSha). Automatic/startup recovery must not restore through this path.",
+			);
+		}
 		await worktreeLock.acquire(targetWorktree, async () => {
-			await abortSnapshotMerge(targetWorktree, preMergeTree);
+			const actualHead = normalizeHeadSha(await readRealHeadShaForGuard(targetWorktree));
+			const expectedHead = normalizeHeadSha(guard.expectedHeadSha);
+			if (actualHead !== expectedHead) {
+				throw new ValidationError(
+					`Cannot abort snapshot merge: HEAD moved since cancel was confirmed ` +
+						`(expected ${expectedHead ?? "empty repository"}, found ${actualHead ?? "empty repository"}). ` +
+						`Nothing has been restored.`,
+				);
+			}
+			await abortSnapshotMerge(targetWorktree, preMergeTree, guard.expectedCurrentTree);
 		});
 	},
 
@@ -1596,9 +1720,7 @@ export const chapterMerge = {
 		);
 
 		return worktreeLock.acquire(targetWorktree, async () => {
-			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree))
-				.trim()
-				.slice(0, 40);
+			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
 			const plan = await planSnapshotMerge(source, target);
 			requireCompleteMergeTree(plan);
 
@@ -1658,6 +1780,12 @@ export const chapterMerge = {
 				}
 				const remaining = await detectRemainingConflicts(targetWorktree, plan.conflicts);
 				if (remaining.length > 0) {
+					// Auto compensation, not user cancel: `plan.preMergeTree` was captured
+					// moments ago inside this same `worktreeLock` section — not a stale
+					// startup session. The worktree has legitimately moved past the conflicted
+					// tree (the narrator was resolving), so this call stays unguarded on
+					// purpose. Do not route startup recovery here, and do not "close" this
+					// by replaying an old tree under an interactive guard.
 					await abortSnapshotMerge(targetWorktree, plan.preMergeTree);
 					return {
 						resolved: false,
@@ -1672,6 +1800,10 @@ export const chapterMerge = {
 			} catch (err) {
 				logger.error("AI conflict resolution failed (snapshot mode)", { error: String(err) });
 				try {
+					// Same fresh-coordinate compensation as above. Residual risk: a concurrent
+					// editor that does not take `worktreeLock` could still race this restore;
+					// that is pre-existing and out of this fix's scope (reported to the main
+					// narrator), not a licence to leave startup aborts unguarded.
 					await abortSnapshotMerge(targetWorktree, plan.preMergeTree);
 				} catch {
 					// best effort

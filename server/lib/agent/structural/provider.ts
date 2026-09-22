@@ -231,6 +231,12 @@ export interface StructureProvider {
 	 */
 	supports(doc: StructDocument): Promise<ProviderSupport> | ProviderSupport;
 	outline(doc: StructDocument): Promise<OutlineNode[]>;
+	/**
+	 * Whether the outline hit a traversal/output budget. Readers must label partial
+	 * results; symbol-based edits and stashes must refuse them because missing
+	 * declarations can make an ambiguous selector look unique. Shares the outline cache.
+	 */
+	isOutlineTruncated?(doc: StructDocument): Promise<boolean>;
 	locate(doc: StructDocument, selector: StructSelector): Promise<LocatedNode[]>;
 	/** Innermost-first chain of named ancestors at a position. */
 	enclosing(doc: StructDocument, position: StructPosition): Promise<LocatedNode[]>;

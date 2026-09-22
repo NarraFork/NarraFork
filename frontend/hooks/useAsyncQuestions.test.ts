@@ -35,7 +35,7 @@ const q = (id: string, overrides: Partial<AsyncQuestion> = {}): AsyncQuestion =>
 	narratorId: "n1",
 	toolCallId: `call-${id}`,
 	toolUseId: `tu-${id}`,
-	questions: [{ question: "k", header: "h" }],
+	questions: [{ id: "k", header: "h" }],
 	answers: null,
 	status: "open",
 	origin: "agent_async",

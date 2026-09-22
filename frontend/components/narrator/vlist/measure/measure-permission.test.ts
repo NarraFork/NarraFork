@@ -11,7 +11,7 @@ beforeAll(() => {
 // each char = 0.6 × fontSize, so ~8 chars @ 14px ≈ 67px ≪ any test width).
 const SHORT = "OK";
 
-function q(header: string, options: Array<{ label: string; description?: string }> = []) {
+function q(header: string, options: Array<{ header: string; description?: string }> = []) {
 	return { header, options };
 }
 
@@ -55,9 +55,9 @@ describe("measureAskUserQuestion — chrome + linear growth", () => {
 		);
 		const c = MEASURE_PERMISSION_CONSTANTS;
 		const zero = measureAskUserQuestion({ questions: [q(SHORT)] }, 600);
-		const oneOpt = measureAskUserQuestion({ questions: [q(SHORT, [{ label: SHORT }])] }, 600);
+		const oneOpt = measureAskUserQuestion({ questions: [q(SHORT, [{ header: SHORT }])] }, 600);
 		const twoOpt = measureAskUserQuestion(
-			{ questions: [q(SHORT, [{ label: SHORT }, { label: SHORT }])] },
+			{ questions: [q(SHORT, [{ header: SHORT }, { header: SHORT }])] },
 			600,
 		);
 		// First option replaces nothing; it inserts a label line separated from the
@@ -72,9 +72,9 @@ describe("measureAskUserQuestion — chrome + linear growth", () => {
 			"./measure-permission"
 		);
 		const c = MEASURE_PERMISSION_CONSTANTS;
-		const noDesc = measureAskUserQuestion({ questions: [q(SHORT, [{ label: SHORT }])] }, 600);
+		const noDesc = measureAskUserQuestion({ questions: [q(SHORT, [{ header: SHORT }])] }, 600);
 		const withDesc = measureAskUserQuestion(
-			{ questions: [q(SHORT, [{ label: SHORT, description: SHORT }])] },
+			{ questions: [q(SHORT, [{ header: SHORT, description: SHORT }])] },
 			600,
 		);
 		expect(withDesc.height - noDesc.height).toBe(
@@ -86,11 +86,11 @@ describe("measureAskUserQuestion — chrome + linear growth", () => {
 	it("tags options as checkbox controls when multiSelect, radio otherwise", async () => {
 		const { measureAskUserQuestion } = await import("./measure-permission");
 		const radio = measureAskUserQuestion(
-			{ questions: [{ header: SHORT, options: [{ label: SHORT }], multiSelect: false }] },
+			{ questions: [{ header: SHORT, options: [{ header: SHORT }], multiSelect: false }] },
 			600,
 		);
 		const check = measureAskUserQuestion(
-			{ questions: [{ header: SHORT, options: [{ label: SHORT }], multiSelect: true }] },
+			{ questions: [{ header: SHORT, options: [{ header: SHORT }], multiSelect: true }] },
 			600,
 		);
 		expect(radio.metas.find((m) => m.role === "option-label")?.control).toBe("radio");
@@ -114,8 +114,8 @@ describe("measureAskUserQuestion — wrapping (pretext, zero DOM)", () => {
 		);
 		const c = MEASURE_PERMISSION_CONSTANTS;
 		const longLabel = "word ".repeat(30).trim();
-		const wide = measureAskUserQuestion({ questions: [q(SHORT, [{ label: longLabel }])] }, 2000);
-		const narrow = measureAskUserQuestion({ questions: [q(SHORT, [{ label: longLabel }])] }, 200);
+		const wide = measureAskUserQuestion({ questions: [q(SHORT, [{ header: longLabel }])] }, 2000);
+		const narrow = measureAskUserQuestion({ questions: [q(SHORT, [{ header: longLabel }])] }, 200);
 		const delta = narrow.height - wide.height;
 		expect(delta).toBeGreaterThan(0);
 		// The delta is entirely extra label lines → a multiple of the label line box.
@@ -129,7 +129,7 @@ describe("measureAskUserQuestion — wrapping (pretext, zero DOM)", () => {
 		const c = MEASURE_PERMISSION_CONSTANTS;
 		expect(c.OPTION_INDENT).toBe(c.OPTION_CONTROL_SIZE + c.OPTION_LABEL_OFFSET);
 		// The option-label block carries the indent as its contentLeft.
-		const r = measureAskUserQuestion({ questions: [q(SHORT, [{ label: SHORT }])] }, 600);
+		const r = measureAskUserQuestion({ questions: [q(SHORT, [{ header: SHORT }])] }, 600);
 		const optIndex = r.metas.findIndex((m) => m.role === "option-label");
 		expect(r.blocks[optIndex]?.contentLeft).toBe(c.OPTION_INDENT);
 	});
@@ -174,7 +174,7 @@ describe("measureAskUserQuestion — read-only mode", () => {
 	it("drops the textarea, countdown and buttons; keeps header + options", async () => {
 		const { measureAskUserQuestion } = await import("./measure-permission");
 		const ro = measureAskUserQuestion(
-			{ questions: [q(SHORT, [{ label: SHORT }])], readOnly: true, hasCountdown: true },
+			{ questions: [q(SHORT, [{ header: SHORT }])], readOnly: true, hasCountdown: true },
 			600,
 		);
 		const roles = ro.metas.map((m) => m.role);

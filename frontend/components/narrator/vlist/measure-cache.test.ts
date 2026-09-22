@@ -749,28 +749,28 @@ describe("extractDataRevision", () => {
 		const unanswered = askDetail({
 			header: "Pick",
 			omitHeader: true,
-			options: [{ label: "Alpha" }, { label: "Beta" }],
+			options: [{ header: "Alpha" }, { header: "Beta" }],
 		});
 		const answered = askDetail({
 			header: "Pick",
 			omitHeader: true,
-			options: [{ label: "Alpha", selected: true }, { label: "Beta" }],
+			options: [{ header: "Alpha", selected: true }, { header: "Beta" }],
 			answer: "Answer: Alpha",
 		});
 		expect(extractDataRevision(unanswered)).not.toBe(extractDataRevision(answered));
 
 		// Option / question count and description text all move the revision.
-		const oneOption = askDetail({ header: "Pick", options: [{ label: "Alpha" }] });
+		const oneOption = askDetail({ header: "Pick", options: [{ header: "Alpha" }] });
 		expect(extractDataRevision(oneOption)).not.toBe(extractDataRevision(unanswered));
 		const described = askDetail({
 			header: "Pick",
-			options: [{ label: "Alpha", description: "a much longer description line" }],
+			options: [{ header: "Alpha", description: "a much longer description line" }],
 		});
 		expect(extractDataRevision(described)).not.toBe(extractDataRevision(oneOption));
 		// omitHeader changes the height (one row less) and must be part of the key.
 		expect(extractDataRevision(oneOption)).not.toBe(
 			extractDataRevision(
-				askDetail({ header: "Pick", omitHeader: true, options: [{ label: "Alpha" }] }),
+				askDetail({ header: "Pick", omitHeader: true, options: [{ header: "Alpha" }] }),
 			),
 		);
 	});

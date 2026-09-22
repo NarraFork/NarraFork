@@ -158,6 +158,19 @@ if (postgresRuntime) {
 	await activatePostgresRuntimeQueue();
 }
 
+// Invalidate interrupted merge sessions before HTTP/WS or narrator recovery can
+// accept an old continue/cancel decision. This gate only updates session metadata;
+// it must never restore a worktree or advance chapter snapshots. Fail closed if
+// the database cannot invalidate old sessions, rather than serving stale commands.
+try {
+	await chapterBatchMerge.cleanupStaleSessions();
+} catch (error) {
+	logger.error("Interrupted merge-session startup gate failed; refusing to serve requests", {
+		error: String(error),
+	});
+	throw error;
+}
+
 // Track event-loop stalls early so blocking operations are visible in logs/diagnostics.
 startEventLoopMonitor();
 
@@ -1424,11 +1437,6 @@ async function reportBrokenModelNarrators(recoveryError: string): Promise<void> 
 		});
 	}
 }
-
-// Mark interrupted merge sessions as error
-chapterBatchMerge.cleanupStaleSessions().catch((err) => {
-	logger.error("Merge session cleanup failed", { error: String(err) });
-});
 
 // Clean up leftover share directories from previous server runs
 import { cleanupStaleShares } from "./lib/shares";

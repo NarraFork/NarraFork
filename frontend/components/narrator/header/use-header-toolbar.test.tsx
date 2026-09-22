@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { parseHTML } from "linkedom";
 import { act, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import * as capacityHooks from "../../../hooks/useNarratorHeaderToolbarCapacity";
 import * as layoutHooks from "../../../hooks/useNarratorToolbarLayout";
 import { PathRulesPopover } from "../interaction/PathRulesPopover";
 import { narratorToolbarItem } from "./narrator-toolbar-items";
@@ -10,7 +9,6 @@ import {
 	type UseHeaderToolbarOptions,
 	type UseHeaderToolbarResult,
 	useHeaderToolbar,
-	useHeaderToolbarCapacityPartition,
 } from "./use-header-toolbar";
 
 let root: Root;
@@ -105,21 +103,17 @@ function overlay() {
 
 describe("panel toolbar controller", () => {
 	test("does not own width capacity state", async () => {
-		const capacity = spyOn(capacityHooks, "useNarratorHeaderToolbarCapacity").mockReturnValue(2);
-		try {
-			await render();
-			expect(capacity).not.toHaveBeenCalled();
-			expect("toolbarVisibleDefs" in controller).toBe(false);
-		} finally {
-			capacity.mockRestore();
-		}
+		await render();
+		// Title width is pretext-measured in the title slot; this controller only
+		// exposes layout zones (surfaced / tucked / bottom).
+		expect("toolbarVisibleDefs" in controller).toBe(false);
+		expect(controller.toolbarSurfacedDefs).toEqual([]);
+		expect(controller.toolbarTuckedDefs).toEqual([]);
 	});
 
 	test("bottom entries stay out of the header hidden list", async () => {
 		await render();
 		expect(controller.toolbarBottomDefs.map((def) => def.id)).toEqual(["path-rules", "terminal"]);
-		expect(controller.toolbarSurfacedDefs).toEqual([]);
-		expect(controller.toolbarTuckedDefs).toEqual([]);
 	});
 
 	test("path rules opens a separately hosted dialog and closes through its callback", async () => {
@@ -145,53 +139,5 @@ describe("panel toolbar controller", () => {
 		await render(props);
 		controller.activateToolbarEntry("terminal");
 		expect(props.toggleTerminalTool).toHaveBeenCalledTimes(1);
-	});
-});
-
-describe("useHeaderToolbarCapacityPartition", () => {
-	function partitionProbe() {
-		const result = { current: null as null | ReturnType<typeof useHeaderToolbarCapacityPartition> };
-		function Probe2(props: Parameters<typeof useHeaderToolbarCapacityPartition>[0]) {
-			result.current = useHeaderToolbarCapacityPartition(props);
-			return null;
-		}
-		return { result, Probe2 };
-	}
-
-	test("reserves title width first; only mobile adds the count cap", async () => {
-		const capacity = spyOn(capacityHooks, "useNarratorHeaderToolbarCapacity").mockReturnValue(2);
-		const { result, Probe2 } = partitionProbe();
-		const base = {
-			surfacedDefs: [narratorToolbarItem("tasks"), narratorToolbarItem("git")].filter(
-				(def): def is NonNullable<typeof def> => !!def,
-			),
-			tuckedDefs: [],
-			headerRowRef: { current: null },
-			headerToolbarRef: { current: null },
-			headerLeadingRef: { current: null },
-			hostOwnsTitle: false,
-			isWorkspacePreview: false,
-		};
-		try {
-			await act(async () => root.render(<Probe2 {...base} isMobileViewport />));
-			expect(capacity).toHaveBeenLastCalledWith(
-				expect.objectContaining({
-					maxWidthFraction: null,
-					maxCapacity: 2,
-					titleSlotMinWidth: 184,
-				}),
-			);
-			expect(result.current?.toolbarVisibleDefs.map((def) => def.id)).toEqual(["tasks", "git"]);
-			await act(async () => root.render(<Probe2 {...base} isMobileViewport={false} />));
-			expect(capacity).toHaveBeenLastCalledWith(
-				expect.objectContaining({
-					maxWidthFraction: null,
-					maxCapacity: null,
-					titleSlotMinWidth: 184,
-				}),
-			);
-		} finally {
-			capacity.mockRestore();
-		}
 	});
 });

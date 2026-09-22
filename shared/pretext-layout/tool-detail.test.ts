@@ -1002,8 +1002,8 @@ describe("classifyToolDetail — ask", () => {
 			],
 		});
 		expect(d.questions[0]?.options).toEqual([
-			{ label: "Alpha" },
-			{ label: "Beta", description: "the second" },
+			{ header: "Alpha" },
+			{ header: "Beta", description: "the second" },
 		]);
 	});
 	it("marks the chosen option and prefixes the answer", () => {

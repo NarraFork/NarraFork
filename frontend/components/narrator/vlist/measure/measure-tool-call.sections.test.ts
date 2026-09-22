@@ -316,9 +316,9 @@ describe("measureToolDetail — ask replay", () => {
 
 	it("omitHeader drops exactly the header row", async () => {
 		const p = await askChrome();
-		const withHeader = await measureAsk([{ header: "Pick one", options: [{ label: "Alpha" }] }]);
+		const withHeader = await measureAsk([{ header: "Pick one", options: [{ header: "Alpha" }] }]);
 		const without = await measureAsk([
-			{ header: "Pick one", omitHeader: true, options: [{ label: "Alpha" }] },
+			{ header: "Pick one", omitHeader: true, options: [{ header: "Alpha" }] },
 		]);
 		// The header row plus the gap that separated it from the first option.
 		expect(withHeader.height - without.height).toBe(p.HEADER_LINE_HEIGHT + p.QUESTION_STACK_GAP);
@@ -327,10 +327,10 @@ describe("measureToolDetail — ask replay", () => {
 	it("each option adds a label row, and a description its own smaller row", async () => {
 		const p = await askChrome();
 		const bare = await measureAsk([
-			{ header: "H", options: [{ label: "Alpha" }, { label: "Beta" }] },
+			{ header: "H", options: [{ header: "Alpha" }, { header: "Beta" }] },
 		]);
 		const withDesc = await measureAsk([
-			{ header: "H", options: [{ label: "Alpha" }, { label: "Beta", description: "second" }] },
+			{ header: "H", options: [{ header: "Alpha" }, { header: "Beta", description: "second" }] },
 		]);
 		expect(withDesc.height - bare.height).toBe(
 			p.OPTION_DESC_MARGIN_TOP + p.OPTION_DESC_LINE_HEIGHT,
@@ -339,21 +339,21 @@ describe("measureToolDetail — ask replay", () => {
 
 	it("options stack with the tighter options gap", async () => {
 		const p = await askChrome();
-		const one = await measureAsk([{ header: "H", options: [{ label: "Alpha" }] }]);
+		const one = await measureAsk([{ header: "H", options: [{ header: "Alpha" }] }]);
 		const two = await measureAsk([
-			{ header: "H", options: [{ label: "Alpha" }, { label: "Beta" }] },
+			{ header: "H", options: [{ header: "Alpha" }, { header: "Beta" }] },
 		]);
 		expect(two.height - one.height).toBe(p.OPTIONS_GAP + p.OPTION_LABEL_LINE_HEIGHT);
 	});
 
 	it("the answer row adds one sm line, the custom answer one xs mono line", async () => {
 		const p = await askChrome();
-		const base = await measureAsk([{ header: "H", options: [{ label: "Alpha" }] }]);
+		const base = await measureAsk([{ header: "H", options: [{ header: "Alpha" }] }]);
 		const answered = await measureAsk([
-			{ header: "H", options: [{ label: "Alpha" }], answer: "Answer: Alpha" },
+			{ header: "H", options: [{ header: "Alpha" }], answer: "Answer: Alpha" },
 		]);
 		const custom = await measureAsk([
-			{ header: "H", options: [{ label: "Alpha" }], customAnswer: "Custom answer: other" },
+			{ header: "H", options: [{ header: "Alpha" }], customAnswer: "Custom answer: other" },
 		]);
 		expect(answered.height - base.height).toBe(p.QUESTION_STACK_GAP + p.OPTION_LABEL_LINE_HEIGHT);
 		expect(custom.height - base.height).toBe(p.QUESTION_STACK_GAP + p.CUSTOM_ANSWER_LINE_HEIGHT);
@@ -370,17 +370,17 @@ describe("measureToolDetail — ask replay", () => {
 	});
 
 	it("selection is height-neutral (render-only)", async () => {
-		const plain = await measureAsk([{ header: "H", options: [{ label: "Alpha" }] }]);
+		const plain = await measureAsk([{ header: "H", options: [{ header: "Alpha" }] }]);
 		const selected = await measureAsk([
-			{ header: "H", options: [{ label: "Alpha", selected: true }] },
+			{ header: "H", options: [{ header: "Alpha", selected: true }] },
 		]);
 		expect(selected.height).toBe(plain.height);
 	});
 
 	it("multiSelect is height-neutral (only the control glyph changes)", async () => {
-		const radio = await measureAsk([{ header: "H", options: [{ label: "Alpha" }] }]);
+		const radio = await measureAsk([{ header: "H", options: [{ header: "Alpha" }] }]);
 		const checkbox = await measureAsk([
-			{ header: "H", multiSelect: true, options: [{ label: "Alpha" }] },
+			{ header: "H", multiSelect: true, options: [{ header: "Alpha" }] },
 		]);
 		expect(checkbox.height).toBe(radio.height);
 	});
@@ -389,7 +389,7 @@ describe("measureToolDetail — ask replay", () => {
 		const m = await mod();
 		const questions: AskQuestion[] = Array.from({ length: 40 }, (_, qi) => ({
 			header: `Q${qi}`,
-			options: Array.from({ length: 40 }, (_, oi) => ({ label: `O${oi}` })),
+			options: Array.from({ length: 40 }, (_, oi) => ({ header: `O${oi}` })),
 		}));
 		const all = await measureAsk(questions);
 		const capped = await measureAsk(
@@ -413,7 +413,7 @@ describe("measureToolDetail — ask replay", () => {
 		const d = await measureSections([
 			{
 				key: "meta.header",
-				body: { kind: "ask", questions: [{ header: "Pick", options: [{ label: "Alpha" }] }] },
+				body: { kind: "ask", questions: [{ header: "Pick", options: [{ header: "Alpha" }] }] },
 			},
 			{
 				key: "section.error",

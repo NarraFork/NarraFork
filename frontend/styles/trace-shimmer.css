@@ -168,7 +168,7 @@
 /*
  * Queued — parked slate text, NOT a travelling highlight.
  *
- * Same reading as the card's left stripe: parameters are ready, an earlier call
+ * Same reading as the card's wash: parameters are ready, an earlier call
  * in the turn still owns the slot. The gradient is static (left-weighted slate
  * over dimmed grey); only opacity breathes, slowly. Height-neutral: only
  * background / text-fill / opacity move.
@@ -177,8 +177,8 @@
 	background-image: linear-gradient(
 		90deg,
 		light-dark(var(--mantine-color-slate-7), var(--mantine-color-slate-4)) 0%,
-		light-dark(var(--mantine-color-slate-6), var(--mantine-color-slate-5)) 35%,
-		var(--mantine-color-dimmed) 70%,
+		light-dark(var(--mantine-color-slate-6), var(--mantine-color-slate-5)) 28%,
+		var(--mantine-color-dimmed) 62%,
 		var(--mantine-color-dimmed) 100%
 	);
 	animation: nf-card-queued-pulse 2.4s ease-in-out infinite;

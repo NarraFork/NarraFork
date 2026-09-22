@@ -70,7 +70,7 @@ const observe = (event: NarraForkEvent) => {
 let questionId = "unknown";
 let localBroadcasts = 0;
 const controllers: AbortController[] = [];
-const questions = [{ question: "choice", header: "Choose", options: [{ label: "yes" }] }];
+const questions = [{ id: "choice", header: "Choose", options: [{ header: "yes" }] }];
 eventBus.onAny(observe);
 
 beforeEach(async () => {

@@ -841,7 +841,8 @@ function leafTextRevision(d: Record<string, unknown>): string {
 			for (const option of q.options as unknown[]) {
 				if (option == null || typeof option !== "object") continue;
 				const o = option as Record<string, unknown>;
-				if (typeof o.label === "string") rev += `|al:${textSignature(o.label)}`;
+				if (typeof o.header === "string") rev += `|al:${textSignature(o.header)}`;
+				else if (typeof o.label === "string") rev += `|al:${textSignature(o.label)}`;
 				if (typeof o.description === "string") rev += `|ad:${textSignature(o.description)}`;
 				// Selection is height-neutral on its own, but it flips with the answer and
 				// keeping it here makes the revision a faithful digest of the payload.

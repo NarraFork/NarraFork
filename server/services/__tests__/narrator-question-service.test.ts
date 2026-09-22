@@ -151,9 +151,9 @@ async function seedToolCall(
 
 const QUESTIONS = [
 	{
-		question: "cache-layer",
+		id: "cache-layer",
 		header: "Which cache layer should the API use?",
-		options: [{ label: "Redis", description: "Shared, needs a service" }],
+		options: [{ header: "Redis", description: "Shared, needs a service" }],
 	},
 ];
 

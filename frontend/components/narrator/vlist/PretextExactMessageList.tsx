@@ -1198,6 +1198,7 @@ export const PretextExactMessageList = memo(
 				smoothFollowerRef.current?.snapToTarget();
 				// Reduced motion: no capture, so the layout effect below finds nothing to play
 				// and the fold applies instantly (the committed geometry).
+				foldCaptureRef.current = null;
 				if (prefersReducedMotion()) return;
 				const read = readFoldGeometryRef.current?.();
 				if (!read || read.geometry.size === 0) {
@@ -1289,7 +1290,10 @@ export const PretextExactMessageList = memo(
 									| { rows?: readonly { key: string; cardMeasured?: unknown }[] }
 									| undefined;
 								const row = measured?.rows?.find((r) => r.key === rowKey);
-								if (row?.cardMeasured != null) {
+								// Without a capture (reduced motion or unavailable geometry), no
+								// resize op will run and no onDone will release the card. Commit
+								// the summary directly instead of retaining it in the short row.
+								if (row?.cardMeasured != null && foldCaptureRef.current !== null) {
 									setClosingRows((prev) => {
 										const next = new Map(prev);
 										const rows = new Set(prev.get(key) ?? []);

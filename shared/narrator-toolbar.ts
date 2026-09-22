@@ -11,13 +11,14 @@
  *
  * The order below is the DEFAULT order for fresh installs, roughly "how often a
  * reader reaches for it". It is NOT a visibility list — the layout assigns ids
- * to header/menu/bottom zones and the *host* decides how many
- * actually fit: the desktop header MEASURES its available width and collapses
- * the rest into the overflow menu (see
- * `frontend/components/narrator/header/narrator-header-toolbar-capacity.ts`), while the
- * mobile header additionally applies the fixed cap below. Earlier the desktop
- * row rendered every surfaced entry and let the title compress instead, which
- * squeezed long titles down to a few characters.
+ * to header/menu/bottom zones and the *host* decides how many actually fit:
+ * the header MEASURES its available width on every viewport (including mobile)
+ * and collapses the rest into the overflow menu (see
+ * `frontend/components/narrator/header/narrator-header-toolbar-capacity.ts`).
+ * There is no fixed mobile count cap — a wider phone simply fits more icons
+ * after the title floor. Earlier the desktop row rendered every surfaced entry
+ * and let the title compress instead, which squeezed long titles down to a few
+ * characters.
  *
  * Two classes of control are deliberately absent:
  *
@@ -80,14 +81,3 @@ const TOOLBAR_ID_SET: ReadonlySet<string> = new Set<string>(NARRATOR_TOOLBAR_IDS
 export function isNarratorToolbarId(id: string): id is NarratorToolbarId {
 	return TOOLBAR_ID_SET.has(id);
 }
-
-/**
- * How many entries the mobile header surfaces before the overflow menu.
- *
- * A fixed cap rather than the desktop's width measurement: on a phone the title
- * must keep a readable share of a ~360px row, and a measured layout would let a
- * short title hand its width to buttons and then reflow the moment the title
- * updates (narrator titles are generated asynchronously). Two entries plus the
- * overflow button is what fits beside a truncated title at that width.
- */
-export const MOBILE_TOOLBAR_VISIBLE_LIMIT = 2;

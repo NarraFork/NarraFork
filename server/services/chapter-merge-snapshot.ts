@@ -25,6 +25,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, projects } from "../db/schema";
+import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { catalogError, NotFoundError, ValidationError } from "../lib/errors";
 import {
 	type GitTreeMergeResult,
@@ -314,33 +315,32 @@ function hasConflictMarkers(text: string): boolean {
 }
 
 /**
- * Undo an in-flight snapshot merge, returning the worktree to its pre-merge bytes.
+ * Restore pre-merge bytes. Never call this from startup or stale-session cleanup.
  *
- * Stronger than `git merge --abort`, which can only restore what git was tracking:
- * this restores the recorded workspace, so files the user had not staged — including
- * untracked ones present when the merge began — come back as they were.
+ * Interactive cancellation supplies the recorded conflict tree as a write-time
+ * guard, via chapterMerge.abortInteractiveSnapshotMerge (which also checks HEAD).
+ * A mismatch must preserve the user's work rather than erase later edits.
  *
- * Deliberately *not* guarded with `expectedCurrentTree`, unlike {@link applySnapshotMerge}
- * and {@link applySnapshotUnmerge}. The two cases differ in what the caller knows:
- *
- *   - An apply writes a tree computed from a specific state, so a state that moved
- *     invalidates the tree and the write must be refused.
- *   - An abort writes a tree that is correct by definition — the recorded pre-merge
- *     bytes — and runs precisely when the worktree has been edited past the conflicted
- *     tree, because a narrator or the user was part-way through resolving. Guarding it
- *     on the conflicted tree would make abort fail in exactly the situation it exists
- *     for and leave conflict markers on disk with nothing left to clean them up.
- *
- * The hazard an abort does have — replaying a stale restore over work done after an
- * earlier abort — is addressed where the coordinate lives rather than here: the
- * `merge_sessions` row's snapshot fields are cleared once consumed, so there is no
- * second abort to issue. See `chapter-batch-merge.resolveDecision`.
+ * The optional form remains for the existing in-session AI failure compensation.
+ * It is not protected against unrelated editors that bypass worktreeLock; keeping
+ * that legacy caller compatible does not make it safe for stale-session recovery.
  */
 export async function abortSnapshotMerge(
 	targetWorktree: string,
 	preMergeTree: string,
+	/**
+	 * When present, passed to `materializeTree` as the expected current tree.
+	 * `restoreUnlocked` captures the real tree first and throws before any write
+	 * on mismatch, closing the TOCTOU window at the write itself.
+	 */
+	expectedCurrentTree?: string,
 ): Promise<string[]> {
-	const restored = await worktreeTreeSnapshot.materializeTree(targetWorktree, preMergeTree);
+	const restored = await worktreeTreeSnapshot.materializeTree(
+		targetWorktree,
+		preMergeTree,
+		LOCAL_DEVICE_ID,
+		expectedCurrentTree,
+	);
 	await advanceChapterSnapshot(targetWorktree, preMergeTree, "merge aborted");
 	return restored;
 }

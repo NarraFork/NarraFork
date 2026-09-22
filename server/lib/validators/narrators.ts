@@ -595,12 +595,17 @@ export const suggestAnswersSchema = z.object({
 	questions: z
 		.array(
 			z.object({
-				question: z.string().min(1),
+				// Advertised shape is header + description only; legacy key fields are
+				// accepted so older clients can still post suggest payloads.
+				id: z.string().min(1).optional(),
+				question: z.string().min(1).optional(),
 				header: z.string().min(1),
+				description: z.string().optional(),
 				options: z.array(
 					z.object({
-						label: z.string(),
-						description: z.string(),
+						header: z.string().min(1).optional(),
+						label: z.string().optional(),
+						description: z.string().optional(),
 					}),
 				),
 				multiSelect: z.boolean().optional(),

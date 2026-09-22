@@ -42,10 +42,14 @@ export interface PendingPermission {
 
 /** One question definition inside an async question record. */
 export interface AsyncQuestionDefinition {
-	question: string;
+	/** Internal draft key; not advertised to models. */
+	id: string;
+	/** SHORT title shown as the heading; also the model-facing answers key. */
 	header: string;
+	/** Optional FULL prompt / extra context under the header. */
+	description?: string;
 	multiSelect?: boolean;
-	options?: { label: string; description?: string; preview?: string }[];
+	options?: { header: string; description?: string; preview?: string }[];
 }
 
 export type AsyncQuestionStatus = "open" | "answered" | "dismissed" | "withdrawn";

@@ -294,6 +294,40 @@ export function useVListStreamingMessage(
 				}
 			},
 			onStreamingSnapshot: (snapshot) => {
+				let toolsChanged = false;
+				for (const chunk of snapshot.toolChunks) {
+					if (!isSubagent && chunk.parentToolUseId) continue;
+					if (persistedToolUseIds.has(chunk.toolUseId)) continue;
+					// A name-only tool may receive no more deltas for a long time.
+					// Restore it from the subscription snapshot, not the next live event.
+					toolsChanged = applyStreamingToolChunk(toolStoreRef.current, chunk) || toolsChanged;
+					if (chunk.started) {
+						toolsChanged =
+							applyStreamingToolStarted(toolStoreRef.current, {
+								...chunk,
+								input: chunk.input as Record<string, unknown> | undefined,
+							}) || toolsChanged;
+					}
+					if (chunk.executing) {
+						toolsChanged = applyStreamingToolExecuting(toolStoreRef.current, chunk) || toolsChanged;
+					}
+					if (chunk.streamingOutput !== undefined) {
+						toolsChanged =
+							applyStreamingToolOutput(
+								toolStoreRef.current,
+								chunk.toolUseId,
+								chunk.streamingOutput,
+							) || toolsChanged;
+					}
+					if (chunk.structuredProgress) {
+						toolsChanged =
+							applyStreamingToolProgress(
+								toolStoreRef.current,
+								chunk.toolUseId,
+								chunk.structuredProgress,
+							) || toolsChanged;
+					}
+				}
 				if (
 					applyExactStreamingSnapshot(
 						blocksRef.current,
@@ -304,6 +338,10 @@ export function useVListStreamingMessage(
 					)
 				) {
 					liveBlockRef.current = blocksRef.current.at(-1) ?? null;
+					flush();
+				}
+				if (toolsChanged) {
+					liveBlockRef.current = null;
 					flush();
 				}
 			},

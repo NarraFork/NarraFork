@@ -7,38 +7,51 @@ import {
 } from "../ask-user-question";
 
 describe("AskUserQuestion", () => {
-	test("rejects missing or placeholder question keys", () => {
-		expect(
-			askUserQuestionTool.parameters.safeParse({
-				questions: [
-					{
-						header: "测试策略",
-						options: [{ label: "坚持全修", description: "" }],
-					},
-				],
-			}).success,
-		).toBe(false);
-		expect(
-			askUserQuestionTool.parameters.safeParse({
-				questions: [
-					{
-						question: "undefined",
-						header: "测试策略",
-						options: [{ label: "坚持全修", description: "" }],
-					},
-				],
-			}).success,
-		).toBe(false);
+	test("advertises only header/description on questions and options", () => {
+		const schema = askUserQuestionTool.rawJsonSchema as {
+			properties?: {
+				questions?: {
+					items?: {
+						required?: string[];
+						properties?: Record<string, unknown>;
+						additionalProperties?: boolean;
+					};
+				};
+			};
+		};
+		const items = schema.properties?.questions?.items;
+		expect(items?.required ?? []).toEqual(["header", "options"]);
+		expect(Object.keys(items?.properties ?? {}).sort()).toEqual([
+			"description",
+			"header",
+			"multiSelect",
+			"options",
+		]);
+		const questionProps = items?.properties as Record<string, { description?: string }>;
+		expect(questionProps.header?.description).toContain("SHORT title");
+		expect(questionProps.description?.description).toContain("FULL question text");
+		expect(items?.additionalProperties).toBe(false);
+		const optionProps = (
+			items?.properties as {
+				options?: { items?: { properties?: Record<string, unknown>; required?: string[] } };
+			}
+		)?.options?.items;
+		expect(optionProps?.required ?? []).toEqual(["header"]);
+		expect(Object.keys(optionProps?.properties ?? {}).sort()).toEqual([
+			"description",
+			"header",
+			"preview",
+		]);
 	});
 
-	test("accepts meaningful question keys and option previews", () => {
+	test("accepts short header + full description and option headers", () => {
 		expect(
 			askUserQuestionTool.parameters.safeParse({
 				questions: [
 					{
-						question: "strategy",
-						header: "测试策略",
-						options: [{ label: "坚持全修", description: "", preview: "preview" }],
+						header: "写路径权限策略",
+						description: "背景：内网已全放行；云端 key 逐点授予。写路径权限模型选哪个？",
+						options: [{ header: "挂权限点（推荐）", description: "推荐" }, { header: "维持现状" }],
 						multiSelect: false,
 					},
 				],
@@ -46,27 +59,30 @@ describe("AskUserQuestion", () => {
 		).toBe(true);
 	});
 
-	test("keeps multiSelect optional in raw schema and runtime validation", () => {
+	test("rejects questions without a header", () => {
 		expect(
 			askUserQuestionTool.parameters.safeParse({
 				questions: [
 					{
-						question: "strategy",
+						description: "只有描述没有正文",
+						options: [{ header: "A" }, { header: "B" }],
+					},
+				],
+			}).success,
+		).toBe(false);
+	});
+
+	test("keeps multiSelect optional", () => {
+		expect(
+			askUserQuestionTool.parameters.safeParse({
+				questions: [
+					{
 						header: "测试策略",
-						options: [{ label: "坚持全修", description: "" }],
+						options: [{ header: "坚持全修" }, { header: "另立 spec" }],
 					},
 				],
 			}).success,
 		).toBe(true);
-
-		const schema = askUserQuestionTool.rawJsonSchema as {
-			properties?: { questions?: { items?: { required?: string[] } } };
-		};
-		expect(schema.properties?.questions?.items?.required ?? []).toEqual([
-			"question",
-			"header",
-			"options",
-		]);
 	});
 });
 
@@ -98,7 +114,7 @@ describe("AskUserQuestion — async mode predicates", () => {
 		// Still asking something → the questions decide how the call is treated.
 		expect(
 			isWithdrawOnlyAskRequest({
-				questions: [{ question: "k", header: "h", options: [] }],
+				questions: [{ header: "h", options: [] }],
 				withdraw: ["q1"],
 			}),
 		).toBe(false);
@@ -124,27 +140,10 @@ describe("AskUserQuestion — async mode predicates", () => {
 		expect(schema.properties?.withdraw?.type).toBe("array");
 	});
 
-	test("the description tells the model how to wait for an async answer", () => {
-		// Without this the async mode is a one-way street: the agent can defer a question
-		// but has no documented way to block on it when the answer finally does decide its
-		// next step, so it either guesses or re-asks synchronously.
-		const description =
-			typeof askUserQuestionTool.description === "function"
-				? askUserQuestionTool.description({} as import("../../types").AgentConfig)
-				: askUserQuestionTool.description;
-		expect(description).toContain('Await({ type: "question"');
-	});
-
-	test("a user-deferred call is validated like any other async submission", () => {
-		// The permission gate marks a "answer later" call with `deferredByUser` and flips
-		// it to `async`. That input must still validate, or the deferral would fail
-		// AFTER the user already released the loop — losing the question entirely.
-		expect(
-			askUserQuestionTool.parameters.safeParse({
-				questions: [{ question: "cache", header: "Which cache?", options: [] }],
-				async: true,
-				deferredByUser: true,
-			}).success,
-		).toBe(true);
+	test("the description tells the model header is short and description holds the prompt", () => {
+		expect(askUserQuestionTool.description).toContain("ONLY these two field names");
+		expect(askUserQuestionTool.description).toContain("SHORT title");
+		expect(askUserQuestionTool.description).toContain("FULL prompt");
+		expect(askUserQuestionTool.description).toContain("Do not cram the long prompt into `header`");
 	});
 });

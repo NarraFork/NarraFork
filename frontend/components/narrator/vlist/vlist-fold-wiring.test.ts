@@ -156,6 +156,82 @@ describe("fold transition: capture happens on the user's click", () => {
 	});
 });
 
+describe("fold transition: reduced-motion drill retention", () => {
+	// Execute the actual shell callbacks, not a copied model of their conditions.
+	// Mounting the whole shell would require its document/query/WS infrastructure.
+	function harness(reduced: boolean, geometryAvailable = true) {
+		const capture = sliceBracketedRegion(
+			SHELL,
+			"const captureFoldBefore = useCallback((key: string) => {",
+		);
+		const toggle = sliceBracketedRegion(
+			SHELL,
+			"onToggleRow: (rowIndex: number, rowKey?: string) => {",
+		);
+		expect(capture).not.toBeNull();
+		expect(toggle).not.toBeNull();
+		const code = new Bun.Transpiler({ loader: "ts" }).transformSync(`
+			let reduced = ${reduced};
+			const prefersReducedMotion = () => reduced;
+			const smoothFollowerRef = { current: null };
+			const foldCaptureRef = { current: { stale: true } };
+			const scrollTopRef = { current: 0 };
+			const readFoldGeometryRef = { current: () => (${geometryAvailable ? '{ geometry: new Map([["trace", {}]]), documentRevision: 1, lod: 1 }' : "null"}) };
+			const useCallback = (fn) => fn;
+			${capture}, []);
+			const key = "trace";
+			let hasCard = true;
+			let closingRows = new Map();
+			const measuredByKeyRef = { current: { get: () => ({ rows: [{ key: "tool", cardMeasured: hasCard ? {} : undefined }] }) } };
+			const setClosingRows = (update) => { closingRows = update(closingRows); };
+			const setInteraction = (update) => update({});
+			const toggleVListTraceRow = () => { hasCard = !hasCard; };
+			const toggleVListRow = () => { throw new Error("wrong fold channel"); };
+			const toggles = { ${toggle} };
+			return {
+				toggle: () => toggles.onToggleRow(0, "tool"),
+				closing: () => closingRows.get(key)?.has("tool") ?? false,
+				capture: () => foldCaptureRef.current,
+				hasCard: () => hasCard,
+			};
+		`);
+		return new Function(code)() as {
+			toggle(): void;
+			closing(): boolean;
+			capture(): unknown;
+			hasCard(): boolean;
+		};
+	}
+
+	it("repeated reduced-motion collapse/expand never retains a closing card or stale capture", () => {
+		const h = harness(true);
+		for (let i = 0; i < 3; i++) {
+			h.toggle();
+			expect(h.hasCard()).toBe(false);
+			expect(h.closing()).toBe(false);
+			expect(h.capture()).toBeNull();
+			h.toggle();
+			expect(h.hasCard()).toBe(true);
+			expect(h.closing()).toBe(false);
+		}
+	});
+
+	it("retains an animated collapse when geometry was captured", () => {
+		const h = harness(false);
+		h.toggle();
+		expect(h.hasCard()).toBe(false);
+		expect(h.closing()).toBe(true);
+		expect(h.capture()).not.toBeNull();
+	});
+
+	it("does not retain a card when geometry cannot be captured", () => {
+		const h = harness(false, false);
+		h.toggle();
+		expect(h.hasCard()).toBe(false);
+		expect(h.closing()).toBe(false);
+	});
+});
+
 describe("fold transition: play happens before paint", () => {
 	it("plays from a LAYOUT effect so the jumped-to state is never painted", () => {
 		// A passive effect runs AFTER paint: the reader would see the new geometry for
