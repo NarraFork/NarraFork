@@ -94,6 +94,8 @@ export interface AgentSectionProps {
 	setAutoContinuationMode: (v: AutoContinuationMode) => void;
 	maxTransientRetries: number;
 	setMaxTransientRetries: (v: number) => void;
+	maxToolCallsPerResponse: number;
+	setMaxToolCallsPerResponse: (v: number) => void;
 	silentToolCallThreshold: number;
 	setSilentToolCallThreshold: (v: number) => void;
 	pipelineUnusedToolCallThreshold: number;
@@ -416,6 +418,21 @@ export function AgentSection(props: AgentSectionProps) {
 				onChange={(v) => props.setMaxTransientRetries(typeof v === "number" ? v : 10)}
 				min={-1}
 				max={100}
+			/>
+			<NumberInput
+				label={t("maxToolCallsPerResponse")}
+				description={t("maxToolCallsPerResponseDesc")}
+				value={props.maxToolCallsPerResponse}
+				onChange={(v) =>
+					props.setMaxToolCallsPerResponse(
+						typeof v === "number" ? Math.max(1, Math.min(128, Math.trunc(v))) : 32,
+					)
+				}
+				min={1}
+				max={128}
+				step={1}
+				decimalScale={0}
+				allowDecimal={false}
 			/>
 			<NumberInput
 				label={t("silentToolCallThreshold")}

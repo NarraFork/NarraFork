@@ -12,7 +12,8 @@ process.env.NARRAFORK_HOME = testHome;
 const { db } = await import("../../db");
 const { narrators } = await import("../../db/schema");
 const { saveSettings, settings } = await import("../../lib/settings");
-const { buildServerRestartUrl, settingsRoutes } = await import("../settings");
+const { buildServerRestartUrl, settingsRoutes, updateSettingsSchema } = await import("../settings");
+const { getDefaults, deepMerge } = await import("../../lib/settings");
 
 afterAll(() => {
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
@@ -38,6 +39,29 @@ function appForRole(role: "admin" | "user") {
 	app.route("/settings", settingsRoutes);
 	return app;
 }
+
+describe("per-response tool-call limit settings", () => {
+	test("defaults to 32 and preserves legacy partial updates", () => {
+		expect(getDefaults().agent.maxToolCallsPerResponse).toBe(32);
+		const legacy = updateSettingsSchema.parse({ agent: { silentToolCallThreshold: 20 } });
+		expect(legacy.agent).not.toHaveProperty("maxToolCallsPerResponse");
+		expect(deepMerge(getDefaults(), legacy).agent.maxToolCallsPerResponse).toBe(32);
+		const configured = getDefaults();
+		configured.agent.maxToolCallsPerResponse = 64;
+		expect(deepMerge(configured, legacy).agent.maxToolCallsPerResponse).toBe(64);
+	});
+
+	test.each([1, 32, 128])("accepts integer limit %s", (limit) => {
+		const parsed = updateSettingsSchema.parse({ agent: { maxToolCallsPerResponse: limit } });
+		expect(parsed.agent?.maxToolCallsPerResponse).toBe(limit);
+	});
+
+	test.each([-1, 0, 129, 500, 1.5, "32", null])("rejects invalid limit %s", (limit) => {
+		expect(
+			updateSettingsSchema.safeParse({ agent: { maxToolCallsPerResponse: limit } }).success,
+		).toBe(false);
+	});
+});
 
 describe("settings restart redirects", () => {
 	test("preserves the request hostname when switching to a wildcard listener", async () => {

@@ -17,10 +17,13 @@ const nextTick = () => new Promise<void>((resolve) => setImmediate(resolve));
 type ChatScript = ProviderAdapter["chat"];
 let script: ChatScript;
 let attempts = 0;
+let scriptedAttempts = 1;
 const started: string[] = [];
 const starts = new Map<string, ReturnType<typeof gate>>();
 const finishes = new Map<string, ReturnType<typeof gate>>();
 const executionFailures = new Set<string>();
+const abortAwareValues = new Set<string>();
+const toolSignals = new Map<string, AbortSignal>();
 const names = [
 	"Write",
 	"Edit",
@@ -40,7 +43,7 @@ const provider: ProviderAdapter = {
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
-		if (++attempts > 1) {
+		if (++attempts > scriptedAttempts) {
 			yield { text: "done" };
 			return;
 		}
@@ -71,10 +74,18 @@ for (const name of names) {
 		name,
 		description: `Controlled ${name} execution`,
 		parameters: z.object({ value: z.string(), file_path: z.string().optional() }),
-		execute: async (input) => {
+		execute: async (input, ctx) => {
 			const value = String(input.value);
 			started.push(value);
+			toolSignals.set(value, ctx.signal);
 			starts.get(value)?.resolve();
+			if (abortAwareValues.has(value)) {
+				await new Promise<void>((resolve) => {
+					if (ctx.signal.aborted) resolve();
+					else ctx.signal.addEventListener("abort", () => resolve(), { once: true });
+				});
+				return { output: `cancelled:${value}`, isError: true };
+			}
 			await finishes.get(value)?.promise;
 			if (executionFailures.has(value)) throw new Error(`failed:${value}`);
 			return { output: `ok:${value}` };
@@ -84,10 +95,13 @@ for (const name of names) {
 
 beforeEach(() => {
 	attempts = 0;
+	scriptedAttempts = 1;
 	started.length = 0;
 	starts.clear();
 	finishes.clear();
 	executionFailures.clear();
+	abortAwareValues.clear();
+	toolSignals.clear();
 });
 afterAll(() => {
 	mock.module("../provider", () => realProviderModule);
@@ -134,6 +148,239 @@ function run(
 function expectSuccess(events: AgentEvent[]) {
 	expect(events.filter((event) => event.type === "error")).toEqual([]);
 }
+
+describe("per-response tool call limit", () => {
+	for (const shape of ["batch", "chunks"] as const) {
+		test(`711 distinct IDs stop at the default 32 without retry (${shape})`, async () => {
+			let providerSignal: AbortSignal | undefined;
+			script = async function* (params) {
+				providerSignal = params.signal;
+				const calls = Array.from({ length: 711 }, (_, i) => ({
+					...tool("Read", `value-${i % 13}`, i),
+					toolUseId: `call-${i}`,
+				}));
+				if (shape === "batch") yield { toolUses: calls };
+				else {
+					for (const call of calls) {
+						yield { toolUseChunk: { toolUseId: call.toolUseId, name: call.name } };
+						yield {
+							toolUseChunk: {
+								toolUseId: call.toolUseId,
+								input: JSON.stringify(call.input),
+								stop: true,
+							},
+						};
+					}
+				}
+			};
+			const controller = new AbortController();
+			const limits: number[] = [];
+			const events = await run({
+				signal: controller.signal,
+				onToolCallLimitExceeded: (limit) => {
+					limits.push(limit);
+				},
+			});
+			expect(limits).toEqual([32]);
+			const errors = events.filter((event) => event.type === "error");
+			expect(errors).toHaveLength(1);
+			expect(errors[0]?.message).toContain("32");
+			expect(
+				events.filter(
+					(event) => event.type === "block_complete" && event.block.type === "tool_use",
+				),
+			).toHaveLength(32);
+			expect(events.some((event) => event.type === "retrying")).toBe(false);
+			expect(
+				events.some((event) => event.type === "tool_call" && event.toolUseId === "call-32"),
+			).toBe(false);
+			expect(providerSignal?.aborted).toBe(true);
+			expect(controller.signal.aborted).toBe(false);
+			expect(attempts).toBe(1);
+		});
+	}
+
+	test("safety stop cancels the running tool, retains success and closes queued calls", async () => {
+		const running = watch("running");
+		abortAwareValues.add("running");
+		const controller = new AbortController();
+		script = async function* () {
+			yield { toolUses: [tool("Read", "success", 0)] };
+			await nextTick();
+			yield { toolUses: [tool("Write", "running", 1)] };
+			await running.started;
+			yield {
+				toolUses: Array.from({ length: 20 }, (_, i) => ({
+					...tool("Edit", "repeat", i + 2),
+					toolUseId: `repeat-${i}`,
+				})),
+			};
+		};
+		const events = await run({ signal: controller.signal, maxToolCallsPerResponse: 9 });
+		expect(started).toEqual(["success", "running"]);
+		expect(toolSignals.get("running")?.aborted).toBe(true);
+		expect(controller.signal.aborted).toBe(false);
+		expect(
+			events.filter((event) => event.type === "tool_result" && event.toolUseId === "success"),
+		).toEqual([expect.objectContaining({ output: "ok:success", isError: false })]);
+		expect(
+			events.filter(
+				(event) => event.type === "tool_result" && event.toolUseId.startsWith("repeat-"),
+			),
+		).toHaveLength(7);
+		expect(
+			events.some(
+				(event) =>
+					event.type === "block_complete" &&
+					event.block.type === "tool_use" &&
+					event.block.toolUseId === "repeat-7",
+			),
+		).toBe(false);
+		expect(events.at(-1)).toMatchObject({ type: "error", message: expect.stringContaining("9") });
+		expect(attempts).toBe(1);
+	});
+
+	test("129 start-only identities stop and discard incomplete cards", async () => {
+		script = async function* () {
+			for (let i = 0; i < 711; i++) {
+				yield { toolUseChunk: { toolUseId: `start-${i}`, name: "Read" } };
+			}
+		};
+		const limits: number[] = [];
+		const events = await run({
+			maxToolCallsPerResponse: 128,
+			onToolCallLimitExceeded: (limit) => {
+				limits.push(limit);
+			},
+		});
+		expect(limits).toEqual([128]);
+		expect(events.filter((event) => event.type === "tool_use_chunk")).toHaveLength(128);
+		expect(events.filter((event) => event.type === "error")).toEqual([
+			expect.objectContaining({ type: "error", message: expect.stringContaining("128") }),
+		]);
+		expect(
+			events
+				.filter((event) => event.type === "tool_use_discarded")
+				.flatMap((event) => event.toolUseIds),
+		).toHaveLength(128);
+		expect(started).toEqual([]);
+		expect(attempts).toBe(1);
+	});
+
+	test("identity budget resets for each provider reply", async () => {
+		scriptedAttempts = 2;
+		script = async function* () {
+			yield {
+				toolUses: Array.from({ length: 70 }, (_, i) => tool("Read", `turn-${attempts}-${i}`, i)),
+			};
+		};
+		const events = await run({ maxToolCallsPerResponse: 128 });
+		expectSuccess(events);
+		expect(started).toHaveLength(140);
+		expect(attempts).toBe(3);
+	});
+
+	test("post-stream parallel tools use one bounded abort drain", async () => {
+		const one = watch("one", true);
+		const two = watch("two", true);
+		const controller = new AbortController();
+		const detached: AgentEvent[] = [];
+		script = async function* () {
+			yield { toolUses: [tool("Read", "one", 0), tool("Read", "two", 1)] };
+		};
+		const pending = run({
+			signal: controller.signal,
+			deferEagerToolsForSafeStop: true,
+			onDetachedToolResult: async (event) => {
+				detached.push(event);
+			},
+		});
+		try {
+			await Promise.all([one.started, two.started]);
+			controller.abort();
+			const events = await pending;
+			expect(events.at(-1)).toMatchObject({ type: "error", message: "Aborted" });
+			expect(events.filter((event) => event.type === "tool_result")).toHaveLength(0);
+		} finally {
+			one.release();
+			two.release();
+		}
+		await nextTick();
+		expect(detached).toHaveLength(2);
+		expect(detached.every((event) => event.type === "tool_result" && !event.isError)).toBe(true);
+	});
+
+	test("abort at a tool_call yield never starts a deferred tool", async () => {
+		const controller = new AbortController();
+		script = async function* () {
+			yield { toolUses: [tool("Read", "one", 0), tool("Read", "two", 1)] };
+		};
+		const events = await run(
+			{ signal: controller.signal, deferEagerToolsForSafeStop: true },
+			(event) => {
+				if (event.type === "tool_call") controller.abort();
+			},
+		);
+		expect(started).toEqual([]);
+		expect(events.at(-1)).toMatchObject({ type: "error", message: "Aborted" });
+		expect(attempts).toBe(1);
+	});
+
+	test("stream chunks and completed duplicate share one identity budget slot", async () => {
+		script = async function* () {
+			yield { toolUseChunk: { toolUseId: "same", name: "Read" } };
+			yield { toolUseChunk: { toolUseId: "same", input: '{"value":"same"}', stop: true } };
+			yield { toolUses: [tool("Read", "same", 0)] };
+		};
+		const events = await run({ maxToolCallsPerResponse: 1 });
+		expectSuccess(events);
+		expect(started).toEqual(["same"]);
+	});
+
+	test("configured limit allows 100 distinct tools", async () => {
+		script = async function* () {
+			yield { toolUses: Array.from({ length: 100 }, (_, i) => tool("Read", `different-${i}`, i)) };
+		};
+		const events = await run({ maxToolCallsPerResponse: 128 });
+		expectSuccess(events);
+		expect(started).toHaveLength(100);
+	});
+
+	test("abort inside a batch ignores cached provider calls and preserves finished results", async () => {
+		const controller = new AbortController();
+		script = async function* () {
+			yield { toolUses: [tool("Read", "finished", 0)] };
+			await nextTick();
+			yield {
+				toolUses: Array.from({ length: 711 }, (_, i) => tool("Read", `buffered-${i}`, i + 1)),
+			};
+			// Deliberately ignores params.signal, like an already decoded SSE buffer.
+			yield { toolUses: [tool("Read", "cached-late", 999)] };
+		};
+		const events = await run({ signal: controller.signal }, (event) => {
+			if (
+				event.type === "block_complete" &&
+				event.block.type === "tool_use" &&
+				event.block.toolUseId === "buffered-0"
+			)
+				controller.abort();
+		});
+		expect(started).toEqual(["finished"]);
+		expect(
+			events.filter((event) => event.type === "tool_result" && event.toolUseId === "finished"),
+		).toEqual([expect.objectContaining({ isError: false, output: "ok:finished" })]);
+		expect(
+			events.some(
+				(event) =>
+					event.type === "tool_result" && event.toolUseId === "buffered-0" && event.isError,
+			),
+		).toBe(true);
+		expect(
+			events.some((event) => event.type === "tool_call" && event.toolUseId === "cached-late"),
+		).toBe(false);
+		expect(attempts).toBe(1);
+	});
+});
 
 describe("ordered streaming tool scheduling", () => {
 	test("Write starts with Edit input still open, then serial Write → Edit → Read finishes before stream end", async () => {
@@ -532,7 +779,9 @@ describe("detached eager tool results after interruption", () => {
 				persistReceipt,
 			);
 			expect(events.at(-1)).toMatchObject({ type: "error", message: "Aborted" });
-			expect(events.filter((event) => event.type === "tool_result")).toEqual([]);
+			expect(events.filter((event) => event.type === "tool_result")).toEqual([
+				expect.objectContaining({ toolUseId: "queued", isError: true, durationMs: 0 }),
+			]);
 			expect(detached).toEqual([]);
 			expect(started).toEqual(["write"]);
 			finishAfter.resolve();

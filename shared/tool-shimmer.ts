@@ -51,8 +51,20 @@ export type ToolShimmerPhase = "streaming" | "reflecting" | "running" | "queued"
 /** A one-shot closing sweep, played once as the call reaches a terminal state. */
 export type ToolShimmerFlash = "success" | "failed";
 
+/**
+ * Leaving `queued`: a short fade-out of the parked slate mark.
+ *
+ * Not a phase (the call is no longer queued) and not an outcome flash. Cutting
+ * the pulse keyframes mid-cycle snaps opacity to whatever the next rule
+ * declares; this one-shot lets the wash finish dissolving before the next
+ * phase's sweep starts. Render hooks hold it for
+ * {@link TOOL_SHIMMER_QUEUED_EXIT_MS} after an observed queued → non-queued
+ * transition.
+ */
+export type ToolShimmerQueuedExit = "queued_out";
+
 /** Every shimmer a surface may need a class for. */
-export type ToolShimmerKind = ToolShimmerPhase | ToolShimmerFlash;
+export type ToolShimmerKind = ToolShimmerPhase | ToolShimmerFlash | ToolShimmerQueuedExit;
 
 /**
  * Statuses whose outcome is a FAILURE worth flashing red.
@@ -174,6 +186,12 @@ export interface ToolShimmerPhaseInput {
 	 * more precise input.
 	 */
 	queuedBehindUpstream?: boolean;
+	/**
+	 * This call's name/input — only used to ask whether it shares a parallel group
+	 * with a live earlier peer. See `ToolUpstreamPeer`.
+	 */
+	toolName?: string | null;
+	input?: Record<string, unknown> | null;
 }
 
 /** Whether an earlier same-turn call still occupies the execution slot. */
@@ -394,6 +412,7 @@ export const CARD_SHIMMER_CLASS: Readonly<Record<ToolShimmerKind, string>> = {
 	reflecting: "nf-card-shimmer--reflect",
 	running: "nf-card-shimmer--run",
 	queued: "nf-card-shimmer--queued",
+	queued_out: "nf-card-shimmer--queued-out",
 	success: "nf-card-shimmer--done",
 	failed: "nf-card-shimmer--fail",
 };
@@ -403,9 +422,20 @@ export const TRACE_SHIMMER_CLASS: Readonly<Record<ToolShimmerKind, string>> = {
 	reflecting: "nf-trace-shimmer--reflect",
 	running: "nf-trace-shimmer--run",
 	queued: "nf-trace-shimmer--queued",
+	queued_out: "nf-trace-shimmer--queued-out",
 	success: "nf-trace-shimmer--done",
 	failed: "nf-trace-shimmer--fail",
 };
+
+/**
+ * How long the queued wash keeps dissolving after the call leaves `queued`, in ms —
+ * the SAME number both stylesheets declare for `--queued-out`.
+ *
+ * Long enough to read as a fade rather than a flicker; short enough that the next
+ * phase's sweep is not noticeably late. Pinned against the stylesheets in
+ * `RenderToolRun.shimmer.test.tsx`.
+ */
+export const TOOL_SHIMMER_QUEUED_EXIT_MS = 450;
 
 /**
  * Duration of the folded row's closing sweep, in ms — the SAME number

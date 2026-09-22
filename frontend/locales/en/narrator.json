@@ -115,6 +115,7 @@
 		"reflecting": "under review",
 		"running": "running",
 		"queued": "waiting for earlier tools",
+		"queued_out": "waiting for earlier tools",
 		"success": "succeeded",
 		"failed": "failed"
 	},
@@ -191,7 +192,6 @@
 	"proxyApprovedBadge": "by narrator",
 	"proxyApprovedTooltip": "Historical record: another narrator decided this permission on the user's behalf. Narrators can no longer approve permissions for each other.",
 	"sendFailed": "Failed to send message",
-	"interruptNotSettled": "The current turn did not stop in time. Your message was not sent.",
 	"uploadingAttachments": "Uploading… {{percent}}%",
 	"sendingMessage": "Sending…",
 	"sendCancelled": "Send cancelled",
@@ -1785,5 +1785,8 @@
 	"fullscreenComposerPlaceholder": "Write your message here...",
 	"fullscreenStats": "{{chars}} characters · {{lines}} lines · {{words}} words",
 	"fullscreenHint": "Ctrl+Enter to apply · Esc to cancel",
-	"expandComposer": "Expand to fullscreen"
+	"expandComposer": "Expand to fullscreen",
+	"modelCatalogMissing": "Delisted",
+	"modelCatalogMissingHint": "Not in the provider catalog anymore. Change {{roles}} to an available model.",
+	"modelCatalogMissingHintGeneric": "Not in the provider catalog anymore. Pick another model or update the provider default."
 }

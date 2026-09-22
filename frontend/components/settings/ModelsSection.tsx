@@ -1,5 +1,5 @@
 import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
-import { Button, MultiSelect, NumberInput, Select, Stack, Text } from "@mantine/core";
+import { Alert, Button, MultiSelect, NumberInput, Select, Stack, Text } from "@mantine/core";
 import {
 	isSubagentReasoningEffort,
 	SUBAGENT_POOL_TYPES,
@@ -84,6 +84,16 @@ export interface ModelsSectionProps {
 	subagentModelReasoningEfforts: SubagentModelReasoningEfforts;
 	setSubagentModelReasoningEfforts: (v: SubagentModelReasoningEfforts) => void;
 	groupedModels: ComboboxData;
+	/**
+	 * Models kept only because default/summary still point at a delisted id.
+	 * Used to warn under those Selects so the user reassigns the role instead
+	 * of wondering why a dead model is stuck in the list.
+	 */
+	catalogMissingModels?: Array<{
+		value: string;
+		label: string;
+		pinnedAs?: Array<"default" | "summary">;
+	}>;
 	navigate: (opts: ToOptions & NavigateOptions) => void;
 }
 
@@ -115,10 +125,29 @@ export function ModelsSection({
 	subagentModelReasoningEfforts,
 	setSubagentModelReasoningEfforts,
 	groupedModels,
+	catalogMissingModels = [],
 	navigate,
 }: ModelsSectionProps) {
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
+	const catalogMissingByValue = useMemo(() => {
+		const map = new Map<string, (typeof catalogMissingModels)[number]>();
+		for (const model of catalogMissingModels) map.set(model.value, model);
+		return map;
+	}, [catalogMissingModels]);
+	/** Warn under a role Select when its current value is a delisted pinned model. */
+	const missingPinAlert = (value: string, role: "default" | "summary") => {
+		const entry = catalogMissingByValue.get(value);
+		if (!entry) return null;
+		if (entry.pinnedAs?.length && !entry.pinnedAs.includes(role)) return null;
+		return (
+			<Alert color="orange" variant="light" mt={4} p="xs">
+				{tn("modelCatalogMissingHint", {
+					roles: role === "default" ? t("defaultModel") : t("summaryModel"),
+				})}
+			</Alert>
+		);
+	};
 	const [migrationOpened, setMigrationOpened] = useState(false);
 	const prefixedModels = useMemo(() => prefixLabels(groupedModels), [groupedModels]);
 	// Stored references remain editable when providers are hidden or the catalog is unavailable.
@@ -224,6 +253,7 @@ export function ModelsSection({
 					if (v) setDefaultModel(v);
 				}}
 			/>
+			{missingPinAlert(defaultModel, "default")}
 			<Select
 				label={t("summaryModel")}
 				data={prefixedModelsNoSummary}
@@ -236,6 +266,7 @@ export function ModelsSection({
 					if (v) setSummaryModel(v);
 				}}
 			/>
+			{missingPinAlert(summaryModel, "summary")}
 			<Select
 				label={t("translationModel")}
 				description={t("translationModelDesc")}

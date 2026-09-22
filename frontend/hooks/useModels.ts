@@ -44,6 +44,7 @@ export interface ProviderModels {
 interface ConfiguredFallbackModel extends ModelOption {
 	providerName: string;
 	agentProviderType?: ProviderCapabilityKey;
+	pinnedAs?: Array<"default" | "summary">;
 }
 
 export function getConfiguredFallbackModels(
@@ -81,6 +82,7 @@ export function getConfiguredFallbackModels(
 		providerName: string,
 		agentProviderType?: ProviderCapabilityKey,
 		modelIsFullValue = false,
+		pinnedAs?: "default" | "summary",
 	) => {
 		const trimmedPrefix = prefix.trim();
 		const trimmedModel = model.trim();
@@ -96,7 +98,16 @@ export function getConfiguredFallbackModels(
 			: trimmedModel.startsWith(`${trimmedPrefix}:`)
 				? trimmedModel
 				: `${trimmedPrefix}:${trimmedModel}`;
-		if (seen.has(value)) return;
+		const existing = seen.has(value) ? results.find((r) => r.value === value) : undefined;
+		if (existing) {
+			// The same concrete model can sit in both the default and summary slots.
+			// Keep one row but remember every role that pins it, so the UI can tell
+			// the user which assignment to change.
+			if (pinnedAs && !existing.pinnedAs?.includes(pinnedAs)) {
+				existing.pinnedAs = [...(existing.pinnedAs ?? []), pinnedAs];
+			}
+			return;
+		}
 		seen.add(value);
 		results.push({
 			value,
@@ -104,6 +115,7 @@ export function getConfiguredFallbackModels(
 			provider: trimmedPrefix,
 			providerName: providerName || trimmedPrefix,
 			agentProviderType,
+			...(pinnedAs ? { pinnedAs: [pinnedAs] } : {}),
 		});
 	};
 
@@ -137,16 +149,51 @@ export function getConfiguredFallbackModels(
 			add(prefix, configured.defaultModel, configured.name, configured.type);
 		}
 	}
-	for (const current of [settings.agent?.defaultModel || "", settings.agent?.summaryModel || ""]) {
-		const value = String(current);
-		const colon = value.indexOf(":");
-		if (colon <= 0) continue;
-		const prefix = value.slice(0, colon);
-		const configured = configuredPrefixes.get(prefix);
-		if (!configured) continue;
-		add(prefix, value, configured.name, configured.type, true);
+	const agentDefaultModel = String(settings.agent?.defaultModel || "");
+	const agentSummaryModel = String(settings.agent?.summaryModel || "");
+	if (agentDefaultModel) {
+		const colon = agentDefaultModel.indexOf(":");
+		if (colon > 0) {
+			const prefix = agentDefaultModel.slice(0, colon);
+			const configured = configuredPrefixes.get(prefix);
+			if (configured) {
+				add(prefix, agentDefaultModel, configured.name, configured.type, true, "default");
+			}
+		}
+	}
+	if (agentSummaryModel) {
+		const colon = agentSummaryModel.indexOf(":");
+		if (colon > 0) {
+			const prefix = agentSummaryModel.slice(0, colon);
+			const configured = configuredPrefixes.get(prefix);
+			if (configured) {
+				add(prefix, agentSummaryModel, configured.name, configured.type, true, "summary");
+			}
+		}
 	}
 	return results;
+}
+
+/**
+ * Decide whether a fallback-only model is actually delisted (catalog was
+ * fetched for that provider and no longer contains it) versus merely not
+ * discovered yet (empty catalog — keep quiet so bootstrap does not look like
+ * an outage).
+ */
+export function classifyFallbackModelPresence(args: {
+	value: string;
+	provider: string | undefined;
+	catalogValues: ReadonlySet<string>;
+	catalogCountByProvider: ReadonlyMap<string, number>;
+	pinnedAs?: Array<"default" | "summary">;
+}): { catalogMissing: boolean; pinnedAs?: Array<"default" | "summary"> } {
+	const { value, provider, catalogValues, catalogCountByProvider, pinnedAs } = args;
+	if (catalogValues.has(value)) return { catalogMissing: false, pinnedAs };
+	const discovered = provider ? (catalogCountByProvider.get(provider) ?? 0) : 0;
+	// Empty catalog for this provider: discovery has not produced a list yet
+	// (or the cache was cleared on purpose). Do not label the model "delisted".
+	if (discovered === 0) return { catalogMissing: false, pinnedAs };
+	return { catalogMissing: true, pinnedAs };
 }
 
 /**
@@ -526,16 +573,46 @@ export function useAllModels() {
 
 		// Keep configured defaults and the current default/summary selections usable even
 		// before model discovery succeeds or after a provider cache is cleared.
+		// When the provider catalog is already populated but no longer lists the
+		// model (delisted after a refresh), still keep the row so the pin stays
+		// visible — but mark it `catalogMissing` so the UI can tell the user to
+		// reassign default/summary to an available model instead of offering hide
+		// or "set as default/summary" as the fix.
+		const catalogValues = new Set<string>();
+		const catalogCountByProvider = new Map<string, number>();
+		const catalogMissingModels: ModelOption[] = [];
+		for (const group of providerModelArrays) {
+			catalogCountByProvider.set(
+				group.prefix,
+				(catalogCountByProvider.get(group.prefix) ?? 0) + group.models.length,
+			);
+			for (const m of group.models) catalogValues.add(m.value);
+		}
 		for (const fallback of getConfiguredFallbackModels(
 			settingsData as Record<string, unknown> | undefined,
 		)) {
 			providerLabels[fallback.provider ?? ""] = fallback.providerName;
+			const presence = classifyFallbackModelPresence({
+				value: fallback.value,
+				provider: fallback.provider,
+				catalogValues,
+				catalogCountByProvider,
+				pinnedAs: fallback.pinnedAs,
+			});
+			const annotated: ModelOption = {
+				...fallback,
+				...(presence.catalogMissing ? { catalogMissing: true } : {}),
+				...(presence.pinnedAs?.length ? { pinnedAs: presence.pinnedAs } : {}),
+			};
+			if (presence.catalogMissing) {
+				catalogMissingModels.push(annotated);
+			}
 			const existing = providerModelArrays.find((group) => group.prefix === fallback.provider);
 			if (existing) {
-				existing.models = mergeModels(existing.models, [fallback]);
+				existing.models = mergeModels(existing.models, [annotated]);
 				existing.agentProviderType ??= fallback.agentProviderType;
 			} else if (fallback.provider) {
-				addGroup(fallback.provider, [fallback], fallback.agentProviderType);
+				addGroup(fallback.provider, [annotated], fallback.agentProviderType);
 			}
 		}
 
@@ -697,6 +774,12 @@ export function useAllModels() {
 			customModels,
 			/** Hidden model values set. */
 			hiddenModels: hidden,
+			/**
+			 * Models kept only because a default/summary (or provider-default)
+			 * selection still points at them after they left the provider catalog.
+			 * The UI should prompt reassignment of those roles.
+			 */
+			catalogMissingModels,
 			/** Provider prefix → display name. */
 			providerLabels,
 			/** Raw settings data (for other fields). */

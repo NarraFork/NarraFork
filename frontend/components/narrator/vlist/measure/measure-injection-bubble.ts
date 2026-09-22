@@ -68,8 +68,15 @@ export const INJECTION_HEADER_BODY_GAP = 4;
  * carries a source name that can be a subagent title or a bash alias, which run
  * longer than a username. Height-neutral — it only widens the frame, never the width
  * the body was wrapped at.
+ *
+ * Floors at a width that fits the densest platform header, not just a bare avatar +
+ * name: `living_work_spec` / `silent_progress` add a cadence subtitle ("every 30 tool
+ * calls") and the reminder-frequency gear beside a truncating name. An empty task
+ * digest body is one short line, so without this floor the shrink-wrap crushed the
+ * header until the source name rendered as a single character ("任…"). Bodies that
+ * are already wider than the floor are unaffected.
  */
-export const INJECTION_HEADER_MIN_CONTENT_WIDTH = 180;
+export const INJECTION_HEADER_MIN_CONTENT_WIDTH = 260;
 /**
  * Ceiling on the bubble's share of the row, as a fraction of the available width.
  *

@@ -158,6 +158,7 @@ export const sendMessageSchema = z
 	.object({
 		message: z.string().default(""),
 		priority: z.boolean().optional(),
+		interrupt: z.boolean().optional(),
 		fileReferences: fileReferencesSchema.optional(),
 	})
 	.refine((body) => !!body.message.trim() || !!body.fileReferences?.length, {

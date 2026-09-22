@@ -187,6 +187,8 @@ export {
 	updateNarratorModelSchema,
 	updateNarratorTitleSchema,
 	updateSegmentCompactSummarySchema,
+	updateWhitelistCmdSchema,
+	updateWhitelistDirSchema,
 } from "./narrators";
 export {
 	notificationIdParamSchema,

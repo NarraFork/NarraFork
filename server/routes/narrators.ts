@@ -330,6 +330,7 @@ import {
 	narratorService,
 } from "../services/narrator-service";
 import {
+	acceptUserMessage,
 	awaitCompactCompletion,
 	type BufferCreator,
 	cancelCompact,
@@ -348,12 +349,10 @@ import {
 	isNarratorActive,
 	normalizeRollbackBlockIndexForMessage,
 	persistGoalAddedNotice,
-	pushBufferedMessage,
 	reconcileRunningStatus,
 	reExecuteDeniedToolCall,
 	reorderBufferedMessages,
 	reprocessAllPendingPermissions,
-	requestBufferedMessageSoftStop,
 	resolveOptionalToolState,
 	resolvePermissionOrDangerReflection,
 	restoreAssistantMessage,
@@ -464,6 +463,7 @@ export async function parseMessageRequest(
 	images: ImageRef[];
 	textFiles: File[];
 	priority?: boolean;
+	interrupt?: boolean;
 	fileReferences?: FileReference[];
 }> {
 	const contentType = c.req.header("content-type") ?? "";
@@ -525,6 +525,7 @@ export async function parseMessageRequest(
 			images,
 			textFiles: textFileEntries,
 			priority: priority || undefined,
+			interrupt: formData.get("interrupt") === "true" || undefined,
 			fileReferences,
 		};
 	}
@@ -536,6 +537,7 @@ export async function parseMessageRequest(
 		images: [],
 		textFiles: [],
 		priority: parsed.data.priority,
+		interrupt: parsed.data.interrupt,
 		fileReferences: parsed.data.fileReferences,
 	};
 }
@@ -1827,7 +1829,18 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		await narratorService.updateStatus(id, "idle");
 	}
 
-	const { message, images, textFiles, priority, fileReferences } = await parseMessageRequest(c, id);
+	const {
+		message,
+		images,
+		textFiles,
+		priority: requestedPriority,
+		interrupt,
+		fileReferences,
+	} = await parseMessageRequest(c, id);
+	// Hard interruption is a primary-narrator intent; subagents keep their existing queue contract.
+	const priority = isSubagentVariant(narrator.variant)
+		? requestedPriority
+		: requestedPriority || interrupt;
 	const userId = c.get("user").sub;
 	// Only a successfully persisted message/queue owns these uploads. In particular,
 	// a rejected reference must not strand images saved by multipart parsing.
@@ -1872,6 +1885,27 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			!("loadSkill" in cmdResult)
 		) {
 			throw new ValidationError("File references require a model message, not a control command");
+		}
+		// Interrupting controls use the same durable admission as ordinary input: never
+		// abort an owner until the replacement is safely queued. Non-interrupt controls
+		// deliberately retain their existing live-session behavior.
+		if (
+			interrupt &&
+			!isSubagentVariant(narrator.variant) &&
+			cmdResult.resolved &&
+			!("expandedPrompt" in cmdResult) &&
+			!("loadSkill" in cmdResult) &&
+			!("specGoal" in cmdResult)
+		) {
+			const result = await acceptUserMessage(id, message, {
+				userId,
+				commandText: message,
+				locale: await getUserLanguage(userId),
+				interrupt: true,
+				executionIntent: { controlCommand: true },
+			});
+			// Controls do not consume attachments; retain the direct path's cleanup.
+			return c.json(result, result.buffered ? 202 : 201);
 		}
 		if (cmdResult.resolved && ("loadTool" in cmdResult || "loadToolNotFound" in cmdResult)) {
 			const locale = await getUserLanguage(userId);
@@ -2153,95 +2187,23 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				});
 				return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
 			}
-
-			// Primary narrator: push onto buffer queue (or unshift if priority).
-			// If the DB status was stale-idle while a loop is actually running, correct
-			// it so the user regains the interrupt button instead of being stuck.
-			await reconcileRunningStatus(id);
-			const user = await db.query.users.findFirst({
-				where: eq(users.id, userId),
-				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-			});
-			const creator: BufferCreator | null = user
-				? {
-						id: user.id,
-						username: user.username,
-						avatarColor: user.avatarColor,
-						avatarImageId: user.avatarImageId,
-					}
-				: null;
-			const result = await pushBufferedMessage(
-				id,
-				finalMessage,
-				images.length > 0 ? images : undefined,
-				commandText,
-				userId,
-				creator,
-				textFiles.length > 0 ? textFiles : undefined,
-				priority ? "front" : undefined,
-				prePromptBashCommand,
-				snapshots,
-			);
-			if (result.ok) {
-				uploadsAccepted = true;
-				const messages = toBufferSummary(await getBufferedMessagesAsync(id));
-				broadcastToNarrator(id, {
-					type: "buffer_set",
-					narratorId: id,
-					messages,
-				});
-				// Priority messages should cut in at the next safe model-request boundary without
-				// aborting running tools. The loop soft-stops after current tools complete, then
-				// consumes the front of the buffer as the next request.
-				if (priority) {
-					requestBufferedMessageSoftStop(id);
-				}
-				return c.json(
-					{
-						buffered: true,
-						bufferedAt: result.bufferedAt,
-						id: result.id,
-						...(specGoalQueued ? { specGoalQueued: true, objective: specGoalObjective } : {}),
-					},
-					202,
-				);
-			}
-			if (result.full) {
-				throw new ValidationError("Message queue is full");
-			}
-			// The queue refused this message. Falling through to a normal send is only
-			// correct when the narrator turned out NOT to be busy after all — the
-			// legitimate case is a zombie `working`/`waiting` row whose writer is gone,
-			// which `reconcileRunningStatus` above has just repaired to idle.
-			//
-			// If a runtime owner still exists, falling through would start a second agent
-			// loop next to the live one. `feedMessage`'s own guard cannot catch that: it
-			// tests `active._loopRunning`, and a loop-less owner (planned-update recovery,
-			// a subagent recovery stage, the recovery Await batch) has no `activeNarrators`
-			// entry at all, so `ensureNarrator` hands back a fresh session whose flag is
-			// false. That is exactly how a post-update restart ended up talking over its
-			// own still-running subagent.
-			if (isNarratorRuntimeBusy(id)) {
-				logger.warn("Refused to send while a loop-less runtime owner holds the narrator", {
-					narratorId: id,
-				});
-				throw new ValidationError("Narrator is busy; the message could not be queued");
-			}
-			// No runtime owner: the busy status was stale. Fall through to a normal send.
 		}
 
 		const locale = await getUserLanguage(userId);
 		const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-		// Apply model override from slash command before sending
-		if (modelOverride?.model) {
+		// Primary overrides belong to the accepted input, not the currently running turn.
+		// Subagent resume keeps its existing idle-only contract.
+		const applyModelOverride =
+			!!modelOverride?.model && !narratorBusy && isSubagentVariant(narrator.variant);
+		if (applyModelOverride && modelOverride?.model) {
 			if (modelOverride.mode === "temporary") {
 				// Persist the original model so it can be restored after the turn
-				// (survives server restarts). Must be written before sendMessage to
+				// (survives server restarts). Must be written before admission to
 				// avoid a race with the agent loop's finally block.
 				await setTemporaryModelRestore(id, narrator.model ?? "__default__");
 			}
-			// Switch model in DB (sendMessage → ensureNarrator reads from DB)
+			// Switch model in DB before admission starts an idle turn.
 			await narratorService.updateModel(id, modelOverride.model);
 		}
 
@@ -2273,29 +2235,49 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			);
 		}
 
-		// prePromptBashCommand (runBashFirst) is passed to sendMessage so the order is:
-		// user prompt message → Bash tool card → model reply (handled inside feedMessage).
-		const userMsg = await sendMessage(
-			id,
-			finalMessage,
+		const user = await db.query.users.findFirst({
+			where: eq(users.id, userId),
+			columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+		});
+		const creator: BufferCreator | null = user
+			? {
+					id: user.id,
+					username: user.username,
+					avatarColor: user.avatarColor,
+					avatarImageId: user.avatarImageId,
+				}
+			: null;
+		// The service atomically enqueues and claims this message, or leaves it queued
+		// behind an existing owner/backlog. HTTP status observations never decide admission.
+		const result = await acceptUserMessage(id, finalMessage, {
 			images,
 			locale,
 			replyInUserLanguage,
 			commandText,
 			userId,
+			creator,
 			textFiles,
-			prePromptBashCommand,
-			undefined,
-			snapshots,
-		);
+			preBashCommand: prePromptBashCommand,
+			fileReferences: snapshots,
+			priority,
+			interrupt,
+			queueOnly: queueBehindCompaction,
+			executionIntent: modelOverride?.model ? { modelOverride } : undefined,
+		});
 		uploadsAccepted = true;
 
-		// Broadcast model change to frontend (ensureNarrator already picked up the new model from DB)
-		if (modelOverride?.model) {
-			updateNarratorModel(id, modelOverride.model);
+		if (result.buffered) {
+			return c.json(
+				{
+					buffered: true,
+					bufferedAt: result.bufferedAt,
+					id: result.id,
+					...(specGoalQueued ? { specGoalQueued: true, objective: specGoalObjective } : {}),
+				},
+				202,
+			);
 		}
-
-		return c.json(fileReferenceMessageForDisplay(userMsg), 201);
+		return c.json(fileReferenceMessageForDisplay(result.userMsg), 201);
 	} finally {
 		if (!uploadsAccepted) {
 			for (const image of images) {

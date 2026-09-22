@@ -607,14 +607,14 @@ export interface NarraForkSettings {
 		defaultNarratorWriteAudience: "auto" | "owner" | "project" | "public";
 		/** Whether newly-created narrators should start with the plan trait enabled. */
 		defaultStartInPlanMode: boolean;
-	summaryModel: string;
-	/** Model used to translate reasoning blocks. "__summary__" follows summaryModel dynamically. */
-	translationModel: string;
-	/** Model used for prompt optimization. "__summary__" follows summaryModel dynamically. */
-	promptOptimizeModel: string;
-	/** Maximum number of context messages for prompt optimization. Default 10. */
-	promptOptimizeContextMaxMessages?: number;
-	customModels: ModelOption[];
+		summaryModel: string;
+		/** Model used to translate reasoning blocks. "__summary__" follows summaryModel dynamically. */
+		translationModel: string;
+		/** Model used for prompt optimization. "__summary__" follows summaryModel dynamically. */
+		promptOptimizeModel: string;
+		/** Maximum number of context messages for prompt optimization. Default 10. */
+		promptOptimizeContextMaxMessages?: number;
+		customModels: ModelOption[];
 		hiddenModels: string[];
 		maxTurns: number;
 		subagentModels: {
@@ -712,6 +712,8 @@ export interface NarraForkSettings {
 		requestDumpMaxSize: number;
 		/** Maximum retries for recoverable (transient) API errors. -1 = infinite. */
 		maxTransientRetries: number;
+		/** Maximum tool calls per model response (integer 1–128). Exceeding it aborts the narrator, not a session-wide cumulative limit. */
+		maxToolCallsPerResponse: number;
 		/** Tool-call count without visible text before asking the model for a short progress update. -1 = disabled. */
 		silentToolCallThreshold: number;
 		/** Pipeline capture inactivity threshold in tool calls. -1 = disabled. */

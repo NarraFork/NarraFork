@@ -115,6 +115,7 @@
 		"reflecting": "正在审查",
 		"running": "正在执行",
 		"queued": "等待前面的工具完成",
+		"queued_out": "等待前面的工具完成",
 		"success": "已成功",
 		"failed": "已失败"
 	},
@@ -191,7 +192,6 @@
 	"proxyApprovedBadge": "由叙述者代审",
 	"proxyApprovedTooltip": "历史记录：此权限曾由另一位叙述者代为决策。叙述者之间的代审机制已移除。",
 	"sendFailed": "发送消息失败",
-	"interruptNotSettled": "当前轮次未能及时停止，消息未发送。",
 	"uploadingAttachments": "上传中… {{percent}}%",
 	"sendingMessage": "发送中…",
 	"sendCancelled": "已取消发送",
@@ -1784,5 +1784,8 @@
 	"fullscreenComposerPlaceholder": "在此输入消息...",
 	"fullscreenStats": "{{chars}} 字符 · {{lines}} 行 · {{words}} 词",
 	"fullscreenHint": "Ctrl+Enter 应用 · Esc 取消",
-	"expandComposer": "全屏编辑"
+	"expandComposer": "全屏编辑",
+	"modelCatalogMissing": "已下线",
+	"modelCatalogMissingHint": "该模型已不在供应商目录中。请把{{roles}}更换为可用模型。",
+	"modelCatalogMissingHintGeneric": "该模型已不在供应商目录中。请选择其他模型，或更新供应商默认模型。"
 }

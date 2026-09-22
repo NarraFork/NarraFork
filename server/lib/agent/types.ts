@@ -1167,6 +1167,10 @@ export interface AgentConfig {
 	 * Defaults to 0 (no in-loop retry — caller handles it).
 	 */
 	maxTransientRetries?: number;
+	/** Maximum distinct tool calls in one provider response (default 32, range 1–128). */
+	maxToolCallsPerResponse?: number;
+	/** Interrupt the owning narrator when a response exceeds its tool-call limit. */
+	onToolCallLimitExceeded?: (limit: number) => void;
 	/**
 	 * Number of completed tool calls without visible text before a progress sidecar is injected.
 	 * -1 disables the reminder. Defaults to 20.

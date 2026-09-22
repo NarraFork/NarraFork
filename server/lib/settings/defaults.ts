@@ -97,6 +97,7 @@ export const DEFAULTS: NarraForkSettings = {
 		commandBlacklist: [],
 		autoContinuationMode: "protectedOnly",
 		maxTransientRetries: 10,
+		maxToolCallsPerResponse: 32,
 		silentToolCallThreshold: 50,
 		pipelineUnusedToolCallThreshold: 10,
 		behaviorFenceInterval: -1,
@@ -588,6 +589,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "可恢复的 API 错误最大重试次数。-1 表示无限重试；有状态提供商（Responses/Codex）会在外层重建历史后重试。",
 		type: "number",
 		valid: "-1 = 无限重试, 默认 10",
+	},
+	"agent.maxToolCallsPerResponse": {
+		desc: "每条模型回复允许的工具调用数量上限，超限自动中止叙述者；不是跨整个会话累计的上限。硬上限 128 用于保护历史预算。",
+		type: "number",
+		valid: "1–128 的整数，默认 32",
 	},
 	"agent.silentToolCallThreshold": {
 		desc: "模型连续执行工具但未输出可见文本达到此次数时，通过 sidecar 要求其简短说明当前工作。-1 表示关闭。",

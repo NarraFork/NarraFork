@@ -451,6 +451,7 @@ export const updateSettingsSchema = z
 					.max(100)
 					.optional(),
 				maxTransientRetries: z.number().int().min(-1).max(100),
+				maxToolCallsPerResponse: z.number().int().min(1).max(128),
 				silentToolCallThreshold: z.number().int().min(-1).max(1000),
 				pipelineUnusedToolCallThreshold: z
 					.number()

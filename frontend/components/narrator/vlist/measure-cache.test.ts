@@ -1127,7 +1127,7 @@ describe("subagent file-change cache identity", () => {
 		const { extractDataRevision } = await import("./measure-cache");
 		const rows = [file, { ...file, deviceId: "device-b" }];
 		expect(extractDataRevision(data({ files: rows }))).not.toBe(
-			extractDataRevision(data({ files: rows.toReversed() })),
+			extractDataRevision(data({ files: [...rows].reverse() })),
 		);
 		const rev = (deviceId: string, workspacePath: string) =>
 			extractDataRevision(data({ files: [{ ...file, deviceId, workspacePath }] }));

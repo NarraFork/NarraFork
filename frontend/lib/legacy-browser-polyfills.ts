@@ -10,7 +10,7 @@
  * failure is a `TypeError` at the first call site rather than anything the build
  * or type-checker can see.
  *
- * That gap already bit once: `Object.hasOwn` (ES2022, Safari 15.4+) is reached
+ * That gap already bit twice. `Object.hasOwn` (ES2022, Safari 15.4+) is reached
  * through @xyflow/react and was patched ad hoc at the top of `hmr-guard.ts`. The
  * same class of bug then took down the narrator VIRTUAL LIST on Safari 14, and the
  * symptom is worth recording because it is so far from the cause:
@@ -24,6 +24,12 @@
  *   the effect, which threw again. The user saw the list flickering forever with
  *   not a single message rendered, and the list's own error card never appeared
  *   (the throw bypassed `pretextDocument.error` entirely).
+ *
+ * The second outage was the mobile Git panel: `lib/api/git.ts` called
+ * `AbortSignal.any([signal, timeout])` (Safari 17.4+) and `AbortSignal.timeout`
+ * (Safari 16+), so on older iOS Safari the workspace probe threw
+ * `AbortSignal.any is not a function` and the panel reported "cannot detect Git
+ * workspace" — a network-shaped error for a missing runtime API.
  *
  * WHAT BELONGS HERE
  * -----------------
@@ -310,6 +316,111 @@ function installStructuredClone(): void {
 }
 
 /**
+ * `AbortSignal.timeout` (Safari 16+) — a signal that aborts on a timer with a
+ * `TimeoutError` DOMException.
+ *
+ * Reached from the git panel's HTTP ceiling (`lib/api/git.ts`) and the editor IO
+ * path. Without it the first timed request throws `TypeError: AbortSignal.timeout
+ * is not a function`, which surfaces as "cannot detect Git workspace" on older
+ * iOS Safari rather than as a networking failure.
+ *
+ * Web IDL `[EnforceRange] unsigned long long`: NaN / ±Infinity / negative throw
+ * TypeError. Fractions truncate toward zero. `setTimeout` itself clamps huge
+ * delays (~24.8 days); every caller here is in the seconds-to-minutes range.
+ */
+function installAbortSignalTimeout(): void {
+	if (typeof AbortSignal.timeout === "function") return;
+	Object.defineProperty(AbortSignal, "timeout", {
+		value: function timeout(milliseconds: number): AbortSignal {
+			const ms = Number(milliseconds);
+			if (!Number.isFinite(ms) || ms < 0) {
+				throw new TypeError(
+					"AbortSignal.timeout requires a non-negative finite number of milliseconds",
+				);
+			}
+			const controller = new AbortController();
+			// No external cancel path exists for this API: the timer always fires.
+			// Callers that need early cancel combine it with AbortSignal.any.
+			setTimeout(() => {
+				controller.abort(new DOMException("The operation timed out.", "TimeoutError"));
+			}, Math.trunc(ms));
+			return controller.signal;
+		},
+		writable: true,
+		configurable: true,
+		enumerable: false,
+	});
+}
+
+/**
+ * `AbortSignal.any` (Safari 17.4+) — one signal that aborts when any input does.
+ *
+ * This is the exact API the mobile Git panel died on:
+ * `AbortSignal.any([t.signal, n])` / `AbortSignal.any is not a function`. The
+ * call sites look ordinary on desktop Chrome and Bun, so the gap only shows up
+ * on older WebKit — which is the primary form factor for the mobile panel.
+ *
+ * Spec notes that the shim must honour:
+ *  - an EMPTY iterable returns a signal that never aborts;
+ *  - the FIRST already-aborted input wins, and no listeners are attached;
+ *  - later aborts do not overwrite the settled reason;
+ *  - listeners are removed once the composite settles, so a long-lived parent
+ *    signal does not accumulate one dead listener per request. (Public share
+ *    still uses `linkPublicShareSignals` for the extra `dispose()` it needs on
+ *    session-lifetime parents; that is a deliberate call-site choice, not a
+ *    gap this shim is meant to close.)
+ */
+function installAbortSignalAny(): void {
+	if (typeof AbortSignal.any === "function") return;
+	Object.defineProperty(AbortSignal, "any", {
+		value: function any(signals: Iterable<AbortSignal>): AbortSignal {
+			if (signals == null || typeof signals[Symbol.iterator] !== "function") {
+				throw new TypeError("AbortSignal.any requires an iterable of AbortSignal");
+			}
+			const list = [...signals];
+			for (const signal of list) {
+				// Duck-typed rather than `instanceof`, which fails across realms
+				// (same-realm checks would reject a signal from a worker).
+				if (
+					signal == null ||
+					typeof signal !== "object" ||
+					typeof (signal as AbortSignal).aborted !== "boolean" ||
+					typeof (signal as AbortSignal).addEventListener !== "function"
+				) {
+					throw new TypeError("AbortSignal.any requires an iterable of AbortSignal");
+				}
+			}
+			const controller = new AbortController();
+			const cleanups: Array<() => void> = [];
+			const detach = () => {
+				for (const cleanup of cleanups) cleanup();
+				cleanups.length = 0;
+			};
+			// Settle already-aborted inputs BEFORE registering any listeners: the
+			// first one wins, in input order, and the rest must not be observed.
+			for (const signal of list) {
+				if (signal.aborted) {
+					controller.abort(signal.reason);
+					return controller.signal;
+				}
+			}
+			for (const signal of list) {
+				const listener = () => {
+					detach();
+					controller.abort(signal.reason);
+				};
+				signal.addEventListener("abort", listener, { once: true });
+				cleanups.push(() => signal.removeEventListener("abort", listener));
+			}
+			return controller.signal;
+		},
+		writable: true,
+		configurable: true,
+		enumerable: false,
+	});
+}
+
+/**
  * Install every shim. Idempotent and safe to call more than once (each installer
  * feature-detects), which keeps module re-evaluation under HMR harmless.
  *
@@ -321,6 +432,8 @@ export function installLegacyBrowserPolyfills(): void {
 	installFindLast();
 	installObjectHasOwn();
 	installStructuredClone();
+	installAbortSignalTimeout();
+	installAbortSignalAny();
 }
 
 installLegacyBrowserPolyfills();

@@ -387,6 +387,91 @@ describe("narrators API", () => {
 		}
 	});
 
+	describe("interrupt-and-insert request fields", () => {
+		test.each([
+			false,
+			true,
+		])("one prioritized message request (multipart=%s)", async (multipart) => {
+			Object.defineProperty(g, "localStorage", {
+				value: { getItem: () => null },
+				configurable: true,
+			});
+			const requests: { url: string; method?: string; body?: BodyInit | null }[] = [];
+			Object.defineProperty(g, "fetch", {
+				value: async (url: string, init: RequestInit) => {
+					requests.push({ url, method: init.method, body: init.body });
+					return Response.json({ buffered: true, id: "replacement" }, { status: 202 });
+				},
+				configurable: true,
+			});
+			const originalXHR = Object.getOwnPropertyDescriptor(globalThis, "XMLHttpRequest");
+			class TestXHR {
+				status = 202;
+				statusText = "Accepted";
+				responseText = '{"buffered":true,"id":"replacement"}';
+				onload: (() => void) | null = null;
+				url = "";
+				method = "";
+				open(method: string, url: string) {
+					this.method = method;
+					this.url = url;
+				}
+				setRequestHeader() {}
+				getAllResponseHeaders() {
+					return "Content-Type: application/json";
+				}
+				send(body: FormData) {
+					requests.push({ url: this.url, method: this.method, body });
+					queueMicrotask(() => this.onload?.());
+				}
+			}
+			Object.defineProperty(globalThis, "XMLHttpRequest", { value: TestXHR, configurable: true });
+			try {
+				for (const interrupt of [undefined, false, true]) {
+					requests.length = 0;
+					const images = multipart
+						? [new File(["image"], "a.png", { type: "image/png" })]
+						: undefined;
+					const textFiles = multipart ? [new File(["text"], "a.txt")] : undefined;
+					const refs = [{ id: "ref", deviceId: "remote", path: "/work/a.ts", label: "a.ts" }];
+					expect(
+						await api.sendNarratorMessage(
+							"n",
+							"replace",
+							images,
+							textFiles,
+							false,
+							undefined,
+							undefined,
+							refs,
+							interrupt,
+						),
+					).toEqual({ buffered: true, id: "replacement" });
+					expect(requests).toHaveLength(1);
+					expect(requests[0]).toMatchObject({ url: "/api/narrators/n/messages", method: "POST" });
+					if (multipart) {
+						const form = requests[0].body as FormData;
+						expect(form.get("interrupt")).toBe(interrupt ? "true" : null);
+						expect(form.get("priority")).toBe(interrupt ? "true" : null);
+						expect(form.get("message")).toBe("replace");
+						expect(form.getAll("images")).toHaveLength(1);
+						expect(form.getAll("textFiles")).toHaveLength(1);
+						expect(JSON.parse(String(form.get("fileReferences")))).toEqual(refs);
+					} else {
+						expect(JSON.parse(String(requests[0].body))).toEqual({
+							message: "replace",
+							fileReferences: refs,
+							...(interrupt ? { interrupt: true, priority: true } : {}),
+						});
+					}
+				}
+			} finally {
+				if (originalXHR) Object.defineProperty(globalThis, "XMLHttpRequest", originalXHR);
+				else Reflect.deleteProperty(globalThis, "XMLHttpRequest");
+			}
+		});
+	});
+
 	describe("file reference request fields", () => {
 		const reference = { id: "ref-1", deviceId: "RemoteCaseID", path: "/work/a.ts", label: "a.ts" };
 

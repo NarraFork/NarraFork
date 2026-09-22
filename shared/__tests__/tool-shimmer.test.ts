@@ -183,6 +183,64 @@ describe("resolveToolShimmerPhase — queued behind an earlier same-turn call", 
 		}
 	});
 
+	it("queues behind a permission-gated earlier call even when tool names are known", () => {
+		// Regression: the first tool sitting on an approve/deny (or a running danger
+		// reflection) must park EVERY later non-started call — including when peers
+		// carry names and the parallel-group check runs. Default Bash is serial and
+		// Edit is not parallel-safe, so they are NOT concurrent.
+		expect(
+			resolveToolShimmerPhase({
+				status: "initializing",
+				toolName: "Edit",
+				input: { file_path: "a.ts", old_string: "a", new_string: "b" },
+				earlierTools: [
+					{
+						status: "pending",
+						toolName: "Bash",
+						input: { command: "rm -f x" },
+						reflectionStatus: "running",
+					},
+				],
+			}),
+		).toBe("queued");
+		expect(
+			resolveToolShimmerPhase({
+				status: "initializing",
+				toolName: "Edit",
+				input: {},
+				earlierTools: [
+					{
+						status: "pending",
+						toolName: "Bash",
+						input: {},
+						hasPendingPermission: true,
+					},
+				],
+			}),
+		).toBe("queued");
+	});
+
+	it("does NOT queue a same-group parallel sibling that is merely initializing", () => {
+		// Two Reads start together; the second is not "parked behind" the first.
+		expect(
+			resolveToolShimmerPhase({
+				status: "initializing",
+				toolName: "Read",
+				input: { file_path: "b.ts" },
+				earlierTools: [{ status: "running", toolName: "Read", input: { file_path: "a.ts" } }],
+			}),
+		).toBe("streaming");
+	});
+
+	it("honours a precomputed queuedBehindUpstream when no peer list is available", () => {
+		expect(resolveToolShimmerPhase({ status: "initializing", queuedBehindUpstream: true })).toBe(
+			"queued",
+		);
+		expect(resolveToolShimmerPhase({ status: "initializing", queuedBehindUpstream: false })).toBe(
+			"streaming",
+		);
+	});
+
 	it("keeps initializing NEUTRAL when earlier calls are settled or absent", () => {
 		expect(
 			resolveToolShimmerPhase({

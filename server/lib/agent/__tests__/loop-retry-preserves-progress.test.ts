@@ -239,11 +239,12 @@ describe("重试不得丢弃已产生的工具进展", () => {
 					expect(browserExecutions).toBe(mode === "deny" || mode === "abortBefore" ? 0 : 1);
 					expect(readExecutions).toBe(mode === "mixed" ? 1 : 0);
 					const results = events.filter((event) => event.type === "tool_result");
-					expect(results).toHaveLength(mode === "abortBefore" ? 0 : mode === "mixed" ? 2 : 1);
-					if (mode !== "abortBefore") {
-						expect(results.find((event) => event.toolName === "Browser")).toMatchObject({
-							isError: mode === "deny",
-						});
+					expect(results).toHaveLength(mode === "mixed" ? 2 : 1);
+					expect(results.find((event) => event.toolName === "Browser")).toMatchObject({
+						isError: mode === "deny" || mode === "abortBefore",
+					});
+					if (mode === "abortBefore") {
+						expect(results[0]).toMatchObject({ durationMs: 0 });
 					}
 					expect(events.at(-1)).toMatchObject(
 						mode === "abort" || mode === "abortBefore"

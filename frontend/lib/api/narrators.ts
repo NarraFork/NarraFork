@@ -1270,7 +1270,10 @@ export const narratorsApi = {
 		onUploadProgress?: (fraction: number) => void,
 		signal?: AbortSignal,
 		fileReferences?: FileReference[],
+		interrupt?: boolean,
 	) => {
+		// Interrupt-and-insert is one request; its replacement always has queue priority.
+		if (interrupt) priority = true;
 		const headers: Record<string, string> = {};
 		const token = getToken();
 		if (token) headers.Authorization = `Bearer ${token}`;
@@ -1287,6 +1290,7 @@ export const narratorsApi = {
 				for (const tf of textFiles) formData.append("textFiles", tf);
 			}
 			if (priority) formData.append("priority", "true");
+			if (interrupt) formData.append("interrupt", "true");
 			if (fileReferences !== undefined) {
 				formData.append("fileReferences", JSON.stringify(fileReferences));
 			}
@@ -1301,7 +1305,12 @@ export const narratorsApi = {
 			res = await fetch(url, {
 				method: "POST",
 				headers,
-				body: JSON.stringify({ message, ...(priority ? { priority: true } : {}), fileReferences }),
+				body: JSON.stringify({
+					message,
+					...(priority ? { priority: true } : {}),
+					...(interrupt ? { interrupt: true } : {}),
+					fileReferences,
+				}),
 				signal,
 			});
 		}

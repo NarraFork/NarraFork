@@ -3899,11 +3899,97 @@ function toolUpstreamPeer(item: AdapterToolItem, ctx: AdapterContext): ToolUpstr
 }
 
 /**
+ * A peer reconstructed from an enriched `tool_use` block.
+ *
+ * `enrichToolUseBlocks` copies `status` / `permissionSuggestions` / `inputJson`
+ * onto every tool_use block, so a block is enough to answer "does this earlier
+ * call still own the slot?" — which is exactly what the activity fold needs for
+ * a sibling that was SPLIT OUT as a standalone permission card and is therefore
+ * not in the fold's own `earlier` list.
+ */
+function blockAsToolUpstreamPeer(
+	block: AdapterContentBlock,
+	ctx: AdapterContext,
+): ToolUpstreamPeer {
+	const toolUseId = typeof block.id === "string" ? block.id : undefined;
+	const input = asObject(block.inputJson ?? block.input);
+	const status = typeof block.status === "string" ? block.status : null;
+	const suggestions = Array.isArray(block.permissionSuggestions)
+		? (block.permissionSuggestions as unknown[])
+		: null;
+	const reflection = getPermissionReflectionSuggestion({
+		suggestions,
+		permissionSuggestions: suggestions,
+	});
+	return {
+		status,
+		isStreaming:
+			input._streamingChars != null ||
+			// A live streaming tool_use may not yet carry the `_streamingChars` wrapper.
+			status === "streaming",
+		// A live request can exist before the row's status re-read; the explicit
+		// resolver is authoritative when it knows this id.
+		hasPendingPermission:
+			(toolUseId ? ctx.resolveHasPendingPermission?.(toolUseId) === true : false) ||
+			status === "pending",
+		reflectionStatus: reflection?.status ?? null,
+		toolName:
+			(typeof block.name === "string" && block.name) ||
+			(typeof block.toolName === "string" && block.toolName) ||
+			null,
+		input,
+	};
+}
+
+/**
+ * Provider-order upstream peers for `item`.
+ *
+ * ⚠️ Must not trust the fold's `earlier` list alone. `groupRenderUnits` splits a
+ * permission-blocked tool OUT of the activity fold as a standalone full card
+ * (`splitToolRunForActivity`), so the next folded row starts with an empty
+ * `earlier` array even though that call still owns the execution slot. The
+ * second folded row then only sees the first — which is why it looked like only
+ * the third call was queued while the second stayed neutral.
+ *
+ * The message's enriched `tool_use` blocks are the complete order, including
+ * those split-out cards. Unit-local `earlier` still covers tools from OTHER
+ * messages in the same activity unit.
+ */
+function collectUpstreamPeers(
+	item: AdapterToolItem,
+	earlier: readonly AdapterToolItem[],
+	ctx: AdapterContext,
+): ToolUpstreamPeer[] {
+	const peers: ToolUpstreamPeer[] = [];
+	const blocks = item.msg?.contentJson;
+	const covered = new Set<string>();
+	if (Array.isArray(blocks)) {
+		for (let i = 0; i < item.blockIndex; i++) {
+			const block = blocks[i];
+			if (!block || block.type !== "tool_use") continue;
+			if (typeof block.id === "string" && block.id) covered.add(block.id);
+			peers.push(blockAsToolUpstreamPeer(block, ctx));
+		}
+	}
+	for (const peer of earlier) {
+		// Same-message peers are already in `peers` via blockIndex order.
+		if (peer.msg && item.msg && peer.msg === item.msg && peer.blockIndex < item.blockIndex) {
+			continue;
+		}
+		const id = peer.tc.toolUseId;
+		if (id && covered.has(id)) continue;
+		peers.push(toolUpstreamPeer(peer, ctx));
+	}
+	return peers;
+}
+
+/**
  * Whether THIS tool call is queued behind an earlier same-turn call.
  *
  * `earlier` is the provider-order prefix of tool items that sit before this one
  * in the run/activity sequence. Reasoning steps are not peers — they do not
- * occupy the tool execution slot.
+ * occupy the tool execution slot. Message-local earlier `tool_use` blocks are
+ * merged in as well (see `collectUpstreamPeers`).
  */
 function isQueuedBehindUpstreamTools(
 	item: AdapterToolItem,
@@ -3919,7 +4005,7 @@ function isQueuedBehindUpstreamTools(
 		// they land in one parallel group.
 		toolName: item.tc.toolName ?? null,
 		input: asObject(item.tc.inputJson),
-		earlierTools: earlier.map((peer) => toolUpstreamPeer(peer, ctx)),
+		earlierTools: collectUpstreamPeers(item, earlier, ctx),
 	});
 }
 

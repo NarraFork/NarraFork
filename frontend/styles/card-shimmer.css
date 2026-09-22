@@ -78,6 +78,7 @@
 .nf-card-shimmer--reflect,
 .nf-card-shimmer--run,
 .nf-card-shimmer--queued,
+.nf-card-shimmer--queued-out,
 .nf-card-shimmer--done,
 .nf-card-shimmer--fail {
 	position: relative;
@@ -88,6 +89,7 @@
 .nf-card-shimmer--reflect::after,
 .nf-card-shimmer--run::after,
 .nf-card-shimmer--queued::after,
+.nf-card-shimmer--queued-out::after,
 .nf-card-shimmer--done::after,
 .nf-card-shimmer--fail::after {
 	content: "";
@@ -177,6 +179,34 @@
 	animation: nf-card-queued-pulse 2.4s ease-in-out infinite;
 }
 
+/*
+ * Leaving queued — one-shot dissolve of the SAME wash.
+ *
+ * ⚠️ Do not just drop `--queued` when the call starts (or the row settles): the
+ * infinite pulse freezes wherever it happens to be and the next rule's overlay
+ * replaces it in one frame, which reads as the transparency snapping. This class
+ * keeps the wash and fades it to zero over `TOOL_SHIMMER_QUEUED_EXIT_MS`, so the
+ * parked mark finishes its gesture before the next phase appears.
+ */
+@keyframes nf-card-queued-out {
+	from {
+		opacity: 0.8;
+	}
+	to {
+		opacity: 0;
+	}
+}
+
+.nf-card-shimmer--queued-out::after {
+	background-image: linear-gradient(
+		90deg,
+		light-dark(rgba(125, 149, 184, 0.16), rgba(125, 149, 184, 0.22)) 0%,
+		light-dark(rgba(125, 149, 184, 0.05), rgba(125, 149, 184, 0.08)) 18%,
+		transparent 42%
+	);
+	animation: nf-card-queued-out 450ms ease-out forwards;
+}
+
 /* Succeeded — green, one reverse pass. */
 .nf-card-shimmer--done::after {
 	background-image: linear-gradient(
@@ -210,6 +240,7 @@
 	.nf-card-shimmer--reflect::after,
 	.nf-card-shimmer--run::after,
 	.nf-card-shimmer--queued::after,
+	.nf-card-shimmer--queued-out::after,
 	.nf-card-shimmer--done::after,
 	.nf-card-shimmer--fail::after {
 		animation: none;
@@ -218,5 +249,9 @@
 	   queued must not collapse into "nothing here" under reduced motion. */
 	.nf-card-shimmer--queued::after {
 		opacity: 0.75;
+	}
+	/* Reduced motion: end the wash immediately (no dissolve). */
+	.nf-card-shimmer--queued-out::after {
+		opacity: 0;
 	}
 }

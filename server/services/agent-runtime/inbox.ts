@@ -1018,8 +1018,11 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 			const { startParentInboundContinuationIfPossible, resumeBufferedMessagesIfIdle } =
 				await import("../narrator-session");
 			const first = await peekInbox(narratorId);
-			if (first?.kind === "user_input")
-				return (await resumeBufferedMessagesIfIdle(narratorId)).resumed;
+			// A user behind a bounded batch of notices is still explicit work, not
+			// an autonomous continuation (which intentionally refuses plan mode).
+			// The user consumer drains those preceding notices without skipping them.
+			if (first?.kind === "user_input" || (await hasInboxKind(narratorId, ["user_input"])))
+				return (await resumeBufferedMessagesIfIdle(narratorId, locale)).resumed;
 			return (await startParentInboundContinuationIfPossible(narratorId, "en")).started;
 		})
 		.catch((error) => {

@@ -99,12 +99,24 @@ function textLefts(root: Element): number[] {
 	});
 }
 
-/** The painted width of each leading icon lane, in row order. */
+/**
+ * The painted width of each leading icon lane, in row order.
+ *
+ * Scoped to task-row lanes: the card header category chip is also a ThemeIcon
+ * (`CategoryChip`), but its parent has no measured `width` — counting it here
+ * would inject a phantom -1 and hide a real lane mismatch.
+ */
 function laneWidths(root: Element): number[] {
-	return Array.from(root.querySelectorAll(".mantine-ThemeIcon-root")).map((icon) => {
-		const style = icon.parentElement?.getAttribute("style") ?? "";
-		return Number.parseInt(/width:\s*(\d+)px/.exec(style)?.[1] ?? "-1", 10);
-	});
+	return (
+		Array.from(root.querySelectorAll(".mantine-ThemeIcon-root"))
+			.filter((icon) => !icon.hasAttribute("data-nf-card-header-chip"))
+			.map((icon) => {
+				const style = icon.parentElement?.getAttribute("style") ?? "";
+				return Number.parseInt(/width:\s*(\d+)px/.exec(style)?.[1] ?? "-1", 10);
+			})
+			// Keep only icons that sit in a sized icon lane (spec-task rows).
+			.filter((w) => w >= 0)
+	);
 }
 
 describe("spec-tasks rows — icon lane vs text lane", () => {

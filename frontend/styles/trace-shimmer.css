@@ -151,6 +151,7 @@
 .nf-trace-shimmer--reflect,
 .nf-trace-shimmer--run,
 .nf-trace-shimmer--queued,
+.nf-trace-shimmer--queued-out,
 .nf-trace-shimmer--done,
 .nf-trace-shimmer--fail {
 	background-size: 200% 100%;
@@ -182,6 +183,67 @@
 		var(--mantine-color-dimmed) 100%
 	);
 	animation: nf-card-queued-pulse 2.4s ease-in-out infinite;
+}
+
+/*
+ * Leaving queued on a text-clip row.
+ *
+ * ⚠️ Cannot fade `opacity` to 0: the gradient IS the glyphs (`text-fill` is
+ * transparent), so opacity 0 would erase the words. The dissolve therefore walks
+ * the slate tint back to plain dimmed grey across several keyframe steps —
+ * same stop layout every frame so a browser that interpolates gradients blends
+ * them, and one that does not still gets a short stepped fade instead of a snap.
+ */
+@keyframes nf-trace-queued-out {
+	0% {
+		background-image: linear-gradient(
+			90deg,
+			light-dark(var(--mantine-color-slate-7), var(--mantine-color-slate-4)) 0%,
+			light-dark(var(--mantine-color-slate-6), var(--mantine-color-slate-5)) 28%,
+			var(--mantine-color-dimmed) 62%,
+			var(--mantine-color-dimmed) 100%
+		);
+	}
+	45% {
+		background-image: linear-gradient(
+			90deg,
+			light-dark(var(--mantine-color-slate-6), var(--mantine-color-slate-5)) 0%,
+			var(--mantine-color-dimmed) 28%,
+			var(--mantine-color-dimmed) 62%,
+			var(--mantine-color-dimmed) 100%
+		);
+	}
+	75% {
+		background-image: linear-gradient(
+			90deg,
+			var(--mantine-color-dimmed) 0%,
+			var(--mantine-color-dimmed) 28%,
+			var(--mantine-color-dimmed) 62%,
+			var(--mantine-color-dimmed) 100%
+		);
+		opacity: 0.85;
+	}
+	100% {
+		background-image: linear-gradient(
+			90deg,
+			var(--mantine-color-dimmed) 0%,
+			var(--mantine-color-dimmed) 28%,
+			var(--mantine-color-dimmed) 62%,
+			var(--mantine-color-dimmed) 100%
+		);
+		opacity: 0.85;
+	}
+}
+
+.nf-trace-shimmer--queued-out {
+	background-image: linear-gradient(
+		90deg,
+		light-dark(var(--mantine-color-slate-7), var(--mantine-color-slate-4)) 0%,
+		light-dark(var(--mantine-color-slate-6), var(--mantine-color-slate-5)) 28%,
+		var(--mantine-color-dimmed) 62%,
+		var(--mantine-color-dimmed) 100%
+	);
+	animation: nf-trace-queued-out 450ms ease-out forwards;
 }
 
 /* Shared keyframe name with card-shimmer.css — one definition, both carriers load
@@ -299,6 +361,7 @@
 	.nf-trace-shimmer--stream,
 	.nf-trace-shimmer--reflect,
 	.nf-trace-shimmer--run,
+	.nf-trace-shimmer--queued-out,
 	.nf-trace-shimmer--done,
 	.nf-trace-shimmer--fail {
 		animation: none;

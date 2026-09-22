@@ -297,7 +297,14 @@ export interface SavedBufferedFile {
 
 // === BufferedMessage interface ===
 
+export interface BufferedExecutionIntent {
+	modelOverride?: { model: string; mode: "temporary" | "permanent" };
+	/** Built-in control command; execute only after the previous owner has finalized. */
+	controlCommand?: boolean;
+}
+
 export interface BufferedMessage {
+	executionIntent?: BufferedExecutionIntent;
 	id: string;
 	text: string;
 	/** Server-accepted immutable bytes; summaries expose only reference metadata. */

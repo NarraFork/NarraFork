@@ -89,6 +89,7 @@ import { knowledgeInjectionReads, knowledgeService } from "../knowledge-service"
 import {
 	cleanupBufferedTextFilesAsync,
 	getBufferedMessagesAsync,
+	mailboxInputRequiresFreshTurn,
 	projectMailboxUserMessage,
 	restoreBufferedMessage,
 	toBufferSummary,
@@ -173,6 +174,7 @@ import {
 	planModeAskedOnce,
 	recordNarratorRuntimeModel,
 	resetActiveUpstreamSession,
+	withNarratorMutationAdmission,
 } from "../narrator-session-state";
 import { clearAliasRegistry, clearTeamFileChanges } from "../narrator-subagent";
 import { generateAndSetTitle } from "../narrator-title";
@@ -1044,6 +1046,7 @@ export async function runAgentLoopUnlocked(
 			await ensureSkillCacheFreshForActiveNarrator(active);
 			const availableDevices = turnSessionDevices;
 
+			let toolCallLimitExceeded = false;
 			const config: import("../../lib/agent").AgentConfig = {
 				runtimePolicy,
 				narratorId,
@@ -1139,6 +1142,11 @@ export async function runAgentLoopUnlocked(
 				serviceTier: resolvedServiceTier,
 				maxTransientRetries: getMaxTransientRetries(),
 				silentToolCallThreshold: getSilentToolCallThreshold(),
+				maxToolCallsPerResponse: settings.agent.maxToolCallsPerResponse,
+				onToolCallLimitExceeded: () => {
+					toolCallLimitExceeded = true;
+					active.abortController.abort();
+				},
 				pipelineUnusedToolCallThreshold: getPipelineUnusedToolCallThreshold(),
 				retryBackoffCeilMs: getRetryBackoffCeilMs(),
 				firstTokenTimeoutMs: getFirstTokenTimeoutMs(),
@@ -1632,6 +1640,16 @@ export async function runAgentLoopUnlocked(
 				hooks,
 			});
 			runState.lastPass = result;
+			if (toolCallLimitExceeded) {
+				// Stop before any retry, review/task continuation or buffered-message replay.
+				// A new explicit user turn can still start normally; no persistent latch.
+				runState.hadError = true;
+				runState.wasInterrupted = true;
+				const partialId = active._partialMessageId;
+				active._partialMessageId = undefined;
+				await finalizeInterruptedRun(active, narratorId, partialId);
+				break;
+			}
 			runState.recovery.overflowRetries = resetContextOverflowRetriesAfterProgress(
 				runState.recovery.overflowRetries,
 				result.completedAssistantTurn,
@@ -2312,10 +2330,23 @@ export async function runAgentLoopUnlocked(
 				!runState.hadError &&
 				!isNarratorRevertAdmissionBlocked(narratorId)
 			) {
-				const bufferedRow = await claimInboxHead(
-					narratorId,
-					(candidate) => candidate.kind === "user_input",
-				);
+				// Serialize this claim with HTTP acceptance + interrupt. Otherwise a live
+				// loop can consume the replacement while its enqueue is returning, then
+				// the interrupt intended for the old input would abort the new one.
+				let requiresFreshTurn = false;
+				const bufferedRow = await withNarratorMutationAdmission(narratorId, async () => {
+					if (active.abortController.signal.aborted) return undefined;
+					return claimInboxHead(narratorId, (candidate) => {
+						requiresFreshTurn = mailboxInputRequiresFreshTurn(candidate);
+						return (
+							!active.abortController.signal.aborted &&
+							candidate.kind === "user_input" &&
+							!requiresFreshTurn
+						);
+					});
+				});
+				// Let the finalizer restore the previous model and release its epoch first.
+				if (requiresFreshTurn) break;
 				let buffered: BufferedMessage | undefined;
 				try {
 					buffered = bufferedRow ? projectMailboxUserMessage(bufferedRow) : undefined;

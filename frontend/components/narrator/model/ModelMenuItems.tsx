@@ -1,5 +1,6 @@
 import { ActionIcon, Badge, Box, CloseButton, Group, Menu, Text, TextInput } from "@mantine/core";
 import {
+	IconAlertTriangle,
 	IconCheck,
 	IconDotsVertical,
 	IconInfoCircle,
@@ -269,9 +270,14 @@ export function ModelMenuItems({
 								const showMembers = isAggItem && selected && selection.members.length > 0;
 								// Three-dot actions only on top-level rows that can actually occupy a
 								// global slot. Meta sentinels would make the slot circular.
+								// A delisted-but-pinned model must not offer "set as default/summary" —
+								// that would just re-affirm the dead pin. Offer the role pickers instead.
+								const isCatalogMissing = m.catalogMissing === true;
 								const showActionsToggle =
-									!!(onSetAsDefaultModel || onSetAsSummaryModel) &&
-									canAssignGlobalModelRole(m.value);
+									(canAssignGlobalModelRole(m.value) &&
+										!!(onSetAsDefaultModel || onSetAsSummaryModel) &&
+										!isCatalogMissing) ||
+									(isCatalogMissing && !!(onEditDefaultModel || onEditSummaryModel));
 								const actionsOpen = showActionsToggle && actionsModelValue === m.value;
 								const globalRoleActions: Array<{
 									key: "default" | "summary";
@@ -279,7 +285,24 @@ export function ModelMenuItems({
 									current: boolean;
 									onSelect: () => void;
 								}> = [];
-								if (showActionsToggle) {
+								if (isCatalogMissing) {
+									if (onEditDefaultModel) {
+										globalRoleActions.push({
+											key: "default",
+											label: t("editDefaultModel"),
+											current: !!defaultModelValue && defaultModelValue === m.value,
+											onSelect: () => onEditDefaultModel(),
+										});
+									}
+									if (onEditSummaryModel) {
+										globalRoleActions.push({
+											key: "summary",
+											label: t("editSummaryModel"),
+											current: !!summaryModelValue && summaryModelValue === m.value,
+											onSelect: () => onEditSummaryModel(),
+										});
+									}
+								} else if (showActionsToggle) {
 									if (onSetAsDefaultModel) {
 										globalRoleActions.push({
 											key: "default",
@@ -297,6 +320,17 @@ export function ModelMenuItems({
 										});
 									}
 								}
+								const catalogMissingHint = isCatalogMissing
+									? m.pinnedAs?.length
+										? t("modelCatalogMissingHint", {
+												roles: m.pinnedAs
+													.map((role) =>
+														role === "default" ? ts("defaultModel") : ts("summaryModel"),
+													)
+													.join(" / "),
+											})
+										: t("modelCatalogMissingHintGeneric")
+									: null;
 								return (
 									<Fragment key={m.value}>
 										<Menu.Item
@@ -309,6 +343,11 @@ export function ModelMenuItems({
 											onClick={() => onSelect(m.value)}
 											rightSection={
 												<Group gap={4} wrap="nowrap">
+													{isCatalogMissing && (
+														<Badge size="xs" variant="light" color="orange">
+															{t("modelCatalogMissing")}
+														</Badge>
+													)}
 													{m.available === false && (
 														<Badge size="xs" variant="light" color="yellow">
 															{t("modelTemporarilyUnavailable")}
@@ -364,9 +403,21 @@ export function ModelMenuItems({
 												</Group>
 											}
 											fw={selected ? 600 : 400}
-											c={m.available === false ? "dimmed" : undefined}
+											c={m.available === false || isCatalogMissing ? "dimmed" : undefined}
 										>
-											{m.label}
+											<Box>
+												<Text size="sm" inherit>
+													{m.label}
+												</Text>
+												{catalogMissingHint && (
+													<Group gap={4} wrap="nowrap" mt={2} align="flex-start">
+														<IconAlertTriangle size={12} color="var(--mantine-color-orange-6)" />
+														<Text size="xs" c="orange" lh={1.3}>
+															{catalogMissingHint}
+														</Text>
+													</Group>
+												)}
+											</Box>
 										</Menu.Item>
 										{actionsOpen && globalRoleActions.length > 0 && (
 											<Box onClick={(e) => e.stopPropagation()} data-model-role-actions={m.value}>

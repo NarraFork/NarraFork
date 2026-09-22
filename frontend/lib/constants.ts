@@ -43,6 +43,20 @@ export type ModelOption = {
 	 * "temporarily unavailable" so the user knows selecting it will wait for
 	 * recovery. Absent/true means available. */
 	available?: boolean;
+	/**
+	 * True when this option is only present because a default/summary (or
+	 * provider-default) selection still points at it, while the provider
+	 * catalog no longer lists it (delisted after a model-list refresh).
+	 * The UI must prompt the user to reassign those roles rather than treat
+	 * this as an ordinary catalog row (and must not offer "set as default/
+	 * summary" as the fix — that would keep the dead pin).
+	 */
+	catalogMissing?: boolean;
+	/**
+	 * Global roles that keep a `catalogMissing` option in the list.
+	 * Empty/absent means it is not currently pinned as default or summary.
+	 */
+	pinnedAs?: Array<"default" | "summary">;
 };
 
 /** Sentinel value stored in DB to mean "follow the default model from settings". */
@@ -151,20 +165,30 @@ export function modelValue(provider: string, modelId: string): string {
 
 /**
  * Merge multiple ModelOption arrays, deduplicating by value.
- * Earlier entries win.
+ * Earlier entries win for identity/display fields (label, provider, rate).
+ * Status annotations accumulate across duplicates: a later catalog-missing or
+ * pinned fallback must not be dropped just because an unmarked catalog row
+ * with the same value came first — those flags are what the UI reads to warn
+ * about a delisted default/summary pin.
  */
 export function mergeModels(...sources: ModelOption[][]): ModelOption[] {
-	const seen = new Set<string>();
-	const result: ModelOption[] = [];
+	const byValue = new Map<string, ModelOption>();
 	for (const list of sources) {
 		for (const m of list) {
-			if (!seen.has(m.value)) {
-				seen.add(m.value);
-				result.push(m);
+			const existing = byValue.get(m.value);
+			if (!existing) {
+				byValue.set(m.value, { ...m, ...(m.pinnedAs ? { pinnedAs: [...m.pinnedAs] } : {}) });
+				continue;
+			}
+			if (m.catalogMissing) existing.catalogMissing = true;
+			if (m.available === false) existing.available = false;
+			if (m.pinnedAs?.length) {
+				const pins = new Set([...(existing.pinnedAs ?? []), ...m.pinnedAs]);
+				existing.pinnedAs = [...pins];
 			}
 		}
 	}
-	return result;
+	return [...byValue.values()];
 }
 
 /** Group ModelOption[] by provider for Mantine Select's grouped data format. */

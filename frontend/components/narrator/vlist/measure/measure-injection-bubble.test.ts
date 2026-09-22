@@ -169,6 +169,32 @@ describe("measureInjectionBubble — width discipline", () => {
 		);
 	});
 
+	it("keeps an empty task digest wide enough for the cadence header", async () => {
+		// The empty digest body is one short line. Shrink-wrapping to it alone left the
+		// header at the old 180px floor, which could not fit source name + "every N tool
+		// calls" + the frequency gear — the name rendered as a single truncated character.
+		const { measureInjectionBubble, INJECTION_BUBBLE_PADDING, INJECTION_HEADER_MIN_CONTENT_WIDTH } =
+			await mod();
+		const r = measureInjectionBubble(
+			{
+				payload: {
+					kind: "spec-task",
+					data: { emptyLabel: "Dynamic Spec — no tasks created yet", tasks: [] },
+				},
+				speaker: null,
+				source: "living_work_spec",
+				hasHeader: true,
+			},
+			WIDTH,
+		);
+		expect(r.usedWidth).toBeGreaterThanOrEqual(
+			INJECTION_BUBBLE_PADDING * 2 + INJECTION_HEADER_MIN_CONTENT_WIDTH,
+		);
+		// The floor widens the frame only; the empty label still measures as one line.
+		expect(r.frame.contentHeight).toBeGreaterThan(0);
+		expect(r.height).toBeGreaterThan(r.frame.contentHeight);
+	});
+
 	it("does not let the header floor change the body's height", async () => {
 		// The floor widens the FRAME only. If it leaked into the wrap width, adding a
 		// header would silently re-wrap the body and change its line count.

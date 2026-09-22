@@ -19,21 +19,39 @@ import { installLegacyBrowserPolyfills } from "./legacy-browser-polyfills";
 
 type Descriptors = Array<{ target: object; key: string; descriptor: PropertyDescriptor }>;
 
-/** Remove a built-in, run `body` against the freshly installed shim, then restore. */
-function withoutNative(targets: Array<[object, string]>, body: () => void): void {
+/**
+ * Remove a built-in, run `body` against the freshly installed shim, then restore.
+ *
+ * Async bodies are supported because `AbortSignal.timeout` is a timer: the
+ * assertion has to outlive the call that schedules it. The restore still runs
+ * only after the body settles, so a failed await cannot leak a shim into the
+ * next test.
+ */
+function withoutNative(targets: Array<[object, string]>, body: () => void): void;
+function withoutNative(targets: Array<[object, string]>, body: () => Promise<void>): Promise<void>;
+function withoutNative(
+	targets: Array<[object, string]>,
+	body: () => void | Promise<void>,
+): void | Promise<void> {
 	const saved: Descriptors = [];
 	for (const [target, key] of targets) {
 		const descriptor = Object.getOwnPropertyDescriptor(target, key);
 		if (descriptor) saved.push({ target, key, descriptor });
 		delete (target as Record<string, unknown>)[key];
 	}
-	try {
-		installLegacyBrowserPolyfills();
-		body();
-	} finally {
+	const restore = () => {
 		for (const entry of saved) {
 			Object.defineProperty(entry.target, entry.key, entry.descriptor);
 		}
+	};
+	try {
+		installLegacyBrowserPolyfills();
+		const result = body();
+		if (result instanceof Promise) return result.finally(restore);
+		restore();
+	} catch (error) {
+		restore();
+		throw error;
 	}
 }
 
@@ -331,10 +349,112 @@ describe("structuredClone shim", () => {
 	});
 });
 
+describe("AbortSignal.timeout shim", () => {
+	it("aborts after the delay with a TimeoutError DOMException", async () => {
+		await withoutNative([[AbortSignal, "timeout"]], async () => {
+			const signal = AbortSignal.timeout(5);
+			expect(signal.aborted).toBe(false);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(signal.aborted).toBe(true);
+			expect(signal.reason).toBeInstanceOf(DOMException);
+			expect((signal.reason as DOMException).name).toBe("TimeoutError");
+		});
+	});
+
+	it("rejects non-finite and negative delays like Web IDL EnforceRange", () => {
+		withoutNative([[AbortSignal, "timeout"]], () => {
+			// biome-ignore lint/suspicious/noExplicitAny: exercising Web IDL coercion
+			expect(() => AbortSignal.timeout(Number.NaN as any)).toThrow(TypeError);
+			// biome-ignore lint/suspicious/noExplicitAny: exercising Web IDL coercion
+			expect(() => AbortSignal.timeout(-1 as any)).toThrow(TypeError);
+			// biome-ignore lint/suspicious/noExplicitAny: exercising Web IDL coercion
+			expect(() => AbortSignal.timeout(Number.POSITIVE_INFINITY as any)).toThrow(TypeError);
+			expect(() => AbortSignal.timeout(0)).not.toThrow();
+		});
+	});
+});
+
+describe("AbortSignal.any shim", () => {
+	it("returns a never-aborting signal for an empty iterable", () => {
+		withoutNative([[AbortSignal, "any"]], () => {
+			const signal = AbortSignal.any([]);
+			expect(signal.aborted).toBe(false);
+		});
+	});
+
+	it("lets the first already-aborted input win, without listening to later ones", () => {
+		withoutNative([[AbortSignal, "any"]], () => {
+			const first = new AbortController();
+			const second = new AbortController();
+			const live = new AbortController();
+			second.abort("second");
+			first.abort("first");
+			const add = live.signal.addEventListener.bind(live.signal);
+			let listened = 0;
+			live.signal.addEventListener = ((...args: Parameters<typeof add>) => {
+				listened++;
+				return add(...args);
+			}) as typeof add;
+			const signal = AbortSignal.any([live.signal, first.signal, second.signal]);
+			expect(signal.aborted).toBe(true);
+			expect(signal.reason).toBe("first");
+			expect(listened).toBe(0);
+		});
+	});
+
+	it("propagates the first later abort and detaches the remaining listeners", () => {
+		withoutNative([[AbortSignal, "any"]], () => {
+			const winner = new AbortController();
+			const other = new AbortController();
+			const removeOther = other.signal.removeEventListener.bind(other.signal);
+			let removedFromOther = 0;
+			other.signal.removeEventListener = ((...args: Parameters<typeof removeOther>) => {
+				removedFromOther++;
+				return removeOther(...args);
+			}) as typeof removeOther;
+			const signal = AbortSignal.any([winner.signal, other.signal]);
+			let events = 0;
+			signal.addEventListener("abort", () => events++);
+			winner.abort("winner");
+			expect(signal.aborted).toBe(true);
+			expect(signal.reason).toBe("winner");
+			expect(events).toBe(1);
+			// The sibling's listener must be gone so a long-lived parent does not
+			// accumulate one dead listener per completed request.
+			expect(removedFromOther).toBeGreaterThanOrEqual(1);
+			other.abort("late");
+			expect(signal.reason).toBe("winner");
+			expect(events).toBe(1);
+		});
+	});
+
+	it("composes with the timeout shim the way the git panel does", async () => {
+		await withoutNative(
+			[
+				[AbortSignal, "any"],
+				[AbortSignal, "timeout"],
+			],
+			async () => {
+				const caller = new AbortController();
+				const combined = AbortSignal.any([caller.signal, AbortSignal.timeout(5)]);
+				expect(combined.aborted).toBe(false);
+				caller.abort("cancelled");
+				expect(combined.aborted).toBe(true);
+				expect(combined.reason).toBe("cancelled");
+				// The timeout still fires later; it must not overwrite the settled reason.
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				expect(combined.reason).toBe("cancelled");
+			},
+		);
+	});
+});
+
 describe("installLegacyBrowserPolyfills", () => {
 	it("is idempotent and never replaces a native implementation", () => {
 		const nativeAt = Array.prototype.at;
 		const nativeHasOwn = Object.hasOwn;
+		const nativeTimeout = AbortSignal.timeout;
+		const nativeAny = AbortSignal.any;
 
 		installLegacyBrowserPolyfills();
 		installLegacyBrowserPolyfills();
@@ -342,5 +462,7 @@ describe("installLegacyBrowserPolyfills", () => {
 		// Feature detection means a modern engine keeps exactly what it had.
 		expect(Array.prototype.at).toBe(nativeAt);
 		expect(Object.hasOwn).toBe(nativeHasOwn);
+		expect(AbortSignal.timeout).toBe(nativeTimeout);
+		expect(AbortSignal.any).toBe(nativeAny);
 	});
 });

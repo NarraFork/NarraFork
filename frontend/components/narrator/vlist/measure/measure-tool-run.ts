@@ -924,6 +924,13 @@ export interface ActivityTraceItem {
 	title: string;
 	hasIcon?: boolean;
 	iconColor?: string;
+	/**
+	 * Tool name / category for the row's chip glyph (renderer; height-neutral).
+	 * `measureCollapsibleTrace` already passthroughs both onto `MeasuredTraceRow`;
+	 * they were missing from this input type, so call sites had to cast.
+	 */
+	toolName?: string;
+	category?: string;
 	shimmer?: boolean;
 	/** Live reflection-gate status for the shimmer colour (renderer; height-neutral). */
 	reflectionStatus?: string;

@@ -1,8 +1,9 @@
 // MUST stay the first import: it installs runtime built-ins that older Safari/WebKit
-// lacks (Array.prototype.at, findLast/findLastIndex, Object.hasOwn, structuredClone).
-// Vite's `safari14` target down-levels syntax only, so a shim installed after another
-// module's top-level code has already run would be too late. See that file's header
-// for the Safari 14 virtual-list flicker this prevents.
+// lacks (Array.prototype.at, findLast/findLastIndex, Object.hasOwn, structuredClone,
+// AbortSignal.timeout, AbortSignal.any). Vite's `safari14` target down-levels syntax
+// only, so a shim installed after another module's top-level code has already run
+// would be too late. See that file's header for the Safari 14 virtual-list flicker
+// this prevents.
 import "@frontend/lib/legacy-browser-polyfills";
 import { reportReactRenderError } from "@frontend/lib/hmr-guard";
 import "@frontend/lib/dom-mutation-guard";

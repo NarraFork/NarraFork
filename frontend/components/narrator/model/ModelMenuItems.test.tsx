@@ -28,6 +28,8 @@ let selected: string[];
 let refreshed: number;
 let setAsDefault: string[];
 let setAsSummary: string[];
+let editDefault: number;
+let editSummary: number;
 const previousGlobals = new Map<string, PropertyDescriptor | undefined>();
 
 beforeEach(async () => {
@@ -38,6 +40,8 @@ beforeEach(async () => {
 	refreshed = 0;
 	setAsDefault = [];
 	setAsSummary = [];
+	editDefault = 0;
+	editSummary = 0;
 	const globals = {
 		window,
 		document: window.document,
@@ -89,11 +93,13 @@ async function render(
 	opened = true,
 	options?: {
 		withGlobalRoleActions?: boolean;
+		withRoleEditors?: boolean;
 		defaultModelValue?: string | null;
 		summaryModelValue?: string | null;
 	},
 ) {
 	const withGlobalRoleActions = options?.withGlobalRoleActions ?? false;
+	const withRoleEditors = options?.withRoleEditors ?? false;
 	await act(async () => {
 		root.render(
 			<MantineProvider env="test">
@@ -107,7 +113,7 @@ async function render(
 									currentModel={currentModel}
 									totalCostUsd={null}
 									aggregations={aggregations}
-									providerLabels={{ a: "Provider A" }}
+									providerLabels={{ a: "Provider A", xiaomi: "Xiaomi" }}
 									onSelect={(value) => selected.push(value)}
 									onPickerOpened={() => {
 										refreshed++;
@@ -118,6 +124,12 @@ async function render(
 										? {
 												onSetAsDefaultModel: (value: string) => setAsDefault.push(value),
 												onSetAsSummaryModel: (value: string) => setAsSummary.push(value),
+											}
+										: {})}
+									{...(withRoleEditors
+										? {
+												onEditDefaultModel: () => editDefault++,
+												onEditSummaryModel: () => editSummary++,
 											}
 										: {})}
 								/>
@@ -203,6 +215,38 @@ describe("per-model global role actions", () => {
 		const toggles = host.querySelectorAll("[aria-label='Model actions']");
 		expect(toggles.length).toBe(1);
 		expect(host.textContent).toContain("One");
+	});
+	test("warns on a delisted pinned model and offers role pickers instead of re-pinning", async () => {
+		const delisted: ModelOption[] = [
+			{ value: "__default__", label: "Follow default", provider: "__default__" },
+			{
+				value: "xiaomi:mimo-x-pro-preview",
+				label: "mimo-x-pro-preview",
+				provider: "xiaomi",
+				catalogMissing: true,
+				pinnedAs: ["summary"],
+			},
+			{ value: "xiaomi:mimo-v2.6-pro", label: "mimo-v2.6-pro", provider: "xiaomi" },
+		];
+		await render("xiaomi:mimo-v2.6-pro", delisted, true, true, {
+			withGlobalRoleActions: true,
+			withRoleEditors: true,
+			summaryModelValue: "xiaomi:mimo-x-pro-preview",
+		});
+		expect(host.textContent).toContain(narratorLocale.modelCatalogMissing);
+		expect(host.textContent).toContain(
+			narratorLocale.modelCatalogMissingHint.replace("{{roles}}", settingsLocale.summaryModel),
+		);
+		const toggles = host.querySelectorAll("[aria-label='Model actions']");
+		// Follow-default has none; both concrete models still have a three-dot.
+		expect(toggles.length).toBe(2);
+		// toggles[0] is the delisted row.
+		await act(async () => {
+			toggles[0]?.dispatchEvent(new window.Event("click", { bubbles: true }));
+		});
+		const items = Array.from(host.querySelectorAll("[data-menu-item]")).map((i) => i.textContent);
+		expect(items).toContain(narratorLocale.editSummaryModel);
+		expect(items).not.toContain(narratorLocale.setAsSummaryModel);
 	});
 });
 

@@ -23,6 +23,7 @@ const executor = await import("../narrator-executor");
 const recovery = await import("../narrator-recovery");
 const savedOpenai = settings.openaiProviders;
 const savedAnthropic = settings.anthropicProviders;
+const savedMaxToolCallsPerResponse = settings.agent.maxToolCallsPerResponse;
 const ids = ["retry-parent", "retry-primary", "retry-child"];
 const marker = "CONTINUATION_CONTEXT Self-continuations left: 5";
 
@@ -34,6 +35,7 @@ afterEach(() => {
 	}
 	settings.openaiProviders = savedOpenai;
 	settings.anthropicProviders = savedAnthropic;
+	settings.agent.maxToolCallsPerResponse = savedMaxToolCallsPerResponse;
 	mock.restore();
 });
 afterAll(() => mock.module("../../db", () => realDb));
@@ -56,6 +58,120 @@ function session(id: string, model: string, provider: string): ActiveNarrator {
 		_substatus: new Set(),
 	};
 }
+
+describe("tool-call limit stops the real runtime without locking later user turns", () => {
+	for (const kind of ["primary", "subagent"] as const) {
+		test(`${kind}: configured limit aborts once and suppresses retry and inbox wake`, async () => {
+			const prefix = "runtime_tool_limit";
+			const model = `${prefix}:gpt-5`;
+			settings.agent.maxToolCallsPerResponse = 7;
+			settings.openaiProviders = [
+				{
+					id: prefix,
+					name: prefix,
+					prefix,
+					apiKey: "test-only",
+					baseUrl: "https://example.invalid/v1",
+					defaultModel: "gpt-5",
+					apiMode: "responses",
+				},
+			];
+			const id = kind === "primary" ? "retry-primary" : "retry-child";
+			const now = new Date().toISOString();
+			for (const target of ["retry-parent", id]) {
+				await db.insert(narrators).values({
+					id: target,
+					type: target === "retry-child" ? "subagent" : "primary",
+					variant: target === "retry-child" ? "subagent:general" : "primary",
+					parentNarratorId: target === "retry-child" ? "retry-parent" : null,
+					model,
+					autoContinuationOverride: "off",
+					cwd: process.env.HOME,
+					createdAt: now,
+					updatedAt: now,
+				});
+			}
+			const profile: RuntimeProfile =
+				kind === "primary"
+					? { kind }
+					: {
+							kind,
+							parentNarratorId: "retry-parent",
+							parentToolUseId: "origin-tool",
+							subagentType: "general",
+							systemPrompt: "tool limit contract",
+							initialHistory: [],
+						};
+			const active = session(id, model, prefix);
+			activeNarrators.set(id, active);
+			const owner = tryClaimExecution(id, kind);
+			if (!owner) throw new Error("Missing tool-limit owner");
+			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				expect(options.config.maxToolCallsPerResponse).toBe(7);
+				expect(options.config.signal.aborted).toBe(false);
+				expect(options.config.onToolCallLimitExceeded).toBeDefined();
+				options.config.onToolCallLimitExceeded?.(7);
+				expect(options.config.signal.aborted).toBe(true);
+				// Even if a pass carries a recovery hint, the limit must win first.
+				return {
+					finalText: "",
+					hasError: false,
+					shouldUpdateTitle: false,
+					retryableError: "transient failure after limit",
+					interrupted: true,
+				};
+			});
+			const retry = spyOn(recovery, "handleTransientError").mockResolvedValue({
+				shouldRetry: true,
+				delayMs: 0,
+			});
+			const outcome = await runAgentLoopUnlocked(
+				active,
+				owner,
+				"first user input",
+				undefined,
+				profile,
+			);
+			expect(execute).toHaveBeenCalledTimes(1);
+			expect(retry).not.toHaveBeenCalled();
+			expect(outcome.hasError).toBe(true);
+			expect(outcome.allowInboxWake).toBe(false);
+			const stopped = await narratorService.getById(id);
+			expect(stopped.status).toBe("idle");
+			expect(stopped.substatus).toContain("interrupted");
+
+			// A separate explicit user turn gets a fresh controller and local limit flag.
+			owner.release();
+			const next = session(id, model, prefix);
+			activeNarrators.set(id, next);
+			const nextOwner = tryClaimExecution(id, kind);
+			if (!nextOwner) throw new Error("Missing new user-turn owner");
+			execute.mockImplementation(async (options) => {
+				expect(options.config.signal.aborted).toBe(false);
+				expect(options.userText).toBe("new explicit user input");
+				return {
+					finalText: "finished",
+					hasError: false,
+					shouldUpdateTitle: false,
+					completedNaturally: true,
+					completedAssistantTurn: true,
+				};
+			});
+			const resumed = await runAgentLoopUnlocked(
+				next,
+				nextOwner,
+				"new explicit user input",
+				undefined,
+				profile,
+			);
+			expect(execute).toHaveBeenCalledTimes(2);
+			expect(retry).not.toHaveBeenCalled();
+			expect(resumed.hasError).toBe(false);
+			expect(resumed.allowInboxWake).toBe(true);
+			expect(resumed.finalText).toBe("finished");
+		});
+	}
+});
 
 describe("provider retry policy is identical through the real primary and child runtime", () => {
 	for (const kind of ["primary", "subagent"] as const) {

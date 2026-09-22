@@ -699,7 +699,16 @@ describe("agentLoop abort result draining", () => {
 		await releaseReads;
 		expect(executedToolValues).toEqual(["read:parallel-1.txt", "read:parallel-2.txt"]);
 		expect(completedToolValues).toEqual(["read:parallel-1.txt", "read:parallel-2.txt"]);
-		expect(toolResultIds).toEqual(["tu_parallel_abort_1", "tu_parallel_abort_2"]);
+		expect(toolResultIds).toEqual([
+			"tu_parallel_abort_1",
+			"tu_parallel_abort_2",
+			"tu_serial_after_parallel",
+		]);
+		expect(
+			events.find(
+				(event) => event.type === "tool_result" && event.toolUseId === "tu_serial_after_parallel",
+			),
+		).toMatchObject({ isError: true, durationMs: 0 });
 		expect(new Set(toolResultIds).size).toBe(toolResultIds.length);
 		expect(executedToolValues).not.toContain("write:after-parallel.txt");
 		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });

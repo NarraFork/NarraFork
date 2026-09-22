@@ -76,6 +76,7 @@ import { TRACE_CHEVRON, TRACE_ROW_GAP, TRACE_ROW_ICON } from "../measure/measure
 import { typographyMetrics } from "../pretext-fonts";
 import type { VListViewControls } from "../VListContentViewHost";
 import { findViewTarget, type VListViewTarget } from "../vlist-content-view-target";
+import { CategoryChip } from "./category-chip";
 import { categoryIcon } from "./category-icons";
 import { DiffStatsText } from "./diff-stats-text";
 import { swallowSelectionClick } from "./key-activate";
@@ -368,16 +369,15 @@ function RecentCallCategoryChip({
 	return (
 		// Same `data-trace-row-chip` marker a folded trace row's chip carries — the two
 		// rows are one shape, so a parity test must be able to find both the same way.
-		<ThemeIcon
+		// Shared CategoryChip: ThemeIcon light + CATEGORY_COLOR, identical to the card header.
+		<CategoryChip
 			data-trace-row-chip
 			size={TRACE_ROW_ICON}
-			variant="light"
 			color={CATEGORY_COLOR[resolved] ?? "gray"}
-			radius="sm"
 			data-testid="subagent-activity-category-chip"
 		>
 			<Icon size={TRACE_ROW_GLYPH_SIZE} />
-		</ThemeIcon>
+		</CategoryChip>
 	);
 }
 

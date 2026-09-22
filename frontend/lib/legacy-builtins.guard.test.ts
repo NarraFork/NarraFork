@@ -174,8 +174,16 @@ const GUARDED_BUILTINS: readonly GuardedBuiltin[] = [
 		name: "AbortSignal.timeout",
 		availableFrom: "Safari 16",
 		pattern: /\bAbortSignal\s*\.\s*timeout\s*\(/g,
-		disposition: "banned",
-		alternative: "`const c = new AbortController(); setTimeout(() => c.abort(), ms)`",
+		disposition: "shimmed",
+	},
+	{
+		name: "AbortSignal.any",
+		availableFrom: "Safari 17.4",
+		// Unshipped once already: `lib/api/git.ts` called this and the mobile Git
+		// panel died with `AbortSignal.any is not a function`. Safari 17.4 is newer
+		// than the rest of the polyfill set, so it must stay on this list.
+		pattern: /\bAbortSignal\s*\.\s*any\s*\(/g,
+		disposition: "shimmed",
 	},
 	{
 		name: "Error cause option",
@@ -497,6 +505,14 @@ describe("legacy built-ins guard (Safari 14 build target)", () => {
 		// A banned API in live code is caught.
 		expect(scanFile(fake, "const sorted = items.toSorted();")).toHaveLength(1);
 		expect(scanFile(fake, "const g = Object.groupBy(items, keyFn);")).toHaveLength(1);
+
+		// AbortSignal.any / timeout are shimmed (and previously shipped unsafely).
+		const anyHits = scanFile(fake, "const s = AbortSignal.any([a, b]);");
+		expect(anyHits).toHaveLength(1);
+		expect(anyHits[0]?.builtin.disposition).toBe("shimmed");
+		const timeoutHits = scanFile(fake, "const t = AbortSignal.timeout(30);");
+		expect(timeoutHits).toHaveLength(1);
+		expect(timeoutHits[0]?.builtin.disposition).toBe("shimmed");
 
 		// The same API named in a comment is not.
 		expect(scanFile(fake, "// avoid items.toSorted() here")).toHaveLength(0);

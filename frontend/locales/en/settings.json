@@ -733,6 +733,8 @@
 	"autoContinuationMode_off": "Never continue",
 	"maxTransientRetries": "Max Retries for Recoverable Errors",
 	"maxTransientRetriesDesc": "Maximum retry attempts for transient API errors (rate limits, server errors). Set to -1 for infinite retries.",
+	"maxToolCallsPerResponse": "Tool Calls per Model Response",
+	"maxToolCallsPerResponseDesc": "Maximum tool calls in a single model response (integer 1–128, default 32). Exceeding this limit automatically aborts the narrator. This is not a cumulative limit across the entire session.",
 	"silentToolCallThreshold": "Silent Tool Call Threshold",
 	"silentToolCallThresholdDesc": "After this many tool calls without visible text content, inject a sidecar asking the model to briefly say what it is working on. Set to -1 to disable.",
 	"pipelineUnusedToolCallThreshold": "Pipeline Capture Inactivity Threshold",

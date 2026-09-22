@@ -733,6 +733,8 @@
 	"autoContinuationMode_off": "不续跑",
 	"maxTransientRetries": "可恢复错误最大重试次数",
 	"maxTransientRetriesDesc": "遇到临时性 API 错误（限流、服务器错误）时的最大重试次数。设为 -1 表示无限重试。",
+	"maxToolCallsPerResponse": "每条模型回复工具调用上限",
+	"maxToolCallsPerResponseDesc": "单条模型回复允许的工具调用数量上限（1–128 的整数，默认 32）。超限自动中止叙述者，不是跨整个会话累计的上限。",
 	"silentToolCallThreshold": "沉默工具调用阈值",
 	"silentToolCallThresholdDesc": "模型连续执行这么多次工具调用但没有输出可见文本时，通过 sidecar 要求它简短说明当前正在做什么。设为 -1 表示关闭。",
 	"pipelineUnusedToolCallThreshold": "Pipeline 捕获闲置阈值",

@@ -313,11 +313,18 @@ export function InjectionSpeakerHeader({
 				// No id to key a glyph on: fall back to initials rather than inventing one.
 				<UserAvatar username={name} avatarColor={speakerTint(name)} size={20} showTooltip={false} />
 			)}
-			<Text size="xs" c="dimmed" fw={600} truncate>
+			{/*
+			 * The name is the primary identity and is the ONLY row element allowed to
+			 * truncate. The cadence subtitle sits beside it on platform reminders and
+			 * must not steal the remaining width: without `flexShrink: 0` a short body
+			 * (empty task digest) collapsed the name to "任…" while the subtitle kept
+			 * its full measure.
+			 */}
+			<Text size="xs" c="dimmed" fw={600} truncate style={{ minWidth: 0 }}>
 				{name}
 			</Text>
 			{speakerKind ? (
-				<Text size="xs" c="dimmed" style={{ whiteSpace: "nowrap", opacity: 0.75 }}>
+				<Text size="xs" c="dimmed" style={{ whiteSpace: "nowrap", opacity: 0.75, flexShrink: 0 }}>
 					{speakerKind}
 				</Text>
 			) : null}
