@@ -15,10 +15,10 @@
  * text or a tool call already followed stops fading at the same moment it stops
  * shimmering, rather than when the turn eventually persists.
  *
- * Collapsed rows are deliberately NOT covered: a collapsed row is one fixed
- * truncating line showing a settled title, and its live end is painted by the
- * left-clipped `liveTail` window, where a per-grapheme fade has no stable start or
- * end position.
+ * Collapsed header animation is deliberately NOT covered: its fixed truncating
+ * line and left-clipped `liveTail` have no stable grapheme start/end position.
+ * Collapse/expand transitions ARE covered: mounting a body inside an already warm
+ * scope must seal old content, including text generated while that body was hidden.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -78,8 +78,18 @@ beforeAll(() => {
  * The step is expanded via `expandedIndices`, which is what the adapter emits when
  * the reader has opened that row — the only state in which a step has a body to fade.
  */
-async function mountLiveStepRow(options?: { shimmer?: boolean }) {
+let fixtureEpoch = 0;
+
+async function mountLiveStepRow(options?: {
+	shimmer?: boolean;
+	warmSibling?: boolean;
+	kind?: "reasoning" | "reasoning-steps";
+}) {
+	const kind = options?.kind ?? "reasoning-steps";
+	const { measureReasoning } = await import("../measure/measure-reasoning");
 	const { measureReasoningStepsTrace } = await import("../measure/measure-tool-run");
+	const { measureMarkdown } = await import("../measure/measure-markdown");
+	const { RenderMarkdown } = await import("./RenderMarkdown");
 	const { renderElement } = await import("../render-registry");
 	const { resolveStreamAnimExtra } = await import("../vlist-stream-anim-extra");
 
@@ -91,44 +101,69 @@ async function mountLiveStepRow(options?: { shimmer?: boolean }) {
 	// fade to this kind, the extra becomes null here and the assertions fail.
 	const extra = resolveStreamAnimExtra({
 		animateStreaming: true,
-		kind: "reasoning-steps",
+		kind,
 		specKey: "__streaming__-b0",
 		narratorId: "n1",
-		mountEpoch: 7,
+		mountEpoch: ++fixtureEpoch,
 	});
 	if (!extra) throw new Error("the shell must supply the fade for a live reasoning-steps row");
 
-	const frame = (body: string) => {
+	const frame = (body: string, expanded = true) => {
 		act(() => {
-			const measured = measureReasoningStepsTrace(
-				[
-					{
-						title: "分析现状",
-						body,
-						shimmer: options?.shimmer ?? true,
-						key: "seg0",
-					},
-				] as never,
-				WIDTH,
-				{ expandedIndices: [0] } as never,
-			);
+			const measured =
+				kind === "reasoning"
+					? measureReasoning({ text: body, isStreaming: options?.shimmer ?? true }, WIDTH, 5, {
+							expanded,
+						})
+					: measureReasoningStepsTrace(
+							[
+								{
+									title: "分析现状",
+									body,
+									shimmer: options?.shimmer ?? true,
+									key: "seg0",
+								},
+							] as never,
+							WIDTH,
+							{ expandedIndices: expanded ? [0] : [] } as never,
+						);
 			reactRoot.render(
 				<MantineProvider>
 					<RenderLodCtx.Provider value={{ lod: 5, interactive: true }}>
-						{renderElement("reasoning-steps", measured as never, { ...extra } as never)}
+						{options?.warmSibling && (
+							<div data-warm-sibling>
+								<RenderMarkdown
+									measured={measureMarkdown("同一会话已经显示的正文", WIDTH)}
+									{...extra}
+									animKeyBase={`${extra.animKeyBase}:sibling`}
+								/>
+							</div>
+						)}
+						<div data-step-row>
+							{/* Plain live reasoning is always expanded; hiding it models leaving
+							    the virtual window. Steps instead fold their body in-place. */}
+							{kind === "reasoning" && !expanded
+								? null
+								: renderElement(kind, measured as never, { ...extra } as never)}
+						</div>
 					</RenderLodCtx.Provider>
 				</MantineProvider>,
 			);
 		});
 	};
 
+	const stepBody = () => container.querySelector("[data-step-row] [data-md-body]");
+
 	return {
 		frame,
+		// Caret fillers are zero-width layout helpers, not authored reasoning text.
+		bodyText: () => (stepBody()?.textContent ?? "").replaceAll("\u200b", ""),
+		bodyNodeCount: () => stepBody()?.querySelectorAll("*").length ?? 0,
 		animText: () =>
-			Array.from(container.querySelectorAll(`span.${ANIM_CLASS}`))
+			Array.from(container.querySelectorAll(`[data-step-row] span.${ANIM_CLASS}`))
 				.map((span) => span.textContent ?? "")
 				.join(""),
-		animSpans: () => Array.from(container.querySelectorAll(`span.${ANIM_CLASS}`)),
+		animSpans: () => Array.from(container.querySelectorAll(`[data-step-row] span.${ANIM_CLASS}`)),
 		unmount: () => {
 			act(() => reactRoot.unmount());
 			container.remove();
@@ -137,6 +172,101 @@ async function mountLiveStepRow(options?: { shimmer?: boolean }) {
 }
 
 describe("live reasoning step body fades in per grapheme", () => {
+	it.each([
+		"reasoning",
+		"reasoning-steps",
+	] as const)("seals a long collapsed %s body in a warm scope, then animates only live additions", async (kind) => {
+		const row = await mountLiveStepRow({ warmSibling: true, kind });
+		const paragraphs = Array.from(
+			{ length: 360 },
+			(_, index) => `第${index}段记录已经生成的分析内容，需要完整保留而不是重新播放逐字动画。`,
+		);
+		const body = paragraphs.join("\n\n");
+		const visibleBody = paragraphs.join("");
+		expect(body.length).toBeGreaterThan(10_000);
+
+		try {
+			// The real markdown sibling commits first and warms the SAME scope while
+			// this step has no mounted body. A cold-scope fixture cannot catch this bug.
+			row.frame(body, false);
+			expect(row.bodyText()).toBe("");
+			expect(row.bodyNodeCount()).toBe(0);
+
+			row.frame(body, true);
+			expect(row.bodyText()).toBe(visibleBody);
+			expect(row.animSpans()).toHaveLength(0);
+			const settledNodeCount = row.bodyNodeCount();
+			expect(settledNodeCount).toBeGreaterThan(0);
+
+			// A second commit must not resurrect births invented by the first render.
+			row.frame(body, true);
+			expect(row.bodyText()).toBe(visibleBody);
+			expect(row.animSpans()).toHaveLength(0);
+			expect(row.bodyNodeCount()).toBe(settledNodeCount);
+
+			const appended = "现在追加的新字";
+			row.frame(body + appended, true);
+			expect(row.bodyText()).toBe(visibleBody + appended);
+			expect(row.animText()).toBe(appended);
+
+			const newParagraph = "新产生的段落也应该正常逐字出现";
+			row.frame(`${body}${appended}\n\n${newParagraph}`, true);
+			expect(row.bodyText()).toBe(visibleBody + appended + newParagraph);
+			expect(row.animText()).toContain(newParagraph);
+			expect(row.animText().replace(appended, "")).toBe(newParagraph);
+
+			row.frame(`${body}${appended}\n\n${newParagraph}`, false);
+			expect(row.bodyNodeCount()).toBe(0);
+			const hiddenGrowth = "折叠期间追加的内容";
+			const hiddenParagraph = "折叠期间生成的全新段落";
+			const grownBody = `${body}${appended}\n\n${newParagraph}${hiddenGrowth}\n\n${hiddenParagraph}`;
+			row.frame(grownBody, false);
+			expect(row.bodyNodeCount()).toBe(0);
+			row.frame(grownBody, true);
+			expect(row.bodyText()).toBe(
+				visibleBody + appended + newParagraph + hiddenGrowth + hiddenParagraph,
+			);
+			expect(row.animSpans()).toHaveLength(0);
+			row.frame(grownBody, true);
+			expect(row.animSpans()).toHaveLength(0);
+		} finally {
+			row.unmount();
+		}
+	});
+
+	it("does not replay mounted paragraphs after their shared animation entries are evicted", async () => {
+		const { STREAM_ANIM_MAX_KEYS } = await import("./stream-token-anim");
+		const row = await mountLiveStepRow({ warmSibling: true });
+		const body = Array.from(
+			{ length: STREAM_ANIM_MAX_KEYS + 100 },
+			(_, index) => `第${index}段已有内容不应该因为缓存淘汰而重新出现动画。`,
+		).join("\n\n");
+		try {
+			row.frame(body, false);
+			row.frame(body);
+			expect(row.animSpans()).toHaveLength(0);
+			row.frame(body);
+			expect(row.animSpans()).toHaveLength(0);
+			row.frame(`${body}新字`);
+			expect(row.animText()).toBe("新字");
+			// An unpredictable block switches the body to flowing layout and remounts
+			// all inline blocks. Empty Mermaid avoids loading a diagram in this test.
+			const flowingBody = `${body}新字\n\n\`\`\`mermaid\n\`\`\``;
+			row.frame(flowingBody);
+			expect(row.animSpans()).toHaveLength(0);
+			row.frame(flowingBody);
+			expect(row.animSpans()).toHaveLength(0);
+			row.frame(`${flowingBody}\n\n图表后新增`);
+			expect(row.animText()).toBe("图表后新增");
+			row.frame(body);
+			expect(row.animSpans()).toHaveLength(0);
+			row.frame(body);
+			expect(row.animSpans()).toHaveLength(0);
+		} finally {
+			row.unmount();
+		}
+	});
+
 	it("animates text appended to the step the model is still writing", async () => {
 		const row = await mountLiveStepRow();
 		// Frame 1 seeds the key: a cold-scope first sighting is a mount, so it seals.

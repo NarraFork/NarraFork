@@ -195,6 +195,8 @@ describe("the announcement is handed to the caller, not fired by the runner", ()
 				expect(projected.kind).toBe("bg_agent");
 				if (projected.kind !== "bg_agent") throw new Error("Expected task notice projection");
 				expect(projected.task.result).toBeUndefined();
+				expect(projected.task.noticeText).toBe(rows[0].text);
+				expect(projected.task.resultMessageId).toBeTruthy();
 				expect(projected.task.resultPreview).not.toContain(result);
 				expect(wakes).toBe(status === "completed" ? 1 : 0);
 			} finally {

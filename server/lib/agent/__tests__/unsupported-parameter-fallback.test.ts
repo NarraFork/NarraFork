@@ -189,15 +189,6 @@ describe("OpenAI request paths", () => {
 			const raw = init?.body;
 			const body = typeof raw === "string" ? JSON.parse(raw) : {};
 			requests.push(body);
-			if ("max_output_tokens" in body) {
-				return new Response(
-					JSON.stringify({ detail: "Unsupported parameter: max_output_tokens" }),
-					{
-						status: 400,
-						headers: { "content-type": "application/json" },
-					},
-				);
-			}
 			const sse =
 				'data: {"type":"response.output_text.delta","delta":"hi"}\n\n' +
 				'data: {"type":"response.completed","response":{"status":"completed"}}\n\n';
@@ -214,63 +205,36 @@ describe("OpenAI request paths", () => {
 		settings.agent.modelCatalog = savedCatalog;
 	});
 
-	for (const partialOutput of [false, true]) {
-		test(`chat HTTP 200 SSE rejection ${partialOutput ? "does not retry after output" : "strips and retries before output"}`, async () => {
-			globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
-				const body = JSON.parse(init?.body as string);
-				requests.push(body);
-				const delta = 'data: {"type":"response.output_text.delta","delta":"hi"}\n\n';
-				const rejection = `data: ${JSON.stringify({
-					type: "error",
-					code: "unsupported_parameter",
-					message: NUG_DETAIL_MESSAGE,
-				})}\n\n`;
-				const sse =
-					requests.length === 1
-						? (partialOutput ? delta : "") + rejection
-						: `${delta}data: {"type":"response.completed","response":{"status":"completed"}}\n\n`;
-				return new Response(sse, {
-					status: 200,
-					headers: { "content-type": "text/event-stream" },
-				});
-			}) as typeof fetch;
-			const provider = new OpenAIProvider({ ...config });
-			const events: ParsedStreamEvent[] = [];
-			for await (const event of provider.chat({
-				conversationId: "unsupported-parameter-chat",
-				content: "hello",
-				model,
-				cwd: process.cwd(),
-				history: [],
-				tools: [],
-				toolResults: [],
-				signal: new AbortController().signal,
-				maxOutputTokens: 2300,
-			})) {
-				events.push(event);
-			}
-			expect(events.map((event) => event.text ?? "").join("")).toBe("hi");
-			expect(requests).toHaveLength(partialOutput ? 1 : 2);
-			expect(requests[0].max_output_tokens).toBe(2300);
-			if (partialOutput) {
-				expect(events.at(-1)?.invalidState?.message).toContain(NUG_DETAIL_MESSAGE);
-				expect(modelRejectsParameter(model, "max_output_tokens")).toBe(false);
-			} else {
-				expect(requests[1]).not.toHaveProperty("max_output_tokens");
-				expect(events.some((event) => event.invalidState)).toBe(false);
-				expect(modelRejectsParameter(model, "max_output_tokens")).toBe(true);
-			}
-		});
-	}
+	test("codex chat omits max_output_tokens even when metadata declares a ceiling", async () => {
+		const provider = new OpenAIProvider({ ...config });
+		const events: ParsedStreamEvent[] = [];
+		for await (const event of provider.chat({
+			conversationId: "unsupported-parameter-chat",
+			content: "hello",
+			model,
+			cwd: process.cwd(),
+			history: [],
+			tools: [],
+			toolResults: [],
+			signal: new AbortController().signal,
+			maxOutputTokens: 2300,
+		})) {
+			events.push(event);
+		}
+		expect(events.map((event) => event.text ?? "").join("")).toBe("hi");
+		expect(requests).toHaveLength(1);
+		expect(requests[0]).not.toHaveProperty("max_output_tokens");
+		expect(requests[0]).not.toHaveProperty("max_tokens");
+		expect(modelRejectsParameter(model, "max_output_tokens")).toBe(false);
+	});
 
-	test("generateWithMeta strips max_output_tokens after the NUG 400 and succeeds", async () => {
+	test("codex generateWithMeta omits max_output_tokens even when requested", async () => {
 		const provider = new OpenAIProvider({ ...config });
 		const result = await provider.generateWithMeta("hello", model, undefined, {
 			maxOutputTokens: 2300,
 		});
 		expect(result.text).toBe("hi");
-		expect(requests.length).toBe(2);
-		expect(requests[0].max_output_tokens).toBe(2300);
-		expect(requests[1].max_output_tokens).toBeUndefined();
+		expect(requests).toHaveLength(1);
+		expect(requests[0]).not.toHaveProperty("max_output_tokens");
 	});
 });

@@ -339,6 +339,11 @@ export class StreamAnimStore {
 		return new StreamAnimScoped(this, scope);
 	}
 
+	/** A mounted block can outlive its bounded shared history entry. */
+	hasEntry(animKey: string): boolean {
+		return this.entries.has(animKey);
+	}
+
 	/**
 	 * Compute the animation boundary (code-unit offset) for `fullText` under
 	 * `animKey` WITHOUT mutating state. Safe to call during render (and under
@@ -481,10 +486,21 @@ export class StreamAnimStore {
 	 * grapheme's age is nonsense and its animation resumes at the wrong progress.
 	 * Births outside the window are dropped here, which is what keeps the list — and
 	 * therefore the live span count — bounded.
+	 *
+	 * Renderers pass the frame they actually painted. Recomputing its boundary in
+	 * an effect can see a scope warmed by sibling effects, turning a cold mount
+	 * into a birth. It would also undo an explicit sealed frame when expanding
+	 * existing content. Never reinterpret that decision at commit time.
 	 */
-	commitFrame(animKey: string, fullText: string, now: number, scope: string): void {
+	commitFrame(
+		animKey: string,
+		fullText: string,
+		now: number,
+		scope: string,
+		renderedFrame?: StreamAnimFrame,
+	): void {
 		const prev = this.entries.get(animKey);
-		const boundary = this.peekBoundary(animKey, fullText, scope);
+		const boundary = renderedFrame?.animBoundary ?? this.peekBoundary(animKey, fullText, scope);
 		// Births carry over only along an APPEND. A recycled key's births index text
 		// from a previous turn that no longer exists, and carrying them would seal the
 		// new block at a stale offset (see peekFrame's matching branch).
@@ -493,7 +509,11 @@ export class StreamAnimStore {
 		// Only genuine growth is a birth. A jump sealed the boundary at the full
 		// length, and recording that as a birth would mark the ENTIRE body as freshly
 		// animating on the next frame — the tab-freezing shape this module refuses.
-		const births = boundary < fullText.length ? appendBirth(carried, boundary, now) : carried;
+		const births = renderedFrame
+			? [...renderedFrame.births]
+			: boundary < fullText.length
+				? appendBirth(carried, boundary, now)
+				: carried;
 		// Re-insert to mark most-recently-used, then evict oldest over capacity.
 		this.entries.delete(animKey);
 		this.entries.set(animKey, { text: fullText, len: fullText.length, births });
@@ -563,6 +583,10 @@ export class StreamAnimScoped {
 		private readonly scope: string,
 	) {}
 
+	hasEntry(animKey: string): boolean {
+		return this.store.hasEntry(animKey);
+	}
+
 	peekBoundary(animKey: string, fullText: string): number {
 		return this.store.peekBoundary(animKey, fullText, this.scope);
 	}
@@ -571,8 +595,13 @@ export class StreamAnimScoped {
 		return this.store.peekFrame(animKey, fullText, now, this.scope);
 	}
 
-	commitFrame(animKey: string, fullText: string, now: number): void {
-		this.store.commitFrame(animKey, fullText, now, this.scope);
+	commitFrame(
+		animKey: string,
+		fullText: string,
+		now: number,
+		renderedFrame?: StreamAnimFrame,
+	): void {
+		this.store.commitFrame(animKey, fullText, now, this.scope, renderedFrame);
 	}
 }
 

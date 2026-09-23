@@ -976,6 +976,7 @@ function TraceRowView({
 					<RenderMarkdown
 						measured={row.body}
 						animateStreaming={animateStreaming}
+						sealOnMount
 						animKeyBase={animKeyBase}
 						animScope={animScope}
 					/>

@@ -124,13 +124,19 @@ export function resolveStreamAnimExtra(input: {
 	 * shell keeps the old single-mount behaviour; the shell always supplies it.
 	 */
 	mountEpoch?: number;
+	/** Accepted catch-up baseline from the SAME committed layout's synthetic message. */
+	snapshotEpoch?: number;
 }): StreamAnimExtra | null {
 	if (!input.animateStreaming) return null;
 	if (!STREAM_ANIM_KINDS.has(input.kind)) return null;
-	const scope =
+	const mountScope =
 		input.mountEpoch == null
 			? input.narratorId
 			: streamAnimScope({ narratorId: input.narratorId, epoch: input.mountEpoch });
+	// A delayed subscription/reconnect snapshot can arrive after the first live
+	// frame warmed this mount. Namespace BOTH identities, just like a new visit.
+	const scope =
+		input.snapshotEpoch == null ? mountScope : `${mountScope}#snapshot-${input.snapshotEpoch}`;
 	return {
 		animateStreaming: true,
 		// The scope prefixes the key too, so a new mount's blocks are new keys rather

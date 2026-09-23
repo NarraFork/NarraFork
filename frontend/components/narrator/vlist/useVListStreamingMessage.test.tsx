@@ -11,6 +11,9 @@ import { measureCache } from "./measure-cache";
 import { PretextLayoutCoordinator } from "./pretext-layout-coordinator";
 import { renderElement, resolveRenderExtra } from "./render-registry";
 import { useVListStreamingMessage } from "./useVListStreamingMessage";
+import { resolveStreamAnimExtra } from "./vlist-stream-anim-extra";
+
+let nextMountEpoch = 0;
 
 const BUILD = { lod: 5 as const, widthBucket: "800", contentWidth: 800, viewportHeight: 600 };
 const VIEW = () => ({ scrollTop: 0, viewportHeight: 600, pinnedToBottom: true });
@@ -57,11 +60,18 @@ async function withStream(
 		commit: (blocks: unknown[], final?: boolean) => Promise<void>;
 		raf: () => Promise<void>;
 		text: () => string;
+		animationCount: () => number;
+		animationText: () => string;
+		showOnlyKeys: (keys: readonly string[] | null) => Promise<void>;
 		coordinator: PretextLayoutCoordinator;
 		switchNarrator: (id: string, subagent?: boolean) => Promise<void>;
 		live: () => TreeMessage | null;
 	}) => Promise<void>,
+	{ animateStreaming = false }: { animateStreaming?: boolean } = {},
 ) {
+	let mountEpoch = ++nextMountEpoch;
+	// Keep active tokens alive while measuring/rendering the large snapshot fixture.
+	const clock = animateStreaming ? spyOn(Date, "now").mockReturnValue(Date.now()) : null;
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
 	let nextRaf = 0;
 	const frames = new Map<number, FrameRequestCallback>();
@@ -130,6 +140,7 @@ async function withStream(
 	const root = createRoot(container);
 	let narratorId = "handoff-n";
 	let isSubagent = false;
+	let visibleKeys: ReadonlySet<string> | null = null;
 	let latestLive: TreeMessage | null = null;
 	function Harness() {
 		const snapshot = useSyncExternalStore(coordinator.subscribe, coordinator.getSnapshot);
@@ -158,11 +169,24 @@ async function withStream(
 		);
 		return (
 			<MantineProvider>
-				{snapshot.items?.map((item) => (
-					<div key={item.spec.key}>
-						{renderElement(item.spec.kind, item.measured, resolveRenderExtra(item.spec))}
-					</div>
-				))}
+				{snapshot.items
+					?.filter((item) => visibleKeys == null || visibleKeys.has(item.spec.key))
+					.map((item) => (
+						<div key={item.spec.key}>
+							{renderElement(item.spec.kind, item.measured, {
+								...resolveRenderExtra(item.spec),
+								...resolveStreamAnimExtra({
+									animateStreaming: animateStreaming && item.spec.key.startsWith("__streaming__"),
+									kind: item.spec.kind,
+									specKey: item.spec.key,
+									narratorId,
+									mountEpoch,
+									// Use the coordinator's committed version, never the hook's pending value.
+									snapshotEpoch: snapshot.streamingMessage?._streamAnimSnapshotEpoch,
+								}),
+							})}
+						</div>
+					))}
 			</MantineProvider>
 		);
 	}
@@ -187,11 +211,23 @@ async function withStream(
 			raf,
 			coordinator,
 			text: () => container.textContent ?? "",
+			animationCount: () => container.querySelectorAll("span.vlist-anim-token").length,
+			animationText: () =>
+				Array.from(container.querySelectorAll("span.vlist-anim-token"))
+					.map((span) => span.textContent ?? "")
+					.join(""),
 			live: () => latestLive,
+			showOnlyKeys: async (keys) => {
+				await act(async () => {
+					visibleKeys = keys == null ? null : new Set(keys);
+					root.render(<Harness />);
+				});
+			},
 			switchNarrator: async (id, subagent = false) => {
 				await act(async () => {
 					narratorId = id;
 					isSubagent = subagent;
+					mountEpoch = ++nextMountEpoch;
 					coordinator.reset();
 					await coordinator.load(
 						id,
@@ -234,12 +270,229 @@ async function withStream(
 		subscribe.mockRestore();
 		unsubscribe.mockRestore();
 		connection.mockRestore();
+		clock?.mockRestore();
 		for (const [key, descriptor] of previous) {
 			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 			else Reflect.deleteProperty(globalThis, key);
 		}
 	}
 }
+
+describe("snapshot animation through real WS / hook / coordinator / DOM", () => {
+	for (const type of ["text", "reasoning"] as const) {
+		it(`seals a delayed 10,000+ character ${type} snapshot in a warm scope, then animates live paragraphs`, async () => {
+			await withStream(
+				async (h) => {
+					await h.delta(content(type, "snapshot-body", "开头", 1, 0));
+					await h.raf();
+					await h.delta(content(type, "snapshot-body", "暖场", 2, 2));
+					await h.raf();
+					expect(h.animationText()).toContain("暖场");
+					const paragraphs = Array.from(
+						{ length: 24 },
+						(_, i) => `历史段落${i}：${"这是静态历史正文。".repeat(50)}`,
+					);
+					const body = `开头暖场\n\n${paragraphs.join("\n\n")}`;
+					expect(body.length).toBeGreaterThan(10_000);
+					const snapshot = () =>
+						h.frame({
+							type: "streaming_snapshot",
+							streamingBlocks: [content(type, "snapshot-body", body, 3, 0)],
+							toolChunks: [],
+						});
+					await snapshot();
+					await h.raf();
+					expect(h.animationCount()).toBe(0);
+					for (const paragraph of paragraphs) expect(h.text()).toContain(paragraph);
+					const epoch = h.coordinator.getSnapshot().streamingMessage?._streamAnimSnapshotEpoch;
+					expect(epoch).toBeGreaterThan(0);
+					await snapshot(); // reconnect resends the same large body
+					await h.raf();
+					expect(h.animationCount()).toBe(0);
+					expect(h.coordinator.getSnapshot().streamingMessage?._streamAnimSnapshotEpoch).toBe(
+						epoch,
+					);
+					await h.delta(content(type, "snapshot-body", "实时尾巴", 4, body.length));
+					await h.raf();
+					expect(h.animationText()).toContain("实时尾巴");
+					expect(h.animationText()).not.toContain("历史段落");
+					await h.delta(content(type, "snapshot-body", "\n\n新段落首批", 5, body.length + 4));
+					await h.raf();
+					expect(h.animationText()).toContain("新段落首批");
+				},
+				{ animateStreaming: true },
+			);
+		});
+	}
+
+	it("seals an offscreen snapshot block on late mount but animates a genuinely new live block", async () => {
+		await withStream(
+			async (h) => {
+				await h.showOnlyKeys(["__streaming__-b0"]);
+				await h.frame({
+					type: "streaming_snapshot",
+					streamingBlocks: [
+						content("text", "snapshot-a", "可见历史", 1, 0),
+						content("text", "snapshot-b", "屏外历史第一段\n\n屏外历史第二段", 1, 0),
+					],
+					toolChunks: [],
+				});
+				await h.raf();
+				expect(h.text()).toContain("可见历史");
+				expect(h.text()).not.toContain("屏外历史");
+				await h.showOnlyKeys(null);
+				expect(h.text()).toContain("屏外历史第一段");
+				expect(h.animationCount()).toBe(0);
+				await h.delta(content("text", "new-live-block", "真正实时的新块", 1, 0));
+				await h.raf();
+				expect(h.animationText()).toBe("真正实时的新块");
+				expect(h.live()?.contentJson.find((block) => block.id === "snapshot-b")).toHaveProperty(
+					"_streamAnimSnapshotEpoch",
+				);
+				expect(
+					h.live()?.contentJson.find((block) => block.id === "new-live-block"),
+				).not.toHaveProperty("_streamAnimSnapshotEpoch");
+			},
+			{ animateStreaming: true },
+		);
+	});
+
+	for (const snapshotFirst of [true, false]) {
+		it(`seals one rAF batch with ${snapshotFirst ? "snapshot → delta" : "delta → snapshot"} without losing text`, async () => {
+			await withStream(
+				async (h) => {
+					await h.delta(content("text", "batch-body", "PREFIX", 1, 0));
+					await h.raf();
+					const body = "PREFIX-CATCHUP\n\n历史第二段";
+					const snapshot = () =>
+						h.frame({
+							type: "streaming_snapshot",
+							streamingBlocks: [content("text", "batch-body", body, 2, 0)],
+							toolChunks: [],
+						});
+					const delta = () => h.delta(content("text", "batch-body", "+TAIL", 3, body.length));
+					if (snapshotFirst) {
+						await snapshot();
+						await delta();
+					} else {
+						await delta();
+						await snapshot();
+					}
+					await h.raf();
+					expect(h.live()?.contentJson).toEqual([
+						expect.objectContaining({ text: `${body}+TAIL`, textOffset: 0 }),
+					]);
+					expect(h.text()).toContain("PREFIX-CATCHUP");
+					expect(h.text()).toContain("历史第二段+TAIL");
+					expect(h.animationCount()).toBe(0);
+					await h.delta(content("text", "batch-body", "+NEXT", 4, body.length + 5));
+					await h.raf();
+					expect(h.animationText()).toBe("+NEXT");
+					expect(h.text()).toContain("历史第二段+TAIL+NEXT");
+				},
+				{ animateStreaming: true },
+			);
+		});
+	}
+
+	it("seals restored history after switching away and back, then resumes new-token animation", async () => {
+		await withStream(
+			async (h) => {
+				await h.delta(content("text", "switch-body", "离开前", 1, 0));
+				await h.raf();
+				await h.delta(content("text", "switch-body", "新字", 2, 3));
+				await h.raf();
+				expect(h.animationText()).toContain("新字");
+				await h.switchNarrator("other");
+				expect(h.animationCount()).toBe(0);
+				await h.switchNarrator("handoff-n");
+				const body = "离开前新字\n\n离开期间历史";
+				await h.frame({
+					type: "streaming_snapshot",
+					streamingBlocks: [content("text", "switch-body", body, 3, 0)],
+					toolChunks: [],
+				});
+				await h.raf();
+				expect(h.text()).toContain("离开前新字");
+				expect(h.text()).toContain("离开期间历史");
+				expect(h.animationCount()).toBe(0);
+				await h.delta(content("text", "switch-body", "回归实时", 4, body.length));
+				await h.raf();
+				expect(h.animationText()).toBe("回归实时");
+			},
+			{ animateStreaming: true },
+		);
+	});
+
+	it("empty, duplicate, stale, provenance-only and tool-only snapshots retain the epoch and active new text", async () => {
+		await withStream(
+			async (h) => {
+				await h.delta(content("text", "noop-body", "历史", 1, 0));
+				await h.raf();
+				await h.frame({
+					type: "streaming_snapshot",
+					streamingBlocks: [content("text", "noop-body", "历史正文", 2, 0)],
+					toolChunks: [],
+				});
+				await h.raf();
+				expect(h.animationCount()).toBe(0);
+				const epoch = h.coordinator.getSnapshot().streamingMessage?._streamAnimSnapshotEpoch;
+				expect(epoch).toBeGreaterThan(0);
+				await h.delta(content("text", "noop-body", "活跃新字", 3, 4));
+				await h.raf();
+				expect(h.animationText()).toBe("活跃新字");
+				const snapshots = [
+					{ streamingBlocks: [], toolChunks: [] },
+					{
+						streamingBlocks: [content("text", "noop-body", "历史正文活跃新字", 3, 0)],
+						toolChunks: [],
+					},
+					{ streamingBlocks: [content("text", "noop-body", "历史", 1, 0)], toolChunks: [] },
+					{
+						streamingBlocks: [content("text", "noop-body", "历史正文活跃新字", 4, 0)],
+						toolChunks: [],
+					},
+					{
+						streamingBlocks: [],
+						toolChunks: [{ toolUseId: "noop-tool", toolName: "Bash", inputCharsTotal: 0 }],
+					},
+				];
+				for (const snapshot of snapshots) {
+					await h.frame({ type: "streaming_snapshot", ...snapshot });
+					await h.raf();
+					expect(h.live()?._streamAnimSnapshotEpoch).toBe(epoch);
+					expect(h.coordinator.getSnapshot().streamingMessage?._streamAnimSnapshotEpoch).toBe(
+						epoch,
+					);
+					expect(h.text()).toContain("历史正文活跃新字");
+					expect(h.animationText()).toBe("活跃新字");
+				}
+				expect(h.live()?.toolCalls?.some((call) => call.toolUseId === "noop-tool")).toBe(true);
+				await h.delta(content("text", "noop-body", "随后", 5, 8));
+				await h.raf();
+				expect(h.animationText()).toBe("活跃新字随后");
+				// A second accepted body change must establish a fresh baseline, not reuse
+				// the first snapshot's generation merely because this scope is already warm.
+				const caughtUp = "历史正文活跃新字随后再次追赶";
+				await h.frame({
+					type: "streaming_snapshot",
+					streamingBlocks: [content("text", "noop-body", caughtUp, 6, 0)],
+					toolChunks: [],
+				});
+				await h.raf();
+				expect(
+					h.coordinator.getSnapshot().streamingMessage?._streamAnimSnapshotEpoch,
+				).toBeGreaterThan(epoch as number);
+				expect(h.text()).toContain(caughtUp);
+				expect(h.animationCount()).toBe(0);
+				await h.delta(content("text", "noop-body", "新尾", 7, caughtUp.length));
+				await h.raf();
+				expect(h.animationText()).toBe("新尾");
+			},
+			{ animateStreaming: true },
+		);
+	});
+});
 
 describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
 	it("restores a name-only tool after switching back without another live event", async () => {

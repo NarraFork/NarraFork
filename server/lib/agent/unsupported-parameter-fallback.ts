@@ -3,15 +3,15 @@ import { logger } from "../logger";
 /**
  * Endpoints that reject individual request fields outright.
  *
- * Observed on NUG's Responses-compatible gateway:
+ * Observed on NUG's Responses-compatible gateway (and still relevant for other
+ * optional fields that a relay may reject even when Codex endpoints no longer
+ * attach `max_output_tokens`):
  *
  *   upstream status 400: {"detail":"Unsupported parameter: max_output_tokens"}
  *
- * `applyOpenAIModelMetadata` always attaches an output ceiling (from the model
- * card and/or the caller), which is correct for the official Responses API but
- * fatal on relays whose request schema simply omits the field. Without a
- * fallback the whole turn fails even though the model is fine — the same class
- * of failure as `reasoning-mandatory-fallback`, for a different parameter.
+ * Without a strip-and-retry the whole turn dies even though the model is fine —
+ * the same class of failure as `reasoning-mandatory-fallback`, for a different
+ * parameter.
  *
  * The learned set is per-process and in-memory on purpose. Losing it on restart
  * costs one extra rejected attempt; persisting it would keep suppressing a

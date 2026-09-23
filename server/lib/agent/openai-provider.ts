@@ -73,9 +73,13 @@ export function applyOpenAIModelMetadata(
 	requested?: number,
 ): void {
 	const metadata = effectiveProviderMetadata(model);
-	const limit = resolveOutputTokenLimit(metadata, requested);
-	if (limit !== undefined)
-		body[apiMode === "completions" ? "max_tokens" : "max_output_tokens"] = limit;
+	// Codex endpoints (including NUG Codex) do not accept max_output_tokens.
+	// Ordinary Responses and Chat Completions retain the configured output ceiling.
+	if (apiMode !== "codex") {
+		const limit = resolveOutputTokenLimit(metadata, requested);
+		if (limit !== undefined)
+			body[apiMode === "completions" ? "max_tokens" : "max_output_tokens"] = limit;
+	}
 	if (metadata.reasoning?.supported === false) {
 		delete body.reasoning;
 		delete body.reasoning_effort;

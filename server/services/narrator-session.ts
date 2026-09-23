@@ -128,7 +128,10 @@ import {
 	resolveRuntimeQueueBackend,
 } from "./agent-runtime/runtime-queue-port";
 import { backgroundTaskService } from "./background-task-service";
-import { formatBackgroundCompletionNotifications } from "./bg-completion-queue";
+import {
+	backgroundAgentNoticePreview,
+	formatBackgroundCompletionNotifications,
+} from "./bg-completion-queue";
 import { gitService } from "./git-service";
 import { resolveNarratorSessionCwd } from "./narrator-cwd";
 import {
@@ -2072,7 +2075,7 @@ export async function deliverPendingInjection(
 							alias: task.alias ?? null,
 							title: task.title,
 							status: task.status,
-							preview: task.result ?? "Result snapshot unavailable.",
+							preview: backgroundAgentNoticePreview(task, locale),
 							...(task.resultTruncated ? { truncated: true } : {}),
 							// Reader-only navigation target (the agent's own message that produced
 							// this result). Omitted rather than stored as null when absent, so a

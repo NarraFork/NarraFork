@@ -323,6 +323,7 @@ function ExpandedView({
 					sourceText={sourceText}
 					onUnknownHeight={onUnknownHeight}
 					animateStreaming={animateStreaming}
+					sealOnMount
 					animKeyBase={animKeyBase != null ? `${animKeyBase}:reasoning` : undefined}
 					animScope={animScope}
 				/>

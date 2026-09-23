@@ -1,18 +1,18 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ModelMetadata } from "@shared/model-catalog/schema/catalog";
-import { settings } from "../../settings";
 import { setNugCachedModels } from "../../nug-model-cache";
-import { executeSearch } from "../../search/router";
-import { customSearchChannelId } from "../../search/settings";
 import {
 	supportsNativeSearch,
 	usesInlineNativeSearch,
 	usesSideRequestNativeSearch,
 } from "../../search/native";
+import { executeSearch } from "../../search/router";
+import { customSearchChannelId } from "../../search/settings";
+import { settings } from "../../settings";
 import { AnthropicProvider, getAnthropicEffectiveContextWindow } from "../anthropic-provider";
 import { CodexProvider } from "../codex-provider";
-import { GeminiProvider } from "../gemini-provider";
 import { GeminiInteractionsProvider } from "../gemini-interactions-provider";
+import { GeminiProvider } from "../gemini-provider";
 import { NugProvider } from "../nug-provider";
 import { OpenAIProvider } from "../openai-provider";
 import type { ChatParams, ProviderAdapter } from "../provider";
@@ -174,17 +174,34 @@ describe("actual provider request bodies", () => {
 	for (const apiMode of ["completions", "responses", "codex"] as const) {
 		test(`OpenAI ${apiMode} chat and both utility paths enforce binding output/reasoning`, async () => {
 			const provider = new OpenAIProvider({ ...config, apiMode, codexWebSocket: false });
-			const field = apiMode === "completions" ? "max_tokens" : "max_output_tokens";
 			const body = await captureChat(provider, { reasoningEffort: "none", maxOutputTokens: 20000 });
-			expect(body[field]).toBe(2300);
+			if (apiMode === "completions") {
+				expect(body.max_tokens).toBe(2300);
+				expect(body.max_output_tokens).toBeUndefined();
+			} else if (apiMode === "responses") {
+				expect(body.max_output_tokens).toBe(2300);
+				expect(body.max_tokens).toBeUndefined();
+			} else {
+				// Only Codex endpoints omit the output ceiling.
+				expect(body.max_output_tokens).toBeUndefined();
+				expect(body.max_tokens).toBeUndefined();
+			}
 			expect(apiMode === "completions" ? body.reasoning_effort : body.reasoning?.effort).toBe(
 				"low",
 			);
-			expect((await captureGenerate(provider, 77))[field]).toBe(77);
-			expect((await captureGenerate(provider, 20000, true))[field]).toBe(2300);
+			if (apiMode === "completions") {
+				expect((await captureGenerate(provider, 77)).max_tokens).toBe(77);
+				expect((await captureGenerate(provider, 20000, true)).max_tokens).toBe(2300);
+			} else if (apiMode === "responses") {
+				expect((await captureGenerate(provider, 77)).max_output_tokens).toBe(77);
+				expect((await captureGenerate(provider, 20000, true)).max_output_tokens).toBe(2300);
+			} else {
+				expect((await captureGenerate(provider, 77)).max_output_tokens).toBeUndefined();
+				expect((await captureGenerate(provider, 20000, true)).max_output_tokens).toBeUndefined();
+			}
 		});
 	}
-	test("both Codex WebSocket request constructors enforce metadata", () => {
+	test("both Codex WebSocket request constructors omit max_output_tokens but enforce reasoning", () => {
 		for (const provider of [
 			new OpenAIProvider({ ...config, apiMode: "codex" }),
 			new CodexProvider({ useWebSocket: true }),
@@ -198,7 +215,7 @@ describe("actual provider request bodies", () => {
 				provider,
 				params({ maxOutputTokens: 99, reasoningEffort: "max" }),
 			);
-			expect(body.max_output_tokens).toBe(99);
+			expect(body.max_output_tokens).toBeUndefined();
 			expect(body.reasoning.effort).toBe("high");
 		}
 	});
@@ -316,7 +333,19 @@ describe("actual provider request bodies", () => {
 			const body = await captureChat(new NugProvider(nugConfig), {
 				model: "runtime-nug:channel:opaque",
 			});
-			expect(body.max_tokens ?? body.max_output_tokens).toBe(101);
+			// Only the Codex channel omits output ceiling fields.
+			if (channelType === "openai") {
+				expect(body.max_tokens).toBe(101);
+				expect(body.max_output_tokens).toBeUndefined();
+			} else if (channelType === "anthropic") {
+				expect(body.max_tokens).toBe(101);
+			} else if (channelType === "responses") {
+				expect(body.max_output_tokens).toBe(101);
+				expect(body.max_tokens).toBeUndefined();
+			} else {
+				expect(body.max_tokens).toBeUndefined();
+				expect(body.max_output_tokens).toBeUndefined();
+			}
 			expect(body.model).toBe("channel:opaque");
 			await expect(
 				new NugProvider(nugConfig).generateWithMeta(
@@ -327,7 +356,15 @@ describe("actual provider request bodies", () => {
 				),
 			).rejects.toThrow();
 			const utility = requests.at(-1)!;
-			expect(utility.max_tokens ?? utility.max_output_tokens).toBe(51);
+			if (channelType === "openai" || channelType === "anthropic") {
+				expect(utility.max_tokens).toBe(51);
+			} else if (channelType === "responses") {
+				expect(utility.max_output_tokens).toBe(51);
+				expect(utility.max_tokens).toBeUndefined();
+			} else {
+				expect(utility.max_tokens).toBeUndefined();
+				expect(utility.max_output_tokens).toBeUndefined();
+			}
 			expect(utility.model).toBe("channel:opaque");
 		});
 	}

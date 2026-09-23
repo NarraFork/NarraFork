@@ -3,6 +3,7 @@ import type { StreamingBlock } from "../message/message-segments";
 import {
 	applyExactStreamDelta,
 	applyExactStreamingSnapshot,
+	applyExactStreamingSnapshotUpdate,
 	type StreamDeltaEvent,
 } from "./exact-streaming-accumulator";
 
@@ -25,6 +26,62 @@ function reasoningDelta(text: string, id?: string, outputIndex?: number): Stream
 		},
 	};
 }
+
+describe("snapshot animation baseline classification", () => {
+	it("distinguishes accepted text changes from metadata-only changes", () => {
+		const blocks: StreamingBlock[] = [
+			{ type: "text", id: "t", text: "已有内容", revision: 1, textOffset: 0 },
+		];
+		expect(
+			applyExactStreamingSnapshotUpdate(blocks, [
+				{ type: "text", id: "t", text: "已有内容", revision: 2, textOffset: 0 },
+			]),
+		).toEqual({ changed: true, textChanged: false });
+		expect(
+			applyExactStreamingSnapshotUpdate(blocks, [
+				{ type: "text", id: "t", text: "已有内容", revision: 2, fileReferenceContext: null },
+			]),
+		).toEqual({ changed: true, textChanged: false });
+		expect(
+			applyExactStreamingSnapshotUpdate(blocks, [
+				{ type: "text", id: "t", text: "完整补载内容", revision: 3, textOffset: 0 },
+			]),
+		).toEqual({ changed: true, textChanged: true });
+	});
+
+	it("does not reset on empty, repeated, stale, or native-only snapshots", () => {
+		const blocks: StreamingBlock[] = [
+			{ type: "text", id: "t", text: "保留最新正文", revision: 4, textOffset: 0 },
+		];
+		for (const snapshot of [
+			[],
+			[{ type: "text", id: "t", text: "保留最新正文", revision: 4, textOffset: 0 }],
+			[{ type: "text", id: "t", text: "保留", revision: 1, textOffset: 0 }],
+		] as StreamingBlock[][]) {
+			expect(applyExactStreamingSnapshotUpdate(blocks, snapshot)).toEqual({
+				changed: false,
+				textChanged: false,
+			});
+		}
+		expect(
+			applyExactStreamingSnapshotUpdate(blocks, [
+				{ type: "web_search", id: "search", status: "completed" },
+			]),
+		).toEqual({ changed: true, textChanged: false });
+	});
+
+	it("counts an older snapshot that fills a missing raw prefix as accepted text", () => {
+		const blocks: StreamingBlock[] = [
+			{ type: "reasoning", id: "r", text: "suffix", revision: 4, textOffset: 6 },
+		];
+		expect(
+			applyExactStreamingSnapshotUpdate(blocks, [
+				{ type: "reasoning", id: "r", text: "prefix", revision: 2, textOffset: 0 },
+			]),
+		).toEqual({ changed: true, textChanged: true });
+		expect(blocks[0]).toMatchObject({ text: "prefixsuffix", revision: 4, textOffset: 0 });
+	});
+});
 
 describe("exact-streaming-accumulator", () => {
 	it("accumulates consecutive text deltas into one text block", () => {

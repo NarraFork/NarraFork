@@ -33,6 +33,7 @@ import {
 	runtimePublication,
 } from "../agent-runtime/publication";
 import {
+	backgroundAgentNoticePreview,
 	type CompletedBgSubagentNotification,
 	formatBackgroundCompletionNotifications,
 	pushBgCompletionNotification,
@@ -175,6 +176,35 @@ describe("publication commit → flush → mailbox delivery", () => {
 });
 
 describe("formatBackgroundCompletionNotifications", () => {
+	it("started and running notices do not imply a missing result or request Await", () => {
+		for (const status of ["started", "running"]) {
+			const task = notification({ status, result: undefined });
+			const text = formatBackgroundCompletionNotifications([task]);
+			expect(text).toContain("Agent has started.");
+			expect(text).not.toContain("Await(");
+			expect(text).not.toContain("unavailable");
+			expect(backgroundAgentNoticePreview(task, "zh-CN")).toContain("已开始执行");
+		}
+	});
+
+	it("notice-only completions describe saved results without repeating them", () => {
+		const task = notification({ noticeText: "run ended", result: "private result" });
+		const text = formatBackgroundCompletionNotifications([task]);
+		expect(text).toContain("result was saved");
+		expect(text).toContain("Await(");
+		expect(text).not.toContain("private result");
+		expect(backgroundAgentNoticePreview(task, "zh-CN")).toContain("结果已保存");
+	});
+
+	it("empty results are not missing and reader previews stay bounded", () => {
+		const task = notification({ result: "" });
+		expect(formatBackgroundCompletionNotifications([task])).toContain("Result:\n(empty)");
+		expect(backgroundAgentNoticePreview(task)).toBe("");
+		expect(backgroundAgentNoticePreview(notification({ result: "x".repeat(12001) }))).toHaveLength(
+			12000,
+		);
+	});
+
 	it("includes the result by default without requiring another Await", () => {
 		const text = formatBackgroundCompletionNotifications([notification()]);
 		expect(text).toContain("listed with line numbers");
@@ -185,7 +215,7 @@ describe("formatBackgroundCompletionNotifications", () => {
 		const text = formatBackgroundCompletionNotifications([
 			notification({ result: undefined, resultPreview: "completed. Use Await" }),
 		]);
-		expect(text).toContain("Result snapshot unavailable.");
+		expect(text).toContain("This notice could not load the result.");
 		expect(text).not.toContain("Result:\ncompleted");
 		expect(text).toContain("Await(");
 	});

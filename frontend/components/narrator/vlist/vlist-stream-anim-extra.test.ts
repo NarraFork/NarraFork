@@ -55,7 +55,7 @@ function frame(
 ): number {
 	const key = `${extra.animKeyBase}:${blockIndex}`;
 	const resolved = store.peekFrame(key, text, now, extra.animScope);
-	store.commitFrame(key, text, now, extra.animScope);
+	store.commitFrame(key, text, now, extra.animScope, resolved);
 	return Math.max(0, text.length - resolved.sealOffset);
 }
 
@@ -94,6 +94,47 @@ describe("mount epoch", () => {
 			narratorId: "n1",
 		});
 		expect(extra?.animScope).toBe("n1");
+	});
+});
+
+describe("snapshot animation baseline", () => {
+	it("namespaces a delayed snapshot in both key and scope without a narrator remount", () => {
+		const input = {
+			animateStreaming: true,
+			kind: "markdown",
+			specKey: "__streaming__-b0",
+			narratorId: "catchup-n",
+			mountEpoch: 1,
+		};
+		const live = resolveStreamAnimExtra(input);
+		const caughtUp = resolveStreamAnimExtra({ ...input, snapshotEpoch: 2 });
+		const reconnected = resolveStreamAnimExtra({ ...input, snapshotEpoch: 3 });
+		expect(caughtUp?.animScope).not.toBe(live?.animScope);
+		expect(caughtUp?.animKeyBase).not.toBe(live?.animKeyBase);
+		expect(reconnected?.animScope).not.toBe(caughtUp?.animScope);
+		expect(reconnected?.animKeyBase).not.toBe(caughtUp?.animKeyBase);
+		// Mount policy comes from each block's snapshot provenance, not the scope:
+		// a NEW live text lane after catch-up must still animate its opening chunk.
+		expect(caughtUp).not.toHaveProperty("sealOnMount");
+	});
+
+	it("seals a delayed snapshot, then resumes animation for subsequent live text", () => {
+		const store = new StreamAnimStore();
+		const live = rowExtra("catchup-n", 1);
+		frame(store, live, 0, "初始小段", 1_000);
+		frame(store, live, 0, "初始小段新增", 1_016);
+		const caughtUp = resolveStreamAnimExtra({
+			animateStreaming: true,
+			kind: "markdown",
+			specKey: "__streaming__-b0",
+			narratorId: "catchup-n",
+			mountEpoch: 1,
+			snapshotEpoch: 2,
+		});
+		if (!caughtUp) throw new Error("missing snapshot animation extra");
+		const full = "初始小段新增补載历史";
+		expect(frame(store, caughtUp, 0, full, 1_032)).toBe(0);
+		expect(frame(store, caughtUp, 0, `${full}实时`, 1_048)).toBe(2);
 	});
 });
 

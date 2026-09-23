@@ -54,7 +54,12 @@ import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/
 import { VListCodeCopyButton } from "../VListCodeCopyButton";
 import { CaretFiller } from "./caret-filler";
 import { FragmentGap, LineFragments } from "./line-fragments";
-import { graphemeAnimAge, StreamAnimStore, splitFragmentForAnim } from "./stream-token-anim";
+import {
+	graphemeAnimAge,
+	type StreamAnimFrame,
+	StreamAnimStore,
+	splitFragmentForAnim,
+} from "./stream-token-anim";
 import { TokenText } from "./TokenLines";
 
 /**
@@ -154,6 +159,12 @@ interface RenderMarkdownProps {
 	 * compositor-only CSS so block heights are unaffected (zero-DOM contract).
 	 */
 	animateStreaming?: boolean;
+	/**
+	 * An expandable body mounts EXISTING text, even while its narrator is live.
+	 * Seal that first committed frame; only subsequent appends/new blocks animate.
+	 * Kept opt-in so ordinary live answer segments can still fade on first sight.
+	 */
+	sealOnMount?: boolean;
 	/** Stable per-element key base (the vlist item's spec.key) for anim memory. */
 	animKeyBase?: string;
 	/**
@@ -176,11 +187,35 @@ export function RenderMarkdown({
 	sourceText,
 	onUnknownHeight,
 	animateStreaming,
+	sealOnMount,
 	animKeyBase,
 	animScope,
 }: RenderMarkdownProps) {
 	const { blocks, frame, contentWidth } = measured;
 	const hostRef = useRef<HTMLDivElement | null>(null);
+	const hasUnknown = useMemo(() => hasUnpredictableBlock(blocks), [blocks]);
+	const committedBody = useRef<{
+		key: string | undefined;
+		scope: string | undefined;
+		flowing: boolean;
+	} | null>(null);
+	// The narrator scope cannot tell a newly streamed block from an old body the
+	// reader just expanded. All blocks in that body's first render must seal,
+	// including blocks whose key still has live births from before it was folded.
+	// Switching absolute/flowing layout also remounts every block, so it needs
+	// the same baseline (otherwise evicted entries become births again).
+	const sealAnimation =
+		sealOnMount === true &&
+		(committedBody.current === null ||
+			committedBody.current.key !== animKeyBase ||
+			committedBody.current.scope !== animScope ||
+			committedBody.current.flowing !== hasUnknown);
+	useEffect(() => {
+		committedBody.current =
+			animateStreaming && !(showSource && sourceText)
+				? { key: animKeyBase, scope: animScope, flowing: hasUnknown }
+				: null;
+	}, [animateStreaming, showSource, sourceText, animKeyBase, animScope, hasUnknown]);
 	// Non-default copy-button corners, for panels that would otherwise sit under
 	// the row's hover action bar (see resolveCodeCopyPlacements).
 	const copyPlacements = useMemo(() => resolveCodeCopyPlacements(blocks, frame), [blocks, frame]);
@@ -194,7 +229,6 @@ export function RenderMarkdown({
 	// the shell decides whether to hand this row a reporter, this decides whether to
 	// observe. Two copies of the rule would eventually disagree, and either half
 	// disagreeing leaves the row clipped or un-recorded.
-	const hasUnknown = useMemo(() => hasUnpredictableBlock(blocks), [blocks]);
 	useEffect(() => {
 		if (!hasUnknown || !onUnknownHeight) return;
 		const node = hostRef.current;
@@ -267,6 +301,7 @@ export function RenderMarkdown({
 								flowing
 								animKey={animateStreaming && animKeyBase ? `${animKeyBase}:${index}` : undefined}
 								animScope={animScope}
+								sealAnimation={sealAnimation}
 								codeCopyPlacement={copyPlacements.get(index)}
 							/>
 						</div>
@@ -304,6 +339,7 @@ export function RenderMarkdown({
 							flowing={false}
 							animKey={animateStreaming && animKeyBase ? `${animKeyBase}:${index}` : undefined}
 							animScope={animScope}
+							sealAnimation={sealAnimation}
 							codeCopyPlacement={copyPlacements.get(index)}
 						/>
 					</Fragment>
@@ -408,6 +444,7 @@ function BlockView({
 	flowing,
 	animKey,
 	animScope,
+	sealAnimation,
 	codeCopyPlacement,
 }: {
 	block: PreparedBlock;
@@ -419,6 +456,7 @@ function BlockView({
 	animKey?: string;
 	/** The anim store's scope (narratorId) for this block's key. */
 	animScope?: string;
+	sealAnimation?: boolean;
 	/** Non-default corner for a fenced panel's copy button; absent → top-right. */
 	codeCopyPlacement?: CodeCopyPlacement;
 }) {
@@ -431,6 +469,7 @@ function BlockView({
 					contentWidth={contentWidth}
 					animKey={animKey}
 					animScope={animScope}
+					sealAnimation={sealAnimation}
 				/>
 			);
 		case "code":
@@ -717,6 +756,7 @@ function InlineBlockView({
 	contentWidth,
 	animKey,
 	animScope,
+	sealAnimation,
 }: {
 	block: PreparedInlineBlock;
 	frame: BlockFrame;
@@ -728,6 +768,7 @@ function InlineBlockView({
 	 * per render so peek and commit cannot disagree about it.
 	 */
 	animScope?: string;
+	sealAnimation?: boolean;
 }) {
 	// Materialize lines + fragments, assigning each fragment a running GLOBAL
 	// offset within the block's concatenated visible text. That offset is what
@@ -782,19 +823,36 @@ function InlineBlockView({
 		() => streamAnimStore.scoped(animScope ?? animKey ?? ""),
 		[animScope, animKey],
 	);
+	const committedScope = useRef<typeof scoped | null>(null);
+	// LRU eviction is not a new paragraph. A long body may have more mounted
+	// blocks than the shared store retains; never replay those blocks merely
+	// because their entries disappeared. Reseed them statically on the next commit.
+	const sealFrame =
+		sealAnimation ||
+		(animKey != null && committedScope.current === scoped && !scoped.hasEntry(animKey));
 	// Named `animFrame`, not `frame`: this component's `frame` prop is the measured
 	// BlockFrame (geometry). Two different meanings of the word in one scope is how
 	// a later edit reaches for the wrong one.
-	const animFrame = animKey != null ? scoped.peekFrame(animKey, visibleText, now) : null;
+	const animFrame: StreamAnimFrame | null =
+		animKey == null
+			? null
+			: sealFrame
+				? { animBoundary: totalLen, sealOffset: totalLen, births: [], now }
+				: scoped.peekFrame(animKey, visibleText, now);
 	// `now` is deliberately NOT a dependency: it changes on every render, so including
 	// it would commit a birth on renders that appended nothing (a hover, a resize, a
 	// parent rebuild), restamping text that was already mid-fade and restarting its
 	// animation. Excluding it means the closure keeps the `now` of the render where
 	// `visibleText` actually changed — which is precisely the birth time wanted.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: `now` must stay out; see above
+	// Commit the exact rendered decision, not another peek after sibling effects
+	// warmed the scope. `animFrame` embeds `now`, so neither is a dependency.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: commit only on text/key/policy changes, not clock ticks
 	useEffect(() => {
-		if (animKey != null) scoped.commitFrame(animKey, visibleText, now);
-	}, [animKey, visibleText, scoped]);
+		committedScope.current = animKey != null ? scoped : null;
+		if (animKey != null && animFrame != null) {
+			scoped.commitFrame(animKey, visibleText, animFrame.now, animFrame);
+		}
+	}, [animKey, visibleText, scoped, sealFrame]);
 	// The split point is the SEAL offset, not the append boundary — a grapheme must
 	// keep its span until its animation finishes (see stream-token-anim's header).
 	const sealOffset = animFrame?.sealOffset ?? Number.POSITIVE_INFINITY;

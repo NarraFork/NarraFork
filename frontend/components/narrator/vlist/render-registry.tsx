@@ -79,6 +79,7 @@ export function resolveRenderExtra(spec: {
 	switch (spec.kind) {
 		case "markdown":
 			extra.fileReferenceContext = normalizeFileReferenceContext(spec.opts?.fileReferenceContext);
+			if (spec.opts?.sealOnMount === true) extra.sealOnMount = true;
 			break;
 		case "message-bubble":
 			if ("role" in data) extra.role = data.role;
@@ -272,6 +273,7 @@ export function renderElement(
 						sourceText={extra.sourceText as string | undefined}
 						onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 						animateStreaming={extra.animateStreaming as boolean | undefined}
+						sealOnMount={extra.sealOnMount as boolean | undefined}
 						animKeyBase={extra.animKeyBase as string | undefined}
 						animScope={extra.animScope as string | undefined}
 					/>

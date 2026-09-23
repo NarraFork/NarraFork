@@ -4832,6 +4832,13 @@ export const PretextExactMessageList = memo(
 											viewControls={contentView.controls}
 											animateStreaming={animateStreamingRows && isStreamingRowKey(item.spec.key)}
 											streamAnimMountEpoch={streamAnimMountEpoch}
+											// Read from the committed document, NEVER streamingMsg: that hook
+											// can already hold the next snapshot while these items are still old.
+											streamAnimSnapshotEpoch={
+												isStreamingRowKey(item.spec.key)
+													? pretextDocument.streamingMessage?._streamAnimSnapshotEpoch
+													: undefined
+											}
 											// The task spinner gate. Two identities, one flag: the newest
 											// framed task bubble (by spec key) and the newest task board (by
 											// tool-use id). Both are null unless the narrator is running.

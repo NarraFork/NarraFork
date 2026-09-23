@@ -37,7 +37,7 @@ import {
 } from "../streaming/streaming-block-supersede";
 import {
 	applyExactStreamDelta,
-	applyExactStreamingSnapshot,
+	applyExactStreamingSnapshotUpdate,
 	type StreamDeltaEvent,
 } from "./exact-streaming-accumulator";
 import { resetStreamingBlockCache } from "./streaming-block-cache";
@@ -57,6 +57,7 @@ import {
 	dropPersistedStreamingTools,
 	streamingToolChunks,
 } from "./streaming-tool-chunks";
+import { nextStreamAnimEpoch } from "./vlist-stream-anim-extra";
 
 const EMPTY_MESSAGES: readonly HandoffMessage[] = [];
 
@@ -102,6 +103,10 @@ export function useVListStreamingMessage(
 	const rafRef = useRef(0);
 	/** The current lane by reference: native-block insertion may shift array indices. */
 	const liveBlockRef = useRef<StreamingBlock | null>(null);
+	const snapshotEpochRef = useRef<number | undefined>(undefined);
+	// Membership, not a second copy of the snapshot body. Weak references also
+	// release checkpointed lanes that are no longer in the raw accumulator.
+	const snapshotBlocksRef = useRef(new WeakSet<StreamingBlock>());
 	const [version, setVersion] = useState(0);
 
 	const flush = useCallback(() => {
@@ -127,6 +132,8 @@ export function useVListStreamingMessage(
 		clearOutputTimers();
 		finalizedRef.current.clear();
 		liveBlockRef.current = null;
+		snapshotEpochRef.current = undefined;
+		snapshotBlocksRef.current = new WeakSet();
 		const hadContent = blocksRef.current.length > 0 || toolStoreRef.current.size > 0;
 		if (hadContent) {
 			blocksRef.current = [];
@@ -328,15 +335,27 @@ export function useVListStreamingMessage(
 							) || toolsChanged;
 					}
 				}
-				if (
-					applyExactStreamingSnapshot(
-						blocksRef.current,
-						snapshot.streamingBlocks.filter((block) => {
-							const identity = contentBlockIdentity(block);
-							return !identity || (finalizedRef.current.get(identity.id) ?? -1) < identity.revision;
-						}) as StreamingBlock[],
-					)
-				) {
+				const applied = applyExactStreamingSnapshotUpdate(
+					blocksRef.current,
+					snapshot.streamingBlocks.filter((block) => {
+						const identity = contentBlockIdentity(block);
+						return !identity || (finalizedRef.current.get(identity.id) ?? -1) < identity.revision;
+					}) as StreamingBlock[],
+				);
+				if (applied.textChanged) {
+					// A catch-up is an existing-text baseline, including on SAME-page
+					// reconnect. Publish the epoch ON the message, not as shell state:
+					// the coordinator must commit it together with the new body/layout.
+					// Deltas coalesced into this rAF are safely sealed with the batch;
+					// later live frames retain the epoch and animate normally.
+					snapshotEpochRef.current = nextStreamAnimEpoch();
+					snapshotBlocksRef.current = new WeakSet(
+						blocksRef.current.filter(
+							(block) => block.type === "text" || block.type === "reasoning",
+						),
+					);
+				}
+				if (applied.changed) {
 					liveBlockRef.current = blocksRef.current.at(-1) ?? null;
 					flush();
 				}
@@ -548,15 +567,24 @@ export function useVListStreamingMessage(
 		// come first, then the live tool cards — the order the model produced them.
 		const toolChunksMsg =
 			chunks.length > 0 ? buildTopLevelStreamingChunksMsg(chunks, narratorId, null) : null;
-		return projectStreamingMessage(
-			buildStreamingMsg({
-				streamingBlocks: blocksRef.current,
-				toolChunksMsg,
-				narratorId,
-				liveBlockIndex: liveBlockRef.current ? blocksRef.current.indexOf(liveBlockRef.current) : -1,
-			}),
-			committedMessages,
-			isSubagent,
-		);
+		const streaming = buildStreamingMsg({
+			streamingBlocks: blocksRef.current,
+			toolChunksMsg,
+			narratorId,
+			liveBlockIndex: liveBlockRef.current ? blocksRef.current.indexOf(liveBlockRef.current) : -1,
+		});
+		if (streaming && snapshotEpochRef.current != null) {
+			streaming._streamAnimSnapshotEpoch = snapshotEpochRef.current;
+			// The builder emits fresh block objects in raw-accumulator order. Mark
+			// only snapshot-covered lanes, before projections filter/reorder them:
+			// a genuinely NEW lane on a later live frame must still fade on birth.
+			for (const [index, raw] of blocksRef.current.entries()) {
+				const block = streaming.contentJson[index];
+				if (block && snapshotBlocksRef.current.has(raw)) {
+					block._streamAnimSnapshotEpoch = snapshotEpochRef.current;
+				}
+			}
+		}
+		return projectStreamingMessage(streaming, committedMessages, isSubagent);
 	}, [enabled, narratorId, version, committedMessages, isSubagent]);
 }

@@ -42,3 +42,39 @@ export function applyExactStreamingSnapshot(
 ): boolean {
 	return applyStreamingSnapshotBlocks(blocks, snapshotBlocks);
 }
+
+/**
+ * Snapshot provenance/revision changes still need publishing, but only accepted
+ * text changes reset the animation baseline. Keep references to the old strings
+ * (not blocks, which the fold can mutate); no extra body copy or parsing.
+ */
+export function applyExactStreamingSnapshotUpdate(
+	blocks: StreamingBlock[],
+	snapshotBlocks: StreamingBlock[],
+): { changed: boolean; textChanged: boolean } {
+	const before = snapshotAnimationText(blocks);
+	const changed = applyExactStreamingSnapshot(blocks, snapshotBlocks);
+	if (!changed) return { changed: false, textChanged: false };
+	const after = snapshotAnimationText(blocks);
+	return {
+		changed,
+		textChanged:
+			before.length !== after.length ||
+			after.some((block, index) => {
+				const previous = before[index];
+				return (
+					previous?.type !== block.type ||
+					previous?.id !== block.id ||
+					previous?.text !== block.text
+				);
+			}),
+	};
+}
+
+function snapshotAnimationText(blocks: readonly StreamingBlock[]) {
+	return blocks.flatMap((block) =>
+		block.type === "text" || block.type === "reasoning"
+			? [{ type: block.type, id: block.id, text: block.text }]
+			: [],
+	);
+}

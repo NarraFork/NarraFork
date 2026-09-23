@@ -1691,15 +1691,20 @@ function adaptMessage(
 		switch (kind) {
 			case "markdown": {
 				const fileReferenceContext = normalizeFileReferenceContext(block.fileReferenceContext);
+				// Client-only provenance survives filtering and checkpoint projection.
+				// Only these existing bodies seal on late mount; a new post-catch-up
+				// text lane still gets its ordinary live first-chunk animation.
+				const snapshotBody = streamingMessage && typeof block._streamAnimSnapshotEpoch === "number";
 				specs.push({
 					kind,
 					key,
 					data: markdownData(block),
 					// Missing provenance retains the legacy shape. The render boundary maps
 					// it to explicit null, never inheriting the live narrator's current cwd.
-					...(fileReferenceContext || typeof block.revision === "number"
+					...(fileReferenceContext || typeof block.revision === "number" || snapshotBody
 						? {
 								opts: {
+									...(snapshotBody ? { sealOnMount: true } : {}),
 									...(fileReferenceContext ? { fileReferenceContext } : {}),
 									...(typeof block.revision === "number"
 										? { contentRevision: block.revision }

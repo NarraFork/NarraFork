@@ -135,6 +135,23 @@ async function mountStreamingRow(animKeyBase: string, animScope?: string) {
 }
 
 describe("streaming fade-in survives subsequent deltas", () => {
+	it("does not turn a cold multi-paragraph mount into births on the next frame", async () => {
+		const row = await mountStreamingRow("k-cold-multi-paragraph");
+		const text = "已有第一段。\n\n已有第二段。\n\n已有第三段。";
+		try {
+			row.frame(text);
+			expect(row.animSpans()).toHaveLength(0);
+			// Effects commit siblings in order. Warming the scope during commit must
+			// not change the cold-mount decision already used by their render.
+			row.frame(text);
+			expect(row.animSpans()).toHaveLength(0);
+			row.frame(`${text}新增`);
+			expect(row.animText()).toBe("新增");
+		} finally {
+			row.unmount();
+		}
+	});
+
 	it("keeps the SAME span element alive after more text arrives", async () => {
 		const row = await mountStreamingRow("k-identity");
 		// Frame 1 seeds the key (a cold-scope first sighting is a mount: no fade).

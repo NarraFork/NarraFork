@@ -68,6 +68,43 @@ describe("commonPrefixLength", () => {
 	});
 });
 
+describe("committing the rendered animation decision", () => {
+	it("does not reclassify cold siblings as births after the first sibling commits", () => {
+		const scoped = new StreamAnimStore().scoped("narrator");
+		const first = scoped.peekFrame("first", "已有第一段", 1_000);
+		const second = scoped.peekFrame("second", "已有第二段", 1_000);
+		expect(first.births).toEqual([]);
+		expect(second.births).toEqual([]);
+		scoped.commitFrame("first", "已有第一段", 1_000, first);
+		scoped.commitFrame("second", "已有第二段", 1_000, second);
+		expect(scoped.peekFrame("second", "已有第二段", 1_016).births).toEqual([]);
+		const appended = scoped.peekFrame("second", "已有第二段新增", 1_016);
+		expect(appended.sealOffset).toBe("已有第二段".length);
+		expect(appended.births).toEqual([{ offset: "已有第二段".length, ts: 1_016 }]);
+	});
+
+	it("an explicit mount frame clears pre-fold births and seeds the append boundary", () => {
+		const store = new StreamAnimStore();
+		const scoped = store.scoped("narrator");
+		scoped.commitFrame("body", "旧内容", 1_000);
+		scoped.commitFrame("body", "旧内容新增", 1_010);
+		expect(store.birthCount("body")).toBeGreaterThan(0);
+		const text = "旧内容新增折叠期间补充";
+		const sealed = {
+			animBoundary: text.length,
+			sealOffset: text.length,
+			births: [],
+			now: 1_020,
+		};
+		// StrictMode can replay the same effect: this must remain a sealed baseline.
+		scoped.commitFrame("body", text, sealed.now, sealed);
+		scoped.commitFrame("body", text, sealed.now, sealed);
+		expect(store.birthCount("body")).toBe(0);
+		expect(scoped.peekFrame("body", text, 1_030).sealOffset).toBe(text.length);
+		expect(scoped.peekFrame("body", `${text}继续`, 1_030).sealOffset).toBe(text.length);
+	});
+});
+
 describe("StreamAnimStore.resolveBoundary", () => {
 	it("does not animate on first sighting (boundary = full length)", () => {
 		const store = new StreamAnimStore();

@@ -110,6 +110,30 @@ async function mockCatalog(
 }
 
 describe("unified metadata storage and runtime", () => {
+	test("legacy empty optional card labels do not block startup migration", () => {
+		delete local.agent.modelCatalog;
+		local.agent.modelCards = [
+			{
+				modelKey: "custom-empty-label",
+				displayName: "",
+				family: "",
+				notes: "",
+				contextWindow: 32000,
+			},
+		];
+		local.agent.modelContextWindows = { "custom-empty-label": 16000 };
+		expect(() => bindModelCatalogSettings(local, () => {})).not.toThrow();
+		const model = local.agent.modelCatalog!.local.models!.find(
+			(m) => m.id === "custom-empty-label",
+		);
+		expect(model?.name).toBeUndefined();
+		expect(model?.family).toBeUndefined();
+		expect(model?.notes).toBeUndefined();
+		expect(getEffectiveModelMetadata("custom-empty-label").metadata.limits?.contextWindow).toBe(
+			16000,
+		);
+		expect(local.agent.modelCatalog!.legacyArchive?.modelCards[0]?.displayName).toBe("");
+	});
 	test("new patch changes runtime limits and reset really restores inheritance", () => {
 		mutate({
 			action: "patch",

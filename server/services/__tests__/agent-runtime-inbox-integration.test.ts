@@ -396,7 +396,7 @@ test("real parent after-tools notice callback is the adoption boundary, includin
 		"en",
 	);
 	failBroadcast = false;
-	expect(projected.text).toContain("Result snapshot unavailable.");
+	expect(projected.text).toContain("This notice could not load the result.");
 	expect(projected.text).toContain("Await(");
 	expect(state(row.id)).toMatchObject({ state: "materialized", adoptedAt: null });
 	projected.onConsumed();

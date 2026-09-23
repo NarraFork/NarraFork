@@ -224,26 +224,31 @@ export function projectPendingInjection(
 			.from(narrators)
 			.where(eq(narrators.id, metadata.taskId))
 			.get();
-		const originalSnapshot = metadata.resultRef?.startsWith("message-original:") ?? false;
+		const noticeOnly = metadata.resultRef?.startsWith("conclusion:") ?? false;
+		const resultRef = noticeOnly
+			? metadata.resultRef?.slice("conclusion:".length)
+			: metadata.resultRef;
+		const originalSnapshot = resultRef?.startsWith("message-original:") ?? false;
 		const resultMessageId = originalSnapshot
-			? metadata.resultRef?.slice("message-original:".length)
-			: metadata.resultRef?.startsWith("message:")
-				? metadata.resultRef.slice(8)
+			? resultRef?.slice("message-original:".length)
+			: resultRef?.startsWith("message:")
+				? resultRef.slice(8)
 				: undefined;
 		// Preserve the idle consumer's bounded long result without reading an unbounded source field.
-		const result = resultMessageId
-			? db
-					.select({
-						text: originalSnapshot
-							? sql<
-									string | null
-								>`CASE WHEN ${narratorMessages.originalContentJson} IS NULL THEN substr(${narratorMessages.contentText}, 1, 12001) WHEN length(CAST(${narratorMessages.originalContentJson} AS BLOB)) <= 98304 THEN substr(json_extract(${narratorMessages.originalContentJson}, '$[0].text'), 1, 12001) ELSE NULL END`
-							: sql<string>`substr(${narratorMessages.contentText}, 1, 12001)`,
-					})
-					.from(narratorMessages)
-					.where(eq(narratorMessages.id, resultMessageId))
-					.get()?.text
-			: undefined;
+		const result =
+			resultMessageId && !noticeOnly && status !== "started"
+				? db
+						.select({
+							text: originalSnapshot
+								? sql<
+										string | null
+									>`CASE WHEN ${narratorMessages.originalContentJson} IS NULL THEN substr(${narratorMessages.contentText}, 1, 12001) WHEN length(CAST(${narratorMessages.originalContentJson} AS BLOB)) <= 98304 THEN substr(json_extract(${narratorMessages.originalContentJson}, '$[0].text'), 1, 12001) ELSE NULL END`
+								: sql<string>`substr(${narratorMessages.contentText}, 1, 12001)`,
+						})
+						.from(narratorMessages)
+						.where(eq(narratorMessages.id, resultMessageId))
+						.get()?.text
+				: undefined;
 		return {
 			kind: "bg_agent",
 			task: {
@@ -252,6 +257,7 @@ export function projectPendingInjection(
 				title: task?.title ?? narrator?.title ?? metadata.taskId,
 				status,
 				resultPreview: row.text,
+				...(noticeOnly ? { noticeText: row.text } : {}),
 				result: result?.slice(0, 12000),
 				resultTruncated: !!result && result.length > 12000,
 				resultMessageId,

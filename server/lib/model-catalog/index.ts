@@ -305,9 +305,11 @@ export function bindModelCatalogSettings(settings: NarraForkSettings, save: () =
 				...(base ?? { id }),
 				metadata: {},
 				rawMetadata: undefined, // Identity edits must not pin the preset's complete source.
-				name: card.displayName ?? base?.name,
-				family: card.family ?? base?.family,
-				notes: card.notes ?? base?.notes,
+				// Legacy editors allowed empty optional labels; the catalog requires
+				// non-empty strings. Treat blanks as unset, retaining preset identity.
+				name: card.displayName?.trim() || base?.name,
+				family: card.family?.trim() || base?.family,
+				notes: card.notes?.trim() || base?.notes,
 				matches: {
 					...base?.matches,
 					...(card.aliases ? { aliases: card.aliases } : {}),

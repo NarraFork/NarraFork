@@ -107,6 +107,30 @@ describe("the per-row interaction payload is reused when nothing changed", () =>
 	});
 });
 
+describe("animation metadata crosses the real row memo", () => {
+	it("invalidates on animation gates and epochs even when measured content is identical", async () => {
+		const { ExactRow } = await import("./ExactRow");
+		type Props = import("./ExactRow").ExactRowProps;
+		const compare = (ExactRow as unknown as { compare: (previous: Props, next: Props) => boolean })
+			.compare;
+		const previous = {
+			item: { spec: { key: "__streaming__-b0", kind: "markdown" }, measured: {} },
+			animateStreaming: true,
+			streamAnimMountEpoch: 1,
+			streamAnimSnapshotEpoch: 2,
+		} as unknown as Props;
+		expect(compare(previous, { ...previous })).toBe(true);
+		expect(compare(previous, { ...previous, animateStreaming: false })).toBe(false);
+		expect(compare(previous, { ...previous, streamAnimMountEpoch: 3 })).toBe(false);
+		expect(compare(previous, { ...previous, streamAnimSnapshotEpoch: 4 })).toBe(false);
+	});
+
+	it("the shell takes snapshot identity from the committed layout, not the next hook value", () => {
+		expect(SHELL).toContain("pretextDocument.streamingMessage?._streamAnimSnapshotEpoch");
+		expect(SHELL).not.toContain("streamingMsg?._streamAnimSnapshotEpoch");
+	});
+});
+
 describe("the stability above is load-bearing", () => {
 	it("the memo comparator still compares both per-row payload props", () => {
 		// If either term were dropped the churn would stop mattering — and so would

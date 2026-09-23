@@ -665,6 +665,8 @@ export interface BaseContentBlock {
 	 * stops appearing after a restart.
 	 */
 	_takenOver?: boolean;
+	/** Client-only live block: this body existed in an accepted catch-up snapshot. */
+	_streamAnimSnapshotEpoch?: number;
 	/** Source citations on assistant text blocks, indexed against `text`. */
 	citations?: TextCitation[];
 	fileReferenceContext?: FileReferenceContext;
@@ -987,6 +989,13 @@ export interface TreeMessage {
 	 * `@shared/pretext-layout/streaming-live-blocks`, never directly.
 	 */
 	liveBlockIndex?: number;
+	/**
+	 * Client-only synthetic row: animation baseline of the last accepted text
+	 * snapshot. Travels with this message through the layout commit, so new
+	 * animation identity can never be paired with the preceding layout's body.
+	 * Not part of the persisted message or server protocol.
+	 */
+	_streamAnimSnapshotEpoch?: number;
 }
 
 export interface PaginatedNarrators {

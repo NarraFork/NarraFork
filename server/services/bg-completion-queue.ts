@@ -51,6 +51,28 @@ export function pushBgCompletionNotification(
 	runtimePublication.schedule();
 }
 
+/** Shared lifecycle wording for reader sidecars and model-facing notifications. */
+export function backgroundAgentNoticePreview(
+	task: CompletedBgSubagentNotification,
+	locale = "en",
+): string {
+	const zh = locale === "zh-CN";
+	if (task.status === "started" || task.status === "running") {
+		return zh ? "子代理已开始执行。" : "Agent has started.";
+	}
+	if (task.noticeText != null) {
+		return zh
+			? "本次执行已结束，结果已保存。可查看子代理结果；此通知不重复附带全文。"
+			: "This run has ended and its result was saved. View the agent result; this notice does not repeat it.";
+	}
+	return (
+		task.result?.slice(0, MAX_BACKGROUND_RESULT_CHARS) ??
+		(zh
+			? "此通知未能读取结果，请查看子代理或使用 Await 获取已保存的结果。"
+			: "This notice could not load the result. View the agent or use Await to inspect the stored result.")
+	);
+}
+
 export function formatBackgroundCompletionNotifications(
 	notifications: CompletedBgSubagentNotification[],
 	options: { includeResult?: boolean } = {},
@@ -61,12 +83,18 @@ export function formatBackgroundCompletionNotifications(
 		// be the alias whenever one exists.
 		const ref = task.alias ?? task.id;
 		const header = `[System] Background agent "${task.title}" (ID: ${ref}) ${task.status}.`;
+		if (task.status === "started" || task.status === "running") {
+			return `${header}\n${backgroundAgentNoticePreview(task)}`;
+		}
+		if (task.noticeText != null) {
+			return `${header}\n${backgroundAgentNoticePreview(task)}\nUse Await({ type: "agent", id: "${ref}" }) to see the stored result.\nUse Send({ id: "${ref}", message }) to continue.`;
+		}
 		const missing = task.result == null;
 		const truncated =
 			task.resultTruncated || (task.result?.length ?? 0) > MAX_BACKGROUND_RESULT_CHARS;
 		const resultText = includeResult
 			? missing
-				? "Result snapshot unavailable."
+				? backgroundAgentNoticePreview(task)
 				: `Result:\n${task.result?.slice(0, MAX_BACKGROUND_RESULT_CHARS) || "(empty)"}${
 						truncated ? `\n[Result truncated to ${MAX_BACKGROUND_RESULT_CHARS} characters.]` : ""
 					}`
