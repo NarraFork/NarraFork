@@ -37,6 +37,7 @@ import {
 	fileChangeIdentityKey,
 } from "./file-change-identity";
 import { normalizeLocalIoEvidence } from "./file-change-local-io-evidence";
+import type { WorkspaceRecoveryTransaction } from "./workspace-write-coordinator";
 
 /** Scheduling/transaction granularity, not permission to truncate a larger operation. */
 export const FILE_CHANGE_PREPARE_BATCH_ITEMS = 32;
@@ -138,8 +139,10 @@ export class FileChangeEvidenceError extends AppError {
  * public cross-project endpoint. This service never reads file bodies or writes files.
  *
  * The caller owns backend verification, the workspace coordinator, durable raw publication,
- * and the DB's durability configuration. Inject a ROOT connection: ambient transactions
- * are refused because releasing a savepoint does not make an intent durable. intent_durable
+ * and the DB's durability configuration. Inject a ROOT connection: implicit ambient
+ * transactions are refused; terminal settlement may explicitly join the coordinator's
+ * active same-connection transaction so its lease manifest commits atomically. Releasing
+ * a savepoint does not make an intent durable. intent_durable
  * means a committed journal under that configuration; it does not upgrade SQLite
  * synchronous=NORMAL to power-loss fsync. Never acknowledge/delete a backend receipt until
  * settleEffect's transaction succeeds. Provisional backend queries should pass receipt:null;
@@ -154,7 +157,16 @@ export class FileChangeEvidenceService {
 			throw fail("DURABILITY_BOUNDARY", "A root SQLite connection is required");
 	}
 
-	private transaction<T>(work: (tx: Executor) => T): T {
+	private transaction<T>(work: (tx: Executor) => T, external?: WorkspaceRecoveryTransaction): T {
+		if (external) {
+			const session = (external as unknown as { session?: { client?: unknown } }).session;
+			if (!this.database.$client.inTransaction || session?.client !== this.database.$client)
+				throw fail(
+					"DURABILITY_BOUNDARY",
+					"Settlement requires the current same-connection transaction",
+				);
+			return work(external);
+		}
 		if (this.database.$client.inTransaction) {
 			throw fail(
 				"DURABILITY_BOUNDARY",
@@ -280,7 +292,9 @@ export class FileChangeEvidenceService {
 			/** Fixed durable lease manifest; never inferred from the scope's current owner. */
 			effectIds?: readonly string[];
 			operationIds?: readonly string[];
-			recoveredByUserId: string;
+			recoveredByUserId: string | null;
+			resolutionAuthority?: typeof fileChangeScopeRecoveries.$inferInsert.resolutionAuthority;
+			maintenanceEvidenceJson?: typeof fileChangeScopeRecoveries.$inferInsert.maintenanceEvidenceJson;
 			decisions: {
 				effectId: string;
 				canonicalPath: string;
@@ -304,7 +318,13 @@ export class FileChangeEvidenceService {
 		// root-connection durability boundary in transaction().
 		if (recoveryTx && !this.database.$client.inTransaction)
 			throw fail("DURABILITY_BOUNDARY", "Recovery requires an active coordinator transaction");
-		assertString(input.recoveredByUserId, "recoveredByUserId");
+		const resolutionAuthority = input.resolutionAuthority ?? "execution_proven";
+		if (input.recoveredByUserId === null) {
+			if (resolutionAuthority !== "system_reconciled")
+				throw fail("INVALID_INPUT", "Human recovery requires an administrator identity");
+		} else assertString(input.recoveredByUserId, "recoveredByUserId");
+		if (resolutionAuthority === "administrator_attested" && !input.maintenanceEvidenceJson)
+			throw fail("INVALID_INPUT", "Administrator recovery requires maintenance evidence");
 		if (!Array.isArray(input.decisions) || input.decisions.length > FILE_CHANGE_LIMITS.revertFiles)
 			throw fail("INVALID_INPUT", "Invalid recovery decision list");
 		for (const decision of input.decisions) {
@@ -463,6 +483,8 @@ export class FileChangeEvidenceService {
 					canonicalRoot: scope.canonicalRoot,
 					pathFlavor: scope.pathFlavor,
 					recoveredByUserId: input.recoveredByUserId,
+					resolutionAuthority,
+					maintenanceEvidenceJson: input.maintenanceEvidenceJson ?? null,
 					effectDecisionsJson: input.decisions,
 					scopeRevisionBefore: scope.revision,
 					fencingTokenBefore: scope.fencingToken,
@@ -907,7 +929,10 @@ export class FileChangeEvidenceService {
 		});
 	}
 
-	settleEffect(input: SettleFileChangeEffect): FileChangeEffectRecord {
+	settleEffect(
+		input: SettleFileChangeEffect,
+		tx?: WorkspaceRecoveryTransaction,
+	): FileChangeEffectRecord {
 		validateSelector(input);
 		const receipt = input.receipt === null ? null : normalizeReceipt(input.receipt);
 		const observedAfter = normalizeState(
@@ -1060,13 +1085,14 @@ export class FileChangeEvidenceService {
 				.where(eq(fileChangeOperations.id, operation.id))
 				.run();
 			return settled;
-		});
+		}, tx);
 	}
 
 	/** Tool/process outcome is separate from actual file effects, including failed-but-written. */
 	finishOperation(
 		operationId: string,
 		outcome: Exclude<FileChangeExecutionOutcome, "running">,
+		tx?: WorkspaceRecoveryTransaction,
 	): FileChangeOperationRecord {
 		assertString(operationId, "operationId");
 		if (!["succeeded", "failed", "interrupted"].includes(outcome))
@@ -1091,7 +1117,98 @@ export class FileChangeEvidenceService {
 				.where(eq(fileChangeOperations.id, operationId))
 				.returning()
 				.get();
-		});
+		}, tx);
+	}
+
+	/** Explicit trusted proof before IO admission; never infers non-dispatch from bytes/errors. */
+	finishPreparationWithoutDispatch(
+		operationId: string,
+		proof: FileChangeNoDispatchProof,
+		tx?: WorkspaceRecoveryTransaction,
+	): FileChangeOperationRecord {
+		assertString(operationId, "operationId");
+		if (
+			proof.targetDispatched !== false ||
+			!["validation_rejected", "cancelled_before_dispatch"].includes(proof.reason)
+		)
+			throw fail("INVALID_INPUT", "Explicit no-dispatch proof is required");
+		return this.transaction((executor) => {
+			const operation = requireOperation(executor, operationId);
+			assertJournal(operation);
+			if (operation.expectedEffectCount !== 1 || operation.preparedEffectCount > 1)
+				throw fail(
+					"INVALID_INPUT",
+					"No-dispatch settlement is bounded to a single local file attempt",
+				);
+			if (
+				operation.executionOutcome !== "running" ||
+				!["preparing", "intent_durable"].includes(operation.settlement)
+			)
+				throw fail("INVALID_TRANSITION", "Only a preparation with no dispatch may be closed");
+			if (
+				effectExists(
+					executor,
+					operationId,
+					inArray(fileChangeEffects.settlement, ["applying", "reconcile_required", "settled"]),
+				)
+			)
+				throw fail("INVALID_TRANSITION", "Attempted effects cannot become non-dispatched");
+			const timestamp = this.now();
+			const effect = executor
+				.select()
+				.from(fileChangeEffects)
+				.where(eq(fileChangeEffects.operationId, operationId))
+				.limit(1)
+				.get();
+			if (effect) {
+				const receipt = normalizeReceipt({
+					receiptId: generateId(),
+					mutationId: effect.mutationId,
+					requestDigest: effect.requestDigest,
+					executionBinding: operation.executionBindingJson,
+					outcome: "not_applied",
+					confirmed: true,
+					observedAfter: unknownAfter(),
+					localIo: {
+						version: 1,
+						outcome: "not_applied",
+						createdParentCount: 0,
+						uncertainParentCount: 0,
+					},
+				});
+				executor
+					.update(fileChangeEffects)
+					.set({
+						settlement: "settled",
+						outcome: "no_change",
+						executionConfirmed: true,
+						executionReceiptJson: receipt,
+						executionReceiptDigest: digest(receipt),
+						attributionGrade: "unknown",
+						linesAdded: 0,
+						linesRemoved: 0,
+						updatedAt: timestamp,
+					})
+					.where(eq(fileChangeEffects.id, effect.id))
+					.run();
+			}
+			return executor
+				.update(fileChangeOperations)
+				.set({
+					settlement: "settled",
+					effectOutcome: "no_change",
+					coverage: "complete",
+					executionOutcome: proof.reason === "cancelled_before_dispatch" ? "interrupted" : "failed",
+					settledEffectCount: operation.preparedEffectCount,
+					unresolvedEffectCount: 0,
+					reason: `no_dispatch:${proof.reason}`,
+					finishedAt: timestamp,
+					updatedAt: timestamp,
+				})
+				.where(eq(fileChangeOperations.id, operationId))
+				.returning()
+				.get();
+		}, tx);
 	}
 
 	/** Authorized owning-resource lookup, not authorization by identifier. */

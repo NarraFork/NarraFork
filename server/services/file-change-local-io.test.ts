@@ -126,11 +126,9 @@ describe("local file cancellation boundaries (real IO)", () => {
 				if (this === target) synced = true;
 			});
 			try {
-				// A cancelled lease may reject verification AFTER persistence.
-				input.assertTarget = async () => input.signal.throwIfAborted();
 				expect(await fileChangeLocalIo.apply(input)).toMatchObject({
-					kind: "target_mutation_unknown",
-					error: expect.any(Error),
+					kind: "applied",
+					error: null,
 				});
 				expect(writes).toBe(5);
 				expect(synced).toBe(true);
@@ -148,7 +146,6 @@ describe("local file cancellation boundaries (real IO)", () => {
 	])("cancellation after exclusive creation persists new content %j", async (content) => {
 		await withFile(null, async (input, controller, proto) => {
 			input.nextBytes = Buffer.from(content);
-			input.assertTarget = async () => input.signal.throwIfAborted();
 			const originalStat = proto.stat;
 			let target: unknown;
 			const statSpy = spyOn(proto, "stat").mockImplementation(async function (
@@ -171,8 +168,8 @@ describe("local file cancellation boundaries (real IO)", () => {
 			});
 			try {
 				expect(await fileChangeLocalIo.apply(input)).toMatchObject({
-					kind: "target_mutation_unknown",
-					error: expect.any(Error),
+					kind: "applied",
+					error: null,
 				});
 				expect(controller.signal.aborted).toBe(true);
 				expect(synced).toBe(true);
@@ -349,7 +346,6 @@ function controlledIo(initial: string | null = null, parents: string[] = []) {
 		signal: controller.signal,
 		assertTarget: async () => {
 			await event("guard");
-			controller.signal.throwIfAborted();
 		},
 		onDispatch: () => calls.push(`dispatch:${path}`),
 	};
@@ -626,12 +622,29 @@ describe("controlled syscall stage evidence", () => {
 		expect(result.parentEffects.possiblePaths).toEqual([]);
 	});
 
+	test.each([
+		"bytes",
+		"identity",
+	])("post-close %s replacement remains unknown despite cancellation", async (replacement) => {
+		const f = controlledIo("original");
+		f.setHook((event) => {
+			if (event === `close:target:done:${f.input.canonicalPath}`) {
+				f.controller.abort();
+				const entry = f.files.get(f.input.canonicalPath);
+				if (!entry) throw new Error("missing fixture");
+				if (replacement === "bytes") entry.bytes = Buffer.from("foreign");
+				else entry.ino++;
+			}
+		});
+		expect((await f.io.apply(f.input)).kind).toBe("target_mutation_unknown");
+	});
+
 	test("successful short-write loop completes before reporting applied", async () => {
 		const f = controlledIo("original");
 		expect((await f.io.apply(f.input)).kind).toBe("applied");
 		expect(f.files.get(f.input.canonicalPath)?.bytes).toEqual(Buffer.from(f.input.nextBytes));
 		expect(f.calls.filter((event) => event.startsWith("write:done:"))).toHaveLength(3);
-		expect(f.calls.at(-1)).toBe(`close:target:done:${f.input.canonicalPath}`);
+		expect(f.calls.at(-1)).toBe(`close:read:done:${f.input.canonicalPath}`);
 	});
 });
 
@@ -642,11 +655,11 @@ describe("controlled cancellation across every IO stage", () => {
 		["mkdir:done:/spec/nested", null, "parent_only"],
 		["open:existing:done", "original", "not_applied"],
 		["read:target", "original", "not_applied"],
-		["open:create:done", null, "target_mutation_unknown"],
-		["truncate:done", "original", "target_mutation_unknown"],
-		["write:done", "original", "target_mutation_unknown"],
-		["sync:done", "original", "target_mutation_unknown"],
-		["close:target:done", "original", "target_mutation_unknown"],
+		["open:create:done", null, "applied"],
+		["truncate:done", "original", "applied"],
+		["write:done", "original", "applied"],
+		["sync:done", "original", "applied"],
+		["close:target:done", "original", "applied"],
 	] as const)("cancel at %s returns %s/%s", async (stage, initial, kind) => {
 		const f = controlledIo(initial);
 		const reason = new Error(`cancel at ${stage}`);
@@ -656,8 +669,8 @@ describe("controlled cancellation across every IO stage", () => {
 		});
 		const result = await f.io.apply(f.input);
 		expect(result.kind).toBe(kind);
-		expect(result.error).toBe(reason);
-		if (kind === "target_mutation_unknown") {
+		expect(result.error).toBe(kind === "applied" ? null : reason);
+		if (kind === "applied") {
 			expect(f.files.get(f.input.canonicalPath)?.bytes).toEqual(Buffer.from(f.input.nextBytes));
 			expect(f.calls).toContain(`sync:done:${f.input.canonicalPath}`);
 			expect(f.calls).toContain(`close:target:done:${f.input.canonicalPath}`);
@@ -701,9 +714,9 @@ describe("controlled cancellation across every IO stage", () => {
 		await Promise.resolve();
 		expect(settled).toBe(false);
 		release();
-		expect((await apply).kind).toBe("target_mutation_unknown");
+		expect((await apply).kind).toBe("applied");
 		expect(f.files.get(f.input.canonicalPath)?.bytes).toEqual(Buffer.from(f.input.nextBytes));
-		expect(f.calls.at(-1)).toBe(`close:target:done:${f.input.canonicalPath}`);
+		expect(f.calls.at(-1)).toBe(`close:read:done:${f.input.canonicalPath}`);
 	});
 
 	test("cancellation cannot race a pending mkdir or erase its completed effects", async () => {

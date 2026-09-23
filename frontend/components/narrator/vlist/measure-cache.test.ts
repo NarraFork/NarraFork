@@ -876,6 +876,39 @@ describe("extractDataRevision", () => {
 			expect(extractDataRevision(rowWith({ added: 40, removed: 3 }))).not.toBe(some);
 		});
 
+		/**
+		 * The per-row PAINTED duration, which is not always `timing.durationMs`.
+		 *
+		 * It derives from `_metadata.execDurationMs`, and a live patch can land that
+		 * metadata ALONE on a call whose status is already terminal — the same window
+		 * `diffStats` above needs its own key component for. Without this the rebuild
+		 * serves the pre-patch row and keeps painting the figure that includes the gate
+		 * wait, which is worse than painting none: a duration reads as authoritative.
+		 */
+		it("keys each row's painted duration independently of the full span", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			const rowWith = (displayDurationMs?: number) => ({
+				headerCount: "1 call",
+				items: [
+					{
+						key: "tool-tu-1",
+						title: "Bash · git diff",
+						status: "success",
+						// Held FIXED across the cases, which is the point: only the painted
+						// figure moves, so nothing else in the key can cover for it.
+						timing: { createdAt: 0, durationMs: 20_000 },
+						...(displayDurationMs != null ? { displayDurationMs } : {}),
+					},
+				],
+			});
+			const none = extractDataRevision(rowWith());
+			const exec = extractDataRevision(rowWith(1_200));
+			expect(exec).not.toBe(none);
+			expect(exec).toContain("tmd:1200");
+			// A corrected figure re-keys too.
+			expect(extractDataRevision(rowWith(1_500))).not.toBe(exec);
+		});
+
 		it("a collapsed fold pays nothing (no card → no card component)", async () => {
 			const { extractDataRevision } = await import("./measure-cache");
 			const rev = extractDataRevision(traceWith());

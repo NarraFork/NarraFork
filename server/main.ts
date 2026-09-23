@@ -171,6 +171,23 @@ try {
 	throw error;
 }
 
+// Record the actual local process owner once, before HTTP/agent writes can start.
+// Identity probe failure never invents proof; unavailable registration disables reconciliation.
+const {
+	initializeWorkspaceOwnerOnStartup,
+	startWorkspaceStartupReconciliation,
+	stopWorkspaceStartupReconciliation,
+} = await import("./services/workspace-startup-reconciliation");
+if (activeDatabaseBackend === "sqlite") {
+	try {
+		await initializeWorkspaceOwnerOnStartup();
+	} catch (error) {
+		logger.warn("Workspace execution owner registration unavailable; barriers remain protected", {
+			error: String(error),
+		});
+	}
+}
+
 // Track event-loop stalls early so blocking operations are visible in logs/diagnostics.
 startEventLoopMonitor();
 
@@ -1271,6 +1288,7 @@ async function openAsApp(url: string) {
 // there is the "cannot skip verification" answer). A server-managed engine verifies itself.
 if (activeDatabaseBackend === "sqlite") {
 	scheduleBackgroundIntegrityCheck(startupShutdownState);
+	startWorkspaceStartupReconciliation();
 }
 
 // Start WebSocket heartbeat (ping/pong) to detect stale connections
@@ -1650,6 +1668,12 @@ async function performGracefulShutdown(
 		// steps below are what guarantee later teardown cannot race a handler that writes to SQLite
 		// after the clean marker.
 		acceptingHttpRequests = false;
+		await shutdownStep(
+			tracker,
+			"workspaceReconciliation.stop",
+			stopWorkspaceStartupReconciliation,
+			5_000,
+		);
 		const shutdownRequestId = httpRequestContext.getStore();
 		closeAllConnections();
 		// A short budget is honest here: stopHttpListener() is synchronous by design

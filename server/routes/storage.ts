@@ -1,6 +1,11 @@
 import { Hono } from "hono";
 import { z } from "zod/v4";
-import { recoverWorkspaceBarrierSchema } from "../lib/validators/workspace-recovery";
+import {
+	beginWorkspaceMaintenanceSchema,
+	commitWorkspaceMaintenanceSchema,
+	recoverWorkspaceBarrierSchema,
+	workspaceMaintenanceTokenSchema,
+} from "../lib/validators/workspace-recovery";
 import { requireAdmin } from "../middleware/auth";
 import { databaseCleanupService } from "../services/database-cleanup-service";
 import {
@@ -10,12 +15,68 @@ import {
 } from "../services/storage-scan-job";
 import { storageService } from "../services/storage-service";
 import {
+	beginWorkspaceMaintenance,
+	cancelWorkspaceMaintenance,
+	commitWorkspaceMaintenance,
 	listWorkspaceBarriers,
 	observeWorkspaceBarrier,
+	observeWorkspaceMaintenance,
 	recoverWorkspaceBarrier,
+	retryWorkspaceRecoveryPersistence,
 } from "../services/workspace-scope-recovery";
 
 export const storageRoutes = new Hono();
+
+storageRoutes.post("/workspace-barriers/:scopeId/retry-persistence", requireAdmin, async (c) => {
+	return c.json(await retryWorkspaceRecoveryPersistence(c.req.param("scopeId") ?? ""));
+});
+
+storageRoutes.post("/workspace-barriers/:scopeId/maintenance/begin", requireAdmin, async (c) => {
+	const parsed = beginWorkspaceMaintenanceSchema.safeParse(await c.req.json().catch(() => null));
+	if (!parsed.success) return c.json({ error: "Invalid maintenance request" }, 400);
+	return c.json(
+		await beginWorkspaceMaintenance({
+			...parsed.data,
+			scopeId: c.req.param("scopeId") ?? "",
+			adminUserId: c.get("user").sub,
+		}),
+	);
+});
+for (const [action, handler] of [
+	["observe", observeWorkspaceMaintenance],
+	["cancel", cancelWorkspaceMaintenance],
+] as const) {
+	storageRoutes.post(
+		`/workspace-barriers/:scopeId/maintenance/${action}`,
+		requireAdmin,
+		async (c) => {
+			const parsed = workspaceMaintenanceTokenSchema.safeParse(
+				await c.req.json().catch(() => null),
+			);
+			if (!parsed.success) return c.json({ error: "Invalid maintenance permission" }, 400);
+			return c.json(
+				await handler({
+					...parsed.data,
+					scopeId: c.req.param("scopeId") ?? "",
+					adminUserId: c.get("user").sub,
+					signal: c.req.raw.signal,
+				}),
+			);
+		},
+	);
+}
+storageRoutes.post("/workspace-barriers/:scopeId/maintenance/commit", requireAdmin, async (c) => {
+	const parsed = commitWorkspaceMaintenanceSchema.safeParse(await c.req.json().catch(() => null));
+	if (!parsed.success) return c.json({ error: "Invalid maintenance commit request" }, 400);
+	return c.json(
+		await commitWorkspaceMaintenance({
+			...parsed.data,
+			scopeId: c.req.param("scopeId") ?? "",
+			adminUserId: c.get("user").sub,
+			signal: c.req.raw.signal,
+		}),
+	);
+});
 
 /**
  * POST /api/storage/scan/start — Kick off a storage scan as a server-side background job
@@ -175,8 +236,9 @@ storageRoutes.get("/workspace-barriers", requireAdmin, async (c) => {
 
 /**
  * POST /api/storage/workspace-barriers/:scopeId/observe — Re-observe every
- * unsettled effect's physical file and return per-effect verdicts. Read-only;
- * the confirmation UI uses this as its preview (admin only).
+ * unsettled effect's physical file and return per-effect verdicts. It may record
+ * fresh strict owner-termination evidence for native IO; it never modifies
+ * workspace files. The confirmation UI uses this as its preview (admin only).
  */
 storageRoutes.post("/workspace-barriers/:scopeId/observe", requireAdmin, async (c) => {
 	const scopeId = c.req.param("scopeId");

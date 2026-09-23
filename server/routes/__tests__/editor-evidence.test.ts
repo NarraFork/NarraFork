@@ -666,7 +666,14 @@ describe("editor evidence failures and immutable human projection", () => {
 		restorers.push(() => spy.mockRestore());
 		expect((await save({ path, content: "new", baseHash: hash("old") })).status).toBe(500);
 		expect(applyCalls).toBe(0);
-		expect(operations()).toHaveLength(0);
+		expect(operations()).toHaveLength(1);
+		expect(operations()[0]).toMatchObject({
+			executionOutcome: "failed",
+			settlement: "settled",
+			effectOutcome: "no_change",
+			unresolvedEffectCount: 0,
+		});
+		expect(effects()).toHaveLength(0);
 		expect(await readFile(path, "utf8")).toBe("old");
 	});
 
@@ -730,7 +737,7 @@ describe("editor evidence failures and immutable human projection", () => {
 		expect(applyCalls).toBe(1);
 	});
 
-	test("operation-finish DB failure keeps the settled receipt frozen and blocks a new save", async () => {
+	test("operation-finish DB failure atomically retains intent and blocks a new save", async () => {
 		const path = join(workspace, "finish-db.txt");
 		await writeFile(path, "old\n");
 		failSql(
@@ -743,11 +750,14 @@ describe("editor evidence failures and immutable human projection", () => {
 			json: { code: "WRITE_RECONCILE_REQUIRED" },
 		});
 		const frozen = effects()[0];
+		// Receipt, operation and lease commit together: failure cannot publish a
+		// half-settled effect while the operation still says running.
 		expect(frozen).toMatchObject({
-			settlement: "settled",
-			attributionGrade: "measured",
-			linesAdded: 1,
-			linesRemoved: 1,
+			settlement: "applying",
+			executionReceiptJson: null,
+			attributionGrade: "unknown",
+			linesAdded: null,
+			linesRemoved: null,
 		});
 		expect(operations()[0].settlement).not.toBe("settled");
 		expectQuarantinedFile(path, "pending");
@@ -812,8 +822,8 @@ describe("editor evidence failures and immutable human projection", () => {
 		const path = join(workspace, "frozen.txt");
 		await writeFile(path, "one\n");
 		const settle = runtime.evidence.settleEffect.bind(runtime.evidence);
-		const spy = spyOn(runtime.evidence, "settleEffect").mockImplementation((input) => {
-			const result = settle(input);
+		const spy = spyOn(runtime.evidence, "settleEffect").mockImplementation((input, tx) => {
+			const result = settle(input, tx);
 			const binding = localFileChangeRuntimeBinding();
 			if (!binding) throw new Error("No runtime");
 			const activity = runtime.coordinator.registerActivity({ scope: scope(), runtime: binding });

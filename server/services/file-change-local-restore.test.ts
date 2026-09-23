@@ -99,6 +99,9 @@ async function request(
 		settle() {
 			throw new Error("helper must not settle the caller journal");
 		},
+		settleWith() {
+			throw new Error("helper must not settle the caller journal");
+		},
 		markUncertain() {
 			throw new Error("caller owns quarantine");
 		},

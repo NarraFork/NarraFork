@@ -19,6 +19,7 @@ import {
 	fileChangeScopes,
 	fileChangeStorageBudgets,
 	users,
+	workspaceExecutionOwners,
 	workspaceWriteLeases,
 } from "../db/schema";
 import { generateId } from "../lib/id";
@@ -31,6 +32,7 @@ import {
 } from "./file-change-evidence";
 import { createFileChangeIdentity } from "./file-change-identity";
 import { fileChangeLocalIo } from "./file-change-local-io";
+import * as ownerAuthority from "./workspace-execution-owner";
 import { createWorkspaceScopeRecovery } from "./workspace-scope-recovery";
 import {
 	createWorkspaceWriteCoordinatorState,
@@ -72,6 +74,8 @@ beforeEach(async () => {
 	recovery = createWorkspaceScopeRecovery({
 		database: db,
 		getRuntime: async () => ({ coordinator, evidence: service }),
+		assertMaintenanceAuthority: () => {},
+		now: () => clock,
 	});
 	source = `recovery-test-${generateId()}`;
 	blobIds = [];
@@ -694,6 +698,438 @@ describe("atomic lease recovery", () => {
 		expect(effectRow(effect.id)?.settlement).toBe("settled");
 	});
 
+	test("maintenance holds the whole scope across requests and audits attestation without death proof", async () => {
+		const { effect } = await dispatchedEffect("maintenance.txt", ABSENT, blobState(hash("x"), 1));
+		const leaseId = durableBarrier(effect);
+		db.update(workspaceWriteLeases)
+			.set({ executionEndedAt: null, ownerEpoch: "legacy-random" })
+			.where(eq(workspaceWriteLeases.leaseId, leaseId))
+			.run();
+		const permit = await recovery.beginWorkspaceMaintenance({
+			scopeId: scope.id,
+			leaseId,
+			adminUserId: USER_ID,
+			acknowledgeWritersStopped: true,
+			operatorReason: "Old instance and external writers stopped",
+		});
+		const input = {
+			scopeId: scope.id,
+			adminUserId: USER_ID,
+			maintenanceToken: permit.maintenanceToken,
+		};
+		await expect(
+			recovery.beginWorkspaceMaintenance({
+				scopeId: scope.id,
+				leaseId,
+				adminUserId: USER_ID,
+				acknowledgeWritersStopped: true,
+				operatorReason: "duplicate",
+			}),
+		).rejects.toThrow();
+		const preview = await recovery.observeWorkspaceMaintenance(input);
+		expect(preview.rangeObservations.some((range) => range.canonicalPath === root)).toBe(true);
+		const result = await recovery.commitWorkspaceMaintenance({
+			...input,
+			confirmationToken: preview.confirmationToken,
+			acknowledgeInspected: true,
+			acknowledgements: preview.observations.map(({ effectId, verdict }) => ({
+				effectId,
+				verdict,
+			})),
+		});
+		expect(result.settledEffectCount).toBe(1);
+		expect(auditRows()[0]).toMatchObject({
+			resolutionAuthority: "administrator_attested",
+			recoveredByUserId: USER_ID,
+			maintenanceEvidenceJson: { oldOwnerEpoch: "legacy-random", generation: permit.generation },
+		});
+		expect(
+			db.select().from(workspaceWriteLeases).where(eq(workspaceWriteLeases.leaseId, leaseId)).get(),
+		).toMatchObject({ status: "recovered", executionEndedAt: null });
+		await expect(recovery.observeWorkspaceMaintenance(input)).rejects.toMatchObject({
+			code: "MAINTENANCE_INVALID",
+		});
+	});
+
+	test("automatic local reconciliation records system authority and no invented administrator", async () => {
+		const { effect } = await dispatchedEffect("auto.txt", ABSENT, blobState(hash("x"), 1));
+		const leaseId = durableBarrier(effect);
+		db.update(workspaceWriteLeases)
+			.set({ executionClass: "local_file_io" })
+			.where(eq(workspaceWriteLeases.leaseId, leaseId))
+			.run();
+		const result = await recovery.reconcileWorkspaceBarrier(scope.id, leaseId);
+		expect(result.recovered).toBe("barrier_cleared");
+		expect(auditRows()[0]).toMatchObject({
+			recoveredByUserId: null,
+			resolutionAuthority: "system_reconciled",
+			maintenanceEvidenceJson: null,
+		});
+	});
+
+	test("automatic recovery leaves opaque writes, foreign observations and unproven owners barred", async () => {
+		const { effect } = await dispatchedEffect("auto-foreign.txt", ABSENT, blobState(hash("x"), 1));
+		const leaseId = durableBarrier(effect);
+		await expect(recovery.reconcileWorkspaceBarrier(scope.id, leaseId)).resolves.toMatchObject({
+			recovered: false,
+		});
+		db.update(workspaceWriteLeases)
+			.set({ executionClass: "local_file_io" })
+			.where(eq(workspaceWriteLeases.leaseId, leaseId))
+			.run();
+		await writeFile(join(root, "auto-foreign.txt"), "foreign");
+		await expect(recovery.reconcileWorkspaceBarrier(scope.id, leaseId)).resolves.toMatchObject({
+			recovered: false,
+		});
+		db.update(workspaceWriteLeases)
+			.set({ executionEndedAt: null, ownerEpoch: "legacy-unproven" })
+			.where(eq(workspaceWriteLeases.leaseId, leaseId))
+			.run();
+		await expect(recovery.reconcileWorkspaceBarrier(scope.id, leaseId)).rejects.toMatchObject({
+			statusCode: 409,
+		});
+		expect(auditRows()).toEqual([]);
+		expect(effectRow(effect.id)?.settlement).toBe("applying");
+	});
+
+	test("only explicit native observation retries strict owner probing; inventory never probes or writes", async () => {
+		const { effect } = await dispatchedEffect("probe-retry.txt", ABSENT, blobState(hash("x"), 1));
+		const leaseId = durableBarrier(effect);
+		db.update(workspaceWriteLeases)
+			.set({
+				executionClass: "local_file_io",
+				executionEndedAt: null,
+				ownerEpoch: "old-probe-unknown",
+			})
+			.where(eq(workspaceWriteLeases.leaseId, leaseId))
+			.run();
+		const prove = spyOn(ownerAuthority, "proveWorkspaceOwnerEnded").mockResolvedValue(null);
+		const record = spyOn(coordinator, "recordLocalOwnerTermination");
+		try {
+			await recovery.listWorkspaceBarriers();
+			expect(prove).not.toHaveBeenCalled();
+			await expect(
+				recovery.observeWorkspaceBarrier(scope.id, undefined, leaseId),
+			).rejects.toMatchObject({ statusCode: 409 });
+			expect(prove).toHaveBeenCalledTimes(1);
+			expect(record).not.toHaveBeenCalled();
+			expect(
+				db
+					.select()
+					.from(workspaceWriteLeases)
+					.where(eq(workspaceWriteLeases.leaseId, leaseId))
+					.get()?.executionEndedAt,
+			).toBeNull();
+		} finally {
+			prove.mockRestore();
+			record.mockRestore();
+		}
+	});
+
+	test("maintenance commit rechecks administrator, physical observations and independent root barriers", async () => {
+		const { effect } = await dispatchedEffect("attested.txt", ABSENT, blobState(hash("x"), 1));
+		const leaseId = durableBarrier(effect);
+		db.update(workspaceWriteLeases)
+			.set({ executionEndedAt: null, ownerEpoch: "legacy-random" })
+			.where(eq(workspaceWriteLeases.leaseId, leaseId))
+			.run();
+		db.update(fileChangeScopes)
+			.set({
+				status: "needs_verification",
+				activeLeaseId: "independent-bash",
+				activeLeaseEpoch: "old-bash",
+				activeMutationCount: 1,
+			})
+			.where(eq(fileChangeScopes.id, scope.id))
+			.run();
+		const permit = await recovery.beginWorkspaceMaintenance({
+			scopeId: scope.id,
+			leaseId,
+			adminUserId: USER_ID,
+			acknowledgeWritersStopped: true,
+			operatorReason: "Stopped all writers",
+		});
+		const input = {
+			scopeId: scope.id,
+			adminUserId: USER_ID,
+			maintenanceToken: permit.maintenanceToken,
+		};
+		let preview = await recovery.observeWorkspaceMaintenance(input);
+		const commit = () =>
+			recovery.commitWorkspaceMaintenance({
+				...input,
+				confirmationToken: preview.confirmationToken,
+				acknowledgeInspected: true,
+				acknowledgements: preview.observations.map(({ effectId, verdict }) => ({
+					effectId,
+					verdict,
+				})),
+			});
+		db.update(users).set({ role: "user" }).where(eq(users.id, USER_ID)).run();
+		await expect(commit()).rejects.toMatchObject({ statusCode: 403 });
+		db.update(users).set({ role: "admin" }).where(eq(users.id, USER_ID)).run();
+		await writeFile(join(root, "attested.txt"), "foreign");
+		await expect(commit()).rejects.toMatchObject({ code: "OBSERVATION_CHANGED" });
+		expect(auditRows()).toEqual([]);
+		preview = await recovery.observeWorkspaceMaintenance(input);
+		const result = await commit();
+		expect(result.remaining).toMatchObject({ rootVerificationRequired: true, legacyBarrier: true });
+		expect(scopeRow()).toMatchObject({
+			activeLeaseId: "independent-bash",
+			status: "needs_verification",
+		});
+	});
+
+	test("maintenance capabilities do not survive service restart or accept a changed fence", async () => {
+		activate();
+		quarantine();
+		db.update(fileChangeScopes)
+			.set({ activeLeaseEpoch: "legacy-random" })
+			.where(eq(fileChangeScopes.id, scope.id))
+			.run();
+		const permit = await recovery.beginWorkspaceMaintenance({
+			scopeId: scope.id,
+			adminUserId: USER_ID,
+			acknowledgeWritersStopped: true,
+			operatorReason: "Stopped",
+		});
+		const input = {
+			scopeId: scope.id,
+			adminUserId: USER_ID,
+			maintenanceToken: permit.maintenanceToken,
+		};
+		const restarted = createWorkspaceScopeRecovery({
+			database: db,
+			getRuntime: async () => ({ coordinator, evidence: service }),
+			assertMaintenanceAuthority: () => {},
+		});
+		await expect(restarted.observeWorkspaceMaintenance(input)).rejects.toMatchObject({
+			code: "MAINTENANCE_INVALID",
+		});
+		db.update(fileChangeScopes)
+			.set({ fencingToken: 123 })
+			.where(eq(fileChangeScopes.id, scope.id))
+			.run();
+		await expect(recovery.observeWorkspaceMaintenance(input)).rejects.toThrow();
+		await recovery.cancelWorkspaceMaintenance(input);
+		expect(auditRows()).toEqual([]);
+	});
+
+	test("maintenance tokens bind administrator/scope, expire without renewal and leave barriers intact", async () => {
+		activate();
+		quarantine();
+		db.update(fileChangeScopes)
+			.set({ activeLeaseEpoch: "legacy-random" })
+			.where(eq(fileChangeScopes.id, scope.id))
+			.run();
+		const begin = () =>
+			recovery.beginWorkspaceMaintenance({
+				scopeId: scope.id,
+				adminUserId: USER_ID,
+				acknowledgeWritersStopped: true,
+				operatorReason: "Stopped",
+			});
+		const permit = await begin();
+		const input = {
+			scopeId: scope.id,
+			adminUserId: USER_ID,
+			maintenanceToken: permit.maintenanceToken,
+		};
+		await expect(
+			recovery.observeWorkspaceMaintenance({ ...input, adminUserId: "other-admin" }),
+		).rejects.toThrow();
+		await expect(
+			recovery.cancelWorkspaceMaintenance({ ...input, scopeId: "other-scope" }),
+		).rejects.toThrow();
+		clock += 300001;
+		await expect(recovery.observeWorkspaceMaintenance(input)).rejects.toMatchObject({
+			code: "MAINTENANCE_EXPIRED",
+		});
+		await Promise.resolve();
+		expect(scopeRow()?.activeLeaseId).toBe("dead-lease");
+		const next = await begin();
+		expect(next.maintenanceToken).not.toBe(permit.maintenanceToken);
+		await recovery.cancelWorkspaceMaintenance({
+			...input,
+			maintenanceToken: next.maintenanceToken,
+		});
+		expect(scopeRow()?.activeLeaseId).toBe("dead-lease");
+		expect(auditRows()).toEqual([]);
+	});
+
+	test("maintenance refuses registered unknown owners and rechecks authority before IO", async () => {
+		activate();
+		quarantine();
+		const epoch = generateId();
+		db.update(fileChangeScopes)
+			.set({ activeLeaseEpoch: epoch })
+			.where(eq(fileChangeScopes.id, scope.id))
+			.run();
+		db.insert(workspaceExecutionOwners)
+			.values({
+				ownerEpoch: epoch,
+				identityJson: {
+					version: 1,
+					pid: 42,
+					birth: "123456789",
+					domain: {
+						platform: "linux",
+						machine: "1234567890abcdef1234567890abcdef",
+						boot: "12345678-1234-1234-1234-123456789012",
+						pidNamespace: "pid:[123]",
+						timeNamespace: "time:[789]",
+					},
+				},
+				createdAt: new Date(clock).toISOString(),
+			})
+			.run();
+		try {
+			await expect(
+				recovery.beginWorkspaceMaintenance({
+					scopeId: scope.id,
+					adminUserId: USER_ID,
+					acknowledgeWritersStopped: true,
+					operatorReason: "Cannot override a registered owner",
+				}),
+			).rejects.toMatchObject({ code: "MAINTENANCE_OWNER_INELIGIBLE" });
+		} finally {
+			db.delete(workspaceExecutionOwners)
+				.where(eq(workspaceExecutionOwners.ownerEpoch, epoch))
+				.run();
+		}
+		let allowed = true;
+		const guarded = createWorkspaceScopeRecovery({
+			database: db,
+			getRuntime: async () => ({ coordinator, evidence: service }),
+			assertMaintenanceAuthority: () => {
+				if (!allowed) throw new Error("exclusive authority lost");
+			},
+		});
+		const permit = await guarded.beginWorkspaceMaintenance({
+			scopeId: scope.id,
+			adminUserId: USER_ID,
+			acknowledgeWritersStopped: true,
+			operatorReason: "Stopped",
+		});
+		allowed = false;
+		const input = {
+			scopeId: scope.id,
+			adminUserId: USER_ID,
+			maintenanceToken: permit.maintenanceToken,
+		};
+		await expect(guarded.observeWorkspaceMaintenance(input)).rejects.toThrow(
+			"exclusive authority lost",
+		);
+		await guarded.cancelWorkspaceMaintenance(input);
+		expect(auditRows()).toEqual([]);
+	});
+
+	test("an owner registration without identity still requires explicit administrator attestation", async () => {
+		activate();
+		quarantine();
+		const epoch = generateId();
+		db.update(fileChangeScopes)
+			.set({ activeLeaseEpoch: epoch })
+			.where(eq(fileChangeScopes.id, scope.id))
+			.run();
+		db.insert(workspaceExecutionOwners)
+			.values({ ownerEpoch: epoch, identityJson: null, createdAt: new Date(clock).toISOString() })
+			.run();
+		try {
+			await expect(recovery.observeWorkspaceBarrier(scope.id)).rejects.toMatchObject({
+				statusCode: 409,
+			});
+			const inventory = await recovery.listWorkspaceBarriers();
+			expect(inventory.items.find((item) => item.scope.id === scope.id)?.maintenanceRequired).toBe(
+				true,
+			);
+			const permit = await recovery.beginWorkspaceMaintenance({
+				scopeId: scope.id,
+				adminUserId: USER_ID,
+				acknowledgeWritersStopped: true,
+				operatorReason: "No stored identity; all old writers stopped",
+			});
+			await recovery.cancelWorkspaceMaintenance({
+				scopeId: scope.id,
+				adminUserId: USER_ID,
+				maintenanceToken: permit.maintenanceToken,
+			});
+			expect(auditRows()).toEqual([]);
+		} finally {
+			db.delete(workspaceExecutionOwners)
+				.where(eq(workspaceExecutionOwners.ownerEpoch, epoch))
+				.run();
+		}
+	});
+
+	test("maintenance cancellation joins in-flight reads before releasing its reservation", async () => {
+		const { effect } = await dispatchedEffect(
+			"cancel-maintenance.txt",
+			ABSENT,
+			blobState(hash("x"), 1),
+		);
+		await writeFile(join(root, "cancel-maintenance.txt"), "x");
+		const leaseId = durableBarrier(effect);
+		db.update(workspaceWriteLeases)
+			.set({ executionEndedAt: null, ownerEpoch: "legacy-random" })
+			.where(eq(workspaceWriteLeases.leaseId, leaseId))
+			.run();
+		const begin = () =>
+			recovery.beginWorkspaceMaintenance({
+				scopeId: scope.id,
+				leaseId,
+				adminUserId: USER_ID,
+				acknowledgeWritersStopped: true,
+				operatorReason: "Stopped",
+			});
+		const permit = await begin();
+		const input = {
+			scopeId: scope.id,
+			adminUserId: USER_ID,
+			maintenanceToken: permit.maintenanceToken,
+		};
+		let unblock!: () => void;
+		let started!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		const blocked = new Promise<void>((resolve) => {
+			unblock = resolve;
+		});
+		const original = fileChangeLocalIo.read.bind(fileChangeLocalIo);
+		const spy = spyOn(fileChangeLocalIo, "read").mockImplementation(async (...args) => {
+			started();
+			await blocked;
+			return original(...args);
+		});
+		try {
+			const observing = recovery
+				.observeWorkspaceMaintenance(input)
+				.catch((error: unknown) => error);
+			await entered;
+			let cancelled = false;
+			const cancelling = recovery.cancelWorkspaceMaintenance(input).then(() => {
+				cancelled = true;
+			});
+			await Promise.resolve();
+			expect(cancelled).toBe(false);
+			await expect(begin()).rejects.toThrow();
+			unblock();
+			expect(await observing).toBeInstanceOf(Error);
+			await cancelling;
+			expect(effectRow(effect.id)?.settlement).toBe("applying");
+			expect(auditRows()).toEqual([]);
+			const next = await begin();
+			await recovery.cancelWorkspaceMaintenance({
+				...input,
+				maintenanceToken: next.maintenanceToken,
+			});
+		} finally {
+			unblock();
+			spy.mockRestore();
+		}
+	});
+
 	test("unknown owner epoch is rejected before any observation or evidence mutation", async () => {
 		const { effect } = await dispatchedEffect("unknown.txt", ABSENT, blobState(hash("x"), 1));
 		const leaseId = durableBarrier(effect);
@@ -729,6 +1165,15 @@ describe("atomic lease recovery", () => {
 			async (lease) => {
 				await expect(
 					recovery.observeWorkspaceBarrier(scope.id, undefined, lease.leaseId),
+				).rejects.toMatchObject({ statusCode: 409 });
+				await expect(
+					recovery.beginWorkspaceMaintenance({
+						scopeId: scope.id,
+						leaseId: lease.leaseId,
+						adminUserId: USER_ID,
+						acknowledgeWritersStopped: true,
+						operatorReason: "An attestation cannot override live execution",
+					}),
 				).rejects.toMatchObject({ statusCode: 409 });
 				expect(effectRow(effect.id)).toEqual(before);
 				expect(auditRows()).toEqual([]);

@@ -678,7 +678,11 @@ describe("fail closed before writes and after uncertain IO", () => {
 		expect((await write(path, "new")).isError).toBe(true);
 		expect(await readFile(path, "utf8")).toBe("old");
 		expect(apply).not.toHaveBeenCalled();
-		expect(operations()[0].settlement).toBe("preparing");
+		expect(operations()[0]).toMatchObject({
+			settlement: "settled",
+			executionOutcome: "failed",
+			reason: "no_dispatch:validation_rejected",
+		});
 	});
 
 	test("attribution linkage admission failure also leaves target unchanged", async () => {
@@ -811,7 +815,7 @@ describe("fail closed before writes and after uncertain IO", () => {
 		expect(apply).toHaveBeenCalledTimes(1);
 	});
 
-	test("operation finish DB failure does not replace a frozen effect or report success", async () => {
+	test("operation finish DB failure rolls back effect receipt and lease settlement together", async () => {
 		const path = join(workspace, "finish.txt");
 		await writeFile(path, "old\n");
 		sqlite.exec(
@@ -821,11 +825,11 @@ describe("fail closed before writes and after uncertain IO", () => {
 		expect(result.isError).toBe(true);
 		expect(await readFile(path, "utf8")).toBe("new\n");
 		expect(effects()[0]).toMatchObject({
-			settlement: "settled",
-			attributionGrade: "measured",
-			linesAdded: 1,
-			linesRemoved: 1,
-			executionReceiptJson: { confirmed: true, outcome: "applied" },
+			settlement: "applying",
+			attributionGrade: "unknown",
+			linesAdded: null,
+			linesRemoved: null,
+			executionReceiptJson: null,
 		});
 		expect(operations()[0].executionOutcome).toBe("running");
 		expect(pendingScope()).toMatchObject({
@@ -1676,8 +1680,8 @@ describe("lazy namespace, coordination and cancellation", () => {
 		await writeFile(path, "one\n");
 		const evidence = new FileChangeEvidenceService(db);
 		const settle = evidence.settleEffect.bind(evidence);
-		spyOn(evidence, "settleEffect").mockImplementation((input) => {
-			const result = settle(input);
+		spyOn(evidence, "settleEffect").mockImplementation((input, tx) => {
+			const result = settle(input, tx);
 			const scope = pendingScope();
 			if (!scope) throw new Error("No granted scope");
 			const activity = runtime.coordinator.registerActivity({
@@ -1695,6 +1699,150 @@ describe("lazy namespace, coordination and cancellation", () => {
 			linesRemoved: 1,
 		});
 		expect(attributions()[0].attributionGrade).toBe("measured");
+	});
+
+	test("confirmed IO stays applied when cancellation interrupts the tool", async () => {
+		const path = join(workspace, "completed-cancel.txt");
+		await writeFile(path, "old\n");
+		const context = await callContext("Write", path);
+		const controller = new AbortController();
+		context.signal = controller.signal;
+		let count = 0;
+		io.apply = async (input) => {
+			count++;
+			const result = await fileChangeLocalIo.apply(input);
+			controller.abort(new Error("cancel after durable IO"));
+			return result;
+		};
+		expect((await write(path, "new\n", context)).isError).toBe(true);
+		expect(effects()[0]).toMatchObject({
+			settlement: "settled",
+			attributionGrade: "measured",
+			executionReceiptJson: { confirmed: true, outcome: "applied" },
+		});
+		expect(operations()[0]).toMatchObject({
+			settlement: "settled",
+			executionOutcome: "interrupted",
+		});
+		expect(db.select().from(schema.workspaceWriteLeases).get()).toMatchObject({
+			status: "settled",
+			mutationManifestJson: { mutations: [{ outcome: "applied" }] },
+		});
+		expect((await write(path, "new\n", context)).isError).toBe(true);
+		expect(count).toBe(1);
+	});
+
+	test("without blobs cancellation still settles confirmed IO and interrupts the tool", async () => {
+		await runtime.initialize();
+		await rm(join(privateRoot, "file-change-source.json"), { force: true });
+		db = database(sqlite);
+		runtime = makeRuntime();
+		const path = join(workspace, "no-blobs-cancel.txt");
+		await writeFile(path, "old");
+		const context = await callContext("Write", path);
+		const controller = new AbortController();
+		context.signal = controller.signal;
+		io.apply = async (input) => {
+			const result = await fileChangeLocalIo.apply(input);
+			controller.abort(new Error("cancel after durable IO"));
+			return result;
+		};
+		expect((await write(path, "new", context)).isError).toBe(true);
+		expect(await readFile(path, "utf8")).toBe("new");
+		expect(operations()[0].executionOutcome).toBe("interrupted");
+		expect(effects()).toHaveLength(0);
+		expect(db.select().from(schema.workspaceWriteLeases).get()).toMatchObject({
+			status: "settled",
+			executionClass: "local_file_io",
+			mutationManifestJson: { mutations: [{ outcome: "applied" }] },
+		});
+	});
+
+	test("cancellation during preparation commits no-dispatch and retains replay barrier", async () => {
+		const path = join(workspace, "prepare-cancel.txt");
+		await writeFile(path, "old");
+		const context = await callContext("Write", path);
+		const controller = new AbortController();
+		context.signal = controller.signal;
+		const evidence = new FileChangeEvidenceService(db);
+		const finalize = evidence.finalizePreparation.bind(evidence);
+		spyOn(evidence, "finalizePreparation").mockImplementation(async (...args) => {
+			const result = await finalize(...args);
+			controller.abort(new Error("cancel preparation"));
+			return result;
+		});
+		runtime = makeRuntime({ evidence });
+		const apply = spyOn(io, "apply");
+		expect((await write(path, "new", context)).isError).toBe(true);
+		expect(apply).not.toHaveBeenCalled();
+		expect(operations()[0]).toMatchObject({
+			settlement: "settled",
+			executionOutcome: "interrupted",
+			reason: "no_dispatch:cancelled_before_dispatch",
+		});
+		expect(effects()[0]).toMatchObject({ settlement: "settled", outcome: "no_change" });
+		expect(await readFile(path, "utf8")).toBe("old");
+		expect((await write(path, "new", context)).isError).toBe(true);
+		expect(apply).not.toHaveBeenCalled();
+	});
+
+	test("cancellation during a metadata retry interrupts only the operation, not its applied receipt", async () => {
+		const path = join(workspace, "cancel-metadata.txt");
+		await writeFile(path, "old");
+		const context = await callContext("Write", path);
+		const controller = new AbortController();
+		context.signal = controller.signal;
+		const evidence = new FileChangeEvidenceService(db);
+		const finish = evidence.finishOperation.bind(evidence);
+		let attempts = 0;
+		spyOn(evidence, "finishOperation").mockImplementation((...args) => {
+			if (++attempts === 1) {
+				controller.abort(new Error("cancel while metadata busy"));
+				throw Object.assign(new Error("busy"), { code: "SQLITE_BUSY" });
+			}
+			return finish(...args);
+		});
+		runtime = makeRuntime({ evidence });
+		const apply = spyOn(io, "apply");
+		expect((await write(path, "new", context)).isError).toBe(true);
+		expect(attempts).toBe(2);
+		expect(apply).toHaveBeenCalledTimes(1);
+		expect(operations()[0].executionOutcome).toBe("interrupted");
+		expect(effects()[0]).toMatchObject({
+			settlement: "settled",
+			executionReceiptJson: { confirmed: true, outcome: "applied" },
+		});
+	});
+
+	test.each([
+		"SQLITE_BUSY",
+		"SQLITE_LOCKED",
+		"SQLITE_CONSTRAINT",
+	])("settlement retries only transient metadata errors %s without IO replay", async (code) => {
+		const path = join(workspace, "metadata-retry.txt");
+		await writeFile(path, "old");
+		const evidence = new FileChangeEvidenceService(db);
+		const finish = evidence.finishOperation.bind(evidence);
+		let attempts = 0;
+		spyOn(evidence, "finishOperation").mockImplementation((...args) => {
+			attempts++;
+			if (attempts <= 3) throw Object.assign(new Error("injected metadata failure"), { code });
+			return finish(...args);
+		});
+		runtime = makeRuntime({ evidence });
+		const apply = spyOn(io, "apply");
+		const result = await write(path, "new");
+		expect(apply).toHaveBeenCalledTimes(1);
+		expect(await readFile(path, "utf8")).toBe("new");
+		expect(attempts).toBe(code === "SQLITE_CONSTRAINT" ? 1 : 4);
+		if (code === "SQLITE_CONSTRAINT") {
+			expect(result.isError).toBe(true);
+			expect(effects()[0].executionReceiptJson).toBeNull();
+		} else {
+			expect(result.isError).toBeUndefined();
+			expect(effects()[0].settlement).toBe("settled");
+			expect(operations()[0].executionOutcome).toBe("succeeded");
+		}
 	});
 
 	test("cancellation after a real partial dispatch settles unknown, never retries matching bytes", async () => {

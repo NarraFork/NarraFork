@@ -1,5 +1,14 @@
 {
 	"title": "设置",
+	"workspaceMaintenanceExplanation": "该旧所有者没有可核验的进程身份。维护将保留整个工作区五分钟且不可续期。请先停止旧实例和所有可能存活的外部写入进程。管理员声明不等于执行已结束的证明；当前文件观测也不能还原历史执行成功与否。",
+	"workspaceMaintenanceWritersStopped": "我已停止全部旧实例以及可能存活的外部写入进程。",
+	"workspaceMaintenanceReason": "维护原因与已完成的检查",
+	"workspaceMaintenanceBegin": "开始管理员维护",
+	"workspaceMaintenanceActive": "整个工作区已保留至 {{expiresAt}}。提交前需重新观测并确认。取消或到期只释放此次维护保留，不会清除原有屏障。",
+	"workspaceMaintenanceCancel": "取消维护",
+	"workspaceBarriersRemaining": "所选屏障已恢复，但仍有其他租约、根目录验证或外部活动屏障，工作区尚未完全解除隔离。",
+	"workspaceBarriersRetryPersistence": "重试恢复元数据",
+	"workspaceBarriersRetryPersistenceDone": "元数据重试已完成，剩余屏障已刷新。",
 	"catalog": {
 		"title": "模型目录",
 		"description": "公共参考元数据与逐字段本地覆盖。存在资料不代表模型可调用。",
@@ -957,7 +966,7 @@
 	"defaultNarratorWriteAudienceProject": "项目可操作成员",
 	"defaultNarratorWriteAudiencePublic": "所有符合项目访问条件的登录用户",
 	"defaultStartInPlanMode": "新叙述者默认进入计划模式",
-	"defaultStartInPlanModeDesc": "为新建叙述者默认启用计划模式 trait。权限模式仍是独立的安全策略。",
+	"defaultStartInPlanModeDesc": "为新建叙述者默认启用计划模式 trait。可在新建对话框中按次覆盖。权限模式仍是独立的安全策略。",
 	"defaultRelaxedPlan": "默认宽松规划",
 	"defaultRelaxedPlanDesc": "启用后，新叙述者默认开启宽松规划模式。宽松规划模式下，规划时工具仍然可用，不会被禁用。",
 	"planModeAllowInlinePlan": "允许内联计划",

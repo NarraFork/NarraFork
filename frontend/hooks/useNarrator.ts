@@ -825,6 +825,7 @@ export function useCreateNarrator() {
 			model?: string;
 			systemPrompt?: string;
 			permissionMode?: string;
+			startInPlanMode?: boolean;
 			reasoningEffort?: string | null;
 			fastModeOverride?: "inherit" | "on" | "off";
 			relaxedPlan?: boolean;

@@ -53,7 +53,18 @@ function render(node: React.ReactNode): Element {
 
 interface RowInput {
 	status?: string;
-	timing?: { createdAt?: number; completedAt?: number; durationMs?: number };
+	timing?: {
+		createdAt?: number;
+		executionStartedAt?: number;
+		completedAt?: number;
+		durationMs?: number;
+	};
+	/** An earlier same-turn call still owns the execution slot (shimmer/mark input). */
+	queuedBehindUpstream?: boolean;
+	/** A live reflection gate on this call. */
+	reflectionStatus?: string;
+	/** The figure the row should paint when it differs from `timing.durationMs`. */
+	displayDurationMs?: number;
 }
 
 function trace(rows: RowInput[]): Element {
@@ -167,6 +178,104 @@ describe("a folded trace row paints its duration", () => {
 		// A header can legitimately arrive with no timing at all; inventing a "0s" there
 		// would read as a real measurement.
 		expect(rowText(trace([{ status: "success" }]))).not.toMatch(/\d+\s*(ms|s)\b/);
+	});
+
+	it("paints `displayDurationMs` in preference to the full attributed span", async () => {
+		// For bash, `timing.durationMs` absorbs permission / reflection / queue waiting,
+		// so a 1.2s command that waited 19s on a gate reported 20s. The row must show
+		// the same figure the expanded card does — see the duration-parity test.
+		const text = rowText(
+			trace([
+				{
+					status: "success",
+					timing: { createdAt: 0, completedAt: 20_000, durationMs: 20_000 },
+					displayDurationMs: 1_200,
+				},
+			]),
+		);
+		// `formatDurationText`'s default style floors to whole seconds, so 1200ms reads
+		// as "1s". The assertion that matters is that 20s is GONE.
+		expect(text).toContain("1s");
+		expect(text).not.toContain("20s");
+	});
+});
+
+describe("a row that has not executed says nothing about elapsed time", () => {
+	// THE BUG: three Bash calls queued behind a danger-reflection gate each showed a
+	// ticking counter (17s / 12s / 11s) plus a spinning blue loader. None had run for
+	// a millisecond — the counter was measuring from the moment the model began
+	// writing their arguments, and the spinner was claiming work was under way.
+
+	it("draws a static clock for a QUEUED row, never a spinner", async () => {
+		const root = trace([{ status: "initializing", queuedBehindUpstream: true }]);
+		const slot = statusSlots(root)[0] as Element;
+		expect(glyphName(slot)).toBe("clock");
+		expect(glyphName(slot)).not.toBe("loader-2");
+		// The spin class is the actual motion; a static glyph with it would still move.
+		expect(String(slot.querySelector("svg")?.getAttribute("class") ?? "")).not.toContain(
+			"vlist-spin",
+		);
+	});
+
+	it("shows NO elapsed counter on a queued row", async () => {
+		// `createdAt` 30s ago with no execution stamp: the old code rendered "30s".
+		const text = rowText(
+			trace([
+				{
+					status: "initializing",
+					queuedBehindUpstream: true,
+					timing: { createdAt: Date.now() - 30_000 },
+				},
+			]),
+		);
+		expect(text).not.toMatch(/\d+\s*(ms|s)\b/);
+	});
+
+	it("draws a static pause glyph for a row awaiting a decision", async () => {
+		// `pending` means a person is being waited on at every write site. It used to
+		// spin here, while the card beside it drew a YELLOW spinner and the shimmer
+		// drew nothing — three surfaces, three answers.
+		const slot = statusSlots(trace([{ status: "pending" }]))[0] as Element;
+		expect(glyphName(slot)).toBe("player-pause");
+		expect(String(slot.querySelector("svg")?.getAttribute("class") ?? "")).not.toContain(
+			"vlist-spin",
+		);
+	});
+
+	it("marks a row whose reflection gate is deliberating as awaiting", async () => {
+		const slot = statusSlots(trace([{ status: "running", reflectionStatus: "running" }]))[0];
+		expect(glyphName(slot as Element)).toBe("player-pause");
+	});
+
+	it("KEEPS the spinner and the counter for a genuinely running row", async () => {
+		// The other half of the fix: this is not "stop spinning". A call that really is
+		// executing must still say so, or the change has removed the signal instead of
+		// correcting it.
+		const root = trace([
+			{ status: "running", timing: { createdAt: 0, executionStartedAt: Date.now() - 5_000 } },
+		]);
+		const slot = statusSlots(root)[0] as Element;
+		expect(glyphName(slot)).toBe("loader-2");
+		expect(String(slot.querySelector("svg")?.getAttribute("class") ?? "")).toContain("vlist-spin");
+		expect(rowText(root)).toMatch(/\d+\s*s\b/);
+	});
+
+	it("counts a running row's elapsed time from EXECUTION, not from stream start", async () => {
+		// A call admitted after a 60s gate wait must start its counter near zero, not
+		// jump straight to 60s — that number describes waiting, not the tool's work.
+		const now = Date.now();
+		const text = rowText(
+			trace([
+				{
+					status: "running",
+					timing: { createdAt: now - 60_000, executionStartedAt: now - 2_000 },
+				},
+			]),
+		);
+		expect(text).not.toContain("60s");
+		// Anchored at the END of the row text: the title itself ends in `.ts`, so a
+		// `\b`-delimited pattern matches inside it and passes vacuously.
+		expect(text).toMatch(/[12]s$/);
 	});
 });
 

@@ -83,8 +83,9 @@ import { activateOnKey, swallowSelectionClick } from "./key-activate";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { CATEGORY_COLOR, ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
 import {
-	hasToolRowStatusMark,
 	isTerminalToolRowStatus,
+	resolveToolRowStatusMark,
+	type ToolRowStatusMark,
 	TRACE_ROW_STATUS_SLOT_STYLE,
 	TraceRowStatusGlyph,
 } from "./trace-row-status";
@@ -144,6 +145,14 @@ export interface TraceRenderLabels {
 	 * geometry.
 	 */
 	shimmerState?: Partial<Record<ToolShimmerKind, string>>;
+	/**
+	 * One name per status MARK, for readers who do not get the glyph's colour or
+	 * shape. Distinct from `shimmerState` on purpose: shimmer is silent for two of
+	 * the states a mark does report (`pending` gets no sweep at all), so a row
+	 * awaiting a decision would otherwise have no accessible name anywhere.
+	 * Attributes only — height-neutral.
+	 */
+	statusMark?: Partial<Record<ToolRowStatusMark, string>>;
 }
 
 /** English names for the shimmer states, used when no labels are injected. */
@@ -401,6 +410,7 @@ export function RenderToolRun({
 					closing={closingRowKeys?.has(row.key) === true}
 					timingLabels={labels.timing}
 					shimmerStateLabels={labels.shimmerState}
+					statusMarkLabels={labels.statusMark}
 					liveTail={rowLiveTails?.get(row.key)}
 					liveTailChars={labels.liveTailChars}
 					// Only the row still being written may fade. `row.shimmer` is the
@@ -715,6 +725,7 @@ function TraceRowView({
 	closing = false,
 	timingLabels,
 	shimmerStateLabels,
+	statusMarkLabels,
 	liveTail,
 	liveTailChars,
 	animateStreaming,
@@ -730,6 +741,7 @@ function TraceRowView({
 	closing?: boolean;
 	timingLabels?: ToolTimingLabels;
 	shimmerStateLabels?: TraceRenderLabels["shimmerState"];
+	statusMarkLabels?: TraceRenderLabels["statusMark"];
 	liveTail?: { charCount: number; tail: string };
 	liveTailChars?: (formatted: string) => string;
 	/** This row is the live one AND the fade is enabled (see RenderToolRunProps). */
@@ -768,6 +780,13 @@ function TraceRowView({
 	// ONE call per row, deliberately above both label branches — see the module header
 	// on why calling it inside each branch loses a transition.
 	const shimmerKind = useTraceRowShimmerKind(row);
+	// The row's status mark, resolved ONCE from the same two facts the shimmer above
+	// reads. Passing them here is what stops a parked call from spinning beside text
+	// that says it is waiting (see `@shared/tool-row-status`).
+	const statusMark = resolveToolRowStatusMark(row.status, {
+		queuedBehindUpstream: row.queuedBehindUpstream,
+		reflectionStatus: row.reflectionStatus ?? null,
+	});
 	const shimmerClass = shimmerKind ? TRACE_SHIMMER_CLASS[shimmerKind] : undefined;
 	const shimmerLabel = shimmerStateLabel(shimmerKind, shimmerStateLabels);
 	const icon = row.hasIcon ? (rowIcon?.(row) ?? <DefaultRowIcon row={row} />) : null;
@@ -861,16 +880,30 @@ function TraceRowView({
 			    duration beside it (fixed line, nowrap, height-neutral). Before the
 			    status so it stays adjacent to the path it describes. */}
 			<DiffStatsText stats={row.diffStats} />
-			{hasToolRowStatusMark(row.status) ? (
+			{statusMark ? (
 				<Box data-testid="trace-row-status-slot" style={TRACE_ROW_STATUS_SLOT_STYLE}>
-					<TraceRowStatusGlyph status={row.status} />
+					<TraceRowStatusGlyph mark={statusMark} labels={statusMarkLabels} />
 				</Box>
 			) : null}
+			{/* ⚠️ `running` is narrowed past "not terminal": a QUEUED or AWAITING row has
+			    not executed for a single millisecond, and an elapsed counter there
+			    measures from the moment the model began writing the call's arguments —
+			    a row that had never run showed "17s", which reads as time the tool
+			    spent working. With `running` false and no final duration yet, the whole
+			    timing text is omitted (see `TimingText`), which is the honest output.
+
+			    Narrowed HERE rather than in `isTerminalToolRowStatus`: that predicate
+			    also gates the card's timeout editor, and a call awaiting approval must
+			    keep it. */}
 			{row.timing ? (
 				<ToolTimingArea
-					running={!isTerminalToolRowStatus(row.status)}
+					running={
+						!isTerminalToolRowStatus(row.status) &&
+						statusMark !== "queued" &&
+						statusMark !== "awaiting"
+					}
 					startedAt={row.timing.startedAt ?? row.timing.createdAt}
-					durationMs={row.timing.durationMs}
+					durationMs={row.displayDurationMs ?? row.timing.durationMs}
 					timing={row.timing}
 					labels={timingLabels}
 				/>

@@ -4,7 +4,6 @@ import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-sou
 import { outputToText } from "@shared/agent-protocol/tool-output";
 import { modelTextFromContentBlocks } from "@shared/native-injection";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
-import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import { mapGenericReasoningEffort } from "@shared/reasoning-effort-support";
 import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
@@ -58,6 +57,12 @@ import {
 	mapDeepSeekEffort,
 	type ResolvedToolDefinition,
 } from "./types";
+import {
+	omitUnsupportedParameters,
+	parseUnsupportedParameter,
+	stripUnsupportedParameter,
+	withUnsupportedParameterFallback,
+} from "./unsupported-parameter-fallback";
 
 export type OpenAIApiMode = "responses" | "completions" | "codex";
 
@@ -76,6 +81,7 @@ export function applyOpenAIModelMetadata(
 		delete body.reasoning_effort;
 		delete body.thinking;
 	}
+	omitUnsupportedParameters(body, model);
 	if (
 		metadata.reasoning?.mode === "fixed" &&
 		body.reasoning &&
@@ -220,28 +226,12 @@ export function appendCodexNativeTools(
 	applyCodexImageGenerationDefaults(tools);
 }
 
-/**
- * Fallback reasoning tiers when the effective metadata has no declared levels.
- * Most codex models expose low..xhigh but no
- * "max" tier, so an unknown model clamps "max" down to "xhigh".
- */
-const DEFAULT_CODEX_REASONING_LEVELS: readonly ReasoningEffort[] = [
-	"low",
-	"medium",
-	"high",
-	"xhigh",
-];
-
+/** Declared catalog tiers constrain requests; unknown models keep the selected effort. */
 export function normalizeCodexReasoningEffort(
 	model: string,
 	reasoningEffort: string | undefined,
 ): string | undefined {
-	const metadata = effectiveProviderMetadata(model);
-	const effort = resolveMetadataReasoning(metadata, reasoningEffort);
-	if (!effort) return undefined;
-	if (metadata.reasoning?.levels?.length || metadata.reasoning?.canDisable != null) return effort;
-	if (effort === "none") return "none";
-	return clampReasoningEffort(effort as ReasoningEffort, DEFAULT_CODEX_REASONING_LEVELS);
+	return resolveMetadataReasoning(effectiveProviderMetadata(model), reasoningEffort);
 }
 
 /**
@@ -877,70 +867,109 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		applyOpenAIModelMetadata(body, params.model, this.apiMode, params.maxOutputTokens);
 		const requestHeaders = this.buildHeaders(apiKey, params.conversationId);
-		params.requestDump?.beginResponseAttempt(
-			{
-				transport: "http",
-				url: endpoint,
-				headers: sanitizeHeaders(requestHeaders),
-				body,
-			},
-			settings.agent?.requestDumpMaxSize,
-		);
 
-		const bodyText = JSON.stringify(body);
-		params.onRequestStart?.();
-		const response = await this.pfetch(endpoint, {
-			method: "POST",
-			headers: requestHeaders,
-			body: bodyText,
-			signal: params.signal,
-		}).catch((error) => {
-			params.requestDump?.setResponseError(error);
-			params.requestDump?.finishResponseCapture(false);
-			throw error;
-		});
+		// One strip-and-retry for endpoints that reject an optional request field
+		// (observed: NUG Responses relays refusing `max_output_tokens`). Only safe
+		// before any stream event has been yielded — after that the consumer has
+		// already seen partial output and a silent re-send would duplicate it.
+		for (let attempt = 0; ; attempt++) {
+			params.requestDump?.beginResponseAttempt(
+				{
+					transport: "http",
+					url: endpoint,
+					headers: sanitizeHeaders(requestHeaders),
+					body,
+				},
+				settings.agent?.requestDumpMaxSize,
+			);
 
-		params.requestDump?.setResponseMeta({
-			status: response.status,
-			headers: sanitizeHeaders(response.headers),
-		});
+			const bodyText = JSON.stringify(body);
+			params.onRequestStart?.();
+			const response = await this.pfetch(endpoint, {
+				method: "POST",
+				headers: requestHeaders,
+				body: bodyText,
+				signal: params.signal,
+			}).catch((error) => {
+				params.requestDump?.setResponseError(error);
+				params.requestDump?.finishResponseCapture(false);
+				if (attempt === 0 && stripUnsupportedParameter(body, params.model, error)) return null;
+				throw error;
+			});
+			if (!response) continue;
 
-		if (!response.body) {
-			const error = response.ok
-				? new Error("OpenAI API returned no body")
-				: createOpenAIApiError(response, "");
-			params.requestDump?.setResponseError(error);
-			params.requestDump?.finishResponseCapture(false);
-			throw error;
-		}
-		const capture = captureResponseStream(response.body, params.requestDump);
-		try {
-			if (!response.ok) {
-				const errorCapture = new BoundedUtf8Capture();
-				const reader = capture.stream.getReader();
-				try {
-					while (errorCapture.received < errorCapture.limit) {
-						const { done, value } = await readWithTimeout(reader);
-						if (done) break;
-						errorCapture.append(value);
+			params.requestDump?.setResponseMeta({
+				status: response.status,
+				headers: sanitizeHeaders(response.headers),
+			});
+
+			if (!response.body) {
+				const error = response.ok
+					? new Error("OpenAI API returned no body")
+					: createOpenAIApiError(response, "");
+				params.requestDump?.setResponseError(error);
+				params.requestDump?.finishResponseCapture(false);
+				if (attempt === 0 && stripUnsupportedParameter(body, params.model, error)) continue;
+				throw error;
+			}
+			const capture = captureResponseStream(response.body, params.requestDump);
+			let yieldedEvent = false;
+			try {
+				if (!response.ok) {
+					const errorCapture = new BoundedUtf8Capture();
+					const reader = capture.stream.getReader();
+					try {
+						while (errorCapture.received < errorCapture.limit) {
+							const { done, value } = await readWithTimeout(reader);
+							if (done) break;
+							errorCapture.append(value);
+						}
+					} finally {
+						void reader.cancel().catch(() => {});
 					}
-				} finally {
-					void reader.cancel().catch(() => {});
+					const error = createOpenAIApiError(response, errorCapture.text());
+					if (attempt === 0 && stripUnsupportedParameter(body, params.model, error)) continue;
+					throw error;
 				}
-				throw createOpenAIApiError(response, errorCapture.text());
-			}
-			if (usesResponsesEndpoint(this.apiMode)) {
-				for await (const evt of _parseResponsesAPIStream(capture.stream)) {
-					yield stampReasoningSource(evt, this.getActiveReasoningSource());
+				if (usesResponsesEndpoint(this.apiMode)) {
+					for await (const evt of _parseResponsesAPIStream(capture.stream)) {
+						// A field-rejection can arrive as HTTP 200 + SSE error. Throw before
+						// any consumer-visible event so the outer strip-and-retry can run;
+						// after content starts, a silent re-send would duplicate output.
+						if (
+							!yieldedEvent &&
+							evt.invalidState &&
+							parseUnsupportedParameter(evt.invalidState.message)
+						) {
+							throw new ProviderInvalidStateError(
+								evt.invalidState.reason,
+								evt.invalidState.message,
+								{ diagnostics: evt.invalidState.diagnostics },
+							);
+						}
+						yieldedEvent = true;
+						yield stampReasoningSource(evt, this.getActiveReasoningSource());
+					}
+				} else {
+					for await (const evt of this.parseSSEStreamWithDetection(capture.stream)) {
+						yieldedEvent = true;
+						yield evt;
+					}
 				}
-			} else {
-				yield* this.parseSSEStreamWithDetection(capture.stream);
+				return;
+			} catch (error) {
+				params.requestDump?.setResponseError(error);
+				if (
+					attempt === 0 &&
+					!yieldedEvent &&
+					stripUnsupportedParameter(body, params.model, error)
+				) {
+					continue;
+				}
+				throw error;
+			} finally {
+				capture.finish();
 			}
-		} catch (error) {
-			params.requestDump?.setResponseError(error);
-			throw error;
-		} finally {
-			capture.finish();
 		}
 	}
 
@@ -1158,13 +1187,15 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 			applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
 			const conversationId = codexIdentity?.conversationId;
-			return this.requestResponsesTextWithMeta(
-				baseUrl,
-				apiKey,
-				body,
-				options?.signal,
-				options,
-				conversationId,
+			return withUnsupportedParameterFallback(model, body, (retryBody) =>
+				this.requestResponsesTextWithMeta(
+					baseUrl,
+					apiKey,
+					retryBody,
+					options?.signal,
+					options,
+					conversationId,
+				),
 			);
 		}
 
@@ -1182,7 +1213,9 @@ export class OpenAIProvider implements ProviderAdapter {
 		};
 		applyGenerateReasoningOptions(body, this.apiMode, model, options);
 		applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
-		return this.requestChatCompletionsTextWithMeta(baseUrl, apiKey, body, options?.signal, options);
+		return withUnsupportedParameterFallback(model, body, (retryBody) =>
+			this.requestChatCompletionsTextWithMeta(baseUrl, apiKey, retryBody, options?.signal, options),
+		);
 	}
 
 	async generateWithHistory(
@@ -1239,13 +1272,15 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 			applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
 			const conversationId = codexIdentity?.conversationId;
-			return this.requestResponsesTextWithMeta(
-				baseUrl,
-				apiKey,
-				body,
-				options?.signal,
-				options,
-				conversationId,
+			return withUnsupportedParameterFallback(model, body, (retryBody) =>
+				this.requestResponsesTextWithMeta(
+					baseUrl,
+					apiKey,
+					retryBody,
+					options?.signal,
+					options,
+					conversationId,
+				),
 			);
 		}
 
@@ -1261,7 +1296,9 @@ export class OpenAIProvider implements ProviderAdapter {
 		};
 		applyGenerateReasoningOptions(body, this.apiMode, model, options);
 		applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
-		return this.requestChatCompletionsTextWithMeta(baseUrl, apiKey, body, options?.signal, options);
+		return withUnsupportedParameterFallback(model, body, (retryBody) =>
+			this.requestChatCompletionsTextWithMeta(baseUrl, apiKey, retryBody, options?.signal, options),
+		);
 	}
 
 	private async requestResponsesTextWithMeta(
@@ -1683,6 +1720,11 @@ function extractApiErrorMessage(rawBody: string): string {
 		const json = JSON.parse(rawBody);
 		// Standard OpenAI error format: { error: { message, type, code } }
 		if (json?.error?.message) return json.error.message;
+		// FastAPI-style gateways: { detail: "Unsupported parameter: ..." }
+		if (typeof json?.detail === "string" && json.detail) return json.detail;
+		if (json?.detail != null && typeof json.detail === "object") {
+			return JSON.stringify(json.detail);
+		}
 		// Some providers use a flat format: { message, type, code }
 		if (json?.message) return json.message;
 	} catch {

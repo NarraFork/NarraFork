@@ -300,6 +300,9 @@ function fakeRollbackLease(
 		registerMutation: () => {},
 		assertMutationPending: () => {},
 		settle: () => {},
+		settleWith: () => {
+			throw new Error("Native atomic settlement is not used by this rollback fixture");
+		},
 		markUncertain: () => {},
 	};
 }

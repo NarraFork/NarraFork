@@ -1,5 +1,14 @@
 {
 	"title": "Settings",
+	"workspaceMaintenanceExplanation": "This legacy owner has no verifiable process identity. Maintenance reserves the entire workspace for five minutes without renewal. You must stop old instances and any external writer first. Your attestation is not proof that execution ended; current-file observations cannot reconstruct historical success.",
+	"workspaceMaintenanceWritersStopped": "I have stopped all old instances and potentially surviving external write processes.",
+	"workspaceMaintenanceReason": "Maintenance reason and checks performed",
+	"workspaceMaintenanceBegin": "Begin administrator maintenance",
+	"workspaceMaintenanceActive": "The entire workspace is reserved until {{expiresAt}}. Observe and confirm again before committing. Cancellation or expiry removes only this reservation, not the original barriers.",
+	"workspaceMaintenanceCancel": "Cancel maintenance",
+	"workspaceBarriersRemaining": "The selected barrier was recovered. Other lease, root verification, or external-activity barriers remain; the workspace is not fully released.",
+	"workspaceBarriersRetryPersistence": "Retry recovery metadata",
+	"workspaceBarriersRetryPersistenceDone": "Metadata retry completed; remaining barriers have been refreshed.",
 	"catalog": {
 		"title": "Model catalog",
 		"description": "Shared reference metadata with local, per-field overrides. A card does not make a model callable.",
@@ -955,7 +964,7 @@
 	"defaultNarratorWriteAudienceProject": "Project members with write access",
 	"defaultNarratorWriteAudiencePublic": "All signed-in users with project access",
 	"defaultStartInPlanMode": "Start new narrators in plan mode",
-	"defaultStartInPlanModeDesc": "Enable the plan-mode trait by default for new narrators. Permission mode remains a separate safety policy.",
+	"defaultStartInPlanModeDesc": "Enable the plan-mode trait by default for new narrators. Overridable per narrator in the create dialog. Permission mode remains a separate safety policy.",
 	"defaultRelaxedPlan": "Default Relaxed Plan",
 	"defaultRelaxedPlanDesc": "Enable relaxed plan mode by default for new narrators. In relaxed plan mode, tools remain available while planning instead of being disabled.",
 	"planModeAllowInlinePlan": "Allow inline plans",

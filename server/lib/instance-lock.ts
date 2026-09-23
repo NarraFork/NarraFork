@@ -3,17 +3,28 @@ import { randomUUID } from "node:crypto";
 import {
 	closeSync,
 	existsSync,
+	ftruncateSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
+	readSync,
 	renameSync,
 	statSync,
 	unlinkSync,
 	writeFileSync,
+	writeSync,
 } from "node:fs";
 import { hostname, uptime } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { logger } from "./logger";
+import {
+	isWorkspaceProcessIdentity,
+	observeWorkspaceProcess,
+	sameWorkspaceProcessDomain,
+	type WorkspaceProcessIdentity,
+	type WorkspaceProcessObservation,
+	workspaceProcessEndReason,
+} from "./workspace-process-identity";
 
 /**
  * Single-instance guard for the NarraFork data directory.
@@ -84,12 +95,27 @@ interface InstanceLockPayload {
 	/** Diagnostics only — deliberately NOT part of any decision (see classifyLockHolder). */
 	hostname: string;
 	uid: number | null;
+	/** Written only after asynchronous startup identity registration, never guessed from v1/v2. */
+	maintenanceIdentity?: WorkspaceProcessIdentity;
+	/** Propagates exclusive provenance: an unsafe takeover must not become trusted next boot. */
+	maintenanceQualified?: boolean;
 }
 
 interface InstanceLockState {
 	path: string | null;
 	token: string | null;
 	acquired: boolean;
+	/** Separate from startup's deliberately fail-open policy. Missing (old hot state) is unsafe. */
+	maintenancePath?:
+		| "fresh"
+		| "pending_reclaim"
+		| "verified_reclaim"
+		| "override"
+		| "unverified_reuse"
+		| "cleared_lock"
+		| "lost_token";
+	/** Immutable snapshot of the actual cleared owner, not a stale-verdict string. */
+	maintenancePredecessor?: WorkspaceProcessIdentity;
 }
 
 /** What we could observe about a pid right now. Three states, never a bare boolean. */
@@ -579,9 +605,22 @@ function clearLockForRetry(path: string, expected: InstanceLockPayload | null): 
 	return true;
 }
 
-function readLockPayload(path: string): InstanceLockPayload | null {
+function readLockPayload(path: string, bounded = false): InstanceLockPayload | null {
 	try {
-		const raw = readFileSync(path, "utf8").trim();
+		let raw: string;
+		if (bounded) {
+			const fd = openSync(path, "r");
+			try {
+				const bytes = Buffer.alloc(PID_CHECK_MAX_BUFFER + 1);
+				const size = readSync(fd, bytes, 0, bytes.length, 0);
+				if (size > PID_CHECK_MAX_BUFFER) return null;
+				raw = bytes.subarray(0, size).toString("utf8").trim();
+			} finally {
+				closeSync(fd);
+			}
+		} else {
+			raw = readFileSync(path, "utf8").trim();
+		}
 		if (!raw) return null;
 		const payload = JSON.parse(raw) as Partial<InstanceLockPayload>;
 		if (typeof payload.pid !== "number" || typeof payload.token !== "string") return null;
@@ -600,6 +639,10 @@ function readLockPayload(path: string): InstanceLockPayload | null {
 			execPath: String(payload.execPath ?? ""),
 			hostname: String(payload.hostname ?? ""),
 			uid: typeof payload.uid === "number" ? payload.uid : null,
+			maintenanceIdentity: isWorkspaceProcessIdentity(payload.maintenanceIdentity)
+				? payload.maintenanceIdentity
+				: undefined,
+			maintenanceQualified: payload.maintenanceQualified === true,
 		};
 	} catch {
 		return null;
@@ -784,6 +827,7 @@ function describeHolder(payload: InstanceLockPayload): Record<string, unknown> {
 
 export function acquireInstanceLock(dbPath: string): void {
 	if (process.env[ALLOW_MULTIPLE_ENV] === "1") {
+		lockState().maintenancePath = "override";
 		logger.warn("NarraFork instance lock bypassed by environment override", {
 			env: ALLOW_MULTIPLE_ENV,
 			dbPath,
@@ -793,10 +837,15 @@ export function acquireInstanceLock(dbPath: string): void {
 
 	const path = getInstanceLockPath(dbPath);
 	const state = lockState();
+	if (process.env[FORCE_UNLOCK_ENV] === "1") state.maintenancePath = "override";
 	if (state.acquired && state.path === path) return;
 
 	mkdirSync(dirname(path), { recursive: true });
 	const forceUnlock = process.env[FORCE_UNLOCK_ENV] === "1";
+	let maintenancePath: InstanceLockState["maintenancePath"] = forceUnlock
+		? "override"
+		: (state.maintenancePath ?? "fresh");
+	let maintenancePredecessor: WorkspaceProcessIdentity | undefined;
 
 	// Budget: one pass to claim a free lock, one more after clearing a lock we proved stale, plus a
 	// small allowance for passes that decided nothing because a competitor changed the file first.
@@ -811,6 +860,8 @@ export function acquireInstanceLock(dbPath: string): void {
 			state.path = path;
 			state.token = token;
 			state.acquired = true;
+			state.maintenancePath = maintenancePath;
+			state.maintenancePredecessor = maintenancePredecessor;
 			logger.info("NarraFork instance lock acquired", { path, pid: process.pid, dbPath });
 			return;
 		} catch (err) {
@@ -825,6 +876,7 @@ export function acquireInstanceLock(dbPath: string): void {
 			state.path = path;
 			state.token = existing.token;
 			state.acquired = true;
+			state.maintenancePath = maintenancePath === "override" ? "override" : "unverified_reuse";
 			logger.info("Reusing NarraFork instance lock for current process", {
 				path,
 				pid: process.pid,
@@ -876,7 +928,17 @@ export function acquireInstanceLock(dbPath: string): void {
 			});
 		}
 
+		// Startup's verdict never grants authority. Save an exact, qualified predecessor only
+		// for later asynchronous OS verification; unknown/force/contention remain rejected.
+		maintenancePredecessor =
+			maintenancePath === "fresh" && verdict.kind === "stale"
+				? captureMaintenancePredecessor(existing)
+				: undefined;
+		if (maintenancePath !== "override")
+			maintenancePath = maintenancePredecessor ? "pending_reclaim" : "cleared_lock";
 		if (!clearLockForRetry(path, existing)) {
+			maintenancePredecessor = undefined;
+			if (maintenancePath !== "override") maintenancePath = "cleared_lock";
 			// Someone else replaced the file between our read and our clear, so the verdict above
 			// describes a payload that is already gone. Re-classify what is there now instead of
 			// acting on it, and do not spend one of the two real attempts on a decision we skipped.
@@ -889,6 +951,184 @@ export function acquireInstanceLock(dbPath: string): void {
 	}
 
 	throw new Error(`Failed to acquire NarraFork instance lock at ${path}`);
+}
+
+function captureMaintenancePredecessor(
+	payload: InstanceLockPayload | null,
+): WorkspaceProcessIdentity | undefined {
+	const identity = payload?.maintenanceIdentity;
+	if (
+		!payload?.maintenanceQualified ||
+		!isWorkspaceProcessIdentity(identity) ||
+		identity.pid !== payload.pid
+	)
+		return undefined;
+	return Object.freeze({ ...identity, domain: Object.freeze({ ...identity.domain }) });
+}
+
+interface LockIdentityRegistrationDependencies {
+	state: InstanceLockState;
+	pid: number;
+	env: NodeJS.ProcessEnv;
+	readCurrent(): InstanceLockPayload | null;
+	persist(identity: WorkspaceProcessIdentity, qualified: boolean): boolean;
+	observe(pid: number): Promise<WorkspaceProcessObservation>;
+}
+
+/** Startup only. A permissive stale decision is replaced by independent, exact OS evidence. */
+async function registerLockIdentity(
+	identity: WorkspaceProcessIdentity,
+	deps: LockIdentityRegistrationDependencies,
+): Promise<void> {
+	const { state } = deps;
+	if (!isWorkspaceProcessIdentity(identity) || identity.pid !== deps.pid || !state.acquired) return;
+	const token = state.token;
+	const path = state.path;
+	const ownsCurrent = () => {
+		const payload = deps.readCurrent();
+		return (
+			!!token &&
+			!!path &&
+			state.token === token &&
+			state.path === path &&
+			state.acquired &&
+			payload?.pid === deps.pid &&
+			payload.token === token
+		);
+	};
+	if (!ownsCurrent()) {
+		state.maintenancePath = "lost_token";
+		return;
+	}
+	let qualified = state.maintenancePath === "fresh" || state.maintenancePath === "verified_reclaim";
+	if (state.maintenancePath === "pending_reclaim" && state.maintenancePredecessor) {
+		const previous = state.maintenancePredecessor;
+		const observation = await deps
+			.observe(previous.pid)
+			.catch(() => ({ kind: "unknown" }) as const);
+		const observedDomain =
+			observation.kind === "unknown"
+				? null
+				: observation.kind === "present"
+					? observation.identity.domain
+					: observation.domain;
+		qualified =
+			!!observedDomain &&
+			sameWorkspaceProcessDomain(identity.domain, observedDomain) &&
+			workspaceProcessEndReason(previous, observation) !== null;
+	}
+	// Environment and token may have changed while the asynchronous probe was running.
+	if (!ownsCurrent()) {
+		state.maintenancePath = "lost_token";
+		return;
+	}
+	if (
+		deps.env[ALLOW_MULTIPLE_ENV] === "1" ||
+		deps.env[FORCE_UNLOCK_ENV] === "1" ||
+		state.maintenancePath === "override"
+	) {
+		state.maintenancePath = "override";
+		qualified = false;
+	}
+	if (
+		state.maintenancePath !== "fresh" &&
+		state.maintenancePath !== "verified_reclaim" &&
+		state.maintenancePath !== "pending_reclaim"
+	)
+		qualified = false;
+	if (!deps.persist(identity, qualified)) return;
+	if (!ownsCurrent()) {
+		state.maintenancePath = "lost_token";
+		return;
+	}
+	if (state.maintenancePath === "pending_reclaim")
+		state.maintenancePath = qualified ? "verified_reclaim" : "cleared_lock";
+}
+
+/** Update the opened inode, never rename over a competitor's replacement lock. */
+function persistLockIdentity(identity: WorkspaceProcessIdentity, qualified: boolean): boolean {
+	const state = lockState();
+	if (!state.path || !state.token) return false;
+	let fd: number | undefined;
+	try {
+		fd = openSync(state.path, "r+");
+		const bytes = Buffer.alloc(PID_CHECK_MAX_BUFFER + 1);
+		const size = readSync(fd, bytes, 0, bytes.length, 0);
+		if (size > PID_CHECK_MAX_BUFFER) return false;
+		const payload = JSON.parse(bytes.subarray(0, size).toString("utf8")) as InstanceLockPayload;
+		if (payload.pid !== process.pid || payload.token !== state.token) return false;
+		const output = Buffer.from(
+			`${JSON.stringify({ ...payload, maintenanceIdentity: identity, maintenanceQualified: qualified }, null, 2)}\n`,
+		);
+		if (output.length > PID_CHECK_MAX_BUFFER) return false;
+		let offset = 0;
+		while (offset < output.length) {
+			const written = writeSync(fd, output, offset, output.length - offset, offset);
+			if (written <= 0) return false;
+			offset += written;
+		}
+		ftruncateSync(fd, output.length);
+		return true;
+	} catch (error) {
+		logger.warn("Could not persist strict instance-lock identity", { error: String(error) });
+		return false;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
+}
+
+export async function registerInstanceLockProcessIdentity(
+	identity: WorkspaceProcessIdentity,
+): Promise<void> {
+	const state = lockState();
+	await registerLockIdentity(identity, {
+		state,
+		pid: process.pid,
+		env: process.env,
+		readCurrent: () => (state.path ? readLockPayload(state.path, true) : null),
+		persist: persistLockIdentity,
+		observe: observeWorkspaceProcess,
+	});
+}
+
+export type InstanceMaintenanceAuthority = Readonly<{ allowed: boolean; reason: string }>;
+
+/** Pure strict policy: startup heuristics, image names and missing files are never authority. */
+function evaluateMaintenanceAuthority(
+	state: InstanceLockState,
+	payload: InstanceLockPayload | null,
+	env: NodeJS.ProcessEnv,
+	pid: number,
+): InstanceMaintenanceAuthority {
+	if (env[ALLOW_MULTIPLE_ENV] === "1" || env[FORCE_UNLOCK_ENV] === "1") {
+		return { allowed: false, reason: "environment_override" };
+	}
+	if (!state.acquired || !state.path || !state.token) {
+		return { allowed: false, reason: "lock_not_acquired" };
+	}
+	if (state.maintenancePath !== "fresh" && state.maintenancePath !== "verified_reclaim") {
+		return { allowed: false, reason: state.maintenancePath ?? "unknown_acquisition_path" };
+	}
+	if (payload?.pid !== pid || payload.token !== state.token) {
+		return { allowed: false, reason: "lost_token" };
+	}
+	return { allowed: true, reason: "exclusive_instance_lock" };
+}
+
+/** Recheck environment and on-disk token on EVERY maintenance use; never probe the OS here. */
+export function getInstanceMaintenanceAuthority(): InstanceMaintenanceAuthority {
+	const state = lockState();
+	let payload: InstanceLockPayload | null = null;
+	try {
+		if (state.path && statSync(state.path).size <= PID_CHECK_MAX_BUFFER) {
+			payload = readLockPayload(state.path, true);
+		}
+	} catch {
+		// Missing, unreadable and oversized lock files all reject maintenance, not startup.
+	}
+	const result = evaluateMaintenanceAuthority(state, payload, process.env, process.pid);
+	if (result.reason === "lost_token") state.maintenancePath = "lost_token";
+	return result;
 }
 
 export function releaseInstanceLock(): void {
@@ -933,4 +1173,7 @@ export const __testing = {
 	readLockPayloadSettled,
 	DERIVED_BOOT_PREFIX,
 	DERIVED_BOOT_TOLERANCE_S,
+	evaluateMaintenanceAuthority,
+	captureMaintenancePredecessor,
+	registerLockIdentity,
 };

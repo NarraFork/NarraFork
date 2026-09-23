@@ -39,6 +39,9 @@ export function NotificationBell() {
 	return (
 		<>
 			<Tooltip label={badgeAria} position="bottom" withArrow>
+				{/* Mantine Indicator defaults to `display: block`, which adds baseline
+				    descender space around the inline-flex ActionIcon and parks the bell
+				    higher than sibling header icons. Flex shrinks the root to the button. */}
 				<Indicator
 					disabled={!label && !unknown}
 					label={label ?? (unknown ? "?" : undefined)}
@@ -47,6 +50,7 @@ export function NotificationBell() {
 					offset={2}
 					withBorder
 					data-testid="notification-bell-badge"
+					style={{ display: "flex", alignItems: "center" }}
 				>
 					<ActionIcon
 						variant="subtle"

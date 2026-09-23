@@ -3743,6 +3743,14 @@ export const fileChangeScopes = sqliteTable(
 	],
 );
 
+// Immutable process identity registered once per newly-created execution owner epoch.
+// Missing/unknown identities are deliberately not backfilled from a later process.
+export const workspaceExecutionOwners = sqliteTable("workspace_execution_owners", {
+	ownerEpoch: text("owner_epoch").primaryKey(),
+	identityJson: text("identity_json", { mode: "json" }).$type<unknown>(),
+	createdAt: text("created_at").notNull(),
+});
+
 // A scope is stable identity; each execution retains its own immutable physical ranges.
 // No TTL can release executing/quarantined work. Settled records are pruned in bounded batches.
 export const workspaceWriteLeases = sqliteTable(
@@ -3754,6 +3762,9 @@ export const workspaceWriteLeases = sqliteTable(
 			.references(() => fileChangeScopes.id),
 		deviceId: text("device_id").notNull(),
 		ownerEpoch: text("owner_epoch").notNull(),
+		executionClass: text("execution_class", { enum: ["local_file_io", "unknown"] })
+			.notNull()
+			.default("unknown"),
 		runtimeEpoch: text("runtime_epoch").notNull(),
 		runtimeGeneration: integer("runtime_generation").notNull(),
 		fencingToken: integer("fencing_token").notNull(),
@@ -3780,6 +3791,13 @@ export const workspaceWriteLeases = sqliteTable(
 			}>()
 			.notNull(),
 		executionEndedAt: text("execution_ended_at"),
+		terminationEvidenceJson: text("termination_evidence_json", { mode: "json" }).$type<{
+			version: 1;
+			kind: "owner_ended";
+			ownerEpoch: string;
+			reason: string;
+			observedAt: string;
+		}>(),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -3787,6 +3805,7 @@ export const workspaceWriteLeases = sqliteTable(
 		index("idx_workspace_lease_device_status").on(table.deviceId, table.status, table.leaseId),
 		index("idx_workspace_lease_scope").on(table.scopeId, table.status, table.leaseId),
 		index("idx_workspace_lease_cleanup").on(table.status, table.updatedAt, table.leaseId),
+		index("idx_workspace_lease_owner").on(table.ownerEpoch, table.leaseId),
 	],
 );
 
@@ -3799,6 +3818,21 @@ export const fileChangeScopeRecoveries = sqliteTable(
 		id: text("id").primaryKey(),
 		/** Immutable audit reference; terminal lease pruning must not delete the audit. */
 		workspaceLeaseId: text("workspace_lease_id"),
+		resolutionAuthority: text("resolution_authority", {
+			enum: ["execution_proven", "administrator_attested", "system_reconciled"],
+		})
+			.notNull()
+			.default("execution_proven"),
+		/** Explicit maintenance evidence; never interpreted as OS process-death proof. */
+		maintenanceEvidenceJson: text("maintenance_evidence_json", { mode: "json" }).$type<{
+			version: 1;
+			mode: "legacy_owner_offline";
+			oldOwnerEpoch: string | null;
+			operatorReason: string;
+			maintenanceAuthority: "exclusive_instance_lock";
+			generation: string;
+			attestedAt: string;
+		}>(),
 		scopeId: text("scope_id")
 			.notNull()
 			.references(() => fileChangeScopes.id),

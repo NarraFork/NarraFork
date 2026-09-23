@@ -43,6 +43,10 @@ import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import { DirectoryPicker } from "../common/DirectoryPicker";
 import { resolveCwdPrefill } from "./composer/create-narrator-cwd-prefill";
+import {
+	resolveStartInPlanModePrefill,
+	shouldSendStartInPlanMode,
+} from "./composer/create-narrator-plan-mode-prefill";
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
 const CREATE_NARRATOR_SETTINGS_QUERY_GC_TIME_MS = 60_000;
@@ -164,7 +168,17 @@ export function CreateNarratorModal({
 
 	const [cwd, setCwd] = useState(initialCwd ?? "");
 	const [selectedModel, setSelectedModel] = useState("");
+	// The switch starts as a placeholder for "follow agent.defaultStartInPlanMode".
+	// `startInPlanModeTouched` records an immediate user flip so a late-arriving
+	// settings default cannot rewrite it; `planModePrefilledForOpenRef` stops the
+	// prefill from writing more than once per open (same timing shape as cwd).
 	const [startInPlanMode, setStartInPlanMode] = useState(false);
+	const [startInPlanModeTouched, setStartInPlanModeTouched] = useState(false);
+	const planModePrefilledForOpenRef = useRef(false);
+	const defaultStartInPlanMode = settings?.agent?.defaultStartInPlanMode ?? false;
+	// Query resolved ⇒ we know the default (server merges agent defaults). Until
+	// then the switch is a placeholder and submit omits the field.
+	const planModeSettingsKnown = settings != null;
 	const [makeNamed, setMakeNamed] = useState(false);
 	const [knowledgeSteward, setKnowledgeSteward] = useState(false);
 	const [handle, setHandle] = useState("");
@@ -241,6 +255,40 @@ export function CreateNarratorModal({
 		}
 	}, [opened, cwd, initialCwd, defaultProjectDir]);
 
+	// Same timing question as the cwd field: the settings query is often unresolved
+	// on the first open, so `defaultStartInPlanMode` arrives a render or two late.
+	// Adopt it until the user flips the switch; never after.
+	useEffect(() => {
+		const decision = resolveStartInPlanModePrefill({
+			opened,
+			userTouched: startInPlanModeTouched,
+			alreadyPrefilled: planModePrefilledForOpenRef.current,
+			value: startInPlanMode,
+			settingsKnown: planModeSettingsKnown,
+			defaultStartInPlanMode,
+		});
+		if (decision.kind === "reset") {
+			planModePrefilledForOpenRef.current = false;
+			if (startInPlanModeTouched) setStartInPlanModeTouched(false);
+			if (startInPlanMode) setStartInPlanMode(false);
+			return;
+		}
+		if (decision.kind === "markPrefilled") {
+			planModePrefilledForOpenRef.current = true;
+			return;
+		}
+		if (decision.kind === "prefill") {
+			setStartInPlanMode(decision.value);
+			planModePrefilledForOpenRef.current = true;
+		}
+	}, [
+		opened,
+		startInPlanModeTouched,
+		startInPlanMode,
+		planModeSettingsKnown,
+		defaultStartInPlanMode,
+	]);
+
 	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -276,11 +324,19 @@ export function CreateNarratorModal({
 	}, []);
 
 	const handleCreate = () => {
+		// Explicit boolean whenever the switch means something (user flipped it, or
+		// the instance default is showing on it). Omitting `false` would let the
+		// server's `input.startInPlanMode ?? defaultStartInPlanMode` re-impose the
+		// default over a deliberate uncheck — the silent-override bug.
+		const sendPlanMode = shouldSendStartInPlanMode({
+			userTouched: startInPlanModeTouched,
+			settingsKnown: planModeSettingsKnown,
+		});
 		createNarrator.mutate(
 			{
 				...(cwd ? { cwd } : {}),
 				model: selectedModel || FOLLOW_DEFAULT_MODEL,
-				...(startInPlanMode ? { startInPlanMode: true } : {}),
+				...(sendPlanMode ? { startInPlanMode } : {}),
 				...(makeNamed && handle.trim() ? { makeNamed: true, handle: handle.trim() } : {}),
 				...(knowledgeSteward ? { kind: "knowledge" as const } : {}),
 			},
@@ -303,7 +359,11 @@ export function CreateNarratorModal({
 		onClose();
 		setCwd("");
 		setSelectedModel("");
+		// Reset to "follow settings" — not a hard false preference. The next open
+		// re-adopts agent.defaultStartInPlanMode via the prefill effect.
 		setStartInPlanMode(false);
+		setStartInPlanModeTouched(false);
+		planModePrefilledForOpenRef.current = false;
 		setMakeNamed(false);
 		setKnowledgeSteward(false);
 		setHandle("");
@@ -450,7 +510,13 @@ export function CreateNarratorModal({
 				label={t("startInPlanMode")}
 				description={t("startInPlanModeHint")}
 				checked={startInPlanMode}
-				onChange={(e) => setStartInPlanMode(e.currentTarget.checked)}
+				onChange={(e) => {
+					// Immediate preference: after this, settings defaults must not rewrite
+					// the switch, and submit always carries this explicit boolean.
+					setStartInPlanMode(e.currentTarget.checked);
+					setStartInPlanModeTouched(true);
+					planModePrefilledForOpenRef.current = true;
+				}}
 			/>
 
 			<Divider label={t("sectionSessionType")} labelPosition="left" />

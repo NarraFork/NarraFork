@@ -547,6 +547,9 @@ export class RevertTransactionService {
 					scopes: [...scopes.values()].map((scope) => ({
 						scope,
 						runtime: this.runtimeBinding(scope.deviceId),
+						// This service exclusively awaits native restoreLocalFile IO; it
+						// does not launch Bash or delegate mutations to remote processes.
+						executionClass: "local_file_io" as const,
 					})),
 					signal: run.signal,
 				},

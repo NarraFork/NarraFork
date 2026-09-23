@@ -87,12 +87,80 @@ export function isTerminalToolRowStatus(status: string | null | undefined): bool
  * Callers must not reserve slot width when this returns null; a blank 12px gap on
  * every successful row is the same visual noise as the check it replaced.
  */
-export type ToolRowStatusMark = "running" | "failed" | "cancelled";
+export type ToolRowStatusMark = "running" | "queued" | "awaiting" | "failed" | "cancelled";
 
+/**
+ * Facts about a row that its STATUS ALONE cannot express.
+ *
+ * Both members describe a call whose `status` is in flight but which is **not
+ * executing**, and neither is derivable from the status column:
+ *
+ *  - `queuedBehindUpstream` — arguments are complete, but an earlier call in the
+ *    same turn still owns the execution slot. Resolved by the adapter from the
+ *    real provider-order prefix and carried on the measured payload; a folded row
+ *    cannot see its peers.
+ *  - `reflectionStatus` — a reflection gate is deliberating. A gate parks its tool
+ *    at `pending`, so without this the row cannot tell "a person is being asked"
+ *    from "a gate is thinking".
+ *
+ * ⚠️ WHY THIS PARAMETER EXISTS AT ALL. `@shared/tool-shimmer` already resolves
+ * both cases correctly (`resolveToolShimmerPhase`), and it receives exactly these
+ * two fields. This module used to take only `status`, so the SAME row painted a
+ * blue spinner beside text saying "waiting for earlier tools": the shimmer knew
+ * the call was parked and the glyph structurally could not. Passing the same facts
+ * to both is what removes that contradiction.
+ *
+ * This module does NOT import `tool-shimmer` to derive the answer: the dependency
+ * already runs the other way (shimmer imports `IN_FLIGHT_TOOL_ROW_STATUSES` from
+ * here), so doing that would form a cycle. The two rules are instead pinned
+ * against each other in `shared/__tests__/tool-row-status.test.ts`, the same
+ * device `TOOL_SHIMMER_PHASE_SETS` uses for its partition claim.
+ */
+export interface ToolRowStatusContext {
+	/** An earlier same-turn call still owns the execution slot. */
+	queuedBehindUpstream?: boolean;
+	/** A reflection gate's status on this call, when one exists. */
+	reflectionStatus?: string | null;
+}
+
+/**
+ * The mark a row draws for its status, or `null` for "draw nothing".
+ *
+ * `null` covers three genuinely different cases that all deserve silence:
+ *  - SUCCESS — the default expectation (see the file header);
+ *  - an unrecognised or empty status — a mark would be a guess;
+ *  - no status at all (a reasoning step) — the row has no lifecycle.
+ *
+ * Callers must not reserve slot width when this returns null; a blank 12px gap on
+ * every successful row is the same visual noise as the check it replaced.
+ *
+ * ── THE THREE IN-FLIGHT MARKS ARE NOT INTERCHANGEABLE ─────────────────────────
+ * `running` claims the tool's own work is under way. `queued` and `awaiting` say
+ * the opposite: nothing is executing, and the reason differs (a sibling holds the
+ * slot / a person or gate is being waited on). Collapsing all three into
+ * `running` — which is what reading `status` alone does — reports work that is not
+ * happening, and does it with a spinner, the strongest activity signal a row has.
+ */
 export function resolveToolRowStatusMark(
 	status: string | null | undefined,
+	context?: ToolRowStatusContext,
 ): ToolRowStatusMark | null {
+	// A live gate outranks the tool's own status, exactly as in
+	// `resolveToolShimmerPhase`: the tool sits at `pending` while the gate thinks,
+	// and asking about `status` first is what reads a deliberating gate as running.
+	if (context?.reflectionStatus === "running") return "awaiting";
 	if (status == null || status === "") return null;
+	// `pending` is "a person is being waited on" at every write site (see
+	// `NON_EXECUTING_IN_FLIGHT_STATUSES` in tool-shimmer.ts): every write of it in
+	// narrator-permission.ts accompanies a `permissionStartedAt` stamp. A spinner
+	// there animates the reader's own inaction back at them.
+	if (status === "pending") return "awaiting";
+	if (
+		(status === "initializing" || status === "streaming") &&
+		context?.queuedBehindUpstream === true
+	) {
+		return "queued";
+	}
 	if (IN_FLIGHT_TOOL_ROW_STATUSES.has(status)) return "running";
 	// Not in flight and not a status we recognise → no mark. Guessing "done" here is
 	// what would put a green check (or a spinner) on a state nobody has interpreted.
@@ -112,10 +180,15 @@ export function resolveToolRowStatusMark(
 	return null;
 }
 
-/** Whether this status draws a mark at all (i.e. whether to render a slot). */
-export function hasToolRowStatusMark(status: string | null | undefined): boolean {
-	return resolveToolRowStatusMark(status) !== null;
-}
+/**
+ * NOTE: there is deliberately no `hasToolRowStatusMark` helper.
+ *
+ * A row used to ask "is there a mark?" and then render the glyph from `status`
+ * again — two independent evaluations of one question. Once the answer depends on
+ * a `context` as well, passing it to only one of the two calls yields a reserved
+ * 12px slot holding nothing, which this module's header forbids outright. Callers
+ * therefore resolve the mark ONCE and render the slot only when it is non-null.
+ */
 
 /**
  * Lifecycle phases a live tool status can occupy, ordered.

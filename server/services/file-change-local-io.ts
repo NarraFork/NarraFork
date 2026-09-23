@@ -108,7 +108,8 @@ export interface LocalFileApplyInput {
 	before: LocalFileObservation;
 	nextBytes: Uint8Array;
 	signal: AbortSignal;
-	/** Includes the frozen runtime, workspace incarnation and coordinator fence. */
+	/** Includes the frozen runtime, workspace incarnation and coordinator fence.
+	 * Must not reject merely because the caller cancelled: used after dispatch too. */
 	assertTarget(): Promise<void>;
 	/** Registration only, immediately before the first potentially mutating syscall. */
 	onDispatch(): void;
@@ -226,6 +227,8 @@ export function createFileChangeLocalIo(
 			let failed = false;
 			let failure: unknown;
 			let registered = false;
+			let writtenIdentity: string | undefined;
+			let writtenMode: number | undefined;
 			const beforeMutation = () => {
 				signal.throwIfAborted();
 				if (!registered) {
@@ -337,12 +340,16 @@ export function createFileChangeLocalIo(
 					offset += written.bytesWritten;
 				}
 				await file.sync();
+				// Cancellation is a tool outcome, not proof of uncertain IO. These
+				// post-dispatch guards must validate identity without the caller signal.
 				await input.assertTarget();
-				signal.throwIfAborted();
 				const written = await file.stat({ bigint: true });
 				const current = await syscalls.lstat(canonicalPath, { bigint: true });
+				regular(written);
 				regular(current);
-				if (localObjectIdentity(written) !== localObjectIdentity(current))
+				writtenIdentity = localObjectIdentity(written);
+				writtenMode = Number(written.mode & 0o7777n);
+				if (writtenIdentity !== localObjectIdentity(current))
 					throw new LocalFileValidationError("Written object was replaced before verification");
 			} catch (error) {
 				failed = true;
@@ -361,10 +368,23 @@ export function createFileChangeLocalIo(
 					}
 				}
 			}
-			// Cancellation while awaiting close must not be reported as a clean apply.
-			if (!failed && signal.aborted) {
-				failed = true;
-				failure = signal.reason;
+			// Complete the final pathname/content check after close too. A successful
+			// write alone cannot prove the canonical target still contains our bytes.
+			if (!failed) {
+				try {
+					await input.assertTarget();
+					const observed = await this.read(canonicalPath, AbortSignal.timeout(5_000));
+					if (
+						observed.bytes === null ||
+						!Buffer.from(observed.bytes).equals(nextBytes) ||
+						observed.identity !== writtenIdentity ||
+						observed.mode !== writtenMode
+					)
+						throw new LocalFileValidationError("Final content/object differs from completed write");
+				} catch (error) {
+					failed = true;
+					failure = error;
+				}
 			}
 			if (!failed) return { kind: "applied", error: null, parentEffects };
 			return {

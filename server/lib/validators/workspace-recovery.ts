@@ -22,3 +22,22 @@ export const recoverWorkspaceBarrierSchema = z.object({
 });
 
 export type RecoverWorkspaceBarrierInput = z.infer<typeof recoverWorkspaceBarrierSchema>;
+
+export const beginWorkspaceMaintenanceSchema = z
+	.object({
+		leaseId: z.string().min(1).max(256).optional(),
+		acknowledgeWritersStopped: z.literal(true),
+		operatorReason: z.string().trim().min(1).max(1000),
+	})
+	.strict();
+export const workspaceMaintenanceTokenSchema = z
+	.object({
+		maintenanceToken: z.string().regex(/^[a-f0-9]{64}$/),
+	})
+	.strict();
+export const commitWorkspaceMaintenanceSchema = recoverWorkspaceBarrierSchema
+	.omit({ leaseId: true })
+	.extend({
+		maintenanceToken: z.string().regex(/^[a-f0-9]{64}$/),
+	})
+	.strict();

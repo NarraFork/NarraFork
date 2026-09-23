@@ -14,22 +14,20 @@
  * supports, which is why the menu can always highlight a tier that will really be used.
  */
 
-import { claudeVersionAtLeast, parseClaudeModel } from "@shared/reasoning-effort-support";
+import {
+	claudeVersionAtLeast,
+	GENERIC_REASONING_EFFORT_TIERS,
+	parseClaudeModel,
+} from "@shared/reasoning-effort-support";
 import type { ModelOption } from "../../lib/constants";
 
 export type ReasoningEffortValue = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 
 /**
- * Fallback tiers for a Codex model missing from the catalog below. Kept
- * separate from GENERIC_REASONING_EFFORT_TIERS: Codex models have no `max`
- * tier, so an unknown one must not offer it.
+ * Unknown Codex models expose all tiers until the catalog declares constraints.
  */
-export const DEFAULT_CODEX_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
-	"none",
-	"low",
-	"medium",
-	"high",
-];
+export const DEFAULT_CODEX_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] =
+	GENERIC_REASONING_EFFORT_TIERS;
 
 /** DeepSeek only supports two effective tiers: high and max (mapped from xhigh). */
 export const DEEPSEEK_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [

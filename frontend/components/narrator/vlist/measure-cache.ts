@@ -421,6 +421,13 @@ function traceRevision(d: Record<string, unknown>): string {
 			const duration = (r.timing as Record<string, unknown>).durationMs;
 			if (typeof duration === "number") rev += `|tm:${duration}`;
 		}
+		// The figure actually PAINTED, which for bash is the pure execution time rather
+		// than `timing.durationMs` (see `@shared/tool-display-duration`). Keyed
+		// separately because it derives from `_metadata.execDurationMs`, which a live
+		// patch can land ALONE on an already-terminal status — the same reason
+		// `diffStats` above needs its own component. Serving the stale figure would be
+		// worse than serving none: a duration looks authoritative.
+		if (typeof r.displayDurationMs === "number") rev += `|tmd:${r.displayDurationMs}`;
 		// An expandable body is measured as markdown when its row is expanded.
 		const body = typeof r.bodyText === "string" ? r.bodyText : r.body;
 		if (typeof body === "string") rev += `|tb:${textSignature(body)}`;

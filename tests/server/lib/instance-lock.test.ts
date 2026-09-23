@@ -9,6 +9,10 @@ import {
 	getInstanceLockPath,
 	releaseInstanceLock,
 } from "../../../server/lib/instance-lock";
+import type {
+	WorkspaceProcessIdentity,
+	WorkspaceProcessObservation,
+} from "../../../server/lib/workspace-process-identity";
 
 /**
  * These tests exist because the previous implementation refused to start whenever the recorded pid
@@ -413,6 +417,230 @@ describe("instance lock", () => {
 		expect(payload.bootId).toBeTruthy();
 		expect(payload.execPath).toBe(process.execPath);
 		if (IS_LINUX) expect(payload.procStartTicks).toBe(realStartTicks(process.pid));
+	});
+});
+
+describe("strict maintenance qualification (independent of startup fail-open)", () => {
+	const state = {
+		path: "/virtual/instance.lock",
+		token: "ours",
+		acquired: true,
+		maintenancePath: "fresh" as const,
+	};
+	const payload = {
+		version: 2,
+		pid: 42,
+		token: "ours",
+		dbPath: "/virtual/db",
+		startedAt: "now",
+		argv: [],
+		bootId: null,
+		procStartTicks: null,
+		execPath: "bun",
+		hostname: "host",
+		uid: null,
+	};
+	const evaluate = __testing.evaluateMaintenanceAuthority;
+
+	it("accepts only fresh acquisition and a currently matching token", () => {
+		expect(evaluate(state, payload, {}, 42).allowed).toBe(true);
+		expect(evaluate(state, null, {}, 42)).toEqual({ allowed: false, reason: "lost_token" });
+		expect(evaluate(state, { ...payload, token: "stolen" }, {}, 42).allowed).toBe(false);
+		expect(evaluate(state, { ...payload, pid: 43 }, {}, 42).allowed).toBe(false);
+	});
+
+	it("rejects unknown, stolen, reused and override paths without modifying startup policy", () => {
+		for (const maintenancePath of [
+			undefined,
+			"override",
+			"unverified_reuse",
+			"cleared_lock",
+			"lost_token",
+		] as const) {
+			expect(evaluate({ ...state, maintenancePath }, payload, {}, 42).allowed).toBe(false);
+		}
+		expect(evaluate({ ...state, acquired: false }, payload, {}, 42).allowed).toBe(false);
+	});
+
+	it("rechecks both force overrides on every use, including after hot reload", () => {
+		for (const name of ["NARRAFORK_ALLOW_MULTIPLE", "NARRAFORK_FORCE_UNLOCK"]) {
+			expect(evaluate(state, payload, { [name]: "1" }, 42)).toEqual({
+				allowed: false,
+				reason: "environment_override",
+			});
+		}
+		// The old startup state predates strict-path recording: do not infer fresh acquisition.
+		expect(
+			evaluate({ path: state.path, token: state.token, acquired: true }, payload, {}, 42).allowed,
+		).toBe(false);
+	});
+});
+
+describe("strict asynchronous crash-lock reclamation", () => {
+	const previous: WorkspaceProcessIdentity = {
+		version: 1,
+		pid: 42,
+		birth: "123456789",
+		domain: {
+			platform: "linux",
+			machine: "1234567890abcdef1234567890abcdef",
+			boot: "12345678-1234-1234-1234-123456789012",
+			pidNamespace: "pid:[123]",
+			timeNamespace: "time:[456]",
+		},
+	};
+	const self: WorkspaceProcessIdentity = { ...previous, pid: 77, birth: "987654321" };
+	function fixture(
+		observation: WorkspaceProcessObservation = { kind: "absent", domain: previous.domain },
+	) {
+		let payload = {
+			version: 2,
+			pid: 77,
+			token: "current",
+			dbPath: "/virtual/db",
+			startedAt: "now",
+			argv: [] as string[],
+			bootId: null,
+			procStartTicks: null,
+			execPath: "bun",
+			hostname: "host",
+			uid: null,
+		};
+		let persisted: { identity: WorkspaceProcessIdentity; qualified: boolean } | null = null;
+		const deps: Parameters<typeof __testing.registerLockIdentity>[1] = {
+			state: {
+				path: "/virtual/lock",
+				token: "current",
+				acquired: true,
+				maintenancePath: "pending_reclaim",
+				maintenancePredecessor: previous,
+			},
+			pid: 77,
+			env: {},
+			readCurrent: () => payload,
+			persist: (identity, qualified) => {
+				persisted = { identity, qualified };
+				return true;
+			},
+			observe: async () => observation,
+		};
+		return {
+			deps,
+			persisted: () => persisted,
+			steal() {
+				payload = { ...payload, token: "competitor" };
+			},
+			authority: () => __testing.evaluateMaintenanceAuthority(deps.state, payload, deps.env, 77),
+		};
+	}
+
+	it("enables maintenance after independent exact proof, rather than requiring another restart", async () => {
+		const f = fixture();
+		expect(f.authority().allowed).toBe(false);
+		await __testing.registerLockIdentity(self, f.deps);
+		expect(f.deps.state.maintenancePath).toBe("verified_reclaim");
+		expect(f.authority().allowed).toBe(true);
+		expect(f.persisted()).toEqual({ identity: self, qualified: true });
+	});
+
+	it("accepts exact PID reuse and exact Linux reboot, not a live owner", async () => {
+		const reused = fixture({ kind: "present", identity: { ...previous, birth: "123456790" } });
+		await __testing.registerLockIdentity(self, reused.deps);
+		expect(reused.authority().allowed).toBe(true);
+		const nextDomain = { ...self.domain, boot: "87654321-1234-1234-1234-123456789012" };
+		const reboot = fixture({ kind: "present", identity: { ...previous, domain: nextDomain } });
+		await __testing.registerLockIdentity({ ...self, domain: nextDomain }, reboot.deps);
+		expect(reboot.authority().allowed).toBe(true);
+		const live = fixture({ kind: "present", identity: previous });
+		await __testing.registerLockIdentity(self, live.deps);
+		expect(live.authority().allowed).toBe(false);
+		expect(live.persisted()?.qualified).toBe(false);
+	});
+
+	it("unknown, override, lost-token and heuristic-only takeover paths cannot be upgraded", async () => {
+		for (const path of ["cleared_lock", "override", "lost_token", "unverified_reuse"] as const) {
+			const f = fixture();
+			f.deps.state.maintenancePath = path;
+			await __testing.registerLockIdentity(self, f.deps);
+			expect(f.authority().allowed).toBe(false);
+			expect(f.persisted()?.qualified).toBe(false);
+		}
+		const unknown = fixture({ kind: "unknown" });
+		await __testing.registerLockIdentity(self, unknown.deps);
+		expect(unknown.authority().allowed).toBe(false);
+	});
+
+	it("rechecks token and force overrides after an asynchronous probe", async () => {
+		for (const override of ["NARRAFORK_ALLOW_MULTIPLE", "NARRAFORK_FORCE_UNLOCK"]) {
+			const f = fixture();
+			f.deps.observe = async () => {
+				f.deps.env[override] = "1";
+				return { kind: "absent", domain: previous.domain };
+			};
+			await __testing.registerLockIdentity(self, f.deps);
+			delete f.deps.env[override];
+			expect(f.authority().allowed).toBe(false);
+			expect(f.persisted()?.qualified).toBe(false);
+		}
+		const stolen = fixture();
+		stolen.deps.observe = async () => {
+			stolen.steal();
+			return { kind: "absent", domain: previous.domain };
+		};
+		await __testing.registerLockIdentity(self, stolen.deps);
+		expect(stolen.deps.state.maintenancePath).toBe("lost_token");
+		expect(stolen.persisted()).toBeNull();
+	});
+
+	it("requires qualified exact predecessor identity and never upgrades a legacy or unsafe chain", () => {
+		const payload = {
+			version: 2,
+			pid: 42,
+			token: "old",
+			dbPath: "/virtual/db",
+			startedAt: "old",
+			argv: [],
+			bootId: previous.domain.boot,
+			procStartTicks: 123456789,
+			execPath: "bun",
+			hostname: "host",
+			uid: null,
+		};
+		expect(__testing.captureMaintenancePredecessor(payload)).toBeUndefined();
+		expect(
+			__testing.captureMaintenancePredecessor({
+				...payload,
+				maintenanceIdentity: previous,
+				maintenanceQualified: false,
+			}),
+		).toBeUndefined();
+		const captured = __testing.captureMaintenancePredecessor({
+			...payload,
+			maintenanceIdentity: previous,
+			maintenanceQualified: true,
+		});
+		expect(captured).toEqual(previous);
+		expect(Object.isFrozen(captured?.domain)).toBe(true);
+		expect(
+			__testing.captureMaintenancePredecessor({
+				...payload,
+				maintenanceIdentity: self,
+				maintenanceQualified: true,
+			}),
+		).toBeUndefined();
+	});
+
+	it("cannot upgrade after failed persistence or foreign observation domains", async () => {
+		const failed = fixture();
+		failed.deps.persist = () => false;
+		await __testing.registerLockIdentity(self, failed.deps);
+		expect(failed.authority().allowed).toBe(false);
+		const foreign = fixture({
+			kind: "absent",
+			domain: { ...previous.domain, pidNamespace: "pid:[999]" },
+		});
+		await __testing.registerLockIdentity(self, foreign.deps);
+		expect(foreign.authority().allowed).toBe(false);
 	});
 });
 

@@ -2127,6 +2127,12 @@ export const fileChangeScopes = pgTable(
 	],
 );
 
+export const workspaceExecutionOwners = pgTable("workspace_execution_owners", {
+	ownerEpoch: text("owner_epoch").primaryKey().notNull(),
+	identityJson: jsonText("identity_json"),
+	createdAt: text("created_at").notNull(),
+});
+
 export const workspaceWriteLeases = pgTable(
 	"workspace_write_leases",
 	{
@@ -2136,6 +2142,7 @@ export const workspaceWriteLeases = pgTable(
 			.references((): PgColumn => fileChangeScopes.id, {}),
 		deviceId: text("device_id").notNull(),
 		ownerEpoch: text("owner_epoch").notNull(),
+		executionClass: text("execution_class").notNull().default("unknown"),
 		runtimeEpoch: text("runtime_epoch").notNull(),
 		runtimeGeneration: integer("runtime_generation").notNull(),
 		fencingToken: integer("fencing_token").notNull(),
@@ -2145,6 +2152,7 @@ export const workspaceWriteLeases = pgTable(
 		rangesJson: jsonText("ranges_json").notNull(),
 		mutationManifestJson: jsonText("mutation_manifest_json").notNull(),
 		executionEndedAt: text("execution_ended_at"),
+		terminationEvidenceJson: jsonText("termination_evidence_json"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -2152,6 +2160,7 @@ export const workspaceWriteLeases = pgTable(
 		index("idx_workspace_lease_device_status").on(table.deviceId, table.status, table.leaseId),
 		index("idx_workspace_lease_scope").on(table.scopeId, table.status, table.leaseId),
 		index("idx_workspace_lease_cleanup").on(table.status, table.updatedAt, table.leaseId),
+		index("idx_workspace_lease_owner").on(table.ownerEpoch, table.leaseId),
 	],
 );
 
@@ -2160,6 +2169,8 @@ export const fileChangeScopeRecoveries = pgTable(
 	{
 		id: text("id").primaryKey().notNull(),
 		workspaceLeaseId: text("workspace_lease_id"),
+		resolutionAuthority: text("resolution_authority").notNull().default("execution_proven"),
+		maintenanceEvidenceJson: jsonText("maintenance_evidence_json"),
 		scopeId: text("scope_id")
 			.notNull()
 			.references((): PgColumn => fileChangeScopes.id, {}),
@@ -3447,8 +3458,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 110,
-  "columnCount": 1589,
+  "tableCount": 111,
+  "columnCount": 1596,
   "tables": [
     {
       "exportName": "projects",
@@ -16731,6 +16742,46 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "primaryKeys": []
     },
     {
+      "exportName": "workspaceExecutionOwners",
+      "name": "workspace_execution_owners",
+      "columns": [
+        {
+          "property": "ownerEpoch",
+          "name": "owner_epoch",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "identityJson",
+          "name": "identity_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
       "exportName": "workspaceWriteLeases",
       "name": "workspace_write_leases",
       "columns": [
@@ -16775,6 +16826,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": true,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "executionClass",
+          "name": "execution_class",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"unknown\"",
+          "defaultExpression": "\"unknown\""
         },
         {
           "property": "runtimeEpoch",
@@ -16860,6 +16922,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "terminationEvidenceJson",
+          "name": "termination_evidence_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "createdAt",
           "name": "created_at",
           "kind": "text",
@@ -16905,6 +16977,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "leaseId"
           ],
           "unique": false
+        },
+        {
+          "name": "idx_workspace_lease_owner",
+          "columns": [
+            "ownerEpoch",
+            "leaseId"
+          ],
+          "unique": false
         }
       ],
       "checks": [],
@@ -16930,6 +17010,27 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "workspaceLeaseId",
           "name": "workspace_lease_id",
           "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "resolutionAuthority",
+          "name": "resolution_authority",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"execution_proven\"",
+          "defaultExpression": "\"execution_proven\""
+        },
+        {
+          "property": "maintenanceEvidenceJson",
+          "name": "maintenance_evidence_json",
+          "kind": "text",
+          "mode": "json",
           "pgType": "text",
           "notNull": false,
           "primary": false,

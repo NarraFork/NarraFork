@@ -40,6 +40,7 @@ import {
 	verbatimOutputToMarkdown,
 } from "../sidecar-body";
 import { subagentResultText } from "../subagent-result-text";
+import { resolveToolDisplayDurationMs } from "../tool-display-duration";
 import { isToolQueuedBehindUpstream, type ToolUpstreamPeer } from "../tool-shimmer";
 import {
 	type CommunicationState,
@@ -577,6 +578,20 @@ interface AdapterTraceItem {
 	 * popover is portaled.
 	 */
 	timing?: Record<string, number>;
+	/**
+	 * The duration the row PAINTS, when it differs from `timing.durationMs`.
+	 *
+	 * `timing.durationMs` is the full span attributed to the call, including time
+	 * spent waiting on a gate or queued behind a sibling — correct for the popover's
+	 * "Total", misleading as the one figure beside a shell command. Resolved by
+	 * `@shared/tool-display-duration`, the same rule the card header uses.
+	 *
+	 * Absent when no duration is known. Height-neutral (one nowrap span in the row's
+	 * fixed line), but KEYED in `traceRevision`: it is painted from the cached
+	 * payload and can land alone when a late metadata patch arrives on an
+	 * already-terminal status.
+	 */
+	displayDurationMs?: number;
 	/** Selection / menu coordinates (renderer only, height-neutral). */
 	identity?: AdapterTraceRowIdentity;
 	/**
@@ -4251,12 +4266,22 @@ function toolTraceItem(
 	const canDrillDown = !!item.tc.toolUseId;
 	// The gate's own status, read with the same live-wins precedence the card uses.
 	const reflectionStatus = resolveToolReflectionStatus(item, ctx);
+	const category = ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson);
+	// The figure the row PAINTS, which is not always `timing.durationMs`: for bash
+	// that field absorbs permission / reflection / queue waiting, and a 1.2s command
+	// that waited 19s on a gate read as a 20s command. Same shared rule the card
+	// header uses — the two must not disagree about one call. Height-neutral.
+	const displayDurationMs = resolveToolDisplayDurationMs({
+		category,
+		execDurationMs: readFiniteNumber(asObject(resolveToolMetadata(item.tc)).execDurationMs),
+		durationMs: readFiniteNumber(item.tc.durationMs) ?? deriveDuration(item.tc),
+	});
 	return {
 		title: truncateTitle(rawTitle),
 		hasIcon: true,
 		iconColor: ctx.resolveToolColor?.(item.tc.toolName, item.tc.inputJson),
 		toolName: item.tc.toolName,
-		category: ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson),
+		category,
 		key: toolItemKey(item),
 		summary,
 		status: item.tc.status ?? null,
@@ -4273,9 +4298,10 @@ function toolTraceItem(
 		// own card), so this is usually absent; it exists so the row is correct wherever
 		// a gated call does end up folded, rather than silently mis-coloured.
 		...(reflectionStatus ? { reflectionStatus } : {}),
-		// Same stamp record a subagent card's header uses, so a folded row shows the
-		// SAME duration the full card would at a higher LOD. Height-neutral.
+		// Same stamp record a subagent card's header uses, so the row's timing popover
+		// reports the same phase breakdown the full card would. Height-neutral.
 		timing: cardTiming(item.tc),
+		...(displayDurationMs != null ? { displayDurationMs } : {}),
 		identity: toolRowIdentity(item),
 		// Same value the standalone card carries, so the two renderings of this tool
 		// are pairable across an LOD change (see AdapterTraceItem.unitId).

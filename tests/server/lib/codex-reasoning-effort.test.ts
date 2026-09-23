@@ -1,9 +1,12 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { getCodexReasoningEffortOptions } from "../../../frontend/components/narrator/narrator-panel-reasoning";
 import {
 	normalizeCodexReasoningEffort,
 	resolveCodexRequestReasoningEffort,
 } from "../../../server/lib/agent/openai-provider";
-import { settings } from "../../../server/lib/settings";
+import { bindModelCatalogSettings } from "../../../server/lib/model-catalog";
+import { getDefaults, settings } from "../../../server/lib/settings";
+import { REASONING_EFFORT_VALUES } from "../../../shared/reasoning-effort";
 
 /**
  * GPT-6 Astra rejects `none` upstream: reasoning is mandatory on every request,
@@ -15,8 +18,45 @@ import { settings } from "../../../server/lib/settings";
 
 const originalDefaultEffort = settings.agent.defaultReasoningEffort;
 
+beforeEach(() => {
+	// Pin declared capabilities rather than relying on a changing bundled catalog.
+	const local = getDefaults();
+	local.agent.modelCatalog = {
+		schemaVersion: 2,
+		migrationVersion: 2,
+		autoApply: false,
+		pinnedVersion: null,
+		local: {
+			revision: 1,
+			models: [
+				{
+					id: "gpt-6-astra",
+					metadata: {
+						supports_reasoning: true,
+						reasoning_effort_levels: ["low", "medium", "high", "xhigh", "max"],
+						can_disable_reasoning: false,
+					},
+				},
+			],
+		},
+	} as unknown as NonNullable<typeof local.agent.modelCatalog>;
+	bindModelCatalogSettings(local, () => {});
+});
+
 afterEach(() => {
 	settings.agent.defaultReasoningEffort = originalDefaultEffort;
+	bindModelCatalogSettings(settings, () => {});
+});
+
+describe("unknown models expose all efforts", () => {
+	test("the Codex menu and request preserve every tier", () => {
+		const model = "codex:future-model-not-in-catalog";
+		expect(getCodexReasoningEffortOptions(model)).toEqual(REASONING_EFFORT_VALUES);
+		for (const effort of REASONING_EFFORT_VALUES) {
+			expect(normalizeCodexReasoningEffort(model, effort)).toBe(effort);
+			expect(resolveCodexRequestReasoningEffort(model, effort)).toBe(effort);
+		}
+	});
 });
 
 describe("normalizeCodexReasoningEffort — Astra mandatory reasoning", () => {

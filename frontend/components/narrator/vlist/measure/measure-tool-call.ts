@@ -124,6 +124,7 @@ import {
 import type { ReflectionNoticeData } from "@shared/pretext-layout/reflection";
 import { BARE_ROW_GAP, BARE_ROW_ICON } from "@shared/pretext-layout/row-metrics";
 import { letterSpacingPxFor, scaleFontSize } from "@shared/pretext-layout/typography";
+import { resolveToolDisplayDurationMs } from "@shared/tool-display-duration";
 import { MARKDOWN_CONSTANTS } from "../parse-markdown";
 import {
 	accumulateFrame,
@@ -2035,9 +2036,11 @@ export function measureToolCall(
 		diffStats: data.diffStats ?? null,
 		isRemoteTarget: data.isRemoteTarget === true,
 		isTakenOver: data.isTakenOver === true,
-		// Bash prefers pure execution time (mirrors the chunked getBashExecDurationMs).
-		displayDurationMs:
-			(data.category === "bash" ? data.execDurationMs : undefined) ?? data.durationMs ?? null,
+		// Bash prefers pure execution time. The rule lives in
+		// `@shared/tool-display-duration` so the folded trace row applies the SAME one —
+		// it used to paint raw `durationMs`, and one call reported 1s as a card and 20s
+		// as a row.
+		displayDurationMs: resolveToolDisplayDurationMs(data),
 		startedAt: data.startedAt ?? null,
 		timeoutMs: data.timeoutMs ?? null,
 		timing: resolveToolTimingStamps(data),

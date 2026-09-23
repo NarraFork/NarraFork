@@ -1277,6 +1277,42 @@ export const miscApi = {
 		}),
 
 	// Workspace write barriers (human-driven external recovery, admin only)
+	retryWorkspaceRecoveryPersistence: (scopeId: string) =>
+		request<{ retried: number; remaining: number }>(
+			`/storage/workspace-barriers/${encodeURIComponent(scopeId)}/retry-persistence`,
+			{ method: "POST" },
+		),
+	beginWorkspaceMaintenance: (
+		scopeId: string,
+		data: { leaseId?: string; acknowledgeWritersStopped: true; operatorReason: string },
+	) =>
+		request<{ maintenanceToken: string; expiresAt: string; generation: string }>(
+			`/storage/workspace-barriers/${encodeURIComponent(scopeId)}/maintenance/begin`,
+			{ method: "POST", body: JSON.stringify(data) },
+		),
+	observeWorkspaceMaintenance: (scopeId: string, maintenanceToken: string, signal?: AbortSignal) =>
+		request<WorkspaceBarrierObservationResult>(
+			`/storage/workspace-barriers/${encodeURIComponent(scopeId)}/maintenance/observe`,
+			{ method: "POST", body: JSON.stringify({ maintenanceToken }), signal },
+		),
+	cancelWorkspaceMaintenance: (scopeId: string, maintenanceToken: string) =>
+		request<{ cancelled: boolean }>(
+			`/storage/workspace-barriers/${encodeURIComponent(scopeId)}/maintenance/cancel`,
+			{ method: "POST", body: JSON.stringify({ maintenanceToken }) },
+		),
+	commitWorkspaceMaintenance: (
+		scopeId: string,
+		data: {
+			maintenanceToken: string;
+			confirmationToken: string;
+			acknowledgements: { effectId: string; verdict: WorkspaceBarrierVerdict }[];
+			acknowledgeInspected?: boolean;
+		},
+	) =>
+		request<WorkspaceBarrierRecoveryResult>(
+			`/storage/workspace-barriers/${encodeURIComponent(scopeId)}/maintenance/commit`,
+			{ method: "POST", body: JSON.stringify(data) },
+		),
 	getWorkspaceBarriers: (cursor?: string) =>
 		request<{ items: WorkspaceBarrier[]; nextCursor: string | null }>(
 			`/storage/workspace-barriers${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,

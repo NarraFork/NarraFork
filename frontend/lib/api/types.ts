@@ -425,6 +425,8 @@ export interface WorkspaceBarrier {
 	ranges: { kind: string; canonicalPath: string }[];
 	executionEnded: boolean;
 	blockedReason: string | null;
+	maintenanceRequired?: boolean;
+	ownerProbeRetryAllowed?: boolean;
 	kind: "quarantined" | "unverified_root";
 	local: boolean;
 	operations: WorkspaceBarrierOperation[];
@@ -460,6 +462,7 @@ export interface WorkspaceBarrierObservationResult {
 }
 
 export interface WorkspaceBarrierRecoveryResult {
+	remaining?: { rootVerificationRequired: boolean; legacyBarrier: boolean; leaseBarrier: boolean };
 	recovered: "barrier_cleared" | "root_verified";
 	settledEffectCount: number;
 	revision?: number;

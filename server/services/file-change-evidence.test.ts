@@ -267,6 +267,97 @@ function settle(
 	});
 }
 
+describe("explicit atomic settlement transactions", () => {
+	test("effect and terminal outcome commit together or both roll back", async () => {
+		const { operation, effect } = await readyEffect();
+		apply(effect);
+		expect(() =>
+			db.transaction((tx) => {
+				service.settleEffect({ ...effectSelector(effect), receipt: receipt(effect) }, tx);
+				service.finishOperation(operation.id, "interrupted", tx);
+				throw new Error("lease manifest failed");
+			}),
+		).toThrow("lease manifest failed");
+		expect(service.getEffect(effect.operationId, effect.mutationId)).toMatchObject({
+			settlement: "applying",
+			executionReceiptJson: null,
+		});
+		expect(service.getOperation(operation.id)?.executionOutcome).toBe("running");
+		db.transaction((tx) => {
+			service.settleEffect({ ...effectSelector(effect), receipt: receipt(effect) }, tx);
+			service.finishOperation(operation.id, "interrupted", tx);
+		});
+		expect(service.getEffect(effect.operationId, effect.mutationId)).toMatchObject({
+			settlement: "settled",
+			executionConfirmed: true,
+		});
+		expect(service.getOperation(operation.id)?.executionOutcome).toBe("interrupted");
+	});
+
+	test("explicit transaction must be active on the journal connection", async () => {
+		const { operation, effect } = await readyEffect();
+		apply(effect);
+		let expired!: Parameters<typeof service.settleEffect>[1];
+		db.transaction((tx) => {
+			expired = tx;
+		});
+		expect(() =>
+			service.settleEffect({ ...effectSelector(effect), receipt: receipt(effect) }, expired),
+		).toThrow("current same-connection");
+		expect(() => db.transaction(() => service.finishOperation(operation.id, "failed"))).toThrow(
+			"ambient transaction",
+		);
+		expect(() =>
+			db.transaction(() =>
+				service.finishOperation(operation.id, "failed", {} as NonNullable<typeof expired>),
+			),
+		).toThrow("current same-connection");
+	});
+
+	test.each([
+		false,
+		true,
+	])("preparation no-dispatch remains terminal and non-replayable (prepared=%s)", async (prepared) => {
+		activate();
+		const input = operationInput();
+		const operation = service.beginOperation(input);
+		const effect = prepared ? service.prepareEffects(operation.id, [effectInput()])[0] : undefined;
+		const result = service.finishPreparationWithoutDispatch(operation.id, {
+			targetDispatched: false,
+			reason: "cancelled_before_dispatch",
+		});
+		expect(result).toMatchObject({
+			settlement: "settled",
+			executionOutcome: "interrupted",
+			effectOutcome: "no_change",
+			reason: "no_dispatch:cancelled_before_dispatch",
+		});
+		expect(service.beginOperation(input).id).toBe(operation.id);
+		if (effect) {
+			expect(service.getEffect(effect.operationId, effect.mutationId)).toMatchObject({
+				settlement: "settled",
+				outcome: "no_change",
+				linesAdded: 0,
+			});
+			const settled = service.getEffect(effect.operationId, effect.mutationId);
+			if (!settled) throw new Error("Missing settled effect");
+			expect(hasConfirmedNoFileChange(sharedEffect(settled))).toBe(true);
+			expect(apply(effect).mayExecute).toBe(false);
+		}
+	});
+
+	test("no-dispatch proof cannot erase an applying effect", async () => {
+		const { operation, effect } = await readyEffect();
+		apply(effect);
+		expect(() =>
+			service.finishPreparationWithoutDispatch(operation.id, {
+				targetDispatched: false,
+				reason: "validation_rejected",
+			}),
+		).toThrow("preparation");
+	});
+});
+
 function sharedEffect(effect: FileChangeEffectRecord): FileChangeEffect {
 	return {
 		id: effect.id,

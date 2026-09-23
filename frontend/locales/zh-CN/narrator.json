@@ -132,6 +132,13 @@
 		"success": "已成功",
 		"failed": "已失败"
 	},
+	"traceRowMark": {
+		"running": "正在执行",
+		"queued": "等待前面的工具完成",
+		"awaiting": "等待决定",
+		"failed": "已失败",
+		"cancelled": "已取消"
+	},
 	"toolCallsStatusOk": "{{count}} 成功",
 	"toolCallsStatusMixed": "{{success}} 成功 · {{fail}} 失败",
 	"reasoningCount": "{{count}} 步推理",

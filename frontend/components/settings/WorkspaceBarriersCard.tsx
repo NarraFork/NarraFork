@@ -1,9 +1,21 @@
-import { Alert, Badge, Button, Checkbox, Divider, Group, Paper, Stack, Text } from "@mantine/core";
+import {
+	Alert,
+	Badge,
+	Button,
+	Checkbox,
+	Divider,
+	Group,
+	Paper,
+	Stack,
+	Text,
+	Textarea,
+} from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { IconAlertTriangle, IconEyeSearch, IconShieldCheck } from "@tabler/icons-react";
 import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useCurrentUser } from "../../hooks/useAuth";
 import {
 	api,
 	type WorkspaceBarrier,
@@ -20,6 +32,11 @@ import { useConfirmDialog } from "../common/confirm-dialog-context";
  * here before any overlapping write is admitted again.
  */
 export function WorkspaceBarriersCard() {
+	const { data: user } = useCurrentUser();
+	if (user?.role !== "admin") return null;
+	return <AdminWorkspaceBarriersCard />;
+}
+function AdminWorkspaceBarriersCard() {
 	const { t } = useTranslation("settings");
 	const queryClient = useQueryClient();
 	const { data, isLoading, error, hasNextPage, fetchNextPage, isFetchingNextPage } =
@@ -104,6 +121,71 @@ function BarrierRow({
 	const [observation, setObservation] = useState<WorkspaceBarrierObservationResult | null>(null);
 	const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
 	const [inspected, setInspected] = useState(false);
+	const [maintenance, setMaintenance] = useState<{
+		maintenanceToken: string;
+		expiresAt: string;
+	} | null>(null);
+	const [writersStopped, setWritersStopped] = useState(false);
+	const [operatorReason, setOperatorReason] = useState("");
+	const maintenanceRef = useRef(maintenance);
+	maintenanceRef.current = maintenance;
+	useEffect(
+		() => () => {
+			const session = maintenanceRef.current;
+			if (session)
+				void api
+					.cancelWorkspaceMaintenance(barrier.scope.id, session.maintenanceToken)
+					.catch(() => {});
+		},
+		[barrier.scope.id],
+	);
+	useEffect(() => {
+		if (!maintenance) return;
+		const timer = setTimeout(
+			() => {
+				setMaintenance(null);
+				setObservation(null);
+			},
+			Math.max(0, Date.parse(maintenance.expiresAt) - Date.now()),
+		);
+		return () => clearTimeout(timer);
+	}, [maintenance]);
+	const maintenanceError = (error: unknown) =>
+		notifications.show({
+			color: "red",
+			message: error instanceof Error ? error.message : String(error),
+		});
+	const retryPersistence = useMutation({
+		mutationFn: () => api.retryWorkspaceRecoveryPersistence(barrier.scope.id),
+		onSuccess: () => {
+			onRecovered();
+			notifications.show({ color: "green", message: t("workspaceBarriersRetryPersistenceDone") });
+		},
+		onError: maintenanceError,
+	});
+	const beginMaintenance = useMutation({
+		mutationFn: () =>
+			api.beginWorkspaceMaintenance(barrier.scope.id, {
+				leaseId: barrier.leaseId ?? undefined,
+				acknowledgeWritersStopped: true,
+				operatorReason,
+			}),
+		onSuccess: (result) => {
+			setMaintenance(result);
+			setObservation(null);
+		},
+		onError: maintenanceError,
+	});
+	const cancelMaintenance = useMutation({
+		mutationFn: () =>
+			api.cancelWorkspaceMaintenance(barrier.scope.id, maintenance?.maintenanceToken ?? ""),
+		onSuccess: () => {
+			setMaintenance(null);
+			setObservation(null);
+			onRecovered();
+		},
+		onError: maintenanceError,
+	});
 	const observeController = useRef<AbortController | null>(null);
 	useEffect(() => () => observeController.current?.abort(), []);
 
@@ -112,6 +194,12 @@ function BarrierRow({
 			observeController.current?.abort();
 			observeController.current = new AbortController();
 			setObservation(null);
+			if (maintenance)
+				return api.observeWorkspaceMaintenance(
+					barrier.scope.id,
+					maintenance.maintenanceToken,
+					observeController.current.signal,
+				);
 			return api.observeWorkspaceBarrier(
 				barrier.scope.id,
 				barrier.leaseId,
@@ -132,22 +220,34 @@ function BarrierRow({
 	});
 
 	const recoverMutation = useMutation({
-		mutationFn: () =>
-			api.recoverWorkspaceBarrier(barrier.scope.id, {
-				leaseId: barrier.leaseId ?? undefined,
+		mutationFn: () => {
+			const request = {
 				confirmationToken: observation?.confirmationToken ?? "",
 				acknowledgements: (observation?.observations ?? [])
 					.filter((entry) => checked.has(entry.effectId))
 					.map((entry) => ({ effectId: entry.effectId, verdict: entry.verdict })),
 				acknowledgeInspected: inspected,
-			}),
+			};
+			return maintenance
+				? api.commitWorkspaceMaintenance(barrier.scope.id, {
+						...request,
+						maintenanceToken: maintenance.maintenanceToken,
+					})
+				: api.recoverWorkspaceBarrier(barrier.scope.id, {
+						...request,
+						leaseId: barrier.leaseId ?? undefined,
+					});
+		},
 		onSuccess: (result) => {
+			setMaintenance(null);
 			notifications.show({
 				color: "green",
 				message:
-					result.recovered === "root_verified"
-						? t("workspaceBarriersRootVerified")
-						: t("workspaceBarriersRecovered", { count: result.settledEffectCount }),
+					result.remaining && Object.values(result.remaining).some(Boolean)
+						? t("workspaceBarriersRemaining")
+						: result.recovered === "root_verified"
+							? t("workspaceBarriersRootVerified")
+							: t("workspaceBarriersRecovered", { count: result.settledEffectCount }),
 			});
 			setObservation(null);
 			onRecovered();
@@ -170,7 +270,8 @@ function BarrierRow({
 		!isRootVerification && (noEffects || (observation?.rangeObservations.length ?? 0) > 0);
 	const recoverReady =
 		observation !== null &&
-		!barrier.blockedReason &&
+		(!barrier.blockedReason || !!maintenance || !!barrier.ownerProbeRetryAllowed) &&
+		!cancelMaintenance.isPending &&
 		(isRootVerification || noEffects || allChecked) &&
 		(!needsInspection || inspected);
 
@@ -248,11 +349,30 @@ function BarrierRow({
 					<Group gap="xs" wrap="nowrap">
 						<Button
 							size="xs"
+							variant="subtle"
+							disabled={
+								!barrier.local ||
+								!!maintenance ||
+								recoverMutation.isPending ||
+								observeMutation.isPending
+							}
+							loading={retryPersistence.isPending}
+							onClick={() => retryPersistence.mutate()}
+						>
+							{t("workspaceBarriersRetryPersistence")}
+						</Button>
+						<Button
+							size="xs"
 							variant="light"
 							leftSection={<IconEyeSearch size={14} />}
 							onClick={() => observeMutation.mutate()}
 							loading={observeMutation.isPending}
-							disabled={!barrier.local || !!barrier.blockedReason || recoverMutation.isPending}
+							disabled={
+								!barrier.local ||
+								(!!barrier.blockedReason && !maintenance && !barrier.ownerProbeRetryAllowed) ||
+								recoverMutation.isPending ||
+								cancelMaintenance.isPending
+							}
 							title={!barrier.local ? t("workspaceBarriersRemoteUnsupported") : undefined}
 						>
 							{t("workspaceBarriersObserve")}
@@ -282,6 +402,49 @@ function BarrierRow({
 					</Group>
 				</Group>
 
+				{barrier.maintenanceRequired && barrier.local && !maintenance && (
+					<Alert color="orange">
+						<Stack gap="xs">
+							<Text size="xs">{t("workspaceMaintenanceExplanation")}</Text>
+							<Checkbox
+								checked={writersStopped}
+								onChange={(event) => setWritersStopped(event.currentTarget.checked)}
+								label={t("workspaceMaintenanceWritersStopped")}
+							/>
+							<Textarea
+								label={t("workspaceMaintenanceReason")}
+								value={operatorReason}
+								maxLength={1000}
+								onChange={(event) => setOperatorReason(event.currentTarget.value)}
+							/>
+							<Button
+								size="xs"
+								disabled={!writersStopped || !operatorReason.trim()}
+								loading={beginMaintenance.isPending}
+								onClick={() => beginMaintenance.mutate()}
+							>
+								{t("workspaceMaintenanceBegin")}
+							</Button>
+						</Stack>
+					</Alert>
+				)}
+				{maintenance && (
+					<Alert color="orange">
+						<Text size="xs">
+							{t("workspaceMaintenanceActive", {
+								expiresAt: formatLocaleDateTime(maintenance.expiresAt),
+							})}
+						</Text>
+						<Button
+							size="xs"
+							variant="subtle"
+							loading={cancelMaintenance.isPending}
+							onClick={() => cancelMaintenance.mutate()}
+						>
+							{t("workspaceMaintenanceCancel")}
+						</Button>
+					</Alert>
+				)}
 				{hasForeign && (
 					<Alert color="red" variant="light" icon={<IconAlertTriangle size={16} />} py="xs">
 						<Text size="xs">{t("workspaceBarriersForeignWarning")}</Text>

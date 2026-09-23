@@ -608,6 +608,45 @@ describe("row status + timing are height-neutral", () => {
 		expect(without.rows[0]?.diffStats).toBeNull();
 	});
 
+	it("a row's painted duration is height-neutral", async () => {
+		// `displayDurationMs` shares the lane `status` / `timing` / `diffStats` occupy:
+		// one nowrap span inside the fixed 18.8px line. Widths included because the
+		// figure it replaces can be SHORTER (`1s` for `20s`) or longer (`1m30s`), and a
+		// row whose height depended on its own text width would betray that here.
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const base = { ...toolRows(1)[0], timing: { createdAt: 0, durationMs: 20_000 } };
+		const heights = new Set<number>();
+		for (const displayDurationMs of [undefined, null, 0, 1_200, 90_000, 3_600_000]) {
+			for (const width of [320, 512, 900]) {
+				const r = measureCollapsibleTrace(
+					{ items: [{ ...base, displayDurationMs }], maxVisible: 10 },
+					width,
+				);
+				heights.add(Math.round(r.height * 1000));
+				expect(r.rows[0]?.blockHeight).toBeCloseTo(18.8, 5);
+			}
+		}
+		// Width does not change a single row's height either, so one value for all.
+		expect(heights.size).toBe(1);
+	});
+
+	it("passes the painted duration through, defaulting to null", async () => {
+		// The renderer paints `displayDurationMs ?? timing.durationMs`, so a dropped
+		// passthrough would silently fall back to the 20s span this field exists to
+		// replace — a wrong number that still looks like a measurement.
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const base = { ...toolRows(1)[0], timing: { createdAt: 0, durationMs: 20_000 } };
+		const withFigure = measureCollapsibleTrace(
+			{ items: [{ ...base, displayDurationMs: 1_200 }], maxVisible: 10 },
+			512,
+		);
+		expect(withFigure.rows[0]?.displayDurationMs).toBe(1_200);
+		// And the full span survives alongside it: the popover's "Total" needs it.
+		expect(withFigure.rows[0]?.timing?.durationMs).toBe(20_000);
+		const without = measureCollapsibleTrace({ items: [base], maxVisible: 10 }, 512);
+		expect(without.rows[0]?.displayDurationMs).toBeNull();
+	});
+
 	it("the five-state SHIMMER cannot move the row either", async () => {
 		// A row now animates in one of five states (neutral / purple / blue, plus a
 		// one-shot green / red) derived from `status` + `shimmer`. That is safe ONLY

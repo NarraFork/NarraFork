@@ -222,8 +222,8 @@ describe("mapGenericReasoningEffort", () => {
 		expect(mapGenericReasoningEffort("GLM-5.1", "max")).toBe("max");
 	});
 
-	test("clamps xhigh onto max, which the generic ladder tops out at", () => {
-		expect(mapGenericReasoningEffort("GLM-5.1", "xhigh")).toBe("max");
+	test("preserves xhigh for models without declared tiers", () => {
+		expect(mapGenericReasoningEffort("GLM-5.1", "xhigh")).toBe("xhigh");
 	});
 
 	test("passes none through so reasoning can be disabled explicitly", () => {
@@ -246,7 +246,14 @@ describe("mapGenericReasoningEffort", () => {
 		expect(mapGenericReasoningEffort("responses:GLM-5.1", "high")).toBe("high");
 	});
 
-	test("the generic ladder omits xhigh but keeps none and max", () => {
-		expect(GENERIC_REASONING_EFFORT_TIERS).toEqual(["none", "low", "medium", "high", "max"]);
+	test("the generic ladder exposes all reasoning tiers", () => {
+		expect(GENERIC_REASONING_EFFORT_TIERS).toEqual([
+			"none",
+			"low",
+			"medium",
+			"high",
+			"xhigh",
+			"max",
+		]);
 	});
 });

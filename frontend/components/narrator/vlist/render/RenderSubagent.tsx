@@ -91,8 +91,9 @@ import {
 } from "./RenderToolCall";
 import { subagentFilePathDisplays } from "./subagent-file-paths";
 import {
-	hasToolRowStatusMark,
 	isTerminalToolRowStatus,
+	resolveToolRowStatusMark,
+	type ToolRowStatusMark,
 	TRACE_ROW_STATUS_SLOT_STYLE,
 	TraceRowStatusGlyph,
 } from "./trace-row-status";
@@ -150,9 +151,15 @@ export interface SubagentLabels {
 	 * layer's English fallbacks. Height-neutral (portaled popover / fixed rows).
 	 */
 	timing?: ToolTimingLabels;
+	/**
+	 * Names for a recent-call row's status MARK, for readers who get neither the
+	 * glyph's colour nor its shape. Absent → the glyph's own English fallbacks.
+	 * Attributes only → height-neutral.
+	 */
+	statusMark?: Partial<Record<ToolRowStatusMark, string>>;
 }
 
-const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing">> = {
+const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing" | "statusMark">> = {
 	recentCalls: "Recent calls",
 	openSession: "Open full session",
 	prompt: "Prompt",
@@ -212,11 +219,12 @@ function withCount(template: string, count: number): string {
 }
 
 /**
- * Labels after merging the defaults: every string is present, while `timing` stays
- * optional because ToolTimingArea owns its own English fallback bundle.
+ * Labels after merging the defaults: every string is present, while `timing` and
+ * `statusMark` stay optional because `ToolTimingArea` and `TraceRowStatusGlyph` own
+ * their own English fallback bundles.
  */
-type ResolvedSubagentLabels = Required<Omit<SubagentLabels, "timing">> &
-	Pick<SubagentLabels, "timing">;
+type ResolvedSubagentLabels = Required<Omit<SubagentLabels, "timing" | "statusMark">> &
+	Pick<SubagentLabels, "timing" | "statusMark">;
 
 interface RenderSubagentProps {
 	measured: MeasuredSubagent;
@@ -601,6 +609,12 @@ function SubagentInner({
 	let recentCalls: React.ReactNode = null;
 	if (measured.recentCallsHeight > 0) {
 		const rows = recentCallNames.slice(0, measured.recentRowCount);
+		// Resolved once per row, ahead of the map: the mark decides BOTH whether the
+		// 12px slot exists and which glyph fills it, and two separate evaluations of
+		// that question are how a slot ends up reserved around nothing.
+		const statusMarks = rows.map((_name, i) =>
+			resolveToolRowStatusMark(measured.recentCallTimings[i]?.status),
+		);
 		recentCalls = (
 			<div
 				key="recent"
@@ -701,12 +715,21 @@ function SubagentInner({
 										);
 									})()}
 								</Text>
-								{/* Only DEVIATION is marked (in flight / failed / cancelled); a
-								    successful call draws nothing, so the slot is absent rather than
-								    blank — see @shared/tool-row-status. */}
-								{hasToolRowStatusMark(measured.recentCallTimings[i]?.status) ? (
+								{/* Only DEVIATION is marked (in flight / queued / awaiting / failed /
+								    cancelled); a successful call draws nothing, so the slot is absent
+								    rather than blank — see @shared/tool-row-status.
+
+								    No context is passed: this projection
+								    (`SubagentToolCallHeader`) carries no upstream-queue verdict and no
+								    gate status, so a queued child call still reads as in flight here.
+								    `pending` is nonetheless corrected by the shared rule, which is the
+								    case these rows actually hit. */}
+								{statusMarks[i] ? (
 									<Box data-testid="trace-row-status-slot" style={TRACE_ROW_STATUS_SLOT_STYLE}>
-										<TraceRowStatusGlyph status={measured.recentCallTimings[i]?.status} />
+										<TraceRowStatusGlyph
+											mark={statusMarks[i] as ToolRowStatusMark}
+											labels={labels.statusMark}
+										/>
 									</Box>
 								) : null}
 								{/* Per-row timing (SubagentCard.tsx:684 parity). `recentCallTimings`

@@ -10,6 +10,13 @@ const originalApi = { ...(await import("../../lib/api")) };
 const originalI18n = { ...(await import("react-i18next")) };
 const originalConfirm = { ...(await import("../common/confirm-dialog-context")) };
 const originalNotifications = { ...(await import("@mantine/notifications")) };
+const originalAuth = { ...(await import("../../hooks/useAuth")) };
+let admin = true;
+mock.module("../../hooks/useAuth", () => ({
+	...originalAuth,
+	useCurrentUser: () => ({ data: { role: admin ? "admin" : "user" } }),
+}));
+const maintenanceCalls: unknown[] = [];
 const pageCalls: (string | undefined)[] = [];
 const recoverCalls: unknown[] = [];
 let pages: { items: WorkspaceBarrier[]; nextCursor: string | null }[] = [];
@@ -25,6 +32,26 @@ mock.module("../../lib/api", () => ({
 		getWorkspaceBarriers: async (cursor?: string) => {
 			pageCalls.push(cursor);
 			return pages[cursor ? 1 : 0];
+		},
+		beginWorkspaceMaintenance: async (...args: unknown[]) => {
+			maintenanceCalls.push(["begin", ...args]);
+			return {
+				maintenanceToken: "m".repeat(64),
+				generation: "generation",
+				expiresAt: new Date(Date.now() + 300000).toISOString(),
+			};
+		},
+		observeWorkspaceMaintenance: async (scopeId: string, token: string, signal?: AbortSignal) => {
+			maintenanceCalls.push(["observe", scopeId, token]);
+			return observe(scopeId, null, signal);
+		},
+		cancelWorkspaceMaintenance: async (...args: unknown[]) => {
+			maintenanceCalls.push(["cancel", ...args]);
+			return { cancelled: true };
+		},
+		commitWorkspaceMaintenance: async (...args: unknown[]) => {
+			maintenanceCalls.push(["commit", ...args]);
+			return { recovered: "barrier_cleared", settledEffectCount: 0 };
 		},
 		observeWorkspaceBarrier: (...args: Parameters<typeof observe>) => observe(...args),
 		recoverWorkspaceBarrier: async (...args: unknown[]) => {
@@ -61,6 +88,8 @@ function install(key: string, value: unknown) {
 beforeEach(() => {
 	pageCalls.length = 0;
 	recoverCalls.length = 0;
+	maintenanceCalls.length = 0;
+	admin = true;
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
 	install("window", window);
 	install("document", window.document);
@@ -155,6 +184,50 @@ async function click(text: string) {
 }
 
 describe("workspace barrier confirmation UI", () => {
+	test("non-administrators never load or render workspace barriers", async () => {
+		admin = false;
+		await render();
+		expect(pageCalls).toEqual([]);
+		expect(container.textContent).not.toContain("workspaceBarriersTitle");
+		expect(container.querySelector("button")).toBeNull();
+	});
+	test("legacy unknown owner offers maintenance while live execution does not", async () => {
+		pages = [
+			{
+				items: [
+					barrier({
+						executionEnded: false,
+						blockedReason: "Unknown owner",
+						maintenanceRequired: true,
+					}),
+				],
+				nextCursor: null,
+			},
+		];
+		await render();
+		expect(container.textContent).toContain("workspaceMaintenanceExplanation");
+		expect(button("workspaceMaintenanceBegin").disabled).toBe(true);
+		expect(button("workspaceBarriersObserve").disabled).toBe(true);
+	});
+	test("identified native owner permits strict observation retry but never administrator maintenance", async () => {
+		pages = [
+			{
+				items: [
+					barrier({
+						executionEnded: false,
+						blockedReason: "Owner probe unknown",
+						ownerProbeRetryAllowed: true,
+						maintenanceRequired: false,
+					}),
+				],
+				nextCursor: null,
+			},
+		];
+		await render();
+		expect(button("workspaceBarriersObserve").disabled).toBe(false);
+		expect(container.textContent).not.toContain("workspaceMaintenanceBegin");
+		expect(button("workspaceBarriersRecoverAction").disabled).toBe(true);
+	});
 	test("loads the next cursor page and displays actual ranges, owner state and blocking reason", async () => {
 		pages = [
 			{ items: [], nextCursor: "scope:0" },

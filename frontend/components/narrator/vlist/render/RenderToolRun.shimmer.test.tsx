@@ -489,9 +489,20 @@ describe("a folded trace row is reachable without colour or a mouse", () => {
 				</MantineProvider>,
 			),
 		);
-		// A settled `fail` row paints no shimmer, so nothing is named — the label only
-		// describes a state the row is actually IN.
-		expect(root.querySelector("[aria-label]")).toBeNull();
+		// A settled `fail` row paints no shimmer, so the ROW carries no name — the
+		// shimmer label only describes a state the row is actually IN.
+		//
+		// Scoped to the row itself rather than "no `[aria-label]` in the tree": the
+		// status GLYPH is a second, independent label channel, and a failed row's red X
+		// is exactly the mark a colour-blind reader needs named (asserted below). The
+		// invariant here is about the shimmer label, so the selector has to say so.
+		expect(root.querySelector("[data-nf-trace-titlerow]")?.hasAttribute("aria-label")).toBe(false);
+		// The glyph, however, IS named — and from its own bundle, not the shimmer's.
+		expect(
+			root
+				.querySelector('[data-testid="trace-row-status-slot"] [aria-label]')
+				?.getAttribute("aria-label") ?? "",
+		).toBe("failed");
 
 		const live = measureActivityTrace(
 			[
@@ -513,9 +524,12 @@ describe("a folded trace row is reachable without colour or a mouse", () => {
 				</MantineProvider>,
 			),
 		);
-		expect(liveRoot.querySelector("[aria-label]")?.getAttribute("aria-label") ?? "").toContain(
-			"正在审查",
-		);
+		// Read off the ROW, not "the first labelled node": the status glyph also carries
+		// one now, and a `querySelector` that happened to reach it first would make this
+		// assertion about the wrong channel.
+		expect(
+			liveRoot.querySelector("[data-nf-trace-titlerow]")?.getAttribute("aria-label") ?? "",
+		).toContain("正在审查");
 	});
 
 	it("leaves a NON-expandable row out of the tab order", () => {

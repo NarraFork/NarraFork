@@ -62,6 +62,7 @@ import {
 	assertLocalWriteFootprint,
 	captureLocalWriteFootprint,
 } from "./file-change-write-footprint";
+import { retryWorkspaceMetadata } from "./workspace-metadata-retry";
 import {
 	type WorkspaceActivityToken,
 	type WorkspaceRuntimeBinding,
@@ -834,7 +835,13 @@ export class LocalFileChangeRuntime {
 			error: String(cause),
 		});
 		return this.coordinator.withWrite(
-			{ scope, runtime: request.runtime, signal, ranges: footprint.ranges },
+			{
+				scope,
+				runtime: request.runtime,
+				signal,
+				ranges: footprint.ranges,
+				executionClass: "local_file_io",
+			},
 			(lease) =>
 				withFileHistoryWrite(
 					{ deviceId: LOCAL_DEVICE_ID, pathFlavor, canonicalPath },
@@ -846,11 +853,10 @@ export class LocalFileChangeRuntime {
 								const existing = this.existingOperation(source.sourceInstanceId, request);
 								if (existing) throw alreadyAttempted(existing);
 								const assertTarget = async () => {
-									signal.throwIfAborted();
 									await request.assertBinding();
 									await assertLocalWriteFootprint(footprint);
 									lease.assertCurrent(lease.executionBinding);
-									const actual = await backend.resolvePathIdentity(lexicalPath, { signal });
+									const actual = await backend.resolvePathIdentity(lexicalPath);
 									if (
 										!backend.paths.equals(actual.canonicalPath, canonicalPath) ||
 										actual.runtimeGeneration !== request.runtime.runtimeGeneration ||
@@ -902,11 +908,20 @@ export class LocalFileChangeRuntime {
 									},
 									footprint,
 								);
-								this.evidence.finishOperation(
-									operation.id,
-									execution.result.kind === "applied" ? "succeeded" : "failed",
+								await retryWorkspaceMetadata(() =>
+									lease.settleWith(operation.id, (tx) => {
+										this.evidence.finishOperation(
+											operation.id,
+											signal.aborted
+												? "interrupted"
+												: execution.result.kind === "applied"
+													? "succeeded"
+													: "failed",
+											tx,
+										);
+										return { outcome: execution.leaseOutcome, value: undefined };
+									}),
 								);
-								lease.settle(operation.id, execution.leaseOutcome);
 								if (execution.result.kind !== "applied") {
 									logger.warn("Coordinated write failed without file history", {
 										operationId: operation.id,
@@ -914,6 +929,7 @@ export class LocalFileChangeRuntime {
 									});
 									throw execution.result.error;
 								}
+								signal.throwIfAborted();
 								const metadata = { ...prepared.result.metadata };
 								delete metadata.linesAdded;
 								delete metadata.linesRemoved;
@@ -1016,7 +1032,13 @@ export class LocalFileChangeRuntime {
 		};
 		try {
 			return await this.coordinator.withWrite(
-				{ scope, runtime: request.runtime, signal, ranges: footprint.ranges },
+				{
+					scope,
+					runtime: request.runtime,
+					signal,
+					ranges: footprint.ranges,
+					executionClass: "local_file_io",
+				},
 				// Fixed order: coordinator first, legacy mutex second. This preserves
 				// coordinator nesting rejection, rollback barriers and bounded admission.
 				// Use the frozen cwd, NOT the evidence root: Bash and legacy tools key
@@ -1048,6 +1070,31 @@ export class LocalFileChangeRuntime {
 										ownerUserId: request.userId,
 										executionBinding: lease.executionBinding,
 										executionSegmentId: request.executionSegmentId ?? null,
+									};
+									const settlePreparation = async (
+										operation: FileChangeOperationRecord,
+										effect?: FileChangeEffectRecord,
+									) => {
+										const mutationId = effect?.mutationId ?? operation.id;
+										lease.registerMutation(mutationId, {
+											operationId: operation.id,
+											effectId: effect?.id,
+										});
+										await retryWorkspaceMetadata(() =>
+											lease.settleWith(mutationId, (tx) => ({
+												outcome: "not_applied",
+												value: this.evidence.finishPreparationWithoutDispatch(
+													operation.id,
+													{
+														targetDispatched: false,
+														reason: signal.aborted
+															? "cancelled_before_dispatch"
+															: "validation_rejected",
+													},
+													tx,
+												),
+											})),
+										);
 									};
 									const assertTarget = async (beforePreparation = false) => {
 										try {
@@ -1108,6 +1155,7 @@ export class LocalFileChangeRuntime {
 											true,
 										);
 									} catch (error) {
+										if (error instanceof BlobHistoryUnavailableBeforeDispatch) throw error;
 										// Quota and cancellation remain normal errors. Only unavailable
 										// namespace/content before journal dispatch permits degradation.
 										if (
@@ -1144,32 +1192,49 @@ export class LocalFileChangeRuntime {
 												{ cause: error },
 											);
 										}
+										const rejected = this.evidence.beginOperation(operationInput);
+										try {
+											request.linkOperation?.(rejected.id);
+										} finally {
+											await settlePreparation(rejected);
+										}
 										throw error;
 									}
 									const operation = this.evidence.beginOperation(operationInput);
-									request.linkOperation?.(operation.id);
-									const effect = this.evidence.prepareEffects(operation.id, [
-										{
-											identity,
-											scopeRevision,
-											requestDigest,
-											before: beforeState,
-											intendedAfter: afterState,
-										},
-									])[0];
-									await this.evidence.finalizePreparation(operation.id, { signal });
+									let effect: FileChangeEffectRecord | undefined;
+									try {
+										request.linkOperation?.(operation.id);
+										effect = this.evidence.prepareEffects(operation.id, [
+											{
+												identity,
+												scopeRevision,
+												requestDigest,
+												before: beforeState,
+												intendedAfter: afterState,
+											},
+										])[0];
+										await this.evidence.finalizePreparation(operation.id, { signal });
+										signal.throwIfAborted();
+										if (
+											!this.evidence.markApplying({
+												operationId: operation.id,
+												mutationId: effect.mutationId,
+												requestDigest,
+												executionBinding: lease.executionBinding,
+											}).mayExecute
+										)
+											throw alreadyAttempted(operation);
+									} catch (error) {
+										// No apply adapter has been called. Persist this positive fact,
+										// keeping the attempt identity as a durable replay barrier.
+										await settlePreparation(operation, effect);
+										throw error;
+									}
 									const selector = {
 										operationId: operation.id,
 										mutationId: effect.mutationId,
 										requestDigest,
 									};
-									if (
-										!this.evidence.markApplying({
-											...selector,
-											executionBinding: lease.executionBinding,
-										}).mayExecute
-									)
-										throw alreadyAttempted(operation);
 									lease.registerMutation(effect.mutationId, {
 										operationId: operation.id,
 										effectId: effect.id,
@@ -1224,31 +1289,43 @@ export class LocalFileChangeRuntime {
 											confirmed: execution.confirmed,
 											localIo: execution.diagnostics,
 										};
-										const settled = this.evidence.settleEffect({
-											...selector,
-											receipt,
-											attributionCeiling,
-											linesAdded: prepared.lineStats?.added,
-											linesRemoved: prepared.lineStats?.removed,
-										});
 										const verified = applied && fileChangeStatesEqual(afterState, observedAfter);
-										this.evidence.finishOperation(
-											operation.id,
-											ioError || !verified
-												? signal.aborted
-													? "interrupted"
-													: "failed"
-												: "succeeded",
-										);
-										lease.settle(
-											effect.mutationId,
-											settled.settlement === "settled" ? execution.leaseOutcome : "unknown",
+										const settled = await retryWorkspaceMetadata(() =>
+											lease.settleWith(effect.mutationId, (tx) => {
+												const value = this.evidence.settleEffect(
+													{
+														...selector,
+														receipt,
+														attributionCeiling,
+														linesAdded: prepared.lineStats?.added,
+														linesRemoved: prepared.lineStats?.removed,
+													},
+													tx,
+												);
+												// A lock retry may outlive cancellation. The receipt stays
+												// fixed, but sample the tool outcome at the successful commit.
+												this.evidence.finishOperation(
+													operation.id,
+													signal.aborted
+														? "interrupted"
+														: ioError || !verified
+															? "failed"
+															: "succeeded",
+													tx,
+												);
+												return {
+													outcome:
+														value.settlement === "settled" ? execution.leaseOutcome : "unknown",
+													value,
+												};
+											}),
 										);
 										// Unknown/failed-but-dispatched effects remain visible with unmeasured
 										// counts. A positively non-applied or identical rewrite is not a change.
 										if (settled.outcome !== "no_change")
 											this.project(request, operation, settled, scope);
 										if (ioError) throw ioError;
+										signal.throwIfAborted();
 										if (!verified)
 											throw new Error(
 												"Local after state did not match the durable intent; reconciliation required",

@@ -715,6 +715,13 @@ function TimingText({
 	if (!showElapsed && !showDuration && timeoutMs == null) return null;
 	return (
 		<span
+			// The ONE marker every timing cell carries, in every form (card header,
+			// subagent header, recent-call row, folded trace row) — they all render this
+			// component. It exists so a test can compare the two forms' figures by
+			// SELECTING this cell: matching the tail of a row's `textContent` silently
+			// fails instead, because a chevron / flex spacer follows the timing.
+			// Attribute only → height-neutral.
+			data-nf-tool-timing
 			style={{
 				display: "inline-flex",
 				alignItems: "center",
@@ -1032,10 +1039,17 @@ export function ToolTimingArea({
 		if (!canEditTimeout) setEditorOpened(false);
 	}, [canEditTimeout]);
 
+	// The live counter measures EXECUTION when the call has an execution stamp, and
+	// only falls back to the caller's `startedAt` (stream start / creation) when it
+	// does not. Without this a call that spent 19s behind a reflection gate showed
+	// "19s" the instant it began running — a number that describes waiting, presented
+	// as the tool's own elapsed time. While it is still waiting there is no execution
+	// stamp, so the fallback keeps that phase counting as before.
+	const elapsedFrom = timing?.executionStartedAt ?? startedAt;
 	const text = (
 		<TimingText
 			running={running}
-			startedAt={startedAt}
+			startedAt={elapsedFrom}
 			durationMs={durationMs}
 			timeoutMs={timeoutMs}
 			timeoutInteractive={canEditTimeout}

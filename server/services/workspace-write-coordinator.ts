@@ -12,7 +12,13 @@ export {
 import {
 	workspaceWriteLeases as durableLeases,
 	fileChangeScopes as scopes,
+	workspaceExecutionOwners,
 } from "@server/db/schema";
+import {
+	assertWorkspaceMaintenanceAuthority,
+	assertWorkspaceOwnerEndedEvidence,
+	type WorkspaceOwnerEndedEvidence,
+} from "./workspace-execution-owner";
 import {
 	appendWorkspaceMutation,
 	pruneWorkspaceTerminalLeases,
@@ -42,6 +48,7 @@ import {
 	type FileChangeScopeIdentity,
 	fileChangeExecutionBindingMatches,
 } from "./file-change-identity";
+import { retryWorkspaceMetadata } from "./workspace-metadata-retry";
 
 export const WORKSPACE_WRITE_COORDINATOR_LIMITS = Object.freeze({
 	waitTimeoutMs: 2_000,
@@ -96,6 +103,7 @@ export class WorkspaceWriteCoordinatorError extends Error {
 		readonly code: WorkspaceWriteCoordinatorErrorCode,
 		message: string,
 		cause?: unknown,
+		readonly recoveryReason?: "owner_unknown",
 	) {
 		super(message, cause === undefined ? undefined : { cause });
 		this.name = "WorkspaceWriteCoordinatorError";
@@ -114,10 +122,12 @@ export interface WorkspaceWriteRequest {
 	leaseToken?: WorkspaceWriteLeaseToken;
 	/** Frozen physical mutation bounds; omitted means the entire scope subtree. */
 	ranges?: readonly WorkspaceWriteRange[];
+	/** Trusted native-IO caller only; unknown execution can outlive its owning process. */
+	executionClass?: "local_file_io" | "unknown";
 }
 
 export type WorkspaceWriteTarget = Readonly<
-	Pick<WorkspaceWriteRequest, "scope" | "runtime" | "ranges">
+	Pick<WorkspaceWriteRequest, "scope" | "runtime" | "ranges" | "executionClass">
 >;
 
 export interface WorkspaceWriteManyRequest {
@@ -162,6 +172,11 @@ export interface WorkspaceWriteLease {
 	assertMutationPending(mutationId: string): void;
 	/** Caller supplies an authoritative outcome, not an inference from current bytes. */
 	settle(mutationId: string, outcome: WorkspaceMutationOutcome): void;
+	/** Commit evidence and mutation guard together; the callback must be synchronous. */
+	settleWith<T>(
+		mutationId: string,
+		body: (tx: WorkspaceRecoveryTransaction) => { outcome: WorkspaceMutationOutcome; value: T },
+	): T;
 	/** Irreversible within this lease. Only external recovery may clear the quarantine. */
 	markUncertain(): void;
 }
@@ -278,7 +293,8 @@ export interface WorkspaceRecoveryInfo {
 	readonly scope: Readonly<FileChangeScopeIdentity>;
 	readonly leaseId: string | null;
 	readonly ranges: readonly WorkspaceWriteRange[];
-	readonly executionEnded: true;
+	/** False for an explicitly attested legacy maintenance recovery, never forged as proof. */
+	readonly executionEnded: boolean;
 	readonly scopeRevision: number;
 	readonly fencingToken: number;
 	readonly lease: WorkspaceLeaseRow | null;
@@ -288,6 +304,8 @@ export interface WorkspaceRecoveryInfo {
 	readonly generation: string;
 }
 export interface WorkspaceRecoveryReservation extends WorkspaceRecoveryInfo {
+	/** Revalidate a retained reservation between HTTP requests without releasing its ranges. */
+	assertCurrent(): void;
 	/** Synchronous evidence/audit writes and barrier clearance share this short transaction. */
 	complete<T>(work: (tx: WorkspaceRecoveryTransaction) => T): T;
 	release(): void;
@@ -465,13 +483,16 @@ export class WorkspaceWriteCoordinator {
 		const children = await Promise.allSettled(
 			group.records.flatMap((record) => [...record.children]),
 		);
+		for (const record of group.records) record.executionEnded = true;
 		try {
 			// All durable settlement commits, or every range remains a recovery hold.
-			this.transaction((tx) => {
-				for (const record of group.records) {
-					this.clearLeaseInTransaction(tx, record);
-				}
-			});
+			await retryWorkspaceMetadata(() =>
+				this.transaction((tx) => {
+					for (const record of group.records) {
+						this.clearLeaseInTransaction(tx, record);
+					}
+				}),
+			);
 		} catch (cause) {
 			for (const record of group.records) {
 				record.executionEnded = true;
@@ -692,8 +713,95 @@ export class WorkspaceWriteCoordinator {
 	}
 
 	/** Metadata-only qualification; an absent registry proves end ONLY within this owner epoch. */
+	/** A process-death proof only terminates controlled native IO, never a shell or unknown writer. */
+	recordLocalOwnerTermination(leaseId: string, proof: WorkspaceOwnerEndedEvidence): boolean {
+		assertString(leaseId, "leaseId", 256);
+		assertWorkspaceMaintenanceAuthority();
+		return this.transaction((tx) => {
+			const lease = tx.select().from(durableLeases).where(eq(durableLeases.leaseId, leaseId)).get();
+			if (!lease) throw fail("recovery_conflict", "Recovery lease disappeared");
+			assertWorkspaceOwnerEndedEvidence(proof, lease.ownerEpoch);
+			const owner = tx
+				.select({ identity: workspaceExecutionOwners.identityJson })
+				.from(workspaceExecutionOwners)
+				.where(eq(workspaceExecutionOwners.ownerEpoch, lease.ownerEpoch))
+				.get();
+			if (!owner?.identity || JSON.stringify(owner.identity) !== JSON.stringify(proof.identity)) {
+				throw fail(
+					"recovery_conflict",
+					"Persisted owner identity changed since termination observation",
+				);
+			}
+			if (
+				lease.deviceId !== "local" ||
+				lease.executionClass !== "local_file_io" ||
+				lease.ownerEpoch === this.state.ownerEpoch
+			) {
+				throw fail(
+					"recovery_conflict",
+					"Owner termination cannot acknowledge this execution class",
+				);
+			}
+			if (lease.executionEndedAt || lease.status === "settled" || lease.status === "recovered")
+				return false;
+			const scopeRow = tx.select().from(scopes).where(eq(scopes.id, lease.scopeId)).get();
+			if (!scopeRow) throw fail("scope_not_found", "Recovery scope disappeared");
+			const scope = copyScope(scopeRow);
+			const ranges = readWorkspaceRanges(lease, lease.rangesJson);
+			for (const reservation of this.state.recoveries?.values() ?? []) {
+				if (workspaceRangesIntersect(scope, ranges, reservation.scope, reservation.ranges)) {
+					throw fail("recovery_conflict", "A recovery already holds the owner termination range");
+				}
+			}
+			// Reuse live execution/activity checks. The capability—not a caller boolean—
+			// supplies the otherwise missing proof. No filesystem operation runs here.
+			this.inspectRecoveryWithAuthority({ scope, leaseId }, () => {
+				assertWorkspaceMaintenanceAuthority();
+				assertWorkspaceOwnerEndedEvidence(proof, lease.ownerEpoch);
+			});
+			const timestamp = now();
+			const updated = tx
+				.update(durableLeases)
+				.set({
+					status: "quarantined",
+					executionEndedAt: timestamp,
+					updatedAt: timestamp,
+					terminationEvidenceJson: {
+						version: 1,
+						kind: "owner_ended",
+						ownerEpoch: lease.ownerEpoch,
+						reason: proof.reason,
+						observedAt: proof.observedAt,
+					},
+				})
+				.where(
+					and(
+						eq(durableLeases.leaseId, leaseId),
+						eq(durableLeases.ownerEpoch, lease.ownerEpoch),
+						eq(durableLeases.status, lease.status),
+					),
+				)
+				.returning({ id: durableLeases.leaseId })
+				.get();
+			if (!updated)
+				throw fail("recovery_conflict", "Lease changed during owner termination acknowledgement");
+			if (scopeRow.activeLeaseId === leaseId) this.clearRecoveredScope(tx, scope, scopeRow, true);
+			return true;
+		});
+	}
 	inspectRecovery(input: WorkspaceRecoveryRequest): WorkspaceRecoveryInfo {
+		return this.inspectRecoveryWithAuthority(input);
+	}
+
+	private inspectRecoveryWithAuthority(
+		input: WorkspaceRecoveryRequest,
+		maintenanceAuthority?: () => void,
+	): WorkspaceRecoveryInfo {
+		maintenanceAuthority?.();
 		const scope = copyScope(input.scope);
+		if (maintenanceAuthority && scope.deviceId !== "local") {
+			throw fail("recovery_conflict", "Maintenance recovery requires a local workspace");
+		}
 		const current = this.requireScope(this.db, scope);
 		const leaseId = input.leaseId ?? current.activeLeaseId;
 		const lease = leaseId
@@ -710,9 +818,11 @@ export class WorkspaceWriteCoordinator {
 			throw fail("recovery_conflict", "Lease is not a matching recovery barrier");
 		if (input.leaseId && !lease && current.activeLeaseId !== input.leaseId)
 			throw fail("recovery_conflict", "Unknown recovery lease");
-		const ranges = lease
-			? readWorkspaceRanges(lease, lease.rangesJson)
-			: freezeWorkspaceRanges(scope);
+		// Legacy maintenance reserves the whole root, not only the displayed effect.
+		const ranges =
+			lease && !maintenanceAuthority
+				? readWorkspaceRanges(lease, lease.rangesJson)
+				: freezeWorkspaceRanges(scope);
 		for (const record of this.state.leases.values()) {
 			if (
 				record.leaseId === leaseId ||
@@ -736,13 +846,14 @@ export class WorkspaceWriteCoordinator {
 		}
 		if (!lease && !current.activeLeaseId && current.status !== "needs_verification")
 			throw fail("invalid_input", "Scope has no recovery barrier");
-		const rootIdentity = !lease
-			? this.db
-					.select({ rootIdentityJson: scopes.rootIdentityJson })
-					.from(scopes)
-					.where(eq(scopes.id, scope.id))
-					.get()?.rootIdentityJson
-			: undefined;
+		const rootIdentity =
+			!lease || maintenanceAuthority
+				? this.db
+						.select({ rootIdentityJson: scopes.rootIdentityJson })
+						.from(scopes)
+						.where(eq(scopes.id, scope.id))
+						.get()?.rootIdentityJson
+				: undefined;
 		const initialRootVerification =
 			!lease &&
 			current.status === "needs_verification" &&
@@ -801,10 +912,14 @@ export class WorkspaceWriteCoordinator {
 			}
 		}
 		const epoch = lease?.ownerEpoch ?? current.activeLeaseEpoch;
-		if (!initialRootVerification && !lease?.executionEndedAt && epoch !== this.state.ownerEpoch)
-			throw fail(
+		const executionEnded =
+			initialRootVerification || !!lease?.executionEndedAt || epoch === this.state.ownerEpoch;
+		if (!executionEnded && !maintenanceAuthority)
+			throw new WorkspaceWriteCoordinatorError(
 				"recovery_conflict",
 				"A different or unknown owner epoch is not proof that execution ended",
+				undefined,
+				"owner_unknown",
 			);
 		if (lease) {
 			lease.rangesJson = Object.freeze({ version: 1, ranges });
@@ -817,14 +932,20 @@ export class WorkspaceWriteCoordinator {
 			Object.freeze(lease);
 		}
 		const generation = createHash("sha256")
-			.update(JSON.stringify(lease ?? { ...current, rootIdentity }))
+			.update(
+				JSON.stringify(
+					maintenanceAuthority
+						? { lease, current, rootIdentity }
+						: (lease ?? { ...current, rootIdentity }),
+				),
+			)
 			.digest("hex");
 		return Object.freeze({
 			scope,
 			leaseId,
 			ranges,
 			lease,
-			executionEnded: true,
+			executionEnded,
 			scopeRevision: current.revision,
 			fencingToken: current.fencingToken,
 			rootVerification: current.status === "needs_verification",
@@ -834,7 +955,24 @@ export class WorkspaceWriteCoordinator {
 	}
 
 	reserveRecovery(input: WorkspaceRecoveryRequest): WorkspaceRecoveryReservation {
-		const info = this.inspectRecovery(input);
+		return this.reserveRecoveryWithAuthority(input);
+	}
+
+	/** Server-only maintenance capability. It cannot override a live execution or persistence hold. */
+	reserveMaintenance(
+		input: WorkspaceRecoveryRequest,
+		assertAuthority: () => void,
+	): WorkspaceRecoveryReservation {
+		if (typeof assertAuthority !== "function")
+			throw fail("invalid_input", "Maintenance requires a trusted authority check");
+		return this.reserveRecoveryWithAuthority(input, assertAuthority);
+	}
+
+	private reserveRecoveryWithAuthority(
+		input: WorkspaceRecoveryRequest,
+		maintenanceAuthority?: () => void,
+	): WorkspaceRecoveryReservation {
+		const info = this.inspectRecoveryWithAuthority(input, maintenanceAuthority);
 		const scope = info.scope;
 		const recoveryRequest = Object.freeze({ scope, leaseId: info.leaseId ?? undefined });
 		this.state.recoveries ??= new Map();
@@ -854,9 +992,18 @@ export class WorkspaceWriteCoordinator {
 				this.pump();
 			}
 		};
+		const assertCurrent = () => {
+			if (!reservations.has(token))
+				throw fail("recovery_conflict", "Recovery reservation was released");
+			const fresh = this.inspectRecoveryWithAuthority(recoveryRequest, maintenanceAuthority);
+			if (fresh.generation !== info.generation) {
+				throw fail("recovery_conflict", "Recovery barrier changed since reservation");
+			}
+		};
 		return Object.freeze({
 			...info,
 			release,
+			assertCurrent,
 			complete: <T>(work: (tx: WorkspaceRecoveryTransaction) => T): T => {
 				const client = (
 					this.db as WorkspaceWriteCoordinatorDb & { $client?: { inTransaction: boolean } }
@@ -869,18 +1016,20 @@ export class WorkspaceWriteCoordinator {
 				if (!reservations.has(token))
 					throw fail("recovery_conflict", "Recovery reservation was released");
 				const result = this.transaction((tx) => {
-					const fresh = this.inspectRecovery(recoveryRequest);
+					const fresh = this.inspectRecoveryWithAuthority(recoveryRequest, maintenanceAuthority);
 					if (fresh.generation !== info.generation)
 						throw fail("recovery_conflict", "Recovery barrier changed since reservation");
 					const value = work(tx);
 					if (value instanceof Promise)
 						throw fail("invalid_input", "Recovery transaction callback must be synchronous");
+					maintenanceAuthority?.();
 					if (info.lease) {
 						const recovered = tx
 							.update(durableLeases)
 							.set({
 								status: "recovered",
-								executionEndedAt: info.lease.executionEndedAt ?? now(),
+								executionEndedAt:
+									info.lease.executionEndedAt ?? (info.executionEnded ? now() : null),
 								updatedAt: now(),
 							})
 							.where(
@@ -973,6 +1122,53 @@ export class WorkspaceWriteCoordinator {
 	 * Retry ONLY a failed quarantine write after the execution body has ended.
 	 * This cannot resume IO, clear needs_verification, or reuse an old fence.
 	 */
+	/** Retry ended metadata holds only. Never restart a body or drop an unpersisted range. */
+	async retryFinishedPersistence(
+		scopeInput: Readonly<FileChangeScopeIdentity>,
+	): Promise<{ retried: number; remaining: number }> {
+		const scope = copyScope(scopeInput);
+		this.requireScope(this.db, scope);
+		const matches = (record: LeaseRecord) =>
+			record.executionEnded &&
+			record.persistencePending &&
+			workspaceRangesIntersect(
+				scope,
+				freezeWorkspaceRanges(scope),
+				record.scope,
+				record.ranges ?? freezeWorkspaceRanges(record.scope),
+			);
+		const records = [...this.state.leases.values()]
+			.filter(matches)
+			.slice(0, WORKSPACE_WRITE_COORDINATOR_LIMITS.batchScopes);
+		const processed = new Set<WorkspaceWriteLeaseToken>();
+		const deadline = performance.now() + 2_000;
+		let retried = 0;
+		for (const record of records) {
+			if (processed.has(record.token) || performance.now() >= deadline) continue;
+			const members = record.group?.records ?? [record];
+			if (members.some((member) => !member.executionEnded || !member.persistencePending)) {
+				throw fail(
+					"recovery_conflict",
+					"Only an entirely ended batch can retry metadata finalization",
+				);
+			}
+			await retryWorkspaceMetadata(
+				() =>
+					record.owner.transaction((tx) => {
+						for (const member of members) record.owner.clearLeaseInTransaction(tx, member);
+					}),
+				{ deadline },
+			);
+			for (const member of members) {
+				member.persistencePending = false;
+				processed.add(member.token);
+			}
+			if (record.group) record.owner.releaseGroup(record.group);
+			else record.owner.release(record);
+			retried += members.length;
+		}
+		return { retried, remaining: [...this.state.leases.values()].filter(matches).length };
+	}
 	retryUncertainPersistence(token: WorkspaceWriteLeaseToken): void {
 		const record = this.state.leases.get(token);
 		if (!record?.executionEnded || !record.persistencePending) {
@@ -1092,8 +1288,13 @@ export class WorkspaceWriteCoordinator {
 		record.closing = true;
 		// A forgotten await by a nested caller still cannot release executing work.
 		const children = await Promise.allSettled([...record.children]);
+		// IO really ended; keep the range registered during metadata backoff, but
+		// prevent a retained token from dispatching fresh work in that async gap.
+		record.executionEnded = true;
 		try {
-			this.transaction((tx) => this.clearLeaseInTransaction(tx, record));
+			await retryWorkspaceMetadata(() =>
+				this.transaction((tx) => this.clearLeaseInTransaction(tx, record)),
+			);
 		} catch (cause) {
 			record.executionEnded = true;
 			record.persistencePending = true;
@@ -1353,6 +1554,13 @@ export class WorkspaceWriteCoordinator {
 		leaseId: string,
 		row: { fencingToken: number; revision: number },
 	): void {
+		if (
+			request.executionClass !== undefined &&
+			request.executionClass !== "unknown" &&
+			(request.executionClass !== "local_file_io" || request.scope.deviceId !== "local")
+		) {
+			throw fail("invalid_input", "Native file IO classification requires a local execution");
+		}
 		const timestamp = now();
 		tx.insert(durableLeases)
 			.values({
@@ -1360,6 +1568,7 @@ export class WorkspaceWriteCoordinator {
 				scopeId: request.scope.id,
 				deviceId: request.scope.deviceId,
 				ownerEpoch: this.state.ownerEpoch,
+				executionClass: request.executionClass ?? "unknown",
 				runtimeEpoch: request.runtime.runtimeEpoch,
 				runtimeGeneration: request.runtime.runtimeGeneration,
 				fencingToken: row.fencingToken,
@@ -1446,6 +1655,10 @@ export class WorkspaceWriteCoordinator {
 				}
 			},
 			settle: (id: string, outcome: WorkspaceMutationOutcome) => this.settle(record, id, outcome),
+			settleWith: <T>(
+				id: string,
+				body: (tx: WorkspaceRecoveryTransaction) => { outcome: WorkspaceMutationOutcome; value: T },
+			) => this.settleWith(record, id, body),
 			markUncertain: () => {
 				this.requireLive(record);
 				record.uncertain = true;
@@ -1486,27 +1699,54 @@ export class WorkspaceWriteCoordinator {
 	}
 
 	private settle(record: LeaseRecord, id: string, outcome: WorkspaceMutationOutcome): void {
+		this.settleWith(record, id, () => ({ outcome, value: undefined }));
+	}
+
+	private settleWith<T>(
+		record: LeaseRecord,
+		id: string,
+		body: (tx: WorkspaceRecoveryTransaction) => { outcome: WorkspaceMutationOutcome; value: T },
+	): T {
 		this.requireLive(record);
 		if (record.mutations.get(id) !== "pending") {
 			throw fail("mutation_conflict", "Mutation is not pending on this lease");
 		}
-		if (outcome !== "applied" && outcome !== "not_applied" && outcome !== "unknown") {
-			throw fail("invalid_input", "Invalid mutation outcome");
+		// Updating the in-memory manifest before the OUTER commit would leave it ahead
+		// of a rolled-back evidence transaction and prevent a safe metadata-only retry.
+		const client = (
+			this.db as WorkspaceWriteCoordinatorDb & { $client?: { inTransaction: boolean } }
+		).$client;
+		if (client?.inTransaction) {
+			throw fail("invalid_input", "Mutation settlement must own the outermost transaction");
 		}
-		if (outcome === "unknown") record.uncertain = true;
-		this.transaction((tx) => {
-			this.requireLeaseRow(tx, record);
+		const result = this.transaction((tx) => {
+			// This is an immutable result for already-dispatched IO, not new execution.
+			// A device reconnect cannot invalidate its journal settlement; durable
+			// scope/fence/lease ownership is still checked against the original binding.
+			this.requireLeaseRow(tx, record, false);
+			const settled = body(tx);
+			if (
+				settled instanceof Promise ||
+				!settled ||
+				!["applied", "not_applied", "unknown"].includes(settled.outcome)
+			) {
+				throw fail("invalid_input", "Settlement requires a synchronous authoritative outcome");
+			}
 			settleWorkspaceMutation(
 				tx,
 				record.leaseId,
 				id,
-				outcome,
+				settled.outcome,
 				record.mutationIndexes?.get(id) ?? [...record.mutations.keys()].indexOf(id),
 			);
-			if (outcome !== "unknown") this.updateMutationCount(tx, record, pendingCount(record) - 1);
+			if (settled.outcome !== "unknown")
+				this.updateMutationCount(tx, record, pendingCount(record) - 1);
+			return settled;
 		});
-		record.mutations.set(id, outcome);
+		if (result.outcome === "unknown") record.uncertain = true;
+		record.mutations.set(id, result.outcome);
 		this.changed();
+		return result.value;
 	}
 
 	private requireLive(record: LeaseRecord): void {
@@ -1973,7 +2213,11 @@ function copyBatchTargets(input: readonly WorkspaceWriteTarget[]): readonly Work
 				!workspaceRangesContain(scope, ranges, previous.ranges ?? freezeWorkspaceRanges(scope)))
 		)
 			throw fail("invalid_input", "Duplicate scope IDs have conflicting ranges");
-		if (!previous) byId.set(scope.id, Object.freeze({ scope, runtime, ranges }));
+		const executionClass = target.executionClass ?? "unknown";
+		if (previous && previous.executionClass !== executionClass) {
+			throw fail("invalid_input", "Duplicate scope IDs have conflicting execution classes");
+		}
+		if (!previous) byId.set(scope.id, Object.freeze({ scope, runtime, ranges, executionClass }));
 	}
 	return Object.freeze(
 		[...byId.values()].sort((left, right) => {
@@ -2127,7 +2371,10 @@ function next(value: number): number {
 
 function scopeStatusError(status: typeof scopes.$inferSelect.status) {
 	return status === "needs_verification"
-		? fail("needs_verification", "Scope needs verification before a destructive operation")
+		? fail(
+				"needs_verification",
+				"Scope needs verification before a destructive operation. Check Settings → Storage → Workspace write barriers for the affected scope, recovery or administrator maintenance; retrying the edit does not clear this barrier.",
+			)
 		: fail("scope_inactive", "Scope is not active");
 }
 

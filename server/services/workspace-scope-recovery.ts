@@ -15,11 +15,14 @@ import {
 	fileChangeOperations,
 	fileChangeScopeRecoveries,
 	fileChangeScopes,
+	users,
+	workspaceExecutionOwners,
 	workspaceWriteLeases,
 } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { isWorkspaceProcessIdentity } from "../lib/workspace-process-identity";
 import type { FileChangeScopeIdentity } from "./file-change-identity";
 import { fileChangeLocalIo, localDirectoryIdentity } from "./file-change-local-io";
 import {
@@ -27,12 +30,17 @@ import {
 	type LocalFileChangeRuntime,
 } from "./file-change-runtime";
 import {
+	assertWorkspaceMaintenanceAuthority,
+	proveWorkspaceOwnerEnded,
+} from "./workspace-execution-owner";
+import type { WorkspaceRecoveryReservation } from "./workspace-write-coordinator";
+import {
 	WORKSPACE_WRITE_COORDINATOR_LIMITS,
 	WorkspaceWriteCoordinatorError,
 } from "./workspace-write-coordinator";
 import { WORKSPACE_LEASE_LIMITS } from "./workspace-write-lease-store";
 
-/** No disk writes. Observation is bounded and outside the final synchronous transaction. */
+/** No workspace file writes. Observation is bounded and outside the final synchronous transaction. */
 export const WORKSPACE_RECOVERY_LIMITS = Object.freeze({
 	pageItems: 25,
 	files: FILE_CHANGE_LIMITS.revertFiles,
@@ -42,6 +50,8 @@ export const WORKSPACE_RECOVERY_LIMITS = Object.freeze({
 	durationMs: 30_000,
 	metadataBytes: 2 * FILE_CHANGE_LIMITS.summaryBytes,
 	legacyAudits: 64,
+	maintenanceDurationMs: 5 * 60_000,
+	maintenanceSessions: 64,
 });
 const tokenSecret = randomBytes(32);
 
@@ -80,6 +90,8 @@ export interface WorkspaceBarrier {
 	ranges: { canonicalPath: string; kind: string }[];
 	executionEnded: boolean;
 	blockedReason: string | null;
+	maintenanceRequired: boolean;
+	ownerProbeRetryAllowed: boolean;
 	operations: WorkspaceBarrierOperationSummary[];
 	effects: WorkspaceBarrierEffectSummary[];
 }
@@ -98,6 +110,9 @@ export interface WorkspaceBarrierObservation {
 export interface WorkspaceScopeRecoveryDeps {
 	database: Pick<typeof defaultDb, "select">;
 	getRuntime(): Promise<Pick<LocalFileChangeRuntime, "coordinator" | "evidence">>;
+	/** Must prove exclusive local ownership; never supplied by the HTTP client. */
+	assertMaintenanceAuthority?: () => void;
+	now?: () => number;
 	/** Tests may tighten budgets, never expand the production ceilings. */
 	observationLimits?: Partial<{ fileBytes: number; totalBytes: number; durationMs: number }>;
 }
@@ -565,8 +580,225 @@ export interface WorkspaceRecoveryInput {
 	signal?: AbortSignal;
 }
 
+export interface WorkspaceMaintenanceInput {
+	scopeId: string;
+	adminUserId: string;
+	maintenanceToken: string;
+	signal?: AbortSignal;
+}
+interface MaintenanceSession {
+	token: string;
+	scopeId: string;
+	leaseId: string | null;
+	adminUserId: string;
+	oldOwnerEpoch: string | null;
+	operatorReason: string;
+	attestedAt: string;
+	expiresAt: number;
+	reservation: WorkspaceRecoveryReservation;
+	controller: AbortController;
+	timer: ReturnType<typeof setTimeout>;
+	inFlight?: Promise<unknown>;
+	closing: boolean;
+}
+
 export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 	const { database, getRuntime } = deps;
+	const now = deps.now ?? Date.now;
+	const authorityCheck = deps.assertMaintenanceAuthority ?? assertWorkspaceMaintenanceAuthority;
+	const assertAuthority = () => {
+		try {
+			authorityCheck();
+		} catch (error) {
+			throw new AppError(
+				error instanceof Error ? error.message : "Exclusive maintenance authority is unavailable",
+				409,
+				"MAINTENANCE_AUTHORITY_REQUIRED",
+			);
+		}
+	};
+	const maintenance = new Map<string, MaintenanceSession>();
+	function assertAdmin(adminUserId: string) {
+		if (
+			database.select({ role: users.role }).from(users).where(eq(users.id, adminUserId)).get()
+				?.role !== "admin"
+		)
+			throw new AppError("Administrator permission required", 403, "FORBIDDEN");
+	}
+	async function releaseMaintenance(session: MaintenanceSession) {
+		session.closing = true;
+		session.controller.abort();
+		clearTimeout(session.timer);
+		// Cancellation is not proof that native IO has ended. Retain the scope until joined.
+		try {
+			await session.inFlight;
+		} catch {
+			/* The IO caller receives its own error. */
+		}
+		session.reservation.release();
+		if (maintenance.get(session.token) === session) maintenance.delete(session.token);
+	}
+	function hasOwnerIdentity(oldOwnerEpoch: string | null) {
+		return (
+			!!oldOwnerEpoch &&
+			isWorkspaceProcessIdentity(
+				database
+					.select({ identity: workspaceExecutionOwners.identityJson })
+					.from(workspaceExecutionOwners)
+					.where(eq(workspaceExecutionOwners.ownerEpoch, oldOwnerEpoch))
+					.get()?.identity,
+			)
+		);
+	}
+	function assertLegacyOwner(oldOwnerEpoch: string | null) {
+		if (hasOwnerIdentity(oldOwnerEpoch))
+			throw new AppError(
+				"Registered owner requires strict process evidence, not administrator attestation",
+				409,
+				"MAINTENANCE_OWNER_INELIGIBLE",
+			);
+	}
+	function assertMaintenance(session: MaintenanceSession) {
+		assertAdmin(session.adminUserId);
+		assertAuthority();
+		assertLegacyOwner(session.oldOwnerEpoch);
+		if (session.closing || now() >= session.expiresAt) {
+			void releaseMaintenance(session);
+			throw new AppError(
+				"Maintenance permission expired or cancelled; begin again",
+				409,
+				"MAINTENANCE_EXPIRED",
+			);
+		}
+		session.reservation.assertCurrent();
+	}
+	function requireMaintenance(input: WorkspaceMaintenanceInput) {
+		const session = maintenance.get(input.maintenanceToken);
+		if (!session || session.scopeId !== input.scopeId || session.adminUserId !== input.adminUserId)
+			throw new AppError(
+				"Maintenance permission is invalid for this administrator and scope",
+				409,
+				"MAINTENANCE_INVALID",
+			);
+		return session;
+	}
+	async function withMaintenance<T>(
+		input: WorkspaceMaintenanceInput,
+		body: (session: MaintenanceSession, signal: AbortSignal) => Promise<T>,
+	): Promise<T> {
+		const session = requireMaintenance(input);
+		assertMaintenance(session);
+		if (session.inFlight) conflict("Maintenance observation or commit is already running");
+		const signal = input.signal
+			? AbortSignal.any([input.signal, session.controller.signal])
+			: session.controller.signal;
+		const operation = Promise.resolve().then(() => {
+			assertMaintenance(session);
+			return body(session, signal);
+		});
+		session.inFlight = operation;
+		try {
+			return await operation;
+		} finally {
+			session.inFlight = undefined;
+		}
+	}
+	async function beginWorkspaceMaintenance(input: {
+		scopeId: string;
+		leaseId?: string | null;
+		adminUserId: string;
+		acknowledgeWritersStopped: boolean;
+		operatorReason: string;
+	}) {
+		assertAdmin(input.adminUserId);
+		assertAuthority();
+		if (
+			input.acknowledgeWritersStopped !== true ||
+			!input.operatorReason.trim() ||
+			input.operatorReason.length > 1000
+		)
+			throw new AppError(
+				"Confirm old instances and external writers are stopped and provide a reason",
+				400,
+				"ACK_REQUIRED",
+			);
+		const runtime = await getRuntime();
+		assertAdmin(input.adminUserId);
+		assertAuthority();
+		const scope = requireScopeRow(database, input.scopeId);
+		requireLocal(scope);
+		const leaseId = resolveLeaseId(database, scope, input.leaseId);
+		if (maintenance.size >= WORKSPACE_RECOVERY_LIMITS.maintenanceSessions)
+			throw new AppError("Too many maintenance sessions", 429, "MAINTENANCE_LIMIT");
+		const oldOwnerEpoch = leaseId
+			? (database
+					.select({ epoch: workspaceWriteLeases.ownerEpoch })
+					.from(workspaceWriteLeases)
+					.where(eq(workspaceWriteLeases.leaseId, leaseId))
+					.get()?.epoch ?? null)
+			: scope.activeLeaseEpoch;
+		assertLegacyOwner(oldOwnerEpoch);
+		const expiresAt = now() + WORKSPACE_RECOVERY_LIMITS.maintenanceDurationMs;
+		const controller = new AbortController();
+		const reservation = runtime.coordinator.reserveMaintenance(
+			{ scope: scopeIdentity(scope), leaseId: leaseId ?? undefined },
+			() => {
+				assertAdmin(input.adminUserId);
+				assertAuthority();
+				assertLegacyOwner(oldOwnerEpoch);
+				if (now() >= expiresAt || controller.signal.aborted)
+					conflict("Maintenance permission expired or cancelled");
+			},
+		);
+		const token = randomBytes(32).toString("hex");
+		const session: MaintenanceSession = {
+			token,
+			scopeId: scope.id,
+			leaseId,
+			adminUserId: input.adminUserId,
+			oldOwnerEpoch,
+			operatorReason: input.operatorReason.trim(),
+			attestedAt: new Date(now()).toISOString(),
+			expiresAt,
+			reservation,
+			controller,
+			closing: false,
+			timer: setTimeout(() => {
+				void releaseMaintenance(session);
+			}, WORKSPACE_RECOVERY_LIMITS.maintenanceDurationMs),
+		};
+		session.timer.unref?.();
+		maintenance.set(token, session);
+		return {
+			maintenanceToken: token,
+			expiresAt: new Date(expiresAt).toISOString(),
+			generation: reservation.generation,
+		};
+	}
+	async function observeWorkspaceMaintenance(input: WorkspaceMaintenanceInput) {
+		return withMaintenance(input, (session, signal) =>
+			observeWorkspaceBarrier(session.scopeId, signal, session.leaseId, session),
+		);
+	}
+	async function commitWorkspaceMaintenance(
+		input: WorkspaceMaintenanceInput &
+			Omit<WorkspaceRecoveryInput, "recoveredByUserId" | "leaseId">,
+	) {
+		const result = await withMaintenance(input, (session, signal) =>
+			recoverWorkspaceBarrier(
+				{ ...input, leaseId: session.leaseId, recoveredByUserId: session.adminUserId, signal },
+				session,
+			),
+		);
+		const session = maintenance.get(input.maintenanceToken);
+		if (session) await releaseMaintenance(session);
+		return result;
+	}
+	async function cancelWorkspaceMaintenance(input: WorkspaceMaintenanceInput) {
+		const session = requireMaintenance(input);
+		await releaseMaintenance(session);
+		return { cancelled: true as const };
+	}
 	const limits: ObservationBudget["limits"] = {
 		fileBytes: WORKSPACE_RECOVERY_LIMITS.fileBytes,
 		totalBytes: WORKSPACE_RECOVERY_LIMITS.totalBytes,
@@ -581,6 +813,16 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 		}
 	}
 
+	async function retryWorkspaceRecoveryPersistence(scopeId: string) {
+		const scope = requireScopeRow(database, scopeId);
+		requireLocal(scope);
+		const runtime = await getRuntime();
+		try {
+			return await runtime.coordinator.retryFinishedPersistence(scopeIdentity(scope));
+		} catch (error) {
+			mapCoordinatorError(error);
+		}
+	}
 	async function listWorkspaceBarriers(cursor?: string): Promise<{
 		items: WorkspaceBarrier[];
 		nextCursor: string | null;
@@ -650,12 +892,18 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 				{ kind: "subtree", canonicalPath: scope.canonicalRoot },
 			];
 			let executionEnded = false;
+			let ownerEpoch = scope.activeLeaseEpoch;
+			let localFileIo = false;
+			let ownerProbeRetryAllowed = false;
 			let blockedReason: string | null = null;
+			let maintenanceRequired = false;
 			if (leaseId) {
 				const row = database
 					.select({
 						ranges: workspaceWriteLeases.rangesJson,
 						ended: workspaceWriteLeases.executionEndedAt,
+						ownerEpoch: workspaceWriteLeases.ownerEpoch,
+						executionClass: workspaceWriteLeases.executionClass,
 					})
 					.from(workspaceWriteLeases)
 					.where(eq(workspaceWriteLeases.leaseId, leaseId))
@@ -663,6 +911,8 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 				if (row) {
 					ranges = [...row.ranges.ranges];
 					executionEnded = row.ended !== null;
+					ownerEpoch = row.ownerEpoch;
+					localFileIo = row.executionClass === "local_file_io";
 				}
 			}
 			try {
@@ -674,6 +924,12 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 				executionEnded = eligibility.executionEnded;
 			} catch (error) {
 				blockedReason = error instanceof Error ? error.message : String(error);
+				const unknownOwner =
+					error instanceof WorkspaceWriteCoordinatorError &&
+					error.recoveryReason === "owner_unknown";
+				const identified = unknownOwner && hasOwnerIdentity(ownerEpoch);
+				maintenanceRequired = unknownOwner && !identified;
+				ownerProbeRetryAllowed = identified && localFileIo;
 			}
 			let effects: RecoveryEffect[] = [];
 			try {
@@ -703,6 +959,8 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 				ranges,
 				executionEnded,
 				blockedReason,
+				maintenanceRequired,
+				ownerProbeRetryAllowed,
 				operations,
 				effects: effects.map(effectSummary),
 			};
@@ -728,19 +986,48 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 		scopeId: string,
 		signal?: AbortSignal,
 		requestedLeaseId?: string | null,
+		maintenanceSession?: MaintenanceSession,
 	) {
 		const runtime = await getRuntime();
-		const scope = requireScopeRow(database, scopeId);
+		let scope = requireScopeRow(database, scopeId);
 		const leaseId = resolveLeaseId(database, scope, requestedLeaseId);
 		requireLocal(scope);
 		const started = performance.now();
 		const bounded = boundedSignal(limits.durationMs, signal);
 		try {
 			bounded.throwIfAborted();
-			const reservation = runtime.coordinator.reserveRecovery({
-				scope: scopeIdentity(scope),
-				leaseId: leaseId ?? undefined,
-			});
+			// Explicit POST only: retry a bounded strict owner probe after a transient startup failure.
+			// Never infer the end of Bash/opaque execution or write anything during inventory GET.
+			if (!maintenanceSession && leaseId) {
+				const lease = database
+					.select({
+						ownerEpoch: workspaceWriteLeases.ownerEpoch,
+						executionClass: workspaceWriteLeases.executionClass,
+						ended: workspaceWriteLeases.executionEndedAt,
+					})
+					.from(workspaceWriteLeases)
+					.where(eq(workspaceWriteLeases.leaseId, leaseId))
+					.get();
+				if (
+					lease?.executionClass === "local_file_io" &&
+					!lease.ended &&
+					lease.ownerEpoch !== runtime.coordinator.ownerEpoch()
+				) {
+					assertAuthority();
+					const proof = await proveWorkspaceOwnerEnded(database, lease.ownerEpoch);
+					bounded.throwIfAborted();
+					if (proof) {
+						runtime.coordinator.recordLocalOwnerTermination(leaseId, proof);
+						scope = requireScopeRow(database, scopeId);
+					}
+				}
+			}
+			const reservation =
+				maintenanceSession?.reservation ??
+				runtime.coordinator.reserveRecovery({
+					scope: scopeIdentity(scope),
+					leaseId: leaseId ?? undefined,
+				});
 			try {
 				const effects = recoveryEffects(database, scope, leaseId ?? null);
 				const rootIdentity =
@@ -752,6 +1039,7 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 				const observations = await observeEffects(effects, budget);
 				const rangeObservations = await observeRanges(reservation.ranges, effects, budget);
 				bounded.throwIfAborted();
+				if (maintenanceSession) assertMaintenance(maintenanceSession);
 				return {
 					scope: scopeSummary(scope),
 					leaseId: leaseId ?? null,
@@ -761,6 +1049,7 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 						scopeId,
 						leaseId: leaseId ?? null,
 						generation: reservation.generation,
+						maintenanceToken: maintenanceSession?.token,
 						effects,
 						observations,
 						rangeObservations,
@@ -768,7 +1057,7 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 					}),
 				};
 			} finally {
-				reservation.release();
+				if (!maintenanceSession) reservation.release();
 			}
 		} catch (error) {
 			mapCoordinatorError(error);
@@ -783,7 +1072,47 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 		}
 	}
 
-	async function recoverWorkspaceBarrier(input: WorkspaceRecoveryInput) {
+	async function reconcileWorkspaceBarrier(scopeId: string, leaseId: string, signal?: AbortSignal) {
+		const lease = database
+			.select({
+				scopeId: workspaceWriteLeases.scopeId,
+				executionClass: workspaceWriteLeases.executionClass,
+			})
+			.from(workspaceWriteLeases)
+			.where(eq(workspaceWriteLeases.leaseId, leaseId))
+			.get();
+		if (!lease || lease.scopeId !== scopeId || lease.executionClass !== "local_file_io")
+			return { recovered: false as const, reason: "manual_observation_required" };
+		const preview = await observeWorkspaceBarrier(scopeId, signal, leaseId);
+		if (
+			preview.observations.length === 0 ||
+			preview.rangeObservations.length > 0 ||
+			preview.observations.some(
+				(entry) => entry.verdict === "foreign" || entry.verdict === "unobservable",
+			)
+		)
+			return { recovered: false as const, reason: "manual_observation_required" };
+		return recoverWorkspaceBarrier(
+			{
+				scopeId,
+				leaseId,
+				signal,
+				recoveredByUserId: null,
+				confirmationToken: preview.confirmationToken,
+				acknowledgements: preview.observations.map(({ effectId, verdict }) => ({
+					effectId,
+					verdict,
+				})),
+			},
+			undefined,
+			true,
+		);
+	}
+	async function recoverWorkspaceBarrier(
+		input: Omit<WorkspaceRecoveryInput, "recoveredByUserId"> & { recoveredByUserId: string | null },
+		maintenanceSession?: MaintenanceSession,
+		systemReconciled = false,
+	) {
 		const runtime = await getRuntime();
 		const scope = requireScopeRow(database, input.scopeId);
 		const leaseId = resolveLeaseId(database, scope, input.leaseId);
@@ -792,10 +1121,12 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 		const signal = boundedSignal(limits.durationMs, input.signal);
 		try {
 			signal.throwIfAborted();
-			const reservation = runtime.coordinator.reserveRecovery({
-				scope: scopeIdentity(scope),
-				leaseId: leaseId ?? undefined,
-			});
+			const reservation =
+				maintenanceSession?.reservation ??
+				runtime.coordinator.reserveRecovery({
+					scope: scopeIdentity(scope),
+					leaseId: leaseId ?? undefined,
+				});
 			try {
 				const effects = recoveryEffects(database, scope, leaseId ?? null);
 				const rootIdentity =
@@ -811,6 +1142,7 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 					scopeId: scope.id,
 					leaseId: leaseId ?? null,
 					generation: reservation.generation,
+					maintenanceToken: maintenanceSession?.token,
 					effects,
 					observations,
 					rangeObservations,
@@ -844,7 +1176,9 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 				)
 					conflict("Recovery evidence changed during observation");
 				let settledEffectCount = 0;
+				if (maintenanceSession) assertMaintenance(maintenanceSession);
 				reservation.complete((tx) => {
+					if (maintenanceSession) assertMaintenance(maintenanceSession);
 					if (rootIdentity)
 						runtime.evidence.recordScopeVerification(
 							{
@@ -854,13 +1188,29 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 							},
 							tx,
 						);
-					else {
+					if (!rootIdentity || maintenanceSession) {
 						const manifest = leaseId ? leaseManifest(database, leaseId) : [];
 						settledEffectCount = runtime.evidence.closeBooksForRecovery(
 							{
 								scopeId: scope.id,
 								workspaceLeaseId: leaseId ?? null,
 								recoveredByUserId: input.recoveredByUserId,
+								resolutionAuthority: maintenanceSession
+									? "administrator_attested"
+									: systemReconciled
+										? "system_reconciled"
+										: "execution_proven",
+								maintenanceEvidenceJson: maintenanceSession
+									? {
+											version: 1,
+											mode: "legacy_owner_offline",
+											oldOwnerEpoch: maintenanceSession.oldOwnerEpoch,
+											operatorReason: maintenanceSession.operatorReason,
+											maintenanceAuthority: "exclusive_instance_lock",
+											generation: reservation.generation,
+											attestedAt: maintenanceSession.attestedAt,
+										}
+									: undefined,
 								effectIds: effects.map((effect) => effect.id),
 								operationIds: [
 									...new Set(
@@ -885,9 +1235,24 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 					settledEffectCount,
 					revision: cleared.revision,
 					fencingToken: cleared.fencingToken,
+					remaining: {
+						rootVerificationRequired: cleared.status === "needs_verification",
+						legacyBarrier: cleared.activeLeaseId !== null,
+						leaseBarrier: !!database
+							.select({ id: workspaceWriteLeases.leaseId })
+							.from(workspaceWriteLeases)
+							.where(
+								and(
+									eq(workspaceWriteLeases.scopeId, scope.id),
+									inArray(workspaceWriteLeases.status, ["executing", "quarantined"]),
+								),
+							)
+							.limit(1)
+							.get(),
+					},
 				};
 			} finally {
-				reservation.release();
+				if (!maintenanceSession) reservation.release();
 			}
 		} catch (error) {
 			mapCoordinatorError(error);
@@ -901,15 +1266,61 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 				});
 		}
 	}
-	return { listWorkspaceBarriers, observeWorkspaceBarrier, recoverWorkspaceBarrier };
+	return {
+		listWorkspaceBarriers,
+		observeWorkspaceBarrier,
+		recoverWorkspaceBarrier,
+		beginWorkspaceMaintenance: (...args: Parameters<typeof beginWorkspaceMaintenance>) =>
+			beginWorkspaceMaintenance(...args).catch(mapCoordinatorError),
+		observeWorkspaceMaintenance: (...args: Parameters<typeof observeWorkspaceMaintenance>) =>
+			observeWorkspaceMaintenance(...args).catch(mapCoordinatorError),
+		commitWorkspaceMaintenance: (...args: Parameters<typeof commitWorkspaceMaintenance>) =>
+			commitWorkspaceMaintenance(...args).catch(mapCoordinatorError),
+		cancelWorkspaceMaintenance: (...args: Parameters<typeof cancelWorkspaceMaintenance>) =>
+			cancelWorkspaceMaintenance(...args).catch(mapCoordinatorError),
+		reconcileWorkspaceBarrier,
+		retryWorkspaceRecoveryPersistence,
+	};
 }
 
-async function defaultRecovery() {
-	const { db } = await import("../db");
-	return createWorkspaceScopeRecovery({
-		database: db,
-		getRuntime: getDefaultLocalFileChangeRuntime,
-	});
+// Keep the same registry, timers and HMAC closure across --hot. A process restart
+// deliberately loses these capabilities; durable barriers remain authoritative.
+const DEFAULT_RECOVERY = Symbol.for("narrafork.workspaceScopeRecovery.v1");
+const recoveryGlobals = globalThis as unknown as Record<
+	symbol,
+	Promise<ReturnType<typeof createWorkspaceScopeRecovery>> | undefined
+>;
+function defaultRecovery() {
+	recoveryGlobals[DEFAULT_RECOVERY] ??= import("../db").then(({ db }) =>
+		createWorkspaceScopeRecovery({
+			database: db,
+			getRuntime: getDefaultLocalFileChangeRuntime,
+		}),
+	);
+	return recoveryGlobals[DEFAULT_RECOVERY];
+}
+export async function beginWorkspaceMaintenance(
+	input: Parameters<
+		ReturnType<typeof createWorkspaceScopeRecovery>["beginWorkspaceMaintenance"]
+	>[0],
+) {
+	return (await defaultRecovery()).beginWorkspaceMaintenance(input);
+}
+export async function observeWorkspaceMaintenance(input: WorkspaceMaintenanceInput) {
+	return (await defaultRecovery()).observeWorkspaceMaintenance(input);
+}
+export async function commitWorkspaceMaintenance(
+	input: Parameters<
+		ReturnType<typeof createWorkspaceScopeRecovery>["commitWorkspaceMaintenance"]
+	>[0],
+) {
+	return (await defaultRecovery()).commitWorkspaceMaintenance(input);
+}
+export async function cancelWorkspaceMaintenance(input: WorkspaceMaintenanceInput) {
+	return (await defaultRecovery()).cancelWorkspaceMaintenance(input);
+}
+export async function retryWorkspaceRecoveryPersistence(scopeId: string) {
+	return (await defaultRecovery()).retryWorkspaceRecoveryPersistence(scopeId);
 }
 export async function listWorkspaceBarriers(cursor?: string) {
 	return (await defaultRecovery()).listWorkspaceBarriers(cursor);

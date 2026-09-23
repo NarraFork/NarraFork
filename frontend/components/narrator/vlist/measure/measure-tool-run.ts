@@ -304,6 +304,15 @@ export interface TraceItemData {
 	 */
 	timing?: Partial<ToolTimingStamps> | null;
 	/**
+	 * The duration the row PAINTS, when it differs from `timing.durationMs` (bash
+	 * prefers pure execution time — see `@shared/tool-display-duration`).
+	 *
+	 * HEIGHT-NEUTRAL for the same reason `timing` is: one nowrap span in the row's
+	 * fixed line. Still keyed in `traceRevision`, because the renderer paints it from
+	 * the cached payload.
+	 */
+	displayDurationMs?: number | null;
+	/**
 	 * Added / removed line counts for a Write/Edit row (`+12 -3`).
 	 *
 	 * HEIGHT-NEUTRAL for the same reason `status` and `timing` are: it is one nowrap
@@ -448,6 +457,12 @@ export interface MeasuredTraceRow {
 	 * Null when the row carried none, so the slot is skipped entirely.
 	 */
 	timing: ToolTimingStamps | null;
+	/**
+	 * The duration the row paints (renderer only; height-neutral). Null → fall back
+	 * to `timing.durationMs`. See `@shared/tool-display-duration` for why the two
+	 * differ for bash.
+	 */
+	displayDurationMs: number | null;
 	/**
 	 * Added / removed line counts for a Write/Edit row (renderer only;
 	 * height-neutral). Null when the row is not a file tool or the counts are
@@ -858,6 +873,7 @@ export function measureCollapsibleTrace(
 			// `recentCallTimings`.
 			status: item.status ?? null,
 			timing: item.timing ? resolveToolTimingStamps(item.timing) : null,
+			displayDurationMs: item.displayDurationMs ?? null,
 			diffStats: item.diffStats ?? null,
 			shimmer: !!item.shimmer,
 			queuedBehindUpstream: item.queuedBehindUpstream === true ? true : undefined,

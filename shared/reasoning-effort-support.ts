@@ -14,7 +14,11 @@
  *      a strict relay can be excluded without waiting for a release.
  */
 
-import { clampReasoningEffort, type ReasoningEffort } from "./reasoning-effort";
+import {
+	clampReasoningEffort,
+	REASONING_EFFORT_VALUES,
+	type ReasoningEffort,
+} from "./reasoning-effort";
 
 /** Claude model families whose capabilities are derived from a version number. */
 export type ClaudeFamily = "sonnet" | "opus" | "haiku" | "fable" | "mythos";
@@ -221,17 +225,10 @@ export function modelAcceptsReasoningEffort(
  *
  * `none` is included: disabling reasoning is expressed as an effort value
  * across every provider we speak to, so it belongs in the generic ladder.
- * `xhigh` is omitted — it is a recent OpenAI/Anthropic addition that generic
- * upstreams rarely implement, and the shared clamp maps a stored `xhigh` onto
- * `max` when it is not offered.
+ * Unknown models expose every tier so newly released capabilities do not need
+ * to wait for a catalog update.
  */
-export const GENERIC_REASONING_EFFORT_TIERS: readonly ReasoningEffort[] = [
-	"none",
-	"low",
-	"medium",
-	"high",
-	"max",
-];
+export const GENERIC_REASONING_EFFORT_TIERS: readonly ReasoningEffort[] = REASONING_EFFORT_VALUES;
 
 /**
  * Clamp an effort onto the generic ladder for a wire protocol that has no tier

@@ -132,6 +132,13 @@
 		"success": "succeeded",
 		"failed": "failed"
 	},
+	"traceRowMark": {
+		"running": "running",
+		"queued": "waiting for earlier tools",
+		"awaiting": "waiting for a decision",
+		"failed": "failed",
+		"cancelled": "cancelled"
+	},
 	"toolCallsStatusOk": "{{count}} succeeded",
 	"toolCallsStatusMixed": "{{success}} ok · {{fail}} failed",
 	"reasoningCount": "{{count}} reasoning steps",

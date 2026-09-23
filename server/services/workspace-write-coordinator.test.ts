@@ -3,11 +3,13 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
 	workspaceWriteLeases as durableLeases,
 	fileChangeScopes as scopes,
+	workspaceExecutionOwners,
 } from "@server/db/schema";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import type { FileChangeScopeIdentity } from "./file-change-identity";
+import * as ownerAuthority from "./workspace-execution-owner";
 import {
 	createWorkspaceWriteCoordinatorState,
 	WORKSPACE_WRITE_COORDINATOR_LIMITS,
@@ -335,14 +337,14 @@ describe("scope admission and execution fencing", () => {
 		expect(await next).toBe(scope.canonicalRoot);
 	});
 
-	test("a live lease rejects changed fences and cannot settle across reconnects", async () => {
+	test("a live lease rejects changed durable fences even after a runtime reconnect", async () => {
 		const first = await hold();
 		first.lease.registerMutation("before-disconnect");
 		update({ fencingToken: 10 });
 		expectCode(() => first.lease.assertCurrent(), "stale_lease");
 		expectCode(() => first.lease.settle("before-disconnect", "applied"), "stale_lease");
 		runtimes.set(scope.deviceId, { ...runtime, runtimeGeneration: 8 });
-		expectCode(() => first.lease.settle("before-disconnect", "not_applied"), "runtime_mismatch");
+		expectCode(() => first.lease.settle("before-disconnect", "not_applied"), "stale_lease");
 		first.release();
 		await expect(first.done).rejects.toThrow(errorCode("persistence_failed"));
 		expect(state.leases.size).toBe(1);
@@ -1930,7 +1932,10 @@ describe("batch persistence and fail-closed group recovery", () => {
 				lease.registerMutation("pending");
 				runtimes.set(b.deviceId, { ...runtime, runtimeGeneration: 8 });
 				expectCode(() => lease.assertCurrent(), "runtime_mismatch");
-				expectCode(() => lease.settle("pending", "applied"), "runtime_mismatch");
+				// Settling old IO is metadata, not permission for a new dispatch.
+				lease.settle("pending", "applied");
+				expect(lease.pendingMutationCount).toBe(0);
+				expectCode(() => lease.registerMutation("new-stale-dispatch"), "runtime_mismatch");
 				lease.markUncertain();
 			}),
 		).rejects.toThrow(errorCode("persistence_failed"));
@@ -2757,4 +2762,231 @@ describe("persistent exact-range leases", () => {
 		expect(fresh.inspectRecovery({ scope, leaseId: id }).executionEnded).toBe(true);
 		fresh.reserveRecovery({ scope, leaseId: id }).complete(() => undefined);
 	});
+});
+
+test("trusted native batch classification survives copying without classifying arbitrary rollbacks", async () => {
+	const a = addScope({ deviceId: "local", canonicalRoot: "/native-a" });
+	const b = addScope({ deviceId: "local", canonicalRoot: "/native-b" });
+	await coordinator.withRollbackMany(
+		{
+			scopes: [a, b].map((scope) => ({
+				...request(scope),
+				executionClass: "local_file_io" as const,
+			})),
+		},
+		(batch) => {
+			for (const lease of batch.leases) {
+				expect(
+					db.select().from(durableLeases).where(eq(durableLeases.leaseId, lease.leaseId)).get()
+						?.executionClass,
+				).toBe("local_file_io");
+			}
+		},
+	);
+	await coordinator.withRollback(request(a), (lease) => {
+		expect(
+			db.select().from(durableLeases).where(eq(durableLeases.leaseId, lease.leaseId)).get()
+				?.executionClass,
+		).toBe("unknown");
+	});
+});
+
+describe("atomic settlement and retained maintenance", () => {
+	test("evidence rollback leaves the mutation pending and permits metadata-only retry", async () => {
+		await coordinator.withWrite(request(), (lease) => {
+			lease.registerMutation("atomic");
+			expect(() =>
+				lease.settleWith("atomic", (tx) => {
+					tx.update(scopes)
+						.set({ displayRoot: "rolled back" })
+						.where(eq(scopes.id, scope.id))
+						.run();
+					throw new Error("journal failure");
+				}),
+			).toThrow("journal failure");
+			expect(row()?.displayRoot).toBe("presentation only");
+			expect(lease.pendingMutationCount).toBe(1);
+			lease.assertCurrent();
+			expect(
+				lease.settleWith("atomic", (tx) => {
+					tx.update(scopes).set({ displayRoot: "committed" }).where(eq(scopes.id, scope.id)).run();
+					return { outcome: "applied", value: 42 };
+				}),
+			).toBe(42);
+			expect(lease.pendingMutationCount).toBe(0);
+		});
+		expect(row()?.displayRoot).toBe("committed");
+		expect(quarantined()).toHaveLength(0);
+	});
+
+	test("outer transaction ownership prevents rollback from desynchronizing memory", async () => {
+		await coordinator.withWrite(request(), (lease) => {
+			lease.registerMutation("nested-settle");
+			expect(() =>
+				db.transaction(() =>
+					lease.settleWith("nested-settle", () => ({ outcome: "applied", value: 1 })),
+				),
+			).toThrow("outermost transaction");
+			expect(lease.pendingMutationCount).toBe(1);
+			lease.settle("nested-settle", "not_applied");
+		});
+	});
+
+	test("legacy maintenance holds the whole root across requests without inventing termination", async () => {
+		const target = addScope({
+			deviceId: "local",
+			status: "needs_verification",
+			rootIdentityJson: { object: "verified" },
+			activeLeaseId: "legacy",
+			activeLeaseEpoch: "previous-owner",
+		});
+		expect(() => coordinator.inspectRecovery({ scope: target })).toThrow(
+			expect.objectContaining({ recoveryReason: "owner_unknown" }),
+		);
+		let authorized = true;
+		const reservation = coordinator.reserveMaintenance({ scope: target }, () => {
+			if (!authorized) throw new Error("authority revoked");
+		});
+		try {
+			expect(reservation.executionEnded).toBe(false);
+			expect(reservation.ranges).toEqual([
+				{ kind: "subtree", canonicalPath: target.canonicalRoot },
+			]);
+			reservation.assertCurrent();
+			expectCode(() => coordinator.registerActivity(request(target)), "recovery_conflict");
+			await expect(
+				coordinator.withWrite(request(target, { waitTimeoutMs: 0 }), () => undefined),
+			).rejects.toThrow(errorCode("wait_timeout"));
+			authorized = false;
+			expect(() => reservation.assertCurrent()).toThrow("authority revoked");
+			expect(() => reservation.complete(() => undefined)).toThrow("authority revoked");
+			expect(row(target)?.status).toBe("needs_verification");
+			authorized = true;
+			reservation.complete(() => undefined);
+			expect(row(target)?.status).toBe("active");
+			expect(row(target)?.activeLeaseId).toBeNull();
+		} finally {
+			reservation.release();
+		}
+		await coordinator.withWrite(request(target), () => undefined);
+	});
+
+	test("maintenance never overrides a live execution or an unpersisted completion hold", async () => {
+		const target = addScope({ deviceId: "local" });
+		const held = await hold(target);
+		expectCode(
+			() => coordinator.reserveMaintenance({ scope: target }, () => undefined),
+			"recovery_conflict",
+		);
+		held.release();
+		await held.done;
+		sqlite.exec(
+			"CREATE TRIGGER reject_completion BEFORE UPDATE OF status ON workspace_write_leases WHEN NEW.status = 'settled' BEGIN SELECT RAISE(ABORT, 'disk unavailable'); END;",
+		);
+		await expect(coordinator.withWrite(request(target), () => undefined)).rejects.toThrow(
+			errorCode("persistence_failed"),
+		);
+		expect(coordinator.capture(target).active.retainedRecoveryHolds).toBe(1);
+		expectCode(
+			() => coordinator.reserveMaintenance({ scope: target }, () => undefined),
+			"recovery_conflict",
+		);
+		sqlite.exec("DROP TRIGGER reject_completion");
+		expect(await coordinator.retryFinishedPersistence(target)).toEqual({
+			retried: 1,
+			remaining: 0,
+		});
+		expect(quarantined(target)).toHaveLength(0);
+		await coordinator.withWrite(request(target), () => undefined);
+	});
+});
+
+test("native owner termination consumes authentic proof, rejects activities and preserves independent root uncertainty", async () => {
+	sqlite.exec(
+		"CREATE TABLE workspace_execution_owners(owner_epoch TEXT PRIMARY KEY,identity_json TEXT,created_at TEXT NOT NULL)",
+	);
+	const target = addScope({ deviceId: "local" });
+	let leaseId = "";
+	await coordinator.withWrite(request(target, { executionClass: "local_file_io" }), (lease) => {
+		leaseId = lease.leaseId;
+		lease.registerMutation("dispatched-before-crash");
+	});
+	const identity = {
+		version: 1,
+		pid: 123,
+		birth: "old-kernel-instance",
+		domain: {
+			platform: "linux",
+			machine: "fixture-machine",
+			boot: "fixture-boot",
+			pidNamespace: "fixture-pid",
+			timeNamespace: "fixture-time",
+		},
+	};
+	db.insert(workspaceExecutionOwners)
+		.values({
+			ownerEpoch: "dead-owner",
+			identityJson: identity as typeof workspaceExecutionOwners.$inferInsert.identityJson,
+			createdAt: "2026-09-18",
+		})
+		.run();
+	db.update(durableLeases)
+		.set({ ownerEpoch: "dead-owner", status: "executing", executionEndedAt: null })
+		.where(eq(durableLeases.leaseId, leaseId))
+		.run();
+	update(
+		{
+			status: "needs_verification",
+			activeLeaseId: leaseId,
+			activeLeaseEpoch: "dead-owner",
+			activeMutationCount: 1,
+		},
+		target,
+	);
+	const proof = {
+		ownerEpoch: "dead-owner",
+		identity,
+		reason: "pid_absent",
+		observedAt: "2026-09-23",
+	} as unknown as ownerAuthority.WorkspaceOwnerEndedEvidence;
+	const authority = spyOn(ownerAuthority, "assertWorkspaceMaintenanceAuthority").mockImplementation(
+		() => undefined,
+	);
+	let acceptProof: ReturnType<typeof spyOn> | undefined;
+	try {
+		expect(() => coordinator.recordLocalOwnerTermination(leaseId, proof)).toThrow(
+			"authentic matching",
+		);
+		acceptProof = spyOn(ownerAuthority, "assertWorkspaceOwnerEndedEvidence").mockImplementation(
+			(_proof, epoch) => {
+				if (_proof !== proof || epoch !== "dead-owner") throw new Error("wrong proof");
+			},
+		);
+		const activity = coordinator.registerActivity(request(target));
+		try {
+			expectCode(
+				() => coordinator.recordLocalOwnerTermination(leaseId, proof),
+				"recovery_conflict",
+			);
+		} finally {
+			coordinator.endActivity(activity);
+		}
+		expect(coordinator.recordLocalOwnerTermination(leaseId, proof)).toBe(true);
+		expect(row(target)?.status).toBe("needs_verification");
+		expect(row(target)?.activeLeaseId).toBeNull();
+		const persisted = db
+			.select()
+			.from(durableLeases)
+			.where(eq(durableLeases.leaseId, leaseId))
+			.get();
+		expect(persisted?.executionEndedAt).toBeString();
+		expect(persisted?.terminationEvidenceJson).toMatchObject({
+			kind: "owner_ended",
+			ownerEpoch: "dead-owner",
+		});
+		expect(coordinator.recordLocalOwnerTermination(leaseId, proof)).toBe(false);
+	} finally {
+		acceptProof?.mockRestore();
+		authority.mockRestore();
+	}
 });

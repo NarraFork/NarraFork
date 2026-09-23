@@ -170,10 +170,10 @@ export function pruneWorkspaceTerminalLeases(tx: WorkspaceLeaseDb): void {
 export const WORKSPACE_WRITE_LEASE_TEST_DDL = `
 CREATE TABLE workspace_write_leases (
  lease_id TEXT PRIMARY KEY NOT NULL, scope_id TEXT NOT NULL REFERENCES file_change_scopes(id),
- device_id TEXT NOT NULL, owner_epoch TEXT NOT NULL, runtime_epoch TEXT NOT NULL,
+ device_id TEXT NOT NULL, owner_epoch TEXT NOT NULL, execution_class TEXT NOT NULL DEFAULT 'unknown', runtime_epoch TEXT NOT NULL,
  runtime_generation INTEGER NOT NULL, fencing_token INTEGER NOT NULL, scope_revision INTEGER NOT NULL,
  path_flavor TEXT NOT NULL, status TEXT NOT NULL, ranges_json TEXT NOT NULL,
- mutation_manifest_json TEXT NOT NULL, execution_ended_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+ mutation_manifest_json TEXT NOT NULL, execution_ended_at TEXT, termination_evidence_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE INDEX idx_workspace_lease_device_status ON workspace_write_leases(device_id,status,lease_id);
 CREATE INDEX idx_workspace_lease_scope ON workspace_write_leases(scope_id,status,lease_id);

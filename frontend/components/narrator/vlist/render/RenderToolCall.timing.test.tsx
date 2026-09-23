@@ -256,6 +256,73 @@ describe("tool header — timing trigger", () => {
 	});
 });
 
+// ── Elapsed counter origin ────────────────────────────────────────────────────
+describe("the live counter measures EXECUTION, not the wait before it", () => {
+	/** The timing cell's text, selected by the marker every form of it carries. */
+	function timingCell(root: Element): string {
+		return root.querySelector("[data-nf-tool-timing]")?.textContent ?? "";
+	}
+
+	it("counts from `executionStartedAt` when the call has one", () => {
+		// A call admitted after a 60s permission / reflection wait must start its counter
+		// near zero. Counting from `createdAt` made it jump straight to 60s — a number
+		// that describes waiting, presented as the tool's own elapsed time.
+		const now = Date.now();
+		const root = render(
+			<renderMod.RenderToolCall
+				measured={card({
+					status: "running",
+					createdAt: now - 60_000,
+					startedAt: now - 60_000,
+					permissionStartedAt: now - 59_900,
+					executionStartedAt: now - 2_000,
+				})}
+				labels={{ timing: LABELS }}
+			/>,
+		);
+		const text = timingCell(root);
+		expect(text).not.toContain("60s");
+		expect(text).toMatch(/^[12]s/);
+	});
+
+	it("falls back to the caller's start while the call is still WAITING", () => {
+		// No execution stamp yet (sitting on an approve/deny form): the pre-existing
+		// behaviour stands, so this change cannot blank out a card that legitimately
+		// counted from creation.
+		const now = Date.now();
+		const root = render(
+			<renderMod.RenderToolCall
+				measured={card({
+					status: "running",
+					createdAt: now - 8_000,
+					startedAt: now - 8_000,
+					permissionStartedAt: now - 7_900,
+				})}
+				labels={{ timing: LABELS }}
+			/>,
+		);
+		expect(timingCell(root)).toMatch(/^[78]s/);
+	});
+
+	it("leaves a FINISHED card's duration untouched", () => {
+		// The counter origin is about live calls only. A settled card paints
+		// `displayDurationMs`, which no part of this change reroutes.
+		const root = render(
+			<renderMod.RenderToolCall
+				measured={card({
+					status: "success",
+					createdAt: 1_000,
+					executionStartedAt: 19_800,
+					completedAt: 21_000,
+					durationMs: 7_000,
+				})}
+				labels={{ timing: LABELS }}
+			/>,
+		);
+		expect(timingCell(root)).toContain("7s");
+	});
+});
+
 // ── Grouped header ────────────────────────────────────────────────────────────
 describe("grouped tool header — aggregate timing", () => {
 	function group(cards: Array<Partial<ToolCallData>>) {

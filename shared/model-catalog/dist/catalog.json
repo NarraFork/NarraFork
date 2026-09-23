@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "catalogVersion": "v2:bundled-007d7b3c12becd9e4b04722bb7d64f2c70a3b260e45a02791e1aad2d0456a60d",
-  "sourceVersion": "bundled-007d7b3c12becd9e4b04722bb7d64f2c70a3b260e45a02791e1aad2d0456a60d",
-  "publishedAt": "2026-09-22T13:36:05+08:00",
+  "catalogVersion": "v2:7653388e2edd077c6f1825e356107f7240b49ff8",
+  "sourceVersion": "7653388e2edd077c6f1825e356107f7240b49ff8",
+  "publishedAt": "2026-09-23T03:50:59Z",
   "models": [
     {
       "id": "auto-smart",
@@ -802,6 +802,65 @@
         "supports_vision": true,
         "supports_xhigh_reasoning_effort": true,
         "tool_use_system_prompt_tokens": 346
+      }
+    },
+    {
+      "id": "claude-opus-5-5",
+      "name": "Claude Opus 5.5",
+      "family": "claude",
+      "status": "legacy-unverified",
+      "matches": {
+        "prefixes": [
+          "claude-opus-5-5"
+        ],
+        "volatileSuffixes": true
+      },
+      "sources": [
+        {
+          "label": "sub2api PR #7509 (unmerged): model-pricing [claude-opus-5-5] @ 64e1245f210ce0881dbc03a327374ab1f5695f05",
+          "url": "https://github.com/lyy0709/sub2api-upstream/blob/64e1245f210ce0881dbc03a327374ab1f5695f05/backend/resources/model-pricing/model_prices_and_context_window.json",
+          "verifiedAt": "2026-09-23T03:38:46Z"
+        }
+      ],
+      "metadata": {
+        "cache_creation_input_token_cost": 0.000005,
+        "cache_creation_input_token_cost_above_1hr": 0.000008,
+        "cache_read_input_token_cost": 2e-7,
+        "input_cost_per_token": 0.000004,
+        "litellm_provider": "anthropic",
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "mode": "chat",
+        "output_cost_per_token": 0.00002,
+        "provider_specific_entry": {
+          "fast": 2
+        },
+        "search_context_cost_per_query": {
+          "search_context_size_high": 0.01,
+          "search_context_size_low": 0.01,
+          "search_context_size_medium": 0.01
+        },
+        "supports_adaptive_thinking": true,
+        "supports_assistant_prefill": false,
+        "supports_computer_use": true,
+        "supports_function_calling": true,
+        "supports_max_reasoning_effort": true,
+        "supports_minimal_reasoning_effort": false,
+        "supports_output_config": true,
+        "supports_pdf_input": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_response_schema": true,
+        "supports_tool_choice": true,
+        "supports_vision": true,
+        "supports_xhigh_reasoning_effort": true,
+        "input_cost_per_token_priority": 0.000008,
+        "output_cost_per_token_priority": 0.00004,
+        "cache_creation_input_token_cost_priority": 0.00001,
+        "cache_read_input_token_cost_priority": 4e-7,
+        "input_cost_per_token_batches": 0.000002,
+        "output_cost_per_token_batches": 0.00001
       }
     },
     {
@@ -7302,6 +7361,13 @@
         "supports_pdf_input": true,
         "supports_prompt_caching": true,
         "supports_reasoning": true,
+        "reasoning_effort_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
         "supports_response_schema": true,
         "supports_service_tier": true,
         "supports_system_messages": true,
@@ -7376,6 +7442,13 @@
         "supports_pdf_input": true,
         "supports_prompt_caching": true,
         "supports_reasoning": true,
+        "reasoning_effort_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
         "supports_response_schema": true,
         "supports_service_tier": true,
         "supports_system_messages": true,
@@ -7447,6 +7520,13 @@
         "supports_pdf_input": true,
         "supports_prompt_caching": true,
         "supports_reasoning": true,
+        "reasoning_effort_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
         "supports_response_schema": true,
         "supports_service_tier": true,
         "supports_system_messages": true,
@@ -7536,6 +7616,152 @@
         "output_cost_per_token": 0.00005,
         "cache_read_input_token_cost": 0.000001,
         "cache_creation_input_token_cost": 0.0000125
+      }
+    },
+    {
+      "id": "gpt-6-luna",
+      "name": "GPT-6 Luna",
+      "family": "gpt",
+      "status": "legacy-unverified",
+      "matches": {
+        "prefixes": [
+          "gpt-6-luna"
+        ],
+        "volatileSuffixes": true
+      },
+      "sources": [
+        {
+          "label": "sub2api PR #7509 (unmerged): model-pricing [gpt-6-luna] @ 64e1245f210ce0881dbc03a327374ab1f5695f05",
+          "url": "https://github.com/lyy0709/sub2api-upstream/blob/64e1245f210ce0881dbc03a327374ab1f5695f05/backend/resources/model-pricing/model_prices_and_context_window.json",
+          "verifiedAt": "2026-09-23T03:38:46Z"
+        }
+      ],
+      "metadata": {
+        "cache_creation_input_token_cost": 1.25e-7,
+        "cache_creation_input_token_cost_batches": 6.25e-8,
+        "cache_creation_input_token_cost_flex": 6.25e-8,
+        "cache_creation_input_token_cost_priority": 2.5e-7,
+        "cache_read_input_token_cost": 1e-8,
+        "cache_read_input_token_cost_batches": 5e-9,
+        "cache_read_input_token_cost_flex": 5e-9,
+        "cache_read_input_token_cost_priority": 2e-8,
+        "input_cost_per_token": 1e-7,
+        "input_cost_per_token_batches": 5e-8,
+        "input_cost_per_token_flex": 5e-8,
+        "input_cost_per_token_priority": 2e-7,
+        "long_context_input_token_threshold": 272000,
+        "long_context_input_cost_multiplier": 2,
+        "long_context_output_cost_multiplier": 1.5,
+        "litellm_provider": "openai",
+        "context_window": 1050000,
+        "max_input_tokens": 922000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "mode": "chat",
+        "output_cost_per_token": 5e-7,
+        "output_cost_per_token_batches": 2.5e-7,
+        "output_cost_per_token_flex": 2.5e-7,
+        "output_cost_per_token_priority": 0.000001,
+        "supported_endpoints": [
+          "/v1/chat/completions",
+          "/v1/batch",
+          "/v1/responses"
+        ],
+        "supported_modalities": [
+          "text",
+          "image"
+        ],
+        "supported_output_modalities": [
+          "text"
+        ],
+        "supports_function_calling": true,
+        "supports_minimal_reasoning_effort": false,
+        "supports_native_streaming": true,
+        "supports_none_reasoning_effort": true,
+        "supports_parallel_function_calling": true,
+        "supports_pdf_input": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_response_schema": true,
+        "supports_service_tier": true,
+        "supports_system_messages": true,
+        "supports_tool_choice": true,
+        "supports_vision": true,
+        "supports_web_search": true,
+        "supports_xhigh_reasoning_effort": true
+      }
+    },
+    {
+      "id": "gpt-6-sol",
+      "name": "GPT-6 Sol",
+      "family": "gpt",
+      "status": "legacy-unverified",
+      "matches": {
+        "prefixes": [
+          "gpt-6-sol"
+        ],
+        "volatileSuffixes": true
+      },
+      "sources": [
+        {
+          "label": "sub2api PR #7509 (unmerged): model-pricing [gpt-6-sol] @ 64e1245f210ce0881dbc03a327374ab1f5695f05",
+          "url": "https://github.com/lyy0709/sub2api-upstream/blob/64e1245f210ce0881dbc03a327374ab1f5695f05/backend/resources/model-pricing/model_prices_and_context_window.json",
+          "verifiedAt": "2026-09-23T03:38:46Z"
+        }
+      ],
+      "metadata": {
+        "cache_creation_input_token_cost": 0.0000025,
+        "cache_creation_input_token_cost_batches": 0.00000125,
+        "cache_creation_input_token_cost_flex": 0.00000125,
+        "cache_creation_input_token_cost_priority": 0.000005,
+        "cache_read_input_token_cost": 2e-7,
+        "cache_read_input_token_cost_batches": 1e-7,
+        "cache_read_input_token_cost_flex": 1e-7,
+        "cache_read_input_token_cost_priority": 4e-7,
+        "input_cost_per_token": 0.000002,
+        "input_cost_per_token_batches": 0.000001,
+        "input_cost_per_token_flex": 0.000001,
+        "input_cost_per_token_priority": 0.000004,
+        "long_context_input_token_threshold": 272000,
+        "long_context_input_cost_multiplier": 2,
+        "long_context_output_cost_multiplier": 1.5,
+        "litellm_provider": "openai",
+        "context_window": 1050000,
+        "max_input_tokens": 922000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "mode": "chat",
+        "output_cost_per_token": 0.00001,
+        "output_cost_per_token_batches": 0.000005,
+        "output_cost_per_token_flex": 0.000005,
+        "output_cost_per_token_priority": 0.00002,
+        "supported_endpoints": [
+          "/v1/chat/completions",
+          "/v1/batch",
+          "/v1/responses"
+        ],
+        "supported_modalities": [
+          "text",
+          "image"
+        ],
+        "supported_output_modalities": [
+          "text"
+        ],
+        "supports_function_calling": true,
+        "supports_minimal_reasoning_effort": false,
+        "supports_native_streaming": true,
+        "supports_none_reasoning_effort": true,
+        "supports_parallel_function_calling": true,
+        "supports_pdf_input": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_response_schema": true,
+        "supports_service_tier": true,
+        "supports_system_messages": true,
+        "supports_tool_choice": true,
+        "supports_vision": true,
+        "supports_web_search": true,
+        "supports_xhigh_reasoning_effort": true
       }
     },
     {
