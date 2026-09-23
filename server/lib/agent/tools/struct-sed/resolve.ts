@@ -17,7 +17,7 @@ import {
 	type StructDocument,
 	type StructKind,
 } from "../../structural";
-import type { LineRange, MovePlacement } from "../../structural/edit-ops";
+import { type LineRange, type MovePlacement, splitLines } from "../../structural/edit-ops";
 import type { ToolResult } from "../../types";
 import {
 	COMMANDS,
@@ -137,7 +137,9 @@ export async function resolveToRange(input: {
 		};
 	}
 
-	const lines = text.split("\n");
+	// Use the mutation layer's line semantics: a final newline is not an extra line.
+	// Keep a virtual line 1 for empty files so insert/append/create remain addressable.
+	const lines = text === "" ? [""] : splitLines(text).lines;
 	try {
 		const parsed = parseAddress(address);
 		const result = resolveAddress(parsed, lines, { maxBlocks: 1 });

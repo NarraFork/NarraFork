@@ -131,6 +131,43 @@ describe("address validation", () => {
 	});
 });
 
+describe("EOF addresses", () => {
+	for (const [name, source, lastLine] of [
+		["trailing newline", "alpha\nbravo\n", 2],
+		["no trailing newline", "alpha\nbravo", 2],
+		["CRLF", "alpha\r\nbravo\r\n", 2],
+		["trailing blank line", "alpha\nbravo\n\n", 3],
+		["empty file", "", 1],
+	] as const) {
+		test(`append at $: ${name}`, async () => {
+			const file = join(workDir, `eof-${name}.txt`);
+			writeFileSync(file, source);
+			const result = await run({
+				file_path: file,
+				command: "append",
+				address: "$",
+				content: "CHARLIE",
+			});
+			expect(result.isError).toBeFalsy();
+			expect(result.metadata?.startLine).toBe(lastLine);
+			expect(result.metadata?.endLine).toBe(lastLine);
+			expect(result.output).toContain("CHARLIE");
+			expect(readFileSync(file, "utf8")).toBe(source);
+		});
+	}
+
+	test("a numeric address beyond the actual last line is still refused", async () => {
+		const result = await run({
+			file_path: plainFile,
+			command: "append",
+			address: "5",
+			content: "extra",
+		});
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("matched nothing");
+	});
+});
+
 describe("dry run is the default", () => {
 	test("no dry_run flag means preview, and nothing is written", async () => {
 		const before = readFileSync(plainFile, "utf8");

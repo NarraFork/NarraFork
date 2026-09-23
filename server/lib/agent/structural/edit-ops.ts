@@ -42,7 +42,7 @@ export function rangesOverlap(a: LineRange, b: LineRange): boolean {
  * silently adding or dropping a trailing newline shows up as a spurious diff line on
  * every subsequent edit.
  */
-function splitLines(text: string): { lines: string[]; trailingNewline: boolean } {
+export function splitLines(text: string): { lines: string[]; trailingNewline: boolean } {
 	if (text === "") return { lines: [], trailingNewline: false };
 	const trailingNewline = text.endsWith("\n");
 	const body = trailingNewline ? text.slice(0, -1) : text;
