@@ -138,8 +138,10 @@ describe("resolveProvider fallback order", () => {
 		expect(provider).toBe("anthropic");
 	});
 
-	test("GPT-6 Astra 作为 builtin Codex 模型解析", () => {
+	test("GPT-6 系列作为 builtin Codex 模型解析", () => {
 		expect(resolveProvider("gpt-6-astra")).toBe("codex");
+		expect(resolveProvider("gpt-6-sol")).toBe("codex");
+		expect(resolveProvider("gpt-6-luna")).toBe("codex");
 	});
 
 	test("已退役的内置 Codex 模型不再强制解析为 Codex", () => {
