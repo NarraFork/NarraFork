@@ -1,0 +1,6 @@
+{
+	"version": "0.7.9",
+	"date": "2026-09-24",
+	"en": "## Bug Fixes\n\n- Prevent existing conversation content from fading in again when streaming snapshots refresh\n- Correct background-agent lifecycle notifications and their delivery to the parent session\n- Fix structural append operations reporting out-of-range addresses for files ending with a newline\n- Fix revert manifest worker loading in compiled releases, with startup checks and safe error reporting\n- Allow opening a Send recipient's session before the delivery receipt becomes available, without jumping to an unrelated message\n- Preserve output limits for non-Codex endpoints and support migrating legacy model cards with empty tags\n\n## Improvements\n\n- Add bounded, privacy-conscious phase diagnostics to file writes, edits, and editor saves to help locate timeouts and failures\n- Raise the default per-device RPC concurrency limit from 16 to 64 and remove cancellation listeners when requests finish",
+	"zh-CN": "## 修复\n\n- 修复流式快照刷新时，已有会话内容重复播放淡入动画的问题\n- 修正后台代理生命周期通知及其向父会话的投递\n- 修复文件以换行结尾时，结构化追加操作误报地址越界的问题\n- 修复编译发布版中回退清单 worker 的加载，补充启动握手与安全错误提示\n- Send 消息尚未生成收件回执时，也可直接打开目标会话，不跳转到无关消息\n- 为非 Codex 端点保留输出长度限制，并兼容旧模型卡空标签的迁移\n\n## 改进\n\n- 为文件写入、编辑与编辑器保存增加有界、避免记录文件内容的分阶段诊断，便于定位超时和失败原因\n- 单设备 RPC 默认并发上限从 16 提高到 64，请求结束时及时清理取消监听器"
+}
