@@ -211,7 +211,7 @@ export const DEFAULTS: NarraForkSettings = {
 		globalDefaultDeviceId: null,
 		rpcTimeoutMs: 120_000,
 		maxRpcBytes: 10 * 1024 * 1024,
-		maxConcurrentRpcPerDevice: 16,
+		maxConcurrentRpcPerDevice: 64,
 		transferChunkBytes: 1024 * 1024,
 		transferConcurrency: 4,
 		maxConcurrentTransfersPerDevice: 2,

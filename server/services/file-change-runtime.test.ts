@@ -35,7 +35,9 @@ import type { ToolContext, ToolExecutionTarget } from "../lib/agent/types";
 import { worktreeWriteLock } from "../lib/async-mutex";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
+import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
+import type { FileChangeDiagnosticSnapshot } from "./file-change-diagnostics";
 import { FileChangeEvidenceService } from "./file-change-evidence";
 import {
 	createFileChangeLocalIo,
@@ -749,6 +751,203 @@ describe("fail closed before writes and after uncertain IO", () => {
 		expect(attributions()).toHaveLength(0);
 	});
 
+	test("IO and runtime verification failures both reach the tool result without releasing the lease", async () => {
+		const path = join(workspace, "two-observation-failures.txt");
+		await writeFile(path, "old");
+		const context = await callContext("Edit", path);
+		const first = new DOMException("The operation timed out.", "TimeoutError");
+		const second = Object.assign(new Error("private secondary message"), { code: "EIO" });
+		let reads = 0;
+		io.read = async (...args) => {
+			reads++;
+			if (reads === 3) throw first;
+			if (reads === 4) throw second;
+			return fileChangeLocalIo.read(...args);
+		};
+		const apply = spyOn(io, "apply");
+		const warning = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const result = await edit(path, "old", "new", context);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("The operation timed out.");
+			expect(result.output).toContain("io_final_read(TimeoutError), after_read(EIO)");
+			expect(result.output).not.toContain("private secondary message");
+			const trace = result.metadata?.fileChangeDiagnostics as FileChangeDiagnosticSnapshot;
+			const operation = operations()[0];
+			const lease = db.select().from(schema.workspaceWriteLeases).get();
+			expect(trace).toMatchObject({
+				version: 1,
+				sourceId: context.toolCallBinding?.toolCallId,
+				operationId: operation.id,
+				leaseId: lease?.leaseId,
+				failures: [
+					{ stage: "io_final_read", name: "TimeoutError" },
+					{ stage: "after_read", name: "Error", code: "EIO" },
+				],
+			});
+			expect(trace.phases.find((phase) => phase.stage === "io_sync")).toBeDefined();
+			expect(trace.phases.every((phase) => phase.elapsedMs >= 0)).toBe(true);
+			expect(warning).toHaveBeenCalledWith("Local file-change operation failed", {
+				sourceKind: "tool",
+				diagnostics: trace,
+			});
+			expect(JSON.stringify(trace)).not.toContain(path);
+			expect(JSON.stringify(trace)).not.toContain("private secondary message");
+			expect(await readFile(path, "utf8")).toBe("new");
+			expect(operation).toMatchObject({
+				executionOutcome: "failed",
+				settlement: "reconcile_required",
+			});
+			expect(effects()[0]).toMatchObject({
+				outcome: "unknown",
+				settlement: "reconcile_required",
+				executionReceiptJson: { outcome: "unknown", confirmed: false },
+			});
+			expect(lease?.status).toBe("quarantined");
+			expect((await edit(path, "new", "later")).output).toContain("needs verification");
+			expect(apply).toHaveBeenCalledTimes(1);
+			expect(await readFile(path, "utf8")).toBe("new");
+		} finally {
+			warning.mockRestore();
+			apply.mockRestore();
+		}
+	});
+
+	test("a runtime-only after-read timeout is distinct from the IO final check", async () => {
+		const path = join(workspace, "runtime-read-timeout.txt");
+		await writeFile(path, "old");
+		let reads = 0;
+		io.read = async (...args) => {
+			if (++reads === 4) throw new DOMException("The operation timed out.", "TimeoutError");
+			return fileChangeLocalIo.read(...args);
+		};
+		const result = await write(path, "new");
+		const trace = result.metadata?.fileChangeDiagnostics as FileChangeDiagnosticSnapshot;
+		expect(result.isError).toBe(true);
+		expect(trace.failures).toEqual([{ stage: "after_read", name: "TimeoutError" }]);
+		expect(effects()[0]).toMatchObject({
+			settlement: "reconcile_required",
+			executionReceiptJson: { outcome: "applied", confirmed: true },
+		});
+		expect(await readFile(path, "utf8")).toBe("new");
+	});
+
+	test("preparation failure survives a second no-dispatch settlement failure in diagnostics", async () => {
+		const path = join(workspace, "preparation-double-failure.txt");
+		await writeFile(path, "old");
+		const evidence = new FileChangeEvidenceService(db);
+		const prepare = spyOn(evidence, "finalizePreparation").mockImplementation(async () => {
+			throw Object.assign(new Error("prepare failed"), { code: "EIO" });
+		});
+		const settle = spyOn(evidence, "finishPreparationWithoutDispatch").mockImplementation(() => {
+			throw Object.assign(new Error("settlement failed"), { code: "SQLITE_CONSTRAINT" });
+		});
+		runtime = makeRuntime({ evidence });
+		const apply = spyOn(io, "apply");
+		try {
+			const result = await edit(path, "old", "new");
+			const trace = result.metadata?.fileChangeDiagnostics as FileChangeDiagnosticSnapshot;
+			expect(result.isError).toBe(true);
+			// Preserve the pre-existing outward error while retaining the original cause in the trace.
+			expect(result.output).toContain("settlement failed");
+			expect(trace.failures).toEqual([
+				{ stage: "prepare_evidence", name: "Error", code: "EIO" },
+				{ stage: "settle_evidence", name: "Error", code: "SQLITE_CONSTRAINT" },
+			]);
+			expect(apply).not.toHaveBeenCalled();
+			expect(await readFile(path, "utf8")).toBe("old");
+			expect(db.select().from(schema.workspaceWriteLeases).get()?.status).toBe("quarantined");
+		} finally {
+			prepare.mockRestore();
+			settle.mockRestore();
+			apply.mockRestore();
+		}
+	});
+
+	test("a primitive caller cancellation reason is rethrown unchanged after confirmed IO", async () => {
+		const path = join(workspace, "primitive-cancel.txt");
+		await writeFile(path, "old");
+		const context = await callContext("Write", path);
+		const controller = new AbortController();
+		context.signal = controller.signal;
+		io.apply = async (input) => {
+			const result = await fileChangeLocalIo.apply(input);
+			controller.abort("cancelled");
+			return result;
+		};
+		await expect(
+			runtime.execute({
+				ctx: context,
+				backend: localBackend,
+				toolName: "Write",
+				filePath: path,
+				input: { content: "new" },
+				construct: () => ({
+					nextBytes: Buffer.from("new"),
+					lineStats: null,
+					result: { output: "written" },
+				}),
+			}),
+		).rejects.toBe("cancelled");
+		expect(await readFile(path, "utf8")).toBe("new");
+		expect(operations()[0]).toMatchObject({
+			executionOutcome: "interrupted",
+			settlement: "settled",
+		});
+		expect(effects()[0]).toMatchObject({
+			executionReceiptJson: { outcome: "applied", confirmed: true },
+		});
+		expect(db.select().from(schema.workspaceWriteLeases).get()?.status).toBe("settled");
+	});
+	test("an adapter rejection has its own phase and never implies no dispatch", async () => {
+		const path = join(workspace, "adapter-timeout.txt");
+		await writeFile(path, "old");
+		io.apply = async () => {
+			throw new DOMException("The operation timed out.", "TimeoutError");
+		};
+		const result = await write(path, "new");
+		expect(result.output).toContain("apply_adapter(TimeoutError)");
+		expect(effects()[0]).toMatchObject({
+			settlement: "reconcile_required",
+			executionReceiptJson: { outcome: "unknown", confirmed: false },
+		});
+		expect(await readFile(path, "utf8")).toBe("old");
+	});
+
+	test("observed-blob publication failure preserves an earlier IO verification failure", async () => {
+		const path = join(workspace, "publication-timeout.txt");
+		await writeFile(path, "old");
+		const { store } = await runtime.initialize();
+		const putBytes = store.putBytes.bind(store);
+		const publish = spyOn(store, "putBytes").mockImplementation(async (bytes, options) => {
+			if (Buffer.from(bytes).toString() === "foreign")
+				throw Object.assign(new Error("publication failed"), { code: "ENOSPC" });
+			return putBytes(bytes, options);
+		});
+		let reads = 0;
+		io.read = async (...args) => {
+			if (++reads === 3) throw new DOMException("The operation timed out.", "TimeoutError");
+			return fileChangeLocalIo.read(...args);
+		};
+		io.apply = async (input) => {
+			const result = await fileChangeLocalIo.apply.call(io, input);
+			await writeFile(path, "foreign");
+			return result;
+		};
+		try {
+			const result = await write(path, "new");
+			const trace = result.metadata?.fileChangeDiagnostics as FileChangeDiagnosticSnapshot;
+			expect(result.isError).toBe(true);
+			expect(trace.failures).toEqual([
+				{ stage: "io_final_read", name: "TimeoutError" },
+				{ stage: "publish_observed", name: "Error", code: "ENOSPC" },
+			]);
+			expect(db.select().from(schema.workspaceWriteLeases).get()?.status).toBe("quarantined");
+			expect(await readFile(path, "utf8")).toBe("foreign");
+		} finally {
+			publish.mockRestore();
+		}
+	});
 	test("after mismatch is an actual applied-but-unknown result, not success or rollback", async () => {
 		const path = join(workspace, "after.txt");
 		await writeFile(path, "old");
@@ -784,7 +983,9 @@ describe("fail closed before writes and after uncertain IO", () => {
 		sqlite.exec(
 			"CREATE TRIGGER fail_settle BEFORE UPDATE OF execution_receipt_json ON file_change_effects BEGIN SELECT RAISE(ABORT, 'settlement-fault'); END",
 		);
-		expect((await write(path, "new", ctx)).isError).toBe(true);
+		const failed = await write(path, "new", ctx);
+		expect(failed.isError).toBe(true);
+		expect(failed.output).toContain("settle_evidence(");
 		expect(await readFile(path, "utf8")).toBe("new");
 		expect(effects()[0]).toMatchObject({ settlement: "applying", executionReceiptJson: null });
 		expect(pendingScope()).toMatchObject({
@@ -1747,7 +1948,13 @@ describe("lazy namespace, coordination and cancellation", () => {
 			controller.abort(new Error("cancel after durable IO"));
 			return result;
 		};
-		expect((await write(path, "new", context)).isError).toBe(true);
+		const failed = await write(path, "new", context);
+		expect(failed.isError).toBe(true);
+		expect(failed.metadata?.fileChangeDiagnostics).toMatchObject({
+			abortSource: "caller",
+			operationId: operations()[0].id,
+			failures: [{ stage: "verify_result", name: "Error" }],
+		});
 		expect(await readFile(path, "utf8")).toBe("new");
 		expect(operations()[0].executionOutcome).toBe("interrupted");
 		expect(effects()).toHaveLength(0);

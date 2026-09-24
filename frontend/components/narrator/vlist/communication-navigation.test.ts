@@ -41,8 +41,30 @@ describe("Send receipt navigation", () => {
 		expect(located).toEqual([["child", "receipt"]]);
 		expect(opened).toEqual([["child", "receipt"]]);
 	});
-	test("queued, deleted, or inaccessible receipts do not jump to unrelated content", async () => {
-		for (const status of [404, 403, 500]) {
+	test("sent-but-not-received opens the session without message tracking", async () => {
+		// A reserved receipt that has not materialized yet is 404. The target id is
+		// already known, so the dock must still open — just without a messageId.
+		const opened: unknown[] = [];
+		const notices: string[] = [];
+		await openCommunicationRecipient(
+			{ id: "child", deliveryMessageId: "reserved" },
+			{
+				locate: async () => {
+					throw Object.assign(new Error("Not found"), { status: 404 });
+				},
+				open: (...args) => {
+					opened.push(args);
+				},
+				notify: (reason) => {
+					notices.push(reason);
+				},
+			},
+		);
+		expect(opened).toEqual([["child"]]);
+		expect(notices).toEqual(["unavailable"]);
+	});
+	test("inaccessible receipts do not jump to unrelated content", async () => {
+		for (const status of [403, 500]) {
 			const notices: string[] = [];
 			await openCommunicationRecipient(
 				{ id: "child", deliveryMessageId: "reserved" },
@@ -58,7 +80,7 @@ describe("Send receipt navigation", () => {
 					},
 				},
 			);
-			expect(notices).toEqual([status === 404 ? "unavailable" : "error"]);
+			expect(notices).toEqual(["error"]);
 		}
 	});
 	test("legacy Send opens the session with an honest missing-receipt notice", async () => {

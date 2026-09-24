@@ -374,6 +374,8 @@ export const buildPlatform = ${JSON.stringify(platform.platformId)};
 			"./server/lib/db-worker/worker-entry.ts",
 			// Large editor IO/encoding runs off-thread in source and compiled builds alike.
 			"./server/services/editor-document-worker.ts",
+			// Revert manifest validation also runs in a Worker; Worker URLs are not bundled imports.
+			"./server/services/revert-transaction-manifest-worker.ts",
 			"--compile",
 			"--minify",
 			"--target",

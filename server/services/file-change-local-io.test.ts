@@ -1,9 +1,10 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { type BigIntStats, constants } from "node:fs";
-import { lstat, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
+import { FileChangeDiagnostics } from "./file-change-diagnostics";
 import {
 	createFileChangeLocalIo,
 	fileChangeLocalIo,
@@ -220,6 +221,226 @@ describe("local file cancellation boundaries (real IO)", () => {
 			input.nextBytes = Buffer.alloc(0);
 			await fileChangeLocalIo.apply(input);
 			expect((await readFile(input.canonicalPath)).length).toBe(0);
+		});
+	});
+});
+
+describe("local file phase diagnostics (real IO)", () => {
+	test.each([
+		"original",
+		null,
+	])("successful phases preserve content (initial=%s)", async (initial) => {
+		await withFile(initial, async (input) => {
+			if (initial === null) {
+				input.canonicalPath = join(input.canonicalPath, "nested", "file");
+				input.lexicalPath = input.canonicalPath;
+			}
+			let tick = 0;
+			const diagnostics = new FileChangeDiagnostics(() => tick++);
+			input.diagnostics = diagnostics;
+			const result = await fileChangeLocalIo.apply(input);
+			expect(result.kind).toBe("applied");
+			expect(result.error).toBeNull();
+			expect(await readFile(input.canonicalPath)).toEqual(Buffer.from(input.nextBytes));
+			expect(result.parentEffects.createdPaths).toHaveLength(initial === null ? 2 : 0);
+			const snapshot = diagnostics.snapshot();
+			expect(snapshot).toMatchObject({ version: 1, failures: [], droppedFailures: 0 });
+			expect(snapshot.phases.map(({ stage }) => stage)).toEqual([
+				"io_validate",
+				"io_read_before",
+				...(initial === null ? (["io_prepare_parents"] as const) : []),
+				"io_open",
+				...(initial === null ? [] : (["io_read_descriptor"] as const)),
+				"io_validate_before_mutation",
+				...(initial === null ? [] : (["io_truncate"] as const)),
+				"io_write",
+				"io_sync",
+				"io_verify_identity",
+				"io_close",
+				"io_final_validate",
+				"io_final_read",
+			]);
+			for (const phase of snapshot.phases) {
+				expect(phase.visits).toBe(1);
+				expect(phase.elapsedMs).toBeGreaterThan(0);
+			}
+			expect(snapshot.elapsedMs).toBeGreaterThan(0);
+		});
+	});
+
+	test("pre-dispatch cancellation records validation without mutation", async () => {
+		await withFile("original", async (input, controller) => {
+			const error = new Error("private cancellation reason");
+			input.diagnostics = new FileChangeDiagnostics();
+			controller.abort(error);
+			const result = await fileChangeLocalIo.apply(input);
+			expect(result.kind).toBe("not_applied");
+			expect(result.error).toBe(error);
+			expect(await readFile(input.canonicalPath, "utf8")).toBe("original");
+			expect(input.diagnostics.snapshot().failures).toEqual([
+				{ stage: "io_validate", name: "Error" },
+			]);
+		});
+	});
+
+	test.each([
+		{ fault: "truncate-before", stage: "io_truncate", content: "original" },
+		{ fault: "truncate-after", stage: "io_truncate", content: "" },
+		{ fault: "write-before", stage: "io_write", content: "" },
+		{ fault: "write-after", stage: "io_write", content: "repl" },
+		{ fault: "sync", stage: "io_sync", content: "replacement" },
+		{ fault: "close", stage: "io_close", content: "replacement" },
+		{ fault: "sync-and-close", stage: "io_sync", content: "replacement" },
+	])("$fault preserves error identity and reports actual effects", async ({
+		fault,
+		stage,
+		content,
+	}) => {
+		await withFile("original", async (input) => {
+			const error = Object.freeze(
+				Object.assign(new Error("private file content /workspace/secret.txt"), { code: "EIO" }),
+			);
+			const closeError = Object.freeze(
+				Object.assign(new Error("private close detail"), { code: "EBADF" }),
+			);
+			const diagnostics = new FileChangeDiagnostics();
+			input.diagnostics = diagnostics;
+			let closes = 0;
+			const io = createFileChangeLocalIo({
+				lstat,
+				mkdir,
+				async open(path, flags, mode) {
+					const file = await open(path, flags, mode);
+					if (!(flags & constants.O_RDWR)) return file;
+					return {
+						stat: (options) => file.stat(options),
+						read: (buffer, offset, length, position) => file.read(buffer, offset, length, position),
+						async truncate(length) {
+							if (fault === "truncate-before") throw error;
+							await file.truncate(length);
+							if (fault === "truncate-after") throw error;
+						},
+						async write(buffer, offset, length, position) {
+							if (fault === "write-before") throw error;
+							const written = await file.write(
+								buffer,
+								offset,
+								fault === "write-after" ? 4 : length,
+								position,
+							);
+							if (fault === "write-after") throw error;
+							return written;
+						},
+						async sync() {
+							if (fault === "sync" || fault === "sync-and-close") throw error;
+							await file.sync();
+						},
+						async close() {
+							closes++;
+							// Release the real descriptor before simulating a close failure.
+							await file.close();
+							if (fault === "close") throw error;
+							if (fault === "sync-and-close") throw closeError;
+						},
+					};
+				},
+			});
+			const result = await io.apply(input);
+			expect(result.kind).toBe("target_mutation_unknown");
+			expect(result.error).toBe(error);
+			expect(result.parentEffects).toEqual({ createdPaths: [], possiblePaths: [] });
+			expect(await readFile(input.canonicalPath, "utf8")).toBe(content);
+			expect(closes).toBe(1);
+			const snapshot = diagnostics.snapshot();
+			expect(snapshot.failures).toEqual([
+				{ stage, name: "Error", code: "EIO" },
+				...(fault === "sync-and-close"
+					? ([{ stage: "io_close", name: "Error", code: "EBADF" }] as const)
+					: []),
+			]);
+			expect(snapshot.phases.at(-1)).toMatchObject({ stage: "io_close", visits: 1 });
+			expect(snapshot.phases.some(({ stage }) => stage === "io_final_read")).toBe(false);
+			expect(snapshot.droppedFailures).toBe(0);
+			expect(JSON.stringify(snapshot)).not.toContain("private");
+			expect(JSON.stringify(snapshot)).not.toContain("/workspace/secret.txt");
+			expect(JSON.stringify(snapshot)).not.toContain("message");
+		});
+	});
+
+	test.each([
+		{ guard: 2, stage: "io_validate_before_mutation", kind: "not_applied", content: "original" },
+		{
+			guard: 3,
+			stage: "io_verify_identity",
+			kind: "target_mutation_unknown",
+			content: "replacement",
+		},
+		{
+			guard: 4,
+			stage: "io_final_validate",
+			kind: "target_mutation_unknown",
+			content: "replacement",
+		},
+	])("guard $guard failure belongs to $stage", async ({ guard, stage, kind, content }) => {
+		await withFile("original", async (input) => {
+			const diagnostics = new FileChangeDiagnostics();
+			input.diagnostics = diagnostics;
+			const error = new LocalFileValidationError("private guard detail");
+			let guards = 0;
+			input.assertTarget = async () => {
+				if (++guards === guard) throw error;
+			};
+			const result = await fileChangeLocalIo.apply(input);
+			expect(result.kind).toBe(kind);
+			expect(result.error).toBe(error);
+			expect(await readFile(input.canonicalPath, "utf8")).toBe(content);
+			const snapshot = diagnostics.snapshot();
+			expect(snapshot.failures).toEqual([{ stage, name: "LocalFileValidationError" }]);
+			expect(snapshot.phases).toContainEqual({
+				stage: "io_close",
+				elapsedMs: expect.any(Number),
+				visits: 1,
+			});
+			expect(snapshot.phases.some(({ stage }) => stage === "io_final_read")).toBe(false);
+		});
+	});
+
+	test("final read failure stays distinct from final validation after persistence", async () => {
+		await withFile("original", async (input, controller) => {
+			const diagnostics = new FileChangeDiagnostics();
+			input.diagnostics = diagnostics;
+			const error = Object.assign(new Error("private final read failure"), { code: "EIO" });
+			const io = createFileChangeLocalIo();
+			const originalRead = io.read.bind(io);
+			const timeoutSpy = spyOn(AbortSignal, "timeout");
+			let reads = 0;
+			const readSpy = spyOn(io, "read").mockImplementation(async (path, signal) => {
+				if (++reads === 2) {
+					expect(signal).toBeInstanceOf(AbortSignal);
+					expect(signal).not.toBe(controller.signal);
+					await originalRead(path, signal);
+					throw error;
+				}
+				return originalRead(path, signal);
+			});
+			try {
+				const result = await io.apply(input);
+				expect(result.kind).toBe("target_mutation_unknown");
+				expect(result.error).toBe(error);
+				expect(reads).toBe(2);
+				expect(timeoutSpy).toHaveBeenCalledWith(5_000);
+				expect(await readFile(input.canonicalPath, "utf8")).toBe("replacement");
+				const snapshot = diagnostics.snapshot();
+				expect(snapshot.failures).toEqual([{ stage: "io_final_read", name: "Error", code: "EIO" }]);
+				expect(snapshot.phases.slice(-3).map(({ stage }) => stage)).toEqual([
+					"io_close",
+					"io_final_validate",
+					"io_final_read",
+				]);
+			} finally {
+				readSpy.mockRestore();
+				timeoutSpy.mockRestore();
+			}
 		});
 	});
 });

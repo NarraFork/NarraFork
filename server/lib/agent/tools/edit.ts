@@ -1,4 +1,8 @@
 import { z } from "zod/v4";
+import {
+	fileChangeDiagnosticMetadata,
+	fileChangeDiagnosticSuffix,
+} from "../../../services/file-change-diagnostics";
 import { LocalFileValidationError } from "../../../services/file-change-local-io";
 import { executeLocalFileChange } from "../../../services/file-change-runtime";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
@@ -785,8 +789,9 @@ export const editTool: ToolDefinition = {
 				output:
 					err instanceof LocalFileValidationError && err.toolOutput
 						? err.toolOutput
-						: `Error editing ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
+						: `Error editing ${file_path}: ${err instanceof Error ? err.message : String(err)}${fileChangeDiagnosticSuffix(err)}`,
 				isError: true,
+				metadata: fileChangeDiagnosticMetadata(err),
 			};
 		}
 	},

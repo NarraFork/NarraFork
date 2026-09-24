@@ -39,6 +39,7 @@ import {
 	FileChangeBlobStoreError,
 	type FileChangeBlobStoreOptions,
 } from "./file-change-blob-store";
+import { FileChangeDiagnostics, fileChangeDiagnosticSuffix } from "./file-change-diagnostics";
 import {
 	type BeginFileChangeOperation,
 	type FileChangeEffectRecord,
@@ -157,7 +158,10 @@ export class EditorFileChangeUncertainError extends Error {
 		readonly operationId: string | undefined,
 		cause: unknown,
 	) {
-		super("Editor save may have changed the file; inspect evidence before retrying", { cause });
+		super(
+			`Editor save may have changed the file; inspect evidence before retrying${fileChangeDiagnosticSuffix(cause)}`,
+			{ cause },
+		);
 		this.name = "EditorFileChangeUncertainError";
 	}
 }
@@ -818,136 +822,177 @@ export class LocalFileChangeRuntime {
 	): Promise<ToolResult> {
 		const source = await this.workspaceSource();
 		const signal = AbortSignal.any([request.signal, AbortSignal.timeout(30_000)]);
-		const { backend, lexicalPath, canonicalPath } = request;
-		const pathFlavor = backend.pathFlavor;
-		if (pathFlavor !== "posix" && pathFlavor !== "windows")
-			throw new Error("Local evidence requires a filesystem path grammar");
-		const { scope, root, rootIdentity } = await this.prepareWorkspaceScope(
-			source,
-			backend,
-			request.cwd,
-			signal,
-			canonicalPath,
-		);
-		const footprint = await captureLocalWriteFootprint(canonicalPath, signal);
-		logger.warn("File history unavailable; executing coordinated tool without blobs", {
-			sourceId: request.sourceId,
-			error: String(cause),
-		});
-		return this.coordinator.withWrite(
-			{
-				scope,
-				runtime: request.runtime,
+		const diagnostics = new FileChangeDiagnostics();
+		diagnostics.identify({ sourceId: request.sourceId });
+		diagnostics.enter("prepare_scope");
+		try {
+			const { backend, lexicalPath, canonicalPath } = request;
+			const pathFlavor = backend.pathFlavor;
+			if (pathFlavor !== "posix" && pathFlavor !== "windows")
+				throw new Error("Local evidence requires a filesystem path grammar");
+			const { scope, root, rootIdentity } = await this.prepareWorkspaceScope(
+				source,
+				backend,
+				request.cwd,
 				signal,
-				ranges: footprint.ranges,
-				executionClass: "local_file_io",
-			},
-			(lease) =>
-				withFileHistoryWrite(
-					{ deviceId: LOCAL_DEVICE_ID, pathFlavor, canonicalPath },
-					() =>
-						withWorkspaceWriteLock(
-							backend,
-							request.cwd,
-							async () => {
-								const existing = this.existingOperation(source.sourceInstanceId, request);
-								if (existing) throw alreadyAttempted(existing);
-								const assertTarget = async () => {
-									await request.assertBinding();
-									await assertLocalWriteFootprint(footprint);
-									lease.assertCurrent(lease.executionBinding);
-									const actual = await backend.resolvePathIdentity(lexicalPath);
-									if (
-										!backend.paths.equals(actual.canonicalPath, canonicalPath) ||
-										actual.runtimeGeneration !== request.runtime.runtimeGeneration ||
-										(await localDirectoryIdentity(root)) !== rootIdentity
-									)
-										throw new LocalFileValidationError("Frozen local target/root changed");
-									lease.assertCurrent(lease.executionBinding);
-								};
-								await assertTarget();
-								const before = await this.io.read(canonicalPath, signal);
-								if (before.mode !== null && (before.mode & 0o222) === 0)
-									throw new LocalFileValidationError("File is read-only");
-								const prepared = await request.construct(before);
-								if (prepared.nextBytes.byteLength > FILE_CHANGE_LIMITS.blobBytes)
-									throw new LocalFileValidationError("Output exceeds the 32 MiB evidence limit");
-								const operation = this.evidence.beginOperation({
-									sourceInstanceId: source.sourceInstanceId,
-									sourceKind: request.sourceKind,
-									sourceId: request.sourceId,
-									toolCallId: request.sourceId,
-									toolUseId: request.toolUseId,
-									attempt: request.attempt,
-									requestDigest: await hashLocalFileChangeRequest(
-										[request.toolName ?? "tool", lexicalPath, canonicalPath],
-										request.input,
-										signal,
-									),
-									expectedEffectCount: 1,
-									actor: request.actor,
-									narratorId: request.narratorId,
-									projectId: request.projectId,
-									ownerUserId: request.userId,
-									executionBinding: lease.executionBinding,
-									executionSegmentId: request.executionSegmentId,
-								});
-								request.linkOperation?.(operation.id);
-								lease.registerMutation(operation.id, { operationId: operation.id });
-								const execution = await applyLocalFileChange(
-									this.io,
-									{
-										backend,
-										lexicalPath,
-										canonicalPath,
-										before,
-										nextBytes: prepared.nextBytes,
-										signal,
-										assertTarget,
-										onDispatch: () => request.onDispatch?.(),
-									},
-									footprint,
-								);
-								await retryWorkspaceMetadata(() =>
-									lease.settleWith(operation.id, (tx) => {
-										this.evidence.finishOperation(
-											operation.id,
-											signal.aborted
-												? "interrupted"
-												: execution.result.kind === "applied"
-													? "succeeded"
-													: "failed",
-											tx,
-										);
-										return { outcome: execution.leaseOutcome, value: undefined };
-									}),
-								);
-								if (execution.result.kind !== "applied") {
-									logger.warn("Coordinated write failed without file history", {
-										operationId: operation.id,
-										localIo: execution.diagnostics,
-									});
-									throw execution.result.error;
-								}
-								signal.throwIfAborted();
-								const metadata = { ...prepared.result.metadata };
-								delete metadata.linesAdded;
-								delete metadata.linesRemoved;
-								return {
-									...prepared.result,
-									metadata: {
-										...metadata,
-										fileChangeHistoryUnavailable: true,
-										fileChangeHistoryReason: "blob_namespace_unavailable",
-										fileChangeLocalIo: execution.diagnostics,
-									},
-								};
-							},
-							signal,
-						),
+				canonicalPath,
+			);
+			diagnostics.enter("capture_footprint");
+			const footprint = await captureLocalWriteFootprint(canonicalPath, signal);
+			logger.warn("File history unavailable; executing coordinated tool without blobs", {
+				sourceId: request.sourceId,
+				error: String(cause),
+			});
+			diagnostics.enter("acquire_lease");
+			return await this.coordinator.withWrite(
+				{
+					scope,
+					runtime: request.runtime,
 					signal,
-				),
-		);
+					ranges: footprint.ranges,
+					executionClass: "local_file_io",
+				},
+				(lease) => {
+					diagnostics.identify({ leaseId: lease.leaseId });
+					diagnostics.enter("acquire_history_lock");
+					return withFileHistoryWrite(
+						{ deviceId: LOCAL_DEVICE_ID, pathFlavor, canonicalPath },
+						() =>
+							withWorkspaceWriteLock(
+								backend,
+								request.cwd,
+								async () => {
+									const existing = this.existingOperation(source.sourceInstanceId, request);
+									if (existing) throw alreadyAttempted(existing);
+									const assertTarget = async () => {
+										await request.assertBinding();
+										await assertLocalWriteFootprint(footprint);
+										lease.assertCurrent(lease.executionBinding);
+										const actual = await backend.resolvePathIdentity(lexicalPath);
+										if (
+											!backend.paths.equals(actual.canonicalPath, canonicalPath) ||
+											actual.runtimeGeneration !== request.runtime.runtimeGeneration ||
+											(await localDirectoryIdentity(root)) !== rootIdentity
+										)
+											throw new LocalFileValidationError("Frozen local target/root changed");
+										lease.assertCurrent(lease.executionBinding);
+									};
+									diagnostics.enter("validate_target");
+									await assertTarget();
+									diagnostics.enter("read_before");
+									const before = await this.io.read(canonicalPath, signal);
+									if (before.mode !== null && (before.mode & 0o222) === 0)
+										throw new LocalFileValidationError("File is read-only");
+									diagnostics.enter("construct");
+									const prepared = await request.construct(before);
+									if (prepared.nextBytes.byteLength > FILE_CHANGE_LIMITS.blobBytes)
+										throw new LocalFileValidationError("Output exceeds the 32 MiB evidence limit");
+									diagnostics.enter("prepare_evidence");
+									const operation = this.evidence.beginOperation({
+										sourceInstanceId: source.sourceInstanceId,
+										sourceKind: request.sourceKind,
+										sourceId: request.sourceId,
+										toolCallId: request.sourceId,
+										toolUseId: request.toolUseId,
+										attempt: request.attempt,
+										requestDigest: await hashLocalFileChangeRequest(
+											[request.toolName ?? "tool", lexicalPath, canonicalPath],
+											request.input,
+											signal,
+										),
+										expectedEffectCount: 1,
+										actor: request.actor,
+										narratorId: request.narratorId,
+										projectId: request.projectId,
+										ownerUserId: request.userId,
+										executionBinding: lease.executionBinding,
+										executionSegmentId: request.executionSegmentId,
+									});
+									diagnostics.identify({ operationId: operation.id });
+									request.linkOperation?.(operation.id);
+									lease.registerMutation(operation.id, { operationId: operation.id });
+									diagnostics.enter("apply_adapter");
+									const execution = await applyLocalFileChange(
+										this.io,
+										{
+											backend,
+											lexicalPath,
+											canonicalPath,
+											before,
+											nextBytes: prepared.nextBytes,
+											signal,
+											assertTarget,
+											diagnostics,
+											onDispatch: () => request.onDispatch?.(),
+										},
+										footprint,
+									);
+									if (
+										execution.result.error != null &&
+										!diagnostics.hasFailure(execution.result.error)
+									)
+										diagnostics.fail(execution.result.error);
+									diagnostics.enter("settle_evidence");
+									await retryWorkspaceMetadata(() =>
+										lease.settleWith(operation.id, (tx) => {
+											this.evidence.finishOperation(
+												operation.id,
+												signal.aborted
+													? "interrupted"
+													: execution.result.kind === "applied"
+														? "succeeded"
+														: "failed",
+												tx,
+											);
+											return { outcome: execution.leaseOutcome, value: undefined };
+										}),
+									);
+									diagnostics.enter("verify_result");
+									if (execution.result.kind !== "applied") {
+										logger.warn("Coordinated write failed without file history", {
+											operationId: operation.id,
+											localIo: execution.diagnostics,
+										});
+										throw execution.result.error;
+									}
+									signal.throwIfAborted();
+									const metadata = { ...prepared.result.metadata };
+									delete metadata.linesAdded;
+									delete metadata.linesRemoved;
+									return {
+										...prepared.result,
+										metadata: {
+											...metadata,
+											fileChangeHistoryUnavailable: true,
+											fileChangeHistoryReason: "blob_namespace_unavailable",
+											fileChangeLocalIo: execution.diagnostics,
+										},
+									};
+								},
+								signal,
+							),
+						signal,
+					);
+				},
+			);
+		} catch (error) {
+			if (!diagnostics.hasFailure(error)) diagnostics.fail(error);
+			if (signal.aborted)
+				diagnostics.identify({
+					abortSource: signal.reason === request.signal.reason ? "caller" : "operation_budget",
+				});
+			diagnostics.finish();
+			logger.warn("Local file-change without history failed", {
+				diagnostics: diagnostics.snapshot(),
+			});
+			throw diagnostics.attach(error);
+		} finally {
+			diagnostics.finish();
+			if (diagnostics.snapshot().elapsedMs > 1_000)
+				logger.warn("Slow local file-change without history", {
+					diagnostics: diagnostics.snapshot(),
+				});
+		}
 	}
 
 	/** One actual-byte journal/IO/receipt pipeline for tools and the human editor. */
@@ -980,57 +1025,69 @@ export class LocalFileChangeRuntime {
 		const { backend, lexicalPath, canonicalPath } = request;
 		if (backend.pathFlavor !== "posix" && backend.pathFlavor !== "windows")
 			throw new Error("Local evidence requires a filesystem path grammar");
-		const signal = AbortSignal.any([request.signal, AbortSignal.timeout(30_000)]);
-		let namespace: Namespace;
+		const operationBudget = AbortSignal.timeout(30_000);
+		const signal = AbortSignal.any([request.signal, operationBudget]);
+		const diagnostics = new FileChangeDiagnostics();
+		diagnostics.identify({ sourceId: request.sourceId });
+		diagnostics.enter("initialize");
 		try {
-			namespace = await this.initialize();
+			let namespace: Namespace;
 			try {
-				await this.assertNamespaceDirectories(namespace);
-				const budget = namespace.catalog.getBudget();
-				if (budget?.generation !== namespace.generation || budget.status !== "ready")
-					throw new Error("Blob namespace generation changed");
-			} catch {
-				this.initialization = undefined;
 				namespace = await this.initialize();
-				await this.assertNamespaceDirectories(namespace);
+				try {
+					await this.assertNamespaceDirectories(namespace);
+					const budget = namespace.catalog.getBudget();
+					if (budget?.generation !== namespace.generation || budget.status !== "ready")
+						throw new Error("Blob namespace generation changed");
+				} catch {
+					this.initialization = undefined;
+					namespace = await this.initialize();
+					await this.assertNamespaceDirectories(namespace);
+				}
+			} catch (error) {
+				throw new BlobHistoryUnavailableBeforeDispatch(
+					"Blob namespace unavailable before dispatch",
+					{
+						cause: error,
+					},
+				);
 			}
-		} catch (error) {
-			throw new BlobHistoryUnavailableBeforeDispatch("Blob namespace unavailable before dispatch", {
-				cause: error,
+			const existing = this.existingOperation(namespace.sourceInstanceId, request);
+			if (existing) throw alreadyAttempted(existing);
+			signal.throwIfAborted();
+			diagnostics.enter("resolve_target");
+			const path = await backend.resolvePathIdentity(lexicalPath, { signal });
+			if (!backend.paths.equals(path.canonicalPath, canonicalPath))
+				throw new LocalFileValidationError("Authorized canonical path changed before capture");
+			diagnostics.enter("prepare_scope");
+			const { scope, root, rootIdentity } = await this.prepareWorkspaceScope(
+				namespace,
+				backend,
+				request.cwd,
+				signal,
+				canonicalPath,
+			);
+			diagnostics.enter("capture_footprint");
+			const footprint = await captureLocalWriteFootprint(canonicalPath, signal);
+			const identity = createFileChangeIdentity(scope, {
+				deviceId: LOCAL_DEVICE_ID,
+				pathFlavor: backend.pathFlavor,
+				canonicalPath,
+				lexicalPath,
+				objectRole: "referent",
 			});
-		}
-		const existing = this.existingOperation(namespace.sourceInstanceId, request);
-		if (existing) throw alreadyAttempted(existing);
-		signal.throwIfAborted();
-		const path = await backend.resolvePathIdentity(lexicalPath, { signal });
-		if (!backend.paths.equals(path.canonicalPath, canonicalPath))
-			throw new LocalFileValidationError("Authorized canonical path changed before capture");
-		const { scope, root, rootIdentity } = await this.prepareWorkspaceScope(
-			namespace,
-			backend,
-			request.cwd,
-			signal,
-			canonicalPath,
-		);
-		const footprint = await captureLocalWriteFootprint(canonicalPath, signal);
-		const identity = createFileChangeIdentity(scope, {
-			deviceId: LOCAL_DEVICE_ID,
-			pathFlavor: backend.pathFlavor,
-			canonicalPath,
-			lexicalPath,
-			objectRole: "referent",
-		});
-		const requestDigest = await hashLocalFileChangeRequest(
-			[request.toolName ?? "editor", lexicalPath, canonicalPath],
-			request.input,
-			signal,
-		);
-		const historyTarget = {
-			deviceId: LOCAL_DEVICE_ID,
-			pathFlavor: backend.pathFlavor,
-			canonicalPath,
-		};
-		try {
+			diagnostics.enter("hash_request");
+			const requestDigest = await hashLocalFileChangeRequest(
+				[request.toolName ?? "editor", lexicalPath, canonicalPath],
+				request.input,
+				signal,
+			);
+			const historyTarget = {
+				deviceId: LOCAL_DEVICE_ID,
+				pathFlavor: backend.pathFlavor,
+				canonicalPath,
+			};
+			diagnostics.enter("acquire_lease");
 			return await this.coordinator.withWrite(
 				{
 					scope,
@@ -1043,8 +1100,10 @@ export class LocalFileChangeRuntime {
 				// coordinator nesting rejection, rollback barriers and bounded admission.
 				// Use the frozen cwd, NOT the evidence root: Bash and legacy tools key
 				// their mutex by this workspace spelling (normalized by the helper).
-				async (lease) =>
-					withFileHistoryWrite(
+				async (lease) => {
+					diagnostics.identify({ leaseId: lease.leaseId });
+					diagnostics.enter("acquire_history_lock");
+					return withFileHistoryWrite(
 						historyTarget,
 						() =>
 							withWorkspaceWriteLock(
@@ -1075,6 +1134,7 @@ export class LocalFileChangeRuntime {
 										operation: FileChangeOperationRecord,
 										effect?: FileChangeEffectRecord,
 									) => {
+										diagnostics.enter("settle_evidence");
 										const mutationId = effect?.mutationId ?? operation.id;
 										lease.registerMutation(mutationId, {
 											operationId: operation.id,
@@ -1119,16 +1179,19 @@ export class LocalFileChangeRuntime {
 											throw new LocalFileValidationError("Frozen local target/root changed");
 										lease.assertCurrent(lease.executionBinding);
 									};
+									diagnostics.enter("validate_target");
 									await assertTarget(true);
 									let before: LocalFileObservation;
 									let prepared: PreparedFileChange<Result>;
 									try {
+										diagnostics.enter("read_before");
 										before = await this.io.read(canonicalPath, signal);
 										// Reading awaits IO too: do not return a conflict body after its ACL or
 										// canonical target changed while those bytes were being collected.
 										if (request.sourceKind === "editor") await assertTarget();
 										if (before.mode !== null && (before.mode & 0o222) === 0)
 											throw new LocalFileValidationError("File is read-only");
+										diagnostics.enter("construct");
 										prepared = await request.construct(before);
 										if (prepared.nextBytes.byteLength > FILE_CHANGE_LIMITS.blobBytes)
 											throw new LocalFileValidationError(
@@ -1137,13 +1200,17 @@ export class LocalFileChangeRuntime {
 									} catch (error) {
 										// Only construction/known validation failures qualify. Infrastructure
 										// failures are not evidence of a no-change operation.
+										diagnostics.fail(error);
+										diagnostics.enter("settle_evidence");
 										request.recordNoDispatch?.(operationInput, error);
 										throw error;
 									}
 									let beforeState: FileChangeState;
 									let afterState: FileChangeState;
 									try {
+										diagnostics.enter("publish_before");
 										beforeState = await this.publish(namespace, before, signal, true);
+										diagnostics.enter("publish_intended");
 										afterState = await this.publish(
 											namespace,
 											{
@@ -1155,6 +1222,7 @@ export class LocalFileChangeRuntime {
 											true,
 										);
 									} catch (error) {
+										diagnostics.fail(error);
 										if (error instanceof BlobHistoryUnavailableBeforeDispatch) throw error;
 										// Quota and cancellation remain normal errors. Only unavailable
 										// namespace/content before journal dispatch permits degradation.
@@ -1192,7 +1260,9 @@ export class LocalFileChangeRuntime {
 												{ cause: error },
 											);
 										}
+										diagnostics.enter("prepare_evidence");
 										const rejected = this.evidence.beginOperation(operationInput);
+										diagnostics.identify({ operationId: rejected.id });
 										try {
 											request.linkOperation?.(rejected.id);
 										} finally {
@@ -1200,7 +1270,9 @@ export class LocalFileChangeRuntime {
 										}
 										throw error;
 									}
+									diagnostics.enter("prepare_evidence");
 									const operation = this.evidence.beginOperation(operationInput);
+									diagnostics.identify({ operationId: operation.id });
 									let effect: FileChangeEffectRecord | undefined;
 									try {
 										request.linkOperation?.(operation.id);
@@ -1227,6 +1299,7 @@ export class LocalFileChangeRuntime {
 									} catch (error) {
 										// No apply adapter has been called. Persist this positive fact,
 										// keeping the attempt identity as a durable replay barrier.
+										diagnostics.fail(error);
 										await settlePreparation(operation, effect);
 										throw error;
 									}
@@ -1239,6 +1312,7 @@ export class LocalFileChangeRuntime {
 										operationId: operation.id,
 										effectId: effect.id,
 									});
+									diagnostics.enter("apply_adapter");
 									const execution = await applyLocalFileChange(
 										this.io,
 										{
@@ -1249,18 +1323,27 @@ export class LocalFileChangeRuntime {
 											nextBytes: prepared.nextBytes,
 											signal,
 											assertTarget,
+											diagnostics,
 											onDispatch: () => request.onDispatch?.(),
 										},
 										footprint,
 									);
+									if (
+										execution.result.error != null &&
+										!diagnostics.hasFailure(execution.result.error)
+									)
+										diagnostics.fail(execution.result.error);
 									const applied = execution.result.kind === "applied";
 									let ioError: unknown = execution.result.error;
 									let observed: LocalFileObservation | undefined;
 									// Cancellation cannot suppress the bounded after observation/settlement.
 									try {
+										diagnostics.enter("after_validate");
 										await assertTarget();
+										diagnostics.enter("after_read");
 										observed = await this.io.read(canonicalPath, AbortSignal.timeout(5_000));
 									} catch (error) {
+										diagnostics.fail(error);
 										ioError ??= error;
 									}
 									// Sample once at the IO boundary. Metadata callbacks never resample or
@@ -1270,15 +1353,25 @@ export class LocalFileChangeRuntime {
 									// that Bash operation, not to this independently journaled file write.
 									const attributionCeiling = "measured";
 									try {
-										const observedAfter: FileChangeState = !observed
-											? { kind: "unknown", reason: "missing_after" }
-											: observed.bytes !== null &&
-													observed.mode === afterStateMode(afterState) &&
-													Buffer.from(observed.bytes).equals(prepared.nextBytes)
-												? afterState
-												: sameObservedBytes(observed, before)
-													? beforeState
-													: await this.publish(namespace, observed, AbortSignal.timeout(5_000));
+										let observedAfter: FileChangeState;
+										if (!observed) {
+											observedAfter = { kind: "unknown", reason: "missing_after" };
+										} else if (
+											observed.bytes !== null &&
+											observed.mode === afterStateMode(afterState) &&
+											Buffer.from(observed.bytes).equals(prepared.nextBytes)
+										) {
+											observedAfter = afterState;
+										} else if (sameObservedBytes(observed, before)) {
+											observedAfter = beforeState;
+										} else {
+											diagnostics.enter("publish_observed");
+											observedAfter = await this.publish(
+												namespace,
+												observed,
+												AbortSignal.timeout(5_000),
+											);
+										}
 										const receipt: FileChangeExecutionReceipt = {
 											receiptId: generateId(),
 											mutationId: effect.mutationId,
@@ -1290,6 +1383,7 @@ export class LocalFileChangeRuntime {
 											localIo: execution.diagnostics,
 										};
 										const verified = applied && fileChangeStatesEqual(afterState, observedAfter);
+										diagnostics.enter("settle_evidence");
 										const settled = await retryWorkspaceMetadata(() =>
 											lease.settleWith(effect.mutationId, (tx) => {
 												const value = this.evidence.settleEffect(
@@ -1324,6 +1418,7 @@ export class LocalFileChangeRuntime {
 										// counts. A positively non-applied or identical rewrite is not a change.
 										if (settled.outcome !== "no_change")
 											this.project(request, operation, settled, scope);
+										diagnostics.enter("verify_result");
 										if (ioError) throw ioError;
 										signal.throwIfAborted();
 										if (!verified)
@@ -1346,22 +1441,42 @@ export class LocalFileChangeRuntime {
 									} catch (error) {
 										// A settled receipt stays frozen. Only unsettled persistence/IO needs
 										// quarantine; never retry a mutation or write a before-state here.
-										if (lease.pendingMutationCount > 0) lease.markUncertain();
+										if (!diagnostics.hasFailure(error)) diagnostics.fail(error);
+										if (lease.pendingMutationCount > 0) {
+											diagnostics.enter("quarantine");
+											lease.markUncertain();
+										}
 										throw error;
 									}
 								},
 								signal,
 							),
 						signal,
-					),
+					);
+				},
 			);
+		} catch (error) {
+			if (!diagnostics.hasFailure(error)) diagnostics.fail(error);
+			if (signal.aborted)
+				diagnostics.identify({
+					abortSource: signal.reason === request.signal.reason ? "caller" : "operation_budget",
+				});
+			diagnostics.finish();
+			if (diagnostics.snapshot().operationId)
+				logger.warn("Local file-change operation failed", {
+					sourceKind: request.sourceKind,
+					diagnostics: diagnostics.snapshot(),
+				});
+			throw diagnostics.attach(error);
 		} finally {
+			diagnostics.finish();
 			const elapsedMs = Math.round(performance.now() - startedAt);
 			if (elapsedMs > 1_000)
 				logger.warn("Slow local file-change operation", {
 					sourceKind: request.sourceKind,
 					sourceId: request.sourceId,
 					elapsedMs,
+					diagnostics: diagnostics.snapshot(),
 				});
 		}
 	}

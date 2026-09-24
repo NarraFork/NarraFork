@@ -1,4 +1,8 @@
 import { z } from "zod/v4";
+import {
+	fileChangeDiagnosticMetadata,
+	fileChangeDiagnosticSuffix,
+} from "../../../services/file-change-diagnostics";
 import { executeLocalFileChange } from "../../../services/file-change-runtime";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
 import { broadcastSpecChanged } from "../../../services/spec-broadcast";
@@ -261,8 +265,9 @@ export const writeTool: ToolDefinition = {
 			});
 		} catch (err) {
 			return {
-				output: `Error writing ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
+				output: `Error writing ${file_path}: ${err instanceof Error ? err.message : String(err)}${fileChangeDiagnosticSuffix(err)}`,
 				isError: true,
+				metadata: fileChangeDiagnosticMetadata(err),
 			};
 		}
 	},

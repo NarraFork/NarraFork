@@ -3,6 +3,7 @@ import { lstat, mkdir, open } from "node:fs/promises";
 import { dirname } from "node:path";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
+import type { FileChangeDiagnostics } from "./file-change-diagnostics";
 
 export interface LocalFileObservation {
 	bytes: Uint8Array | null;
@@ -108,6 +109,7 @@ export interface LocalFileApplyInput {
 	before: LocalFileObservation;
 	nextBytes: Uint8Array;
 	signal: AbortSignal;
+	diagnostics?: FileChangeDiagnostics;
 	/** Includes the frozen runtime, workspace incarnation and coordinator fence.
 	 * Must not reject merely because the caller cancelled: used after dispatch too. */
 	assertTarget(): Promise<void>;
@@ -238,14 +240,17 @@ export function createFileChangeLocalIo(
 				signal.throwIfAborted();
 			};
 			try {
+				input.diagnostics?.enter("io_validate");
 				signal.throwIfAborted();
 				if (nextBytes.byteLength > FILE_CHANGE_LIMITS.blobBytes)
 					throw new LocalFileValidationError("Output exceeds the 32 MiB evidence limit");
 				await input.assertTarget();
 				signal.throwIfAborted();
+				input.diagnostics?.enter("io_read_before");
 				if (!equal(before, await this.read(canonicalPath, signal)))
 					throw new LocalFileValidationError("Content/object changed before dispatch");
 				if (before.bytes === null) {
+					input.diagnostics?.enter("io_prepare_parents");
 					// Bound the whole ancestor chain before any mutation, then discover
 					// missing entries without recursive mkdir's opaque partial effects.
 					const ancestors: string[] = [];
@@ -287,6 +292,7 @@ export function createFileChangeLocalIo(
 					await input.assertTarget();
 					beforeMutation();
 					targetMutation = true;
+					input.diagnostics?.enter("io_open");
 					try {
 						file = await syscalls.open(
 							canonicalPath,
@@ -305,10 +311,15 @@ export function createFileChangeLocalIo(
 						throw new LocalFileValidationError("File is read-only");
 					signal.throwIfAborted();
 					// No O_TRUNC/O_CREAT: even a failed open cannot mutate the target.
+					input.diagnostics?.enter("io_open");
 					file = await syscalls.open(canonicalPath, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0));
 				}
-				if (before.bytes !== null && !equal(before, await readHandle(file, signal)))
-					throw new LocalFileValidationError("Opened content/object changed before dispatch");
+				if (before.bytes !== null) {
+					input.diagnostics?.enter("io_read_descriptor");
+					if (!equal(before, await readHandle(file, signal)))
+						throw new LocalFileValidationError("Opened content/object changed before dispatch");
+				}
+				input.diagnostics?.enter("io_validate_before_mutation");
 				// After exclusive creation, complete persistence despite cancellation.
 				if (before.bytes !== null) await input.assertTarget();
 				// Recheck the descriptor after asynchronous guards. This narrows the
@@ -324,10 +335,12 @@ export function createFileChangeLocalIo(
 				if (before.bytes !== null) {
 					beforeMutation();
 					targetMutation = true;
+					input.diagnostics?.enter("io_truncate");
 					await file.truncate(0);
 				}
 				// Never race IO with cancellation: await the entire bounded write,
 				// sync and close, even if cancellation happens after mutation starts.
+				input.diagnostics?.enter("io_write");
 				let offset = 0;
 				while (offset < nextBytes.byteLength) {
 					const written = await file.write(
@@ -339,7 +352,9 @@ export function createFileChangeLocalIo(
 					if (!written.bytesWritten) throw new Error("Local file write made no progress");
 					offset += written.bytesWritten;
 				}
+				input.diagnostics?.enter("io_sync");
 				await file.sync();
+				input.diagnostics?.enter("io_verify_identity");
 				// Cancellation is a tool outcome, not proof of uncertain IO. These
 				// post-dispatch guards must validate identity without the caller signal.
 				await input.assertTarget();
@@ -352,13 +367,16 @@ export function createFileChangeLocalIo(
 				if (writtenIdentity !== localObjectIdentity(current))
 					throw new LocalFileValidationError("Written object was replaced before verification");
 			} catch (error) {
+				input.diagnostics?.fail(error);
 				failed = true;
 				failure = error;
 			} finally {
 				if (file) {
 					try {
+						input.diagnostics?.enter("io_close");
 						await file.close();
 					} catch (error) {
+						input.diagnostics?.fail(error);
 						// A failed close is not successful completion. Keep the primary
 						// error if an earlier stage failed; do not mask it with cleanup.
 						// Closing an existing nontruncating descriptor does not itself
@@ -372,7 +390,9 @@ export function createFileChangeLocalIo(
 			// write alone cannot prove the canonical target still contains our bytes.
 			if (!failed) {
 				try {
+					input.diagnostics?.enter("io_final_validate");
 					await input.assertTarget();
+					input.diagnostics?.enter("io_final_read");
 					const observed = await this.read(canonicalPath, AbortSignal.timeout(5_000));
 					if (
 						observed.bytes === null ||
@@ -382,6 +402,7 @@ export function createFileChangeLocalIo(
 					)
 						throw new LocalFileValidationError("Final content/object differs from completed write");
 				} catch (error) {
+					input.diagnostics?.fail(error);
 					failed = true;
 					failure = error;
 				}

@@ -15,6 +15,7 @@ import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	workspaceWriteLeases,
 } from "../db/schema";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { editTool } from "../lib/agent/tools/edit";
@@ -294,7 +295,17 @@ test.skipIf(process.platform === "win32")(
 						tx.delete(fileChangeEffects).where(inArray(fileChangeEffects.operationId, ids)).run();
 						tx.delete(fileChangeOperations).where(inArray(fileChangeOperations.id, ids)).run();
 					}
-					for (const scope of scopes)
+					for (const scope of scopes) {
+						// Settled leases retain a restrictive scope FK. Remove only this
+						// disposable fixture's terminal leases before removing its scope.
+						tx.delete(workspaceWriteLeases)
+							.where(
+								and(
+									eq(workspaceWriteLeases.scopeId, scope.id),
+									eq(workspaceWriteLeases.status, "settled"),
+								),
+							)
+							.run();
 						tx.delete(fileChangeScopes)
 							.where(
 								and(
@@ -303,6 +314,7 @@ test.skipIf(process.platform === "win32")(
 								),
 							)
 							.run();
+					}
 					if (messageIds.length)
 						tx.delete(narratorMessages).where(inArray(narratorMessages.id, messageIds)).run();
 					tx.delete(narrators).where(eq(narrators.id, narratorId)).run();

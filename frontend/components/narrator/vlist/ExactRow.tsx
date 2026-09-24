@@ -667,7 +667,7 @@ export const ExactRow = memo(
 												"This older message has no receipt link. Opened the recipient's session instead.")
 											: reason === "unavailable"
 												? (labels?.communicationReceiptUnavailable ??
-													"The message has not been received yet or is no longer available. Please try again later.")
+													"The message has not been received yet or is no longer available. Opened the recipient's session without jumping to a message.")
 												: (labels?.communicationReceiptError ??
 													"Could not locate the received message."),
 								}),

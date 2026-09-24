@@ -65,7 +65,7 @@
 	"communicationCancelled": "已取消",
 	"communicationViewFull": "查看完整消息",
 	"communicationReceiptLegacy": "这条历史消息没有收件定位信息，已打开目标会话。",
-	"communicationReceiptUnavailable": "消息尚未被接收，或对应消息已不可用，请稍后重试。",
+	"communicationReceiptUnavailable": "消息尚未被接收或已不可用，已打开目标会话（未定位到消息）。",
 	"communicationReceiptError": "无法定位接收到的消息。",
 	"communicationWaiting": "等待中",
 	"poolReasoningEffort": {

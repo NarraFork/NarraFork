@@ -25,6 +25,10 @@
  */
 
 import { z } from "zod";
+import {
+	fileChangeDiagnosticMetadata,
+	fileChangeDiagnosticSuffix,
+} from "../../../../services/file-change-diagnostics";
 import { LocalFileValidationError } from "../../../../services/file-change-local-io";
 import { executeLocalFileChange } from "../../../../services/file-change-runtime";
 import { toolSpecPathError } from "../../../spec-uri";
@@ -776,9 +780,10 @@ export const structSedTool: ToolDefinition = {
 			return recorded;
 		} catch (err) {
 			return {
-				output: `Error editing ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+				output: `Error editing ${filePath}: ${err instanceof Error ? err.message : String(err)}${fileChangeDiagnosticSuffix(err)}`,
 				isError: true,
 				title: filePath,
+				metadata: fileChangeDiagnosticMetadata(err),
 			};
 		}
 	},

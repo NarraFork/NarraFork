@@ -21,7 +21,6 @@
 import { createHash } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
-import { Worker } from "node:worker_threads";
 import {
 	FILE_CHANGE_LIMITS,
 	type FileChangeBlobRef,
@@ -34,7 +33,6 @@ import { eq } from "drizzle-orm";
 import { fileChangeBlobs, fileChangeScopes, revertOperationFiles } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
-import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import {
 	createFileChangeIdentity,
@@ -74,11 +72,17 @@ import type {
 	ValidatedTransactionManifest,
 } from "./revert-transaction-manifest-worker";
 import {
+	RevertTransactionError,
+	runRevertManifestWorker as worker,
+} from "./revert-transaction-worker";
+import {
 	WORKSPACE_WRITE_COORDINATOR_LIMITS,
 	type WorkspaceRuntimeBinding,
 	type WorkspaceWriteBatch,
 	type WorkspaceWriteLease,
 } from "./workspace-write-coordinator";
+
+export { RevertTransactionError } from "./revert-transaction-worker";
 
 type Namespace = Awaited<ReturnType<LocalFileChangeRuntime["verifyNamespace"]>>;
 type Scope = typeof fileChangeScopes.$inferSelect;
@@ -128,12 +132,6 @@ export interface RevertTransactionOptions {
 		files: number;
 		status: string;
 	}) => void;
-}
-export class RevertTransactionError extends AppError {
-	constructor(code: string) {
-		super(`Local revert transaction refused: ${code}`, 409, `REVERT_TRANSACTION_${code}`);
-		this.name = "RevertTransactionError";
-	}
 }
 
 type BoundFile = {
@@ -1080,27 +1078,6 @@ async function observe(path: string, signal: AbortSignal): Promise<LocalRestoreO
 		raw: observation.bytes,
 		objectIdentity: observation.identity,
 	};
-}
-async function worker<T>(request: TransactionManifestRequest, signal: AbortSignal): Promise<T> {
-	signal.throwIfAborted();
-	const thread = new Worker(new URL("./revert-transaction-manifest-worker.ts", import.meta.url));
-	let abort: () => void = () => {};
-	try {
-		return await new Promise<T>((resolve, reject) => {
-			abort = () => reject(fail("MANIFEST_CANCELLED"));
-			signal.addEventListener("abort", abort, { once: true });
-			thread.once("message", (message: { value: T; error?: string }) =>
-				message.error ? reject(fail(message.error)) : resolve(message.value),
-			);
-			thread.once("error", () => reject(fail("MANIFEST_WORKER_FAILED")));
-			thread.once("exit", () => reject(fail("MANIFEST_WORKER_EXITED")));
-			thread.postMessage(request);
-			if (signal.aborted) abort();
-		});
-	} finally {
-		signal.removeEventListener("abort", abort);
-		await thread.terminate();
-	}
 }
 function fixedRequest(input: RevertTransactionRequest): Omit<RevertTransactionRequest, "signal"> {
 	if (

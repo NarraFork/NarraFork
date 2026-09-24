@@ -77,6 +77,7 @@ interface PendingRpc {
 	resolve: (result: unknown) => void;
 	reject: (err: Error) => void;
 	timer: ReturnType<typeof setTimeout> | null;
+	removeAbortListener?: () => void;
 	onStream?: (channel: string, chunk: Uint8Array) => void;
 	longLived?: boolean;
 }
@@ -303,10 +304,13 @@ export function sendRpc(
 	}
 
 	if (!opts.longLived) {
-		const maxConcurrent = settings.devices?.maxConcurrentRpcPerDevice ?? 16;
+		const configuredMax = settings.devices?.maxConcurrentRpcPerDevice ?? 64;
+		const maxConcurrent = Math.max(1, Math.floor(configuredMax));
 		// Count only short-lived RPCs against the cap; long-lived ones (PTY) are
 		// tracked separately and must not exhaust the budget.
-		const shortLivedPending = conn.pending.size - conn.longLivedCount;
+		const shortLivedPending = [...conn.pending.values()].filter(
+			(pending) => !pending.longLived,
+		).length;
 		if (shortLivedPending >= maxConcurrent) {
 			return Promise.reject(
 				new Error(`Device ${deviceId} RPC concurrency limit reached (${maxConcurrent})`),
@@ -339,23 +343,19 @@ export function sendRpc(
 		if (opts.longLived) conn.longLivedCount++;
 
 		if (opts.signal) {
+			const abortListener = () => {
+				if (conn.pending.has(id)) {
+					cleanupPending(conn, id);
+					sendCancel(conn, id);
+					reject(new Error("RPC aborted"));
+				}
+			};
 			if (opts.signal.aborted) {
-				cleanupPending(conn, id);
-				sendCancel(conn, id);
-				reject(new Error("RPC aborted"));
+				abortListener();
 				return;
 			}
-			opts.signal.addEventListener(
-				"abort",
-				() => {
-					if (conn.pending.has(id)) {
-						cleanupPending(conn, id);
-						sendCancel(conn, id);
-						reject(new Error("RPC aborted"));
-					}
-				},
-				{ once: true },
-			);
+			opts.signal.addEventListener("abort", abortListener, { once: true });
+			pending.removeAbortListener = () => opts.signal?.removeEventListener("abort", abortListener);
 		}
 
 		try {
@@ -367,21 +367,21 @@ export function sendRpc(
 	});
 }
 
-function cleanupPending(conn: DeviceConnection, id: string): void {
+function cleanupPending(conn: DeviceConnection, id: string): PendingRpc | undefined {
 	const pending = conn.pending.get(id);
-	if (pending) {
-		if (pending.timer) clearTimeout(pending.timer);
-		if (pending.longLived) conn.longLivedCount = Math.max(0, conn.longLivedCount - 1);
-		conn.pending.delete(id);
-	}
+	if (!pending) return undefined;
+	if (pending.timer) clearTimeout(pending.timer);
+	pending.removeAbortListener?.();
+	if (pending.longLived) conn.longLivedCount = Math.max(0, conn.longLivedCount - 1);
+	conn.pending.delete(id);
+	return pending;
 }
 
 function rejectConnectionPending(conn: DeviceConnection, error: Error): void {
-	for (const pending of conn.pending.values()) {
-		if (pending.timer) clearTimeout(pending.timer);
-		pending.reject(error);
+	for (const id of [...conn.pending.keys()]) {
+		const pending = cleanupPending(conn, id);
+		pending?.reject(error);
 	}
-	conn.pending.clear();
 	conn.longLivedCount = 0;
 }
 
@@ -671,9 +671,7 @@ function handleRpcStream(conn: DeviceConnection, frame: RpcStreamFrame): void {
 function handleRpcResult(conn: DeviceConnection, frame: RpcResultFrame): void {
 	const pending = conn.pending.get(frame.id);
 	if (!pending) return;
-	if (pending.timer) clearTimeout(pending.timer);
-	if (pending.longLived) conn.longLivedCount = Math.max(0, conn.longLivedCount - 1);
-	conn.pending.delete(frame.id);
+	cleanupPending(conn, frame.id);
 	if (frame.ok) {
 		pending.resolve(frame.result);
 	} else {

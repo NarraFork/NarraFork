@@ -70,6 +70,8 @@ if (port) {
 			});
 		}
 	});
+	// The caller may probe compiled entry paths, but must never dispatch before this handshake.
+	port.postMessage({ type: "revert-manifest-worker-ready", version: 1 });
 }
 
 /** Also works for terminal journals: applying twice cannot bypass the original UI consent. */

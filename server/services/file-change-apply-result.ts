@@ -59,6 +59,10 @@ export async function applyLocalFileChange(
 		if (result.kind !== "applied" && result.error == null)
 			result = { ...result, error: new Error("Local file mutation did not complete") };
 	} catch (error) {
+		if (input.diagnostics && !input.diagnostics.hasFailure(error)) {
+			input.diagnostics.enter("apply_adapter");
+			input.diagnostics.fail(error);
+		}
 		result = {
 			kind: "target_mutation_unknown",
 			error,
