@@ -3269,8 +3269,11 @@ export class PluginManager {
 		payload: Record<string, unknown>,
 	): Promise<void> {
 		try {
-			const { broadcastToAll } = await import("../websocket/narrator-ws");
-			broadcastToAll({ type, ...payload });
+			const { broadcastToAdmins, broadcastToAll } = await import("../websocket/narrator-ws");
+			// Permission prompts can only be decided by an admin; contribution changes
+			// affect every client's UI (menus, providers) and stay deployment-wide.
+			if (type === "plugin:contributions_changed") broadcastToAll({ type, ...payload });
+			else broadcastToAdmins({ type, ...payload });
 		} catch {
 			// Event push is best-effort; polling remains the fallback.
 		}

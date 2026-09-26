@@ -737,6 +737,12 @@ export const bashTool: ToolDefinition = {
 				if (watchdogKilled)
 					meta.push("Process was terminated by watchdog (process exited unexpectedly)");
 				if (aborted) meta.push("Command was aborted by user");
+				if (!timedOut && !aborted && handle.outputIncomplete?.()) {
+					meta.push(
+						"Output is incomplete: the device reached its output limit or a background " +
+							"process kept the output pipes open after the command exited",
+					);
+				}
 				if (meta.length > 0) {
 					output += `\n\n<bash_metadata>\n${meta.join("\n")}\n</bash_metadata>`;
 				}
@@ -904,6 +910,12 @@ async function _runInBackground(
 				backgroundTaskService.appendOutput(
 					taskId,
 					"\n\n<bash_metadata>\nBackground command terminated by health watchdog\n</bash_metadata>",
+				);
+			} else if (!timedOut && handle.outputIncomplete?.()) {
+				backgroundTaskService.appendOutput(
+					taskId,
+					"\n\n<bash_metadata>\nOutput is incomplete: the device reached its output limit or a " +
+						"background process kept the output pipes open after the command exited\n</bash_metadata>",
 				);
 			}
 			const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";

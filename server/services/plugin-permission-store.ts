@@ -31,6 +31,25 @@ const DEFAULT_MAX_OBJECT_KEYS = 8_192;
 const DEFAULT_MAX_STRING_BYTES = 16 * 1024;
 const DEFAULT_MAX_DIAGNOSTICS = 32;
 const DEFAULT_ACTOR = "admin";
+/**
+ * Decided requests are kept only as recent history. The loader rejects an
+ * installation with more rows than maxGrantsPerInstallation (512), and a
+ * rejected file is reset as corrupt — wiping grants and permanent denials — so
+ * the history must never be allowed to grow toward that bound.
+ */
+const MAX_RESOLVED_REQUEST_HISTORY = 100;
+
+/** Keep every pending row plus the most recent decided rows, preserving order. */
+function trimResolvedRequests(requests: PluginPermissionRequest[]): PluginPermissionRequest[] {
+	let resolvedToDrop =
+		requests.filter((r) => r.status !== "pending").length - MAX_RESOLVED_REQUEST_HISTORY;
+	if (resolvedToDrop <= 0) return requests;
+	return requests.filter((r) => {
+		if (r.status === "pending" || resolvedToDrop <= 0) return true;
+		resolvedToDrop--;
+		return false;
+	});
+}
 
 const identifierSchema = z
 	.string()
@@ -1030,7 +1049,7 @@ export class PluginPermissionStore {
 			if (current) {
 				const updated: PermissionInstallationDocument = {
 					...clone(current),
-					pendingRequests: [...(current.pendingRequests ?? []), request],
+					pendingRequests: [...trimResolvedRequests(current.pendingRequests ?? []), request],
 					updatedAt: this.timestamp(),
 				};
 				candidate.plugins[pluginId][installationId] = updated;

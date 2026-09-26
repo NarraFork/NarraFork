@@ -1230,6 +1230,11 @@ describe("OAuth remote runtime permission constraints", () => {
 				expect(probes.length).toBeLessThanOrEqual(4);
 				expect(probes.every((probe) => probe.signal?.aborted)).toBe(true);
 				expect(await result).toMatchObject({ behavior: "deny" });
+				if (failure === "abort") {
+					// Cancelled during path canonicalization: denied as an abort, not as a
+					// shell parse failure that then runs the rest of the policy pipeline.
+					expect(await result).toMatchObject({ message: "Permission check aborted" });
+				}
 				if (failure === "compile-abort") {
 					expect(await result).toMatchObject({
 						message: "Execution policy compilation failed: permission interrupted",

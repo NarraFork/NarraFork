@@ -122,6 +122,13 @@ function ensureConnectionGeneration(conn: DeviceConnection): number {
 const sockets = hotSafe("narrafork:deviceSockets", () => new Set<DeviceWS>());
 
 const DEVICE_HANDSHAKE_TIMEOUT_MS = 10_000;
+/** Methods allowed to bypass the short-RPC quota and timeout (they end on kill/abort). */
+const LONG_LIVED_RPC_METHODS: ReadonlySet<string> = new Set(["pty.open"]);
+/**
+ * Separate ceiling for long-lived calls: exempting them from the short-RPC quota
+ * must not make them unbounded. Generous — each is one open remote terminal.
+ */
+const MAX_LONG_LIVED_RPC_PER_DEVICE = 256;
 const reverseHandshakeTimers = new WeakMap<DeviceWS, ReturnType<typeof setTimeout>>();
 
 export function getDeviceConnections(): Set<DeviceWS> {
@@ -356,7 +363,23 @@ export function sendRpc(
 
 	if (opts.signal?.aborted) return Promise.reject(new Error("RPC aborted"));
 
-	if (!opts.longLived) {
+	if (opts.longLived) {
+		// longLived bypasses both the short-RPC quota and the timeout, so it is only
+		// for calls that genuinely stay open until killed. Bind it to the method so no
+		// caller can opt an ordinary RPC out of those limits.
+		if (!LONG_LIVED_RPC_METHODS.has(method)) {
+			return Promise.reject(
+				new Error(`RPC ${method} cannot be long-lived; only ${[...LONG_LIVED_RPC_METHODS]}`),
+			);
+		}
+		if (conn.longLivedCount >= MAX_LONG_LIVED_RPC_PER_DEVICE) {
+			return Promise.reject(
+				new Error(
+					`Device ${deviceId} long-lived RPC limit reached (${MAX_LONG_LIVED_RPC_PER_DEVICE} open sessions)`,
+				),
+			);
+		}
+	} else {
 		const maxConcurrent = rpcConcurrencyLimit();
 		let shortLivedPending = 0;
 		for (const pending of conn.pending.values()) if (!pending.longLived) shortLivedPending++;
@@ -386,6 +409,18 @@ export function sendRpc(
 	}
 
 	const id = `rpc_${conn.rpcSeq++}`;
+	// An explicit per-call deadline that is already spent (<= 0, e.g. a remaining
+	// budget) must fail fast, not silently become the 120s default.
+	if (
+		!opts.longLived &&
+		typeof opts.timeoutMs === "number" &&
+		Number.isFinite(opts.timeoutMs) &&
+		opts.timeoutMs <= 0
+	) {
+		return Promise.reject(
+			new Error(`RPC ${method} to device ${deviceId} timed out after 0ms (deadline already spent)`),
+		);
+	}
 	const configuredTimeout = opts.timeoutMs ?? settings.devices?.rpcTimeoutMs;
 	// Never let NaN/Infinity or timer overflow silently turn a deadline into an
 	// unbounded wait (or a 1ms timeout). Long-lived calls opt out explicitly below.

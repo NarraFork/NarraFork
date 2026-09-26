@@ -115,6 +115,16 @@ describe("resolveProviderAndModel", () => {
 			expect(() => resolveProviderAndModel("missing-plugin:chat")).toThrow(
 				'Provider "missing-plugin" is not configured',
 			);
+
+			// A user disabling the plugin must not surface a reason latched earlier.
+			registry.enablePlugin("com.example.cline");
+			registry.markUnavailable("cline-instance", "runtime-generation-changed");
+			registry.setPluginState("com.example.cline", { desiredState: "disabled" });
+			expect(() => resolveProviderAndModel("cline-ext:chat:large")).toThrow(
+				expect.objectContaining({
+					message: "Provider cline-ext is unavailable: plugin-disabled",
+				}),
+			);
 		} finally {
 			unregister();
 		}

@@ -3745,6 +3745,9 @@ export async function handlePermission(
 				throw new Error("command parser produced no executable command");
 			}
 		} catch (err) {
+			// Cancellation is not a parse failure: deny right away instead of logging a
+			// misleading analysis warning and running the rest of the policy pipeline.
+			if (signal?.aborted) return { behavior: "deny", message: "Permission check aborted" };
 			shellAnalysisError = err instanceof Error ? err.message : String(err);
 			bashAnalysis = undefined;
 			logger.warn("Bash command analysis failed; unsafe auto-allow will be blocked", {
@@ -3919,6 +3922,9 @@ export async function handlePermission(
 
 	// Stopping owned work must remain possible when remote metadata RPCs are
 	// exhausted/offline. The tool still enforces task ownership when executing.
+	// Deliberately decided BEFORE policy compilation: stop/await run no command and
+	// touch no path, so directory/command policy (and its compile failures) do not
+	// apply. OAuth-denied devices and review read-only mode are rejected above.
 	if (isBashControlOp) {
 		await options?.onInputResolved?.(effectiveInput);
 		await db

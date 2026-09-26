@@ -173,7 +173,7 @@ describe("native dialog protection", () => {
 		await flush();
 		expect(f.messages[0]).toContain("Failed to dismiss native dialog");
 		expect(f.messages[0]).toContain("handle failed");
-		expect(f.messages[0]?.length).toBeLessThan(2_200);
+		expect(f.messages[0]?.length).toBeLessThanOrEqual(2_000);
 	});
 
 	test("initialization failure cleans all listeners without detaching and permits retry", async () => {

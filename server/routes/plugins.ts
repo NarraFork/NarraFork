@@ -981,8 +981,19 @@ export function createPluginRoutes(
 			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
 			// The body is optional: a bare POST denies just this request, while
 			// `{ permanent: true }` additionally records "never ask again".
+			// An empty body means the default; a body that fails to parse is a client
+			// error — silently downgrading a truncated `{"permanent":true` to a plain
+			// deny would hide that the "never ask again" choice was lost.
 			let permanent = false;
-			const rawBody = await c.req.json().catch(() => undefined);
+			const bodyText = await c.req.text();
+			let rawBody: unknown;
+			if (bodyText.trim().length > 0) {
+				try {
+					rawBody = JSON.parse(bodyText);
+				} catch {
+					throw new ValidationError("Request body must be valid JSON");
+				}
+			}
 			if (rawBody !== undefined) {
 				const bodyParsed = z
 					.object({ permanent: z.boolean().optional() })

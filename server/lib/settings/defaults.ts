@@ -390,7 +390,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "number",
 	},
 	"devices.maxConcurrentRpcPerDevice": {
-		desc: "每个设备允许的最大并发短 RPC 数，默认 64（PTY 会话不占用此配额）。",
+		desc: "每个设备允许的最大并发短 RPC 数，默认 64。长期打开的 PTY 会话（pty.open）不占用此配额，但 pty.write/resize/kill 等短调用仍会占用。",
 		type: "number",
 	},
 	"devices.rpcConcurrencyDefaultsVersion": {

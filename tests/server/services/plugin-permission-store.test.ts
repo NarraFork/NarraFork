@@ -457,6 +457,45 @@ describe("PluginPermissionStore", () => {
 		).rejects.toThrow("permanent denial requires a denied status");
 	});
 
+	test("decided request history is trimmed so the file never reaches the load cap", async () => {
+		const { root, stateStore, permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+		// Well past the 100-row history but far below the 512-row loader bound.
+		for (let i = 0; i < 130; i++) {
+			const request = await permissionStore.addPendingRequest(
+				"com.example.permissions",
+				installationId,
+				{ capability: "query.read.projects", scope: { type: "project", id: `p${i}` } },
+			);
+			if (!request) throw new Error("expected a queued pending request");
+			await permissionStore.resolvePendingRequest(
+				"com.example.permissions",
+				installationId,
+				request.requestId,
+				"denied",
+			);
+		}
+		const kept = await permissionStore.addPendingRequest(
+			"com.example.permissions",
+			installationId,
+			{
+				capability: "query.read.projects",
+				scope: { type: "global" },
+			},
+		);
+		expect(kept?.status).toBe("pending");
+
+		// Reload from disk: the document must still parse (not be reset as corrupt).
+		const reloaded = new PluginPermissionStore({ root, stateStore });
+		const pending = await reloaded.listPendingRequests("com.example.permissions", installationId);
+		expect(pending.map((r) => r.requestId)).toEqual([kept?.requestId ?? ""]);
+		const raw = JSON.parse(await readFile(join(root, "permissions.json"), "utf8")) as {
+			plugins: Record<string, Record<string, { pendingRequests: unknown[] }>>;
+		};
+		const rows = raw.plugins["com.example.permissions"]?.[installationId]?.pendingRequests ?? [];
+		expect(rows.length).toBeLessThanOrEqual(101);
+	});
+
 	test("resolvePendingRequest returns undefined for unknown requestId", async () => {
 		const { permissionStore } = await makeStores();
 		await permissionStore.ensureInstallation("com.example.permissions", installationId);

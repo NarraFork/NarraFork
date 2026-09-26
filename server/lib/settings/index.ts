@@ -294,7 +294,14 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	// migration once so an operator can still deliberately choose 16 afterwards.
 	if (merged.devices && (raw.devices?.rpcConcurrencyDefaultsVersion ?? 0) < 1) {
 		if (raw.devices?.maxConcurrentRpcPerDevice === 16) {
-			merged.devices.maxConcurrentRpcPerDevice = DEFAULTS.devices?.maxConcurrentRpcPerDevice ?? 64;
+			const next = DEFAULTS.devices?.maxConcurrentRpcPerDevice ?? 64;
+			merged.devices.maxConcurrentRpcPerDevice = next;
+			// Also catches a deliberate 16 set before this migration existed, so leave
+			// a trace; setting 16 again afterwards is preserved.
+			logger.info("Migrated devices.maxConcurrentRpcPerDevice to the raised default", {
+				from: 16,
+				to: next,
+			});
 		}
 		merged.devices.rpcConcurrencyDefaultsVersion = 1;
 		needsSave = true;

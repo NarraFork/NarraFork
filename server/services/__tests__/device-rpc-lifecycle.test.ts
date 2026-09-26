@@ -155,6 +155,24 @@ describe("device RPC lifecycle", () => {
 			remove.mockRestore();
 		}
 	});
+	test("RemoteExecHandle surfaces executor-reported output truncation", async () => {
+		const backend = createRemoteBackend(deviceId, {
+			connectionGeneration: getDeviceConnectionGeneration(deviceId) ?? 0,
+		});
+		for (const truncated of [true, false]) {
+			const handle = await backend.execCommand({ command: "pwd", cwd: "/work" });
+			outstanding.push(handle.exited.catch(() => {}));
+			await handleDeviceWS.message(ws, {
+				type: "rpc_result",
+				id: lastId(),
+				ok: true,
+				result: { exitCode: 0, timedOut: false, truncated },
+			});
+			expect(await handle.exited).toBe(0);
+			expect(handle.outputIncomplete?.()).toBe(truncated);
+		}
+	});
+
 	test("failure and duplicate/late result release a slot exactly once", async () => {
 		const failed = rpc();
 		const failedId = lastId();
@@ -232,6 +250,21 @@ describe("device RPC lifecycle", () => {
 		expect(isDeviceOnline(deviceId)).toBe(true);
 		await result(nextId);
 		expect(await next).toBe(42);
+	});
+
+	test("only pty.open may be long-lived, so ordinary RPCs cannot escape the quota/timeout", async () => {
+		const sentBefore = sent.length;
+		await expect(rpc("exec.start", { longLived: true })).rejects.toThrow("cannot be long-lived");
+		expect(sent.length).toBe(sentBefore);
+		await roundTrip();
+	});
+
+	test("an already-spent explicit deadline fails fast instead of waiting the default", async () => {
+		const sentBefore = sent.length;
+		await expect(rpc("fs.stat", { timeoutMs: 0 })).rejects.toThrow("deadline already spent");
+		await expect(rpc("fs.stat", { timeoutMs: -5 })).rejects.toThrow("deadline already spent");
+		expect(sent.length).toBe(sentBefore);
+		await roundTrip();
 	});
 
 	test("PTY does not count against the short RPC cap", async () => {

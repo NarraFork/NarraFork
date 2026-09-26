@@ -266,6 +266,12 @@ export interface ExecHandle {
 	readonly whenSettled?: Promise<void>;
 	/** True once the process has exited. */
 	isExited(): boolean;
+	/**
+	 * After `exited` resolves: true when the backend knows the delivered output is
+	 * incomplete (byte cap reached, inherited pipes force-closed, queued output
+	 * abandoned). Optional — backends that cannot tell simply omit it.
+	 */
+	outputIncomplete?(): boolean;
 	/** Terminate the process (and its process group, when supported). */
 	kill(): Promise<void>;
 }

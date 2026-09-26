@@ -1052,6 +1052,23 @@ export function broadcastToAll(message: Record<string, unknown>): void {
 }
 
 /**
+ * Broadcast only to admin connections. For frames that only an admin can act on
+ * (plugin permission prompts): sending them to everyone leaks which plugins ask
+ * for which capabilities and relies on each client to filter by role.
+ */
+export function broadcastToAdmins(message: Record<string, unknown>): void {
+	const payload = JSON.stringify(message);
+	for (const ws of connections) {
+		if (ws.data.userRole !== "admin") continue;
+		try {
+			ws.send(payload);
+		} catch {
+			removeConnection(ws);
+		}
+	}
+}
+
+/**
  * Broadcast to the connections whose user may read one project.
  *
  * For the frames whose payload is narrower than "the whole deployment": container

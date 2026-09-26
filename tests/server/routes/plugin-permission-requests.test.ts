@@ -218,6 +218,18 @@ describe("plugin permission request routes", () => {
 		expect(call.value.options).toEqual({ permanent: true, deniedBy: "admin" });
 	});
 
+	it("rejects a truncated JSON deny body instead of downgrading to a plain deny", async () => {
+		const manager = new PendingPermissionManager();
+		const app = createApp(manager);
+		const response = await app.request("/com.example.demo/grants/requests/req-1/deny", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: '{"permanent":true',
+		});
+		expect(response.status).toBe(400);
+		expect(manager.calls).toEqual([]);
+	});
+
 	it("rejects an unexpected deny body shape with 400", async () => {
 		const manager = new PendingPermissionManager();
 		const app = createApp(manager);

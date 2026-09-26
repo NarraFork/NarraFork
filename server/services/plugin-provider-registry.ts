@@ -1317,6 +1317,7 @@ export class PluginProviderRegistry {
 		let changed = 0;
 		for (const entry of this.entriesByInstance.values()) {
 			if (entry.kind !== "executable-plugin" || entry.pluginId !== pluginId) continue;
+			const wasDisabled = entry.disabled;
 			if (state.desiredState !== undefined) {
 				entry.disabled =
 					state.desiredState !== "enabled" ||
@@ -1324,6 +1325,10 @@ export class PluginProviderRegistry {
 					state.installed === false;
 			}
 			if (state.featureDisabled === true || state.installed === false) entry.disabled = true;
+			// availability() prefers explicitUnavailableReason while disabled. A reason
+			// latched earlier (e.g. runtime-generation-changed) would otherwise be shown
+			// for a provider the user just disabled; report "plugin-disabled" instead.
+			if (entry.disabled && !wasDisabled) entry.explicitUnavailableReason = undefined;
 			if (state.compatibility !== undefined) {
 				entry.compatible = state.compatibility === "compatible";
 			}

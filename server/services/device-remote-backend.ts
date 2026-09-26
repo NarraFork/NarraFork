@@ -82,6 +82,7 @@ export interface RemoteBackendOptions {
 class RemoteExecHandle implements ExecHandle {
 	readonly pid = undefined;
 	private exitedFlag = false;
+	private truncatedFlag = false;
 	private dataCbs: Array<(chunk: Uint8Array) => void> = [];
 	private abort = new AbortController();
 	readonly exited: Promise<number | null>;
@@ -128,6 +129,9 @@ class RemoteExecHandle implements ExecHandle {
 		).then(
 			(result) => {
 				cleanup();
+				// The executor reports truncation (byte cap, force-closed inherited
+				// pipes, abandoned queue); surface it rather than drop it.
+				this.truncatedFlag = (result as ExecStartResult)?.truncated === true;
 				return (result as ExecStartResult)?.exitCode ?? null;
 			},
 			(err) => {
@@ -143,6 +147,10 @@ class RemoteExecHandle implements ExecHandle {
 
 	isExited(): boolean {
 		return this.exitedFlag;
+	}
+
+	outputIncomplete(): boolean {
+		return this.truncatedFlag;
 	}
 
 	async kill(): Promise<void> {

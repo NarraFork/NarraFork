@@ -24,6 +24,9 @@ function onTargetAvailable(target: Target): void {
 /** Chromium keeps pending dialogs per CDP session. A fresh createCDPSession() cannot
  * dismiss an earlier dialog, and target.page() can block while initializing behind it.
  * Isolate this Puppeteer CDP-specific adapter here; fail explicitly if it changes.
+ * `_session()` and `_targetManager()` are private, so package.json pins
+ * puppeteer-core to an exact version: bump it deliberately and rerun
+ * dialogs.integration.test.ts, since a silent internal change would fail launch.
  * This is a BORROWED session: never detach it or disable its Page domain.
  */
 function dialogClient(target: Target): CDPSession {
@@ -91,8 +94,11 @@ export function installDialogProtection(
 			const onDialog = (event: { type: string; message: string }) => {
 				const summary = `${event.type}: ${event.message.slice(0, MAX_DIALOG_TEXT)}`;
 				void dismiss(summary).catch((error) => {
+					// Keep the whole line within MAX_DIALOG_TEXT, but split the budget so a
+					// long dialog message can never crowd out the error that explains it.
+					const half = Math.floor(MAX_DIALOG_TEXT / 2) - 32;
 					state.record(
-						`Failed to dismiss native dialog (${summary}): ${String(error).slice(0, MAX_DIALOG_TEXT)}`,
+						`Failed to dismiss native dialog (${summary.slice(0, half)}): ${String(error).slice(0, half)}`,
 					);
 				});
 			};
