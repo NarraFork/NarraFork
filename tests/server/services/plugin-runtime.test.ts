@@ -13,6 +13,7 @@ import {
 	PluginRuntime,
 	type RunnerProcess,
 	RuntimeSupervisor,
+	type RuntimeSupervisorOptions,
 } from "../../../server/services/plugin-runtime";
 
 const encoder = new TextEncoder();
@@ -187,11 +188,24 @@ class FakeProcessHandle implements PluginProcessHandle {
 		for (const handler of this.messageHandlers) handler(message);
 	}
 
+	emitError(error: Error): void {
+		for (const handler of this.errorHandlers) handler(error);
+	}
+
+	queueExit(exitCode: number): () => void {
+		// A transport may already have dispatched exit before error cleanup
+		// unsubscribes its observers; deliver that queued event deterministically.
+		const handlers = [...this.exitHandlers];
+		return () => {
+			if (this.exitCode !== undefined) return;
+			this.exitCode = exitCode;
+			this.resolveExited(exitCode);
+			for (const handler of handlers) handler(exitCode);
+		};
+	}
+
 	finish(exitCode: number): void {
-		if (this.exitCode !== undefined) return;
-		this.exitCode = exitCode;
-		this.resolveExited(exitCode);
-		for (const handler of this.exitHandlers) handler(exitCode);
+		this.queueExit(exitCode)();
 	}
 
 	isKilled(): boolean {
@@ -552,6 +566,199 @@ describe("PluginRuntime", () => {
 });
 
 describe("RuntimeSupervisor", () => {
+	function recoveryHarness(options: RuntimeSupervisorOptions = {}) {
+		// Capture only supervisor delays, leaving handshake/RPC timers real. Explicit
+		// firing also models a callback already dequeued before clearTimeout ran.
+		const baseDelay = 54_321;
+		const timers = spyOn(globalThis, "setTimeout");
+		const scheduled = () =>
+			timers.mock.calls.flatMap(([callback, delay], index) => {
+				const result = timers.mock.results[index];
+				return result.type === "return" && (delay === baseDelay || delay === baseDelay * 2)
+					? [{ callback, delay, timer: result.value }]
+					: [];
+			});
+		const runner = new FakeRunner();
+		const supervisor = new RuntimeSupervisor({
+			restartBaseDelayMs: baseDelay,
+			restartMaxDelayMs: baseDelay * 2,
+			restartJitterRatio: 0,
+			...options,
+		});
+		return {
+			runner,
+			supervisor,
+			scheduled,
+			fire(index: number) {
+				const timer = scheduled()[index];
+				expect(timer).toBeDefined();
+				clearTimeout(timer.timer);
+				timer.callback();
+			},
+			async cleanup() {
+				for (const { timer } of scheduled()) clearTimeout(timer);
+				timers.mockRestore();
+				await supervisor.shutdown();
+			},
+		};
+	}
+
+	it("recovery counts error plus exit only once against the restart budget", async () => {
+		const h = recoveryHarness({ maxRestarts: 1, maxTotalRestarts: 10 });
+		try {
+			const runtime = await h.supervisor.start({ ...baseRuntimeOptions, runner: h.runner });
+			const exit = h.runner.handles[0].queueExit(1);
+			h.runner.handles[0].emitError(new Error("transport failed"));
+			expect(runtime.state).toBe("failed");
+			exit();
+			expect(runtime.state).toBe("crashed");
+			expect(h.scheduled()).toHaveLength(1);
+			h.fire(0);
+			await eventually(() => runtime.state === "active");
+			expect(runtime.generation).toBe(2);
+			h.runner.handles[1].finish(1);
+			expect(runtime.state).toBe("quarantine");
+			expect(h.scheduled()).toHaveLength(1);
+		} finally {
+			await h.cleanup();
+		}
+	});
+
+	it("recovery retries new generations with exponential backoff and the total budget", async () => {
+		const h = recoveryHarness({ maxRestarts: 10, maxTotalRestarts: 2 });
+		try {
+			const runtime = await h.supervisor.start({ ...baseRuntimeOptions, runner: h.runner });
+			for (let generation = 1; generation <= 2; generation++) {
+				const handle = h.runner.handles[generation - 1];
+				const exit = handle.queueExit(1);
+				handle.emitError(new Error("transport failed"));
+				exit();
+				expect(h.scheduled()).toHaveLength(generation);
+				h.fire(generation - 1);
+				await eventually(() => runtime.state === "active");
+				expect(runtime.generation).toBe(generation + 1);
+			}
+			expect(h.scheduled().map(({ delay }) => delay)).toEqual([54_321, 108_642]);
+			h.runner.handles[2].finish(1);
+			expect(runtime.state).toBe("quarantine");
+			expect(h.scheduled()).toHaveLength(2);
+		} finally {
+			await h.cleanup();
+		}
+	});
+
+	it("recovery rechecks the generation after waiting behind manual start's mutex", async () => {
+		const h = recoveryHarness();
+		try {
+			const runtime = await h.supervisor.start({ ...baseRuntimeOptions, runner: h.runner });
+			const restart = spyOn(runtime, "restart");
+			h.runner.handles[0].finish(1);
+			const manualStart = h.supervisor.start(runtime.pluginId);
+			h.fire(0);
+			await manualStart;
+			// This no-op start is a FIFO barrier after the timer callback.
+			await h.supervisor.start(runtime.pluginId);
+			expect(restart).not.toHaveBeenCalled();
+			expect(runtime.state).toBe("active");
+			expect(runtime.generation).toBe(2);
+			expect(h.runner.handles).toHaveLength(2);
+		} finally {
+			await h.cleanup();
+		}
+	});
+
+	it("recovery leaves a newer generation's pending timer intact when an old callback runs", async () => {
+		const h = recoveryHarness();
+		try {
+			const runtime = await h.supervisor.start({ ...baseRuntimeOptions, runner: h.runner });
+			h.runner.handles[0].finish(1);
+			// Direct recovery does not cancel the supervisor's first timer.
+			await runtime.restart();
+			const restart = spyOn(runtime, "restart");
+			h.runner.handles[1].finish(1);
+			expect(h.scheduled()).toHaveLength(2);
+			h.fire(0);
+			// The free mutex enters its callback on the next microtask.
+			await Promise.resolve();
+			expect(restart).not.toHaveBeenCalled();
+			expect(runtime.state).toBe("crashed");
+			h.fire(1);
+			await eventually(() => runtime.state === "active");
+			expect(restart).toHaveBeenCalledTimes(1);
+			expect(runtime.generation).toBe(3);
+		} finally {
+			await h.cleanup();
+		}
+	});
+
+	it("recovery ignores a replaced runtime even when the new identity has the same generation", async () => {
+		const h = recoveryHarness();
+		try {
+			const old = await h.supervisor.start({ ...baseRuntimeOptions, runner: h.runner });
+			const restart = spyOn(old, "restart");
+			h.runner.handles[0].finish(1);
+			const replacement = await h.supervisor.start({
+				...baseRuntimeOptions,
+				command: [...baseRuntimeOptions.command, "replacement"],
+				runner: h.runner,
+			});
+			expect(replacement.runtimeId).not.toBe(old.runtimeId);
+			expect(replacement.generation).toBe(old.generation);
+			h.fire(0);
+			await h.supervisor.start(replacement.pluginId);
+			expect(restart).not.toHaveBeenCalled();
+			expect(old.state).toBe("stopped");
+			expect(replacement.state).toBe("active");
+			expect(h.runner.handles).toHaveLength(2);
+		} finally {
+			await h.cleanup();
+		}
+	});
+
+	it("recovery does not revive a stopped same-generation runtime", async () => {
+		const h = recoveryHarness();
+		try {
+			const runtime = await h.supervisor.start({ ...baseRuntimeOptions, runner: h.runner });
+			const restart = spyOn(runtime, "restart");
+			h.runner.handles[0].finish(1);
+			await runtime.shutdown();
+			h.fire(0);
+			// disable is queued after the callback and leaves the runtime stopped.
+			await h.supervisor.disable(runtime.pluginId);
+			expect(restart).not.toHaveBeenCalled();
+			expect(runtime.generation).toBe(1);
+			expect(h.runner.handles).toHaveLength(1);
+		} finally {
+			await h.cleanup();
+		}
+	});
+
+	it.each([
+		"supervisor",
+		"runtime",
+	] as const)("recovery does not revive a runtime quarantined by %s through an already dequeued timer", async (source) => {
+		const h = recoveryHarness();
+		try {
+			const runtime = await h.supervisor.start({ ...baseRuntimeOptions, runner: h.runner });
+			const restart = spyOn(runtime, "restart");
+			h.runner.handles[0].finish(1);
+			if (source === "supervisor") {
+				h.supervisor.quarantine(runtime.pluginId, "operator quarantine");
+			} else {
+				runtime.quarantine("runtime quarantine");
+			}
+			h.fire(0);
+			await expect(h.supervisor.start(runtime.pluginId)).rejects.toMatchObject({
+				code: "QUARANTINED",
+			});
+			expect(restart).not.toHaveBeenCalled();
+			expect(runtime.state).toBe("quarantine");
+			expect(runtime.generation).toBe(1);
+		} finally {
+			await h.cleanup();
+		}
+	});
+
 	it("quarantines after the restart budget is exhausted", async () => {
 		const supervisor = new RuntimeSupervisor({
 			maxRestarts: 1,

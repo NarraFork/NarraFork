@@ -48,7 +48,7 @@ type connectionState struct {
 	transfers     *handlers.Transfers
 	authenticated atomic.Bool
 
-	writeMu   sync.Mutex
+	writeMu   contextWriteMutex
 	cancelMu  sync.Mutex
 	cancels   map[string]*requestCancel
 	closeOnce sync.Once
@@ -56,6 +56,40 @@ type connectionState struct {
 
 type requestCancel struct {
 	cancel context.CancelFunc
+}
+
+// contextWriteMutex serializes socket writes without making cancelled RPCs wait
+// behind another request's slow socket write. Its zero value is ready for use.
+type contextWriteMutex struct {
+	once  sync.Once
+	token chan struct{}
+}
+
+func (m *contextWriteMutex) LockContext(ctx context.Context) error {
+	m.once.Do(func() { m.token = make(chan struct{}, 1) })
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case m.token <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			m.Unlock()
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *contextWriteMutex) Lock() { _ = m.LockContext(context.Background()) }
+
+func (m *contextWriteMutex) Unlock() {
+	select {
+	case <-m.token:
+	default:
+		panic("unlock of unlocked contextWriteMutex")
+	}
 }
 
 func NewClient(cfg *config.Config, dispatcher *rpc.Dispatcher, platform rpc.Platform, caps rpc.Capabilities) *Client {
@@ -88,13 +122,12 @@ func (s *connectionState) SendBinary(frame []byte) error {
 	if !s.authenticated.Load() {
 		return fmt.Errorf("connection is not authenticated")
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if err := s.ctx.Err(); err != nil {
-		return err
-	}
 	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
 	defer cancel()
+	if err := s.writeMu.LockContext(ctx); err != nil {
+		return err
+	}
+	defer s.writeMu.Unlock()
 	return s.conn.Write(ctx, websocket.MessageBinary, frame)
 }
 
@@ -461,7 +494,9 @@ func (s *connectionState) serveAuthenticated() error {
 				log.Printf("bad rpc frame: %v", err)
 				continue
 			}
-			go s.handleRequest(req)
+			// Register before reading the next frame: an immediately following
+			// rpc_cancel must find this request even if its worker has not run.
+			s.handleRequest(req)
 		case "rpc_cancel":
 			var cf rpc.CancelFrame
 			if err := json.Unmarshal(data, &cf); err == nil {
@@ -487,14 +522,21 @@ func (s *connectionState) handleRequest(req rpc.RequestFrame) {
 	}
 	s.cancels[req.ID] = entry
 	s.cancelMu.Unlock()
+	go s.runRequest(reqCtx, req, entry)
+}
+
+func (s *connectionState) runRequest(reqCtx context.Context, req rpc.RequestFrame, entry *requestCancel) {
 	defer func() {
 		s.cancelMu.Lock()
 		if s.cancels[req.ID] == entry {
 			delete(s.cancels, req.ID)
 		}
 		s.cancelMu.Unlock()
-		cancel()
+		entry.cancel()
 	}()
+	if reqCtx.Err() != nil {
+		return
+	}
 
 	stream := func(channel string, chunk []byte) {
 		if reqCtx.Err() != nil {
@@ -566,12 +608,26 @@ func (s *connectionState) writeJSON(ctx context.Context, v any) error {
 	if err != nil {
 		return err
 	}
-	s.writeMu.Lock()
+	// The caller's ctx (e.g. one RPC) may abandon waiting for the send lock, but
+	// must never govern the frame write itself: coder/websocket closes the WHOLE
+	// connection when a write ctx is cancelled mid-frame, so an rpc_cancel on a
+	// slow link would drop every other RPC and PTY session on this device. Once
+	// the lock is held, write under the connection's own lifetime instead.
+	lockCtx, cancelLock := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelLock()
+	if err := s.writeMu.LockContext(lockCtx); err != nil {
+		return err
+	}
 	defer s.writeMu.Unlock()
 	if err := s.ctx.Err(); err != nil {
 		return err
 	}
-	writeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
+	// Cancelled while we were queued: skip the frame rather than start a write
+	// nobody is waiting for.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	writeCtx, cancelWrite := context.WithTimeout(s.ctx, 30*time.Second)
+	defer cancelWrite()
 	return s.conn.Write(writeCtx, websocket.MessageText, data)
 }

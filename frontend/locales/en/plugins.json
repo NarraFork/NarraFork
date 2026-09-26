@@ -116,6 +116,12 @@
 			"authorizeSkip": "Keep all",
 			"authorizeBusy": "Applying…"
 		},
+		"permissionPrompt": {
+			"title": "\"{{plugin}}\" is requesting a new capability grant",
+			"runtimeHint": "A running plugin called a capability that is not granted yet. The call cannot proceed until you decide.",
+			"openGrants": "Open grant management",
+			"later": "Later"
+		},
 		"detail": {
 			"errorTitle": "Something went wrong",
 			"backToList": "Back to plugins",
@@ -180,6 +186,13 @@
 				"pendingEmpty": "No pending requests",
 				"approve": "Allow",
 				"deny": "Deny",
+				"denyPermanent": "Deny permanently",
+				"denyPermanentHint": "Deny and never ask again; the plugin's calls to this capability will fail outright. You can lift it from the permanent denials list below.",
+				"denyPermanentConfirmTitle": "Deny capability permanently",
+				"denyPermanentConfirmMessage": "Permanently deny \"{{capability}}\"? The plugin's calls to this capability will fail outright and you will not be asked again. You can lift this decision later from grant management.",
+				"denialsTitle": "Permanently denied",
+				"denialsHint": "These capabilities are permanently denied: calls fail outright and no permission request is raised. Lift a denial to let the plugin ask again.",
+				"undeny": "Lift",
 				"pendingHint": "Plugins request capabilities here when they are not yet granted",
 				"pendingUpgradeHint": "An update declares capabilities this installation was never granted. They stay unavailable until you approve them; everything you approved before keeps working.",
 				"pendingSourceUpgrade": "New in update",

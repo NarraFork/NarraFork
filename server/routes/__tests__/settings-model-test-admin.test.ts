@@ -63,6 +63,33 @@ describe("per-response tool-call limit settings", () => {
 	});
 });
 
+describe("search channel settings validation", () => {
+	test("accepts reordered plugin and built-in channels without changing their settings", () => {
+		const channels = [
+			{ id: "plugin:com.example.search:web", kind: "plugin", enabled: false, timeoutMs: 90000 },
+			{ id: "custom:engine", kind: "custom-api", enabled: true, providerId: "engine" },
+			{ id: "nug:gateway", kind: "nug-mcp", enabled: true, providerId: "gateway" },
+			{ id: "subagent", kind: "subagent", enabled: true, maxTurns: 7 },
+			{ id: "native", kind: "native", enabled: true },
+		];
+
+		for (const reordered of [channels, [...channels].reverse()]) {
+			const parsed = updateSettingsSchema.parse({ search: { channels: reordered } });
+			expect<unknown>(parsed.search?.channels).toEqual(reordered);
+		}
+	});
+
+	test("still rejects unknown channel kinds", () => {
+		const result = updateSettingsSchema.safeParse({
+			search: { channels: [{ id: "unknown", kind: "unknown", enabled: true }] },
+		});
+		expect(result.success).toBe(false);
+		if (!result.success) {
+			expect(result.error.issues[0]?.path).toEqual(["search", "channels", 0, "kind"]);
+		}
+	});
+});
+
 describe("settings restart redirects", () => {
 	test("preserves the request hostname when switching to a wildcard listener", async () => {
 		const original = structuredClone(settings);

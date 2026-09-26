@@ -85,6 +85,7 @@ import { compileExecutionPolicy } from "./execution-policy/compiler";
 import { executionPolicyEngine, type ResolvedExecutionPolicy } from "./execution-policy/engine";
 import { registerExecutionPolicyPendingReprocessor } from "./execution-policy/events";
 import { normalizeExecutionPolicyRuleSet } from "./execution-policy/normalize";
+import { resolveCanonicalPaths } from "./execution-policy/path-probes";
 import {
 	createExecutionTargetContext,
 	executionTargetContextKey,
@@ -3383,22 +3384,18 @@ function permissionPrimaryPath(
 	return undefined;
 }
 
-async function canonicalizeShellAnalysisPaths(
+export async function canonicalizeShellAnalysisPaths(
 	analysis: BashAnalysis,
 	context: ExecutionTargetContext,
+	signal?: AbortSignal,
 ): Promise<BashAnalysis> {
+	signal?.throwIfAborted();
 	if (analysis.filePaths.length === 0) return analysis;
-	const canonicalPaths = await Promise.all(
-		analysis.filePaths.map(async (path) => {
-			const identity = await context.backend.resolvePathIdentity(path);
-			if (identity.runtimeGeneration !== context.target.runtimeGeneration) {
-				throw new Error(
-					`Shell path identity generation drifted: expected ${context.target.runtimeGeneration}, ` +
-						`got ${identity.runtimeGeneration}.`,
-				);
-			}
-			return identity.canonicalPath;
-		}),
+	const canonicalPaths = await resolveCanonicalPaths(
+		analysis.filePaths,
+		context,
+		"Shell path identity",
+		signal,
 	);
 	return { ...analysis, filePaths: [...new Set(canonicalPaths)] };
 }
@@ -3742,7 +3739,7 @@ export async function handlePermission(
 				executionContext?.paths ?? localPathSemantics,
 			);
 			if (executionContext) {
-				bashAnalysis = await canonicalizeShellAnalysisPaths(bashAnalysis, executionContext);
+				bashAnalysis = await canonicalizeShellAnalysisPaths(bashAnalysis, executionContext, signal);
 			}
 			if (bashAnalysis.commands.length === 0) {
 				throw new Error("command parser produced no executable command");
@@ -3911,12 +3908,36 @@ export async function handlePermission(
 		}
 	}
 
+	// Bash await/stop are pure control operations for ordinary sessions, but review
+	// follow-ups are limited to synchronous Git inspection and cannot use them.
+	if (reviewReadOnlyBash && isBashControlOp) {
+		return {
+			behavior: "deny",
+			message: "Review Bash only permits synchronous, read-only Git inspection commands.",
+		};
+	}
+
+	// Stopping owned work must remain possible when remote metadata RPCs are
+	// exhausted/offline. The tool still enforces task ownership when executing.
+	if (isBashControlOp) {
+		await options?.onInputResolved?.(effectiveInput);
+		await db
+			.update(narratorToolCalls)
+			.set({
+				status: "running",
+				permissionDecidedBy: "auto",
+				permissionDecidedAt: new Date().toISOString(),
+			})
+			.where(and(eq(narratorToolCalls.id, permissionToolCallId)));
+		return { behavior: "allow", updatedInput: effectiveInput };
+	}
 	let compiledPolicy: ResolvedExecutionPolicy;
 	try {
 		compiledPolicy = await executionPolicyEngine.compile(
 			narratorId,
 			executionContext,
 			runtimeConstraint?.useRobotDiagnosticPreset ? ["robotDiagnostic"] : [],
+			signal,
 		);
 	} catch (error) {
 		return {
@@ -3958,28 +3979,6 @@ export async function handlePermission(
 	await options?.onInputResolved?.(effectiveInput);
 
 	const permMeta: PermissionDecisionMeta = {};
-
-	// Bash await/stop are pure control operations for ordinary sessions, but review
-	// follow-ups are limited to synchronous Git inspection and cannot use them.
-	if (reviewReadOnlyBash && isBashControlOp) {
-		return {
-			behavior: "deny",
-			message: "Review Bash only permits synchronous, read-only Git inspection commands.",
-		};
-	}
-
-	// Bash await/stop are pure control operations — skip full permission analysis
-	if (isBashControlOp) {
-		await db
-			.update(narratorToolCalls)
-			.set({
-				status: "running",
-				permissionDecidedBy: "auto",
-				permissionDecidedAt: new Date().toISOString(),
-			})
-			.where(and(eq(narratorToolCalls.id, permissionToolCallId)));
-		return { behavior: "allow", updatedInput: effectiveInput };
-	}
 
 	const decisionPermMode =
 		runtimeConstraint && executionContext

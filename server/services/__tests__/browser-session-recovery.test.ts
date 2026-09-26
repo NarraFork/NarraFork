@@ -30,6 +30,7 @@ const connectCalls: boolean[] = [];
 // contextId → restore outcome
 let restoreOutcomes: Map<string, { ok: true } | { ok: false; reason: string }> = new Map();
 const persistedMessages: Array<{ narratorId: string; text: string; blocks: unknown[] }> = [];
+const closedContexts: string[] = [];
 
 function session(overrides: Partial<BrowserSessionHandoff> = {}): BrowserSessionHandoff {
 	return {
@@ -74,7 +75,17 @@ mock.module("../../lib/browser", () => ({
 	connectBrowser: mock(async (headless: boolean) => {
 		connectCalls.push(headless);
 		if (connectShouldThrow) throw new Error("connect failed");
-		return { __fakeBrowser: true, headless };
+		return {
+			__fakeBrowser: true,
+			headless,
+			browserContexts: () =>
+				[...restoreOutcomes.keys()].map((id) => ({
+					id,
+					close: async () => {
+						closedContexts.push(id);
+					},
+				})),
+		};
 	}),
 	restoreSessionFromHandoff: mock(
 		async (_browser: unknown, handoff: BrowserSessionHandoff) =>
@@ -110,6 +121,7 @@ describe("browser session update recovery", () => {
 		connectCalls.length = 0;
 		restoreOutcomes = new Map();
 		persistedMessages.length = 0;
+		closedContexts.length = 0;
 	});
 
 	afterEach(() => {
@@ -187,6 +199,23 @@ describe("browser session update recovery", () => {
 		expect(persistedMessages).toHaveLength(1);
 		expect(persistedMessages[0].narratorId).toBe("n-lost");
 		expect(persistedMessages[0].text).toContain("s-lost");
+	});
+
+	test("closes the context of a session that could not be restored, keeping restored ones", async () => {
+		restoreOutcomes.set("ctx-blocked", { ok: false, reason: "dialog blocked restore" });
+		restoreOutcomes.set("ctx-ok", { ok: true });
+		handoffToReturn = {
+			capturedByPid: 1,
+			capturedAt: new Date().toISOString(),
+			wsEndpoints: { headless: "ws://headless" },
+			sessions: [
+				session({ sessionId: "s-blocked", contextId: "ctx-blocked" }),
+				session({ sessionId: "s-ok", contextId: "ctx-ok" }),
+			],
+		};
+		await restoreBrowserSessionsAfterUpdate();
+		// The handoff is read-once, so an unrestored context would otherwise leak in Chrome.
+		expect(closedContexts).toEqual(["ctx-blocked"]);
 	});
 
 	test("reconnect failure marks all sessions in that mode as lost and notifies once per narrator", async () => {

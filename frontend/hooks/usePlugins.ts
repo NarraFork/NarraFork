@@ -15,6 +15,7 @@ export const pluginKeys = {
 	diagnostics: (pluginId: string) => ["plugins", pluginId, "diagnostics"] as const,
 	grants: (pluginId: string) => ["plugins", pluginId, "grants"] as const,
 	permissionRequests: (pluginId: string) => ["plugins", pluginId, "permission-requests"] as const,
+	permanentDenials: (pluginId: string) => ["plugins", pluginId, "permanent-denials"] as const,
 	providerConfig: (pluginId: string) => ["plugins", pluginId, "provider-config"] as const,
 	uiContributions: ["plugins", "ui-contributions"] as const,
 	uiHealth: ["plugins", "ui-health"] as const,
@@ -89,6 +90,23 @@ export function usePluginGrants(pluginId: string, options?: { enabled?: boolean 
 		queryKey: pluginKeys.grants(pluginId),
 		queryFn: () => pluginsApi.getGrants(pluginId),
 		enabled: (options?.enabled ?? true) && pluginId.length > 0,
+		refetchInterval: PLUGIN_REFETCH_INTERVAL_MS,
+		gcTime: PLUGINS_QUERY_GC_TIME_MS,
+	});
+}
+
+/**
+ * Permanent ("never ask again") denials (admin). Polls while the grants tab is
+ * mounted and is invalidated by grant-related mutations.
+ */
+export function usePluginPermanentDenials(pluginId: string) {
+	return useQuery({
+		queryKey: pluginKeys.permanentDenials(pluginId),
+		queryFn: async () => {
+			const data = await pluginsApi.listPermanentDenials(pluginId);
+			return data.denials ?? [];
+		},
+		enabled: pluginId.length > 0,
 		refetchInterval: PLUGIN_REFETCH_INTERVAL_MS,
 		gcTime: PLUGINS_QUERY_GC_TIME_MS,
 	});

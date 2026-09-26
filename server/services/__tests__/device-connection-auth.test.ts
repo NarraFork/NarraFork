@@ -707,6 +707,7 @@ describe("direct device mutual authentication", () => {
 		const sent: Record<string, unknown>[] = [];
 		const closed: CloseInfo[] = [];
 		const ws = {
+			readyState: 1,
 			data: {
 				channel: "device" as const,
 				connectedAt: Date.now(),
@@ -715,7 +716,7 @@ describe("direct device mutual authentication", () => {
 			},
 			send(data: string | Uint8Array) {
 				if (typeof data === "string") sent.push(JSON.parse(data));
-				return 0;
+				return data.length;
 			},
 			close(code: number, reason: string) {
 				closed.push({ code, reason });

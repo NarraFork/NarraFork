@@ -116,6 +116,12 @@
 			"authorizeSkip": "保持全部",
 			"authorizeBusy": "应用中…"
 		},
+		"permissionPrompt": {
+			"title": "「{{plugin}}」请求新的能力授权",
+			"runtimeHint": "运行中的插件调用了尚未授权的能力，在你决定前该调用无法继续。",
+			"openGrants": "前往管理授权",
+			"later": "稍后处理"
+		},
 		"detail": {
 			"errorTitle": "出错了",
 			"backToList": "返回插件列表",
@@ -180,6 +186,13 @@
 				"pendingEmpty": "暂无待授权请求",
 				"approve": "允许",
 				"deny": "拒绝",
+				"denyPermanent": "永久拒绝",
+				"denyPermanentHint": "拒绝且不再询问；插件再次调用该能力将直接失败。之后可在下方永久拒绝列表中解除。",
+				"denyPermanentConfirmTitle": "永久拒绝能力",
+				"denyPermanentConfirmMessage": "永久拒绝「{{capability}}」？插件再次调用该能力将直接失败，且不会再向你询问。此决定可稍后在管理授权中解除。",
+				"denialsTitle": "永久拒绝",
+				"denialsHint": "这些能力已被永久拒绝：插件调用会直接失败，不再产生授权请求。解除后插件可重新申请。",
+				"undeny": "解除",
 				"pendingHint": "插件调用未授权能力时在此请求授权",
 				"pendingUpgradeHint": "更新声明了本安装从未授权过的能力。在你批准前这些能力不可用；此前已授权的能力照常工作。",
 				"pendingSourceUpgrade": "更新新增",

@@ -9,6 +9,11 @@ import { PluginHostDispatcher } from "@server/services/plugin-host-dispatcher";
 import { PluginHostServices } from "@server/services/plugin-host-services";
 import { pluginInstallationAuthorityId } from "@server/services/plugin-integration-authority-service";
 import {
+	PluginLifecycleRevokeCoordinator,
+	type PluginLifecycleRevokeEvent,
+} from "@server/services/plugin-lifecycle-revoke-coordinator";
+import {
+	type PluginLifecycleRevokeCoordinatorLike,
 	PluginManager,
 	type PluginRuntimeSupervisorLike,
 	pluginManager,
@@ -199,6 +204,122 @@ class FakeSupervisor implements PluginRuntimeSupervisorLike {
 		this.gates.set(pluginId, { entered, release });
 		return { entered: entered.promise, release: release.resolve };
 	}
+}
+
+async function makeLifecycleRaceFixture(pluginId: string) {
+	const root = await makeTempRoot();
+	const storeRoot = join(root, "plugins");
+	const supervisor = new FakeSupervisor();
+	const stateStore = new PluginStateStore(storeRoot);
+	const permissionStore = new PluginPermissionStore({ root: storeRoot, stateStore });
+	const capabilityBroker = new CapabilityBroker();
+	const hostServices = new PluginHostServices({ capabilityBroker, permissionStore });
+	const platform = createPluginPlatformServices({
+		runtimeSupervisor: supervisor as never,
+		stateStore,
+		permissionStore,
+		capabilityBroker,
+		hostServices,
+	});
+	const crashEntered = deferred();
+	const releaseCrash = deferred();
+	const restored = deferred();
+	const effects: string[] = [];
+	let blockCrash = false;
+	let failRevokes = false;
+	let providerEnabled = false;
+	const revoke: PluginLifecycleRevokeCoordinatorLike["revoke"] = async (event) => {
+		if (blockCrash && event.kind === "crash") {
+			crashEntered.resolve();
+			await releaseCrash.promise;
+		}
+		const report = await platform.lifecycleRevokeCoordinator.revoke(event);
+		providerEnabled = false;
+		effects.push(`revoke:${event.kind}:${event.runtimeGeneration ?? "all"}`);
+		if (failRevokes && ["crash", "runtime_generation"].includes(event.kind)) {
+			throw new Error("Injected lifecycle adapter failure");
+		}
+		return report;
+	};
+	const manager = new PluginManager({
+		root: storeRoot,
+		disabled: false,
+		stateStore,
+		permissionStore,
+		hostServices,
+		runtimeSupervisor: supervisor,
+		lifecycleRevokeCoordinator: { revoke },
+		restorePluginLifecycle: async (id) => {
+			await platform.restorePlugin(id);
+			providerEnabled = true;
+			effects.push("restore");
+			if (blockCrash) restored.resolve();
+		},
+	});
+	// Observe the actual fire-and-forget handler promises, not a sleep followed by
+	// a binding-presence check. This also works before the serialization fix.
+	const pending: Promise<void>[] = [];
+	const internal = manager as unknown as Record<string, (...args: unknown[]) => Promise<void>>;
+	for (const name of ["handleRuntimeStateChange", "observeRuntimeLifecycle"]) {
+		const original = internal[name]?.bind(manager);
+		if (!original) continue;
+		internal[name] = (...args) => {
+			const result = original(...args);
+			pending.push(result);
+			return result;
+		};
+	}
+	const settle = async () => {
+		while (pending.length) await Promise.all(pending.splice(0));
+	};
+	const source = await makePackage(root, pluginId, (manifest) => {
+		(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+	});
+	await manager.install(source);
+	await manager.enable(pluginId);
+	await manager.activate(pluginId);
+	await settle();
+	const runtime = supervisor.get(pluginId);
+	if (!runtime) throw new Error("Runtime was not registered");
+	effects.length = 0;
+	return {
+		manager,
+		supervisor,
+		runtime,
+		stateStore,
+		hostServices,
+		effects,
+		settle,
+		crashEntered,
+		releaseCrash,
+		restored,
+		failRevokes() {
+			failRevokes = true;
+		},
+		crash() {
+			blockCrash = true;
+			runtime.state = "crashed";
+			runtime.options.onStateChange?.("crashed", "active");
+			runtime.options.onCrash?.(new Error("old generation crashed"));
+		},
+		async callProvider() {
+			// Controllable provider adapter: availability is an effect of lifecycle
+			// revoke/restore, independent of whether a host binding exists.
+			if (!providerEnabled) throw new Error("Provider disabled");
+			const current = supervisor.get(pluginId);
+			if (!current) throw new Error("Provider runtime missing");
+			const binding = hostServices.getRuntimeBinding(pluginId, current.runtimeId);
+			if (!binding) throw new Error("Provider runtime not bound");
+			const response = await binding.dispatcher.dispatch({
+				jsonrpc: "2.0",
+				id: "race-provider-call",
+				method: "diagnostics.getOwn",
+				params: {},
+			});
+			expect("result" in response).toBe(true);
+			return binding.plugin;
+		},
+	};
 }
 
 afterEach(async () => {
@@ -1398,6 +1519,238 @@ describe("PluginManager", () => {
 		]);
 	});
 
+	for (const stoppedRuntime of [false, true]) {
+		for (const recovery of ["enable", "disable"] as const) {
+			test(`${recovery} retries failed revocation for a disabled plugin with ${stoppedRuntime ? "a stopped runtime" : "no runtime"}`, async () => {
+				const root = await makeTempRoot();
+				const pluginId = `com.example.revoke-recovery-${recovery}-${stoppedRuntime}`;
+				const supervisor = new FakeSupervisor();
+				const events: PluginLifecycleRevokeEvent[] = [];
+				let failNextRevoke = false;
+				let providerEnabled = false;
+				let restores = 0;
+				const coordinator = new PluginLifecycleRevokeCoordinator({
+					adapters: {
+						ui_session: () => undefined,
+						capability_broker: () => undefined,
+						event_gateway: () => undefined,
+						scheduler: () => undefined,
+						secret_broker: () => undefined,
+						tool_registry: () => undefined,
+						mcp_adapter: () => undefined,
+						provider_registry: ({ event }) => {
+							events.push(event);
+							if (failNextRevoke) {
+								failNextRevoke = false;
+								throw new Error("Transient provider adapter failure");
+							}
+							providerEnabled = false;
+						},
+					},
+				});
+				const manager = new PluginManager({
+					root: join(root, "plugins"),
+					disabled: false,
+					runtimeSupervisor: supervisor,
+					lifecycleRevokeCoordinator: coordinator,
+					restorePluginLifecycle: () => {
+						providerEnabled = true;
+						restores++;
+					},
+				});
+				await manager.install(
+					await makePackage(root, pluginId, (manifest) => {
+						(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+					}),
+				);
+				if (stoppedRuntime) {
+					supervisor.register({
+						pluginId,
+						pluginVersion: "1.0.0",
+						command: ["fake-runtime"],
+						cwd: root,
+					});
+				}
+				const permissions = await manager.getPermissions(pluginId);
+				failNextRevoke = true;
+				await expect(
+					manager.replacePermissions(pluginId, {
+						grants: [],
+						expectedRevision: permissions.revision,
+						grantedBy: "recovery-test-admin",
+					}),
+				).rejects.toThrow("Plugin lifecycle revocation failed");
+				expect((await manager.getStatus(pluginId))?.desiredState).toBe("disabled");
+				expect(providerEnabled).toBe(false);
+				expect(restores).toBe(0);
+				expect(events).toHaveLength(1);
+				const failedEvent = events[0];
+				if (!failedEvent) throw new Error("Missing failed revoke event");
+				// The real coordinator caches failed deterministic events. A retry of
+				// that same ID cannot recover even though the adapter is healthy now.
+				await expect(coordinator.revoke(failedEvent)).rejects.toThrow(
+					"Plugin lifecycle revocation failed",
+				);
+				expect(events).toHaveLength(1);
+				// A recovery attempt that also fails must not bypass the fence. A later
+				// explicit attempt must use yet another ID, not that cached failure.
+				failNextRevoke = true;
+				await expect(manager[recovery](pluginId)).rejects.toThrow(
+					"Plugin lifecycle revocation failed",
+				);
+				expect((await manager.getStatus(pluginId))?.desiredState).toBe("disabled");
+				expect(providerEnabled).toBe(false);
+				expect(restores).toBe(0);
+				expect(events).toHaveLength(2);
+				if (recovery === "disable") {
+					await manager.disable(pluginId);
+					expect(providerEnabled).toBe(false);
+					expect(restores).toBe(0);
+					expect(events).toHaveLength(3);
+				}
+				const enabled = await manager.enable(pluginId);
+				expect(enabled.desiredState).toBe("enabled");
+				expect(providerEnabled).toBe(true);
+				expect(restores).toBe(1);
+				expect(events).toHaveLength(3);
+				expect(new Set(events.map((event) => event.eventId)).size).toBe(3);
+				expect(events[2]?.kind).toBe("disable");
+				expect((await manager.getPermissions(pluginId)).grants).toEqual([]);
+			});
+		}
+	}
+
+	test("serializes a blocked crash before new-generation provider restoration", async () => {
+		const fixture = await makeLifecycleRaceFixture("com.example.ordered-crash");
+		const { runtime, supervisor, effects, stateStore, manager } = fixture;
+		fixture.crash();
+		await fixture.crashEntered.promise;
+		await supervisor.start(runtime.options.pluginId);
+		// A bounded observation window only detects an illegal concurrent restore;
+		// the deferred controls the race and settle waits for all actual handlers.
+		let restoredBeforeRevokeCompleted = false;
+		try {
+			restoredBeforeRevokeCompleted = await Promise.race([
+				fixture.restored.promise.then(() => true),
+				new Promise<false>((resolve) => setTimeout(() => resolve(false), 60)),
+			]);
+		} finally {
+			fixture.releaseCrash.resolve();
+			await fixture.settle();
+		}
+		expect(restoredBeforeRevokeCompleted).toBe(false);
+		expect(effects.filter((effect) => effect === "revoke:crash:1")).toHaveLength(1);
+		expect(effects.at(-1)).toBe("restore");
+		const identity = await fixture.callProvider();
+		expect(identity.runtimeGeneration).toBe(2);
+		expect(identity.runtimeId).toBe(runtime.runtimeId);
+		expect(identity).toMatchObject({
+			installationId: (await manager.getStatus(runtime.options.pluginId))?.installationId,
+		});
+		const state = await stateStore.getState(runtime.options.pluginId);
+		expect(state?.runtimeState).toBe("active");
+		expect(state?.runtimeGeneration).toBe(2);
+		expect(state?.lastError).toBeNull();
+		const effectsAfterRecovery = [...effects];
+		runtime.options.onCrash?.(new Error("duplicate old crash notification"));
+		await fixture.settle();
+		expect(effects).toEqual(effectsAfterRecovery);
+		await fixture.callProvider();
+	});
+
+	test("failed revocation fences a delayed active restore without mixing generations", async () => {
+		const fixture = await makeLifecycleRaceFixture("com.example.failed-revoke-race");
+		const { runtime, supervisor, stateStore } = fixture;
+		fixture.failRevokes();
+		fixture.crash();
+		await fixture.crashEntered.promise;
+		await supervisor.start(runtime.options.pluginId);
+		fixture.releaseCrash.resolve();
+		await fixture.settle();
+		expect(fixture.effects).not.toContain("restore");
+		await expect(fixture.callProvider()).rejects.toThrow("Provider disabled");
+		const state = await stateStore.getState(runtime.options.pluginId);
+		expect(state?.runtimeGeneration).toBe(2);
+		expect(state?.runtimeState).toBe("quarantine");
+		expect(state?.lastError?.phase).toBe("lifecycle-revoke");
+	});
+
+	test("a delayed active event cannot restore revoked grants", async () => {
+		const fixture = await makeLifecycleRaceFixture("com.example.revoked-grant-race");
+		const { runtime, manager, supervisor, hostServices } = fixture;
+		const pluginId = runtime.options.pluginId;
+		const permissions = await manager.getPermissions(pluginId);
+		fixture.crash();
+		await fixture.crashEntered.promise;
+		const revoking = manager.revokePermissions(pluginId, {
+			expectedRevision: permissions.revision,
+			grantIds: permissions.grants.map((grant) => grant.grantId),
+			grantedBy: "race-test-admin",
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+		await supervisor.start(pluginId);
+		fixture.releaseCrash.resolve();
+		await revoking;
+		await fixture.settle();
+		const binding = hostServices.getRuntimeBinding(pluginId, runtime.runtimeId);
+		expect(binding?.grantRevision).toBe(permissions.revision + 1);
+		if (!binding) throw new Error("New generation was not rebound");
+		const denied = await binding.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "after-delayed-active",
+			method: "diagnostics.getOwn",
+			params: {},
+		});
+		expect("error" in denied).toBe(true);
+		expect((await manager.getPermissions(pluginId)).grants).toEqual([]);
+	});
+
+	test("a delayed active event cannot undo an explicit disable", async () => {
+		const fixture = await makeLifecycleRaceFixture("com.example.disable-race");
+		const { runtime, manager, supervisor } = fixture;
+		fixture.crash();
+		await fixture.crashEntered.promise;
+		const disabling = manager.disable(runtime.options.pluginId);
+		// Let disable enqueue its operation before the subsequent active event.
+		await Promise.resolve();
+		await Promise.resolve();
+		await supervisor.start(runtime.options.pluginId);
+		fixture.releaseCrash.resolve();
+		await disabling;
+		await fixture.settle();
+		expect((await manager.getStatus(runtime.options.pluginId))?.desiredState).toBe("disabled");
+		expect((await manager.getStatus(runtime.options.pluginId))?.runtimeState).toBe("inactive");
+		await expect(fixture.callProvider()).rejects.toThrow("Provider disabled");
+		expect(
+			fixture.hostServices.hasRuntimeBinding(runtime.options.pluginId, runtime.runtimeId),
+		).toBe(false);
+	});
+
+	test("callbacks from a replaced runtime cannot revoke or overwrite the new instance", async () => {
+		const fixture = await makeLifecycleRaceFixture("com.example.replaced-runtime");
+		const { runtime, supervisor, manager } = fixture;
+		const pluginId = runtime.options.pluginId;
+		await manager.deactivate(pluginId);
+		await fixture.settle();
+		supervisor.runtimes.delete(pluginId);
+		await manager.activate(pluginId);
+		await fixture.settle();
+		const replacement = supervisor.get(pluginId);
+		if (!replacement) throw new Error("Replacement runtime missing");
+		expect(replacement).not.toBe(runtime);
+		fixture.effects.length = 0;
+		runtime.state = "crashed";
+		runtime.options.onStateChange?.("crashed", "active");
+		runtime.options.onCrash?.(new Error("late retired process exit"));
+		await fixture.settle();
+		expect(fixture.effects).toEqual([]);
+		const identity = await fixture.callProvider();
+		expect(identity.runtimeId).toBe(replacement.runtimeId);
+		expect(identity.runtimeGeneration).toBe(replacement.generation);
+		expect((await manager.getStatus(pluginId))?.runtimeState).toBe("active");
+	});
+
 	test("keeps the capability binding after an idle-style runtime restart (generation change)", async () => {
 		const root = await makeTempRoot();
 		const storeRoot = join(root, "plugins");
@@ -1689,11 +2042,12 @@ describe("PluginManager", () => {
 		);
 		const installationId = await manager.getCurrentInstallationId(pluginId);
 		// Simulate a runtime capability request that surfaced as a pending request.
-		const pending = await manager["permissionStore"].addPendingRequest(pluginId, installationId, {
+		const pending = await manager.permissionStore.addPendingRequest(pluginId, installationId, {
 			capability: "query.read.projects",
 			scope: { type: "global" },
 			requestedByRuntimeId: "rt-test",
 		});
+		if (!pending) throw new Error("expected a queued pending request");
 		await manager.approvePermissionRequest(pluginId, pending.requestId, "admin-approve");
 
 		// The canonical grant must live in the DB authority, not only the mirror.
@@ -1717,6 +2071,87 @@ describe("PluginManager", () => {
 					grant.capability === "query.read.projects" && grant.grantedBy === "admin-approve",
 			),
 		).toBe(true);
+	});
+
+	test("permanent deny records the pair and blocks every future request for it", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.deny-permanent";
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await manager.install(
+			await makePackage(root, pluginId, (manifest) => {
+				(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+			}),
+		);
+		const installationId = await manager.getCurrentInstallationId(pluginId);
+		const pending = await manager.permissionStore.addPendingRequest(pluginId, installationId, {
+			capability: "query.read.projects",
+			scope: { type: "global" },
+			requestedByRuntimeId: "rt-test",
+		});
+		if (!pending) throw new Error("expected a queued pending request");
+
+		await manager.denyPermissionRequest(pluginId, pending.requestId, {
+			permanent: true,
+			deniedBy: "admin-deny",
+		});
+
+		// The denial is listed with its metadata ...
+		const denials = await manager.listPermanentDenials(pluginId);
+		expect(denials).toHaveLength(1);
+		expect(denials[0]).toMatchObject({
+			capability: "query.read.projects",
+			scope: { type: "global" },
+			deniedBy: "admin-deny",
+		});
+
+		// ... and the same pair can never be queued again, runtime or upgrade path.
+		const reRequest = await manager.permissionStore.addPendingRequest(pluginId, installationId, {
+			capability: "query.read.projects",
+			scope: { type: "global" },
+		});
+		expect(reRequest).toBeUndefined();
+		expect(await manager.listPendingPermissionRequests(pluginId)).toHaveLength(0);
+
+		// Lifting the denial lets the plugin ask again.
+		await manager.removePermanentDenial(pluginId, "query.read.projects", { type: "global" });
+		expect(await manager.listPermanentDenials(pluginId)).toHaveLength(0);
+		const reRequestAfterLift = await manager.permissionStore.addPendingRequest(
+			pluginId,
+			installationId,
+			{ capability: "query.read.projects", scope: { type: "global" } },
+		);
+		expect(reRequestAfterLift).toBeDefined();
+	});
+
+	test("denying an already approved request fails instead of reporting success", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.deny-after-approve";
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await manager.install(
+			await makePackage(root, pluginId, (manifest) => {
+				(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+			}),
+		);
+		const installationId = await manager.getCurrentInstallationId(pluginId);
+		const pending = await manager.permissionStore.addPendingRequest(pluginId, installationId, {
+			capability: "query.read.projects",
+			scope: { type: "global" },
+		});
+		if (!pending) throw new Error("expected a queued pending request");
+
+		await manager.approvePermissionRequest(pluginId, pending.requestId, "admin-approve");
+		await expect(
+			manager.denyPermissionRequest(pluginId, pending.requestId, { permanent: true }),
+		).rejects.toThrow();
+		expect(await manager.listPermanentDenials(pluginId)).toHaveLength(0);
 	});
 
 	test("restores the stable UUID from the authority and retires legacy hash authorities on initialize", async () => {

@@ -1838,6 +1838,7 @@ interface RuntimeRecord {
 	restarts: number[];
 	totalRestarts: number[];
 	restartTimer?: ReturnType<typeof setTimeout>;
+	recoveryGeneration?: number;
 	quarantineReason?: string;
 }
 
@@ -1889,6 +1890,8 @@ export class RuntimeSupervisor {
 			if (sameRuntimeCommand(existing.options.command, options.command)) {
 				return existing.runtime;
 			}
+			if (existing.restartTimer) clearTimeout(existing.restartTimer);
+			existing.restartTimer = undefined;
 			void existing.runtime.shutdown().catch(() => undefined);
 			this.records.delete(options.pluginId);
 		}
@@ -1981,6 +1984,8 @@ export class RuntimeSupervisor {
 		const record = this.records.get(pluginId);
 		if (!record) return;
 		record.desiredEnabled = false;
+		if (record.restartTimer) clearTimeout(record.restartTimer);
+		record.restartTimer = undefined;
 		record.quarantineReason = reason;
 		record.runtime.quarantine(reason);
 	}
@@ -2004,7 +2009,7 @@ export class RuntimeSupervisor {
 		state: "crashed" | "failed",
 	): void {
 		const record = this.records.get(pluginId);
-		if (!record?.desiredEnabled || record.runtime !== runtime) return;
+		if (!record?.desiredEnabled || record.quarantineReason || record.runtime !== runtime) return;
 		const diagnostics = runtime.getDiagnostics();
 		if (
 			state === "failed" &&
@@ -2013,10 +2018,14 @@ export class RuntimeSupervisor {
 				diagnostics.lastError.code.startsWith("HELLO_") ||
 				["STDOUT_LIMIT", "INVALID_JSON_RPC", "PROCESS_EXIT"].includes(diagnostics.lastError.code))
 		) {
-			record.quarantineReason = diagnostics.lastError.message;
-			runtime.quarantine(record.quarantineReason);
+			this.quarantine(pluginId, diagnostics.lastError.message);
 			return;
 		}
+		// Error and exit can both report the same failed process. Keep this marker
+		// after the timer fires/cancels; only a new generation gets another attempt.
+		const generation = runtime.generation;
+		if (record.recoveryGeneration === generation) return;
+		record.recoveryGeneration = generation;
 		const now = Date.now();
 		record.restarts = record.restarts.filter(
 			(timestamp) => now - timestamp <= this.options.restartWindowMs,
@@ -2028,8 +2037,7 @@ export class RuntimeSupervisor {
 			record.restarts.length >= this.options.maxRestarts ||
 			record.totalRestarts.length >= this.options.maxTotalRestarts
 		) {
-			record.quarantineReason = "restart budget exhausted";
-			runtime.quarantine(record.quarantineReason);
+			this.quarantine(pluginId, "restart budget exhausted");
 			return;
 		}
 		record.restarts.push(now);
@@ -2041,10 +2049,22 @@ export class RuntimeSupervisor {
 		);
 		const jitter = exponential * this.options.restartJitterRatio * (this.options.random() * 2 - 1);
 		const delay = Math.max(0, Math.round(exponential + jitter));
-		record.restartTimer = setTimeout(() => {
-			record.restartTimer = undefined;
+		const restartTimer = setTimeout(() => {
 			void this.mutex.acquire(pluginId, async () => {
-				if (!record.desiredEnabled || record.quarantineReason) return;
+				// Manual start, replacement or quarantine may win while this callback
+				// waits for the mutex. Never restart a recovered or obsolete process.
+				if (
+					this.records.get(pluginId) !== record ||
+					record.runtime !== runtime ||
+					record.restartTimer !== restartTimer ||
+					!record.desiredEnabled ||
+					record.quarantineReason ||
+					runtime.generation !== generation ||
+					(runtime.state !== "failed" && runtime.state !== "crashed")
+				) {
+					return;
+				}
+				record.restartTimer = undefined;
 				try {
 					await runtime.restart();
 				} catch (error) {
@@ -2056,6 +2076,7 @@ export class RuntimeSupervisor {
 				}
 			});
 		}, delay);
+		record.restartTimer = restartTimer;
 	}
 }
 

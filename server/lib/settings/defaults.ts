@@ -212,6 +212,7 @@ export const DEFAULTS: NarraForkSettings = {
 		rpcTimeoutMs: 120_000,
 		maxRpcBytes: 10 * 1024 * 1024,
 		maxConcurrentRpcPerDevice: 64,
+		rpcConcurrencyDefaultsVersion: 1,
 		transferChunkBytes: 1024 * 1024,
 		transferConcurrency: 4,
 		maxConcurrentTransfersPerDevice: 2,
@@ -389,7 +390,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "number",
 	},
 	"devices.maxConcurrentRpcPerDevice": {
-		desc: "每个设备允许的最大并发 RPC 数。",
+		desc: "每个设备允许的最大并发短 RPC 数，默认 64（PTY 会话不占用此配额）。",
+		type: "number",
+	},
+	"devices.rpcConcurrencyDefaultsVersion": {
+		desc: "RPC 并发默认值的一次性迁移版本（系统内部使用）。",
 		type: "number",
 	},
 	"devices.transferChunkBytes": {

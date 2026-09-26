@@ -12,13 +12,20 @@ import {
 } from "../lib/errors";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { pluginIdSchema } from "../lib/plugins/manifest";
-import { permissionGrantSchema } from "../lib/plugins/permissions";
+import {
+	capabilitySchema,
+	permissionGrantSchema,
+	permissionScopeSchema,
+} from "../lib/plugins/permissions";
 import type { JsonValue } from "../lib/plugins/protocol";
 import { settings } from "../lib/settings";
 import type { ProxyOverride } from "../lib/settings/types";
 import { assertAdmin } from "../middleware/auth";
 import { pluginManager as corePluginManager } from "../services/plugin-manager";
-import type { PluginPermissionRequest } from "../services/plugin-permission-store";
+import type {
+	PluginPermanentDenial,
+	PluginPermissionRequest,
+} from "../services/plugin-permission-store";
 import { pluginPlatformServices } from "../services/plugin-platform-services";
 
 const MAX_DIAGNOSTIC_TEXT = 1_000;
@@ -45,7 +52,13 @@ export interface PluginManager {
 		requestId: string,
 		grantedBy: string,
 	): Promise<unknown>;
-	denyPermissionRequest?(pluginId: string, requestId: string): Promise<boolean>;
+	denyPermissionRequest?(
+		pluginId: string,
+		requestId: string,
+		options?: { permanent?: boolean; deniedBy?: string },
+	): Promise<boolean>;
+	listPermanentDenials?(pluginId: string): Promise<PluginPermanentDenial[]>;
+	removePermanentDenial?(pluginId: string, capability: string, scope: unknown): Promise<boolean>;
 	/** Admin authorization-health report (read-only). */
 	inspectAuthorization?(pluginId: string): Promise<unknown>;
 	/** Admin repair of the canonical installation identity and mirror. */
@@ -139,6 +152,12 @@ const permissionRevokeSchema = z
 	.object({
 		expectedRevision: permissionRevisionSchema,
 		grantIds: z.array(z.string().trim().min(1).max(256)).max(512),
+	})
+	.strict();
+const permanentDenialRemoveSchema = z
+	.object({
+		capability: capabilitySchema,
+		scope: permissionScopeSchema,
 	})
 	.strict();
 
@@ -960,11 +979,66 @@ export function createPluginRoutes(
 			const requestId = c.req.param("requestId");
 			const parsed = z.string().trim().min(1).max(256).safeParse(requestId);
 			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
-			const denied = await manager.denyPermissionRequest(pluginId, requestId);
+			// The body is optional: a bare POST denies just this request, while
+			// `{ permanent: true }` additionally records "never ask again".
+			let permanent = false;
+			const rawBody = await c.req.json().catch(() => undefined);
+			if (rawBody !== undefined) {
+				const bodyParsed = z
+					.object({ permanent: z.boolean().optional() })
+					.strict()
+					.safeParse(rawBody);
+				if (!bodyParsed.success) throw zodValidationError(bodyParsed.error);
+				permanent = bodyParsed.data.permanent ?? false;
+			}
+			const denied = await manager.denyPermissionRequest(pluginId, requestId, {
+				permanent,
+				deniedBy: adminActor(c),
+			});
 			if (!denied) {
 				throw new NotFoundError("Permission request", requestId);
 			}
-			return c.json({ denied: true });
+			return c.json({ denied: true, permanent });
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	app.get("/:pluginId/grants/denials", admin, async (c) => {
+		try {
+			requirePluginsEnabled();
+			if (!manager.listPermanentDenials) {
+				throw new AppError("Plugin permission management is unavailable", 501, "NOT_IMPLEMENTED");
+			}
+			const pluginId = parsePluginId(c);
+			const denials = await manager.listPermanentDenials(pluginId);
+			return c.json({ denials });
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	app.post("/:pluginId/grants/denials/remove", admin, async (c) => {
+		try {
+			requirePluginsEnabled();
+			if (!manager.removePermanentDenial) {
+				throw new AppError("Plugin permission management is unavailable", 501, "NOT_IMPLEMENTED");
+			}
+			const pluginId = parsePluginId(c);
+			let rawBody: unknown;
+			try {
+				rawBody = await c.req.json();
+			} catch (error) {
+				throw parseBodyError(error);
+			}
+			const parsed = permanentDenialRemoveSchema.safeParse(rawBody);
+			if (!parsed.success) throw zodValidationError(parsed.error);
+			const removed = await manager.removePermanentDenial(
+				pluginId,
+				parsed.data.capability,
+				parsed.data.scope,
+			);
+			return c.json({ removed });
 		} catch (error) {
 			return errorResponse(c, error);
 		}

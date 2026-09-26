@@ -4,6 +4,7 @@ import { robotDiagnosticRuleSet } from "@server/lib/robot-diagnostic-policy";
 import { getSettingsRevision } from "@server/lib/settings";
 import { type CompiledExecutionPolicy, compileExecutionPolicy } from "./compiler";
 import { mergeExecutionPolicyRuleSets } from "./normalize";
+import { resolveCanonicalPaths } from "./path-probes";
 import { executionPolicyRepository, type LoadedExecutionPolicy } from "./repository";
 import { executionTargetContextKey } from "./target-context";
 import type {
@@ -33,6 +34,47 @@ interface CompiledCacheEntry {
 	ownerNarratorId?: string;
 	settingsRevision: number;
 	promise: Promise<ResolvedExecutionPolicy>;
+	controller: AbortController;
+	waiters: number;
+	settled: boolean;
+}
+
+/** One waiter may leave without cancelling another caller's shared compilation. */
+function waitForCompilation(
+	entry: CompiledCacheEntry,
+	signal?: AbortSignal,
+): Promise<ResolvedExecutionPolicy> {
+	entry.waiters++;
+	return new Promise((resolve, reject) => {
+		let finished = false;
+		const finish = (complete: () => void) => {
+			if (finished) return;
+			finished = true;
+			entry.waiters--;
+			signal?.removeEventListener("abort", abort);
+			complete();
+		};
+		const abort = () =>
+			finish(() => {
+				const reason = signal?.reason;
+				if (entry.waiters === 0 && !entry.settled) {
+					entry.controller.abort(reason);
+					// The last caller owns cleanup: do not report cancellation until probes drain.
+					void entry.promise.then(
+						() => reject(reason),
+						() => reject(reason),
+					);
+				} else {
+					reject(reason);
+				}
+			});
+		signal?.addEventListener("abort", abort, { once: true });
+		void entry.promise.then(
+			(value) => finish(() => resolve(value)),
+			(error) => finish(() => reject(error)),
+		);
+		if (signal?.aborted) abort();
+	});
 }
 
 function stableJson(value: unknown): string {
@@ -81,41 +123,30 @@ function presetsKey(presets: readonly ExecutionPolicyPreset[]): string {
 	return presets.length === 0 ? "none" : [...new Set(presets)].sort().join(",");
 }
 
-async function canonicalizeDirectoryRule<T extends DirectoryWhitelistRule | DirectoryBlacklistRule>(
-	rule: T,
-	context: ExecutionTargetContext,
-): Promise<T> {
-	const absolutePath = context.paths.resolve(context.target.cwd, rule.path);
-	const identity = await context.backend.resolvePathIdentity(absolutePath);
-	if (identity.runtimeGeneration !== context.target.runtimeGeneration) {
-		throw new Error(
-			`Execution policy path generation drifted: expected ${context.target.runtimeGeneration}, ` +
-				`got ${identity.runtimeGeneration}.`,
-		);
-	}
-	return {
-		...rule,
-		path: identity.canonicalPath,
-		pathKey: context.paths.identityKey(identity.canonicalPath),
-	};
-}
-
 async function canonicalizeCompiledRules(
 	compiled: CompiledExecutionPolicy,
 	context: ExecutionTargetContext | null,
+	signal: AbortSignal,
 ): Promise<ExecutionPolicyRuleSet> {
+	signal.throwIfAborted();
 	if (!context || context.paths.flavor === "spec") return compiled;
-	const [directoryWhitelist, directoryBlacklist] = await Promise.all([
-		Promise.all(
-			compiled.directoryWhitelist.map((rule) => canonicalizeDirectoryRule(rule, context)),
-		),
-		Promise.all(
-			compiled.directoryBlacklist.map((rule) => canonicalizeDirectoryRule(rule, context)),
-		),
-	]);
+	// Share the deduplication and concurrency budget across both lists, but keep every
+	// rule's order and metadata: identical roots may have different access/deny levels.
+	const canonicalPaths = await resolveCanonicalPaths(
+		[...compiled.directoryWhitelist, ...compiled.directoryBlacklist].map((rule) => rule.path),
+		context,
+		"Execution policy path",
+		signal,
+	);
+	let next = 0;
+	const paths = context.paths;
+	function canonicalRule<T extends DirectoryWhitelistRule | DirectoryBlacklistRule>(rule: T): T {
+		const path = canonicalPaths[next++];
+		return { ...rule, path, pathKey: paths.identityKey(path) };
+	}
 	return {
-		directoryWhitelist,
-		directoryBlacklist,
+		directoryWhitelist: compiled.directoryWhitelist.map(canonicalRule),
+		directoryBlacklist: compiled.directoryBlacklist.map(canonicalRule),
 		commandWhitelist: compiled.commandWhitelist,
 		commandBlacklist: compiled.commandBlacklist,
 	};
@@ -156,8 +187,11 @@ export class ExecutionPolicyEngine {
 		narratorId: string,
 		context: ExecutionTargetContext | null,
 		presets: readonly ExecutionPolicyPreset[] = [],
+		signal?: AbortSignal,
 	): Promise<ResolvedExecutionPolicy> {
+		signal?.throwIfAborted();
 		const loaded = await this.load(narratorId);
+		signal?.throwIfAborted();
 		const appliedPresets = presetsKey(presets);
 		// Presets join the revision, not just the cache key: enabling or disabling one changes
 		// the effective rule set, and a stale entry would otherwise be reused across the switch.
@@ -168,7 +202,9 @@ export class ExecutionPolicyEngine {
 		const cacheKey = `${narratorId}:${revision}:${contextKey}`;
 		const settingsRevision = getSettingsRevision();
 		const cached = this.compiledCache.get(cacheKey);
-		if (cached?.settingsRevision === settingsRevision) return cached.promise;
+		if (cached?.settingsRevision === settingsRevision && !cached.controller.signal.aborted) {
+			return waitForCompilation(cached, signal);
+		}
 		if (cached) this.compiledCache.delete(cacheKey);
 
 		const entry: CompiledCacheEntry = {
@@ -176,6 +212,9 @@ export class ExecutionPolicyEngine {
 			ownerNarratorId: loaded.ownerNarratorId,
 			settingsRevision,
 			promise: Promise.resolve(undefined as never),
+			controller: new AbortController(),
+			waiters: 0,
+			settled: false,
 		};
 		entry.promise = (async () => {
 			const effectiveRules =
@@ -186,7 +225,11 @@ export class ExecutionPolicyEngine {
 							...[...new Set(presets)].map((preset) => presetRuleSet(preset)),
 						);
 			const selected = compileExecutionPolicy(effectiveRules, context);
-			const canonicalRules = await canonicalizeCompiledRules(selected, context);
+			const canonicalRules = await canonicalizeCompiledRules(
+				selected,
+				context,
+				entry.controller.signal,
+			);
 			const compiled = compileExecutionPolicy(canonicalRules, context);
 			return Object.freeze({
 				...compiled,
@@ -196,17 +239,22 @@ export class ExecutionPolicyEngine {
 				projectGitPath: loaded.projectGitPath,
 				revision,
 			});
-		})().catch((error) => {
-			// Evict this entry only if it is still the one stored under this key.
-			// A concurrent compile() may have already replaced it with a fresh attempt,
-			// so a stale reference must not clobber a valid entry.
-			if (this.compiledCache.get(cacheKey) === entry) {
-				this.compiledCache.delete(cacheKey);
-			}
-			throw error;
-		});
+		})().then(
+			(policy) => {
+				entry.settled = true;
+				return policy;
+			},
+			(error) => {
+				entry.settled = true;
+				// A cancelled batch may already have been replaced. Never evict its successor.
+				if (this.compiledCache.get(cacheKey) === entry) {
+					this.compiledCache.delete(cacheKey);
+				}
+				throw error;
+			},
+		);
 		this.compiledCache.set(cacheKey, entry);
-		return entry.promise;
+		return waitForCompilation(entry, signal);
 	}
 
 	/** Invalidate a narrator and every cached subagent whose rules are owned by it. */

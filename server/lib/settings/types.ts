@@ -5,10 +5,10 @@
 
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
 import type { ModelCard } from "@shared/model-card";
-import type { ModelCatalogSettings } from "../model-catalog";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
+import type { ModelCatalogSettings } from "../model-catalog";
 import type { PermissionMode } from "../permission-modes";
 import type { UserAgentMode } from "../user-agent";
 
@@ -1011,8 +1011,10 @@ export interface NarraForkSettings {
 		rpcTimeoutMs: number;
 		/** Max bytes a single RPC result/stream may carry (default: 10 MB). */
 		maxRpcBytes: number;
-		/** Max concurrent in-flight RPCs per device (default: 16). */
+		/** Max concurrent in-flight short RPCs per device (default: 64). */
 		maxConcurrentRpcPerDevice: number;
+		/** Internal one-time migration marker; preserves later operator overrides. */
+		rpcConcurrencyDefaultsVersion?: number;
 		/** File-transfer chunk size in bytes (default: 1 MiB). */
 		transferChunkBytes: number;
 		/** Parallel in-flight chunks within a single transfer (default: 4). */

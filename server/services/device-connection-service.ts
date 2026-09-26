@@ -70,6 +70,8 @@ export interface DeviceTransport {
 	sendBinary(data: Uint8Array): void;
 	/** Current outbound send-buffer size in bytes (for backpressure), if known. */
 	bufferedAmount?(): number;
+	/** Detect a closed socket even when its close callback has not run yet. */
+	isOpen?(): boolean;
 	close(code: number, reason: string): void;
 }
 
@@ -80,6 +82,10 @@ interface PendingRpc {
 	removeAbortListener?: () => void;
 	onStream?: (channel: string, chunk: Uint8Array) => void;
 	longLived?: boolean;
+	/** Optional so pending calls surviving a hot reload remain readable. No params are retained. */
+	method?: RpcMethod;
+	startedAt?: number;
+	timeoutMs?: number;
 }
 
 interface DeviceConnection {
@@ -93,6 +99,7 @@ interface DeviceConnection {
 	/** Monotonic identity for this authenticated transport generation. */
 	generation?: number;
 	hello?: DeviceHelloFrame;
+	lastRpcLimitLogAt?: number;
 }
 
 /** deviceId → live connection. Survives hot reloads. */
@@ -272,6 +279,46 @@ export class DeviceCapabilityError extends Error {
 	}
 }
 
+export interface DeviceRpcDiagnostics {
+	maxConcurrent: number;
+	total: number;
+	shortLived: number;
+	longLived: number;
+	/** At most eight oldest short calls; never includes commands, paths or RPC params. */
+	oldest: Array<{ id: string; method: string; ageMs: number | null; timeoutMs: number | null }>;
+}
+
+function rpcConcurrencyLimit(): number {
+	const value = settings.devices?.maxConcurrentRpcPerDevice;
+	return typeof value === "number" && Number.isFinite(value) && value > 0
+		? Math.max(1, Math.floor(value))
+		: 64;
+}
+
+function rpcDiagnostics(conn: DeviceConnection): DeviceRpcDiagnostics {
+	const now = Date.now();
+	const oldest: DeviceRpcDiagnostics["oldest"] = [];
+	let shortLived = 0;
+	for (const [id, pending] of conn.pending) {
+		if (pending.longLived) continue;
+		shortLived++;
+		if (oldest.length < 8) {
+			oldest.push({
+				id,
+				method: pending.method ?? "unknown",
+				ageMs: pending.startedAt === undefined ? null : Math.max(0, now - pending.startedAt),
+				timeoutMs: pending.timeoutMs ?? null,
+			});
+		}
+	}
+	return {
+		maxConcurrent: rpcConcurrencyLimit(),
+		total: conn.pending.size,
+		shortLived,
+		longLived: conn.pending.size - shortLived,
+		oldest,
+	};
+}
 /**
  * Send an RPC to a device and await its terminal result. Rejects on timeout,
  * disconnect, or an abort signal (which also sends a cancel frame).
@@ -284,6 +331,10 @@ export function sendRpc(
 ): Promise<unknown> {
 	const conn = connections.get(deviceId);
 	if (!conn) return Promise.reject(new DeviceOfflineError(deviceId));
+	if (conn.transport.isOpen?.() === false) {
+		teardownConnection(deviceId, conn.transport);
+		return Promise.reject(new DeviceOfflineError(deviceId));
+	}
 	const connectionGeneration = ensureConnectionGeneration(conn);
 	if (
 		opts.expectedConnectionGeneration !== undefined &&
@@ -303,23 +354,47 @@ export function sendRpc(
 		}
 	}
 
+	if (opts.signal?.aborted) return Promise.reject(new Error("RPC aborted"));
+
 	if (!opts.longLived) {
-		const configuredMax = settings.devices?.maxConcurrentRpcPerDevice ?? 64;
-		const maxConcurrent = Math.max(1, Math.floor(configuredMax));
-		// Count only short-lived RPCs against the cap; long-lived ones (PTY) are
-		// tracked separately and must not exhaust the budget.
-		const shortLivedPending = [...conn.pending.values()].filter(
-			(pending) => !pending.longLived,
-		).length;
+		const maxConcurrent = rpcConcurrencyLimit();
+		let shortLivedPending = 0;
+		for (const pending of conn.pending.values()) if (!pending.longLived) shortLivedPending++;
 		if (shortLivedPending >= maxConcurrent) {
+			const rpc = rpcDiagnostics(conn);
+			const now = Date.now();
+			if (conn.lastRpcLimitLogAt === undefined || now - conn.lastRpcLimitLogAt >= 30_000) {
+				conn.lastRpcLimitLogAt = now;
+				logger.warn("Device RPC concurrency limit reached", {
+					deviceId,
+					generation: connectionGeneration,
+					rpc,
+				});
+			}
+			const summary = rpc.oldest
+				.map(
+					(call) =>
+						`${call.method} age=${call.ageMs ?? "unknown"}ms timeout=${call.timeoutMs ?? "unknown"}ms`,
+				)
+				.join(", ");
 			return Promise.reject(
-				new Error(`Device ${deviceId} RPC concurrency limit reached (${maxConcurrent})`),
+				new Error(
+					`Device ${deviceId} RPC concurrency limit reached (${maxConcurrent}); pending=${rpc.shortLived}; oldest: ${summary}`,
+				),
 			);
 		}
 	}
 
 	const id = `rpc_${conn.rpcSeq++}`;
-	const timeoutMs = opts.timeoutMs ?? settings.devices?.rpcTimeoutMs ?? 120_000;
+	const configuredTimeout = opts.timeoutMs ?? settings.devices?.rpcTimeoutMs;
+	// Never let NaN/Infinity or timer overflow silently turn a deadline into an
+	// unbounded wait (or a 1ms timeout). Long-lived calls opt out explicitly below.
+	const timeoutMs =
+		typeof configuredTimeout === "number" &&
+		Number.isFinite(configuredTimeout) &&
+		configuredTimeout > 0
+			? Math.min(2_147_483_647, Math.max(1, Math.floor(configuredTimeout)))
+			: 120_000;
 
 	return new Promise<unknown>((resolve, reject) => {
 		// Long-lived RPCs (PTY sessions) have no timeout — they end on kill/abort
@@ -338,6 +413,9 @@ export function sendRpc(
 			timer,
 			onStream: opts.onStream,
 			longLived: opts.longLived,
+			method,
+			startedAt: Date.now(),
+			timeoutMs: opts.longLived ? undefined : timeoutMs,
 		};
 		conn.pending.set(id, pending);
 		if (opts.longLived) conn.longLivedCount++;
@@ -370,10 +448,12 @@ export function sendRpc(
 function cleanupPending(conn: DeviceConnection, id: string): PendingRpc | undefined {
 	const pending = conn.pending.get(id);
 	if (!pending) return undefined;
-	if (pending.timer) clearTimeout(pending.timer);
-	pending.removeAbortListener?.();
-	if (pending.longLived) conn.longLivedCount = Math.max(0, conn.longLivedCount - 1);
 	conn.pending.delete(id);
+	if (pending.timer) clearTimeout(pending.timer);
+	pending.timer = null;
+	pending.removeAbortListener?.();
+	pending.removeAbortListener = undefined;
+	if (pending.longLived) conn.longLivedCount = Math.max(0, conn.longLivedCount - 1);
 	return pending;
 }
 
@@ -606,9 +686,18 @@ const wsTransportCache = new WeakMap<DeviceWS, DeviceTransport>();
 function wsTransport(ws: DeviceWS): DeviceTransport {
 	let t = wsTransportCache.get(ws);
 	if (!t) {
+		const send = (data: string | Uint8Array) => {
+			// Bun returns 0 for a dropped frame, -1 for an accepted/buffered frame.
+			// A dropped RPC must use the existing send-failure cleanup, not wait for
+			// a result from a request the executor never received.
+			if (ws.readyState !== 1 || ws.send(data) === 0) {
+				throw new Error("Device WebSocket frame was not accepted");
+			}
+		};
 		t = {
-			send: (data: string) => ws.send(data),
-			sendBinary: (data: Uint8Array) => ws.send(data),
+			send,
+			sendBinary: send,
+			isOpen: () => ws.readyState === 1,
 			bufferedAmount: () => {
 				try {
 					return (ws as unknown as { getBufferedAmount?: () => number }).getBufferedAmount?.() ?? 0;
@@ -853,6 +942,7 @@ export interface DeviceConnectionDiagnostics {
 	deviceId: string;
 	mode: "reverse" | "direct";
 	online: boolean;
+	rpc?: DeviceRpcDiagnostics;
 	stage:
 		| "ready"
 		| "waiting_for_executor"
@@ -936,6 +1026,7 @@ export async function getDeviceConnectionDiagnostics(
 			mode: row.connectionMode,
 			online: true,
 			stage: "ready",
+			rpc: rpcDiagnostics(conn),
 			directUrl: row.directUrl,
 			...persisted,
 			lastEventAt: conn.connectedAt,
@@ -1093,9 +1184,16 @@ async function dialDirect(state: DirectDialState): Promise<void> {
 	}
 	state.ws = ws;
 
+	const send = (data: string | ArrayBuffer) => {
+		if (ws.readyState !== WebSocket.OPEN) {
+			throw new Error("Device WebSocket frame was not accepted: socket is not open");
+		}
+		ws.send(data);
+	};
 	const transport: DeviceTransport = {
-		send: (data: string) => ws.send(data),
-		sendBinary: (data: Uint8Array) => ws.send(toArrayBuffer(data)),
+		send,
+		sendBinary: (data: Uint8Array) => send(toArrayBuffer(data)),
+		isOpen: () => ws.readyState === WebSocket.OPEN,
 		bufferedAmount: () => ws.bufferedAmount ?? 0,
 		close: (code: number, reason: string) => {
 			try {

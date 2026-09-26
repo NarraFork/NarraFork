@@ -91,6 +91,13 @@ export const browserTool: ToolDefinition = {
 		'- "perf_stop": Stop tracing and save trace data to a JSON file (returns file path). ' +
 		"The trace file is in Chrome DevTools Trace Event format — " +
 		"use grep/bash/python to analyze it, or open it in Chrome DevTools\n\n" +
+		"Native JavaScript dialogs (alert, confirm, prompt, beforeunload) are automatically dismissed " +
+		"to prevent blocking, including dialogs in newly opened windows. Confirm returns false and prompt returns null; " +
+		"business confirmations are never automatically accepted. Use get_console to inspect dialog messages and failures. " +
+		"A dialog left open while NarraFork was restarting can make that session unrecoverable; it is then closed " +
+		"and you are notified, so launch a new session. " +
+		"New windows do not automatically become the active page. HTML/DOM modals still require DOM inspection and click; " +
+		"OS file pickers and other browser permission dialogs are not handled by this policy.\n\n" +
 		"Network capture is OFF by default. Use network_start/network_stop to capture only when needed. " +
 		"If you need the initial page-load requests, set capture_network=true on launch.\n\n" +
 		"Parameters:\n" +
@@ -412,7 +419,7 @@ async function handleLaunch(
 	}
 
 	const session = await createSession(narratorId, url, headless, ttlMs, captureNetwork);
-	const title = await session.page.title();
+	const { title } = await actions.getPageSnapshot(session.page);
 
 	return {
 		output:

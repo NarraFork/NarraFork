@@ -261,7 +261,7 @@ const geminiProviderSchema = z.object({
 
 const searchChannelSchema = z.object({
 	id: z.string().min(1),
-	kind: z.enum(["native", "nug-mcp", "custom-api", "subagent"]),
+	kind: z.enum(["native", "nug-mcp", "custom-api", "subagent", "plugin"]),
 	enabled: z.boolean(),
 	providerId: z.string().optional(),
 	model: z.string().optional(),

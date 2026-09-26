@@ -12,6 +12,7 @@ import type {
 import { eventBus } from "../event-bus";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
+import { installDialogProtection } from "./dialogs";
 import { createContext, DEFAULT_VIEWPORT, USER_AGENT } from "./pool";
 import { redactHeaders, redactPostData, redactUrl } from "./redaction";
 import { serializeBrowserValue } from "./serialization";
@@ -435,6 +436,9 @@ export async function createSession(
 	attachNetworkListeners(page, session);
 
 	try {
+		await installDialogProtection(context, (text) => {
+			pushConsoleMessage(session, { type: "dialog", text });
+		});
 		await page.goto(url, { waitUntil: "domcontentloaded" });
 	} catch (err) {
 		await context.close().catch((closeErr) => {
@@ -739,6 +743,20 @@ export async function restoreSessionFromHandoff(
 	const context = browser.browserContexts().find((ctx) => ctx.id === handoff.contextId);
 	if (!context) return { ok: false, reason: "context_missing" };
 
+	// Rehydrating Page objects can itself wait on renderer commands behind an open dialog.
+	// Install at the target level first, retaining only a bounded diagnostic buffer until
+	// the session exists. A second install below redirects the sink without duplicating listeners.
+	const earlyDialogMessages: string[] = [];
+	try {
+		await installDialogProtection(context, (text) => {
+			earlyDialogMessages.push(text);
+			if (earlyDialogMessages.length > MAX_CONSOLE_MESSAGES) earlyDialogMessages.shift();
+		});
+	} catch (error) {
+		// A dialog opened while disconnected may belong to another CDP client. Chrome
+		// cannot replay that dialog to us: leave the context intact and fail promptly.
+		return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+	}
 	const pages = await context.pages();
 	// Prefer a page matching the captured URL; otherwise take the first available page.
 	const page = pages.find((p) => p.url() === handoff.currentPageUrl) ?? pages[0];
@@ -760,6 +778,10 @@ export async function restoreSessionFromHandoff(
 		networkRequests: [],
 		networkRequestMap: new WeakMap(),
 	};
+	for (const text of earlyDialogMessages) pushConsoleMessage(session, { type: "dialog", text });
+	await installDialogProtection(context, (text) => {
+		pushConsoleMessage(session, { type: "dialog", text });
+	});
 	attachConsoleListeners(page, session);
 	attachNetworkListeners(page, session);
 

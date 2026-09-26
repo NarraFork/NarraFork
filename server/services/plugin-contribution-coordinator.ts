@@ -379,10 +379,13 @@ export class PluginContributionCoordinator {
 		snapshot: PluginCatalogSnapshot,
 		options: PluginContributionCoordinatorRefreshOptions,
 	): Promise<PluginContributionCoordinatorReport> {
+		const prepared = await this.prepare(snapshot);
+		// Manifest I/O may span crash recovery or an explicit disable. Read lifecycle
+		// state afterwards so both the fingerprint and synchronous registry update
+		// reflect that transition instead of reapplying the pre-I/O state.
 		const states = [
 			...(await resolveStates(options.lifecycleStates ?? this.defaultLifecycleStates)),
 		];
-		const prepared = await this.prepare(snapshot);
 		const nextGenerations = new Map<string, string>();
 		for (const item of prepared) {
 			if (item.generation) nextGenerations.set(item.plugin.pluginId, item.generation);

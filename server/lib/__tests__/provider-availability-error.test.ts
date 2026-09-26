@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { ProviderRegistryError } from "../../services/plugin-provider-registry";
 import { isProviderUnavailableError } from "../provider-availability-error";
 
 describe("isProviderUnavailableError", () => {
@@ -35,6 +36,23 @@ describe("isProviderUnavailableError", () => {
 		const err = new Error("No default model is configured. Set agent.defaultModel in settings.");
 		err.name = "DefaultModelNotConfiguredError";
 		expect(isProviderUnavailableError(err)).toBe(true);
+	});
+
+	test("matches plugin provider registry errors by code, not wording", () => {
+		const unavailable = new ProviderRegistryError(
+			"PROVIDER_UNAVAILABLE",
+			"Provider plug is unavailable: runtime-crash",
+		);
+		expect(isProviderUnavailableError(unavailable)).toBe(true);
+		expect(
+			isProviderUnavailableError(
+				new ProviderRegistryError("PROVIDER_NOT_FOUND", "Provider is not registered: plug"),
+			),
+		).toBe(true);
+		// A catalog miss is a bad model id, handled elsewhere; not a provider outage.
+		expect(
+			isProviderUnavailableError(new ProviderRegistryError("MODEL_NOT_FOUND", "Model x missing")),
+		).toBe(false);
 	});
 
 	test("does not claim transient upstream failures, which must be retried instead", () => {

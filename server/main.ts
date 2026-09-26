@@ -134,12 +134,11 @@ import {
 	wsHandlers,
 } from "./websocket/ws-handler";
 
-// Register the optional executable-plugin provider bridge. Builtin and compatible-API
-// providers remain the fallback; an unavailable plugin provider returns null and
-// preserves the existing resolution error semantics.
-const unregisterExternalProviderResolver = registerExternalProviderResolver((_provider, model) => {
-	return pluginProviderRegistry.tryResolveProvider(model)?.adapter ?? null;
-});
+// Builtin/compatible-API providers are resolved first. Only an unregistered plugin
+// prefix may decline here; preserve registered providers' actual failure reasons.
+const unregisterExternalProviderResolver = registerExternalProviderResolver((provider, model) =>
+	pluginProviderRegistry.resolveExternalProvider(provider, model),
+);
 
 // Resolve any interrupted cross-store provider prefix migration before accepting requests.
 // A mismatched journal intentionally fails startup rather than serving mixed model references.

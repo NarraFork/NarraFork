@@ -1,7 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import type { MiddlewareHandler } from "hono";
 import { createPluginRoutes, type PluginManager } from "../../../server/routes/plugins";
-import type { PluginPermissionRequest } from "../../../server/services/plugin-permission-store";
+import type {
+	PluginPermanentDenial,
+	PluginPermissionRequest,
+} from "../../../server/services/plugin-permission-store";
 
 const allowAdmin: MiddlewareHandler = async (_c, next) => {
 	await next();
@@ -114,9 +117,26 @@ class PendingPermissionManager implements PluginManager {
 		return this.approveMutation;
 	}
 
-	async denyPermissionRequest(pluginId: string, requestId: string): Promise<boolean> {
-		this.calls.push({ method: "denyPermissionRequest", value: { pluginId, requestId } });
+	async denyPermissionRequest(
+		pluginId: string,
+		requestId: string,
+		options?: { permanent?: boolean; deniedBy?: string },
+	): Promise<boolean> {
+		this.calls.push({ method: "denyPermissionRequest", value: { pluginId, requestId, options } });
 		return this.denyResult;
+	}
+
+	denials: PluginPermanentDenial[] = [];
+	removeDenialResult = true;
+
+	async listPermanentDenials(pluginId: string): Promise<PluginPermanentDenial[]> {
+		this.calls.push({ method: "listPermanentDenials", value: pluginId });
+		return this.denials;
+	}
+
+	async removePermanentDenial(pluginId: string, capability: string, scope: unknown) {
+		this.calls.push({ method: "removePermanentDenial", value: { pluginId, capability, scope } });
+		return this.removeDenialResult;
 	}
 }
 
@@ -167,13 +187,108 @@ describe("plugin permission request routes", () => {
 			method: "POST",
 		});
 		expect(response.status).toBe(200);
-		expect(await response.json()).toEqual({ denied: true });
+		expect(await response.json()).toEqual({ denied: true, permanent: false });
 		expect(manager.calls).toEqual([
 			{
 				method: "denyPermissionRequest",
-				value: { pluginId: "com.example.demo", requestId: "req-1" },
+				value: {
+					pluginId: "com.example.demo",
+					requestId: "req-1",
+					options: { permanent: false, deniedBy: "admin" },
+				},
 			},
 		]);
+	});
+
+	it("denies a pending request permanently when the body asks for it", async () => {
+		const manager = new PendingPermissionManager();
+		const app = createApp(manager);
+		const response = await app.request("/com.example.demo/grants/requests/req-1/deny", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ permanent: true }),
+		});
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ denied: true, permanent: true });
+		const call = manager.calls.at(-1) as {
+			method: string;
+			value: { options: { permanent?: boolean; deniedBy?: string } };
+		};
+		expect(call.method).toBe("denyPermissionRequest");
+		expect(call.value.options).toEqual({ permanent: true, deniedBy: "admin" });
+	});
+
+	it("rejects an unexpected deny body shape with 400", async () => {
+		const manager = new PendingPermissionManager();
+		const app = createApp(manager);
+		const response = await app.request("/com.example.demo/grants/requests/req-1/deny", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ permanent: "yes" }),
+		});
+		expect(response.status).toBe(400);
+	});
+
+	it("lists permanent denials", async () => {
+		const manager = new PendingPermissionManager();
+		manager.denials = [
+			{
+				capability: "query.read.projects",
+				scope: { type: "global" },
+				deniedAt: "2026-07-18T00:00:00.000Z",
+			},
+		];
+		const app = createApp(manager);
+		const response = await app.request("/com.example.demo/grants/denials");
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ denials: manager.denials });
+		expect(manager.calls).toEqual([{ method: "listPermanentDenials", value: "com.example.demo" }]);
+	});
+
+	it("removes a permanent denial", async () => {
+		const manager = new PendingPermissionManager();
+		const app = createApp(manager);
+		const response = await app.request("/com.example.demo/grants/denials/remove", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ capability: "query.read.projects", scope: { type: "global" } }),
+		});
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ removed: true });
+		expect(manager.calls).toEqual([
+			{
+				method: "removePermanentDenial",
+				value: {
+					pluginId: "com.example.demo",
+					capability: "query.read.projects",
+					scope: { type: "global" },
+				},
+			},
+		]);
+	});
+
+	it("rejects a malformed denial removal body with 400", async () => {
+		const app = createApp(new PendingPermissionManager());
+		const response = await app.request("/com.example.demo/grants/denials/remove", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ capability: "", scope: { type: "global" } }),
+		});
+		expect(response.status).toBe(400);
+	});
+
+	it("blocks non-admins from the denials endpoints with 403", async () => {
+		const app = createApp(new PendingPermissionManager(), denyAdmin);
+		expect((await app.request("/com.example.demo/grants/denials")).status).toBe(403);
+		expect(
+			(
+				await app.request("/com.example.demo/grants/denials/remove", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ capability: "query.read.projects", scope: { type: "global" } }),
+				})
+			).status,
+		).toBe(403);
 	});
 
 	it("returns 404 when the deny mutation reports the request is gone", async () => {

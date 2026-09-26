@@ -13,20 +13,17 @@ import {
 	Text,
 	TextInput,
 	Title,
-	Tooltip,
 } from "@mantine/core";
 import {
 	IconAlertCircle,
-	IconAlertTriangle,
 	IconArrowLeft,
-	IconCheck,
+	IconBan,
 	IconPlayerPlay,
 	IconPlugConnected,
 	IconPlugConnectedX,
 	IconPlus,
 	IconRefresh,
 	IconTrash,
-	IconX,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
@@ -34,6 +31,10 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
 import { isPluginsDisabledError, localizePluginError } from "../../components/plugins-admin/errors";
+import {
+	HighRiskWarning,
+	PendingRequestRow,
+} from "../../components/plugins-admin/PendingRequestRow";
 import { PluginDiagnosticsPanel } from "../../components/plugins-admin/PluginDiagnosticsPanel";
 import { PluginProviderConfigPanel } from "../../components/plugins-admin/PluginProviderConfigPanel";
 import { PluginSettingsSurfacePanel } from "../../components/plugins-admin/PluginSettingsSurfacePanel";
@@ -47,6 +48,7 @@ import {
 	usePlugin,
 	usePluginDiagnostics,
 	usePluginGrants,
+	usePluginPermanentDenials,
 	usePluginPermissionRequests,
 	useRetryPlugin,
 	useUninstallPlugin,
@@ -193,29 +195,6 @@ function ContributionsTab({ plugin }: { plugin: PluginDetail }) {
 	);
 }
 
-// Capabilities that carry meaningful host-security implications and warrant an
-// inline warning. Shown both when approving a pending request and when the
-// manifest declares a capability that is not yet granted.
-const HIGH_RISK_CAPABILITIES: Record<string, string> = {
-	"network.egress.allowlist": "highRiskNetworkEgressAllowlist",
-};
-
-function HighRiskWarning({ capability }: { capability: string }) {
-	const { t } = useTranslation("plugins");
-	const key = HIGH_RISK_CAPABILITIES[capability];
-	if (!key) return null;
-	const label = t(`admin.detail.grants.highRisk.${key}`);
-	return (
-		<Tooltip label={label} multiline w={320} withArrow>
-			<IconAlertTriangle
-				size={15}
-				color="var(--mantine-color-orange-5)"
-				style={{ flexShrink: 0, cursor: "help" }}
-			/>
-		</Tooltip>
-	);
-}
-
 function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 	const { t } = useTranslation("plugins");
 	const confirm = useConfirmDialog();
@@ -232,13 +211,18 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 	// panel stays live without manual refreshes.
 	const grantsQuery = usePluginGrants(plugin.pluginId);
 	const pendingQuery = usePluginPermissionRequests(plugin.pluginId);
+	const denialsQuery = usePluginPermanentDenials(plugin.pluginId);
 	const set = grantsQuery.data ?? null;
 	const pendingRequests = pendingQuery.data ?? [];
+	const permanentDenials = denialsQuery.data ?? [];
 
 	const invalidateGrants = () => {
 		void queryClient.invalidateQueries({ queryKey: pluginKeys.grants(plugin.pluginId) });
 		void queryClient.invalidateQueries({
 			queryKey: pluginKeys.permissionRequests(plugin.pluginId),
+		});
+		void queryClient.invalidateQueries({
+			queryKey: pluginKeys.permanentDenials(plugin.pluginId),
 		});
 	};
 
@@ -312,6 +296,30 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 		setBusy(true);
 		try {
 			await pluginsApi.denyGrantRequest(plugin.pluginId, requestId);
+			invalidateGrants();
+		} catch (err) {
+			setError(localizePluginError(err, t));
+		} finally {
+			setBusy(false);
+		}
+	};
+
+	const denyPendingPermanent = async (requestId: string) => {
+		setBusy(true);
+		try {
+			await pluginsApi.denyGrantRequest(plugin.pluginId, requestId, { permanent: true });
+			invalidateGrants();
+		} catch (err) {
+			setError(localizePluginError(err, t));
+		} finally {
+			setBusy(false);
+		}
+	};
+
+	const removeDenial = async (capability: string, scope: { type: string; id?: string }) => {
+		setBusy(true);
+		try {
+			await pluginsApi.removePermanentDenial(plugin.pluginId, { capability, scope });
 			invalidateGrants();
 		} catch (err) {
 			setError(localizePluginError(err, t));
@@ -426,56 +434,62 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 							</Text>
 						)}
 						{pendingRequests.map((req) => (
-							<Paper key={req.requestId} withBorder p="xs" radius="md">
+							<PendingRequestRow
+								key={req.requestId}
+								request={req}
+								busy={busy}
+								onApprove={(requestId) => void approvePending(requestId)}
+								onDeny={(requestId) => void denyPending(requestId)}
+								onDenyPermanent={(requestId) => void denyPendingPermanent(requestId)}
+							/>
+						))}
+					</Stack>
+				</Paper>
+			)}
+			{permanentDenials.length > 0 && (
+				<Paper withBorder p="md" radius="md">
+					<Stack gap="xs">
+						<Group gap="xs" align="center">
+							<Text fw={600} size="sm">
+								{t("admin.detail.grants.denialsTitle")}
+							</Text>
+							<Badge color="red" variant="filled" size="sm">
+								{permanentDenials.length}
+							</Badge>
+						</Group>
+						<Text size="xs" c="dimmed">
+							{t("admin.detail.grants.denialsHint")}
+						</Text>
+						{permanentDenials.map((denial) => (
+							<Paper
+								key={`${denial.capability}:${JSON.stringify(denial.scope)}`}
+								withBorder
+								p="xs"
+								radius="md"
+							>
 								<Group justify="space-between" wrap="nowrap">
 									<Group gap="sm" wrap="wrap">
 										<Badge color="indigo" variant="light" size="sm">
-											{req.capability}
+											{denial.capability}
 										</Badge>
 										<Badge color="gray" variant="light" size="sm">
-											{req.scope.type}
-											{req.scope.id ? `:${req.scope.id}` : ""}
+											{denial.scope.type}
+											{denial.scope.id ? `:${denial.scope.id}` : ""}
 										</Badge>
-										{req.source === "upgrade" ? (
-											<Badge color="yellow" variant="light" size="sm">
-												{req.requestedForVersion
-													? t("admin.detail.grants.pendingSourceUpgradeVersion", {
-															version: req.requestedForVersion,
-														})
-													: t("admin.detail.grants.pendingSourceUpgrade")}
-											</Badge>
-										) : (
-											<Badge color="blue" variant="light" size="sm">
-												{t("admin.detail.grants.pendingSourceRuntime")}
-											</Badge>
-										)}
-										<HighRiskWarning capability={req.capability} />
 										<Text size="xs" c="dimmed">
-											{formatLocaleDateTime(req.requestedAt)}
+											{formatLocaleDateTime(denial.deniedAt)}
 										</Text>
 									</Group>
-									<Group gap="xs" wrap="nowrap">
-										<Button
-											size="compact-xs"
-											variant="light"
-											color="green"
-											leftSection={<IconCheck size={14} />}
-											onClick={() => void approvePending(req.requestId)}
-											disabled={busy}
-										>
-											{t("admin.detail.grants.approve")}
-										</Button>
-										<Button
-											size="compact-xs"
-											variant="light"
-											color="red"
-											leftSection={<IconX size={14} />}
-											onClick={() => void denyPending(req.requestId)}
-											disabled={busy}
-										>
-											{t("admin.detail.grants.deny")}
-										</Button>
-									</Group>
+									<Button
+										size="compact-xs"
+										variant="light"
+										color="gray"
+										leftSection={<IconBan size={14} />}
+										onClick={() => void removeDenial(denial.capability, denial.scope)}
+										disabled={busy}
+									>
+										{t("admin.detail.grants.undeny")}
+									</Button>
 								</Group>
 							</Paper>
 						))}

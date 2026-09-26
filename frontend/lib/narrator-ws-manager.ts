@@ -1484,6 +1484,7 @@ export class NarratorWSManager {
 								requestId: typeof data.requestId === "string" ? data.requestId : undefined,
 								capability: typeof data.capability === "string" ? data.capability : undefined,
 								status: typeof data.status === "string" ? data.status : undefined,
+								source: typeof data.source === "string" ? data.source : undefined,
 							},
 						}),
 					);

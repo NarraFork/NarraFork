@@ -220,6 +220,69 @@ describe("provider contribution sync", () => {
 		expect(enabled.status).toBe("available");
 	});
 
+	test.each([
+		"active",
+		"disabled",
+	] as const)("uses lifecycle state after manifest loading when it changes to %s", async (nextState) => {
+		const manifest = parseManifest(manifestInput());
+		const providerRegistry = new PluginProviderRegistry();
+		let states: readonly PluginContributionLifecycleState[] = lifecycle("enabled");
+		let blockLoad = false;
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const coordinator = new PluginContributionCoordinator({
+			contributionRegistry: new PluginContributionRegistry(),
+			toolRegistry: new PluginToolRegistry({
+				capabilityBroker: { authorize: async () => ({ allowed: true as const }) },
+			}),
+			providerRegistry,
+			lifecycleStates: () => states,
+			manifestLoader: async () => {
+				if (blockLoad) {
+					entered.resolve();
+					await release.promise;
+				}
+				return manifest;
+			},
+		});
+		await coordinator.initialize(snapshotFor(manifest));
+		states = [
+			{
+				...lifecycle("enabled")[0],
+				runtimeState: nextState === "active" ? "failed" : "active",
+			},
+		];
+		blockLoad = true;
+		const refreshing = coordinator.refresh(snapshotFor(manifest), { force: true });
+		try {
+			await entered.promise;
+			states = [
+				{
+					...lifecycle(nextState === "disabled" ? "disabled" : "enabled")[0],
+					runtimeState: "active",
+				},
+			];
+			// Mirrors active recovery while the older refresh is awaiting disk I/O.
+			if (nextState === "active") providerRegistry.enablePlugin(pluginId);
+			else providerRegistry.disablePlugin(pluginId);
+		} finally {
+			release.resolve();
+		}
+		await refreshing;
+		const [entry] = pluginEntries(providerRegistry);
+		if (nextState === "active") {
+			expect(entry.status).toBe("available");
+			expect(
+				providerRegistry.resolveProvider("demo:demo/base", { createAdapter: false }).modelId,
+			).toBe("demo/base");
+		} else {
+			expect(entry.status).toBe("unavailable");
+			expect(entry.unavailableReason).toBe("Plugin is disabled");
+		}
+		// The stored fingerprint must use the same latest state as availability.
+		expect((await coordinator.refresh(snapshotFor(manifest))).changed).toBe(false);
+	});
+
 	test("marks providers unavailable when the manifest cannot be loaded", async () => {
 		const manifest = parseManifest(manifestInput());
 		const providerRegistry = new PluginProviderRegistry();

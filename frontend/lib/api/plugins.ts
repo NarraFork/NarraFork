@@ -123,6 +123,18 @@ export interface PluginPermissionRequestSummary {
 	resolvedAt?: string;
 }
 
+/**
+ * A "deny permanently, never ask again" record. The pair is never queued as a
+ * pending request while the denial stands; an admin can lift it from the grants
+ * panel. Not a revocation — existing grants keep working.
+ */
+export interface PluginPermanentDenial {
+	capability: string;
+	scope: { type: string; id?: string };
+	deniedAt: string;
+	deniedBy?: string;
+}
+
 export interface PluginRuntimeDiagnostics {
 	runtimeId?: string;
 	generation?: number;
@@ -402,12 +414,24 @@ export const pluginsApi = {
 			`${pluginPath(pluginId)}/grants/requests/${encodeURIComponent(requestId)}/approve`,
 			{ method: "POST" },
 		),
-	/** Deny a pending runtime permission request (admin). */
-	denyGrantRequest: (pluginId: string, requestId: string) =>
-		request<{ denied: boolean }>(
+	/** Deny a pending runtime permission request (admin). `permanent` also records "never ask again". */
+	denyGrantRequest: (pluginId: string, requestId: string, options?: { permanent?: boolean }) =>
+		request<{ denied: boolean; permanent?: boolean }>(
 			`${pluginPath(pluginId)}/grants/requests/${encodeURIComponent(requestId)}/deny`,
-			{ method: "POST" },
+			{ method: "POST", body: JSON.stringify({ permanent: options?.permanent ?? false }) },
 		),
+	/** List permanent ("never ask again") denials for a plugin (admin). */
+	listPermanentDenials: (pluginId: string) =>
+		request<{ denials: PluginPermanentDenial[] }>(`${pluginPath(pluginId)}/grants/denials`),
+	/** Lift a permanent denial so the plugin may request the pair again (admin). */
+	removePermanentDenial: (
+		pluginId: string,
+		input: { capability: string; scope: { type: string; id?: string } },
+	) =>
+		request<{ removed: boolean }>(`${pluginPath(pluginId)}/grants/denials/remove`, {
+			method: "POST",
+			body: JSON.stringify(input),
+		}),
 };
 
 /** Normalize the list payload (server may return a bare array or an envelope). */

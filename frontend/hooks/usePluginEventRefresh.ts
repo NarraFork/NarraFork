@@ -33,6 +33,9 @@ export function usePluginEventRefresh(): void {
 					queryKey: pluginKeys.permissionRequests(detail.pluginId),
 				});
 				void queryClient.invalidateQueries({
+					queryKey: pluginKeys.permanentDenials(detail.pluginId),
+				});
+				void queryClient.invalidateQueries({
 					queryKey: pluginKeys.grants(detail.pluginId),
 				});
 			}

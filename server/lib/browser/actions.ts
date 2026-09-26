@@ -11,6 +11,8 @@ import { drainConsoleCaptures, touchSession, touchSessionVisual } from "./sessio
 
 const DEFAULT_MAX_LENGTH = 20_000;
 const DEFAULT_ACTION_TIMEOUT = 10_000;
+// Title is optional metadata: do not let it hold already-collected diagnostics hostage.
+const SNAPSHOT_TITLE_TIMEOUT_MS = 1_000;
 /**
  * Per-attempt budget for `Page.captureScreenshot`. Chrome can wedge this command indefinitely
  * (occluded/minimized headed window, lost GPU surface, crashed target). Without an explicit
@@ -26,11 +28,20 @@ export interface PageSnapshot {
 	title: string;
 }
 
-async function snapshot(page: Page): Promise<PageSnapshot> {
-	return {
-		url: page.url(),
-		title: await page.title(),
-	};
+/** Best-effort metadata with a bounded title wait, also shared by browser launch. */
+export async function getPageSnapshot(page: Page): Promise<PageSnapshot> {
+	const url = page.url();
+	try {
+		// This bounds our wait, not the underlying CDP command. Do not retry a stalled title.
+		const title = await runWithTimeout(page.title(), {
+			timeout: SNAPSHOT_TITLE_TIMEOUT_MS,
+			label: "Browser snapshot title",
+		});
+		return { url, title };
+	} catch (err) {
+		logger.warn("Browser snapshot title unavailable", { error: errorToMessage(err) });
+		return { url, title: "[Title unavailable]" };
+	}
 }
 
 function formatConsoleLocation(message: BrowserConsoleMessage): string {
@@ -178,7 +189,7 @@ export async function navigate(
 		await page.goto(opts.url, { waitUntil: "domcontentloaded" });
 	}
 
-	return { snapshot: await snapshot(page) };
+	return { snapshot: await getPageSnapshot(page) };
 }
 
 /** Click an element by selector. */
@@ -208,7 +219,7 @@ export async function click(
 	// full navigation).
 	await Promise.race([navPromise, new Promise((r) => setTimeout(r, 500))]);
 
-	return { snapshot: await snapshot(page) };
+	return { snapshot: await getPageSnapshot(page) };
 }
 
 /** Fill a form field. */
@@ -227,7 +238,7 @@ export async function fill(
 	await session.page.keyboard.up("Control");
 	await session.page.keyboard.press("Backspace");
 	await session.page.type(selector, value, { delay: 20 });
-	return { snapshot: await snapshot(session.page) };
+	return { snapshot: await getPageSnapshot(session.page) };
 }
 
 /** Select an option from a <select> element. */
@@ -239,7 +250,7 @@ export async function select(
 ): Promise<{ snapshot: PageSnapshot }> {
 	touchSessionVisual(session);
 	await session.page.select(selector, value);
-	return { snapshot: await snapshot(session.page) };
+	return { snapshot: await getPageSnapshot(session.page) };
 }
 
 /** Type text or press special keys. */
@@ -265,7 +276,7 @@ export async function type(
 		}
 	}
 
-	return { snapshot: await snapshot(page) };
+	return { snapshot: await getPageSnapshot(page) };
 }
 
 /** Hover over an element. */
@@ -276,7 +287,7 @@ export async function hover(
 ): Promise<{ snapshot: PageSnapshot }> {
 	touchSessionVisual(session);
 	await session.page.hover(selector);
-	return { snapshot: await snapshot(session.page) };
+	return { snapshot: await getPageSnapshot(session.page) };
 }
 
 /** In-flight capture per session, so concurrent callers share one Chrome round-trip. */
@@ -424,7 +435,7 @@ export async function getText(
 		text = `${text.slice(0, maxLength)}\n\n[Text truncated at ${maxLength} characters]`;
 	}
 
-	return { text, snapshot: await snapshot(session.page) };
+	return { text, snapshot: await getPageSnapshot(session.page) };
 }
 
 /** Get an attribute value of an element. */
@@ -438,7 +449,7 @@ export async function getAttribute(
 	const value = await session.page
 		.$eval(selector, (el, attr) => el.getAttribute(attr), attribute)
 		.catch(() => null);
-	return { value, snapshot: await snapshot(session.page) };
+	return { value, snapshot: await getPageSnapshot(session.page) };
 }
 
 /** Get captured console output and page errors. */
@@ -459,7 +470,7 @@ export async function getConsole(
 	return {
 		output,
 		count,
-		snapshot: await snapshot(session.page),
+		snapshot: await getPageSnapshot(session.page),
 	};
 }
 
@@ -510,7 +521,7 @@ export async function getNetwork(
 		output,
 		count,
 		totalCount,
-		snapshot: await snapshot(session.page),
+		snapshot: await getPageSnapshot(session.page),
 	};
 }
 
@@ -546,7 +557,7 @@ export async function evaluate(
 	});
 	const result = clipOutput(serializeBrowserValue(raw, { pretty: true }), maxLength, "Output");
 
-	return { result, snapshot: await snapshot(session.page) };
+	return { result, snapshot: await getPageSnapshot(session.page) };
 }
 
 export interface EvaluateCaptureResult {
@@ -612,7 +623,7 @@ export async function evaluateCapture(
 		result,
 		consoleOutput,
 		consoleCount: capturedMessages.length,
-		snapshot: await snapshot(session.page),
+		snapshot: await getPageSnapshot(session.page),
 		durationMs: Date.now() - startedAt,
 		isError,
 		...(error ? { error } : {}),
@@ -641,7 +652,7 @@ export async function wait(
 		await new Promise((r) => setTimeout(r, timeout));
 	}
 
-	return { snapshot: await snapshot(session.page) };
+	return { snapshot: await getPageSnapshot(session.page) };
 }
 
 /** Scroll the page. */
@@ -668,7 +679,7 @@ export async function scroll(
 		await page.mouse.wheel({ deltaY });
 	}
 
-	return { snapshot: await snapshot(page) };
+	return { snapshot: await getPageSnapshot(page) };
 }
 
 // ── Performance tracing ──
@@ -746,5 +757,5 @@ export async function getDom(
 		cleaned = `${cleaned.slice(0, maxLength)}\n\n[DOM truncated at ${maxLength} characters]`;
 	}
 
-	return { dom: cleaned, snapshot: await snapshot(page) };
+	return { dom: cleaned, snapshot: await getPageSnapshot(page) };
 }

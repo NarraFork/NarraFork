@@ -1013,6 +1013,9 @@ describe("OAuth remote runtime permission constraints", () => {
 		toolInput: Record<string, unknown>;
 		backend?: ExecutionBackend;
 		target?: ToolExecutionTarget;
+		signal?: AbortSignal;
+		directoryRules?: string[];
+		reviewReadOnlyBash?: boolean;
 		constraint?: {
 			permissionMode: "readOnly" | "dontAsk" | "bypassPermissions";
 			allowKnowledgeWrite: boolean;
@@ -1038,6 +1041,19 @@ describe("OAuth remote runtime permission constraints", () => {
 			toolName: input.toolName,
 			input: input.toolInput,
 		});
+		if (input.directoryRules?.length) {
+			await db.insert(narratorBlacklistDirs).values(
+				input.directoryRules.map((path, index) => ({
+					id: `probe-rule-${input.label}-${index}`,
+					narratorId,
+					path,
+					denyLevel: "denyAll" as const,
+					enabled: true,
+					targetKind: "all" as const,
+					createdAt: now(),
+				})),
+			);
+		}
 		const target =
 			input.target ??
 			frozenTarget(backend, {
@@ -1046,7 +1062,7 @@ describe("OAuth remote runtime permission constraints", () => {
 			});
 		return handlePermission(
 			narratorId,
-			new AbortController().signal,
+			input.signal ?? new AbortController().signal,
 			input.toolName,
 			input.toolInput,
 			toolUseId,
@@ -1065,7 +1081,165 @@ describe("OAuth remote runtime permission constraints", () => {
 				oauthClientId: "oauth-runtime-client",
 				grantId: "oauth-runtime-grant",
 			},
+			input.reviewReadOnlyBash,
 		);
+	}
+
+	test("Bash stop remains available when remote policy metadata is unavailable", async () => {
+		let probes = 0;
+		const base = makeRemoteRuntimeBackend();
+		const backend: ExecutionBackend = {
+			...base,
+			resolvePathIdentity: async () => {
+				probes++;
+				throw new Error("Device RPC concurrency limit reached (16)");
+			},
+		};
+		const result = await evaluate({
+			label: "stop-with-full-rpc-budget",
+			toolName: "Bash",
+			toolInput: { stop: "owned-task" },
+			backend,
+			directoryRules: ["/restricted"],
+		});
+		expect(result).toMatchObject({ behavior: "allow" });
+		expect(probes).toBe(0);
+	});
+	test("review Bash still rejects stop without probing remote directory rules", async () => {
+		let probes = 0;
+		const backend: ExecutionBackend = {
+			...makeRemoteRuntimeBackend(),
+			resolvePathIdentity: async () => {
+				probes++;
+				throw new Error("metadata unavailable");
+			},
+		};
+		const result = await evaluate({
+			label: "review-stop-with-full-rpc-budget",
+			toolName: "Bash",
+			toolInput: { stop: "owned-task" },
+			backend,
+			directoryRules: ["/restricted"],
+			reviewReadOnlyBash: true,
+		});
+		expect(result).toMatchObject({
+			behavior: "deny",
+			message: expect.stringContaining("Review Bash"),
+		});
+		expect(probes).toBe(0);
+	});
+	test("real Bash analysis deduplicates repeated operands and bounds large remote batches", async () => {
+		for (const repeated of [true, false]) {
+			const base = makeRemoteRuntimeBackend();
+			let active = 0;
+			let peak = 0;
+			let calls = 0;
+			const backend: ExecutionBackend = {
+				...base,
+				resolvePathIdentity: async (path, options) => {
+					calls++;
+					active++;
+					peak = Math.max(peak, active);
+					try {
+						expect(options?.signal).toBeDefined();
+						await new Promise<void>((resolve) => setImmediate(resolve));
+						return await base.resolvePathIdentity(path, options);
+					} finally {
+						active--;
+					}
+				},
+			};
+			const operands = Array.from({ length: 24 }, (_, i) => (repeated ? "." : `file-${i}`));
+			expect(
+				await evaluate({
+					label: repeated ? "repeated-path-probes" : "many-path-probes",
+					toolName: "Bash",
+					toolInput: { command: `ls ${operands.join(" ")}` },
+					backend,
+				}),
+			).toMatchObject({ behavior: "allow" });
+			expect(calls).toBe(repeated ? 1 : 24);
+			expect(peak).toBeLessThanOrEqual(4);
+			expect(active).toBe(0);
+		}
+	});
+
+	for (const failure of ["rpc", "generation", "abort", "compile-abort"] as const) {
+		test(`real Bash permission ${failure} failure denies and drains active metadata probes`, async () => {
+			const base = makeRemoteRuntimeBackend();
+			const owner = new AbortController();
+			let active = 0;
+			const probes: Array<{ signal?: AbortSignal; fail: (reason: unknown) => void }> = [];
+			const backend: ExecutionBackend = {
+				...base,
+				resolvePathIdentity: (path, options) => {
+					active++;
+					const first = probes.length === 0;
+					return new Promise((resolve, reject) => {
+						let settled = false;
+						const finish = (complete: () => void) => {
+							if (settled) return;
+							settled = true;
+							active--;
+							options?.signal?.removeEventListener("abort", abort);
+							complete();
+						};
+						const fail = (reason: unknown) => finish(() => reject(reason));
+						const abort = () => fail(options?.signal?.reason);
+						probes.push({ signal: options?.signal, fail });
+						options?.signal?.addEventListener("abort", abort, { once: true });
+						if (first)
+							queueMicrotask(() => {
+								if (failure === "abort" || failure === "compile-abort")
+									owner.abort(new Error("permission interrupted"));
+								else if (failure === "rpc") fail(new Error("metadata unavailable"));
+								else
+									finish(() =>
+										resolve({
+											lexicalPath: path,
+											canonicalPath: path,
+											exists: true,
+											runtimeGeneration: 2,
+										}),
+									);
+							});
+					});
+				},
+			};
+			const result = evaluate({
+				label: `failed-path-probes-${failure}`,
+				toolName: "Bash",
+				toolInput: {
+					command:
+						failure === "compile-abort"
+							? "pwd"
+							: `ls ${Array.from({ length: 24 }, (_, i) => `file-${i}`).join(" ")}`,
+				},
+				backend,
+				signal: owner.signal,
+				directoryRules:
+					failure === "compile-abort"
+						? Array.from({ length: 24 }, (_, i) => `/remote/forbidden-${i}`)
+						: undefined,
+			});
+			void result.catch(() => {});
+			try {
+				await waitFor(() => probes.length > 0);
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(active).toBe(0);
+				expect(probes.length).toBeLessThanOrEqual(4);
+				expect(probes.every((probe) => probe.signal?.aborted)).toBe(true);
+				expect(await result).toMatchObject({ behavior: "deny" });
+				if (failure === "compile-abort") {
+					expect(await result).toMatchObject({
+						message: "Execution policy compilation failed: permission interrupted",
+					});
+				}
+			} finally {
+				for (const probe of probes) probe.fail(new Error("test cleanup"));
+				await result.catch(() => {});
+			}
+		});
 	}
 
 	test("uses the frozen remote platform and fails closed for read-only shell", async () => {

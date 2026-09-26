@@ -138,6 +138,8 @@ interface PermissionInstallationDocument {
 	grants: StoredPermissionGrant[];
 	/** Runtime permission prompts awaiting user resolution (capability not yet granted). */
 	pendingRequests: PluginPermissionRequest[];
+	/** "Deny and never ask again" records; matched requests are never queued. */
+	permanentDenials: PluginPermanentDenial[];
 	updatedAt: string;
 }
 
@@ -172,6 +174,27 @@ export interface PluginPermissionRequest {
 	requestedForVersion?: string;
 	status: "pending" | "granted" | "denied";
 	resolvedAt?: string;
+}
+
+/**
+ * A "deny permanently, never ask again" decision for a (capability, scope) pair.
+ *
+ * Unlike a plain denial — which resolves only the one pending row and lets the
+ * plugin re-ask on its next call — a permanent denial makes `addPendingRequest`
+ * refuse to queue the pair at all, so neither the grant panel nor the global
+ * prompt is raised again. It is NOT a grant revocation: existing grants keep
+ * working. Removable by an admin when the decision should be revisited.
+ */
+export interface PluginPermanentDenial {
+	capability: string;
+	scope: PermissionScope;
+	deniedAt: string;
+	deniedBy?: string;
+}
+
+/** Identity key shared by pending-request dedupe and permanent-denial matching. */
+function permissionPairKey(capability: string, scope: PermissionScope): string {
+	return `${capability}${JSON.stringify(scope)}`;
 }
 
 interface PermissionFileDocument {
@@ -384,6 +407,29 @@ function parsePendingRequest(value: unknown): PluginPermissionRequest {
 	};
 }
 
+function parsePermanentDenial(value: unknown): PluginPermanentDenial {
+	if (!isRecord(value)) throw new ValidationError("Permanent permission denial is invalid");
+	const capabilityParsed = capabilitySchema.safeParse(value.capability);
+	if (!capabilityParsed.success)
+		throw new ValidationError("Permanent permission denial capability is invalid");
+	const scopeParsed = permissionScopeSchema.safeParse(value.scope);
+	if (!scopeParsed.success)
+		throw new ValidationError("Permanent permission denial scope is invalid");
+	if (!isIsoDate(value.deniedAt))
+		throw new ValidationError("Permanent permission denial timestamp is invalid");
+	if (
+		value.deniedBy !== undefined &&
+		(typeof value.deniedBy !== "string" || !identifierSchema.safeParse(value.deniedBy).success)
+	)
+		throw new ValidationError("Permanent permission denial actor is invalid");
+	return {
+		capability: capabilityParsed.data,
+		scope: scopeParsed.data,
+		deniedAt: value.deniedAt,
+		deniedBy: value.deniedBy as string | undefined,
+	};
+}
+
 function parseInstallation(
 	pluginId: string,
 	installationId: string,
@@ -417,12 +463,25 @@ function parseInstallation(
 	if (new Set(pendingRequests.map((r) => r.requestId)).size !== pendingRequests.length) {
 		throw new ValidationError("Stored plugin pending request ids must be unique");
 	}
+	// Absent in files written before permanent denials existed — treat as none.
+	const rawDenials = Array.isArray(value.permanentDenials) ? value.permanentDenials : [];
+	if (rawDenials.length > limits.maxGrantsPerInstallation) {
+		throw new ValidationError("Stored plugin permanent denials list is invalid");
+	}
+	const permanentDenials = rawDenials.map((raw) => parsePermanentDenial(raw));
+	if (
+		new Set(permanentDenials.map((d) => permissionPairKey(d.capability, d.scope))).size !==
+		permanentDenials.length
+	) {
+		throw new ValidationError("Stored plugin permanent denials must be unique");
+	}
 	return {
 		pluginId,
 		installationId,
 		revision: parsedRevision.data,
 		grants,
 		pendingRequests,
+		permanentDenials,
 		updatedAt: value.updatedAt,
 	};
 }
@@ -646,6 +705,7 @@ export class PluginPermissionStore {
 					installationId,
 				})),
 				pendingRequests: clone(source?.pendingRequests ?? []),
+				permanentDenials: clone(source?.permanentDenials ?? []),
 				updatedAt,
 			};
 			const candidate = clone(document);
@@ -733,6 +793,7 @@ export class PluginPermissionStore {
 				revision: nextRevision,
 				grants: normalized.map((grant) => ({ ...grant, revision: nextRevision })),
 				pendingRequests: clone(current?.pendingRequests ?? []),
+				permanentDenials: clone(current?.permanentDenials ?? []),
 				updatedAt: this.timestamp(),
 			};
 			const candidate = clone(this.requireDocument());
@@ -893,6 +954,12 @@ export class PluginPermissionStore {
 		return clone((doc.pendingRequests ?? []).filter((r) => r.status === "pending"));
 	}
 
+	/**
+	 * Queue a permission prompt, or return `undefined` when the (capability, scope)
+	 * pair is permanently denied — "never ask again" means exactly that, so no row
+	 * is written and no UI prompt is raised. An existing pending row for the same
+	 * pair is returned unchanged (idempotent).
+	 */
 	async addPendingRequest(
 		pluginId: string,
 		installationId: string,
@@ -903,7 +970,7 @@ export class PluginPermissionStore {
 			source?: PluginPermissionRequestSource;
 			requestedForVersion?: string;
 		},
-	): Promise<PluginPermissionRequest> {
+	): Promise<PluginPermissionRequest | undefined> {
 		assertPluginIdentity(pluginId, installationId);
 		const capabilityResult = capabilitySchema.safeParse(input.capability);
 		if (!capabilityResult.success) throw new ValidationError("Invalid capability");
@@ -917,6 +984,17 @@ export class PluginPermissionStore {
 			const document = this.requireDocument();
 			const doc = document.plugins[pluginId]?.[installationId];
 			const existingRequests: PluginPermissionRequest[] = doc?.pendingRequests ?? [];
+			const pairKey = permissionPairKey(input.capability, input.scope);
+
+			// A permanent denial wins over everything, including a still-pending row
+			// (reachable only if the denial was recorded out of band). No prompt, no row.
+			if (
+				(doc?.permanentDenials ?? []).some(
+					(denial) => permissionPairKey(denial.capability, denial.scope) === pairKey,
+				)
+			) {
+				return undefined;
+			}
 
 			// Idempotent: same capability + scope with pending status → return existing.
 			// This deliberately ignores `source`: one pending request per (capability, scope)
@@ -925,10 +1003,7 @@ export class PluginPermissionStore {
 			// duplicate rows, and a capability already queued by a runtime call is not
 			// queued twice because the new manifest also declares it.
 			const existing = existingRequests.find(
-				(r) =>
-					r.capability === input.capability &&
-					JSON.stringify(r.scope) === JSON.stringify(input.scope) &&
-					r.status === "pending",
+				(r) => permissionPairKey(r.capability, r.scope) === pairKey && r.status === "pending",
 			);
 			if (existing) return clone(existing);
 
@@ -958,15 +1033,16 @@ export class PluginPermissionStore {
 					pendingRequests: [...(current.pendingRequests ?? []), request],
 					updatedAt: this.timestamp(),
 				};
-				candidate.plugins[pluginId]![installationId] = updated;
+				candidate.plugins[pluginId][installationId] = updated;
 			} else {
 				const revision = this.pluginRevision(pluginId, document);
-				candidate.plugins[pluginId]![installationId] = {
+				candidate.plugins[pluginId][installationId] = {
 					pluginId,
 					installationId,
 					revision,
 					grants: [],
 					pendingRequests: [request],
+					permanentDenials: [],
 					updatedAt: this.timestamp(),
 				};
 			}
@@ -978,48 +1054,208 @@ export class PluginPermissionStore {
 		});
 	}
 
+	/**
+	 * Resolve a request that is still pending. Returns `undefined` when the row is
+	 * unknown OR already decided, so a stale client (or a replayed request id) can
+	 * never flip an approved row to denied and report success while the grant
+	 * stays in force.
+	 *
+	 * `permanentDenial` records "never ask again" in the SAME locked write as the
+	 * denial. Two separate writes left a window in which a plugin retry could queue
+	 * a fresh pending row (the old row was already denied, the permanent denial not
+	 * yet recorded), and a failure of the second write left the request denied
+	 * while the API reported an error.
+	 */
 	async resolvePendingRequest(
 		pluginId: string,
 		installationId: string,
 		requestId: string,
 		status: "granted" | "denied",
+		options: { permanentDenial?: { deniedBy?: string } } = {},
 	): Promise<PluginPermissionRequest | undefined> {
 		assertPluginIdentity(pluginId, installationId);
 		if (!identifierSchema.safeParse(requestId).success)
 			throw new ValidationError("Invalid requestId");
 		if (status !== "granted" && status !== "denied")
 			throw new ValidationError("Invalid resolve status");
+		const permanentDenial = options.permanentDenial;
+		if (permanentDenial && status !== "denied")
+			throw new ValidationError("A permanent denial requires a denied status");
+		if (
+			permanentDenial?.deniedBy !== undefined &&
+			!identifierSchema.safeParse(permanentDenial.deniedBy).success
+		)
+			throw new ValidationError("Invalid deniedBy");
+
+		return this.mutex.acquire("permissions", async () => {
+			await this.ensureLoadedLocked();
+			const document = this.requireDocument();
+			const candidate = clone(document);
+			const pluginEntry = candidate.plugins[pluginId];
+			const current = pluginEntry?.[installationId];
+			if (!pluginEntry || !current) return undefined;
+			const nextRequests = [...(current.pendingRequests ?? [])];
+			const index = nextRequests.findIndex((r) => r.requestId === requestId);
+			const target = index === -1 ? undefined : nextRequests[index];
+			if (!target || target.status !== "pending") return undefined;
+
+			const resolved: PluginPermissionRequest = {
+				...target,
+				status,
+				resolvedAt: this.timestamp(),
+			};
+			nextRequests[index] = resolved;
+
+			let permanentDenials = current.permanentDenials ?? [];
+			if (permanentDenial) {
+				const pairKey = permissionPairKey(resolved.capability, resolved.scope);
+				const exists = permanentDenials.some(
+					(denial) => permissionPairKey(denial.capability, denial.scope) === pairKey,
+				);
+				if (!exists) {
+					if (permanentDenials.length >= this.limits.maxGrantsPerInstallation) {
+						throw new ValidationError("Too many permanent permission denials");
+					}
+					permanentDenials = [
+						...permanentDenials,
+						{
+							capability: resolved.capability,
+							scope: clone(resolved.scope),
+							deniedAt: this.timestamp(),
+							deniedBy: permanentDenial.deniedBy,
+						},
+					];
+				}
+			}
+
+			pluginEntry[installationId] = {
+				...current,
+				pendingRequests: nextRequests,
+				permanentDenials,
+				updatedAt: this.timestamp(),
+			};
+			candidate.updatedAt = this.timestamp();
+			await this.writeLocked(candidate);
+			this.document = candidate;
+			return clone(resolved);
+		});
+	}
+
+	async listPermanentDenials(
+		pluginId: string,
+		installationId: string,
+	): Promise<PluginPermanentDenial[]> {
+		assertPluginIdentity(pluginId, installationId);
+		await this.ensureLoaded();
+		return clone(this.document?.plugins[pluginId]?.[installationId]?.permanentDenials ?? []);
+	}
+
+	/**
+	 * Record a "never ask again" decision. Idempotent per (capability, scope): a
+	 * repeat call returns the existing record untouched.
+	 */
+	async addPermanentDenial(
+		pluginId: string,
+		installationId: string,
+		input: { capability: string; scope: PermissionScope; deniedBy?: string },
+	): Promise<PluginPermanentDenial> {
+		assertPluginIdentity(pluginId, installationId);
+		const capabilityResult = capabilitySchema.safeParse(input.capability);
+		if (!capabilityResult.success) throw new ValidationError("Invalid capability");
+		const scopeResult = permissionScopeSchema.safeParse(input.scope);
+		if (!scopeResult.success) throw new ValidationError("Invalid permission scope");
+		if (input.deniedBy !== undefined && !identifierSchema.safeParse(input.deniedBy).success)
+			throw new ValidationError("Invalid deniedBy");
 
 		return this.mutex.acquire("permissions", async () => {
 			await this.ensureLoadedLocked();
 			const document = this.requireDocument();
 			const doc = document.plugins[pluginId]?.[installationId];
-			if (!doc) return undefined;
-			const requests: PluginPermissionRequest[] = doc.pendingRequests ?? [];
-			const index = requests.findIndex((r) => r.requestId === requestId);
-			if (index === -1) return undefined;
+			const pairKey = permissionPairKey(input.capability, input.scope);
+			const existing = (doc?.permanentDenials ?? []).find(
+				(denial) => permissionPairKey(denial.capability, denial.scope) === pairKey,
+			);
+			if (existing) return clone(existing);
+			if ((doc?.permanentDenials ?? []).length >= this.limits.maxGrantsPerInstallation) {
+				throw new ValidationError("Too many permanent permission denials");
+			}
 
-			const resolved: PluginPermissionRequest = {
-				...clone(requests[index]!),
-				status,
-				resolvedAt: this.timestamp(),
+			const denial: PluginPermanentDenial = {
+				capability: input.capability,
+				scope: clone(input.scope),
+				deniedAt: this.timestamp(),
+				deniedBy: input.deniedBy,
 			};
-
 			const candidate = clone(document);
+			candidate.plugins[pluginId] ??= {};
 			const current = candidate.plugins[pluginId]?.[installationId];
-			if (!current) return undefined;
-			const nextRequests = [...(current.pendingRequests ?? [])];
-			nextRequests[index] = resolved;
-			const updated: PermissionInstallationDocument = {
-				...clone(current),
-				pendingRequests: nextRequests,
-				updatedAt: this.timestamp(),
-			};
-			candidate.plugins[pluginId]![installationId] = updated;
+			if (current) {
+				candidate.plugins[pluginId][installationId] = {
+					...clone(current),
+					permanentDenials: [...(current.permanentDenials ?? []), denial],
+					updatedAt: this.timestamp(),
+				};
+			} else {
+				const revision = this.pluginRevision(pluginId, document);
+				candidate.plugins[pluginId][installationId] = {
+					pluginId,
+					installationId,
+					revision,
+					grants: [],
+					pendingRequests: [],
+					permanentDenials: [denial],
+					updatedAt: this.timestamp(),
+				};
+			}
+			this.assertInstallationCount(candidate, pluginId);
 			candidate.updatedAt = this.timestamp();
 			await this.writeLocked(candidate);
 			this.document = candidate;
-			return clone(resolved);
+			return clone(denial);
+		});
+	}
+
+	/**
+	 * Lift a permanent denial so the plugin may ask for the pair again. Returns
+	 * false when no matching denial exists.
+	 */
+	async removePermanentDenial(
+		pluginId: string,
+		installationId: string,
+		capability: string,
+		scope: PermissionScope,
+	): Promise<boolean> {
+		assertPluginIdentity(pluginId, installationId);
+		const capabilityResult = capabilitySchema.safeParse(capability);
+		if (!capabilityResult.success) throw new ValidationError("Invalid capability");
+		const scopeResult = permissionScopeSchema.safeParse(scope);
+		if (!scopeResult.success) throw new ValidationError("Invalid permission scope");
+
+		return this.mutex.acquire("permissions", async () => {
+			await this.ensureLoadedLocked();
+			const document = this.requireDocument();
+			const doc = document.plugins[pluginId]?.[installationId];
+			if (!doc) return false;
+			const pairKey = permissionPairKey(capability, scope);
+			const denials = doc.permanentDenials ?? [];
+			const next = denials.filter(
+				(denial) => permissionPairKey(denial.capability, denial.scope) !== pairKey,
+			);
+			if (next.length === denials.length) return false;
+
+			const candidate = clone(document);
+			const pluginEntry = candidate.plugins[pluginId];
+			const current = pluginEntry?.[installationId];
+			if (!pluginEntry || !current) return false;
+			pluginEntry[installationId] = {
+				...clone(current),
+				permanentDenials: next,
+				updatedAt: this.timestamp(),
+			};
+			candidate.updatedAt = this.timestamp();
+			await this.writeLocked(candidate);
+			this.document = candidate;
+			return true;
 		});
 	}
 

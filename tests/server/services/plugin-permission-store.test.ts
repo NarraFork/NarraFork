@@ -1,11 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	PluginPermissionConflictError,
 	PluginPermissionStore,
-	type PluginPermissionRequest,
 } from "@server/services/plugin-permission-store";
 import { PluginStateStore } from "@server/services/plugin-state-store";
 
@@ -240,6 +239,7 @@ describe("PluginPermissionStore", () => {
 			installationId,
 			input,
 		);
+		if (!request) throw new Error("expected a queued pending request");
 
 		expect(request).toMatchObject({
 			capability: "query.read.projects",
@@ -288,6 +288,7 @@ describe("PluginPermissionStore", () => {
 			installationId,
 			input,
 		);
+		if (!first || !second) throw new Error("expected queued pending requests");
 
 		expect(second.requestId).toBe(first.requestId);
 		expect(second).toEqual(first);
@@ -339,6 +340,7 @@ describe("PluginPermissionStore", () => {
 			installationId,
 			input,
 		);
+		if (!request) throw new Error("expected a queued pending request");
 
 		// Grant it
 		const granted = await permissionStore.resolvePendingRequest(
@@ -348,9 +350,9 @@ describe("PluginPermissionStore", () => {
 			"granted",
 		);
 		expect(granted).not.toBeUndefined();
-		expect(granted!.status).toBe("granted");
-		expect(granted!.resolvedAt).toBe("2026-07-18T12:00:00.000Z");
-		expect(granted!.requestId).toBe(request.requestId);
+		expect(granted?.status).toBe("granted");
+		expect(granted?.resolvedAt).toBe("2026-07-18T12:00:00.000Z");
+		expect(granted?.requestId).toBe(request.requestId);
 
 		// No longer returned by listPendingRequests
 		const pending = await permissionStore.listPendingRequests(
@@ -365,20 +367,94 @@ describe("PluginPermissionStore", () => {
 			installationId,
 			{ capability: "query.read.chapters", scope: { type: "global" as const } },
 		);
+		if (!request2) throw new Error("expected a queued pending request");
 		const denied = await permissionStore.resolvePendingRequest(
 			"com.example.permissions",
 			installationId,
 			request2.requestId,
 			"denied",
 		);
-		expect(denied!.status).toBe("denied");
-		expect(denied!.resolvedAt).toBe("2026-07-18T12:00:00.000Z");
+		expect(denied?.status).toBe("denied");
+		expect(denied?.resolvedAt).toBe("2026-07-18T12:00:00.000Z");
 
 		const pendingAfter = await permissionStore.listPendingRequests(
 			"com.example.permissions",
 			installationId,
 		);
 		expect(pendingAfter).toHaveLength(0);
+	});
+
+	test("resolvePendingRequest refuses to re-decide an already resolved request", async () => {
+		const { permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+		const request = await permissionStore.addPendingRequest(
+			"com.example.permissions",
+			installationId,
+			{ capability: "query.read.projects", scope: { type: "global" as const } },
+		);
+		if (!request) throw new Error("expected a queued pending request");
+
+		await permissionStore.resolvePendingRequest(
+			"com.example.permissions",
+			installationId,
+			request.requestId,
+			"granted",
+		);
+		// A stale tab denying (even permanently) after approval must not succeed.
+		const replay = await permissionStore.resolvePendingRequest(
+			"com.example.permissions",
+			installationId,
+			request.requestId,
+			"denied",
+			{ permanentDenial: {} },
+		);
+		expect(replay).toBeUndefined();
+		expect(
+			await permissionStore.listPermanentDenials("com.example.permissions", installationId),
+		).toHaveLength(0);
+	});
+
+	test("resolvePendingRequest records a permanent denial in the same write", async () => {
+		const { permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+		const input = { capability: "query.read.projects", scope: { type: "global" as const } };
+		const request = await permissionStore.addPendingRequest(
+			"com.example.permissions",
+			installationId,
+			input,
+		);
+		if (!request) throw new Error("expected a queued pending request");
+
+		const denied = await permissionStore.resolvePendingRequest(
+			"com.example.permissions",
+			installationId,
+			request.requestId,
+			"denied",
+			{ permanentDenial: { deniedBy: "admin" } },
+		);
+		expect(denied?.status).toBe("denied");
+		const denials = await permissionStore.listPermanentDenials(
+			"com.example.permissions",
+			installationId,
+		);
+		expect(denials).toMatchObject([{ capability: input.capability, deniedBy: "admin" }]);
+		// The plugin retrying afterwards is refused without queuing a new prompt.
+		expect(
+			await permissionStore.addPendingRequest("com.example.permissions", installationId, input),
+		).toBeUndefined();
+	});
+
+	test("resolvePendingRequest rejects a permanent denial combined with a grant", async () => {
+		const { permissionStore } = await makeStores();
+		await expect(
+			permissionStore.resolvePendingRequest(
+				"com.example.permissions",
+				installationId,
+				"any-id",
+				"granted",
+				{ permanentDenial: {} },
+			),
+		).rejects.toThrow("permanent denial requires a denied status");
 	});
 
 	test("resolvePendingRequest returns undefined for unknown requestId", async () => {
@@ -499,6 +575,7 @@ describe("PluginPermissionStore", () => {
 				scope: { type: "global" as const },
 			},
 		);
+		if (!request) throw new Error("expected a queued pending request");
 
 		// Perform a replace (which should preserve pending requests)
 		await permissionStore.replace(
@@ -520,7 +597,7 @@ describe("PluginPermissionStore", () => {
 			installationId,
 		);
 		expect(pending).toHaveLength(1);
-		expect(pending[0]!.requestId).toBe(request.requestId);
+		expect(pending[0]?.requestId).toBe(request.requestId);
 	});
 
 	test("idempotent add does not count duplicates toward limit", async () => {
@@ -538,6 +615,7 @@ describe("PluginPermissionStore", () => {
 			installationId,
 			sharedInput,
 		);
+		if (!first) throw new Error("expected a queued pending request");
 
 		// Add 19 more unique pending requests (total 20)
 		for (let i = 0; i < 19; i++) {
@@ -559,6 +637,7 @@ describe("PluginPermissionStore", () => {
 			installationId,
 			sharedInput,
 		);
+		if (!dup) throw new Error("expected the idempotent duplicate to resolve");
 		expect(dup.requestId).toBe(first.requestId);
 
 		const pendingAfter = await permissionStore.listPendingRequests(
@@ -566,5 +645,204 @@ describe("PluginPermissionStore", () => {
 			installationId,
 		);
 		expect(pendingAfter).toHaveLength(20);
+	});
+});
+
+describe("PluginPermissionStore permanent denials", () => {
+	test("a permanent denial blocks future pending requests for the exact pair", async () => {
+		const { permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+
+		await permissionStore.addPermanentDenial("com.example.permissions", installationId, {
+			capability: "query.read.projects",
+			scope: { type: "global" },
+			deniedBy: "admin-user-1",
+		});
+
+		// Same pair: never queued again.
+		const blocked = await permissionStore.addPendingRequest(
+			"com.example.permissions",
+			installationId,
+			{ capability: "query.read.projects", scope: { type: "global" } },
+		);
+		expect(blocked).toBeUndefined();
+		expect(
+			await permissionStore.listPendingRequests("com.example.permissions", installationId),
+		).toHaveLength(0);
+
+		// A different scope of the same capability is a different decision and still queues.
+		const otherScope = await permissionStore.addPendingRequest(
+			"com.example.permissions",
+			installationId,
+			{ capability: "query.read.projects", scope: { type: "project", id: "project-1" } },
+		);
+		expect(otherScope).toBeDefined();
+	});
+
+	test("a permanent denial wins over a still-pending row for the same pair", async () => {
+		const { permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+
+		const request = await permissionStore.addPendingRequest(
+			"com.example.permissions",
+			installationId,
+			{ capability: "query.read.projects", scope: { type: "global" } },
+		);
+		if (!request) throw new Error("expected a queued pending request");
+
+		await permissionStore.addPermanentDenial("com.example.permissions", installationId, {
+			capability: "query.read.projects",
+			scope: { type: "global" },
+		});
+
+		// The pending row itself stays until resolved, but nothing new is queued.
+		const again = await permissionStore.addPendingRequest(
+			"com.example.permissions",
+			installationId,
+			{ capability: "query.read.projects", scope: { type: "global" } },
+		);
+		expect(again).toBeUndefined();
+	});
+
+	test("addPermanentDenial is idempotent and listPermanentDenials returns metadata", async () => {
+		const { permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+
+		const input = {
+			capability: "query.read.projects",
+			scope: { type: "global" as const },
+			deniedBy: "admin-user-1",
+		};
+		const first = await permissionStore.addPermanentDenial(
+			"com.example.permissions",
+			installationId,
+			input,
+		);
+		const second = await permissionStore.addPermanentDenial(
+			"com.example.permissions",
+			installationId,
+			input,
+		);
+		expect(second).toEqual(first);
+		expect(first).toMatchObject({
+			capability: "query.read.projects",
+			scope: { type: "global" },
+			deniedAt: "2026-07-18T12:00:00.000Z",
+			deniedBy: "admin-user-1",
+		});
+
+		const denials = await permissionStore.listPermanentDenials(
+			"com.example.permissions",
+			installationId,
+		);
+		expect(denials).toHaveLength(1);
+		expect(denials[0]).toEqual(first);
+	});
+
+	test("removePermanentDenial lets the plugin ask again; removing twice reports false", async () => {
+		const { permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+
+		await permissionStore.addPermanentDenial("com.example.permissions", installationId, {
+			capability: "query.read.projects",
+			scope: { type: "global" },
+		});
+		expect(
+			await permissionStore.removePermanentDenial(
+				"com.example.permissions",
+				installationId,
+				"query.read.projects",
+				{
+					type: "global",
+				},
+			),
+		).toBe(true);
+		expect(
+			await permissionStore.removePermanentDenial(
+				"com.example.permissions",
+				installationId,
+				"query.read.projects",
+				{
+					type: "global",
+				},
+			),
+		).toBe(false);
+
+		const request = await permissionStore.addPendingRequest(
+			"com.example.permissions",
+			installationId,
+			{ capability: "query.read.projects", scope: { type: "global" } },
+		);
+		expect(request).toBeDefined();
+	});
+
+	test("permanent denials survive replace, reload, and installation inheritance", async () => {
+		const { root, permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+		await permissionStore.addPermanentDenial("com.example.permissions", installationId, {
+			capability: "query.read.projects",
+			scope: { type: "global" },
+		});
+
+		// A grant replace must not drop the denial list.
+		await permissionStore.replace(
+			"com.example.permissions",
+			installationId,
+			[
+				{
+					grantId: "grant-chapters",
+					capability: "query.read.chapters",
+					scope: { type: "global" },
+					grantedBy: "admin-user-1",
+				},
+			],
+			{ expectedRevision: 0 },
+		);
+		expect(
+			await permissionStore.listPermanentDenials("com.example.permissions", installationId),
+		).toHaveLength(1);
+
+		// Reload from disk.
+		const reloaded = new PluginPermissionStore({ root });
+		expect(
+			await reloaded.listPermanentDenials("com.example.permissions", installationId),
+		).toHaveLength(1);
+
+		// A new installation inheriting the previous set keeps the "never ask" decision.
+		const successorId = "b".repeat(64);
+		await reloaded.ensureInstallation("com.example.permissions", successorId, installationId);
+		expect(
+			await reloaded.listPermanentDenials("com.example.permissions", successorId),
+		).toHaveLength(1);
+		const blocked = await reloaded.addPendingRequest("com.example.permissions", successorId, {
+			capability: "query.read.projects",
+			scope: { type: "global" },
+		});
+		expect(blocked).toBeUndefined();
+	});
+
+	test("a permissions file written before permanent denials existed still loads", async () => {
+		const { root, permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+		await permissionStore.addPendingRequest("com.example.permissions", installationId, {
+			capability: "query.read.projects",
+			scope: { type: "global" },
+		});
+
+		// Strip the field to simulate a legacy file.
+		const path = join(root, "permissions.json");
+		const parsed = JSON.parse(await readFile(path, "utf8")) as {
+			plugins: Record<string, Record<string, Record<string, unknown>>>;
+		};
+		delete parsed.plugins["com.example.permissions"]?.[installationId]?.permanentDenials;
+		await writeFile(path, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
+
+		const legacy = new PluginPermissionStore({ root });
+		expect(
+			await legacy.listPermanentDenials("com.example.permissions", installationId),
+		).toHaveLength(0);
+		expect(
+			await legacy.listPendingRequests("com.example.permissions", installationId),
+		).toHaveLength(1);
 	});
 });

@@ -1,4 +1,8 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import {
+	PluginProviderRegistry,
+	ProviderRegistryError,
+} from "../../../services/plugin-provider-registry";
 import { settings } from "../../settings";
 
 class MockProvider {}
@@ -67,6 +71,85 @@ describe("resolveProviderAndModel", () => {
 		try {
 			expect(() => resolveProviderAndModel("acme:chat:large")).toThrow(
 				/Provider "acme" is not configured/,
+			);
+		} finally {
+			unregister();
+		}
+	});
+
+	test("preserves plugin lifecycle errors and resolves again after recovery without reconfiguration", () => {
+		const registry = new PluginProviderRegistry();
+		const adapter = {} as never;
+		registry.register({
+			kind: "executable-plugin",
+			pluginId: "com.example.cline",
+			localId: "main",
+			providerInstanceId: "cline-instance",
+			providerPrefix: "cline-ext",
+			displayName: "Cline",
+			createAdapter: () => adapter,
+		});
+		const unregister = registerExternalProviderResolver((provider, model) =>
+			registry.resolveExternalProvider(provider, model),
+		);
+		try {
+			expect(resolveProviderAndModel("cline-ext:chat:large").adapter).toBe(adapter);
+			registry.markUnavailable("cline-instance", "runtime-generation-changed");
+			expect(() => resolveProviderAndModel("cline-ext:chat:large")).toThrow(
+				expect.objectContaining({
+					code: "PROVIDER_UNAVAILABLE",
+					message: "Provider cline-ext is unavailable: runtime-generation-changed",
+				}),
+			);
+			// Discovery probes still decline unavailable providers without throwing.
+			expect(registry.tryResolveProvider("cline-ext:chat:large")).toBeUndefined();
+			registry.enablePlugin("com.example.cline");
+			expect(resolveProviderAndModel("cline-ext:chat:large").adapter).toBe(adapter);
+			registry.disablePlugin("com.example.cline", "runtime-crash");
+			expect(() => resolveProviderAndModel("cline-ext:chat:large")).toThrow(
+				expect.objectContaining({
+					code: "PROVIDER_UNAVAILABLE",
+					message: "Provider cline-ext is unavailable: runtime-crash",
+				}),
+			);
+			expect(() => resolveProviderAndModel("missing-plugin:chat")).toThrow(
+				'Provider "missing-plugin" is not configured',
+			);
+		} finally {
+			unregister();
+		}
+	});
+
+	test("does not mask a registered plugin's config or adapter failure as a missing prefix", () => {
+		const configError = new ProviderRegistryError(
+			"PROVIDER_CONFIG_INVALID",
+			"Plugin adapter rejected its configuration",
+		);
+		const registry = new PluginProviderRegistry({
+			remoteProviderAdapterFactory: () => {
+				throw configError;
+			},
+		});
+		registry.register({
+			kind: "executable-plugin",
+			pluginId: "com.example.config",
+			localId: "main",
+			providerInstanceId: "config-instance",
+			providerPrefix: "config-plugin",
+			displayName: "Config plugin",
+			configSchema: { type: "object", required: ["token"] },
+			config: { token: "fixture" },
+		});
+		const unregister = registerExternalProviderResolver((provider, model) =>
+			registry.resolveExternalProvider(provider, model),
+		);
+		try {
+			expect(() => resolveProviderAndModel("config-plugin:chat")).toThrow(
+				expect.objectContaining({ code: "PROVIDER_CONFIG_INVALID" }),
+			);
+			registry.setRemoteProviderAdapterFactory(undefined);
+			expect(() => resolveProviderAndModel("config-plugin:chat")).toThrow(
+				expect.objectContaining({ code: "PROVIDER_UNAVAILABLE" }),
 			);
 		} finally {
 			unregister();

@@ -112,6 +112,7 @@ import { RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
 import { isTabActive } from "./nav/recent-tabs-logic";
 import { useNavBadges } from "./nav/use-nav-badges";
 import { NotificationBell } from "./notifications/NotificationBell";
+import { PluginPermissionRequestHost } from "./plugins-admin/PluginPermissionRequestHost";
 import { StartupRecoveryAlert } from "./StartupRecoveryAlert";
 import { BrokenModelMigrationHost } from "./settings/BrokenModelMigrationHost";
 import { ProviderBaseUrlFixHost } from "./settings/ProviderBaseUrlFixHost";
@@ -1105,6 +1106,7 @@ function AuthenticatedLayout() {
 			<SummaryModelPickerHost />
 			<ProviderBaseUrlFixHost />
 			<BrokenModelMigrationHost />
+			<PluginPermissionRequestHost />
 
 			{createNarratorOpened && (
 				<LazyOverlayBoundary resetKey={createNarratorOpened} label={t("newNarrator")}>

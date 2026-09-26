@@ -53,6 +53,7 @@ import {
 import {
 	type PermissionGrantInput,
 	type PermissionMutationResult,
+	type PluginPermanentDenial,
 	type PluginPermissionRequest,
 	type PluginPermissionSet,
 	PluginPermissionStore,
@@ -100,6 +101,15 @@ interface RuntimeLike {
 	state: string;
 	generation: number;
 	getDiagnostics(): RuntimeDiagnostics;
+}
+
+interface RuntimeStateEvent {
+	runtime: RuntimeLike;
+	diagnostics: RuntimeDiagnostics;
+	state: string;
+	sourceError?: unknown;
+	revoked?: boolean;
+	failurePersisted?: boolean;
 }
 
 function asPluginToolRuntime(runtime: RuntimeLike | undefined): PluginToolRuntime | undefined {
@@ -491,6 +501,7 @@ export class PluginManager {
 	private readonly removeInstalledPackage: (pluginId: string) => Promise<void>;
 	private readonly now: () => Date;
 	private readonly lifecycleMutex = new AsyncMutex();
+	private readonly lifecycleRevokeFailures = new Map<string, unknown>();
 	private readonly packageMutex = new AsyncMutex();
 	private catalogSnapshot?: PluginCatalogSnapshot;
 	private initializePromise?: Promise<PluginManagerStatus[]>;
@@ -660,7 +671,7 @@ export class PluginManager {
 				await this.failOperation(operation, error, "compatibility");
 				throw error;
 			}
-			if (state.desiredState === "enabled") {
+			if (state.desiredState === "enabled" && !this.lifecycleRevokeFailures.has(pluginId)) {
 				await this.refreshCatalog("enable");
 				return this.requireStatus(pluginId);
 			}
@@ -671,7 +682,17 @@ export class PluginManager {
 					lastError: null,
 				});
 				try {
-					await this.restorePluginLifecycle(pluginId);
+					if (this.lifecycleRevokeFailures.has(pluginId)) {
+						// An explicit recovery attempt needs a fresh event ID: the coordinator
+						// caches failed generation/grant events even after an adapter recovers.
+						await this.revokePluginLifecycle(pluginId, "disable", "manager-enable-recovery");
+					}
+					const runtime = this.runtimeSupervisor.get(pluginId);
+					if (runtime && ["active", "degraded"].includes(runtime.state)) {
+						await this.reconcileActiveRuntimeAccess(pluginId);
+					} else {
+						await this.restorePluginAccess(pluginId);
+					}
 				} catch (error) {
 					await this.stateStore.updateState(pluginId, {
 						desiredState: "disabled",
@@ -694,7 +715,11 @@ export class PluginManager {
 		return this.lifecycleMutex.acquire(pluginId, async () => {
 			const state = await this.requireState(pluginId);
 			const runtime = this.runtimeSupervisor.get(pluginId);
-			if (state.desiredState === "disabled" && (!runtime || runtime.state === "stopped")) {
+			if (
+				state.desiredState === "disabled" &&
+				(!runtime || runtime.state === "stopped") &&
+				!this.lifecycleRevokeFailures.has(pluginId)
+			) {
 				await this.refreshCatalog("disable");
 				return this.requireStatus(pluginId);
 			}
@@ -966,34 +991,91 @@ export class PluginManager {
 		});
 	}
 
-	async denyPermissionRequest(pluginId: string, requestId: string): Promise<boolean> {
+	async denyPermissionRequest(
+		pluginId: string,
+		requestId: string,
+		options: { permanent?: boolean; deniedBy?: string } = {},
+	): Promise<boolean> {
 		await this.ensureInitialized();
 		assertPluginId(pluginId);
 		if (typeof requestId !== "string" || !requestId.trim() || requestId.length > 256) {
 			throw new ValidationError("Invalid permission request id");
 		}
+		if (
+			options.deniedBy !== undefined &&
+			(typeof options.deniedBy !== "string" ||
+				!options.deniedBy.trim() ||
+				options.deniedBy.length > 256 ||
+				/[\0\r\n]/u.test(options.deniedBy))
+		) {
+			throw new ValidationError("Invalid permission actor");
+		}
+		// Same lock as approvePermissionRequest: an approve and a deny racing on one
+		// request must serialize, and the loser must see the row as already decided.
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			const installationId = await this.currentInstallationId(pluginId);
+			await this.requireState(pluginId);
+			// The store refuses rows that are no longer pending, so a stale tab or a
+			// replayed id cannot flip an approved request to denied. "Never ask again"
+			// is recorded in the same write, leaving no window for a plugin retry to
+			// queue a fresh prompt between the denial and the permanent record.
+			const resolved = await this.permissionStore.resolvePendingRequest(
+				pluginId,
+				installationId,
+				requestId,
+				"denied",
+				options.permanent ? { permanentDenial: { deniedBy: options.deniedBy } } : {},
+			);
+			if (!resolved) throw new NotFoundError("PluginPermissionRequest", requestId);
+
+			eventBus.emit({
+				type: "plugin:permission_resolved",
+				pluginId,
+				requestId,
+				status: "denied",
+			} as Record<string, unknown> as NarraForkEvent);
+			await this.broadcastPluginEvent("plugin:permission_resolved", {
+				pluginId,
+				requestId,
+				status: "denied",
+			});
+
+			return true;
+		});
+	}
+
+	async listPermanentDenials(pluginId: string): Promise<PluginPermanentDenial[]> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
 		const installationId = await this.currentInstallationId(pluginId);
 		await this.requireState(pluginId);
-		const resolved = await this.permissionStore.resolvePendingRequest(
+		return this.permissionStore.listPermanentDenials(pluginId, installationId);
+	}
+
+	/** Lift a permanent denial so the plugin may request the pair again. */
+	async removePermanentDenial(
+		pluginId: string,
+		capability: string,
+		scope: unknown,
+	): Promise<boolean> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		if (typeof capability !== "string" || !capability.trim() || capability.length > 256) {
+			throw new ValidationError("Invalid capability");
+		}
+		const parsedScope = permissionScopeSchema.safeParse(scope);
+		if (!parsedScope.success) throw new ValidationError("Invalid permission scope");
+		const installationId = await this.currentInstallationId(pluginId);
+		await this.requireState(pluginId);
+		const removed = await this.permissionStore.removePermanentDenial(
 			pluginId,
 			installationId,
-			requestId,
-			"denied",
+			capability,
+			parsedScope.data,
 		);
-		if (!resolved) throw new NotFoundError("PluginPermissionRequest", requestId);
-
-		eventBus.emit({
-			type: "plugin:permission_resolved",
-			pluginId,
-			requestId,
-			status: "denied",
-		} as Record<string, unknown> as NarraForkEvent);
-		await this.broadcastPluginEvent("plugin:permission_resolved", {
-			pluginId,
-			requestId,
-			status: "denied",
-		});
-
+		if (!removed) {
+			throw new NotFoundError("PluginPermanentDenial", `${capability}:${JSON.stringify(scope)}`);
+		}
 		return true;
 	}
 
@@ -1810,7 +1892,7 @@ export class PluginManager {
 							runtimeState: "active",
 							consecutiveFailures: 0,
 						});
-						await this.restorePluginLifecycle(pluginId);
+						await this.restorePluginAccess(pluginId);
 						await this.refreshCatalog("activate");
 						return this.requireStatus(pluginId);
 					}
@@ -1838,6 +1920,7 @@ export class PluginManager {
 					const runtime = await this.runtimeSupervisor.start(runtimeOptions);
 					const diagnostics = runtime.getDiagnostics();
 					if (runtimeOptions.runtimeId && packageSummary.hash) {
+						await this.completePendingRuntimeRevocation(pluginId, diagnostics);
 						await this.bindRuntimeForRuntime(
 							pluginId,
 							await this.currentInstallationId(pluginId),
@@ -1853,7 +1936,7 @@ export class PluginManager {
 						lastError: null,
 						updatedAt: this.timestamp(),
 					}));
-					await this.restorePluginLifecycle(pluginId);
+					await this.restorePluginAccess(pluginId);
 					await this.refreshCatalog("activate");
 					// The runtime is already up, so pulling the model catalog costs no extra
 					// activation. Discovery failure must not fail activation: the provider stays
@@ -1949,16 +2032,35 @@ export class PluginManager {
 		}
 		const onStateChange = runtimeOptions.onStateChange;
 		const onCrash = runtimeOptions.onCrash;
+		// A supervisor can replace its record while the retired process still emits
+		// callbacks. Remember the emitting object, not just the plugin lookup key.
+		let owner: RuntimeLike | undefined;
+		let crashEvent: RuntimeStateEvent | undefined;
+		const capture = (runtimeState: string): RuntimeStateEvent | undefined => {
+			owner ??= this.runtimeSupervisor.get(state.pluginId);
+			if (!owner || owner !== this.runtimeSupervisor.get(state.pluginId)) return undefined;
+			return { runtime: owner, diagnostics: owner.getDiagnostics(), state: runtimeState };
+		};
 		return {
 			...runtimeOptions,
 			onStateChange: (runtimeState, previous) => {
+				const event = capture(runtimeState);
+				if (event) {
+					if (["crashed", "failed"].includes(runtimeState)) crashEvent = event;
+					// Never await this queue from a supervisor callback: start/disable
+					// may themselves be awaited by an operation holding lifecycleMutex.
+					void this.handleRuntimeStateChange(state.pluginId, event);
+				}
 				onStateChange?.(runtimeState, previous);
-				void this.handleRuntimeStateChange(state.pluginId, runtimeState);
 			},
 			onCrash: (error) => {
+				const event = crashEvent ?? capture(owner?.state ?? "crashed");
+				if (event && event.runtime === this.runtimeSupervisor.get(state.pluginId)) {
+					crashEvent = event;
+					event.sourceError = error;
+					void this.handleRuntimeStateChange(state.pluginId, event);
+				}
 				onCrash?.(error);
-				void this.observeRuntimeLifecycle(state.pluginId, "crash", error);
-				void this.persistFailure(state.pluginId, error, "runtime", false);
 			},
 		};
 	}
@@ -2037,6 +2139,30 @@ export class PluginManager {
 		});
 	}
 
+	private async completePendingRuntimeRevocation(
+		pluginId: string,
+		diagnostics: RuntimeDiagnostics,
+	): Promise<void> {
+		if (this.lifecycleRevokeFailures.has(pluginId)) {
+			await this.revokePluginLifecycle(
+				pluginId,
+				"runtime_generation",
+				"runtime-generation-changed",
+				{
+					runtimeId: diagnostics.runtimeId,
+					runtimeGeneration: diagnostics.generation,
+				},
+			);
+		}
+	}
+
+	private async restorePluginAccess(pluginId: string): Promise<void> {
+		if (this.lifecycleRevokeFailures.has(pluginId)) {
+			throw this.lifecycleRevokeFailures.get(pluginId);
+		}
+		await this.restorePluginLifecycle(pluginId);
+	}
+
 	/**
 	 * Reconcile host/capability access for a runtime that reports active.
 	 *
@@ -2059,7 +2185,10 @@ export class PluginManager {
 		if (!runtime || !["active", "degraded"].includes(runtime.state)) return;
 		const diagnostics = runtime.getDiagnostics();
 		if (!diagnostics?.runtimeId) return;
+		const event = { runtime, diagnostics, state: runtime.state };
+		await this.completePendingRuntimeRevocation(pluginId, diagnostics);
 		const installationId = await this.currentInstallationId(pluginId);
+		if (!this.isCurrentRuntimeEvent(pluginId, event)) return;
 		const binding = this.hostServices.getRuntimeBinding(pluginId, diagnostics.runtimeId);
 		if (!binding || binding.plugin.installationId !== installationId) {
 			await this.bindRuntimeForRuntime(pluginId, installationId, diagnostics);
@@ -2068,11 +2197,12 @@ export class PluginManager {
 			// the current generation before restoring platform access.
 			await this.bindRuntimeForRuntime(pluginId, installationId, diagnostics);
 		}
+		if (!this.isCurrentRuntimeEvent(pluginId, event)) return;
 		// Always restore platform-level access: an earlier revocation may have
 		// left the plugin in the broker/secret/tool revoked sets even when the
 		// binding itself survived. The restore is idempotent and only runs
 		// after the enabled/compatible/active gates above.
-		await this.restorePluginLifecycle(pluginId);
+		await this.restorePluginAccess(pluginId);
 	}
 
 	/**
@@ -2428,19 +2558,32 @@ export class PluginManager {
 		return parsed.data;
 	}
 
-	private async persistRuntimeState(pluginId: string, runtimeState: string): Promise<void> {
+	private isCurrentRuntimeEvent(pluginId: string, event: RuntimeStateEvent): boolean {
+		const runtime = this.runtimeSupervisor.get(pluginId);
+		return (
+			runtime === event.runtime &&
+			runtime.generation === event.diagnostics.generation &&
+			runtime.state === event.state
+		);
+	}
+
+	private async persistRuntimeState(pluginId: string, event: RuntimeStateEvent): Promise<void> {
 		const existing = await this.stateStore.getState(pluginId);
 		if (!existing) return;
-		const runtime = this.runtimeSupervisor.get(pluginId);
-		const diagnostics = runtime?.getDiagnostics();
+		const { diagnostics, state: runtimeState } = event;
 		await this.stateStore
-			.updateState(pluginId, (state) => ({
-				...state,
-				runtimeState: mapRuntimeState(runtimeState),
-				runtimeGeneration: Math.max(state.runtimeGeneration, diagnostics?.generation ?? 0),
-				restartCount: Math.max(state.restartCount, Math.max(0, (diagnostics?.generation ?? 1) - 1)),
-				updatedAt: this.timestamp(),
-			}))
+			.updateState(pluginId, (state) =>
+				this.isCurrentRuntimeEvent(pluginId, event)
+					? {
+							...state,
+							runtimeState: mapRuntimeState(runtimeState),
+							runtimeGeneration: diagnostics.generation,
+							restartCount: Math.max(state.restartCount, Math.max(0, diagnostics.generation - 1)),
+							...(runtimeState === "active" ? { lastError: null, consecutiveFailures: 0 } : {}),
+							updatedAt: this.timestamp(),
+						}
+					: state,
+			)
 			.catch((error) => {
 				logger.warn("Unable to persist plugin runtime state", {
 					pluginId,
@@ -2454,21 +2597,29 @@ export class PluginManager {
 		error: unknown,
 		phase: string,
 		quarantine: boolean,
+		event?: RuntimeStateEvent,
 	): Promise<void> {
 		const existing = await this.stateStore.getState(pluginId);
-		if (!existing) return;
-		const runtime = this.runtimeSupervisor.get(pluginId);
-		const diagnostics = runtime?.getDiagnostics();
-		await this.stateStore.updateState(pluginId, (state) => ({
-			...state,
-			runtimeState: quarantine ? "quarantine" : "failed",
-			crashCount: state.crashCount + 1,
-			restartCount: Math.max(state.restartCount, Math.max(0, (diagnostics?.generation ?? 1) - 1)),
-			consecutiveFailures: state.consecutiveFailures + 1,
-			runtimeGeneration: Math.max(state.runtimeGeneration, diagnostics?.generation ?? 0),
-			lastError: pluginStateError(error, { phase, at: this.timestamp() }),
-			updatedAt: this.timestamp(),
-		}));
+		if (!existing || (event && !this.isCurrentRuntimeEvent(pluginId, event))) return;
+		const diagnostics =
+			event?.diagnostics ?? this.runtimeSupervisor.get(pluginId)?.getDiagnostics();
+		await this.stateStore.updateState(pluginId, (state) =>
+			event && !this.isCurrentRuntimeEvent(pluginId, event)
+				? state
+				: {
+						...state,
+						runtimeState: quarantine ? "quarantine" : "failed",
+						crashCount: state.crashCount + 1,
+						restartCount: Math.max(
+							state.restartCount,
+							Math.max(0, (diagnostics?.generation ?? 1) - 1),
+						),
+						consecutiveFailures: state.consecutiveFailures + 1,
+						runtimeGeneration: Math.max(state.runtimeGeneration, diagnostics?.generation ?? 0),
+						lastError: pluginStateError(error, { phase, at: this.timestamp() }),
+						updatedAt: this.timestamp(),
+					},
+		);
 		try {
 			await this.refreshCatalog();
 		} catch (refreshError) {
@@ -2739,7 +2890,7 @@ export class PluginManager {
 			state.desiredState === "enabled" &&
 			(runtime ? runtimeCanAccessHost : state.runtimeState === "active");
 		if ((mutation.changed || rebound) && canRestore) {
-			await this.restorePluginLifecycle(pluginId);
+			await this.restorePluginAccess(pluginId);
 		}
 		return {
 			status: await this.requireStatus(pluginId),
@@ -2779,7 +2930,11 @@ export class PluginManager {
 				reason,
 				...details,
 			});
+			await this.legacyRevokeUiSessions?.(pluginId);
 		} catch (error) {
+			// A stale callback must not quarantine its replacement, but a failed
+			// cross-layer revoke still fences every restore until a fresh revoke succeeds.
+			this.lifecycleRevokeFailures.set(pluginId, error);
 			this.hostServices.revokeRuntime(
 				pluginId,
 				details.runtimeId,
@@ -2787,69 +2942,64 @@ export class PluginManager {
 			);
 			throw error;
 		}
-		await this.legacyRevokeUiSessions?.(pluginId);
+		if (!report.deduplicated) this.lifecycleRevokeFailures.delete(pluginId);
 		return report;
 	}
 
-	private async handleRuntimeStateChange(pluginId: string, runtimeState: string): Promise<void> {
-		const runtime = this.runtimeSupervisor.get(pluginId);
-		const diagnostics = runtime?.getDiagnostics();
-		try {
-			if (runtimeState === "active" && diagnostics) {
-				if (await this.isRuntimeGenerationChange(pluginId, diagnostics.generation)) {
-					await this.revokePluginLifecycle(
-						pluginId,
-						"runtime_generation",
-						"runtime-generation-changed",
-						{
-							runtimeId: diagnostics.runtimeId,
-							runtimeGeneration: diagnostics.generation,
-						},
-					);
-				}
-				// Reconcile unconditionally: even when the generation did not
-				// change, an earlier revocation may have removed the host
-				// binding or left the plugin-level revoked state in place
-				// (crash followed by a failed restart, out-of-order state
-				// events). Rebuilding the binding with the current runtime
-				// identity and restoring platform access heals the stuck
-				// "active but unreachable" state.
-				await this.reconcileActiveRuntimeAccess(pluginId);
-				await this.restorePluginLifecycle(pluginId);
-			}
-			if (["crashed", "failed", "quarantine"].includes(runtimeState)) {
-				const kind = runtimeState === "quarantine" ? "quarantine" : "crash";
-				await this.revokePluginLifecycle(pluginId, kind, `runtime-${kind}`, {
-					runtimeId: diagnostics?.runtimeId,
-					runtimeGeneration: diagnostics?.generation,
-				});
-			}
-			await this.persistRuntimeState(pluginId, runtimeState);
-			await this.refreshCatalog();
-		} catch (error) {
-			await this.handleObservedLifecycleRevokeFailure(pluginId, runtimeState, error);
-		}
-	}
-
-	private async observeRuntimeLifecycle(
+	private async handleRuntimeStateChange(
 		pluginId: string,
-		kind: Extract<PluginLifecycleRevokeEventKind, "crash" | "quarantine">,
-		sourceError?: unknown,
+		event: RuntimeStateEvent,
 	): Promise<void> {
-		const diagnostics = this.runtimeSupervisor.get(pluginId)?.getDiagnostics();
-		try {
-			await this.revokePluginLifecycle(pluginId, kind, `runtime-${kind}`, {
-				runtimeId: diagnostics?.runtimeId,
-				runtimeGeneration: diagnostics?.generation,
-			});
-		} catch (error) {
-			await this.handleObservedLifecycleRevokeFailure(
-				pluginId,
-				diagnostics?.state ?? kind,
-				error,
-				sourceError,
-			);
-		}
+		// Share ordering with disable/uninstall/permission mutations. Supervisor
+		// callbacks only enqueue; locked manager operations never await this queue.
+		await this.lifecycleMutex.acquire(pluginId, async () => {
+			const { diagnostics, state: runtimeState } = event;
+			try {
+				if (runtimeState === "active" && this.isCurrentRuntimeEvent(pluginId, event)) {
+					if (await this.isRuntimeGenerationChange(pluginId, diagnostics.generation)) {
+						await this.revokePluginLifecycle(
+							pluginId,
+							"runtime_generation",
+							"runtime-generation-changed",
+							{
+								runtimeId: diagnostics.runtimeId,
+								runtimeGeneration: diagnostics.generation,
+							},
+						);
+					}
+					if (this.isCurrentRuntimeEvent(pluginId, event)) {
+						await this.reconcileActiveRuntimeAccess(pluginId);
+					}
+				}
+				if (["crashed", "failed", "quarantine"].includes(runtimeState) && !event.revoked) {
+					// Even if a restart has begun, finish revocation before the queued
+					// active event restores access. onCrash shares this event, so it
+					// cannot launch a second revocation after a newer restore.
+					event.revoked = true;
+					const kind = runtimeState === "quarantine" ? "quarantine" : "crash";
+					await this.revokePluginLifecycle(pluginId, kind, `runtime-${kind}`, {
+						runtimeId: diagnostics.runtimeId,
+						runtimeGeneration: diagnostics.generation,
+					});
+				}
+				if (!this.isCurrentRuntimeEvent(pluginId, event)) return;
+				if (event.sourceError !== undefined && !event.failurePersisted) {
+					event.failurePersisted = true;
+					await this.persistFailure(pluginId, event.sourceError, "runtime", false, event);
+				} else if (!event.failurePersisted) {
+					await this.persistRuntimeState(pluginId, event);
+				}
+				await this.refreshCatalog();
+			} catch (error) {
+				await this.handleObservedLifecycleRevokeFailure(
+					pluginId,
+					runtimeState,
+					error,
+					event.sourceError,
+					event,
+				);
+			}
+		});
 	}
 
 	private async handleObservedLifecycleRevokeFailure(
@@ -2857,6 +3007,7 @@ export class PluginManager {
 		runtimeState: string,
 		error: unknown,
 		sourceError?: unknown,
+		event?: RuntimeStateEvent,
 	): Promise<void> {
 		logger.error("Plugin lifecycle revocation failed for a runtime event", {
 			pluginId,
@@ -2872,10 +3023,17 @@ export class PluginManager {
 						}))
 					: undefined,
 		});
+		if (event && !this.isCurrentRuntimeEvent(pluginId, event)) return;
 		if (runtimeState !== "quarantine") {
 			this.runtimeSupervisor.quarantine(pluginId, "lifecycle revocation failed");
 		}
-		await this.persistFailure(pluginId, error, "lifecycle-revoke", true).catch((persistError) => {
+		await this.persistFailure(
+			pluginId,
+			error,
+			"lifecycle-revoke",
+			true,
+			event ? { ...event, state: "quarantine" } : undefined,
+		).catch((persistError) => {
 			logger.error("Unable to persist plugin lifecycle revocation failure", {
 				pluginId,
 				error: persistError instanceof Error ? persistError.message : String(persistError),
@@ -3008,6 +3166,9 @@ export class PluginManager {
 					source: "upgrade",
 					requestedForVersion: version,
 				});
+				// Permanently denied pairs stay silent across upgrades too: re-declaring
+				// the capability in a new version must not re-raise the question.
+				if (!request) continue;
 				queued.push(capability);
 				eventBus.emit({
 					type: "plugin:permission_request",
@@ -3069,6 +3230,10 @@ export class PluginManager {
 				},
 			);
 
+			// Permanently denied: no row was queued, so the broker surfaces a plain
+			// denial with no pendingRequestId and no UI prompt.
+			if (!req) return undefined;
+
 			eventBus.emit({
 				type: "plugin:permission_request",
 				pluginId: input.pluginId,
@@ -3079,6 +3244,9 @@ export class PluginManager {
 				pluginId: input.pluginId,
 				requestId: req.requestId,
 				capability: input.capability,
+				// Explicit so UI consumers can gate on source without mirroring the
+				// store's "missing means runtime" default.
+				source: "runtime",
 			});
 
 			return { requestId: req.requestId };

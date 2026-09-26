@@ -823,7 +823,12 @@ function availability(entry: InternalProviderEntry): {
 	status: ProviderRegistryStatus;
 	reason?: string;
 } {
-	if (entry.disabled) return { status: "unavailable", reason: "plugin-disabled" };
+	if (entry.disabled) {
+		return {
+			status: "unavailable",
+			reason: entry.explicitUnavailableReason ?? "plugin-disabled",
+		};
+	}
 	if (!entry.compatible) return { status: "unavailable", reason: "plugin-incompatible" };
 	if (entry.explicitUnavailableReason) {
 		return { status: "unavailable", reason: entry.explicitUnavailableReason };
@@ -1484,6 +1489,21 @@ export class PluginProviderRegistry {
 			adapter,
 			catalogStale: entry.catalogStale,
 		};
+	}
+
+	/** Agent resolver bridge; unlike catalog probes, errors here must reach the caller. */
+	resolveExternalProvider(provider: string, model: string): ProviderAdapter | null {
+		// Decline only unknown prefixes. Swallowing PROVIDER_UNAVAILABLE here turns
+		// a temporary lifecycle transition into a misleading "not configured" error.
+		if (!this.findInternal(provider)) return null;
+		const resolved = this.resolveProvider(model);
+		if (!resolved.adapter) {
+			throw new ProviderRegistryError(
+				"PROVIDER_UNAVAILABLE",
+				`Provider ${resolved.providerPrefix} is unavailable: no adapter factory is registered`,
+			);
+		}
+		return resolved.adapter;
 	}
 
 	tryResolveProvider(

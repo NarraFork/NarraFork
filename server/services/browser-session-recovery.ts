@@ -11,6 +11,7 @@
 //   narrator for any session that could not be restored.
 
 import { DEFAULT_LOCALE } from "@shared/i18n-locales";
+import type { Browser } from "puppeteer-core";
 import {
 	closeAllSessions,
 	connectBrowser,
@@ -142,8 +143,10 @@ export async function restoreBrowserSessionsAfterUpdate(): Promise<void> {
 			recordFailure(session.narratorId, session.sessionId, "reconnect_failed");
 			continue;
 		}
+		let restored = false;
 		try {
 			const result = await restoreSessionFromHandoff(browser, session);
+			restored = result.ok;
 			if (result.ok) restoredCount++;
 			else recordFailure(session.narratorId, session.sessionId, result.reason);
 		} catch (error) {
@@ -154,6 +157,10 @@ export async function restoreBrowserSessionsAfterUpdate(): Promise<void> {
 			});
 			recordFailure(session.narratorId, session.sessionId, "restore_error");
 		}
+		// restoreSessionFromHandoff leaves the context intact on failure so a caller
+		// with a retry path could try again. This one has none (the handoff is
+		// read-once), so nothing would ever reference or close the context again.
+		if (!restored) await closeOrphanedContext(browser, session.contextId, session.sessionId);
 	}
 
 	logger.info("Browser session recovery finished", {
@@ -162,6 +169,37 @@ export async function restoreBrowserSessionsAfterUpdate(): Promise<void> {
 	});
 
 	await notifyFailedNarrators(failuresByNarrator);
+}
+
+const ORPHANED_CONTEXT_CLOSE_TIMEOUT_MS = 5_000;
+
+async function closeOrphanedContext(
+	browser: Browser,
+	contextId: string,
+	sessionId: string,
+): Promise<void> {
+	const context = browser.browserContexts().find((ctx) => ctx.id === contextId);
+	if (!context) return;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		// Bounded: a context blocked by a foreign dialog must not stall startup.
+		await Promise.race([
+			context.close(),
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(
+					() => reject(new Error("timed out closing orphaned context")),
+					ORPHANED_CONTEXT_CLOSE_TIMEOUT_MS,
+				);
+			}),
+		]);
+	} catch (error) {
+		logger.warn("Failed to close an unrestorable browser context", {
+			sessionId,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
 }
 
 async function notifyFailedNarrators(
