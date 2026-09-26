@@ -811,7 +811,9 @@ export class RevertTransactionService {
 			signal,
 		});
 		if (
-			resolved.canonicalPath !== file.manifest.identity.canonicalPath ||
+			// Windows canonicalization may differ only in drive-letter/case spelling.
+			// POSIX `equals` compares normalized canonical paths, i.e. the same object.
+			!localBackend.paths.equals(resolved.canonicalPath, file.manifest.identity.canonicalPath) ||
 			resolved.runtimeGeneration !== lease.executionBinding.runtimeGeneration
 		)
 			throw fail("PATH_STALE");
@@ -828,8 +830,9 @@ export class RevertTransactionService {
 	private scopeIdentity(scope: Scope, file: TransactionManifestFile) {
 		if (
 			file.identity.deviceId !== LOCAL_DEVICE_ID ||
-			file.identity.pathFlavor !== "posix" ||
-			process.platform === "win32" ||
+			(localBackend.pathFlavor !== "posix" && localBackend.pathFlavor !== "windows") ||
+			file.identity.pathFlavor !== localBackend.pathFlavor ||
+			scope.pathFlavor !== localBackend.pathFlavor ||
 			!scope.rootIdentityJson?.object ||
 			fileChangeIdentityKey(createFileChangeIdentity(scope, file.identity)) !==
 				fileChangeIdentityKey(file.identity) ||

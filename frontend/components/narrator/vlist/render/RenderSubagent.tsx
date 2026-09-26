@@ -33,18 +33,21 @@ import {
 	Paper,
 	Text,
 	ThemeIcon,
+	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
-import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
 // The row height comes from the shared row metrics, resolved at RENDER time, so it
 // tracks the reader's typography exactly as the measure side does.
 import { bareRowMetrics } from "@shared/pretext-layout/row-metrics";
 import {
+	IconAlertTriangle,
 	IconBan,
 	IconChevronDown,
 	IconChevronRight,
 	IconCircleCheck,
 	IconCircleX,
+	IconLink,
 	IconRobot,
 } from "@tabler/icons-react";
 import type { CSSProperties, ReactNode } from "react";
@@ -119,6 +122,10 @@ export interface SubagentLabels {
 	takenOverBadge?: string;
 	/** The model follows the parent's live selection, not a concrete snapshot. */
 	followParent?: string;
+	/** Tooltip on a followed-parent badge. */
+	followTooltip?: string;
+	/** Tooltip on a pool-fallback badge: `{parentModel}` / `{pool}` placeholders. */
+	fallbackReason?: string;
 	/** File-changes section title ("Changed files"). */
 	fileChanges?: string;
 	/** Suffix for a file whose line counts are unknown. */
@@ -169,6 +176,8 @@ const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing" | "statusMark">> = 
 	backgroundBadge: "Background",
 	takenOverBadge: "Taken over by user",
 	followParent: "Follow parent",
+	followTooltip: "Following the parent model",
+	fallbackReason: "The parent's {parentModel} is not in the {pool} pool",
 	fileChanges: "Changed files",
 	linesNotMeasured: "lines not measured",
 	moreFiles: "{count} more files",
@@ -242,6 +251,8 @@ interface RenderSubagentProps {
 	isTakenOver?: boolean;
 	/** Extra model badge. */
 	model?: string;
+	/** Follow/fallback decision when `model` is `__parent__`. */
+	modelInheritance?: SubagentModelInheritance;
 	/** Extra thinking-effort badge (cyan), mirroring SubagentCard.tsx. */
 	reasoningEffort?: string;
 	/** Collapsed result preview text (first ~120 chars). */
@@ -421,6 +432,51 @@ function RecentCallTiming({
 }
 
 /** Render a SubagentCard from its MeasuredSubagent. */
+/**
+ * Narrow model badge: the model actually running, with an icon for how it was
+ * chosen. The reason for a pool fallback lives in the tooltip, not the badge,
+ * so the fixed badge row does not grow.
+ */
+function SubagentModelBadge({
+	model,
+	inheritance,
+	labels,
+}: {
+	model: string;
+	inheritance?: SubagentModelInheritance;
+	labels: Required<Omit<SubagentLabels, "timing" | "statusMark">>;
+}) {
+	if (model !== FOLLOW_PARENT_MODEL || !inheritance) {
+		return (
+			<Badge data-testid="subagent-model" size="xs" variant="light" color="violet">
+				{model === FOLLOW_PARENT_MODEL ? labels.followParent : model}
+			</Badge>
+		);
+	}
+	const fallback = inheritance.source === "pool-fallback";
+	const tooltip = fallback
+		? labels.fallbackReason
+				.replace("{parentModel}", inheritance.parentModel)
+				.replace("{pool}", inheritance.poolKey ?? "general")
+		: labels.followTooltip;
+	const Icon = fallback ? IconAlertTriangle : IconLink;
+	return (
+		<Tooltip label={tooltip} withinPortal>
+			<Badge
+				data-testid="subagent-model"
+				data-inheritance={inheritance.source}
+				size="xs"
+				variant="light"
+				color={fallback ? "yellow" : "violet"}
+				leftSection={<Icon size={10} aria-hidden />}
+				aria-label={`${inheritance.model} — ${tooltip}`}
+			>
+				{inheritance.model}
+			</Badge>
+		</Tooltip>
+	);
+}
+
 export function RenderSubagent(props: RenderSubagentProps) {
 	const { measured, permissionSlot } = props;
 	const labels = { ...DEFAULT_LABELS, ...props.labels };
@@ -482,6 +538,7 @@ function SubagentInner({
 	isBackground,
 	isTakenOver,
 	model,
+	modelInheritance,
 	reasoningEffort,
 	resultPreview,
 	recentCallNames = [],
@@ -547,9 +604,7 @@ function SubagentInner({
 					</Badge>
 				) : null}
 				{model ? (
-					<Badge data-testid="subagent-model" size="xs" variant="light" color="violet">
-						{model === FOLLOW_PARENT_MODEL ? labels.followParent : model}
-					</Badge>
+					<SubagentModelBadge model={model} inheritance={modelInheritance} labels={labels} />
 				) : null}
 				{reasoningEffort ? (
 					<Badge data-testid="subagent-reasoning-effort" size="xs" variant="light" color="cyan">

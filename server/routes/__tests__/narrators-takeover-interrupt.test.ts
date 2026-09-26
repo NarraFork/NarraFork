@@ -44,10 +44,14 @@ const { generateId } = await import("../../lib/id");
 const {
 	clearTakenOver,
 	consumeForegroundSubagentHardInterrupt,
+	getDetachableMap,
 	getForegroundAbortControllers,
 	isTakenOver,
 	markTakenOver,
+	ProxyAbortController,
 } = await import("../../services/narrator-subagent");
+const { activeNarrators } = await import("../../services/narrator-session-state");
+type ActiveNarrator = import("../../services/narrator-session-state").ActiveNarrator;
 
 afterAll(() => {
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
@@ -134,8 +138,41 @@ beforeAll(async () => {
 	]);
 });
 
+/**
+ * Stand in for a running foreground subagent the way production has it.
+ *
+ * A live subagent is ALWAYS registered in `activeNarrators` (subagent-executor does
+ * it before the first pass) and in the detach registry (subagent-runner, for the
+ * whole run). Registering only the foreground controller — as the cases above do —
+ * lets `interruptNarrator` return false and silently skips the branch production
+ * actually takes, which is how the takeover-destroying Stop went unnoticed.
+ */
+function registerRealisticForegroundRun(id: string, parentSignal = new AbortController().signal) {
+	const turn = registerForegroundTurn(id);
+	const session = new AbortController();
+	activeNarrators.set(id, {
+		narratorId: id,
+		alive: true,
+		abortController: session,
+	} as unknown as ActiveNarrator);
+	getDetachableMap().set(id, {
+		runId: "route-test-run",
+		markDetached: () => {},
+		publishHandoff: () => false,
+		proxy: new ProxyAbortController(),
+		parentSignal,
+		fgAbort: turn,
+		toolUseId: "route-test-tool-use",
+		parentNarratorId: parentId,
+		subagentId: id,
+	});
+	return { turn, session };
+}
+
 afterEach(async () => {
 	getForegroundAbortControllers().clear();
+	getDetachableMap().clear();
+	activeNarrators.delete(subagentId);
 	consumeForegroundSubagentHardInterrupt(subagentId);
 	clearTakenOver(subagentId);
 	// Restore the running-turn state the other tests assume, so a case that parks the
@@ -209,5 +246,56 @@ describe("interrupting a taken-over foreground subagent", () => {
 		const after = await db.select().from(narrators).where(eq(narrators.id, subagentId));
 		expect(after[0]?.status).toBe("idle");
 		expect(after[0]?.substatus).toBe(JSON.stringify(["taken_over"]));
+	});
+
+	test("REAL registration: stops the turn softly, never the session controller", async () => {
+		markTakenOver(subagentId);
+		const { turn, session } = registerRealisticForegroundRun(subagentId);
+
+		const res = await interrupt(subagentId);
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ interrupted: true });
+		// The turn controller is what routes the stop into the takeover-aware control
+		// transition (drain the queue or re-suspend in `taken_over`).
+		expect(turn.signal.aborted).toBe(true);
+		expect(consumeForegroundSubagentHardInterrupt(subagentId)).toBe(false);
+		// The session controller must stay untouched: aborting it is the generic
+		// terminal abort that cleared the takeover and settled the parent's Agent call.
+		expect(session.signal.aborted).toBe(false);
+		expect(isTakenOver(subagentId)).toBe(true);
+		// Nothing was settled on the subagent row either.
+		const after = await db.select().from(narrators).where(eq(narrators.id, subagentId));
+		expect(after[0]?.status).toBe("working");
+	});
+
+	test("REAL registration while SUSPENDED: nothing is stopped or settled", async () => {
+		markTakenOver(subagentId);
+		const { turn, session } = registerRealisticForegroundRun(subagentId);
+		// Suspended in the control transition: the runner still owns the run, but no
+		// turn is in flight, so there is no foreground controller.
+		getForegroundAbortControllers().delete(subagentId);
+		await db
+			.update(narrators)
+			.set({ status: "idle", substatus: JSON.stringify(["taken_over"]) })
+			.where(eq(narrators.id, subagentId));
+
+		const res = await interrupt(subagentId);
+
+		expect(await res.json()).toEqual({ interrupted: false });
+		expect(turn.signal.aborted).toBe(false);
+		expect(session.signal.aborted).toBe(false);
+		expect(isTakenOver(subagentId)).toBe(true);
+		const after = await db.select().from(narrators).where(eq(narrators.id, subagentId));
+		expect(after[0]?.substatus).toBe(JSON.stringify(["taken_over"]));
+	});
+
+	test("REAL registration without a takeover still stops the whole session", async () => {
+		const { session } = registerRealisticForegroundRun(subagentId);
+
+		const res = await interrupt(subagentId);
+
+		expect(await res.json()).toEqual({ interrupted: true });
+		expect(session.signal.aborted).toBe(true);
 	});
 });

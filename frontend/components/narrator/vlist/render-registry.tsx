@@ -14,6 +14,7 @@
  */
 
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
+import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import type { MeasuredElement } from "./prepared-block";
 import type { VListElementKind } from "./registry";
@@ -196,6 +197,7 @@ export function resolveRenderExtra(spec: {
 			if ("description" in data) extra.description = data.description;
 			if ("agentType" in data) extra.agentType = data.agentType;
 			if ("model" in data) extra.model = data.model;
+			if ("modelInheritance" in data) extra.modelInheritance = data.modelInheritance;
 			if ("reasoningEffort" in data) extra.reasoningEffort = data.reasoningEffort;
 			if ("isBackground" in data) extra.isBackground = data.isBackground;
 			// The takeover badge is height-neutral but PAINTED, so it must reach the
@@ -495,6 +497,7 @@ export function renderElement(
 					isBackground={extra.isBackground as boolean | undefined}
 					isTakenOver={extra.isTakenOver as boolean | undefined}
 					model={extra.model as string | undefined}
+					modelInheritance={extra.modelInheritance as SubagentModelInheritance | undefined}
 					reasoningEffort={extra.reasoningEffort as string | undefined}
 					resultPreview={extra.resultPreview as string | undefined}
 					recentCallNames={extra.recentCallNames as string[] | undefined}

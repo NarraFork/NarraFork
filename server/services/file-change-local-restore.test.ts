@@ -15,6 +15,7 @@ import {
 	type LocalRestoreGuard,
 	preflightLocalFileRestore,
 	restoreLocalFile,
+	setLocalRestoreSemanticsForTests,
 } from "./file-change-local-restore";
 import type { WorkspaceRuntimeBinding, WorkspaceWriteLease } from "./workspace-write-coordinator";
 
@@ -218,6 +219,9 @@ async function untouched(f: Awaited<ReturnType<typeof fixture>>, expected: strin
 	return result;
 }
 
+// This suite asserts POSIX contracts (arbitrary modes like 0o640/0o750, O_NONBLOCK,
+// uid checks). Windows behavior is covered by the Windows-semantics suite below,
+// which runs natively on Windows CI and via the semantics override elsewhere.
 const supported = process.platform !== "win32";
 describe.skipIf(!supported)("guarded local typed object restore", () => {
 	test.each([
@@ -1121,4 +1125,122 @@ describe.skipIf(!supported)("guarded local typed object restore", () => {
 			expect(await fs.readFile(join(root, "moved"), "utf8")).toBe("before");
 		},
 	);
+});
+
+// Windows restore DECISIONS applied on the real host FS. On Windows these use the
+// real semantics; elsewhere the override only changes decisions, never authority.
+describe("guarded local restore with Windows semantics", () => {
+	const WRITABLE = 0o666;
+	const READ_ONLY = 0o444;
+	beforeEach(() => setLocalRestoreSemanticsForTests("win32"));
+	afterEach(() => setLocalRestoreSemanticsForTests(null));
+
+	test("bytes restore keeps an unchanged mode without an attribute write", async () => {
+		const f = await fixture("before", "after", { expectedMode: WRITABLE, desiredMode: WRITABLE });
+		let chmods = 0;
+		patchHandle(f.path, (file) => {
+			const chmod = file.chmod.bind(file);
+			file.chmod = async (mode) => {
+				chmods++;
+				return chmod(mode);
+			};
+		});
+		const result = await restoreLocalFile(f.input);
+		expect(result.status).toBe("applied");
+		expect(chmods).toBe(0);
+		expect(await fs.readFile(f.path, "utf8")).toBe("after");
+	});
+
+	test("clearing/setting the read-only attribute opens a writable handle", async () => {
+		const f = await fixture("same", "same", { expectedMode: WRITABLE, desiredMode: READ_ONLY });
+		const flags: number[] = [];
+		const original = fs.open;
+		const spy = spyOn(fs, "open").mockImplementation(async (...args) => {
+			if (args[0] === f.path) flags.push(Number(args[1]));
+			return original(...args);
+		});
+		restorers.push(() => spy.mockRestore());
+		expect((await restoreLocalFile(f.input)).status).toBe("applied");
+		expect(flags.length).toBeGreaterThan(0);
+		for (const value of flags) expect(value & constants.O_RDWR).toBe(constants.O_RDWR);
+		expect((await fs.stat(f.path)).mode & 0o222).toBe(0);
+	});
+
+	test("a mode difference beyond the read-only attribute is refused before dispatch", async () => {
+		const f = await fixture("same", "same", { expectedMode: WRITABLE, desiredMode: 0o755 });
+		expect((await untouched(f, "same")).reason).toBe("unsupported_object");
+	});
+
+	test("creating with an unrepresentable mode is refused before dispatch", async () => {
+		const f = await fixture(null, "created", { name: "created", desiredMode: 0o600 });
+		const result = await restoreLocalFile(f.input);
+		expect(result).toMatchObject({ status: "not_dispatched", reason: "unsupported_object" });
+		expect(await fs.lstat(f.path).catch(() => null)).toBeNull();
+	});
+
+	test("deleting a read-only file is refused before dispatch", async () => {
+		const f = await fixture("keep", null, { expectedMode: READ_ONLY });
+		expect((await untouched(f, "keep")).reason).toBe("permission_denied");
+	});
+
+	test("changing the mode of a read-only file is refused before dispatch", async () => {
+		const f = await fixture("keep", "keep", { expectedMode: READ_ONLY, desiredMode: WRITABLE });
+		expect((await untouched(f, "keep")).reason).toBe("permission_denied");
+	});
+
+	test("delete closes its own descriptor and re-proves identity before unlink", async () => {
+		const f = await fixture("gone", null, { expectedMode: WRITABLE });
+		let closedBeforeUnlink = false;
+		let handle: fs.FileHandle | undefined;
+		patchHandle(f.path, (file) => {
+			handle = file;
+		});
+		const originalUnlink = fs.unlink;
+		const unlink = spyOn(fs, "unlink").mockImplementation(async (path) => {
+			// A closed FileHandle reports fd -1.
+			closedBeforeUnlink = handle?.fd === -1;
+			return originalUnlink(path);
+		});
+		restorers.push(() => unlink.mockRestore());
+		const result = await restoreLocalFile(f.input);
+		expect(result.status).toBe("applied");
+		expect(closedBeforeUnlink).toBe(true);
+		expect(await fs.lstat(f.path).catch(() => null)).toBeNull();
+	});
+
+	test("a replacement between releasing the descriptor and unlink is refused", async () => {
+		const f = await fixture("gone", null, { expectedMode: WRITABLE });
+		patchHandle(f.path, (file) => {
+			const close = file.close.bind(file);
+			file.close = async () => {
+				await close();
+				await fs.rename(f.path, join(root, "moved"));
+				await fs.writeFile(f.path, "gone");
+			};
+		});
+		const result = await restoreLocalFile(f.input);
+		expect(result).toMatchObject({ status: "not_dispatched", reason: "target_changed" });
+		expect(await fs.readFile(f.path, "utf8")).toBe("gone");
+		expect(await fs.readFile(join(root, "moved"), "utf8")).toBe("gone");
+	});
+
+	test("a sharing violation before dispatch is a retryable io_busy, not a write", async () => {
+		const f = await fixture("before", "after", { expectedMode: WRITABLE, desiredMode: WRITABLE });
+		const spy = spyOn(fs, "open").mockImplementation(async () => {
+			throw Object.assign(new Error("resource busy or locked"), { code: "EBUSY" });
+		});
+		restorers.push(() => spy.mockRestore());
+		expect((await untouched(f, "before")).reason).toBe("io_busy");
+	});
+
+	test("a sharing violation after dispatch stays uncertain", async () => {
+		const f = await fixture("before", "after", { expectedMode: WRITABLE, desiredMode: WRITABLE });
+		patchHandle(f.path, (file) => {
+			file.truncate = async () => {
+				throw Object.assign(new Error("resource busy or locked"), { code: "EBUSY" });
+			};
+		});
+		const result = await restoreLocalFile(f.input);
+		expect(result).toMatchObject({ status: "uncertain_after_dispatch", reason: "io_busy" });
+	});
 });

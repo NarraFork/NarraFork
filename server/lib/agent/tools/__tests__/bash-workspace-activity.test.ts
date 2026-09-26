@@ -162,6 +162,9 @@ if (migrationScenario) {
 	const { writeTool } = await import("../write");
 	const { localBackend } = await import("../../execution/local-backend");
 	const { windowsPathSemantics } = await import("../../execution/path-semantics");
+	const { LocalFileValidationError, LocalObjectIdentityUnavailableError } = await import(
+		"@server/services/file-change-local-io"
+	);
 	const {
 		LocalFileChangeRuntime: Runtime,
 		withLocalFileChangeRuntime,
@@ -768,14 +771,15 @@ await Bun.write("bash.txt", "finished");`;
 			expect(await readFile(join(workspace, "bash.txt"), "utf8")).toBe("second");
 		});
 
-		test("remote and Windows targets never initialize a local evidence namespace", async () => {
+		const complete = (): ExecHandle => ({
+			exited: Promise.resolve(0),
+			onData() {},
+			isExited: () => true,
+			kill: async () => {},
+		});
+
+		test("remote targets never initialize a local evidence namespace", async () => {
 			const register = spyOn(runtime, "registerBashActivity");
-			const complete = (): ExecHandle => ({
-				exited: Promise.resolve(0),
-				onData() {},
-				isExited: () => true,
-				kill: async () => {},
-			});
 			backend = Object.assign(Object.create(localBackend), {
 				kind: "remote",
 				deviceId: "remote-fixture",
@@ -783,15 +787,68 @@ await Bun.write("bash.txt", "finished");`;
 				execCommand: mock(async () => complete()),
 			});
 			expect((await run("remote-command", context())).isError).not.toBe(true);
+			expect(register).not.toHaveBeenCalled();
+			expect(db.select().from(schema.fileChangeScopes).all()).toHaveLength(0);
+		});
+
+		test("local Windows Bash is registered with the coordinator like POSIX", async () => {
+			// Rollback runs on Windows too, so an unregistered local shell could write
+			// under a rollback lease. The Windows-flavored backend must reach admission.
+			const register = spyOn(runtime, "registerBashActivity").mockImplementation(async () => {
+				throw new Error("admission reached");
+			});
+			const execCommand = mock(async () => complete());
 			backend = Object.assign(Object.create(localBackend), {
 				pathFlavor: "windows",
 				paths: windowsPathSemantics,
 				statFile: async () => ({ isDirectory: true, isFile: false, size: 0 }),
-				execCommand: mock(async () => complete()),
+				execCommand,
 			});
+			expect((await run("windows-command", context("C:\\workspace"))).isError).toBe(true);
+			expect(register).toHaveBeenCalledTimes(1);
+			// Failed admission fails closed before the shell is dispatched.
+			expect(execCommand).not.toHaveBeenCalled();
+		});
+
+		const windowsBackend = (execCommand: ExecutionBackend["execCommand"]) =>
+			Object.assign(Object.create(localBackend), {
+				pathFlavor: "windows",
+				paths: windowsPathSemantics,
+				statFile: async () => ({ isDirectory: true, isFile: false, size: 0 }),
+				execCommand,
+			});
+
+		test("a Windows volume without object identities runs Bash uncoordinated", async () => {
+			// FAT/exFAT and some shares report no dev/ino/birthtime: such a workspace can
+			// never hold rollback evidence, so there is no lease for the shell to race.
+			spyOn(runtime, "registerBashActivity").mockImplementation(async () => {
+				throw new LocalObjectIdentityUnavailableError("no object identity");
+			});
+			const execCommand = mock(async () => complete());
+			backend = windowsBackend(execCommand);
 			expect((await run("windows-command", context("C:\\workspace"))).isError).not.toBe(true);
-			expect(register).not.toHaveBeenCalled();
-			expect(db.select().from(schema.fileChangeScopes).all()).toHaveLength(0);
+			expect(execCommand).toHaveBeenCalledTimes(1);
+		});
+
+		test("other Windows admission validation failures still fail closed", async () => {
+			// Only "the volume has no identities" is exempt; a real mismatch is not.
+			spyOn(runtime, "registerBashActivity").mockImplementation(async () => {
+				throw new LocalFileValidationError("Canonical workspace root is not a directory");
+			});
+			const execCommand = mock(async () => complete());
+			backend = windowsBackend(execCommand);
+			expect((await run("windows-command", context("C:\\workspace"))).isError).toBe(true);
+			expect(execCommand).not.toHaveBeenCalled();
+		});
+
+		test("POSIX never degrades on a missing object identity", async () => {
+			spyOn(runtime, "registerBashActivity").mockImplementation(async () => {
+				throw new LocalObjectIdentityUnavailableError("no object identity");
+			});
+			const execCommand = mock(async () => complete());
+			backend = Object.assign(Object.create(localBackend), { execCommand });
+			expect((await run("posix-command")).isError).toBe(true);
+			expect(execCommand).not.toHaveBeenCalled();
 		});
 
 		test("frozen remote target cannot fall back to local and stale local runtime cannot spawn", async () => {

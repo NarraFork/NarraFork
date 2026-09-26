@@ -133,6 +133,7 @@ export type ScopedRevertUnavailableReason =
 	| "runtime_reload_required"
 	| "incomplete_coverage"
 	| "unsupported_target"
+	| "platform_unsupported"
 	| "pending_operations"
 	| "nothing_owned";
 

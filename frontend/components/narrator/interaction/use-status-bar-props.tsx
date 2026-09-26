@@ -1,7 +1,7 @@
 import type { TFunction } from "i18next";
 import type React from "react";
 import type { useModelCardIndex } from "../../../hooks/useModelCards";
-import type { ModelOption } from "../../../lib/constants";
+import { FOLLOW_PARENT_MODEL, type ModelOption } from "../../../lib/constants";
 import type { NarratorInteractionStatusBarProps } from "./NarratorInteractionStatusBar";
 import { useFastModeControl } from "./use-fast-mode-control";
 import { useModelSelection } from "./use-model-selection";
@@ -106,6 +106,11 @@ export function useStatusBarProps(
 		resolvedBareModel: options.resolvedBareModel,
 		resolvedModelOption: options.resolvedModelOption,
 		narratorReasoningEffort: options.narratorReasoningEffort,
+		// Only a following child inherits; a pinned child's inheritance is stale.
+		inheritedReasoningEffort:
+			options.narrator.model === FOLLOW_PARENT_MODEL
+				? options.narrator.modelInheritance?.parentReasoningEffort
+				: undefined,
 		settingsData: options.settingsData,
 		modelCardIndex: options.modelCardIndex,
 		reasoningEffortMutation: options.reasoningEffortMutation,

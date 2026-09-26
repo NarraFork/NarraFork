@@ -26,6 +26,31 @@ export type RuntimeControlOutcome =
 	| { kind: "finish"; finalText: string; hasError: boolean; interrupted: boolean }
 	| { kind: "resume"; prompt: string; userId: string | null; prePromptBashCommand?: string };
 
+/**
+ * Whether the pass just ended because THIS subagent's current turn was stopped.
+ *
+ * The canonical signal is `turnAbort`. But the session-level `active.abortController`
+ * is only linked one way (turnAbort → proxy → session), so anything that aborts the
+ * session controller directly — `interruptNarrator(subagentId)` from the Stop route,
+ * the plugin API, the gateway — leaves `turnAbort` untouched. For an ordinary
+ * subagent that is a real end of the run. For a TAKEN-OVER one it must not be: the
+ * user drives it like an independent narrator, so stopping it means "stop this turn",
+ * and treating it as a terminal abort would clear the takeover and hand a result to
+ * the parent that is still supposed to be blocked. Parent/timeout/detach aborts are
+ * excluded here and again inside {@link applyForegroundControl}.
+ */
+export function isForegroundTurnInterrupted(
+	active: ActiveNarrator,
+	profile: SubagentRuntimeProfile,
+): boolean {
+	const control = profile.control;
+	if (!control) return false;
+	if (control.turnAbort.signal.aborted) return true;
+	if (control.detached || control.parentSignal.aborted || control.timeoutSignal?.aborted)
+		return false;
+	return active.alive && active.abortController.signal.aborted && isTakenOver(active.narratorId);
+}
+
 /** A bounded control transition, not a second executor or next-pass loop. */
 export async function applyForegroundControl(
 	active: ActiveNarrator,
@@ -38,7 +63,7 @@ export async function applyForegroundControl(
 	const id = active.narratorId;
 	if (control.detached || control.parentSignal.aborted || control.timeoutSignal?.aborted)
 		return { kind: "none" };
-	const locallyInterrupted = control.turnAbort.signal.aborted;
+	const locallyInterrupted = isForegroundTurnInterrupted(active, profile);
 	if (consumeForegroundSubagentHardInterrupt(id) && locallyInterrupted) {
 		return {
 			kind: "finish",

@@ -429,7 +429,10 @@ import {
 import { broadcastSpecChanged } from "../services/spec-broadcast";
 import { appendProtectedSpecTask } from "../services/spec-vfs-service";
 import { resolveStandaloneNarratorCwd } from "../services/standalone-narrator-cwd";
-import { resolveSubagentModelForRun } from "../services/subagent-model";
+import {
+	resolveSubagentModelForRun,
+	resolveSubagentModelInheritance,
+} from "../services/subagent-model";
 import { resumeSubagent, withSubagentResumeLock } from "../services/subagent-resume";
 import { TAKEN_OVER_SUBSTATUS } from "../services/subagent-takeover";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
@@ -1348,9 +1351,18 @@ narratorRoutes.get("/:id", async (c) => {
 	// value here. One narrator's refs are cheap to count exactly (an indexed count(*)),
 	// unlike the list endpoint where it would mean one subquery per row.
 	const messageCount = await countNarratorMessageRefs(id);
+	// Policy decision only (no routing, so balanced aggregations do not advance).
+	// A resolution failure just leaves the plain "follow parent" label.
+	const modelInheritance =
+		narrator.model === FOLLOW_PARENT_MODEL
+			? await resolveSubagentModelInheritance(narrator, c.get("user").sub)
+					.then((result) => result.inheritance)
+					.catch(() => undefined)
+			: undefined;
 	return c.json({
 		...publicNarratorResponse(narrator, hasDraft),
 		messageCount,
+		...(modelInheritance && { modelInheritance }),
 		...(runtimeModel && {
 			runtimeModel: {
 				provider: runtimeModel.provider,
@@ -3866,13 +3878,39 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 	// the runBashFirst pre-prompt flow), so the loop-level abort below cannot
 	// reach the underlying process on its own.
 	let interrupted = interruptManualBash(id);
-	if (interruptNarrator(id)) interrupted = true;
-	if (!interrupted) {
+	// A TAKEN-OVER subagent owned by the foreground runner is stopped through its turn
+	// controller, never through `interruptNarrator`. A running subagent is always
+	// registered in `activeNarrators`, so `interruptNarrator` would succeed and abort
+	// the SESSION controller — bypassing `turnAbort`, so the runtime took the generic
+	// abort exit, cleared the takeover and settled the parent's blocked Agent call.
+	// Aborting `turnAbort` softly routes the stop into the control transition that
+	// drains the queue or re-suspends in `taken_over`. While SUSPENDED there is no turn
+	// controller and nothing is touched (see the EXCEPTION note below).
+	//
+	// Ownership is judged by the detach registry, which the foreground runner holds for
+	// its whole run (suspension included). A takeover continued on the session engine
+	// has no entry there and keeps the ordinary `interruptNarrator` stop.
+	const {
+		getDetachableMap,
+		getForegroundAbortControllers,
+		interruptForegroundSubagent,
+		interruptForegroundSubagentsForParent,
+		isTakenOver,
+	} = await import("../services/narrator-subagent");
+	const foregroundTakeover = isTakenOver(id) && getDetachableMap().has(id);
+	if (foregroundTakeover) {
+		if (getForegroundAbortControllers().has(id)) {
+			interrupted = interruptForegroundSubagent(id, { hard: false }) || interrupted;
+			// `interruptNarrator` would also have stopped this subagent's own child
+			// subagents; keep that fan-out. It only touches children whose owning Agent
+			// call was cancelled by the abort above.
+			void interruptForegroundSubagentsForParent(id).catch(() => {});
+		}
+	} else if (interruptNarrator(id)) interrupted = true;
+	if (!interrupted && !foregroundTakeover) {
 		// Fallback: the UI Stop button should hard-stop foreground/background subagents.
 		// The soft foreground interrupt is still used by Send({ doInterrupt: true }).
-		const { cancelBackgroundTask, interruptForegroundSubagent, isTakenOver } = await import(
-			"../services/narrator-subagent"
-		);
+		const { cancelBackgroundTask } = await import("../services/narrator-subagent");
 		// EXCEPTION — a taken-over subagent must never be HARD interrupted from here.
 		// A hard interrupt makes runForegroundLoop break out of its loop before the
 		// queue-drain and the takeover suspension, so `finalizeSubagent` discards
@@ -3900,7 +3938,9 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 	// Fallback: if no active loop found but DB status is still working/waiting,
 	// the narrator is a zombie (loop ended without updating status, e.g. after
 	// hot reload or unhandled error). Force-reset to interrupted.
-	if (!interrupted) {
+	// A foreground takeover still owned by its runner is never a zombie: overwriting
+	// its status would erase `taken_over` while the parent is still blocked on it.
+	if (!interrupted && !foregroundTakeover) {
 		const narrator = await narratorService.getById(id);
 		if (narrator.status === "working" || narrator.status === "waiting") {
 			await narratorService.updateStatus(id, "idle", { substatus: ["interrupted"] });

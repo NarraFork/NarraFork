@@ -43,6 +43,8 @@ export interface ActiveNarrator {
 	_modelRefreshError?: unknown;
 	/** Fixed effort mandated by the inherited model's selected pool entry. */
 	_inheritedReasoningEffort?: ReasoningEffort;
+	/** Parent's own override for a `__parent__` child; ranks below the child's override. */
+	_parentReasoningEffort?: ReasoningEffort;
 	model: string;
 	provider: string;
 	/** Settings revision used to derive `_modelRef` / `_reasoningEffortRef` into runtime values. */

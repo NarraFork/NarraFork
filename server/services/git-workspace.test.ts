@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { GitWorkspace } from "@shared/git-workspace";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
@@ -839,4 +839,92 @@ test("a narrower path grant never authorizes the containing worktree", () => {
 	);
 	expect(gitPathPolicyAllows(policy, context, repo, "read")).toBe(false);
 	expect(gitPathPolicyAllows(policy, context, repo, "write")).toBe(false);
+});
+
+test("repository root above cwd: ancestor grants do not narrow it, a cwd grant still does", () => {
+	// cwd is a package inside the repo, so the repo root is an ANCESTOR of cwd.
+	const cwd = join(repo, "packages", "a");
+	const context: ExecutionTargetContext = {
+		backend: localBackend,
+		paths: localBackend.paths,
+		deviceClass: null,
+		target: {
+			deviceId: "local",
+			backendKind: "local",
+			cwd,
+			pathFlavor: localBackend.pathFlavor,
+			runtimeGeneration: 0,
+			selectionSource: "session_default",
+		},
+	};
+	const withGrant = (path: string, accessLevel: "readOnly" | "readWrite") =>
+		compileExecutionPolicy(
+			{
+				directoryWhitelist: [
+					{
+						ruleType: "directoryWhitelist",
+						enabled: true,
+						path,
+						pathFlavor: "posix",
+						pathKey: path,
+						accessLevel,
+						selector: { kind: "host" },
+						source: "narrator",
+					},
+				],
+				directoryBlacklist: [],
+				commandWhitelist: [],
+				commandBlacklist: [],
+			},
+			context,
+		);
+	// A readOnly grant covering the repo (from above) only grants; like no rule at all.
+	const ancestor = withGrant(dirname(repo), "readOnly");
+	expect(gitPathPolicyAllows(ancestor, context, repo, "read")).toBe(true);
+	expect(gitPathPolicyAllows(ancestor, context, repo, "write")).toBe(true);
+	// An explicit grant on cwd is narrower than the repo root: still no whole-repo access.
+	const narrower = withGrant(cwd, "readWrite");
+	expect(gitPathPolicyAllows(narrower, context, repo, "read")).toBe(false);
+	expect(gitPathPolicyAllows(narrower, context, repo, "write")).toBe(false);
+});
+
+test("a readOnly grant on an ancestor or the root itself never downgrades the worktree", () => {
+	const context: ExecutionTargetContext = {
+		backend: localBackend,
+		paths: localBackend.paths,
+		deviceClass: null,
+		target: {
+			deviceId: "local",
+			backendKind: "local",
+			cwd: repo,
+			pathFlavor: localBackend.pathFlavor,
+			runtimeGeneration: 0,
+			selectionSource: "session_default",
+		},
+	};
+	// e.g. projects/{a,b,c}: narrator runs in a, grants readOnly on projects/ to read b and c.
+	for (const grantPath of [dirname(repo), repo]) {
+		const policy = compileExecutionPolicy(
+			{
+				directoryWhitelist: [
+					{
+						ruleType: "directoryWhitelist",
+						enabled: true,
+						path: grantPath,
+						pathFlavor: "posix",
+						pathKey: grantPath,
+						accessLevel: "readOnly",
+						selector: { kind: "host" },
+						source: "narrator",
+					},
+				],
+				directoryBlacklist: [],
+				commandWhitelist: [],
+				commandBlacklist: [],
+			},
+			context,
+		);
+		expect(gitPathPolicyAllows(policy, context, repo, "read")).toBe(true);
+		expect(gitPathPolicyAllows(policy, context, repo, "write")).toBe(true);
+	}
 });

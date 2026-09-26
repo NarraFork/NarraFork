@@ -100,6 +100,7 @@ export function upsertSubagentToolCallHeader(
 		subagentNarratorId: activity?.subagentNarratorId ?? null,
 		model: normalizeSubagentModel(activity?.model),
 		...(reasoningEffort ? { reasoningEffort } : {}),
+		...(activity?.modelInheritance ? { modelInheritance: activity.modelInheritance } : {}),
 		// This rebuilds the summary from scratch, so anything not restated here is
 		// ERASED. A child tool event knows nothing about takeover, and dropping the
 		// flag on every such event would make the badge flicker off the moment the
@@ -151,6 +152,10 @@ export function replaceSubagentActivitySnapshot(
 				? { fileChanges: sameChild.fileChanges }
 				: {}),
 		...(reasoningEffort ? { reasoningEffort } : {}),
+		// Like `model`, an empty snapshot must not erase a known decision.
+		...((activity.modelInheritance ?? sameChild?.modelInheritance)
+			? { modelInheritance: activity.modelInheritance ?? sameChild?.modelInheritance }
+			: {}),
 		// The snapshot is AUTHORITATIVE for takeover (the server reads the live
 		// in-memory Set when building it), so unlike `model` it must NOT fall back to
 		// the previous value: a snapshot arriving after the user stopped the takeover

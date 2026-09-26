@@ -1,5 +1,6 @@
 import { parseCompactMessageBlock } from "@shared/compact-message";
 import { type FileReferenceDisplay, fileReferenceDisplay } from "@shared/file-reference";
+import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
 import {
@@ -96,6 +97,7 @@ import {
 	type SubagentExecutionBoundary,
 	type SubagentFileChanges,
 } from "./subagent-file-changes";
+import { getRecentSubagentModelInheritance } from "./subagent-model";
 import { isTakenOverForDisplay, listDisplayTakenOverSubagents } from "./subagent-takeover";
 import { toolEditPreviewColumns } from "./tool-edit-preview";
 
@@ -2110,6 +2112,8 @@ export interface SubagentActivity {
 	model: string | null;
 	/** Effective tier used by the subagent, including the global default when stored override is null. */
 	reasoningEffort: string | null;
+	/** Last run's follow/fallback decision for `__parent__` children; absent when unknown. */
+	modelInheritance?: SubagentModelInheritance;
 	latestToolCalls: SubagentActivityToolCall[];
 	/**
 	 * Files this subagent changed, with cumulative line churn.
@@ -2305,10 +2309,17 @@ async function buildSubagentActivities(
 			(owner.model
 				? resolveDefaultReasoningEffort(resolveProvider(owner.model), owner.model)
 				: undefined);
+		// In-memory read of the last run's decision; resolving traits per card here
+		// would turn a history page into a query storm.
+		const modelInheritance =
+			owner.model === FOLLOW_PARENT_MODEL
+				? getRecentSubagentModelInheritance(owner.subagentNarratorId)
+				: undefined;
 		activities.set(owner.parentToolUseId, {
 			subagentNarratorId: owner.subagentNarratorId,
 			model: owner.model,
 			reasoningEffort: effectiveReasoningEffort ?? null,
+			...(modelInheritance ? { modelInheritance } : {}),
 			latestToolCalls: toolCallsByNarrator.get(owner.subagentNarratorId) ?? [],
 			// Omitted (not an empty aggregate) when the child changed nothing, so a card
 			// that has no files to show carries no extra payload.

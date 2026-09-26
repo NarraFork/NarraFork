@@ -13,6 +13,7 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
+import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import { IconLock, IconLockOpen, IconShield } from "@tabler/icons-react";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -40,6 +41,7 @@ import type {
 import { CodexQuotaIndicator } from "../model/CodexQuotaIndicator";
 import { ModelMenuItems } from "../model/ModelMenuItems";
 import { ModelPriceModal } from "../model/ModelPriceModal";
+import { modelInheritanceLabel } from "../model/model-inheritance-label";
 import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
 import type { RetryInfo } from "../useNarratorPanelWS";
 import { InlineOverrideActions } from "./InlineOverrideActions";
@@ -77,6 +79,10 @@ export interface NarratorInteractionStatusBarProps {
 	/** The narrator object (read-only display of model/permissionMode/etc.). */
 	narrator: {
 		model?: string | null;
+		/** Follow/fallback decision when `model` is `__parent__`. */
+		modelInheritance?: SubagentModelInheritance | null;
+		/** `subagent:*` narrators may switch back to following their parent. */
+		variant?: string | null;
 		permissionMode?: string | null;
 		totalCostUsd?: number | null;
 		isAskInPassing?: boolean | null;
@@ -355,6 +361,14 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 		t,
 	]);
 
+	const followsParent = narrator.model === FOLLOW_PARENT_MODEL;
+	const canFollowParent = !!narrator.variant?.startsWith("subagent:");
+	const inheritance = followsParent ? modelInheritanceLabel(narrator.modelInheritance, t) : null;
+	const followLabel = inheritance?.label ?? t("followParent");
+	const followTooltip = inheritance
+		? (inheritance.reason ?? t("inheritance.followTooltip"))
+		: t("followParent");
+
 	return (
 		<>
 			<NarratorStatusBar
@@ -543,13 +557,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 									<NarratorStatusToolbar
 										leading={
 											<Group gap={6} wrap="nowrap">
-												<Tooltip
-													label={
-														narrator.model === FOLLOW_PARENT_MODEL
-															? t("followParent")
-															: t("modelTooltip")
-													}
-												>
+												<Tooltip label={followsParent ? followTooltip : t("modelTooltip")}>
 													<Menu
 														position="top-end"
 														opened={menuOpenDesktop}
@@ -565,8 +573,8 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																// The menu renders the full catalog; the trigger only needs
 																// the selected option so native sizing ignores longer models.
 																data={
-																	narrator.model === FOLLOW_PARENT_MODEL
-																		? [{ value: FOLLOW_PARENT_MODEL, label: t("followParent") }]
+																	followsParent
+																		? [{ value: FOLLOW_PARENT_MODEL, label: followLabel }]
 																		: model.allModels
 																				.filter((m) => {
 																					const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
@@ -600,6 +608,11 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																onChange={() => {}}
 																onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
 																style={{ pointerEvents: "auto" }}
+																styles={
+																	inheritance?.fallback
+																		? { input: { color: "var(--mantine-color-yellow-5)" } }
+																		: undefined
+																}
 															/>
 														</Menu.Target>
 														<Menu.Dropdown
@@ -611,6 +624,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																aggregations={model.aggregations}
 																allModels={model.allModels}
 																currentModel={narrator.model}
+																canFollowParent={canFollowParent}
 																totalCostUsd={narrator.totalCostUsd}
 																onSelect={(v) =>
 																	model.mutation.mutate({ id: narratorId, model: v })
@@ -836,13 +850,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 								<NarratorStatusToolbar
 									leading={
 										<>
-											<Tooltip
-												label={
-													narrator.model === FOLLOW_PARENT_MODEL
-														? t("followParent")
-														: t("modelTooltip")
-												}
-											>
+											<Tooltip label={followsParent ? followTooltip : t("modelTooltip")}>
 												<Menu
 													position="bottom-end"
 													withinPortal
@@ -855,18 +863,16 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 													<Menu.Target>
 														<ActionIcon
 															variant="subtle"
-															color="gray"
 															size="sm"
-															aria-label={
-																narrator.model === FOLLOW_PARENT_MODEL
-																	? t("followParent")
-																	: t("modelTooltip")
-															}
+															color={inheritance?.fallback ? "yellow" : "gray"}
+															aria-label={followsParent ? followLabel : t("modelTooltip")}
 														>
 															<Text size="xs" fw={600}>
 																{(() => {
-																	if (narrator.model === FOLLOW_PARENT_MODEL)
-																		return t("followParent").charAt(0);
+																	if (followsParent)
+																		return (inheritance?.model ?? t("followParent"))
+																			.charAt(0)
+																			.toUpperCase();
 																	if (narrator.model === FOLLOW_DEFAULT_MODEL || !narrator.model)
 																		return "D";
 																	const m = model.allModels.find((x) => x.value === narrator.model);
@@ -889,6 +895,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															aggregations={model.aggregations}
 															allModels={model.allModels}
 															currentModel={narrator.model}
+															canFollowParent={canFollowParent}
 															totalCostUsd={narrator.totalCostUsd}
 															onSelect={(v) => model.mutation.mutate({ id: narratorId, model: v })}
 															onShowPrice={setPriceModel}

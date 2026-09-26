@@ -27,6 +27,7 @@ import {
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { isSubagentModelInheritance } from "@shared/model-inheritance";
 import type { SubagentModelPools } from "@shared/subagent-model-policy";
 import {
 	IconChevronDown,
@@ -102,6 +103,7 @@ import {
 } from "../details-panel-lifecycle";
 import { localizeNarratorError } from "../error-localization";
 import { NarratorAvatar } from "../header/NarratorAvatar";
+import { modelInheritanceLabel } from "../model/model-inheritance-label";
 import { SubagentModelPoolEditor } from "../model/SubagentModelPoolEditor";
 import type { ViewerInfo } from "../useNarratorPanelWS";
 import {
@@ -432,9 +434,15 @@ function NarratorDetailsContent({
 		: false;
 	const refreshNarratorSkillsMutation = useRefreshNarratorSkills();
 
+	const inheritanceLabel =
+		narrator?.model === FOLLOW_PARENT_MODEL && isSubagentModelInheritance(narrator.modelInheritance)
+			? modelInheritanceLabel(narrator.modelInheritance, t)
+			: null;
 	const resolvedModel =
 		narrator?.model === FOLLOW_PARENT_MODEL
-			? t("followParent")
+			? inheritanceLabel
+				? `${inheritanceLabel.label}${inheritanceLabel.reason ? ` (${inheritanceLabel.reason})` : ""}`
+				: t("followParent")
 			: narrator?.model && narrator.model !== FOLLOW_DEFAULT_MODEL
 				? narrator.model
 				: defaultModelValue || narrator?.model || t("details.notAvailable");

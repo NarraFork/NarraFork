@@ -1139,6 +1139,7 @@ const reasonKeys = {
 	runtime_reload_required: "revertScopeRuntimeReloadRequired",
 	incomplete_coverage: "revertScopeIncompleteCoverage",
 	unsupported_target: "revertScopeUnsupportedTarget",
+	platform_unsupported: "revertScopePlatformUnsupported",
 	pending_operations: "revertScopePendingOperations",
 	future_unknown_reason: "revertScopeUnavailable",
 } as const;

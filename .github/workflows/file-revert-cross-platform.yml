@@ -1,0 +1,74 @@
+name: file-revert-cross-platform
+
+# Verified file rollback runs on POSIX and Windows servers. Windows semantics
+# (synthetic modes, no O_NOFOLLOW, sharing violations, NTFS object identity) can
+# only be proven on a real Windows host, so run the pipeline tests on both.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "server/services/file-change-*.ts"
+      - "server/services/revert-*.ts"
+      - "server/services/workspace-write-*.ts"
+      - "server/services/narrator-scoped-revert.ts"
+      - "server/lib/agent/execution/local-backend.ts"
+      - "server/lib/agent/execution/path-semantics.ts"
+      - "server/lib/agent/tools/bash.ts"
+      - "server/lib/agent/tools/__tests__/bash-workspace-activity.test.ts"
+      - "shared/file-change-protocol.ts"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/file-revert-cross-platform.yml"
+  pull_request:
+    paths:
+      - "server/services/file-change-*.ts"
+      - "server/services/revert-*.ts"
+      - "server/services/workspace-write-*.ts"
+      - "server/services/narrator-scoped-revert.ts"
+      - "server/lib/agent/execution/local-backend.ts"
+      - "server/lib/agent/execution/path-semantics.ts"
+      - "server/lib/agent/tools/bash.ts"
+      - "server/lib/agent/tools/__tests__/bash-workspace-activity.test.ts"
+      - "shared/file-change-protocol.ts"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/file-revert-cross-platform.yml"
+  workflow_dispatch:
+
+jobs:
+  file-revert:
+    name: File revert pipeline (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Check TypeScript
+        run: bunx tsgo --noEmit
+
+      - name: Run file revert tests
+        run: >-
+          bun test --isolate
+          ./server/services/file-change-platform-capability.test.ts
+          ./server/services/file-change-local-restore.test.ts
+          ./server/services/file-change-runtime.test.ts
+          ./server/services/revert-transaction-service.test.ts
+          ./server/services/revert-planner-local-access.test.ts
+          ./server/services/revert-mutation-journal.test.ts
+          ./server/services/narrator-scoped-revert.test.ts
+          ./server/lib/agent/tools/__tests__/bash-workspace-activity.test.ts

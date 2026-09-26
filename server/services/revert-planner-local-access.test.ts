@@ -1101,6 +1101,29 @@ describe("action apply reauthorization and immutable admission", () => {
 		}
 	});
 
+	test("an unsupported data volume is reported as platform_unsupported and blocks apply", async () => {
+		const { path, call } = await fixture();
+		const plan = await actionPrepared("delete_tool_block", call.messageId, { blockIndex: 1 });
+		const before = history();
+		const capability = await import("./file-change-platform-capability");
+		const probe = spyOn(capability, "fileChangePlatformCapability").mockResolvedValue({
+			supported: false,
+			platform: "win32",
+			reason: "object_identity_unavailable",
+		});
+		try {
+			const preview = await boundedJson(await actionPreview("revert_files"));
+			expect(preview).toMatchObject({ plan: null, unavailable: "platform_unsupported" });
+			const rejected = await boundedJson(await apply(plan, "delete_tool_block"), 409);
+			expect(rejected.code).toBe("REVERT_PLANNER_PLATFORM_UNSUPPORTED");
+			expect(await readFile(path, "utf8")).toBe("new\n");
+			expect(history()).toBe(before);
+			expect(journalFiles(plan).every((file) => file.receiptJson === null)).toBe(true);
+		} finally {
+			probe.mockRestore();
+		}
+	});
+
 	test("multi-tool rollback cannot masquerade as a single-tool delete", async () => {
 		const boundary = message("user", [{ type: "text", text: "keep user" }]);
 		const { path } = await fixture();

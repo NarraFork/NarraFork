@@ -168,6 +168,11 @@ export interface UseModelSelectionOptions {
 	resolvedBareModel: string;
 	resolvedModelOption: ModelOption | undefined;
 	narratorReasoningEffort: string | null | undefined;
+	/**
+	 * A `__parent__` subagent's parent override. With no override of its own the
+	 * child follows this tier rather than the global default.
+	 */
+	inheritedReasoningEffort?: string | null;
 	settingsData: ModelSelectionSettings | undefined;
 	modelCardIndex: ModelCardIndex;
 	reasoningEffortMutation: ReasoningEffortMutation;
@@ -205,6 +210,7 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 		resolvedBareModel,
 		resolvedModelOption,
 		narratorReasoningEffort,
+		inheritedReasoningEffort,
 		settingsData,
 		modelCardIndex,
 		reasoningEffortMutation,
@@ -339,7 +345,8 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 	const displayedReasoningEffort = useMemo(() => {
 		const opts = reasoningEffortOptions as readonly ReasoningEffort[];
 		const desired = reasoningFollowsDefault
-			? globalDefaultReasoningEffort
+			? ((inheritedReasoningEffort as ReasoningEffort | null | undefined) ??
+				globalDefaultReasoningEffort)
 			: (normalizeReasoningEffortForModel(
 					resolvedModel,
 					narratorReasoningEffort,
@@ -351,6 +358,7 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 		narratorReasoningEffort,
 		reasoningEffortOptions,
 		reasoningFollowsDefault,
+		inheritedReasoningEffort,
 		globalDefaultReasoningEffort,
 	]);
 

@@ -746,6 +746,102 @@ describe("real shared orchestrator profile contract", () => {
 		}
 	});
 
+	test("a SESSION-level abort on a taken-over subagent re-suspends instead of ending the run", async () => {
+		/*
+		 * The production Stop path aborted `active.abortController` directly (via
+		 * `interruptNarrator`), never `turnAbort`. The runtime then took the generic
+		 * abort exit, the runner cleared the takeover and the parent's blocked Agent
+		 * call was settled. The stop must instead land in the control transition and
+		 * park the subagent in `taken_over`, with the same run resumable afterwards.
+		 */
+		const parent = new AbortController();
+		const proxy = new ProxyAbortController();
+		const profile: Extract<RuntimeProfile, { kind: "subagent" }> = {
+			...(profiles[1] as Extract<RuntimeProfile, { kind: "subagent" }>),
+			control: {
+				parentSignal: parent.signal,
+				proxy,
+				turnAbort: new AbortController(),
+				detached: false,
+			},
+		};
+		const entered = deferred<void>();
+		const originalWait = manual.waitForManualOverride;
+		spyOn(manual, "waitForManualOverride").mockImplementation((...args) => {
+			const waiting = originalWait(...args);
+			entered.resolve();
+			return waiting;
+		});
+		const h = fixture(profile, [
+			async () => {
+				// Exactly what `interruptNarrator(subagentId)` does to a running subagent.
+				h.session.abortController.abort();
+				return { ...finished, aborted: true, completedNaturally: false };
+			},
+			finished,
+		]);
+		resetForegroundTurn(h.session, profile);
+		const turn = profile.control?.turnAbort;
+		takeover.markTakenOver(h.session.narratorId);
+		const run = h.run();
+		try {
+			await entered.promise;
+			// The turn controller was never touched: the session abort alone got here.
+			expect(turn?.signal.aborted).toBe(false);
+			expect(takeover.isTakenOver(h.session.narratorId)).toBe(true);
+			expect(isExecutionSuspended(h.session.narratorId)).toBe(true);
+			// Release before resuming, otherwise the next natural completion re-suspends
+			// in `taken_over` (correctly) and the run never returns.
+			takeover.clearTakenOver(h.session.narratorId);
+			expect(
+				manual.resumeManualOverride(h.session.narratorId, {
+					prompt: "after stop",
+					history: [],
+					trailingToolResults: [],
+				}),
+			).toBe(true);
+			const result = await run;
+			expect(result.hasError).toBe(false);
+			expect(h.calls.map((call) => call.userText)).toEqual(["same input", "after stop"]);
+		} finally {
+			takeover.clearTakenOver(h.session.narratorId);
+			manual.clearManualOverrideRuntimes();
+			profile.control?.cleanupTurnAbort?.();
+			proxy.dispose();
+			await run;
+		}
+	});
+
+	test("a SESSION-level abort on a subagent that is NOT taken over still ends the run", async () => {
+		const parent = new AbortController();
+		const proxy = new ProxyAbortController();
+		const profile: Extract<RuntimeProfile, { kind: "subagent" }> = {
+			...(profiles[1] as Extract<RuntimeProfile, { kind: "subagent" }>),
+			control: {
+				parentSignal: parent.signal,
+				proxy,
+				turnAbort: new AbortController(),
+				detached: false,
+			},
+		};
+		const wait = spyOn(manual, "waitForManualOverride");
+		const h = fixture(profile, [
+			async () => {
+				h.session.abortController.abort();
+				return { ...finished, aborted: true, completedNaturally: false };
+			},
+		]);
+		resetForegroundTurn(h.session, profile);
+		try {
+			await h.run();
+			expect(wait).not.toHaveBeenCalled();
+			expect(h.calls).toHaveLength(1);
+		} finally {
+			profile.control?.cleanupTurnAbort?.();
+			proxy.dispose();
+		}
+	});
+
 	test("PG finalizer/consumption contract has no SQLite cleanup fallthrough", async () => {
 		const source = await Bun.file(
 			new URL("../agent-runtime/orchestrator.ts", import.meta.url),

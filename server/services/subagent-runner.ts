@@ -1,5 +1,5 @@
 import type { FileReferenceSnapshot } from "@shared/file-reference";
-import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, narratorToolCalls } from "../db/schema";
@@ -77,11 +77,17 @@ import {
 } from "./subagent-executor";
 import { appendSubagentFileChanges } from "./subagent-file-changes";
 import { agentLabelFromNarrator, agentResultTag, resolveAgentLabel } from "./subagent-label";
-import { resolveSubagentModelForRun, subagentStoredModelReference } from "./subagent-model";
+import {
+	formatSubagentModelFallbackNote,
+	resolveSubagentModelForRun,
+	subagentRunReasoningEffort,
+	subagentStoredModelReference,
+} from "./subagent-model";
 import {
 	clearTakenOver,
 	consumePendingBackgroundFinalize,
 	isBackgroundTakenOver,
+	isTakenOver,
 } from "./subagent-takeover";
 import { broadcastSubagentTakeoverChanged } from "./subagent-takeover-broadcast";
 import { clearTeamInbox } from "./subagent-team";
@@ -910,6 +916,7 @@ export function broadcastSubagentStarted(
 	subagentType: string,
 	model?: string,
 	reasoningEffort?: string | null,
+	inheritance?: SubagentModelInheritance,
 ): void {
 	eventBus.emit({
 		type: "narrator:subagent_started",
@@ -928,6 +935,7 @@ export function broadcastSubagentStarted(
 		subagentType,
 		...(model && { model }),
 		...(reasoningEffort && { reasoningEffort }),
+		...(inheritance && { modelInheritance: inheritance }),
 	});
 	backgroundTaskService.notifyDerivedStatusChanged(parentNarratorId, subagentId);
 }
@@ -1672,6 +1680,21 @@ function startForegroundRunUnlocked(
 			if (owner.isCurrent()) {
 				// The shared runtime returns only after control is settled. Terminal
 				// publication must not preserve a takeover tag from an earlier pass.
+				//
+				// Every control exit that SETTLES a takeover (released, stop-takeover
+				// handoff, manual-override answer) clears it itself. So a takeover still
+				// held here, with no parent/timeout/detach cause, means the runtime left
+				// through a path that bypassed the control transition — the class of bug
+				// where a direct session abort ended a takeover. Nothing can re-suspend
+				// once the loop has returned, so the clear stays; the warning makes a
+				// regression visible instead of silent.
+				if (isTakenOver(subagentId) && !signal.aborted && !timedOut && !detached) {
+					logger.warn("Foreground takeover ended without a control settlement", {
+						subagentId,
+						parentNarratorId,
+						wasInterrupted,
+					});
+				}
 				clearTakenOver(subagentId);
 				try {
 					await finalizeSubagent(
@@ -1944,11 +1967,9 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		actingUserId: userId ?? null,
 	});
 	const modelPolicy = resolveEffectiveSubagentModelPolicy(parentTraits.traits, subagentType);
-	const candidateModels = [
-		subagentPref,
-		parent.model ?? FOLLOW_DEFAULT_MODEL,
-		settings.agent.defaultModel,
-	];
+	// No global-default step: a pooled fallback must be the pool's own first entry,
+	// matching resolveSubagentModelInheritance so creation and later runs agree.
+	const candidateModels = [subagentPref, parent.model || FOLLOW_DEFAULT_MODEL];
 	const modelSelection = resolveSubagentModelSelectionFromPolicy({
 		policy: modelPolicy,
 		explicitModel,
@@ -2030,10 +2051,12 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 
 	const subagentId = subagent.id;
 	updateLease.setNarratorId(subagentId);
-	const { model, reasoningEffort: fixedPoolEffort } = await resolveSubagentModelForRun(
-		subagent,
-		userId,
-	).catch((error) => {
+	const {
+		model,
+		reasoningEffort: fixedPoolEffort,
+		parentReasoningEffort,
+		inheritance,
+	} = await resolveSubagentModelForRun(subagent, userId).catch((error) => {
 		updateLease.release();
 		throw error;
 	});
@@ -2068,7 +2091,12 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		toolUseId,
 		subagentType,
 		subagent.model === FOLLOW_PARENT_MODEL ? FOLLOW_PARENT_MODEL : model,
-		fixedPoolEffort ?? subagent.reasoningEffort ?? resolveDefaultReasoningEffort(provider, model),
+		subagentRunReasoningEffort(
+			{ reasoningEffort: fixedPoolEffort, parentReasoningEffort },
+			subagent.reasoningEffort,
+			resolveDefaultReasoningEffort(provider, model),
+		),
+		inheritance,
 	);
 
 	if (background) {
@@ -2155,7 +2183,9 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			});
 		});
 
-		let output = buildBackgroundAgentStartOutput(aliasRegistration.alias);
+		let output =
+			buildBackgroundAgentStartOutput(aliasRegistration.alias) +
+			formatSubagentModelFallbackNote(inheritance);
 		if (aliasRegistration.conflicted) {
 			output +=
 				`\n\nNote: The requested alias "${alias || title}" was already taken. ` +
@@ -2185,6 +2215,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		rebuildSystemPrompt,
 		updateLease,
 	});
+	output += formatSubagentModelFallbackNote(inheritance);
 	if (aliasRegistration.conflicted) {
 		const requestedAliasLabel = alias || title || subagentId;
 		output +=
@@ -2386,10 +2417,12 @@ async function startContinuedSubagentUnlocked(
 	const priorTaskVersion = getBackgroundTaskTerminalVersion(priorTask);
 
 	const subagentType = getSubagentType(original.variant) ?? original.subagentType ?? "general";
-	const { model, reasoningEffort: fixedPoolEffort } = await resolveSubagentModelForRun(
-		original,
-		input.userId,
-	);
+	const {
+		model,
+		reasoningEffort: fixedPoolEffort,
+		parentReasoningEffort,
+		inheritance,
+	} = await resolveSubagentModelForRun(original, input.userId);
 	const provider = resolveProvider(model);
 	const cwd = original.cwd ?? ".";
 
@@ -2493,7 +2526,12 @@ async function startContinuedSubagentUnlocked(
 			toolUseId,
 			subagentType,
 			original.model === FOLLOW_PARENT_MODEL ? FOLLOW_PARENT_MODEL : model,
-			fixedPoolEffort ?? original.reasoningEffort ?? resolveDefaultReasoningEffort(provider, model),
+			subagentRunReasoningEffort(
+				{ reasoningEffort: fixedPoolEffort, parentReasoningEffort },
+				original.reasoningEffort,
+				resolveDefaultReasoningEffort(provider, model),
+			),
+			inheritance,
 		);
 
 		const mailboxInput = input.mailboxInput

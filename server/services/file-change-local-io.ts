@@ -22,13 +22,26 @@ export class LocalFileValidationError extends Error {
 	}
 }
 
+/**
+ * The VOLUME cannot identify objects at all (e.g. FAT/exFAT or some network shares
+ * on Windows), as opposed to one object failing validation. Callers that only need
+ * evidence as an optional extra can tell "nothing is recordable here" from a real
+ * mismatch by this type. `name` stays "LocalFileValidationError": diagnostics
+ * whitelist error names, and every existing handler treats it as that class.
+ */
+export class LocalObjectIdentityUnavailableError extends LocalFileValidationError {}
+
 export function localObjectIdentity(stat: BigIntStats): string {
 	if (stat.ino === 0n && stat.dev === 0n)
-		throw new LocalFileValidationError("Local filesystem does not expose an object identity");
+		throw new LocalObjectIdentityUnavailableError(
+			"Local filesystem does not expose an object identity",
+		);
 	// Without a creation timestamp, recycled dev/ino values cannot distinguish
 	// workspace incarnations. Do not invent continuity from mtime/ctime instead.
 	if (stat.birthtimeNs <= 0n)
-		throw new LocalFileValidationError("Local filesystem does not expose a valid creation time");
+		throw new LocalObjectIdentityUnavailableError(
+			"Local filesystem does not expose a valid creation time",
+		);
 	return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
 }
 

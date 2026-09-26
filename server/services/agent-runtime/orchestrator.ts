@@ -219,7 +219,11 @@ import {
 import { registerNarratorLoop } from "../update-coordinator";
 import { worktreeWatcher } from "../worktree-watcher";
 import { createRuntimeEventContext, createRuntimeMessageWriters } from "./context";
-import { applyForegroundControl, resetForegroundTurn } from "./control";
+import {
+	applyForegroundControl,
+	isForegroundTurnInterrupted,
+	resetForegroundTurn,
+} from "./control";
 import { buildRuntimeHistory } from "./history";
 import { createRuntimeRunState, type RuntimeProfile, type RuntimeRunOutcome } from "./input";
 import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
@@ -1730,7 +1734,11 @@ export async function runAgentLoopUnlocked(
 				active._continuationSuppressed = false;
 			}
 
-			if (profile.kind === "subagent" && profile.control?.turnAbort.signal.aborted) {
+			// `isForegroundTurnInterrupted`, not `turnAbort.signal.aborted` alone: a direct
+			// abort of the session controller on a taken-over subagent (Stop route, plugin
+			// API) never touches turnAbort, and falling through to the generic abort exit
+			// below would end the takeover and settle the parent's blocked tool call.
+			if (profile.kind === "subagent" && isForegroundTurnInterrupted(active, profile)) {
 				const control = await applyForegroundControl(active, owner, profile, result);
 				if (control.kind === "resume") {
 					resetForegroundTurn(active, profile);

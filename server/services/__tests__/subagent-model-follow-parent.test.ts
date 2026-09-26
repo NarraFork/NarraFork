@@ -308,6 +308,20 @@ if (process.env[CHILD_ENV] !== "1") {
 			expect((await narratorService.getById(PARENT)).model).toBe(FOLLOW_DEFAULT_MODEL);
 		});
 
+		test("a __default__ parent is labelled with the configured default, but still routes live", async () => {
+			await narratorService.updateModel(PARENT, FOLLOW_DEFAULT_MODEL);
+			const child = await spawn();
+			const first = await resolveSubagentModelForRun(await narratorService.getById(child.id));
+			// The display never shows the raw sentinel.
+			expect(first.model).toBe(A);
+			expect(first.inheritance).toMatchObject({ source: "parent", model: A, parentModel: A });
+			// Every run re-resolves, so the label tracks a later global change too.
+			settings.agent.defaultModel = B;
+			const second = await resolveSubagentModelForRun(await narratorService.getById(child.id));
+			expect(second.model).toBe(B);
+			expect(second.inheritance).toMatchObject({ model: B, parentModel: B });
+		});
+
 		test("parent outside the pool falls back legally, stores inheritance, then follows a newly allowed parent", async () => {
 			settings.agent.subagentAllowedModels.general = [A];
 			const child = await spawn();
@@ -318,12 +332,95 @@ if (process.env[CHILD_ENV] !== "1") {
 			expect(await resolveSubagentModelForRun(await narratorService.getById(child.id))).toEqual({
 				modelRef: C,
 				model: C,
+				inheritance: { source: "pool-fallback", model: C, parentModel: B, poolKey: "general" },
 			});
 			const second = await spawn();
 			await assertRun(second.id, C);
 			settings.agent.subagentAllowedModels.general = [C, B];
 			await drive(second.id);
 			await assertRun(second.id, B);
+		});
+
+		test("fallback skips the global default and uses the pool's first entry", async () => {
+			// Global default A is in the pool, but it is not what the pool author chose first.
+			settings.agent.subagentAllowedModels.general = [C, A];
+			await narratorService.updateModel(PARENT, B);
+			const child = await spawn();
+			await assertRun(child.id, C);
+			const resolved = await resolveSubagentModelForRun(await narratorService.getById(child.id));
+			expect(resolved.inheritance).toEqual({
+				source: "pool-fallback",
+				model: C,
+				parentModel: B,
+				poolKey: "general",
+			});
+		});
+
+		test("follow result is reported to the card and fallback is explained to the parent", async () => {
+			const { getRecentSubagentModelInheritance } = await import("../subagent-model");
+			const followed = await spawn();
+			const start = broadcasts.filter(({ event }) => event.type === "subagent_started").at(-1);
+			expect(start?.event.modelInheritance).toEqual({
+				source: "parent",
+				model: A,
+				parentModel: A,
+				poolKey: "general",
+			});
+			expect(getRecentSubagentModelInheritance(followed.id)?.source).toBe("parent");
+
+			settings.agent.subagentAllowedModels.general = [C];
+			const output = await runSubagent({
+				parentNarratorId: PARENT,
+				toolUseId: TOOL,
+				subagentType: "general",
+				prompt: "Return without using tools.",
+				cwd: process.env.HOME as string,
+				signal: new AbortController().signal,
+				locale: "en",
+			});
+			expect(output).toContain(`the parent model "${A}" is not in the allowed "general"`);
+			expect(output).toContain(`ran on "${C}" instead`);
+		});
+
+		test("reasoning effort: pool tier > child override > parent override > default", async () => {
+			const { subagentRunReasoningEffort } = await import("../subagent-model");
+			// Parent override reaches a child with no override of its own.
+			await narratorService.updateReasoningEffort(PARENT, "high");
+			const child = await spawn();
+			expect(configs.at(-1)).toMatchObject({ narratorId: child.id, reasoningEffort: "high" });
+			const run = await resolveSubagentModelForRun(await narratorService.getById(child.id));
+			expect(run.parentReasoningEffort).toBe("high");
+			// A later parent change is picked up on the next run.
+			await narratorService.updateReasoningEffort(PARENT, "medium");
+			await drive(child.id);
+			expect(configs.at(-1)).toMatchObject({ narratorId: child.id, reasoningEffort: "medium" });
+			// The child's own override wins over the parent.
+			await narratorService.updateReasoningEffort(child.id, "low");
+			await drive(child.id);
+			expect(configs.at(-1)).toMatchObject({ narratorId: child.id, reasoningEffort: "low" });
+			// Precedence as a pure rule, including the fixed pool tier.
+			expect(
+				subagentRunReasoningEffort(
+					{ reasoningEffort: "max", parentReasoningEffort: "high" },
+					"low",
+					"none",
+				),
+			).toBe("max");
+			expect(subagentRunReasoningEffort({ parentReasoningEffort: "high" }, null, "none")).toBe(
+				"high",
+			);
+			expect(subagentRunReasoningEffort({}, null, "none")).toBe("none");
+		});
+
+		test("a following child stores no tier; a pinned child keeps its creation snapshot", async () => {
+			await narratorService.updateReasoningEffort(PARENT, "high");
+			const following = await spawn();
+			expect(following.reasoningEffort).toBeNull();
+			const pinned = await spawn({ model: A });
+			expect(pinned.reasoningEffort).toBe("high");
+			await narratorService.updateReasoningEffort(PARENT, "medium");
+			await drive(pinned.id);
+			expect(configs.at(-1)).toMatchObject({ narratorId: pinned.id, reasoningEffort: "high" });
 		});
 
 		test("a rejected type preference does not pin a fallback child", async () => {

@@ -55,6 +55,7 @@ import {
 	type SendDeliveryReceipt,
 	type SendDeliveryTarget,
 } from "@shared/communication-tool";
+import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import {
 	ACTIVE_REFLECTION_STATUSES,
 	getPermissionReflectionSuggestion,
@@ -442,6 +443,19 @@ export function patchSubagentActivity(
 	return result.changed ? result : unchanged(messages);
 }
 
+function sameModelInheritance(
+	a: SubagentModelInheritance | undefined,
+	b: SubagentModelInheritance,
+): boolean {
+	return (
+		!!a &&
+		a.source === b.source &&
+		a.model === b.model &&
+		a.parentModel === b.parentModel &&
+		a.poolKey === b.poolKey
+	);
+}
+
 /**
  * Attach the child narrator id / model to a parent card WITHOUT recording a tool
  * call. `subagent_started` announces which narrator a card now owns before that
@@ -456,6 +470,7 @@ export function patchSubagentIdentity(
 		subagentNarratorId?: string | null;
 		model?: string | null;
 		reasoningEffort?: string | null;
+		modelInheritance?: SubagentModelInheritance;
 	},
 ): LivePatchResult {
 	if (!parentToolUseId || !Array.isArray(messages) || messages.length === 0)
@@ -478,7 +493,9 @@ export function patchSubagentIdentity(
 				current &&
 				current.subagentNarratorId === resolvedNarratorId &&
 				normalizeModel(current.model) === resolvedModel &&
-				normalizeModel(current.reasoningEffort) === resolvedReasoningEffort
+				normalizeModel(current.reasoningEffort) === resolvedReasoningEffort &&
+				(!identity.modelInheritance ||
+					sameModelInheritance(current.modelInheritance, identity.modelInheritance))
 			) {
 				return current;
 			}
@@ -487,6 +504,9 @@ export function patchSubagentIdentity(
 				subagentNarratorId: resolvedNarratorId,
 				model: resolvedModel,
 				...(resolvedReasoningEffort ? { reasoningEffort: resolvedReasoningEffort } : {}),
+				...((identity.modelInheritance ?? current?.modelInheritance)
+					? { modelInheritance: identity.modelInheritance ?? current?.modelInheritance }
+					: {}),
 				latestToolCalls: current?.latestToolCalls ?? [],
 			};
 		},

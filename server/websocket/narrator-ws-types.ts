@@ -8,6 +8,7 @@ import type {
 	BackgroundTaskListDelta,
 	BackgroundTaskProgressFrame,
 } from "@shared/background-task-list";
+import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
 import type { ProgressPhase } from "@shared/progress-phase";
@@ -447,6 +448,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			model?: string;
 			reasoningEffort?: string | null;
+			/** Present for `__parent__` children: followed parent, or pool fallback. */
+			modelInheritance?: SubagentModelInheritance;
 			status: "updated" | "pending";
 			applyAt: "next_request" | "next_model_request";
 	  }
@@ -668,6 +671,8 @@ export type NarratorServerMessage =
 			subagentType: string;
 			model?: string;
 			reasoningEffort?: string;
+			/** Present for `__parent__` children: followed parent, or pool fallback. */
+			modelInheritance?: SubagentModelInheritance;
 	  }
 	| {
 			type: "background_task_started";

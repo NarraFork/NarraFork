@@ -47,6 +47,8 @@ export type ScopedRevertUnavailableReason =
 	| "runtime_reload_required"
 	| "incomplete_coverage"
 	| "unsupported_target"
+	/** The server's data volume cannot provide stable object identities/link counts. */
+	| "platform_unsupported"
 	| "pending_operations"
 	/** Only explicit empty selections, known read-only calls or spec-only writes. */
 	| "nothing_owned";

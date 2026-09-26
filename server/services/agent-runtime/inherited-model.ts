@@ -1,4 +1,4 @@
-import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
 import type { ReasoningEffort } from "../../lib/agent";
 import type { ActiveNarrator } from "../narrator-session-state";
 
@@ -13,6 +13,8 @@ export interface InheritedModelResolution {
 	model: string;
 	modelRef: string;
 	reasoningEffort?: ReasoningEffort;
+	parentReasoningEffort?: ReasoningEffort;
+	inheritance?: SubagentModelInheritance;
 	/** Revision captured before the asynchronous policy resolution, not after it. */
 	settingsRevision?: number;
 }
@@ -50,7 +52,10 @@ export function createInheritedModelRuntime(deps: InheritedModelDependencies) {
 		active._modelSelectionRef = modelRef;
 		active._followParentNarratorId =
 			modelRef === FOLLOW_PARENT_MODEL ? parentNarratorId : undefined;
-		if (modelRef !== FOLLOW_PARENT_MODEL) active._inheritedReasoningEffort = undefined;
+		if (modelRef !== FOLLOW_PARENT_MODEL) {
+			active._inheritedReasoningEffort = undefined;
+			active._parentReasoningEffort = undefined;
+		}
 	}
 
 	function refresh(active: ActiveNarrator): void {

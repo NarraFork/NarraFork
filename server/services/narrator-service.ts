@@ -1459,9 +1459,14 @@ export const narratorService = {
 			!input.model || input.model === FOLLOW_PARENT_MODEL
 				? FOLLOW_PARENT_MODEL
 				: resolveEffectiveModel(input.model);
-		// Inherit the parent's explicit override if any; otherwise store null
-		// (follow the global default). Never固化 the resolved default here.
-		const resolvedReasoningEffort = input.reasoningEffort ?? parent.reasoningEffort ?? null;
+		// A following child stores no tier of its own: it reads the parent's override
+		// live at run time (subagentRunReasoningEffort), so a later parent change
+		// reaches it. Copying it here would freeze a snapshot that then outranks the
+		// parent forever. Pinned children keep the creation-time copy.
+		// Never固化 the resolved default here.
+		const resolvedReasoningEffort =
+			input.reasoningEffort ??
+			(storedModel === FOLLOW_PARENT_MODEL ? null : (parent.reasoningEffort ?? null));
 
 		const subChapterId = parent.chapterId ?? null;
 		const subTraits: string[] = [

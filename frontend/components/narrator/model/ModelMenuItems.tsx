@@ -58,6 +58,7 @@ export function ModelMenuItems({
 	onRefreshProviderModels,
 	refreshingProviderId,
 	onPickerOpened,
+	canFollowParent = false,
 }: {
 	allModels: ModelOption[];
 	aggregations?: ModelAggregation[];
@@ -105,6 +106,11 @@ export function ModelMenuItems({
 	 * button.
 	 */
 	onPickerOpened?: () => void;
+	/**
+	 * Subagents only: show "Follow parent" as a selectable entry, so a manual pin
+	 * can be undone. Otherwise it only appears as the current-state label.
+	 */
+	canFollowParent?: boolean;
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: ts } = useTranslation("settings");
@@ -183,8 +189,13 @@ export function ModelMenuItems({
 	return (
 		<>
 			{/* Inheritance is a current-state label, not a catalog model or a global role. */}
-			{currentModel === FOLLOW_PARENT_MODEL && (
-				<Menu.Item disabled ref={selectedItemRef} rightSection={<IconCheck size={14} />}>
+			{(currentModel === FOLLOW_PARENT_MODEL || canFollowParent) && (
+				<Menu.Item
+					disabled={currentModel === FOLLOW_PARENT_MODEL}
+					ref={currentModel === FOLLOW_PARENT_MODEL ? selectedItemRef : undefined}
+					rightSection={currentModel === FOLLOW_PARENT_MODEL ? <IconCheck size={14} /> : undefined}
+					onClick={() => onSelect(FOLLOW_PARENT_MODEL)}
+				>
 					{t("followParent")}
 				</Menu.Item>
 			)}

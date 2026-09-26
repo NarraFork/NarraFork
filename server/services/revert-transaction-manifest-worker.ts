@@ -418,9 +418,11 @@ function validate(
 					equal(file.desired, row?.desiredStateJson),
 				"FILE_METADATA",
 			);
+			// Filesystem grammars only. The caller's scopeIdentity() additionally binds
+			// every file to the live local backend's flavor before any target IO.
 			check(
 				file.identity.deviceId === "local" &&
-					file.identity.pathFlavor === "posix" &&
+					(file.identity.pathFlavor === "posix" || file.identity.pathFlavor === "windows") &&
 					file.identity.objectRole === "referent",
 				"UNSUPPORTED_TARGET",
 			);

@@ -52,6 +52,7 @@ import {
 	fileChangeLocalIo,
 	type LocalFileObservation,
 	LocalFileValidationError,
+	LocalObjectIdentityUnavailableError,
 	localDirectoryIdentity,
 } from "./file-change-local-io";
 import {
@@ -1625,10 +1626,24 @@ export async function registerLocalBashActivity(
 	}
 	if (backend.deviceId !== LOCAL_DEVICE_ID)
 		throw new Error("Local Bash requires the local device identity");
-	// Real rollback is currently local POSIX only. Do not introduce its namespace
-	// requirements on Windows or remote targets where rollback execution is disabled.
-	if (backend.pathFlavor === "windows" || process.platform === "win32") return undefined;
-	return (await currentRuntime()).registerBashActivity({ ...request, target });
+	// Local rollback runs on POSIX and Windows, so local Bash on both must be
+	// visible to the coordinator: an unregistered shell could write concurrently
+	// with a rollback lease and have its changes silently overwritten.
+	try {
+		return await (await currentRuntime()).registerBashActivity({ ...request, target });
+	} catch (error) {
+		// EXCEPTION, Windows only: a workspace on a volume without object identities
+		// (FAT/exFAT, some network shares) can never hold rollback evidence, so no
+		// lease can cover it and there is nothing for this shell to race. Refusing
+		// the shell there would make Bash unusable on such volumes for no protection.
+		// POSIX always provides identities, so a failure there stays fail-closed.
+		if (backend.pathFlavor !== "windows" || !(error instanceof LocalObjectIdentityUnavailableError))
+			throw error;
+		logger.warn("Bash workspace has no object identity; running without rollback coordination", {
+			reason: error.message,
+		});
+		return undefined;
+	}
 }
 
 async function currentRuntime(): Promise<LocalFileChangeRuntime> {

@@ -521,6 +521,8 @@ function subagentRevision(d: Record<string, unknown>): string {
 	// — keyed anyway because the identity patch writes them ALONE (nothing else in
 	// the key would move), which makes them free insurance if that row ever wraps.
 	if (typeof d.model === "string") rev += `|go:${d.model}`;
+	const inh = d.modelInheritance as { source?: string; model?: string } | undefined;
+	if (inh?.source) rev += `|gi:${inh.source}:${inh.model ?? ""}`;
 	if (typeof d.reasoningEffort === "string") rev += `|ge:${d.reasoningEffort}`;
 	if (d.isBackground === true) rev += "|gg:1";
 	// Takeover badge — same fixed badge row as `isBackground`, so height-neutral,

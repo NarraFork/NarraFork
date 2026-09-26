@@ -10,6 +10,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
 import { FOLLOW_PARENT_MODEL } from "../../../../lib/constants";
@@ -43,6 +44,7 @@ function renderCard(badges: {
 	reasoningEffort?: string;
 	isTakenOver?: boolean;
 	followParentLabel?: string;
+	modelInheritance?: SubagentModelInheritance;
 }): Element {
 	const measured = measureSubagentCard({ ...DATA, ...badges }, WIDTH, 5, {});
 	return parse(
@@ -53,6 +55,7 @@ function renderCard(badges: {
 					description={DATA.description}
 					agentType={DATA.agentType}
 					model={badges.model}
+					modelInheritance={badges.modelInheritance}
 					labels={badges.followParentLabel ? { followParent: badges.followParentLabel } : undefined}
 					reasoningEffort={badges.reasoningEffort}
 					isTakenOver={badges.isTakenOver}
@@ -79,6 +82,34 @@ describe("RenderSubagent — header badges", () => {
 	it("has an English fallback for the parent reference", () => {
 		expect(badgeText(renderCard({ model: FOLLOW_PARENT_MODEL }), "subagent-model")).toBe(
 			"Follow parent",
+		);
+	});
+
+	it("shows the followed parent's concrete model instead of a bare label", () => {
+		const root = renderCard({
+			model: FOLLOW_PARENT_MODEL,
+			modelInheritance: { source: "parent", model: "opus", parentModel: "opus" },
+		});
+		const badge = root.querySelector('[data-testid="subagent-model"]');
+		expect(badge?.textContent).toBe("opus");
+		expect(badge?.getAttribute("data-inheritance")).toBe("parent");
+	});
+
+	it("marks a pool fallback and explains it without widening the badge", () => {
+		const root = renderCard({
+			model: FOLLOW_PARENT_MODEL,
+			modelInheritance: {
+				source: "pool-fallback",
+				model: "haiku",
+				parentModel: "opus",
+				poolKey: "explore",
+			},
+		});
+		const badge = root.querySelector('[data-testid="subagent-model"]');
+		expect(badge?.textContent).toBe("haiku");
+		expect(badge?.getAttribute("data-inheritance")).toBe("pool-fallback");
+		expect(badge?.getAttribute("aria-label")).toContain(
+			"The parent's opus is not in the explore pool",
 		);
 	});
 

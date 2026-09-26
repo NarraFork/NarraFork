@@ -26,6 +26,7 @@ import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-identity";
 import { fileChangeLocalIo, localDirectoryIdentity } from "./file-change-local-io";
+import { fileChangePlatformCapability } from "./file-change-platform-capability";
 import {
 	getDefaultLocalFileChangeRuntime,
 	type LocalFileChangeRuntime,
@@ -356,6 +357,15 @@ function assertIdle(capture: WorkspaceCaptureSummary) {
 function stale(message: string) {
 	return new RevertPlannerError("STALE", message);
 }
+/** Volume-level admission (e.g. FAT/exFAT on Windows) before any history is read. */
+async function assertLocalRevertPlatform() {
+	const capability = await fileChangePlatformCapability();
+	if (!capability.supported)
+		throw new RevertPlannerError(
+			"PLATFORM_UNSUPPORTED",
+			`Local filesystem cannot provide verified rollback identities (${capability.reason})`,
+		);
+}
 async function verifiedNamespace(signal: AbortSignal) {
 	signal.throwIfAborted();
 	const runtime = await getDefaultLocalFileChangeRuntime();
@@ -494,11 +504,15 @@ export async function prepareLocalRevertAction(
 			.where(eq(narrators.id, narratorId))
 			.get();
 		if (!narrator) throw new NotFoundError("Narrator", narratorId);
-		if (narrator.type !== "primary" || localBackend.pathFlavor !== "posix")
+		if (
+			narrator.type !== "primary" ||
+			(localBackend.pathFlavor !== "posix" && localBackend.pathFlavor !== "windows")
+		)
 			throw new RevertPlannerError(
 				"UNSUPPORTED_TARGET",
-				"This action requires a local POSIX primary narrator",
+				"This action requires a local filesystem primary narrator",
 			);
+		await assertLocalRevertPlatform();
 		let selector: RevertPlannerRequest["selector"];
 		let kind: RevertPlannerRequest["kind"];
 		if (input.action === "revert_files") {
@@ -596,8 +610,12 @@ export async function prepareLocalRevertAction(
 		if (!(error instanceof AppError) || error.statusCode !== 409) throw error;
 		const code = error.code;
 		if (/IDEMPOTENCY|ACTION_MISMATCH|REQUEST_CONFLICT/.test(code)) throw error;
+		// The coarse reason below is all the client sees. Keep the precise code for
+		// remote diagnosis; never log error.message, which can embed absolute paths.
+		logger.warn("Revert preview refused", { narratorId, action: input.action, code });
 		let unavailable: ScopedRevertUnavailableReason = "incomplete_coverage";
 		if (code === "REVERT_RUNTIME_RELOAD_REQUIRED") unavailable = "runtime_reload_required";
+		else if (code === "REVERT_PLANNER_PLATFORM_UNSUPPORTED") unavailable = "platform_unsupported";
 		else if (/UNSUPPORTED|WORKSPACE_UNAVAILABLE|TARGET_UNVERIFIED/.test(code))
 			unavailable = "unsupported_target";
 		else if (/BUDGET|TOO_LARGE/.test(code)) unavailable = "window_too_large";
@@ -645,6 +663,7 @@ export async function applyLocalRevertPlan(
 	const owner = await access.owner(principal, narratorId, signal);
 	const { assertBashActivityProtectionReady } = await import("../lib/agent/tools/bash");
 	assertBashActivityProtectionReady();
+	await assertLocalRevertPlatform();
 	const { plans, transactions } = await services(signal);
 	const plan = plans.getSummary(owner, planId);
 	if (plan.planHash !== input.planHash)

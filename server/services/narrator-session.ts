@@ -177,7 +177,7 @@ import {
 	registerConclusionWatcher,
 	resolveManualOverride,
 } from "./subagent-manual-override";
-import { resolveSubagentModelForRun } from "./subagent-model";
+import { resolveSubagentModelForRun, subagentRunReasoningEffort } from "./subagent-model";
 import { isTakenOver } from "./subagent-takeover";
 import { resolveEffectiveTraits } from "./trait-layer-service";
 import { worktreeWatcher } from "./worktree-watcher";
@@ -1239,13 +1239,15 @@ async function createNarrator(
 		_followParentNarratorId:
 			narrator.model === FOLLOW_PARENT_MODEL ? narrator.parentNarratorId : undefined,
 		_inheritedReasoningEffort: inheritedModel?.reasoningEffort,
+		_parentReasoningEffort: inheritedModel?.parentReasoningEffort,
 		_settingsRevision: getSettingsRevision(),
 		model: narratorModel,
 		provider: narratorProvider,
 		_reasoningEffortRef: narrator.reasoningEffort ?? null,
 		reasoningEffort:
-			inheritedModel?.reasoningEffort ??
-			narrator.reasoningEffort ??
+			(inheritedModel
+				? subagentRunReasoningEffort(inheritedModel, narrator.reasoningEffort)
+				: narrator.reasoningEffort) ??
 			resolveDefaultReasoningEffort(narratorProvider, narratorModel) ??
 			null,
 		systemPrompt: effectiveSystemPrompt,
@@ -7050,10 +7052,11 @@ export const inheritedModelRuntime = createInheritedModelRuntime({
 		active.provider = resolveProvider(resolved.model);
 		active._settingsRevision = resolved.settingsRevision;
 		active._inheritedReasoningEffort = resolved.reasoningEffort;
+		active._parentReasoningEffort = resolved.parentReasoningEffort;
 		active.reasoningEffort = resolveRuntimeReasoningEffort(
 			active.provider,
 			active.model,
-			resolved.reasoningEffort ?? active._reasoningEffortRef,
+			subagentRunReasoningEffort(resolved, active._reasoningEffortRef),
 		);
 		broadcastToNarrator(active.narratorId, {
 			type: "model_changed",
@@ -7065,6 +7068,7 @@ export const inheritedModelRuntime = createInheritedModelRuntime({
 			narratorId: active.narratorId,
 			model: active.model,
 			reasoningEffort: active.reasoningEffort ?? null,
+			...(resolved.inheritance && { modelInheritance: resolved.inheritance }),
 			status: active._loopRunning ? "pending" : "updated",
 			applyAt: active._loopRunning ? "next_model_request" : "next_request",
 		});
@@ -7154,7 +7158,13 @@ export function updateNarratorReasoningEffort(
 		active.reasoningEffort = resolveRuntimeReasoningEffort(
 			active.provider,
 			active.model,
-			active._inheritedReasoningEffort ?? reasoningEffort,
+			subagentRunReasoningEffort(
+				{
+					reasoningEffort: active._inheritedReasoningEffort,
+					parentReasoningEffort: active._parentReasoningEffort,
+				},
+				reasoningEffort,
+			),
 		);
 		broadcastToNarrator(narratorId, {
 			type: "model_settings_changed",
@@ -7176,6 +7186,8 @@ export function updateNarratorReasoningEffort(
 			applyAt: "next_model_request",
 		});
 	}
+	// Children with no override of their own follow this narrator's tier.
+	inheritedModelRuntime.parentChanged(narratorId);
 }
 
 /** Apply only after the input owns execution and its predecessor has finalized. */

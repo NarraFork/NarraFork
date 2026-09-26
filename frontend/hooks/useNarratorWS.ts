@@ -1,5 +1,9 @@
 import type { AsyncQuestion, PendingPermission } from "@frontend/types/narrator";
 import type { BackgroundTaskListDelta } from "@shared/background-task-list";
+import {
+	isSubagentModelInheritance,
+	type SubagentModelInheritance,
+} from "@shared/model-inheritance";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
 import {
@@ -745,6 +749,8 @@ interface NarratorWSCallbacks {
 		snippet?: string;
 	}) => void;
 	onModelChanged?: (model: string) => void;
+	/** Follow/fallback decision of a `__parent__` subagent, from its runtime resolution. */
+	onModelInheritanceChanged?: (inheritance: SubagentModelInheritance) => void;
 	/** Return true when a structural reconcile is pending; messageVersion stays deferred until it succeeds. */
 	onCatchUp?: (
 		orphanChildren: TreeMessage[],
@@ -773,6 +779,7 @@ interface NarratorWSCallbacks {
 		model?: string,
 		subagentNarratorId?: string,
 		reasoningEffort?: string,
+		modelInheritance?: SubagentModelInheritance,
 	) => void;
 	onSubagentSuspended?: (subagentNarratorId: string, toolUseId: string) => void;
 	onSubagentStatusChanged?: (
@@ -1522,8 +1529,14 @@ export function useNarratorWS(
 							callbackOwner.callbacks.onModelChanged?.(data.model as string);
 						}
 						break;
-					case "model_switched":
 					case "model_settings_changed":
+						// Only the inheritance decision is cached; the concrete model stays out
+						// of narrator.model for the reason below.
+						if (isSubagentModelInheritance(data.modelInheritance)) {
+							callbackOwner.callbacks.onModelInheritanceChanged?.(data.modelInheritance);
+						}
+						break;
+					case "model_switched":
 					case "model_settings_applied":
 						// Runtime/applied model events describe the concrete model being used for the
 						// current request. Do not write them into the narrator query cache, because
@@ -1627,6 +1640,7 @@ export function useNarratorWS(
 							data.model as string | undefined,
 							data.subagentNarratorId as string | undefined,
 							data.reasoningEffort as string | undefined,
+							isSubagentModelInheritance(data.modelInheritance) ? data.modelInheritance : undefined,
 						);
 						break;
 					case "subagent_suspended":

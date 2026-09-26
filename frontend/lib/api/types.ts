@@ -7,6 +7,7 @@ export type {
 import type { TextCitation } from "@shared/citations";
 import type { FileReference, FileReferenceContext } from "@shared/file-reference";
 import type { LocalizedValue } from "@shared/i18n-locales";
+import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
@@ -562,6 +563,8 @@ export interface SubagentActivitySummary {
 	model: string | null;
 	/** Effective tier, already resolving a null narrator override through the global default. */
 	reasoningEffort?: string | null;
+	/** Last run's follow/fallback decision for `__parent__` children. */
+	modelInheritance?: SubagentModelInheritance;
 	latestToolCalls: SubagentToolCallHeader[];
 	/** Bounded file-change summary projected for the child activity card. */
 	fileChanges?: SubagentFileChanges;

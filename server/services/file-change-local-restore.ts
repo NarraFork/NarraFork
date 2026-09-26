@@ -76,6 +76,33 @@ export interface LocalFileRestoreInput extends LocalRestoreDescriptor {
 	timeoutMs?: number;
 }
 
+/**
+ * Windows semantics differ in ways that matter for a guarded restore:
+ * - no O_NOFOLLOW/O_NONBLOCK: reparse points are DETECTED by the existing
+ *   lstat-before-open and fd/path identity comparisons, not prevented;
+ * - mode is synthesized from the read-only attribute only (0o666/0o444); there
+ *   are no execute bits and no owner/ACL model visible through stat;
+ * - deleting a read-only file fails with EPERM, and fchmod needs a handle with
+ *   write-attribute access;
+ * - sharing violations (EBUSY, and EPERM from antivirus/indexers) are common
+ *   and transient before any mutation.
+ * Admission of the volume itself (stable dev:ino:birthtime, real nlink) is
+ * checked by file-change-platform-capability before a plan is prepared.
+ */
+let restoreSemantics: NodeJS.Platform = process.platform;
+/**
+ * Test-only: apply Windows restore DECISIONS (read-only delete, mode handling,
+ * sharing-violation mapping) on a POSIX host. Backend authority and open flags
+ * always follow the real host, so this cannot relax production checks.
+ */
+export function setLocalRestoreSemanticsForTests(platform: NodeJS.Platform | null): void {
+	restoreSemantics = platform ?? process.platform;
+}
+const windowsSemantics = () => restoreSemantics === "win32";
+/** libuv's synthesized regular-file modes: read-only attribute clear / set. */
+const WINDOWS_WRITABLE_MODE = 0o666;
+const WINDOWS_READ_ONLY_MODE = 0o444;
+
 export interface LocalRestoreObservation {
 	/** A raw observation, NOT a published blob reference or durable execution receipt. */
 	state: FileChangeState;
@@ -95,6 +122,8 @@ export type LocalRestoreFailure =
 	| "budget_exceeded"
 	| "cancelled"
 	| "timeout"
+	/** Windows sharing violation before dispatch: nothing was written; retryable. */
+	| "io_busy"
 	| "io_failed";
 export interface LocalFileRestoreResult {
 	/** Only this invocation. Never use a new no-op to settle an older uncertain mutation. */
@@ -126,8 +155,9 @@ function fail(code: LocalRestoreFailure): never {
 }
 
 /**
- * One guarded POSIX regular/absent object, not an OS CAS, transaction or idempotency
- * journal. Windows (no equivalent tested NOFOLLOW/nonblocking/mode contract), links,
+ * One guarded local regular/absent object, not an OS CAS, transaction or idempotency
+ * journal. POSIX requires O_NOFOLLOW/O_NONBLOCK; Windows follows the weaker contract
+ * documented at `restoreSemantics` above (detect, not prevent, reparse swaps). Links,
  * directories, special objects and multiply-linked files fail closed. Both lexical
  * and canonical ancestors must be real directories, including symlink cwd aliases.
  *
@@ -236,6 +266,8 @@ class RestoreSession {
 	bytesRead = 0;
 	bytesWritten = 0;
 	private file?: fs.FileHandle;
+	/** Path stamp from the most recent successful verifyOpened. */
+	private verifiedStamp?: BigIntStats;
 	private cleanup?: Promise<void>;
 	private readonly backend: ExecutionBackend;
 	private readonly lease: WorkspaceWriteLease;
@@ -282,9 +314,10 @@ class RestoreSession {
 			this.backend.deviceId !== LOCAL_DEVICE_ID ||
 			identity.deviceId !== LOCAL_DEVICE_ID ||
 			identity.pathFlavor !== this.backend.pathFlavor ||
-			process.platform === "win32" ||
-			!constants.O_NOFOLLOW ||
-			!constants.O_NONBLOCK
+			// Authority follows the REAL host, never the test semantics override.
+			(process.platform === "win32"
+				? this.backend.pathFlavor !== "windows"
+				: this.backend.pathFlavor !== "posix" || !constants.O_NOFOLLOW || !constants.O_NONBLOCK)
 		)
 			fail("unsupported_backend");
 		const runtime = this.readRuntime(identity.deviceId);
@@ -343,7 +376,8 @@ class RestoreSession {
 				this.backend.resolvePathIdentity(lexical, { signal: this.budget.signal }),
 			);
 			if (
-				resolved.canonicalPath !== canonical ||
+				// Drive-letter/case spelling may vary on Windows; POSIX equals is exact.
+				!this.backend.paths.equals(resolved.canonicalPath, canonical) ||
 				resolved.runtimeGeneration !== this.target.executionBinding.runtimeGeneration
 			)
 				fail("target_changed");
@@ -441,9 +475,11 @@ class RestoreSession {
 	private async opened(flags: number, mode?: number) {
 		await this.io(async () => {
 			// Assign even after timeout so close() owns a late-opened descriptor.
+			// Windows has neither flag (checkAuthority requires both on POSIX). There a
+			// swapped reparse point is caught by the lstat/fstat stamp comparisons.
 			this.file = await fs.open(
 				this.target.identity.canonicalPath,
-				flags | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+				flags | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
 				mode,
 			);
 		});
@@ -491,6 +527,24 @@ class RestoreSession {
 		if (!this.file) fail("io_failed");
 		return this.file;
 	}
+	/**
+	 * Windows only: an open handle turns unlink into a delete-pending entry on
+	 * volumes without POSIX delete semantics (later lstat reports EPERM, not
+	 * ENOENT). Close our descriptor, then re-prove the path is still the exact
+	 * object verified after the last guard. Still before dispatch.
+	 */
+	private async releaseBeforeDelete() {
+		const stamp = this.verifiedStamp;
+		if (!stamp) fail("target_changed");
+		const file = this.file;
+		this.file = undefined;
+		if (file) await this.io(() => file.close());
+		await this.inspectAncestors();
+		const entry = await this.entry(this.target.identity.canonicalPath);
+		if (!entry || !sameStamp(stamp, entry)) fail("target_changed");
+		this.budget.check();
+		this.checkAuthority();
+	}
 	private async verifyOpened(state: Readonly<RestoreState>, object: string) {
 		const result = await this.readOpened();
 		// Nothing supplied by the caller is awaited after these checks. Recheck
@@ -500,6 +554,7 @@ class RestoreSession {
 		const entry = await this.entry(this.target.identity.canonicalPath);
 		if (!entry || !sameStamp(result.stamp, opened) || !sameStamp(opened, entry))
 			fail("target_changed");
+		this.verifiedStamp = entry;
 		this.observation = result.observation;
 		if (
 			!fileChangeStatesEqual(state, result.observation.state) ||
@@ -540,8 +595,16 @@ class RestoreSession {
 				.find((path) => this.ancestors.get(path));
 			if (!parent) fail("target_changed");
 			const mode = this.ancestors.get(parent)?.mode ?? 0n;
-			if (!(mode & 0o222n) || !(mode & 0o111n)) fail("permission_denied");
-			await this.io(() => fs.access(parent, constants.W_OK | constants.X_OK));
+			// Windows directory modes are synthetic and carry no search bit. The
+			// write/delete ACL is only enforced by the actual syscall, before which
+			// a denial is still a clean not_dispatched failure.
+			if (windowsSemantics()) {
+				if (!(mode & 0o222n)) fail("permission_denied");
+				await this.io(() => fs.access(parent, constants.W_OK));
+			} else {
+				if (!(mode & 0o222n) || !(mode & 0o111n)) fail("permission_denied");
+				await this.io(() => fs.access(parent, constants.W_OK | constants.X_OK));
+			}
 		}
 	}
 	private dispatch() {
@@ -586,6 +649,19 @@ class RestoreSession {
 			desired.kind !== "regular" ||
 			expected.blob.digest !== desired.blob.digest ||
 			expected.blob.sizeBytes !== desired.blob.sizeBytes;
+		// Windows chmod can only toggle the read-only attribute (the write bits of the
+		// synthesized mode). Any other mode difference is unrepresentable: refuse it
+		// BEFORE dispatch instead of discovering the mismatch in post-verification.
+		const modeChange =
+			expected.kind === "regular" && desired.kind === "regular" && expected.mode !== desired.mode;
+		if (
+			windowsSemantics() &&
+			desired.kind === "regular" &&
+			(expected.kind === "regular"
+				? ((expected.mode ^ desired.mode) & ~0o222) !== 0
+				: desired.mode !== WINDOWS_WRITABLE_MODE && desired.mode !== WINDOWS_READ_ONLY_MODE)
+		)
+			fail("unsupported_object");
 		let object = expectedObjectIdentity;
 		if (expected.kind === "regular") {
 			const entry = await this.entry(identity.canonicalPath);
@@ -595,6 +671,16 @@ class RestoreSession {
 			if (localObjectIdentity(entry) !== expectedObjectIdentity) fail("target_changed");
 			if (desired.kind === "regular" && byteChange && (entry.mode & 0o222n) === 0n)
 				fail("permission_denied");
+			// Windows refuses to delete a read-only file (EPERM) where POSIX only
+			// consults the parent directory, and a read-only file cannot be opened for
+			// the write-attribute access fchmod needs. Refuse both before dispatch
+			// rather than turning an unverified attribute write into an uncertain result.
+			if (
+				windowsSemantics() &&
+				(entry.mode & 0o222n) === 0n &&
+				(desired.kind === "absent" || modeChange)
+			)
+				fail("permission_denied");
 			if (
 				desired.kind === "regular" &&
 				expected.mode !== desired.mode &&
@@ -603,9 +689,11 @@ class RestoreSession {
 				BigInt(process.geteuid()) !== entry.uid
 			)
 				fail("permission_denied");
-			await this.opened(
-				desired.kind === "regular" && byteChange ? constants.O_RDWR : constants.O_RDONLY,
-			);
+			// Windows fchmod needs a handle with write-attribute access; a read-only
+			// handle fails AFTER dispatch. Open for writing when the mode changes.
+			const writable =
+				desired.kind === "regular" && (byteChange || (windowsSemantics() && modeChange));
+			await this.opened(writable ? constants.O_RDWR : constants.O_RDONLY);
 			await this.verifyOpened(expected, expectedObjectIdentity as string);
 		} else await this.verifyAbsent();
 		await this.permissions(byteChange, noChange);
@@ -622,6 +710,7 @@ class RestoreSession {
 		if (noChange) return "no_change"; // Positive THIS-invocation no syscall, not old execution confirmation.
 
 		if (desired.kind === "absent") {
+			if (windowsSemantics() && expected.kind === "regular") await this.releaseBeforeDelete();
 			this.dispatch();
 			await this.io(() => fs.unlink(identity.canonicalPath)); // Single entry only, never rm/recursive.
 			await this.guard("after_dispatch");
@@ -684,7 +773,12 @@ class RestoreSession {
 		}
 		// Mode-only uses the SAME descriptor as the last guard, never chmod(path).
 		this.dispatch();
-		await this.io(() => file.chmod(desired.mode));
+		// Windows: only touch the read-only attribute when it actually differs, so an
+		// unchanged mode never adds an attribute write after the byte mutation.
+		const currentMode = windowsSemantics()
+			? Number((await this.io(() => file.stat({ bigint: true }))).mode & 0o7777n)
+			: null;
+		if (currentMode !== desired.mode) await this.io(() => file.chmod(desired.mode));
 		await this.io(() => file.sync());
 		await this.guard("after_dispatch");
 		await this.verifyOpened(desired, object);
@@ -913,6 +1007,11 @@ function sameStamp(a: BigIntStats, b: BigIntStats) {
 function failureCode(error: unknown): LocalRestoreFailure {
 	if (error instanceof RestoreError) return error.code;
 	const code = (error as NodeJS.ErrnoException | undefined)?.code;
+	// Sharing violations (another process holds the file open without sharing, as
+	// Windows antivirus/indexers/editors often do). The reason only names the cause:
+	// result.status still says whether a mutation was dispatched, so a busy error
+	// after dispatch remains uncertain_after_dispatch and never looks retry-safe.
+	if (code === "EBUSY" || code === "ETXTBSY") return "io_busy";
 	if (code === "EACCES" || code === "EPERM") return "permission_denied";
 	if (code === "ELOOP" || code === "ENOTDIR" || code === "EISDIR") return "unsupported_object";
 	return "io_failed";

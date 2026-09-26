@@ -181,6 +181,9 @@ export interface VListRenderLabels {
 		/** "Taken over by user" badge on a card whose child the user is driving. */
 		takenOverBadge: string;
 		followParent: string;
+		followTooltip: string;
+		/** `{parentModel}` / `{pool}` are substituted by the card. */
+		fallbackReason: string;
 		/** File-changes section title. */
 		fileChanges: string;
 		/** Suffix for a file whose line counts are unknown. */
@@ -610,6 +613,12 @@ export function useVListLabels(): VListLabels {
 				backgroundBadge: t("backgroundBadge"),
 				takenOverBadge: t("subagentTakenOver"),
 				followParent: t("followParent"),
+				followTooltip: t("inheritance.followTooltip"),
+				// Placeholders stay literal so the card can substitute per-badge values.
+				fallbackReason: t("inheritance.fallbackReason", {
+					parentModel: "{parentModel}",
+					pool: "{pool}",
+				}),
 				fileChanges: t("subagentChangedFiles"),
 				linesNotMeasured: t("subagentLinesNotMeasured"),
 				moreFiles: t("subagentMoreFiles"),

@@ -81,6 +81,8 @@ function scopeUnavailableKey(preview: ScopePreview | undefined): string | null {
 			case "git_unsupported":
 			case "unsupported_target":
 				return "revertScopeUnsupportedTarget";
+			case "platform_unsupported":
+				return "revertScopePlatformUnsupported";
 			default:
 				return "revertScopeUnavailable";
 		}
