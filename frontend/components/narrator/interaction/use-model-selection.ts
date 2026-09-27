@@ -111,6 +111,90 @@ function codexModelSupportsReasoningDisabled(model?: string, modelOption?: Model
 	return getBareModelForReasoning(model, modelOption) !== "gpt-6-astra";
 }
 
+/** The thinking tiers a gateway can report, in ascending order. */
+const GATEWAY_REPORTED_EFFORT_ORDER: readonly ReasoningEffortValue[] = [
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+];
+
+/**
+ * Whether the gateway made any claim about this model's thinking tiers.
+ *
+ * The distinction that matters is field presence, not list length: a reported
+ * `[]` asserts the model has no thinking tiers, while an absent field means the
+ * gateway never told us and support has to be inferred from the model id. Only
+ * the caller can act on that difference, so it is exposed as its own predicate
+ * instead of being folded into the options lookup.
+ */
+function hasGatewayReportedEffortLevels(modelOption?: ModelOption): boolean {
+	return Array.isArray(modelOption?.effortLevels);
+}
+
+/**
+ * Map a gateway-reported effort list onto the UI's unified enum.
+ *
+ * per-model tiers for all of them, and that beats guessing from the model id.
+ * Relay ids in particular (k3, GLM-5.1, MiniMax-M2) match no vendor naming rule,
+ * so id-based inference produced no menu at all for models that do accept the
+ * parameter.
+ *
+ * Whether "none" is offered depends on the channel, because the gateway reports
+ * which intensities the upstream accepts and never reports "none" — turning
+ * thinking off is a client-side decision about whether to ask for it at all.
+ * Whether that decision can be expressed depends on how the request is built:
+ * see gatewayChannelCanDisableThinking.
+ *
+ * Returns undefined when the reported list yields no usable tier, so the caller
+ * can treat "reported nothing usable" the same as "reported []".
+ */
+function getGatewayReportedEffortOptions(
+	modelOption?: ModelOption,
+): readonly ReasoningEffortValue[] | undefined {
+	const levels = modelOption?.effortLevels;
+	if (!levels || levels.length === 0) return undefined;
+	const present = new Set<ReasoningEffortValue>();
+	for (const level of levels) {
+		const normalized = level.trim().toLowerCase();
+		if ((GATEWAY_REPORTED_EFFORT_ORDER as readonly string[]).includes(normalized)) {
+			present.add(normalized as ReasoningEffortValue);
+		}
+	}
+	const ordered = GATEWAY_REPORTED_EFFORT_ORDER.filter((l) => present.has(l));
+	if (ordered.length === 0) return undefined;
+	return gatewayChannelCanDisableThinking(modelOption?.channelType)
+		? (["none", ...ordered] as readonly ReasoningEffortValue[])
+		: ordered;
+}
+
+/**
+ * NUG channel types whose requests are built by a protocol delegate that can
+ * express "thinking off".
+ *
+ * Kept as an explicit list mirroring the delegate switch in
+ * server/lib/agent/nug-provider.ts (createDelegate). Channels absent from it
+ * so "none" is dropped in transit and a menu entry for it would promise a
+ * control that does nothing.
+ *
+ * The delegates listed here do implement it: the Anthropic delegate maps "none"
+ * to `thinking: { type: "disabled" }`, and the Codex/Responses path returns
+ * "none" from its effort normalizer instead of a tier. Withholding the entry
+ * from them would remove a control users have today.
+ */
+function gatewayChannelCanDisableThinking(channelType?: string): boolean {
+	switch (channelType) {
+		case "anthropic":
+		case "codex":
+		case "openai":
+		case "responses":
+			return true;
+		default:
+			return false;
+	}
+}
+
 function isDeepSeekModel(model?: string): boolean {
 	if (!model) return false;
 	return model.toLowerCase().includes("deepseek");
@@ -252,6 +336,20 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 	const supportsReasoningEffort = useMemo(() => {
 		const providerPrefix = resolvedModel?.split(":")[0];
 		if (!providerPrefix) return false;
+		// A gateway that reports tiers is authoritative for any channel type, and
+		// is checked before the Codex shortcut below: the gateway knows the specific
+		// routed model, whereas "this is a Codex-capable provider" is an assumption
+		// about the whole channel that a reported [] directly contradicts.
+		//
+		// Three states, deliberately distinguished:
+		//   - non-empty list → supported
+		//   - []             → NOT supported; the gateway explicitly says this model
+		//                      has no thinking tiers, so do not fall back to
+		//                      inference that would offer a menu it would reject
+		//   - absent field   → no claim was made; fall through to id-based inference
+		if (hasGatewayReportedEffortLevels(resolvedModelOption)) {
+			return !!getGatewayReportedEffortOptions(resolvedModelOption);
+		}
 		// Codex always has tiers, regardless of the model id.
 		if (codexCapableProviders.has(providerPrefix) || isCodexChannelModel) return true;
 		return modelAcceptsReasoningEffort(
@@ -267,6 +365,14 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 	]);
 	const reasoningEffortOptions = useMemo(() => {
 		if (!resolvedModel) return GENERIC_REASONING_EFFORT_TIERS;
+		// Gateway-reported tiers win over every table below, including DeepSeek's and
+		// model cards: those infer capability from the model id, while the gateway
+		// states it per routed model. Checked first so a relay-hosted model whose id
+		// resembles a known vendor's still gets the tiers its actual upstream
+		// accepts. A model reporting [] never reaches here — supportsReasoningEffort
+		// hides the menu entirely for it.
+		const gatewayOptions = getGatewayReportedEffortOptions(resolvedModelOption);
+		if (gatewayOptions) return gatewayOptions;
 		const card = modelCardIndex
 			? lookupModelCard(
 					getBareModelForReasoning(resolvedModel, resolvedModelOption),

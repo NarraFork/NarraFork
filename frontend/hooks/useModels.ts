@@ -391,6 +391,9 @@ export function useAllModels() {
 				const bareModel = String(rawBareModel || id);
 				const channel = String(m.channel ?? id.split(":")[0] ?? "");
 				const channelType = String(m.channelType ?? channel);
+				// An empty array is meaningful and must survive: the gateway reports the
+				// exact thinking tiers each model accepts, and `[]` asserts there are
+				// none. Only an absent field means "unknown, infer from the model id".
 				const effortLevels = Array.isArray(m.effortLevels)
 					? m.effortLevels.filter((l): l is string => typeof l === "string")
 					: undefined;
@@ -410,7 +413,7 @@ export function useAllModels() {
 					channel,
 					channelType,
 					bareModel,
-					...(effortLevels && effortLevels.length > 0 ? { effortLevels } : {}),
+					...(effortLevels ? { effortLevels } : {}),
 					...(pricing ? { pricing } : {}),
 					...(numField("officialInputUsd") != null
 						? { officialInputUsd: numField("officialInputUsd") }

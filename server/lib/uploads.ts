@@ -525,6 +525,25 @@ export async function saveUploadedImage(narratorId: string, file: File): Promise
 	mkdirSync(dir, { recursive: true });
 	ensureUploadDirWritable(dir);
 
+	// Self-heal: if the directory was created by another user (e.g. root),
+	// attempt to fix permissions so the current process can write into it.
+	try {
+		accessSync(dir, constants.W_OK);
+	} catch {
+		try {
+			chmodSync(dir, 0o755);
+			logger.warn("Fixed upload directory permissions", { dir });
+		} catch (chmodErr) {
+			logger.error("Upload directory not writable and cannot fix permissions", {
+				dir,
+				error: String(chmodErr),
+			});
+			throw new ValidationError(
+				"Image upload failed: storage directory is not writable. Please check server file permissions.",
+			);
+		}
+	}
+
 	const filePath = resolve(dir, `${imageId}${ext}`);
 	try {
 		await Bun.write(filePath, bytes);

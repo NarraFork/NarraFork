@@ -1,4 +1,5 @@
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
 import { getTestDb } from "../../../tests/setup";
 import {
@@ -48,6 +49,7 @@ const {
 type EventHandlerContext = import("../narrator-event-handler").EventHandlerContext;
 
 const PARENT_NARRATOR_ID = "parent-narrator";
+const SUBAGENT_NARRATOR_ID = "subagent-narrator";
 const PARENT_TOOL_USE_ID = "parent-tool-use";
 
 describe("request attribution", () => {
@@ -81,7 +83,7 @@ describe("request attribution", () => {
 
 function makeSubagentContext(): EventHandlerContext {
 	return {
-		narratorId: "subagent-narrator",
+		narratorId: SUBAGENT_NARRATOR_ID,
 		broadcastTargetId: PARENT_NARRATOR_ID,
 		conversationId: "subagent-conversation",
 		parentToolUseId: PARENT_TOOL_USE_ID,
@@ -98,9 +100,20 @@ function makeSubagentContext(): EventHandlerContext {
 	};
 }
 
+function makeMainContext(sseEmitter?: EventEmitter): EventHandlerContext {
+	return {
+		...makeSubagentContext(),
+		narratorId: PARENT_NARRATOR_ID,
+		broadcastTargetId: PARENT_NARRATOR_ID,
+		conversationId: "main-conversation",
+		parentToolUseId: undefined,
+		sseEmitter,
+	};
+}
+
 afterEach(() => {
 	clearStreamingSnapshot(PARENT_NARRATOR_ID);
-	clearStreamingSnapshot("subagent-narrator");
+	clearStreamingSnapshot(SUBAGENT_NARRATOR_ID);
 	broadcastMessages.length = 0;
 	broadcastTargets.length = 0;
 });
@@ -683,6 +696,227 @@ describe("完成工具输入传递", () => {
 		);
 
 		expect(calls).toEqual([["Bash", "bash-completed", { command: "git status" }]]);
+	});
+
+	test("retryable_error 只移除无内容的生图进度并重建其余快照", async () => {
+		const sseEmitter = new EventEmitter();
+		const sseEvents: unknown[] = [];
+		sseEmitter.on("event", (event) => sseEvents.push(event));
+		const ctx = makeMainContext(sseEmitter);
+
+		await processEvent({ type: "stream_text", text: "保留的 partial 文本", outputIndex: 0 }, ctx);
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId: "tool-stays",
+				toolName: "Read",
+				input: { file_path: "/tmp/keep.txt" },
+			},
+			ctx,
+		);
+		await processEvent(
+			{ type: "image_generation", id: "image-preparing", status: "in_progress", outputIndex: 1 },
+			ctx,
+		);
+		await processEvent(
+			{ type: "image_generation", id: "image-spinning", status: "generating", outputIndex: 2 },
+			ctx,
+		);
+		await processEvent(
+			{
+				type: "image_generation",
+				id: "image-partial",
+				status: "generating",
+				partialSavedPath: "/tmp/image-partial.png",
+				outputIndex: 3,
+			},
+			ctx,
+		);
+		await processEvent(
+			{
+				type: "image_generation",
+				id: "image-complete",
+				status: "completed",
+				savedPath: "/tmp/image-complete.png",
+				outputIndex: 4,
+			},
+			ctx,
+		);
+
+		broadcastMessages.length = 0;
+		sseEvents.length = 0;
+		await processEvent({ type: "retryable_error", message: "temporary gateway failure" }, ctx);
+
+		const snapshot = getStreamingSnapshot(PARENT_NARRATOR_ID);
+		expect(snapshot?.streamingBlocks).toEqual([
+			{
+				type: "text",
+				text: "保留的 partial 文本",
+				outputIndex: 0,
+				id: expect.any(String),
+				fileReferenceContext: null,
+			},
+			{
+				type: "image_generation",
+				id: "image-partial",
+				status: "completed",
+				revisedPrompt: undefined,
+				partialSavedPath: "/tmp/image-partial.png",
+				outputIndex: 3,
+			},
+			{
+				type: "image_generation",
+				id: "image-complete",
+				status: "completed",
+				revisedPrompt: undefined,
+				savedPath: "/tmp/image-complete.png",
+				outputIndex: 4,
+			},
+		]);
+		expect(snapshot?.toolChunks.has("tool-stays")).toBe(true);
+		expect(
+			snapshot?.streamingBlocks.some(
+				(block) =>
+					block.type === "image_generation" &&
+					(block.status === "in_progress" || block.status === "generating"),
+			),
+		).toBe(false);
+
+		const reset = broadcastMessages.find(
+			(message) => (message as { type?: string }).type === "streaming_reset",
+		) as Record<string, unknown> | undefined;
+		const rebuilt = broadcastMessages.find(
+			(message) => (message as { type?: string }).type === "streaming_snapshot",
+		) as Record<string, unknown> | undefined;
+		expect(reset).toMatchObject({ type: "streaming_reset", narratorId: PARENT_NARRATOR_ID });
+		expect(rebuilt).toMatchObject({
+			type: "streaming_snapshot",
+			narratorId: PARENT_NARRATOR_ID,
+			streamingBlocks: snapshot?.streamingBlocks,
+		});
+		expect((rebuilt?.toolChunks as unknown[])?.length).toBe(1);
+		expect(sseEvents).toEqual([
+			{ type: "streaming_reset" },
+			{
+				type: "streaming_snapshot",
+				data: {
+					streamingBlocks: snapshot?.streamingBlocks,
+					toolChunks: [...(snapshot?.toolChunks.values() ?? [])],
+				},
+			},
+		]);
+	});
+
+	test("没有未完成生图时 retryable_error 不重置 partial 文本、完成图片或工具", async () => {
+		const sseEmitter = new EventEmitter();
+		const sseEvents: unknown[] = [];
+		sseEmitter.on("event", (event) => sseEvents.push(event));
+		const ctx = makeMainContext(sseEmitter);
+		await processEvent({ type: "stream_text", text: "still here", outputIndex: 0 }, ctx);
+		await processEvent(
+			{
+				type: "image_generation",
+				id: "already-done",
+				status: "completed",
+				savedPath: "/tmp/already-done.png",
+				outputIndex: 1,
+			},
+			ctx,
+		);
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId: "still-running",
+				toolName: "Bash",
+				input: { command: "sleep 1" },
+			},
+			ctx,
+		);
+		const before = getStreamingSnapshot(PARENT_NARRATOR_ID);
+		const blocksBefore = before?.streamingBlocks.map((block) => ({ ...block }));
+
+		broadcastMessages.length = 0;
+		sseEvents.length = 0;
+		await processEvent({ type: "retryable_error", message: "retry without image" }, ctx);
+
+		expect(getStreamingSnapshot(PARENT_NARRATOR_ID)?.streamingBlocks).toEqual(blocksBefore);
+		expect(getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.has("still-running")).toBe(true);
+		expect(
+			broadcastMessages.some((message) =>
+				["streaming_reset", "streaming_snapshot"].includes(
+					(message as { type?: string }).type ?? "",
+				),
+			),
+		).toBe(false);
+		expect(sseEvents).toEqual([]);
+	});
+
+	test("子代理 retry 只清自身生图快照，父快照保持不变", async () => {
+		const parentCtx = makeMainContext();
+		await processEvent(
+			{ type: "stream_text", text: "parent live text", outputIndex: 0 },
+			parentCtx,
+		);
+
+		const childCtx = makeSubagentContext();
+		await processEvent(
+			{ type: "image_generation", id: "child-ghost", status: "in_progress", outputIndex: 0 },
+			childCtx,
+		);
+		await processEvent(
+			{
+				type: "image_generation",
+				id: "child-partial",
+				status: "generating",
+				partialSavedPath: "/tmp/child-partial.png",
+				outputIndex: 1,
+			},
+			childCtx,
+		);
+
+		broadcastMessages.length = 0;
+		await processEvent({ type: "retryable_error", message: "child retry" }, childCtx);
+
+		expect(getStreamingSnapshot(PARENT_NARRATOR_ID)?.streamingBlocks).toEqual([
+			{
+				type: "text",
+				text: "parent live text",
+				outputIndex: 0,
+				id: expect.any(String),
+				fileReferenceContext: null,
+			},
+		]);
+		expect(getStreamingSnapshot(SUBAGENT_NARRATOR_ID)?.streamingBlocks).toEqual([
+			{
+				type: "image_generation",
+				id: "child-partial",
+				status: "completed",
+				revisedPrompt: undefined,
+				partialSavedPath: "/tmp/child-partial.png",
+				outputIndex: 1,
+			},
+		]);
+
+		const resets = broadcastMessages.filter(
+			(message) => (message as { type?: string }).type === "streaming_reset",
+		) as Array<Record<string, unknown>>;
+		expect(resets).toContainEqual({
+			type: "streaming_reset",
+			narratorId: PARENT_NARRATOR_ID,
+			parentToolUseId: PARENT_TOOL_USE_ID,
+		});
+		expect(resets).toContainEqual({
+			type: "streaming_reset",
+			narratorId: SUBAGENT_NARRATOR_ID,
+		});
+		const snapshots = broadcastMessages.filter(
+			(message) => (message as { type?: string }).type === "streaming_snapshot",
+		) as Array<Record<string, unknown>>;
+		expect(snapshots).toHaveLength(1);
+		expect(snapshots[0]).toMatchObject({
+			narratorId: SUBAGENT_NARRATOR_ID,
+			streamingBlocks: getStreamingSnapshot(SUBAGENT_NARRATOR_ID)?.streamingBlocks,
+		});
 	});
 });
 

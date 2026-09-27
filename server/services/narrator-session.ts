@@ -5406,7 +5406,9 @@ async function rollbackToBlockUnlocked(
 			blocksToDelete,
 			{
 				preserveConversationId: true,
-				skipRevert: opts?.skipRevert,
+				// History-only: file state was already settled in step 0. Also avoids the
+				// per-block rebuild loop inside deleteMessageBlocks.
+				skipRevert: true,
 			},
 		);
 
