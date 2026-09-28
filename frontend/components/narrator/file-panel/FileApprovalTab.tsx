@@ -60,7 +60,13 @@ export function FileApprovalTab({
 		useContext(PermEnterHintCtx);
 	const isActivePermission = permission.id === activePermissionId;
 	const toolUseId = permission.toolUseId ?? null;
-	const { data, isLoading } = usePermissionFilePreview(narratorId, toolUseId, !!toolUseId);
+	// The tool-call row belongs to the narrator that issued it; a subagent's request shown
+	// on the parent panel would not be found under the parent's id.
+	const { data, isLoading } = usePermissionFilePreview(
+		permission.ownerNarratorId ?? narratorId,
+		toolUseId,
+		!!toolUseId,
+	);
 
 	const draftKey = permission.id;
 	const [feedback, setFeedback] = useState(() => readFileApprovalDraft(draftKey));

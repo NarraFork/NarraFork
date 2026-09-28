@@ -49,7 +49,7 @@ import {
 	type StashEntry,
 	type StashFailure,
 } from "../../structural/stash";
-import type { ToolDefinition, ToolResult } from "../../types";
+import type { ToolContext, ToolDefinition, ToolResult } from "../../types";
 import {
 	applyLineEnding,
 	decodeFileBytes,
@@ -57,7 +57,7 @@ import {
 	encodeFileBytes,
 	normalizeLineEndings,
 } from "../encoding";
-import { applyCommand, changeLineStats, diffMetadata, previewRegion } from "./apply";
+import { applyCommand, changeLineStats, diffMetadata, diffWindow, previewRegion } from "./apply";
 import { COMMANDS, MAX_BATCH_OPERATIONS, MAX_FILE_BYTES } from "./commands";
 import { resolveToRange, type ValidatedSpec, validateSpec } from "./resolve";
 
@@ -651,6 +651,14 @@ export const structSedTool: ToolDefinition = {
 		// anything is written, which is the check a structural address does not carry.
 		const dryRun = args.dry_run !== false;
 		if (dryRun) {
+			// Approval preview (see `previewStructSedChange`): hand over the whole before/after
+			// pair computed by THIS pipeline, so what the reviewer sees cannot drift from what
+			// the approved call will write.
+			(ctx as PreviewCaptureContext)[PREVIEW_CAPTURE]?.({
+				filePath: ioPath,
+				before: normalized,
+				after: nextText,
+			});
 			const afterRange: LineRange =
 				command === "delete"
 					? { startLine: Math.max(1, range.startLine - 1), endLine: range.startLine }
@@ -788,6 +796,58 @@ export const structSedTool: ToolDefinition = {
 		}
 	},
 };
+
+/** Full before/after text of a StructSed call, captured without writing anything. */
+export interface StructSedChangePreview {
+	/** Path the tool resolved and read. */
+	filePath: string;
+	/** LF-normalized content before the change. */
+	before: string;
+	/** LF-normalized content after the change. */
+	after: string;
+}
+
+/**
+ * Private hook through which a dry run reports its computed texts. A symbol key keeps it
+ * out of every other ToolContext consumer and out of anything the model can pass.
+ */
+const PREVIEW_CAPTURE = Symbol("structSedPreviewCapture");
+type PreviewCaptureContext = ToolContext & {
+	[PREVIEW_CAPTURE]?: (preview: StructSedChangePreview) => void;
+};
+
+/**
+ * What a pending StructSed call WOULD change, for the approval UI.
+ *
+ * Approval is only ever requested for `dry_run: false` (a dry run is classified read-only),
+ * so the card has no tool output to show at that point. Re-running the SAME pipeline as a
+ * dry run — stash handles are only peeked, nothing is written — yields the exact texts the
+ * write would produce. Returns the tool's own error text when the call cannot be previewed
+ * (address no longer resolves, remote backend, file too large, …).
+ */
+export async function previewStructSedChange(
+	args: Record<string, unknown>,
+	ctx: ToolContext,
+): Promise<
+	| {
+			preview: StructSedChangePreview;
+			/** Changed region with context, or null when too large to show as a diff. */
+			window: ReturnType<typeof diffWindow>;
+	  }
+	| { error: string }
+> {
+	const holder: { captured: StructSedChangePreview | null } = { captured: null };
+	const captureCtx: PreviewCaptureContext = {
+		...ctx,
+		[PREVIEW_CAPTURE]: (preview) => {
+			holder.captured = preview;
+		},
+	};
+	const result = await structSedTool.execute({ ...args, dry_run: true }, captureCtx);
+	const preview = holder.captured;
+	if (!preview) return { error: result.output || "StructSed preview produced no change." };
+	return { preview, window: diffWindow(preview.before, preview.after) };
+}
 
 /**
  * Why a stash handle could not be used, and what to do about it.

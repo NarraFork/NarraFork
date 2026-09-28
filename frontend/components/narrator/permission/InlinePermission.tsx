@@ -9,13 +9,15 @@
  * whole classic renderer into its import graph.
  */
 
+import { usePermissionFilePreview } from "@frontend/hooks/useNarrator";
 import { readSession, removeSession, writeSession } from "@frontend/lib/session-store";
 import type { PendingPermission } from "@frontend/types/narrator";
-import { Badge, Box, Button, Group, Modal, Paper, Text, Textarea } from "@mantine/core";
+import { Badge, Box, Button, Group, Loader, Modal, Paper, Text, Textarea } from "@mantine/core";
 import { IconFileCode } from "@tabler/icons-react";
 import { type CSSProperties, type ReactNode, useContext, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarratorPermissionsCapability } from "../../../hooks/usePlatform";
+import { DiffView } from "../diff/DiffView";
 import { MESSAGE_SELECTION_IGNORE_ATTR } from "../message/MessageSelectionCtx";
 import { AskUserQuestionBanner, coerceQuestions } from "../question/AskUserQuestionBanner";
 import { FileModDrawerCtx, PermEnterHintCtx } from "../tool-call/tool-call-contexts";
@@ -41,6 +43,68 @@ function ReviewInPanelButton() {
 		>
 			{t("fileMod_viewInPanel")}
 		</Button>
+	);
+}
+
+// --- StructSed change preview ---
+
+/**
+ * What a pending StructSed call would change.
+ *
+ * Edit and Write carry their change in their input (old/new string, content), so the tool
+ * card already shows it. StructSed carries only a selector (`symbol` / `address`) plus the
+ * command, and approval is only ever asked for the real write (a dry run is read-only), so
+ * there is no dry-run output on the card either. The server re-runs the tool's own pipeline
+ * as a dry run and returns the changed window, which is shown here as a diff.
+ */
+function StructSedChangePreview({ permission }: { permission: PendingPermission }) {
+	const { t } = useTranslation("narrator");
+	const narratorId = permission.ownerNarratorId ?? "";
+	const toolUseId = permission.toolUseId ?? null;
+	const { data, isLoading, error } = usePermissionFilePreview(
+		narratorId,
+		toolUseId,
+		!!narratorId && !!toolUseId,
+	);
+	if (!narratorId || !toolUseId) return null;
+	if (isLoading) {
+		return (
+			<Group gap="xs" mb="xs">
+				<Loader size="xs" />
+				<Text size="xs" c="dimmed">
+					{t("fileMod_previewLoading")}
+				</Text>
+			</Group>
+		);
+	}
+	if (error) {
+		return (
+			<Text size="xs" c="red" mb="xs" style={{ overflowWrap: "anywhere" }}>
+				{t("fileMod_previewFailed", {
+					error: error instanceof Error ? error.message : String(error),
+				})}
+			</Text>
+		);
+	}
+	const window = data?.diffWindow;
+	if (!window) {
+		return data ? (
+			<Text size="xs" c="dimmed" mb="xs">
+				{t("fileMod_diffTooLarge")}
+			</Text>
+		) : null;
+	}
+	const filePath = data.filePath ?? "";
+	return (
+		<Box mb="xs">
+			<DiffView
+				oldStr={window.oldText}
+				newStr={window.newText}
+				startLine={window.startLine}
+				maxHeight={360}
+				language={filePath.split(".").pop() ?? ""}
+			/>
+		</Box>
 	);
 }
 
@@ -382,6 +446,7 @@ export function InlinePermission({
 					)}
 				</Paper>
 			)}
+			{permission.toolName === "StructSed" && <StructSedChangePreview permission={permission} />}
 			{planEdited && !editing && (
 				<Badge size="xs" color="indigo" variant="light" mb={4}>
 					{t("planEdited")}

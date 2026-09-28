@@ -55,6 +55,7 @@ import {
 import { summaryGenerate } from "../lib/agent";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
+import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
 import { redactSpillPointerPaths } from "../lib/api-request-dump-store";
 import { narratorTraitsLock } from "../lib/async-mutex";
@@ -298,6 +299,7 @@ import {
 	stopDangerReflectionLoop,
 	takeOverQuestionReflection,
 } from "../services/narrator-permission";
+import { reconstructToolExecutionTarget } from "../services/narrator-persistence";
 import { enterNarratorPlanMode, exitNarratorPlanMode } from "../services/narrator-plan-mode";
 import {
 	answerAsyncQuestion,
@@ -6620,9 +6622,47 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
 			canonicalFilePath: true,
 			runtimeGeneration: true,
 			executionTargetsJson: true,
+			deviceSelectionSource: true,
 		},
 	});
 	if (!toolCall) return c.json({ error: "Tool call not found" }, 404);
+
+	// StructSed records no replayable file identity until it has written, and its pending
+	// input is a selector (symbol / address) rather than text. Preview it by re-running the
+	// tool's own pipeline as a dry run against the frozen target: that reads the file and
+	// resolves the address exactly as the approved call will, and writes nothing.
+	if (toolCall.toolName === "StructSed") {
+		const input =
+			toolCall.inputJson &&
+			typeof toolCall.inputJson === "object" &&
+			!Array.isArray(toolCall.inputJson)
+				? (toolCall.inputJson as Record<string, unknown>)
+				: null;
+		if (!input) return c.json({ error: "Tool call has no input" }, 400);
+		const target = reconstructToolExecutionTarget(toolCall);
+		const cwd = target?.cwd ?? (await resolveNarratorCwd(narratorId));
+		if (!cwd) return c.json({ error: "Tool call has no working directory" }, 409);
+		const outcome = await previewStructSedChange(input, {
+			narratorId,
+			cwd,
+			signal: c.req.raw.signal,
+			locale: (await getUserLanguage(c.get("user").sub)) as Locale,
+			requestPermission: async () => ({ behavior: "deny", message: "preview only" }),
+			...(target ? { executionTarget: target } : {}),
+		});
+		if ("error" in outcome) {
+			return c.json({ error: outcome.error, code: "STRUCT_SED_PREVIEW_FAILED" }, 409);
+		}
+		return c.json({
+			deviceId: target?.deviceId ?? "local",
+			filePath: outcome.preview.filePath,
+			currentContent: outcome.preview.before,
+			previewContent: outcome.preview.after,
+			diffWindow: outcome.window,
+			toolName: toolCall.toolName,
+			inputJson: toolCall.inputJson,
+		});
+	}
 
 	let identity: DeviceFileIdentity | null;
 	try {

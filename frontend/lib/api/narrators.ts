@@ -1796,6 +1796,8 @@ export const narratorsApi = {
 			filePath: string;
 			currentContent: string | null;
 			previewContent: string | null;
+			/** StructSed only: changed region with context; null when too large to diff. */
+			diffWindow?: { oldText: string; newText: string; startLine: number } | null;
 			toolName: string;
 			inputJson: Record<string, unknown>;
 		}>(
