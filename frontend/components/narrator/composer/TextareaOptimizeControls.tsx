@@ -11,13 +11,13 @@ import { useTranslation } from "react-i18next";
 /**
  * Geometry of this control cluster, in px, so a caller can reserve exactly the room it takes.
  *
- * A `rightSection` is NOT measured by Mantine: `rightSectionWidth` is written verbatim into
- * `--input-right-section-width`, and the input uses that variable as its `padding-inline-end`.
- * These four call sites used to pass the literal `"auto"`, which makes that padding value
- * invalid — the declaration is dropped, so the input keeps its default inline padding — while
- * `.section`'s own `width: auto` still grows to fit the buttons. The two then disagree and the
- * buttons sit on top of the last characters of the text. Reserving the real width keeps the
- * input's padding and the section's width in agreement.
+ * A `rightSection` is NOT measured by Mantine: `rightSectionWidth` goes through its `rem()`
+ * helper into `--input-right-section-width`, and the input uses that variable as its
+ * `padding-inline-end`. A NUMBER becomes a length (`calc(3.5rem * var(--mantine-scale))` for 56);
+ * a string is passed through unchanged, so the literal `"auto"` made the padding declaration
+ * invalid — the browser drops it, the input keeps its default inline padding, while `.section`'s
+ * own `width: auto` still grows to fit the buttons. The two then disagree and the buttons sit on
+ * top of the last characters of the text. Reserving the real width keeps them in agreement.
  */
 const ACTION_ICON_SM_PX = 22; // Mantine `--ai-size-sm`; both buttons below use size="sm".
 const CONTROLS_GAP_PX = 4; // The Group's `gap`.
