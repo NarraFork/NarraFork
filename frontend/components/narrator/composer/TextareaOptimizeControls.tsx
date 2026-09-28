@@ -8,6 +8,39 @@ import {
 } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 
+/**
+ * Geometry of this control cluster, in px, so a caller can reserve exactly the room it takes.
+ *
+ * A `rightSection` is NOT measured by Mantine: `rightSectionWidth` is written verbatim into
+ * `--input-right-section-width`, and the input uses that variable as its `padding-inline-end`.
+ * These four call sites used to pass the literal `"auto"`, which makes that padding value
+ * invalid — the declaration is dropped, so the input keeps its default inline padding — while
+ * `.section`'s own `width: auto` still grows to fit the buttons. The two then disagree and the
+ * buttons sit on top of the last characters of the text. Reserving the real width keeps the
+ * input's padding and the section's width in agreement.
+ */
+const ACTION_ICON_SM_PX = 22; // Mantine `--ai-size-sm`; both buttons below use size="sm".
+const CONTROLS_GAP_PX = 4; // The Group's `gap`.
+const SECTION_PADDING_END_PX = 8; // Right inset, applied by the Group's own `pr` below.
+
+/**
+ * The width a `Textarea` must reserve for these controls.
+ *
+ * `hasExpand` has to mirror whether `onExpand` is passed — the expand button is conditional, so
+ * a caller that omits it (the fullscreen editor) needs a narrower strip.
+ *
+ * The inset lives on the Group rather than in the caller's `section` styles so this number is
+ * exactly the component's own outer width; a caller that also padded the section would shift
+ * the buttons relative to the strip it reserved.
+ */
+export function textareaOptimizeControlsWidth(hasExpand: boolean): number {
+	return (
+		ACTION_ICON_SM_PX * (hasExpand ? 2 : 1) +
+		CONTROLS_GAP_PX * (hasExpand ? 1 : 0) +
+		SECTION_PADDING_END_PX
+	);
+}
+
 export interface TextareaOptimizeControlsProps {
 	disabled?: boolean;
 	loading?: boolean;
@@ -26,7 +59,7 @@ export function TextareaOptimizeControls(props: TextareaOptimizeControlsProps) {
 	const contextCount = props.contextMessageCount ?? 10;
 
 	return (
-		<Group gap={4} wrap="nowrap" style={{ pointerEvents: "auto" }}>
+		<Group gap={4} wrap="nowrap" pr={8} style={{ pointerEvents: "auto" }}>
 			<Menu position="top-end" withArrow withinPortal offset={{ mainAxis: 8, crossAxis: 8 }}>
 				<Menu.Target>
 					<Tooltip label={t("optimizePrompt")} position="top">

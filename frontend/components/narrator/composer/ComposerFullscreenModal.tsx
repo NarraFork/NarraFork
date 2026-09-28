@@ -5,7 +5,10 @@ import { useHotkeys } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { TextareaOptimizeControls } from "./TextareaOptimizeControls";
+import {
+	TextareaOptimizeControls,
+	textareaOptimizeControlsWidth,
+} from "./TextareaOptimizeControls";
 
 export interface ComposerFullscreenModalProps {
 	opened: boolean;
@@ -145,18 +148,11 @@ export function ComposerFullscreenModal({
 							/>
 						) : undefined
 					}
-					rightSectionWidth={optimizeHook ? "auto" : undefined}
-					rightSectionProps={
-						optimizeHook
-							? {
-									style: {
-										alignItems: "center",
-										paddingRight: 8,
-										top: 8,
-									},
-								}
-							: undefined
-					}
+					// No `onExpand` is passed here, so only the optimize button is present and the reserved
+					// strip is correspondingly narrower. `top` keeps the buttons beside the FIRST line of a
+					// tall textarea rather than centred in it.
+					rightSectionWidth={optimizeHook ? textareaOptimizeControlsWidth(false) : undefined}
+					rightSectionProps={optimizeHook ? { style: { top: 8 } } : undefined}
 				/>
 				<Stack gap="sm" mt="md">
 					{showStats && text.length > 0 && (
