@@ -4145,6 +4145,22 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 				...(parentToolUseId ? { toolUseId: parentToolUseId } : {}),
 			});
 
+		// A suspended foreground runner retains its loop flag and abort controller.
+		// Settle its control wait before treating those as an executing turn; a pending
+		// stop alone cannot wake the runner to consume that marker.
+		if (isManualOverride(id)) {
+			const finalText = await getSubagentFinalText(id);
+			const hasError = parseSubstatus(narrator.substatus).includes("error");
+			if (resolveManualOverride(id, finalText, hasError)) {
+				clearTakenOver(id);
+				await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
+				await broadcastReleased();
+				return c.json({ stopped: true, deferred: false });
+			}
+			// Resume may have claimed the wait during the lookup. Re-probe the live
+			// runner below and defer handoff to that turn instead of releasing twice.
+		}
+
 		// Probe after the awaited lookups, immediately before marking the
 		// handoff. A loop can finish while those awaits yield. Its CURRENT owner,
 		// not the mode it originally started in, decides who must settle the result.
@@ -4203,17 +4219,6 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 		// Idle — resolve the parent's blocked Promise immediately with the current result.
 		const finalText = await getSubagentFinalText(id);
 		const hasError = parseSubstatus(narrator.substatus).includes("error");
-
-		// Foreground-loop takeover: the parent is blocked in waitForManualOverride.
-		// Resolve it directly; the parent's runForegroundLoop finalizer returns the
-		// result and cleans up status.
-		if (isManualOverride(id)) {
-			clearTakenOver(id);
-			await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
-			resolveManualOverride(id, finalText, hasError);
-			await broadcastReleased();
-			return c.json({ stopped: true, deferred: false });
-		}
 
 		// Session-engine takeover (e.g. continued from a manual_override): the parent
 		// was already unblocked when the user continued the subagent, and a conclusion

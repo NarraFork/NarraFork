@@ -154,6 +154,11 @@ export function exportDeadline(timeoutMs: number | undefined): number | undefine
 	return Date.now() + timeoutMs;
 }
 
+/** Let queued I/O and timers run before continuing. */
+function yieldToEventLoop(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
+}
+
 /** Throw if the export should stop. `at` names the point, so a failure says where it stopped. */
 function checkControl(control: ExportControl, at: string): void {
 	if (control.signal?.aborted) throw new ArchiveExportCancelledError("aborted", at);
@@ -313,6 +318,11 @@ async function eachPage(
 				total += result.rows.length;
 			}
 			if (result.nextCursor === null) break;
+			// Yield a MACROtask between pages. The SQLite store's `readRows` is async in signature
+			// only — it runs a synchronous query — so the `await` above resolves as a microtask and
+			// a long export would otherwise run every page in one uninterrupted turn, starving
+			// timers, HTTP, WebSocket and child-process I/O until it finished.
+			await yieldToEventLoop();
 			if (result.nextCursor === after) {
 				throw new Error(`Archive export of "${table}" stalled at cursor ${after}`);
 			}

@@ -7,9 +7,13 @@ import {
 	type ModelAggregation,
 } from "../../../lib/constants";
 import {
+	applyModelMenuMaxHeight,
 	canAssignGlobalModelRole,
 	centerModelMenuSelection,
+	MODEL_MENU_POSITIONING,
 	modelMenuSelection,
+	modelProviderPrefix,
+	shouldAutoFocusModelFilter,
 } from "./model-menu-selection";
 
 const aggregations: ModelAggregation[] = [
@@ -44,6 +48,25 @@ describe("model menu selection", () => {
 			"__agg__:group",
 		);
 		expect(modelMenuSelection("__agg__:group:a:model", []).targetValue).toBe("__agg__:group");
+	});
+});
+
+describe("model provider prefix for role rows", () => {
+	test("extracts the provider prefix from a concrete model value", () => {
+		expect(modelProviderPrefix("codex:gpt-6-astra")).toBe("codex");
+		expect(modelProviderPrefix("xiaomi:codex:gpt-6-astra")).toBe("xiaomi");
+		expect(modelProviderPrefix("a:model:variant")).toBe("a");
+	});
+	test("returns null for empty values and meta sentinels", () => {
+		expect(modelProviderPrefix(null)).toBeNull();
+		expect(modelProviderPrefix(undefined)).toBeNull();
+		expect(modelProviderPrefix("")).toBeNull();
+		expect(modelProviderPrefix("no-colon")).toBeNull();
+		expect(modelProviderPrefix(FOLLOW_DEFAULT_MODEL)).toBeNull();
+		expect(modelProviderPrefix(FOLLOW_SUMMARY_MODEL)).toBeNull();
+		expect(modelProviderPrefix(FOLLOW_PARENT_MODEL)).toBeNull();
+		expect(modelProviderPrefix(buildAggModelValue("group"))).toBeNull();
+		expect(modelProviderPrefix(buildAggModelValue("group", "a:model"))).toBeNull();
 	});
 });
 
@@ -99,4 +122,42 @@ test("both statusbar variants wire aggregation controls inside the model dropdow
 			/<ModelMenuItems\s+opened=\{menuOpen(?:Desktop|Mobile)\}\s+aggregations=\{model\.aggregations\}/g,
 		),
 	).toHaveLength(2);
+});
+
+describe("model menu viewport fitting", () => {
+	test("clamps the dropdown to the visible height left above the keyboard", () => {
+		const floating = { style: {} as { maxHeight?: string } } as HTMLElement;
+		applyModelMenuMaxHeight(floating, 173.6);
+		expect(floating.style.maxHeight).toBe("min(60vh, 173px)");
+		applyModelMenuMaxHeight(floating, 10);
+		expect(floating.style.maxHeight).toBe("min(60vh, 96px)");
+	});
+
+	test("lets the dropdown flip while open and sizes it through floating-ui", () => {
+		expect(MODEL_MENU_POSITIONING.preventPositionChangeWhenVisible).toBe(false);
+		const floating = { style: {} as { maxHeight?: string } } as HTMLElement;
+		MODEL_MENU_POSITIONING.middlewares.size.apply({
+			elements: { floating },
+			availableHeight: 240,
+		} as unknown as Parameters<typeof MODEL_MENU_POSITIONING.middlewares.size.apply>[0]);
+		expect(floating.style.maxHeight).toBe("min(60vh, 240px)");
+	});
+
+	test("does not auto-focus the search field on touch devices", () => {
+		const win = (matches: boolean) => ({ matchMedia: () => ({ matches }) }) as unknown as Window;
+		expect(shouldAutoFocusModelFilter(win(true))).toBe(false);
+		expect(shouldAutoFocusModelFilter(win(false))).toBe(true);
+	});
+});
+
+test("every model dropdown uses the viewport-aware positioning", async () => {
+	for (const file of [
+		"../interaction/NarratorInteractionStatusBar.tsx",
+		"../compact/compact-summary-modal.tsx",
+	]) {
+		const source = await Bun.file(new URL(file, import.meta.url)).text();
+		expect(source.match(/data-model-menu-scroll/g)?.length).toBe(
+			source.match(/\{\.\.\.MODEL_MENU_POSITIONING\}/g)?.length,
+		);
+	}
 });

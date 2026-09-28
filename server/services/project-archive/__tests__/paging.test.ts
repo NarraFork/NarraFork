@@ -34,10 +34,10 @@ import {
 } from "@server/db/schema";
 import { generateId } from "@server/lib/id";
 import { getProjectDbPath, projectDbManager } from "@server/lib/project-db";
-import { fullSync } from "@server/services/project-db-sync";
+import { __testing, fullSync } from "@server/services/project-db-sync";
 import { importProject } from "@server/services/project-import";
 import { eq } from "drizzle-orm";
-import { ARCHIVE_EXPORT_PAGE_SIZE } from "../export-rows";
+import { ARCHIVE_EXPORT_PAGE_SIZE, readAllRows } from "../export-rows";
 import { projectArchiveMainStore } from "../store";
 
 /** Comfortably more than one page, so the second page is not a single trailing row. */
@@ -268,5 +268,94 @@ describe("a multi-page export and import keeps every row", () => {
 		} finally {
 			archive.close();
 		}
+	});
+});
+
+describe("the incremental narrator sync", () => {
+	test("copies only the refs the archive is missing, including backfilled older ones", async () => {
+		const fixture = await createBigFixture();
+		await fullSync(fixture.projectId);
+
+		// One newer message, plus one whose seq sits BELOW everything archived (a lazily-forked
+		// narrator backfilling its prefix). A high-water mark would skip the second one forever.
+		const now = new Date().toISOString();
+		const newer = generateId();
+		const backfilled = generateId();
+		await db.insert(narratorMessages).values(
+			[newer, backfilled].map((id) => ({
+				id,
+				narratorId: fixture.narratorId,
+				role: "assistant" as const,
+				contentJson: [{ type: "text", text: id }],
+				createdAt: now,
+			})),
+		);
+		await db.insert(narratorMessageRefs).values([
+			{ id: generateId(), narratorId: fixture.narratorId, messageId: newer, seq: MESSAGE_COUNT },
+			{ id: generateId(), narratorId: fixture.narratorId, messageId: backfilled, seq: -1 },
+		]);
+
+		const stats = await __testing.syncNarratorMessages(fixture.narratorId);
+		expect(stats).toEqual({
+			mainRefs: MESSAGE_COUNT + 2,
+			archivedMessages: MESSAGE_COUNT,
+			newRefs: 2,
+		});
+
+		const archive = new Database(getProjectDbPath(fixture.gitPath), { readonly: true });
+		try {
+			const ids = new Set(
+				(
+					archive
+						.prepare("SELECT message_id FROM narrator_message_refs WHERE narrator_id = ?")
+						.all(fixture.narratorId) as Array<{ message_id: string }>
+				).map((row) => row.message_id),
+			);
+			expect(ids.size).toBe(MESSAGE_COUNT + 2);
+			expect(ids.has(newer)).toBe(true);
+			expect(ids.has(backfilled)).toBe(true);
+			const copied = archive
+				.prepare("SELECT COUNT(*) AS c FROM narrator_messages WHERE id IN (?, ?)")
+				.get(newer, backfilled) as { c: number };
+			expect(copied.c).toBe(2);
+		} finally {
+			archive.close();
+		}
+
+		// Nothing new: a second pass copies nothing.
+		const again = await __testing.syncNarratorMessages(fixture.narratorId);
+		expect(again?.newRefs).toBe(0);
+	});
+});
+
+describe("a multi-page export yields the event loop between pages", () => {
+	test("a timer queued before the export runs before the export finishes", async () => {
+		const fixture = await createBigFixture();
+		let timerRanAt: number | null = null;
+		let pagesAtTimer = -1;
+		let pagesRead = 0;
+		// Count pages through a wrapping store so the test can tell WHEN the timer ran.
+		const countingStore = {
+			...projectArchiveMainStore,
+			readRows: async (query: Parameters<typeof projectArchiveMainStore.readRows>[0]) => {
+				const page = await projectArchiveMainStore.readRows(query);
+				pagesRead += 1;
+				return page;
+			},
+		};
+		setTimeout(() => {
+			timerRanAt = Date.now();
+			pagesAtTimer = pagesRead;
+		}, 0);
+		const rows = await readAllRows(countingStore, "narrator_message_refs", {
+			filter: { column: "narrator_id", values: [fixture.narratorId] },
+		});
+		expect(rows).toHaveLength(MESSAGE_COUNT);
+		expect(pagesRead).toBeGreaterThan(1);
+		// Without a macrotask yield the synchronous store would read every page in one turn and
+		// the timer would only fire afterwards (pagesAtTimer === pagesRead, or not at all yet).
+		expect(timerRanAt).not.toBeNull();
+		expect(pagesAtTimer).toBeGreaterThan(0);
+		expect(pagesAtTimer).toBeLessThan(pagesRead);
 	});
 });

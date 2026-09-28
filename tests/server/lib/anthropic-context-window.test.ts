@@ -198,9 +198,9 @@ describe("resolveModelContextWindow reports where the value came from", () => {
 		});
 	});
 
-	test("unknown model falls back to 128k and reports fallback", () => {
+	test("unknown model falls back to the default context window and reports fallback", () => {
 		expect(resolveModelContextWindow("totally-unknown-model", "relay")).toEqual({
-			contextWindow: 128_000,
+			contextWindow: 272_000,
 			source: "fallback",
 		});
 	});

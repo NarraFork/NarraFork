@@ -818,6 +818,80 @@ describe("action-bound HTTP preview and real local execution", () => {
 		expect(events.some((event) => event.message.type === "full_reload")).toBe(true);
 		expect(events.every((event) => event.committed)).toBe(true);
 	});
+	test("a subagent is its own revert root: files and its history roll back, the parent is untouched", async () => {
+		// Users interact with subagents directly, so rollback must work inside one.
+		const parentId = generateId();
+		const parentMessage = generateId();
+		db.insert(schema.narrators)
+			.values({
+				id: parentId,
+				title: "parent",
+				cwd: workspace,
+				ownerUserId: userId,
+				contextProjectId: projectId,
+				messageVersion: 3,
+				createdAt: now(),
+				updatedAt: now(),
+			})
+			.run();
+		db.insert(schema.narratorMessages)
+			.values({
+				id: parentMessage,
+				narratorId: parentId,
+				role: "assistant",
+				contentJson: [{ type: "text", text: "parent history stays" }],
+				createdAt: now(),
+			})
+			.run();
+		db.insert(schema.narratorMessageRefs)
+			.values({ id: generateId(), narratorId: parentId, messageId: parentMessage, seq: 1 })
+			.run();
+		db.update(schema.narrators)
+			.set({
+				type: "subagent",
+				variant: "subagent:general",
+				subagentType: "general",
+				parentNarratorId: parentId,
+				aclRootNarratorId: parentId,
+				contextProjectId: null,
+			})
+			.where(eq(schema.narrators.id, narratorId))
+			.run();
+		const path = join(workspace, "subagent.txt");
+		await writeFile(path, "S0\n");
+		const boundary = await edit(path, "S0", "S1");
+		const later = await edit(path, "S1", "S2");
+		const parentBefore = db
+			.select()
+			.from(schema.narratorMessageRefs)
+			.where(eq(schema.narratorMessageRefs.narratorId, parentId))
+			.all();
+		const plan = await actionPrepared("rollback_to_block", boundary.messageId, {
+			blockIndex: boundary.blockIndex,
+		});
+		expect(plan.expectedFileCount).toBe(1);
+		await committed(plan, "rollback_to_block");
+		expect(await readFile(path, "utf8")).toBe("S1\n");
+		expect(messageRefs().map((ref) => ref.messageId)).toEqual([boundary.messageId]);
+		expect(messageRow(later.messageId)).toBeUndefined();
+		expect(
+			db
+				.select()
+				.from(schema.narratorMessageRefs)
+				.where(eq(schema.narratorMessageRefs.narratorId, parentId))
+				.all(),
+		).toEqual(parentBefore);
+		expect(messageRow(parentMessage)?.contentJson).toEqual([
+			{ type: "text", text: "parent history stays" },
+		]);
+		// File-only rollback inside the subagent works through the same path.
+		const again = await edit(path, "S1", "S3");
+		const filePlan = await actionPrepared("revert_files", again.messageId, {
+			idempotencyKey: "subagent-files",
+		});
+		await committed(filePlan, "revert_files");
+		expect(await readFile(path, "utf8")).toBe("S1\n");
+	});
 	test("user rollback keeps the complete multimodal boundary even when blockIndex points at its text", async () => {
 		const prefix = message("assistant", [{ type: "text", text: "earlier context" }]);
 		const blocks = [

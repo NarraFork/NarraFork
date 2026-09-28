@@ -16,7 +16,7 @@
  * hence the assertion is on the signal, plus the hard-interrupt marker so a
  * re-introduced abort cannot sneak back as a "soft" one.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -227,6 +227,8 @@ describe("releasing a background takeover after switching to a foreground runner
 			substatus: JSON.stringify(["taken_over"]),
 		});
 		markTakenOver(subagentId, { background: true });
+		// Suspension retains the foreground runner's controller until finalization.
+		registerForegroundTurn(subagentId);
 		const controller = new AbortController();
 		const completion = waitForManualOverride(
 			subagentId,
@@ -244,6 +246,49 @@ describe("releasing a background takeover after switching to a foreground runner
 			expect(isManualOverride(subagentId)).toBe(false);
 			expect(await completion).toMatchObject({ action: "finish", hasError: false });
 		} finally {
+			controller.abort();
+			await completion;
+		}
+	});
+});
+
+describe("resuming while releasing a suspended takeover", () => {
+	test("defers to the resumed turn when it consumes the wait during the result lookup", async () => {
+		const { markTakenOver, waitForManualOverride, resumeManualOverride, isPendingStopTakeover } =
+			await import("../../services/narrator-subagent");
+		const session = await import("../../services/narrator-session");
+		markTakenOver(subagentId);
+		registerForegroundTurn(subagentId);
+		const controller = new AbortController();
+		const completion = waitForManualOverride(
+			subagentId,
+			controller.signal,
+			parentId,
+			"origin-tool",
+		);
+		const lookup = spyOn(session, "getSubagentFinalText").mockImplementationOnce(async () => {
+			expect(
+				resumeManualOverride(subagentId, {
+					prompt: "continue",
+					history: [],
+					trailingToolResults: [],
+				}),
+			).toBe(true);
+			return "previous result";
+		});
+		try {
+			const response = await app().request(
+				`http://localhost/narrators/${subagentId}/stop-takeover`,
+				{ method: "POST" },
+			);
+			expect(lookup).toHaveBeenCalledTimes(1);
+			expect(response.status).toBe(200);
+			expect(await response.json()).toEqual({ stopped: true, deferred: true });
+			expect(isPendingStopTakeover(subagentId)).toBe(true);
+			expect(isTakenOver(subagentId)).toBe(true);
+			expect(await completion).toMatchObject({ action: "resume", prompt: "continue" });
+		} finally {
+			lookup.mockRestore();
 			controller.abort();
 			await completion;
 		}

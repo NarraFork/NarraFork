@@ -883,7 +883,7 @@ export function getAnthropicEffectiveContextWindow(
 	// a deliberate user decision (relays commonly cap far below 1M) — raising it
 	// to 1M here would make the custom value look ignored and delay auto-compact
 	// past the real limit. Only derived values (gateway catalog, built-in table,
-	// 128k fallback) get lifted to the official 1M window.
+	// default fallback) get lifted to the official 1M window.
 	const explicit =
 		resolved.source === "user" || resolved.source === "provider" || resolved.source === "card";
 	if (!explicit && config.officialApi && supportsAnthropic1mContext(model)) {

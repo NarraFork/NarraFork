@@ -815,10 +815,29 @@ const admissionWork = hotSafe<Map<string, Set<NarratorWorkAdmission>>>(
 	"narrafork.narratorAdmissionWork",
 	() => new Map(),
 );
-const revertAdmissions = hotSafe<Map<string, { phase: "waiting" | "held" }>>(
+/**
+ * Keyed by the reverted narrator. A subagent revert reserves only that subagent
+ * (its parent keeps running); `rootId` lets one team's reverts serialize, since a
+ * primary revert also selects its delegated children's history.
+ */
+const revertAdmissions = hotSafe<Map<string, { phase: "waiting" | "held"; rootId?: string }>>(
 	"narrafork.narratorRevertAdmissions",
 	() => new Map(),
 );
+
+/**
+ * Work that holds a narrator: everything claimed under it as an admission root
+ * (a primary's whole team) plus work claimed by it as a non-root member (a
+ * subagent's own runner, delivery or finalization).
+ */
+function admissionWorkFor(narratorId: string): NarratorWorkAdmission[] {
+	const result = new Set(admissionWork.get(narratorId) ?? []);
+	for (const [rootId, claims] of admissionWork) {
+		if (rootId === narratorId) continue;
+		for (const work of claims) if (work.narratorId === narratorId) result.add(work);
+	}
+	return [...result];
+}
 
 /** Resolve ownership from persisted parent links, never a request's broadcast/cwd hint. */
 export async function resolveNarratorAdmissionRoot(narratorId: string): Promise<string> {
@@ -850,7 +869,8 @@ export async function resolveNarratorAdmissionRoot(narratorId: string): Promise<
 
 export function isNarratorRevertAdmissionBlocked(narratorId: string): boolean {
 	const inherited = admissionContext.getStore()?.work.get(narratorId);
-	return revertAdmissions.has(inherited?.live ? inherited.rootId : narratorId);
+	if (inherited?.live && revertAdmissions.has(inherited.rootId)) return true;
+	return revertAdmissions.has(narratorId);
 }
 
 export function assertNarratorNotReverting(narratorId: string): void {
@@ -901,18 +921,26 @@ export function withNarratorWorkAdmission<T>(
 ): Promise<T> {
 	const inherited = admissionContext.getStore()?.work.get(narratorId);
 	const enter = (rootId: string): Promise<T> => {
-		const gate = revertAdmissions.get(rootId);
-		const draining = [...(admissionContext.getStore()?.work.values() ?? [])].some(
-			(work) => work.live && work.rootId === rootId,
+		const live = [...(admissionContext.getStore()?.work.values() ?? [])].filter(
+			(work) => work.live,
 		);
-		if (gate && !(gate.phase === "waiting" && draining)) {
-			return Promise.reject(
-				new AppError(
-					"Narrator history is reserved for a file revert",
-					409,
-					"NARRATOR_REVERT_IN_PROGRESS",
-				),
+		// A root gate covers the whole team; a subagent gate covers only that subagent,
+		// so its parent and siblings keep running while it is reverted.
+		for (const key of new Set([rootId, narratorId])) {
+			const gate = revertAdmissions.get(key);
+			if (!gate) continue;
+			const draining = live.some((work) =>
+				key === rootId ? work.rootId === rootId : work.narratorId === key,
 			);
+			if (!(gate.phase === "waiting" && draining)) {
+				return Promise.reject(
+					new AppError(
+						"Narrator history is reserved for a file revert",
+						409,
+						"NARRATOR_REVERT_IN_PROGRESS",
+					),
+				);
+			}
 		}
 		const lease = claimAdmissionWork(narratorId, rootId);
 		const parent = admissionContext.getStore();
@@ -978,13 +1006,16 @@ export function withNarratorMutationAdmission<T>(
 	);
 }
 
-/** Includes startup and COMPLETE finalization, but does not make a background child's parent busy. */
+/**
+ * Includes startup and COMPLETE finalization, but does not make a background child's
+ * parent busy. For a primary this is its whole team; for a subagent, only its own work.
+ */
 export function hasNarratorAdmissionWork(narratorId: string): boolean {
-	return (admissionWork.get(narratorId)?.size ?? 0) > 0;
+	return admissionWorkFor(narratorId).length > 0;
 }
 
 export function listNarratorAdmissionOwners(narratorId: string): string[] {
-	return [...new Set([...(admissionWork.get(narratorId) ?? [])].map((work) => work.narratorId))];
+	return [...new Set(admissionWorkFor(narratorId).map((work) => work.narratorId))];
 }
 
 export async function waitForNarratorAdmissionWork(
@@ -999,7 +1030,7 @@ export async function waitForNarratorAdmissionWork(
 				reject(signal.reason);
 			};
 			signal.addEventListener("abort", onAbort, { once: true });
-			void Promise.all([...(admissionWork.get(narratorId) ?? [])].map((work) => work.settled))
+			void Promise.all(admissionWorkFor(narratorId).map((work) => work.settled))
 				.then(() => resolve())
 				.finally(() => signal.removeEventListener("abort", onAbort));
 		});
@@ -1007,13 +1038,37 @@ export async function waitForNarratorAdmissionWork(
 	signal.throwIfAborted();
 }
 
-/** Reserve starts while interrupt drains OUTSIDE the start mutex; promotion is atomic. */
-export function reserveNarratorRevertAdmission(narratorId: string): {
+/**
+ * Reserve starts while interrupt drains OUTSIDE the start mutex; promotion is atomic.
+ *
+ * `rootId` is the reverted narrator's admission root. A primary is its own root and
+ * reserves its whole team. A subagent reserves only itself, but a root revert and a
+ * member revert of the same team still exclude each other: the root's selection
+ * reaches into delegated children's history.
+ */
+export function reserveNarratorRevertAdmission(
+	narratorId: string,
+	rootId: string = narratorId,
+): {
 	acquire: (signal: AbortSignal, busy: () => boolean) => Promise<() => void>;
 	release: () => void;
 } {
 	assertNarratorNotReverting(narratorId);
-	const gate = { phase: "waiting" as "waiting" | "held" };
+	const teamBusy =
+		rootId === narratorId
+			? [...revertAdmissions.values()].some((gate) => gate.rootId === rootId)
+			: revertAdmissions.has(rootId);
+	if (teamBusy) {
+		throw new AppError(
+			"Narrator history is reserved for a file revert",
+			409,
+			"NARRATOR_REVERT_IN_PROGRESS",
+		);
+	}
+	const gate = {
+		phase: "waiting" as "waiting" | "held",
+		...(rootId === narratorId ? {} : { rootId }),
+	};
 	revertAdmissions.set(narratorId, gate);
 	const release = () => {
 		if (revertAdmissions.get(narratorId) === gate) revertAdmissions.delete(narratorId);

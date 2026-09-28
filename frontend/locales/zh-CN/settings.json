@@ -1224,7 +1224,7 @@
 	"providerPrefix": "供应商前缀",
 	"providerPrefixPlaceholder": "选择供应商",
 	"contextWindow": "上下文窗口",
-	"contextWindowPlaceholder": "例如 128000",
+	"contextWindowPlaceholder": "例如 272000",
 	"contextWindowSuffix": "tokens",
 	"notificationSection": "通知",
 	"notifyOnDone": "叙述者完成时通知",

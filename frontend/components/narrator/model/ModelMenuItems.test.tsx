@@ -312,6 +312,42 @@ describe("per-model global role actions", () => {
 	});
 });
 
+describe("provider prefix on default/summary rows", () => {
+	test("shows the resolved target's provider prefix as a secondary line", async () => {
+		const withRoles: ModelOption[] = [
+			{ value: "__default__", label: "gpt-6-astra", provider: "__default__" },
+			{ value: "__summary__", label: "mimo-v2.6-pro", provider: "__summary__" },
+			{ value: "codex:gpt-6-astra", label: "gpt-6-astra", provider: "codex" },
+			{ value: "xiaomi:mimo-v2.6-pro", label: "mimo-v2.6-pro", provider: "xiaomi" },
+		];
+		await render("codex:gpt-6-astra", withRoles, true, true, {
+			defaultModelValue: "codex:gpt-6-astra",
+			summaryModelValue: "xiaomi:mimo-v2.6-pro",
+		});
+		expect(host.textContent).toContain("codex");
+		expect(host.textContent).toContain("xiaomi");
+		// The prefix is a secondary line under the role row label, not a group header.
+		const roleRows = Array.from(host.querySelectorAll("[data-menu-item]")).filter(
+			(item) =>
+				item.textContent?.includes("gpt-6-astra") || item.textContent?.includes("mimo-v2.6-pro"),
+		);
+		expect(roleRows.length).toBeGreaterThan(0);
+	});
+	test("omits the prefix line for meta targets and empty slots", async () => {
+		const withRoles: ModelOption[] = [
+			{ value: "__default__", label: "Follow default", provider: "__default__" },
+			{ value: "__summary__", label: "Follow summary", provider: "__summary__" },
+		];
+		await render(null, withRoles, true, true, {
+			defaultModelValue: "__agg__:group",
+			summaryModelValue: "",
+		});
+		// Aggregation/empty targets have no single provider prefix to show.
+		const rows = Array.from(host.querySelectorAll("[data-menu-item]")).map((i) => i.textContent);
+		expect(rows.some((t) => t === "Follow default" || t === "Follow summary")).toBe(true);
+	});
+});
+
 describe("aggregation choices inside model menu", () => {
 	test("exposes automatic routing and distinguishable provider members; preserves model values", async () => {
 		await render("__agg__:group:a:two");

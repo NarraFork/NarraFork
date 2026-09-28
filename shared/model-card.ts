@@ -291,7 +291,7 @@ export function cardMaxCompletionTokens(card: ModelCard | undefined): number | u
  * silently dropping the caller to its bottom fallback.
  *
  * Concretely: `claude-sonnet-4-5-20260101` strips to `claude-sonnet-4-5`, which
- * is a pricing card with no window. Stopping there reports 128k for a 200k
+ * is a pricing card with no window. Stopping there reports the default fallback for a 200k
  * model. Continuing the walk reaches the `claude-sonnet-4` prefix card and its
  * real 200k — which is exactly what the pre-card fuzzy match returned.
  *

@@ -50,7 +50,13 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, explorationGroups, mergeSessions, narrators } from "../db/schema";
+import {
+	chapters,
+	explorationGroups,
+	mergeSessions,
+	narratorMessageRefs,
+	narrators,
+} from "../db/schema";
 import type { NarraForkEvent } from "../lib/event-bus";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
@@ -66,6 +72,7 @@ import {
 } from "./project-archive/export-rows";
 import type { ArchiveTable } from "./project-archive/manifest";
 import { projectArchiveMainStore as mainStore } from "./project-archive/store";
+import { createNarratorSyncScheduler } from "./project-db-sync-scheduler";
 
 // === Helpers ===
 
@@ -208,6 +215,13 @@ async function syncNarrator(narratorId: string): Promise<void> {
 	await copyById(pdb, "narrators", "id", [narratorId]);
 }
 
+/** What one incremental message sync looked at and copied — used for slow-sync diagnostics. */
+interface NarratorMessageSyncStats {
+	readonly mainRefs: number;
+	readonly archivedMessages: number;
+	readonly newRefs: number;
+}
+
 /**
  * Sync messages for a narrator (incremental: only refs the archive does not have yet).
  *
@@ -216,16 +230,16 @@ async function syncNarrator(narratorId: string): Promise<void> {
  * key constraints, and the message content is still correctly preserved. Full data integrity is
  * restored on import.
  */
-async function syncNarratorMessages(narratorId: string): Promise<void> {
+async function syncNarratorMessages(narratorId: string): Promise<NarratorMessageSyncStats | null> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
 		columns: { chapterId: true },
 	});
-	if (!narrator?.chapterId) return;
+	if (!narrator?.chapterId) return null;
 	const projectId = await projectIdForChapter(narrator.chapterId);
-	if (!projectId) return;
+	if (!projectId) return null;
 	const pdb = await getProjectDb(projectId);
-	if (!pdb) return;
+	if (!pdb) return null;
 
 	// Which refs does the archive already have?
 	//
@@ -233,6 +247,10 @@ async function syncNarratorMessages(narratorId: string): Promise<void> {
 	// over time (see narrator-refs-backfill), so backfilled rows sit below the mark and would be
 	// skipped forever. Compare by message id instead — the ids are narrow, indexed, and bounded
 	// by the narrator's own ref count.
+	//
+	// Nor is "ref counts are equal, nothing to do" usable: this path only appends, so refs the
+	// main database has since deleted stay in the archive until the next full sync, and an equal
+	// count can hide exactly as many new refs as there are stale ones.
 	const syncedIds = new Set(
 		(
 			pdb
@@ -241,23 +259,35 @@ async function syncNarratorMessages(narratorId: string): Promise<void> {
 		).map((row) => row.message_id),
 	);
 
-	const allRefs = await readAllRows(mainStore, "narrator_message_refs", {
-		filter: { column: "narrator_id", values: [narratorId] },
-	});
-	const newRefs = allRefs.filter((ref) => !syncedIds.has(String(ref.message_id)));
-	if (newRefs.length === 0) return;
+	// ONE narrow read of (id, message_id), NOT the paged full-row `readAllRows`. A paged read
+	// filtered by narrator and ordered by primary key re-sorts the narrator's whole ref set for
+	// every page — O(N²/page) — which on a working narrator with ~90k refs held the event loop
+	// for ~10s on every debounced sync. The two ids per ref are all the diff needs; the full rows
+	// of only the NEW refs are fetched below, by primary key.
+	const mainRefs = await db
+		.select({ id: narratorMessageRefs.id, messageId: narratorMessageRefs.messageId })
+		.from(narratorMessageRefs)
+		.where(eq(narratorMessageRefs.narratorId, narratorId));
+	const newRefs = mainRefs.filter((ref) => !syncedIds.has(ref.messageId));
+	const stats: NarratorMessageSyncStats = {
+		mainRefs: mainRefs.length,
+		archivedMessages: syncedIds.size,
+		newRefs: newRefs.length,
+	};
+	if (newRefs.length === 0) return stats;
 
-	const messageIds = distinctIds(newRefs, "message_id");
+	const messageIds = [...new Set(newRefs.map((ref) => ref.messageId))];
 
 	await copyTable(mainStore, pdb, "narrator_messages", {
 		filter: { column: "id", values: messageIds },
 	});
 	await copyTable(mainStore, pdb, "narrator_message_refs", {
-		filter: { column: "id", values: distinctIds(newRefs, "id") },
+		filter: { column: "id", values: newRefs.map((ref) => ref.id) },
 	});
 	await copyTable(mainStore, pdb, "narrator_tool_calls", {
 		filter: { column: "message_id", values: messageIds },
 	});
+	return stats;
 }
 
 /** Sync exploration groups for a project (delete-then-insert). */
@@ -543,25 +573,50 @@ export async function fullSync(
 
 // === Event-driven incremental sync ===
 
-const messageDebounceMap = new Map<string, Timer>();
 const MESSAGE_DEBOUNCE_MS = 500;
+/**
+ * Minimum gap between two event-driven syncs of the same narrator. The archive is a best-effort
+ * backup, so a working narrator's archive trailing by a few seconds is harmless; re-diffing its
+ * whole ref set after every 500ms pause is not.
+ */
+const MESSAGE_SYNC_MIN_INTERVAL_MS = 10_000;
+/** An event-driven narrator sync slower than this is logged with its sizes. */
+const SLOW_NARRATOR_SYNC_MS = 500;
+
+async function runNarratorSync(narratorId: string): Promise<void> {
+	const startedAt = performance.now();
+	try {
+		await syncNarrator(narratorId);
+	} catch (err) {
+		logger.warn("Project DB narrator sync failed", { narratorId, error: String(err) });
+	}
+	let stats: NarratorMessageSyncStats | null = null;
+	try {
+		stats = await syncNarratorMessages(narratorId);
+	} catch (err) {
+		logger.warn("Project DB message sync failed", { narratorId, error: String(err) });
+	}
+	const elapsedMs = Math.round(performance.now() - startedAt);
+	if (elapsedMs >= SLOW_NARRATOR_SYNC_MS) {
+		logger.warn("Slow project DB narrator sync", { narratorId, elapsedMs, ...stats });
+	}
+}
+
+const narratorSyncScheduler = createNarratorSyncScheduler({
+	debounceMs: MESSAGE_DEBOUNCE_MS,
+	minIntervalMs: MESSAGE_SYNC_MIN_INTERVAL_MS,
+	run: runNarratorSync,
+	onError: (narratorId, err) => {
+		logger.warn("Project DB narrator sync failed", { narratorId, error: String(err) });
+	},
+});
 
 function debouncedNarratorSync(narratorId: string): void {
-	const existing = messageDebounceMap.get(narratorId);
-	if (existing) clearTimeout(existing);
-	messageDebounceMap.set(
-		narratorId,
-		setTimeout(() => {
-			messageDebounceMap.delete(narratorId);
-			syncNarrator(narratorId).catch((err) => {
-				logger.warn("Project DB narrator sync failed", { narratorId, error: String(err) });
-			});
-			syncNarratorMessages(narratorId).catch((err) => {
-				logger.warn("Project DB message sync failed", { narratorId, error: String(err) });
-			});
-		}, MESSAGE_DEBOUNCE_MS),
-	);
+	narratorSyncScheduler.schedule(narratorId);
 }
+
+/** Internal entry points exposed for tests only. */
+export const __testing = { syncNarratorMessages };
 
 async function handleEvent(event: NarraForkEvent): Promise<void> {
 	switch (event.type) {

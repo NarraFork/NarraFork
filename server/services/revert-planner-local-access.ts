@@ -35,7 +35,11 @@ import {
 import { assertNarratorAccess, type NarratorAclRow, type NarratorPrincipal } from "./narrator-acl";
 import { resolveNarratorProjectId } from "./narrator-project";
 import type { ScopedRevertUnavailableReason } from "./narrator-scoped-revert";
-import { invalidateWorkspaceTreeCache, resetActiveUpstreamSession } from "./narrator-session-state";
+import {
+	invalidateWorkspaceTreeCache,
+	resetActiveUpstreamSession,
+	resolveNarratorAdmissionRoot,
+} from "./narrator-session-state";
 import { assertProjectAccess } from "./project-acl";
 import { boundedDetail, collectRevertBlockers } from "./revert-blockers";
 import {
@@ -119,8 +123,27 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 			.get();
 		if (!row) throw new NotFoundError("Narrator", narratorId);
 		await assertNarratorAccess(row, principal, "write");
-		const projectId = await resolveNarratorProjectId(row);
-		if (row.chapterId && !projectId) throw new NotFoundError("Narrator project", narratorId);
+		// A subagent row carries no chapter/project of its own; its project is the
+		// delegation root's. Without this, reverting inside a subagent would skip the
+		// project write gate its parent is held to.
+		const projectRow =
+			row.type === "subagent"
+				? await (async () => {
+						const rootId = await resolveNarratorAdmissionRoot(narratorId);
+						const root = db
+							.select({
+								chapterId: narrators.chapterId,
+								contextProjectId: narrators.contextProjectId,
+							})
+							.from(narrators)
+							.where(eq(narrators.id, rootId))
+							.get();
+						if (!root) throw new NotFoundError("Narrator", rootId);
+						return root;
+					})()
+				: row;
+		const projectId = await resolveNarratorProjectId(projectRow);
+		if (projectRow.chapterId && !projectId) throw new NotFoundError("Narrator project", narratorId);
 		if (projectId) {
 			const project = db
 				.select({
@@ -499,18 +522,18 @@ export async function prepareLocalRevertAction(
 		const { assertBashActivityProtectionReady } = await import("../lib/agent/tools/bash");
 		assertBashActivityProtectionReady();
 		const narrator = db
-			.select({ type: narrators.type, messageVersion: narrators.messageVersion })
+			.select({ messageVersion: narrators.messageVersion })
 			.from(narrators)
 			.where(eq(narrators.id, narratorId))
 			.get();
 		if (!narrator) throw new NotFoundError("Narrator", narratorId);
-		if (
-			narrator.type !== "primary" ||
-			(localBackend.pathFlavor !== "posix" && localBackend.pathFlavor !== "windows")
-		)
+		// Subagents are revert roots too: users work in them directly. Their selection
+		// covers only their own history (plus anything they delegated), and admission
+		// reserves only the subagent, never its parent's live turn.
+		if (localBackend.pathFlavor !== "posix" && localBackend.pathFlavor !== "windows")
 			throw new RevertPlannerError(
 				"UNSUPPORTED_TARGET",
-				"This action requires a local filesystem primary narrator",
+				"This action requires a local filesystem narrator",
 			);
 		await assertLocalRevertPlatform();
 		let selector: RevertPlannerRequest["selector"];

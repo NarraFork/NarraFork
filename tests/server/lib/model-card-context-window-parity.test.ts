@@ -13,10 +13,10 @@ import {
  * ids the table never listed (`claude-opus-4-6-thinking`, dated snapshots, …).
  * Model cards match strictly by design — exact key, alias, date-suffix-stripped,
  * then only explicitly declared prefixes — so a naive port drops every one of
- * those ids to the 128k fallback.
+ * those ids to the default fallback.
  *
  * Nothing reports that. The model still answers; auto-compact just fires at the
- * wrong time (far too early for a 1M model, never for a sub-128k one). So the
+ * wrong time (far too early for a 1M model, never for a sub-default one). So the
  * old table and the old lookup are duplicated verbatim below as an independent
  * oracle, and every id both implementations can see must agree.
  *
@@ -256,7 +256,7 @@ describe("model card context-window parity with the legacy builtin table", () =>
 			]) {
 				const resolved = resolveModelContextWindow(retired, "");
 				expect(resolved.source).toBe("fallback");
-				expect(resolved.contextWindow).toBe(128_000);
+				expect(resolved.contextWindow).toBe(272_000);
 			}
 		});
 	});
@@ -264,9 +264,7 @@ describe("model card context-window parity with the legacy builtin table", () =>
 	test("Astra retains its 1.05M window for dated snapshots", () => {
 		withoutUserOverrides(() => {
 			expect(resolveModelContextWindow("gpt-6-astra", "").contextWindow).toBe(1_050_000);
-			expect(resolveModelContextWindow("gpt-6-astra-2026-09-03", "").contextWindow).toBe(
-				1_050_000,
-			);
+			expect(resolveModelContextWindow("gpt-6-astra-2026-09-03", "").contextWindow).toBe(1_050_000);
 		});
 	});
 });

@@ -697,6 +697,7 @@ export const narratorMessageRefs = pgTable(
 		index("idx_narrator_refs_compact_seq").on(table.narratorId, table.isCompact, table.seq),
 		index("idx_narrator_refs_message").on(table.messageId),
 		index("idx_narrator_refs_segment_compact").on(table.segmentCompactId),
+		index("idx_narrator_refs_narrator_id").on(table.narratorId, table.id),
 	],
 );
 
@@ -7749,6 +7750,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_narrator_refs_segment_compact",
           "columns": [
             "segmentCompactId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrator_refs_narrator_id",
+          "columns": [
+            "narratorId",
+            "id"
           ],
           "unique": false
         }

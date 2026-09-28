@@ -995,7 +995,7 @@ export function getBuiltinModelContextWindows(
  * - `catalog`: model metadata reported by a gateway (NUG model catalog)
  * - `provider`: the provider's own `defaultContextWindow` field
  * - `builtin`: a model card field seeded by NarraFork and left untouched
- * - `fallback`: nothing matched, the 128k default
+ * - `fallback`: nothing matched, the {@link DEFAULT_CONTEXT_WINDOW} default
  *
  * Callers that apply a capability floor (e.g. Anthropic's 1M official-API
  * window) must skip the floor for `user` / `provider` / `card` so an explicitly
@@ -1030,7 +1030,7 @@ export function resolveModelContextWindow(
 	// aggregation value (`__agg__:<id>`) is split into provider/model halves by a
 	// caller, it arrives as provider="__agg__", model="<id>". Resolve such meta
 	// references to a representative concrete model first, otherwise the lookup
-	// matches nothing and silently falls back to the 128k default (wrong tier for
+	// matches nothing and silently falls back to the default context window (wrong tier for
 	// large-context models). Resolution here is side-effect free: it does not
 	// advance balanced-aggregation round-robin state.
 	const reconstructed = provider ? `${provider}:${model}` : model;
@@ -1057,7 +1057,7 @@ export function resolveModelContextWindow(
 		const window = resolved.metadata.limits?.contextWindow;
 		const layer = resolved.provenance["limits.contextWindow"]?.layer;
 		// Explicit unknown blocks fallback to stale legacy model cards.
-		if (window === null) return { contextWindow: 128_000, source: "fallback" };
+		if (window === null) return { contextWindow: DEFAULT_CONTEXT_WINDOW, source: "fallback" };
 		if (window !== undefined && (layer?.startsWith("local-") || layer === "discovered"))
 			return {
 				contextWindow: window,
@@ -1072,7 +1072,7 @@ export function resolveModelContextWindow(
 		if (configured) return { contextWindow: configured, source: "provider" };
 		return window !== undefined
 			? { contextWindow: window, source: "builtin" }
-			: { contextWindow: 128_000, source: "fallback" };
+			: { contextWindow: DEFAULT_CONTEXT_WINDOW, source: "fallback" };
 	}
 
 	// 0. Check per-model user overrides (highest priority)
@@ -1093,7 +1093,7 @@ export function resolveModelContextWindow(
 
 	// 2. Check NUG model-catalog metadata. NUG model ids often include a
 	// channel prefix (e.g. antigravity:claude-opus-4-6-thinking), so the
-	// card table alone would otherwise miss them and fall back to 128k.
+	// card table alone would otherwise miss them and fall back to the default.
 	const nugContextWindow = getNugModelContextWindow(model, provider);
 	if (nugContextWindow) return { contextWindow: nugContextWindow, source: "catalog" };
 
@@ -1117,12 +1117,18 @@ export function resolveModelContextWindow(
 	// Reported as `builtin` rather than `card` so the Anthropic 1M floor keeps
 	// applying to it exactly as before.
 	if (card) return { contextWindow: card.contextWindow, source: "builtin" };
-	return { contextWindow: 128_000, source: "fallback" };
+	return { contextWindow: DEFAULT_CONTEXT_WINDOW, source: "fallback" };
 }
 
 export function getModelContextWindow(model: string, provider: string): number | null {
 	return resolveModelContextWindow(model, provider).contextWindow;
 }
+
+/**
+ * Fallback context window when a model has no configured, catalog, or card value.
+ * Kept deliberately generous so unknown modern models do not compact too early.
+ */
+export const DEFAULT_CONTEXT_WINDOW = 272_000;
 
 /** Threshold above which a model is considered "large context". */
 export const LARGE_CONTEXT_BOUNDARY = 600_000;
@@ -1141,11 +1147,11 @@ export function getSummaryModelContextWindow(modelOverride?: string): number {
 	const summaryModel = modelOverride?.trim() || s().agent.summaryModel;
 	const parsed = parseModelId(summaryModel);
 	const prov = parsed.provider ?? "anthropic";
-	return getModelContextWindow(parsed.model, prov) ?? 128_000;
+	return getModelContextWindow(parsed.model, prov) ?? DEFAULT_CONTEXT_WINDOW;
 }
 
 export function getContextThresholds(model: string, provider: string): { compactStart: number } {
-	const ctxWin = getModelContextWindow(model, provider) ?? 128_000;
+	const ctxWin = getModelContextWindow(model, provider) ?? DEFAULT_CONTEXT_WINDOW;
 	const tier = ctxWin > LARGE_CONTEXT_BOUNDARY ? "large" : "standard";
 	const userThresholds = s().agent.contextThresholds;
 	const cfg = userThresholds?.[tier] ?? DEFAULT_CONTEXT_THRESHOLDS[tier];

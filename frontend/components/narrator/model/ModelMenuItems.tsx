@@ -22,6 +22,8 @@ import {
 	canAssignGlobalModelRole,
 	centerModelMenuSelection,
 	modelMenuSelection,
+	modelProviderPrefix,
+	shouldAutoFocusModelFilter,
 } from "./model-menu-selection";
 
 /**
@@ -138,7 +140,7 @@ export function ModelMenuItems({
 	}, [opened]);
 	const filterInputRef = useRef<HTMLInputElement>(null);
 	useEffect(() => {
-		if (!opened) return;
+		if (!opened || !shouldAutoFocusModelFilter()) return;
 		const id = window.setTimeout(() => filterInputRef.current?.focus({ preventScroll: true }));
 		return () => window.clearTimeout(id);
 	}, [opened]);
@@ -169,11 +171,19 @@ export function ModelMenuItems({
 				.map(([prov, models]) => {
 					const providerLabel = provLabels[prov] ?? prov;
 					const filteredModels = models.filter((m) => {
+						const roleTargetValue =
+							m.provider === "__default__"
+								? defaultModelValue
+								: m.provider === "__summary__"
+									? summaryModelValue
+									: null;
 						const haystack = [
 							m.label,
 							m.value,
 							m.provider ?? "",
 							providerLabel,
+							roleTargetValue ?? "",
+							modelProviderPrefix(roleTargetValue) ?? "",
 							m.rateMultiplier != null ? String(m.rateMultiplier) : "",
 						]
 							.join(" ")
@@ -285,6 +295,15 @@ export function ModelMenuItems({
 								const selected = isAggItem
 									? currentAgg?.aggId === aggId
 									: selection.value === m.value;
+								// Default/Summary rows sit under a role header, not a provider group,
+								// so surface the resolved target's provider prefix as a small line.
+								const roleTargetValue =
+									m.provider === "__default__"
+										? defaultModelValue
+										: m.provider === "__summary__"
+											? summaryModelValue
+											: null;
+								const roleProviderPrefix = modelProviderPrefix(roleTargetValue);
 								const showMembers = isAggItem && selected && selection.members.length > 0;
 								// Three-dot actions only on top-level rows that can actually occupy a
 								// global slot. Meta sentinels would make the slot circular.
@@ -436,6 +455,11 @@ export function ModelMenuItems({
 											c={m.available === false || isCatalogMissing ? "dimmed" : undefined}
 										>
 											<Box>
+												{roleProviderPrefix && (
+													<Text size="xs" c="dimmed" lh={1.3}>
+														{roleProviderPrefix}
+													</Text>
+												)}
 												<Text size="sm" inherit>
 													{m.label}
 												</Text>

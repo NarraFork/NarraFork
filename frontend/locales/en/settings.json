@@ -1222,7 +1222,7 @@
 	"providerPrefix": "Provider Prefix",
 	"providerPrefixPlaceholder": "Select provider",
 	"contextWindow": "Context Window",
-	"contextWindowPlaceholder": "e.g. 128000",
+	"contextWindowPlaceholder": "e.g. 272000",
 	"contextWindowSuffix": "tokens",
 	"notificationSection": "Notifications",
 	"notifyOnDone": "Notify when narrator finishes",

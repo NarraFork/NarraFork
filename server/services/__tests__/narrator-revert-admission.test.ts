@@ -705,12 +705,59 @@ test("a primary fork is independent; ownership follows child parent links, not c
 	await expect(
 		deliverInjection(CHILD, { content: "child narrator", source: "test" }),
 	).rejects.toMatchObject(rejection);
+	// A root revert already reserves the whole team, so the child cannot start its own.
 	await expect(
 		session.acquireNarratorRevertAdmission(CHILD, {
 			signal: new AbortController().signal,
 			interrupt: false,
 		}),
-	).rejects.toMatchObject({ statusCode: 409, code: "NARRATOR_REVERT_SUBAGENT_UNSUPPORTED" });
+	).rejects.toMatchObject(rejection);
+});
+
+test("a subagent revert reserves only the subagent, never its parent", async () => {
+	const release = await session.acquireNarratorRevertAdmission(CHILD, {
+		signal: new AbortController().signal,
+		interrupt: false,
+	});
+	pendingReleases.push(release);
+	await expect(
+		deliverInjection(CHILD, { content: "child narrator", source: "test" }),
+	).rejects.toMatchObject(rejection);
+	// The parent keeps working while one of its subagents is being reverted.
+	await deliverInjection(ROOT, { content: "parent narrator", source: "test" });
+	expect(await db.select().from(narratorMessages)).toHaveLength(1);
+	// But the team root cannot revert concurrently: its selection reaches the child.
+	await expect(acquire()).rejects.toMatchObject(rejection);
+	release();
+	await acquire();
+});
+
+test("a subagent revert waits for the subagent's own work, not its parent's", async () => {
+	const parentWork = deferred();
+	const running = state.withNarratorWorkAdmission(ROOT, () => parentWork.promise);
+	try {
+		const release = await session.acquireNarratorRevertAdmission(CHILD, {
+			signal: new AbortController().signal,
+			interrupt: false,
+		});
+		release();
+	} finally {
+		parentWork.resolve();
+		await running;
+	}
+	const childWork = deferred();
+	const child = state.withNarratorWorkAdmission(CHILD, () => childWork.promise);
+	try {
+		await expect(
+			session.acquireNarratorRevertAdmission(CHILD, {
+				signal: new AbortController().signal,
+				interrupt: false,
+			}),
+		).rejects.toMatchObject({ statusCode: 409, code: "NARRATOR_REVERT_BUSY" });
+	} finally {
+		childWork.resolve();
+		await child;
+	}
 });
 
 test("continuation admission wins before its first write: non-interrupting revert refuses", async () => {

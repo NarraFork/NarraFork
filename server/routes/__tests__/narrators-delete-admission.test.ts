@@ -228,6 +228,39 @@ describe("the narrator itself running", () => {
 	}, 30_000);
 });
 
+describe("a suspended subagent runner", () => {
+	test("admits history deletion without aborting the retained runner", async () => {
+		const { tryClaimExecution, setExecutionSuspended, isExecutionSuspended } = await import(
+			"../../services/agent-runtime/ownership"
+		);
+		const { waitForManualOverride } = await import("../../services/subagent-manual-override");
+		const owner = tryClaimExecution(narratorId, "subagent");
+		if (!owner) throw new Error("Failed to claim test execution");
+		const parentController = new AbortController();
+		const completion = waitForManualOverride(
+			narratorId,
+			parentController.signal,
+			"parent",
+			"origin-tool",
+		);
+		const session = registerBusyLoop(narratorId, WORKTREE, { stopsOnAbort: false });
+		setExecutionSuspended(owner, true);
+		try {
+			expect(isExecutionSuspended(narratorId)).toBe(true);
+			const response = await del(`/${narratorId}/messages/${generateId()}?skipRevert=1`);
+			// The nonexistent message is reached only after history admission succeeds.
+			expect(response.status).toBe(404);
+			expect(session.abortController.signal.aborted).toBe(false);
+			expect(session._loopRunning).toBe(true);
+			expect(isExecutionSuspended(narratorId)).toBe(true);
+		} finally {
+			parentController.abort();
+			await completion;
+			owner.release();
+		}
+	}, 30_000);
+});
+
 describe("an idle narrator", () => {
 	test("is admitted without an interrupt", async () => {
 		expect(await admissionError(await del(`/${narratorId}/messages/${generateId()}`))).toBeNull();

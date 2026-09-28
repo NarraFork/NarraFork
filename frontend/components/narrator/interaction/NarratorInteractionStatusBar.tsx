@@ -42,6 +42,7 @@ import { CodexQuotaIndicator } from "../model/CodexQuotaIndicator";
 import { ModelMenuItems } from "../model/ModelMenuItems";
 import { ModelPriceModal } from "../model/ModelPriceModal";
 import { modelInheritanceLabel } from "../model/model-inheritance-label";
+import { MODEL_MENU_POSITIONING } from "../model/model-menu-selection";
 import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
 import type { RetryInfo } from "../useNarratorPanelWS";
 import { InlineOverrideActions } from "./InlineOverrideActions";
@@ -560,6 +561,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 												<Tooltip label={followsParent ? followTooltip : t("modelTooltip")}>
 													<Menu
 														position="top-end"
+														{...MODEL_MENU_POSITIONING}
 														opened={menuOpenDesktop}
 														onChange={(o) => {
 															// Don't let the price popup's outside-click close the menu.
@@ -854,6 +856,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 												<Menu
 													position="bottom-end"
 													withinPortal
+													{...MODEL_MENU_POSITIONING}
 													opened={menuOpenMobile}
 													onChange={(o) => {
 														if (!o && priceModel != null) return;

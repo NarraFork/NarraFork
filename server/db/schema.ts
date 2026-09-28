@@ -1444,6 +1444,10 @@ export const narratorMessageRefs = sqliteTable(
 		index("idx_narrator_refs_compact_seq").on(table.narratorId, table.isCompact, table.seq),
 		index("idx_narrator_refs_message").on(table.messageId),
 		index("idx_narrator_refs_segment_compact").on(table.segmentCompactId),
+		// Keyset paging of one narrator's refs by primary key (project archive export/import).
+		// Without it `WHERE narrator_id IN (…) AND id > ? ORDER BY id LIMIT n` re-sorts the
+		// narrator's entire ref set in a temp B-tree for every page.
+		index("idx_narrator_refs_narrator_id").on(table.narratorId, table.id),
 	],
 );
 

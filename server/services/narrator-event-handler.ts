@@ -33,6 +33,7 @@ import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import {
 	DEFAULT_CONTEXT_THRESHOLDS,
+	DEFAULT_CONTEXT_WINDOW,
 	LARGE_CONTEXT_BOUNDARY,
 	resolveTranslationModelOverride,
 	settings,
@@ -2559,7 +2560,7 @@ export async function processEvent(
 			});
 
 			// Resolve active thresholds based on context window size
-			const ctxWin = event.contextWindow ?? 128_000;
+			const ctxWin = event.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
 			const tier = ctxWin > LARGE_CONTEXT_BOUNDARY ? "large" : "standard";
 			const activeThresholds =
 				settings.agent.contextThresholds?.[tier] ?? DEFAULT_CONTEXT_THRESHOLDS[tier];

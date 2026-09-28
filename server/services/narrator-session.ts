@@ -207,6 +207,7 @@ import {
 	pendingPlanDiff,
 	planModeAskedOnce,
 	reserveNarratorRevertAdmission,
+	resolveNarratorAdmissionRoot,
 	updateActiveSubagentModel,
 	updateActiveSubagentReasoningEffort,
 	waitForNarratorAdmissionWork,
@@ -6705,18 +6706,17 @@ export async function acquireNarratorRevertAdmission(
 	});
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	signal.throwIfAborted();
-	if (isSubagentVariant(narrator.variant)) {
-		throw new AppError(
-			"File revert admission only supports primary narrators",
-			409,
-			"NARRATOR_REVERT_SUBAGENT_UNSUPPORTED",
-		);
-	}
+	// Users drive subagents directly, so a subagent is a valid revert root. It
+	// reserves (and interrupts) only itself: its parent and siblings keep running.
+	// The persisted root still orders it against a revert of the whole team.
+	const isSubagent = isSubagentVariant(narrator.variant);
+	const rootId = isSubagent ? await resolveNarratorAdmissionRoot(narratorId) : narratorId;
+	signal.throwIfAborted();
 	const busy = () => isNarratorRuntimeBusy(narratorId) || compactLocks.has(narratorId);
 	if (!interrupt && (busy() || hasNarratorAdmissionWork(narratorId))) {
 		throw new AppError("Narrator execution has not settled", 409, "NARRATOR_REVERT_BUSY");
 	}
-	const reservation = reserveNarratorRevertAdmission(narratorId);
+	const reservation = reserveNarratorRevertAdmission(narratorId, rootId);
 	let released = false;
 	const releaseAndResume = () => {
 		if (released) return;
@@ -6753,7 +6753,8 @@ export async function acquireNarratorRevertAdmission(
 				for (const owner of new Set([narratorId, ...listNarratorAdmissionOwners(narratorId)])) {
 					// A soft foreground abort suspends for manual input; a revert needs
 					// the real terminal boundary, including an already-suspended runner.
-					if (owner !== narratorId) interruptForegroundSubagent(owner, { hard: true });
+					if (owner !== narratorId || isSubagent)
+						interruptForegroundSubagent(owner, { hard: true });
 					const controllers = [
 						activeNarrators.get(owner)?.abortController,
 						getBackgroundAbortControllers().get(owner),
@@ -6816,7 +6817,11 @@ export async function interruptAndWaitForIdle(
 	narratorId: string,
 	opts?: { timeoutMs?: number },
 ): Promise<boolean> {
-	const busy = () => isLoopRunning(narratorId) || isNarratorRuntimeBusy(narratorId);
+	// A manual-override suspension retains the runner but executes no turn. Local
+	// abort cannot wake that wait; the next resumed turn rebuilds history from DB.
+	const busy = () =>
+		!isExecutionSuspended(narratorId) &&
+		(isLoopRunning(narratorId) || isNarratorRuntimeBusy(narratorId));
 	if (!busy()) return true;
 
 	// A suspended permission request is not something an abort can reach: the loop is

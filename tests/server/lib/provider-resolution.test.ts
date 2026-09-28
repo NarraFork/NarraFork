@@ -511,7 +511,7 @@ describe("getModelContextWindow / getContextThresholds 解析元模型引用", (
 		expect(getModelContextWindow("__agg__:agg1m", "")).toBe(1_000_000);
 	});
 
-	test("聚合值不再静默回退到 128k 默认值", () => {
+	test("聚合值不再静默回退到默认上下文长度", () => {
 		settings.agent.modelAggregations = [
 			{
 				id: "aggbig",
@@ -520,8 +520,8 @@ describe("getModelContextWindow / getContextThresholds 解析元模型引用", (
 				routingMode: "priority",
 			},
 		];
-		// 修复前：provider="__agg__"、model="aggbig" 匹配不到 → 回落 128k
-		expect(getModelContextWindow("aggbig", "__agg__")).not.toBe(128_000);
+		// 修复前：provider="__agg__"、model="aggbig" 匹配不到 → 回落默认值
+		expect(getModelContextWindow("aggbig", "__agg__")).not.toBe(272_000);
 	});
 
 	test("pinned 聚合值解析到被钉住的成员", () => {

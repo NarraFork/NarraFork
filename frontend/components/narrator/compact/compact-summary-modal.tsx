@@ -33,6 +33,7 @@ import { consumeCompactLiveStream } from "../../../lib/compact-live-stream";
 import { narratorWSManager } from "../../../lib/narrator-ws-manager";
 import { MarkdownContent } from "../markdown/MarkdownContent";
 import { ModelMenuItems } from "../model/ModelMenuItems";
+import { MODEL_MENU_POSITIONING } from "../model/model-menu-selection";
 
 export const COMPACTING_MARKER_ATTR = "data-compacting-marker";
 export const COMPACT_DETAIL_QUERY_GC_TIME_MS = 30_000;
@@ -760,6 +761,7 @@ export function CompactSummaryModal({
 									position="bottom-start"
 									width="target"
 									withinPortal
+									{...MODEL_MENU_POSITIONING}
 									zIndex={1100}
 								>
 									<Menu.Target>
