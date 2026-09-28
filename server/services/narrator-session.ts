@@ -15,7 +15,7 @@ import {
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
 } from "@shared/text-file-types";
-import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, exists, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	chapters,
@@ -4343,6 +4343,30 @@ export async function startParentInboundContinuationIfPossible(
  */
 const RETRY_TAIL_SCAN_LIMIT = 10;
 
+/**
+ * `narrator_message_refs` stores only the reference; "is this a real top-level turn?"
+ * lives on the message row (its `parent_tool_use_id` and `role`). Expressed as a
+ * correlated EXISTS rather than a join, deliberately.
+ *
+ * Joining the message row put `parent_tool_use_id IS NULL` in the WHERE clause, which
+ * the planner satisfied by driving FROM `narrator_messages` through
+ * `idx_messages_parent_tool_use_lookup` — a predicate matching ~90% of every message in
+ * the database — then looking up each ref and sorting the narrator's whole ref set in a
+ * temp B-tree just to read a handful of rows (281-293ms on a 131k-message library).
+ * As EXISTS the planner walks `idx_narrator_refs_seq` in `seq DESC` order and stops after
+ * the LIMIT, answering each probe from the message primary key: 0.00-0.01ms, with
+ * row-for-row identical results on the three largest narrators.
+ */
+function messageRefExists(opts: {
+	roles?: readonly ("user" | "assistant")[];
+	requireTopLevel?: boolean;
+}) {
+	const conditions = [eq(narratorMessages.id, narratorMessageRefs.messageId)];
+	if (opts.requireTopLevel) conditions.push(isNull(narratorMessages.parentToolUseId));
+	if (opts.roles) conditions.push(inArray(narratorMessages.role, [...opts.roles]));
+	return exists(db.select({ one: sql`1` }).from(narratorMessages).where(and(...conditions)));
+}
+
 /** Minimal message shape needed to pick the retry target. */
 interface RetryCandidateMessage {
 	id: string;
@@ -4434,13 +4458,11 @@ async function retryLastMessageUnlocked(
 			seq: narratorMessageRefs.seq,
 		})
 		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 		.where(
 			and(
 				eq(narratorMessageRefs.narratorId, narratorId),
 				isNull(narratorMessageRefs.segmentCompactId),
-				isNull(narratorMessages.parentToolUseId),
-				inArray(narratorMessages.role, ["user", "assistant"]),
+				messageRefExists({ roles: ["user", "assistant"], requireTopLevel: true }),
 			),
 		)
 		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
@@ -4896,12 +4918,10 @@ async function reExecuteDeniedToolCallUnlocked(
 	const lastRef = await db
 		.select({ messageId: narratorMessageRefs.messageId })
 		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 		.where(
 			and(
 				eq(narratorMessageRefs.narratorId, narratorId),
-				isSubagent ? undefined : isNull(narratorMessages.parentToolUseId),
-				inArray(narratorMessages.role, ["user", "assistant"]),
+				messageRefExists({ roles: ["user", "assistant"], requireTopLevel: !isSubagent }),
 			),
 		)
 		.orderBy(sql`${narratorMessageRefs.seq} DESC`)

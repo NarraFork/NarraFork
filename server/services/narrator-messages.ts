@@ -26,6 +26,7 @@ import {
 	asc,
 	desc,
 	eq,
+	exists,
 	getTableColumns,
 	gt,
 	gte,
@@ -3829,10 +3830,37 @@ const narratorMessageQueriesUnlocked = {
 					"PRETEXT_DOCUMENT_CHANGED",
 				);
 		};
+		// "Top-level message" is expressed as a correlated EXISTS rather than the
+		// inner join this used to be, because the join form admitted a catastrophic
+		// plan: SQLite drove from `narrator_messages` through
+		// `idx_messages_parent_tool_use_lookup`, whose `parent_tool_use_id IS NULL`
+		// predicate matches ~90% of all messages, re-looked-up every ref and sorted
+		// the whole set in a temp B-tree merely to read the newest `limit` rows.
+		// That is the FIRST request of every narrator open, and it measured 306ms
+		// on a 131k-message library (p50 8.1s end to end in the logs).
+		//
+		// As EXISTS the planner walks `idx_narrator_refs_seq` in `seq DESC` order
+		// and stops after `limit + 1` rows, since the subquery is answered by the
+		// message primary key. Measured 0.07ms — row-for-row identical on the 12
+		// largest narrators, for the tail page and the `beforeSeq` scroll-up page
+		// alike. Deliberately NOT an `INDEXED BY` hint: this spelling needs no
+		// SQLite-only syntax, so it stays off the dialect-migration ledger.
+		const isTopLevelRef = () =>
+			exists(
+				db
+					.select({ one: sql`1` })
+					.from(narratorMessages)
+					.where(
+						and(
+							eq(narratorMessages.id, narratorMessageRefs.messageId),
+							isNull(narratorMessages.parentToolUseId),
+						),
+					),
+			);
 		const baseConditions = [
 			eq(narratorMessageRefs.narratorId, narratorId),
 			isNull(narratorMessageRefs.segmentCompactId),
-			...(isSubagent ? [] : [isNull(narratorMessages.parentToolUseId)]),
+			...(isSubagent ? [] : [isTopLevelRef()]),
 		];
 
 		// `afterSeq` → ascending page after the cursor (kept for compatibility with
@@ -3851,7 +3879,6 @@ const narratorMessageQueriesUnlocked = {
 		const refRows = await db
 			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 			.where(and(...conditions))
 			.orderBy(ascending ? asc(narratorMessageRefs.seq) : desc(narratorMessageRefs.seq))
 			.limit(limit + 1);
