@@ -62,7 +62,10 @@ import {
 	readFileReferences,
 	trimFileReferenceInput,
 } from "../composer/file-reference-input";
-import { TextareaOptimizeControls } from "../composer/TextareaOptimizeControls";
+import {
+	TextareaOptimizeControls,
+	textareaOptimizeControlsWidth,
+} from "../composer/TextareaOptimizeControls";
 import {
 	ACCEPTED_TYPES,
 	MAX_IMAGE_LONG_EDGE,
@@ -584,13 +587,8 @@ export function MessageEditorPanel({
 								onContextMessageCountChange={optimizeHook.setContextMessageCount}
 							/>
 						}
-						rightSectionWidth="auto"
-						styles={{
-							section: {
-								alignItems: "center",
-								paddingRight: 8,
-							},
-						}}
+						// Reserved width, not "auto": see textareaOptimizeControlsWidth.
+						rightSectionWidth={textareaOptimizeControlsWidth(true)}
 					/>
 					<Text size="xs" c="dimmed">
 						{t("editAssistantHint")}
@@ -657,13 +655,8 @@ export function MessageEditorPanel({
 								onContextMessageCountChange={optimizeHook.setContextMessageCount}
 							/>
 						}
-						rightSectionWidth="auto"
-						styles={{
-							section: {
-								alignItems: "center",
-								paddingRight: 8,
-							},
-						}}
+						// Reserved width, not "auto": see textareaOptimizeControlsWidth.
+						rightSectionWidth={textareaOptimizeControlsWidth(true)}
 					/>
 					{hasEditImages && (
 						<Group gap="xs">
