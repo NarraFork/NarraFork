@@ -76,17 +76,35 @@ export async function applySqliteDataBackfills(
 	// added the columns with defaults but the 0025 migration's data backfill never ran.
 	{
 		// Normalize invalid traits values to valid JSON arrays. ensureColumns may have added the
-		// column with DEFAULT '' instead of '[]'.
-		const fixTraitsJson = sqlite
-			.prepare(
-				`UPDATE narrators SET traits = '[]'
-				 WHERE traits IS NULL OR traits = '' OR json_valid(traits) = 0`,
-			)
-			.run();
-		if (fixTraitsJson.changes > 0) {
-			logger.info("Normalized invalid traits JSON to empty array", {
-				count: fixTraitsJson.changes,
-			});
+		// column with DEFAULT '' instead of '[]' (the mechanism is fixed in `formatDefault`, but
+		// databases patched before that fix still carry the damage).
+		//
+		// ALL THREE tables, not just narrators. `traits` is a JSON-mode column on each of them,
+		// and drizzle's row mapper runs `JSON.parse` on every JSON-mode value it reads — so a
+		// single stored '' does not degrade one field, it makes the whole row UNREADABLE:
+		// `db.query.userPreferences.findFirst()` (and every other reader of that table) throws
+		// "JSON Parse error: Unexpected EOF". Narrators was the only table repaired here, so
+		// projects and user_preferences kept their '' rows and kept failing their readers.
+		// Table names are module-local literals, not input. Each is guarded so a database that
+		// somehow lacks the column or table degrades to a warning instead of blocking startup —
+		// this loop is a repair pass, and a repair pass must never be the reason boot fails.
+		for (const table of ["narrators", "projects", "user_preferences"]) {
+			try {
+				const fixTraitsJson = sqlite
+					.prepare(
+						`UPDATE "${table}" SET traits = '[]'
+						 WHERE traits IS NULL OR traits = '' OR json_valid(traits) = 0`,
+					)
+					.run();
+				if (fixTraitsJson.changes > 0) {
+					logger.info("Normalized invalid traits JSON to empty array", {
+						table,
+						count: fixTraitsJson.changes,
+					});
+				}
+			} catch (error) {
+				logger.warn("Could not normalize traits JSON", { table, error: String(error) });
+			}
 		}
 
 		const fixSubstatusJson = sqlite
