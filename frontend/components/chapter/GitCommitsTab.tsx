@@ -13,10 +13,12 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useGitLog, useGitReset } from "../../hooks/useGit";
 import { useChapterSplitCapability } from "../../hooks/usePlatform";
-import { type GitTarget, gitCanWrite } from "../../lib/api/git";
+import { type GitTarget, gitBasePath, gitCanWrite, gitTargetKey } from "../../lib/api/git";
 import { formatRelativeTime } from "../../lib/format";
+import { buildCommitPreviewHref } from "../../lib/git-commit-preview-navigation";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { ChapterSplitModal } from "./ChapterSplitModal";
+import { GitCommitDetailModal } from "./GitCommitDetailModal";
 
 const LIMIT = 50;
 const MAX_GIT_COMMIT_LIST_TEXT_CHARS = 1_000;
@@ -35,6 +37,15 @@ export function GitCommitsTab({
 	chapterId?: string;
 	target?: GitTarget;
 }) {
+	return (
+		<GitCommitsContent
+			key={JSON.stringify([gitBasePath(target), gitTargetKey(target)])}
+			target={target}
+		/>
+	);
+}
+
+function GitCommitsContent({ target }: { target: GitTarget }) {
 	const canWrite = gitCanWrite(target);
 	const splitChapterId = typeof target === "string" ? target : target.chapterId;
 	const { t } = useTranslation("git");
@@ -45,6 +56,7 @@ export function GitCommitsTab({
 		: chapterSplitCapability.reason || t("splitUnsupported");
 	const [skip, setSkip] = useState(0);
 	const [splitTarget, setSplitTarget] = useState<{ sha: string; message: string } | null>(null);
+	const [previewSha, setPreviewSha] = useState<string | null>(null);
 	const { data: commits, isLoading, error } = useGitLog(target, LIMIT, skip);
 	const reset = useGitReset(target);
 
@@ -97,21 +109,60 @@ export function GitCommitsTab({
 				<Stack gap={2}>
 					{commits.map((c) => (
 						<Group key={c.sha} gap={6} wrap="nowrap" py={2} px={4}>
-							<Text size="xs" c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
-								{c.shortSha}
-							</Text>
-							<Text size="xs" lineClamp={1} style={{ flex: 1, minWidth: 0 }}>
-								{clampGitCommitListText(c.message)}
-							</Text>
-							<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-								{clampGitCommitListText(c.author)}
-							</Text>
-							<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-								{formatRelativeTime(c.date)}
-							</Text>
+							{/* The row body opens the read-only preview; the menu keeps its own click. */}
+							<UnstyledButton
+								component="a"
+								href={buildCommitPreviewHref(target, c.sha)}
+								onClick={(event) => {
+									// Preserve native link actions (new tab, middle click, copy address).
+									if (
+										event.button > 0 ||
+										event.metaKey ||
+										event.ctrlKey ||
+										event.shiftKey ||
+										event.altKey
+									)
+										return;
+									event.preventDefault();
+									setPreviewSha(c.sha);
+								}}
+								aria-label={t("commitPreview.open", { sha: c.shortSha })}
+								data-commit-row={c.sha}
+								style={{
+									flex: 1,
+									minWidth: 0,
+									display: "flex",
+									gap: 6,
+									alignItems: "center",
+								}}
+							>
+								<Text
+									component="span"
+									size="xs"
+									c="dimmed"
+									ff="monospace"
+									style={{ flexShrink: 0 }}
+								>
+									{c.shortSha}
+								</Text>
+								<Text component="span" size="xs" lineClamp={1} style={{ flex: 1, minWidth: 0 }}>
+									{clampGitCommitListText(c.message)}
+								</Text>
+								<Text component="span" size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+									{clampGitCommitListText(c.author)}
+								</Text>
+								<Text component="span" size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+									{formatRelativeTime(c.date)}
+								</Text>
+							</UnstyledButton>
 							<Menu position="bottom-end" withinPortal>
 								<Menu.Target>
-									<UnstyledButton onClick={(e) => e.stopPropagation()} style={{ lineHeight: 1 }}>
+									<UnstyledButton
+										type="button"
+										aria-label={t("commitPreview.actions", { sha: c.shortSha })}
+										onClick={(e) => e.stopPropagation()}
+										style={{ lineHeight: 1 }}
+									>
 										<IconDots size={14} />
 									</UnstyledButton>
 								</Menu.Target>
@@ -176,6 +227,7 @@ export function GitCommitsTab({
 					onClose={() => setSplitTarget(null)}
 				/>
 			)}
+			<GitCommitDetailModal target={target} sha={previewSha} onClose={() => setPreviewSha(null)} />
 		</>
 	);
 }

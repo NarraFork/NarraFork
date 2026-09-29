@@ -6,7 +6,9 @@ import { logger } from "../lib/logger";
 import { narratorPrincipalOf, requireNarratorAccess } from "../lib/narrator-access";
 import { requireChapterAccess } from "../lib/project-access";
 import {
+	gitCommitDiffQuerySchema,
 	gitCommitSchema,
+	gitCommitShaSchema,
 	gitDiffQuerySchema,
 	gitDiscardSchema,
 	gitLogQuerySchema,
@@ -22,6 +24,7 @@ import {
 	gitAttributionScopes,
 	gitManagementService,
 	invalidateGitWorkspace,
+	validateFilePaths,
 	validateGitFileTargets,
 } from "../services/git-management-service";
 import { withGitRequestContext } from "../services/git-service";
@@ -340,6 +343,20 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 	routes.get(`${prefix}/log`, async (c) => {
 		const { path, git } = access(c);
 		return c.json(await git.getLog(path, gitLogQuerySchema.parse(c.req.query())));
+	});
+	// Commit preview: read-only, so a read-only workspace may use it too.
+	routes.get(`${prefix}/commits/:sha`, async (c) => {
+		const { path, git } = access(c);
+		const sha = gitCommitShaSchema.parse(c.req.param("sha"));
+		return c.json(await git.getCommitDetail(path, sha));
+	});
+	routes.get(`${prefix}/commits/:sha/diff`, async (c) => {
+		const { path, git } = access(c);
+		const sha = gitCommitShaSchema.parse(c.req.param("sha"));
+		const { file, oldPath } = gitCommitDiffQuerySchema.parse(c.req.query());
+		// Lexical only: a historical path may no longer exist in the working tree.
+		validateFilePaths(oldPath ? [file, oldPath] : [file]);
+		return c.json(await git.getCommitPatch(path, sha, file, oldPath));
 	});
 	routes.post(`${prefix}/reset`, async (c) => {
 		const { target, path, git } = access(c);

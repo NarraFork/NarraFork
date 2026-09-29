@@ -13,7 +13,12 @@
  *     because refusing it makes a real file impossible to stage or discard.
  */
 import { describe, expect, test } from "bun:test";
-import { gitRef, gitResetSchema } from "@server/lib/validators/git";
+import {
+	gitCommitDiffQuerySchema,
+	gitCommitShaSchema,
+	gitRef,
+	gitResetSchema,
+} from "@server/lib/validators/git";
 import { validateFilePaths } from "@server/routes/git";
 
 /** Whether the guard accepted the whole list. */
@@ -141,6 +146,55 @@ describe("gitRef — flag injection and illegal characters are refused", () => {
 
 	test("accepts single-dot paths (used in some ref syntax)", () => {
 		expect(refOk("v1.2.3")).toBe(true);
+	});
+});
+
+describe("commit preview schemas", () => {
+	test("accepts only full SHA-1/SHA-256 names and normalizes their case", () => {
+		for (const length of [40, 64]) {
+			const sha = "aB".repeat(length / 2);
+			expect(gitCommitShaSchema.parse(sha)).toBe(sha.toLowerCase());
+		}
+		for (const value of [
+			"",
+			"abcdef1",
+			"HEAD",
+			"HEAD~1",
+			"--all",
+			"--format=%H",
+			"-p",
+			`${"a".repeat(40)}..${"b".repeat(40)}`,
+			`${"a".repeat(40)}^{commit}`,
+			"a".repeat(39),
+			"a".repeat(41),
+			"a".repeat(63),
+			"a".repeat(65),
+			"g".repeat(40),
+			"a".repeat(10_000),
+			`${"a".repeat(40)}\n`,
+		])
+			expect(gitCommitShaSchema.safeParse(value).success).toBe(false);
+	});
+
+	test("requires a bounded file and independently bounds an optional rename source", () => {
+		const file = "文档/new #?&+ name.txt";
+		const oldPath = "old/name with\tand\nwhitespace.txt";
+		expect(gitCommitDiffQuerySchema.parse({ file, oldPath })).toEqual({ file, oldPath });
+		expect(gitCommitDiffQuerySchema.parse({ file })).toEqual({ file });
+		expect(
+			gitCommitDiffQuerySchema.safeParse({ file: "x".repeat(4096), oldPath: "y".repeat(4096) })
+				.success,
+		).toBe(true);
+		for (const query of [
+			{},
+			{ oldPath },
+			{ file: "" },
+			{ file: null },
+			{ file, oldPath: "" },
+			{ file: "x".repeat(4097) },
+			{ file, oldPath: "x".repeat(4097) },
+		])
+			expect(gitCommitDiffQuerySchema.safeParse(query).success).toBe(false);
 	});
 });
 

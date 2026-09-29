@@ -34,6 +34,8 @@ const AUTHENTICATED_PATHS: string[] = [
 	"/narrators/archived",
 	"/narrators/abc",
 	"/narrators/workspace/abc",
+	`/git/narrators/abc/commits/${"a".repeat(40)}`,
+	`/git/chapters/abc/commits/${"b".repeat(40)}`,
 	"/settings",
 	"/settings/agent",
 	"/settings/users",
@@ -47,6 +49,10 @@ const AUTHENTICATED_PATHS: string[] = [
 ];
 
 describe("app shell i18n namespaces", () => {
+	test.each(["narrators", "chapters"])("%s commit deep links preload git translations", (kind) => {
+		const loaded = getNamespacesForPath(`/git/${kind}/abc/commits/${"a".repeat(40)}`);
+		expect(loaded).toContain("git");
+	});
 	test.each(
 		AUTHENTICATED_PATHS,
 	)("%s preloads every namespace the app shell renders with", (path) => {

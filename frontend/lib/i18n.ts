@@ -127,6 +127,9 @@ function getRouteNamespaces(path: string): Namespace[] {
 			"chat",
 		];
 	}
+	if (path.startsWith("/git/narrators/") || path.startsWith("/git/chapters/")) {
+		return ["git"];
+	}
 	if (path === "/messages") return ["common", "nav", "chat"];
 	if (path === "/narrators") return ["common", "nav", "narrators", "narrator", "chat"];
 	if (path === "/narrators/archived") return ["common", "nav", "narrators"];

@@ -24,6 +24,7 @@ import type {
 	WriteBytesOptions,
 } from "../lib/agent/execution/backend";
 import {
+	FEATURE_GIT_COMMIT_PREVIEW_V1,
 	FEATURE_GIT_WORKSPACE_V1,
 	FEATURE_GIT_WORKSPACE_WATCH_V1,
 	GIT_WORKSPACE_MAX_BYTES,
@@ -411,11 +412,16 @@ export class RemoteBackend implements ExecutionBackend {
 		);
 	}
 
+	get supportsGitCommitPreview(): boolean {
+		return hasDeviceProtocolFeature(this.deviceId, FEATURE_GIT_COMMIT_PREVIEW_V1);
+	}
+
 	async gitWorkspace(
 		request: GitWorkspaceRequest,
 		signal?: AbortSignal,
 	): Promise<GitWorkspaceResult> {
 		const timeoutMs = request.timeoutMs ?? GIT_WORKSPACE_TIMEOUT_MS;
+		const preview = request.operation === "commitDetail" || request.operation === "commitDiff";
 		return (await this.rpc(
 			"git.workspace",
 			{
@@ -423,7 +429,13 @@ export class RemoteBackend implements ExecutionBackend {
 				timeoutMs,
 				maxBytes: Math.min(request.maxBytes ?? GIT_WORKSPACE_MAX_BYTES, this.maxBytes),
 			},
-			{ signal, timeoutMs: timeoutMs + 5_000, requiredFeatures: [FEATURE_GIT_WORKSPACE_V1] },
+			{
+				signal,
+				timeoutMs: timeoutMs + 5_000,
+				requiredFeatures: preview
+					? [FEATURE_GIT_WORKSPACE_V1, FEATURE_GIT_COMMIT_PREVIEW_V1]
+					: [FEATURE_GIT_WORKSPACE_V1],
+			},
 		)) as GitWorkspaceResult;
 	}
 

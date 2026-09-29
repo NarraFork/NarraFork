@@ -338,6 +338,13 @@ function AuthenticatedLayout() {
 	const requestDumpErrorsOnly = settings?.agent?.requestDumpErrorsOnly === true;
 	const computedScheme = useComputedColorScheme("dark");
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
+	const previewLoginRedirect = useRouterState({
+		select: ({ location }) =>
+			location.pathname.startsWith("/git/narrators/") ||
+			location.pathname.startsWith("/git/chapters/")
+				? location.href
+				: undefined,
+	});
 	const appShellScrollKey = useAppShellHistoryEntryKey();
 	// `/auth/me` is session-only, so a 401 here means this session is unusable —
 	// but only when the error code actually says so.
@@ -599,7 +606,7 @@ function AuthenticatedLayout() {
 
 	// No token → redirect to login (useCurrentUser is disabled, won't fire)
 	if (!hasToken) {
-		return <Navigate to="/login" />;
+		return <Navigate to="/login" search={{ redirect: previewLoginRedirect }} replace />;
 	}
 
 	// Token exists but auth failed (expired/invalid/user gone) → clear token and redirect.
@@ -608,7 +615,7 @@ function AuthenticatedLayout() {
 	// already dropped the token when it was genuinely dead.
 	if (sessionLost) {
 		clearToken();
-		return <Navigate to="/login" />;
+		return <Navigate to="/login" search={{ redirect: previewLoginRedirect }} replace />;
 	}
 
 	// Token exists, query in flight → show loader

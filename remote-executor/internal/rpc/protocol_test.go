@@ -30,6 +30,7 @@ func TestCapabilitiesAdvertiseSafePlanReadFeatures(t *testing.T) {
 		FeatureFsReadBoundedV1,
 		FeatureGitWorkspaceV1,
 		FeatureGitWorkspaceWatchV1,
+		FeatureGitCommitPreviewV1,
 	} {
 		if !containsFeature(decoded.Features, feature) {
 			t.Fatalf("updated executor did not advertise %q: %s", feature, encoded)
@@ -43,8 +44,10 @@ func TestCapabilitiesPreserveLegacyFeaturesDuringRollingUpgrade(t *testing.T) {
 	if err := json.Unmarshal(legacyHello, &hello); err != nil {
 		t.Fatalf("decode legacy hello: %v", err)
 	}
-	if containsFeature(hello.Capabilities.Features, FeatureFsStatResolvedPathV1) {
-		t.Fatal("legacy hello must not gain a new capability during decode")
+	for _, feature := range []string{FeatureFsStatResolvedPathV1, FeatureGitWorkspaceV1, FeatureGitCommitPreviewV1} {
+		if containsFeature(hello.Capabilities.Features, feature) {
+			t.Fatalf("legacy hello must not gain %q during decode", feature)
+		}
 	}
 
 	encoded, err := json.Marshal(Capabilities{Features: []string{"legacy.feature.v1"}})

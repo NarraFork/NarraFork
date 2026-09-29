@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -23,9 +24,14 @@ func startGitBinaryExecutor(t *testing.T, serverURL, root string) context.Cancel
 	if runtime.GOOS == "windows" {
 		binary += ".exe"
 	}
-	buildCtx, stopBuild := context.WithTimeout(context.Background(), 60*time.Second)
+	buildCtx, stopBuild := context.WithTimeout(context.Background(), 180*time.Second)
 	defer stopBuild()
-	build := exec.CommandContext(buildCtx, "go", "build", "-o", binary, "./cmd/narrafork-executor")
+	// A portable toolchain need not be installed on the machine's global PATH.
+	goBinary := filepath.Join(runtime.GOROOT(), "bin", "go")
+	if runtime.GOOS == "windows" {
+		goBinary += ".exe"
+	}
+	build := exec.CommandContext(buildCtx, goBinary, "build", "-buildvcs=false", "-o", binary, "./cmd/narrafork-executor")
 	build.Dir = filepath.Join("..", "..")
 	build.Stdout, build.Stderr = io.Discard, io.Discard
 	if err := build.Run(); err != nil {
@@ -36,12 +42,12 @@ func startGitBinaryExecutor(t *testing.T, serverURL, root string) context.Cancel
 	cmd.Stdin = strings.NewReader("rdev_test\n")
 	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
 	for _, item := range os.Environ() {
-		if !strings.HasPrefix(item, "NARRAFORK_EXECUTOR_") && !strings.HasPrefix(item, "HOME=") && !strings.HasPrefix(item, "XDG_CONFIG_HOME=") {
+		if !strings.HasPrefix(item, "NARRAFORK_EXECUTOR_") && !strings.HasPrefix(item, "HOME=") && !strings.HasPrefix(item, "USERPROFILE=") && !strings.HasPrefix(item, "XDG_CONFIG_HOME=") {
 			cmd.Env = append(cmd.Env, item)
 		}
 	}
 	home := t.TempDir()
-	cmd.Env = append(cmd.Env, "HOME="+home, "XDG_CONFIG_HOME="+home)
+	cmd.Env = append(cmd.Env, "HOME="+home, "USERPROFILE="+home, "XDG_CONFIG_HOME="+home)
 	cmd.WaitDelay = 2 * time.Second
 	if runtime.GOOS != "windows" {
 		cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
@@ -78,14 +84,16 @@ func TestGitWorkspaceRemoteLifecycle(t *testing.T) {
 	if !ts.hello.Capabilities.Git || ts.hello.Capabilities.Shell {
 		t.Fatal("CLI capabilities did not preserve Git with --disable-shell")
 	}
-	found := false
-	for _, feature := range ts.hello.Capabilities.Features {
-		if feature == rpc.FeatureGitWorkspaceV1 {
-			found = true
+	for _, required := range []string{rpc.FeatureGitWorkspaceV1, rpc.FeatureGitCommitPreviewV1} {
+		count := 0
+		for _, feature := range ts.hello.Capabilities.Features {
+			if feature == required {
+				count++
+			}
 		}
-	}
-	if !found {
-		t.Fatal("executor did not advertise full Git capability")
+		if count != 1 {
+			t.Fatalf("executor must advertise %q exactly once: %v", required, ts.hello.Capabilities.Features)
+		}
 	}
 	ctx, stop := context.WithTimeout(context.Background(), 30*time.Second)
 	defer stop()
@@ -119,6 +127,33 @@ func TestGitWorkspaceRemoteLifecycle(t *testing.T) {
 	call("unstage", map[string]any{"all": true})
 	call("stage", map[string]any{"files": []any{"file.txt"}})
 	sha := strings.TrimSpace(call("commit", map[string]any{"message": "first", "identity": identity})["stdout"].(string))
+	detail := call("commitDetail", map[string]any{"commit": sha, "maxBytes": 4096})
+	detailOutputs := detail["outputs"].(map[string]any)
+	if detailOutputs["found"] != "1" || detailOutputs["nameStatus"] != "A\x00file.txt\x00" || !strings.HasPrefix(detailOutputs["meta"].(string), sha+"\x00") {
+		t.Fatalf("real RPC commit detail: %v", detail)
+	}
+	preview := call("commitDiff", map[string]any{"commit": sha, "path": "file.txt", "maxBytes": 4096})
+	if !strings.Contains(preview["stdout"].(string), "+initial") || preview["outputs"].(map[string]any)["fileStatus"] != "ok" {
+		t.Fatalf("real RPC commit patch: %v", preview)
+	}
+	for _, tc := range []struct{ path, oldPath, status string }{{"missing.txt", "file.txt", "not_found"}, {"file.txt", "unrelated.txt", "invalid"}} {
+		failure := call("commitDiff", map[string]any{"commit": sha, "path": tc.path, "oldPath": tc.oldPath})
+		if failure["outputs"].(map[string]any)["fileStatus"] != tc.status || failure["stdout"] != "" {
+			t.Fatalf("real RPC file failure %s: %v", tc.status, failure)
+		}
+	}
+	if missing := call("commitDetail", map[string]any{"commit": strings.Repeat("0", 40)}); missing["outputs"].(map[string]any)["found"] != "0" {
+		t.Fatalf("real RPC missing commit: %v", missing)
+	}
+	if err := writeJSON(ctx, ts.conn, rpc.RequestFrame{Type: "rpc", ID: "cancel-preview", Method: "git.workspace", Params: map[string]any{"cwd": root, "expectedRoot": root, "operation": "commitDiff", "commit": sha, "path": "file.txt"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(ctx, ts.conn, rpc.CancelFrame{Type: "rpc_cancel", ID: "cancel-preview"}); err != nil {
+		t.Fatal(err)
+	}
+	if pong, _, err := ts.call(ctx, "after-preview-cancel", "system.ping", nil); err != nil || !pong.OK {
+		t.Fatalf("real RPC preview cancellation broke transport: %v %+v", err, pong)
+	}
 	write("initial\nupdated\n")
 	if diff := call("diff", map[string]any{"files": []any{"file.txt"}})["stdout"].(string); !strings.Contains(diff, "+updated") {
 		t.Fatalf("remote diff: %q", diff)
@@ -150,6 +185,13 @@ func TestGitWorkspaceRemoteLifecycle(t *testing.T) {
 	full := call("fullDiff", map[string]any{"maxBytes": 512})
 	if full["truncated"] != true || len(full["stdout"].(string)) > 512 {
 		t.Fatalf("remote diff output was not bounded")
+	}
+	call("stage", map[string]any{"all": true})
+	largeSHA := strings.TrimSpace(call("commit", map[string]any{"message": "bounded historical patch", "identity": identity})["stdout"].(string))
+	boundedPreview := call("commitDiff", map[string]any{"commit": largeSHA, "path": "file.txt", "maxBytes": 512})
+	encodedPreview, err := json.Marshal(boundedPreview)
+	if err != nil || len(encodedPreview) > 512 || boundedPreview["truncated"] != true || boundedPreview["outputs"].(map[string]any)["fileStatus"] != "ok" {
+		t.Fatalf("real RPC historical patch budget: bytes=%d result=%v err=%v", len(encodedPreview), boundedPreview, err)
 	}
 	for index := 0; index < 20; index++ {
 		path := filepath.Join(root, fmt.Sprintf("status-%02d.txt", index))

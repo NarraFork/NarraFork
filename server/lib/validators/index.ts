@@ -82,7 +82,9 @@ export {
 } from "./explorations";
 export { type FsWriteInput, fsWriteSchema } from "./fs";
 export {
+	gitCommitDiffQuerySchema,
 	gitCommitSchema,
+	gitCommitShaSchema,
 	gitDiffQuerySchema,
 	gitDiscardSchema,
 	gitLogQuerySchema,

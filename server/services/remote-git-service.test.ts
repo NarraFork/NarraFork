@@ -1,8 +1,14 @@
 import { expect, test } from "bun:test";
+import {
+	GIT_COMMIT_PREVIEW_PATCH_MAX_BYTES,
+	GIT_COMMIT_PREVIEW_UNSUPPORTED,
+} from "@shared/git-commit-preview";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
-import type {
-	GitWorkspaceRequest,
-	GitWorkspaceResult,
+import {
+	GIT_WORKSPACE_MAX_BYTES,
+	GIT_WORKSPACE_TIMEOUT_MS,
+	type GitWorkspaceRequest,
+	type GitWorkspaceResult,
 } from "../lib/agent/execution/git-workspace-rpc";
 import {
 	createRemoteGitService,
@@ -10,7 +16,7 @@ import {
 	supportsRemoteGitWorkspace,
 } from "./remote-git-service";
 
-function backendFixture() {
+function backendFixture(supportsGitCommitPreview = true) {
 	const calls: Array<{ request: GitWorkspaceRequest; signal?: AbortSignal }> = [];
 	let response: GitWorkspaceResult = { stdout: "" };
 	let failure: Error | undefined;
@@ -18,6 +24,7 @@ function backendFixture() {
 		kind: "remote",
 		deviceId: "device-a",
 		supportsGitWorkspace: true,
+		supportsGitCommitPreview,
 		async gitWorkspace(request: GitWorkspaceRequest, signal?: AbortSignal) {
 			calls.push({ request, signal });
 			if (failure) throw failure;
@@ -35,6 +42,164 @@ function backendFixture() {
 		},
 	};
 }
+
+const PREVIEW_SHA = "a".repeat(40);
+const PREVIEW_PARENT = "b".repeat(40);
+function previewOutputs(overrides: Record<string, string> = {}) {
+	return {
+		found: "1",
+		// Ten fields: the full object name is distinct from the display abbreviation.
+		meta: [
+			PREVIEW_SHA,
+			"aaaaaaa",
+			PREVIEW_PARENT,
+			"Author",
+			"author@test",
+			"2026-09-25T10:00:00Z",
+			"Committer",
+			"committer@test",
+			"2026-09-25T11:00:00Z",
+			"subject\n\nmultiline body\n",
+		].join("\0"),
+		nameStatus: "M\0src/file.txt\0R100\0old name.txt\0new name.txt\0",
+		numstat: "2\t1\tsrc/file.txt\0" + "0\t0\t\0old name.txt\0new name.txt\0",
+		...overrides,
+	};
+}
+
+test("remote commit preview uses read RPCs with pinned roots, cancellation and bounded outputs", async () => {
+	const f = backendFixture();
+	const controller = new AbortController();
+	let writes = 0;
+	const git = createRemoteGitService(f.backend, controller.signal, async () => {
+		writes++;
+	});
+	const cwd = "C:\\Work\\History";
+	f.respond({ outputs: previewOutputs() });
+	const detail = await git.getCommitDetail(cwd, PREVIEW_SHA);
+	expect(detail).toMatchObject({
+		sha: PREVIEW_SHA,
+		shortSha: "aaaaaaa",
+		parents: [PREVIEW_PARENT],
+		comparedTo: PREVIEW_PARENT,
+		authorName: "Author",
+		authorEmail: "author@test",
+		authoredAt: "2026-09-25T10:00:00Z",
+		committerName: "Committer",
+		committerEmail: "committer@test",
+		committedAt: "2026-09-25T11:00:00Z",
+		message: "subject\n\nmultiline body",
+		messageTruncated: false,
+		filesTruncated: false,
+	});
+	expect(detail.files).toEqual([
+		{ path: "src/file.txt", status: "modified", linesAdded: 2, linesRemoved: 1, binary: false },
+		{
+			path: "new name.txt",
+			oldPath: "old name.txt",
+			status: "renamed",
+			linesAdded: 0,
+			linesRemoved: 0,
+			binary: false,
+		},
+	]);
+	expect(f.calls[0]?.request).toEqual({
+		cwd,
+		expectedRoot: cwd,
+		operation: "commitDetail",
+		commit: PREVIEW_SHA,
+		timeoutMs: GIT_WORKSPACE_TIMEOUT_MS,
+		maxBytes: GIT_WORKSPACE_MAX_BYTES,
+	});
+	const patch =
+		"diff --git a/old name.txt b/new name.txt\nsimilarity index 100%\nrename from old name.txt\nrename to new name.txt\n";
+	f.respond({ stdout: patch, truncated: true });
+	expect(await git.getCommitPatch(cwd, PREVIEW_SHA, "new name.txt", "old name.txt")).toEqual({
+		diff: patch,
+		truncated: true,
+	});
+	expect(f.calls[1]?.request).toEqual({
+		cwd,
+		expectedRoot: cwd,
+		operation: "commitDiff",
+		commit: PREVIEW_SHA,
+		path: "new name.txt",
+		oldPath: "old name.txt",
+		timeoutMs: GIT_WORKSPACE_TIMEOUT_MS,
+		maxBytes: GIT_COMMIT_PREVIEW_PATCH_MAX_BYTES,
+	});
+	expect(f.calls.every((call) => call.signal === controller.signal)).toBe(true);
+	expect(writes).toBe(0);
+	controller.abort();
+	expect(f.calls.every((call) => call.signal?.aborted)).toBe(true);
+});
+
+test("remote commit preview preserves independent metadata and list truncation boundaries", async () => {
+	const f = backendFixture();
+	const git = createRemoteGitService(f.backend);
+	for (const key of ["meta", "nameStatus", "numstat"] as const) {
+		const outputs = previewOutputs({ [`${key}Truncated`]: "1" });
+		if (key === "nameStatus") outputs.nameStatus += "A\0incomplete";
+		if (key === "numstat")
+			outputs.numstat = "2\t1\tsrc/file.txt\0" + "0\t0\t\0old name.txt\0partial";
+		f.respond({ outputs, truncated: true });
+		const detail = await git.getCommitDetail("/repo", PREVIEW_SHA);
+		expect(detail.messageTruncated).toBe(key === "meta");
+		expect(detail.filesTruncated).toBe(key === "nameStatus");
+		expect(detail.files.map((file) => file.path)).toEqual(["src/file.txt", "new name.txt"]);
+		expect(detail.files[0]?.linesAdded).toBe(2);
+		expect(detail.files[1]?.linesAdded).toBe(key === "numstat" ? null : 0);
+	}
+	f.respond({ outputs: previewOutputs({ meta: "partial\0metadata", metaTruncated: "1" }) });
+	await expect(git.getCommitDetail("/repo", PREVIEW_SHA)).rejects.toThrow("incomplete");
+	f.respond({
+		outputs: previewOutputs({ meta: previewOutputs().meta.replace(PREVIEW_SHA, "aaaaaaa") }),
+	});
+	await expect(git.getCommitDetail("/repo", PREVIEW_SHA)).rejects.toThrow("identity");
+});
+
+test("remote commit preview preserves unsupported and membership errors without fallback or replay", async () => {
+	const old = backendFixture(false);
+	const oldGit = createRemoteGitService(old.backend);
+	for (const read of [
+		() => oldGit.getCommitDetail("/same/path", PREVIEW_SHA),
+		() => oldGit.getCommitPatch("/same/path", PREVIEW_SHA, "file.txt"),
+	])
+		await expect(read()).rejects.toMatchObject({
+			statusCode: 409,
+			code: GIT_COMMIT_PREVIEW_UNSUPPORTED,
+		});
+	expect(old.calls).toHaveLength(0);
+	// Lack of the additive preview feature must not disable ordinary workspace RPCs.
+	await oldGit.probe("/same/path");
+	expect(old.calls).toHaveLength(1);
+
+	const f = backendFixture();
+	const git = createRemoteGitService(f.backend);
+	f.respond({ outputs: { found: "0" } });
+	await expect(git.getCommitDetail("/repo", PREVIEW_SHA)).rejects.toMatchObject({
+		statusCode: 404,
+		code: "GIT_COMMIT_NOT_FOUND",
+	});
+	await expect(git.getCommitPatch("/repo", PREVIEW_SHA, "file.txt")).rejects.toMatchObject({
+		statusCode: 404,
+		code: "GIT_COMMIT_NOT_FOUND",
+	});
+	for (const [fileStatus, statusCode] of [
+		["not_found", 404],
+		["too_large", 413],
+		["invalid", 400],
+	] as const) {
+		f.respond({
+			outputs: { found: "1", fileStatus },
+			stdout: "diff --git a/file.txt b/file.txt\n",
+		});
+		await expect(git.getCommitPatch("/repo", PREVIEW_SHA, "file.txt")).rejects.toMatchObject({
+			statusCode,
+		});
+	}
+	expect(f.calls).toHaveLength(5);
+});
 
 test("remote Git operations retain target, cancellation, actor and finite budgets", async () => {
 	const f = backendFixture();
