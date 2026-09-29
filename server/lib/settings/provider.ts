@@ -203,25 +203,6 @@ export class DefaultModelNotConfiguredError extends AppError {
 }
 
 /**
- * The summary model setting is empty. Unlike {@link DefaultModelNotConfiguredError}
- * this does not mean "nothing is configured anywhere" — it means the code path
- * refuses to run without an explicit summary model, because handing an empty id
- * to the model catalog surfaces as an opaque schema error instead of an
- * actionable prompt. `name` is pinned for `isProviderUnavailableError`, which
- * keeps it out of the transient-retry path and lets the summary wrappers
- * broadcast the picker event.
- */
-export class SummaryModelNotConfiguredError extends AppError {
-	constructor() {
-		const entry = ERROR_CATALOG.SUMMARY_MODEL_NOT_CONFIGURED;
-		super(entry.en, entry.status, entry.code, {
-			messageCode: "SUMMARY_MODEL_NOT_CONFIGURED",
-		});
-		this.name = "SummaryModelNotConfiguredError";
-	}
-}
-
-/**
  * Prefix for model aggregation values stored in narrators.model.
  * Format: "__agg__:{aggId}" for auto mode, "__agg__:{aggId}:{provider:model}" for pinned provider.
  */
@@ -1161,10 +1142,32 @@ export const DEFAULT_AUTO_COMPACT_KEEP_PAIRS = 2;
 /**
  * Resolve the summary model's effective context window (tokens).
  * Uses the built-in card table when the provider has no explicit setting.
+ *
+ * The summary model is left EMPTY by design on a fresh install and then follows
+ * the default model (see `resolveConfiguredSummaryModel`), so this lookup must
+ * follow the same rule. Parsing the raw setting instead handed `""` to the
+ * model catalog, whose query validation threw "Invalid string at
+ * ModelQuery.upstreamModelId" — before compact ever reached `summaryGenerate`,
+ * which already resolved the empty value correctly.
+ *
+ * This is a metadata lookup: when nothing resolves (no default model either) it
+ * returns the tier default instead of throwing, and leaves reporting "no model
+ * configured" to the generate call that actually needs one.
  */
 export function getSummaryModelContextWindow(modelOverride?: string): number {
-	const summaryModel = modelOverride?.trim() || s().agent.summaryModel;
-	const parsed = parseModelId(summaryModel);
+	const configured = s().agent.summaryModel?.trim();
+	const summaryRef =
+		!configured || isFollowSummaryModelValue(configured) ? FOLLOW_DEFAULT_MODEL : configured;
+	const override = modelOverride?.trim();
+	const requested = !override || isFollowSummaryModelValue(override) ? summaryRef : override;
+
+	let concrete = resolveMetaModelForLookup(requested);
+	// A broken/empty aggregation falls back to the default model, mirroring
+	// `resolveEffectiveModel` / `resolveConfiguredSummaryModel`.
+	if (isMetaModelReference(concrete)) concrete = resolveMetaModelForLookup(FOLLOW_DEFAULT_MODEL);
+	if (!concrete || isMetaModelReference(concrete)) return DEFAULT_CONTEXT_WINDOW;
+
+	const parsed = parseModelId(concrete);
 	const prov = parsed.provider ?? "anthropic";
 	return getModelContextWindow(parsed.model, prov) ?? DEFAULT_CONTEXT_WINDOW;
 }

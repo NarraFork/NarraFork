@@ -43,8 +43,7 @@ afterEach(() => {
 function expectValidJsonLiteral(value: string | null): void {
 	const literal = String(value);
 	expect(literal).not.toBe("''");
-	const inner =
-		literal.startsWith("'") && literal.endsWith("'") ? literal.slice(1, -1) : literal;
+	const inner = literal.startsWith("'") && literal.endsWith("'") ? literal.slice(1, -1) : literal;
 	expect(JSON.parse(inner)).toEqual([]);
 }
 
@@ -90,7 +89,9 @@ describe("JSON-mode column defaults", () => {
 		// And the value a row actually receives must survive the mapper that reads it.
 		database.run("INSERT INTO projects (id, name) VALUES ('p1', 'demo')");
 		const stored = (
-			database.query<{ traits: string }, []>("SELECT traits FROM projects WHERE id = 'p1'").get() as {
+			database
+				.query<{ traits: string }, []>("SELECT traits FROM projects WHERE id = 'p1'")
+				.get() as {
 				traits: string;
 			}
 		).traits;

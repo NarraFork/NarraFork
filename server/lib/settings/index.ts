@@ -107,7 +107,6 @@ export {
 	resolveModelContextWindow,
 	resolveProvider,
 	resolveTranslationModelOverride,
-	SummaryModelNotConfiguredError,
 	usesCodexApiMode,
 	usesCodexModel,
 	usesStatefulApi,

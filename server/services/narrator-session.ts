@@ -4364,7 +4364,12 @@ function messageRefExists(opts: {
 	const conditions = [eq(narratorMessages.id, narratorMessageRefs.messageId)];
 	if (opts.requireTopLevel) conditions.push(isNull(narratorMessages.parentToolUseId));
 	if (opts.roles) conditions.push(inArray(narratorMessages.role, [...opts.roles]));
-	return exists(db.select({ one: sql`1` }).from(narratorMessages).where(and(...conditions)));
+	return exists(
+		db
+			.select({ one: sql`1` })
+			.from(narratorMessages)
+			.where(and(...conditions)),
+	);
 }
 
 /** Minimal message shape needed to pick the retry target. */

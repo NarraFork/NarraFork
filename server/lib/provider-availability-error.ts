@@ -27,9 +27,6 @@ export function isProviderUnavailableError(err: unknown): boolean {
 	// retried with backoff for minutes before failing — the caller just appeared
 	// to hang instead of reporting "no default model is configured".
 	if (err instanceof Error && err.name === "DefaultModelNotConfiguredError") return true;
-	// Same reasoning for the summary model: an empty `agent.summaryModel` cannot be
-	// served, and retrying only delays the picker prompt.
-	if (err instanceof Error && err.name === "SummaryModelNotConfiguredError") return true;
 
 	// Plugin providers raise ProviderRegistryError with a stable code and a
 	// free-form reason ("Provider x is unavailable: runtime-crash"). Before the

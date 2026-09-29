@@ -1,7 +1,7 @@
 import { type TrackApiRequestOptions, trackApiRequest } from "../api-request-tracker";
 import { logger } from "../logger";
 import { isProviderUnavailableError } from "../provider-availability-error";
-import { parseModelId, SummaryModelNotConfiguredError, settings } from "../settings";
+import { parseModelId, settings } from "../settings";
 import { auxiliaryRetryDelayMs, getAuxiliaryMaxRetries } from "./error-handling";
 import {
 	type FileReferenceProjectionOptions,
@@ -452,15 +452,7 @@ export async function summaryGenerate(
 		...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
 	};
 	return withSummaryRetry(
-		() => {
-			// An empty summary model must never reach the model catalog: it fails as
-			// an opaque schema error ("Invalid string at ModelQuery.upstreamModelId")
-			// instead of the actionable "configure a summary model". Throwing here —
-			// inside the retry body — routes it through `isSummaryProviderError`, which
-			// broadcasts the picker event and skips the transient-retry backoff.
-			if (!model) throw new SummaryModelNotConfiguredError();
-			return agentGenerateWithMeta(text, model, systemInstruction, generateOptions, requestTracking);
-		},
+		() => agentGenerateWithMeta(text, model, systemInstruction, generateOptions, requestTracking),
 		signal,
 		model,
 		reportSummaryModelErrors,
@@ -488,9 +480,6 @@ export async function summaryGenerateWithHistory(
 		agentGenerateWithHistoryWithMeta(systemInstruction, content, model, locale, generateOptions);
 	const result = await withSummaryRetry(
 		async () => {
-			// Same guard as `summaryGenerate`: keep the empty id away from the catalog
-			// so the failure is actionable and the picker prompt fires.
-			if (!model) throw new SummaryModelNotConfiguredError();
 			if (!requestTracking) return generate();
 			const resolved = resolveProviderAndModel(model);
 			return trackApiRequest(
