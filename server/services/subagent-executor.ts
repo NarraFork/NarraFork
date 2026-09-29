@@ -179,7 +179,12 @@ function projectSubagentInboxMessage(row: RuntimeMailboxRow): SubagentBufferedMe
 		...(row.state === "claimed" ? { _mailboxClaim: inboxClaim(row) } : {}),
 	};
 }
-function acceptsBufferedSubagentInput(
+/**
+ * Queue heads a subagent turn may be (re)started for: the user's own input, and a
+ * Send addressed to this subagent (`channel: "buffer"`). Team reports to a parent and
+ * task notices are not work for this subagent and never start a turn.
+ */
+export function acceptsBufferedSubagentInput(
 	row: Pick<RuntimeMailboxRow, "kind" | "metadataJson">,
 ): boolean {
 	return (

@@ -812,6 +812,74 @@ describe("real shared orchestrator profile contract", () => {
 		}
 	});
 
+	test("a stop that lands during a transient-retry backoff re-suspends a taken-over subagent", async () => {
+		/*
+		 * Only the check right after a model pass used to route a stop into control.
+		 * A stop during the retry backoff hit the retry's own abort exit instead, the
+		 * runner cleared the takeover and settled the parent — "stop this turn" ended
+		 * the takeover depending on when it was clicked.
+		 */
+		const parent = new AbortController();
+		const proxy = new ProxyAbortController();
+		const profile: Extract<RuntimeProfile, { kind: "subagent" }> = {
+			...(profiles[1] as Extract<RuntimeProfile, { kind: "subagent" }>),
+			control: {
+				parentSignal: parent.signal,
+				proxy,
+				turnAbort: new AbortController(),
+				detached: false,
+			},
+		};
+		const entered = deferred<void>();
+		const originalWait = manual.waitForManualOverride;
+		spyOn(manual, "waitForManualOverride").mockImplementation((...args) => {
+			const waiting = originalWait(...args);
+			entered.resolve();
+			return waiting;
+		});
+		const recovery = await import("../narrator-recovery");
+		spyOn(recovery, "handleTransientError").mockImplementation(async () => {
+			// The user presses Stop while the loop sleeps before replaying.
+			profile.control?.turnAbort.abort("Interrupted by user");
+			return { shouldRetry: false, delayMs: 0 };
+		});
+		const h = fixture(profile, [
+			// A silent disconnect takes the backoff path even on a stateless provider
+			// (a stateless `retryableError` is "retry-exhausted" and never sleeps).
+			{
+				...finished,
+				completedNaturally: false,
+				completedAssistantTurn: false,
+				silentDisconnect: true,
+			},
+			finished,
+		]);
+		resetForegroundTurn(h.session, profile);
+		takeover.markTakenOver(h.session.narratorId);
+		const run = h.run();
+		try {
+			await entered.promise;
+			expect(takeover.isTakenOver(h.session.narratorId)).toBe(true);
+			expect(isExecutionSuspended(h.session.narratorId)).toBe(true);
+			takeover.clearTakenOver(h.session.narratorId);
+			expect(
+				manual.resumeManualOverride(h.session.narratorId, {
+					prompt: "after backoff stop",
+					history: [],
+					trailingToolResults: [],
+				}),
+			).toBe(true);
+			expect((await run).hasError).toBe(false);
+			expect(h.calls.map((call) => call.userText)).toEqual(["same input", "after backoff stop"]);
+		} finally {
+			takeover.clearTakenOver(h.session.narratorId);
+			manual.clearManualOverrideRuntimes();
+			profile.control?.cleanupTurnAbort?.();
+			proxy.dispose();
+			await run;
+		}
+	});
+
 	test("a SESSION-level abort on a subagent that is NOT taken over still ends the run", async () => {
 		const parent = new AbortController();
 		const proxy = new ProxyAbortController();

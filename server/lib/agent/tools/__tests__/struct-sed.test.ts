@@ -19,6 +19,7 @@ import { MAX_TRAVERSAL_DEPTH } from "../../structural/outline";
 import { treeSitterProvider } from "../../structural/tree-sitter-provider";
 import type { ToolContext } from "../../types";
 import { structSedTool } from "../struct-sed";
+import type { DiffHunk } from "../struct-sed/apply";
 import { structViewTool } from "../struct-view";
 
 const TS_SOURCE = `export class PaymentService {
@@ -196,27 +197,38 @@ describe("dry run is the default", () => {
 		expect(result.output).toContain("BRAVO");
 	});
 
-	test("the preview carries before/after text for the card's diff", async () => {
-		// The card renders these as a real diff; the changed region plus context, numbered
-		// from where it starts. The output text stays for the model.
+	test("the preview carries one diff hunk per changed region for the card", async () => {
+		// The card renders these as real diffs; each changed region plus context, numbered
+		// from where it starts on each side. The output text stays for the model.
 		const result = await run({
 			file_path: plainFile,
 			command: "replace",
 			address: "2",
 			content: "BRAVO",
 		});
-		expect(typeof result.metadata?.diffBefore).toBe("string");
-		expect(typeof result.metadata?.diffAfter).toBe("string");
-		expect(result.metadata?.diffBefore).toContain("bravo");
-		expect(result.metadata?.diffAfter).toContain("BRAVO");
-		expect(typeof result.metadata?.diffStartLine).toBe("number");
+		const hunks = result.metadata?.diffHunks as DiffHunk[] | undefined;
+		expect(hunks).toHaveLength(1);
+		expect(hunks?.[0]?.oldText).toContain("bravo");
+		expect(hunks?.[0]?.newText).toContain("BRAVO");
+		expect(hunks?.[0]?.oldStart).toBe(1);
+		expect(hunks?.[0]?.newStart).toBe(1);
+		// The single-window fields are gone; old records still carry them and the card
+		// keeps reading those, but nothing new writes them.
+		expect(result.metadata?.diffBefore).toBeUndefined();
 	});
 
-	test("a change spanning the whole file omits the diff so the card keeps the preview", async () => {
-		// A move from the top of a large file to the bottom would diff the entire file,
-		// which is more overwhelming than the preview it would replace.
+	test("a move across a large file becomes two small hunks, not one file-sized window", async () => {
+		// The old single window spanned first-to-last difference, so its size was the
+		// DISTANCE of the move. Top-to-bottom it covered the whole file and was dropped; a
+		// few hundred lines apart it overflowed the broadcast budget and rendered empty.
 		const big = join(workDir, "big.txt");
-		writeFileSync(big, Array.from({ length: 900 }, (_, i) => `line ${i + 1}`).join("\n"), "utf8");
+		// Trailing newline so the last line is a whole line on both sides; without it the
+		// header figure's line diff reads `line 900` vs `line 900\n` as a changed line.
+		writeFileSync(
+			big,
+			`${Array.from({ length: 900 }, (_, i) => `line ${i + 1}`).join("\n")}\n`,
+			"utf8",
+		);
 		const result = await run({
 			file_path: big,
 			command: "move",
@@ -225,8 +237,22 @@ describe("dry run is the default", () => {
 			placement: "after",
 		});
 		expect(result.isError).toBeFalsy();
-		expect(result.metadata?.diffBefore).toBeUndefined();
-		expect(result.output).toContain("Before:");
+		const hunks = result.metadata?.diffHunks as DiffHunk[] | undefined;
+		expect(hunks).toHaveLength(2);
+		for (const hunk of hunks ?? []) {
+			expect(hunk.oldText.split("\n").length).toBeLessThanOrEqual(7);
+			expect(hunk.newText.split("\n").length).toBeLessThanOrEqual(7);
+		}
+		// Removal at the top: both sides start at line 1.
+		expect(hunks?.[0]).toMatchObject({ oldStart: 1, newStart: 1 });
+		expect(hunks?.[0]?.oldText.startsWith("line 1\n")).toBe(true);
+		expect(hunks?.[0]?.newText.startsWith("line 2\n")).toBe(true);
+		// Insertion at the bottom: the removal above shifted the new side up by one line,
+		// which is why a hunk needs its own origin per side.
+		expect(hunks?.[1]).toMatchObject({ oldStart: 898, newStart: 897 });
+		expect(hunks?.[1]?.newText).toContain("line 900\nline 1");
+		expect(result.metadata?.linesAdded).toBe(1);
+		expect(result.metadata?.linesRemoved).toBe(1);
 	});
 
 	test("substitute reports its replacement count", async () => {

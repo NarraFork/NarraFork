@@ -8,6 +8,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { projectDiffDocument } from "../diff-core";
 import { classifyToolDetail, type ToolDetailData } from "../tool-detail";
 
 const FILE = "E:/repo/server/lib/agent/tools/struct-view.ts";
@@ -274,6 +275,51 @@ describe("dry-run diff rendering", () => {
 		expect(body?.customHighlight).toBe("struct-view");
 	});
 
+	test("a diff projected into truncated leaves still renders as a diff", () => {
+		// The server projects tool I/O field by field, so a long move window (well past
+		// the 2000-char broadcast budget) reaches the card as `{_truncated, preview}`. A
+		// bare string check treated that as "no diff": the card showed the one-line
+		// summary inside a box sized for the full payload, i.e. an empty card.
+		const leaf = (text: string) => ({ _truncated: true, preview: text, fullLength: 9000 });
+		const body = outputBody(
+			classify({
+				inputJson: { file_path: FILE, command: "move" },
+				outputJson: "move applied to file → move on L10-20 → before L90-90",
+				metadata: {
+					command: "move",
+					startLine: 10,
+					endLine: 20,
+					diffBefore: leaf("one\ntwo\nthree"),
+					diffAfter: leaf("one\nthree\ntwo"),
+					diffStartLine: 7,
+				},
+			}),
+		);
+		expect(body?.format).toBe("diff");
+		expect(body?.diffDocument).toBeDefined();
+		// Flagged cut, so the reader's scroll can fetch the full payload.
+		expect(body?.textTruncated).toBe(true);
+	});
+
+	test("an empty diffHunks array still falls back to the retired single-window fields", () => {
+		// A writer that emits `diffHunks: []` while still carrying `diffBefore`/`diffAfter`
+		// must not hide the diff that is present. Empty is "nothing projected", not "no diff".
+		const body = outputBody(
+			classify({
+				inputJson: { file_path: FILE, command: "replace" },
+				metadata: {
+					command: "replace",
+					diffHunks: [],
+					diffBefore: "one\ntwo",
+					diffAfter: "one\nTWO",
+					diffStartLine: 1,
+				},
+			}),
+		);
+		expect(body?.format).toBe("diff");
+		expect(body?.diffDocument).toBeDefined();
+	});
+
 	test("an applied call with no diff data uses the summary tokenizer", () => {
 		// Falls back to the text summary only when the tool omitted the diff (e.g. a change
 		// too large to show that way).
@@ -355,5 +401,103 @@ describe("preview vs applied are told apart", () => {
 			}),
 		);
 		expect(labels).not.toContain("dry run");
+	});
+});
+
+describe("multi-hunk diffs", () => {
+	// The move from the report: a removal near the top and an insertion far below. The
+	// retired single window covered everything in between; hunks cover only the changes.
+	const moveMeta = {
+		command: "move",
+		startLine: 5,
+		endLine: 6,
+		diffHunks: [
+			{
+				oldText: "l2\nl3\nl4\nl5\nl6\nl7\nl8\nl9",
+				newText: "l2\nl3\nl4\nl7\nl8\nl9",
+				oldStart: 2,
+				newStart: 2,
+			},
+			{
+				oldText: "l38\nl39\nl40\nl41\nl42\nl43",
+				newText: "l38\nl39\nl40\nl5\nl6\nl41\nl42\nl43",
+				oldStart: 38,
+				newStart: 36,
+			},
+		],
+	};
+
+	function diffBodies(detail: ToolDetailData | null): Array<Record<string, unknown>> {
+		return (detail?.sections ?? [])
+			.map((part) => part.body as unknown as Record<string, unknown>)
+			.filter((body) => body.kind === "capped" && body.format === "diff");
+	}
+
+	test("each hunk is its own diff body, and the first keeps the result slot", () => {
+		const bodies = diffBodies(
+			classify({ inputJson: { file_path: FILE, command: "move" }, metadata: moveMeta }),
+		);
+		expect(bodies).toHaveLength(2);
+		expect(bodies[0]?.source).toBe("output.main");
+		expect(bodies[1]?.source).toBe("output.hunk.1");
+		expect(bodies.every((body) => body.codeLangPath === FILE)).toBe(true);
+	});
+
+	test("each side of a hunk is numbered from its own origin", () => {
+		// The insertion hunk sits two lines higher on the new side, because the removal
+		// came first. One shared origin would misnumber every row of it.
+		const bodies = diffBodies(
+			classify({ inputJson: { file_path: FILE, command: "move" }, metadata: moveMeta }),
+		);
+		const doc = bodies[1]?.diffDocument as { startLine?: number; newStartLine?: number };
+		expect(doc.startLine).toBe(38);
+		expect(doc.newStartLine).toBe(36);
+		const projected = projectDiffDocument(bodies[1]?.diffDocument as never, { startRow: 0 });
+		const added = projected.lines.filter((line) => line.type === "added");
+		expect(added.map((line) => line.newLineNo)).toEqual([39, 40]);
+		const context = projected.lines.find((line) => line.content === "l41");
+		expect(context?.oldLineNo).toBe(41);
+		expect(context?.newLineNo).toBe(41);
+	});
+
+	test("a hunk cut by the server or the transport is flagged truncated", () => {
+		const cutByServer = diffBodies(
+			classify({
+				inputJson: { file_path: FILE, command: "replace" },
+				metadata: {
+					command: "replace",
+					diffHunks: [{ oldText: "a", newText: "b", oldStart: 1, newStart: 1, truncated: true }],
+				},
+			}),
+		);
+		expect(cutByServer[0]?.textTruncated).toBe(true);
+		const cutInTransit = diffBodies(
+			classify({
+				inputJson: { file_path: FILE, command: "replace" },
+				metadata: {
+					command: "replace",
+					diffHunks: [
+						{
+							oldText: { _truncated: true, preview: "a\nb", fullLength: 9000 },
+							newText: "a\nB",
+							oldStart: 1,
+							newStart: 1,
+						},
+					],
+				},
+			}),
+		);
+		expect(cutInTransit).toHaveLength(1);
+		expect(cutInTransit[0]?.textTruncated).toBe(true);
+	});
+
+	test("hunks the server left out are reported, not silently dropped", () => {
+		const detail = JSON.stringify(
+			classify({
+				inputJson: { file_path: FILE, command: "substitute" },
+				metadata: { ...moveMeta, command: "substitute", diffOmittedHunks: 3 },
+			}),
+		);
+		expect(detail).toContain("3 more changed regions not shown");
 	});
 });

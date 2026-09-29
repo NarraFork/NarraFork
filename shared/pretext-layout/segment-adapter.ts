@@ -3677,12 +3677,18 @@ function buildToolCardData(
 	// via the injected authoritative resolver; "generic" when absent.
 	const category = ctx.resolveToolCategory?.(item.tc.toolName, item.tc.inputJson) ?? "generic";
 	const isStreaming = isStreamingToolItem(item);
-	const metadata = resolveToolMetadata(item.tc);
 	// Truncated payloads are replaced by the full ones once the shell has fetched
 	// them (same injection pattern as resolvePendingPlan), so the expanded card can
 	// show the real body instead of a preview.
 	const inputJson = withFullInput(item, ctx);
 	const outputJson = withFullOutput(item, ctx);
+	// Metadata lives INSIDE the output envelope, so it is projected with it: a long
+	// StructSed `diffBefore`/`diffAfter` arrives as a truncated leaf. Reading it off the
+	// fetched output (when there is one) is what lets the landed payload replace the
+	// preview diff — reading `item.tc` kept the cut copy forever.
+	const metadata = resolveToolMetadata(
+		outputJson === item.tc.outputJson ? item.tc : { ...item.tc, outputJson },
+	);
 	const errorMessage = readNonEmptyString(item.tc, "errorMessage");
 	const denyMessage = nonEmptyTrimmed(item.tc.permissionDenyMessage);
 	return {

@@ -122,8 +122,10 @@ export function getRuntimeEnvironment(): RuntimeEnvironmentInfo {
  * Whether WSL (Windows Subsystem for Linux) is allowed.
  *
  * Controlled by the `--wsl=true|false` CLI flag. Defaults to `false`.
- * When false, the shell detector will reject WSL bash and the system prompt
- * will instruct the AI not to suggest WSL migration.
+ * When false, the shell detector will reject WSL bash (System32/SysWOW64)
+ * so agent commands run through Git Bash / PowerShell instead. This does not
+ * restrict the model from mentioning or invoking `wsl.exe` when the user asks
+ * for it — choosing the default shell is a runtime decision, not a prompt rule.
  */
 let _allowWsl = false;
 

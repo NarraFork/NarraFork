@@ -216,15 +216,25 @@ test("ordinary users see contact advice but no path or repair", async () => {
 	expect(button("repair")).toBeUndefined();
 });
 
-test("admin details are collapsed and unrepairable state requires manual handling", async () => {
+test("unrepairable state opens diagnostics and requires manual handling", async () => {
 	get.mockResolvedValue({ ...restricted, canRepair: false });
 	await render();
 	await openModal();
-	expect(document.querySelector("details")?.hasAttribute("open")).toBe(false);
+	// Stuck operators need the code/path immediately; do not hide them behind a click.
+	expect(document.querySelector("details")?.hasAttribute("open")).toBe(true);
 	expect(document.body.textContent).toContain("/private/app");
 	expect(document.body.textContent).toContain("755");
 	expect(document.body.textContent).toContain("manual");
 	expect(button("repair")).toBeUndefined();
+});
+
+test("repairable state keeps diagnostics collapsed and offers repair", async () => {
+	get.mockResolvedValue(restricted);
+	await render();
+	await openModal();
+	expect(document.querySelector("details")?.hasAttribute("open")).toBe(false);
+	expect(document.body.textContent).not.toContain("manual");
+	expect(button("repair")).toBeDefined();
 });
 
 test("pending confirmation sends no POST and cancellation leaves the modal usable", async () => {

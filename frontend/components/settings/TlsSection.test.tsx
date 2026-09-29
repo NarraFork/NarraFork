@@ -196,3 +196,31 @@ describe("TlsSection — SAN editor initialization", () => {
 		expect(text).not.toContain("other.home.arpa");
 	});
 });
+
+describe("TlsSection — re-issue pulse", () => {
+	const reissueButton = (c: HTMLElement) => c.querySelector("[data-sans-changed]");
+
+	test("does not pulse when editor matches the certificate", () => {
+		queryState.current = {
+			data: { ...tlsStatus(["nas.local"]), certSans: ["localhost", "127.0.0.1", "nas.local"] },
+		};
+		const container = renderSection();
+		expect(reissueButton(container)).toBeNull();
+	});
+
+	test("pulses when stored SANs differ from the certificate", () => {
+		queryState.current = {
+			data: { ...tlsStatus(["nas.local"]), certSans: ["localhost", "127.0.0.1"] },
+		};
+		const container = renderSection();
+		expect(reissueButton(container)).not.toBeNull();
+	});
+
+	test("pulses when a SAN was removed but the cert still has it", () => {
+		queryState.current = {
+			data: { ...tlsStatus([]), certSans: ["localhost", "127.0.0.1", "nas.local"] },
+		};
+		const container = renderSection();
+		expect(reissueButton(container)).not.toBeNull();
+	});
+});

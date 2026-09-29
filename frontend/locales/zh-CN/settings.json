@@ -1664,6 +1664,7 @@
 	"tlsCustomSansDesc": "访问本服务使用的额外主机名或 IP，如 nas.local、192.168.1.10、*.home.arpa。修改后需重新签发证书生效。",
 	"tlsCustomSansPlaceholder": "输入主机名或 IP 后回车",
 	"tlsSanInvalid": "无效的条目：{{entries}}。请使用主机名（如 nas.local、*.home.arpa）或 IP 地址。",
+	"tlsSansPendingReissue": "已保存。当前证书尚未包含：{{sans}}，需重新签发证书后生效。",
 	"tlsAutoSansNote": "自动包含：{{sans}}",
 	"tlsDownloadCa": "下载 CA 证书",
 	"tlsCaDownloadError": "CA 证书下载失败",

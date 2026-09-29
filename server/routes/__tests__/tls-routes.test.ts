@@ -71,6 +71,44 @@ describe("tls route guards", () => {
 		expect(body.error).toContain("https://evil.example");
 	});
 
+	test("PUT /sans is admin-only and rejects invalid entries", async () => {
+		const denied = await appForRole("user").request("/settings/tls/sans", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ customSans: ["nas.local"] }),
+		});
+		expect(denied.status).toBe(403);
+		const bad = await appForRole("admin").request("/settings/tls/sans", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ customSans: ["https://evil.example"] }),
+		});
+		expect(bad.status).toBe(400);
+	});
+
+	test("PUT /sans persists the list without issuing a cert", async () => {
+		const saved = await appForRole("admin").request("/settings/tls/sans", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ customSans: ["NAS.local", "192.168.1.10"] }),
+		});
+		expect(saved.status).toBe(200);
+		const status = (await (await appForRole("user").request("/settings/tls/status")).json()) as {
+			customSans: string[];
+			certExists: boolean;
+			caExists: boolean;
+		};
+		expect(status.customSans).toEqual(["nas.local", "192.168.1.10"]);
+		expect(status.certExists).toBe(false);
+		expect(status.caExists).toBe(false);
+		// Reset so later tests see an empty sidecar.
+		await appForRole("admin").request("/settings/tls/sans", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ customSans: [] }),
+		});
+	});
+
 	test("status is readable by any signed-in user before any cert exists", async () => {
 		const response = await appForRole("user").request("/settings/tls/status");
 		expect(response.status).toBe(200);

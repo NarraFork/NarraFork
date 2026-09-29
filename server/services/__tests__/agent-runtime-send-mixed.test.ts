@@ -198,14 +198,30 @@ test("full parent queue does not prevent sibling delivery and no old entry is ev
 	expect(rows("sibling-a")).toHaveLength(1);
 });
 
-test("takeover is a per-target result and does not suppress parent or later sibling", async () => {
+test("a taken-over target still receives the message, alongside parent and later sibling", async () => {
+	// Rejecting a Send to a taken-over subagent silently dropped the instruction:
+	// nothing was queued. It must be delivered like to any running subagent.
 	taken.add("sibling-a");
 	const result = await sendSubagentMessageDetailed(
 		input("sender-child", ["sibling-a", "parent", "sibling-b"]),
 	);
-	expect(result.targets.map((target) => target.status)).toEqual(["taken_over", "queued", "queued"]);
-	expect(rows("sibling-a")).toHaveLength(0);
-	expect(rows()).toHaveLength(2);
+	expect(result.targets.map((target) => target.status)).toEqual(["queued", "queued", "queued"]);
+	expect(rows("sibling-a")).toHaveLength(1);
+	expect(rows()).toHaveLength(3);
+	expect(result.output).toContain("taken over by the user");
+});
+
+test("doInterrupt is ignored for a taken-over child: queued, user's turn untouched", async () => {
+	taken.add("sibling-a");
+	const turn = new AbortController();
+	getForegroundAbortControllers().set("sibling-a", turn);
+	tryClaimExecution("sibling-a", "subagent");
+	const request = input("parent-root", ["sibling-a"]);
+	const result = await sendSubagentMessageDetailed({ ...request, doInterrupt: true });
+	expect(result.targets.map((target) => target.status)).toEqual(["queued"]);
+	expect(turn.signal.aborted).toBe(false);
+	expect(rows("sibling-a")).toHaveLength(1);
+	expect(result.output).toContain("doInterrupt was ignored");
 });
 
 test("explicit replyTo mixed fanout rejects the entire call without settling waiter or enqueue", async () => {

@@ -1002,8 +1002,17 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 				if (!notice) return false;
 			}
 			if (row.variant.startsWith("subagent:")) {
+				// A taken-over subagent with no live runner (e.g. a background takeover parked
+				// idle) is woken only for its OWN queued work — user input or a Send to it; the
+				// takeover survives that turn. A task notice alone must not start a turn the
+				// user is holding. (A suspended runner still owns execution and is resumed by
+				// the sender directly, never through this wake.)
 				const { isTakenOver } = await import("../subagent-takeover");
-				if (isTakenOver(narratorId)) return false;
+				if (isTakenOver(narratorId)) {
+					const { acceptsBufferedSubagentInput } = await import("../subagent-executor");
+					const head = await peekInbox(narratorId);
+					if (!head || !acceptsBufferedSubagentInput(head)) return false;
+				}
 				const { resumeSubagent } = await import("../subagent-resume");
 				return (
 					await resumeSubagent({

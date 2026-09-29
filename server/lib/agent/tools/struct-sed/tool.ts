@@ -57,7 +57,14 @@ import {
 	encodeFileBytes,
 	normalizeLineEndings,
 } from "../encoding";
-import { applyCommand, changeLineStats, diffMetadata, diffWindow, previewRegion } from "./apply";
+import {
+	applyCommand,
+	changeLineStats,
+	type DiffHunks,
+	diffHunks,
+	diffMetadata,
+	previewRegion,
+} from "./apply";
 import { COMMANDS, MAX_BATCH_OPERATIONS, MAX_FILE_BYTES } from "./commands";
 import { resolveToRange, type ValidatedSpec, validateSpec } from "./resolve";
 
@@ -668,9 +675,8 @@ export const structSedTool: ToolDefinition = {
 			const plan = isBatch
 				? `${resolvedOps.map((op) => `  ${op.spec.index}. ${op.spec.command} → ${op.label}`).join("\n")}\n`
 				: `${addressLabel}\n`;
-			// The card renders this as a real before/after diff. Computed from the two texts
-			// (not the command's range) so it is correct for move/copy and batches too, and
-			// omitted for a change too large to diff — the card then keeps its text preview.
+			// The card renders this as one diff per changed region. Computed from the two texts
+			// (not the command's range) so it is correct for move/copy and batches too.
 			// `dryRun: true` tells the card to mark the diff as a PREVIEW: the applied write
 			// below carries the same diff WITHOUT this flag, so identical-looking diffs are
 			// told apart by the banner rather than being mistaken for one another.
@@ -831,8 +837,8 @@ export async function previewStructSedChange(
 ): Promise<
 	| {
 			preview: StructSedChangePreview;
-			/** Changed region with context, or null when too large to show as a diff. */
-			window: ReturnType<typeof diffWindow>;
+			/** Every changed region with context, or null when nothing changed. */
+			diff: DiffHunks | null;
 	  }
 	| { error: string }
 > {
@@ -846,7 +852,7 @@ export async function previewStructSedChange(
 	const result = await structSedTool.execute({ ...args, dry_run: true }, captureCtx);
 	const preview = holder.captured;
 	if (!preview) return { error: result.output || "StructSed preview produced no change." };
-	return { preview, window: diffWindow(preview.before, preview.after) };
+	return { preview, diff: diffHunks(preview.before, preview.after) };
 }
 
 /**

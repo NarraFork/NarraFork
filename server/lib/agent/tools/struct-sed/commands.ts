@@ -63,13 +63,32 @@ export const MAX_PREVIEW_LINES = 80;
  */
 export const MAX_BATCH_OPERATIONS = FILE_CHANGE_LIMITS.fileToolRequestFields - 1;
 
-/** Context lines kept around a change when building the card's diff. */
+/** Context lines kept around each changed hunk in the card's diff. */
 export const DIFF_CONTEXT_LINES = 3;
 
 /**
- * Largest changed span (in lines) for which a diff card is built.
+ * Most hunks a card carries.
  *
- * Beyond this the diff is more overwhelming than the text preview — a move from the top of
- * a file to the bottom spans the whole file — so the card falls back to the preview instead.
+ * A move or copy produces two, a batch up to one per operation; a substitute across a file
+ * can produce one per match. Past this the diff stops being readable at a glance, so the
+ * card keeps the first hunks and says how many were left out rather than dropping the diff.
  */
-export const MAX_DIFF_SPAN_LINES = 400;
+export const MAX_DIFF_HUNKS = 16;
+
+/**
+ * Line ceiling for one hunk's side.
+ *
+ * Hunks are only as long as the change itself plus context, so this bounds the one case
+ * that is still large by nature: replacing or deleting a big block. Beyond it the hunk is
+ * cut and flagged, which keeps the payload inside the per-field broadcast budget far more
+ * often than the old single window, whose length was the DISTANCE between edits.
+ */
+export const MAX_DIFF_HUNK_LINES = 400;
+
+/**
+ * Edit-length ceiling for the line diff between the changed spans.
+ *
+ * Kept deterministic (no timeout) so the same call produces the same hunks on any
+ * machine. Exceeding it falls back to one hunk spanning the changed region.
+ */
+export const MAX_DIFF_EDIT_LENGTH = 4_000;

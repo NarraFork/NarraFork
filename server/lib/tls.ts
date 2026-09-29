@@ -162,6 +162,18 @@ export function readCustomSans(): string[] {
 	}
 }
 
+/**
+ * Validate and persist the custom SAN list WITHOUT issuing a certificate.
+ * The list takes effect on the next issuance; `getTlsStatus().certSans`
+ * still reports what the current certificate actually covers.
+ */
+export function saveCustomSans(entries: string[]): string[] {
+	const parsed = parseSanEntries(entries);
+	const canonical = [...parsed.dns, ...parsed.ips];
+	writeCustomSans(canonical);
+	return canonical;
+}
+
 function writeCustomSans(customSans: string[]): void {
 	const { dir, sanSidecarPath } = getTlsPaths();
 	mkdirSync(dir, { recursive: true, mode: 0o700 });

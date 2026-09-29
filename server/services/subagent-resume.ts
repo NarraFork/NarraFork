@@ -23,7 +23,7 @@ import {
 	withNarratorWorkAdmission,
 } from "./narrator-session-state";
 import type { RevertScope, RevertWarning } from "./snapshot-revert";
-import { loadSubagentHistory } from "./subagent-executor";
+import { consumeNextBufferedSubagentMessage, loadSubagentHistory } from "./subagent-executor";
 import {
 	claimManualOverride,
 	getManualOverrideRuntime,
@@ -186,7 +186,10 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 	const provider = resolveProvider(effectiveModel);
 
 	let prompt = input.prompt ?? "";
-	let persistPrompt = input.intent === "follow_up";
+	// A mailbox wake carries no prompt of its own: the accepted mailbox row IS the input
+	// and is consumed by the runner. Treating it as a follow-up to persist made every
+	// prompt-less inbox wake fail the "message or attachment is required" check below.
+	let persistPrompt = input.intent === "follow_up" && !input.mailboxInput;
 	let initialHistory: unknown[] | undefined;
 	let initialTrailingToolResults: unknown[] | undefined;
 
@@ -563,6 +566,73 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 		} catch (error) {
 			if (manualClaim) releaseManualOverrideClaim(manualClaim);
 			throw error;
+		}
+
+		if (manualClaim && input.mailboxInput) {
+			// Waking a SUSPENDED runner (manual override / takeover) for a message that is
+			// already accepted in its mailbox. The mailbox row is the only copy: it must be
+			// consumed here, not re-persisted from `input.prompt`. Persisting the prompt
+			// (the generic branch below) left the row queued as well, so the message was
+			// written twice — once now under its reserved id and again when the next turn
+			// drained the queue, which then failed on that same reserved id.
+			try {
+				// A terminal that already fired (timeout / parent abort) wins the claim and
+				// must NOT take the mailbox row with it: settle and bail BEFORE consume, so
+				// the queued message stays available for a later eligible wake. Checking
+				// only after consume dropped that row on the floor — `releaseManualOverrideClaim`
+				// restores the claim, not the message.
+				const preRuntime = getManualOverrideRuntime(input.subagentId);
+				if (preRuntime?.pendingTerminal) {
+					settleManualOverrideClaim(manualClaim, preRuntime.pendingTerminal);
+					throw new ValidationError("Subagent suspension ended while the resume was preparing");
+				}
+				const queued = await consumeNextBufferedSubagentMessage({
+					narratorId: input.subagentId,
+					parentNarratorId: original.parentNarratorId,
+					toolUseId: originToolUseId,
+					model: prepared.effectiveModel,
+					provider: prepared.provider,
+					cwd: prepared.narrator.cwd ?? ".",
+					locale: input.locale,
+				});
+				if (!queued) throw new ValidationError("Mailbox head is not available for this wake");
+				// Terminal landed during consume. The row is already materialized into
+				// history (consume is one-shot and persists the user message), so it is
+				// durable — but this wake cannot start a turn. Settle with the terminal
+				// rather than leaving the parent blocked on a resume that never runs.
+				const runtime = getManualOverrideRuntime(input.subagentId);
+				if (runtime?.pendingTerminal) {
+					settleManualOverrideClaim(manualClaim, runtime.pendingTerminal);
+					throw new ValidationError("Subagent suspension ended while the resume was preparing");
+				}
+				const resumed = settleManualOverrideClaim(manualClaim, {
+					action: "resume",
+					prompt: queued.currentInput ?? queued.prompt,
+					history: queued.history,
+					trailingToolResults: queued.trailingToolResults,
+					userId: queued.preservePrincipal ? (input.createdBy ?? null) : (queued.userId ?? null),
+				});
+				if (!resumed) {
+					// Same as above: the mailbox row is already in history. Do not mark the
+					// narrator "working" for a turn that will never start.
+					throw new ValidationError("Subagent suspension ended before it could be resumed");
+				}
+				// Status flips only after the runner actually accepted the resume, so a
+				// failed settle cannot leave a zombie "working" row. A status write failure
+				// must not turn an accepted resume into a caller-visible error.
+				try {
+					await narratorService.updateStatus(input.subagentId, "working");
+				} catch (statusError) {
+					logger.warn("Failed to mark resumed subagent working", {
+						narratorId: input.subagentId,
+						error: statusError instanceof Error ? statusError.message : String(statusError),
+					});
+				}
+				return { started: true, resumedSuspendedRunner: true, originToolUseId };
+			} catch (error) {
+				releaseManualOverrideClaim(manualClaim);
+				throw error;
+			}
 		}
 
 		if (manualClaim) {

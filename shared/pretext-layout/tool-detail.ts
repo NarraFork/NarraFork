@@ -1746,48 +1746,38 @@ function classifyStructureEdit(
 		]);
 	}
 
-	// A dry run carries the changed region as before/after text. Rendering that as a real
-	// diff — the same widget Edit uses — shows which lines move at a glance, where the
-	// struct-view tokenizer (built for the report's line-numbered syntax) would leave the
-	// source unhighlighted. The tool omits the diff for a change too large to show that way,
-	// in which case the text preview below is what remains.
-	const diffBefore = typeof metadata?.diffBefore === "string" ? metadata.diffBefore : null;
-	const diffAfter = typeof metadata?.diffAfter === "string" ? metadata.diffAfter : null;
-	if (diffBefore != null && diffAfter != null) {
-		const diffStartLine =
-			typeof metadata?.diffStartLine === "number" ? metadata.diffStartLine : undefined;
-		const diffDocument = createDiffDocument({
-			oldText: diffBefore,
-			newText: diffAfter,
-			focusSide: "new",
-			...(diffStartLine != null ? { startLine: diffStartLine } : {}),
-		});
-		// A preview and an applied edit now BOTH render a diff — visually identical red/green
-		// rows. A dry run therefore leads with an explicit "not written" banner so the diff
-		// is not mistaken for a completed change; the applied edit has no banner.
-		const isDryRun = metadata?.dryRun === true;
+	// A preview and an applied edit BOTH render diffs — visually identical red/green rows.
+	// A dry run therefore leads with an explicit "not written" banner so the diff is not
+	// mistaken for a completed change; the applied edit has no banner.
+	const dryRunNotice =
+		metadata?.dryRun === true
+			? section("output.notice", undefined, {
+					kind: "error" as const,
+					// Yellow, not red: this is a notice, not a failure.
+					tone: "warning" as const,
+					text: "Preview only — nothing was written. Re-run with dry_run: false to apply.",
+				})
+			: null;
+
+	// One diff per changed region. Rendering them as real diffs — the widget Edit uses —
+	// shows which lines move at a glance, where the struct-view tokenizer (built for the
+	// report's line-numbered syntax) would leave the source unhighlighted.
+	const hunks = readDiffHunks(metadata);
+	if (hunks.length > 0) {
+		const omitted = typeof metadata?.diffOmittedHunks === "number" ? metadata.diffOmittedHunks : 0;
 		return sections([
 			headerSection,
-			...(isDryRun
-				? [
-						section("output.notice", undefined, {
-							kind: "error" as const,
-							// Yellow, not red: this is a notice, not a failure.
-							tone: "warning" as const,
-							text: "Preview only — nothing was written. Re-run with dry_run: false to apply.",
-						}),
-					]
-				: []),
-			textSection("output.main", outputJson, "output", {
-				cap: "diff",
-				format: "diff",
-				diffDocument,
-				revision: diffDocument.revision,
-				text: output,
-				followTarget: { kind: "diff-row", focus: diffDocument.focus },
-				textTruncated: diffDocument.truncated,
-				...(filePath ? { codeLangPath: filePath } : {}),
-			}),
+			dryRunNotice,
+			...hunks.map((hunk, index) =>
+				diffHunkSection(hunk, index, hunks.length, outputJson, output, filePath),
+			),
+			omitted > 0
+				? section("output.omitted", undefined, {
+						kind: "error" as const,
+						tone: "warning" as const,
+						text: `${omitted} more changed region${omitted === 1 ? "" : "s"} not shown.`,
+					})
+				: null,
 		]);
 	}
 
@@ -1803,6 +1793,105 @@ function classifyStructureEdit(
 			customHighlight: "struct-view" as const,
 		}),
 	]);
+}
+
+/** One changed region of a StructSed diff, as the card reads it from metadata. */
+interface StructureEditHunk {
+	oldText: string;
+	newText: string;
+	oldStart?: number;
+	newStart?: number;
+	/** The server cut the hunk, or the transport projected a side into a truncated leaf. */
+	cut: boolean;
+}
+
+/**
+ * Every hunk the metadata carries, in either shape.
+ *
+ * `diffHunks` is current. `diffBefore`/`diffAfter`/`diffStartLine` is the retired single
+ * window that persisted records still hold; it reads as one hunk with a shared origin.
+ *
+ * Every text is read through `readLeafText`, never `typeof === "string"`: the server
+ * projects tool I/O field by field, so a long side arrives as a `{_truncated, preview}`
+ * leaf. A string check read that as "no diff", fell back to the one-line summary, and the
+ * truncated payload still reserved the full cap — an applied edit rendered as an empty box.
+ */
+function readDiffHunks(metadata: Record<string, unknown> | null): StructureEditHunk[] {
+	const list = metadata?.diffHunks;
+	// Empty array must fall through to the retired single-window fields: a writer that
+	// emits `diffHunks: []` while still carrying `diffBefore`/`diffAfter` (or a projection
+	// that strips every unreadable entry) would otherwise hide a diff that is present.
+	if (Array.isArray(list) && list.length > 0) {
+		const hunks: StructureEditHunk[] = [];
+		for (const entry of list) {
+			const hunk = asObject(entry);
+			const oldText = readLeafText(hunk?.oldText);
+			const newText = readLeafText(hunk?.newText);
+			if (!hunk || oldText === undefined || newText === undefined) continue;
+			hunks.push({
+				oldText,
+				newText,
+				...(typeof hunk.oldStart === "number" ? { oldStart: hunk.oldStart } : {}),
+				...(typeof hunk.newStart === "number" ? { newStart: hunk.newStart } : {}),
+				cut:
+					hunk.truncated === true ||
+					hasTruncatedLeaf(hunk.oldText) ||
+					hasTruncatedLeaf(hunk.newText),
+			});
+		}
+		if (hunks.length > 0) return hunks;
+		// Every entry was unreadable after truncation — also try the legacy fields.
+	}
+	const oldText = readLeafText(metadata?.diffBefore);
+	const newText = readLeafText(metadata?.diffAfter);
+	if (oldText === undefined || newText === undefined) return [];
+	const start = typeof metadata?.diffStartLine === "number" ? metadata.diffStartLine : undefined;
+	return [
+		{
+			oldText,
+			newText,
+			...(start !== undefined ? { oldStart: start, newStart: start } : {}),
+			cut: hasTruncatedLeaf(metadata?.diffBefore) || hasTruncatedLeaf(metadata?.diffAfter),
+		},
+	];
+}
+
+/**
+ * One hunk as its own diff body.
+ *
+ * The first hunk keeps the `output.main` source so the result slot (fullscreen viewer,
+ * copy, the reader's payload fetch) still resolves to the tool's primary body; the rest
+ * get `output.hunk.N`. Each is a separate section so each sizes to its own rows under
+ * the shared diff cap instead of one box sized for the distance between edits.
+ */
+function diffHunkSection(
+	hunk: StructureEditHunk,
+	index: number,
+	total: number,
+	outputJson: unknown,
+	output: string,
+	filePath: string | undefined,
+): ToolDetailSection | null {
+	const diffDocument = createDiffDocument({
+		oldText: hunk.oldText,
+		newText: hunk.newText,
+		focusSide: "new",
+		...(hunk.oldStart !== undefined ? { startLine: hunk.oldStart } : {}),
+		...(hunk.newStart !== undefined ? { newStartLine: hunk.newStart } : {}),
+	});
+	const source: ToolBodySource = index === 0 ? "output.main" : `output.hunk.${index}`;
+	return textSection(source, outputJson, index === 0 ? "output" : undefined, {
+		cap: "diff",
+		format: "diff",
+		diffDocument,
+		revision: diffDocument.revision,
+		// The body's copy/fullscreen text. The tool's summary line belongs to the first hunk
+		// only; later hunks carry their own new side so copying one yields that region.
+		text: index === 0 && total === 1 ? output : hunk.newText,
+		followTarget: { kind: "diff-row", focus: diffDocument.focus },
+		textTruncated: hunk.cut || diffDocument.truncated,
+		...(filePath ? { codeLangPath: filePath } : {}),
+	});
 }
 
 /** `L12-40`-style chip from the resolved range the tool reports. */

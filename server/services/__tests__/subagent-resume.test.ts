@@ -25,6 +25,15 @@ const unknownOriginIds = new Set<string>();
 const mismatchedMarkerIds = new Set<string>();
 const databaseNarratorIds = new Set<string>();
 const announcements: unknown[] = [];
+// Fixture mailbox heads consumed by a mailbox wake, and who consumed them.
+const queuedMailboxInputs: string[] = [];
+const mailboxConsumeCalls: string[] = [];
+/**
+ * One-shot hook run inside the resume preparation window (after the manual-override
+ * claim, before the mailbox head is consumed). Used to park a `pendingTerminal` on
+ * the claimed entry mid-resume without racing the real timer.
+ */
+let duringPrepare: (() => void) | undefined;
 let realConclusionResolver: typeof import("../narrator-persistence").narratorPersistence.resolveSubagentConclusionReference;
 let realResolverChild: ReturnType<typeof makeNarrator> | null = null;
 let realResolverOriginal: Record<string, unknown> | null = null;
@@ -170,6 +179,10 @@ beforeAll(async () => {
 		narratorService: {
 			...realNarratorService,
 			getById: mock(async (id: string) => {
+				// Persistent until it observes a claimed entry: getById runs before the
+				// manual-override claim as well, and an abort that early settles the
+				// waiting entry (no pendingTerminal) instead of parking a terminal on it.
+				if (duringPrepare) duringPrepare();
 				if (id === parentNarratorId)
 					return {
 						...makeNarrator(id),
@@ -282,6 +295,21 @@ beforeAll(async () => {
 			history: [{ role: "user", content: "history" }],
 			trailingToolResults: loadedTrailingToolResults,
 		})),
+		// Stands in for the mailbox head: a mailbox wake consumes this row instead of
+		// persisting its own prompt. Each call drains one queued fixture entry.
+		consumeNextBufferedSubagentMessage: mock(async (opts: { narratorId: string }) => {
+			mailboxConsumeCalls.push(opts.narratorId);
+			const next = queuedMailboxInputs.shift();
+			return next
+				? {
+						prompt: next,
+						currentInput: next,
+						history: [{ role: "user", content: "history" }],
+						trailingToolResults: [],
+						userId: "mailbox-user",
+					}
+				: null;
+		}),
 	}));
 	realModules["../subagent-executor"] = () => realSubagentExecutor;
 
@@ -612,6 +640,9 @@ afterEach(async () => {
 	mismatchedMarkerIds.clear();
 	databaseNarratorIds.clear();
 	announcements.length = 0;
+	queuedMailboxInputs.length = 0;
+	mailboxConsumeCalls.length = 0;
+	duringPrepare = undefined;
 	realResolverChild = null;
 	realResolverOriginal = null;
 	clearManualOverrideRuntimes();
@@ -1411,6 +1442,97 @@ describe("resumeSubagent", () => {
 		expect(conclusionCalls).toHaveLength(0);
 		expect(announcements).toHaveLength(1);
 		expect(hasActiveSubagentResumeRun(subagentId)).toBe(false);
+	});
+
+	test("a parent Send wakes a suspended (taken-over) runner by consuming its mailbox row once", async () => {
+		// The parent's message is already accepted in the mailbox. Waking the suspended
+		// runner must consume THAT row, not persist `prompt` as a second copy: the old
+		// path wrote the message now and again when the queue drained on the next turn.
+		const subagentId = "mailbox-wake-suspended";
+		const waiting = waitForManualOverride(
+			subagentId,
+			new AbortController().signal,
+			parentNarratorId,
+			originToolUseId,
+		);
+		queuedMailboxInputs.push("[Message from the parent narrator]\nplease also check X");
+		const result = await resumeSubagent({
+			subagentId,
+			intent: "follow_up",
+			actor: "parent_agent",
+			mailboxInput: true,
+			prompt: "[Message from the parent narrator]\nplease also check X",
+			locale: "en",
+		});
+		expect(result.resumedSuspendedRunner).toBe(true);
+		expect(startCalls).toHaveLength(0);
+		expect(persistedCalls).toHaveLength(0);
+		expect(mailboxConsumeCalls).toEqual([subagentId]);
+		await expect(waiting).resolves.toMatchObject({
+			action: "resume",
+			prompt: "[Message from the parent narrator]\nplease also check X",
+			userId: "mailbox-user",
+		});
+	});
+
+	test("a terminal that fired before consume leaves the mailbox row queued", async () => {
+		// Timeout / parent-abort settles the claim with a terminal. That must not take
+		// the mailbox row with it: checking only AFTER consume dropped the queued
+		// message, and releaseManualOverrideClaim restores the claim — not the message.
+		const subagentId = "mailbox-wake-terminal-wins";
+		const ac = new AbortController();
+		const waiting = waitForManualOverride(subagentId, ac.signal, parentNarratorId, originToolUseId);
+		queuedMailboxInputs.push("[Message from the parent narrator]\nlater work");
+		// Aborts only once the manual-override claim is held (prepareResumeTurn's getById):
+		// recordTerminal then parks a pendingTerminal on the claimed entry instead of
+		// settling the still-waiting one.
+		const { getManualOverrideRuntime } = await import("../subagent-manual-override");
+		duringPrepare = () => {
+			if (getManualOverrideRuntime(subagentId)?.phase !== "claimed") return;
+			duringPrepare = undefined;
+			ac.abort();
+		};
+		await expect(
+			resumeSubagent({
+				subagentId,
+				intent: "follow_up",
+				actor: "parent_agent",
+				mailboxInput: true,
+				prompt: "[Message from the parent narrator]\nlater work",
+				locale: "en",
+			}),
+		).rejects.toThrow("Subagent suspension ended while the resume was preparing");
+		expect(mailboxConsumeCalls).toEqual([]);
+		expect(queuedMailboxInputs).toEqual(["[Message from the parent narrator]\nlater work"]);
+		await expect(waiting).resolves.toMatchObject({
+			action: "finish",
+			finalText: "Parent narrator interrupted",
+		});
+	});
+
+	test("a mailbox wake with no queued head leaves the suspended runner waiting", async () => {
+		const subagentId = "mailbox-wake-empty";
+		const waiting = waitForManualOverride(
+			subagentId,
+			new AbortController().signal,
+			parentNarratorId,
+			originToolUseId,
+		);
+		await expect(
+			resumeSubagent({
+				subagentId,
+				intent: "follow_up",
+				actor: "parent_agent",
+				mailboxInput: true,
+				locale: "en",
+			}),
+		).rejects.toThrow("Mailbox head is not available");
+		// Released back to waiting, so a later real input can still resume it.
+		expect(
+			(await import("../subagent-manual-override")).getManualOverrideRuntime(subagentId)?.phase,
+		).toBe("waiting");
+		clearManualOverrideRuntimes();
+		await expect(waiting).resolves.toMatchObject({ action: "finish" });
 	});
 
 	test("resumes a suspended original runner instead of starting another engine", async () => {

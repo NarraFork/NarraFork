@@ -972,3 +972,62 @@ test.each([
 		sendSpy.mockRestore();
 	}
 });
+
+test("a nested request on a busy session runs on an ephemeral socket without touching the parent chain", async () => {
+	// Reflection gates run a nested request under the SAME sticky key while the
+	// parent stream is suspended mid-response holding the cached socket. That used
+	// to throw "session is already in use" and auto-cancel every danger reflection.
+	activeServer = startServer(({ requestIndex, body, send }) => {
+		const input = body.input as Array<{ content: Array<{ text: string }> }>;
+		const text = input.at(-1)?.content[0]?.text ?? "";
+		for (const frame of completedFrames(`resp-${requestIndex}`, `echo:${text}`)) send(frame);
+	});
+	const server = activeServer;
+	const stream = (input: string[]) =>
+		streamCodexResponsesWebSocket({
+			baseUrl: server.baseUrl,
+			apiKey: "sk-test",
+			sessionKey: "narrator-1",
+			conversationId: "conv-1",
+			credentialId: "cred-1",
+			model: "gpt-5.3-codex",
+			request: {
+				model: "gpt-5.3-codex",
+				input: input.map(userMessage) as never,
+				stream: true,
+				instructions: "base",
+			},
+			signal: new AbortController().signal,
+		});
+
+	// Parent: suspend right after the first delta, while the session is busy.
+	const parent = stream(["hello"]);
+	const firstParentEvents: ParsedStreamEvent[] = [];
+	for (;;) {
+		const next = await parent.next();
+		if (next.done) throw new Error("parent ended early");
+		firstParentEvents.push(next.value);
+		if (next.value.text) break;
+	}
+
+	const nested: ParsedStreamEvent[] = [];
+	for await (const event of stream(["reflect"])) nested.push(event);
+	expect(collectText(nested)).toBe("echo:reflect");
+	expect(server.connectionCount()).toBe(2);
+	expect(server.requests[1]?.connectionIndex).toBe(1);
+	expect(server.requests[1]?.body.previous_response_id).toBeUndefined();
+
+	const restParentEvents: ParsedStreamEvent[] = [];
+	for await (const event of parent) {
+		restParentEvents.push(event);
+	}
+	expect(collectText([...firstParentEvents, ...restParentEvents])).toBe("echo:hello");
+
+	// The parent's cached chain survived: the next turn continues on socket 0.
+	const follow: ParsedStreamEvent[] = [];
+	for await (const event of stream(["hello", "again"])) follow.push(event);
+	expect(collectText(follow)).toBe("echo:again");
+	expect(server.requests[2]?.connectionIndex).toBe(0);
+	expect(server.requests[2]?.body.previous_response_id).toBe("resp-0");
+	expect(server.connectionCount()).toBe(2);
+});

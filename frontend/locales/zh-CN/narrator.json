@@ -1209,6 +1209,7 @@
 	"fileMod_previewLoading": "正在计算修改内容…",
 	"fileMod_previewFailed": "无法预览此修改：{{error}}",
 	"fileMod_diffTooLarge": "修改范围过大，无法内联显示，请在面板中审查。",
+	"fileMod_diffHunksOmitted": "另有 {{count}} 处修改未显示，请在面板中审查。",
 	"fileMod_approvalTitle": "等待审批",
 	"fileMod_fullFilePreview": "完整文件（变更后）",
 	"fileMod_noChanges": "无变更",

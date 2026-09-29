@@ -81,6 +81,12 @@ export interface DiffDocument {
 	totalRows: number;
 	/** Defined only when the file origin was provided by the caller. */
 	startLine?: number;
+	/**
+	 * New-side origin when it differs from the old side's (`startLine`). A hunk that sits
+	 * after an earlier insertion or removal starts at different lines on each side; one
+	 * shared origin would misnumber every row of it. Absent = same as `startLine`.
+	 */
+	newStartLine?: number;
 	/** Missing source data / bounded calculation; NOT a viewport's row limit. */
 	truncated: boolean;
 	omission: "source-range" | "input-budget" | "diff-budget" | null;
@@ -93,6 +99,8 @@ export interface DiffDocumentInput {
 	newRange?: SourceTextRange;
 	focusSide?: "old" | "new";
 	startLine?: number;
+	/** New-side origin; defaults to `startLine`. See `DiffDocument.newStartLine`. */
+	newStartLine?: number;
 }
 
 export interface DiffProjection {
@@ -287,6 +295,7 @@ function diffDocumentRevision(
 			range(doc.oldSource.range),
 			range(doc.newSource.range),
 			doc.startLine ?? null,
+			doc.newStartLine ?? null,
 			focusSide ?? null,
 			doc.focus,
 			doc.omission,
@@ -301,13 +310,32 @@ function hasMissingSource(range: SourceTextRange): boolean {
 	return !range.complete && !(range.streaming && range.originKnown && range.startOffset === 0);
 }
 
+/** Cache-key component for both origins; `startLine`-only callers keep their old key. */
+function originKey(input: DiffDocumentInput): string | number {
+	const start = input.startLine ?? 0;
+	return input.newStartLine === undefined || input.newStartLine === input.startLine
+		? start
+		: `${start}/${input.newStartLine}`;
+}
+
+/**
+ * 1-based file line of a side's first retained line, or 1 when the origin is unknown.
+ * The one place both sides' numbering is decided, so the gutter width and the painted
+ * numbers cannot disagree.
+ */
+function sideOrigin(doc: DiffDocument, side: "old" | "new"): number {
+	const source = side === "old" ? doc.oldSource : doc.newSource;
+	if (doc.startLine === undefined || !source.range.originKnown) return 1;
+	return side === "new" ? (doc.newStartLine ?? doc.startLine) : doc.startLine;
+}
+
 /** One bounded source model, shared by inline and fullscreen; no viewport state. */
 export function createDiffDocument(input: DiffDocumentInput): DiffDocument {
 	// The usual hit samples a bounded key and confirms exact strings BEFORE scanning
 	// coordinates/normalizing. Oversized original strings are never retained here.
 	const rawKey =
 		input.oldText.length + input.newText.length <= MAX_DIFF_INPUT_CHARS
-			? `raw:${diffCacheKey(input.oldText, input.newText, input.startLine ?? 0)}\u0000${JSON.stringify([input.oldRange, input.newRange, input.focusSide])}`
+			? `raw:${diffCacheKey(input.oldText, input.newText, originKey(input))}\u0000${JSON.stringify([input.oldRange, input.newRange, input.focusSide])}`
 			: null;
 	const rawHit = rawKey === null ? undefined : documentCache.get(rawKey);
 	if (rawKey !== null && rawHit?.oldText === input.oldText && rawHit.newText === input.newText) {
@@ -322,7 +350,7 @@ export function createDiffDocument(input: DiffDocumentInput): DiffDocument {
 	const newSource = sourceSnapshot(input.newText, input.newRange, newLimit);
 	const key =
 		rawKey ??
-		`bounded:${diffCacheKey(oldSource.text, newSource.text, input.startLine ?? 0)}\u0000${JSON.stringify([oldSource.range, newSource.range, input.focusSide])}`;
+		`bounded:${diffCacheKey(oldSource.text, newSource.text, originKey(input))}\u0000${JSON.stringify([oldSource.range, newSource.range, input.focusSide])}`;
 	const hit = documentCache.get(key);
 	if (!rawKey && hit?.oldText === oldSource.text && hit.newText === newSource.text) {
 		documentCache.delete(key);
@@ -380,6 +408,9 @@ export function createDiffDocument(input: DiffDocumentInput): DiffDocument {
 		runs,
 		totalRows,
 		startLine: input.startLine,
+		...(input.newStartLine !== undefined && input.newStartLine !== input.startLine
+			? { newStartLine: input.newStartLine }
+			: {}),
 		truncated: omission !== null,
 		omission,
 	};
@@ -440,8 +471,7 @@ function rowPoints(doc: DiffDocument, row: number) {
 	if (!run || row < 0 || row >= doc.totalRows) return null;
 	const relative = row - run.startRow;
 	const index = run.type === "paired" ? relative % run.count : relative;
-	const type =
-		run.type === "paired" ? (relative < run.count ? "removed" : "added") : run.type;
+	const type = run.type === "paired" ? (relative < run.count ? "removed" : "added") : run.type;
 	return {
 		run,
 		index,
@@ -487,9 +517,12 @@ export function diffDocumentLineNoWidth(
 	minWidth = DIFF_LINE_NO_MIN_WIDTH,
 ): number {
 	let max = 1;
-	for (const source of [doc.oldSource, doc.newSource]) {
-		const base = doc.startLine !== undefined && source.range.originKnown ? doc.startLine : 1;
-		max = Math.max(max, source.range.startLine + Math.max(0, source.lineStarts.length - 1) + base);
+	for (const side of ["old", "new"] as const) {
+		const source = side === "old" ? doc.oldSource : doc.newSource;
+		max = Math.max(
+			max,
+			source.range.startLine + Math.max(0, source.lineStarts.length - 1) + sideOrigin(doc, side),
+		);
 	}
 	return Math.max(minWidth, `${lineNumberPrefix ?? ""}${max}`.length);
 }
@@ -550,9 +583,7 @@ export function resolveDiffSourcePoint(
 	const inRun = index - run[sideStart];
 	const row =
 		run.startRow +
-		(run.type === "paired"
-			? (point.side === "old" ? inRun : run.count + inRun)
-			: inRun);
+		(run.type === "paired" ? (point.side === "old" ? inRun : run.count + inRun) : inRun);
 	return { row, point: resolved, lost, reason: lost ? "range" : null };
 }
 
@@ -599,10 +630,8 @@ export function projectDiffDocument(
 		}
 		const point = newPoint ?? oldPoint;
 		if (!point) continue;
-		const number = (p: DiffSourcePoint | undefined, source: DiffSourceSnapshot) =>
-			p
-				? p.line + (doc.startLine !== undefined && source.range.originKnown ? doc.startLine : 1)
-				: undefined;
+		const number = (p: DiffSourcePoint | undefined, side: "old" | "new") =>
+			p ? p.line + sideOrigin(doc, side) : undefined;
 		lines.push({
 			type,
 			content: clampLineContent(
@@ -612,8 +641,8 @@ export function projectDiffDocument(
 				),
 			),
 			wordChanges,
-			oldLineNo: number(oldPoint, doc.oldSource),
-			newLineNo: number(newPoint, doc.newSource),
+			oldLineNo: number(oldPoint, "old"),
+			newLineNo: number(newPoint, "new"),
 			key: `${point.side}:${point.epoch}:${point.line}`,
 			oldPoint,
 			newPoint,
@@ -679,7 +708,7 @@ function sampleForKey(value: string): string {
 	);
 }
 
-function diffCacheKey(oldStr: string, newStr: string, startLine: number): string {
+function diffCacheKey(oldStr: string, newStr: string, startLine: number | string): string {
 	return `${startLine}\u0000${oldStr.length}\u0000${newStr.length}\u0000${sampleForKey(oldStr)}\u0000${sampleForKey(newStr)}`;
 }
 

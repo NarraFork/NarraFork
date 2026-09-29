@@ -226,6 +226,46 @@ describe("application data directory permissions", () => {
 	});
 
 	test.skipIf(!posix)(
+		"Windows accepts a healthy directory reached through a junction-like alias",
+		async () => {
+			// Windows user profiles, OneDrive and subst drives routinely name the same
+			// directory through a reparse point. POSIX refuses the alias; Windows must
+			// secure the real target instead of reporting a false permission fault.
+			const alias = join(root, "alias");
+			await fs.symlink(data, alias);
+			const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+			Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+			restorers.push(() => {
+				if (descriptor) Object.defineProperty(process, "platform", descriptor);
+			});
+			expect(await inspectApplicationDataDirectory(alias)).toEqual({
+				status: "ok",
+				canRepair: false,
+			});
+			expect(await requireApplicationDataDirectory(alias)).toBeString();
+			expect(await requireApplicationDataDirectory(alias)).toBe(
+				await requireApplicationDataDirectory(data),
+			);
+		},
+	);
+
+	test.skipIf(!posix)(
+		"Windows missing path is unavailable, not a false permission fault",
+		async () => {
+			const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+			Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+			restorers.push(() => {
+				if (descriptor) Object.defineProperty(process, "platform", descriptor);
+			});
+			const missing = join(root, "missing");
+			expect(await inspectApplicationDataDirectory(missing)).toMatchObject({
+				status: "unavailable",
+				canRepair: false,
+			});
+		},
+	);
+
+	test.skipIf(!posix)(
 		"rechecks authorization immediately before changing permissions",
 		async () => {
 			await fs.chmod(data, 0o777);

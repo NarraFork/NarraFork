@@ -5657,6 +5657,26 @@ function pendingPermissionInputForReprocess(pending: PendingPermission): Record<
 	return { ...pending.input, plan_file_path: pending.planSource.path };
 }
 
+function broadcastReprocessedPermissionDecision(
+	requestId: string,
+	pending: PendingPermission,
+	result: PermissionResult,
+): void {
+	if (result.behavior === "dangerReflection") return;
+	broadcastToNarrator(pending.broadcastTargetId, {
+		type: "permission_resolved",
+		narratorId: pending.broadcastTargetId,
+		requestId,
+		toolUseId: pending.toolUseId,
+		decision: result.behavior === "allow" ? "allow" : "deny",
+		...(result.behavior === "allow" && result.updatedInput
+			? { updatedInput: result.updatedInput }
+			: {}),
+		...(result.behavior === "deny" && result.message ? { feedbackText: result.message } : {}),
+		...pendingPermissionRoutingIdentity(pending),
+	});
+}
+
 async function failReprocessedPendingPermission(
 	requestId: string,
 	pending: PendingPermission,
@@ -5758,6 +5778,7 @@ export function reprocessAllPendingPermissions(narratorId: string): number {
 			originalContext?.reviewReadOnlyBash,
 		)
 			.then(async (result) => {
+				broadcastReprocessedPermissionDecision(requestId, pending, result);
 				if (result.behavior !== "dangerReflection") {
 					await restoreReprocessedPermissionStatus(pending);
 				} else {

@@ -112,9 +112,11 @@ export function DataDirectorySecurityCheckButton() {
 											? "dataDirectorySecurity.inconclusive"
 											: status === "ok"
 												? "dataDirectorySecurity.healthy"
-												: faulty
-													? "dataDirectorySecurity.description"
-													: "dataDirectorySecurity.checking",
+												: status === "unavailable"
+													? "dataDirectorySecurity.unavailable"
+													: faulty
+														? "dataDirectorySecurity.description"
+														: "dataDirectorySecurity.checking",
 							)}
 						</Text>
 						{faulty && (
@@ -133,7 +135,9 @@ export function DataDirectorySecurityCheckButton() {
 							</Text>
 						)}
 						{details && (
-							<details>
+							// Expand by default once the operator is already stuck: the code
+							// and path are what a Windows admin needs before trying anything else.
+							<details open={faulty && !query.data?.canRepair}>
 								<summary>{t("dataDirectorySecurity.details")}</summary>
 								<Code block style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
 									{[

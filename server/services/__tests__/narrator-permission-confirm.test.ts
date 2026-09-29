@@ -805,6 +805,14 @@ describe("pending permission execution identity", () => {
 
 			expect(await permissionPromise).toMatchObject({ behavior: "allow" });
 			expect(pendingPermissions.has(toolCall)).toBe(false);
+			expect(
+				events.find((event) => event.type === "permission_resolved" && event.decision === "allow"),
+			).toMatchObject({
+				type: "permission_resolved",
+				requestId: toolCall,
+				toolUseId: toolUse,
+				decision: "allow",
+			});
 		} finally {
 			controller.abort();
 		}

@@ -11,6 +11,7 @@ import {
 	issueServerCert,
 	MAX_CUSTOM_SANS,
 	regenerateCa,
+	saveCustomSans,
 } from "../lib/tls";
 
 import { requireAdmin } from "../middleware/auth";
@@ -49,6 +50,17 @@ export const tlsRoutes = new Hono()
 				"Content-Disposition": 'attachment; filename="narrafork-ca.pem"',
 			},
 		});
+	})
+
+	// Persist the SAN list without re-issuing, so edits survive a page reload
+	// even before the admin re-issues the certificate.
+	.put("/sans", requireAdmin, async (c) => {
+		const body = await c.req.json().catch(() => ({}));
+		const parsed = generateSchema.safeParse(body);
+		if (!parsed.success || parsed.data.customSans === undefined) {
+			throw new ValidationError(parsed.success ? "customSans is required" : parsed.error.message);
+		}
+		return c.json({ customSans: saveCustomSans(parsed.data.customSans) });
 	})
 
 	// One-shot setup / re-issue: validate SANs, ensure CA, issue (or re-issue)

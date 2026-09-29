@@ -190,6 +190,7 @@ import {
 	consumeNextBufferedSubagentMessage,
 	readSubagentSpecContinuationState,
 	shouldStopSubagentForBufferedMessageSync,
+	subagentRetryRecoveredBroadcast,
 } from "../subagent-executor";
 import {
 	getConclusionWatcher,
@@ -454,6 +455,46 @@ export async function runAgentLoopUnlocked(
 		});
 		return content;
 	};
+
+	/**
+	 * Route a stopped foreground-subagent turn into its control transition.
+	 *
+	 * A stop can land at ANY await of a pass — while streaming, but equally during a
+	 * transient-retry backoff, a model-availability wait, or the turn-end bookkeeping.
+	 * Only the check right after `executeAgentLoop` used to consult the control channel;
+	 * every other abort exit broke out of the loop, the runner then cleared the takeover
+	 * and handed a result to the blocked parent. For a taken-over subagent that turned
+	 * "stop this turn" into "end the takeover", depending on when the click landed.
+	 *
+	 * Returns what the caller must do next, or undefined to keep its own abort exit
+	 * (ordinary subagents, parent/timeout/detach aborts, primaries).
+	 */
+	const applyInterruptedTurnControl = async (
+		pass: ExecuteLoopResult,
+	): Promise<"continue" | "break" | undefined> => {
+		if (profile.kind !== "subagent" || !isForegroundTurnInterrupted(active, profile)) return;
+		const control = await applyForegroundControl(active, owner, profile, pass);
+		if (control.kind === "resume") {
+			resetForegroundTurn(active, profile);
+			runState.input.text = control.prompt;
+			runState.pendingPrePromptBashCommand = control.prePromptBashCommand;
+			active._currentUserId = control.userId;
+			runState.hadError = false;
+			runState.wasInterrupted = false;
+			return "continue";
+		}
+		if (control.kind === "finish") {
+			runState.finalText = control.finalText;
+			runState.hadError = control.hasError;
+			runState.wasInterrupted = control.interrupted;
+			return "break";
+		}
+	};
+	/** The pass shape handed to control when a stop lands outside a model pass. */
+	const abortedPass = (pass?: ExecuteLoopResult): ExecuteLoopResult => ({
+		...(pass ?? { finalText: runState.finalText, hasError: false, shouldUpdateTitle: false }),
+		aborted: true,
+	});
 
 	try {
 		while (active.alive && owner.isCurrent()) {
@@ -1527,7 +1568,7 @@ export async function runAgentLoopUnlocked(
 			 */
 			const suspendUntilModelRecovered = async (
 				mu: Omit<NonNullable<ExecuteLoopResult["modelUnavailable"]>, "provider">,
-			): Promise<boolean> => {
+			): Promise<boolean | "interrupted"> => {
 				// Finalize or clean up the partial message from the failed turn.
 				// If tools already ran (side effects), keep it so the rebuilt history
 				// includes them; otherwise it is deleted so the resume starts fresh.
@@ -1601,6 +1642,10 @@ export async function runAgentLoopUnlocked(
 
 				if (!active.alive || !owner.isCurrent()) return false;
 				if (active.abortController.signal.aborted || outcome === "aborted") {
+					// A stopped turn of a taken-over subagent goes back to its control
+					// transition (re-suspend in taken_over) instead of ending the run.
+					if (profile.kind === "subagent" && isForegroundTurnInterrupted(active, profile))
+						return "interrupted";
 					await finalizeInterruptedRun(active, narratorId, undefined);
 					runState.wasInterrupted = true;
 					return false;
@@ -1658,6 +1703,14 @@ export async function runAgentLoopUnlocked(
 						providerPrefix: known.providerPrefix,
 						nugModelId: known.nugModelId,
 					});
+					if (resumed === "interrupted") {
+						const next = await applyInterruptedTurnControl(abortedPass());
+						if (next === "continue") continue;
+						if (next === "break") break;
+						await finalizeInterruptedRun(active, narratorId, undefined);
+						runState.wasInterrupted = true;
+						break;
+					}
 					if (!resumed) break;
 					// Re-resolve from the loop top: the user may have switched models
 					// while this turn was suspended.
@@ -1738,23 +1791,10 @@ export async function runAgentLoopUnlocked(
 			// abort of the session controller on a taken-over subagent (Stop route, plugin
 			// API) never touches turnAbort, and falling through to the generic abort exit
 			// below would end the takeover and settle the parent's blocked tool call.
-			if (profile.kind === "subagent" && isForegroundTurnInterrupted(active, profile)) {
-				const control = await applyForegroundControl(active, owner, profile, result);
-				if (control.kind === "resume") {
-					resetForegroundTurn(active, profile);
-					runState.input.text = control.prompt;
-					runState.pendingPrePromptBashCommand = control.prePromptBashCommand;
-					active._currentUserId = control.userId;
-					runState.hadError = false;
-					runState.wasInterrupted = false;
-					continue;
-				}
-				if (control.kind === "finish") {
-					runState.finalText = control.finalText;
-					runState.hadError = control.hasError;
-					runState.wasInterrupted = control.interrupted;
-					break;
-				}
+			{
+				const next = await applyInterruptedTurnControl(result);
+				if (next === "continue") continue;
+				if (next === "break") break;
 			}
 			const recoveryState = runState.recovery;
 			const recovery = selectRuntimeRecovery(recoveryState, {
@@ -1891,6 +1931,14 @@ export async function runAgentLoopUnlocked(
 				}
 				if (quotaResumeAt) runState.recovery.quotaWaits += 1;
 				const resumed = await suspendUntilModelRecovered(mu);
+				if (resumed === "interrupted") {
+					const next = await applyInterruptedTurnControl(abortedPass(result));
+					if (next === "continue") continue;
+					if (next === "break") break;
+					await finalizeInterruptedRun(active, narratorId, undefined);
+					runState.wasInterrupted = true;
+					break;
+				}
 				if (!resumed) break;
 				runState.recovery.transientRetries = 0;
 				continue;
@@ -1970,6 +2018,10 @@ export async function runAgentLoopUnlocked(
 				});
 				runState.recovery.transientRetries = recoveryState.transientRetries;
 				if (outcome.kind === "aborted") {
+					// Stopped during the retry backoff: a taken-over subagent re-suspends.
+					const next = await applyInterruptedTurnControl(abortedPass(result));
+					if (next === "continue") continue;
+					if (next === "break") break;
 					const partialId = active._partialMessageId;
 					active._partialMessageId = undefined;
 					await finalizeInterruptedRun(active, narratorId, partialId);
@@ -2032,6 +2084,22 @@ export async function runAgentLoopUnlocked(
 				break;
 			}
 
+			// A successful pass right after transient retries: tell the parent panel
+			// the subagent has recovered, so its stale "retry N/M" badge clears now
+			// instead of lingering for the whole remaining run (the parent only
+			// clears `_retryInfo` on `subagent_status_changed` /
+			// `subagent_conclusion_updated`, and an already-working subagent emits
+			// neither mid-run). Returns null when no retry preceded this pass.
+			if (subagentPlacement) {
+				const retryRecovered = subagentRetryRecoveredBroadcast(
+					runState.recovery.transientRetries,
+					subagentPlacement.parentNarratorId,
+					narratorId,
+				);
+				if (retryRecovered) {
+					broadcastToNarrator(subagentPlacement.parentNarratorId, retryRecovered);
+				}
+			}
 			// Reset transient retry counter on success or after a non-retried silent disconnect.
 			runState.recovery.transientRetries = 0;
 
@@ -2189,6 +2257,10 @@ export async function runAgentLoopUnlocked(
 			// the interrupted state, causing pending-permission aborts to incorrectly
 			// continue into buffered-message / done handling.
 			if (result.aborted || active.abortController.signal.aborted) {
+				// The stop may have landed during the awaits since the pass returned.
+				const next = await applyInterruptedTurnControl(abortedPass(result));
+				if (next === "continue") continue;
+				if (next === "break") break;
 				const partialId = active._partialMessageId;
 				active._partialMessageId = undefined;
 				await finalizeInterruptedRun(active, narratorId, partialId);

@@ -192,27 +192,29 @@ bun run dev -- --wsl=true
 
 ---
 
-## 5. WSL 禁止（--wsl=false，默认）
+## 5. 默认 shell 不用 WSL bash（--wsl=false，默认）
 
-### 5.1 AI 不建议 WSL
+> 这是**运行时 shell 选择**行为，不是 system prompt 禁令。AI 可以讨论 WSL，但 Bash 工具默认不会通过 WSL bash 执行。
+
+### 5.1 默认 shell 检测
 
 ```
-我在 Windows 上遇到了一个 shell 脚本执行问题，有什么解决方案？
+运行 echo hello 看看输出
 ```
 
 检查点：
-- [ ] AI 不建议 "切换到 WSL" 或 "在 WSL 中运行"
-- [ ] AI 给出 Windows 原生解决方案（Git Bash / PowerShell）
+- [ ] 日志/调试信息中 shell 不是 `C:\Windows\System32\bash.exe`
+- [ ] 实际 shell 是 Git Bash（`…\Git\…\bash.exe`）或 PowerShell
 
-### 5.2 直接问 WSL
+### 5.2 用户问 WSL（不设禁区）
 
 ```
 我能不能用 WSL 来运行这个项目？
 ```
 
 检查点：
-- [ ] AI 明确表示当前环境不使用 WSL
-- [ ] 不提供 WSL 安装或配置指导
+- [ ] AI 可以正常回答、给出建议（允许讨论 WSL）
+- [ ] 若执行命令，仍走当前默认 shell（Git Bash / PowerShell），除非用户显式要求 `wsl.exe …`
 
 ### 5.3 Linux 命令适配
 
@@ -223,23 +225,22 @@ bun run dev -- --wsl=true
 检查点：
 - [ ] AI 使用 Grep 工具（而非 shell grep）
 - [ ] 或者使用 `rg`（ripgrep）而非 Linux grep
-- [ ] 不建议 "在 WSL 中运行 grep"
 
 ---
 
-## 6. WSL 允许（--wsl=true）
+## 6. 允许 WSL bash 作为默认 shell（--wsl=true）
 
 > 重启服务器：`bun run dev -- --wsl=true`
 
-### 6.1 WSL 建议不被阻止
+### 6.1 shell 选择
 
 ```
-我想在 Linux 环境下运行一些脚本，有什么建议？
+运行 echo hello 看看输出
 ```
 
 检查点：
-- [ ] system prompt 中没有 WSL 禁止指令
-- [ ] AI 可以自由建议 WSL（如果合适的话）
+- [ ] 若机器上只有 WSL bash 可用，Bash 工具会用它执行（而非硬落到 PowerShell）
+- [ ] system prompt 中仍然没有 WSL 禁止指令（禁令已删除，与本开关无关）
 
 ---
 

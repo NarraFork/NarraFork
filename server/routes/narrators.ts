@@ -6689,7 +6689,8 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
 			filePath: outcome.preview.filePath,
 			currentContent: outcome.preview.before,
 			previewContent: outcome.preview.after,
-			diffWindow: outcome.window,
+			diffHunks: outcome.diff?.hunks ?? [],
+			...(outcome.diff?.omittedHunks ? { diffOmittedHunks: outcome.diff.omittedHunks } : {}),
 			toolName: toolCall.toolName,
 			inputJson: toolCall.inputJson,
 		});

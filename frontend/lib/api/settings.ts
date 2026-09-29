@@ -155,6 +155,11 @@ export const settingsApi = {
 			customSans: string[];
 			autoSans: string[];
 		}>("/settings/tls/status"),
+	saveTlsSans: (customSans: string[]) =>
+		request<{ customSans: string[] }>("/settings/tls/sans", {
+			method: "PUT",
+			body: JSON.stringify({ customSans }),
+		}),
 	generateTlsWithCa: (customSans?: string[]) =>
 		request<{
 			certPath: string;

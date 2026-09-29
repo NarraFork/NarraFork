@@ -22,6 +22,8 @@ interface DiffViewProps {
 	wordWrap?: boolean;
 	language?: string;
 	startLine?: number;
+	/** New-side origin when it differs from `startLine` (a hunk after an earlier edit). */
+	newStartLine?: number;
 	lineNumberPrefix?: string;
 	gutterMinWidth?: number;
 	onNearBottom?: () => void;
@@ -38,6 +40,7 @@ export const DiffView = memo(function DiffView({
 	wordWrap = false,
 	language,
 	startLine,
+	newStartLine,
 	lineNumberPrefix,
 	gutterMinWidth,
 	onNearBottom,
@@ -47,8 +50,13 @@ export const DiffView = memo(function DiffView({
 		() =>
 			lines
 				? undefined
-				: createDiffDocument({ oldText: oldStr ?? "", newText: newStr ?? "", startLine }),
-		[lines, oldStr, newStr, startLine],
+				: createDiffDocument({
+						oldText: oldStr ?? "",
+						newText: newStr ?? "",
+						startLine,
+						...(newStartLine !== undefined ? { newStartLine } : {}),
+					}),
+		[lines, oldStr, newStr, startLine, newStartLine],
 	);
 	return (
 		<AutoFollowScroll

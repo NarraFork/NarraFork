@@ -136,7 +136,34 @@ export function TlsSection({ onCertIssued }: TlsSectionProps) {
 		}
 	};
 
+	// Persist every valid edit immediately: the main settings "Save" button does
+	// not cover SANs (they live in a server-side sidecar), so without this the
+	// list was lost on reload unless the admin also re-issued the certificate.
+	const handleSansChange = async (values: string[]) => {
+		setSanInput(values);
+		if (!validateSans(values)) return;
+		try {
+			await api.saveTlsSans(values.map((s) => s.trim()).filter(Boolean));
+			await invalidateStatus();
+		} catch (err) {
+			setSanError(err instanceof Error ? err.message : t("tlsGenerateError"));
+		}
+	};
+
 	const data = status.data;
+	// Saved names the current certificate does not cover yet → re-issue needed.
+	const certSanSet = new Set((data?.certSans ?? []).map((s) => s.toLowerCase()));
+	const pendingSans = data?.certExists
+		? sanInput.filter((s) => !certSanSet.has(s.trim().toLowerCase()))
+		: [];
+	// Custom names the current cert was issued with = its SANs minus the auto set.
+	// Any difference (added OR removed) from the editor means a re-issue is due.
+	const autoSanSet = new Set((data?.autoSans ?? []).map((s) => s.toLowerCase()));
+	const certCustom = [...certSanSet].filter((s) => !autoSanSet.has(s));
+	const editorSans = new Set(sanInput.map((s) => s.trim().toLowerCase()).filter(Boolean));
+	const sansChanged =
+		!!data?.certExists &&
+		(editorSans.size !== certCustom.length || certCustom.some((s) => !editorSans.has(s)));
 
 	return (
 		<Stack gap="sm">
@@ -167,13 +194,15 @@ export function TlsSection({ onCertIssued }: TlsSectionProps) {
 				description={t("tlsCustomSansDesc")}
 				placeholder={t("tlsCustomSansPlaceholder")}
 				value={sanInput}
-				onChange={(v) => {
-					setSanInput(v);
-					setSanError(null);
-				}}
+				onChange={handleSansChange}
 				error={sanError}
 				clearable
 			/>
+			{pendingSans.length > 0 && (
+				<Text size="xs" c="yellow">
+					{t("tlsSansPendingReissue", { sans: pendingSans.join(", ") })}
+				</Text>
+			)}
 			{data && data.autoSans.length > 0 && (
 				<Text size="xs" c="dimmed">
 					{t("tlsAutoSansNote", { sans: data.autoSans.join(", ") })}
@@ -189,6 +218,12 @@ export function TlsSection({ onCertIssued }: TlsSectionProps) {
 					size="xs"
 					loading={generating}
 					onClick={handleGenerate}
+					data-sans-changed={sansChanged || undefined}
+					style={
+						sansChanged && !generating
+							? { animation: "tlsReissuePulse 1.5s ease infinite" }
+							: undefined
+					}
 				>
 					{generating
 						? t("tlsGenerating")
@@ -236,6 +271,15 @@ export function TlsSection({ onCertIssued }: TlsSectionProps) {
 			<Alert color="yellow" icon={<IconAlertTriangle size={16} />} variant="light" py={6}>
 				{t("tlsGenerateWarning")}
 			</Alert>
+
+			{/* Same pulse as the settings Save button, looped until the cert is re-issued. */}
+			<style>{`
+				@keyframes tlsReissuePulse {
+					0% { box-shadow: 0 0 0 0 var(--mantine-color-green-5); }
+					40% { box-shadow: 0 0 0 10px transparent; }
+					100% { box-shadow: 0 0 0 0 transparent; }
+				}
+			`}</style>
 
 			{/* Regenerate-CA confirmation */}
 			<Modal

@@ -8,7 +8,10 @@ import {
 	getDetachableMap,
 	getForegroundAbortControllers,
 } from "../subagent-detach";
-import { consumeNextBufferedSubagentMessage } from "../subagent-executor";
+import {
+	acceptsBufferedSubagentInput,
+	consumeNextBufferedSubagentMessage,
+} from "../subagent-executor";
 import { resumeManualOverride, waitForManualOverride } from "../subagent-manual-override";
 import {
 	beginSubagentInterruptSuspension,
@@ -130,11 +133,15 @@ export async function applyForegroundControl(
 	);
 	setExecutionSuspended(owner, true);
 	try {
-		// Registration precedes inbox inspection: user input may only settle this control,
+		// Registration precedes inbox inspection: queued input may only settle this control,
 		// never observe a gap and start a second owner.
-		// Team reports and notices do not authorize releasing user control.
+		// User input AND a Send addressed to this subagent both resume it: a message that
+		// arrived while the turn was ending (buffered, because the status still read
+		// `working`) would otherwise sit unread until the user happened to act. Team
+		// reports and task notices do not authorize releasing user control.
+		const head = await peekInbox(id);
 		const queued =
-			(await peekInbox(id))?.kind === "user_input"
+			head && acceptsBufferedSubagentInput(head)
 				? await consumeQueued().catch((error) => {
 						logger.warn("Failed to materialize user input for suspended runtime", {
 							narratorId: id,

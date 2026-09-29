@@ -500,18 +500,22 @@ export async function clearCodexResponsesWebSocketSessions(): Promise<void> {
 	}
 }
 
+function createSessionState(): CachedSession {
+	return {
+		connection: null,
+		disabled: false,
+		lastRequest: null,
+		lastCompleted: null,
+		turnState: null,
+		busy: false,
+		lastUsedAt: Date.now(),
+	};
+}
+
 function getOrCreateSession(key: string): CachedSession {
 	let session = sessionCache.get(key);
 	if (!session) {
-		session = {
-			connection: null,
-			disabled: false,
-			lastRequest: null,
-			lastCompleted: null,
-			turnState: null,
-			busy: false,
-			lastUsedAt: Date.now(),
-		};
+		session = createSessionState();
 		sessionCache.set(key, session);
 		ensureSessionCleanupTimer();
 		void trimCodexResponsesWebSocketSessions();
@@ -1112,12 +1116,24 @@ export async function* streamCodexResponsesWebSocket(
 	options: StreamCodexResponsesWebSocketOptions,
 ): AsyncGenerator<ParsedStreamEvent> {
 	const cacheKey = buildSessionCacheKey(options);
-	const session = getOrCreateSession(cacheKey);
-	if (session.disabled) {
+	const cachedSession = getOrCreateSession(cacheKey);
+	if (cachedSession.disabled) {
 		throw new CodexWebSocketFallbackError("Codex Responses WebSocket is disabled for this session");
 	}
-	if (session.busy) {
-		throw new Error("Codex Responses WebSocket session is already in use");
+	// A nested request under the same sticky key (a danger/plan/task reflection runs while
+	// the parent turn's stream still holds the cached socket, and the parent is blocked on
+	// it) cannot wait for the session: that would deadlock. It also must not share it — one
+	// socket carries one in-flight response, and touching the parent's response chain would
+	// corrupt its `previous_response_id` continuation. Run it on a private, uncached session
+	// instead: a fresh socket, full request, closed when this call ends.
+	const ephemeral = cachedSession.busy;
+	const session = ephemeral ? createSessionState() : cachedSession;
+	if (ephemeral) {
+		logger.info("Codex Responses WebSocket session busy; using an ephemeral connection", {
+			sessionKey: options.sessionKey,
+			credentialId: options.credentialId,
+			model: options.model,
+		});
 	}
 
 	touchSession(session);
@@ -1703,21 +1719,27 @@ export async function* streamCodexResponsesWebSocket(
 		// An early-returning consumer must not leave unread frames for the next request.
 		if (!completed && connection) await discardResponseChain(session);
 		await resetAbortedSessionIfNeeded();
-		session.busy = false;
-		touchSession(session);
-		if (!completed && connection?.isClosed()) {
-			session.connection = null;
-		}
-		const canDiscardSession =
-			!completed &&
-			!session.disabled &&
-			session.connection === null &&
-			session.lastRequest === null &&
-			session.lastCompleted === null &&
-			session.turnState === null;
-		if (canDiscardSession) {
-			sessionCache.delete(cacheKey);
-			stopSessionCleanupTimerIfIdle();
+		if (ephemeral) {
+			// Never cached, so nothing else can reuse this socket: close it now instead of
+			// leaving it for the idle sweeper (which only walks the cache).
+			await closeSessionConnection(session);
+		} else {
+			session.busy = false;
+			touchSession(session);
+			if (!completed && connection?.isClosed()) {
+				session.connection = null;
+			}
+			const canDiscardSession =
+				!completed &&
+				!session.disabled &&
+				session.connection === null &&
+				session.lastRequest === null &&
+				session.lastCompleted === null &&
+				session.turnState === null;
+			if (canDiscardSession) {
+				sessionCache.delete(cacheKey);
+				stopSessionCleanupTimerIfIdle();
+			}
 		}
 	}
 }

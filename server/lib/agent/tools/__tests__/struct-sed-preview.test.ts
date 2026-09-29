@@ -47,9 +47,11 @@ describe("previewStructSedChange", () => {
 		if ("error" in outcome) throw new Error(outcome.error);
 		expect(outcome.preview.before).toBe(SOURCE);
 		expect(outcome.preview.after).toBe("alpha\nBRAVO\ncharlie\ndelta\n");
-		expect(outcome.window?.oldText).toContain("bravo");
-		expect(outcome.window?.newText).toContain("BRAVO");
-		expect(outcome.window?.startLine).toBe(1);
+		expect(outcome.diff?.hunks).toHaveLength(1);
+		expect(outcome.diff?.hunks[0]?.oldText).toContain("bravo");
+		expect(outcome.diff?.hunks[0]?.newText).toContain("BRAVO");
+		expect(outcome.diff?.hunks[0]?.oldStart).toBe(1);
+		expect(outcome.diff?.hunks[0]?.newStart).toBe(1);
 		// `dry_run: false` in the pending input must not leak through into a write.
 		expect(readFileSync(file, "utf8")).toBe(SOURCE);
 	});

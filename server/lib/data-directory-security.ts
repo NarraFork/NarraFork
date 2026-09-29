@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { type BigIntStats, constants } from "node:fs";
-import { lstat, open, realpath } from "node:fs/promises";
+import { lstat, open, realpath, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { DataDirectorySecurityStatus } from "@shared/data-directory-security";
 import { logger } from "./logger";
@@ -42,22 +42,66 @@ function checkDeadline(deadline: number) {
 		throw new DataDirectoryCheckIncompleteError("Data directory permission check timed out");
 }
 
+/**
+ * Windows `realpath` may return an extended-length `\\?\` form. Strip the prefix
+ * so path comparisons and UI diagnostics show the ordinary path.
+ */
+function stripWindowsExtendedPrefix(path: string): string {
+	if (path.startsWith("\\\\?\\UNC\\")) return `\\\\${path.slice(8)}`;
+	if (path.startsWith("\\\\?\\")) return path.slice(4);
+	return path;
+}
+
 /** Only metadata on a bounded ancestor chain: never enumerate application files. */
 async function readChain(path: string, deadline: number): Promise<DirectoryChain> {
-	const canonical = resolve(path);
+	const requested = resolve(path);
 	checkDeadline(deadline);
-	if (resolve(await realpath(canonical)) !== canonical)
+	// Identity is the real directory we secure, not the spelling the operator typed.
+	// Windows realpath routinely rewrites case, 8.3 names, junctions and `\\?\`
+	// prefixes; requiring the configured path to equal that result character-by-
+	// character rejects ordinary user-profile layouts. POSIX keeps the strict
+	// "already canonical" rule so a symlink alias cannot hide a swapped target.
+	const canonical = stripWindowsExtendedPrefix(resolve(await realpath(requested)));
+	checkDeadline(deadline);
+	if (process.platform !== "win32" && canonical !== requested)
 		throw new DataDirectorySecurityError(
 			"canonical_path",
-			canonical,
-			`Application data directory must use its real canonical path: ${canonical}`,
+			requested,
+			`Application data directory must use its real canonical path: ${requested}`,
 		);
 	const entries: DirectoryEntry[] = [];
 	for (let cursor = canonical; ; cursor = dirname(cursor)) {
 		checkDeadline(deadline);
 		if (entries.length >= MAX_ANCESTORS)
 			throw new Error("Application data directory ancestor limit exceeded");
-		entries.push({ path: cursor, stat: await lstat(cursor, { bigint: true }) });
+		const link = await lstat(cursor, { bigint: true });
+		let identity = link;
+		if (link.isSymbolicLink()) {
+			// After realpath the chain should already be fully resolved. A remaining
+			// symlink is either a POSIX policy violation or a Windows reparse point
+			// (junction) whose referent is a directory; only the latter is accepted.
+			if (process.platform !== "win32")
+				throw new DataDirectorySecurityError(
+					"directory_type",
+					cursor,
+					`Application data ancestor must be a non-symlink directory: ${cursor}`,
+				);
+			const followed = await stat(cursor, { bigint: true });
+			if (!followed.isDirectory())
+				throw new DataDirectorySecurityError(
+					"directory_type",
+					cursor,
+					`Application data ancestor must be a non-symlink directory: ${cursor}`,
+				);
+			identity = followed;
+		} else if (!link.isDirectory()) {
+			throw new DataDirectorySecurityError(
+				"directory_type",
+				cursor,
+				`Application data ancestor must be a non-symlink directory: ${cursor}`,
+			);
+		}
+		entries.push({ path: cursor, stat: identity });
 		if (dirname(cursor) === cursor) break;
 	}
 	checkDeadline(deadline);

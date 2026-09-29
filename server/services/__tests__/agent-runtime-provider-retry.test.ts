@@ -21,6 +21,7 @@ const { activeNarrators } = await import("../narrator-session-state");
 const { narratorService } = await import("../narrator-service");
 const executor = await import("../narrator-executor");
 const recovery = await import("../narrator-recovery");
+const ws = await import("../../websocket/narrator-ws");
 const savedOpenai = settings.openaiProviders;
 const savedAnthropic = settings.anthropicProviders;
 const savedMaxToolCallsPerResponse = settings.agent.maxToolCallsPerResponse;
@@ -305,4 +306,93 @@ describe("provider retry policy is identical through the real primary and child 
 			});
 		}
 	}
+});
+
+describe("subagent transient-retry recovery notifies the parent", () => {
+	// Regression: the unified runtime dropped the recovery broadcast, so a subagent
+	// that recovered from a transient retry kept its stale "retry N/M" badge in the
+	// parent panel for the whole remaining run — the badge clears only on
+	// subagent_status_changed / subagent_conclusion_updated, and an already-working
+	// subagent emits neither mid-run.
+	test("successful pass after a transient retry broadcasts subagent_status_changed to the parent", async () => {
+		const prefix = "runtime_retry_recovered";
+		const model = `${prefix}:gpt-5`;
+		settings.openaiProviders = [
+			{
+				id: prefix,
+				name: prefix,
+				prefix,
+				apiKey: "test-only",
+				baseUrl: "https://example.invalid/v1",
+				defaultModel: "gpt-5",
+				apiMode: "responses",
+			},
+		];
+		const id = "retry-child";
+		const now = new Date().toISOString();
+		for (const target of ["retry-parent", id]) {
+			await db.insert(narrators).values({
+				id: target,
+				type: target === "retry-child" ? "subagent" : "primary",
+				variant: target === "retry-child" ? "subagent:general" : "primary",
+				parentNarratorId: target === "retry-child" ? "retry-parent" : null,
+				model,
+				autoContinuationOverride: "off",
+				cwd: process.env.HOME,
+				createdAt: now,
+				updatedAt: now,
+			});
+		}
+		const profile: RuntimeProfile = {
+			kind: "subagent",
+			parentNarratorId: "retry-parent",
+			parentToolUseId: "origin-tool",
+			subagentType: "general",
+			systemPrompt: "retry recovered contract",
+			initialHistory: [],
+		};
+		const active = session(id, model, prefix);
+		activeNarrators.set(id, active);
+		const owner = tryClaimExecution(id, "subagent");
+		if (!owner) throw new Error("Missing retry-recovered owner");
+		let calls = 0;
+		spyOn(executor, "executeAgentLoop").mockImplementation(async () => {
+			calls++;
+			return calls === 1
+				? {
+						finalText: "",
+						hasError: false,
+						shouldUpdateTitle: false,
+						retryableError: "configured provider transient failure",
+					}
+				: {
+						finalText: "finished",
+						hasError: false,
+						shouldUpdateTitle: false,
+						completedNaturally: true,
+						completedAssistantTurn: true,
+					};
+		});
+		spyOn(recovery, "handleTransientError").mockResolvedValue({
+			shouldRetry: true,
+			delayMs: 0,
+		});
+		const broadcast = spyOn(ws, "broadcastToNarrator").mockImplementation(() => {});
+		const outcome = await runAgentLoopUnlocked(
+			active,
+			owner,
+			"first user input",
+			undefined,
+			profile,
+		);
+
+		expect(outcome.finalText).toBe("finished");
+		expect(calls).toBe(2);
+		expect(broadcast).toHaveBeenCalledWith("retry-parent", {
+			type: "subagent_status_changed",
+			narratorId: "retry-parent",
+			subagentNarratorId: id,
+			status: "working",
+		});
+	});
 });

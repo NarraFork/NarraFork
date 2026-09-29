@@ -1259,22 +1259,22 @@ async function sendSubagentMessageDetailedWithRun(
 				throw new Error("Target subagent is archived");
 			}
 
-			// If the user has taken over this subagent, the parent must not drive it.
-			// Report the takeover so the agent waits for the user to finish.
-			if (isTakenOver(fresh.id)) {
-				sections.push(
-					`Agent ${label} is being taken over by the user and cannot be driven right now. ` +
-						`Its result will be available after the user stops the takeover.`,
-				);
-				targetResults.push({
-					id: fresh.id,
-					label,
-					title: fresh.title,
-					status: "taken_over",
-					awaited: input.shouldAwait,
-				});
-				continue;
-			}
+			// A taken-over subagent is driven by the user like an independent narrator, and
+			// an independent narrator still receives its team's messages. Rejecting the Send
+			// here (the old behaviour) silently dropped the parent's instruction: the model
+			// was told "cannot be driven right now" and nothing was ever queued. The message
+			// is delivered through the ordinary paths below instead — buffered into a running
+			// turn, or waking the suspended runner — and the takeover itself is untouched,
+			// so the subagent parks in `taken_over` again when that turn ends.
+			//
+			// What the parent may NOT do is cut into the user's turn: `doInterrupt` would stop
+			// work the user is steering, so it is ignored for a taken-over target.
+			const takenOver = isTakenOver(fresh.id);
+			const takeoverNote = takenOver
+				? ` Agent ${label} is taken over by the user: it will handle this message and then` +
+					" wait for the user again; its final result arrives after the user stops the takeover."
+				: "";
+			const interruptTarget = input.doInterrupt && !takenOver;
 
 			if (input.shouldAwait) {
 				replyHandle = registerAgentReplyWait({
@@ -1325,7 +1325,7 @@ async function sendSubagentMessageDetailedWithRun(
 
 			if (fresh.status === "working" || fresh.status === "waiting") {
 				const buffered = await pushSubagentBufferedMessage(fresh.id, deliveredMessage, {
-					position: input.doInterrupt ? "front" : "back",
+					position: interruptTarget ? "front" : "back",
 					delivery,
 					createdBy: input.userId ?? null,
 				});
@@ -1335,13 +1335,15 @@ async function sendSubagentMessageDetailedWithRun(
 					);
 				}
 				deliveryMessageId = delivery.recipientMessageId;
-				let interruptNote = "";
+				let interruptNote = takeoverNote;
 				let interrupted: boolean | undefined;
-				if (input.doInterrupt && !buffered.duplicate) {
+				if (interruptTarget && !buffered.duplicate) {
 					interrupted = interruptForegroundSubagent(fresh.id);
 					interruptNote = interrupted
 						? " Interrupted foreground subagent."
 						: " Target is not an interruptible foreground subagent.";
+				} else if (input.doInterrupt && takenOver) {
+					interruptNote += " doInterrupt was ignored because the user is driving this subagent.";
 				}
 				if (replyHandle) {
 					const deliveryNote = `Sent to ${label}; message queued.${interruptNote} Requested a Send reply.`;
@@ -1412,8 +1414,8 @@ async function sendSubagentMessageDetailedWithRun(
 			} else wakeFailed = true;
 			if (replyHandle) {
 				const deliveryNote = wakeFailed
-					? `Sent to ${label}; durable message retained for the next eligible turn. A Send reply was requested.`
-					: `Sent to ${label}; subagent started asynchronously and a Send reply was requested.`;
+					? `Sent to ${label}; durable message retained for the next eligible turn.${takeoverNote} A Send reply was requested.`
+					: `Sent to ${label}; subagent started asynchronously.${takeoverNote} A Send reply was requested.`;
 				replyHandle.updateSnapshot({
 					deliveryNote,
 					deliveryMessageId,
@@ -1430,9 +1432,9 @@ async function sendSubagentMessageDetailedWithRun(
 				});
 			} else {
 				sections.push(
-					wakeFailed
+					(wakeFailed
 						? `Sent to ${label}; durable message retained for the next eligible turn.`
-						: `Sent to ${label}; subagent started asynchronously.`,
+						: `Sent to ${label}; subagent started asynchronously.`) + takeoverNote,
 				);
 				targetResults.push({
 					id: fresh.id,

@@ -5,7 +5,7 @@ import { detectShell } from "../lib/agent/shell";
 import { BASH_TOOL_NAME } from "../lib/agent/tool-name";
 import { getGlobalPromptCandidates, PROJECT_PROMPT_FILENAMES } from "../lib/global-prompt-paths";
 import { buildPlanFileRelPath, isSafePlanFileIdForPath } from "../lib/plan-file-path";
-import { IS_WINDOWS, isWslAllowed } from "../lib/platform";
+import { IS_WINDOWS } from "../lib/platform";
 import {
 	getDynamicSpecSystemReminder,
 	getPlanModeSystemReminder,
@@ -154,10 +154,6 @@ export async function buildEffectiveSystemPrompt(
 - Prefer the dedicated tools (Read, Write, Edit, Glob, Grep) over shell commands whenever possible.`;
 		}
 
-		// On Windows, forbid WSL suggestions unless --wsl=true
-		if (IS_WINDOWS && !isWslAllowed()) {
-			cwdSection += `\n\nIMPORTANT: This is a native Windows environment. Do NOT suggest switching to WSL (Windows Subsystem for Linux), installing WSL, or running commands through WSL. All tools and commands must work natively on Windows.`;
-		}
 		prompt = `${base}${sep}${cwdSection}`;
 	}
 
