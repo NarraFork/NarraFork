@@ -134,6 +134,58 @@ export function mockToolExecutingFrame(opts: {
 }
 
 /**
+ * `permission_request` — the tool is waiting on the reader's approval.
+ *
+ * Shaped like `narrator-permission.ts`'s broadcast: the request rides under
+ * `request`, and its `id` is the requestId every later decision names. The id must
+ * be unique PER RUN — the panel records every resolved id and drops a request it
+ * has already seen resolved, so a replay reusing an id would never show its form.
+ */
+export function mockPermissionRequestFrame(opts: {
+	narratorId: string;
+	requestId: string;
+	toolUseId: string;
+	toolName: string;
+	input: Record<string, unknown>;
+	decisionReason?: string;
+}): MockFrame {
+	return {
+		type: "permission_request",
+		narratorId: opts.narratorId,
+		request: {
+			id: opts.requestId,
+			toolName: opts.toolName,
+			toolUseId: opts.toolUseId,
+			inputJson: opts.input,
+			...(opts.decisionReason ? { decisionReason: opts.decisionReason } : {}),
+		},
+	};
+}
+
+/**
+ * `permission_resolved` — the request is gone.
+ *
+ * `decision` is optional on purpose: the runner also sends a decision-less resolve
+ * to RETIRE a request it is abandoning (stop mid-hold). Without a decision the card
+ * status is left alone and only the pending entry is removed, which is what an
+ * abandoned mock request needs.
+ */
+export function mockPermissionResolvedFrame(opts: {
+	narratorId: string;
+	requestId: string;
+	toolUseId: string;
+	decision?: "allow" | "deny";
+}): MockFrame {
+	return {
+		type: "permission_resolved",
+		narratorId: opts.narratorId,
+		requestId: opts.requestId,
+		toolUseId: opts.toolUseId,
+		...(opts.decision ? { decision: opts.decision } : {}),
+	};
+}
+
+/**
  * `tool_output` — streaming stdout.
  *
  * `output` is the CUMULATIVE preview, not a delta: the consumer keeps the latest

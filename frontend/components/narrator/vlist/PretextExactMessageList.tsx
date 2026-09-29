@@ -15,6 +15,7 @@ import { useCurrentUser } from "@frontend/hooks/useAuth";
 import { useLocalPref } from "@frontend/hooks/useLocalPref";
 import { useInterruptNarrator, useResumeRecoverySubagents } from "@frontend/hooks/useNarrator";
 import { useNarratorWS } from "@frontend/hooks/useNarratorWS";
+import { useNarratorPermissionsCapability } from "@frontend/hooks/usePlatform";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import type { TreeMessage } from "@frontend/lib/api/types";
@@ -85,8 +86,9 @@ import {
 	setCompactProgress,
 } from "./compact-progress-store";
 import { ExactRow } from "./ExactRow";
+import type { InlinePermissionData } from "./measure/measure-permission";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
-import type { MeasuredToolCall } from "./measure/measure-tool-call";
+import { type MeasuredToolCall, toolCardInnerWidth } from "./measure/measure-tool-call";
 import type { MeasuredCollapsibleTrace } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
 import { resolveRenderExtra } from "./render-registry";
@@ -228,6 +230,12 @@ import {
 } from "./vlist-jump-target";
 import { resolveJumpWindowDecision } from "./vlist-jump-window";
 import {
+	buildLifecycleSnapshot,
+	type LifecycleElementSource,
+	type LifecycleSnapshot,
+	planLifecycleMotion,
+} from "./vlist-lifecycle-motion";
+import {
 	createLodFocusPoint,
 	createLodStepThrottle,
 	type LodFocusPoint,
@@ -256,12 +264,18 @@ import {
 	drillScope,
 	frameScope,
 	LOD_MOTION_DURATION_MS,
+	lifecycleScope,
 	lodScope,
 	type MotionOp,
 	prefersReducedMotion,
 	rowScope,
 } from "./vlist-motion-scheduler";
-import { usePermissionSlots } from "./vlist-permission-bridge";
+import {
+	toolUseIdFromSpecKey,
+	usePermissionSlots,
+	useTracePermissionSlots,
+} from "./vlist-permission-bridge";
+import { predictInlinePermission } from "./vlist-permission-prediction";
 import type { VListItem } from "./vlist-pipeline";
 import { createPointerDragTracker } from "./vlist-pointer-drag";
 import { buildReflectionSourceIndex } from "./vlist-reflection-index";
@@ -1184,6 +1198,23 @@ export const PretextExactMessageList = memo(
 					return next;
 				});
 			}, []);
+			/**
+			 * Rows the LIFECYCLE channel marked closing on this commit, as `traceKey` → row
+			 * keys. The lifecycle effect either plans a resize whose `onDone` releases them, or
+			 * releases them itself — a retained card must never outlive its transition.
+			 */
+			const pendingLifecycleClosingRef = useRef<{
+				marks: Map<string, Set<string>>;
+				/**
+				 * The `renderItems` the marks were taken against. The marking effect runs on the
+				 * commit the request list changed, BEFORE the document rebuilds (that happens in
+				 * usePretextDocument's passive effect). The lifecycle effect on that same commit
+				 * sees no shape change yet, so it must not release the marks until it runs
+				 * against a DIFFERENT item array — otherwise the release cancels the mark in one
+				 * batched update and the card unmounts with the rebuild instead of closing.
+				 */
+				items: readonly unknown[];
+			} | null>(null);
 			const drillMorphPrevRef = useRef<Map<string, DrillRowSnapshot>>(new Map());
 			/**
 			 * The document revision the last snapshot was taken under. A morph only plays when
@@ -1201,6 +1232,23 @@ export const PretextExactMessageList = memo(
 			const lodMorphPrevRef = useRef<Map<string, LodElementSnapshot> | null>(null);
 			const lodMorphLodRef = useRef<number>(-1);
 			const lodMorphDocRevRef = useRef<number>(-1);
+			/**
+			 * LIFECYCLE transition (see vlist-lifecycle-motion.ts): the previous committed
+			 * frame of the mounted window, and the frame context it was taken under. Pure
+			 * data in refs, like the drill/LOD baselines — never React state.
+			 */
+			const lifecyclePrevRef = useRef<LifecycleSnapshot | null>(null);
+			const lifecyclePrevContextRef = useRef<{
+				lod: number;
+				widthBucket: string;
+				scrollTop: number;
+			} | null>(null);
+			/**
+			 * Set by the fold play effect when it consumed the reader's capture on THIS
+			 * commit, and cleared by the lifecycle effect. A reader's fold and a lifecycle
+			 * flip landing on the same commit would otherwise both animate the same node.
+			 */
+			const foldPlayedThisCommitRef = useRef(false);
 			/**
 			 * Snapshot the mounted rows' current geometry so the commit this click produces
 			 * can be animated from it.
@@ -1535,6 +1583,88 @@ export const PretextExactMessageList = memo(
 					toolUseId ? pendingSuggestionsByToolUseId.get(toolUseId) : undefined,
 				[pendingSuggestionsByToolUseId],
 			);
+			// The live InlinePermission form's box, reserved ARITHMETICALLY on the request's
+			// first frame (see vlist-permission-prediction). Predicted against the standalone
+			// card's inner width: a drilled-in card is measured standalone too, so one width
+			// serves both hosts.
+			const permissionCapability = useNarratorPermissionsCapability();
+			const canDecidePermissions =
+				permissionCapability.supported && permissionCapability.approveDeny;
+			const permissionPredictionsByToolUseId = useMemo(() => {
+				const map = new Map<string, InlinePermissionData>();
+				const innerWidth = toolCardInnerWidth(contentWidth, false);
+				for (const perm of permCb?.pendingPermissions ?? []) {
+					if (!perm.toolUseId) continue;
+					const prediction = predictInlinePermission(perm, {
+						innerWidth,
+						canDecide: canDecidePermissions,
+					});
+					if (prediction) map.set(perm.toolUseId, prediction);
+				}
+				return map;
+			}, [permCb?.pendingPermissions, contentWidth, canDecidePermissions]);
+			const resolvePermissionFormPrediction = useCallback(
+				(toolUseId: string | undefined) =>
+					toolUseId ? permissionPredictionsByToolUseId.get(toolUseId) : undefined,
+				[permissionPredictionsByToolUseId],
+			);
+			// The form's PAINTED height, reported by the card once it has mounted. Keyed by
+			// the request id as well as the tool-use id: a retried request is a new form, and
+			// its first frame must start from the prediction rather than the previous form's
+			// reading. Entries for requests that are gone are dropped with the list.
+			const [permissionFormHeights, setPermissionFormHeights] = useState<
+				ReadonlyMap<string, { requestId: string; height: number }>
+			>(() => new Map());
+			const pendingRequestIdByToolUseId = useMemo(() => {
+				const map = new Map<string, string>();
+				for (const perm of permCb?.pendingPermissions ?? []) {
+					if (perm.toolUseId) map.set(perm.toolUseId, perm.id);
+				}
+				return map;
+			}, [permCb?.pendingPermissions]);
+			// Read by the (stable) reporter, which must not change identity per request.
+			const pendingRequestIdByToolUseIdRef = useRef(pendingRequestIdByToolUseId);
+			pendingRequestIdByToolUseIdRef.current = pendingRequestIdByToolUseId;
+			const reportPermissionFormHeight = useCallback((toolUseId: string, height: number) => {
+				const requestId = pendingRequestIdByToolUseIdRef.current.get(toolUseId);
+				if (!requestId || !Number.isFinite(height) || height <= 0) return;
+				const rounded = Math.round(height);
+				setPermissionFormHeights((prev) => {
+					const current = prev.get(toolUseId);
+					if (current && current.requestId === requestId && Math.abs(current.height - rounded) <= 1)
+						return prev;
+					const next = new Map(prev);
+					next.set(toolUseId, { requestId, height: rounded });
+					return next;
+				});
+			}, []);
+			const resolvePermissionFormHeight = useCallback(
+				(toolUseId: string | undefined) => {
+					if (!toolUseId) return undefined;
+					const entry = permissionFormHeights.get(toolUseId);
+					if (!entry) return undefined;
+					// A reading from a previous request for the same call is not this form's.
+					return pendingRequestIdByToolUseId.get(toolUseId) === entry.requestId
+						? entry.height
+						: undefined;
+				},
+				[permissionFormHeights, pendingRequestIdByToolUseId],
+			);
+			// Drop readings whose request is gone, so the map cannot grow for the session.
+			useEffect(() => {
+				setPermissionFormHeights((prev) => {
+					if (prev.size === 0) return prev;
+					let changed = false;
+					const next = new Map(prev);
+					for (const [toolUseId, entry] of prev) {
+						if (pendingRequestIdByToolUseId.get(toolUseId) !== entry.requestId) {
+							next.delete(toolUseId);
+							changed = true;
+						}
+					}
+					return changed ? next : prev;
+				});
+			}, [pendingRequestIdByToolUseId]);
 			// Truncated payloads on expanded cards, fetched in full on demand (the chunked
 			// path's LazyDetailRenderer equivalent). The id list is published by an effect
 			// AFTER the build below, so this render uses the previous list — one build
@@ -1705,6 +1835,8 @@ export const PretextExactMessageList = memo(
 				resolveSubagentRecentSummary: resolveExactSubagentRecentSummary,
 				resolveRecentMessageIds,
 				resolveHasPendingPermission,
+				resolvePermissionFormPrediction,
+				resolvePermissionFormHeight,
 				resolvePendingPlan,
 				resolvePendingPermissionSuggestions,
 				resolveFullToolInput,
@@ -2348,6 +2480,71 @@ export const PretextExactMessageList = memo(
 				reflections: reflectionIndex,
 				asyncQuestions: permCb?.asyncQuestions,
 			});
+			// The same forms for calls that stayed a row of their L1/L2 activity trace and
+			// were drilled open onto their card (see useTracePermissionSlots).
+			const tracePermissionSlotsByKey = useTracePermissionSlots({ renderItems, permCb });
+			/**
+			 * Keep an ANSWERED form's card painted while its drilled block closes.
+			 *
+			 * When a request leaves the list (the reader answered, or another client did),
+			 * the next rebuild commits the row's short height and React would unmount the
+			 * card in that very frame — it would vanish instead of closing, exactly the
+			 * failure `closingRowKeys` was built for on a manual un-drill. This runs on the
+			 * commit where the list changed, which is BEFORE the rebuild (the document
+			 * rebuilds in usePretextDocument's effect off the new resolver identity), so the
+			 * rendered rows are still the pinned ones and can be marked here.
+			 *
+			 * The lifecycle effect then either plans the block's resize (whose `onDone`
+			 * releases the row) or releases it at once.
+			 */
+			const previousPendingIdsRef = useRef<ReadonlySet<string>>(new Set());
+			useLayoutEffect(() => {
+				const current = new Set<string>();
+				for (const perm of permCb?.pendingPermissions ?? []) {
+					if (perm.toolUseId) current.add(perm.toolUseId);
+				}
+				const previous = previousPendingIdsRef.current;
+				previousPendingIdsRef.current = current;
+				if (previous.size === 0 || prefersReducedMotion()) return;
+				const marks = new Map<string, Set<string>>();
+				for (const item of renderItemsRef.current) {
+					if (item?.spec.kind !== "activity-trace") continue;
+					const rows = (
+						item.measured as {
+							rows?: readonly { key: string; pinnedOpen?: boolean; cardMeasured?: unknown }[];
+						}
+					).rows;
+					for (const row of rows ?? []) {
+						if (row.pinnedOpen !== true || row.cardMeasured == null) continue;
+						const toolUseId = toolUseIdFromSpecKey(row.key);
+						if (!toolUseId || !previous.has(toolUseId) || current.has(toolUseId)) continue;
+						let set = marks.get(item.spec.key);
+						if (!set) {
+							set = new Set();
+							marks.set(item.spec.key, set);
+						}
+						set.add(row.key);
+					}
+				}
+				if (marks.size === 0) return;
+				// Merge with any marks still waiting for their rebuild (two answers in a row).
+				const waiting = pendingLifecycleClosingRef.current?.marks;
+				if (waiting) {
+					for (const [traceKey, rows] of waiting) {
+						const set = marks.get(traceKey) ?? new Set<string>();
+						for (const rowKey of rows) set.add(rowKey);
+						marks.set(traceKey, set);
+					}
+				}
+				pendingLifecycleClosingRef.current = { marks, items: renderItemsRef.current };
+				setClosingRows((prev) => {
+					const next = new Map(prev);
+					for (const [traceKey, rows] of marks) {
+						next.set(traceKey, new Set([...(prev.get(traceKey) ?? []), ...rows]));
+					}
+					return next;
+				});
+			}, [permCb?.pendingPermissions]);
 
 			// Keys that currently host a dynamic (post-paint measured) body — rows carrying
 			// a live permission FORM, a row hosting an intrinsically unpredictable block
@@ -2361,7 +2558,18 @@ export const PretextExactMessageList = memo(
 				const keys = new Set<string>();
 				for (const item of renderItems) {
 					if (!item) continue;
-					if (permissionSlotByKey.has(item.spec.key)) keys.add(item.spec.key);
+					// A card that RESERVED its form arithmetically stays a fixed, clipped row: the
+					// form reports its own height through `permissionFormHeight`. Only a form the
+					// card could not reserve (AskUserQuestion's banner, a subagent card's) keeps
+					// the whole row on the post-paint path.
+					if (
+						permissionSlotByKey.has(item.spec.key) &&
+						!(
+							item.spec.kind === "tool-call" &&
+							(item.measured as MeasuredToolCall).permissionFormHeight > 0
+						)
+					)
+						keys.add(item.spec.key);
 					// A mermaid diagram (or an image of unknown intrinsic size) only reserves a
 					// conservative PLACEHOLDER, so its row must be allowed to report the settled
 					// height. This is the CONTRACT's controlled exception, not a new one: the
@@ -2628,6 +2836,9 @@ export const PretextExactMessageList = memo(
 					return;
 				foldCaptureRef.current = null;
 				const ops: MotionOp[] = [];
+				// This commit's geometry now belongs to the reader's fold; the lifecycle
+				// channel must not plan a second animation over the same nodes.
+				foldPlayedThisCommitRef.current = true;
 				for (const motion of motions) {
 					// A `reveal` clips, and an inset is measured from the bottom of the node it
 					// plays on — so it MUST target the row's inner content box, whose height is
@@ -3233,6 +3444,167 @@ export const PretextExactMessageList = memo(
 					}),
 					LOD_MOTION_DURATION_MS,
 				);
+			});
+
+			/**
+			 * LIFECYCLE transition — an element changing SHAPE because its content moved to
+			 * another phase (a running card collapsing on completion, a live reasoning card
+			 * settling, an L1/L2 row drilled open for a permission form and closed again).
+			 * See vlist-lifecycle-motion.ts for what qualifies and why it is enumerated.
+			 *
+			 * Declared after the fold, drill and LOD effects and before MOTION FLUSH, so its
+			 * ops join the same burst. It snapshots on EVERY commit (a baseline that only
+			 * rolls on some commits diffs against a stale frame — the LOD morph's lesson),
+			 * and plays only when the frame context is unchanged:
+			 *
+			 *  - same LOD and width bucket (those re-theme the whole document; the LOD morph
+			 *    owns that transition);
+			 *  - no reader fold on this commit (the fold effect already animated these nodes);
+			 *  - no reduced motion.
+			 *
+			 * The document revision is deliberately NOT part of the gate: every lifecycle
+			 * change arrives through a live patch or a structural rebuild, and requiring a
+			 * stable revision would reject precisely the commits this channel exists for.
+			 * The signature diff is what keeps ordinary rebuilds out — a reload or a page
+			 * that changes no element's shape plans nothing.
+			 */
+			useLayoutEffect(() => {
+				const node = viewportRef.current;
+				const layout = exactLayoutRef.current;
+				const foldPlayed = foldPlayedThisCommitRef.current;
+				foldPlayedThisCommitRef.current = false;
+				if (!node || !layout) return;
+				const items = renderItemsRef.current;
+				const window = visibleRef.current;
+				const sources: LifecycleElementSource[] = [];
+				for (let index = window.start; index < window.end; index++) {
+					const item = items[index];
+					const geo = layout.items[index];
+					if (!item || !geo) continue;
+					sources.push({
+						key: item.spec.key,
+						kind: item.spec.kind,
+						...(item.spec.lifecycleId ? { lifecycleId: item.spec.lifecycleId } : {}),
+						top: geo.top,
+						height: geo.height,
+						measured: item.measured,
+					});
+				}
+				const next = buildLifecycleSnapshot(sources);
+				const context = {
+					lod: pretextDocument.manifest?.lod ?? -1,
+					widthBucket: String(pretextDocument.manifest?.widthBucket ?? ""),
+					scrollTop: node.scrollTop,
+				};
+				const prev = lifecyclePrevRef.current;
+				const prevContext = lifecyclePrevContextRef.current;
+				lifecyclePrevRef.current = next;
+				lifecyclePrevContextRef.current = context;
+				// Retained closing cards (an answered request) wait for the commit that
+				// actually carries the rebuilt document; on the marking commit itself the rows
+				// have not changed shape yet, and releasing them there would cancel the mark in
+				// the same batched update. Once the items moved on, every mark whose resize did
+				// not get planned (the block left the window, the delta was unreadable, a
+				// guard below skipped the plan) is released NOW — no op means no onDone.
+				const pendingClosing = pendingLifecycleClosingRef.current;
+				const settleClosing = pendingClosing !== null && pendingClosing.items !== items;
+				const releaseUnplanned = (planned: ReadonlySet<string>) => {
+					if (!settleClosing || !pendingClosing) return;
+					pendingLifecycleClosingRef.current = null;
+					for (const [traceKey, rows] of pendingClosing.marks) {
+						for (const rowKey of rows) {
+							if (!planned.has(`${traceKey}::${rowKey}`)) releaseClosingRow(traceKey, rowKey);
+						}
+					}
+				};
+				if (
+					!prev ||
+					!prevContext ||
+					foldPlayed ||
+					prefersReducedMotion() ||
+					prevContext.lod !== context.lod ||
+					prevContext.widthBucket !== context.widthBucket
+				) {
+					releaseUnplanned(new Set());
+					return;
+				}
+				// Land a running chase first: the plan's pinned afterScrollTop is the PREDICTED
+				// bottom, and a glide still heading there would move rows under the animation.
+				smoothFollowerRef.current?.snapToTarget();
+				const afterScrollTop = pinnedToBottom ? getScrollBottomTarget(node) : node.scrollTop;
+				const plan = planLifecycleMotion({
+					before: prev,
+					after: next,
+					beforeScrollTop: prevContext.scrollTop,
+					afterScrollTop,
+				});
+				releaseUnplanned(
+					new Set(
+						plan.nestedResizes
+							.filter((resize) => resize.kind === "resize")
+							.map((resize) => `${resize.traceKey}::${resize.rowKey}`),
+					),
+				);
+				if (
+					plan.rows.length === 0 &&
+					plan.nestedMotions.length === 0 &&
+					plan.nestedResizes.length === 0
+				) {
+					return;
+				}
+				// Own cancel domain (`life:`), disjoint from the fold's `row:`: a lifecycle
+				// replay cancels only its previous lifecycle motion. The two channels cannot plan
+				// on the same commit (`foldPlayedThisCommitRef`); if a reader's click lands while
+				// a lifecycle motion is still running, the later WAAPI animation composites over
+				// the earlier one on the same property, so the click's motion is what shows.
+				const ops: MotionOp[] = [];
+				for (const motion of plan.rows) {
+					// Same node targeting as the fold: `shift` on the outer row box, `reveal` /
+					// `resize` on the inner content box (the one whose height is the layout's).
+					const selector =
+						motion.kind === "shift"
+							? `[data-nf-row-key="${cssAttrEscape(motion.key)}"]`
+							: `[data-nf-row-body="${cssAttrEscape(motion.key)}"]`;
+					ops.push({
+						scope: `${lifecycleScope(motion.key)}:${motion.kind}`,
+						resolve: () => node.querySelector<HTMLElement>(selector),
+						keyframes: foldRowKeyframes(motion),
+					});
+				}
+				for (const nestedMotion of plan.nestedMotions) {
+					ops.push({
+						scope: `${lifecycleScope(nestedMotion.traceKey)}:nested:${nestedMotion.rowKey}`,
+						resolve: () =>
+							node
+								.querySelector<HTMLElement>(
+									`[data-nf-row-key="${cssAttrEscape(nestedMotion.traceKey)}"]`,
+								)
+								?.querySelector<HTMLElement>(
+									`[data-nf-trace-row="${cssAttrEscape(nestedMotion.rowKey)}"]`,
+								),
+						keyframes: shiftKeyframes(nestedMotion.fromOffset),
+					});
+				}
+				for (const resize of plan.nestedResizes) {
+					ops.push({
+						scope: `${lifecycleScope(resize.traceKey)}:nested-size:${resize.rowKey}`,
+						resolve: () =>
+							node
+								.querySelector<HTMLElement>(`[data-nf-row-key="${cssAttrEscape(resize.traceKey)}"]`)
+								?.querySelector<HTMLElement>(
+									`[data-nf-trace-block="${cssAttrEscape(resize.rowKey)}"]`,
+								),
+						keyframes:
+							resize.kind === "reveal"
+								? revealKeyframes(resize.fromInsetBottom)
+								: nestedResizeKeyframes(resize.fromHeight, resize.toHeight),
+						// A retained card (a request answered) is released once its block closes.
+						// A no-op for rows that were never marked closing.
+						onDone: () => releaseClosingRow(resize.traceKey, resize.rowKey),
+					});
+				}
+				motionRef.current.begin();
+				motionRef.current.push(ops);
 			});
 
 			/**
@@ -4172,7 +4544,7 @@ export const PretextExactMessageList = memo(
 			//
 			// Expressed as "keep what is still in the manifest" rather than "delete the
 			// dropped rows' keys": spec keys are derived and take several shapes
-			// (`tool-<id>`, `<msgId>-b3`, `activity-<id>-<index>`, `toolrun-summary-…`), so
+			// (`tool-<id>`, `<msgId>-b3`, `activity-t:<toolUseId>`, `toolrun-summary-…`), so
 			// reconstructing them from message ids would duplicate that derivation and drift
 			// from it. Same direction pruneHeightOverrides takes. Without this, each trimmed
 			// row leaves a dead closure behind for the rest of the session — the very growth
@@ -4789,6 +5161,8 @@ export const PretextExactMessageList = memo(
 											injectionNavigation={injectionNavigation}
 											currentUserId={currentUserId}
 											permissionSlot={permissionSlot}
+											traceRowPermissionSlots={tracePermissionSlotsByKey.get(item.spec.key)}
+											onPermissionFormHeight={reportPermissionFormHeight}
 											editorSlot={editorSlot}
 											onTerminate={terminateRunningTool}
 											resolveUpdateTimeout={getUpdateTimeout}

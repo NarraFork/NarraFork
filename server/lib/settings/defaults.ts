@@ -873,7 +873,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "object",
 	},
 	"clientFingerprint.installationId": {
-		desc: "作为 x-codex-installation-id 发送的持久化 UUID（客户端指纹身份，首次访问自动生成）。",
+		desc: "作为请求体 client_metadata 的 x-codex-installation-id 键发送的持久化 UUID（客户端指纹身份，首次访问自动生成；与真实 Codex 一致，不作为直接 HTTP 头发送）。",
 		type: "string",
 	},
 	"clientFingerprint.claudeDeviceId": {

@@ -278,6 +278,86 @@ describe("content integrity", () => {
 	});
 });
 
+describe("permission gate", () => {
+	const gated = (overrides: Partial<MockScenario> = {}) =>
+		buildMockScript(
+			scenario({ reasoning: false, text: false, permissions: true, runId: "7", ...overrides }),
+		);
+
+	/**
+	 * The tool call a step belongs to. A `permission_request` nests it under
+	 * `request` (the real wire shape), so a top-level read alone would orphan it.
+	 */
+	const toolUseIdOf = (step: MockStep): string | undefined => {
+		const top = step.frame.toolUseId;
+		if (typeof top === "string") return top;
+		const nested = (step.frame.request as { toolUseId?: unknown } | undefined)?.toolUseId;
+		return typeof nested === "string" ? nested : undefined;
+	};
+
+	it("is off by default, so the plain script is unchanged", () => {
+		const steps = buildMockScript(scenario({ reasoning: false, text: false }));
+		expect(steps.some((step) => step.kind.startsWith("permission-"))).toBe(false);
+	});
+
+	it("stops only Bash / Write / Edit, between started and executing", () => {
+		const steps = gated();
+		const ids = [...new Set(steps.map(toolUseIdOf))];
+		expect(ids.includes(undefined)).toBe(false);
+		let gatedCount = 0;
+		for (const id of ids) {
+			const own = steps.filter((step) => toolUseIdOf(step) === id);
+			const toolName = own.find((step) => step.kind === "tool-started")?.frame.toolName;
+			const kinds = own.map((step) => step.kind);
+			const request = kinds.indexOf("permission-request");
+			if (!["Bash", "Write", "Edit"].includes(String(toolName))) {
+				expect(request).toBe(-1);
+				continue;
+			}
+			gatedCount++;
+			// started → request → resolved → executing: the real gate's position.
+			expect(request).toBe(kinds.indexOf("tool-started") + 1);
+			expect(kinds[request + 1]).toBe("permission-resolved");
+			expect(kinds[request + 2]).toBe("tool-executing");
+		}
+		expect(gatedCount).toBeGreaterThan(0);
+	});
+
+	it("holds on the request and allows on the resolve, with matching ids", () => {
+		const steps = gated({ permissionHoldMs: 900 });
+		const request = steps.find((step) => step.kind === "permission-request");
+		const resolved = steps.find((step) => step.kind === "permission-resolved");
+		expect(request?.holdMs).toBe(900);
+		expect(resolved?.holdMs).toBeUndefined();
+		const req = request?.frame.request as { id: string; toolUseId: string; inputJson: unknown };
+		// Wire shape: the request rides under `request`, keyed by the requestId, and
+		// names the tool call whose `tool_started` immediately precedes it.
+		expect(request?.frame.type).toBe("permission_request");
+		const requestIndex = request ? steps.indexOf(request) : -1;
+		const started = stepAt(steps, requestIndex - 1);
+		expect(started.kind).toBe("tool-started");
+		expect(req.toolUseId).toBe(String(started.frame.toolUseId));
+		expect(resolved?.frame).toMatchObject({
+			type: "permission_resolved",
+			requestId: req.id,
+			toolUseId: req.toolUseId,
+			decision: "allow",
+		});
+		expect(req.inputJson).toBeTruthy();
+	});
+
+	it("gives every run distinct request ids (a resolved id is never shown again)", () => {
+		const idsOf = (runId: string) =>
+			gated({ runId })
+				.filter((step) => step.kind === "permission-request")
+				.map((step) => (step.frame.request as { id: string }).id);
+		const first = idsOf("1");
+		const second = idsOf("2");
+		expect(new Set(first).size).toBe(first.length);
+		expect(first.some((id) => second.includes(id))).toBe(false);
+	});
+});
+
 describe("tool lifecycle", () => {
 	const toolOnly = () => buildMockScript(scenario({ reasoning: false, text: false }));
 

@@ -4795,6 +4795,12 @@ function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrat
  *
  * handlePermission moves the row to "pending" again before any user-facing request,
  * so the visible lifecycle is unchanged.
+ *
+ * ⚠️ Not used by production code: re-runs insert a NEW row with a higher
+ * `executionAttempt` (`prepareToolCallExecutionAttempt`). Applying these fields to an
+ * existing row IN PLACE moves it `pending → initializing` on the SAME attempt, which
+ * the client's `LIVE_TOOL_PHASE_RANK` (shared/tool-row-status.ts) treats as a stale
+ * snapshot and refuses. Any new caller must also bump `executionAttempt`.
  */
 export const TOOL_CALL_RERUN_RESET_FIELDS = {
 	status: "initializing" as const,

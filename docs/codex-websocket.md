@@ -33,7 +33,10 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
     `build_websocket_headers` 写这个头，HTTP `/responses` 与 `/responses/compact` 都不发，
     因此它不在 `buildCodexEmulationHeaders`（HTTP/WS 共用的身份层）里，由本传输自己设置
   - `x-codex-window-id`：由 `conversationId` 确定性派生（见 `deriveCodexWindowId`）
-  - `x-codex-installation-id`（经 `extraHeaders` 传入）
+  - **不发送** `x-codex-installation-id` 直接头：codex-rs 的 `compatibility_headers()`
+    只投影 window-id / session-id / thread-id / turn-metadata / parent-thread / subagent，
+    installation id 只出现在 body `client_metadata`（及 turn-metadata blob）；唯一把它做成
+    真实 HTTP 头的是 remote-control 注册接口，不是 `/responses`。
   - 可选 `ChatGPT-Account-Id`（仅官方域名且提供了 accountId 时）
   - 可选 `x-codex-turn-metadata`（仅调用方显式传入时）
   - 最后合并调用方的 `extraHeaders`，因此它可以覆盖上面任意一项
@@ -50,8 +53,9 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
   `responses_request_properties_match` 划的是同一条线：input 单独比较、metadata 直接忽略
 
 两条调用路径都通过 `resolveClientFingerprint` 解析 `userAgent` + `extraHeaders`
-（含 `originator`、`x-codex-installation-id`、`session-id`/`thread-id`、
-`x-codex-window-id`）。`openai-provider.ts` 的 codex 通道与内置 Codex adapter
+（含 `originator`、`session-id`/`thread-id`、`x-codex-window-id`；
+`x-codex-installation-id` 只在 body `client_metadata`，不进 header 集合）。
+`openai-provider.ts` 的 codex 通道与内置 Codex adapter
 （`codex-provider.ts`）均如此；默认 `userAgentMode` 为 `codex` 时呈现
 `codex-tui` UA 与 `originator: codex-tui`，显式选 NarraFork 时两者都变为
 `narrafork`。

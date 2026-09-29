@@ -1961,6 +1961,16 @@ export interface RenderToolCallProps {
 	 */
 	permissionSlot?: ReactNode;
 	/**
+	 * Report the live form's painted OUTER height (its own top margin included).
+	 *
+	 * Supplied by the shell when the card RESERVED the form arithmetically
+	 * (`measured.permissionFormHeight > 0`): the card is then a fixed, clipped row, and
+	 * this reading is how a form that grows — the reader's multi-line feedback, the plan
+	 * editor, a fetched diff — gets its new height into the layout. Absent → the slot is
+	 * painted unobserved (the legacy dynamic-row path observes the whole row instead).
+	 */
+	onPermissionFormHeight?: (height: number) => void;
+	/**
 	 * Manual takeover of a RUNNING reflection gate (stop it and decide yourself).
 	 * The API call lives outside vlist/, so the integration layer supplies it; the
 	 * notice itself is measured + rendered on the pure path.
@@ -2080,6 +2090,55 @@ function useToolCardShimmerClass(
 	return undefined;
 }
 
+/**
+ * Observe a live permission form's painted OUTER height and report it.
+ *
+ * `display: flow-root` is load-bearing: the form's outermost box carries `mt="xs"`,
+ * and without a block formatting context that margin would collapse THROUGH this
+ * wrapper, so `offsetHeight` would read 10px short of the box the reserve has to
+ * cover (the measure layer's reserve includes the margin — see
+ * `resolvePermissionFormReserve`).
+ *
+ * Rounded, and only reported when it changed by more than a pixel, so an autosize
+ * textarea settling its sub-pixel height cannot loop the layout. This is the render
+ * layer's only DOM reading, and it is the same controlled exception the dynamic-row
+ * reporter already is — just scoped to the one region whose content is not ours.
+ */
+function PermissionFormHeightReporter({
+	onHeight,
+	children,
+}: {
+	onHeight: (height: number) => void;
+	children: ReactNode;
+}) {
+	const ref = useRef<HTMLDivElement | null>(null);
+	const onHeightRef = useRef(onHeight);
+	onHeightRef.current = onHeight;
+	const lastRef = useRef<number | null>(null);
+	useEffect(() => {
+		const node = ref.current;
+		if (!node) return;
+		const report = () => {
+			const height = Math.round(node.offsetHeight);
+			if (height <= 0) return;
+			const last = lastRef.current;
+			if (last !== null && Math.abs(last - height) <= 1) return;
+			lastRef.current = height;
+			onHeightRef.current(height);
+		};
+		report();
+		if (typeof ResizeObserver === "undefined") return;
+		const observer = new ResizeObserver(report);
+		observer.observe(node);
+		return () => observer.disconnect();
+	}, []);
+	return (
+		<div ref={ref} data-nf-permission-form style={{ display: "flow-root" }}>
+			{children}
+		</div>
+	);
+}
+
 export function RenderToolCall({
 	measured,
 	labels,
@@ -2091,6 +2150,7 @@ export function RenderToolCall({
 	onPermissionAllow,
 	onPermissionDeny,
 	permissionSlot,
+	onPermissionFormHeight,
 	onReflectionTakeOver,
 	reflectionTakingOver,
 	viewTargets,
@@ -2103,6 +2163,7 @@ export function RenderToolCall({
 		effectiveOpened,
 		detail,
 		permission,
+		permissionFormHeight,
 		reflection,
 		hasBorder,
 		inRun,
@@ -2138,7 +2199,17 @@ export function RenderToolCall({
 	// measured command/output body, or the measured permission/reflection copy,
 	// open. A reflection notice still replaces the permission area
 	// (ToolCallCard.tsx:5419). The shell post-paints the slot.
-	const liveSlot = reflection ? null : (permissionSlot ?? null);
+	const rawLiveSlot = reflection ? null : (permissionSlot ?? null);
+	// A RESERVED form (the measure layer made room for it) is observed on its own, so
+	// its growth reaches the layout while the card stays a clipped, arithmetic row.
+	const liveSlot =
+		rawLiveSlot != null && permissionFormHeight > 0 && onPermissionFormHeight ? (
+			<PermissionFormHeightReporter onHeight={onPermissionFormHeight}>
+				{rawLiveSlot}
+			</PermissionFormHeightReporter>
+		) : (
+			rawLiveSlot
+		);
 	const measuredSlot = reflection ? (
 		<RenderReflectionNotice
 			measured={reflection}

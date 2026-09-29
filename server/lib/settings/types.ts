@@ -525,8 +525,9 @@ export interface NarraForkSettings {
 	/**
 	 * Machine-level client fingerprint state shared across providers.
 	 * `installationId` is a persisted UUID (generated lazily) sent as the
-	 * `x-codex-installation-id` header when Codex emulation is enabled.
-	 * `claudeDeviceId` is a persisted 64-hex id (generated lazily) sent as
+	 * `x-codex-installation-id` key inside Codex request-body `client_metadata`
+	 * (not as a direct HTTP header — matches the real Codex CLI). `claudeDeviceId`
+	 * is a persisted 64-hex id (generated lazily) sent as
 	 * `metadata.user_id.device_id` on official Anthropic requests, matching the
 	 * shape and lifetime of the Claude Code CLI's own `device_id`.
 	 */

@@ -421,6 +421,9 @@ export function renderElement(
 					onTerminate={extra.onTerminate as (() => void) | undefined}
 					onUpdateTimeout={extra.onUpdateTimeout as ((timeoutMs: number) => void) | undefined}
 					permissionSlot={extra.permissionSlot as React.ReactNode}
+					onPermissionFormHeight={
+						extra.onPermissionFormHeight as ((height: number) => void) | undefined
+					}
 					onReflectionTakeOver={extra.onReflectionTakeOver as (() => void) | undefined}
 					// Per-body viewer wiring (copy / wrap / source / fullscreen action bar).
 					// The shell derives the targets from the MEASURED card, so without this

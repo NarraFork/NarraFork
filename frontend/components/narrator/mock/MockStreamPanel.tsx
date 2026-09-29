@@ -45,6 +45,8 @@ export function MockStreamPanel({ narratorId }: MockStreamPanelProps) {
 	const [tools, setTools] = useState(DEFAULT_MOCK_SCENARIO.tools);
 	const [rounds, setRounds] = useState(DEFAULT_MOCK_SCENARIO.rounds);
 	const [textRepeat, setTextRepeat] = useState(DEFAULT_MOCK_SCENARIO.textRepeat);
+	const [permissions, setPermissions] = useState(DEFAULT_MOCK_SCENARIO.permissions);
+	const [permissionHoldMs, setPermissionHoldMs] = useState(DEFAULT_MOCK_SCENARIO.permissionHoldMs);
 
 	// Pacing.
 	const [charsPerFrame, setCharsPerFrame] = useState(DEFAULT_MOCK_SCENARIO.charsPerFrame);
@@ -78,6 +80,8 @@ export function MockStreamPanel({ narratorId }: MockStreamPanelProps) {
 			charsPerFrame,
 			toolOutputCharsPerFrame,
 			textRepeat,
+			permissions,
+			permissionHoldMs,
 		}),
 		[
 			narratorId,
@@ -88,6 +92,8 @@ export function MockStreamPanel({ narratorId }: MockStreamPanelProps) {
 			charsPerFrame,
 			toolOutputCharsPerFrame,
 			textRepeat,
+			permissions,
+			permissionHoldMs,
 		],
 	);
 
@@ -222,6 +228,24 @@ export function MockStreamPanel({ narratorId }: MockStreamPanelProps) {
 					label="Tool calls"
 					checked={tools}
 					onChange={(e) => setTools(e.currentTarget.checked)}
+				/>
+				<Switch
+					size="sm"
+					label="Permission gate (Bash / Write / Edit)"
+					description="Request → hold → scripted allow. The form is display-only: its buttons reach the server, which does not know the mock request and ignores it."
+					checked={permissions}
+					disabled={!tools}
+					onChange={(e) => setPermissions(e.currentTarget.checked)}
+				/>
+				<NumberInput
+					size="xs"
+					label="Permission hold (ms)"
+					min={0}
+					max={60_000}
+					step={250}
+					value={permissionHoldMs}
+					disabled={!tools || !permissions}
+					onChange={(v) => setPermissionHoldMs(Math.max(0, toInt(v, permissionHoldMs)))}
 				/>
 
 				<Divider label="Scope" labelPosition="left" />

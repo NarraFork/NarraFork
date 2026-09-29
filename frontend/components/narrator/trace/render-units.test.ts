@@ -452,21 +452,21 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 		expect(activity.items.some((i) => i.kind === "tool" && i.tc.toolUseId === "tool-2")).toBe(true);
 	});
 
-	test("a tool AWAITING A PERMISSION decision keeps its full card", () => {
-		// The only surviving exemption: the approve/deny form can only be hosted by a
-		// tool-call / subagent-card (PERMISSION_HOST_KINDS), so folding this row would
-		// drop the controls the narrator is blocked on.
+	test("a tool AWAITING A PERMISSION decision stays a row of the trace", () => {
+		// It used to be split out as a standalone card, which made one call change
+		// component twice (row → card on the request, card → row on the decision). The
+		// adapter now drills the row open onto the card that hosts the form, so the
+		// grouper must keep the call exactly where its siblings are.
 		const segments = segmentMessages([
 			toolMessage("message-1", "tool-1", "thought one"),
 			toolMessage("message-2", "tool-2", "thought two", { status: "pending" }),
 		]);
 		const units = groupRenderUnits(segments, true);
-		const toolRunUnit = units.find((u) => u.kind === "segment" && u.seg.kind === "tool-run");
-		expect(toolRunUnit).toBeDefined();
+		expect(units.some((u) => u.kind === "segment" && u.seg.kind === "tool-run")).toBe(false);
 		const folded = units.filter((u) => u.kind === "activity");
 		expect(
 			folded.some((u) => u.items.some((i) => i.kind === "tool" && i.tc.toolUseId === "tool-2")),
-		).toBe(false);
+		).toBe(true);
 	});
 
 	test("streaming reasoning folds, and its row key survives persistence", () => {
@@ -633,23 +633,27 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 		}
 	});
 
-	test("a permission-blocked call keeps only ITS card, siblings still fold", () => {
+	test("a permission-blocked call does not split its trace", () => {
 		const segments = segmentMessages([
 			toolMessage("message-0", "tool-0", "why"),
-			(() => {
-				const msg = toolMessage("message-1", "tool-1", "", { status: "pending" });
-				return msg;
-			})(),
+			toolMessage("message-1", "tool-1", "", { status: "pending" }),
 			toolMessage("message-2", "tool-2", ""),
 		]);
 		const units = groupRenderUnits(segments, true);
-		const kinds = units.map((unit) => unit.kind);
-		expect(kinds).toContain("activity");
 		// groupRenderUnits wraps tool-run segments as { kind: "segment", seg: {...} }.
 		const keptItems = units.flatMap((unit) =>
 			unit.kind === "segment" && unit.seg.kind === "tool-run" ? unit.seg.items : [],
 		);
-		expect(keptItems).toMatchObject([{ tc: { toolUseId: "tool-1" } }]);
+		expect(keptItems).toEqual([]);
+		// All three calls stay in ONE trace, in source order, so the blocked call keeps its
+		// position between its neighbours while its row is drilled open.
+		const activity = units.filter((unit) => unit.kind === "activity");
+		expect(activity).toHaveLength(1);
+		const toolIds =
+			activity[0]?.kind === "activity"
+				? activity[0].items.flatMap((item) => (item.kind === "tool" ? [item.tc.toolUseId] : []))
+				: [];
+		expect(toolIds).toEqual(["tool-0", "tool-1", "tool-2"]);
 	});
 
 	test("AskUserQuestion keeps its card out of the activity fold", () => {

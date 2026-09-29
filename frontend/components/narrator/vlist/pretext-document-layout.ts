@@ -70,6 +70,10 @@ export interface BuildPretextDocumentLayoutOptions {
 	/** Whether an error card may offer the model probe (shares that measured row). */
 	canOfferModelTest?: (errorText: string) => boolean;
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
+	/** First-frame layout of a live InlinePermission form (see AdapterContext). */
+	resolvePermissionFormPrediction?: (toolUseId: string | undefined) => unknown;
+	/** Painted height of that form once it has mounted (see AdapterContext). */
+	resolvePermissionFormHeight?: (toolUseId: string | undefined) => number | undefined;
 	/**
 	 * Pinned-card resolver forwarded to the adapter. Built locally by
 	 * `buildPretextDocumentLayout` over the id it derives from the messages being
@@ -106,6 +110,62 @@ function sourceMessagesForUnit(unit: RenderUnit): SourceMessage[] {
 	if (unit.seg.kind === "message") return [unit.seg.msg as SourceMessage];
 	if (unit.seg.kind === "tool-run") return unit.seg.sourceMessages as SourceMessage[];
 	return [];
+}
+
+/**
+ * Hand-off-stable key of one L1/L2 activity unit: `activity-<first item identity>`.
+ *
+ * ⚠️ It must NOT derive from the first SOURCE MESSAGE's id, which is what it used to be
+ * (`activity-<firstMsgId>-<unitIndex>`). A live turn's content sits in the synthetic
+ * `__streaming__` message and inherits a real id the moment it persists, so the key
+ * changed exactly at the hand-off — the instant the row content merely settled —
+ * and React remounted the whole trace: shimmer phase reset, and the reader's
+ * drill-down / expand state (both keyed by this string) silently dropped. Probed on
+ * the real pipeline: `activity-__streaming__-3` → `activity-a1-3` when a tool_use
+ * block landed, with an identical single row inside.
+ *
+ * The first ITEM carries an identity that both sides share:
+ *  - a tool: its tool-use id (`t:<id>`, plus the retry disambiguator), the same id
+ *    `dropPersistedStreamingTools` hands off on;
+ *  - reasoning: its modern block id (`r:<id>`), global and identical in the
+ *    accumulator and the stored block. A legacy block with no id falls back to its
+ *    message coordinates, which is no worse than the old key.
+ *
+ * Uniqueness: one tool-use id / block id lands in at most one unit (the grouper
+ * retires a synthetic twin whose tool is persisted anywhere in the document, and
+ * `projectStreamingDocument` retires reasoning a committed block supersedes), and the
+ * manifest de-duplicates any residual collision with `#dupN` like every other key.
+ *
+ * Exported so `buildSourceResolver` registers the SAME string — two derivations of one
+ * key are how the resolver and the manifest would silently drift apart.
+ */
+export function activityUnitKey(
+	unit: Pick<Extract<RenderUnit, { kind: "activity" }>, "items" | "sourceMessages">,
+	unitIndex: number,
+): string {
+	const first = unit.items[0];
+	if (first?.kind === "tool") {
+		const toolUseId = first.tc?.toolUseId;
+		if (toolUseId) {
+			return first.dedupeSuffix
+				? `activity-t:${toolUseId}#${first.dedupeSuffix}`
+				: `activity-t:${toolUseId}`;
+		}
+	} else if (first?.kind === "reasoning") {
+		const blockId = (first.block as { id?: unknown } | undefined)?.id;
+		// The accumulator's synthetic lane ids (`streaming:reasoning:0`) have no persisted
+		// counterpart, so they would change at the hand-off anyway; falling through keeps
+		// such a unit on the `__streaming__`-bearing key, which the measure cache already
+		// knows not to cache.
+		if (typeof blockId === "string" && blockId.length > 0 && !blockId.startsWith("streaming:")) {
+			return `activity-r:${blockId}`;
+		}
+		const messageId = first.msg?.id;
+		if (messageId) return `activity-r:${messageId}-b${first.blockIndex}`;
+	}
+	// No item identity at all (defensive — the grouper never emits an empty unit):
+	// the historical shape, still unique within one build.
+	return `activity-${unit.sourceMessages[0]?.id ?? "unknown"}-${unitIndex}`;
 }
 
 function sourceSeq(message: Pick<SourceMessage, "seq"> | undefined, fallback: number): number {
@@ -173,7 +233,7 @@ function buildSourceResolver(
 	const all = renderUnits.flatMap((unit, unitIndex) => {
 		const sources = sourceMessagesForUnit(unit);
 		if (unit.kind === "activity") {
-			exact.set(`activity-${sources[0]?.id ?? "unknown"}-${unitIndex}`, sources);
+			exact.set(activityUnitKey(unit, unitIndex), sources);
 		}
 		if (unit.kind === "segment" && unit.seg.kind === "message" && unit.seg.msg.id)
 			exact.set(unit.seg.msg.id, sources);
@@ -296,7 +356,7 @@ export function buildPretextDocumentLayout(
 		unit.kind === "activity"
 			? {
 					kind: "activity",
-					key: `activity-${unit.sourceMessages[0]?.id ?? "unknown"}-${index}`,
+					key: activityUnitKey(unit, index),
 					items: unit.items as unknown as AdapterActivityInput[],
 					sourceMessages: unit.sourceMessages as unknown as AdapterMessage[],
 				}

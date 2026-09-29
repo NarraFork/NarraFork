@@ -26,9 +26,13 @@
  * only the shimmer stops and the status glyph settles. Reasoning rows are keyed by
  * their ordinal inside the unit for the same reason (see `stableKeyBase`).
  *
- * The one exception is a tool AWAITING A PERMISSION DECISION: its approve/deny
- * form can only be hosted by a full card, and the shape change that follows the
- * decision is the direct result of a user action rather than an unprompted jump.
+ * A tool AWAITING A PERMISSION DECISION folds too. It used to be the one exception
+ * (its approve/deny form needs a full card), which made a single call change
+ * component TWICE: row → standalone card when the request landed, card → row when
+ * the decision did — each swap a different element at a different height, with the
+ * card also growing once the real form painted. It now stays the SAME trace row and
+ * the adapter drills it open onto its card while the request is live, so the form
+ * rides the drill-down's own transition (see `adaptActivityItems`' pinned-open rows).
  */
 
 import { isCommunicationTool } from "@shared/communication-tool";
@@ -96,19 +100,6 @@ export type RenderUnit =
 			sourceMessages: NarratorMsg[];
 			sourceSegments: RenderSegment[];
 	  };
-
-/**
- * A tool awaiting the user's permission decision.
- *
- * `status === "pending"` IS that state: `narrator-permission.ts` writes it when it
- * creates the request and moves off it once the decision lands. Such a tool keeps
- * its full card at every LOD because the approve/deny form has nowhere else to
- * live — `PERMISSION_HOST_KINDS` only admits `tool-call` / `subagent-card`, so a
- * folded row would silently drop the controls the narrator is blocked on.
- */
-export function isPermissionAwaitingToolItem(item: ToolRunItem): boolean {
-	return item.tc.status === "pending";
-}
 
 export type ToolRunLodGroup =
 	| { kind: "active"; item: ToolRunItem; index: number }
@@ -246,10 +237,10 @@ function splitMessageSegmentForActivity(
  * activity trace.
  *
  * Running / streaming tools DO fold (that is what makes the hand-off invisible —
- * see the module header). These kinds keep their cards:
+ * see the module header), and so does a tool blocked on a permission decision: the
+ * adapter drills its row open onto the card that hosts the form, so it no longer
+ * needs to leave the trace. These kinds keep their cards:
  *  - subagent calls, whose task details stay visible at every LOD;
- *  - a tool blocked on a permission decision (its approve/deny form has nowhere
- *    else to live — see `isPermissionAwaitingToolItem`);
  *  - prefer-open tools (AskUserQuestion), whose options/form must stay on screen
  *    at low LOD and default-expand without a drill-down;
  *  - the most recent spec://tasks.json call, when the caller passes its tool-use
@@ -257,12 +248,7 @@ function splitMessageSegmentForActivity(
  *    the task board is the narrator's live working state).
  */
 function isKeptToolItem(item: ToolRunItem, keepToolUseIds?: ReadonlySet<string>): boolean {
-	if (
-		item.isSubagent ||
-		isCommunicationTool(item.tc) ||
-		isPermissionAwaitingToolItem(item) ||
-		isPreferOpenTool(item.tc)
-	) {
+	if (item.isSubagent || isCommunicationTool(item.tc) || isPreferOpenTool(item.tc)) {
 		return true;
 	}
 	const toolUseId = item.tc.toolUseId;
@@ -372,8 +358,8 @@ function toolItemsFromToolRunSegment(
  * Visible answer content and user messages remain plain segment units and preserve
  * their chronological positions.
  *
- * A tool that must keep its full card (permission-blocked, or named in
- * `keepToolUseIds`) is split out ON ITS OWN, as a one-item tool-run segment at its
+ * A tool that must keep its full card (a subagent / communication / prefer-open call,
+ * or one named in `keepToolUseIds`) is split out ON ITS OWN, as a one-item tool-run segment at its
  * original position; its siblings still fold. See `splitToolRunForActivity` for why
  * excluding the whole run instead made a low LOD lose a call entirely.
  *

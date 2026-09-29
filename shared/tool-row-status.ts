@@ -199,9 +199,15 @@ export function resolveToolRowStatusMark(
  * `success`, and the spinner stays on the previous call until the next
  * structural reload — the "status lags by one tool call" symptom.
  *
- * `pending` shares rank 1 with `initializing`: it is a sibling outcome of the
- * permission gate ("waiting on a human"), not a later phase, and events that
- * set it are authoritative in their own right.
+ * `pending` ranks ABOVE `initializing`. The permission gate only ever moves a row
+ * `initializing → pending`, never back: every server write of `initializing`
+ * either inserts a new row (attempt 1) or a new EXECUTION ATTEMPT
+ * (`prepareToolCallExecutionAttempt`, a higher `executionAttempt`, which
+ * `mergeToolLifecycleRecord` admits as a retry before this rank is consulted).
+ * So a same-attempt `initializing` arriving after `pending` is a stale snapshot —
+ * e.g. a `publishPartial` that read the row before the gate wrote `pending` and
+ * broadcast after it. With the two tied, that snapshot won and put the row back
+ * to "setting up" while its approval form was on screen.
  *
  * Unknown statuses are absent on purpose: refusing them would freeze a card on
  * a state this frontend cannot spell.
@@ -209,7 +215,7 @@ export function resolveToolRowStatusMark(
 export const LIVE_TOOL_PHASE_RANK: Readonly<Record<string, number>> = {
 	streaming: 0,
 	initializing: 1,
-	pending: 1,
+	pending: 1.5,
 	running: 2,
 	// Anything terminal outranks everything: a completed tool must never reopen.
 	success: 3,

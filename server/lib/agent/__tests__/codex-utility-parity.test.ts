@@ -85,7 +85,8 @@ describe.each([
 		const req = await capture(run);
 
 		expect(req.headers.originator).toBe(ORIGINATOR_CODEX);
-		expect(req.headers["x-codex-installation-id"]).toBeTruthy();
+		// Official /responses never projects the installation id onto a header.
+		expect(req.headers["x-codex-installation-id"]).toBeUndefined();
 		expect(req.headers["user-agent"]).toMatch(new RegExp(`^${ORIGINATOR_CODEX}/[^ ]+ `));
 		expect(req.headers["user-agent"]).toMatch(
 			new RegExp(`unknown \\(${ORIGINATOR_CODEX}; [^)]+\\)$`),
@@ -142,8 +143,10 @@ describe.each([
 		expect(req.body.text).toEqual({ verbosity: "low" });
 		expect(metadata.session_id).toBe(req.headers["session-id"]);
 		expect(metadata.thread_id).toBe(req.headers["thread-id"]);
-		// The real client uses the hyphenated key here, matching the header name.
-		expect(metadata["x-codex-installation-id"]).toBe(req.headers["x-codex-installation-id"]);
+		// The real client uses the hyphenated key here and carries it ONLY in
+		// client_metadata — never as a matching direct header.
+		expect(metadata["x-codex-installation-id"]).toBeTruthy();
+		expect(req.headers["x-codex-installation-id"]).toBeUndefined();
 	});
 
 	test("sends the window identity and omits the turn-metadata blob", async () => {

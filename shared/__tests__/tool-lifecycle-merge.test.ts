@@ -22,6 +22,33 @@ describe("isLiveToolStatusRegression", () => {
 		expect(isLiveToolStatusRegression("success", "somethingNew")).toBe(false);
 		expect(isLiveToolStatusRegression(undefined, "running")).toBe(false);
 	});
+
+	it("treats pending → initializing as a regression (the gate never moves back)", () => {
+		// A partial-message broadcast that read the row before the permission gate wrote
+		// `pending` must not put an awaiting row back to "setting up".
+		expect(isLiveToolStatusRegression("pending", "initializing")).toBe(true);
+		expect(isLiveToolStatusRegression("initializing", "pending")).toBe(false);
+		expect(isLiveToolStatusRegression("pending", "running")).toBe(false);
+	});
+});
+
+describe("mergeToolLifecycleRecord — the permission gate", () => {
+	it("keeps pending when a stale initializing snapshot of the same attempt arrives", () => {
+		const merged = mergeToolLifecycleRecord(
+			{ status: "pending", executionAttempt: 1, permissionStartedAt: 10 },
+			{ status: "initializing", executionAttempt: 1 },
+		);
+		expect(merged.status).toBe("pending");
+	});
+
+	it("still admits a NEW attempt that starts over at initializing", () => {
+		// allow-retry inserts attempt 2 at `initializing`; that is the present state.
+		const merged = mergeToolLifecycleRecord(
+			{ status: "pending", executionAttempt: 1 },
+			{ status: "initializing", executionAttempt: 2 },
+		);
+		expect(merged.status).toBe("initializing");
+	});
 });
 
 describe("mergeToolLifecycleRecord", () => {

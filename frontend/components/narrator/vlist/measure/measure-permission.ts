@@ -199,6 +199,19 @@ export const PERM_BUTTON_GROUP_GAP = SPACING.sm; // 12
 /** readOnly note ("permission actions unavailable") — single xs line. */
 export const READONLY_NOTE_HEIGHT = XS_LINE_HEIGHT; // 17
 
+/**
+ * StructSed preview loading row: `Group gap="xs" mb="xs"` holding a Loader size xs
+ * (18px) and an xs dimmed line, so the row is the taller of the two. A function
+ * because the text line follows the reader's typography.
+ */
+export function PREVIEW_LOADING_ROW_HEIGHT(): number {
+	return Math.max(PREVIEW_LOADER_SIZE, typographyMetrics().line.xs);
+}
+/** Mantine `Loader size="xs"` box (`--loader-size-xs: 18px`). */
+export const PREVIEW_LOADER_SIZE = 18;
+/** The loading row's mb="xs"(10). */
+export const PREVIEW_LOADING_MARGIN_BOTTOM = SPACING.xs;
+
 /** Height of the ExitPlanMode edit Textarea, clamped to [8, 30] rows. */
 export function planTextareaHeight(rows: number): number {
 	const r = clamp(rows, PLAN_TEXTAREA_MIN_ROWS, PLAN_TEXTAREA_MAX_ROWS);
@@ -292,6 +305,13 @@ export interface InlinePermissionData {
 	planEditRows?: number;
 	/** Whether the "plan edited" badge is shown (planEdited && !editing). */
 	planEdited?: boolean;
+	/**
+	 * StructSed's change preview is still loading: the form opens with a one-line
+	 * "loading preview…" row (`Group mb="xs"` with an xs Loader + xs text) that the
+	 * diff later replaces. Only the loading state is predictable — the diff itself is
+	 * fetched, so its height arrives through the painted-height report.
+	 */
+	hasPreviewLoading?: boolean;
 	/** Whether a decision-reason line block is shown. */
 	hasDecisionReason?: boolean;
 	/** Wrapped line count of the decision reason; default 1. */
@@ -337,6 +357,7 @@ export interface MeasuredAskUserQuestion extends MeasuredElement {
 
 export type PermBlockRole =
 	| "exec-target"
+	| "preview-loading"
 	| "plan-edited-badge"
 	| "plan-textarea"
 	| "decision-reason"
@@ -643,6 +664,16 @@ export function measureInlinePermission(
 			}),
 			{ role: "exec-target", data: { cwdLines, pathLines } },
 			TARGET_MARGIN_BOTTOM,
+		);
+	}
+
+	// StructSed change-preview loading row (mb="xs"). Painted by InlinePermission right
+	// after the execution target, before the plan badge.
+	if (data.hasPreviewLoading) {
+		push(
+			makeFixed(PREVIEW_LOADING_ROW_HEIGHT(), "preview-loading"),
+			{ role: "preview-loading" },
+			PREVIEW_LOADING_MARGIN_BOTTOM,
 		);
 	}
 

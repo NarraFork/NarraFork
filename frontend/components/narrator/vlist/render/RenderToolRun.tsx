@@ -52,6 +52,7 @@ import {
 	IconTool,
 } from "@tabler/icons-react";
 import { useEffect, useRef, useState } from "react";
+import "../vlist-markdown.css";
 import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
 import {
 	CARD_HEADER_INNER_ICON,
@@ -100,6 +101,14 @@ const ROW_INNER_ICON = CARD_HEADER_INNER_ICON;
 const HEADER_INNER_ICON = ROW_INNER_ICON;
 const DIMMED = "var(--mantine-color-dimmed)";
 
+/** One-shot opacity fade for a trace row label switching form (see `useLabelFormFade`). */
+const LABEL_FADE_CLASS = "vlist-trace-label-in";
+
+function joinClasses(...classes: (string | undefined)[]): string | undefined {
+	const joined = classes.filter(Boolean).join(" ");
+	return joined.length > 0 ? joined : undefined;
+}
+
 /** A row's chip tint from its category, via the vlist render layer's own table. */
 function categoryColor(category: string | undefined): string {
 	if (!category) return "gray";
@@ -130,6 +139,12 @@ export interface TraceRenderLabels {
 	 * because the number is per-row; the renderer appends `…` + the tail itself.
 	 */
 	liveTailChars?: (formatted: string) => string;
+	/**
+	 * Placeholder for a LIVE reasoning row that has no text yet ("思考中…"). Without it
+	 * the row opened as a bare chip with an empty label, and its first words then popped
+	 * into a line that had given no sign it was about to hold anything.
+	 */
+	reasoningPending?: string;
 	/**
 	 * Timing popover strings for the per-row duration slot. Absent → the render
 	 * layer's English fallbacks. Height-neutral (portaled popover, fixed rows).
@@ -413,6 +428,7 @@ export function RenderToolRun({
 					statusMarkLabels={labels.statusMark}
 					liveTail={rowLiveTails?.get(row.key)}
 					liveTailChars={labels.liveTailChars}
+					reasoningPending={labels.reasoningPending}
 					// Only the row still being written may fade. `row.shimmer` is the
 					// adapter's own live marker, so a run that the answer text or a tool
 					// call already followed settles here too — the same moment its shimmer
@@ -469,6 +485,26 @@ const ROW_FLASH_MS = TRACE_SHIMMER_FLASH_HOLD_MS;
  * while scrolling, so a mount-triggered flash would light up whole screens of
  * settled history.
  */
+type LabelForm = "pending" | "tail" | "title";
+
+/**
+ * Whether the label should fade in on THIS render: true only when an already-mounted row
+ * switched label form. A row mounting (scrolling into the window, a new row arriving)
+ * keeps its label still — fading every row as it scrolls in would be motion the reader
+ * did not cause.
+ *
+ * No state needed: the switch is detected in the SAME render that mounts the new form's
+ * keyed node, so that node carries the class on its first paint. The next form-stable
+ * render removes the class again, which does not restart (or cut) an animation that is
+ * already running — a CSS animation plays once per class application.
+ */
+function useLabelFormFade(form: LabelForm): boolean {
+	const previous = useRef<LabelForm | null>(null);
+	const switched = previous.current !== null && previous.current !== form;
+	previous.current = form;
+	return switched;
+}
+
 function useTraceRowShimmerKind(row: MeasuredTraceRow): ToolShimmerKind | null {
 	const status = row.status;
 	const prevStatusRef = useRef<string | null>(null);
@@ -542,7 +578,16 @@ function useTraceRowShimmerKind(row: MeasuredTraceRow): ToolShimmerKind | null {
  * branches of the SAME row and two memories of one row's status is a bug (see the
  * module header).
  */
-function TraceRowTitle({ row, shimmerClass }: { row: MeasuredTraceRow; shimmerClass?: string }) {
+function TraceRowTitle({
+	row,
+	shimmerClass,
+	fadeIn = false,
+}: {
+	row: MeasuredTraceRow;
+	shimmerClass?: string;
+	/** Play the one-shot label fade (a label-form switch on a mounted row). */
+	fadeIn?: boolean;
+}) {
 	const split = splitTraceRowTitle(row.title, row.toolName);
 	const typo = typographyMetrics();
 	return (
@@ -553,7 +598,7 @@ function TraceRowTitle({ row, shimmerClass }: { row: MeasuredTraceRow; shimmerCl
 			// so the folded row grew while its title stayed neutral-sized.
 			c="dimmed"
 			truncate
-			className={shimmerClass}
+			className={joinClasses(shimmerClass, fadeIn ? LABEL_FADE_CLASS : undefined)}
 			style={{
 				flex: "0 1 auto",
 				minWidth: 0,
@@ -662,25 +707,29 @@ function LiveTailText({
 	tail,
 	charsLabel,
 	shimmerClass,
+	fadeIn = false,
 }: {
 	tail: { charCount: number; tail: string };
 	charsLabel?: (formatted: string) => string;
 	/** Resolved once per row by `TraceRowView` — see `TraceRowTitle` on why. */
 	shimmerClass?: string;
+	/** Play the one-shot label fade (a label-form switch on a mounted row). */
+	fadeIn?: boolean;
 }) {
 	const prefix = charsLabel?.(String(tail.charCount)) ?? `${tail.charCount} chars`;
+	const fade = fadeIn ? LABEL_FADE_CLASS : undefined;
 	return (
 		<>
 			{/* The size readout. `flexShrink: 0` keeps it intact while the tail absorbs
 			    the width pressure — it is the one part of the label that must never be
 			    clipped, since it is what tells the reader the run is still growing. */}
-			<Text size="xs" c="dimmed" style={{ flexShrink: 0, opacity: 0.6 }}>
+			<Text size="xs" c="dimmed" className={fade} style={{ flexShrink: 0, opacity: 0.6 }}>
 				{prefix}…
 			</Text>
 			<Text
 				size="xs"
 				c="dimmed"
-				className={shimmerClass}
+				className={joinClasses(shimmerClass, fade)}
 				style={{
 					// `0 1 auto` — HUG the tail's own text, shrinking only under pressure.
 					// The same basis a settled title uses, and for the same reason.
@@ -728,6 +777,7 @@ function TraceRowView({
 	statusMarkLabels,
 	liveTail,
 	liveTailChars,
+	reasoningPending,
 	animateStreaming,
 	animKeyBase,
 	animScope,
@@ -744,6 +794,8 @@ function TraceRowView({
 	statusMarkLabels?: TraceRenderLabels["statusMark"];
 	liveTail?: { charCount: number; tail: string };
 	liveTailChars?: (formatted: string) => string;
+	/** Placeholder label for a live reasoning row with no text yet. */
+	reasoningPending?: string;
 	/** This row is the live one AND the fade is enabled (see RenderToolRunProps). */
 	animateStreaming?: boolean;
 	animKeyBase?: string;
@@ -790,17 +842,31 @@ function TraceRowView({
 	const shimmerClass = shimmerKind ? TRACE_SHIMMER_CLASS[shimmerKind] : undefined;
 	const shimmerLabel = shimmerStateLabel(shimmerKind, shimmerStateLabels);
 	const icon = row.hasIcon ? (rowIcon?.(row) ?? <DefaultRowIcon row={row} />) : null;
+	// Which form the label takes: the live tail, a placeholder for a live row with no
+	// text yet (reasoning rows carry no status — that is how a tool row is told apart),
+	// or the ordinary title. `fadeLabel` is true only on a commit where the form CHANGED
+	// on an already-mounted row (see useLabelFormFade).
+	const labelForm: LabelForm = liveTail
+		? "tail"
+		: row.shimmer && !row.title.trim() && row.status == null
+			? "pending"
+			: "title";
+	const fadeLabel = useLabelFormFade(labelForm);
 	const interactive = !!row.identity && !!rowInteraction;
+	// A row the SYSTEM drilled open for a live permission form cannot be folded by the
+	// reader (see `MeasuredTraceRow.pinnedOpen`): a click would store an explicit
+	// expansion that outlives the request and leave the row open after the decision.
+	const togglable = row.expandable && row.pinnedOpen !== true;
 	// A modified click means "select this row", not "expand it" — the interaction
 	// wrapper performs the selection, so swallow the toggle.
-	const handleToggle = row.expandable
+	const handleToggle = togglable
 		? (e: React.MouseEvent) => {
 				if (interactive && (e.metaKey || e.ctrlKey || e.shiftKey)) return;
 				onToggleRow?.(row.itemIndex, row.key);
 			}
 		: undefined;
 	// Enter / Space on a focused row, the keyboard equivalent of the click above.
-	const handleKeyDown = row.expandable
+	const handleKeyDown = togglable
 		? activateOnKey(() => onToggleRow?.(row.itemIndex, row.key))
 		: undefined;
 	const titleRow = (
@@ -818,16 +884,16 @@ function TraceRowView({
 			// These are ATTRIBUTES ONLY — no box, no font, nothing the measure layer
 			// models — so the row's height is unchanged (asserted in
 			// `measure-tool-run.test.ts`).
-			role={row.expandable ? "button" : undefined}
-			tabIndex={row.expandable ? 0 : undefined}
-			aria-expanded={row.expandable ? row.expanded : undefined}
+			role={togglable ? "button" : undefined}
+			tabIndex={togglable ? 0 : undefined}
+			aria-expanded={togglable ? row.expanded : undefined}
 			// The shimmer's five states are carried by colour alone; this is the only
 			// channel a non-visual reader has for them.
 			aria-label={shimmerLabel ? `${row.title || "…"} — ${shimmerLabel}` : undefined}
 			title={shimmerLabel}
 			style={{
 				height: traceMetrics().rowHeight,
-				cursor: row.expandable ? "pointer" : "default",
+				cursor: togglable ? "pointer" : "default",
 				userSelect: "none",
 			}}
 			onClick={handleToggle}
@@ -864,10 +930,30 @@ function TraceRowView({
 			    title instead of being flung to the row's right edge. A short title keeps
 			    them adjacent; a long one truncates and they follow the ellipsis. The
 			    trailing spacer below absorbs whatever is left. */}
-			{liveTail ? (
-				<LiveTailText tail={liveTail} charsLabel={liveTailChars} shimmerClass={shimmerClass} />
+			{/* The label has three FORMS on a live reasoning row — the placeholder before any
+			    text, the scrolling tail while a long step is written, the settled title — and
+			    switching between them used to be a hard cut in place. Each form is keyed, so
+			    React remounts the label only when the FORM changes and the one-shot CSS fade
+			    (`vlist-trace-label-in`, opacity only, height-neutral) plays exactly on that
+			    switch; a tail advancing or a title growing keeps its key and never re-fades.
+			    A row that mounted in its current form (scrolling into the window) is not a
+			    switch, so `fadeLabel` stays false for it. */}
+			{labelForm === "tail" && liveTail ? (
+				<LiveTailText
+					key="tail"
+					tail={liveTail}
+					charsLabel={liveTailChars}
+					shimmerClass={shimmerClass}
+					fadeIn={fadeLabel}
+				/>
+			) : labelForm === "pending" ? (
+				<TraceRowTitle
+					key="pending"
+					row={{ ...row, title: reasoningPending ?? "…" }}
+					shimmerClass={shimmerClass}
+				/>
 			) : (
-				<TraceRowTitle row={row} shimmerClass={shimmerClass} />
+				<TraceRowTitle key="title" row={row} shimmerClass={shimmerClass} fadeIn={fadeLabel} />
 			)}
 			{/* Status + duration, adjacent to the label rather than right-aligned: in a
 			    column of rows a far-right number has to be traced back across the gap to

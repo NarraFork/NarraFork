@@ -656,6 +656,23 @@ export interface ToolCallData {
 	 * reflection row's height is final on its first paint.
 	 */
 	reflection?: ReflectionNoticeData | null;
+	/**
+	 * The live InlinePermission form this card hosts, reserved ARITHMETICALLY.
+	 *
+	 * Before this, the form was a post-paint body: the card was a `minHeight` row whose
+	 * real height arrived one frame later through a ResizeObserver, so every request
+	 * made the card grow twice (once to the arithmetic card, again to the painted form)
+	 * and nothing could animate the second step. `prediction` is the region layout the
+	 * request will paint (execution target, decision reason, feedback box, buttons…),
+	 * so the first frame already reserves the right box; `height`, once the form has
+	 * mounted, is its real painted height and wins — the reader's own input (a
+	 * three-line feedback, the plan editor) and async content (a diff preview) can
+	 * grow it, and only a reading knows.
+	 *
+	 * Both are OUTER heights: `height` includes the form's own top margin, and the
+	 * prediction's `topMargin` is added to its measured body. Absent → no reserve.
+	 */
+	permissionForm?: { prediction: InlinePermissionData; height?: number };
 	/** Rendered inside a run: no border, a trailing 1px divider unless last. */
 	inRun?: boolean;
 	/** In-run only: whether this is the last card (drops the divider). */
@@ -839,6 +856,14 @@ export interface MeasuredToolCall extends MeasuredElement {
 	/** Permission region top within the card content box. */
 	permissionTop: number;
 	/**
+	 * Height reserved for the LIVE permission form (outer, margin included), or 0.
+	 *
+	 * Set from `ToolCallData.permissionForm`: the painted height once known, else the
+	 * arithmetic prediction. The renderer paints the live slot into this reserve; it
+	 * never paints the zero-DOM `permission` copy for it.
+	 */
+	permissionFormHeight: number;
+	/**
 	 * Measured reflection notice (present when a gate is running/resolved), else
 	 * null. Takes the permission area's place, exactly like the chunked card.
 	 */
@@ -982,6 +1007,25 @@ export function computeDefaultOpen(data: ToolCallData, pendingPermission: boolea
 	if ((data.category === "await" || data.category === "bash") && data.detail != null) return true;
 	if (data.status === "fail") return true;
 	return false;
+}
+
+/**
+ * Outer height reserved for a live permission form (see `ToolCallData.permissionForm`).
+ *
+ * The painted height wins once reported; before that, the prediction is measured with
+ * the same zero-DOM model the read-only copy uses, plus its top margin (the live form's
+ * `Box mt="xs"` is part of what the observer reads, so both sides describe the same box).
+ */
+export function resolvePermissionFormReserve(
+	form: NonNullable<ToolCallData["permissionForm"]>,
+	innerWidth: number,
+	lod: RenderLod,
+): number {
+	if (typeof form.height === "number" && Number.isFinite(form.height) && form.height > 0) {
+		return form.height;
+	}
+	const predicted = measureInlinePermission(form.prediction, innerWidth, lod);
+	return predicted.topMargin + predicted.height;
 }
 
 /**
@@ -1969,6 +2013,7 @@ export function measureToolCall(
 	let detail: MeasuredToolDetail | null = null;
 	let permission: MeasuredInlinePermission | null = null;
 	let reflection: MeasuredReflectionNotice | null = null;
+	let permissionFormHeight = 0;
 	let innerContentH = headerH;
 
 	const detailTop = headerH;
@@ -1997,6 +2042,11 @@ export function measureToolCall(
 			// under every resolved and every historical notice.
 			reflection = measureReflectionNotice(data.reflection, innerWidth);
 			innerContentH += reflection.topMargin + reflection.height;
+		} else if (data.permissionForm && !isStreaming) {
+			// The LIVE form's reserve. Real height when the form has painted, otherwise
+			// the prediction, so the card is the right size on the request's first frame.
+			permissionFormHeight = resolvePermissionFormReserve(data.permissionForm, innerWidth, lod);
+			innerContentH += permissionFormHeight;
 		} else if (hasPending && !isStreaming) {
 			// Streaming cards render only StreamingInputDetail — no permission UI.
 			permission = measureInlinePermission(pending, innerWidth, lod);
@@ -2027,6 +2077,7 @@ export function measureToolCall(
 		detailTop,
 		permission,
 		permissionTop,
+		permissionFormHeight,
 		reflection,
 		reflectionTop,
 		category: data.category,

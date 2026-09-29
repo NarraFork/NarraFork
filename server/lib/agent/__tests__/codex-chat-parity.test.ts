@@ -85,7 +85,8 @@ describe("codex HTTP chat request parity", () => {
 		const req = await captureChat();
 
 		expect(req.headers.originator).toBe(ORIGINATOR_CODEX);
-		expect(req.headers["x-codex-installation-id"]).toBeTruthy();
+		// Official /responses never projects the installation id onto a header.
+		expect(req.headers["x-codex-installation-id"]).toBeUndefined();
 		expect(req.headers["user-agent"]).toMatch(new RegExp(`^${ORIGINATOR_CODEX}/[^ ]+ `));
 		// The Codex Responses transport is always streamed.
 		expect(req.headers.accept).toBe("text/event-stream");
@@ -102,8 +103,9 @@ describe("codex HTTP chat request parity", () => {
 		expect(req.headers.originator).toBe(ORIGINATOR);
 		expect(req.headers["user-agent"]).toMatch(new RegExp(`^${ORIGINATOR}/[^ ]+ `));
 		expect(req.headers["user-agent"]).not.toMatch(/^codex-tui\//);
-		// Protocol identity fields still travel; only the presented client name changes.
-		expect(req.headers["x-codex-installation-id"]).toBeTruthy();
+		// Protocol identity fields still travel in the body; only the presented
+		// client name changes. No direct installation-id header.
+		expect(req.headers["x-codex-installation-id"]).toBeUndefined();
 	});
 
 	/**
@@ -130,8 +132,10 @@ describe("codex HTTP chat request parity", () => {
 		expect(req.body.prompt_cache_key).toBe("conv-http-1");
 		expect(clientMetadata.session_id).toBe("conv-http-1");
 		expect(clientMetadata.thread_id).toBe("conv-http-1");
-		// The real client uses the hyphenated key here, matching the header name.
-		expect(clientMetadata["x-codex-installation-id"]).toBe(req.headers["x-codex-installation-id"]);
+		// The real client uses the hyphenated key here and carries it ONLY in
+		// client_metadata — never as a matching direct header.
+		expect(clientMetadata["x-codex-installation-id"]).toBeTruthy();
+		expect(req.headers["x-codex-installation-id"]).toBeUndefined();
 	});
 
 	test("sends the same stable body fields as the WebSocket and utility paths", async () => {

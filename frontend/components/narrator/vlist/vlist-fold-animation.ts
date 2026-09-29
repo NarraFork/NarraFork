@@ -181,8 +181,17 @@ export interface FoldMotionPlanInput {
 	readonly before: ReadonlyMap<string, FoldRowGeometry>;
 	/** Row geometry AFTER the toggle, keyed by `spec.key`. */
 	readonly after: ReadonlyMap<string, FoldRowGeometry>;
-	/** The row whose fold state the user changed; the only candidate for a reveal. */
-	readonly toggledKey: string;
+	/**
+	 * The row whose fold state the user changed; the only candidate for a reveal.
+	 * Either this or `toggledKeys`.
+	 */
+	readonly toggledKey?: string;
+	/**
+	 * Several rows whose shape changed in ONE commit — the lifecycle channel's case (a
+	 * live card and the trace row next to it can both settle on the same patch). Each
+	 * gets the same reveal / resize treatment `toggledKey` would.
+	 */
+	readonly toggledKeys?: ReadonlySet<string>;
 	/** Viewport scroll offset before the toggle. */
 	readonly beforeScrollTop: number;
 	/**
@@ -206,13 +215,14 @@ export interface FoldMotionPlanInput {
  * per mounted row.
  */
 export function planFoldMotion(input: FoldMotionPlanInput): FoldRowMotion[] {
-	const { before, after, toggledKey, beforeScrollTop, afterScrollTop } = input;
+	const { before, after, toggledKey, toggledKeys, beforeScrollTop, afterScrollTop } = input;
 	const scrollDelta = afterScrollTop - beforeScrollTop;
+	const isToggled = (key: string) => key === toggledKey || toggledKeys?.has(key) === true;
 	const out: FoldRowMotion[] = [];
 	for (const [key, next] of after) {
 		const prev = before.get(key);
 		if (!prev) continue;
-		if (key === toggledKey) {
+		if (isToggled(key)) {
 			const grew = next.height - prev.height;
 			// Expansion uncovers the newly added region inside the already-final box.
 			if (grew > 0 && isAnimatableShift(grew)) {

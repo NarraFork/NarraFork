@@ -767,7 +767,7 @@
 	"fingerprintAddHeader": "Add header",
 	"fingerprintRemoveHeader": "Remove header",
 	"fingerprintInstallationId": "Installation ID",
-	"fingerprintInstallationIdDesc": "A persistent UUID sent as x-codex-installation-id. Regenerate to rotate this identity.",
+	"fingerprintInstallationIdDesc": "A persistent UUID sent as the x-codex-installation-id key inside request-body client_metadata (matching real Codex; not sent as a direct HTTP header). Regenerate to rotate this identity.",
 	"fingerprintRegenerate": "Regenerate",
 	"customApiProtocol": "API Protocol",
 	"customApiProtocolDesc": "Select the protocol this endpoint actually implements. Switching between Anthropic and OpenAI-style protocols automatically migrates the provider type while keeping name, prefix, key, and base URL.",

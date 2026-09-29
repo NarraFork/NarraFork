@@ -364,6 +364,13 @@ export interface TraceItemData {
 	 * case — every pre-existing producer (and drill-down test) leaves it unset.
 	 */
 	cardKind?: "tool-call" | "subagent-card";
+	/**
+	 * The adapter drilled this row open for a live permission request: its card hosts
+	 * the approve/deny form, so the row stays open for as long as the request does and
+	 * the reader cannot fold it. Height-neutral here (the height comes from `card`);
+	 * the renderer reads it to bind no toggle.
+	 */
+	pinnedOpen?: boolean;
 }
 
 /** Trace payload. maxVisible + header labels default per variant. */
@@ -483,6 +490,11 @@ export interface MeasuredTraceRow {
 	expandable: boolean;
 	/** Whether the body is currently expanded (height-affecting). */
 	expanded: boolean;
+	/**
+	 * Drilled open by the system for a live permission form (see
+	 * `TraceItemData.pinnedOpen`). The renderer binds no toggle to such a row.
+	 */
+	pinnedOpen?: boolean;
 	/** Top offset (px) of the row Group within the element. */
 	top: number;
 	/** The 18.8px row Group height (excludes any expanded body). */
@@ -769,6 +781,10 @@ export function measureCollapsibleTrace(
 								lodUserOverride: true,
 								isRecent: true,
 								viewportHeight: expandState.viewportHeight,
+								// A pinned row's card hosts the live form: measure it exactly as the
+								// standalone L3+ card with a pending request is measured, so the
+								// reserve (`data.permissionForm`) and the exemptions agree.
+								...(item.pinnedOpen === true ? { hasPendingPermission: true } : {}),
 							});
 				blockHeight = card.height;
 			} else if (typeof item.bodyText === "string" && item.bodyText.trim().length > 0) {
@@ -900,6 +916,7 @@ export function measureCollapsibleTrace(
 			// Passthrough only — never used above in any height computation.
 			identity: item.identity,
 			unitId: item.unitId,
+			...(item.pinnedOpen === true ? { pinnedOpen: true } : {}),
 		};
 	});
 

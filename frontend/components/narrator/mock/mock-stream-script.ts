@@ -37,6 +37,8 @@ import {
 } from "./mock-stream-corpus";
 import {
 	type MockFrame,
+	mockPermissionRequestFrame,
+	mockPermissionResolvedFrame,
 	mockReasoningDeltaFrame,
 	mockTextDeltaFrame,
 	mockToolChunkFrame,
@@ -52,6 +54,8 @@ export type MockStepKind =
 	| "text"
 	| "tool-chunk"
 	| "tool-started"
+	| "permission-request"
+	| "permission-resolved"
 	| "tool-executing"
 	| "tool-output"
 	| "tool-completed";
@@ -63,7 +67,19 @@ export interface MockStep {
 	/** Characters of visible content this step delivers (0 for lifecycle-only frames). */
 	chars: number;
 	frame: MockFrame;
+	/**
+	 * Wait this long before the NEXT step instead of the pacing interval. Set on a
+	 * permission request so its form stays on screen long enough to watch the row
+	 * drill open and, on resolve, close again.
+	 */
+	holdMs?: number;
 }
+
+/**
+ * Tools whose calls pass through a permission gate when the scenario asks for one.
+ * The write-capable tools, i.e. the ones a real session most often stops on.
+ */
+const PERMISSION_GATED_TOOLS: ReadonlySet<string> = new Set(["Bash", "Write", "Edit"]);
 
 export interface MockScenario {
 	narratorId: string;
@@ -81,6 +97,18 @@ export interface MockScenario {
 	toolOutputCharsPerFrame: number;
 	/** Repeat each round's text body this many times (volume stress). */
 	textRepeat: number;
+	/**
+	 * Stop Bash / Write / Edit at a permission gate: request → hold → allow, between
+	 * `tool_started` and `tool_executing` (where the real gate sits).
+	 */
+	permissions: boolean;
+	/** How long each permission form stays up before the scripted allow. */
+	permissionHoldMs: number;
+	/**
+	 * Makes permission request ids unique per run. The panel drops a request whose
+	 * id it has already seen resolved, so two runs must never share one.
+	 */
+	runId?: string;
 }
 
 export const DEFAULT_MOCK_SCENARIO: Omit<MockScenario, "narratorId"> = {
@@ -91,6 +119,8 @@ export const DEFAULT_MOCK_SCENARIO: Omit<MockScenario, "narratorId"> = {
 	charsPerFrame: 24,
 	toolOutputCharsPerFrame: 120,
 	textRepeat: 1,
+	permissions: false,
+	permissionHoldMs: 1500,
 };
 
 export { MOCK_ROUND_COUNT };
@@ -194,7 +224,33 @@ function expandTool(
 		}),
 	});
 
-	// 3. Permission gate passed → the executing shimmer.
+	// 3a. Optional permission gate. The request holds the run so the row's drill-open
+	//     is watchable; the scripted allow then closes it before execution starts.
+	if (scenario.permissions && PERMISSION_GATED_TOOLS.has(toolName)) {
+		const requestId = `mock-perm-${scenario.runId ?? "0"}-${toolUseId}`;
+		steps.push({
+			kind: "permission-request",
+			round,
+			chars: 0,
+			frame: mockPermissionRequestFrame({
+				narratorId,
+				requestId,
+				toolUseId,
+				toolName,
+				input: spec.input,
+				decisionReason: `${toolName} is not on this session's allow list`,
+			}),
+			holdMs: Math.max(0, Math.floor(scenario.permissionHoldMs)),
+		});
+		steps.push({
+			kind: "permission-resolved",
+			round,
+			chars: 0,
+			frame: mockPermissionResolvedFrame({ narratorId, requestId, toolUseId, decision: "allow" }),
+		});
+	}
+
+	// 3b. Permission gate passed → the executing shimmer.
 	steps.push({
 		kind: "tool-executing",
 		round,

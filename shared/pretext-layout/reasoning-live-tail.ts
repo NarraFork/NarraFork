@@ -29,8 +29,8 @@
  * ⚠️ The result must reach the renderer through the DRAW-TIME channel, never
  * through the measured payload: a trace row's measured `title` feeds the
  * measurement cache key (`traceRevision`'s `|tt:` signature) and an activity
- * trace's key — `activity-<firstMsgId>-<i>` — carries no `__streaming__` marker,
- * so it is cached like any settled element. A per-frame-changing measured title
+ * trace's key — `activity-r:<blockId>` / `activity-t:<toolUseId>` — carries no
+ * `__streaming__` marker, so it is cached like any settled element. A per-frame-changing measured title
  * would mint a cache entry per delta (the bounded-cache guard in
  * `low-lod-streaming-cost.test.ts`), while a field the revision ignores would be
  * served STALE from the cache. Painting it at draw time is what satisfies both,

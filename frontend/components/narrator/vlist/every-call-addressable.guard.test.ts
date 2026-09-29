@@ -24,6 +24,7 @@ import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { groupRenderUnits } from "../trace/render-units";
 import { installCanvasStub } from "./measure/test-canvas-stub";
+import { activityUnitKey } from "./pretext-document-layout";
 
 beforeAll(() => {
 	installCanvasStub();
@@ -98,7 +99,9 @@ async function adaptAtLod(messages: NarratorMsg[], lod: RenderLod) {
 		unit.kind === "activity"
 			? {
 					kind: "activity" as const,
-					key: `activity-${unit.sourceMessages[0]?.id ?? "unknown"}-${index}`,
+					// The production key helper, not a hand copy of its formula: a copy is free
+					// to drift, and this guard would then check a key nothing ships.
+					key: activityUnitKey(unit, index),
 					items: unit.items as never,
 					sourceMessages: unit.sourceMessages as never,
 				}

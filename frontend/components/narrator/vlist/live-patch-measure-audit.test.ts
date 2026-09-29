@@ -538,7 +538,7 @@ describe("live-patch audit: EXHAUSTIVE — a height change always changes the ke
  * folded trace breaks the same invariant through a different door: at L1-L3 the
  * activity fold and the tool-run fold collapse MANY members into ONE element
  * whose `spec.key` is minted from its FIRST member only
- * (`activity-<firstMsgId>-<i>` / `toolrun-summary-tool-<firstToolUseId>`).
+ * (`activity-t:<firstToolUseId>` / `toolrun-summary-tool-<firstToolUseId>`).
  *
  * So when a fold GAINS members — the ordinary case of a turn continuing, whether
  * the new message arrives through `appendMessage` or a streaming handoff — its key
@@ -614,13 +614,15 @@ describe("low-LOD folds: a fold that grows must re-key", () => {
 		const { groupRenderUnits } = await import("../trace/render-units");
 		const { adaptRenderUnits } = await import("./segment-adapter");
 		const { VLIST_REGISTRY } = await import("./registry");
+		const { activityUnitKey } = await import("./pretext-document-layout");
 		const { buildCacheKey, extractDataRevision } = await cacheMod();
 		const units = groupRenderUnits(segmentMessages(messages), lod <= 2);
 		const adapterUnits = units.map((unit, index) =>
 			unit.kind === "activity"
 				? {
 						kind: "activity" as const,
-						key: `activity-${unit.sourceMessages[0]?.id ?? "unknown"}-${index}`,
+						// Production's key: the audit is about which cache key a real row gets.
+						key: activityUnitKey(unit, index),
 						items: unit.items as never,
 						sourceMessages: unit.sourceMessages as never,
 					}

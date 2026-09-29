@@ -105,6 +105,10 @@ export interface ComputeLayoutOptions {
 	/** True when a tool/subagent item has a live pending permission request; forces
 	 * its card expanded and folds into the measure cache key. */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
+	/** First-frame layout of a live InlinePermission form (see AdapterContext). */
+	resolvePermissionFormPrediction?: (toolUseId: string | undefined) => unknown;
+	/** Painted height of that form once mounted (see AdapterContext). */
+	resolvePermissionFormHeight?: (toolUseId: string | undefined) => number | undefined;
 	/** Tool-use id of the latest spec://tasks.json call; that card never folds. */
 	resolveLatestSpecTasksToolUseId?: () => string | null;
 	/** Plan body from a pending permission when the tool call carries none yet. */
@@ -183,6 +187,8 @@ export function computePretextVListLayout(
 		canOfferProviderFix: opts.canOfferProviderFix,
 		canOfferModelTest: opts.canOfferModelTest,
 		resolveHasPendingPermission: opts.resolveHasPendingPermission,
+		resolvePermissionFormPrediction: opts.resolvePermissionFormPrediction,
+		resolvePermissionFormHeight: opts.resolvePermissionFormHeight,
 		resolveLatestSpecTasksToolUseId: opts.resolveLatestSpecTasksToolUseId,
 		resolvePendingPlan: opts.resolvePendingPlan,
 		resolveFullToolInput: opts.resolveFullToolInput,

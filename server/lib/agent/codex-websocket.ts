@@ -184,9 +184,10 @@ export interface StreamCodexResponsesWebSocketOptions {
 	/** Override the User-Agent handshake header. Defaults to the narrafork UA. */
 	userAgent?: string;
 	/**
-	 * Extra handshake headers (client fingerprint: originator,
-	 * x-codex-installation-id, session/thread ids, user-configured headers).
-	 * Applied last so they can override the built-in defaults.
+	 * Extra handshake headers (client fingerprint: originator, session/thread
+	 * ids, x-codex-window-id, user-configured headers). Applied last so they can
+	 * override the built-in defaults. The installation id is NOT part of this
+	 * set — it travels in the request body's client_metadata, matching codex-rs.
 	 */
 	extraHeaders?: Record<string, string>;
 	/** Optional, request-scoped raw transcript capture (not attached to the cached session). */
@@ -595,7 +596,7 @@ export function buildHandshakeHeaders(
 	if (options.turnMetadata) {
 		headers[TURN_METADATA_HEADER] = options.turnMetadata;
 	}
-	// Client fingerprint (originator, x-codex-installation-id, session-id/thread-id,
+	// Client fingerprint (originator, session-id/thread-id, window id,
 	// user-configured headers) applied last so it overrides built-in defaults such as
 	// originator. The session-id/thread-id pair (matching the real Codex CLI's hyphenated
 	// header names) is supplied here rather than hardcoded above.

@@ -492,6 +492,82 @@ item 锚点修正、marker 跳转、reveal 跳转、`scrollToBottom` 一律瞬�
 
 > **试过 transform 反向位移，已回退。** 曾把 glide 改成"`scrollTop` 瞬时到底 + 画布 `translateY(+delta)` 动画回 0"，目的是让插值跑在合成器线程。理论收益成立（零 scroll 事件/零窗口重算），但**实测看不到任何滚动动画，只有瞬间抖动**：真实的流式提交里，同一帧既写 `scrollTop` 又装位移动画，而画布本身正在被 React 重建（`totalHeight` 变化、行挂载/卸载），位移被反复清除或从错误基线起算。这条路要走通得先解决"位移与文档重建的时序归属"，成本远超收益。追赶方案虽然占用主线程，但它与既有的锚定/窗口/pin 机械是同一套坐标系，行为可预测。
 
+## 4.9 生命周期过渡（内容换阶段时的形态变化，纯装饰层）
+
+§4.6 只在读者点击那一次 commit 播，§4.7 只在档位变化那一次播，其余一律瞬时。**但有一类形态变化既不是读者点的、也不换档**：内容本身进入了另一个阶段。它们正落在读者视线上，曾经全部硬切：
+
+- L3+：运行中的工具卡强制展开，一完成就一帧塌成表头（几百像素瞬间消失）；
+- L3+：流式推理卡展开显示，一落地就塌成折叠表头；
+- L1/L2：等待审批的调用被拆成独立 `tool-call` 卡片（高度 22.8 → 119+），决策后又变回 trace 行。
+
+这一节是第三条通道（`vlist-lifecycle-motion.ts` 纯算 + shell 的 LIFECYCLE layout effect），外加让它成立的三个前置修复。
+
+### 前置一：形态不变，身份才能不变
+
+**L1/L2 的待审批工具留在 trace 里，原地钻取。** `render-units.ts` 不再把待审批工具拆成独立单元；adapter 把该行标为 `pinnedOpen`（`isAwaitingPermissionForm`），行在 trace 内展开成"工具卡 + 审批表单"，决策后原地收回。`pinnedOpen` 的行**不绑定 toggle**（RenderToolRun `togglable`）：点击会写入一个显式展开状态，表单消失后行仍停在展开态。判据取**客户端的 pending 列表**而不是工具状态：读者点下的那一刻客户端就删掉条目，行在点击时就开始收回；按状态判定会等往返落地才收，中间读者什么都没做，却看到先开后关两步。仍在思考的反思门（reflection gate）占着权限区，不强制钻取。
+
+**trace key 跨 hand-off 稳定。** 旧 key 是 `activity-<msgId>-<unitIndex>`，流式 id `__streaming__` 在落库时换成真实 id，整条 trace 重挂载：shimmer 相位重置，读者的钻取/展开状态（都以这个字符串为键）静默丢失。现在 key 取第一项的双侧共有身份（`activityUnitKey`：工具取 `t:<toolUseId>`，推理取 `r:<blockId>`），`buildSourceResolver` 用同一个函数，防止两处推导漂移。
+
+**内容块带 `lifecycleId`。** 流式块 key 是 `__streaming__-b<i>`，落地后是 `<msgId>-b<j>`；`ElementSpec.lifecycleId`（modern block 的全局 id `blk:<id>`）让同一个推理 run 在交接两侧配得上对。
+
+### 前置二：表单高度是算术，不是 dynamic 行
+
+审批表单在首帧就按**预测高度**预留（`vlist-permission-prediction.ts`：PendingPermission → InlinePermissionData 纯函数），挂载后由 `PermissionFormHeightReporter` 上报实高，经 `permissionFormRevision` 进缓存键。结构化编辑（StructSed）的 diff 预览在表单挂载后才拉取，首帧画的是 `preview-loading` 行（`PREVIEW_LOADING_ROW_HEIGHT`），预测必须包含它，否则预览一到就顶跳一次。
+
+### 前置三：`pending` 高于 `initializing`
+
+`LIVE_TOOL_PHASE_RANK` 里 `pending`（1.5）现在高于 `initializing`（1）。服务端每一次写 `initializing` 要么是插入新行（attempt 1），要么是**新的执行尝试**（更高的 `executionAttempt`，`mergeToolLifecycleRecord` 在查排名之前就把它当作重试放行）；审批门只会 `initializing → pending`，不会反向。所以同一 attempt 上 `pending` 之后到达的 `initializing` 必然是陈旧快照（`publishPartial` 在门写 `pending` 之前读了行、之后才广播）。两者并列时陈旧快照获胜，表单还在屏幕上，行却退回"准备中"。
+
+### 什么算生命周期变化：枚举的形态签名，不是"任何高度变化"
+
+内容到达带来的增长（stdout、流式正文、拉取的 payload）必须保持瞬时，否则列表每个 delta 都在动画自己。所以只有**形态**翻转的元素参与，签名按 kind 逐一枚举：
+
+| kind | 签名 |
+|------|------|
+| `tool-call` | 展开/收起；是否预留权限表单及其高度 |
+| `subagent-card` | 展开/收起 |
+| `reasoning` | 形态（streaming / count / collapsed / expanded） |
+| `activity-trace` | 每个嵌套行是否钻取展开 |
+
+其他 kind 没有签名，永远不会触发 plan。只在一帧里出现的元素（新出现或离开窗口）没有可过渡的起点。
+
+**配对是 `lifecycleId ?? key` 且 kind 必须相同。** 只按 key 回落时分不清"流式推理卡"和"一帧后继承了它流式索引的答案正文"，配错比不动画更糟。
+
+**几何复用折叠的算术**（`planFoldMotion` 的 `toggledKeys` 集合、`planFoldNestedRowMotion`、`planFoldNestedRowResize`），所以生命周期收起与读者点击 chevron 不可区分：表头不动，正文离开，下方元素在同样 200ms 内合拢。
+
+### 门控（每帧快照，条件播放）
+
+LIFECYCLE effect 声明在 fold / drill / LOD 之后、MOTION FLUSH 之前，op 并入同一批。它**每次 commit 都快照**（只在部分 commit 滚动的基线会拿陈旧帧做 diff，§4.7 的教训），只在帧上下文不变时播：
+
+- LOD 与 width bucket 都不变（它们会重新主题化整篇文档，那是 §4.7 的事）；
+- 本次 commit 没有读者折叠（`foldPlayedThisCommitRef`：fold effect 已经动过这些节点，两个 plan 落在同一属性上会互相覆盖）；
+- 非 reduced-motion。
+
+⚠️ **documentRevision 刻意不进门控。** 生命周期变化全部经由 live patch 或结构重建到达，要求 revision 不变等于正好拒掉这条通道存在的意义。挡住普通重建的是签名 diff：一次 reload 或翻页如果没有改变任何元素的形态，就不产生 plan。
+
+钉底时先 `snapToTarget()`：plan 的 afterScrollTop 是**预测**的底部，仍在追赶的滑行会在动画下挪动行（与 §4.8 的"几何占有转换前吸附"同理）。
+
+**取消域独立**（`lifecycleScope` → `life:`），与折叠的 `row:` 不相交：生命周期重放只取消自己上一次的动画。
+
+### 收回时保留行
+
+决策那一刻表单就从数据里消失，钻取的行在下一次 build 里已经是收起形态，没有东西可以"收"。所以 pending 列表变化的 effect 在收回**之前**把行标记为 closing（`pendingLifecycleClosingRef` + `setClosingRows`），让卡片再挂一帧供 resize 动画收起。**没被 plan 接住的 closing 行必须立即释放**（块离开窗口、delta 读不出来）：它们没有 op，也就没有 `onDone`，不释放会永远留在屏幕上。
+
+### 标签换形态淡入（L1/L2）
+
+无标题的流式推理行曾经是空行；现在画 `reasoningPending` 占位（"Thinking…" / "思考中…"），且只在**活动**行上画，已落地的无标题行不画。标签只在**换形态**时淡入（占位 → 标题、标题 → 实时尾巴，`LabelForm` + `useLabelFormFade`，`vlist-label-fade`，reduced-motion 下不播）：新挂载的行不算切换，标题逐字增长也不算。
+
+### 调试台
+
+mock 调试台的 **Permission gate** 开关让 Bash / Write / Edit 在 `tool_started` 与 `tool_executing` 之间走一遍 `permission_request` → 保持 → `permission_resolved`(allow)，用来肉眼观察原地钻取和收回（见 `mock/README-REMOVAL.md`）。
+
+### 测试
+
+- `low-lod-lifecycle-timeline.test.ts`：真实管线按事件时间线驱动，断言 L1/L2 下 trace key 不变、审批期间行原地钻取、决策后收回。
+- `vlist-lifecycle-motion.test.ts`：签名、配对、plan 纯算。
+- `vlist-fold-wiring.test.ts`：LIFECYCLE effect 的接线顺序守卫（flush 必须是最后一个 motion effect）。
+- `render/RenderToolRun.lifecycle.test.tsx`：占位标签、淡入只在换形态时播、`pinnedOpen` 行不绑定 toggle。
+- `shared/__tests__/tool-lifecycle-merge.test.ts`：`pending → initializing` 是回退，更高 attempt 仍放行。
 ## 5. 测试约定
 
 - **canvas stub**：measure 测试 `beforeAll(() => installCanvasStub())`（见 `measure/test-canvas-stub.ts`），提供确定性 measureText（每字符=0.6×fontSize）。**必须在 import pretext-backed 模块之前调用**（用动态 `await import()`）。

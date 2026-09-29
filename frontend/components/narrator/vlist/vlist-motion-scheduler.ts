@@ -446,3 +446,15 @@ export function drillScope(rowUid: string): string {
 export function lodScope(unitId: string): string {
 	return `lod:${unitId}`;
 }
+
+/**
+ * Scope name for one element's LIFECYCLE transition (a shape change caused by its
+ * content changing phase, not by the reader — see vlist-lifecycle-motion.ts).
+ *
+ * Disjoint from `row:` on purpose: the fold and the lifecycle channel never plan on the
+ * same commit, and keeping their cancel domains separate means a lifecycle replay can
+ * only ever cancel an earlier lifecycle motion, never a reader's fold.
+ */
+export function lifecycleScope(key: string): string {
+	return `life:${key}`;
+}

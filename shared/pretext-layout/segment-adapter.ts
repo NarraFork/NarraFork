@@ -647,6 +647,19 @@ interface AdapterTraceItem {
 	 * dispatch `renderElement` the same way.
 	 */
 	cardKind?: "tool-call" | "subagent-card";
+	/**
+	 * The row is drilled open by the SYSTEM, not the reader: its call is blocked on a
+	 * live permission request, and the card it opens onto is the only place the
+	 * approve/deny form can live. See `isAwaitingPermissionForm`.
+	 *
+	 * Behaves like the L3+ card's `lodExempt`: the reader cannot fold it shut (the
+	 * renderer binds no toggle), because a click would store an explicit expansion in
+	 * `expandedTraceRows` that outlives the request — the row would stay open after the
+	 * decision, exactly the residue the auto-drill must not leave behind. Height-neutral
+	 * on its own (the height comes from the card); keyed by `traceRevision` because it
+	 * changes what the renderer binds.
+	 */
+	pinnedOpen?: boolean;
 }
 
 export type AdapterRenderUnit =
@@ -707,6 +720,35 @@ export interface ElementSpec {
 	 * read only by the morph layer.
 	 */
 	morphGroupId?: string;
+	/**
+	 * HAND-OFF-STABLE identity of the content this element shows, for the lifecycle
+	 * transition (a live element settling into its persisted form).
+	 *
+	 * `key` cannot serve across the hand-off for content blocks: a live block keys as
+	 * `__streaming__-b<i>` and its persisted copy as `<msgId>-b<j>`, and the streaming
+	 * index is not even stable — once an earlier block persists, the projection filters
+	 * it out and every later live block's index shifts down, so `__streaming__-b0` can
+	 * name the reasoning in one frame and the answer text in the next. A modern block's
+	 * global id (`blk:<id>`) is the same on both sides, so it pairs the right two boxes.
+	 *
+	 * Absent where no such id exists (legacy blocks, synthetic lanes), in which case a
+	 * consumer falls back to `key` AND requires the kind to match. Never painted, never
+	 * part of `data`/`opts`: height- and cache-neutral.
+	 */
+	lifecycleId?: string;
+}
+
+/**
+ * The `lifecycleId` of a content block, or undefined when it has no durable id.
+ *
+ * Only a real block id qualifies: the accumulator's synthetic lane ids
+ * (`streaming:text:0`, `streaming:reasoning:1`) have no persisted counterpart and
+ * would pair with nothing.
+ */
+function contentBlockLifecycleId(block: AdapterContentBlock | undefined): string | undefined {
+	const id = (block as { id?: unknown } | undefined)?.id;
+	if (typeof id !== "string" || id.length === 0 || id.startsWith("streaming:")) return undefined;
+	return `blk:${id}`;
 }
 
 export interface AdapterContext {
@@ -831,6 +873,26 @@ export interface AdapterContext {
 	 * so the card re-measures when the permission appears/disappears.
 	 */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
+	/**
+	 * ARITHMETIC height of the live permission form a card will host, for the first
+	 * frame: the shell predicts it from the pending request (`measureInlinePermission`
+	 * over the regions that request will paint) so the card reserves the form's box on
+	 * the commit the request lands, instead of growing once the form has painted.
+	 *
+	 * Returns undefined for a tool with no InlinePermission form (no live request, or
+	 * one hosted some other way — AskUserQuestion's banner, a subagent card), in which
+	 * case the card keeps its previous behaviour.
+	 */
+	resolvePermissionFormPrediction?: (toolUseId: string | undefined) => unknown;
+	/**
+	 * The painted height of that form once it has mounted (reported by the render
+	 * layer's observer, outer margin included). Wins over the prediction: the form can
+	 * grow from the reader's own input (a multi-line feedback, the plan editor) and
+	 * from async content (a StructSed diff preview loading), and only a real reading
+	 * knows. The card stays a FIXED, clipped row either way — the value just arrives
+	 * through the layout instead of an unclipped post-paint box.
+	 */
+	resolvePermissionFormHeight?: (toolUseId: string | undefined) => number | undefined;
 	/**
 	 * The tool-use id of the MOST RECENT spec://tasks.json operation in the loaded
 	 * window (the same identity the chunked path's task-board spinner keys on).
@@ -1643,10 +1705,14 @@ function adaptMessage(
 			// element kind could swap in a trace with no way back.
 			const displayText = data.translatedText ?? data.text;
 			const parsed = parseReasoning(displayText);
+			// A run is identified by its FIRST block, the same block the fold's
+			// `activityUnitKey` and `reasoningRowIdentity` anchor on.
+			const lifecycleId = contentBlockLifecycleId(block);
 			if (hasStructuredReasoning(parsed)) {
 				specs.push({
 					kind: "reasoning-steps",
 					key,
+					...(lifecycleId ? { lifecycleId } : {}),
 					data: reasoningStepsData(
 						parsed,
 						streaming,
@@ -1676,6 +1742,7 @@ function adaptMessage(
 				specs.push({
 					kind,
 					key,
+					...(lifecycleId ? { lifecycleId } : {}),
 					data,
 					opts: {
 						expanded: ctx.isExpanded?.(key),
@@ -1698,9 +1765,11 @@ function adaptMessage(
 				// Only these existing bodies seal on late mount; a new post-catch-up
 				// text lane still gets its ordinary live first-chunk animation.
 				const snapshotBody = streamingMessage && typeof block._streamAnimSnapshotEpoch === "number";
+				const lifecycleId = contentBlockLifecycleId(block);
 				specs.push({
 					kind,
 					key,
+					...(lifecycleId ? { lifecycleId } : {}),
 					data: markdownData(block),
 					// Missing provenance retains the legacy shape. The render boundary maps
 					// it to explicit null, never inheriting the live narrator's current cwd.
@@ -3667,6 +3736,59 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
  * derivation is how the two would silently diverge (different summary resolver,
  * a missing timing field, a stale truncation count).
  */
+/**
+ * `{ permissionForm }` for a card that is about to host a live InlinePermission form,
+ * else `{}`.
+ *
+ * Carries the shell-predicted region layout and, once the form has painted, its real
+ * height. The measure layer reserves `height ?? measure(prediction)` below the detail
+ * body. Omitted entirely when the shell has no prediction for this call — a form the
+ * shell hosts some other way (AskUserQuestion's banner) keeps the old dynamic-row
+ * path, so nothing reserves room for a node that will not mount here.
+ */
+function permissionFormFields(
+	item: AdapterToolItem,
+	ctx: AdapterContext,
+	hostsForm: boolean,
+): { permissionForm?: { prediction: unknown; height?: number } } {
+	if (!hostsForm) return {};
+	const toolUseId = item.tc.toolUseId;
+	const prediction = ctx.resolvePermissionFormPrediction?.(toolUseId);
+	if (prediction == null) return {};
+	const height = ctx.resolvePermissionFormHeight?.(toolUseId);
+	return {
+		permissionForm: {
+			prediction,
+			...(typeof height === "number" && Number.isFinite(height) && height > 0 ? { height } : {}),
+		},
+	};
+}
+
+/**
+ * Whether a folded tool row must be drilled open onto its card so the reader can
+ * answer a live permission request.
+ *
+ * ⚠️ Gated on the LIVE REQUEST LIST (`resolveHasPendingPermission`), never on the
+ * tool's own `status === "pending"`. The two are written by different events and
+ * travel different paths (the list is React state, the status a rAF-batched live
+ * patch), so they disagree for a few frames on both ends. The list is the one that
+ * matters: it is what the form is built from, and the client removes an entry the
+ * instant the reader answers, so the row starts closing ON the click — a status-based
+ * gate would hold it open until the round-trip landed and then close it, a two-step
+ * open/close with nothing the reader did in between.
+ *
+ * A reflection gate that is still deliberating owns the permission area (its notice
+ * REPLACES the form — `decidePermissionSlot` applies the same precedence), and a
+ * deliberating gate is not something the reader must answer, so it does not force the
+ * drill. The reader can still open the row to see the notice or take over.
+ */
+function isAwaitingPermissionForm(item: AdapterToolItem, ctx: AdapterContext): boolean {
+	if (!item.tc.toolUseId) return false;
+	if (ctx.resolveHasPendingPermission?.(item.tc.toolUseId) !== true) return false;
+	const reflectionStatus = resolveToolReflectionStatus(item, ctx);
+	return reflectionStatus == null || reflectionStatus === "awaiting_user";
+}
+
 function buildToolCardData(
 	item: AdapterToolItem,
 	ctx: AdapterContext,
@@ -3691,11 +3813,17 @@ function buildToolCardData(
 	);
 	const errorMessage = readNonEmptyString(item.tc, "errorMessage");
 	const denyMessage = nonEmptyTrimmed(item.tc.permissionDenyMessage);
+	const reflection = resolveToolReflection(item, ctx, hasPendingPermission);
 	return {
 		toolName: item.tc.toolName,
 		summary: toolSummary(item.tc, ctx),
 		status: item.tc.status ?? "success",
 		isStreaming,
+		// The live permission form's box, reserved on the commit the request lands.
+		// Only while a request is live AND no reflection notice owns the area (the
+		// notice replaces the form — the same precedence `decidePermissionSlot`
+		// applies to the slot itself, so the reserve and the mounted node agree).
+		...permissionFormFields(item, ctx, hasPendingPermission && reflection == null),
 		// Height-neutral shimmer input. Keyed in measure-cache `extractDataRevision`
 		// because an earlier sibling finishing is the ONLY thing that clears this
 		// while this call's own status stays `initializing`.
@@ -3730,7 +3858,7 @@ function buildToolCardData(
 		// Reflection notice (danger / plan / task / question gate). Replaces the
 		// permission area, and is MEASURED — the row's height is final on first
 		// paint instead of being corrected by a ResizeObserver afterwards.
-		reflection: resolveToolReflection(item, ctx, hasPendingPermission),
+		reflection,
 		// Expanded detail region height model (line counts / body lines / px).
 		// null when the tool call has no meaningful detail body.
 		detail: classifyToolDetail({
@@ -4324,10 +4452,11 @@ function toolTraceItem(
 		// are pairable across an LOD change (see AdapterTraceItem.unitId).
 		unitId: toolItemKey(item),
 		...(canDrillDown ? { canDrillDown: true } : {}),
-		// A folded row only ever holds NON-ACTIVE tools (groupToolItemsForLod splits
-		// active items out, isInactiveToolRunSegment gates the activity fold), so the
-		// pending-permission flag is false by construction here — the drilled-in card
-		// deliberately hosts no permission form.
+		// The drilled-in card is the SAME card the call gets at L3+, including its
+		// permission area: a call blocked on a live request folds into the trace like
+		// any other and its row is drilled open onto this card (see
+		// `isAwaitingPermissionForm`), so the flag below is what makes the card reserve
+		// the form and the shell mount it.
 		...(expanded && canDrillDown
 			? item.isSubagent
 				? {
@@ -4545,6 +4674,8 @@ function adaptActivityItems(
 	traceItems: AdapterTraceItem[];
 	reasoningCount: number;
 	toolCount: number;
+	/** Indices (into `traceItems`) of the rows drilled open for a live permission form. */
+	pinnedRowIndices: number[];
 	/**
 	 * Indices (into `traceItems`) of the rows that ended up expanded — DERIVED from
 	 * the per-key decisions taken while emitting, never resolved separately.
@@ -4578,6 +4709,7 @@ function adaptActivityItems(
 	// `canonicalReasoningRunText`. The first block of a run therefore emits every row
 	// for it, and its followers are skipped rather than re-parsed.
 	const consumedReasoningBlocks = new Set<number>();
+	const pinnedRowIndices: number[] = [];
 	for (const [itemIndex, item] of items.entries()) {
 		if (item.kind === "reasoning") {
 			if (consumedReasoningBlocks.has(itemIndex)) continue;
@@ -4716,11 +4848,23 @@ function adaptActivityItems(
 		const rowKey = item.dedupeSuffix
 			? `${toolItemKey(toolItem)}#${item.dedupeSuffix}`
 			: toolItemKey(toolItem);
-		const expanded = ctx.isRowExpanded?.(traceKey, rowKey) ?? false;
+		// A call blocked on a live permission request is drilled open by the system:
+		// its card is the only host the approve/deny form has, and keeping the call a
+		// row of THIS trace (rather than splitting it out as a standalone card, which
+		// is what it used to be) is what removes the row → card → row component swaps.
+		// Subagent rows are excluded: a subagent call never folds (isKeptToolItem).
+		const pinnedOpen = !toolItem.isSubagent && isAwaitingPermissionForm(toolItem, ctx);
+		const expanded = pinnedOpen || (ctx.isRowExpanded?.(traceKey, rowKey) ?? false);
 		if (expanded) expandedIndices.push(traceItems.length);
 		const queuedBehindUpstream = isQueuedBehindUpstreamTools(toolItem, earlierToolItems, ctx);
 		earlierToolItems.push(toolItem);
 		const toolRow = toolTraceItem(toolItem, ctx, expanded, queuedBehindUpstream);
+		if (pinnedOpen) {
+			toolRow.pinnedOpen = true;
+			// Recorded by ITEM position, so the caller can tell whether it falls inside
+			// the trace's visible window (see `adaptActivityUnit`).
+			pinnedRowIndices.push(traceItems.length);
+		}
 		// `unitId` moves with the key: two calls sharing an id are still two distinct
 		// pieces of content.
 		if (item.dedupeSuffix) {
@@ -4729,7 +4873,7 @@ function adaptActivityItems(
 		}
 		traceItems.push(toolRow);
 	}
-	return { traceItems, reasoningCount, toolCount, expandedIndices };
+	return { traceItems, reasoningCount, toolCount, expandedIndices, pinnedRowIndices };
 }
 
 /**
@@ -4756,6 +4900,13 @@ function isRecentActivityUnit(items: AdapterActivityInput[], ctx: AdapterContext
 	return false;
 }
 
+/**
+ * Rows an `activity-trace` shows before its "earlier" toggle — mirrors the measure
+ * layer's `ACTIVITY_MAX_VISIBLE` (the shared core cannot import from the frontend;
+ * `segment-adapter.test.ts` pins the two together).
+ */
+export const ADAPTER_ACTIVITY_MAX_VISIBLE = 10;
+
 /** Adapt a cross-segment activity unit. The input is typed so source order and
  * message ownership survive the fold, including L4 recency and stable toggles. */
 export function adaptActivityUnit(
@@ -4764,6 +4915,14 @@ export function adaptActivityUnit(
 	ctx: AdapterContext,
 ): ElementSpec {
 	const activity = adaptActivityItems(items, ctx, key);
+	// A row drilled open for a live permission form must be ON SCREEN, or the request
+	// the narrator is blocked on has no visible controls at all: neither behind the L1
+	// header fold nor in the hidden "earlier" range of a long trace. Both overrides
+	// last only as long as the request does, and neither touches the reader's stored
+	// fold state.
+	const hasPinnedRow = activity.pinnedRowIndices.length > 0;
+	const firstVisibleIndex = Math.max(0, activity.traceItems.length - ADAPTER_ACTIVITY_MAX_VISIBLE);
+	const pinnedRowHidden = activity.pinnedRowIndices.some((index) => index < firstVisibleIndex);
 	return {
 		kind: "activity-trace",
 		key,
@@ -4777,9 +4936,9 @@ export function adaptActivityUnit(
 		opts: {
 			// L1 folds history behind the header but keeps the current run's rows on
 			// screen, so live activity stays readable at the simplest level.
-			collapsed: ctx.lod === 1 && !isRecentActivityUnit(items, ctx),
+			collapsed: ctx.lod === 1 && !hasPinnedRow && !isRecentActivityUnit(items, ctx),
 			itemsOpened: ctx.isExpanded?.(key) ?? false,
-			showEarlier: ctx.showEarlier?.(key) ?? false,
+			showEarlier: pinnedRowHidden || (ctx.showEarlier?.(key) ?? false),
 			// Derived while the rows were emitted, never resolved a second time — see
 			// adaptActivityItems on why a stored index cannot survive a live run.
 			expandedIndices: activity.expandedIndices,

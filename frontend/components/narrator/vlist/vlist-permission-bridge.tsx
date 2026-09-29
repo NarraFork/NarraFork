@@ -34,6 +34,7 @@ import { InlinePermission } from "../permission/InlinePermission";
 import { AskUserQuestionBanner, coerceQuestions } from "../question/AskUserQuestionBanner";
 import {
 	decidePermissionSlot,
+	findPendingForKey,
 	isPermissionHostRow,
 	resolveAsyncQuestionHosts,
 	toolUseIdFromSpecKey,
@@ -80,6 +81,73 @@ export type { AsyncQuestionSlot } from "../narrator-panel-types";
  * reflection notice must NOT also mount a permission form, exactly as the chunked
  * card resolves it (ToolCallCard.tsx:5419).
  */
+/**
+ * Live permission form nodes for DRILLED-IN cards inside activity traces, as
+ * `traceKey → (rowKey → node)`.
+ *
+ * At L1/L2 a call blocked on a request is no longer split out as its own `tool-call`
+ * row: it stays a row of its activity trace, drilled open onto its card by the adapter
+ * (`pinnedOpen`). `usePermissionSlots` only walks top-level host rows, so this is the
+ * other half — the same `buildPermissionNode`, keyed by the nested row instead.
+ *
+ * Only system-drilled rows get a form. A reader who drills a row open by hand while a
+ * request is live sees the same card; giving it the form too is harmless, but the
+ * pinned rows are exactly the ones whose measure reserved it, so the two stay in step.
+ */
+export function useTracePermissionSlots({
+	renderItems,
+	permCb,
+}: Pick<UsePermissionSlotsArgs, "renderItems" | "permCb">): ReadonlyMap<
+	string,
+	ReadonlyMap<string, ReactNode>
+> {
+	const pendingPermissions = permCb?.pendingPermissions;
+	const onPermissionDecision = permCb?.onPermissionDecision;
+	const onQuestionSubmit = permCb?.onQuestionSubmit;
+	const onQuestionReflect = permCb?.onQuestionReflect;
+	const onQuestionDeny = permCb?.onQuestionDeny;
+	const onQuestionDefer = permCb?.onQuestionDefer;
+	return useMemo(() => {
+		const byTrace = new Map<string, Map<string, ReactNode>>();
+		if (!pendingPermissions || pendingPermissions.length === 0) return byTrace;
+		for (const item of renderItems) {
+			if (item?.spec.kind !== "activity-trace") continue;
+			const rows = (item.measured as { rows?: readonly { key: string; pinnedOpen?: boolean }[] })
+				.rows;
+			if (!rows) continue;
+			for (const row of rows) {
+				if (row.pinnedOpen !== true) continue;
+				const pending = findPendingForKey(row.key, pendingPermissions);
+				if (!pending) continue;
+				let slots = byTrace.get(item.spec.key);
+				if (!slots) {
+					slots = new Map();
+					byTrace.set(item.spec.key, slots);
+				}
+				slots.set(
+					row.key,
+					buildPermissionNode(pending, {
+						onPermissionDecision,
+						onQuestionSubmit,
+						onQuestionReflect,
+						onQuestionDeny,
+						onQuestionDefer,
+					}),
+				);
+			}
+		}
+		return byTrace;
+	}, [
+		renderItems,
+		pendingPermissions,
+		onPermissionDecision,
+		onQuestionSubmit,
+		onQuestionReflect,
+		onQuestionDeny,
+		onQuestionDefer,
+	]);
+}
+
 export function usePermissionSlots({
 	renderItems,
 	permCb,

@@ -251,6 +251,10 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// data…" forever. The nested (drilled-in trace row) path already keys it via
 	// `|tdn:` — this is the same contract for a standalone card.
 	if (typeof d.truncatedLeafCount === "number") rev += `|tp:${d.truncatedLeafCount}`;
+	// The live permission form's reserve on a STANDALONE card (the drilled-in card's
+	// copy is keyed by `traceRevision`). Height-affecting, and it is the only component
+	// that moves when the form's painted height is reported.
+	rev += permissionFormRevision(d.permissionForm);
 	// Takeover badge. Height-neutral (it rides the fixed header row), and keyed for
 	// exactly the reason `timeoutMs` above is: the takeover patch writes this ONE
 	// field — `status` cannot move, because the whole point is that the call is
@@ -347,13 +351,54 @@ function diffStatsRevision(value: unknown): string {
 }
 
 /**
+ * Revision of a card's live permission-form reserve (`ToolCallData.permissionForm`).
+ *
+ * O(1): the painted height is one number; the prediction is a flat record of a dozen
+ * primitive region flags/counts, so its keys are read directly rather than stringified.
+ */
+function permissionFormRevision(value: unknown): string {
+	if (value == null || typeof value !== "object") return "";
+	const form = value as { prediction?: unknown; height?: unknown };
+	let rev = "|pf";
+	if (typeof form.height === "number") rev += `:h${Math.round(form.height)}`;
+	const prediction = form.prediction;
+	if (prediction != null && typeof prediction === "object") {
+		const p = prediction as Record<string, unknown>;
+		for (const key of PERMISSION_PREDICTION_KEYS) {
+			const v = p[key];
+			if (v === undefined) continue;
+			rev += `,${key}=${typeof v === "boolean" ? (v ? 1 : 0) : String(v)}`;
+		}
+	}
+	return rev;
+}
+
+/** Every height-bearing field of `InlinePermissionData`, in a fixed order. */
+const PERMISSION_PREDICTION_KEYS = [
+	"readOnly",
+	"hasExecutionTarget",
+	"executionCwdLines",
+	"executionPathLines",
+	"isExitPlanMode",
+	"isEditingPlan",
+	"planEditRows",
+	"planEdited",
+	"hasDecisionReason",
+	"decisionReasonLines",
+	"hasPreviewLoading",
+	"feedbackRows",
+	"buttonRows",
+] as const;
+
+/**
  * Revision of a FOLDED TRACE payload (`activity-trace`, `tool-run-count`,
  * `reasoning-steps`).
  *
  * Why these need their own revision
  * ---------------------------------
- * A trace's spec.key is minted from its FIRST member — `activity-<firstMsgId>-<i>`
- * for the cross-segment activity fold, `toolrun-count-tool-<firstToolUseId>` for a
+ * A trace's spec.key is minted from its FIRST member — `activity-t:<toolUseId>` /
+ * `activity-r:<blockId>` for the cross-segment activity fold (see
+ * `activityUnitKey`), `toolrun-count-tool-<firstToolUseId>` for a
  * folded batch — while its height is
  * `header + rows(N) + …`, i.e. driven by the members that come AFTER the first.
  * So a fold that GROWS keeps its key, and none of the other key components move
@@ -442,9 +487,16 @@ function traceRevision(d: Record<string, unknown>): string {
 		//
 		// Only expanded rows carry a `card` (the adapter builds nothing for a folded
 		// row), so a collapsed fold pays one null check per row.
+		// A system-drilled row (live permission form) binds no toggle, so the renderer
+		// reads this from the cached payload. It flips with the request while the card
+		// payload can stay otherwise identical.
+		if (r.pinnedOpen === true) rev += "|tpo:1";
 		if (r.card != null && typeof r.card === "object") {
 			const card = r.card as Record<string, unknown>;
 			if (typeof card.status === "string") rev += `|tds:${card.status}`;
+			// The live form's reserve: appears/disappears with the request and grows
+			// with the painted height, while status and key can stay put.
+			rev += permissionFormRevision(card.permissionForm);
 			// A drilled-in card paints its deadline from the cached measured payload.
 			// `timeout_updated` changes only this field, so its trace must re-key even
 			// though the nested card's height is unchanged.

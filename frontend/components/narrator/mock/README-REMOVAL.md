@@ -29,6 +29,17 @@ list), Agent (delegation), Edit (diff, with `old_string` streamed before
 box), Bash (streaming terminal transcript, plus one **failing** call), WebSearch,
 a `spec://tasks.json` write (task board) and ExitPlanMode (markdown plan card).
 
+With **Permission gate** on, Bash / Write / Edit stop between `tool_started` and
+`tool_executing` for a `permission_request` → hold → `permission_resolved`
+(allow) cycle, so the low-LOD in-place drill (row opens into card + form, then
+closes on the decision) can be watched. The form is display-only. Its buttons do
+reach the server, which does not know the synthetic request id. Over WS the server
+logs a warning and replies with an `error` frame; over the HTTP fallback it returns
+404, which shows a "decision failed" toast. Nothing is written in either case.
+Request ids are unique per pass because the panel never re-shows an id it has seen
+resolved. A request still open when the run stops gets a decision-less
+`permission_resolved`: `streaming_reset` does not clear pending permissions.
+
 ## Delete it in six steps
 
 1. `rm -rf frontend/components/narrator/mock/`

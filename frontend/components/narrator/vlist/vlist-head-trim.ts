@@ -269,7 +269,7 @@ function oldestSeqOf(messages: readonly TrimCandidate[]): number | null {
  *
  * Deliberately expressed as "keep what is still alive" rather than "delete what
  * was dropped". Spec keys are DERIVED and take several shapes (`tool-<id>`,
- * `<msgId>-b3`, `activity-<id>-<index>`, `toolrun-summary-…`; see
+ * `<msgId>-b3`, `activity-t:<toolUseId>`, `toolrun-summary-…`; see
  * `buildSourceResolver`), so reconstructing the dropped keys from message ids
  * would mean reimplementing that derivation and drifting from it. The surviving
  * manifest already enumerates every live key, which is the same direction

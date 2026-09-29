@@ -156,6 +156,29 @@
 	}
 }
 
+/* A folded trace row's label switching FORM (placeholder → tail → settled title).
+   Opacity only: the label sits in a fixed 18.8px line, and anything that moves or
+   blurs glyphs would read as the row itself jumping. Applied once, on the render that
+   mounts the new form (see RenderToolRun's useLabelFormFade). */
+.vlist-trace-label-in {
+	animation: vlist-trace-label-in 150ms ease-out both;
+}
+
+@keyframes vlist-trace-label-in {
+	from {
+		opacity: 0;
+	}
+	to {
+		opacity: 1;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.vlist-trace-label-in {
+		animation: none;
+	}
+}
+
 /* Emphasize marks (weight/style usually already in the measured font string;
    keep CSS as a safety net when the cascade drops synthetic bold/italic). */
 .vlist-frag.is-strong {

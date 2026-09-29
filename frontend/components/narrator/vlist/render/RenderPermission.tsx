@@ -485,6 +485,10 @@ function PermFixedRow({
 					</Group>
 				</Paper>
 			);
+		case "preview-loading":
+			// Reserved height only: this region is measured for the LIVE form's first
+			// frame (the real form paints its own loader), never drawn by this zero-DOM copy.
+			return <div style={common} />;
 		case "plan-edited-badge":
 			return (
 				<div style={common}>

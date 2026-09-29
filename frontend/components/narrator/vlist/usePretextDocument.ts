@@ -99,6 +99,14 @@ export interface UsePretextDocumentOptions {
 	 * reference changes when the pending set changes, so folding it into
 	 * buildOptions triggers a document rebuild (cards expand / collapse). */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
+	/**
+	 * First-frame layout / painted height of a live InlinePermission form. Both
+	 * change identity when their inputs do (a request arriving, a form reporting a new
+	 * height), so folding them into buildOptions rebuilds the document with the
+	 * reserve the card must now make.
+	 */
+	resolvePermissionFormPrediction?: (toolUseId: string | undefined) => unknown;
+	resolvePermissionFormHeight?: (toolUseId: string | undefined) => number | undefined;
 	resolvePendingPlan?: (toolUseId: string | undefined) => string | undefined;
 	/** Full (un-truncated) tool payloads once the shell has fetched them. */
 	resolveFullToolInput?: (toolUseId: string | undefined) => unknown;
@@ -356,6 +364,8 @@ export function usePretextDocument(
 			canOfferProviderFix: options.canOfferProviderFix,
 			canOfferModelTest: options.canOfferModelTest,
 			resolveHasPendingPermission: options.resolveHasPendingPermission,
+			resolvePermissionFormPrediction: options.resolvePermissionFormPrediction,
+			resolvePermissionFormHeight: options.resolvePermissionFormHeight,
 			// ⚠️ No `latestSpecTasksToolUseId` here, deliberately. The pinned tasks card
 			// is resolved by `buildPretextDocumentLayout` from the exact message list it
 			// lays out, so it needs no build option and cannot go stale: every event that
@@ -406,6 +416,10 @@ export function usePretextDocument(
 			// Rebuild when the pending-permission set changes (its reference changes
 			// with the set), so cards expand/collapse as permissions come and go.
 			options.resolveHasPendingPermission,
+			// The live form's reserve: a new request (prediction) and a new painted height
+			// both change a card's height, so each must rebuild the document.
+			options.resolvePermissionFormPrediction,
+			options.resolvePermissionFormHeight,
 			// Same contract for the pending plan bodies: a file-based plan arrives in
 			// the permission payload AFTER the tool card exists, so the resolver's
 			// identity must change with it or the adapter never re-runs and the card

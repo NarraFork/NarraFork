@@ -197,6 +197,18 @@ export interface ExactRowProps {
 	 */
 	permissionSlot?: ReactNode;
 	/**
+	 * Live permission form nodes for DRILLED-IN cards inside this row's trace, keyed by
+	 * trace row key. A call blocked on a request now stays a row of its activity trace
+	 * and is drilled open onto its card, so the form has to reach that nested card
+	 * rather than a top-level `tool-call` row. Absent for every row without one.
+	 */
+	traceRowPermissionSlots?: ReadonlyMap<string, ReactNode>;
+	/**
+	 * Report a live form's painted height by its tool-use id (the card reserved it
+	 * arithmetically; see `RenderToolCall.onPermissionFormHeight`). Stable.
+	 */
+	onPermissionFormHeight?: (toolUseId: string, height: number) => void;
+	/**
 	 * Inline message editor for THIS row. When present it REPLACES the row body
 	 * entirely (no zero-DOM copy, no interaction wrapper — editing has no context
 	 * menu, matching the chunked path) and the row switches to the post-paint
@@ -347,6 +359,8 @@ export const ExactRow = memo(
 		currentUserId,
 		narratorId,
 		permissionSlot,
+		traceRowPermissionSlots,
+		onPermissionFormHeight,
 		editorSlot,
 		onUnknownHeight,
 		onTerminate,
@@ -526,8 +540,24 @@ export const ExactRow = memo(
 					// Goes through the SAME kind-routed dispatcher as the row's own chevron:
 					// the two halves of one toggle must address the same channel, or closing
 					// from the card would write an index while opening wrote a key.
-					onToggle: () => toggleRow(row.itemIndex, row.key),
+					//
+					// NOT bound on a row the system drilled open for a live request: the
+					// reader answers the form, and the row closes by itself when the request
+					// goes (a stored click would outlive it). The L3+ card is the same:
+					// `lodExempt` keeps it open while a request is pending.
+					...(row.pinnedOpen === true ? {} : { onToggle: () => toggleRow(row.itemIndex, row.key) }),
 				};
+				// The live approve/deny form for this call. The card reserved its box, so the
+				// form's growth is reported by tool-use id rather than by observing the row.
+				const liveForm = traceRowPermissionSlots?.get(row.key);
+				if (liveForm !== undefined) {
+					cardExtra.permissionSlot = liveForm;
+					if (onPermissionFormHeight && card.toolUseId) {
+						const toolUseId = card.toolUseId;
+						cardExtra.onPermissionFormHeight = (height: number) =>
+							onPermissionFormHeight(toolUseId, height);
+					}
+				}
 				// ⚠️ A drilled-in card is a REAL tool card and must carry the same live
 				// controls the standalone L3+ card gets. Running and streaming tools DO
 				// fold into a trace (see render-units' isKeptToolItem — only a
@@ -711,7 +741,19 @@ export const ExactRow = memo(
 		}
 		// A live permission form (pending-permission tool/subagent card) is injected
 		// as a slot; the pure renderer draws it in place of the zero-DOM copy.
-		if (permissionSlot !== undefined) extra.permissionSlot = permissionSlot;
+		if (permissionSlot !== undefined) {
+			extra.permissionSlot = permissionSlot;
+			// A card that RESERVED the form reports the form's own height; one that did not
+			// (AskUserQuestion's banner, a subagent card) stays on the dynamic-row path.
+			if (kind === "tool-call" && onPermissionFormHeight) {
+				const measured = item.measured as MeasuredToolCall;
+				if (measured.permissionFormHeight > 0 && measured.toolUseId) {
+					const toolUseId = measured.toolUseId;
+					extra.onPermissionFormHeight = (height: number) =>
+						onPermissionFormHeight(toolUseId, height);
+				}
+			}
+		}
 		// Manual takeover of a RUNNING reflection gate. The notice itself is measured
 		// + rendered on the pure path; only this action needs the app layer.
 		if (kind === "tool-call" && onReflectionTakeOver) {
@@ -941,6 +983,8 @@ export const ExactRow = memo(
 		// Authorship decides the bubble's side; a row must repaint if the viewer changes.
 		prev.currentUserId === next.currentUserId &&
 		prev.permissionSlot === next.permissionSlot &&
+		prev.traceRowPermissionSlots === next.traceRowPermissionSlots &&
+		prev.onPermissionFormHeight === next.onPermissionFormHeight &&
 		prev.editorSlot === next.editorSlot &&
 		prev.onUnknownHeight === next.onUnknownHeight &&
 		prev.onTerminate === next.onTerminate &&

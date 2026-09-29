@@ -3,8 +3,12 @@
  * under `clientFingerprint`.
  *
  * `installationId` mirrors the real Codex CLI, which persists a UUID v4 to
- * `~/.codex/installation_id` and sends it as the `x-codex-installation-id`
- * header. `claudeDeviceId` mirrors the Claude Code CLI's `device_id`. NarraFork
+ * `~/.codex/installation_id` and sends it as the `x-codex-installation-id` key
+ * inside the request body's `client_metadata` (NOT as a direct HTTP header —
+ * codex-rs's compatibility_headers() never projects it; only the unrelated
+ * remote-control enrollment API does). NarraFork follows the same split: the
+ * value rides in body `client_metadata` via createCodexRequestIdentity.
+ * `claudeDeviceId` mirrors the Claude Code CLI's `device_id`. NarraFork
  * keeps a single id per instance (one narrafork process/db = one installation),
  * so both are stored in settings rather than dedicated files.
  *

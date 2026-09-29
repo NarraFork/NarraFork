@@ -118,6 +118,7 @@
 	"reasoning": "推理",
 	"reasoningEncryptedPlaceholder": "推理内容已加密",
 	"reasoningChars": "{{formatted}} 字符",
+	"reasoningPending": "思考中…",
 	"reasoningSteps": "{{count}} 步",
 	"reasoningShowEarlier": "展开前 {{count}} 条",
 	"reasoningHideEarlier": "收起更早",

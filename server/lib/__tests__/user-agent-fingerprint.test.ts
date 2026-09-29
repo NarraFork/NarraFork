@@ -17,7 +17,24 @@ describe("buildCodexEmulationHeaders", () => {
 	test("includes stable codex identity headers", () => {
 		const headers = buildCodexEmulationHeaders({ installationId: INSTALLATION_ID });
 		expect(headers.originator).toBe(ORIGINATOR_CODEX);
-		expect(headers["x-codex-installation-id"]).toBe(INSTALLATION_ID);
+	});
+
+	/**
+	 * codex-rs puts the installation id only in body `client_metadata`; its
+	 * compatibility_headers() never projects it onto a direct HTTP header (only
+	 * remote-control enrollment does). Emitting the header here produced a
+	 * shape no real `/responses` client sends — a distinguishable fingerprint.
+	 * The value still travels in body client_metadata via createCodexRequestIdentity.
+	 */
+	test("never emits x-codex-installation-id as a direct header", () => {
+		const headers = buildCodexEmulationHeaders({
+			installationId: INSTALLATION_ID,
+			conversationId: "conv-123",
+		});
+		expect(headers["x-codex-installation-id"]).toBeUndefined();
+		for (const key of Object.keys(headers)) {
+			expect(key.toLowerCase()).not.toBe("x-codex-installation-id");
+		}
 	});
 
 	/**
@@ -31,7 +48,6 @@ describe("buildCodexEmulationHeaders", () => {
 			userAgentMode: "narrafork",
 		});
 		expect(headers.originator).toBe(ORIGINATOR);
-		expect(headers["x-codex-installation-id"]).toBe(INSTALLATION_ID);
 	});
 
 	test.each([
@@ -101,7 +117,7 @@ describe("resolveClientFingerprint", () => {
 		});
 		expect(userAgent.startsWith(`${ORIGINATOR_CODEX}/`)).toBe(true);
 		expect(headers.originator).toBe(ORIGINATOR_CODEX);
-		expect(headers["x-codex-installation-id"]).toBe(INSTALLATION_ID);
+		expect(headers["x-codex-installation-id"]).toBeUndefined();
 		expect(headers["session-id"]).toBe("conv-1");
 	});
 
@@ -139,7 +155,7 @@ describe("resolveClientFingerprint", () => {
 		});
 		expect(userAgent).toBe(getHttpUserAgent());
 		expect(headers.originator).toBe(ORIGINATOR);
-		expect(headers["x-codex-installation-id"]).toBe(INSTALLATION_ID);
+		expect(headers["x-codex-installation-id"]).toBeUndefined();
 	});
 
 	test("user extra headers override emitted codex headers", () => {
@@ -151,7 +167,9 @@ describe("resolveClientFingerprint", () => {
 		});
 		expect(headers.originator).toBe("custom-originator");
 		expect(headers["x-extra"]).toBe("1");
-		expect(headers["x-codex-installation-id"]).toBe(INSTALLATION_ID);
+		// Emitted set stays clean; an operator CAN still inject the header via
+		// extraHeaders (override semantics), but the emulator itself must not.
+		expect(headers["x-codex-installation-id"]).toBeUndefined();
 	});
 
 	/**

@@ -542,6 +542,7 @@ describe("fold transition: play happens before paint", () => {
 			"const capture = foldCaptureRef.current;", // fold
 			"buildDrillSnapshots(", // drill morph
 			"buildLodSnapshots(", // LOD morph
+			"buildLifecycleSnapshot(", // lifecycle transition
 		]) {
 			const at = SHELL.indexOf(marker);
 			expect(at, `${marker} is missing`).toBeGreaterThan(0);
@@ -549,6 +550,74 @@ describe("fold transition: play happens before paint", () => {
 		}
 		// Stated at the source, so the next reader does not have to rediscover it here.
 		expect(SHELL).toContain("MOTION FLUSH");
+	});
+});
+
+describe("lifecycle transition: wiring", () => {
+	/** The lifecycle layout effect's body. */
+	function lifecycleEffect(): string {
+		const start = SHELL.indexOf("const foldPlayed = foldPlayedThisCommitRef.current;");
+		expect(start, "the lifecycle effect is missing").toBeGreaterThan(0);
+		const end = SHELL.indexOf("motionRef.current.push(ops);", start);
+		expect(end).toBeGreaterThan(start);
+		return SHELL.slice(start, end);
+	}
+
+	it("runs AFTER the three reader-driven planners", () => {
+		// The fold effect sets `foldPlayedThisCommitRef` for the commit it animated; the
+		// lifecycle effect reads it. Declared the other way round, it would read the
+		// PREVIOUS commit's flag and double-animate the reader's own fold.
+		const lifecycle = SHELL.indexOf("buildLifecycleSnapshot(");
+		for (const marker of [
+			"const capture = foldCaptureRef.current;",
+			"buildDrillSnapshots(",
+			"buildLodSnapshots(",
+		]) {
+			expect(SHELL.indexOf(marker)).toBeLessThan(lifecycle);
+		}
+	});
+
+	it("rolls its baseline BEFORE any early return", () => {
+		// The LOD morph's lesson: a baseline that only rolls on some commits diffs against
+		// a stale frame and mispairs everything.
+		const body = lifecycleEffect();
+		const roll = body.indexOf("lifecyclePrevRef.current = next;");
+		const firstReturn = body.indexOf("!prevContext ||");
+		expect(roll).toBeGreaterThan(0);
+		expect(roll).toBeLessThan(firstReturn);
+	});
+
+	it("yields to the reader's fold, a level/width change and reduced motion", () => {
+		const body = lifecycleEffect();
+		expect(body).toContain("foldPlayed");
+		expect(body).toContain("prevContext.lod !== context.lod");
+		expect(body).toContain("prevContext.widthBucket !== context.widthBucket");
+		expect(body).toContain("prefersReducedMotion()");
+	});
+
+	it("uses its own cancel domain, not the fold's", () => {
+		const body = lifecycleEffect();
+		expect(body).toContain("lifecycleScope(");
+		expect(body).not.toContain("rowScope(");
+	});
+
+	it("never leaves a retained card without a release", () => {
+		// Every row marked closing either gets a resize op whose onDone releases it, or is
+		// released by the effect directly — otherwise the card would stay on screen.
+		const body = lifecycleEffect();
+		expect(body).toContain("pendingLifecycleClosingRef.current");
+		expect(body).toContain("releaseClosingRow(traceKey, rowKey)");
+		expect(body).toContain("onDone: () => releaseClosingRow(resize.traceKey, resize.rowKey)");
+		// Every early exit settles the marks too, so a skipped plan cannot strand a card.
+		expect(body).toContain("releaseUnplanned(new Set());");
+	});
+
+	it("does not release a retained card on the commit that marked it", () => {
+		// The marking effect runs before the document rebuilds. Releasing on that same
+		// commit (rows unchanged, empty plan) cancelled the mark in one batched update, so
+		// the card unmounted with the rebuild instead of closing.
+		const body = lifecycleEffect();
+		expect(body).toContain("pendingClosing.items !== items");
 	});
 });
 

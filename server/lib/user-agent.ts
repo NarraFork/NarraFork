@@ -302,17 +302,32 @@ export function getHttpCodexUserAgent(): string {
  * the shared client identity, so it is set by the WS transport itself rather
  * than here (see buildHandshakeHeaders).
  *
+ * Also omitted: x-codex-installation-id as a direct header. codex-rs only puts
+ * the installation id in the request body's `client_metadata` (and inside the
+ * turn-metadata blob we deliberately do not send); its `compatibility_headers()`
+ * projects window-id / session-id / thread-id onto real headers but never the
+ * installation id — the only place that constant is sent as a real HTTP header
+ * is the remote-control enrollment API, a different service. Emitting it here
+ * produced a header set no real `/responses` client sends. The value still
+ * travels in body `client_metadata["x-codex-installation-id"]` via
+ * createCodexRequestIdentity; only this header projection is absent.
+ *
  * Included:
  * - originator: follows the operator's User-Agent mode — "narrafork" when they
  *   chose NarraFork identity, otherwise the managed Codex CLI value. Selecting
  *   NarraFork and still shipping `originator: codex-tui` is exactly the bug
  *   users reported: dumps and relays key off originator first, so a UA-only
  *   override still looked like codex-tui on the wire.
- * - x-codex-installation-id: <persisted UUID>
  * - session-id / thread-id: one stable conversation id
  * - x-codex-window-id: window UUID derived from the conversation id
  */
 export function buildCodexEmulationHeaders(opts: {
+	/**
+	 * Presence of a non-empty id is what opts the caller into the Codex header
+	 * set (see resolveClientFingerprint). The value itself is intentionally NOT
+	 * emitted as a header — official `/responses` carries it only in body
+	 * `client_metadata`.
+	 */
 	installationId: string;
 	conversationId?: string;
 	/** When "narrafork", originator presents as NarraFork instead of codex-tui. */
@@ -320,7 +335,6 @@ export function buildCodexEmulationHeaders(opts: {
 }): Record<string, string> {
 	const headers: Record<string, string> = {
 		originator: originatorForUserAgentMode(opts.userAgentMode),
-		"x-codex-installation-id": opts.installationId,
 	};
 	if (opts.conversationId) {
 		headers["session-id"] = opts.conversationId;

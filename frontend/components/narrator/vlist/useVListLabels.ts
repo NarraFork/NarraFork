@@ -149,6 +149,8 @@ export interface VListRenderLabels {
 		showEarlier: (hiddenCount: number) => string;
 		/** Size prefix of a live reasoning row's scrolling tail ("1234 字符"). */
 		liveTailChars: (formatted: string) => string;
+		/** Placeholder for a live reasoning row with no text yet ("思考中…"). */
+		reasoningPending: string;
 		/** Per-row timing popover (a folded row shows its own duration). */
 		timing: VListTimingLabels;
 		/**
@@ -586,6 +588,8 @@ export function useVListLabels(): VListLabels {
 				// `reasoningChars` string the L3+ collapsed reasoning header shows, so one
 				// concept is worded identically at every level.
 				liveTailChars: (formatted: string) => t("reasoningChars", { formatted }),
+				// A live reasoning row that has opened but carries no text yet.
+				reasoningPending: t("reasoningPending"),
 				// Same bundle the tool card and the subagent card use: a folded row now
 				// carries its own duration + lifecycle popover.
 				timing,

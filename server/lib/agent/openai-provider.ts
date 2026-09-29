@@ -1477,9 +1477,12 @@ export class OpenAIProvider implements ProviderAdapter {
 	 * The Codex header set follows apiMode rather than a separate toggle: the
 	 * codex transport already sends a codex UA, codex instructions, native codex
 	 * tools and the stable codex body contract, so suppressing only these headers
-	 * produced a shape no real client emits (body carrying an installation id
-	 * while the matching header was absent). Operators who need a different
-	 * identity use userAgentMode/extraHeaders, which still override everything here.
+	 * produced a shape no real client emits. The installation id itself is NOT
+	 * emitted as a header — official `/responses` carries it only in body
+	 * `client_metadata`, and a direct `x-codex-installation-id` header is a
+	 * distinguishable mark (the real client sends it only on remote-control
+	 * enrollment). Operators who need a different identity use
+	 * userAgentMode/extraHeaders, which still override everything here.
 	 */
 	private resolveFingerprint(conversationId?: string): {
 		userAgent: string;

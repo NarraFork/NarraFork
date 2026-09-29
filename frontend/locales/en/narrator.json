@@ -118,6 +118,7 @@
 	"reasoning": "Reasoning",
 	"reasoningEncryptedPlaceholder": "Reasoning content is encrypted",
 	"reasoningChars": "{{formatted}} chars",
+	"reasoningPending": "Thinking…",
 	"reasoningSteps": "{{count}} steps",
 	"reasoningShowEarlier": "Show {{count}} earlier",
 	"reasoningHideEarlier": "Hide earlier",

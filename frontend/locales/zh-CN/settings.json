@@ -769,7 +769,7 @@
 	"fingerprintAddHeader": "添加请求头",
 	"fingerprintRemoveHeader": "删除请求头",
 	"fingerprintInstallationId": "安装 ID",
-	"fingerprintInstallationIdDesc": "作为 x-codex-installation-id 发送的持久化 UUID。重新生成可轮换该身份标识。",
+	"fingerprintInstallationIdDesc": "作为请求体 client_metadata 的 x-codex-installation-id 键发送的持久化 UUID（与真实 Codex 一致，不作为直接 HTTP 头发送）。重新生成可轮换该身份标识。",
 	"fingerprintRegenerate": "重新生成",
 	"customApiProtocol": "API 协议",
 	"customApiProtocolDesc": "选择这个端点实际兼容的协议。切换到 Anthropic 或 OpenAI 系协议时会自动迁移供应商类型并保留名称、前缀、Key 和 Base URL。",
