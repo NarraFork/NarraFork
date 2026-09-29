@@ -1220,6 +1220,11 @@ export function NarratorPanel({
 
 	const handleCompactError = useCallback(
 		(err: unknown) => {
+			// An unset summary model is not a generic compact failure: it already has an
+			// actionable modal (the summary-model picker), opened by the server's
+			// `summary_model_unavailable` broadcast. A "compact failed" toast on top
+			// would explain nothing and cover the very surface that names the fix.
+			if (err instanceof ApiError && err.data?.code === "SUMMARY_MODEL_NOT_CONFIGURED") return;
 			const isInProgress = err instanceof ApiError && err.status === 409;
 			notifications.show({
 				title: isInProgress ? t("compactInProgress") : t("compactFailed"),

@@ -60,13 +60,14 @@ export function SummaryModelPickerHost() {
 		}
 	}, [settingsData, suppressed]);
 
-	// Listen for WS-triggered DOM events
+	// Listen for WS-triggered DOM events. `model` may legitimately be the empty
+	// string ("not configured"), so presence — not truthiness — is what matters.
 	useEffect(() => {
 		const handleUnavailable = (e: Event) => {
 			if (suppressed) return;
 			const detail = (e as CustomEvent).detail;
 			const model = detail?.model as string | undefined;
-			if (model) {
+			if (typeof model === "string") {
 				dismissedRef.current = false;
 				setUnavailableModel(model);
 				setErrorMessage(detail?.error ?? "");
@@ -78,7 +79,7 @@ export function SummaryModelPickerHost() {
 			if (suppressed) return;
 			const detail = (e as CustomEvent).detail;
 			const model = detail?.model as string | undefined;
-			if (model) {
+			if (typeof model === "string") {
 				dismissedRef.current = false;
 				setUnavailableModel(model);
 				setErrorMessage(detail?.error ?? "");

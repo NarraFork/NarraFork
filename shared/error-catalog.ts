@@ -114,6 +114,19 @@ export const ERROR_CATALOG = {
 		code: "DEFAULT_MODEL_NOT_CONFIGURED",
 		en: "No default model is configured. Choose one in Settings → Models, then retry.",
 	},
+	/**
+	 * The summary model is deliberately left unset on a fresh install and is meant
+	 * to follow the default model — but a summary-dependent action must never be
+	 * handed an EMPTY model id, which fails deep inside the model catalog as an
+	 * opaque schema error ("Invalid string at ModelQuery.upstreamModelId"). This
+	 * code lets the operator see the real cause ("configure a summary model")
+	 * instead, and drives the summary-model picker prompt.
+	 */
+	SUMMARY_MODEL_NOT_CONFIGURED: {
+		status: 503,
+		code: "SUMMARY_MODEL_NOT_CONFIGURED",
+		en: "No summary model is configured. Choose one in Settings → Models, then retry.",
+	},
 	PODMAN_NOT_FOUND: {
 		status: 422,
 		code: "PODMAN_NOT_FOUND",

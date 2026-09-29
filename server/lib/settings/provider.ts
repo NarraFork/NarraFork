@@ -203,6 +203,25 @@ export class DefaultModelNotConfiguredError extends AppError {
 }
 
 /**
+ * The summary model setting is empty. Unlike {@link DefaultModelNotConfiguredError}
+ * this does not mean "nothing is configured anywhere" — it means the code path
+ * refuses to run without an explicit summary model, because handing an empty id
+ * to the model catalog surfaces as an opaque schema error instead of an
+ * actionable prompt. `name` is pinned for `isProviderUnavailableError`, which
+ * keeps it out of the transient-retry path and lets the summary wrappers
+ * broadcast the picker event.
+ */
+export class SummaryModelNotConfiguredError extends AppError {
+	constructor() {
+		const entry = ERROR_CATALOG.SUMMARY_MODEL_NOT_CONFIGURED;
+		super(entry.en, entry.status, entry.code, {
+			messageCode: "SUMMARY_MODEL_NOT_CONFIGURED",
+		});
+		this.name = "SummaryModelNotConfiguredError";
+	}
+}
+
+/**
  * Prefix for model aggregation values stored in narrators.model.
  * Format: "__agg__:{aggId}" for auto mode, "__agg__:{aggId}:{provider:model}" for pinned provider.
  */
