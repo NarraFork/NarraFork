@@ -87,10 +87,14 @@ export function SummaryModelPickerModal({
 							? t("summaryModelUnavailableDesc")
 							: t("summaryModelErrorDescIntro")}
 					</Text>
-					<Code block style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
-						{unavailableModel}
-						{errorMessage ? `\n${errorMessage}` : ""}
-					</Code>
+					{/* The model may be empty when the summary model is simply unset —
+					    render the block only when there is something to show. */}
+					{(unavailableModel || errorMessage) && (
+						<Code block style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+							{unavailableModel}
+							{errorMessage ? `${unavailableModel ? "\n" : ""}${errorMessage}` : ""}
+						</Code>
+					)}
 					{errorKind === "unavailable" && (
 						<Text size="sm" c="dimmed">
 							{t("summaryModelUnavailableHint")}

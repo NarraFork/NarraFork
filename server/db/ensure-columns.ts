@@ -54,9 +54,9 @@ export function ensureColumns(sqlite: Database): void {
 
 			// SQLite requires a default for NOT NULL columns added via ALTER TABLE
 			if (col.default !== undefined) {
-				ddl += ` NOT NULL DEFAULT ${formatDefault(col.default)}`;
+				ddl += ` NOT NULL DEFAULT ${formatDefault(col.default, col.dataType)}`;
 			} else if (col.notNull) {
-				ddl += ` NOT NULL DEFAULT ${defaultForType(sqlType)}`;
+				ddl += ` NOT NULL DEFAULT ${defaultForType(sqlType, col.dataType)}`;
 			}
 
 			try {
@@ -97,7 +97,20 @@ function mapDrizzleColumnType(columnType: string, dataType: string): string {
 	return "TEXT";
 }
 
-function formatDefault(value: unknown): string {
+/**
+ * Serialize a column default for `ALTER TABLE ... ADD COLUMN`.
+ *
+ * `dataType === "json"` is checked FIRST and deliberately. A JSON-mode column
+ * (`text("traits", { mode: "json" }).default([])`) carries its default as a plain JS
+ * value — `[]` — and the generic fallback below stringifies it, and `String([])` is `""`.
+ * That produced `TEXT NOT NULL DEFAULT ''`: a syntactically fine ALTER TABLE whose every
+ * existing row then held `''`, which is not JSON. Drizzle's row mapper calls `JSON.parse`
+ * on every JSON-mode value it reads, so `db.query.<table>.findFirst()` threw
+ * "JSON Parse error: Unexpected EOF" for the whole table, taking every reader down with it.
+ * The default must therefore be a JSON LITERAL, not the value's `String()` form.
+ */
+function formatDefault(value: unknown, dataType?: string): string {
+	if (dataType === "json") return formatJsonDefault(value);
 	if (value instanceof SQL) {
 		// Can't easily serialize arbitrary SQL defaults — fall back to type default
 		return "''";
@@ -109,7 +122,21 @@ function formatDefault(value: unknown): string {
 	return `'${String(value).replace(/'/g, "''")}'`;
 }
 
-function defaultForType(sqlType: string): string {
+/**
+ * A JSON-mode default, as a quoted JSON literal.
+ *
+ * A drizzle `sql` default cannot be read back (the same limitation the generic branch
+ * above admits), so it falls back to `'[]'`: the one value that is valid JSON for every
+ * JSON column shape declared in this schema, and the empty case those columns mean when
+ * they are unset. Every caller here is a `notNull` column, so "no value" is not an option.
+ */
+function formatJsonDefault(value: unknown): string {
+	if (value instanceof SQL) return "'[]'";
+	return `'${JSON.stringify(value ?? null).replace(/'/g, "''")}'`;
+}
+
+function defaultForType(sqlType: string, dataType?: string): string {
+	if (dataType === "json") return "'[]'";
 	if (sqlType === "INTEGER") return "0";
 	return "''";
 }

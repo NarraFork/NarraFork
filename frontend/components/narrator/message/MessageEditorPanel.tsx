@@ -196,9 +196,16 @@ export function MessageEditorPanel({
 			: [],
 	);
 	const [editNewTextFiles, setEditNewTextFiles] = useState<File[]>([]);
-	// File references (in-text markers like #file(...))
+	// File references (in-text markers like #file(...)). Like the two initializers
+	// above, the persisted metadata lives on the message's `file_reference` blocks;
+	// `initialText` only carries the surrounding text, so seeding from it yields []
+	// and silently drops every reference the message already had.
 	const [editFileReferences, setEditFileReferences] = useState<FileReference[]>(() =>
-		readFileReferences(initialText),
+		isUser
+			? readFileReferences(
+					blocks.filter((block) => block.type === "file_reference").map((block) => block.reference),
+				)
+			: [],
 	);
 	const [isSubmittingEdit, setIsSubmittingEdit] = useState(false);
 

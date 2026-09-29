@@ -21,6 +21,7 @@ import {
 	count as countFn,
 	desc,
 	eq,
+	exists,
 	gt,
 	gte,
 	inArray,
@@ -6099,20 +6100,50 @@ narratorRoutes.get("/:id/file-modifications", async (c) => {
 	// and serializing that on every refresh is synchronous main-thread work for a picker
 	// nobody scrolls that far back in. The newest window is the useful one, so take the
 	// tail and re-sort ascending for the UI.
+	//
+	// The ref window is taken FIRST, as its own subquery, and only then joined to the
+	// message row for `role`/`createdAt`. Written the other way round — join first, then
+	// `ORDER BY ref.seq DESC LIMIT n` — the planner drove from `narrator_messages` through
+	// `idx_messages_parent_tool_use_lookup`, whose `parent_tool_use_id IS NULL` predicate
+	// matches ~90% of every message in the database, and sorted this narrator's entire ref
+	// set in a temp B-tree to read 500 rows: ~300ms. Driving from `idx_narrator_refs_seq`
+	// makes the ORDER BY free and lets the LIMIT stop the scan early: 3.3ms, identical rows.
+	// The EXISTS is not decoration here — with the join still in place the planner ignores
+	// it and keeps the bad plan, so this query needs the refs-first shape rather than a
+	// predicate swap (unlike the ref-only queries in narrator-session.ts).
+	const newestRefPage = db
+		.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+		.from(narratorMessageRefs)
+		.where(
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				exists(
+					db
+						.select({ one: sql`1` })
+						.from(narratorMessages)
+						.where(
+							and(
+								eq(narratorMessages.id, narratorMessageRefs.messageId),
+								isNull(narratorMessages.parentToolUseId),
+							),
+						),
+				),
+			),
+		)
+		.orderBy(desc(narratorMessageRefs.seq))
+		.limit(FILE_MODIFICATION_TIMELINE_LIMIT + 1)
+		.as("newest_ref_page");
+
 	const newestRefs = await db
 		.select({
-			messageId: narratorMessageRefs.messageId,
-			seq: narratorMessageRefs.seq,
+			messageId: newestRefPage.messageId,
+			seq: newestRefPage.seq,
 			role: narratorMessages.role,
 			createdAt: narratorMessages.createdAt,
 		})
-		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
-		.where(
-			and(eq(narratorMessageRefs.narratorId, narratorId), isNull(narratorMessages.parentToolUseId)),
-		)
-		.orderBy(desc(narratorMessageRefs.seq))
-		.limit(FILE_MODIFICATION_TIMELINE_LIMIT + 1);
+		.from(newestRefPage)
+		.innerJoin(narratorMessages, eq(narratorMessages.id, newestRefPage.messageId))
+		.orderBy(desc(newestRefPage.seq));
 
 	const timelineTruncated = newestRefs.length > FILE_MODIFICATION_TIMELINE_LIMIT;
 	const windowRefs = timelineTruncated
