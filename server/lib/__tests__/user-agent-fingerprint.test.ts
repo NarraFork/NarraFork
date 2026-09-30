@@ -83,6 +83,7 @@ describe("buildCodexEmulationHeaders", () => {
 		const without = buildCodexEmulationHeaders({ installationId: INSTALLATION_ID });
 		expect(without["session-id"]).toBeUndefined();
 		expect(without["thread-id"]).toBeUndefined();
+		expect(without["x-client-request-id"]).toBeUndefined();
 
 		const withConv = buildCodexEmulationHeaders({
 			installationId: INSTALLATION_ID,
@@ -90,6 +91,9 @@ describe("buildCodexEmulationHeaders", () => {
 		});
 		expect(withConv["session-id"]).toBe("conv-123");
 		expect(withConv["thread-id"]).toBe("conv-123");
+		// codex-rs sends x-client-request-id (= thread_id) on HTTP /responses and
+		// the WS handshake; only /responses/compact omits it.
+		expect(withConv["x-client-request-id"]).toBe("conv-123");
 	});
 
 	test("emits the conversation-stable window id but no turn tracking", () => {

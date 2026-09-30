@@ -10,8 +10,11 @@ export const FOLLOW_PARENT_MODEL = "__parent__";
  * silently runs something else.
  */
 export interface SubagentModelInheritance {
-	/** `parent`: the parent's model was allowed. `pool-fallback`: it was not. */
-	source: "parent" | "pool-fallback";
+	/**
+	 * `parent`: the parent's model was allowed. `pool-fallback`: it was not.
+	 * `preference`: the parent had no concrete model ID, so the type preference ran.
+	 */
+	source: "parent" | "pool-fallback" | "preference";
 	/** The pool-authorized reference the child runs on. */
 	model: string;
 	/** The parent's model that was followed or rejected. */
@@ -30,7 +33,7 @@ export function isSubagentModelInheritance(value: unknown): value is SubagentMod
 	if (!value || typeof value !== "object") return false;
 	const v = value as Record<string, unknown>;
 	return (
-		(v.source === "parent" || v.source === "pool-fallback") &&
+		(v.source === "parent" || v.source === "pool-fallback" || v.source === "preference") &&
 		typeof v.model === "string" &&
 		typeof v.parentModel === "string" &&
 		(v.poolKey === undefined || typeof v.poolKey === "string") &&

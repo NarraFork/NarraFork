@@ -872,11 +872,22 @@ export class OpenAIProvider implements ProviderAdapter {
 		applyOpenAIModelMetadata(body, params.model, this.apiMode, params.maxOutputTokens);
 		const requestHeaders = this.buildHeaders(apiKey, params.conversationId);
 
+		// x-codex-turn-state is per-turn: the server hands it back on the first
+		// response of a turn and expects it replayed on every later request of
+		// that same turn (here: the strip-and-retry attempts below). codex-rs
+		// keeps it in a per-turn OnceLock and sends it as an HTTP header on this
+		// transport; the websocket path carries it in client_metadata instead
+		// (see applyTurnStateToRequest in codex-websocket.ts).
+		let turnState: string | null = null;
+
 		// One strip-and-retry for endpoints that reject an optional request field
 		// (observed: NUG Responses relays refusing `max_output_tokens`). Only safe
 		// before any stream event has been yielded — after that the consumer has
 		// already seen partial output and a silent re-send would duplicate it.
 		for (let attempt = 0; ; attempt++) {
+			if (turnState && this.apiMode === "codex") {
+				requestHeaders["x-codex-turn-state"] = turnState;
+			}
 			params.requestDump?.beginResponseAttempt(
 				{
 					transport: "http",
@@ -901,6 +912,12 @@ export class OpenAIProvider implements ProviderAdapter {
 				throw error;
 			});
 			if (!response) continue;
+
+			// Capture the turn's sticky-routing token before status handling so
+			// even a non-2xx first response can seed the retried request.
+			if (this.apiMode === "codex" && !turnState) {
+				turnState = response.headers.get("x-codex-turn-state");
+			}
 
 			params.requestDump?.setResponseMeta({
 				status: response.status,
@@ -1191,6 +1208,10 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 			applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
 			const conversationId = codexIdentity?.conversationId;
+			// Per-turn x-codex-turn-state slot: the fallback retry below is a later
+			// request of the SAME turn and must replay the token the first
+			// response handed back (codex-rs sends it as an HTTP header here).
+			const turnState: { value: string | null } = { value: null };
 			return withUnsupportedParameterFallback(model, body, (retryBody) =>
 				this.requestResponsesTextWithMeta(
 					baseUrl,
@@ -1199,6 +1220,7 @@ export class OpenAIProvider implements ProviderAdapter {
 					options?.signal,
 					options,
 					conversationId,
+					turnState,
 				),
 			);
 		}
@@ -1276,6 +1298,10 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 			applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
 			const conversationId = codexIdentity?.conversationId;
+			// Per-turn x-codex-turn-state slot: the fallback retry below is a later
+			// request of the SAME turn and must replay the token the first
+			// response handed back (codex-rs sends it as an HTTP header here).
+			const turnState: { value: string | null } = { value: null };
 			return withUnsupportedParameterFallback(model, body, (retryBody) =>
 				this.requestResponsesTextWithMeta(
 					baseUrl,
@@ -1284,6 +1310,7 @@ export class OpenAIProvider implements ProviderAdapter {
 					options?.signal,
 					options,
 					conversationId,
+					turnState,
 				),
 			);
 		}
@@ -1312,16 +1339,26 @@ export class OpenAIProvider implements ProviderAdapter {
 		signal?: AbortSignal,
 		options?: GenerateOptions,
 		conversationId?: string,
+		turnState?: { value: string | null },
 	): Promise<GenerateMetaResult> {
 		if (body.stream !== true) {
 			throw new Error("OpenAI lightweight Responses generation requires stream=true");
 		}
+		const headers = this.buildHeaders(apiKey, conversationId);
+		if (turnState?.value && this.apiMode === "codex") {
+			headers["x-codex-turn-state"] = turnState.value;
+		}
 		const response = await this.pfetch(`${baseUrl}/responses`, {
 			method: "POST",
-			headers: this.buildHeaders(apiKey, conversationId),
+			headers,
 			body: JSON.stringify(body),
 			signal,
 		});
+		// Capture the turn's sticky-routing token before status handling so even
+		// a non-2xx first response can seed the retried request.
+		if (turnState && this.apiMode === "codex" && !turnState.value) {
+			turnState.value = response.headers.get("x-codex-turn-state");
+		}
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
 			throw createOpenAIApiError(response, errText);

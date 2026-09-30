@@ -112,15 +112,16 @@ describe.each([
 	});
 
 	/**
-	 * codex-rs writes x-client-request-id in exactly one place —
-	 * build_websocket_headers — so the HTTP /responses path (and
-	 * /responses/compact) never carries it. Sending it here produced a shape no
-	 * real client emits: a non-lite HTTP body with a websocket-only header.
+	 * codex-rs sends x-client-request-id (= thread_id) on every HTTP /responses
+	 * request (codex-api/src/endpoint/responses.rs, next to
+	 * build_session_headers) and on the websocket handshake; only
+	 * /responses/compact omits it. The utility transport must match the main
+	 * HTTP path and correlate it with the conversation identity.
 	 */
-	test("does not send the websocket-only x-client-request-id over HTTP", async () => {
+	test("sends x-client-request-id matching the conversation identity", async () => {
 		const req = await capture(run);
 
-		expect(req.headers["x-client-request-id"]).toBeUndefined();
+		expect(req.headers["x-client-request-id"]).toBe(req.headers["thread-id"]);
 	});
 
 	test("sets prompt_cache_key to the same id", async () => {

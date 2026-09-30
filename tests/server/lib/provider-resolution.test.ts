@@ -140,6 +140,7 @@ describe("resolveProvider fallback order", () => {
 
 	test("GPT-6 系列作为 builtin Codex 模型解析", () => {
 		expect(resolveProvider("gpt-6-astra")).toBe("codex");
+		expect(resolveProvider("gpt-6.1-sol")).toBe("codex");
 		expect(resolveProvider("gpt-6-sol")).toBe("codex");
 		expect(resolveProvider("gpt-6-luna")).toBe("codex");
 	});
