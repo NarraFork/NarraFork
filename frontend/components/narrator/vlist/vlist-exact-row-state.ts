@@ -274,6 +274,7 @@ export function resolveTraceRowIdentity(
 		identity.tool = {
 			toolName: rowIdentity.toolName ?? meta?.toolName ?? "",
 			toolUseId,
+			...(meta?.isRunningBash ? { isRunningBash: true } : {}),
 			...(meta?.filePath ? { filePath: meta.filePath } : {}),
 			...(meta?.isReadTool ? { isReadTool: true } : {}),
 			// Gates "open in panel". Broader than isReadTool (any Read/Write/Edit with
@@ -455,6 +456,8 @@ export function sameToolMeta(a: VListToolMeta | undefined, b: VListToolMeta | un
 	if (!a || !b) return false;
 	return (
 		a.toolName === b.toolName &&
+		a.toolUseId === b.toolUseId &&
+		a.isRunningBash === b.isRunningBash &&
 		a.filePath === b.filePath &&
 		a.isFileTool === b.isFileTool &&
 		a.isReadTool === b.isReadTool &&

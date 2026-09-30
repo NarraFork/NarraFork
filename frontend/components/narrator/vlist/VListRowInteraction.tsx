@@ -274,6 +274,7 @@ export function VListRowInteraction({
 	const hasToolActions = !!(
 		toolActions?.onViewSubagentSession ||
 		toolActions?.onDetachSubagent ||
+		toolActions?.onDetachBash ||
 		toolActions?.onCancelBackgroundTask ||
 		toolActions?.onOpenFilePanel ||
 		canInspect ||
@@ -293,11 +294,11 @@ export function VListRowInteraction({
 					{tNarrator("viewSubagentSession")}
 				</Menu.Item>
 			)}
-			{toolActions?.onDetachSubagent && (
+			{(toolActions?.onDetachSubagent || toolActions?.onDetachBash) && (
 				<Menu.Item
 					leftSection={<IconCloudOff size={14} />}
 					onClick={() => {
-						toolActions.onDetachSubagent?.();
+						(toolActions.onDetachBash ?? toolActions.onDetachSubagent)?.();
 						swipe.closeSwipe();
 					}}
 				>

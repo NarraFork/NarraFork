@@ -23,6 +23,7 @@ import { groupReasoningRuns } from "@shared/pretext-layout/reasoning-segments";
 import { extractField } from "@shared/pretext-layout/tool-detail";
 import { makeMessageBlockSelectionId } from "../message/MessageSelectionCtx";
 import type { ContentBlock } from "../narrator-panel-types";
+import { isRunningForegroundBash } from "../tool-call/tool-display";
 
 /** Tools whose input carries a file path worth offering in the row menu. */
 const FILE_TOOLS = new Set(["Read", "Write", "Edit"]);
@@ -40,6 +41,8 @@ const SUBAGENT_ID_TAG_RE = /<subagent_id>([^<]+)<\/subagent_id>/;
 
 /** Tool facts a folded tool row needs for its tool-specific menu items. */
 export interface TraceRowToolMeta {
+	/** Only executing/running foreground Bash commands, excluding stop calls. */
+	isRunningBash?: boolean;
 	/** Raw tool name (e.g. "Read", "Await"). */
 	toolName: string;
 	/** Tool-call id — drives the inspector item (absent → hidden). */
@@ -256,6 +259,15 @@ export function traceRowIsTerminal(tc: TraceRowToolCallLike): boolean {
 export function traceRowToolMeta(tc: TraceRowToolCallLike): TraceRowToolMeta {
 	const meta: TraceRowToolMeta = { toolName: tc.toolName };
 	if (tc.toolUseId) meta.toolUseId = tc.toolUseId;
+	if (
+		isRunningForegroundBash(
+			tc.toolName,
+			tc.inputJson,
+			tc.status,
+			tc.outputJson?._metadata ?? tc._metadata,
+		)
+	)
+		meta.isRunningBash = true;
 	if (FILE_TOOLS.has(tc.toolName)) {
 		const filePath = readFilePath(tc.inputJson);
 		if (filePath) {

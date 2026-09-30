@@ -124,6 +124,24 @@ describe("deleteBlockIndices", () => {
 });
 
 describe("buildRowToolActions", () => {
+	it("binds live Bash detachment to toolUseId, never a child or Send target", () => {
+		const seen: string[] = [];
+		const handlers: VListRowHandlers = { onDetachBash: (id) => seen.push(id) };
+		const live: VListToolMeta = { toolName: "Bash", toolUseId: "bash-1", isRunningBash: true };
+		const actions = buildRowToolActions(live, handlers);
+		actions.onDetachBash?.();
+		expect(seen).toEqual(["bash-1"]);
+		expect(actions.onDetachSubagent).toBeUndefined();
+		for (const meta of [
+			{ ...live, isRunningBash: false },
+			{ ...live, toolUseId: undefined },
+			{ ...live, toolName: "Agent" },
+			{ ...live, toolName: "Send", sendTargetNarratorId: "sibling" },
+		]) {
+			expect(buildRowToolActions(meta, handlers).onDetachBash).toBeUndefined();
+		}
+		expect(buildRowToolActions(live, {}).onDetachBash).toBeUndefined();
+	});
 	const allHandlers = (sink: string[]): VListRowHandlers => ({
 		onViewSubagentSession: (id) => sink.push(`view:${id}`),
 		onDetachSubagent: (id) => sink.push(`detach:${id}`),

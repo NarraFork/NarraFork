@@ -82,6 +82,23 @@ interface RunningBashEntry {
 	timeoutMs: number;
 	kill: () => void;
 	setTimedOut: () => void;
+	narratorId: string;
+	detach?: () => Promise<DetachedBashProcess>;
+}
+
+export interface DetachedBashProcess {
+	taskId: string;
+	alias: string;
+}
+
+/** Adopt the existing execution; never dispatch the command a second time. */
+export async function detachBashProcess(
+	toolUseId: string,
+	narratorId: string,
+): Promise<DetachedBashProcess | null> {
+	const entry = runningBashProcesses.get(toolUseId);
+	if (!entry || entry.narratorId !== narratorId || !entry.detach) return null;
+	return entry.detach();
 }
 
 let preexistingBashRegistry = true;
@@ -545,9 +562,28 @@ export const bashTool: ToolDefinition = {
 				isBackground: false,
 				isChapter: !!ctx.chapterId,
 			});
+			let releaseDetachedLease: (() => Promise<void>) | undefined;
+			let resolveDetached!: (result: ToolResult) => void;
+			const detachedResult = new Promise<ToolResult>((resolve) => {
+				resolveDetached = resolve;
+			});
 			const runForeground = async (): Promise<ToolResult> => {
-				const handle = await execution.start(ctx.signal);
-
+				// Backends may retain start(signal) until actual process settlement.
+				// Give them an execution-owned signal and only forward foreground aborts
+				// while this execution still belongs to the foreground tool.
+				const processAbort = new AbortController();
+				const forwardAbort = () => processAbort.abort(ctx.signal.reason);
+				ctx.signal.addEventListener("abort", forwardAbort, { once: true });
+				if (ctx.signal.aborted) forwardAbort();
+				let handle: ExecHandle;
+				try {
+					handle = await execution.start(processAbort.signal);
+				} catch (error) {
+					ctx.signal.removeEventListener("abort", forwardAbort);
+					throw error;
+				}
+				let detached: DetachedBashProcess | undefined;
+				let detachPending: Promise<DetachedBashProcess> | undefined;
 				let output = "";
 				let timedOut = false;
 				let aborted = false;
@@ -577,7 +613,7 @@ export const bashTool: ToolDefinition = {
 					ctx.emitOutput?.(getLiveOutputPreview());
 				};
 				const scheduleLiveOutput = (force = false) => {
-					if (!ctx.emitOutput) return;
+					if (detached || !ctx.emitOutput) return;
 					if (force || Date.now() - lastLiveEmitAt >= LIVE_OUTPUT_INTERVAL_MS) {
 						flushLiveOutput();
 						return;
@@ -586,19 +622,25 @@ export const bashTool: ToolDefinition = {
 					pendingLiveEmit = true;
 					liveEmitTimer = setTimeout(flushLiveOutput, LIVE_OUTPUT_INTERVAL_MS);
 				};
+				const appendText = (text: string) => {
+					output += text;
+					if (detached && text && !processAbort.signal.aborted)
+						backgroundTaskService.appendOutput(detached.taskId, text);
+				};
 				const append = (raw: Uint8Array) => {
 					if (outputTruncated) return;
 					const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
 					outputBytes += chunk.byteLength;
 					if (outputBytes > MAX_OUTPUT_BYTES) {
-						output += decoder.write(chunk).slice(0, 200);
-						output +=
-							"\n\n<bash_metadata>\nOutput truncated at 10MB in-memory limit\n</bash_metadata>";
+						appendText(
+							decoder.write(chunk).slice(0, 200) +
+								"\n\n<bash_metadata>\nOutput truncated at 10MB in-memory limit\n</bash_metadata>",
+						);
 						outputTruncated = true;
 						scheduleLiveOutput(true);
 						return;
 					}
-					output += decoder.write(chunk);
+					appendText(decoder.write(chunk));
 					scheduleLiveOutput();
 				};
 				handle.onData(append);
@@ -634,6 +676,88 @@ export const bashTool: ToolDefinition = {
 					void kill();
 				}, timeoutMs);
 
+				// Serialize concurrent detach requests. Output stays in this collector
+				// during durable task creation, including a process exit in that window.
+				const detach = (): Promise<DetachedBashProcess> => {
+					if (detachPending) return detachPending;
+					if (exited || handle.isExited() || timedOut || aborted || ctx.signal.aborted)
+						return Promise.reject(new AppError("Bash is no longer running in foreground", 409));
+					detachPending = (async () => {
+						const { registerTaskAlias, unregisterTaskAlias } = await import(
+							"@server/services/subagent-alias"
+						);
+						if (exited || handle.isExited() || timedOut || aborted || ctx.signal.aborted)
+							throw new AppError("Bash is no longer running in foreground", 409);
+						const taskId = `bash_${generateShortId()}`;
+						const { alias } = registerTaskAlias(ctx.narratorId, taskId, title);
+						try {
+							await backgroundTaskService.createBashTask({
+								id: taskId,
+								parentNarratorId: ctx.narratorId,
+								command,
+								toolUseId: ctx.currentToolUseId ?? undefined,
+								toolCallBinding: ctx.toolCallBinding,
+								executionTarget: ctx.executionTarget,
+								alias,
+								title,
+							});
+						} catch (error) {
+							unregisterTaskAlias(ctx.narratorId, taskId);
+							throw error;
+						}
+						if (timedOut || aborted || ctx.signal.aborted) {
+							await backgroundTaskService.markFailed(
+								taskId,
+								"Foreground Bash stopped during detach",
+							);
+							unregisterTaskAlias(ctx.narratorId, taskId);
+							throw new AppError("Bash is no longer running in foreground", 409);
+						}
+						const updateLeaseTransferred = ctx.updateExecutionLease?.transfer() ?? false;
+						if (ctx.updateExecutionLease && !updateLeaseTransferred) {
+							await backgroundTaskService.markFailed(taskId, "Could not transfer execution lease");
+							unregisterTaskAlias(ctx.narratorId, taskId);
+							throw new Error("Background Bash could not transfer its update execution lease");
+						}
+						if (updateLeaseTransferred) {
+							releaseDetachedLease = async () => {
+								try {
+									await (handle.whenSettled ?? handle.exited);
+								} catch {
+									// Coordinator independently retains unknown-outcome holds.
+								} finally {
+									ctx.updateExecutionLease?.release();
+								}
+							};
+						}
+						detached = { taskId, alias };
+						ctx.signal.removeEventListener("abort", forwardAbort);
+						ctx.signal.removeEventListener("abort", abortHandler);
+						if (liveEmitTimer) clearTimeout(liveEmitTimer);
+						liveEmitTimer = null;
+						pendingLiveEmit = false;
+						backgroundTaskService.registerAbortController(taskId, processAbort);
+						backgroundTaskService.registerKillHandler(taskId, () => void kill());
+						if (output) backgroundTaskService.appendOutput(taskId, output);
+						resolveDetached({
+							output:
+								`<background_task_id>${alias}</background_task_id>\n\n` +
+								`Bash moved to background: ${title}\nAwait({ type: "bash", id: "${alias}" })`,
+							title,
+							metadata: {
+								background_task_id: taskId,
+								background_task_alias: alias,
+								detached: true,
+							},
+						});
+						return detached;
+					})();
+					void detachPending.catch(() => {
+						detachPending = undefined;
+					});
+					return detachPending;
+				};
+
 				// Register in the running map so the UI can update timeout mid-execution
 				const toolUseId = ctx.currentToolUseId;
 				if (toolUseId) {
@@ -641,6 +765,8 @@ export const bashTool: ToolDefinition = {
 						timer,
 						startedAt: Date.now(),
 						timeoutMs: timeoutMs ?? DEFAULT_TIMEOUT_MS,
+						narratorId: ctx.narratorId,
+						detach,
 						kill: () => void kill(),
 						setTimedOut: () => {
 							timedOut = true;
@@ -687,7 +813,7 @@ export const bashTool: ToolDefinition = {
 					// Notify UI once when process exceeds long-running threshold.
 					// ctx.emitLongRunning 由 loop.ts 注入，触发链路：
 					// tool_long_running AgentEvent → narrator-event-handler → WS → 前端终止按钮
-					if (!longRunningFired && elapsed >= LONG_RUNNING_THRESHOLD_MS) {
+					if (!detached && !longRunningFired && elapsed >= LONG_RUNNING_THRESHOLD_MS) {
 						longRunningFired = true;
 						const toolUseId = ctx.currentToolUseId;
 						if (toolUseId) {
@@ -700,18 +826,36 @@ export const bashTool: ToolDefinition = {
 				let exitCodeValue: number | null = null;
 				try {
 					exitCodeValue = await handle.exited;
+					await detachPending?.catch(() => undefined);
 				} catch (error) {
+					await detachPending?.catch(() => undefined);
 					if (toolUseId) {
 						clearTimeout(runningBashProcesses.get(toolUseId)?.timer);
 						runningBashProcesses.delete(toolUseId);
 					}
 					if (liveEmitTimer) clearTimeout(liveEmitTimer);
+					if (detached) {
+						await backgroundTaskService.markFailed(
+							detached.taskId,
+							`${output}\nError: ${error instanceof Error ? error.message : String(error)}`,
+						);
+					}
 					throw error;
 				} finally {
 					clearTimeout(timer);
 					if (toolUseId) clearTimeout(runningBashProcesses.get(toolUseId)?.timer);
 					clearInterval(watchdogTimer);
 					ctx.signal.removeEventListener("abort", abortHandler);
+					ctx.signal.removeEventListener("abort", forwardAbort);
+					if (detached) {
+						// Tool return is not process settlement: retain the legacy write
+						// lock and transferred lease until the backend's real barrier.
+						try {
+							await (handle.whenSettled ?? handle.exited);
+						} catch {
+							// Coordinator retains its unknown-outcome recovery hold.
+						}
+					}
 				}
 
 				// Flush any bytes buffered inside the decoder (the legacy-encoding decoder
@@ -723,7 +867,7 @@ export const bashTool: ToolDefinition = {
 				}
 
 				// Flush any pending live output before sending the final tool result.
-				if (pendingLiveEmit || output) flushLiveOutput();
+				if (!detached && (pendingLiveEmit || output)) flushLiveOutput();
 
 				// Capture the effective timeout (may have been updated mid-execution)
 				const effectiveTimeout = toolUseId
@@ -750,6 +894,19 @@ export const bashTool: ToolDefinition = {
 				const exitCode = exitCodeValue ?? (timedOut || aborted || watchdogKilled ? 1 : 0);
 				if (exitCode !== 0) output += `\n[exit code: ${exitCode}]`;
 
+				if (detached) {
+					if (timedOut) {
+						await backgroundTaskService.markTimedOut(detached.taskId, output, exitCode);
+					} else if (exitCode === 0) {
+						await backgroundTaskService.markCompleted(detached.taskId, output, exitCode);
+					} else {
+						await backgroundTaskService.markFailed(detached.taskId, output, exitCode);
+					}
+					// The foreground already received its adoption result. The service
+					// owns output spillage now; do not create a second foreground dump.
+					return { output: "", title };
+				}
+
 				const truncated = truncateOutput(output || "(no output)");
 
 				return {
@@ -761,8 +918,14 @@ export const bashTool: ToolDefinition = {
 				};
 			};
 
-			const outcome = await withBashWriteLock(backend, serializationInput, runForeground);
-			return outcome.value;
+			// Race only the HTTP/tool result, not the write-lock callback or process
+			// collector. They continue until the original execution really settles.
+			const lifecycle = withBashWriteLock(backend, serializationInput, runForeground)
+				.then((outcome) => outcome.value)
+				// Release after terminal output/status publication, just like Bash
+				// started in background mode, not immediately upon process exit.
+				.finally(() => releaseDetachedLease?.());
+			return await Promise.race([lifecycle, detachedResult]);
 		} catch (err) {
 			return {
 				output: `Error: ${err instanceof Error ? err.message : String(err)}`,

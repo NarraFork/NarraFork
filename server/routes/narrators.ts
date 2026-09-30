@@ -3969,6 +3969,17 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 	return c.json({ interrupted });
 });
 
+// Adopt a running Bash execution without interrupting or respawning it.
+// The narrator write-access gate above also covers this tool-specific route.
+narratorRoutes.post("/:id/tools/:toolUseId/detach", async (c) => {
+	const { detachBashProcess } = await import("../lib/agent/tools/bash");
+	const detached = await detachBashProcess(c.req.param("toolUseId"), c.req.param("id"));
+	if (!detached) {
+		return c.json({ error: "Bash is not running in foreground mode" }, 409);
+	}
+	return c.json({ detached: true, ...detached });
+});
+
 // Detach a foreground subagent to background mode (zero-interrupt)
 narratorRoutes.post("/:id/detach", async (c) => {
 	const id = c.req.param("id");

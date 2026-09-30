@@ -105,6 +105,42 @@ describe("narrators API", () => {
 		expect(resolved.message).toEqual(message);
 	});
 
+	test("detaches Bash with an encoded tool endpoint and no request body", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		let receivedUrl = "";
+		let receivedInit: RequestInit | undefined;
+		Object.defineProperty(g, "fetch", {
+			value: async (url: string, init: RequestInit) => {
+				receivedUrl = url;
+				receivedInit = init;
+				return Response.json({ detached: true, taskId: "task-1", alias: "build" });
+			},
+			configurable: true,
+		});
+		expect(await api.detachBash("n/1", "tu/1")).toEqual({
+			detached: true,
+			taskId: "task-1",
+			alias: "build",
+		});
+		expect(receivedUrl).toEndWith("/narrators/n%2F1/tools/tu%2F1/detach");
+		expect(receivedInit?.method).toBe("POST");
+		expect(receivedInit?.body).toBeUndefined();
+		Object.defineProperty(g, "fetch", {
+			value: async () => Response.json({ error: "Already finished" }, { status: 409 }),
+			configurable: true,
+		});
+		try {
+			await api.detachBash("n", "tu");
+			throw new Error("Expected a conflict");
+		} catch (error) {
+			expect(error).toBeInstanceOf(ApiError);
+			expect((error as ApiError).status).toBe(409);
+		}
+	});
+
 	test("interrupt can wait for the old loop to finish before replacement input", async () => {
 		Object.defineProperty(g, "localStorage", {
 			value: { getItem: () => null },

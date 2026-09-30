@@ -91,6 +91,8 @@ export interface VListRowHandlers {
 	onOpenChapter?: (chapterId: string) => void;
 	/** Detach a running subagent to a background task; absent → item hidden. */
 	onDetachSubagent?: (narratorId: string) => void;
+	/** Detach this running foreground Bash tool call, not a child narrator. */
+	onDetachBash?: (toolUseId: string) => void;
 	/** Cancel a background subagent task; absent → item hidden. */
 	onCancelBackgroundTask?: (narratorId: string) => void;
 	/**
@@ -120,6 +122,7 @@ export function rowActionHandlerDependencies(
 		handlers?.onEditMessage,
 		handlers?.onViewSubagentSession,
 		handlers?.onDetachSubagent,
+		handlers?.onDetachBash,
 		handlers?.onCancelBackgroundTask,
 		handlers?.onOpenFilePanel,
 	];
@@ -139,6 +142,8 @@ export interface VListRowToolActions {
 	onViewSubagentSession?: () => void;
 	/** "Detach to background". */
 	onDetachSubagent?: () => void;
+	/** "Detach to background" for a Bash tool call. */
+	onDetachBash?: () => void;
 	/** "Cancel background task". */
 	onCancelBackgroundTask?: () => void;
 	/** "Open in panel" — a file-oriented tool's path, bound to the dock host. */
@@ -161,6 +166,11 @@ export function buildRowToolActions(
 ): VListRowToolActions {
 	const actions: VListRowToolActions = {};
 	if (!meta) return actions;
+
+	if (meta.toolName === "Bash" && meta.isRunningBash && meta.toolUseId && handlers.onDetachBash) {
+		const toolUseId = meta.toolUseId;
+		actions.onDetachBash = () => handlers.onDetachBash?.(toolUseId);
+	}
 
 	// File viewer: any Read / Write / Edit with a path (the panel shows the file's
 	// current on-disk content, so a write is as valid an entry point as a read).

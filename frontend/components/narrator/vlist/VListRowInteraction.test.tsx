@@ -246,6 +246,30 @@ test("Edit right-click prefers the persisted tool ref over the render id and cur
 	expect(legacyOpen).not.toHaveBeenCalled();
 });
 
+describe("VListRowInteraction — Bash detachment", () => {
+	test("offers detach and dispatches the Bash tool id, not the subagent handler", async () => {
+		const detach = mock((_id: string) => {});
+		const agent = mock((_id: string) => {});
+		await renderRow({
+			toolMeta: { toolName: "Bash", toolUseId: "bash-1", isRunningBash: true },
+			handlers: { onDetachBash: detach, onDetachSubagent: agent },
+		});
+		expect(menuLabels()).toContain("detachToBackground");
+		clickMenuItem("detachToBackground");
+		expect(detach).toHaveBeenCalledWith("bash-1");
+		expect(agent).not.toHaveBeenCalled();
+	});
+	test("hides detach when Bash is not running or the handler is absent", async () => {
+		await renderRow({
+			toolMeta: { toolName: "Bash", toolUseId: "bash-1" },
+			handlers: { onDetachBash: () => {} },
+		});
+		expect(menuLabels()).not.toContain("detachToBackground");
+		await renderRow({ toolMeta: { toolName: "Bash", toolUseId: "bash-1", isRunningBash: true } });
+		expect(menuLabels()).not.toContain("detachToBackground");
+	});
+});
+
 describe("VListRowInteraction — subagent card items", () => {
 	test("offers open-session and detach for a live foreground subagent", async () => {
 		await renderRow({

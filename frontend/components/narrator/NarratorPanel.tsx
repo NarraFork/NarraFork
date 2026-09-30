@@ -2038,6 +2038,22 @@ export function NarratorPanel({
 		}
 	}, []);
 
+	const handleDetachBash = useCallback(
+		async (toolUseId: string) => {
+			try {
+				await api.detachBash(narratorId, toolUseId);
+			} catch (error) {
+				// Completion can race the menu click; the server is authoritative.
+				if (error instanceof ApiError && error.status === 409) return;
+				notifications.show({
+					color: "red",
+					message: error instanceof Error ? error.message : String(error),
+				});
+			}
+		},
+		[narratorId],
+	);
+
 	const handleCancelSubagentBackground = useCallback(
 		async (subagentNarratorId: string) => {
 			try {
@@ -2091,6 +2107,7 @@ export function NarratorPanel({
 			// Gated on provider capability, mirroring SubagentCard: an unsupported
 			// backend hides the item rather than failing on click.
 			onDetachSubagent: canDetachSubagentToBackground ? handleDetachSubagent : undefined,
+			onDetachBash: handleDetachBash,
 			onCancelBackgroundTask: canCancelSubagentBackground
 				? handleCancelSubagentBackground
 				: undefined,
@@ -2118,6 +2135,7 @@ export function NarratorPanel({
 			handleVlistViewSubagentSession,
 			canDetachSubagentToBackground,
 			handleDetachSubagent,
+			handleDetachBash,
 			canCancelSubagentBackground,
 			handleCancelSubagentBackground,
 			handleOpenFilePanel,
