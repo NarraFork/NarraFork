@@ -17,6 +17,7 @@ const headerTitle = () => read("./header/NarratorPanelHeaderTitle.tsx");
 const overflowMenu = () => read("./header/NarratorToolbarOverflowMenu.tsx");
 const headerToolbar = () => read("./header/HeaderToolbar.tsx");
 const headerToolbarHook = () => read("./header/use-header-toolbar.tsx");
+const headerLayout = () => read("./header/NarratorHeaderLayout.tsx");
 const titleWidth = () => read("./header/header-title-width.ts");
 
 describe("header layout: pretext title width + right-hand tools", () => {
@@ -46,7 +47,12 @@ describe("header layout: pretext title width + right-hand tools", () => {
 		expect(toolbar).toContain("selectHeaderToolbarEntries");
 		expect(toolbar).toContain("unmeasured ? null");
 		const panel = await narratorPanel();
-		expect(panel).toContain("resolveHeaderLayoutAfterTitle");
+		const layout = await headerLayout();
+		expect(layout).toContain("resolveHeaderLayoutAfterTitle");
+		expect(layout).toContain("children(layout)");
+		expect(panel).toContain("<NarratorHeaderLayout");
+		expect(panel).toContain("titleFullWidth={headerTitleFullWidth}");
+		expect(panel).toContain("surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}");
 		expect(panel).toContain("visibleToolCount={headerLayout.visibleToolCount}");
 		expect(panel).toContain("titleFullWidth={headerLayout.titleWidth}");
 		expect(panel).toContain("unmeasured={headerLayout.unmeasured}");
@@ -60,7 +66,24 @@ describe("header layout: pretext title width + right-hand tools", () => {
 		expect(widthSrc).toContain("HEADER_TOOLBAR_GAP_PX = 10");
 		const panel = await narratorPanel();
 		expect(panel).toContain("gap: HEADER_LEADING_GAP_PX");
-		expect(panel).toContain("HEADER_ROW_PADDING_PX");
+		const layout = await headerLayout();
+		expect(layout).toContain("gap: HEADER_LEADING_GAP_PX");
+		expect(layout).toContain("HEADER_ROW_PADDING_PX / 2");
+	});
+
+	it("keeps raw header-width state and observation out of the full panel", async () => {
+		const panel = await narratorPanel();
+		for (const oldBinding of [
+			"headerRowWidth",
+			"setHeaderRowWidth",
+			"headerRowReady",
+			"headerRowRef",
+		]) {
+			expect(panel).not.toContain(oldBinding);
+		}
+		const layout = await headerLayout();
+		expect(layout).toContain("new ResizeObserver(read)");
+		expect(layout).toContain("sameLayout(published.current, next)");
 	});
 
 	it("toolbar slices by arithmetic visibleToolCount; overflow carries the rest", async () => {

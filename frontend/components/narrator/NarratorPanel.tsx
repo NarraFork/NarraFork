@@ -39,16 +39,7 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import {
-	lazy,
-	Suspense,
-	useCallback,
-	useEffect,
-	useLayoutEffect,
-	useMemo,
-	useRef,
-	useState,
-} from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
@@ -137,12 +128,8 @@ import {
 } from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import { HeaderToolbar } from "./header/HeaderToolbar";
-import {
-	HEADER_LEADING_GAP_PX,
-	HEADER_ROW_PADDING_PX,
-	headerTitleLayoutWidth,
-	resolveHeaderLayoutAfterTitle,
-} from "./header/header-title-width";
+import { HEADER_LEADING_GAP_PX, headerTitleLayoutWidth } from "./header/header-title-width";
+import { NarratorHeaderLayout } from "./header/NarratorHeaderLayout";
 import { NarratorPanelHeaderTitle } from "./header/NarratorPanelHeaderTitle";
 import { buildBottomToolbarActions } from "./header/NarratorToolbarItem";
 import {
@@ -646,47 +633,6 @@ export function NarratorPanel({
 	 * workspace, detached subagent panel) still renders this block.
 	 */
 	const hostOwnsTitle = dock?.hostOwnsTitle === true;
-
-	/*
-	 * Title-first header arithmetic (no flex fight):
-	 *   1. W = pretext measure of the COMPLETE title string
-	 *   2. Title box = W (fixed)
-	 *   3. Tools = resolveHeaderLayoutAfterTitle(rowWidth, W, …) → how many fit
-	 */
-	const headerRowRef = useRef<HTMLDivElement>(null);
-	const [headerRowWidth, setHeaderRowWidth] = useState(0);
-	/*
-	 * Skeleton early-return (`if (!narrator)` at the bottom) runs AFTER hooks: the
-	 * first layout pass sees `headerRowRef.current === null`. A dep array of only
-	 * `[headerRowReady]` would run once on mount, miss that null ref, and never
-	 * re-arm when the real header mounts — width would stay 0 and `unmeasured`
-	 * forever. Re-check every commit instead; setState to the same value bails out.
-	 */
-	const [headerRowReady, setHeaderRowReady] = useState(false);
-	useLayoutEffect(() => {
-		if (headerRowRef.current) {
-			setHeaderRowReady(true);
-			return;
-		}
-		setHeaderRowReady(false);
-	});
-	useLayoutEffect(() => {
-		if (!headerRowReady) return;
-		const el = headerRowRef.current;
-		if (!el) return;
-		const read = () => {
-			const w = el.getBoundingClientRect().width;
-			if (w > 0) setHeaderRowWidth(w);
-		};
-		read();
-		if (typeof ResizeObserver === "undefined") {
-			window.addEventListener("resize", read);
-			return () => window.removeEventListener("resize", read);
-		}
-		const ro = new ResizeObserver(read);
-		ro.observe(el);
-		return () => ro.disconnect();
-	}, [headerRowReady]);
 
 	const headerDisplayTitle = narrator?.title || t("untitled");
 	const headerTitleFullWidth = useMemo(() => {
@@ -2649,27 +2595,6 @@ export function NarratorPanel({
 		t,
 	});
 
-	/** Title-first: full pretext W fixed, then tools packed into the remainder. */
-	const headerLayout = useMemo(
-		() =>
-			resolveHeaderLayoutAfterTitle({
-				rowWidth: headerRowWidth,
-				titleFullWidth: headerTitleFullWidth,
-				showBack: !isWorkspacePreview,
-				showTitleActions: !hostOwnsTitle && !isWorkspacePreview,
-				surfacedToolCount: toolbarController.toolbarSurfacedDefs.length,
-				showClose: !!onClose,
-			}),
-		[
-			headerRowWidth,
-			headerTitleFullWidth,
-			isWorkspacePreview,
-			hostOwnsTitle,
-			toolbarController.toolbarSurfacedDefs.length,
-			onClose,
-		],
-	);
-
 	// Memoized so header capacity changes do not rebuild bottom actions on every
 	// incidental panel render; capacity itself lives inside HeaderToolbar.
 	const toolbarInlineControls = useMemo(
@@ -2938,143 +2863,129 @@ export function NarratorPanel({
 					<DropOverlay visible={isDragging} />
 					{/* Header — title-first arithmetic, single flex row, no flex fight:
 					    fixed title @ pretext W, then only tools that fit after it. */}
-					<div
-						ref={headerRowRef}
-						className={onHeaderPointerDown ? "nf-panel-header" : undefined}
-						style={{
-							display: "flex",
-							alignItems: "center",
-							flexWrap: "nowrap",
-							// Must match HEADER_ROW_GAP_PX / HEADER_LEADING_GAP_PX in header-title-width.
-							gap: HEADER_LEADING_GAP_PX,
-							padding: `8px ${HEADER_ROW_PADDING_PX / 2}px`,
-							borderBottom: "1px solid var(--mantine-color-default-border)",
-							flexShrink: 0,
-							overflow: "hidden",
-							cursor: onHeaderPointerDown ? "grab" : undefined,
-						}}
-						onPointerDown={
-							onHeaderPointerDown
-								? (e: React.PointerEvent) => {
-										// Skip drag initiation when clicking interactive elements
-										const el = e.target as HTMLElement;
-										if (el.closest("button, a, input, select, textarea, [role='button']")) return;
-										onHeaderPointerDown(e);
-									}
-								: undefined
-						}
+					<NarratorHeaderLayout
+						titleFullWidth={headerTitleFullWidth}
+						showBack={!isWorkspacePreview}
+						showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
+						surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
+						showClose={!!onClose}
+						onHeaderPointerDown={onHeaderPointerDown}
 					>
-						{/* Leading: fixed chrome + title; does not flex-shrink the title away. */}
-						<div
-							style={{
-								display: "flex",
-								alignItems: "center",
-								gap: HEADER_LEADING_GAP_PX,
-								flexWrap: "nowrap",
-								flex: "0 0 auto",
-								minWidth: 0,
-								maxWidth: "100%",
-								overflow: "hidden",
-							}}
-						>
-							{!isWorkspacePreview &&
-								(onMinimize ? (
-									<Tooltip label={t("backToGraph")} position="right">
-										<ActionIcon size="sm" variant="subtle" color="gray" onClick={onMinimize}>
-											<IconArrowsMinimize size={16} />
-										</ActionIcon>
-									</Tooltip>
-								) : onBack ? (
-									<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
-										<IconArrowLeft size={16} />
-									</ActionIcon>
-								) : onOpenStandalonePage ? (
-									<Tooltip label={t("openStandalonePage")} position="right">
-										<ActionIcon
-											size="sm"
-											variant="subtle"
-											color="gray"
-											onClick={onOpenStandalonePage}
-										>
-											<IconExternalLink size={16} />
-										</ActionIcon>
-									</Tooltip>
-								) : compact ? (
-									<ActionIcon
-										size="sm"
-										variant="subtle"
-										color="gray"
-										onClick={() =>
-											navigate({
-												to: "/narrators/$narratorId",
-												params: { narratorId },
-												search: { from: "graph" },
-											})
-										}
-									>
-										<IconExternalLink size={16} />
-									</ActionIcon>
-								) : (
-									<ActionIcon
-										size="sm"
-										variant="subtle"
-										color="gray"
-										onClick={() => navigate({ to: ".." })}
-									>
-										<IconArrowLeft size={16} />
-									</ActionIcon>
-								))}
-							{/*
-							 * `flex: 1` even when the title is suppressed: it is what pushes the
-							 * tool row to the right edge, and it hands the freed width to those
-							 * buttons instead of leaving a gap where the title used to be.
-							 *
-							 * The floor that keeps the title readable is the capacity BUDGET
-							 * (`headerTitleSlotMinWidth`), not a CSS `min-width`. A min-width here
-							 * would win against the tool row's `flex-shrink: 0` only by overflowing
-							 * or wrapping a nowrap row — both worse than the truncation it would
-							 * prevent. `HEADER_TITLE_SLOT_ATTR` marks the slot so the measurement
-							 * budgets it by policy instead of reading a width this element derives
-							 * from whatever the tool row left over.
-							 */}
-							<NarratorPanelHeaderTitle
-								narratorId={narratorId}
-								narrator={narrator}
-								hostOwnsTitle={hostOwnsTitle}
-								isWorkspacePreview={isWorkspacePreview}
-								titleFullWidth={headerLayout.titleWidth}
-							/>
-							{disconnected && !isWorkspacePreview && (
-								<Badge
-									size="xs"
-									variant="dot"
-									color="red"
-									style={{ cursor: "pointer", flex: "0 0 auto" }}
-									onClick={reconnect}
-									title={t("reconnect")}
+						{(headerLayout) => (
+							<>
+								{/* Leading: fixed chrome + title; does not flex-shrink the title away. */}
+								<div
+									style={{
+										display: "flex",
+										alignItems: "center",
+										gap: HEADER_LEADING_GAP_PX,
+										flexWrap: "nowrap",
+										flex: "0 0 auto",
+										minWidth: 0,
+										maxWidth: "100%",
+										overflow: "hidden",
+									}}
 								>
-									{t("disconnected")}
-								</Badge>
-							)}
-						</div>
-						{!isWorkspacePreview && (
-							<HeaderToolbar
-								narratorId={narratorId}
-								controller={toolbarController}
-								inlineControls={toolbarInlineControls}
-								toolbarBadgeCounts={toolbarBadgeCounts}
-								headerHostCapabilities={headerHostCapabilities}
-								openArchiveConfirm={openArchiveConfirm}
-								archiveMutation={archiveMutation}
-								dock={dock}
-								mockStreamEnabled={mockStreamEnabled}
-								onClose={onClose}
-								visibleToolCount={headerLayout.visibleToolCount}
-								unmeasured={headerLayout.unmeasured}
-								t={t}
-							/>
+									{!isWorkspacePreview &&
+										(onMinimize ? (
+											<Tooltip label={t("backToGraph")} position="right">
+												<ActionIcon size="sm" variant="subtle" color="gray" onClick={onMinimize}>
+													<IconArrowsMinimize size={16} />
+												</ActionIcon>
+											</Tooltip>
+										) : onBack ? (
+											<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
+												<IconArrowLeft size={16} />
+											</ActionIcon>
+										) : onOpenStandalonePage ? (
+											<Tooltip label={t("openStandalonePage")} position="right">
+												<ActionIcon
+													size="sm"
+													variant="subtle"
+													color="gray"
+													onClick={onOpenStandalonePage}
+												>
+													<IconExternalLink size={16} />
+												</ActionIcon>
+											</Tooltip>
+										) : compact ? (
+											<ActionIcon
+												size="sm"
+												variant="subtle"
+												color="gray"
+												onClick={() =>
+													navigate({
+														to: "/narrators/$narratorId",
+														params: { narratorId },
+														search: { from: "graph" },
+													})
+												}
+											>
+												<IconExternalLink size={16} />
+											</ActionIcon>
+										) : (
+											<ActionIcon
+												size="sm"
+												variant="subtle"
+												color="gray"
+												onClick={() => navigate({ to: ".." })}
+											>
+												<IconArrowLeft size={16} />
+											</ActionIcon>
+										))}
+									{/*
+									 * `flex: 1` even when the title is suppressed: it is what pushes the
+									 * tool row to the right edge, and it hands the freed width to those
+									 * buttons instead of leaving a gap where the title used to be.
+									 *
+									 * The floor that keeps the title readable is the capacity BUDGET
+									 * (`headerTitleSlotMinWidth`), not a CSS `min-width`. A min-width here
+									 * would win against the tool row's `flex-shrink: 0` only by overflowing
+									 * or wrapping a nowrap row — both worse than the truncation it would
+									 * prevent. `HEADER_TITLE_SLOT_ATTR` marks the slot so the measurement
+									 * budgets it by policy instead of reading a width this element derives
+									 * from whatever the tool row left over.
+									 */}
+									<NarratorPanelHeaderTitle
+										narratorId={narratorId}
+										narrator={narrator}
+										hostOwnsTitle={hostOwnsTitle}
+										isWorkspacePreview={isWorkspacePreview}
+										titleFullWidth={headerLayout.titleWidth}
+									/>
+									{disconnected && !isWorkspacePreview && (
+										<Badge
+											size="xs"
+											variant="dot"
+											color="red"
+											style={{ cursor: "pointer", flex: "0 0 auto" }}
+											onClick={reconnect}
+											title={t("reconnect")}
+										>
+											{t("disconnected")}
+										</Badge>
+									)}
+								</div>
+								{!isWorkspacePreview && (
+									<HeaderToolbar
+										narratorId={narratorId}
+										controller={toolbarController}
+										inlineControls={toolbarInlineControls}
+										toolbarBadgeCounts={toolbarBadgeCounts}
+										headerHostCapabilities={headerHostCapabilities}
+										openArchiveConfirm={openArchiveConfirm}
+										archiveMutation={archiveMutation}
+										dock={dock}
+										mockStreamEnabled={mockStreamEnabled}
+										onClose={onClose}
+										visibleToolCount={headerLayout.visibleToolCount}
+										unmeasured={headerLayout.unmeasured}
+										t={t}
+									/>
+								)}
+							</>
 						)}
-					</div>
+					</NarratorHeaderLayout>
 
 					<LeakedToolCallModal
 						narratorId={narratorId}
