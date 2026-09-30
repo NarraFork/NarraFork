@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
@@ -8,6 +8,13 @@ import { addToken, initConfig } from "../update-server/lib/config";
 import { createReleaseRoutes } from "../update-server/routes/releases";
 import type { StorageBackend } from "../update-server/storage/types";
 import type { ReleaseMeta, ZstdPatchMeta } from "../update-server/types";
+
+test("production HTTP entry allows bounded full release uploads above 128 MiB", () => {
+	// app.request bypasses Bun.serve admission, so route tests alone cannot catch
+	// an entry-point limit that rejects full binaries before authentication/routes.
+	const entry = readFileSync(new URL("../update-server/index.ts", import.meta.url), "utf8");
+	expect(entry).toMatch(/Bun\.serve\(\{[\s\S]*?maxRequestBodySize:\s*256\s*\*\s*1024\s*\*\s*1024/);
+});
 
 class MemoryStorage implements StorageBackend {
 	readonly files = new Map<string, Buffer>();

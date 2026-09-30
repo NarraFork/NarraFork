@@ -50,6 +50,9 @@ const app = createApp(storage);
 const server = Bun.serve({
 	port,
 	hostname: host,
+	// Full release binaries exceed Bun's 128 MiB default; match the production proxy's
+	// bounded 256 MiB upload budget, including multipart headers and release notes.
+	maxRequestBodySize: 256 * 1024 * 1024,
 	fetch: app.fetch,
 });
 
