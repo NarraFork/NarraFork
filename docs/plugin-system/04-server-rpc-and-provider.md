@@ -903,6 +903,13 @@ interface ProviderChatParams {
 		terminalReserveEvents: number;
 		terminalReserveBytes: number;
 	};
+	/**
+	 * 请求 dump 采集提示。存在 = 宿主支持 `dump.request`/`dump.response` 流事件且
+	 * 本次调用需要采集；`maxBytes` 是请求体+响应体合计的字节预算，插件超出时自行
+	 * 截断并标记 `truncated: true`。缺失 = 插件**禁止**发送 dump 事件——该字段的
+	 * 存在本身就是兼容性协商：不认识这些事件类型的旧宿主永远不会下发它。
+	 */
+	requestDump?: { maxBytes: number };
 }
 ```
 
@@ -1077,6 +1084,25 @@ type ProviderStreamEvent =
 			responseId?: string;
 			credentialId?: string;
 			usage?: ProviderUsage;
+	  }
+	| {
+			// 仅当 chat params 携带 `requestDump` 时才允许发送；见 §13.10
+			type: "dump.request";
+			transport?: string;
+			url?: string;
+			headers?: Record<string, string>;
+			bodyChunk?: string; // ≤64KiB
+			final?: boolean;
+			truncated?: boolean;
+	  }
+	| {
+			type: "dump.response";
+			status?: number;
+			headers?: Record<string, string>;
+			bodyChunk?: string; // ≤64KiB
+			final?: boolean;
+			truncated?: boolean;
+			error?: string;
 	  };
 
 interface ReasoningContinuation {
@@ -1251,6 +1277,32 @@ interface ProviderOperationError {
 - done 中的 message/conversation/response ID 映射到最后一个 `ParsedStreamEvent`；
 - done 只结束 provider 的 `AsyncGenerator`，不直接生成 Agent Loop 的 done。
 
+### 13.10 dump 事件（`dump.request` / `dump.response`）
+
+**设计建议**：
+
+- **按请求 opt-in**：只有当本次 `provider.chat` 的 params 携带 `requestDump: { maxBytes }`
+  时才允许发送这两个事件。缺失即禁止——宿主将未受邀的 dump 事件按协议违规处理
+  （kill transport），因为不认识这些事件类型的旧宿主同样会这么做；该规则使新增事件
+  无需 bump 协议版本即可软着陆。
+- **用途**：把插件进程内真实发出的上游 HTTP 请求/响应回报给宿主，使宿主的
+  request dump 开关（`agent.requestDumpEnabled`）对插件供应商产出的不再是没有
+  请求/响应内容的空壳。采集与否由宿主按设置逐请求决定；插件不自行决定是否采集。
+- **排序**：同一次上游尝试内 `dump.request`（元信息 + body chunks）先于
+  `dump.response`（status/headers + body chunks）；与 `request_started` 的先后不限。
+  携带 url/headers 的 `dump.request` 开启新一次尝试——插件内部重试就再发一组，
+  宿主适配器据此把上一次尝试归档进 dump 的 `attempts[]`。
+- **分块**：`bodyChunk` 单块 ≤64KiB（256KiB frame 上限内），`final: true` 关闭当前
+  body；超出 `maxBytes` 预算时插件自行截断并标记 `truncated: true`。
+- **语义隔离**：dump 事件是诊断旁路，不进入 `ParsedStreamEvent`，不置
+  `hasVisibleOutput`（不影响空响应判定），计入 normal credit 与单 operation 输出预算。
+  `provider.generate` 从不携带 `requestDump` 提示，在 generate 流中发送 dump 事件
+  按协议违规处理。
+- **脱敏责任在宿主**：插件进程持有凭据（宿主经 `config` 下发），因此宿主知道全部
+  秘密值并对 url/headers/body 做统一遮蔽（敏感头按名遮蔽 + 已知秘密值精确替换）。
+  插件可以自行遮蔽（例如不回显 Authorization 的值），但不得依赖插件侧遮蔽的正确性。
+- **终端事件之前**：`dump.response` 必须先于 `done`/`error` 发送，终端事件关闭流。
+
 ---
 
 ## 14. 取消：`provider.cancel` 与 `AbortSignal`
@@ -1414,6 +1466,8 @@ interface ProviderCancelResult {
 | 所有工具参数累计 | 8MiB | 终止该 operation |
 | 单推理 continuation metadata | 64KiB | 丢弃 metadata 并报协议错误 |
 | error response snippet | 16KiB | 截断并标记 truncated |
+| 单 dump bodyChunk | 64KiB | 要求插件拆分 |
+| 单 operation dump 累计 | chat params `requestDump.maxBytes`（宿主通告，≤4MiB） | cancel，报告 output limit |
 | stderr ring buffer | 1MiB/进程 | 丢弃最旧内容 |
 | stderr 单行 | 64KiB | 截断单行 |
 | operation 事件数 | 100,000 | cancel，防止无限细碎事件 |
@@ -1633,15 +1687,25 @@ source 是兼容性身份，不应包含 token、邮箱等敏感信息。
 
 ### 19.6 request dump
 
-**设计建议**：RemoteProviderAdapter 写入宿主 request dump 的只应是：
+**已实现**：dump 采集由宿主按请求 opt-in 触发——`provider.chat` params 携带
+`requestDump: { maxBytes }` 时，插件通过 `dump.request`/`dump.response` 流事件（§13.10）
+上报真实上游请求/响应，`RemoteProviderAdapter` 消费后写入 Agent Loop 下发的
+`ApiRequestDumpCollector`，与内置供应商走同一条 `api_requests` 持久化、溢写与下载路径。
 
-- provider RPC 请求的脱敏摘要；
-- event 类型、seq、大小和有界预览；
-- 插件错误 diagnostics；
-- stderr 的有界尾部。
+宿主侧职责：
 
-插件不应默认把供应商原始响应全量通过 RPC 发回。若未来需要下载原始 dump，应设计独立、受权限控制、
-有大小上限的诊断文件接口。
+- 是否采集由 `agent.requestDumpEnabled` / `requestDumpErrorsOnly` /
+  `mayLeakXmlToolCalls` 强制采集统一决定（Agent Loop 每次 `chat()` 调用前现读设置），
+  插件不感知这些设置，只响应逐请求的 `requestDump` 提示；
+- 对上报内容统一脱敏：敏感头按名遮蔽，且宿主从自己下发的 `config` 中收集秘密值
+  （key 匹配 `key|token|secret|pass|credential` 且长度 ≥8 的字符串），对 URL、
+  header 值、请求/响应体做精确替换遮蔽；
+- 通告的 `maxBytes` 取 `min(agent.requestDumpMaxSize, 4MiB)`，保证 dump 事件与正文
+  输出共享的 24MiB 单 operation 预算不被 dump 挤占。
+
+插件侧契约：仅在被邀请时发送 dump 事件、按 `maxBytes` 自行截断并标记
+`truncated`、dump 事件先于终端事件发送。不支持 dump 的旧插件忽略 `requestDump`
+字段即可，行为与不采集时完全一致。
 
 ---
 
@@ -1863,6 +1927,8 @@ handling 测试，确保加入 Registry 后：
 - 未声明 `maxConcurrent*` 时，插件侧 provider 并发默认 chat 1、generate 1；
 - stdout 只允许协议，日志只走 stderr；
 - `RemoteProviderAdapter` 在宿主侧构造 canonical history/tools；
+- 请求 dump 由宿主按请求 opt-in（chat params 的 `requestDump` 提示），插件仅在受邀时
+  上报 `dump.request`/`dump.response`，脱敏归宿主；
 - 工具执行、权限、重试和 Agent Loop done 判断始终归宿主；
 - 兼容 API 优先使用现有内置适配器，可执行插件只用于不能由兼容层表达的供应商。
 

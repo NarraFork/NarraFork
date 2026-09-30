@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { type ProviderStreamEvent, providerStreamEventSchema } from "@server/lib/plugins/protocol";
+import {
+	PLUGIN_REQUEST_DUMP_MAX_BYTES,
+	type ProviderStreamEvent,
+	providerStreamEventSchema,
+} from "@server/lib/plugins/protocol";
 import {
 	type ProviderOperation,
 	type ProviderOperationKind,
@@ -7,6 +11,7 @@ import {
 } from "@server/services/plugin-provider-rpc";
 import type { ChatParams, DbMessage } from "../provider";
 import { RemoteProviderAdapter, type RemoteProviderRpcClient } from "../remote-provider-adapter";
+import { ApiRequestDumpCollector } from "../request-dump";
 import type { ResolvedToolDefinition } from "../types";
 
 const MODEL = {
@@ -804,5 +809,195 @@ describe("RemoteProviderAdapter", () => {
 			retryable: true,
 		});
 		expect(calls).toBe(1);
+	});
+});
+
+describe("RemoteProviderAdapter request dump", () => {
+	const done = () => event("done", { status: "completed", stopReason: "end_turn" });
+
+	test("chat params carry the requestDump hint only when a collector is attached", async () => {
+		const withDump = makeRpc([done()]);
+		await collect(
+			makeAdapter(withDump).chat(chatParams({ requestDump: new ApiRequestDumpCollector() })),
+		);
+		const hinted = withDump.chatParams?.requestDump as { maxBytes?: number } | undefined;
+		expect(typeof hinted?.maxBytes).toBe("number");
+		expect(hinted?.maxBytes).toBeGreaterThan(0);
+		expect(hinted?.maxBytes).toBeLessThanOrEqual(PLUGIN_REQUEST_DUMP_MAX_BYTES);
+
+		const withoutDump = makeRpc([done()]);
+		await collect(makeAdapter(withoutDump).chat(chatParams()));
+		expect(withoutDump.chatParams?.requestDump).toBeUndefined();
+	});
+
+	test("dump events populate the collector and never reach the parsed stream", async () => {
+		const rpc = makeRpc([
+			event("dump.request", {
+				transport: "http-sse",
+				url: "https://upstream.invalid/v1/chat",
+				headers: { "content-type": "application/json" },
+			}),
+			event("dump.request", { bodyChunk: '{"model":"model-1",', final: false }),
+			event("dump.request", { bodyChunk: '"input":"hello"}', final: true }),
+			event("dump.response", { status: 200, headers: { "content-type": "text/event-stream" } }),
+			event("dump.response", { bodyChunk: "data: chunk-1\n", final: true }),
+			event("text.delta", { text: "answer" }),
+			done(),
+		]);
+		const collector = new ApiRequestDumpCollector();
+		const events = await collect(makeAdapter(rpc).chat(chatParams({ requestDump: collector })));
+
+		// Dump events are a diagnostic side channel: only the real model output remains.
+		expect(events).toEqual([
+			{ text: "answer", textOutputIndex: undefined },
+			{ stopReason: "end_turn" },
+		]);
+		const dump = collector.snapshot();
+		expect(dump.request).toMatchObject({
+			transport: "http-sse",
+			url: "https://upstream.invalid/v1/chat",
+			headers: { "content-type": "application/json" },
+			body: { model: "model-1", input: "hello" },
+		});
+		expect(dump.response).toMatchObject({
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+			bodyText: "data: chunk-1\n",
+			bodyIncomplete: false,
+		});
+	});
+
+	test("config secrets are masked in reported url, headers, and bodies", async () => {
+		// makeAdapter's config carries apiKey "secret-value": the host knows it, so the
+		// plugin can report verbatim and the host still masks every occurrence.
+		const rpc = makeRpc([
+			event("dump.request", {
+				url: "https://upstream.invalid/v1/chat?key=secret-value",
+				headers: { authorization: "Bearer secret-value", "x-other": "secret-value" },
+				bodyChunk: '{"auth":"secret-value"}',
+				final: true,
+			}),
+			event("dump.response", { status: 200, bodyChunk: "echo: secret-value", final: true }),
+			done(),
+		]);
+		const collector = new ApiRequestDumpCollector();
+		await collect(makeAdapter(rpc).chat(chatParams({ requestDump: collector })));
+
+		const serialized = JSON.stringify(collector.snapshot());
+		expect(serialized).not.toContain("secret-value");
+		const dump = collector.snapshot();
+		// authorization is masked by header name; x-other only by the known secret value.
+		expect(dump.request?.headers?.authorization).toBe("Bear********alue");
+		expect(dump.request?.headers?.["x-other"]).toBe("secr********alue");
+		expect(dump.request?.url).toBe("https://upstream.invalid/v1/chat?key=secr********alue");
+	});
+
+	test("masks secrets split across chunks in both requests and responses of every retry", async () => {
+		const events: ProviderStreamEvent[] = [];
+		for (let retry = 0; retry < 3; retry++) {
+			events.push(
+				event("dump.request", {
+					url: `https://upstream.invalid/${retry}`,
+					bodyChunk: '{"auth":"secret-',
+				}),
+			);
+			events.push(event("dump.request", { bodyChunk: 'value"}', final: true }));
+			events.push(
+				event("dump.response", { status: retry === 2 ? 200 : 429, bodyChunk: "secret-" }),
+			);
+			events.push(event("dump.response", { bodyChunk: "value", final: true }));
+		}
+		events.push(done());
+		const collector = new ApiRequestDumpCollector();
+		await collect(makeAdapter(makeRpc(events)).chat(chatParams({ requestDump: collector })));
+		const dump = collector.snapshot();
+		expect(dump.attempts).toHaveLength(2);
+		expect(JSON.stringify(dump)).not.toContain("secret-value");
+		expect(dump.request?.body).toEqual({ auth: "secr********alue" });
+		expect(dump.response?.bodyText).toBe("secr********alue");
+		for (const attempt of dump.attempts ?? [])
+			expect(attempt.response?.bodyText).toBe("secr********alue");
+	});
+
+	test("masks encoded secret forms even when chunks split inside escape sequences", async () => {
+		for (const encoded of [
+			"s\\u0065cret-value",
+			"secret%2Dvalue",
+			"%73%65cret-value",
+			Buffer.from("secret-value").toString("base64"),
+			"secret\\u002dvalue",
+		]) {
+			const collector = new ApiRequestDumpCollector();
+			const rpc = makeRpc([
+				event("dump.request", {
+					url: "https://upstream.invalid",
+					bodyChunk: `{"auth":"${encoded.slice(0, 4)}`,
+				}),
+				event("dump.request", { bodyChunk: `${encoded.slice(4)}"}`, final: true }),
+				event("dump.response", { bodyChunk: encoded.slice(0, 4) }),
+				event("dump.response", { bodyChunk: encoded.slice(4), final: true }),
+				done(),
+			]);
+			await collect(makeAdapter(rpc).chat(chatParams({ requestDump: collector })));
+			expect(collector.snapshot().request?.body).toEqual({ auth: "secr********alue" });
+			expect(collector.snapshot().response?.bodyText).toBe("secr********alue");
+		}
+	});
+
+	test("plugin-internal retries archive earlier attempts", async () => {
+		const rpc = makeRpc([
+			event("dump.request", { url: "https://upstream.invalid/attempt-1", final: true }),
+			event("dump.response", { status: 429, bodyChunk: "rate limited", final: true }),
+			event("dump.request", { url: "https://upstream.invalid/attempt-2", final: true }),
+			event("dump.response", { status: 200, bodyChunk: "ok", final: true }),
+			done(),
+		]);
+		const collector = new ApiRequestDumpCollector();
+		await collect(makeAdapter(rpc).chat(chatParams({ requestDump: collector })));
+
+		const dump = collector.snapshot();
+		expect(dump.attempts).toHaveLength(1);
+		expect(dump.attempts?.[0]?.requestText).toContain("attempt-1");
+		expect(dump.attempts?.[0]?.response).toMatchObject({ status: 429 });
+		expect(dump.request?.url).toBe("https://upstream.invalid/attempt-2");
+		expect(dump.response).toMatchObject({ status: 200, bodyText: "ok" });
+	});
+
+	test("a request without a response is preserved when the stream ends", async () => {
+		const rpc = makeRpc([
+			event("dump.request", {
+				url: "https://upstream.invalid/v1/chat",
+				bodyChunk: "{}",
+				final: true,
+			}),
+			event("error", {
+				error: {
+					classification: "transport",
+					code: "CONNECT_FAILED",
+					message: "connect failed",
+				},
+			}),
+			done(),
+		]);
+		const collector = new ApiRequestDumpCollector();
+		await collect(makeAdapter(rpc).chat(chatParams({ requestDump: collector })));
+
+		const dump = collector.snapshot();
+		expect(dump.request?.url).toBe("https://upstream.invalid/v1/chat");
+	});
+
+	test("dump events are dropped silently when no collector is attached", async () => {
+		const rpc = makeRpc([
+			event("dump.request", { url: "https://upstream.invalid/v1/chat", final: true }),
+			event("dump.response", { status: 200, bodyChunk: "ok", final: true }),
+			event("text.delta", { text: "answer" }),
+			done(),
+		]);
+		const events = await collect(makeAdapter(rpc).chat(chatParams()));
+
+		expect(events).toEqual([
+			{ text: "answer", textOutputIndex: undefined },
+			{ stopReason: "end_turn" },
+		]);
 	});
 });
