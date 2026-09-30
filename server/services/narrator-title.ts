@@ -107,6 +107,61 @@ export async function syncTitleToNarrator(chapterId: string, title: string): Pro
 }
 
 /**
+ * Reduce a user message to the text that should drive title generation.
+ *
+ * `/skill` (and similar slash-command skill loads) expand into
+ * `<command-name>…</command-name>` + a whole `<skill_content>` body before the
+ * user's actual request. That body is required for the model but is skill
+ * documentation — using it as a title source produces titles that describe the
+ * skill instead of what the user asked for.
+ *
+ * Returns the trailing user request when present; otherwise the invoked skill
+ * name (so a bare `/skill foo` still titles as "foo", not the skill manual).
+ */
+export function extractUserRequestForTitle(messageText: string): string {
+	if (!messageText) return "";
+
+	const normalize = (text: string) => text.replace(/\s+/g, " ").trim();
+	// Only the generated leading command envelope is scaffolding. XML examples in
+	// ordinary prose/code (especially a literal close tag) are the user's request.
+	const command = messageText.match(/^\s*<command-name>\s*([^<]+?)\s*<\/command-name>\s*/);
+	if (!command) return normalize(messageText);
+	const remainder = messageText.slice(command[0].length);
+	const opening = remainder.match(/^<skill_content\s+name="([^"]+)"\s*>\s*/);
+	if (!opening) return normalize(remainder) || command[1].trim();
+	if (opening[1] !== command[1].trim()) return normalize(messageText);
+	// Closing scaffolding occupies its own line. Do not treat inline examples or
+	// later close tags in the trailing user's code sample as the body boundary.
+	const closing = /^<\/skill_content>[ \t]*(?:\r?\n|$)/m.exec(remainder.slice(opening[0].length));
+	if (!closing) return normalize(messageText);
+	const bodyEnd = opening[0].length + closing.index + closing[0].length;
+	return normalize(remainder.slice(bodyEnd)) || command[1].trim();
+}
+
+/**
+ * Build the `<conversation>` excerpt sent to the full-title model.
+ * User turns are reduced via {@link extractUserRequestForTitle} so skill
+ * expansion never dominates the title prompt.
+ */
+export function buildTitleConversationText(
+	selected: Array<{ role: string; contentText?: string | null }>,
+	headCount: number,
+): string {
+	return selected
+		.map((m, i) => {
+			const role = m.role === "assistant" ? "Assistant" : "User";
+			const text =
+				m.role === "user" ? extractUserRequestForTitle(m.contentText ?? "") : (m.contentText ?? "");
+			const isRecent = i >= headCount;
+			const maxLen = isRecent ? 800 : 200;
+			const truncated = text.length > maxLen ? `${text.slice(0, maxLen)}...` : text;
+			const section = isRecent ? "(recent) " : "(early) ";
+			return `${section}[${role}]: ${truncated}`;
+		})
+		.join("\n\n");
+}
+
+/**
  * Generate a title for a narrator session using the summary model.
  */
 export async function generateTitle(
@@ -130,17 +185,7 @@ export async function generateTitle(
 
 	if (selected.length === 0) return "New conversation";
 
-	const conversationText = selected
-		.map((m, i) => {
-			const role = m.role === "assistant" ? "Assistant" : "User";
-			const text = m.contentText ?? "";
-			const isRecent = i >= head.length;
-			const maxLen = isRecent ? 800 : 200;
-			const truncated = text.length > maxLen ? `${text.slice(0, maxLen)}...` : text;
-			const section = isRecent ? "(recent) " : "(early) ";
-			return `${section}[${role}]: ${truncated}`;
-		})
-		.join("\n\n");
+	const conversationText = buildTitleConversationText(selected, head.length);
 
 	const titlePrompt = getPrompt("title", locale);
 
@@ -183,8 +228,13 @@ export async function generateTitle(
 	return title || "New conversation";
 }
 
-function buildProvisionalTitle(userMessage: string): string | null {
-	const normalized = userMessage.replace(/\s+/g, " ").trim();
+/**
+ * Derive a short placeholder title from the user's request (skill expansion
+ * already stripped). Exported for tests that pin the title-input selection.
+ */
+export function buildProvisionalTitle(userMessage: string): string | null {
+	// Skill expansion must not become the placeholder title — use the user's request.
+	const normalized = extractUserRequestForTitle(userMessage).replace(/\s+/g, " ").trim();
 	if (!normalized) return null;
 
 	const firstSentence = normalized.match(/^.+?[。！？.!?](?:\s|$)/u)?.[0].trim() ?? normalized;
@@ -211,6 +261,15 @@ export async function setProvisionalTitleFromUserMessage(
 }
 
 /**
+ * Title-model input for the quick path: the user's request, skill expansion
+ * removed, truncated to a bounded prompt size.
+ */
+export function buildQuickTitleSource(userMessage: string): string {
+	const requestText = extractUserRequestForTitle(userMessage) || userMessage.trim();
+	return requestText.length > 500 ? `${requestText.slice(0, 500)}...` : requestText;
+}
+
+/**
  * Generate a quick title from just the user message (before AI replies).
  * Fire-and-forget — errors are logged, not thrown.
  */
@@ -221,7 +280,7 @@ export async function generateQuickTitle(
 	userId?: string | null,
 ): Promise<void> {
 	try {
-		const truncated = userMessage.length > 500 ? `${userMessage.slice(0, 500)}...` : userMessage;
+		const truncated = buildQuickTitleSource(userMessage);
 		const titlePrompt = getPrompt("quickTitle", locale);
 
 		logger.info("Quick title generation starting", {
