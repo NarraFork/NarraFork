@@ -1,8 +1,8 @@
 /**
  * Built-in routines registry.
  *
- * Currently only houses optional agent tools. Command and skill routines
- * may be added in the future.
+ * Houses optional agent tools plus command and skill routines. Skill routines
+ * materialize a `SKILL.md` when enabled (see `routine-service`).
  */
 
 export interface BuiltinCommandDef {
@@ -171,9 +171,9 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 		tool: {
 			toolName: "McpAdmin",
 			descriptionEn:
-				"MCP server management (admin only) — list, add, remove, connect, disconnect, and test external MCP servers",
+				"MCP server management (admin only) — list, add, remove, connect, disconnect, refresh tools, and test external MCP servers",
 			descriptionZh:
-				"MCP 服务器管理（仅管理员）— 列出、添加、移除、连接、断开和测试外部 MCP 服务器",
+				"MCP 服务器管理（仅管理员）— 列出、添加、移除、连接、断开、刷新工具和测试外部 MCP 服务器",
 		},
 	},
 	{
@@ -230,6 +230,152 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 			descriptionEn:
 				"Knowledge review — review and approve/reject publish requests into the global base, resolve conflicts",
 			descriptionZh: "知识库审阅 — 审阅并批准/驳回发布到全局库的请求，解决冲突",
+		},
+	},
+
+	// ── Skills (materialized as SKILL.md when enabled) ──────────────────
+	{
+		id: "skill-creator",
+		type: "skill",
+		category: "workflow",
+		/**
+		 * Opt-in methodology guide: useful when the user asks to create/update a
+		 * skill, but would pollute every session if preloaded by default.
+		 */
+		defaultEnabled: false,
+		skill: {
+			name: "skill-creator",
+			descriptionEn:
+				"Create or update NarraFork skills — scoped instructions, companion files, and validation",
+			descriptionZh: "创建或更新 NarraFork 技能 — 有边界的指令、附属文件与校验",
+			content: `# Skill Creator
+
+Create or update NarraFork skills that give narrators useful, non-obvious guidance without constraining unrelated work.
+
+## Core Principles
+
+**Assume the narrator is already capable.** Include only information that changes decisions or improves work. Remove generic advice, repeated instructions, speculative edge cases, and examples that do not clarify the task.
+
+**Preserve user intent and scope.** A skill should support the requested task, not replace the user's product choices, expand the assignment, or modify unrelated configuration. Do not turn one example, past failure, or personal preference into a universal rule.
+
+**Match specificity to the risk.** Leave room for reasonable approaches when several are fine. Use fixed steps only when correctness, safety, or a genuinely fragile workflow requires them.
+
+**Keep discovery cheap and precise.** \`name\` and \`description\` are visible before the skill body loads. Describe the capability and when it applies; avoid catchalls that attract unrelated work.
+
+**Disclose detail progressively.** Keep purpose, essential constraints, and routing in \`SKILL.md\`. Put large schemas, examples, or mode-specific procedures in companion reference files and read only what the current task needs.
+
+## Anatomy of a Skill
+
+A skill is a directory containing a required \`SKILL.md\` and optional companion files:
+
+\`\`\`text
+skill-name/
+|-- SKILL.md                 Required: YAML frontmatter + markdown body
+|-- scripts/                 Optional executable helpers
+|-- references/              Optional docs loaded as needed
+\`-- assets/                  Optional templates / files used in output
+\`\`\`
+
+NarraFork discovers any directory under a skills root that contains \`SKILL.md\`. Nested directories under a skill directory are companion files, not nested skills. When a skill loads, companion files are listed as paths under the skill base directory (keep the tree small and purposeful).
+
+### SKILL.md
+
+YAML frontmatter must include:
+
+- \`name\` — skill identifier used for Skill tool / \`/load\` invocation
+- \`description\` — what it does and when it applies (keep it discriminating)
+
+The markdown body is loaded only when the skill is used. Put purpose, workflow, real constraints, and links to companion files there.
+
+### Companion Files
+
+Add subdirectories only when the concrete task needs them:
+
+- \`scripts/\` — deterministic helpers the skill runs via Bash (run them once before finishing)
+- \`references/\` — schemas, API notes, mode-specific guides; link from \`SKILL.md\` and say when to read them
+- \`assets/\` — templates or binaries copied into generated output, not loaded as instructions
+
+Write companion files with Write into the skill directory. Avoid empty placeholder trees.
+
+Do not add README, changelog, installation guides, or duplicated quick references unless a specific packaging requirement needs them.
+
+## Skill Locations
+
+| Scope | Path |
+|-------|------|
+| Global (all projects) | \`$NARRAFORK_HOME/skills/<skill-dir>/SKILL.md\` (usually \`~/.narrafork/skills/\`) |
+| Project (one repo) | \`<project gitPath>/.narrafork/skills/<skill-dir>/SKILL.md\` |
+
+Discovery also scans \`.narrafork/skill\`, \`.claude/skills\`, \`.agents/skills\`, and \`.codex/skills\` under the project or home root — prefer the NarraFork paths above for new skills.
+
+Prefer project skills for repo-specific workflows and global skills for cross-project methodology. Honor a user-specified location.
+
+## Naming
+
+- Lowercase letters, digits, and hyphens; folder name should match the skill name
+- Short and action-oriented (e.g. \`release-changelog\`, \`db-migration-check\`)
+- Under 64 characters; namespace by domain when it aids discovery (\`review-…\`, \`deploy-…\`)
+
+## Description
+
+Frontmatter \`description\` is the primary discovery surface. State the capability and when it applies. Add a boundary only when a similar request should *not* activate the skill.
+
+\`\`\`yaml
+description: Create or update NarraFork skills with scoped instructions and optional companion resources.
+\`\`\`
+
+Do not dump the full workflow into the description.
+
+## Create or Update a Skill
+
+Adapt the work to the request: a narrow edit is a focused change; a new skill may need structure, instructions, and validation.
+
+### Write path (preferred in a live session)
+
+1. Choose scope (global vs project) and directory name.
+2. Write \`SKILL.md\` with complete frontmatter and body via Write.
+3. Write any companion files under the same skill directory.
+4. Validate with the checklist below.
+5. Make it available in the session (below).
+
+### API path
+
+- Global: \`POST /api/skills/global\` with \`{ name, description, content }\`
+- Project: \`POST /api/skills?projectId=<id>\` with the same fields
+
+\`content\` is the markdown body; frontmatter is generated. These endpoints write only \`SKILL.md\`. Companion files must still be written into the skill directory with Write.
+
+### Make the skill available in the current session
+
+- The Skill tool reloads skill summaries on use; a newly written skill is usually visible immediately.
+- If it is missing from the available list (summary cache is short-lived), invoke it by exact name — lookup force-refreshes when the name is not in the fresh cache.
+- New narrator sessions pick up skills at creation time.
+- Renaming \`SKILL.md\` to \`SKILL.md.disabled\` hides a skill from automatic discovery (the UI toggle does this).
+
+There is no \`create_skill\` / \`get_skills\` agent tool — use Write and the existing skill APIs.
+
+## Validate
+
+Before finishing, check:
+
+1. \`SKILL.md\` exists at the intended path
+2. Frontmatter has non-empty \`name\` and \`description\`
+3. \`name\` matches how users will invoke it; directory name matches
+4. Description is specific enough to avoid wrong-task activation
+5. Body states outcome, constraints, and when to read companion files
+6. Companion file paths referenced in the body actually exist
+7. No leftover scaffold placeholders (TODO, "example only")
+8. For scripts: run them once and confirm behavior
+
+When testing is warranted, verify observable behavior rather than wording. Prefer a narrow fix over accumulating universal rules from every incident.
+
+## What Not To Include
+
+- Generic advice the narrator already knows
+- Copied manuals already available from authoritative sources
+- Unrelated permissions, product decisions, or scope expansions
+- Empty directories, placeholder examples, or docs nobody will read
+`,
 		},
 	},
 ];
