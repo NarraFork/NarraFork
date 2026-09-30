@@ -15,6 +15,7 @@ import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { resolveProvider } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { resolveRuntimeQueueBackend } from "./agent-runtime/runtime-queue-port";
 import { classifyRuntimeWriteError, runAtomicWrite } from "./agent-runtime/runtime-write";
 import { narratorService } from "./narrator-service";
 import {
@@ -329,10 +330,15 @@ async function deliverCompletedResume(
 					) {
 						throw new ValidationError("Standalone worker creation binding has changed");
 					}
-					if (announcement)
-						runAtomicWrite(db, "subagent-resume.commitStandaloneAnnouncement", (tx) =>
-							commitResumedBackgroundTaskAnnouncement(announcement, completionOutput, tx),
-						);
+					if (announcement) {
+						if (resolveRuntimeQueueBackend() === "postgres") {
+							await commitResumedBackgroundTaskAnnouncement(announcement, completionOutput);
+						} else {
+							runAtomicWrite(db, "subagent-resume.commitStandaloneAnnouncement", (tx) =>
+								commitResumedBackgroundTaskAnnouncement(announcement, completionOutput, tx),
+							);
+						}
+					}
 					active.delivered = true;
 					activeResumeRuns.delete(subagentId);
 					return;
@@ -362,6 +368,7 @@ async function deliverCompletedResume(
 						originToolUseId,
 					);
 				}
+				const pgAnnouncement = announcement && resolveRuntimeQueueBackend() === "postgres";
 				await updateToolCallConclusion({
 					subagentId,
 					parentNarratorId: narrator.parentNarratorId as string,
@@ -371,10 +378,13 @@ async function deliverCompletedResume(
 					messageId: reference.messageId,
 					toolCallId: reference.toolCallId,
 					resultMessageId,
-					onPersist: announcement
-						? (tx) => commitResumedBackgroundTaskAnnouncement(announcement, finalText, tx)
-						: undefined,
+					onPersist:
+						announcement && !pgAnnouncement
+							? (tx) => commitResumedBackgroundTaskAnnouncement(announcement, finalText, tx)
+							: undefined,
 				});
+				// The conclusion hook is SQLite-only; PG owns its async publication transaction.
+				if (pgAnnouncement) await commitResumedBackgroundTaskAnnouncement(announcement, finalText);
 				active.delivered = true;
 				activeResumeRuns.delete(subagentId);
 			});
@@ -783,10 +793,15 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 						await withSubagentResumeLock(input.subagentId, async () => {
 							const active = activeResumeRuns.get(input.subagentId);
 							if (active?.token === token && active.runId === started.runId) {
-								if (announcement)
-									runAtomicWrite(db, "subagent-resume.commitSkippedAnnouncement", (tx) =>
-										commitResumedBackgroundTaskAnnouncement(announcement, output, tx),
-									);
+								if (announcement) {
+									if (resolveRuntimeQueueBackend() === "postgres") {
+										await commitResumedBackgroundTaskAnnouncement(announcement, output);
+									} else {
+										runAtomicWrite(db, "subagent-resume.commitSkippedAnnouncement", (tx) =>
+											commitResumedBackgroundTaskAnnouncement(announcement, output, tx),
+										);
+									}
+								}
 								activeResumeRuns.delete(input.subagentId);
 							}
 						});

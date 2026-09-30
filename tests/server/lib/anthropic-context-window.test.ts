@@ -103,6 +103,9 @@ describe("Anthropic effective context window respects explicit configuration", (
 	test("local model and saved binding windows outrank provider defaults; reset never re-pins archived values", () => {
 		const config = anthropicConfig({ defaultContextWindow: 400_000 });
 		settings.anthropicProviders = [config];
+		// Refresh the canonical provider projection before catalog mutations save it.
+		delete settings.customApiProviders;
+		saveSettings(settings);
 		const patch = (target: "model" | "binding", targetId: string, value?: number) =>
 			mutateModelCatalog({
 				action: "patch",

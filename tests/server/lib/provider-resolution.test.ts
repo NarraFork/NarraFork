@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { getProvider, resolveProviderAndModel } from "../../../server/lib/agent/provider";
 import { __setCodexManagerForTests, CodexManager } from "../../../server/lib/codex-manager";
 import { AppError } from "../../../server/lib/errors";
+import { bindModelCatalogSettings } from "../../../server/lib/model-catalog";
 import { deleteNugCachedModels, setNugCachedModels } from "../../../server/lib/nug-model-cache";
 import { isProviderUnavailableError } from "../../../server/lib/provider-availability-error";
 import {
@@ -15,6 +16,7 @@ import {
 	resolveAllowedModelCandidate,
 	resolveEffectiveModel,
 	resolveProvider,
+	saveSettings,
 	settings,
 } from "../../../server/lib/settings";
 
@@ -453,10 +455,41 @@ describe("getModelContextWindow / getContextThresholds 解析元模型引用", (
 		settings.agent.modelAggregations = [];
 		settings.agent.modelContextWindows = {};
 		settings.agent.contextThresholds = undefined;
+		// The unified catalog recognizes custom prefixes through configured providers.
+		// Keep channel identity in the NUG cache, but omit its window to test builtin fallback.
+		addOpenaiProvider("deepseek");
+		settings.nugProviders = [
+			{
+				id: "nug-id",
+				name: "NUG",
+				prefix: "nug",
+				apiKey: "test-key",
+				baseUrl: "https://nug.example.test",
+				defaultModel: "antigravity:claude-opus-4-6-thinking",
+			},
+		];
+		setNugCachedModels("nug-id", [
+			{
+				id: "antigravity:claude-opus-4-6-thinking",
+				model: "claude-opus-4-6-thinking",
+				channel: "antigravity",
+				channelType: "anthropic",
+			},
+		]);
+		delete settings.customApiProviders;
+		settings.agent.modelCatalog = {
+			schemaVersion: 1,
+			migrationVersion: 1,
+			local: { revision: 0 },
+			autoApply: false,
+			pinnedVersion: null,
+		};
+		bindModelCatalogSettings(settings, () => saveSettings(settings));
 		__setCodexManagerForTests(undefined);
 	});
 	afterEach(() => {
 		restoreFromSnapshot(snapshot);
+		bindModelCatalogSettings(settings, () => saveSettings(settings));
 		__setCodexManagerForTests(undefined);
 		deleteNugCachedModels("nug-id");
 		for (const dir of tempDirs.splice(0)) {
@@ -620,7 +653,8 @@ describe("getModelContextWindow / getContextThresholds 解析元模型引用", (
 
 	test("per-model 覆盖优先于内置 1M", () => {
 		settings.agent.modelContextWindows = { "anthropic:claude-opus-4-8": 300_000 };
+		// The legacy editor becomes a catalog binding only through the save adapter.
+		saveSettings(settings);
 		expect(getModelContextWindow("claude-opus-4-8", "anthropic")).toBe(300_000);
-		settings.agent.modelContextWindows = {};
 	});
 });

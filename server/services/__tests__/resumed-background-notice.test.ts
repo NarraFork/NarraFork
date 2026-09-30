@@ -18,12 +18,15 @@
  *   - waking after a stop   → a turn is spent on work the user just interrupted
  */
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
-import { narratorBufferedMessages, narrators } from "../../db/schema";
+import { narratorBufferedMessages, narrators, runtimePublicationOutbox } from "../../db/schema";
+import * as publicationModule from "../agent-runtime/publication";
 import { runtimePublication } from "../agent-runtime/publication";
+import * as runtimeQueueModule from "../agent-runtime/runtime-queue-port";
+import { runAtomicWrite } from "../agent-runtime/runtime-write";
 import { projectPendingInjection } from "../parent-injection-queue";
 import {
 	announceResumedBackgroundTask,
@@ -109,6 +112,81 @@ describe("planResumedBackgroundTaskNotice", () => {
 	});
 });
 
+describe("resumed announcement backend transaction contracts", () => {
+	for (const fails of [false, true]) {
+		it(`awaits the PostgreSQL terminal commit${fails ? " and propagates rejection" : ""} without SQLite`, async () => {
+			const facade = publicationModule.getRuntimePublicationService();
+			const run = {
+				producerKind: "agent" as const,
+				taskId: "pg-resumed-child",
+				logicalRunId: "pg-resumed-run",
+				recipientId: "pg-resumed-parent",
+			};
+			let release!: () => void;
+			const barrier = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			let entered!: () => void;
+			const committing = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			const backend = spyOn(runtimeQueueModule, "resolveRuntimeQueueBackend").mockReturnValue(
+				"postgres",
+			);
+			const publication = spyOn(publicationModule, "getRuntimePublicationService").mockReturnValue({
+				...facade,
+				backend: "postgres",
+				getAgentRun: async () => run,
+				commitAgentTerminal: async (input) => {
+					expect(input).toMatchObject({ run, text: "PG result", eventKind: "completed" });
+					entered();
+					await barrier;
+					if (fails) throw new Error("PG commit failed");
+					return { status: "committed", deliveryId: null, arrivalSeq: null };
+				},
+			});
+			const sqliteRead = spyOn(db, "select").mockImplementation(() => {
+				throw new Error("PostgreSQL announcement must not read SQLite");
+			});
+			const sqliteTransaction = spyOn(db, "transaction").mockImplementation(() => {
+				throw new Error("PostgreSQL announcement must not open a SQLite transaction");
+			});
+			try {
+				const completion = commitResumedBackgroundTaskAnnouncement(
+					{
+						subagentId: run.taskId,
+						parentNarratorId: run.recipientId,
+						logicalRunId: run.logicalRunId,
+						status: "completed",
+						wakeParent: true,
+						locale: "en",
+					},
+					"PG result",
+				);
+				expect(completion).toBeInstanceOf(Promise);
+				let settled = false;
+				const observed = Promise.resolve(completion).finally(() => {
+					settled = true;
+				});
+				await committing;
+				expect(settled).toBe(false);
+				release();
+				if (fails) await expect(observed).rejects.toThrow("PG commit failed");
+				else await observed;
+				expect(settled).toBe(true);
+				expect(sqliteRead).not.toHaveBeenCalled();
+				expect(sqliteTransaction).not.toHaveBeenCalled();
+			} finally {
+				release();
+				sqliteTransaction.mockRestore();
+				sqliteRead.mockRestore();
+				publication.mockRestore();
+				backend.mockRestore();
+			}
+		});
+	}
+});
+
 describe("the announcement is handed to the caller, not fired by the runner", () => {
 	/**
 	 * ⚠️ ORDER, and it is invisible when wrong.
@@ -179,7 +257,19 @@ describe("the announcement is handed to the caller, not fired by the runner", ()
 			};
 			const result = "PRIVATE FINAL RESULT MUST NOT BE INJECTED AGAIN";
 			try {
-				db.transaction((tx) => commitResumedBackgroundTaskAnnouncement(notice, result, tx));
+				const before = db.select().from(runtimePublicationOutbox).all();
+				expect(() =>
+					runAtomicWrite(db, "test.rollbackResumedAnnouncement", (tx) => {
+						expect(commitResumedBackgroundTaskAnnouncement(notice, result, tx)).toBeUndefined();
+						throw new Error("rollback resumed announcement");
+					}),
+				).toThrow("rollback resumed announcement");
+				expect(db.select().from(runtimePublicationOutbox).all()).toEqual(before);
+				expect(
+					runAtomicWrite(db, "test.commitResumedAnnouncement", (tx) =>
+						commitResumedBackgroundTaskAnnouncement(notice, result, tx),
+					),
+				).toBeUndefined();
 				await announceResumedBackgroundTask(notice);
 				runtimePublication.flushRecipient("notice-parent");
 				await announceResumedBackgroundTask(notice);
