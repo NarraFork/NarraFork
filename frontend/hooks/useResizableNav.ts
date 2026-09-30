@@ -1,67 +1,22 @@
 /**
- * useResizableNav — the sidebar's width, driven by CSS VARIABLES during a drag.
+ * Sidebar width store: React owns settled widths; DOM layout properties own drags.
  *
- * Why an external store rather than `useState`
- * -------------------------------------------
- * The width used to be `useState` inside `AuthenticatedLayout` (1031 lines, ~86
- * hooks), and the drag writes it on every `mousemove`. That re-rendered the whole
- * AppShell each frame — navbar NavLinks, both `RecentTabList`s, every Tooltip. The
- * same component already documents what that costs: an unrelated per-second tick
- * that re-rendered "the whole AppShell (navbar NavLinks, tab strip, tooltips)" was
- * measured at ~140ms of main-thread work per second, and the fix there was to move
- * the subscription into a leaf component (see OutputStatsBadge). The width was the
- * same bug, unfixed.
+ * `useNavCollapsed` isolates the rare boolean flips from the pixel stream, and
+ * `useNavWidth` belongs only in the thin AppShell wrapper. Ordinary drag frames
+ * never notify React: Mantine otherwise rewrites its AppShell <style> element.
  *
- * Splitting width from collapsed is the point of the store. They change at wildly
- * different rates:
- *   - `width` moves every frame of a drag, and is needed by exactly one consumer:
- *     the `navbar.width` prop on `<AppShell>`.
- *   - `collapsed` is a boolean derived from it, needed all over the navbar content
- *     (labels, tooltips, padding), and flips at most once per drag.
+ * Updating inherited CSS variables on `html` was still expensive: a dashboard
+ * trace showed ~643 elements restyled per frame (~1.22s across 180 frames). Writing
+ * width/padding/margin on the three layout consumers reduced that to ~3 elements
+ * (~66ms). Cache those nodes at pointerdown; do no DOM queries or geometry reads
+ * on pointermove. Content still reflows normally alongside the sidebar.
  *
- * With `useSyncExternalStore` a consumer only re-renders when ITS OWN snapshot
- * changes by `Object.is`. So `useNavCollapsed()` re-renders on the boolean flip and
- * ignores the pixel stream, while `useNavWidth()` — deliberately called only by the
- * thin AppShell wrapper — absorbs it. The layout that hosts the navbar content never
- * subscribes to width at all.
+ * Suppress transitions on the actual consumers, not a variable on `html`:
+ * AppShell declares its own transition duration, shadowing an ancestor override.
+ * Restore the original inline properties after React has committed the final width.
  *
- * WHY REACT IS BYPASSED ENTIRELY MID-DRAG
- * --------------------------------------
- * Isolating the re-render was necessary but NOT sufficient. Mantine's AppShell does
- * not put the navbar width in an inline style: `AppShellMediaStyles` renders an
- * `InlineStyles` element, which is a `<style>` tag written through
- * `dangerouslySetInnerHTML`. So every distinct `navbar.width` REWRITES A STYLE SHEET,
- * which invalidates document-wide CSS and forces a full style recalculation — cost
- * proportional to the whole DOM, not to the navbar. Re-rendering only a thin wrapper
- * does nothing about that; the wrapper is exactly what renders the style tag.
- *
- * So during a drag the width never reaches React at all. `writeWidth` sets the two
- * variables AppShell reads (`--app-shell-navbar-width` for the navbar's own width,
- * `--app-shell-navbar-offset` for Main's padding and the alt-layout Header's margin)
- * directly on the element carrying them, and React is told once on release.
- *
- * Two details make the override hold:
- *   - The variables are set on `document.documentElement`, because Mantine's
- *     `cssVariablesSelector` defaults to `:root` and AppShell runs in `fixed` mode
- *     (its media styles therefore land in the `:root` block rather than on `#id`).
- *     Setting them inline on the same element wins on specificity.
- *   - `--app-shell-transition-duration: 0ms` is forced for the duration of the drag.
- *     Main transitions `padding` and Header transitions `margin-inline-start`, so
- *     without this every frame starts a fresh 200ms animation toward a target that
- *     has already moved, which both smears visually and multiplies the work.
- *
- * The drag listeners are attached on pointerdown and removed on pointerup, rather
- * than living for the component's whole lifetime as they did before.
- *
- * POINTER EVENTS, NOT MOUSE EVENTS
- * --------------------------------
- * The drag used to run on `mousedown`/`mousemove`/`mouseup`. On a touchscreen that
- * is dead: a touch press fires a synthetic `mousedown`, but as soon as the finger
- * moves the browser hands the gesture to scrolling and stops producing mouse
- * events (plus the handle's own `preventDefault` on mousedown cannot stop that —
- * scrolling is cancelled by `touch-action`, not by preventDefault). The pointer
- * family covers mouse, touch, and pen with one API, and `touch-action: none` on
- * the handle keeps the browser from interpreting the gesture as a scroll.
+ * Pointer events cover mouse, touch and pen. The handle's `touch-action: none`
+ * prevents touch drags being claimed by scrolling; listeners live only for a drag.
  */
 
 import { useSyncExternalStore } from "react";
@@ -146,70 +101,99 @@ function subscribe(listener: () => void): () => void {
 	return () => listeners.delete(listener);
 }
 
-/**
- * The two AppShell variables the navbar width feeds, and the transition switch.
- *
- * `width` sizes the navbar itself; `offset` is what Main pads by and what the
- * alt-layout Header takes as `margin-inline-start`. Both must move together or the
- * sidebar and the content beside it disagree mid-drag.
- */
-const NAVBAR_WIDTH_VAR = "--app-shell-navbar-width";
-const NAVBAR_OFFSET_VAR = "--app-shell-navbar-offset";
-const TRANSITION_VAR = "--app-shell-transition-duration";
-
-/** The element Mantine's `:root` variables resolve against. */
-function varsTarget(): HTMLElement | null {
-	if (typeof document === "undefined") return null;
-	return document.documentElement;
+interface SavedStyle {
+	style: CSSStyleDeclaration;
+	property: string;
+	value: string;
+	priority: string;
 }
 
-/**
- * Push a width straight to CSS, bypassing React.
- *
- * This is the whole point of the drag path: no component re-renders, and — crucially
- * — Mantine's `<style>` tag is not rewritten (see the module comment).
- */
+interface DragStyles {
+	navbar: HTMLElement | null;
+	main: HTMLElement | null;
+	offsetElements: HTMLElement[];
+	saved: SavedStyle[];
+}
+
+let dragStyles: DragStyles | null = null;
+let releaseFrame: number | null = null;
+
+/** Resolve and save only the layout properties owned by the resize gesture. */
+function captureDragStyles(target?: HTMLElement | null): DragStyles {
+	const shell =
+		target?.closest(".mantine-AppShell-root") ?? document.querySelector(".mantine-AppShell-root");
+	const navbar = shell?.querySelector<HTMLElement>(".mantine-AppShell-navbar") ?? null;
+	const main = shell?.querySelector<HTMLElement>(".mantine-AppShell-main") ?? null;
+	const offsetElements =
+		shell?.getAttribute("data-layout") === "alt"
+			? Array.from(
+					shell.querySelectorAll<HTMLElement>(".mantine-AppShell-header, .mantine-AppShell-footer"),
+				)
+			: [];
+	const saved: SavedStyle[] = [];
+	const save = (element: HTMLElement | null, property: string) => {
+		if (!element) return;
+		saved.push({
+			style: element.style,
+			property,
+			value: element.style.getPropertyValue(property) || "",
+			priority: element.style.getPropertyPriority(property),
+		});
+	};
+	save(navbar, "width");
+	save(main, "padding-inline-start");
+	for (const element of offsetElements) save(element, "margin-inline-start");
+	for (const element of [navbar, main, ...offsetElements]) {
+		save(element, "transition-duration");
+		element?.style.setProperty("transition-duration", "0ms");
+	}
+	return { navbar, main, offsetElements, saved };
+}
+
+/** Drop only our overrides, preserving unrelated styles and original priorities. */
+function restoreDragStyles(): void {
+	if (releaseFrame !== null) {
+		cancelAnimationFrame(releaseFrame);
+		releaseFrame = null;
+	}
+	if (!dragStyles) return;
+	for (const { style, property, value, priority } of dragStyles.saved) {
+		if (value) style.setProperty(property, value, priority);
+		else style.removeProperty(property);
+	}
+	dragStyles = null;
+}
+
+/** Non-inherited properties avoid restyling every descendant of the AppShell. */
 function paintWidth(width: number): void {
-	const target = varsTarget();
-	if (!target) return;
+	if (!dragStyles) return;
 	const px = `${width}px`;
-	target.style.setProperty(NAVBAR_WIDTH_VAR, px);
-	target.style.setProperty(NAVBAR_OFFSET_VAR, px);
+	dragStyles.navbar?.style.setProperty("width", px);
+	dragStyles.main?.style.setProperty(
+		"padding-inline-start",
+		`calc(${px} + var(--app-shell-padding))`,
+	);
+	for (const element of dragStyles.offsetElements) {
+		element.style.setProperty("margin-inline-start", px);
+	}
 }
 
-/**
- * Force / restore the AppShell transition duration around a drag.
- *
- * Main transitions `padding` and the alt-layout Header transitions
- * `margin-inline-start`, both off the same variable. Left at its default every drag
- * frame starts a fresh ~200ms animation toward a target that has already moved,
- * which smears visually AND multiplies the work — see the module comment. Restored on
- * release so the collapse toggle (a click, where the animation is wanted) is unaffected.
- */
-function setDragTransitionSuppressed(suppressed: boolean): void {
-	const target = varsTarget();
-	if (!target) return;
-	if (suppressed) target.style.setProperty(TRANSITION_VAR, "0ms");
-	else target.style.removeProperty(TRANSITION_VAR);
-}
-
-/**
- * Hand the width back to React and drop the inline overrides.
- *
- * Order matters: React must have committed the new `navbar.width` BEFORE the inline
- * variables are removed, or there is a frame where the sheet still carries the old
- * value and the sidebar snaps back. `emit()` here runs synchronously through
- * `useSyncExternalStore`, and the removal is deferred one frame.
- */
+/** Keep overrides (including 0ms transitions) until React commits the final width. */
 function releaseToReact(): void {
 	emit();
-	const target = varsTarget();
-	if (!target) return;
+	if (!dragStyles) return;
+	if (releaseFrame !== null) cancelAnimationFrame(releaseFrame);
+	const releasedStyles = dragStyles;
 	const drop = () => {
-		target.style.removeProperty(NAVBAR_WIDTH_VAR);
-		target.style.removeProperty(NAVBAR_OFFSET_VAR);
+		// A stale callback must never clear a newer gesture's overrides.
+		if (dragStyles !== releasedStyles || drag) return;
+		releaseFrame = null;
+		restoreDragStyles();
 	};
-	if (typeof requestAnimationFrame === "function") requestAnimationFrame(drop);
+	// Hidden tabs suspend animation frames. React's store update is queued first;
+	// clean up after it without waiting indefinitely for the page to become visible.
+	if (document.visibilityState === "hidden") queueMicrotask(drop);
+	else if (typeof requestAnimationFrame === "function") releaseFrame = requestAnimationFrame(drop);
 	else drop();
 }
 
@@ -267,7 +251,6 @@ function endDrag(): void {
 	window.removeEventListener("blur", endDrag);
 	window.removeEventListener("pointercancel", endDrag);
 	document.removeEventListener("visibilitychange", onVisibilityChange);
-	setDragTransitionSuppressed(false);
 
 	// Snap. Which way depends on where the drag STARTED, so a drag out of the
 	// collapsed rail expands and a drag into it collapses.
@@ -292,8 +275,16 @@ function onVisibilityChange(): void {
 }
 
 /** Begin a resize drag. Stable identity, so it never invalidates a memo. */
-export function startNavResize(event: { clientX: number; preventDefault: () => void }): void {
+export function startNavResize(event: {
+	clientX: number;
+	preventDefault: () => void;
+	currentTarget?: HTMLElement | null;
+}): void {
 	event.preventDefault();
+	if (drag) endDrag();
+	// A release frame from the previous gesture must never clear the next one.
+	restoreDragStyles();
+	dragStyles = captureDragStyles(event.currentTarget);
 	drag = {
 		startX: event.clientX,
 		startWidth: getWidth(),
@@ -301,22 +292,10 @@ export function startNavResize(event: { clientX: number; preventDefault: () => v
 	};
 	document.body.style.cursor = "col-resize";
 	document.body.style.userSelect = "none";
-	setDragTransitionSuppressed(true);
 	window.addEventListener("pointermove", onPointerMove);
 	window.addEventListener("pointerup", endDrag);
-	// ── Abnormal terminations ──
-	//
-	// `pointerup` is not guaranteed to arrive. If the window loses focus while the
-	// button is held (alt-tab, a native dialog, dragging out of the browser and
-	// releasing there), the release lands on another surface and this drag would stay
-	// open indefinitely: `drag` stays non-null AND `document.body.style.userSelect`
-	// stays "none", which makes TEXT UNSELECTABLE ACROSS THE WHOLE APP until the next
-	// pointerup anywhere. The width itself does not run away (no `pointermove` arrives
-	// without focus), so the leaked body style is the visible symptom.
-	//
-	// `blur` covers focus loss, `pointercancel` the browser taking the gesture over,
-	// and `visibilitychange` a backgrounded tab. All three route to the same `endDrag`,
-	// which snaps and persists exactly as a normal release does.
+	// A release outside the window, browser cancellation, or backgrounded tab may
+	// never deliver pointerup. All must end the drag and release selection blocking.
 	window.addEventListener("blur", endDrag);
 	window.addEventListener("pointercancel", endDrag);
 	document.addEventListener("visibilitychange", onVisibilityChange);
@@ -324,8 +303,10 @@ export function startNavResize(event: { clientX: number; preventDefault: () => v
 
 /** Toggle between the collapsed rail and the last expanded width. */
 export function toggleNavCollapsed(): void {
+	if (drag) endDrag();
+	restoreDragStyles();
 	const next = getCollapsed() ? (lastExpandedWidth ?? DEFAULT_WIDTH) : COLLAPSED_WIDTH;
-	// A click, not a gesture: React drives it, and the transition is wanted here.
+	// No drag overrides: React drives the click, including its normal transition.
 	writeWidth(next, true);
 	releaseToReact();
 	persist(next);
@@ -336,12 +317,9 @@ export function toggleNavCollapsed(): void {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * The live width in px.
- *
- * ⚠️ This subscribes to EVERY drag frame, so it belongs only in a component whose
- * re-render is cheap and whose children are passed through as a stable `children`
- * element (see AppShellWithNavWidth in AppRootLayout). Calling it from a component
- * that renders the navbar content re-creates the original performance bug.
+ * The settled width (also notified at collapse-threshold crossings). Keep this
+ * subscription in the thin AppShell wrapper so width-only commits do not recreate
+ * navbar content. Ordinary drag frames paint layout properties without emitting.
  */
 export function useNavWidth(): number {
 	return useSyncExternalStore(subscribe, getWidth, getWidth);
@@ -357,30 +335,20 @@ export function useNavCollapsed(): boolean {
 	return useSyncExternalStore(subscribe, getCollapsed, getCollapsed);
 }
 
-/**
- * The inline CSS override currently applied, or null when React owns the width.
- * Exposed for tests: the drag path's whole contract is that it paints CSS without
- * notifying React, which is otherwise invisible.
- */
+/** Current layout overrides, exposed for render-isolation and handover tests. */
 export function readNavWidthOverrideForTest(): { width: string; offset: string } | null {
-	const target = varsTarget();
-	if (!target) return null;
-	const width = target.style.getPropertyValue(NAVBAR_WIDTH_VAR);
-	const offset = target.style.getPropertyValue(NAVBAR_OFFSET_VAR);
+	if (!dragStyles) return null;
+	const width = dragStyles.navbar?.style.getPropertyValue("width") || "";
+	const offset = dragStyles.offsetElements[0]?.style.getPropertyValue("margin-inline-start") || "";
 	return width || offset ? { width, offset } : null;
 }
 
-/** Test seam: reset the module store to a known state. */
+/** Test seam: reset the module store and any pending gesture to a known state. */
 export function resetNavWidthStoreForTest(width = DEFAULT_WIDTH): void {
-	drag = null;
+	if (drag) endDrag();
+	restoreDragStyles();
 	currentWidth = width;
 	lastExpandedWidth = width >= COLLAPSE_THRESHOLD ? width : DEFAULT_WIDTH;
-	const target = varsTarget();
-	if (target) {
-		target.style.removeProperty(NAVBAR_WIDTH_VAR);
-		target.style.removeProperty(NAVBAR_OFFSET_VAR);
-		target.style.removeProperty(TRANSITION_VAR);
-	}
 	emit();
 }
 
