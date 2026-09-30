@@ -46,6 +46,13 @@ export interface McpServerStatus extends McpServerConfigProjection {
 	tools: Tool[];
 }
 
+/** Outcome of re-fetching one server's tool list. */
+export interface McpRefreshResult {
+	ok: boolean;
+	toolCount: number;
+	error?: string;
+}
+
 /** Project a persisted MCP config without exposing secret values. */
 export function projectMcpServerConfig(config: McpServerConfig): McpServerConfigProjection {
 	return {
@@ -79,6 +86,7 @@ interface ActiveClient {
 
 class McpManager {
 	private clients = new Map<string, ActiveClient>();
+	private connectionIntents = new Map<string, symbol>();
 	private _shuttingDown = false;
 
 	/** External callback invoked whenever the set of available tools changes.
@@ -97,15 +105,19 @@ class McpManager {
 
 	/** Connect to a single MCP server. */
 	async connect(config: McpServerConfig): Promise<void> {
+		// Snapshot intent: settings updates may mutate an object while transport work awaits.
+		config = structuredClone(config);
+		if (!this.isCurrentConfig(config)) return;
 		// Preserve reconnect attempt count across reconnections so the
 		// MAX_RECONNECT_ATTEMPTS limit is actually enforced.
 		const prevAttempts = this.clients.get(config.id)?.reconnectAttempts ?? 0;
 
-		// Disconnect existing connection if any
-		if (this.clients.has(config.id)) {
-			await this.disconnect(config.id);
-		}
-
+		// Publish this generation synchronously after disconnect invalidates its predecessor.
+		const closing = this.disconnect(config.id);
+		const intent = Symbol(config.id);
+		this.connectionIntents.set(config.id, intent);
+		await closing;
+		if (this.connectionIntents.get(config.id) !== intent || !this.isCurrentConfig(config)) return;
 		const entry: ActiveClient = {
 			config,
 			client: null,
@@ -126,7 +138,7 @@ class McpManager {
 			// Handle transport close — auto-reconnect if not shutting down
 			transport.onclose = () => {
 				const e = this.clients.get(config.id);
-				if (!e || e.status !== "connected") return;
+				if (e !== entry || e.status !== "connected") return;
 				e.status = "error";
 				e.error = "Transport closed unexpectedly";
 				eventBus.emit({
@@ -146,10 +158,17 @@ class McpManager {
 				`MCP connect to "${config.name}"`,
 			);
 
+			if (this.clients.get(config.id) !== entry || !this.isCurrentConfig(config)) {
+				if (this.clients.get(config.id) === entry) this.clients.delete(config.id);
+				await transport.close?.();
+				return;
+			}
+
 			// Listen for tools/list_changed notifications — re-fetch tools when server updates them
 			client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
 				try {
 					const refreshed = await client.listTools();
+					if (this.clients.get(config.id) !== entry || !this.isCurrentConfig(config)) return;
 					entry.tools = refreshed.tools ?? [];
 					logger.info(`MCP: "${config.name}" tools updated, now ${entry.tools.length} tool(s)`);
 					this.onToolsChanged?.();
@@ -164,6 +183,11 @@ class McpManager {
 				CONNECT_TIMEOUT_MS,
 				`MCP listTools for "${config.name}"`,
 			);
+			if (this.clients.get(config.id) !== entry || !this.isCurrentConfig(config)) {
+				if (this.clients.get(config.id) === entry) this.clients.delete(config.id);
+				await transport.close?.();
+				return;
+			}
 			entry.tools = result.tools ?? [];
 			entry.status = "connected";
 			entry.error = undefined;
@@ -179,6 +203,11 @@ class McpManager {
 				toolCount: entry.tools.length,
 			});
 		} catch (err) {
+			if (this.clients.get(config.id) !== entry || !this.isCurrentConfig(config)) {
+				if (this.clients.get(config.id) === entry) this.clients.delete(config.id);
+				await entry.transport?.close?.().catch(() => {});
+				return;
+			}
 			const msg = err instanceof Error ? err.message : String(err);
 			entry.status = "error";
 			entry.error = msg;
@@ -195,6 +224,7 @@ class McpManager {
 
 	/** Disconnect a single MCP server. */
 	async disconnect(serverId: string): Promise<void> {
+		this.connectionIntents.delete(serverId);
 		const entry = this.clients.get(serverId);
 		if (!entry) return;
 
@@ -218,6 +248,96 @@ class McpManager {
 			type: "mcp:server_disconnected",
 			serverId,
 			name,
+		});
+	}
+
+	/**
+	 * Re-fetch a server's tool list without a config change.
+	 *
+	 * Prefers a lightweight `tools/list` on the live connection — the case where an
+	 * upstream (e.g. JetBrains MCP) toggles APIs but never sends `tools/list_changed`.
+	 * Falls back to a full reconnect when there is no live client or the re-list
+	 * fails. Does not change the persisted `enabled` intent: a disabled server is
+	 * reported as an error rather than silently brought up.
+	 */
+	async refresh(serverId: string): Promise<McpRefreshResult> {
+		const entry = this.clients.get(serverId);
+		const configured = (Array.isArray(settings.mcpServers) ? settings.mcpServers : []).find(
+			(s) => s.id === serverId,
+		);
+		const config = configured ? structuredClone(configured) : undefined;
+		if (!config) {
+			return { ok: false, toolCount: 0, error: `MCP server "${serverId}" is not configured` };
+		}
+		if (!config.enabled) {
+			return { ok: false, toolCount: 0, error: `MCP server "${config.name}" is disabled` };
+		}
+
+		const intent = this.connectionIntents.get(serverId);
+		const stillCurrent = () =>
+			this.isCurrentConfig(config) &&
+			this.clients.get(serverId) === entry &&
+			this.connectionIntents.get(serverId) === intent;
+		const cancelled = (): McpRefreshResult => ({
+			ok: false,
+			toolCount: 0,
+			error: `MCP server "${config.name}" changed or was disconnected during refresh`,
+		});
+		if (entry && !this.isCurrentConfig(entry.config)) return cancelled();
+		if (entry?.status === "connected" && entry.client) {
+			try {
+				const result = await withTimeout(
+					entry.client.listTools(),
+					CONNECT_TIMEOUT_MS,
+					`MCP refresh tools for "${config.name}"`,
+				);
+				if (!stillCurrent()) return cancelled();
+				entry.tools = result.tools ?? [];
+				logger.info(`MCP: refreshed tools for "${config.name}", now ${entry.tools.length} tool(s)`);
+				this.onToolsChanged?.();
+				return { ok: true, toolCount: entry.tools.length };
+			} catch (err) {
+				logger.warn(
+					`MCP: refresh listTools failed for "${config.name}", reconnecting: ${
+						err instanceof Error ? err.message : String(err)
+					}`,
+				);
+			}
+		}
+
+		// Never reconnect a stale lifecycle after disable/delete/replacement/disconnect.
+		if (!stillCurrent()) return cancelled();
+		await this.connect(config);
+		if (!this.isCurrentConfig(config)) return cancelled();
+		const after = this.clients.get(serverId);
+		if (after?.status === "connected") {
+			return { ok: true, toolCount: after.tools.length };
+		}
+		return {
+			ok: false,
+			toolCount: after?.tools.length ?? 0,
+			error: after?.error ?? `MCP server "${config.name}" is not connected`,
+		};
+	}
+
+	/** Refresh the tool list of every enabled configured server. */
+	async refreshAll(): Promise<Array<{ serverId: string; name: string } & McpRefreshResult>> {
+		const servers = (Array.isArray(settings.mcpServers) ? settings.mcpServers : []).filter(
+			(s) => s.enabled,
+		);
+		const settled = await Promise.allSettled(servers.map((s) => this.refresh(s.id)));
+		return settled.map((result, idx) => {
+			const cfg = servers[idx];
+			if (result.status === "fulfilled") {
+				return { serverId: cfg.id, name: cfg.name, ...result.value };
+			}
+			return {
+				serverId: cfg.id,
+				name: cfg.name,
+				ok: false,
+				toolCount: 0,
+				error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+			};
 		});
 	}
 
@@ -374,6 +494,13 @@ class McpManager {
 				logger.error(`MCP: reconnect failed for "${entry.config.name}": ${err}`);
 			}
 		}, delay);
+	}
+
+	private isCurrentConfig(config: McpServerConfig): boolean {
+		const current = (Array.isArray(settings.mcpServers) ? settings.mcpServers : []).find(
+			(s) => s.id === config.id,
+		);
+		return !!current?.enabled && config.enabled && !this.configChanged(current, config);
 	}
 
 	private configChanged(a: McpServerConfig, b: McpServerConfig): boolean {

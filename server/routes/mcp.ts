@@ -517,6 +517,54 @@ mcpRoutes.post("/servers/:id/disconnect", requireAdmin, async (c) => {
 	return c.json(status ?? { id, status: "disconnected", enabled: false });
 });
 
+/**
+ * Re-fetch a server's tool list without toggling the connection intent.
+ *
+ * Distinct from disconnect+connect: a live connection only re-runs `tools/list`,
+ * which is what an upstream that toggles APIs without `tools/list_changed`
+ * (e.g. JetBrains MCP) needs. A dead connection falls back to reconnect.
+ */
+mcpRoutes.post("/servers/:id/refresh", requireAdmin, async (c) => {
+	const { id } = c.req.param();
+	const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
+	const config = servers.find((s) => s.id === id);
+	if (!config) return c.json({ error: "Not found" }, 404);
+
+	const result = await mcpManager.refresh(id);
+	syncMcpTools();
+
+	const status = mcpManager.getServerStatuses().find((s) => s.id === id);
+	if (!result.ok) {
+		return c.json(
+			{
+				error: result.error ?? "Failed to refresh MCP tools",
+				ok: false,
+				toolCount: result.toolCount,
+				status: status ?? { id, status: "error", error: result.error },
+			},
+			502,
+		);
+	}
+	return c.json({
+		ok: true,
+		toolCount: result.toolCount,
+		status: status ?? { id, status: "connected", tools: [] },
+	});
+});
+
+/** Re-fetch tool lists of every enabled MCP server. */
+mcpRoutes.post("/servers/refresh", requireAdmin, async (c) => {
+	const results = await mcpManager.refreshAll();
+	syncMcpTools();
+	const failed = results.filter((r) => !r.ok);
+	return c.json({
+		ok: failed.length === 0,
+		refreshed: results.length - failed.length,
+		failed: failed.length,
+		results,
+	});
+});
+
 /** Test an existing server with secret values inherited from persisted settings. */
 mcpRoutes.post("/servers/:id/test", requireAdmin, async (c) => {
 	const { id } = c.req.param();
