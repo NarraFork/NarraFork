@@ -4,7 +4,7 @@
  * The behaviour under test is a PERFORMANCE contract, so it is asserted by counting
  * renders rather than by inspecting pixels:
  *
- *   - a drag frame must re-render only the width consumer, never the navbar content;
+ *   - ordinary drag frames must re-render neither width nor navbar consumers;
  *   - the collapsed boolean must not re-render on the pixel stream;
  *   - a `children` element passed through the width consumer must not re-render at
  *     all, which is what keeps `RecentTabList` / `NavLink` / `Tooltip` out of the
@@ -44,7 +44,54 @@ async function installDom(): Promise<void> {
 	for (const key of DOM_KEYS) {
 		previous.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
 	}
-	const { window } = parseHTML("<!doctype html><html><body><div id=root></div></body></html>");
+	const { window } = parseHTML(`<!doctype html><html><body>
+		<div class="mantine-AppShell-root" data-layout="alt"
+			style="--app-shell-transition-duration: 200ms">
+			<header class="mantine-AppShell-header"></header>
+			<nav class="mantine-AppShell-navbar"><div id="resize-handle"></div></nav>
+			<main class="mantine-AppShell-main"></main>
+			<footer class="mantine-AppShell-footer"></footer>
+		</div>
+		<div id="root"></div>
+	</body></html>`);
+	// linkedom ignores setProperty's priority and has no getPropertyPriority.
+	// Model that CSSOM bookkeeping only, and restore the shared prototype after each
+	// test. Actual cascade/transition behaviour is verified in Chrome, not this shim.
+	const stylePrototype = Object.getPrototypeOf(window.document.body.style);
+	const styleKeys = ["getPropertyPriority", "setProperty", "removeProperty"];
+	const styleDescriptors = styleKeys.map(
+		(key) => [key, Object.getOwnPropertyDescriptor(stylePrototype, key)] as const,
+	);
+	const setProperty = stylePrototype.setProperty;
+	const removeProperty = stylePrototype.removeProperty;
+	const priorities = new WeakMap<CSSStyleDeclaration, Map<string, string>>();
+	Object.defineProperties(stylePrototype, {
+		getPropertyPriority: {
+			configurable: true,
+			value(this: CSSStyleDeclaration, property: string) {
+				return priorities.get(this)?.get(property) ?? "";
+			},
+		},
+		setProperty: {
+			configurable: true,
+			value(this: CSSStyleDeclaration, property: string, value: string, priority = "") {
+				let map = priorities.get(this);
+				if (!map) {
+					map = new Map();
+					priorities.set(this, map);
+				}
+				map.set(property, priority);
+				setProperty.call(this, property, value);
+			},
+		},
+		removeProperty: {
+			configurable: true,
+			value(this: CSSStyleDeclaration, property: string) {
+				priorities.get(this)?.delete(property);
+				return removeProperty.call(this, property);
+			},
+		},
+	});
 	const store = new Map<string, string>();
 	const values: Record<string, unknown> = {
 		window,
@@ -69,6 +116,10 @@ async function installDom(): Promise<void> {
 		});
 	}
 	restore = () => {
+		for (const [key, descriptor] of styleDescriptors) {
+			if (descriptor) Object.defineProperty(stylePrototype, key, descriptor);
+			else Reflect.deleteProperty(stylePrototype, key);
+		}
 		for (const key of DOM_KEYS) {
 			const descriptor = previous.get(key);
 			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
@@ -128,6 +179,11 @@ function firePointer(type: string, clientX: number): void {
 /** Set once react-dom is loaded; `firePointer` runs before any import in some tests. */
 const flushSyncRef: { current: (fn: () => void) => void } = { current: (fn) => fn() };
 
+function layoutNode(part: string): HTMLElement {
+	const element = document.querySelector<HTMLElement>(`.mantine-AppShell-${part}`);
+	if (!element) throw new Error(`No AppShell ${part}`);
+	return element;
+}
 describe("nav width store", () => {
 	it("tracks the drag and clamps to the allowed range", async () => {
 		const { startNavResize, NAV_WIDTH_CONSTANTS, resetNavWidthStoreForTest } = await import(
@@ -218,12 +274,12 @@ async function mountHarness<T>(hook: () => T): Promise<{
 	return { renderHookCounts: counts };
 }
 
-describe("CSS-variable drag path", () => {
+describe("local layout-property drag path", () => {
 	// The core contract. Mantine writes the navbar width into a `<style>` tag via
 	// dangerouslySetInnerHTML, so any React round-trip mid-drag rewrites a style sheet
 	// and forces a document-wide style recalculation. The drag must therefore reach
 	// CSS directly and leave React untouched until release.
-	it("paints CSS variables without notifying React mid-drag", async () => {
+	it("paints layout properties without notifying React mid-drag", async () => {
 		const { startNavResize, useNavWidth, readNavWidthOverrideForTest } = await import(
 			"./useResizableNav"
 		);
@@ -255,19 +311,22 @@ describe("CSS-variable drag path", () => {
 		firePointer("pointerup", 160);
 	});
 
-	it("suppresses the AppShell transition for the duration of the drag", async () => {
+	it("suppresses transitions on the consumers despite AppShell's own duration", async () => {
 		const { startNavResize } = await import("./useResizableNav");
-		const root = document.documentElement;
-		// linkedom returns undefined (not "") for an unset custom property.
-		const readTransition = () =>
-			root.style.getPropertyValue("--app-shell-transition-duration") || "";
-		expect(readTransition()).toBe("");
+		const shell = layoutNode("root");
+		expect(shell.style.getPropertyValue("--app-shell-transition-duration")).toBe("200ms");
 		startNavResize({ clientX: 100, preventDefault: () => {} });
-		// Main transitions `padding`; leaving it on makes each frame animate toward a
-		// target that has already moved.
-		expect(readTransition()).toBe("0ms");
+		for (const part of ["navbar", "main", "header", "footer"]) {
+			expect(layoutNode(part).style.getPropertyValue("transition-duration")).toBe("0ms");
+		}
 		firePointer("pointerup", 100);
-		expect(readTransition()).toBe("");
+		// Keep transitions disabled through the handover, not just until pointerup.
+		expect(layoutNode("main").style.getPropertyValue("transition-duration")).toBe("0ms");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		for (const part of ["navbar", "main", "header", "footer"]) {
+			expect(layoutNode(part).style.getPropertyValue("transition-duration") || "").toBe("");
+		}
+		expect(shell.style.getPropertyValue("--app-shell-transition-duration")).toBe("200ms");
 	});
 
 	it("still notifies React when a drag frame crosses the collapse threshold", async () => {
@@ -285,8 +344,164 @@ describe("CSS-variable drag path", () => {
 	});
 });
 
+describe("drag style scope and handover", () => {
+	it("updates only the layout consumers, never inherited root variables", async () => {
+		const { startNavResize } = await import("./useResizableNav");
+		const htmlStyle = document.documentElement.getAttribute("style");
+		const shellStyle = layoutNode("root").getAttribute("style");
+		startNavResize({ clientX: 100, preventDefault: () => {} });
+		firePointer("pointermove", 160);
+		expect(layoutNode("navbar").style.getPropertyValue("width")).toBe("310px");
+		expect(layoutNode("main").style.getPropertyValue("padding-inline-start")).toBe(
+			"calc(310px + var(--app-shell-padding))",
+		);
+		for (const part of ["header", "footer"]) {
+			expect(layoutNode(part).style.getPropertyValue("margin-inline-start")).toBe("310px");
+		}
+		expect(document.documentElement.getAttribute("style")).toBe(htmlStyle);
+		expect(layoutNode("root").getAttribute("style")).toBe(shellStyle);
+		firePointer("pointerup", 160);
+	});
+
+	it("does not move a standard-layout header or footer", async () => {
+		const { startNavResize } = await import("./useResizableNav");
+		layoutNode("root").setAttribute("data-layout", "default");
+		startNavResize({ clientX: 100, preventDefault: () => {} });
+		firePointer("pointermove", 150);
+		expect(layoutNode("navbar").style.getPropertyValue("width")).toBe("300px");
+		for (const part of ["header", "footer"]) {
+			expect(layoutNode(part).getAttribute("style")).toBeNull();
+		}
+		firePointer("pointerup", 150);
+	});
+
+	it("resolves the event's own shell, leaving a different shell untouched", async () => {
+		const { startNavResize } = await import("./useResizableNav");
+		const other = layoutNode("root").cloneNode(true) as HTMLElement;
+		document.body.append(other);
+		const handle = other.querySelector<HTMLElement>("#resize-handle");
+		startNavResize({ clientX: 100, currentTarget: handle, preventDefault: () => {} });
+		firePointer("pointermove", 160);
+		expect(other.querySelector<HTMLElement>("nav")?.style.width).toBe("310px");
+		expect(layoutNode("navbar").getAttribute("style")).toBeNull();
+		firePointer("pointerup", 160);
+	});
+
+	it("caches targets so moves do no DOM lookup or geometry reads", async () => {
+		const { startNavResize } = await import("./useResizableNav");
+		startNavResize({ clientX: 100, preventDefault: () => {} });
+		const shell = layoutNode("root");
+		const query = shell.querySelector;
+		const documentQuery = document.querySelector;
+		const forbidden = () => {
+			throw new Error("The resize hot path must not query DOM or layout");
+		};
+		shell.querySelector = forbidden;
+		document.querySelector = forbidden;
+		for (const element of shell.querySelectorAll<HTMLElement>("*")) {
+			element.getBoundingClientRect = forbidden;
+		}
+		try {
+			for (let x = 110; x <= 160; x++) {
+				expect(() => firePointer("pointermove", x)).not.toThrow();
+			}
+		} finally {
+			shell.querySelector = query;
+			document.querySelector = documentQuery;
+			firePointer("pointerup", 160);
+		}
+	});
+
+	it("restores original values and priorities without erasing unrelated styles", async () => {
+		const { startNavResize, readNavWidthOverrideForTest } = await import("./useResizableNav");
+		const navbar = layoutNode("navbar");
+		const main = layoutNode("main");
+		const header = layoutNode("header");
+		navbar.style.setProperty("width", "240px", "important");
+		main.style.setProperty("padding-inline-start", "24px", "important");
+		header.style.setProperty("margin-inline-start", "240px", "important");
+		for (const element of [navbar, main, header]) {
+			element.style.setProperty("transition-duration", "150ms", "important");
+			element.style.setProperty("padding-bottom", "7px");
+		}
+		startNavResize({ clientX: 100, preventDefault: () => {} });
+		firePointer("pointermove", 140);
+		firePointer("pointerup", 140);
+		// React gets one frame to take over before the original styles return.
+		expect(navbar.style.width).toBe("290px");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(readNavWidthOverrideForTest()).toBeNull();
+		for (const [element, property, value] of [
+			[navbar, "width", "240px"],
+			[main, "padding-inline-start", "24px"],
+			[header, "margin-inline-start", "240px"],
+		] as const) {
+			expect(element.style.getPropertyValue(property)).toBe(value);
+			expect(element.style.getPropertyPriority(property)).toBe("important");
+			expect(element.style.getPropertyValue("transition-duration")).toBe("150ms");
+			expect(element.style.getPropertyPriority("transition-duration")).toBe("important");
+			expect(element.style.paddingBottom).toBe("7px");
+		}
+	});
+
+	it("a previous release callback cannot clear a new drag", async () => {
+		const { startNavResize, readNavWidthOverrideForTest } = await import("./useResizableNav");
+		const raf = globalThis.requestAnimationFrame;
+		const cancel = globalThis.cancelAnimationFrame;
+		const callbacks: FrameRequestCallback[] = [];
+		const cancelled: number[] = [];
+		globalThis.requestAnimationFrame = (callback) => callbacks.push(callback);
+		globalThis.cancelAnimationFrame = (id) => cancelled.push(id);
+		try {
+			startNavResize({ clientX: 100, preventDefault: () => {} });
+			firePointer("pointermove", 130);
+			firePointer("pointerup", 130);
+			startNavResize({ clientX: 130, preventDefault: () => {} });
+			firePointer("pointermove", 150);
+			expect(cancelled).toContain(1);
+			// Even a callback delivered despite cancellation must not clear the new drag.
+			callbacks[0](0);
+			expect(readNavWidthOverrideForTest()).toEqual({ width: "300px", offset: "300px" });
+			expect(layoutNode("main").style.getPropertyValue("transition-duration")).toBe("0ms");
+			firePointer("pointerup", 150);
+			callbacks[1](0);
+			expect(readNavWidthOverrideForTest()).toBeNull();
+			expect(layoutNode("main").style.getPropertyValue("transition-duration") || "").toBe("");
+		} finally {
+			globalThis.requestAnimationFrame = raf;
+			globalThis.cancelAnimationFrame = cancel;
+		}
+	});
+
+	it("cleans up a hidden page without waiting for suspended animation frames", async () => {
+		const { startNavResize, readNavWidthOverrideForTest } = await import("./useResizableNav");
+		startNavResize({ clientX: 100, preventDefault: () => {} });
+		firePointer("pointermove", 140);
+		Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+		const raf = globalThis.requestAnimationFrame;
+		globalThis.requestAnimationFrame = () => {
+			throw new Error("Hidden pages must not wait for rAF");
+		};
+		try {
+			window.dispatchEvent(new window.Event("pointercancel"));
+			await Promise.resolve();
+			expect(readNavWidthOverrideForTest()).toBeNull();
+			expect(layoutNode("main").style.getPropertyValue("transition-duration") || "").toBe("");
+		} finally {
+			globalThis.requestAnimationFrame = raf;
+		}
+	});
+
+	it("collapse clicks keep their normal transitions and create no drag overrides", async () => {
+		const { toggleNavCollapsed, readNavWidthOverrideForTest } = await import("./useResizableNav");
+		layoutNode("main").style.setProperty("transition-duration", "200ms");
+		flushSyncRef.current(() => toggleNavCollapsed());
+		expect(readNavWidthOverrideForTest()).toBeNull();
+		expect(layoutNode("main").style.getPropertyValue("transition-duration")).toBe("200ms");
+	});
+});
 describe("render isolation during a drag", () => {
-	it("re-renders the WIDTH consumer per frame but not the collapsed consumer", async () => {
+	it("notifies width only on release, leaving collapsed and navbar consumers alone", async () => {
 		const { startNavResize, useNavWidth, useNavCollapsed } = await import("./useResizableNav");
 		const { createElement } = await import("react");
 		const { createRoot } = await import("react-dom/client");
@@ -327,14 +542,15 @@ describe("render isolation during a drag", () => {
 		// 30 frames of a drag that never crosses the collapse threshold.
 		startNavResize({ clientX: 300, preventDefault: () => {} });
 		for (let i = 1; i <= 30; i++) firePointer("pointermove", 300 + i);
+		expect(widthRenders).toBe(baseWidth);
 		firePointer("pointerup", 330);
 
 		const widthDelta = widthRenders - baseWidth;
 		const collapsedDelta = collapsedRenders - baseCollapsed;
 		const contentDelta = navbarContentRenders - baseContent;
 
-		// The width consumer absorbs the stream...
-		expect(widthDelta).toBeGreaterThan(0);
+		// The width consumer hears only the settled value, once.
+		expect(widthDelta).toBe(1);
 		// ...while the layout (collapsed only) does not re-render at all, because the
 		// boolean never changed. This is the whole point: the navbar content lives here.
 		expect(collapsedDelta).toBe(0);
@@ -457,15 +673,18 @@ describe("abnormal drag terminations", () => {
 		expect(document.body.style.userSelect).toBe("");
 	});
 
-	it("also restores the transition variable on an abnormal end", async () => {
-		const { startNavResize } = await import("./useResizableNav");
-		const readTransition = () =>
-			document.documentElement.style.getPropertyValue("--app-shell-transition-duration") || "";
+	it("restores local transition and layout overrides on an abnormal end", async () => {
+		const { startNavResize, readNavWidthOverrideForTest } = await import("./useResizableNav");
+		const main = layoutNode("main");
+		main.style.setProperty("transition-duration", "150ms");
 		startNavResize({ clientX: 300, preventDefault: () => {} });
-		expect(readTransition()).toBe("0ms");
+		firePointer("pointermove", 330);
+		expect(main.style.getPropertyValue("transition-duration")).toBe("0ms");
 		fireOn(window, "blur");
-		// A leaked 0ms would silently disable the AppShell's animations app-wide.
-		expect(readTransition()).toBe("");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(main.style.getPropertyValue("transition-duration")).toBe("150ms");
+		expect(main.style.getPropertyValue("padding-inline-start") || "").toBe("");
+		expect(readNavWidthOverrideForTest()).toBeNull();
 	});
 
 	it("leaves an idle page alone (no drag in progress)", async () => {

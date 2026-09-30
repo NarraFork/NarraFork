@@ -257,24 +257,13 @@ function OutputStatsBadge({ enabled }: { enabled: boolean }) {
 }
 
 /**
- * The AppShell, with the live nav width injected here and NOWHERE ELSE.
+ * Only this thin wrapper subscribes to the settled nav width. Drag frames update
+ * DOM layout properties without notifying React; releases and collapse-threshold
+ * crossings let Mantine take over. Keeping `children` as a stable element isolates
+ * the navbar's RecentTabLists, NavLinks and Tooltips from width-only commits.
  *
- * This exists purely to bound what a resize drag re-renders. `useNavWidth`
- * subscribes to every `mousemove` frame, so whichever component calls it re-renders
- * at ~60Hz for the duration of the drag. Calling it in `AuthenticatedLayout` (1031
- * lines, ~86 hooks) meant re-rendering the whole shell each frame — both
- * `RecentTabList`s, every navbar `NavLink` and its `Tooltip`. The same file already
- * records the cost of exactly that shape: a per-second tick re-rendering "the whole
- * AppShell (navbar NavLinks, tab strip, tooltips)" measured ~140ms of main-thread
- * work per second (see OutputStatsBadge, which was extracted for the same reason).
- *
- * Because `children` arrives as an already-created element, React re-renders only
- * this function body and reuses the entire subtree by reference — the navbar content
- * is not re-rendered at all.
- *
- * ⚠️ Do not read `useNavWidth()` outside this component, and do not move navbar
- * content into it. Either change silently restores the original per-frame cost while
- * leaving the code looking correct.
+ * Do not move the width subscription into AuthenticatedLayout or navbar content
+ * into this wrapper: either change restores the expensive shell-wide re-render.
  */
 function AppShellWithNavWidth({
 	navbar,
@@ -646,8 +635,8 @@ function AuthenticatedLayout() {
 			className={APP_SHELL_CLASSNAME}
 			layout="alt"
 			header={{ height: APP_SHELL_HEADER_HEIGHT }}
-			// `width` is supplied by the wrapper, which is the ONLY component
-			// subscribed to the drag's pixel stream (see AppShellWithNavWidth).
+			// Only the wrapper subscribes to settled width and threshold crossings;
+			// ordinary drag frames bypass React (see AppShellWithNavWidth).
 			navbar={{
 				breakpoint: "sm",
 				collapsed: { mobile: !opened },
