@@ -19,7 +19,48 @@
 		"author": "Meta Platforms, Inc. and affiliates",
 		"repository": "https://github.com/facebook/zstd",
 		"textFile": "zstd.txt",
-		"distributedVia": "Static binaries at vendor/zstd/zstd-linux-{x64,arm64}, built by scripts/build-zstd-static.sh and shipped for delta updates."
+		"distributedVia": "Linux static helpers at vendor/zstd/zstd-linux-{x64,arm64}; native Windows ARM64 zstd-win-arm64.exe at dist/helpers/windows-arm64/, built from the same upstream source by scripts/prepare-windows-arm64-helpers.ts for delta updates."
+	},
+	{
+		"name": "ripgrep",
+		"version": "15.1.0",
+		"license": "MIT",
+		"declaredLicense": "MIT OR Unlicense",
+		"selectionReason": "MIT branch selected; the upstream Windows ARM64 release supplies LICENSE-MIT verbatim.",
+		"author": "Andrew Gallant",
+		"repository": "https://github.com/BurntSushi/ripgrep",
+		"textFile": "ripgrep.txt",
+		"distributedVia": "Six native CLI helpers for Linux/macOS/Windows x64 and ARM64 prepared by scripts/prepare-ripgrep-helpers.ts under dist/helpers/ripgrep/, for separately authorized distribution via the update server tools endpoint."
+	},
+	{
+		"name": "PCRE2 (ripgrep helpers)",
+		"version": "10.45",
+		"license": "BSD-3-Clause WITH PCRE2-exception",
+		"author": "Philip Hazel, Zoltan Herczeg and PCRE2 contributors",
+		"repository": "https://github.com/PCRE2Project/pcre2",
+		"textFile": "pcre2.txt",
+		"distributedVia": "Included in the official ripgrep 15.1.0 CLI helpers (features:+pcre2).",
+		"note": "Verbatim LICENCE.md from upstream tag pcre2-10.45, including the binary-library redistribution exemption."
+	},
+	{
+		"name": "LLVM compiler-rt",
+		"version": "20.1.7",
+		"license": "Apache-2.0 WITH LLVM-exception",
+		"author": "LLVM Project contributors",
+		"repository": "https://github.com/llvm/llvm-project",
+		"textFile": "llvm-compiler-rt.txt",
+		"distributedVia": "Compiler builtins statically linked into zstd-win-arm64.exe by the pinned llvm-mingw 20250613 cross-toolchain.",
+		"note": "The verbatim LICENSE.TXT from the verified llvm-mingw archive includes LLVM's full license and exceptions; the compiler executable itself is build-only, not distributed."
+	},
+	{
+		"name": "MinGW-w64 runtime",
+		"version": "bundled with llvm-mingw 20250613",
+		"license": "LicenseRef-MinGW-w64-runtime",
+		"author": "MinGW-w64 project and runtime contributors",
+		"repository": "https://github.com/mingw-w64/mingw-w64",
+		"textFile": "mingw-w64-runtime.txt",
+		"distributedVia": "Statically linked into native zstd-win-arm64.exe; Windows UCRT system DLLs are not redistributed.",
+		"note": "Mixed runtime licenses: the complete upstream COPYING.MinGW-w64-runtime.txt notices are reproduced verbatim rather than reduced to a guessed SPDX identifier."
 	},
 	{
 		"name": "musl libc",

@@ -1,10 +1,7 @@
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import {
-	downloadHelperBinary,
-	getCachedHelperBinaryPath,
-	type HelperBinarySpec,
-} from "./helper-binaries";
+import { downloadHelperBinary, getCachedHelperBinaryPath } from "./helper-binaries";
+import { getCliHelperSpec, isNativeCliHelper } from "./helper-binary-platform";
 import { logger } from "./logger";
 import { IS_WINDOWS } from "./platform";
 
@@ -36,7 +33,7 @@ function findRgInWinGet(): string | undefined {
 		for (const entry of entries) {
 			if (entry.toLowerCase().startsWith("burntsushi.ripgrep")) {
 				const candidate = join(packagesDir, entry, "rg.exe");
-				if (existsSync(candidate)) return candidate;
+				if (existsSync(candidate) && isNativeCliHelper(candidate)) return candidate;
 			}
 		}
 	} catch {
@@ -45,28 +42,13 @@ function findRgInWinGet(): string | undefined {
 	return undefined;
 }
 
-function getRipgrepHelperSpec(): HelperBinarySpec | null {
-	if (process.platform === "win32") {
-		return { toolName: "rg-win64.exe", cachedName: "rg.exe", displayName: "ripgrep" };
-	}
-	if (process.platform === "linux" && process.arch === "arm64") {
-		return { toolName: "rg-linux-arm64", cachedName: "rg", displayName: "ripgrep" };
-	}
-	if (process.platform === "linux") {
-		return { toolName: "rg-linux-x64", cachedName: "rg", displayName: "ripgrep" };
-	}
-	if (process.platform === "darwin" && process.arch === "arm64") {
-		return { toolName: "rg-darwin-arm64", cachedName: "rg", displayName: "ripgrep" };
-	}
-	if (process.platform === "darwin") {
-		return { toolName: "rg-darwin-x64", cachedName: "rg", displayName: "ripgrep" };
-	}
-	return null;
+function getRipgrepHelperSpec() {
+	return getCliHelperSpec("rg");
 }
 
 function findCachedRg(): string | null {
 	const spec = getRipgrepHelperSpec();
-	const cached = spec ? getCachedHelperBinaryPath(spec.cachedName) : null;
+	const cached = spec ? getCachedHelperBinaryPath(spec.cachedName, spec.windowsArch) : null;
 	return cached && verifyRg(cached) ? cached : null;
 }
 
@@ -81,7 +63,7 @@ export function findRgSync(): string | null {
 			`${process.env.USERPROFILE ?? ""}\\.cargo\\bin\\rg.exe`,
 		];
 		for (const p of winPaths) {
-			if (p && existsSync(p)) return p;
+			if (p && existsSync(p) && isNativeCliHelper(p)) return p;
 		}
 
 		// 2. WinGet packages (dynamic folder name).
@@ -90,7 +72,7 @@ export function findRgSync(): string | null {
 
 		// 3. Ask the OS to find it on PATH.
 		const which = Bun.which("rg");
-		if (which) return which;
+		if (which && isNativeCliHelper(which)) return which;
 
 		// 4. Use NarraFork-managed helper binary if already cached.
 		return findCachedRg();
@@ -107,7 +89,7 @@ export function findRgSync(): string | null {
 	}
 
 	const which = Bun.which("rg");
-	if (which) return which;
+	if (which && isNativeCliHelper(which)) return which;
 
 	return findCachedRg();
 }

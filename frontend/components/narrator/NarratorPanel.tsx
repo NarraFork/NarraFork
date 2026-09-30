@@ -1696,17 +1696,19 @@ export function NarratorPanel({
 	 * the blue-toned neutral from the status registry so they read as "the system is
 	 * waiting", not "you need to do something".
 	 */
-	const workIndicatorColor = isRetrying
-		? "yellow"
-		: isBlockingCompacting || (isBackgroundCompacting && !isWorking)
-			? "orange"
-			: isWaitingForRecovery
-				? modelUnavailableColor
-				: isWaiting
-					? "yellow"
-					: isPlanning
-						? "green"
-						: "blue";
+	const workIndicatorColor = substatus.includes("reflecting")
+		? statusRegistry.narratorSubstatus("reflecting").color
+		: isRetrying
+			? "yellow"
+			: isBlockingCompacting || (isBackgroundCompacting && !isWorking)
+				? "orange"
+				: isWaitingForRecovery
+					? modelUnavailableColor
+					: isWaiting
+						? "yellow"
+						: isPlanning
+							? "green"
+							: "blue";
 
 	// --- Turn elapsed timer ---
 	// Hooks must stay above the `if (!narrator) return` early exit below.
@@ -2737,6 +2739,7 @@ export function NarratorPanel({
 	 * twice. See planNarratorWorkIndicator for the invariant.
 	 */
 	const workIndicatorPlan = planNarratorWorkIndicator({
+		isReflecting: substatus.includes("reflecting"),
 		isRetrying,
 		isBlockingCompacting,
 		isBackgroundCompacting,

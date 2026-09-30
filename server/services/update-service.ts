@@ -22,6 +22,7 @@ import { inArray } from "drizzle-orm";
 import { db } from "../db";
 import { narratorToolCalls } from "../db/schema";
 import { downloadHelperBinary, getHelperBinaryServerBaseUrl } from "../lib/helper-binaries";
+import { getCliHelperSpec, isNativeCliHelper } from "../lib/helper-binary-platform";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
@@ -101,7 +102,9 @@ async function zstdCliResponds(binary: string): Promise<boolean> {
  * is bypassed so a previous network timeout does not short-circuit the attempt.
  */
 async function getZstdCliPath(forceDownload = false): Promise<string | null> {
-	if (await zstdCliResponds("zstd")) return "zstd";
+	// Resolving first lets ARM64 reject an emulated x64 PATH executable.
+	const system = Bun.which("zstd");
+	if (system && isNativeCliHelper(system) && (await zstdCliResponds(system))) return system;
 
 	if (process.platform === "darwin") {
 		// No prebuilt helper binary is published for macOS, and installing one from a request
@@ -109,25 +112,9 @@ async function getZstdCliPath(forceDownload = false): Promise<string | null> {
 		return null;
 	}
 
-	let toolName: string;
-	let cachedName: string;
-	if (process.platform === "win32") {
-		toolName = "zstd-win64.exe";
-		cachedName = "zstd.exe";
-	} else if (process.platform === "linux" && process.arch === "arm64") {
-		toolName = "zstd-linux-arm64";
-		cachedName = "zstd";
-	} else if (process.platform === "linux") {
-		toolName = "zstd-linux-x64";
-		cachedName = "zstd";
-	} else {
-		return null;
-	}
-
-	return downloadHelperBinary(
-		{ toolName, cachedName, displayName: "zstd CLI" },
-		{ bypassFailureCache: forceDownload },
-	);
+	const spec = getCliHelperSpec("zstd");
+	if (!spec) return null;
+	return downloadHelperBinary(spec, { bypassFailureCache: forceDownload });
 }
 
 export interface ReleaseInfo {

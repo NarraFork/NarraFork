@@ -8,6 +8,7 @@
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { isWindowsPeFile, matchesWindowsPeArch, type WindowsPeArch } from "../../shared/windows-pe";
 import { logger } from "./logger";
 import { narraforkDir, settings } from "./settings";
 
@@ -29,6 +30,8 @@ export interface HelperBinarySpec {
 	displayName: string;
 	/** Optional trusted SHA-256 digest for integrity verification. */
 	expectedSha256?: string;
+	/** Required PE machine for Windows CLI helpers (cache and download). */
+	windowsArch?: WindowsPeArch;
 }
 
 /** Build the base URL for the update server (strips trailing slash). */
@@ -38,9 +41,13 @@ export function getHelperBinaryServerBaseUrl(): string {
 }
 
 /** Return a cached helper binary path if it exists, ensuring it is executable. */
-export function getCachedHelperBinaryPath(cachedName: string): string | null {
+export function getCachedHelperBinaryPath(
+	cachedName: string,
+	windowsArch?: WindowsPeArch,
+): string | null {
 	const cached = join(HELPER_BIN_DIR, cachedName);
 	if (!existsSync(cached)) return null;
+	if (windowsArch && !isWindowsPeFile(cached, windowsArch)) return null;
 	try {
 		chmodSync(cached, 0o755);
 	} catch {
@@ -91,7 +98,7 @@ export async function downloadHelperBinary(
 	options: DownloadHelperBinaryOptions = {},
 ): Promise<string | null> {
 	if (options.useCache !== false) {
-		const cached = getCachedHelperBinaryPath(spec.cachedName);
+		const cached = getCachedHelperBinaryPath(spec.cachedName, spec.windowsArch);
 		if (cached) return cached;
 	}
 
@@ -146,7 +153,22 @@ export async function downloadHelperBinary(
 			return null;
 		}
 
-		const buf = Buffer.from(await resp.arrayBuffer());
+		const reader = resp.body?.getReader();
+		if (!reader) throw new Error("Helper download has no body");
+		const chunks: Uint8Array[] = [];
+		let bytes = 0;
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				bytes += value.byteLength;
+				if (bytes > maxBytes) throw new Error("Helper download exceeded size limit");
+				chunks.push(value);
+			}
+		} finally {
+			await reader.cancel();
+		}
+		const buf = Buffer.concat(chunks, bytes);
 		if (buf.length > maxBytes) {
 			logger.warn("Helper binary download exceeded size limit", {
 				displayName: spec.displayName,
@@ -164,6 +186,10 @@ export async function downloadHelperBinary(
 			});
 			rememberDownloadFailure(cacheKey);
 			return null;
+		}
+
+		if (spec.windowsArch && !matchesWindowsPeArch(buf, spec.windowsArch)) {
+			throw new Error(`Helper PE architecture mismatch: expected ${spec.windowsArch}`);
 		}
 
 		mkdirSync(HELPER_BIN_DIR, { recursive: true });

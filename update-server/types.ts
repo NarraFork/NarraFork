@@ -10,7 +10,8 @@ export type Platform =
 	| "linux-x64-baseline"
 	| "linux-arm64"
 	| "win-x64"
-	| "win-x64-baseline";
+	| "win-x64-baseline"
+	| "win-arm64";
 
 /** Release channel */
 export type Channel = "stable" | "beta";

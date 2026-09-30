@@ -39,7 +39,7 @@
         "@xyflow/react": "^12.10.2",
         "archiver": "^7.0.1",
         "broad-infinite-list": "^1.4.1",
-        "bun-pty": "^0.4.8",
+        "bun-pty": "0.4.11",
         "chardet": "^2.1.1",
         "croner": "^10.0.1",
         "dayjs": "^1.11.21",
@@ -1010,7 +1010,7 @@
 
     "buffer-from": ["buffer-from@1.1.2", "https://registry.npmmirror.com/buffer-from/-/buffer-from-1.1.2.tgz", {}, "sha512-E+XQCRwSbaaiChtv6k6Dwgc+bx+Bs6vuKJHHl5kox/BaKbhiXzqQOwK4cO22yElGp2OCmjwVhT3HmxgyPGnJfQ=="],
 
-    "bun-pty": ["bun-pty@0.4.8", "https://registry.npmmirror.com/bun-pty/-/bun-pty-0.4.8.tgz", {}, "sha512-rO70Mrbr13+jxHHHu2YBkk2pNqrJE5cJn29WE++PUr+GFA0hq/VgtQPZANJ8dJo6d7XImvBk37Innt8GM7O28w=="],
+    "bun-pty": ["bun-pty@0.4.11", "", {}, "sha512-DpBfXCoWbcDziqL4gT3sFw/O6vfe2Gm1LmsnjfGjpqNhmsPjBcVorTrRv7OVATsy88PiXfn486vp0w4x3/Q84g=="],
 
     "bun-types": ["bun-types@1.4.2", "", { "dependencies": { "@types/node": "*" } }, "sha512-bxV1FgK7yBIzjRe5zBozIM4Bem11ZJcCXSrjWRG3YWLt8yFDePu4cLjpebO8OvPeIE9trbyPF4fuj3Cia4Fj3w=="],
 

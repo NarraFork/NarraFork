@@ -20,10 +20,11 @@ import {
 	useComputedColorScheme,
 } from "@mantine/core";
 import { IconGripVertical, IconPlus, IconX } from "@tabler/icons-react";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useTerminalCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
+import { attachTabStripWheel } from "./tab-strip-wheel";
 
 interface Tab {
 	id: string;
@@ -215,6 +216,14 @@ export function TerminalTabBar({
 	const terminalCapability = useTerminalCapability();
 	const processTreeSupported = terminalCapability.processTree?.supported !== false;
 	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+	const scrollRef = useRef<HTMLDivElement>(null);
+
+	// Vertical wheel pans overflowing tabs horizontally without needing Shift.
+	useEffect(() => {
+		const el = scrollRef.current;
+		if (!el) return;
+		return attachTabStripWheel(el);
+	}, []);
 
 	const handleDragEnd = useCallback(
 		(event: DragEndEvent) => {
@@ -234,6 +243,7 @@ export function TerminalTabBar({
 	return (
 		<Group gap={0} wrap="nowrap" style={{ overflow: "hidden", flex: 1, minWidth: 0 }}>
 			<div
+				ref={scrollRef}
 				style={{
 					display: "flex",
 					overflowX: "auto",

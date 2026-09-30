@@ -41,6 +41,7 @@ const WORK_INDICATOR_FLAGS = [
 
 function workIndicatorInput(overrides: Partial<WorkIndicatorInput> = {}): WorkIndicatorInput {
 	return {
+		isReflecting: false,
 		isRetrying: false,
 		isBlockingCompacting: false,
 		isBackgroundCompacting: false,
@@ -68,6 +69,24 @@ function allWorkIndicatorInputs(): WorkIndicatorInput[] {
 }
 
 describe("planNarratorWorkIndicator", () => {
+	test("reflection takes precedence over waiting and task summaries", () => {
+		expect(
+			planNarratorWorkIndicator(
+				workIndicatorInput({
+					isReflecting: true,
+					isWaiting: true,
+					hasSpecTask: true,
+				}),
+			).primary,
+		).toBe("reflecting");
+		const display = getNarratorStatusBarDisplay({
+			panelNarratorId: "n",
+			narrator: { id: "n", status: "waiting" },
+			liveSubstatus: ["reflecting"],
+		});
+		expect(display.labelKey).toBe("status_reflecting");
+		expect(display.color).toBe("indigo");
+	});
 	test("a plain background compaction is reported once, in the primary slot", () => {
 		// The regression: the primary label already says "compacting in background",
 		// so appending the short suffix repeated both the phrase and the progress

@@ -45,11 +45,8 @@ export type StatusEntry = {
 	 * state it has to be told apart from, so adding one more colour could not fix
 	 * anything — two states that matter were always going to look alike.
 	 *
-	 * Shape carries the distinction instead, and colour is free to group states by what
-	 * they ASK OF THE READER rather than by identity. That is why `reflecting` is orange
-	 * like the other attention states: a running gate can be approved, rejected or taken
-	 * over by hand, so it belongs with "you can act on this" — and its shield shape is
-	 * what keeps it distinct from a plain permission prompt.
+	 * Shape carries the distinction alongside colour: reflecting uses an indigo shield
+	 * for automated self-review; yellow/orange alerts signal user attention.
 	 *
 	 * ⚠️ NOT the `icon` field above. That one holds Unicode glyphs (`◉` / `◔` / …) which
 	 * NOTHING renders — every consumer reads only `color` / `solidAccent`. Rather than
@@ -171,27 +168,9 @@ const narratorSubstatusMap: StatusMap<NarratorSubstatus> = {
 	suspended: { color: "yellow", icon: "◔", i18nKey: "status.narratorSuspended" },
 	manual_override: { color: "orange", icon: "◔", i18nKey: "status.narratorManualOverride" },
 	taken_over: { color: "grape", icon: "◉", i18nKey: "status.narratorTakenOver" },
-	/**
-	 * ORANGE + a SHIELD. Colour groups it with the other states the user can act on;
-	 * shape is what keeps it distinct from them.
-	 *
-	 * The colour history is worth keeping, because two earlier attempts were both wrong
-	 * for instructive reasons. It was grape, which `reasoning` still owns — but reasoning
-	 * is ordinary progress while a gate has PAUSED the session, so one hue for both was
-	 * misleading. Then teal, which measured only 31° from green: indistinguishable from
-	 * the success/unread colour in exactly the places they sit side by side.
-	 *
-	 * Orange is right for a reason that is not "a free slot": a running gate is
-	 * INTERACTIVE — it can be approved, rejected or taken over manually — so it belongs
-	 * with the attention family rather than with the "machine is busy" colours. The
-	 * shield then separates it from a plain permission prompt's alert.
-	 *
-	 * `solidAccent` because a reflecting narrator is genuinely OCCUPIED. The gate parks it
-	 * at `waiting` (narrator-permission.ts) — a status the sidebar's fill rule does not
-	 * cover — so without this the tab icon stayed HOLLOW, i.e. shaped exactly like idle.
-	 */
+	/** Automated self-review: distinct from yellow/orange user-attention states. */
 	reflecting: {
-		color: "orange",
+		color: "indigo",
 		icon: "◉",
 		i18nKey: "status.narratorReflecting",
 		solidAccent: true,

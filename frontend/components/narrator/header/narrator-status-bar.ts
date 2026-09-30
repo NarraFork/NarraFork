@@ -34,6 +34,7 @@ const STATUS_BAR_SUBSTATUS_PRIORITY = [
 	"interrupted",
 	"suspended",
 	"manual_override",
+	"reflecting",
 	"unread",
 ] as const;
 
@@ -71,6 +72,7 @@ export type NarratorWorkIndicatorPrimary =
 	| "quota_exhausted"
 	| "spec_task"
 	| "waiting"
+	| "reflecting"
 	| "planning"
 	| "background_compact"
 	| "thinking";
@@ -113,28 +115,31 @@ export function planNarratorWorkIndicator(input: {
 	/** Waiting for an exhausted quota window to reset. Same "machine is waiting" slot. */
 	isWaitingForQuota: boolean;
 	hasSpecTask: boolean;
+	isReflecting: boolean;
 	isWaiting: boolean;
 	isPlanning: boolean;
 	/** A compact failed and the failure has not been superseded yet. */
 	hasCompactFailure: boolean;
 }): NarratorWorkIndicatorPlan {
-	const primary: NarratorWorkIndicatorPrimary = input.isRetrying
-		? "retrying"
-		: input.isBlockingCompacting
-			? "blocking_compact"
-			: input.isWaitingForModel
-				? "model_unavailable"
-				: input.isWaitingForQuota
-					? "quota_exhausted"
-					: input.hasSpecTask
-						? "spec_task"
-						: input.isWaiting
-							? "waiting"
-							: input.isPlanning
-								? "planning"
-								: input.isBackgroundCompacting
-									? "background_compact"
-									: "thinking";
+	const primary: NarratorWorkIndicatorPrimary = input.isReflecting
+		? "reflecting"
+		: input.isRetrying
+			? "retrying"
+			: input.isBlockingCompacting
+				? "blocking_compact"
+				: input.isWaitingForModel
+					? "model_unavailable"
+					: input.isWaitingForQuota
+						? "quota_exhausted"
+						: input.hasSpecTask
+							? "spec_task"
+							: input.isWaiting
+								? "waiting"
+								: input.isPlanning
+									? "planning"
+									: input.isBackgroundCompacting
+										? "background_compact"
+										: "thinking";
 	return {
 		primary,
 		showBackgroundCompactSuffix:

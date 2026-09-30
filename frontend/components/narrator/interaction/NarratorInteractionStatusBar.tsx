@@ -343,6 +343,8 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 				return workIndicator.quotaWaitText;
 			case "spec_task":
 				return workIndicator.currentSpecTask?.text ?? t("thinking");
+			case "reflecting":
+				return t("status_reflecting");
 			case "waiting":
 				return t("status_waiting");
 			case "planning":
@@ -1111,7 +1113,13 @@ function UnstyledButtonWorkIndicator(
 			style={{ minWidth: 0, flex: 1 }}
 		>
 			<Group gap={6} wrap="nowrap">
-				<Loader size={14} color={workIndicator.color} style={{ flexShrink: 0 }} />
+				{workIndicator.plan.primary === "reflecting" ? (
+					<Box c={workIndicator.color} style={{ display: "flex", flexShrink: 0 }}>
+						<IconShield size={14} />
+					</Box>
+				) : (
+					<Loader size={14} color={workIndicator.color} style={{ flexShrink: 0 }} />
+				)}
 				{/* The current task text can be long (spec task titles especially), so
 				    reveal the full string on hover/tap when the row clips it. */}
 				<TruncatedText size="xs" c={workIndicator.color} text={workIndicatorText} />

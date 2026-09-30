@@ -259,10 +259,10 @@ describe("a reflecting narrator reads as occupied, and not as reasoning", () => 
 		expect(getEffectiveNarratorDisplay("waiting", ["reflecting"]).solidAccent).toBe(true);
 	});
 
-	test("reflecting joins the attention family by COLOUR", () => {
-		// The gate is interactive — approve / reject / take over — so it shares the orange
-		// of the other states the user can act on. Identity comes from shape, not hue.
-		expect(getEffectiveNarratorDisplay("waiting", ["reflecting"]).color).toBe("orange");
+	test("reflecting has a distinct self-review colour", () => {
+		const reflecting = getEffectiveNarratorDisplay("waiting", ["reflecting"]);
+		expect(reflecting.color).toBe("indigo");
+		expect(reflecting.color).not.toBe(getEffectiveNarratorDisplay("waiting", []).color);
 	});
 
 	test("reflecting is told apart from reasoning by SHAPE, not colour", () => {

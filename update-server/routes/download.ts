@@ -82,8 +82,10 @@ function detectPlatformFromFilename(filename: string): string | null {
 		"macos-arm64",
 		"macos-x64",
 		"windows-x64-baseline",
+		"windows-arm64",
 		"windows-x64",
 		"win-x64-baseline",
+		"win-arm64",
 		"win-x64",
 	];
 

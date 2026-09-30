@@ -170,6 +170,8 @@ describe("platform suffix resolution", () => {
 	test("matches build-script platform names with and without .exe", () => {
 		expect([...resolvePlatformSuffixes("windows-x64").keys()]).toEqual(["win-x64"]);
 		expect([...resolvePlatformSuffixes("windows-x64.exe").keys()]).toEqual(["win-x64"]);
+		expect([...resolvePlatformSuffixes("windows-arm64").keys()]).toEqual(["win-arm64"]);
+		expect([...resolvePlatformSuffixes("windows-arm64.exe").keys()]).toEqual(["win-arm64"]);
 		expect([...resolvePlatformSuffixes("linux-x64").keys()]).toEqual(["linux-x64"]);
 		expect([...resolvePlatformSuffixes("nope").keys()]).toEqual([]);
 	});

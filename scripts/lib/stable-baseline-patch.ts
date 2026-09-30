@@ -28,6 +28,7 @@ export const RELEASE_PLATFORM_SUFFIXES: Record<string, string> = {
 	"darwin-x64": "macos-x64",
 	"win-x64": "windows-x64.exe",
 	"win-x64-baseline": "windows-x64-baseline.exe",
+	"win-arm64": "windows-arm64.exe",
 };
 
 /**

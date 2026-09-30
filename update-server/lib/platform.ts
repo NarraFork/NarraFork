@@ -11,6 +11,7 @@ export const VALID_PLATFORMS: Platform[] = [
 	"linux-arm64",
 	"win-x64",
 	"win-x64-baseline",
+	"win-arm64",
 ];
 
 export function isValidPlatform(value: string): value is Platform {
