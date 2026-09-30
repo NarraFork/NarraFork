@@ -60,6 +60,7 @@ import { db } from "../db";
 import { chapters, worktreeTreeSnapshots } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { AsyncMutex } from "../lib/async-mutex";
+import { canWriteOptionalDiskData, DiskSpaceError, guardDiskWrite } from "../lib/disk-safety";
 import {
 	type GitTreeMergeResult,
 	mergeGitTrees,
@@ -1762,6 +1763,10 @@ async function captureUnlocked(
 	opts?: { gitTimeoutMs?: number; signal?: AbortSignal },
 ): Promise<string> {
 	opts?.signal?.throwIfAborted();
+	// Do not amplify a low-space condition with git objects/indexes or capture receipts.
+	// tryCapture/tryCaptureHot already degrade this failure to a missing boundary.
+	if (!(await canWriteOptionalDiskData(dir))) throw new DiskSpaceError(dir);
+	await guardDiskWrite(dir);
 	// One receipt per real scan, inside the shadow lock, never per hash/caller.
 	// This observer acquires no workspace lock and cannot authorize a restore.
 	const receipts = snapshotCaptureReceipts();
@@ -2512,9 +2517,14 @@ export const worktreeTreeSnapshot = {
 		const warmupGitTimeoutMs = opts?.warmupGitTimeoutMs ?? WARMUP_GIT_TIMEOUT_MS;
 		const cooldownMs = opts?.cooldownMs ?? WARMUP_FAILURE_COOLDOWN_MS;
 		const minStartedAt = opts?.minStartedAt;
+		const deadline = Date.now() + budgetMs;
 		try {
 			assertLocal(deviceId);
 			const dir = shadowDir(deviceId, worktreePath);
+			// Low space is recoverable on the disk-cache TTL, not the 15-minute warmup
+			// failure cooldown. Refuse before launching a scan or creating a receipt.
+			if (!(await raceBudget(canWriteOptionalDiskData(dir), Math.max(0, deadline - Date.now()))))
+				return null;
 
 			const cooldownUntil = warmupCooldownUntil.get(dir);
 			if (cooldownUntil !== undefined) {
@@ -2522,8 +2532,7 @@ export const worktreeTreeSnapshot = {
 				warmupCooldownUntil.delete(dir);
 			}
 
-			const deadline = Date.now() + budgetMs;
-			let remainingMs = budgetMs;
+			let remainingMs = Math.max(0, deadline - Date.now());
 			for (;;) {
 				const inFlight = warmupInFlight.get(dir);
 				if (!inFlight) break;

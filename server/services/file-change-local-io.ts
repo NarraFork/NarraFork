@@ -3,6 +3,7 @@ import { lstat, mkdir, open } from "node:fs/promises";
 import { dirname } from "node:path";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
+import { guardDiskWrite } from "../lib/disk-safety";
 import type { FileChangeDiagnostics } from "./file-change-diagnostics";
 
 export interface LocalFileObservation {
@@ -258,6 +259,9 @@ export function createFileChangeLocalIo(
 				if (nextBytes.byteLength > FILE_CHANGE_LIMITS.blobBytes)
 					throw new LocalFileValidationError("Output exceeds the 32 MiB evidence limit");
 				await input.assertTarget();
+				// Before mkdir/create/truncate: keep the WAL/result reserve and charge the
+				// entire new content (not just growth; rewrites can allocate fresh blocks).
+				await guardDiskWrite(canonicalPath, nextBytes.byteLength);
 				signal.throwIfAborted();
 				input.diagnostics?.enter("io_read_before");
 				if (!equal(before, await this.read(canonicalPath, signal)))

@@ -12,6 +12,7 @@ import { logger } from "../logger";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
 import { assertSpecPath, assertToolSpecPaths, toolSpecPathError } from "../spec-uri";
+import { checkToolDiskSafety, diskToolError, normalizeDiskToolResult } from "./disk-safety";
 import type { ExecutionBackend } from "./execution/backend";
 import { LOCAL_DEVICE_ID } from "./execution/backend";
 import { targetPathSemantics, toolBaseCwd } from "./execution/path-resolve";
@@ -1329,6 +1330,9 @@ export async function executeTool(
 
 		try {
 			config.signal.throwIfAborted();
+			// Not an observer: denial must happen before snapshots and durable execution claims.
+			const diskCheck = await checkToolDiskSafety(tu.name, effectiveInput, ctx);
+			config.signal.throwIfAborted();
 			const lifecycle = {
 				toolUse: tu,
 				effectiveInput,
@@ -1385,7 +1389,12 @@ export async function executeTool(
 						onEvent({ type: "tool_progress", toolUseId: tu.toolUseId, elapsed });
 					}, PROGRESS_INTERVAL_MS);
 				}
-				result = await tool.execute(effectiveInput, ctx);
+				result = normalizeDiskToolResult(
+					await tool.execute(effectiveInput, ctx),
+					ctx.executionTarget?.canonicalPath ?? ctx.cwd,
+					ctx.locale,
+				);
+				result.output += diskCheck.notice;
 			} catch (error) {
 				executionError = error;
 				throw error;
@@ -1492,8 +1501,15 @@ export async function executeTool(
 		} catch (err) {
 			// A failed durable claim must still reject (not become a normal tool result).
 			if (claimingExecution) throw err;
+			const diskError = diskToolError(
+				err,
+				ctx.executionTarget?.canonicalPath ?? ctx.cwd,
+				ctx.locale,
+			);
 			return {
-				output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
+				output:
+					diskError?.output ?? `Tool error: ${err instanceof Error ? err.message : String(err)}`,
+				fatal: diskError?.fatal,
 				isError: true,
 				durationMs: Date.now() - start,
 				permissionStartedAt,
@@ -1502,7 +1518,7 @@ export async function executeTool(
 				updatedInput: redirectedInput,
 				pipelineExitConfirmation,
 				pipelineExitConfirmationStateId,
-				metadata: executionTargetMetadata(frozenExecution?.target),
+				metadata: executionTargetMetadata(frozenExecution?.target, diskError?.metadata),
 			};
 		} finally {
 			if (!updateLeaseTransferred) updateExecutionLease.release();

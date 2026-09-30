@@ -14,6 +14,20 @@ import { commandSchema, localeSchema } from "./common";
 /** Repair only the configured directory, after explicit administrator confirmation. */
 export const dataDirectoryRepairSchema = z.object({ confirmed: z.literal(true) }).strict();
 
+export const diskSafetySettingsSchema = z
+	.object({
+		mode: z.enum(["enforce", "warn", "off"]),
+		warningFreeMb: z.number().min(0).max(1_000_000),
+		warningFreePercent: z.number().min(0).max(100),
+		blockFreeMb: z.number().min(0).max(1_000_000),
+		criticalFreeMb: z.number().min(0).max(1_000_000),
+		reserveMb: z.number().min(0).max(1_000_000),
+		checkIntervalMs: z.number().int().min(1000).max(300_000),
+		pathCacheTtlMs: z.number().int().min(1000).max(600_000),
+		probeTimeoutMs: z.number().int().min(50).max(2000),
+	})
+	.partial();
+
 export const defaultNarratorVisibilitySchema = z.enum(["auto", "private", "public"]);
 export const defaultNarratorWriteAudienceSchema = z.enum(["auto", "owner", "project", "public"]);
 

@@ -69,6 +69,7 @@ import {
 import {
 	defaultNarratorVisibilitySchema,
 	defaultNarratorWriteAudienceSchema,
+	diskSafetySettingsSchema,
 } from "../lib/validators/settings";
 import { subagentModelReasoningEffortsSchema } from "../lib/validators/subagent-models";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
@@ -349,6 +350,7 @@ export const updateSettingsSchema = z
 				}
 			})
 			.optional(),
+		diskSafety: diskSafetySettingsSchema.optional(),
 		paths: z
 			.object({
 				defaultProjectDir: z.string().min(1),

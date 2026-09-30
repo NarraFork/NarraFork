@@ -6,6 +6,7 @@ import { db } from "./db";
 import { users } from "./db/schema";
 import { buildAppErrorResponse, toErrorPayload } from "./lib/app-error-response";
 import { normalizeConfiguredOrigins, resolveAllowedCorsOrigin } from "./lib/cors-origin";
+import { DiskSpaceError, isDiskFullError } from "./lib/disk-safety";
 import { catalogError } from "./lib/errors";
 import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
@@ -426,7 +427,10 @@ app.route("/api/projects", volumeSnapshotRoutes);
 app.route("/api/volume-snapshots", volumeSnapshotRoutes);
 
 app.onError((err, c) => {
-	const knownErrorResponse = buildAppErrorResponse(err, c);
+	const storageError = isDiskFullError(err)
+		? new DiskSpaceError("request storage", null, undefined, true)
+		: err;
+	const knownErrorResponse = buildAppErrorResponse(storageError, c);
 	if (knownErrorResponse) return knownErrorResponse;
 	logger.error("Unhandled error", { error: String(err), stack: (err as Error).stack });
 	// The message stays deliberately generic (an unhandled error may quote internals), but it
