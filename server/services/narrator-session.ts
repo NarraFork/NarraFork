@@ -4519,9 +4519,9 @@ async function retryLastMessageUnlocked(
 		});
 	}
 
-	// Only verified empty records are history-only cleanup. Other trailing rows
-	// (including system/subagent traffic) still require the ordinary revert path.
-	// Publish each removal immediately: a later protected range can refuse deletion.
+	// Retry is not consent to roll back files. In particular, history-only rollback
+	// leaves hidden file checkpoints after this user message; they must stay intact.
+	// Publish each empty-placeholder removal immediately: later history cleanup can fail.
 	for (const messageId of resolved.emptyAssistantIds) {
 		if (await narratorService.deleteEmptyRetryPlaceholder(narratorId, messageId)) {
 			broadcastToNarrator(narratorId, {
@@ -4531,7 +4531,9 @@ async function retryLastMessageUnlocked(
 			});
 		}
 	}
-	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, lastMsg.id);
+	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, lastMsg.id, {
+		skipRevert: true,
+	});
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {
 			type: "messages_deleted",

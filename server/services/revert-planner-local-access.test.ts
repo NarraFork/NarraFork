@@ -43,6 +43,7 @@ import {
 	type LocalFileChangeRuntime,
 	localFileChangeRuntimeBinding,
 } from "./file-change-runtime";
+import { narratorService } from "./narrator-service";
 import * as narratorState from "./narrator-session-state";
 import type { RevertPlanFileMetadata, RevertPlanSummary } from "./revert-plan-service";
 import { RevertPlannerLocalAccess } from "./revert-planner-local-access";
@@ -914,6 +915,68 @@ describe("action-bound HTTP preview and real local execution", () => {
 		expect(messageRow(boundary)).toEqual(boundaryRow);
 		expect(messageRow(first.messageId)).toBeUndefined();
 		expect(messageRow(second.messageId)).toBeUndefined();
+	});
+	test("history-only retry preparation preserves hidden checkpoints for explicit file revert", async () => {
+		const boundary = message("user", [{ type: "text", text: "change this file" }]);
+		const path = join(workspace, "retry-checkpoints.txt");
+		const original = Buffer.from("original 中文\nsecond line\n", "utf8");
+		await writeFile(path, original);
+		const written = await write(path, "written 中文\nsecond line\n");
+		const edited = await edit(path, "second line", "edited line");
+		const changed = await readFile(path);
+		expect(changed.equals(original)).toBe(false);
+		expect(effects()).toHaveLength(2);
+
+		await narratorService.deleteMessagesAfter(narratorId, boundary, { skipRevert: true });
+		expect(await readFile(path)).toEqual(changed);
+		expect(messageRow(written.messageId)).toBeUndefined();
+		expect(messageRow(edited.messageId)).toBeUndefined();
+		const checkpointRefs = messageRefs().filter((ref) => ref.segmentCompactId !== null);
+		expect(checkpointRefs).toHaveLength(2);
+		const checkpoints = checkpointRefs.map((ref) => messageRow(ref.messageId));
+		for (const checkpoint of checkpoints) {
+			expect(checkpoint).toMatchObject({
+				role: "disp",
+				contentJson: [{ type: "file_history_checkpoint" }],
+			});
+		}
+		const checkpointTools = () =>
+			db
+				.select()
+				.from(schema.narratorToolCalls)
+				.where(eq(schema.narratorToolCalls.narratorId, narratorId))
+				.orderBy(schema.narratorToolCalls.id)
+				.limit(100)
+				.all();
+		const preservedTools = checkpointTools();
+		expect(preservedTools).toHaveLength(2);
+		expect(preservedTools.every((tool) => tool.isFileHistoryCheckpoint)).toBe(true);
+		expect(preservedTools.map((tool) => tool.executionOriginToolCallId).sort()).toEqual(
+			[written.toolCallId, edited.toolCallId].sort(),
+		);
+
+		// Real retry preparation is a second history-only cleanup, not a new run.
+		message("assistant", [{ type: "text", text: "failed response to discard" }]);
+		await narratorService.deleteMessagesAfter(narratorId, boundary, { skipRevert: true });
+		expect(await readFile(path)).toEqual(changed);
+		expect(messageRefs().filter((ref) => ref.segmentCompactId !== null)).toEqual(checkpointRefs);
+		expect(checkpointRefs.map((ref) => messageRow(ref.messageId))).toEqual(checkpoints);
+		expect(checkpointTools()).toEqual(preservedTools);
+		expect(
+			messageRefs()
+				.filter((ref) => ref.segmentCompactId === null)
+				.map((ref) => ref.messageId),
+		).toEqual([boundary]);
+
+		// The deleted tool messages are not valid UI boundaries; the retained user is.
+		const beforeExplicitRevert = history();
+		const plan = await actionPrepared("revert_files", boundary, {
+			idempotencyKey: "explicit-revert-after-history-only-retry",
+		});
+		expect(await readFile(path)).toEqual(changed);
+		await committed(plan, "revert_files");
+		expect(await readFile(path)).toEqual(original);
+		expect(history()).toBe(beforeExplicitRevert);
 	});
 	test("revert_files message boundary includes later tools but leaves earlier writes and all history", async () => {
 		const path = join(workspace, "from-message.txt");
