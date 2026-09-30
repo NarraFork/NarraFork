@@ -6,6 +6,12 @@ import { localeSchema } from "./common";
 const runContextEnum = z.enum(["standalone", "chapter"]);
 const narratorModeEnum = z.enum(["new", "reuse"]);
 
+export const scheduledTaskCleanupPolicySchema = z.discriminatedUnion("mode", [
+	z.object({ mode: z.literal("none") }),
+	z.object({ mode: z.literal("keepLatestN"), keepLatestN: z.number().int().min(1).max(1000) }),
+	z.object({ mode: z.literal("olderThanDays"), olderThanDays: z.number().int().min(1).max(3650) }),
+]);
+
 const baseFields = {
 	name: z.string().min(1).max(200),
 	cronExpr: z.string().min(1).max(200),
@@ -20,6 +26,7 @@ const baseFields = {
 	projectId: z.string().max(100).optional().nullable(),
 	chapterId: z.string().max(100).optional().nullable(),
 	narratorMode: narratorModeEnum.optional(),
+	cleanupPolicy: scheduledTaskCleanupPolicySchema.optional(),
 	enabled: z.boolean().optional(),
 };
 

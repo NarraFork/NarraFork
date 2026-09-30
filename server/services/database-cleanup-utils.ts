@@ -53,9 +53,14 @@ export interface CleanupPlanBlockedRoot {
 	blockingStatus: string;
 }
 
+type NarratorCleanupTarget =
+	| Exclude<DatabaseCleanupTarget, "apiRequestDumps">
+	| "scheduledSessions";
+
 export interface BuildNarratorCleanupPlanOptions {
 	staleCutoffIso?: string;
 	runningTerminalIds?: Set<string>;
+	rootNarratorIds?: Set<string>;
 }
 
 export interface NarratorCleanupPlan {
@@ -74,7 +79,7 @@ interface EligibilityResult {
 }
 
 function getEligibilityResult(
-	target: Exclude<DatabaseCleanupTarget, "apiRequestDumps">,
+	target: NarratorCleanupTarget,
 	narrator: NarratorCleanupRecord,
 	ctx: EligibilityContext,
 ): EligibilityResult {
@@ -90,7 +95,10 @@ function getEligibilityResult(
 	if (target === "archivedSessions") {
 		return narrator.status === "archived" ? { ok: true } : { ok: false, reasonCode: "nonArchived" };
 	}
-	if (!STALE_SESSION_STATUSES.has(narrator.status)) {
+	if (
+		!STALE_SESSION_STATUSES.has(narrator.status) &&
+		!(target === "scheduledSessions" && narrator.status === "archived")
+	) {
 		return { ok: false, reasonCode: "nonStaleStatus" };
 	}
 	if (ctx.staleCutoffIso && getNarratorLastActivityAt(narrator) > ctx.staleCutoffIso) {
@@ -147,11 +155,10 @@ function hasSelectedAncestor(
 	return false;
 }
 
-function isRootCandidate(
-	target: Exclude<DatabaseCleanupTarget, "apiRequestDumps">,
-	narrator: NarratorCleanupRecord,
-): boolean {
+function isRootCandidate(target: NarratorCleanupTarget, narrator: NarratorCleanupRecord): boolean {
 	if (narrator.variant !== "primary") return false;
+	// Task cleanup reports chapter/running roots as blocked, rather than hiding them.
+	if (target === "scheduledSessions") return true;
 	if (narrator.chapterId !== null) return false;
 	if (target === "archivedSessions") {
 		return narrator.status === "archived";
@@ -164,7 +171,7 @@ export function getNarratorLastActivityAt(narrator: NarratorCleanupRecord): stri
 }
 
 export function buildNarratorCleanupPlan(
-	target: Exclude<DatabaseCleanupTarget, "apiRequestDumps">,
+	target: NarratorCleanupTarget,
 	narrators: NarratorCleanupRecord[],
 	options: BuildNarratorCleanupPlanOptions = {},
 ): NarratorCleanupPlan {
@@ -186,6 +193,7 @@ export function buildNarratorCleanupPlan(
 
 	for (const narrator of narrators) {
 		if (!isRootCandidate(target, narrator)) continue;
+		if (options.rootNarratorIds && !options.rootNarratorIds.has(narrator.id)) continue;
 		const subtree = collectSubtree(narrator, childrenMap);
 		const blockingNarrator = subtree.find((item) => !getEligibilityResult(target, item, ctx).ok);
 		if (blockingNarrator) {

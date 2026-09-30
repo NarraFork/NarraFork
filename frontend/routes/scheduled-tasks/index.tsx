@@ -24,6 +24,7 @@ import { useDisclosure } from "@mantine/hooks";
 import { LOCALE_OPTIONS, type Locale } from "@shared/i18n-locales";
 import {
 	IconAlertTriangle,
+	IconBrush,
 	IconChevronRight,
 	IconClock,
 	IconFolder,
@@ -42,6 +43,7 @@ import { useChapters } from "../../hooks/useChapters";
 import { useAllModels } from "../../hooks/useModels";
 import { useProjects } from "../../hooks/useProjects";
 import {
+	useCleanupScheduledTask,
 	useCreateScheduledTask,
 	useDeleteScheduledTask,
 	useRunScheduledTask,
@@ -78,6 +80,8 @@ interface TaskDraft {
 	projectId: string;
 	chapterId: string;
 	narratorMode: "new" | "reuse";
+	cleanupMode: "none" | "keepLatestN" | "olderThanDays";
+	cleanupValue: number;
 	enabled: boolean;
 	timezone: string;
 }
@@ -94,6 +98,8 @@ const EMPTY_DRAFT: TaskDraft = {
 	projectId: "",
 	chapterId: "",
 	narratorMode: "new",
+	cleanupMode: "none",
+	cleanupValue: 20,
 	enabled: true,
 	timezone: "",
 };
@@ -111,6 +117,13 @@ function draftFromTask(task: ScheduledTask): TaskDraft {
 		projectId: task.projectId ?? "",
 		chapterId: task.chapterId ?? "",
 		narratorMode: task.narratorMode,
+		cleanupMode: task.cleanupPolicy?.mode ?? "none",
+		cleanupValue:
+			task.cleanupPolicy?.mode === "keepLatestN"
+				? task.cleanupPolicy.keepLatestN
+				: task.cleanupPolicy?.mode === "olderThanDays"
+					? task.cleanupPolicy.olderThanDays
+					: 20,
 		enabled: task.enabled,
 		timezone: task.timezone ?? "",
 	};
@@ -127,6 +140,8 @@ function ScheduledTasksPage() {
 	const toggleMutation = useToggleScheduledTask();
 	const runMutation = useRunScheduledTask();
 	const deleteMutation = useDeleteScheduledTask();
+	const cleanupMutation = useCleanupScheduledTask();
+	const [cleanupTask, setCleanupTask] = useState<ScheduledTask | null>(null);
 
 	const [editOpened, { open: openEdit, close: closeEdit }] = useDisclosure(false);
 	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
@@ -170,6 +185,12 @@ function ScheduledTasksPage() {
 			projectId: isChapter ? draft.projectId || null : null,
 			chapterId: isChapter ? draft.chapterId || null : null,
 			narratorMode: draft.narratorMode,
+			cleanupPolicy:
+				draft.cleanupMode === "none"
+					? { mode: "none" }
+					: draft.cleanupMode === "keepLatestN"
+						? { mode: "keepLatestN", keepLatestN: draft.cleanupValue }
+						: { mode: "olderThanDays", olderThanDays: draft.cleanupValue },
 			enabled: draft.enabled,
 		};
 	}, [draft, cronExpr]);
@@ -232,6 +253,10 @@ function ScheduledTasksPage() {
 							}}
 							onToggle={(enabled) => toggleMutation.mutate({ id: task.id, enabled })}
 							onRun={() => runMutation.mutate(task.id)}
+							onCleanup={() => {
+								cleanupMutation.reset();
+								setCleanupTask(task);
+							}}
 							onDetails={() =>
 								navigate({ to: "/scheduled-tasks/$taskId", params: { taskId: task.id } })
 							}
@@ -243,6 +268,37 @@ function ScheduledTasksPage() {
 					))}
 				</Stack>
 			)}
+
+			<Modal
+				opened={!!cleanupTask}
+				onClose={() => setCleanupTask(null)}
+				title={t("cleanupNow")}
+				centered
+			>
+				<Stack>
+					<Alert color="orange">{t("cleanupWarning")}</Alert>
+					<Text size="sm">{t("cleanupConfirm", { name: cleanupTask?.name })}</Text>
+					{cleanupTask?.cleanupPolicy?.mode === "none" && (
+						<Text size="sm">{t("cleanupDisabled")}</Text>
+					)}
+					{cleanupMutation.data && (
+						<Text size="sm">{t("cleanupResult", { ...cleanupMutation.data })}</Text>
+					)}
+					{cleanupMutation.error && (
+						<Text c="red" size="sm">
+							{cleanupMutation.error.message}
+						</Text>
+					)}
+					<Button
+						color="orange"
+						loading={cleanupMutation.isPending}
+						disabled={!cleanupTask || cleanupTask.cleanupPolicy?.mode === "none"}
+						onClick={() => cleanupTask && cleanupMutation.mutate(cleanupTask.id)}
+					>
+						{t("cleanupNow")}
+					</Button>
+				</Stack>
+			</Modal>
 
 			<TaskFormModal
 				opened={editOpened}
@@ -287,6 +343,7 @@ function TaskRow({
 	onDelete,
 	onToggle,
 	onRun,
+	onCleanup,
 	onDetails,
 	onOpenNarrator,
 	running,
@@ -296,6 +353,7 @@ function TaskRow({
 	onDelete: () => void;
 	onToggle: (enabled: boolean) => void;
 	onRun: () => void;
+	onCleanup: () => void;
 	onDetails: () => void;
 	onOpenNarrator: (narratorId: string) => void;
 	running: boolean;
@@ -411,6 +469,16 @@ function TaskRow({
 					<Tooltip label={t("runNow")}>
 						<ActionIcon variant="subtle" onClick={onRun} loading={running} aria-label={t("runNow")}>
 							<IconPlayerPlay size={16} />
+						</ActionIcon>
+					</Tooltip>
+					<Tooltip label={t("cleanupNow")}>
+						<ActionIcon
+							variant="subtle"
+							color="orange"
+							onClick={onCleanup}
+							aria-label={t("cleanupNow")}
+						>
+							<IconBrush size={16} />
 						</ActionIcon>
 					</Tooltip>
 					<Tooltip label={t("edit")}>
@@ -690,6 +758,33 @@ function TaskFormModal({
 						onChange={(v) => patch({ locale: (v as TaskDraft["locale"]) ?? "en" })}
 					/>
 				</Group>
+
+				<Stack gap="xs">
+					<Select
+						label={t("cleanupPolicy")}
+						value={draft.cleanupMode}
+						data={[
+							{ value: "none", label: t("cleanupNone") },
+							{ value: "keepLatestN", label: t("cleanupKeepLatestN") },
+							{ value: "olderThanDays", label: t("cleanupOlderThanDays") },
+						]}
+						onChange={(v) => patch({ cleanupMode: (v as TaskDraft["cleanupMode"]) ?? "none" })}
+					/>
+					{draft.cleanupMode !== "none" && (
+						<NumberInput
+							label={t(draft.cleanupMode === "keepLatestN" ? "cleanupKeepCount" : "cleanupDays")}
+							value={draft.cleanupValue}
+							min={1}
+							max={draft.cleanupMode === "keepLatestN" ? 1000 : 3650}
+							allowDecimal={false}
+							allowNegative={false}
+							onChange={(v) => patch({ cleanupValue: typeof v === "number" ? v : 1 })}
+						/>
+					)}
+					<Text size="xs" c="dimmed">
+						{t("cleanupWarning")}
+					</Text>
+				</Stack>
 
 				<Select
 					label={t("model")}

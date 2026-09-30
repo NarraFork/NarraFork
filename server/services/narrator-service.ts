@@ -122,6 +122,7 @@ import {
 	withSeqFloorRaiseScope,
 } from "./narrator-refs/seq-store";
 import { materializeChildrenOf } from "./narrator-refs-backfill";
+import { withNarratorWorkAdmission } from "./narrator-session-state";
 import { specVfsService } from "./spec-vfs-service";
 import { removeTabFromAllUsers } from "./user-preferences-service";
 
@@ -290,6 +291,8 @@ async function deleteNarratorPackExtractions(narratorId: string): Promise<void> 
 
 export interface CreateNarratorInput {
 	chapterId?: string | null;
+	/** Internal creation provenance; not accepted by the public narrator API. */
+	scheduledTaskId?: string | null;
 	type?: "primary";
 	model?: string;
 	systemPrompt?: string;
@@ -1309,6 +1312,7 @@ export async function prepareNarratorCreation(
 		row: {
 			id: generateId(),
 			chapterId,
+			scheduledTaskId: input.scheduledTaskId ?? null,
 			type,
 			variant: "primary",
 			traits,
@@ -1395,149 +1399,155 @@ export const narratorService = {
 	},
 
 	async createSubagent(input: CreateSubagentInput) {
-		if (input.subagentOriginKind === "standalone" && input.originToolCallId != null) {
-			throw new ValidationError("Standalone subagents cannot have an Agent tool-call origin");
-		}
-		const parent = await this.getById(input.parentNarratorId);
-
-		if (isSubagentVariant(parent.variant)) {
-			throw new ValidationError("Subagents cannot spawn nested subagents");
-		}
-		if (input.originToolCallId != null) {
-			const origin = await db.query.narratorToolCalls.findFirst({
-				where: eq(narratorToolCalls.id, input.originToolCallId),
-				columns: {
-					narratorId: true,
-					toolUseId: true,
-					toolName: true,
-					status: true,
-					executionAttempt: true,
-					executionStartedAt: true,
-				},
-			});
-			if (
-				!origin ||
-				origin.narratorId !== input.parentNarratorId ||
-				origin.toolName !== "Agent" ||
-				origin.status !== "running" ||
-				!origin.executionStartedAt
-			) {
-				throw new ValidationError("Subagent origin must be its parent's executing Agent row");
+		return withNarratorWorkAdmission(input.parentNarratorId, async () => {
+			if (input.subagentOriginKind === "standalone" && input.originToolCallId != null) {
+				throw new ValidationError("Standalone subagents cannot have an Agent tool-call origin");
 			}
-			await narratorPersistence.validateToolCallBinding(input.parentNarratorId, origin.toolUseId, {
-				toolCallId: input.originToolCallId,
-				attempt: origin.executionAttempt,
-			});
-		}
+			const parent = await this.getById(input.parentNarratorId);
 
-		const now = new Date().toISOString();
-		const id = generateId();
+			if (isSubagentVariant(parent.variant)) {
+				throw new ValidationError("Subagents cannot spawn nested subagents");
+			}
+			if (input.originToolCallId != null) {
+				const origin = await db.query.narratorToolCalls.findFirst({
+					where: eq(narratorToolCalls.id, input.originToolCallId),
+					columns: {
+						narratorId: true,
+						toolUseId: true,
+						toolName: true,
+						status: true,
+						executionAttempt: true,
+						executionStartedAt: true,
+					},
+				});
+				if (
+					!origin ||
+					origin.narratorId !== input.parentNarratorId ||
+					origin.toolName !== "Agent" ||
+					origin.status !== "running" ||
+					!origin.executionStartedAt
+				) {
+					throw new ValidationError("Subagent origin must be its parent's executing Agent row");
+				}
+				await narratorPersistence.validateToolCallBinding(
+					input.parentNarratorId,
+					origin.toolUseId,
+					{
+						toolCallId: input.originToolCallId,
+						attempt: origin.executionAttempt,
+					},
+				);
+			}
 
-		let basePermMode = input.permissionMode ?? parent.permissionMode ?? "default";
-		if (parseTraits(parent.traits).includes("plan")) {
-			const parentRelaxed = resolveInitialRelaxedPlan({
-				permissionMode: parent.permissionMode,
+			const now = new Date().toISOString();
+			const id = generateId();
+
+			let basePermMode = input.permissionMode ?? parent.permissionMode ?? "default";
+			if (parseTraits(parent.traits).includes("plan")) {
+				const parentRelaxed = resolveInitialRelaxedPlan({
+					permissionMode: parent.permissionMode,
+					explicit: parent.relaxedPlan ?? undefined,
+					defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
+				});
+				basePermMode = parentRelaxed ? (parent.permissionMode ?? "default") : "readOnly";
+			}
+			const resolvedPermMode = basePermMode as
+				| "default"
+				| "acceptEdits"
+				| "bypassPermissions"
+				| "readOnly"
+				| "dontAsk";
+			const resolvedRelaxedPlan = resolveInitialRelaxedPlan({
+				permissionMode: resolvedPermMode,
 				explicit: parent.relaxedPlan ?? undefined,
 				defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
 			});
-			basePermMode = parentRelaxed ? (parent.permissionMode ?? "default") : "readOnly";
-		}
-		const resolvedPermMode = basePermMode as
-			| "default"
-			| "acceptEdits"
-			| "bypassPermissions"
-			| "readOnly"
-			| "dontAsk";
-		const resolvedRelaxedPlan = resolveInitialRelaxedPlan({
-			permissionMode: resolvedPermMode,
-			explicit: parent.relaxedPlan ?? undefined,
-			defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
-		});
 
-		// Preserve inheritance instead of freezing the parent's current model at creation.
-		const storedModel =
-			!input.model || input.model === FOLLOW_PARENT_MODEL
-				? FOLLOW_PARENT_MODEL
-				: resolveEffectiveModel(input.model);
-		// A following child stores no tier of its own: it reads the parent's override
-		// live at run time (subagentRunReasoningEffort), so a later parent change
-		// reaches it. Copying it here would freeze a snapshot that then outranks the
-		// parent forever. Pinned children keep the creation-time copy.
-		// Never固化 the resolved default here.
-		const resolvedReasoningEffort =
-			input.reasoningEffort ??
-			(storedModel === FOLLOW_PARENT_MODEL ? null : (parent.reasoningEffort ?? null));
+			// Preserve inheritance instead of freezing the parent's current model at creation.
+			const storedModel =
+				!input.model || input.model === FOLLOW_PARENT_MODEL
+					? FOLLOW_PARENT_MODEL
+					: resolveEffectiveModel(input.model);
+			// A following child stores no tier of its own: it reads the parent's override
+			// live at run time (subagentRunReasoningEffort), so a later parent change
+			// reaches it. Copying it here would freeze a snapshot that then outranks the
+			// parent forever. Pinned children keep the creation-time copy.
+			// Never固化 the resolved default here.
+			const resolvedReasoningEffort =
+				input.reasoningEffort ??
+				(storedModel === FOLLOW_PARENT_MODEL ? null : (parent.reasoningEffort ?? null));
 
-		const subChapterId = parent.chapterId ?? null;
-		const subTraits: string[] = [
-			...(subChapterId === null ? ["standalone"] : []),
-			...(input.inheritedTraits ?? []),
-		];
+			const subChapterId = parent.chapterId ?? null;
+			const subTraits: string[] = [
+				...(subChapterId === null ? ["standalone"] : []),
+				...(input.inheritedTraits ?? []),
+			];
 
-		const [narrator] = await db
-			.insert(narrators)
-			.values({
+			const [narrator] = await db
+				.insert(narrators)
+				.values({
+					id,
+					chapterId: subChapterId,
+					type: "subagent",
+					subagentType: input.subagentType,
+					variant: subagentVariant(input.subagentType),
+					traits: subTraits,
+					title: input.title ?? null,
+					model: storedModel,
+					systemPrompt: input.systemPrompt ?? null,
+					permissionMode: resolvedPermMode,
+					reasoningEffort: resolvedReasoningEffort,
+					fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
+					fastMode: legacyFastModeMirror(parent.fastModeOverride),
+					relaxedPlan: resolvedRelaxedPlan,
+					planReflectionAutoApproveOverride:
+						input.planReflectionAutoApproveOverride ??
+						parent.planReflectionAutoApproveOverride ??
+						"inherit",
+					dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+					autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
+					behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
+					behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
+					parentNarratorId: input.parentNarratorId,
+					originToolCallId: input.originToolCallId ?? null,
+					subagentOriginKind:
+						input.originToolCallId != null ? "tool" : (input.subagentOriginKind ?? null),
+					cwd: input.cwd,
+					defaultDeviceId: input.defaultDeviceId ?? parent.defaultDeviceId ?? null,
+					// A subagent is part of its parent's work, so its access is DELEGATED to the
+					// root rather than copied: `acl_root_narrator_id` is the only thing consulted
+					// when deciding who may read or drive it. That is what makes a later sharing
+					// change on the main session reach its subagents — there is nothing to
+					// propagate, because there is no copy. Copying used to be the approach, and
+					// sharing a parent afterwards silently left its subagents unreachable.
+					//
+					// Nested subagents point at the same root, so the chain is never walked on a
+					// decision path.
+					aclRootNarratorId: parent.aclRootNarratorId ?? input.parentNarratorId,
+					// Kept because "whose work is this" is still read for listings, attribution
+					// and user deletion — it just no longer decides access.
+					ownerUserId: parent.ownerUserId,
+					// Frozen at their strictest values ON PURPOSE, not copied from the parent.
+					// Delegation means these are never consulted, and a copy that cannot follow
+					// the root is a trap: any future code path that reads them instead of the
+					// judged row would get a stale snapshot that may be WIDER than the root.
+					// Pinning them here makes such a mistake fail closed instead of leaking.
+					visibility: "private",
+					writeAudience: "owner",
+					inheritMode: "fresh",
+					status: "working",
+					createdAt: now,
+					updatedAt: now,
+				})
+				.returning();
+
+			logger.info("Subagent created", {
 				id,
-				chapterId: subChapterId,
-				type: "subagent",
-				subagentType: input.subagentType,
-				variant: subagentVariant(input.subagentType),
-				traits: subTraits,
-				title: input.title ?? null,
-				model: storedModel,
-				systemPrompt: input.systemPrompt ?? null,
-				permissionMode: resolvedPermMode,
-				reasoningEffort: resolvedReasoningEffort,
-				fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
-				fastMode: legacyFastModeMirror(parent.fastModeOverride),
-				relaxedPlan: resolvedRelaxedPlan,
-				planReflectionAutoApproveOverride:
-					input.planReflectionAutoApproveOverride ??
-					parent.planReflectionAutoApproveOverride ??
-					"inherit",
-				dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
-				autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
-				behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
-				behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
 				parentNarratorId: input.parentNarratorId,
-				originToolCallId: input.originToolCallId ?? null,
-				subagentOriginKind:
-					input.originToolCallId != null ? "tool" : (input.subagentOriginKind ?? null),
-				cwd: input.cwd,
-				defaultDeviceId: input.defaultDeviceId ?? parent.defaultDeviceId ?? null,
-				// A subagent is part of its parent's work, so its access is DELEGATED to the
-				// root rather than copied: `acl_root_narrator_id` is the only thing consulted
-				// when deciding who may read or drive it. That is what makes a later sharing
-				// change on the main session reach its subagents — there is nothing to
-				// propagate, because there is no copy. Copying used to be the approach, and
-				// sharing a parent afterwards silently left its subagents unreachable.
-				//
-				// Nested subagents point at the same root, so the chain is never walked on a
-				// decision path.
-				aclRootNarratorId: parent.aclRootNarratorId ?? input.parentNarratorId,
-				// Kept because "whose work is this" is still read for listings, attribution
-				// and user deletion — it just no longer decides access.
-				ownerUserId: parent.ownerUserId,
-				// Frozen at their strictest values ON PURPOSE, not copied from the parent.
-				// Delegation means these are never consulted, and a copy that cannot follow
-				// the root is a trap: any future code path that reads them instead of the
-				// judged row would get a stale snapshot that may be WIDER than the root.
-				// Pinning them here makes such a mistake fail closed instead of leaking.
-				visibility: "private",
-				writeAudience: "owner",
-				inheritMode: "fresh",
-				status: "working",
-				createdAt: now,
-				updatedAt: now,
-			})
-			.returning();
-
-		logger.info("Subagent created", {
-			id,
-			parentNarratorId: input.parentNarratorId,
-			subagentType: input.subagentType,
+				subagentType: input.subagentType,
+			});
+			return narrator;
 		});
-		return narrator;
 	},
 
 	/**
@@ -2011,128 +2021,130 @@ export const narratorService = {
 		messageIds: string[],
 		opts?: { title?: string },
 	) {
-		const parent = await this.getById(parentNarratorId);
-		if (isSubagentVariant(parent.variant)) {
-			throw new ValidationError("Cannot fork from a subagent narrator");
-		}
+		return withNarratorWorkAdmission(parentNarratorId, async () => {
+			const parent = await this.getById(parentNarratorId);
+			if (isSubagentVariant(parent.variant)) {
+				throw new ValidationError("Cannot fork from a subagent narrator");
+			}
 
-		const parentRefs = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-				isCompact: narratorMessageRefs.isCompact,
-			})
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, parentNarratorId),
-					inArray(narratorMessageRefs.messageId, messageIds),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq);
+			const parentRefs = await db
+				.select({
+					messageId: narratorMessageRefs.messageId,
+					seq: narratorMessageRefs.seq,
+					isCompact: narratorMessageRefs.isCompact,
+				})
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, parentNarratorId),
+						inArray(narratorMessageRefs.messageId, messageIds),
+					),
+				)
+				.orderBy(narratorMessageRefs.seq);
 
-		if (parentRefs.length === 0) {
-			throw new ValidationError("None of the specified messages belong to this narrator");
-		}
+			if (parentRefs.length === 0) {
+				throw new ValidationError("None of the specified messages belong to this narrator");
+			}
 
-		const now = new Date().toISOString();
-		const id = generateId();
-		const storedModel = parent.model ?? FOLLOW_DEFAULT_MODEL;
-		const resolvedPermMode = (parent.permissionMode ?? "default") as
-			| "default"
-			| "acceptEdits"
-			| "bypassPermissions"
-			| "readOnly"
-			| "dontAsk";
+			const now = new Date().toISOString();
+			const id = generateId();
+			const storedModel = parent.model ?? FOLLOW_DEFAULT_MODEL;
+			const resolvedPermMode = (parent.permissionMode ?? "default") as
+				| "default"
+				| "acceptEdits"
+				| "bypassPermissions"
+				| "readOnly"
+				| "dontAsk";
 
-		// Fork inserts the narrator row first, then initializeRefSeqFloor — do not pre-raise
-		// a not-yet-inserted id. withSeqFloorRaiseScope marks after the tx commits because
-		// initializeRefSeqFloor records into the active raise scope.
-		const newNarrator = withSeqFloorRaiseScope(() =>
-			db.transaction((tx) => {
-				// Insert first so this transaction owns SQLite's write lock before it
-				// snapshots the parent's marker state.
-				const created = tx
-					.insert(narrators)
-					.values({
-						id,
-						chapterId: null,
-						type: "primary",
-						variant: "primary",
-						traits: ["standalone"],
-						model: storedModel,
-						systemPrompt: parent.systemPrompt,
-						permissionMode: resolvedPermMode,
-						reasoningEffort: parent.reasoningEffort ?? null,
-						fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
-						fastMode: legacyFastModeMirror(parent.fastModeOverride),
-						relaxedPlan: resolveInitialRelaxedPlan({
+			// Fork inserts the narrator row first, then initializeRefSeqFloor — do not pre-raise
+			// a not-yet-inserted id. withSeqFloorRaiseScope marks after the tx commits because
+			// initializeRefSeqFloor records into the active raise scope.
+			const newNarrator = withSeqFloorRaiseScope(() =>
+				db.transaction((tx) => {
+					// Insert first so this transaction owns SQLite's write lock before it
+					// snapshots the parent's marker state.
+					const created = tx
+						.insert(narrators)
+						.values({
+							id,
+							chapterId: null,
+							type: "primary",
+							variant: "primary",
+							traits: ["standalone"],
+							model: storedModel,
+							systemPrompt: parent.systemPrompt,
 							permissionMode: resolvedPermMode,
-							explicit: parent.relaxedPlan ?? undefined,
-							defaultRelaxedPlan: false,
-						}),
-						planReflectionAutoApproveOverride:
-							parent.planReflectionAutoApproveOverride ?? "inherit",
-						dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
-						autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
-						behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
-						behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
-						parentNarratorId,
-						// A fork carries the parent's history, so it must not be reachable by a
-						// wider audience than the parent was. Both axes are copied, not delegated:
-						// a fork is an independent session (`type: "primary"`), and its owner must
-						// be able to re-share it without the origin's settings overriding them.
-						ownerUserId: parent.ownerUserId,
-						visibility: parent.visibility,
-						writeAudience: parent.writeAudience,
-						inheritMode: "full",
-						status: "idle",
-						title: opts?.title ?? null,
-						cwd: parent.cwd ?? null,
-						createdAt: now,
-						updatedAt: now,
-					})
-					.returning()
-					.get();
+							reasoningEffort: parent.reasoningEffort ?? null,
+							fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
+							fastMode: legacyFastModeMirror(parent.fastModeOverride),
+							relaxedPlan: resolveInitialRelaxedPlan({
+								permissionMode: resolvedPermMode,
+								explicit: parent.relaxedPlan ?? undefined,
+								defaultRelaxedPlan: false,
+							}),
+							planReflectionAutoApproveOverride:
+								parent.planReflectionAutoApproveOverride ?? "inherit",
+							dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+							autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
+							behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
+							behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
+							parentNarratorId,
+							// A fork carries the parent's history, so it must not be reachable by a
+							// wider audience than the parent was. Both axes are copied, not delegated:
+							// a fork is an independent session (`type: "primary"`), and its owner must
+							// be able to re-share it without the origin's settings overriding them.
+							ownerUserId: parent.ownerUserId,
+							visibility: parent.visibility,
+							writeAudience: parent.writeAudience,
+							inheritMode: "full",
+							status: "idle",
+							title: opts?.title ?? null,
+							cwd: parent.cwd ?? null,
+							createdAt: now,
+							updatedAt: now,
+						})
+						.returning()
+						.get();
 
-				// Re-read selected refs in this synchronous transaction. A compact can
-				// finalize after the request preflight; only the state visible here may be
-				// shared with the child.
-				const pendingCompactIds = selectPendingCompactMessageIds(tx);
-				const stableParentRefs = tx
-					.select({
-						messageId: narratorMessageRefs.messageId,
-						seq: narratorMessageRefs.seq,
-						isCompact: narratorMessageRefs.isCompact,
-					})
-					.from(narratorMessageRefs)
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, parentNarratorId),
-							inArray(narratorMessageRefs.messageId, messageIds),
-							excludePendingCompactCondition(pendingCompactIds),
-						),
-					)
-					.orderBy(narratorMessageRefs.seq)
-					.all();
+					// Re-read selected refs in this synchronous transaction. A compact can
+					// finalize after the request preflight; only the state visible here may be
+					// shared with the child.
+					const pendingCompactIds = selectPendingCompactMessageIds(tx);
+					const stableParentRefs = tx
+						.select({
+							messageId: narratorMessageRefs.messageId,
+							seq: narratorMessageRefs.seq,
+							isCompact: narratorMessageRefs.isCompact,
+						})
+						.from(narratorMessageRefs)
+						.where(
+							and(
+								eq(narratorMessageRefs.narratorId, parentNarratorId),
+								inArray(narratorMessageRefs.messageId, messageIds),
+								excludePendingCompactCondition(pendingCompactIds),
+							),
+						)
+						.orderBy(narratorMessageRefs.seq)
+						.all();
 
-				const dupRefValues = stableParentRefs.map((row, i) => ({
-					id: generateId(),
-					narratorId: id,
-					messageId: row.messageId,
-					seq: i + 1,
-					isCompact: 0,
-				}));
-				insertRefsBatched(tx, dupRefValues);
-				const nextSeq = initializeRefSeqFloor(tx, id);
+					const dupRefValues = stableParentRefs.map((row, i) => ({
+						id: generateId(),
+						narratorId: id,
+						messageId: row.messageId,
+						seq: i + 1,
+						isCompact: 0,
+					}));
+					insertRefsBatched(tx, dupRefValues);
+					const nextSeq = initializeRefSeqFloor(tx, id);
 
-				return { ...created, nextSeq };
-			}),
-		);
+					return { ...created, nextSeq };
+				}),
+			);
 
-		await specVfsService.forkSpecNamespace(parentNarratorId, newNarrator.id);
-		await applySpecForkCarryover(newNarrator.id, "card");
-		return newNarrator;
+			await specVfsService.forkSpecNamespace(parentNarratorId, newNarrator.id);
+			await applySpecForkCarryover(newNarrator.id, "card");
+			return newNarrator;
+		});
 	},
 
 	async forkNarrator(
@@ -2154,297 +2166,298 @@ export const narratorService = {
 			specCarryover?: SpecForkCarryover;
 		},
 	) {
-		const parent = await this.getById(parentNarratorId);
+		return withNarratorWorkAdmission(parentNarratorId, async () => {
+			const parent = await this.getById(parentNarratorId);
 
-		if (isSubagentVariant(parent.variant)) {
-			throw new ValidationError("Cannot fork from a subagent narrator");
-		}
-
-		if (parent.chapterId && !opts?.newChapterId && !opts?.standalone) {
-			throw new ValidationError(
-				"Chapter-bound narrators can only be forked together with a chapter",
-			);
-		}
-
-		const inheritMode = opts?.inheritMode ?? "fresh";
-		const now = new Date().toISOString();
-		const id = generateId();
-
-		const resolvedPermMode = (parent.permissionMode ?? "default") as
-			| "default"
-			| "acceptEdits"
-			| "bypassPermissions"
-			| "readOnly"
-			| "dontAsk";
-
-		const targetChapterId = opts?.newChapterId ?? null;
-
-		let contextSummary: string | null = null;
-		let apiConversationId: string | null = null;
-		let systemPrompt = parent.systemPrompt;
-
-		if (inheritMode === "compressed") {
-			const { narratorContext } = await import("./narrator-context");
-			const locale = (opts?.locale ?? "en") as import("../lib/prompt-i18n").Locale;
-			contextSummary = await narratorContext.generateContextSummary(parentNarratorId, locale, {
-				userId: opts?.userId,
-			});
-			if (contextSummary && parent.systemPrompt) {
-				systemPrompt = `${parent.systemPrompt}\n\n## Previous Context Summary\n\nThis session continues from a previous conversation. Here is a summary of the prior context:\n\n${contextSummary}`;
+			if (isSubagentVariant(parent.variant)) {
+				throw new ValidationError("Cannot fork from a subagent narrator");
 			}
-		} else if (inheritMode === "full") {
-			// Do NOT inherit apiConversationId: forked narrators must use their
-			// own upstream session to avoid sharing a sticky routing slot in NUG
-			// (which causes queue contention and unintended co-migration on
-			// credential switches). The first request will establish a fresh
-			// upstream session automatically.
-			apiConversationId = null;
-			contextSummary = parent.contextSummary ?? null;
-		}
 
-		let prefixRows: Array<{
-			messageId: string;
-			seq: number;
-			isCompact: number;
-			segmentCompactId: string | null;
-		}> = [];
-		let resolvedForkMessageId: string | null = null;
-		let forkCompactSeq: number | undefined;
-		let requestedForkMessageId: string | null = null;
-		let pendingCompactIds: string[] = [];
+			if (parent.chapterId && !opts?.newChapterId && !opts?.standalone) {
+				throw new ValidationError(
+					"Chapter-bound narrators can only be forked together with a chapter",
+				);
+			}
 
-		const directMessageId = opts?.forkMessageId;
-		if ((forkMessageUuid || directMessageId) && inheritMode !== "fresh") {
-			// A caller may identify the fork point by either coordinate: the SDK
-			// message uuid (only assistant messages carry one) or the local row id.
-			// Prefer the explicit row id, then resolve the uuid, then accept a
-			// uuid-shaped argument that is actually a row id (older callers passed
-			// the id through this parameter).
-			if (directMessageId) {
-				requestedForkMessageId = directMessageId;
-			} else if (forkMessageUuid) {
-				const msg = await db.query.narratorMessages.findFirst({
-					where: eq(narratorMessages.messageUuid, forkMessageUuid),
-					columns: { id: true },
+			const inheritMode = opts?.inheritMode ?? "fresh";
+			const now = new Date().toISOString();
+			const id = generateId();
+
+			const resolvedPermMode = (parent.permissionMode ?? "default") as
+				| "default"
+				| "acceptEdits"
+				| "bypassPermissions"
+				| "readOnly"
+				| "dontAsk";
+
+			const targetChapterId = opts?.newChapterId ?? null;
+
+			let contextSummary: string | null = null;
+			let apiConversationId: string | null = null;
+			let systemPrompt = parent.systemPrompt;
+
+			if (inheritMode === "compressed") {
+				const { narratorContext } = await import("./narrator-context");
+				const locale = (opts?.locale ?? "en") as import("../lib/prompt-i18n").Locale;
+				contextSummary = await narratorContext.generateContextSummary(parentNarratorId, locale, {
+					userId: opts?.userId,
 				});
-				if (msg) {
-					requestedForkMessageId = msg.id;
-				} else {
-					const byId = await db.query.narratorMessages.findFirst({
-						where: eq(narratorMessages.id, forkMessageUuid),
+				if (contextSummary && parent.systemPrompt) {
+					systemPrompt = `${parent.systemPrompt}\n\n## Previous Context Summary\n\nThis session continues from a previous conversation. Here is a summary of the prior context:\n\n${contextSummary}`;
+				}
+			} else if (inheritMode === "full") {
+				// Do NOT inherit apiConversationId: forked narrators must use their
+				// own upstream session to avoid sharing a sticky routing slot in NUG
+				// (which causes queue contention and unintended co-migration on
+				// credential switches). The first request will establish a fresh
+				// upstream session automatically.
+				apiConversationId = null;
+				contextSummary = parent.contextSummary ?? null;
+			}
+
+			let prefixRows: Array<{
+				messageId: string;
+				seq: number;
+				isCompact: number;
+				segmentCompactId: string | null;
+			}> = [];
+			let resolvedForkMessageId: string | null = null;
+			let forkCompactSeq: number | undefined;
+			let requestedForkMessageId: string | null = null;
+			let pendingCompactIds: string[] = [];
+
+			const directMessageId = opts?.forkMessageId;
+			if ((forkMessageUuid || directMessageId) && inheritMode !== "fresh") {
+				// A caller may identify the fork point by either coordinate: the SDK
+				// message uuid (only assistant messages carry one) or the local row id.
+				// Prefer the explicit row id, then resolve the uuid, then accept a
+				// uuid-shaped argument that is actually a row id (older callers passed
+				// the id through this parameter).
+				if (directMessageId) {
+					requestedForkMessageId = directMessageId;
+				} else if (forkMessageUuid) {
+					const msg = await db.query.narratorMessages.findFirst({
+						where: eq(narratorMessages.messageUuid, forkMessageUuid),
 						columns: { id: true },
 					});
-					if (!byId) throw new ValidationError("Fork message not found");
-					requestedForkMessageId = byId.id;
+					if (msg) {
+						requestedForkMessageId = msg.id;
+					} else {
+						const byId = await db.query.narratorMessages.findFirst({
+							where: eq(narratorMessages.id, forkMessageUuid),
+							columns: { id: true },
+						});
+						if (!byId) throw new ValidationError("Fork message not found");
+						requestedForkMessageId = byId.id;
+					}
 				}
 			}
-		}
 
-		const storedModel = parent.model ?? FOLLOW_DEFAULT_MODEL;
-		// Inherit the parent's explicit override if any; otherwise store null
-		// (follow the global default). Never固化 the resolved default here.
-		const resolvedReasoningEffort = parent.reasoningEffort ?? null;
+			const storedModel = parent.model ?? FOLLOW_DEFAULT_MODEL;
+			// Inherit the parent's explicit override if any; otherwise store null
+			// (follow the global default). Never固化 the resolved default here.
+			const resolvedReasoningEffort = parent.reasoningEffort ?? null;
 
-		const forkTraits2: string[] = targetChapterId ? [] : ["standalone"];
+			const forkTraits2: string[] = targetChapterId ? [] : ["standalone"];
 
-		// Same as forkFromMessages: insert first, initializeRefSeqFloor after refs land.
-		const newNarrator = withSeqFloorRaiseScope(() =>
-			db.transaction((tx) => {
-				// Insert before reading parent refs so this transaction acquires the write
-				// lock first; a concurrent finalize then waits and cannot change the state
-				// between our final read and ref copy.
-				tx.insert(narrators)
-					.values({
-						id,
-						chapterId: targetChapterId,
-						type: "primary",
-						variant: "primary",
-						traits: forkTraits2,
-						model: storedModel,
-						systemPrompt,
-						permissionMode: resolvedPermMode,
-						reasoningEffort: resolvedReasoningEffort,
-						fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
-						fastMode: legacyFastModeMirror(parent.fastModeOverride),
-						relaxedPlan: resolveInitialRelaxedPlan({
+			// Same as forkFromMessages: insert first, initializeRefSeqFloor after refs land.
+			const newNarrator = withSeqFloorRaiseScope(() =>
+				db.transaction((tx) => {
+					// Insert before reading parent refs so this transaction acquires the write
+					// lock first; a concurrent finalize then waits and cannot change the state
+					// between our final read and ref copy.
+					tx.insert(narrators)
+						.values({
+							id,
+							chapterId: targetChapterId,
+							type: "primary",
+							variant: "primary",
+							traits: forkTraits2,
+							model: storedModel,
+							systemPrompt,
 							permissionMode: resolvedPermMode,
-							explicit: parent.relaxedPlan ?? undefined,
-							defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
-						}),
-						planReflectionAutoApproveOverride:
-							parent.planReflectionAutoApproveOverride ?? "inherit",
-						dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
-						autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
-						behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
-						behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
-						parentNarratorId,
-						forkMessageId: null,
-						// Same rule as forkFromMessages: inherited history keeps the parent's
-						// audiences, both of them. When the fork lands in a chapter it is at least
-						// project-visible anyway, so inheriting can only narrow, never widen.
-						ownerUserId: parent.ownerUserId,
-						visibility: parent.visibility,
-						writeAudience: parent.writeAudience,
-						inheritMode,
-						apiConversationId,
-						contextSummary,
-						status: "idle",
-						title: opts?.title ?? null,
-						cwd: parent.cwd ?? null,
-						createdAt: now,
-						updatedAt: now,
-					})
-					.run();
-
-				// Resolve and copy refs in one synchronous transaction. This closes the
-				// finalize window: either the finalizer commits first (so its stable marker
-				// is copied) or the fork commits first (so an active marker is omitted).
-				//
-				// The in-flight compact markers are resolved once, up front, through the
-				// partial index — so none of the queries below has to join message bodies.
-				pendingCompactIds = selectPendingCompactMessageIds(tx);
-				const excludePending = excludePendingCompactCondition(pendingCompactIds);
-				if (requestedForkMessageId) {
-					const forkRef = tx.query.narratorMessageRefs
-						.findFirst({
-							where: and(
-								eq(narratorMessageRefs.narratorId, parentNarratorId),
-								eq(narratorMessageRefs.messageId, requestedForkMessageId),
-							),
-						})
-						.sync();
-					if (!forkRef) {
-						throw new ValidationError("Fork message not found in parent narrator's refs");
-					}
-					// Only the history the model still sees is materialized: everything up to
-					// and including the last stable compact at or before the fork point is
-					// left in the parent and backfilled on demand (see narrator-refs-backfill).
-					const lastCompact = tx
-						.select({ seq: narratorMessageRefs.seq })
-						.from(narratorMessageRefs)
-						.where(
-							and(
-								eq(narratorMessageRefs.narratorId, parentNarratorId),
-								eq(narratorMessageRefs.isCompact, 1),
-								sql`${narratorMessageRefs.seq} <= ${forkRef.seq}`,
-								excludePending,
-							),
-						)
-						.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-						.limit(1)
-						.all();
-					forkCompactSeq = lastCompact[0]?.seq;
-					prefixRows = tx
-						.select({
-							messageId: narratorMessageRefs.messageId,
-							seq: narratorMessageRefs.seq,
-							isCompact: narratorMessageRefs.isCompact,
-							segmentCompactId: narratorMessageRefs.segmentCompactId,
-						})
-						.from(narratorMessageRefs)
-						.where(
-							and(
-								eq(narratorMessageRefs.narratorId, parentNarratorId),
-								forkCompactSeq != null
-									? sql`${narratorMessageRefs.seq} > ${forkCompactSeq}`
-									: undefined,
-								sql`${narratorMessageRefs.seq} <= ${forkRef.seq}`,
-								sql`${narratorMessageRefs.segmentCompactId} IS NULL`,
-								excludePending,
-							),
-						)
-						.orderBy(narratorMessageRefs.seq)
-						.all();
-					resolvedForkMessageId = prefixRows.at(-1)?.messageId ?? null;
-				} else if (inheritMode === "full") {
-					const lastCompact = tx
-						.select({ seq: narratorMessageRefs.seq })
-						.from(narratorMessageRefs)
-						.where(
-							and(
-								eq(narratorMessageRefs.narratorId, parentNarratorId),
-								eq(narratorMessageRefs.isCompact, 1),
-								excludePending,
-							),
-						)
-						.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-						.limit(1)
-						.all();
-					forkCompactSeq = lastCompact[0]?.seq;
-					const rows = tx
-						.select({
-							messageId: narratorMessageRefs.messageId,
-							seq: narratorMessageRefs.seq,
-							isCompact: narratorMessageRefs.isCompact,
-							segmentCompactId: narratorMessageRefs.segmentCompactId,
-						})
-						.from(narratorMessageRefs)
-						.where(
-							and(
-								eq(narratorMessageRefs.narratorId, parentNarratorId),
-								forkCompactSeq != null
-									? sql`${narratorMessageRefs.seq} > ${forkCompactSeq}`
-									: undefined,
-								sql`${narratorMessageRefs.segmentCompactId} IS NULL`,
-								excludePending,
-							),
-						)
-						.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-						.limit(MAX_INHERITED_FULL_FORK_REFS + 1)
-						.all();
-
-					if (rows.length > MAX_INHERITED_FULL_FORK_REFS) {
-						prefixRows = rows.slice(0, MAX_INHERITED_FULL_FORK_REFS).reverse();
-						logger.warn("Full narrator fork context truncated to safe ref limit", {
+							reasoningEffort: resolvedReasoningEffort,
+							fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
+							fastMode: legacyFastModeMirror(parent.fastModeOverride),
+							relaxedPlan: resolveInitialRelaxedPlan({
+								permissionMode: resolvedPermMode,
+								explicit: parent.relaxedPlan ?? undefined,
+								defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
+							}),
+							planReflectionAutoApproveOverride:
+								parent.planReflectionAutoApproveOverride ?? "inherit",
+							dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+							autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
+							behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
+							behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
 							parentNarratorId,
-							newNarratorId: id,
-							limit: MAX_INHERITED_FULL_FORK_REFS,
-							copiedRefs: prefixRows.length,
-							hasCompactSummary: Boolean(parent.contextSummary),
-						});
-					} else {
-						prefixRows = rows.reverse();
+							forkMessageId: null,
+							// Same rule as forkFromMessages: inherited history keeps the parent's
+							// audiences, both of them. When the fork lands in a chapter it is at least
+							// project-visible anyway, so inheriting can only narrow, never widen.
+							ownerUserId: parent.ownerUserId,
+							visibility: parent.visibility,
+							writeAudience: parent.writeAudience,
+							inheritMode,
+							apiConversationId,
+							contextSummary,
+							status: "idle",
+							title: opts?.title ?? null,
+							cwd: parent.cwd ?? null,
+							createdAt: now,
+							updatedAt: now,
+						})
+						.run();
+
+					// Resolve and copy refs in one synchronous transaction. This closes the
+					// finalize window: either the finalizer commits first (so its stable marker
+					// is copied) or the fork commits first (so an active marker is omitted).
+					//
+					// The in-flight compact markers are resolved once, up front, through the
+					// partial index — so none of the queries below has to join message bodies.
+					pendingCompactIds = selectPendingCompactMessageIds(tx);
+					const excludePending = excludePendingCompactCondition(pendingCompactIds);
+					if (requestedForkMessageId) {
+						const forkRef = tx.query.narratorMessageRefs
+							.findFirst({
+								where: and(
+									eq(narratorMessageRefs.narratorId, parentNarratorId),
+									eq(narratorMessageRefs.messageId, requestedForkMessageId),
+								),
+							})
+							.sync();
+						if (!forkRef) {
+							throw new ValidationError("Fork message not found in parent narrator's refs");
+						}
+						// Only the history the model still sees is materialized: everything up to
+						// and including the last stable compact at or before the fork point is
+						// left in the parent and backfilled on demand (see narrator-refs-backfill).
+						const lastCompact = tx
+							.select({ seq: narratorMessageRefs.seq })
+							.from(narratorMessageRefs)
+							.where(
+								and(
+									eq(narratorMessageRefs.narratorId, parentNarratorId),
+									eq(narratorMessageRefs.isCompact, 1),
+									sql`${narratorMessageRefs.seq} <= ${forkRef.seq}`,
+									excludePending,
+								),
+							)
+							.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+							.limit(1)
+							.all();
+						forkCompactSeq = lastCompact[0]?.seq;
+						prefixRows = tx
+							.select({
+								messageId: narratorMessageRefs.messageId,
+								seq: narratorMessageRefs.seq,
+								isCompact: narratorMessageRefs.isCompact,
+								segmentCompactId: narratorMessageRefs.segmentCompactId,
+							})
+							.from(narratorMessageRefs)
+							.where(
+								and(
+									eq(narratorMessageRefs.narratorId, parentNarratorId),
+									forkCompactSeq != null
+										? sql`${narratorMessageRefs.seq} > ${forkCompactSeq}`
+										: undefined,
+									sql`${narratorMessageRefs.seq} <= ${forkRef.seq}`,
+									sql`${narratorMessageRefs.segmentCompactId} IS NULL`,
+									excludePending,
+								),
+							)
+							.orderBy(narratorMessageRefs.seq)
+							.all();
+						resolvedForkMessageId = prefixRows.at(-1)?.messageId ?? null;
+					} else if (inheritMode === "full") {
+						const lastCompact = tx
+							.select({ seq: narratorMessageRefs.seq })
+							.from(narratorMessageRefs)
+							.where(
+								and(
+									eq(narratorMessageRefs.narratorId, parentNarratorId),
+									eq(narratorMessageRefs.isCompact, 1),
+									excludePending,
+								),
+							)
+							.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+							.limit(1)
+							.all();
+						forkCompactSeq = lastCompact[0]?.seq;
+						const rows = tx
+							.select({
+								messageId: narratorMessageRefs.messageId,
+								seq: narratorMessageRefs.seq,
+								isCompact: narratorMessageRefs.isCompact,
+								segmentCompactId: narratorMessageRefs.segmentCompactId,
+							})
+							.from(narratorMessageRefs)
+							.where(
+								and(
+									eq(narratorMessageRefs.narratorId, parentNarratorId),
+									forkCompactSeq != null
+										? sql`${narratorMessageRefs.seq} > ${forkCompactSeq}`
+										: undefined,
+									sql`${narratorMessageRefs.segmentCompactId} IS NULL`,
+									excludePending,
+								),
+							)
+							.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+							.limit(MAX_INHERITED_FULL_FORK_REFS + 1)
+							.all();
+
+						if (rows.length > MAX_INHERITED_FULL_FORK_REFS) {
+							prefixRows = rows.slice(0, MAX_INHERITED_FULL_FORK_REFS).reverse();
+							logger.warn("Full narrator fork context truncated to safe ref limit", {
+								parentNarratorId,
+								newNarratorId: id,
+								limit: MAX_INHERITED_FULL_FORK_REFS,
+								copiedRefs: prefixRows.length,
+								hasCompactSummary: Boolean(parent.contextSummary),
+							});
+						} else {
+							prefixRows = rows.reverse();
+						}
+						resolvedForkMessageId = prefixRows.at(-1)?.messageId ?? null;
 					}
-					resolvedForkMessageId = prefixRows.at(-1)?.messageId ?? null;
-				}
 
-				if (inheritMode === "full" && prefixRows.length === 0 && parent.apiConversationId) {
-					apiConversationId = null;
-					logger.warn(
-						"Full narrator fork has no local refs; remote conversation id not inherited",
-						{
-							parentNarratorId,
-							newNarratorId: id,
-						},
-					);
-				}
+					if (inheritMode === "full" && prefixRows.length === 0 && parent.apiConversationId) {
+						apiConversationId = null;
+						logger.warn(
+							"Full narrator fork has no local refs; remote conversation id not inherited",
+							{
+								parentNarratorId,
+								newNarratorId: id,
+							},
+						);
+					}
 
-				tx.update(narrators)
-					.set({ forkMessageId: resolvedForkMessageId, apiConversationId })
-					.where(eq(narrators.id, id))
-					.run();
+					tx.update(narrators)
+						.set({ forkMessageId: resolvedForkMessageId, apiConversationId })
+						.where(eq(narrators.id, id))
+						.run();
 
-				if (prefixRows.length > 0) {
-					// 单条 INSERT...SELECT 复制 refs（替代应用层批量循环 + 逐行 nanoid）。
-					// id 用 hex(randomblob(16)) 生成 (32 字符十六进制), 与 nanoid 同样全局唯一。
-					//
-					// seq 刻意**沿用父叙述者的原值**，不再重编号为 0 起。惰性 fork 之后要能按 seq
-					// 区间从父叙述者补齐更早的历史；一旦重编号，父子 seq 就失去对应关系，补齐
-					// 只能插负数或整体位移。保留原值后，补齐就只是插入更多行（见
-					// narrator-refs-backfill.ts）。seq 因此从 forkCompactSeq+1 开始而非 0，
-					// 中间留有空洞——所有消费者都是游标/排序语义，不依赖 seq 密集。
-					//
-					// 注意: SQL 必须复现 prefixRows 的完整过滤条件（compact 边界、segment 排除、
-					// 进行中 compact 标记排除、上限截断），不能简化为 seq <= lastSeq，否则会错误
-					// 复制已 compact 掉的历史 refs。
-					//
-					// 这里刻意不 join narrator_messages: 进行中的 compact 标记已经在上面通过
-					// 部分索引解析成一个通常为空的 id 列表，join 消息表只会把整段历史的
-					// contentJson 拖进来（3 万条消息约 149 MB）。
-					const lastSeq = prefixRows[prefixRows.length - 1].seq;
-					const firstSeq = prefixRows[0].seq;
-					const excludePendingRaw = excludePendingCompactRawCondition(pendingCompactIds);
-					tx.run(sql`
+					if (prefixRows.length > 0) {
+						// 单条 INSERT...SELECT 复制 refs（替代应用层批量循环 + 逐行 nanoid）。
+						// id 用 hex(randomblob(16)) 生成 (32 字符十六进制), 与 nanoid 同样全局唯一。
+						//
+						// seq 刻意**沿用父叙述者的原值**，不再重编号为 0 起。惰性 fork 之后要能按 seq
+						// 区间从父叙述者补齐更早的历史；一旦重编号，父子 seq 就失去对应关系，补齐
+						// 只能插负数或整体位移。保留原值后，补齐就只是插入更多行（见
+						// narrator-refs-backfill.ts）。seq 因此从 forkCompactSeq+1 开始而非 0，
+						// 中间留有空洞——所有消费者都是游标/排序语义，不依赖 seq 密集。
+						//
+						// 注意: SQL 必须复现 prefixRows 的完整过滤条件（compact 边界、segment 排除、
+						// 进行中 compact 标记排除、上限截断），不能简化为 seq <= lastSeq，否则会错误
+						// 复制已 compact 掉的历史 refs。
+						//
+						// 这里刻意不 join narrator_messages: 进行中的 compact 标记已经在上面通过
+						// 部分索引解析成一个通常为空的 id 列表，join 消息表只会把整段历史的
+						// contentJson 拖进来（3 万条消息约 149 MB）。
+						const lastSeq = prefixRows[prefixRows.length - 1].seq;
+						const firstSeq = prefixRows[0].seq;
+						const excludePendingRaw = excludePendingCompactRawCondition(pendingCompactIds);
+						tx.run(sql`
 					INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact, segment_compact_id)
 					SELECT
 						lower(hex(randomblob(16))),
@@ -2462,223 +2475,226 @@ export const narratorService = {
 					ORDER BY refs.seq
 				`);
 
-					// Reserve copied seqs in the child's monotone counter in this transaction.
-					// Subsequent lazy backfills can only raise, never lower, this floor.
-					initializeRefSeqFloor(tx, id);
+						// Reserve copied seqs in the child's monotone counter in this transaction.
+						// Subsequent lazy backfills can only raise, never lower, this floor.
+						initializeRefSeqFloor(tx, id);
 
-					// Record the lazy-fork boundary whenever the parent still holds refs below
-					// the window we copied — whether they were skipped by the compact boundary
-					// or dropped by the MAX_INHERITED_FULL_FORK_REFS cap. Previously the capped
-					// history was simply unreachable; now it can be backfilled.
-					const parentHasOlder = tx
-						.select({ seq: narratorMessageRefs.seq })
-						.from(narratorMessageRefs)
-						.where(
-							and(
-								eq(narratorMessageRefs.narratorId, parentNarratorId),
-								sql`${narratorMessageRefs.seq} < ${firstSeq}`,
-							),
-						)
-						.limit(1)
-						.all();
-					if (parentHasOlder.length > 0) {
-						tx.update(narrators)
-							.set({
-								refsInheritedFrom: parentNarratorId,
-								refsBackfillCursor: firstSeq,
+						// Record the lazy-fork boundary whenever the parent still holds refs below
+						// the window we copied — whether they were skipped by the compact boundary
+						// or dropped by the MAX_INHERITED_FULL_FORK_REFS cap. Previously the capped
+						// history was simply unreachable; now it can be backfilled.
+						const parentHasOlder = tx
+							.select({ seq: narratorMessageRefs.seq })
+							.from(narratorMessageRefs)
+							.where(
+								and(
+									eq(narratorMessageRefs.narratorId, parentNarratorId),
+									sql`${narratorMessageRefs.seq} < ${firstSeq}`,
+								),
+							)
+							.limit(1)
+							.all();
+						if (parentHasOlder.length > 0) {
+							tx.update(narrators)
+								.set({
+									refsInheritedFrom: parentNarratorId,
+									refsBackfillCursor: firstSeq,
+								})
+								.where(eq(narrators.id, id))
+								.run();
+						}
+					}
+
+					if (inheritMode === "compressed" && contextSummary) {
+						const compactMsgId = generateId();
+						const compactNow = new Date().toISOString();
+						tx.insert(narratorMessages)
+							.values({
+								id: compactMsgId,
+								narratorId: id,
+								role: "system",
+								contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
+								contentText: `[Compressed context from parent conversation]`,
+								createdAt: compactNow,
 							})
-							.where(eq(narrators.id, id))
+							.run();
+						// Same single seq authority as every other refs writer — the child's
+						// copied prefix is already in place, so this claims max(prefix)+1.
+						const compactSeq = claimNextRefSeq(tx, id);
+						tx.insert(narratorMessageRefs)
+							.values({
+								id: generateId(),
+								narratorId: id,
+								messageId: compactMsgId,
+								seq: compactSeq,
+								isCompact: 1,
+							})
 							.run();
 					}
-				}
 
-				if (inheritMode === "compressed" && contextSummary) {
-					const compactMsgId = generateId();
-					const compactNow = new Date().toISOString();
-					tx.insert(narratorMessages)
-						.values({
-							id: compactMsgId,
-							narratorId: id,
-							role: "system",
-							contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
-							contentText: `[Compressed context from parent conversation]`,
-							createdAt: compactNow,
-						})
-						.run();
-					// Same single seq authority as every other refs writer — the child's
-					// copied prefix is already in place, so this claims max(prefix)+1.
-					const compactSeq = claimNextRefSeq(tx, id);
-					tx.insert(narratorMessageRefs)
-						.values({
-							id: generateId(),
-							narratorId: id,
-							messageId: compactMsgId,
-							seq: compactSeq,
-							isCompact: 1,
-						})
-						.run();
-				}
+					// Copy all four per-narrator permission rule sets from the parent, preserving the
+					// canonical selector and its legacy mirror so every fork inherits one execution profile.
+					const parentWhitelistDirs = tx
+						.select()
+						.from(narratorWhitelistDirs)
+						.where(eq(narratorWhitelistDirs.narratorId, parentNarratorId))
+						.all();
+					if (parentWhitelistDirs.length > 0) {
+						tx.insert(narratorWhitelistDirs)
+							.values(
+								parentWhitelistDirs.map((dir) => ({
+									id: generateId(),
+									narratorId: id,
+									path: dir.path,
+									accessLevel: dir.accessLevel,
+									enabled: dir.enabled,
+									targetKind: dir.targetKind,
+									targetValue: dir.targetValue,
+									deviceScope: dir.deviceScope,
+									createdAt: now,
+								})),
+							)
+							.run();
+					}
 
-				// Copy all four per-narrator permission rule sets from the parent, preserving the
-				// canonical selector and its legacy mirror so every fork inherits one execution profile.
-				const parentWhitelistDirs = tx
-					.select()
-					.from(narratorWhitelistDirs)
-					.where(eq(narratorWhitelistDirs.narratorId, parentNarratorId))
-					.all();
-				if (parentWhitelistDirs.length > 0) {
-					tx.insert(narratorWhitelistDirs)
-						.values(
-							parentWhitelistDirs.map((dir) => ({
-								id: generateId(),
-								narratorId: id,
-								path: dir.path,
-								accessLevel: dir.accessLevel,
-								enabled: dir.enabled,
-								targetKind: dir.targetKind,
-								targetValue: dir.targetValue,
-								deviceScope: dir.deviceScope,
-								createdAt: now,
-							})),
-						)
-						.run();
-				}
+					const parentBlacklistDirs = tx
+						.select()
+						.from(narratorBlacklistDirs)
+						.where(eq(narratorBlacklistDirs.narratorId, parentNarratorId))
+						.all();
+					if (parentBlacklistDirs.length > 0) {
+						tx.insert(narratorBlacklistDirs)
+							.values(
+								parentBlacklistDirs.map((dir) => ({
+									id: generateId(),
+									narratorId: id,
+									path: dir.path,
+									denyLevel: dir.denyLevel,
+									enabled: dir.enabled,
+									targetKind: dir.targetKind,
+									targetValue: dir.targetValue,
+									deviceScope: dir.deviceScope,
+									createdAt: now,
+								})),
+							)
+							.run();
+					}
 
-				const parentBlacklistDirs = tx
-					.select()
-					.from(narratorBlacklistDirs)
-					.where(eq(narratorBlacklistDirs.narratorId, parentNarratorId))
-					.all();
-				if (parentBlacklistDirs.length > 0) {
-					tx.insert(narratorBlacklistDirs)
-						.values(
-							parentBlacklistDirs.map((dir) => ({
-								id: generateId(),
-								narratorId: id,
-								path: dir.path,
-								denyLevel: dir.denyLevel,
-								enabled: dir.enabled,
-								targetKind: dir.targetKind,
-								targetValue: dir.targetValue,
-								deviceScope: dir.deviceScope,
-								createdAt: now,
-							})),
-						)
-						.run();
-				}
+					const parentWhitelistCmds = tx
+						.select()
+						.from(narratorWhitelistCmds)
+						.where(eq(narratorWhitelistCmds.narratorId, parentNarratorId))
+						.all();
+					if (parentWhitelistCmds.length > 0) {
+						tx.insert(narratorWhitelistCmds)
+							.values(
+								parentWhitelistCmds.map((cmd) => ({
+									id: generateId(),
+									narratorId: id,
+									pattern: cmd.pattern,
+									enabled: cmd.enabled,
+									targetKind: cmd.targetKind,
+									targetValue: cmd.targetValue,
+									deviceScope: cmd.deviceScope,
+									createdAt: now,
+								})),
+							)
+							.run();
+					}
 
-				const parentWhitelistCmds = tx
-					.select()
-					.from(narratorWhitelistCmds)
-					.where(eq(narratorWhitelistCmds.narratorId, parentNarratorId))
-					.all();
-				if (parentWhitelistCmds.length > 0) {
-					tx.insert(narratorWhitelistCmds)
-						.values(
-							parentWhitelistCmds.map((cmd) => ({
-								id: generateId(),
-								narratorId: id,
-								pattern: cmd.pattern,
-								enabled: cmd.enabled,
-								targetKind: cmd.targetKind,
-								targetValue: cmd.targetValue,
-								deviceScope: cmd.deviceScope,
-								createdAt: now,
-							})),
-						)
-						.run();
-				}
+					const parentBlacklistCmds = tx
+						.select()
+						.from(narratorBlacklistCmds)
+						.where(eq(narratorBlacklistCmds.narratorId, parentNarratorId))
+						.all();
+					if (parentBlacklistCmds.length > 0) {
+						tx.insert(narratorBlacklistCmds)
+							.values(
+								parentBlacklistCmds.map((cmd) => ({
+									id: generateId(),
+									narratorId: id,
+									pattern: cmd.pattern,
+									denyPrompt: cmd.denyPrompt,
+									enabled: cmd.enabled,
+									targetKind: cmd.targetKind,
+									targetValue: cmd.targetValue,
+									deviceScope: cmd.deviceScope,
+									createdAt: now,
+								})),
+							)
+							.run();
+					}
 
-				const parentBlacklistCmds = tx
-					.select()
-					.from(narratorBlacklistCmds)
-					.where(eq(narratorBlacklistCmds.narratorId, parentNarratorId))
-					.all();
-				if (parentBlacklistCmds.length > 0) {
-					tx.insert(narratorBlacklistCmds)
-						.values(
-							parentBlacklistCmds.map((cmd) => ({
-								id: generateId(),
-								narratorId: id,
-								pattern: cmd.pattern,
-								denyPrompt: cmd.denyPrompt,
-								enabled: cmd.enabled,
-								targetKind: cmd.targetKind,
-								targetValue: cmd.targetValue,
-								deviceScope: cmd.deviceScope,
-								createdAt: now,
-							})),
-						)
-						.run();
-				}
+					const finalNarrator = tx.query.narrators
+						.findFirst({ where: eq(narrators.id, id) })
+						.sync();
+					if (!finalNarrator) throw new NotFoundError("Narrator", id);
+					return finalNarrator;
+				}),
+			);
 
-				const finalNarrator = tx.query.narrators.findFirst({ where: eq(narrators.id, id) }).sync();
-				if (!finalNarrator) throw new NotFoundError("Narrator", id);
-				return finalNarrator;
-			}),
-		);
-
-		// fire-and-forget: spec fork 和 carryover 不阻塞 fork 响应
-		// fork 的成功不依赖这些副作用, 失败时记录到 narrators 表便于后续补偿
-		void (async () => {
-			const maxRetries = 3;
-			for (let attempt = 1; attempt <= maxRetries; attempt++) {
-				try {
-					await specVfsService.forkSpecNamespace(parentNarratorId, id);
-					break;
-				} catch (err) {
-					const isLast = attempt === maxRetries;
-					if (isLast) {
-						logger.error("forkSpecNamespace failed after retries", {
-							parentNarratorId,
-							newNarratorId: id,
-							attempt,
-							error: String(err),
-						});
-					} else {
-						logger.warn("forkSpecNamespace attempt failed, retrying", {
-							parentNarratorId,
-							newNarratorId: id,
-							attempt,
-							error: String(err),
-						});
-						await new Promise((r) => setTimeout(r, 500 * attempt));
+			// fire-and-forget: spec fork 和 carryover 不阻塞 fork 响应
+			// fork 的成功不依赖这些副作用, 失败时记录到 narrators 表便于后续补偿
+			void (async () => {
+				const maxRetries = 3;
+				for (let attempt = 1; attempt <= maxRetries; attempt++) {
+					try {
+						await specVfsService.forkSpecNamespace(parentNarratorId, id);
+						break;
+					} catch (err) {
+						const isLast = attempt === maxRetries;
+						if (isLast) {
+							logger.error("forkSpecNamespace failed after retries", {
+								parentNarratorId,
+								newNarratorId: id,
+								attempt,
+								error: String(err),
+							});
+						} else {
+							logger.warn("forkSpecNamespace attempt failed, retrying", {
+								parentNarratorId,
+								newNarratorId: id,
+								attempt,
+								error: String(err),
+							});
+							await new Promise((r) => setTimeout(r, 500 * attempt));
+						}
 					}
 				}
-			}
-			for (let attempt = 1; attempt <= maxRetries; attempt++) {
-				try {
-					await applySpecForkCarryover(id, opts?.specCarryover ?? "card");
-					break;
-				} catch (err) {
-					const isLast = attempt === maxRetries;
-					if (isLast) {
-						logger.error("applySpecForkCarryover failed after retries", {
-							parentNarratorId,
-							newNarratorId: id,
-							attempt,
-							error: String(err),
-						});
-					} else {
-						logger.warn("applySpecForkCarryover attempt failed, retrying", {
-							parentNarratorId,
-							newNarratorId: id,
-							attempt,
-							error: String(err),
-						});
-						await new Promise((r) => setTimeout(r, 500 * attempt));
+				for (let attempt = 1; attempt <= maxRetries; attempt++) {
+					try {
+						await applySpecForkCarryover(id, opts?.specCarryover ?? "card");
+						break;
+					} catch (err) {
+						const isLast = attempt === maxRetries;
+						if (isLast) {
+							logger.error("applySpecForkCarryover failed after retries", {
+								parentNarratorId,
+								newNarratorId: id,
+								attempt,
+								error: String(err),
+							});
+						} else {
+							logger.warn("applySpecForkCarryover attempt failed, retrying", {
+								parentNarratorId,
+								newNarratorId: id,
+								attempt,
+								error: String(err),
+							});
+							await new Promise((r) => setTimeout(r, 500 * attempt));
+						}
 					}
 				}
-			}
-		})();
-		eventBus.emit({ type: "narrator:forked", narratorId: id, parentNarratorId });
-		broadcastToNarrator(parentNarratorId, {
-			type: "narrator_forked",
-			narratorId: id,
-			parentNarratorId,
+			})();
+			eventBus.emit({ type: "narrator:forked", narratorId: id, parentNarratorId });
+			broadcastToNarrator(parentNarratorId, {
+				type: "narrator_forked",
+				narratorId: id,
+				parentNarratorId,
+			});
+			logger.info("Narrator forked", { parentNarratorId, newNarratorId: id, forkMessageUuid });
+			return newNarrator;
 		});
-		logger.info("Narrator forked", { parentNarratorId, newNarratorId: id, forkMessageUuid });
-		return newNarrator;
 	},
 
 	async getLatestMessageUuid(narratorId: string): Promise<string | null> {
@@ -2726,74 +2742,76 @@ export const narratorService = {
 			locale?: string;
 		},
 	) {
-		const parent = await this.getById(parentNarratorId);
+		return withNarratorWorkAdmission(parentNarratorId, async () => {
+			const parent = await this.getById(parentNarratorId);
 
-		if (isSubagentVariant(parent.variant)) {
-			throw new ValidationError("Cannot fork from a subagent narrator");
-		}
-		if (parent.chapterId) {
-			throw new ValidationError(
-				"Chapter-bound narrators must fork via chapter fork (use chapterFork.fork)",
-			);
-		}
+			if (isSubagentVariant(parent.variant)) {
+				throw new ValidationError("Cannot fork from a subagent narrator");
+			}
+			if (parent.chapterId) {
+				throw new ValidationError(
+					"Chapter-bound narrators must fork via chapter fork (use chapterFork.fork)",
+				);
+			}
 
-		if (mode === "fresh") {
-			const newNarrator = await this.create({
-				chapterId: null,
-				model: opts?.model ?? parent.model ?? undefined,
-				systemPrompt: parent.systemPrompt ?? undefined,
-				permissionMode: parent.permissionMode ?? undefined,
-				cwd: parent.cwd ?? undefined,
-				reasoningEffort: parent.reasoningEffort as
-					| "none"
-					| "low"
-					| "medium"
-					| "high"
-					| "xhigh"
-					| null
-					| undefined,
-				fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
-				relaxedPlan: parent.relaxedPlan ?? undefined,
-				planReflectionAutoApproveOverride: normalizeBooleanOverride(
-					parent.planReflectionAutoApproveOverride,
-				),
-				dangerReflectionOverride: normalizeDangerReflectionOverride(
-					parent.dangerReflectionOverride,
-				),
-				autoContinuationOverride: normalizeAutoContinuationOverride(
-					parent.autoContinuationOverride,
-				),
-				behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
-				behaviorFenceAttachOverride: normalizeBooleanOverride(parent.behaviorFenceAttachOverride),
-				title: opts?.title ?? undefined,
-				// A tool-initiated fork belongs to whoever owns the session that spawned
-				// it — the model has no identity of its own to attribute it to. Both
-				// audiences come along so the fork is never reachable more widely than
-				// the session it came from.
-				ownerUserId: parent.ownerUserId,
-				visibility: parent.visibility,
-				writeAudience: parent.writeAudience,
+			if (mode === "fresh") {
+				const newNarrator = await this.create({
+					chapterId: null,
+					model: opts?.model ?? parent.model ?? undefined,
+					systemPrompt: parent.systemPrompt ?? undefined,
+					permissionMode: parent.permissionMode ?? undefined,
+					cwd: parent.cwd ?? undefined,
+					reasoningEffort: parent.reasoningEffort as
+						| "none"
+						| "low"
+						| "medium"
+						| "high"
+						| "xhigh"
+						| null
+						| undefined,
+					fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
+					relaxedPlan: parent.relaxedPlan ?? undefined,
+					planReflectionAutoApproveOverride: normalizeBooleanOverride(
+						parent.planReflectionAutoApproveOverride,
+					),
+					dangerReflectionOverride: normalizeDangerReflectionOverride(
+						parent.dangerReflectionOverride,
+					),
+					autoContinuationOverride: normalizeAutoContinuationOverride(
+						parent.autoContinuationOverride,
+					),
+					behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
+					behaviorFenceAttachOverride: normalizeBooleanOverride(parent.behaviorFenceAttachOverride),
+					title: opts?.title ?? undefined,
+					// A tool-initiated fork belongs to whoever owns the session that spawned
+					// it — the model has no identity of its own to attribute it to. Both
+					// audiences come along so the fork is never reachable more widely than
+					// the session it came from.
+					ownerUserId: parent.ownerUserId,
+					visibility: parent.visibility,
+					writeAudience: parent.writeAudience,
+				});
+				eventBus.emit({
+					type: "narrator:forked",
+					narratorId: newNarrator.id,
+					parentNarratorId,
+				});
+				broadcastToNarrator(parentNarratorId, {
+					type: "narrator_forked",
+					narratorId: newNarrator.id,
+					parentNarratorId,
+				});
+				return newNarrator;
+			}
+
+			const latestMsgUuid = await this.getLatestMessageUuid(parentNarratorId);
+
+			return this.forkNarrator(parentNarratorId, latestMsgUuid, {
+				title: opts?.title,
+				inheritMode: opts?.inheritMode ?? "full",
+				userId: opts?.userId ?? null,
+				locale: opts?.locale,
 			});
-			eventBus.emit({
-				type: "narrator:forked",
-				narratorId: newNarrator.id,
-				parentNarratorId,
-			});
-			broadcastToNarrator(parentNarratorId, {
-				type: "narrator_forked",
-				narratorId: newNarrator.id,
-				parentNarratorId,
-			});
-			return newNarrator;
-		}
-
-		const latestMsgUuid = await this.getLatestMessageUuid(parentNarratorId);
-
-		return this.forkNarrator(parentNarratorId, latestMsgUuid, {
-			title: opts?.title,
-			inheritMode: opts?.inheritMode ?? "full",
-			userId: opts?.userId ?? null,
-			locale: opts?.locale,
 		});
 	},
 
