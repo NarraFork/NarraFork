@@ -13,6 +13,8 @@ const features = new Set();
 const calls = [];
 let currentGeneration = 7;
 let hang = false;
+let conditionalResult = { applied: true };
+let conditionalError = null;
 mock.module(${JSON.stringify(settingsPath)}, () => ({ settings: { devices: { maxRpcBytes: 1048576, rpcTimeoutMs: 10000 } } }));
 mock.module(${JSON.stringify(connectionPath)}, () => ({
   hasDeviceProtocolFeature: (_id, feature) => features.has(feature),
@@ -22,6 +24,10 @@ mock.module(${JSON.stringify(connectionPath)}, () => ({
     if (opts.expectedConnectionGeneration !== currentGeneration) throw new Error("generation changed");
     for (const feature of opts.requiredFeatures ?? []) if (!features.has(feature)) throw Object.assign(new Error("unsupported " + feature), { name: "DeviceCapabilityError" });
     if (hang) return new Promise((_resolve, reject) => opts.signal.addEventListener("abort", () => reject(opts.signal.reason), { once: true }));
+    if (method === "fs.writeConditional") {
+      if (conditionalError) throw conditionalError;
+      return conditionalResult;
+    }
     if (method === "glob") return { matches: ["file.ts"], truncated: true };
     if (method === "fs.stat") return { exists: true, isFile: true, isDirectory: false, size: 2, resolvedPath: "/work/file.ts" };
     if (method === "fs.read") return { dataB64: "b2s=", totalSize: 2, truncated: false, resolvedPath: "/work/file.ts" };
@@ -51,6 +57,29 @@ features.add("fs.read.bounded.v1"); assert.equal(backend.supportsFsReadBounded, 
 await backend.readFileBytes("/work/file.ts", {expectedResolvedPath: "/work/file.ts", timeoutMs: 1000, signal: abort.signal, maxBytes: 1048576});
 sent = calls.at(-1); assert.equal(sent.opts.timeoutMs, 1000); assert.equal(sent.params.timeoutMs, 1000);
 assert.deepEqual(sent.opts.requiredFeatures, ["fs.read.atomic-resolved-path.v1", "fs.read.bounded.v1"]);
+const writeOpts = { expectedBytes: Buffer.from("ok"), expectedResolvedPath: "/work/file.ts", signal: abort.signal, timeoutMs: 800 };
+await assert.rejects(backend.conditionalWriteFileBytes("/work/file.ts", Buffer.from("next"), writeOpts), /upgrade/);
+features.add("fs.write.conditional.v1");
+await backend.conditionalWriteFileBytes("/work/file.ts", Buffer.from("next"), writeOpts);
+sent = calls.at(-1); assert.equal(sent.opts.timeoutMs, 800); assert.equal(sent.opts.signal, abort.signal);
+assert.equal(sent.params.expectedDataB64, "b2s="); assert.deepEqual(sent.opts.requiredFeatures, ["fs.write.conditional.v1"]);
+conditionalResult = { applied: false, conflict: true };
+await assert.rejects(backend.conditionalWriteFileBytes("/work/file.ts", Buffer.from("next"), writeOpts), /conflict/);
+conditionalResult = { applied: true };
+conditionalError = new Error("conditional replacement cannot safely preserve complete Windows security metadata; original file retained");
+await assert.rejects(backend.conditionalWriteFileBytes("/work/file.ts", Buffer.from("next"), writeOpts), (err) => {
+  assert.match(err.message, /outcome is unknown/);
+  assert.match(err.message, /cannot safely preserve complete Windows security metadata/);
+  assert.equal(err.cause, conditionalError);
+  return true;
+});
+conditionalError = new Error("x".repeat(4096));
+await assert.rejects(backend.conditionalWriteFileBytes("/work/file.ts", Buffer.from("next"), writeOpts), (err) => {
+  assert.ok(err.message.length < 1300);
+  return true;
+});
+conditionalError = null;
+await assert.rejects(backend.conditionalWriteFileBytes("/work/file.ts", new Uint8Array(2000001), writeOpts), /limit/);
 hang = true;
 const pending = backend.glob("**/*", {cwd: "/work", timeoutMs: 1500, signal: abort.signal});
 abort.abort(new Error("cancel scan")); await assert.rejects(pending, /cancel scan/);

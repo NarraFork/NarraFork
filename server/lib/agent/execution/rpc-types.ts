@@ -27,6 +27,8 @@ export const FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE = FEATURE_FS_WRITE_ATOMIC_RES
 export const FEATURE_GLOB_BOUNDED_V1 = "glob.bounded.v1";
 /** Reads check cancellation between chunks and revalidate identity/size after reading. */
 export const FEATURE_FS_READ_BOUNDED_V1 = "fs.read.bounded.v1";
+/** Serialized content check + replacement; does not exclude external filesystem writers. */
+export const FEATURE_FS_CONDITIONAL_WRITE_V1 = "fs.write.conditional.v1";
 
 // ── Handshake ────────────────────────────────────────────────────────────────
 
@@ -120,6 +122,7 @@ export type RpcMethod =
 	| "fs.stat"
 	| "fs.read"
 	| "fs.write"
+	| "fs.writeConditional"
 	| "fs.remove"
 	| "fs.mkdirp"
 	| "fs.list"
@@ -235,6 +238,20 @@ export interface FsReadResult {
 	totalSize: number;
 	/** Canonical identity verified for this opened file when requested. */
 	resolvedPath?: string;
+}
+
+export interface FsConditionalWriteParams {
+	path: string;
+	dataB64: string;
+	/** null requires absence; a string requires byte equality, including the empty file. */
+	expectedDataB64: string | null;
+	expectedResolvedPath: string;
+	timeoutMs?: number;
+}
+
+export interface FsConditionalWriteResult {
+	applied: boolean;
+	conflict?: boolean;
 }
 
 export interface FsWriteParams {

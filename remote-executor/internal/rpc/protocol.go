@@ -32,6 +32,9 @@ const FeatureGlobBoundedV1 = "glob.bounded.v1"
 // bounded chunks and revalidates canonical identity and file size before returning.
 const FeatureFsReadBoundedV1 = "fs.read.bounded.v1"
 
+// Executor-serialized check-and-replace; not an OS-level CAS against external writers.
+const FeatureFsConditionalWriteV1 = "fs.write.conditional.v1"
+
 // FeatureGitWorkspaceV1 covers structured, bounded, cancellable full Git management.
 const FeatureGitWorkspaceV1 = "git.workspace.v1"
 
@@ -100,6 +103,7 @@ func (c Capabilities) MarshalJSON() ([]byte, error) {
 		FeatureFsWriteAtomicResolvedPathV1,
 		FeatureGlobBoundedV1,
 		FeatureFsReadBoundedV1,
+		FeatureFsConditionalWriteV1,
 		FeatureGitWorkspaceV1,
 		FeatureGitWorkspaceWatchV1,
 	} {

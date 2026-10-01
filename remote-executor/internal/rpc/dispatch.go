@@ -54,9 +54,11 @@ func (d *Dispatcher) Dispatch(
 	case "fs.read":
 		return d.h.FsReadContext(ctx, params)
 	case "fs.write":
-		return d.h.FsWrite(params)
+		return d.h.FsWriteContext(ctx, params)
+	case "fs.writeConditional":
+		return d.h.FsWriteConditional(ctx, params)
 	case "fs.remove":
-		return d.h.FsRemove(params)
+		return d.h.FsRemoveContext(ctx, params)
 	case "fs.mkdirp":
 		return d.h.FsMkdirp(params)
 	case "fs.list":

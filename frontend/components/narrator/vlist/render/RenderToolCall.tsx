@@ -541,6 +541,38 @@ function ToolHeaderRow({
 			>
 				{toolName}
 			</span>
+			{/* "Open full session" for a call that waits on a subagent (Await-agent,
+			    or a single-target Send). Same affordance the subagent card draws in
+			    its recent-calls header, but placed BEFORE the summary in THIS card's
+			    fixed header row: the summary's `flex: 1` absorbs the button's width,
+			    so the tail cluster — including the timing indicator — keeps its
+			    exact right-edge position instead of being pushed left. Height-neutral
+			    because the row height is measured regardless, and the compact text
+			    fits the 19px lane (a Mantine compact-xs root is 22px and would
+			    overflow, hence the explicit height reset). */}
+			{onOpenSession ? (
+				<Button
+					data-testid="tool-open-session"
+					size="compact-xs"
+					variant="subtle"
+					styles={{
+						root: {
+							height: "auto",
+							minHeight: 0,
+							padding: "1px 6px",
+							fontSize: typographyMetrics().size.xs,
+							flexShrink: 0,
+						},
+					}}
+					onClick={(e: React.MouseEvent) => {
+						// Never let the button click toggle the card.
+						e.stopPropagation();
+						onOpenSession();
+					}}
+				>
+					{openSessionLabel}
+				</Button>
+			) : null}
 			<span
 				style={{
 					// `flex: 1` — the summary claims the header's slack, which pushes the diff
@@ -646,41 +678,6 @@ function ToolHeaderRow({
 					onUpdateTimeout={onUpdateTimeout}
 				/>
 			</span>
-			{/* "Open full session" for a call that waits on a subagent (Await-agent,
-			    or a single-target Send). Same affordance the subagent card draws in
-			    its recent-calls header, but placed in THIS card's fixed header row —
-			    height-neutral because the row height is measured regardless, and the
-			    button's compact text fits the 19px lane (a Mantine compact-xs root
-			    is 22px and would overflow, hence the explicit height reset). */}
-			{onOpenSession ? (
-				<Button
-					data-testid="tool-open-session"
-					size="compact-xs"
-					variant="subtle"
-					styles={{
-						root: {
-							height: "auto",
-							minHeight: 0,
-							padding: "1px 6px",
-							fontSize: typographyMetrics().size.xs,
-							flexShrink: 0,
-						},
-					}}
-					onKeyDown={(e) => {
-						// Keep native button activation; the header would prevent it and toggle.
-						if (e.key === "Enter" || e.key === " " || e.key === "Spacebar") {
-							e.stopPropagation();
-						}
-					}}
-					onClick={(e: React.MouseEvent) => {
-						// Never let the button click toggle the card.
-						e.stopPropagation();
-						onOpenSession();
-					}}
-				>
-					{openSessionLabel}
-				</Button>
-			) : null}
 			{running && onTerminate ? (
 				<Tooltip label={terminateLabel} position="top" withArrow fz="xs">
 					<UnstyledButton

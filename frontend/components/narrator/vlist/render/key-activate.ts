@@ -22,6 +22,13 @@ import type React from "react";
 export function activateOnKey(activate: () => void) {
 	return (e: React.KeyboardEvent) => {
 		if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
+		// A keydown's target is the FOCUSED element. When that is an interactive
+		// child of this row (a native `<button>` like the open-session or terminate
+		// control, or a popover trigger), the child owns the activation: Enter/Space
+		// must reach its own native click, not toggle the row underneath it.
+		// Handling it here too would preventDefault the child's activation AND
+		// double-fire the row's own action.
+		if (e.target !== e.currentTarget) return;
 		e.preventDefault();
 		e.stopPropagation();
 		activate();

@@ -278,7 +278,10 @@ export const structViewTool: ToolDefinition = {
 		// exactly where it is most needed — a file whose language cannot be parsed is one
 		// whose ranges can only be named by line.
 		if (mode === "stash") {
-			return runStash(filePath, text, doc, resolved, args, ctx.narratorId, encoding, []);
+			return runStash(ioPath, text, doc, resolved, args, ctx.narratorId, encoding, [], {
+				deviceId: backend.deviceId,
+				pathFlavor: backend.pathFlavor,
+			});
 		}
 		if (!resolved) {
 			return {

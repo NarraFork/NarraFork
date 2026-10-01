@@ -82,6 +82,7 @@ export async function runStash(
 	narratorId: string,
 	encoding: string,
 	notes: string[],
+	sourceIdentity?: { deviceId: string; pathFlavor: "posix" | "windows" | "spec" },
 ): Promise<ToolResult> {
 	const rawAddress = typeof args.address === "string" ? args.address.trim() : "";
 	const rawSymbol = typeof args.symbol === "string" ? args.symbol.trim() : "";
@@ -193,6 +194,7 @@ export async function runStash(
 			narratorId,
 			text: body,
 			filePath,
+			...sourceIdentity,
 			startLine,
 			endLine,
 			encoding,

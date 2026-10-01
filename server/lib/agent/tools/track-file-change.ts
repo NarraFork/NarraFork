@@ -25,7 +25,7 @@ export async function trackFileChange(
 	action: "write" | "edit" | "bash" = "edit",
 	backend: ExecutionBackend = localBackend,
 	lineStats?: { added: number; removed: number } | null,
-	options?: { evidenceRecorded: boolean },
+	options?: { evidenceRecorded: boolean; toolName?: "StructSed" },
 ): Promise<void> {
 	// Team file-change tracking (subagents only). A UI projection failure cannot
 	// turn a durably settled mutation into a failed execution.
@@ -69,7 +69,8 @@ export async function trackFileChange(
 			filePath: attributedPath,
 			narratorId: ctx.narratorId,
 			action,
-			toolName: action === "write" ? "Write" : action === "bash" ? "Bash" : "Edit",
+			toolName:
+				options?.toolName ?? (action === "write" ? "Write" : action === "bash" ? "Bash" : "Edit"),
 			toolUseId: ctx.currentToolUseId ?? null,
 			...(lineStats ? { lineStats } : {}),
 		});

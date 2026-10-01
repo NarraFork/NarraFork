@@ -8,6 +8,7 @@ import {
 	Group,
 	Loader,
 	Modal,
+	SegmentedControl,
 	Select,
 	Stack,
 	Text,
@@ -16,7 +17,7 @@ import {
 import { notifications } from "@mantine/notifications";
 import type { ExecutorPlatform } from "@shared/remote-executor";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import type {
@@ -26,12 +27,16 @@ import type {
 } from "../../lib/api/devices";
 import {
 	isEnrollableServerBaseUrl,
-	isLoopbackServerBaseUrl,
 	rememberInstallServerBaseUrl,
 	suggestedInstallServerBaseUrl,
 } from "../../lib/device-install-url";
 import { formatLocaleTime } from "../../lib/intl-format";
 import { CopyButton } from "../common/CopyButton";
+import {
+	InstallCommandCache,
+	installCommandExpired,
+	installUrlProblem,
+} from "./executor-install-command";
 
 /**
  * Installing the remote executor on a target machine.
@@ -53,10 +58,22 @@ export function ExecutorInstallModal({
 	onClose: () => void;
 }) {
 	const { t } = useTranslation("settings");
+	const deviceId = device?.id;
+	const [initializedDevice, setInitializedDevice] = useState<string | undefined>();
 	const [platform, setPlatform] = useState<ExecutorPlatform | null>(null);
 	const [mode, setMode] = useState<"system" | "user">("system");
 	const [disableShell, setDisableShell] = useState(false);
 	const [tokenDelivery, setTokenDelivery] = useState<ExecutorTokenDelivery>("enroll");
+	const [confirmedLoopback, setConfirmedLoopback] = useState<string | null>(null);
+	const [advanced, setAdvanced] = useState(false);
+	const [pending, setPending] = useState(false);
+	const [commandError, setCommandError] = useState<string | null>(null);
+	const [refresh, setRefresh] = useState(0);
+	const [now, setNow] = useState(Date.now());
+	const cache = useRef(new InstallCommandCache());
+	const activeDevice = useRef(device?.id);
+	activeDevice.current = device?.id;
+	const [debouncedUrl, setDebouncedUrl] = useState("");
 	const [serverBaseUrl, setServerBaseUrl] = useState("");
 	const [showScript, setShowScript] = useState(false);
 	const [result, setResult] = useState<InstallScriptResult | null>(null);
@@ -78,16 +95,22 @@ export function ExecutorInstallModal({
 	// Reset per-device state so a previously generated command (and its ticket)
 	// never leaks into the next device's dialog.
 	useEffect(() => {
-		if (!device) return;
+		cache.current = new InstallCommandCache();
 		setResult(null);
+		setInitializedDevice(deviceId);
+		if (!deviceId) return;
 		setPlatform(null);
 		setMode("system");
 		setDisableShell(false);
 		setTokenDelivery("enroll");
+		setConfirmedLoopback(null);
+		setAdvanced(false);
+		setDebouncedUrl("");
+		setRefresh(0);
 		setShowScript(false);
 		setRevealedToken(null);
 		setServerBaseUrl(suggestedInstallServerBaseUrl());
-	}, [device]);
+	}, [deviceId]);
 
 	useEffect(() => {
 		if (platform || publishedPlatforms.length === 0) return;
@@ -103,33 +126,112 @@ export function ExecutorInstallModal({
 	// server rule so the option is visibly unavailable instead of failing on submit;
 	// the server still enforces it.
 	const canEnroll = isEnrollableServerBaseUrl(trimmedBaseUrl);
-	const baseUrlIsLoopback = isLoopbackServerBaseUrl(trimmedBaseUrl);
+	const urlProblem = installUrlProblem(trimmedBaseUrl);
 	const effectiveDelivery: ExecutorTokenDelivery = canEnroll ? tokenDelivery : "prompt";
+	const urlBlocked =
+		urlProblem === "invalid" || (urlProblem === "loopback" && confirmedLoopback !== trimmedBaseUrl);
 
-	const generateMut = useMutation({
-		mutationFn: () => {
-			if (!device || !platform) throw new Error("No platform selected");
-			return api.createInstallScript(device.id, {
-				platform,
-				mode,
-				disableShell,
-				// Always sent: the server's fallback is the request origin, which is right
-				// for a plain reverse proxy but wrong whenever the target machine reaches
-				// this server by another name.
-				serverBaseUrl: trimmedBaseUrl || undefined,
-				tokenDelivery: effectiveDelivery,
-			});
+	useEffect(() => {
+		setConfirmedLoopback((confirmed) => (confirmed === trimmedBaseUrl ? confirmed : null));
+	}, [trimmedBaseUrl]);
+
+	useEffect(() => {
+		if (!deviceId) return;
+		const timer = setTimeout(() => setDebouncedUrl(trimmedBaseUrl), 400);
+		return () => clearTimeout(timer);
+	}, [trimmedBaseUrl, deviceId]);
+
+	useEffect(() => {
+		// Explicit retry changes the request generation; expiration itself does not.
+		void refresh;
+		let current = true;
+		setResult(null);
+		setCommandError(null);
+		setPending(false);
+		if (
+			!device?.id ||
+			initializedDevice !== device.id ||
+			!platform ||
+			!manifestData?.manifest ||
+			urlBlocked ||
+			debouncedUrl !== trimmedBaseUrl
+		)
+			return;
+		const input = {
+			platform,
+			mode,
+			disableShell,
+			serverBaseUrl: trimmedBaseUrl,
+			tokenDelivery: effectiveDelivery,
+		};
+		const key = cache.current.key(device.id, input, manifestData.manifest.version);
+		setPending(true);
+		cache.current
+			.get(key, () => api.createInstallScript(device.id, input))
+			.then(
+				(generated) => {
+					if (!current) return;
+					setResult(generated);
+					setPending(false);
+					rememberInstallServerBaseUrl(trimmedBaseUrl);
+				},
+				(error: unknown) => {
+					if (!current) return;
+					setPending(false);
+					setCommandError(error instanceof Error ? error.message : String(error));
+				},
+			);
+		return () => {
+			current = false;
+		};
+	}, [
+		device?.id,
+		platform,
+		mode,
+		disableShell,
+		trimmedBaseUrl,
+		debouncedUrl,
+		effectiveDelivery,
+		manifestData?.manifest,
+		urlBlocked,
+		refresh,
+		initializedDevice,
+	]);
+
+	useEffect(() => {
+		if (!deviceId) return;
+		const timer = setInterval(() => setNow(Date.now()), 1000);
+		return () => clearInterval(timer);
+	}, [deviceId]);
+
+	const diagnostics = useQuery({
+		queryKey: ["deviceInstallDiagnostics", device?.id],
+		queryFn: () => {
+			if (!deviceId) throw new Error("No device selected");
+			return api.getDeviceDiagnostics(deviceId);
 		},
-		onSuccess: (generated) => {
-			setResult(generated);
-			if (trimmedBaseUrl) rememberInstallServerBaseUrl(trimmedBaseUrl);
-		},
-		onError: (error) =>
-			notifications.show({
-				color: "red",
-				message: error instanceof Error ? error.message : String(error),
-			}),
+		enabled: !!device,
+		refetchInterval: device ? 2000 : false,
 	});
+	const expired = !!result && installCommandExpired(result, now);
+	const retry = () => {
+		if (device && platform && manifestData?.manifest) {
+			cache.current.remove(
+				cache.current.key(
+					device.id,
+					{
+						platform,
+						mode,
+						disableShell,
+						serverBaseUrl: trimmedBaseUrl,
+						tokenDelivery: effectiveDelivery,
+					},
+					manifestData.manifest.version,
+				),
+			);
+		}
+		setRefresh((value) => value + 1);
+	};
 
 	/**
 	 * Issues the key the manual path asks the operator to type.
@@ -140,11 +242,10 @@ export function ExecutorInstallModal({
 	 * deliberate act by someone who is about to install.
 	 */
 	const revealKeyMut = useMutation({
-		mutationFn: () => {
-			if (!device) throw new Error("No device selected");
-			return api.rotateDeviceToken(device.id);
+		mutationFn: (deviceId: string) => api.rotateDeviceToken(deviceId),
+		onSuccess: (issued, deviceId) => {
+			if (activeDevice.current === deviceId) setRevealedToken(issued.token);
 		},
-		onSuccess: (issued) => setRevealedToken(issued.token),
 		onError: (error) =>
 			notifications.show({
 				color: "red",
@@ -156,9 +257,7 @@ export function ExecutorInstallModal({
 	const invalidate = () => {
 		setResult(null);
 		setShowScript(false);
-		// The key belongs to the command it was issued for: a regenerated command in
-		// enroll mode rotates again, so a stale plaintext key on screen would be wrong.
-		setRevealedToken(null);
+		// Configuration switches never rotate or hide the explicitly issued device key.
 	};
 
 	const selectedInfo = publishedPlatforms.find((info) => info.platform === platform);
@@ -176,113 +275,83 @@ export function ExecutorInstallModal({
 						{t("executorInstallIntro", { name: device.name, version: manifest.version })}
 					</Text>
 
-					<Select
-						label={t("executorInstallPlatform")}
-						data={publishedPlatforms.map((info) => ({
-							value: info.platform,
-							label: info.label,
+					<SegmentedControl
+						aria-label={t("executorInstallOs", "Operating system")}
+						data={[...new Set(publishedPlatforms.map((info) => info.os))].map((os) => ({
+							value: os,
+							label: os === "darwin" ? "macOS" : os === "windows" ? "Windows" : "Linux",
 						}))}
-						value={platform}
-						onChange={(value) => {
-							setPlatform(value as ExecutorPlatform | null);
+						value={selectedInfo?.os}
+						onChange={(os) => {
+							const candidates = publishedPlatforms.filter((info) => info.os === os);
+							setPlatform(
+								(candidates.find((info) => info.arch === selectedInfo?.arch) ?? candidates[0])
+									.platform,
+							);
 							invalidate();
 						}}
-						allowDeselect={false}
 					/>
-
-					{selectedInfo && !selectedInfo.supportsPty ? (
-						<Alert color="yellow" variant="light">
-							{t("executorInstallNoPty")}
+					{urlProblem ? (
+						<Alert color="yellow">
+							<Stack gap="xs">
+								<Text>
+									{urlProblem === "loopback"
+										? t("executorInstallServerUrlLoopback")
+										: t(
+												"executorInstallServerUrlInvalid",
+												"Enter a valid HTTP(S) server URL reachable from the target machine.",
+											)}
+								</Text>
+								<TextInput
+									label={t("executorInstallServerUrl")}
+									value={serverBaseUrl}
+									onChange={(event) => setServerBaseUrl(event.currentTarget.value)}
+								/>
+								{urlProblem === "loopback" && urlBlocked ? (
+									<Button onClick={() => setConfirmedLoopback(trimmedBaseUrl)}>
+										{t("executorInstallConfirmLocalHost")}
+									</Button>
+								) : null}
+							</Stack>
+						</Alert>
+					) : null}
+					{pending ? <Loader size="sm" /> : null}
+					{commandError ? (
+						<Alert color="red">
+							<Text>{commandError}</Text>
+							<Button onClick={retry}>{t("executorInstallRefresh", "Get a new command")}</Button>
+							{effectiveDelivery === "enroll" ? (
+								<Button variant="light" onClick={() => setTokenDelivery("prompt")}>
+									{t("executorInstallTokenDeliveryManual")}
+								</Button>
+							) : null}
+						</Alert>
+					) : null}
+					{expired ? (
+						<Alert color="yellow">
+							<Text>
+								{t(
+									"executorInstallExpired",
+									"This command has expired. Get a new command before installing.",
+								)}
+							</Text>
+							<Button onClick={retry}>{t("executorInstallRefresh", "Get a new command")}</Button>
 						</Alert>
 					) : null}
 
-					<Select
-						label={t("executorInstallMode")}
-						description={t("executorInstallModeHelp")}
-						data={[
-							{ value: "system", label: t("executorInstallModeSystem") },
-							{ value: "user", label: t("executorInstallModeUser") },
-						]}
-						value={mode}
-						onChange={(value) => {
-							setMode((value as "system" | "user") ?? "system");
-							invalidate();
-						}}
-						allowDeselect={false}
-					/>
-
-					<TextInput
-						label={t("executorInstallServerUrl")}
-						description={t("executorInstallServerUrlHelp")}
-						placeholder="https://narrafork.example.com"
-						value={serverBaseUrl}
-						onChange={(event) => {
-							setServerBaseUrl(event.currentTarget.value);
-							invalidate();
-						}}
-					/>
-					{baseUrlIsLoopback ? (
-						<Alert color="yellow" variant="light">
-							{t("executorInstallServerUrlLoopback")}
-						</Alert>
-					) : null}
-
-					<Select
-						label={t("executorInstallTokenDelivery")}
-						description={t("executorInstallTokenDeliveryHelp")}
-						data={[
-							{
-								value: "enroll",
-								label: t("executorInstallTokenDeliveryAuto"),
-								disabled: !canEnroll,
-							},
-							{ value: "prompt", label: t("executorInstallTokenDeliveryManual") },
-						]}
-						value={effectiveDelivery}
-						onChange={(value) => {
-							setTokenDelivery((value as ExecutorTokenDelivery) ?? "enroll");
-							invalidate();
-						}}
-						allowDeselect={false}
-					/>
-					{!canEnroll ? (
-						<Alert color="yellow" variant="light">
-							{t("executorInstallTokenDeliveryUnavailable")}
-						</Alert>
-					) : null}
-
-					<Alert color="blue" variant="light">
-						{t("executorInstallPathGuardLater")}
-					</Alert>
-
-					<Checkbox
-						label={t("executorInstallDisableShell")}
-						description={t("executorInstallDisableShellHelp")}
-						checked={disableShell}
-						onChange={(event) => {
-							setDisableShell(event.currentTarget.checked);
-							invalidate();
-						}}
-					/>
-
-					<Group justify="flex-end">
-						<Button
-							loading={generateMut.isPending}
-							disabled={!platform}
-							onClick={() => generateMut.mutate()}
-						>
-							{t("executorInstallGenerate")}
-						</Button>
-					</Group>
-
-					{result ? (
+					{result && !expired ? (
 						<>
 							<Divider />
-							<Text fw={600} size="sm">
-								{t("executorInstallRunOneLiner", {
-									shell: result.shell === "sh" ? "sh" : "PowerShell",
-								})}
-							</Text>
+							<Group justify="space-between">
+								<Text fw={600} size="sm">
+									{t("executorInstallRunOneLiner", {
+										shell: result.shell === "sh" ? "sh" : "PowerShell",
+									})}
+								</Text>
+								<Text size="xs" c="dimmed">
+									{selectedInfo?.arch}
+								</Text>
+							</Group>
 							<Code block style={{ overflowWrap: "anywhere" }}>
 								{result.oneLiner}
 							</Code>
@@ -294,89 +363,206 @@ export function ExecutorInstallModal({
 										</Button>
 									)}
 								</CopyButton>
+								<Button variant="light" onClick={retry}>
+									{t("executorInstallRefresh", "Get a new command")}
+								</Button>
 								<Text size="xs" c="dimmed">
 									{t("executorInstallTicketExpires", {
 										time: formatLocaleTime(result.expiresAt),
 									})}
 								</Text>
 							</Group>
-							<Alert color={result.tokenDelivery === "enroll" ? "blue" : "yellow"} variant="light">
-								<Stack gap="xs">
-									<Text size="sm">
-										{result.tokenDelivery === "enroll"
-											? t("executorInstallEnrollNotice")
-											: t("executorInstallTokenReminder")}
-									</Text>
-									{/*
-									 * Manual mode needs a key the operator does not have: registration stopped
-									 * displaying it (the installer normally rotates it anyway), so without this
-									 * the only way forward is to close the dialog and rotate from the device
-									 * card. Issuing it here keeps the one flow that genuinely requires a
-									 * visible key self-contained.
-									 */}
-									{result.tokenDelivery === "prompt" ? (
-										revealedToken ? (
-											<>
-												<Code block style={{ overflowWrap: "anywhere" }}>
-													{revealedToken}
-												</Code>
+							{result.tokenDelivery === "enroll" ? (
+								<Text size="sm" c="dimmed">
+									{t("executorInstallEnrollNotice")}
+								</Text>
+							) : (
+								<Alert color="yellow" variant="light">
+									<Stack gap="xs">
+										<Text size="sm">{t("executorInstallTokenReminder")}</Text>
+										{/*
+										 * Manual mode needs a key the operator does not have: registration stopped
+										 * displaying it (the installer normally rotates it anyway), so without this
+										 * the only way forward is to close the dialog and rotate from the device
+										 * card. Issuing it here keeps the one flow that genuinely requires a
+										 * visible key self-contained.
+										 */}
+										{result.tokenDelivery === "prompt" ? (
+											revealedToken ? (
+												<>
+													<Code block style={{ overflowWrap: "anywhere" }}>
+														{revealedToken}
+													</Code>
+													<Group gap="xs">
+														<CopyButton value={revealedToken}>
+															{({ copied, copy }) => (
+																<Button onClick={copy} variant="light" size="xs">
+																	{copied ? t("copied") : t("executorInstallCopyKey")}
+																</Button>
+															)}
+														</CopyButton>
+														<Text size="xs" c="dimmed">
+															{t("executorInstallKeyRotatedNotice")}
+														</Text>
+													</Group>
+												</>
+											) : (
 												<Group gap="xs">
-													<CopyButton value={revealedToken}>
-														{({ copied, copy }) => (
-															<Button onClick={copy} variant="light" size="xs">
-																{copied ? t("copied") : t("executorInstallCopyKey")}
-															</Button>
-														)}
-													</CopyButton>
+													<Button
+														variant="light"
+														size="xs"
+														loading={revealKeyMut.isPending}
+														onClick={() => revealKeyMut.mutate(device.id)}
+													>
+														{t("executorInstallRevealKey")}
+													</Button>
 													<Text size="xs" c="dimmed">
-														{t("executorInstallKeyRotatedNotice")}
+														{t("executorInstallRevealKeyHelp")}
 													</Text>
 												</Group>
-											</>
-										) : (
-											<Group gap="xs">
-												<Button
-													variant="light"
-													size="xs"
-													loading={revealKeyMut.isPending}
-													onClick={() => revealKeyMut.mutate()}
-												>
-													{t("executorInstallRevealKey")}
-												</Button>
-												<Text size="xs" c="dimmed">
-													{t("executorInstallRevealKeyHelp")}
-												</Text>
-											</Group>
-										)
-									) : null}
-								</Stack>
-							</Alert>
-
-							<Button variant="subtle" size="xs" onClick={() => setShowScript((open) => !open)}>
-								{showScript ? t("executorInstallHideScript") : t("executorInstallShowScript")}
-							</Button>
-							<Collapse expanded={showScript}>
-								<Stack gap="xs">
-									<Text size="xs" c="dimmed">
-										{t("executorInstallRunWith", {
-											shell: result.shell === "sh" ? "sh" : "PowerShell",
-											filename: result.filename,
-										})}
-									</Text>
-									<Code block style={{ maxHeight: 320, overflow: "auto" }}>
-										{result.script}
-									</Code>
-									<CopyButton value={result.script}>
-										{({ copied, copy }) => (
-											<Button onClick={copy} variant="default" size="xs">
-												{copied ? t("copied") : t("executorInstallCopyScript")}
-											</Button>
-										)}
-									</CopyButton>
-								</Stack>
-							</Collapse>
+											)
+										) : null}
+									</Stack>
+								</Alert>
+							)}
 						</>
 					) : null}
+					{diagnostics.data ? (
+						<Alert color={diagnostics.data.online ? "green" : "blue"}>
+							<Text>
+								{diagnostics.data.online
+									? t(
+											"executorInstallDeviceOnline",
+											"Device is currently online. This does not confirm this installation.",
+										)
+									: t(`deviceDiagnosticStage_${diagnostics.data.stage}`, diagnostics.data.stage)}
+							</Text>
+							{!diagnostics.data.online ? (
+								<Text size="sm" c="dimmed">
+									{t(
+										"executorInstallConnectionHelp",
+										"Run the command on the target machine. If it stays offline, check the server URL and network access.",
+									)}
+								</Text>
+							) : null}
+							{diagnostics.data.lastError ? (
+								<Text size="sm">{diagnostics.data.lastError}</Text>
+							) : null}
+						</Alert>
+					) : null}
+					{diagnostics.isError ? (
+						<Alert color="yellow">{t("deviceDiagnosticsLoadFailed")}</Alert>
+					) : null}
+					<Button variant="subtle" onClick={() => setAdvanced((open) => !open)}>
+						{t("executorInstallAdvanced", "Advanced options")}
+					</Button>
+					<Collapse expanded={advanced}>
+						<Stack>
+							<Select
+								label={t("executorInstallArchitecture", "Architecture")}
+								data={publishedPlatforms
+									.filter((info) => info.os === selectedInfo?.os)
+									.map((info) => ({ value: info.platform, label: info.arch }))}
+								value={platform}
+								onChange={(value) => {
+									setPlatform(value as ExecutorPlatform | null);
+									invalidate();
+								}}
+								allowDeselect={false}
+							/>
+							{selectedInfo && !selectedInfo.supportsPty ? (
+								<Alert color="yellow" variant="light">
+									{t("executorInstallNoPty")}
+								</Alert>
+							) : null}
+							<Select
+								label={t("executorInstallMode")}
+								description={t("executorInstallModeHelp")}
+								data={[
+									{ value: "system", label: t("executorInstallModeSystem") },
+									{ value: "user", label: t("executorInstallModeUser") },
+								]}
+								value={mode}
+								onChange={(value) => {
+									setMode((value as "system" | "user") ?? "system");
+									invalidate();
+								}}
+								allowDeselect={false}
+							/>
+							<TextInput
+								label={t("executorInstallServerUrl")}
+								description={t("executorInstallServerUrlHelp")}
+								placeholder="https://narrafork.example.com"
+								value={serverBaseUrl}
+								onChange={(event) => {
+									setServerBaseUrl(event.currentTarget.value);
+									invalidate();
+								}}
+							/>
+							<Select
+								label={t("executorInstallTokenDelivery")}
+								description={t("executorInstallTokenDeliveryHelp")}
+								data={[
+									{
+										value: "enroll",
+										label: t("executorInstallTokenDeliveryAuto"),
+										disabled: !canEnroll,
+									},
+									{ value: "prompt", label: t("executorInstallTokenDeliveryManual") },
+								]}
+								value={effectiveDelivery}
+								onChange={(value) => {
+									setTokenDelivery(value === "enroll" ? "enroll" : "prompt");
+									invalidate();
+								}}
+								allowDeselect={false}
+							/>
+							{!canEnroll ? (
+								<Alert color="yellow" variant="light">
+									{t("executorInstallTokenDeliveryUnavailable")}
+								</Alert>
+							) : null}
+							<Alert color="blue" variant="light">
+								{t("executorInstallPathGuardLater")}
+							</Alert>
+							<Checkbox
+								label={t("executorInstallDisableShell")}
+								description={t("executorInstallDisableShellHelp")}
+								checked={disableShell}
+								onChange={(event) => {
+									setDisableShell(event.currentTarget.checked);
+									invalidate();
+								}}
+							/>
+							{result && !expired ? (
+								<>
+									<Button variant="subtle" size="xs" onClick={() => setShowScript((open) => !open)}>
+										{showScript ? t("executorInstallHideScript") : t("executorInstallShowScript")}
+									</Button>
+									<Collapse expanded={showScript}>
+										<Stack gap="xs">
+											<Text size="xs" c="dimmed">
+												{t("executorInstallRunWith", {
+													shell: result.shell === "sh" ? "sh" : "PowerShell",
+													filename: result.filename,
+												})}
+											</Text>
+											<Code block style={{ maxHeight: 320, overflow: "auto" }}>
+												{result.script}
+											</Code>
+											<CopyButton value={result.script}>
+												{({ copied, copy }) => (
+													<Button onClick={copy} variant="default" size="xs">
+														{copied ? t("copied") : t("executorInstallCopyScript")}
+													</Button>
+												)}
+											</CopyButton>
+										</Stack>
+									</Collapse>
+								</>
+							) : null}
+						</Stack>
+					</Collapse>
 				</Stack>
 			)}
 		</Modal>

@@ -555,6 +555,16 @@ func (t *Transfers) Complete(params map[string]any) (any, error) {
 		}
 	}
 
+	release, lockErr := acquireFileMutation(t.ctx)
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer release()
+	// Revalidate after waiting for other executor-managed file mutations.
+	destinationPath, pathErr = t.h.guard.CheckCreate(sess.path)
+	if pathErr != nil {
+		return nil, pathErr
+	}
 	if renErr := os.Rename(partPath, destinationPath); renErr != nil {
 		return map[string]any{"ok": false, "fileSize": info.Size(), "error": renErr.Error()}, nil
 	}

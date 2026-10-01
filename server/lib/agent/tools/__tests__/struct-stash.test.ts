@@ -48,7 +48,7 @@ describe("stash mode", () => {
 		expect(r.output).not.toContain("return 1");
 		// But the caller learns enough to act.
 		expect(r.output).toContain("line(s)");
-		expect(r.metadata?.handle).toMatch(/^stash_\w{8}$/);
+		expect(r.metadata?.handle).toMatch(/^stash_[A-Za-z0-9_-]{8}$/);
 	});
 
 	test("stashes by line address — the case that had no working path", async () => {

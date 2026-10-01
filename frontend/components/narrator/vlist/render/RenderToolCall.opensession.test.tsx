@@ -73,6 +73,21 @@ describe("RenderToolCall — Await card open-session button", () => {
 		expect(button.closest("[data-nf-card-header]")).not.toBeNull();
 	});
 
+	it("sits before the tail cluster, so the timing indicator never moves", () => {
+		const withButton = awaitCard({ onOpenSession: () => {} });
+		const withoutButton = awaitCard({});
+		const tail = withButton.querySelector("[data-nf-card-tail]");
+		const button = withButton.querySelector('[data-testid="tool-open-session"]');
+		if (!tail || !button) throw new Error("header cells not found");
+		// The button is placed BEFORE the summary (whose flex:1 absorbs its width):
+		// the diff/status/timing tail keeps its right-edge position whether or not
+		// the button exists, instead of being shoved left by it.
+		expect(button.compareDocumentPosition(tail) & 4).toBe(4); // FOLLOWING
+		// And it is not INSIDE the cross-faded tail cluster the drill morph animates.
+		expect(tail.contains(button)).toBe(false);
+		expect(withoutButton.querySelector("[data-nf-card-tail]")).not.toBeNull();
+	});
+
 	it("honours the injected localized label", () => {
 		const root = awaitCard({ onOpenSession: () => {}, label: "打开完整会话" });
 		expect(root.querySelector('[data-testid="tool-open-session"]')?.textContent).toBe(

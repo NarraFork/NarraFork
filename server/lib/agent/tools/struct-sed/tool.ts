@@ -31,6 +31,7 @@ import {
 } from "../../../../services/file-change-diagnostics";
 import { LocalFileValidationError } from "../../../../services/file-change-local-io";
 import { executeLocalFileChange } from "../../../../services/file-change-runtime";
+import { prepareRemoteStructSedChange } from "../../../../services/struct-sed-remote-change";
 import { toolSpecPathError } from "../../../spec-uri";
 import { withDeviceParam } from "../../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../../execution/path-resolve";
@@ -57,6 +58,7 @@ import {
 	encodeFileBytes,
 	normalizeLineEndings,
 } from "../encoding";
+import { trackFileChange } from "../track-file-change";
 import {
 	applyCommand,
 	changeLineStats,
@@ -399,15 +401,6 @@ export const structSedTool: ToolDefinition = {
 		}
 
 		const backend = getToolBackend(ctx, (args as { device?: string }).device);
-		// The write pipeline is local-only. Failing loudly beats silently editing the
-		// wrong machine's copy of the file.
-		if (backend.kind !== "local") {
-			return {
-				output:
-					"StructSed can only edit files on the local backend. Use Read/Edit against the remote device, or run this on the local workspace.",
-				isError: true,
-			};
-		}
 
 		const baseCwd = toolBaseCwd(backend, ctx.cwd);
 		const resolvedPath =
@@ -421,6 +414,8 @@ export const structSedTool: ToolDefinition = {
 		const createIfMissing = args.create_if_missing === true;
 
 		let originalText: string;
+		let originalBytes: Uint8Array | null = null;
+		let originalEncoding = "utf-8";
 		try {
 			const stat = await backend.statFile(ioPath);
 			if (stat?.isDirectory) {
@@ -456,7 +451,8 @@ export const structSedTool: ToolDefinition = {
 						isError: true,
 					};
 				}
-				({ text: originalText } = decodeFileBytes(read.bytes));
+				originalBytes = read.bytes;
+				({ text: originalText, encoding: originalEncoding } = decodeFileBytes(read.bytes));
 			}
 		} catch (err) {
 			return {
@@ -498,6 +494,18 @@ export const structSedTool: ToolDefinition = {
 		for (const spec of validated) {
 			const stashed = stashRanges.get(spec.index);
 			if (stashed) {
+				// Legacy stashes were local. Text equality alone never identifies a source file.
+				if (
+					(stashed.deviceId ?? "local") !== backend.deviceId ||
+					(stashed.pathFlavor !== undefined && stashed.pathFlavor !== backend.pathFlavor) ||
+					!backend.paths.equals(stashed.filePath, ioPath)
+				) {
+					return {
+						output: `stash ${spec.fromStash} can only delete its source file on device ${stashed.deviceId ?? "local"}: ${stashed.filePath}. Nothing changed; the stash is retained.`,
+						isError: true,
+						title: filePath,
+					};
+				}
 				// The recorded line numbers are only a hint; they are verified against the file as
 				// it is NOW. Acting on a stale range would delete whatever moved into those lines.
 				const located = locateStashRange(normalized, stashed);
@@ -705,6 +713,59 @@ export const structSedTool: ToolDefinition = {
 		}
 
 		try {
+			if (backend.kind !== "local") {
+				if (!backend.conditionalWriteFileBytes) {
+					return {
+						output:
+							"Remote StructSed preview is supported, but applying requires an executor upgrade with conditional-write support.",
+						isError: true,
+						title: filePath,
+					};
+				}
+				const nextBytes = encodeFileBytes(
+					applyLineEnding(
+						nextText,
+						detectLineEnding(originalBytes === null ? nextText : originalText),
+					),
+					originalEncoding,
+				);
+				if (nextBytes.byteLength > MAX_FILE_BYTES) {
+					return {
+						output: `StructSed output exceeds ${MAX_FILE_BYTES} bytes. Nothing written.`,
+						isError: true,
+						title: filePath,
+					};
+				}
+				await prepareRemoteStructSedChange(ctx, backend, ioPath, recordedInput, {
+					content: originalBytes === null ? null : originalText,
+					encoding: originalEncoding,
+				});
+				await backend.conditionalWriteFileBytes(ioPath, nextBytes, {
+					expectedBytes: originalBytes,
+					expectedResolvedPath: ioPath,
+					signal: ctx.signal,
+					timeoutMs: 30_000,
+				});
+				await trackFileChange(ctx, ioPath, "edit", backend, changeLineStats(normalized, nextText), {
+					evidenceRecorded: false,
+					toolName: "StructSed",
+				});
+				if (args.keep !== true) {
+					for (const handle of consumedHandles) dropStash(handle, ctx.narratorId);
+				}
+				return {
+					output: `${command} applied to ${filePath} → ${addressLabel}`,
+					title: filePath,
+					metadata: {
+						command,
+						startLine: range.startLine,
+						endLine: range.endLine,
+						...diffMetadata(normalized, nextText),
+						fileChangeEvidence: { version: 1, grade: "legacy_unverified" },
+						deviceId: backend.deviceId,
+					},
+				};
+			}
 			const recorded = await executeLocalFileChange({
 				ctx,
 				backend,

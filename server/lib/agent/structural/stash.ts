@@ -51,6 +51,9 @@ export interface StashEntry {
 	text: string;
 	/** Source file, for the summary line and for explaining a stale handle. */
 	filePath: string;
+	/** Absent on legacy entries, which originated on the local backend. */
+	deviceId?: string;
+	pathFlavor?: "posix" | "windows" | "spec";
 	startLine: number;
 	endLine: number;
 	/** Source encoding, so a caller can decide how to re-encode on write. */
@@ -83,6 +86,9 @@ export interface StashInput {
 	narratorId: string;
 	text: string;
 	filePath: string;
+	/** Absent on legacy entries, which originated on the local backend. */
+	deviceId?: string;
+	pathFlavor?: "posix" | "windows" | "spec";
 	startLine: number;
 	endLine: number;
 	encoding?: string;
@@ -141,6 +147,8 @@ export function putStash(input: StashInput): StashEntry {
 		narratorId: input.narratorId,
 		text: input.text,
 		filePath: input.filePath,
+		deviceId: input.deviceId,
+		pathFlavor: input.pathFlavor,
 		startLine: input.startLine,
 		endLine: input.endLine,
 		encoding: input.encoding ?? "utf-8",
