@@ -10,7 +10,7 @@
  * 6. Large-window regression: 6000+ items still fully cached, no thrash.
  */
 
-import { beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -339,6 +339,217 @@ describe("canonical body revision", () => {
 		expect(extractDataRevision({ items: [{ key: "row", card: changed }] })).not.toBe(
 			extractDataRevision({ items: [{ key: "row", card }] }),
 		);
+	});
+});
+
+describe("bounded immutable text signatures", () => {
+	beforeEach(async () => {
+		const { measureCache } = await import("./measure-cache");
+		measureCache.clear();
+	});
+
+	it("preserves the original UTF-16/FNV signature on cold and warm paths", async () => {
+		const { MeasureCache } = await import("./measure-cache");
+		const cache = new MeasureCache(10);
+		// Fixed pre-optimization results, including the sampling and admission boundaries.
+		const cases: [string, string][] = [
+			["", "0.ztntfp"],
+			["unchanged", "9.1ufp29q"],
+			["历史正文", "4.1r1v6oz"],
+			["a".repeat(512), "512.6a1fph"],
+			["a".repeat(513), "513.is5zjg"],
+			["b".repeat(2048), "2048.yqoan9"],
+			["\ud83d\ude42\ud800x", "4.13mfu1y"],
+			["z".repeat(2_000_000), "2000000.1jkoc6l"],
+		];
+		for (const [text, signature] of cases) {
+			expect(cache.signatureForText(text)).toBe(signature);
+			expect(cache.signatureForText(text)).toBe(signature);
+		}
+	});
+
+	it("reuses text across newly adapted data but detects same-length edits", async () => {
+		const { extractDataRevision, measureCache } = await import("./measure-cache");
+		const data = { text: "unchanged" };
+		const sampling = spyOn(String.prototype, "charCodeAt");
+		try {
+			const original = extractDataRevision(data);
+			const coldReads = sampling.mock.calls.length;
+			expect(coldReads).toBe(data.text.length);
+			const adaptedAgain = extractDataRevision({ ...data });
+			const warmReads = sampling.mock.calls.length;
+			expect(adaptedAgain).toBe(original);
+			expect(warmReads).toBe(coldReads);
+			data.text = "UNCHANGED";
+			expect(extractDataRevision(data)).not.toBe(original);
+			expect(sampling.mock.calls.length).toBe(coldReads + data.text.length);
+			expect(measureCache.textSignatureEntries).toBe(2);
+		} finally {
+			sampling.mockRestore();
+		}
+	});
+
+	it("still reads mutable status, nested body/range, permissions and trace identities", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const { createSourceText } = await import("@shared/pretext-layout/source-text");
+		const body = {
+			...bodyFixture("output.main", "aaaa bbbb"),
+			range: { ...createSourceText("aaaa bbbb", { epoch: "epoch-one" }).range },
+		};
+		const row = {
+			key: "row-one",
+			title: "same title",
+			bodyText: "same body",
+			identity: { toolDetailRef: { toolCallId: "call-one", messageId: "message-one" } },
+		};
+		const data = {
+			status: "running",
+			timeoutMs: 1000,
+			truncatedLeafCount: 1,
+			detail: { kind: "sections", sections: [{ key: "output.main", body }] },
+			permissionForm: { height: 80, prediction: { feedbackRows: 1 } },
+			items: [row],
+		};
+		let previous = extractDataRevision(data);
+		for (const mutate of [
+			() => {
+				data.status = "success";
+			},
+			() => {
+				data.timeoutMs = 2000;
+			},
+			() => {
+				data.truncatedLeafCount = 0;
+			},
+			() => {
+				body.text = "aaaabbbb_";
+			},
+			() => {
+				body.text = "aaaa\nbbbb";
+			},
+			() => {
+				body.format = "text";
+			},
+			() => {
+				body.range.epoch = "epoch-two";
+			},
+			() => {
+				body.range.startColumn = 2;
+			},
+			() => {
+				data.permissionForm.height = 120;
+			},
+			() => {
+				data.permissionForm.prediction.feedbackRows = 2;
+			},
+			() => {
+				row.identity.toolDetailRef.toolCallId = "call-two";
+			},
+			() => {
+				row.bodyText = "new_ body";
+			},
+			() => {
+				data.items.push({ ...row, key: "row-two" });
+			},
+		]) {
+			mutate();
+			const next = extractDataRevision(data);
+			expect(next).not.toBe(previous);
+			previous = next;
+		}
+	});
+
+	it("does not admit oversized strings and always keeps their sampling bounded", async () => {
+		const { MeasureCache } = await import("./measure-cache");
+		const cache = new MeasureCache(10);
+		const huge = "z".repeat(2_000_000);
+		const sampling = spyOn(String.prototype, "charCodeAt");
+		try {
+			cache.signatureForText(huge);
+			const firstReads = sampling.mock.calls.length;
+			cache.signatureForText(huge);
+			expect(firstReads).toBe(513); // Original 512 samples plus the final character.
+			expect(sampling.mock.calls.length).toBe(firstReads * 2);
+			expect(cache.textSignatureEntries).toBe(0);
+			expect(cache.retainedTextSignatureChars).toBe(0);
+		} finally {
+			sampling.mockRestore();
+		}
+	});
+
+	it("admits the maximum short length but bypasses the first oversized key", async () => {
+		const { MeasureCache, TEXT_SIGNATURE_MAX_TEXT_CHARS } = await import("./measure-cache");
+		const cache = new MeasureCache(10);
+		cache.signatureForText("x".repeat(TEXT_SIGNATURE_MAX_TEXT_CHARS));
+		cache.signatureForText("x".repeat(TEXT_SIGNATURE_MAX_TEXT_CHARS + 1));
+		expect(cache.textSignatureEntries).toBe(1);
+		expect(cache.retainedTextSignatureChars).toBe(TEXT_SIGNATURE_MAX_TEXT_CHARS);
+	});
+
+	it("bounds entry count without evicting the admitted sequential-scan cohort", async () => {
+		const { MeasureCache, TEXT_SIGNATURE_MAX_ENTRIES } = await import("./measure-cache");
+		const cache = new MeasureCache(10);
+		for (let index = 0; index < TEXT_SIGNATURE_MAX_ENTRIES; index++) {
+			cache.signatureForText(`entry-${String(index).padStart(5, "0")}`);
+		}
+		const chars = cache.retainedTextSignatureChars;
+		expect(cache.textSignatureEntries).toBe(TEXT_SIGNATURE_MAX_ENTRIES);
+		cache.signatureForText("later-cold-value");
+		expect(cache.textSignatureEntries).toBe(TEXT_SIGNATURE_MAX_ENTRIES);
+		expect(cache.retainedTextSignatureChars).toBe(chars);
+		const sampling = spyOn(String.prototype, "charCodeAt");
+		try {
+			cache.signatureForText("entry-00000");
+			expect(sampling.mock.calls.length).toBe(0);
+		} finally {
+			sampling.mockRestore();
+		}
+	});
+
+	it("bounds retained UTF-16 characters independently of the entry ceiling", async () => {
+		const { MeasureCache, TEXT_SIGNATURE_MAX_TEXT_CHARS, TEXT_SIGNATURE_CHAR_BUDGET } =
+			await import("./measure-cache");
+		const cache = new MeasureCache(10);
+		const suffix = "文".repeat(TEXT_SIGNATURE_MAX_TEXT_CHARS - 6);
+		const count = Math.floor(TEXT_SIGNATURE_CHAR_BUDGET / TEXT_SIGNATURE_MAX_TEXT_CHARS);
+		for (let index = 0; index < count; index++) {
+			cache.signatureForText(`${String(index).padStart(6, "0")}${suffix}`);
+		}
+		expect(cache.retainedTextSignatureChars).toBe(TEXT_SIGNATURE_CHAR_BUDGET);
+		cache.signatureForText("later");
+		expect(cache.retainedTextSignatureChars).toBe(TEXT_SIGNATURE_CHAR_BUDGET);
+		expect(cache.textSignatureEntries).toBe(count);
+	});
+
+	it("clears signatures with storage, while stats resets leave warm values intact", async () => {
+		const { MeasureCache } = await import("./measure-cache");
+		const cache = new MeasureCache(1);
+		const text = "unchanged";
+		cache.signatureForText(text);
+		const sampling = spyOn(String.prototype, "charCodeAt");
+		try {
+			cache.resetStats();
+			cache.signatureForText(text);
+			expect(sampling.mock.calls.length).toBe(0);
+			cache.clear();
+			expect(cache.textSignatureEntries).toBe(0);
+			expect(cache.retainedTextSignatureChars).toBe(0);
+			cache.signatureForText(text);
+			expect(sampling.mock.calls.length).toBe(text.length);
+			const measured = {
+				height: 1,
+				blocks: [],
+				contentWidth: 1,
+				usedWidth: 1,
+				frame: null,
+			} as never;
+			cache.set("first", measured);
+			cache.set("second", measured); // Measurement storage reached its own ceiling.
+			expect(cache.textSignatureEntries).toBe(0);
+			expect(cache.retainedTextSignatureChars).toBe(0);
+		} finally {
+			sampling.mockRestore();
+		}
 	});
 });
 
