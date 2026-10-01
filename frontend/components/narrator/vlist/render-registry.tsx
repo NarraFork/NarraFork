@@ -418,6 +418,7 @@ export function renderElement(
 					labels={extra.labels as never}
 					narratorId={extra.narratorId as string | undefined}
 					onToggle={extra.onToggle as (() => void) | undefined}
+					onOpenSession={extra.onOpenSession as (() => void) | undefined}
 					onTerminate={extra.onTerminate as (() => void) | undefined}
 					onUpdateTimeout={extra.onUpdateTimeout as ((timeoutMs: number) => void) | undefined}
 					permissionSlot={extra.permissionSlot as React.ReactNode}

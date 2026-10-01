@@ -8,6 +8,43 @@ beforeAll(() => {
 	installCanvasStub();
 });
 
+describe("media run framing", () => {
+	it("forwards run opts only to generated images and keeps source payload intact", async () => {
+		const { VLIST_REGISTRY } = await import("../registry");
+		const measure = VLIST_REGISTRY.media.measure;
+		for (const source of [
+			{},
+			{ savedPath: "/generated.png", width: 1024, height: 512 },
+			{ partialSavedPath: "/partial.png", status: "generating" },
+			{ result: "data:image/png;base64,abc" },
+		]) {
+			const data = { type: "image_generation", statusText: "Generated", ...source };
+			const original = { ...data };
+			const standalone = measure(data, 600, 5);
+			const middle = measure(data, 600, 5, { inRun: true, isLast: false });
+			const last = measure(data, 600, 5, { inRun: true, isLast: true });
+			expect(middle).toMatchObject({ inRun: true, isLast: false });
+			expect(last).toMatchObject({ inRun: true, isLast: true });
+			expect(standalone).toMatchObject({ inRun: false, isLast: false });
+			expect(middle.height).toBe(standalone.height - 1);
+			expect(last.height).toBe(standalone.height - 2);
+			expect(last.contentWidth).toBe(580);
+			expect(last.blocks).toEqual(standalone.blocks);
+			expect(last.frame).toEqual(standalone.frame);
+			expect(data).toEqual(original);
+		}
+	});
+
+	it("ignores run opts for ordinary image and text_file attachments", async () => {
+		const { VLIST_REGISTRY } = await import("../registry");
+		for (const type of ["image", "text_file"]) {
+			const data = { type, filename: "attachment", width: 100, height: 50 };
+			const measure = VLIST_REGISTRY.media.measure;
+			expect(measure(data, 600, 5, { inRun: true, isLast: false })).toEqual(measure(data, 600, 5));
+		}
+	});
+});
+
 describe("measureImage", () => {
 	it("is a fixed 200px block regardless of width", async () => {
 		const { measureImage, MEASURE_MEDIA_CONSTANTS } = await import("./measure-media");

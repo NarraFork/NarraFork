@@ -13,6 +13,7 @@
  */
 
 import type { PretextLayoutIndex } from "@shared/pretext-layout";
+import { isConnectableCardSpec } from "@shared/pretext-layout/segment-adapter";
 import type { LaidOutItem, ListLayout } from "@shared/pretext-layout/vlist-virtualization";
 import type { VListItem } from "./vlist-pipeline";
 
@@ -74,17 +75,20 @@ export function resolveRowHitHeight(
 	return Math.max(own, boundary - current.top);
 }
 
-/**
- * True when a rendered item is a frameless in-run card (tool-call in a multi-card
- * run, or an in-run subagent card). These carry no border of their own and rely
- * on the grouping frame the legacy path draws around a whole tool-run.
- */
 export function isFramedRunItem(item: VListItem | undefined): boolean {
-	if (!item) return false;
+	if (!item || !isConnectableCardSpec(item.spec)) return false;
 	const m = item.measured as { inRun?: boolean; borderHeight?: number };
-	if (item.spec.kind === "tool-call") return m.inRun === true;
 	if (item.spec.kind === "subagent-card") return m.borderHeight === 0;
-	return false;
+	return m.inRun === true;
+}
+
+/** A shared frame and zero-gap boundary must both stop at the same run tail. */
+export function isConnectedCardBoundary(
+	current: VListItem | undefined,
+	next: VListItem | undefined,
+): boolean {
+	if (!isFramedRunItem(current) || !isFramedRunItem(next)) return false;
+	return current?.spec.opts?.isLast !== true;
 }
 
 /**
@@ -102,7 +106,7 @@ export function computeToolRunFrames(
 	while (i < items.length) {
 		if (isFramedRunItem(items[i])) {
 			let j = i;
-			while (j + 1 < items.length && isFramedRunItem(items[j + 1])) j++;
+			while (j + 1 < items.length && isConnectedCardBoundary(items[j], items[j + 1])) j++;
 			// Keyed by the FIRST member's spec key, not by the index. The index is not an
 			// identity: a fold anywhere earlier in the document renumbers every run after
 			// it, so an index-keyed frame would be paired with a different run's geometry

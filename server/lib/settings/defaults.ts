@@ -699,6 +699,16 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "默认系统提示词。所有叙述者在自身 systemPrompt 为空时使用此值作为基础提示。",
 		type: "string",
 	},
+	"agent.browserProxy": {
+		desc: "Browser 独立代理覆盖，应用于新会话，不影响已有会话。省略或 default 跟随全局网络代理。",
+		type: "object",
+		valid: "mode: default | direct | system | custom; url: HTTP(S) 代理地址",
+	},
+	"agent.webFetchPolicy.proxy": {
+		desc: "Web Fetch 独立代理覆盖，同时用于 HTTP 抓取与浏览器渲染。省略或 default 跟随全局网络代理。",
+		type: "object",
+		valid: "mode: default | direct | system | custom; url: HTTP(S) 代理地址",
+	},
 	"agent.webFetchPolicy.allowAll": {
 		desc: "为 true 时所有 URL 自动允许抓取，无需用户批准。",
 		type: "boolean",

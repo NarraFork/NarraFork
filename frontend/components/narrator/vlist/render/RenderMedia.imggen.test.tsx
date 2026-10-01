@@ -24,6 +24,7 @@ import { ImageViewerProvider } from "../../../common/ImageViewerProvider";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "../registry";
 import { renderElement, resolveRenderExtra } from "../render-registry";
+import { RenderMedia } from "./RenderMedia";
 
 let parse: (html: string) => Element;
 
@@ -127,6 +128,35 @@ const imgsOf = (root: Element) => Array.from(root.querySelectorAll("img"));
 const textOf = (root: Element) => root.textContent ?? "";
 
 describe("generated image reaches the DOM (virtual list)", () => {
+	for (const isLast of [false, true]) {
+		it(`renders measured run framing with preview and loader intact (last=${isLast})`, () => {
+			const data = {
+				type: "image_generation",
+				status: "generating",
+				statusText: "Generating image…",
+				partialSavedPath: "/partial.png",
+				width: 512,
+				height: 256,
+			};
+			const measured = VLIST_REGISTRY.media.measure(data, 600, 5, { inRun: true, isLast });
+			const root = renderWithProviders(
+				<RenderMedia measured={measured} generating resolveImageSrc={() => "/partial.png"} />,
+			);
+			const image = imgsOf(root)[0];
+			if (!image) throw new Error("generated preview missing");
+			let card: Element | null = image;
+			while (card && !card.getAttribute("style")?.includes("padding:10px"))
+				card = card.parentElement;
+			expect(card).not.toBeNull();
+			expect(card?.getAttribute("style")).toContain("border:0");
+			expect(card?.getAttribute("style")).toContain("border-radius:0");
+			expect(root.querySelectorAll(".mantine-Divider-root")).toHaveLength(isLast ? 0 : 1);
+			expect(image.getAttribute("src")).toBe("/partial.png");
+			expect(textOf(root)).toContain("Generating image…");
+			expect(textOf(root)).toContain("…");
+			expect(measured.height).toBe(measured.frame.contentHeight + 20 + (isLast ? 0 : 1));
+		});
+	}
 	it("renders an <img> for a persisted savedPath block", () => {
 		// The exact shape the event handler persists: a path + intrinsic size, no
 		// inline base64 and no status.

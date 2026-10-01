@@ -164,6 +164,7 @@ import {
 	getDistanceFromBottom,
 	getScrollBottomTarget,
 	isBottomLostToContentGrowth,
+	isBottomLostToViewportResize,
 	isSuppressedScrollEcho,
 	isUpwardHistoryScroll,
 } from "./vlist-exact-scroll";
@@ -596,6 +597,9 @@ export const PretextExactMessageList = memo(
 			// on every scroll pixel. React state (scrollTop) only advances when the
 			// mounted window actually changes.
 			const scrollTopRef = useRef(0);
+			// Sample height with scrollTop; observer/state updates must not consume a resize
+			// before its browser-generated scroll event has been classified.
+			const scrollViewportHeightRef = useRef<number | null>(null);
 			const scrollRafRef = useRef(0);
 			// Where the in-flight LOD gesture is pointing (mouse / pinch center), captured
 			// by the gesture handlers and read back by readCurrentView when the rebuild
@@ -632,6 +636,7 @@ export const PretextExactMessageList = memo(
 			const assignViewport = useCallback(
 				(node: HTMLDivElement | null) => {
 					viewportRef.current = node;
+					scrollViewportHeightRef.current = node?.clientHeight ?? null;
 					// Mirror into state so the ResizeObserver effect re-runs when the node is
 					// replaced (see viewportNode). Written unconditionally: React calls this
 					// with null on detach and the real node on attach, and a state write with
@@ -680,6 +685,7 @@ export const PretextExactMessageList = memo(
 				suppressScrollStateRef.current = true;
 				suppressedScrollTopRef.current = settled;
 				scrollTopRef.current = settled;
+				scrollViewportHeightRef.current = node.clientHeight;
 				if (advanceState) setScrollTop(settled);
 				requestAnimationFrame(() => {
 					suppressScrollStateRef.current = false;
@@ -4071,6 +4077,13 @@ export const PretextExactMessageList = memo(
 				if (!node) return;
 				const previousTop = scrollTopRef.current;
 				const nextTop = node.scrollTop;
+				const liveViewportHeight = node.clientHeight;
+				const viewportResizedWhilePinned = isBottomLostToViewportResize(
+					pinnedToBottomRef.current,
+					scrollViewportHeightRef.current,
+					liveViewportHeight,
+				);
+				scrollViewportHeightRef.current = liveViewportHeight;
 				scrollTopRef.current = nextTop;
 
 				const atBottom = getDistanceFromBottom(node) <= BOTTOM_DISTANCE_EPSILON;
@@ -4084,7 +4097,7 @@ export const PretextExactMessageList = memo(
 				// frame must reason about: reporting the raw `atBottom` while staying pinned
 				// would flash the scroll-to-bottom affordance and make the panel count unread
 				// messages for a reader who is being followed.
-				const effectiveAtBottom = atBottom || grewBeneathReader;
+				const effectiveAtBottom = atBottom || grewBeneathReader || viewportResizedWhilePinned;
 				// Suppress the pinned-state update ONLY for the echo of our own write. A
 				// different value means the reader scrolled, and their intent wins immediately
 				// (see writeScrollTop / isSuppressedScrollEcho).
@@ -4095,8 +4108,11 @@ export const PretextExactMessageList = memo(
 				);
 				// Scrollbar drags and keyboard scrolling have no wheel/touch event to arm
 				// the history gate. Record their actual upward travel before testing it.
-				if (isUpwardHistoryScroll(previousTop, nextTop, isEcho)) {
-					olderHistoryIntentAtRef.current = Date.now();
+				// Keyboard resize/focus adjustment is not a request to read older history.
+				if (!viewportResizedWhilePinned) {
+					if (isUpwardHistoryScroll(previousTop, nextTop, isEcho)) {
+						olderHistoryIntentAtRef.current = Date.now();
+					}
 				}
 				if (!isEcho) {
 					// The reader moved during our suppression window: close it so nothing else
@@ -4125,7 +4141,10 @@ export const PretextExactMessageList = memo(
 				// during mount/settle, which is how a narrator switch ended up scrolling down
 				// into place. Yields to an active chase so it cannot cut a streaming glide
 				// short (the chase's live target already covers this growth).
-				if (grewBeneathReader && smoothFollowerRef.current?.isActive() !== true) {
+				if (
+					(grewBeneathReader || viewportResizedWhilePinned) &&
+					smoothFollowerRef.current?.isActive() !== true
+				) {
 					writeScrollTop(getScrollBottomTarget(node));
 				}
 				if (effectiveAtBottom) onUnreadCountChange?.(0);
@@ -4296,7 +4315,10 @@ export const PretextExactMessageList = memo(
 						// A finger dragging downward pulls earlier content into view (scroll
 						// up): treat it as upward intent for the auto-load gate.
 						const y = event.touches[0]?.clientY ?? 0;
-						if (y - lastTouchY > 0) markUpwardIntent();
+						if (y - lastTouchY > 0) {
+							detachFromBottom();
+							markUpwardIntent();
+						}
 						lastTouchY = y;
 						return;
 					}

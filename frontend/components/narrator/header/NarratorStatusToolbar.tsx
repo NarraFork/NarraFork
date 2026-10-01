@@ -14,6 +14,7 @@ import {
 	useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { useInputMenu } from "../../../hooks/useInputMenu";
 import { getNarratorStatusInlineStyle } from "../../../lib/safe-area";
 
 const DEFAULT_GAP_PX = 4;
@@ -325,6 +326,7 @@ export function NarratorStatusToolbar({
 	measurementKey: string;
 	reservedTextWidth?: number;
 }) {
+	const inputMenu = useInputMenu();
 	const rowRef = useContext(NarratorStatusRowContext);
 	const containerRef = useRef<HTMLDivElement>(null);
 	const leadingRef = useRef<HTMLDivElement>(null);
@@ -518,7 +520,13 @@ export function NarratorStatusToolbar({
 				),
 			)}
 			{overflowActions.length > 0 && (
-				<Menu position="top-end" withinPortal keepMounted transitionProps={{ duration: 0 }}>
+				<Menu
+					{...inputMenu.menuProps}
+					position="top-end"
+					withinPortal
+					keepMounted
+					transitionProps={{ duration: 0 }}
+				>
 					<Menu.Target>
 						<Tooltip label={moreLabel}>
 							<ActionIcon
@@ -527,13 +535,14 @@ export function NarratorStatusToolbar({
 								size="sm"
 								aria-label={moreLabel}
 								data-testid="narrator-status-more"
+								{...inputMenu.targetProps}
 								style={{ flexShrink: 0 }}
 							>
 								<IconDotsVertical size={16} />
 							</ActionIcon>
 						</Tooltip>
 					</Menu.Target>
-					<Menu.Dropdown>
+					<Menu.Dropdown style={{ overflowY: "auto" }}>
 						{overflowActions.map((action) => (
 							<Fragment key={action.key}>{action.render("menu")}</Fragment>
 						))}

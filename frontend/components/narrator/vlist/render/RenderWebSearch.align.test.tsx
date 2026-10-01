@@ -72,11 +72,12 @@ afterEach(() => {
 	currentContainer = null;
 });
 
-function renderCard() {
+function renderCard(opts: { inRun?: boolean; isLast?: boolean } = {}, isSearching = false) {
 	const measured = measureWebSearch(
-		{ query: "cats", status: "completed", label: "Searched" },
+		{ query: "cats", status: isSearching ? "searching" : "completed", label: "Searched" },
 		600,
 		5,
+		opts,
 	);
 	const container = document.createElement("div");
 	document.body.appendChild(container);
@@ -86,7 +87,7 @@ function renderCard() {
 	act(() => {
 		root.render(
 			<MantineProvider>
-				<RenderWebSearch measured={measured} isSearching={false} />
+				<RenderWebSearch measured={measured} isSearching={isSearching} />
 			</MantineProvider>,
 		);
 	});
@@ -94,6 +95,27 @@ function renderCard() {
 }
 
 describe("RenderWebSearch optical alignment", () => {
+	for (const isLast of [false, true]) {
+		it(`reads measured run flags and preserves the searching loader (last=${isLast})`, () => {
+			const { container, measured } = renderCard({ inRun: true, isLast }, true);
+			const card = container.querySelector(".mantine-Paper-root") as HTMLElement;
+			expect(card.style.height).toBe(`${measured.height - (isLast ? 0 : 1)}px`);
+			expect(["0", "0px"]).toContain(card.style.border);
+			expect(card.style.background).toBe("transparent");
+			expect(container.querySelectorAll(".mantine-Divider-root")).toHaveLength(isLast ? 0 : 1);
+			expect(container.querySelectorAll(".mantine-Loader-root")).toHaveLength(1);
+			const lane = card.firstElementChild as HTMLElement;
+			expect(lane.style.height).toBe("18px");
+		});
+	}
+
+	it("retains standalone border and rounded framing", () => {
+		const { container, measured } = renderCard();
+		const card = container.querySelector(".mantine-Paper-root") as HTMLElement;
+		expect(card.style.height).toBe(`${measured.height}px`);
+		expect(card.getAttribute("data-with-border")).not.toBeNull();
+		expect(container.querySelectorAll(".mantine-Divider-root")).toHaveLength(0);
+	});
 	it("keeps the reserved 17px line box and centres the 12px glyphs inside it", () => {
 		const { container } = renderCard();
 		const line = container.querySelector("[data-vlist-ws-line]") as HTMLElement | null;

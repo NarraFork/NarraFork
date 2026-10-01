@@ -297,6 +297,16 @@ export interface MeasureImageGenerationInput {
 	height?: number | null;
 }
 
+export interface MeasureMediaOpts {
+	inRun?: boolean;
+	isLast?: boolean;
+}
+
+export interface MeasuredImageGeneration extends MeasuredElement {
+	inRun: boolean;
+	isLast: boolean;
+}
+
 interface ImageMetrics {
 	width: number;
 	height: number;
@@ -385,7 +395,14 @@ export function measureImageGeneration(
 	data: MeasureImageGenerationInput,
 	contentWidth: number,
 	_lod: RenderLod = DEFAULT_RENDER_LOD,
-): MeasuredElement {
+	opts: MeasureMediaOpts = {},
+): MeasuredImageGeneration {
+	const inRun = opts.inRun === true;
+	const isLast = opts.isLast === true;
+	const border = inRun ? 0 : IMGGEN_BORDER * 2;
+	const divider = inRun && !isLast ? 1 : 0;
+	// Preserve the legacy standalone width model. In-run cards have no border,
+	// so this padding-only budget also exactly matches their rendered content.
 	const innerWidth = Math.max(1, contentWidth - IMGGEN_PAPER_PADDING * 2);
 	const generating = isGeneratingStatus(data.status);
 	const loaderWidth = generating ? IMGGEN_LOADER_SIZE + IMGGEN_GROUP_GAP : 0;
@@ -477,9 +494,11 @@ export function measureImageGeneration(
 
 	const usedWidth = frames.reduce((w, f) => Math.max(w, f.usedWidth), 0);
 	const frame: ElementFrame = { blocks: frames, contentHeight, usedWidth };
-	const height = IMGGEN_PAPER_PADDING * 2 + IMGGEN_BORDER * 2 + contentHeight;
+	const height = IMGGEN_PAPER_PADDING * 2 + border + contentHeight + divider;
 
 	return {
+		inRun,
+		isLast,
 		height,
 		blocks,
 		frame,
@@ -506,6 +525,7 @@ export function measureMedia(
 	block: MediaBlockInput,
 	contentWidth: number,
 	lod: RenderLod = DEFAULT_RENDER_LOD,
+	opts: MeasureMediaOpts = {},
 ): MeasuredElement {
 	switch (block.type) {
 		case "image":
@@ -513,7 +533,7 @@ export function measureMedia(
 		case "text_file":
 			return measureTextFile(block, contentWidth, lod);
 		case "image_generation":
-			return measureImageGeneration(block, contentWidth, lod);
+			return measureImageGeneration(block, contentWidth, lod, opts);
 		default: {
 			const frame: ElementFrame = { blocks: [], contentHeight: 0, usedWidth: 0 };
 			return { height: 0, blocks: [], frame, contentWidth, usedWidth: 0 };

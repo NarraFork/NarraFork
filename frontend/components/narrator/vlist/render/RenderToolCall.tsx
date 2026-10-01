@@ -149,6 +149,8 @@ export interface ToolCallLabels {
 	remote?: string;
 	/** Header badge label for a call blocked by a user takeover of its subagent. */
 	takenOver?: string;
+	/** Header button that opens the session this call waits on (Await-agent). */
+	openSession?: string;
 	/**
 	 * Localized `_planFile` provenance template, e.g. `"Plan from {file}"`. The
 	 * measure layer only carries the raw path (shared/ has no i18n), so the
@@ -189,6 +191,7 @@ const DEFAULT_LABELS: Required<
 		| "output"
 		| "remote"
 		| "takenOver"
+		| "openSession"
 		| "planSource"
 		| "download"
 		| "copy"
@@ -201,6 +204,7 @@ const DEFAULT_LABELS: Required<
 	output: "Output",
 	remote: "remote",
 	takenOver: "Taken over by user",
+	openSession: "Open full session",
 	planSource: "Plan from {file}",
 	download: "Download",
 	copy: "Copy link",
@@ -430,6 +434,10 @@ interface ToolHeaderRowProps {
 	isTakenOver: boolean;
 	/** Localized takeover badge label. */
 	takenOverLabel: string;
+	/** Open the session this call waits on (Await-agent). Absent → no button. */
+	onOpenSession?: () => void;
+	/** Localized open-session button label. */
+	openSessionLabel: string;
 	opened: boolean;
 	onToggle?: () => void;
 	/** Optional category-icon override; falls back to a neutral tool glyph. */
@@ -462,6 +470,8 @@ function ToolHeaderRow({
 	remoteLabel,
 	isTakenOver,
 	takenOverLabel,
+	onOpenSession,
+	openSessionLabel,
 	opened,
 	onToggle,
 	icon: Icon = IconTool,
@@ -636,6 +646,41 @@ function ToolHeaderRow({
 					onUpdateTimeout={onUpdateTimeout}
 				/>
 			</span>
+			{/* "Open full session" for a call that waits on a subagent (Await-agent,
+			    or a single-target Send). Same affordance the subagent card draws in
+			    its recent-calls header, but placed in THIS card's fixed header row —
+			    height-neutral because the row height is measured regardless, and the
+			    button's compact text fits the 19px lane (a Mantine compact-xs root
+			    is 22px and would overflow, hence the explicit height reset). */}
+			{onOpenSession ? (
+				<Button
+					data-testid="tool-open-session"
+					size="compact-xs"
+					variant="subtle"
+					styles={{
+						root: {
+							height: "auto",
+							minHeight: 0,
+							padding: "1px 6px",
+							fontSize: typographyMetrics().size.xs,
+							flexShrink: 0,
+						},
+					}}
+					onKeyDown={(e) => {
+						// Keep native button activation; the header would prevent it and toggle.
+						if (e.key === "Enter" || e.key === " " || e.key === "Spacebar") {
+							e.stopPropagation();
+						}
+					}}
+					onClick={(e: React.MouseEvent) => {
+						// Never let the button click toggle the card.
+						e.stopPropagation();
+						onOpenSession();
+					}}
+				>
+					{openSessionLabel}
+				</Button>
+			) : null}
 			{running && onTerminate ? (
 				<Tooltip label={terminateLabel} position="top" withArrow fz="xs">
 					<UnstyledButton
@@ -1940,6 +1985,12 @@ export interface RenderToolCallProps {
 	/** Toggle expand/collapse (header click). */
 	onToggle?: () => void;
 	/**
+	 * Open the full session of the subagent this call waits on (an Await-agent
+	 * card whose target resolved, or a single-target Send). Same affordance as
+	 * the subagent card's in-card button; absent → no button.
+	 */
+	onOpenSession?: () => void;
+	/**
 	 * Terminate the running tool. Supplied by the integration layer for bash / MCP
 	 * cards (the chunked header's InlineTerminateControl equivalent).
 	 */
@@ -2145,6 +2196,7 @@ export function RenderToolCall({
 	icon,
 	narratorId,
 	onToggle,
+	onOpenSession,
 	onTerminate,
 	onUpdateTimeout,
 	onPermissionAllow,
@@ -2239,6 +2291,8 @@ export function RenderToolCall({
 				remoteLabel={merged.remote}
 				isTakenOver={measured.isTakenOver}
 				takenOverLabel={merged.takenOver}
+				onOpenSession={onOpenSession}
+				openSessionLabel={merged.openSession}
 				opened={effectiveOpened}
 				onToggle={onToggle}
 				icon={icon ?? categoryIcon(category, measured.toolName)}

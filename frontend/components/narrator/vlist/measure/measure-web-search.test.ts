@@ -24,6 +24,37 @@ describe("resolveWebSearchQuery / isWebSearchSearching", () => {
 });
 
 describe("measureWebSearch", () => {
+	it("forwards run opts without changing data and reserves only non-last dividers", async () => {
+		const { VLIST_REGISTRY } = await import("../registry");
+		const data = { query: "cats", status: "searching", label: "Searching" };
+		const original = { ...data };
+		const measure = VLIST_REGISTRY["web-search"].measure;
+		const standalone = measure(data, 600, 5);
+		const middle = measure(data, 600, 5, { inRun: true, isLast: false });
+		const last = measure(data, 600, 5, { inRun: true, isLast: true });
+		expect(middle).toMatchObject({ inRun: true, isLast: false });
+		expect(last).toMatchObject({ inRun: true, isLast: true });
+		expect(standalone).toMatchObject({ inRun: false, isLast: false });
+		expect(middle.height).toBe(standalone.height - 1);
+		expect(last.height).toBe(standalone.height - 2);
+		expect(last.contentWidth).toBe(standalone.contentWidth + 2);
+		expect(last.frame).toEqual(middle.frame);
+		expect(data).toEqual(original);
+	});
+
+	it("prepared measurers retain run opts across widths", async () => {
+		const { prepareWebSearchMeasurer } = await import("./measure-web-search");
+		const measure = prepareWebSearchMeasurer(
+			{ query: "long query ".repeat(20) },
+			{
+				inRun: true,
+				isLast: true,
+			},
+		);
+		for (const width of [100, 600]) {
+			expect(measure(width)).toMatchObject({ inRun: true, isLast: true });
+		}
+	});
 	it("renders a short completed search as a single fixed-height row", async () => {
 		const { measureWebSearch, MEASURE_WEB_SEARCH_CONSTANTS } = await import("./measure-web-search");
 		const r = measureWebSearch({ query: "cats", status: "completed", label: "Searched" }, 600);

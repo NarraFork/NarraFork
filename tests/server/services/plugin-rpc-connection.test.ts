@@ -1,8 +1,10 @@
 import { describe, expect, it, spyOn } from "bun:test";
-import type {
-	JsonRpcEnvelope,
-	JsonRpcNotification,
-	JsonRpcResponse,
+import {
+	type JsonRpcEnvelope,
+	type JsonRpcNotification,
+	type JsonRpcRequest,
+	type JsonRpcResponse,
+	PROVIDER_REQUEST_MAX_BYTES,
 } from "../../../server/lib/plugins/protocol";
 import { PluginHostDispatcher } from "../../../server/services/plugin-host-dispatcher";
 import {
@@ -159,29 +161,87 @@ describe("PluginRpcConnection", () => {
 		await connection.close();
 	});
 
-	it("sends a long outbound request without enlarging the inbound frame limit", async () => {
+	it("sends a full 64 MiB image request, rejects one extra byte, and preserves inbound limits", async () => {
+		expect(PROVIDER_REQUEST_MAX_BYTES).toBe(64 * 1024 * 1024);
 		const transport = new MemoryTransport();
 		const connection = new PluginRpcConnection({
 			transport,
 			maxFrameBytes: 1024,
-			maxOutboundFrameBytes: 12 * 1024 * 1024,
+			maxOutboundFrameBytes: PROVIDER_REQUEST_MAX_BYTES,
 		});
+		const request: JsonRpcRequest = {
+			jsonrpc: "2.0",
+			id: "image-boundary",
+			method: "provider.chat",
+			params: {
+				protocolVersion: "1.0",
+				operationId: "op-boundary",
+				request: {
+					current: {
+						text: "图片边界",
+						images: [{ mediaType: "image/png", dataBase64: "" }],
+						toolResults: [],
+					},
+					history: [],
+					tools: [],
+				},
+			},
+		};
+		const params = request.params as {
+			request: {
+				current: { text: string; images: Array<{ mediaType: string; dataBase64: string }> };
+			};
+		};
+		// Size the complete UTF-8 JSON body, not decoded image bytes or the framing header.
+		const overhead = Buffer.byteLength(JSON.stringify(request), "utf8");
+		const available = PROVIDER_REQUEST_MAX_BYTES - overhead;
+		params.request.current.text += "x".repeat(available % 4);
+		params.request.current.images[0].dataBase64 = "A".repeat(available - (available % 4));
+		expect(Buffer.byteLength(JSON.stringify(request), "utf8")).toBe(PROVIDER_REQUEST_MAX_BYTES);
 		transport.onSend = (message) => {
 			if ("id" in message && message.id !== undefined)
 				transport.emit(responseFor(message.id, true));
 		};
 		try {
-			// Exceeds both the old 1 MiB frame limit and the old 8 MiB writer budget.
 			await expect(
-				connection.request("provider.chat", {
-					history: Array.from({ length: 20 }, () => ({
-						role: "user",
-						text: "x".repeat(512 * 1024),
-					})),
-				}),
+				connection.request(request.method, params, { id: request.id }),
 			).resolves.toMatchObject({ result: true });
+			await eventually(() => connection.queuedMessages === 0);
+			expect(transport.writes.length).toBe(1);
+			expect(connection.getDiagnostics()).toMatchObject({
+				outboundPending: 0,
+				queuedBytes: 0,
+				queuedMessages: 0,
+			});
+			// Drop the successful frame reference before constructing the oversized request.
+			transport.writes.length = 0;
+			params.request.current.text += "x";
+			expect(Buffer.byteLength(JSON.stringify(request), "utf8")).toBe(
+				PROVIDER_REQUEST_MAX_BYTES + 1,
+			);
+			await expect(
+				connection.request(request.method, params, { id: request.id }),
+			).rejects.toMatchObject({ code: "OUTBOUND_FRAME_LIMIT" });
+			expect(transport.writes.length).toBe(0);
+			expect(connection.isClosed).toBe(false);
+			expect(connection.getDiagnostics()).toMatchObject({
+				outboundPending: 0,
+				queuedBytes: 0,
+				queuedMessages: 0,
+			});
+			await expect(
+				connection.request("plugin.health", {}, { id: "health-after-limit" }),
+			).resolves.toMatchObject({ result: true });
+			await eventually(() => connection.queuedMessages === 0);
+			expect(transport.writes.length).toBe(1);
+			expect(transport.writes[0]).toMatchObject({ method: "plugin.health" });
+			expect(connection.getDiagnostics()).toMatchObject({
+				outboundPending: 0,
+				queuedBytes: 0,
+				queuedMessages: 0,
+			});
 			expect(connection.getLimits().maxInboundFrameBytes).toBe(1024);
-			expect(connection.getLimits().maxQueuedBytes).toBeGreaterThan(12 * 1024 * 1024);
+			expect(connection.getLimits().maxQueuedBytes).toBeGreaterThan(PROVIDER_REQUEST_MAX_BYTES);
 			transport.emit(notification("too-large", { text: "x".repeat(2048) }));
 			await eventually(() => connection.isClosed);
 		} finally {

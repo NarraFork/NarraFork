@@ -1,5 +1,5 @@
 /**
- * Affordance for an EXTERNAL narrator being dragged over the sidebar.
+ * Shared affordance for sidebar reordering and external narrator drops.
  *
  * Two shapes, because the two outcomes are not variations of each other: an insertion
  * LINE for "order it here", and a BOX around a workspace group for "join this workspace".

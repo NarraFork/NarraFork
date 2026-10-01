@@ -82,6 +82,16 @@ export interface WebSearchBlockData {
 	label?: string | null;
 }
 
+export interface MeasureWebSearchOpts {
+	inRun?: boolean;
+	isLast?: boolean;
+}
+
+export interface MeasuredWebSearch extends MeasuredElement {
+	inRun: boolean;
+	isLast: boolean;
+}
+
 /** Resolve the display query: block.query, else the joined block.queries. */
 export function resolveWebSearchQuery(block: WebSearchBlockData): string | null {
 	if (typeof block.query === "string" && block.query.length > 0) return block.query;
@@ -122,14 +132,19 @@ export function measureWebSearch(
 	block: WebSearchBlockData,
 	contentWidth: number,
 	_lod: RenderLod = DEFAULT_RENDER_LOD,
-): MeasuredElement {
+	opts: MeasureWebSearchOpts = {},
+): MeasuredWebSearch {
+	const inRun = opts.inRun === true;
+	const isLast = opts.isLast === true;
+	const border = inRun ? 0 : WEB_SEARCH_BORDER * 2;
+	const divider = inRun && !isLast ? 1 : 0;
 	const query = resolveWebSearchQuery(block);
 	const isSearching = isWebSearchSearching(block);
 	const label = block.label ?? fallbackLabel(isSearching, block.status);
 
 	const chromeLeft = webSearchChromeLeft(isSearching);
 	// Inner content box width (inside padding + border).
-	const innerWidth = Math.max(1, contentWidth - WEB_SEARCH_PADDING * 2 - WEB_SEARCH_BORDER * 2);
+	const innerWidth = Math.max(1, contentWidth - WEB_SEARCH_PADDING * 2 - border);
 
 	const items: RichInlineItem[] = [
 		{ text: label, font: typographyMetrics().font.xs, break: "normal", extraWidth: 0 },
@@ -170,9 +185,11 @@ export function measureWebSearch(
 
 	// Row height is the taller of the fixed icon lane vs the (possibly wrapped) text.
 	const rowHeight = Math.max(WEB_SEARCH_ICON_SIZE, frame.contentHeight);
-	const height = WEB_SEARCH_VERTICAL_CHROME + rowHeight;
+	const height = WEB_SEARCH_PADDING * 2 + border + rowHeight + divider;
 
 	return {
+		inRun,
+		isLast,
 		height,
 		blocks,
 		frame,
@@ -185,9 +202,10 @@ export function measureWebSearch(
 /** Parse once, measure many (e.g. on resize). Returns a reusable closure. */
 export function prepareWebSearchMeasurer(
 	block: WebSearchBlockData,
-): (contentWidth: number, lod?: RenderLod) => MeasuredElement {
+	opts: MeasureWebSearchOpts = {},
+): (contentWidth: number, lod?: RenderLod) => MeasuredWebSearch {
 	return (contentWidth: number, lod: RenderLod = DEFAULT_RENDER_LOD) =>
-		measureWebSearch(block, contentWidth, lod);
+		measureWebSearch(block, contentWidth, lod, opts);
 }
 
 export const MEASURE_WEB_SEARCH_CONSTANTS = {

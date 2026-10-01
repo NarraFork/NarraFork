@@ -16,6 +16,7 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
+import { Divider } from "@mantine/core";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { Fragment, useMemo } from "react";
 import {
@@ -23,6 +24,7 @@ import {
 	IMGGEN_ICON_SIZE,
 	IMGGEN_LOADER_SIZE,
 	IMGGEN_PAPER_PADDING,
+	type MeasuredImageGeneration,
 } from "../measure/measure-media";
 import type {
 	BlockFrame,
@@ -226,6 +228,7 @@ function RenderImageGeneration({
 	narratorId?: string;
 }) {
 	const { blocks, frame, contentWidth } = measured;
+	const { inRun, isLast } = measured as Partial<MeasuredImageGeneration>;
 	const header = blocks[0] as PreparedInlineBlock;
 	const headerFrame = frame.blocks[0]!;
 	const imageBlock = blocks[1];
@@ -235,64 +238,67 @@ function RenderImageGeneration({
 	const iconArea = IMGGEN_ICON_SIZE + IMGGEN_GROUP_GAP + loaderWidth;
 
 	return (
-		<div
-			style={{
-				position: "relative",
-				padding: IMGGEN_PAPER_PADDING,
-				border: "1px solid var(--mantine-color-default-border)",
-				borderRadius: "var(--mantine-radius-sm)",
-				boxSizing: "border-box",
-			}}
-		>
-			<div style={{ position: "relative", height: frame.contentHeight }}>
-				{/* Header row: icon (+ loader) at left, wrapping status/prompt text. */}
-				<div
-					style={{
-						position: "absolute",
-						top: headerFrame.top,
-						left: 0,
-						width: IMGGEN_ICON_SIZE,
-						height: IMGGEN_ICON_SIZE,
-						display: "flex",
-						alignItems: "center",
-						justifyContent: "center",
-						borderRadius: "var(--mantine-radius-sm)",
-						background: "var(--mantine-color-violet-light)",
-						color: "var(--mantine-color-violet-light-color)",
-					}}
-				>
-					<PhotoGlyph />
-				</div>
-				{generating ? (
+		<div>
+			<div
+				style={{
+					position: "relative",
+					padding: IMGGEN_PAPER_PADDING,
+					border: inRun ? 0 : "1px solid var(--mantine-color-default-border)",
+					borderRadius: inRun ? 0 : "var(--mantine-radius-sm)",
+					boxSizing: "border-box",
+				}}
+			>
+				<div style={{ position: "relative", height: frame.contentHeight }}>
+					{/* Header row: icon (+ loader) at left, wrapping status/prompt text. */}
 					<div
 						style={{
 							position: "absolute",
 							top: headerFrame.top,
-							left: IMGGEN_ICON_SIZE + IMGGEN_GROUP_GAP,
-							width: IMGGEN_LOADER_SIZE,
+							left: 0,
+							width: IMGGEN_ICON_SIZE,
 							height: IMGGEN_ICON_SIZE,
 							display: "flex",
 							alignItems: "center",
-							color: "var(--mantine-color-violet-6)",
-							fontSize: IMGGEN_LOADER_SIZE,
+							justifyContent: "center",
+							borderRadius: "var(--mantine-radius-sm)",
+							background: "var(--mantine-color-violet-light)",
+							color: "var(--mantine-color-violet-light-color)",
 						}}
 					>
-						…
+						<PhotoGlyph />
 					</div>
-				) : null}
-				<HeaderInlineView block={header} frame={headerFrame} contentLeft={iconArea} />
+					{generating ? (
+						<div
+							style={{
+								position: "absolute",
+								top: headerFrame.top,
+								left: IMGGEN_ICON_SIZE + IMGGEN_GROUP_GAP,
+								width: IMGGEN_LOADER_SIZE,
+								height: IMGGEN_ICON_SIZE,
+								display: "flex",
+								alignItems: "center",
+								color: "var(--mantine-color-violet-6)",
+								fontSize: IMGGEN_LOADER_SIZE,
+							}}
+						>
+							…
+						</div>
+					) : null}
+					<HeaderInlineView block={header} frame={headerFrame} contentLeft={iconArea} />
 
-				{/* Image area: aspect-ratio reserved box or unknown placeholder. */}
-				{imageBlock && imageFrame ? (
-					<ImageAreaView
-						block={imageBlock}
-						frame={imageFrame}
-						contentWidth={contentWidth}
-						resolveImageSrc={resolveImageSrc}
-						narratorId={narratorId}
-					/>
-				) : null}
+					{/* Image area: aspect-ratio reserved box or unknown placeholder. */}
+					{imageBlock && imageFrame ? (
+						<ImageAreaView
+							block={imageBlock}
+							frame={imageFrame}
+							contentWidth={contentWidth}
+							resolveImageSrc={resolveImageSrc}
+							narratorId={narratorId}
+						/>
+					) : null}
+				</div>
 			</div>
+			{inRun && !isLast ? <Divider color="var(--mantine-color-default-border)" size={1} /> : null}
 		</div>
 	);
 }

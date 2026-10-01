@@ -120,13 +120,21 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		kind: "media",
 		label: "Image / generated image / text file",
 		lodSensitive: false,
-		measure: (d, w, l) => measureMedia(d as AnyData, w, l),
+		measure: (d, w, l, o) =>
+			measureMedia(d as AnyData, w, l, {
+				inRun: o?.inRun === true,
+				isLast: o?.isLast === true,
+			}),
 	},
 	"web-search": {
 		kind: "web-search",
 		label: "Web search",
 		lodSensitive: false,
-		measure: (d, w, l) => measureWebSearch(d as AnyData, w, l),
+		measure: (d, w, l, o) =>
+			measureWebSearch(d as AnyData, w, l, {
+				inRun: o?.inRun === true,
+				isLast: o?.isLast === true,
+			}),
 	},
 	"system-simple": {
 		kind: "system-simple",

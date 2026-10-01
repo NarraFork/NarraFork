@@ -47,6 +47,14 @@ export interface ProxyOverride {
 	url?: string;
 }
 
+/** Minimal settings patch; explicit default survives JSON and clears old overrides. */
+export function buildWebToolProxyPatch(tool: "webFetch" | "browser", next?: ProxyOverride) {
+	const proxy = next ?? { mode: "default" as const };
+	return {
+		agent: tool === "webFetch" ? { webFetchPolicy: { proxy } } : { browserProxy: proxy },
+	};
+}
+
 export function normalizeProxyOverrideMode(value: unknown): ProxyOverrideMode {
 	return value === "direct" || value === "system" || value === "custom" || value === "default"
 		? value

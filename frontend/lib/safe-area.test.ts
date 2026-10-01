@@ -707,6 +707,40 @@ describe("mobile safe-area layout contract", () => {
 		expect(opened.viewportBottom).toBe(500);
 	});
 
+	test("keyboard updates never temporarily expand the shell while measuring viewport units", () => {
+		const realm = trackerRealm();
+		realm.focus(realm.document.querySelector("textarea"));
+		realm.visualViewport.height = 500;
+		const overridesDuringMeasurement: string[] = [];
+		const cleanup = installAppViewportTracking(realm.window, realm.document, (unit) => {
+			overridesDuringMeasurement.push(realm.readPublishedBottom());
+			return unit.startsWith("env(") ? 0 : 844;
+		});
+		try {
+			expect(realm.readPublishedBottom()).toBe("500px");
+			overridesDuringMeasurement.length = 0;
+			// A repeated visualViewport event / focus settle callback must not remove
+			// the current height before synchronous layout reads: that expands the
+			// message list, clamps scrollTop, then shrinks it back at the same height.
+			realm.resizeVisualViewport(500);
+			expect(overridesDuringMeasurement).toEqual(["500px", "500px", "500px"]);
+			expect(realm.readPublishedBottom()).toBe("500px");
+
+			overridesDuringMeasurement.length = 0;
+			realm.resizeVisualViewport(420);
+			expect(overridesDuringMeasurement).toEqual(["500px", "500px", "500px"]);
+			expect(realm.readPublishedBottom()).toBe("420px");
+
+			overridesDuringMeasurement.length = 0;
+			realm.focus(null);
+			realm.resizeVisualViewport(844);
+			expect(overridesDuringMeasurement).toEqual(["420px", "420px", "420px"]);
+			expect(realm.readPublishedBottom()).toBe("");
+		} finally {
+			cleanup();
+		}
+	});
+
 	test("the root tracker never publishes a fractional shell height", () => {
 		// iPhone 8 Plus (414x736, DPR 3, no safe area) reports fractional
 		// visualViewport heights. Publishing them verbatim left a hairline row at

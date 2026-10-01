@@ -1,12 +1,32 @@
 import { describe, expect, test } from "bun:test";
 import {
 	buildProxyOverride,
+	buildWebToolProxyPatch,
 	commitProxyUrlDraft,
 	normalizeProxyUrl,
 	summarizeOutboundProxyPolicy,
 } from "./proxy";
 
 describe("proxy helpers", () => {
+	test("web tool patches retain explicit inheritance through JSON without unrelated settings", () => {
+		expect(JSON.parse(JSON.stringify(buildWebToolProxyPatch("webFetch")))).toEqual({
+			agent: { webFetchPolicy: { proxy: { mode: "default" } } },
+		});
+		expect(JSON.parse(JSON.stringify(buildWebToolProxyPatch("browser")))).toEqual({
+			agent: { browserProxy: { mode: "default" } },
+		});
+	});
+
+	test("web tool patches target only the selected tool", () => {
+		const proxy = { mode: "custom" as const, url: "http://proxy.example:8080" };
+		expect(buildWebToolProxyPatch("webFetch", proxy)).toEqual({
+			agent: { webFetchPolicy: { proxy } },
+		});
+		expect(buildWebToolProxyPatch("browser", { mode: "direct" })).toEqual({
+			agent: { browserProxy: { mode: "direct" } },
+		});
+	});
+
 	test("normalizes proxy URLs without schemes", () => {
 		expect(normalizeProxyUrl("proxy.example.test:8080")).toBe("http://proxy.example.test:8080");
 		expect(normalizeProxyUrl("127.0.0.1:8080")).toBe("http://127.0.0.1:8080");

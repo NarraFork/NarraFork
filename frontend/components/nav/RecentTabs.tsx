@@ -1,31 +1,8 @@
+import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
 import {
-	type CollisionDetection,
-	closestCenter,
-	DndContext,
-	type DragEndEvent,
-	type DragMoveEvent,
-	DragOverlay,
-	type DragStartEvent,
-	type DropAnimationFunctionArguments,
-	MouseSensor,
-	pointerWithin,
-	TouchSensor,
-	useSensor,
-	useSensors,
-} from "@dnd-kit/core";
-import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
-import {
-	applyDirectoryMemberOrder,
 	directoryRowId,
-	directoryRowKeyBlock,
-	directoryRowSortableIds,
-	directoryRowSortId,
 	groupRecentTabsByDirectory,
-	moveDirectoryRow,
 	type RecentTabRow,
-	resolveDirectoryDropTarget,
-	sameRecentTabOrder,
 } from "@frontend/hooks/recent-tab-directory-groups";
 import { isLoopbackBrowserOrigin } from "@frontend/lib/local-origin";
 import {
@@ -79,7 +56,7 @@ import {
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCollapsedTabDirectories } from "../../hooks/useCollapsedTabDirectories";
 import { useArchiveNarrator } from "../../hooks/useNarrator";
@@ -90,14 +67,11 @@ import {
 	addRecentTab,
 	addRecentTabOrThrow,
 	addRecentTabsBatch,
-	applyRecentTabMove,
-	applyRecentTabsDelta,
 	applyRecentTabsDeltaAndFollowUp,
 	applyRecentTabsRuntimePatches,
 	bumpRecentTabRuntimeVersions,
 	clampRecentTabText,
 	collectRecentTabsDeltaFrame,
-	computeRecentTabOrderMoves,
 	normalizeRecentTabViewers,
 	pruneRecentTabsRuntimeVersions,
 	type RecentTab,
@@ -122,13 +96,12 @@ import {
 	triggerNotification,
 	updateAsyncQuestionAttention,
 } from "../../lib/notification";
-import { endDrag, moveDrag, startDragManual, startPointerDrag } from "../../lib/panel-drag";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 
 import { UserAvatar } from "../UserAvatar";
 import { RecentTabDirectoryRow, type RecentTabDirectoryRowProps } from "./RecentTabDirectoryRow";
 import { RecentTabDropIndicator } from "./RecentTabDropIndicator";
-import type { RecentTabDropRow, RecentTabDropTarget } from "./recent-tab-drop-target";
+import type { RecentTabDropTarget } from "./recent-tab-drop-target";
 /*
  * Imported, NOT re-exported.
  *
@@ -140,13 +113,13 @@ import type { RecentTabDropRow, RecentTabDropTarget } from "./recent-tab-drop-ta
  * reload. Importers must reach the logic module directly.
  */
 import {
-	autoScrollAllowedForPointer,
 	clampSwipeTravel,
 	classifySwipeRelease,
 	isTabActive,
 	SWIPE_THRESHOLD,
 } from "./recent-tabs-logic";
 import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
+import { useRecentTabsDrag } from "./useRecentTabsDrag";
 
 const CreateNarratorModal = React.lazy(() =>
 	import("../narrator/CreateNarratorModal").then((m) => ({
@@ -255,26 +228,6 @@ const CONTAINER_STATUS_I18N: Record<string, string> = {
 
 const QUERY_KEY = ["user-preferences", "recent-tabs"];
 
-/**
- * Horizontal band that a scroll container's auto-scroll is allowed in.
- *
- * The container itself is the inner `overflow:auto` box, which sits inside the navbar's
- * horizontal padding. Gating on its own rect would leave that padding as a dead strip
- * where a drag still inside the sidebar stops scrolling. So the enclosing `<nav>` is
- * preferred when there is one, and the element's own rect is the fallback for any
- * scroll container outside the navbar.
- */
-function autoScrollGateRect(element: Element): { left: number; right: number } {
-	const nav = element.closest("nav");
-	return (nav ?? element).getBoundingClientRect();
-}
-
-/** Viewport x of a drag's activator event, or null for non-pointer activations. */
-function pointerXFromActivatorEvent(activatorEvent: Event): number | null {
-	const e = activatorEvent as MouseEvent | TouchEvent;
-	if ("clientX" in e) return e.clientX;
-	return e.touches?.[0]?.clientX ?? null;
-}
 const PREFETCH_QUERY_GC_TIME_MS = 5 * 60_000;
 
 function getRecentTabNarratorId(tab: RecentTab): string | null {
@@ -284,18 +237,13 @@ function getRecentTabNarratorId(tab: RecentTab): string | null {
 	return null;
 }
 
-// Module-level flag: set on dragEnd, cleared on next click capture.
-// Prevents the synthetic click after drag from triggering Link navigation.
-let justDragged = false;
+// Each list owns its click guard and pending submission state.
+const RecentTabsDragContext = React.createContext<
+	Pick<ReturnType<typeof useRecentTabsDrag>, "pending" | "consumeClick">
+>({ pending: false, consumeClick: () => false });
 
 function tabSortId(tab: RecentTab) {
 	return `${tab.type}:${tab.id}`;
-}
-
-function workspaceGroupId(tab: RecentTab | undefined): string | null {
-	if (!tab) return null;
-	if (tab.type === "workspace") return tab.id;
-	return tab.workspaceId ?? null;
 }
 
 // === Shared hook: WS subscription + cache updates (mount once in root) ===
@@ -617,46 +565,6 @@ interface RecentTabListProps {
 }
 
 /**
- * Custom collision detection that groups workspace children with their header.
- * When the pointer is over any workspace child (or its workspace header),
- * the entire workspace group is treated as a single drop target.
- * This ensures dragging an external item over a workspace causes the whole
- * group to shift together visually.
- */
-function workspaceGroupCollisionDetection(
-	args: Parameters<CollisionDetection>[0],
-	sortItemsById: Map<string, RecentTab>,
-): ReturnType<CollisionDetection> {
-	const baseCollisions = pointerWithin(args);
-	const collisions = baseCollisions.length > 0 ? baseCollisions : closestCenter(args);
-	if (collisions.length === 0) return collisions;
-
-	const first = collisions[0];
-	if (!first) return collisions;
-
-	const overTab = sortItemsById.get(String(first.id));
-	if (!overTab) return collisions;
-
-	const activeTab = sortItemsById.get(String(args.active.id));
-	const overWorkspaceId = workspaceGroupId(overTab);
-	const activeChildWorkspaceId = activeTab?.workspaceId ?? null;
-
-	if (activeChildWorkspaceId) {
-		if (overWorkspaceId === activeChildWorkspaceId) {
-			return collisions;
-		}
-		return [{ ...first, id: args.active.id }];
-	}
-
-	if (!overWorkspaceId) return collisions;
-
-	const wsHeader = sortItemsById.get(`workspace:${overWorkspaceId}`);
-	if (!wsHeader) return collisions;
-
-	return [{ ...first, id: tabSortId(wsHeader) }];
-}
-
-/**
  * Renders a filtered subset of recent tabs with DnD, clear button, etc.
  * `filter="project"` shows project tabs; `filter="narrator"` shows chapter+narrator tabs.
  */
@@ -738,469 +646,50 @@ export function RecentTabList({
 	// "New narrator in this directory" modal state (cwd pre-filled from a tab)
 	const [newNarratorCwd, setNewNarratorCwd] = useState<string | null>(null);
 
-	// Drag state: the tab currently being dragged (for workspace, tracks the whole group)
-	const [draggingTabId, setDraggingTabId] = useState<string | null>(null);
-	const [optimisticTabs, setOptimisticTabs] = useState<RecentTab[] | null>(null);
-	// When true, all sortable items skip their transition so the post-drop
-	// layout snaps into place without any sliding animation.
-	const [dropSnap, setDropSnap] = useState(false);
-
-	const renderTabs = optimisticTabs ?? tabs;
-
-	/**
-	 * True while directory mode is replaying a multi-move sequence.
-	 *
-	 * One aggregated drop can expand into several serial `moveRecentTab` requests, and the
-	 * optimistic order must survive all of them. State rather than a ref because the
-	 * convergence effect below genuinely depends on it: it arms its fallback timeout only
-	 * once the replay finishes, and must re-run when that flips. On a slow connection the
-	 * old unconditional timeout fired mid-sequence, so the list snapped back to the old
-	 * order and then jumped to the new one.
-	 */
-	const [dirReplayInFlight, setDirReplayInFlight] = useState(false);
-
-	useEffect(() => {
-		if (!optimisticTabs || draggingTabId) return;
-		// Compares `dirSortOrder` too: an in-group reorder leaves the flat sequence
-		// untouched, so an identity-only check reads as converged immediately and the
-		// row springs back for one round trip.
-		if (sameRecentTabOrder(optimisticTabs, tabs)) {
-			setOptimisticTabs(null);
-			return;
-		}
-		// Still replaying: the server order is legitimately mid-sequence, so waiting is
-		// correct and a timeout here would only expose an intermediate state.
-		if (dirReplayInFlight) return;
-
-		// Fallback for the case where the server order never converges to the optimistic
-		// one (a move was rejected, or another client reordered concurrently). Dropping
-		// the mask is the honest outcome: what the server holds is the truth.
-		const timeout = window.setTimeout(() => {
-			setOptimisticTabs(null);
-		}, 1000);
-		return () => window.clearTimeout(timeout);
-	}, [optimisticTabs, tabs, draggingTabId, dirReplayInFlight]);
-
-	const filtered = useMemo(
-		() =>
-			filter === "project"
-				? renderTabs.filter((t) => t.type === "project")
-				: renderTabs.filter((t) => t.type !== "project"),
-		[renderTabs, filter],
-	);
-
-	// Split into top-level tabs and workspace children
-	const { topLevel, childrenByWorkspace } = useMemo(() => {
-		const top: RecentTab[] = [];
-		const byWs = new Map<string, RecentTab[]>();
-		for (const tab of filtered) {
-			if (tab.workspaceId) {
-				const arr = byWs.get(tab.workspaceId);
-				if (arr) arr.push(tab);
-				else byWs.set(tab.workspaceId, [tab]);
-			} else {
-				top.push(tab);
-			}
-		}
-		return { topLevel: top, childrenByWorkspace: byWs };
-	}, [filtered]);
-
-	// Build a flat array of all items in visual order (topLevel + their workspace children).
-	// This ensures dnd-kit sees the true layout so that dragging external items over
-	// a workspace causes the whole group (header + children) to shift together.
-	// Split into pinned and unpinned groups for separate DnD contexts.
-	const { pinnedItems, unpinnedItems } = useMemo(() => {
-		const pinned: RecentTab[] = [];
-		const unpinned: RecentTab[] = [];
-		for (const tab of topLevel) {
-			const target = tab.pinned ? pinned : unpinned;
-			target.push(tab);
-			if (tab.type === "workspace") {
-				const children = childrenByWorkspace.get(tab.id) ?? [];
-				target.push(...children);
-			}
-		}
-		return { pinnedItems: pinned, unpinnedItems: unpinned };
-	}, [topLevel, childrenByWorkspace]);
-
-	/**
-	 * Directory-aggregated rows for the unpinned group.
-	 *
-	 * Built from the unpinned TOP-LEVEL tabs; workspace children are folded into their
-	 * header's unit inside `groupRecentTabsByDirectory`, so a workspace the user assembled
-	 * by hand is neither scattered into directory groups nor split by a drag.
-	 */
-	const directoryRows = useMemo(() => {
-		if (!groupingEnabled) return [];
-		return groupRecentTabsByDirectory(
-			topLevel.filter((tab) => !tab.pinned),
-			childrenByWorkspace,
-		);
-	}, [groupingEnabled, topLevel, childrenByWorkspace]);
-	const directoryRowsRef = useRef(directoryRows);
-	directoryRowsRef.current = directoryRows;
-	/** Sortable id currently dragged in directory mode; its unit's children collapse. */
-	const [dirDraggingId, setDirDraggingId] = useState<string | null>(null);
-
-	/**
-	 * Collapsed state per directory path, resolved once and shared.
-	 *
-	 * Both the renderer and `directorySortIds` need this answer, and they must not
-	 * disagree: registering a sortable id for a row that did not render leaves dnd-kit
-	 * with an id it cannot measure. Computing it twice is exactly how the two would
-	 * drift, so it is derived here and read from both places.
-	 */
+	const listBoxRef = useRef<HTMLDivElement | null>(null);
+	// Collapse is a user/view preference, never a temporary drag state.
 	const directoryCollapsedByPath = useMemo(() => {
-		const map = new Map<string, boolean>();
-		for (const row of directoryRows) {
-			if (row.kind !== "directory") continue;
-			const containsActive = row.children.some((child) => isTabActive(child, pathname));
-			const containsPending =
-				!!pendingKey && row.children.some((child) => `${child.type}:${child.id}` === pendingKey);
-			map.set(row.path, isDirectoryCollapsed(row.path, { containsActive, containsPending }));
+		const children = new Map<string, RecentTab[]>();
+		for (const tab of tabs) {
+			if (!tab.workspaceId) continue;
+			const group = children.get(tab.workspaceId) ?? [];
+			group.push(tab);
+			children.set(tab.workspaceId, group);
 		}
-		return map;
-	}, [directoryRows, pathname, pendingKey, isDirectoryCollapsed]);
-
-	const directorySortIds = useMemo(
-		() =>
-			directoryRows.flatMap((row) =>
-				directoryRowSortableIds(row, {
-					collapsed: row.kind === "directory" ? directoryCollapsedByPath.get(row.path) : undefined,
-					dragging:
-						row.kind === "directory" ? dirDraggingId === directoryRowId(row.path) : undefined,
-				}),
-			),
-		[directoryRows, directoryCollapsedByPath, dirDraggingId],
+		const rows = groupRecentTabsByDirectory(
+			tabs.filter((tab) => !tab.workspaceId && !tab.pinned),
+			children,
+		);
+		return new Map(
+			rows.flatMap((row) => {
+				if (row.kind !== "directory") return [];
+				const containsActive = row.children.some((child) => isTabActive(child, pathname));
+				const containsPending =
+					!!pendingKey && row.children.some((child) => tabSortId(child) === pendingKey);
+				return [
+					[row.path, isDirectoryCollapsed(row.path, { containsActive, containsPending })] as const,
+				];
+			}),
+		);
+	}, [tabs, pathname, pendingKey, isDirectoryCollapsed]);
+	const onReorderError = useCallback(() => {
+		notifications.show({ color: "red", message: t("recentTabsReorderFailed") });
+	}, [t]);
+	const drag = useRecentTabsDrag({
+		tabs,
+		groupingEnabled,
+		directoryCollapsedByPath,
+		containerRef: listBoxRef,
+		qc,
+		onError: onReorderError,
+	});
+	const dragInteraction = useMemo(
+		() => ({ pending: drag.pending, consumeClick: drag.consumeClick }),
+		[drag.pending, drag.consumeClick],
 	);
 
-	// Stable sort-id arrays for SortableContext
-	const pinnedSortIds = useMemo(() => pinnedItems.map(tabSortId), [pinnedItems]);
-	const unpinnedSortIds = useMemo(() => unpinnedItems.map(tabSortId), [unpinnedItems]);
-	const pinnedItemsBySortId = useMemo(
-		() => new Map(pinnedItems.map((tab) => [tabSortId(tab), tab])),
-		[pinnedItems],
-	);
-	const unpinnedItemsBySortId = useMemo(
-		() => new Map(unpinnedItems.map((tab) => [tabSortId(tab), tab])),
-		[unpinnedItems],
-	);
-
-	// Helper: for a given sortIdx in a specific group, return the indices of the whole workspace group
-	// that the item at that index belongs to (header + all children).
-	// Returns a range [startIdx, endIdx] (inclusive).
-	// Returns [idx, idx] for non-workspace items.
-	const getWorkspaceGroupRange = useCallback(
-		(items: RecentTab[], idx: number): [start: number, end: number] => {
-			const tab = items[idx];
-			if (!tab) return [idx, idx];
-			if (tab.type !== "workspace") return [idx, idx];
-			// Find the last index of this workspace's children
-			let end = idx;
-			for (let i = idx + 1; i < items.length; i++) {
-				if (items[i].workspaceId === tab.id) end = i;
-				else break;
-			}
-			return [idx, end];
-		},
-		[],
-	);
-
-	// Custom collision detection factory for a specific group
-	const pinnedCollisionDetection = useMemo(
-		() => (args: Parameters<CollisionDetection>[0]) =>
-			workspaceGroupCollisionDetection(args, pinnedItemsBySortId),
-		[pinnedItemsBySortId],
-	);
-
-	const unpinnedCollisionDetection = useMemo(
-		() => (args: Parameters<CollisionDetection>[0]) =>
-			workspaceGroupCollisionDetection(args, unpinnedItemsBySortId),
-		[unpinnedItemsBySortId],
-	);
-
-	const sensors = useSensors(
-		useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
-		useSensor(TouchSensor, { activationConstraint: { delay: 300, tolerance: 5 } }),
-	);
-
-	/**
-	 * Viewport x of the pointer for the in-flight drag, or null when unknown.
-	 *
-	 * A ref rather than state because it is written on every pointer move and only read
-	 * from `canScroll` below — re-rendering the whole tab list per frame is exactly what
-	 * this file avoids elsewhere.
-	 */
-	const dragPointerXRef = useRef<number | null>(null);
-
-	/**
-	 * Scope auto-scroll to the sidebar column.
-	 *
-	 * Without this the tab list keeps scrolling after the pointer has moved onto the
-	 * narrator / workspace area, because dnd-kit derives the vertical scroll direction
-	 * from the pointer's height alone. See `autoScrollAllowedForPointer`.
-	 */
-	const autoScrollOptions = useMemo(
-		() => ({
-			canScroll: (element: Element) =>
-				autoScrollAllowedForPointer(dragPointerXRef.current, autoScrollGateRect(element)),
-		}),
-		[],
-	);
-
-	// Height of the workspace group (header + children) measured on drag start.
-	// Applied to the header's sortable wrapper when isDragging so dnd-kit reserves
-	// the full group height as the gap placeholder.
-	const [wsGroupHeight, setWsGroupHeight] = useState<number | null>(null);
-	// Workspace ID whose children should stay collapsed (cleared with wsGroupHeight).
-	const [collapsedWsId, setCollapsedWsId] = useState<string | null>(null);
-	// Track which group (pinned/unpinned) is currently being dragged
-	const [activeGroup, setActiveGroup] = useState<"pinned" | "unpinned" | null>(null);
-
-	// Bridge @dnd-kit drag into global narrator drag so workspace panels can receive drops
-	const pinnedItemsRef = useRef(pinnedItems);
-	pinnedItemsRef.current = pinnedItems;
-	const unpinnedItemsRef = useRef(unpinnedItems);
-	unpinnedItemsRef.current = unpinnedItems;
-
-	const handleDragStartForGroup = useCallback(
-		(group: "pinned" | "unpinned", event: DragStartEvent) => {
-			setOptimisticTabs(null);
-			const activeId = event.active.id as string;
-			setDraggingTabId(activeId);
-			setActiveGroup(group);
-			// Seed the auto-scroll gate here, not only in onDragMove: the body below
-			// returns early for tabs with no narrator, and auto-scroll can already run
-			// on the frames before the first move event.
-			dragPointerXRef.current = pointerXFromActivatorEvent(event.activatorEvent);
-
-			const items = group === "pinned" ? pinnedItemsRef.current : unpinnedItemsRef.current;
-
-			// Measure workspace group height before children collapse
-			const tab = items.find((t) => tabSortId(t) === activeId);
-			if (tab?.type === "workspace") {
-				setCollapsedWsId(tab.id);
-				const headerEl = document.querySelector(
-					`[data-tab-sort-id="${globalThis.CSS.escape(activeId)}"]`,
-				) as HTMLElement | null;
-				if (headerEl) {
-					let totalHeight = headerEl.offsetHeight;
-					let sibling = headerEl.nextElementSibling as HTMLElement | null;
-					while (sibling) {
-						const sibId = sibling.getAttribute("data-tab-sort-id");
-						if (!sibId) break;
-						const sibTab = items.find((t) => tabSortId(t) === sibId);
-						if (!sibTab || sibTab.workspaceId !== tab.id) break;
-						totalHeight += sibling.offsetHeight;
-						sibling = sibling.nextElementSibling as HTMLElement | null;
-					}
-					setWsGroupHeight(totalHeight);
-				}
-			} else {
-				setWsGroupHeight(null);
-				setCollapsedWsId(null);
-			}
-
-			const nId =
-				tab?.type === "narrator" ? tab.id : tab?.type === "chapter" ? tab.narratorId : null;
-			if (!nId || !tab) return;
-			const me = event.activatorEvent as MouseEvent | TouchEvent;
-			const x = "clientX" in me ? me.clientX : (me.touches?.[0]?.clientX ?? 0);
-			const y = "clientY" in me ? me.clientY : (me.touches?.[0]?.clientY ?? 0);
-			startDragManual(nId, tab.title, x, y);
-		},
-		[],
-	);
-
-	const handleDragStartPinned = useCallback(
-		(event: DragStartEvent) => handleDragStartForGroup("pinned", event),
-		[handleDragStartForGroup],
-	);
-
-	const handleDragStartUnpinned = useCallback(
-		(event: DragStartEvent) => handleDragStartForGroup("unpinned", event),
-		[handleDragStartForGroup],
-	);
-
-	const handleDragMove = useCallback((event: DragMoveEvent) => {
-		const me = event.activatorEvent as MouseEvent | TouchEvent;
-		const baseX = "clientX" in me ? me.clientX : (me.touches?.[0]?.clientX ?? 0);
-		const baseY = "clientY" in me ? me.clientY : (me.touches?.[0]?.clientY ?? 0);
-		// Feed the auto-scroll gate before moving the panel-drag singleton: dnd-kit runs
-		// its auto-scroll effect after this callback, so the x it reads is this frame's.
-		dragPointerXRef.current = baseX + event.delta.x;
-		moveDrag(baseX + event.delta.x, baseY + event.delta.y);
-	}, []);
-
-	// After a drop, suppress all sortable transitions for one frame so the
-	// layout snaps into place without any sliding animation.
-	const clearDragState = useCallback(() => {
-		dragPointerXRef.current = null;
-		setDropSnap(true);
-		setDraggingTabId(null);
-		setWsGroupHeight(null);
-		setCollapsedWsId(null);
-		setActiveGroup(null);
-		requestAnimationFrame(() => setDropSnap(false));
-	}, []);
-
-	// Sort-id of the item being dropped — used by dropAnimation to locate
-	// the target DOM element after React re-renders with the optimistic order.
-	const dropTargetIdRef = useRef<string | null>(null);
-
-	// Custom drop animation: wait one frame for React to render the optimistic
-	// list (with dropSnap killing transitions), then animate the overlay from
-	// its current position to the new DOM position of the dropped item.
-	const dropAnimation = useCallback(
-		(args: DropAnimationFunctionArguments) => {
-			const { dragOverlay, transform: currentTransform } = args;
-			const node = dragOverlay.node;
-			const targetId = dropTargetIdRef.current;
-			dropTargetIdRef.current = null;
-
-			return new Promise<void>((resolve) => {
-				// Double rAF: the first frame lets React flush the optimistic
-				// re-render (with dropSnap killing transitions); the second
-				// frame guarantees layout has settled so getBoundingClientRect
-				// reflects the element's true position in the new order.
-				requestAnimationFrame(() => {
-					requestAnimationFrame(() => {
-						const targetEl = targetId
-							? (document.querySelector(
-									`[data-tab-sort-id="${globalThis.CSS.escape(targetId)}"]`,
-								) as HTMLElement | null)
-							: null;
-
-						if (!targetEl) {
-							clearDragState();
-							resolve();
-							return;
-						}
-
-						// The overlay is position:fixed with top/left set to the
-						// drag-start viewport position, plus a CSS transform for
-						// the drag delta.  getBoundingClientRect() on the target
-						// gives us the destination in viewport coords; subtract
-						// the overlay's fixed top/left (without transform) to get
-						// the required transform at the end of the animation.
-						const targetRect = targetEl.getBoundingClientRect();
-						const overlayRect = node.getBoundingClientRect();
-						// Current visual position already accounts for currentTransform
-						const finalX = currentTransform.x + (targetRect.left - overlayRect.left);
-						const finalY = currentTransform.y + (targetRect.top - overlayRect.top);
-
-						if (
-							Math.abs(finalX - currentTransform.x) < 1 &&
-							Math.abs(finalY - currentTransform.y) < 1
-						) {
-							clearDragState();
-							resolve();
-							return;
-						}
-
-						// Keyframes must include the current transform as the start
-						// so the animation begins at the overlay's actual position
-						// rather than snapping to (0,0) which is the fixed top/left.
-						const animation = node.animate(
-							[
-								{
-									transform: `translate3d(${currentTransform.x}px, ${currentTransform.y}px, 0)`,
-								},
-								{ transform: `translate3d(${finalX}px, ${finalY}px, 0)` },
-							],
-							{ duration: 250, easing: "ease", fill: "forwards" },
-						);
-						const finish = () => {
-							clearDragState();
-							resolve();
-						};
-						animation.onfinish = finish;
-						animation.oncancel = finish;
-					});
-				});
-			});
-		},
-		[clearDragState],
-	);
-
-	const handleDragEnd = useCallback(
-		(event: DragEndEvent) => {
-			justDragged = true;
-			// Clear on the next tick. The browser fires its synthetic click (if any)
-			// synchronously right after mouseup — before this timeout runs — so that
-			// click is still suppressed by handleClick. But a reorder drag usually
-			// produces NO synthetic click (the element moved / DOM reflowed), and
-			// without this reset the flag would linger and swallow the user's next
-			// real click on a tab (the "have to click twice" bug).
-			setTimeout(() => {
-				justDragged = false;
-			}, 0);
-			// End global narrator drag first — workspace drop handlers run synchronously
-			endDrag();
-
-			const { active, over } = event;
-			if (!over || active.id === over.id) {
-				clearDragState();
-				return;
-			}
-
-			if (!activeGroup) {
-				clearDragState();
-				return;
-			}
-
-			const items = activeGroup === "pinned" ? pinnedItems : unpinnedItems;
-
-			const oldSortIdx = items.findIndex((t) => tabSortId(t) === active.id);
-			const newSortIdx = items.findIndex((t) => tabSortId(t) === over.id);
-			if (oldSortIdx === -1 || newSortIdx === -1) {
-				clearDragState();
-				return;
-			}
-
-			const activeTab = items[oldSortIdx];
-			if (!activeTab) {
-				clearDragState();
-				return;
-			}
-
-			const [overStart, overEnd] = getWorkspaceGroupRange(items, newSortIdx);
-			const movingDown = oldSortIdx < newSortIdx;
-			const anchorTab = items[movingDown ? overEnd : overStart];
-			if (!anchorTab) {
-				clearDragState();
-				return;
-			}
-
-			const anchorKey = tabSortId(anchorTab);
-			const localTarget: { afterKey: string } | { beforeKey: string } = movingDown
-				? { afterKey: anchorKey }
-				: { beforeKey: anchorKey };
-
-			const optimistic = applyRecentTabMove(renderTabs, tabSortId(activeTab), localTarget);
-
-			// Snap the list to the new order immediately (dropSnap kills transitions).
-			// Expand workspace children (clear collapsedWsId) so they occupy layout
-			// space, but keep draggingTabId alive so everything stays opacity:0
-			// while the overlay animates to the new position.
-			setDropSnap(true);
-			setOptimisticTabs(optimistic);
-			setCollapsedWsId(null);
-			setWsGroupHeight(null);
-			dropTargetIdRef.current = tabSortId(activeTab);
-
-			moveTab(tabSortId(activeTab), localTarget);
-		},
-		[
-			pinnedItems,
-			unpinnedItems,
-			activeGroup,
-			renderTabs,
-			moveTab,
-			getWorkspaceGroupRange,
-			clearDragState,
-		],
-	);
+	// Rendering, hit testing and persistence share the same visual units.
+	const { topLevel, childrenByWorkspace, pinnedItems, unpinnedItems, directoryRows } = drag.model;
 
 	/** Release all child tabs from a workspace and delete the workspace entity. */
 	const releaseWorkspace = useCallback(
@@ -1447,12 +936,6 @@ export function RecentTabList({
 		setArchiveConfirmTab(null);
 	}, [archiveConfirmTab, archiveNarrator]);
 
-	const handleDragCancel = useCallback(() => {
-		endDrag();
-		setOptimisticTabs(null);
-		clearDragState();
-	}, [clearDragState]);
-
 	const handleWsAddClick = useCallback(
 		(e: React.MouseEvent, wsId: string) => {
 			e.stopPropagation();
@@ -1491,172 +974,6 @@ export function RecentTabList({
 		[wsCreateTarget, navigate, onNavigate, qc, t],
 	);
 
-	// ── Directory-mode drag and drop ───────────────────────────────────────────
-	//
-	// The aggregated order is DERIVED from the server's flat order, so a drop cannot be
-	// persisted directly ("third slot inside a derived group" is not a before/after key).
-	// Instead the drop is translated twice: `moveDirectoryRow` permutes the visible rows,
-	// then `computeRecentTabOrderMoves` replays that permutation as flat before/after
-	// moves — the exact primitive the server persists. `finalTabs` from the same call is
-	// what the cache converges to, so it is shown optimistically and the order does not
-	// snap back while the moves are replayed one by one.
-
-	const directoryCollisionDetection = useCallback((args: Parameters<CollisionDetection>[0]) => {
-		const base = pointerWithin(args);
-		const collisions = base.length > 0 ? base : closestCenter(args);
-		if (collisions.length === 0) return collisions;
-		const first = collisions[0];
-		const resolved = resolveDirectoryDropTarget(
-			directoryRowsRef.current,
-			String(args.active.id),
-			String(first.id),
-		);
-		return [{ ...first, id: resolved }];
-	}, []);
-
-	/**
-	 * Pointer travel direction for the in-flight directory drag.
-	 *
-	 * `moveDirectoryRow` needs it because the drop anchor is collapsed to a group HEADER,
-	 * which loses where inside a multi-row group the pointer was. Kept in a ref because
-	 * it is written on every pointer move and only read once, at drop.
-	 */
-	const dirDragDirectionRef = useRef<"up" | "down">("down");
-
-	const handleDirectoryDragMove = useCallback(
-		(event: DragMoveEvent) => {
-			if (event.delta.y !== 0) dirDragDirectionRef.current = event.delta.y > 0 ? "down" : "up";
-			handleDragMove(event);
-		},
-		[handleDragMove],
-	);
-
-	const handleDirectoryDragStart = useCallback((event: DragStartEvent) => {
-		setOptimisticTabs(null);
-		const activeId = String(event.active.id);
-		setDirDraggingId(activeId);
-		dirDragDirectionRef.current = "down";
-		dragPointerXRef.current = pointerXFromActivatorEvent(event.activatorEvent);
-		// Bridge into the workspace-panel drag singleton, same as the flat handler.
-		const tab = findDirectoryRowTab(directoryRowsRef.current, activeId);
-		const nId =
-			tab?.type === "narrator" || tab?.type === "subagent"
-				? tab.id
-				: tab?.type === "chapter"
-					? tab.narratorId
-					: null;
-		if (!tab || !nId) return;
-		const me = event.activatorEvent as MouseEvent | TouchEvent;
-		const x = "clientX" in me ? me.clientX : (me.touches?.[0]?.clientX ?? 0);
-		const y = "clientY" in me ? me.clientY : (me.touches?.[0]?.clientY ?? 0);
-		startDragManual(nId, tab.title, x, y);
-	}, []);
-
-	const handleDirectoryDragCancel = useCallback(() => {
-		endDrag();
-		dragPointerXRef.current = null;
-		setDirDraggingId(null);
-		setOptimisticTabs(null);
-	}, []);
-
-	const handleDirectoryDragEnd = useCallback(
-		(event: DragEndEvent) => {
-			justDragged = true;
-			setTimeout(() => {
-				justDragged = false;
-			}, 0);
-			endDrag();
-			dragPointerXRef.current = null;
-			setDirDraggingId(null);
-
-			const { active, over } = event;
-			if (!over || active.id === over.id) return;
-			const rows = directoryRowsRef.current;
-			const activeId = String(active.id);
-			const nextRows = moveDirectoryRow(
-				rows,
-				activeId,
-				String(over.id),
-				dirDragDirectionRef.current,
-			);
-			if (!nextRows) return;
-
-			// A reorder INSIDE one directory group is persisted as that group's member
-			// order, never as flat moves. Flat moves would have to shuffle the recency
-			// order to express it, and `above_idle` rewrites that order the moment any
-			// member starts working — which is why hand-ordering never used to survive.
-			const memberRow = findDirectoryMemberRow(nextRows, activeId);
-			if (memberRow) {
-				const keys = memberRow.children.map((child) => `${child.type}:${child.id}`);
-				setDropSnap(true);
-				setOptimisticTabs(applyDirectoryMemberOrder(tabsRef.current, keys));
-				requestAnimationFrame(() => setDropSnap(false));
-				void api
-					.setRecentTabDirectoryOrder(keys)
-					.then((result) => applyRecentTabsDeltaAndFollowUp(qc, result))
-					.catch(() => {
-						notifications.show({ color: "red", message: t("recentTabsReorderFailed") });
-						void refreshRecentTabsLoadedWindow(qc, { reset: true }).catch(() => {});
-					});
-				return;
-			}
-
-			const { moves, finalTabs } = computeRecentTabOrderMoves(
-				tabsRef.current,
-				nextRows.map(directoryRowKeyBlock),
-			);
-			if (moves.length === 0) return;
-
-			// Show the converged order at once; the moves below then persist it. The
-			// intermediate server states never flash because optimisticTabs masks them
-			// until the real order matches (same contract as the flat handler).
-			setDropSnap(true);
-			setOptimisticTabs(finalTabs);
-			requestAnimationFrame(() => setDropSnap(false));
-
-			setDirReplayInFlight(true);
-			void (async () => {
-				try {
-					let resetNeeded = false;
-					let backfillNeeded = false;
-					let lastRevision: number | undefined;
-					for (const move of moves) {
-						const result = await api.moveRecentTab(
-							move.key,
-							move.beforeKey
-								? { beforeKey: move.beforeKey }
-								: { afterKey: move.afterKey as string },
-						);
-						const applied = applyRecentTabsDelta(qc, result);
-						if (applied.gaps.length > 0) resetNeeded = true;
-						if (applied.backfill.length > 0) backfillNeeded = true;
-						lastRevision = result.revision;
-					}
-					// One follow-up for the whole replay, and only when a move could not be
-					// applied locally: a pure reorder never changes which rows are loaded.
-					if (resetNeeded || backfillNeeded) {
-						await refreshRecentTabsLoadedWindow(qc, {
-							reset: resetNeeded,
-							minimumRevision: lastRevision,
-						});
-					}
-				} catch {
-					// A failed move leaves the server order HALF-REPLAYED, so resync rather
-					// than trusting the optimistic order or the partial cache. The user must
-					// be told: the list is about to settle into an order that is neither what
-					// they had nor what they asked for, and silently doing that reads as the
-					// drag having been ignored at random.
-					notifications.show({ color: "red", message: t("recentTabsReorderFailed") });
-					await refreshRecentTabsLoadedWindow(qc, { reset: true }).catch(() => {});
-				} finally {
-					// Releases the convergence effect to arm its fallback timeout.
-					setDirReplayInFlight(false);
-				}
-			})();
-		},
-		[qc, t],
-	);
-
 	/**
 	 * The empty-section body, or null when there are tabs to render.
 	 *
@@ -1683,127 +1000,38 @@ export function RecentTabList({
 		) : null;
 
 	// The tab being dragged (may be a workspace header or a child).
-	const draggingTab = draggingTabId
-		? (pinnedItems.find((t) => tabSortId(t) === draggingTabId) ??
-			unpinnedItems.find((t) => tabSortId(t) === draggingTabId) ??
-			null)
-		: null;
-
-	// Helper to render a group of tabs
-	const renderTabGroup = (items: RecentTab[], group: "pinned" | "unpinned") => {
-		if (items.length === 0) return null;
-
-		const sortIds = group === "pinned" ? pinnedSortIds : unpinnedSortIds;
-		const collisionDetection =
-			group === "pinned" ? pinnedCollisionDetection : unpinnedCollisionDetection;
-		const onDragStart = group === "pinned" ? handleDragStartPinned : handleDragStartUnpinned;
-
-		return (
-			<DndContext
-				sensors={sensors}
-				collisionDetection={collisionDetection}
-				autoScroll={autoScrollOptions}
-				onDragStart={onDragStart}
-				onDragMove={handleDragMove}
-				onDragEnd={handleDragEnd}
-				onDragCancel={handleDragCancel}
-			>
-				<SortableContext items={sortIds} strategy={verticalListSortingStrategy}>
-					{items.map((tab, sortIdx) => {
-						const isHeader = !tab.workspaceId;
-						const isDraggingThis = tabSortId(tab) === draggingTabId;
-						// When a workspace header is being dragged (or animating its drop),
-						// keep children invisible — the overlay shows them.
-						const isChildOfDraggingWs =
-							!isHeader &&
-							tab.workspaceId &&
-							draggingTab?.type === "workspace" &&
-							tab.workspaceId === draggingTab.id;
-
-						// Workspace children use a compact sortable component.
-						if (!isHeader) {
-							const tabKey = `${tab.type}:${tab.id}`;
-							return (
-								<SortableWorkspaceChildTab
-									key={tabSortId(tab)}
-									tab={tab}
-									active={
-										pendingKey
-											? pendingKey === tabKey
-											: isTabActive(tab, pathname) &&
-												!(excludeActiveNarratorId && tab.id === excludeActiveNarratorId)
-									}
-									onRemove={handleRemove}
-									onNavigate={onNavigate}
-									onContextMenu={handleContextMenu}
-									onPrefetch={prefetchNarratorTab}
-									dimmed={isDraggingThis || !!isChildOfDraggingWs}
-									collapsed={!!tab.workspaceId && tab.workspaceId === collapsedWsId}
-								/>
-							);
-						}
-
-						const tabKey = `${tab.type}:${tab.id}`;
-						// Only connect top for the visually-first tab: the first pinned tab
-						// when the pinned group exists, otherwise the first unpinned tab.
-						// (Unpinned items render below the pinned group, so their first tab
-						// must NOT connect to the nav header when pinned tabs are present.)
-						const shouldConnectTop =
-							firstTabConnected &&
-							sortIdx === 0 &&
-							(group === "pinned" || pinnedItems.length === 0);
-
-						return (
-							<SortableTabItem
-								key={tabSortId(tab)}
-								tab={tab}
-								active={
-									pendingKey
-										? pendingKey === tabKey
-										: isTabActive(tab, pathname) &&
-											!(excludeActiveNarratorId && tab.id === excludeActiveNarratorId)
-								}
-								onRemove={handleRemove}
-								onTogglePin={handleSwipePin}
-								onNavigate={onNavigate}
-								onContextMenu={handleContextMenu}
-								onPrefetch={prefetchNarratorTab}
-								connectTop={shouldConnectTop}
-								onWsAddClick={tab.type === "workspace" ? handleWsAddClick : undefined}
-								dimmed={isDraggingThis}
-								wsGroupHeight={
-									isDraggingThis && tab.type === "workspace"
-										? (wsGroupHeight ?? undefined)
-										: undefined
-								}
-							/>
-						);
-					})}
-				</SortableContext>
-				{/* Floating overlay while dragging — workspace shows the whole group, others show a single tab. */}
-				{/*
-				 * `pointerEvents: none` is load-bearing, not cosmetic. dnd-kit renders this
-				 * ghost as `position: fixed` under the pointer and tracks the gesture on
-				 * document, so it never needs hits itself — but while it is hittable it is
-				 * the topmost element at every release point, and the drop targets that ask
-				 * the DOM "what is under the pointer" (dockview surfaces, the graph canvas)
-				 * all see the ghost instead of themselves.
-				 */}
-				<DragOverlay dropAnimation={dropAnimation} style={{ pointerEvents: "none" }}>
-					{draggingTab && activeGroup === group ? (
-						draggingTab.type === "workspace" ? (
-							<DragOverlayWorkspaceItem
-								tab={draggingTab}
-								wsChildren={childrenByWorkspace.get(draggingTab.id) ?? []}
-							/>
-						) : (
-							<DragOverlayTabItem tab={draggingTab} active={isTabActive(draggingTab, pathname)} />
-						)
-					) : null}
-				</DragOverlay>
-			</DndContext>
-		);
-	};
+	const renderTabGroup = (items: RecentTab[], group: "pinned" | "unpinned") =>
+		items.map((tab, index) => {
+			if (tab.workspaceId) {
+				return (
+					<DraggableWorkspaceChildTab
+						key={tabSortId(tab)}
+						tab={tab}
+						active={isRowActive(tab)}
+						onRemove={handleRemove}
+						onNavigate={onNavigate}
+						onContextMenu={handleContextMenu}
+						onPrefetch={prefetchNarratorTab}
+					/>
+				);
+			}
+			return (
+				<DraggableTabItem
+					key={tabSortId(tab)}
+					tab={tab}
+					active={isRowActive(tab)}
+					onRemove={handleRemove}
+					onTogglePin={handleSwipePin}
+					onNavigate={onNavigate}
+					onContextMenu={handleContextMenu}
+					onPrefetch={prefetchNarratorTab}
+					connectTop={
+						firstTabConnected && index === 0 && (group === "pinned" || pinnedItems.length === 0)
+					}
+					onWsAddClick={tab.type === "workspace" ? handleWsAddClick : undefined}
+				/>
+			);
+		});
 
 	/** Active/highlight state for a row, shared by both render paths. */
 	const isRowActive = (tab: RecentTab) => {
@@ -1821,33 +1049,28 @@ export function RecentTabList({
 	 * the whole group, and workspace headers move the whole workspace, whose children
 	 * stay static because a workspace is a structure the user built by hand.
 	 */
-	const renderDirectoryRows = (rows: RecentTabRow[]) => {
-		if (rows.length === 0) return null;
-		const connectTopEligible = firstTabConnected && pinnedItems.length === 0;
-
-		return rows.map((row, rowIdx) => {
+	const renderDirectoryRows = (rows: RecentTabRow[]) =>
+		rows.map((row, index) => {
+			const connectTop = firstTabConnected && pinnedItems.length === 0 && index === 0;
 			if (row.kind === "tab") {
-				const tab = row.tab;
 				return (
-					<SortableTabItem
-						key={tabSortId(tab)}
-						tab={tab}
-						active={isRowActive(tab)}
+					<DraggableTabItem
+						key={tabSortId(row.tab)}
+						tab={row.tab}
+						active={isRowActive(row.tab)}
 						onRemove={handleRemove}
 						onTogglePin={handleSwipePin}
 						onNavigate={onNavigate}
 						onContextMenu={handleContextMenu}
 						onPrefetch={prefetchNarratorTab}
-						connectTop={connectTopEligible && rowIdx === 0}
+						connectTop={connectTop}
 					/>
 				);
 			}
-
 			if (row.kind === "workspace") {
-				const draggingThis = dirDraggingId === tabSortId(row.tab);
 				return (
 					<React.Fragment key={tabSortId(row.tab)}>
-						<SortableTabItem
+						<DraggableTabItem
 							tab={row.tab}
 							active={isRowActive(row.tab)}
 							onRemove={handleRemove}
@@ -1855,135 +1078,63 @@ export function RecentTabList({
 							onNavigate={onNavigate}
 							onContextMenu={handleContextMenu}
 							onPrefetch={prefetchNarratorTab}
-							connectTop={connectTopEligible && rowIdx === 0}
+							connectTop={connectTop}
 							onWsAddClick={handleWsAddClick}
 						/>
-						{/* Children are not individually sortable here; they collapse while the
-						    header is dragged so the drop gap measures as one header. */}
-						<div style={draggingThis ? { height: 0, overflow: "hidden" } : undefined}>
-							{row.children.map((child) => (
-								<StaticTabItem
-									key={tabSortId(child)}
-									tab={child}
-									active={isRowActive(child)}
-									onRemove={handleRemove}
-									onNavigate={onNavigate}
-									onContextMenu={handleContextMenu}
-									onPrefetch={prefetchNarratorTab}
-									indent
-								/>
-							))}
-						</div>
+						{row.children.map((child) => (
+							<DraggableWorkspaceChildTab
+								key={tabSortId(child)}
+								tab={child}
+								active={isRowActive(child)}
+								onRemove={handleRemove}
+								onNavigate={onNavigate}
+								onContextMenu={handleContextMenu}
+								onPrefetch={prefetchNarratorTab}
+							/>
+						))}
 					</React.Fragment>
 				);
 			}
-
 			const containsActive = row.children.some((child) => isTabActive(child, pathname));
 			const containsPending =
-				!!pendingKey && row.children.some((child) => `${child.type}:${child.id}` === pendingKey);
-			// Read the SHARED resolution rather than calling `isDirectoryCollapsed` again:
-			// `directorySortIds` registers member ids based on that map, and a second
-			// evaluation here could disagree and register ids for rows that never rendered.
+				!!pendingKey && row.children.some((child) => tabSortId(child) === pendingKey);
 			const collapsed = directoryCollapsedByPath.get(row.path) ?? true;
-			const draggingThis = dirDraggingId === directoryRowId(row.path);
-
 			return (
 				<React.Fragment key={directoryRowId(row.path)}>
-					<SortableDirectoryRow
+					<DraggableDirectoryRow
 						path={row.path}
 						label={row.label}
 						tabs={row.children}
 						collapsed={collapsed}
-						active={collapsed && row.children.some((child) => isRowActive(child))}
+						active={collapsed && row.children.some(isRowActive)}
 						onToggle={(path) => toggleDirectory(path, { containsActive, containsPending })}
-						connectTop={connectTopEligible && rowIdx === 0}
+						connectTop={connectTop}
 						t={t}
 					/>
-					{!collapsed && (
-						<div style={draggingThis ? { height: 0, overflow: "hidden" } : undefined}>
-							{row.children.map((child) => (
-								<SortableTabItem
-									key={tabSortId(child)}
-									tab={child}
-									active={isRowActive(child)}
-									onRemove={handleRemove}
-									// Pinning a member lifts it out of the group into the pinned
-									// section — what "pin" means everywhere else in the list.
-									onTogglePin={handleSwipePin}
-									onNavigate={onNavigate}
-									onContextMenu={handleContextMenu}
-									onPrefetch={prefetchNarratorTab}
-									// The path lives on the header above; repeating it per member is
-									// exactly what this mode exists to stop.
-									hideSubtitle
-									indent
-								/>
-							))}
-						</div>
-					)}
+					{!collapsed &&
+						row.children.map((child) => (
+							<DraggableTabItem
+								key={tabSortId(child)}
+								tab={child}
+								active={isRowActive(child)}
+								onRemove={handleRemove}
+								onTogglePin={handleSwipePin}
+								onNavigate={onNavigate}
+								onContextMenu={handleContextMenu}
+								onPrefetch={prefetchNarratorTab}
+								hideSubtitle
+								indent
+							/>
+						))}
 				</React.Fragment>
 			);
 		});
-	};
 
 	// ── External drop: a narrator dragged in from the list page ────────────────
 	//
 	// Not part of the DndContexts above: their sortable ids come from the tabs that already
 	// exist, so a narrator that is not a tab yet can never be an `active` item there. This
 	// rides the `panel-drag` singleton instead (see `useRecentTabExternalDrop`).
-
-	const listBoxRef = useRef<HTMLDivElement | null>(null);
-
-	/**
-	 * Measure the rendered rows in viewport coordinates.
-	 *
-	 * Read from the DOM rather than computed from the tab arrays: only the DOM knows the
-	 * real geometry after collapsed directories, workspace children and variable row
-	 * heights. `data-tab-sort-id` is already on every row variant, so no new markup is
-	 * needed — and a row that did not render simply is not measured, which is the correct
-	 * answer for a collapsed group's members.
-	 */
-	const measureDropRows = useCallback((): RecentTabDropRow[] => {
-		const container = listBoxRef.current;
-		if (!container) return [];
-		const pinnedKeys = new Set(pinnedItemsRef.current.map(tabSortId));
-		const blockByRowId = new Map<string, string[]>();
-		for (const row of directoryRowsRef.current) {
-			blockByRowId.set(directoryRowSortId(row), directoryRowKeyBlock(row));
-		}
-		const tabsById = new Map(
-			[...pinnedItemsRef.current, ...unpinnedItemsRef.current].map((tab) => [tabSortId(tab), tab]),
-		);
-		const rows: RecentTabDropRow[] = [];
-		for (const element of container.querySelectorAll<HTMLElement>("[data-tab-sort-id]")) {
-			const key = element.dataset.tabSortId;
-			if (!key) continue;
-			const rect = element.getBoundingClientRect();
-			// A zero-height row is a collapsed workspace child (squashed during an internal
-			// drag). Including it would give the pointer a target with no area, and several
-			// coincident ones make the resolved slot arbitrary.
-			if (rect.height <= 0) continue;
-			const tab = tabsById.get(key);
-			const directoryBlock = blockByRowId.get(key);
-			// A directory row has no tab of its own; its members' keys ARE its block. Members
-			// rendered under an expanded header share that block so an anchor next to any of
-			// them lands outside the group rather than splitting it.
-			const memberBlock = directoryRowsRef.current
-				.filter((row) => row.kind === "directory")
-				.find((row) => row.children.some((child) => tabSortId(child) === key));
-			const keyBlock = directoryBlock ??
-				(memberBlock ? directoryRowKeyBlock(memberBlock) : undefined) ?? [key];
-			rows.push({
-				key,
-				top: rect.top,
-				bottom: rect.bottom,
-				pinned: pinnedKeys.has(key),
-				...(tab ? { workspaceId: workspaceGroupId(tab) ?? undefined } : {}),
-				keyBlock,
-			});
-		}
-		return rows;
-	}, []);
 
 	const handleExternalDrop = useCallback(
 		({
@@ -2050,216 +1201,206 @@ export function RecentTabList({
 		enabled: filter === "narrator",
 		// An internal reorder is bridged into the same singleton, so without this gate one
 		// drop would be handled twice — by @dnd-kit and by this hook.
-		suspended: draggingTabId !== null || dirDraggingId !== null,
-		measureRows: measureDropRows,
+		suspended: drag.draggingId !== null,
+		suspendedRef: drag.draggingRef,
+		measureRows: drag.measureRows,
 		onDrop: handleExternalDrop,
 	});
 
-	/** Floating preview while dragging in directory mode: header-only for a group. */
-	let directoryOverlay: React.ReactNode = null;
-	if (dirDraggingId) {
-		const dirRow = directoryRows.find(
-			(r) => r.kind === "directory" && directoryRowId(r.path) === dirDraggingId,
-		);
-		if (dirRow?.kind === "directory") {
-			directoryOverlay = (
+	let overlay: React.ReactNode = null;
+	if (drag.draggingDirectory) {
+		const row = drag.draggingDirectory;
+		const collapsed = directoryCollapsedByPath.get(row.path) ?? true;
+		overlay = (
+			<>
 				<RecentTabDirectoryRow
-					path={dirRow.path}
-					label={dirRow.label}
-					tabs={dirRow.children}
-					collapsed
+					path={row.path}
+					label={row.label}
+					tabs={row.children}
+					collapsed={collapsed}
 					active={false}
 					onToggle={() => {}}
 					t={t}
 				/>
-			);
-		} else {
-			const tab = findDirectoryRowTab(directoryRows, dirDraggingId);
-			if (tab) {
-				directoryOverlay = <DragOverlayTabItem tab={tab} active={isTabActive(tab, pathname)} />;
-			}
-		}
-	}
-
-	if (topLevel.length === 0) {
-		return (
-			<Box
-				ref={listBoxRef}
-				style={{
-					overflow: "hidden",
-					position: "relative",
-					// An empty section is content-sized, i.e. zero-height, so the drop hit test
-					// would never match and dragging a narrator into a freshly cleared sidebar
-					// could not work. Reserve one row's worth of area for it — but only where a
-					// drop is actually accepted, so the projects section stays flush.
-					...(filter === "narrator" ? { minHeight: 44 } : {}),
-				}}
-			>
-				{emptyBody}
-				{externalDrop && (
-					<RecentTabDropIndicator
-						rows={externalDrop.rows}
-						target={externalDrop.target}
-						containerTop={externalDrop.containerTop}
-					/>
-				)}
-			</Box>
+				{!collapsed &&
+					row.children.map((tab) => (
+						<DragOverlayTabItem key={tabSortId(tab)} tab={tab} active={false} />
+					))}
+			</>
 		);
-	}
-
-	return (
-		// `position: relative` anchors the external-drop indicator, which is absolutely
-		// positioned over the rows.
-		<Box ref={listBoxRef} style={{ overflow: "hidden", position: "relative" }}>
-			{/* When dropSnap is true, kill all transitions so items snap into place */}
-			{dropSnap && <style>{"[data-tab-sort-id]{transition:none!important}"}</style>}
-
-			{externalDrop && (
-				<RecentTabDropIndicator
-					rows={externalDrop.rows}
-					target={externalDrop.target}
-					containerTop={externalDrop.containerTop}
-				/>
-			)}
-
-			{/* Render pinned tabs group — always flat, always sortable */}
-			{renderTabGroup(pinnedItems, "pinned")}
-
-			{/* Render unpinned tabs group */}
-			{groupingEnabled ? (
-				<DndContext
-					sensors={sensors}
-					collisionDetection={directoryCollisionDetection}
-					autoScroll={autoScrollOptions}
-					onDragStart={handleDirectoryDragStart}
-					onDragMove={handleDirectoryDragMove}
-					onDragEnd={handleDirectoryDragEnd}
-					onDragCancel={handleDirectoryDragCancel}
-				>
-					<SortableContext items={directorySortIds} strategy={verticalListSortingStrategy}>
-						{renderDirectoryRows(directoryRows)}
-					</SortableContext>
-					{/* See the pointerEvents note on the flat group's DragOverlay above. */}
-					<DragOverlay style={{ pointerEvents: "none" }}>{directoryOverlay}</DragOverlay>
-				</DndContext>
+	} else if (drag.draggingTab) {
+		const tab = drag.draggingTab;
+		overlay =
+			tab.type === "workspace" ? (
+				<DragOverlayWorkspaceItem tab={tab} wsChildren={childrenByWorkspace.get(tab.id) ?? []} />
 			) : (
-				renderTabGroup(unpinnedItems, "unpinned")
-			)}
-
-			{sectionState.isError ? (
-				<Stack gap={2} py={4} align="center">
-					<Text size="xs" c="red">
-						{t("recentTabsSyncError")}
-					</Text>
-					<Button size="compact-xs" variant="subtle" onClick={sectionState.retry}>
-						{t("retryRecentTabs")}
-					</Button>
-				</Stack>
-			) : sectionState.hasMore ? (
-				<Button
-					size="compact-xs"
-					variant="subtle"
-					fullWidth
-					loading={sectionState.isFetchingNextPage}
-					onClick={sectionState.loadMore}
-				>
-					{t("loadMoreRecentTabs")}
-				</Button>
-			) : null}
-
-			{ctxMenu && (
-				<TabContextMenu
-					x={ctxMenu.x}
-					y={ctxMenu.y}
-					onClose={() => setCtxMenu(null)}
-					onMoveToTop={handleMoveToTop}
-					onPin={handlePin}
-					isPinned={!!ctxMenu.tab.pinned}
-					onRemove={handleCtxClose}
-					onReveal={handleReveal}
-					canReveal={revealAvailable && ctxMenu.tab.type !== "project"}
-					onNewNarratorHere={handleNewNarratorHere}
-					canNewNarratorHere={
-						ctxMenu.tab.type === "chapter" ||
-						ctxMenu.tab.type === "narrator" ||
-						ctxMenu.tab.type === "subagent"
-					}
-					onCopyCwd={handleCopyCwd}
-					canCopyCwd={["chapter", "narrator", "subagent"].includes(ctxMenu.tab.type)}
-					onRename={handleRename}
-					canRename={ctxMenu.tab.type === "narrator"}
-					onArchive={handleArchive}
-					canArchive={ctxMenu.tab.type === "narrator"}
-					isFirst={
-						topLevel.findIndex((t) => t.type === ctxMenu.tab.type && t.id === ctxMenu.tab.id) === 0
-					}
-					isWorkspace={ctxMenu.tab.type === "workspace"}
-					t={t}
-				/>
-			)}
-			<Modal
-				opened={!!renameTab}
-				onClose={() => setRenameTab(null)}
-				title={t("rename")}
-				centered
-				size="sm"
+				<DragOverlayTabItem tab={tab} active={isTabActive(tab, pathname)} />
+			);
+	}
+	const indicator = drag.indicator ?? externalDrop;
+	return (
+		<RecentTabsDragContext.Provider value={dragInteraction}>
+			<DndContext
+				sensors={drag.sensors}
+				autoScroll={drag.autoScrollOptions}
+				onDragStart={drag.onDragStart}
+				onDragMove={drag.onDragMove}
+				onDragEnd={drag.onDragEnd}
+				onDragCancel={drag.onDragCancel}
 			>
-				<TextInput
-					value={renameValue}
-					onChange={(e) => setRenameValue(e.currentTarget.value)}
-					onKeyDown={(e) => {
-						// Enter while an IME candidate is open commits the word, not the rename.
-						if (e.key === "Enter" && !e.nativeEvent.isComposing) void handleRenameSubmit();
-						if (e.key === "Escape") setRenameTab(null);
+				<Box
+					ref={listBoxRef}
+					style={{
+						overflow: "hidden",
+						position: "relative",
+						...(topLevel.length === 0 && filter === "narrator" ? { minHeight: 44 } : {}),
 					}}
-					data-autofocus
-				/>
-				<Group justify="flex-end" mt="md">
-					<Button variant="default" onClick={() => setRenameTab(null)}>
-						{t("cancel")}
-					</Button>
-					<Button loading={renaming} onClick={() => void handleRenameSubmit()}>
-						{t("rename")}
-					</Button>
-				</Group>
-			</Modal>
-			<Modal
-				opened={!!archiveConfirmTab}
-				onClose={() => setArchiveConfirmTab(null)}
-				title={tn("archiveNarrator")}
-				centered
-				size="sm"
-			>
-				<Text size="sm">{tn("archiveActiveWarning")}</Text>
-				<Group justify="flex-end" mt="md">
-					<Button variant="default" onClick={() => setArchiveConfirmTab(null)}>
-						{t("cancel")}
-					</Button>
-					<Button color="orange" loading={archiveNarrator.isPending} onClick={handleArchiveConfirm}>
-						{tn("confirmArchive")}
-					</Button>
-				</Group>
-			</Modal>
-			{wsCreateTarget !== null && (
-				<React.Suspense fallback={null}>
-					<CreateNarratorModal
-						opened={wsCreateTarget !== null}
-						onClose={() => setWsCreateTarget(null)}
-						onCreated={handleWsNarratorCreated}
-					/>
-				</React.Suspense>
-			)}
-			{newNarratorCwd !== null && (
-				<React.Suspense fallback={null}>
-					<CreateNarratorModal
-						opened={newNarratorCwd !== null}
-						initialCwd={newNarratorCwd}
-						onClose={() => setNewNarratorCwd(null)}
-						onCreated={handleNewNarratorHereCreated}
-					/>
-				</React.Suspense>
-			)}
-		</Box>
+				>
+					{indicator && (
+						<RecentTabDropIndicator
+							rows={indicator.rows}
+							target={indicator.target}
+							containerTop={indicator.containerTop}
+						/>
+					)}
+					{topLevel.length === 0 ? (
+						emptyBody
+					) : (
+						<>
+							{renderTabGroup(pinnedItems, "pinned")}
+							{groupingEnabled
+								? renderDirectoryRows(directoryRows)
+								: renderTabGroup(unpinnedItems, "unpinned")}
+						</>
+					)}
+
+					{topLevel.length > 0 &&
+						(sectionState.isError ? (
+							<Stack gap={2} py={4} align="center">
+								<Text size="xs" c="red">
+									{t("recentTabsSyncError")}
+								</Text>
+								<Button size="compact-xs" variant="subtle" onClick={sectionState.retry}>
+									{t("retryRecentTabs")}
+								</Button>
+							</Stack>
+						) : sectionState.hasMore ? (
+							<Button
+								size="compact-xs"
+								variant="subtle"
+								fullWidth
+								loading={sectionState.isFetchingNextPage}
+								onClick={sectionState.loadMore}
+							>
+								{t("loadMoreRecentTabs")}
+							</Button>
+						) : null)}
+
+					{ctxMenu && (
+						<TabContextMenu
+							x={ctxMenu.x}
+							y={ctxMenu.y}
+							onClose={() => setCtxMenu(null)}
+							onMoveToTop={handleMoveToTop}
+							onPin={handlePin}
+							isPinned={!!ctxMenu.tab.pinned}
+							onRemove={handleCtxClose}
+							onReveal={handleReveal}
+							canReveal={revealAvailable && ctxMenu.tab.type !== "project"}
+							onNewNarratorHere={handleNewNarratorHere}
+							canNewNarratorHere={
+								ctxMenu.tab.type === "chapter" ||
+								ctxMenu.tab.type === "narrator" ||
+								ctxMenu.tab.type === "subagent"
+							}
+							onCopyCwd={handleCopyCwd}
+							canCopyCwd={["chapter", "narrator", "subagent"].includes(ctxMenu.tab.type)}
+							onRename={handleRename}
+							canRename={ctxMenu.tab.type === "narrator"}
+							onArchive={handleArchive}
+							canArchive={ctxMenu.tab.type === "narrator"}
+							isFirst={
+								topLevel.findIndex(
+									(t) => t.type === ctxMenu.tab.type && t.id === ctxMenu.tab.id,
+								) === 0
+							}
+							isWorkspace={ctxMenu.tab.type === "workspace"}
+							t={t}
+						/>
+					)}
+					<Modal
+						opened={!!renameTab}
+						onClose={() => setRenameTab(null)}
+						title={t("rename")}
+						centered
+						size="sm"
+					>
+						<TextInput
+							value={renameValue}
+							onChange={(e) => setRenameValue(e.currentTarget.value)}
+							onKeyDown={(e) => {
+								// Enter while an IME candidate is open commits the word, not the rename.
+								if (e.key === "Enter" && !e.nativeEvent.isComposing) void handleRenameSubmit();
+								if (e.key === "Escape") setRenameTab(null);
+							}}
+							data-autofocus
+						/>
+						<Group justify="flex-end" mt="md">
+							<Button variant="default" onClick={() => setRenameTab(null)}>
+								{t("cancel")}
+							</Button>
+							<Button loading={renaming} onClick={() => void handleRenameSubmit()}>
+								{t("rename")}
+							</Button>
+						</Group>
+					</Modal>
+					<Modal
+						opened={!!archiveConfirmTab}
+						onClose={() => setArchiveConfirmTab(null)}
+						title={tn("archiveNarrator")}
+						centered
+						size="sm"
+					>
+						<Text size="sm">{tn("archiveActiveWarning")}</Text>
+						<Group justify="flex-end" mt="md">
+							<Button variant="default" onClick={() => setArchiveConfirmTab(null)}>
+								{t("cancel")}
+							</Button>
+							<Button
+								color="orange"
+								loading={archiveNarrator.isPending}
+								onClick={handleArchiveConfirm}
+							>
+								{tn("confirmArchive")}
+							</Button>
+						</Group>
+					</Modal>
+					{wsCreateTarget !== null && (
+						<React.Suspense fallback={null}>
+							<CreateNarratorModal
+								opened={wsCreateTarget !== null}
+								onClose={() => setWsCreateTarget(null)}
+								onCreated={handleWsNarratorCreated}
+							/>
+						</React.Suspense>
+					)}
+					{newNarratorCwd !== null && (
+						<React.Suspense fallback={null}>
+							<CreateNarratorModal
+								opened={newNarratorCwd !== null}
+								initialCwd={newNarratorCwd}
+								onClose={() => setNewNarratorCwd(null)}
+								onCreated={handleNewNarratorHereCreated}
+							/>
+						</React.Suspense>
+					)}
+				</Box>
+				{/* Keep preview rows outside the measured source container. */}
+				<DragOverlay dropAnimation={null} style={{ pointerEvents: "none" }}>
+					{overlay}
+				</DragOverlay>
+			</DndContext>
+		</RecentTabsDragContext.Provider>
 	);
 }
 
@@ -2481,16 +1622,14 @@ function WorkspaceChildTab({
 	);
 }
 
-/** Compact sortable child tab for workspace children. */
-const SortableWorkspaceChildTab = React.memo(function SortableWorkspaceChildTab({
+/** Compact workspace member; remains in normal layout throughout the gesture. */
+const DraggableWorkspaceChildTab = React.memo(function DraggableWorkspaceChildTab({
 	tab,
 	active,
 	onRemove,
 	onNavigate,
 	onContextMenu,
 	onPrefetch,
-	dimmed,
-	collapsed: collapsedProp,
 }: {
 	tab: RecentTab;
 	active: boolean;
@@ -2498,76 +1637,43 @@ const SortableWorkspaceChildTab = React.memo(function SortableWorkspaceChildTab(
 	onNavigate?: () => void;
 	onContextMenu: (e: React.MouseEvent, tab: RecentTab) => void;
 	onPrefetch?: (tab: RecentTab) => void;
-	/** When true, hide the child (opacity 0) — overlay is showing it */
-	dimmed?: boolean;
-	/** When true, collapse to height 0 so dnd-kit measures header-only gap */
-	collapsed?: boolean;
 }) {
 	const navigate = useNavigate();
-	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+	const drag = useContext(RecentTabsDragContext);
+	const { attributes, listeners, setNodeRef } = useDraggable({
 		id: tabSortId(tab),
-	});
-
-	// Track whether this child was dimmed (collapsed) in the previous render.
-	// When transitioning from dimmed→visible we skip the dnd-kit transition
-	// so the child snaps back instantly instead of sliding in.
-	const wasDimmedRef = useRef(false);
-	const skipTransition = !dimmed && wasDimmedRef.current;
-	useEffect(() => {
-		wasDimmedRef.current = !!dimmed;
+		disabled: drag.pending,
 	});
 	const to =
 		tab.type === "chapter" && tab.narratorId
 			? `/narrators/${tab.narratorId}`
 			: `/narrators/${tab.id}`;
-	const iconColor = getRecentTabIconColor(tab);
-	const filledStatus = isFilledRecentTabStatus(tab);
-	const handlePrefetch = useCallback(() => onPrefetch?.(tab), [onPrefetch, tab]);
-	const handleClick = useCallback(() => {
-		handlePrefetch();
-		onNavigate?.();
-		navigate({ to });
-	}, [handlePrefetch, navigate, onNavigate, to]);
-	const handleMouseDown = useCallback(
-		(e: React.MouseEvent) => {
-			handlePrefetch();
-			if (e.button === 1) e.preventDefault();
-		},
-		[handlePrefetch],
-	);
-
-	// When the parent workspace header is being dragged, collapse children to
-	// zero height so dnd-kit measures the gap as header-only and the full group
-	// height comes from the header's sortable item alone.
-	const collapsed = collapsedProp && !isDragging;
-	const sortStyle: React.CSSProperties = collapsed
-		? { height: 0, overflow: "hidden", opacity: 0, transition: "none" }
-		: skipTransition
-			? { opacity: dimmed ? 0 : 1, transition: "none" }
-			: {
-					transform: CSS.Transform.toString(transform),
-					transition,
-					opacity: isDragging || dimmed ? 0 : 1,
-				};
-
+	const prefetch = useCallback(() => onPrefetch?.(tab), [onPrefetch, tab]);
 	return (
-		<div
-			ref={setNodeRef}
-			{...attributes}
-			{...listeners}
-			style={sortStyle}
-			data-tab-sort-id={tabSortId(tab)}
-		>
+		<div ref={setNodeRef} {...attributes} {...listeners} data-tab-sort-id={tabSortId(tab)}>
 			<NavLink
 				active={active}
 				label={<Text size="xs">{tab.title}</Text>}
 				leftSection={
-					<TabIcon tab={tab} size={14} iconColor={iconColor} filledStatus={filledStatus} />
+					<TabIcon
+						tab={tab}
+						size={14}
+						iconColor={getRecentTabIconColor(tab)}
+						filledStatus={isFilledRecentTabStatus(tab)}
+					/>
 				}
-				onClick={handleClick}
-				onPointerEnter={handlePrefetch}
-				onFocus={handlePrefetch}
-				onMouseDown={handleMouseDown}
+				onClick={() => {
+					if (drag.consumeClick()) return;
+					prefetch();
+					onNavigate?.();
+					navigate({ to });
+				}}
+				onPointerEnter={prefetch}
+				onFocus={prefetch}
+				onMouseDown={(e: React.MouseEvent) => {
+					prefetch();
+					if (e.button === 1) e.preventDefault();
+				}}
 				onAuxClick={(e: React.MouseEvent) => {
 					if (e.button === 1) {
 						e.preventDefault();
@@ -2577,10 +1683,7 @@ const SortableWorkspaceChildTab = React.memo(function SortableWorkspaceChildTab(
 				onContextMenu={(e) => onContextMenu(e, tab)}
 				py={2}
 				pl="lg"
-				styles={{
-					root: { borderRadius: 4, minHeight: 28 },
-					label: { overflow: "hidden" },
-				}}
+				styles={{ root: { borderRadius: 4, minHeight: 28 }, label: { overflow: "hidden" } }}
 			/>
 		</div>
 	);
@@ -2721,10 +1824,8 @@ interface TabItemBodyProps {
  * right-click menu, swipe-right-to-close, swipe-left-to-pin, and dragging the icon into
  * a workspace panel.
  *
- * Deliberately free of `useSortable`. Directory mode renders rows OUTSIDE any
- * `DndContext` (see `RecentTabList`), and a `useSortable` call there would throw. Keeping
- * the body sortable-agnostic means both modes run the same interaction code instead of a
- * second copy that drifts.
+ * The body is independent of drag sensors. All list modes share the same gesture
+ * wrapper and cross-surface bridge; previews render without interactive drag sources.
  */
 function TabItemBody({
 	tab,
@@ -2744,6 +1845,7 @@ function TabItemBody({
 	dragProps,
 }: TabItemBodyProps) {
 	const navigate = useNavigate();
+	const drag = useContext(RecentTabsDragContext);
 	const { t } = useTranslation("common");
 	const to =
 		tab.type === "project"
@@ -2758,16 +1860,13 @@ function TabItemBody({
 
 	const handlePrefetch = useCallback(() => onPrefetch?.(tab), [onPrefetch, tab]);
 
-	// Click to navigate — blocked after drag via module-level flag
+	// Only this list's synthetic post-drag click is suppressed.
 	const handleClick = useCallback(() => {
-		if (justDragged) {
-			justDragged = false;
-			return;
-		}
+		if (drag.consumeClick()) return;
 		handlePrefetch();
 		navigate({ to });
 		onNavigate?.();
-	}, [handlePrefetch, navigate, to, onNavigate]);
+	}, [drag.consumeClick, handlePrefetch, navigate, to, onNavigate]);
 
 	// Middle-click to close — preventDefault on mousedown to suppress autoscroll
 	// when the tab list overflows and has a scrollbar.
@@ -2881,26 +1980,8 @@ function TabItemBody({
 	// wrapper and only mounted while the gesture is in progress.
 	const pinHintActive = swipeX < -SWIPE_THRESHOLD;
 
-	// Cross-component drag — pointerdown on icon starts a global narrator drag.
-	// We use onPointerDown + stopPropagation so @dnd-kit's PointerSensor
-	// on the outer div doesn't capture it (pointer events fire before mouse events).
-	const dragNarratorId =
-		tab.type === "narrator" || tab.type === "subagent"
-			? tab.id
-			: tab.type === "chapter"
-				? tab.narratorId
-				: null;
-
-	const handleIconPointerDown = useCallback(
-		(e: React.PointerEvent) => {
-			if (e.button !== 0 || !dragNarratorId) return;
-			e.stopPropagation();
-			e.preventDefault();
-			startPointerDrag(dragNarratorId, tab.title, e.clientX, e.clientY);
-		},
-		[dragNarratorId, tab.title],
-	);
-
+	// Icon and body use the same sensors and cross-surface drag bridge.
+	const dragNarratorId = getRecentTabNarratorId(tab);
 	return (
 		<div
 			ref={outerRef}
@@ -2972,13 +2053,10 @@ function TabItemBody({
 					}
 					leftSection={
 						<span
-							onPointerDown={handleIconPointerDown}
 							style={{
 								cursor: dragNarratorId ? "grab" : undefined,
-								// Give the drag singleton exclusive ownership of the touch
-								// gesture (same fix as `.nf-panel-header`): without this the
-								// browser claims vertical swipes for scroll and the drag dies.
-								touchAction: dragNarratorId ? "none" : undefined,
+								// Long-press activation belongs to the same touch sensor as the body.
+								touchAction: "pan-y",
 							}}
 						>
 							<TabIcon tab={tab} size={16} iconColor={iconColor} filledStatus={filledStatus} />
@@ -3016,107 +2094,41 @@ function TabItemBody({
 	);
 }
 
-interface SortableTabItemProps
-	extends Omit<TabItemBodyProps, "outerRef" | "outerStyle" | "dragProps" | "isDragging"> {
-	/** When true, reduce opacity to indicate the item is being dragged */
-	dimmed?: boolean;
-	/** Measured group height (header + children) — applied when dragging a workspace */
-	wsGroupHeight?: number;
-}
-
-/** Draggable row for the flat list: `useSortable` wrapper around {@link TabItemBody}. */
-const SortableTabItem = React.memo(function SortableTabItem({
-	dimmed,
-	wsGroupHeight,
-	...bodyProps
-}: SortableTabItemProps) {
-	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
-		id: tabSortId(bodyProps.tab),
+/** Sources stay visible in normal flow; only the overlay moves. */
+const DraggableTabItem = React.memo(function DraggableTabItem(
+	props: Omit<TabItemBodyProps, "outerRef" | "outerStyle" | "dragProps" | "isDragging">,
+) {
+	const drag = useContext(RecentTabsDragContext);
+	const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+		id: tabSortId(props.tab),
+		disabled: drag.pending,
 	});
-
-	const sortStyle: React.CSSProperties = {
-		transform: CSS.Transform.toString(transform),
-		transition,
-		opacity: isDragging || dimmed ? 0 : 1,
-		zIndex: isDragging ? 10 : undefined,
-		// When dragging a workspace header, reserve the full group height
-		// (header + children) so the gap placeholder matches the overlay size.
-		...(isDragging && wsGroupHeight ? { height: wsGroupHeight } : {}),
-	};
-
 	return (
 		<TabItemBody
-			{...bodyProps}
+			{...props}
 			isDragging={isDragging}
 			outerRef={setNodeRef}
-			outerStyle={sortStyle}
 			dragProps={{ ...attributes, ...listeners }}
 		/>
 	);
 });
 
-/**
- * Non-draggable row, for the children of a workspace in directory mode.
- *
- * In directory mode a workspace moves as ONE unit (dragging the header moves the whole
- * structure, and its members are not pulled into directory groups either), so children
- * must not register as sortable — but they still render inside the DndContext. Keeping
- * this sortable-free variant shares the interaction code instead of forking it.
- */
-const StaticTabItem = React.memo(function StaticTabItem(
-	props: Omit<TabItemBodyProps, "outerRef" | "outerStyle" | "dragProps" | "isDragging">,
-) {
-	return <TabItemBody {...props} />;
-});
-
-/**
- * Sortable wrapper for a directory group header. The header is the unit's drag handle
- * AND its collapse toggle, so the click must go through the same post-drag suppression
- * (`justDragged`) the flat rows use — without it, every reorder would also fold the group.
- */
-function SortableDirectoryRow(props: RecentTabDirectoryRowProps) {
-	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+function DraggableDirectoryRow(props: RecentTabDirectoryRowProps) {
+	const drag = useContext(RecentTabsDragContext);
+	const { attributes, listeners, setNodeRef } = useDraggable({
 		id: directoryRowId(props.path),
+		disabled: drag.pending,
 	});
-
-	const style: React.CSSProperties = {
-		transform: CSS.Transform.toString(transform),
-		transition,
-		opacity: isDragging ? 0 : 1,
-		zIndex: isDragging ? 10 : undefined,
-	};
-
-	const handleToggle = (path: string) => {
-		if (justDragged) {
-			justDragged = false;
-			return;
-		}
-		props.onToggle(path);
-	};
-
 	return (
-		<div ref={setNodeRef} {...attributes} {...listeners} style={style}>
-			<RecentTabDirectoryRow {...props} onToggle={handleToggle} />
+		<div ref={setNodeRef} {...attributes} {...listeners}>
+			<RecentTabDirectoryRow
+				{...props}
+				onToggle={(path) => {
+					if (!drag.consumeClick()) props.onToggle(path);
+				}}
+			/>
 		</div>
 	);
-}
-
-/**
- * The directory row that owns `sortId` as a MEMBER, if any.
- *
- * Distinguishes "reordered a member inside its group" (persisted as group member order)
- * from every other drop (persisted as flat moves). A directory HEADER is not a member,
- * so dragging a whole group correctly falls through to the flat path.
- */
-function findDirectoryMemberRow(
-	rows: RecentTabRow[],
-	sortId: string,
-): Extract<RecentTabRow, { kind: "directory" }> | null {
-	for (const row of rows) {
-		if (row.kind !== "directory") continue;
-		if (row.children.some((child) => `${child.type}:${child.id}` === sortId)) return row;
-	}
-	return null;
 }
 
 /** Resolve a sortable id to its tab across the aggregated rows (for drag previews). */
@@ -3153,18 +2165,6 @@ function findCachedNarratorSummary(
 			const hit = page.items?.find((item) => item.id === narratorId);
 			if (hit) return hit;
 		}
-	}
-	return null;
-}
-
-function findDirectoryRowTab(rows: RecentTabRow[], sortId: string): RecentTab | null {
-	for (const row of rows) {
-		if (row.kind === "directory") {
-			const hit = row.children.find((child) => tabSortId(child) === sortId);
-			if (hit) return hit;
-			continue;
-		}
-		if (tabSortId(row.tab) === sortId) return row.tab;
 	}
 	return null;
 }

@@ -17,6 +17,7 @@ import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import { IconLock, IconLockOpen, IconShield } from "@tabler/icons-react";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useInputMenu } from "../../../hooks/useInputMenu";
 import type { SpecTaskItem } from "../../../lib/api/spec";
 import {
 	AGG_MODEL_PREFIX,
@@ -248,6 +249,7 @@ export interface NarratorInteractionStatusBarProps {
 }
 
 export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBarProps) {
+	const inputMenu = useInputMenu();
 	const {
 		narrator,
 		narratorId,
@@ -563,6 +565,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 												<Tooltip label={followsParent ? followTooltip : t("modelTooltip")}>
 													<Menu
 														position="top-end"
+														{...inputMenu.menuProps}
 														{...MODEL_MENU_POSITIONING}
 														opened={menuOpenDesktop}
 														onChange={(o) => {
@@ -573,6 +576,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 													>
 														<Menu.Target>
 															<NativeSelect
+																{...inputMenu.targetProps}
 																size="xs"
 																// The menu renders the full catalog; the trigger only needs
 																// the selected option so native sizing ignores longer models.
@@ -629,6 +633,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																allModels={model.allModels}
 																currentModel={narrator.model}
 																canFollowParent={canFollowParent}
+																inheritance={narrator.modelInheritance}
 																totalCostUsd={narrator.totalCostUsd}
 																onSelect={(v) =>
 																	model.mutation.mutate({ id: narratorId, model: v })
@@ -649,9 +654,10 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 
 												{/* Reasoning Effort (Codex + Anthropic providers) */}
 												{reasoning.supported && (
-													<Menu position="top-end">
+													<Menu {...inputMenu.menuProps} position="top-end">
 														<Menu.Target>
 															<NativeSelect
+																{...inputMenu.targetProps}
 																size="xs"
 																data={[
 																	{
@@ -701,6 +707,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 												>
 													{narrator.isAskInPassing ? (
 														<NativeSelect
+															{...inputMenu.targetProps}
 															size="xs"
 															leftSection={PERM_MODE_ICONS.readOnly ?? <IconShield size={14} />}
 															data={[{ value: "readOnly", label: t("perm_readOnly") }]}
@@ -710,9 +717,10 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															style={{ pointerEvents: "auto", opacity: 0.6 }}
 														/>
 													) : (
-														<Menu position="top-end">
+														<Menu {...inputMenu.menuProps} position="top-end">
 															<Menu.Target>
 																<NativeSelect
+																	{...inputMenu.targetProps}
 																	size="xs"
 																	leftSection={
 																		PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
@@ -856,8 +864,9 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 										<>
 											<Tooltip label={followsParent ? followTooltip : t("modelTooltip")}>
 												<Menu
-													position="bottom-end"
+													position="top-end"
 													withinPortal
+													{...inputMenu.menuProps}
 													{...MODEL_MENU_POSITIONING}
 													opened={menuOpenMobile}
 													onChange={(o) => {
@@ -871,6 +880,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															size="sm"
 															color={inheritance?.fallback ? "yellow" : "gray"}
 															aria-label={followsParent ? followLabel : t("modelTooltip")}
+															{...inputMenu.targetProps}
 														>
 															<Text size="xs" fw={600}>
 																{(() => {
@@ -901,10 +911,10 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															allModels={model.allModels}
 															currentModel={narrator.model}
 															canFollowParent={canFollowParent}
+															inheritance={narrator.modelInheritance}
 															totalCostUsd={narrator.totalCostUsd}
 															onSelect={(v) => model.mutation.mutate({ id: narratorId, model: v })}
 															onShowPrice={setPriceModel}
-															label={t("modelTooltip")}
 															providerLabels={model.providerLabels}
 															onEditDefaultModel={model.onEditDefaultModel}
 															onEditSummaryModel={model.onEditSummaryModel}
@@ -920,13 +930,14 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 
 											{/* Reasoning Effort (Codex + Anthropic providers) - Mobile */}
 											{reasoning.supported && (
-												<Menu position="bottom-end" withinPortal>
+												<Menu {...inputMenu.menuProps} position="top-end" withinPortal>
 													<Menu.Target>
 														<ActionIcon
 															variant="subtle"
 															color="gray"
 															size="sm"
 															aria-label={t("reasoningEffort")}
+															{...inputMenu.targetProps}
 														>
 															<Text size="xs" fw={600}>
 																{(() => {
@@ -991,13 +1002,14 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 														{PERM_MODE_ICONS.readOnly ?? <IconShield size={16} />}
 													</ActionIcon>
 												) : (
-													<Menu position="bottom-end" withinPortal>
+													<Menu {...inputMenu.menuProps} position="top-end" withinPortal>
 														<Menu.Target>
 															<ActionIcon
 																variant="subtle"
 																color="gray"
 																size="sm"
 																aria-label={t("permissionMode")}
+																{...inputMenu.targetProps}
 															>
 																{PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
 																	<IconShield size={16} />

@@ -113,6 +113,8 @@ export interface VListRenderLabels {
 		remote: string;
 		/** Header badge for a call blocked by a user takeover of its subagent. */
 		takenOver: string;
+		/** Header button opening the session an Await-agent call waits on. */
+		openSession: string;
 		/** `_planFile` provenance template carrying a literal `{file}` placeholder. */
 		planSource: string;
 		/**
@@ -539,6 +541,9 @@ export function useVListLabels(): VListLabels {
 				// The SAME key the narrator status chip uses for `taken_over`, so the
 				// blocked card and the child's own status read identically.
 				takenOver: t("subagentTakenOver"),
+				// The SAME wording the subagent card's own button uses — opening the
+				// awaited child is the same action from a different card.
+				openSession: t("openFullSubagentSession"),
 				// The raw `_planFile` path lives in the measured detail (shared/ has no
 				// i18n), so inject the template with a literal placeholder and let the
 				// render layer substitute the path — same trick as COUNT_PLACEHOLDER.

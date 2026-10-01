@@ -89,6 +89,7 @@
 		"remove": "Remove reference",
 		"openFailed": "Could not open file reference",
 		"newSessionFirst": "Create the new session before adding file references.",
+		"controlCommand": "This command does not accept file references.",
 		"remoteReadOnly": "Remote file references are read-only.",
 		"binaryNotSupported": "Binary files cannot be opened as text references. Use a file attachment instead.",
 		"missingContext": "This file reference has no available session context."
@@ -854,6 +855,7 @@
 		"dismiss": "Delete this reminder"
 	},
 	"compactUnsupportedTitle": "Compact unavailable",
+	"slashForkNoMessage": "Nothing to fork from yet — send a message first.",
 	"compactUnsupported": "Compacting is not available in this backend/runtime.",
 	"compactFallbackSummaryTitle": "Deterministic compact summary",
 	"compactFallbackSummaryDesc": "This backend will create a deterministic fallback summary instead of asking a model to summarize the compacted messages.",

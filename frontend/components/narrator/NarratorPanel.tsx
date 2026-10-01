@@ -155,7 +155,7 @@ import { useMessageRevertConfirm } from "./interaction/use-message-revert-confir
 import { useNarratorForkActions } from "./interaction/use-narrator-fork-actions";
 import { useNarratorSend } from "./interaction/use-narrator-send";
 import { usePermissionFocusNav } from "./interaction/use-permission-focus-nav";
-import { useResolvedModel } from "./interaction/use-resolved-model";
+import { capabilityModelReference, useResolvedModel } from "./interaction/use-resolved-model";
 import { LodSwitchToast } from "./lod/LodSwitchToast";
 import { type RenderLod, RenderLodCtx } from "./lod/RenderLodCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
@@ -643,13 +643,20 @@ export function NarratorPanel({
 	// Resolve the effective model: when following default, use the actual default
 	// model value; when using a model aggregation, resolve to a representative
 	// concrete member so capability/context-window lookups work (the backend
-	// resolves the actual member at request time).
+	// resolves the actual member at request time). A follow-parent subagent
+	// resolves through its server-reported inheritance instead of the raw
+	// `__parent__` sentinel, which no capability lookup can parse.
 	// Only the model *resolution* stays in the panel: resolvedModel feeds the NUG
 	// quota, Kimi usage and context-threshold queries and the WS state below. The
 	// reasoning/codex/fast-mode/permission control derivations moved down into the
 	// status bar (see useStatusBarProps), which is where they are consumed.
 	const { resolvedModel, resolvedProvider, resolvedBareModel, resolvedModelOption } =
-		useResolvedModel(narrator?.model, defaultModelValue, aggregations, allModels);
+		useResolvedModel(
+			capabilityModelReference(narrator?.model, narrator?.modelInheritance?.model),
+			defaultModelValue,
+			aggregations,
+			allModels,
+		);
 
 	// Fetch context thresholds for the current model (used as fallback when WS hasn't pushed yet)
 	const { data: modelThresholds } = useQuery({
@@ -1771,6 +1778,56 @@ export function NarratorPanel({
 		navigateToNarrator: (id: string) =>
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
 	});
+
+	// Slash-command handlers for /fork and /compact, mirroring the manual
+	// controls exactly: fork from the latest real message (its right-click fork
+	// action — chapter-bound narrators open the same host fork flow), and trigger
+	// a compaction (the context-ring "compact now" action, with the same
+	// capability gating handleCompactBefore applies).
+	const handleForkCommand = useCallback(() => {
+		const lastMessage = effectiveLastMessage;
+		if (!lastMessage || String(lastMessage.id).startsWith("optimistic-") || !forkHandler) {
+			notifications.show({
+				title: t("slashForkNoMessage"),
+				message: "",
+				color: "yellow",
+				autoClose: 4000,
+			});
+			return;
+		}
+		forkHandler(lastMessage.id);
+	}, [effectiveLastMessage, forkHandler, t]);
+
+	const handleCompactCommand = useCallback(() => {
+		if (!compactSupported) {
+			notifications.show({
+				title: t("compactUnsupportedTitle"),
+				message: compactUnsupportedReason,
+				color: "yellow",
+			});
+			return;
+		}
+		if (compactUsesFallbackSummary) {
+			notifications.show({
+				title: t("compactFallbackSummaryTitle"),
+				message: compactFallbackSummaryReason,
+				color: "yellow",
+				autoClose: 5000,
+			});
+		}
+		// Compacting state will arrive via substatus_change WS event
+		api.triggerCompact(narratorId).catch((err) => {
+			handleCompactError(err);
+		});
+	}, [
+		narratorId,
+		handleCompactError,
+		compactSupported,
+		compactUnsupportedReason,
+		compactUsesFallbackSummary,
+		compactFallbackSummaryReason,
+		t,
+	]);
 	// --- Message rendering setup ---
 
 	// --- Multi-select (state + range/toggle handlers + toolbar + batch actions) ---
@@ -2492,6 +2549,8 @@ export function NarratorPanel({
 		setNarratorWorking,
 		navigateToNarrator: (id: string) =>
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
+		onForkCommand: handleForkCommand,
+		onCompactCommand: handleCompactCommand,
 		normalizeBooleanOverride,
 		normalizeDangerReflectionOverride,
 		t,

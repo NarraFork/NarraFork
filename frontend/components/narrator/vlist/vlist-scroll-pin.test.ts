@@ -153,7 +153,7 @@ describe("upward scroll intent loads older history without a wheel event", () =>
 		expect(intentWrite).toBeLessThan(frame.indexOf("maybeAutoLoadOlder("));
 	});
 
-	it("records native message reveals as programmatic scrolls too", async () => {
+	it("records list-local message reveals as programmatic scrolls too", async () => {
 		const source = await Bun.file(
 			new URL("./PretextExactMessageList.tsx", import.meta.url).pathname,
 		).text();
@@ -161,8 +161,8 @@ describe("upward scroll intent loads older history without a wheel event", () =>
 			source.indexOf("const revealMounted = () =>"),
 			source.indexOf("const revealByLayout = async"),
 		);
-		expect(reveal).toContain('behavior: "instant"');
-		expect(reveal).toContain("writeScrollTop(node.scrollTop)");
+		expect(reveal).toContain("writeScrollTop(jumpTargetScrollTop(node, element))");
+		expect(reveal).not.toContain("element.scrollIntoView(");
 	});
 });
 
@@ -202,6 +202,68 @@ describe("isBottomLostToContentGrowth — a row growing beneath a pinned reader"
 	});
 });
 
+describe("keyboard viewport resize preserves the existing bottom pin", () => {
+	it("recognizes keyboard opening, animation steps and closing independently of scrollTop", async () => {
+		const { isBottomLostToViewportResize } = await import("./vlist-exact-scroll");
+		for (const [before, after] of [
+			[700, 400],
+			[400, 380],
+			[380, 700],
+		]) {
+			expect(isBottomLostToViewportResize(true, before, after)).toBe(true);
+		}
+	});
+
+	it("keeps a keyboard-adjusted upward position pinned, then honors the next real upward scroll", async () => {
+		const { isBottomLostToContentGrowth, isBottomLostToViewportResize } = await import(
+			"./vlist-exact-scroll"
+		);
+		// The focus/keyboard transition moved scrollTop upward: the old predicate
+		// alone would permanently release the pin before the geometry effect ran.
+		const staysPinned = (
+			beforeTop: number,
+			afterTop: number,
+			beforeHeight: number,
+			afterHeight: number,
+		) =>
+			isBottomLostToContentGrowth(true, beforeTop, afterTop) ||
+			isBottomLostToViewportResize(true, beforeHeight, afterHeight);
+		expect(isBottomLostToContentGrowth(true, 4000, 3800)).toBe(false);
+		expect(staysPinned(4000, 3800, 700, 400)).toBe(true);
+		// Once the viewport settles, even a gentle upward scroll must detach.
+		expect(staysPinned(4300, 4297, 400, 400)).toBe(false);
+	});
+
+	it("does not re-pin history readers or suppress upward scrolling at a stable height", async () => {
+		const { isBottomLostToViewportResize } = await import("./vlist-exact-scroll");
+		expect(isBottomLostToViewportResize(false, 700, 400)).toBe(false);
+		expect(isBottomLostToViewportResize(true, 400, 400)).toBe(false);
+		expect(isBottomLostToViewportResize(true, 400, 400.5)).toBe(false);
+		expect(isBottomLostToViewportResize(true, null, 400)).toBe(false);
+	});
+
+	it("checks live height before unpinning or inferring older-history intent", async () => {
+		const source = await Bun.file(
+			new URL("./PretextExactMessageList.tsx", import.meta.url).pathname,
+		).text();
+		const frame = source.slice(
+			source.indexOf("const processScrollFrame = useCallback("),
+			source.indexOf("const onScroll = useCallback("),
+		);
+		expect(frame).toContain("isBottomLostToViewportResize(");
+		expect(frame).toContain("scrollViewportHeightRef.current");
+		expect(frame).toContain("node.clientHeight");
+		expect(frame).toContain("atBottom || grewBeneathReader || viewportResizedWhilePinned");
+		expect(frame).toContain("if (!viewportResizedWhilePinned)");
+		expect(frame).toContain("grewBeneathReader || viewportResizedWhilePinned");
+		const touch = source.slice(
+			source.indexOf("const onTouchMove = (event: TouchEvent) =>"),
+			source.indexOf("const onTouchEnd = (event: TouchEvent) =>"),
+		);
+		expect(touch).toContain("detachFromBottom();");
+	});
+});
+
 describe("processScrollFrame answers content growth in the same frame", () => {
 	/**
 	 * Deciding to stay pinned is not enough on its own: the VIEW must also be pulled
@@ -224,9 +286,8 @@ describe("processScrollFrame answers content growth in the same frame", () => {
 		// The re-glue SNAPS: what reaches it is a row settling its post-paint height,
 		// not content arriving. It only stands down for an active chase so it cannot
 		// cut a streaming glide short. (See the settle-vs-arrival group below.)
-		expect(frame).toContain(
-			"if (grewBeneathReader && smoothFollowerRef.current?.isActive() !== true)",
-		);
+		expect(frame).toContain("(grewBeneathReader || viewportResizedWhilePinned) &&");
+		expect(frame).toContain("smoothFollowerRef.current?.isActive() !== true");
 		expect(frame).toContain("writeScrollTop(getScrollBottomTarget(node));");
 		// The mounted window must come from where the viewport now is, not from the
 		// pre-re-glue reading.

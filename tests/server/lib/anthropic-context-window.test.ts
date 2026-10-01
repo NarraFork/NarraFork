@@ -8,8 +8,14 @@ import {
 	getModelCatalogSnapshot,
 	mutateModelCatalog,
 } from "../../../server/lib/model-catalog";
-import type { AnthropicProviderConfig } from "../../../server/lib/settings";
-import { resolveModelContextWindow, saveSettings, settings } from "../../../server/lib/settings";
+import { deleteNugCachedModels, setNugCachedModels } from "../../../server/lib/nug-model-cache";
+import type { AnthropicProviderConfig, NUGProviderConfig } from "../../../server/lib/settings";
+import {
+	getModelContextWindow,
+	resolveModelContextWindow,
+	saveSettings,
+	settings,
+} from "../../../server/lib/settings";
 
 /**
  * Regression tests for the "custom context window has no effect" report.
@@ -206,5 +212,96 @@ describe("resolveModelContextWindow reports where the value came from", () => {
 			contextWindow: 272_000,
 			source: "fallback",
 		});
+	});
+});
+
+/**
+ * Regression tests for narrafork-issue#99: a NUG anthropic delegate receives the
+ * full routed id (`<channel>:<model>`, e.g. antigravity:gemini-3.8-flash-high) as
+ * its model, while `config.prefix` stays the outer NUG provider prefix ("gw").
+ * getAnthropicEffectiveContextWindow used to strip the first `:` segment via
+ * parseModelId, dropping the channel and querying `gw:gemini-3.8-flash-high` —
+ * a key present in neither the NUG cache nor the model catalog — so everything
+ * fell back to the 272k default and that wrong value overrode the correct
+ * top-level one in loop.ts (`parsed.usage.contextWindow ?? ...`).
+ */
+describe("NUG anthropic delegate keeps the channel segment in the lookup key", () => {
+	let snapshot: ReturnType<typeof cloneSettingsSnapshot>;
+
+	const nugConfig: NUGProviderConfig = {
+		id: "nug-gw",
+		name: "NUG Gateway",
+		prefix: "gw",
+		apiKey: "nug-key",
+		baseUrl: "https://nug.example.test",
+		defaultModel: "antigravity:gemini-3.8-flash-high",
+	};
+
+	// Mirror buildNugDelegateBaseConfig: the delegate gets the NUG provider's
+	// prefix, and the routed model id as its model/defaultModel.
+	const delegateConfig: AnthropicProviderConfig = {
+		id: nugConfig.id,
+		name: nugConfig.name,
+		prefix: nugConfig.prefix,
+		apiKey: nugConfig.apiKey,
+		baseUrl: nugConfig.baseUrl,
+		defaultModel: nugConfig.defaultModel,
+		officialApi: false,
+	};
+
+	beforeEach(() => {
+		snapshot = cloneSettingsSnapshot();
+		settings.nugProviders = [nugConfig];
+		settings.anthropicProviders = [anthropicConfig()];
+		settings.agent.modelContextWindows = {};
+		settings.agent.modelAggregations = [];
+		resetCatalog();
+		setNugCachedModels(nugConfig.id, [
+			{
+				id: "antigravity:gemini-3.8-flash-high",
+				channel: "antigravity",
+				channelType: "anthropic",
+				model: "gemini-3.8-flash-high",
+				contextLength: 1_048_576,
+			},
+		]);
+	});
+
+	afterEach(() => {
+		deleteNugCachedModels(nugConfig.id);
+		restoreFromSnapshot(snapshot);
+	});
+
+	test("delegate resolves the gateway-reported window, not the 272k fallback", () => {
+		// The top-level loop queries with the full prefixed id and gets it right.
+		expect(getModelContextWindow("gw:antigravity:gemini-3.8-flash-high", "gw")).toBe(1_048_576);
+		// The delegate must now land on the same value instead of the fallback.
+		expect(
+			getAnthropicEffectiveContextWindow("antigravity:gemini-3.8-flash-high", delegateConfig),
+		).toBe(1_048_576);
+	});
+
+	test("delegate result matches the top-level query for the same model", () => {
+		const topLevel = resolveModelContextWindow("gw:antigravity:gemini-3.8-flash-high", "gw");
+		expect(
+			getAnthropicEffectiveContextWindow("antigravity:gemini-3.8-flash-high", delegateConfig),
+		).toBe(topLevel.contextWindow);
+	});
+
+	test("per-model user override keyed on the full id applies on the delegate path", () => {
+		settings.agent.modelContextWindows = {
+			"gw:antigravity:gemini-3.8-flash-high": 700_000,
+		};
+		saveSettings(settings);
+		expect(
+			getAnthropicEffectiveContextWindow("antigravity:gemini-3.8-flash-high", delegateConfig),
+		).toBe(700_000);
+	});
+
+	test("direct anthropic providers with bare model ids are unaffected", () => {
+		// No colon in the model id: nothing to strip before, nothing stripped now.
+		expect(getAnthropicEffectiveContextWindow("totally-unknown-model", anthropicConfig())).toBe(
+			272_000,
+		);
 	});
 });

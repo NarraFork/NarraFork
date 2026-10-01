@@ -702,6 +702,85 @@ describe("recent-tabs capacity and undo", () => {
 	});
 });
 
+describe("recent-tabs workspace member anchored moves", () => {
+	const memberIds = ["child-a", "child-b", "child-c", "child-d"];
+	const seedWorkspace = async () => {
+		seedLegacyTabs([
+			makeTab("project-1", { type: "project", pinned: true }),
+			makeTab("n-top"),
+			makeTab("ws-1", { type: "workspace", title: "Workspace" }),
+			...memberIds.map((id) => makeTab(id, { workspaceId: "ws-1" })),
+			makeTab("n-tail"),
+		]);
+		await recentTabs.ensureMigrated("user-1");
+	};
+	const storedMembership = () =>
+		db
+			.select({
+				key: userRecentTabs.tabKey,
+				type: userRecentTabs.type,
+				workspaceId: userRecentTabs.workspaceId,
+			})
+			.from(userRecentTabs)
+			.where(eq(userRecentTabs.userId, "user-1"))
+			.orderBy(userRecentTabs.tabKey)
+			.all();
+
+	// Every source/anchor pair covers both directions, including middle positions
+	// and moves whose source originally precedes or follows the target sibling.
+	for (const position of ["before", "after"] as const) {
+		for (const source of memberIds) {
+			for (const anchor of memberIds.filter((id) => id !== source)) {
+				it(`moves ${source} ${position} ${anchor} without changing membership`, async () => {
+					await seedWorkspace();
+					const membership = storedMembership();
+					const expectedMembers = memberIds.filter((id) => id !== source);
+					const target = expectedMembers.indexOf(anchor) + (position === "after" ? 1 : 0);
+					expectedMembers.splice(target, 0, source);
+
+					const result = await recentTabs.moveRecentTab("user-1", {
+						key: `narrator:${source}`,
+						...(position === "before"
+							? { beforeKey: `narrator:${anchor}` }
+							: { afterKey: `narrator:${anchor}` }),
+					});
+
+					expect(storedKeys()).toEqual([
+						"project:project-1",
+						"narrator:n-top",
+						"workspace:ws-1",
+						...expectedMembers.map((id) => `narrator:${id}`),
+						"narrator:n-tail",
+					]);
+					expect(storedMembership()).toEqual(membership);
+					const changed = expectedMembers.some((id, index) => id !== memberIds[index]);
+					expect(result.changed).toBe(changed);
+				});
+			}
+		}
+	}
+
+	for (const position of ["before", "after"] as const) {
+		it(`keeps an external top-level move ${position} a child at the workspace edge`, async () => {
+			await seedWorkspace();
+			const membership = storedMembership();
+			await recentTabs.moveRecentTab("user-1", {
+				key: position === "before" ? "narrator:n-tail" : "narrator:n-top",
+				...(position === "before"
+					? { beforeKey: "narrator:child-b" }
+					: { afterKey: "narrator:child-b" }),
+			});
+			const workspaceKeys = ["workspace:ws-1", ...memberIds.map((id) => `narrator:${id}`)];
+			expect(storedKeys()).toEqual(
+				position === "before"
+					? ["project:project-1", "narrator:n-top", "narrator:n-tail", ...workspaceKeys]
+					: ["project:project-1", ...workspaceKeys, "narrator:n-top", "narrator:n-tail"],
+			);
+			expect(storedMembership()).toEqual(membership);
+		});
+	}
+});
+
 /**
  * Anchored upsert: create AND position a tab in one revision.
  *

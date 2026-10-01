@@ -1,4 +1,5 @@
 import { ActionIcon, Badge, Box, CloseButton, Group, Menu, Text, TextInput } from "@mantine/core";
+import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import {
 	IconAlertTriangle,
 	IconCheck,
@@ -18,6 +19,7 @@ import {
 	type ModelOption,
 	parseAggModelValue,
 } from "../../../lib/constants";
+import { modelInheritanceLabel } from "./model-inheritance-label";
 import {
 	canAssignGlobalModelRole,
 	centerModelMenuSelection,
@@ -61,6 +63,7 @@ export function ModelMenuItems({
 	refreshingProviderId,
 	onPickerOpened,
 	canFollowParent = false,
+	inheritance,
 }: {
 	allModels: ModelOption[];
 	aggregations?: ModelAggregation[];
@@ -113,6 +116,12 @@ export function ModelMenuItems({
 	 * can be undone. Otherwise it only appears as the current-state label.
 	 */
 	canFollowParent?: boolean;
+	/**
+	 * What a `__parent__` selection actually resolved to on the latest run. Rendered
+	 * inside the follow-parent group exactly like the resolved Default/Summary rows:
+	 * provider prefix line + model label, plus a warning line on pool fallback.
+	 */
+	inheritance?: SubagentModelInheritance | null;
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: ts } = useTranslation("settings");
@@ -196,18 +205,52 @@ export function ModelMenuItems({
 		: entries;
 	// For aggregation selection check: parse current model to see if it's an aggregation
 	const currentAgg = currentModel ? parseAggModelValue(currentModel) : null;
+	// Follow-parent group: resolved exactly like the Default/Summary role rows —
+	// provider prefix line + resolved model label, plus a fallback warning.
+	const followsParent = currentModel === FOLLOW_PARENT_MODEL;
+	const inheritanceInfo = followsParent ? modelInheritanceLabel(inheritance, t) : null;
+	const followModel = followsParent && inheritance ? inheritance.model : null;
+	const followModelLabel = followModel
+		? (allModels.find((o) => o.value === followModel)?.label ?? followModel)
+		: null;
+	const followModelPrefix = modelProviderPrefix(followModel);
 	return (
 		<>
-			{/* Inheritance is a current-state label, not a catalog model or a global role. */}
-			{(currentModel === FOLLOW_PARENT_MODEL || canFollowParent) && (
-				<Menu.Item
-					disabled={currentModel === FOLLOW_PARENT_MODEL}
-					ref={currentModel === FOLLOW_PARENT_MODEL ? selectedItemRef : undefined}
-					rightSection={currentModel === FOLLOW_PARENT_MODEL ? <IconCheck size={14} /> : undefined}
-					onClick={() => onSelect(FOLLOW_PARENT_MODEL)}
-				>
-					{t("followParent")}
-				</Menu.Item>
+			{/* Inheritance is a current-state group, not a catalog model or a global role. */}
+			{(followsParent || canFollowParent) && (
+				<span>
+					<Menu.Label>{t("followParent")}</Menu.Label>
+					<Menu.Item
+						disabled={followsParent}
+						ref={followsParent ? selectedItemRef : undefined}
+						rightSection={followsParent ? <IconCheck size={14} /> : undefined}
+						onClick={() => onSelect(FOLLOW_PARENT_MODEL)}
+					>
+						{followModelLabel ? (
+							<Box>
+								{followModelPrefix && (
+									<Text size="xs" c="dimmed" lh={1.3}>
+										{followModelPrefix}
+									</Text>
+								)}
+								<Text size="sm" inherit>
+									{followModelLabel}
+								</Text>
+								{inheritanceInfo?.fallback && inheritanceInfo.reason && (
+									<Group gap={4} wrap="nowrap" mt={2} align="flex-start">
+										<IconAlertTriangle size={12} color="var(--mantine-color-orange-6)" />
+										<Text size="xs" c="orange" lh={1.3}>
+											{inheritanceInfo.reason}
+										</Text>
+									</Group>
+								)}
+							</Box>
+						) : (
+							t("followParent")
+						)}
+					</Menu.Item>
+					<Menu.Divider />
+				</span>
 			)}
 			{totalCostUsd != null && totalCostUsd > 0 && (
 				<>

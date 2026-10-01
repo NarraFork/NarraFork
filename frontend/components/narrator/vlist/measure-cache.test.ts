@@ -17,6 +17,74 @@ beforeAll(() => {
 	installCanvasStub();
 });
 
+describe("mixed action-card append cache locality", () => {
+	it.each([
+		"tool",
+		"search",
+		"generation",
+		"subagent",
+	])("append after a %s tail invalidates only that tail and the new card", async (tail) => {
+		const { segmentMessages } = await import("../message/message-segments");
+		const { adaptSegments } = await import("./segment-adapter");
+		const { measureCache } = await import("./measure-cache");
+		const { measureElementCached } = await import("./registry");
+		const tool = (id: string, name = "Read") => ({
+			type: "tool_use",
+			id,
+			name,
+			status: "success",
+			inputJson: { file_path: "a.ts", prompt: "inspect" },
+		});
+		const search = { type: "web_search", query: "layout", status: "completed" };
+		const generation = { type: "image_generation", status: "completed", width: 320, height: 160 };
+		const tails = { tool: tool("tail"), search, generation, subagent: tool("tail-agent", "Agent") };
+		function msg(id: string, contentJson: Record<string, unknown>[]) {
+			return {
+				id,
+				role: "assistant",
+				contentJson,
+				toolCalls: [],
+				children: [],
+				parentToolUseId: null,
+			} as unknown as import("../narrator-panel-types").NarratorMsg;
+		}
+		const messages = [
+			msg("stable", [tool("read"), search, generation, tool("agent", "Agent")]),
+			msg("tail", [tails[tail as keyof typeof tails]]),
+		];
+		const adapt = (source: typeof messages) =>
+			adaptSegments(
+				segmentMessages(source) as unknown as import("./segment-adapter").AdapterSegment[],
+				{ lod: 5 },
+			);
+		const measure = (spec: import("./segment-adapter").ElementSpec) =>
+			measureElementCached(spec.kind, spec.data, 860, 5, spec.opts, spec.key, "stable-document");
+		measureCache.clear();
+		try {
+			const before = adapt(messages);
+			const measuredBefore = before.map(measure);
+			expect(measureCache.misses).toBe(5);
+			const after = adapt([...messages, msg("appended", [tool("new-tool")])]);
+			const measuredAfter = after.map(measure);
+			expect(measureCache.hits).toBe(4);
+			expect(measureCache.misses).toBe(7);
+			for (let i = 0; i < 4; i++) {
+				expect(after[i]).toEqual(before[i]);
+				expect(measuredAfter[i]).toBe(measuredBefore[i]);
+			}
+			expect(before[4]?.opts).toMatchObject({ inRun: true, isLast: true });
+			expect(after[4]?.opts).toMatchObject({ inRun: true, isLast: false });
+			expect(measuredAfter[4]).not.toBe(measuredBefore[4]);
+			expect(after[5]?.opts).toMatchObject({ inRun: true, isLast: true });
+			expect(after.map(measure)).toEqual(measuredAfter);
+			expect(measureCache.misses).toBe(7);
+			expect(measureCache.hits).toBe(10);
+		} finally {
+			measureCache.clear();
+		}
+	});
+});
+
 describe("ask-in-passing cached measurements", () => {
 	beforeEach(async () => {
 		const { measureCache } = await import("./measure-cache");

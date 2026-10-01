@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Browser, BrowserContext, Page } from "puppeteer-core";
 import { logger } from "../logger";
-import { getWebFetchProxy } from "../web-fetch/proxy";
+import { getBrowserProxy, getWebFetchProxy } from "../web-fetch/proxy";
 
 /** Browser instances keyed by mode. */
 const browsers: Map<boolean, Browser> = new Map();
@@ -37,19 +37,20 @@ const LAUNCH_ARGS = [
 	"--disable-extensions",
 ];
 
-/** Build launch args, appending --proxy-server when a proxy is configured. */
 function buildLaunchArgs(headless: boolean): string[] {
-	const args = [...LAUNCH_ARGS];
-	if (headless) {
-		args.push("--disable-gpu");
-	}
-	const proxy = getWebFetchProxy();
-	if (proxy) {
-		args.push(`--proxy-server=${proxy}`);
-		// Always reach local targets directly, mirroring resolveProxyForUrl().
-		args.push("--proxy-bypass-list=<-loopback>;localhost;127.0.0.1;[::1]");
-	}
+	const args = [...LAUNCH_ARGS, "--no-proxy-server"];
+	if (headless) args.push("--disable-gpu");
+	// Proxies are applied per context, never fixed at process launch. This lets
+	// new sessions pick up changes without interrupting existing sessions.
 	return args;
+}
+
+export function browserContextProxyOptions(proxy: string | undefined) {
+	return {
+		// Explicit direct mode also overrides a proxy on a preserved old Chrome.
+		proxyServer: proxy ?? "direct://",
+		proxyBypassList: ["localhost", "*.localhost", "127.0.0.0/8", "[::1]", "0.0.0.0"],
+	};
 }
 
 /**
@@ -312,7 +313,16 @@ export interface FetchPageOptions {
  */
 export async function fetchPage(url: string, options?: FetchPageOptions): Promise<Page> {
 	const b = await getBrowser();
-	const page = await b.newPage();
+	const ctx = await b.createBrowserContext(browserContextProxyOptions(getWebFetchProxy()));
+	let page: Page;
+	try {
+		page = await ctx.newPage();
+	} catch (err) {
+		await ctx.close().catch(() => {});
+		throw err;
+	}
+	// WebFetch callers close the returned page; dispose its isolated context too.
+	page.once("close", () => void ctx.close().catch(() => {}));
 
 	try {
 		await page.setViewport(DEFAULT_VIEWPORT);
@@ -340,7 +350,7 @@ export async function fetchPage(url: string, options?: FetchPageOptions): Promis
 
 		return page;
 	} catch (err) {
-		await page.close().catch(() => {});
+		await ctx.close().catch(() => {});
 		throw err;
 	}
 }
@@ -352,7 +362,7 @@ export async function fetchPage(url: string, options?: FetchPageOptions): Promis
  */
 export async function createContext(headless = true): Promise<BrowserContext> {
 	const b = await getBrowser(headless);
-	const ctx = await b.createBrowserContext();
+	const ctx = await b.createBrowserContext(browserContextProxyOptions(getBrowserProxy()));
 	return ctx;
 }
 

@@ -261,3 +261,61 @@ describe("narrator interrupt send", () => {
 		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
 	});
 });
+
+describe("control slash commands", () => {
+	test.each([
+		"/fork",
+		"/compact",
+	] as const)("%s runs its handler immediately without sending or touching attachments", async (command) => {
+		const file = new File(["note"], "note.txt");
+		const onForkCommand = mock(() => {});
+		const onCompactCommand = mock(() => {});
+		await render({ attachedTextFiles: [file], onForkCommand, onCompactCommand });
+		const composer = options.composerRef.current as NarratorComposerHandle;
+		composer.getText = () => command;
+		composer.getFileReferences = () => [];
+		await act(async () => actions.handleSend());
+		expect(send).not.toHaveBeenCalled();
+		expect(onForkCommand).toHaveBeenCalledTimes(command === "/fork" ? 1 : 0);
+		expect(onCompactCommand).toHaveBeenCalledTimes(command === "/compact" ? 1 : 0);
+		expect(composer.hideTextForSend).toHaveBeenCalledTimes(1);
+		expect(composer.commitDraftAfterSend).toHaveBeenCalledTimes(1);
+		// Staged attachments survive a control command for the next message.
+		expect(options.hideAttachedFilesForSend).not.toHaveBeenCalled();
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+		expect(queue.map((message) => message.id)).toEqual(["existing"]);
+	});
+
+	test.each([
+		"/fork",
+		"/compact",
+	] as const)("%s rejects file references and keeps the draft", async (command) => {
+		const onForkCommand = mock(() => {});
+		const onCompactCommand = mock(() => {});
+		await render({ onForkCommand, onCompactCommand });
+		(options.composerRef.current as NarratorComposerHandle).getText = () => command;
+		await act(async () => actions.handleSend());
+		expect(onForkCommand).not.toHaveBeenCalled();
+		expect(onCompactCommand).not.toHaveBeenCalled();
+		expect(send).not.toHaveBeenCalled();
+		expect(notify).toHaveBeenCalledWith(
+			expect.objectContaining({
+				title: "sendFailed",
+				message: "fileReferences.controlCommand",
+				color: "red",
+			}),
+		);
+		expect(options.composerRef.current?.commitDraftAfterSend).not.toHaveBeenCalled();
+		expect(options.sendingRef.current).toBe(false);
+	});
+
+	test("a control command without a registered handler is a no-op", async () => {
+		await render();
+		(options.composerRef.current as NarratorComposerHandle).getText = () => "/compact";
+		(options.composerRef.current as NarratorComposerHandle).getFileReferences = () => [];
+		await act(async () => actions.handleSend());
+		expect(send).not.toHaveBeenCalled();
+		expect(notify).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.commitDraftAfterSend).toHaveBeenCalledTimes(1);
+	});
+});

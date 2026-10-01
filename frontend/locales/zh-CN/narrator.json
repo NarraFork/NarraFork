@@ -89,6 +89,7 @@
 		"remove": "移除引用",
 		"openFailed": "无法打开文件引用",
 		"newSessionFirst": "请先创建新会话，再添加文件引用。",
+		"controlCommand": "该命令不支持文件引用。",
 		"remoteReadOnly": "远程文件引用仅支持只读查看。",
 		"binaryNotSupported": "二进制文件不能作为文本引用打开，请使用文件附件。",
 		"missingContext": "此文件引用缺少可用的会话上下文。"
@@ -853,6 +854,7 @@
 		"dismiss": "删除此提醒"
 	},
 	"compactUnsupportedTitle": "压缩不可用",
+	"slashForkNoMessage": "暂无可分叉的消息，请先发送一条消息。",
 	"compactUnsupported": "当前后端/运行时不支持消息压缩。",
 	"compactFallbackSummaryTitle": "确定性压缩摘要",
 	"compactFallbackSummaryDesc": "当前后端会生成确定性 fallback 摘要，而不是调用模型总结被压缩的消息。",

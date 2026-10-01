@@ -8,6 +8,8 @@ import {
 	IconTool,
 } from "@tabler/icons-react";
 
+import { useInputMenu } from "../../../hooks/useInputMenu";
+
 export type QueueMode = "turn" | "tool" | "interrupt";
 
 const QUEUE_MODES: QueueMode[] = ["turn", "tool", "interrupt"];
@@ -192,11 +194,13 @@ export function SendOptionsSplitButton({
 	onSendWithMode,
 	t,
 }: SendOptionsSplitButtonProps) {
+	const inputMenu = useInputMenu();
 	return (
 		<Button.Group>
-			<Menu position="top-end" withinPortal>
+			<Menu {...inputMenu.menuProps} position="top-end" withinPortal>
 				<Menu.Target>
 					<Button
+						{...inputMenu.targetProps}
 						color={color}
 						variant={variant}
 						px={6}

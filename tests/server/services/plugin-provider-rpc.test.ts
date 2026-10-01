@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type { JsonRpcNotification, ProviderStreamEvent } from "@server/lib/plugins/protocol";
 import {
 	PluginProviderRpcClient,
+	type ProviderOperation,
 	type ProviderRpcRequestOptions,
 	type ProviderRpcTransport,
 	type ProviderStreamWindow,
@@ -193,13 +194,18 @@ function generateParams() {
 }
 
 async function setup(
-	options: { window?: Partial<ProviderStreamWindow>; limits?: Record<string, number> } = {},
+	options: {
+		window?: Partial<ProviderStreamWindow>;
+		limits?: Record<string, number>;
+		idFactory?: (prefix: "op" | "rpc") => string;
+	} = {},
 ) {
 	const transport = new MockTransport();
 	const client = new PluginProviderRpcClient({
 		transport,
 		expectedPluginId: "com.example.provider",
 		streamWindow: options.window,
+		idFactory: options.idFactory,
 		limits: {
 			streamIdleTimeoutMs: 10_000,
 			operationTimeoutMs: 10_000,
@@ -374,6 +380,100 @@ describe("accepted streaming and operation registry", () => {
 
 		expect(client.getDiagnostics().activeOperations).toBe(0);
 		await expect(stream.next()).rejects.toMatchObject({ code: "UNKNOWN_RESULT" });
+	});
+});
+
+describe("outbound request byte limits", () => {
+	async function completeOperation(transport: MockTransport, operation: ProviderOperation) {
+		const stream = operation.events();
+		transport.emit(
+			notification(operation.operationId, 1, {
+				type: "done",
+				status: "completed",
+				stopReason: "end_turn",
+			}),
+		);
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "done" }, done: false });
+		await expect(stream.next()).resolves.toMatchObject({ done: true });
+	}
+
+	it.each([
+		"chat",
+		"generate",
+	] as const)("enforces the full UTF-8 %s params boundary and recovers after rejection", async (kind) => {
+		let nextId = 0;
+		const idFactory = (prefix: "op" | "rpc") => `${prefix}_${String(++nextId).padStart(4, "0")}`;
+		const start = (client: PluginProviderRpcClient, text: string) => {
+			if (kind === "generate") {
+				return client.generate({
+					...generateParams(),
+					request: { mode: "prompt", text },
+				});
+			}
+			const params = chatParams();
+			return client.chat({
+				...params,
+				request: {
+					...params.request,
+					current: {
+						...params.request.current,
+						text,
+						images: [{ mediaType: "image/png", dataBase64: "AQID".repeat(16) }],
+					},
+				},
+			});
+		};
+		// Capture the actual params, including the host's fixed-width IDs and stream window.
+		const probe = await setup({ idFactory });
+		clients.push(probe.client);
+		const probeOperation = await start(probe.client, "");
+		const probeRequest = probe.transport.requests.find(
+			(request) => request.method === `provider.${kind}`,
+		);
+		expect(probeRequest).toBeDefined();
+		const probeParams = getRecord(probeRequest?.params);
+		expect(probeParams.protocolVersion).toBe(protocolVersion);
+		expect(probeParams.operationId).toBe(probeOperation.operationId);
+		expect(probeParams.streamWindow).toMatchObject({ maxUnackedEvents: 64 });
+		const overhead = Buffer.byteLength(JSON.stringify(probeParams), "utf8");
+		await completeOperation(probe.transport, probeOperation);
+
+		// Multi-byte text plus JSON-escaped characters catches UTF-16/string-length accounting.
+		const text = `${"界".repeat(16)}"\\`;
+		const textJsonBytes = Buffer.byteLength(JSON.stringify(text), "utf8") - 2;
+		const maxRequestBytes = overhead + textJsonBytes;
+		const { client, transport } = await setup({ limits: { maxRequestBytes }, idFactory });
+		clients.push(client);
+		const operation = await start(client, text);
+		const sent = transport.requests.find((request) => request.method === `provider.${kind}`);
+		const sentParams = getRecord(sent?.params);
+		expect(Buffer.byteLength(JSON.stringify(sentParams), "utf8")).toBe(maxRequestBytes);
+		const {
+			protocolVersion: _protocolVersion,
+			operationId: _operationId,
+			streamWindow: _streamWindow,
+			...callerParams
+		} = sentParams;
+		expect(Buffer.byteLength(JSON.stringify(callerParams), "utf8")).toBeLessThan(maxRequestBytes);
+		expect(JSON.stringify(sentParams).length).toBeLessThan(maxRequestBytes);
+		await completeOperation(transport, operation);
+
+		const requestsBeforeRejection = transport.requests.length;
+		expect(Buffer.byteLength(JSON.stringify(`${text}x`), "utf8") - 2 + overhead).toBe(
+			maxRequestBytes + 1,
+		);
+		await expect(start(client, `${text}x`)).rejects.toMatchObject({ code: "OUTPUT_LIMIT" });
+		expect(transport.requests.length).toBe(requestsBeforeRejection);
+		expect(client.getDiagnostics()).toMatchObject({
+			activeOperations: 0,
+			queuedBytes: 0,
+			operations: [],
+			transportKilled: false,
+		});
+		expect(transport.killed).toHaveLength(0);
+		const recovered = await start(client, "ok");
+		await completeOperation(transport, recovered);
+		expect(client.getDiagnostics().activeOperations).toBe(0);
 	});
 });
 

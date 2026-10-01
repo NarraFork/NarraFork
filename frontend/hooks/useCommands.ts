@@ -28,6 +28,26 @@ export function useNarratorCommands(narratorId: string | undefined) {
 					source: "builtin",
 					type: "command" as const,
 				},
+				{
+					name: "fork",
+					prompt: "",
+					description: localize(
+						"Fork a new session from the latest message (same as its right-click fork)",
+						"从最新消息分叉出新会话（等同于最新消息的右键分叉）",
+					),
+					source: "builtin",
+					type: "command" as const,
+				},
+				{
+					name: "compact",
+					prompt: "",
+					description: localize(
+						"Compact the conversation context now (same as the context-ring action)",
+						"立即压缩当前会话上下文（等同于上下文圆环的“立即压缩”）",
+					),
+					source: "builtin",
+					type: "command" as const,
+				},
 				...(data.commands ?? []).map((c) => ({
 					name: c.name,
 					prompt: c.prompt,

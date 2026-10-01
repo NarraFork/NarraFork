@@ -4,6 +4,7 @@ import type { NarratorMsg } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { buildPretextLayoutManifest } from "./pretext-layout-manifest";
 import type { AdapterRenderUnit } from "./segment-adapter";
+import { computeToolRunFrames } from "./vlist-exact-layout";
 
 beforeAll(() => {
 	installCanvasStub();
@@ -22,6 +23,117 @@ function message(id: string, role: "user" | "assistant", text: string): Narrator
 		createdAt: "2026-07-23T00:00:00.000Z",
 	} as unknown as NarratorMsg;
 }
+
+describe("mixed native-card manifest integration", () => {
+	function nativeMessage(id: string, blocks: Record<string, unknown>[]): NarratorMsg {
+		return { ...message(id, "assistant", ""), contentJson: blocks } as unknown as NarratorMsg;
+	}
+	function tool(id: string, name = "Read") {
+		return {
+			type: "tool_use",
+			id,
+			name,
+			status: "success",
+			inputJson: { file_path: "a.ts", prompt: "inspect" },
+		};
+	}
+	function build(messages: NarratorMsg[]) {
+		return buildPretextLayoutManifest({
+			layoutRevision: "mixed-run",
+			documentRevision: 1,
+			lod: 5,
+			widthBucket: "860",
+			renderUnits: segmentMessages(messages).map((seg) => ({
+				kind: "segment",
+				seg,
+			})) as unknown as AdapterRenderUnit[],
+			contentWidth: 860,
+			viewportHeight: 720,
+			gap: 4,
+			segmentGap: 17,
+			topPadding: 16,
+			bottomPadding: 16,
+			resolveSource: (_spec, index) => ({
+				firstSeq: index,
+				lastSeq: index,
+				sourceMessageIds: messages.map((m) => m.id),
+			}),
+		});
+	}
+	const search = { type: "web_search", query: "layout", status: "completed" };
+	const gen = { type: "image_generation", status: "completed", width: 320, height: 160 };
+
+	it("overrides segmentGap with zero through tools/search/generation/subagent across assistant messages", () => {
+		const built = build([
+			nativeMessage("m0", [tool("read"), search]),
+			nativeMessage("m1", [gen, tool("agent", "Agent"), tool("last")]),
+		]);
+		expect(built.items.map((item) => item.spec.kind)).toEqual([
+			"tool-call",
+			"web-search",
+			"media",
+			"subagent-card",
+			"tool-call",
+		]);
+		expect(built.items.map((item) => [item.spec.opts?.inRun, item.spec.opts?.isLast])).toEqual([
+			[true, false],
+			[true, false],
+			[true, false],
+			[true, false],
+			[true, true],
+		]);
+		expect(built.manifest.items.map((item) => item.gapAfter)).toEqual([0, 0, 0, 0, undefined]);
+		expect(computeToolRunFrames(built.items)).toEqual([
+			{ key: `run:${built.items[0]?.spec.key}`, start: 0, end: 4 },
+		]);
+		for (let i = 1; i < built.items.length; i++) {
+			expect(built.index.itemStarts[i]).toBe(built.index.itemEnds[i - 1]);
+		}
+		for (const item of built.items) {
+			expect(item.measured.height).toBeGreaterThan(0);
+			// Subagent geometry consumes opts but does not expose run flags on its result.
+			if (item.spec.kind !== "subagent-card") {
+				expect((item.measured as { inRun?: boolean }).inRun).toBe(true);
+			}
+		}
+		expect(built.index.totalHeight).toBe(
+			32 + built.items.reduce((sum, item) => sum + item.measured.height, 0),
+		);
+	});
+
+	it("restores segmentGap around a user breaker without connecting the two runs", () => {
+		const built = build([
+			nativeMessage("m0", [tool("before"), search]),
+			message("m1", "user", "new turn"),
+			nativeMessage("m2", [gen, tool("after")]),
+		]);
+		expect(built.manifest.items.map((item) => item.gapAfter)).toEqual([0, 17, 17, 0, undefined]);
+		expect(built.items[1]?.spec.opts).toMatchObject({ inRun: true, isLast: true });
+		expect(built.items[3]?.spec.opts).toMatchObject({ inRun: true, isLast: false });
+		expect(built.index.itemStarts[2]! - built.index.itemEnds[1]!).toBe(17);
+		expect(built.index.itemStarts[3]! - built.index.itemEnds[2]!).toBe(17);
+		expect(computeToolRunFrames(built.items)).toEqual([
+			{ key: `run:${built.items[0]?.spec.key}`, start: 0, end: 1 },
+			{ key: `run:${built.items[3]?.spec.key}`, start: 3, end: 4 },
+		]);
+	});
+
+	it("honors explicit run tails rather than merging all consecutive frameless cards", () => {
+		const built = build([
+			nativeMessage("m0", [tool("before"), search]),
+			message("m1", "user", "separate turn"),
+			nativeMessage("m2", [gen, tool("after")]),
+		]);
+		// Exercise the frame helper's tail contract independently of the breaker
+		// row: two consecutive frameless pairs still must not share one frame.
+		const cards = [...built.items.slice(0, 2), ...built.items.slice(3)];
+		expect(cards).toHaveLength(4);
+		expect(computeToolRunFrames(cards)).toEqual([
+			{ key: `run:${cards[0]?.spec.key}`, start: 0, end: 1 },
+			{ key: `run:${cards[2]?.spec.key}`, start: 2, end: 3 },
+		]);
+	});
+});
 
 describe("pretext layout manifest deduplication", () => {
 	it("does not throw on duplicate itemKeys and deduplicates them deterministically", () => {

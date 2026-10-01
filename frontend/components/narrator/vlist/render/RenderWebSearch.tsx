@@ -28,11 +28,12 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
-import { Loader, Paper, ThemeIcon } from "@mantine/core";
+import { Divider, Loader, Paper, ThemeIcon } from "@mantine/core";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { IconWorldSearch } from "@tabler/icons-react";
 import { Fragment, useMemo } from "react";
 import {
+	type MeasuredWebSearch,
 	WEB_SEARCH_BORDER,
 	WEB_SEARCH_ICON_SIZE,
 	WEB_SEARCH_LABEL_CLASS,
@@ -56,11 +57,14 @@ const QUERY_COLOR = "var(--mantine-color-teal-text)";
 
 export function RenderWebSearch({ measured, isSearching = false }: RenderWebSearchProps) {
 	const { blocks, contentWidth } = measured;
+	const { inRun, isLast } = measured as Partial<MeasuredWebSearch>;
+	const divider = inRun && !isLast ? 1 : 0;
+	const border = inRun ? 0 : WEB_SEARCH_BORDER * 2;
 	const textBlock = blocks[0] as PreparedInlineBlock | undefined;
 
 	const chromeLeft = webSearchChromeLeft(isSearching);
 	// Content-lane height inside the padding+border (== measured rowHeight).
-	const laneHeight = measured.height - WEB_SEARCH_PADDING * 2 - WEB_SEARCH_BORDER * 2;
+	const laneHeight = measured.height - WEB_SEARCH_PADDING * 2 - border - divider;
 
 	const lines = useMemo(() => {
 		if (!textBlock || textBlock.kind !== "inline") return [];
@@ -92,93 +96,97 @@ export function RenderWebSearch({ measured, isSearching = false }: RenderWebSear
 	const loaderTop = Math.max(0, (laneHeight - WEB_SEARCH_LOADER_SIZE) / 2);
 
 	return (
-		<Paper
-			withBorder
-			radius="sm"
-			p="xs"
-			style={{
-				position: "relative",
-				width: "100%",
-				height: measured.height,
-				boxSizing: "border-box",
-			}}
-		>
-			<div style={{ position: "relative", width: "100%", height: laneHeight }}>
-				<ThemeIcon
-					size={WEB_SEARCH_ICON_SIZE}
-					variant="light"
-					color="teal"
-					radius="sm"
-					style={{ position: "absolute", left: 0, top: iconTop }}
-				>
-					<IconWorldSearch size={12} />
-				</ThemeIcon>
-				{isSearching ? (
-					<div
-						style={{
-							position: "absolute",
-							left: WEB_SEARCH_ICON_SIZE + 6,
-							top: loaderTop,
-						}}
+		<div>
+			<Paper
+				withBorder={!inRun}
+				radius={inRun ? 0 : "sm"}
+				p="xs"
+				style={{
+					position: "relative",
+					width: "100%",
+					height: measured.height - divider,
+					...(inRun ? { border: 0, background: "transparent" } : {}),
+					boxSizing: "border-box",
+				}}
+			>
+				<div style={{ position: "relative", width: "100%", height: laneHeight }}>
+					<ThemeIcon
+						size={WEB_SEARCH_ICON_SIZE}
+						variant="light"
+						color="teal"
+						radius="sm"
+						style={{ position: "absolute", left: 0, top: iconTop }}
 					>
-						<Loader size={WEB_SEARCH_LOADER_SIZE} color="teal" type="dots" />
-					</div>
-				) : null}
-				<div
-					data-vlist-ws-text=""
-					style={{ position: "absolute", left: chromeLeft, top: 0, right: 0 }}
-				>
-					{lines.map((line, lineIndex) => (
+						<IconWorldSearch size={12} />
+					</ThemeIcon>
+					{isSearching ? (
 						<div
-							// biome-ignore lint/suspicious/noArrayIndexKey: lines are a stable ordered list
-							key={lineIndex}
-							data-vlist-ws-line=""
 							style={{
 								position: "absolute",
-								left: 0,
-								top: lineIndex * lineHeight,
-								height: lineHeight,
-								display: "flex",
-								alignItems: "center",
-								width: "max-content",
-								// Kill the inherited body strut (16px × 1.55). Without this the
-								// inline-block fragments sit on that taller baseline and the
-								// 12px ink reads several pixels below the 18px icon.
-								fontSize: 0,
-								lineHeight: 1,
+								left: WEB_SEARCH_ICON_SIZE + 6,
+								top: loaderTop,
 							}}
 						>
-							<LineFragments>
-								{line.fragments.map((frag, fi) => (
-									<Fragment
-										// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
-										key={fi}
-									>
-										<FragmentGap gapBefore={frag.gapBefore} />
-										<span
-											style={{
-												...fragmentTextStyle({
-													font: frag.font,
-													gapBefore: frag.gapBefore,
-													letterSpacing: letterSpacingForFont(frag.font),
-												}),
-												// `font` restores the 12px size the parent zeroed out.
-												// lineHeight:1 shrinks the box to the em-square so flex
-												// can centre the glyphs in the reserved 17px line.
-												lineHeight: 1,
-												color: fragColor(frag.className),
-											}}
-										>
-											{frag.text}
-										</span>
-									</Fragment>
-								))}
-							</LineFragments>
+							<Loader size={WEB_SEARCH_LOADER_SIZE} color="teal" type="dots" />
 						</div>
-					))}
+					) : null}
+					<div
+						data-vlist-ws-text=""
+						style={{ position: "absolute", left: chromeLeft, top: 0, right: 0 }}
+					>
+						{lines.map((line, lineIndex) => (
+							<div
+								// biome-ignore lint/suspicious/noArrayIndexKey: lines are a stable ordered list
+								key={lineIndex}
+								data-vlist-ws-line=""
+								style={{
+									position: "absolute",
+									left: 0,
+									top: lineIndex * lineHeight,
+									height: lineHeight,
+									display: "flex",
+									alignItems: "center",
+									width: "max-content",
+									// Kill the inherited body strut (16px × 1.55). Without this the
+									// inline-block fragments sit on that taller baseline and the
+									// 12px ink reads several pixels below the 18px icon.
+									fontSize: 0,
+									lineHeight: 1,
+								}}
+							>
+								<LineFragments>
+									{line.fragments.map((frag, fi) => (
+										<Fragment
+											// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
+											key={fi}
+										>
+											<FragmentGap gapBefore={frag.gapBefore} />
+											<span
+												style={{
+													...fragmentTextStyle({
+														font: frag.font,
+														gapBefore: frag.gapBefore,
+														letterSpacing: letterSpacingForFont(frag.font),
+													}),
+													// `font` restores the 12px size the parent zeroed out.
+													// lineHeight:1 shrinks the box to the em-square so flex
+													// can centre the glyphs in the reserved 17px line.
+													lineHeight: 1,
+													color: fragColor(frag.className),
+												}}
+											>
+												{frag.text}
+											</span>
+										</Fragment>
+									))}
+								</LineFragments>
+							</div>
+						))}
+					</div>
 				</div>
-			</div>
-		</Paper>
+			</Paper>
+			{divider ? <Divider color="var(--mantine-color-default-border)" size={1} /> : null}
+		</div>
 	);
 }
 

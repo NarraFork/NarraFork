@@ -1,10 +1,13 @@
 import { beforeAll, describe, expect, it } from "bun:test";
+import { segmentMessages } from "../message/message-segments";
+import type { NarratorMsg } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "./registry";
 import {
 	type AdapterActivityInput,
 	type AdapterContext,
 	type AdapterSegment,
+	adaptRenderUnits,
 	adaptSegment,
 	adaptSegments,
 	classifyContentBlock,
@@ -4094,6 +4097,144 @@ describe("reasoning steps: one identity across the L2/L3 boundary", () => {
  *
  * So these cases pin the routing and the payload, not a nesting arrangement.
  */
+describe("mixed action-card display runs from real message segments", () => {
+	function msg(id: string, blocks: Record<string, unknown>[], role = "assistant"): NarratorMsg {
+		return {
+			id,
+			role,
+			contentJson: blocks,
+			toolCalls: [],
+			children: [],
+			parentToolUseId: null,
+		} as unknown as NarratorMsg;
+	}
+	function tool(id: string, name = "Read") {
+		return {
+			type: "tool_use",
+			id,
+			name,
+			inputJson:
+				name === "Send"
+					? { id: "worker", message: "hello" }
+					: { file_path: "a.ts", prompt: "inspect" },
+			status: "success",
+		};
+	}
+	const search = { type: "web_search", query: "layout", status: "completed" };
+	const generated = { type: "image_generation", status: "completed", width: 320, height: 160 };
+	function adapt(messages: NarratorMsg[], ctx = CTX) {
+		return adaptSegments(segmentMessages(messages) as unknown as AdapterSegment[], ctx);
+	}
+
+	it.each([
+		1, 2, 3, 4, 5,
+	] as const)("L%s joins visible tools, subagent and native cards across assistant boundaries", (lod) => {
+		const messages = [
+			msg("mixed-a", [{ ...tool("read"), status: "running" }, search]),
+			msg("mixed-b", [generated, tool("agent", "Agent"), { ...tool("last"), status: "running" }]),
+		];
+		// Active tools stay full cards even at low LOD; no fabricated ElementSpecs.
+		const ctx: AdapterContext = { lod, recentMessageIds: new Set(messages.map((m) => m.id)) };
+		const specs = adapt(messages, ctx);
+		expect(specs.map((s) => s.kind)).toEqual([
+			"tool-call",
+			"web-search",
+			"media",
+			"subagent-card",
+			"tool-call",
+		]);
+		expect(specs.map((s) => [s.opts?.inRun, s.opts?.isLast])).toEqual([
+			[true, false],
+			[true, false],
+			[true, false],
+			[true, false],
+			[true, true],
+		]);
+		for (const spec of specs.filter((s) => s.kind === "tool-call")) {
+			expect(spec.data).toMatchObject({ inRun: spec.opts?.inRun, isLast: spec.opts?.isLast });
+		}
+		expect(
+			adaptRenderUnits(
+				(segmentMessages(messages) as unknown as AdapterSegment[]).map((seg) => ({
+					kind: "segment",
+					seg,
+				})),
+				ctx,
+			),
+		).toEqual(specs);
+	});
+
+	it.each([
+		["text", [{ type: "text", text: "answer" }], "assistant"],
+		["thinking", [{ type: "thinking", thinking: "considering" }], "assistant"],
+		["attachment", [{ type: "image", width: 320, height: 160 }], "assistant"],
+		["user", [{ type: "text", text: "next question" }], "user"],
+		["empty user", [], "user"],
+		["system", [{ type: "text", text: "notice" }], "system"],
+		["communication", [tool("send", "Send")], "assistant"],
+	] as const)("%s breaks two otherwise adjacent native-card runs", (_label, blocks, role) => {
+		const messages = [
+			msg("before", [tool("before-tool"), search]),
+			msg("breaker", [...blocks], role),
+			msg("after", [generated, tool("after-tool")]),
+		];
+		const specs = adapt(messages);
+		expect(
+			adaptRenderUnits(
+				(segmentMessages(messages) as unknown as AdapterSegment[]).map((seg) => ({
+					kind: "segment",
+					seg,
+				})),
+				CTX,
+			),
+		).toEqual(specs);
+		const cards = specs.filter(
+			(s) =>
+				["tool-call", "web-search", "media"].includes(s.kind) &&
+				!(s.kind === "media" && (s.data as { type: string }).type !== "image_generation"),
+		);
+		expect(cards.map((s) => [s.opts?.inRun, s.opts?.isLast])).toEqual([
+			[true, false],
+			[true, true],
+			[true, false],
+			[true, true],
+		]);
+	});
+
+	it("activity traces break runs, and collapsed low-LOD tools do not bridge native cards", () => {
+		const segments = segmentMessages([
+			msg("before", [search]),
+			msg("old-tool", [tool("old")]),
+			msg("after", [generated]),
+		]) as unknown as AdapterSegment[];
+		const low = adaptSegments(segments, { lod: 1, recentMessageIds: new Set() });
+		expect(low.map((s) => s.kind)).toEqual(["web-search", "tool-run-count", "media"]);
+		expect(low[0]?.opts).toMatchObject({ inRun: false, isLast: true });
+		expect(low[2]?.opts).toMatchObject({ inRun: false, isLast: true });
+		const activity = adaptRenderUnits(
+			[
+				{ kind: "segment", seg: segments[0]! },
+				{ kind: "activity", key: "trace-break", items: [], sourceMessages: [] },
+				{ kind: "segment", seg: segments[2]! },
+			],
+			CTX,
+		);
+		expect(activity.map((s) => s.kind)).toEqual(["web-search", "activity-trace", "media"]);
+		expect(activity[0]?.opts).toMatchObject({ inRun: false, isLast: true });
+		expect(activity[2]?.opts).toMatchObject({ inRun: false, isLast: true });
+	});
+
+	it("stream append changes only the prior tail's run context and leaves earlier cards stable", () => {
+		const messages = [msg("stable", [tool("stable-read"), search, generated])];
+		const before = adapt(messages);
+		const after = adapt([...messages, msg("append", [tool("append-tool")])]);
+		expect(after.slice(0, 2)).toEqual(before.slice(0, 2));
+		expect(before[2]?.opts).toMatchObject({ inRun: true, isLast: true });
+		expect(after[2]?.opts).toMatchObject({ inRun: true, isLast: false });
+		expect(after[3]?.opts).toMatchObject({ inRun: true, isLast: true });
+	});
+});
+
 describe("adaptSegment — a concluded review", () => {
 	const CTX: AdapterContext = { lod: 5 };
 

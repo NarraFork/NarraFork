@@ -804,6 +804,8 @@ export interface NarraForkSettings {
 		 * Multi-instance providers use their own `disabled` field instead.
 		 */
 		disabledProviders?: string[];
+		/** Browser proxy override for new sessions. Absent/"default" = global policy. */
+		browserProxy?: ProxyOverride;
 		/** WebFetch permission policy. */
 		webFetchPolicy?: {
 			/** When true, all URLs are auto-allowed without user approval. */
@@ -812,7 +814,7 @@ export interface NarraForkSettings {
 			whitelist?: Array<{ pattern: string; enabled?: boolean }>;
 			/** URL keyword blacklist — matching URLs are auto-denied (priority over whitelist). */
 			blacklist?: Array<{ pattern: string; enabled?: boolean }>;
-			/** Optional WebFetch/browser proxy override. Absent/"default" = follow the global policy. */
+			/** Optional WebFetch proxy override. Absent/"default" = follow the global policy. */
 			proxy?: ProxyOverride;
 		};
 		/**

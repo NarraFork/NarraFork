@@ -5,7 +5,7 @@ const RPC_PROTOCOL = "narrafork.rpc/1";
 const PROVIDER_PROTOCOL = "1.0";
 const MAX_HEADER_BYTES = 8 * 1024;
 // Provider requests carry full histories; inbound host responses share this bounded parser.
-const MAX_FRAME_BYTES = 32 * 1024 * 1024;
+const MAX_FRAME_BYTES = 64 * 1024 * 1024;
 const MAX_BUFFER_BYTES = MAX_HEADER_BYTES + MAX_FRAME_BYTES + 4;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });

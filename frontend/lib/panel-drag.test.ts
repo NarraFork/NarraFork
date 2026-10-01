@@ -1,11 +1,16 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+	cancelDrag,
+	endDrag,
+	getPanelDrag,
 	isNarratorSubject,
 	isSyntheticSubjectId,
+	moveDrag,
 	onPanelDragEnd,
 	onPanelDragMove,
 	type PanelDragState,
 	startDetachedPanelDrag,
+	startDragManual,
 	startPanelDrag,
 } from "./panel-drag";
 
@@ -78,6 +83,56 @@ describe("isNarratorSubject", () => {
 	test("falls back to id-shape inference when subjectKind is absent", () => {
 		expect(isNarratorSubject(state({ id: "narr_1" }))).toBe(true);
 		expect(isNarratorSubject(state({ id: "__spec__" }))).toBe(false);
+	});
+});
+
+describe("manual drag completion", () => {
+	const ends: Array<PanelDragState | null> = [];
+	let offEnd: () => void;
+
+	beforeEach(() => {
+		ends.length = 0;
+		offEnd = onPanelDragEnd((state) => {
+			expect(getPanelDrag()).toBeNull();
+			ends.push(state);
+		});
+	});
+
+	afterEach(() => {
+		offEnd();
+		cancelDrag();
+	});
+
+	test("cancellation sends null rather than committing the final state", () => {
+		startDragManual("narr_1", "T", 10, 20);
+		moveDrag(30, 40);
+		cancelDrag();
+		expect(ends).toEqual([null]);
+		expect(getPanelDrag()).toBeNull();
+		moveDrag(50, 60);
+		expect(getPanelDrag()).toBeNull();
+	});
+
+	test("normal completion still returns and emits the final state", () => {
+		startDragManual("narr_1", "T", 10, 20);
+		moveDrag(30, 40);
+		const final = endDrag();
+		expect(final).toEqual({ id: "narr_1", title: "T", x: 30, y: 40 });
+		expect(ends).toEqual([final]);
+		expect(getPanelDrag()).toBeNull();
+	});
+
+	test("repeated cancellation is safe and a subsequent drag still commits", () => {
+		cancelDrag();
+		expect(ends).toEqual([]);
+		startDragManual("narr_1", "T", 10, 20);
+		cancelDrag();
+		cancelDrag();
+		expect(ends).toEqual([null]);
+		startDragManual("narr_2", "Next", 50, 60);
+		const final = endDrag();
+		expect(final).toEqual({ id: "narr_2", title: "Next", x: 50, y: 60 });
+		expect(ends).toEqual([null, final]);
 	});
 });
 
@@ -273,6 +328,45 @@ describe("drag activation threshold", () => {
 	});
 
 	const arm = () => startPanelDrag({ panelId: "p1", id: "narr_1", title: "T", x: 100, y: 100 });
+
+	test("cancel clears an armed pointer drag without activating or submitting it", () => {
+		const ends: Array<PanelDragState | null> = [];
+		const offEnd = onPanelDragEnd((state) => ends.push(state));
+		arm();
+		cancelDrag();
+		for (const listeners of handlers.values()) expect(listeners.size).toBe(0);
+		dispatch("pointermove", 140, 100);
+		dispatch("pointerup", 140, 100);
+		expect(getPanelDrag()).toBeNull();
+		expect(ends).toEqual([]);
+		startDragManual("narr_2", "Next", 10, 20);
+		expect(endDrag()).toMatchObject({ id: "narr_2" });
+		offEnd();
+	});
+
+	test("cancel clears live pointer listeners, styles and ownership without a drop", () => {
+		const ends: Array<PanelDragState | null> = [];
+		const offEnd = onPanelDragEnd((state) => ends.push(state));
+		arm();
+		dispatch("pointermove", 140, 100);
+		// endDrag continues to defer pointer-owned drags to their document listener.
+		expect(endDrag()).toBeNull();
+		expect(getPanelDrag()).not.toBeNull();
+		expect(ends).toEqual([]);
+		cancelDrag();
+		cancelDrag();
+		expect(getPanelDrag()).toBeNull();
+		expect(document.body.style.userSelect).toBe("");
+		expect(document.body.style.cursor).toBe("");
+		for (const listeners of handlers.values()) expect(listeners.size).toBe(0);
+		dispatch("pointerup", 140, 100);
+		expect(ends).toEqual([null]);
+		arm();
+		dispatch("pointermove", 150, 100);
+		dispatch("pointerup", 150, 100);
+		expect(ends[1]).toMatchObject({ id: "narr_1", x: 150 });
+		offEnd();
+	});
 
 	test("release within threshold → click (no drag-end fired)", () => {
 		let ended = 0;

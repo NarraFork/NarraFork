@@ -5,7 +5,7 @@ const RPC_PROTOCOL = "narrafork.rpc/1";
 const PROVIDER_PROTOCOL = "1.0";
 const MAX_HEADER_BYTES = 8 * 1024;
 // Provider requests carry full histories; inbound host responses share this bounded parser.
-const MAX_FRAME_BYTES = 32 * 1024 * 1024;
+const MAX_FRAME_BYTES = 64 * 1024 * 1024;
 const MAX_BUFFER_BYTES = MAX_HEADER_BYTES + MAX_FRAME_BYTES + 4;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -201,8 +201,48 @@ function finishOperation(operationId, event) {
 	const operation = operations.get(operationId);
 	if (!operation) return;
 	if (operation.timer) clearTimeout(operation.timer);
+	// A dump-captured operation reports the upstream response before the terminal event:
+	// `done`/`error` close the stream, so dump evidence must precede them.
+	if (operation.dump) {
+		emit(operationId, {
+			type: "dump.response",
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+		emit(operationId, {
+			type: "dump.response",
+			bodyChunk: operation.words.join(""),
+			final: true,
+		});
+	}
 	emit(operationId, event);
 	operations.delete(operationId);
+}
+
+/**
+ * Report the upstream request for a dump-captured call.
+ *
+ * The hard rule: dump events may be emitted ONLY when the chat params carried
+ * `requestDump` — the field's presence is the whole compatibility negotiation, and
+ * hosts predating these event types kill the connection on unknown event types. Bodies
+ * travel in ≤64KiB chunks to respect the 256KiB frame limit. The host re-masks
+ * credentials (it knows the values it handed over in `config`), so this plugin reports
+ * the true header shape without echoing the key itself.
+ */
+function emitDumpRequest(operationId, params) {
+	const body = JSON.stringify({
+		model: params?.modelId,
+		input: params?.request?.current?.text ?? "",
+	});
+	emit(operationId, {
+		type: "dump.request",
+		transport: "mock",
+		url: "https://api.example.invalid/v1/chat",
+		headers: { "content-type": "application/json", authorization: "Bearer ***" },
+		bodyChunk: body.slice(0, 64 * 1024),
+		final: true,
+		truncated: body.length > 64 * 1024,
+	});
 }
 
 /**
@@ -281,11 +321,15 @@ function startChat(id, params) {
 		wordIndex: 0,
 		timer: undefined,
 		words: chatWordsFor(params?.config),
+		// The host opts into dump capture per call via `params.requestDump`; without the
+		// hint this plugin must never emit dump.request/dump.response events.
+		dump: typeof params?.requestDump?.maxBytes === "number",
 	});
 	// Accept first: the host treats an event before the accept as a protocol error.
 	send({ jsonrpc: "2.0", id, result: { operationId, accepted: true } }, () => {
 		const operation = operations.get(operationId);
 		if (!operation) return;
+		if (operation.dump) emitDumpRequest(operationId, params);
 		operation.timer = setTimeout(() => streamChat(operationId), 5);
 	});
 }

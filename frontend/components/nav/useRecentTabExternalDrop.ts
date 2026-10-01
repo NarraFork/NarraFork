@@ -52,6 +52,8 @@ export interface UseRecentTabExternalDropOptions {
 	 * by @dnd-kit's `onDragEnd` and once here — issuing two conflicting mutations.
 	 */
 	suspended: boolean;
+	/** Synchronous internal-drag gate; when supplied, takes precedence over suspended. */
+	suspendedRef?: React.RefObject<boolean>;
 	/** Measure the currently rendered rows. Called on every drag frame over the sidebar. */
 	measureRows: () => RecentTabDropRow[];
 	onDrop: (drop: { narratorId: string; title: string; target: RecentTabDropTarget }) => void;
@@ -61,6 +63,7 @@ export function useRecentTabExternalDrop({
 	containerRef,
 	enabled,
 	suspended,
+	suspendedRef,
 	measureRows,
 	onDrop,
 }: UseRecentTabExternalDropOptions): RecentTabExternalDropState | null {
@@ -69,8 +72,14 @@ export function useRecentTabExternalDrop({
 	// Refs so the subscription is registered once and never re-registered mid-drag:
 	// resubscribing would drop the pending target and the release would do nothing.
 	const stateRef = useRef<RecentTabExternalDropState | null>(null);
-	const suspendedRef = useRef(suspended);
-	suspendedRef.current = suspended;
+	const suspendedBooleanRef = useRef(suspended);
+	suspendedBooleanRef.current = suspended;
+	const externalSuspendedRef = useRef(suspendedRef);
+	externalSuspendedRef.current = suspendedRef;
+	const readSuspended = useCallback(
+		() => externalSuspendedRef.current?.current ?? suspendedBooleanRef.current,
+		[],
+	);
 	const measureRef = useRef(measureRows);
 	measureRef.current = measureRows;
 	const onDropRef = useRef(onDrop);
@@ -83,51 +92,45 @@ export function useRecentTabExternalDrop({
 	}, []);
 
 	useEffect(() => {
+		clear();
 		if (!enabled) return;
 
-		const unsubMove = onPanelDragMove((drag: PanelDragState) => {
+		const resolveDrag = (drag: PanelDragState): RecentTabExternalDropState | null => {
 			// A tool/resource panel can never become a recent tab.
-			if (suspendedRef.current || !isNarratorSubject(drag)) {
-				clear();
-				return;
-			}
+			if (readSuspended() || !isNarratorSubject(drag)) return null;
 			const el = containerRef.current;
-			if (!el) {
-				clear();
-				return;
-			}
+			if (!el) return null;
 			const rect = el.getBoundingClientRect();
 			const inside =
 				drag.x >= rect.left && drag.x <= rect.right && drag.y >= rect.top && drag.y <= rect.bottom;
-			if (!inside) {
-				clear();
-				return;
-			}
+			if (!inside) return null;
 			const rows = measureRef.current();
 			const target = resolveRecentTabDropTarget(rows, drag.y);
-			if (!target) {
-				clear();
-				return;
-			}
-			const next: RecentTabExternalDropState = {
+			if (!target) return null;
+			return {
 				narratorId: drag.id,
 				title: drag.title,
 				target,
 				rows,
 				containerTop: rect.top,
 			};
+		};
+
+		const unsubMove = onPanelDragMove((drag: PanelDragState) => {
+			const next = resolveDrag(drag);
+			if (!next) {
+				clear();
+				return;
+			}
 			stateRef.current = next;
 			setState(next);
 		});
 
 		const unsubEnd = onPanelDragEnd((final: PanelDragState | null) => {
-			const resolved = stateRef.current;
-			stateRef.current = null;
-			setState(null);
-			if (!final || !resolved || suspendedRef.current) return;
-			// The subject may have changed identity mid-drag only in pathological cases,
-			// but acting on a stale narrator id would create a tab for the wrong session.
-			if (final.id !== resolved.narratorId) return;
+			clear();
+			// Release coordinates, rows and identity are authoritative, not the last move.
+			const resolved = final ? resolveDrag(final) : null;
+			if (!resolved) return;
 			onDropRef.current({
 				narratorId: resolved.narratorId,
 				title: resolved.title,
@@ -138,15 +141,15 @@ export function useRecentTabExternalDrop({
 		return () => {
 			unsubMove();
 			unsubEnd();
-			stateRef.current = null;
+			clear();
 		};
-	}, [enabled, containerRef, clear]);
+	}, [enabled, containerRef, clear, readSuspended]);
 
 	// A drag that starts inside the sidebar arms `suspended` only after the first frame,
 	// so drop any indicator that slipped through before the gate closed.
 	useEffect(() => {
-		if (suspended) clear();
-	}, [suspended, clear]);
+		if (readSuspended()) clear();
+	});
 
 	return state;
 }

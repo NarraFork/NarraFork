@@ -9,8 +9,8 @@ export const manifestSchemaVersion = MANIFEST_SCHEMA_VERSION;
 export const NARRAFORK_RPC_PROTOCOL = "narrafork.rpc/1" as const;
 /** Provider business protocol negotiated on top of the RPC transport. */
 export const PROVIDER_PROTOCOL_VERSION = "1.0" as const;
-/** Bounded host-to-provider request budget; inbound events keep their smaller limits. */
-export const PROVIDER_REQUEST_MAX_BYTES = 32 * 1024 * 1024;
+/** Full UTF-8 JSON-RPC request body budget, including base64 images; inbound limits stay small. */
+export const PROVIDER_REQUEST_MAX_BYTES = 64 * 1024 * 1024;
 /**
  * Ceiling on the dump budget the host advertises to a plugin in
  * `ProviderChatParams.requestDump.maxBytes`. The operator-configured
@@ -76,11 +76,11 @@ export const RPC_CANCEL_REQUEST_METHOD = "$/cancelRequest" as const;
 export const RPC_CREDIT_METHOD = "$/credit" as const;
 
 // Transport enforces the actual UTF-8 frame budget. These traversal guards must
-// accommodate long provider histories within the 32 MiB outbound frame limit:
+// accommodate histories and base64 images within the provider outbound frame limit:
 // even the smallest JSON array entry takes two bytes (value + separator).
 const MAX_JSON_DEPTH = 128;
-const MAX_JSON_NODES = 16 * 1024 * 1024;
-const MAX_JSON_STRING_LENGTH = 32 * 1024 * 1024;
+const MAX_JSON_NODES = PROVIDER_REQUEST_MAX_BYTES / 2;
+const MAX_JSON_STRING_LENGTH = PROVIDER_REQUEST_MAX_BYTES;
 const FORBIDDEN_JSON_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 
 export type JsonPrimitive = string | number | boolean | null;

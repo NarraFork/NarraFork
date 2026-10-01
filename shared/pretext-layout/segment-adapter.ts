@@ -4956,30 +4956,92 @@ function markUnitStart(specs: ElementSpec[], unitFirstIndex: number): void {
 	if (first) first.unitStart = true;
 }
 
-/** Adapt a whole render-unit list to a flat element-spec list. */
+/** Only assistant action cards share a continuous surface; attachments never do. */
+export function isConnectableCardSpec(spec: ElementSpec): boolean {
+	return (
+		spec.kind === "tool-call" ||
+		spec.kind === "subagent-card" ||
+		spec.kind === "web-search" ||
+		(spec.kind === "media" && (spec.data as { type?: unknown } | null)?.type === "image_generation")
+	);
+}
+
+/** Update only the two geometry flags, never a group array or group-wide cache key. */
+function setCardRunContext(spec: ElementSpec, inRun: boolean, isLast: boolean): void {
+	spec.opts ??= {};
+	const opts = spec.opts;
+	if (opts.inRun !== inRun) opts.inRun = inRun;
+	if (opts.isLast !== isLast) opts.isLast = isLast;
+	// Tool measures consume run chrome from data; subagents/native cards use opts.
+	if (spec.kind === "tool-call") {
+		const data = spec.data as { inRun?: boolean; isLast?: boolean };
+		if (data.inRun !== inRun) data.inRun = inRun;
+		if (data.isLast !== isLast) data.isLast = isLast;
+	}
+}
+
+/**
+ * Append in display order, stitching only adjacent action cards. This replaces
+ * the old per-tool-segment boundary with a visual boundary, without a second
+ * full-list scan. An append changes only the previous tail and the new card.
+ */
+function appendCardSpecs(
+	out: ElementSpec[],
+	specs: ElementSpec[],
+	previousCard: ElementSpec | undefined,
+): ElementSpec | undefined {
+	for (const spec of specs) {
+		if (isConnectableCardSpec(spec)) {
+			setCardRunContext(spec, previousCard !== undefined, true);
+			if (previousCard) setCardRunContext(previousCard, true, false);
+			previousCard = spec;
+		} else {
+			previousCard = undefined;
+		}
+		out.push(spec);
+	}
+	return previousCard;
+}
+
+function isAssistantCardSegment(seg: AdapterSegment): boolean {
+	return seg.kind === "tool-run" || seg.msg.role === "assistant";
+}
 export function adaptRenderUnits(
 	units: readonly AdapterRenderUnit[],
 	ctx: AdapterContext,
 ): ElementSpec[] {
 	const out: ElementSpec[] = [];
+	let previousCard: ElementSpec | undefined;
 	for (const unit of units) {
 		const unitFirstIndex = out.length;
-		if (unit.kind === "activity") out.push(adaptActivityUnit(unit.items, unit.key, ctx));
-		else out.push(...adaptSegment(unit.seg, ctx));
+		if (unit.kind === "activity") {
+			out.push(adaptActivityUnit(unit.items, unit.key, ctx));
+			previousCard = undefined;
+		} else if (isAssistantCardSegment(unit.seg)) {
+			previousCard = appendCardSpecs(out, adaptSegment(unit.seg, ctx), previousCard);
+		} else {
+			out.push(...adaptSegment(unit.seg, ctx));
+			previousCard = undefined;
+		}
 		markUnitStart(out, unitFirstIndex);
 	}
 	return out;
 }
 
-/** Adapt a plain segment list (used by unit tests and compatibility callers). */
 export function adaptSegments(
 	segments: readonly AdapterSegment[],
 	ctx: AdapterContext,
 ): ElementSpec[] {
 	const out: ElementSpec[] = [];
+	let previousCard: ElementSpec | undefined;
 	for (const seg of segments) {
 		const unitFirstIndex = out.length;
-		out.push(...adaptSegment(seg, ctx));
+		if (isAssistantCardSegment(seg)) {
+			previousCard = appendCardSpecs(out, adaptSegment(seg, ctx), previousCard);
+		} else {
+			out.push(...adaptSegment(seg, ctx));
+			previousCard = undefined;
+		}
 		markUnitStart(out, unitFirstIndex);
 	}
 	return out;

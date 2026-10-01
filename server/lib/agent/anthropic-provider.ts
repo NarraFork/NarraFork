@@ -877,7 +877,17 @@ export function getAnthropicEffectiveContextWindow(
 	model: string,
 	config: AnthropicProviderConfig,
 ): number | null {
-	const resolved = resolveModelContextWindow(parseModelId(model).model, config.prefix);
+	// Do NOT strip the first `:` segment here. For NUG delegates `model` is the
+	// full routed id (`<channel>:<model>`, e.g. antigravity:gemini-3.8-flash-high)
+	// and stripping would drop the channel, producing a lookup key
+	// (`gw:gemini-3.8-flash-high`) that matches neither the NUG cache nor the
+	// model catalog — everything silently falls back to the 272k default and the
+	// wrong value then overrides the correct top-level one in loop.ts. Direct
+	// Anthropic providers pass bare ids, where nothing is stripped anyway, and
+	// resolveModelContextWindow already handles a model that starts with
+	// `config.prefix`. Keeping the routed id also makes per-model user overrides
+	// and local bindings keyed on the full id resolve identically on both paths.
+	const resolved = resolveModelContextWindow(model, config.prefix);
 	// Official-API floor, but never above an explicit configuration. A per-model
 	// override typed in settings, or the provider's own defaultContextWindow, is
 	// a deliberate user decision (relays commonly cap far below 1M) — raising it

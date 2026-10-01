@@ -476,11 +476,11 @@ export function installAppViewportTracking(
 	const update = () => {
 		animationFrame = 0;
 		if (disposed) return;
-		// Measure the engine's viewport units with the override removed, otherwise a
-		// previously published `--app-viewport-bottom` would size `html` and make the
-		// probe report the old value back — a feedback loop that latches the keyboard
-		// height in place after the keyboard closes.
-		root.style.removeProperty("--app-viewport-bottom");
+		// The fixed probes declare dvh/lvh explicitly: they measure the viewport,
+		// not html's overridden height. Keep the current shell height during these
+		// synchronous layout reads. Removing it here temporarily expands the message
+		// viewport and clamps scrollTop; restoring the same height afterward cannot
+		// restore that position (and the scroll frame sees no height change).
 		const dynamicViewportHeight = measureViewportUnit("100dvh");
 		const largeViewportHeight = measureViewportUnit("100lvh");
 		// Measured the same way as the two viewport units so all three land in one
@@ -509,6 +509,8 @@ export function installAppViewportTracking(
 				"--app-viewport-bottom",
 				`${snapViewportBottomForPaint(state.viewportBottom)}px`,
 			);
+		} else {
+			root.style.removeProperty("--app-viewport-bottom");
 		}
 		// `env(safe-area-inset-bottom)` positions the home indicator against the
 		// physical screen. Publish it only when the visible viewport actually reaches

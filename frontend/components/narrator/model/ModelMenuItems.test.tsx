@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { MantineProvider, Menu } from "@mantine/core";
+import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import i18next, { type i18n } from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -106,6 +107,8 @@ async function render(
 		onShowPrice?: (model: ModelOption) => void;
 		defaultModelValue?: string | null;
 		summaryModelValue?: string | null;
+		canFollowParent?: boolean;
+		inheritance?: SubagentModelInheritance | null;
 	},
 ) {
 	const withGlobalRoleActions = options?.withGlobalRoleActions ?? false;
@@ -126,6 +129,8 @@ async function render(
 									providerLabels={{ a: "Provider A", xiaomi: "Xiaomi" }}
 									onSelect={(value) => selected.push(value)}
 									onShowPrice={options?.onShowPrice}
+									canFollowParent={options?.canFollowParent}
+									inheritance={options?.inheritance}
 									onPickerOpened={() => {
 										refreshed++;
 									}}
@@ -214,6 +219,43 @@ describe("follow parent selection", () => {
 	test("does not offer follow-parent for a concrete or primary selection", async () => {
 		await render("a:one");
 		expect(host.textContent).not.toContain("Follow parent");
+	});
+
+	test("resolves the followed parent model exactly like the default/summary role rows", async () => {
+		await render(FOLLOW_PARENT_MODEL, models, true, true, {
+			inheritance: { source: "parent", model: "a:one", parentModel: "a:one" },
+		});
+		// Group header + provider prefix line + resolved model label.
+		expect(host.textContent).toContain("Follow parent");
+		expect(host.textContent).toContain("One");
+		const follow = button("aOne");
+		expect(follow.disabled).toBe(true);
+		expect(host.textContent).not.toContain(narratorLocale["inheritance.fallbackReason"]);
+	});
+
+	test("warns with the pool-fallback reason under the resolved fallback model", async () => {
+		await render(FOLLOW_PARENT_MODEL, models, true, true, {
+			inheritance: {
+				source: "pool-fallback",
+				model: "a:two",
+				parentModel: "a:one",
+				poolKey: "general",
+			},
+		});
+		expect(host.textContent).toContain("Two");
+		expect(host.textContent).toContain(
+			narratorLocale["inheritance.fallbackReason"]
+				.replace("{{parentModel}}", "a:one")
+				.replace("{{pool}}", "general"),
+		);
+	});
+
+	test("offers a clickable follow-parent entry to undo a manual pin", async () => {
+		await render("a:one", models, true, true, { canFollowParent: true });
+		const follow = button("Follow parent");
+		expect(follow.disabled).toBe(false);
+		await act(async () => follow.click());
+		expect(selected).toEqual([FOLLOW_PARENT_MODEL]);
 	});
 });
 

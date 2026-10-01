@@ -23,6 +23,7 @@ import { useCurrentUser } from "../../hooks/useAuth";
 import { api } from "../../lib/api";
 import { miscApi } from "../../lib/api/misc";
 import {
+	buildWebToolProxyPatch,
 	normalizeProxyUrl,
 	type OutboundProxyMode,
 	type ProxyOverride,
@@ -60,6 +61,7 @@ function ProxyManagementPage() {
 			</div>
 
 			<AiProviderOverrides />
+			<WebToolOverrides />
 			<GatewayOverrides />
 			<HookOverrides />
 		</Stack>
@@ -289,10 +291,7 @@ function AiProviderOverrides() {
 		saveMut.mutate({ [key]: updated });
 	};
 
-	const hasAny =
-		!!s?.codex ||
-		customApiProviders.length > 0 ||
-		nugProviders.length > 0;
+	const hasAny = !!s?.codex || customApiProviders.length > 0 || nugProviders.length > 0;
 
 	const label = (p: ProviderLike) => p.name || p.prefix || p.id;
 
@@ -305,8 +304,7 @@ function AiProviderOverrides() {
 					disabled={saveMut.isPending}
 					onChange={(next) => saveMut.mutate({ codex: { proxy: next } })}
 				/>
-				{(customApiProviders.length > 0 ||
-					nugProviders.length > 0) && <Divider />}
+				{(customApiProviders.length > 0 || nugProviders.length > 0) && <Divider />}
 				{customApiProviders.map((p) => (
 					<OverrideRow
 						key={p.id}
@@ -330,6 +328,75 @@ function AiProviderOverrides() {
 					/>
 				))}
 			</Stack>
+		</GroupCard>
+	);
+}
+
+// ---------------------------------------------------------------------------
+// Web tool overrides (settings)
+// ---------------------------------------------------------------------------
+
+function WebToolOverrides() {
+	const { t } = useTranslation("settings");
+	const qc = useQueryClient();
+	const {
+		data: settingsData,
+		isLoading,
+		isError,
+	} = useQuery({
+		queryKey: ["admin", "settings"],
+		queryFn: api.getSettings,
+		gcTime: PROXY_SETTINGS_QUERY_GC_TIME_MS,
+	});
+	const agent = (
+		settingsData as
+			| {
+					agent?: {
+						webFetchPolicy?: { proxy?: ProxyOverride };
+						browserProxy?: ProxyOverride;
+					};
+			  }
+			| undefined
+	)?.agent;
+
+	const saveMut = useMutation({
+		mutationFn: ({ tool, next }: { tool: "webFetch" | "browser"; next?: ProxyOverride }) =>
+			api.updateSettings(buildWebToolProxyPatch(tool, next)),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+			notifications.show({ message: t("proxySaved"), color: "green" });
+		},
+		onError: (error) => {
+			notifications.show({
+				message: t("proxySaveFailed", { error: error.message }),
+				color: "red",
+			});
+		},
+	});
+
+	return (
+		<GroupCard title={t("proxyGroupWebTools")} loading={isLoading} empty={false}>
+			{isError ? (
+				<Alert color="red">{t("proxyLoadFailed")}</Alert>
+			) : (
+				<Stack gap="sm">
+					<OverrideRow
+						name="Web Fetch"
+						value={agent?.webFetchPolicy?.proxy}
+						disabled={saveMut.isPending}
+						onChange={(next) => saveMut.mutate({ tool: "webFetch", next })}
+					/>
+					<OverrideRow
+						name="Browser"
+						value={agent?.browserProxy}
+						disabled={saveMut.isPending}
+						onChange={(next) => saveMut.mutate({ tool: "browser", next })}
+					/>
+					<Text size="xs" c="dimmed">
+						{t("proxyBrowserNewSessionsNote")}
+					</Text>
+				</Stack>
+			)}
 		</GroupCard>
 	);
 }

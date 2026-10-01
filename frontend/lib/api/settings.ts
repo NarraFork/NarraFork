@@ -424,10 +424,11 @@ export const settingsApi = {
 		request<RecentTabsMutationResponse>(`/user-preferences/recent-tabs/${type}/${id}`, {
 			method: "DELETE",
 		}),
-	moveRecentTab: (key: string, target: RecentTabMoveTarget) =>
+	moveRecentTab: (key: string, target: RecentTabMoveTarget, signal?: AbortSignal) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/move", {
 			method: "PATCH",
 			body: JSON.stringify({ key, ...target }),
+			signal,
 		}),
 	pinRecentTab: (key: string, pinned: boolean) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/pin", {
@@ -439,10 +440,11 @@ export const settingsApi = {
 	 * cannot be replaced by a sequence of `moveRecentTab` calls: those rewrite the flat
 	 * recency order, which the `above_idle` auto-promote then overwrites.
 	 */
-	setRecentTabDirectoryOrder: (keys: string[]) =>
+	setRecentTabDirectoryOrder: (keys: string[], signal?: AbortSignal) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/dir-order", {
 			method: "PATCH",
 			body: JSON.stringify({ keys }),
+			signal,
 		}),
 	clearRecentTabs: (scope: "all" | "projects" | "inactive_narrators", keepTabKey?: string) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/clear", {

@@ -96,6 +96,16 @@ export interface UseNarratorSendOptions {
 	setNarratorWorking: () => void;
 	navigateToNarrator: (narratorId: string) => void;
 
+	/**
+	 * Client-side slash commands mirroring the manual controls: `/fork` forks
+	 * from the latest message (its right-click fork action), `/compact` triggers
+	 * a compaction (the context-ring "compact now" action). The panel supplies
+	 * both because chapter-bound forks need the host's git-aware handler; an
+	 * absent handler turns the command into a no-op.
+	 */
+	onForkCommand?: () => void;
+	onCompactCommand?: () => void;
+
 	normalizeBooleanOverride: (value: unknown) => BooleanOverride;
 	normalizeDangerReflectionOverride: (value: unknown) => DangerReflectionOverride;
 	t: TFunction<"narrator">;
@@ -123,7 +133,8 @@ export interface UseNarratorSendResult {
  * in-flight sending state + upload-progress throttle + cancel, the buffered-send
  * reconciliation (`applyBufferedSendResult`), the optimistic `submitMessage`, the
  * `doSendBuffered` composer path, the mode-aware `handleSendWithMode` (with its
- * `/new` spawn and compact-queue branches), the dock-bridge `forwardTextToNarrator`,
+ * `/new` spawn, `/fork` and `/compact` control commands, and compact-queue
+ * branches), the dock-bridge `forwardTextToNarrator`,
  * and the retry/continue actions.
  *
  * Kept lifted (called from the panel) rather than pushed into a single child:
@@ -163,6 +174,8 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		registerSubmitToNarrator,
 		setNarratorWorking,
 		navigateToNarrator,
+		onForkCommand,
+		onCompactCommand,
 		normalizeBooleanOverride,
 		normalizeDangerReflectionOverride,
 		t,
@@ -459,6 +472,21 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		} | null = null;
 		try {
 			composerRef.current?.noteSent(msg, fileReferences);
+
+			// /fork and /compact are client-side control commands mirroring the
+			// manual actions (fork from the latest message; compact now). They are
+			// not model input and never queue: clear just the text and run the
+			// action immediately, keeping any staged attachments for the next
+			// message. File references still cannot attach to a control command.
+			const controlCommand = msg.trim();
+			if (controlCommand === "/fork" || controlCommand === "/compact") {
+				if (fileReferences.length) throw new Error(t("fileReferences.controlCommand"));
+				composerRef.current?.hideTextForSend();
+				composerRef.current?.commitDraftAfterSend();
+				if (controlCommand === "/fork") onForkCommand?.();
+				else onCompactCommand?.();
+				return;
+			}
 
 			const newMatch = msg.match(/^\/new(?:\s+([\s\S]*))?$/);
 			if (newMatch) {

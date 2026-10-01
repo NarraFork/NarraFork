@@ -1232,6 +1232,15 @@ function insertRelativeToKey(
 	anchorKey: string,
 	position: "before" | "after",
 ): void {
+	// A member moving within its own workspace targets one sibling, not the whole
+	// workspace boundary. Keep this move-only exception out of anchored upserts.
+	if (group.length === 1 && group[0].workspaceId) {
+		const anchorIndex = tabs.findIndex((tab) => tabKey(tab) === anchorKey);
+		if (anchorIndex >= 0 && tabs[anchorIndex].workspaceId === group[0].workspaceId) {
+			tabs.splice(position === "before" ? anchorIndex : anchorIndex + 1, 0, ...group);
+			return;
+		}
+	}
 	if (!tryInsertRelativeToKey(tabs, group, anchorKey, position)) tabs.push(...group);
 }
 

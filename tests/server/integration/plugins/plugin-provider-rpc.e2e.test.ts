@@ -219,7 +219,7 @@ describe("provider plugin over real stdio RPC", () => {
 		expect(runtime.state).toBe("stopped");
 	}, 30_000);
 
-	test("production runner delivers long histories through every outbound limit", async () => {
+	test("production runner delivers large histories and base64 images through every outbound limit", async () => {
 		const root = await mkdtemp(join(tmpdir(), "provider-long-history-"));
 		const supervisor = new RuntimeSupervisor();
 		const manager = new PluginManager({ root, disabled: false, runtimeSupervisor: supervisor });
@@ -249,10 +249,11 @@ describe("provider plugin over real stdio RPC", () => {
 					role: "user" as const,
 					content: [{ type: "text" as const, text: block }],
 				}));
-			// Cross the former connection (1 MiB), writer (8 MiB) and receiver (16 MiB) ceilings.
+			// Cross the former connection (1 MiB), writer (8 MiB), receiver (16 MiB),
+			// and provider request (32 MiB) ceilings without enlarging inbound frames.
 			const sharedContent = [{ type: "text" as const, text: "shared history block" }];
 			const histories = [
-				...[4, 20, 40].map(history),
+				...[4, 20, 40, 80].map(history),
 				// Many small nodes, aliased content and a single >1M-character block
 				// used to fail JSON validation before reaching the frame budget.
 				[
@@ -266,26 +267,42 @@ describe("provider plugin over real stdio RPC", () => {
 					},
 				],
 			];
-			for (const requestHistory of histories) {
+			const requests = histories.map((requestHistory) => ({
+				history: requestHistory,
+				current: { text: "hello", toolResults: [] },
+				tools: [],
+			}));
+			// 27 MiB of binary data becomes 36 MiB of base64, before JSON/RPC overhead.
+			// Synthetic data keeps the subprocess test completely offline.
+			const imageRequest = {
+				history: [],
+				current: {
+					text: "describe this image",
+					images: [{ mediaType: "image/png", dataBase64: "AAAA".repeat(9 * 1024 * 1024) }],
+					toolResults: [],
+				},
+				tools: [],
+			};
+			expect(Buffer.byteLength(JSON.stringify(imageRequest), "utf8")).toBeGreaterThan(
+				32 * 1024 * 1024,
+			);
+			for (const request of [...requests, imageRequest]) {
 				const operation = await client.chat({
 					providerTypeId: entry.providerTypeId,
 					providerInstanceId: entry.providerInstanceId,
 					providerPrefix: entry.providerPrefix,
 					modelId: "example/offline",
 					config: {},
-					conversation: { conversationId: "long-history" },
-					request: {
-						history: requestHistory,
-						current: { text: "hello", toolResults: [] },
-						tools: [],
-					},
+					conversation: { conversationId: "large-request" },
+					request,
 				});
 				let text = "";
 				for await (const event of operation.events())
 					if (event.type === "text.delta") text += event.text;
 				expect(text).toBe(EXPECTED_CHAT_TEXT);
 			}
-			await expect(runtime.request("provider.chat", { history: history(66) })).rejects.toThrow(
+			// 65 MiB cannot fit even before the outer JSON-RPC envelope is added.
+			await expect(runtime.request("provider.chat", { history: history(130) })).rejects.toThrow(
 				"connection frame limit",
 			);
 			expect(runtime.state).toBe("active");

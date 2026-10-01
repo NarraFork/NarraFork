@@ -574,6 +574,13 @@ export const ExactRow = memo(
 				if (onTerminate && canTerminateTool(card.toolName)) {
 					cardExtra.onTerminate = onTerminate;
 				}
+				// "Open full session" for an Await-agent / single-target Send row. The
+				// trace element carries no per-row interaction, so bind from this row's
+				// own tool actions — the same source the subagent drill-down uses.
+				const drillToolActions = resolveRowToolActions?.(row.key);
+				if (drillToolActions?.onViewSubagentSession) {
+					cardExtra.onOpenSession = drillToolActions.onViewSubagentSession;
+				}
 				if (
 					resolveUpdateTimeout &&
 					isRunningStatus(card.status) &&
@@ -720,6 +727,12 @@ export const ExactRow = memo(
 			// card), matching the chunked SubagentCard's own `showPrompt`.
 			extra.onTogglePrompt = toggles.onTogglePrompt;
 			extra.onToggleFileChanges = toggles.onToggleFileChanges;
+		}
+		// Await-agent / single-target Send card: same "open full session" button the
+		// subagent card draws, bound from the same row action. Only rows whose target
+		// resolved carry the action (buildRowToolActions), so the button never no-ops.
+		if (kind === "tool-call" && interaction?.toolActions?.onViewSubagentSession) {
+			extra.onOpenSession = interaction.toolActions.onViewSubagentSession;
 		}
 		// Long-running bash / MCP tools get the header terminate control (parity with
 		// the chunked InlineTerminateControl). Only cards that can actually be stopped

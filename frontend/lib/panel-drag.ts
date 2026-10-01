@@ -309,6 +309,27 @@ export function moveDrag(x: number, y: number) {
 	emit();
 }
 
+/**
+ * Cancel without committing a drop. Live drags notify end listeners with null;
+ * pending pointer drags are discarded silently. Repeated cancellation is a no-op.
+ * Manual drags need no document, while pointer drags also release their listeners
+ * and cursor styles. State is cleared before notifying consumers.
+ */
+export function cancelDrag(): void {
+	const wasActive = _current !== null;
+	if (_ownsPointer) {
+		teardownPointerListeners();
+		document.body.style.userSelect = "";
+		document.body.style.cursor = "";
+	}
+	_pending = null;
+	_current = null;
+	_ownsPointer = false;
+	if (wasActive) {
+		for (const fn of _endListeners) fn(null);
+	}
+}
+
 export function endDrag(): PanelDragState | null {
 	if (_ownsPointer) return null; // let document listener handle it
 	const final = _current;
