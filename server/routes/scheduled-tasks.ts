@@ -1,10 +1,11 @@
 import { Hono } from "hono";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { ForbiddenError, NotFoundError, ValidationError } from "../lib/errors";
 import {
 	createScheduledTaskSchema,
 	toggleScheduledTaskSchema,
 	updateScheduledTaskSchema,
 } from "../lib/validators";
+import { cleanupScheduledTaskNarrators } from "../services/scheduled-task-cleanup";
 import { scheduledTaskService } from "../services/scheduled-task-service";
 
 export const scheduledTaskRoutes = new Hono();
@@ -47,6 +48,12 @@ scheduledTaskRoutes.put("/:id", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateScheduledTaskSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	if (parsed.data.cleanupPolicy !== undefined) {
+		const existing = await scheduledTaskService.get(id);
+		if (!existing) throw new NotFoundError("ScheduledTask", id);
+		const user = c.get("user");
+		if (existing.createdBy !== user.sub && user.role !== "admin") throw new ForbiddenError();
+	}
 	const task = await scheduledTaskService.update(id, parsed.data);
 	return c.json(task);
 });
@@ -81,6 +88,16 @@ scheduledTaskRoutes.get("/:id/runs", async (c) => {
 	const cursor = c.req.query("cursor") || null;
 	const result = await scheduledTaskService.listRuns(id, { limit, cursor });
 	return c.json(result);
+});
+
+/** Apply the saved retention policy to one bounded batch (none is a no-op). */
+scheduledTaskRoutes.post("/:id/cleanup", async (c) => {
+	const id = c.req.param("id");
+	const task = await scheduledTaskService.get(id);
+	if (!task) throw new NotFoundError("ScheduledTask", id);
+	const user = c.get("user");
+	if (task.createdBy !== user.sub && user.role !== "admin") throw new ForbiddenError();
+	return c.json(await cleanupScheduledTaskNarrators(id));
 });
 
 /** Delete a scheduled task. */

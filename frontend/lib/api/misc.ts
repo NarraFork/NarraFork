@@ -348,6 +348,28 @@ export const miscApi = {
 	// authoritative post-change state rather than having to infer it.
 	mcpDisconnectServer: (id: string) =>
 		request<Record<string, unknown>>(`/mcp/servers/${id}/disconnect`, { method: "POST" }),
+	// Re-fetch one server's tool list (reconnects only if the live connection is gone).
+	mcpRefreshServer: (id: string) =>
+		request<{
+			ok: boolean;
+			toolCount: number;
+			error?: string;
+			status: Record<string, unknown>;
+		}>(`/mcp/servers/${id}/refresh`, { method: "POST" }),
+	// Re-fetch tool lists of every enabled MCP server.
+	mcpRefreshAllServers: () =>
+		request<{
+			ok: boolean;
+			refreshed: number;
+			failed: number;
+			results: Array<{
+				serverId: string;
+				name: string;
+				ok: boolean;
+				toolCount: number;
+				error?: string;
+			}>;
+		}>("/mcp/servers/refresh", { method: "POST" }),
 	mcpTestConnection: (data: Record<string, unknown>) =>
 		request<{
 			ok: boolean;

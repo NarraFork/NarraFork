@@ -19,7 +19,7 @@ export const ORIGINATOR = "narrafork";
 export const CLAUDE_CLI_VERSION = "2.1.251";
 // Managed Codex client version used only for outbound protocol emulation.
 // Keep the User-Agent prefix/suffix and originator aligned when updating it.
-const CODEX_CLI_VERSION = "0.146.0";
+const CODEX_CLI_VERSION = "0.159.2";
 export const ORIGINATOR_CODEX = "codex-tui";
 
 /**
@@ -296,12 +296,6 @@ export function getHttpCodexUserAgent(): string {
  * the header is dropped rather than the tools. {@link stripResponsesLiteHeader}
  * enforces this on every outbound header map, and the codex parity tests pin it.
  *
- * Also omitted: x-client-request-id. codex-rs writes it in exactly one place —
- * build_websocket_headers — and neither the HTTP /responses path nor
- * /responses/compact sends it. It is a websocket-handshake header, not part of
- * the shared client identity, so it is set by the WS transport itself rather
- * than here (see buildHandshakeHeaders).
- *
  * Also omitted: x-codex-installation-id as a direct header. codex-rs only puts
  * the installation id in the request body's `client_metadata` (and inside the
  * turn-metadata blob we deliberately do not send); its `compatibility_headers()`
@@ -319,6 +313,12 @@ export function getHttpCodexUserAgent(): string {
  *   users reported: dumps and relays key off originator first, so a UA-only
  *   override still looked like codex-tui on the wire.
  * - session-id / thread-id: one stable conversation id
+ * - x-client-request-id: same value as thread-id. codex-rs sends it on every
+ *   HTTP `/responses` request (codex-api/src/endpoint/responses.rs inserts it
+ *   alongside build_session_headers) and on the websocket handshake
+ *   (build_websocket_headers); only `/responses/compact` omits it. The WS
+ *   transport sets the same value itself, so this projection is a no-op there
+ *   and covers the HTTP path.
  * - x-codex-window-id: window UUID derived from the conversation id
  */
 export function buildCodexEmulationHeaders(opts: {
@@ -339,6 +339,7 @@ export function buildCodexEmulationHeaders(opts: {
 	if (opts.conversationId) {
 		headers["session-id"] = opts.conversationId;
 		headers["thread-id"] = opts.conversationId;
+		headers["x-client-request-id"] = opts.conversationId;
 		headers["x-codex-window-id"] = deriveCodexWindowId(opts.conversationId);
 	}
 	return headers;

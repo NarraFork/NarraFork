@@ -36,6 +36,7 @@ import {
 	MALFORMED_REQUEST_CAPTURE_REASON,
 	MALFORMED_REQUEST_DUMP_DIR,
 } from "./agent/malformed-request-dump";
+import { canWriteOptionalDiskData, guardDiskWrite } from "./disk-safety";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
 import { getNarraforkPath } from "./narrafork-home";
@@ -377,6 +378,10 @@ export async function writeRawDumpSpill(
 		const serializedDump = dumpJson ?? JSON.stringify(dump);
 		if (serializedDump == null) return null;
 		const { json, truncated, originalBytes } = serializeSpillEnvelope(meta, dump, serializedDump);
+		// Optional forensic copies must not consume space reserved for database WAL.
+		// A null pointer falls back to the existing bounded inline head, never a huge row.
+		if (!(await canWriteOptionalDiskData(dir))) return null;
+		await guardDiskWrite(dir, Buffer.byteLength(json, "utf8"));
 		await mkdir(dir, { recursive: true });
 		await writeFile(filePath, json, "utf8");
 		await pruneOldSpills(dir);

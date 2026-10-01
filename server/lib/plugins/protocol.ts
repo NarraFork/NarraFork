@@ -11,6 +11,16 @@ export const NARRAFORK_RPC_PROTOCOL = "narrafork.rpc/1" as const;
 export const PROVIDER_PROTOCOL_VERSION = "1.0" as const;
 /** Bounded host-to-provider request budget; inbound events keep their smaller limits. */
 export const PROVIDER_REQUEST_MAX_BYTES = 32 * 1024 * 1024;
+/**
+ * Ceiling on the dump budget the host advertises to a plugin in
+ * `ProviderChatParams.requestDump.maxBytes`. The operator-configured
+ * `agent.requestDumpMaxSize` is a retention ceiling and may be far larger; what crosses
+ * the RPC boundary must stay well below the per-operation output budget (24 MiB) that
+ * dump events share with the model's actual output.
+ */
+export const PLUGIN_REQUEST_DUMP_MAX_BYTES = 4 * 1024 * 1024;
+/** Maximum size of a single `dump.request`/`dump.response` body chunk. */
+export const PLUGIN_DUMP_CHUNK_MAX_CHARS = 64 * 1024;
 /** MessageChannel UI bridge protocol. */
 export const NARRAFORK_UI_PROTOCOL = "narrafork.ui/1" as const;
 
@@ -523,6 +533,17 @@ export const providerUsageSchema = z
 	})
 	.strict();
 
+/**
+ * Header map carried by dump events. Bounded in entry count and per-field size; values
+ * are masked by the host before persistence regardless of what the plugin sent.
+ */
+const dumpHeadersSchema = z
+	.record(z.string().max(200), z.string().max(4_000))
+	.refine((headers) => Object.keys(headers).length <= 64, {
+		message: "dump headers must not exceed 64 entries",
+	})
+	.optional();
+
 export const providerStreamEventSchema = z.discriminatedUnion("type", [
 	z
 		.object({
@@ -694,6 +715,37 @@ export const providerStreamEventSchema = z.discriminatedUnion("type", [
 			responseId: optionalTextSchema,
 			credentialId: optionalTextSchema,
 			usage: providerUsageSchema.optional(),
+		})
+		.strict(),
+	// ── Upstream request/response dump (opt-in per chat call) ──
+	// A plugin may emit these ONLY when the chat params carried `requestDump` — the
+	// field's presence is the compatibility negotiation: hosts that predate these event
+	// types never send the hint, so a compliant plugin never makes an old host choke on
+	// an unknown event. The host enforces the rule as a protocol violation.
+	// Bodies travel in ≤64KiB chunks to respect the 256KiB frame limit; an event carrying
+	// `url`/`headers` (request) or `status`/`headers` (response) opens a new upstream
+	// attempt, `final: true` closes the current body. The host sanitizes everything —
+	// plugins MUST NOT rely on their own masking being sufficient.
+	z
+		.object({
+			type: z.literal("dump.request"),
+			transport: optionalTextSchema,
+			url: z.string().max(2_048).optional(),
+			headers: dumpHeadersSchema,
+			bodyChunk: z.string().min(1).max(PLUGIN_DUMP_CHUNK_MAX_CHARS).optional(),
+			final: z.boolean().optional(),
+			truncated: z.boolean().optional(),
+		})
+		.strict(),
+	z
+		.object({
+			type: z.literal("dump.response"),
+			status: z.number().int().min(100).max(599).optional(),
+			headers: dumpHeadersSchema,
+			bodyChunk: z.string().min(1).max(PLUGIN_DUMP_CHUNK_MAX_CHARS).optional(),
+			final: z.boolean().optional(),
+			truncated: z.boolean().optional(),
+			error: z.string().max(4_000).optional(),
 		})
 		.strict(),
 ]);

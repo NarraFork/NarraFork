@@ -72,6 +72,17 @@ export function useRunScheduledTask() {
 	});
 }
 
+export function useCleanupScheduledTask() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.cleanupScheduledTask(id),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: QUERY_KEY });
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
 export function useDeleteScheduledTask() {
 	const qc = useQueryClient();
 	return useMutation({

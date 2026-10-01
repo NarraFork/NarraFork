@@ -1334,6 +1334,19 @@ function planMessageRangeDeletion(
 				inclusive
 					? gte(narratorMessageRefs.seq, boundary.seq)
 					: gt(narratorMessageRefs.seq, boundary.seq),
+				// A history-only action must retain previously detached file evidence,
+				// not delete/recreate its IDs on every retry. Match only our internal
+				// checkpoint shape, never all hidden/compacted refs. File rollback still
+				// selects these records through the ordinary range above.
+				opts?.skipRevert
+					? sql`NOT EXISTS (
+						SELECT 1 FROM ${narratorMessages}
+						WHERE ${narratorMessages.id} = ${narratorMessageRefs.messageId}
+						AND ${narratorMessageRefs.segmentCompactId} = ${narratorMessageRefs.messageId}
+						AND ${narratorMessages.role} = 'disp'
+						AND ${narratorMessages.contentJson} = ${JSON.stringify([{ type: "file_history_checkpoint" }])}
+					)`
+					: undefined,
 			),
 		)
 		.orderBy(narratorMessageRefs.seq)

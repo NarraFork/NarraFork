@@ -14,6 +14,7 @@ import {
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Hono } from "hono";
 import { testEnvironment } from "../../../../../tests/preload";
 import { cleanDb, getTestDb } from "../../../../../tests/setup";
 import * as schema from "../../../../db/schema";
@@ -158,7 +159,7 @@ if (migrationScenario) {
 	sqlite.exec("PRAGMA busy_timeout = 0;");
 	mock.module("@server/db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 	const { backgroundTaskService } = await import("@server/services/background-task-service");
-	const { bashTool, updateBashTimeout } = await import("../bash");
+	const { bashTool, detachBashProcess, updateBashTimeout } = await import("../bash");
 	const { writeTool } = await import("../write");
 	const { localBackend } = await import("../../execution/local-backend");
 	const { windowsPathSemantics } = await import("../../execution/path-semantics");
@@ -287,17 +288,20 @@ if (migrationScenario) {
 			selectionSource: "explicit" as const,
 		});
 	}
-	function context(cwd = workspace, extra: Partial<ToolContext> = {}): ToolContext {
+	function context(
+		cwd = workspace,
+		extra: Partial<ToolContext> = {},
+	): ToolContext & { currentToolUseId: string } {
 		return {
 			narratorId: "root-bash",
 			cwd,
-			currentToolUseId: `bash-use-${++nextId}`,
 			locale: "en",
 			signal: new AbortController().signal,
 			resolveBackend: () => backend,
 			executionTarget: target(cwd),
 			requestPermission: async () => ({ behavior: "allow" }),
 			...extra,
+			currentToolUseId: extra.currentToolUseId ?? `bash-use-${++nextId}`,
 		};
 	}
 	function run(command: string, ctx = context(), extra: Record<string, unknown> = {}) {
@@ -405,6 +409,282 @@ await Bun.write("bash.txt", "finished");`;
 		if (!task) throw new Error("Background task was not created");
 		return task.id;
 	}
+
+	describe("zero-interrupt foreground Bash detach", () => {
+		test("adopts once, preserves output and coordinator, and ignores foreground abort", async () => {
+			const scope = await scopeFromWrite();
+			const gate = program({ prefix: "console.log('before-detach');" });
+			const abort = new AbortController();
+			const emitOutput = mock(() => {});
+			const released = deferred();
+			const lease = {
+				kind: "ordinary" as const,
+				setNarratorId: mock(() => {}),
+				transfer: mock(() => true),
+				release: mock(() => released.resolve()),
+			};
+			const ctx = context(workspace, {
+				signal: abort.signal,
+				emitOutput,
+				updateExecutionLease: lease,
+			});
+			const result = run(gate.command, ctx);
+			await gate.ready.promise;
+			expect(await detachBashProcess(ctx.currentToolUseId, "root-writer")).toBeNull();
+			const [detached, duplicate] = await Promise.all([
+				detachBashProcess(ctx.currentToolUseId, ctx.narratorId),
+				detachBashProcess(ctx.currentToolUseId, ctx.narratorId),
+			]);
+			expect(detached).not.toBeNull();
+			expect(duplicate).toEqual(detached);
+			if (!detached) throw new Error("Expected detached process");
+			const foreground = await result;
+			expect(foreground.metadata).toEqual({
+				background_task_id: detached.taskId,
+				background_task_alias: detached.alias,
+				detached: true,
+			});
+			expect(foreground.output).toContain(
+				`<background_task_id>${detached.alias}</background_task_id>`,
+			);
+			expect(dispatched).toHaveLength(1);
+			expect(db.select().from(schema.backgroundTasks).all()).toHaveLength(1);
+			expect(lease.transfer).toHaveBeenCalledTimes(1);
+			expect(lease.release).not.toHaveBeenCalled();
+			await blocked(scope);
+			const liveCount = emitOutput.mock.calls.length;
+			abort.abort();
+			expect(dispatched[0].isExited()).toBe(false);
+			gate.release.resolve();
+			const completed = await backgroundTaskService.waitForCompletion(detached.taskId, 5_000);
+			expect(completed.status).toBe("completed");
+			expect(completed.output).toContain("before-detach");
+			expect(completed.output).toContain("ready");
+			expect(emitOutput.mock.calls.length).toBe(liveCount);
+			await released.promise;
+			expect(lease.release).toHaveBeenCalledTimes(1);
+			await finished();
+			expect(await rollback(scope)).toBe("granted");
+			expect(await detachBashProcess(ctx.currentToolUseId, ctx.narratorId)).toBeNull();
+		});
+
+		test("HTTP detach enforces narrator write access and returns the adopted identity", async () => {
+			const { narratorRoutes } = await import("@server/routes/narrators");
+			const app = new Hono<{ Variables: { user: { sub: string; role: string } } }>();
+			app.use("*", async (c, next) => {
+				c.set("user", {
+					sub: "api-fixture-user",
+					role: c.req.header("X-Test-Admin") === "yes" ? "admin" : "user",
+				});
+				await next();
+			});
+			app.onError((error, c) => {
+				const status = "statusCode" in error && error.statusCode === 404 ? 404 : 500;
+				return c.json({ error: error.message }, status);
+			});
+			app.route("/api/narrators", narratorRoutes);
+			const gate = program();
+			const ctx = context();
+			const result = run(gate.command, ctx);
+			await gate.ready.promise;
+			const url = `/api/narrators/${ctx.narratorId}/tools/${ctx.currentToolUseId}/detach`;
+			expect((await app.request(url, { method: "POST" })).status).toBe(404);
+			const wrongOwner = await app.request(
+				`/api/narrators/root-writer/tools/${ctx.currentToolUseId}/detach`,
+				{ method: "POST", headers: { "X-Test-Admin": "yes" } },
+			);
+			expect(wrongOwner.status).toBe(409);
+			const response = await app.request(url, {
+				method: "POST",
+				headers: { "X-Test-Admin": "yes" },
+			});
+			expect(response.status).toBe(200);
+			const identity = (await response.json()) as {
+				detached: boolean;
+				taskId: string;
+				alias: string;
+			};
+			expect(identity.detached).toBe(true);
+			expect(identity.taskId).toStartWith("bash_");
+			expect((await result).metadata?.background_task_id).toBe(identity.taskId);
+			gate.release.resolve();
+			await backgroundTaskService.waitForCompletion(identity.taskId, 5_000);
+			expect(
+				(
+					await app.request(url, {
+						method: "POST",
+						headers: { "X-Test-Admin": "yes" },
+					})
+				).status,
+			).toBe(409);
+		});
+
+		test("remote handle keeps its original backend, signal, output and settlement barrier", async () => {
+			backend = Object.create(localBackend);
+			Object.defineProperties(backend, {
+				kind: { value: "remote" },
+				deviceId: { value: "remote-fixture" },
+				defaultCwd: { value: "/remote/workspace" },
+			});
+			const exit = deferred<number>();
+			const settled = deferred<void>();
+			const listening = deferred();
+			let emit!: (chunk: Uint8Array) => void;
+			let signal: AbortSignal | undefined;
+			let completed = false;
+			const handle: ExecHandle = {
+				exited: exit.promise,
+				whenSettled: settled.promise,
+				isExited: () => completed,
+				kill: mock(async () => {}),
+				onData: (callback) => {
+					emit = callback;
+					listening.resolve();
+					return () => {};
+				},
+				outputIncomplete: () => true,
+			};
+			backend.execCommand = mock(async (params) => {
+				signal = params.signal;
+				return handle;
+			});
+			const abort = new AbortController();
+			const released = deferred();
+			const lease = {
+				kind: "ordinary" as const,
+				setNarratorId: mock(() => {}),
+				transfer: mock(() => true),
+				release: mock(() => released.resolve()),
+			};
+			const ctx = context("/remote/workspace", {
+				signal: abort.signal,
+				updateExecutionLease: lease,
+			});
+			const result = run("remote-command", ctx);
+			await listening.promise;
+			emit(Buffer.from("before\n"));
+			const detached = await detachBashProcess(ctx.currentToolUseId, ctx.narratorId);
+			if (!detached) throw new Error("Expected detached process");
+			await result;
+			abort.abort();
+			expect(signal).not.toBe(abort.signal);
+			expect(signal?.aborted).toBe(false);
+			emit(Buffer.from("after\n"));
+			expect(backgroundTaskService.getOutputBuffer(detached.taskId)).toBe("before\nafter\n");
+			completed = true;
+			exit.resolve(7);
+			await Promise.resolve();
+			expect(lease.release).not.toHaveBeenCalled();
+			settled.resolve();
+			const terminal = await backgroundTaskService.waitForCompletion(detached.taskId, 5_000);
+			expect(terminal.status).toBe("failed");
+			expect(terminal.output).toContain("Output is incomplete");
+			expect(terminal.output).toContain("[exit code: 7]");
+			expect(backend.execCommand).toHaveBeenCalledTimes(1);
+			expect(handle.kill).not.toHaveBeenCalled();
+			await released.promise;
+			expect(lease.release).toHaveBeenCalledTimes(1);
+		});
+
+		test("retains the legacy write lock until the detached process settles", async () => {
+			const { withWorkspaceWriteLock } = await import("../write-serialization");
+			const gate = program();
+			const executable = join(workspace, "touch");
+			await Bun.write(executable, `#!/bin/sh\n${gate.command}\n`);
+			await chmod(executable, 0o700);
+			const ctx = context();
+			const result = run("./touch bash.txt", ctx);
+			await gate.ready.promise;
+			const detached = await detachBashProcess(ctx.currentToolUseId, ctx.narratorId);
+			expect(detached).not.toBeNull();
+			await result;
+			let admitted = false;
+			const competing = withWorkspaceWriteLock(localBackend, workspace, async () => {
+				admitted = true;
+			});
+			await Promise.resolve();
+			expect(admitted).toBe(false);
+			gate.release.resolve();
+			await competing;
+			expect(admitted).toBe(true);
+		});
+
+		test("retains the updated timeout and marks the background task timed out", async () => {
+			const gate = program();
+			const ctx = context();
+			const result = run(gate.command, ctx);
+			await gate.ready.promise;
+			const detached = await detachBashProcess(ctx.currentToolUseId, ctx.narratorId);
+			if (!detached) throw new Error("Expected detached process");
+			await result;
+			expect(updateBashTimeout(ctx.currentToolUseId, 1_000)).toBe(1_000);
+			const completed = await backgroundTaskService.waitForCompletion(detached.taskId, 5_000);
+			expect(completed.status).toBe("timed_out");
+			expect(completed.output).toContain("Command timed out after 1000ms");
+			await finished();
+			expect(updateBashTimeout(ctx.currentToolUseId, 10_000)).toBeNull();
+		});
+
+		test("background cancel kills the original process without resurrecting its row", async () => {
+			const scope = await scopeFromWrite();
+			const gate = program();
+			const ctx = context();
+			const result = run(gate.command, ctx);
+			await gate.ready.promise;
+			const detached = await detachBashProcess(ctx.currentToolUseId, ctx.narratorId);
+			if (!detached) throw new Error("Expected detached process");
+			await result;
+			expect(await backgroundTaskService.cancel(detached.taskId)).toBe(true);
+			await finished();
+			expect((await backgroundTaskService.getById(detached.taskId))?.status).toBe("cancelled");
+			expect(dispatched).toHaveLength(1);
+			expect(await rollback(scope)).toBe("granted");
+		});
+
+		test("failed task registration keeps foreground execution and abort intact", async () => {
+			const gate = program();
+			const abort = new AbortController();
+			const ctx = context(workspace, { signal: abort.signal });
+			const result = run(gate.command, ctx);
+			await gate.ready.promise;
+			spyOn(backgroundTaskService, "createBashTask").mockRejectedValueOnce(
+				new Error("DB unavailable"),
+			);
+			await expect(detachBashProcess(ctx.currentToolUseId, ctx.narratorId)).rejects.toThrow(
+				"DB unavailable",
+			);
+			expect(db.select().from(schema.backgroundTasks).all()).toHaveLength(0);
+			abort.abort();
+			expect((await result).output).toContain("Command was aborted by user");
+			expect(dispatched).toHaveLength(1);
+		});
+
+		test("exit during durable adoption produces a completed background task", async () => {
+			const gate = program();
+			const ctx = context();
+			const result = run(gate.command, ctx);
+			await gate.ready.promise;
+			const create = backgroundTaskService.createBashTask.bind(backgroundTaskService);
+			const creating = deferred();
+			const finishCreate = deferred();
+			spyOn(backgroundTaskService, "createBashTask").mockImplementationOnce(async (opts) => {
+				creating.resolve();
+				await finishCreate.promise;
+				return create(opts);
+			});
+			const adoption = detachBashProcess(ctx.currentToolUseId, ctx.narratorId);
+			await creating.promise;
+			gate.release.resolve();
+			await finished();
+			finishCreate.resolve();
+			const detached = await adoption;
+			if (!detached) throw new Error("Expected detached process");
+			expect((await result).metadata?.background_task_id).toBe(detached.taskId);
+			expect((await backgroundTaskService.waitForCompletion(detached.taskId, 5_000)).status).toBe(
+				"completed",
+			);
+		});
+	});
 
 	describe("real local Bash activity admission", () => {
 		for (const background of [false, true]) {

@@ -384,6 +384,15 @@ export interface ProviderChatParams extends ProviderBaseParams {
 			locale?: string;
 		};
 	};
+	/**
+	 * Request-dump capture hint. Present = the host supports `dump.request` /
+	 * `dump.response` stream events AND wants this call captured; `maxBytes` is the
+	 * combined request+response body budget the plugin must respect (truncating with
+	 * `truncated: true`). Absent = the plugin MUST NOT emit dump events — hosts predating
+	 * them would treat the unknown event type as a fatal protocol violation, so the
+	 * field's presence is the entire compatibility negotiation.
+	 */
+	requestDump?: { maxBytes: number };
 }
 
 export interface ProviderGenerateParams extends ProviderBaseParams {
@@ -577,6 +586,12 @@ interface OperationRecord {
 	allowedToolNames: Set<string>;
 	exposedToolCall: boolean;
 	hasVisibleOutput: boolean;
+	/** True when the chat params carried the `requestDump` hint; unsolicited dump events are a protocol violation. */
+	dumpRequested: boolean;
+	/** Combined dump body budget advertised to the plugin (`requestDump.maxBytes`). */
+	dumpMaxBytes: number;
+	/** Dump body bytes accepted so far for this operation. */
+	dumpBytes: number;
 	sawError: boolean;
 	terminalError?: Error;
 	postDoneError?: Error;
@@ -1038,6 +1053,10 @@ export class PluginProviderRpcClient {
 			kind === "chat"
 				? new Set((params as ProviderChatParams).request.tools.map((tool) => tool.name))
 				: new Set<string>();
+		const dumpMaxBytes =
+			kind === "chat"
+				? Math.max(0, Math.floor((params as ProviderChatParams).requestDump?.maxBytes ?? 0))
+				: 0;
 		const record: OperationRecord = {
 			operationId,
 			requestId,
@@ -1065,6 +1084,9 @@ export class PluginProviderRpcClient {
 			allowedToolNames,
 			exposedToolCall: false,
 			hasVisibleOutput: false,
+			dumpRequested: dumpMaxBytes > 0,
+			dumpMaxBytes,
+			dumpBytes: 0,
 			sawError: false,
 		};
 		const publicOperation = new ProviderOperationImpl(this, record);
@@ -1351,6 +1373,32 @@ export class PluginProviderRpcClient {
 			record.toolCalls.set(event.toolUseId, { mode: "complete", ended: true, bytes });
 			record.exposedToolCall = true;
 			record.hasVisibleOutput = true;
+		}
+		if (event.type === "dump.request" || event.type === "dump.response") {
+			// Dump events are diagnostic metadata, never model output: they must not mark the
+			// operation as having visible output (empty-response detection) and never reach
+			// `generate` operations, which are never given the capture hint.
+			if (record.kind === "generate") {
+				this.protocolViolation(record, "PROTOCOL_ERROR", "provider.generate emitted a dump event");
+				return false;
+			}
+			// The `requestDump` chat-params hint is the entire compatibility negotiation for
+			// these event types (older hosts reject unknown event types by killing the
+			// transport), so emitting them unsolicited is a hard violation, not a soft error.
+			if (!record.dumpRequested) {
+				this.protocolViolation(
+					record,
+					"PROTOCOL_ERROR",
+					"Provider emitted an unsolicited dump event",
+				);
+				return false;
+			}
+			const bytes = event.bodyChunk ? utf8Bytes(event.bodyChunk) : 0;
+			record.dumpBytes += bytes;
+			if (record.dumpBytes > record.dumpMaxBytes) {
+				this.outputLimit(record, "Provider dump output exceeded the advertised budget");
+				return false;
+			}
 		}
 		return true;
 	}

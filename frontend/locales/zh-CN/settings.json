@@ -761,7 +761,7 @@
 	"fingerprintUaCodex": "Codex",
 	"fingerprintUaCustom": "自定义",
 	"fingerprintCustomUaLabel": "自定义 User-Agent",
-	"fingerprintCustomUaPlaceholder": "例如 codex-tui/0.146.0 (Linux 6.8.0; x86_64) unknown (codex-tui; 0.146.0)",
+	"fingerprintCustomUaPlaceholder": "例如 codex-tui/0.159.2 (Linux 6.8.0; x86_64) unknown (codex-tui; 0.159.2)",
 	"fingerprintExtraHeaders": "额外请求头",
 	"fingerprintExtraHeadersDesc": "每个请求附加发送的请求头。",
 	"fingerprintHeaderNamePlaceholder": "请求头名称",

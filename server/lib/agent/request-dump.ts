@@ -201,6 +201,105 @@ export function sanitizeHeaders(
 	);
 }
 
+/**
+ * Config keys whose string values are treated as secrets when sanitizing a
+ * plugin-reported dump. The host resolves the plugin's config (credentials included)
+ * and hands it to the plugin process, so these exact values are what may surface in a
+ * reported URL (`?key=...`), header, or body even when the header name alone is not on
+ * {@link SENSITIVE_HEADER_PATTERNS}.
+ */
+const SECRET_CONFIG_KEY_PATTERN = /key|token|secret|pass|credential/i;
+
+/**
+ * Values shorter than this are never masked: below it the false-positive rate on
+ * ordinary config strings (regions, model aliases) outweighs the leak protection.
+ */
+const MIN_SECRET_VALUE_LENGTH = 8;
+
+/**
+ * Collect secret-looking string values from a plugin provider's resolved config.
+ * Recursive because providers nest credentials (e.g. `{ auth: { apiKey } }`).
+ */
+export function collectSecretConfigValues(config: Record<string, unknown> | undefined): string[] {
+	const secrets = new Set<string>();
+	const walk = (value: unknown, key: string | undefined, depth: number): void => {
+		if (depth > 8 || value == null) return;
+		if (typeof value === "string") {
+			if (key && SECRET_CONFIG_KEY_PATTERN.test(key) && value.length >= MIN_SECRET_VALUE_LENGTH) {
+				secrets.add(value);
+			}
+			return;
+		}
+		if (Array.isArray(value)) {
+			for (const item of value) walk(item, key, depth + 1);
+			return;
+		}
+		if (typeof value === "object") {
+			for (const [childKey, child] of Object.entries(value as Record<string, unknown>)) {
+				walk(child, childKey, depth + 1);
+			}
+		}
+	};
+	for (const [key, value] of Object.entries(config ?? {})) walk(value, key, 0);
+	// Longest first so overlapping secrets never leave a recognizable fragment behind.
+	return [...secrets].sort((a, b) => b.length - a.length);
+}
+
+/**
+ * Replace every occurrence of a known secret in plugin-reported dump text. Applied to
+ * URLs and request bodies; headers go through {@link sanitizeHeaders} first, which only
+ * masks by header NAME, so callers should run the result through this as well.
+ */
+export function maskSecretValues(text: string, secrets: readonly string[]): string {
+	let masked = text;
+	for (const secret of secrets) {
+		if (!secret) continue;
+		const replacement = maskHeaderValue(secret);
+		const urlEncoded = new URLSearchParams({ value: secret }).toString().slice(6);
+		const encoded = new Set([
+			secret,
+			JSON.stringify(secret).slice(1, -1),
+			urlEncoded,
+			urlEncoded.replace(/\+/g, "%20"),
+			urlEncoded.replace(/%[0-9A-F]{2}/g, (part) => part.toLowerCase()),
+			Buffer.from(secret).toString("base64"),
+			Buffer.from(secret).toString("base64url"),
+		]);
+		for (const value of encoded) masked = masked.split(value).join(replacement);
+		// JSON may escape only SOME characters. Match literal/JSON-escaped/unicode
+		// representations per UTF-16 unit, without decoding or rewriting the payload.
+		const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		const pattern = secret
+			.split("")
+			.map((char) => {
+				const hex = char
+					.charCodeAt(0)
+					.toString(16)
+					.padStart(4, "0")
+					.replace(/[a-f]/g, (digit) => `[${digit}${digit.toUpperCase()}]`);
+				const percent = [...Buffer.from(char)]
+					.map(
+						(byte) =>
+							`%${byte
+								.toString(16)
+								.padStart(2, "0")
+								.replace(/[a-f]/g, (digit) => `[${digit}${digit.toUpperCase()}]`)}`,
+					)
+					.join("");
+				const alternatives = new Set([
+					escapeRegex(char),
+					escapeRegex(JSON.stringify(char).slice(1, -1)),
+					`\\\\u${hex}`,
+					percent,
+				]);
+				return `(?:${[...alternatives].join("|")})`;
+			})
+			.join("");
+		masked = masked.replace(new RegExp(pattern, "g"), () => replacement);
+	}
+	return masked;
+}
+
 export class ApiRequestDumpCollector {
 	private dump: ApiRequestDump;
 	private responseCapture?: BoundedUtf8Capture;

@@ -13,6 +13,10 @@ const settingsState: { mcpServers: McpServerConfig[] } = { mcpServers: [] };
 const connectedServerIds = new Set<string>();
 let lastTestConfig: McpServerConfig | null = null;
 let saveSettingsCalls = 0;
+let refreshCalls: string[] = [];
+let refreshAllCalls = 0;
+/** When set, refresh(id) fails with this message. */
+let refreshFailWith: string | null = null;
 
 /**
  * The set `mcpManager.initialize()` would connect on the next startup. Mirrors
@@ -38,6 +42,30 @@ const mcpManagerMock = {
 	},
 	disconnect: async (serverId: string) => {
 		connectedServerIds.delete(serverId);
+	},
+	refresh: async (serverId: string) => {
+		refreshCalls.push(serverId);
+		if (refreshFailWith) {
+			return { ok: false, toolCount: 0, error: refreshFailWith };
+		}
+		if (!connectedServerIds.has(serverId)) {
+			return { ok: false, toolCount: 0, error: "not connected" };
+		}
+		return { ok: true, toolCount: 1 };
+	},
+	refreshAll: async () => {
+		refreshAllCalls++;
+		return settingsState.mcpServers
+			.filter((s) => s.enabled)
+			.map((s) => ({
+				serverId: s.id,
+				name: s.name,
+				ok: connectedServerIds.has(s.id) && !refreshFailWith,
+				toolCount: connectedServerIds.has(s.id) ? 1 : 0,
+				...(connectedServerIds.has(s.id) && !refreshFailWith
+					? {}
+					: { error: refreshFailWith ?? "not connected" }),
+			}));
 	},
 	reload: async () => {},
 	testConnection: async (config: McpServerConfig) => {
@@ -119,6 +147,9 @@ beforeEach(() => {
 	connectedServerIds.clear();
 	lastTestConfig = null;
 	saveSettingsCalls = 0;
+	refreshCalls = [];
+	refreshAllCalls = 0;
+	refreshFailWith = null;
 	settingsState.mcpServers = [structuredClone(existingServer)];
 });
 
@@ -199,6 +230,8 @@ describe("MCP external server management authorization", () => {
 			["delete", request("/servers/existing", { method: "DELETE" })],
 			["connect", request("/servers/existing/connect", { method: "POST" })],
 			["disconnect", request("/servers/existing/disconnect", { method: "POST" })],
+			["refresh", request("/servers/existing/refresh", { method: "POST" })],
+			["refresh all", request("/servers/refresh", { method: "POST" })],
 			["test existing", jsonRequest("/servers/existing/test", "POST", { name: "test" })],
 			["test", jsonRequest("/servers/test", "POST", { name: "test", enabled: false })],
 			["import", jsonRequest("/servers/import", "POST", { json: { mcpServers: {} } })],
@@ -389,5 +422,80 @@ describe("MCP manual connect/disconnect persists the connection intent", () => {
 		expect(response.status).toBe(404);
 		expect(saveSettingsCalls).toBe(0);
 		expect(settingsState.mcpServers).toEqual(before);
+	});
+});
+
+describe("MCP tool-list refresh", () => {
+	beforeEach(() => {
+		role = "admin";
+	});
+
+	it("refreshes a single server and returns the updated status without toggling enabled", async () => {
+		settingsState.mcpServers[0].enabled = true;
+		connectedServerIds.add("existing");
+		saveSettingsCalls = 0;
+
+		const response = await app.request("/servers/existing/refresh", { method: "POST" });
+		expect(response.status).toBe(200);
+		const body = await response.json();
+		expect(body.ok).toBe(true);
+		expect(body.toolCount).toBe(1);
+		expect(body.status).toMatchObject({ id: "existing", status: "connected" });
+		expect(refreshCalls).toEqual(["existing"]);
+		// Refresh is not a connection-intent change: it must not rewrite settings.
+		expect(saveSettingsCalls).toBe(0);
+		expect(settingsState.mcpServers[0].enabled).toBe(true);
+	});
+
+	it("reports refresh failure with an error payload", async () => {
+		settingsState.mcpServers[0].enabled = true;
+		connectedServerIds.add("existing");
+		refreshFailWith = "upstream tools/list failed";
+
+		const response = await app.request("/servers/existing/refresh", { method: "POST" });
+		expect(response.status).toBe(502);
+		const body = await response.json();
+		expect(body.ok).toBe(false);
+		expect(body.error).toContain("upstream tools/list failed");
+		expect(refreshCalls).toEqual(["existing"]);
+	});
+
+	it("returns 404 for an unknown server id", async () => {
+		const response = await app.request("/servers/missing/refresh", { method: "POST" });
+		expect(response.status).toBe(404);
+		expect(refreshCalls).toEqual([]);
+	});
+
+	it("refreshes all enabled servers", async () => {
+		settingsState.mcpServers[0].enabled = true;
+		connectedServerIds.add("existing");
+		settingsState.mcpServers.push({
+			id: "second",
+			name: "Second",
+			transport: "stdio",
+			command: "node",
+			enabled: true,
+		});
+		connectedServerIds.add("second");
+		// Disabled servers are skipped by refreshAll.
+		settingsState.mcpServers.push({
+			id: "off",
+			name: "Off",
+			transport: "stdio",
+			command: "node",
+			enabled: false,
+		});
+
+		const response = await app.request("/servers/refresh", { method: "POST" });
+		expect(response.status).toBe(200);
+		const body = await response.json();
+		expect(body.ok).toBe(true);
+		expect(body.refreshed).toBe(2);
+		expect(body.failed).toBe(0);
+		expect(refreshAllCalls).toBe(1);
+		expect(body.results.map((r: { serverId: string }) => r.serverId).sort()).toEqual([
+			"existing",
+			"second",
+		]);
 	});
 });

@@ -9,6 +9,7 @@ import type {
 } from "@shared/file-change-protocol";
 import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
 import type { NotificationLink } from "@shared/notification-center";
+import type { ScheduledTaskCleanupPolicy } from "@shared/scheduled-task-cleanup";
 import { sql } from "drizzle-orm";
 import {
 	type AnySQLiteColumn,
@@ -454,6 +455,11 @@ export const narrators = sqliteTable(
 	{
 		id: text("id").primaryKey(),
 		chapterId: text("chapter_id").references(() => chapters.id),
+		/** Creation provenance, never attached when a scheduled task reuses a session. */
+		scheduledTaskId: text("scheduled_task_id").references(
+			(): AnySQLiteColumn => scheduledTasks.id,
+			{ onDelete: "set null" },
+		),
 		apiConversationId: text("api_conversation_id"),
 		/** Durable logical run identity; recovery keeps it, a genuine new start replaces it. */
 		logicalRunId: text("logical_run_id"),
@@ -758,6 +764,11 @@ export const narrators = sqliteTable(
 		// The consequence to know: a future code path that writes these columns without
 		// going through the service layer can create an illegal pair, and nothing will
 		// stop it. `narrator-access-nesting.test.ts` covers the paths that exist today.
+		index("idx_narrators_scheduled_task_created").on(
+			table.scheduledTaskId,
+			table.createdAt,
+			table.id,
+		),
 		index("idx_narrators_chapter").on(table.chapterId),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
@@ -4950,6 +4961,11 @@ export const scheduledTasks = sqliteTable(
 		narratorMode: text("narrator_mode", { enum: ["new", "reuse"] })
 			.notNull()
 			.default("new"),
+		/** Opt-in, task-scoped destructive retention. Existing tasks remain unchanged. */
+		cleanupPolicy: text("cleanup_policy", { mode: "json" })
+			.$type<ScheduledTaskCleanupPolicy>()
+			.notNull()
+			.default({ mode: "none" }),
 		// reuse mode: the narrator remembered across runs.
 		reuseNarratorId: text("reuse_narrator_id").references(
 			// biome-ignore lint/suspicious/noExplicitAny: forward reference to narrators
@@ -4974,6 +4990,7 @@ export const scheduledTasks = sqliteTable(
 		// FK covering indexes for user / narrator / chapter deletion.
 		index("idx_scheduled_tasks_created_by").on(table.createdBy),
 		index("idx_scheduled_tasks_reuse_narrator").on(table.reuseNarratorId),
+		index("idx_scheduled_tasks_last_narrator").on(table.lastNarratorId),
 		index("idx_scheduled_tasks_chapter").on(table.chapterId),
 	],
 );

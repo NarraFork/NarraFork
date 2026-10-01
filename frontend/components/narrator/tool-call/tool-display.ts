@@ -6,6 +6,27 @@ import {
 	resolveCommunicationTargets,
 } from "@shared/pretext-layout/communication-state";
 
+/** Only a live foreground Bash command can be detached; never stop/Agent/Send calls. */
+export function isRunningForegroundBash(
+	toolName: string | undefined,
+	input: unknown,
+	status: string | undefined,
+	metadata?: Record<string, unknown>,
+): boolean {
+	if (toolName !== "Bash" || (status !== "executing" && status !== "running")) return false;
+	if (!input || typeof input !== "object") return false;
+	const args = input as Record<string, unknown>;
+	return (
+		typeof args.command === "string" &&
+		args.command.trim().length > 0 &&
+		!args.stop &&
+		args.background !== true &&
+		args.run_in_background !== true &&
+		!metadata?.background_task_id &&
+		metadata?.detached !== true
+	);
+}
+
 export type ToolCategory =
 	| "read"
 	| "file"

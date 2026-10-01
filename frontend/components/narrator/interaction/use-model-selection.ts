@@ -75,6 +75,7 @@ const ANTHROPIC_XHIGH_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] 
 const CODEX_REASONING_OPTIONS_BY_MODEL: Record<string, readonly ReasoningEffortValue[]> = {
 	// GPT-6 Astra requires reasoning, so it intentionally omits `none`.
 	"gpt-6-astra": ["low", "medium", "high", "xhigh", "max"],
+	"gpt-6.1-sol": ["none", "low", "medium", "high", "xhigh", "max"],
 	"gpt-6-sol": ["none", "low", "medium", "high", "xhigh", "max"],
 	"gpt-6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-sol": ["none", "low", "medium", "high", "xhigh", "max"],

@@ -12,6 +12,55 @@ function msg(contentJson: ContentBlock[], id = "m1", seq = 1): NarratorMsg {
 	return { id, seq, role: "assistant", contentJson } as unknown as NarratorMsg;
 }
 
+describe("foreground Bash detachment", () => {
+	it("uses the exact tool id and only executing/running foreground commands", () => {
+		for (const status of [
+			"executing",
+			"running",
+			"pending",
+			"permission",
+			"success",
+			"fail",
+			"cancelled",
+			undefined,
+		]) {
+			const meta = deriveToolMeta(
+				toolBlock({ name: "Bash", status, input: { command: "bun run build" } }),
+			);
+			expect(meta?.toolUseId).toBe("tu-1");
+			expect(!!meta?.isRunningBash).toBe(status === "executing" || status === "running");
+		}
+		for (const input of [
+			{},
+			{ command: " " },
+			{ stop: "task" },
+			{ command: "build", stop: "task" },
+			{ command: "build", run_in_background: true },
+			{ command: "build", background: true },
+		]) {
+			expect(
+				deriveToolMeta(toolBlock({ name: "Bash", status: "running", input }))?.isRunningBash,
+			).toBeUndefined();
+		}
+		for (const name of ["Agent", "Send", "Await", "Execute"]) {
+			expect(
+				deriveToolMeta(toolBlock({ name, status: "running", input: { command: "build" } }))
+					?.isRunningBash,
+			).toBeUndefined();
+		}
+		expect(
+			deriveToolMeta(
+				toolBlock({
+					name: "Bash",
+					status: "running",
+					input: { command: "build" },
+					output: { _metadata: { background_task_id: "task", detached: true } },
+				}),
+			)?.isRunningBash,
+		).toBeUndefined();
+	});
+});
+
 describe("active question waits", () => {
 	it("exposes only running question waits, not completed or other waits", () => {
 		for (const status of ["running", "success", "fail", "cancelled", "pending", undefined]) {

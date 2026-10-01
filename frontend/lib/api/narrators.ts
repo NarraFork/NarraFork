@@ -790,6 +790,11 @@ export const narratorsApi = {
 			`/narrators/${id}/interrupt${waitForIdle ? "?waitForIdle=1" : ""}`,
 			{ method: "POST" },
 		),
+	detachBash: (narratorId: string, toolUseId: string) =>
+		request<{ detached: true; taskId: string; alias: string }>(
+			`/narrators/${encodeURIComponent(narratorId)}/tools/${encodeURIComponent(toolUseId)}/detach`,
+			{ method: "POST" },
+		),
 	detachSubagent: (id: string) =>
 		request<{ detached: boolean }>(`/narrators/${id}/detach`, { method: "POST" }),
 	takeoverSubagent: (id: string) =>

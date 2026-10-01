@@ -1,4 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { SQL } from "drizzle-orm";
 import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { cleanDb } from "../../../tests/setup";
@@ -100,6 +103,7 @@ beforeAll(async () => {
 		...realDb.query,
 		narratorMessages: {
 			...realDb.query.narratorMessages,
+			findMany: realDb.query.narratorMessages.findMany.bind(realDb.query.narratorMessages),
 			findFirst: mock(async (options?: { columns?: Record<string, boolean> }) =>
 				options?.columns?.parentToolUseId
 					? originResult
@@ -198,7 +202,7 @@ beforeAll(async () => {
 				return narrator;
 			}),
 			getModelHistorySinceLastCompact: mock(async (id: string) =>
-				isEditTestNarrator(id)
+				isEditTestNarrator(id) || databaseNarratorIds.has(id)
 					? realNarratorService.getModelHistorySinceLastCompact(id)
 					: [
 							{
@@ -220,7 +224,7 @@ beforeAll(async () => {
 						messageId: args[1],
 						opts: args[2],
 					});
-					return isEditTestNarrator(args[0])
+					return isEditTestNarrator(args[0]) || databaseNarratorIds.has(args[0])
 						? realNarratorService.deleteMessagesAfter(...args)
 						: Promise.resolve({ deletedMessageIds: [] });
 				},
@@ -1387,16 +1391,156 @@ describe("resumeSubagent", () => {
 		await finishRun(subagentId);
 	});
 
-	// The default is load-bearing for the other callers of this intent (a plain
-	// retry, the Codex image-generation fix, recharge resume): they never edited
-	// anything, so their truncation must still roll files back.
-	test("a plain retry still reverts the truncated messages' file changes", async () => {
-		const subagentId = "resume-plain-retry-reverts";
+	// Plain retries and automatic recovery must preserve files unless rollback is explicit.
+	test("a plain retry preserves the truncated messages' file changes by default", async () => {
+		const subagentId = "resume-plain-retry-preserves-files";
 
 		const result = await resumeSubagent({
 			subagentId,
 			intent: "retry_last_input",
 			actor: "user",
+			createdBy: "user-8",
+			locale: "en",
+		});
+
+		expect(result.started).toBe(true);
+		const truncation = deleteMessagesAfterCalls.at(-1);
+		expect(truncation?.narratorId).toBe(subagentId);
+		expect(truncation?.opts).toMatchObject({ skipRevert: true });
+		await finishRun(subagentId);
+	});
+
+	test("a plain retry after history-only rollback preserves real database checkpoints and files", async () => {
+		const { db } = await import("../../db");
+		const { narrators, narratorMessages, narratorMessageRefs, narratorToolCalls } = await import(
+			"../../db/schema"
+		);
+		const { eq } = await import("drizzle-orm");
+		const { narratorService } = await import("../narrator-service");
+		const subagentId = "resume-database-history-only";
+		const cwd = mkdtempSync(join(tmpdir(), "nf-subagent-retry-"));
+		const path = join(cwd, "kept.txt");
+		const now = new Date().toISOString();
+		databaseNarratorIds.add(subagentId);
+		try {
+			writeFileSync(path, "kept file bytes\n");
+			db.insert(narrators)
+				.values([
+					{ id: parentNarratorId, cwd, createdAt: now, updatedAt: now },
+					{
+						id: subagentId,
+						type: "subagent",
+						variant: "subagent:general",
+						parentNarratorId,
+						cwd,
+						status: "idle",
+						createdAt: now,
+						updatedAt: now,
+					},
+				])
+				.run();
+			const message = (id: string, seq: number, role: "user" | "assistant") => {
+				db.insert(narratorMessages)
+					.values({
+						id,
+						narratorId: subagentId,
+						role,
+						contentText: role === "user" ? "retry my request" : null,
+						contentJson:
+							role === "user"
+								? [{ type: "text", text: "retry my request" }]
+								: [{ type: "tool_use", id: "edit", name: "Edit" }],
+						createdAt: now,
+					})
+					.run();
+				db.insert(narratorMessageRefs)
+					.values({ id: `ref-${id}`, narratorId: subagentId, messageId: id, seq })
+					.run();
+			};
+			message("retry-user", 0, "user");
+			message("retry-answer", 1, "assistant");
+			db.insert(narratorToolCalls)
+				.values({
+					id: "retry-edit-call",
+					narratorId: subagentId,
+					messageId: "retry-answer",
+					toolUseId: "edit",
+					toolName: "Edit",
+					inputJson: { file_path: path, old_string: "before", new_string: "kept" },
+					status: "success",
+					executionDeviceId: "local",
+					executionCwd: cwd,
+					executionPathFlavor: "posix",
+					resolvedFilePath: path,
+					createdAt: now,
+				})
+				.run();
+			const evidence = () => ({
+				messages: db
+					.select()
+					.from(narratorMessages)
+					.where(eq(narratorMessages.narratorId, subagentId))
+					.all(),
+				refs: db
+					.select()
+					.from(narratorMessageRefs)
+					.where(eq(narratorMessageRefs.narratorId, subagentId))
+					.all(),
+				tools: db
+					.select()
+					.from(narratorToolCalls)
+					.where(eq(narratorToolCalls.narratorId, subagentId))
+					.all(),
+			});
+			const deleted = await narratorService.deleteMessagesAfter(subagentId, "retry-user", {
+				skipRevert: true,
+			});
+			expect(deleted.deletedMessageIds).toEqual(["retry-answer"]);
+			const kept = evidence();
+			expect(kept.messages.filter((row) => row.role === "disp")).toHaveLength(1);
+			expect(kept.refs.filter((row) => row.segmentCompactId !== null)).toHaveLength(1);
+			expect(kept.tools).toHaveLength(1);
+			expect(kept.tools[0]).toMatchObject({
+				isFileHistoryCheckpoint: true,
+				executionOriginToolCallId: "retry-edit-call",
+			});
+			deleteMessagesAfterCalls.length = 0;
+			const result = await resumeSubagent({
+				subagentId,
+				intent: "retry_last_input",
+				actor: "user",
+				locale: "en",
+				// Isolate retry preparation from the unrelated standalone announcement fixture.
+				skipConclusionDelivery: true,
+			});
+			expect(result.started).toBe(true);
+			expect(deleteMessagesAfterCalls).toEqual([
+				{ narratorId: subagentId, messageId: "retry-user", opts: { skipRevert: true } },
+			]);
+			expect(startCalls).toHaveLength(1);
+			expect(startCalls[0]).toMatchObject({
+				subagentId,
+				prompt: "retry my request",
+				persistPrompt: false,
+			});
+			expect(evidence()).toEqual(kept);
+			expect(readFileSync(path, "utf8")).toBe("kept file bytes\n");
+			await finishRun(subagentId);
+			await expect(result.terminalCompletion).resolves.toContain("done");
+		} finally {
+			await finishRun(subagentId);
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a plain retry explicitly requesting rollback forwards skipRevert false", async () => {
+		const subagentId = "resume-plain-retry-explicit-revert";
+
+		const result = await resumeSubagent({
+			subagentId,
+			intent: "retry_last_input",
+			actor: "user",
+			retryRevertFiles: true,
 			createdBy: "user-8",
 			locale: "en",
 		});

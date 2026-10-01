@@ -8,6 +8,7 @@ import type { ModelCard } from "@shared/model-card";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
+import type { DiskSafetySettings } from "../disk-safety-config";
 import type { ModelCatalogSettings } from "../model-catalog";
 import type { PermissionMode } from "../permission-modes";
 import type { UserAgentMode } from "../user-agent";
@@ -483,6 +484,8 @@ export interface OidcProviderConfig {
 }
 
 export interface NarraForkSettings {
+	/** Tool-triggered local filesystem safety; absent older settings use safe defaults. */
+	diskSafety?: DiskSafetySettings;
 	/** Instance-wide, monotonic setup completion; absent until legacy preferences are migrated. */
 	setupWizardCompleted?: boolean;
 	/**

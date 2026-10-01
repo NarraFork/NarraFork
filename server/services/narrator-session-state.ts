@@ -1007,6 +1007,31 @@ export function withNarratorMutationAdmission<T>(
 }
 
 /**
+ * Non-interrupting exclusive lifecycle reservation for automatic deletion. A pending
+ * start/resume/fork already owns work, so it wins and cleanup declines immediately.
+ * Held gates reject new work (including starts resolving their root across an await).
+ */
+export async function withIdleNarratorCleanupAdmission<T>(
+	narratorIds: string[],
+	fn: () => Promise<T>,
+): Promise<T | null> {
+	const ids = [...new Set(narratorIds)];
+	if (ids.some((id) => hasNarratorAdmissionWork(id) || revertAdmissions.has(id))) return null;
+	const gates = ids.map((id) => {
+		const gate = { phase: "held" as const };
+		revertAdmissions.set(id, gate);
+		return { id, gate };
+	});
+	try {
+		return await fn();
+	} finally {
+		for (const { id, gate } of gates) {
+			if (revertAdmissions.get(id) === gate) revertAdmissions.delete(id);
+		}
+	}
+}
+
+/**
  * Includes startup and COMPLETE finalization, but does not make a background child's
  * parent busy. For a primary this is its whole team; for a subagent, only its own work.
  */

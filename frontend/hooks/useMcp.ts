@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
+import i18n from "../lib/i18n";
 import { reportMutationError } from "../lib/query-client";
 
 const MCP_SERVERS_QUERY_GC_TIME_MS = 60_000;
@@ -157,6 +158,38 @@ export function useDisconnectMcpServer() {
 	return useMutation({
 		mutationFn: api.mcpDisconnectServer,
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["mcp-servers"] }),
+	});
+}
+
+export function useRefreshMcpServer() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: api.mcpRefreshServer,
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["mcp-servers"] }),
+		// Refresh failure has to surface: the button would otherwise look like a
+		// no-op while the tool list stayed stale (the whole point of the action).
+		onError: (err) => reportMutationError(err),
+	});
+}
+
+export function useRefreshAllMcpServers() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: api.mcpRefreshAllServers,
+		onSuccess: (data) => {
+			const failures = data.results.filter((result) => !result.ok);
+			if (failures.length)
+				reportMutationError(
+					new Error(
+						i18n.t("routines:mcpRefreshPartialFailure", {
+							count: failures.length,
+							names: failures.map((result) => result.name).join(", "),
+						}),
+					),
+				);
+			return qc.invalidateQueries({ queryKey: ["mcp-servers"] });
+		},
+		onError: (err) => reportMutationError(err),
 	});
 }
 

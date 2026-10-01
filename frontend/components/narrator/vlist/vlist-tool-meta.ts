@@ -27,6 +27,7 @@
 
 import { extractField, isTruncated, resolveDisplayText } from "@shared/pretext-layout/tool-detail";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
+import { isRunningForegroundBash } from "../tool-call/tool-display";
 import { runningSendTargetNarratorId } from "../trace/trace-row-identity";
 
 /** Tools whose input carries a file path worth offering in the menu. */
@@ -44,6 +45,10 @@ const SUBAGENT_ID_TAG_RE = /<subagent_id>([^<]+)<\/subagent_id>/;
 
 /** Per-row tool facts consumed by VListRowInteraction's menu gating. */
 export interface VListToolMeta {
+	/** Exact owning tool use id, needed for live Bash detachment. */
+	toolUseId?: string;
+	/** Only executing/running foreground Bash commands, excluding stop calls. */
+	isRunningBash?: boolean;
 	/** Raw tool name (e.g. "Read", "Await", "Agent"). */
 	toolName?: string;
 	/** Subagent card: the child narrator id, when the activity summary knows it. */
@@ -223,6 +228,9 @@ export function deriveToolMeta(block: ContentBlock): VListToolMeta | null {
 
 	const meta: VListToolMeta = {};
 	if (toolName) meta.toolName = toolName;
+	const toolUseId = nonEmpty(record.id) ?? nonEmpty(record.toolUseId);
+	if (toolUseId) meta.toolUseId = toolUseId;
+	if (isRunningForegroundBash(toolName, inputRecord, status, metadata)) meta.isRunningBash = true;
 	if (toolName === "Await" && inputRecord.type === "question" && status === "running") {
 		meta.awaitQuestionId = nonEmpty(inputRecord.id);
 		const seq = record.seq ?? record.messageSeq;

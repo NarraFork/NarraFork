@@ -37,6 +37,22 @@ export interface SubagentRunModel {
 	inheritance?: SubagentModelInheritance;
 }
 
+/** Configured default model for a builtin subagent type, if any. */
+export function resolveSubagentTypePreference(
+	subagentType: string | null | undefined,
+): string | undefined {
+	const type = subagentType ?? "general";
+	if (type === "explore" || type === "plan" || type === "search" || type === "review") {
+		return settings.agent.subagentModels?.[type] || undefined;
+	}
+	return undefined;
+}
+
+/** A concrete provider:model ID — not empty, not `__default__`, not `__parent__`. */
+function hasConcreteModelId(model: string | null | undefined): boolean {
+	return Boolean(model) && model !== FOLLOW_DEFAULT_MODEL && model !== FOLLOW_PARENT_MODEL;
+}
+
 /** Only explicit pins or a successfully selected type preference stop inheritance. */
 export function subagentStoredModelReference(input: {
 	explicitModel?: string;
@@ -88,6 +104,28 @@ export async function resolveSubagentModelInheritance(
 		narrator.subagentType ?? "general",
 	);
 	const parentModel = parent.model || FOLLOW_DEFAULT_MODEL;
+	// When the parent has no concrete model ID, "follow parent" would only reach the
+	// global default. A configured type preference is the right source instead.
+	const typePref = resolveSubagentTypePreference(narrator.subagentType);
+	if (!hasConcreteModelId(parent.model) && typePref) {
+		const preferred = resolveSubagentModelSelectionFromPolicy({
+			policy,
+			explicitModel: typePref,
+			candidates: [],
+		});
+		if (preferred) {
+			return {
+				selection: preferred,
+				inheritance: {
+					source: "preference",
+					model: displayModelReference(preferred.model),
+					parentModel: displayModelReference(parentModel),
+					...(policy.source !== "none" && { poolKey: policy.poolKey }),
+					...(parent.reasoningEffort && { parentReasoningEffort: parent.reasoningEffort }),
+				},
+			};
+		}
+	}
 	// A type preference selected at creation is a pin. Following rows keep following
 	// their parent; they do not silently acquire a newly configured type preference.
 	const followed = resolveSubagentModelSelectionFromPolicy({

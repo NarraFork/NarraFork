@@ -6,9 +6,11 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
 import { DEFAULT_CODEX_TIER_ORDER } from "../codex-manager";
+import { DEFAULT_DISK_SAFETY } from "../disk-safety-config";
 import type { FieldDoc, NarraForkSettings } from "./types";
 
 export const DEFAULTS: NarraForkSettings = {
+	diskSafety: { ...DEFAULT_DISK_SAFETY },
 	server: { port: 7778, host: "localhost", openBrowser: "browser", allowedOrigins: [] },
 	proxy: { mode: "direct" },
 	// SQLite by default. Selecting "postgres" additionally requires NF_DATABASE_URL /
@@ -227,6 +229,39 @@ export const DEFAULTS: NarraForkSettings = {
  * Kept alongside DEFAULTS so changes stay in sync.
  */
 export const SETTING_DOCS: Record<string, FieldDoc> = {
+	"diskSafety.mode": {
+		desc: "磁盘安全策略：enforce 拒绝危险写入；warn 仅提示；off 关闭。管理员可临时覆盖，普通工具权限不会绕过。",
+		type: "string",
+	},
+	"diskSafety.warningFreeMb": { desc: "剩余空间警告阈值（MiB），默认 1024。", type: "number" },
+	"diskSafety.warningFreePercent": {
+		desc: "剩余空间百分比警告阈值，默认 5；字节或百分比任一命中即警告。",
+		type: "number",
+	},
+	"diskSafety.blockFreeMb": {
+		desc: "拒绝文件写入和不透明命令的剩余空间阈值（MiB），默认 256。",
+		type: "number",
+	},
+	"diskSafety.criticalFreeMb": {
+		desc: "数据目录达到此阈值（MiB）时停止普通工具所在轮次（包括只读工具的历史写入），默认 64；取消后台任务仍放行。",
+		type: "number",
+	},
+	"diskSafety.reserveMb": {
+		desc: "实际写入后留给 WAL/结果记录的预算（MiB），默认 32。",
+		type: "number",
+	},
+	"diskSafety.checkIntervalMs": {
+		desc: "每个磁盘 OS 空间查询最短间隔（毫秒），默认 10000。",
+		type: "number",
+	},
+	"diskSafety.pathCacheTtlMs": {
+		desc: "路径到磁盘映射缓存期限（毫秒），默认 60000。",
+		type: "number",
+	},
+	"diskSafety.probeTimeoutMs": {
+		desc: "单次磁盘检测等待预算（毫秒），默认 1000，最大 2000；超时视为未知。",
+		type: "number",
+	},
 	// ── server ──────────────────────────────────────────────────────────
 	"server.port": {
 		desc: "服务器监听端口。重启后生效。",

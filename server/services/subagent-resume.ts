@@ -69,8 +69,8 @@ export interface ResumeSubagentInput {
 	editMessageId?: string;
 	editContent?: string;
 	/**
-	 * Roll back the file changes truncated by a `retry_last_input` resume; defaults
-	 * to true, which is what every retry did before this was expressible.
+	 * Roll back the file changes truncated by a `retry_last_input` resume only
+	 * when explicitly true; omitted or false preserves the workspace files.
 	 *
 	 * Distinct from `editRevertFiles`: an edit resume rewrites the intent to
 	 * `retry_last_input` after its own rollback has already run, and that second
@@ -204,16 +204,14 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 				getFileReferenceSnapshots(lastUserMessage.contentJson),
 			),
 		);
-		// `skipRevert` must be forwarded, not defaulted. `deleteMessagesAfter` rolls the
-		// workspace back unless told otherwise, so omitting it here reverts files that
-		// the caller may have explicitly asked to keep — and a `regenerate_edited_message`
-		// resume arrives here having ALREADY performed (or deliberately skipped) exactly
-		// that rollback, so a second one is both unrequested and, once its own
-		// regeneration is live, liable to fail on the workspace-write guard.
+		// Retry truncates conversation history, not workspace files, unless rollback
+		// was explicitly requested. An edit resume arrives here having already
+		// performed (or deliberately skipped) its rollback and forces false to avoid
+		// an unrequested second rollback that may fail on the workspace-write guard.
 		const { deletedMessageIds } = await narratorService.deleteMessagesAfter(
 			input.subagentId,
 			lastUserMessage.id,
-			{ skipRevert: input.retryRevertFiles === false },
+			{ skipRevert: input.retryRevertFiles !== true },
 		);
 		if (deletedMessageIds.length > 0) {
 			broadcastToNarrator(input.subagentId, {

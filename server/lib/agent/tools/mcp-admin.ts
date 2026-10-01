@@ -14,7 +14,7 @@ import { errorResult, isAdminUser, requestWritePermission } from "./admin-common
 const mcpTransportSchema = z.enum(["stdio", "streamable-http", "sse"]);
 const mcpBehaviorSchema = z.enum(["readOnly", "readWrite", "ask", "deny"]);
 
-const actionSchema = z.enum(["list", "add", "remove", "connect", "disconnect", "test"]);
+const actionSchema = z.enum(["list", "add", "remove", "connect", "disconnect", "refresh", "test"]);
 
 const serverFieldsSchema = {
 	name: z.string().min(1).max(200).optional().describe("Display name for the server (add)"),
@@ -52,6 +52,12 @@ export interface McpManagerLike {
 	getServerStatuses(): Array<Record<string, unknown>>;
 	connect(config: Record<string, unknown>): Promise<void>;
 	disconnect(serverId: string): Promise<void>;
+	/** Re-fetch one server's tool list. */
+	refresh(serverId: string): Promise<{ ok: boolean; toolCount: number; error?: string }>;
+	/** Re-fetch tool lists of every enabled server. */
+	refreshAll(): Promise<
+		Array<{ serverId: string; name?: string; ok: boolean; toolCount: number; error?: string }>
+	>;
 	testConnection(
 		config: Record<string, unknown>,
 	): Promise<{ ok: boolean; tools?: unknown[]; error?: string }>;
@@ -66,7 +72,7 @@ export function createMcpAdminTool(deps: McpAdminToolDeps = {}): ToolDefinition 
 	return {
 		name: "McpAdmin",
 		description:
-			"Manage external MCP servers (admin only, mutating actions require approval). action=list shows configured servers and connection status; action=add registers a new server (stdio command or streamable-http/sse URL) and connects it; action=remove deletes a server; action=connect/disconnect toggles the runtime connection; action=test validates connectivity without persisting. Secret env/header values are never echoed back.",
+			"Manage external MCP servers (admin only, mutating actions require approval). action=list shows configured servers and connection status; action=add registers a new server (stdio command or streamable-http/sse URL) and connects it; action=remove deletes a server; action=connect/disconnect toggles the runtime connection; action=refresh re-fetches the tool list from a connected server (or all enabled servers when id is omitted) so tool changes that did not emit tools/list_changed become visible; action=test validates connectivity without persisting. Secret env/header values are never echoed back.",
 		parameters: z.object({
 			action: actionSchema.describe("The MCP server management action to perform."),
 			id: z
@@ -74,7 +80,9 @@ export function createMcpAdminTool(deps: McpAdminToolDeps = {}): ToolDefinition 
 				.min(1)
 				.max(100)
 				.optional()
-				.describe("Server id (remove/connect/disconnect/test)."),
+				.describe(
+					"Server id (remove/connect/disconnect/refresh/test). Omit id with action=refresh to refresh every enabled server.",
+				),
 			...serverFieldsSchema,
 		}),
 		async execute(args, ctx): Promise<ToolResult> {
@@ -202,6 +210,78 @@ export function createMcpAdminTool(deps: McpAdminToolDeps = {}): ToolDefinition 
 						output: JSON.stringify(project(config), null, 2),
 						title: "MCP server added",
 						metadata: { tool: "McpAdmin", action, serverId: config.id },
+					};
+				}
+
+				if (action === "refresh") {
+					// Same approval model as connect/disconnect: refresh can reconnect a
+					// dead server (spawning stdio processes) and replaces the tool surface
+					// exposed to narrators.
+					const id = input.id as string | undefined;
+					const servers = (
+						Array.isArray(settingsRef.mcpServers) ? settingsRef.mcpServers : []
+					) as Record<string, unknown>[];
+					if (id) {
+						const idx = servers.findIndex((s) => s.id === id);
+						if (idx === -1) return errorResult(`MCP server not found: ${id}`);
+						const denied = await requestWritePermission(ctx, "McpAdmin", {
+							action,
+							id,
+							name: servers[idx].name,
+							warning:
+								"This will re-fetch the tool list from the MCP server (reconnecting if needed) and update tools available to narrators.",
+						});
+						if (denied) return errorResult(denied, "McpAdmin denied");
+
+						const result = await manager.refresh(id);
+						await syncTools();
+						const status = manager.getServerStatuses().find((s) => s.id === id);
+						return {
+							output: JSON.stringify(
+								{
+									ok: result.ok,
+									serverId: id,
+									toolCount: result.toolCount,
+									error: result.error,
+									status: status ?? { id, status: "unknown" },
+								},
+								null,
+								2,
+							),
+							title: result.ok ? "MCP tools refreshed" : "MCP refresh failed",
+							metadata: { tool: "McpAdmin", action, serverId: id, ok: result.ok },
+						};
+					}
+
+					const denied = await requestWritePermission(ctx, "McpAdmin", {
+						action,
+						warning:
+							"This will re-fetch tool lists from every enabled MCP server (reconnecting where needed) and update tools available to narrators.",
+					});
+					if (denied) return errorResult(denied, "McpAdmin denied");
+
+					const results = await manager.refreshAll();
+					await syncTools();
+					const failed = results.filter((r) => !r.ok);
+					return {
+						output: JSON.stringify(
+							{
+								ok: failed.length === 0,
+								refreshed: results.length - failed.length,
+								failed: failed.length,
+								results,
+							},
+							null,
+							2,
+						),
+						title:
+							failed.length === 0 ? "MCP tools refreshed" : "MCP refresh completed with errors",
+						metadata: {
+							tool: "McpAdmin",
+							action,
+							ok: failed.length === 0,
+							refreshed: results.length - failed.length,
+						},
 					};
 				}
 

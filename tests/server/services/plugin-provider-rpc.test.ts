@@ -854,3 +854,125 @@ describe("operation limits and crash semantics", () => {
 		expect(transport.killed).toEqual([]);
 	});
 });
+
+describe("provider dump events", () => {
+	function dumpChatParams(maxBytes = 1024) {
+		return { ...chatParams(), requestDump: { maxBytes } };
+	}
+
+	it("delivers solicited dump events without marking the operation as visible output", async () => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		const operation = await client.chat(dumpChatParams());
+		const stream = operation.events();
+		transport.emit(
+			notification(operation.operationId, 1, {
+				type: "dump.request",
+				url: "https://upstream.example.test/v1/chat",
+				headers: { "content-type": "application/json" },
+				bodyChunk: "{}",
+				final: true,
+			}),
+		);
+		transport.emit(
+			notification(operation.operationId, 2, {
+				type: "dump.response",
+				status: 200,
+				bodyChunk: "data: ok",
+				final: true,
+			}),
+		);
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "dump.request" } });
+		// Dump events are diagnostic metadata: the operation must stay replay-safe until
+		// real model output arrives, otherwise an upstream retry would be blocked by
+		// evidence collection alone.
+		expect(operation.replaySafe).toBe(true);
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "dump.response" } });
+		transport.emit(notification(operation.operationId, 3, { type: "text.delta", text: "hi" }));
+		transport.emit(
+			notification(operation.operationId, 4, {
+				type: "done",
+				status: "completed",
+				stopReason: "end_turn",
+			}),
+		);
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "text.delta" } });
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "done" } });
+		await expect(stream.next()).resolves.toMatchObject({ done: true });
+		expect(transport.killed).toHaveLength(0);
+	});
+
+	it("rejects unsolicited dump events as a protocol violation", async () => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		// No requestDump hint: the plugin may not emit dump events, because hosts that
+		// predate them would kill the transport on the unknown event type.
+		const operation = await client.chat(chatParams());
+		const stream = operation.events();
+		transport.emit(
+			notification(operation.operationId, 1, {
+				type: "dump.request",
+				url: "https://upstream.example.test/v1/chat",
+				final: true,
+			}),
+		);
+		await expect(stream.next()).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
+		expect(client.getDiagnostics().protocolErrors).toBe(1);
+		expect(transport.killed).toHaveLength(0);
+	});
+
+	it("rejects dump events on generate operations as a protocol violation", async () => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		const operation = await client.generate(generateParams());
+		const stream = operation.events();
+		transport.emit(
+			notification(operation.operationId, 1, {
+				type: "dump.response",
+				status: 200,
+				bodyChunk: "ok",
+				final: true,
+			}),
+		);
+		await expect(stream.next()).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
+		expect(client.getDiagnostics().protocolErrors).toBe(1);
+		expect(transport.killed).toHaveLength(0);
+	});
+
+	it("cancels the operation when dump output exceeds the advertised budget", async () => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		const operation = await client.chat(dumpChatParams(4));
+		const stream = operation.events();
+		transport.emit(
+			notification(operation.operationId, 1, {
+				type: "dump.response",
+				status: 200,
+				bodyChunk: "toolong",
+			}),
+		);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const cancellations = transport.requests.filter((item) => item.method === "provider.cancel");
+		expect(cancellations).toHaveLength(1);
+		expect(cancellations[0].params).toMatchObject({
+			operationId: operation.operationId,
+			reason: "output_limit",
+		});
+		transport.emit(
+			notification(operation.operationId, 2, {
+				type: "error",
+				error: { classification: "cancelled", code: "OUTPUT_LIMIT", message: "limited" },
+			}),
+		);
+		transport.emit(
+			notification(operation.operationId, 3, {
+				type: "done",
+				status: "failed",
+				stopReason: "error",
+			}),
+		);
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "error" } });
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "done" } });
+		await expect(stream.next()).rejects.toMatchObject({ code: "OUTPUT_LIMIT" });
+	});
+});

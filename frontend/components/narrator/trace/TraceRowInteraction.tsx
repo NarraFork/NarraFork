@@ -111,6 +111,8 @@ export interface TraceRowInteractionProps {
 	 * path); absent → item hidden.
 	 */
 	onDetachSubagent?: (narratorId: string) => void;
+	/** Detach a running foreground Bash tool call; absent → item hidden. */
+	onDetachBash?: (toolUseId: string) => void;
 	/** Cancel a background subagent task; absent → item hidden. */
 	onCancelBackgroundTask?: (narratorId: string) => void;
 	/**
@@ -133,6 +135,7 @@ export function TraceRowInteraction({
 	toolDetailRef,
 	onViewSubagentSession,
 	onDetachSubagent,
+	onDetachBash,
 	onCancelBackgroundTask,
 	onOpenFilePanel,
 	children,
@@ -250,6 +253,12 @@ export function TraceRowInteraction({
 		!tool?.isBackground &&
 		!tool?.isTerminal
 	);
+	const canDetachBash = !!(
+		tool?.toolName === "Bash" &&
+		tool.isRunningBash &&
+		tool.toolUseId &&
+		onDetachBash
+	);
 	const canCancelBackground = !!(
 		childNarratorId &&
 		onCancelBackgroundTask &&
@@ -263,6 +272,7 @@ export function TraceRowInteraction({
 	const hasToolActions = !!(
 		canViewSession ||
 		canDetach ||
+		canDetachBash ||
 		canCancelBackground ||
 		canInspect ||
 		canOpenFilePanel ||
@@ -282,11 +292,12 @@ export function TraceRowInteraction({
 					{tNarrator("viewSubagentSession")}
 				</Menu.Item>
 			)}
-			{canDetach && (
+			{(canDetach || canDetachBash) && (
 				<Menu.Item
 					leftSection={<IconCloudOff size={14} />}
 					onClick={() => {
-						if (childNarratorId) onDetachSubagent?.(childNarratorId);
+						if (canDetachBash && tool?.toolUseId) onDetachBash?.(tool.toolUseId);
+						else if (childNarratorId) onDetachSubagent?.(childNarratorId);
 						swipe.closeSwipe();
 					}}
 				>

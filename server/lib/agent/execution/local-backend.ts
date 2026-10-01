@@ -20,6 +20,7 @@ import {
 	unlink,
 } from "node:fs/promises";
 import { isAbsolute, join as joinPath, posix as posixPath, resolve } from "node:path";
+import { guardDiskWrite } from "../../disk-safety";
 import { envWithAmbientProxy } from "../../net/proxy-env";
 import { getHome, IS_WINDOWS } from "../../platform";
 import { pathsEqualForOS } from "../../platform-path";
@@ -452,6 +453,8 @@ export class LocalBackend implements ExecutionBackend {
 	}
 
 	async writeFileBytes(path: string, bytes: Uint8Array, opts?: WriteBytesOptions): Promise<void> {
+		// Legacy tools also need a last-mile budget before Bun.write can truncate a target.
+		await guardDiskWrite(opts?.expectedResolvedPath ?? path, bytes.byteLength);
 		const expectedResolvedPath = opts?.expectedResolvedPath;
 		if (!expectedResolvedPath) {
 			await Bun.write(path, bytes);

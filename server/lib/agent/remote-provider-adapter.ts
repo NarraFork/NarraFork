@@ -1,4 +1,5 @@
 import type { JsonValue, ProviderStreamEvent } from "@server/lib/plugins/protocol";
+import { PLUGIN_REQUEST_DUMP_MAX_BYTES } from "@server/lib/plugins/protocol";
 import type {
 	ModelCatalog,
 	PluginProviderRpcClient,
@@ -11,6 +12,7 @@ import type {
 	ProviderOperation,
 	ProviderToolDefinition,
 } from "@server/services/plugin-provider-rpc";
+import { settings } from "../settings";
 import type {
 	BuiltHistory,
 	ChatParams,
@@ -21,6 +23,14 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
+import type { ApiRequestDump } from "./request-dump";
+import {
+	BoundedUtf8Capture,
+	collectSecretConfigValues,
+	maskSecretValues,
+	responseDumpBudget,
+	sanitizeHeaders,
+} from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
 import type {
 	AgentToolUse,
@@ -30,6 +40,9 @@ import type {
 } from "./types";
 
 type ProviderUsage = NonNullable<Extract<ProviderStreamEvent, { type: "usage" }>["usage"]>;
+
+/** Plugin-reported upstream request/response evidence; consumed only by the dump tap. */
+type DumpStreamEvent = Extract<ProviderStreamEvent, { type: "dump.request" | "dump.response" }>;
 
 /** The narrow RPC surface consumed by the adapter; useful for tests and alternate runtimes. */
 export interface RemoteProviderRpcClient {
@@ -184,7 +197,8 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		if (params.signal.aborted) throw createAbortError(params.signal.reason);
-		const operation = await this.rpc.chat(await this.buildChatParams(params), {
+		const chatParams = await this.buildChatParams(params);
+		const operation = await this.rpc.chat(chatParams, {
 			signal: params.signal,
 		});
 		if (params.signal.aborted) {
@@ -192,10 +206,18 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			throw createAbortError(params.signal.reason);
 		}
 		const removeAbort = this.listenForAbort(operation, params.signal);
+		const dumpTap = this.createDumpTap(params, chatParams);
 		let requestStarted = false;
 		let cancelled = false;
 		try {
 			for await (const event of operation.events()) {
+				// Dump events are diagnostic side-channel data: they feed the request-dump
+				// collector, never the parsed-event stream, and must not mark the request as
+				// started or count as visible output.
+				if (event.type === "dump.request" || event.type === "dump.response") {
+					dumpTap(event);
+					continue;
+				}
 				if (event.type === "request_started") {
 					requestStarted = true;
 					if (event.reasoningSource) this.activeReasoningSource = event.reasoningSource;
@@ -224,6 +246,9 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			if (cancelled) throw createAbortError(params.signal.reason);
 		} finally {
 			removeAbort();
+			// Preserve a request that never got a response (e.g. connect failure) so the
+			// persisted dump still shows what was sent.
+			dumpTap.flush();
 		}
 	}
 
@@ -481,6 +506,149 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		});
 	}
 
+	/**
+	 * Build the consumer for plugin-reported `dump.request` / `dump.response` events.
+	 *
+	 * Returns a no-op when the loop attached no collector (dump disabled, or the toggle
+	 * flipped off mid-session): the events are dropped here while the RPC layer
+	 * independently rejects ones the plugin was never invited to send.
+	 *
+	 * Sanitization is host-owned on purpose — the plugin process holds the credentials
+	 * (the host handed them over in `config`), so the exact secret values are known here
+	 * and masked out of URLs, headers, and bodies regardless of what the plugin sent.
+	 *
+	 * Attempt tracking mirrors the collector's model: a `dump.request` carrying
+	 * url/headers opens a new upstream attempt, and the first `dump.response` of an
+	 * attempt calls `beginResponseAttempt`, which archives the previous attempt into
+	 * `attempts[]` — so plugins that retry internally produce a faithful attempt list.
+	 */
+	private createDumpTap(
+		params: ChatParams,
+		chatParams: ProviderChatParams,
+	): ((event: DumpStreamEvent) => void) & { flush(): void } {
+		const noop = Object.assign(() => {}, { flush: () => {} });
+		const collector = params.requestDump;
+		if (!collector) return noop;
+
+		const maxBytes = chatParams.requestDump?.maxBytes ?? PLUGIN_REQUEST_DUMP_MAX_BYTES;
+		const secrets = collectSecretConfigValues(chatParams.config);
+		const mask = (text: string): string => maskSecretValues(text, secrets);
+		const maskHeaders = (
+			headers: Record<string, string> | undefined,
+		): Record<string, string> | undefined => {
+			const sanitized = sanitizeHeaders(headers);
+			if (!sanitized) return undefined;
+			return Object.fromEntries(
+				Object.entries(sanitized).map(([key, value]) => [key, mask(value)]),
+			);
+		};
+
+		interface PendingRequest {
+			transport?: string;
+			url?: string;
+			headers?: Record<string, string>;
+			body: BoundedUtf8Capture;
+			truncated: boolean;
+		}
+		let pendingRequest: PendingRequest | null = null;
+		let responseOpen = false;
+		let responseFailed = false;
+		let responseBody: BoundedUtf8Capture | null = null;
+
+		const buildRequest = (): NonNullable<ApiRequestDump["request"]> => {
+			const pending = pendingRequest;
+			const sanitizedBody = new BoundedUtf8Capture(maxBytes);
+			sanitizedBody.append(mask(pending?.body.text() ?? ""));
+			let bodyText = sanitizedBody.text();
+			if (
+				pending?.truncated ||
+				(pending && pending.body.received > pending.body.kept) ||
+				sanitizedBody.received > sanitizedBody.kept
+			) {
+				bodyText += "\n[request body truncated by plugin to fit the dump budget]";
+			}
+			let body: unknown = bodyText;
+			if (bodyText) {
+				try {
+					body = JSON.parse(bodyText);
+				} catch {
+					// Non-JSON bodies stay as raw text; the dump exists to show what was sent.
+				}
+			}
+			return {
+				transport: pending?.transport ?? "plugin",
+				...(pending?.url ? { url: pending.url } : {}),
+				...(pending?.headers ? { headers: pending.headers } : {}),
+				body,
+			};
+		};
+		const closeResponse = (complete: boolean): void => {
+			if (!responseOpen) return;
+			responseOpen = false;
+			// Mask the bounded concatenation, not each chunk: plugins choose arbitrary
+			// boundaries (including inside escaped secrets). Reset for EVERY retry.
+			if (responseBody) collector.appendResponseText(mask(responseBody.text()));
+			collector.finishResponseCapture(complete && !responseFailed);
+			if (responseBody)
+				collector.setResponseMeta({
+					bodyBytesReceived: responseBody.received,
+					...(responseBody.received > responseBody.kept ? { bodyTruncated: true } : {}),
+				});
+			responseBody = null;
+			responseFailed = false;
+		};
+		/** Preserve a request whose response never arrived before starting the next attempt. */
+		const preservePendingRequest = (): void => {
+			if (!pendingRequest) return;
+			collector.setRequest(buildRequest());
+			pendingRequest = null;
+		};
+
+		const tap = ((event: DumpStreamEvent): void => {
+			if (event.type === "dump.request") {
+				const opensAttempt =
+					event.transport !== undefined || event.url !== undefined || event.headers !== undefined;
+				if (opensAttempt) {
+					closeResponse(false);
+					preservePendingRequest();
+					pendingRequest = {
+						...(event.transport ? { transport: mask(event.transport) } : {}),
+						...(event.url ? { url: mask(event.url) } : {}),
+						...(event.headers ? { headers: maskHeaders(event.headers) } : {}),
+						body: new BoundedUtf8Capture(maxBytes),
+						truncated: false,
+					};
+				}
+				if (event.bodyChunk) pendingRequest?.body.append(event.bodyChunk);
+				if (event.truncated && pendingRequest) pendingRequest.truncated = true;
+				return;
+			}
+			// dump.response
+			if (!responseOpen) {
+				responseOpen = true;
+				responseFailed = false;
+				responseBody = new BoundedUtf8Capture(maxBytes);
+				collector.beginResponseAttempt(buildRequest(), maxBytes);
+				pendingRequest = null;
+				collector.setResponseMeta({
+					...(event.status !== undefined ? { status: event.status } : {}),
+					...(event.headers ? { headers: maskHeaders(event.headers) } : {}),
+				});
+			}
+			if (event.bodyChunk) responseBody?.append(event.bodyChunk);
+			if (event.error) {
+				responseFailed = true;
+				collector.setResponseError(mask(event.error));
+			}
+			if (event.final) closeResponse(!event.truncated);
+		}) as ((event: DumpStreamEvent) => void) & { flush(): void };
+		tap.flush = (): void => {
+			closeResponse(false);
+			preservePendingRequest();
+		};
+		return tap;
+	}
+
 	private async buildChatParams(params: ChatParams): Promise<ProviderChatParams> {
 		const history = canonicalHistory(params.history, this.activeReasoningSource);
 		const toolResults = params.toolResults
@@ -493,6 +661,20 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 				...(params.stickySessionKey ? { stickySessionKey: params.stickySessionKey } : {}),
 				...(params.resetUpstreamSession ? { resetUpstreamSession: true } : {}),
 			},
+			// The hint's presence doubles as protocol negotiation: a plugin may emit
+			// dump.request/dump.response events only for calls that carry it, so hosts
+			// predating those event types never receive one. `maxBytes` stays well below
+			// the per-operation RPC output budget that dump events share with real output.
+			...(params.requestDump
+				? {
+						requestDump: {
+							maxBytes: Math.min(
+								responseDumpBudget(settings.agent?.requestDumpMaxSize),
+								PLUGIN_REQUEST_DUMP_MAX_BYTES,
+							),
+						},
+					}
+				: {}),
 			request: {
 				history,
 				current: {

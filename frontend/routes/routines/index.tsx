@@ -65,6 +65,8 @@ import {
 	useDisconnectMcpServer,
 	useImportMcpServers,
 	useMcpServers,
+	useRefreshAllMcpServers,
+	useRefreshMcpServer,
 	useTestMcpConnection,
 	useUpdateMcpServer,
 } from "../../hooks/useMcp";
@@ -1942,6 +1944,8 @@ function McpToolsTab() {
 	const deleteMutation = useDeleteMcpServer();
 	const connectMutation = useConnectMcpServer();
 	const disconnectMutation = useDisconnectMcpServer();
+	const refreshMutation = useRefreshMcpServer();
+	const refreshAllMutation = useRefreshAllMcpServers();
 	const testMutation = useTestMcpConnection();
 
 	const [editOpened, { open: openEdit, close: closeEdit }] = useDisclosure(false);
@@ -2214,6 +2218,23 @@ function McpToolsTab() {
 					{t("mcpServersDesc")}
 				</Text>
 				<Group gap="xs">
+					<ActionIcon
+						variant="subtle"
+						size="sm"
+						disabled={!mcpServerManagementSupported}
+						loading={refreshAllMutation.isPending}
+						title={
+							mcpServerManagementSupported
+								? t("mcpRefreshAll")
+								: mcpServerManagementUnsupportedReason
+						}
+						onClick={() => {
+							if (!mcpServerManagementSupported) return;
+							refreshAllMutation.mutate();
+						}}
+					>
+						<IconRefresh size={14} />
+					</ActionIcon>
 					<Button
 						size="xs"
 						variant="subtle"
@@ -2349,6 +2370,27 @@ function McpToolsTab() {
 											<IconPlug size={14} />
 										</ActionIcon>
 									)}
+									{/* Refresh re-lists tools on the live connection (or reconnects a
+									    dead one). Available whenever management is: a disabled server
+									    reports an error rather than silently coming back up. */}
+									<ActionIcon
+										variant="subtle"
+										size="sm"
+										color="blue"
+										disabled={!mcpServerManagementSupported}
+										loading={refreshMutation.isPending}
+										title={
+											mcpServerManagementSupported
+												? t("mcpRefreshTools")
+												: mcpServerManagementUnsupportedReason
+										}
+										onClick={() => {
+											if (!mcpServerManagementSupported) return;
+											refreshMutation.mutate(server.id);
+										}}
+									>
+										<IconRefresh size={14} />
+									</ActionIcon>
 									<Button
 										variant="subtle"
 										size="compact-xs"

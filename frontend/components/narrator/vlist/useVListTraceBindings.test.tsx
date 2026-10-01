@@ -306,6 +306,44 @@ describe("useVListTraceBindings", () => {
 		expect(renderCounts.get(input.renderItems[1]?.measured)).toBe(1);
 	});
 
+	test("Bash bindings refresh folded and drilled actions when status or callbacks change", () => {
+		const detach = mock((_id: string) => {});
+		const replacement = mock((_id: string) => {});
+		let input = frame([group("bash", [traceItem("bash", "bash", "Bash")]), group("old")], {
+			onDetachBash: detach,
+		});
+		input.rowToolMetaIndex.set("bash", {
+			toolName: "Bash",
+			toolUseId: "bash",
+			isRunningBash: true,
+		});
+		const first = render(input);
+		expect(surface("message-bash").onDetachBash).toBe(detach);
+		expect(surface("message-bash").identity.tool).toMatchObject({
+			toolName: "Bash",
+			toolUseId: "bash",
+			isRunningBash: true,
+		});
+		first.get("bash")?.resolveRowToolActions("tool-bash")?.onDetachBash?.();
+		expect(detach).toHaveBeenCalledWith("bash");
+		input = freshFrame(input);
+		input.rowHandlers = { onDetachBash: replacement };
+		const changed = render(input);
+		expect(changed.get("bash")).not.toBe(first.get("bash"));
+		expect(changed.get("old")).toBe(first.get("old"));
+		expect(surface("message-bash").onDetachBash).toBe(replacement);
+		changed.get("bash")?.resolveRowToolActions("tool-bash")?.onDetachBash?.();
+		expect(replacement).toHaveBeenCalledWith("bash");
+		input = freshFrame(input);
+		input.rowToolMetaIndex.set("bash", { toolName: "Bash", toolUseId: "bash" });
+		const completed = render(input);
+		expect(completed.get("bash")).not.toBe(changed.get("bash"));
+		expect(completed.get("old")).toBe(first.get("old"));
+		expect(surface("message-bash").onDetachBash).toBeUndefined();
+		expect(surface("message-bash").identity.tool?.isRunningBash).toBeUndefined();
+		expect(completed.get("bash")?.resolveRowToolActions("tool-bash")?.onDetachBash).toBeUndefined();
+	});
+
 	test("drilled card opens the current child and lifecycle capabilities follow live meta", () => {
 		const open = mock((_id: string) => {});
 		const detach = mock((_id: string) => {});

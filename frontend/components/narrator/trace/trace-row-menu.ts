@@ -41,6 +41,8 @@ export interface TraceRowSubagentHandlers {
 	onViewSubagentSession?: (narratorId: string) => void;
 	/** Detach a running subagent to a background task. */
 	onDetachSubagent?: (narratorId: string) => void;
+	/** Detach a running foreground Bash tool call. */
+	onDetachBash?: (toolUseId: string) => void;
 	/** Cancel a background subagent task. */
 	onCancelBackgroundTask?: (narratorId: string) => void;
 	/**

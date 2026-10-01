@@ -46,6 +46,14 @@ function makeManager(): { manager: McpManagerLike; calls: string[] } {
 			disconnect: async (id) => {
 				calls.push(`disconnect:${id}`);
 			},
+			refresh: async (id) => {
+				calls.push(`refresh:${id}`);
+				return { ok: true, toolCount: 1 };
+			},
+			refreshAll: async () => {
+				calls.push("refreshAll");
+				return [{ serverId: "s1", name: "demo", ok: true, toolCount: 1 }];
+			},
 			testConnection: async () => ({ ok: true, tools: [{ name: "test-tool" }] }),
 		},
 	};
@@ -199,5 +207,61 @@ describe("McpAdmin tool", () => {
 		expect(settings.mcpServers).toHaveLength(0);
 		expect(settings.saved).toBe(0);
 		expect(calls.some((c) => c.startsWith("connect"))).toBe(false);
+	});
+
+	test("refresh re-fetches one server's tools after approval", async () => {
+		const { manager, calls } = makeManager();
+		const settings = makeSettings([{ id: "s1", name: "demo", transport: "stdio", enabled: true }]);
+		const tool = createMcpAdminTool({ manager, settings, isAdminUser: () => true });
+		let permissionRequested = false;
+
+		const result = await tool.execute(
+			{ action: "refresh", id: "s1" },
+			makeCtx({
+				onPermission: () => {
+					permissionRequested = true;
+				},
+			}),
+		);
+		expect(permissionRequested).toBe(true);
+		expect(result.isError).toBeFalsy();
+		expect(result.title).toContain("refreshed");
+		expect(calls).toEqual(["refresh:s1"]);
+		// Refresh must not rewrite the persisted connection intent.
+		expect(settings.saved).toBe(0);
+		expect(result.output).toContain('"ok": true');
+	});
+
+	test("refresh without id refreshes every enabled server", async () => {
+		const { manager, calls } = makeManager();
+		const settings = makeSettings([{ id: "s1", name: "demo", transport: "stdio", enabled: true }]);
+		const tool = createMcpAdminTool({ manager, settings, isAdminUser: () => true });
+
+		const result = await tool.execute({ action: "refresh" }, makeCtx());
+		expect(result.isError).toBeFalsy();
+		expect(calls).toEqual(["refreshAll"]);
+		expect(result.output).toContain('"refreshed": 1');
+	});
+
+	test("refresh of an unknown server is an error", async () => {
+		const { manager, calls } = makeManager();
+		const settings = makeSettings();
+		const tool = createMcpAdminTool({ manager, settings, isAdminUser: () => true });
+
+		const result = await tool.execute({ action: "refresh", id: "nope" }, makeCtx());
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("not found");
+		expect(calls).toEqual([]);
+	});
+
+	test("refresh is denied for non-admin users", async () => {
+		const { manager, calls } = makeManager();
+		const settings = makeSettings([{ id: "s1", name: "demo", transport: "stdio", enabled: true }]);
+		const tool = createMcpAdminTool({ manager, settings, isAdminUser: () => false });
+
+		const result = await tool.execute({ action: "refresh", id: "s1" }, makeCtx());
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("administrators");
+		expect(calls).toEqual([]);
 	});
 });

@@ -149,6 +149,7 @@ interface RenderOpts {
 	withMessageActions?: boolean;
 	onViewSubagentSession?: (narratorId: string) => void;
 	onDetachSubagent?: (narratorId: string) => void;
+	onDetachBash?: (toolUseId: string) => void;
 	onCancelBackgroundTask?: (narratorId: string) => void;
 }
 
@@ -176,6 +177,7 @@ async function renderRow(opts: RenderOpts = {}) {
 						toolDetailRef={opts.toolDetailRef}
 						onViewSubagentSession={opts.onViewSubagentSession}
 						onDetachSubagent={opts.onDetachSubagent}
+						onDetachBash={opts.onDetachBash}
 						onCancelBackgroundTask={opts.onCancelBackgroundTask}
 					>
 						<div>row title</div>
@@ -343,6 +345,34 @@ describe("TraceRowInteraction — subagent session gating (no per-row query)", (
  * subagent items the expanded SubagentCard offers. Gating below mirrors
  * SubagentCard.tsx's menu exactly.
  */
+describe("TraceRowInteraction — Bash detachment", () => {
+	test("dispatches live Bash to its tool id and not a child narrator", async () => {
+		const detach = mock((_id: string) => {});
+		await renderRow({
+			tool: { toolName: "Bash", toolUseId: "bash-1", isRunningBash: true },
+			onDetachBash: detach,
+			onDetachSubagent: detachSubagentMock,
+		});
+		expect(menuLabels()).toContain("detachToBackground");
+		clickMenuItem("detachToBackground");
+		expect(detach).toHaveBeenCalledWith("bash-1");
+		expect(detachSubagentMock).not.toHaveBeenCalled();
+	});
+	test("hides detach for inactive Bash, absent callback, and Agent/Send rows", async () => {
+		for (const tool of [
+			{ toolName: "Bash", toolUseId: "bash-1" },
+			{ toolName: "Bash", isRunningBash: true },
+			{ toolName: "Send", toolUseId: "send-1", isRunningBash: true },
+			{ toolName: "Agent", toolUseId: "agent-1", isRunningBash: true },
+		]) {
+			await renderRow({ tool, onDetachBash: () => {} });
+			expect(menuLabels()).not.toContain("detachToBackground");
+		}
+		await renderRow({ tool: { toolName: "Bash", toolUseId: "bash-1", isRunningBash: true } });
+		expect(menuLabels()).not.toContain("detachToBackground");
+	});
+});
+
 describe("TraceRowInteraction — subagent card items (Agent / Task / Send rows)", () => {
 	const running = {
 		toolName: "Agent",

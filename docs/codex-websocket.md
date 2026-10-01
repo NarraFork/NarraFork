@@ -29,9 +29,10 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
   - `Origin`：官方域名下为 `https://chatgpt.com`，否则为 `baseUrl`
   - `OpenAI-Beta: responses_websockets=2026-02-06`
   - `session-id` / `thread-id`：同取 `conversationId`
-  - `x-client-request-id`：同取 `conversationId`。**仅 WS 握手发送**——codex-rs 全仓只有
-    `build_websocket_headers` 写这个头，HTTP `/responses` 与 `/responses/compact` 都不发，
-    因此它不在 `buildCodexEmulationHeaders`（HTTP/WS 共用的身份层）里，由本传输自己设置
+  - `x-client-request-id`：同取 `conversationId`。codex-rs 在 HTTP `/responses`
+    （codex-api/src/endpoint/responses.rs，与 `build_session_headers` 同处）和 WS 握手
+    （`build_websocket_headers`）都发送它，只有 `/responses/compact` 不发。因此它由
+    `buildCodexEmulationHeaders`（HTTP/WS 共用的身份层）统一投影，本传输再写入同值
   - `x-codex-window-id`：由 `conversationId` 确定性派生（见 `deriveCodexWindowId`）
   - **不发送** `x-codex-installation-id` 直接头：codex-rs 的 `compatibility_headers()`
     只投影 window-id / session-id / thread-id / turn-metadata / parent-thread / subagent，
@@ -46,7 +47,7 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
   上游 `build_websocket_headers` 显式传 `/*turn_state*/ None`，并在 WS 的 `client_metadata`
   里注入该 token；只有 HTTP 路径才把它作为请求头发送
 - **不发送** `x-openai-internal-codex-responses-lite`：该头不是身份标记，而是一份请求体契约的一半。真实客户端由模型目录里的 `ModelInfo.use_responses_lite` 驱动，置位时同时做四件事——省略顶层 `instructions` 与 `tools`、把 `additional_tools` 与 developer 指令消息插到 `input` 最前、`parallel_tool_calls: false`、再加这个头。上游会校验这对配对关系，只要 `tools` 里出现 hosted 工具（如 `web_search` / `image_generation`）就返回 400：`X-OpenAI-Internal-Codex-Responses-Lite only supports function tools, custom tools, and client-executed tool search.`。NarraFork 发送的是经典非 lite 请求体，因此不声明 lite；`stripResponsesLiteHeader` 会把用户 `extraHeaders` 里塞进来的该头也去掉。
-- 请求体：`{ type: "response.create", ...ResponsesRequestBody }`，包含稳定的 `client_metadata`、`prompt_cache_key`、`tool_choice: "auto"`、`parallel_tool_calls: false`、`reasoning.summary: "auto"`（非 lite 形态省略 `reasoning.context`，与 codex-rs 0.146.0 一致）与 `text.verbosity: "low"`，`client_metadata` 含会话稳定的 `x-codex-window-id`，以及拿到 turn state 之后的 `x-codex-turn-state`
+- 请求体：`{ type: "response.create", ...ResponsesRequestBody }`，包含稳定的 `client_metadata`、`prompt_cache_key`、`tool_choice: "auto"`、`parallel_tool_calls: false`、`reasoning.summary: "auto"`（非 lite 形态省略 `reasoning.context`，与 codex-rs 0.159.2 一致）与 `text.verbosity: "low"`，`client_metadata` 含会话稳定的 `x-codex-window-id`，以及拿到 turn state 之后的 `x-codex-turn-state`
 - 增量续写复用判定（`requestWithoutInput`）**排除 `client_metadata`**：该字段带有随请求变化的运行时值
   （尤其是 `x-codex-turn-state`），若参与比较，首个响应之后的每个请求都会被判定为「不同请求」，
   从而静默退化成全量重发并丢失 prompt cache。codex-rs 的

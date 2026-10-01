@@ -188,6 +188,47 @@ describe("tool row identity", () => {
 	});
 });
 
+describe("traceRowToolMeta — Bash detachment", () => {
+	test("exposes only live foreground Bash commands", () => {
+		for (const status of [
+			"running",
+			"executing",
+			"pending",
+			"permission",
+			"success",
+			"cancelled",
+			undefined,
+		]) {
+			const meta = traceRowToolMeta({
+				toolName: "Bash",
+				toolUseId: "bash-1",
+				status,
+				inputJson: { command: "build" },
+			});
+			expect(!!meta.isRunningBash).toBe(status === "running" || status === "executing");
+		}
+		for (const inputJson of [
+			{ stop: "task" },
+			{ command: "build", stop: "task" },
+			{ command: "build", run_in_background: true },
+			{ command: "build", background: true },
+			{},
+		]) {
+			expect(
+				traceRowToolMeta({ toolName: "Bash", status: "running", inputJson }).isRunningBash,
+			).toBeUndefined();
+		}
+		expect(
+			traceRowToolMeta({
+				toolName: "Bash",
+				status: "running",
+				inputJson: { command: "build" },
+				_metadata: { background_task_id: "task", detached: true },
+			}).isRunningBash,
+		).toBeUndefined();
+	});
+});
+
 describe("traceRowToolMeta — subagent lifecycle facts", () => {
 	test("reads the child narrator id from the embedded activity summary", () => {
 		const meta = traceRowToolMeta({
