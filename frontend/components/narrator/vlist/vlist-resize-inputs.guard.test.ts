@@ -1,230 +1,203 @@
 /**
- * vlist-resize-inputs.guard.test.ts — Nothing may reach the layout build at pixel
- * resolution during a resize.
- *
- * This guard exists because the same bug shipped twice under two different
- * explanations. The width path was gated (deferred behind the pointer), but
- * `viewportHeight` was ALSO a build option and ALSO a dependency of the rebuild
- * effect — and a sash drag changes both dimensions, so every frame of height change
- * re-measured the whole document and the width gate did nothing. Counted against
- * the real coordinator over an 80-frame drag at 4000 messages:
- *
- *     height raw       → 80 rebuilds, 1267ms
- *     height bucketed  →  2 rebuilds,   35ms
- *
- * The failure is invisible to unit tests on the pure helpers (they all pass either
- * way) and to a rendering test (which cannot tell a fast rebuild from a skipped
- * one). It is a WIRING property, so it is asserted on the wiring.
+ * Full-build inputs stay committed/bucketed while the production controller previews
+ * the bounded live window. Behaviour lives in vlist-live-resize.test.ts; these guards
+ * assert the shell -> controller -> document ownership that pure tests cannot see.
  */
-
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import { shellSource } from "./guard-source";
+import { readVlistFile, shellModule, shellSource } from "./guard-source";
 import { sliceBracketedRegion } from "./source-slice";
 
-const VLIST_DIR = import.meta.dir;
-
-function read(relativePath: string): string {
-	return readFileSync(join(VLIST_DIR, relativePath), "utf8");
+function region(source: string, anchor: string): string {
+	const result = sliceBracketedRegion(source, anchor);
+	if (result === null) throw new Error(`Production resize region not found: ${anchor}`);
+	return result;
 }
 
-/**
- * The `usePretextDocument({...})` call's option object in the shell.
- *
- * Brace-matched, NOT cut at a hardcoded `"\n\t});"`: that sentinel assumed the
- * call sits at one tab of indentation, so re-indenting the shell made this guard
- * fail for a reason that has nothing to do with viewport buckets (see
- * source-slice.ts).
- */
-function documentHookOptions(source: string): string {
-	const region = sliceBracketedRegion(source, "usePretextDocument(narratorId, {");
-	if (region === null) throw new Error("usePretextDocument(narratorId, { … }) call not found");
-	return region;
+function documentHookOptions(): string {
+	return region(shellModule("PretextExactMessageList.tsx"), "usePretextDocument(narratorId, {");
 }
 
-describe("resize inputs cannot reach the layout at pixel resolution", () => {
-	it("passes a BUCKETED viewport height to the document hook, never the raw state", () => {
-		const options = documentHookOptions(read("PretextExactMessageList.tsx"));
-		// The bucketed value must be what is handed over...
+function resizeOptions(): string {
+	return region(shellModule("PretextExactMessageList.tsx"), "createVListResizeController({");
+}
+
+function controller(): string {
+	return readVlistFile("vlist-live-resize.ts");
+}
+
+// Negative assertions cover the shell's whole module set plus the document bridge.
+// The self-check below verifies that both extracted resize paths remain in that set.
+function resizeSources(): string {
+	return [
+		shellSource(),
+		readVlistFile("usePretextDocument.ts"),
+		readVlistFile("pretext-layout-coordinator.ts"),
+	].join("\n");
+}
+
+describe("resize inputs cannot reach the full layout at pixel resolution", () => {
+	it("passes a BUCKETED committed height to the document hook, never the raw state", () => {
+		const options = documentHookOptions();
 		expect(options).toMatch(/viewportHeight:\s*layoutViewportHeight/);
-		// ...and the raw state variable must not be, in any shorthand or explicit form.
-		expect(options).not.toMatch(/viewportHeight:\s*viewportHeight\b/);
+		expect(options).not.toMatch(/viewportHeight:\s*(?:viewportHeight|layoutHeight)\b/);
 		expect(options).not.toMatch(/^\s*viewportHeight,\s*$/m);
 	});
 
-	it("derives the layout height through bucketViewportHeight", () => {
-		const source = read("PretextExactMessageList.tsx");
+	it("buckets layoutHeight, not the exact live viewportHeight", () => {
+		const source = shellModule("PretextExactMessageList.tsx");
 		expect(source).toMatch(
-			/const\s+layoutViewportHeight\s*=\s*bucketViewportHeight\(\s*viewportHeight\s*\)/,
+			/const\s+layoutViewportHeight\s*=\s*bucketViewportHeight\(\s*layoutHeight\s*\)/,
+		);
+		expect(source).not.toMatch(/bucketViewportHeight\(\s*viewportHeight\s*\)/);
+	});
+
+	it("keeps using the EXACT height for the mounted window", () => {
+		expect(shellModule("PretextExactMessageList.tsx")).toMatch(
+			/resolveVisibleWindow\(\s*exactLayout,\s*scrollTop,\s*viewportHeight/,
 		);
 	});
 
-	// The exact height is still required for virtualization, anchoring and
-	// bottom-pinning. If those started reading the bucketed value the mounted window
-	// would be wrong by up to a bucket, so the raw state must remain in use.
-	it("keeps using the EXACT height for the mounted window", () => {
-		const source = read("PretextExactMessageList.tsx");
-		expect(source).toMatch(/resolveVisibleWindow\(\s*exactLayout,\s*scrollTop,\s*viewportHeight/);
-	});
-
 	it("keeps using the EXACT height for scroll anchoring", () => {
-		const source = read("PretextExactMessageList.tsx");
-		// readCurrentView feeds captureCoordinatorAnchor.
-		expect(source).toMatch(/viewportHeight:\s*node\?\.clientHeight\s*\?\?\s*viewportHeightRef/);
+		expect(shellModule("PretextExactMessageList.tsx")).toMatch(
+			/viewportHeight:\s*node\?\.clientHeight\s*\?\?\s*viewportHeightRef/,
+		);
 	});
 
-	// A width write outside the settle decision would re-open the original bug.
-	//
-	// TWO writes are legitimate, and only two:
-	//   1. the FIRST measurement, which is not a change but this list learning its
-	//      width. Deferring it made the placeholder paint a frame at the sentinel
-	//      geometry and jump 140ms later (the mount-time width step).
-	//   2. the settle decision's commit branch, which owns every subsequent change.
-	// Anything else — a raw write from an observer callback, an effect, a prop — is
-	// what the gate exists to prevent, so each write is matched to one of the two
-	// sanctioned guards rather than merely counted.
-	it("commits contentWidth only from the first measurement or the settle decision", () => {
-		const source = read("PretextExactMessageList.tsx");
-		const applyWidthIndex = source.indexOf("const applyWidth = (trigger: WidthSettleTrigger)");
-		expect(applyWidthIndex).toBeGreaterThan(-1);
-		const writes = [...source.matchAll(/setContentWidth\(/g)];
-		expect(writes.length).toBe(2);
-		for (const write of writes) {
-			// Every write lives in the resize handler, never in a render path or effect.
-			expect(write.index).toBeGreaterThan(applyWidthIndex);
-			// Which branch a write sits in is decided by its NEAREST preceding guard, so
-			// this needs no window constant to tune (and cannot pass merely because a
-			// guard appears somewhere far above an ungated write).
-			const before = source.slice(0, write.index);
-			const sentinelAt = before.lastIndexOf("committedContentWidthRef.current === 0");
-			const commitAt = before.lastIndexOf("decision.commit");
-			expect(Math.max(sentinelAt, commitAt)).toBeGreaterThan(applyWidthIndex);
+	it("publishes global contentWidth only from onInitial and onCommit", () => {
+		const options = resizeOptions();
+		const callbacks = ["onInitial", "onCommit"].map((name) =>
+			region(options, `${name}: ({ width, height }) => {`),
+		);
+		for (const callback of callbacks) {
+			expect(callback.match(/setContentWidth\s*\(/g)).toHaveLength(1);
+			expect(callback).toMatch(/committedContentWidthRef\.current\s*=\s*width\s*;/);
+			expect(callback).toMatch(/setContentWidth\(width\)/);
 		}
-		// And the two writes belong to DIFFERENT branches: one first-measurement, one
-		// settled. Both landing in the same branch would mean a guard went missing.
-		const nearestGuard = (index: number) => {
-			const before = source.slice(0, index);
-			return before.lastIndexOf("committedContentWidthRef.current === 0") >
-				before.lastIndexOf("decision.commit")
-				? "first-measurement"
-				: "settled";
-		};
-		expect(writes.map((w) => nearestGuard(w.index)).sort()).toEqual([
-			"first-measurement",
-			"settled",
-		]);
+		// Each of the two writes is positively owned above, and there are no others
+		// in any shell sibling or extracted production resize module.
+		expect(resizeSources().match(/setContentWidth\s*\(/g)).toHaveLength(2);
+		expect(resizeSources().match(/committedContentWidthRef\.current\s*=/g)).toHaveLength(2);
 	});
 
-	// The first-measurement fast path must stay SYNCHRONOUS with the layout effect's
-	// own measure pass, or the sentinel geometry gets painted for a frame after all.
-	it("commits the first measurement before consulting the settle decision", () => {
-		const source = read("PretextExactMessageList.tsx");
-		const effect = source.slice(source.indexOf("const applyWidth = (trigger: WidthSettleTrigger)"));
-		const sentinelIndex = effect.indexOf("committedContentWidthRef.current === 0");
-		const decisionIndex = effect.indexOf("resolveWidthSettle({");
-		expect(sentinelIndex).toBeGreaterThan(-1);
-		expect(decisionIndex).toBeGreaterThan(-1);
-		expect(sentinelIndex).toBeLessThan(decisionIndex);
+	it("keeps preview out of global width and full-build height state", () => {
+		const preview = region(resizeOptions(), "onPreview: ({ width, height }) => {");
+		expect(preview.match(/setViewportHeight\s*\(/g)).toHaveLength(1);
+		expect(preview).toMatch(/setViewportHeight\(height\)/);
+		expect(preview).toMatch(/return\s+pretextDocumentRef\.current\.previewWidth\(width\)/);
+		expect(preview).not.toMatch(/setContentWidth|setLayoutHeight|setWidthCommitEpoch/);
+		expect(preview).not.toMatch(/committedContentWidthRef\.current\s*=/);
 	});
 
-	// The sentinel itself: a plausible starting width is what made the placeholder
-	// paint an 860px centered column on every mount, whatever the reader's
-	// preference. 0 cannot be mistaken for a measurement.
 	it("starts from an unmeasured sentinel, not a plausible width", () => {
-		const source = read("PretextExactMessageList.tsx");
+		const source = shellModule("PretextExactMessageList.tsx");
 		expect(source).toMatch(/const\s*\[contentWidth,\s*setContentWidth\]\s*=\s*useState\(0\)/);
 		expect(source).toMatch(/const\s+committedContentWidthRef\s*=\s*useRef\(0\)/);
 	});
 
-	it("gates the resize handler through resolveWidthSettle", () => {
-		const source = read("PretextExactMessageList.tsx");
-		expect(source).toContain("resolveWidthSettle({");
-		expect(source).toMatch(/pointerDown:\s*pointerTracker\.isDown\(\)/);
+	it("initializes synchronously on the controller observer path before settle or preview", () => {
+		const source = controller();
+		const evaluate = region(source, "function evaluate(trigger: WidthSettleTrigger): void {");
+		const initial = region(evaluate, 'if (trigger === "observer" && committedWidth === 0) {');
+		expect(evaluate).toMatch(/const\s+committedWidth\s*=\s*options\.getCommittedWidth\(\)/);
+		expect(initial).toMatch(/options\.onInitial\(size\);\s*return;/);
+		expect(initial).not.toMatch(/setTimer|requestFrame|resolveWidthSettle|onPreview|preview\(/);
+		expect(evaluate.indexOf(initial)).toBeLessThan(evaluate.indexOf("resolveWidthSettle({"));
+		expect(source).toMatch(/observe:\s*\(\)\s*=>\s*evaluate\("observer"\)/);
 	});
 
-	// The OUTER-BOX measurement, without which a gesture-free host resize (a dock panel
-	// toggled from a button) is indistinguishable from scrollbar feedback — the ring
-	// filled with the panel's two widths and pinned the column from the FIFTH toggle
-	// onwards, permanently, because `gesture-end` was its only reset.
-	//
-	// A wiring guard because the pure-function tests pass either way: the exemption is
-	// only reachable if the shell actually measures and threads both widths.
-	it("threads the outer box width into the settle decision", () => {
-		const source = read("PretextExactMessageList.tsx");
-		const call = source.slice(
-			source.indexOf("resolveWidthSettle({"),
-			source.indexOf("});", source.indexOf("resolveWidthSettle({")),
+	it("reads the LIVE pointer in the shell and controller settle path", () => {
+		expect(resizeOptions()).toMatch(/pointerDown:\s*\(\)\s*=>\s*pointerTracker\.isDown\(\)/);
+		const call = region(controller(), "resolveWidthSettle({");
+		// Capture-phase release is explicitly final even before the tracker clears.
+		expect(call).toMatch(
+			/pointerDown:\s*trigger\s*===\s*"gesture-end"\s*\?\s*false\s*:\s*options\.pointerDown\(\)/,
 		);
-		expect(call).toMatch(/boxWidth[,:]/);
+		expect(call).toMatch(/hasPendingPreview:\s*pending\b/);
+	});
+
+	it("threads node.offsetWidth through readSize into the controller settle decision", () => {
+		const readSize = region(resizeOptions(), "readSize: () => ({");
+		expect(readSize).toMatch(/width:\s*resolveNarratorColumnWidth\(node\.clientWidth,/);
+		expect(readSize).toMatch(/boxWidth:\s*node\.offsetWidth\b/);
+		expect(readSize).not.toMatch(/boxWidth:\s*node\.clientWidth\b/);
+		const evaluate = region(controller(), "function evaluate(trigger: WidthSettleTrigger): void {");
+		expect(evaluate).toMatch(/const\s+size\s*=\s*options\.readSize\(\)/);
+		const call = region(evaluate, "resolveWidthSettle({");
+		expect(call).toMatch(/boxWidth:\s*size\.boxWidth/);
 		expect(call).toMatch(/committedBoxWidth[,:]/);
-		// Measured from the OUTER box. `clientWidth` excludes the scrollbar, so reading
-		// it here would make feedback look like a host resize and release the guard on
-		// exactly the loop it bounds.
-		expect(source).toMatch(/const\s+boxWidth\s*=\s*node\.offsetWidth\s*;/);
 	});
 
-	// A host resize must also RESET the cycle history, not merely bypass the guard once:
-	// leaving the alternation in the ring would pin the very next toggle instead.
-	it("clears the cycle history on a host resize as well as a gesture", () => {
-		const source = read("PretextExactMessageList.tsx");
-		const effect = source.slice(source.indexOf("const applyWidth = (trigger: WidthSettleTrigger)"));
-		const commitIndex = effect.indexOf("if (decision.commit) {");
-		expect(commitIndex).toBeGreaterThan(-1);
-		const branch = effect.slice(commitIndex, effect.indexOf("\t\t\treturn;", commitIndex));
-		expect(branch).toMatch(/isExternalGeometryChange\(\s*boxWidth\s*,\s*committedBoxWidth\s*\)/);
-		expect(branch).toMatch(/trigger\s*===\s*"gesture-end"\s*\|\|\s*externalGeometry/);
-		// And the reference the next comparison reads must advance with the commit, or
-		// every later frame would keep reporting the same resize as still external.
-		expect(branch).toMatch(/committedBoxWidth\s*=\s*boxWidth\s*;/);
-	});
-
-	// INVERTED from an earlier version of this guard, which REQUIRED cost inputs.
-	//
-	// Two cost predictors were tried and both silently disabled the freeze:
-	//   - `lastBuildMs > 12ms` timed the measurement pass only. A realistic window
-	//     measures ~2ms, so every real session looked "cheap" and committed per frame
-	//     while its ~1600 mounted DOM nodes were rebuilt on each one.
-	//   - `mountedRowCount > 12` ignored that a row's cost varies ~30x with content
-	//     (prose ~60 DOM units, code ~22, a one-line card ~2), so two panels either
-	//     side of a splitter landed on opposite sides of the threshold — one froze, the
-	//     other did not, which is exactly what the user saw.
-	//
-	// The decision now takes no cost input at all. This guard keeps one from creeping
-	// back in, because the failure mode is silent: the gate still exists, still looks
-	// wired, and simply never engages.
-	it("passes NO cost estimate to the settle decision", () => {
-		const source = read("PretextExactMessageList.tsx");
-		const call = source.slice(
-			source.indexOf("resolveWidthSettle({"),
-			source.indexOf("});", source.indexOf("resolveWidthSettle({")),
+	it("clears controller feedback history on host commits and gesture release", () => {
+		const source = controller();
+		const commit = region(source, "if (decision.commit) {");
+		const reset = region(
+			commit,
+			'if (trigger === "gesture-end" || isExternalGeometryChange(size.boxWidth, committedBoxWidth)) {',
 		);
+		expect(reset).toMatch(/recentCommittedWidths\s*=\s*\[\]\s*;/);
+		expect(commit).toMatch(/committedBoxWidth\s*=\s*size\.boxWidth\s*;/);
+		expect(commit).toMatch(/pushCommittedWidth\(recentCommittedWidths,\s*size\.width\)/);
+		expect(commit).toContain("options.onCommit(size)");
+		const release = region(source, "release: () => {");
+		expect(release).toMatch(/evaluate\("gesture-end"\)/);
+		expect(release).toMatch(/if\s*\(!disposed\)\s*recentCommittedWidths\s*=\s*\[\]/);
+	});
+
+	it("passes NO cost estimate to the production settle decision", () => {
+		const call = region(controller(), "resolveWidthSettle({");
 		expect(call.length).toBeGreaterThan(40);
-		expect(call).not.toContain("lastBuildMs");
-		expect(call).not.toContain("mountedRowCount");
-		expect(call).not.toMatch(/Budget|budget|cost|Cost/);
-		// Only the four inputs the decision actually takes (shorthand or explicit).
+		expect(call).not.toMatch(/lastBuildMs|mountedRowCount|Budget|budget|cost|Cost/);
 		for (const field of ["nextWidth", "committedWidth", "trigger", "pointerDown"]) {
 			expect(call).toMatch(new RegExp(`${field}[,:]`));
 		}
 	});
 
-	// Read across the shell's WHOLE module set, not just its entry file. A negative
-	// assertion scoped to one file stops guarding the moment the thing it forbids can
-	// live next door: a cost-tracking ref in an extracted sibling would satisfy this
-	// rule while reintroducing exactly the predictor it exists to keep out — and
-	// nothing would go red, which is worse than having no guard at all.
-	it("keeps no cost-tracking refs anywhere in the shell", () => {
-		const source = shellSource();
+	it("keeps no cost-tracking refs anywhere in the shell or new resize modules", () => {
+		const source = resizeSources();
 		expect(source).not.toContain("lastBuildMsRef");
 		expect(source).not.toContain("mountedRowCountRef");
 	});
 
-	// Guard self-check: the extractor must actually find the option block, or every
-	// assertion above would vacuously pass on an empty string.
-	it("guard self-check: the option block is located and non-trivial", () => {
-		const options = documentHookOptions(read("PretextExactMessageList.tsx"));
-		expect(options.length).toBeGreaterThan(200);
-		expect(options).toContain("contentWidth");
+	it("full-build width and dependencies consume committed state, never preview width", () => {
+		const options = documentHookOptions();
+		expect(options).toMatch(/widthBucket:\s*String\(Math\.round\(contentWidth\)\)/);
+		expect(options).toMatch(/^\s*contentWidth,\s*$/m);
+		expect(options).not.toMatch(/resizeWidth|displayContentWidth|previewWidth/);
+		const build = region(
+			readVlistFile("usePretextDocument.ts"),
+			"const buildOptions = useMemo<PretextLayoutBuildOptions>(",
+		);
+		expect(build).toMatch(/contentWidth:\s*options\.contentWidth/);
+		expect(build).toMatch(/^\s*options\.contentWidth,\s*$/m);
+		expect(build).not.toMatch(/resizeWidth|resizeRevision|resizePreview|previewWidth|scrollTop/);
+	});
+
+	it("preview reflows existing specs without full adaptation or a full layout build", () => {
+		const source = readVlistFile("pretext-layout-coordinator.ts");
+		const start = source.indexOf("\tpreviewWidth(");
+		expect(start).toBeGreaterThan(-1);
+		const preview = region(source.slice(start), "): boolean {");
+		expect(preview).toContain("previewResize({");
+		expect(preview).toMatch(/items:\s*current\.items/);
+		expect(preview).toMatch(/measure:\s*measureElementCached/);
+		const paths = [preview, readVlistFile("vlist-resize-preview.ts")].join("\n");
+		expect(paths).not.toMatch(
+			/\b(?:buildPretext(?:DocumentLayout|LayoutManifest|EngineLayout)|compute(?:Pretext)?VListLayout|buildLayout|rebuild|adaptSegments|segmentMessages|groupRenderUnits)\s*\(/,
+		);
+		expect(paths).not.toMatch(
+			/from\s*["'][^"']*(?:segment-adapter|message-segments|pretext-document-layout|pretext-layout-manifest)["']/,
+		);
+		expect(paths).not.toMatch(/lastBuildOptions\s*=|lastBuildOptions\.contentWidth\s*=/);
+	});
+
+	it("guard self-check: shell and extracted production option blocks are non-trivial", () => {
+		expect(documentHookOptions().length).toBeGreaterThan(200);
+		expect(documentHookOptions()).toContain("contentWidth");
+		expect(resizeOptions()).toContain("onPreview:");
+		expect(controller()).toContain("export function createVListResizeController(");
+		for (const path of ["vlist-live-resize.ts", "vlist-resize-preview.ts"]) {
+			expect(shellSource()).toContain(`/* ==== guard-source: ${path} ==== */`);
+			expect(shellSource()).toContain(readVlistFile(path));
+		}
 	});
 });

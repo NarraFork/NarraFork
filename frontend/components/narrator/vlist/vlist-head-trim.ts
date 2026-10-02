@@ -279,7 +279,7 @@ function oldestSeqOf(messages: readonly TrimCandidate[]): number | null {
  * rather than trusting it.
  */
 export function retainKeysInPlace(
-	caches: readonly Map<string, unknown>[],
+	caches: readonly Pick<Map<string, unknown>, "size" | "keys" | "delete">[],
 	liveKeys: ReadonlySet<string>,
 ): number {
 	let removed = 0;

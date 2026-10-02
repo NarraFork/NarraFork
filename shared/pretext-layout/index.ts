@@ -140,6 +140,66 @@ function normalizeMetrics(metrics: PretextLayoutMetrics): PretextLayoutMetrics {
 	};
 }
 
+interface PretextLayoutIdentityLookup {
+	itemIndexForKey(itemKey: string): number | undefined;
+	itemIndicesForSourceSeq: PretextLayoutIndex["itemIndicesForSourceSeq"];
+	itemIndicesForSourceMessageId: PretextLayoutIndex["itemIndicesForSourceMessageId"];
+}
+
+// Every snapshot shares identity/source lookup state, never a chain of previous snapshots.
+const identityLookups = new WeakMap<PretextLayoutIndex, PretextLayoutIdentityLookup>();
+
+function createPretextLayoutIndex(
+	manifest: PretextLayoutManifest,
+	itemStarts: readonly number[],
+	itemEnds: readonly number[],
+	totalHeight: number,
+	identity: PretextLayoutIdentityLookup,
+): PretextLayoutIndex {
+	const { items, metrics } = manifest;
+	const itemIndexAtOffset = (offset: number): number => {
+		if (items.length === 0) return -1;
+		const target = Math.min(Math.max(offset, 0), Math.max(0, totalHeight - 1));
+		let low = 0;
+		let high = itemStarts.length - 1;
+		while (low <= high) {
+			const middle = (low + high) >> 1;
+			const start = itemStarts[middle] ?? 0;
+			const end = itemEnds[middle] ?? start;
+			if (target < start) high = middle - 1;
+			else if (target >= end && middle < itemStarts.length - 1) low = middle + 1;
+			else return middle;
+		}
+		return Math.min(Math.max(low, 0), itemStarts.length - 1);
+	};
+	const itemStart = (itemIndex: number): number => {
+		if (items.length === 0) return metrics.topPadding;
+		return itemStarts[Math.min(Math.max(itemIndex, 0), items.length - 1)] ?? metrics.topPadding;
+	};
+	const itemEnd = (itemIndex: number): number => {
+		if (items.length === 0) return metrics.topPadding;
+		return itemEnds[Math.min(Math.max(itemIndex, 0), items.length - 1)] ?? metrics.topPadding;
+	};
+	const index: PretextLayoutIndex = {
+		manifest,
+		itemStarts,
+		itemEnds,
+		totalHeight,
+		itemIndexAtOffset,
+		itemStart,
+		itemEnd,
+		itemByKey: (itemKey) => {
+			const itemIndex = identity.itemIndexForKey(itemKey);
+			const item = itemIndex === undefined ? undefined : items[itemIndex];
+			return item && itemIndex !== undefined ? { item, index: itemIndex } : undefined;
+		},
+		itemIndicesForSourceSeq: identity.itemIndicesForSourceSeq,
+		itemIndicesForSourceMessageId: identity.itemIndicesForSourceMessageId,
+	};
+	identityLookups.set(index, identity);
+	return index;
+}
+
 export function buildPretextLayoutIndex(manifest: PretextLayoutManifest): PretextLayoutIndex {
 	const metrics = normalizeMetrics(manifest.metrics);
 	const seenKeys = new Set<string>();
@@ -165,30 +225,7 @@ export function buildPretextLayoutIndex(manifest: PretextLayoutManifest): Pretex
 		cursor = end + (index < items.length - 1 ? gap : 0);
 	}
 	const totalHeight = cursor + metrics.bottomPadding;
-	const itemIndexAtOffset = (offset: number): number => {
-		if (items.length === 0) return -1;
-		const target = Math.min(Math.max(offset, 0), Math.max(0, totalHeight - 1));
-		let low = 0;
-		let high = itemStarts.length - 1;
-		while (low <= high) {
-			const middle = (low + high) >> 1;
-			const start = itemStarts[middle] ?? 0;
-			const end = itemEnds[middle] ?? start;
-			if (target < start) high = middle - 1;
-			else if (target >= end && middle < itemStarts.length - 1) low = middle + 1;
-			else return middle;
-		}
-		return Math.min(Math.max(low, 0), itemStarts.length - 1);
-	};
-	const itemStart = (itemIndex: number): number => {
-		if (items.length === 0) return metrics.topPadding;
-		return itemStarts[Math.min(Math.max(itemIndex, 0), items.length - 1)] ?? metrics.topPadding;
-	};
-	const itemEnd = (itemIndex: number): number => {
-		if (items.length === 0) return metrics.topPadding;
-		return itemEnds[Math.min(Math.max(itemIndex, 0), items.length - 1)] ?? metrics.topPadding;
-	};
-	const byKey = new Map(items.map((item, index) => [item.itemKey, { item, index }]));
+	const byKey = new Map(items.map((item, index) => [item.itemKey, index]));
 	const bySourceMessageId = new Map<string, number[]>();
 	for (let index = 0; index < items.length; index++) {
 		const uniqueMessageIds = new Set(items[index]?.sourceMessageIds ?? []);
@@ -229,18 +266,86 @@ export function buildPretextLayoutIndex(manifest: PretextLayoutManifest): Pretex
 		}
 		return matched.sort((left, right) => left - right);
 	};
-	return {
-		manifest: { ...manifest, metrics, items },
+	return createPretextLayoutIndex(
+		{ ...manifest, metrics, items },
 		itemStarts,
 		itemEnds,
 		totalHeight,
-		itemIndexAtOffset,
-		itemStart,
-		itemEnd,
-		itemByKey: (itemKey) => byKey.get(itemKey),
-		itemIndicesForSourceSeq,
-		itemIndicesForSourceMessageId: (messageId) => bySourceMessageId.get(messageId) ?? [],
-	};
+		{
+			itemIndexForKey: (itemKey) => byKey.get(itemKey),
+			itemIndicesForSourceSeq,
+			itemIndicesForSourceMessageId: (messageId) => bySourceMessageId.get(messageId) ?? [],
+		},
+	);
+}
+
+/**
+ * Replace only changed heights, preserving item identity/order and all source lookup state.
+ * No height or revision change returns the original index. A revision-only change shares
+ * the existing items and geometry. Neither path mutates the supplied snapshot.
+ */
+export function patchPretextLayoutHeights(
+	index: PretextLayoutIndex,
+	heights: ReadonlyMap<number, number>,
+	layoutRevision?: string,
+): PretextLayoutIndex {
+	const { manifest } = index;
+	let items: PretextLayoutItem[] | undefined;
+	let firstChanged = manifest.items.length;
+	for (const [itemIndex, height] of heights) {
+		if (!Number.isInteger(itemIndex) || itemIndex < 0 || itemIndex >= manifest.items.length)
+			throw new Error(`invalid layout item index ${itemIndex}`);
+		nonNegativeFinite(height, `layout item ${itemIndex} height`);
+		const item = manifest.items[itemIndex];
+		if (!item || item.height === height) continue;
+		items ??= manifest.items.slice();
+		items[itemIndex] = { ...item, height };
+		firstChanged = Math.min(firstChanged, itemIndex);
+	}
+	const nextRevision = layoutRevision ?? manifest.layoutRevision;
+	if (!items && nextRevision === manifest.layoutRevision) return index;
+
+	let itemStarts = index.itemStarts;
+	let itemEnds = index.itemEnds;
+	let totalHeight = index.totalHeight;
+	if (items) {
+		const starts = index.itemStarts.slice();
+		const ends = index.itemEnds.slice();
+		let cursor = starts[firstChanged] ?? manifest.metrics.topPadding;
+		// Recompute from the unchanged prefix rather than adding deltas: the exact
+		// arithmetic order matches a full build, even after many fractional patches.
+		for (let itemIndex = firstChanged; itemIndex < items.length; itemIndex++) {
+			const item = items[itemIndex];
+			if (!item) continue;
+			starts[itemIndex] = cursor;
+			const end = cursor + item.height;
+			ends[itemIndex] = end;
+			cursor =
+				end + (itemIndex < items.length - 1 ? (item.gapAfter ?? manifest.metrics.itemGap) : 0);
+		}
+		itemStarts = starts;
+		itemEnds = ends;
+		totalHeight = cursor + manifest.metrics.bottomPadding;
+	}
+
+	let identity = identityLookups.get(index);
+	if (!identity) {
+		// Structural implementations of the public interface can share their lookups
+		// too. Register once, so later patches never wrap a preceding patch's methods.
+		identity = {
+			itemIndexForKey: (itemKey) => index.itemByKey(itemKey)?.index,
+			itemIndicesForSourceSeq: index.itemIndicesForSourceSeq.bind(index),
+			itemIndicesForSourceMessageId: index.itemIndicesForSourceMessageId.bind(index),
+		};
+		identityLookups.set(index, identity);
+	}
+	return createPretextLayoutIndex(
+		{ ...manifest, layoutRevision: nextRevision, items: items ?? manifest.items },
+		itemStarts,
+		itemEnds,
+		totalHeight,
+		identity,
+	);
 }
 
 export function capturePretextLayoutAnchor(

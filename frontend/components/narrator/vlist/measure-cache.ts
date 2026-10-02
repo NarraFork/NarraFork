@@ -303,6 +303,15 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// copy is keyed by `traceRevision`). Height-affecting, and it is the only component
 	// that moves when the form's painted height is reported.
 	rev += permissionFormRevision(d.permissionForm);
+	// Grouped cards keep their children in a structural toolCalls array. A local
+	// same-width form report must invalidate that group's frame just like a trace's.
+	if (Array.isArray(d.toolCalls)) {
+		rev += `|gpf:${d.toolCalls
+			.map((child) =>
+				permissionFormRevision((child as Record<string, unknown> | null)?.permissionForm),
+			)
+			.join(";")}`;
+	}
 	// Takeover badge. Height-neutral (it rides the fixed header row), and keyed for
 	// exactly the reason `timeoutMs` above is: the takeover patch writes this ONE
 	// field — `status` cannot move, because the whole point is that the call is

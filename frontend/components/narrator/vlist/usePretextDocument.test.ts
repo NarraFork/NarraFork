@@ -27,6 +27,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
+import { restorePretextLayoutAnchor } from "@shared/pretext-layout";
 import { resetTypographyForTest, setTypography } from "@shared/pretext-layout/typography";
 import { parseHTML } from "linkedom";
 import { createElement } from "react";
@@ -34,8 +35,11 @@ import { createRoot, type Root } from "react-dom/client";
 import { bumpFontRevisionForTest } from "./katex-runtime";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { measureCache } from "./measure-cache";
+import type { PretextDocumentFetchPage } from "./pretext-document-loader";
+import { captureCoordinatorAnchor } from "./pretext-layout-coordinator";
 import type { PretextDocumentView, UsePretextDocumentResult } from "./usePretextDocument";
 import { usePretextDocument } from "./usePretextDocument";
+import { indexWithHeightOverrides } from "./vlist-resize-preview";
 
 const DOM_GLOBAL_KEYS = [
 	"window",
@@ -136,12 +140,18 @@ function page(): PretextDocumentPageResult {
 
 /** Stable across renders, so the hook's build/subscribe effects do not re-run. */
 const LOAD_OPTIONS = { fetchPage: async () => page() };
+let harnessWidth = 860;
+let harnessEpoch = 0;
+let harnessLoadOptions: { fetchPage: PretextDocumentFetchPage } = LOAD_OPTIONS;
+let harnessOverrides = new Map<string, number>();
+let harnessView: PretextDocumentView = { scrollTop: 0, viewportHeight: 720, pinnedToBottom: true };
+const readHeightOverrides = () => harnessOverrides;
 
 /** Live-view reads, counted: one per invalidateFontDependentLayout call. */
 let viewCalls = 0;
 function readCurrentView(): PretextDocumentView {
 	viewCalls++;
-	return { scrollTop: 0, viewportHeight: 720, pinnedToBottom: true };
+	return harnessView;
 }
 
 let renders: UsePretextDocumentResult[] = [];
@@ -150,13 +160,15 @@ function Harness() {
 	renders.push(
 		usePretextDocument("n1", {
 			lod: 5,
-			widthBucket: "860",
-			contentWidth: 860,
+			widthBucket: String(harnessWidth),
+			contentWidth: harnessWidth,
+			widthCommitEpoch: harnessEpoch,
 			viewportHeight: 720,
 			scrollTop: 0,
 			pinnedToBottom: true,
 			getCurrentView: readCurrentView,
-			loadOptions: LOAD_OPTIONS,
+			getHeightOverrides: readHeightOverrides,
+			loadOptions: harnessLoadOptions,
 		}),
 	);
 	return null;
@@ -187,6 +199,11 @@ function latest(): UsePretextDocumentResult {
 }
 
 beforeEach(() => {
+	harnessWidth = 860;
+	harnessEpoch = 0;
+	harnessLoadOptions = LOAD_OPTIONS;
+	harnessOverrides = new Map();
+	harnessView = { scrollTop: 0, viewportHeight: 720, pinnedToBottom: true };
 	restoreDom = installDom();
 	restoreCanvas = installCanvasStub();
 	renders = [];
@@ -322,3 +339,214 @@ describe("usePretextDocument typography subscription", () => {
 		expect(measureCache.size).toBe(0);
 	});
 });
+
+describe("usePretextDocument resize integration", () => {
+	test("loadOlderAsync forwards live painted heights after a gated page and width preview", async () => {
+		const messages = Array.from({ length: 100 }, (_, seq) =>
+			message(seq, "Historical response that wraps while the width changes. ".repeat(8)),
+		);
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		harnessLoadOptions = {
+			fetchPage: async (_id, options) => {
+				if (options.beforeSeq != null) await gate;
+				const eligible = messages.filter((row) =>
+					options.beforeSeq == null ? true : (row.seq ?? 0) < options.beforeSeq,
+				);
+				const rows = eligible.slice(-options.limit);
+				const minSeq = rows[0]?.seq ?? null;
+				return {
+					messages: rows,
+					messageVersion: 33,
+					minSeq,
+					maxSeq: rows.at(-1)?.seq ?? null,
+					hasPrev: minSeq != null && minSeq > 0,
+					hasNext: false,
+				};
+			},
+		};
+		await mount();
+		const initial = latest();
+		if (!initial.index) throw new Error("missing initial layout");
+		const offscreen = initial.items[0];
+		if (!offscreen) throw new Error("missing offscreen row");
+		harnessOverrides = new Map([[offscreen.spec.key, 300]]);
+		harnessView = {
+			scrollTop: initial.index.itemStart(15) + 7,
+			viewportHeight: 260,
+			pinnedToBottom: false,
+		};
+		const pending = initial.loadOlderAsync();
+		latest().previewWidth(420);
+		await settle();
+		const preview = latest();
+		if (!preview.index) throw new Error("missing preview layout");
+		expect(preview.items[0]?.contentWidth).toBe(860);
+		const changedIndex = preview.items.findIndex((item) => item.contentWidth === 420);
+		const changed = preview.items[changedIndex];
+		if (!changed || changedIndex < 0) throw new Error("missing reflowed row");
+		// Replace the entire map while I/O is gated, without rerendering the hook.
+		harnessOverrides = new Map([
+			[offscreen.spec.key, 2000],
+			[changed.spec.key, 900],
+		]);
+		const effective = indexWithHeightOverrides(preview.index, harnessOverrides);
+		harnessView = { ...harnessView, scrollTop: effective.itemStart(changedIndex + 2) + 13 };
+		const anchor = captureCoordinatorAnchor(effective, harnessView);
+		expect(anchor).not.toEqual(captureCoordinatorAnchor(preview.index, harnessView));
+		release();
+		expect(await pending).toBe(60);
+		await settle();
+		const committed = latest();
+		if (!committed.index) throw new Error("missing committed layout");
+		expect(committed.messages).toHaveLength(100);
+		expect(committed.scrollTopCorrection).toBe(
+			restorePretextLayoutAnchor(
+				anchor,
+				indexWithHeightOverrides(committed.index, new Map([[offscreen.spec.key, 2000]])),
+				260,
+			),
+		);
+		expect(committed.scrollTopCorrection).not.toBe(
+			restorePretextLayoutAnchor(anchor, committed.index, 260),
+		);
+	});
+
+	test("preview retains the semantic baseline, and an equal-width epoch forces finish", async () => {
+		const root = await mount();
+		const initial = latest();
+		initial.previewWidth(420);
+		await settle();
+		expect(latest().resizePreview).toBe(true);
+		expect(latest().semanticItems).toBe(initial.semanticItems);
+		expect(latest().semanticManifest).toBe(initial.semanticManifest);
+		expect(latest().items.every((item) => item.contentWidth === 420)).toBe(true);
+		// Still 860 in React: returning to the original width cannot rely on setState equality.
+		harnessEpoch++;
+		root.render(createElement(Harness));
+		await settle();
+		expect(latest().resizePreview).toBe(false);
+		expect(latest().items.every((item) => item.contentWidth === 860)).toBe(true);
+		expect(latest().semanticItems).not.toBe(initial.semanticItems);
+	});
+
+	test("final width is built once and stays authoritative after a streaming update", async () => {
+		const root = await mount();
+		latest().previewWidth(420);
+		await settle();
+		harnessWidth = 420;
+		harnessEpoch++;
+		const callsBefore = viewCalls;
+		root.render(createElement(Harness));
+		await settle();
+		expect(viewCalls - callsBefore).toBe(1); // one live view for the finish, not two builds
+		expect(latest().resizePreview).toBe(false);
+		latest().setStreamingMessage({
+			...message(2, "stream words ".repeat(50)),
+			id: "__streaming__",
+		});
+		await settle();
+		expect(latest().items.every((item) => item.contentWidth === 420)).toBe(true);
+	});
+
+	test("finishes the painted document during a pending tail reload without waiting for I/O", async () => {
+		const root = await mount();
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let fetches = 0;
+		harnessLoadOptions = {
+			fetchPage: async () => {
+				fetches++;
+				await gate;
+				return page();
+			},
+		};
+		latest().reload();
+		root.render(createElement(Harness));
+		await settle();
+		expect(latest().status).toBe("loading");
+		latest().previewWidth(420);
+		await settle();
+		expect(latest().resizePreview).toBe(true);
+		harnessWidth = 420;
+		harnessEpoch++;
+		root.render(createElement(Harness));
+		await settle();
+		expect(latest().resizePreview).toBe(false);
+		expect(latest().items.every((item) => item.contentWidth === 420)).toBe(true);
+		expect(fetches).toBe(1);
+		release();
+		await settle();
+		expect(latest().status).toBe("ready");
+		expect(latest().items.every((item) => item.contentWidth === 420)).toBe(true);
+	});
+});
+
+for (const forceReloadAtFinish of [false, true]) {
+	test(`pending reload preserves effective finish anchor (new reload at finish: ${forceReloadAtFinish})`, async () => {
+		const documentPage = {
+			...page(),
+			messages: [
+				message(0, "override host"),
+				message(1, "middle words ".repeat(500)),
+				message(2, "tail words ".repeat(100)),
+			],
+			maxSeq: 2,
+			// New content at stable ids is a NEW canonical version, not an in-place cache hit.
+			messageVersion: forceReloadAtFinish ? 14 : 13,
+		};
+		harnessLoadOptions = { fetchPage: async () => documentPage };
+		const root = await mount();
+		const initial = latest();
+		const key = initial.items[0]?.spec.key;
+		const height = initial.items[0]?.measured.height;
+		if (!key || height == null || !initial.index) throw new Error("missing layout");
+		harnessOverrides.set(key, height + 200);
+		const expected = initial.index.itemStart(2) + 200 + 5;
+		harnessView = { scrollTop: expected, viewportHeight: 40, pinnedToBottom: false };
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let fetches = 0;
+		harnessLoadOptions = {
+			fetchPage: async () => {
+				fetches++;
+				await gate;
+				return documentPage;
+			},
+		};
+		latest().reload();
+		root.render(createElement(Harness));
+		await settle();
+		expect(latest().status).toBe("loading");
+		latest().previewWidth(420);
+		await settle();
+		expect(
+			latest().items[0]?.contentWidth,
+			JSON.stringify({
+				initialCount: initial.items.length,
+				heights: initial.items.map((item) => item.measured.height),
+				expected,
+				view: harnessView,
+				sources: initial.messages.map((message) => message.contentText?.length),
+			}),
+		).toBe(860); // the overridden host remained off-screen
+		harnessView = { ...harnessView, scrollTop: latest().scrollTopCorrection ?? expected };
+		harnessEpoch++;
+		if (forceReloadAtFinish) latest().reload();
+		root.render(createElement(Harness));
+		await settle();
+		expect(latest().resizePreview).toBe(false);
+		expect(latest().scrollTopCorrection).toBe(expected);
+		release();
+		await settle();
+		expect(fetches).toBe(forceReloadAtFinish ? 2 : 1);
+		expect(latest().status).toBe("ready");
+		expect(latest().scrollTopCorrection).toBe(expected);
+	});
+}

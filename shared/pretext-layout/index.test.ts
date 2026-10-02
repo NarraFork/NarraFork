@@ -2,8 +2,10 @@ import { describe, expect, it } from "bun:test";
 import {
 	buildPretextLayoutIndex,
 	capturePretextLayoutAnchor,
+	type PretextLayoutIndex,
 	type PretextLayoutItem,
 	type PretextLayoutManifest,
+	patchPretextLayoutHeights,
 	replacePretextLayout,
 } from "./index";
 
@@ -25,6 +27,335 @@ function manifest(count: number, height = 48): PretextLayoutManifest {
 		items,
 	};
 }
+
+function expectEquivalentLayout(actual: PretextLayoutIndex, expected: PretextLayoutIndex): void {
+	expect(actual.manifest).toEqual(expected.manifest);
+	expect(actual.itemStarts).toEqual(expected.itemStarts);
+	expect(actual.itemEnds).toEqual(expected.itemEnds);
+	expect(actual.totalHeight).toBe(expected.totalHeight);
+	for (let itemIndex = -1; itemIndex <= expected.manifest.items.length; itemIndex++) {
+		expect(actual.itemStart(itemIndex)).toBe(expected.itemStart(itemIndex));
+		expect(actual.itemEnd(itemIndex)).toBe(expected.itemEnd(itemIndex));
+	}
+	const offsets = [-1, 0, actual.totalHeight, actual.totalHeight + 1, Infinity, -Infinity];
+	for (let itemIndex = 0; itemIndex < actual.manifest.items.length; itemIndex++) {
+		const item = expected.manifest.items[itemIndex];
+		if (!item) continue;
+		expect(actual.itemByKey(item.itemKey)).toEqual(expected.itemByKey(item.itemKey));
+		expect(actual.itemByKey(item.itemKey)?.item).toBe(actual.manifest.items[itemIndex]);
+		for (const seq of [item.firstSeq - 1, item.firstSeq, item.lastSeq, item.lastSeq + 1]) {
+			expect(actual.itemIndicesForSourceSeq(seq)).toEqual(expected.itemIndicesForSourceSeq(seq));
+		}
+		for (const messageId of item.sourceMessageIds) {
+			expect(actual.itemIndicesForSourceMessageId(messageId)).toEqual(
+				expected.itemIndicesForSourceMessageId(messageId),
+			);
+		}
+		const start = actual.itemStart(itemIndex);
+		const end = actual.itemEnd(itemIndex);
+		offsets.push(start - 0.01, start, start + 0.01, (start + end) / 2, end - 0.01, end, end + 0.01);
+	}
+	for (const offset of offsets) {
+		expect(actual.itemIndexAtOffset(offset)).toBe(expected.itemIndexAtOffset(offset));
+	}
+	expect(actual.itemByKey("missing")).toBeUndefined();
+	expect(actual.itemIndicesForSourceSeq(NaN)).toEqual([]);
+	expect(actual.itemIndicesForSourceSeq(0.5)).toEqual([]);
+	expect(actual.itemIndicesForSourceMessageId("missing")).toEqual([]);
+}
+
+function rebuildWithHeights(
+	index: PretextLayoutIndex,
+	heights: ReadonlyMap<number, number>,
+	layoutRevision = index.manifest.layoutRevision,
+): PretextLayoutIndex {
+	return buildPretextLayoutIndex({
+		...index.manifest,
+		layoutRevision,
+		items: index.manifest.items.map((item, itemIndex) => ({
+			...item,
+			height: heights.get(itemIndex) ?? item.height,
+		})),
+	});
+}
+
+describe("patchPretextLayoutHeights", () => {
+	it("replaces only height-different items and shares identity/source lookups", () => {
+		const previous = buildPretextLayoutIndex(manifest(451));
+		const heights = new Map([
+			[219, 213],
+			[0, previous.manifest.items[0]?.height ?? 0],
+			[450, 0],
+		]);
+		const next = patchPretextLayoutHeights(previous, heights, "patched");
+		expectEquivalentLayout(next, rebuildWithHeights(previous, heights, "patched"));
+		expect(next.manifest.metrics).toBe(previous.manifest.metrics);
+		expect(next.itemIndicesForSourceSeq).toBe(previous.itemIndicesForSourceSeq);
+		expect(next.itemIndicesForSourceMessageId).toBe(previous.itemIndicesForSourceMessageId);
+		expect(next.itemIndicesForSourceMessageId("message-219")).toBe(
+			previous.itemIndicesForSourceMessageId("message-219"),
+		);
+		for (let itemIndex = 0; itemIndex < previous.manifest.items.length; itemIndex++) {
+			const before = previous.manifest.items[itemIndex];
+			const after = next.manifest.items[itemIndex];
+			if (!before || !after) throw new Error("missing item");
+			if (itemIndex === 219 || itemIndex === 450) {
+				const height = heights.get(itemIndex);
+				if (height === undefined) throw new Error("missing patched height");
+				expect(after).not.toBe(before);
+				expect(after).toEqual({ ...before, height });
+			} else expect(after).toBe(before);
+			expect(after.sourceMessageIds).toBe(before.sourceMessageIds);
+		}
+		expect(next.itemStarts.slice(0, 220)).toEqual(previous.itemStarts.slice(0, 220));
+		expect(next.itemEnds.slice(0, 219)).toEqual(previous.itemEnds.slice(0, 219));
+		const sourceIndex = next.itemIndicesForSourceSeq(219)[0];
+		expect(sourceIndex).toBe(219);
+		expect(next.manifest.items[sourceIndex ?? -1]?.height).toBe(213);
+		expect(next.itemByKey("message-219")?.item.height).toBe(213);
+	});
+
+	it("returns the original snapshot for no-op patches, but honors revision-only updates", () => {
+		const previous = buildPretextLayoutIndex(manifest(5));
+		const unchanged = new Map(previous.manifest.items.map((item, index) => [index, item.height]));
+		expect(patchPretextLayoutHeights(previous, new Map())).toBe(previous);
+		expect(patchPretextLayoutHeights(previous, unchanged)).toBe(previous);
+		expect(patchPretextLayoutHeights(previous, unchanged, previous.manifest.layoutRevision)).toBe(
+			previous,
+		);
+		const next = patchPretextLayoutHeights(previous, unchanged, "");
+		expect(next).not.toBe(previous);
+		expect(next.manifest.layoutRevision).toBe("");
+		expect(next.manifest.items).toBe(previous.manifest.items);
+		expect(next.manifest.metrics).toBe(previous.manifest.metrics);
+		expect(next.itemStarts).toBe(previous.itemStarts);
+		expect(next.itemEnds).toBe(previous.itemEnds);
+		expectEquivalentLayout(next, rebuildWithHeights(previous, unchanged, ""));
+		expect(patchPretextLayoutHeights(next, unchanged, "")).toBe(next);
+	});
+
+	it("preserves zero/custom gaps, drops the final gap and resolves offset boundaries", () => {
+		const fixture = manifest(5);
+		fixture.metrics = { topPadding: 11, itemGap: 4, bottomPadding: 13 };
+		fixture.items = fixture.items.map((item, index) => ({
+			...item,
+			height: [5, 7, 2, 6, 8][index] ?? 0,
+			gapAfter: [0, 3, 0, undefined, 999][index],
+		}));
+		const previous = buildPretextLayoutIndex(fixture);
+		const heights = new Map([
+			[4, 2],
+			[0, 10],
+			[1, 4],
+		]);
+		const next = patchPretextLayoutHeights(previous, heights);
+		expect(next.itemStarts).toEqual([11, 21, 28, 30, 40]);
+		expect(next.itemEnds).toEqual([21, 25, 30, 36, 42]);
+		expect(next.totalHeight).toBe(55);
+		for (const [offset, itemIndex] of [
+			[-1, 0],
+			[0, 0],
+			[10, 0],
+			[11, 0],
+			[20.99, 0],
+			[21, 1],
+			[25, 2],
+			[27, 2],
+			[28, 2],
+			[30, 3],
+			[36, 4],
+			[40, 4],
+			[42, 4],
+			[55, 4],
+			[999, 4],
+		]) {
+			expect(next.itemIndexAtOffset(offset ?? 0)).toBe(itemIndex);
+		}
+		expectEquivalentLayout(next, rebuildWithHeights(previous, heights));
+		const lastOnly = patchPretextLayoutHeights(next, new Map([[4, 10]]));
+		expect(lastOnly.itemStarts).toEqual(next.itemStarts);
+		expect(lastOnly.totalHeight).toBe(63);
+	});
+
+	it("handles empty, single-item and all-zero layouts with top/bottom padding", () => {
+		const empty = buildPretextLayoutIndex(manifest(0));
+		expect(patchPretextLayoutHeights(empty, new Map())).toBe(empty);
+		const revisedEmpty = patchPretextLayoutHeights(empty, new Map(), "empty");
+		expect(revisedEmpty.totalHeight).toBe(32);
+		expect(revisedEmpty.itemStart(0)).toBe(16);
+		expect(revisedEmpty.itemEnd(0)).toBe(16);
+		expect(revisedEmpty.itemIndexAtOffset(16)).toBe(-1);
+		expectEquivalentLayout(revisedEmpty, rebuildWithHeights(empty, new Map(), "empty"));
+		for (const count of [1, 4]) {
+			for (const padding of [0, 0.25, 16]) {
+				const fixture = manifest(count);
+				fixture.metrics = { topPadding: padding, itemGap: 0, bottomPadding: padding };
+				fixture.items = fixture.items.map((item) => ({ ...item, gapAfter: 0 }));
+				const previous = buildPretextLayoutIndex(fixture);
+				const heights = new Map(fixture.items.map((_, index) => [index, 0]));
+				const next = patchPretextLayoutHeights(previous, heights);
+				expect(next.totalHeight).toBe(padding * 2);
+				expectEquivalentLayout(next, rebuildWithHeights(previous, heights));
+			}
+		}
+	});
+
+	it("leaves frozen previous snapshots and the input map unchanged", () => {
+		const previous = buildPretextLayoutIndex(manifest(9));
+		const snapshot = JSON.stringify(previous);
+		for (const item of previous.manifest.items) {
+			Object.freeze(item.sourceMessageIds);
+			Object.freeze(item);
+		}
+		Object.freeze(previous.manifest.items);
+		Object.freeze(previous.manifest.metrics);
+		Object.freeze(previous.manifest);
+		Object.freeze(previous.itemStarts);
+		Object.freeze(previous.itemEnds);
+		Object.freeze(previous);
+		const heights = new Map([[4, 0.7]]);
+		const first = patchPretextLayoutHeights(previous, heights);
+		const firstSnapshot = JSON.stringify(first);
+		const second = patchPretextLayoutHeights(first, new Map([[0, 100.1]]));
+		expectEquivalentLayout(first, rebuildWithHeights(previous, heights));
+		expectEquivalentLayout(second, rebuildWithHeights(first, new Map([[0, 100.1]])));
+		expect(JSON.stringify(previous)).toBe(snapshot);
+		expect(JSON.stringify(first)).toBe(firstSnapshot);
+		expect(previous.itemByKey("message-4")?.item.height).toBe(76);
+		expect(first.itemByKey("message-4")?.item.height).toBe(0.7);
+		expect([...heights]).toEqual([[4, 0.7]]);
+	});
+
+	it("rejects invalid indices/heights even after valid or unchanged entries without mutation", () => {
+		const previous = buildPretextLayoutIndex(manifest(3));
+		const snapshot = JSON.stringify(previous);
+		for (const itemIndex of [-1, 3, 0.5, NaN, Infinity, -Infinity]) {
+			expect(() => patchPretextLayoutHeights(previous, new Map([[itemIndex, 10]]))).toThrow(
+				"invalid layout item index",
+			);
+		}
+		for (const height of [-1, NaN, Infinity, -Infinity]) {
+			for (const firstHeight of [48, 0]) {
+				expect(() =>
+					patchPretextLayoutHeights(
+						previous,
+						new Map([
+							[0, firstHeight],
+							[1, height],
+						]),
+						"bad",
+					),
+				).toThrow("finite non-negative");
+			}
+		}
+		expect(() =>
+			patchPretextLayoutHeights(
+				previous,
+				new Map([
+					[0, 0],
+					[3, 0],
+				]),
+			),
+		).toThrow();
+		expect(() =>
+			patchPretextLayoutHeights(buildPretextLayoutIndex(manifest(0)), new Map([[0, 0]])),
+		).toThrow();
+		expect(JSON.stringify(previous)).toBe(snapshot);
+		expectEquivalentLayout(previous, buildPretextLayoutIndex(manifest(3)));
+	});
+
+	it("matches full builds over seeded random fractional/zero heights and repeated patches", () => {
+		let seed = 0x725e17;
+		const random = () => {
+			seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+			return seed / 2 ** 32;
+		};
+		const fixture = manifest(51);
+		fixture.metrics = { topPadding: 1.3, itemGap: 0.7, bottomPadding: 2.9 };
+		fixture.items = fixture.items.map((item, index) => {
+			const firstSeq = Math.floor(random() * 30) - 5;
+			return {
+				...item,
+				firstSeq,
+				lastSeq: firstSeq + Math.floor(random() * 15),
+				sourceMessageIds: ["shared", `source-${index % 5}`, `source-${index % 5}`],
+				height: random() * 100,
+				gapAfter: index % 3 === 0 ? 0 : index % 3 === 1 ? random() * 3 : undefined,
+			};
+		});
+		let actual = buildPretextLayoutIndex(fixture);
+		let expected = buildPretextLayoutIndex(fixture);
+		const sourceLookup = actual.itemIndicesForSourceSeq;
+		const messageLookup = actual.itemIndicesForSourceMessageId;
+		for (let round = 0; round < 80; round++) {
+			const heights = new Map<number, number>();
+			for (let change = 0; change < 12; change++) {
+				const itemIndex = Math.floor(random() * fixture.items.length);
+				heights.set(itemIndex, change % 4 === 0 ? 0 : random() * 100);
+			}
+			const previous = actual;
+			const snapshot = JSON.stringify(previous);
+			actual = patchPretextLayoutHeights(actual, heights, `random-${round}`);
+			expected = rebuildWithHeights(expected, heights, `random-${round}`);
+			expectEquivalentLayout(actual, expected);
+			expect(JSON.stringify(previous)).toBe(snapshot);
+			expect(actual.itemIndicesForSourceSeq).toBe(sourceLookup);
+			expect(actual.itemIndicesForSourceMessageId).toBe(messageLookup);
+			for (let itemIndex = 0; itemIndex < fixture.items.length; itemIndex++) {
+				const before = previous.manifest.items[itemIndex];
+				const after = actual.manifest.items[itemIndex];
+				if (!heights.has(itemIndex) || heights.get(itemIndex) === before?.height)
+					expect(after).toBe(before);
+			}
+		}
+	});
+
+	it("does not accumulate lookup wrappers across thousands of patches", () => {
+		let index = buildPretextLayoutIndex(manifest(1));
+		const original = index;
+		for (let round = 0; round < 12_000; round++) {
+			index = patchPretextLayoutHeights(index, new Map([[0, round % 2]]));
+		}
+		expect(index.itemByKey("message-0")?.item.height).toBe(1);
+		expect(index.itemIndicesForSourceSeq).toBe(original.itemIndicesForSourceSeq);
+		expect(index.itemIndicesForSourceMessageId).toBe(original.itemIndicesForSourceMessageId);
+		expect(index.itemIndicesForSourceSeq(0)).toEqual([0]);
+		expect(index.itemIndicesForSourceMessageId("message-0")).toEqual([0]);
+		expect(original.itemByKey("message-0")?.item.height).toBe(48);
+	});
+
+	it("supports structural indices without rebuilding source lookup state or chaining wrappers", () => {
+		const base = buildPretextLayoutIndex(manifest(2));
+		let keyCalls = 0;
+		const structural: PretextLayoutIndex = {
+			...base,
+			itemByKey(key) {
+				keyCalls++;
+				return base.itemByKey(key);
+			},
+			itemIndicesForSourceSeq(seq) {
+				expect(this).toBe(structural);
+				return base.itemIndicesForSourceSeq(seq);
+			},
+			itemIndicesForSourceMessageId(messageId) {
+				expect(this).toBe(structural);
+				return base.itemIndicesForSourceMessageId(messageId);
+			},
+		};
+		let next = patchPretextLayoutHeights(structural, new Map([[0, 1]]));
+		const sourceLookup = next.itemIndicesForSourceSeq;
+		for (let round = 0; round < 100; round++) {
+			next = patchPretextLayoutHeights(next, new Map([[0, round]]));
+		}
+		expect(keyCalls).toBe(0);
+		expect(next.itemByKey("message-0")?.item.height).toBe(99);
+		expect(keyCalls).toBe(1);
+		expect(next.itemIndicesForSourceSeq).toBe(sourceLookup);
+		expect(next.itemIndicesForSourceSeq(0)).toEqual([0]);
+		expect(next.itemIndicesForSourceMessageId("message-0")).toEqual([0]);
+		expectEquivalentLayout(next, rebuildWithHeights(base, new Map([[0, 99]])));
+	});
+});
 
 describe("pretext layout index", () => {
 	it("builds an exact full-history prefix index without estimates", () => {

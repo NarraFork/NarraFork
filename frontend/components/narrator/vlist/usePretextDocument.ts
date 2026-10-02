@@ -25,6 +25,8 @@ import {
 	type PretextLayoutCoordinatorSnapshot,
 } from "./pretext-layout-coordinator";
 import type { VListItem } from "./vlist-pipeline";
+import type { ResizePermissionResolver } from "./vlist-resize-permission";
+import { indexWithHeightOverrides } from "./vlist-resize-preview";
 
 export interface PretextDocumentView {
 	scrollTop: number;
@@ -50,6 +52,15 @@ export interface UsePretextDocumentOptions {
 	widthBucket: string | number;
 	contentWidth: number;
 	viewportHeight: number;
+	/** Explicit finish signal, including a drag that returns to its starting width. */
+	widthCommitEpoch?: number;
+	/** Live controlled-exception heights, read only at preview/finish time. */
+	getHeightOverrides?: () => ReadonlyMap<string, number>;
+	getResizeInputs?: () => {
+		dirtyKeys: ReadonlySet<string>;
+		resolvePermissionForm: ResizePermissionResolver;
+		onMeasuredKeys: (keys: ReadonlySet<string>) => void;
+	};
 	gap?: number;
 	/** Wider gap between top-level render units (messages / tool-runs / dividers). */
 	segmentGap?: number;
@@ -159,6 +170,15 @@ export interface UsePretextDocumentResult {
 	manifest?: PretextLayoutManifest;
 	index?: PretextLayoutIndex;
 	items: readonly VListItem[];
+	/** Content/spec baseline; pure width previews do not invalidate semantic metadata. */
+	semanticItems: readonly VListItem[];
+	semanticManifest?: PretextLayoutManifest;
+	resizePreview: boolean;
+	resizeWidth?: number;
+	resizeMeasuredCount: number;
+	resizeRevision: number;
+	/** Width-only preview at the LIVE view, returning whether another bounded batch is needed. */
+	previewWidth: (width: number) => boolean;
 	scrollTopCorrection?: number;
 	scrollTopCorrectionKind?: PretextLayoutAnchor["kind"];
 	/** True when the correction answers tail growth and may glide (vlist-smooth-follow). */
@@ -336,6 +356,11 @@ export function usePretextDocument(
 	// rebuild trigger (width change, live patch, reload). Only an LOD switch honors
 	// the gesture focus point; every other rebuild anchors on the viewport top.
 	const lastLodRef = useRef(options.lod);
+	const lastWidthCommitEpochRef = useRef(options.widthCommitEpoch);
+	const heightOverridesReaderRef = useRef(options.getHeightOverrides);
+	heightOverridesReaderRef.current = options.getHeightOverrides;
+	const resizeInputsReaderRef = useRef(options.getResizeInputs);
+	resizeInputsReaderRef.current = options.getResizeInputs;
 	const buildOptions = useMemo<PretextLayoutBuildOptions>(
 		() => ({
 			lod: options.lod,
@@ -504,6 +529,33 @@ export function usePretextDocument(
 		const forceReload = shouldForcePretextDocumentLoad(reloadToken, handledReloadTokenRef.current);
 		if (forceReload) handledReloadTokenRef.current = reloadToken;
 		if (forceReload || current.status === "loading") {
+			let loadAnchor = anchor;
+			let restoreOverrides: ReadonlyMap<string, number> | undefined;
+			// A cached/background-loaded document is still being painted. Finish its
+			// mixed frames now, without abandoning the width-independent tail fetch.
+			if (current.input && lastWidthCommitEpochRef.current !== options.widthCommitEpoch) {
+				try {
+					const overrides = heightOverridesReaderRef.current?.();
+					loadAnchor = current.index
+						? captureAnchor(indexWithHeightOverrides(current.index, overrides), currentView)
+						: undefined;
+					const valid = new Map<string, number>();
+					for (const [key, height] of overrides ?? []) {
+						const i = current.index?.itemByKey(key)?.index;
+						if (i != null && current.items?.[i]?.contentWidth === buildOptions.contentWidth)
+							valid.set(key, height);
+					}
+					restoreOverrides = valid;
+					coordinator.finishResize(buildOptions, currentView, overrides);
+					lastWidthCommitEpochRef.current = options.widthCommitEpoch;
+					// finish already retargeted the pending load with the EFFECTIVE anchor.
+					// Do not overwrite it with the raw anchor captured before this finish.
+					if (!forceReload) return;
+				} catch {
+					// The coordinator retains the error; the canonical load can recover.
+				}
+				lastWidthCommitEpochRef.current = options.widthCommitEpoch;
+			}
 			// load() coalesces: if a tail fetch for this narrator is already in
 			// flight, it re-targets that same fetch to the latest build options and
 			// commits once, instead of starting a second identical request. A
@@ -515,9 +567,9 @@ export function usePretextDocument(
 				narratorId,
 				buildOptions,
 				options.loadOptions,
-				anchor,
-				options.viewportHeight,
-				{ forceReload },
+				loadAnchor,
+				currentView.viewportHeight,
+				{ forceReload, restoreOverrides },
 			);
 			return;
 		}
@@ -539,10 +591,13 @@ export function usePretextDocument(
 			// already discarded via `void` on a rejected promise; this is the same
 			// contract for the synchronous path.
 			try {
-				coordinator.rebuild(buildOptions, anchor, options.viewportHeight);
+				if (lastWidthCommitEpochRef.current !== options.widthCommitEpoch) {
+					coordinator.finishResize(buildOptions, currentView, heightOverridesReaderRef.current?.());
+				} else coordinator.rebuild(buildOptions, anchor, currentView.viewportHeight);
 			} catch {
 				// Reported through the snapshot (status: "error" + error).
 			}
+			lastWidthCommitEpochRef.current = options.widthCommitEpoch;
 		} else
 			void coordinator.load(
 				narratorId,
@@ -562,6 +617,7 @@ export function usePretextDocument(
 		options.getCurrentView,
 		options.loadOptions,
 		options.viewportHeight,
+		options.widthCommitEpoch,
 		reloadToken,
 	]);
 	// Publish the loaded window on teardown so the next mount can restore it.
@@ -629,6 +685,8 @@ export function usePretextDocument(
 	// corrected scrollTop synchronously after the DOM grows and before paint, so the
 	// prepend and the correction land in the same frame (no visible jump).
 	useLayoutEffect(() => {
+		// The same numeric correction must be re-applied to each new canvas commit.
+		void snapshot.resizeRevision;
 		if (snapshot.scrollTop == null || !snapshot.scrollTopAnchorKind) return;
 		options.onScrollTopCorrection?.(
 			snapshot.scrollTop,
@@ -640,6 +698,7 @@ export function usePretextDocument(
 		snapshot.scrollTop,
 		snapshot.scrollTopAnchorKind,
 		snapshot.scrollTopSmoothFollow,
+		snapshot.resizeRevision,
 	]);
 	const reload = useCallback(() => setReloadToken((value) => value + 1), []);
 	// Preserve the visible content by height arithmetic: the coordinator shifts
@@ -656,14 +715,18 @@ export function usePretextDocument(
 		// awaits the result needs. Only a document that cannot page at all returns 0.
 		if (current.status !== "ready" || !current.hasPrev) return 0;
 		if (!current.index) return 0;
-		return coordinator.loadOlder(buildOptions, () => {
-			const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
-			return {
-				scrollTop: view.scrollTop,
-				pinnedToBottom: view.pinnedToBottom,
-				viewportHeight: view.viewportHeight,
-			};
-		});
+		return coordinator.loadOlder(
+			buildOptions,
+			() => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			},
+			() => heightOverridesReaderRef.current?.(),
+		);
 	}, [buildOptions, coordinator, options.getCurrentView]);
 	// Fire-and-forget wrapper for the scroll gate / first-screen fill, which have
 	// nothing to await and no way to report a failure. The rejection is swallowed
@@ -813,6 +876,16 @@ export function usePretextDocument(
 		},
 		[coordinator, options.getCurrentView],
 	);
+	const previewWidth = useCallback(
+		(width: number) =>
+			coordinator?.previewWidth(
+				width,
+				() => resolvePretextDocumentView(viewRef.current, options.getCurrentView),
+				heightOverridesReaderRef.current?.(),
+				resizeInputsReaderRef.current?.(),
+			) ?? false,
+		[coordinator, options.getCurrentView],
+	);
 	return {
 		status: snapshot.status,
 		messages: snapshot.input?.messages ?? EMPTY_MESSAGES,
@@ -821,6 +894,13 @@ export function usePretextDocument(
 		manifest: snapshot.manifest,
 		index: snapshot.index,
 		items: snapshot.items ?? EMPTY_ITEMS,
+		semanticItems: snapshot.semanticItems ?? snapshot.items ?? EMPTY_ITEMS,
+		semanticManifest: snapshot.semanticManifest ?? snapshot.manifest,
+		resizePreview: snapshot.resizePreview === true,
+		resizeWidth: snapshot.resizeWidth,
+		resizeMeasuredCount: snapshot.resizeMeasuredCount ?? 0,
+		resizeRevision: snapshot.resizeRevision ?? 0,
+		previewWidth,
 		scrollTopCorrection: snapshot.scrollTop,
 		scrollTopCorrectionKind: snapshot.scrollTopAnchorKind,
 		scrollTopCorrectionSmoothFollow: snapshot.scrollTopSmoothFollow,

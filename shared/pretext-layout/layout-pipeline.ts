@@ -36,6 +36,8 @@ import {
 export interface VListItem {
 	spec: ElementSpec;
 	measured: MeasuredElement;
+	/** Outer column width used for this frame (not its padding-adjusted inner width). */
+	contentWidth?: number;
 }
 
 export interface VListLayoutResult {
@@ -221,7 +223,7 @@ export function computePretextVListLayout(
 			spec.key,
 			opts.documentRevision,
 		);
-		items[i] = { spec, measured };
+		items[i] = { spec, measured, contentWidth: opts.contentWidth };
 		heights[i] = measured.height;
 	}
 

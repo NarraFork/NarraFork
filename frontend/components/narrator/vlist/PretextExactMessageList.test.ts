@@ -282,7 +282,7 @@ describe("PretextExactMessageList", () => {
 		expect(rowProps).toMatch(
 			/hitHeight:\s*resolveRowHitHeight\(\s*exactLayout\.items,\s*itemIndex,\s*exactLayout\.totalHeight,?\s*\)/,
 		);
-		expect(rowProps).toMatch(/\n\s*contentWidth,\s*\n/);
+		expect(rowProps).toMatch(/contentWidth:\s*item\.contentWidth\s*\?\?\s*contentWidth/);
 		// The projected geometry must reach ExactRow unchanged through the element factory.
 		expect(source).toMatch(/windowRowProjections\.push\(\{\s*props: rowProps,/);
 		expect(source).toContain("useVListWindowRows(narratorId, windowRowProjections)");
