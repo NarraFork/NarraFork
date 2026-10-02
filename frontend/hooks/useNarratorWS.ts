@@ -398,7 +398,7 @@ export function coercePermissionRoutingFields(
 	};
 }
 
-interface NarratorWSCallbacks {
+export interface NarratorWSCallbacks {
 	onMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
 	onUserMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
 	onStreamEvent?: (data: { event?: Record<string, unknown>; [key: string]: unknown }) => void;

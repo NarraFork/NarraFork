@@ -1109,6 +1109,35 @@ describe("Send exact delivery receipts", () => {
 		).toHaveLength(2);
 	});
 
+	test("broadcast rechecks persisted status before admission without requiring a runtime owner", async () => {
+		const message = {
+			fromId: "parent",
+			fromTitle: null,
+			fromType: "primary",
+			fromToolUseId: "status-broadcast",
+			fromToolCallBinding: sourceBinding("parent", "status-broadcast"),
+			text: "new scope",
+			timestamp: now,
+			isBroadcast: true,
+		};
+		for (const status of ["idle", "archived"]) {
+			sqlite.prepare("UPDATE narrators SET status = ? WHERE id = 'child'").run(status);
+			expect(await deliverTeamMessage("child", message, "parent")).toBeUndefined();
+			expect(await agentQueued()).toHaveLength(0);
+		}
+		expect(broadcasts).toHaveLength(0);
+		sqlite.prepare("UPDATE narrators SET status = 'working' WHERE id = 'child'").run();
+		sqlite.prepare("UPDATE narrators SET status = 'waiting' WHERE id = 'sibling'").run();
+		expect(getExecutionOwner("child")).toBeUndefined();
+		expect(getExecutionOwner("sibling")).toBeUndefined();
+		expect(await deliverTeamMessage("child", message, "parent")).toBeString();
+		expect(await deliverTeamMessage("sibling", message, "parent")).toBeString();
+		expect(await agentQueued("child")).toHaveLength(1);
+		expect(await agentQueued("sibling")).toHaveLength(1);
+		// Broadcast does not schedule the historical runner even with a working/waiting row.
+		expect(getExecutionOwner("child")).toBeUndefined();
+		expect(getExecutionOwner("sibling")).toBeUndefined();
+	});
 	test("TeamStatus broadcast reserves separate IDs and keeps independent inbox scheduling", async () => {
 		const message = {
 			fromId: "parent",

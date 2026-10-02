@@ -164,6 +164,7 @@ export interface ExactRowProps {
 	 * attachments stay non-interactive. HEIGHT-NEUTRAL.
 	 */
 	onOpenFilePanel?: (filePath: string) => void;
+	onFetchAttachment?: (fetchUrl: string, filename: string) => void;
 	/** Localized label for a clickable attachment row (tooltip / aria). */
 	openAttachmentLabel?: string;
 	/** Localized "was truncated" note painted inside an injection bubble. */
@@ -330,6 +331,12 @@ export interface ExactRowProps {
 	 * Height-neutral: it only swaps a glyph inside an already-reserved lane.
 	 */
 	specTaskLive?: boolean;
+	/**
+	 * Quote-strip jump: the shell's cross-page message jump, bound by the shell so
+	 * a reply strip click pages history until the target is covered. Absent → the
+	 * strip renders inert.
+	 */
+	onQuoteJump?: (targetId: string) => void;
 }
 
 /**
@@ -352,6 +359,7 @@ export const ExactRow = memo(
 		rowInteraction,
 		closingRowKeys,
 		onOpenFilePanel,
+		onFetchAttachment,
 		openAttachmentLabel,
 		injectionNoteLabel,
 		reviewTruncatedLabel,
@@ -383,12 +391,21 @@ export const ExactRow = memo(
 		streamAnimMountEpoch,
 		streamAnimSnapshotEpoch,
 		specTaskLive,
+		onQuoteJump,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
 		const kind = item.spec.kind;
 		// User bubbles: build the avatar/name/time header node from the forwarded
 		// creator data (the pure render layer cannot construct it itself).
 		injectUserBubbleHeader(kind, extra);
+		// Reply quote strip: wire the jump when the strip carries a reachable target.
+		if (kind === "message-bubble" && onQuoteJump) {
+			const quote = (item.spec.data as { quote?: { targetId?: string | null } | null })?.quote;
+			if (quote?.targetId) {
+				const targetId = quote.targetId;
+				extra.onQuoteClick = () => onQuoteJump(targetId);
+			}
+		}
 		// Which side the bubble sits on + its tint. Resolved here, not in the adapter:
 		// a teammate's turn and your own are the same height, so viewer identity must
 		// not reach the measured data (it would fork the cache per user).
@@ -427,6 +444,7 @@ export const ExactRow = memo(
 		// dockview surface. The path itself already rode along as height-neutral
 		// measure data, so this only binds the handler.
 		injectUserBubbleAttachmentOpen(kind, extra, onOpenFilePanel, openAttachmentLabel);
+		if (kind === "message-bubble") extra.onFetchAttachment = onFetchAttachment;
 		injectRenderLabels(kind, extra, renderLabels);
 		if (TOGGLEABLE_CARD_KINDS.has(kind)) {
 			extra.onToggle = toggles.onToggle;
@@ -864,6 +882,8 @@ export const ExactRow = memo(
 						toolActions={interaction.toolActions}
 						onViewOriginal={interaction.onViewOriginal}
 						inspectContent={interaction.inspectContent}
+						selected={interaction.selected}
+						onToggleSelect={interaction.onToggleSelect}
 						onOpenFullscreen={
 							menuViewTarget && viewControls
 								? () => viewControls.openFullscreen(menuViewTarget)
@@ -989,6 +1009,7 @@ export const ExactRow = memo(
 		prev.rowInteraction === next.rowInteraction &&
 		prev.narratorId === next.narratorId &&
 		prev.onOpenFilePanel === next.onOpenFilePanel &&
+		prev.onFetchAttachment === next.onFetchAttachment &&
 		prev.openAttachmentLabel === next.openAttachmentLabel &&
 		prev.injectionNoteLabel === next.injectionNoteLabel &&
 		prev.reviewTruncatedLabel === next.reviewTruncatedLabel &&

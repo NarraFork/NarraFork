@@ -18,7 +18,7 @@ import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { loadedHumanAttentionItems, useHumanAttention } from "../../hooks/useHumanAttention";
 import { api } from "../../lib/api";
-import { HumanAttentionInboxDrawer } from "../narrator/question/GlobalQuestionInbox";
+import { NotificationCenterDrawer } from "../notifications/NotificationCenterDrawer";
 
 const NEEDS_ATTENTION_QUERY_GC_TIME_MS = 30_000;
 const MAX_ITEMS = 5;
@@ -166,7 +166,13 @@ export function NeedsAttention() {
 					)}
 				</Stack>
 			)}
-			<HumanAttentionInboxDrawer opened={inboxOpened} onClose={() => setInboxOpened(false)} />
+			{inboxOpened && (
+				<NotificationCenterDrawer
+					opened
+					onClose={() => setInboxOpened(false)}
+					initialTab="attention"
+				/>
+			)}
 		</Card>
 	);
 }

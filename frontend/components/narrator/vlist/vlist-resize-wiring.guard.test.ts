@@ -165,6 +165,12 @@ describe("ExactRow memo identity", () => {
 
 	// Everything the row paints from `spec` must be compared, or a change would not
 	// reach the DOM. Today that is `key` and `unitId` (`data-nf-unit`).
+	//
+	// `data` is exempt: it is measured INTO `measured` (the comparator's first
+	// clause), so a different `data` already yields a different `measured` object
+	// and never needs its own comparison — see ExactRow's comparator comment and
+	// measure-cache.extractDataRevision. Reads of `spec.data.*` in the row body are
+	// for interaction callbacks (e.g. the reply-quote jump target), not paint.
 	it("compares every spec field the row renders", () => {
 		const source = row();
 		const rowBody = source.slice(
@@ -174,6 +180,7 @@ describe("ExactRow memo identity", () => {
 		const readFields = new Set(
 			[...rowBody.matchAll(/item\.spec\.([a-zA-Z]+)/g)].map((match) => match[1]),
 		);
+		readFields.delete("data");
 		expect(readFields.size).toBeGreaterThan(0);
 		const cmp = comparator(source);
 		for (const field of readFields) {

@@ -7,7 +7,6 @@ import {
 	Group,
 	HoverCard,
 	Loader,
-	Menu,
 	ScrollArea,
 	Stack,
 	Text,
@@ -21,7 +20,6 @@ import {
 	IconChevronDown,
 	IconChevronRight,
 	IconCopy,
-	IconDotsVertical,
 	IconFilter,
 	IconFilterOff,
 	IconFolder,
@@ -35,6 +33,7 @@ import {
 import { type ReactNode, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useClipboard } from "../../hooks/useClipboard";
+import { formatLocaleDateTime } from "../../lib/intl-format";
 import {
 	type CurrentDiffFile,
 	type CurrentDiffTarget,
@@ -139,12 +138,10 @@ export function GitChangesTab({
 	chapterId,
 	target = chapterId ?? "",
 	onRefresh,
-	onOpenSecondaryView,
 }: {
 	chapterId?: string;
 	target?: GitTarget;
 	onRefresh?: () => void;
-	onOpenSecondaryView?: (view: "commits" | "stash") => void;
 }) {
 	const canWrite = gitCanWrite(target);
 	const preferenceKey = gitTargetKey(target) ?? "";
@@ -431,21 +428,6 @@ export function GitChangesTab({
 						<IconRefresh size={15} />
 					</ActionIcon>
 				</Tooltip>
-				{onOpenSecondaryView && (
-					<Menu withinPortal position="bottom-end">
-						<Menu.Target>
-							<ActionIcon size="sm" variant="subtle" aria-label={t("panel.moreActions")}>
-								<IconDotsVertical size={15} />
-							</ActionIcon>
-						</Menu.Target>
-						<Menu.Dropdown>
-							<Menu.Item onClick={() => onOpenSecondaryView("commits")}>
-								{t("panel.commits")}
-							</Menu.Item>
-							<Menu.Item onClick={() => onOpenSecondaryView("stash")}>{t("panel.stash")}</Menu.Item>
-						</Menu.Dropdown>
-					</Menu>
-				)}
 			</Group>
 
 			{status.truncated && (
@@ -945,12 +927,12 @@ function FileRow({
  */
 function formatAttributionTime(value: string): string {
 	try {
-		return new Intl.DateTimeFormat(undefined, {
+		return formatLocaleDateTime(value, {
 			month: "short",
 			day: "numeric",
 			hour: "numeric",
 			minute: "2-digit",
-		}).format(new Date(value));
+		});
 	} catch {
 		return value;
 	}

@@ -17,7 +17,7 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import type { ShikiToken } from "@frontend/lib/shiki-token-cache";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
-import { TokenFlowText, TokenText } from "./TokenLines";
+import { TokenFlowText, TokenText } from "../../content/TokenLines";
 
 let parse: (html: string) => Element;
 

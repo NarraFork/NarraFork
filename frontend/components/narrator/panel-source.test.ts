@@ -48,6 +48,23 @@ function reachableSiblingModules(entry: string): Set<string> {
 }
 
 describe("panel source manifest", () => {
+	test("browser session updates never automatically open the browser panel", () => {
+		const panel = readNarratorFile("NarratorPanel.tsx");
+		expect(panel).toContain("dockSetBrowserInfo?.({");
+		expect(panel).toContain("sessionCount: wsState.browserSessionCount");
+		expect(panel).not.toMatch(/dockOpenToolPanel\?\.\(["']browser["']\)/);
+		expect(panel).not.toContain("prevBrowserSessionCountRef");
+	});
+
+	test("keeps the global attention inbox out of the panel interaction area", () => {
+		const interaction = readNarratorFile("NarratorInteractionArea.tsx");
+		const panel = readNarratorFile("NarratorPanel.tsx");
+		expect(interaction).not.toContain("HumanAttentionInboxButton");
+		expect(interaction).not.toContain("showHumanAttentionInbox");
+		expect(panel).not.toContain("useHumanAttention");
+		expect(panel).not.toContain("showHumanAttentionInbox");
+	});
+
 	test("contains unique, existing, non-empty module paths", () => {
 		expect(new Set(PANEL_MODULES).size).toBe(PANEL_MODULES.length);
 		for (const name of PANEL_MODULES) {

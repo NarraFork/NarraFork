@@ -31,6 +31,7 @@
 	"summaryPreviewHint": "Edit it if needed, then send it to the narrator as a user message.",
 	"cancel": "Cancel",
 	"messageDeleted": "This message was deleted",
+	"emptyRoom": "No messages yet",
 	"loadOlder": "Load older messages",
 	"historyStart": "Beginning of the conversation",
 	"newMessages": "{{count}} new message(s)",

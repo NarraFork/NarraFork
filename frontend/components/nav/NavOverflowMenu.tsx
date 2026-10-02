@@ -38,12 +38,10 @@ function entryId(entry: NavLayoutEntry): string {
 
 function SortableRow({
 	id,
-	hidden,
 	onNavigate,
 	badgeLabel,
 }: {
 	id: string;
-	hidden: boolean;
 	onNavigate?: () => void;
 	/** Unread count label for this row, when the entry has a live badge. */
 	badgeLabel?: string;
@@ -90,12 +88,7 @@ function SortableRow({
 					onClick={onNavigate}
 				>
 					<Icon size={14} />
-					<Text
-						size="sm"
-						c={hidden ? "dimmed" : undefined}
-						style={{ flex: 1, minWidth: 0 }}
-						truncate
-					>
+					<Text size="sm" style={{ flex: 1, minWidth: 0 }} truncate>
 						{t(def.labelKey)}
 					</Text>
 					{badgeLabel ? (
@@ -148,7 +141,6 @@ export function NavOverflowMenu({ entries, onSaveLayout, navCollapsed }: NavOver
 	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
 
 	const flatIds = useMemo(() => entries.map(entryId), [entries]);
-	const dividerIndex = useMemo(() => flatIds.indexOf(NAV_DIVIDER_ID), [flatIds]);
 
 	const handleDragEnd = useCallback(
 		(event: DragEndEvent) => {
@@ -212,14 +204,12 @@ export function NavOverflowMenu({ entries, onSaveLayout, navCollapsed }: NavOver
 						<Text size="xs" c="dimmed" fw={600} px={8} py={4}>
 							{t("navSectionVisible")}
 						</Text>
-						{entries.map((entry, index) => {
+						{entries.map((entry) => {
 							if (entry.kind === "divider") return <SortableDivider key={NAV_DIVIDER_ID} />;
-							const hidden = dividerIndex >= 0 && index > dividerIndex;
 							return (
 								<SortableRow
 									key={entry.id}
 									id={entry.id}
-									hidden={hidden}
 									onNavigate={() => handleNavigate(entry.id)}
 									badgeLabel={resolveBadge(ITEM_DEF_MAP.get(entry.id)?.badge).label || undefined}
 								/>

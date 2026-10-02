@@ -20,6 +20,7 @@
 
 import { formatLocaleNumber } from "@frontend/lib/intl-format";
 import { Box, Group, Text, ThemeIcon } from "@mantine/core";
+import { TRACE_SHIMMER_CLASS } from "@shared/tool-shimmer";
 import { IconBrain, IconChevronDown, IconChevronRight, IconLanguage } from "@tabler/icons-react";
 import {
 	type MeasuredReasoning,
@@ -143,6 +144,7 @@ function StreamingRow({ labels }: { labels: ReasoningLabels }) {
 				size="xs"
 				fs="italic"
 				c="dimmed"
+				className={TRACE_SHIMMER_CLASS.streaming}
 				style={{ lineHeight: `${typographyMetrics().line.xs}px` }}
 			>
 				{thinking}

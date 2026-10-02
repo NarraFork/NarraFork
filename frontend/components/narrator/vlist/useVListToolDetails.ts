@@ -30,6 +30,7 @@ import {
 import type { AdapterContext } from "@shared/pretext-layout/segment-adapter";
 import { useQueries } from "@tanstack/react-query";
 import { useCallback, useMemo, useRef } from "react";
+import type { VListDataSource } from "./vlist-data-source";
 
 /** Max detail records fetched concurrently, so one screen cannot storm the API. */
 const MAX_CONCURRENT_FETCHES = 6;
@@ -147,10 +148,14 @@ export function mergeToolDetailPayloads(
 /**
  * Fetch visible + expanded + truncated calls by their exact persisted identity.
  * A missing ref remains a legacy request; never borrow a body from a richer ref.
+ *
+ * `fetchDetail` overrides the transport (the public share page calls its own
+ * share-credentialed endpoint); absent → the narrator API.
  */
 export function useVListToolDetails(
 	narratorId: string,
 	requests: readonly VListToolDetailRequest[],
+	fetchDetail?: VListDataSource["fetchToolDetail"],
 ): UseVListToolDetailsResult {
 	// Dedupe exact identities before applying the cap, not provider tool-use ids.
 	const wanted = useMemo(() => {
@@ -189,7 +194,9 @@ export function useVListToolDetails(
 		queries: wanted.map((request) => ({
 			queryKey: toolCallDetailQueryKey(narratorId, request.toolUseId, request),
 			queryFn: ({ signal }: { signal: AbortSignal }) =>
-				narratorsApi.getToolCallDetail(narratorId, request.toolUseId, request, signal),
+				fetchDetail
+					? fetchDetail(narratorId, request.toolUseId, request, signal)
+					: narratorsApi.getToolCallDetail(narratorId, request.toolUseId, request, signal),
 			enabled: !!narratorId && !!request.toolUseId,
 			staleTime: DETAIL_CACHE_MS,
 			gcTime: DETAIL_CACHE_MS,

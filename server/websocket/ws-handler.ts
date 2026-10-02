@@ -6,6 +6,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import type { VNetClientMessage } from "../lib/vnet/types";
+import type { VerifiedPublicShare } from "../services/public-narrator-share-service";
 import {
 	type DeviceWSData,
 	getDeviceConnections,
@@ -135,6 +136,8 @@ export function resolveWSData(
 	},
 	vnetAuth?: VNetWSData["auth"],
 	sessionAuth?: SessionWSAuth,
+	/** Anonymous public-share credential (verified at the upgrade boundary). */
+	publicShare?: VerifiedPublicShare,
 ): WSData | null {
 	if (url.pathname === "/ws/narrator" || url.pathname.startsWith("/ws/narrator?")) {
 		return {
@@ -150,6 +153,7 @@ export function resolveWSData(
 			avatarColor: userInfo?.avatarColor,
 			avatarImageId: userInfo?.avatarImageId,
 			userRole: userInfo?.role,
+			...(publicShare ? { publicShare } : {}),
 			sessionExp: sessionAuth?.sessionExp,
 			sessionUserId: sessionAuth?.sessionUserId,
 		};

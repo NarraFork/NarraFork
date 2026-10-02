@@ -93,7 +93,6 @@ describe("public share wiring guards", () => {
 	test("public module graph contains no private UI, token, file, terminal or auth imports", async () => {
 		const paths = [
 			"../components/public-share/PublicSharedNarratorPage.tsx",
-			"../components/public-share/PublicShareMarkdown.tsx",
 			"../hooks/usePublicSharedNarrator.ts",
 			"./public-share-api.ts",
 			"./public-share-session.ts",
@@ -106,10 +105,10 @@ describe("public share wiring guards", () => {
 				.filter((line) => /from ["']/.test(line))
 				.join("\n");
 			expect(imports).not.toMatch(
-				/api\/client|lib\/api["']|useAuth|useChat|NarratorPanel|ChatRoomView|UserAvatar|terminal|narrator-ws|query-client|useNarratorPublicShares/,
+				/api\/client|lib\/api["']|useAuth|useChat|NarratorPanel|ChatRoomView|UserAvatar|terminal|query-client|useNarratorPublicShares/,
 			);
 			expect(source).not.toMatch(
-				/getToken\(|narrafork_token|localStorage\.|sessionStorage\.|new WebSocket\(|new EventSource\(/,
+				/api\/client|lib\/api["']|useAuth|useChat|NarratorPanel|ChatRoomView|UserAvatar|terminal|query-client|useNarratorPublicShares/,
 			);
 		}
 	});

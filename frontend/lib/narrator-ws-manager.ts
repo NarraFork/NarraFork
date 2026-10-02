@@ -360,6 +360,23 @@ export function decideNarratorForegroundRecovery(opts: {
 // Manager
 // ---------------------------------------------------------------------------
 
+// ── Share-auth mode ─────────────────────────────────────────────────────────
+// The anonymous public-share page rides THIS manager (same /ws/narrator channel,
+// same event fan-out) but authenticates with the share credential instead of the
+// session JWT. The mode is process-wide and deliberately trivial: the public
+// route never mounts the authenticated shell, so the two modes never coexist.
+let shareAuth: { shareId: string; token: string } | null = null;
+
+/**
+ * Switch the manager's credential to a public share (or back to the session JWT
+ * with `null`). Reconnects so the socket re-opens under the new credential.
+ */
+export function setNarratorWSShareAuth(auth: { shareId: string; token: string } | null): void {
+	const changed = shareAuth?.shareId !== auth?.shareId || shareAuth?.token !== auth?.token;
+	shareAuth = auth;
+	if (changed) narratorWSManager.reconnect();
+}
+
 export class NarratorWSManager {
 	private ws: WebSocket | null = null;
 	private _connected = false;
@@ -1378,7 +1395,7 @@ export class NarratorWSManager {
 		}
 
 		const token = getToken();
-		if (!token) {
+		if (!token && !shareAuth) {
 			// No token yet — retry after a short delay
 			this.reconnectTimer = setTimeout(() => {
 				this.reconnectTimer = undefined;
@@ -1387,7 +1404,12 @@ export class NarratorWSManager {
 			return;
 		}
 
-		const tokenQuery = `token=${encodeURIComponent(token)}`;
+		// Share-auth mode connects with the public credential instead of the JWT
+		// (server/ws verifies it at the upgrade boundary, scoped at subscribe time).
+		// The JWT branch only runs when `token` is present (the guard above).
+		const tokenQuery = shareAuth
+			? `share=${encodeURIComponent(shareAuth.shareId)}&token=${encodeURIComponent(shareAuth.token)}`
+			: `token=${encodeURIComponent(token ?? "")}`;
 		const ws = new WebSocket(buildWsUrl("/ws/narrator", tokenQuery));
 		this.ws = ws;
 

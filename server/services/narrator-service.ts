@@ -152,6 +152,8 @@ const MAX_INHERITED_FULL_FORK_REFS = 500;
  * same thing an exact number would.
  */
 const TEAM_VIEW_OMITTED_COUNT_CAP = 500;
+export const TEAM_BROADCAST_MAX_TARGETS = 100;
+export const TEAM_BROADCAST_RECENT_IDLE_LIMIT = 100;
 
 /**
  * The narrator columns a team listing renders. Deliberately narrower than the
@@ -1550,13 +1552,52 @@ export const narratorService = {
 		});
 	},
 
+	/** Status defines broadcast membership; recent idle members are suggestions only. */
+	async listSubagentsForBroadcast(parentNarratorId: string, senderId: string, now = Date.now()) {
+		const columns = {
+			id: narrators.id,
+			title: narrators.title,
+			traits: narrators.traits,
+			variant: narrators.variant,
+			status: narrators.status,
+		};
+		const scope = and(
+			eq(narrators.parentNarratorId, parentNarratorId),
+			notInArray(narrators.id, [senderId]),
+			sql`${narrators.variant} LIKE 'subagent:%'`,
+		);
+		// Match the existing last-activity convention, not incidental title/settings edits.
+		const lastActivity = sql<string>`COALESCE(${narrators.lastMessageAt}, ${narrators.updatedAt}, ${narrators.createdAt})`;
+		const targets = await db
+			.select(columns)
+			.from(narrators)
+			.where(and(scope, inArray(narrators.status, ["working", "waiting"])))
+			.limit(TEAM_BROADCAST_MAX_TARGETS + 1)
+			.all();
+		const idle = await db
+			.select({ ...columns, lastActivityAt: lastActivity })
+			.from(narrators)
+			.where(
+				and(
+					scope,
+					eq(narrators.status, "idle"),
+					sql`${lastActivity} >= ${new Date(now - 60 * 60 * 1000).toISOString()}`,
+					sql`${lastActivity} <= ${new Date(now).toISOString()}`,
+				),
+			)
+			.orderBy(desc(lastActivity), desc(narrators.id))
+			.limit(TEAM_BROADCAST_RECENT_IDLE_LIMIT + 1)
+			.all();
+		return {
+			targets,
+			recentIdle: idle.slice(0, TEAM_BROADCAST_RECENT_IDLE_LIMIT),
+			recentIdleTruncated: idle.length > TEAM_BROADCAST_RECENT_IDLE_LIMIT,
+		};
+	},
+
 	/**
-	 * List all subagents belonging to a parent narrator.
-	 *
-	 * Unbounded on purpose: selector resolution (`Send`, `Await`, `ContextAsk`)
-	 * needs to see every candidate or it would report "no such subagent" for one
-	 * that exists. Callers that only DISPLAY the team must use
-	 * `listSubagentsForTeamView`, which is bounded.
+	 * Unbounded on purpose for explicit Send/Await/ContextAsk selector resolution.
+	 * Display uses listSubagentsForTeamView; broadcast uses listSubagentsForBroadcast.
 	 */
 	async listSubagentsByParent(parentNarratorId: string) {
 		return db.query.narrators.findMany({

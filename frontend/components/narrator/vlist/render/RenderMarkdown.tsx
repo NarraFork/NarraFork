@@ -52,6 +52,7 @@ import { hasUnpredictableBlock } from "../vlist-unpredictable-blocks";
 import "../vlist-markdown.css";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { getTypographyRevision } from "@shared/pretext-layout/typography";
+import { TokenText } from "../../content/TokenLines";
 import { VListCodeCopyButton } from "../VListCodeCopyButton";
 import { CaretFiller } from "./caret-filler";
 import { FragmentGap, LINE_FRAGMENTS_STYLE, LineFragments } from "./line-fragments";
@@ -63,7 +64,6 @@ import {
 	StreamAnimStore,
 	splitFragmentForAnim,
 } from "./stream-token-anim";
-import { TokenText } from "./TokenLines";
 
 /**
  * Module-level boundary memory shared by every streaming markdown render. Keyed

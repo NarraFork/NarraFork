@@ -16,6 +16,7 @@ import {
 import type { CreatedPublicShare, PublicShareLink } from "@shared/public-narrator-share";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { formatLocaleDateTime } from "../../lib/intl-format";
 import { useClipboard } from "../../hooks/useClipboard";
 import { useNarratorPublicShares } from "../../hooks/useNarratorPublicShares";
 import { authorizedFetch, readFetchError, request } from "../../lib/api/client";
@@ -28,7 +29,7 @@ export function NarratorPublicShareManager({
 	narratorId: string;
 	canManage: boolean;
 }) {
-	const { t } = useTranslation("narrator");
+	const { t, i18n } = useTranslation("narrator");
 	const links = useNarratorPublicShares(narratorId, canManage);
 	const [guestName, setGuestName] = useState("");
 	const [label, setLabel] = useState("");
@@ -213,12 +214,14 @@ export function NarratorPublicShareManager({
 								{share.label || t("publicShares.noLabel")}
 							</Text>
 							<Text size="xs" c="dimmed">
-								{t("publicShares.createdAt", { date: new Date(share.createdAt).toLocaleString() })}
+								{t("publicShares.createdAt", {
+									date: formatLocaleDateTime(share.createdAt, undefined, i18n.resolvedLanguage),
+								})}
 							</Text>
 							{share.revokedAt ? (
 								<Text size="xs" c="dimmed">
 									{t("publicShares.revokedAt", {
-										date: new Date(share.revokedAt).toLocaleString(),
+										date: formatLocaleDateTime(share.revokedAt, undefined, i18n.resolvedLanguage),
 									})}
 								</Text>
 							) : (

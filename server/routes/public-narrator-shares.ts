@@ -1,4 +1,7 @@
+import { eq } from "drizzle-orm";
 import { Hono } from "hono";
+import { db } from "../db";
+import { narrators } from "../db/schema";
 import { getClientIp } from "../lib/client-ip";
 import { AppError, RateLimitError } from "../lib/errors";
 import {
@@ -6,11 +9,8 @@ import {
 	publicSharePageSchema,
 } from "../lib/validators/public-narrator-shares";
 import { listPublicDiscussion, postPublicDiscussion } from "../services/chat-service";
+import { narratorService } from "../services/narrator-service";
 import { PUBLIC_SHARE_LIMITS as L } from "../services/public-narrator-share-limits";
-import {
-	getPublicSharedTool,
-	listPublicSharedMessages,
-} from "../services/public-narrator-share-messages";
 import { publicShareRateLimiter } from "../services/public-narrator-share-rate-limit";
 import {
 	createPublicShare,
@@ -18,10 +18,10 @@ import {
 	listPublicShares,
 	revalidatePublicShare,
 	revokePublicShare,
+	unavailablePublicShare,
 	type VerifiedPublicShare,
 	verifyPublicShare,
 } from "../services/public-narrator-share-service";
-import { publicNarratorShareStreams } from "../services/public-narrator-share-stream";
 
 /** Bounded at the stream, even when Content-Length is absent or dishonest. */
 export async function readPublicShareJson(request: Request): Promise<unknown> {
@@ -158,12 +158,76 @@ publicNarratorShareRoutes.get("/:shareId", (c) =>
 publicNarratorShareRoutes.get("/:shareId/session", (c) =>
 	c.json(getPublicSharedSession(c.get("publicShare"))),
 );
-publicNarratorShareRoutes.get("/:shareId/messages", (c) =>
-	c.json(listPublicSharedMessages(c.get("publicShare"), c.req.query())),
-);
-publicNarratorShareRoutes.get("/:shareId/tools/:toolUseId", (c) =>
-	c.json(getPublicSharedTool(c.get("publicShare"), c.req.param("toolUseId"))),
-);
+
+// ── Narrator document read-through ──────────────────────────────────────────
+// The share link IS the grant: these forward verbatim to the narrator read
+// services (no projection), so a share reader sees exactly what the session
+// owner sees. Parameter parsing mirrors the authenticated routes in
+// `server/routes/narrators.ts` — keep them in sync.
+publicNarratorShareRoutes.get("/:shareId/pretext-document", async (c) => {
+	const auth = c.get("publicShare");
+	const afterSeqRaw = c.req.query("afterSeq");
+	const beforeSeqRaw = c.req.query("beforeSeq");
+	const limitRaw = c.req.query("limit");
+	const messageVersionRaw = c.req.query("messageVersion");
+	const afterSeq = afterSeqRaw != null ? Number.parseInt(afterSeqRaw, 10) : undefined;
+	const beforeSeq = beforeSeqRaw != null ? Number.parseInt(beforeSeqRaw, 10) : undefined;
+	const requestedLimit = limitRaw != null ? Number.parseInt(limitRaw, 10) : undefined;
+	const expectedMessageVersion =
+		messageVersionRaw != null ? Number.parseInt(messageVersionRaw, 10) : undefined;
+	const limit =
+		requestedLimit != null && !Number.isNaN(requestedLimit)
+			? Math.min(Math.max(requestedLimit, 1), 100)
+			: 100;
+	const result = await narratorService.getPretextDocumentPage(auth.narratorId, {
+		afterSeq: afterSeq != null && !Number.isNaN(afterSeq) ? afterSeq : undefined,
+		beforeSeq: beforeSeq != null && !Number.isNaN(beforeSeq) ? beforeSeq : undefined,
+		limit,
+		messageVersion:
+			expectedMessageVersion != null && !Number.isNaN(expectedMessageVersion)
+				? expectedMessageVersion
+				: undefined,
+	});
+	// Read the message version AFTER the page, never concurrently — the page
+	// builder's lazy-ref backfill bumps it, and only the sequenced read observes
+	// the same post-backfill version (see the narrator route's note).
+	const narratorMeta = await db.query.narrators.findFirst({
+		where: eq(narrators.id, auth.narratorId),
+		columns: { messageVersion: true },
+	});
+	if (!narratorMeta) throw unavailablePublicShare();
+	if (narratorMeta.messageVersion !== result.messageVersion)
+		throw new AppError(
+			"Narrator message version changed while the exact-layout page was being built",
+			409,
+			"PRETEXT_DOCUMENT_CHANGED",
+		);
+	revalidatePublicShare(auth);
+	return c.json(result);
+});
+publicNarratorShareRoutes.get("/:shareId/message-location/:messageId", async (c) => {
+	const auth = c.get("publicShare");
+	const location = await narratorService.getMessageLocation(
+		auth.narratorId,
+		c.req.param("messageId"),
+	);
+	revalidatePublicShare(auth);
+	return c.json(location);
+});
+publicNarratorShareRoutes.get("/:shareId/tool-calls/:toolUseId", async (c) => {
+	const auth = c.get("publicShare");
+	const detail = await narratorService.getToolCallDetail(
+		auth.narratorId,
+		c.req.param("toolUseId"),
+		{
+			toolCallId: c.req.query("toolCallId"),
+			messageId: c.req.query("messageId"),
+		},
+	);
+	revalidatePublicShare(auth);
+	return c.json(detail);
+});
+
 publicNarratorShareRoutes.get("/:shareId/discussion", async (c) => {
 	const auth = c.get("publicShare");
 	const parsed = publicSharePageSchema.safeParse(c.req.query());
@@ -188,16 +252,6 @@ publicNarratorShareRoutes.post("/:shareId/discussion", async (c) => {
 	});
 	revalidatePublicShare(auth);
 	return c.json(message, 201);
-});
-publicNarratorShareRoutes.get("/:shareId/events", (c) => {
-	const stream = publicNarratorShareStreams.open(
-		c.get("publicShare"),
-		c.get("publicIp"),
-		c.req.raw.signal,
-	);
-	c.header("Content-Type", "text/event-stream; charset=utf-8");
-	c.header("X-Accel-Buffering", "no");
-	return c.body(stream);
 });
 // Terminating fallbacks are essential: an invalid sharing path must NEVER execute
 // SessionAuth or a first-party route registered later on the parent Hono app.

@@ -7,7 +7,6 @@
  */
 
 import type { ChatMessage } from "../../lib/api/chat";
-import type { ChatMeasureIdentity } from "./chat-measure-cache";
 
 /**
  * Window within which a follow-up message from the same author is "grouped"
@@ -207,25 +206,6 @@ export function resolveReplyPreview(
 	if (!info) return null;
 	if (info.state === "unavailable") return null;
 	return info.preview;
-}
-
-/** Measure identity for one row (what the cache keys on). */
-export function toMeasureIdentity(row: ChatRowInput): ChatMeasureIdentity {
-	return {
-		id: row.message.id,
-		text: row.message.deletedAt ? "" : row.message.contentText,
-		deleted: !!row.message.deletedAt,
-		// `text` alone cannot separate two revisions of one message: the cache's text
-		// signature is length plus the first and last 64 characters, so an edit that
-		// preserves those would reuse the old measured height.
-		editedAt: row.message.editedAt,
-		replyPreview: row.replyPreview,
-		// Passed explicitly: a reply whose target is deleted or unresolvable has an
-		// empty preview but still draws a strip, which the preview cannot express.
-		hasReply: row.reply !== null,
-		grouped: row.grouped,
-		attachments: row.message.attachments ?? [],
-	};
 }
 
 /** Whether a scroll position counts as pinned to the bottom. */

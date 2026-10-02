@@ -108,6 +108,12 @@ export const chatApi = {
 		);
 	},
 
+	/** Resolve a message id to its room seq (the vlist's jump coordinate). */
+	getChatMessageLocation: (roomId: string, messageId: string) =>
+		request<{ messageId: string; seq: number }>(
+			`/chat/rooms/${roomId}/messages/${messageId}/location`,
+		),
+
 	postChatMessage: (
 		roomId: string,
 		data: { text: string; replyToMessageId?: string | null; attachmentIds?: string[] },

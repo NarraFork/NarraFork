@@ -47,6 +47,8 @@ async function seedSubagent(opts: {
 	status?: "idle" | "working" | "waiting" | "archived";
 	title?: string | null;
 	traits?: string[];
+	lastMessageAt?: string;
+	updatedAt?: string;
 }): Promise<void> {
 	await db.insert(narrators).values({
 		id: opts.id,
@@ -57,7 +59,8 @@ async function seedSubagent(opts: {
 		title: opts.title ?? `sub ${opts.id}`,
 		traits: opts.traits ?? [],
 		createdAt: opts.createdAt,
-		updatedAt: opts.createdAt,
+		updatedAt: opts.updatedAt ?? opts.createdAt,
+		lastMessageAt: opts.lastMessageAt,
 	});
 }
 
@@ -90,6 +93,107 @@ function isoAt(seconds: number): string {
 	return new Date(Date.UTC(2026, 0, 1, 0, 0, seconds)).toISOString();
 }
 
+describe("listSubagentsForBroadcast", () => {
+	test("4000 historical members do not enter working/waiting targets or recent idle suggestions", async () => {
+		await seedParent();
+		for (let batch = 0; batch < 8; batch++) {
+			await db.insert(narrators).values(
+				Array.from({ length: 500 }, (_, i) => ({
+					id: `old-${batch * 500 + i}`,
+					type: "subagent" as const,
+					variant: "subagent:general",
+					parentNarratorId: PARENT,
+					status: "idle" as const,
+					createdAt: isoAt(0),
+					updatedAt: isoAt(0),
+				})),
+			);
+		}
+		await seedSubagent({ id: "working", status: "working", createdAt: isoAt(0) });
+		await seedSubagent({ id: "waiting", status: "waiting", createdAt: isoAt(0) });
+		await seedSubagent({ id: "recent", createdAt: isoAt(7199) });
+		await seedSubagent({ id: "archived", status: "archived", createdAt: isoAt(7199) });
+		const view = await narratorService.listSubagentsForBroadcast(
+			PARENT,
+			PARENT,
+			Date.parse(isoAt(7200)),
+		);
+		expect(view.targets.map((n) => n.id).sort()).toEqual(["waiting", "working"]);
+		expect(view.recentIdle.map((n) => n.id)).toEqual(["recent"]);
+		expect(view.recentIdleTruncated).toBe(false);
+		expect(Object.keys(view.targets[0] ?? {}).sort()).toEqual([
+			"id",
+			"status",
+			"title",
+			"traits",
+			"variant",
+		]);
+	});
+	test("recent idle uses last message activity, inclusive hour boundary, with legacy fallback", async () => {
+		await seedParent();
+		await seedSubagent({ id: "boundary", createdAt: isoAt(0), lastMessageAt: isoAt(3600) });
+		await seedSubagent({ id: "recent", createdAt: isoAt(0), lastMessageAt: isoAt(7199) });
+		await seedSubagent({
+			id: "stale-message-new-settings",
+			createdAt: isoAt(0),
+			lastMessageAt: isoAt(3599),
+			updatedAt: isoAt(7200),
+		});
+		await seedSubagent({ id: "legacy", createdAt: isoAt(0), updatedAt: isoAt(6000) });
+		await seedSubagent({ id: "future", createdAt: isoAt(7201) });
+		const view = await narratorService.listSubagentsForBroadcast(
+			PARENT,
+			PARENT,
+			Date.parse(isoAt(7200)),
+		);
+		expect(view.recentIdle.map((n) => n.id)).toEqual(["recent", "legacy", "boundary"]);
+		expect(view.recentIdle[0]?.lastActivityAt).toBe(isoAt(7199));
+	});
+	test("excludes sender, unrelated parent and non-subagent forks", async () => {
+		await seedParent();
+		await seedSubagent({ id: "self", status: "waiting", createdAt: isoAt(7199) });
+		await db.insert(narrators).values([
+			{
+				id: "foreign",
+				variant: "subagent:general",
+				status: "working",
+				createdAt: isoAt(7199),
+				updatedAt: isoAt(7199),
+			},
+			{
+				id: "fork",
+				parentNarratorId: PARENT,
+				variant: "primary",
+				status: "working",
+				createdAt: isoAt(7199),
+				updatedAt: isoAt(7199),
+			},
+		]);
+		const view = await narratorService.listSubagentsForBroadcast(
+			PARENT,
+			"self",
+			Date.parse(isoAt(7200)),
+		);
+		expect(view.targets).toHaveLength(0);
+		expect(view.recentIdle).toHaveLength(0);
+	});
+	test("bounds active candidates and recent idle suggestions independently", async () => {
+		await seedParent();
+		for (let i = 0; i < 105; i++) {
+			await seedSubagent({ id: `live-${i}`, status: "working", createdAt: isoAt(0) });
+			await seedSubagent({ id: `idle-${i}`, createdAt: isoAt(3600 + i) });
+		}
+		const view = await narratorService.listSubagentsForBroadcast(
+			PARENT,
+			PARENT,
+			Date.parse(isoAt(7200)),
+		);
+		expect(view.targets).toHaveLength(101);
+		expect(view.recentIdle).toHaveLength(100);
+		expect(view.recentIdleTruncated).toBe(true);
+		expect(view.recentIdle[0]?.id).toBe("idle-104");
+	});
+});
 describe("listSubagentsForTeamView", () => {
 	test("returns the newest members and reports the exact remainder", async () => {
 		await seedParent();

@@ -32,7 +32,8 @@ const dependencies = {
 };
 const code = new Bun.Transpiler({ loader: "ts" }).transformSync(`
 function useBindings({ narratorId, selectionIndex, rowHandlers, openEditor,
-	messagesById, rowToolMetaIndex, manifestItems, renderItems, setOriginalModalMessageId }) {
+	messagesById, rowToolMetaIndex, manifestItems, renderItems, setOriginalModalMessageId,
+	messageSelectedIds, onToggleMessageSelect }) {
 	${source.slice(start, end)}
 	return interactionsByKey;
 }`);

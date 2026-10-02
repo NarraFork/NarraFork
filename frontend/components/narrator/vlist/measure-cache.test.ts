@@ -85,6 +85,62 @@ describe("mixed action-card append cache locality", () => {
 	});
 });
 
+describe("chat grouped-header cached measurements", () => {
+	it("remeasures a grouped row when a tail reload makes it the first row", async () => {
+		const { measureCache } = await import("./measure-cache");
+		const { measureElementCached, VLIST_REGISTRY } = await import("./registry");
+		const { adaptSegment } = await import("./segment-adapter");
+		const adapt = (omitHeader: boolean) => {
+			const spec = adaptSegment(
+				{
+					kind: "message",
+					msg: {
+						id: "stable-chat-message",
+						role: "user",
+						contentJson: [{ type: "text", text: "Unchanged body" }],
+						omitHeader,
+					},
+				},
+				{ lod: 5 },
+			)[0];
+			if (!spec) throw new Error("missing user bubble spec");
+			return spec;
+		};
+		const measure = (spec: import("./segment-adapter").ElementSpec) =>
+			measureElementCached(spec.kind, spec.data, 600, 5, spec.opts, spec.key, "chat:0");
+		measureCache.clear();
+		try {
+			const grouped = adapt(true);
+			const first = measure(grouped);
+			const withHeader = adapt(false);
+			expect(withHeader.key).toBe(grouped.key);
+			const second = measure(withHeader);
+			expect(second).not.toBe(first);
+			expect(second.height).toBeGreaterThan(first.height);
+			expect(second).toEqual(
+				VLIST_REGISTRY[withHeader.kind].measure(withHeader.data, 600, 5, withHeader.opts),
+			);
+			expect(measure(adapt(false))).toBe(second);
+			const regrouped = measure(adapt(true));
+			expect(regrouped).not.toBe(second);
+			expect(regrouped.height).toBe(first.height);
+			expect(measureCache.misses).toBe(3);
+			expect(measureCache.hits).toBe(1);
+		} finally {
+			measureCache.clear();
+		}
+	});
+
+	it("normalizes effective defaults and invalidates a change of body format", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const base = { role: "user", text: "**same body**" };
+		const initial = extractDataRevision(base);
+		expect(extractDataRevision({ ...base, hasHeader: true, bodyFormat: "plain" })).toBe(initial);
+		expect(extractDataRevision({ ...base, hasHeader: false })).not.toBe(initial);
+		expect(extractDataRevision({ ...base, bodyFormat: "markdown" })).not.toBe(initial);
+	});
+});
+
 describe("ask-in-passing cached measurements", () => {
 	beforeEach(async () => {
 		const { measureCache } = await import("./measure-cache");

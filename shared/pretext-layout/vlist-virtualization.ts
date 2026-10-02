@@ -118,3 +118,20 @@ export function itemIndexAtOffset(items: readonly LaidOutItem[], offsetY: number
 	}
 	return Math.min(low, items.length - 1);
 }
+
+/**
+ * How many tail items arrived between the reader's last seen tail KEY and the
+ * list's new tail, computed as an INDEX delta. A flat +1 under-reports a burst
+ * that lands in a single commit — the normal case, since several appends often
+ * coalesce into one render.
+ *
+ * The first page (`previousKey === ""`) is not new traffic, a shrinking or
+ * replaced tail (the previous key is gone) is a prepend / cache replacement
+ * rather than an arrival, and a reader who already saw the tail gets zero.
+ */
+export function unseenKeyArrivals(previousKey: string, nextKeys: readonly string[]): number {
+	if (previousKey === "" || nextKeys.length === 0) return 0;
+	const previousIndex = nextKeys.indexOf(previousKey);
+	if (previousIndex < 0) return 0;
+	return Math.max(0, nextKeys.length - 1 - previousIndex);
+}

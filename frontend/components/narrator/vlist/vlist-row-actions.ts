@@ -18,7 +18,10 @@
  */
 
 import type { RevertScope } from "../../../lib/api/narrators";
-import type { MessageContextMenuActions } from "../message/MessageContextMenuCtx";
+import type {
+	CustomMessageMenuItem,
+	MessageContextMenuActions,
+} from "../message/MessageContextMenuCtx";
 import type { VListToolMeta } from "./vlist-tool-meta";
 
 /**
@@ -101,6 +104,13 @@ export interface VListRowHandlers {
 	 * hidden, exactly like the standalone narrator embed.
 	 */
 	onOpenFilePanel?: (filePath: string) => void;
+	/**
+	 * Host-defined extra menu items (a chat room's reply/delete, a share page's
+	 * "copy text"). Called per row with the owning message id; absent/undefined
+	 * result → no extra section. Keep it referentially stable (useCallback) —
+	 * rowActionHandlerDependencies keys on it.
+	 */
+	customMessageActions?: (messageId: string) => CustomMessageMenuItem[] | undefined;
 }
 
 /**
@@ -125,6 +135,7 @@ export function rowActionHandlerDependencies(
 		handlers?.onDetachBash,
 		handlers?.onCancelBackgroundTask,
 		handlers?.onOpenFilePanel,
+		handlers?.customMessageActions,
 	];
 }
 
@@ -281,6 +292,9 @@ export function buildRowCtxActions(
 	} else if (target.editable !== false && handlers.onEditMessage) {
 		actions.onEditMessage = () => handlers.onEditMessage?.(messageId);
 	}
+
+	const customItems = handlers.customMessageActions?.(messageId);
+	if (customItems && customItems.length > 0) actions.customItems = customItems;
 
 	return actions;
 }

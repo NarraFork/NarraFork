@@ -1,17 +1,13 @@
 import type {
 	PublicDiscussionMessage,
 	PublicDiscussionPage,
-	PublicSharedMessagePage,
 	PublicSharedSession,
-	PublicSharedToolDetail,
-	PublicShareEvent,
 } from "@shared/public-narrator-share";
+import type { PretextDocumentPageResult } from "./api/types";
 import { apiUrl, assetUrl } from "./base-path";
 
-const MAX_RESPONSE_BYTES = 1024 * 1024;
-const MAX_EVENT_CHARS = 64 * 1024;
+const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 20_000;
-const STREAM_IDLE_TIMEOUT_MS = 45_000;
 const IDENTIFIER = /^[a-zA-Z0-9_-]{1,128}$/;
 const TOOL_IDENTIFIER = /^[A-Za-z0-9_:.-]{1,128}$/;
 const CREDENTIAL = /^[a-zA-Z0-9_-]{32,256}$/;
@@ -48,96 +44,6 @@ export function publicShareExternalHref(href: string | undefined, origin: string
 		return url.href;
 	} catch {
 		return null;
-	}
-}
-
-function validKind(value: unknown): value is "text" | "reasoning" {
-	return value === "text" || value === "reasoning";
-}
-
-/** A closed display protocol, not a pass-through for internal WS or tool events. */
-export function parsePublicShareEvent(raw: string): PublicShareEvent {
-	if (raw.length > MAX_EVENT_CHARS) throw new PublicShareError(502);
-	const event = JSON.parse(raw);
-	if (!event || typeof event !== "object") throw new PublicShareError(502);
-	switch (event.type) {
-		case "ping":
-		case "reset":
-		case "revoked":
-			return { type: event.type };
-		case "invalidate":
-			if (["messages", "discussion", "session"].includes(event.scope)) {
-				return { type: "invalidate", scope: event.scope };
-			}
-			break;
-		case "snapshot":
-			if (
-				Array.isArray(event.blocks) &&
-				event.blocks.length <= 256 &&
-				typeof event.truncated === "boolean" &&
-				event.blocks.every(
-					(block: { id?: unknown; kind?: unknown; text?: unknown }) =>
-						block &&
-						typeof block.id === "string" &&
-						block.id.length <= 256 &&
-						validKind(block.kind) &&
-						typeof block.text === "string",
-				)
-			) {
-				return {
-					type: "snapshot",
-					blocks: event.blocks.map(
-						(block: { id: string; kind: "text" | "reasoning"; text: string }) => ({
-							id: block.id,
-							kind: block.kind,
-							text: block.text,
-						}),
-					),
-					truncated: event.truncated,
-				};
-			}
-			break;
-		case "delta":
-			if (
-				typeof event.blockId === "string" &&
-				event.blockId.length <= 256 &&
-				validKind(event.kind) &&
-				typeof event.text === "string" &&
-				Number.isSafeInteger(event.offset) &&
-				event.offset >= 0
-			) {
-				return {
-					type: "delta",
-					blockId: event.blockId,
-					kind: event.kind,
-					text: event.text,
-					offset: event.offset,
-				};
-			}
-	}
-	throw new PublicShareError(502);
-}
-
-export class PublicShareSseParser {
-	private buffer = "";
-	push(chunk: string): PublicShareEvent[] {
-		this.buffer += chunk;
-		const events: PublicShareEvent[] = [];
-		while (true) {
-			const end = /\r?\n\r?\n/.exec(this.buffer);
-			if (!end) break;
-			const frame = this.buffer.slice(0, end.index);
-			this.buffer = this.buffer.slice(end.index + end[0].length);
-			if (frame.length > MAX_EVENT_CHARS) throw new PublicShareError(502);
-			const data = frame
-				.split(/\r?\n/)
-				.filter((line) => line.startsWith("data:"))
-				.map((line) => line.slice(5).replace(/^ /, ""))
-				.join("\n");
-			if (data) events.push(parsePublicShareEvent(data));
-		}
-		if (this.buffer.length > MAX_EVENT_CHARS) throw new PublicShareError(502);
-		return events;
 	}
 }
 
@@ -190,21 +96,33 @@ export function linkPublicShareSignals(signals: readonly AbortSignal[]): {
 	return { signal: controller.signal, dispose };
 }
 
+/**
+ * The share page's read surface. The document endpoints return the narrator's
+ * OWN shapes (TreeMessage pages, tool detail) — the share link is the grant,
+ * and the shell rendering them is the same PretextExactMessageList the owner
+ * uses. Realtime rides `/ws/narrator` in share-auth mode, not a bespoke SSE.
+ */
 export interface PublicShareClient {
 	session(signal: AbortSignal): Promise<PublicSharedSession>;
-	messages(
+	pretextDocument(
 		signal: AbortSignal,
-		beforeSeq?: number,
-		messageVersion?: number,
-	): Promise<PublicSharedMessagePage>;
+		opts: { afterSeq?: number; beforeSeq?: number; limit?: number; messageVersion?: number },
+	): Promise<PretextDocumentPageResult>;
+	messageLocation(
+		messageId: string,
+		signal: AbortSignal,
+	): Promise<{ messageId: string; topLevelMessageId?: string; seq: number }>;
+	toolCallDetail(
+		toolUseId: string,
+		ref: { toolCallId?: string; messageId?: string },
+		signal: AbortSignal,
+	): Promise<{ inputJson?: unknown; outputJson?: unknown } | null>;
 	discussion(signal: AbortSignal, beforeSeq?: number): Promise<PublicDiscussionPage>;
-	tool(id: string, signal: AbortSignal): Promise<PublicSharedToolDetail>;
 	post(
 		text: string,
 		replyToMessageId: string | undefined,
 		signal: AbortSignal,
 	): Promise<PublicDiscussionMessage>;
-	events(signal: AbortSignal, onEvent: (event: PublicShareEvent) => void): Promise<void>;
 }
 
 /** No internal client imports, storage access, JWT renewal, cookies, redirects or arbitrary URLs. */
@@ -217,7 +135,7 @@ export function createPublicShareClient(shareId: string, credential: string): Pu
 			method: body === undefined ? "GET" : "POST",
 			headers: {
 				Authorization: `Share ${credential}`,
-				Accept: suffix === "/events" ? "text/event-stream" : "application/json",
+				Accept: "application/json",
 				...(body === undefined ? {} : { "Content-Type": "application/json" }),
 			},
 			body,
@@ -244,23 +162,41 @@ export function createPublicShareClient(shareId: string, credential: string): Pu
 			linked.dispose();
 		}
 	}
-	function paging(beforeSeq?: number, messageVersion?: number) {
-		const query = new URLSearchParams({ limit: "50" });
-		if (beforeSeq !== undefined && Number.isSafeInteger(beforeSeq) && beforeSeq > 0)
-			query.set("beforeSeq", String(beforeSeq));
-		if (messageVersion !== undefined && Number.isSafeInteger(messageVersion) && messageVersion >= 0)
-			query.set("messageVersion", String(messageVersion));
-		return query;
-	}
 	return {
 		session: (signal) => json("", signal),
-		messages: (signal, beforeSeq, version) =>
-			json(`/messages?${paging(beforeSeq, version)}`, signal),
-		discussion: (signal, beforeSeq) => json(`/discussion?${paging(beforeSeq)}`, signal),
-		tool: (id, signal) => {
-			if (!TOOL_IDENTIFIER.test(id) || id === "." || id === "..")
+		pretextDocument: (signal, opts) => {
+			const query = new URLSearchParams();
+			if (opts.afterSeq !== undefined && Number.isSafeInteger(opts.afterSeq))
+				query.set("afterSeq", String(opts.afterSeq));
+			if (opts.beforeSeq !== undefined && Number.isSafeInteger(opts.beforeSeq))
+				query.set("beforeSeq", String(opts.beforeSeq));
+			if (opts.limit !== undefined && Number.isSafeInteger(opts.limit))
+				query.set("limit", String(opts.limit));
+			if (opts.messageVersion !== undefined && Number.isSafeInteger(opts.messageVersion))
+				query.set("messageVersion", String(opts.messageVersion));
+			const suffix = query.size ? `/pretext-document?${query}` : "/pretext-document";
+			return json(suffix, signal);
+		},
+		messageLocation: (messageId, signal) => {
+			if (!IDENTIFIER.test(messageId)) return Promise.reject(new PublicShareError(400));
+			return json(`/message-location/${encodeURIComponent(messageId)}`, signal);
+		},
+		toolCallDetail: (toolUseId, ref, signal) => {
+			if (!TOOL_IDENTIFIER.test(toolUseId) || toolUseId === "." || toolUseId === "..")
 				return Promise.reject(new PublicShareError(400));
-			return json(`/tools/${encodeURIComponent(id)}`, signal);
+			const query = new URLSearchParams();
+			if (ref.toolCallId) query.set("toolCallId", ref.toolCallId);
+			if (ref.messageId) query.set("messageId", ref.messageId);
+			const suffix = query.size
+				? `/tool-calls/${encodeURIComponent(toolUseId)}?${query}`
+				: `/tool-calls/${encodeURIComponent(toolUseId)}`;
+			return json(suffix, signal);
+		},
+		discussion: (signal, beforeSeq) => {
+			const query = new URLSearchParams({ limit: "50" });
+			if (beforeSeq !== undefined && Number.isSafeInteger(beforeSeq) && beforeSeq > 0)
+				query.set("beforeSeq", String(beforeSeq));
+			return json(`/discussion?${query}`, signal);
 		},
 		post: (text, replyToMessageId, signal) => {
 			if (
@@ -276,41 +212,6 @@ export function createPublicShareClient(shareId: string, credential: string): Pu
 				signal,
 				JSON.stringify({ text, ...(replyToMessageId ? { replyToMessageId } : {}) }),
 			);
-		},
-		async events(signal, onEvent) {
-			const idle = new AbortController();
-			let timer = setTimeout(() => idle.abort(), STREAM_IDLE_TIMEOUT_MS);
-			const linked = linkPublicShareSignals([signal, idle.signal]);
-			let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-			try {
-				const response = await fetchShare("/events", linked.signal);
-				if (!response.headers.get("content-type")?.includes("text/event-stream"))
-					throw new PublicShareError(502);
-				reader = response.body?.getReader();
-				if (!reader) throw new PublicShareError(502);
-				const decoder = new TextDecoder();
-				const parser = new PublicShareSseParser();
-				while (!signal.aborted) {
-					const { value, done } = await reader.read();
-					if (done) break;
-					clearTimeout(timer);
-					timer = setTimeout(() => idle.abort(), STREAM_IDLE_TIMEOUT_MS);
-					// Parse bounded pieces even if a proxy coalesces many frames into one read.
-					for (let offset = 0; offset < value.length; offset += 16_384) {
-						for (const event of parser.push(
-							decoder.decode(value.subarray(offset, offset + 16_384), { stream: true }),
-						)) {
-							if (signal.aborted) return;
-							onEvent(event);
-						}
-					}
-				}
-			} finally {
-				clearTimeout(timer);
-				linked.dispose();
-				await reader?.cancel().catch(() => {});
-				reader?.releaseLock();
-			}
 		},
 	};
 }

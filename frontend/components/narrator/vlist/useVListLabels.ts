@@ -595,6 +595,7 @@ export function useVListLabels(): VListLabels {
 				liveTailChars: (formatted: string) => t("reasoningChars", { formatted }),
 				// A live reasoning row that has opened but carries no text yet.
 				reasoningPending: t("reasoningPending"),
+				reasoningEmpty: t("reasoningEmpty"),
 				// Same bundle the tool card and the subagent card use: a folded row now
 				// carries its own duration + lifecycle popover.
 				timing,

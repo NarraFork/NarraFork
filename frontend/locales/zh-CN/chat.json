@@ -31,6 +31,7 @@
 	"summaryPreviewHint": "可以先修改，然后作为用户消息发送给叙述者。",
 	"cancel": "取消",
 	"messageDeleted": "该消息已删除",
+	"emptyRoom": "暂无消息",
 	"loadOlder": "加载更早的消息",
 	"historyStart": "会话开始",
 	"newMessages": "{{count}} 条新消息",

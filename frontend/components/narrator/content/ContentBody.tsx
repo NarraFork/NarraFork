@@ -12,7 +12,7 @@ import { type CSSProperties, lazy, Suspense, useMemo } from "react";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import { DiffContent } from "../diff/DiffContent";
 import { MarkdownContent } from "../markdown/MarkdownContent";
-import { TokenFlowText } from "../vlist/render/TokenLines";
+import { TokenFlowText } from "./TokenLines";
 
 const HighlightedCode = lazy(() =>
 	import("../markdown/HighlightedCode").then((module) => ({ default: module.HighlightedCode })),

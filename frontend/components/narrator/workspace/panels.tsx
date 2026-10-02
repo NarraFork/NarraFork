@@ -40,7 +40,7 @@ import type {
 	KnowledgePanelParams,
 	NarratorBoundPanelParams,
 } from "../panels/panel-kind";
-import { usePanelCompact, usePanelHeaderDrag } from "../panels/shared";
+import { usePanelCompact, usePanelGeometryReady, usePanelHeaderDrag } from "../panels/shared";
 import type { WebviewLeafConfig } from "../split-tree";
 import {
 	type NarratorPanelParams,
@@ -80,7 +80,8 @@ const WorkspaceTerminalPanel = lazy(() =>
 /** Narrator cell adapter. Child sessions open as secondary Dockview tabs. */
 function NarratorDockPanel(props: IDockviewPanelProps<NarratorPanelParams>) {
 	const { narratorId } = props.params;
-	const { ref, compact } = usePanelCompact();
+	const { ref: compactRef, compact } = usePanelCompact();
+	const { ref, geometryReady } = usePanelGeometryReady(compactRef);
 	const directorActive = useWorkspaceDirectorActive();
 	const [isActive, setIsActive] = useState(props.api.isActive);
 
@@ -106,7 +107,7 @@ function NarratorDockPanel(props: IDockviewPanelProps<NarratorPanelParams>) {
 
 	const content = (
 		<Box ref={ref} style={{ height: "100%", overflow: "hidden" }}>
-			{!directorActive && (
+			{geometryReady && !directorActive && (
 				<NarratorPanelVisibilityProvider value={isActive}>
 					<NarratorPanel
 						key={narratorId}

@@ -51,7 +51,20 @@ export function buildAnchors(entries: readonly AnchorEntry[]): LineAnchor[] {
 	const sorted = [...entries].sort((a, b) => a.top - b.top);
 	const unique: AnchorEntry[] = [];
 	for (const entry of sorted) {
-		if (unique.length > 0 && unique[unique.length - 1].line === entry.line) continue;
+		// A semantic tree need not follow source order (numeric JSON keys, reopened
+		// INI sections). Sorting by line would invent a different visual order;
+		// dropping only the offending row would silently map it to another key.
+		// Reject the whole map so BOTH directions use proportional sync instead.
+		if (
+			!Number.isFinite(entry.line) ||
+			!Number.isFinite(entry.top) ||
+			!Number.isFinite(entry.height) ||
+			entry.line < 0
+		)
+			return [];
+		const previous = unique[unique.length - 1];
+		if (previous && entry.line < previous.line) return [];
+		if (previous?.line === entry.line) continue;
 		unique.push(entry);
 	}
 	return unique.map((entry, i) => {
@@ -73,9 +86,14 @@ export function buildAnchors(entries: readonly AnchorEntry[]): LineAnchor[] {
  * `lineForScrollTop`. Returns null when there is nothing anchored to go by.
  */
 export function scrollTopForLine(anchors: readonly LineAnchor[], line: number): number | null {
-	if (anchors.length === 0) return null;
+	if (anchors.length === 0 || !Number.isFinite(line)) return null;
 	if (line <= 0) return 0;
-	let previous = anchors[0];
+	// Leading whitespace/comments may leave the first anchor after line zero.
+	// Interpolate from the document origin rather than dividing the first
+	// anchor's line interval by itself (which used to produce 0/0).
+	const first = anchors[0];
+	if (line < first.line) return (line / first.line) * first.top;
+	let previous = first;
 	for (const anchor of anchors) {
 		if (anchor.line === line) return anchor.top;
 		if (anchor.line > line) {
@@ -101,14 +119,14 @@ export function lineForScrollTop(
 	lineCount: number,
 	_fallbackLineHeight = 1,
 ): number {
-	if (anchors.length === 0) return 0;
+	if (anchors.length === 0 || !Number.isFinite(offset)) return 0;
 	if (offset <= 0) return 0;
 	for (let i = 0; i < anchors.length; i++) {
 		const previous = anchors[i];
 		const next = anchors[i + 1];
 		const end = previous.top + previous.height;
 		if (offset < previous.top) {
-			if (!i) return 0;
+			if (!i) return Math.min(lineCount, (offset / Math.max(1, previous.top)) * previous.line);
 			const before = anchors[i - 1];
 			const progress = (offset - before.top) / Math.max(1, previous.top - before.top);
 			return Math.min(lineCount, before.line + progress * (previous.line - before.line));
@@ -142,8 +160,44 @@ export function collectPreviewAnchors(scroller: HTMLElement, lineCount?: number)
 			height: rect.height,
 		});
 	}
-	if (lineCount != null && !entries.some((entry) => entry.line === lineCount)) {
+	// A sentinel alone cannot locate any content (parse-error/oversized preview).
+	if (entries.length && lineCount != null && !entries.some((entry) => entry.line === lineCount)) {
 		entries.push({ line: lineCount, top: scroller.scrollHeight, height: 1 });
 	}
 	return buildAnchors(entries);
+}
+
+/** Coalesce preview commits/layout changes without observing scroll/style writes. */
+export function observePreviewAnchorChanges(scroller: HTMLElement, refresh: () => void) {
+	let timer: ReturnType<typeof setTimeout> | null = null;
+	let disposed = false;
+	const schedule = () => {
+		if (disposed || timer !== null) return;
+		timer = setTimeout(() => {
+			timer = null;
+			refresh();
+		}, 100);
+	};
+	const mutationObserver =
+		typeof MutationObserver === "undefined" ? null : new MutationObserver(schedule);
+	mutationObserver?.observe(scroller, {
+		childList: true,
+		characterData: true,
+		subtree: true,
+		attributes: true,
+		attributeFilter: ["data-line"],
+	});
+	const resizeObserver =
+		typeof ResizeObserver === "undefined" ? null : new ResizeObserver(schedule);
+	resizeObserver?.observe(scroller);
+	return {
+		schedule,
+		dispose() {
+			disposed = true;
+			mutationObserver?.disconnect();
+			resizeObserver?.disconnect();
+			if (timer !== null) clearTimeout(timer);
+			timer = null;
+		},
+	};
 }

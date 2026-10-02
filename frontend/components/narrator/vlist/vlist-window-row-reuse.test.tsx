@@ -96,6 +96,8 @@ const PROP_KEYS = {
 	streamAnimMountEpoch: true,
 	streamAnimSnapshotEpoch: true,
 	specTaskLive: true,
+	onQuoteJump: true,
+	onFetchAttachment: true,
 } satisfies Record<keyof ExactRowProps, true>;
 
 describe("window row element frames", () => {

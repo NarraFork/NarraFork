@@ -5,8 +5,6 @@ import {
 	createPublicShareClient,
 	linkPublicShareSignals,
 	PublicShareError,
-	PublicShareSseParser,
-	parsePublicShareEvent,
 	publicShareExternalHref,
 	readPublicShareToken,
 } from "./public-share-api";
@@ -98,28 +96,23 @@ describe("anonymous public share fetch boundary", () => {
 		const calls: { url: string; init: RequestInit }[] = [];
 		replaceGlobal("fetch", async (url: string, init: RequestInit) => {
 			calls.push({ url, init });
-			return url.endsWith("/events")
-				? new Response('data: {"type":"ping"}\n\n', {
-						headers: { "Content-Type": "text/event-stream" },
-					})
-				: Response.json({});
+			return Response.json({});
 		});
 		const client = createPublicShareClient("share-id", credential);
 		const signal = new AbortController().signal;
 		await client.session(signal);
-		await client.messages(signal, 123, 7);
+		await client.pretextDocument(signal, { beforeSeq: 123, messageVersion: 7, limit: 50 });
 		await client.discussion(signal, 100);
-		await client.tool("tool-1", signal);
+		await client.toolCallDetail("tool-1", {}, signal);
+		await client.messageLocation("msg-1", signal);
 		await client.post("hello", "message-1", signal);
-		const events: unknown[] = [];
-		await client.events(signal, (event) => events.push(event));
 		expect(calls.map((call) => call.url)).toEqual([
 			"/api/public/narrator-shares/share-id",
-			"/api/public/narrator-shares/share-id/messages?limit=50&beforeSeq=123&messageVersion=7",
+			"/api/public/narrator-shares/share-id/pretext-document?beforeSeq=123&limit=50&messageVersion=7",
 			"/api/public/narrator-shares/share-id/discussion?limit=50&beforeSeq=100",
-			"/api/public/narrator-shares/share-id/tools/tool-1",
+			"/api/public/narrator-shares/share-id/tool-calls/tool-1",
+			"/api/public/narrator-shares/share-id/message-location/msg-1",
 			"/api/public/narrator-shares/share-id/discussion",
-			"/api/public/narrator-shares/share-id/events",
 		]);
 		for (const { url, init } of calls) {
 			expect(url).not.toContain(credential);
@@ -129,73 +122,10 @@ describe("anonymous public share fetch boundary", () => {
 			expect(init.redirect).toBe("error");
 			expect(new Headers(init.headers).get("authorization")).toBe(`Share ${credential}`);
 		}
-		expect(JSON.parse(calls[4].init.body as string)).toEqual({
+		expect(JSON.parse(calls[5].init.body as string)).toEqual({
 			text: "hello",
 			replyToMessageId: "message-1",
 		});
-		expect(events).toEqual([{ type: "ping" }]);
-	});
-
-	test("REST and SSE still work when AbortSignal.any is absent", async () => {
-		const descriptor = Object.getOwnPropertyDescriptor(AbortSignal, "any");
-		Object.defineProperty(AbortSignal, "any", { value: undefined, configurable: true });
-		const calls: string[] = [];
-		replaceGlobal("fetch", async (url: string) => {
-			calls.push(url);
-			return url.endsWith("/events")
-				? new Response('data: {"type":"ping"}\n\n', {
-						headers: { "Content-Type": "text/event-stream" },
-					})
-				: Response.json({});
-		});
-		try {
-			const client = createPublicShareClient("share", credential);
-			const signal = new AbortController().signal;
-			await client.session(signal);
-			await client.messages(signal);
-			await client.discussion(signal);
-			await client.post("hello", undefined, signal);
-			await client.tool("tool", signal);
-			const events: unknown[] = [];
-			await client.events(signal, (event) => events.push(event));
-			expect(calls).toHaveLength(6);
-			expect(events).toEqual([{ type: "ping" }]);
-		} finally {
-			if (descriptor) Object.defineProperty(AbortSignal, "any", descriptor);
-			else Reflect.deleteProperty(AbortSignal, "any");
-		}
-	});
-
-	test.each([200, 503])("REST and SSE detach session listeners after HTTP %s", async (status) => {
-		const controller = new AbortController();
-		const add = spyOn(controller.signal, "addEventListener");
-		const remove = spyOn(controller.signal, "removeEventListener");
-		replaceGlobal("fetch", async (url: string) =>
-			url.endsWith("/events")
-				? new Response('data: {"type":"ping"}\n\n', {
-						status,
-						headers: { "Content-Type": "text/event-stream" },
-					})
-				: Response.json({}, { status }),
-		);
-		try {
-			const client = createPublicShareClient("share", credential);
-			for (const operation of [
-				() => client.session(controller.signal),
-				() => client.events(controller.signal, () => {}),
-			]) {
-				if (status === 200) await operation();
-				else await expect(operation()).rejects.toBeInstanceOf(PublicShareError);
-			}
-			expect(add).toHaveBeenCalledTimes(2);
-			expect(remove).toHaveBeenCalledTimes(2);
-			for (let index = 0; index < 2; index++) {
-				expect(remove.mock.calls[index][1]).toBe(add.mock.calls[index][1]);
-			}
-		} finally {
-			add.mockRestore();
-			remove.mockRestore();
-		}
 	});
 
 	test("failure never reads, clears or renews a signed-in token", async () => {
@@ -254,7 +184,9 @@ describe("anonymous public share fetch boundary", () => {
 			PublicShareError,
 		);
 		const client = createPublicShareClient("share", credential);
-		await expect(client.tool("../files", signal)).rejects.toBeInstanceOf(PublicShareError);
+		await expect(client.toolCallDetail("../files", {}, signal)).rejects.toBeInstanceOf(
+			PublicShareError,
+		);
 		await expect(client.post("x".repeat(8001), undefined, signal)).rejects.toBeInstanceOf(
 			PublicShareError,
 		);
@@ -273,10 +205,10 @@ describe("anonymous public share fetch boundary", () => {
 		});
 		const client = createPublicShareClient("share", credential);
 		const signal = new AbortController().signal;
-		await client.tool("provider:call.123", signal);
-		expect(url).toBe("/api/public/narrator-shares/share/tools/provider%3Acall.123");
+		await client.toolCallDetail("provider:call.123", {}, signal);
+		expect(url).toBe("/api/public/narrator-shares/share/tool-calls/provider%3Acall.123");
 		for (const id of [".", "..", "a/b"])
-			await expect(client.tool(id, signal)).rejects.toBeInstanceOf(PublicShareError);
+			await expect(client.toolCallDetail(id, {}, signal)).rejects.toBeInstanceOf(PublicShareError);
 	});
 
 	test("responses are bounded before JSON parsing", async () => {
@@ -287,7 +219,9 @@ describe("anonymous public share fetch boundary", () => {
 				new Response(
 					new ReadableStream({
 						start(controller) {
-							controller.enqueue(new Uint8Array(1024 * 1024 + 1));
+							// The document window budget is 32 MiB (a full pretext window);
+							// one byte past it must abort the read rather than buffer it.
+							controller.enqueue(new Uint8Array(32 * 1024 * 1024 + 1));
 						},
 						cancel() {
 							cancelled = true;
@@ -315,48 +249,7 @@ describe("anonymous public share fetch boundary", () => {
 	});
 });
 
-describe("public display protocol", () => {
-	test("SSE handles split CRLF, comments, data frames and combined frames", () => {
-		const parser = new PublicShareSseParser();
-		expect(parser.push(': heartbeat\r\n\r\ndata: {"type":"p')).toEqual([]);
-		expect(parser.push('ing"}\r\n\r')).toEqual([]);
-		expect(parser.push('\ndata: {"type":"reset"}\n\ndata: {"type":"revoked"}\n\n')).toEqual([
-			{ type: "ping" },
-			{ type: "reset" },
-			{ type: "revoked" },
-		]);
-	});
-
-	test("only whitelisted events and display fields survive", () => {
-		expect(
-			parsePublicShareEvent(
-				JSON.stringify({
-					type: "snapshot",
-					truncated: false,
-					raw: "secret",
-					blocks: [{ id: "b", kind: "text", text: "hello", filePath: "/secret" }],
-				}),
-			),
-		).toEqual({
-			type: "snapshot",
-			truncated: false,
-			blocks: [{ id: "b", kind: "text", text: "hello" }],
-		});
-		for (const event of [
-			{ type: "permission_request" },
-			{ type: "delta", blockId: "b", kind: "text", text: "x", offset: -1 },
-			{ type: "delta", blockId: "b", kind: "html", text: "x", offset: 0 },
-			{ type: "invalidate", scope: "terminal" },
-			{ type: "snapshot", blocks: [null], truncated: false },
-		])
-			expect(() => parsePublicShareEvent(JSON.stringify(event))).toThrow();
-	});
-
-	test("oversized complete and incomplete frames are rejected", () => {
-		expect(() => new PublicShareSseParser().push("x".repeat(65537))).toThrow();
-		expect(() => new PublicShareSseParser().push(`${"x".repeat(65537)}\n\n`)).toThrow();
-	});
-
+describe("public display boundary", () => {
 	test("internal, relative, credentialed and active links are inert", () => {
 		for (const href of [
 			"/api/files",

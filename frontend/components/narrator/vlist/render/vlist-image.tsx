@@ -68,8 +68,9 @@ function sourceIdentity(
 	filePath: string | undefined,
 	imageId: string | undefined,
 	uploadNarratorId: string | undefined,
+	fetchUrl?: string | undefined,
 ): string {
-	return JSON.stringify([previewUrl, filePath, imageId, uploadNarratorId]);
+	return JSON.stringify([previewUrl, filePath, imageId, uploadNarratorId, fetchUrl]);
 }
 
 /** The source lanes a ref can resolve through, plus what already failed. */
@@ -81,6 +82,8 @@ export interface ImageSourceState {
 	/** An uploaded image id, usable only together with a narrator id. */
 	imageId?: string;
 	uploadNarratorId?: string;
+	/** A caller-named authenticated API path (chat attachments and friends). */
+	fetchUrl?: string;
 	/** The blob URL the fetch lane produced, if it has settled. */
 	blobUrl: string | null;
 	/** True once the blob fetch itself failed (network / 404 / too large). */
@@ -101,12 +104,12 @@ export function resolveImageSource(state: ImageSourceState): {
 	direct: string | null;
 	error: boolean;
 } {
-	const { rawDirect, filePath, imageId, uploadNarratorId, blobUrl, failedSrcs } = state;
+	const { rawDirect, filePath, imageId, uploadNarratorId, fetchUrl, blobUrl, failedSrcs } = state;
 	const direct = rawDirect != null && failedSrcs.has(rawDirect) ? null : rawDirect;
 	// A retired blob makes the fetch lane spent: keeping it "available" here is what
 	// would let the direct URL be offered again and restart the flip-flop.
 	const deadBlob = blobUrl != null && failedSrcs.has(blobUrl);
-	const hasFallback = (!!filePath || !!(imageId && uploadNarratorId)) && !deadBlob;
+	const hasFallback = (!!filePath || !!(imageId && uploadNarratorId) || !!fetchUrl) && !deadBlob;
 	const deadDirect = rawDirect != null && failedSrcs.has(rawDirect) && !hasFallback;
 	return { direct, error: state.fetchError || deadDirect || deadBlob };
 }
@@ -121,6 +124,14 @@ export interface VListImageRef {
 	imageFormat?: string;
 	/** Upload-scoped narrator id (falls back to the panel narratorId). */
 	uploadNarratorId?: string;
+	/**
+	 * An arbitrary authenticated API path whose bytes are the image (fetched with
+	 * the session token, same as the filePath/uploads lanes). This is the seam for
+	 * surfaces whose media live behind a domain endpoint instead of the narrator
+	 * upload store — e.g. a chat attachment (`/chat/attachments/:id`), which
+	 * re-checks room access server-side. Last-resort lane after filePath/imageId.
+	 */
+	fetchUrl?: string;
 }
 
 /**
@@ -156,7 +167,8 @@ export function useResolvedImageSrc(
 	const filePath = ref?.filePath;
 	const imageId = ref?.imageId;
 	const uploadNarratorId = ref?.uploadNarratorId ?? narratorId;
-	const identity = sourceIdentity(rawDirect, filePath, imageId, uploadNarratorId);
+	const fetchUrl = ref?.fetchUrl;
+	const identity = sourceIdentity(rawDirect, filePath, imageId, uploadNarratorId, fetchUrl);
 	// Failures recorded for a DIFFERENT image must not suppress this one's sources.
 	const failedSrcs = failed?.identity === identity ? failed.srcs : NO_FAILED_SOURCES;
 	// Once a direct URL is known dead, stop offering it so the fetch path below can
@@ -166,6 +178,7 @@ export function useResolvedImageSrc(
 		filePath,
 		imageId,
 		uploadNarratorId,
+		fetchUrl,
 		blobUrl,
 		fetchError: error,
 		failedSrcs,
@@ -179,12 +192,16 @@ export function useResolvedImageSrc(
 			return;
 		}
 		if (!supported) return;
-		// Decide the fetch endpoint: fs preview by path, else uploads by id.
+		// Decide the fetch endpoint: fs preview by path, uploads by id, then a
+		// caller-named authenticated path (chat attachments and other domain
+		// endpoints whose bytes sit behind the session token).
 		let url: string | null = null;
 		if (filePath) {
 			url = `${apiUrl("/fs/preview")}?path=${encodeURIComponent(filePath)}`;
 		} else if (imageId && uploadNarratorId) {
 			url = apiUrl(`/uploads/${uploadNarratorId}/${imageId}`);
+		} else if (fetchUrl) {
+			url = apiUrl(fetchUrl);
 		}
 		if (!url) return;
 
@@ -219,7 +236,7 @@ export function useResolvedImageSrc(
 			cancelled = true;
 			if (objectUrl) URL.revokeObjectURL(objectUrl);
 		};
-	}, [direct, filePath, imageId, uploadNarratorId, supported]);
+	}, [direct, filePath, imageId, uploadNarratorId, fetchUrl, supported]);
 
 	const src = direct ?? blobUrl;
 	/**
@@ -311,9 +328,11 @@ export function VListImage({
 }: VListImageProps) {
 	const uploadCapability = useUploadCapability();
 	const openImageViewer = useImageViewer();
-	// Direct preview URLs and fs-preview reads don't need the narrator-serving
-	// capability; only uploads-by-id does. Treat non-upload paths as supported.
-	const needsUploadServe = !media.previewUrl && !media.filePath && !!media.imageId;
+	// Direct preview URLs, fs-preview reads and caller-named authenticated paths
+	// don't need the narrator-serving capability; only uploads-by-id does. Treat
+	// non-upload paths as supported.
+	const needsUploadServe =
+		!media.previewUrl && !media.filePath && !media.fetchUrl && !!media.imageId;
 	const supported = !needsUploadServe || uploadCapability.serveNarratorImages.supported;
 	const { src, error, onLoadError } = useResolvedImageSrc(media, narratorId, supported);
 	const filename = media.filename ?? "image";

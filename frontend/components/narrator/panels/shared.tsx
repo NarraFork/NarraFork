@@ -5,7 +5,7 @@
  */
 
 import type { IDockviewPanelProps } from "dockview-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { type PanelDragSubjectKind, startPanelDrag } from "../../../lib/panel-drag";
 import { useDockviewSurfaceId } from "../../dockview";
 
@@ -33,6 +33,51 @@ export function usePanelCompact(): {
 	}, []);
 	useEffect(() => () => roRef.current?.disconnect(), []);
 	return { ref, compact };
+}
+
+/**
+ * Dockview's always-rendered panels mount inside an unpositioned overlay. Its
+ * actual size is written on the next animation frame, even though the content
+ * can already read a temporary full-surface width. Mount expensive content only
+ * after that first positioning; never gate it again during moves or tab changes.
+ */
+export function usePanelGeometryReady(onAttach: (el: HTMLDivElement | null) => void): {
+	ref: (el: HTMLDivElement | null) => void;
+	geometryReady: boolean;
+} {
+	const [node, setNode] = useState<HTMLDivElement | null>(null);
+	const [geometryReady, setGeometryReady] = useState(false);
+	const ref = useCallback(
+		(el: HTMLDivElement | null) => {
+			onAttach(el);
+			setNode(el);
+		},
+		[onAttach],
+	);
+	useLayoutEffect(() => {
+		if (!node || geometryReady) return;
+		const overlay = node.closest<HTMLElement>(".dv-render-overlay");
+		if (!overlay) {
+			setGeometryReady(true);
+			return;
+		}
+		const isPositioned = () =>
+			overlay.style.visibility !== "hidden" &&
+			Number.parseFloat(overlay.style.width) > 0 &&
+			Number.parseFloat(overlay.style.height) > 0;
+		if (isPositioned()) {
+			setGeometryReady(true);
+			return;
+		}
+		const observer = new MutationObserver(() => {
+			if (!isPositioned()) return;
+			observer.disconnect();
+			setGeometryReady(true);
+		});
+		observer.observe(overlay, { attributes: true, attributeFilter: ["style"] });
+		return () => observer.disconnect();
+	}, [node, geometryReady]);
+	return { ref, geometryReady };
 }
 
 /**

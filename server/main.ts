@@ -115,6 +115,11 @@ import {
 } from "./services/oauth-ws-ticket-service";
 import { registerProjectDbSync } from "./services/project-db-sync";
 import { recoverProviderPrefixMigrationOnStartup } from "./services/provider-prefix-migration-service";
+import { publicShareConnectionBudget } from "./services/public-narrator-share-connections";
+import {
+	type VerifiedPublicShare,
+	verifyPublicShare,
+} from "./services/public-narrator-share-service";
 import { initReviewEventHandler } from "./services/review-event-handler";
 import { terminalService } from "./services/terminal-service";
 import {
@@ -967,6 +972,48 @@ function startServer(listenPort: number) {
 
 				// WebSocket upgrade for /ws/narrator and /ws/terminal
 				if (url.pathname.startsWith("/ws")) {
+					// Anonymous public-share reader: `?share=<shareId>&token=<secret>` instead
+					// of a session JWT. Verified once at upgrade, scoped at subscribe time
+					// (narrator-ws reads `ws.data.publicShare`), and dropped on revocation.
+					const shareId = url.searchParams.get("share");
+					if (shareId && url.pathname === "/ws/narrator") {
+						const shareToken = url.searchParams.get("token");
+						if (!shareToken) {
+							return new Response("Authentication required", { status: 401 });
+						}
+						let share: VerifiedPublicShare;
+						try {
+							share = verifyPublicShare(shareId, `Share ${shareToken}`);
+						} catch {
+							return new Response("Share link unavailable", { status: 401 });
+						}
+						const wsData = resolveWSData(url, undefined, undefined, undefined, share);
+						if (!wsData) {
+							return new Response("Unknown WebSocket endpoint", { status: 404 });
+						}
+						const ip = resolveClientIp({
+							peerIp: server.requestIP(req)?.address,
+							xForwardedFor: req.headers.get("x-forwarded-for"),
+							xRealIp: req.headers.get("x-real-ip"),
+							trustedProxyCidrs: settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"],
+						});
+						if (wsData.channel !== "narrator") {
+							return new Response("Unknown WebSocket endpoint", { status: 404 });
+						}
+						const upgraded = publicShareConnectionBudget.upgrade(share.shareId, ip, (lease) => {
+							wsData.publicShareConnectionLease = lease;
+							return server.upgrade(req, { data: wsData });
+						});
+						if (upgraded === null) {
+							return new Response("Too many sharing connections", {
+								status: 429,
+								headers: { "Retry-After": "15" },
+							});
+						}
+						if (upgraded) return undefined;
+						return new Response("WebSocket upgrade failed", { status: 400 });
+					}
+
 					// Verify JWT from query param
 					const token = url.searchParams.get("token");
 					if (!token) {

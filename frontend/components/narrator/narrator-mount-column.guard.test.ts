@@ -72,14 +72,33 @@ describe("mount column: the loading placeholder never paints a measured width", 
 });
 
 describe("mount column: the scrollbar cannot change the measured width", () => {
-	it("reserves the scrollbar gutter on the list viewport", () => {
+	it("always shows the vertical scrollbar and reserves its gutter on the list viewport", () => {
 		const source = shell();
 		const viewport = source.indexOf("data-pretext-exact-message-list");
 		expect(viewport).toBeGreaterThan(-1);
 		// The style block precedes the marker attribute on the same element.
 		const style = source.slice(source.lastIndexOf("style={{", viewport), viewport);
-		expect(style).toContain('overflow: "auto"');
+		expect(style).toContain('overflowX: "auto"');
+		expect(style).toContain('overflowY: "scroll"');
 		expect(style).toContain('scrollbarGutter: "stable"');
+	});
+});
+
+describe("mount column: dock hosts wait for their first positioned geometry", () => {
+	it("gates narrator content in both focus and workspace adapters", () => {
+		for (const [directory, name] of [
+			["dock", "ChatDockPanel"],
+			["workspace", "NarratorDockPanel"],
+		] as const) {
+			const source = read(NARRATOR_DIR, directory, "panels.tsx");
+			const start = source.indexOf(`function ${name}(`);
+			expect(start).toBeGreaterThan(-1);
+			const end = source.indexOf("\nfunction ", start + 1);
+			const adapter = source.slice(start, end);
+			expect(adapter).toContain("usePanelGeometryReady(compactRef)");
+			expect(adapter).toContain("<Box ref={ref}");
+			expect(adapter).toMatch(/\{geometryReady &&[\s\S]*?<NarratorPanel/);
+		}
 	});
 });
 

@@ -58,6 +58,7 @@ import {
 	collectPreviewAnchors,
 	type LineAnchor,
 	lineForScrollTop,
+	observePreviewAnchorChanges,
 	scrollTopForLine,
 } from "./editor-scroll-sync";
 import {
@@ -466,14 +467,17 @@ function FileEditorDocument({
 		observer.observe(el);
 		return () => observer.disconnect();
 	}, [mode]);
-	// Bidirectional scroll sync. Markdown previews carry data-line anchors (VS
-	// Code's approach), so both directions interpolate SOURCE LINES between
-	// neighbouring block anchors — proportional height sync drifts by whole
-	// screens because rendered block height is not linear in line count. Node
-	// trees have no anchors and keep the proportional fallback. Targets are
-	// approached through rAF followers (exponential ease) instead of throttled
-	// instant writes, so the following pane glides at display refresh rate.
+	// Bidirectional scroll sync. Both preview kinds carry `data-line` anchors:
+	// markdown blocks get them from MarkdownContent, node-tree rows from the
+	// parser (structured-parse stamps each entry's source line). Both directions
+	// interpolate SOURCE LINES between neighbouring anchors — proportional
+	// height sync drifts by whole screens because rendered block height is not
+	// linear in line count. The proportional fallback remains for anchorless
+	// content (parse error, oversized doc). Targets are approached through rAF
+	// followers (exponential ease) instead of throttled instant writes, so the
+	// following pane glides at display refresh rate.
 	const lineAnchorsRef = useRef<LineAnchor[]>([]);
+	const scheduleAnchorRefreshRef = useRef<(() => void) | null>(null);
 	useEffect(() => {
 		if (mode !== "split" || !editor) return;
 		const previewEl = previewScrollRef.current;
@@ -580,32 +584,26 @@ function FileEditorDocument({
 		// (debounced — highlighting arrives in bursts), then realign: the two
 		// maps are exact inverses, so realigning after a live-preview refresh is
 		// a drift correction, never a fight with the side the user is scrolling.
-		let realignTimer: ReturnType<typeof setTimeout> | null = null;
-		const scheduleRealign = () => {
-			if (realignTimer) return;
-			realignTimer = setTimeout(() => {
-				realignTimer = null;
-				refreshAnchors();
-				if (lineAnchorsRef.current.length) syncPreviewToEditor();
-			}, 100);
-		};
-		const mutationObserver =
-			typeof MutationObserver === "undefined" ? null : new MutationObserver(scheduleRealign);
-		mutationObserver?.observe(previewEl, { childList: true, subtree: true });
-		// Split-direction flips and pane resizes change rendered block heights.
-		const resizeObserver =
-			typeof ResizeObserver === "undefined" ? null : new ResizeObserver(scheduleRealign);
-		resizeObserver?.observe(previewEl);
+		const anchorObserver = observePreviewAnchorChanges(previewEl, () => {
+			refreshAnchors();
+			syncPreviewToEditor();
+		});
+		scheduleAnchorRefreshRef.current = anchorObserver.schedule;
 		return () => {
 			subscription.dispose();
 			previewEl.removeEventListener("scroll", previewListener);
-			mutationObserver?.disconnect();
-			resizeObserver?.disconnect();
-			if (realignTimer) clearTimeout(realignTimer);
+			scheduleAnchorRefreshRef.current = null;
+			anchorObserver.dispose();
 			previewFollower.dispose();
 			editorFollower.dispose();
 		};
 	}, [mode, editor]);
+	// React may reuse every preview row and only update data-line; an unchanged
+	// preview can also have a new model line count (the document-end sentinel).
+	// Schedule after the commit, retaining the observers' debounce and teardown.
+	useLayoutEffect(() => {
+		if (previewText !== null) scheduleAnchorRefreshRef.current?.();
+	}, [previewText]);
 	// Restore the fractional reading position once the regenerated preview renders.
 	// Fraction (not absolute pixels) because the new content may be longer or shorter.
 	useLayoutEffect(() => {

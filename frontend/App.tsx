@@ -51,6 +51,7 @@ import {
 	invalidatePluginModelQueries,
 } from "@frontend/components/plugins/notifications";
 import { useBranding } from "@frontend/hooks/useBranding";
+import { useGitBadgeRefresh } from "@frontend/hooks/useGit";
 import { usePluginContributions } from "@frontend/hooks/usePluginContributions";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import {
@@ -158,6 +159,11 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
 	// pre-login surfaces are where telling two instances apart matters most. The
 	// endpoint is public, so this needs no session.
 	useBranding();
+
+	// Foreground/WS-reconnect catch-up for the git status badges (ChapterBar /
+	// NarratorGitBar), which have no polling of their own. App-shell level so a
+	// badge mounted anywhere (narrator page, graph node) benefits.
+	useGitBadgeRefresh();
 
 	// WS reconnect → resync the contribution snapshot (the event stream is only
 	// an invalidation signal; the HTTP response remains the payload of truth).

@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
@@ -164,6 +164,8 @@ test("parent/team/child producers persist into the same mailbox, read projection
 	});
 	expect(await drainPendingInjections("parent")).toHaveLength(1);
 	expect(await drainPendingInjections("parent")).toHaveLength(1);
+	db.update(narrators).set({ status: "working" }).where(eq(narrators.id, "child")).run();
+	const teamOwner = required(tryClaimExecution("child", "subagent"));
 	const team = delivery();
 	await deliverTeamMessage(
 		"child",
@@ -186,6 +188,95 @@ test("parent/team/child producers persist into the same mailbox, read projection
 	expect(await inbox.listInboxRows("child")).toHaveLength(2);
 	expect(state(buffered.id)?.kind).toBe("agent_message");
 	expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(3);
+	teamOwner.release();
+});
+
+test("broadcast-only inbox never authorizes a wake, regardless of persisted recipient status", async () => {
+	for (const status of ["idle", "working", "waiting"] as const) {
+		for (const id of ["parent", "child"]) {
+			db.update(narrators).set({ status }).where(eq(narrators.id, id)).run();
+			const d = delivery(id);
+			await inbox.enqueueInboxAgent(d, d.text, { isBroadcast: true });
+			expect(await inbox.hasWakeEligibleInboxInput(id)).toBe(false);
+			expect(await inbox.wakeInboxIfEligible(id)).toBe(false);
+			expect(getExecutionOwner(id)).toBeUndefined();
+		}
+	}
+	expect(await inbox.listInboxRows("child")).toHaveLength(3);
+});
+
+test("explicit Send and user input behind a broadcast still authorize the correct wake", async () => {
+	const session = await import("../narrator-session");
+	const continuation = spyOn(session, "startParentInboundContinuationIfPossible").mockResolvedValue(
+		{
+			started: true,
+		},
+	);
+	const buffered = spyOn(session, "resumeBufferedMessagesIfIdle").mockResolvedValue({
+		resumed: true,
+	});
+	try {
+		const broadcast = delivery("parent");
+		await inbox.enqueueInboxAgent(broadcast, broadcast.text, { isBroadcast: true });
+		expect(await inbox.wakeInboxIfEligible("parent")).toBe(false);
+		expect(continuation).not.toHaveBeenCalled();
+		const direct = delivery("parent");
+		await inbox.enqueueInboxAgent(direct, direct.text);
+		expect(await inbox.hasWakeEligibleInboxInput("parent")).toBe(true);
+		expect(await inbox.wakeInboxIfEligible("parent")).toBe(true);
+		expect(continuation).toHaveBeenCalledTimes(1);
+		await enqueueBufferedMessage("parent", "explicit user");
+		expect(await inbox.wakeInboxIfEligible("parent")).toBe(true);
+		expect(buffered).toHaveBeenCalledTimes(1);
+	} finally {
+		continuation.mockRestore();
+		buffered.mockRestore();
+	}
+});
+
+test("broadcast arriving during the publication barrier cannot authorize a deferred wake", async () => {
+	const { runtimePublication } = await import("../agent-runtime/publication");
+	let publication: ReturnType<typeof inbox.enqueueInboxAgent> | undefined;
+	const flush = spyOn(runtimePublication, "flushRecipient").mockImplementation((id) => {
+		const d = delivery(id);
+		// SQLite admission commits synchronously; the facade wraps that result in a Promise.
+		publication = inbox.enqueueInboxAgent(d, d.text, { isBroadcast: true });
+		return 0;
+	});
+	try {
+		expect(await inbox.wakeInboxIfEligible("child")).toBe(false);
+		expect(flush).toHaveBeenCalled();
+		await publication;
+		expect(await inbox.listInboxRows("child")).toHaveLength(1);
+		expect(getExecutionOwner("child")).toBeUndefined();
+	} finally {
+		flush.mockRestore();
+	}
+});
+
+test("live runner consumes broadcast without granting a future wake", async () => {
+	const d = delivery();
+	const accepted = await inbox.enqueueInboxAgent(d, d.text, { isBroadcast: true, channel: "team" });
+	const owner = required(tryClaimExecution("child", "subagent"));
+	try {
+		expect(await consume()).toBeDefined();
+		expect(state(accepted.delivery.id)?.state).toBe("materialized");
+	} finally {
+		owner.release();
+	}
+	expect(await inbox.wakeInboxIfEligible("child")).toBe(false);
+});
+
+test("foreign-process broadcast claim recovery requeues without waking historical work", async () => {
+	const d = delivery();
+	const accepted = await inbox.enqueueInboxAgent(d, d.text, { isBroadcast: true });
+	db.update(narratorBufferedMessages)
+		.set({ state: "claimed", claimToken: "process:dead-broadcast:token", claimEpoch: "old" })
+		.where(eq(narratorBufferedMessages.id, accepted.delivery.id))
+		.run();
+	expect(await inbox.recoverInboxClaimsOnColdStartup()).toBe(1);
+	expect(state(accepted.delivery.id)?.state).toBe("queued");
+	expect(await inbox.wakeInboxIfEligible("child")).toBe(false);
 });
 
 test("source receipt is mandatory; exact retry returns original navigation and negative tombstone", async () => {

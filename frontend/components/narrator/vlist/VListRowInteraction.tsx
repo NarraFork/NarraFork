@@ -146,6 +146,12 @@ export interface VListRowInteractionProps {
 	inspectContent?: { title: string; text: string };
 	/** Row body (the pure renderer's output). */
 	children: ReactNode;
+	/**
+	 * Message-level selection (chat rooms), orthogonal to the block-selection
+	 * system: outline when selected, modifier-click toggles. Absent → no chrome.
+	 */
+	selected?: boolean;
+	onToggleSelect?: (opts: { shiftKey: boolean }) => void;
 }
 
 /**
@@ -167,6 +173,8 @@ export function VListRowInteraction({
 	onViewOriginal,
 	onOpenFullscreen,
 	inspectContent,
+	selected,
+	onToggleSelect,
 	children,
 }: VListRowInteractionProps) {
 	const interactive = useRenderInteractive();
@@ -228,6 +236,13 @@ export function VListRowInteraction({
 			const isShift = e.shiftKey;
 			if (!isModKey && !isShift) return;
 			if (shouldIgnoreMessageBlockSelection(e.target)) return;
+			// Message-level selection (chat): the host owns the set; the block
+			// selection system stays the default when no message toggle is wired.
+			if (onToggleSelect) {
+				e.preventDefault();
+				onToggleSelect({ shiftKey: isShift });
+				return;
+			}
 			if (!selection.selectionMode) {
 				const sel = window.getSelection();
 				if (sel && sel.rangeCount > 0 && !sel.isCollapsed) return;
@@ -243,6 +258,7 @@ export function VListRowInteraction({
 		[
 			interactive,
 			isMobile,
+			onToggleSelect,
 			selection.selectionMode,
 			selection.rangeSelectTo,
 			selection.toggleBlock,
@@ -513,6 +529,24 @@ export function VListRowInteraction({
 					{tNarrator("contextMenu_delete")}
 				</Menu.Item>
 			)}
+			{msgCtx.customItems && msgCtx.customItems.length > 0 ? (
+				<>
+					<Menu.Divider />
+					{msgCtx.customItems.map((item) => (
+						<Menu.Item
+							key={item.key}
+							color={item.danger ? "red" : undefined}
+							leftSection={item.icon}
+							onClick={() => {
+								item.onClick();
+								swipe.closeSwipe();
+							}}
+						>
+							{item.label}
+						</Menu.Item>
+					))}
+				</>
+			) : null}
 		</>
 	) : null;
 
@@ -532,6 +566,10 @@ export function VListRowInteraction({
 	const selectionOffset =
 		isMobile && showSelectedVisual && !swipe.swipeRevealed ? SWIPE_REVEAL_WIDTH : 0;
 	const effectiveOffset = swipe.swipeOffset > 0 ? swipe.swipeOffset : selectionOffset;
+	// The chat selection outline reuses the block-selection visual (same tint,
+	// same offset) so the two read as one language.
+	const showMessageSelected = selected === true;
+	const showOutline = showSelectedVisual || showMessageSelected;
 
 	if (!interactive) return <>{children}</>;
 
@@ -552,9 +590,9 @@ export function VListRowInteraction({
 					height: "100%",
 					transform: effectiveOffset > 0 ? `translateX(-${effectiveOffset}px)` : undefined,
 					transition: swipe.swipeTransition,
-					outline: showSelectedVisual ? "2px solid var(--mantine-color-indigo-6)" : undefined,
-					outlineOffset: showSelectedVisual ? -2 : undefined,
-					borderRadius: showSelectedVisual ? 4 : undefined,
+					outline: showOutline ? "2px solid var(--mantine-color-indigo-6)" : undefined,
+					outlineOffset: showOutline ? -2 : undefined,
+					borderRadius: showOutline ? 4 : undefined,
 				}}
 			>
 				{children}

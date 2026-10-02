@@ -100,7 +100,7 @@ if (process.env.NF_AIP_BRIDGE_TEST_CHILD !== "1") {
 			useCancelAskInPassing: () => ({ mutateAsync: cancel }),
 		}));
 		mock.module("@mantine/notifications", () => ({ notifications: { show: notify } }));
-		mock.module("../AskInPassingCard", () => ({ useOpenAskInPassingNarrator: () => open }));
+		mock.module("../question/AskInPassingCard", () => ({ useOpenAskInPassingNarrator: () => open }));
 		useBridge = (await import("./vlist-ask-in-passing-bridge")).useVListAskInPassing;
 	});
 	afterEach(async () => {

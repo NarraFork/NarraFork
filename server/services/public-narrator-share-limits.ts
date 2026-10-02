@@ -1,4 +1,4 @@
-/** Hard budgets shared by the anonymous transcript, discussion and SSE boundary. */
+/** Hard budgets shared by the anonymous transcript, discussion and WebSocket boundary. */
 export const PUBLIC_SHARE_LIMITS = Object.freeze({
 	bodyBytes: 64 * 1024,
 	bodyReadMs: 10_000,

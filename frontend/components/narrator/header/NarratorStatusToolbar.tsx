@@ -25,11 +25,14 @@ const DEFAULT_GAP_PX = 4;
  */
 const MORE_BUTTON_WIDTH_PX = 22;
 /**
- * Locks the status row height so toggling the overflow button or moving the
- * terminal action (whose badge reserves 5px of block padding) can never change
- * the row's height. 28px covers the tallest inline control plus its reserve.
+ * Locks the status row height so toggling the overflow button, moving the
+ * terminal action (whose badge reserves 5px of block padding) or switching
+ * between the wide and narrow panel layouts can never change the row's height.
+ * 30px matches the tallest inline control — the desktop branch's xs
+ * NativeSelect/Button (Mantine `--input-height-xs` / `--button-height-xs`),
+ * which exceeds the ActionIcon-sm rows used by the narrow branch (22px).
  */
-export const NARRATOR_STATUS_ROW_MIN_HEIGHT_PX = 28;
+export const NARRATOR_STATUS_ROW_MIN_HEIGHT_PX = 30;
 /**
  * Space kept for the leading status dot / label / elapsed time. Those controls
  * truncate, so the toolbar may claim everything else on the row.

@@ -147,11 +147,35 @@ type FakeNarrator = {
 	variant: string;
 	status: string;
 	title: string | null;
+	lastActivityAt?: string;
+	traits?: string[];
 };
 
 const narrators = new Map<string, FakeNarrator>();
 
 const fakeNarratorService = {
+	async listSubagentsForBroadcast(parentNarratorId: string, senderId: string, now = Date.now()) {
+		const team = [...narrators.values()].filter(
+			(n) =>
+				n.parentNarratorId === parentNarratorId &&
+				n.id !== senderId &&
+				n.variant.startsWith("subagent:"),
+		);
+		const idle = team.filter(
+			(n) =>
+				n.status === "idle" &&
+				n.lastActivityAt &&
+				Date.parse(n.lastActivityAt) >= now - 3_600_000 &&
+				Date.parse(n.lastActivityAt) <= now,
+		);
+		return {
+			targets: team.filter((n) => n.status === "working" || n.status === "waiting").slice(0, 101),
+			recentIdle: idle
+				.slice(0, 100)
+				.map((n) => ({ ...n, lastActivityAt: n.lastActivityAt as string })),
+			recentIdleTruncated: idle.length > 100,
+		};
+	},
 	async listSubagentsByParent(parentNarratorId: string) {
 		return [...narrators.values()].filter((n) => n.parentNarratorId === parentNarratorId);
 	},
@@ -194,6 +218,7 @@ const fakeNarratorService = {
 };
 
 mock.module("@server/services/narrator-service", () => ({
+	...realNarratorServiceModule,
 	narratorService: fakeNarratorService,
 }));
 
@@ -213,6 +238,7 @@ type DeliveredMessage = {
 
 const teamFileChanges = new Map<string, Map<string, Set<string>>>();
 const deliveredMessages: DeliveredMessage[] = [];
+let deliveryHook: ((targetId: string) => Promise<string | undefined>) | undefined;
 
 mock.module("@server/services/narrator-subagent", () => ({
 	registerTaskAlias(_parentNarratorId: string, _taskId: string, title?: string) {
@@ -227,6 +253,7 @@ mock.module("@server/services/narrator-subagent", () => ({
 		parentNarratorId?: string,
 	) {
 		deliveredMessages.push({ targetId, message, parentNarratorId });
+		return deliveryHook ? deliveryHook(targetId) : `delivery-${targetId}`;
 	},
 }));
 
@@ -285,6 +312,7 @@ function seed() {
 	narrators.clear();
 	teamFileChanges.clear();
 	deliveredMessages.length = 0;
+	deliveryHook = undefined;
 }
 
 describe("Bash stop mode", () => {
@@ -606,11 +634,13 @@ describe("TeamStatus actions", () => {
 		expect(result.output).toContain("worker");
 		expect(result.output).not.toContain("sub-1");
 		expect(result.output).not.toContain("foreign");
-		expect(result.metadata).toEqual({
+		expect(result.metadata).toMatchObject({
 			kind: "send",
 			broadcast: true,
 			await: false,
 			targetCount: 1,
+			targetNames: ["Worker"],
+			recentIdle: [],
 			targets: [{ id: "sub-1", label: "worker", title: "Worker", status: "queued" }],
 		});
 		expect(deliveredMessages).toHaveLength(1);
@@ -729,7 +759,15 @@ describe("TeamStatus actions", () => {
 			broadcast: false,
 			await: false,
 			targetCount: 1,
-			targets: [{ id: "sub-1", label: "explorer", title: "Explorer", status: "queued" }],
+			targets: [
+				{
+					id: "sub-1",
+					deliveryMessageId: "delivery-sub-1",
+					label: "explorer",
+					title: "Explorer",
+					status: "queued",
+				},
+			],
 			warning: "(warning: target is idle, message may not be received)",
 		});
 		expect(deliveredMessages[0]).toMatchObject({
@@ -753,6 +791,136 @@ describe("TeamStatus actions", () => {
  * inform. What has to hold: the cut is reported rather than silent, active members
  * survive it, and an explicit `query` reaches past the window.
  */
+describe("TeamStatus broadcast status scope", () => {
+	function member(id: string, status: string, lastActivityAt?: string) {
+		narrators.set(id, {
+			id,
+			parentNarratorId: "primary",
+			variant: "subagent:general",
+			status,
+			title: `Name ${id}`,
+			lastActivityAt,
+		});
+	}
+	function setup() {
+		seed();
+		narrators.set("primary", {
+			id: "primary",
+			parentNarratorId: null,
+			variant: "primary",
+			status: "working",
+			title: "Main",
+		});
+	}
+	test("4000 historical idle members are not sent to; working/waiting need no runtime owner", async () => {
+		setup();
+		for (let i = 0; i < 4000; i++)
+			member(`old-${i}`, "idle", new Date(Date.now() - 7_200_000).toISOString());
+		member("working", "working");
+		member("waiting", "waiting");
+		member("recent", "idle", new Date(Date.now() - 1000).toISOString());
+		member("archived", "archived", new Date().toISOString());
+		const recent = narrators.get("recent");
+		if (!recent) throw new Error("Missing recent idle fixture");
+		recent.traits = ["subagent-alias:recent-slug"];
+		const result = await teamStatusTool.execute(
+			{ action: "broadcast", message: "New scope" },
+			makeCtx("primary"),
+		);
+		expect(deliveredMessages.map((d) => d.targetId)).toEqual(["working", "waiting"]);
+		expect(result.metadata).toMatchObject({
+			targetCount: 2,
+			targetNames: ["Name working", "Name waiting"],
+			recentIdle: [{ name: "Name recent", slug: "recent-slug", id: "recent" }],
+		});
+		expect(result.output).toContain('name="Name recent" slug=recent-slug id=recent');
+		expect(result.output).toContain("NOT sent to or woken");
+		expect(result.output).not.toContain("old-3999");
+	});
+	test("recent idle suggestions remain visible when there are no recipients", async () => {
+		setup();
+		member("recent", "idle", new Date().toISOString());
+		const result = await teamStatusTool.execute(
+			{ action: "broadcast", message: "Update" },
+			makeCtx("primary"),
+		);
+		expect(deliveredMessages).toHaveLength(0);
+		expect(result.metadata).toMatchObject({
+			targetCount: 0,
+			targetNames: [],
+			recentIdle: [{ id: "recent" }],
+		});
+		expect(result.output).toContain("separate Send");
+	});
+	test("more than 100 working/waiting candidates refuses the entire broadcast", async () => {
+		setup();
+		for (let i = 0; i < 101; i++) member(`live-${i}`, "working");
+		const result = await teamStatusTool.execute(
+			{ action: "broadcast", message: "Update" },
+			makeCtx("primary"),
+		);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("Broadcast refused");
+		expect(result.metadata).toMatchObject({ targetCount: 0, targets: [] });
+		expect(deliveredMessages).toHaveLength(0);
+	});
+	test("idle suggestions are bounded and truncation is reported", async () => {
+		setup();
+		for (let i = 0; i < 101; i++) member(`recent-${i}`, "idle", new Date().toISOString());
+		const result = await teamStatusTool.execute(
+			{ action: "broadcast", message: "Update" },
+			makeCtx("primary"),
+		);
+		expect(result.metadata).toMatchObject({ recentIdleTruncated: true, targetCount: 0 });
+		expect((result.metadata as { recentIdle: unknown[] }).recentIdle).toHaveLength(100);
+		expect(result.output).toContain("100 most recently active");
+		expect(deliveredMessages).toHaveLength(0);
+	});
+	test("ending candidates and failures do not inflate accepted recipient count", async () => {
+		setup();
+		member("ending", "working");
+		member("failed", "working");
+		member("ok", "working");
+		deliveryHook = async (id) => {
+			if (id === "ending") return undefined;
+			if (id === "failed") throw new Error("queue full");
+			return `delivery-${id}`;
+		};
+		const result = await teamStatusTool.execute(
+			{ action: "broadcast", message: "Update" },
+			makeCtx("primary"),
+		);
+		expect(result.isError).toBe(true);
+		expect(result.metadata).toMatchObject({
+			targetCount: 1,
+			targets: [{ id: "ok" }],
+			targetNames: ["Name ending", "Name failed", "Name ok"],
+		});
+	});
+	test("four-worker concurrency and cancellation prevent further admission", async () => {
+		setup();
+		for (let i = 0; i < 20; i++) member(`live-${i}`, "working");
+		const controller = new AbortController();
+		let active = 0;
+		let peak = 0;
+		deliveryHook = async (id) => {
+			active++;
+			peak = Math.max(peak, active);
+			await Promise.resolve();
+			controller.abort();
+			active--;
+			return `delivery-${id}`;
+		};
+		const result = await teamStatusTool.execute(
+			{ action: "broadcast", message: "Update" },
+			{ ...makeCtx("primary"), signal: controller.signal },
+		);
+		expect(peak).toBe(4);
+		expect(deliveredMessages).toHaveLength(4);
+		expect(result.metadata).toMatchObject({ targetCount: 4 });
+		expect(result.output).toContain("Broadcast cancelled");
+	});
+});
 describe("TeamStatus list actions are bounded", () => {
 	function seedAgents(count: number, status: string) {
 		for (let i = 0; i < count; i++) {

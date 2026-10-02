@@ -12,11 +12,14 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { TRACE_SHIMMER_CLASS } from "@shared/tool-shimmer";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { measureReasoning } from "../measure/measure-reasoning";
 import { measureActivityTrace, measureCollapsibleTrace } from "../measure/measure-tool-run";
 import { installCanvasStub } from "../measure/test-canvas-stub";
+import { RenderReasoning } from "./RenderReasoning";
 import { RenderToolRun, type TraceRenderLabels } from "./RenderToolRun";
 
 const disposeCanvasStub = installCanvasStub();
@@ -52,7 +55,10 @@ beforeAll(() => {
 	host = doc.getElementById("host") as unknown as HTMLElement;
 });
 
-const LABELS: TraceRenderLabels = { reasoningPending: "思考中…" };
+const LABELS: TraceRenderLabels = {
+	reasoningPending: "正在思考",
+	reasoningEmpty: "思考已完成（无可见摘要）",
+};
 
 /** One live reasoning row (no status: that is what marks it as reasoning). */
 function reasoningTrace(title: string, shimmer = true) {
@@ -85,7 +91,8 @@ describe("live reasoning row label", () => {
 	it("paints a placeholder while the row has no text", () => {
 		const { root, render } = mount();
 		render(<RenderToolRun measured={reasoningTrace("")} labels={LABELS} />);
-		expect(rowText()).toContain("思考中…");
+		expect(rowText()).toContain("正在思考");
+		expect(host.querySelector(`.${TRACE_SHIMMER_CLASS.streaming}`)).not.toBeNull();
 		// A freshly mounted row is not a switch.
 		expect(fadedLabels()).toBe(0);
 		act(() => root.unmount());
@@ -109,10 +116,58 @@ describe("live reasoning row label", () => {
 		act(() => root.unmount());
 	});
 
-	it("does not show the placeholder on a settled row with no title", () => {
+	it("settles an empty summary with an honest label and stops its shimmer", () => {
 		const { root, render } = mount();
+		render(<RenderToolRun measured={reasoningTrace("")} labels={LABELS} />);
 		render(<RenderToolRun measured={reasoningTrace("", false)} labels={LABELS} />);
-		expect(rowText()).not.toContain("思考中…");
+		expect(rowText()).toContain("思考已完成（无可见摘要）");
+		expect(rowText()).not.toContain("正在思考");
+		expect(host.querySelector(`.${TRACE_SHIMMER_CLASS.streaming}`)).toBeNull();
+		act(() => root.unmount());
+	});
+
+	it("treats a whitespace-only summary as empty", () => {
+		const { root, render } = mount();
+		render(<RenderToolRun measured={reasoningTrace(" \n\t ")} labels={LABELS} />);
+		expect(rowText()).toContain("正在思考");
+		expect(host.querySelector(`.${TRACE_SHIMMER_CLASS.streaming}`)).not.toBeNull();
+		render(<RenderToolRun measured={reasoningTrace(" \n\t ", false)} labels={LABELS} />);
+		expect(rowText()).toContain("思考已完成（无可见摘要）");
+		expect(host.querySelector(`.${TRACE_SHIMMER_CLASS.streaming}`)).toBeNull();
+		act(() => root.unmount());
+	});
+
+	it("uses meaningful fallbacks when labels are omitted", () => {
+		const { root, render } = mount();
+		render(<RenderToolRun measured={reasoningTrace("")} />);
+		expect(rowText()).toContain("Thinking");
+		expect(host.querySelector(`.${TRACE_SHIMMER_CLASS.streaming}`)).not.toBeNull();
+		render(<RenderToolRun measured={reasoningTrace("", false)} />);
+		expect(rowText()).toContain("Thought complete (no visible summary)");
+		act(() => root.unmount());
+	});
+
+	it("does not replace an empty tool title with a reasoning label", () => {
+		const { root, render } = mount();
+		const measured = measureActivityTrace(
+			[{ title: "", hasIcon: true, iconColor: "gray", status: "success" }],
+			WIDTH,
+		);
+		render(<RenderToolRun measured={measured} labels={LABELS} />);
+		expect(rowText()).not.toContain("思考已完成");
+		expect(rowText()).not.toContain("正在思考");
+		act(() => root.unmount());
+	});
+});
+
+describe("standalone reasoning live indicator", () => {
+	it("uses the same text shimmer without changing the measured form", () => {
+		const { root, render } = mount();
+		const measured = measureReasoning({ text: "", isStreaming: true }, WIDTH);
+		expect(measured.form).toBe("streaming");
+		render(<RenderReasoning measured={measured} labels={{ thinking: "正在思考" }} />);
+		expect(host.textContent).toContain("正在思考");
+		expect(host.querySelector(`.${TRACE_SHIMMER_CLASS.streaming}`)).not.toBeNull();
 		act(() => root.unmount());
 	});
 });

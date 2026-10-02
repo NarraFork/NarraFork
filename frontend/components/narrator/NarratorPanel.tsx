@@ -46,7 +46,6 @@ import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
 import { useGitWorkspace } from "../../hooks/useGit";
-import { loadedHumanAttentionItems, useHumanAttention } from "../../hooks/useHumanAttention";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
 import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
@@ -281,17 +280,6 @@ export function NarratorPanel({
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
 	const narrator = narratorProp ?? fetchedNarrator;
-	const humanAttentionQuery = useHumanAttention(!workspacePreview);
-	const attentionItems = loadedHumanAttentionItems(humanAttentionQuery.data?.pages);
-	// Only synchronous decisions owned by this session already have a tail prompt.
-	// Async asks (even when awaited), child sessions and unknown pages still need the inbox.
-	const showHumanAttentionInbox =
-		humanAttentionQuery.isError ||
-		humanAttentionQuery.hasNextPage ||
-		attentionItems.length === 0 ||
-		attentionItems.some(
-			(item) => item.narratorId !== narratorId || item.source === "question" || !item.blocking,
-		);
 	const relaxedPlanForced = narrator?.permissionMode === "bypassPermissions";
 	const relaxedPlanEnabled = relaxedPlanForced || narrator?.relaxedPlan === true;
 
@@ -1099,27 +1087,9 @@ export function NarratorPanel({
 		});
 	}, [dockSetBrowserInfo, wsState.browserSessionCount, wsState.browserVisualChange]);
 
-	// Auto-open the browser dock panel when a NEW session appears (count rises).
-	// The first observed value only seeds the ref so an initial load / reconnect
-	// with pre-existing sessions doesn't force the panel open — only a genuine
-	// increase (a freshly created session) triggers it. Opening an already-open
-	// panel just re-activates it, which is fine when a second session starts.
+	// Browser session updates only refresh panel data and badges. Opening the
+	// browser panel is a user action, not a side effect of loading sessions.
 	const dockOpenToolPanel = dock?.openToolPanel;
-	const prevBrowserSessionCountRef = useRef<number | undefined>(undefined);
-	useEffect(() => {
-		const prev = prevBrowserSessionCountRef.current;
-		const cur = wsState.browserSessionCount;
-		prevBrowserSessionCountRef.current = cur;
-		if (prev === undefined) return;
-		if (cur > prev && !isWorkspacePreview && browserSessionsCapability.supported !== false) {
-			dockOpenToolPanel?.("browser");
-		}
-	}, [
-		dockOpenToolPanel,
-		wsState.browserSessionCount,
-		isWorkspacePreview,
-		browserSessionsCapability.supported,
-	]);
 
 	const {
 		disconnected,
@@ -3367,7 +3337,6 @@ export function NarratorPanel({
 									? () => dock.openToolPanel("git")
 									: () => setMobileToolPanel("git")
 						}
-						showHumanAttentionInbox={showHumanAttentionInbox}
 						isChapterMerged={isChapterMerged}
 						statusBarInputs={{
 							ownsHorizontalSafeArea,

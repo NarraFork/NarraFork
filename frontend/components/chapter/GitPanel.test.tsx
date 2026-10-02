@@ -940,43 +940,6 @@ describe("GitPanel", () => {
 		queryClient.clear();
 	});
 
-	test.each([
-		true,
-		false,
-	])("more menu opens commits and stash with write capability %s", async (write) => {
-		const { container, queryClient } = await renderNarratorWorkspace(
-			readyWorkspace({ capabilities: { read: true, write } }),
-		);
-		try {
-			for (const [view, emptyKey] of [
-				["commits", "commitEmpty"],
-				["stash", "stashEmpty"],
-			] as const) {
-				buttonByLabel(container, i18n.t("git:panel.moreActions")).click();
-				await flushRender();
-				const entry = Array.from(
-					document.querySelectorAll<HTMLButtonElement>("[role=menuitem]"),
-				).find((item) => item.textContent === i18n.t(`git:panel.${view}`));
-				expect(entry).toBeDefined();
-				entry?.click();
-				await flushRender();
-				await flushRender();
-				expect(container.textContent).toContain(i18n.t(`git:${emptyKey}`));
-				expect(
-					container.querySelector(`input[placeholder="${i18n.t("git:commitMessage")}"]`),
-				).toBeNull();
-				buttonByLabel(container, i18n.t("git:panel.backToChanges")).click();
-				await flushRender();
-				expect(
-					container.querySelector(`input[placeholder="${i18n.t("git:commitMessage")}"]`),
-				).not.toBeNull();
-				expect(buttonByLabel(container, i18n.t("git:panel.moreActions"))).toBeTruthy();
-			}
-		} finally {
-			queryClient.clear();
-		}
-	});
-
 	for (const state of [
 		"not_git",
 		"missing_directory",

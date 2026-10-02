@@ -23,6 +23,7 @@ import {
 import {
 	createChatAttachment,
 	discardChatAttachment,
+	getChatMessageLocation,
 	getUnreadSummary,
 	listDirectory,
 	listDmRooms,
@@ -88,6 +89,16 @@ chatRoutes.get("/rooms/:roomId/messages", async (c) => {
 			userId,
 			beforeSeq: parsed.data.beforeSeq,
 			limit: parsed.data.limit,
+		}),
+	);
+});
+
+chatRoutes.get("/rooms/:roomId/messages/:messageId/location", async (c) => {
+	return c.json(
+		await getChatMessageLocation({
+			roomId: c.req.param("roomId"),
+			messageId: c.req.param("messageId"),
+			userId: c.get("user").sub,
 		}),
 	);
 });

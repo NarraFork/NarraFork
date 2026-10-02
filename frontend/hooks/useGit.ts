@@ -21,6 +21,7 @@ import {
 } from "../lib/api/git";
 import { GitWorkspaceSubscriptions } from "../lib/git-workspace-subscription";
 import { type ListenerHandle, narratorWSManager } from "../lib/narrator-ws-manager";
+import { observePageLifecycle } from "../lib/page-lifecycle";
 import { useNarrator } from "./useNarrator";
 
 export type {
@@ -317,6 +318,59 @@ export function useGitStatus(target: GitTarget | undefined | null) {
 		retry: false,
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
+}
+
+/**
+ * Minimum interval between two badge refreshes (ms). `focus` and
+ * `visibilitychange` co-fire on a single return gesture, and a foreground return
+ * usually also triggers the WS reconnect that raises the second signal
+ * milliseconds later — without the throttle one user action buys two or three
+ * invalidations of the same queries.
+ */
+const GIT_BADGE_REFRESH_MIN_INTERVAL_MS = 2_000;
+
+/**
+ * Foreground/reconnect catch-up for the git status badges (ChapterBar /
+ * NarratorGitBar). Mounted ONCE at the app shell, not per bar.
+ *
+ * The badge queries (`gitStatus`, `chapterGitStatus`) are normally kept fresh by
+ * server pushes routed over the narrator WS. Two gaps leave them stale:
+ *
+ * - **Window focus without a visibility change.** React Query's focus manager
+ *   only listens to `visibilitychange`; clicking between two visible windows
+ *   (or Alt-Tab on a WM that keeps the window "visible") fires no such event,
+ *   so the built-in `refetchOnWindowFocus` never triggers.
+ * - **WS reconnect.** Pushes sent while the socket was down are lost, and the
+ *   server-side git workspace subscription only exists while the Git PANEL is
+ *   open (`useGitWorkspaceSubscription`) — a bar without the panel has no
+ *   catch-up of its own, so the badge would keep pre-disconnect numbers
+ *   indefinitely.
+ *
+ * `invalidateQueries` refetches active observers only, so an app showing no
+ * badge pays nothing. Deliberately limited to the two badge queries: the open
+ * Git panel already gets its facts re-invalidated by the `git_workspace_subscribed`
+ * snapshot that follows its resubscribe on reconnect.
+ */
+export function useGitBadgeRefresh() {
+	const qc = useQueryClient();
+	useEffect(() => {
+		let lastRefreshAt = 0;
+		const refresh = () => {
+			const now = Date.now();
+			if (now - lastRefreshAt < GIT_BADGE_REFRESH_MIN_INTERVAL_MS) return;
+			lastRefreshAt = now;
+			void qc.invalidateQueries({ queryKey: ["gitStatus"] });
+			void qc.invalidateQueries({ queryKey: ["chapterGitStatus"] });
+		};
+		const unobserve = observePageLifecycle({ onForeground: refresh });
+		const offConnection = narratorWSManager.onConnectionChange((connected, isReconnect) => {
+			if (connected && isReconnect) refresh();
+		});
+		return () => {
+			unobserve();
+			offConnection();
+		};
+	}, [qc]);
 }
 
 export function useGitModifications(target: GitTarget | undefined | null) {

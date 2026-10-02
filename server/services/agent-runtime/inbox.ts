@@ -336,6 +336,23 @@ export async function hasInboxKind(narratorId: string, kinds: MailboxKind[]): Pr
 		.limit(1)
 		.get();
 }
+/** Wake authority is separate from consumption: broadcasts remain visible to live runners. */
+export async function hasWakeEligibleInboxInput(narratorId: string): Promise<boolean> {
+	const port = getRuntimeQueuePort();
+	if (port) return port.mailbox.hasWakeEligibleInput(narratorId);
+	return !!db
+		.select({ id: mailbox.id })
+		.from(mailbox)
+		.where(
+			and(
+				eq(mailbox.narratorId, narratorId),
+				eq(mailbox.state, "queued"),
+				sql`(${mailbox.kind} = 'user_input' OR (${mailbox.kind} = 'agent_message' AND COALESCE(json_extract(${mailbox.metadataJson}, '$.isBroadcast'), 0) != 1))`,
+			),
+		)
+		.limit(1)
+		.get();
+}
 /**
  * The eligible-head projection the claim predicate sees, widened to the dialect-neutral
  * row. The SQLite `EligibleMailboxHead` narrows `kind` to an enum union; both adapters'
@@ -983,7 +1000,7 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 						.where(eq(narrators.id, narratorId))
 						.get();
 			if (!row || row.status === "archived") return false;
-			if (!(await hasInboxKind(narratorId, ["user_input", "agent_message"]))) {
+			if (!(await hasWakeEligibleInboxInput(narratorId))) {
 				const notice = port
 					? await port.mailbox.hasActionableTaskNotice(narratorId)
 					: !!db

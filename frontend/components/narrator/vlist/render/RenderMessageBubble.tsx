@@ -96,6 +96,19 @@ interface RenderMessageBubbleProps {
 	onOpenAttachment?: (filePath: string) => void;
 	/** Localized label for the clickable attachment row (tooltip / aria). */
 	openAttachmentLabel?: string;
+	/**
+	 * Reply quote strip clicked — the integration layer owns the "load until
+	 * reachable" jump policy; absent → the strip renders non-interactive.
+	 * HEIGHT-NEUTRAL (the strip's box is reserved by the measure pass).
+	 */
+	onQuoteClick?: () => void;
+	/**
+	 * Activate an attachment whose bytes live behind a caller-named authenticated
+	 * path (`fetchUrl`, e.g. a chat attachment). The integration layer owns the
+	 * action (a download with the session token); absent → such rows stay
+	 * non-interactive. HEIGHT-NEUTRAL.
+	 */
+	onFetchAttachment?: (fetchUrl: string, filename: string) => void;
 }
 
 export function RenderMessageBubble({
@@ -109,6 +122,8 @@ export function RenderMessageBubble({
 	onToggle,
 	onOpenAttachment,
 	openAttachmentLabel,
+	onQuoteClick,
+	onFetchAttachment,
 }: RenderMessageBubbleProps) {
 	if (role === "assistant") {
 		return (
@@ -148,6 +163,8 @@ export function RenderMessageBubble({
 			narratorId={narratorId}
 			onOpenAttachment={onOpenAttachment}
 			openAttachmentLabel={openAttachmentLabel}
+			onQuoteClick={onQuoteClick}
+			onFetchAttachment={onFetchAttachment}
 		/>
 	);
 }
@@ -355,6 +372,8 @@ function UserBubble({
 	narratorId,
 	onOpenAttachment,
 	openAttachmentLabel,
+	onQuoteClick,
+	onFetchAttachment,
 }: {
 	measured: MeasuredElement;
 	header?: React.ReactNode;
@@ -363,6 +382,8 @@ function UserBubble({
 	narratorId?: string;
 	onOpenAttachment?: (filePath: string) => void;
 	openAttachmentLabel?: string;
+	onQuoteClick?: () => void;
+	onFetchAttachment?: (fetchUrl: string, filename: string) => void;
 }) {
 	// A user bubble is [attachment…, body?]: attachment blocks are fixed boxes,
 	// the body (when present) is the trailing pre-wrap code block.
@@ -410,16 +431,47 @@ function UserBubble({
 					if (block.kind !== "fixed") return null;
 					const frame = measured.frame.blocks[index];
 					if (!frame) return null;
+					const top = contentTop + frame.top;
+					if (block.tag === "user-quote") {
+						return (
+							<QuoteStrip key="user-quote" block={block} top={top} onQuoteClick={onQuoteClick} />
+						);
+					}
+					if (block.tag === "user-markdown") {
+						return (
+							<div
+								key="user-markdown"
+								style={{
+									position: "absolute",
+									top,
+									left: USER_BUBBLE_PADDING,
+									width: measured.contentWidth,
+									height: block.height,
+									// Unknown Markdown media stays scrollable inside the exact box;
+									// it must not resize an already committed chat row.
+									overflow: "auto",
+								}}
+							>
+								<FileReferenceScopeProvider value={{ context: null }}>
+									<RenderMarkdown measured={block.data?.measured as MeasuredElement} />
+								</FileReferenceScopeProvider>
+							</div>
+						);
+					}
+					if (block.tag === "user-deleted") {
+						return <TombstoneLine key="user-deleted" block={block} top={top} />;
+					}
 					return (
 						<UserAttachmentView
 							// biome-ignore lint/suspicious/noArrayIndexKey: attachment blocks are a stable ordered list (message contentJson order)
 							key={index}
 							block={block}
-							top={contentTop + frame.top}
+							top={top}
 							left={USER_BUBBLE_PADDING}
 							narratorId={narratorId}
 							onOpenAttachment={onOpenAttachment}
 							openAttachmentLabel={openAttachmentLabel}
+							onFetchAttachment={onFetchAttachment}
 						/>
 					);
 				})}
@@ -456,6 +508,125 @@ function UserBubble({
 }
 
 /**
+ * The reply quote strip above a bubble's content: who was quoted, what they
+ * said, click to jump. ONE clamped line inside the exact box the measure pass
+ * reserved — everything truncates rather than wrapping, so no quoted text or
+ * username length can push the row past its reserved line.
+ */
+function QuoteStrip({
+	block,
+	top,
+	onQuoteClick,
+}: {
+	block: PreparedFixedBlock;
+	top: number;
+	onQuoteClick?: () => void;
+}) {
+	const data = block.data ?? {};
+	const authorName =
+		typeof data.authorName === "string" && data.authorName ? data.authorName : null;
+	const text = typeof data.text === "string" ? data.text : "";
+	const state = data.state;
+	const style: React.CSSProperties = {
+		position: "absolute",
+		top,
+		left: USER_BUBBLE_PADDING,
+		right: USER_BUBBLE_PADDING,
+		height: block.height,
+		display: "flex",
+		alignItems: "center",
+		gap: 4,
+		paddingLeft: 6,
+		borderLeft: "3px solid var(--mantine-primary-color-filled)",
+		overflow: "hidden",
+		cursor: onQuoteClick ? "pointer" : "default",
+		boxSizing: "border-box",
+	};
+	const body = (
+		<>
+			{authorName ? (
+				<span
+					style={{
+						flexShrink: 0,
+						maxWidth: "45%",
+						overflow: "hidden",
+						textOverflow: "ellipsis",
+						whiteSpace: "nowrap",
+						font: typographyMetrics().font.xs,
+						fontWeight: 600,
+						color: "var(--mantine-color-dimmed)",
+					}}
+				>
+					{authorName}
+				</span>
+			) : null}
+			<span
+				style={{
+					minWidth: 0,
+					overflow: "hidden",
+					textOverflow: "ellipsis",
+					whiteSpace: "nowrap",
+					font: typographyMetrics().font.xs,
+					fontStyle: state === "quoted" ? undefined : "italic",
+					color: "var(--mantine-color-dimmed)",
+				}}
+			>
+				{text}
+			</span>
+		</>
+	);
+	if (onQuoteClick == null) return <div style={style}>{body}</div>;
+	return (
+		<button
+			type="button"
+			onClick={(event) => {
+				event.stopPropagation();
+				onQuoteClick();
+			}}
+			style={{
+				...style,
+				padding: 0,
+				paddingLeft: 6,
+				border: "none",
+				borderLeft: "3px solid var(--mantine-primary-color-filled)",
+				background: "none",
+				font: typographyMetrics().font.xs,
+				textAlign: "left",
+			}}
+		>
+			{body}
+		</button>
+	);
+}
+
+/**
+ * The tombstone line of a soft-deleted message: one dimmed italic line inside
+ * the reserved box, replacing body AND attachments.
+ */
+function TombstoneLine({ block, top }: { block: PreparedFixedBlock; top: number }) {
+	const data = block.data ?? {};
+	const text = typeof data.text === "string" ? data.text : "";
+	return (
+		<div
+			style={{
+				position: "absolute",
+				top,
+				left: USER_BUBBLE_PADDING,
+				height: block.height,
+				font: typographyMetrics().font.body,
+				fontStyle: "italic",
+				color: "var(--mantine-color-dimmed)",
+				whiteSpace: "pre",
+				overflow: "hidden",
+				textOverflow: "ellipsis",
+			}}
+		>
+			{text}
+		</div>
+	);
+}
+
+/**
  * Paint one user attachment inside the box the measure layer reserved. Images
  * resolve their blob through VListImage (previewUrl → uploads-by-id); text files
  * draw the same single icon+name+size row as the media render copy.
@@ -467,6 +638,7 @@ function UserAttachmentView({
 	narratorId,
 	onOpenAttachment,
 	openAttachmentLabel,
+	onFetchAttachment,
 }: {
 	block: PreparedFixedBlock;
 	top: number;
@@ -474,6 +646,7 @@ function UserAttachmentView({
 	narratorId?: string;
 	onOpenAttachment?: (filePath: string) => void;
 	openAttachmentLabel?: string;
+	onFetchAttachment?: (fetchUrl: string, filename: string) => void;
 }) {
 	const scope = useFileReferenceScope();
 	const data = block.data ?? {};
@@ -482,19 +655,23 @@ function UserAttachmentView({
 		// The path is a height-neutral passthrough from measure; when both it and a
 		// host handler exist the row becomes clickable WITHOUT changing its box.
 		const filePath = str(data.filePath);
+		const fetchUrl = str(data.fetchUrl);
+		const filename = str(data.filename) ?? "";
 		const reference = data.reference as FileReference | undefined;
 		const openFile =
 			block.tag === "user-file-reference"
 				? reference && scope.openFile
 					? () => scope.openFile?.(reference)
 					: undefined
-				: filePath && onOpenAttachment
-					? () => onOpenAttachment(filePath)
-					: undefined;
+				: fetchUrl && onFetchAttachment
+					? () => onFetchAttachment(fetchUrl, filename)
+					: filePath && onOpenAttachment
+						? () => onOpenAttachment(filePath)
+						: undefined;
 		return (
 			<div style={{ position: "absolute", top, left, height: block.height, maxWidth: "100%" }}>
 				<TextFileRow
-					filename={str(data.filename) ?? ""}
+					filename={filename}
 					size={typeof data.size === "number" ? data.size : null}
 					height={block.height}
 					// The exact box measure reserved. Without it the row is unbounded
@@ -529,6 +706,7 @@ function UserAttachmentView({
 					imageId: str(data.imageId),
 					filename: str(data.filename),
 					uploadNarratorId: str(data.uploadNarratorId),
+					fetchUrl: str(data.fetchUrl),
 				}}
 				narratorId={narratorId}
 				maxHeight={block.height}

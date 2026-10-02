@@ -209,6 +209,8 @@ export interface AdapterMessage {
 		username: string;
 		avatarColor?: string | null;
 		avatarImageId?: string | null;
+		/** Share-guest author (chat rooms): initial-avatar + badge instead of a profile. */
+		isGuest?: boolean;
 	} | null;
 	/**
 	 * Who authored the content, independent of `role`. System- and AI-injected
@@ -232,6 +234,27 @@ export interface AdapterMessage {
 	deliveryId?: string | null;
 	deliveryKind?: "user_input" | "agent_message" | "task_notice" | null;
 	deliveryState?: "queued" | "claimed" | "materialized" | "failed" | "cancelled" | null;
+	/**
+	 * Reply quote strip (chat-style surfaces). Projected verbatim into the user
+	 * bubble's data: the strip is one clamped line, so it never changes what the
+	 * bubble's own text would have measured. See measure-message-bubble's
+	 * MeasureQuoteLine (frontend side; this shape is its structural twin).
+	 */
+	replyQuote?: {
+		authorName: string | null;
+		text: string;
+		state: "quoted" | "deleted" | "unavailable";
+		targetId?: string | null;
+		targetSeq?: number | null;
+	} | null;
+	/**
+	 * Tombstone form: the user bubble's body collapses to this localized label
+	 * (chat soft-delete). Height-affecting — it replaces the body's measured wrap.
+	 */
+	deletedLabel?: string;
+	/** Grouped follow-up (same author, close in time): omit the bubble header row. */
+	omitHeader?: boolean;
+	bodyFormat?: "plain" | "markdown";
 }
 
 function deliveryProjection(message?: AdapterMessage): Record<string, unknown> {
@@ -1268,6 +1291,9 @@ function userAttachmentData(block: AdapterContentBlock, msg: AdapterMessage) {
 		// row height (measure keeps TEXT_FILE_HEIGHT), so adding it cannot shift
 		// any predicted geometry.
 		filePath: readNonEmptyString(block, "filePath") ?? null,
+		// HEIGHT-NEUTRAL: an authenticated endpoint serving the bytes (chat
+		// attachments) — resolved by VListImage's fetchUrl lane, never measured.
+		fetchUrl: readNonEmptyString(block, "fetchUrl") ?? null,
 	};
 }
 
@@ -1537,9 +1563,15 @@ function adaptMessage(
 				data: {
 					role: "user",
 					text,
-					hasHeader: true,
+					// Chat-style surfaces fold a follow-up's header (grouping) and may
+					// carry a reply quote strip or a tombstone; the narrator defaults
+					// remain byte-identical when none of these are set.
+					hasHeader: msg.omitHeader !== true,
+					...(msg.bodyFormat ? { bodyFormat: msg.bodyFormat } : {}),
 					creator: msg.creator ?? null,
 					createdAt: msg.createdAt ?? null,
+					...(msg.replyQuote ? { quote: msg.replyQuote } : {}),
+					...(msg.deletedLabel ? { deleted: true, deletedLabel: msg.deletedLabel } : {}),
 					// Height-neutral attribution: the bubble header already reserves its
 					// row, so origin/originLabel only change what the header paints
 					// (name / avatar / badge), never the measured height or cache key.

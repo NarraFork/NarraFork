@@ -16,11 +16,10 @@ import {
 	type UseStatusBarPropsOptions,
 	useStatusBarProps,
 } from "./interaction/use-status-bar-props";
-import { HumanAttentionInboxButton } from "./question/GlobalQuestionInbox";
 
 /**
  * Context shared by several of the interaction area's sub-regions (status bar,
- * queue hook, composer, inbox, merged hint). Passed ONCE and merged locally into
+ * queue hook, composer, merged hint). Passed ONCE and merged locally into
  * the grouped prop objects, rather than repeated inside each of statusBarInputs /
  * queueDeps / composerRowProps by the panel.
  */
@@ -73,9 +72,6 @@ export interface NarratorInteractionAreaProps {
 		UseStatusBarPropsOptions,
 		"narratorId" | "narrator" | "isWorkspacePreview" | "compact" | "isMobileViewport"
 	>;
-
-	// ── Human-attention inbox ──
-	showHumanAttentionInbox: boolean;
 
 	// ── Composer row — the queue press-and-hold gesture fields are injected here
 	//    from the local useQueuedMessageActions call, not threaded from the panel;
@@ -187,13 +183,6 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 
 			{/* Status bar */}
 			<NarratorInteractionStatusBar {...statusBar} />
-
-			{/* Question inbox, directly above the composer. */}
-			{!props.common.isWorkspacePreview && props.showHumanAttentionInbox && (
-				<Box px="md" pb={4} style={{ flexShrink: 0 }}>
-					<HumanAttentionInboxButton currentNarratorId={props.common.narratorId} />
-				</Box>
-			)}
 
 			{/* Input */}
 			{props.common.isWorkspacePreview ? null : props.isChapterMerged ? (

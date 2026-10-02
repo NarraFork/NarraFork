@@ -446,7 +446,9 @@ export function sameRowInteraction(a: RowInteraction, b: RowInteraction): boolea
 		// The inspector's content is derived from the spec; a different injection body
 		// must not inherit a neighbour's "what the model saw" text.
 		a.inspectContent?.text === b.inspectContent?.text &&
-		a.inspectContent?.title === b.inspectContent?.title
+		a.inspectContent?.title === b.inspectContent?.title &&
+		// Selection is painted state; a flip must repaint the row.
+		a.selected === b.selected
 	);
 }
 
@@ -533,4 +535,7 @@ export interface RowInteraction {
 	 * `modelFacing`, with the speaker/source label as the inspector's title.
 	 */
 	inspectContent?: { title: string; text: string };
+	/** Message-level selection (chat rooms): outline + modifier-click toggle. */
+	selected?: boolean;
+	onToggleSelect?: (opts: { shiftKey: boolean }) => void;
 }

@@ -68,6 +68,10 @@ export const USER_HEADER_BODY_GAP = 4;
 export const USER_HEADER_MIN_CONTENT_WIDTH = 140;
 /** Stack gap between a user bubble's attachments and its body text (Stack gap={4}). */
 export const USER_ATTACHMENT_GAP = 4;
+/** Stack gap between the reply quote strip and whatever follows it (Stack gap={4}). */
+export const USER_QUOTE_GAP = 4;
+/** Left rail width of the reply quote strip (the tinted vertical bar). */
+export const USER_QUOTE_RAIL = 3;
 /**
  * Minimum inner width for a bubble carrying attachments. A dimensionless image
  * paints at its intrinsic aspect ratio inside the reserved 200px-tall box, so
@@ -155,8 +159,35 @@ export interface MeasureUserAttachment {
 	 * always TEXT_FILE_HEIGHT, this only lets the render layer make it clickable.
 	 */
 	filePath?: string | null;
+	/**
+	 * Authenticated API path serving this attachment's bytes (e.g. a chat
+	 * attachment's `/chat/attachments/:id`). HEIGHT-NEUTRAL passthrough: the box
+	 * comes from the persisted dimensions; the render layer resolves the blob
+	 * with the session token via VListImage's fetchUrl lane.
+	 */
+	fetchUrl?: string | null;
 	/** Accepted locator only: snapshots never enter the layout payload. */
 	reference?: FileReference;
+}
+
+export interface MeasureQuoteLine {
+	/** Quoted author display name; null when the target cannot be attributed. */
+	authorName: string | null;
+	/** Single-line preview (already truncated by the caller to a bounded length). */
+	text: string;
+	/**
+	 * Which label the strip shows: the quoted preview, a "message deleted" note,
+	 * or an "unavailable" note when the target is outside the loaded window.
+	 */
+	state: "quoted" | "deleted" | "unavailable";
+	/**
+	 * Jump coordinates of the quoted message (render-only passthrough). Never
+	 * read by the measure pass — a reply's target is immutable once posted, so
+	 * these ride the data object for the integration layer's onQuoteClick
+	 * closure without participating in the revision key.
+	 */
+	targetId?: string | null;
+	targetSeq?: number | null;
 }
 
 export interface MeasureMessageInput {
@@ -164,6 +195,8 @@ export interface MeasureMessageInput {
 	/** Visible text of the message (the common case). For assistant this is
 	 * markdown; for user it is plain pre-wrap text. */
 	text: string;
+	/** Explicit opt-in for chat; absent keeps narrator user bodies plain. */
+	bodyFormat?: "plain" | "markdown";
 	/** True when the user header row (avatar/name/time) should be counted. */
 	hasHeader?: boolean;
 	/** User bubbles: image / text_file attachments stacked above the body text. */
@@ -174,6 +207,21 @@ export interface MeasureMessageInput {
 	 * expansion) folded behind a toggle instead of painted as the body.
 	 */
 	commandText?: string | null;
+	/**
+	 * Reply quote strip (user bubbles), painted between the header and the
+	 * attachments/body. One clamped line, exactly `line.xs` tall — the strip
+	 * truncates to the bubble width instead of wrapping, so it never influences
+	 * the shrink-wrap decision.
+	 */
+	quote?: MeasureQuoteLine | null;
+	/**
+	 * Tombstone form (user bubbles): the message was soft-deleted, so the body
+	 * and attachments collapse to a single dimmed italic line. `text` is ignored
+	 * in this form; `deletedLabel` carries the localized tombstone copy.
+	 */
+	deleted?: boolean;
+	/** Localized "message deleted" line measured/painted in the tombstone form. */
+	deletedLabel?: string;
 }
 
 /** Expand state for a slash-command bubble's folded expansion. */
@@ -317,8 +365,10 @@ function attachmentBlock(
 			mediaType: attachment.mediaType ?? null,
 			size: typeof attachment.size === "number" ? attachment.size : null,
 			uploadNarratorId: attachment.uploadNarratorId ?? null,
-			// Render-only (see MeasureUserAttachment.filePath): does not touch height.
+			// Render-only (see MeasureUserAttachment.filePath / .fetchUrl): neither
+			// touches height — the box comes from the persisted dimensions above.
 			filePath: attachment.filePath ?? null,
+			fetchUrl: attachment.fetchUrl ?? null,
 			...(natural && fit
 				? {
 						width: natural.width,
@@ -340,37 +390,106 @@ function attachmentBlock(
 function measureUserMessage(input: MeasureMessageInput, contentWidth: number): MeasuredElement {
 	const innerWidth = Math.max(1, contentWidth - USER_BUBBLE_PADDING * 2);
 	const blocks: PreparedBlock[] = [];
-	// Attachments (images / text files) stack ABOVE the body text, inside the same
-	// bubble — the block order MessageBubble renders (server persists attachment
-	// blocks before the text block).
-	for (const attachment of input.attachments ?? []) {
-		const block = attachmentBlock(
-			attachment,
-			blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP,
-			innerWidth,
-		);
-		if (block) blocks.push(block);
-	}
-	const hasAttachments = blocks.length > 0;
-	// User body text is PLAIN pre-wrap (not markdown): a single pre-wrap block.
-	// An attachment-only message has no text block at all (an empty pre-wrap block
-	// would still reserve one line, leaving a blank gap under the image).
-	if (input.text.length > 0 || !hasAttachments) {
-		const bodyBlock: PreparedCodeBlock = {
-			kind: "code",
-			// Cross-width memo (see prepared-markdown-cache): the segment precompute is
-			// width-independent and is the dominant cost of a user bubble.
-			prepared: getPreparedTextWithSegments(input.text, typographyMetrics().font.body, "pre-wrap"),
-			lineHeight: typographyMetrics().line.body,
-			lang: null,
-			marginTop: hasAttachments ? USER_ATTACHMENT_GAP : 0,
+	// True when the bubble holds at least one attachment block (used for the
+	// attachment min-width floor below); a quote strip alone does not count.
+	let hasAttachments = false;
+	// Reply quote strip: ONE clamped line between the header and the content. It
+	// truncates to whatever width the bubble settles on, so it reports no
+	// displayWidth and cannot widen the shrink-wrap (matching the chat list's
+	// reply strip, whose box is likewise a fixed single line).
+	if (input.quote) {
+		blocks.push({
+			kind: "fixed",
+			marginTop: 0,
+			height: typographyMetrics().line.xs,
+			tag: "user-quote",
+			data: {
+				authorName: input.quote.authorName,
+				text: input.quote.text,
+				state: input.quote.state,
+			},
 			contentLeft: 0,
 			quoteRailLefts: [],
 			markerText: null,
 			markerLeft: null,
 			markerClassName: null,
-		};
-		blocks.push(bodyBlock);
+		});
+	}
+	if (input.deleted) {
+		// Tombstone form: body AND attachments collapse to one dimmed italic line.
+		// The label is short localized copy ("message deleted"), but its natural
+		// width still feeds the shrink-wrap so the bubble hugs the line instead of
+		// clipping it or stretching a full column for one word.
+		const label = input.deletedLabel ?? "";
+		const prepared = prepareWithSegments(label, typographyMetrics().font.body, {
+			whiteSpace: "pre-wrap",
+		});
+		const natural = Math.ceil(measureNaturalWidth(prepared));
+		blocks.push({
+			kind: "fixed",
+			marginTop: blocks.length === 0 ? 0 : USER_QUOTE_GAP,
+			height: typographyMetrics().line.body,
+			tag: "user-deleted",
+			displayWidth: Math.min(innerWidth, Math.max(1, natural)),
+			data: { text: label },
+			contentLeft: 0,
+			quoteRailLefts: [],
+			markerText: null,
+			markerLeft: null,
+			markerClassName: null,
+		});
+	} else {
+		// Attachments (images / text files) stack ABOVE the body text, inside the same
+		// bubble — the block order MessageBubble renders (server persists attachment
+		// blocks before the text block).
+		for (const attachment of input.attachments ?? []) {
+			const block = attachmentBlock(
+				attachment,
+				blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP,
+				innerWidth,
+			);
+			if (block) blocks.push(block);
+		}
+		hasAttachments = blocks.some((block) => block.kind === "fixed" && block.tag !== "user-quote");
+		// User body text is PLAIN pre-wrap (not markdown): a single pre-wrap block.
+		// An attachment-only message has no text block at all (an empty pre-wrap block
+		// would still reserve one line, leaving a blank gap under the image).
+		if (input.bodyFormat === "markdown" && input.text.length > 0) {
+			const body = measureMarkdown(input.text, innerWidth);
+			blocks.push({
+				kind: "fixed",
+				tag: "user-markdown",
+				height: body.height,
+				displayWidth: innerWidth,
+				marginTop: blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP,
+				data: { measured: body },
+				contentLeft: 0,
+				quoteRailLefts: [],
+				markerText: null,
+				markerLeft: null,
+				markerClassName: null,
+			});
+		} else if (input.text.length > 0 || !hasAttachments) {
+			const bodyBlock: PreparedCodeBlock = {
+				kind: "code",
+				// Cross-width memo (see prepared-markdown-cache): the segment precompute is
+				// width-independent and is the dominant cost of a user bubble.
+				prepared: getPreparedTextWithSegments(
+					input.text,
+					typographyMetrics().font.body,
+					"pre-wrap",
+				),
+				lineHeight: typographyMetrics().line.body,
+				lang: null,
+				marginTop: blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP,
+				contentLeft: 0,
+				quoteRailLefts: [],
+				markerText: null,
+				markerLeft: null,
+				markerClassName: null,
+			};
+			blocks.push(bodyBlock);
+		}
 	}
 	// No code-box padding for plain user text (it's not a fenced block).
 	const frame = accumulateFrame(blocks, innerWidth, pretextLineMetrics, {
@@ -582,6 +701,8 @@ export const MEASURE_MESSAGE_CONSTANTS = {
 	USER_HEADER_MIN_CONTENT_WIDTH,
 	USER_ATTACHMENT_GAP,
 	USER_ATTACHMENT_MIN_CONTENT_WIDTH,
+	USER_QUOTE_GAP,
+	USER_QUOTE_RAIL,
 	USER_IMAGE_HEIGHT: IMAGE_FIXED_HEIGHT,
 	USER_TEXT_FILE_HEIGHT: TEXT_FILE_HEIGHT,
 	ASSISTANT_PAD_X,

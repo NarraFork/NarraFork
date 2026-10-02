@@ -26,14 +26,14 @@
  *   5. WAKE ELIGIBILITY — `wakeInboxIfEligible` reads routing/queue state only
  *      through named PG port operations: a mounted owner, an archived narrator and a
  *      started/cancelled-only notice queue all decline with ZERO SQLite touches, and
- *      the positive gate degrades to `false` through the narrator-buffer PG guard
- *      (the unmigrated start path fails closed rather than reaching SQLite).
+ *      the positive gate reaches a stubbed runner dispatch seam. The runner startup
+ *      is not asserted here: that path still contains unmigrated SQLite reads.
  *
  * Rules, same as the sibling PG suites: `PG_INTEGRATION=1` means PostgreSQL really
  * has to run (a blocked harness is a failure, never a quiet pass); the container is
  * the harness' own random name and only it is cleaned up.
  */
-import { afterAll, expect, mock, test } from "bun:test";
+import { afterAll, expect, mock, spyOn, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
@@ -62,7 +62,11 @@ const poison = <T>(handle: string): T =>
 			},
 		},
 	) as T;
-mock.module("../../../../server/db", () => ({ db: poison("db"), sqlite: poison("sqlite") }));
+mock.module("../../../../server/db", () => ({
+	db: poison("db"),
+	sqlite: poison("sqlite"),
+	activeDatabaseBackend: "postgres",
+}));
 // No WS server exists in this process; the broadcast is asserted via the recorded frames.
 // The mock module mirrors the real module's export NAMES (scanned from source) so every
 // named import in the lazily-loaded graph links, without pulling the real module (its
@@ -154,6 +158,7 @@ async function journal(
 		{ id: "pgc-owned", createdAt: now, updatedAt: now },
 		{ id: "pgc-notice-idle", createdAt: now, updatedAt: now },
 		{ id: "pgc-notice-started", createdAt: now, updatedAt: now },
+		{ id: "pgc-broadcast", status: "working", createdAt: now, updatedAt: now },
 	]);
 	const queue = createPostgresRuntimeQueue(client.db);
 	const readiness = await queue.activateLegacyAdmission();
@@ -475,8 +480,52 @@ async function journal(
 			claimedAt: now,
 		})
 		.where(eq(narratorBufferedMessages.id, legacyEnqueued.delivery.id));
+	const broadcastDelivery = createAgentMessageDelivery(
+		"pgc-broadcast",
+		{ id: "pgc-sender", title: "Sender", label: "sender", type: "general", isParent: false },
+		"pgc-use-send",
+		"broadcast",
+		{ toolCallId: "pgc-tc-send", attempt: 1 },
+	);
+	const broadcast = await inbox.enqueueInboxAgent(broadcastDelivery, "broadcast", {
+		isBroadcast: true,
+	});
+	await client.db
+		.update(narratorBufferedMessages)
+		.set({ state: "claimed", claimToken: "process:dead-broadcast:token", claimEpoch: "old" })
+		.where(eq(narratorBufferedMessages.id, broadcast.delivery.id));
 	const recovered = await inbox.recoverInboxClaimsOnColdStartup();
-	expect(recovered).toBe(2);
+	expect(recovered).toBe(3);
+	expect((await mailboxState(broadcast.delivery.id))?.state).toBe("queued");
+	expect(await inbox.hasWakeEligibleInboxInput("pgc-broadcast")).toBe(false);
+	expect(await inbox.wakeInboxIfEligible("pgc-broadcast")).toBe(false);
+	// The same broadcast remains claimable by an already-running owner.
+	const broadcastOwner = tryClaimExecution("pgc-broadcast", "primary");
+	if (!broadcastOwner) throw new Error("broadcast owner missing");
+	const broadcastClaim = await inbox.claimInboxHead("pgc-broadcast", () => true);
+	expect(broadcastClaim?.id).toBe(broadcast.delivery.id);
+	await inbox.releaseInboxClaim(broadcastClaim as NonNullable<typeof broadcastClaim>, "retry");
+	broadcastOwner.release();
+	// Legacy direct sends with absent metadata, and explicitly false flags, remain eligible.
+	for (const metadataJson of ["{}", '{"isBroadcast":false}']) {
+		await client.db
+			.update(narratorBufferedMessages)
+			.set({ metadataJson })
+			.where(eq(narratorBufferedMessages.id, broadcast.delivery.id));
+		expect(await inbox.hasWakeEligibleInboxInput("pgc-broadcast")).toBe(true);
+	}
+	await client.db
+		.update(narratorBufferedMessages)
+		.set({ metadataJson: broadcast.delivery.metadataJson })
+		.where(eq(narratorBufferedMessages.id, broadcast.delivery.id));
+	await queue.mailbox.enqueue({
+		kind: "user_input",
+		narratorId: "pgc-broadcast",
+		requestKey: "rk-after-broadcast",
+		text: "explicit user",
+		projectedByteSize: 13,
+	});
+	expect(await inbox.hasWakeEligibleInboxInput("pgc-broadcast")).toBe(true);
 	expect((await mailboxState(foreignEnqueued.delivery.id))?.state).toBe("queued");
 	expect((await mailboxState(legacyEnqueued.delivery.id))?.state).toBe("queued");
 	// Idempotent within the process: the one-shot startup gate has run.
@@ -513,14 +562,20 @@ async function journal(
 	});
 	expect(await inbox.wakeInboxIfEligible("pgc-notice-started")).toBe(false);
 	expect(poisonHits).toBe(0);
-	// (d) The positive gate (recovered user inputs are queued for pgc-notice-idle)
-	// reaches the narrator start path, whose reads are still SQLite-direct (a later
-	// track): the wake degrades to false through the narrator-buffer PG guard — and
-	// even that failure touches no SQLite handle.
-	const poisonBefore = poisonHits;
-	expect(await inbox.wakeInboxIfEligible("pgc-notice-idle")).toBe(false);
-	expect(poisonHits).toBe(poisonBefore); // the unmigrated start path fails closed, not into SQLite
-	poisonHits = 0;
+	// (d) Positive eligibility reaches the dispatch seam. Starting the runner is still
+	// SQLite-direct, so stub only that seam: this proves PG mailbox routing, not a PG runner.
+	const session = await import("../../../../server/services/narrator-session");
+	const resume = spyOn(session, "resumeBufferedMessagesIfIdle").mockResolvedValue({
+		resumed: true,
+	});
+	try {
+		expect(await inbox.wakeInboxIfEligible("pgc-notice-idle")).toBe(true);
+		expect(await inbox.wakeInboxIfEligible("pgc-broadcast")).toBe(true);
+		expect(resume).toHaveBeenCalledTimes(2);
+		expect(poisonHits).toBe(0);
+	} finally {
+		resume.mockRestore();
+	}
 
 	return "verified";
 }

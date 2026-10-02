@@ -973,7 +973,7 @@ test("failed blocking question reflection keeps its draft and explicit retry", a
 	expect(readSession("ask-draft", blocking.toolCallId)).not.toBeNull();
 });
 
-test("Dashboard uses summaries only and View all opens the same drawer", async () => {
+test("Dashboard uses summaries only and View all opens notification center pending tab", async () => {
 	addPermission(item("dashboard"));
 	const narrators = track(
 		spyOn(api, "listNarratorsPaginated").mockResolvedValue({
@@ -991,7 +991,9 @@ test("Dashboard uses summaries only and View all opens the same drawer", async (
 	expect(permissions).not.toHaveBeenCalled();
 	expect(detail).not.toHaveBeenCalled();
 	await click("View all");
-	expect(document.body.textContent).toContain("Human attention center");
+	expect(document.body.textContent).toContain("Notifications");
+	expect(document.body.textContent).not.toContain("Human attention center");
+	expect(document.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toBe("Pending");
 	expect(row("permission:dashboard")).toBeDefined();
 	expect(detail).not.toHaveBeenCalled();
 	expect(qc.getQueryData(humanAttentionListKey)).toMatchObject({

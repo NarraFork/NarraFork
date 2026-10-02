@@ -370,6 +370,55 @@ function TaskRow({
 				: "red"
 		: "gray";
 
+	// Switch + 5 ActionIcons is ~230px wide and cannot shrink. On narrow screens it
+	// would starve the info column down to one character per line, so the same
+	// actions are rendered twice: beside the info on ≥sm, on their own row below sm.
+	const actions = (
+		<>
+			<Switch
+				checked={task.enabled}
+				onChange={(e) => onToggle(e.currentTarget.checked)}
+				size="sm"
+			/>
+			{task.lastNarratorId && (
+				<Tooltip label={t("openLastNarrator")}>
+					<ActionIcon
+						variant="subtle"
+						onClick={() => onOpenNarrator(task.lastNarratorId as string)}
+						aria-label={t("openLastNarrator")}
+					>
+						<IconMessage size={16} />
+					</ActionIcon>
+				</Tooltip>
+			)}
+			<Tooltip label={t("runNow")}>
+				<ActionIcon variant="subtle" onClick={onRun} loading={running} aria-label={t("runNow")}>
+					<IconPlayerPlay size={16} />
+				</ActionIcon>
+			</Tooltip>
+			<Tooltip label={t("cleanupNow")}>
+				<ActionIcon
+					variant="subtle"
+					color="orange"
+					onClick={onCleanup}
+					aria-label={t("cleanupNow")}
+				>
+					<IconBrush size={16} />
+				</ActionIcon>
+			</Tooltip>
+			<Tooltip label={t("edit")}>
+				<ActionIcon variant="subtle" onClick={onEdit} aria-label={t("edit")}>
+					<IconPencil size={16} />
+				</ActionIcon>
+			</Tooltip>
+			<Tooltip label={t("delete")}>
+				<ActionIcon variant="subtle" color="red" onClick={onDelete} aria-label={t("delete")}>
+					<IconTrash size={16} />
+				</ActionIcon>
+			</Tooltip>
+		</>
+	);
+
 	return (
 		<Paper withBorder p="md">
 			<Group justify="space-between" wrap="nowrap" align="flex-start">
@@ -449,49 +498,12 @@ function TaskRow({
 						</Stack>
 					</Group>
 				</UnstyledButton>
-				<Group gap="xs" wrap="nowrap">
-					<Switch
-						checked={task.enabled}
-						onChange={(e) => onToggle(e.currentTarget.checked)}
-						size="sm"
-					/>
-					{task.lastNarratorId && (
-						<Tooltip label={t("openLastNarrator")}>
-							<ActionIcon
-								variant="subtle"
-								onClick={() => onOpenNarrator(task.lastNarratorId as string)}
-								aria-label={t("openLastNarrator")}
-							>
-								<IconMessage size={16} />
-							</ActionIcon>
-						</Tooltip>
-					)}
-					<Tooltip label={t("runNow")}>
-						<ActionIcon variant="subtle" onClick={onRun} loading={running} aria-label={t("runNow")}>
-							<IconPlayerPlay size={16} />
-						</ActionIcon>
-					</Tooltip>
-					<Tooltip label={t("cleanupNow")}>
-						<ActionIcon
-							variant="subtle"
-							color="orange"
-							onClick={onCleanup}
-							aria-label={t("cleanupNow")}
-						>
-							<IconBrush size={16} />
-						</ActionIcon>
-					</Tooltip>
-					<Tooltip label={t("edit")}>
-						<ActionIcon variant="subtle" onClick={onEdit} aria-label={t("edit")}>
-							<IconPencil size={16} />
-						</ActionIcon>
-					</Tooltip>
-					<Tooltip label={t("delete")}>
-						<ActionIcon variant="subtle" color="red" onClick={onDelete} aria-label={t("delete")}>
-							<IconTrash size={16} />
-						</ActionIcon>
-					</Tooltip>
+				<Group gap="xs" wrap="nowrap" visibleFrom="sm">
+					{actions}
 				</Group>
+			</Group>
+			<Group gap="xs" wrap="nowrap" hiddenFrom="sm" mt="sm" justify="flex-end">
+				{actions}
 			</Group>
 		</Paper>
 	);

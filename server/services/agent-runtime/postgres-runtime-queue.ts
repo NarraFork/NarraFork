@@ -1622,6 +1622,22 @@ export function createPostgresRuntimeQueue(
 				.limit(1);
 			return rows.length > 0;
 		},
+		/** Broadcasts are consumable, but cannot authorize a new execution. */
+		async hasWakeEligibleInput(narratorId: string): Promise<boolean> {
+			pointer(narratorId);
+			const rows = await db
+				.select({ id: mailbox.id })
+				.from(mailbox)
+				.where(
+					and(
+						eq(mailbox.narratorId, narratorId),
+						eq(mailbox.state, "queued"),
+						sql`(${mailbox.kind} = 'user_input' OR (${mailbox.kind} = 'agent_message' AND COALESCE(${mailbox.metadataJson}::jsonb -> 'isBroadcast', 'false'::jsonb) != 'true'::jsonb))`,
+					),
+				)
+				.limit(1);
+			return rows.length > 0;
+		},
 		/** Single-row read for the buffered-message write paths. */
 		async getById(id: string): Promise<PgMailboxRow | undefined> {
 			pointer(id);

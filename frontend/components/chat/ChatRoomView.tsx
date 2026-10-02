@@ -21,7 +21,6 @@ import {
 	Button,
 	FileButton,
 	Group,
-	Loader,
 	Modal,
 	Stack,
 	Text,
@@ -30,11 +29,12 @@ import {
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { IconCopy, IconPaperclip, IconSend, IconSparkles, IconX } from "@tabler/icons-react";
+import { type InfiniteData, useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
 import {
-	useChatMessages,
+	chatKeys,
 	useChatRoomLive,
 	useDeleteChatMessage,
 	useDiscardChatAttachment,
@@ -45,11 +45,11 @@ import {
 	useSummarizeChat,
 	useUploadChatAttachment,
 } from "../../hooks/useChat";
-import type { ChatMessage } from "../../lib/api/chat";
+import type { ChatMessage, ChatMessagePage } from "../../lib/api/chat";
 import { ApiError } from "../../lib/api/client";
 import { copyTextToClipboard } from "../../lib/clipboard";
 import { ChatComposerAttachments, type PendingChatAttachment } from "./ChatComposerAttachments";
-import { ChatMessageList, type ChatMessageListHandle } from "./ChatMessageList";
+import { ChatMessageList } from "./ChatMessageList";
 import {
 	clearChatComposerDraft,
 	getChatDraftStorageId,
@@ -59,7 +59,6 @@ import {
 } from "./chat-composer-draft";
 import { buildForwardText } from "./chat-forward-text";
 import { CHAT_HEADER_HEIGHT } from "./chat-header";
-import type { ChatReplyInfo } from "./chat-list-layout";
 
 /** Server-side cap, mirrored so the composer can show the remaining budget. */
 const CHAT_MESSAGE_MAX_CHARS = 8_000;
@@ -72,22 +71,6 @@ const CHAT_ATTACHMENTS_PER_MESSAGE_MAX = 10;
  * server data directory at module scope and cannot be bundled for the browser.
  */
 const CHAT_ATTACHMENTS_UNAVAILABLE_CODE = "CHAT_ATTACHMENTS_UNAVAILABLE";
-/**
- * How long a jumped-to message stays outlined.
- *
- * Long enough to find with the eye after the scroll settles, short enough not to be
- * mistaken for a persistent selection state.
- */
-const JUMP_HIGHLIGHT_MS = 1_600;
-/**
- * Ceiling on pages fetched while chasing a quoted message backwards.
- *
- * `seq` is contiguous per room and a page is 50, so this reaches ~1000 messages
- * back. A bound is required rather than looping until the target appears: an
- * unbounded walk on a long-lived room would pull the entire history into memory to
- * satisfy one click, and the honest answer past this depth is "too far back".
- */
-const JUMP_MAX_PAGE_FETCHES = 20;
 
 export interface ChatRoomViewProps {
 	roomId: string | undefined;
@@ -123,7 +106,13 @@ export function ChatRoomView({
 	const currentUserId = (currentUser as { id?: string } | undefined)?.id ?? null;
 
 	useChatRoomLive(roomId);
-	const messagesQuery = useChatMessages(roomId);
+	// The message list reads through the vlist's own paging (ChatMessageList's
+	// fetchPage writes each page into this cache); the view subscribes passively
+	// for the selection/forward/delete actions — no fetch ever starts here.
+	const messagesQuery = useQuery<InfiniteData<ChatMessagePage>>({
+		queryKey: chatKeys.messages(roomId ?? ""),
+		enabled: false,
+	});
 	const messages = useFlatChatMessages(messagesQuery.data);
 	const sendMessage = useSendChatMessage(roomId);
 	const deleteMessage = useDeleteChatMessage(roomId);
@@ -139,17 +128,6 @@ export function ChatRoomView({
 	const anchorIndexRef = useRef<number | null>(null);
 	const [summaryPreview, setSummaryPreview] = useState<string | null>(null);
 	const [pending, setPending] = useState<PendingChatAttachment[]>([]);
-	const [highlightedId, setHighlightedId] = useState<string | null>(null);
-	const [isJumping, setIsJumping] = useState(false);
-	const listRef = useRef<ChatMessageListHandle | null>(null);
-	const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-	useEffect(
-		() => () => {
-			if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
-		},
-		[],
-	);
 
 	// ── Composer draft persistence ──────────────────────────────────────────
 	//
@@ -257,14 +235,17 @@ export function ChatRoomView({
 	}, [messages]);
 
 	// Index-based range selection (see the module note on why not DOM order).
+	// The list is the shared vlist now, so the row index no longer arrives with
+	// the click — resolve it from the message id against the cached window.
 	const toggleSelect = useCallback(
 		(messageId: string, index: number, shiftKey: boolean) => {
+			const resolvedIndex = messageIndexById.get(messageId) ?? index;
 			setSelectedIds((previous) => {
 				const next = new Set(previous);
 				const anchor = anchorIndexRef.current;
-				if (shiftKey && anchor !== null) {
-					const lo = Math.min(anchor, index);
-					const hi = Math.max(anchor, index);
+				if (shiftKey && anchor !== null && resolvedIndex >= 0) {
+					const lo = Math.min(anchor, resolvedIndex);
+					const hi = Math.max(anchor, resolvedIndex);
 					for (let i = lo; i <= hi; i++) {
 						const id = messages[i]?.id;
 						if (id) next.add(id);
@@ -273,11 +254,11 @@ export function ChatRoomView({
 				}
 				if (next.has(messageId)) next.delete(messageId);
 				else next.add(messageId);
-				anchorIndexRef.current = index;
+				anchorIndexRef.current = resolvedIndex >= 0 ? resolvedIndex : null;
 				return next;
 			});
 		},
-		[messages],
+		[messages, messageIndexById],
 	);
 
 	const clearSelection = useCallback(() => {
@@ -445,62 +426,8 @@ export function ChatRoomView({
 	);
 
 	// ── Jump to a quoted message ────────────────────────────────────────────
-
-	const flashMessage = useCallback((messageId: string) => {
-		setHighlightedId(messageId);
-		if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
-		highlightTimerRef.current = setTimeout(() => setHighlightedId(null), JUMP_HIGHLIGHT_MS);
-	}, []);
-
-	/**
-	 * Scroll to the quoted message, loading older pages until it is reachable.
-	 *
-	 * The loop is bounded two ways, and both matter: `JUMP_MAX_PAGE_FETCHES` caps the
-	 * work, and the `seq` comparison stops as soon as the loaded window covers the
-	 * target — so a nearby quote costs zero fetches. Without the `seq` test there
-	 * would be nothing to compare against except "is it loaded yet", which cannot
-	 * distinguish "not yet" from "never" (a target deleted from the sequence).
-	 */
-	const handleJumpToReply = useCallback(
-		(reply: ChatReplyInfo) => {
-			if (listRef.current?.scrollToMessage(reply.targetId)) {
-				flashMessage(reply.targetId);
-				return;
-			}
-			const targetSeq = reply.targetSeq;
-			if (targetSeq === null) {
-				notifications.show({ color: "gray", message: t("jumpTargetUnavailable") });
-				return;
-			}
-			if (isJumping) return;
-			setIsJumping(true);
-			void (async () => {
-				try {
-					for (let fetches = 0; fetches < JUMP_MAX_PAGE_FETCHES; fetches++) {
-						// `fetchNextPage` here walks BACKWARDS in time: the infinite query's
-						// "next" page is the next older block (see useChatMessages).
-						if (!messagesQuery.hasNextPage) break;
-						const result = await messagesQuery.fetchNextPage();
-						const loaded = result.data?.pages.at(-1)?.messages ?? [];
-						const oldestLoadedSeq = loaded[0]?.seq;
-						if (oldestLoadedSeq !== undefined && oldestLoadedSeq <= targetSeq) break;
-					}
-					// One frame for the newly prepended pages to lay out before positioning
-					// against them; the list computes tops from the layout, which is derived
-					// from the message array in a render pass.
-					await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
-					if (listRef.current?.scrollToMessage(reply.targetId)) {
-						flashMessage(reply.targetId);
-					} else {
-						notifications.show({ color: "gray", message: t("jumpTargetTooFar") });
-					}
-				} finally {
-					setIsJumping(false);
-				}
-			})();
-		},
-		[flashMessage, isJumping, messagesQuery, t],
-	);
+	// Handled entirely inside the vlist shell: the quote strip calls its jump
+	// machinery, which pages older history until the target is covered.
 
 	const handleDelete = useCallback(
 		(message: ChatMessage) => {
@@ -623,27 +550,17 @@ export function ChatRoomView({
 			) : null}
 
 			<Box style={{ flex: 1, minHeight: 0 }}>
-				{messagesQuery.isLoading ? (
-					<Box style={{ height: "100%", display: "grid", placeItems: "center" }}>
-						<Loader size="sm" />
-					</Box>
-				) : (
+				{roomId ? (
 					<ChatMessageList
-						ref={listRef}
-						messages={messages}
+						roomId={roomId}
 						currentUserId={currentUserId}
-						hasOlder={messagesQuery.hasNextPage}
-						isLoadingOlder={messagesQuery.isFetchingNextPage || isJumping}
-						onLoadOlder={() => messagesQuery.fetchNextPage()}
 						onVisibleSeq={markRead}
 						selectedIds={selectedIds}
 						onToggleSelect={toggleSelect}
 						onReply={setReplyTo}
 						onDelete={handleDelete}
-						onJumpToReply={handleJumpToReply}
-						highlightedId={highlightedId}
 					/>
-				)}
+				) : null}
 			</Box>
 
 			{selectedIds.size > 0 ? (

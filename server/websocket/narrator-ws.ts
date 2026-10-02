@@ -70,6 +70,12 @@ import {
 } from "../services/narrator-session";
 import { addStatsSubscriber, removeStatsSubscriber } from "../services/output-stats";
 import { assertChapterProjectAccess, canReadProject } from "../services/project-acl";
+import type { PublicShareConnectionLease } from "../services/public-narrator-share-connections";
+import {
+	onPublicShareRevoked,
+	revalidatePublicShare,
+	type VerifiedPublicShare,
+} from "../services/public-narrator-share-service";
 import {
 	bufferRealtimeMessage,
 	type CatchUpBuffer,
@@ -116,6 +122,15 @@ export interface NarratorWSData {
 	 * which are treated as non-admin.
 	 */
 	userRole?: string;
+	/**
+	 * Anonymous public-share reader. When present the connection carries NO user
+	 * identity: narrator subscribe is scoped to exactly this share's narrator,
+	 * chat subscribe to exactly its discussion room, and write frames stay
+	 * refused by the existing `!userId` guard (read-only by construction).
+	 * Revalidated at subscribe time; a revocation closes the socket.
+	 */
+	publicShare?: VerifiedPublicShare;
+	publicShareConnectionLease?: PublicShareConnectionLease;
 }
 
 type NarratorSubscriptionKind = "list" | "panel" | "messages";
@@ -179,13 +194,30 @@ type ViewerInfo = {
 	avatarImageId: string | null;
 };
 
-const connections = new Set<NarratorWS>();
-const connectionsByUserId = new Map<string, Set<NarratorWS>>();
+const connections = hotSafe("narrafork.narratorWs.connections", () => new Set<NarratorWS>());
+const connectionsByUserId = hotSafe(
+	"narrafork.narratorWs.connectionsByUserId",
+	() => new Map<string, Set<NarratorWS>>(),
+);
+
+// A revoked share link drops its open sockets immediately rather than waiting
+// for the next revalidation: the revoke listener fires post-commit, and closing
+// here is the only place that sees the live connection set.
+onPublicShareRevoked((shareId) => {
+	for (const ws of connections) {
+		if (ws.data.publicShare?.shareId !== shareId) continue;
+		try {
+			ws.close(4001, "Share link revoked");
+		} catch {
+			// An already-closing socket is the outcome we wanted anyway.
+		}
+	}
+});
 
 function addConnection(ws: NarratorWS): void {
 	connections.add(ws);
 	const userId = ws.data.userId;
-	if (!userId) return;
+	if (!userId || ws.data.publicShare) return;
 	let userConnections = connectionsByUserId.get(userId);
 	if (!userConnections) {
 		userConnections = new Set();
@@ -195,10 +227,19 @@ function addConnection(ws: NarratorWS): void {
 }
 
 function removeConnection(ws: NarratorWS): void {
+	ws.data.publicShareConnectionLease?.release();
+	removeAllChatSubscriptions(ws);
 	releaseGitWorkspaceSubscriptions(ws);
-	connections.delete(ws);
+	const removed = connections.delete(ws);
+	if (removed && ws.data.publicShare) {
+		try {
+			ws.close(1001, "Share connection closed");
+		} catch {
+			/* Already closed. */
+		}
+	}
 	const userId = ws.data.userId;
-	if (!userId) return;
+	if (!userId || ws.data.publicShare) return;
 	const userConnections = connectionsByUserId.get(userId);
 	if (!userConnections) return;
 	userConnections.delete(ws);
@@ -216,7 +257,10 @@ function removeConnection(ws: NarratorWS): void {
 // two members are fixed at creation, and a narrator room follows the narrator's
 // visibility. ⚠️ If leaving/kicking is ever added, that path MUST also evict the
 // user's sockets from this index.
-const chatRoomSubscribers = new Map<string, Set<NarratorWS>>();
+const chatRoomSubscribers = hotSafe(
+	"narrafork.narratorWs.chatRoomSubscribers",
+	() => new Map<string, Set<NarratorWS>>(),
+);
 
 /** Per-connection ceiling, mirroring the narrator subscription cap's intent. */
 export const MAX_CHAT_ROOM_SUBSCRIPTIONS_PER_CONNECTION = 50;
@@ -255,6 +299,7 @@ export function broadcastToChatRoom(roomId: string, message: NarratorServerMessa
 	if (!subscribers || subscribers.size === 0) return;
 	const payload = JSON.stringify(message);
 	for (const ws of subscribers) {
+		if (ws.data.publicShare && ws.data.publicShare.roomId !== roomId) continue;
 		try {
 			ws.send(payload);
 		} catch {
@@ -360,6 +405,7 @@ export function getNarratorConnections(): Set<NarratorWS> {
 export function broadcastToNarrator(narratorId: string, message: NarratorServerMessage): void {
 	const payload = JSON.stringify(message);
 	for (const ws of connections) {
+		if (ws.data.publicShare && ws.data.publicShare.narratorId !== narratorId) continue;
 		if (ws.data.subscribedNarrators.has(narratorId)) {
 			if (ws.data.catchingUpNarrators.has(narratorId)) {
 				const buffer = ws.data.catchUpBuffers.get(narratorId);
@@ -423,10 +469,35 @@ async function authorizeReadableNarrators(
 ): Promise<string[]> {
 	const userId = ws.data.userId;
 	if (!userId) {
-		for (const narratorId of narratorIds) {
-			safeSend(ws, { type: "subscribe_denied", narratorId, requestId });
+		// Public-share reader: the share itself is the grant, scoped to exactly one
+		// narrator. Revalidated synchronously so a revoked link cannot hold a
+		// subscription; anything else is denied in the same indistinguishable shape.
+		const share = ws.data.publicShare;
+		if (!share) {
+			for (const narratorId of narratorIds) {
+				safeSend(ws, { type: "subscribe_denied", narratorId, requestId });
+			}
+			return [];
 		}
-		return [];
+		let liveShare: VerifiedPublicShare;
+		try {
+			liveShare = revalidatePublicShare(share);
+		} catch {
+			for (const narratorId of narratorIds) {
+				safeSend(ws, { type: "subscribe_denied", narratorId, requestId });
+			}
+			return [];
+		}
+		const allowed: string[] = [];
+		for (const narratorId of new Set(narratorIds)) {
+			if (narratorId === liveShare.narratorId) {
+				allowed.push(narratorId);
+			} else {
+				ws.data.subscribedNarrators.delete(narratorId);
+				safeSend(ws, { type: "subscribe_denied", narratorId, requestId });
+			}
+		}
+		return allowed;
 	}
 	const principal = { userId, isAdmin: ws.data.userRole === "admin" };
 	const allowed: string[] = [];
@@ -1039,10 +1110,11 @@ if (hotOnce("narrafork.notificationCenterWs.listenersRegistered")) {
 	});
 }
 
-/** Broadcast a message to ALL narrator WS connections (not filtered by subscription). */
+/** Deployment-wide frames are for authenticated sessions, NEVER anonymous share readers. */
 export function broadcastToAll(message: Record<string, unknown>): void {
 	const payload = JSON.stringify(message);
 	for (const ws of connections) {
+		if (ws.data.publicShare) continue;
 		try {
 			ws.send(payload);
 		} catch {
@@ -1059,7 +1131,7 @@ export function broadcastToAll(message: Record<string, unknown>): void {
 export function broadcastToAdmins(message: Record<string, unknown>): void {
 	const payload = JSON.stringify(message);
 	for (const ws of connections) {
-		if (ws.data.userRole !== "admin") continue;
+		if (ws.data.publicShare || ws.data.userRole !== "admin") continue;
 		try {
 			ws.send(payload);
 		} catch {
@@ -1549,6 +1621,21 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 
 export const handleNarratorWS = {
 	open(ws: NarratorWS) {
+		const lease = ws.data.publicShareConnectionLease;
+		if (
+			lease &&
+			!lease.open(() => {
+				removeConnection(ws);
+				try {
+					ws.close(1001, "Share connection expired");
+				} catch {
+					/* Already closed. */
+				}
+			})
+		) {
+			ws.close(1008, "Share connection reservation expired");
+			return;
+		}
 		ws.data.lastPongAt = Date.now();
 		addConnection(ws);
 	},
@@ -1564,6 +1651,21 @@ export const handleNarratorWS = {
 			return;
 		}
 		const msg = result.data;
+
+		// Anonymous grants permit only the transcript/room protocol and heartbeat.
+		// In particular, output-stats sends directly from the connection registry.
+		if (
+			ws.data.publicShare &&
+			![
+				"pong",
+				"subscribe",
+				"unsubscribe",
+				"sync_check",
+				"chat_subscribe",
+				"chat_unsubscribe",
+			].includes(msg.type)
+		)
+			return;
 
 		// Update heartbeat timestamp on any valid message
 		ws.data.lastPongAt = Date.now();
@@ -1891,7 +1993,24 @@ export const handleNarratorWS = {
 			}
 			case "chat_subscribe": {
 				const userId = ws.data.userId;
-				if (!userId) break;
+				if (!userId) {
+					// Public-share reader: exactly the share's own discussion room, nothing
+					// else. Revalidated so a revoked link cannot keep the room feed.
+					const share = ws.data.publicShare;
+					if (!share) break;
+					let liveShare: VerifiedPublicShare;
+					try {
+						liveShare = revalidatePublicShare(share);
+					} catch {
+						break;
+					}
+					for (const roomId of msg.roomIds) {
+						if (roomId !== liveShare.roomId) continue;
+						if (ws.data.subscribedChatRooms.has(roomId)) continue;
+						addChatSubscription(ws, roomId);
+					}
+					break;
+				}
 				const { assertCanRead } = await import("../services/chat-service");
 				for (const roomId of msg.roomIds) {
 					if (ws.data.subscribedChatRooms.has(roomId)) continue;

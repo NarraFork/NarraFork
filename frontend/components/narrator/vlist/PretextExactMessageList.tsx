@@ -14,7 +14,7 @@
 import { useCurrentUser } from "@frontend/hooks/useAuth";
 import { useLocalPref } from "@frontend/hooks/useLocalPref";
 import { useInterruptNarrator, useResumeRecoverySubagents } from "@frontend/hooks/useNarrator";
-import { useNarratorWS } from "@frontend/hooks/useNarratorWS";
+import { type NarratorWSCallbacks, useNarratorWS } from "@frontend/hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "@frontend/hooks/usePlatform";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { narratorsApi } from "@frontend/lib/api/narrators";
@@ -113,6 +113,7 @@ import { resolveVListBlockTarget, toolUseIdFromBlockId } from "./vlist-block-tar
 import { useVListCompactActions } from "./vlist-compact-bridge";
 import type { VListViewOwner, VListViewTarget } from "./vlist-content-view-target";
 import { installVListCopyHandler } from "./vlist-copy-text";
+import type { VListDataSource } from "./vlist-data-source";
 import {
 	buildDrillSnapshots,
 	DRILL_MORPH_X_OFFSET,
@@ -444,6 +445,25 @@ type PretextExactMessageListProps = {
 	/** A new request repeats the jump while retaining this list's loaded window. */
 	highlightRequestId?: string;
 	tailFooter?: ReactNode;
+	/**
+	 * Pluggable data boundary for surfaces rendering the same document through a
+	 * different credential (the anonymous public share page). Absent → every seam
+	 * falls back to the authenticated narrator APIs and the path is unchanged.
+	 * Realtime is NOT part of this object: share-auth rides the same /ws/narrator
+	 * manager (setNarratorWSShareAuth), so the existing subscriptions keep working.
+	 */
+	dataSource?: VListDataSource;
+	/**
+	 * Message-level selection (chat rooms): the outlined message ids, and the
+	 * modifier-click toggle (shift/ctrl/cmd). Absent → no selection chrome.
+	 */
+	selectedMessageIds?: ReadonlySet<string>;
+	onToggleMessageSelect?: (messageId: string, opts: { shiftKey: boolean }) => void;
+	/**
+	 * Read-watermark seam (chat rooms): called with the last STRICTLY-visible
+	 * source message id + seq whenever it changes.
+	 */
+	onVisibleMessagesChange?: (last: { id: string; seq: number | null } | null) => void;
 };
 
 /**
@@ -527,6 +547,10 @@ export const PretextExactMessageList = memo(
 				highlightMessageId,
 				highlightRequestId,
 				tailFooter,
+				dataSource,
+				selectedMessageIds: messageSelectedIds,
+				onToggleMessageSelect,
+				onVisibleMessagesChange,
 			} = props;
 			const lod = useRenderLod() as RenderLod;
 			// Advanced-animation preference (same key AppRootLayout writes to <html>);
@@ -1524,8 +1548,13 @@ export const PretextExactMessageList = memo(
 			// Who is reading. Decides whether a user bubble is drawn as the reader's own turn
 			// or a teammate's — this is a shared deployment, so `role: "user"` alone does not
 			// mean "you". Height-neutral, so it stays out of the measurement cache key.
+			//
+			// A dataSource may fix the viewer identity explicitly (the anonymous share page
+			// has no session: every bubble is somebody else's — or, for the discussion pane,
+			// resolved by the projection from `author.isSelf`).
 			const { data: currentUser } = useCurrentUser();
-			const currentUserId = currentUser?.id ?? null;
+			const currentUserId =
+				dataSource?.viewerId !== undefined ? dataSource.viewerId : (currentUser?.id ?? null);
 			// Language identity for the measurement cache: localized text is baked into
 			// measured content, so a switch must invalidate cached heights (see
 			// buildPretextDocumentLayout's labelsRevision).
@@ -1684,6 +1713,7 @@ export const PretextExactMessageList = memo(
 			const { resolveFullToolInput, resolveFullToolOutput } = useVListToolDetails(
 				narratorId,
 				truncatedToolCalls.narratorId === narratorId ? truncatedToolCalls.requests : [],
+				dataSource?.fetchToolDetail,
 			);
 			// Header terminate control: interrupting the narrator is what actually stops a
 			// running shell / MCP tool (the chunked control does the same).
@@ -1804,12 +1834,24 @@ export const PretextExactMessageList = memo(
 			// call below the fold effect would silently plan every fold from an uncorrected
 			// scroll position (rows sliding by the anchor's own Δ), with nothing throwing.
 			// vlist-fold-wiring.test.ts asserts this marker precedes the play effect.
+			// The data boundary: a share-credentialed fetchPage/locateMessage pair
+			// replaces the narrator API defaults; absent, nothing changes. Memoized:
+			// the document effect keys on this object, so an inline literal would
+			// reload the document on every render.
+			const loadOptions = useMemo(
+				() => ({
+					...(dataSource?.fetchPage ? { fetchPage: dataSource.fetchPage } : {}),
+					...(dataSource?.locateMessage ? { locateMessage: dataSource.locateMessage } : {}),
+				}),
+				[dataSource?.fetchPage, dataSource?.locateMessage],
+			);
 			const pretextDocument = usePretextDocument(narratorId, {
 				lod,
 				labels: vlistLabels,
 				labelsRevision,
 				widthBucket: String(Math.round(contentWidth)),
 				contentWidth,
+				loadOptions,
 				// BUCKETED on purpose. Height reaches the build for exactly one reason (the
 				// plan-detail cap), but at pixel resolution it made every frame of a sash drag
 				// re-measure the whole document — bypassing the width gate entirely, which is
@@ -2067,120 +2109,151 @@ export const PretextExactMessageList = memo(
 			// The exact shell is stable-state only. Subscribe to the existing message
 			// control stream once a complete document exists. Realtime mutations reload
 			// the full exact input; reconnect catch-up reloads only when it reports data.
-			useNarratorWS(
-				revisionSubscriptionId,
-				{
-					onMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
-						upsertOrReload(wsData.message),
-					onUserMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
-						upsertOrReload(wsData.message),
-					onMessageUpdated: replaceOrReload,
-					onMessagesDeleted: removeOrReload,
-					// A segment compact hides its compressed messages through this dedicated
-					// event rather than `messages_deleted` (they are not gone — their summary
-					// lives behind the marker). The ids arrive in the event, so the in-place
-					// removal applies exactly as a deletion does: the run the reader just
-					// selected collapses immediately, wherever they are scrolled.
-					onSegmentCompactHide: (hiddenMessageIds: string[]) => {
-						if (removeMessagesRef.current(hiddenMessageIds)) {
-							appliedMessageRevisionRef.current += 1;
-						}
-						bumpMessageRevision();
-					},
-					// Completion (and failure — the dispatcher folds `compact_failed` into this
-					// callback) carries no message body: the content already arrived via
-					// `message` / `message_updated`, both applied in place above. It is kept
-					// for two things the in-place paths cannot cover:
-					//
-					//   1. Paths that broadcast a BARE compact_done with no preceding message
-					//      frame (narrator-recovery does, in several places). Without this
-					//      handler the document had no signal at all and stayed stale until the
-					//      reader reloaded the page — the reported bug's second half.
-					//   2. Converging the local seq numbering. `insertMessage` deliberately
-					//      does not shift the following seqs (see vlist-message-insert), and
-					//      this reload adopts the server's.
-					//
-					// It does NOT exist to shrink the window: the document page filters only on
-					// `segmentCompactId` (server-side), so a full-history compact leaves every
-					// older message readable and a segment compact's hidden rows are already
-					// gone via `onSegmentCompactHide` above.
-					onCompactDone: (_contextPercentAfter, isSegment, _mode, replacement) => {
-						// COW retries may name old and/or new marker ids; the non-retry
-						// path often names none. Always clear aliases when present, then
-						// every key this panel wrote (progress is keyed by the id that
-						// `compact_progress` broadcast, which is not always on the done
-						// payload). Do not clearAll here — another narrator may still be
-						// compacting.
-						clearCompactProgressAliases(replacement, isSegment);
-						const observed = compactProgressKeysRef.current;
-						for (const [messageId, wasSegment] of observed) {
-							if (isSegment != null && wasSegment !== isSegment) continue;
-							clearCompactProgress(messageId, wasSegment);
-							observed.delete(messageId);
-						}
-						bumpMessageRevision();
-					},
-					onCompactFailed: (_error, _mode, messageId) => {
-						clearCompactProgress(messageId);
-						if (messageId) compactProgressKeysRef.current.delete(messageId);
-					},
-					onFullReload: () => {
-						clearAllCompactProgress();
-						compactProgressKeysRef.current.clear();
-						bumpMessageRevision();
-					},
-					// Live compact-progress ticks repaint only the mounted fixed-height marker.
-					// They never enter the pretext document or its measurement cache.
-					onCompactProgress: ({
-						messageId,
-						isSegment,
+			const externalSubscribeMessages = dataSource?.subscribeMessages;
+			const messageWsCallbacks: NarratorWSCallbacks = {
+				onMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
+					upsertOrReload(wsData.message),
+				onUserMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
+					upsertOrReload(wsData.message),
+				onMessageUpdated: replaceOrReload,
+				onMessagesDeleted: removeOrReload,
+				// A segment compact hides its compressed messages through this dedicated
+				// event rather than `messages_deleted` (they are not gone — their summary
+				// lives behind the marker). The ids arrive in the event, so the in-place
+				// removal applies exactly as a deletion does: the run the reader just
+				// selected collapses immediately, wherever they are scrolled.
+				onSegmentCompactHide: (hiddenMessageIds: string[]) => {
+					if (removeMessagesRef.current(hiddenMessageIds)) {
+						appliedMessageRevisionRef.current += 1;
+					}
+					bumpMessageRevision();
+				},
+				// Completion (and failure — the dispatcher folds `compact_failed` into this
+				// callback) carries no message body: the content already arrived via
+				// `message` / `message_updated`, both applied in place above. It is kept
+				// for two things the in-place paths cannot cover:
+				//
+				//   1. Paths that broadcast a BARE compact_done with no preceding message
+				//      frame (narrator-recovery does, in several places). Without this
+				//      handler the document had no signal at all and stayed stale until the
+				//      reader reloaded the page — the reported bug's second half.
+				//   2. Converging the local seq numbering. `insertMessage` deliberately
+				//      does not shift the following seqs (see vlist-message-insert), and
+				//      this reload adopts the server's.
+				//
+				// It does NOT exist to shrink the window: the document page filters only on
+				// `segmentCompactId` (server-side), so a full-history compact leaves every
+				// older message readable and a segment compact's hidden rows are already
+				// gone via `onSegmentCompactHide` above.
+				onCompactDone: (_contextPercentAfter, isSegment, _mode, replacement) => {
+					// COW retries may name old and/or new marker ids; the non-retry
+					// path often names none. Always clear aliases when present, then
+					// every key this panel wrote (progress is keyed by the id that
+					// `compact_progress` broadcast, which is not always on the done
+					// payload). Do not clearAll here — another narrator may still be
+					// compacting.
+					clearCompactProgressAliases(replacement, isSegment);
+					const observed = compactProgressKeysRef.current;
+					for (const [messageId, wasSegment] of observed) {
+						if (isSegment != null && wasSegment !== isSegment) continue;
+						clearCompactProgress(messageId, wasSegment);
+						observed.delete(messageId);
+					}
+					bumpMessageRevision();
+				},
+				onCompactFailed: (_error, _mode, messageId) => {
+					clearCompactProgress(messageId);
+					if (messageId) compactProgressKeysRef.current.delete(messageId);
+				},
+				onFullReload: () => {
+					clearAllCompactProgress();
+					compactProgressKeysRef.current.clear();
+					bumpMessageRevision();
+				},
+				// Live compact-progress ticks repaint only the mounted fixed-height marker.
+				// They never enter the pretext document or its measurement cache.
+				onCompactProgress: ({
+					messageId,
+					isSegment,
+					phase,
+					thinkingChars,
+					outputChars,
+					retryCount,
+				}) => {
+					if (!messageId) return;
+					const segment = !!isSegment;
+					setCompactProgress(messageId, segment, {
 						phase,
 						thinkingChars,
 						outputChars,
 						retryCount,
-					}) => {
-						if (!messageId) return;
-						const segment = !!isSegment;
-						setCompactProgress(messageId, segment, {
-							phase,
-							thinkingChars,
-							outputChars,
-							retryCount,
-						});
-						compactProgressKeysRef.current.set(messageId, segment);
-					},
-					onCatchUp: (orphanChildren, topLevel, subagentActivities) => {
-						const initialSync = initialRevisionSyncRef.current;
-						initialRevisionSyncRef.current = false;
-						let applied = false;
-						for (const message of topLevel) {
-							if (upsertMessageRef.current(message)) applied = true;
-						}
-						const revisionDelta = resolveExactCatchUpRevisionDelta({
-							initialSync,
-							topLevelCount: topLevel.length,
-							applied,
-							orphanChildrenCount: orphanChildren.length,
-							subagentActivitiesCount: subagentActivities.length,
-						});
-						appliedMessageRevisionRef.current += revisionDelta.appliedRevisionDelta;
-						if (revisionDelta.messageRevisionDelta > 0) bumpMessageRevision();
-					},
-					onSyncOk: () => {
-						initialRevisionSyncRef.current = false;
-					},
-					// Access was refused or revoked: no snapshot or catch-up is coming. Clear the
-					// pending initial sync so the view stops waiting on a stream it will never
-					// receive, and refetch — the REST call now answers 404 and the surrounding
-					// route renders its "not found" state instead of an endless spinner.
-					onSubscribeDenied: () => {
-						initialRevisionSyncRef.current = false;
-						bumpMessageRevision();
-					},
+					});
+					compactProgressKeysRef.current.set(messageId, segment);
 				},
+				onCatchUp: (orphanChildren, topLevel, subagentActivities) => {
+					const initialSync = initialRevisionSyncRef.current;
+					initialRevisionSyncRef.current = false;
+					let applied = false;
+					for (const message of topLevel) {
+						if (upsertMessageRef.current(message)) applied = true;
+					}
+					const revisionDelta = resolveExactCatchUpRevisionDelta({
+						initialSync,
+						topLevelCount: topLevel.length,
+						applied,
+						orphanChildrenCount: orphanChildren.length,
+						subagentActivitiesCount: subagentActivities.length,
+					});
+					appliedMessageRevisionRef.current += revisionDelta.appliedRevisionDelta;
+					if (revisionDelta.messageRevisionDelta > 0) bumpMessageRevision();
+				},
+				onSyncOk: () => {
+					initialRevisionSyncRef.current = false;
+				},
+				// Access was refused or revoked: no snapshot or catch-up is coming. Clear the
+				// pending initial sync so the view stops waiting on a stream it will never
+				// receive, and refetch — the REST call now answers 404 and the surrounding
+				// route renders its "not found" state instead of an endless spinner.
+				onSubscribeDenied: () => {
+					initialRevisionSyncRef.current = false;
+					bumpMessageRevision();
+				},
+			};
+			// An external data source (a chat room, the share page's own wiring) drives
+			// the same handler set instead of the narrator WS subscription.
+			useNarratorWS(
+				externalSubscribeMessages ? undefined : revisionSubscriptionId,
+				messageWsCallbacks,
 				exactMessageSnapshot,
 				{ kind: "messages" },
 			);
+			const messageWsCallbacksRef = useRef(messageWsCallbacks);
+			messageWsCallbacksRef.current = messageWsCallbacks;
+			const stableExternalHandlers = useMemo<NarratorWSCallbacks>(() => {
+				const forward = <K extends keyof NarratorWSCallbacks>(key: K) =>
+					((...args: unknown[]) => {
+						const handler = messageWsCallbacksRef.current[key];
+						if (typeof handler === "function") (handler as (...a: unknown[]) => void)(...args);
+					}) as never;
+				return {
+					onMessage: forward("onMessage"),
+					onUserMessage: forward("onUserMessage"),
+					onMessageUpdated: forward("onMessageUpdated"),
+					onMessagesDeleted: forward("onMessagesDeleted"),
+					onSegmentCompactHide: forward("onSegmentCompactHide"),
+					onCompactDone: forward("onCompactDone"),
+					onCompactFailed: forward("onCompactFailed"),
+					onFullReload: forward("onFullReload"),
+					onCompactProgress: forward("onCompactProgress"),
+					onCatchUp: forward("onCatchUp"),
+					onSyncOk: forward("onSyncOk"),
+					onSubscribeDenied: forward("onSubscribeDenied"),
+				};
+			}, []);
+			useEffect(() => {
+				if (!externalSubscribeMessages) return;
+				return externalSubscribeMessages(stableExternalHandlers);
+			}, [externalSubscribeMessages, stableExternalHandlers]);
 			// Live LIFECYCLE updates (tool started/completed, reflection gates, permission
 			// decisions, background terminals, subagent activity). These mutate an
 			// already-loaded message in place, so they are applied as anchor-preserving
@@ -2647,6 +2720,34 @@ export const PretextExactMessageList = memo(
 			visibleRef.current = visible;
 			const exactLayoutRef = useRef(exactLayout);
 			exactLayoutRef.current = exactLayout;
+
+			// Read watermark seam: the STRICTLY visible window (no overscan) mapped to
+			// its last source message id. Chat rooms translate that id back into a seq
+			// to advance their read cursor; absent the prop, this is inert.
+			const seenWindow = useMemo(
+				() =>
+					exactLayout
+						? resolveVisibleWindow(exactLayout, scrollTop, viewportHeight, 0)
+						: { start: 0, end: 0, topSpacer: 0, bottomSpacer: 0 },
+				[exactLayout, scrollTop, viewportHeight],
+			);
+			const onVisibleMessagesChangeRef = useRef(onVisibleMessagesChange);
+			onVisibleMessagesChangeRef.current = onVisibleMessagesChange;
+			useEffect(() => {
+				const callback = onVisibleMessagesChangeRef.current;
+				if (!callback) return;
+				const manifestItems = pretextDocument.manifest?.items ?? [];
+				const lastItem = manifestItems[seenWindow.end - 1];
+				const lastId = lastItem?.sourceMessageIds.at(-1) ?? null;
+				callback(
+					lastId
+						? {
+								id: lastId,
+								seq: typeof lastItem?.lastSeq === "number" ? lastItem.lastSeq : null,
+							}
+						: null,
+				);
+			}, [seenWindow.end, pretextDocument.manifest]);
 
 			/**
 			 * Identity of the currently committed DOCUMENT (not its geometry).
@@ -4423,11 +4524,23 @@ export const PretextExactMessageList = memo(
 					// target's seq on the server, then page older until the window covers it.
 					const resolved = await resolveJumpTargetSeq(targetIds, {
 						fetchMessageLocation: (messageId) =>
-							narratorsApi.getMessageLocation(narratorId, messageId),
+							dataSource?.locateMessage
+								? dataSource.locateMessage(narratorId, messageId)
+								: narratorsApi.getMessageLocation(narratorId, messageId),
 						fetchToolMessage: async (toolUseId) => {
-							const detail = await narratorsApi.getToolCallDetail(narratorId, toolUseId);
+							const detail = dataSource?.fetchToolDetail
+								? await dataSource.fetchToolDetail(
+										narratorId,
+										toolUseId,
+										{},
+										new AbortController().signal,
+									)
+								: await narratorsApi.getToolCallDetail(narratorId, toolUseId);
 							return {
-								messageId: typeof detail?.messageId === "string" ? detail.messageId : undefined,
+								messageId:
+									typeof (detail as { messageId?: unknown } | null)?.messageId === "string"
+										? (detail as { messageId: string }).messageId
+										: undefined,
 							};
 						},
 					});
@@ -4481,7 +4594,14 @@ export const PretextExactMessageList = memo(
 					if (cancelled()) return false;
 					return revealByLayout(revealIds);
 				},
-				[narratorId, t, getSmoothFollower, writeScrollTop],
+				[
+					narratorId,
+					t,
+					getSmoothFollower,
+					writeScrollTop,
+					dataSource?.fetchToolDetail,
+					dataSource?.locateMessage,
+				],
 			);
 
 			// UI-driven LOD changes (the indicator's notches / steppers) never pass through
@@ -4556,6 +4676,19 @@ export const PretextExactMessageList = memo(
 				const controller = highlightRef.current;
 				return () => controller.cancel();
 			}, []);
+
+			// Quote-strip jump (chat / discussion rows): page history until the quoted
+			// message is covered, same machinery as a search deep-link.
+			const quoteJump = useCallback(
+				(targetId: string) => {
+					void scrollToMessageTarget({
+						domIds: [`msg-${targetId}`],
+						targetIds: [targetId],
+						highlightId: targetId,
+					});
+				},
+				[scrollToMessageTarget],
+			);
 
 			const manifestItems = pretextDocument.manifest?.items ?? [];
 			const hasRenderableLayout = hasRenderableExactLayout(
@@ -4812,6 +4945,14 @@ export const PretextExactMessageList = memo(
 						toolActions,
 						...(editedMeta ? { onViewOriginal: () => setOriginalModalMessageId(messageId) } : {}),
 						...(inspectContent ? { inspectContent } : {}),
+						// Message-level selection (chat): outline + modifier-click toggle.
+						...(onToggleMessageSelect
+							? {
+									selected: messageSelectedIds?.has(messageId) ?? false,
+									onToggleSelect: (opts: { shiftKey: boolean }) =>
+										onToggleMessageSelect(messageId, opts),
+								}
+							: {}),
 					};
 					map.set(
 						item.spec.key,
@@ -4832,6 +4973,8 @@ export const PretextExactMessageList = memo(
 				rowToolMetaIndex,
 				messagesById,
 				openEditor,
+				messageSelectedIds,
+				onToggleMessageSelect,
 			]);
 
 			// System cards (compact markers included) carry no `-b{n}` suffix in their spec
@@ -5037,6 +5180,7 @@ export const PretextExactMessageList = memo(
 						closingRowKeys: closingRows.get(item.spec.key),
 						narratorId,
 						onOpenFilePanel: rowHandlers?.onOpenFilePanel,
+						onFetchAttachment: dataSource?.onFetchAttachment,
 						openAttachmentLabel,
 						injectionNoteLabel,
 						reviewTruncatedLabel,
@@ -5079,6 +5223,7 @@ export const PretextExactMessageList = memo(
 							? pretextDocument.streamingMessage?._streamAnimSnapshotEpoch
 							: undefined,
 						specTaskLive: isSpecTaskLiveItem(item, specTaskLiveGate),
+						onQuoteJump: quoteJump,
 					};
 					windowRowProjections.push({
 						props: rowProps,
@@ -5095,8 +5240,10 @@ export const PretextExactMessageList = memo(
 					style={{
 						position: "relative",
 						height: "100%",
-						overflow: "auto",
-						// Reserve the vertical scrollbar's track from the very first frame.
+						overflowX: "auto",
+						overflowY: "scroll",
+						// Always show the vertical scrollbar, including while loading or switching
+						// narrators, and reserve its track from the very first frame.
 						//
 						// Without it, `clientWidth` drops ~15px the moment the loaded document
 						// becomes taller than the viewport, so the column was measured once

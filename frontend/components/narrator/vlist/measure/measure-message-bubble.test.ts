@@ -60,6 +60,39 @@ describe("measureMessageBubble — assistant", () => {
 });
 
 describe("measureMessageBubble — user", () => {
+	it("chat Markdown reserves the renderer's exact body box alongside quote and attachment", async () => {
+		const { measureMessageBubble, USER_BUBBLE_PADDING, USER_HEADER_HEIGHT, USER_HEADER_BODY_GAP } =
+			await import("./measure-message-bubble");
+		const { measureMarkdown } = await import("./measure-markdown");
+		const text = "**bold** [link](https://example.com)\n\n```ts\nconst n = 1;\n```";
+		const input = {
+			role: "user" as const,
+			text,
+			bodyFormat: "markdown" as const,
+			quote: { authorName: "alice", text: "quote", state: "quoted" as const },
+			attachments: [{ type: "text_file", filename: "notes.txt", fetchUrl: "/chat/attachments/a" }],
+		};
+		const bubble = measureMessageBubble(input, 440);
+		const body = measureMarkdown(text, 440 - 2 * USER_BUBBLE_PADDING);
+		const block = bubble.blocks.at(-1);
+		expect(block).toMatchObject({
+			kind: "fixed",
+			tag: "user-markdown",
+			height: body.height,
+			data: { measured: body },
+		});
+		expect(bubble.usedWidth).toBe(440);
+		expect(bubble.height).toBe(
+			2 * USER_BUBBLE_PADDING +
+				USER_HEADER_HEIGHT +
+				USER_HEADER_BODY_GAP +
+				bubble.frame.contentHeight,
+		);
+		const grouped = measureMessageBubble({ ...input, hasHeader: false }, 440);
+		expect(bubble.height - grouped.height).toBe(USER_HEADER_HEIGHT + USER_HEADER_BODY_GAP);
+		const plain = measureMessageBubble({ role: "user", text }, 440);
+		expect(plain.blocks[0]?.kind).toBe("code");
+	});
 	it("includes bubble padding and header row", async () => {
 		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
 			"./measure-message-bubble"
@@ -136,6 +169,148 @@ describe("measureMessageBubble — user", () => {
 		const withHeader = measureMessageBubble({ role: "user", text: "hi" }, 1000);
 		const noHeaderFloorRef = measureMessageBubble({ role: "user", text: "hi" }, 1000);
 		expect(withHeader.height).toBe(noHeaderFloorRef.height);
+	});
+});
+
+// ── reply quote strip + soft-delete tombstone ─────────────────────────────────
+// The chat/discussion surfaces carry message shapes the narrator list never had:
+// a reply quote strip and a tombstone form. Both are reserved as FIXED blocks so
+// the render pass paints inside measured boxes; these pin their geometry.
+describe("measureMessageBubble — quote strip", () => {
+	const QUOTE = {
+		authorName: "张三",
+		text: "被引用的那条消息预览",
+		state: "quoted" as const,
+	};
+
+	it("adds exactly one clamped xs line plus the gap", async () => {
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const { typographyMetrics } = await import("../pretext-fonts");
+		const plain = measureMessageBubble({ role: "user", text: "hi" }, 1000);
+		const quoted = measureMessageBubble({ role: "user", text: "hi", quote: QUOTE }, 1000);
+		expect(quoted.height - plain.height).toBe(typographyMetrics().line.xs + 4);
+		// The strip is the FIRST block (between header and body).
+		expect(quoted.blocks[0]?.kind).toBe("fixed");
+		expect((quoted.blocks[0] as { tag?: string }).tag).toBe("user-quote");
+	});
+
+	it("never widens the shrink-wrap, however long the quoted text is", async () => {
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const plain = measureMessageBubble({ role: "user", text: "hi" }, 1000);
+		const quoted = measureMessageBubble(
+			{
+				role: "user",
+				text: "hi",
+				quote: {
+					authorName: "a very long quoted author name",
+					text: "x".repeat(400),
+					state: "quoted",
+				},
+			},
+			1000,
+		);
+		// The strip truncates to the bubble's settled width instead of contributing
+		// a displayWidth (same contract as the chat list's reply strip).
+		expect(quoted.usedWidth).toBe(plain.usedWidth);
+	});
+
+	it("positions the body below the strip", async () => {
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const { typographyMetrics } = await import("../pretext-fonts");
+		const quoted = measureMessageBubble({ role: "user", text: "hi", quote: QUOTE }, 1000);
+		const bodyIndex = quoted.blocks.findIndex((block) => block.kind === "code");
+		const quoteFrame = quoted.frame.blocks[0];
+		const bodyFrame = quoted.frame.blocks[bodyIndex];
+		expect(bodyFrame?.top).toBe((quoteFrame?.top ?? 0) + typographyMetrics().line.xs + 4);
+	});
+});
+
+describe("measureMessageBubble — tombstone", () => {
+	it("collapses body AND attachments to one dimmed line", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const { typographyMetrics } = await import("../pretext-fonts");
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const tombstone = measureMessageBubble(
+			{
+				role: "user",
+				text: "this body is gone but must not be measured",
+				attachments: [{ type: "image", imageId: "img-1", filename: "shot.png" }],
+				deleted: true,
+				deletedLabel: "此消息已删除",
+			},
+			1000,
+		);
+		// padding + header + exactly ONE body-height line — no image box, no wrap.
+		expect(tombstone.height).toBe(
+			c.USER_BUBBLE_PADDING * 2 +
+				c.USER_HEADER_HEIGHT +
+				c.USER_HEADER_BODY_GAP +
+				typographyMetrics().line.body,
+		);
+		expect(tombstone.blocks).toHaveLength(1);
+		expect((tombstone.blocks[0] as { tag?: string }).tag).toBe("user-deleted");
+	});
+
+	it("shrink-wraps around the tombstone label's natural width", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const tombstone = measureMessageBubble(
+			{ role: "user", text: "", deleted: true, deletedLabel: "此消息已删除", hasHeader: false },
+			1000,
+		);
+		// The label's displayWidth feeds the frame, so the bubble hugs the line
+		// instead of claiming the full column or clipping the text.
+		expect(tombstone.usedWidth).toBeLessThan(1000);
+		expect(tombstone.usedWidth).toBeGreaterThan(c.USER_BUBBLE_PADDING * 2);
+	});
+
+	it("keeps the quote strip above the tombstone when both are present", async () => {
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const tombstone = measureMessageBubble(
+			{
+				role: "user",
+				text: "",
+				deleted: true,
+				deletedLabel: "此消息已删除",
+				quote: { authorName: "张三", text: "被引用", state: "quoted" },
+			},
+			1000,
+		);
+		expect(tombstone.blocks.map((block) => (block as { tag?: string }).tag)).toEqual([
+			"user-quote",
+			"user-deleted",
+		]);
+	});
+});
+
+describe("extractDataRevision — quote/tombstone/edit keys", () => {
+	it("re-keys on quote resolve, soft delete, label edit and editedAt", async () => {
+		const { extractDataRevision } = await import("../measure-cache");
+		const base = extractDataRevision({ role: "user", text: "hi" });
+		const quoted = extractDataRevision({
+			role: "user",
+			text: "hi",
+			quote: { authorName: "a", text: "b", state: "quoted" },
+		});
+		const quotedResolved = extractDataRevision({
+			role: "user",
+			text: "hi",
+			quote: { authorName: "a", text: "LONGER preview after the page loaded", state: "quoted" },
+		});
+		const deleted = extractDataRevision({ role: "user", text: "hi", deleted: true });
+		const edited = extractDataRevision({
+			role: "user",
+			text: "hi",
+			editedAt: "2026-04-02T10:00:00Z",
+		});
+		expect(quoted).not.toBe(base);
+		expect(quotedResolved).not.toBe(quoted);
+		expect(deleted).not.toBe(base);
+		expect(edited).not.toBe(base);
 	});
 });
 

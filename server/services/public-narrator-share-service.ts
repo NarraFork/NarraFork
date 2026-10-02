@@ -15,11 +15,6 @@ import {
 } from "../lib/validators/public-narrator-shares";
 import { ensureNarratorDiscussionRoomForShare } from "./chat-service";
 import { canManageNarratorAcl, NARRATOR_ACL_COLUMNS, type NarratorPrincipal } from "./narrator-acl";
-import {
-	assertPublicLineageVersions,
-	publicLineageVersion,
-	publicReadLineage,
-} from "./public-narrator-share-lineage";
 
 export function unavailablePublicShare(): AppError {
 	return new AppError("Share link unavailable", 404, "PUBLIC_SHARE_UNAVAILABLE");
@@ -227,14 +222,14 @@ export function getPublicSharedSession(auth: VerifiedPublicShare): PublicSharedS
 		.limit(1)
 		.get();
 	if (!row) throw unavailablePublicShare();
-	const scopes = publicReadLineage(current.narratorId);
-	assertPublicLineageVersions(scopes);
 	revalidatePublicShare(current);
 	return {
 		shareId: current.shareId,
+		narratorId: current.narratorId,
+		roomId: current.roomId,
 		guestName: current.guestName,
 		title: row.title ?? "",
 		status: ["working", "waiting", "archived"].includes(row.status) ? row.status : "idle",
-		messageVersion: publicLineageVersion(scopes),
+		messageVersion: row.messageVersion,
 	};
 }

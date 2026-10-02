@@ -145,6 +145,8 @@ export interface TraceRenderLabels {
 	 * into a line that had given no sign it was about to hold anything.
 	 */
 	reasoningPending?: string;
+	/** A finished reasoning row whose provider supplied no visible summary. */
+	reasoningEmpty?: string;
 	/**
 	 * Timing popover strings for the per-row duration slot. Absent → the render
 	 * layer's English fallbacks. Height-neutral (portaled popover, fixed rows).
@@ -429,6 +431,7 @@ export function RenderToolRun({
 					liveTail={rowLiveTails?.get(row.key)}
 					liveTailChars={labels.liveTailChars}
 					reasoningPending={labels.reasoningPending}
+					reasoningEmpty={labels.reasoningEmpty}
 					// Only the row still being written may fade. `row.shimmer` is the
 					// adapter's own live marker, so a run that the answer text or a tool
 					// call already followed settles here too — the same moment its shimmer
@@ -778,6 +781,7 @@ function TraceRowView({
 	liveTail,
 	liveTailChars,
 	reasoningPending,
+	reasoningEmpty,
 	animateStreaming,
 	animKeyBase,
 	animScope,
@@ -796,6 +800,8 @@ function TraceRowView({
 	liveTailChars?: (formatted: string) => string;
 	/** Placeholder label for a live reasoning row with no text yet. */
 	reasoningPending?: string;
+	/** Finished reasoning without a visible summary. */
+	reasoningEmpty?: string;
 	/** This row is the live one AND the fade is enabled (see RenderToolRunProps). */
 	animateStreaming?: boolean;
 	animKeyBase?: string;
@@ -851,6 +857,14 @@ function TraceRowView({
 		: row.shimmer && !row.title.trim() && row.status == null
 			? "pending"
 			: "title";
+	// Empty summaries are legitimate (e.g. encrypted Codex reasoning). Keep the
+	// live indicator distinct from a finished row; never animate settled history.
+	const displayRow =
+		labelForm === "pending"
+			? { ...row, title: reasoningPending ?? "Thinking" }
+			: row.status == null && row.iconColor === "grape" && !row.title.trim()
+				? { ...row, title: reasoningEmpty ?? "Thought complete (no visible summary)" }
+				: row;
 	const fadeLabel = useLabelFormFade(labelForm);
 	const interactive = !!row.identity && !!rowInteraction;
 	// A row the SYSTEM drilled open for a live permission form cannot be folded by the
@@ -889,7 +903,7 @@ function TraceRowView({
 			aria-expanded={togglable ? row.expanded : undefined}
 			// The shimmer's five states are carried by colour alone; this is the only
 			// channel a non-visual reader has for them.
-			aria-label={shimmerLabel ? `${row.title || "…"} — ${shimmerLabel}` : undefined}
+			aria-label={shimmerLabel ? `${displayRow.title || "…"} — ${shimmerLabel}` : undefined}
 			title={shimmerLabel}
 			style={{
 				height: traceMetrics().rowHeight,
@@ -947,13 +961,14 @@ function TraceRowView({
 					fadeIn={fadeLabel}
 				/>
 			) : labelForm === "pending" ? (
-				<TraceRowTitle
-					key="pending"
-					row={{ ...row, title: reasoningPending ?? "…" }}
-					shimmerClass={shimmerClass}
-				/>
+				<TraceRowTitle key="pending" row={displayRow} shimmerClass={shimmerClass} />
 			) : (
-				<TraceRowTitle key="title" row={row} shimmerClass={shimmerClass} fadeIn={fadeLabel} />
+				<TraceRowTitle
+					key="title"
+					row={displayRow}
+					shimmerClass={shimmerClass}
+					fadeIn={fadeLabel}
+				/>
 			)}
 			{/* Status + duration, adjacent to the label rather than right-aligned: in a
 			    column of rows a far-right number has to be traced back across the gap to

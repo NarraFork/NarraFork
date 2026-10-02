@@ -327,6 +327,27 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// entry and paint the new text inside the old box (CONTRACT.md §4.5 约束 3).
 	// O(1) via the sampled signature, same as every other text field here.
 	if (typeof d.text === "string") rev += `|sx:${textSignature(d.text)}`;
+	// Chat regrouping can add/remove the fixed header without editing the message.
+	// Body format also changes geometry while text/id/document version stay equal.
+	// Normalize the narrator defaults so omitted and explicit defaults share a key.
+	if (d.role === "user") {
+		rev += `|uh:${d.hasHeader === false ? 0 : 1}|bf:${d.bodyFormat === "markdown" ? "markdown" : "plain"}`;
+	}
+	// User-bubble reply quote strip / tombstone form. Both are reserved fixed
+	// blocks inside the measured payload, so a reply target resolve (preview
+	// landing after the page loads), a soft delete, or an edit of the tombstone
+	// label must re-key — otherwise the cached element keeps painting the old
+	// strip / keeps the body that a tombstone replaced.
+	if (d.quote && typeof d.quote === "object") {
+		const quote = d.quote as Record<string, unknown>;
+		rev += `|qu:${String(quote.state ?? "")}:${textSignature(String(quote.text ?? ""))}:${textSignature(String(quote.authorName ?? ""))}`;
+	}
+	if (d.deleted === true) rev += "|del:1";
+	if (typeof d.deletedLabel === "string") rev += `|dl:${textSignature(d.deletedLabel)}`;
+	// Canonical edit stamp of a user/chat message: an in-place edit keeps the
+	// spec.key and usually the role, so without this the measured body stays the
+	// pre-edit one (the gap chat's own measure cache key already closed).
+	if (typeof d.editedAt === "string") rev += `|ea:${d.editedAt}`;
 	// Communication bodies can finish streaming or hydrate without changing status.
 	// Re-key the bounded measured text and both independently reserved footer rows.
 	if (typeof d.message === "string") {
@@ -363,6 +384,9 @@ export function extractDataRevision(data: unknown): string | undefined {
 					a.height,
 					a.filePath,
 					a.uploadNarratorId,
+					// Domain-endpoint locator (chat attachments): the id lives in the path,
+					// so this also re-keys a same-filename re-upload.
+					a.fetchUrl,
 				];
 			}),
 		)}`;

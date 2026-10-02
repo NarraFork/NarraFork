@@ -69,23 +69,27 @@ describe("parseStructured — json", () => {
 		);
 		expect(ok.truncated).toBe(false);
 		expect(leafValue(ok.nodes, "name")).toBe("narrafork");
+		// Minified single-line input: every node anchors to line 0.
 		expect(findNode(ok.nodes, "version")).toEqual({
 			kind: "leaf",
 			key: "version",
 			value: "3",
 			valueType: "number",
+			line: 0,
 		});
 		expect(findNode(ok.nodes, "stable")).toEqual({
 			kind: "leaf",
 			key: "stable",
 			value: "true",
 			valueType: "boolean",
+			line: 0,
 		});
 		expect(findNode(ok.nodes, "missing")).toEqual({
 			kind: "leaf",
 			key: "missing",
 			value: "null",
 			valueType: "null",
+			line: 0,
 		});
 		const scripts = findNode(ok.nodes, "scripts");
 		expect(scripts?.kind).toBe("branch");
@@ -184,6 +188,7 @@ describe("parseStructured — toml", () => {
 			key: "port",
 			value: "7779",
 			valueType: "number",
+			line: 2,
 		});
 		expect(leafValue(ok.nodes, "ratio")).toBe("1.5");
 		expect(leafValue(ok.nodes, "enabled")).toBe("true");
@@ -232,5 +237,112 @@ describe("parseStructured — toml", () => {
 	it("strips a UTF-8 BOM from the first key", () => {
 		const ok = expectOk(parseStructured('\uFEFFtitle = "x"\n', "toml"));
 		expect(findNode(ok.nodes, "title")).toBeDefined();
+	});
+});
+
+describe("parseStructured — source lines", () => {
+	it("json: records the key line for pretty-printed objects", () => {
+		const ok = expectOk(parseStructured('{\n  "a": 1,\n  "b": {\n    "c": 2\n  }\n}', "json"));
+		expect(findNode(ok.nodes, "a")?.line).toBe(1);
+		const b = findNode(ok.nodes, "b");
+		expect(b?.line).toBe(2);
+		if (b?.kind === "branch") expect(findNode(b.children, "c")?.line).toBe(3);
+	});
+
+	it("json: records element start lines for arrays, including nested objects", () => {
+		const ok = expectOk(parseStructured('{\n"list": [\n{"x": 1},\n2,\nnull\n]\n}', "json"));
+		const list = findNode(ok.nodes, "list");
+		expect(list?.line).toBe(1);
+		if (list?.kind !== "branch") throw new Error("list must be a branch");
+		expect(findNode(list.children, "[0]")?.line).toBe(2);
+		expect(findNode(list.children, "[1]")?.line).toBe(3);
+		expect(findNode(list.children, "[2]")?.line).toBe(4);
+		const first = findNode(list.children, "[0]");
+		if (first?.kind === "branch") expect(findNode(first.children, "x")?.line).toBe(2);
+	});
+
+	it("json: leading blank lines do not shift line numbers", () => {
+		const ok = expectOk(parseStructured('\n\n{"a": 1}', "json"));
+		expect(findNode(ok.nodes, "a")?.line).toBe(2);
+	});
+
+	it("json: counts \\r\\n and bare \\r as one line break each", () => {
+		const ok = expectOk(parseStructured('{\r\n"a": 1,\r\n"b": 2\r}', "json"));
+		expect(findNode(ok.nodes, "a")?.line).toBe(1);
+		expect(findNode(ok.nodes, "b")?.line).toBe(2);
+	});
+
+	it("json: decodes escaped keys before anchoring them", () => {
+		const ok = expectOk(parseStructured('{\n"a\\"b": 1,\n"c": 2\n}', "json"));
+		expect(findNode(ok.nodes, 'a"b')?.line).toBe(1);
+		expect(findNode(ok.nodes, "c")?.line).toBe(2);
+	});
+
+	it("json: keys containing path separators anchor their own node", () => {
+		// "a/b" must not collide with the nested path a → b.
+		const ok = expectOk(parseStructured('{\n"a/b": 1,\n"a": {\n"b": 2\n}\n}', "json"));
+		expect(findNode(ok.nodes, "a/b")?.line).toBe(1);
+		const a = findNode(ok.nodes, "a");
+		expect(a?.line).toBe(2);
+		if (a?.kind === "branch") expect(findNode(a.children, "b")?.line).toBe(3);
+	});
+
+	it("json: survives nesting past the depth cap without recording it", () => {
+		let deep = "1";
+		for (let i = 0; i < MAX_STRUCTURED_DEPTH + 10; i++) deep = `{"a":${deep}}`;
+		const ok = expectOk(parseStructured(deep, "json"));
+		expect(ok.truncated).toBe(true);
+		// Depth-capped nodes have no line, but shallower ones do.
+		expect(findNode(ok.nodes, "a")?.line).toBe(0);
+	});
+
+	it("toml: records table, entry and dotted-key lines", () => {
+		const text = [
+			'title = "demo"', // line 0
+			"",
+			"[server.http]", // line 2
+			'host = "x"', // line 3
+			"",
+			"[meta]", // line 5
+			'owner.name = "team"', // line 6
+		].join("\n");
+		const ok = expectOk(parseStructured(text, "toml"));
+		expect(findNode(ok.nodes, "title")?.line).toBe(0);
+		// The intermediate `server` branch anchors to the header that created it.
+		expect(findNode(ok.nodes, "server")?.line).toBe(2);
+		const http = branch(branch(ok.nodes, "server"), "http");
+		expect(findNode(ok.nodes, "server")?.kind).toBe("branch");
+		expect(findNode(http, "host")?.line).toBe(3);
+		const meta = branch(ok.nodes, "meta");
+		expect(findNode(branch(meta, "owner"), "name")?.line).toBe(6);
+	});
+
+	it("toml: records array-of-tables element lines per entry", () => {
+		const text = [
+			"[[bin]]", // line 0
+			'name = "one"', // line 1
+			"[[bin]]", // line 2
+			'name = "two"', // line 3
+		].join("\n");
+		const ok = expectOk(parseStructured(text, "toml"));
+		const bins = branch(ok.nodes, "bin");
+		expect(findNode(ok.nodes, "bin")?.line).toBe(0);
+		expect(findNode(bins, "[0]")?.line).toBe(0);
+		expect(findNode(bins, "[1]")?.line).toBe(2);
+		const first = findNode(bins, "[0]");
+		if (first?.kind === "branch") expect(findNode(first.children, "name")?.line).toBe(1);
+	});
+
+	it("ini: records section and key lines", () => {
+		const text = [
+			"root = 1", // line 0
+			"; comment", // line 1
+			"[sec]", // line 2
+			"k = v", // line 3
+		].join("\n");
+		const ok = expectOk(parseStructured(text, "ini"));
+		expect(findNode(ok.nodes, "root")?.line).toBe(0);
+		expect(findNode(ok.nodes, "sec")?.line).toBe(2);
+		expect(findNode(branch(ok.nodes, "sec"), "k")?.line).toBe(3);
 	});
 });

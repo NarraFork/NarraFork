@@ -58,7 +58,7 @@ import {
 	type NarratorBoundPanelParams,
 	type SubagentPanelParams,
 } from "../panels/panel-kind";
-import { usePanelCompact, usePanelHeaderDrag } from "../panels/shared";
+import { usePanelCompact, usePanelGeometryReady, usePanelHeaderDrag } from "../panels/shared";
 import { toolEditReferenceKey } from "../tool-call/tool-edit-reference";
 import type { NarratorDockPanelType } from "./dock-panel-types";
 import { NarratorDockContext, useNarratorDockContext } from "./NarratorDockContext";
@@ -274,7 +274,8 @@ function ChatDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 	const dock = useNarratorDockContext();
 	// Identity ALWAYS comes from the live page context, never serialized params.
 	const narratorId = dock?.narratorId ?? (props.params as { narratorId?: string }).narratorId ?? "";
-	const { ref, compact } = usePanelCompact();
+	const { ref: compactRef, compact } = usePanelCompact();
+	const { ref, geometryReady } = usePanelGeometryReady(compactRef);
 	const onHeaderPointerDown = usePanelHeaderDrag(props, narratorId);
 	const { data: narratorData } = useNarrator(narratorId);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON entity
@@ -287,19 +288,21 @@ function ChatDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 
 	return (
 		<Box ref={ref} style={{ height: "100%", overflow: "hidden" }}>
-			<LazyPanelBoundary>
-				<NarratorPanel
-					key={narratorId}
-					narratorId={narratorId}
-					compact={compact}
-					onForkFromMessage={dock?.onForkFromMessage ?? undefined}
-					onHeaderPointerDown={onHeaderPointerDown}
-					onViewSubagentSession={dock?.openSubagentPanel}
-					highlightMessageId={dock?.highlightMessageId}
-					onBack={dock?.onBack ?? undefined}
-					onMinimize={dock?.onMinimize ?? undefined}
-				/>
-			</LazyPanelBoundary>
+			{geometryReady && (
+				<LazyPanelBoundary>
+					<NarratorPanel
+						key={narratorId}
+						narratorId={narratorId}
+						compact={compact}
+						onForkFromMessage={dock?.onForkFromMessage ?? undefined}
+						onHeaderPointerDown={onHeaderPointerDown}
+						onViewSubagentSession={dock?.openSubagentPanel}
+						highlightMessageId={dock?.highlightMessageId}
+						onBack={dock?.onBack ?? undefined}
+						onMinimize={dock?.onMinimize ?? undefined}
+					/>
+				</LazyPanelBoundary>
+			)}
 		</Box>
 	);
 }

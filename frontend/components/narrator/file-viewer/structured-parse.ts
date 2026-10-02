@@ -31,6 +31,8 @@ export type StructuredNode =
 			key: string;
 			value: string;
 			valueType: StructuredValueType;
+			/** 0-based source line, when the parser could locate the entry. */
+			line?: number;
 	  }
 	| {
 			kind: "branch";
@@ -38,6 +40,8 @@ export type StructuredNode =
 			children: StructuredNode[];
 			/** Direct child count (shown as a badge on a collapsed branch). */
 			childCount: number;
+			/** 0-based source line, when the parser could locate the entry. */
+			line?: number;
 	  };
 
 export interface StructuredParseOk {
@@ -105,6 +109,22 @@ interface Budget {
 	truncated: boolean;
 }
 
+/**
+ * RFC 6901 escaping for path segments in the line map: keys may themselves
+ * contain "/" or "~", and an unescaped join would make two distinct paths
+ * collide onto one line entry.
+ */
+function escapePathSegment(key: string): string {
+	return key.replace(/~/g, "~0").replace(/\//g, "~1");
+}
+
+/** Map key for the line of the node at `segments` (e.g. `/a/[0]/b`). */
+function pathKey(segments: readonly string[]): string {
+	let out = "";
+	for (const segment of segments) out += `/${escapePathSegment(segment)}`;
+	return out;
+}
+
 function leafFor(key: string, value: unknown): StructuredNode {
 	if (value === null) return { kind: "leaf", key, value: "null", valueType: "null" };
 	switch (typeof value) {
@@ -133,8 +153,18 @@ function isPlainContainer(value: unknown): value is Record<string, unknown> | un
  * Convert a parsed value into nodes, honouring the depth + node budget. When a
  * cap is hit the branch gets a synthetic truncation leaf and `budget.truncated`
  * is set so the panel can say so.
+ *
+ * `lines` maps escaped path keys (see `pathKey`) to 0-based source lines; it is
+ * what lets the split view scroll-sync a node tree against the source. Missing
+ * entries simply leave the node anchorless.
  */
-function valueToNodes(value: unknown, depth: number, budget: Budget): StructuredNode[] {
+function valueToNodes(
+	value: unknown,
+	depth: number,
+	budget: Budget,
+	keyPrefix = "",
+	lines?: ReadonlyMap<string, number>,
+): StructuredNode[] {
 	if (!isPlainContainer(value)) return [];
 	if (depth >= MAX_STRUCTURED_DEPTH) {
 		budget.truncated = true;
@@ -152,27 +182,209 @@ function valueToNodes(value: unknown, depth: number, budget: Budget): Structured
 			break;
 		}
 		budget.remaining -= 1;
+		const line = lines?.get(`${keyPrefix}/${escapePathSegment(key)}`);
+		let node: StructuredNode;
 		if (isPlainContainer(child)) {
-			const children = valueToNodes(child, depth + 1, budget);
-			nodes.push({ kind: "branch", key, children, childCount: children.length });
+			const children = valueToNodes(
+				child,
+				depth + 1,
+				budget,
+				`${keyPrefix}/${escapePathSegment(key)}`,
+				lines,
+			);
+			node = { kind: "branch", key, children, childCount: children.length };
 		} else {
-			nodes.push(leafFor(key, child));
+			node = leafFor(key, child);
 		}
+		if (line !== undefined) node.line = line;
+		nodes.push(node);
 	}
 	return nodes;
 }
 
-function toResult(value: unknown): StructuredParseResult {
+function toResult(value: unknown, lines?: ReadonlyMap<string, number>): StructuredParseResult {
 	const budget: Budget = { remaining: MAX_STRUCTURED_NODES, truncated: false };
 	if (!isPlainContainer(value)) {
 		// A bare scalar document (e.g. `42`) has no tree worth showing.
 		return { error: "Document root is not an object or array" };
 	}
-	const nodes = valueToNodes(value, 0, budget);
+	const nodes = valueToNodes(value, 0, budget, "", lines);
 	return { nodes, truncated: budget.truncated };
 }
 
 // ── json ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Record the 0-based source line of every object member and array element in a
+ * JSON document, keyed by escaped path (`/a/[0]/b`). `JSON.parse` discards
+ * position information, and the split view's scroll sync needs a line per tree
+ * node — so this is a separate iterative pass over the text.
+ *
+ * Why iterative and defensive: the input can be up to 1 MB, which permits
+ * nesting deep enough to overflow a recursive descent; and while the scanner is
+ * only consulted after `JSON.parse` has accepted the document, any internal
+ * surprise must degrade to "no lines" (proportional scroll sync) rather than
+ * break the node view. Object members record the KEY's line (the tree row shows
+ * the key); array elements record the element's start line. Depth beyond
+ * MAX_STRUCTURED_DEPTH is structurally walked but not recorded — the node
+ * conversion truncates there anyway.
+ */
+function scanJsonLines(text: string): Map<string, number> {
+	const lines = new Map<string, number>();
+	const n = text.length;
+	let i = 0;
+	let line = 0;
+
+	type Frame =
+		| {
+				kind: "object";
+				/** Escaped path key of this container, or null past the recording depth. */
+				key: string | null;
+				pendingKey: string | null;
+				pendingLine: number;
+				expectValue: boolean;
+		  }
+		| { kind: "array"; key: string | null; index: number };
+	const stack: Frame[] = [];
+
+	const skipSpace = () => {
+		while (i < n) {
+			const code = text.charCodeAt(i);
+			if (code === 10) {
+				line++;
+				i++;
+			} else if (code === 13) {
+				i++;
+				if (text.charCodeAt(i) === 10) i++;
+				line++;
+			} else if (code === 32 || code === 9) {
+				i++;
+			} else break;
+		}
+	};
+
+	/** Consume the string token at `i` (text[i] === '"'); returns it decoded, or null. */
+	const scanString = (): string | null => {
+		const start = i;
+		i++;
+		while (i < n) {
+			const ch = text[i];
+			if (ch === "\\") {
+				i += 2;
+				continue;
+			}
+			if (ch === '"') {
+				i++;
+				try {
+					return JSON.parse(text.slice(start, i)) as string;
+				} catch {
+					return null;
+				}
+			}
+			// Raw newlines are invalid inside JSON strings; count defensively anyway.
+			if (ch === "\n") line++;
+			else if (ch === "\r") {
+				if (text[i + 1] === "\n") i++;
+				line++;
+			}
+			i++;
+		}
+		return null;
+	};
+
+	/** Skip a number / true / false / null token at `i`. */
+	const skipAtom = () => {
+		while (i < n && !",}] \t\r\n".includes(text[i] as string)) i++;
+	};
+
+	/** Handle the value starting at `i`: push a frame for containers, skip scalars. */
+	const openValue = (entryKey: string | null) => {
+		const ch = text[i];
+		if (ch === "{" || ch === "[") {
+			// Frames past the recording depth keep the structure walk correct but
+			// carry a null key so nothing inside them is recorded.
+			const key = entryKey !== null && stack.length <= MAX_STRUCTURED_DEPTH ? entryKey : null;
+			if (ch === "{") {
+				stack.push({ kind: "object", key, pendingKey: null, pendingLine: 0, expectValue: false });
+			} else {
+				stack.push({ kind: "array", key, index: 0 });
+			}
+			i++;
+			return;
+		}
+		if (ch === '"') scanString();
+		else skipAtom();
+	};
+
+	if (text.charCodeAt(0) === 0xfeff) i = 1; // BOM: line 0 content, skip for the root check
+	skipSpace();
+	if (text[i] === "{") {
+		stack.push({ kind: "object", key: "", pendingKey: null, pendingLine: 0, expectValue: false });
+		i++;
+	} else if (text[i] === "[") {
+		stack.push({ kind: "array", key: "", index: 0 });
+		i++;
+	} else {
+		return lines; // scalar root — rejected by toResult anyway
+	}
+
+	while (stack.length > 0 && i < n) {
+		skipSpace();
+		if (i >= n) break;
+		const frame = stack[stack.length - 1] as Frame;
+		const ch = text[i];
+
+		if (frame.kind === "object") {
+			if (!frame.expectValue) {
+				if (ch === "}") {
+					stack.pop();
+					i++;
+					continue;
+				}
+				if (ch === ",") {
+					i++;
+					continue;
+				}
+				if (ch !== '"') return lines; // unexpected token — bail, keep what we have
+				const keyLine = line;
+				const key = scanString();
+				if (key === null) return lines;
+				skipSpace();
+				if (text[i] !== ":") return lines;
+				i++;
+				frame.pendingKey = key;
+				frame.pendingLine = keyLine;
+				frame.expectValue = true;
+				continue;
+			}
+			// Value position for the pending member key.
+			frame.expectValue = false;
+			const entryKey =
+				frame.key === null ? null : `${frame.key}/${escapePathSegment(frame.pendingKey as string)}`;
+			if (entryKey !== null) lines.set(entryKey, frame.pendingLine);
+			frame.pendingKey = null;
+			openValue(entryKey);
+			continue;
+		}
+
+		// Array frame: value, "," or "]".
+		if (ch === "]") {
+			stack.pop();
+			i++;
+			continue;
+		}
+		if (ch === ",") {
+			i++;
+			continue;
+		}
+		const entryKey =
+			frame.key === null ? null : `${frame.key}/${escapePathSegment(`[${frame.index}]`)}`;
+		if (entryKey !== null) lines.set(entryKey, line);
+		frame.index++;
+		openValue(entryKey);
+	}
+	return lines;
+}
 
 function parseJsonNodes(text: string): StructuredParseResult {
 	const trimmed = text.trim();
@@ -183,7 +395,15 @@ function parseJsonNodes(text: string): StructuredParseResult {
 	} catch (err) {
 		return { error: err instanceof Error ? err.message : "Invalid JSON" };
 	}
-	return toResult(parsed);
+	// Scan the ORIGINAL text: trim() removes leading blank lines, which would
+	// shift every recorded line away from the editor's line numbers.
+	let lines: Map<string, number> | undefined;
+	try {
+		lines = scanJsonLines(text);
+	} catch {
+		lines = undefined; // anchorless tree beats no tree
+	}
+	return toResult(parsed, lines);
 }
 
 // ── line splitting shared by toml + ini ──────────────────────────────────────
@@ -217,12 +437,14 @@ function containerToPlain(container: Container): Record<string, unknown> {
 
 function parseIniNodes(text: string): StructuredParseResult {
 	const root = newContainer();
+	const lines = new Map<string, number>();
 	let section: Container = root;
+	let sectionName: string | null = null;
 	let sawAny = false;
 
-	const lines = splitLines(text);
-	for (let i = 0; i < lines.length; i++) {
-		const raw = lines[i] ?? "";
+	const sourceLines = splitLines(text);
+	for (let i = 0; i < sourceLines.length; i++) {
+		const raw = sourceLines[i] ?? "";
 		const line = raw.trim();
 		if (!line || line.startsWith(";") || line.startsWith("#")) continue;
 
@@ -237,6 +459,9 @@ function parseIniNodes(text: string): StructuredParseResult {
 				section = newContainer();
 				root.set(name, section);
 			}
+			sectionName = name;
+			// First occurrence wins: a re-opened section keeps its original anchor.
+			if (!lines.has(pathKey([name]))) lines.set(pathKey([name]), i);
 			sawAny = true;
 			continue;
 		}
@@ -247,11 +472,12 @@ function parseIniNodes(text: string): StructuredParseResult {
 		if (!key) return { error: `Line ${i + 1}: empty key` };
 		// INI values are untyped text; keep quotes stripped but do not coerce.
 		section.set(key, stripQuotes(line.slice(eq + 1).trim()));
+		lines.set(pathKey(sectionName ? [sectionName, key] : [key]), i);
 		sawAny = true;
 	}
 
 	if (!sawAny) return { error: "No INI entries found" };
-	return toResult(containerToPlain(root));
+	return toResult(containerToPlain(root), lines);
 }
 
 function stripQuotes(value: string): string {
@@ -280,12 +506,16 @@ function stripQuotes(value: string): string {
  */
 function parseTomlNodes(text: string): StructuredParseResult {
 	const root = newContainer();
+	const lines = new Map<string, number>();
 	let current: Container = root;
+	// Resolved path of `current` (array-of-tables hops spelled `[i]`), so entry
+	// lines can be keyed by the path the node tree will actually show.
+	let currentPath: string[] = [];
 	let sawAny = false;
 
-	const lines = splitLines(text);
-	for (let i = 0; i < lines.length; i++) {
-		const line = stripTomlComment((lines[i] ?? "").trim());
+	const sourceLines = splitLines(text);
+	for (let i = 0; i < sourceLines.length; i++) {
+		const line = stripTomlComment((sourceLines[i] ?? "").trim());
 		if (!line) continue;
 
 		if (line.startsWith("[[")) {
@@ -294,7 +524,9 @@ function parseTomlNodes(text: string): StructuredParseResult {
 			if (!path) return { error: `Line ${i + 1}: invalid table name` };
 			const next = pushArrayTable(root, path);
 			if (!next) return { error: `Line ${i + 1}: conflicting table path` };
-			current = next;
+			current = next.container;
+			currentPath = next.resolved;
+			recordLinePrefixes(lines, next.resolved, i);
 			sawAny = true;
 			continue;
 		}
@@ -303,9 +535,11 @@ function parseTomlNodes(text: string): StructuredParseResult {
 			if (!line.endsWith("]")) return { error: `Line ${i + 1}: unterminated [table] header` };
 			const path = parseTomlKeyPath(line.slice(1, -1).trim());
 			if (!path) return { error: `Line ${i + 1}: invalid table name` };
-			const next = descend(root, path);
+			const next = descendResolved(root, path);
 			if (!next) return { error: `Line ${i + 1}: conflicting table path` };
-			current = next;
+			current = next.container;
+			currentPath = next.resolved;
+			recordLinePrefixes(lines, next.resolved, i);
 			sawAny = true;
 			continue;
 		}
@@ -319,14 +553,20 @@ function parseTomlNodes(text: string): StructuredParseResult {
 			return { error: `Line ${i + 1}: unsupported TOML value` };
 		}
 		const leafKey = path[path.length - 1] as string;
-		const owner = path.length > 1 ? descend(current, path.slice(0, -1)) : current;
+		// descendResolved reports a path RELATIVE to `current`; prefix it with the
+		// current table's resolved path so the line keys match the node tree.
+		const owner =
+			path.length > 1
+				? descendResolved(current, path.slice(0, -1))
+				: { container: current, resolved: [] as string[] };
 		if (!owner) return { error: `Line ${i + 1}: conflicting key path` };
-		owner.set(leafKey, parsedValue);
+		owner.container.set(leafKey, parsedValue);
+		recordLinePrefixes(lines, [...currentPath, ...owner.resolved, leafKey], i);
 		sawAny = true;
 	}
 
 	if (!sawAny) return { error: "No TOML entries found" };
-	return toResult(containerToPlain(root));
+	return toResult(containerToPlain(root), lines);
 }
 
 /** Sentinel for "this line uses TOML syntax we do not support". */
@@ -412,47 +652,76 @@ function parseTomlKeyPath(raw: string): string[] | null {
 	return parts;
 }
 
-/** Walk/create nested tables along `path`; null on a scalar/array collision. */
-function descend(root: Container, path: string[]): Container | null {
+/**
+ * `descend` plus the RESOLVED path (array-of-tables hops spelled `[i]`), which
+ * is the path the node tree will actually show — needed to key line numbers.
+ */
+function descendResolved(
+	root: Container,
+	path: string[],
+): { container: Container; resolved: string[] } | null {
+	const resolved: string[] = [];
 	let node = root;
 	for (const segment of path) {
 		const existing = node.get(segment);
 		if (existing instanceof Map) {
 			node = existing;
+			resolved.push(segment);
 			continue;
 		}
 		if (Array.isArray(existing)) {
 			// `[[a]]` then `[a.b]` targets the LAST element of the array of tables.
 			const tail = existing[existing.length - 1];
 			if (!(tail instanceof Map)) return null;
+			resolved.push(segment, `[${existing.length - 1}]`);
 			node = tail;
 			continue;
 		}
 		if (existing !== undefined) return null;
 		const created = newContainer();
 		node.set(segment, created);
+		resolved.push(segment);
 		node = created;
 	}
-	return node;
+	return { container: node, resolved };
 }
 
 /** Append a fresh table to the array of tables at `path`. */
-function pushArrayTable(root: Container, path: string[]): Container | null {
+function pushArrayTable(
+	root: Container,
+	path: string[],
+): { container: Container; resolved: string[] } | null {
 	const parentPath = path.slice(0, -1);
 	const key = path[path.length - 1] as string;
-	const parent = parentPath.length > 0 ? descend(root, parentPath) : root;
+	const parent =
+		parentPath.length > 0
+			? descendResolved(root, parentPath)
+			: { container: root, resolved: [] as string[] };
 	if (!parent) return null;
-	const existing = parent.get(key);
+	const existing = parent.container.get(key);
 	const created = newContainer();
 	if (existing === undefined) {
-		parent.set(key, [created]);
-		return created;
+		parent.container.set(key, [created]);
+		return { container: created, resolved: [...parent.resolved, key, "[0]"] };
 	}
 	if (Array.isArray(existing)) {
 		existing.push(created);
-		return created;
+		return { container: created, resolved: [...parent.resolved, key, `[${existing.length - 1}]`] };
 	}
 	return null;
+}
+
+/** Record `line` for `segments` and every unrecorded prefix of it (first wins). */
+function recordLinePrefixes(
+	lines: Map<string, number>,
+	segments: readonly string[],
+	line: number,
+): void {
+	for (let end = segments.length; end >= 1; end--) {
+		const key = pathKey(segments.slice(0, end));
+		if (lines.has(key)) continue;
+		lines.set(key, line);
+	}
 }
 
 /** Parse a single-line TOML value, or return UNPARSEABLE. */

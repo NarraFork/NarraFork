@@ -85,6 +85,7 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import "../vlist-markdown.css";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
+import { TokenFlowText } from "../../content/TokenLines";
 import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
 import { AutoFollowScroll } from "../../scroll/AutoFollowScroll";
 import { OPTION_CONTROL_SIZE } from "../measure/measure-permission";
@@ -105,6 +106,7 @@ import {
 	HEADER_CELL_GAP,
 	headerRowHeight,
 	isRunningStatus,
+	META_BADGE_ROW,
 	type MeasuredToolBody,
 	type MeasuredToolCall,
 	type MeasuredToolCallGroup,
@@ -133,7 +135,6 @@ import { FragmentGap, LineFragments } from "./line-fragments";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
 import { type ReflectionNoticeLabels, RenderReflectionNotice } from "./RenderReflectionNotice";
-import { TokenFlowText } from "./TokenLines";
 import { readExactDisplayBox, VListImage } from "./vlist-image";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -434,10 +435,6 @@ interface ToolHeaderRowProps {
 	isTakenOver: boolean;
 	/** Localized takeover badge label. */
 	takenOverLabel: string;
-	/** Open the session this call waits on (Await-agent). Absent → no button. */
-	onOpenSession?: () => void;
-	/** Localized open-session button label. */
-	openSessionLabel: string;
 	opened: boolean;
 	onToggle?: () => void;
 	/** Optional category-icon override; falls back to a neutral tool glyph. */
@@ -470,8 +467,6 @@ function ToolHeaderRow({
 	remoteLabel,
 	isTakenOver,
 	takenOverLabel,
-	onOpenSession,
-	openSessionLabel,
 	opened,
 	onToggle,
 	icon: Icon = IconTool,
@@ -541,38 +536,6 @@ function ToolHeaderRow({
 			>
 				{toolName}
 			</span>
-			{/* "Open full session" for a call that waits on a subagent (Await-agent,
-			    or a single-target Send). Same affordance the subagent card draws in
-			    its recent-calls header, but placed BEFORE the summary in THIS card's
-			    fixed header row: the summary's `flex: 1` absorbs the button's width,
-			    so the tail cluster — including the timing indicator — keeps its
-			    exact right-edge position instead of being pushed left. Height-neutral
-			    because the row height is measured regardless, and the compact text
-			    fits the 19px lane (a Mantine compact-xs root is 22px and would
-			    overflow, hence the explicit height reset). */}
-			{onOpenSession ? (
-				<Button
-					data-testid="tool-open-session"
-					size="compact-xs"
-					variant="subtle"
-					styles={{
-						root: {
-							height: "auto",
-							minHeight: 0,
-							padding: "1px 6px",
-							fontSize: typographyMetrics().size.xs,
-							flexShrink: 0,
-						},
-					}}
-					onClick={(e: React.MouseEvent) => {
-						// Never let the button click toggle the card.
-						e.stopPropagation();
-						onOpenSession();
-					}}
-				>
-					{openSessionLabel}
-				</Button>
-			) : null}
 			<span
 				style={{
 					// `flex: 1` — the summary claims the header's slack, which pushes the diff
@@ -1504,6 +1467,7 @@ function DetailBlocks({
 	height,
 	labels,
 	narratorId,
+	openSession,
 	specTasksLive,
 }: {
 	kind: MeasuredToolBody["kind"];
@@ -1513,6 +1477,12 @@ function DetailBlocks({
 	height: number;
 	labels: DetailLabels;
 	narratorId?: string;
+	/**
+	 * "Open full session" affordance for a call waiting on a subagent
+	 * (Await-agent / single-target Send). Painted on the FIRST badges row — the
+	 * meta header — where the call's type/target/timeout chips already live.
+	 */
+	openSession?: { onOpen: () => void; label: string };
 	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
 	specTasksLive?: boolean;
 }) {
@@ -1521,6 +1491,11 @@ function DetailBlocks({
 	const color = kind === "error" ? "var(--mantine-color-red-text)" : undefined;
 	const isSpecTasks = kind === "spec-tasks";
 	const isError = kind === "error";
+	// The open-session button rides the FIRST badges row (the meta header), so a
+	// card whose detail has several badge rows paints it exactly once.
+	const openSessionIndex = openSession
+		? blocks.findIndex((b) => b.kind === "fixed" && b.tag === "detail-meta-badges")
+		: -1;
 	return (
 		<div style={{ position: "relative", width: availableWidth, height }}>
 			{blocks.map((block, index) => {
@@ -1628,6 +1603,35 @@ function DetailBlocks({
 										{b.label}
 									</Badge>
 								))}
+								{/* "Open full session" rides the meta header's badges row (the
+							    card's second line). The row is measured at META_BADGE_ROW
+							    (16px) and its box is overflow-hidden, so the button resets
+							    the compact-xs root's fixed 22px height to fit the same
+							    lane as the size-xs badges beside it — nothing here can
+							    move the measured geometry. */}
+								{openSession && index === openSessionIndex ? (
+									<Button
+										data-testid="tool-open-session"
+										size="compact-xs"
+										variant="subtle"
+										styles={{
+											root: {
+												height: "auto",
+												minHeight: 0,
+												padding: "0 6px",
+												fontSize: typographyMetrics().size.xs,
+												lineHeight: `${META_BADGE_ROW - 2}px`,
+												flexShrink: 0,
+											},
+										}}
+										onClick={(e: React.MouseEvent) => {
+											e.stopPropagation();
+											openSession.onOpen();
+										}}
+									>
+										{openSession.label}
+									</Button>
+								) : null}
 							</Group>
 						) : null}
 						{progress ? <MetaProgress progress={progress} /> : null}
@@ -1768,6 +1772,7 @@ function DetailRegion({
 	availableWidth,
 	labels,
 	narratorId,
+	openSession,
 	viewTargets,
 	viewControls,
 	specTasksLive,
@@ -1776,6 +1781,8 @@ function DetailRegion({
 	availableWidth: number;
 	labels: DetailLabels;
 	narratorId?: string;
+	/** "Open full session" affordance for an Await-agent card's badges row. */
+	openSession?: { onOpen: () => void; label: string };
 	viewTargets?: readonly VListViewTarget[];
 	viewControls?: VListViewControls;
 	specTasksLive?: boolean;
@@ -1812,6 +1819,7 @@ function DetailRegion({
 							measured={section.measuredBody}
 							labels={labels}
 							narratorId={narratorId}
+							openSession={openSession}
 							viewTarget={
 								section.measuredBody.model.kind === "capped"
 									? findViewTarget(viewTargets, section.measuredBody.model.source)
@@ -1832,6 +1840,7 @@ export function RenderToolBody({
 	measured,
 	labels = DEFAULT_LABELS,
 	narratorId,
+	openSession,
 	viewTarget,
 	viewControls,
 	specTasksLive,
@@ -1839,6 +1848,8 @@ export function RenderToolBody({
 	measured: MeasuredToolBody;
 	labels?: DetailLabels;
 	narratorId?: string;
+	/** "Open full session" affordance for an Await-agent card's badges row. */
+	openSession?: { onOpen: () => void; label: string };
 	viewTarget?: VListViewTarget;
 	viewControls?: VListViewControls;
 	specTasksLive?: boolean;
@@ -1874,6 +1885,7 @@ export function RenderToolBody({
 				availableWidth={contentWidth}
 				height={height}
 				labels={labels}
+				openSession={openSession}
 				specTasksLive={specTasksLive}
 			/>
 		);
@@ -2292,8 +2304,6 @@ export function RenderToolCall({
 				remoteLabel={merged.remote}
 				isTakenOver={measured.isTakenOver}
 				takenOverLabel={merged.takenOver}
-				onOpenSession={onOpenSession}
-				openSessionLabel={merged.openSession}
 				opened={effectiveOpened}
 				onToggle={onToggle}
 				icon={icon ?? categoryIcon(category, measured.toolName)}
@@ -2316,6 +2326,12 @@ export function RenderToolCall({
 							availableWidth={contentWidth}
 							labels={merged}
 							narratorId={narratorId}
+							// The "open full session" button lives on the badges row of the
+							// card's meta header (the second line), not the toggleable header
+							// row — see DetailBlocks.
+							openSession={
+								onOpenSession ? { onOpen: onOpenSession, label: merged.openSession } : undefined
+							}
 							viewTargets={viewTargets}
 							viewControls={viewControls}
 							specTasksLive={specTasksLive}

@@ -25,7 +25,27 @@ const DOM_KEYS = [
 	"requestAnimationFrame",
 	"cancelAnimationFrame",
 	"IS_REACT_ACT_ENVIRONMENT",
+	"MutationObserver",
 ] as const;
+
+class TestMutationObserver {
+	static instances: TestMutationObserver[] = [];
+	target: Node | null = null;
+	disconnected = false;
+	constructor(readonly callback: MutationCallback) {
+		TestMutationObserver.instances.push(this);
+	}
+	observe(target: Node, options: MutationObserverInit) {
+		expect(options).toEqual({ attributes: true, attributeFilter: ["style"] });
+		this.target = target;
+	}
+	disconnect() {
+		this.disconnected = true;
+	}
+	notify() {
+		if (!this.disconnected) this.callback([], this as unknown as MutationObserver);
+	}
+}
 
 /**
  * Minimal DOM for react-dom to render into. Same shape as the other DOM harnesses
@@ -47,6 +67,7 @@ async function installDom(): Promise<() => void> {
 			setTimeout(() => cb(Date.now()), 0) as unknown as number,
 		cancelAnimationFrame: (h: number) => clearTimeout(h),
 		IS_REACT_ACT_ENVIRONMENT: false,
+		MutationObserver: TestMutationObserver,
 	};
 	for (const key of DOM_KEYS) {
 		Object.defineProperty(globalThis, key, { value: values[key], configurable: true });
@@ -130,6 +151,116 @@ beforeAll(async () => {
 afterAll(async () => {
 	await new Promise((resolve) => setTimeout(resolve, 10));
 	restoreDom?.();
+});
+
+async function mountGeometryProbe(style?: string) {
+	const React = await import("react");
+	const { createRoot } = await import("react-dom/client");
+	const { flushSync } = await import("react-dom");
+	const { usePanelGeometryReady } = await import("./shared");
+	const container = document.createElement("div");
+	if (style !== undefined) {
+		container.className = "dv-render-overlay";
+		container.setAttribute("style", style);
+	}
+	document.body.appendChild(container);
+	const root = createRoot(container);
+	let mounts = 0;
+	let unmounts = 0;
+	let initialWidth = "";
+	const onAttach = () => {};
+	function Content() {
+		React.useLayoutEffect(() => {
+			mounts++;
+			initialWidth = container.style.width;
+			return () => {
+				unmounts++;
+			};
+		}, []);
+		return <span>content</span>;
+	}
+	function Probe() {
+		const { ref, geometryReady } = usePanelGeometryReady(onAttach);
+		return <div ref={ref}>{geometryReady && <Content />}</div>;
+	}
+	const observerStart = TestMutationObserver.instances.length;
+	flushSync(() => root.render(<Probe />));
+	return {
+		container,
+		get mounts() {
+			return mounts;
+		},
+		get unmounts() {
+			return unmounts;
+		},
+		get initialWidth() {
+			return initialWidth;
+		},
+		get observers() {
+			return TestMutationObserver.instances.slice(observerStart);
+		},
+		update(style: string) {
+			flushSync(() => {
+				container.setAttribute("style", style);
+				for (const observer of this.observers) observer.notify();
+			});
+		},
+		dispose() {
+			flushSync(() => root.unmount());
+			container.remove();
+		},
+	};
+}
+
+describe("usePanelGeometryReady", () => {
+	it("waits for the visible positioned overlay, then keeps content mounted", async () => {
+		const probe = await mountGeometryProbe("visibility: hidden");
+		try {
+			expect(probe.mounts).toBe(0);
+			probe.update("visibility: hidden; width: 520px; height: 700px");
+			expect(probe.mounts).toBe(0);
+			probe.update("width: 520px; height: 0px");
+			expect(probe.mounts).toBe(0);
+			probe.update("width: 520px; height: 700px");
+			expect(probe.mounts).toBe(1);
+			expect(probe.initialWidth).toBe("520px");
+			expect(probe.observers.every((observer) => observer.disconnected)).toBe(true);
+			probe.update("visibility: hidden; width: 800px; height: 700px");
+			probe.update("width: 420px; height: 700px");
+			expect(probe.mounts).toBe(1);
+			expect(probe.unmounts).toBe(0);
+		} finally {
+			probe.dispose();
+		}
+	});
+
+	it("mounts immediately in an already positioned overlay", async () => {
+		const probe = await mountGeometryProbe("width: 520px; height: 700px");
+		try {
+			expect(probe.mounts).toBe(1);
+			expect(probe.observers).toHaveLength(0);
+		} finally {
+			probe.dispose();
+		}
+	});
+
+	it("does not delay hosts without an overlay", async () => {
+		const probe = await mountGeometryProbe();
+		try {
+			expect(probe.mounts).toBe(1);
+			expect(probe.observers).toHaveLength(0);
+		} finally {
+			probe.dispose();
+		}
+	});
+
+	it("disconnects a pending observer when the host unmounts", async () => {
+		const probe = await mountGeometryProbe("visibility: hidden");
+		expect(probe.mounts).toBe(0);
+		expect(probe.observers).toHaveLength(1);
+		probe.dispose();
+		expect(probe.observers[0]?.disconnected).toBe(true);
+	});
 });
 
 describe("usePanelHeaderDrag", () => {

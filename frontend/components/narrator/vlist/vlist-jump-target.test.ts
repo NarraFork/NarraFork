@@ -98,8 +98,12 @@ describe("dock message jump wiring", () => {
 		expect(panel).toContain("highlightRequestId={highlightRequestId}");
 		const list = await Bun.file(new URL("./PretextExactMessageList.tsx", import.meta.url)).text();
 		expect(list).toContain("JSON.stringify([narratorId, highlightMessageId, highlightRequestId])");
-		expect(list).toContain(
-			"[documentReady, highlightMessageId, highlightRequestId, narratorId, scrollToMessageTarget]",
+		// The dependency list is asserted whitespace-insensitively: biome reflows it
+		// across lines once it outgrows the column budget, and the invariant is which
+		// deps the jump effect tracks, not how they are wrapped.
+		const flat = list.replace(/\s+/g, " ");
+		expect(flat).toContain(
+			"documentReady, highlightMessageId, highlightRequestId, narratorId, scrollToMessageTarget",
 		);
 	});
 });

@@ -294,6 +294,10 @@ export function renderElement(
 					onToggle={extra.onToggle as (() => void) | undefined}
 					onOpenAttachment={extra.onOpenAttachment as ((filePath: string) => void) | undefined}
 					openAttachmentLabel={extra.openAttachmentLabel as string | undefined}
+					onQuoteClick={extra.onQuoteClick as (() => void) | undefined}
+					onFetchAttachment={
+						extra.onFetchAttachment as ((fetchUrl: string, filename: string) => void) | undefined
+					}
 				/>
 			);
 		case "communication-bubble":

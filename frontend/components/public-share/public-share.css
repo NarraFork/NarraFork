@@ -27,50 +27,24 @@
 	padding: 8px 12px;
 	border-bottom: 1px solid var(--mantine-color-default-border);
 }
-.public-share-scroll {
+/* The vlist surface inside a pane: the list owns its own scrolling. */
+.public-share-list {
 	flex: 1;
 	min-height: 0;
-	overflow: auto;
-	overscroll-behavior: contain;
-	overflow-wrap: anywhere;
-	padding: 12px;
+	display: flex;
+	flex-direction: column;
+}
+.public-share-list > * {
+	flex: 1;
+	min-height: 0;
 }
 .public-share-composer {
 	padding: 10px;
 	border-top: 1px solid var(--mantine-color-default-border);
 }
-.public-share-markdown {
-	font-size: var(--mantine-font-size-sm);
-	line-height: 1.6;
-	overflow-wrap: anywhere;
-}
-.public-share-markdown > :first-child {
-	margin-top: 0;
-}
-.public-share-markdown > :last-child {
-	margin-bottom: 0;
-}
-.public-share-markdown pre,
-.public-share-tool-text {
-	white-space: pre-wrap;
-	overflow-wrap: anywhere;
-	max-width: 100%;
-	padding: 8px;
-	background: var(--mantine-color-default);
-	border-radius: 4px;
-	font-size: 12px;
-}
-.public-share-markdown a {
-	color: var(--mantine-color-anchor);
-}
 .public-share-placeholder {
 	color: var(--mantine-color-dimmed);
 	font-style: italic;
-}
-.public-share-details > summary {
-	cursor: pointer;
-	font-size: var(--mantine-font-size-sm);
-	padding: 6px 0;
 }
 .public-share-mobile-tabs {
 	display: none;

@@ -4,9 +4,10 @@ import { PublicShareSession } from "../lib/public-share-session";
 
 export function usePublicSharedNarrator(shareId: string, credential: string) {
 	// A credential change creates an empty store synchronously, before effects can run.
+	const client = useMemo(() => createPublicShareClient(shareId, credential), [shareId, credential]);
 	const controller = useMemo(
-		() => new PublicShareSession(createPublicShareClient(shareId, credential)),
-		[shareId, credential],
+		() => new PublicShareSession(client, shareId, credential),
+		[client, shareId, credential],
 	);
 	const state = useSyncExternalStore(
 		controller.subscribe,
@@ -17,5 +18,5 @@ export function usePublicSharedNarrator(shareId: string, credential: string) {
 		controller.start();
 		return controller.stop;
 	}, [controller]);
-	return { controller, state };
+	return { client, controller, state };
 }

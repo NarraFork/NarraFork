@@ -6,9 +6,12 @@
  * anchoring is what stops the viewport jumping when that page is inserted.
  */
 import { describe, expect, test } from "bun:test";
-import { findVisibleRange, layoutItems } from "@shared/pretext-layout/vlist-virtualization";
+import {
+	findVisibleRange,
+	layoutItems,
+	unseenKeyArrivals,
+} from "@shared/pretext-layout/vlist-virtualization";
 import type { ChatMessage } from "../../lib/api/chat";
-import { unseenArrivals } from "./ChatMessageList";
 import {
 	anchoredScrollTop,
 	buildChatRows,
@@ -20,10 +23,13 @@ import {
 	isPinnedToBottom,
 	resolveReplyInfo,
 	resolveReplyPreview,
-	toMeasureIdentity,
 } from "./chat-list-layout";
 
 const T0 = Date.parse("2026-01-01T00:00:00.000Z");
+
+/** Key lists for the unseen-arrivals cases (indexes model a contiguous seq). */
+const KEYS_45 = Array.from({ length: 45 }, (_, i) => `k${i + 1}`);
+const KEYS_41 = KEYS_45.slice(0, 41);
 
 function msg(overrides: Partial<ChatMessage> & { id: string }): ChatMessage {
 	return {
@@ -256,16 +262,6 @@ describe("reply info states", () => {
 		expect(rows[0].replyPreview).toBeNull();
 		expect(rows[0].reply).toBeNull();
 	});
-
-	test("hasReply reaches the measure identity for every reply state", () => {
-		const rows = buildChatRows([
-			msg({ id: "a", seq: 1 }),
-			msg({ id: "b", seq: 2, replyToMessageId: "a", replyToSeq: 1, replyToPreview: "" }),
-		]);
-		expect(toMeasureIdentity(rows[0]).hasReply).toBe(false);
-		// Without this the strip would be dropped for exactly the rows that need a label.
-		expect(toMeasureIdentity(rows[1]).hasReply).toBe(true);
-	});
 });
 
 describe("attachments in rows", () => {
@@ -278,11 +274,6 @@ describe("attachments in rows", () => {
 		width: 100,
 		height: 50,
 	};
-
-	test("attachments reach the measure identity", () => {
-		const row = buildChatRows([msg({ id: "a", attachments: [attachment] })])[0];
-		expect(toMeasureIdentity(row).attachments).toHaveLength(1);
-	});
 
 	test("an attachment opens a new visual group", () => {
 		// A headerless bubble containing only a thumbnail gives the reader no author and
@@ -297,26 +288,6 @@ describe("attachments in rows", () => {
 			}),
 		]);
 		expect(rows[1].grouped).toBe(false);
-	});
-});
-
-describe("measure identity", () => {
-	test("a deleted message carries empty text and the deleted flag", () => {
-		const row = buildChatRows([
-			msg({ id: "a", contentText: "gone", deletedAt: new Date(T0).toISOString() }),
-		])[0];
-		const identity = toMeasureIdentity(row);
-		expect(identity.deleted).toBe(true);
-		expect(identity.text).toBe("");
-	});
-
-	test("grouping and reply state reach the cache key inputs", () => {
-		const rows = buildChatRows([
-			msg({ id: "a", seq: 1 }),
-			msg({ id: "b", seq: 2, createdAt: new Date(T0 + 1_000).toISOString() }),
-		]);
-		expect(toMeasureIdentity(rows[1]).grouped).toBe(true);
-		expect(toMeasureIdentity(rows[0]).grouped).toBe(false);
 	});
 });
 
@@ -379,20 +350,21 @@ describe("read watermark window", () => {
 describe("unseen arrivals", () => {
 	test("a burst landing in one commit counts every message", () => {
 		// The defect this pins: a flat +1 reported "1 new message" for five.
-		expect(unseenArrivals(40, 45)).toBe(5);
+		expect(unseenKeyArrivals("k40", KEYS_45)).toBe(5);
 	});
 
 	test("a single message counts once", () => {
-		expect(unseenArrivals(40, 41)).toBe(1);
+		expect(unseenKeyArrivals("k40", KEYS_41)).toBe(1);
 	});
 
 	test("a room's first page is not new traffic", () => {
-		expect(unseenArrivals(0, 900)).toBe(0);
+		expect(unseenKeyArrivals("", KEYS_45)).toBe(0);
 	});
 
-	test("a shrinking tail is a prepend or cache swap, not an arrival", () => {
-		expect(unseenArrivals(45, 40)).toBe(0);
-		expect(unseenArrivals(45, 45)).toBe(0);
+	test("a shrinking or replaced tail is a prepend or cache swap, not an arrival", () => {
+		expect(unseenKeyArrivals("k45", KEYS_45.slice(0, 40))).toBe(0);
+		expect(unseenKeyArrivals("k45", KEYS_45)).toBe(0);
+		expect(unseenKeyArrivals("gone", KEYS_45)).toBe(0);
 	});
 });
 

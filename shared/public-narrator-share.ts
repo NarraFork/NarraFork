@@ -21,41 +21,14 @@ export interface CreatedPublicShare {
 
 export interface PublicSharedSession {
 	shareId: string;
+	/** The narrator this share renders (drives the vlist's dataSource + WS scope). */
+	narratorId: string;
+	/** The discussion room backing this share (drives the discussion pane). */
+	roomId: string;
 	title: string;
 	status: string;
 	messageVersion: number;
 	guestName: string;
-}
-
-export interface PublicSharedTool {
-	id: string;
-	name: string;
-	status: string;
-}
-
-export interface PublicSharedToolDetail extends PublicSharedTool {
-	input: string;
-	output: string;
-	truncated: boolean;
-}
-
-export interface PublicSharedMessage {
-	id: string;
-	seq: number;
-	role: "user" | "assistant" | "system";
-	createdAt: string;
-	text: string;
-	reasoning: string;
-	tools: PublicSharedTool[];
-	truncated: boolean;
-	mediaOmitted: boolean;
-}
-
-export interface PublicSharedMessagePage {
-	messages: PublicSharedMessage[];
-	hasMore: boolean;
-	nextBeforeSeq: number | null;
-	messageVersion: number;
 }
 
 export interface PublicDiscussionMessage {
@@ -74,18 +47,3 @@ export interface PublicDiscussionPage {
 	hasMore: boolean;
 	nextBeforeSeq: number | null;
 }
-
-export interface PublicLiveBlock {
-	id: string;
-	kind: "text" | "reasoning";
-	text: string;
-}
-
-/** SSE data uses this closed union; no raw internal WS events cross this boundary. */
-export type PublicShareEvent =
-	| { type: "snapshot"; blocks: PublicLiveBlock[]; truncated: boolean }
-	| { type: "delta"; blockId: string; kind: "text" | "reasoning"; text: string; offset: number }
-	| { type: "invalidate"; scope: "messages" | "discussion" | "session" }
-	| { type: "reset" }
-	| { type: "revoked" }
-	| { type: "ping" };

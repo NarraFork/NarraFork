@@ -38,7 +38,13 @@ function collectSourceFiles(dir: string, out: string[] = []): string[] {
 			collectSourceFiles(full, out);
 		} else {
 			const dot = entry.lastIndexOf(".");
-			if (dot >= 0 && SCAN_EXTENSIONS.has(entry.slice(dot))) out.push(full);
+			if (dot >= 0 && SCAN_EXTENSIONS.has(entry.slice(dot))) {
+				// Test files may statically import vlist's test stubs (canvas/geometry
+				// fakes) — they never ship in a production bundle, so they cannot leak
+				// the list onto the OFF path the way production code would.
+				if (entry.includes(".test.")) continue;
+				out.push(full);
+			}
 		}
 	}
 	return out;

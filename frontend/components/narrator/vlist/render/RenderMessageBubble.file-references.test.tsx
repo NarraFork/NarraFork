@@ -120,6 +120,54 @@ function click(element: Element) {
 }
 
 describe("captured message file references", () => {
+	test("chat opt-in renders Markdown links inside an exact box with quote and attachment actions", async () => {
+		const message: AdapterMessage = {
+			id: "chat",
+			role: "user",
+			bodyFormat: "markdown",
+			omitHeader: true,
+			contentJson: [
+				{ type: "text_file", filename: "notes.txt", fetchUrl: "/chat/attachments/a" },
+				{ type: "text", text: "**bold** [external](https://example.com)" },
+			],
+			replyQuote: {
+				authorName: "alice",
+				text: "quoted",
+				state: "quoted",
+				targetId: "target",
+				targetSeq: 1,
+			},
+		};
+		const spec = specs(message)[0];
+		const measured = measureElement(spec.kind, spec.data, 700, 4);
+		const downloads: string[][] = [];
+		await act(async () =>
+			root.render(
+				<MantineProvider env="test">
+					{renderElement(spec.kind, measured, {
+						...resolveRenderExtra(spec),
+						onFetchAttachment: (url: string, filename: string) => downloads.push([url, filename]),
+					})}
+				</MantineProvider>,
+			),
+		);
+		expect(container.querySelector('a[href="https://example.com/"]')?.textContent).toBe("external");
+		expect(container.querySelector(".is-strong")?.textContent).toBe("bold");
+		expect(container.textContent).toContain("quoted");
+		const attachment = container.querySelector('[role="button"]');
+		expect(attachment).not.toBeNull();
+		if (attachment) click(attachment);
+		expect(downloads).toEqual([["/chat/attachments/a", "notes.txt"]]);
+		const body = measured.blocks.find(
+			(block) => block.kind === "fixed" && block.tag === "user-markdown",
+		);
+		expect(body?.kind).toBe("fixed");
+		const bodyElement = container.querySelector("[data-md-body]")?.parentElement;
+		expect(Number.parseFloat(bodyElement?.style.width ?? "0")).toBe(measured.contentWidth);
+		expect(Number.parseFloat(bodyElement?.style.height ?? "0")).toBe(
+			body?.kind === "fixed" ? body.height : -1,
+		);
+	});
 	test("history and stream/reconnect preserve device scopes instead of the current default", async () => {
 		const blocks: StreamingBlock[] = [];
 		const context = { deviceId: "CapturedDevice", cwd: "/repo" };

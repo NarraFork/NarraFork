@@ -23,7 +23,7 @@ import {
 } from "@frontend/components/narrator/message/MessageOriginBadge";
 import { UserAvatar } from "@frontend/components/UserAvatar";
 import { formatShortMessageTime } from "@frontend/lib/intl-format";
-import { Badge, Group, Text } from "@mantine/core";
+import { Avatar, Badge, Group, Text } from "@mantine/core";
 import { parseOriginLabel } from "@shared/message-origin";
 import { useTranslation } from "react-i18next";
 import type { VListElementKind } from "./registry";
@@ -35,6 +35,8 @@ export interface BubbleCreator {
 	username: string;
 	avatarColor?: string | null;
 	avatarImageId?: string | null;
+	/** Share-guest author (chat rooms): initial-avatar + a badge instead of a profile. */
+	isGuest?: boolean;
 }
 
 /** Format a message timestamp like MessageBubble: today → HH:mm, else MM/DD HH:mm. */
@@ -76,20 +78,31 @@ export function UserBubbleHeader({
 	return (
 		<Group gap={6} wrap="nowrap" h="100%" align="center">
 			{creator ? (
-				<UserAvatar
-					username={creator.username}
-					avatarColor={creator.avatarColor}
-					avatarImageId={creator.avatarImageId}
-					userId={creator.id}
-					size={20}
-					showTooltip={false}
-				/>
+				creator.isGuest ? (
+					<Avatar size={20} radius="xl">
+						{creator.username.slice(0, 1)}
+					</Avatar>
+				) : (
+					<UserAvatar
+						username={creator.username}
+						avatarColor={creator.avatarColor}
+						avatarImageId={creator.avatarImageId}
+						userId={creator.id}
+						size={20}
+						showTooltip={false}
+					/>
+				)
 			) : (
 				<OriginAvatar originLabel={originLabel} size={20} />
 			)}
 			<Text size="xs" fw={600} c="indigo" truncate style={{ minWidth: 0, whiteSpace: "nowrap" }}>
 				{resolveUserBubbleName({ creator, origin, originLabel }, t)}
 			</Text>
+			{creator?.isGuest ? (
+				<Badge size="xs" variant="light" style={{ flexShrink: 0 }}>
+					{t("guestBadge")}
+				</Badge>
+			) : null}
 			{/* Icon-only marker; sits inside the reserved 20px row so height is unchanged. */}
 			<MessageOriginBadge origin={origin} originLabel={originLabel} />
 			{badge ? (

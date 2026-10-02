@@ -113,7 +113,7 @@ export const teamStatusTool: ToolDefinition = {
 		'- "list_agents": List sibling subagents only\n' +
 		'- "list_bash": List background bash tasks only\n' +
 		'- "file_changes": Show files modified by each subagent (or a specific one via target_id)\n' +
-		'- "broadcast": Send a message to ALL direct subagents (archived subagents are excluded — they are never woken by @all members)\n' +
+		'- "broadcast": Send ONLY to working/waiting direct subagents. Returns recipient names and idle subagents active within the last hour (name + slug + id), which are NOT sent to or woken; use a separate Send if needed. More than 100 candidates is refused; use explicit Send instead.\n' +
 		'- "send": Send a message to a specific direct subagent (requires target_id)\n\n' +
 		"Notes:\n" +
 		"- The primary narrator is the team root; subagents use their parent's team scope.\n" +
@@ -329,89 +329,116 @@ export const teamStatusTool: ToolDefinition = {
 				if (!message) {
 					return { output: "Message text is required for broadcast.", isError: true };
 				}
-				const { narratorService } = await import("@server/services/narrator-service");
+				const { narratorService, TEAM_BROADCAST_MAX_TARGETS } = await import(
+					"@server/services/narrator-service"
+				);
 				const { agentLabelFromNarrator } = await import("@server/services/subagent-label");
 				const sender = await narratorService.getById(ctx.narratorId);
-				const siblings = await narratorService.listSubagentsByParent(parentNarratorId);
-				const teamMembers = siblings.filter(
-					(s: { id: string; variant?: string | null }) =>
-						s.id !== ctx.narratorId && s.variant?.startsWith("subagent:") === true,
-				);
-				// Archived members are retired: @all members must not deliver to them or
-				// wake them. Direct Send is separately rejected in agent-communication.
-				const archived = teamMembers.filter((s: { status: string }) => s.status === "archived");
-				const targets = teamMembers.filter((s: { status: string }) => s.status !== "archived");
-				if (targets.length === 0) {
-					const targetKind = ctx.parentNarratorId ? "sibling subagents" : "child subagents";
-					const archivedNote =
-						archived.length > 0 ? ` ${archived.length} archived subagent(s) were excluded.` : "";
+				const { targets, recentIdle, recentIdleTruncated } =
+					await narratorService.listSubagentsForBroadcast(parentNarratorId, ctx.narratorId);
+				const idleSuggestions = recentIdle.map((target) => ({
+					name: target.title ?? agentLabelFromNarrator(target, parentNarratorId),
+					slug: agentLabelFromNarrator(target, parentNarratorId),
+					id: target.id,
+					lastActivityAt: target.lastActivityAt,
+				}));
+				const idleNote = [
+					"Idle subagents active within the last hour (NOT sent to or woken; use a separate Send by slug/id if needed):",
+					...(idleSuggestions.length > 0
+						? idleSuggestions.map(
+								(target) =>
+									`- name=${JSON.stringify(target.name)} slug=${target.slug} id=${target.id}`,
+							)
+						: ["(none)"]),
+					...(recentIdleTruncated
+						? [
+								"Only the 100 most recently active idle members are shown; use TeamStatus list/query to find more.",
+							]
+						: []),
+				].join("\n");
+				// Fail closed rather than silently truncating or launching an unbounded fan-out.
+				if (targets.length > TEAM_BROADCAST_MAX_TARGETS) {
+					await reportTeamSendTargetCount(ctx, 0);
 					return {
-						output: `No ${targetKind} to broadcast to.${archivedNote}`,
+						output: `Broadcast refused: more than ${TEAM_BROADCAST_MAX_TARGETS} working/waiting candidates. Use Send with explicit recipients. No messages were delivered.\n${idleNote}`,
+						isError: true,
 						metadata: {
 							kind: "send",
 							broadcast: true,
 							await: false,
-							targets: [],
 							targetCount: 0,
-							warning: `No ${targetKind} to broadcast to.${archivedNote}`,
+							targets: [],
+							recentIdle: idleSuggestions,
+							recentIdleTruncated,
 						},
 					};
 				}
-				await reportTeamSendTargetCount(ctx, targets.length);
-				const senderType = teamMemberType(sender.variant);
-				const now = new Date().toISOString();
+				const targetNames = targets.map(
+					(target) => target.title ?? agentLabelFromNarrator(target, parentNarratorId),
+				);
 				const msg: TeamMessage = {
 					fromId: ctx.narratorId,
 					fromTitle: sender.title,
 					fromLabel: agentLabelFromNarrator(sender, parentNarratorId),
-					fromType: senderType,
+					fromType: teamMemberType(sender.variant),
 					fromToolUseId: ctx.currentToolUseId,
 					fromToolCallBinding: ctx.toolCallBinding,
 					text: message,
-					timestamp: now,
+					timestamp: new Date().toISOString(),
 					isBroadcast: true,
 				};
-				const deliveryIds = new Map(
-					await Promise.all(
-						targets.map(
-							async (target) =>
-								[target.id, await deliverTeamMessage(target.id, msg, parentNarratorId)] as const,
-						),
-					),
+				const deliveryIds = new Map<string, string>();
+				const failures: string[] = [];
+				let next = 0;
+				// Four workers at most; cancellation stops admission of further recipients.
+				await Promise.all(
+					Array.from({ length: Math.min(4, targets.length) }, async () => {
+						while (!ctx.signal.aborted) {
+							const target = targets[next++];
+							if (!target) break;
+							try {
+								const deliveryMessageId = await deliverTeamMessage(
+									target.id,
+									msg,
+									parentNarratorId,
+								);
+								if (deliveryMessageId) deliveryIds.set(target.id, deliveryMessageId);
+							} catch (error) {
+								failures.push(
+									`${agentLabelFromNarrator(target, parentNarratorId)}: ${String(error)}`,
+								);
+							}
+						}
+					}),
 				);
-				const nonWorking = targets.filter(
-					(t: { id: string; status: string }) => t.status !== "working",
-				);
-				const targetKind = ctx.parentNarratorId ? "sibling(s)" : "child subagent(s)";
-				let output = `Broadcast sent to ${targets.length} ${targetKind}: ${targets
-					.map((t) => agentLabelFromNarrator(t, parentNarratorId))
-					.join(", ")}`;
-				if (archived.length > 0) {
-					output += `\n(${archived.length} archived subagent(s) excluded — broadcast does not wake archived members)`;
-				}
-				if (nonWorking.length > 0) {
-					output += `\n(warning: ${nonWorking.length} target(s) not currently working — messages may not be received)`;
-				}
-				const warningParts: string[] = [];
-				if (archived.length > 0) {
-					warningParts.push(
-						`${archived.length} archived subagent(s) excluded — broadcast does not wake archived members`,
-					);
-				}
-				if (nonWorking.length > 0) {
-					warningParts.push(
-						`${nonWorking.length} target(s) not currently working — messages may not be received`,
-					);
-				}
+				const delivered = targets.filter((target) => deliveryIds.has(target.id));
+				await reportTeamSendTargetCount(ctx, delivered.length);
+				const targetKind = ctx.parentNarratorId ? "sibling subagents" : "child subagents";
+				const warning = [
+					"Only working/waiting members receive broadcasts. Idle and archived members are excluded and never woken.",
+					...(ctx.signal.aborted ? ["Broadcast cancelled; no further recipients admitted."] : []),
+					...failures,
+				].join("\n");
 				return {
-					output,
+					output: [
+						`Broadcast targets (working/waiting): ${targetNames.map((name) => JSON.stringify(name)).join(", ") || "(none)"}`,
+						delivered.length > 0
+							? `Broadcast sent to ${delivered.length} ${targetKind}: ${delivered.map((target) => agentLabelFromNarrator(target, parentNarratorId)).join(", ")}`
+							: `No ${targetKind} to broadcast to (no recipients accepted).`,
+						warning,
+						idleNote,
+					].join("\n"),
+					...(failures.length > 0 || ctx.signal.aborted ? { isError: true } : {}),
 					metadata: {
 						kind: "send",
 						broadcast: true,
 						await: false,
-						...(warningParts.length > 0 ? { warning: warningParts.join("; ") } : {}),
-						targetCount: targets.length,
-						targets: targets.map((target) => ({
+						warning,
+						targetNames,
+						recentIdle: idleSuggestions,
+						recentIdleTruncated,
+						targetCount: delivered.length,
+						targets: delivered.map((target) => ({
 							id: target.id,
 							deliveryMessageId: deliveryIds.get(target.id),
 							label: agentLabelFromNarrator(target, parentNarratorId),

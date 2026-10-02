@@ -999,6 +999,24 @@ export interface TreeMessage {
 	 * Not part of the persisted message or server protocol.
 	 */
 	_streamAnimSnapshotEpoch?: number;
+	/**
+	 * Chat/discussion projection only (never produced by the narrator API): a
+	 * reply quote strip for the user bubble. The kernel's AdapterMessage passthrough
+	 * reads it verbatim; see shared/pretext-layout/segment-adapter.ts.
+	 */
+	replyQuote?: {
+		authorName: string | null;
+		text: string;
+		state: "quoted" | "deleted" | "unavailable";
+		targetId?: string | null;
+		targetSeq?: number | null;
+	} | null;
+	/** Chat/discussion projection only: a grouped follow-up omits the bubble header. */
+	omitHeader?: boolean;
+	/** Chat projection opts into Markdown; narrator user messages stay plain. */
+	bodyFormat?: "plain" | "markdown";
+	/** Chat/discussion projection only: tombstone label replacing the body. */
+	deletedLabel?: string;
 }
 
 export interface PaginatedNarrators {

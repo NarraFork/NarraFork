@@ -150,6 +150,16 @@ export async function deliverTeamMessage(
 	message: TeamMessage,
 	parentNarratorId?: string,
 ): Promise<string | undefined> {
+	// Recheck the agreed working/waiting definition at delivery: a candidate may
+	// have become idle after selection. No runtime-owner requirement is imposed.
+	if (message.isBroadcast) {
+		const target = await db
+			.select({ status: narrators.status })
+			.from(narrators)
+			.where(eq(narrators.id, targetId))
+			.get();
+		if (target?.status !== "working" && target?.status !== "waiting") return undefined;
+	}
 	// Reserve independently per recipient, even when the caller broadcasts one object.
 	if (message.fromToolUseId) {
 		message = {
@@ -196,7 +206,10 @@ export async function deliverTeamMessage(
 			isBroadcast: message.isBroadcast,
 		});
 	}
-	if (accepted.delivery.state === "queued") void wakeInboxIfEligible(targetId);
+	if (accepted.delivery.state === "cancelled" || accepted.delivery.state === "failed")
+		throw new Error(`Previous delivery is ${accepted.delivery.state}; explicit retry is required`);
+	if (!message.isBroadcast && accepted.delivery.state === "queued")
+		void wakeInboxIfEligible(targetId);
 	return message.delivery?.recipientMessageId;
 }
 

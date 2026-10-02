@@ -1108,6 +1108,24 @@ export interface ListMessagesInput {
  * `LIMIT n + 1` decides `hasMore` — deliberately not `COUNT(*)`, which grows
  * with the room and would run on every page fetch.
  */
+/**
+ * Resolve a message id to its room sequence — the jump target coordinate the
+ * vlist's cross-page scroll needs when the quoted row is not loaded yet.
+ */
+export async function getChatMessageLocation(input: {
+	roomId: string;
+	messageId: string;
+	userId: string;
+}): Promise<{ messageId: string; seq: number }> {
+	await assertCanRead(input.roomId, input.userId);
+	const row = await db.query.chatMessages.findFirst({
+		where: and(eq(chatMessages.roomId, input.roomId), eq(chatMessages.id, input.messageId)),
+		columns: { id: true, seq: true },
+	});
+	if (!row) throw new NotFoundError("ChatMessage", input.messageId);
+	return { messageId: row.id, seq: row.seq };
+}
+
 export async function listMessages(input: ListMessagesInput): Promise<ChatMessagePage> {
 	await assertCanRead(input.roomId, input.userId);
 	const limit = Math.min(Math.max(input.limit ?? CHAT_PAGE_DEFAULT, 1), CHAT_PAGE_MAX);
