@@ -806,6 +806,8 @@ export interface NarraForkSettings {
 		disabledProviders?: string[];
 		/** Browser proxy override for new sessions. Absent/"default" = global policy. */
 		browserProxy?: ProxyOverride;
+		/** Explicit pre-approval for Notification.send; never overrides read-only mode. */
+		notificationPolicy?: { allowSend?: boolean };
 		/** WebFetch permission policy. */
 		webFetchPolicy?: {
 			/** When true, all URLs are auto-allowed without user approval. */

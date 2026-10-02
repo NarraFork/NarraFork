@@ -1242,6 +1242,7 @@
 	"contextWindowPlaceholder": "例如 272000",
 	"contextWindowSuffix": "tokens",
 	"notificationSection": "通知",
+	"notifyAutomaticTriggersDesc": "下方完成和等待权限开关仅控制自动通知，关闭它们不会禁用已配置的渠道。可选 Notification 工具可独立查询渠道，或通过已启用的钉钉、飞书渠道向 user_id 或 username 精确指定的用户主动发送通知；不主动发送浏览器或声音通知。",
 	"notifyOnDone": "叙述者完成时通知",
 	"notifyOnDoneDesc": "当侧边栏标签中的叙述者完成任务时触发通知",
 	"notifyOnWaiting": "叙述者等待权限时通知",

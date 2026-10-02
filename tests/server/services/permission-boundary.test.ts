@@ -1263,3 +1263,60 @@ describe("classifyDanger", () => {
 		expect(resolveDangerReflectionLevel("on", "light")).toBe("light");
 	});
 });
+
+describe("Notification action permissions", () => {
+	const decide = (
+		action: string,
+		permMode: string,
+		extra: Partial<Parameters<typeof resolvePermissionDecision>[0]> = {},
+	) =>
+		resolvePermissionDecision({
+			toolName: "Notification",
+			input: { action, username: "recipient" },
+			permMode,
+			cwd: "/home/user/project",
+			...extra,
+		});
+
+	test("non-secret channel metadata can be read in every permission mode", () => {
+		for (const mode of ["default", "acceptEdits", "readOnly", "dontAsk", "bypassPermissions"]) {
+			expect(decide("list_channels", mode)).toBe("allow");
+		}
+	});
+
+	test("sending requires approval unless bypass or explicitly pre-approved", () => {
+		for (const mode of ["default", "acceptEdits"]) {
+			expect(decide("send", mode)).toBe("ask");
+			expect(decide("send", mode, { notificationPolicy: { allowSend: false } })).toBe("ask");
+			expect(decide("send", mode, { notificationPolicy: { allowSend: true } })).toBe("allow");
+		}
+		expect(decide("send", "bypassPermissions")).toBe("allow");
+		expect(decide("send", "dontAsk")).toBe("deny");
+		expect(decide("send", "dontAsk", { notificationPolicy: { allowSend: true } })).toBe("allow");
+	});
+
+	test("pre-approval never overrides read-only or strict plan mode", () => {
+		for (const allowSend of [false, true]) {
+			expect(decide("send", "readOnly", { notificationPolicy: { allowSend } })).toBe("deny");
+			for (const mode of ["default", "acceptEdits", "bypassPermissions"]) {
+				const strictPlan = {
+					planMode: true,
+					relaxedPlan: false,
+					notificationPolicy: { allowSend },
+				};
+				expect(decide("send", mode, strictPlan)).toBe("deny");
+				expect(decide("list_channels", mode, strictPlan)).toBe("allow");
+			}
+		}
+	});
+
+	test("unknown actions are never treated as reads or covered by send pre-approval", () => {
+		expect(decide("future_action", "readOnly")).toBe("deny");
+		expect(decide("future_action", "dontAsk", { notificationPolicy: { allowSend: true } })).toBe(
+			"deny",
+		);
+		expect(decide("future_action", "default", { notificationPolicy: { allowSend: true } })).toBe(
+			"ask",
+		);
+	});
+});

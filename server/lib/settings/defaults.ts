@@ -44,6 +44,7 @@ export const DEFAULTS: NarraForkSettings = {
 		// wizard makes selecting one a hard gate before anything can run.
 		defaultModel: "",
 		defaultPermissionMode: "acceptEdits",
+		notificationPolicy: { allowSend: false },
 		defaultNarratorVisibility: "auto",
 		defaultNarratorWriteAudience: "auto",
 		defaultStartInPlanMode: false,
@@ -708,6 +709,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "Web Fetch 独立代理覆盖，同时用于 HTTP 抓取与浏览器渲染。省略或 default 跟随全局网络代理。",
 		type: "object",
 		valid: "mode: default | direct | system | custom; url: HTTP(S) 代理地址",
+	},
+	"agent.notificationPolicy.allowSend": {
+		desc: "为 true 时预先允许 Notification 主动发送钉钉/飞书通知，免逐次审批；只读与严格计划模式仍禁止发送。默认关闭。",
+		type: "boolean",
 	},
 	"agent.webFetchPolicy.allowAll": {
 		desc: "为 true 时所有 URL 自动允许抓取，无需用户批准。",
