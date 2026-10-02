@@ -420,6 +420,17 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 	if _, present := params["files"]; op == "watch" && present {
 		return nil, fmt.Errorf("watch does not accept files")
 	}
+	if op == "commitDetail" || op == "commitDiff" {
+		// Historical paths are validated lexically only: they may no longer exist,
+		// and these operations read the object database, never the working tree.
+		if _, present := params["files"]; present {
+			return nil, fmt.Errorf("commit preview does not accept files")
+		}
+		if err := h.checkGitHelpers(g, false); err != nil {
+			return nil, err
+		}
+		return h.workspaceCommitPreview(g, op, params, maxBytes)
+	}
 	files, err := h.gitFilePaths(g, root, params)
 	if err != nil {
 		return nil, err

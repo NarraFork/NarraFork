@@ -1,3 +1,9 @@
+import {
+	GIT_COMMIT_PREVIEW_PATCH_MAX_BYTES,
+	GIT_COMMIT_PREVIEW_UNSUPPORTED,
+	type GitCommitDetail,
+	type GitCommitPatch,
+} from "@shared/git-commit-preview";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import {
 	GIT_WORKSPACE_AI_DIFF_BYTES,
@@ -8,7 +14,13 @@ import {
 	type GitWorkspaceRequest,
 	type GitWorkspaceResult,
 } from "../lib/agent/execution/git-workspace-rpc";
-import { GitError } from "../lib/errors";
+import { AppError, GitError, ValidationError } from "../lib/errors";
+import {
+	assertSingleFilePatch,
+	buildCommitDetail,
+	commitNotFound,
+	parseCommitMeta,
+} from "./git-commit-preview-parse";
 import type { GitCommitIdentity, GitStatusFile, GitStatusSummary } from "./git-service";
 
 const WRITES = new Set<GitWorkspaceOperation>([
@@ -241,7 +253,73 @@ export function createRemoteGitService(
 		stashDrop: (cwd: string, index: number) => mutate(cwd, "stashDrop", { index }),
 		resetSoft: (cwd: string, target: string) => mutate(cwd, "reset", { mode: "soft", target }),
 		resetHard: (cwd: string, target: string) => mutate(cwd, "reset", { mode: "hard", target }),
+		/**
+		 * The executor returns the three raw listings; parsing is shared with the local
+		 * backend so both answer identically. `outputs.<key>Truncated` = "1" marks a
+		 * listing cut by its own budget.
+		 */
+		async getCommitDetail(cwd: string, sha: string): Promise<GitCommitDetail> {
+			requireCommitPreview();
+			const result = await request(cwd, "commitDetail", { commit: sha });
+			const outputs = result.outputs ?? {};
+			if (outputs.found === "0") throw commitNotFound(sha);
+			const cut = (key: string) => outputs[`${key}Truncated`] === "1";
+			return buildCommitDetail(parseCommitMeta(outputs.meta ?? "", cut("meta")), {
+				numstat: outputs.numstat ?? "",
+				numstatTruncated: cut("numstat"),
+				nameStatus: outputs.nameStatus ?? "",
+				nameStatusTruncated: cut("nameStatus"),
+			});
+		},
+		async getCommitPatch(
+			cwd: string,
+			sha: string,
+			file: string,
+			oldPath?: string,
+		): Promise<GitCommitPatch> {
+			requireCommitPreview();
+			const result = await request(cwd, "commitDiff", {
+				commit: sha,
+				path: file,
+				...(oldPath ? { oldPath } : {}),
+				maxBytes: GIT_COMMIT_PREVIEW_PATCH_MAX_BYTES,
+			});
+			if (result.outputs?.found === "0") throw commitNotFound(sha);
+			switch (result.outputs?.fileStatus) {
+				case "not_found":
+					throw new AppError("File is not part of this commit", 404, "GIT_COMMIT_FILE_NOT_FOUND");
+				case "too_large":
+					throw new AppError(
+						"Commit path exceeds the preview budget",
+						413,
+						"GIT_COMMIT_PREVIEW_TOO_LARGE",
+					);
+				case "invalid":
+					throw new ValidationError("Commit preview path must name a single changed file");
+			}
+			const diff = result.stdout ?? "";
+			// Only the executor's complete, scoped T record authorizes a second section.
+			// Do not infer it from patch headers, a caller flag, or an unscoped list.
+			const scoped = result.outputs?.typechangeNameStatus;
+			if (scoped !== undefined && (scoped !== `T\0${file}\0` || oldPath))
+				throw new ValidationError("Invalid scoped commit typechange record");
+			assertSingleFilePatch(
+				diff,
+				file,
+				scoped === undefined ? undefined : { status: "typechange", path: file },
+			);
+			return { diff, truncated: result.truncated ?? false };
+		},
 	};
+	function requireCommitPreview() {
+		// No local fallback: the repository lives on the device.
+		if (backend.supportsGitCommitPreview !== true)
+			throw new AppError(
+				"The device executor is too old to preview commits; upgrade it",
+				409,
+				GIT_COMMIT_PREVIEW_UNSUPPORTED,
+			);
+	}
 }
 
 export type RemoteGitService = ReturnType<typeof createRemoteGitService>;

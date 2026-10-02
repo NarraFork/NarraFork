@@ -52,6 +52,7 @@ import {
 	decodeCatalog,
 	encodeCatalog,
 	MAX_CATALOG_BYTES,
+	MAX_CATALOG_REVISION_BYTES,
 	parseCatalogRevision,
 } from "./source";
 
@@ -1064,6 +1065,7 @@ export function mutateModelCard(mutation: ModelCardMutation) {
 async function boundedDownload(
 	url: string,
 	max: number,
+	kind: "revision" | "archive",
 	headers?: Record<string, string>,
 ): Promise<{ bytes?: Uint8Array; etag?: string }> {
 	const response = await fetch(url, {
@@ -1071,24 +1073,31 @@ async function boundedDownload(
 		redirect: "error",
 		signal: AbortSignal.timeout(15_000),
 	});
-	if (response.status === 304) return {};
-	if (!response.ok) throw new Error(`Catalog download HTTP ${response.status}`);
-	if (Number(response.headers.get("content-length")) > max)
-		throw new Error("Catalog download exceeds size limit");
+	const assertWithinLimit = (size: number) => {
+		if (size > max)
+			throw new Error(
+				`Catalog ${kind} download exceeds size limit (${size} bytes; limit ${max} bytes)`,
+			);
+	};
 	const reader = response.body?.getReader();
-	if (!reader) throw new Error("Empty catalog response");
 	const chunks: Uint8Array[] = [];
 	let total = 0;
 	try {
+		if (response.status === 304) return {};
+		if (!response.ok) throw new Error(`Catalog ${kind} download HTTP ${response.status}`);
+		assertWithinLimit(Number(response.headers.get("content-length")));
+		if (!reader) throw new Error(`Empty catalog ${kind} response`);
 		while (true) {
 			const result = await reader.read();
 			if (result.done) break;
 			total += result.value.byteLength;
-			if (total > max) throw new Error("Catalog download exceeds size limit");
+			assertWithinLimit(total);
 			chunks.push(result.value);
 		}
 	} finally {
-		await reader.cancel();
+		// Cancel header-rejected bodies too; cleanup must not hide the download error.
+		await reader?.cancel().catch(() => undefined);
+		reader?.releaseLock();
 	}
 	const bytes = new Uint8Array(total);
 	let offset = 0;
@@ -1104,7 +1113,8 @@ export function checkModelCatalogUpdate(): Promise<ModelCatalogSnapshot> {
 		try {
 			const revisionDownload = await boundedDownload(
 				CATALOG_REVISION_URL,
-				64 * 1024,
+				MAX_CATALOG_REVISION_BYTES,
+				"revision",
 				etag ? { "If-None-Match": etag } : undefined,
 			);
 			lastCheckedAt = new Date().toISOString();
@@ -1115,6 +1125,7 @@ export function checkModelCatalogUpdate(): Promise<ModelCatalogSnapshot> {
 				const archive = await boundedDownload(
 					`${CATALOG_ARCHIVE_BASE}${revision.version}`,
 					MAX_CATALOG_BYTES,
+					"archive",
 				);
 				if (!archive.bytes) throw new Error("Empty catalog archive");
 				const candidate = await catalogFromArchive(

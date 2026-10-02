@@ -301,6 +301,8 @@ export interface ExecutionBackend {
 	/** Feature-negotiated structured remote Git; absent on local/legacy backends. */
 	readonly supportsGitWorkspace?: boolean;
 	readonly supportsGitWorkspaceWatch?: boolean;
+	/** Executor advertises the read-only commit preview operations. */
+	readonly supportsGitCommitPreview?: boolean;
 	gitWorkspace?(request: GitWorkspaceRequest, signal?: AbortSignal): Promise<GitWorkspaceResult>;
 	readonly deviceId: string;
 	readonly kind: "local" | "remote";

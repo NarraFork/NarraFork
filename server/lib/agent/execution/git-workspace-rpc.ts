@@ -1,6 +1,8 @@
 /** Additive, shell-free Git management contract, mirrored by the Go executor. */
 export const FEATURE_GIT_WORKSPACE_V1 = "git.workspace.v1";
 export const FEATURE_GIT_WORKSPACE_WATCH_V1 = "git.workspace.watch.v1";
+/** Read-only `commitDetail`/`commitDiff` operations; older executors lack them. */
+export const FEATURE_GIT_COMMIT_PREVIEW_V1 = "git.workspace.commit-preview.v1";
 export const GIT_WORKSPACE_TIMEOUT_MS = 30_000;
 export const GIT_WORKSPACE_WRITE_TIMEOUT_MS = 120_000;
 export const GIT_WORKSPACE_MAX_BYTES = 2 * 1024 * 1024;
@@ -21,7 +23,9 @@ export type GitWorkspaceOperation =
 	| "stashPush"
 	| "stashPop"
 	| "stashDrop"
-	| "reset";
+	| "reset"
+	| "commitDetail"
+	| "commitDiff";
 
 export interface GitWorkspaceRequest {
 	cwd: string;
@@ -39,6 +43,14 @@ export interface GitWorkspaceRequest {
 	index?: number;
 	target?: string;
 	mode?: "soft" | "hard";
+	/** commitDetail/commitDiff: full commit SHA. */
+	commit?: string;
+	/**
+	 * commitDiff: historical repo-relative path. Deliberately NOT `files`: those are
+	 * checked against the current filesystem, and a historical path may be gone.
+	 */
+	path?: string;
+	oldPath?: string;
 	maxBytes?: number;
 	timeoutMs?: number;
 }

@@ -24,6 +24,12 @@ import {
 	withModelMetadataSnapshotIterator,
 } from "../../../server/lib/model-catalog";
 import {
+	CATALOG_ARCHIVE_BASE,
+	CATALOG_REVISION_URL,
+	MAX_CATALOG_BYTES,
+	MAX_CATALOG_REVISION_BYTES,
+} from "../../../server/lib/model-catalog/source";
+import {
 	deleteNugCachedModels,
 	getNugCachedModelsByProvider,
 	resolveNugModelMeta,
@@ -100,12 +106,18 @@ async function mockCatalog(
 		});
 	}
 	const archive = await new Bun.Archive(files, { compress: "gzip" }).bytes();
-	globalThis.fetch = (async (url: string | URL | Request) =>
-		new Response(
-			String(url).endsWith("/commits/main")
-				? JSON.stringify({ sha: version, commit: { committer: { date: catalog.publishedAt } } })
-				: archive,
-		)) as unknown as typeof fetch;
+	globalThis.fetch = (async (url: string | URL | Request) => {
+		if (String(url) === CATALOG_REVISION_URL)
+			return Response.json({
+				name: "main",
+				commit: {
+					sha: version,
+					commit: { committer: { date: catalog.publishedAt } },
+				},
+			});
+		if (String(url) === `${CATALOG_ARCHIVE_BASE}${version}`) return new Response(archive);
+		throw new Error(`Unexpected catalog URL: ${url}`);
+	}) as unknown as typeof fetch;
 	return version;
 }
 
@@ -901,32 +913,160 @@ describe("catalog update and API boundary", () => {
 		expect(missing.status).toBe(400);
 		expect((await missing.json()).error).toContain("model is required");
 	});
-	test("invalid revisions, corrupt archives, oversized responses and redirects retain last good", async () => {
+	test.each([
+		true,
+		false,
+	])("accepts 1 MiB branch metadata without requesting commit patches (Content-Length: %s)", async (includeLength) => {
+		expect(MAX_CATALOG_REVISION_BYTES).toBe(1024 * 1024);
+		expect(MAX_CATALOG_BYTES).toBe(16 * 1024 * 1024);
+		const initial = getModelCatalogSnapshot();
+		const version = await mockCatalog(`large-branch-${includeLength}`);
+		const fixture = globalThis.fetch;
+		const urls: string[] = [];
+		globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+			urls.push(String(url));
+			if (String(url).endsWith("/commits/main"))
+				return new Response("x".repeat(MAX_CATALOG_REVISION_BYTES + 1));
+			const response = await fixture(url, init);
+			if (String(url) !== CATALOG_REVISION_URL) return response;
+			const body = (await response.text()).padEnd(MAX_CATALOG_REVISION_BYTES, " ");
+			return new Response(body, {
+				headers: includeLength
+					? { "content-length": String(MAX_CATALOG_REVISION_BYTES) }
+					: undefined,
+			});
+		}) as unknown as typeof fetch;
+		const checked = await checkModelCatalogUpdate();
+		expect(checked.update.lastError).toBeUndefined();
+		expect(checked.update.pendingVersion).toBe(`v2:${version}`);
+		expect(checked.catalog).toEqual(initial.catalog);
+		expect(checked.local).toEqual(initial.local);
+		expect(urls).toEqual([
+			"https://api.github.com/repos/NarraFork/narrafork-model-catalog/branches/main",
+			`https://codeload.github.com/NarraFork/narrafork-model-catalog/tar.gz/${version}`,
+		]);
+	});
+	test("reuses the branch ETag and preserves the staged catalog on 304", async () => {
+		const version = await mockCatalog("branch-etag");
+		const fixture = globalThis.fetch;
+		const etag = '"catalog-branch-etag"';
+		let revisionCalls = 0;
+		let archiveCalls = 0;
+		globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+			if (String(url) === CATALOG_REVISION_URL) {
+				revisionCalls++;
+				if (revisionCalls > 1) {
+					expect(new Headers(init?.headers).get("If-None-Match")).toBe(etag);
+					return new Response(null, { status: 304 });
+				}
+				const response = await fixture(url, init);
+				response.headers.set("etag", etag);
+				return response;
+			}
+			archiveCalls++;
+			return fixture(url, init);
+		}) as unknown as typeof fetch;
+		const first = await checkModelCatalogUpdate();
+		expect(first.update.lastError).toBeUndefined();
+		expect(first.update.pendingVersion).toBe(`v2:${version}`);
+		const second = await checkModelCatalogUpdate();
+		expect(second.update.lastError).toBeUndefined();
+		expect(second.update.pendingVersion).toBe(first.update.pendingVersion);
+		expect(second.update.pendingDiff).toEqual(first.update.pendingDiff);
+		expect(second.catalog).toEqual(first.catalog);
+		expect(second.local).toEqual(first.local);
+		expect(revisionCalls).toBe(2);
+		expect(archiveCalls).toBe(1);
+	});
+	test.each([
+		["revision", MAX_CATALOG_REVISION_BYTES],
+		["archive", MAX_CATALOG_BYTES],
+	] as const)("rejects oversized %s Content-Length even when cancellation fails", async (kind, max) => {
+		const before = getModelCatalogSnapshot();
+		const version = await mockCatalog(`oversized-header-${kind}`);
+		const fixture = globalThis.fetch;
+		const rejectedUrl =
+			kind === "revision" ? CATALOG_REVISION_URL : `${CATALOG_ARCHIVE_BASE}${version}`;
+		let cancellations = 0;
+		globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+			if (String(url) !== rejectedUrl) return fixture(url, init);
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					cancel() {
+						cancellations++;
+						throw new Error("cancel failed");
+					},
+				}),
+				{ headers: { "content-length": String(max + 1) } },
+			);
+		}) as unknown as typeof fetch;
+		const checked = await checkModelCatalogUpdate();
+		expect(checked.update.lastError).toBe(
+			`Catalog ${kind} download exceeds size limit (${max + 1} bytes; limit ${max} bytes)`,
+		);
+		expect(cancellations).toBe(1);
+		expect(checked.catalog).toEqual(before.catalog);
+		expect(checked.local).toEqual(before.local);
+		expect(checked.update.pendingVersion).toBe(before.update.pendingVersion);
+		expect(checked.update.pendingDiff).toEqual(before.update.pendingDiff);
+	});
+	test.each([
+		["revision", MAX_CATALOG_REVISION_BYTES],
+		["archive", MAX_CATALOG_BYTES],
+	] as const)("cancels oversized %s streams without Content-Length", async (kind, max) => {
+		const before = getModelCatalogSnapshot();
+		const version = await mockCatalog(`oversized-stream-${kind}`);
+		const fixture = globalThis.fetch;
+		const rejectedUrl =
+			kind === "revision" ? CATALOG_REVISION_URL : `${CATALOG_ARCHIVE_BASE}${version}`;
+		let cancellations = 0;
+		globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+			if (String(url) !== rejectedUrl) return fixture(url, init);
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(new Uint8Array(max));
+						controller.enqueue(new Uint8Array(1));
+					},
+					cancel() {
+						cancellations++;
+					},
+				}),
+			);
+		}) as unknown as typeof fetch;
+		const checked = await checkModelCatalogUpdate();
+		expect(checked.update.lastError).toBe(
+			`Catalog ${kind} download exceeds size limit (${max + 1} bytes; limit ${max} bytes)`,
+		);
+		expect(cancellations).toBe(1);
+		expect(checked.catalog).toEqual(before.catalog);
+		expect(checked.local).toEqual(before.local);
+		expect(checked.update.pendingVersion).toBe(before.update.pendingVersion);
+	});
+	test("invalid revisions, corrupt archives and redirects retain last good", async () => {
 		const version = getModelCatalogSnapshot().catalog.catalogVersion;
 		const urls: string[] = [];
 		globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
 			urls.push(String(url));
 			expect(init?.redirect).toBe("error");
-			if (String(url).endsWith("/commits/main"))
-				return new Response(
-					JSON.stringify({
+			expect(init?.signal).toBeInstanceOf(AbortSignal);
+			if (String(url) === CATALOG_REVISION_URL)
+				return Response.json({
+					commit: {
 						sha: "a".repeat(40),
 						commit: { committer: { date: "2026-01-01T00:00:00Z" } },
-					}),
-				);
+					},
+				});
 			return new Response("corrupt archive");
 		}) as unknown as typeof fetch;
 		expect((await checkModelCatalogUpdate()).update.lastError).toBeDefined();
 		expect(urls).toEqual([
-			"https://api.github.com/repos/NarraFork/narrafork-model-catalog/commits/main",
+			"https://api.github.com/repos/NarraFork/narrafork-model-catalog/branches/main",
 			`https://codeload.github.com/NarraFork/narrafork-model-catalog/tar.gz/${"a".repeat(40)}`,
 		]);
 		globalThis.fetch = (async () =>
-			new Response(JSON.stringify({ sha: "../../other-repo" }))) as unknown as typeof fetch;
+			Response.json({ commit: { sha: "../../other-repo" } })) as unknown as typeof fetch;
 		expect((await checkModelCatalogUpdate()).update.lastError).toContain("Git revision");
-		globalThis.fetch = (async () =>
-			new Response("{}", { headers: { "content-length": "65537" } })) as unknown as typeof fetch;
-		expect((await checkModelCatalogUpdate()).update.lastError).toContain("size limit");
 		globalThis.fetch = (async () =>
 			new Response(null, {
 				status: 302,

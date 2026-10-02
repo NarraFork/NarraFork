@@ -20,9 +20,11 @@
  */
 
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { PLUGIN_UI_RUNTIME_CSS_PATH, PLUGIN_UI_RUNTIME_JS_PATH } from "../plugin-runtime/paths";
 
 export interface PluginUiRuntimeBundle {
@@ -57,7 +59,30 @@ export function isMainApplicationBuild(config: PluginUiRuntimeBuildConfig): bool
 	return !config.build.lib && !config.build.ssr;
 }
 
-const ENTRY = resolve(import.meta.dir ?? __dirname, "..", "plugin-runtime", "vendor.ts");
+/**
+ * Absolute path to the runtime entry, resolved so it survives every Vite config loader.
+ *
+ * Vite 8's default `bundle` loader writes the compiled config into `node_modules/.vite-temp`
+ * and the `runner` loader leaves both `import.meta.dir` and `__dirname` undefined, so the
+ * previous `import.meta.dir ?? __dirname` anchor resolved into the wrong directory (or threw
+ * `__dirname is not defined`) and the build failed to open `plugin-runtime`. `import.meta.url`
+ * still points at THIS source file under every loader; the repository-root fallback covers a
+ * bundled config where even that is rewritten.
+ */
+function resolveRuntimeEntry(): string {
+	const candidates = [
+		import.meta.url
+			? resolve(dirname(fileURLToPath(import.meta.url)), "..", "plugin-runtime", "vendor.ts")
+			: undefined,
+		resolve(process.cwd(), "frontend", "plugin-runtime", "vendor.ts"),
+	];
+	for (const candidate of candidates) if (candidate && existsSync(candidate)) return candidate;
+	throw new Error(
+		"Cannot locate frontend/plugin-runtime/vendor.ts for the plugin UI runtime build",
+	);
+}
+
+const ENTRY = resolveRuntimeEntry();
 
 /**
  * Bundle the runtime once.

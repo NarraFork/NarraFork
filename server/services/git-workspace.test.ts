@@ -2,10 +2,10 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import type { GitCommitDetail, GitCommitPatch } from "@shared/git-commit-preview";
 import type { GitWorkspace } from "@shared/git-workspace";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
-import { db } from "../db";
 import { chapters, narrators, projects, remoteDevices, users } from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { windowsPathSemantics } from "../lib/agent/execution/path-semantics";
@@ -23,6 +23,9 @@ import { gitService, withGitRequestContext } from "./git-service";
 import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
 import { gitPathPolicyAllows } from "./git-workspace-access";
 import { type ActiveNarrator, activeNarrators } from "./narrator-session-state";
+
+// The singleton starts asynchronously; await it before a fixture captures its handle.
+const { db } = await import("../db");
 
 let root: string, repo: string, owner: string, narratorId: string;
 const scanProjectIds: string[] = [];
@@ -116,6 +119,41 @@ async function project(path: string) {
 		updatedAt: now(),
 	});
 	return id;
+}
+
+async function commitPreviewFixture() {
+	const projectId = await project(repo);
+	scanProjectIds.push(projectId);
+	await db.update(projects).set({ visibility: "public" }).where(eq(projects.id, projectId));
+	const chapterId = generateId();
+	scanChapterIds.push(chapterId);
+	await db.insert(chapters).values({
+		id: chapterId,
+		projectId,
+		title: "Commit preview",
+		branch: "main",
+		baseBranch: "main",
+		worktreePath: repo,
+		createdAt: now(),
+		updatedAt: now(),
+	});
+	const reader = generateId();
+	await db
+		.insert(users)
+		.values({ id: reader, username: reader, passwordHash: "fixture", createdAt: now() });
+	await db.update(narrators).set({ visibility: "public" }).where(eq(narrators.id, narratorId));
+	const response = await request("workspace", undefined, narratorId, reader);
+	expect(response.status).toBe(200);
+	const ws = (await response.json()) as GitWorkspace;
+	expect(ws.capabilities).toEqual({ read: true, write: false });
+	return {
+		reader,
+		projectId,
+		chapterId,
+		workspaceKey: ws.workspaceKey as string,
+		sha: await git(repo, "rev-parse", "HEAD"),
+		bases: [`/narrators/${narratorId}/git`, `/chapters/${chapterId}/git`],
+	};
 }
 
 beforeEach(async () => {
@@ -471,6 +509,110 @@ describe("authenticated Git management", () => {
 		expect((await request("workspace")).status).toBe(403);
 		expect(probes).toBe(1);
 	});
+});
+
+describe("commit preview routes", () => {
+	test("read-only viewers preview both domains without changing HEAD, index bytes or working files", async () => {
+		const f = await commitPreviewFixture();
+		await writeFile(join(repo, "seed.txt"), "staged draft\n");
+		await git(repo, "add", "seed.txt");
+		await writeFile(join(repo, "seed.txt"), "unstaged draft\n");
+		await writeFile(join(repo, "untracked.txt"), "untracked draft\n");
+		const indexBefore = await readFile(join(repo, ".git", "index"));
+		for (const base of f.bases) {
+			// The narrator path is pinned; the chapter adapter retains its keyless contract.
+			const params = new URLSearchParams();
+			if (base.startsWith("/narrators/")) params.set("workspaceKey", f.workspaceKey);
+			const metadata = await app(f.reader).request(`${base}/commits/${f.sha}?${params}`);
+			expect(metadata.status).toBe(200);
+			const detail = (await metadata.json()) as GitCommitDetail;
+			expect(detail).toMatchObject({
+				sha: f.sha,
+				parents: [],
+				comparedTo: null,
+				message: "baseline",
+			});
+			expect(detail.files).toContainEqual({
+				path: "seed.txt",
+				status: "added",
+				linesAdded: 1,
+				linesRemoved: 0,
+				binary: false,
+			});
+			params.set("file", "seed.txt");
+			const response = await app(f.reader).request(`${base}/commits/${f.sha}/diff?${params}`);
+			expect(response.status).toBe(200);
+			const patch = (await response.json()) as GitCommitPatch;
+			expect(patch.diff).toContain("+seed");
+			expect(patch.diff).not.toContain("draft");
+			expect(patch.truncated).toBe(false);
+		}
+		expect(await git(repo, "rev-parse", "HEAD")).toBe(f.sha);
+		expect((await readFile(join(repo, ".git", "index"))).equals(indexBefore)).toBe(true);
+		expect(await readFile(join(repo, "seed.txt"), "utf8")).toBe("unstaged draft\n");
+		expect(await readFile(join(repo, "untracked.txt"), "utf8")).toBe("untracked draft\n");
+	}, 15_000);
+
+	test("wrong workspace pins return 409 for detail and diff in either domain", async () => {
+		const f = await commitPreviewFixture();
+		for (const base of f.bases) {
+			for (const suffix of ["", "/diff"]) {
+				const params = new URLSearchParams({
+					workspaceKey: "different-device:/different-root",
+					file: "seed.txt",
+				});
+				const response = await app(f.reader).request(`${base}/commits/${f.sha}${suffix}?${params}`);
+				expect(response.status).toBe(409);
+				expect(await response.json()).toMatchObject({ code: "GIT_WORKSPACE_CHANGED" });
+			}
+		}
+	}, 15_000);
+
+	test("revoked narrator and project visibility immediately denies previously readable previews", async () => {
+		const f = await commitPreviewFixture();
+		for (const base of f.bases)
+			expect((await app(f.reader).request(`${base}/commits/${f.sha}`)).status).toBe(200);
+		await db.update(narrators).set({ visibility: "private" }).where(eq(narrators.id, narratorId));
+		await db.update(projects).set({ visibility: "private" }).where(eq(projects.id, f.projectId));
+		for (const base of f.bases) {
+			for (const suffix of ["", "/diff?file=seed.txt"]) {
+				const response = await app(f.reader).request(`${base}/commits/${f.sha}${suffix}`);
+				expect(response.status).toBe(404);
+				const body = await response.text();
+				expect(body).not.toContain(f.sha);
+				expect(body).not.toContain("seed.txt");
+			}
+		}
+	}, 15_000);
+
+	test("malicious destination/source paths are rejected and missing objects or files return 404", async () => {
+		const f = await commitPreviewFixture();
+		for (const base of f.bases) {
+			for (const path of [
+				"../outside",
+				"sub\\..\\..\\outside",
+				"C:\\outside",
+				"/outside",
+				".git/config",
+				"seed.txt\0tail",
+			]) {
+				for (const field of ["file", "oldPath"]) {
+					const params = new URLSearchParams({ file: "seed.txt", workspaceKey: f.workspaceKey });
+					params.set(field, path);
+					const response = await app(f.reader).request(`${base}/commits/${f.sha}/diff?${params}`);
+					expect(response.status).toBe(400);
+				}
+			}
+			const missingCommit = await app(f.reader).request(`${base}/commits/${"0".repeat(40)}`);
+			expect(missingCommit.status).toBe(404);
+			expect(await missingCommit.json()).toMatchObject({ code: "GIT_COMMIT_NOT_FOUND" });
+			const missingFile = await app(f.reader).request(
+				`${base}/commits/${f.sha}/diff?file=missing.txt`,
+			);
+			expect(missingFile.status).toBe(404);
+			expect(await missingFile.json()).toMatchObject({ code: "GIT_COMMIT_FILE_NOT_FOUND" });
+		}
+	}, 20_000);
 });
 
 test("execution path policy rejects a remote cwd before any Git probe", async () => {

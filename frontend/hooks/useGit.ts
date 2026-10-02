@@ -6,8 +6,19 @@ import type {
 	FileChangeAttributionGrade,
 	FileChangeProjectionCompleteness,
 } from "../../shared/file-change-protocol";
+import {
+	GIT_COMMIT_PREVIEW_UNSUPPORTED,
+	type GitCommitDetail,
+	type GitCommitPatch,
+} from "../../shared/git-commit-preview";
 import { type ApiError, api } from "../lib/api";
-import { type GitLogEntry, type GitTarget, type GitWorkspace, gitTargetKey } from "../lib/api/git";
+import {
+	type GitLogEntry,
+	type GitTarget,
+	type GitWorkspace,
+	gitBasePath,
+	gitTargetKey,
+} from "../lib/api/git";
 import { GitWorkspaceSubscriptions } from "../lib/git-workspace-subscription";
 import { type ListenerHandle, narratorWSManager } from "../lib/narrator-ws-manager";
 import { useNarrator } from "./useNarrator";
@@ -127,6 +138,8 @@ export const GIT_FACT_QUERIES = [
 	"gitDiff",
 	"gitLog",
 	"gitStashList",
+	"gitCommitDetail",
+	"gitCommitDiff",
 ];
 
 export function gitWorkspaceTarget(narratorId: string, workspace?: GitWorkspace): GitTarget | null {
@@ -201,10 +214,16 @@ async function readWorkspace<T>(
 	try {
 		return await read();
 	} catch (error) {
+		const failure = error as ApiError;
+		// An older executor missing preview operations is not a workspace change.
+		// Re-probing here would unmount/reopen its consumer and repeat the same 409.
+		const unsupportedPreview =
+			failure?.status === 409 && failure.data?.code === GIT_COMMIT_PREVIEW_UNSUPPORTED;
 		if (
 			target &&
 			typeof target !== "string" &&
-			[401, 403, 409, 503].includes((error as ApiError)?.status)
+			!unsupportedPreview &&
+			[401, 403, 409, 503].includes(failure?.status)
 		) {
 			qc.resetQueries({ queryKey: ["gitWorkspace", target.narratorId] });
 		}
@@ -368,6 +387,50 @@ export function useGitDiff(
 		enabled: !!target && !!file,
 		retry: false,
 		gcTime: 30_000,
+	});
+}
+
+// Commit objects are immutable, but the route granting access is not. Keep the
+// workspace prefix for invalidation, and scope previews to their narrator/chapter.
+export function useGitCommitDetail(target: GitTarget | undefined | null, sha: string | null) {
+	const qc = useQueryClient();
+	return useQuery<GitCommitDetail>({
+		queryKey: ["gitCommitDetail", gitTargetKey(target), sha, target ? gitBasePath(target) : null],
+		queryFn: ({ signal }) =>
+			readWorkspace(qc, target, () =>
+				api.getGitCommitDetail(target as GitTarget, sha as string, signal),
+			),
+		enabled: !!target && !!sha,
+		retry: false,
+		staleTime: Number.POSITIVE_INFINITY,
+		gcTime: GIT_QUERY_GC_TIME_MS,
+	});
+}
+
+export function useGitCommitDiff(
+	target: GitTarget | undefined | null,
+	sha: string | null,
+	file: string | null,
+	oldPath?: string,
+) {
+	const qc = useQueryClient();
+	return useQuery<GitCommitPatch>({
+		queryKey: [
+			"gitCommitDiff",
+			gitTargetKey(target),
+			sha,
+			file,
+			oldPath ?? null,
+			target ? gitBasePath(target) : null,
+		],
+		queryFn: ({ signal }) =>
+			readWorkspace(qc, target, () =>
+				api.getGitCommitDiff(target as GitTarget, sha as string, file as string, oldPath, signal),
+			),
+		enabled: !!target && !!sha && !!file,
+		retry: false,
+		staleTime: Number.POSITIVE_INFINITY,
+		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
 }
 

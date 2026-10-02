@@ -1,3 +1,4 @@
+import { GIT_COMMIT_SHA_PATTERN } from "@shared/git-commit-preview";
 import { z } from "zod";
 
 const filePathArray = z.array(z.string().min(1)).min(1);
@@ -77,6 +78,17 @@ export const gitDiffQuerySchema = z.object({
 		.string()
 		.optional()
 		.transform((v) => v === "true"),
+});
+
+/** Full commit object name only: refs, ranges and flags cannot reach git. */
+export const gitCommitShaSchema = z
+	.string()
+	.regex(GIT_COMMIT_SHA_PATTERN, "Commit preview requires a full commit SHA")
+	.transform((sha) => sha.toLowerCase());
+
+export const gitCommitDiffQuerySchema = z.object({
+	file: z.string().min(1).max(4096),
+	oldPath: z.string().min(1).max(4096).optional(),
 });
 
 // === modification view ===

@@ -103,6 +103,81 @@ describe("git APIs", () => {
 		clearToken();
 	});
 
+	test("commit preview reads pin and encode workspace, paths and route identities without writes", async () => {
+		installLocalStorage();
+		setToken("git-token");
+		const calls: Array<{ url: string; init?: RequestInit }> = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (input: RequestInfo | URL, init?: RequestInit) => {
+				calls.push({ url: String(input), init });
+				return Response.json({});
+			},
+		});
+		const target: GitTarget = {
+			narratorId: "narrator /?#",
+			workspaceKey: "device:设备/E:/work tree?&=#+",
+			canWrite: false,
+		};
+		const sha = "a".repeat(40);
+		const sha256 = "b".repeat(64);
+		const file = "folder/file #?+&测试.txt";
+		const oldPath = "old folder/name\twith\nnewline+&.txt";
+		const controller = new AbortController();
+		await api.getGitCommitDetail(target, sha, controller.signal);
+		await api.getGitCommitDiff(target, sha, file, oldPath, controller.signal);
+		await api.getGitCommitDiff(target, sha, file, undefined, controller.signal);
+		await api.getGitCommitDetail("chapter /?#", sha256, controller.signal);
+		await api.getGitCommitDiff("chapter /?#", sha256, file, oldPath, controller.signal);
+
+		const urls = calls.map(({ url }) => new URL(url, "http://localhost"));
+		expect(urls[0]?.pathname).toBe(`/api/narrators/narrator%20%2F%3F%23/git/commits/${sha}`);
+		expect(urls[1]?.pathname).toBe(`${urls[0]?.pathname}/diff`);
+		expect(
+			urls.slice(0, 3).every((url) => url.searchParams.get("workspaceKey") === target.workspaceKey),
+		).toBe(true);
+		expect(urls[0]?.searchParams.size).toBe(1);
+		for (const index of [1, 2, 4]) expect(urls[index]?.searchParams.get("file")).toBe(file);
+		for (const index of [1, 4]) expect(urls[index]?.searchParams.get("oldPath")).toBe(oldPath);
+		expect(urls[1]?.searchParams.size).toBe(3);
+		expect(urls[2]?.searchParams.has("oldPath")).toBe(false);
+		expect(urls[3]?.pathname).toBe(`/api/chapters/chapter%20%2F%3F%23/git/commits/${sha256}`);
+		expect(urls[4]?.pathname).toBe(`${urls[3]?.pathname}/diff`);
+		expect(urls.slice(3).every((url) => !url.searchParams.has("workspaceKey"))).toBe(true);
+		expect(calls.every(({ init }) => (init?.method ?? "GET") === "GET" && !init?.body)).toBe(true);
+		expect(calls.every(({ init }) => init?.signal && !init.signal.aborted)).toBe(true);
+		controller.abort("preview closed");
+		expect(calls.every(({ init }) => init?.signal?.aborted)).toBe(true);
+		expect(calls.every(({ init }) => init?.signal?.reason === "preview closed")).toBe(true);
+		clearToken();
+	});
+
+	test.each(["detail", "diff"] as const)("aborts an in-flight commit %s read", async (kind) => {
+		installLocalStorage();
+		const captured: { signal?: AbortSignal | null } = {};
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: (_input: RequestInfo | URL, init?: RequestInit) => {
+				captured.signal = init?.signal;
+				return new Promise<Response>((_resolve, reject) => {
+					init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), {
+						once: true,
+					});
+				});
+			},
+		});
+		const controller = new AbortController();
+		const target: GitTarget = { narratorId: "n", workspaceKey: "w", canWrite: false };
+		const pending =
+			kind === "detail"
+				? api.getGitCommitDetail(target, "a".repeat(40), controller.signal)
+				: api.getGitCommitDiff(target, "a".repeat(40), "file.txt", undefined, controller.signal);
+		const reason = new DOMException("Preview closed", "AbortError");
+		controller.abort(reason);
+		await expect(pending).rejects.toBe(reason);
+		expect(captured.signal?.aborted).toBe(true);
+	});
+
 	test("a stale workspace conflict is surfaced without replaying the write", async () => {
 		installLocalStorage();
 		let calls = 0;

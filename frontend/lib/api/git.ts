@@ -1,3 +1,4 @@
+import type { GitCommitDetail, GitCommitPatch } from "@shared/git-commit-preview";
 import type { GitWorkspace } from "@shared/git-workspace";
 import { request } from "./client";
 import type { ApiEntity } from "./types";
@@ -131,6 +132,24 @@ export const gitApi = {
 		}),
 	getGitLog: (target: GitTarget, limit = 50, skip = 0, signal?: AbortSignal) =>
 		gitRequest<GitLogEntry[]>(gitReadPath(target, `/log?limit=${limit}&skip=${skip}`), { signal }),
+	getGitCommitDetail: (target: GitTarget, sha: string, signal?: AbortSignal) =>
+		gitRequest<GitCommitDetail>(gitReadPath(target, `/commits/${encodeURIComponent(sha)}`), {
+			signal,
+		}),
+	getGitCommitDiff: (
+		target: GitTarget,
+		sha: string,
+		file: string,
+		oldPath?: string,
+		signal?: AbortSignal,
+	) => {
+		const params = new URLSearchParams({ file });
+		if (oldPath) params.set("oldPath", oldPath);
+		return gitRequest<GitCommitPatch>(
+			gitReadPath(target, `/commits/${encodeURIComponent(sha)}/diff?${params}`),
+			{ signal },
+		);
+	},
 	gitReset: (target: GitTarget, commit: string, mode: "soft" | "hard") =>
 		gitRequest<ApiEntity>(`${gitBasePath(target)}/reset`, {
 			method: "POST",

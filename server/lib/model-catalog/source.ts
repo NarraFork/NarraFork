@@ -3,27 +3,31 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { gunzipSync } from "node:zlib";
-import type { CatalogDocument } from "@shared/model-catalog/schema/catalog";
-import { validateCatalog } from "@shared/model-catalog/src/index";
 import {
 	decimalValue,
 	multiplyDecimal,
+	type RawCatalog,
 	rawCatalogFromModelFiles,
 	validateRawMetadata,
-	type RawCatalog,
 } from "@shared/model-catalog/card";
 import { legacyMetadataToRaw } from "@shared/model-catalog/card-resolver";
+import type { CatalogDocument } from "@shared/model-catalog/schema/catalog";
+import { validateCatalog } from "@shared/model-catalog/src/index";
 
+// Commit details include file patches; branch metadata keeps checks independent of diff size.
 export const CATALOG_REVISION_URL =
-	"https://api.github.com/repos/NarraFork/narrafork-model-catalog/commits/main";
+	"https://api.github.com/repos/NarraFork/narrafork-model-catalog/branches/main";
 export const CATALOG_ARCHIVE_BASE =
 	"https://codeload.github.com/NarraFork/narrafork-model-catalog/tar.gz/";
+export const MAX_CATALOG_REVISION_BYTES = 1024 * 1024;
 export const MAX_CATALOG_BYTES = 16 * 1024 * 1024;
 
 export function parseCatalogRevision(value: unknown): { version: string; publishedAt: string } {
-	const revision = value as { sha?: string; commit?: { committer?: { date?: string } } } | null;
-	const version = revision?.sha;
-	const publishedAt = revision?.commit?.committer?.date;
+	const branch = value as {
+		commit?: { sha?: string; commit?: { committer?: { date?: string } } };
+	} | null;
+	const version = branch?.commit?.sha;
+	const publishedAt = branch?.commit?.commit?.committer?.date;
 	if (
 		typeof version !== "string" ||
 		!/^[a-f0-9]{40}$/.test(version) ||
