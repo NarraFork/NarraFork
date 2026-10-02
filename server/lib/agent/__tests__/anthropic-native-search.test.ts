@@ -161,6 +161,39 @@ describe("main conversation request", () => {
 });
 
 describe("performWebSearch side request", () => {
+	test.each([
+		"ok",
+		"See https://a.example",
+	])("text-only response is a channel failure: %s", async (text) => {
+		installFetchCapture(CHAT_SSE.replace('"text":"ok"', `"text":${JSON.stringify(text)}`));
+		const provider = new AnthropicProvider(providerConfig());
+		await expect(
+			provider.performWebSearch({ model: MODEL, query: "narrafork release notes" }),
+		).rejects.toThrow("no search result evidence");
+	});
+
+	test("a server search invocation without its result is not a completed search", async () => {
+		const invocationOnlySse =
+			'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"narrafork"}}}\n\n' +
+			CHAT_SSE;
+		installFetchCapture(invocationOnlySse);
+		const provider = new AnthropicProvider(providerConfig());
+		await expect(
+			provider.performWebSearch({ model: MODEL, query: "narrafork release notes" }),
+		).rejects.toThrow("no search result evidence");
+	});
+
+	test("a real empty search result succeeds without text or URLs", async () => {
+		const emptyResultsSse =
+			'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[]}}\n\n' +
+			'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+		installFetchCapture(emptyResultsSse);
+		const provider = new AnthropicProvider(providerConfig());
+		await expect(
+			provider.performWebSearch({ model: MODEL, query: "narrafork release notes" }),
+		).resolves.toEqual({ text: "", sources: [] });
+	});
+
 	test("matches the CLI one-shot shape and flattens results", async () => {
 		installFetchCapture(SEARCH_SSE);
 		const provider = new AnthropicProvider(providerConfig());

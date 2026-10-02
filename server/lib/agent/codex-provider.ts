@@ -862,7 +862,8 @@ export class CodexProvider implements ProviderAdapter {
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
 		appendCodexNativeTools(tools, params.model, {
-			webSearch: this.useWebSearch && isNativeSearchChannelFirstEnabled(),
+			webSearch:
+				this.useWebSearch && isNativeSearchChannelFirstEnabled(undefined, "codex", params.model),
 			imageGeneration: this.useImageGeneration,
 		});
 		request.tools = tools;

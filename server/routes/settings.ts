@@ -31,7 +31,7 @@ import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { reconcileNugRelayClients } from "../lib/nug-relay/manager";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
-import { executeSearch, listSearchChannels } from "../lib/search/router";
+import { listSearchChannels, testSearchChannel } from "../lib/search/router";
 import { normalizeSearchSettings } from "../lib/search/settings";
 import { scheduleServerRestart } from "../lib/server-restart";
 import {
@@ -806,6 +806,22 @@ function restoreMaskedSearchProviderBaseUrl(
 	}
 }
 
+function restoreMaskedSearchProvider(
+	provider: NonNullable<NarraForkSettings["search"]>["customProviders"][number],
+	existing: NonNullable<NarraForkSettings["search"]>["customProviders"][number] | undefined,
+): void {
+	if (provider.apiKey?.startsWith("*")) provider.apiKey = existing?.apiKey ?? "";
+	const headers = provider.headers;
+	if (headers) {
+		for (const [key, value] of Object.entries(headers)) {
+			if (isSensitiveHeaderName(key) && value.startsWith("*")) {
+				headers[key] = existing?.headers?.[key] ?? "";
+			}
+		}
+	}
+	restoreMaskedSearchProviderBaseUrl(provider, existing);
+}
+
 function maskSearchSettings(search: NarraForkSettings["search"]): NarraForkSettings["search"] {
 	if (!search) return undefined;
 	return {
@@ -1300,6 +1316,8 @@ const testSearchSchema = z.object({
 	query: z.string().min(2).max(1000),
 	purpose: z.string().max(1000).optional(),
 	channelId: z.string().optional(),
+	channel: searchChannelSchema.optional(),
+	customProvider: customSearchProviderSchema.optional(),
 });
 
 settingsRoutes.post("/search/test", requireAdmin, async (c) => {
@@ -1308,14 +1326,25 @@ settingsRoutes.post("/search/test", requireAdmin, async (c) => {
 	if (!parsed.success) {
 		throw new ValidationError(parsed.error.issues.map((i) => i.message).join(", "));
 	}
+	const customProvider = parsed.data.customProvider;
+	if (customProvider) {
+		restoreMaskedSearchProvider(
+			customProvider,
+			settings.search?.customProviders.find((item) => item.id === customProvider.id),
+		);
+	}
 	try {
-		const result = await executeSearch({
-			query: parsed.data.query,
-			purpose: parsed.data.purpose,
-			channelId: parsed.data.channelId,
-			locale: "zh-CN",
-			signal: c.req.raw.signal,
-		});
+		const result = await testSearchChannel(
+			{
+				query: parsed.data.query,
+				purpose: parsed.data.purpose,
+				channelId: parsed.data.channelId,
+				locale: "zh-CN",
+				signal: c.req.raw.signal,
+				userId: c.get("user").sub,
+			},
+			{ channel: parsed.data.channel, customProvider: parsed.data.customProvider },
+		);
 		return c.json(result);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
@@ -1518,17 +1547,7 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 			const currentProviders = current.search?.customProviders ?? [];
 			for (const p of validated.search.customProviders) {
 				const existing = currentProviders.find((cp) => cp.id === p.id);
-				if (p.apiKey?.startsWith("*")) {
-					p.apiKey = existing?.apiKey ?? "";
-				}
-				if (p.headers) {
-					for (const [key, value] of Object.entries(p.headers)) {
-						if (isSensitiveHeaderName(key) && value.startsWith("*")) {
-							p.headers[key] = existing?.headers?.[key] ?? "";
-						}
-					}
-				}
-				restoreMaskedSearchProviderBaseUrl(p, existing);
+				restoreMaskedSearchProvider(p, existing);
 			}
 		}
 
