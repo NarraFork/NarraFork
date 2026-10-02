@@ -75,7 +75,10 @@ test.each([
 		expect(prepared.trailingUserText).toBeUndefined();
 		expect(prepared.history).toEqual(
 			expect.arrayContaining([
-				expect.objectContaining({ role: "system", content: "fresh injection" }),
+				expect.objectContaining({
+					role: "system",
+					content: '<sender kind="system" />\nfresh injection',
+				}),
 			]),
 		);
 	} else {
@@ -161,7 +164,7 @@ test("empty prompt recovers the popped user but pure tool results never invent c
 		...options(),
 		sourceMessages: [message("u", "user", "actual accepted text")],
 	});
-	expect(recovered.currentText).toBe("actual accepted text");
+	expect(recovered.currentText).toBe('<sender kind="human" />\nactual accepted text');
 	expect(recovered.history).toEqual([]);
 	const tool = message("tool", "assistant", "");
 	tool.contentJson = [{ type: "tool_use", id: "call", name: "Read", input: { path: "x" } }];
@@ -191,7 +194,9 @@ test("current text stays distinct from extracted sys and source attachment metad
 		sourceMessages: source,
 		currentInput: "new principal input",
 	});
-	expect(prepared.currentText).toBe("pending notice\n\nnew principal input");
+	expect(prepared.currentText).toBe(
+		'<sender kind="system" />\npending notice\n\n<sender kind="system" />\nnew principal input',
+	);
 	expect(prepared.sourceMessages).toBe(source);
 });
 
@@ -253,7 +258,7 @@ test("real loader plus currentRevision adoption retain exact history identity an
 		contentJson: [{ type: "text", text: "edited current" }],
 	});
 	const first = await buildRuntimeHistory(options());
-	expect(first.currentText).toBe("edited current");
+	expect(first.currentText).toBe('<sender kind="human" />\nedited current');
 	expect(store.getByDelivery(row.deliveryId as string)?.currentAdoptedAt).toBeNull();
 	consumeAgentMessageHistory([...first.history], first.currentText);
 	consumeAgentMessageHistory(first.history, "other replacement input");
@@ -270,4 +275,69 @@ test("real loader plus currentRevision adoption retain exact history identity an
 		db.select().from(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, saved.id)).get()
 			?.injectionConsumedAt,
 	).toBeInstanceOf(Date);
+});
+
+test("grouped extracted sys receipts require the exact projected packet before adoption", async () => {
+	const owner = tryClaimExecution("primary", "primary");
+	if (!owner) throw new Error("Missing owner");
+	const store = createMailboxStore(db);
+	const result = store.enqueue({
+		kind: "user_input",
+		narratorId: "primary",
+		text: "one\ntwo",
+		projectedByteSize: 7,
+		requestKey: "grouped-sender-receipt",
+	});
+	if (result.status !== "accepted") throw new Error(result.status);
+	const row = store.claimBatch("primary", { token: "claim", epoch: owner.epoch })[0];
+	await narratorPersistence.persistSystemMessage(
+		"primary",
+		"one\ntwo",
+		[
+			{
+				type: "system_injection",
+				source: "subagent_message",
+				modelText: "one\ntwo",
+				body: {
+					kind: "messages",
+					items: [
+						{ fromId: "agent-a", fromTitle: "A", text: "one" },
+						{ fromId: "agent-b", fromTitle: "B", text: "two" },
+					],
+				},
+			},
+		],
+		undefined,
+		undefined,
+		{
+			mailboxClaim: {
+				id: row.id,
+				narratorId: row.narratorId,
+				token: row.claimToken as string,
+				epoch: row.claimEpoch as string,
+			},
+		},
+	);
+	const prepared = await buildRuntimeHistory(options());
+	expect(prepared.currentText).toContain('<sender kind="agent" id="agent-a" name="A" />\none');
+	expect(prepared.currentText).toContain('<sender kind="agent" id="agent-b" name="B" />\ntwo');
+	consumeAgentMessageHistory(prepared.history, "unrelated replacement input");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeNull();
+	const accepted = await buildRuntimeHistory(options());
+	consumeAgentMessageHistory(accepted.history, accepted.currentText);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).not.toBeNull();
+});
+
+test("an already prepared initial packet is not attributed or extracted twice", async () => {
+	const source = message("sys", "sys", "prepared context");
+	const first = await buildRuntimeHistory({ ...options(), sourceMessages: [source] });
+	const resumed = await buildRuntimeHistory({
+		...options(),
+		sourceMessages: [source],
+		currentInput: first.currentText,
+	});
+	expect(resumed.currentInputText).toBe(first.currentText);
+	expect(resumed.currentInputText.match(/<sender /g)).toHaveLength(1);
 });

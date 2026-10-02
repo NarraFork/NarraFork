@@ -1366,6 +1366,7 @@ interface ForegroundLoopInput {
 	userId?: string | null;
 	systemPrompt: string;
 	initialHistory: unknown[];
+	initialCurrentText?: string;
 	initialTrailingToolResults?: unknown[];
 	customDef: Awaited<ReturnType<typeof customSubagentService.loadByName>> | null;
 	rebuildSystemPrompt?: (contextSummary?: string | null) => Promise<string>;
@@ -1623,6 +1624,7 @@ function startForegroundRunUnlocked(
 					userId: currentUserId,
 					systemPrompt: currentSystemPrompt,
 					initialHistory: currentHistory,
+					initialCurrentText: input.initialCurrentText,
 					initialTrailingToolResults: currentTrailingToolResults,
 					customDef,
 					rebuildSystemPrompt,
@@ -2093,10 +2095,20 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	}
 
 	// 2. Persist subagent's user message (linked to parent's tool_use)
-	await narratorService.persistSubagentUserMessage(subagentId, prompt, toolUseId).catch((error) => {
-		updateLease.release();
-		throw error;
-	});
+	await narratorService
+		.persistSubagentUserMessage(subagentId, prompt, toolUseId, {
+			createdBy: userId,
+			sender: {
+				id: parentNarratorId,
+				title: parent.title,
+				label: parent.title || "parent",
+				isParent: true,
+			},
+		})
+		.catch((error) => {
+			updateLease.release();
+			throw error;
+		});
 
 	// Broadcast subagent_started after persist so the frontend only sees it
 	// when the subagent record is fully consistent (narrator + user message).
@@ -2563,6 +2575,7 @@ async function startContinuedSubagentUnlocked(
 		if (input.mailboxInput && !mailboxInput)
 			throw new ValidationError("Mailbox head is not available for this wake");
 		const currentInput =
+			mailboxInput?.currentInput ??
 			mailboxInput?.prompt ??
 			projectFileReferenceText(
 				userMessage?.contentText ?? prompt ?? "",
@@ -2634,6 +2647,8 @@ async function startContinuedSubagentUnlocked(
 							: (input.createdBy ?? null),
 				systemPrompt,
 				initialHistory: rebuilt.history,
+				initialCurrentText:
+					mailboxInput?.prompt ?? ("currentText" in rebuilt ? rebuilt.currentText : undefined),
 				initialTrailingToolResults: rebuilt.trailingToolResults,
 				customDef,
 				rebuildSystemPrompt,

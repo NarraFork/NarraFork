@@ -15,6 +15,7 @@ import {
 	acknowledgePipelineExitConfirmation,
 	clearPipelineStateIfActive,
 } from "../../lib/agent/pipeline-state";
+import { projectMessageSenderText } from "../../lib/agent/sender-projection";
 import { detectShell } from "../../lib/agent/shell";
 import { getMissingWorkingDirectoryRecovery, SHELL_TOOL_NAME } from "../../lib/agent/tools/bash";
 import { clearBehaviorFenceEditGrant } from "../../lib/agent/tools/behavior-fence-grant";
@@ -1484,7 +1485,10 @@ export async function runAgentLoopUnlocked(
 			// Run one agent loop pass
 
 			// Preserve the exact prepared packet: a pure tool replay never gets synthetic text.
-			let effectiveText = usesInitialHistory ? runState.input.text : preparedHistory.currentText;
+			let effectiveText =
+				usesInitialHistory && profile.kind === "subagent"
+					? (profile.initialCurrentText ?? preparedHistory.currentInputText)
+					: preparedHistory.currentText;
 			const _isPureToolResultReplay = !effectiveText.trim() && trailingToolResults.length > 0;
 
 			// Passive knowledge injection (point A): when this turn carries real user text,
@@ -1533,7 +1537,7 @@ export async function runAgentLoopUnlocked(
 								hits,
 							});
 							for (const h of hits) knowledgeInjectedIds.add(h.entryId);
-							effectiveText = `${effectiveText}\n\n${block}`;
+							effectiveText = `${effectiveText}\n\n${projectMessageSenderText(knowledgeMessage, block)}`;
 						}
 					}
 				} catch (err) {

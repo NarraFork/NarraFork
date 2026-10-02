@@ -330,7 +330,7 @@ describe("real shared orchestrator profile contract", () => {
 			const result = await h.run();
 			expect(result).toMatchObject({ started: true, finalText: "finished", hasError: false });
 			expect(h.calls).toHaveLength(1);
-			expect(h.calls[0].userText).toBe("same input");
+			expect(h.calls[0].userText).toBe('<sender kind="system" />\nsame input');
 			expect(h.calls[0].config.model).toBe(MODEL);
 			expect(h.calls[0].eventContext).toMatchObject({
 				narratorId: h.session.narratorId,
@@ -458,7 +458,10 @@ describe("real shared orchestrator profile contract", () => {
 			]);
 			const result = await h.run();
 			expect(result.hasError).toBe(false);
-			expect(h.calls.map((call) => call.userText)).toEqual(["same input", ""]);
+			expect(h.calls.map((call) => call.userText)).toEqual([
+				'<sender kind="system" />\nsame input',
+				"",
+			]);
 			expect(
 				db.select().from(narratorMessages).where(eq(narratorMessages.role, "user")).all(),
 			).toEqual([]);
@@ -735,7 +738,10 @@ describe("real shared orchestrator profile contract", () => {
 				}),
 			).toBe(true);
 			expect((await run).hasError).toBe(false);
-			expect(h.calls.map((call) => call.userText)).toEqual(["same input", "manual resume"]);
+			expect(h.calls.map((call) => call.userText)).toEqual([
+				'<sender kind="system" />\nsame input',
+				'<sender kind="system" />\nmanual resume',
+			]);
 			expect(getExecutionOwner(h.session.narratorId)).toBe(h.owner);
 		} finally {
 			takeover.clearTakenOver(h.session.narratorId);
@@ -802,7 +808,10 @@ describe("real shared orchestrator profile contract", () => {
 			).toBe(true);
 			const result = await run;
 			expect(result.hasError).toBe(false);
-			expect(h.calls.map((call) => call.userText)).toEqual(["same input", "after stop"]);
+			expect(h.calls.map((call) => call.userText)).toEqual([
+				'<sender kind="system" />\nsame input',
+				'<sender kind="system" />\nafter stop',
+			]);
 		} finally {
 			takeover.clearTakenOver(h.session.narratorId);
 			manual.clearManualOverrideRuntimes();
@@ -870,7 +879,10 @@ describe("real shared orchestrator profile contract", () => {
 				}),
 			).toBe(true);
 			expect((await run).hasError).toBe(false);
-			expect(h.calls.map((call) => call.userText)).toEqual(["same input", "after backoff stop"]);
+			expect(h.calls.map((call) => call.userText)).toEqual([
+				'<sender kind="system" />\nsame input',
+				'<sender kind="system" />\nafter backoff stop',
+			]);
 		} finally {
 			takeover.clearTakenOver(h.session.narratorId);
 			manual.clearManualOverrideRuntimes();
@@ -929,3 +941,83 @@ describe("real shared orchestrator profile contract", () => {
 		expect(subagentSource).not.toContain("cleanupBufferedTextFiles(");
 	});
 });
+
+test("prepared child current packet preserves distinct knowledge and human senders", async () => {
+	const child = profiles.find((profile) => profile.kind === "subagent");
+	if (!child || child.kind !== "subagent") throw new Error("Missing child profile");
+	const packet =
+		'<sender kind="system" id="knowledge_hint" name="knowledge_hint" />\nRelevant context\n\n<sender kind="human" id="principal-a" name="principal-a" />\nHuman request';
+	const h = fixture({ ...child, initialCurrentText: packet }, [finished]);
+	const outcome = await h.run("Human request");
+	expect(outcome.hasError).toBe(false);
+	expect(h.calls).toHaveLength(1);
+	expect(h.calls[0].userText).toBe(packet);
+	expect(h.calls[0].userText.match(/Human request/g)).toHaveLength(1);
+	expect(h.calls[0].userText.match(/kind="human"/g)).toHaveLength(1);
+});
+
+for (const profile of profiles) {
+	test(`${profile.kind}: real keyword knowledge hit has the same system sender live and in history`, async () => {
+		const { knowledgeService } = await import("../knowledge-service");
+		const { narratorPersistence } = await import("../narrator-persistence");
+		const { buildRuntimeHistory } = await import("../agent-runtime/history");
+		const { projectMessageSenderText } = await import("../../lib/agent/sender-projection");
+		const previousMode = settings.knowledge.injectMode;
+		settings.knowledge.injectMode = "summary";
+		try {
+			const collection = await knowledgeService.createCollection({
+				name: `Sender knowledge ${profile.kind}`,
+				ownerUserId: "principal-a",
+			});
+			const keyword = `senderkeyword${profile.kind}`;
+			const entry = await knowledgeService.createEntry({
+				collectionId: collection.id,
+				title: `Sender regression ${profile.kind}`,
+				content: "Real knowledge evidence",
+				keywords: [keyword],
+				authorUserId: "principal-a",
+			});
+			const h = fixture(profile, [finished]);
+			h.session._currentUserId = "principal-a";
+			const request = `Please recall ${keyword}`;
+			await narratorPersistence.persistUserMessage(
+				h.session.narratorId,
+				request,
+				undefined,
+				undefined,
+				"principal-a",
+				undefined,
+				profile.kind === "subagent" ? { parentToolUseId: profile.parentToolUseId } : undefined,
+			);
+			expect((await h.run(request)).hasError).toBe(false);
+			expect(h.calls).toHaveLength(1);
+			const rawMessages = await (
+				await import("../narrator-service")
+			).narratorService.getModelHistorySinceLastCompact(h.session.narratorId);
+			const knowledge = rawMessages.find(
+				(message) => message.role === "sys" && message.contentText?.includes(entry.id),
+			);
+			if (!knowledge?.contentText)
+				throw new Error("Real keyword lookup did not persist a knowledge hit");
+			const projected = projectMessageSenderText(knowledge, knowledge.contentText);
+			expect(projected).toStartWith('<sender kind="system" />\n');
+			expect(h.calls[0].userText).toStartWith(
+				'<sender kind="human" id="principal-a" name="principal-a" />\n',
+			);
+			expect(h.calls[0].userText).toContain(`\n\n${projected}`);
+			expect(h.calls[0].userText.match(/<sender kind="system"/g)).toHaveLength(1);
+			expect(knowledge.contentText).not.toContain("<sender ");
+			const rebuilt = await buildRuntimeHistory({
+				narratorId: h.session.narratorId,
+				profile: profile.kind,
+				model: MODEL,
+				provider: "orchestratorfixture",
+				sourceMessages: rawMessages,
+			});
+			expect(JSON.stringify(rebuilt.history)).toContain(JSON.stringify(projected).slice(1, -1));
+			expect(h.session._currentUserId).toBe("principal-a");
+		} finally {
+			settings.knowledge.injectMode = previousMode;
+		}
+	});
+}

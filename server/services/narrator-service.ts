@@ -91,7 +91,7 @@ import {
 import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { agentMessageDeliveryBody } from "./agent-message-delivery";
-import { buildAgentMessageOrigin } from "./agent-message-origin";
+import { type AgentMessageSender, buildAgentMessageOrigin } from "./agent-message-origin";
 import type {
 	BlockAllSkillsResult,
 	BlockSkillResult,
@@ -1685,6 +1685,8 @@ export const narratorService = {
 			commandText?: string | null;
 			createdBy?: string | null;
 			origin?: MessageOriginOptions;
+			/** Agent dispatches have an author but are not Send deliveries/receipts. */
+			sender?: AgentMessageSender;
 			delivery?: import("./agent-message-delivery").AgentMessageDelivery;
 			mailboxClaim?: import("./agent-runtime/mailbox-types").MailboxClaim;
 		},
@@ -1693,8 +1695,8 @@ export const narratorService = {
 		if (delivery && delivery.recipientNarratorId !== narratorId) {
 			throw new ValidationError("Agent delivery recipient does not match message recipient");
 		}
-		const origin =
-			options?.origin ?? (delivery ? buildAgentMessageOrigin(delivery.sender) : undefined);
+		const author = delivery?.sender ?? options?.sender;
+		const origin = options?.origin ?? (author ? buildAgentMessageOrigin(author) : undefined);
 		const contentJson: Array<
 			| { type: "text"; text: string }
 			| PersistedUserImageBlock
@@ -1718,6 +1720,13 @@ export const narratorService = {
 		if (delivery) {
 			contentJson.push(
 				buildSystemInjectionBlock("subagent_message", agentMessageDeliveryBody(delivery)),
+			);
+		} else if (author) {
+			contentJson.push(
+				buildSystemInjectionBlock("subagent_message", {
+					kind: "messages",
+					items: [{ fromId: author.id, fromTitle: author.title, fromLabel: author.label, text }],
+				}),
 			);
 		}
 		const effectiveText =

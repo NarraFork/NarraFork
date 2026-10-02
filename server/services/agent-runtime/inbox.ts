@@ -1,7 +1,16 @@
 import { formatOriginLabel, type MessageOriginOptions } from "@shared/message-origin";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../../db";
-import { narratorBufferedMessages as mailbox, narrators, narratorToolCalls } from "../../db/schema";
+import {
+	narratorBufferedMessages as mailbox,
+	narrators,
+	narratorToolCalls,
+	users,
+} from "../../db/schema";
+import {
+	projectInjectionSenderText,
+	projectMessageSenderText,
+} from "../../lib/agent/sender-projection";
 import { AppError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
@@ -487,6 +496,44 @@ async function readClaimCommittedState(
 		.get();
 }
 
+async function inboxInjectionText(
+	narratorId: string,
+	options: import("../narrator-injection").DeliverInjectionOptions,
+): Promise<string> {
+	const text = options.content.trim();
+	if (options.role !== "user")
+		return projectInjectionSenderText(text, options.source, options.body);
+	let creator: { username: string } | null = null;
+	if (options.createdBy) {
+		try {
+			const refs = getNarratorMessageRefsPort();
+			creator = refs
+				? await refs.creator(options.createdBy)
+				: ((await db.query.users.findFirst({
+						where: eq(users.id, options.createdBy),
+						columns: { username: true },
+					})) ?? null);
+		} catch (error) {
+			logger.warn("Injection sender name unavailable", { narratorId, error: String(error) });
+		}
+	}
+	return projectMessageSenderText(
+		{
+			id: options.messageId ?? "",
+			narratorId,
+			role: "user",
+			createdBy: options.createdBy,
+			creator,
+			origin: "user",
+			parentToolUseId: null,
+			messageUuid: null,
+			contentText: text,
+			contentJson: [{ type: "system_injection", source: options.source, body: options.body }],
+		},
+		text,
+	);
+}
+
 /** A lost post-commit WS frame must not discard the already materialized model projection. */
 export async function deliverInboxInjection(
 	narratorId: string,
@@ -512,7 +559,8 @@ export async function deliverInboxInjection(
 			});
 			return {
 				messageId: committed.currentMessageId,
-				turnText: options.schedule === "onNextTurn" ? options.content.trim() : null,
+				turnText:
+					options.schedule === "onNextTurn" ? await inboxInjectionText(narratorId, options) : null,
 				started: false,
 				interjected: false,
 			};
@@ -539,7 +587,8 @@ export async function deliverInboxInjection(
 		});
 		return {
 			messageId: committed.currentMessageId,
-			turnText: options.schedule === "onNextTurn" ? options.content.trim() : null,
+			turnText:
+				options.schedule === "onNextTurn" ? await inboxInjectionText(narratorId, options) : null,
 			started: false,
 			interjected: false,
 		};
@@ -673,7 +722,7 @@ async function deliverClaimedInboxInjectionPg(
 		);
 		const result = {
 			messageId: reservedMessageId,
-			turnText: schedule === "onNextTurn" ? content : null,
+			turnText: schedule === "onNextTurn" ? await inboxInjectionText(narratorId, options) : null,
 			started: false,
 			interjected: false,
 		};

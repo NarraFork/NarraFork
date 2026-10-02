@@ -1,12 +1,20 @@
+import { modelTextFromContentBlocks } from "@shared/native-injection";
 import { buildHistory } from "../../lib/agent";
 import {
 	getFileReferenceSnapshots,
 	projectFileReferenceText,
 } from "../../lib/agent/file-reference-projection";
-import type { BuiltHistory, DbMessage } from "../../lib/agent/provider";
+import type { BuiltHistory } from "../../lib/agent/provider";
+import {
+	findCurrentSenderMessage,
+	projectMessageSenderForModel,
+	projectMessageSenderText,
+	projectSenderText,
+	type SenderMessage,
+} from "../../lib/agent/sender-projection";
 import { trackAgentMessageHistory } from "../agent-message-delivery";
 
-export type RuntimeHistoryMessage = DbMessage & {
+export type RuntimeHistoryMessage = SenderMessage & {
 	injectionConsumedAt?: Date | string | null;
 };
 
@@ -28,6 +36,8 @@ export interface PreparedRuntimeHistory extends BuiltHistory {
 	/** Detached rows that entered this particular provider build and receipt candidate registration. */
 	modelMessages: RuntimeHistoryMessage[];
 	currentText: string;
+	/** Projected caller packet only, for a subagent whose initial history is already prepared. */
+	currentInputText: string;
 	isPureToolResultReplay: boolean;
 	recoveredTrailingUserText: string | null;
 }
@@ -58,6 +68,36 @@ export function recoverRuntimeTrailingUserText(
 	return null;
 }
 
+function projectCurrentInput(messages: readonly RuntimeHistoryMessage[], text: string): string {
+	if (!text.trim()) return text;
+	const projectMatch = (message: RuntimeHistoryMessage): string | undefined => {
+		const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
+		const snapshots = getFileReferenceSnapshots(blocks);
+		const bodies = [message.contentText ?? "", modelTextFromContentBlocks(blocks)].map((value) =>
+			projectFileReferenceText(value, snapshots),
+		);
+		if (bodies.includes(text)) return projectMessageSenderText(message, text);
+		// Recognize only an exact server projection, never sender-like prose.
+		if (bodies.some((body) => projectMessageSenderText(message, body) === text)) return text;
+		return undefined;
+	};
+	// The accepted tail user owns current input. A same-text system hint appended
+	// after acceptance must not override that author. Never search older users.
+	const currentUser = findCurrentSenderMessage(messages);
+	if (currentUser) {
+		const projected = projectMatch(currentUser);
+		if (projected !== undefined) return projected;
+	}
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.parentToolUseId || message.role === "disp" || message.role === "system") continue;
+		if (message.role === "assistant" || message.role === "user") break;
+		const projected = projectMatch(message);
+		if (projected !== undefined) return projected;
+	}
+	// Unpersisted control/continuation text has no authenticated human author.
+	return projectSenderText(text, { kind: "system" });
+}
 /** No principal changes, attachment reads, mailbox draining, persistence or adoption happen here. */
 export async function buildRuntimeHistory(
 	options: RuntimeHistoryOptions,
@@ -95,10 +135,12 @@ export async function buildRuntimeHistory(
 	await trackAgentMessageHistory(
 		options.narratorId,
 		built.history,
-		modelMessages,
+		// Receipt guards must compare the same bytes the model receives, especially
+		// grouped agent messages whose markers are inserted between item bodies.
+		modelMessages.map(projectMessageSenderForModel),
 		built.trailingUserText,
 	);
-	const input = options.currentInput ?? "";
+	const input = projectCurrentInput(modelMessages, options.currentInput ?? "");
 	const combined = built.trailingUserText?.trim()
 		? input.trim()
 			? `${built.trailingUserText}\n\n${input}`
@@ -109,15 +151,21 @@ export async function buildRuntimeHistory(
 		combined.trim() || isPureToolResultReplay
 			? null
 			: recoverRuntimeTrailingUserText(modelMessages);
+	const recoveredMessage = findCurrentSenderMessage(modelMessages);
+	const recoveredModelText =
+		recoveredTrailingUserText && recoveredMessage
+			? projectMessageSenderText(recoveredMessage, recoveredTrailingUserText)
+			: recoveredTrailingUserText;
 	return {
 		...built,
 		sourceMessages,
 		modelMessages,
+		currentInputText: input,
 		currentText: isPureToolResultReplay
 			? ""
 			: combined.trim()
 				? combined
-				: (recoveredTrailingUserText ?? combined),
+				: (recoveredModelText ?? combined),
 		isPureToolResultReplay,
 		recoveredTrailingUserText,
 	};

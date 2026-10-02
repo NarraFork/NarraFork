@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators } from "../db/schema";
 import { projectFileReferenceText } from "../lib/agent/file-reference-projection";
+import { projectMessageSenderText } from "../lib/agent/sender-projection";
 import { buildAttachedFilesHint } from "../lib/attached-files";
 import { AppError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -143,6 +144,7 @@ export interface SubagentExecOptions {
 	systemPrompt: string;
 	/** Initial history (empty for new subagents, pre-loaded for continued) */
 	initialHistory: unknown[];
+	initialCurrentText?: string;
 	initialTrailingToolResults?: unknown[];
 	initialPrePromptBashCommand?: string;
 	/** Pre-loaded custom subagent definition (avoids redundant I/O) */
@@ -708,7 +710,7 @@ export async function loadSubagentHistory(
 	model: string,
 	provider: string,
 	currentInput?: string,
-): Promise<import("../lib/agent/provider").BuiltHistory> {
+): Promise<import("../lib/agent/provider").BuiltHistory & { currentText?: string }> {
 	return buildRuntimeHistory({
 		narratorId,
 		model,
@@ -889,7 +891,10 @@ export async function consumeBufferedSubagentMessageInPass(opts: {
 			locale: activeNarrators.get(opts.narratorId)?.locale,
 			inPass: true,
 		});
-		const text = projectFileReferenceText(claimed.buffered.text, claimed.buffered.fileReferences);
+		const text = projectMessageSenderText(
+			{ ...claimed.userMsg, messageUuid: null },
+			projectFileReferenceText(claimed.buffered.text, claimed.buffered.fileReferences),
+		);
 		return { buffered: claimed.buffered, text: hint ? `${text}\n\n${hint}` : text };
 	} catch (error) {
 		logger.error("Failed to persist injected subagent user message; retained for retry", {
@@ -988,11 +993,13 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 		// Match the primary loop's currentTurnText: only prepend context the builder
 		// extracted. Official Anthropic keeps sys as system history, so replaying the
 		// persisted hint itself here would inject it twice.
-		const prompt = rebuilt.trailingUserText?.trim()
-			? modelText.trim()
-				? `${rebuilt.trailingUserText}\n\n${modelText}`
-				: rebuilt.trailingUserText
-			: modelText;
+		const prompt =
+			rebuilt.currentText ??
+			(rebuilt.trailingUserText?.trim()
+				? modelText.trim()
+					? `${rebuilt.trailingUserText}\n\n${modelText}`
+					: rebuilt.trailingUserText
+				: modelText);
 		return {
 			prompt,
 			currentInput: modelText,
@@ -1237,6 +1244,7 @@ async function runSubagentRuntime(
 			initialModel: opts.model,
 			rebuildSystemPrompt: opts.rebuildSystemPrompt,
 			initialHistory: opts.initialHistory,
+			initialCurrentText: opts.initialCurrentText,
 			initialTrailingToolResults: opts.initialTrailingToolResults,
 			initialPrePromptBashCommand: opts.initialPrePromptBashCommand,
 			control: opts.control,

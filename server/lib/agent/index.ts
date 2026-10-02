@@ -15,6 +15,7 @@ import {
 	resolveProviderAndModel,
 } from "./provider";
 import { withReasoningMandatoryFallback } from "./reasoning-mandatory-fallback";
+import { projectMessageSenderForModel } from "./sender-projection";
 import { stripCitationMarkersForModel } from "./strip-citation-markers";
 import { stripPlanBodyForModel } from "./strip-plan-body";
 import "./tools";
@@ -93,11 +94,16 @@ export async function buildHistory(
 	// which only breaks once several turns accumulate: the replayed history then
 	// carries duplicate ids and the API rejects the request with 400. Rename the
 	// later collisions in this in-memory copy — DB rows keep the original ids.
-	const uniqueMessages = uniquifyDbMessageToolUseIds(cleanedMessages, {
-		narratorId,
-		provider: resolved.provider,
-		model: resolved.model,
-	});
+	// Attribution is a model-only projection, after accepted file material. Roles and
+	// stored rows stay unchanged; every provider receives the same sender format.
+	const uniqueMessages = uniquifyDbMessageToolUseIds(
+		cleanedMessages.map(projectMessageSenderForModel),
+		{
+			narratorId,
+			provider: resolved.provider,
+			model: resolved.model,
+		},
+	);
 	return resolved.adapter.buildHistory(uniqueMessages, resolved.model, narratorId);
 }
 
