@@ -134,6 +134,34 @@ test("remote commit preview uses read RPCs with pinned roots, cancellation and b
 	expect(f.calls.every((call) => call.signal?.aborted)).toBe(true);
 });
 
+test("remote double-section patches require exact complete scoped typechange evidence", async () => {
+	const f = backendFixture();
+	const git = createRemoteGitService(f.backend);
+	const diff = "diff --git a/file b/file\nfirst\ndiff --git a/file b/file\nsecond\n";
+	for (const evidence of [
+		undefined,
+		"M\0file\0",
+		"T\0other\0",
+		"T\0file\0M\0extra\0",
+		"T\0file\0R100\0partial\0",
+		"T\0file",
+	]) {
+		f.respond({
+			stdout: diff,
+			outputs: evidence === undefined ? {} : { typechangeNameStatus: evidence },
+		});
+		await expect(git.getCommitPatch("/repo", PREVIEW_SHA, "file")).rejects.toThrow();
+	}
+	f.respond({ stdout: diff, outputs: { typechangeNameStatus: "T\0file\0" } });
+	expect((await git.getCommitPatch("/repo", PREVIEW_SHA, "file")).diff).toBe(diff);
+	await expect(git.getCommitPatch("/repo", PREVIEW_SHA, "file", "forged")).rejects.toThrow();
+	f.respond({
+		stdout: `${diff}diff --git a/extra b/extra\n`,
+		outputs: { typechangeNameStatus: "T\0file\0" },
+	});
+	await expect(git.getCommitPatch("/repo", PREVIEW_SHA, "file")).rejects.toThrow("single file");
+});
+
 test("remote commit preview preserves independent metadata and list truncation boundaries", async () => {
 	const f = backendFixture();
 	const git = createRemoteGitService(f.backend);

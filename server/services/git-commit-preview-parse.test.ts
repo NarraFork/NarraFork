@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { GIT_COMMIT_PREVIEW_MESSAGE_MAX_BYTES } from "@shared/git-commit-preview";
 import {
+	assertSingleFilePatch,
 	buildCommitDetail,
 	parseCommitFiles,
 	parseCommitMeta,
@@ -25,6 +26,19 @@ const meta = (message: string) =>
 	].join("\0");
 
 describe("commit preview complete-record parsing", () => {
+	test("two patch sections require a verified matching typechange without a rename source", () => {
+		const diff = "diff --git a/file b/file\nfirst\ndiff --git a/file b/file\nsecond\n";
+		const entry = { status: "typechange" as const, path: "file" };
+		expect(() => assertSingleFilePatch(diff, "file", entry)).not.toThrow();
+		expect(() => assertSingleFilePatch(diff, "file")).toThrow("single file");
+		expect(() => assertSingleFilePatch(diff, "file", { ...entry, path: "other" })).toThrow();
+		expect(() => assertSingleFilePatch(diff, "file", { ...entry, status: "modified" })).toThrow();
+		expect(() => assertSingleFilePatch(diff, "file", { ...entry, oldPath: "source" })).toThrow();
+		expect(() =>
+			assertSingleFilePatch(`${diff}diff --git a/extra b/extra\n`, "file", entry),
+		).toThrow();
+	});
+
 	test("metadata preserves multiline message and caps actual UTF-8 bytes", () => {
 		const small = parseCommitMeta(meta("subject\n\nbody\n"), false);
 		expect(small).toMatchObject({

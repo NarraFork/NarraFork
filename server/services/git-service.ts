@@ -1593,7 +1593,8 @@ export const gitService = {
 			if (
 				records.length !== 1 ||
 				records[0]?.path !== entry.path ||
-				records[0]?.oldPath !== entry.oldPath
+				records[0]?.oldPath !== entry.oldPath ||
+				records[0]?.status !== entry.status
 			)
 				throw new ValidationError("Commit preview path must name a single changed file");
 			const result = await execRead(
@@ -1604,7 +1605,7 @@ export const gitService = {
 			);
 			if (result.exitCode !== 0)
 				throw new GitError(gitFailureMessage("Git commit patch failed", result));
-			assertSingleFilePatch(result.stdout, file);
+			assertSingleFilePatch(result.stdout, file, records[0]);
 			return { diff: result.stdout, truncated: result.truncated === true };
 		});
 	},

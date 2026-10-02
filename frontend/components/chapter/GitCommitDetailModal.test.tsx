@@ -14,6 +14,7 @@ import { I18nextProvider, initReactI18next } from "react-i18next";
 import { gitWorkspaceTarget, useGitWorkspace } from "../../hooks/useGit";
 import { ApiError, api } from "../../lib/api";
 import { type GitTarget, type GitWorkspace, gitTargetKey } from "../../lib/api/git";
+import { resetAppBaseForTest } from "../../lib/base-path";
 import commonLocale from "../../locales/en/common.json";
 import gitLocale from "../../locales/en/git.json";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
@@ -286,6 +287,7 @@ function renderWorkspacePreview() {
 }
 
 beforeEach(async () => {
+	resetAppBaseForTest();
 	installDom();
 	if (!i18n.isInitialized) {
 		await i18n.use(initReactI18next).init({
@@ -319,6 +321,7 @@ afterEach(async () => {
 	container.remove();
 	mock.restore();
 	restoreDom();
+	resetAppBaseForTest();
 });
 afterAll(disposeCanvas);
 
@@ -712,6 +715,34 @@ describe("Git commit preview with real query observers", () => {
 });
 
 describe("shared GitCommitPreview interactions", () => {
+	test.each([
+		"/nf/",
+		"/proxy/7778/",
+	])("native links and copied links retain mount %s", async (base) => {
+		Object.defineProperty(document, "baseURI", {
+			configurable: true,
+			value: `https://preview.example${base}`,
+		});
+		Object.defineProperty(globalThis, "location", {
+			configurable: true,
+			value: { origin: "https://preview.example", href: `https://preview.example${base}` },
+		});
+		spyOn(api, "getGitCommitDetail").mockResolvedValue(detail());
+		const writeText = mock(async (_value: string) => {});
+		Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+		renderUi(<GitCommitPreview target={TARGET} sha={SHA_A} selectedPath={RENAMED_FILE} />);
+		await waitForFiles();
+		const preview = element("[data-commit-open-page]").getAttribute("href") ?? "";
+		expect(new URL(preview, location.origin).pathname).toBe(
+			`${base}git/narrators/${TARGET.narratorId}/commits/${SHA_A}`,
+		);
+		expect(element(`[data-commit-parent="${PARENT}"]`).getAttribute("href")).toContain(
+			`${base}git/narrators/${TARGET.narratorId}/commits/${PARENT}`,
+		);
+		click("[data-commit-copy-link]");
+		await waitFor(() => writeText.mock.calls.length === 1, "copied mounted link");
+		expect(writeText.mock.calls[0]?.[0]).toBe(`${location.origin}${preview}`);
+	});
 	test("copies the full SHA and an absolute link with the current file and workspace", async () => {
 		spyOn(api, "getGitCommitDetail").mockResolvedValue(detail());
 		const writeText = mock(async (_value: string) => {});

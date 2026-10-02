@@ -15,7 +15,7 @@ import { useGitLog, useGitReset } from "../../hooks/useGit";
 import { useChapterSplitCapability } from "../../hooks/usePlatform";
 import { type GitTarget, gitBasePath, gitCanWrite, gitTargetKey } from "../../lib/api/git";
 import { formatRelativeTime } from "../../lib/format";
-import { buildCommitPreviewHref } from "../../lib/git-commit-preview-navigation";
+import { buildCommitPreviewBrowserHref } from "../../lib/git-commit-preview-navigation";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { ChapterSplitModal } from "./ChapterSplitModal";
 import { GitCommitDetailModal } from "./GitCommitDetailModal";
@@ -112,7 +112,7 @@ function GitCommitsContent({ target }: { target: GitTarget }) {
 							{/* The row body opens the read-only preview; the menu keeps its own click. */}
 							<UnstyledButton
 								component="a"
-								href={buildCommitPreviewHref(target, c.sha)}
+								href={buildCommitPreviewBrowserHref(target, c.sha)}
 								onClick={(event) => {
 									// Preserve native link actions (new tab, middle click, copy address).
 									if (

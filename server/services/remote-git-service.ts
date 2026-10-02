@@ -298,7 +298,16 @@ export function createRemoteGitService(
 					throw new ValidationError("Commit preview path must name a single changed file");
 			}
 			const diff = result.stdout ?? "";
-			assertSingleFilePatch(diff, file);
+			// Only the executor's complete, scoped T record authorizes a second section.
+			// Do not infer it from patch headers, a caller flag, or an unscoped list.
+			const scoped = result.outputs?.typechangeNameStatus;
+			if (scoped !== undefined && (scoped !== `T\0${file}\0` || oldPath))
+				throw new ValidationError("Invalid scoped commit typechange record");
+			assertSingleFilePatch(
+				diff,
+				file,
+				scoped === undefined ? undefined : { status: "typechange", path: file },
+			);
 			return { diff, truncated: result.truncated ?? false };
 		},
 	};

@@ -1,6 +1,7 @@
 import { GIT_COMMIT_SHA_PATTERN } from "@shared/git-commit-preview";
 import { defaultStringifySearch } from "@tanstack/react-router";
 import type { GitTarget } from "./api/git";
+import { assetUrl } from "./base-path";
 
 export const COMMIT_PREVIEW_FILE_MAX_LENGTH = 4096;
 const WORKSPACE_KEY_MAX_LENGTH = 4096;
@@ -30,6 +31,7 @@ export function validateCommitPreviewSearch(search: Record<string, unknown>): Co
 	return { file: file as string | undefined, workspaceKey: workspaceKey as string | undefined };
 }
 
+/** Internal Router address; its basepath is added by Router navigation. */
 export function buildCommitPreviewHref(
 	target: GitTarget,
 	sha: string,
@@ -50,4 +52,13 @@ export function buildCommitPreviewHref(
 	);
 	const query = params.toString();
 	return `/git/${owner}/commits/${sha.toLowerCase()}${query ? `?${query}` : ""}`;
+}
+
+/** Browser address for native anchors and copied links, including the app mount. */
+export function buildCommitPreviewBrowserHref(
+	target: GitTarget,
+	sha: string,
+	file?: string | null,
+): string {
+	return assetUrl(buildCommitPreviewHref(target, sha, file));
 }

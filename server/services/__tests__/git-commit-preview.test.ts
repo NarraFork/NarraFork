@@ -7,8 +7,10 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ExecutionBackend } from "../../lib/agent/execution/backend";
 import { safeSpawn } from "../../lib/spawn";
 import { gitService } from "../git-service";
+import { createRemoteGitService } from "../remote-git-service";
 
 const tempDirs: string[] = [];
 afterAll(() => {
@@ -174,6 +176,45 @@ describe("gitService.getCommitDetail", () => {
 });
 
 describe("commit preview boundaries", () => {
+	test("symlink and regular-file transitions preview both sections locally and remotely", async () => {
+		const dir = await repo();
+		const path = "type change.txt";
+		// Construct actual Git index modes, independent of host symlink privileges.
+		for (const [mode, content] of [
+			["120000", "target"],
+			["100644", "regular content\n"],
+			["120000", "other-target"],
+		]) {
+			writeFileSync(join(dir, path), content);
+			const blob = await git(["hash-object", "-w", "--", path], dir);
+			await git(["update-index", "--add", "--cacheinfo", `${mode},${blob},${path}`], dir);
+			await git(["commit", "-m", `mode ${mode}`], dir);
+			const sha = await git(["rev-parse", "HEAD"], dir);
+			if (content === "target") continue;
+			const detail = await gitService.getCommitDetail(dir, sha);
+			expect(detail.files).toHaveLength(1);
+			expect(detail.files[0]).toMatchObject({ path, status: "typechange" });
+			const patch = await gitService.getCommitPatch(dir, sha, path);
+			expect(patch.truncated).toBe(false);
+			expect(patch.diff.match(/^diff --git /gm)).toHaveLength(2);
+			expect(patch.diff).toContain(`new file mode ${mode}`);
+			expect(patch.diff).toContain(`deleted file mode ${mode === "120000" ? "100644" : "120000"}`);
+			const backend = {
+				kind: "remote",
+				supportsGitWorkspace: true,
+				supportsGitCommitPreview: true,
+				gitWorkspace: async () => ({
+					stdout: patch.diff,
+					outputs: { found: "1", fileStatus: "ok", typechangeNameStatus: `T\0${path}\0` },
+				}),
+			} as unknown as ExecutionBackend;
+			expect(await createRemoteGitService(backend).getCommitPatch(dir, sha, path)).toEqual(patch);
+			await expect(gitService.getCommitPatch(dir, sha, path, "forged")).rejects.toMatchObject({
+				statusCode: 400,
+			});
+		}
+	});
+
 	test("rejects directories and forged rename sources before producing any patch", async () => {
 		const dir = await repo();
 		mkdirSync(join(dir, "folder"));

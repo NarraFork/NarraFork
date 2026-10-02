@@ -312,10 +312,17 @@ func (h *Handlers) workspaceCommitPreview(g *workspaceGit, op string, params map
 	if scopedCut {
 		return commitFileFailure("too_large", maxBytes)
 	}
-	if len(scopedRecords) != 1 || scopedRecords[0].path != path || scopedRecords[0].oldPath != oldPath {
+	if len(scopedRecords) != 1 || scopedRecords[0].path != path || scopedRecords[0].oldPath != oldPath || scopedRecords[0].status != selected.status {
 		return commitFileFailure("invalid", maxBytes)
 	}
 	outputs := map[string]string{"found": "1", "fileStatus": "ok"}
+	maxHeaders := 1
+	if scopedRecords[0].status == "T" && oldPath == "" {
+		// Git emits deletion + addition for one type-changing entry. Preserve the
+		// complete scoped evidence so the TS adapter can allow exactly two sections.
+		maxHeaders = 2
+		outputs["typechangeNameStatus"] = scoped
+	}
 	remaining, err := commitResponseBudget(outputs, maxBytes)
 	if err != nil {
 		return nil, err
@@ -333,7 +340,7 @@ func (h *Handlers) workspaceCommitPreview(g *workspaceGit, op string, params map
 	}
 	patch, _, encodedCut := commitJSONPrefix(patch, remaining)
 	truncated := output.lastTruncated || encodedCut
-	if strings.Count(patch, "\ndiff --git ") > 0 || !truncated && !strings.HasPrefix(patch, "diff --git ") {
+	if strings.Count(patch, "\ndiff --git ") >= maxHeaders || !truncated && !strings.HasPrefix(patch, "diff --git ") {
 		return commitFileFailure("invalid", maxBytes)
 	}
 	return commitPreviewResult(outputs, patch, truncated, maxBytes)

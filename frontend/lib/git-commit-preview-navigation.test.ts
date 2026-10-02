@@ -1,10 +1,25 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { defaultParseSearch } from "@tanstack/react-router";
+import { resetAppBaseForTest } from "./base-path";
 import {
+	buildCommitPreviewBrowserHref,
 	buildCommitPreviewHref,
 	COMMIT_PREVIEW_FILE_MAX_LENGTH,
 	validateCommitPreviewSearch,
 } from "./git-commit-preview-navigation";
+
+const originalDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+const originalLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+afterEach(() => {
+	for (const [key, descriptor] of [
+		["document", originalDocument],
+		["location", originalLocation],
+	] as const) {
+		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+		else Reflect.deleteProperty(globalThis, key);
+	}
+	resetAppBaseForTest();
+});
 
 const SHA = "a".repeat(40);
 const TARGET = {
@@ -15,6 +30,34 @@ const TARGET = {
 };
 
 describe("commit preview navigation", () => {
+	test.each([
+		"/",
+		"/nf/",
+		"/proxy/7778/",
+	])("browser links add mount %s once without changing Router addresses or search", (base) => {
+		Object.defineProperty(globalThis, "document", {
+			configurable: true,
+			value: { baseURI: `https://example.test${base}` },
+		});
+		Object.defineProperty(globalThis, "location", {
+			configurable: true,
+			value: { href: `https://example.test${base}git/chapters/chapter/commits/${SHA}` },
+		});
+		resetAppBaseForTest();
+		for (const target of ["chapter /#", TARGET]) {
+			for (const file of [undefined, "目录/new +#?% name.ts", "123", "[ 1, 2 ]"]) {
+				const internal = buildCommitPreviewHref(target, SHA, file);
+				const browser = buildCommitPreviewBrowserHref(target, SHA, file);
+				expect(internal.startsWith("/git/")).toBe(true);
+				expect(browser).toBe(`${base}${internal.slice(1)}`);
+				const url = new URL(browser, "https://example.test");
+				expect(validateCommitPreviewSearch(defaultParseSearch(url.search))).toEqual({
+					file,
+					workspaceKey: typeof target === "string" ? undefined : target.workspaceKey,
+				});
+			}
+		}
+	});
 	test("chapter links retain the legacy target and do not leak host paths or capabilities", () => {
 		const href = buildCommitPreviewHref("chapter /#", SHA);
 		expect(href).toBe(`/git/chapters/chapter%20%2F%23/commits/${SHA}`);

@@ -292,11 +292,16 @@ export function commitNotFound(sha: string): AppError {
 
 /**
  * The pathspec must resolve to exactly one file of this commit. Empty output means
- * the path is not part of it; several headers mean a directory was named.
+ * the path is not part of it. Only a verified scoped typechange entry permits
+ * two headers: Git renders a file-type transition as deletion plus addition.
  * Content lines are always prefixed (`+`, `-`, ` `), so a header can only appear
  * at the start of a line.
  */
-export function assertSingleFilePatch(diff: string, file: string): void {
+export function assertSingleFilePatch(
+	diff: string,
+	file: string,
+	verifiedEntry?: NameStatusRecord,
+): void {
 	const headers = diff.match(/^diff --git /gm)?.length ?? 0;
 	if (headers === 0)
 		throw new AppError(
@@ -304,5 +309,12 @@ export function assertSingleFilePatch(diff: string, file: string): void {
 			404,
 			"GIT_COMMIT_FILE_NOT_FOUND",
 		);
-	if (headers > 1) throw new ValidationError("Commit preview path must name a single file");
+	const maxHeaders =
+		verifiedEntry?.status === "typechange" &&
+		verifiedEntry.path === file &&
+		verifiedEntry.oldPath === undefined
+			? 2
+			: 1;
+	if (headers > maxHeaders)
+		throw new ValidationError("Commit preview path must name a single file");
 }

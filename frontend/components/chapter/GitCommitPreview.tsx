@@ -1,4 +1,4 @@
-import { buildCommitPreviewHref } from "@frontend/lib/git-commit-preview-navigation";
+import { buildCommitPreviewBrowserHref } from "@frontend/lib/git-commit-preview-navigation";
 import {
 	ActionIcon,
 	Alert,
@@ -104,7 +104,7 @@ function CommitPreviewContent({
 	const path =
 		selectedPath === undefined ? (localPath ?? data?.files[0]?.path ?? null) : selectedPath;
 	const selected = data?.files.find((file) => file.path === path);
-	const previewHref = data ? buildCommitPreviewHref(target, sha, selected?.path) : "";
+	const previewHref = data ? buildCommitPreviewBrowserHref(target, sha, selected?.path) : "";
 	const query = filter.trim().toLocaleLowerCase();
 	const visibleFiles = data?.files.filter(
 		(file) =>
@@ -247,7 +247,7 @@ function CommitPreviewContent({
 										data.parents.map((parent) => (
 											<Anchor
 												key={parent}
-												href={buildCommitPreviewHref(target, parent)}
+												href={buildCommitPreviewBrowserHref(target, parent)}
 												size="xs"
 												ff="monospace"
 												title={parent}

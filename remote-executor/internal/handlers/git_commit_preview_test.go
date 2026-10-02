@@ -84,6 +84,41 @@ func assertCommitFileStatus(t *testing.T, h *Handlers, root, sha, path, oldPath,
 	}
 }
 
+func TestGitCommitPreviewTypeChanges(t *testing.T) {
+	root, h := newGitFixture(t)
+	path, parent := "type change.txt", ""
+	for i, mode := range []string{"120000", "100644", "120000"} {
+		blob := commitTestInput(t, root, fmt.Sprintf("content-%d\n", i), "hash-object", "-w", "--stdin")
+		tree := commitTestInput(t, root, fmt.Sprintf("%s blob %s\t%s\x00", mode, blob, path), "mktree", "-z")
+		args := []string{"commit-tree", tree}
+		if parent != "" {
+			args = append(args, "-p", parent)
+		}
+		sha := commitTestInput(t, root, "type transition", append(args, "-F", "-")...)
+		if parent != "" {
+			detail := gitCall(t, h, root, "commitDetail", map[string]any{"commit": sha})
+			if names := detail["outputs"].(map[string]string)["nameStatus"]; names != "T\x00"+path+"\x00" {
+				t.Fatalf("typechange name-status: %q", names)
+			}
+			result := gitCall(t, h, root, "commitDiff", map[string]any{"commit": sha, "path": path})
+			outputs := result["outputs"].(map[string]string)
+			patch := result["stdout"].(string)
+			if outputs["fileStatus"] != "ok" || outputs["typechangeNameStatus"] != "T\x00"+path+"\x00" || result["truncated"] != false || strings.Count(patch, "diff --git ") != 2 || !strings.Contains(patch, "new file mode "+mode) {
+				t.Fatalf("typechange preview: %v", result)
+			}
+			oldMode := "120000"
+			if mode == "120000" {
+				oldMode = "100644"
+			}
+			if !strings.Contains(patch, "deleted file mode "+oldMode) {
+				t.Fatalf("typechange deletion missing: %q", patch)
+			}
+			assertCommitFileStatus(t, h, root, sha, path, "forged", "invalid", gitWorkspaceMaxBytes)
+		}
+		parent = sha
+	}
+}
+
 func TestGitCommitPreviewCanonicalRoot(t *testing.T) {
 	root, h := newGitFixture(t)
 	probe := gitCall(t, h, root, "probe", nil)
