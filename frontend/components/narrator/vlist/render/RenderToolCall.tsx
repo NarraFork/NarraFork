@@ -1802,6 +1802,18 @@ export function RenderToolBody({
 	specTasksLive?: boolean;
 }) {
 	const { model, blocks, frame, contentWidth, height, appliedCap } = measured;
+	// The content-view host can update independently of the body. Keep its
+	// Markdown input stable instead of manufacturing a fresh wrapper each time.
+	const markdownMeasured = useMemo(
+		() => ({
+			height: frame.contentHeight,
+			blocks,
+			frame,
+			contentWidth,
+			usedWidth: frame.usedWidth,
+		}),
+		[blocks, frame, contentWidth, frame.contentHeight, frame.usedWidth],
+	);
 	if (model.kind === "ask")
 		return (
 			<AskDetailBlocks
@@ -1903,15 +1915,7 @@ export function RenderToolBody({
 									{formatPlanSource(labels.planSource, model.sourcePath)}
 								</Text>
 							) : null}
-							<RenderMarkdown
-								measured={{
-									height: frame.contentHeight,
-									blocks,
-									frame,
-									contentWidth,
-									usedWidth: frame.usedWidth,
-								}}
-							/>
+							<RenderMarkdown measured={markdownMeasured} />
 						</div>
 					) : model.customHighlight && !showSource ? (
 						<CustomHighlightedBody text={model.text ?? ""} kind={model.customHighlight} />

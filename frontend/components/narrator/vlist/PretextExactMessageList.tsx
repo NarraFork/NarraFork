@@ -85,7 +85,7 @@ import {
 	clearCompactProgressAliases,
 	setCompactProgress,
 } from "./compact-progress-store";
-import { ExactRow } from "./ExactRow";
+import type { ExactRowProps } from "./ExactRow";
 import type { InlinePermissionData } from "./measure/measure-permission";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { type MeasuredToolCall, toolCardInnerWidth } from "./measure/measure-tool-call";
@@ -104,6 +104,7 @@ import {
 	type VListToolDetailRequest,
 } from "./useVListToolDetails";
 import { useVListTraceBindings } from "./useVListTraceBindings";
+import { useVListWindowRows } from "./useVListWindowRows";
 import { VListContentViewModal } from "./VListContentViewModal";
 import { VListUserMarkers } from "./VListUserMarkers";
 import { useVListAskInPassing } from "./vlist-ask-in-passing-bridge";
@@ -327,6 +328,7 @@ import {
 } from "./vlist-user-markers";
 import { mergePinnedRowIndices, resolvePinnedRowIndices } from "./vlist-virtualization";
 import { createVisualStateStore } from "./vlist-visual-state";
+import type { WindowRowProjection } from "./vlist-window-row-reuse";
 
 /**
  * Reuse the keyframe path's element list for the unified planner.
@@ -4967,6 +4969,103 @@ export const PretextExactMessageList = memo(
 				],
 			);
 
+			// Project ALL draw inputs on every render. Only element construction is
+			// cached: a callback, signature, slot or geometry change must still reach
+			// the row. No second handwritten invalidation/dependency list.
+			const windowRowProjections: WindowRowProjection[] = [];
+			if (hasRenderableLayout && exactLayout) {
+				const mountedIndices = [
+					...range(visible.start, visible.end),
+					// Retain editor drafts and the swipe anchor outside the normal window.
+					// The two pins may name the SAME row: keep its React key unique.
+					...mergePinnedRowIndices(
+						resolvePinnedRowIndices(visible, editingRowIndex),
+						resolvePinnedRowIndices(visible, swipeAnchorRowIndex),
+					),
+				];
+				for (const itemIndex of mountedIndices) {
+					const item = renderItems[itemIndex];
+					const geometry = exactLayout.items[itemIndex];
+					const manifestItem = manifestItems[itemIndex];
+					if (!item || !geometry || !manifestItem) continue;
+					const sourceIds = sourceIdsForItem(item, manifestItem);
+					const itemId = domIdForItem(item, sourceIds);
+					const traceBinding = traceBindingsByKey.get(item.spec.key);
+					const permissionSlot = permissionSlotByKey.get(item.spec.key);
+					const editorSlot =
+						editingRow?.key === item.spec.key ? renderEditorSlot(editingRow) : undefined;
+					const askInPassingPending = askInPassing.pendingByKey.get(item.spec.key);
+					// Same predicate as dynamicRowKeys: reporter and unclipped box agree.
+					const isDynamicRow = dynamicRowKeys.has(item.spec.key);
+					const rowProps: ExactRowProps = {
+						item,
+						top: geometry.top,
+						height: geometry.height,
+						hitHeight: resolveRowHitHeight(exactLayout.items, itemIndex, exactLayout.totalHeight),
+						contentWidth,
+						itemId,
+						sourceIds,
+						// Height-neutral live tails and closing cards still advance this
+						// signature, even when the measured object is a cache hit.
+						interactionSig: `${rowInteractionSig(activeInteraction, item.spec.key)}|${contentView.rowSig(item.spec.key)}|${liveTailSignature(item.spec.data)}|${closingRowSig(closingRows, item.spec.key)}`,
+						toggles: getRowToggles(item.spec.key),
+						renderLabels,
+						interaction: interactionsByKey.get(item.spec.key),
+						rowInteraction: traceBinding?.rowInteraction,
+						closingRowKeys: closingRows.get(item.spec.key),
+						narratorId,
+						onOpenFilePanel: rowHandlers?.onOpenFilePanel,
+						openAttachmentLabel,
+						injectionNoteLabel,
+						reviewTruncatedLabel,
+						injectionNavigation,
+						currentUserId,
+						permissionSlot,
+						traceRowPermissionSlots: tracePermissionSlotsByKey.get(item.spec.key),
+						onPermissionFormHeight: reportPermissionFormHeight,
+						editorSlot,
+						onTerminate: terminateRunningTool,
+						resolveUpdateTimeout: getUpdateTimeout,
+						onReflectionTakeOver: resolveReflectionTakeOver(item, getReflectionTakeOver),
+						// Drilled-in cards bind their own gate, prompt and tool actions.
+						getReflectionTakeOver,
+						onTogglePromptForKey: togglePromptForKey,
+						resolveRowToolActions: traceBinding?.resolveRowToolActions,
+						onUnknownHeight: isDynamicRow ? getUnknownHeightReporter(item.spec.key) : undefined,
+						onResumeSubagentRecovery: handleResumeSubagentRecovery,
+						specCarryoverActions: resolveSpecCarryoverActions(item, sourceIds, resolveSpecActions),
+						errorNoticeActions: resolveErrorNoticeActions(item, sourceIds, errorNotice.resolve),
+						injectionGuardActions: resolveInterruptGuardActions(
+							item,
+							sourceIds,
+							resolveGuardActions,
+						),
+						reviewFeedbackActions: resolveReviewFeedbackActions(
+							item,
+							sourceIds,
+							resolveReviewActions,
+						),
+						compactActions: compact.byKey.get(item.spec.key),
+						compactCancelTitle: compact.cancelTitle,
+						askInPassingPending,
+						onOpenAskInPassingTarget: askInPassing.openByKey.get(item.spec.key),
+						viewControls: contentView.controls,
+						animateStreaming: animateStreamingRows && isStreamingRowKey(item.spec.key),
+						streamAnimMountEpoch,
+						// Accepted document snapshot, never the potentially newer streamingMsg.
+						streamAnimSnapshotEpoch: isStreamingRowKey(item.spec.key)
+							? pretextDocument.streamingMessage?._streamAnimSnapshotEpoch
+							: undefined,
+						specTaskLive: isSpecTaskLiveItem(item, specTaskLiveGate),
+					};
+					windowRowProjections.push({
+						props: rowProps,
+						skipReuse: isStreamingRowKey(item.spec.key),
+					});
+				}
+			}
+			const windowRowElements = useVListWindowRows(narratorId, windowRowProjections);
+
 			return (
 				<div
 					ref={assignViewport}
@@ -5087,139 +5186,7 @@ export const PretextExactMessageList = memo(
 										/>
 									);
 								})}
-								{[
-									...range(visible.start, visible.end),
-									// Rows that must survive scrolling out of the window. Merged (not
-									// spread back to back) because the two reasons can name the SAME
-									// index — the reader may swipe the row they are editing — and that
-									// would mint two children under one key.
-									...mergePinnedRowIndices(
-										// The row being edited: unmounting would destroy the draft.
-										resolvePinnedRowIndices(visible, editingRowIndex),
-										// The swipe anchor's row: unmounting drops the anchor and its
-										// close handler, which is what silently broke touch
-										// range-selection once the first swiped row scrolled away.
-										resolvePinnedRowIndices(visible, swipeAnchorRowIndex),
-									),
-								].map((itemIndex) => {
-									const item = renderItems[itemIndex];
-									const geometry = exactLayout.items[itemIndex];
-									const manifestItem = manifestItems[itemIndex];
-									if (!item || !geometry || !manifestItem) return null;
-									const sourceIds = sourceIdsForItem(item, manifestItem);
-									const itemId = domIdForItem(item, sourceIds);
-									const traceBinding = traceBindingsByKey.get(item.spec.key);
-									const permissionSlot = permissionSlotByKey.get(item.spec.key);
-									const editorSlot =
-										editingRow?.key === item.spec.key ? renderEditorSlot(editingRow) : undefined;
-									const askInPassingPending = askInPassing.pendingByKey.get(item.spec.key);
-									// Must agree with `dynamicRowKeys` above: that set gates which keys may
-									// HOLD an override, this decides which rows get a reporter and the
-									// unclipped box. A row in one but not the other is either clipped with
-									// no way to report, or reports into a set that drops it.
-									const isDynamicRow = dynamicRowKeys.has(item.spec.key);
-									return (
-										<ExactRow
-											key={item.spec.key}
-											item={item}
-											top={geometry.top}
-											height={geometry.height}
-											hitHeight={resolveRowHitHeight(
-												exactLayout.items,
-												itemIndex,
-												exactLayout.totalHeight,
-											)}
-											contentWidth={contentWidth}
-											itemId={itemId}
-											sourceIds={sourceIds}
-											// Layout-affecting interaction state PLUS the viewer's pure render
-											// state, so a wrap / source toggle re-renders just this row.
-											//
-											// The live reasoning tail rides here too. It is read at DRAW time from
-											// `spec.data` (never measured — see reasoning-live-tail), so none of the
-											// three things the memo compares below moves when it advances: a folded
-											// trace's `measured` is the SAME cached object, its key is constant, and
-											// the tail is height-neutral. Without this term the memo skips the
-											// re-render and the newest characters never reach the DOM. Empty string
-											// for every settled row, so scroll-time memo hits are unaffected.
-											// The closing set rides here too: it is read at DRAW time through a ref
-											// (so `measured` and the keys are unchanged), and without a term in
-											// this signature the memo would skip the re-render that mounts — and
-											// later unmounts — a closing card. Empty for every trace with nothing
-											// closing, so scroll-time memo hits are unaffected.
-											interactionSig={`${rowInteractionSig(activeInteraction, item.spec.key)}|${contentView.rowSig(item.spec.key)}|${liveTailSignature(item.spec.data)}|${closingRowSig(closingRows, item.spec.key)}`}
-											toggles={getRowToggles(item.spec.key)}
-											renderLabels={renderLabels}
-											interaction={interactionsByKey.get(item.spec.key)}
-											rowInteraction={traceBinding?.rowInteraction}
-											closingRowKeys={closingRows.get(item.spec.key)}
-											narratorId={narratorId}
-											onOpenFilePanel={rowHandlers?.onOpenFilePanel}
-											openAttachmentLabel={openAttachmentLabel}
-											injectionNoteLabel={injectionNoteLabel}
-											reviewTruncatedLabel={reviewTruncatedLabel}
-											injectionNavigation={injectionNavigation}
-											currentUserId={currentUserId}
-											permissionSlot={permissionSlot}
-											traceRowPermissionSlots={tracePermissionSlotsByKey.get(item.spec.key)}
-											onPermissionFormHeight={reportPermissionFormHeight}
-											editorSlot={editorSlot}
-											onTerminate={terminateRunningTool}
-											resolveUpdateTimeout={getUpdateTimeout}
-											onReflectionTakeOver={resolveReflectionTakeOver(item, getReflectionTakeOver)}
-											// Unresolved on purpose: a drilled-in card binds its OWN gate (see
-											// rowCard). Referentially stable (useCallback), so the memo is unaffected.
-											getReflectionTakeOver={getReflectionTakeOver}
-											// A drilled-in SUBAGENT card's own controls: the prompt fold (keyed by
-											// the card, not the trace) and the session/lifecycle actions a trace
-											// element has no interaction payload for. Both stable.
-											onTogglePromptForKey={togglePromptForKey}
-											resolveRowToolActions={traceBinding?.resolveRowToolActions}
-											onUnknownHeight={
-												isDynamicRow ? getUnknownHeightReporter(item.spec.key) : undefined
-											}
-											onResumeSubagentRecovery={handleResumeSubagentRecovery}
-											specCarryoverActions={resolveSpecCarryoverActions(
-												item,
-												sourceIds,
-												resolveSpecActions,
-											)}
-											errorNoticeActions={resolveErrorNoticeActions(
-												item,
-												sourceIds,
-												errorNotice.resolve,
-											)}
-											injectionGuardActions={resolveInterruptGuardActions(
-												item,
-												sourceIds,
-												resolveGuardActions,
-											)}
-											reviewFeedbackActions={resolveReviewFeedbackActions(
-												item,
-												sourceIds,
-												resolveReviewActions,
-											)}
-											compactActions={compact.byKey.get(item.spec.key)}
-											compactCancelTitle={compact.cancelTitle}
-											askInPassingPending={askInPassingPending}
-											onOpenAskInPassingTarget={askInPassing.openByKey.get(item.spec.key)}
-											viewControls={contentView.controls}
-											animateStreaming={animateStreamingRows && isStreamingRowKey(item.spec.key)}
-											streamAnimMountEpoch={streamAnimMountEpoch}
-											// Read from the committed document, NEVER streamingMsg: that hook
-											// can already hold the next snapshot while these items are still old.
-											streamAnimSnapshotEpoch={
-												isStreamingRowKey(item.spec.key)
-													? pretextDocument.streamingMessage?._streamAnimSnapshotEpoch
-													: undefined
-											}
-											// The task spinner gate. Two identities, one flag: the newest
-											// framed task bubble (by spec key) and the newest task board (by
-											// tool-use id). Both are null unless the narrator is running.
-											specTaskLive={isSpecTaskLiveItem(item, specTaskLiveGate)}
-										/>
-									);
-								})}
+								{windowRowElements}
 							</div>
 						) : (
 							// Loading / error placeholder. While the document is being fetched and

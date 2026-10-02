@@ -14,6 +14,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { shellSource } from "./guard-source";
+import { sliceBracketedRegion } from "./source-slice";
 import {
 	INTERRUPT_TASK_GUARD_SOURCE,
 	isInterruptGuardItem,
@@ -115,7 +116,10 @@ describe("interrupt guard actions — row resolution", () => {
 describe("interrupt guard actions — shell wiring", () => {
 	it("injects the resolved actions into the row's render extra", () => {
 		expect(SHELL).toContain("if (injectionGuardActions) extra.injectionGuardActions");
-		expect(SHELL).toContain("injectionGuardActions={resolveInterruptGuardActions(");
+		const rowProps = sliceBracketedRegion(SHELL, "const rowProps: ExactRowProps = {");
+		expect(rowProps).toMatch(
+			/injectionGuardActions:\s*resolveInterruptGuardActions\(\s*item,\s*sourceIds,\s*resolveGuardActions,?\s*\)/,
+		);
 		// Row identity must be part of the memo comparison or an in-flight dismissal
 		// would not repaint the disabled close button.
 		expect(SHELL).toContain("prev.injectionGuardActions === next.injectionGuardActions");

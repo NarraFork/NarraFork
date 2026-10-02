@@ -28,7 +28,7 @@ import { MarkdownListMarker } from "@frontend/components/common/MarkdownListMark
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { MD_HEADING_SLUG_ATTR } from "@frontend/lib/markdown-anchor-scroll";
 import { Box } from "@mantine/core";
-import { Fragment, lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, lazy, memo, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { MarkdownLink } from "../../markdown/MarkdownLink";
 import { MEASURE_MARKDOWN_CODE_PADDING } from "../measure/measure-markdown";
 import { pretextLineMetrics } from "../measure/pretext-metrics";
@@ -51,9 +51,12 @@ import { splitTokensByVisualLines } from "../vlist-token-lines";
 import { hasUnpredictableBlock } from "../vlist-unpredictable-blocks";
 import "../vlist-markdown.css";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
+import { getTypographyRevision } from "@shared/pretext-layout/typography";
 import { VListCodeCopyButton } from "../VListCodeCopyButton";
 import { CaretFiller } from "./caret-filler";
-import { FragmentGap, LineFragments } from "./line-fragments";
+import { FragmentGap, LINE_FRAGMENTS_STYLE, LineFragments } from "./line-fragments";
+import { MarkdownLineFragments } from "./MarkdownLineFragments";
+import { staticInlineMarkupCache } from "./static-inline-markup";
 import {
 	graphemeAnimAge,
 	type StreamAnimFrame,
@@ -133,7 +136,7 @@ const LazyMermaidDiagram = lazy(() =>
 	import("../../markdown/MermaidDiagram").then((m) => ({ default: m.MermaidDiagram })),
 );
 
-interface RenderMarkdownProps {
+export interface RenderMarkdownProps {
 	measured: MeasuredElement;
 	/**
 	 * Show `sourceText` as raw monospace text instead of the measured render.
@@ -176,12 +179,35 @@ interface RenderMarkdownProps {
 	animScope?: string;
 }
 
+interface MarkdownBodyProps extends RenderMarkdownProps {
+	typographyRevision: number;
+}
+
+function sameOwnValues<T extends object>(a: T, b: T): boolean {
+	if (a === b) return true;
+	const keys = Object.keys(a) as (keyof T)[];
+	if (keys.length !== Object.keys(b).length) return false;
+	return keys.every((key) => Object.hasOwn(b, key) && Object.is(a[key], b[key]));
+}
+
+/** A fresh measured wrapper is not fresh content. Never deep-walk/sample the body. */
+export function sameMarkdownRenderInputs(a: MarkdownBodyProps, b: MarkdownBodyProps): boolean {
+	const keys = Object.keys(a) as (keyof MarkdownBodyProps)[];
+	if (keys.length !== Object.keys(b).length) return false;
+	for (const key of keys) {
+		if (!Object.hasOwn(b, key)) return false;
+		if (key === "measured") {
+			if (!sameOwnValues(a.measured, b.measured)) return false;
+		} else if (!Object.is(a[key], b[key])) return false;
+	}
+	return true;
+}
 /**
  * Render a measured markdown element. The outer box height equals the predicted
  * height (or an override applied by the shell); children are absolutely
  * positioned inside it.
  */
-export function RenderMarkdown({
+function RenderMarkdownBody({
 	measured,
 	showSource,
 	sourceText,
@@ -190,7 +216,7 @@ export function RenderMarkdown({
 	sealOnMount,
 	animKeyBase,
 	animScope,
-}: RenderMarkdownProps) {
+}: MarkdownBodyProps) {
 	const { blocks, frame, contentWidth } = measured;
 	const hostRef = useRef<HTMLDivElement | null>(null);
 	const hasUnknown = useMemo(() => hasUnpredictableBlock(blocks), [blocks]);
@@ -347,6 +373,16 @@ export function RenderMarkdown({
 			})}
 		</div>
 	);
+}
+
+const MemoMarkdownBody = memo(RenderMarkdownBody, sameMarkdownRenderInputs);
+
+/**
+ * Preserve the caller's typography/measurement update timing. The revision travels
+ * through the memo without creating an independent post-paint geometry update.
+ */
+export function RenderMarkdown(props: RenderMarkdownProps) {
+	return <MemoMarkdownBody {...props} typographyRevision={getTypographyRevision()} />;
 }
 
 /**
@@ -803,6 +839,14 @@ function InlineBlockView({
 		});
 		return { lines: out, totalLen: offset, visibleText: text };
 	}, [block, contentWidth, animKey]);
+	const typographyRevision = getTypographyRevision();
+	const staticMarkup = useMemo(
+		() =>
+			animKey == null && lines.some((line) => line.fragments.length >= 3)
+				? staticInlineMarkupCache.get(block, contentWidth, lines, typographyRevision)
+				: null,
+		[block, contentWidth, lines, typographyRevision, animKey],
+	);
 
 	// Resolve this frame's animation state during render (pure — no store mutation),
 	// then commit it after paint so the NEXT frame's boundary and ages are correct.
@@ -864,147 +908,162 @@ function InlineBlockView({
 	const quoteContentTop = isQuote ? quotePaddingY + MARKDOWN_CONSTANTS.PARAGRAPH_MARGIN_TOP : 0;
 
 	return (
-		<div
-			// Marks the boundary of ONE logical inline block (a paragraph, heading or
-			// list item). The `data-vlist-line` children inside it are VISUAL lines
-			// produced by soft wrapping, which the source had no newline for — the copy
-			// handler (vlist-copy-text.ts) needs this boundary to tell "same paragraph,
-			// wrapped" from "next paragraph".
-			data-vlist-inline-block
-			// Anchor target for a same-document `[x](#…)` link (see
-			// lib/markdown-anchor-scroll). Height-neutral: an attribute only. Set on
-			// the block box rather than on a line, because a wrapped heading has
-			// several lines and a jump must land on the block's top.
-			{...(block.headingSlug ? { [MD_HEADING_SLUG_ATTR]: block.headingSlug } : {})}
-			style={{
-				position: "absolute",
-				top: frame.top,
-				left: 0,
-				width: contentWidth,
-				height: frame.height,
-			}}
-		>
-			{/* Blockquote background fill (MarkdownContent.module.css .mdQuote):
+		<MarkdownLineFragments markup={staticMarkup} layout={lines}>
+			<div
+				// Marks the boundary of ONE logical inline block (a paragraph, heading or
+				// list item). The `data-vlist-line` children inside it are VISUAL lines
+				// produced by soft wrapping, which the source had no newline for — the copy
+				// handler (vlist-copy-text.ts) needs this boundary to tell "same paragraph,
+				// wrapped" from "next paragraph".
+				data-vlist-inline-block
+				// Anchor target for a same-document `[x](#…)` link (see
+				// lib/markdown-anchor-scroll). Height-neutral: an attribute only. Set on
+				// the block box rather than on a line, because a wrapped heading has
+				// several lines and a jump must land on the block's top.
+				{...(block.headingSlug ? { [MD_HEADING_SLUG_ATTR]: block.headingSlug } : {})}
+				style={{
+					position: "absolute",
+					top: frame.top,
+					left: 0,
+					width: contentWidth,
+					height: frame.height,
+				}}
+			>
+				{/* Blockquote background fill (MarkdownContent.module.css .mdQuote):
 			    tinted panel + trailing rounded corners, spanning from the
 			    outermost rail to the right edge. Height-neutral (behind text). */}
-			{isQuote ? (
-				<div
-					style={{
-						position: "absolute",
-						left: block.quoteRailLefts[0] ?? 0,
-						top: 0,
-						right: 0,
-						bottom: 0,
-						background: "var(--vlist-quote-bg)",
-						borderStartEndRadius: "var(--mantine-radius-default)",
-						borderEndEndRadius: "var(--mantine-radius-default)",
-					}}
-				/>
-			) : null}
-			<MarkdownListMarker block={block} top={quoteContentTop} />
-			{block.quoteRailLefts.map((railLeft, i) => (
-				<div
-					// biome-ignore lint/suspicious/noArrayIndexKey: rails are a stable ordered list
-					key={i}
-					style={{
-						position: "absolute",
-						left: railLeft,
-						top: 0,
-						bottom: 0,
-						width: 3,
-						background: "var(--mantine-primary-color-filled)",
-					}}
-				/>
-			))}
-			{lines.map((line, lineIndex) => (
-				<div
-					// biome-ignore lint/suspicious/noArrayIndexKey: lines are a stable ordered list
-					key={lineIndex}
-					data-vlist-line
-					style={{
-						position: "absolute",
-						left: block.contentLeft,
-						top: quoteContentTop + lineIndex * block.lineHeight,
-						height: block.lineHeight,
-						display: "flex",
-						alignItems: "center",
-						// Stretch past the text so the blank remainder of the line still
-						// resolves a caret during a drag-selection; `max-content` ended the
-						// row at the last glyph, leaving the rest of the line caret-less.
-						// Purely horizontal, so the height model is untouched.
-						minWidth: "max-content",
-						width: `calc(100% - ${block.contentLeft}px)`,
-					}}
-				>
-					<LineFragments>
-						{line.fragments.map((frag, fi) => {
-							// An inline formula replaces its placeholder glyph with real KaTeX
-							// output, pinned to the width the measure layer reserved.
-							const body = frag.math ? (
-								<InlineMathView
-									math={frag.math}
-									gapBefore={frag.gapBefore}
-									lineHeight={block.lineHeight}
+				{isQuote ? (
+					<div
+						style={{
+							position: "absolute",
+							left: block.quoteRailLefts[0] ?? 0,
+							top: 0,
+							right: 0,
+							bottom: 0,
+							background: "var(--vlist-quote-bg)",
+							borderStartEndRadius: "var(--mantine-radius-default)",
+							borderEndEndRadius: "var(--mantine-radius-default)",
+						}}
+					/>
+				) : null}
+				<MarkdownListMarker block={block} top={quoteContentTop} />
+				{block.quoteRailLefts.map((railLeft, i) => (
+					<div
+						// biome-ignore lint/suspicious/noArrayIndexKey: rails are a stable ordered list
+						key={i}
+						style={{
+							position: "absolute",
+							left: railLeft,
+							top: 0,
+							bottom: 0,
+							width: 3,
+							background: "var(--mantine-primary-color-filled)",
+						}}
+					/>
+				))}
+				{lines.map((line, lineIndex) => {
+					// Sparse lines keep React: native parsing does not amortize its cost there.
+					const markup = line.fragments.length >= 3 ? staticMarkup?.[lineIndex] : null;
+					return (
+						<div
+							// biome-ignore lint/suspicious/noArrayIndexKey: lines are a stable ordered list
+							key={lineIndex}
+							data-vlist-line
+							style={{
+								position: "absolute",
+								left: block.contentLeft,
+								top: quoteContentTop + lineIndex * block.lineHeight,
+								height: block.lineHeight,
+								display: "flex",
+								alignItems: "center",
+								// Stretch past the text so the blank remainder of the line still
+								// resolves a caret during a drag-selection; `max-content` ended the
+								// row at the last glyph, leaving the rest of the line caret-less.
+								// Purely horizontal, so the height model is untouched.
+								minWidth: "max-content",
+								width: `calc(100% - ${block.contentLeft}px)`,
+							}}
+						>
+							{markup != null ? (
+								<span
+									data-vlist-line-frags
+									style={LINE_FRAGMENTS_STYLE}
+									// biome-ignore lint/security/noDangerouslySetInnerHtml: fixed escaped span markup from the bounded serializer
+									dangerouslySetInnerHTML={{ __html: markup }}
 								/>
 							) : (
-								(() => {
-									const content =
-										animating &&
-										animFrame != null &&
-										sealOffset < frag.globalStart + frag.text.length ? (
-											<FragmentAnimContent
-												key="anim"
-												frag={frag}
-												sealOffset={sealOffset}
-												births={animFrame.births}
-												now={animFrame.now}
+								<span data-vlist-line-frags style={LINE_FRAGMENTS_STYLE}>
+									{line.fragments.map((frag, fi) => {
+										// An inline formula replaces its placeholder glyph with real KaTeX
+										// output, pinned to the width the measure layer reserved.
+										const body = frag.math ? (
+											<InlineMathView
+												math={frag.math}
+												gapBefore={frag.gapBefore}
+												lineHeight={block.lineHeight}
 											/>
 										) : (
-											frag.text
+											(() => {
+												const content =
+													animating &&
+													animFrame != null &&
+													sealOffset < frag.globalStart + frag.text.length ? (
+														<FragmentAnimContent
+															key="anim"
+															frag={frag}
+															sealOffset={sealOffset}
+															births={animFrame.births}
+															now={animFrame.now}
+														/>
+													) : (
+														frag.text
+													);
+												return frag.href != null ? (
+													<MarkdownLink
+														lineNumbersInChildren
+														href={frag.href}
+														className={frag.className}
+														style={fragmentTextStyle({
+															font: frag.font,
+															gapBefore: frag.gapBefore,
+															letterSpacing: letterSpacingForFont(frag.font),
+														})}
+													>
+														{content}
+													</MarkdownLink>
+												) : (
+													<span
+														className={frag.className}
+														style={fragmentTextStyle({
+															font: frag.font,
+															gapBefore: frag.gapBefore,
+															letterSpacing: letterSpacingForFont(frag.font),
+														})}
+													>
+														{content}
+													</span>
+												);
+											})()
 										);
-									return frag.href != null ? (
-										<MarkdownLink
-											lineNumbersInChildren
-											href={frag.href}
-											className={frag.className}
-											style={fragmentTextStyle({
-												font: frag.font,
-												gapBefore: frag.gapBefore,
-												letterSpacing: letterSpacingForFont(frag.font),
-											})}
-										>
-											{content}
-										</MarkdownLink>
-									) : (
-										<span
-											className={frag.className}
-											style={fragmentTextStyle({
-												font: frag.font,
-												gapBefore: frag.gapBefore,
-												letterSpacing: letterSpacingForFont(frag.font),
-											})}
-										>
-											{content}
-										</span>
-									);
-								})()
-							);
-							return (
-								<Fragment
-									// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
-									key={fi}
-								>
-									{/* Precedes the fragment: the space belongs to the boundary
+										return (
+											<Fragment
+												// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
+												key={fi}
+											>
+												{/* Precedes the fragment: the space belongs to the boundary
 									    before it, not to the fragment's own text. */}
-									<FragmentGap gapBefore={frag.gapBefore} />
-									{body}
-								</Fragment>
-							);
-						})}
-					</LineFragments>
-				</div>
-			))}
-		</div>
+												<FragmentGap gapBefore={frag.gapBefore} />
+												{body}
+											</Fragment>
+										);
+									})}
+								</span>
+							)}
+						</div>
+					);
+				})}
+			</div>
+		</MarkdownLineFragments>
 	);
 }
 

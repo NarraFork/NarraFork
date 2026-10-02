@@ -22,6 +22,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { shellSource } from "./guard-source";
+import { sliceBracketedRegion } from "./source-slice";
 import {
 	errorNoticeText,
 	isErrorNoticeItem,
@@ -110,7 +111,10 @@ describe("error notice actions — row resolution", () => {
 describe("error notice actions — shell wiring", () => {
 	it("injects the resolved actions into the row's render extra", () => {
 		expect(SHELL).toContain("if (errorNoticeActions) extra.errorNoticeActions");
-		expect(SHELL).toContain("errorNoticeActions={resolveErrorNoticeActions(");
+		const rowProps = sliceBracketedRegion(SHELL, "const rowProps: ExactRowProps = {");
+		expect(rowProps).toMatch(
+			/errorNoticeActions:\s*resolveErrorNoticeActions\(\s*item,\s*sourceIds,\s*errorNotice\.resolve,?\s*\)/,
+		);
 		// Row identity must be part of the memo comparison or an in-flight dismissal
 		// would not repaint the disabled close button.
 		expect(SHELL).toContain("prev.errorNoticeActions === next.errorNoticeActions");

@@ -22,6 +22,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { shellSource } from "./guard-source";
+import { sliceBracketedRegion } from "./source-slice";
 import type { VListItem } from "./vlist-pipeline";
 import { isSpecCarryoverItem, resolveSpecCarryoverActions } from "./vlist-spec-carryover-actions";
 
@@ -92,7 +93,10 @@ describe("spec carryover actions — row resolution", () => {
 describe("spec carryover actions — shell wiring", () => {
 	it("injects the resolved actions into the row's render extra", () => {
 		expect(SHELL).toContain("if (specCarryoverActions) extra.specCarryoverActions");
-		expect(SHELL).toContain("specCarryoverActions={resolveSpecCarryoverActions(");
+		const rowProps = sliceBracketedRegion(SHELL, "const rowProps: ExactRowProps = {");
+		expect(rowProps).toMatch(
+			/specCarryoverActions:\s*resolveSpecCarryoverActions\(\s*item,\s*sourceIds,\s*resolveSpecActions,?\s*\)/,
+		);
 		// Row identity must be part of the memo comparison or a busy-state change
 		// would not repaint the card's loading button.
 		expect(SHELL).toContain("prev.specCarryoverActions === next.specCarryoverActions");
