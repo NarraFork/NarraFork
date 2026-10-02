@@ -57,6 +57,22 @@ describe("hand-declared bundled entries", () => {
 });
 
 describe("version self-check", () => {
+	test("purego and its runtime-derived attribution match the executor dependency", () => {
+		const goMod = readFileSync(join(REPO_ROOT, "remote-executor", "go.mod"), "utf8");
+		const version = goMod.match(/github\.com\/ebitengine\/purego\s+v([^\s]+)/)?.[1];
+		expect(version).toBeDefined();
+		const { entries, texts } = manifest();
+		const purego = entries.find((entry) => entry.name === "github.com/ebitengine/purego");
+		const runtime = entries.find(
+			(entry) => entry.name === "github.com/ebitengine/purego (Go runtime-derived code)",
+		);
+		expect(purego?.version).toBe(version);
+		expect(purego?.license).toBe("Apache-2.0");
+		expect(runtime?.version).toBe(version);
+		expect(runtime?.license).toBe("BSD-3-Clause");
+		expect(texts[purego?.textId ?? ""]).toContain("Apache License");
+		expect(texts[runtime?.textId ?? ""]).toContain("The Go Authors");
+	});
 	test("the Bun entry matches the runtime that gets compiled in", () => {
 		// `bun build --compile` embeds the runtime of the bun executing it, so this — not the
 		// `packageManager` pin — is what a released binary actually contains.

@@ -4,6 +4,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"reflect"
@@ -21,9 +22,14 @@ type linuxConditionalMetadata struct {
 	UID, GID uint32
 	Mode     os.FileMode
 	Attrs    map[string][]byte
+	ctx      context.Context
 }
 
-func captureConditionalMetadata(f *os.File) (conditionalMetadata, error) {
+func captureConditionalMetadata(f *os.File, contexts ...context.Context) (conditionalMetadata, error) {
+	ctx := conditionalMetadataContext(contexts)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	fd := int(f.Fd())
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil {
@@ -48,14 +54,18 @@ func captureConditionalMetadata(f *os.File) (conditionalMetadata, error) {
 	if flags & ^0x80000 != 0 {
 		return nil, fmt.Errorf("conditional replacement refuses unsupported inode flags %#x", flags)
 	}
-	attrs, err := conditionalXattrs(fd)
+	attrs, err := conditionalXattrs(fd, ctx)
 	if err != nil {
 		return nil, err
 	}
-	return &linuxConditionalMetadata{UID: stat.Uid, GID: stat.Gid, Mode: info.Mode().Perm(), Attrs: attrs}, nil
+	return &linuxConditionalMetadata{UID: stat.Uid, GID: stat.Gid, Mode: info.Mode().Perm(), Attrs: attrs, ctx: ctx}, nil
 }
 
-func conditionalXattrs(fd int) (map[string][]byte, error) {
+func conditionalXattrs(fd int, contexts ...context.Context) (map[string][]byte, error) {
+	ctx := conditionalMetadataContext(contexts)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// Fixed buffers bound both kernel output and Go allocations; ERANGE rejects
 	// large metadata instead of retrying/growing without a budget.
 	buf := make([]byte, 64*1024)
@@ -66,6 +76,9 @@ func conditionalXattrs(fd int) (map[string][]byte, error) {
 	attrs := make(map[string][]byte)
 	total := n
 	for _, name := range strings.Split(string(buf[:n]), "\x00") {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if name == "" {
 			continue
 		}
@@ -86,6 +99,9 @@ func conditionalXattrs(fd int) (map[string][]byte, error) {
 }
 
 func (m *linuxConditionalMetadata) apply(f *os.File) error {
+	if err := m.ctx.Err(); err != nil {
+		return err
+	}
 	fd := int(f.Fd())
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil {
@@ -99,11 +115,14 @@ func (m *linuxConditionalMetadata) apply(f *os.File) error {
 	if err := f.Chmod(m.Mode); err != nil {
 		return err
 	}
-	inherited, err := conditionalXattrs(fd)
+	inherited, err := conditionalXattrs(fd, m.ctx)
 	if err != nil {
 		return err
 	}
 	for name := range inherited {
+		if err := m.ctx.Err(); err != nil {
+			return err
+		}
 		if _, exists := m.Attrs[name]; !exists {
 			if err := unix.Fremovexattr(fd, name); err != nil {
 				return fmt.Errorf("cannot remove inherited metadata %q: %w", name, err)
@@ -111,6 +130,9 @@ func (m *linuxConditionalMetadata) apply(f *os.File) error {
 		}
 	}
 	for name, value := range m.Attrs {
+		if err := m.ctx.Err(); err != nil {
+			return err
+		}
 		if err := unix.Fsetxattr(fd, name, value, 0); err != nil {
 			return fmt.Errorf("cannot preserve metadata %q: %w", name, err)
 		}
@@ -119,11 +141,12 @@ func (m *linuxConditionalMetadata) apply(f *os.File) error {
 }
 
 func (m *linuxConditionalMetadata) matches(f *os.File) error {
-	current, err := captureConditionalMetadata(f)
+	current, err := captureConditionalMetadata(f, m.ctx)
 	if err != nil {
 		return err
 	}
-	if !reflect.DeepEqual(m, current) {
+	other := current.(*linuxConditionalMetadata)
+	if m.UID != other.UID || m.GID != other.GID || m.Mode != other.Mode || !reflect.DeepEqual(m.Attrs, other.Attrs) {
 		return errConditionalMetadataChanged
 	}
 	return nil

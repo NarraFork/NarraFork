@@ -45,9 +45,6 @@ func TestConditionalWriteConflictAndCreate(t *testing.T) {
 }
 
 func TestConditionalWriteConcurrentOnlyOneApplies(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("existing-file replacement is fail-closed; covered by platform rejection test")
-	}
 	root := t.TempDir()
 	path := filepath.Join(root, "file.txt")
 	if err := os.WriteFile(path, []byte("before"), 0600); err != nil {
@@ -81,7 +78,7 @@ func TestConditionalWriteConcurrentOnlyOneApplies(t *testing.T) {
 		t.Fatalf("applied %d, want one", count)
 	}
 	info, _ := os.Stat(path)
-	if info.Mode().Perm() != 0600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 		t.Fatal("permissions not preserved")
 	}
 }
@@ -123,4 +120,42 @@ func TestConditionalWriteBoundedAndNoTemporaryLeak(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatal("rejected write left artifacts")
 	}
+}
+
+func TestConditionalTemporaryCleanupRetainsReusedPath(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "temporary")
+	if err := os.WriteFile(path, []byte("original temporary"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := conditionalHandleInfo(t, path)
+	if err := os.Rename(path, filepath.Join(root, "moved")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("external occupant"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeConditionalTemporary(path, info); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "external occupant" {
+		t.Fatalf("cleanup removed external file: %q %v", data, err)
+	}
+}
+
+// Windows path-based Stat resolves file IDs lazily in SameFile. Bind fixture
+// identity through a handle before a rename can reuse the original pathname.
+func conditionalHandleInfo(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info
 }

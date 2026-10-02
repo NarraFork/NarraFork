@@ -73,7 +73,7 @@
 	},
 	{
 		"name": "Go standard library",
-		"version": "1.23+",
+		"version": "1.24+",
 		"license": "BSD-3-Clause",
 		"author": "The Go Authors",
 		"repository": "https://github.com/golang/go",
@@ -115,6 +115,24 @@
 		"repository": "https://github.com/golang/sys",
 		"textFile": "go-x-sys.txt",
 		"distributedVia": "Compiled into the remote executor binaries (remote-executor/go.mod, indirect)."
+	},
+	{
+		"name": "github.com/ebitengine/purego",
+		"version": "0.10.2",
+		"license": "Apache-2.0",
+		"author": "The Ebitengine Authors",
+		"repository": "https://github.com/ebitengine/purego",
+		"textFile": "go-purego.txt",
+		"distributedVia": "Compiled into the macOS remote executor for native ACL calls without CGO. Runtime-derived files are covered by the companion BSD-3-Clause entry."
+	},
+	{
+		"name": "github.com/ebitengine/purego (Go runtime-derived code)",
+		"version": "0.10.2",
+		"license": "BSD-3-Clause",
+		"author": "The Go Authors",
+		"repository": "https://github.com/ebitengine/purego",
+		"textFile": "go-stdlib.txt",
+		"distributedVia": "Go runtime/cgo code copied by purego and compiled into the macOS remote executor; files and attribution are listed in purego v0.10.2 README External Code."
 	},
 	{
 		"name": "@parcel/watcher native binaries",

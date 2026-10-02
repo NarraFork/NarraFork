@@ -335,7 +335,9 @@ func (h *Handlers) FsWriteContext(ctx context.Context, params map[string]any) (a
 	return map[string]any{}, nil
 }
 
-// FsWriteConditional checks content and canonical identity, then commits one rename.
+// FsWriteConditional checks content and canonical identity before a platform-native
+// replacement. Windows additionally verifies merged permissions and keeps recovery
+// material if a native replacement cannot be safely rolled back.
 // Rechecks reduce external races but cannot exclude an external writer between the
 // final check and rename. Never advertised as OS CAS. Cancellation after rename
 // may lose the reply; callers must not retry automatically.
@@ -449,8 +451,11 @@ func (h *Handlers) FsWriteConditional(ctx context.Context, params map[string]any
 				return false, 0, err
 			}
 		} else {
-			originalMetadata, err = captureConditionalMetadata(f)
+			originalMetadata, err = captureConditionalMetadata(f, ctx)
 			if err != nil {
+				if errors.Is(err, errConditionalMetadataChanged) {
+					return true, 0, nil
+				}
 				return false, 0, err
 			}
 			originalInfo = info
@@ -469,8 +474,20 @@ func (h *Handlers) FsWriteConditional(ctx context.Context, params map[string]any
 	if err != nil {
 		return nil, err
 	}
-	defer os.Remove(tmp.Name())
-	defer tmp.Close()
+	var tmpInfo os.FileInfo
+	defer func() {
+		// Windows CreateTemp does not share DELETE. Close before opening the
+		// identity-bound cleanup handle, including on pre-commit failures.
+		tmp.Close()
+		if tmpInfo != nil {
+			// Native commit can consume the pathname; preserve any new occupant.
+			removeConditionalTemporary(tmp.Name(), tmpInfo)
+		}
+	}()
+	tmpInfo, err = tmp.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("cannot bind temporary identity; retained %q: %w", tmp.Name(), err)
+	}
 	if _, err := tmp.Write(data); err != nil {
 		return nil, err
 	}
@@ -502,7 +519,10 @@ func (h *Handlers) FsWriteConditional(ctx context.Context, params map[string]any
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
+	if err := commitConditionalReplacement(ctx, path, tmp.Name(), originalInfo, originalMetadata, data); err != nil {
+		if errors.Is(err, errConditionalMetadataChanged) {
+			return map[string]any{"applied": false, "conflict": true}, nil
+		}
 		return nil, err
 	}
 	return map[string]any{"applied": true}, nil

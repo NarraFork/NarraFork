@@ -1,5 +1,7 @@
 # Cross-compilation matrix for the NarraFork remote executor.
-# Produces static, single-file binaries (CGO disabled) under dist/.
+# Produces single-file binaries (CGO disabled) under dist/.
+# Darwin calls system libSystem for ACL handling; CGO-disabled does not mean
+# a fully static binary on every platform.
 #
 #   make build          # build for the host platform
 #   make dist           # build all platforms
@@ -18,8 +20,8 @@ LDFLAGS := -s -w \
 	-X $(MODULE)/internal/buildinfo.BuildTime=$(BUILD_TIME)
 BUILDFLAGS := -trimpath -ldflags "$(LDFLAGS)"
 
-# os/arch pairs. Same-arch binaries are portable across distros because they are
-# statically linked with CGO disabled.
+# os/arch pairs. Linux binaries are statically linked with CGO disabled;
+# Darwin and Windows rely on the target OS's native system libraries.
 PLATFORMS := \
 	linux/amd64 \
 	linux/arm64 \

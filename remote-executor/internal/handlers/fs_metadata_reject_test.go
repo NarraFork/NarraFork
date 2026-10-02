@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestConditionalWriteRejectsUnverifiablePlatformMetadata(t *testing.T) {
+func TestConditionalWriteNativeContentConflictRetainsOriginal(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "file")
 	if err := os.WriteFile(path, []byte("before"), 0600); err != nil {
@@ -20,8 +20,9 @@ func TestConditionalWriteRejectsUnverifiablePlatformMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := New(NewPathGuard([]string{root}), 4000000)
-	if _, err := h.FsWriteConditional(context.Background(), conditionalParams(path, "before", "after")); err == nil {
-		t.Fatal("unverifiable replacement accepted")
+	result, err := h.FsWriteConditional(context.Background(), conditionalParams(path, "stale", "after"))
+	if err != nil || result.(map[string]any)["conflict"] != true {
+		t.Fatalf("stale content accepted: %v %v", result, err)
 	}
 	current, err := os.Stat(path)
 	if err != nil || !os.SameFile(original, current) {
