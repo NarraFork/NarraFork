@@ -95,6 +95,7 @@ export interface VListTimingLabels {
 
 /** Per-kind render label bundles, keyed by the vlist element kind. */
 export interface VListRenderLabels {
+	textPreview?: { expand: string; collapse: string; loading?: string; loadFailed?: string };
 	reasoning: {
 		reasoning: string;
 		thinking: string;
@@ -526,6 +527,12 @@ export function useVListLabels(): VListLabels {
 			cancelled: t("traceRowMark.cancelled"),
 		};
 		return {
+			textPreview: {
+				expand: t("textPreview.expand"),
+				collapse: t("textPreview.collapse"),
+				loading: t("textPreview.loading"),
+				loadFailed: t("textPreview.loadFailed"),
+			},
 			reasoning: {
 				reasoning: t("reasoning"),
 				thinking: t("thinking"),

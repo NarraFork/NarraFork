@@ -21,8 +21,6 @@ import { RenderLodCtx } from "../../lod/RenderLodCtx";
 import { segmentMessages } from "../../message/message-segments";
 import type { NarratorMsg } from "../../narrator-panel-types";
 import { groupRenderUnits } from "../../trace/render-units";
-import type { MeasuredCommunicationBubble } from "../measure/measure-communication-bubble";
-import type { MeasuredInjectionBubble } from "../measure/measure-injection-bubble";
 import type { MeasuredSubagent, SubagentCardData } from "../measure/measure-subagent";
 import type { MeasuredToolCall } from "../measure/measure-tool-call";
 import { installCanvasStub } from "../measure/test-canvas-stub";
@@ -191,6 +189,24 @@ function paint(spec: ElementSpec, measured: MeasuredElement) {
 }
 
 const compact = (text: string) => text.replace(/\s/g, "");
+
+function paintExpanded(spec: ElementSpec): Document {
+	const expanded = { ...spec, opts: { ...spec.opts, textExpanded: true } };
+	return paint(expanded, measure(expanded));
+}
+
+function assertPreview(spec: ElementSpec) {
+	const measured = measure(spec);
+	// Preview rendering deliberately skips whole-paragraph static-markup caching;
+	// the full expanded path still exercises that optimization in paintExpanded.
+	const document = render(renderElement(spec.kind, measured, resolveRenderExtra(spec)));
+	// Local visual truncation must save mounted DOM, not just hide the complete body.
+	expect(document.querySelectorAll("[data-vlist-line]").length).toBeLessThan(40);
+	expect(document.body.textContent).not.toContain(END);
+	expect(measured.height).toBeLessThan(400);
+	return document;
+}
+
 function completeBody(document: Document) {
 	// A subagent also paints its short description through RenderMarkdown; select
 	// the result body by its unique tail, then require exactly one complete copy.
@@ -300,7 +316,7 @@ describe("large Markdown: six production measure/render entry points", () => {
 		);
 	});
 
-	test("Send outgoing: bounded complete body still reaches DOM after the 480px scroll cap", () => {
+	test("Send outgoing: bounded preview and explicit expansion preserve the complete body", () => {
 		expect(limitCommunicationPreview(COMMUNICATION.markdown)).toEqual({
 			text: COMMUNICATION.markdown,
 			truncated: false,
@@ -323,8 +339,8 @@ describe("large Markdown: six production measure/render entry points", () => {
 		expect(data.messageTruncated).toBe(false);
 		expect(data.toolUseId).toBe("tu-Send");
 		expect(data.recipients[0]).toMatchObject({ id: "worker", deliveryMessageId: "receipt-real" });
-		const measured = measure(spec) as MeasuredCommunicationBubble;
-		const document = paint(spec, measured);
+		assertPreview(spec);
+		const document = paintExpanded(spec);
 		assertBody(document, COMMUNICATION);
 		expect(document.querySelector("[data-vlist-communication-frame]")).not.toBeNull();
 		expect(
@@ -332,11 +348,11 @@ describe("large Markdown: six production measure/render entry points", () => {
 		).toContain("justify-content:flex-start");
 		expect(
 			document.querySelector("[data-vlist-communication-body]")?.getAttribute("style"),
-		).toContain("height:480px");
+		).not.toContain("height:480px");
 	});
 
 	for (const source of ["subagent_message", "team_message"]) {
-		test(`Send received ${source}: injected user-role transport is not a human input bubble or a 480px cap`, () => {
+		test(`Send received ${source}: injected transport has a bounded preview and complete expansion`, () => {
 			expect(COMMUNICATION.markdown.length).toBeLessThanOrEqual(8_000);
 			const spec = adapt(
 				injection(
@@ -363,9 +379,8 @@ describe("large Markdown: six production measure/render entry points", () => {
 				speakerId: "real-sender",
 				target: { kind: "narrator", narratorId: "real-sender", messageId: "sending-tool" },
 			});
-			const measured = measure(spec) as MeasuredInjectionBubble;
-			expect(measured.height).toBeGreaterThan(480);
-			const document = paint(spec, measured);
+			assertPreview(spec);
+			const document = paintExpanded(spec);
 			assertBody(document, COMMUNICATION);
 			expect(document.querySelector("[data-vlist-injection-frame]")).not.toBeNull();
 			expect(document.querySelector("[data-vlist-injection-row]")?.getAttribute("style")).toContain(
@@ -403,7 +418,38 @@ describe("large Markdown: six production measure/render entry points", () => {
 			markdown: BACKGROUND.markdown,
 			target: { kind: "narrator", narratorId: "bg-real", messageId: "result-real" },
 		});
-		assertBody(paint(spec, measure(spec)), BACKGROUND);
+		assertPreview(spec);
+		assertBody(paintExpanded(spec), BACKGROUND);
+	});
+
+	test("bg_bash: fences remain verbatim while only preview code lines mount", () => {
+		const output = `# not a heading\n> not a quote\n${"  ! compiler diagnostic | column |\n".repeat(500)}${END}`;
+		const spec = adapt(
+			injection("bg_bash", {
+				kind: "tasksDone",
+				flavor: "bash",
+				items: [
+					{ id: "bash-job", alias: "check", status: "success", preview: output, truncated: true },
+				],
+			}),
+		);
+		expect(spec.kind).toBe("injection-bubble");
+		expect(spec.data).toMatchObject({ target: null, hasNote: true });
+		const preview = render(renderElement(spec.kind, measure(spec), resolveRenderExtra(spec)));
+		expect(preview.querySelectorAll("[data-vlist-code-line]").length).toBeGreaterThan(0);
+		expect(preview.querySelectorAll("[data-vlist-code-line]").length).toBeLessThan(40);
+		expect(preview.body.textContent).not.toContain(END);
+		const expandedSpec = { ...spec, opts: { ...spec.opts, textExpanded: true } };
+		const expanded = render(
+			renderElement(spec.kind, measure(expandedSpec), resolveRenderExtra(expandedSpec)),
+		);
+		const lines = [...expanded.querySelectorAll("[data-vlist-code-line]")]
+			.map((line) => line.textContent ?? "")
+			.join("\n");
+		expect(compact(lines)).toBe(compact(output));
+		expect(expanded.body.textContent).toContain(END);
+		// Producer loss remains distinguishable from the reversible visual preview.
+		expect(expanded.querySelector("[data-vlist-injection-note]")).not.toBeNull();
 	});
 
 	test("subagent result: real output envelope → SubagentBody → RenderToolBody, direct and trace drill", () => {
@@ -457,7 +503,7 @@ describe("large Markdown: six production measure/render entry points", () => {
 		assertBody(rememberOriginal(traceNode, render(traceNode)), LARGE);
 	});
 
-	test("Send larger than preview budget explicitly reports truncation instead of pretending to show all 23K", () => {
+	test("Send beyond the preview budget keeps available source separate and expands all 23K", () => {
 		const spec = adapt(tool("Send", { id: "worker", message: LARGE.markdown }));
 		const data = spec.data as CommunicationBubbleData;
 		const preview = limitCommunicationPreview(LARGE.markdown);
@@ -466,9 +512,10 @@ describe("large Markdown: six production measure/render entry points", () => {
 		expect(data.message.length).toBeLessThanOrEqual(COMMUNICATION_PREVIEW_MAX_CHARS);
 		expect(data.messageTruncated).toBe(true);
 		expect(data.messageBody?.text).toBe(LARGE.markdown);
-		const document = paint(spec, measure(spec));
+		const document = assertPreview(spec);
 		expect(document.querySelector("[data-vlist-communication-frame]")).not.toBeNull();
-		expect(document.querySelector("[data-vlist-communication-view-full]")).not.toBeNull();
-		expect(document.querySelector("[data-md-body]")?.textContent).not.toContain(END);
+		expect(document.querySelector("[data-vlist-text-preview-toggle]")).not.toBeNull();
+		expect(data.messageBody?.textTruncated).toBe(false);
+		assertBody(paintExpanded(spec), LARGE);
 	});
 });

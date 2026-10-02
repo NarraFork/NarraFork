@@ -57,6 +57,8 @@ export interface ComputeLayoutOptions {
 	bottomPadding?: number;
 	/** Resolve an element's expanded state (reasoning/tool/subagent/trace). */
 	isExpanded?: (key: string) => boolean | undefined;
+	/** Reader opted out of the body preview; distinct from opening the card. */
+	isTextExpanded?: AdapterContext["isTextExpanded"];
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
@@ -169,6 +171,7 @@ export function computePretextVListLayout(
 	const ctx: AdapterContext = {
 		lod: opts.lod,
 		isExpanded: opts.isExpanded,
+		isTextExpanded: opts.isTextExpanded,
 		isLodUserOverride: opts.isLodUserOverride,
 		showEarlier: opts.showEarlier,
 		expandedRows: opts.expandedRows,

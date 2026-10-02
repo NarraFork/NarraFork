@@ -67,8 +67,12 @@ async function withStream(
 		switchNarrator: (id: string, subagent?: boolean) => Promise<void>;
 		live: () => TreeMessage | null;
 	}) => Promise<void>,
-	{ animateStreaming = false }: { animateStreaming?: boolean } = {},
+	{
+		animateStreaming = false,
+		textExpanded = false,
+	}: { animateStreaming?: boolean; textExpanded?: boolean } = {},
 ) {
+	const build = { ...BUILD, isTextExpanded: () => textExpanded };
 	let mountEpoch = ++nextMountEpoch;
 	// Keep active tokens alive while measuring/rendering the large snapshot fixture.
 	const clock = animateStreaming ? spyOn(Date, "now").mockReturnValue(Date.now()) : null;
@@ -121,7 +125,7 @@ async function withStream(
 	const coordinator = new PretextLayoutCoordinator();
 	await coordinator.load(
 		"handoff-n",
-		BUILD,
+		build,
 		{
 			fetchPage: async () => ({
 				messages: [],
@@ -231,7 +235,7 @@ async function withStream(
 					coordinator.reset();
 					await coordinator.load(
 						id,
-						BUILD,
+						build,
 						{
 							fetchPage: async () => ({
 								messages: [],
@@ -320,10 +324,36 @@ describe("snapshot animation through real WS / hook / coordinator / DOM", () => 
 					await h.raf();
 					expect(h.animationText()).toContain("新段落首批");
 				},
-				{ animateStreaming: true },
+				// Full-history animation is tested after opting out of the tail preview.
+				{ animateStreaming: true, textExpanded: true },
 			);
 		});
 	}
+
+	it("the default long reasoning preview keeps new tails visible without mounting its history", async () => {
+		await withStream(async (h) => {
+			const body = `HIDDEN_HEAD\n\n${"long historical reasoning text。\n".repeat(1500)}VISIBLE_TAIL`;
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [content("reasoning", "bounded-body", body, 1, 0)],
+				toolChunks: [],
+			});
+			await h.raf();
+			const first = h.coordinator.getSnapshot().items?.[0]?.measured;
+			expect(first?.textPreview?.sourceText).toBe(body);
+			expect(first?.textPreview?.direction).toBe("tail");
+			expect(first?.height).toBeLessThan(350);
+			expect(h.text()).toContain("VISIBLE_TAIL");
+			expect(h.text()).not.toContain("HIDDEN_HEAD");
+			await h.delta(content("reasoning", "bounded-body", "最新尾部", 2, body.length));
+			await h.raf();
+			const updated = h.coordinator.getSnapshot().items?.[0]?.measured;
+			expect(updated?.height).toBe(first?.height);
+			expect(updated?.textPreview?.sourceText).toBe(`${body}最新尾部`);
+			expect(h.text()).toContain("最新尾部");
+			expect(h.text().length).toBeLessThan(5000);
+		});
+	});
 
 	it("seals an offscreen snapshot block on late mount but animates a genuinely new live block", async () => {
 		await withStream(

@@ -5,6 +5,7 @@ import { installCanvasStub } from "./measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "./registry";
 import {
 	type AdapterActivityInput,
+	type AdapterContentBlock,
 	type AdapterContext,
 	type AdapterSegment,
 	adaptRenderUnits,
@@ -4237,6 +4238,197 @@ describe("mixed action-card display runs from real message segments", () => {
 
 describe("adaptSegment — a concluded review", () => {
 	const CTX: AdapterContext = { lod: 5 };
+
+	describe("independent text preview expansion", () => {
+		const message = (
+			id: string,
+			role: string,
+			contentJson: AdapterContentBlock[],
+		): AdapterSegment => ({
+			kind: "message",
+			msg: { id, role, contentJson },
+		});
+
+		it("preserves durable body expansion across streaming hand-off without reusing it for a new block", async () => {
+			const { textExpansionStateKey } = await import("./segment-adapter");
+			const { createVListInteractionState, setVListTextExpanded, isVListTextExpanded } =
+				await import("./vlist-interaction-state");
+			let state = createVListInteractionState(5);
+			const context: AdapterContext = {
+				lod: 5,
+				isTextExpanded: (key, bodyKey) => isVListTextExpanded(state, key, bodyKey),
+			};
+			const text = "full retained body ".repeat(1000);
+			const make = (messageId: string, blockId: string, body = text) =>
+				adaptSegment(
+					message(messageId, "assistant", [{ type: "reasoning", id: blockId, text: body }]),
+					context,
+				)[0]!;
+			const live = make("__streaming__", "durable-reasoning");
+			const canonical = textExpansionStateKey(live.key, live.lifecycleId);
+			state = setVListTextExpanded(state, live.key, true, undefined, canonical);
+			expect(make("__streaming__", "durable-reasoning").opts!.textExpanded).toBe(true);
+			const committed = make("persisted-1", "durable-reasoning");
+			expect(committed.key).not.toBe(live.key);
+			expect(committed.opts!.textExpanded).toBe(true);
+			expect((committed.data as { text: string }).text).toBe(text);
+			expect(make("__streaming__", "new-turn-reasoning").opts!.textExpanded).toBe(false);
+			state = setVListTextExpanded(state, committed.key, false, undefined, canonical);
+			expect(make("__streaming__", "durable-reasoning").opts!.textExpanded).toBe(false);
+			expect(isVListTextExpanded(state, live.key)).toBe(false);
+
+			const structured = make(
+				"__streaming__",
+				"durable-steps",
+				"**First**\n\nfirst\n\n**Second**\n\nsecond",
+			);
+			state = setVListTextExpanded(
+				state,
+				structured.key,
+				true,
+				"seg0",
+				textExpansionStateKey(structured.key, structured.lifecycleId),
+			);
+			expect(
+				make("persisted-steps", "durable-steps", "**First**\n\nfirst\n\n**Second**\n\nsecond").opts!
+					.textExpandedKeys,
+			).toEqual(["seg0"]);
+		});
+
+		it("forwards the same direct body option for ordinary and streaming reasoning", () => {
+			for (const id of ["ordinary", "__streaming__"]) {
+				const [spec] = adaptSegment(
+					message(id, "assistant", [{ type: "reasoning", text: "whole source" }]),
+					{
+						lod: 5,
+						isTextExpanded: (key) => key === `${id}-b0`,
+					},
+				);
+				expect(spec!.opts!.textExpanded).toBe(true);
+				expect((spec!.data as { text: string }).text).toBe("whole source");
+			}
+		});
+
+		it("does not change ordinary markdown or message-bubble measurement options", () => {
+			for (const role of ["user", "assistant"]) {
+				const [spec] = adaptSegment(
+					message("plain", role, [{ type: "text", text: "full source" }]),
+					{
+						lod: 5,
+						isTextExpanded: () => true,
+					},
+				);
+				expect(spec!.opts).toBeUndefined();
+			}
+		});
+
+		it("wires native injection bodies independently of mutation permissions", () => {
+			const [spec] = adaptSegment(
+				message("inject", "sys", [
+					{
+						type: "system_injection",
+						source: "team_message",
+						modelText: "full source",
+						body: {
+							kind: "messages",
+							items: [{ fromId: "worker", fromType: "subagent", text: "full source" }],
+						},
+					},
+				]),
+				{
+					lod: 5,
+					isTextExpanded: () => true,
+				},
+			);
+			expect(spec!.kind).toBe("injection-bubble");
+			expect(spec!.opts!.textExpanded).toBe(true);
+		});
+
+		it("addresses step bodies by emitted row key while retaining full source", () => {
+			const body = "source paragraph ".repeat(1000);
+			const [spec] = adaptSegment(
+				message("steps", "assistant", [
+					{ type: "reasoning", text: `**First**\n\n${body}\n\n**Second**\n\nsecond body` },
+				]),
+				{
+					lod: 5,
+					expandedRows: () => [0],
+					isTextExpanded: (key, bodyKey) => key === "steps-b0" && bodyKey === "seg0",
+				},
+			);
+			expect(spec!.kind).toBe("reasoning-steps");
+			expect(spec!.opts!.textExpandedKeys).toEqual(["seg0"]);
+			expect((spec!.data as { steps: { body: string }[] }).steps[0]!.body).toBe(body.trim());
+		});
+
+		it("avoids re-parsing a giant single titled paragraph but preserves later step identity", async () => {
+			const { parseReasoningSegments } = await import("@shared/pretext-layout/reasoning-segments");
+			const body = "full body ".repeat(40_000);
+			let parses = 0;
+			const context: AdapterContext = {
+				lod: 5,
+				resolveReasoningSegments: (text) => {
+					parses++;
+					return parseReasoningSegments(text);
+				},
+			};
+			const make = (text: string) =>
+				adaptSegment(
+					message("large-single-step", "assistant", [{ type: "reasoning", text }]),
+					context,
+				)[0]!;
+			const first = make(`**First**\n\n${body}`);
+			const appended = make(`**First**\n\n${body}append`);
+			expect(parses).toBe(0);
+			expect(first.kind).toBe("reasoning-steps");
+			expect((appended.data as { steps: { body: string; key: string }[] }).steps[0]).toMatchObject({
+				body: `${body}append`,
+				key: "seg0",
+			});
+			const second = make(`**First**\n\n${body}append\n\n**Second**\n\nnext`);
+			expect(parses).toBe(1);
+			expect((second.data as { steps: { key: string }[] }).steps.map((step) => step.key)).toEqual([
+				"seg0",
+				"seg1",
+			]);
+		});
+
+		it("keeps full step bodies and keys exact across high-LOD multi-paragraph streaming", async () => {
+			const { parseReasoningSegments } = await import("@shared/pretext-layout/reasoning-segments");
+			const text = `**First**\n\n${"first paragraph\n\n".repeat(1000)}**Second**\n\n${"second paragraph\n\n".repeat(1000)}`;
+			for (const length of [9000, 16000, 22000, text.length]) {
+				const source = text.slice(0, length);
+				const [spec] = adaptSegment(
+					message("__streaming__", "assistant", [{ type: "reasoning", text: source }]),
+					{ lod: 5 },
+				);
+				const steps = (spec!.data as { steps: { key: string; body: string | null }[] }).steps;
+				const expected = parseReasoningSegments(source);
+				expect(steps.map((step) => step.key)).toEqual(expected.map((_, index) => `seg${index}`));
+				expect(steps.map((step) => step.body)).toEqual(
+					expected.map((step) => (step.isEmpty ? null : step.body)),
+				);
+			}
+		});
+
+		it("budgets a giant plain run before paragraph parsing without losing source", () => {
+			const text = "plain reasoning ".repeat(40_000);
+			let parses = 0;
+			const [spec] = adaptSegment(
+				message("large-plain", "assistant", [{ type: "reasoning", text }]),
+				{
+					lod: 5,
+					resolveReasoningSegments: () => {
+						parses++;
+						return [];
+					},
+				},
+			);
+			expect(parses).toBe(0);
+			expect(spec!.kind).toBe("reasoning");
+			expect((spec!.data as { text: string }).text).toBe(text);
+		});
+	});
 
 	describe("publication result receipts", () => {
 		const publicationResult = {

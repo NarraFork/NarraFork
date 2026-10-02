@@ -30,14 +30,15 @@ import {
 	REASONING_CHEVRON_SIZE,
 	REASONING_ICON_SIZE,
 	REASONING_ROW_PADDING_Y,
-	REASONING_TRANSLATION_TOGGLE_HEIGHT,
 	REASONING_TRANSLATION_TOGGLE_MARGIN_TOP,
 	reasoningHeaderRowHeight,
+	reasoningTranslationToggleHeight,
 } from "../measure/measure-reasoning";
 import type { MeasuredElement } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
+import { hasUnpredictableBlock } from "../vlist-unpredictable-blocks";
 import { swallowSelectionClick } from "./key-activate";
-import { RenderMarkdown } from "./RenderMarkdown";
+import { RenderTextPreview, type TextPreviewLabels } from "./RenderTextPreview";
 
 /**
  * i18n-facing labels, injected by the dispatch/registry layer.
@@ -59,6 +60,8 @@ export interface ReasoningLabels {
 }
 
 interface RenderReasoningProps {
+	textPreviewLabels?: TextPreviewLabels;
+	onToggleTextExpanded?: (bodyKey?: string) => void;
 	measured: MeasuredReasoning;
 	labels?: ReasoningLabels;
 	/**
@@ -103,6 +106,8 @@ export function RenderReasoning({
 	animateStreaming,
 	animKeyBase,
 	animScope,
+	textPreviewLabels,
+	onToggleTextExpanded,
 }: RenderReasoningProps) {
 	switch (measured.form) {
 		case "streaming":
@@ -124,6 +129,8 @@ export function RenderReasoning({
 					animateStreaming={animateStreaming}
 					animKeyBase={animKeyBase}
 					animScope={animScope}
+					textPreviewLabels={textPreviewLabels}
+					onToggleTextExpanded={onToggleTextExpanded}
 				/>
 			);
 	}
@@ -273,7 +280,11 @@ function ExpandedView({
 	animateStreaming,
 	animKeyBase,
 	animScope,
+	textPreviewLabels,
+	onToggleTextExpanded,
 }: {
+	textPreviewLabels?: TextPreviewLabels;
+	onToggleTextExpanded?: (bodyKey?: string) => void;
 	measured: MeasuredReasoning;
 	labels: ReasoningLabels;
 	showSource?: boolean;
@@ -288,7 +299,8 @@ function ExpandedView({
 }) {
 	const showToggle = !measured.isStreaming;
 	const bodyMeasured: MeasuredElement = {
-		height: measured.frame.contentHeight,
+		textPreview: measured.textPreview,
+		height: measured.frame.contentHeight + (measured.textPreview?.buttonHeight ?? 0),
 		blocks: measured.blocks,
 		frame: measured.frame,
 		contentWidth: measured.contentWidth,
@@ -319,11 +331,17 @@ function ExpandedView({
 			>
 				{/* Source view swaps the render for the raw text inside the SAME reserved
 				    body geometry, so the card cannot move (RenderMarkdown pins the box). */}
-				<RenderMarkdown
+				<RenderTextPreview
+					textPreviewLabels={textPreviewLabels}
+					onToggleTextExpanded={onToggleTextExpanded}
 					measured={bodyMeasured}
 					showSource={showSource}
 					sourceText={sourceText}
-					onUnknownHeight={onUnknownHeight}
+					onUnknownHeight={
+						measured.textPreview?.expanded && hasUnpredictableBlock(measured.blocks)
+							? undefined
+							: onUnknownHeight
+					}
 					animateStreaming={animateStreaming}
 					sealOnMount
 					animKeyBase={animKeyBase != null ? `${animKeyBase}:reasoning` : undefined}
@@ -334,7 +352,7 @@ function ExpandedView({
 						gap={4}
 						mt={REASONING_TRANSLATION_TOGGLE_MARGIN_TOP}
 						style={{
-							height: REASONING_TRANSLATION_TOGGLE_HEIGHT - REASONING_TRANSLATION_TOGGLE_MARGIN_TOP,
+							height: reasoningTranslationToggleHeight() - REASONING_TRANSLATION_TOGGLE_MARGIN_TOP,
 							cursor: onToggleTranslation ? "pointer" : undefined,
 							// Inline-flex keeps the hit area on the words themselves (parity with
 							// the chunked ReasoningBlock), so a click beside the label does not

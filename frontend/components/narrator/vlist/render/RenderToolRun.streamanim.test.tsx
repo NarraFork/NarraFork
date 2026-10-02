@@ -114,6 +114,9 @@ async function mountLiveStepRow(options?: {
 				kind === "reasoning"
 					? measureReasoning({ text: body, isStreaming: options?.shimmer ?? true }, WIDTH, 5, {
 							expanded,
+							// The reader explicitly requested full content; the default
+							// scrolling preview intentionally does not replay tail births.
+							textExpanded: true,
 						})
 					: measureReasoningStepsTrace(
 							[
@@ -125,7 +128,7 @@ async function mountLiveStepRow(options?: {
 								},
 							] as never,
 							WIDTH,
-							{ expandedIndices: expanded ? [0] : [] } as never,
+							{ expandedIndices: expanded ? [0] : [], textExpandedKeys: ["seg0"] } as never,
 						);
 			reactRoot.render(
 				<MantineProvider>

@@ -168,9 +168,10 @@ describe("plain markdown rows honour the source toggle", () => {
 		// affordance on `measured.form`, see canShowRowSourceInline).
 		const { measureReasoning } = await import("../measure/measure-reasoning");
 		const { RenderReasoning } = await import("./RenderReasoning");
-		const text = "# Thought\n\n- step";
+		const text = `# Thought\n\n${"word\n".repeat(20)}LAST\n\n- step`;
 		const measured = measureReasoning({ text }, CONTENT_WIDTH, 5, { expanded: true });
 		expect(measured.form).toBe("expanded");
+		expect(measured.textPreview?.clipped).toBe(false);
 
 		const container = document.createElement("div");
 		document.body.appendChild(container);
@@ -187,6 +188,9 @@ describe("plain markdown rows honour the source toggle", () => {
 		expect(container.textContent ?? "").toContain("# Thought");
 		const box = sourceBox(container);
 		if (!box) throw new Error("expected a source box");
+		expect(box.textContent).toBe(text);
+		expect(box.getAttribute("style")).toMatch(/overflow-y:\s*auto/);
+		expect(container.querySelector("[data-vlist-text-preview-toggle]")).toBeNull();
 		// Pinned to the reasoning BODY's measured height, so the card cannot move.
 		expect(pxOf(box, "height")).toBeCloseTo(measured.frame.contentHeight, 1);
 		act(() => reactRoot.unmount());

@@ -36,6 +36,7 @@
  * Zero DOM: heights come from pretext line metrics exactly like every other measure.
  */
 
+import { TEXT_PREVIEW_MAX_CHARS } from "@shared/pretext-layout/text-preview";
 import { DEFAULT_RENDER_LOD, type MeasuredElement, type RenderLod } from "../prepared-block";
 import {
 	FONT_SIZE,
@@ -44,10 +45,10 @@ import {
 	SPACING,
 	typographyMetrics,
 } from "../pretext-fonts";
-import { measureMarkdown } from "./measure-markdown";
 import { isSpecTaskPayload, measureSpecTask, type SpecTaskData } from "./measure-spec-task";
 import { measureSystemSimpleCard } from "./measure-system-simple";
 import { measureSystemTextCard } from "./measure-system-text";
+import { measureTextPreview, type TextPreviewOptions } from "./measure-text-preview";
 
 /** Inner padding of an injection bubble (Paper p="sm" = 12px), as for a user bubble. */
 export const INJECTION_BUBBLE_PADDING = SPACING.sm;
@@ -86,23 +87,8 @@ export const INJECTION_HEADER_MIN_CONTENT_WIDTH = 260;
  * the whole row and lose its side.
  */
 export const INJECTION_BUBBLE_MAX_WIDTH_RATIO = 0.86;
-/**
- * Chars of the body fed to the measurement.
- *
- * The retired projection had its own ceiling (`SIDECAR_PROJECTION_MAX_LINES` = 200) and
- * the comment there explains why it existed: the measure layer only gets to decide what
- * to draw AFTER the projection has built its output, so an unbounded body turns one
- * pathological record into a per-measure-pass cost of its full length. The bubble path
- * does not go through that projection, so the ceiling has to live here.
- *
- * Not merely defensive: `Send`'s message text reaches `deliverInjection` unbounded
- * (`agent-communication.ts` passes `input.message` straight through), so the only per-
- * message limit on a teammate's text is this one. Bounding it here rather than trusting
- * four unrelated upstream producers to each keep their own cap is the same reasoning as
- * `COMMAND_EXPANSION_MAX_CHARS`, and the prefix is what the render copy paints, so the
- * measured and painted text stay identical.
- */
-export const INJECTION_BODY_MAX_CHARS = 32 * 1024;
+/** Local preview preparation budget only. Explicit expansion preserves the full source. */
+export const INJECTION_BODY_MAX_CHARS = TEXT_PREVIEW_MAX_CHARS;
 
 /** Trailing "…output was truncated" note: one xs line inside the frame. */
 export const INJECTION_NOTE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
@@ -281,6 +267,7 @@ export function measureInjectionBubble(
 	input: MeasureInjectionBubbleInput,
 	contentWidth: number,
 	_lod: RenderLod = DEFAULT_RENDER_LOD,
+	opts: TextPreviewOptions = {},
 ): MeasuredInjectionBubble {
 	const hasHeader = input.hasHeader !== false;
 	const hasNote = input.hasNote === true;
@@ -298,15 +285,10 @@ export function measureInjectionBubble(
 
 	// Bounded prefix, so a pathological body cannot make every measure pass O(its size).
 	const rawMarkdown = input.markdown ?? "";
-	const bodyText =
-		bodyForm === "payload"
-			? ""
-			: rawMarkdown.length > INJECTION_BODY_MAX_CHARS
-				? rawMarkdown.slice(0, INJECTION_BODY_MAX_CHARS)
-				: rawMarkdown;
+	const bodyText = bodyForm === "payload" ? "" : rawMarkdown;
 	const firstPass = payload
 		? measureInnerCard(payload.kind, payload.data, innerWidth, _lod)
-		: measureMarkdown(bodyText, innerWidth);
+		: measureTextPreview(bodyText, innerWidth, opts);
 
 	// ── Second pass, only for a body that contains a FULL-BLEED block ────────────
 	//
@@ -337,7 +319,7 @@ export function measureInjectionBubble(
 	);
 	const body =
 		!payload && shrinkTo < innerWidth && hasFullBleedBlock(firstPass.blocks)
-			? measureMarkdown(bodyText, shrinkTo)
+			? measureTextPreview(bodyText, shrinkTo, opts)
 			: firstPass;
 	// The markdown frame is reused verbatim: its per-block `top` values are relative
 	// to the body's own origin, and the render copy offsets the whole body by
@@ -349,7 +331,7 @@ export function measureInjectionBubble(
 	const headerBlock = hasHeader ? INJECTION_HEADER_HEIGHT + INJECTION_HEADER_BODY_GAP : 0;
 	const noteBlock = hasNote ? INJECTION_NOTE_GAP + typographyMetrics().line.xs : 0;
 	const bodyTop = INJECTION_BUBBLE_PADDING + headerBlock;
-	const height = INJECTION_BUBBLE_PADDING * 2 + headerBlock + frame.contentHeight + noteBlock;
+	const height = INJECTION_BUBBLE_PADDING * 2 + headerBlock + body.height + noteBlock;
 
 	// Shrink-wrap to the widest line, floored so the header is not clipped, and
 	// capped at the ratio limit. `frame.usedWidth` was produced AT `innerWidth`, so
@@ -365,7 +347,8 @@ export function measureInjectionBubble(
 		form: "injection",
 		bodyForm,
 		payloadKind: payload?.kind ?? null,
-		measuredMarkdown: bodyText,
+		textPreview: body.textPreview,
+		measuredMarkdown: body.textPreview?.previewText ?? bodyText,
 		height,
 		blocks: body.blocks,
 		frame,

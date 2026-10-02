@@ -93,7 +93,6 @@ import {
 	type RenderLod,
 } from "../prepared-block";
 import { SPACING, typographyMetrics } from "../pretext-fonts";
-import { measureMarkdown } from "./measure-markdown";
 // The drilled-in SUBAGENT card (an Agent/Task/Send row reveals the same card it
 // gets at L3+). Not a cycle: measure-subagent sources its row height from
 // `@shared/pretext-layout/row-metrics` directly, so this edge is the only one
@@ -108,6 +107,7 @@ import {
 	CARD_PADDING as SUBAGENT_CARD_PADDING,
 	type SubagentCardData,
 } from "./measure-subagent";
+import { measureTextPreview } from "./measure-text-preview";
 // The drill-down card. NOT a cycle: measure-tool-call depends on markdown /
 // media / permission / reflection / pretext-metrics and never on this module.
 import {
@@ -388,6 +388,7 @@ export interface CollapsibleTraceData {
 
 /** Prop-driven fold / expand state (upstream resolves this from LOD). */
 export interface TraceExpandState {
+	textExpandedKeys?: readonly string[];
 	/** ActivityTrace L1: fold the whole row list behind the clickable header. */
 	collapseItems?: boolean;
 	/** When collapseItems, whether the user opened the folded list. */
@@ -789,8 +790,11 @@ export function measureCollapsibleTrace(
 				blockHeight = card.height;
 			} else if (typeof item.bodyText === "string" && item.bodyText.trim().length > 0) {
 				const inner = traceBodyInnerWidth(contentWidth);
-				body = measureMarkdown(item.bodyText, inner);
-				blockHeight += TRACE_BODY_PADDING_Y * 2 + body.frame.contentHeight;
+				body = measureTextPreview(item.bodyText, inner, {
+					textExpanded: expandState.textExpandedKeys?.includes(item.key ?? String(itemIndex)),
+					direction: item.shimmer ? "tail" : "head",
+				});
+				blockHeight += TRACE_BODY_PADDING_Y * 2 + body.height;
 			}
 		}
 
@@ -877,7 +881,7 @@ export function measureCollapsibleTrace(
 		}
 		return {
 			itemIndex,
-			key: item.key ?? `row-${itemIndex}`,
+			key: item.key ?? String(itemIndex),
 			title: item.title,
 			hasIcon: !!item.hasIcon,
 			iconColor: item.iconColor,

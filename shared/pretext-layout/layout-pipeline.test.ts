@@ -66,6 +66,79 @@ function truncatedToolUnit(toolUseId: string): AdapterRenderUnit {
  * read "loading full data…" forever.
  */
 describe("shared pretext layout pipeline — adapter context forwarding", () => {
+	it("forwards body expansion through the real shared pipeline, separately from card expansion", () => {
+		const units: AdapterRenderUnit[] = [
+			{
+				kind: "segment",
+				seg: {
+					kind: "message",
+					msg: {
+						id: "in",
+						role: "sys",
+						contentJson: [
+							{
+								type: "system_injection",
+								source: "team_message",
+								body: { kind: "messages", items: [{ fromId: "sender", text: "message body" }] },
+							},
+						],
+					},
+				},
+			},
+			{
+				kind: "segment",
+				seg: {
+					kind: "message",
+					msg: {
+						id: "reason",
+						role: "assistant",
+						contentJson: [{ type: "reasoning", text: "plain reasoning" }],
+					},
+				},
+			},
+		];
+		for (const expanded of [false, true]) {
+			const result = computePretextVListLayout(
+				units,
+				{
+					contentWidth: 640,
+					lod: 5,
+					isExpanded: () => true,
+					isTextExpanded: () => expanded,
+				},
+				(_kind, _data, width, _lod, opts) => measured(opts?.textExpanded ? 900 : 100, width),
+			);
+			expect(result.items).toHaveLength(2);
+			for (const item of result.items) {
+				expect(item.spec.opts?.textExpanded).toBe(expanded);
+				expect(item.measured.height).toBe(expanded ? 900 : 100);
+			}
+		}
+	});
+
+	it("forwards independently addressed reasoning-step bodies", () => {
+		const result = computePretextVListLayout(
+			[
+				{
+					kind: "segment",
+					seg: {
+						kind: "message",
+						msg: {
+							id: "steps",
+							role: "assistant",
+							contentJson: [
+								{ type: "reasoning", text: "**First**\n\nbody one\n\n**Second**\n\nbody two" },
+							],
+						},
+					},
+				},
+			],
+			{ contentWidth: 640, lod: 5, isTextExpanded: (_key, bodyKey) => bodyKey === "seg0" },
+			(_kind, _data, width) => measured(40, width),
+		);
+		expect(result.items[0]?.spec.kind).toBe("reasoning-steps");
+		expect(result.items[0]?.spec.opts?.textExpandedKeys).toEqual(["seg0"]);
+	});
 	it("hands the adapter every injected resolver", () => {
 		const seen: string[] = [];
 		const probe = (name: string) => () => {

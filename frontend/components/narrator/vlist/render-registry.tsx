@@ -303,7 +303,14 @@ export function renderElement(
 		case "communication-bubble":
 			return (
 				<RenderCommunicationBubble
+					fullTextLoading={extra.fullTextLoading as boolean | undefined}
+					fullTextError={extra.fullTextError as string | undefined}
+					textPreviewLabels={extra.textPreviewLabels as never}
+					onToggleTextExpanded={
+						extra.onToggleTextExpanded as ((bodyKey?: string) => void) | undefined
+					}
 					measured={m}
+					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 					data={extra.data as never}
 					header={extra.header as React.ReactNode}
 					onOpenRecipient={extra.onOpenRecipient as ((id: string) => void) | undefined}
@@ -313,6 +320,10 @@ export function renderElement(
 		case "injection-bubble":
 			return (
 				<RenderInjectionBubble
+					textPreviewLabels={extra.textPreviewLabels as never}
+					onToggleTextExpanded={
+						extra.onToggleTextExpanded as ((bodyKey?: string) => void) | undefined
+					}
 					measured={m as never}
 					header={extra.header as React.ReactNode}
 					noteText={extra.noteText as string | undefined}
@@ -326,6 +337,10 @@ export function renderElement(
 		case "reasoning":
 			return (
 				<RenderReasoning
+					textPreviewLabels={extra.textPreviewLabels as never}
+					onToggleTextExpanded={
+						extra.onToggleTextExpanded as ((bodyKey?: string) => void) | undefined
+					}
 					measured={m}
 					labels={extra.labels as never}
 					// Same per-body source toggle as markdown (expanded form only).
@@ -456,6 +471,11 @@ export function renderElement(
 		case "reasoning-steps":
 			return (
 				<RenderToolRun
+					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
+					textPreviewLabels={extra.textPreviewLabels as never}
+					onToggleTextExpanded={
+						extra.onToggleTextExpanded as ((bodyKey?: string) => void) | undefined
+					}
 					measured={m}
 					labels={extra.labels as never}
 					onToggleItems={extra.onToggleItems as (() => void) | undefined}

@@ -54,6 +54,22 @@ function makeManifest(): PretextLayoutManifest {
 }
 
 describe("PretextExactMessageList", () => {
+	it("resolves the current body's canonical owner and slot before a full-text toggle", () => {
+		const toggle = sliceBracketedRegion(
+			shellModule("PretextExactMessageList.tsx"),
+			"onToggleTextExpanded: (bodyKey?: string) => {",
+		);
+		if (!toggle) throw new Error("missing full-text toggle wiring");
+		expect(toggle).toContain("renderItemsRef.current.find");
+		expect(toggle).toContain("resolveTextExpansionPreference(item?.spec ?? { key }, bodyKey)");
+		expect(toggle).toMatch(
+			/isVListTextExpanded\(\s*prev,\s*preference.specKey,\s*preference.bodyKey/,
+		);
+		expect(toggle).toMatch(
+			/setVListTextExpanded\(\s*prev,\s*key,\s*expanded,\s*bodyKey,\s*preference.specKey,\s*preference.bodyKey \?\? null/,
+		);
+	});
+
 	it("projects the shared prefix index into absolute-position geometry without estimates", () => {
 		const index = buildPretextLayoutIndex(makeManifest());
 		const layout = buildExactListLayout(index);
