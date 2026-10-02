@@ -21,6 +21,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { shellSource } from "./guard-source";
+import { sliceBracketedRegion } from "./source-slice";
 import type { VListItem } from "./vlist-pipeline";
 import {
 	isReviewFeedbackItem,
@@ -90,7 +91,10 @@ describe("review feedback actions — row resolution", () => {
 describe("review feedback actions — shell wiring", () => {
 	it("injects the resolved action into the row's render extra", () => {
 		expect(SHELL).toContain("if (reviewFeedbackActions) extra.reviewFeedbackActions");
-		expect(SHELL).toContain("reviewFeedbackActions={resolveReviewFeedbackActions(");
+		const rowProps = sliceBracketedRegion(SHELL, "const rowProps: ExactRowProps = {");
+		expect(rowProps).toMatch(
+			/reviewFeedbackActions:\s*resolveReviewFeedbackActions\(\s*item,\s*sourceIds,\s*resolveReviewActions,?\s*\)/,
+		);
 		// Row identity must take part in the memo comparison, or the in-flight state would
 		// not repaint the button.
 		expect(SHELL).toContain("prev.reviewFeedbackActions === next.reviewFeedbackActions");

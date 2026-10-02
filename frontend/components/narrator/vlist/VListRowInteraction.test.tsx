@@ -7,11 +7,13 @@
  * under the same conditions the chunked ToolCallCard / SubagentCard use, and
  * that clicking one invokes the bound action.
  *
- * The swipe hook is stubbed with the context menu forced open so the dropdown is
- * mounted synchronously; i18n returns raw keys so assertions are label-stable.
+ * The swipe hook exposes controllable menu/closing state; existing action tests
+ * start with the context menu open. Media queries use the real installed hook,
+ * and i18n records menu construction while returning label-stable raw keys.
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { MantineProvider } from "@mantine/core";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -19,6 +21,8 @@ import { createRoot, type Root } from "react-dom/client";
 import type { ToolCallDetailRef } from "../../../lib/api/narrators";
 import { NarratorDockContext, type NarratorDockContextValue } from "../dock/NarratorDockContext";
 
+const realMantineHooksModule = { ...(await import("@mantine/hooks")) };
+const realSwipeMenuModule = { ...(await import("@frontend/hooks/useSwipeMenu")) };
 const realReactI18nextModule = { ...(await import("react-i18next")) };
 const realUsePlatformModule = { ...(await import("@frontend/hooks/usePlatform")) };
 const realMessageSelectionModule = { ...(await import("../message/MessageSelectionCtx")) };
@@ -26,17 +30,24 @@ const realMessageSelectionModule = { ...(await import("../message/MessageSelecti
 const closeSwipeMock = mock(() => {});
 const clipboardCopyMock = mock((_value: string) => {});
 let platformMock: "windows" | "macos" | "linux" = "linux";
+let ctxMenuOpened = true;
+let swipeOffset = 0;
+let swipeClosing = false;
+let mobileMatches = false;
+const translateMock = mock((key: string) => key);
+const mediaQueryValues: boolean[] = [];
+const mediaQueryListeners = new Set<(event: MediaQueryListEvent) => void>();
+const globalDescriptors = new Map<string, PropertyDescriptor | undefined>();
 
 mock.module("@frontend/hooks/useSwipeMenu", () => ({
 	useSwipeMenu: () => ({
 		swipeBoxRef: { current: null },
 		swipeMenuRef: { current: null },
-		swipeOffset: 0,
-		swipeRevealed: false,
-		swipeClosing: false,
+		swipeOffset,
+		swipeRevealed: swipeOffset > 0,
+		swipeClosing,
 		closeSwipe: closeSwipeMock,
-		// Forced open so the dropdown (and thus the menu items) render.
-		ctxMenuOpened: true,
+		ctxMenuOpened,
 		setCtxMenuOpened: () => {},
 		ctxMenuPos: { x: 0, y: 0, flipY: false },
 		setCtxMenuPos: () => {},
@@ -51,7 +62,12 @@ mock.module("@frontend/hooks/usePlatform", () => ({
 	usePlatform: () => platformMock,
 }));
 mock.module("@mantine/hooks", () => ({
-	useMediaQuery: () => false,
+	...realMantineHooksModule,
+	useMediaQuery: (...args: Parameters<typeof realMantineHooksModule.useMediaQuery>) => {
+		const matches = realMantineHooksModule.useMediaQuery(...args);
+		if (args[0] === MOBILE_VIEWPORT_MEDIA_QUERY) mediaQueryValues.push(matches);
+		return matches;
+	},
 	useClipboard: () => ({ copy: clipboardCopyMock, copied: false, reset: () => {} }),
 	useDisclosure: (initial = false) => [
 		initial,
@@ -59,7 +75,7 @@ mock.module("@mantine/hooks", () => ({
 	],
 }));
 mock.module("react-i18next", () => ({
-	useTranslation: () => ({ t: (key: string) => key }),
+	useTranslation: () => ({ t: translateMock }),
 }));
 mock.module("../CompactMenuSub", () => ({ CompactMenuSub: () => null }));
 mock.module("../message/MessageSelectionCtx", () => ({
@@ -85,13 +101,21 @@ let container: HTMLDivElement | undefined;
 function installDom() {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
 	const matchMedia = (query: string) => ({
-		matches: false,
+		matches: query === MOBILE_VIEWPORT_MEDIA_QUERY ? mobileMatches : false,
 		media: query,
 		onchange: null,
 		addListener() {},
 		removeListener() {},
-		addEventListener() {},
-		removeEventListener() {},
+		addEventListener(type: string, listener: (event: MediaQueryListEvent) => void) {
+			if (query === MOBILE_VIEWPORT_MEDIA_QUERY && type === "change") {
+				mediaQueryListeners.add(listener);
+			}
+		},
+		removeEventListener(type: string, listener: (event: MediaQueryListEvent) => void) {
+			if (query === MOBILE_VIEWPORT_MEDIA_QUERY && type === "change") {
+				mediaQueryListeners.delete(listener);
+			}
+		},
 		dispatchEvent: () => false,
 	});
 	const requestAnimationFrame = (callback: FrameRequestCallback) => setTimeout(callback, 0);
@@ -124,6 +148,7 @@ function installDom() {
 	};
 	for (const [key, value] of Object.entries(globals)) {
 		const descriptor = Object.getOwnPropertyDescriptor(globalThis, key);
+		globalDescriptors.set(key, descriptor);
 		if (descriptor && !descriptor.configurable) {
 			if ("writable" in descriptor && descriptor.writable) Reflect.set(globalThis, key, value);
 			continue;
@@ -205,6 +230,12 @@ beforeEach(() => {
 	closeSwipeMock.mockClear();
 	clipboardCopyMock.mockClear();
 	platformMock = "linux";
+	ctxMenuOpened = true;
+	swipeOffset = 0;
+	swipeClosing = false;
+	mobileMatches = false;
+	mediaQueryValues.length = 0;
+	translateMock.mockClear();
 });
 
 afterEach(async () => {
@@ -212,15 +243,112 @@ afterEach(async () => {
 	container?.remove();
 	root = undefined;
 	container = undefined;
+	expect(mediaQueryListeners.size).toBe(0);
+	for (const [key, descriptor] of globalDescriptors) {
+		if (!descriptor) Reflect.deleteProperty(globalThis, key);
+		else if (!descriptor.configurable && "writable" in descriptor && descriptor.writable) {
+			Reflect.set(globalThis, key, descriptor.value);
+		} else Object.defineProperty(globalThis, key, descriptor);
+	}
+	globalDescriptors.clear();
 });
 
 afterAll(() => {
+	mock.module("@mantine/hooks", () => realMantineHooksModule);
+	mock.module("@frontend/hooks/useSwipeMenu", () => realSwipeMenuModule);
 	mock.module("react-i18next", () => realReactI18nextModule);
 	mock.module("@frontend/hooks/usePlatform", () => realUsePlatformModule);
 	mock.module("../message/MessageSelectionCtx", () => realMessageSelectionModule);
 	mock.restore();
 });
 
+describe("VListRowInteraction — idle mounting cost", () => {
+	test("does not construct menu content while both menus are closed", async () => {
+		ctxMenuOpened = false;
+		await renderRow({
+			copyText: "copy body",
+			onOpenFullscreen: () => {},
+			onViewOriginal: () => {},
+			actions: { messageId: "m1", onEditMessage: () => {}, onDeleteBlock: () => {} },
+			toolMeta: { toolName: "Read", filePath: "/a.ts", isReadTool: true },
+			narratorId: "n1",
+			toolUseId: "tu_1",
+		});
+		expect(container?.textContent).toContain("row body");
+		expect(menuLabels()).toEqual([]);
+		// Unlike checking absent DOM alone, this catches eager creation of the
+		// discarded menu JSX: every available menu item resolves its label.
+		expect(translateMock).not.toHaveBeenCalled();
+	});
+
+	test("opens with current actions after closed-row updates, without swipe-only cancel", async () => {
+		ctxMenuOpened = false;
+		const oldEdit = mock(() => {});
+		const newEdit = mock(() => {});
+		await renderRow({ actions: { messageId: "m1", onEditMessage: oldEdit } });
+		await renderRow({ actions: { messageId: "m1", onEditMessage: newEdit } });
+		expect(translateMock).not.toHaveBeenCalled();
+		ctxMenuOpened = true;
+		await renderRow({ actions: { messageId: "m1", onEditMessage: newEdit } });
+		expect(menuLabels()).toContain("contextMenu_edit");
+		expect(menuLabels()).not.toContain("cancel");
+		expect(translateMock.mock.calls.map(([key]) => key)).not.toContain("cancel");
+		clickMenuItem("contextMenu_edit");
+		expect(newEdit).toHaveBeenCalledTimes(1);
+		expect(oldEdit).not.toHaveBeenCalled();
+	});
+
+	test("retains swipe items during closing, then stops building them", async () => {
+		ctxMenuOpened = false;
+		swipeOffset = 180;
+		const onOpenFullscreen = mock(() => {});
+		const opts = { copyText: "body", onOpenFullscreen };
+		await renderRow(opts);
+		expect(menuLabels()).toContain("fullscreen");
+		expect(menuLabels()).toContain("copy");
+		expect(menuLabels()).toContain("cancel");
+		clickMenuItem("fullscreen");
+		expect(onOpenFullscreen).toHaveBeenCalledTimes(1);
+		swipeOffset = 0;
+		swipeClosing = true;
+		await renderRow(opts);
+		expect(menuLabels()).toContain("fullscreen");
+		expect(menuLabels()).toContain("cancel");
+		swipeClosing = false;
+		translateMock.mockClear();
+		await renderRow(opts);
+		expect(menuLabels()).toEqual([]);
+		expect(translateMock).not.toHaveBeenCalled();
+	});
+
+	test.each([
+		false,
+		true,
+	])("keeps the real deferred media query initialization (%s)", async (mobile) => {
+		ctxMenuOpened = false;
+		mobileMatches = mobile;
+		await renderRow({ copyText: "body" });
+		expect(mediaQueryValues).toEqual([false, mobile]);
+		expect(mediaQueryListeners.size).toBe(1);
+	});
+
+	test("keeps subscribing to desktop/mobile breakpoint changes", async () => {
+		ctxMenuOpened = false;
+		await renderRow();
+		expect(mediaQueryValues).toEqual([false, false]);
+		for (const matches of [true, false]) {
+			await act(async () => {
+				mobileMatches = matches;
+				for (const listener of mediaQueryListeners) {
+					listener({ matches, media: MOBILE_VIEWPORT_MEDIA_QUERY } as MediaQueryListEvent);
+				}
+			});
+		}
+		expect(mediaQueryValues).toEqual([false, false, true, false]);
+		expect(mediaQueryListeners.size).toBe(1);
+		expect(translateMock).not.toHaveBeenCalled();
+	});
+});
 test("Edit right-click prefers the persisted tool ref over the render id and current-file action", async () => {
 	const openFilePanel = mock((..._args: unknown[]) => {});
 	const legacyOpen = mock((_path: string) => {});

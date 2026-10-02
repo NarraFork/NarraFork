@@ -34,6 +34,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { shellSource } from "./guard-source";
+import { sliceBracketedRegion } from "./source-slice";
 
 const DIR = import.meta.dir;
 const SHELL = shellSource();
@@ -91,7 +92,8 @@ describe("drilled-in card: reflection take-over", () => {
 	});
 
 	it("passes the UNRESOLVED resolver down to the row", () => {
-		expect(SHELL).toContain("getReflectionTakeOver={getReflectionTakeOver}");
+		const rowProps = sliceBracketedRegion(SHELL, "const rowProps: ExactRowProps = {");
+		expect(rowProps).toMatch(/\n\s*getReflectionTakeOver,\s*\n/);
 	});
 
 	it("keeps the new resolver in the ExactRow memo comparator", () => {

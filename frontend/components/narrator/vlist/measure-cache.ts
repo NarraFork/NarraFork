@@ -43,6 +43,11 @@ import type { MeasuredElement } from "./prepared-block";
  */
 export const MEASURE_BODY_SOURCE_CHAR_BUDGET = 4_000_000;
 
+/** Bound Map hashing/equality and retained UTF-16 key lengths independently. */
+export const TEXT_SIGNATURE_MAX_TEXT_CHARS = 2048;
+export const TEXT_SIGNATURE_MAX_ENTRIES = 8192;
+export const TEXT_SIGNATURE_CHAR_BUDGET = 1_048_576;
+
 /** Only the measured body's retained payload, never a stringify/deep walk of user input. */
 export function retainedBodySourceChars(value: unknown): number {
 	if (!value || typeof value !== "object") return 0;
@@ -74,6 +79,8 @@ export class MeasureCache {
 	private sourceChars = 0;
 	private _hits = 0;
 	private _misses = 0;
+	private textSignatures = new Map<string, string>();
+	private textSignatureChars = 0;
 
 	constructor(
 		private ceiling: number,
@@ -88,6 +95,36 @@ export class MeasureCache {
 		}
 		this._hits++;
 		return entry.value;
+	}
+
+	/**
+	 * Reuse only an immutable STRING value, never a mutable adapter data object.
+	 * Larger keys bypass Map entirely: their hashing/equality could scan the body
+	 * before the original fixed-sample signature algorithm even starts.
+	 */
+	signatureForText(text: string): string {
+		if (text.length > TEXT_SIGNATURE_MAX_TEXT_CHARS) return computeTextSignature(text);
+		const cached = this.textSignatures.get(text);
+		if (cached !== undefined) return cached;
+		const signature = computeTextSignature(text);
+		// Admission, not eviction: a full sequential scan keeps its admitted cohort
+		// hot even when the working set exceeds either limit. Cold strings fall back.
+		if (
+			this.textSignatures.size < TEXT_SIGNATURE_MAX_ENTRIES &&
+			this.textSignatureChars + text.length <= TEXT_SIGNATURE_CHAR_BUDGET
+		) {
+			this.textSignatures.set(text, signature);
+			this.textSignatureChars += text.length;
+		}
+		return signature;
+	}
+
+	get textSignatureEntries(): number {
+		return this.textSignatures.size;
+	}
+
+	get retainedTextSignatureChars(): number {
+		return this.textSignatureChars;
 	}
 
 	private remove(key: string): void {
@@ -118,6 +155,8 @@ export class MeasureCache {
 		this.map.clear();
 		this.families.clear();
 		this.sourceChars = 0;
+		this.textSignatures.clear();
+		this.textSignatureChars = 0;
 	}
 	clear(): void {
 		this.clearStorage();
@@ -759,6 +798,11 @@ function detailTextRevision(detail: unknown): string {
 const REVISION_HASH_SAMPLES = 512;
 
 function textSignature(text: string): string {
+	return measureCache.signatureForText(text);
+}
+
+/** Original signature algorithm; cache misses and oversized text take this path. */
+function computeTextSignature(text: string): string {
 	const len = text.length;
 	let hash = 0x811c9dc5;
 	const mix = (code: number) => {

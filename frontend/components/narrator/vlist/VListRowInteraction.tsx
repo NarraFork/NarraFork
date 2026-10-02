@@ -281,7 +281,12 @@ export function VListRowInteraction({
 		filePath
 	);
 
-	const toolMenuItemsNode = hasToolActions ? (
+	// Creating an element still costs work even when no menu mounts it. Keep the
+	// closing swipe mounted too: dropping its items early would cut off the fade.
+	const showSwipeMenu = interactive && (swipe.swipeOffset > 0 || swipe.swipeClosing);
+	const showMenuItems = interactive && (swipe.ctxMenuOpened || showSwipeMenu);
+	const showToolMenuItems = showMenuItems && hasToolActions;
+	const toolMenuItemsNode = showToolMenuItems ? (
 		<>
 			{toolActions?.onViewSubagentSession && (
 				<Menu.Item
@@ -367,7 +372,7 @@ export function VListRowInteraction({
 
 	const hasViewActions = copyText != null || onOpenFullscreen != null || inspectContent != null;
 
-	const menuItemsNode = (
+	const menuItemsNode = showMenuItems ? (
 		<>
 			{onOpenFullscreen && (
 				<Menu.Item
@@ -509,9 +514,9 @@ export function VListRowInteraction({
 				</Menu.Item>
 			)}
 		</>
-	);
+	) : null;
 
-	const menuItemsWithCancel = (
+	const menuItemsWithCancel = showSwipeMenu ? (
 		<>
 			{menuItemsNode}
 			<Menu.Divider />
@@ -519,7 +524,7 @@ export function VListRowInteraction({
 				{t("cancel")}
 			</Menu.Item>
 		</>
-	);
+	) : null;
 
 	// Selected visual offset (mobile only) so a selected row matches the anchor's
 	// swipe, mirroring ContentViewer's selectionOffset behaviour.
@@ -556,7 +561,7 @@ export function VListRowInteraction({
 			</Box>
 
 			{/* Swipe-reveal action menu — portal to body, position:fixed. */}
-			{(swipe.swipeOffset > 0 || swipe.swipeClosing) &&
+			{showSwipeMenu &&
 				(() => {
 					const menuEl = swipe.swipeMenuRef.current;
 					const pos = swipe.getSwipeMenuPosition(menuEl?.offsetHeight ?? 200);

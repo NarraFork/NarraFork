@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { buildPretextLayoutIndex, type PretextLayoutManifest } from "@shared/pretext-layout";
 import { NarratorWSManager } from "../../../lib/narrator-ws-manager";
-import { shellSource } from "./guard-source";
+import { shellModule, shellSource } from "./guard-source";
+import { sliceBracketedRegion } from "./source-slice";
 import {
 	resolvePretextDocumentView,
 	resolveRebuildView,
@@ -261,8 +262,15 @@ describe("PretextExactMessageList", () => {
 		expect(source).toContain("exactLayout.totalHeight");
 		// Rows tile the canvas via an outer hit box and center their own column, so
 		// a drag-selection never crosses a caret-less strip (gaps / side margins).
-		expect(source).toContain("hitHeight={resolveRowHitHeight(");
-		expect(source).toContain("contentWidth={contentWidth}");
+		const rowProps = sliceBracketedRegion(source, "const rowProps: ExactRowProps = {");
+		expect(rowProps).toMatch(
+			/hitHeight:\s*resolveRowHitHeight\(\s*exactLayout\.items,\s*itemIndex,\s*exactLayout\.totalHeight,?\s*\)/,
+		);
+		expect(rowProps).toMatch(/\n\s*contentWidth,\s*\n/);
+		// The projected geometry must reach ExactRow unchanged through the element factory.
+		expect(source).toMatch(/windowRowProjections\.push\(\{\s*props: rowProps,/);
+		expect(source).toContain("useVListWindowRows(narratorId, windowRowProjections)");
+		expect(shellModule("useVListWindowRows.tsx")).toContain("<ExactRow key={key} {...props} />");
 		expect(source).toContain("{ minHeight: hitHeight } : { height: hitHeight }");
 		expect(source).toContain('style={{ position: "relative", width: "100%" }}');
 		expect(source).toContain("const resolveExactToolColor = useCallback");

@@ -60,10 +60,12 @@ const VLIST_DIR = import.meta.dir;
 export const SHELL_MODULES = [
 	"PretextExactMessageList.tsx",
 	"ExactRow.tsx",
+	"useVListWindowRows.tsx",
 	"vlist-exact-document.ts",
 	"vlist-exact-layout.ts",
 	"vlist-exact-row-state.ts",
 	"vlist-exact-scroll.ts",
+	"vlist-window-row-reuse.ts",
 ] as const;
 
 export type ShellModuleName = (typeof SHELL_MODULES)[number];

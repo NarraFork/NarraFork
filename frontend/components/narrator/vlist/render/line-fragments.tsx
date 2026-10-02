@@ -67,27 +67,18 @@
 
 import type { ReactNode } from "react";
 
-/**
- * The single flex item of a visual line. Every render-*.tsx that paints pretext
- * fragments inside a flex line MUST route them through this, or the line
- * reintroduces the stray newlines described above.
- */
+/** Shared by React fragments and the escaped static-span painter. Geometry identical. */
+export const LINE_FRAGMENTS_STYLE = {
+	// One block flex item prevents fragment boundaries becoming copied newlines.
+	display: "block",
+	// Do not shrink/re-wrap into extra rows outside the measured height.
+	flexShrink: 0,
+	// Center/right alignment must use the same max-content advance.
+	width: "max-content",
+} as const;
 export function LineFragments({ children }: { children: ReactNode }) {
 	return (
-		<span
-			data-vlist-line-frags
-			style={{
-				// Block, so its inline children have no block boundary between them and
-				// the plain-text serializer keeps them on one line.
-				display: "block",
-				// Never let the flex line squeeze this below its content: the fragments
-				// would rewrap and break the reserved height (see the note above).
-				flexShrink: 0,
-				// Size to content so centered / right-aligned lines place fragments at
-				// the same offsets as the unwrapped version.
-				width: "max-content",
-			}}
-		>
+		<span data-vlist-line-frags style={LINE_FRAGMENTS_STYLE}>
 			{children}
 		</span>
 	);

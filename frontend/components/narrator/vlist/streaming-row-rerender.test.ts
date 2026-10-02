@@ -8,6 +8,7 @@
 
 import { describe, expect, it } from "bun:test";
 import { shellModule, shellSource } from "./guard-source";
+import { sliceBracketedRegion } from "./source-slice";
 
 const SHELL = shellSource();
 
@@ -56,12 +57,16 @@ describe("the trace row-interaction slot uses per-group semantic bindings", () =
 
 	it("resolves the current group's binding by the complete item key", () => {
 		expect(SHELL).toContain("const traceBinding = traceBindingsByKey.get(item.spec.key)");
-		expect(SHELL).toContain("rowInteraction={traceBinding?.rowInteraction}");
+		const rowProps = sliceBracketedRegion(SHELL, "const rowProps: ExactRowProps = {");
+		expect(rowProps).toContain("rowInteraction: traceBinding?.rowInteraction");
 	});
 
 	it("does not give ordinary rows a global tool-action resolver", () => {
-		expect(SHELL).toContain("resolveRowToolActions={traceBinding?.resolveRowToolActions}");
+		const rowProps = sliceBracketedRegion(SHELL, "const rowProps: ExactRowProps = {");
+		expect(rowProps).toContain("resolveRowToolActions: traceBinding?.resolveRowToolActions");
 		expect(SHELL).not.toContain("resolveRowToolActions={resolveRowToolActions}");
+		expect(rowProps).not.toMatch(/resolveRowToolActions:\s*resolveRowToolActions\b/);
+		expect(rowProps).not.toMatch(/\n\s*resolveRowToolActions,\s*\n/);
 	});
 });
 
