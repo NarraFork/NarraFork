@@ -271,6 +271,7 @@ import {
 	type MorphElement,
 	planMorphTargets,
 } from "./vlist-morph-plan";
+import { createVListMorphScrollOrigin } from "./vlist-morph-scroll-origin";
 import {
 	createMotionScheduler,
 	drillScope,
@@ -637,6 +638,8 @@ export const PretextExactMessageList = memo(
 			// before its browser-generated scroll event has been classified.
 			const scrollViewportHeightRef = useRef<number | null>(null);
 			const scrollRafRef = useRef(0);
+			// Lifetime holder only: recording a scroll sample never schedules React work.
+			const [morphScrollOrigin] = useState(createVListMorphScrollOrigin);
 			// Where the in-flight LOD gesture is pointing (mouse / pinch center), captured
 			// by the gesture handlers and read back by readCurrentView when the rebuild
 			// captures its anchor. Expires (LOD_FOCUS_TTL_MS) so an unrelated later rebuild
@@ -694,6 +697,7 @@ export const PretextExactMessageList = memo(
 
 			const assignViewport = useCallback(
 				(node: HTMLDivElement | null) => {
+					morphScrollOrigin.invalidate();
 					viewportRef.current = node;
 					scrollViewportHeightRef.current = node?.clientHeight ?? null;
 					// Mirror into state so the ResizeObserver effect re-runs when the node is
@@ -704,7 +708,7 @@ export const PretextExactMessageList = memo(
 					if (typeof scrollRef === "function") scrollRef(node);
 					else setExternalRef(scrollRef, node);
 				},
-				[scrollRef],
+				[scrollRef, morphScrollOrigin],
 			);
 			const assignContent = useCallback(
 				(node: HTMLDivElement | null) => {
@@ -733,28 +737,32 @@ export const PretextExactMessageList = memo(
 			 * of once per animation frame; the chase's exact landing still uses the full
 			 * write so state converges to the true position.
 			 */
-			const writeScrollTopCore = useCallback((nextTop: number, advanceState: boolean) => {
-				const node = viewportRef.current;
-				if (!node || !visibleViewportRef.current.isVisible(node)) {
-					smoothFollowerRef.current?.cancel();
-					return;
-				}
-				const target = Math.max(0, nextTop);
-				node.scrollTop = target;
-				// Read back: the container clamps, so the settled value is what future scroll
-				// events will report for this write.
-				const settled = node.scrollTop;
-				suppressScrollStateRef.current = true;
-				suppressedScrollTopRef.current = settled;
-				scrollTopRef.current = settled;
-				scrollViewportHeightRef.current = node.clientHeight;
-				visibleViewportRef.current.recordScrollTop(settled);
-				if (advanceState) setScrollTop(settled);
-				requestAnimationFrame(() => {
-					suppressScrollStateRef.current = false;
-					suppressedScrollTopRef.current = null;
-				});
-			}, []);
+			const writeScrollTopCore = useCallback(
+				(nextTop: number, advanceState: boolean) => {
+					morphScrollOrigin.invalidate();
+					const node = viewportRef.current;
+					if (!node || !visibleViewportRef.current.isVisible(node)) {
+						smoothFollowerRef.current?.cancel();
+						return;
+					}
+					const target = Math.max(0, nextTop);
+					node.scrollTop = target;
+					// Read back: the container clamps, so the settled value is what future scroll
+					// events will report for this write.
+					const settled = node.scrollTop;
+					suppressScrollStateRef.current = true;
+					suppressedScrollTopRef.current = settled;
+					scrollTopRef.current = settled;
+					scrollViewportHeightRef.current = node.clientHeight;
+					visibleViewportRef.current.recordScrollTop(settled);
+					if (advanceState) setScrollTop(settled);
+					requestAnimationFrame(() => {
+						suppressScrollStateRef.current = false;
+						suppressedScrollTopRef.current = null;
+					});
+				},
+				[morphScrollOrigin],
+			);
 			const writeScrollTop = useCallback(
 				(nextTop: number) => writeScrollTopCore(nextTop, true),
 				[writeScrollTopCore],
@@ -3028,6 +3036,23 @@ export const PretextExactMessageList = memo(
 			}, [ensureWriteSource, narratorId, visible.start, visible.end, renderItems]);
 			const exactLayoutRef = useRef(exactLayout);
 			exactLayoutRef.current = exactLayout;
+			const readMorphScrollTop = useCallback(() => {
+				const node = viewportRef.current;
+				const layout = exactLayoutRef.current;
+				if (!node || !layout) return scrollTopRef.current;
+				return morphScrollOrigin.read(
+					{
+						narratorId,
+						viewport: node,
+						items: renderItemsRef.current,
+						layout,
+						viewportHeight: viewportHeightRef.current,
+						footerHeight: footerHeightRef.current,
+						footer: tailFooter,
+					},
+					() => node.scrollTop,
+				);
+			}, [morphScrollOrigin, narratorId, tailFooter]);
 
 			// Read watermark seam: the STRICTLY visible window (no overscan) mapped to
 			// its last source message id. Chat rooms translate that id back into a seq
@@ -3418,7 +3443,7 @@ export const PretextExactMessageList = memo(
 						})),
 					});
 				}
-				const next = buildDrillSnapshots(traces, node.scrollTop);
+				const next = buildDrillSnapshots(traces, readMorphScrollTop());
 				const prev = drillMorphPrevRef.current;
 				// Only morph across a USER-driven fold: if the document revision moved, a live
 				// patch / page / reload rebuilt the window and the diff would mix the reader's
@@ -3562,7 +3587,7 @@ export const PretextExactMessageList = memo(
 				const layout = exactLayoutRef.current;
 				if (!node || !layout) return;
 				const items = renderItemsRef.current;
-				const scrollTop = node.scrollTop;
+				const scrollTop = readMorphScrollTop();
 				const vh = viewportHeightRef.current;
 				// Assemble the unitId-bearing elements straight from the layout + specs. The
 				// whole committed document is read here (geometry is O(n) plain numbers, cheap);
@@ -3913,7 +3938,7 @@ export const PretextExactMessageList = memo(
 					widthBucket: String(pretextDocument.manifest?.widthBucket ?? ""),
 					resizing:
 						pretextDocument.resizePreview || resizeControllerRef.current?.isPending() === true,
-					scrollTop: node.scrollTop,
+					scrollTop: readMorphScrollTop(),
 				};
 				const prev = lifecyclePrevRef.current;
 				const prevContext = lifecyclePrevContextRef.current;
@@ -3952,7 +3977,7 @@ export const PretextExactMessageList = memo(
 				// Land a running chase first: the plan's pinned afterScrollTop is the PREDICTED
 				// bottom, and a glide still heading there would move rows under the animation.
 				smoothFollowerRef.current?.snapToTarget();
-				const afterScrollTop = pinnedToBottom ? getScrollBottomTarget(node) : node.scrollTop;
+				const afterScrollTop = pinnedToBottom ? getScrollBottomTarget(node) : readMorphScrollTop();
 				const plan = planLifecycleMotion({
 					before: prev,
 					after: next,
@@ -4244,6 +4269,7 @@ export const PretextExactMessageList = memo(
 				});
 				resizeControllerRef.current = controller;
 				const measure = () => {
+					morphScrollOrigin.invalidate();
 					// The stable chat temporarily parks off-layout while a dock slot mounts.
 					// Do not commit a one-pixel reading width or zero plan-detail cap.
 					if (!visibleViewportRef.current.isVisible(node)) return;
@@ -4267,7 +4293,7 @@ export const PretextExactMessageList = memo(
 					controller.dispose();
 					if (resizeControllerRef.current === controller) resizeControllerRef.current = null;
 				};
-			}, [viewportNode, centeredColumn, readViewportView, writeScrollTop]);
+			}, [viewportNode, centeredColumn, readViewportView, writeScrollTop, morphScrollOrigin]);
 			// A capped column may keep the same width across a viewport breakpoint.
 			// Notify the controller explicitly rather than relying on ResizeObserver.
 			useLayoutEffect(() => {
@@ -4294,12 +4320,14 @@ export const PretextExactMessageList = memo(
 
 			const hasTailFooter = tailFooter != null;
 			useLayoutEffect(() => {
+				morphScrollOrigin.invalidate();
 				const node = footerNodeRef.current;
 				if (!hasTailFooter || !node) {
 					setFooterHeight(0);
 					return;
 				}
 				const measure = () => {
+					morphScrollOrigin.invalidate();
 					if (!visibleViewportRef.current.isVisible(viewportRef.current)) return;
 					setFooterHeight(Math.max(0, node.offsetHeight));
 				};
@@ -4308,7 +4336,7 @@ export const PretextExactMessageList = memo(
 				const observer = new ResizeObserver(measure);
 				observer.observe(node);
 				return () => observer.disconnect();
-			}, [hasTailFooter]);
+			}, [hasTailFooter, morphScrollOrigin]);
 
 			// The streaming row now grows `exactLayout.totalHeight` like any other row, so
 			// the geometry revision no longer needs a separate tail-height term.
@@ -4505,12 +4533,39 @@ export const PretextExactMessageList = memo(
 				resizeControllerRef.current?.refresh();
 				const layout = exactLayoutRef.current;
 				if (!layout) return;
+				// This frame sampled the native position before React mounts the new band.
+				// Reuse only for a whole-viewport jump with unchanged document geometry.
+				// Fine scrolling keeps its original pre-paint layout-read order; deferring
+				// that small flush increased its frame-interval tail in browser controls.
+				if (
+					resizeControllerRef.current?.isPending() !== true &&
+					liveViewportHeight === viewportHeightRef.current &&
+					Math.abs(settledTop - previousTop) > liveViewportHeight
+				) {
+					morphScrollOrigin.record(
+						{
+							narratorId,
+							viewport: node,
+							items: renderItemsRef.current,
+							layout,
+							viewportHeight: liveViewportHeight,
+							footerHeight: footerHeightRef.current,
+							footer: tailFooter,
+						},
+						settledTop,
+					);
+				} else {
+					morphScrollOrigin.invalidate();
+				}
 				const nextWindow = resolveVisibleWindow(layout, settledTop, viewportHeight, ITEM_OVERSCAN);
 				const cur = visibleRef.current;
 				if (nextWindow.start !== cur.start || nextWindow.end !== cur.end) {
 					setScrollTop(settledTop);
 				}
 			}, [
+				morphScrollOrigin,
+				narratorId,
+				tailFooter,
 				maybeAutoLoadOlder,
 				readViewportView,
 				onAtBottomChange,
@@ -4521,9 +4576,11 @@ export const PretextExactMessageList = memo(
 			]);
 
 			const onScroll = useCallback(() => {
+				// Until the queued native event is classified, an older sample is not live.
+				morphScrollOrigin.invalidate();
 				if (scrollRafRef.current) return;
 				scrollRafRef.current = requestAnimationFrame(processScrollFrame);
-			}, [processScrollFrame]);
+			}, [processScrollFrame, morphScrollOrigin]);
 			useEffect(
 				() => () => {
 					if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current);
