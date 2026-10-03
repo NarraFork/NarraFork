@@ -9,6 +9,7 @@ import {
 	canSurfaceHandleDrag,
 	DOCKVIEW_SURFACE_ATTR,
 	dropExistingPanel,
+	dropNativePanel,
 	isLocalPanelDrag,
 	isTopmostSurface,
 	NATIVE_DROP_PREVIEW_CLASS,
@@ -118,6 +119,61 @@ describe("native drop resolution → preview → panel mutation", () => {
 		});
 		expect(moves).toHaveLength(1);
 		expect(moves[0]).toMatchObject({ panel: "a", ...move });
+	});
+});
+
+describe("native release does not commit a latched hover target", () => {
+	function fixture(x: number, y = 400) {
+		const { api, moves } = makeApi({ a: { groupId: "g1" }, b: { groupId: "g2" } }, ["g1", "g2"]);
+		const event = {
+			kind: "content",
+			group: api.groups[0], // Dockview still dispatches through the previous group.
+			nativeEvent: { clientX: x, clientY: y },
+			getData: () => ({
+				viewId: api.id,
+				panelId: "a",
+				tabGroupId: undefined as string | undefined,
+			}),
+			defaultPrevented: false,
+			preventDefault() {
+				this.defaultPrevented = true;
+			},
+		};
+		return { api, moves, event };
+	}
+
+	test.each([
+		{ x: 650, move: { group: "g2", index: 1 } },
+		{ x: 550, move: { group: "g2", position: "left" } },
+	])("immediate cross-group release at $x re-hit-tests before mutation", ({ x, move }) => {
+		const { api, moves, event } = fixture(x);
+		expect(resolveNativeDrop(api, event)).toBeNull(); // Preview must still belong to its event group.
+		expect(dropNativePanel(api, event)).toBe(true);
+		expect(event.defaultPrevented).toBe(true);
+		expect(moves).toHaveLength(1);
+		expect(moves[0]).toMatchObject({ panel: "a", ...move });
+	});
+
+	test("release outside all groups cancels rather than falling back to native state", () => {
+		const { api, moves, event } = fixture(1200);
+		expect(dropNativePanel(api, event)).toBe(true);
+		expect(event.defaultPrevented).toBe(true);
+		expect(moves).toEqual([]);
+	});
+
+	test("tab sorting, whole-group, foreign and already prevented drops remain untouched", () => {
+		for (const mode of ["tab", "group", "foreign", "prevented"] as const) {
+			const { api, moves, event } = fixture(650);
+			if (mode === "tab") event.kind = "tab";
+			if (mode === "group")
+				event.getData = () => ({ viewId: api.id, panelId: "a", tabGroupId: "tg" });
+			if (mode === "foreign")
+				event.getData = () => ({ viewId: "other", panelId: "a", tabGroupId: undefined });
+			if (mode === "prevented") event.defaultPrevented = true;
+			expect(dropNativePanel(api, event)).toBe(false);
+			expect(event.defaultPrevented).toBe(mode === "prevented");
+			expect(moves).toEqual([]);
+		}
 	});
 });
 

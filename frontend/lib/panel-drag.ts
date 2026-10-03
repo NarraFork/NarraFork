@@ -151,11 +151,9 @@ function beginPointerDrag(state: PanelDragState) {
 	_ownsPointer = true;
 	document.addEventListener("pointermove", onDocPointerMove, true);
 	document.addEventListener("pointerup", onDocPointerUp, true);
-	// Touch drags can be interrupted by the browser (e.g. a native gesture wins
-	// despite touch-action, or an interruption like an incoming call). Treat a
-	// pointercancel like a pointerup so the singleton never gets stuck with a
-	// half-live drag (grabbing cursor, swallowed next click).
-	document.addEventListener("pointercancel", onDocPointerUp, true);
+	// A browser interruption must release the cursor/listeners WITHOUT committing
+	// the last hover target as a drop.
+	document.addEventListener("pointercancel", cancelDrag, true);
 }
 
 /** Promote the pending drag to a live drag (first time the threshold is crossed). */
@@ -171,7 +169,7 @@ function activatePendingDrag(x: number, y: number) {
 function teardownPointerListeners() {
 	document.removeEventListener("pointermove", onDocPointerMove, true);
 	document.removeEventListener("pointerup", onDocPointerUp, true);
-	document.removeEventListener("pointercancel", onDocPointerUp, true);
+	document.removeEventListener("pointercancel", cancelDrag, true);
 }
 
 /**
@@ -278,7 +276,7 @@ function onDocPointerMove(e: PointerEvent) {
 	emit();
 }
 
-function onDocPointerUp() {
+function onDocPointerUp(event: PointerEvent) {
 	teardownPointerListeners();
 	_ownsPointer = false;
 	// Released before crossing the threshold → this was a click, not a drag.
@@ -290,7 +288,8 @@ function onDocPointerUp() {
 	}
 	document.body.style.userSelect = "";
 	document.body.style.cursor = "";
-	const final = _current;
+	// The release can cross a group/zone boundary without a final pointermove.
+	const final = _current ? { ..._current, x: event.clientX, y: event.clientY } : null;
 	_current = null;
 	for (const fn of _endListeners) fn(final);
 }

@@ -125,19 +125,14 @@
 	);
 }
 
-/* Reflecting — ORANGE (orange-6 #fd7e14), the attention family. A running gate can be
-   approved, rejected or taken over by hand, so it asks something of the reader; its
-   SHIELD shape is what tells it apart from a plain permission prompt. Earlier attempts
-   at a unique hue both failed — grape collided with the reasoning lane, teal sat only
-   31° from green — because the palette has no free slot left. See `StatusShape` in
-   status-registry for the measurements. */
+/* Reflecting — indigo self-review, distinct from user-attention yellow/orange. */
 .nf-card-shimmer--reflect::after {
 	background-image: linear-gradient(
 		90deg,
 		transparent 0%,
-		rgba(253, 126, 20, 0.07) 30%,
-		rgba(253, 126, 20, 0.15) 50%,
-		rgba(253, 126, 20, 0.07) 70%,
+		rgba(76, 110, 245, 0.07) 30%,
+		rgba(76, 110, 245, 0.15) 50%,
+		rgba(76, 110, 245, 0.07) 70%,
 		transparent 100%
 	);
 }

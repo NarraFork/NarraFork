@@ -13,6 +13,7 @@ import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
 import type { ProgressPhase } from "@shared/progress-phase";
 import type { NarratorWsSubscriptionLimitError, RecentTabsDelta } from "@shared/recent-tabs";
+import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { ApiRequestDiagnostics } from "../lib/agent/types";
@@ -625,6 +626,7 @@ export type NarratorServerMessage =
 	  }
 	| {
 			type: "tool_started";
+			streamingEditOrigin?: StreamingEditOrigin;
 			narratorId: string;
 			toolCallId: string | null;
 			toolUseId: string;

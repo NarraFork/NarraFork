@@ -575,6 +575,8 @@
 	"dangerReflectionLevel_standard": "中等",
 	"dangerReflectionLevel_strict": "严格",
 	"planReflectionShort": "计划反思",
+	"planReflectionApprovalOff": "反思批准已关闭",
+	"planReflectionApprovalOn": "反思批准已开启",
 	"dangerReflectionShort": "危险反思",
 	"override_inherit": "继承全局",
 	"override_followDefault": "跟随默认",

@@ -1,23 +1,13 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { eq, inArray } from "drizzle-orm";
+import { inArray } from "drizzle-orm";
 import { db } from "../../db";
-import { narrators } from "../../db/schema";
+import { narratorMessageRefs, narratorMessages, narrators } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { drainPendingInjections, takePendingInjectionBatch } from "../parent-injection-queue";
-import { getDetachableMap } from "../subagent-detach";
 import * as executor from "../subagent-executor";
-import { clearManualOverrideRuntimes, isManualOverride } from "../subagent-manual-override";
-import {
-	executeBackgroundTask,
-	startContinuedSubagent,
-	startForegroundRun,
-} from "../subagent-runner";
-import {
-	clearTakenOver,
-	isTakenOver,
-	markPendingBackgroundFinalize,
-	markTakenOver,
-} from "../subagent-takeover";
+import { clearManualOverrideRuntimes } from "../subagent-manual-override";
+import { startForegroundRun } from "../subagent-runner";
+import { clearTakenOver } from "../subagent-takeover";
 
 const ids: string[] = [];
 afterEach(async () => {
@@ -26,7 +16,12 @@ afterEach(async () => {
 		clearTakenOver(id);
 		drainPendingInjections(id);
 	}
-	if (ids.length) await db.delete(narrators).where(inArray(narrators.id, ids));
+	if (ids.length) {
+		// Foreground/announcement delivery now owns durable result snapshots too.
+		await db.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.narratorId, ids));
+		await db.delete(narratorMessages).where(inArray(narratorMessages.narratorId, ids));
+		await db.delete(narrators).where(inArray(narrators.id, ids));
+	}
 	ids.length = 0;
 });
 

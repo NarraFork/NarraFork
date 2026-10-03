@@ -31,6 +31,10 @@ import {
 	mergeSendDeliveryTargets,
 	type SendDeliveryReceipt,
 } from "@shared/communication-tool";
+import {
+	handoffStreamingEditOrigin,
+	type StreamingEditOrigin,
+} from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import {
 	isLiveToolStatusRegression,
@@ -178,6 +182,7 @@ export function applyStreamingToolChunk(store: StreamingToolStore, event: ToolCh
 }
 
 export interface ToolStartedEvent {
+	streamingEditOrigin?: StreamingEditOrigin;
 	toolUseId: string;
 	toolName: string;
 	streamStartedAt?: number;
@@ -242,7 +247,12 @@ export function applyStreamingToolStarted(
 		_status: resolveLiveToolStatus(existing?._status, "initializing"),
 		...(event.input
 			? {
-					_input: event.input,
+					_input: handoffStreamingEditOrigin(
+						event.toolUseId,
+						event.input,
+						event.streamingEditOrigin,
+						existing?._input,
+					) as Record<string, unknown>,
 					streamingFieldRanges: completeStreamingFieldRanges(existing, event.input),
 				}
 			: {}),
@@ -396,7 +406,12 @@ export function applyStreamingToolCompleted(
 		...(event.durationMs != null ? { _durationMs: event.durationMs } : {}),
 		...(event.updatedInput
 			? {
-					_input: event.updatedInput,
+					_input: handoffStreamingEditOrigin(
+						event.toolUseId,
+						event.updatedInput,
+						undefined,
+						existing?._input,
+					) as Record<string, unknown>,
 					streamingFieldRanges: completeStreamingFieldRanges(existing, event.updatedInput),
 				}
 			: {}),

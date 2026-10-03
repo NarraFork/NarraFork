@@ -14,10 +14,13 @@ import {
 	startNetworkCapture,
 	stopNetworkCapture,
 } from "../../browser";
+import { PROFILE_LIMITS } from "../../browser/memory-profile-constants";
 import { generateShortId } from "../../id";
 import { logger } from "../../logger";
 import { createShare, getShareDir, SCREENSHOT_PREVIEW_EXPIRY_HOURS } from "../../shares";
 import type { ToolContext, ToolDefinition, ToolResult } from "../types";
+import { handleBrowserMemory } from "./browser-memory";
+import { handleBrowserMemoryProfile } from "./browser-memory-profile";
 import { looseNumber, normalizeNumber } from "./number-param";
 import { trackFileChange } from "./track-file-change";
 
@@ -46,6 +49,12 @@ const ACTIONS = [
 	"list_sessions",
 	"perf_start",
 	"perf_stop",
+	"memory_metrics",
+	"heap_snapshot",
+	"memory_profile_start",
+	"memory_profile_stop",
+	"memory_profile_status",
+	"memory_profile_cancel",
 ] as const;
 
 type Action = (typeof ACTIONS)[number];
@@ -55,7 +64,7 @@ export const browserTool: ToolDefinition = {
 	description:
 		"Control a browser for multi-step web interactions. Supports navigation, clicking, " +
 		"form filling, screenshots, DOM inspection, JavaScript execution, network debugging, " +
-		"and performance profiling.\n\n" +
+		"performance profiling, and page-target memory diagnostics.\n\n" +
 		"Workflow:\n" +
 		'1. Use action "launch" with a URL to start a session (returns session_id)\n' +
 		"2. Use the session_id for subsequent actions (click, fill, type, etc.)\n" +
@@ -91,6 +100,31 @@ export const browserTool: ToolDefinition = {
 		'- "perf_stop": Stop tracing and save trace data to a JSON file (returns file path). ' +
 		"The trace file is in Chrome DevTools Trace Event format — " +
 		"use grep/bash/python to analyze it, or open it in Chrome DevTools\n\n" +
+		'- "memory_metrics": Sample JSHeapUsedSize/JSHeapTotalSize (bytes), Documents, Frames, Nodes and JSEventListeners. ' +
+		"Missing metrics are unavailable, not zero. Default timeout 10s, maximum 30s.\n" +
+		'- "heap_snapshot": Export a .heapsnapshot file for Chrome DevTools Memory; returns path, size and a 24h download link, never heap contents. ' +
+		"Default timeout 60s, maximum 120s; file_path is not supported.\n" +
+		"Memory workflow: memory_metrics → repeat page interactions → memory_metrics (same GC choice) → heap_snapshot. " +
+		"collect_garbage defaults to false; set it explicitly to force GC before either memory action. " +
+		"GC and snapshots may pause/disturb the page; do not use their duration as normal interaction timing. " +
+		"Metrics cover the current page target, not browser RSS, GPU memory or all workers/frames. " +
+		"One increase alone is not proof of a leak. Export multiple snapshots for comparison in DevTools. " +
+		"Cancellation stops local export but Chrome may keep collecting until it finishes; Chrome is never killed. " +
+		"Heap snapshots can contain tokens and page text. They are NOT redacted; anyone holding the share link can download them for 24h.\n\n" +
+		'- "memory_profile_start": Record allocation hotspots and/or natural GC (mode allocation/gc/both; default both). ' +
+		"Returns profile_id after collectors start. duration_ms defaults to 30000, range 1000–120000; automatically finishes. " +
+		"sampling_interval_bytes defaults to 32768, range 16384–1048576, stack depth 64.\n" +
+		'- "memory_profile_stop": Finish early; requires profile_id. Returns bounded summary and 24h artifact links. Repeated stop of the same finished recording returns its result.\n' +
+		'- "memory_profile_status": Inspect state/progress/results without fetching large data; profile_id optional for the latest recording.\n' +
+		'- "memory_profile_cancel": Cancel and discard incomplete recording; requires profile_id. Does not delete already completed shares.\n' +
+		"Profile workflow: start → reproduce actions with click/evaluate/scroll → stop → compare the GC spans and allocation hotspots. " +
+		"Only one memory profile runs globally. Profiling conflicts with heap snapshots/forced GC; GC recording also conflicts with browser-wide perf tracing. " +
+		"Never force GC during natural-GC observation. Recording is cancelled on close, disconnect or new-document navigation; same-document SPA navigation is allowed. " +
+		"GC statistics describe the target renderer main thread's observed spans, NOT exact collection cycles, CPU percentage or all workers. " +
+		"Allocation sizes are statistical estimates including requested collected objects; samples have no timestamps and do not prove which stack caused a particular GC. " +
+		"Raw browser-wide traces are never shared; only scoped GC events are exported. Profiles/filtered traces may still contain script URLs and paths; links are accessible to their holders for 24h. " +
+		"Unsupported scope, partial data and unverified browser versions produce explicit warnings, not a healthy/zero-GC conclusion. " +
+		"If resource limits are reached, increase sampling_interval_bytes or shorten duration_ms and retry.\n\n" +
 		"Native JavaScript dialogs (alert, confirm, prompt, beforeunload) are automatically dismissed " +
 		"to prevent blocking, including dialogs in newly opened windows. Confirm returns false and prompt returns null; " +
 		"business confirmations are never automatically accepted. Use get_console to inspect dialog messages and failures. " +
@@ -109,7 +143,8 @@ export const browserTool: ToolDefinition = {
 		"- key (optional): Special key name for type action (e.g. Enter, Tab, Escape, ArrowDown)\n" +
 		"- direction (optional): 'back'/'forward' for navigate, 'up'/'down' for scroll\n" +
 		"- amount (optional): Scroll distance in pixels for scroll action (default: 500)\n" +
-		"- timeout (optional): Timeout in ms for wait/element actions and JavaScript execution (default: 10000 for wait)\n" +
+		"- timeout (optional): Timeout in ms for wait/element actions, JavaScript execution and memory diagnostics (memory actions use a bounded total deadline)\n" +
+		"- collect_garbage (optional): Explicitly force GC before memory_metrics/heap_snapshot (default: false)\n" +
 		"- ttl_ms (optional): Browser session inactivity auto-close TTL in ms for launch/set_ttl; default 600000, allowed 1000–86400000\n" +
 		"- coordinate (optional): {x, y} for click/scroll at specific position\n" +
 		"- max_length (optional): Max output length for dom/get_text/evaluate/evaluate_capture/get_console/get_network (default: 20000)\n" +
@@ -132,6 +167,23 @@ export const browserTool: ToolDefinition = {
 			url: {
 				description: "URL for launch/navigate actions",
 				type: "string",
+			},
+			profile_id: {
+				type: "string",
+				description: "Recording ID required for memory_profile_stop/cancel",
+			},
+			mode: {
+				type: "string",
+				enum: ["allocation", "gc", "both"],
+				description: "memory_profile_start mode (default both)",
+			},
+			duration_ms: {
+				type: "number",
+				description: "Profile duration, 1000–120000ms, default 30000",
+			},
+			sampling_interval_bytes: {
+				type: "number",
+				description: "Profile sampling interval, 16384–1048576 bytes, default 32768",
 			},
 			session_id: {
 				description:
@@ -158,7 +210,7 @@ export const browserTool: ToolDefinition = {
 			},
 			timeout: {
 				description:
-					"Timeout in ms for wait/element actions and JavaScript execution (default: 10000 for wait)",
+					"Timeout in ms for wait/element actions, JavaScript execution and memory diagnostics (bounded total deadline for memory actions)",
 				type: "number",
 			},
 			ttl_ms: {
@@ -201,6 +253,10 @@ export const browserTool: ToolDefinition = {
 				description: "For get_network, include headers and post data in output",
 				type: "boolean",
 			},
+			collect_garbage: {
+				description: "Force GC before memory_metrics/heap_snapshot (default: false)",
+				type: "boolean",
+			},
 			capture_network: {
 				description:
 					"For launch only, start network capture before initial navigation (default: false)",
@@ -233,6 +289,13 @@ export const browserTool: ToolDefinition = {
 		action: z.enum(ACTIONS).describe("The browser action to perform"),
 		url: z.string().optional().describe("URL for launch/navigate"),
 		session_id: z.string().optional().describe("Browser session ID"),
+		profile_id: z.string().optional().describe("Memory recording ID (stop/cancel required)"),
+		mode: z
+			.enum(["allocation", "gc", "both"])
+			.optional()
+			.describe("Memory profile mode (default both)"),
+		duration_ms: looseNumber("Memory profile recording duration in ms"),
+		sampling_interval_bytes: looseNumber("Memory profile allocation sampling interval in bytes"),
 		selector: z.string().optional().describe("CSS selector"),
 		value: z
 			.string()
@@ -266,6 +329,10 @@ export const browserTool: ToolDefinition = {
 			.boolean()
 			.optional()
 			.describe("For get_network, include headers and post data in output"),
+		collect_garbage: z
+			.boolean()
+			.optional()
+			.describe("Force GC before memory_metrics/heap_snapshot (default: false)"),
 		capture_network: z
 			.boolean()
 			.optional()
@@ -287,6 +354,8 @@ export const browserTool: ToolDefinition = {
 			action,
 			url,
 			session_id,
+			profile_id,
+			mode,
 			selector,
 			value,
 			key,
@@ -294,6 +363,7 @@ export const browserTool: ToolDefinition = {
 			clear,
 			include_details,
 			capture_network,
+			collect_garbage,
 			file_path,
 			headless,
 			categories,
@@ -301,6 +371,8 @@ export const browserTool: ToolDefinition = {
 			action: Action;
 			url?: string;
 			session_id?: string;
+			profile_id?: string;
+			mode?: "allocation" | "gc" | "both";
 			selector?: string;
 			value?: string;
 			key?: string;
@@ -308,6 +380,7 @@ export const browserTool: ToolDefinition = {
 			clear?: boolean;
 			include_details?: boolean;
 			capture_network?: boolean;
+			collect_garbage?: boolean;
 			file_path?: string;
 			headless?: boolean;
 			categories?: string[];
@@ -315,6 +388,17 @@ export const browserTool: ToolDefinition = {
 
 		// Normalize numeric params leniently (float/string/out-of-range → sane int).
 		const timeout = normalizeNumber((args as { timeout?: unknown }).timeout, { min: 0 });
+		const duration_ms = normalizeNumber((args as { duration_ms?: unknown }).duration_ms, {
+			min: PROFILE_LIMITS.minDurationMs,
+			max: PROFILE_LIMITS.maxDurationMs,
+		});
+		const sampling_interval_bytes = normalizeNumber(
+			(args as { sampling_interval_bytes?: unknown }).sampling_interval_bytes,
+			{
+				min: PROFILE_LIMITS.minSamplingIntervalBytes,
+				max: PROFILE_LIMITS.maxSamplingIntervalBytes,
+			},
+		);
 		const ttl_ms = normalizeNumber((args as { ttl_ms?: unknown }).ttl_ms, {
 			min: MIN_SESSION_TTL_MS,
 			max: MAX_SESSION_TTL_MS,
@@ -359,6 +443,10 @@ export const browserTool: ToolDefinition = {
 				default:
 					return await handleSessionAction(ctx, action, {
 						session_id,
+						profile_id,
+						mode,
+						duration_ms,
+						sampling_interval_bytes,
 						selector,
 						value,
 						key,
@@ -371,6 +459,7 @@ export const browserTool: ToolDefinition = {
 						clear,
 						wait_after_ms,
 						include_details,
+						collect_garbage,
 						file_path,
 						url,
 						categories,
@@ -442,6 +531,9 @@ function handleListSessions(narratorId: string): ToolResult {
 		(s) =>
 			`- ${s.id} | ${s.url} | ${s.headless ? "headless" : "headed"} | ` +
 			`network: ${s.networkCaptureEnabled ? "capturing" : "off"} (${s.networkRequestCount}) | ` +
+			(s.memoryProfile
+				? `memory profile: ${s.memoryProfile.state} (${s.memoryProfile.profileId ?? "none"}) | `
+				: "") +
 			`ttl: ${formatDurationMs(s.ttlMs)} | expires: ${new Date(s.expiresAt).toISOString()} | ` +
 			`last active: ${new Date(s.lastActivity).toISOString()}`,
 	);
@@ -501,6 +593,10 @@ async function handleSessionAction(
 	action: Action,
 	opts: {
 		session_id?: string;
+		profile_id?: string;
+		mode?: "allocation" | "gc" | "both";
+		duration_ms?: number;
+		sampling_interval_bytes?: number;
 		selector?: string;
 		value?: string;
 		key?: string;
@@ -513,6 +609,7 @@ async function handleSessionAction(
 		clear?: boolean;
 		wait_after_ms?: number;
 		include_details?: boolean;
+		collect_garbage?: boolean;
 		file_path?: string;
 		url?: string;
 		categories?: string[];
@@ -536,6 +633,33 @@ async function handleSessionAction(
 	}
 
 	switch (action) {
+		case "memory_profile_start":
+		case "memory_profile_stop":
+		case "memory_profile_status":
+		case "memory_profile_cancel":
+			if (opts.file_path || opts.collect_garbage) {
+				return {
+					output: "Memory profiles do not support custom file_path or forced GC",
+					isError: true,
+				};
+			}
+			return handleBrowserMemoryProfile(session, action, {
+				profileId: opts.profile_id,
+				mode: opts.mode,
+				durationMs: opts.duration_ms,
+				samplingIntervalBytes: opts.sampling_interval_bytes,
+				signal: opts.signal,
+			});
+		case "memory_metrics":
+		case "heap_snapshot":
+			if (opts.file_path) {
+				return { output: "file_path is not supported for memory diagnostics", isError: true };
+			}
+			return handleBrowserMemory(session, action, {
+				collectGarbage: opts.collect_garbage,
+				timeout: opts.timeout,
+				signal: opts.signal,
+			});
 		case "click": {
 			if (!opts.selector && !opts.coordinate) {
 				return {
@@ -899,6 +1023,7 @@ async function handleSessionAction(
 
 		case "perf_stop": {
 			const shareId = generateShortId();
+			const shareUrl = `/api/shares/${shareId}`;
 			const shareDir = getShareDir(shareId);
 			const filename = `trace-${session.id}-${Date.now()}.json`;
 			const filePath = resolve(shareDir, filename);
@@ -920,13 +1045,13 @@ async function handleSessionAction(
 					`Duration: ${(result.durationMs / 1000).toFixed(1)}s\n` +
 					`Trace file: ${filePath}\n` +
 					`Size: ${(result.fileSize / 1024).toFixed(1)} KB\n` +
-					`Share URL: /api/shares/${shareId}/download\n` +
+					`Share URL: ${shareUrl}\n` +
 					`The trace file is in Chrome DevTools Trace Event format (JSON with traceEvents array).`,
 				metadata: {
 					sessionId: session.id,
 					tracePath: filePath,
 					shareId,
-					shareUrl: `/api/shares/${shareId}/download`,
+					shareUrl,
 				},
 			};
 		}

@@ -287,21 +287,13 @@
 	);
 }
 
-/* Reflecting — ORANGE, grouped with the states the reader can act on.
-   Two earlier attempts failed for measurable reasons. Grape collided with the reasoning
-   lane, which is ordinary progress rather than a pause. Teal then measured only 31° of
-   hue from green — indistinguishable from the success sweep. The palette simply has no
-   free slot left (cyan is 21° from blue, violet 27° from indigo, pink 21° from red), so
-   colour alone was never going to separate these states.
-   So colour now groups by what is ASKED OF THE READER: a running gate is interactive
-   (approve / reject / take over manually), which is the orange attention family. Identity
-   is carried by SHAPE instead — the shield in the notice and the sidebar. */
+/* Reflecting — indigo automated self-review, paired with the shield status glyph. */
 .nf-trace-shimmer--reflect {
 	background-image: linear-gradient(
 		90deg,
 		var(--mantine-color-dimmed) 0%,
 		var(--mantine-color-dimmed) 35%,
-		light-dark(var(--mantine-color-orange-7), var(--mantine-color-orange-3)) 50%,
+		light-dark(var(--mantine-color-indigo-7), var(--mantine-color-indigo-3)) 50%,
 		var(--mantine-color-dimmed) 65%,
 		var(--mantine-color-dimmed) 100%
 	);

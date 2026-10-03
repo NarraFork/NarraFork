@@ -13,6 +13,9 @@ import { eventBus } from "../event-bus";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
 import { installDialogProtection } from "./dialogs";
+import { type BrowserMemoryJob, cancelMemoryJob } from "./memory-job";
+import type { MemoryProfileHandle } from "./memory-profiler";
+import { finishPerformanceTrace, type PerformanceTracingState } from "./performance-tracing";
 import { createContext, DEFAULT_VIEWPORT, USER_AGENT } from "./pool";
 import { redactHeaders, redactPostData, redactUrl } from "./redaction";
 import { serializeBrowserValue } from "./serialization";
@@ -92,7 +95,13 @@ export interface BrowserSession {
 	/** Internal lookup for in-flight network requests. */
 	networkRequestMap: WeakMap<HTTPRequest, BrowserNetworkRequest>;
 	/** Performance tracing state. */
-	tracing?: { active: boolean; startedAt: number };
+	tracing?: PerformanceTracingState;
+	/** Process-local profile recorder; never transferred in restart handoff. */
+	memoryProfile?: MemoryProfileHandle;
+	/** Process-local diagnostic cancellation; excluded from stats and restart handoff. */
+	memoryJob?: BrowserMemoryJob;
+	/** Prevent new diagnostics from racing session shutdown. */
+	memoryDiagnosticsClosed?: boolean;
 }
 
 /**
@@ -109,6 +118,8 @@ export interface BrowserSessionHandoff {
 	currentPageUrl: string;
 	/** puppeteer BrowserContext.id, used to re-resolve the context after reconnect. */
 	contextId: string;
+	/** Only an interruption marker; no recorder, endpoint, summary or artifact is persisted. */
+	interruptedProfileId?: string;
 	headless: boolean;
 	ttlMs: number;
 	networkCaptureEnabled: boolean;
@@ -146,11 +157,10 @@ function expireSession(
 	session: BrowserSession,
 ): void {
 	logger.info("Browser session expired", { narratorId, sessionId, ttlMs: session.ttlMs });
-	if (session.tracing?.active) {
-		void session.page.tracing.stop().catch(() => {});
-		session.tracing = undefined;
-	}
-	void session.context.close().catch(() => {});
+	if (session.tracing?.active) void finishPerformanceTrace(session).catch(() => {});
+	void cancelMemoryJob(session)
+		.then(() => session.context.close())
+		.catch(() => {});
 	map.delete(sessionId);
 	if (map.size === 0) sessions.delete(narratorId);
 	eventBus.emit({ type: "browser:session_closed", sessionId, narratorId });
@@ -488,6 +498,7 @@ export function getSession(narratorId: string, sessionId: string): BrowserSessio
 		// Accessing pages will throw if context is closed
 		session.context.pages();
 	} catch {
+		void cancelMemoryJob(session);
 		map.delete(sessionId);
 		if (map.size === 0) sessions.delete(narratorId);
 		return undefined;
@@ -503,10 +514,8 @@ export async function closeSession(narratorId: string, sessionId: string): Promi
 	const session = map.get(sessionId);
 	if (!session) return false;
 
-	if (session.tracing?.active) {
-		await session.page.tracing.stop().catch(() => {});
-		session.tracing = undefined;
-	}
+	await cancelMemoryJob(session);
+	if (session.tracing?.active) await finishPerformanceTrace(session).catch(() => {});
 	await session.context.close().catch(() => {});
 	map.delete(sessionId);
 	if (map.size === 0) sessions.delete(narratorId);
@@ -577,14 +586,16 @@ export async function cleanupNarrator(narratorId: string): Promise<void> {
 	for (const session of map.values()) {
 		if (session.tracing?.active) {
 			promises.push(
-				session.page.tracing
-					.stop()
+				finishPerformanceTrace(session)
 					.then(() => {})
 					.catch(() => {}),
 			);
-			session.tracing = undefined;
 		}
-		promises.push(session.context.close().catch(() => {}));
+		promises.push(
+			cancelMemoryJob(session)
+				.then(() => session.context.close())
+				.catch(() => {}),
+		);
 	}
 	await Promise.all(promises);
 
@@ -607,6 +618,13 @@ export function listSessions(narratorId: string): Array<{
 	expiresAt: number;
 	headless: boolean;
 	tracing: { active: boolean; startedAt: number } | null;
+	memoryProfile: {
+		profileId?: string;
+		state: string;
+		mode?: string;
+		startedAt?: string;
+		deadline?: string;
+	} | null;
 	networkRequestCount: number;
 	networkCaptureEnabled: boolean;
 }> {
@@ -626,6 +644,15 @@ export function listSessions(narratorId: string): Array<{
 		expiresAt: s.lastActivity + s.ttlMs,
 		headless: s.headless,
 		tracing: s.tracing ? { active: s.tracing.active, startedAt: s.tracing.startedAt } : null,
+		memoryProfile: s.memoryProfile
+			? {
+					profileId: s.memoryProfile.view.profileId,
+					state: s.memoryProfile.view.state,
+					mode: s.memoryProfile.view.config?.mode,
+					startedAt: s.memoryProfile.view.startedAt,
+					deadline: s.memoryProfile.view.deadline,
+				}
+			: null,
 		networkRequestCount: s.networkRequests.length,
 		networkCaptureEnabled: s.networkCaptureEnabled,
 	}));
@@ -635,8 +662,7 @@ export function listSessions(narratorId: string): Array<{
 export async function stopTracing(narratorId: string, sessionId: string): Promise<boolean> {
 	const session = getSession(narratorId, sessionId);
 	if (!session?.tracing?.active) return false;
-	await session.page.tracing.stop().catch(() => {});
-	session.tracing = undefined;
+	await finishPerformanceTrace(session).catch(() => {});
 	return true;
 }
 
@@ -668,18 +694,20 @@ export async function closeAllSessions(options: { preserve?: boolean } = {}): Pr
 	for (const [, map] of sessions) {
 		for (const session of map.values()) {
 			if (session.tracing?.active) {
-				// Tracing state is process-local and cannot survive a restart; stop it either way.
+				// Tracing is process-local; preserve handoff must also end the owned trace.
 				promises.push(
-					session.page.tracing
-						.stop()
+					finishPerformanceTrace(session)
 						.then(() => {})
 						.catch(() => {}),
 				);
-				session.tracing = undefined;
 			}
-			if (!preserve) {
-				promises.push(session.context.close().catch(() => {}));
-			}
+			promises.push(
+				cancelMemoryJob(session)
+					.then(async () => {
+						if (!preserve) await session.context.close();
+					})
+					.catch(() => {}),
+			);
 			closed++;
 		}
 	}
@@ -722,6 +750,11 @@ export function snapshotSessionsForHandoff(): BrowserSessionHandoff[] {
 				url: session.url,
 				currentPageUrl,
 				contextId,
+				...(["starting", "recording", "finalizing"].includes(
+					session.memoryProfile?.view.state ?? "",
+				)
+					? { interruptedProfileId: session.memoryProfile?.view.profileId }
+					: {}),
 				headless: session.headless,
 				ttlMs: session.ttlMs,
 				networkCaptureEnabled: session.networkCaptureEnabled,
@@ -778,6 +811,19 @@ export async function restoreSessionFromHandoff(
 		networkRequests: [],
 		networkRequestMap: new WeakMap(),
 	};
+	if (handoff.interruptedProfileId && /^[A-Za-z0-9_-]{1,64}$/.test(handoff.interruptedProfileId)) {
+		session.memoryProfile = {
+			view: {
+				profileId: handoff.interruptedProfileId,
+				state: "cancelled",
+				stage: "restart_interrupted",
+				warnings: ["Recording was interrupted by server restart and was not resumed."],
+			},
+			done: Promise.resolve(),
+			stop: () => {},
+			cancel: () => {},
+		};
+	}
 	for (const text of earlyDialogMessages) pushConsoleMessage(session, { type: "dialog", text });
 	await installDialogProtection(context, (text) => {
 		pushConsoleMessage(session, { type: "dialog", text });

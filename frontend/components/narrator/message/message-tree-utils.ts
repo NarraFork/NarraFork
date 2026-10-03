@@ -12,6 +12,7 @@ import type {
 	ToolCallRecord,
 	TreeMessage,
 } from "@frontend/lib/api";
+import { copyStreamingEditInput, handoffStreamingEditOrigin } from "@shared/streaming-edit-origin";
 import { mergeToolLifecycleRecord, type ToolLifecycleRecord } from "@shared/tool-row-status";
 
 interface ToolCall {
@@ -25,6 +26,15 @@ interface ToolCall {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Only validated dedicated server evidence may survive a full-input handoff. */
+export function preserveStreamingEditLocation(
+	previous: unknown,
+	incoming: unknown,
+	toolUseId: string,
+): unknown {
+	return handoffStreamingEditOrigin(toolUseId, incoming, undefined, previous);
 }
 
 export function normalizeSubagentModel(value: unknown): string | null {
@@ -301,9 +311,17 @@ function mergeToolFields<T extends { inputJson?: unknown; outputJson?: unknown; 
 	if (
 		isRecord(incomingInput) &&
 		Object.keys(incomingInput).some((key) => key.startsWith("_streaming")) &&
+		!("old_string" in incomingInput || "new_string" in incomingInput) &&
 		isRecord(existing.inputJson)
 	) {
-		merged.inputJson = { ...existing.inputJson, ...incomingInput };
+		merged.inputJson = copyStreamingEditInput(existing.inputJson, incomingInput);
+	} else if (incomingInput !== undefined) {
+		const identity = existing as T & { toolUseId?: string; id?: string };
+		merged.inputJson = preserveStreamingEditLocation(
+			existing.inputJson,
+			incomingInput,
+			identity.toolUseId ?? identity.id ?? "",
+		);
 	}
 	if (fields.outputJson === undefined && existing.outputJson !== undefined) {
 		merged.outputJson = existing.outputJson;

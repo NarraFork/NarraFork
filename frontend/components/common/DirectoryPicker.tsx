@@ -76,6 +76,7 @@ interface DirectoryPickerProps {
 	/** Extra element rendered before the browse button in rightSection */
 	rightSectionExtra?: React.ReactNode;
 	leftSection?: React.ReactNode;
+	dropdownPosition?: "top" | "bottom";
 }
 
 export function DirectoryPicker({
@@ -89,6 +90,7 @@ export function DirectoryPicker({
 	disabled,
 	rightSectionExtra,
 	leftSection,
+	dropdownPosition,
 }: DirectoryPickerProps) {
 	const { t } = useTranslation("common");
 	const fsCapability = useFileSystemCapability();
@@ -148,6 +150,7 @@ export function DirectoryPicker({
 				leftSection={leftSection}
 				rightSection={rightContent}
 				rightSectionWidth={rightSectionExtra ? 64 : undefined}
+				dropdownPosition={dropdownPosition}
 			/>
 			<Modal
 				opened={opened}

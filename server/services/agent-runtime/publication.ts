@@ -1,4 +1,4 @@
-import { and, desc, eq, gt, inArray, isNull, ne, or } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { db } from "../../db";
 import { resolveDatabaseBackendConfig } from "../../db/postgres-runtime";
 import {
@@ -7,6 +7,7 @@ import {
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
+	runtimeAwaitedTerminalConsumptions,
 	runtimePublicationOutbox,
 } from "../../db/schema";
 import { ValidationError } from "../../lib/errors";
@@ -47,6 +48,17 @@ import {
 	type PublicationRun,
 	publicationDedupeKey,
 } from "./publication-outbox";
+import {
+	AGENT_RESULT_JSON_MAX_BYTES,
+	AGENT_RESULT_OUTPUT_CHARS,
+	type AgentTerminalResult,
+	type AgentTerminalResultReadOptions,
+	type AwaitedTerminalConsumeOptions,
+	agentSourceResultRef,
+	decodeAgentTerminalSnapshot,
+	decodeRunAssistantProjection,
+	parseRunSourceBoundary,
+} from "./publication-result";
 import {
 	type RuntimeQueuePort,
 	requireRuntimeQueuePort,
@@ -130,13 +142,46 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		parentNarratorId: string;
 		resumeRunId?: string;
 		started?: boolean;
+		/** Task projection registration adopts the actor's existing run, never starts a second one. */
+		taskRow?: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId">;
 	}): PublicationRun {
 		return runAtomicWrite(database, "publication.startAgentRun", (tx) => {
-			const logicalRunId = store.persistLogicalRun(
-				input.narratorId,
-				{ resumeRunId: input.resumeRunId },
-				tx,
-			);
+			let resumeRunId = input.resumeRunId;
+			if (input.taskRow && resumeRunId === undefined) {
+				const actor = tx
+					.select({ logicalRunId: narrators.logicalRunId })
+					.from(narrators)
+					.where(eq(narrators.id, input.narratorId))
+					.get();
+				if (actor?.logicalRunId) {
+					const existingRun: PublicationRun = {
+						producerKind: "agent",
+						taskId: input.narratorId,
+						logicalRunId: actor.logicalRunId,
+						recipientId: input.parentNarratorId,
+					};
+					// Only a pre-registered start is adopted. An old terminal/consumed run is
+					// not an admission token for the next task.
+					const reservation = tx
+						.select({ id: runtimePublicationOutbox.id })
+						.from(runtimePublicationOutbox)
+						.where(
+							and(
+								eq(runtimePublicationOutbox.producerKind, "agent"),
+								eq(runtimePublicationOutbox.taskId, input.narratorId),
+								eq(runtimePublicationOutbox.logicalRunId, actor.logicalRunId),
+								eq(runtimePublicationOutbox.recipientId, input.parentNarratorId),
+								eq(runtimePublicationOutbox.eventKind, "terminal"),
+								eq(runtimePublicationOutbox.state, "reserved"),
+							),
+						)
+						.limit(1)
+						.get();
+					if (reservation && !store.isAwaitedTerminal(existingRun, tx))
+						resumeRunId = actor.logicalRunId;
+				}
+			}
+			const logicalRunId = store.persistLogicalRun(input.narratorId, { resumeRunId }, tx);
 			const run: PublicationRun = {
 				producerKind: "agent",
 				taskId: input.narratorId,
@@ -144,7 +189,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 				recipientId: input.parentNarratorId,
 			};
 			reserve(run, tx, input.started);
-			if (!input.resumeRunId) {
+			if (!resumeRunId) {
 				// A stable ref boundary, not millisecond timestamps: two runs may start in
 				// the same ms. An empty narrator's watermark is NARRATOR_REF_SEQ_EMPTY_TOP
 				// (= base 0 minus one), NOT 0 — the first ref of an empty narrator claims
@@ -201,13 +246,29 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 			.from(runtimePublicationOutbox)
 			.where(eq(runtimePublicationOutbox.dedupeKey, publicationDedupeKey(run, "terminal")))
 			.get();
-		const boundary = source?.resultRef?.startsWith("source_after:")
-			? Number(source.resultRef.slice(13))
-			: undefined;
+		const consumed = tx
+			.select({ sourceResultRef: runtimeAwaitedTerminalConsumptions.sourceResultRef })
+			.from(runtimeAwaitedTerminalConsumptions)
+			.where(
+				and(
+					eq(runtimeAwaitedTerminalConsumptions.producerKind, run.producerKind),
+					eq(runtimeAwaitedTerminalConsumptions.taskId, run.taskId),
+					eq(runtimeAwaitedTerminalConsumptions.logicalRunId, run.logicalRunId),
+					eq(runtimeAwaitedTerminalConsumptions.recipientId, run.recipientId),
+				),
+			)
+			.limit(1)
+			.get();
+		const capturedSourceRef = agentSourceResultRef(consumed?.sourceResultRef);
+		const boundary = parseRunSourceBoundary(source?.resultRef);
 		const assistant =
-			boundary !== undefined && Number.isSafeInteger(boundary)
+			!capturedSourceRef && boundary !== null
 				? tx
-						.select({ id: narratorMessages.id, role: narratorMessages.role })
+						.select({
+							id: narratorMessages.id,
+							role: narratorMessages.role,
+							narratorId: narratorMessages.narratorId,
+						})
 						.from(narratorMessageRefs)
 						.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
 						.where(
@@ -219,7 +280,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 						.orderBy(desc(narratorMessageRefs.seq))
 						.limit(L.pageSize)
 						.all()
-						.find((row) => row.role === "assistant")
+						.find((row) => row.role === "assistant" && row.narratorId === run.taskId)
 				: undefined;
 		// Capture only the already-supported idle display projection. The complete result
 		// remains in its existing source; later semantic edits must not change this receipt.
@@ -248,9 +309,11 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 							logicalRunId: run.logicalRunId,
 							truncated,
 							originalBytes,
-							sourceResultRef: assistant
-								? `message:${assistant.id}`
-								: `background_task:${run.taskId}:${run.logicalRunId}`,
+							sourceResultRef:
+								capturedSourceRef ??
+								(assistant
+									? `message:${assistant.id}`
+									: `background_task:${run.taskId}:${run.logicalRunId}`),
 						},
 					},
 				],
@@ -273,6 +336,163 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 				.run();
 		}
 		return `message-original:${messageId}`;
+	}
+
+	function readAssistantSource(run: PublicationRun, messageId: string): AgentTerminalResult | null {
+		const projection = database
+			.select({
+				plain: sql<
+					string | null
+				>`CASE WHEN ${narratorMessages.originalContentJson} IS NULL THEN substr(${narratorMessages.contentText}, 1, ${AGENT_RESULT_OUTPUT_CHARS + 1}) ELSE NULL END`,
+				json: sql<
+					string | null
+				>`CASE WHEN length(CAST(COALESCE(${narratorMessages.originalContentJson}, ${narratorMessages.contentJson}) AS BLOB)) <= ${AGENT_RESULT_JSON_MAX_BYTES} THEN COALESCE(${narratorMessages.originalContentJson}, ${narratorMessages.contentJson}) ELSE NULL END`,
+			})
+			.from(narratorMessages)
+			.where(
+				and(
+					eq(narratorMessages.id, messageId),
+					eq(narratorMessages.narratorId, run.taskId),
+					eq(narratorMessages.role, "assistant"),
+				),
+			)
+			.limit(1)
+			.get();
+		const result = projection
+			? decodeRunAssistantProjection(projection.plain, projection.json)
+			: null;
+		const sourceResultRef = agentSourceResultRef(`message:${messageId}`);
+		return result ? { ...result, ...(sourceResultRef ? { sourceResultRef } : {}) } : null;
+	}
+	/** Indexed, bounded and read-only: never resolves a run by guessing the actor's latest id. */
+	function readAgentTerminalResult(
+		run: PublicationRun,
+		options: AgentTerminalResultReadOptions = {},
+	): AgentTerminalResult | null {
+		if (run.producerKind !== "agent") return null;
+		const keys = (["completed", "failed", "timed_out", "cancelled"] as const).map((event) =>
+			publicationDedupeKey(run, event),
+		);
+		const intent = database
+			.select({
+				eventKind: runtimePublicationOutbox.eventKind,
+				state: runtimePublicationOutbox.state,
+				resultRef: runtimePublicationOutbox.resultRef,
+			})
+			.from(runtimePublicationOutbox)
+			.where(
+				and(
+					eq(runtimePublicationOutbox.producerKind, "agent"),
+					eq(runtimePublicationOutbox.taskId, run.taskId),
+					eq(runtimePublicationOutbox.logicalRunId, run.logicalRunId),
+					eq(runtimePublicationOutbox.recipientId, run.recipientId),
+					ne(runtimePublicationOutbox.eventKind, "started"),
+				),
+			)
+			.limit(1)
+			.get();
+		const terminalIntent =
+			!!intent && intent.state !== "reserved" && intent.eventKind !== "terminal";
+		const terminalDelivery = database
+			.select({ id: narratorBufferedMessages.id })
+			.from(narratorBufferedMessages)
+			.where(
+				and(
+					eq(narratorBufferedMessages.narratorId, run.recipientId),
+					eq(narratorBufferedMessages.kind, "task_notice"),
+					eq(narratorBufferedMessages.noticeKind, "agent"),
+					inArray(narratorBufferedMessages.dedupeKey, keys),
+				),
+			)
+			.limit(1)
+			.get();
+		const consumedReceipt = database
+			.select({
+				taskId: runtimeAwaitedTerminalConsumptions.taskId,
+				sourceResultRef: runtimeAwaitedTerminalConsumptions.sourceResultRef,
+			})
+			.from(runtimeAwaitedTerminalConsumptions)
+			.where(
+				and(
+					eq(runtimeAwaitedTerminalConsumptions.producerKind, "agent"),
+					eq(runtimeAwaitedTerminalConsumptions.taskId, run.taskId),
+					eq(runtimeAwaitedTerminalConsumptions.logicalRunId, run.logicalRunId),
+					eq(runtimeAwaitedTerminalConsumptions.recipientId, run.recipientId),
+				),
+			)
+			.limit(1)
+			.get();
+		if (terminalIntent || terminalDelivery || consumedReceipt) {
+			// JSON remains text in SQL: CASE prevents an edited/corrupt huge row from reaching JS.
+			const receipt = database
+				.select({
+					json: sql<
+						string | null
+					>`CASE WHEN length(CAST(COALESCE(${narratorMessages.originalContentJson}, ${narratorMessages.contentJson}) AS BLOB)) <= ${AGENT_RESULT_JSON_MAX_BYTES} THEN COALESCE(${narratorMessages.originalContentJson}, ${narratorMessages.contentJson}) ELSE NULL END`,
+				})
+				.from(narratorMessages)
+				.where(
+					and(
+						eq(narratorMessages.id, `publication-result:${run.logicalRunId}`),
+						eq(narratorMessages.narratorId, run.taskId),
+						eq(narratorMessages.role, "disp"),
+					),
+				)
+				.limit(1)
+				.get();
+			const result = decodeAgentTerminalSnapshot(receipt?.json ?? null, run.logicalRunId);
+			if (result) return result;
+			const exactSource = agentSourceResultRef(consumedReceipt?.sourceResultRef);
+			return exactSource ? readAssistantSource(run, exactSource.slice(8)) : null;
+		}
+		// Only the live waiter's same-run transition observation can authorize deferred output.
+		// Ordinary idle lookup, a mismatched observation, or an old actor id must not do so.
+		if (
+			options.settledRunId !== run.logicalRunId ||
+			intent?.state !== "reserved" ||
+			intent.eventKind !== "terminal" ||
+			!intent.resultRef?.startsWith("source_after:")
+		)
+			return null;
+		const boundary = parseRunSourceBoundary(intent.resultRef);
+		if (boundary === null) return null;
+		const settledActor = () => {
+			const actor = database
+				.select({
+					logicalRunId: narrators.logicalRunId,
+					status: narrators.status,
+					parentNarratorId: narrators.parentNarratorId,
+				})
+				.from(narrators)
+				.where(eq(narrators.id, run.taskId))
+				.get();
+			return (
+				actor?.logicalRunId === run.logicalRunId &&
+				actor.status === "idle" &&
+				actor.parentNarratorId === run.recipientId
+			);
+		};
+		if (!settledActor()) return null;
+		const candidates = database
+			.select({
+				id: narratorMessages.id,
+				role: narratorMessages.role,
+				narratorId: narratorMessages.narratorId,
+			})
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+			.where(
+				and(eq(narratorMessageRefs.narratorId, run.taskId), gt(narratorMessageRefs.seq, boundary)),
+			)
+			.orderBy(desc(narratorMessageRefs.seq))
+			.limit(L.pageSize)
+			.all();
+		const assistant = candidates.find(
+			(row) => row.role === "assistant" && row.narratorId === run.taskId,
+		);
+		if (!assistant) return null;
+		const result = readAssistantSource(run, assistant.id);
+		return settledActor() ? result : null;
 	}
 
 	/** Source result mutation and intent are committed by the caller's SAME synchronous transaction. */
@@ -357,10 +577,13 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		startAgentRun,
 		getAgentRun,
 		persistResult,
+		readAgentTerminalResult,
 		commit,
 		flushRecipient,
 		flushPage,
 		schedule,
+		consumeAwaitedTerminal: (run: PublicationRun, options?: AwaitedTerminalConsumeOptions) =>
+			store.consumeAwaitedTerminal(run, undefined, options),
 		hasPendingSource(run: PublicationRun) {
 			const keys = (
 				["started", "completed", "failed", "timed_out", "cancelled", "terminal"] as const
@@ -544,11 +767,13 @@ export function createUnwiredPublicationFacade(
 		startAgentRun: () => unavailable("startAgentRun"),
 		getAgentRun: () => unavailable("getAgentRun"),
 		persistResult: () => unavailable("persistResult"),
+		readAgentTerminalResult: () => unavailable("readAgentTerminalResult"),
 		commit: () => unavailable("commit"),
 		flushRecipient: () => unavailable("flushRecipient"),
 		flushPage: () => unavailable("flushPage"),
 		schedule: () => unavailable("schedule"),
 		hasPendingSource: () => unavailable("hasPendingSource"),
+		consumeAwaitedTerminal: () => unavailable("consumeAwaitedTerminal"),
 		newBashRun: () => unavailable("newBashRun"),
 		migrateLegacyTaskNotice: () => unavailable("migrateLegacyTaskNotice"),
 		setLegacyRuntimeAdmissionReader: (kind, reader) => {
@@ -590,6 +815,8 @@ export interface PublicationTerminalCommit {
 	/** The producer's result text; the agent kind snapshots it into a message/ref. */
 	readonly text: string;
 	readonly summary: string;
+	/** Foreground delivery stores the snapshot then consumes in the same transaction, without notice/wake. */
+	readonly delivery?: "background" | "foreground";
 }
 
 export interface AsyncRuntimePublicationService {
@@ -683,6 +910,16 @@ export interface AsyncRuntimePublicationService {
 		recipientId: string,
 		entry: LegacyTaskNotice,
 	): Promise<"migrated" | "diagnostic">;
+	/** Read only this run's bounded result; deferred source reads require a trusted same-run settled observation. */
+	readAgentTerminalResult(
+		run: PublicationRun,
+		options?: AgentTerminalResultReadOptions,
+	): Promise<AgentTerminalResult | null>;
+	/** Durable, exact-run consumption; revoke only terminal notices not yet in recipient history. */
+	consumeAwaitedTerminal(
+		run: PublicationRun,
+		options?: AwaitedTerminalConsumeOptions,
+	): Promise<void>;
 	hasPendingSource(run: PublicationRun): Promise<boolean>;
 	flushRecipient(recipientId: string): Promise<number>;
 	flushPage(): Promise<boolean>;
@@ -1056,6 +1293,22 @@ function createSqliteAsyncPublicationService(
 		commitAgentTerminal: async (input) => {
 			if (input.run.producerKind !== "agent")
 				throw new Error("Agent terminal commit requires an agent run");
+			if (input.delivery === "foreground")
+				return runAtomicWrite(db, "publication.commitForegroundTerminal", (tx) => {
+					const existing = tx
+						.select({ id: narratorMessages.id })
+						.from(narratorMessages)
+						.where(eq(narratorMessages.id, `publication-result:${input.run.logicalRunId}`))
+						.get();
+					// Preserve the source_after boundary until the immutable snapshot exists.
+					legacy.persistResult(input.run, input.text, tx);
+					legacy.store.consumeAwaitedTerminal(input.run, tx);
+					return {
+						status: existing ? "duplicate" : "committed",
+						deliveryId: null,
+						arrivalSeq: null,
+					};
+				});
 			return commitTerminal(input);
 		},
 		commitBashTerminal: async (input) => {
@@ -1065,6 +1318,8 @@ function createSqliteAsyncPublicationService(
 		},
 		migrateLegacyTaskNotice: async (recipientId, entry) =>
 			legacy.migrateLegacyTaskNotice(recipientId, entry),
+		readAgentTerminalResult: async (run, options) => legacy.readAgentTerminalResult(run, options),
+		consumeAwaitedTerminal: async (run, options) => legacy.consumeAwaitedTerminal(run, options),
 		hasPendingSource: async (run) => legacy.hasPendingSource(run),
 		flushRecipient: async (recipientId) => legacy.flushRecipient(recipientId),
 		flushPage: async () => legacy.flushPage(),
@@ -1243,6 +1498,8 @@ function createPgPublicationService(queue: RuntimeQueuePort): AsyncRuntimePublic
 			schedule();
 			return status;
 		},
+		readAgentTerminalResult: (run, options) => engine.readAgentTerminalResult(run, options),
+		consumeAwaitedTerminal: (run, options) => queue.outbox.consumeAwaitedTerminal(run, options),
 		hasPendingSource: (run) => engine.hasPendingSource(run),
 		flushRecipient,
 		flushPage,

@@ -87,7 +87,13 @@ export function isTerminalToolRowStatus(status: string | null | undefined): bool
  * Callers must not reserve slot width when this returns null; a blank 12px gap on
  * every successful row is the same visual noise as the check it replaced.
  */
-export type ToolRowStatusMark = "running" | "queued" | "awaiting" | "failed" | "cancelled";
+export type ToolRowStatusMark =
+	| "running"
+	| "queued"
+	| "reflecting"
+	| "awaiting"
+	| "failed"
+	| "cancelled";
 
 /**
  * Facts about a row that its STATUS ALONE cannot express.
@@ -148,7 +154,7 @@ export function resolveToolRowStatusMark(
 	// A live gate outranks the tool's own status, exactly as in
 	// `resolveToolShimmerPhase`: the tool sits at `pending` while the gate thinks,
 	// and asking about `status` first is what reads a deliberating gate as running.
-	if (context?.reflectionStatus === "running") return "awaiting";
+	if (context?.reflectionStatus === "running") return "reflecting";
 	if (status == null || status === "") return null;
 	// `pending` is "a person is being waited on" at every write site (see
 	// `NON_EXECUTING_IN_FLIGHT_STATUSES` in tool-shimmer.ts): every write of it in

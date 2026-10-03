@@ -99,6 +99,16 @@ CREATE TABLE public.narrator_buffered_messages (
 );
 CREATE UNIQUE INDEX idx_nbm_dedupe ON public.narrator_buffered_messages (narrator_id, dedupe_key);
 CREATE UNIQUE INDEX idx_nbm_delivery ON public.narrator_buffered_messages (delivery_id);
+CREATE TABLE public.runtime_awaited_terminal_consumptions (
+	producer_kind text NOT NULL,
+	task_id text NOT NULL,
+	logical_run_id text NOT NULL,
+	recipient_id text NOT NULL REFERENCES public.narrators(id) ON DELETE CASCADE,
+	consumed_at text NOT NULL,
+	source_result_ref text,
+	UNIQUE (producer_kind, task_id, logical_run_id, recipient_id)
+);
+CREATE INDEX idx_runtime_awaited_terminal_recipient ON public.runtime_awaited_terminal_consumptions(recipient_id);
 CREATE TABLE public.runtime_publication_outbox (
 	id text PRIMARY KEY,
 	producer_kind text NOT NULL,
@@ -185,6 +195,12 @@ describe("PostgreSQL runtime queue adapter (scratch schema, real engine)", () =>
 								staged.delivery.id,
 							);
 							expect(await store.mailbox.getByStagingId("n-d", "stage-contract")).toBeUndefined();
+							// Retire this user-input fixture before B's task-notice batch test:
+							// user input is intentionally a one-row batch barrier.
+							await store.mailbox.cancel(
+								staged.delivery.deliveryId as string,
+								"staging probe complete",
+							);
 						}
 
 						// ── A. enqueue: idempotent replay and concurrent counter claims ──

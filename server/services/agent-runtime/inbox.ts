@@ -10,6 +10,7 @@ import type { Locale } from "../../lib/prompt-i18n";
 import type { AgentMessageDelivery } from "../agent-message-delivery";
 import { getNarratorMessageRefsPort } from "../narrator-refs/store";
 import { createMailboxStore, mailboxDedupeKey } from "./mailbox";
+import { isAwaitedTerminalConsumption } from "./mailbox-shared";
 import type { MailboxClaim, MailboxInput, MailboxKind } from "./mailbox-types";
 import { getExecutionOwner, tryClaimExecution } from "./ownership";
 import {
@@ -494,11 +495,19 @@ export async function releaseInboxClaim(row: RuntimeMailboxRow, error: unknown):
  */
 async function readClaimCommittedState(
 	claim: MailboxClaim,
-): Promise<{ state: string; currentMessageId: string | null } | undefined> {
+): Promise<
+	| { state: string; currentMessageId: string | null; kind: string; lastError: string | null }
+	| undefined
+> {
 	const port = getRuntimeQueuePort();
 	if (port) return port.mailbox.getStateById(claim.id, claim.narratorId);
 	return db
-		.select({ state: mailbox.state, currentMessageId: mailbox.currentMessageId })
+		.select({
+			state: mailbox.state,
+			currentMessageId: mailbox.currentMessageId,
+			kind: mailbox.kind,
+			lastError: mailbox.lastError,
+		})
 		.from(mailbox)
 		.where(and(eq(mailbox.id, claim.id), eq(mailbox.narratorId, claim.narratorId)))
 		.get();
@@ -510,7 +519,13 @@ export async function deliverInboxInjection(
 	options: import("../narrator-injection").DeliverInjectionOptions,
 	claim?: MailboxClaim,
 ): Promise<import("../narrator-injection").DeliverInjectionResult> {
-	if (claim) assertInboxClaimOwner(claim);
+	if (claim) {
+		assertInboxClaimOwner(claim);
+		// Avoid entering the persistence/retry logger for an already-revoked notice.
+		// The post-error guards below still cover revocation after this read.
+		if (isAwaitedTerminalConsumption(await readClaimCommittedState(claim)))
+			return { messageId: null, turnText: "", started: false, interjected: false };
+	}
 	// The refs port — not an env probe — decides the branch. A claimed delivery on
 	// PostgreSQL materializes through the queue's own section (message + ref + mailbox
 	// flip in ONE transaction); the SQLite placement hook never crosses into it.
@@ -521,6 +536,15 @@ export async function deliverInboxInjection(
 			// Same rule as the SQLite half below: a lost post-commit frame must not discard
 			// the already materialized projection.
 			const committed = await readClaimCommittedState(claim);
+			if (
+				error instanceof Error &&
+				error.message === "Stale mailbox claim" &&
+				isAwaitedTerminalConsumption(committed)
+			) {
+				// Empty string is intentional: injection consumers use `turnText ?? content`.
+				// Null would re-inject the revoked notice despite its absent history row.
+				return { messageId: null, turnText: "", started: false, interjected: false };
+			}
 			if (committed?.state !== "materialized" || committed.currentMessageId !== options.messageId)
 				throw error;
 			logger.warn("Mailbox projection committed; notification delivery failed", {
@@ -548,6 +572,13 @@ export async function deliverInboxInjection(
 		});
 	} catch (error) {
 		const committed = claim ? await readClaimCommittedState(claim) : undefined;
+		if (
+			error instanceof Error &&
+			error.message === "Stale mailbox claim" &&
+			isAwaitedTerminalConsumption(committed)
+		) {
+			return { messageId: null, turnText: "", started: false, interjected: false };
+		}
 		if (committed?.state !== "materialized" || committed.currentMessageId !== options.messageId)
 			throw error;
 		logger.warn("Mailbox projection committed; notification delivery failed", {

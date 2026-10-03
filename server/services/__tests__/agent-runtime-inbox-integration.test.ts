@@ -544,6 +544,52 @@ test("immutable bounded notice snapshot ignores later edits and never parses ove
 	expect(projected.task.resultPreview).toBe("safe summary");
 });
 
+test("Await-revoked terminal claim is a benign empty projection and does not block following Send", async () => {
+	const store = createPublicationOutbox(db);
+	const run = {
+		producerKind: "agent" as const,
+		taskId: "sender",
+		recipientId: "parent",
+		logicalRunId: "await-revoked",
+	};
+	store.reserveRunSlots(run);
+	store.commitIntent({
+		...run,
+		eventKind: "completed",
+		summary: "duplicate terminal",
+		resultRef: "narrator:sender:await-revoked",
+	});
+	store.transferNext("parent", "agent");
+	await inbox.withInboxOwner("parent", async () => {
+		const row = required(await inbox.claimInboxHead("parent", () => true));
+		const projected = {
+			...projectPendingInjection(row),
+			mailboxClaim: inbox.inboxClaim(row),
+			recipientMessageId: row.recipientMessageId ?? undefined,
+		};
+		store.consumeAwaitedTerminal(run);
+		expect(await deliverPendingInjection("parent", "en", "busy", "onNextTurn", projected)).toBe("");
+		expect(state(row.id)?.state).toBe("cancelled");
+		expect(
+			db
+				.select()
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, "parent"))
+				.all(),
+		).toHaveLength(0);
+		const next = delivery("parent", "following Send is retained");
+		await inbox.enqueueInboxAgent(next, next.text, { channel: "parent" });
+		const send = required(await inbox.claimInboxHead("parent", () => true));
+		const text = await deliverPendingInjection("parent", "en", "busy", "onNextTurn", {
+			...projectPendingInjection(send),
+			mailboxClaim: inbox.inboxClaim(send),
+			recipientMessageId: send.recipientMessageId ?? undefined,
+		});
+		expect(text).toContain("following Send is retained");
+		expect(state(send.id)?.state).toBe("materialized");
+	});
+});
+
 test("late claim callback cannot materialize after shared owner replacement", async () => {
 	const d = delivery("parent");
 	await inbox.enqueueInboxAgent(d, d.text, { channel: "parent" });

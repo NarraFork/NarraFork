@@ -225,6 +225,9 @@ export const narrators = pgTable(
 	{
 		id: text("id").primaryKey().notNull(),
 		chapterId: text("chapter_id").references((): PgColumn => chapters.id, {}),
+		scheduledTaskId: text("scheduled_task_id").references((): PgColumn => scheduledTasks.id, {
+			onDelete: "set null",
+		}),
 		apiConversationId: text("api_conversation_id"),
 		logicalRunId: text("logical_run_id"),
 		inboxSequence: integer("inbox_sequence").notNull().default(0),
@@ -305,6 +308,11 @@ export const narrators = pgTable(
 		insertSeq: bigint("insert_seq", { mode: "number" }).notNull().generatedByDefaultAsIdentity(),
 	},
 	(table) => [
+		index("idx_narrators_scheduled_task_created").on(
+			table.scheduledTaskId,
+			table.createdAt,
+			table.id,
+		),
 		index("idx_narrators_chapter").on(table.chapterId),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
@@ -1874,6 +1882,32 @@ export const runtimePublicationOutbox = pgTable(
 	],
 );
 
+export const runtimeAwaitedTerminalConsumptions = pgTable(
+	"runtime_awaited_terminal_consumptions",
+	{
+		producerKind: text("producer_kind").notNull(),
+		taskId: text("task_id").notNull(),
+		logicalRunId: text("logical_run_id").notNull(),
+		recipientId: text("recipient_id").notNull(),
+		consumedAt: text("consumed_at").notNull(),
+		sourceResultRef: text("source_result_ref"),
+	},
+	(table) => [
+		uniqueIndex("idx_runtime_awaited_terminal_run").on(
+			table.producerKind,
+			table.taskId,
+			table.logicalRunId,
+			table.recipientId,
+		),
+		index("idx_runtime_awaited_terminal_recipient").on(table.recipientId),
+		foreignKey({
+			name: "runtime_awaited_terminal_consumptions_recipient_i_d01467ba1c_fk",
+			columns: [table.recipientId],
+			foreignColumns: [narrators.id],
+		}).onDelete("cascade"),
+	],
+);
+
 export const hooks = pgTable(
 	"hooks",
 	{
@@ -3021,6 +3055,9 @@ export const scheduledTasks = pgTable(
 		projectId: text("project_id").references((): PgColumn => projects.id, { onDelete: "set null" }),
 		chapterId: text("chapter_id").references((): PgColumn => chapters.id, { onDelete: "set null" }),
 		narratorMode: text("narrator_mode").notNull().default("new"),
+		cleanupPolicy: jsonText("cleanup_policy")
+			.notNull()
+			.default(sql.raw('\'{"mode":"none"}\'::text')),
 		reuseNarratorId: text("reuse_narrator_id").references((): PgColumn => narrators.id, {
 			onDelete: "set null",
 		}),
@@ -3039,6 +3076,7 @@ export const scheduledTasks = pgTable(
 		index("idx_scheduled_tasks_project").on(table.projectId),
 		index("idx_scheduled_tasks_created_by").on(table.createdBy),
 		index("idx_scheduled_tasks_reuse_narrator").on(table.reuseNarratorId),
+		index("idx_scheduled_tasks_last_narrator").on(table.lastNarratorId),
 		index("idx_scheduled_tasks_chapter").on(table.chapterId),
 	],
 );
@@ -3459,8 +3497,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 111,
-  "columnCount": 1596,
+  "tableCount": 112,
+  "columnCount": 1604,
   "tables": [
     {
       "exportName": "projects",
@@ -4798,6 +4836,22 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "emitAsTableConstraint": false
         },
         {
+          "property": "scheduledTaskId",
+          "name": "scheduled_task_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "scheduledTasks",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrators_scheduled_task_id_scheduled_tasks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
           "property": "apiConversationId",
           "name": "api_conversation_id",
           "kind": "text",
@@ -5503,6 +5557,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         }
       ],
       "indexes": [
+        {
+          "name": "idx_narrators_scheduled_task_created",
+          "columns": [
+            "scheduledTaskId",
+            "createdAt",
+            "id"
+          ],
+          "unique": false
+        },
         {
           "name": "idx_narrators_chapter",
           "columns": [
@@ -15031,6 +15094,97 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "primaryKeys": []
     },
     {
+      "exportName": "runtimeAwaitedTerminalConsumptions",
+      "name": "runtime_awaited_terminal_consumptions",
+      "columns": [
+        {
+          "property": "producerKind",
+          "name": "producer_kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "taskId",
+          "name": "task_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "logicalRunId",
+          "name": "logical_run_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "recipientId",
+          "name": "recipient_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "runtime_awaited_terminal_consumptions_recipient_i_d01467ba1c_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "consumedAt",
+          "name": "consumed_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "sourceResultRef",
+          "name": "source_result_ref",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_runtime_awaited_terminal_run",
+          "columns": [
+            "producerKind",
+            "taskId",
+            "logicalRunId",
+            "recipientId"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_runtime_awaited_terminal_recipient",
+          "columns": [
+            "recipientId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
       "exportName": "hooks",
       "name": "hooks",
       "columns": [
@@ -21973,6 +22127,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "\"new\""
         },
         {
+          "property": "cleanupPolicy",
+          "name": "cleanup_policy",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "{ mode: \"none\" }",
+          "defaultExpression": "sql.raw(\"'{\\\"mode\\\":\\\"none\\\"}'::text\")"
+        },
+        {
           "property": "reuseNarratorId",
           "name": "reuse_narrator_id",
           "kind": "text",
@@ -22102,6 +22268,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_scheduled_tasks_reuse_narrator",
           "columns": [
             "reuseNarratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_scheduled_tasks_last_narrator",
+          "columns": [
+            "lastNarratorId"
           ],
           "unique": false
         },

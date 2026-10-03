@@ -7,6 +7,7 @@ import {
 	type SourceTextSnapshot,
 	safeSourceSliceStart,
 } from "@shared/pretext-layout/source-text";
+import { copyStreamingEditInput } from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { SubagentActivitySummary, TreeMessage } from "../../lib/api";
 import {
@@ -315,7 +316,10 @@ function streamingChunkInput(chunk: TopLevelStreamingChunk): Record<string, unkn
 	const ranges = chunk.streamingFieldRanges
 		? { _streamingFieldRanges: chunk.streamingFieldRanges }
 		: {};
-	if (chunk._input) return { ...chunk._input, ...ranges };
+	if (chunk._input) {
+		// Validated once on started/updatedInput; rendering never re-hashes old_string.
+		return copyStreamingEditInput(chunk._input, ranges);
+	}
 	return {
 		_streamingChars: chunk.inputCharsTotal,
 		...(chunk.extractedFilePath ? { _streamingFilePath: chunk.extractedFilePath } : {}),
@@ -343,6 +347,9 @@ function streamingChunkInput(chunk: TopLevelStreamingChunk): Record<string, unkn
 export function topLevelStreamingChunkToToolFields(
 	chunk: TopLevelStreamingChunk,
 ): Record<string, unknown> {
+	// Edit preview origins belong to input._streamingMetadata. Promoting them to
+	// result metadata would bypass target validation and shadow the actual result.
+	const metadata = chunk._metadata ?? (chunk.toolName === "Edit" ? undefined : chunk.metadata);
 	const receipts = {
 		...(chunk._sendDeliveryTargets ? { _sendDeliveryTargets: chunk._sendDeliveryTargets } : {}),
 		...(chunk._sendDeliveryTargetCount !== undefined
@@ -370,9 +377,7 @@ export function topLevelStreamingChunkToToolFields(
 			...(chunk._startedAt != null ? { startedAt: chunk._startedAt } : {}),
 			...(chunk._output !== undefined ? { outputJson: chunk._output } : {}),
 			...(chunk._durationMs != null ? { durationMs: chunk._durationMs } : {}),
-			...((chunk._metadata ?? chunk.metadata)
-				? { _metadata: chunk._metadata ?? chunk.metadata }
-				: {}),
+			...(metadata ? { _metadata: metadata } : {}),
 			...(chunk._longRunning ? { _longRunning: true } : {}),
 			...(chunk._streamedFullOutput ? { _streamedFullOutput: true } : {}),
 			_streamingOutput: chunk._streamingOutput,
@@ -383,7 +388,7 @@ export function topLevelStreamingChunkToToolFields(
 	return {
 		...receipts,
 		inputJson: streamingChunkInput(chunk),
-		...(chunk.metadata ? { _metadata: chunk.metadata } : {}),
+		...(chunk.metadata && chunk.toolName !== "Edit" ? { _metadata: chunk.metadata } : {}),
 	};
 }
 
@@ -522,8 +527,8 @@ export function buildTopLevelStreamingChunksMsg(
 					...(chunk._startedAt && { startedAt: chunk._startedAt }),
 					...(chunk._output !== undefined && { outputJson: chunk._output }),
 					...(chunk._durationMs != null && { durationMs: chunk._durationMs }),
+					...(chunk.metadata && chunk.toolName !== "Edit" && { _metadata: chunk.metadata }),
 					...(chunk._metadata && { _metadata: chunk._metadata }),
-					...(chunk.metadata && { _metadata: chunk.metadata }),
 					...(chunk._longRunning && { _longRunning: true }),
 					...(chunk._streamedFullOutput && { _streamedFullOutput: true }),
 					...(chunk._streamingOutput && { _streamingOutput: chunk._streamingOutput }),

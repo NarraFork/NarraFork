@@ -521,6 +521,7 @@ export function useVListLabels(): VListLabels {
 		const statusMark: Record<ToolRowStatusMark, string> = {
 			running: t("traceRowMark.running"),
 			queued: t("traceRowMark.queued"),
+			reflecting: t("status_reflecting"),
 			awaiting: t("traceRowMark.awaiting"),
 			failed: t("traceRowMark.failed"),
 			cancelled: t("traceRowMark.cancelled"),

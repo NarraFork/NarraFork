@@ -1,5 +1,11 @@
 import { resolve } from "node:path";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
+import {
+	createStreamingEditOrigin,
+	STREAMING_EDIT_ORIGIN_MAX_CODE_UNITS,
+	type StreamingEditOrigin,
+	validateStreamingEditOrigin,
+} from "@shared/streaming-edit-origin";
 import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-injection";
 import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec-task-service";
 import { specVfsService } from "../../services/spec-vfs-service";
@@ -288,7 +294,7 @@ function extractJsonFields(raw: string, wantedKeys: ReadonlySet<string>): Extrac
 /** Per-tool mapping: which fields to extract, and which are "large" (streamed incrementally) */
 const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = {
 	Write: { short: ["file_path"], large: ["content"] },
-	Edit: { short: ["file_path", "replace_all"], large: ["old_string", "new_string"] },
+	Edit: { short: ["file_path", "device", "replace_all"], large: ["old_string", "new_string"] },
 	Bash: { short: ["description"], large: ["command"] },
 	Grep: { short: ["pattern", "path", "glob", "output_mode", "type"], large: [] },
 	Glob: { short: ["pattern", "path"], large: [] },
@@ -335,14 +341,29 @@ function normalizeLineEndings(text: string): string {
 	return text.replaceAll("\r\n", "\n");
 }
 
-async function resolveStreamingEditMetadata(
-	acc: { name: string; extractedFilePath?: string; extractedFields?: Record<string, string> },
+export async function resolveStreamingEditMetadata(
+	acc: {
+		name: string;
+		extractedFilePath?: string;
+		extractedFields?: Record<string, string>;
+		streamingEditOrigin?: StreamingEditOrigin;
+	},
 	cwd: string,
+	toolUseId: string,
+	defaultDeviceId = "local",
 ): Promise<Record<string, unknown> | undefined> {
 	if (acc.name !== "Edit") return undefined;
 	const filePath = acc.extractedFilePath ?? acc.extractedFields?.file_path;
 	const oldString = acc.extractedFields?.old_string;
-	if (!filePath || oldString == null || oldString === "") return undefined;
+	const device = acc.extractedFields?.device ?? defaultDeviceId;
+	// This matcher reads local files only. Never borrow a local path for a remote tool.
+	if (
+		device !== "local" ||
+		!filePath ||
+		!oldString ||
+		oldString.length > STREAMING_EDIT_ORIGIN_MAX_CODE_UNITS
+	)
+		return undefined;
 
 	try {
 		const resolvedPath = resolve(cwd, filePath);
@@ -352,11 +373,23 @@ async function resolveStreamingEditMetadata(
 		const replaceAll = acc.extractedFields?.replace_all === "true";
 		const match = findReplaceMatch(content, normalizedOld, replaceAll);
 		const lineCount = normalizedOld.split("\n").length;
-		return {
+		const metadata = {
 			startLine: match.startLine,
 			endLine: match.startLine + lineCount - 1,
 			matchStatus: "matched",
 		};
+		acc.streamingEditOrigin = createStreamingEditOrigin(
+			toolUseId,
+			{
+				file_path: filePath,
+				old_string: oldString,
+				device,
+				replace_all: replaceAll,
+			},
+			metadata,
+			device,
+		);
+		return metadata;
 	} catch (err) {
 		return {
 			matchStatus: "unmatched",
@@ -3025,6 +3058,12 @@ async function* agentLoopInMetadataSnapshot(
 				return identity;
 			};
 			const markCompletedToolUse = (tu: AgentToolUse): ToolOrderIdentity => {
+				// These are UI-only annotations, not Edit parameters. Strip model-authored
+				// claims before persistence too (including the non-streaming provider path).
+				if (tu.name === "Edit" && tu.input && typeof tu.input === "object") {
+					delete tu.input._streamingMetadata;
+					delete tu.input._streamingEditOrigin;
+				}
 				const identity = registerToolOrderIdentity(tu, isStrictSerial(tu));
 				if (tu.outputIndex == null && identity.outputIndex != null) {
 					tu.outputIndex = identity.outputIndex;
@@ -3147,6 +3186,7 @@ async function* agentLoopInMetadataSnapshot(
 					extractedFields?: Record<string, string>;
 					/** Metadata derived while tool input is still streaming (e.g. Edit match line). */
 					streamingMetadata?: Record<string, unknown>;
+					streamingEditOrigin?: StreamingEditOrigin;
 					/** Name of the large field currently being streamed */
 					activeStreamingField?: string;
 					/** How many raw chars of the active field have been decoded and emitted so far */
@@ -4523,7 +4563,12 @@ async function* agentLoopInMetadataSnapshot(
 												acc.extractedFields?.old_string != null &&
 												(acc.extractedFilePath || acc.extractedFields.file_path)
 											) {
-												acc.streamingMetadata = await resolveStreamingEditMetadata(acc, config.cwd);
+												acc.streamingMetadata = await resolveStreamingEditMetadata(
+													acc,
+													config.cwd,
+													id,
+													config.defaultDeviceId ?? "local",
+												);
 												fieldsChanged = true;
 											}
 
@@ -4613,7 +4658,12 @@ async function* agentLoopInMetadataSnapshot(
 												acc.extractedFields?.old_string != null &&
 												(acc.extractedFilePath || acc.extractedFields.file_path)
 											) {
-												acc.streamingMetadata = await resolveStreamingEditMetadata(acc, config.cwd);
+												acc.streamingMetadata = await resolveStreamingEditMetadata(
+													acc,
+													config.cwd,
+													id,
+													config.defaultDeviceId ?? "local",
+												);
 											}
 											let streamingField:
 												| { name: string; delta: string; startsField?: boolean }
@@ -4674,6 +4724,10 @@ async function* agentLoopInMetadataSnapshot(
 												parsedInput = { _raw: stopRaw };
 											}
 										}
+										const streamingEditOrigin =
+											(parsedInput?.device ?? config.defaultDeviceId ?? "local") === "local"
+												? validateStreamingEditOrigin(acc.streamingEditOrigin, id, parsedInput)
+												: undefined;
 										const tu: AgentToolUse = {
 											toolUseId: id,
 											name: acc.name,
@@ -4737,6 +4791,7 @@ async function* agentLoopInMetadataSnapshot(
 											toolUseId: id,
 											toolName: tu.name,
 											input: parsedInput,
+											streamingEditOrigin,
 											streamStartedAt: acc.startedAt,
 											streamCompletedAt: acc.streamCompletedAt,
 										};

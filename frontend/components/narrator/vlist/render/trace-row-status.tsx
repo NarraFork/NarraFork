@@ -21,7 +21,14 @@
  */
 
 import type { ToolRowStatusMark } from "@shared/tool-row-status";
-import { IconBan, IconCircleX, IconClock, IconLoader2, IconPlayerPause } from "@tabler/icons-react";
+import {
+	IconBan,
+	IconCircleX,
+	IconClock,
+	IconLoader2,
+	IconPlayerPause,
+	IconShield,
+} from "@tabler/icons-react";
 import type { CSSProperties } from "react";
 
 // Re-exported so the render layer has one import for "row status" concerns; the
@@ -58,6 +65,7 @@ function cssColor(color: string, shade: number): string {
 const DEFAULT_MARK_LABELS: Readonly<Record<ToolRowStatusMark, string>> = {
 	running: "running",
 	queued: "waiting for earlier tools",
+	reflecting: "reflecting",
 	awaiting: "waiting for a decision",
 	failed: "failed",
 	cancelled: "cancelled",
@@ -102,6 +110,9 @@ export function TraceRowStatusGlyph({
 		// (`--queued` in card-shimmer.css / trace-shimmer.css). Static: the call has
 		// not started.
 		return <IconClock {...common} style={{ color: cssColor("slate", 5), flexShrink: 0 }} />;
+	}
+	if (mark === "reflecting") {
+		return <IconShield {...common} style={{ color: cssColor("indigo", 6), flexShrink: 0 }} />;
 	}
 	if (mark === "awaiting") {
 		// Yellow, matching the card's own `STATUS_COLOR.pending` and the yellow border

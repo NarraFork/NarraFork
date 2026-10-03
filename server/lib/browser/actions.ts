@@ -5,6 +5,7 @@ import { writeFile } from "node:fs/promises";
 import type { KeyInput, Page } from "puppeteer-core";
 import { logger } from "../logger";
 import { cleanHtml } from "../web-fetch/dom";
+import { finishPerformanceTrace, startPerformanceTrace } from "./performance-tracing";
 import { serializeBrowserValue } from "./serialization";
 import type { BrowserConsoleMessage, BrowserNetworkRequest, BrowserSession } from "./session";
 import { drainConsoleCaptures, touchSession, touchSessionVisual } from "./session";
@@ -706,11 +707,10 @@ export async function perfStart(
 		throw new Error("Tracing is already active on this session");
 	}
 	const categories = opts?.categories?.length ? opts.categories : DEFAULT_PERF_CATEGORIES;
-	await session.page.tracing.start({
+	await startPerformanceTrace(session, {
 		categories,
 		screenshots: opts?.screenshots ?? false,
 	});
-	session.tracing = { active: true, startedAt: Date.now() };
 }
 
 /** Stop performance tracing and write the trace buffer to `savePath`. */
@@ -723,13 +723,11 @@ export async function perfStop(
 		throw new Error("No active tracing on this session");
 	}
 	const durationMs = Date.now() - session.tracing.startedAt;
-	const buffer = await session.page.tracing.stop();
+	const buffer = await finishPerformanceTrace(session);
 	if (!buffer) {
-		session.tracing = undefined;
 		throw new Error("Tracing returned empty buffer");
 	}
 	await writeFile(savePath, buffer);
-	session.tracing = undefined;
 	return { fileSize: buffer.byteLength, durationMs };
 }
 

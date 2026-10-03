@@ -47,8 +47,8 @@ describe("resolveToolRowStatusMark — in-flight is not one state", () => {
 	it("lets a live reflection gate outrank the tool's own status", () => {
 		// A gate parks its tool at `pending`, but it can also be observed while the
 		// tool still reads `running` — the gate is the more current fact either way.
-		expect(resolveToolRowStatusMark("pending", { reflectionStatus: "running" })).toBe("awaiting");
-		expect(resolveToolRowStatusMark("running", { reflectionStatus: "running" })).toBe("awaiting");
+		expect(resolveToolRowStatusMark("pending", { reflectionStatus: "running" })).toBe("reflecting");
+		expect(resolveToolRowStatusMark("running", { reflectionStatus: "running" })).toBe("reflecting");
 	});
 
 	it("does not treat a RESOLVED gate as awaiting", () => {
@@ -151,7 +151,7 @@ describe("the mark and the shimmer cannot contradict each other", () => {
 
 	it("agrees that a deliberating gate is not executing", () => {
 		const input = { status: "pending", reflectionStatus: "running" } as const;
-		expect(resolveToolRowStatusMark(input.status, input)).toBe("awaiting");
+		expect(resolveToolRowStatusMark(input.status, input)).toBe("reflecting");
 		expect(resolveToolShimmerPhase(input)).toBe("reflecting");
 	});
 });

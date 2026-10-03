@@ -6,6 +6,7 @@ import {
 } from "@shared/model-inheritance";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
+import { readStreamingEditOrigin, type StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import {
 	normalizeSubagentToolInputSummary,
 	type SubagentToolInputSummary,
@@ -536,6 +537,7 @@ export interface NarratorWSCallbacks {
 		input?: Record<string, unknown>,
 		parentToolUseId?: string,
 		meta?: SubagentToolEventMeta,
+		streamingEditOrigin?: StreamingEditOrigin,
 	) => void;
 	onToolUseChunk?: (
 		toolUseId: string,
@@ -880,6 +882,7 @@ export interface NarratorWSCallbacks {
 			contentCharsReceived?: number;
 			extractedFields?: Record<string, string>;
 			metadata?: Record<string, unknown>;
+			streamingEditOrigin?: StreamingEditOrigin;
 			/** The INPUT finished parsing — NOT "executing" (see `executing`). */
 			started?: boolean;
 			/** Permission granted and execution under way. */
@@ -1179,6 +1182,7 @@ export function useNarratorWS(
 							data.input as Record<string, unknown> | undefined,
 							data.parentToolUseId as string | undefined,
 							subagentToolEventMeta(data),
+							readStreamingEditOrigin(data.streamingEditOrigin),
 						);
 						break;
 					case "tool_use_chunk":
@@ -1782,6 +1786,7 @@ export function useNarratorWS(
 								contentCharsReceived?: number;
 								extractedFields?: Record<string, string>;
 								metadata?: Record<string, unknown>;
+								streamingEditOrigin?: StreamingEditOrigin;
 								/** The INPUT finished parsing — NOT "executing" (see `executing`). */
 								started?: boolean;
 								/** Permission granted and execution under way. */

@@ -48,6 +48,7 @@ import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
 import type { RetryInfo } from "../useNarratorPanelWS";
 import { InlineOverrideActions } from "./InlineOverrideActions";
 import { PermissionMenuContent } from "./PermissionMenuContent";
+import { createPlanReflectionStatusAction } from "./PlanReflectionStatusControl";
 import { ReasoningEffortMenuItems } from "./ReasoningEffortMenuItems";
 import type {
 	BooleanOverride,
@@ -366,6 +367,28 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 		t,
 	]);
 
+	const planReflectionAction = createPlanReflectionStatusAction({
+		hasPlanTrait: permission.hasPlanTrait,
+		supported: permission.planReflection.supported,
+		isWorkspacePreview,
+		effective: permission.planReflection.effective,
+		globalDefault: permission.planReflection.global,
+		disabled: permission.reflectionSettingsDisabled,
+		onChange: permission.planReflection.onChange,
+		t,
+	});
+	const planReflectionActions = planReflectionAction ? [planReflectionAction] : [];
+	// The translated state label changes the action's intrinsic width, including
+	// while it lives in the overflow menu and cannot be measured inline.
+	const statusToolbarMeasurementKey = `${mobile.measurementKey}\u0001${
+		planReflectionAction
+			? t(
+					permission.planReflection.effective
+						? "planReflectionApprovalOn"
+						: "planReflectionApprovalOff",
+				)
+			: ""
+	}`;
 	const followsParent = narrator.model === FOLLOW_PARENT_MODEL;
 	const canFollowParent = !!narrator.variant?.startsWith("subagent:");
 	const inheritance = followsParent ? modelInheritanceLabel(narrator.modelInheritance, t) : null;
@@ -380,45 +403,67 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 				ownsHorizontalSafeArea={props.ownsHorizontalSafeArea}
 				borderTop={props.borderTop}
 			>
-				{workIndicator.show && !isWorkspacePreview ? (
-					<UnstyledButtonWorkIndicator {...props} workIndicatorText={workIndicatorText} />
-				) : (
-					<Group gap={6} wrap="nowrap" style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
-						<Box
-							w={8}
-							h={8}
+				<Group
+					gap={6}
+					align="center"
+					wrap="nowrap"
+					style={{ flex: 1, minWidth: 0, overflow: "hidden" }}
+				>
+					{workIndicator.show && !isWorkspacePreview ? (
+						<UnstyledButtonWorkIndicator {...props} workIndicatorText={workIndicatorText} />
+					) : (
+						<Group
+							gap={6}
+							wrap="nowrap"
 							style={{
-								borderRadius: "50%",
-								backgroundColor: statusRegistry.accentVar(workIndicator.statusBarDisplay, "filled"),
-								flexShrink: 0,
+								flex: 1,
+								minWidth: 0,
+								overflow: "hidden",
 							}}
-						/>
-						<TruncatedText size="xs" c="dimmed" text={t(workIndicator.statusBarDisplay.labelKey)} />
-						{tasks.supported && tasks.buttonEnabled && (
-							<BackgroundTasksStatusButton
-								runningCount={tasks.runningCount}
-								onOpen={tasks.onOpenPanel}
+						>
+							<Box
+								w={8}
+								h={8}
+								style={{
+									borderRadius: "50%",
+									backgroundColor: statusRegistry.accentVar(
+										workIndicator.statusBarDisplay,
+										"filled",
+									),
+									flexShrink: 0,
+								}}
 							/>
-						)}
-						{workIndicator.compactFailure && !workIndicator.isCompacting && (
-							<Text
+							<TruncatedText
 								size="xs"
-								c="red"
-								style={{ flexShrink: 0 }}
-								title={workIndicator.compactFailure.error || undefined}
-							>
-								· {t("compactFailed")}
-							</Text>
-						)}
-						{workIndicator.turnElapsedText && !isWorkspacePreview && (
-							<TurnElapsedTime
-								text={`· ${t("lastTurnDuration", { duration: workIndicator.turnElapsedText })}`}
-								startedAtLabel={workIndicator.turnStartedAtLabel}
-								isMobile={isMobileViewport}
+								c="dimmed"
+								text={t(workIndicator.statusBarDisplay.labelKey)}
 							/>
-						)}
-					</Group>
-				)}
+							{tasks.supported && tasks.buttonEnabled && (
+								<BackgroundTasksStatusButton
+									runningCount={tasks.runningCount}
+									onOpen={tasks.onOpenPanel}
+								/>
+							)}
+							{workIndicator.compactFailure && !workIndicator.isCompacting && (
+								<Text
+									size="xs"
+									c="red"
+									style={{ flexShrink: 0 }}
+									title={workIndicator.compactFailure.error || undefined}
+								>
+									· {t("compactFailed")}
+								</Text>
+							)}
+							{workIndicator.turnElapsedText && !isWorkspacePreview && (
+								<TurnElapsedTime
+									text={`· ${t("lastTurnDuration", { duration: workIndicator.turnElapsedText })}`}
+									startedAtLabel={workIndicator.turnStartedAtLabel}
+									isMobile={isMobileViewport}
+								/>
+							)}
+						</Group>
+					)}
+				</Group>
 				{workIndicator.show && !isWorkspacePreview && workIndicator.turnElapsedText && (
 					<TurnElapsedTime
 						text={workIndicator.turnElapsedText}
@@ -848,9 +893,9 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 												)}
 											</Group>
 										}
-										actions={mobile.bottomActions ?? []}
+										actions={[...planReflectionActions, ...(mobile.bottomActions ?? [])]}
 										moreLabel={t("moreActions")}
-										measurementKey={mobile.measurementKey}
+										measurementKey={statusToolbarMeasurementKey}
 									/>
 								</Box>
 							)}
@@ -1074,9 +1119,9 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 											</Tooltip>
 										</>
 									}
-									actions={mobile.actions}
+									actions={[...planReflectionActions, ...mobile.actions]}
 									moreLabel={t("moreActions")}
-									measurementKey={mobile.measurementKey}
+									measurementKey={statusToolbarMeasurementKey}
 								/>
 							</Box>
 						</Group>
@@ -1098,7 +1143,9 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
  * JSX flatter; it reads the same grouped props.
  */
 function UnstyledButtonWorkIndicator(
-	props: NarratorInteractionStatusBarProps & { workIndicatorText: string },
+	props: NarratorInteractionStatusBarProps & {
+		workIndicatorText: string;
+	},
 ) {
 	const { workIndicator, queue, t, workIndicatorText } = props;
 	return (
@@ -1126,7 +1173,17 @@ function UnstyledButtonWorkIndicator(
 		>
 			<Group gap={6} wrap="nowrap">
 				{workIndicator.plan.primary === "reflecting" ? (
-					<Box c={workIndicator.color} style={{ display: "flex", flexShrink: 0 }}>
+					<Box
+						c={workIndicator.color}
+						style={{
+							display: "flex",
+							width: 14,
+							height: 14,
+							alignItems: "center",
+							justifyContent: "center",
+							flexShrink: 0,
+						}}
+					>
 						<IconShield size={14} />
 					</Box>
 				) : (
@@ -1134,7 +1191,7 @@ function UnstyledButtonWorkIndicator(
 				)}
 				{/* The current task text can be long (spec task titles especially), so
 				    reveal the full string on hover/tap when the row clips it. */}
-				<TruncatedText size="xs" c={workIndicator.color} text={workIndicatorText} />
+				<TruncatedText size="xs" lh="14px" c={workIndicator.color} text={workIndicatorText} />
 				{((queue.positionValue != null && queue.positionValue > 0) || queue.messageValue) && (
 					<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
 						·{" "}

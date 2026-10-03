@@ -6,7 +6,34 @@
  */
 import { expect, test } from "bun:test";
 import { MAILBOX_LIMITS } from "./limits";
-import { boundedError, boundedJson, mailboxDedupeKey, pointer } from "./mailbox-shared";
+import {
+	AWAITED_TERMINAL_CONSUMED_REASON,
+	boundedError,
+	boundedJson,
+	isAwaitedTerminalConsumption,
+	mailboxDedupeKey,
+	pointer,
+} from "./mailbox-shared";
+
+test("only exact Await cancellation of an unmaterialized task notice is a benign skip", () => {
+	const row = {
+		state: "cancelled",
+		kind: "task_notice",
+		lastError: AWAITED_TERMINAL_CONSUMED_REASON,
+		currentMessageId: null,
+	};
+	expect(isAwaitedTerminalConsumption(row)).toBe(true);
+	for (const other of [
+		undefined,
+		{ ...row, kind: "agent_message" },
+		{ ...row, kind: "user_input" },
+		{ ...row, lastError: "cancelled by user" },
+		{ ...row, state: "failed" },
+		{ ...row, state: "claimed" },
+		{ ...row, currentMessageId: "persisted-history" },
+	])
+		expect(isAwaitedTerminalConsumption(other)).toBe(false);
+});
 
 test("boundedJson encodes within the byte budget and rejects overflow", () => {
 	expect(boundedJson({ a: 1 }, 1024)).toBe('{"a":1}');

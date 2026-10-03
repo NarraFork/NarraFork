@@ -74,6 +74,7 @@ import {
 	IconListCheck,
 	IconLoader2,
 	IconLock,
+	IconPlayerPause,
 	IconPlayerPlay,
 	IconPlayerStop,
 	type IconProps,
@@ -82,6 +83,7 @@ import {
 } from "@tabler/icons-react";
 import type { ComponentType, ReactNode } from "react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { resolveToolRowStatusMark, TraceRowStatusGlyph } from "./trace-row-status";
 import "../vlist-markdown.css";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
@@ -422,6 +424,8 @@ function InlineLines({
 // Header row.
 // ─────────────────────────────────────────────────────────────────────────────
 interface ToolHeaderRowProps {
+	queuedBehindUpstream?: boolean;
+	reflectionStatus?: string | null;
 	toolName: string;
 	summary: string;
 	category: ToolCategory;
@@ -458,6 +462,8 @@ interface ToolHeaderRowProps {
 }
 
 function ToolHeaderRow({
+	queuedBehindUpstream,
+	reflectionStatus,
 	toolName,
 	summary,
 	category,
@@ -481,6 +487,7 @@ function ToolHeaderRow({
 }: ToolHeaderRowProps) {
 	const color = CATEGORY_COLOR[category];
 	const statusColor = STATUS_COLOR[status];
+	const statusMark = resolveToolRowStatusMark(status, { reflectionStatus, queuedBehindUpstream });
 	const running = isRunningStatus(status);
 	return (
 		<Group
@@ -625,7 +632,11 @@ function ToolHeaderRow({
 						flexShrink: 0,
 					}}
 				>
-					<StatusGlyph status={status} color={statusColor} />
+					{statusMark != null ? (
+						<TraceRowStatusGlyph mark={statusMark} />
+					) : (
+						<StatusGlyph status={status} color={statusColor} />
+					)}
 				</span>
 				{/* Timing lives INSIDE the existing single header row (height-neutral):
 			    a live elapsed counter while running, else the final duration. The
@@ -1158,6 +1169,7 @@ function StatusGlyph({ status, color }: { status: ToolCallStatus; color: string 
 	const c = cssColor(color, 6);
 	switch (status) {
 		case "pending":
+			return <IconPlayerPause size={12} color={c} />;
 		case "running":
 		case "initializing":
 			return <IconLoader2 size={12} color={c} className="vlist-spin" />;
@@ -2295,6 +2307,8 @@ export function RenderToolCall({
 	const body = (
 		<>
 			<ToolHeaderRow
+				queuedBehindUpstream={queuedBehindUpstream}
+				reflectionStatus={reflection?.status}
 				toolName={measured.toolName}
 				summary={measured.summary}
 				category={category}

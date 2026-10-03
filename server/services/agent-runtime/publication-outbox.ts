@@ -1,6 +1,7 @@
 import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import {
 	backgroundTasks,
+	runtimeAwaitedTerminalConsumptions as consumptions,
 	narratorBufferedMessages as mailbox,
 	narrators,
 	narratorToolCalls,
@@ -17,7 +18,9 @@ import {
 	initializeLegacyMailbox,
 	mailboxHasCapacity,
 } from "./mailbox";
+import { AWAITED_TERMINAL_CONSUMED_REASON } from "./mailbox-shared";
 import type { NoticeKind, RuntimeDb, RuntimeStoreDb, RuntimeTx } from "./mailbox-types";
+import { type AwaitedTerminalConsumeOptions, agentSourceResultRef } from "./publication-result";
 import { runAtomicWrite } from "./runtime-write";
 
 export type PublicationEvent = "started" | "completed" | "failed" | "timed_out" | "cancelled";
@@ -686,6 +689,106 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 			.run();
 		return { status: "registered", run, eventKind: admission.eventKind };
 	}
+	function isAwaitedTerminal(run: PublicationRun, tx: RuntimeStoreDb = db): boolean {
+		return !!tx
+			.select({ taskId: consumptions.taskId })
+			.from(consumptions)
+			.where(
+				and(
+					eq(consumptions.producerKind, run.producerKind),
+					eq(consumptions.taskId, run.taskId),
+					eq(consumptions.logicalRunId, run.logicalRunId),
+					eq(consumptions.recipientId, run.recipientId),
+				),
+			)
+			.limit(1)
+			.get();
+	}
+	/** SQLite's immediate atomic write excludes concurrent transfer/materialization. Claimed
+	 * notices are revoked too; a stale materializer must fail before creating a history ref.
+	 */
+	function consumeAwaitedTerminal(
+		run: PublicationRun,
+		tx?: RuntimeTx,
+		options: AwaitedTerminalConsumeOptions = {},
+	): void {
+		if (!tx) {
+			runAtomicWrite(db, "outbox.consumeAwaitedTerminal", (inner) =>
+				consumeAwaitedTerminal(run, inner, options),
+			);
+			return;
+		}
+		assertRun(run);
+		if (
+			!tx
+				.select({ id: narrators.id })
+				.from(narrators)
+				.where(eq(narrators.id, run.recipientId))
+				.get()
+		)
+			return;
+		const sourceResultRef = agentSourceResultRef(options.sourceResultRef);
+		if (options.sourceResultRef !== undefined && !sourceResultRef)
+			throw new Error("Invalid awaited result source reference");
+		const time = new Date().toISOString();
+		tx.insert(consumptions)
+			.values({ ...run, consumedAt: time, sourceResultRef: sourceResultRef ?? null })
+			.onConflictDoUpdate({
+				target: [
+					consumptions.producerKind,
+					consumptions.taskId,
+					consumptions.logicalRunId,
+					consumptions.recipientId,
+				],
+				set: {
+					sourceResultRef: sql`COALESCE(${consumptions.sourceResultRef}, ${sourceResultRef ?? null})`,
+				},
+			})
+			.run();
+		tx.delete(outbox)
+			.where(
+				and(
+					runWhere(run),
+					inArray(outbox.eventKind, ["terminal", "completed", "failed", "timed_out", "cancelled"]),
+				),
+			)
+			.run();
+		const keys = (["completed", "failed", "timed_out", "cancelled"] as const).map((event) =>
+			publicationDedupeKey(run, event),
+		);
+		tx.update(mailbox)
+			.set({
+				state: "cancelled",
+				text: "",
+				metadataJson: null,
+				payloadRefJson: null,
+				imagesJson: null,
+				textFilePathsJson: null,
+				fileReferencesJson: null,
+				creatorJson: null,
+				commandText: null,
+				bashCommand: null,
+				byteSize: 0,
+				projectedByteSize: 0,
+				claimToken: null,
+				claimEpoch: null,
+				claimedAt: null,
+				lastError: AWAITED_TERMINAL_CONSUMED_REASON,
+				updatedAt: time,
+			})
+			.where(
+				and(
+					eq(mailbox.narratorId, run.recipientId),
+					eq(mailbox.kind, "task_notice"),
+					eq(mailbox.noticeKind, run.producerKind),
+					inArray(mailbox.dedupeKey, keys),
+					inArray(mailbox.state, ["queued", "claimed", "failed"]),
+					isNull(mailbox.recipientRefId),
+					isNull(mailbox.currentMessageId),
+				),
+			)
+			.run();
+	}
 	function reserveRunSlots(
 		run: PublicationRun,
 		options: { started?: boolean } = {},
@@ -700,7 +803,13 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 			throw new Error("Unknown legacy source can only use its failure slot");
 		if (run.logicalRunId.startsWith("legacy:completed:"))
 			throw new Error("Legacy completion can only use its captured event slot");
-		const events = options.started ? (["started", "terminal"] as const) : (["terminal"] as const);
+		const events = isAwaitedTerminal(run, tx)
+			? options.started
+				? (["started"] as const)
+				: []
+			: options.started
+				? (["started", "terminal"] as const)
+				: (["terminal"] as const);
 		const existing = tx
 			.select({ event: outbox.eventKind })
 			.from(outbox)
@@ -781,6 +890,8 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 			throw new Error("Unknown legacy source can only publish failed outcome");
 		if (!["started", "completed", "failed", "timed_out", "cancelled"].includes(intent.eventKind))
 			throw new Error("Invalid publication event identity");
+		if (intent.eventKind !== "started" && isAwaitedTerminal(intent, tx))
+			return { status: "duplicate", deliveryId: null, arrivalSeq: null };
 		const dedupeKey = publicationDedupeKey(intent, intent.eventKind);
 		const delivered = tx
 			.select({ deliveryId: mailbox.deliveryId, arrivalSeq: mailbox.arrivalSeq })
@@ -814,13 +925,17 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 					and(runWhere(intent), eq(outbox.eventKind, "terminal"), eq(outbox.state, "reserved")),
 				)
 				.get();
-		if (!slot || (intent.eventKind === "started" && slot.eventKind !== "started"))
-			throw new Error("Publication requires a startup reservation");
 		const recipientExists = tx
 			.select({ id: narrators.id })
 			.from(narrators)
 			.where(eq(narrators.id, intent.recipientId))
 			.get();
+		// Recipient deletion cascades its Await authority. A delayed publisher whose
+		// consumed slot is gone must still be harmless after that lifetime boundary.
+		if (!slot && !recipientExists && intent.eventKind !== "started")
+			return { status: "duplicate", deliveryId: null, arrivalSeq: null };
+		if (!slot || (intent.eventKind === "started" && slot.eventKind !== "started"))
+			throw new Error("Publication requires a startup reservation");
 		// A reserved slot can be marked undeliverable without revoking the running producer's
 		// right to commit its terminal result. lastError on a reservation is only set by failRecipient.
 		const recipientFailure =
@@ -971,6 +1086,8 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 	}
 	return {
 		reserveRunSlots,
+		consumeAwaitedTerminal,
+		isAwaitedTerminal,
 		commitIntent,
 		transferNext,
 		persistLogicalRun,

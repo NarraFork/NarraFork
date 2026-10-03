@@ -6,6 +6,8 @@ import {
 	resolveDiffSourcePoint,
 } from "@shared/pretext-layout/diff-core";
 import { normalizeSourceText } from "@shared/pretext-layout/source-text";
+import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
+import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
 import {
 	buildTopLevelStreamingChunksMsg,
 	resolveAllToolCallsFromMsg,
@@ -23,6 +25,168 @@ import {
 	dropPersistedStreamingTools,
 	streamingToolChunks,
 } from "./streaming-tool-chunks";
+
+describe("Edit origin handoff", () => {
+	const input = {
+		file_path: "/a.ts",
+		old_string: `${"h".repeat(20_000)}\nold`,
+		new_string: "keep\nnew",
+	};
+	const evidence = createStreamingEditOrigin("edit", input, {
+		startLine: 42,
+		endLine: 43,
+		matchStatus: "matched",
+	});
+	if (!evidence) throw new Error("missing fixture origin");
+	function seededStore(
+		metadata: Record<string, unknown> = { startLine: 42, matchStatus: "matched" },
+	) {
+		const store = createStreamingToolStore();
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 100,
+			extractedFilePath: input.file_path,
+			extractedFields: { old_string: input.old_string },
+			metadata,
+		});
+		return store;
+	}
+	function assertOrigin(store: ReturnType<typeof seededStore>, startLine: number | undefined) {
+		const chunk = store.get("edit");
+		if (!chunk) throw new Error("missing Edit chunk");
+		const synthetic = buildTopLevelStreamingChunksMsg([chunk], "n", null);
+		if (!synthetic) throw new Error("missing synthetic message");
+		const representations = [
+			topLevelStreamingChunkToToolFields(chunk),
+			synthetic.toolCalls?.[0],
+			resolveAllToolCallsFromMsg(synthetic)[0],
+		];
+		for (const fields of representations) {
+			if (!fields) throw new Error("missing tool representation");
+			const detail = classifyToolDetail({
+				toolUseId: "edit",
+				toolName: "Edit",
+				category: "file",
+				inputJson: fields.inputJson,
+				metadata: (fields as { _metadata?: Record<string, unknown> })._metadata,
+				status: chunk._status,
+				isStreaming: !chunk._started,
+			});
+			const body = detail?.sections.find((section) => section.key === "input.edit")?.body;
+			if (body?.kind !== "capped" || !body.diffDocument) throw new Error("missing diff");
+			expect(body.diffDocument.startLine).toBe(startLine);
+			const rows = projectDiffDocument(body.diffDocument, { startRow: 0 }).lines;
+			if (startLine !== undefined) expect(rows[0]?.oldLineNo).toBe(startLine);
+		}
+	}
+	for (const eager of [false, true]) {
+		it(`retains actual rows through started/executing/completed (eager=${eager})`, () => {
+			const store = seededStore();
+			assertOrigin(store, 42);
+			if (eager) applyStreamingToolExecuting(store, { toolUseId: "edit" });
+			expect(store.get("edit")?.extractedFields?.old_string?.length).toBeLessThanOrEqual(16_000);
+			applyStreamingToolStarted(store, {
+				toolUseId: "edit",
+				toolName: "Edit",
+				input,
+				streamingEditOrigin: evidence,
+			});
+			assertOrigin(store, 42);
+			applyStreamingToolExecuting(store, { toolUseId: "edit" });
+			assertOrigin(store, 42);
+			applyStreamingToolCompleted(store, {
+				toolUseId: "edit",
+				status: "success",
+				metadata: { startLine: 80 },
+			});
+			assertOrigin(store, 80);
+			expect(input).not.toHaveProperty("_streamingMetadata");
+		});
+	}
+	it("started without preview and reconnect snapshot retain evidence even after eager executing", () => {
+		for (const snapshot of [false, true]) {
+			const store = createStreamingToolStore();
+			if (snapshot)
+				applyStreamingToolChunk(store, {
+					toolUseId: "edit",
+					toolName: "Edit",
+					inputCharsTotal: 30_000,
+					extractedFilePath: input.file_path,
+					extractedFields: { old_string: input.old_string.slice(-16_000) },
+				});
+			applyStreamingToolExecuting(store, { toolUseId: "edit" });
+			applyStreamingToolStarted(store, {
+				toolUseId: "edit",
+				toolName: "Edit",
+				input,
+				streamingEditOrigin: evidence,
+			});
+			assertOrigin(store, 42);
+			expect(store.get("edit")?._status).toBe("running");
+			applyStreamingToolCompleted(store, { toolUseId: "edit", status: "success" });
+			assertOrigin(store, 42);
+		}
+	});
+	it("updatedInput hashes the full replacement once and honors CRLF normalization", () => {
+		for (const updatedInput of [
+			{ ...input, old_string: input.old_string.replaceAll("\n", "\r\n") },
+			{ ...input, old_string: `H${input.old_string.slice(1)}` },
+			{ ...input, old_string: input.old_string.replaceAll("\n", "\r") },
+			{ ...input, file_path: "/b.ts" },
+			{ ...input, replace_all: true },
+			{ ...input, device: "remote" },
+		]) {
+			const store = seededStore();
+			applyStreamingToolStarted(store, {
+				toolUseId: "edit",
+				toolName: "Edit",
+				input,
+				streamingEditOrigin: evidence,
+			});
+			applyStreamingToolCompleted(store, { toolUseId: "edit", status: "success", updatedInput });
+			assertOrigin(store, updatedInput.old_string.includes("\r\n") ? 42 : undefined);
+		}
+	});
+	it("rejects forged input metadata, unmatched and illegal dedicated origins", () => {
+		for (const streamingEditOrigin of [
+			undefined,
+			{ ...evidence, startLine: 0 },
+			{ ...evidence, endLine: 41 },
+			{ ...evidence, matchStatus: "unmatched" as "matched" },
+		]) {
+			const store = seededStore();
+			applyStreamingToolStarted(store, {
+				toolUseId: "edit",
+				toolName: "Edit",
+				input: { ...input, _streamingMetadata: { startLine: 999 } },
+				streamingEditOrigin,
+			});
+			assertOrigin(store, undefined);
+		}
+	});
+	it("does not borrow an origin for changed arguments or an unmatched edit", () => {
+		for (const changed of [
+			{ ...input, file_path: "/b.ts" },
+			{ ...input, old_string: "different" },
+			{ ...input, device: "remote" },
+			{ ...input, replace_all: true },
+			{ ...input, old_string: `H${input.old_string.slice(1)}` },
+		]) {
+			const store = seededStore();
+			applyStreamingToolStarted(store, {
+				toolUseId: "edit",
+				toolName: "Edit",
+				input: changed,
+				streamingEditOrigin: evidence,
+			});
+			assertOrigin(store, undefined);
+		}
+		const store = seededStore({ matchStatus: "unmatched" });
+		applyStreamingToolStarted(store, { toolUseId: "edit", toolName: "Edit", input });
+		assertOrigin(store, undefined);
+	});
+});
 
 describe("applyStreamingToolChunk — arguments being written", () => {
 	it("creates an entry on the first chunk so the card appears immediately", () => {

@@ -7,6 +7,7 @@ import type {
 	ReasoningProviderMetadata,
 	ReferencePricingSnapshot,
 } from "@shared/agent-protocol/types";
+import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { z } from "zod/v4";
 import type { PathFlavor } from "./execution/backend";
@@ -419,6 +420,8 @@ export type AgentEvent =
 			toolUseId: string;
 			toolName: string;
 			input: Record<string, unknown>;
+			/** Server pre-match evidence, never taken from model input. */
+			streamingEditOrigin?: StreamingEditOrigin;
 			streamStartedAt?: number;
 			streamCompletedAt?: number;
 	  }

@@ -242,9 +242,10 @@ describe("a row that has not executed says nothing about elapsed time", () => {
 		);
 	});
 
-	it("marks a row whose reflection gate is deliberating as awaiting", async () => {
+	it("marks a deliberating reflection with an indigo shield", async () => {
 		const slot = statusSlots(trace([{ status: "running", reflectionStatus: "running" }]))[0];
-		expect(glyphName(slot as Element)).toBe("player-pause");
+		expect(glyphName(slot as Element)).toBe("shield");
+		expect(slot.querySelector("svg")?.getAttribute("style")).toContain("indigo-6");
 	});
 
 	it("KEEPS the spinner and the counter for a genuinely running row", async () => {

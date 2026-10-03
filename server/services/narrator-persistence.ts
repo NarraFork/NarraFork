@@ -52,7 +52,11 @@ import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
 import { createFileChangeExecutionSegmentsService } from "./file-change-execution-segments";
 import { enrichToolUseBlocks, truncateToolIO } from "./narrator-messages";
 import type { RefMessage, RefMessageInput } from "./narrator-refs/port";
-import { type PgNarratorRefsTx, persistPgMessageWithRef } from "./narrator-refs/postgres-store";
+import {
+	type PgNarratorRefsTx,
+	persistPgMessageWithRef,
+	resolvePgMessageNarratorLocks,
+} from "./narrator-refs/postgres-store";
 import { dbTransactionWithSeqFloor } from "./narrator-refs/seq-floor-tx";
 import {
 	claimNextRefSeq,
@@ -1006,6 +1010,8 @@ function persistPlacement(
 export type PgPlacementTx = PgNarratorRefsTx;
 
 export interface PgMessagePlacementHooks {
+	/** All additional narrator rows touched by onPersist, declared before locks are acquired. */
+	narratorIds?: readonly string[];
 	/**
 	 * PG counterpart of {@link MessagePlacementOptions.onPersist}: commits related
 	 * state in the SAME transaction as the message, ref and mailbox materialization.
@@ -1026,7 +1032,7 @@ export function createPgPlacedMessageMaterializer(
 	message: RefMessageInput,
 	hooks?: PgMessagePlacementHooks,
 ): PgMaterializer {
-	return async (tx, row) => {
+	const materializer: PgMaterializer = async (tx, row) => {
 		if (row.narratorId !== message.narratorId) throw new Error("Mailbox recipient mismatch");
 		if (!row.recipientMessageId)
 			throw new Error("Mailbox claim has no reserved recipient identity");
@@ -1036,6 +1042,12 @@ export function createPgPlacedMessageMaterializer(
 		await hooks?.onPersist?.(tx, persisted.messageId, persisted.refId);
 		return { messageId: persisted.messageId, refId: persisted.refId };
 	};
+	materializer.planNarratorLocks = async (tx, claim) => {
+		if (claim.narratorId !== message.narratorId) throw new Error("Mailbox recipient mismatch");
+		const { narratorIds } = await resolvePgMessageNarratorLocks(tx, message);
+		return [...narratorIds, ...(hooks?.narratorIds ?? [])];
+	};
+	return materializer;
 }
 
 // ── narratorPersistence object ─────────────────────────────────────────────

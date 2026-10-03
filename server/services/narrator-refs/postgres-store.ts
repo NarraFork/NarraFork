@@ -64,8 +64,40 @@ function pageSize(value: number) {
 	return value;
 }
 
+/** Read-only, bounded dependency planning. The tool call (not parentNarratorId) owns the bump. */
+export async function resolvePgMessageNarratorLocks(
+	tx: PgNarratorRefsTx,
+	message: Pick<RefMessageInput, "narratorId" | "parentToolUseId">,
+): Promise<{ narratorIds: string[]; parentNarratorId?: string }> {
+	const [parent] = message.parentToolUseId
+		? await tx
+				.select({ narratorId: narratorToolCalls.narratorId })
+				.from(narratorToolCalls)
+				.where(eq(narratorToolCalls.toolUseId, message.parentToolUseId))
+				.limit(1)
+		: [];
+	return {
+		narratorIds: [...new Set([message.narratorId, ...(parent ? [parent.narratorId] : [])])].sort(),
+		parentNarratorId: parent?.narratorId,
+	};
+}
+
+// A materialization section may never expand its predeclared narrator lock set.
+const prelockedNarrators = new WeakMap<PgNarratorRefsTx, ReadonlySet<string>>();
+export function restrictPgNarratorLocks(tx: PgNarratorRefsTx, ids: readonly string[]): void {
+	if (prelockedNarrators.has(tx)) throw new Error("Narrator lock scope already declared");
+	prelockedNarrators.set(tx, new Set(ids));
+}
+
 /** Same row lock is mandatory before any append/shift/copy read, not just before its write. */
 export async function lockPgNarratorRefs(tx: PgNarratorRefsTx, ids: string[]): Promise<void> {
+	const prelocked = prelockedNarrators.get(tx);
+	if (prelocked) {
+		for (const id of ids) {
+			if (!prelocked.has(id)) throw new Error(`Undeclared narrator lock dependency: ${id}`);
+		}
+		return;
+	}
 	for (const id of [...new Set(ids)].sort()) {
 		const [row] = await tx
 			.select({ id: narrators.id })
@@ -181,14 +213,8 @@ export async function persistPgMessageWithRef(
 	options: { beforeMessageId?: string; bumpMessageVersion?: boolean } = {},
 ): Promise<PgPersistedMessageRef> {
 	validateMessage(message);
-	const [parent] = message.parentToolUseId
-		? await tx
-				.select({ narratorId: narratorToolCalls.narratorId })
-				.from(narratorToolCalls)
-				.where(eq(narratorToolCalls.toolUseId, message.parentToolUseId))
-				.limit(1)
-		: [];
-	await lockPgNarratorRefs(tx, [message.narratorId, ...(parent ? [parent.narratorId] : [])]);
+	const { narratorIds, parentNarratorId } = await resolvePgMessageNarratorLocks(tx, message);
+	await lockPgNarratorRefs(tx, narratorIds);
 	// First-write floor repair when the process has not healed this narrator yet.
 	const needsFloor = !isNarratorSeqFloorHealed(message.narratorId);
 	if (needsFloor) await initializePgRefSeqFloor(tx, message.narratorId);
@@ -221,11 +247,11 @@ export async function persistPgMessageWithRef(
 				: { messageStructureVersion: sql`${narrators.messageStructureVersion} + 1` }),
 		})
 		.where(eq(narrators.id, message.narratorId));
-	if (parent && bumpMessageVersion)
+	if (parentNarratorId && bumpMessageVersion)
 		await tx
 			.update(narrators)
 			.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
-			.where(eq(narrators.id, parent.narratorId));
+			.where(eq(narrators.id, parentNarratorId));
 	return {
 		messageId: created.id,
 		refId,

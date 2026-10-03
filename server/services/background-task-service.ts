@@ -45,6 +45,7 @@ import type { RuntimeTx } from "./agent-runtime/mailbox-types";
 import {
 	getRuntimePublicationService,
 	type PublicationEvent,
+	type PublicationRun,
 	publicationEvent,
 	runtimePublication,
 	taskPublicationRun,
@@ -141,6 +142,24 @@ export function resolveBackgroundTaskEffectiveStatus(input: {
 export interface WaitResult {
 	status: string;
 	output: string | null;
+	terminalResultReceived?: boolean;
+	publicationRun?: PublicationRun;
+	sourceResultRef?: string;
+}
+
+/** Derive the receipt from the SAME row that supplied the terminal output. */
+function terminalWaitReceipt(task: {
+	id: string;
+	type: string;
+	parentNarratorId: string;
+	logicalRunId: string | null;
+}): Pick<WaitResult, "terminalResultReceived" | "publicationRun"> {
+	return {
+		terminalResultReceived: true,
+		...(task.logicalRunId && task.type !== "transfer"
+			? { publicationRun: taskPublicationRun(task) }
+			: {}),
+	};
 }
 
 export interface CompletedNotification {
@@ -1209,6 +1228,7 @@ class BackgroundTaskService {
 			taskId,
 			parentNarratorId: task.parentNarratorId,
 			taskType: task.type,
+			...terminalWaitReceipt(task),
 			output: storedOutput,
 		});
 
@@ -1272,6 +1292,7 @@ class BackgroundTaskService {
 			taskId,
 			parentNarratorId: task.parentNarratorId,
 			taskType: task.type,
+			...terminalWaitReceipt(task),
 			error: storedError,
 			status: "failed",
 		});
@@ -1335,6 +1356,7 @@ class BackgroundTaskService {
 			taskId,
 			parentNarratorId: task.parentNarratorId,
 			taskType: task.type,
+			...terminalWaitReceipt(task),
 			error: storedError,
 			status: "timeout",
 		});
@@ -1399,6 +1421,8 @@ class BackgroundTaskService {
 				taskId,
 				parentNarratorId: task.parentNarratorId,
 				taskType: task.type as BackgroundTaskType,
+				...terminalWaitReceipt(task),
+				output: task.output,
 			});
 			this.broadcastStatus(
 				task.parentNarratorId,
@@ -1433,6 +1457,8 @@ class BackgroundTaskService {
 			taskId,
 			parentNarratorId: task.parentNarratorId,
 			taskType: task.type,
+			...terminalWaitReceipt(task),
+			output: task.output,
 		});
 
 		this.broadcastStatus(task.parentNarratorId, taskId, "cancelled", storedOutput, task.toolUseId);
@@ -1545,6 +1571,7 @@ class BackgroundTaskService {
 				taskId,
 				parentNarratorId: task.parentNarratorId,
 				taskType: "agent",
+				...terminalWaitReceipt(task),
 				output: task.output ?? "",
 			});
 		else if (task.status === "cancelled")
@@ -1553,6 +1580,8 @@ class BackgroundTaskService {
 				taskId,
 				parentNarratorId: task.parentNarratorId,
 				taskType: "agent",
+				...terminalWaitReceipt(task),
+				output: task.output,
 			});
 		else
 			eventBus.emit({
@@ -1560,6 +1589,7 @@ class BackgroundTaskService {
 				taskId,
 				parentNarratorId: task.parentNarratorId,
 				taskType: "agent",
+				...terminalWaitReceipt(task),
 				status: task.status === "timeout" ? "timeout" : "failed",
 				error: task.output ?? "",
 			});
@@ -2588,6 +2618,8 @@ class BackgroundTaskService {
 							taskId: task.id,
 							parentNarratorId: result.parentNarratorId,
 							taskType: result.type as BackgroundTaskType,
+							...terminalWaitReceipt(result),
+							output: result.output,
 						});
 						this.cleanupRuntime(task.id);
 					}
@@ -2747,7 +2779,11 @@ class BackgroundTaskService {
 		// Check if already done
 		const task = await this.getById(taskId);
 		if (task && task.status !== "running") {
-			return { status: toWaitStatus(task.status), output: task.output };
+			return {
+				status: toWaitStatus(task.status),
+				output: task.output,
+				...terminalWaitReceipt(task),
+			};
 		}
 
 		return new Promise<WaitResult>((resolve) => {
@@ -2764,25 +2800,49 @@ class BackgroundTaskService {
 				signal?.removeEventListener("abort", onAbort);
 			};
 
-			const onCompleted = (event: { taskId: string; output: string | null }) => {
+			const onCompleted = (event: {
+				taskId: string;
+				output: string | null;
+				publicationRun?: PublicationRun;
+			}) => {
 				if (settled || event.taskId !== taskId) return;
 				cleanup();
-				resolve({ status: "completed", output: event.output });
+				resolve({
+					status: "completed",
+					output: event.output,
+					terminalResultReceived: true,
+					publicationRun: event.publicationRun,
+				});
 			};
 			const onFailed = (event: {
 				taskId: string;
 				error: string | null;
 				status?: "failed" | "timeout";
+				publicationRun?: PublicationRun;
 			}) => {
 				if (settled || event.taskId !== taskId) return;
 				cleanup();
-				resolve({ status: toWaitStatus(event.status ?? "failed"), output: event.error });
+				resolve({
+					status: toWaitStatus(event.status ?? "failed"),
+					output: event.error,
+					terminalResultReceived: true,
+					publicationRun: event.publicationRun,
+				});
 			};
-			const onCancelled = (event: { taskId: string }) => {
+			const onCancelled = (event: {
+				taskId: string;
+				output?: string | null;
+				publicationRun?: PublicationRun;
+			}) => {
 				if (settled || event.taskId !== taskId) return;
-				const output = this.getOutputBuffer(taskId);
+				const output = event.output === undefined ? this.getOutputBuffer(taskId) : event.output;
 				cleanup();
-				resolve({ status: "cancelled", output });
+				resolve({
+					status: "cancelled",
+					output,
+					terminalResultReceived: event.output !== undefined,
+					publicationRun: event.publicationRun,
+				});
 			};
 
 			const onAbort = () => {
@@ -2814,7 +2874,11 @@ class BackgroundTaskService {
 				.then((fresh) => {
 					if (settled || !fresh || fresh.status === "running") return;
 					cleanup();
-					resolve({ status: toWaitStatus(fresh.status), output: fresh.output });
+					resolve({
+						status: toWaitStatus(fresh.status),
+						output: fresh.output,
+						...terminalWaitReceipt(fresh),
+					});
 				})
 				.catch(() => {
 					// Live lifecycle listeners remain authoritative if the recheck fails.
@@ -2836,6 +2900,7 @@ class BackgroundTaskService {
 			return {
 				status: task.output?.includes(text) ? "found" : toWaitStatus(task.status),
 				output: task.output,
+				...terminalWaitReceipt(task),
 			};
 		}
 
@@ -2869,17 +2934,27 @@ class BackgroundTaskService {
 				}
 			};
 
-			const onCompleted = (event: { taskId: string; output: string | null }) => {
+			const onCompleted = (event: {
+				taskId: string;
+				output: string | null;
+				publicationRun?: PublicationRun;
+			}) => {
 				if (settled || event.taskId !== taskId) return;
 				const output = event.output ?? "";
 				cleanup();
-				resolve({ status: output.includes(text) ? "found" : "completed", output });
+				resolve({
+					status: output.includes(text) ? "found" : "completed",
+					output,
+					terminalResultReceived: true,
+					publicationRun: event.publicationRun,
+				});
 			};
 
 			const onFailed = (event: {
 				taskId: string;
 				error: string | null;
 				status?: "failed" | "timeout";
+				publicationRun?: PublicationRun;
 			}) => {
 				if (settled || event.taskId !== taskId) return;
 				const output = event.error ?? "";
@@ -2887,14 +2962,25 @@ class BackgroundTaskService {
 				resolve({
 					status: output.includes(text) ? "found" : toWaitStatus(event.status ?? "failed"),
 					output,
+					terminalResultReceived: true,
+					publicationRun: event.publicationRun,
 				});
 			};
 
-			const onCancelled = (event: { taskId: string }) => {
+			const onCancelled = (event: {
+				taskId: string;
+				output?: string | null;
+				publicationRun?: PublicationRun;
+			}) => {
 				if (settled || event.taskId !== taskId) return;
-				const finalBuf = this.getOutputBuffer(taskId);
+				const finalBuf = event.output === undefined ? this.getOutputBuffer(taskId) : event.output;
 				cleanup();
-				resolve({ status: finalBuf?.includes(text) ? "found" : "cancelled", output: finalBuf });
+				resolve({
+					status: finalBuf?.includes(text) ? "found" : "cancelled",
+					output: finalBuf,
+					terminalResultReceived: event.output !== undefined,
+					publicationRun: event.publicationRun,
+				});
 			};
 
 			const onAbort = () => {
@@ -2932,6 +3018,7 @@ class BackgroundTaskService {
 						resolve({
 							status: output.includes(text) ? "found" : toWaitStatus(fresh.status),
 							output: fresh.output,
+							...terminalWaitReceipt(fresh),
 						});
 						return;
 					}
@@ -3234,23 +3321,40 @@ class BackgroundTaskService {
 			// is merely paused would tell the model the transfer is over. An Await that
 			// waits out its timeout is recoverable; a wrong terminal answer is not.
 			if (task.type === "transfer") continue;
-			if (task.type === "bash") {
+			// Recovery may register a legacy run. Read its terminal output/run together
+			// rather than pairing a new registration with the pre-recovery snapshot.
+			const recovered = await this.getById(task.id);
+			if (!recovered || recovered.status === "running") continue;
+			const receipt = terminalWaitReceipt(recovered);
+			if (recovered.status === "completed") {
+				eventBus.emit({
+					type: "background_task:completed",
+					taskId: recovered.id,
+					parentNarratorId: recovered.parentNarratorId,
+					taskType: recovered.type,
+					output: recovered.output,
+					...receipt,
+				});
+			} else if (recovered.status === "failed" || recovered.status === "timeout") {
 				eventBus.emit({
 					type: "background_task:failed",
-					taskId: task.id,
-					parentNarratorId: task.parentNarratorId,
-					taskType: "bash",
-					status: "failed",
-					error: "Execution outcome unknown after restart; the command was not rerun.",
+					taskId: recovered.id,
+					parentNarratorId: recovered.parentNarratorId,
+					taskType: recovered.type,
+					status: recovered.status,
+					error: recovered.output,
+					...receipt,
 				});
-				continue;
+			} else {
+				eventBus.emit({
+					type: "background_task:cancelled",
+					taskId: recovered.id,
+					parentNarratorId: recovered.parentNarratorId,
+					taskType: recovered.type,
+					output: recovered.output,
+					...receipt,
+				});
 			}
-			eventBus.emit({
-				type: "background_task:cancelled",
-				taskId: task.id,
-				parentNarratorId: task.parentNarratorId,
-				taskType: task.type as BackgroundTaskType,
-			});
 		}
 		// One invalidate per parent rather than per-row upserts: recovery rewrites a
 		// whole cohort at once, and the clients that care were disconnected across

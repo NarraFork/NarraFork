@@ -192,6 +192,167 @@ async function journal(
 		return row;
 	};
 
+	// Lock-order proof: an append holding a-parent must not find z-child already
+	// held by materialize. Observe an actual PG lock wait, then probe via a third connection.
+	await client.db
+		.insert(narrators)
+		.values(
+			["a-parent", "z-child", "z-extra"].map((id) => ({ id, createdAt: now, updatedAt: now })),
+		);
+	const lockRoot = await store.append({
+		id: "lock-root",
+		narratorId: "a-parent",
+		role: "assistant",
+		contentJson: [],
+		createdAt: now,
+	});
+	await client.db.insert(narratorToolCalls).values({
+		id: "lock-call",
+		narratorId: "a-parent",
+		messageId: lockRoot.id,
+		toolUseId: "lock-tool",
+		toolName: "Agent",
+		createdAt: now,
+	});
+	const lockRow = await enqueueAndClaim("z-child", "lock-order", "locked placement");
+	const held = Promise.withResolvers<void>(),
+		release = Promise.withResolvers<void>();
+	const append = client.db.transaction(async (tx) => {
+		await tx
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(eq(narrators.id, "a-parent"))
+			.for("update");
+		held.resolve();
+		await release.promise;
+		return persistPgMessageWithRef(tx, {
+			id: "lock-append",
+			narratorId: "z-child",
+			parentToolUseId: "lock-tool",
+			role: "assistant",
+			contentJson: [],
+			createdAt: now,
+		});
+	});
+	await held.promise;
+	const planned = Promise.withResolvers<number>();
+	const materializer = createPgPlacedMessageMaterializer(
+		placedMessage(lockRow, { parentToolUseId: "lock-tool" }),
+		{ narratorIds: ["z-extra", "z-child", "a-parent", "z-extra"] },
+	);
+	const plan = materializer.planNarratorLocks;
+	if (!plan) throw new Error("Placement factory must declare narrator dependencies");
+	materializer.planNarratorLocks = async (tx, claim) => {
+		const result = await tx.execute(sql`SELECT pg_backend_pid() AS pid`);
+		const ids = await plan(tx, claim);
+		planned.resolve(Number(result[0].pid));
+		return ids;
+	};
+	const placement = queue.mailbox.materialize(claimOf(lockRow), materializer);
+	try {
+		const pid = await planned.promise;
+		let waiting = false;
+		const deadline = Date.now() + 1000;
+		while (!waiting && Date.now() < deadline) {
+			const rows = await client.sql.unsafe(
+				"SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1",
+				[pid],
+			);
+			waiting = rows[0]?.wait_event_type === "Lock";
+			if (!waiting) await Bun.sleep(5);
+		}
+		expect(waiting).toBe(true);
+		await client.db.transaction(async (tx) => {
+			const rows = await tx
+				.select({ id: narrators.id })
+				.from(narrators)
+				.where(eq(narrators.id, "z-child"))
+				.for("update", { noWait: true });
+			expect(rows).toHaveLength(1);
+		});
+	} finally {
+		release.resolve();
+		await Promise.all([append, placement]);
+	}
+
+	// An undeclared callback cannot expand locks during refs writes: roll back all effects.
+	const undeclared = await enqueueAndClaim("z-child", "undeclared", "rejected dependency");
+	const undeclaredMessage = placedMessage(undeclared, { parentToolUseId: "lock-tool" });
+	await expect(
+		queue.mailbox.materialize(claimOf(undeclared), async (tx) => {
+			const persisted = await persistPgMessageWithRef(tx, undeclaredMessage);
+			return { messageId: persisted.messageId, refId: persisted.refId };
+		}),
+	).rejects.toThrow("Undeclared narrator lock dependency");
+	expect((await mailboxState(undeclared.id)).state).toBe("claimed");
+	expect(
+		await client.db
+			.select()
+			.from(narratorMessages)
+			.where(eq(narratorMessages.id, undeclaredMessage.id)),
+	).toHaveLength(0);
+
+	// Claim may change after read-only planning: state/token/epoch recheck remains authoritative.
+	const stale = await enqueueAndClaim("z-child", "stale-plan", "stale plan");
+	const staleMaterializer = createPgPlacedMessageMaterializer(placedMessage(stale));
+	const stalePlan = staleMaterializer.planNarratorLocks;
+	if (!stalePlan || !stale.recipientMessageId) throw new Error("Incomplete stale claim fixture");
+	staleMaterializer.planNarratorLocks = async (tx, claim) => {
+		const ids = await stalePlan(tx, claim);
+		await client.db
+			.update(narratorBufferedMessages)
+			.set({ claimToken: "replacement-token" })
+			.where(eq(narratorBufferedMessages.id, stale.id));
+		return ids;
+	};
+	await expect(queue.mailbox.materialize(claimOf(stale), staleMaterializer)).rejects.toThrow(
+		"Stale mailbox claim",
+	);
+	expect(
+		await client.db
+			.select()
+			.from(narratorMessages)
+			.where(eq(narratorMessages.id, stale.recipientMessageId)),
+	).toHaveLength(0);
+
+	// Reverse lexical IDs still prelock both parent and recipient, including hook dependencies.
+	const reverseRoot = await store.append({
+		id: "reverse-root",
+		narratorId: "z-extra",
+		role: "assistant",
+		contentJson: [],
+		createdAt: now,
+	});
+	await client.db.insert(narratorToolCalls).values({
+		id: "reverse-call",
+		narratorId: "z-extra",
+		messageId: reverseRoot.id,
+		toolUseId: "reverse-tool",
+		toolName: "Agent",
+		createdAt: now,
+	});
+	const reverse = await enqueueAndClaim("a-parent", "reverse-placement", "reverse placement");
+	const reverseBefore = await narratorState("z-extra");
+	await queue.mailbox.materialize(
+		claimOf(reverse),
+		createPgPlacedMessageMaterializer(placedMessage(reverse, { parentToolUseId: "reverse-tool" }), {
+			narratorIds: ["z-child", "z-child", "a-parent"],
+			onPersist: async (tx) => {
+				// This nested refs helper may touch only the factory's predeclared union.
+				await persistPgMessageWithRef(tx, {
+					id: "hook-predeclared",
+					narratorId: "z-child",
+					parentToolUseId: "reverse-tool",
+					role: "disp",
+					contentJson: [],
+					createdAt: now,
+				});
+			},
+		}),
+	);
+	expect((await narratorState("z-extra")).version).toBe(reverseBefore.version + 2);
+	expect((await mailboxState(reverse.id)).state).toBe("materialized");
+
 	// ── 1. Same-transaction materialize: message + ref + hook + mailbox flip ──
 	const parentRoot = await store.append({
 		id: "pgm-parent-root",

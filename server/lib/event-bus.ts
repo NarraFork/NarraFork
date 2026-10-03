@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { BackgroundTaskType } from "@shared/background-task-list";
 import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
+import type { PublicationRun } from "../services/agent-runtime/publication-outbox";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
 import type { ApiRequestDiagnostics } from "./agent/types";
 import type { PublicCodexQuotaOverview } from "./codex-manager";
@@ -346,6 +347,8 @@ export type NarraForkEvent =
 			parentNarratorId: string;
 			taskType: BackgroundTaskType;
 			output: string | null;
+			/** Identity captured with the terminal result, never inferred from a later run. */
+			publicationRun?: PublicationRun;
 	  }
 	| {
 			type: "background_task:failed";
@@ -355,12 +358,15 @@ export type NarraForkEvent =
 			error: string | null;
 			/** Distinguishes an execution timeout from an ordinary failure. */
 			status?: "failed" | "timeout";
+			publicationRun?: PublicationRun;
 	  }
 	| {
 			type: "background_task:cancelled";
 			taskId: string;
 			parentNarratorId: string;
 			taskType: BackgroundTaskType;
+			output?: string | null;
+			publicationRun?: PublicationRun;
 	  }
 	| {
 			type: "background_task:output";
