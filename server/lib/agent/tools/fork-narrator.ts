@@ -29,10 +29,7 @@ export const forkNarratorTool: ToolDefinition = {
 					'"fresh" = new narrator with no history; "fork" = inherit current conversation history',
 				),
 			message: z.string().describe("The initial message to send to the new narrator"),
-			title: z
-				.string()
-				.optional()
-				.describe("Title for the new narrator (and chapter, if chapter-bound)"),
+			title: z.string().optional().describe("Title for the new independent narrator"),
 			inheritMode: z
 				.enum(["full", "compressed"])
 				.optional()
@@ -43,14 +40,14 @@ export const forkNarratorTool: ToolDefinition = {
 				.enum(FORK_WORKTREE_SOURCES)
 				.optional()
 				.describe(
-					'Chapter-bound only. "workspace" includes uncommitted files; "commit" uses committed history only. Independent of mode/inheritMode.',
+					"Deprecated and rejected. Use the explicit Worktree resource tool to create filesystem resources.",
 				),
 			commitSha: z
 				.string()
 				.min(1)
 				.optional()
 				.describe(
-					'Chapter-bound only. Fork from this commit in the parent branch history; requires worktreeSource="commit".',
+					"Deprecated and rejected. Use the explicit Worktree resource tool to select a commit.",
 				),
 			model: z
 				.string()
@@ -75,7 +72,7 @@ export const forkNarratorTool: ToolDefinition = {
 					type: "string",
 				},
 				title: {
-					description: "Title for the new narrator (and chapter, if chapter-bound)",
+					description: "Title for the new independent narrator",
 					type: "string",
 				},
 				inheritMode: {
@@ -86,13 +83,13 @@ export const forkNarratorTool: ToolDefinition = {
 				},
 				worktreeSource: {
 					description:
-						'Chapter-bound only. "workspace" includes uncommitted files; "commit" uses committed history only. Independent of mode/inheritMode.',
+						"Deprecated and rejected. Use the explicit Worktree resource tool to create filesystem resources.",
 					type: "string",
 					enum: [...FORK_WORKTREE_SOURCES],
 				},
 				commitSha: {
 					description:
-						'Chapter-bound only. Fork from this commit in the parent branch history; requires worktreeSource="commit".',
+						"Deprecated and rejected. Use the explicit Worktree resource tool to select a commit.",
 					type: "string",
 				},
 				model: {
@@ -115,6 +112,14 @@ export const forkNarratorTool: ToolDefinition = {
 			model?: string;
 		};
 
+		if (worktreeSource !== undefined || commitSha !== undefined) {
+			return {
+				output:
+					"ForkNarrator creates an independent conversation, not files. Use the explicit Worktree resource tool for worktreeSource or commitSha.",
+				isError: true,
+			};
+		}
+
 		try {
 			const { narratorService } = await import("@server/services/narrator-service");
 			const { sendMessage } = await import("@server/services/narrator-session");
@@ -125,7 +130,7 @@ export const forkNarratorTool: ToolDefinition = {
 
 			// Refuse before creating anything. A forked narrator holds this same tool and
 			// its first message is written by the AI that forked it, so nothing else stops
-			// a chain — and every hop is a git worktree plus a running loop, not a row.
+			// a chain — every hop starts another independent running loop.
 			const parentDepth = await resolveForkDepth({
 				id: parent.id,
 				chapterId: parent.chapterId ?? null,
@@ -140,77 +145,15 @@ export const forkNarratorTool: ToolDefinition = {
 				};
 			}
 
-			let newNarratorId: string;
-			let newTitle: string;
-			let chapterInfo = "";
-
-			if (parent.chapterId) {
-				// Chapter-bound: fork via chapter fork
-				const { chapterFork } = await import("@server/services/chapter-fork");
-				const { db } = await import("@server/db");
-				const { narrators } = await import("@server/db/schema");
-				const { and, eq } = await import("drizzle-orm");
-
-				const chapterInherit = mode === "fresh" ? "fresh" : (inheritMode ?? "full");
-
-				// In "fork" mode, resolve the latest message UUID so that
-				// chapterFork can restore uncommitted file changes via
-				// file-state-rebuild, keeping worktree ↔ message history consistent.
-				let forkAtMessageUuid: string | undefined;
-				if (mode === "fork") {
-					forkAtMessageUuid =
-						(await narratorService.getLatestMessageUuid(ctx.narratorId)) ?? undefined;
-				}
-
-				const newChapter = await chapterFork.fork(parent.chapterId, {
-					title,
-					inheritMode: chapterInherit,
-					userId: ctx.userId ?? null,
-					worktreeSource,
-					startCommitSha: commitSha,
-					forkAtMessageUuid: commitSha ? undefined : forkAtMessageUuid,
-					locale,
-				});
-
-				// Find the new chapter's primary narrator
-				const newNarrator = await db.query.narrators.findFirst({
-					where: and(eq(narrators.chapterId, newChapter.id), eq(narrators.variant, "primary")),
-				});
-				if (!newNarrator) {
-					return {
-						output: "Internal error: chapter fork did not create a narrator",
-						isError: true,
-					};
-				}
-
-				newNarratorId = newNarrator.id;
-				newTitle = newChapter.title ?? title ?? "Forked narrator";
-
-				// Override model if specified
-				if (model) {
-					await db
-						.update(narrators)
-						.set({ model, updatedAt: new Date().toISOString() })
-						.where(eq(narrators.id, newNarratorId));
-				}
-
-				chapterInfo = getToolMessageWithParams("forkNarratorChapterInfo", locale, {
-					chapterId: newChapter.id,
-					chapterTitle: newChapter.title ?? "",
-				});
-			} else {
-				// Standalone narrator
-				const newNarrator = await narratorService.forkStandaloneFromTool(ctx.narratorId, mode, {
-					title,
-					inheritMode,
-					userId: ctx.userId ?? null,
-					model,
-					locale: ctx.locale,
-				});
-
-				newNarratorId = newNarrator.id;
-				newTitle = newNarrator.title ?? title ?? "Forked narrator";
-			}
+			const newNarrator = await narratorService.forkStandaloneFromTool(ctx.narratorId, mode, {
+				title,
+				inheritMode,
+				userId: ctx.userId ?? null,
+				model,
+				locale: ctx.locale,
+			});
+			const newNarratorId = newNarrator.id;
+			const newTitle = newNarrator.title ?? title ?? "Forked narrator";
 
 			// Fire-and-forget: send the initial message to the new narrator.
 			// The prompt was written by the forking AI, not by a human.
@@ -240,7 +183,7 @@ export const forkNarratorTool: ToolDefinition = {
 				output: getToolMessageWithParams("forkNarratorSuccess", locale, {
 					narratorId: newNarratorId,
 					title: newTitle,
-					chapterInfo,
+					chapterInfo: "",
 				}),
 			};
 		} catch (err) {

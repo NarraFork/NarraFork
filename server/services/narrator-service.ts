@@ -1,5 +1,5 @@
 import { existsSync, rmSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, sep } from "node:path";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { foldHandle } from "@shared/narrator-handle";
@@ -129,6 +129,7 @@ import {
 	withSeqFloorRaiseScope,
 } from "./narrator-refs/seq-store";
 import { materializeChildrenOf } from "./narrator-refs-backfill";
+import { isSignedReviewBoundaryRow, signReviewBoundaryRuleId } from "./narrator-review-boundary";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
 import { resolveSkillContextForNarrator } from "./skill-service";
 import { specVfsService } from "./spec-vfs-service";
@@ -1284,14 +1285,63 @@ function copyForkAccessAndRules(
 		tx.insert(narratorWhitelistDirs)
 			.values(whiteDirs.map((row) => ({ ...row, narratorId: childId })))
 			.run();
-	const blackDirs = copied(
-		tx
-			.select()
-			.from(narratorBlacklistDirs)
-			.where(eq(narratorBlacklistDirs.narratorId, parentId))
-			.limit(1_001)
-			.all(),
-	);
+	const sourceBlackDirs = tx
+		.select()
+		.from(narratorBlacklistDirs)
+		.where(eq(narratorBlacklistDirs.narratorId, parentId))
+		.limit(1_001)
+		.all();
+	const blackDirs = copied(sourceBlackDirs).map((row, index) => ({
+		...row,
+		// Re-sign only verified server provenance, never an ID prefix from legacy input.
+		id: isSignedReviewBoundaryRow(sourceBlackDirs[index])
+			? signReviewBoundaryRuleId(childId, row.path)
+			: row.id,
+		narratorId: childId,
+	}));
+	// Review primaries are created with the ordinary default permission mode.
+	// Their real constraint is the chapter's worktree, so freeze that boundary
+	// before dropping chapter identity; descendants keep the server-owned deny row.
+	const sourceChapter = tx
+		.select({ role: chapters.role, worktreePath: chapters.worktreePath })
+		.from(narrators)
+		.innerJoin(chapters, eq(narrators.chapterId, chapters.id))
+		.where(eq(narrators.id, parentId))
+		.limit(1)
+		.get();
+	if (sourceChapter?.role === "review") {
+		if (!sourceChapter.worktreePath)
+			throw new ValidationError("Review workspace boundary is unavailable");
+		const root = sourceChapter.worktreePath;
+		const existingBoundary = blackDirs.some(
+			(row) => isSignedReviewBoundaryRow(row) && resolve(row.path) === resolve(root),
+		);
+		if (!existingBoundary) {
+			// Keep editable rules intact (including denyAll and non-host selectors).
+			// The legacy unique index uses lexical paths, while policy compilation uses
+			// canonical identities: a bounded '/.' suffix lets both layers coexist.
+			if (blackDirs.length >= 1_000) throw new ValidationError("Fork access profile exceeds limit");
+			let boundaryPath = root;
+			while (blackDirs.some((row) => row.path === boundaryPath && row.deviceScope === "local")) {
+				boundaryPath = `${boundaryPath}${sep}.`;
+			}
+			blackDirs.push({
+				id: signReviewBoundaryRuleId(childId, boundaryPath),
+				narratorId: childId,
+				path: boundaryPath,
+				pathFlavor: null,
+				pathKey: null,
+				denyLevel: "denyWrite",
+				enabled: true,
+				targetKind: "host",
+				targetValue: null,
+				deviceScope: "local",
+				createdAt: new Date().toISOString(),
+				updatedAt: null,
+			});
+		}
+	}
+	if (blackDirs.length > 1_000) throw new ValidationError("Fork access profile exceeds limit");
 	if (blackDirs.length)
 		tx.insert(narratorBlacklistDirs)
 			.values(blackDirs.map((row) => ({ ...row, narratorId: childId })))
@@ -1329,12 +1379,27 @@ async function resolveForkExecutionContext(parent: typeof narrators.$inferSelect
 		parent.workspaceContext.deviceId === (parent.defaultDeviceId ?? "local")
 			? parent.workspaceContext
 			: null;
+	// A committed workspace is authoritative. Never reinterpret a remote session's
+	// absent cwd as the host project's path; an unresolved remote workspace stays blocked.
+	const remote = parent.defaultDeviceId && parent.defaultDeviceId !== "local";
+	const cwd = committedContext?.cwd || parent.cwd || (remote ? null : context.cwd);
+	if (remote && !cwd) {
+		throw new ValidationError(
+			"Remote workspace is unresolved; select a device directory before forking",
+		);
+	}
+	const contextProjectId = await resolveNarratorProjectId(parent);
 	return {
-		cwd: parent.cwd || committedContext?.cwd || context.cwd,
+		cwd,
 		defaultDeviceId: parent.defaultDeviceId,
+		workspaceRevision: 0,
+		workspaceContext: committedContext
+			? { ...committedContext, revision: 0, contextProjectId: contextProjectId ?? undefined }
+			: null,
+		aclRootNarratorId: parent.aclRootNarratorId,
 		enabledTools: parent.enabledTools,
 		isAskInPassing: parent.isAskInPassing,
-		contextProjectId: await resolveNarratorProjectId(parent),
+		contextProjectId,
 		oauthPolicySnapshotJson: parent.oauthPolicySnapshotJson,
 	};
 }
@@ -2476,7 +2541,14 @@ export const narratorService = {
 							traits: forkTraits2,
 							...executionContext,
 							// A new chapter supplies its own project and effective workspace.
-							...(targetChapterId ? { contextProjectId: null, cwd: null } : {}),
+							...(targetChapterId
+								? {
+										contextProjectId: null,
+										cwd: null,
+										workspaceContext: null,
+										workspaceRevision: 0,
+									}
+								: {}),
 							model: storedModel,
 							systemPrompt,
 							permissionMode: resolvedPermMode,
@@ -2868,17 +2940,12 @@ export const narratorService = {
 			if (isSubagentVariant(parent.variant)) {
 				throw new ValidationError("Cannot fork from a subagent narrator");
 			}
-			if (parent.chapterId) {
-				throw new ValidationError(
-					"Chapter-bound narrators must fork via chapter fork (use chapterFork.fork)",
-				);
-			}
-
 			if (mode === "fresh") {
 				return this.forkNarrator(parentNarratorId, null, {
 					title: opts?.title,
 					model: opts?.model,
 					inheritMode: "fresh",
+					standalone: true,
 					userId: opts?.userId,
 					locale: opts?.locale,
 				});
@@ -2888,6 +2955,8 @@ export const narratorService = {
 
 			return this.forkNarrator(parentNarratorId, latestMsgUuid, {
 				title: opts?.title,
+				model: opts?.model,
+				standalone: true,
 				inheritMode: opts?.inheritMode ?? "full",
 				userId: opts?.userId ?? null,
 				locale: opts?.locale,

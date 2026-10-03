@@ -10,7 +10,6 @@ import { narratorPrincipalOf } from "../lib/narrator-access";
 import { getHome } from "../lib/platform";
 import { narraforkDir } from "../lib/settings";
 import { isDeviceAuthorized } from "./device-service";
-import type { CompiledExecutionPolicy } from "./execution-policy/compiler";
 import { executionPolicyEngine } from "./execution-policy/engine";
 import type { ExecutionDeviceClass, ExecutionTargetContext } from "./execution-policy/types";
 import {
@@ -19,6 +18,7 @@ import {
 	resolveNarratorGitTarget,
 } from "./git-workspace";
 import { ACCESS_PAGE_SIZE, GitAccessScan } from "./git-workspace-access-scan";
+import { gitPathPolicyAllows } from "./git-workspace-path-policy";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { canWriteNarrator, loadNarratorForAccess, type NarratorPrincipal } from "./narrator-acl";
 import { resolveOAuthDeviceRuntimeAuthorization } from "./oauth-device-runtime-policy";
@@ -61,35 +61,7 @@ async function requireSafeLocalGitPath(target: GitWorkspaceTarget, path: string)
 		throw denied();
 }
 
-/** A whole-tree operation cannot skip forbidden descendants or widen a subtree grant. */
-export function gitPathPolicyAllows(
-	policy: CompiledExecutionPolicy,
-	context: ExecutionTargetContext,
-	root: string,
-	need: "read" | "write",
-): boolean {
-	const paths = context.paths;
-	if (
-		policy.directoryBlacklist.some(
-			(rule) =>
-				rule.enabled &&
-				(rule.denyLevel === "denyAll" || need === "write") &&
-				(paths.contains(root, rule.path) || paths.contains(rule.path, root)),
-		)
-	)
-		return false;
-	const decision = policy.evaluatePath({ path: root, operation: need });
-	if (decision.decision === "deny") return false;
-	// An explicit narrower grant is not permission to manage its containing repository.
-	// Only rules strictly INSIDE root count: a whitelist only ever grants, so an ancestor
-	// (or identical) rule with a lower access level — e.g. a readOnly grant on the parent
-	// directory holding sibling projects — must not downgrade the narrator's own workspace.
-	const scoped = policy.directoryWhitelist.filter(
-		(rule) => paths.contains(root, rule.path) && !paths.equals(root, rule.path),
-	);
-	if (scoped.length > 0 && decision.decision !== "allow") return false;
-	return true;
-}
+export { gitPathPolicyAllows } from "./git-workspace-path-policy";
 
 function ancestors(path: string, target: GitWorkspaceTarget): string[] {
 	const paths = target.backend?.paths;

@@ -39,7 +39,7 @@ import { containerService } from "../services/container-service";
 import { gitService } from "../services/git-service";
 import { integrationResourceBindingService } from "../services/integration-resource-binding-service";
 import { propagateOAuthProjectRemoval } from "../services/oauth-runtime-revocation";
-import { ensureGitignoreEntry } from "../services/project-db-sync";
+import { ensureGitignoreEntry, syncProject } from "../services/project-db-sync";
 import {
 	getProjectAccess,
 	removeProjectMember,
@@ -146,7 +146,7 @@ projectRoutes.post("/", async (c) => {
 
 	const now = new Date().toISOString();
 	const projectId = generateId();
-	// Owner of any narrator auto-created alongside the root chapter below.
+	// A project is context only; ordinary narrators are created explicitly, without a root chapter.
 	const createdByUserId = c.get("user").sub;
 	// The setup commits below (initial commit, .gitignore) are authored by whoever
 	// created the project rather than by the host machine's global git config.
@@ -227,19 +227,8 @@ projectRoutes.post("/", async (c) => {
 				}
 
 				try {
-					await chapterService.createRootChapter({
-						projectId,
-						title: body.name,
-						gitPath,
-						defaultBranch,
-						createdByUserId,
-					});
-				} catch (err) {
-					console.warn("Failed to create root chapter:", err);
-				}
-
-				try {
 					projectDbManager.openForGitPath(projectId, gitPath);
+					await syncProject(projectId);
 					ensureGitignoreEntry(gitPath);
 					await gitService.commitGitignoreIfDirty(gitPath, gitIdentity);
 				} catch (err) {
@@ -323,23 +312,10 @@ projectRoutes.post("/", async (c) => {
 		});
 	}
 
-	// Auto-create root chapter
-	try {
-		await chapterService.createRootChapter({
-			projectId,
-			title: body.name,
-			gitPath,
-			defaultBranch,
-			createdByUserId,
-		});
-	} catch (err) {
-		// Non-fatal — project is still usable without root chapter
-		console.warn("Failed to create root chapter:", err);
-	}
-
 	// Initialize project backup DB + .gitignore
 	try {
 		projectDbManager.openForGitPath(projectId, gitPath);
+		await syncProject(projectId);
 		ensureGitignoreEntry(gitPath);
 		await gitService.commitGitignoreIfDirty(gitPath, gitIdentity);
 	} catch (err) {

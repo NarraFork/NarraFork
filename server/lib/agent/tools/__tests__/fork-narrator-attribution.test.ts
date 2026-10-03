@@ -21,15 +21,12 @@ const { chapterFork } = await import("@server/services/chapter-fork");
 const { forkNarratorTool } = await import("../fork-narrator");
 const original = {
 	getById: narratorService.getById,
-	create: narratorService.create,
 	getLatestMessageUuid: narratorService.getLatestMessageUuid,
 	forkNarrator: narratorService.forkNarrator,
 	forkChapter: chapterFork.fork,
 };
-
 afterEach(() => {
 	narratorService.getById = original.getById;
-	narratorService.create = original.create;
 	narratorService.getLatestMessageUuid = original.getLatestMessageUuid;
 	narratorService.forkNarrator = original.forkNarrator;
 	chapterFork.fork = original.forkChapter;
@@ -42,87 +39,94 @@ afterAll(() => {
 	mock.module("../../fork-narrator-depth", () => realDepth);
 	mock.restore();
 });
+const ctx = { narratorId: "parent", userId: "caller-A", locale: "en" } as ToolContext;
 
-describe("ForkNarrator attribution", () => {
-	test.each([
-		"fresh",
-		"fork",
-	] as const)("standalone %s keeps caller identity and assistant origin", async (mode) => {
-		const parent = { id: "parent", chapterId: null, variant: "primary", ownerUserId: "owner-B" };
-		narratorService.getById = mock(async () => parent as never);
-		narratorService.getLatestMessageUuid = mock(async () => null);
-		narratorService.create = mock(async () => ({ id: "child", title: "child" }) as never);
-		const fork = mock(
-			async (..._args: Parameters<typeof narratorService.forkNarrator>) =>
-				({ id: "child", title: "child" }) as never,
-		);
-		narratorService.forkNarrator = fork;
-		const result = await forkNarratorTool.execute(
-			{ mode, message: "continue", inheritMode: "compressed" },
-			{
-				narratorId: "parent",
-				userId: "caller-A",
-				locale: "en",
-			} as ToolContext,
-		);
-		expect(result.isError).not.toBe(true);
-		if (mode === "fork")
-			expect(fork.mock.calls[0]?.[2]).toMatchObject({
-				userId: "caller-A",
-				inheritMode: "compressed",
+describe("ordinary ForkNarrator", () => {
+	for (const chapterId of [null, "chapter"]) {
+		for (const inheritMode of ["fresh", "full", "compressed"] as const) {
+			test(`${chapterId ?? "standalone"} ${inheritMode} retains model, actor and origin without resources`, async () => {
+				const now = new Date().toISOString();
+				if (chapterId) {
+					await db.insert(projects).values({
+						id: "project",
+						name: "fixture",
+						gitPath: "/fixture",
+						createdAt: now,
+						updatedAt: now,
+					});
+					await db.insert(chapters).values({
+						id: chapterId,
+						projectId: "project",
+						title: "fixture",
+						branch: "fixture",
+						baseBranch: "main",
+						createdAt: now,
+						updatedAt: now,
+					});
+				}
+				await db
+					.insert(narrators)
+					.values({ id: "parent", chapterId, createdAt: now, updatedAt: now });
+				narratorService.getById = mock(
+					async () => ({ id: "parent", chapterId, variant: "primary" }) as never,
+				);
+				narratorService.getLatestMessageUuid = mock(async () => "latest");
+				const fork = mock(
+					async (..._args: Parameters<typeof narratorService.forkNarrator>) =>
+						({ id: "child", title: "child" }) as never,
+				);
+				narratorService.forkNarrator = fork;
+				const resourceFork = mock(async () => {
+					throw new Error("must not create resources");
+				});
+				chapterFork.fork = resourceFork;
+				const result = await forkNarratorTool.execute(
+					{
+						mode: inheritMode === "fresh" ? "fresh" : "fork",
+						inheritMode: inheritMode === "fresh" ? undefined : inheritMode,
+						message: "continue",
+						title: "child",
+						model: "custom-model",
+					},
+					ctx,
+				);
+				expect(result.isError, String(result.output)).not.toBe(true);
+				expect(fork.mock.calls[0]?.[2]).toMatchObject({
+					userId: "caller-A",
+					inheritMode,
+					standalone: true,
+					model: "custom-model",
+					title: "child",
+				});
+				expect(resourceFork).not.toHaveBeenCalled();
+				expect(await db.select().from(chapters)).toHaveLength(chapterId ? 1 : 0);
+				expect(await db.select().from(projects)).toHaveLength(chapterId ? 1 : 0);
+				expect(sendCalls[0]?.[6]).toBe("caller-A");
+				expect(sendCalls[0]?.[9]).toMatchObject({ origin: "assistant" });
 			});
-		expect(sendCalls[0]?.[6]).toBe("caller-A");
-		expect(sendCalls[0]?.[9]).toMatchObject({ origin: "assistant" });
-	});
-
-	test("chapter compressed fork passes the caller to its summary and initial message", async () => {
-		narratorService.getById = mock(
-			async () => ({ id: "parent", chapterId: "chapter", variant: "primary" }) as never,
-		);
-		narratorService.getLatestMessageUuid = mock(async () => null);
-		const now = new Date().toISOString();
-		await db.insert(projects).values({
-			id: "project",
-			name: "test",
-			gitPath: "/tmp/test",
-			createdAt: now,
-			updatedAt: now,
+		}
+	}
+	test.each([
+		{ worktreeSource: "workspace" },
+		{ worktreeSource: "commit" },
+		{ commitSha: "abc" },
+	])("deprecated resource args are explicitly rejected before effects: %j", async (deprecated) => {
+		const get = mock(async () => {
+			throw new Error("must not read parent");
 		});
-		await db.insert(chapters).values({
-			id: "new-chapter",
-			title: "child chapter",
-			projectId: "project",
-			branch: "branch",
-			baseBranch: "main",
-			createdAt: now,
-			updatedAt: now,
-		});
-		await db.insert(narrators).values({
-			id: "child",
-			chapterId: "new-chapter",
-			variant: "primary",
-			createdAt: now,
-			updatedAt: now,
-		});
-		const fork = mock(
-			async (..._args: Parameters<typeof chapterFork.fork>) =>
-				({ id: "new-chapter", title: "child chapter" }) as never,
-		);
-		chapterFork.fork = fork;
+		narratorService.getById = get;
 		const result = await forkNarratorTool.execute(
-			{ mode: "fork", message: "continue", inheritMode: "compressed" },
-			{
-				narratorId: "parent",
-				userId: "caller-A",
-				locale: "en",
-			} as ToolContext,
+			{ mode: "fresh", message: "go", ...deprecated },
+			ctx,
 		);
-		expect(result.isError).not.toBe(true);
-		expect(fork.mock.calls[0]?.[1]).toMatchObject({
-			userId: "caller-A",
-			inheritMode: "compressed",
-		});
-		expect(sendCalls[0]?.[6]).toBe("caller-A");
-		expect(sendCalls[0]?.[9]).toMatchObject({ origin: "assistant" });
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("Worktree");
+		expect(get).not.toHaveBeenCalled();
+		expect(sendCalls).toHaveLength(0);
+	});
+	test("schema omission does not inject deprecated defaults", () => {
+		const parsed = forkNarratorTool.parameters.parse({ mode: "fresh", message: "go" });
+		expect(parsed).not.toHaveProperty("worktreeSource");
+		expect(parsed).not.toHaveProperty("commitSha");
 	});
 });

@@ -1,28 +1,34 @@
 import { notifications } from "@mantine/notifications";
-import { useCallback, useMemo, useRef } from "react";
+import { useCallback, useRef } from "react";
 import { useForkNarrator, useStartAskInPassing } from "../../../hooks/useNarrator";
+
+/** Ordinary promotion never routes back to a resource canvas, including legacy sources. */
+export function ordinaryPromoteDestination(narratorId: string) {
+	if (!narratorId) throw new Error("Promoted conversation ID is missing");
+	return { to: "/narrators/$narratorId" as const, params: { narratorId } };
+}
 
 export interface UseNarratorForkActionsOptions {
 	narratorId: string;
 	/** The narrator's chapter id (null/undefined for standalone narrators). */
 	chapterId: string | null | undefined;
-	/** Chapter-bound fork handler supplied by the host (git-aware auto-naming). */
+	/** Legacy resource callback retained for host compatibility; ordinary forks do not invoke it. */
 	onForkFromMessage: ((messageId: string) => void) | undefined;
 	/** Navigate to a narrator route (used after a standalone fork). */
 	navigateToNarrator: (narratorId: string) => void;
 }
 
 export interface UseNarratorForkActionsResult {
-	/** Fork from a message: chapter-bound via host handler, else a direct narrator fork. */
+	/** Fork any ordinary source into an independent conversation. */
 	forkHandler: ((messageId: string) => void) | undefined;
 	/** Start an "ask in passing" child probe from a source message. */
 	handleAskInPassing: (messageUuid: string | null, messageId: string) => void;
 }
 
 /**
- * Fork + "ask in passing" actions extracted from NarratorPanel. A chapter-bound
- * narrator forks through the host's `onForkFromMessage` (auto-named, git-aware);
- * a standalone narrator forks its session directly and navigates to the new one.
+ * Fork + "ask in passing" actions extracted from NarratorPanel. Ordinary forks
+ * always create an independent conversation and navigate to its narrator route.
+ * A chapter-bound source does not allocate another resource.
  *
  * Kept lifted (called from the panel): the resolved handlers feed the panel's
  * trace-row action context memo, consumed by descendants.
@@ -30,7 +36,7 @@ export interface UseNarratorForkActionsResult {
 export function useNarratorForkActions(
 	options: UseNarratorForkActionsOptions,
 ): UseNarratorForkActionsResult {
-	const { narratorId, chapterId, onForkFromMessage, navigateToNarrator } = options;
+	const { narratorId, navigateToNarrator } = options;
 
 	const forkNarratorMutation = useForkNarrator();
 	const forkNarratorMutationRef = useRef(forkNarratorMutation);
@@ -54,12 +60,9 @@ export function useNarratorForkActions(
 		},
 		[narratorId],
 	);
-	// Chapter-bound: use onForkFromMessage (direct fork with auto-generated name)
-	// Standalone: use handleStandaloneFork (direct narrator fork)
-	const forkHandler = useMemo(
-		() => (chapterId ? onForkFromMessage : handleStandaloneFork),
-		[chapterId, onForkFromMessage, handleStandaloneFork],
-	);
+	// Legacy hosts keep their resource callbacks, but ordinary message forks never
+	// call them: even a chapter-bound source produces an independent conversation.
+	const forkHandler = handleStandaloneFork;
 
 	const startAskInPassingMutation = useStartAskInPassing();
 	const startAskInPassingMutationRef = useRef(startAskInPassingMutation);
