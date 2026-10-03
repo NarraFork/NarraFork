@@ -30,12 +30,11 @@ import {
 	IconChevronDown,
 	IconChevronRight,
 	IconEyeOff,
-	IconFile,
-	IconFolder,
 	IconRefresh,
 } from "@tabler/icons-react";
 import { useCallback, useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { FileTreeIcon } from "./file-icons";
 import { TREE_ROOT_KEY } from "./tree-patch";
 import type { TreeEntry, TreeLineStats, TreeState } from "./tree-store";
 import { useFileTree } from "./useFileTree";
@@ -314,12 +313,12 @@ function FileTreeRow({
 					) : (
 						<IconChevronRight size={14} style={{ flexShrink: 0, opacity: 0.6 }} />
 					)}
-					<IconFolder size={14} style={{ flexShrink: 0, opacity: 0.75 }} />
+					<FileTreeIcon name={entry.name} isDirectory expanded={expanded} />
 				</>
 			) : (
 				<>
 					<Box style={{ width: 14, flexShrink: 0 }} />
-					<IconFile size={14} style={{ flexShrink: 0, opacity: 0.6 }} />
+					<FileTreeIcon name={entry.name} isDirectory={false} />
 				</>
 			)}
 			<Text
