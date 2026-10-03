@@ -20,6 +20,7 @@
  */
 
 import type { VListElementKind } from "@shared/pretext-layout/element-kinds";
+import { TEXT_PREVIEW_MAX_CHARS } from "@shared/pretext-layout/text-preview";
 import { measureAskInPassing } from "./measure/measure-ask-in-passing";
 import { measureCommunicationBubble } from "./measure/measure-communication-bubble";
 import { measureInjectionBubble } from "./measure/measure-injection-bubble";
@@ -96,13 +97,13 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		kind: "communication-bubble",
 		label: "Outgoing communication bubble (framed markdown)",
 		lodSensitive: false,
-		measure: (d, w, l) => measureCommunicationBubble(d as AnyData, w, l),
+		measure: (d, w, l, o) => measureCommunicationBubble(d as AnyData, w, l, o as AnyData),
 	},
 	"injection-bubble": {
 		kind: "injection-bubble",
 		label: "Injected content bubble (framed markdown)",
 		lodSensitive: false,
-		measure: (d, w, l) => measureInjectionBubble(d as AnyData, w, l),
+		measure: (d, w, l, o) => measureInjectionBubble(d as AnyData, w, l, o as AnyData),
 	},
 	markdown: {
 		kind: "markdown",
@@ -365,6 +366,11 @@ function measureStreamingElement(
 		// risk preparing one and measuring the other.
 		const text = resolveReasoningDisplayText(data as AnyData, expandState);
 		if (text.length === 0) return undefined;
+		// Bound BEFORE touching the incremental cache: long live reasoning must not
+		// prepare the whole accumulated body merely to throw most of it away.
+		if (!expandState.textExpanded && text.length > TEXT_PREVIEW_MAX_CHARS) {
+			return measureReasoning(data as AnyData, contentWidth, lod, expandState);
+		}
 		return measureReasoning(data as AnyData, contentWidth, lod, {
 			...expandState,
 			// Scope the cache per body: the translation toggle flips between two

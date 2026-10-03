@@ -54,6 +54,12 @@ export function retainedBodySourceChars(value: unknown): number {
 	const item = value as Record<string, unknown>;
 	const model = item.model as Record<string, unknown> | undefined;
 	let chars = 0;
+	// Preview geometry is small, but it intentionally retains the FULL source for
+	// reader expansion. Account for that payload, not just prepared visible blocks.
+	const preview = item.textPreview as { sourceText?: unknown } | undefined;
+	chars += typeof preview?.sourceText === "string" ? preview.sourceText.length : 0;
+	for (const key of ["displayText", "sourceText"] as const)
+		chars += typeof item[key] === "string" ? item[key].length : 0;
 	if (model?.kind === "capped") {
 		chars += typeof model.text === "string" ? model.text.length : 0;
 		const doc = model.diffDocument as
@@ -62,12 +68,15 @@ export function retainedBodySourceChars(value: unknown): number {
 		chars += doc?.oldSource?.text?.length ?? 0;
 		chars += doc?.newSource?.text?.length ?? 0;
 	}
-	for (const key of ["detail", "promptMeasured", "resultMeasured"] as const)
+	for (const key of ["detail", "promptMeasured", "resultMeasured", "body", "bodyMeasured"] as const)
 		chars += retainedBodySourceChars(item[key]);
 	if (Array.isArray(item.sections))
 		for (const section of item.sections) chars += retainedBodySourceChars(section?.measuredBody);
 	if (Array.isArray(item.rows))
-		for (const row of item.rows) chars += retainedBodySourceChars(row?.cardMeasured);
+		for (const row of item.rows) {
+			chars += retainedBodySourceChars(row?.cardMeasured);
+			chars += retainedBodySourceChars(row?.body);
+		}
 	if (Array.isArray(item.children))
 		for (const child of item.children) chars += retainedBodySourceChars(child);
 	return chars;
@@ -352,6 +361,9 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// Re-key the bounded measured text and both independently reserved footer rows.
 	if (typeof d.message === "string") {
 		rev += `|cm:${textSignature(d.message)}|ct:${d.messageTruncated === true ? 1 : 0}`;
+		const source = d.messageBody as { text?: unknown; textTruncated?: unknown } | undefined;
+		if (typeof source?.text === "string") rev += `|cms:${textSignature(source.text)}`;
+		if (source?.textTruncated === true) rev += "|cmcut:1";
 		if (typeof d.error === "string") rev += `|ce:${textSignature(d.error)}`;
 		if (typeof d.warning === "string") rev += `|cw:${textSignature(d.warning)}`;
 		// ExactRow memoizes by the measured object: navigation-only changes must
@@ -1021,9 +1033,13 @@ function digestOpts(opts: Record<string, unknown>): string {
 		} else if (typeof v === "number") {
 			result += String(v);
 		} else if (Array.isArray(v)) {
-			// Small sorted array of numbers (expandedIndices, expandedRows)
-			const sorted = (v as number[]).slice().sort((a, b) => a - b);
-			result += sorted.join(",");
+			if (k === "textExpandedKeys") {
+				// String keys may contain commas; preserve boundaries and set semantics.
+				result += JSON.stringify([...new Set(v as string[])].sort());
+			} else {
+				const sorted = (v as number[]).slice().sort((a, b) => a - b);
+				result += sorted.join(",");
+			}
 		} else if (v instanceof Set) {
 			const sorted = [...v].sort();
 			result += sorted.join(",");

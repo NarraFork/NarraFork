@@ -38,6 +38,7 @@ import type {
 import type { TraceRowInteractionSlot } from "./render/RenderToolRun";
 import { renderElement, resolveRenderExtra } from "./render-registry";
 import { renderLabelsForKind, type VListRenderLabels } from "./useVListLabels";
+import type { UseVListToolDetailsResult } from "./useVListToolDetails";
 import { VListContentViewHost, type VListViewControls } from "./VListContentViewHost";
 import { VListRowInteraction } from "./VListRowInteraction";
 import type { VListCompactRowActions } from "./vlist-compact-bridge";
@@ -138,6 +139,7 @@ export interface ExactRowProps {
 	/** Interaction signature for this row's key; changes force a re-render. */
 	interactionSig: string;
 	toggles: RowToggles;
+	resolveToolDetailStatus?: UseVListToolDetailsResult["resolveToolDetailStatus"];
 	/** Localized chrome bundles for the render layer (stable across renders). */
 	renderLabels: VListRenderLabels;
 	/** Present when this row carries a single-block interaction menu. */
@@ -354,6 +356,7 @@ export const ExactRow = memo(
 		itemId,
 		sourceIds,
 		toggles,
+		resolveToolDetailStatus,
 		renderLabels,
 		interaction,
 		rowInteraction,
@@ -395,6 +398,20 @@ export const ExactRow = memo(
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
 		const kind = item.spec.kind;
+		// Read-only shares retain this reader-owned fold without enabling mutation/menu actions.
+		extra.textPreviewLabels = renderLabels.textPreview;
+		extra.onToggleTextExpanded = toggles.onToggleTextExpanded;
+		if (kind === "communication-bubble" && resolveToolDetailStatus) {
+			const source = item.spec.data as {
+				toolUseId?: string;
+				toolDetailRef?: Parameters<typeof resolveToolDetailStatus>[1];
+			};
+			if (source.toolUseId) {
+				const status = resolveToolDetailStatus(source.toolUseId, source.toolDetailRef);
+				extra.fullTextLoading = status.loading;
+				extra.fullTextError = status.error;
+			}
+		}
 		// User bubbles: build the avatar/name/time header node from the forwarded
 		// creator data (the pure render layer cannot construct it itself).
 		injectUserBubbleHeader(kind, extra);
@@ -995,6 +1012,7 @@ export const ExactRow = memo(
 		prev.item.measured === next.item.measured &&
 		prev.item.spec.key === next.item.spec.key &&
 		prev.item.spec.kind === next.item.spec.kind &&
+		prev.item.spec.lifecycleId === next.item.spec.lifecycleId &&
 		// Painted as `data-nf-unit` (the LOD-independent row identity), so a change
 		// must reach the DOM even though it affects nothing else.
 		prev.item.spec.unitId === next.item.spec.unitId &&
@@ -1005,6 +1023,8 @@ export const ExactRow = memo(
 		prev.itemId === next.itemId &&
 		prev.interactionSig === next.interactionSig &&
 		prev.toggles === next.toggles &&
+		prev.renderLabels === next.renderLabels &&
+		prev.resolveToolDetailStatus === next.resolveToolDetailStatus &&
 		prev.interaction === next.interaction &&
 		prev.rowInteraction === next.rowInteraction &&
 		prev.narratorId === next.narratorId &&

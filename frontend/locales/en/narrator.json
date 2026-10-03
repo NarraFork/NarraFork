@@ -1,5 +1,11 @@
 {
 	"you": "You",
+	"textPreview": {
+		"expand": "Expand content",
+		"collapse": "Collapse text",
+		"loading": "Loading full content…",
+		"loadFailed": "Full content could not be loaded"
+	},
 	"historyRecovery": {
 		"title": "History too large to display",
 		"description": "One or more messages contain too many tool calls or too much content for the history aggregator. Delete an oversized message (and everything after it) to restore access.",

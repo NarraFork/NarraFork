@@ -61,7 +61,10 @@ import {
 	parseReasoningSegments,
 	type ReasoningSegment,
 } from "./reasoning-segments";
-import { parseStreamingReasoningTitles } from "./reasoning-segments-cache";
+import {
+	parseStreamingReasoningSegments,
+	parseStreamingReasoningTitles,
+} from "./reasoning-segments-cache";
 import {
 	buildReflectionNoticeData,
 	getPermissionReflectionSuggestion,
@@ -76,6 +79,7 @@ import {
 	isLiveStreamingRun,
 	STREAMING_MESSAGE_ID,
 } from "./streaming-live-blocks";
+import { TEXT_PREVIEW_MAX_CHARS } from "./text-preview";
 import {
 	type ClassifyToolDetailInput,
 	classifyToolDetail,
@@ -759,6 +763,13 @@ export interface ElementSpec {
 	 * part of `data`/`opts`: height- and cache-neutral.
 	 */
 	lifecycleId?: string;
+	/** Body-only aliases for folded reasoning rows. Never replaces visual/selection identities. */
+	textBodyPreferences?: Readonly<Record<string, TextBodyPreference>>;
+}
+
+export interface TextBodyPreference {
+	specKey: string;
+	bodyKey?: string;
 }
 
 /**
@@ -774,10 +785,39 @@ function contentBlockLifecycleId(block: AdapterContentBlock | undefined): string
 	return `blk:${id}`;
 }
 
+/** Stable body preference identity across a live block's persisted message hand-off. */
+export function textExpansionStateKey(specKey: string, lifecycleId?: string): string {
+	return lifecycleId ? `text-lifecycle:${lifecycleId}` : specKey;
+}
+
+/** Resolve only the body preference; a folded row keeps its existing trace/row keys. */
+export function resolveTextExpansionPreference(
+	spec: Pick<ElementSpec, "key" | "lifecycleId" | "textBodyPreferences">,
+	bodyKey?: string,
+): TextBodyPreference {
+	return (
+		(bodyKey !== undefined ? spec.textBodyPreferences?.[bodyKey] : undefined) ?? {
+			specKey: textExpansionStateKey(spec.key, spec.lifecycleId),
+			bodyKey,
+		}
+	);
+}
+
+function adapterTextExpanded(
+	ctx: AdapterContext,
+	specKey: string,
+	bodyKey?: string,
+	lifecycleId?: string,
+): boolean {
+	return ctx.isTextExpanded?.(textExpansionStateKey(specKey, lifecycleId), bodyKey) ?? false;
+}
+
 export interface AdapterContext {
 	lod: RenderLod;
 	/** Explicit interaction override; undefined preserves the measure's default. */
 	isExpanded?: (key: string) => boolean | undefined;
+	/** Full body expansion; separate from the surrounding card's fold. */
+	isTextExpanded?: (specKey: string, bodyKey?: string) => boolean;
 	/** L3 / L4 explicit click override, separate from normal opened state. */
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
@@ -1399,10 +1439,108 @@ function adaptContextBlocks(
 export function adaptSegment(seg: AdapterSegment, ctx: AdapterContext): ElementSpec[] {
 	switch (seg.kind) {
 		case "message":
-			return adaptMessage(seg.msg, seg.visibleBlockIndices, ctx);
+			return adaptMessage(seg.msg, seg.visibleBlockIndices, ctx).map((spec) => {
+				if (spec.kind === "injection-bubble") {
+					spec.opts = {
+						...spec.opts,
+						textExpanded: adapterTextExpanded(ctx, spec.key, undefined, spec.lifecycleId),
+					};
+				}
+				return spec;
+			});
 		case "tool-run":
 			return adaptToolRun(seg.items, ctx);
 	}
+}
+
+/**
+ * A long unstructured run does not need step parsing at all. Probe only appended
+ * bytes after the first frame; importantly, the preview budget is applied BEFORE
+ * the paragraph parser could allocate a full-size growing body. The original text
+ * stays in reasoningData for the measure's bounded preview / explicit expansion.
+ * A bold marker anywhere falls back to the exact parser, preserving step identity.
+ */
+// Probe entries retain source strings too. Count AND per-entry byte-like character
+// budgets keep these classification caches from bypassing the measurement budget.
+const REASONING_PROBE_MAX_SOURCE_CHARS = 1_000_000;
+const plainReasoningProbes = new Map<string, { text: string; hasBold: boolean }>();
+
+function isLongPlainReasoning(key: string, text: string): boolean {
+	if (text.length <= TEXT_PREVIEW_MAX_CHARS) return false;
+	const previous = plainReasoningProbes.get(key);
+	const appendOnly = previous && text.startsWith(previous.text);
+	const hasBold = appendOnly
+		? previous.hasBold || text.indexOf("**", Math.max(0, previous.text.length - 1)) >= 0
+		: text.includes("**");
+	if (plainReasoningProbes.size >= 4 && !plainReasoningProbes.has(key)) {
+		const oldest = plainReasoningProbes.keys().next().value;
+		if (oldest !== undefined) plainReasoningProbes.delete(oldest);
+	}
+	if (text.length <= REASONING_PROBE_MAX_SOURCE_CHARS) {
+		plainReasoningProbes.set(key, { text, hasBold });
+	} else plainReasoningProbes.delete(key);
+	return !hasBold;
+}
+
+/** One titled, still-growing paragraph: retain a lazy source range instead of
+ * splitting/rejoining its whole body on every delta. A later blank paragraph
+ * returns to the exact parser, so additional steps keep their existing identity.
+ */
+interface SingleStepProbe {
+	text: string;
+	title: string;
+	bodyStart: number;
+	pendingBlankLine: boolean;
+	multipleParagraphs: boolean;
+}
+const singleStepProbes = new Map<string, SingleStepProbe>();
+
+function longSingleReasoningStep(key: string, text: string): ReasoningSegment[] | null {
+	if (text.length <= TEXT_PREVIEW_MAX_CHARS) return null;
+	let probe = singleStepProbes.get(key);
+	let scanStart: number;
+	if (probe && text.startsWith(probe.text)) {
+		scanStart = probe.text.length;
+	} else {
+		// Classify only the bounded prefix, before full paragraph parsing/preparation.
+		const heading = /^\s*\*\*([^\r\n]*?)\*\*\r?\n[ \t\r\n]*/.exec(
+			text.slice(0, TEXT_PREVIEW_MAX_CHARS),
+		);
+		if (!heading?.[1]?.trim() || heading[1].includes("**")) return null;
+		probe = {
+			text: "",
+			title: heading[1].trim(),
+			bodyStart: heading[0].length,
+			pendingBlankLine: false,
+			multipleParagraphs: false,
+		};
+		scanStart = probe.bodyStart;
+	}
+	// Incremental structural scan. Whitespace after a newline is carried across
+	// chunks, including a split CRLF. Conservative matches merely fall back.
+	if (!probe.multipleParagraphs) {
+		for (let i = scanStart; i < text.length; i++) {
+			const char = text.charCodeAt(i);
+			if (char === 10) {
+				if (probe.pendingBlankLine) {
+					probe.multipleParagraphs = true;
+					break;
+				}
+				probe.pendingBlankLine = true;
+			} else if (char !== 32 && char !== 9 && char !== 13) probe.pendingBlankLine = false;
+		}
+	}
+	probe.text = text;
+	if (singleStepProbes.size >= 4 && !singleStepProbes.has(key)) {
+		const oldest = singleStepProbes.keys().next().value;
+		if (oldest !== undefined) singleStepProbes.delete(oldest);
+	}
+	if (text.length <= REASONING_PROBE_MAX_SOURCE_CHARS) {
+		singleStepProbes.set(key, probe);
+	} else singleStepProbes.delete(key);
+	if (probe.multipleParagraphs) return null;
+	const body = text.slice(probe.bodyStart).trim();
+	return [{ title: probe.title, body, isEmpty: body.length === 0 || body === "<!-- -->" }];
 }
 
 function adaptMessage(
@@ -1593,6 +1731,7 @@ function adaptMessage(
 					? {
 							opts: {
 								expanded: ctx.isExpanded?.(key) ?? false,
+
 								...(ctx.labels?.showExpandedPrompt
 									? { showLabel: ctx.labels.showExpandedPrompt }
 									: {}),
@@ -1736,10 +1875,17 @@ function adaptMessage(
 			// the plain card carries the language toggle, so letting the flip change the
 			// element kind could swap in a trace with no way back.
 			const displayText = data.translatedText ?? data.text;
-			const parsed = parseReasoning(displayText);
+			const lifecycleId = contentBlockLifecycleId(block);
+			const textExpanded = adapterTextExpanded(ctx, key, undefined, lifecycleId);
+			const parsed =
+				!textExpanded && isLongPlainReasoning(key, displayText)
+					? []
+					: (longSingleReasoningStep(key, displayText) ??
+						(streaming && !ctx.resolveReasoningSegments
+							? parseStreamingReasoningSegments(`high-lod:${key}`, displayText)
+							: parseReasoning(displayText)));
 			// A run is identified by its FIRST block, the same block the fold's
 			// `activityUnitKey` and `reasoningRowIdentity` anchor on.
-			const lifecycleId = contentBlockLifecycleId(block);
 			if (hasStructuredReasoning(parsed)) {
 				specs.push({
 					kind: "reasoning-steps",
@@ -1768,6 +1914,9 @@ function adaptMessage(
 					opts: {
 						showEarlier: ctx.showEarlier?.(key) ?? false,
 						expandedIndices: ctx.expandedRows?.(key) ?? [],
+						textExpandedKeys: parsed.flatMap((_, index) =>
+							adapterTextExpanded(ctx, key, `seg${index}`, lifecycleId) ? [`seg${index}`] : [],
+						),
 					},
 				});
 			} else {
@@ -1778,6 +1927,7 @@ function adaptMessage(
 					data,
 					opts: {
 						expanded: ctx.isExpanded?.(key),
+						textExpanded,
 						showOriginal,
 						// A live reasoning body (synthetic streaming row or checkpoint
 						// projection) must go through the incremental prepared-block path
@@ -1803,6 +1953,7 @@ function adaptMessage(
 					key,
 					...(lifecycleId ? { lifecycleId } : {}),
 					data: markdownData(block),
+
 					// Missing provenance retains the legacy shape. The render boundary maps
 					// it to explicit null, never inheriting the live narrator's current cwd.
 					...(fileReferenceContext || typeof block.revision === "number" || snapshotBody
@@ -3354,6 +3505,8 @@ export interface CommunicationBubbleData {
 	broadcast: boolean;
 	message: string;
 	messageTruncated: boolean;
+	/** True upstream truncation, distinct from the bounded inline preview. */
+	sourceTruncated: boolean;
 	messageBody?: ToolCappedDetail;
 	labels?: Record<string, string>;
 	awaitReply: boolean;
@@ -3405,7 +3558,8 @@ function buildCommunicationBubbleData(
 	const text = readLeafText(input.message) ?? "";
 	const preview = limitCommunicationPreview(text);
 	const message = preview.text;
-	const messageTruncated = hasTruncatedLeaf(input.message) || preview.truncated;
+	const sourceTruncated = hasTruncatedLeaf(input.message);
+	const messageTruncated = sourceTruncated || preview.truncated;
 	const targets = resolveCommunicationTargets(metadata, asObject(item.tc)._sendDeliveryTargets);
 	const awaitReply =
 		item.tc.toolName === "Send" &&
@@ -3447,14 +3601,15 @@ function buildCommunicationBubbleData(
 		broadcast: item.tc.toolName === "TeamStatus" && input.action === "broadcast",
 		message,
 		messageTruncated,
+		sourceTruncated,
 		labels: ctx.labels,
 		messageBody: describeToolBody(
 			{
 				kind: "capped",
 				id: "input.message",
 				source: "input.message",
-				// Viewer-only reference: inline measure/render consumes bounded `message`.
-				// Keeping the source here lets an explicitly loaded payload open in full.
+				// Full available source for both inline text expansion and the viewer.
+				// The measure chooses its bounded preview; never reconstruct from `message`.
 				text,
 				format: "markdown",
 				live: false,
@@ -3493,7 +3648,13 @@ function adaptCommunicationBubble(item: AdapterToolItem, ctx: AdapterContext): E
 		key,
 		unitId: key,
 		data: buildCommunicationBubbleData(item, ctx),
-		opts: { opened: true, forceExpanded: true, inRun: false, isLast: true },
+		opts: {
+			opened: true,
+			forceExpanded: true,
+			inRun: false,
+			isLast: true,
+			textExpanded: ctx.isTextExpanded?.(key) ?? false,
+		},
 	};
 }
 
@@ -4704,6 +4865,7 @@ function adaptActivityItems(
 	traceKey: string,
 ): {
 	traceItems: AdapterTraceItem[];
+	textBodyPreferences: Record<string, TextBodyPreference>;
 	reasoningCount: number;
 	toolCount: number;
 	/** Indices (into `traceItems`) of the rows drilled open for a live permission form. */
@@ -4717,6 +4879,7 @@ function adaptActivityItems(
 	let reasoningCount = 0;
 	let toolCount = 0;
 	const traceItems: AdapterTraceItem[] = [];
+	const textBodyPreferences: Record<string, TextBodyPreference> = {};
 	// ⚠️ Expansion is decided per ROW KEY, and the index is recorded as the row is
 	// emitted. Both halves of that matter:
 	//
@@ -4794,6 +4957,10 @@ function adaptActivityItems(
 			reasoningCount += rows.length;
 			const identity = reasoningRowIdentity(item);
 			const keyBase = reasoningRowKeyBase(item);
+			// Match the high-LOD run's FIRST block and seg ordinal, not the trace's
+			// lifecycle: one trace may contain several independent reasoning runs.
+			const bodyLifecycleId = contentBlockLifecycleId(item.block);
+			const structuredBody = hasStructuredReasoning(parsed);
 			// Visual live state is per BLOCK, not per message: a reasoning run that the
 			// answer text or a tool call already followed is finished, and must settle
 			// immediately rather than shimmer until the turn persists.
@@ -4811,6 +4978,12 @@ function adaptActivityItems(
 			for (const [index, row] of rows.entries()) {
 				const isLast = index === rows.length - 1;
 				const rowKey = `${keyBase}-step-${index}`;
+				if (bodyLifecycleId) {
+					textBodyPreferences[rowKey] = {
+						specKey: textExpansionStateKey(traceKey, bodyLifecycleId),
+						bodyKey: structuredBody ? `seg${index}` : undefined,
+					};
+				}
 				// A step with real content gets an expandable markdown body, so the reader
 				// can open ONE step of a folded run instead of choosing between a bare
 				// title list and the whole reply. Live rows carry no body (see above), and
@@ -4905,7 +5078,14 @@ function adaptActivityItems(
 		}
 		traceItems.push(toolRow);
 	}
-	return { traceItems, reasoningCount, toolCount, expandedIndices, pinnedRowIndices };
+	return {
+		traceItems,
+		textBodyPreferences,
+		reasoningCount,
+		toolCount,
+		expandedIndices,
+		pinnedRowIndices,
+	};
 }
 
 /**
@@ -4958,6 +5138,9 @@ export function adaptActivityUnit(
 	return {
 		kind: "activity-trace",
 		key,
+		...(Object.keys(activity.textBodyPreferences).length > 0
+			? { textBodyPreferences: activity.textBodyPreferences }
+			: {}),
 		data: {
 			items: activity.traceItems,
 			headerLabel: sysLabel(ctx, "activityTraceLabel"),
@@ -4974,6 +5157,14 @@ export function adaptActivityUnit(
 			// Derived while the rows were emitted, never resolved a second time — see
 			// adaptActivityItems on why a stored index cannot survive a live run.
 			expandedIndices: activity.expandedIndices,
+			textExpandedKeys: activity.traceItems.flatMap((row, index) => {
+				const bodyKey = row.key ?? String(index);
+				const preference = resolveTextExpansionPreference(
+					{ key, textBodyPreferences: activity.textBodyPreferences },
+					bodyKey,
+				);
+				return ctx.isTextExpanded?.(preference.specKey, preference.bodyKey) ? [bodyKey] : [];
+			}),
 			// A drilled-in row nests a real tool card, whose `plan` detail caps at
 			// 0.85 × viewport — so the trace needs the viewport height a standalone
 			// card already gets through its own opts.

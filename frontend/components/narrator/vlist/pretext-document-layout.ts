@@ -31,6 +31,7 @@ export interface BuildPretextDocumentLayoutOptions {
 	topPadding?: number;
 	bottomPadding?: number;
 	isExpanded?: (key: string) => boolean | undefined;
+	isTextExpanded?: (specKey: string, bodyKey?: string) => boolean;
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];

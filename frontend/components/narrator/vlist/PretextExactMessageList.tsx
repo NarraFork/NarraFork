@@ -92,6 +92,7 @@ import { type MeasuredToolCall, toolCardInnerWidth } from "./measure/measure-too
 import type { MeasuredCollapsibleTrace } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
 import { resolveRenderExtra } from "./render-registry";
+import { resolveTextExpansionPreference } from "./segment-adapter";
 import { type UsePretextDocumentResult, usePretextDocument } from "./usePretextDocument";
 import { useVListContentView } from "./useVListContentView";
 import { useVListLabels } from "./useVListLabels";
@@ -212,9 +213,11 @@ import {
 	isFullPayloadRequestedRow,
 	isPromptOpenRow,
 	isTraceRowExpanded,
+	isVListTextExpanded,
 	markVListFullPayloadRequested,
 	resetVListInteractionStateForLod,
 	setVListExpanded,
+	setVListTextExpanded,
 	toggleVListFileChangesOpen,
 	toggleVListLodUserOverride,
 	toggleVListPromptOpen,
@@ -610,6 +613,8 @@ export const PretextExactMessageList = memo(
 			 */
 			const compactProgressKeysRef = useRef<Map<string, boolean>>(new Map());
 			const pinnedToBottomRef = useRef(true);
+			// Explicit full-text reading is not a request to chase newly streamed text.
+			const textReadingDetachedRef = useRef(false);
 			const suppressScrollStateRef = useRef(false);
 			/**
 			 * The scrollTop our own last programmatic write settled on, while its suppression
@@ -835,7 +840,7 @@ export const PretextExactMessageList = memo(
 				[setHeightOverride],
 			);
 			const activeInteraction =
-				interaction.lod === lod ? interaction : createVListInteractionState(lod);
+				interaction.lod === lod ? interaction : resetVListInteractionStateForLod(interaction, lod);
 			// Latest-value refs for the two callbacks that are handed to EVERY mounted row.
 			// The ExactRow memo compares those callbacks identity-wise, so they must not be
 			// rebuilt per render; they read the current interaction / narrator id from here
@@ -865,6 +870,10 @@ export const PretextExactMessageList = memo(
 			const resolveTraceRowExpanded = useCallback(
 				(traceKey: string, rowKey: string) =>
 					isTraceRowExpanded(activeInteraction, traceKey, rowKey),
+				[activeInteraction],
+			);
+			const resolveTextExpanded = useCallback(
+				(key: string, bodyKey?: string) => isVListTextExpanded(activeInteraction, key, bodyKey),
 				[activeInteraction],
 			);
 			const resolveShowOriginal = useCallback(
@@ -977,10 +986,12 @@ export const PretextExactMessageList = memo(
 					// in fact following — every streaming commit would then capture an ITEM
 					// anchor, and its correction would cancel the chase it should feed. An
 					// active chase IS the bottom pin in motion.
-					pinnedToBottom: node
-						? getDistanceFromBottom(node) <= BOTTOM_DISTANCE_EPSILON ||
-							smoothFollowerRef.current?.isActive() === true
-						: pinnedToBottomRef.current,
+					pinnedToBottom:
+						!textReadingDetachedRef.current &&
+						(node
+							? getDistanceFromBottom(node) <= BOTTOM_DISTANCE_EPSILON ||
+								smoothFollowerRef.current?.isActive() === true
+							: pinnedToBottomRef.current),
 					// Document offset of the point the LOD gesture is centered on, so the
 					// rebuild anchors THAT content instead of the viewport top. Stale points
 					// are dropped by resolveLodFocusOffset (see the gesture wiring below).
@@ -1416,6 +1427,34 @@ export const PretextExactMessageList = memo(
 							}
 							setInteraction((prev) => toggleVListRow(prev, key, rowIndex));
 						},
+						onToggleTextExpanded: (bodyKey?: string) => {
+							// Stop in place, not snapToTarget: a growing tail must not move the
+							// clicked control before the item anchor is captured.
+							smoothFollowerRef.current?.cancel();
+							textReadingDetachedRef.current = true;
+							pinnedToBottomRef.current = false;
+							setPinnedToBottom(false);
+							captureFoldBefore(key);
+							setInteraction((prev) => {
+								const item = renderItemsRef.current.find((candidate) => candidate.spec.key === key);
+								const preference = resolveTextExpansionPreference(item?.spec ?? { key }, bodyKey);
+								const expanded = !isVListTextExpanded(prev, preference.specKey, preference.bodyKey);
+								const next = setVListTextExpanded(
+									prev,
+									key,
+									expanded,
+									bodyKey,
+									preference.specKey,
+									preference.bodyKey ?? null,
+								);
+								if (bodyKey !== undefined || !expanded) return next;
+								const source = item?.spec.data as { messageBody?: ToolCappedDetail } | undefined;
+								return item?.spec.kind === "communication-bubble" &&
+									source?.messageBody?.textTruncated
+									? markVListFullPayloadRequested(next, key)
+									: next;
+							});
+						},
 						onToggleTranslation: () => {
 							// A fold, despite the name. The two texts wrap to different line counts at
 							// the same width (`measureReasoning` measures `displayText`, and
@@ -1710,11 +1749,12 @@ export const PretextExactMessageList = memo(
 				narratorId: string;
 				requests: readonly VListToolDetailRequest[];
 			}>({ narratorId, requests: [] });
-			const { resolveFullToolInput, resolveFullToolOutput } = useVListToolDetails(
-				narratorId,
-				truncatedToolCalls.narratorId === narratorId ? truncatedToolCalls.requests : [],
-				dataSource?.fetchToolDetail,
-			);
+			const { resolveFullToolInput, resolveFullToolOutput, resolveToolDetailStatus } =
+				useVListToolDetails(
+					narratorId,
+					truncatedToolCalls.narratorId === narratorId ? truncatedToolCalls.requests : [],
+					dataSource?.fetchToolDetail,
+				);
 			// Header terminate control: interrupting the narrator is what actually stops a
 			// running shell / MCP tool (the chunked control does the same).
 			//
@@ -1871,6 +1911,7 @@ export const PretextExactMessageList = memo(
 				showEarlier: resolveShowEarlier,
 				expandedRows: resolveExpandedRows,
 				isRowExpanded: resolveTraceRowExpanded,
+				isTextExpanded: resolveTextExpanded,
 				showOriginal: resolveShowOriginal,
 				isPromptOpen: resolvePromptOpen,
 				isFileChangesOpen: resolveFileChangesOpen,
@@ -1955,6 +1996,7 @@ export const PretextExactMessageList = memo(
 				void narratorId;
 				appliedMessageRevisionRef.current = 0;
 				initialRevisionSyncRef.current = true;
+				textReadingDetachedRef.current = false;
 				setMessageRevision(0);
 				// The shell is NOT remounted per narrator (no `key={narratorId}`), so the
 				// per-row handler caches keyed by spec.key would otherwise accumulate every
@@ -4200,7 +4242,18 @@ export const PretextExactMessageList = memo(
 				// frame must reason about: reporting the raw `atBottom` while staying pinned
 				// would flash the scroll-to-bottom affordance and make the panel count unread
 				// messages for a reader who is being followed.
-				const effectiveAtBottom = atBottom || grewBeneathReader || viewportResizedWhilePinned;
+				// An explicit downward reader scroll can opt back into following. Merely
+				// ending up at the bottom after a body fold cannot undo reader intent.
+				if (
+					textReadingDetachedRef.current &&
+					nextTop > previousTop &&
+					!suppressScrollStateRef.current &&
+					atBottom
+				)
+					textReadingDetachedRef.current = false;
+				const effectiveAtBottom =
+					!textReadingDetachedRef.current &&
+					(atBottom || grewBeneathReader || viewportResizedWhilePinned);
 				// Suppress the pinned-state update ONLY for the echo of our own write. A
 				// different value means the reader scrolled, and their intent wins immediately
 				// (see writeScrollTop / isSuppressedScrollEcho).
@@ -4293,6 +4346,7 @@ export const PretextExactMessageList = memo(
 					// An explicit jump-to-bottom lands where it was told to, instantly — a
 					// chase drifting in afterwards would fight the write.
 					getSmoothFollower().cancel();
+					textReadingDetachedRef.current = false;
 					pinnedToBottomRef.current = true;
 					setPinnedToBottom(true);
 					if (instant) writeScrollTop(getScrollBottomTarget(viewportRef.current));
@@ -5174,6 +5228,8 @@ export const PretextExactMessageList = memo(
 						// signature, even when the measured object is a cache hit.
 						interactionSig: `${rowInteractionSig(activeInteraction, item.spec.key)}|${contentView.rowSig(item.spec.key)}|${liveTailSignature(item.spec.data)}|${closingRowSig(closingRows, item.spec.key)}`,
 						toggles: getRowToggles(item.spec.key),
+						resolveToolDetailStatus:
+							item.spec.kind === "communication-bubble" ? resolveToolDetailStatus : undefined,
 						renderLabels,
 						interaction: interactionsByKey.get(item.spec.key),
 						rowInteraction: traceBinding?.rowInteraction,

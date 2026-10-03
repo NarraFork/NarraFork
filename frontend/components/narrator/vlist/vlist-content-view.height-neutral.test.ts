@@ -19,10 +19,16 @@
 import { afterAll, describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { MantineProvider } from "@mantine/core";
 import type { ToolCappedDetail } from "@shared/pretext-layout/tool-detail";
+import { parseHTML } from "linkedom";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { shellSource } from "./guard-source";
+import { measureMarkdown } from "./measure/measure-markdown";
 import { DETAIL_TOP_MARGIN, measureToolBody, measureToolDetail } from "./measure/measure-tool-call";
 import { installCanvasStub } from "./measure/test-canvas-stub";
+import { RenderMarkdown } from "./render/RenderMarkdown";
 import { sliceBracketedRegion } from "./source-slice";
 import { resolveToolDetailViewTargets } from "./vlist-content-view-target";
 
@@ -130,29 +136,41 @@ describe("wrap / source toggles stay out of the measure path", () => {
  * the invariant the whole exact path is built on.
  */
 describe("a plain row's source view cannot resize the row", () => {
+	function sourceBody(markdown: string, sourceText: string) {
+		const measured = measureMarkdown(markdown, 600);
+		const html = renderToStaticMarkup(
+			createElement(
+				MantineProvider,
+				null,
+				createElement(RenderMarkdown, { measured, showSource: true, sourceText }),
+			),
+		);
+		const document = parseHTML(`<html><body>${html}</body></html>`).document;
+		const body = document.querySelector("[data-vlist-markdown-source]");
+		if (!body) throw new Error("source body was not rendered");
+		return { measured, body, style: body.getAttribute("style") ?? "" };
+	}
+
 	it("pins the source box to the measured height and scrolls the overflow", () => {
-		const src = read("render/RenderMarkdown.tsx");
-		const start = src.indexOf("function MarkdownSourceBody(");
-		expect(start).toBeGreaterThan(-1);
-		// Up to the next top-level declaration — the destructured params contain their
-		// own `\n}`, so the closing brace alone is not a reliable terminator.
-		const body = src.slice(start, src.indexOf("\n/**", start));
-		// Height comes from the caller (the measured frame), never from the content.
-		expect(body).toContain("height,");
-		expect(body).toContain('overflowY: "auto"');
-		// The source is pre-wrap, so horizontal overflow is a paint artifact, never
-		// content — the wrapped state of every body box is `overflowX: hidden`.
-		expect(body).toContain('overflowX: "hidden"');
-		// No growth escape hatches: either of these would let the text set the height.
-		expect(body).not.toContain("minHeight");
-		expect(body).not.toContain("maxHeight");
+		const text = "a long source line\n".repeat(1000);
+		const { measured, body, style } = sourceBody("# Short heading", text);
+		expect(style).toContain(`height:${measured.frame.contentHeight}px`);
+		expect(style).toContain("overflow-y:auto");
+		expect(style).toContain("overflow-x:hidden");
+		expect(style).not.toContain("min-height");
+		expect(style).not.toContain("max-height");
+		expect(body.textContent).toBe(text);
 	});
 
-	it("hands the box the measured content height, not an intrinsic one", () => {
-		const src = read("render/RenderMarkdown.tsx");
-		expect(src).toMatch(
-			/<MarkdownSourceBody[\s\S]{0,160}height=\{frame\.contentHeight\}[\s\S]{0,40}\/>/,
+	it("uses measured height even when rendered Markdown hosts an unpredictable diagram", () => {
+		const { measured, style } = sourceBody(
+			"```mermaid\ngraph TD; A-->B;\n```",
+			"diagram source\n".repeat(1000),
 		);
+		expect(measured.blocks.some((block) => block.kind === "unknown")).toBe(true);
+		expect(style).toContain(`height:${measured.frame.contentHeight}px`);
+		expect(style).toContain("overflow-y:auto");
+		expect(style).not.toContain("min-height");
 	});
 
 	it("wires the row's source state without touching the layout inputs", () => {
