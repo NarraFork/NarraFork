@@ -282,7 +282,7 @@ describe("PretextExactMessageList", () => {
 		expect(rowProps).toMatch(
 			/hitHeight:\s*resolveRowHitHeight\(\s*exactLayout\.items,\s*itemIndex,\s*exactLayout\.totalHeight,?\s*\)/,
 		);
-		expect(rowProps).toMatch(/\n\s*contentWidth,\s*\n/);
+		expect(rowProps).toMatch(/contentWidth:\s*item\.contentWidth\s*\?\?\s*contentWidth/);
 		// The projected geometry must reach ExactRow unchanged through the element factory.
 		expect(source).toMatch(/windowRowProjections\.push\(\{\s*props: rowProps,/);
 		expect(source).toContain("useVListWindowRows(narratorId, windowRowProjections)");
@@ -292,7 +292,13 @@ describe("PretextExactMessageList", () => {
 		expect(source).toContain("const resolveExactToolColor = useCallback");
 		expect(source).toContain("resolveToolColor: resolveExactToolColor");
 		expect(source).toContain("getCurrentView: readCurrentView");
-		expect(source).toContain("const scrollTop = node?.scrollTop ?? scrollTopRef.current");
+		const liveView = sliceBracketedRegion(source, "const readCurrentView = useCallback(");
+		expect(liveView).toContain("const view = readViewportView();");
+		const visibleView = sliceBracketedRegion(source, "const readViewportView = useCallback(");
+		expect(visibleView).toContain("visibleViewportRef.current.read(");
+		expect(visibleView).toContain("viewportRef.current");
+		expect(visibleView).toContain("scrollTop: scrollTopRef.current");
+		expect(visibleView).toContain("viewportHeight: viewportHeightRef.current");
 		// An LOD gesture must report the point it is centered on, so the rebuild
 		// re-anchors THAT content instead of yanking the viewport top into place.
 		expect(source).toContain("focusOffset: resolveLodFocusOffset(");

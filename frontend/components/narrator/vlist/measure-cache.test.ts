@@ -1898,3 +1898,31 @@ function bodyFixture(
 		followTarget: { kind: "end" },
 	};
 }
+
+describe("responsive usage cached measurements", () => {
+	it("keys second-line presence and content at an unchanged width/document/key", async () => {
+		const { measureElementCached } = await import("./registry");
+		const data = { placement: "trailing" as const, text: "tokens" };
+		const measure = (secondaryText?: string) =>
+			measureElementCached(
+				"turn-usage",
+				{ ...data, ...(secondaryText ? { secondaryText } : {}) },
+				600,
+				5,
+				undefined,
+				"same-width-usage-cache-test",
+				"same-doc",
+			);
+		const desktop = measure();
+		const mobile = measure("cost A");
+		const edited = measure("cost B");
+		expect(mobile.height).toBeGreaterThan(desktop.height);
+		expect(edited.height).toBe(mobile.height);
+		expect(edited).not.toBe(mobile);
+		expect((edited as import("./measure/measure-turn-usage").MeasuredTurnUsage).lines).toEqual([
+			"tokens",
+			"cost B",
+		]);
+		expect(measure()).toEqual(desktop);
+	});
+});

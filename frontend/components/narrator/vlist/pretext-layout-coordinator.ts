@@ -40,6 +40,7 @@ import {
 	type PretextDocumentLoadOptions,
 	refreshPretextDocumentWindow,
 } from "./pretext-document-loader";
+import { measureElementCached } from "./registry";
 import { projectStreamingDocument } from "./streaming-handoff";
 import { askInPassingBlock, syncAskInPassingMessage } from "./vlist-ask-in-passing-sync";
 import { trimClockNow, trimLoadedHead } from "./vlist-head-trim";
@@ -48,6 +49,8 @@ import { insertLoadedMessage } from "./vlist-message-insert";
 import { removeLoadedMessages } from "./vlist-message-remove";
 import { type ReplaceAliases, replaceLoadedMessage } from "./vlist-message-replace";
 import type { VListItem } from "./vlist-pipeline";
+import type { ResizePermissionResolver } from "./vlist-resize-permission";
+import { indexWithHeightOverrides, previewResize } from "./vlist-resize-preview";
 
 export type PretextLayoutCoordinatorStatus = "idle" | "loading" | "computing" | "ready" | "error";
 
@@ -73,6 +76,15 @@ export interface PretextLayoutCoordinatorSnapshot {
 	manifest?: PretextLayoutManifest;
 	index?: PretextLayoutIndex;
 	items?: readonly VListItem[];
+	/** Last full-build semantics, unchanged by width-only preview frames. */
+	semanticItems?: readonly VListItem[];
+	semanticManifest?: PretextLayoutManifest;
+	/** Mixed per-item widths, present only while the resize preview is painted. */
+	resizePreview?: boolean;
+	resizeWidth?: number;
+	resizeMeasuredCount?: number;
+	/** Every preview is an atomic geometry + scroll correction, even at the same top. */
+	resizeRevision?: number;
 	scrollTop?: number;
 	scrollTopAnchorKind?: PretextLayoutAnchor["kind"];
 	/**
@@ -177,6 +189,9 @@ export class PretextLayoutCoordinator {
 	 */
 	private lastBuildOptions: PretextLayoutBuildOptions | undefined;
 	private lastViewportHeight = 0;
+	private resizeRevision = 0;
+	/** Width changes survive full commits clearing the mixed-width preview flags. */
+	private resizeEpoch = 0;
 	/**
 	 * Live streaming message, appended to the document at build time.
 	 *
@@ -213,6 +228,7 @@ export class PretextLayoutCoordinator {
 		buildOptions: PretextLayoutBuildOptions;
 		anchor?: PretextLayoutAnchor;
 		viewportHeight: number;
+		restoreOverrides?: ReadonlyMap<string, number>;
 		promise: Promise<PretextLayoutCoordinatorSnapshot>;
 	} | null = null;
 
@@ -229,16 +245,19 @@ export class PretextLayoutCoordinator {
 		loadOptions: PretextDocumentLoadOptions = {},
 		anchor?: PretextLayoutAnchor,
 		viewportHeight = 0,
-		opts: { forceReload?: boolean } = {},
+		opts: { forceReload?: boolean; restoreOverrides?: ReadonlyMap<string, number> } = {},
 	): Promise<PretextLayoutCoordinatorSnapshot> {
 		// Coalesce: reuse an in-flight tail fetch for the same narrator instead of
 		// issuing a duplicate request. Re-target it to the latest build options so
 		// it commits once at the final width/LOD. forceReload always restarts.
 		const pending = this.pendingLoad;
 		if (pending && !opts.forceReload && pending.narratorId === narratorId) {
+			if (pending.buildOptions.contentWidth !== buildOptions.contentWidth)
+				pending.restoreOverrides = undefined;
 			pending.buildOptions = buildOptions;
 			pending.anchor = anchor;
 			pending.viewportHeight = viewportHeight;
+			if (opts.restoreOverrides) pending.restoreOverrides = opts.restoreOverrides;
 			this.loadOptions = loadOptions;
 			return pending.promise;
 		}
@@ -255,6 +274,7 @@ export class PretextLayoutCoordinator {
 			buildOptions,
 			anchor,
 			viewportHeight,
+			restoreOverrides: opts.restoreOverrides,
 			promise: undefined as unknown as Promise<PretextLayoutCoordinatorSnapshot>,
 		};
 		// Size the first-screen fetch by the initiating LOD (an explicit
@@ -290,6 +310,9 @@ export class PretextLayoutCoordinator {
 					entry.anchor,
 					entry.viewportHeight,
 					generation,
+					undefined,
+					"ready",
+					entry.restoreOverrides,
 				);
 			} catch (error) {
 				if (generation !== this.generation) return this.current;
@@ -326,6 +349,7 @@ export class PretextLayoutCoordinator {
 	async loadOlder(
 		buildOptions: PretextLayoutBuildOptions,
 		getView: () => PrependView = () => ({ scrollTop: 0, pinnedToBottom: false, viewportHeight: 0 }),
+		getHeightOverrides?: () => ReadonlyMap<string, number> | undefined,
 	): Promise<number> {
 		const previous = this.input;
 		if (!previous?.hasPrev || this.narratorId == null) return 0;
@@ -334,7 +358,7 @@ export class PretextLayoutCoordinator {
 		// again, and a premature 0 would end the jump one page short of its target.
 		if (this.loadingOlder) return this.pendingOlder ?? 0;
 		this.loadingOlder = true;
-		const promise = this.runLoadOlder(previous, buildOptions, getView);
+		const promise = this.runLoadOlder(previous, buildOptions, getView, getHeightOverrides);
 		this.pendingOlder = promise;
 		return promise;
 	}
@@ -343,10 +367,12 @@ export class PretextLayoutCoordinator {
 		previous: PretextDocumentInput,
 		buildOptions: PretextLayoutBuildOptions,
 		getView: () => PrependView,
+		getHeightOverrides?: () => ReadonlyMap<string, number> | undefined,
 	): Promise<number> {
 		if (this.narratorId == null) return 0;
 		const generation = this.generation;
 		const previousTotalHeight = this.current.index?.totalHeight ?? 0;
+		const resizeEpoch = this.resizeEpoch;
 		this.current = { ...this.current, loadingOlder: true };
 		this.emit();
 		try {
@@ -367,7 +393,30 @@ export class PretextLayoutCoordinator {
 			}
 			// Read the view LIVE (after the fetch) so momentum scrolling during a slow
 			// request cannot desync the base scrollTop from the applied correction.
-			this.commitPrependLayout(next, buildOptions, getView(), previousTotalHeight, generation);
+			const view = getView();
+			const resized = resizeEpoch !== this.resizeEpoch || this.current.resizePreview === true;
+			const targetBuild = resized ? (this.lastBuildOptions ?? buildOptions) : buildOptions;
+			// Read painted heights after ALL awaits, just like the live scroll view.
+			const heightOverrides = resized ? getHeightOverrides?.() : undefined;
+			const anchor =
+				resized && this.current.index
+					? captureCoordinatorAnchor(
+							indexWithHeightOverrides(this.current.index, heightOverrides),
+							view,
+						)
+					: undefined;
+			const restoreOverrides = resized
+				? this.heightOverridesAtWidth(targetBuild.contentWidth, heightOverrides)
+				: undefined;
+			this.commitPrependLayout(
+				next,
+				targetBuild,
+				view,
+				previousTotalHeight,
+				generation,
+				anchor,
+				restoreOverrides,
+			);
 			return added;
 		} catch (error) {
 			if (generation !== this.generation) return 0;
@@ -410,6 +459,145 @@ export class PretextLayoutCoordinator {
 		this.current = { ...this.current, status: "computing", error: undefined };
 		this.emit();
 		return this.commitLayout(this.input, buildOptions, anchor, viewportHeight, generation);
+	}
+
+	/**
+	 * A width-only frame. It never changes the full-build params or cancels an
+	 * in-flight page/KaTeX load; a later semantic commit replaces this snapshot and
+	 * the resize controller previews that NEW document on its next frame.
+	 */
+	previewWidth(
+		width: number,
+		getView: () => PrependView,
+		heightOverrides?: ReadonlyMap<string, number>,
+		options?: {
+			dirtyKeys?: ReadonlySet<string>;
+			resolvePermissionForm?: ResizePermissionResolver;
+			onMeasuredKeys?: (keys: ReadonlySet<string>) => void;
+			compactUsageLines?: boolean;
+		},
+	): boolean {
+		const current = this.current;
+		if (
+			(current.status !== "ready" && current.status !== "loading") ||
+			!current.input ||
+			!current.index ||
+			!current.items ||
+			!this.lastBuildOptions
+		)
+			return false;
+		const result = previewResize({
+			index: current.index,
+			items: current.items,
+			committedWidth: this.lastBuildOptions.contentWidth,
+			width,
+			lod: this.lastBuildOptions.lod,
+			view: getView(),
+			heightOverrides,
+			dirtyKeys: options?.dirtyKeys,
+			resolvePermissionForm: options?.resolvePermissionForm,
+			compactUsageLines: options?.compactUsageLines,
+			measure: measureElementCached,
+		});
+		const targetWidth = Math.max(1, Math.round(width));
+		if (result.changedKeys.size === 0) {
+			// Display geometry (group frames/footer) follows the gesture even when the
+			// reader has scrolled into an already-current window. Do NOT replay either
+			// the last preview's correction or a fresh capture over their real scroll.
+			if ((current.resizeWidth ?? this.lastBuildOptions.contentWidth) === targetWidth)
+				return result.needsMore;
+			this.resizeEpoch++;
+			this.current = {
+				...current,
+				resizePreview: true,
+				resizeWidth: targetWidth,
+				resizeMeasuredCount: 0,
+				resizeRevision: ++this.resizeRevision,
+				scrollTop: undefined,
+				scrollTopAnchorKind: undefined,
+				scrollTopSmoothFollow: false,
+			};
+			this.emit();
+			return result.needsMore;
+		}
+		options?.onMeasuredKeys?.(result.changedKeys);
+		this.resizeEpoch++;
+		this.current = {
+			...current,
+			manifest: result.index.manifest,
+			index: result.index,
+			items: result.items,
+			resizePreview: true,
+			resizeWidth: targetWidth,
+			resizeMeasuredCount: result.changedKeys.size,
+			resizeRevision: ++this.resizeRevision,
+			scrollTop: result.scrollTop,
+			scrollTopAnchorKind: result.anchorKind,
+			scrollTopSmoothFollow: false,
+		};
+		this.emit();
+		return result.needsMore;
+	}
+
+	private heightOverridesAtWidth(
+		width: number,
+		heightOverrides?: ReadonlyMap<string, number>,
+	): ReadonlyMap<string, number> {
+		const restoreOverrides = new Map<string, number>();
+		for (const [key, height] of heightOverrides ?? []) {
+			const index = this.current.index?.itemByKey(key)?.index;
+			if (index != null && this.current.items?.[index]?.contentWidth === width) {
+				restoreOverrides.set(key, height);
+			}
+		}
+		return restoreOverrides;
+	}
+
+	/** Explicit finish: equal widths do not imply the off-screen frames are current. */
+	finishResize(
+		buildOptions: PretextLayoutBuildOptions,
+		view: PrependView,
+		heightOverrides?: ReadonlyMap<string, number>,
+	): PretextLayoutCoordinatorSnapshot {
+		const index = this.current.index;
+		const anchor = index
+			? captureCoordinatorAnchor(indexWithHeightOverrides(index, heightOverrides), view)
+			: undefined;
+		// Only final-width DOM heights remain valid in the target index. Keeping them
+		// effective on both sides prevents the settle handoff jumping back to raw heights.
+		const restoreOverrides = this.heightOverridesAtWidth(
+			buildOptions.contentWidth,
+			heightOverrides,
+		);
+		// Width settlement is not a data mutation: keep upward pages and tail loads
+		// on their fetch generation. Semantic rebuilds still invalidate them normally.
+		const generation = this.generation;
+		const pending = this.pendingLoad?.generation === generation ? this.pendingLoad : null;
+		this.resizeEpoch++;
+		if (pending) {
+			pending.buildOptions = buildOptions;
+			pending.anchor = anchor;
+			pending.viewportHeight = view.viewportHeight;
+			pending.restoreOverrides = restoreOverrides;
+		}
+		if (!this.input) {
+			if (pending) return this.current;
+			throw new Error("cannot rebuild layout before document input is loaded");
+		}
+		if (!pending) {
+			this.current = { ...this.current, status: "computing", error: undefined };
+			this.emit();
+		}
+		return this.commitLayout(
+			this.input,
+			buildOptions,
+			anchor,
+			view.viewportHeight,
+			generation,
+			undefined,
+			pending ? "loading" : "ready",
+			restoreOverrides,
+		);
 	}
 
 	/**
@@ -1195,6 +1383,8 @@ export class PretextLayoutCoordinator {
 		viewportHeight: number,
 		generation: number,
 		smoothFollow?: boolean,
+		status: "ready" | "loading" = "ready",
+		restoreOverrides?: ReadonlyMap<string, number>,
 	): PretextLayoutCoordinatorSnapshot {
 		if (generation !== this.generation) return this.current;
 		try {
@@ -1205,15 +1395,22 @@ export class PretextLayoutCoordinator {
 			const previous = this.current.index;
 			let scrollTop: number | undefined;
 			if (previous && anchor) {
-				scrollTop = restorePretextLayoutAnchor(anchor, built.index, viewportHeight);
+				scrollTop = restorePretextLayoutAnchor(
+					anchor,
+					indexWithHeightOverrides(built.index, restoreOverrides),
+					viewportHeight,
+				);
 			}
 			this.current = {
-				status: "ready",
+				status,
 				input,
 				streamingMessage: this.streamingMessage,
 				manifest: built.manifest,
 				index: built.index,
 				items: built.items,
+				semanticItems: built.items,
+				semanticManifest: built.manifest,
+				resizeRevision: ++this.resizeRevision,
 				hasPrev: input.hasPrev,
 				loadingOlder: this.loadingOlder,
 				lastBuildMs: this.lastBuildMs,
@@ -1258,6 +1455,8 @@ export class PretextLayoutCoordinator {
 		view: PrependView,
 		previousTotalHeight: number,
 		generation: number,
+		anchor?: PretextLayoutAnchor,
+		restoreOverrides?: ReadonlyMap<string, number>,
 	): PretextLayoutCoordinatorSnapshot {
 		if (generation !== this.generation) return this.current;
 		try {
@@ -1266,7 +1465,16 @@ export class PretextLayoutCoordinator {
 			if (generation !== this.generation) return this.current;
 			let scrollTop: number;
 			let scrollTopAnchorKind: PretextLayoutAnchor["kind"];
-			if (view.pinnedToBottom) {
+			if (anchor) {
+				// Preview/settle changed geometry while the fetch was in flight. Capture
+				// from the live index; stable keys fall back to source ids after regrouping.
+				scrollTop = restorePretextLayoutAnchor(
+					anchor,
+					indexWithHeightOverrides(built.index, restoreOverrides),
+					view.viewportHeight,
+				);
+				scrollTopAnchorKind = anchor.kind;
+			} else if (view.pinnedToBottom) {
 				// First-screen fill: keep the newest content pinned to the bottom.
 				scrollTop = Math.max(0, built.index.totalHeight - Math.max(0, view.viewportHeight));
 				scrollTopAnchorKind = "bottom";
@@ -1283,6 +1491,9 @@ export class PretextLayoutCoordinator {
 				manifest: built.manifest,
 				index: built.index,
 				items: built.items,
+				semanticItems: built.items,
+				semanticManifest: built.manifest,
+				resizeRevision: ++this.resizeRevision,
 				hasPrev: input.hasPrev,
 				loadingOlder: this.loadingOlder,
 				lastBuildMs: this.lastBuildMs,

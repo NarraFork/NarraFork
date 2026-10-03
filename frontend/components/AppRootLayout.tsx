@@ -59,6 +59,7 @@ import { useCurrentUser, useLogout } from "../hooks/useAuth";
 import { useChatUnreadLive } from "../hooks/useChat";
 import { useKnowledgeNotifications } from "../hooks/useKnowledge";
 import { useLocalNumberPref, useLocalPref } from "../hooks/useLocalPref";
+import { useMobileViewport } from "../hooks/useMobileViewport";
 import { useNavLayout } from "../hooks/useNavLayout";
 import { useOutputStats } from "../hooks/useOutputStats";
 import { useRecentTabKeyboardNav } from "../hooks/useRecentTabKeyboardNav";
@@ -76,7 +77,6 @@ import {
 import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../lib/history-state";
 import { changeAppLanguage, getNamespacesForPath, normalizeLanguage } from "../lib/i18n";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
-import { MOBILE_VIEWPORT_MEDIA_QUERY } from "../lib/responsive";
 import {
 	APP_SHELL_CLASSNAME,
 	APP_SHELL_DESKTOP_NAVBAR_HEIGHT,
@@ -257,6 +257,37 @@ function OutputStatsBadge({ enabled }: { enabled: boolean }) {
 }
 
 /**
+ * The mobile breakpoint only affects these two side effects, not shell JSX.
+ * Keep its subscription here so resizing does not reconcile the entire navbar.
+ */
+export function MobileNavbarEffects({
+	wizardOpen,
+	opened,
+	openNav,
+	closeNav,
+}: {
+	wizardOpen: boolean;
+	opened: boolean;
+	openNav: () => void;
+	closeNav: () => void;
+}) {
+	const router = useRouter();
+	const isMobile = useMobileViewport();
+	useEffect(() => {
+		if (wizardOpen && isMobile) openNav();
+	}, [wizardOpen, isMobile, openNav]);
+
+	// The shared controller consumes the same-URL entry before replaying route
+	// navigation, keeping Back at one hop. `opened` is sticky across widening,
+	// but only controls an overlay on mobile: desktop must never intercept Back.
+	useEffect(() => {
+		if (!opened || !isMobile) return;
+		return pushHistorySentinel(router.history, APP_HISTORY_SENTINEL.mobileNav, closeNav).dispose;
+	}, [opened, isMobile, closeNav, router.history]);
+	return null;
+}
+
+/**
  * Only this thin wrapper subscribes to the settled nav width. Drag frames update
  * DOM layout properties without notifying React; releases and collapse-threshold
  * crossings let Mantine take over. Keeping `children` as a stable element isolates
@@ -286,9 +317,6 @@ function AppShellWithNavWidth({
 
 function AuthenticatedLayout() {
 	const [opened, { toggle, open: openNav, close: closeNav }] = useDisclosure();
-	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY, undefined, {
-		getInitialValueInEffect: false,
-	});
 	// Touch/pen input only: a mouse drag across the header must keep collapsing
 	// the sidebar rather than arming a reload gesture.
 	const isTouchPointer = useMediaQuery("(pointer: coarse)", false, {
@@ -301,7 +329,6 @@ function AuthenticatedLayout() {
 	// here because the title below is gated on it.
 	const [searchOpen, setSearchOpen] = useState(false);
 	const navigate = useNavigate();
-	const router = useRouter();
 	const { t, i18n } = useTranslation("nav");
 	const { t: ts } = useTranslation("settings");
 	const { data: user, isLoading, isError, error, fetchStatus } = useCurrentUser();
@@ -465,24 +492,6 @@ function AuthenticatedLayout() {
 		window.addEventListener("narrafork:open-wizard", handler);
 		return () => window.removeEventListener("narrafork:open-wizard", handler);
 	}, [isAdmin]);
-
-	useEffect(() => {
-		if (wizardOpen && isMobile) openNav();
-	}, [wizardOpen, isMobile, openNav]);
-
-	// --- Mobile navbar back-button interception ---
-	// The shared controller creates a valid TanStack entry and, when navigation starts while
-	// it is open, consumes that entry before replaying the route change. This keeps Back at one hop.
-	//
-	// Gated on `isMobile` because `opened` only *controls* the navbar below the sm breakpoint
-	// (`collapsed: { mobile: !opened }`); at the desktop breakpoint the navbar is a permanent
-	// column and `opened` is inert. It is also sticky: opening the burger and then widening the
-	// window (or rotating a tablet) leaves `opened === true` on desktop, which pushed a sentinel
-	// that intercepted Back with no overlay on screen to close.
-	useEffect(() => {
-		if (!opened || !isMobile) return;
-		return pushHistorySentinel(router.history, APP_HISTORY_SENTINEL.mobileNav, closeNav).dispose;
-	}, [opened, isMobile, closeNav, router.history]);
 
 	// Sync language from backend preference on login / app init
 	// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally do not react to i18n.language changes, otherwise manual language switches can be rolled back by stale backend prefs
@@ -651,6 +660,12 @@ function AuthenticatedLayout() {
 			wizardWidth={wizardOpen ? "min(420px, 100vw)" : undefined}
 			padding="md"
 		>
+			<MobileNavbarEffects
+				wizardOpen={wizardOpen}
+				opened={opened}
+				openNav={openNav}
+				closeNav={closeNav}
+			/>
 			<WSConnectionAlert />
 			<VersionUpdateBanner />
 			<AppShell.Header ref={headerRef} style={APP_SHELL_SAFE_HEADER_STYLE}>

@@ -302,11 +302,13 @@ describe("exact list wiring", () => {
 		expect(source).toContain(
 			"const scrollableHeight = (exactLayout?.totalHeight ?? 0) + footerHeight",
 		);
-		expect(source).toContain(
-			"collectVListUserMarkers(renderItems, exactLayout?.items ?? [], scrollableHeight)",
+		expect(source).toContain("collectVListUserMarkerSemantics(semanticItems)");
+		expect(source).toContain("collectVListCompactMarkerSemantics(semanticItems)");
+		expect(source).toMatch(
+			/projectVListUserMarkers\(\s*userMarkerSemantics,\s*exactLayout\?\.items \?\? \[\],\s*scrollableHeight,?\s*\)/,
 		);
-		expect(source).toContain(
-			"collectVListCompactMarkers(renderItems, exactLayout?.items ?? [], scrollableHeight)",
+		expect(source).toMatch(
+			/projectVListCompactMarkers\(\s*compactMarkerSemantics,\s*exactLayout\?\.items \?\? \[\],\s*scrollableHeight,?\s*\)/,
 		);
 	});
 

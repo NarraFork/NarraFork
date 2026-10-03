@@ -113,25 +113,58 @@ export function collectVListUserMarkers(
 	layoutItems: readonly (VListUserMarkerGeometry | undefined)[],
 	documentHeight: number,
 ): VListUserMarker[] {
-	const markers: VListUserMarker[] = [];
-	const usable = Number.isFinite(documentHeight) && documentHeight > 0 ? documentHeight : 0;
+	return projectVListUserMarkers(
+		collectVListUserMarkerSemantics(items),
+		layoutItems,
+		documentHeight,
+	);
+}
+
+export type VListUserMarkerSemantic = Omit<VListUserMarker, "top" | "fraction" | "ordinal">;
+
+/** Read bodies only on semantic commits, never on a width/geometry frame. */
+export function collectVListUserMarkerSemantics(
+	items: readonly (VListUserMarkerItem | undefined)[],
+): VListUserMarkerSemantic[] {
+	const markers: VListUserMarkerSemantic[] = [];
 	for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
 		const item = items[itemIndex];
 		if (!isUserBubble(item) || !item) continue;
-		const geometry = layoutItems[itemIndex];
-		if (!geometry || !Number.isFinite(geometry.top)) continue;
-		const top = Math.max(0, geometry.top);
 		markers.push({
 			key: item.spec.key,
 			itemIndex,
-			top,
-			fraction: usable > 0 ? clamp01(top / usable) : 0,
-			ordinal: markers.length + 1,
 			preview: resolveVListUserMarkerPreview(item.spec.data),
 			createdAt: resolveVListUserMarkerCreatedAt(item.spec.data),
 		});
 	}
 	return markers;
+}
+
+function projectMarkerGeometry<T extends { itemIndex: number }>(
+	semantics: readonly T[],
+	layoutItems: readonly (VListUserMarkerGeometry | undefined)[],
+	documentHeight: number,
+): (T & { top: number; fraction: number })[] {
+	const markers: (T & { top: number; fraction: number })[] = [];
+	const usable = Number.isFinite(documentHeight) && documentHeight > 0 ? documentHeight : 0;
+	for (const semantic of semantics) {
+		const geometry = layoutItems[semantic.itemIndex];
+		if (!geometry || !Number.isFinite(geometry.top)) continue;
+		const top = Math.max(0, geometry.top);
+		markers.push({ ...semantic, top, fraction: usable > 0 ? clamp01(top / usable) : 0 });
+	}
+	return markers;
+}
+
+export function projectVListUserMarkers(
+	semantics: readonly VListUserMarkerSemantic[],
+	layoutItems: readonly (VListUserMarkerGeometry | undefined)[],
+	documentHeight: number,
+): VListUserMarker[] {
+	return projectMarkerGeometry(semantics, layoutItems, documentHeight).map((marker, index) => ({
+		...marker,
+		ordinal: index + 1,
+	}));
 }
 
 /**
@@ -273,23 +306,35 @@ export function collectVListCompactMarkers(
 	layoutItems: readonly (VListUserMarkerGeometry | undefined)[],
 	documentHeight: number,
 ): VListCompactMarker[] {
-	const markers: VListCompactMarker[] = [];
-	const usable = Number.isFinite(documentHeight) && documentHeight > 0 ? documentHeight : 0;
+	return projectVListCompactMarkers(
+		collectVListCompactMarkerSemantics(items),
+		layoutItems,
+		documentHeight,
+	);
+}
+
+export type VListCompactMarkerSemantic = Omit<VListCompactMarker, "top" | "fraction">;
+
+export function collectVListCompactMarkerSemantics(
+	items: readonly (VListUserMarkerItem | undefined)[],
+): VListCompactMarkerSemantic[] {
+	const markers: VListCompactMarkerSemantic[] = [];
 	for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
 		const candidate = resolveCompactMarkerCandidate(items[itemIndex]);
 		if (!candidate) continue;
-		const geometry = layoutItems[itemIndex];
-		if (!geometry || !Number.isFinite(geometry.top)) continue;
-		const top = Math.max(0, geometry.top);
 		markers.push({
 			key: items[itemIndex]?.spec.key ?? `compact-${itemIndex}`,
 			itemIndex,
-			top,
-			fraction: usable > 0 ? clamp01(top / usable) : 0,
-			flavor: candidate.flavor,
-			status: candidate.status,
-			tooltip: candidate.tooltip,
+			...candidate,
 		});
 	}
 	return markers;
+}
+
+export function projectVListCompactMarkers(
+	semantics: readonly VListCompactMarkerSemantic[],
+	layoutItems: readonly (VListUserMarkerGeometry | undefined)[],
+	documentHeight: number,
+): VListCompactMarker[] {
+	return projectMarkerGeometry(semantics, layoutItems, documentHeight);
 }

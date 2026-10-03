@@ -409,7 +409,10 @@ describe("shell wiring — the compact callbacks reach the row", () => {
 
 	it("the shell hosts one shared cancel dialog", async () => {
 		const shell = await SHELL;
-		expect(shell).toContain("useVListCompactActions({ narratorId, renderItems, sourceIdsByKey })");
+		const bridge = sliceBracketedRegion(shell, "useVListCompactActions({");
+		expect(bridge).toContain("narratorId,");
+		expect(bridge).toContain("renderItems: semanticItems,");
+		expect(bridge).toContain("sourceIdsByKey,");
 		expect(shell).toContain("{compact.cancelDialog}");
 	});
 

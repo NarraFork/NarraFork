@@ -13,12 +13,16 @@
  */
 
 /** Scroll position at which a container is scrolled fully to the bottom. */
-export function getScrollBottomTarget(node: HTMLElement | null): number {
+export function getScrollBottomTarget(
+	node: Pick<HTMLElement, "scrollHeight" | "clientHeight"> | null,
+): number {
 	return node ? Math.max(0, node.scrollHeight - node.clientHeight) : 0;
 }
 
 /** Distance in px from the container's current position to its bottom. */
-export function getDistanceFromBottom(node: HTMLElement): number {
+export function getDistanceFromBottom(
+	node: Pick<HTMLElement, "scrollHeight" | "scrollTop" | "clientHeight">,
+): number {
 	return Math.max(0, node.scrollHeight - node.scrollTop - node.clientHeight);
 }
 

@@ -32,7 +32,7 @@ const dependencies = {
 };
 const code = new Bun.Transpiler({ loader: "ts" }).transformSync(`
 function useBindings({ narratorId, selectionIndex, rowHandlers, openEditor,
-	messagesById, rowToolMetaIndex, manifestItems, renderItems, setOriginalModalMessageId,
+	messagesById, rowToolMetaIndex, semanticManifestItems, semanticItems, setOriginalModalMessageId,
 	messageSelectedIds, onToggleMessageSelect }) {
 	${source.slice(start, end)}
 	return interactionsByKey;
@@ -72,8 +72,8 @@ function Probe({ narratorId, messages, handlers }: Input) {
 		rowHandlers: handlers,
 		openEditor,
 		setOriginalModalMessageId: openOriginal,
-		renderItems,
-		manifestItems: messages.map((message) => ({
+		semanticItems: renderItems,
+		semanticManifestItems: messages.map((message) => ({
 			itemKey: `${message.id}-b0`,
 			sourceMessageIds: [message.id],
 		})),

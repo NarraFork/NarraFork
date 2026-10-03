@@ -77,6 +77,21 @@ describe("nav width render isolation", () => {
 		expect(layoutSource()).not.toContain("useResizableNav()");
 	});
 
+	it("keeps the mobile navbar breakpoint subscription out of AuthenticatedLayout", () => {
+		const source = layoutSource();
+		const layout = functionBody(source, "AuthenticatedLayout");
+		expect(layout).not.toContain("useMobileViewport()");
+		expect(functionBody(source, "MobileNavbarEffects")).toContain("useMobileViewport()");
+		expect(layout).not.toContain("const isMobile");
+	});
+
+	it("keeps the mobile effects subscriber free of navbar content", () => {
+		const body = functionBody(layoutSource(), "MobileNavbarEffects");
+		for (const forbidden of ["RecentTabList", "NavLink", "Tooltip", "useRecentTabs", "useQuery"]) {
+			expect(body).not.toContain(forbidden);
+		}
+	});
+
 	it("guard self-check: both function bodies are located and non-trivial", () => {
 		const source = layoutSource();
 		expect(functionBody(source, "AppShellWithNavWidth").length).toBeGreaterThan(100);

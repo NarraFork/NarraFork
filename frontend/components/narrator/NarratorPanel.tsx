@@ -1,6 +1,6 @@
+import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
 import { formatLocaleNumber } from "@frontend/lib/intl-format";
 import { narratorColumnPlaceholderStyle } from "@frontend/lib/narrator-content-column";
-import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import {
 	ActionIcon,
 	Badge,
@@ -176,6 +176,10 @@ import { NarratorInteractionArea } from "./NarratorInteractionArea";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import type { NarratorPanelProps } from "./narrator-panel-types";
+import {
+	createResponsiveNarratorPanel,
+	NarratorPanelCompactContext,
+} from "./panels/compact-context";
 import { LeakedToolCallModal } from "./permission/LeakedToolCallModal";
 import { RevertActionConfirmModal } from "./permission/RevertScopeConfirmModal";
 import { compactProgressLabel } from "./progress-label";
@@ -247,7 +251,11 @@ function _getMessageViewportDistanceFromBottom(scroller: HTMLElement) {
 	return getMessageViewportScrollBottom(scroller) - scroller.scrollTop;
 }
 
-export function NarratorPanel({
+export const NarratorPanel = createResponsiveNarratorPanel<NarratorPanelProps>(NarratorPanelBody);
+
+// Own query/WS/state updates still render normally; only the responsive compact flag
+// is excluded from this memo boundary and delivered directly to the two leaves.
+function NarratorPanelBody({
 	narratorId,
 	narrator: narratorProp,
 	onForkFromMessage,
@@ -257,7 +265,6 @@ export function NarratorPanel({
 	appendInputRef,
 	terminalOpen,
 	onToggleTerminal,
-	compact,
 	ownsHorizontalSafeArea = false,
 	onMinimize,
 	onBack,
@@ -276,7 +283,7 @@ export function NarratorPanel({
 	onDetailsPropsChange,
 	specPanelOpen,
 	onToggleSpecPanel,
-}: NarratorPanelProps) {
+}: Omit<NarratorPanelProps, "compact">) {
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
 	const narrator = narratorProp ?? fetchedNarrator;
@@ -366,7 +373,7 @@ export function NarratorPanel({
 	const { data: userPrefs } = useUserPreferences();
 	const updateUserPrefs = useUpdateUserPreferences();
 	const fastModeDefault = userPrefs?.fastModeDefault ?? false;
-	const isMobileViewport = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
+	const isMobileViewport = useMobileViewport();
 	const isCoarsePointer = useMediaQuery("(hover: none), (pointer: coarse)") ?? false;
 	const fastModeUsesTapSettings = isMobileViewport || isCoarsePointer;
 
@@ -2958,30 +2965,36 @@ export function NarratorPanel({
 													<IconExternalLink size={16} />
 												</ActionIcon>
 											</Tooltip>
-										) : compact ? (
-											<ActionIcon
-												size="sm"
-												variant="subtle"
-												color="gray"
-												onClick={() =>
-													navigate({
-														to: "/narrators/$narratorId",
-														params: { narratorId },
-														search: { from: "graph" },
-													})
-												}
-											>
-												<IconExternalLink size={16} />
-											</ActionIcon>
 										) : (
-											<ActionIcon
-												size="sm"
-												variant="subtle"
-												color="gray"
-												onClick={() => navigate({ to: ".." })}
-											>
-												<IconArrowLeft size={16} />
-											</ActionIcon>
+											<NarratorPanelCompactContext.Consumer>
+												{(compact) =>
+													compact ? (
+														<ActionIcon
+															size="sm"
+															variant="subtle"
+															color="gray"
+															onClick={() =>
+																navigate({
+																	to: "/narrators/$narratorId",
+																	params: { narratorId },
+																	search: { from: "graph" },
+																})
+															}
+														>
+															<IconExternalLink size={16} />
+														</ActionIcon>
+													) : (
+														<ActionIcon
+															size="sm"
+															variant="subtle"
+															color="gray"
+															onClick={() => navigate({ to: ".." })}
+														>
+															<IconArrowLeft size={16} />
+														</ActionIcon>
+													)
+												}
+											</NarratorPanelCompactContext.Consumer>
 										))}
 									{/*
 									 * `flex: 1` even when the title is suppressed: it is what pushes the
@@ -3309,7 +3322,7 @@ export function NarratorPanel({
 
 					{/* ═══════════════════ Bottom Interaction Area ═══════════════════ */}
 					<NarratorInteractionArea
-						common={{ narratorId, narrator, isWorkspacePreview, compact, isMobileViewport }}
+						common={{ narratorId, narrator, isWorkspacePreview, isMobileViewport }}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}
 						updateAttachedImages={updateAttachedImages}
