@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { parseHTML } from "linkedom";
-import type { ReactNode } from "react";
+import type { HTMLAttributes, ReactNode } from "react";
+import { createPortal } from "react-dom";
 import type { Root } from "react-dom/client";
 
 const keys = ["window", "document", "navigator", "IS_REACT_ACT_ENVIRONMENT"] as const;
@@ -8,6 +9,7 @@ const originals = keys.map(
 	(key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const,
 );
 const { window } = parseHTML("<!doctype html><html><body></body></html>");
+Object.defineProperty(window, "getSelection", { configurable: true, value: () => null });
 Object.assign(globalThis, {
 	window,
 	document: window.document,
@@ -68,7 +70,17 @@ mock.module("react-i18next", () => ({
 }));
 mock.module("../dock/NarratorDockContext", () => ({ useNarratorDockContext: () => null }));
 mock.module("./NarratorWorktreeControls", () => ({
-	NarratorWorktreeControls: () => <span>quick-worktree</span>,
+	NarratorWorktreeControls: () => (
+		<>
+			<span>quick-worktree</span>
+			{createPortal(
+				<button type="button" data-worktree-dialog>
+					dialog
+				</button>,
+				document.body,
+			)}
+		</>
+	),
 }));
 mock.module("../../project/NarratorCompatibilityEntry", () => ({
 	NarratorCompatibilityEntry: ({ projectId }: { projectId: string }) => (
@@ -112,7 +124,12 @@ mock.module("@frontend/components/container/ContainerConfigModal", () => ({
 	},
 }));
 type WrapperProps = { children?: ReactNode };
-const Wrapper = ({ children }: WrapperProps) => <div>{children}</div>;
+const Wrapper = ({ children, onClick, onKeyDown, role }: HTMLAttributes<HTMLDivElement>) => (
+	// biome-ignore lint/a11y/noStaticElementInteractions: mock forwards Mantine Group event handlers and dynamic role
+	<div role={role} onClick={onClick} onKeyDown={onKeyDown}>
+		{children}
+	</div>
+);
 const Button = ({
 	children,
 	onClick,
@@ -148,7 +165,7 @@ mock.module("@mantine/core", () => ({
 }));
 const { act } = await import("react");
 const { createRoot } = await import("react-dom/client");
-const { ChapterBar } = await import("./ChapterBar");
+const { ChapterBar, NarratorGitBar } = await import("./ChapterBar");
 let root: Root;
 let container: HTMLElement;
 async function flush() {
@@ -190,6 +207,38 @@ afterAll(() => {
 		else Reflect.deleteProperty(globalThis, key);
 	}
 });
+for (const variant of ["chapter", "standalone"] as const) {
+	test(`${variant} Git row ignores worktree portal clicks and activation keys`, async () => {
+		const openGit = mock(() => {});
+		await act(async () => {
+			root.render(
+				variant === "chapter" ? (
+					<ChapterBar chapterId="chapter" narratorId="n" onOpenGitPanel={openGit} />
+				) : (
+					<NarratorGitBar narratorId="n" onOpenGitPanel={openGit} />
+				),
+			);
+			await flush();
+		});
+		const dialog = document.querySelector<HTMLElement>("[data-worktree-dialog]");
+		if (!dialog) throw new Error("Missing worktree dialog portal");
+		await act(async () => {
+			dialog.click();
+			for (const key of ["Enter", " "]) {
+				const event = new window.Event("keydown", { bubbles: true, cancelable: true });
+				Object.defineProperty(event, "key", { value: key });
+				dialog.dispatchEvent(event);
+				expect(event.defaultPrevented).toBe(false);
+			}
+		});
+		expect(openGit).not.toHaveBeenCalled();
+		await act(async () => {
+			container.querySelector<HTMLElement>('[role="button"]')?.click();
+		});
+		expect(openGit).toHaveBeenCalledTimes(1);
+	});
+}
+
 test("old fork, merge, containers and project compatibility remain reachable beside quick worktree", async () => {
 	expect(container.textContent).toContain("quick-worktree");
 	expect(container.textContent).toContain("compatibility:project");

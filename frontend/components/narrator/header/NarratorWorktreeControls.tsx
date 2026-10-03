@@ -7,12 +7,14 @@ import { ApiError, api } from "@frontend/lib/api";
 import {
 	ActionIcon,
 	Alert,
+	Badge,
 	Button,
 	Collapse,
 	Group,
 	Loader,
-	Menu,
 	Modal,
+	ScrollArea,
+	Select,
 	Stack,
 	Text,
 	Textarea,
@@ -26,6 +28,12 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { DirectoryPicker } from "../../common/DirectoryPicker";
 import { type WorktreeDraft, WorktreeFlow, type WorktreeFlowState } from "./worktree-flow";
+import {
+	filterSortWorktrees,
+	type WorktreeSort,
+	worktreeDirectoryLabel,
+	worktreeLabel,
+} from "./worktree-list-view";
 import {
 	draftFingerprint,
 	RECEIPT_SCOPE_LIMIT,
@@ -253,6 +261,9 @@ function ScopedWorktreeControls({
 		if (attempt.flow.state.unknown) void attempt.flow.reconcile();
 	};
 	const [menuOpened, setMenuOpened] = useState(false);
+	const [search, setSearch] = useState("");
+	const [sort, setSort] = useState<WorktreeSort>("lastCommitAt");
+	const [descending, setDescending] = useState(true);
 	const worktrees = useQuery({
 		queryKey: ["narratorWorktrees", narratorId, context?.git?.workspaceKey],
 		queryFn: ({ signal }) =>
@@ -260,7 +271,18 @@ function ScopedWorktreeControls({
 		enabled: canList,
 		retry: false,
 		staleTime: 5_000,
+		refetchOnWindowFocus: false,
 	});
+	const visibleEntries = filterSortWorktrees(
+		worktrees.data?.entries ?? [],
+		search,
+		sort,
+		descending,
+	);
+	const formatTime = (timestamp: number | null | undefined) =>
+		timestamp == null || !Number.isFinite(timestamp)
+			? t("worktree.unknownTime")
+			: new Date(timestamp).toLocaleString();
 	const pendingLimit = pendingReceipts.current.size >= RECEIPT_SCOPE_LIMIT;
 	const canCreate =
 		canSwitch &&
@@ -302,26 +324,69 @@ function ScopedWorktreeControls({
 						<IconGitFork size={15} />
 					</ActionIcon>
 				</Tooltip>
-				<Menu opened={menuOpened} onChange={setMenuOpened} position="top-end" withinPortal>
-					<Menu.Target>
-						<Tooltip label={canSwitch ? t("worktree.switch") : disabledReason}>
-							<ActionIcon
-								size="sm"
-								variant="subtle"
-								aria-label={t("worktree.switch")}
-								disabled={(!canSwitch && !canInspect) || switchMutation.isPending || state.busy}
-							>
-								<IconSwitchHorizontal size={15} />
-							</ActionIcon>
-						</Tooltip>
-					</Menu.Target>
-					<Menu.Dropdown>
-						<Menu.Label>
-							{context?.deviceId}: {context?.cwd}
-						</Menu.Label>
-						{storageError && <Menu.Label c="red">{t(storageError)}</Menu.Label>}
+				<Tooltip label={canSwitch ? t("worktree.switch") : disabledReason}>
+					<ActionIcon
+						size="sm"
+						variant="subtle"
+						aria-label={t("worktree.switch")}
+						disabled={(!canSwitch && !canInspect) || switchMutation.isPending || state.busy}
+						onClick={() => {
+							setSearch("");
+							setMenuOpened(true);
+							if (canList) void worktrees.refetch();
+						}}
+					>
+						<IconSwitchHorizontal size={15} />
+					</ActionIcon>
+				</Tooltip>
+				<Modal
+					opened={menuOpened}
+					onClose={() => setMenuOpened(false)}
+					title={t("worktree.switch")}
+					size="lg"
+				>
+					<Stack gap="sm">
+						<Text size="xs" c="dimmed" truncate title={`${context?.deviceId}: ${context?.cwd}`}>
+							{worktreeDirectoryLabel(context?.cwd ?? "")}
+						</Text>
+						<TextInput
+							label={t("worktree.search")}
+							placeholder={t("worktree.searchPlaceholder")}
+							value={search}
+							onChange={(event) => setSearch(event.currentTarget.value)}
+							data-autofocus
+						/>
+						<Group align="end" wrap="nowrap">
+							<Select
+								label={t("worktree.sort")}
+								value={sort}
+								allowDeselect={false}
+								style={{ flex: 1 }}
+								data={[
+									{ value: "lastCommitAt", label: t("worktree.lastCommit") },
+									{ value: "createdAt", label: t("worktree.createdTime") },
+									{ value: "name", label: t("worktree.nameSort") },
+								]}
+								onChange={(value) => {
+									if (value === "lastCommitAt" || value === "createdAt" || value === "name") {
+										setSort(value);
+										setDescending(value !== "name");
+									}
+								}}
+							/>
+							<Button variant="light" onClick={() => setDescending((value) => !value)}>
+								{t(descending ? "worktree.descending" : "worktree.ascending")}
+							</Button>
+						</Group>
+						{sort === "createdAt" && (
+							<Text size="xs" c="dimmed">
+								{t("worktree.createdTimeHint")}
+							</Text>
+						)}
+						{storageError && <Alert color="red">{t(storageError)}</Alert>}
 						{canCreate && (state.unknown || state.createdPath) && (
-							<Menu.Item
+							<Button
+								variant="subtle"
 								disabled={state.busy}
 								onClick={() => {
 									if (state.createRequest)
@@ -332,75 +397,138 @@ function ScopedWorktreeControls({
 									flowRef.current = null;
 									setState({ step: "idle", busy: false });
 									setDraft(EMPTY_DRAFT);
-
+									setMenuOpened(false);
 									setOpened(true);
 								}}
 							>
 								{t("worktree.independentTask")}
-							</Menu.Item>
+							</Button>
 						)}
 						{state.unknown && state.createRequest && (
-							<Menu.Item onClick={() => setOpened(true)}>{t("worktree.verify")}</Menu.Item>
+							<Button
+								variant="subtle"
+								onClick={() => {
+									setMenuOpened(false);
+									setOpened(true);
+								}}
+							>
+								{t("worktree.verify")}
+							</Button>
 						)}
 						{[...pendingReceipts.current.values()]
 							.filter((attempt) => attempt.flow !== flow)
 							.map((attempt) => (
-								<Menu.Item
+								<Button
 									key={attempt.flow.state.createRequest?.requestId}
+									variant="subtle"
 									disabled={state.busy}
-									onClick={() => resumeReceipt(attempt)}
+									onClick={() => {
+										setMenuOpened(false);
+										resumeReceipt(attempt);
+									}}
 								>
 									{t(
 										attempt.flow.state.unknown
 											? "worktree.pendingAttempt"
 											: "worktree.resumeSwitch",
 									)}
-									: local: {attempt.flow.state.createRequest?.destinationPath}
-								</Menu.Item>
+									: {attempt.flow.state.createRequest?.destinationPath}
+								</Button>
 							))}
 						{original.current && original.current.cwd !== context?.cwd && (
-							<Menu.Item
+							<Button
+								variant="subtle"
 								disabled={!canSwitch || state.busy}
 								onClick={() => {
 									const target = original.current;
-									if (target) void switchTo(target.cwd, target.deviceId).catch(() => {});
+									if (target)
+										void switchTo(target.cwd, target.deviceId)
+											.then(() => setMenuOpened(false))
+											.catch(() => {});
 								}}
+								title={original.current.cwd}
 							>
-								{t("worktree.returnOriginal")}: {original.current.cwd}
-							</Menu.Item>
+								{t("worktree.returnOriginal")}: {worktreeDirectoryLabel(original.current.cwd)}
+							</Button>
 						)}
-						{worktrees.isPending && canCreate && (
-							<Menu.Label>
-								<Loader size="xs" />
-							</Menu.Label>
-						)}
+						{worktrees.isPending && canList && <Loader size="xs" />}
 						{worktrees.error && (
-							<Menu.Item onClick={() => void worktrees.refetch()}>
+							<Button variant="subtle" onClick={() => void worktrees.refetch()}>
 								{t("worktree.retry")}: {worktrees.error.message}
-							</Menu.Item>
+							</Button>
 						)}
-						{worktrees.data?.entries.map((entry) => (
-							<Menu.Item
-								key={entry.path}
-								disabled={
-									!canSwitch ||
-									state.busy ||
-									entry.path === context?.cwd ||
-									entry.locked ||
-									entry.prunable
-								}
-								onClick={() => void switchTo(entry.path).catch(() => {})}
-							>
-								<Text size="xs">{entry.branch ?? t("worktree.detached")}</Text>
-								<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
-									{context?.deviceId}: {entry.path}
-								</Text>
-							</Menu.Item>
-						))}
-						{worktrees.data?.truncated && <Menu.Label>{t("worktree.listTruncated")}</Menu.Label>}
-						{switchError && <Menu.Label c="red">{switchError}</Menu.Label>}
-					</Menu.Dropdown>
-				</Menu>
+						<ScrollArea.Autosize mah="45vh" type="auto">
+							<Stack gap={4}>
+								{visibleEntries.map((entry) => (
+									<Button
+										key={entry.path}
+										data-worktree-path={entry.path}
+										variant={entry.path === context?.cwd ? "light" : "subtle"}
+										fullWidth
+										justify="flex-start"
+										h="auto"
+										py="xs"
+										styles={{ label: { display: "block", width: "100%", textAlign: "left" } }}
+										title={`${context?.deviceId}: ${entry.path}`}
+										disabled={
+											!canSwitch ||
+											state.busy ||
+											switchMutation.isPending ||
+											entry.path === context?.cwd ||
+											entry.locked ||
+											entry.prunable
+										}
+										onClick={() =>
+											void switchTo(entry.path)
+												.then(() => setMenuOpened(false))
+												.catch(() => {})
+										}
+									>
+										<Group gap="xs" wrap="nowrap">
+											<Text size="sm" truncate>
+												{entry.branch
+													? worktreeLabel(entry)
+													: `${t("worktree.detached")} · ${worktreeLabel(entry)}`}
+											</Text>
+											{entry.path === context?.cwd && (
+												<Badge size="xs">{t("worktree.current")}</Badge>
+											)}
+											{entry.locked && (
+												<Badge size="xs" color="yellow">
+													{t("worktree.locked")}
+												</Badge>
+											)}
+											{entry.prunable && (
+												<Badge size="xs" color="red">
+													{t("worktree.unavailable")}
+												</Badge>
+											)}
+										</Group>
+										<Text size="xs" c="dimmed" truncate>
+											{context?.deviceId !== "local" && `${context?.deviceId}: `}
+											{worktreeDirectoryLabel(entry.path)}
+										</Text>
+										{sort !== "name" && (
+											<Text size="xs" c="dimmed">
+												{t(sort === "createdAt" ? "worktree.createdTime" : "worktree.lastCommit")}:{" "}
+												{formatTime(entry[sort])}
+											</Text>
+										)}
+									</Button>
+								))}
+								{!worktrees.isPending && !worktrees.error && visibleEntries.length === 0 && (
+									<Text size="sm" c="dimmed">
+										{t(search.trim() ? "worktree.noMatches" : "worktree.emptyList")}
+									</Text>
+								)}
+							</Stack>
+						</ScrollArea.Autosize>
+						{worktrees.data?.truncated && (
+							<Alert color="yellow">{t("worktree.listTruncated")}</Alert>
+						)}
+						{switchError && <Alert color="red">{switchError}</Alert>}
+					</Stack>
+				</Modal>
 			</Group>
 			<Modal
 				opened={opened}
@@ -504,7 +632,7 @@ function ScopedWorktreeControls({
 							</Alert>
 						)}
 						{state.unknown && <Alert color="yellow">{t("worktree.unknown")}</Alert>}
-						{state.unknown && (
+						{canInspect && (
 							<Button
 								variant="default"
 								onClick={() => {

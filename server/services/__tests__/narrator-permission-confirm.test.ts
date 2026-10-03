@@ -81,6 +81,7 @@ const {
 	reprocessAllPendingPermissions,
 	resolvePermission,
 	resolvePermissionDecision,
+	shouldTriggerDangerReflection,
 } = await import("../narrator-permission");
 const { activeNarrators, pendingDangerReflections, pendingPermissions } = await import(
 	"../narrator-session-state"
@@ -369,6 +370,92 @@ describe("confirmDangerReflection ordering", () => {
 		expect(row?.status).toBe("running");
 		expect((row?.permissionSuggestions as Array<{ status?: string }>)[0]?.status).toBe("confirmed");
 	});
+});
+
+describe("working-directory switch danger reflection", () => {
+	const input = {
+		expectedRevision: 1,
+		requestId: "switch-workspace-request",
+		target: { deviceId: "local", cwd: "/workspace/next" },
+	};
+
+	test("workspace switches are high risk even inside an allowed directory and with read-only skips", () => {
+		const classified = classifyDanger(
+			"SwitchWorkingDirectory",
+			input,
+			"/workspace",
+			undefined,
+			[{ path: "/workspace", enabled: true, accessLevel: "full" }],
+			[],
+			true,
+		);
+		expect(classified?.severity).toBe("high");
+		if (!classified) throw new Error("Workspace switch must be classified");
+		for (const level of ["light", "standard", "strict"] as const)
+			expect(shouldTriggerDangerReflection(classified, level)).toBe(true);
+		expect(shouldTriggerDangerReflection(classified, "off")).toBe(false);
+		expect(classified.details).toContain("Requested working directory: /workspace/next");
+	});
+
+	for (const permissionMode of ["default", "bypassPermissions"] as const) {
+		test.each([
+			"light",
+			"standard",
+			"strict",
+			"off",
+		] as const)(`${permissionMode} mode honors %s reflection for workspace switches`, async (level) => {
+			const id = `switch-reflection-${permissionMode}-${level}`;
+			const callId = `${id}-call`;
+			const useId = `${id}-use`;
+			await seedPermissionRequest({
+				narratorId: id,
+				messageId: `${id}-message`,
+				toolCallId: callId,
+				toolUseId: useId,
+				toolName: "SwitchWorkingDirectory",
+				input,
+				permissionMode,
+			});
+			await db
+				.update(narrators)
+				.set({ dangerReflectionOverride: level })
+				.where(eq(narrators.id, id));
+			const permissionPromise = handlePermission(
+				id,
+				new AbortController().signal,
+				"SwitchWorkingDirectory",
+				input,
+				useId,
+				"/workspace",
+				"en",
+			);
+			if (permissionMode === "default") {
+				// Reflection must not replace an existing human-approval requirement.
+				await waitFor(() => pendingPermissions.has(callId));
+				expect(pendingDangerReflections.has(callId)).toBe(false);
+				expect(await resolvePermission(callId, "deny")).toBe(true);
+				expect(await permissionPromise).toMatchObject({ behavior: "deny" });
+				return;
+			}
+			const result = await permissionPromise;
+			if (level === "off") {
+				expect(result.behavior).toBe("allow");
+				expect(pendingDangerReflections.has(callId)).toBe(false);
+				return;
+			}
+			expect(result.behavior).toBe("dangerReflection");
+			if (result.behavior !== "dangerReflection") throw new Error("Expected reflection pause");
+			expect(pendingDangerReflections.has(callId)).toBe(true);
+			expect(
+				(await db.query.narratorToolCalls.findFirst({ where: eq(narratorToolCalls.id, callId) }))
+					?.permissionDecidedBy,
+			).not.toBe("auto");
+			expect(
+				await confirmDangerReflection(callId, "Verified the user-requested target workspace"),
+			).toBe(true);
+			expect(await result.decision).toMatchObject({ behavior: "allow" });
+		});
+	}
 });
 
 describe("danger fingerprint execution identity", () => {

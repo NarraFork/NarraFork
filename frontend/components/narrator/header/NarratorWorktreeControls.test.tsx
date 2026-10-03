@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
 import type {
 	WorktreeCreateRequest,
 	WorktreeCreateResult,
+	WorktreeEntry,
 	WorktreePrepareRequest,
 } from "@shared/narrator-worktrees";
 import type { WorkspaceContext } from "@shared/workspace-context";
@@ -95,11 +96,13 @@ mock.module("@frontend/lib/api", () => ({
 	},
 	ApiError: FakeApiError,
 }));
+let listEntries: WorktreeEntry[] = [];
+const refetch = mock(async () => {});
 mock.module("@tanstack/react-query", () => ({
 	useQuery: () => ({
-		data: { entries: [], capabilities: { create: true } },
+		data: { entries: listEntries, capabilities: { create: true } },
 		isPending: false,
-		refetch: async () => {},
+		refetch,
 	}),
 }));
 mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
@@ -128,6 +131,31 @@ mock.module("@mantine/core", () => {
 		Loader: () => <span>loader</span>,
 		Tooltip: Wrapper,
 		Menu,
+		Badge: Wrapper,
+		ScrollArea: { Autosize: Wrapper },
+		Select: ({
+			label,
+			value,
+			data,
+			onChange,
+		}: {
+			label: string;
+			value: string;
+			data: { value: string; label: string }[];
+			onChange: (value: string) => void;
+		}) => (
+			<select
+				aria-label={label}
+				value={value}
+				onChange={(event) => onChange(event.currentTarget.value)}
+			>
+				{data.map((option) => (
+					<option key={option.value} value={option.value}>
+						{option.label}
+					</option>
+				))}
+			</select>
+		),
 		Modal: ({ opened, children }: Children & { opened: boolean }) =>
 			opened ? <div data-modal>{children}</div> : null,
 		Collapse: ({ expanded, children }: Children & { expanded: boolean }) =>
@@ -147,8 +175,19 @@ mock.module("@mantine/core", () => {
 			onClick,
 			disabled,
 			type,
-		}: Children & { onClick?: () => void; disabled?: boolean; type?: "submit" | "button" }) => (
-			<button type={type ?? "button"} disabled={disabled} onClick={onClick}>
+			"data-worktree-path": path,
+		}: Children & {
+			onClick?: () => void;
+			disabled?: boolean;
+			type?: "submit" | "button";
+			"data-worktree-path"?: string;
+		}) => (
+			<button
+				type={type ?? "button"}
+				disabled={disabled}
+				onClick={onClick}
+				data-worktree-path={path}
+			>
 				{children}
 			</button>
 		),
@@ -224,6 +263,8 @@ async function submit() {
 }
 beforeEach(async () => {
 	activeContext = context;
+	listEntries = [];
+	refetch.mockClear();
 	activeUser = { id: "u1" };
 	storage.clear();
 	quotaFailure = false;
@@ -248,6 +289,60 @@ afterAll(() => {
 		if (value) Object.defineProperty(globalThis, key, value);
 		else Reflect.deleteProperty(globalThis, key);
 	}
+});
+
+test("switch dialog refreshes, searches, sorts and closes after a successful switch", async () => {
+	listEntries = [
+		{
+			...created("/repo/older").worktree,
+			branch: "refs/heads/older",
+			lastCommitAt: 100,
+			createdAt: 300,
+		},
+		{
+			...created("/repo/newer").worktree,
+			branch: "refs/heads/newer",
+			lastCommitAt: 200,
+			createdAt: 50,
+		},
+	] as WorktreeEntry[];
+	await click("worktree.switch");
+	expect(refetch).toHaveBeenCalledTimes(1);
+	const paths = () =>
+		[...container.querySelectorAll("[data-worktree-path]")].map((node) =>
+			node.getAttribute("data-worktree-path"),
+		);
+	expect(paths()).toEqual(["/repo/newer", "/repo/older"]);
+	await click("worktree.descending");
+	expect(paths()).toEqual(["/repo/older", "/repo/newer"]);
+	await input("worktree.search", "NEWER");
+	expect(paths()).toEqual(["/repo/newer"]);
+	await input("worktree.search", "not-there");
+	expect(paths()).toEqual([]);
+	expect(container.textContent).toContain("worktree.noMatches");
+	await input("worktree.search", "");
+	await act(async () => {
+		const select = container.querySelector("select");
+		if (!select) throw new Error("Missing sort selector");
+		// linkedom's select value is read-only; override to emulate a browser change.
+		Object.defineProperty(select, "value", { configurable: true, value: "createdAt" });
+		select.dispatchEvent(new window.Event("change", { bubbles: true }));
+	});
+	expect(paths()).toEqual(["/repo/older", "/repo/newer"]);
+	expect(container.textContent).toContain("worktree.createdTimeHint");
+	await act(async () => {
+		container.querySelector<HTMLButtonElement>('[data-worktree-path="/repo/newer"]')?.click();
+		await flush();
+	});
+	expect(switched.mock.calls[0]?.[0]).toMatchObject({
+		target: { cwd: "/repo/newer", deviceId: "local" },
+	});
+	expect(container.querySelector("[data-modal]")).toBeNull();
+});
+
+test("switch dialog shows an empty state", async () => {
+	await click("worktree.switch");
+	expect(container.textContent).toContain("worktree.emptyList");
 });
 
 test("advanced is collapsed and expands the existing unified DirectoryPicker", async () => {
@@ -329,8 +424,9 @@ test("a successful switch retains the requirement as a composer prompt exactly o
 test("return to original directory freezes the original device and sends the latest revision", async () => {
 	activeContext = { ...context, cwd: "/wt/named", revision: 3, contextKey: "new" };
 	await act(async () => root.render(<NarratorWorktreeControls narratorId="n" />));
-	expect(container.textContent).toContain("local: /wt/named");
-	await click("worktree.returnOriginal: /repo");
+	await click("worktree.switch");
+	expect(container.textContent).toContain("named");
+	await click("worktree.returnOriginal: repo");
 	expect(switched.mock.calls[0]?.[0]).toMatchObject({
 		expectedRevision: 3,
 		target: { deviceId: "local", cwd: "/repo" },
@@ -459,7 +555,8 @@ test("manual context switch frees a blank form but retains exact old receipt for
 	).toBe("");
 	expect(container.textContent).toContain("worktree.pendingNotice");
 	expect(create).toHaveBeenCalledTimes(1);
-	await click("worktree.pendingAttempt: local: /wt/named");
+	await click("worktree.inspectExisting");
+	await click("worktree.pendingAttempt: /wt/named");
 	expect(reconcile.mock.calls[0]?.[1]).toEqual(original);
 	expect((reconcile.mock.calls[0]?.[1] as WorktreeCreateRequest).expectedRevision).toBe(2);
 	await click("worktree.continueSwitch");
@@ -566,6 +663,7 @@ test("independent blank form does not restore another proposal; same draft canno
 	await input("worktree.name", "old");
 	await submit();
 	await remount();
+	await click("worktree.switch");
 	await click("worktree.independentTask");
 	expect((container.querySelector('[aria-label="worktree.name"]') as HTMLInputElement).value).toBe(
 		"",
@@ -586,6 +684,7 @@ test("live pending attempts deliver only their own frozen requirement and retain
 	await openForm();
 	await input("worktree.requirement", "requirement A");
 	await submit();
+	await click("worktree.inspectExisting");
 	await click("worktree.independentTask");
 	prepare.mockResolvedValueOnce({
 		branchName: "branch-b",
@@ -595,10 +694,12 @@ test("live pending attempts deliver only their own frozen requirement and retain
 	switched.mockRejectedValueOnce(new FakeApiError("busy", 409));
 	await input("worktree.requirement", "requirement B");
 	await submit();
-	await click("worktree.pendingAttempt: local: /wt/named");
+	await click("worktree.inspectExisting");
+	await click("worktree.pendingAttempt: /wt/named");
 	await click("worktree.continueSwitch");
 	expect(delivered.mock.calls.map((call) => call[0])).toEqual(["requirement A"]);
-	await click("worktree.resumeSwitch: local: /wt/b");
+	await click("worktree.switch");
+	await click("worktree.resumeSwitch: /wt/b");
 	await click("worktree.retrySwitch");
 	expect(delivered.mock.calls.map((call) => call[0])).toEqual(["requirement A", "requirement B"]);
 	expect(create).toHaveBeenCalledTimes(2);

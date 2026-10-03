@@ -2355,6 +2355,27 @@ export function classifyDanger(
 			executionContext,
 		);
 
+	if (toolName === "SwitchWorkingDirectory") {
+		const target = input.target as { deviceId?: unknown; cwd?: unknown } | undefined;
+		return danger(
+			"SwitchWorkingDirectory changes the narrator's execution workspace.",
+			[
+				"Subsequent tools use a different working directory, skills and permission context.",
+				"Existing background tools, subagents and terminals remain on their original targets.",
+			],
+			[
+				"Verify the target device and directory match the user's requested workspace.",
+				"Keep the current workspace if switching is not necessary for this task.",
+			],
+			[
+				`Current working directory: ${cwd}`,
+				`Requested device: ${String(target?.deviceId ?? "unknown")}`,
+				`Requested working directory: ${String(target?.cwd ?? "unknown")}`,
+			],
+			"high",
+		);
+	}
+
 	if (toolName === "Agent") {
 		if (input.subagent_type === "explore" || input.subagent_type === "plan") return null;
 		const workdir = typeof input.workdir === "string" ? input.workdir : "";

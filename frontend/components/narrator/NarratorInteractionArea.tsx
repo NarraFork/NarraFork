@@ -120,11 +120,9 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 		handleSaveEditQueued,
 	} = useQueuedMessageActions({ narratorId: props.common.narratorId, ...props.queueDeps, t });
 
-	const hasImages = props.attachedImages.length > 0;
-
 	return (
 		<Box style={{ position: "relative", flexShrink: 0 }}>
-			{/* Resize boundary; preview/progress/queue rows already draw their own top border. */}
+			{/* Resize boundary; the queue draws its own top border when present. */}
 			<Box
 				onPointerDown={startBottomSpacingResize}
 				role="separator"
@@ -140,25 +138,11 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 					touchAction: "none",
 					zIndex: 100,
 					borderTop:
-						hasImages ||
-						props.attachedTextFiles.length > 0 ||
-						(props.sendingState?.attachmentCount ?? 0) > 0 ||
 						props.queueDeps.queuedMessages.length > 0
 							? undefined
 							: "1px solid var(--mantine-color-default-border)",
 				}}
 			/>
-
-			{/* Staged image + text-file previews (owns its own object-URL previews). */}
-			<AttachmentPreviews
-				attachedImages={props.attachedImages}
-				attachedTextFiles={props.attachedTextFiles}
-				updateAttachedImages={props.updateAttachedImages}
-				updateAttachedTextFiles={props.updateAttachedTextFiles}
-			/>
-
-			{/* Upload / send progress while attachments upload. */}
-			<UploadProgressBar sendingState={props.sendingState} cancelSending={props.cancelSending} />
 
 			{/* Queued messages indicator */}
 			<QueuedMessagesPanel
@@ -166,7 +150,6 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 				queueExpanded={queueExpanded}
 				setQueueExpanded={setQueueExpanded}
 				editingQueuedId={editingQueuedId}
-				hasImages={hasImages}
 				handleDragEndQueued={handleDragEndQueued}
 				handleSaveEditQueued={handleSaveEditQueued}
 				handleCancelEditQueued={handleCancelEditQueued}
@@ -210,6 +193,16 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 				borderTop={props.chapterId || props.onOpenGitPanel ? undefined : statusBar.borderTop}
 			/>
 
+			{/* Staged image + text-file previews (owns its own object-URL previews). */}
+			<AttachmentPreviews
+				attachedImages={props.attachedImages}
+				attachedTextFiles={props.attachedTextFiles}
+				updateAttachedImages={props.updateAttachedImages}
+				updateAttachedTextFiles={props.updateAttachedTextFiles}
+			/>
+
+			{/* Upload / send progress while attachments upload. */}
+			<UploadProgressBar sendingState={props.sendingState} cancelSending={props.cancelSending} />
 			{/* Input */}
 			{props.common.isWorkspacePreview ? null : props.isChapterMerged ? (
 				<Box

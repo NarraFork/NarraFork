@@ -94,10 +94,13 @@ export function NarratorGitBar({
 			tabIndex={0}
 			aria-label={t("panel.title")}
 			style={{ flexShrink: 0, cursor: "pointer", userSelect: "text" }}
-			onClick={() => {
+			onClick={(event) => {
+				// Portal events bubble through React, even when outside this DOM row.
+				if (!event.currentTarget.contains(event.target as Node)) return;
 				if (!isTextSelectionGesture(window.getSelection())) onOpenGitPanel();
 			}}
 			onKeyDown={(event) => {
+				if (!event.currentTarget.contains(event.target as Node)) return;
 				if (isActivationKey(event.key)) {
 					event.preventDefault();
 					onOpenGitPanel();
@@ -140,7 +143,8 @@ export function NarratorGitBar({
 					title={`${executionContext.deviceId}: ${executionContext.cwd}`}
 					style={{ flex: 1, minWidth: 0 }}
 				>
-					{executionContext.deviceId}: {executionContext.cwd}
+					{executionContext.deviceId !== "local" && `${executionContext.deviceId}: `}
+					{executionContext.cwd.split(/[\\/]/).filter(Boolean).pop() || executionContext.cwd}
 				</Text>
 			)}
 			<NarratorWorktreeControls
@@ -238,15 +242,20 @@ export function ChapterBar({
 	 * collapsed selection (a plain click) still opens the panel. The predicate lives
 	 * in chapter-bar-git-trigger.ts, where it is tested directly.
 	 */
-	const handleGitTriggerClick = useCallback(() => {
-		if (isTextSelectionGesture(window.getSelection())) return;
-		openGitPanel?.();
-	}, [openGitPanel]);
+	const handleGitTriggerClick = useCallback(
+		(event: React.MouseEvent) => {
+			if (!event.currentTarget.contains(event.target as Node)) return;
+			if (isTextSelectionGesture(window.getSelection())) return;
+			openGitPanel?.();
+		},
+		[openGitPanel],
+	);
 
 	// Keyboard equivalent for the role="button" row. Space is prevented so the
 	// conversation behind it does not scroll instead.
 	const handleGitTriggerKeyDown = useCallback(
 		(e: React.KeyboardEvent) => {
+			if (!e.currentTarget.contains(e.target as Node)) return;
 			if (!isActivationKey(e.key)) return;
 			e.preventDefault();
 			openGitPanel?.();
@@ -353,7 +362,8 @@ export function ChapterBar({
 							truncate
 							title={`${executionContext.deviceId}: ${executionContext.cwd}`}
 						>
-							{executionContext.deviceId}: {executionContext.cwd}
+							{executionContext.deviceId !== "local" && `${executionContext.deviceId}: `}
+							{executionContext.cwd.split(/[\\/]/).filter(Boolean).pop() || executionContext.cwd}
 						</Text>
 					)}
 					{chapter.status !== "active" && (
