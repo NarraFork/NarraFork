@@ -816,7 +816,9 @@ export class OpenAIProvider implements ProviderAdapter {
 			if (this.apiMode === "codex") {
 				const toolsArr = (body.tools ?? []) as unknown[];
 				appendCodexNativeTools(toolsArr, params.model, {
-					webSearch: this.codexWebSearchEnabled && isNativeSearchChannelFirstEnabled(),
+					webSearch:
+						this.codexWebSearchEnabled &&
+						isNativeSearchChannelFirstEnabled(undefined, this.config.prefix, params.model),
 					imageGeneration: this.codexImageGenerationEnabled,
 				});
 				body.tools = toolsArr;
@@ -1711,7 +1713,9 @@ export class OpenAIProvider implements ProviderAdapter {
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
 		appendCodexNativeTools(tools, params.model, {
-			webSearch: this.codexWebSearchEnabled && isNativeSearchChannelFirstEnabled(),
+			webSearch:
+				this.codexWebSearchEnabled &&
+				isNativeSearchChannelFirstEnabled(undefined, this.config.prefix, params.model),
 			imageGeneration: this.codexImageGenerationEnabled,
 		});
 		request.tools = tools;

@@ -23,18 +23,15 @@ import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useAllModels } from "../../hooks/useModels";
 import { api } from "../../lib/api";
+import type {
+	CustomSearchProviderConfig,
+	SearchChannelConfig,
+	SearchChannelKind,
+} from "../../lib/api/settings";
 
 export const Route = createFileRoute("/settings/search")({
 	component: SettingsSearchPage,
 });
-
-type SearchChannelKind =
-	| "native"
-	| "nug-mcp"
-	| "custom-api"
-	| "subagent"
-	/** Contributed by a plugin through `contributes.searchProviders`. */
-	| "plugin";
 
 /** Backend-resolved label and availability, keyed by channel id. */
 interface SearchChannelInfo {
@@ -42,29 +39,6 @@ interface SearchChannelInfo {
 	kind: SearchChannelKind;
 	label: string;
 	available: boolean;
-}
-
-interface SearchChannelConfig {
-	id: string;
-	kind: SearchChannelKind;
-	enabled: boolean;
-	providerId?: string;
-	model?: string;
-	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
-	maxTurns?: number;
-	timeoutMs?: number;
-}
-
-interface CustomSearchProviderConfig {
-	id: string;
-	name: string;
-	disabled?: boolean;
-	protocol: string;
-	baseUrl: string;
-	apiKey?: string;
-	headers?: Record<string, string>;
-	options?: Record<string, unknown>;
-	timeoutMs?: number;
 }
 
 interface SearchProtocolMeta {
@@ -194,8 +168,20 @@ function SettingsSearchPage() {
 	});
 
 	const testChannel = useMutation({
-		mutationFn: (channelId: string) =>
-			api.testSearchChannel({ channelId, query: testQuery, purpose: testPurpose }),
+		mutationFn: (channel: SearchChannelConfig) =>
+			api.testSearchChannel({
+				channelId: channel.id,
+				channel,
+				...(channel.kind === "custom-api"
+					? {
+							customProvider: state?.customProviders.find(
+								(provider) => provider.id === channel.providerId,
+							),
+						}
+					: {}),
+				query: testQuery,
+				purpose: testPurpose,
+			}),
 		onSuccess: (data) => {
 			notifications.show({
 				message: data.text ? data.text.slice(0, 180) : t("searchChannelTestSuccess"),
@@ -475,7 +461,7 @@ function SettingsSearchPage() {
 											disabled={channel.kind === "native"}
 											onClick={() => {
 												setTestingChannel(channel.id);
-												testChannel.mutate(channel.id);
+												testChannel.mutate(channel);
 											}}
 										>
 											{t("searchTestChannel")}

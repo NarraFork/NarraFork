@@ -1904,7 +1904,18 @@ function startForegroundRunUnlocked(
 
 /** Compatibility wrapper that preserves the legacy model-tool text boundary. */
 export async function runForegroundLoop(input: ForegroundLoopInput): Promise<string> {
-	return (await startForegroundRun(input).foreground).output;
+	const { getSearchExecutionScope } = await import("../lib/search/execution-scope");
+	const handle = startForegroundRun(input);
+	if (getSearchExecutionScope()) {
+		// A channel failure must reach the search router so the next channel can run.
+		// Wait for lifecycle finalization, not just the legacy tagged text result.
+		const [, terminal] = await Promise.all([handle.foreground, handle.terminal]);
+		if (terminal.hasError || terminal.interrupted || terminal.timedOut) {
+			throw new Error(terminal.finalText || "Search subagent failed");
+		}
+		return terminal.output;
+	}
+	return (await handle.foreground).output;
 }
 
 // === Subagent runner ===

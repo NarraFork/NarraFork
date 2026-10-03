@@ -28,7 +28,13 @@ import { withModelMetadataSnapshotIterator } from "../model-catalog";
 import { captureReferencePricingSnapshot } from "../model-pricing";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
-import { shouldUseNativeSearch } from "../search/native";
+import {
+	consumeSearchExecutionTurn,
+	getSearchExecutionScope,
+	matchesSearchExecutionScope,
+	SearchExecutionBudgetExceededError,
+} from "../search/execution-scope";
+import { shouldUseNativeSearch, usesSideRequestNativeSearch } from "../search/native";
 import { hasUsableFunctionSearchChannelFor } from "../search/router";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { sideCarBodyWithText } from "../sidecar-templates";
@@ -2416,7 +2422,11 @@ async function* agentLoopInMetadataSnapshot(
 	let provider = resolvedProvider.adapter;
 	let effectiveModel = resolvedProvider.model;
 	let effectiveProvider = resolvedProvider.provider;
-	const maxTurns = config.maxTurns ?? settings.agent.maxTurns;
+	const searchScope = getSearchExecutionScope();
+	const maxTurns = Math.min(
+		config.maxTurns ?? settings.agent.maxTurns,
+		searchScope?.remainingTurns ?? Number.POSITIVE_INFINITY,
+	);
 	const locale = (config.locale as Locale) ?? "en";
 
 	// Permission checks must be serialized even when tools themselves are parallel-safe.
@@ -2505,7 +2515,10 @@ async function* agentLoopInMetadataSnapshot(
 			// session, so a native-only channel list would otherwise advertise a tool
 			// that always errors on non-opted providers).
 			resolved.some((t) => t.name === "WebSearch") &&
-			!hasUsableFunctionSearchChannelFor(providerName)
+			!(searchScope || config.runtimePolicy?.searchOnly
+				? (!searchScope || matchesSearchExecutionScope(providerName, modelName)) &&
+					usesSideRequestNativeSearch(providerName, modelName)
+				: hasUsableFunctionSearchChannelFor(providerName))
 		) {
 			resolved = resolved.filter((t) => t.name !== "WebSearch");
 		}
@@ -4132,6 +4145,20 @@ async function* agentLoopInMetadataSnapshot(
 					});
 					const toolSnapshot = requestToolSnapshots.get(config);
 					if (toolSnapshot) requestToolSnapshots.set(toolConfig, toolSnapshot);
+					if (searchScope) {
+						if (!matchesSearchExecutionScope(effectiveProvider, effectiveModel)) {
+							yield {
+								type: "error",
+								message: "Search execution provider/model changed outside its scope",
+							};
+							return;
+						}
+						if (searchScope.remainingTurns <= 0) {
+							yield { type: "error", message: new SearchExecutionBudgetExceededError().message };
+							return;
+						}
+						consumeSearchExecutionTurn();
+					}
 					const stream = provider.chat({
 						conversationId: config.conversationId,
 						content,
@@ -7201,5 +7228,8 @@ async function* agentLoopInMetadataSnapshot(
 		}
 	}
 
+	if (searchScope) {
+		yield { type: "error", message: new SearchExecutionBudgetExceededError().message };
+	}
 	yield { type: "max_turns_exceeded", maxTurns };
 }

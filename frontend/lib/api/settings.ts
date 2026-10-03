@@ -11,6 +11,31 @@ import { ApiError, apiBase, authorizedFetch, readFetchError, request } from "./c
 import { parseContentDispositionFileName } from "./narrators";
 import type { ApiEntity } from "./types";
 
+export type SearchChannelKind = "native" | "nug-mcp" | "custom-api" | "subagent" | "plugin";
+
+export interface SearchChannelConfig {
+	id: string;
+	kind: SearchChannelKind;
+	enabled: boolean;
+	providerId?: string;
+	model?: string;
+	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+	maxTurns?: number;
+	timeoutMs?: number;
+}
+
+export interface CustomSearchProviderConfig {
+	id: string;
+	name: string;
+	disabled?: boolean;
+	protocol: string;
+	baseUrl: string;
+	apiKey?: string;
+	headers?: Record<string, string>;
+	options?: Record<string, unknown>;
+	timeoutMs?: number;
+}
+
 export interface RecentTabsPageResponse {
 	items: PersistedRecentTab[];
 	nextCursor?: string;
@@ -233,7 +258,13 @@ export const settingsApi = {
 			method: "POST",
 			body: JSON.stringify({ model, prompt }),
 		}),
-	testSearchChannel: (data: { channelId?: string; query: string; purpose?: string }) =>
+	testSearchChannel: (data: {
+		channelId?: string;
+		channel?: SearchChannelConfig;
+		customProvider?: CustomSearchProviderConfig;
+		query: string;
+		purpose?: string;
+	}) =>
 		request<{ text: string; channelId: string; channelLabel: string; attempts?: unknown[] }>(
 			"/settings/search/test",
 			{

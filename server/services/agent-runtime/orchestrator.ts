@@ -52,6 +52,10 @@ import { markNugCachedModelUnavailable } from "../../lib/nug-model-cache";
 import { resolveEffectiveRelaxedPlan } from "../../lib/permission-modes";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../../lib/prompt-i18n";
 import {
+	getSearchExecutionScope,
+	SearchExecutionBudgetExceededError,
+} from "../../lib/search/execution-scope";
+import {
 	FOLLOW_DEFAULT_MODEL,
 	getAutoCompactKeepPairs,
 	getContextThresholds,
@@ -1760,6 +1764,55 @@ export async function runAgentLoopUnlocked(
 			runState.hitMaxTurns = result.maxTurnsExceeded === true;
 
 			runState.totalTokens += accountTokenUsageForTurn(active);
+			const searchScope = getSearchExecutionScope();
+			if (searchScope && (searchScope.remainingTurns <= 0 || result.maxTurnsExceeded)) {
+				// No retry/spec/goal continuation can acquire a fresh budget implicitly.
+				const completedNaturally =
+					result.completedNaturally === true &&
+					!result.hasError &&
+					!result.maxTurnsExceeded &&
+					!result.aborted &&
+					!result.interrupted &&
+					!result.contextLengthExceeded &&
+					!result.silentDisconnect &&
+					!result.paymentRequired &&
+					!result.modelUnavailable &&
+					!result.retryableError;
+				if (!completedNaturally) {
+					// Recovery signals often leave hasError=false and finalText contains
+					// partial assistant output, not the upstream failure. Keep their specific
+					// error instead of masking it with the exhausted-budget fallback.
+					const message =
+						result.paymentRequired?.message ||
+						result.modelUnavailable?.message ||
+						result.retryableError ||
+						(result.hasError && !result.maxTurnsExceeded ? result.finalText : "") ||
+						(result.silentDisconnect ? "Codex WebSocket silent disconnect" : "") ||
+						(result.contextLengthExceeded ? "Error: context length exceeded" : "") ||
+						(result.aborted ? "Aborted" : "") ||
+						new SearchExecutionBudgetExceededError().message;
+					const errorCode = result.paymentRequired
+						? "payment_required"
+						: (result.retryableErrorCode ?? result.errorCode);
+					const diagnostics =
+						result.modelUnavailable?.diagnostics ??
+						result.retryableDiagnostics ??
+						result.errorDiagnostics;
+					runState.hadError = true;
+					runState.finalText = message;
+					await narratorService.updateStatus(narratorId, "idle", {
+						substatus: ["error"],
+						errorMessage: message,
+						errorCode,
+						diagnostics,
+					});
+					active.events.emit("event", {
+						type: "error",
+						data: { message, errorCode, diagnostics },
+					});
+				}
+				break;
+			}
 
 			// Suppress runaway auto-continuation when a continuation pass makes no effective
 			// progress: either it called no tools, or it repeatedly hit the same protected-task
