@@ -207,6 +207,7 @@ export type ToolCategory =
 	| "browser"
 	| "knowledge"
 	| "contextAsk"
+	| "workspace"
 	| "generic";
 
 /** Tool-call status (subset of the live statuses that affect the height model). */

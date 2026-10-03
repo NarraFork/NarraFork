@@ -1,3 +1,4 @@
+import { worktreeListPreview } from "@shared/narrator-worktrees";
 import { z } from "zod/v4";
 import type { NarratorPrincipal } from "../../../services/narrator-acl";
 import type { NarratorWorktreeService } from "../../../services/narrator-worktree-service";
@@ -47,7 +48,9 @@ export function createWorktreeTool<Principal>(
 						: await service.create(principal, ctx.narratorId, request, ctx.signal);
 				return {
 					output: JSON.stringify(result),
-					...("outcome" in result ? { isError: result.outcome !== "created" } : {}),
+					...("outcome" in result
+						? { isError: result.outcome !== "created" }
+						: { metadata: { workspaceWorktrees: worktreeListPreview(result) } }),
 				};
 			} catch (cause) {
 				return {

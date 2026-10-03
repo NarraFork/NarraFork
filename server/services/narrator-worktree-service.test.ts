@@ -538,6 +538,26 @@ describe("local worktree list/create fixtures", () => {
 		expect(writes).toBe(1);
 	});
 
+	test("Worktree list tool supplies structured display metadata without changing protocol output", async () => {
+		const tool = createWorktreeTool(service, async () => "actor");
+		const result = await tool.execute({ action: "list", workspaceKey: proposal().workspaceKey }, {
+			narratorId: "narrator",
+			signal: signal(),
+		} as ToolContext);
+		const output = JSON.parse(result.output);
+		expect(result.isError).not.toBe(true);
+		expect(result.metadata?.workspaceWorktrees).toEqual({
+			entries: output.entries.map(
+				(entry: { path: string; branch: string | null; detached: boolean }) => ({
+					path: entry.path,
+					branch: entry.branch,
+					detached: entry.detached,
+				}),
+			),
+			truncated: output.truncated,
+		});
+		expect(output.repositoryKey).toBeDefined();
+	});
 	test("new branch name is optional and generated once, then frozen across persistent replay", async () => {
 		let naming = 0;
 		ports.generateBranchName = async () => {

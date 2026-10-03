@@ -44,6 +44,7 @@ import {
 	type SourceTextRange,
 } from "./source-text";
 import { hasTruncatedLeaf, readLeafText, stringifyForDisplay } from "./tool-io-projection";
+import { workspaceObject, workspaceSummary, workspaceText } from "./workspace-tool-display";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Canonical tool-detail bodies and ordered sections.
@@ -1011,6 +1012,8 @@ function classifyByCategory(
 			return classifyKnowledge(toolName, inputJson, outputJson, metadata);
 		case "contextAsk":
 			return classifyContextAsk(inputJson, outputJson, metadata, status);
+		case "workspace":
+			return classifyWorkspace(toolName, inputJson, outputJson, input.labels, metadata);
 		default:
 			return classifyGeneric(inputJson, outputJson);
 	}
@@ -3264,4 +3267,93 @@ function classifyContextAsk(
 			),
 		]) ?? { kind: "sections", sections: [] }
 	);
+}
+
+/** Workspace cards deliberately use plain rows, not protocol dumps or badge strips. */
+function classifyWorkspace(
+	toolName: string,
+	input: unknown,
+	output: unknown,
+	labels?: Record<string, string>,
+	metadata?: Record<string, unknown> | null,
+): ToolDetailData | null {
+	const args = workspaceObject(input);
+	const envelope = workspaceObject(output);
+	const raw = envelope && "_text" in envelope ? envelope._text : output;
+	const result = workspaceObject(raw) ?? workspaceObject(tryParseJson(readLeafText(raw)));
+	const rows: ToolMetaRow[] = [];
+	const text = (key: Parameters<typeof workspaceText>[0]) => workspaceText(key, labels);
+	const pathRow = (path: unknown, branch?: unknown) => {
+		const value = readLeafText(path);
+		if (!value) return;
+		const name = readLeafText(branch)?.replace(/^refs\/heads\//, "");
+		rows.push({ text: name ? `${name} · ${value}` : value, mono: true });
+	};
+	let handled = false;
+	if (toolName === "Worktree") {
+		if (readLeafText(args?.action) === "list") {
+			const list = workspaceObject(metadata?.workspaceWorktrees) ?? result;
+			if (Array.isArray(list?.entries)) {
+				rows.push({ text: text("workspaceList") });
+				for (const entry of list.entries) {
+					const item = workspaceObject(entry);
+					pathRow(
+						item?.path,
+						item?.branch ?? (item?.detached ? text("workspaceDetached") : undefined),
+					);
+				}
+				if (!list.entries.length) rows.push({ text: text("workspaceEmpty") });
+				if (list.truncated === true) rows.push({ text: text("workspaceTruncated") });
+				handled = true;
+			} else rows.push({ text: text("workspaceList") });
+		} else {
+			const worktree = workspaceObject(result?.worktree);
+			const outcome = readLeafText(result?.outcome);
+			rows.push({
+				text:
+					outcome === "created"
+						? text("workspaceCreated")
+						: outcome === "failed"
+							? text("workspaceFailed")
+							: outcome === "unknown"
+								? text("workspaceUnknown")
+								: text("workspaceCreate"),
+			});
+			pathRow(
+				worktree?.path ?? args?.destinationPath,
+				worktree?.branch ?? workspaceObject(args?.branch)?.name,
+			);
+			handled = ["created", "failed", "unknown"].includes(outcome ?? "");
+		}
+	} else if (toolName === "SwitchWorkingDirectory") {
+		const previous = workspaceObject(result?.previous);
+		const current = workspaceObject(result?.current);
+		const target = current ?? workspaceObject(args?.target);
+		rows.push({
+			text:
+				result?.changed === true
+					? text("workspaceChanged")
+					: result?.changed === false
+						? text("workspaceUnchanged")
+						: text("workspaceSwitch"),
+		});
+		const from = readLeafText(previous?.cwd);
+		const to = readLeafText(target?.cwd);
+		if (to) rows.push({ text: from && from !== to ? `${from} → ${to}` : to, mono: true });
+		const device = readLeafText(target?.deviceId);
+		if (device && device !== "local") rows.push({ text: device, mono: true });
+		handled = typeof result?.changed === "boolean";
+	} else {
+		rows.push({ text: workspaceSummary(toolName, input, labels) });
+	}
+	const error = workspaceObject(result?.error);
+	const message = readLeafText(error?.message) ?? readLeafText(result?.error);
+	if (message) {
+		rows.push({ text: message, dimmed: false });
+		handled = true;
+	}
+	return sections([
+		section("meta.workspace", undefined, metaRows(rows)),
+		...(!handled ? [textSection("output.main", output, "output")] : []),
+	]);
 }

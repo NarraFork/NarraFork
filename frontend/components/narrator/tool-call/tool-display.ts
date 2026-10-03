@@ -5,6 +5,7 @@ import {
 	formatCommunicationState,
 	resolveCommunicationTargets,
 } from "@shared/pretext-layout/communication-state";
+import { workspaceSummary } from "@shared/pretext-layout/workspace-tool-display";
 
 /** Only a live foreground Bash command can be detached; never stop/Agent/Send calls. */
 export function isRunningForegroundBash(
@@ -53,6 +54,7 @@ export type ToolCategory =
 	| "knowledge"
 	| "schedule"
 	| "contextAsk"
+	| "workspace"
 	| "generic";
 
 const READ_TOOLS = new Set(["Read"]);
@@ -165,6 +167,7 @@ export function getCategory(name: string, input?: unknown): ToolCategory {
 	if (BROWSER_TOOLS.has(name)) return "browser";
 	if (KNOWLEDGE_TOOLS.has(name)) return "knowledge";
 	if (CONTEXT_ASK_TOOLS.has(name)) return "contextAsk";
+	if (["Worktree", "SwitchWorkingDirectory", "SwitchDevice"].includes(name)) return "workspace";
 	return "generic";
 }
 
@@ -482,6 +485,8 @@ export function getSummary(
 	}
 	const cat = getCategory(toolName, input);
 	switch (cat) {
+		case "workspace":
+			return short(workspaceSummary(toolName, input, labels), 80);
 		case "read": {
 			const fp = getFilePath(input);
 			if (!fp) return "";
