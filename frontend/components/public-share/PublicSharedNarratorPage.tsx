@@ -1,6 +1,5 @@
 import {
 	Alert,
-	Badge,
 	Button,
 	Group,
 	Loader,
@@ -234,6 +233,25 @@ function SessionPane({
 				client.messageLocation(messageId, signal ?? new AbortController().signal),
 			fetchToolDetail: (_id, toolUseId, ref, signal) =>
 				client.toolCallDetail(toolUseId, ref, signal),
+			fetchTextDocumentRange: client.readTextDocumentRange,
+			ensureWriteDocumentSource: (_id, toolUseId, pin, signal) => {
+				if (
+					!pin?.toolCallId ||
+					!pin.messageId ||
+					!Number.isSafeInteger(pin.executionAttempt) ||
+					(pin.executionAttempt as number) < 0
+				)
+					return Promise.reject(new Error("Exact Write reference required"));
+				return client.ensureWriteDocumentSource(
+					toolUseId,
+					{
+						toolCallId: pin.toolCallId,
+						messageId: pin.messageId,
+						executionAttempt: pin.executionAttempt as number,
+					},
+					signal,
+				);
+			},
 		}),
 		[client],
 	);

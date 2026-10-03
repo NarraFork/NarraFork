@@ -1,6 +1,12 @@
+import { letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import type { CSSProperties } from "react";
-import { ContentBody } from "../content/ContentBody";
+import { ContentBody, contentLanguage } from "../content/ContentBody";
+import { DocumentCodeBody } from "../content/DocumentCodeBody";
+import { DocumentSourceStatus } from "../content/DocumentSourceStatus";
+import { queueDocumentFind } from "../content/document-find-intent";
 import { AutoFollowScroll, type ContentViewportLayout } from "../scroll/AutoFollowScroll";
+import { detailBodyFont, detailContentLineHeight } from "./measure/measure-tool-call";
+import { typographyMetrics } from "./pretext-fonts";
 import type { VListViewTarget } from "./vlist-content-view-target";
 
 /** Fullscreen paint budget. Copy retains the original available payload. */
@@ -39,7 +45,22 @@ export function VListViewBody({
 	return (
 		<AutoFollowScroll
 			bodyId={target.id}
-			layout={target.kind === "diff" ? layout : undefined}
+			onKeyDown={(event) => {
+				if (
+					!model?.textDocumentSource ||
+					!(event.ctrlKey || event.metaKey) ||
+					event.altKey ||
+					event.shiftKey ||
+					event.key.toLowerCase() !== "f" ||
+					(event.target instanceof Element &&
+						event.target.closest("input,textarea,[contenteditable=true]"))
+				)
+					return;
+				event.preventDefault();
+				event.stopPropagation();
+				queueDocumentFind(model.textDocumentSource);
+			}}
+			layout={target.kind === "diff" || target.textDocument ? layout : undefined}
 			live={model?.live}
 			revision={model?.revision}
 			followTarget={target.kind === "diff" ? "row" : "end"}
@@ -47,17 +68,34 @@ export function VListViewBody({
 			viewportStyle={{ height: "100%", overflowX: wordWrap ? "hidden" : "auto" }}
 			contentStyle={style}
 		>
-			<ContentBody
-				format={target.kind === "term" ? "text" : target.kind}
-				text={text}
-				diffDocument={model?.diffDocument}
-				wordWrap={wordWrap}
-				showSource={showSource}
-				language={model?.codeLang ?? target.codeLang}
-				codeLangPath={model?.codeLangPath ?? target.codeLangPath}
-				fileReferenceContext={target.fileReferenceContext ?? null}
-				style={style}
-			/>
+			{model?.textDocumentSource ? <DocumentSourceStatus failed={model.textDocumentError} /> : null}
+			{target.textDocument ? (
+				<DocumentCodeBody
+					document={target.textDocument}
+					pane="modal"
+					language={contentLanguage(
+						model?.codeLang ?? target.codeLang,
+						model?.codeLangPath ?? target.codeLangPath,
+					)}
+					wordWrap={wordWrap}
+					font={detailBodyFont()}
+					fontRevision={typographyMetrics().revision}
+					lineHeight={detailContentLineHeight()}
+					letterSpacing={letterSpacingForFont(detailBodyFont())}
+				/>
+			) : (
+				<ContentBody
+					format={target.kind === "term" ? "text" : target.kind}
+					text={text}
+					diffDocument={model?.diffDocument}
+					wordWrap={wordWrap}
+					showSource={showSource}
+					language={model?.codeLang ?? target.codeLang}
+					codeLangPath={model?.codeLangPath ?? target.codeLangPath}
+					fileReferenceContext={target.fileReferenceContext ?? null}
+					style={style}
+				/>
+			)}
 		</AutoFollowScroll>
 	);
 }

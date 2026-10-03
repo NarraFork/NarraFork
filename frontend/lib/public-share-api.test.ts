@@ -90,6 +90,90 @@ describe("public share cancellation links", () => {
 	});
 });
 
+describe("public complete input source reader", () => {
+	test("historical ensure remains Share-only and preserves exact row identity", async () => {
+		noStorage();
+		const calls: Array<{ url: string; init: RequestInit }> = [];
+		const ref = {
+			id: "regenerated",
+			epoch: "new-epoch",
+			revision: 1,
+			length: 50000,
+			complete: true,
+			originKnown: true,
+		};
+		replaceGlobal("fetch", async (url: string, init: RequestInit) => {
+			calls.push({ url, init });
+			return Response.json(ref);
+		});
+		const client = createPublicShareClient("share-id", credential);
+		expect(
+			await client.ensureWriteDocumentSource("provider:call", {
+				toolCallId: "row",
+				messageId: "message",
+				executionAttempt: 2,
+			}),
+		).toEqual(ref);
+		expect(calls[0].url).toBe(
+			"/api/public/narrator-shares/share-id/tool-calls/provider%3Acall/input-document?toolCallId=row&messageId=message&executionAttempt=2",
+		);
+		expect(new Headers(calls[0].init.headers).get("Authorization")).toBe(`Share ${credential}`);
+		await expect(
+			client.ensureWriteDocumentSource("provider:call", {
+				toolCallId: "row",
+				messageId: "message",
+				executionAttempt: -1,
+			}),
+		).rejects.toMatchObject({ status: 400 });
+		expect(calls).toHaveLength(1);
+	});
+	test("range reads use Share credentials and clamp page chars without JWT/storage access", async () => {
+		noStorage();
+		const calls: Array<{ url: string; init: RequestInit }> = [];
+		replaceGlobal("fetch", async (url: string, init: RequestInit) => {
+			calls.push({ url, init });
+			return Response.json({
+				ref: {
+					id: "source-id",
+					epoch: "epoch",
+					revision: 1,
+					length: 9,
+					complete: true,
+					originKnown: true,
+				},
+				offset: 3,
+				text: "\ud800\r\n",
+			});
+		});
+		const client = createPublicShareClient("share-id", credential);
+		const range = await client.getTextDocumentRange("source-id", 3, 99999);
+		expect(range.text).toBe("\ud800\r\n");
+		expect(calls[0].url).toBe(
+			"/api/public/narrator-shares/share-id/text-documents/source-id?offset=3&limit=8192",
+		);
+		expect(new Headers(calls[0].init.headers).get("Authorization")).toBe(`Share ${credential}`);
+		const ref = {
+			...range.ref,
+			source: { narratorId: "other-not-used", toolUseId: "tool", field: "content" },
+		};
+		await client.readTextDocumentRange(ref, 3, 5);
+		expect(calls[1].url).not.toContain("other-not-used");
+	});
+
+	test("range responses are byte-bounded to 64KiB and unavailable shares never fall back to JWT", async () => {
+		noStorage();
+		const client = createPublicShareClient("share-id", credential);
+		replaceGlobal("fetch", async () => new Response(`{"text":"${"a".repeat(65536)}"}`));
+		await expect(client.getTextDocumentRange("source-id", 0, 8192)).rejects.toMatchObject({
+			status: 502,
+		});
+		replaceGlobal("fetch", async () => Response.json({ error: "revoked" }, { status: 404 }));
+		await expect(client.getTextDocumentRange("source-id", 0, 8192)).rejects.toMatchObject({
+			status: 404,
+		});
+	});
+});
+
 describe("anonymous public share fetch boundary", () => {
 	test("all operations use only the share API and Share authorization, without cookies or storage", async () => {
 		noStorage();

@@ -31,6 +31,7 @@ import {
 	mergeSendDeliveryTargets,
 	type SendDeliveryReceipt,
 } from "@shared/communication-tool";
+import { isTextDocumentRef } from "@shared/pretext-layout/tool-detail";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import {
 	isLiveToolStatusRegression,
@@ -46,6 +47,44 @@ import {
 
 /** Live per-tool state for the streaming row, keyed by toolUseId in arrival order. */
 export type StreamingToolStore = Map<string, TopLevelStreamingChunk>;
+
+const retiredDocuments = new WeakMap<StreamingToolStore, Set<string>>();
+const documentIdentity = (ref: import("@shared/pretext-layout/text-document").TextDocumentRef) =>
+	JSON.stringify([ref.id, ref.epoch]);
+
+/** Late frames from an older execution attempt cannot resurrect its card. */
+export function isRetiredStreamingDocument(
+	store: StreamingToolStore,
+	toolUseId: string,
+	ref: import("@shared/pretext-layout/text-document").TextDocumentRef,
+): boolean {
+	if (retiredDocuments.get(store)?.has(documentIdentity(ref))) return true;
+	const current = store.get(toolUseId)?.textDocument;
+	return (
+		!!current &&
+		documentIdentity(current) !== documentIdentity(ref) &&
+		current.source?.executionAttempt !== undefined &&
+		ref.source?.executionAttempt !== undefined &&
+		ref.source.executionAttempt < current.source.executionAttempt
+	);
+}
+
+function switchStreamingDocument(
+	store: StreamingToolStore,
+	toolUseId: string,
+	ref: import("@shared/pretext-layout/text-document").TextDocumentRef,
+): TopLevelStreamingChunk | undefined {
+	const current = store.get(toolUseId);
+	if (!current?.textDocument || documentIdentity(current.textDocument) === documentIdentity(ref))
+		return current;
+	let retired = retiredDocuments.get(store);
+	if (!retired) {
+		retired = new Set();
+		retiredDocuments.set(store, retired);
+	}
+	retired.add(documentIdentity(current.textDocument));
+	return undefined;
+}
 
 /**
  * Placeholder for an entry created by an event that carries no tool name.
@@ -143,6 +182,7 @@ export interface ToolChunkEvent {
 	metadata?: Record<string, unknown>;
 	/** One delta of a field being streamed (accumulated across frames). */
 	streamingField?: { name: string; delta: string; startsField?: boolean };
+	inputDocument?: import("@shared/pretext-layout/text-document").TextDocumentStreamUpdate;
 }
 
 /**
@@ -153,7 +193,14 @@ export interface ToolChunkEvent {
  */
 export function applyStreamingToolChunk(store: StreamingToolStore, event: ToolChunkEvent): boolean {
 	if (!event.toolUseId) return false;
-	const existing = store.get(event.toolUseId);
+	if (
+		event.inputDocument &&
+		isRetiredStreamingDocument(store, event.toolUseId, event.inputDocument.ref)
+	)
+		return false;
+	const existing = event.inputDocument
+		? switchStreamingDocument(store, event.toolUseId, event.inputDocument.ref)
+		: store.get(event.toolUseId);
 	// A promoted tool (started/completed) owns its state through the lifecycle
 	// events below; a late argument chunk must not demote it back to "streaming".
 	if (existing?._started) return false;
@@ -165,6 +212,7 @@ export function applyStreamingToolChunk(store: StreamingToolStore, event: ToolCh
 		toolUseId: event.toolUseId,
 		toolName: event.toolName,
 		inputCharsTotal: event.inputCharsTotal,
+		...(event.inputDocument ? { textDocument: event.inputDocument.ref } : {}),
 		...(event.extractedFilePath !== undefined
 			? { extractedFilePath: event.extractedFilePath }
 			: {}),
@@ -228,7 +276,13 @@ export function applyStreamingToolStarted(
 	event: ToolStartedEvent,
 ): boolean {
 	if (!event.toolUseId) return false;
-	const existing = store.get(event.toolUseId);
+	const document = isTextDocumentRef(event.input?.textDocument)
+		? event.input.textDocument
+		: undefined;
+	if (document && isRetiredStreamingDocument(store, event.toolUseId, document)) return false;
+	const existing = document
+		? switchStreamingDocument(store, event.toolUseId, document)
+		: store.get(event.toolUseId);
 	store.set(event.toolUseId, {
 		inputCharsTotal: existing?.inputCharsTotal ?? 0,
 		...existing,
@@ -243,6 +297,12 @@ export function applyStreamingToolStarted(
 		...(event.input
 			? {
 					_input: event.input,
+					...(document
+						? {
+								textDocument: event.input
+									.textDocument as import("@shared/pretext-layout/text-document").TextDocumentRef,
+							}
+						: {}),
 					streamingFieldRanges: completeStreamingFieldRanges(existing, event.input),
 				}
 			: {}),
@@ -397,6 +457,12 @@ export function applyStreamingToolCompleted(
 		...(event.updatedInput
 			? {
 					_input: event.updatedInput,
+					...(isTextDocumentRef(event.updatedInput.textDocument)
+						? {
+								textDocument: event.updatedInput
+									.textDocument as import("@shared/pretext-layout/text-document").TextDocumentRef,
+							}
+						: {}),
 					streamingFieldRanges: completeStreamingFieldRanges(existing, event.updatedInput),
 				}
 			: {}),
@@ -438,15 +504,93 @@ export function dropDiscardedStreamingTools(
 export function dropPersistedStreamingTools(
 	store: StreamingToolStore,
 	persistedToolUseIds: ReadonlySet<string>,
+	matchesDocument?: (chunk: TopLevelStreamingChunk) => boolean,
 ): boolean {
 	if (store.size === 0 || persistedToolUseIds.size === 0) return false;
 	let changed = false;
 	for (const toolUseId of [...store.keys()]) {
 		if (!persistedToolUseIds.has(toolUseId)) continue;
+		const chunk = store.get(toolUseId);
+		if (chunk?.textDocument && matchesDocument && !matchesDocument(chunk)) continue;
 		store.delete(toolUseId);
 		changed = true;
 	}
 	return changed;
+}
+
+export interface PersistedDocumentPin {
+	narratorId?: string;
+	toolCallId?: string;
+	messageId?: string;
+	executionAttempt?: number;
+}
+
+/** Bounded identity index; never touches input/output text or serializes tool payloads. */
+export function collectPersistedDocumentPins(
+	messages: readonly unknown[],
+): ReadonlyMap<string, readonly PersistedDocumentPin[]> {
+	const pins = new Map<string, PersistedDocumentPin[]>();
+	const visit = (list: readonly unknown[]) => {
+		for (const entry of list) {
+			if (!entry || typeof entry !== "object") continue;
+			const message = entry as {
+				id?: string;
+				narratorId?: string;
+				toolCalls?: unknown[];
+				contentJson?: unknown[];
+				children?: unknown[];
+			};
+			for (const [records, blocks] of [
+				[message.toolCalls, false],
+				[message.contentJson, true],
+			] as const) {
+				for (const raw of records ?? []) {
+					if (!raw || typeof raw !== "object") continue;
+					const call = raw as {
+						id?: string;
+						tcId?: string;
+						toolUseId?: string;
+						type?: string;
+						executionAttempt?: number;
+					};
+					if (blocks && call.type !== "tool_use") continue;
+					const id = blocks ? call.id : call.toolUseId;
+					if (!id) continue;
+					const values = pins.get(id) ?? [];
+					values.push({
+						narratorId: message.narratorId,
+						messageId: message.id,
+						toolCallId: blocks ? call.tcId : call.id,
+						executionAttempt: call.executionAttempt,
+					});
+					pins.set(id, values);
+				}
+			}
+			if (message.children) visit(message.children);
+		}
+	};
+	visit(messages);
+	return pins;
+}
+
+export function isTextDocumentPersisted(
+	ref: import("@shared/pretext-layout/text-document").TextDocumentRef,
+	pins: ReadonlyMap<string, readonly PersistedDocumentPin[]>,
+): boolean {
+	const source = ref.source;
+	if (!source) return false;
+	return (pins.get(source.toolUseId) ?? []).some((pin) => {
+		if (pin.narratorId && pin.narratorId !== source.narratorId) return false;
+		if (source.toolCallId) return pin.toolCallId === source.toolCallId;
+		if (source.messageId)
+			return (
+				pin.messageId === source.messageId &&
+				(source.executionAttempt === undefined || pin.executionAttempt === source.executionAttempt)
+			);
+		return (
+			source.executionAttempt !== undefined && pin.executionAttempt === source.executionAttempt
+		);
+	});
 }
 
 /** Live chunks in arrival order, for the synthetic message builder. */

@@ -49,6 +49,7 @@ import {
 } from "./provider-model-metadata";
 import { BoundedUtf8Capture, captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
+import { finalToolInput, ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import { resolveToolJsonSchema } from "./tool-registry";
 import {
 	type AgentToolUse,
@@ -1844,16 +1845,6 @@ interface OAIToolResult {
 
 // === Helpers ===
 
-/** Try to parse a string as JSON. Returns true if valid. */
-function isParsableJson(s: string): boolean {
-	try {
-		JSON.parse(s);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
 /**
  * Tag a reasoning event that carries OpenAI-shaped metadata (item id +
  * encrypted_content) with the upstream identity that minted it, so later
@@ -2060,6 +2051,8 @@ export interface ResponsesAPIChunk {
 	/** Present on delta/done events to identify the item */
 	item_id?: string;
 	delta?: string;
+	/** Authoritative full function arguments on arguments.done. */
+	arguments?: string;
 	/** Present on *.done events that carry the full accumulated text. */
 	text?: string;
 	output_index?: number;
@@ -2139,7 +2132,8 @@ export interface ResponsesToolAccum {
 	outputIndex?: number;
 	callId: string;
 	name: string;
-	args: string;
+	args?: string;
+	inputStream?: ToolInputStream;
 	emitted: boolean;
 }
 
@@ -2799,10 +2793,21 @@ export function parseResponsesAPIEvent(
 					toolName: name,
 				});
 			}
-			toolAccum.set(idx, { callId, name, args: "", emitted: false, outputIndex: idx });
+			const inputStream = new ToolInputStream();
+			const initialInput =
+				typeof chunk.item.arguments === "string" ? chunk.item.arguments : undefined;
+			if (initialInput) inputStream.feed(initialInput);
+			const initialComplete = inputStream.hasCompleteInput();
+			toolAccum.set(idx, { callId, name, inputStream, emitted: initialComplete, outputIndex: idx });
 			logger.debug("Responses API tool call started", { outputIndex: idx, callId, toolName: name });
 			results.push({
-				toolUseChunk: { toolUseId: callId, name, input: undefined, stop: false, outputIndex: idx },
+				toolUseChunk: {
+					toolUseId: callId,
+					name,
+					input: initialInput,
+					stop: initialComplete,
+					outputIndex: idx,
+				},
 				_responsesApi: true,
 			});
 			return results;
@@ -2816,7 +2821,7 @@ export function parseResponsesAPIEvent(
 		const idx = chunk.output_index;
 		const acc = idx != null ? toolAccum.get(idx) : undefined;
 		if (acc && !acc.emitted) {
-			acc.args += chunk.delta;
+			toolInputStreamFor(acc).feed(chunk.delta);
 			results.push({
 				toolUseChunk: {
 					toolUseId: acc.callId,
@@ -2827,7 +2832,7 @@ export function parseResponsesAPIEvent(
 				},
 			});
 			// Early completion if args form valid JSON
-			if (isParsableJson(acc.args)) {
+			if (toolInputStreamFor(acc).hasCompleteInput()) {
 				results.push({
 					toolUseChunk: {
 						toolUseId: acc.callId,
@@ -2848,15 +2853,14 @@ export function parseResponsesAPIEvent(
 		const idx = chunk.output_index;
 		const acc = idx != null ? toolAccum.get(idx) : undefined;
 		if (acc && !acc.emitted) {
-			if (typeof chunk.item?.arguments === "string") {
-				acc.args = chunk.item.arguments;
-			}
+			const snapshot = finalToolInput(acc, chunk.arguments ?? chunk.item?.arguments);
 			acc.emitted = true;
 			results.push({
 				toolUseChunk: {
 					toolUseId: acc.callId,
 					name: acc.name,
 					stop: true,
+					...snapshot,
 					outputIndex: acc.outputIndex,
 				},
 			});
@@ -2868,17 +2872,27 @@ export function parseResponsesAPIEvent(
 	// { type, output_index, item: { type: "function_call", id, call_id, name, arguments, status: "completed" } }
 	if (type === "response.output_item.done" && chunk.item?.type === "function_call") {
 		const idx = chunk.output_index;
-		const acc = idx != null ? toolAccum.get(idx) : undefined;
+		let acc = idx != null ? toolAccum.get(idx) : undefined;
+		// Some relays publish only the completed item / response.output snapshot.
+		if (!acc && idx != null && chunk.item.call_id && chunk.item.name) {
+			acc = {
+				callId: chunk.item.call_id,
+				name: chunk.item.name,
+				inputStream: new ToolInputStream(),
+				emitted: false,
+				outputIndex: idx,
+			};
+			toolAccum.set(idx, acc);
+		}
 		if (acc && !acc.emitted) {
-			if (typeof chunk.item.arguments === "string") {
-				acc.args = chunk.item.arguments;
-			}
+			const snapshot = finalToolInput(acc, chunk.item.arguments);
 			acc.emitted = true;
 			results.push({
 				toolUseChunk: {
 					toolUseId: acc.callId,
 					name: acc.name,
 					stop: true,
+					...snapshot,
 					outputIndex: acc.outputIndex,
 				},
 			});
@@ -2941,13 +2955,14 @@ export function parseResponsesAPIEvent(
 /**
  * Tool call accumulator entry.
  * `emitted` tracks whether a toolUseChunk with stop=true has already been
- * yielded for this tool call (via the isParsableJson early-emit path).
+ * yielded for this tool call (via the incremental scanner early-emit path).
  */
 interface ToolAccumEntry {
 	outputIndex?: number;
 	id: string;
 	name: string;
-	args: string;
+	args?: string;
+	inputStream?: ToolInputStream;
 	emitted: boolean;
 }
 
@@ -3018,15 +3033,14 @@ function flushToolAccum(toolAccum: Map<number, ToolAccumEntry>): ParsedStreamEve
 			logger.error("OpenAI tool call missing ID from stream", { toolName: acc.name });
 			continue;
 		}
-		let input: Record<string, unknown> = {};
-		try {
-			input = JSON.parse(acc.args);
-		} catch {
+		const inputStream = toolInputStreamFor(acc);
+		// EOF without a native completion is not equivalent to an explicit empty call.
+		const input = inputStream.totalChars === 0 ? { _raw: "" } : inputStream.finish();
+		if (input != null && typeof input === "object" && "_raw" in input) {
 			logger.warn("Failed to parse OpenAI tool arguments", {
 				toolName: acc.name,
-				argsLength: acc.args.length,
+				argsLength: inputStream.totalChars,
 			});
-			input = { _raw: acc.args };
 		}
 		toolUses.push({
 			toolUseId: acc.id,
@@ -3149,7 +3163,7 @@ function parseSSELine(
 					toolUseChunk: {
 						toolUseId: id,
 						name,
-						input: undefined,
+						input: chunk.item.arguments,
 						stop: false,
 						outputIndex: chunk.output_index,
 					},
@@ -3166,7 +3180,7 @@ function parseSSELine(
 		// Find the active (non-emitted) tool call accumulator
 		const acc = findActiveResponsesAcc(toolAccum);
 		if (acc && !acc.emitted) {
-			acc.args += chunk.delta;
+			toolInputStreamFor(acc).feed(chunk.delta);
 			const results: ParsedStreamEvent[] = [
 				{
 					toolUseChunk: {
@@ -3178,7 +3192,7 @@ function parseSSELine(
 					},
 				},
 			];
-			if (isParsableJson(acc.args)) {
+			if (toolInputStreamFor(acc).hasCompleteInput()) {
 				results.push({
 					toolUseChunk: {
 						toolUseId: acc.id,
@@ -3196,27 +3210,21 @@ function parseSSELine(
 
 	// ── Responses API: function call completed ──
 	if (chunk.item?.call_id && chunk.item?.status === "completed") {
-		const acc = findAccByCallId(toolAccum, chunk.item.call_id);
-		if (acc && !acc.emitted) {
-			acc.emitted = true;
-			return [
-				{
-					toolUseChunk: {
-						toolUseId: acc.id,
-						name: acc.name,
-						stop: true,
-						outputIndex: acc.outputIndex,
-					},
-				},
-			];
-		}
-		return [];
+		const completed = completeCompatibleTool(chunk.item, chunk.output_index, toolAccum);
+		return completed ? [completed] : [];
 	}
 
 	// ── Responses API: response completed ──
 	if (chunk.response?.status === "completed") {
 		// Flush any remaining un-emitted tool calls
 		const results: ParsedStreamEvent[] = [];
+		if (Array.isArray(chunk.response.output)) {
+			for (const [index, item] of chunk.response.output.entries()) {
+				if (!item || typeof item !== "object") continue;
+				const completed = completeCompatibleTool(item, index, toolAccum);
+				if (completed) results.push(completed);
+			}
+		}
 		for (const [, acc] of toolAccum) {
 			if (!acc.emitted) {
 				results.push({
@@ -3263,7 +3271,7 @@ function parseSSELine(
 			if (tc.id && !toolAccum.has(idx)) {
 				const id = tc.id;
 				const name = tc.function?.name ?? "";
-				toolAccum.set(idx, { id, name, args: "", emitted: false });
+				toolAccum.set(idx, { id, name, inputStream: new ToolInputStream(), emitted: false });
 				logger.debug("OpenAI tool call started", { toolCallId: id, toolName: name, index: idx });
 				// Emit initial chunk so the loop knows the tool name early
 				results.push({
@@ -3280,7 +3288,7 @@ function parseSSELine(
 			const acc = toolAccum.get(idx);
 			if (acc && !acc.emitted) {
 				if (tc.function?.arguments) {
-					acc.args += tc.function.arguments;
+					toolInputStreamFor(acc).feed(tc.function.arguments);
 					// Emit argument delta (include name for consumer convenience)
 					results.push({
 						toolUseChunk: {
@@ -3294,7 +3302,7 @@ function parseSSELine(
 					// Early completion: if accumulated args form valid JSON, emit stop
 					// immediately so the agent loop can start executing the tool while
 					// the rest of the stream (other tool calls / text) is still arriving.
-					if (isParsableJson(acc.args)) {
+					if (toolInputStreamFor(acc).hasCompleteInput()) {
 						results.push({
 							toolUseChunk: {
 								toolUseId: acc.id,
@@ -3396,6 +3404,38 @@ function parseSSELine(
 }
 
 // ── Responses API helpers ──
+
+/** Final-only compatibility envelopes still carry full arguments and establish Responses mode. */
+function completeCompatibleTool(
+	item: NonNullable<OAIStreamChunk["item"]>,
+	outputIndex: number | undefined,
+	toolAccum: Map<number, ToolAccumEntry>,
+): ParsedStreamEvent | undefined {
+	if (!item.call_id) return undefined;
+	let acc = findAccByCallId(toolAccum, item.call_id);
+	if (!acc && item.name) {
+		acc = {
+			id: item.call_id,
+			name: item.name,
+			inputStream: new ToolInputStream(),
+			emitted: false,
+			outputIndex,
+		};
+		toolAccum.set(responsesApiSlot(acc.id, toolAccum), acc);
+	}
+	if (!acc || acc.emitted) return undefined;
+	acc.emitted = true;
+	return {
+		toolUseChunk: {
+			toolUseId: acc.id,
+			name: acc.name,
+			stop: true,
+			...finalToolInput(acc, item.arguments),
+			outputIndex: acc.outputIndex,
+		},
+		_responsesApi: true,
+	};
+}
 
 /** Allocate a stable numeric slot for a Responses API call_id. */
 function responsesApiSlot(callId: string, toolAccum: Map<number, ToolAccumEntry>): number {

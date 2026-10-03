@@ -1799,7 +1799,9 @@ export function measureToolBody(
 						media.contentPx,
 						detail.text,
 						innerWidth,
-						detail.textTruncated,
+						detail.textTruncated ||
+							(detail.textDocument !== undefined &&
+								detail.textDocument.length > (detail.text?.length ?? 0)),
 					);
 			const block = makeFixed(capped, "detail-body", 0, {
 				cap,

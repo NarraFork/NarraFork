@@ -206,9 +206,12 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		narratorWSManager.unsubscribe = (() => {}) as typeof narratorWSManager.unsubscribe;
 		narratorWSManager.joinPresence = (() => {}) as typeof narratorWSManager.joinPresence;
 		narratorWSManager.leavePresence = (() => {}) as typeof narratorWSManager.leavePresence;
-		narratorWSManager.addListener = (() => ({
-			_id: nextHandleId++,
-		})) as typeof narratorWSManager.addListener;
+		const sourceListeners: Array<(data: Record<string, unknown>) => void> = [];
+		const sourceUpdates: unknown[] = [];
+		narratorWSManager.addListener = ((_opts, listener) => {
+			sourceListeners.push(listener);
+			return { _id: nextHandleId++ };
+		}) as typeof narratorWSManager.addListener;
 		narratorWSManager.removeListener = (() => {}) as typeof narratorWSManager.removeListener;
 		narratorWSManager.onConnectionChange = (() =>
 			() => {}) as typeof narratorWSManager.onConnectionChange;
@@ -225,7 +228,12 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		function Harness(): ReactNode {
 			useNarratorWS(
 				props.narratorId,
-				{},
+				{
+					onToolUseChunk: (...args) => sourceUpdates.push(args[10]),
+					onToolStarted: (...args) => sourceUpdates.push(args[7]),
+					onStreamingSnapshot: (snapshot) =>
+						sourceUpdates.push(snapshot.toolChunks[0]?.inputDocument),
+				},
 				props.cursor || props.messageVersion != null
 					? { cursor: props.cursor, messageVersion: props.messageVersion }
 					: undefined,
@@ -246,6 +254,44 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		try {
 			root.render(createElement(Harness));
 			await settle();
+			const inputDocument = {
+				ref: {
+					id: "source",
+					epoch: "epoch",
+					revision: 2,
+					length: 7,
+					complete: true,
+					originKnown: true,
+				},
+				offset: 3,
+			};
+			for (const frame of [
+				{
+					type: "tool_use_chunk",
+					narratorId: "n1",
+					toolUseId: "tool",
+					toolName: "Write",
+					inputCharsTotal: 100,
+					streamingField: { name: "content", delta: "tail", offset: 3, complete: true },
+					inputDocument,
+				},
+				{
+					type: "tool_started",
+					narratorId: "n1",
+					toolUseId: "tool",
+					toolName: "Write",
+					inputDocument,
+				},
+				{
+					type: "streaming_snapshot",
+					narratorId: "n1",
+					toolChunks: [
+						{ toolUseId: "tool", toolName: "Write", inputCharsTotal: 100, inputDocument },
+					],
+				},
+			])
+				for (const listener of sourceListeners) listener(frame);
+			expect(sourceUpdates).toEqual([inputDocument, inputDocument, inputDocument]);
 			props = { narratorId: "n2" };
 			root.render(createElement(Harness));
 			await settle();

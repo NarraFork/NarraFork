@@ -24,6 +24,70 @@ describe("narrators API", () => {
 		}
 	});
 
+	test("historical ensure sends exact row/message/attempt without asking for full tool detail", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const calls: string[] = [];
+		const ref = {
+			id: "regenerated",
+			epoch: "fresh",
+			revision: 1,
+			length: 50000,
+			complete: true,
+			originKnown: true,
+		};
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: string) => {
+				calls.push(url);
+				return Response.json(ref);
+			},
+		});
+		expect(
+			await api.ensureWriteDocumentSource("reader", "provider:call", {
+				toolCallId: "exact-row",
+				messageId: "exact-message",
+				executionAttempt: 2,
+			}),
+		).toEqual(ref);
+		expect(calls).toEqual([
+			"/api/narrators/reader/tool-calls/provider%3Acall/input-document?toolCallId=exact-row&messageId=exact-message&executionAttempt=2",
+		]);
+	});
+
+	test("complete source reader routes by exact narrator/ref and bounds raw Unicode response bytes", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const calls: string[] = [];
+		const ref = {
+			id: "source-id",
+			epoch: "epoch",
+			revision: 1,
+			length: 8,
+			complete: true,
+			originKnown: true,
+			source: { narratorId: "child-id", toolUseId: "provider-id", field: "content" },
+		};
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: string) => {
+				calls.push(url);
+				return Response.json({ ref, offset: 2, text: "\ud800\r\n" });
+			},
+		});
+		expect((await api.readTextDocumentRange(ref, 2, 999999)).text).toBe("\ud800\r\n");
+		expect(calls).toEqual(["/api/narrators/child-id/text-documents/source-id?offset=2&limit=8192"]);
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async () => new Response(`{"text":"${"a".repeat(65536)}"}`),
+		});
+		await expect(api.readTextDocumentRange(ref, 0, 8192)).rejects.toThrow("packet limit");
+	});
+
 	test("bounded document reads enforce streamed bytes without relying on Content-Length", async () => {
 		Object.defineProperty(g, "localStorage", {
 			value: { getItem: () => null },

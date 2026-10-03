@@ -440,6 +440,11 @@ import { resumeSubagent, withSubagentResumeLock } from "../services/subagent-res
 import { TAKEN_OVER_SUBSTATUS } from "../services/subagent-takeover";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
 import { getToolEditPreview } from "../services/tool-edit-preview";
+import {
+	parseHistoricalWriteDocumentReference,
+	parseTextDocumentRangeQuery,
+	toolInputStreamSource,
+} from "../services/tool-input-stream-source";
 import { usageHistoryService } from "../services/usage-history-service";
 import { syncNarratorDraftToRecentTabs } from "../services/user-preferences-service";
 import {
@@ -3330,6 +3335,37 @@ narratorRoutes.get("/:id/tool-calls/:toolUseId/file-edit-preview", async (c) => 
 
 // Get full tool call detail (untruncated inputJson/outputJson). Provider IDs can
 // repeat, so callers may pin the actual tool row or containing message.
+narratorRoutes.get("/:id/tool-calls/:toolUseId/input-document", async (c) => {
+	const narratorId = c.req.param("id");
+	await requireNarratorAccess(c, narratorId, "read");
+	const reference = parseHistoricalWriteDocumentReference(c.req.query());
+	const ref = await toolInputStreamSource.ensureWriteDocumentSource(
+		narratorId,
+		c.req.param("toolUseId"),
+		reference,
+		c.req.raw.signal,
+	);
+	await requireNarratorAccess(c, narratorId, "read");
+	c.header("Cache-Control", "no-store");
+	return c.json(ref);
+});
+
+narratorRoutes.get("/:id/text-documents/:refId", async (c) => {
+	const narratorId = c.req.param("id");
+	const { offset, limit } = parseTextDocumentRangeQuery(c.req.query());
+	const range = await toolInputStreamSource.getTextDocumentRange(
+		narratorId,
+		c.req.param("refId"),
+		offset,
+		limit,
+		c.req.raw.signal,
+	);
+	// The existing /:id/* gate applies first; re-check ACL after async disk reads.
+	await requireNarratorAccess(c, narratorId, "read");
+	c.header("Cache-Control", "no-store");
+	return c.json(range);
+});
+
 narratorRoutes.get("/:id/tool-calls/:toolUseId", async (c) => {
 	const id = c.req.param("id");
 	const toolUseId = c.req.param("toolUseId");

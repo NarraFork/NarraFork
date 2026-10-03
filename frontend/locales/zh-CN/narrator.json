@@ -1,5 +1,17 @@
 {
 	"you": "你",
+	"documentCodeBody": "完整源代码",
+	"documentFind": "搜索完整原文",
+	"documentFindPrevious": "上一项",
+	"documentFindNext": "下一项",
+	"documentFindClose": "关闭搜索",
+	"documentNotFound": "原文中暂未找到匹配项",
+	"documentSearchFailed": "搜索失败，请重试。",
+	"documentCopyFailed": "复制失败，请检查剪贴板权限后重试。",
+	"documentLoadFailed": "无法加载完整原文或语法高亮。",
+	"documentRetry": "重试",
+	"documentLoading": "正在加载完整原文…",
+	"documentHighlightPending": "正在更新语法高亮…",
 	"historyRecovery": {
 		"title": "历史过大，无法显示",
 		"description": "有消息包含过多工具调用或过大内容，历史聚合无法加载。删除超长消息（及其后所有消息）即可恢复访问。",

@@ -34,6 +34,7 @@ import {
 import type { CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
+import { DocumentCopyButton } from "../content/DocumentCopyButton";
 import { MESSAGE_SELECTION_IGNORE_ATTR } from "../message/MessageSelectionCtx";
 import { isMarkdownTarget } from "./vlist-content-view-body";
 import type { VListViewTarget } from "./vlist-content-view-target";
@@ -208,22 +209,43 @@ export function VListContentViewActions({
 						</ActionIcon>
 					</Tooltip>
 				) : null}
-				<CopyButton value={target.text}>
-					{({ copied, copy }) => (
-						<Tooltip label={copied ? t("copied") : t("copy")} withArrow position="top">
-							<ActionIcon
-								size={BUTTON_SIZE}
-								variant="filled"
-								color={copied ? "teal" : "gray"}
-								onClick={copy}
-								aria-label={copied ? t("copied") : t("copy")}
-								style={buttonStyle}
-							>
-								<IconCopy size={ICON_SIZE} />
-							</ActionIcon>
-						</Tooltip>
-					)}
-				</CopyButton>
+				{target.textDocument ? (
+					<DocumentCopyButton document={target.textDocument} />
+				) : target.model?.textDocumentSource ? (
+					<Tooltip
+						label={tNarrator(
+							target.model.textDocumentError ? "documentLoadFailed" : "documentLoading",
+						)}
+						withArrow
+						position="top"
+					>
+						<ActionIcon
+							size={BUTTON_SIZE}
+							disabled
+							aria-label={tNarrator("documentLoading")}
+							style={buttonStyle}
+						>
+							<IconCopy size={ICON_SIZE} />
+						</ActionIcon>
+					</Tooltip>
+				) : (
+					<CopyButton value={target.text}>
+						{({ copied, copy }) => (
+							<Tooltip label={copied ? t("copied") : t("copy")} withArrow position="top">
+								<ActionIcon
+									size={BUTTON_SIZE}
+									variant="filled"
+									color={copied ? "teal" : "gray"}
+									onClick={copy}
+									aria-label={copied ? t("copied") : t("copy")}
+									style={buttonStyle}
+								>
+									<IconCopy size={ICON_SIZE} />
+								</ActionIcon>
+							</Tooltip>
+						)}
+					</CopyButton>
+				)}
 				<Tooltip label={t("fullscreen")} withArrow position="top">
 					<ActionIcon
 						size={BUTTON_SIZE}

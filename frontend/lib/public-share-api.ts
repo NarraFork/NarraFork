@@ -1,8 +1,16 @@
+import {
+	TEXT_DOCUMENT_PACKET_BYTES,
+	TEXT_DOCUMENT_PAGE_CHARS,
+	type TextDocumentRange,
+	type TextDocumentRangeReader,
+	type TextDocumentRef,
+} from "@shared/pretext-layout/text-document";
 import type {
 	PublicDiscussionMessage,
 	PublicDiscussionPage,
 	PublicSharedSession,
 } from "@shared/public-narrator-share";
+import type { WriteDocumentSourceReference } from "./api/narrators";
 import type { PretextDocumentPageResult } from "./api/types";
 import { apiUrl, assetUrl } from "./base-path";
 
@@ -47,7 +55,7 @@ export function publicShareExternalHref(href: string | undefined, origin: string
 	}
 }
 
-async function readBoundedJson<T>(response: Response): Promise<T> {
+async function readBoundedJson<T>(response: Response, maxBytes = MAX_RESPONSE_BYTES): Promise<T> {
 	const reader = response.body?.getReader();
 	if (!reader) throw new PublicShareError(502);
 	let bytes = 0;
@@ -58,7 +66,7 @@ async function readBoundedJson<T>(response: Response): Promise<T> {
 			const { value, done } = await reader.read();
 			if (done) break;
 			bytes += value.byteLength;
-			if (bytes > MAX_RESPONSE_BYTES) throw new PublicShareError(502);
+			if (bytes > maxBytes) throw new PublicShareError(502);
 			text += decoder.decode(value, { stream: true });
 		}
 		return JSON.parse(text + decoder.decode()) as T;
@@ -103,6 +111,18 @@ export function linkPublicShareSignals(signals: readonly AbortSignal[]): {
  * uses. Realtime rides `/ws/narrator` in share-auth mode, not a bespoke SSE.
  */
 export interface PublicShareClient {
+	ensureWriteDocumentSource(
+		toolUseId: string,
+		reference: WriteDocumentSourceReference,
+		signal?: AbortSignal,
+	): Promise<TextDocumentRef>;
+	getTextDocumentRange(
+		refId: string,
+		offset: number,
+		limit: number,
+		signal?: AbortSignal,
+	): Promise<TextDocumentRange>;
+	readTextDocumentRange: TextDocumentRangeReader;
 	session(signal: AbortSignal): Promise<PublicSharedSession>;
 	pretextDocument(
 		signal: AbortSignal,
@@ -151,18 +171,77 @@ export function createPublicShareClient(shareId: string, credential: string): Pu
 		}
 		return response;
 	}
-	async function json<T>(suffix: string, signal: AbortSignal, body?: string): Promise<T> {
+	async function json<T>(
+		suffix: string,
+		signal: AbortSignal,
+		body?: string,
+		maxBytes = MAX_RESPONSE_BYTES,
+		timeoutMs = REQUEST_TIMEOUT_MS,
+	): Promise<T> {
 		const timeout = new AbortController();
-		const timer = setTimeout(() => timeout.abort(), REQUEST_TIMEOUT_MS);
+		const timer = setTimeout(() => timeout.abort(), timeoutMs);
 		const linked = linkPublicShareSignals([signal, timeout.signal]);
 		try {
-			return await readBoundedJson<T>(await fetchShare(suffix, linked.signal, body));
+			return await readBoundedJson<T>(await fetchShare(suffix, linked.signal, body), maxBytes);
 		} finally {
 			clearTimeout(timer);
 			linked.dispose();
 		}
 	}
+	const getTextDocumentRange: PublicShareClient["getTextDocumentRange"] = (
+		refId,
+		offset,
+		limit,
+		signal,
+	) => {
+		if (
+			!IDENTIFIER.test(refId) ||
+			!Number.isSafeInteger(offset) ||
+			offset < 0 ||
+			!Number.isSafeInteger(limit) ||
+			limit < 1
+		)
+			return Promise.reject(new PublicShareError(400));
+		const query = new URLSearchParams({
+			offset: String(offset),
+			limit: String(Math.min(limit, TEXT_DOCUMENT_PAGE_CHARS)),
+		});
+		return json<TextDocumentRange>(
+			`/text-documents/${encodeURIComponent(refId)}?${query}`,
+			signal ?? new AbortController().signal,
+			undefined,
+			TEXT_DOCUMENT_PACKET_BYTES,
+			10_000,
+		);
+	};
 	return {
+		ensureWriteDocumentSource: (toolUseId, reference, signal) => {
+			if (
+				!TOOL_IDENTIFIER.test(toolUseId) ||
+				toolUseId === "." ||
+				toolUseId === ".." ||
+				!IDENTIFIER.test(reference.toolCallId) ||
+				!IDENTIFIER.test(reference.messageId) ||
+				!Number.isSafeInteger(reference.executionAttempt) ||
+				reference.executionAttempt < 0
+			)
+				return Promise.reject(new PublicShareError(400));
+			const query = new URLSearchParams({
+				toolCallId: reference.toolCallId,
+				messageId: reference.messageId,
+				executionAttempt: String(reference.executionAttempt),
+			});
+			return json<TextDocumentRef>(
+				`/tool-calls/${encodeURIComponent(toolUseId)}/input-document?${query}`,
+				signal ?? new AbortController().signal,
+				undefined,
+				TEXT_DOCUMENT_PACKET_BYTES,
+				10_000,
+			);
+		},
+		getTextDocumentRange,
+		readTextDocumentRange: (ref, offset, limit, signal) =>
+			getTextDocumentRange(ref.id, offset, limit, signal),
 		session: (signal) => json("", signal),
 		pretextDocument: (signal, opts) => {
 			const query = new URLSearchParams();

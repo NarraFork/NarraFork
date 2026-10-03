@@ -21,8 +21,10 @@
  * error.
  */
 
+import type { TextDocumentRangeReader } from "@shared/pretext-layout/text-document";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNarratorWS } from "../../../hooks/useNarratorWS";
+import { documentWriteInput, receiveWriteDocument } from "../content/document-source";
 import {
 	buildStreamingMsg,
 	type StreamingBlock,
@@ -51,10 +53,13 @@ import {
 	applyStreamingToolOutput,
 	applyStreamingToolProgress,
 	applyStreamingToolStarted,
+	collectPersistedDocumentPins,
 	collectPersistedToolUseIds,
 	createStreamingToolStore,
 	dropDiscardedStreamingTools,
 	dropPersistedStreamingTools,
+	isRetiredStreamingDocument,
+	isTextDocumentPersisted,
 	streamingToolChunks,
 } from "./streaming-tool-chunks";
 import { nextStreamAnimEpoch } from "./vlist-stream-anim-extra";
@@ -68,6 +73,7 @@ export interface UseVListStreamingMessageOptions {
 	isSubagent?: boolean;
 	/** Actual loaded document: the sole evidence that a block is visible elsewhere. */
 	committedMessages?: readonly HandoffMessage[];
+	fetchTextDocumentRange?: TextDocumentRangeReader;
 }
 
 /**
@@ -168,11 +174,23 @@ export function useVListStreamingMessage(
 		() => collectPersistedToolUseIds(committedMessages),
 		[committedMessages],
 	);
+	const persistedDocumentPins = useMemo(
+		() => collectPersistedDocumentPins(committedMessages),
+		[committedMessages],
+	);
 	useEffect(() => {
-		if (dropPersistedStreamingTools(toolStoreRef.current, persistedToolUseIds)) {
+		if (
+			dropPersistedStreamingTools(
+				toolStoreRef.current,
+				persistedToolUseIds,
+				(chunk) =>
+					!!chunk.textDocument &&
+					isTextDocumentPersisted(chunk.textDocument, persistedDocumentPins),
+			)
+		) {
 			setVersion((value) => value + 1);
 		}
-	}, [persistedToolUseIds]);
+	}, [persistedToolUseIds, persistedDocumentPins]);
 
 	// Final message events seal ids, but only the actual document may release their
 	// raw bodies. A late final/checkpoint cannot clear a newer revision or NEW id.
@@ -304,15 +322,48 @@ export function useVListStreamingMessage(
 				let toolsChanged = false;
 				for (const chunk of snapshot.toolChunks) {
 					if (!isSubagent && chunk.parentToolUseId) continue;
-					if (persistedToolUseIds.has(chunk.toolUseId)) continue;
+					if (
+						chunk.inputDocument
+							? isTextDocumentPersisted(chunk.inputDocument.ref, persistedDocumentPins)
+							: persistedToolUseIds.has(chunk.toolUseId)
+					)
+						continue;
+					if (
+						chunk.inputDocument &&
+						isRetiredStreamingDocument(
+							toolStoreRef.current,
+							chunk.toolUseId,
+							chunk.inputDocument.ref,
+						)
+					)
+						continue;
+					const inputDocument = chunk.inputDocument
+						? {
+								...chunk.inputDocument,
+								ref: receiveWriteDocument(
+									chunk.inputDocument,
+									undefined,
+									options.fetchTextDocumentRange,
+								),
+							}
+						: undefined;
 					// A name-only tool may receive no more deltas for a long time.
 					// Restore it from the subscription snapshot, not the next live event.
-					toolsChanged = applyStreamingToolChunk(toolStoreRef.current, chunk) || toolsChanged;
+					toolsChanged =
+						applyStreamingToolChunk(toolStoreRef.current, { ...chunk, inputDocument }) ||
+						toolsChanged;
 					if (chunk.started) {
 						toolsChanged =
 							applyStreamingToolStarted(toolStoreRef.current, {
 								...chunk,
-								input: chunk.input as Record<string, unknown> | undefined,
+								input: (chunk.toolName === "Write" && narratorId
+									? documentWriteInput(
+											narratorId,
+											chunk.toolUseId,
+											chunk.input,
+											chunk.inputDocument?.ref.source,
+										)
+									: chunk.input) as Record<string, unknown> | undefined,
 							}) || toolsChanged;
 					}
 					if (chunk.executing) {
@@ -459,8 +510,24 @@ export function useVListStreamingMessage(
 				extractedFields,
 				metadata,
 				streamingField,
+				_meta,
+				inputDocument,
 			) => {
 				if (!isSubagent && rawParentToolUseId) return;
+				if (
+					inputDocument &&
+					isRetiredStreamingDocument(toolStoreRef.current, toolUseId, inputDocument.ref)
+				)
+					return;
+				if (inputDocument)
+					inputDocument = {
+						...inputDocument,
+						ref: receiveWriteDocument(
+							inputDocument,
+							streamingField?.delta,
+							options.fetchTextDocumentRange,
+						),
+					};
 				// The model is writing tool arguments, so no text lane is open: whatever
 				// reasoning or text preceded this is finished and must settle now instead of
 				// waiting for the turn to persist.
@@ -475,6 +542,7 @@ export function useVListStreamingMessage(
 						...(extractedFields !== undefined ? { extractedFields } : {}),
 						...(metadata !== undefined ? { metadata } : {}),
 						...(streamingField ? { streamingField } : {}),
+						...(inputDocument ? { inputDocument } : {}),
 					})
 				)
 					flush();
@@ -487,15 +555,35 @@ export function useVListStreamingMessage(
 				input,
 				rawParentToolUseId,
 				meta,
+				inputDocument,
 			) => {
 				if (!isSubagent && rawParentToolUseId) return;
+				if (
+					inputDocument &&
+					isRetiredStreamingDocument(toolStoreRef.current, toolUseId, inputDocument.ref)
+				)
+					return;
+				if (inputDocument)
+					receiveWriteDocument(inputDocument, undefined, options.fetchTextDocumentRange);
 				if (
 					applyStreamingToolStarted(toolStoreRef.current, {
 						toolUseId,
 						toolName,
 						...(streamStartedAt != null ? { streamStartedAt } : {}),
 						...(streamCompletedAt != null ? { streamCompletedAt } : {}),
-						...(input ? { input } : {}),
+						...(input
+							? {
+									input: (toolName === "Write" && narratorId
+										? documentWriteInput(
+												narratorId,
+												toolUseId,
+												input,
+												inputDocument?.ref.source ??
+													(meta?.toolCallId ? { toolCallId: meta.toolCallId } : undefined),
+											)
+										: input) as Record<string, unknown>,
+								}
+							: {}),
 						...(meta ? { metadata: meta as Record<string, unknown> } : {}),
 					})
 				)
@@ -524,7 +612,14 @@ export function useVListStreamingMessage(
 						status,
 						...(output !== undefined ? { output } : {}),
 						...(durationMs != null ? { durationMs } : {}),
-						...(updatedInput ? { updatedInput } : {}),
+						...(updatedInput
+							? {
+									updatedInput: (toolStoreRef.current.get(toolUseId)?.toolName === "Write" &&
+									narratorId
+										? documentWriteInput(narratorId, toolUseId, updatedInput)
+										: updatedInput) as Record<string, unknown>,
+								}
+							: {}),
 						...(metadata ? { metadata } : {}),
 					})
 				)
