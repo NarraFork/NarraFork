@@ -109,7 +109,15 @@ export function NarratorGitBar({
 		>
 			<Group gap={6} wrap="nowrap">
 				<IconGitBranch size={14} color="var(--mantine-color-dimmed)" aria-hidden="true" />
-				<Text size="xs" c="dimmed" ff="monospace" truncate>
+				<Text
+					size="xs"
+					c="dimmed"
+					ff="monospace"
+					truncate
+					title={
+						executionContext ? `${executionContext.deviceId}: ${executionContext.cwd}` : undefined
+					}
+				>
 					{target
 						? status.data?.branch || t("workspace.ready")
 						: t(
@@ -133,19 +141,6 @@ export function NarratorGitBar({
 						</Group>
 					</Badge>
 				</Tooltip>
-			)}
-			{executionContext && (
-				<Text
-					size="xs"
-					c="dimmed"
-					ff="monospace"
-					truncate
-					title={`${executionContext.deviceId}: ${executionContext.cwd}`}
-					style={{ flex: 1, minWidth: 0 }}
-				>
-					{executionContext.deviceId !== "local" && `${executionContext.deviceId}: `}
-					{executionContext.cwd.split(/[\\/]/).filter(Boolean).pop() || executionContext.cwd}
-				</Text>
 			)}
 			<NarratorWorktreeControls
 				key={narratorId}
@@ -310,7 +305,15 @@ export function ChapterBar({
 					<Text size="xs" c="dimmed">
 						·
 					</Text>
-					<Text size="xs" c="dimmed" ff="monospace" truncate>
+					<Text
+						size="xs"
+						c="dimmed"
+						ff="monospace"
+						truncate
+						title={
+							executionContext ? `${executionContext.deviceId}: ${executionContext.cwd}` : undefined
+						}
+					>
 						{narratorId ? workspaceStatus?.branch || "Git" : chapter.branch}
 					</Text>
 					{gitStatus &&
@@ -354,18 +357,6 @@ export function ChapterBar({
 								)}
 							</Group>
 						)}
-					{executionContext && (
-						<Text
-							size="xs"
-							c="dimmed"
-							ff="monospace"
-							truncate
-							title={`${executionContext.deviceId}: ${executionContext.cwd}`}
-						>
-							{executionContext.deviceId !== "local" && `${executionContext.deviceId}: `}
-							{executionContext.cwd.split(/[\\/]/).filter(Boolean).pop() || executionContext.cwd}
-						</Text>
-					)}
 					{chapter.status !== "active" && (
 						<Badge
 							size="xs"

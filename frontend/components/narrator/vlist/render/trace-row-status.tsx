@@ -112,7 +112,18 @@ export function TraceRowStatusGlyph({
 		return <IconClock {...common} style={{ color: cssColor("slate", 5), flexShrink: 0 }} />;
 	}
 	if (mark === "reflecting") {
-		return <IconShield {...common} style={{ color: cssColor("indigo", 6), flexShrink: 0 }} />;
+		return (
+			<IconShield
+				{...common}
+				// Optical centering: the pointed shield reads lower than adjacent text.
+				style={{
+					color: cssColor("indigo", 6),
+					flexShrink: 0,
+					display: "block",
+					transform: "translateY(-1px)",
+				}}
+			/>
+		);
 	}
 	if (mark === "awaiting") {
 		// Yellow, matching the card's own `STATUS_COLOR.pending` and the yellow border

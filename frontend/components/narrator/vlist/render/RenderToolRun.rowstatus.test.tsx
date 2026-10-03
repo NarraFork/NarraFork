@@ -246,6 +246,9 @@ describe("a row that has not executed says nothing about elapsed time", () => {
 		const slot = statusSlots(trace([{ status: "running", reflectionStatus: "running" }]))[0];
 		expect(glyphName(slot as Element)).toBe("shield");
 		expect(slot.querySelector("svg")?.getAttribute("style")).toContain("indigo-6");
+		expect(slot.querySelector("svg")?.getAttribute("style")).toContain("translateY(-1px)");
+		expect(slot.getAttribute("style")).toContain("align-items:center");
+		expect(slot.getAttribute("style")).toContain("height:12px");
 	});
 
 	it("KEEPS the spinner and the counter for a genuinely running row", async () => {
