@@ -94,8 +94,9 @@ export interface DirectorFrames {
  * Compute the primary + secondary frames for director mode.
  *
  * Landscape: primary on the left, rail on the right (secondaries stacked
- * vertically). Portrait: rail on top (secondaries in a grid), primary below.
- * Ported from the pre-dockview DirectorPanelLayout.
+ * vertically). Portrait: rail on top (secondaries in ONE row — when the row
+ * outgrows the rail the surface scrolls it horizontally instead of wrapping
+ * into a grid), primary below.
  */
 export function computeDirectorFrames(opts: {
 	width: number;
@@ -147,31 +148,22 @@ export function computeDirectorFrames(opts: {
 			});
 			continue;
 		}
+		// One row, uniform width: share the rail when everything fits, hold the
+		// target width and let the row overflow (the surface scrolls) when it
+		// does not. Frames are rail-content coordinates; the scrolled offset is
+		// applied at render time, not here.
 		const railWidth = Math.max(0, width - DIRECTOR_PADDING * 2);
-		const maxColumns = Math.max(
-			1,
-			Math.min(
-				3,
-				Math.floor(
-					(railWidth + DIRECTOR_GAP) / (DIRECTOR_SECONDARY_TARGET_PORTRAIT_WIDTH + DIRECTOR_GAP),
-				),
-			),
+		const fitWidth = (railWidth - DIRECTOR_GAP * (secondaryCount - 1)) / secondaryCount;
+		const itemWidth = clamp(
+			fitWidth,
+			DIRECTOR_SECONDARY_TARGET_PORTRAIT_WIDTH,
+			DIRECTOR_SECONDARY_MAX_PORTRAIT,
 		);
-		const columns = Math.min(secondaryCount, maxColumns);
-		const rows = Math.ceil(secondaryCount / columns);
-		const railHeight = Math.max(0, railThickness - DIRECTOR_PADDING * 2);
-		const availableWidth = Math.max(0, railWidth - DIRECTOR_GAP * Math.max(0, columns - 1));
-		const availableHeight = Math.max(0, railHeight - DIRECTOR_GAP * Math.max(0, rows - 1));
-		const itemWidth =
-			columns > 0 ? Math.min(availableWidth / columns, DIRECTOR_SECONDARY_MAX_PORTRAIT) : 0;
-		const itemHeight = rows > 0 ? availableHeight / rows : 0;
-		const column = columns > 0 ? index % columns : 0;
-		const row = columns > 0 ? Math.floor(index / columns) : 0;
 		secondaryFrames.push({
-			left: DIRECTOR_PADDING + column * (itemWidth + DIRECTOR_GAP),
-			top: DIRECTOR_PADDING + row * (itemHeight + DIRECTOR_GAP),
+			left: DIRECTOR_PADDING + index * (itemWidth + DIRECTOR_GAP),
+			top: DIRECTOR_PADDING,
 			width: itemWidth,
-			height: itemHeight,
+			height: Math.max(0, railThickness - DIRECTOR_PADDING * 2),
 		});
 	}
 
@@ -183,4 +175,13 @@ export function previewScaleForWidth(frameWidth: number): number {
 	return frameWidth <= DIRECTOR_PREVIEW_NARROW_WIDTH
 		? DIRECTOR_PREVIEW_SCALE_NARROW
 		: DIRECTOR_PREVIEW_SCALE;
+}
+
+/**
+ * Index of the portrait-rail frame containing `x` (rail-content coordinates),
+ * or -1 when the point lands in a gap or outside the row. Frames never overlap
+ * (they are separated by DIRECTOR_GAP), so at most one can contain a point.
+ */
+export function directorRailIndexAtX(frames: DirectorFrame[], x: number): number {
+	return frames.findIndex((f) => x >= f.left && x <= f.left + f.width);
 }

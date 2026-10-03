@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { parseHTML } from "linkedom";
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "./responsive";
 import {
 	APP_SHELL_CONTENT_HEIGHT,
 	APP_SHELL_DESKTOP_NAVBAR_HEIGHT,
@@ -170,6 +171,9 @@ function trackerRealm(html = "<!doctype html><html><body><textarea></textarea></
 		},
 		readPublishedBottom() {
 			return domDocument.documentElement.style.getPropertyValue("--app-viewport-bottom") ?? "";
+		},
+		readPublishedOcclusion() {
+			return domDocument.documentElement.style.getPropertyValue("--app-keyboard-occlusion") ?? "";
 		},
 		readPublishedInset() {
 			return domDocument.documentElement.style.getPropertyValue("--app-safe-area-inset-bottom");
@@ -788,6 +792,7 @@ describe("mobile safe-area layout contract", () => {
 		// At rest the shell height is left to the engine's `100dvh`, so no override is
 		// published at all — one fewer value that can disagree with `env()`.
 		expect(realm.readPublishedBottom()).toBe("");
+		expect(realm.readPublishedOcclusion()).toBe("");
 		expect(realm.readPublishedInset()).toBe(PHYSICAL_SAFE_AREA_INSET_BOTTOM);
 
 		realm.focus(realm.document.querySelector("textarea"));
@@ -795,12 +800,16 @@ describe("mobile safe-area layout contract", () => {
 		// The keyboard is the one occlusion the engine does not fold into `dvh`, so it
 		// is also the only time a height is published.
 		expect(realm.readPublishedBottom()).toBe("500px");
+		// The push-up companion: how much of the 844px dynamic viewport the keyboard
+		// occludes. Surfaces that ride up over the keyboard size and shift by this.
+		expect(realm.readPublishedOcclusion()).toBe("344px");
 		expect(realm.readPublishedInset()).toBe("0px");
 		expect(root.hasAttribute("data-virtual-keyboard-open")).toBe(true);
 
 		realm.focus(null);
 		realm.resizeVisualViewport(844);
 		expect(realm.readPublishedBottom()).toBe("");
+		expect(realm.readPublishedOcclusion()).toBe("");
 		expect(realm.readPublishedInset()).toBe(PHYSICAL_SAFE_AREA_INSET_BOTTOM);
 		expect(root.hasAttribute("data-virtual-keyboard-open")).toBe(false);
 
@@ -824,6 +833,7 @@ describe("mobile safe-area layout contract", () => {
 
 		cleanup();
 		expect(realm.readPublishedBottom()).toBe("");
+		expect(realm.readPublishedOcclusion()).toBe("");
 		expect(realm.readPublishedInset() ?? "").toBe("");
 		// Cleanup must actually detach, not just stop publishing: a leaked listener
 		// keeps a torn-down tracker writing to a root it no longer owns.
@@ -997,18 +1007,26 @@ describe("mobile safe-area layout contract", () => {
 		expect(css).toContain("overflow-y: auto");
 		expect(css).toContain("overscroll-behavior-y: contain");
 		expect(css).toContain("-webkit-overflow-scrolling: touch");
-		// One conditional block is allowed, and only one: the installed-PWA height basis.
-		// iOS resolves the viewport units differently per shell — measured on an iPhone 11
-		// (896px panel), `100dvh` is 848 in standalone (the panel minus the 48px top inset,
-		// which iOS excludes from the dynamic viewport) and 714 in Safari. So `dvh` leaves
-		// the shell 48px short of the physical bottom in a PWA, while `lvh` would overflow
-		// behind Safari's toolbar by 82px in the browser. `display-mode` is the only signal
-		// that separates the two cases, so the basis has to be switched rather than picked.
+		// Two conditional blocks are allowed, and only two. The first is the
+		// installed-PWA height basis: iOS resolves the viewport units differently
+		// per shell — measured on an iPhone 11 (896px panel), `100dvh` is 848 in
+		// standalone (the panel minus the 48px top inset, which iOS excludes from
+		// the dynamic viewport) and 714 in Safari. So `dvh` leaves the shell 48px
+		// short of the physical bottom in a PWA, while `lvh` would overflow
+		// behind Safari's toolbar by 82px in the browser. `display-mode` is the
+		// only signal that separates the two cases, so the basis has to be
+		// switched rather than picked.
 		//
-		// The prohibition this replaces still holds in substance: no *width* media query may
-		// re-derive the chain, because that is what let two breakpoints disagree about who
-		// owns the height. Assert the allowed query exactly instead of banning the at-rule.
-		expect(declarations.match(/@media[^{]*/g)).toEqual(["@media (display-mode: standalone) "]);
+		// The prohibition this replaces still holds in substance: no *width* media
+		// query may re-derive the chain, because that is what let two breakpoints
+		// disagree about who owns the height. Assert the allowed queries exactly
+		// instead of banning the at-rule: the display-mode basis switch, plus the
+		// director lift — which does not touch the chain at all, it only hands
+		// the keyboard occlusion to one opt-in surface.
+		expect(declarations.match(/@media[^{]*/g)).toEqual([
+			"@media (display-mode: standalone) ",
+			`@media ${MOBILE_VIEWPORT_MEDIA_QUERY} `,
+		]);
 		// The shell chain itself never positions; the one `position: fixed` layer in the
 		// app (Mantine's overlay inner) is Mantine's own declaration, and this stylesheet
 		// only re-sizes it.
@@ -1074,6 +1092,38 @@ describe("mobile safe-area layout contract", () => {
 		const overlayRule = css.slice(css.indexOf(".mantine-Drawer-inner"));
 		expect(overlayRule).toContain("bottom: auto");
 		expect(css.match(/\.mantine-\w+-inner/g)).toEqual([".mantine-Drawer-inner"]);
+	});
+
+	test("the director lift is one gated variable from tracker to surface", async () => {
+		// The push-up contract has three links that must name the same two variables:
+		// the tracker publishes `--app-keyboard-occlusion` and flips
+		// `data-virtual-keyboard-open`; the stylesheet gates the occlusion into
+		// `--nf-director-keyboard-lift` on mobile widths only; DirectorLayout grows
+		// and shifts its own box by the lift. A rename in any link silently restores
+		// the squeeze this exists to remove.
+		const [css, tracker, surface] = await Promise.all([
+			Bun.file(new URL("../styles/safe-area.css", import.meta.url)).text(),
+			Bun.file(new URL("./safe-area.ts", import.meta.url)).text(),
+			Bun.file(
+				new URL("../components/narrator/workspace/DirectorLayout.tsx", import.meta.url),
+			).text(),
+		]);
+		const declarations = stripCssComments(css);
+
+		expect(tracker).toContain('"--app-keyboard-occlusion"');
+		expect(tracker).toContain('"data-virtual-keyboard-open"');
+		// Gated on the open keyboard AND the mobile width — neither condition alone
+		// may lift the surface (desktop keeps the squeeze, rest keeps inset: 0).
+		const gate = declarations.slice(declarations.indexOf(`@media ${MOBILE_VIEWPORT_MEDIA_QUERY}`));
+		expect(gate).toContain("html[data-virtual-keyboard-open] .nf-director-layout");
+		expect(gate).toContain("--nf-director-keyboard-lift: var(--app-keyboard-occlusion, 0px)");
+		// The surface consumes the lift and nothing else: no second guess about the
+		// keyboard's height anywhere else in the tree. The full expression is
+		// asserted — including the `* -1` that makes the lift a push-UP; dropping
+		// the negation would silently grow the surface INTO the keyboard.
+		expect(surface).toContain('className="nf-director-layout"');
+		expect(surface).toContain('top: "calc(var(--nf-director-keyboard-lift, 0px) * -1)"');
+		expect(surface).not.toContain("--app-keyboard-occlusion");
 	});
 
 	test("only authenticated layout conflicts use the dynamic viewport contract", async () => {

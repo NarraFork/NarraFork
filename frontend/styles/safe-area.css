@@ -119,3 +119,31 @@ html[data-nf-authenticated-app-shell="true"] .mantine-Drawer-inner {
 	height: var(--app-viewport-bottom, 100dvh);
 	max-height: var(--app-viewport-bottom, 100dvh);
 }
+
+/*
+ * Narrow screens: the director surface rides up over the virtual keyboard
+ * instead of being squeezed by it.
+ *
+ * The shell-level response to `--app-viewport-bottom` shrinks every layer, which
+ * is right for scrollable pages but wrong for the director surface: its primary
+ * panel and preview rail are sized from their own box, so a shrunken box
+ * compresses both. On mobile widths the surface instead keeps its pre-keyboard
+ * height — the component grows its own box by `--nf-director-keyboard-lift` and
+ * shifts its top edge up by the same amount, so the bottom edge (the composer)
+ * stays exactly on the keyboard while the excess slides off the top, clipped by
+ * the parent. `data-virtual-keyboard-open` and `--app-keyboard-occlusion` are
+ * published together by installAppViewportTracking, so the lift is 0 at rest and
+ * this rule alone decides when a nonzero lift can apply.
+ *
+ * 48em is Mantine's `sm` breakpoint (see MOBILE_VIEWPORT_MEDIA_QUERY in
+ * lib/responsive.ts — the JS definition of "mobile viewport" this mirrors).
+ */
+.nf-director-layout {
+	--nf-director-keyboard-lift: 0px;
+}
+
+@media not all and (min-width: 48em) {
+	html[data-virtual-keyboard-open] .nf-director-layout {
+		--nf-director-keyboard-lift: var(--app-keyboard-occlusion, 0px);
+	}
+}
