@@ -3,6 +3,7 @@ import type { DockviewApi } from "dockview-react";
 import { parseHTML } from "linkedom";
 import { act, memo } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { usePluginUiSurface } from "../../plugins/PluginUiSurfaceContext";
 import { dockPanelId } from "./dock-panel-types";
 import {
 	type NarratorDockContextValue,
@@ -13,6 +14,13 @@ import {
 let root: Root;
 let dock: NarratorDockContextValue;
 let renders: number[];
+let pluginRenders: number;
+
+const PluginConsumer = memo(() => {
+	usePluginUiSurface();
+	pluginRenders++;
+	return null;
+});
 let panels: Array<{ params?: { panelType: string } }>;
 const originals = new Map<string, PropertyDescriptor | undefined>();
 
@@ -35,6 +43,7 @@ beforeEach(async () => {
 		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 	}
 	renders = [0, 0];
+	pluginRenders = 0;
 	panels = [{ params: { panelType: "chat" } }];
 	root = createRoot(document.body.appendChild(document.createElement("div")));
 	await act(async () => {
@@ -42,6 +51,7 @@ beforeEach(async () => {
 			<NarratorDockProvider narratorId="narrator">
 				<Consumer index={0} />
 				<Consumer index={1} />
+				<PluginConsumer />
 			</NarratorDockProvider>,
 		);
 	});
@@ -210,4 +220,32 @@ describe("dock tool panel toggle", () => {
 		expect(present.has(dockPanelId("filemod"))).toBe(false);
 		expect(opened).toEqual([]);
 	});
+});
+
+test("outbound panel publication preserves bridge and plugin-host identities", async () => {
+	const before = dock;
+	const received: string[] = [];
+	const unregisterOld = dock.registerScrollToMessage((id) => received.push(`old:${id}`));
+	await act(async () => dock.setBrowserInfo({ sessionCount: 1, visualChange: null }));
+	expect(dock).not.toBe(before);
+	for (const key of [
+		"registerAppendChatInput",
+		"appendChatInput",
+		"registerWriteTerminalStdin",
+		"writeTerminalStdin",
+		"registerScrollToMessage",
+		"scrollToMessage",
+		"registerSubmitToNarrator",
+		"submitToNarrator",
+	] as const) {
+		expect(dock[key]).toBe(before[key]);
+	}
+	expect(pluginRenders).toBe(1);
+	dock.scrollToMessage?.("m1");
+	const unregisterNew = dock.registerScrollToMessage((id) => received.push(`new:${id}`));
+	unregisterOld();
+	dock.scrollToMessage?.("m2");
+	unregisterNew();
+	dock.scrollToMessage?.("m3");
+	expect(received).toEqual(["old:m1", "new:m2"]);
 });

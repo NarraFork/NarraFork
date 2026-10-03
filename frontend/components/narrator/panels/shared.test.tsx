@@ -294,3 +294,57 @@ describe("usePanelHeaderDrag", () => {
 		expect(state?.subjectKind).toBe("tool");
 	});
 });
+
+describe("usePanelCompact retained hidden surfaces", () => {
+	it("keeps the last visible breakpoint through zero-width parking and resumes normally", async () => {
+		const React = await import("react");
+		const { createRoot } = await import("react-dom/client");
+		const { flushSync } = await import("react-dom");
+		const { usePanelCompact } = await import("./shared");
+		const previous = Object.getOwnPropertyDescriptor(globalThis, "ResizeObserver");
+		let callback: ResizeObserverCallback | undefined;
+		let disconnected = false;
+		class Observer {
+			constructor(cb: ResizeObserverCallback) {
+				callback = cb;
+			}
+			observe() {}
+			disconnect() {
+				disconnected = true;
+			}
+		}
+		Object.defineProperty(globalThis, "ResizeObserver", { configurable: true, value: Observer });
+		const element = document.body.appendChild(document.createElement("div"));
+		const root = createRoot(element);
+		let compact = true;
+		function Probe() {
+			const state = usePanelCompact();
+			compact = state.compact;
+			return React.createElement("div", { ref: state.ref });
+		}
+		const resize = (width: number) =>
+			flushSync(() =>
+				callback?.([{ contentRect: { width } } as ResizeObserverEntry], {} as ResizeObserver),
+			);
+		try {
+			flushSync(() => root.render(React.createElement(Probe)));
+			expect(compact).toBe(true);
+			resize(0);
+			expect(compact).toBe(true);
+			resize(900);
+			expect(compact).toBe(false);
+			resize(0);
+			expect(compact).toBe(false);
+			resize(639);
+			expect(compact).toBe(true);
+			resize(640);
+			expect(compact).toBe(false);
+		} finally {
+			flushSync(() => root.unmount());
+			expect(disconnected).toBe(true);
+			element.remove();
+			if (previous) Object.defineProperty(globalThis, "ResizeObserver", previous);
+			else Reflect.deleteProperty(globalThis, "ResizeObserver");
+		}
+	});
+});

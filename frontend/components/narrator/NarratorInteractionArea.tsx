@@ -16,6 +16,7 @@ import {
 	type UseStatusBarPropsOptions,
 	useStatusBarProps,
 } from "./interaction/use-status-bar-props";
+import { useNarratorPanelCompact } from "./panels/compact-context";
 
 /**
  * Context shared by several of the interaction area's sub-regions (status bar,
@@ -27,7 +28,6 @@ export interface NarratorInteractionCommon {
 	narratorId: string;
 	narrator: UseStatusBarPropsOptions["narrator"];
 	isWorkspacePreview: boolean;
-	compact: boolean | undefined;
 	isMobileViewport: boolean;
 }
 
@@ -66,8 +66,8 @@ export interface NarratorInteractionAreaProps {
 	// ── Status bar — raw inputs; the props are assembled here via useStatusBarProps
 	//    (model / reasoning / codex / permission control sub-objects are computed
 	//    from the control hooks rather than in NarratorPanel). The shared context
-	//    fields (narratorId/narrator/isWorkspacePreview/compact/isMobileViewport)
-	//    come from `common` and are omitted here. ──
+	//    fields (narratorId/narrator/isWorkspacePreview/isMobileViewport) come from
+	//    `common`; compact comes from the responsive context. All are omitted here. ──
 	statusBarInputs: Omit<
 		UseStatusBarPropsOptions,
 		"narratorId" | "narrator" | "isWorkspacePreview" | "compact" | "isMobileViewport"
@@ -95,7 +95,8 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 	const bottomSpacing = useBottomSpacing();
 	// Assemble the status-bar props here (computing the model/reasoning/codex/
 	// permission control sub-objects via the control hooks) instead of in the panel.
-	const statusBar = useStatusBarProps({ ...props.common, ...props.statusBarInputs });
+	const compact = useNarratorPanelCompact();
+	const statusBar = useStatusBarProps({ ...props.common, ...props.statusBarInputs, compact });
 	// Queue buffer interactions live here rather than in the panel: every output
 	// below is consumed only within this component's subtree.
 	const {

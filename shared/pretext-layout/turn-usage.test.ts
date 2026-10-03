@@ -4,6 +4,8 @@ import {
 	formatTurnUsageCost,
 	formatTurnUsageParts,
 	getPromptTokenFootprint,
+	type ResponsiveTurnUsageData,
+	reflowTurnUsageData,
 	resolveTurnUsageLines,
 } from "./turn-usage";
 
@@ -171,5 +173,40 @@ describe("resolveTurnUsageLines", () => {
 		});
 		expect(lines?.leading).toBe("↑ 100");
 		expect(lines?.trailing).toBe("Σ 100 ctx · 100 in · 20 out");
+	});
+});
+
+describe("responsive usage data", () => {
+	it("selects preformatted lines, removes the mobile second line and preserves no-op identity", () => {
+		const desktop: ResponsiveTurnUsageData = {
+			placement: "trailing",
+			text: "tokens · cost",
+			responsiveLines: {
+				desktop: { text: "tokens · cost" },
+				mobile: { text: "tokens", secondaryText: "cost" },
+			},
+		};
+		expect(reflowTurnUsageData(desktop, false)).toBe(desktop);
+		const mobile = reflowTurnUsageData(desktop, true) as ResponsiveTurnUsageData;
+		expect(mobile.text).toBe("tokens");
+		expect(mobile.secondaryText).toBe("cost");
+		expect(mobile.responsiveLines).toBe(desktop.responsiveLines);
+		expect(reflowTurnUsageData(mobile, true)).toBe(mobile);
+		const restored = reflowTurnUsageData(mobile, false) as ResponsiveTurnUsageData;
+		expect(restored).toEqual(desktop);
+		expect("secondaryText" in restored).toBe(false);
+	});
+
+	it("leaves leading, legacy and non-usage payloads unchanged", () => {
+		for (const data of [
+			null,
+			"text",
+			{},
+			{ placement: "leading", text: "↑ 10" },
+			{ placement: "trailing", text: "legacy" },
+		]) {
+			expect(reflowTurnUsageData(data, true)).toBe(data);
+			expect(reflowTurnUsageData(data, undefined)).toBe(data);
+		}
 	});
 });

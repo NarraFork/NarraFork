@@ -227,6 +227,8 @@ export interface WidthSettleInput {
 	boxWidth?: number;
 	/** The outer width recorded when the committed width was last committed. */
 	committedBoxWidth?: number;
+	/** A live preview (even one only queued) still needs an explicit final commit. */
+	hasPendingPreview?: boolean;
 }
 
 const NO_ACTION: WidthSettleDecision = { commit: false, defer: false, deferForMs: 0 };
@@ -254,7 +256,17 @@ export function resolveWidthSettle(input: WidthSettleInput): WidthSettleDecision
 	// integer in every browser we target, so nothing real is lost; what it buys is
 	// that a fractional wobble in a computed layout can never re-trigger the loop.
 	const changed = Math.round(input.nextWidth) !== Math.round(input.committedWidth);
-	if (!changed) return NO_ACTION;
+	if (!changed) {
+		if (!input.hasPendingPreview) return NO_ACTION;
+		// Returning to the starting width does not undo a preview's local geometry.
+		// Nor does a queued preview count as a completed full-layout commit.
+		if (input.trigger === "gesture-end" || input.trigger === "timer") return COMMIT;
+		return {
+			commit: false,
+			defer: true,
+			deferForMs: input.pointerDown ? WIDTH_POINTER_BACKSTOP_MS : WIDTH_SETTLE_DELAY_MS,
+		};
+	}
 
 	// The gesture ended: this is the commit point the whole design waits for.
 	//

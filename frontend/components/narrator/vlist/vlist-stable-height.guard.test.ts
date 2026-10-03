@@ -181,7 +181,9 @@ describe("stable-height invariant: live lifecycle patches", () => {
 		expect(fn).toContain("captureCoordinatorAnchor(");
 		// The anchor must be restored through the same commit path that the rebuild
 		// uses, so the correction reaches the shell's scroll write.
-		expect(src).toContain("restorePretextLayoutAnchor(anchor, built.index, viewportHeight)");
+		expect(src).toMatch(
+			/restorePretextLayoutAnchor\(\s*anchor,\s*indexWithHeightOverrides\(built\.index, restoreOverrides\),\s*viewportHeight,?\s*\)/,
+		);
 	});
 
 	it("reads the LIVE scroll view at patch time, not a stale render-time copy", () => {

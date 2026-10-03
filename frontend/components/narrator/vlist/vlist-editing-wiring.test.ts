@@ -36,7 +36,7 @@ describe("vlist inline editing wiring", () => {
 		// report or reporting into a set that pruned it away.
 		expect(SHELL).toMatch(/const isDynamicRow = dynamicRowKeys\.has\(item\.spec\.key\)/);
 		expect(SHELL).toMatch(
-			/isDynamicRow \? getUnknownHeightReporter\(item\.spec\.key\) : undefined/,
+			/isDynamicRow\s*\? getUnknownHeightReporter\(item\.spec\.key, item\.contentWidth \?\? contentWidth\)\s*: undefined/,
 		);
 	});
 

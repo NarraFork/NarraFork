@@ -303,6 +303,15 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// copy is keyed by `traceRevision`). Height-affecting, and it is the only component
 	// that moves when the form's painted height is reported.
 	rev += permissionFormRevision(d.permissionForm);
+	// Grouped cards keep their children in a structural toolCalls array. A local
+	// same-width form report must invalidate that group's frame just like a trace's.
+	if (Array.isArray(d.toolCalls)) {
+		rev += `|gpf:${d.toolCalls
+			.map((child) =>
+				permissionFormRevision((child as Record<string, unknown> | null)?.permissionForm),
+			)
+			.join(";")}`;
+	}
 	// Takeover badge. Height-neutral (it rides the fixed header row), and keyed for
 	// exactly the reason `timeoutMs` above is: the takeover patch writes this ONE
 	// field — `status` cannot move, because the whole point is that the call is
@@ -357,6 +366,10 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// spec.key and usually the role, so without this the measured body stays the
 	// pre-edit one (the gap chat's own measure cache key already closed).
 	if (typeof d.editedAt === "string") rev += `|ea:${d.editedAt}`;
+	if (d.placement === "trailing") {
+		// The same-width breakpoint preview can add/remove the second usage line.
+		rev += `|us:${typeof d.secondaryText === "string" ? textSignature(d.secondaryText) : "-"}`;
+	}
 	// Communication bodies can finish streaming or hydrate without changing status.
 	// Re-key the bounded measured text and both independently reserved footer rows.
 	if (typeof d.message === "string") {

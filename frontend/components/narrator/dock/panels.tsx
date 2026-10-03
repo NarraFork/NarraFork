@@ -61,6 +61,7 @@ import {
 import { usePanelCompact, usePanelGeometryReady, usePanelHeaderDrag } from "../panels/shared";
 import { toolEditReferenceKey } from "../tool-call/tool-edit-reference";
 import type { NarratorDockPanelType } from "./dock-panel-types";
+import { FocusChatSlot } from "./FocusChatHost";
 import { NarratorDockContext, useNarratorDockContext } from "./NarratorDockContext";
 
 const NarratorTerminal = lazy(() =>
@@ -288,21 +289,23 @@ function ChatDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 
 	return (
 		<Box ref={ref} style={{ height: "100%", overflow: "hidden" }}>
-			{geometryReady && (
-				<LazyPanelBoundary>
-					<NarratorPanel
-						key={narratorId}
-						narratorId={narratorId}
-						compact={compact}
-						onForkFromMessage={dock?.onForkFromMessage ?? undefined}
-						onHeaderPointerDown={onHeaderPointerDown}
-						onViewSubagentSession={dock?.openSubagentPanel}
-						highlightMessageId={dock?.highlightMessageId}
-						onBack={dock?.onBack ?? undefined}
-						onMinimize={dock?.onMinimize ?? undefined}
-					/>
-				</LazyPanelBoundary>
-			)}
+			<FocusChatSlot compact={compact} onHeaderPointerDown={onHeaderPointerDown}>
+				{geometryReady && (
+					<LazyPanelBoundary>
+						<NarratorPanel
+							key={narratorId}
+							narratorId={narratorId}
+							compact={compact}
+							onForkFromMessage={dock?.onForkFromMessage ?? undefined}
+							onHeaderPointerDown={onHeaderPointerDown}
+							onViewSubagentSession={dock?.openSubagentPanel}
+							highlightMessageId={dock?.highlightMessageId}
+							onBack={dock?.onBack ?? undefined}
+							onMinimize={dock?.onMinimize ?? undefined}
+						/>
+					</LazyPanelBoundary>
+				)}
+			</FocusChatSlot>
 		</Box>
 	);
 }

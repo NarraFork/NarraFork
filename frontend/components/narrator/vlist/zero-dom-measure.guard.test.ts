@@ -53,6 +53,8 @@ const PURE_PATH_FILES = [
 	"vlist-lod-gesture.ts",
 	"vlist-virtualization.ts",
 	"vlist-pipeline.ts",
+	"vlist-resize-preview.ts",
+	"vlist-resize-permission.ts",
 	"vlist-permission-match.ts",
 	"vlist-reflection-index.ts",
 	"vlist-interaction-state.ts",
