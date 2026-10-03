@@ -144,6 +144,144 @@ describe("local worktree list/create fixtures", () => {
 		expect(authorizations).toEqual(["read"]);
 	});
 
+	test("list batches unique HEAD timestamps, including detached worktrees, in one bounded read", async () => {
+		const detached = join(source, ".worktrees", "detached");
+		await git(["worktree", "add", "--detach", detached, "HEAD"]);
+		await git([
+			"-c",
+			"user.name=Fixture",
+			"-c",
+			"user.email=fixture@example.test",
+			"commit",
+			"--allow-empty",
+			"-C",
+			"HEAD",
+		]);
+		const run = ports.runGit;
+		const calls: string[][] = [];
+		ports.runGit = async (workspace, args, abort, writing) => {
+			calls.push(args);
+			expect(writing).toBe(false);
+			return run?.(workspace, args, abort, writing) as ReturnType<NonNullable<typeof run>>;
+		};
+		const result = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		const shows = calls.filter((args) => args[0] === "show");
+		expect(shows).toHaveLength(1);
+		expect(shows[0]).toEqual([
+			"show",
+			"--no-walk",
+			"--no-patch",
+			"--format=%H %ct",
+			...new Set(result.entries.map((entry) => entry.head ?? "")),
+			"--",
+		]);
+		expect(result.entries.find((entry) => entry.path === detached)?.detached).toBe(true);
+		for (const entry of result.entries) {
+			expect(entry.lastCommitAt).toBe(
+				Number(await git(["show", "-s", "--format=%ct", entry.head ?? ""])) * 1000,
+			);
+			const birthtime = (await lstat(entry.path)).birthtimeMs;
+			expect(entry.createdAt).toBe(birthtime > 0 ? birthtime : null);
+		}
+	});
+
+	test("list preserves missing HEAD/path metadata and deduplicates shared HEADs", async () => {
+		const head = "a".repeat(40);
+		const missing = "b".repeat(40);
+		const paths = [source, join(source, "missing"), join(source, "zero-birthtime")];
+		const calls: string[][] = [];
+		ports.runGit = async (_workspace, args) => {
+			calls.push(args);
+			return {
+				exitCode: 0,
+				stderr: "",
+				stdout:
+					args[0] === "show"
+						? `${head} 1700000000\n`
+						: paths
+								.map(
+									(path, index) =>
+										`worktree ${path}\0HEAD ${index === 1 ? missing : head}\0detached\0\0`,
+								)
+								.join(""),
+			};
+		};
+		ports.statDirectory = async (path) => {
+			if (path === paths[1]) throw new Error("ENOENT");
+			return { birthtimeMs: path === source ? 1234 : 0, isDirectory: () => true };
+		};
+		const result = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		expect(calls[1]?.slice(4, -1)).toEqual([head, missing]);
+		expect(result.entries.map((entry) => [entry.createdAt, entry.lastCommitAt])).toEqual([
+			[1234, 1700000000000],
+			[null, null],
+			[null, 1700000000000],
+		]);
+	});
+
+	test("empty/unborn HEADs skip the metadata Git command and never use non-directory birthtime", async () => {
+		let calls = 0;
+		ports.runGit = async () => {
+			calls++;
+			return {
+				exitCode: 0,
+				stderr: "",
+				stdout: `worktree ${source}\0HEAD ${"0".repeat(40)}\0\0worktree missing\0\0`,
+			};
+		};
+		ports.statDirectory = async () => ({ birthtimeMs: 1234, isDirectory: () => false });
+		const result = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		expect(calls).toBe(1);
+		expect(
+			result.entries.every((entry) => entry.createdAt === null && entry.lastCommitAt === null),
+		).toBe(true);
+	});
+
+	test("Git metadata failures, throws and truncated output keep the worktree inventory usable", async () => {
+		const run = ports.runGit;
+		for (const failure of ["exit", "throw", "truncate", "invalid"] as const) {
+			ports.runGit = async (workspace, args, abort, writing) => {
+				if (args[0] !== "show")
+					return run?.(workspace, args, abort, writing) as ReturnType<NonNullable<typeof run>>;
+				if (failure === "throw") throw new Error("metadata unavailable");
+				return {
+					exitCode: failure === "exit" ? 128 : 0,
+					stderr: "",
+					stdout: `${args[4]} ${failure === "invalid" ? "9007199254740991" : "1700000000"}\n`,
+					stdoutTruncated: failure === "truncate",
+				};
+			};
+			const result = await service.list(
+				"actor",
+				"narrator",
+				{ workspaceKey: "workspace" },
+				signal(),
+			);
+			expect(result.entries).toHaveLength(1);
+			expect(result.entries[0]?.lastCommitAt).toBeNull();
+			expect(result.capabilities.list).toBe(true);
+		}
+	});
+
+	test("directory metadata concurrency is bounded and caller cancellation is not swallowed", async () => {
+		const controller = new AbortController();
+		let reads = 0;
+		ports.runGit = async () => ({
+			exitCode: 0,
+			stderr: "",
+			stdout: Array.from({ length: 12 }, (_, index) => `worktree path-${index}\0\0`).join(""),
+		});
+		ports.statDirectory = async () => {
+			reads++;
+			if (reads === 4) controller.abort(new Error("cancel metadata"));
+			return new Promise(() => {});
+		};
+		await expect(
+			service.list("actor", "narrator", { workspaceKey: "workspace" }, controller.signal),
+		).rejects.toThrow("cancel metadata");
+		expect(reads).toBe(4);
+	});
+
 	test("creates a new branch from a pinned base in one argv call; leaves dirty source intact", async () => {
 		await writeFile(join(source, "tracked.txt"), "dirty source\n");
 		await writeFile(join(source, "untracked.txt"), "untracked\n");
@@ -153,6 +291,8 @@ describe("local worktree list/create fixtures", () => {
 		expect(result.outcome).toBe("created");
 		expect(result.worktree?.branch).toBe("refs/heads/feature");
 		expect(result.worktree?.head).toBe(headBefore);
+		expect(result.worktree).not.toHaveProperty("createdAt");
+		expect(result.worktree).not.toHaveProperty("lastCommitAt");
 		expect(await readFile(join(source, "tracked.txt"), "utf8")).toBe("dirty source\n");
 		expect(await readFile(join(request.destinationPath, "tracked.txt"), "utf8")).toBe(
 			"committed\n",

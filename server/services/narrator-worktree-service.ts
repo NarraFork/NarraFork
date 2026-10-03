@@ -97,6 +97,8 @@ export interface WorktreeServicePorts<Principal> {
 	) => Promise<string>;
 	/** Tests may shorten (never increase) the naming deadline. */
 	nameTimeoutMs?: number;
+	/** Test seam for directory birthtime; production uses asynchronous lstat, never mtime/ctime. */
+	statDirectory?: (path: string) => Promise<Pick<Stats, "birthtimeMs" | "isDirectory">>;
 	/** Test seam. Production defaults to local-only argv execution with hard bounds. */
 	runGit?: (
 		target: WorktreeTarget,
@@ -213,6 +215,75 @@ export class NarratorWorktreeService<Principal> {
 		);
 	}
 
+	/** Best-effort list metadata only; raw entries remain unchanged for creation/reconciliation. */
+	private async enrichListEntries(
+		target: WorktreeTarget,
+		entries: WorktreeEntry[],
+		signal: AbortSignal,
+	): Promise<void> {
+		const metadataSignal = AbortSignal.any([signal, AbortSignal.timeout(WORKTREE_READ_TIMEOUT_MS)]);
+		for (const entry of entries) {
+			entry.createdAt = null;
+			entry.lastCommitAt = null;
+		}
+		const heads = [...new Set(entries.map((entry) => entry.head))].filter(
+			(head): head is string =>
+				!!head && /^(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/.test(head) && !/^0+$/.test(head),
+		);
+		const commits = async () => {
+			if (!heads.length) return;
+			try {
+				const result = await this.run(
+					target,
+					["show", "--no-walk", "--no-patch", "--format=%H %ct", ...heads, "--"],
+					metadataSignal,
+				);
+				if (result.exitCode !== 0 || result.stdoutTruncated || result.stderrTruncated) return;
+				const times = new Map<string, number>();
+				for (const line of result.stdout.split("\n")) {
+					const match = /^(\S+) (\d+)$/.exec(line);
+					if (!match) continue;
+					const time = Number(match[2]) * 1000;
+					if (Number.isSafeInteger(time)) times.set(match[1]?.toLowerCase() ?? "", time);
+				}
+				for (const entry of entries)
+					entry.lastCommitAt = times.get(entry.head?.toLowerCase() ?? "") ?? null;
+			} catch {
+				// Missing objects, Git failures and metadata deadlines do not invalidate the inventory.
+			}
+		};
+		let next = 0;
+		const directories = async () => {
+			while (next < entries.length && !metadataSignal.aborted) {
+				const entry = entries[next++];
+				if (!entry) return;
+				let onAbort: (() => void) | undefined;
+				try {
+					const aborted = new Promise<never>((_resolve, reject) => {
+						onAbort = () => reject(metadataSignal.reason);
+						metadataSignal.addEventListener("abort", onAbort, { once: true });
+						if (metadataSignal.aborted) onAbort();
+					});
+					const stat = await Promise.race([
+						(this.ports.statDirectory ?? lstat)(entry.path),
+						aborted,
+					]);
+					// birthtime approximates directory creation, NOT when Git registered the worktree.
+					// Unsupported/zero birthtimes and non-directories are unknown; no mtime/ctime fallback.
+					if (stat.isDirectory() && Number.isFinite(stat.birthtimeMs) && stat.birthtimeMs > 0)
+						entry.createdAt = stat.birthtimeMs;
+				} catch {
+					// Prunable/missing paths and unsupported filesystem metadata stay usable.
+				} finally {
+					if (onAbort) metadataSignal.removeEventListener("abort", onAbort);
+				}
+			}
+		};
+		// At most four filesystem reads; after cancellation no replacement reads are launched.
+		await Promise.all([commits(), ...Array.from({ length: 4 }, directories)]);
+		signal.throwIfAborted();
+	}
+
 	async list(
 		principal: Principal,
 		narratorId: string,
@@ -223,6 +294,7 @@ export class NarratorWorktreeService<Principal> {
 		const target = await this.ports.authorize(principal, narratorId, "read", signal);
 		assertReady(target, "read", workspaceKey);
 		const result = await this.entries(target, signal);
+		await this.enrichListEntries(target, result.entries, signal);
 		return {
 			repositoryKey: target.workspace.repositoryKey,
 			...result,

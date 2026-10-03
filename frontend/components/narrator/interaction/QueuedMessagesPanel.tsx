@@ -20,7 +20,6 @@ const QUEUE_COLLAPSE_THRESHOLD = 2;
 /**
  * The queue state + handlers, assembled once by the panel and threaded through
  * NarratorInteractionArea as a single `queue` group (mirrors `statusBarInputs`).
- * Excludes `hasImages`, which the interaction area derives from its attachments.
  */
 export interface QueuedMessagesData {
 	queuedMessages: BufferMessageSummary[];
@@ -45,9 +44,7 @@ export interface QueuedMessagesData {
 	handleCancelAllQueued: () => void;
 }
 
-export interface QueuedMessagesPanelProps extends QueuedMessagesData {
-	hasImages: boolean;
-}
+export type QueuedMessagesPanelProps = QueuedMessagesData;
 
 /**
  * The queued-messages region above the composer: a collapsed summary bar past the
@@ -68,7 +65,7 @@ export function QueuedMessagesPanel(props: QueuedMessagesPanelProps) {
 		<Stack
 			gap={0}
 			style={{
-				borderTop: props.hasImages ? undefined : "1px solid var(--mantine-color-default-border)",
+				borderTop: "1px solid var(--mantine-color-default-border)",
 				flexShrink: 0,
 			}}
 		>

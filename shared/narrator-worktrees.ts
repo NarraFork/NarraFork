@@ -6,6 +6,10 @@ export interface WorktreeEntry {
 	detached: boolean;
 	locked: boolean;
 	prunable: boolean;
+	/** List-only approximate directory creation time (filesystem birthtime), not Git registration. */
+	createdAt?: number | null;
+	/** List-only HEAD commit time in milliseconds, including detached HEAD; unknown is null. */
+	lastCommitAt?: number | null;
 }
 export interface WorktreeCreateRequest {
 	expectedRevision: number;
