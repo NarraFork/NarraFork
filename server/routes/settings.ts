@@ -514,6 +514,7 @@ export const updateSettingsSchema = z
 				autoCompactKeepPairs: z.number().int().min(1).max(25).optional(),
 				queueDuringCompaction: z.boolean().optional(),
 				browserProxy: proxyOverrideSchema,
+				notificationPolicy: z.object({ allowSend: z.boolean().optional() }).optional(),
 				webFetchPolicy: z
 					.object({
 						allowAll: z.boolean().optional(),

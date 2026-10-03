@@ -420,12 +420,43 @@ export function knowledgeSummary(
 	}
 }
 
+/** Only routing fields belong in a collapsed notification row, never its message body. */
+function notificationSummary(input: unknown): string {
+	const action = extractField(input, "action");
+	const target = extractField(input, "user_id") || extractField(input, "username");
+	const channels = extractStringArrayField(input, "channels");
+	const routingChannels = channels.filter((value) => value === "dingtalk" || value === "feishu");
+	return short(
+		[
+			action === "list_channels" || action === "send" ? action : "Notification",
+			target ? `→ ${short(target, 40)}` : "",
+			...(routingChannels.length > 0
+				? new Set(routingChannels)
+				: action === "send"
+					? ["available channels"]
+					: []),
+		]
+			.filter(Boolean)
+			.join(" · "),
+		100,
+	);
+}
+
 export function getSummary(
 	toolName: string,
 	input: unknown,
 	metadata?: Record<string, unknown>,
 	labels?: Record<string, string>,
 ): string {
+	// Keep the existing generic category/icon and detail renderer. Notification is not
+	// inter-agent Send: sharing its category would render the wrong communication card.
+	if (toolName === "Notification") {
+		const fields =
+			input && typeof input === "object"
+				? (input as Record<string, unknown>)._streamingFields
+				: undefined;
+		return notificationSummary(fields && typeof fields === "object" ? fields : input);
+	}
 	if (
 		typeof input === "object" &&
 		input &&

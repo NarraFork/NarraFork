@@ -62,6 +62,7 @@ const BUILTIN_TOOLS: ToolMeta[] = [
 	{ name: "Await", descKey: "tpToolDescAwait", category: "always-allow" },
 	{ name: "Send", descKey: "tpToolDescSend", category: "default" },
 	{ name: "ShareFile", descKey: "tpToolDescShareFile", category: "optional" },
+	{ name: "Notification", descKey: "tpToolDescNotification", category: "optional" },
 	{ name: "Terminal", descKey: "tpToolDescTerminal", category: "optional" },
 	{ name: "Browser", descKey: "tpToolDescBrowser", category: "optional" },
 	{ name: "Recall", descKey: "tpToolDescRecall", category: "optional" },
@@ -337,6 +338,20 @@ function ToolPermissionsPage() {
 						</Text>
 					</Paper>
 
+					{selectedBuiltin?.name === "Notification" && (
+						<Paper withBorder p="sm">
+							<NotificationSendPermissionSwitch
+								allowSend={settings?.agent?.notificationPolicy?.allowSend ?? false}
+								isAdmin={isAdmin}
+								pending={updateSettings.isPending || !settings}
+								onChange={(allowSend) =>
+									updateSettings.mutate({ agent: { notificationPolicy: { allowSend } } })
+								}
+								t={t}
+							/>
+						</Paper>
+					)}
+
 					{/* Bash: command whitelist / blacklist */}
 					{selectedBuiltin?.name === "Bash" && (
 						<>
@@ -611,6 +626,33 @@ function ToolPermissionsPage() {
 				</>
 			)}
 		</Container>
+	);
+}
+
+export function NotificationSendPermissionSwitch({
+	allowSend,
+	isAdmin,
+	pending,
+	onChange,
+	t,
+}: {
+	allowSend: boolean;
+	isAdmin: boolean;
+	pending: boolean;
+	onChange: (allowSend: boolean) => void;
+	t: (key: string) => string;
+}) {
+	return (
+		<Switch
+			label={t("tpNotificationAllowSend")}
+			description={t("tpNotificationAllowSendDesc")}
+			checked={allowSend}
+			disabled={!isAdmin || pending}
+			onChange={(event) => {
+				if (isAdmin && !pending) onChange(event.currentTarget.checked);
+			}}
+			size="sm"
+		/>
 	);
 }
 

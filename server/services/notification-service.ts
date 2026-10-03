@@ -1,78 +1,214 @@
-import { createHmac } from "node:crypto";
 import { db } from "@server/db";
 import { chapters, narrators, userPreferences, users } from "@server/db/schema";
+import { ForbiddenError } from "@server/lib/errors";
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
-import { and, eq, inArray } from "drizzle-orm";
+import { isPlanModeTrait } from "@server/lib/narrator-utils";
+import { resolveEffectiveRelaxedPlan } from "@server/lib/permission-modes";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { listNarratorAudience, type NarratorAclRow } from "./narrator-acl";
+import {
+	deliverNotification,
+	type NotificationChannel,
+	type NotificationDeliveryResult,
+} from "./notification-delivery";
 import { getRecentTabUserIdsForNarrator } from "./recent-tabs-service";
 
-// --- DingTalk helpers ---
+export type NotificationTarget = { user_id?: string; username?: string };
+const CHANNELS: readonly NotificationChannel[] = ["dingtalk", "feishu"];
 
-function buildDingtalkUrl(webhook: string, secret: string): string {
-	if (!secret) return webhook;
-	const timestamp = Date.now().toString();
-	const stringToSign = `${timestamp}\n${secret}`;
-	const sign = createHmac("sha256", secret).update(stringToSign).digest("base64");
-	return `${webhook}&timestamp=${timestamp}&sign=${encodeURIComponent(sign)}`;
+async function findNotificationUser(target: NotificationTarget, credentials: boolean) {
+	if ((target.user_id !== undefined) === (target.username !== undefined)) {
+		throw new Error("Specify exactly one of user_id or username");
+	}
+	if (!(target.user_id ?? target.username)?.trim()) throw new Error("User identifier is required");
+	const [user] = await db
+		.select({
+			user_id: users.id,
+			username: users.username,
+			dingtalkEnabled: userPreferences.notifyDingtalkEnabled,
+			dingtalkConfigured: sql<boolean>`coalesce(length(trim(${userPreferences.notifyDingtalkWebhook})), 0) > 0`,
+			feishuEnabled: userPreferences.notifyFeishuEnabled,
+			feishuConfigured: sql<boolean>`coalesce(length(trim(${userPreferences.notifyFeishuWebhook})), 0) > 0`,
+			...(credentials
+				? {
+						dingtalkWebhook: userPreferences.notifyDingtalkWebhook,
+						dingtalkSecret: userPreferences.notifyDingtalkSecret,
+						feishuWebhook: userPreferences.notifyFeishuWebhook,
+						feishuSecret: userPreferences.notifyFeishuSecret,
+					}
+				: {}),
+		})
+		.from(users)
+		.leftJoin(userPreferences, eq(users.id, userPreferences.userId))
+		.where(
+			target.user_id !== undefined
+				? eq(users.id, target.user_id)
+				: eq(users.username, target.username as string),
+		)
+		.limit(1);
+	if (!user) throw new Error("User not found");
+	return user;
+}
+
+function channelStates(user: Awaited<ReturnType<typeof findNotificationUser>>) {
+	return CHANNELS.map((channel) => {
+		const configured = Boolean(
+			channel === "dingtalk" ? user.dingtalkConfigured : user.feishuConfigured,
+		);
+		const enabled = Boolean(channel === "dingtalk" ? user.dingtalkEnabled : user.feishuEnabled);
+		return { channel, configured, enabled, available: configured && enabled };
+	});
+}
+
+/** Exact, single-user lookup. Credentials are not even selected for this operation. */
+export async function listNotificationChannels(target: NotificationTarget) {
+	const user = await findNotificationUser(target, false);
+	return { user_id: user.user_id, username: user.username, channels: channelStates(user) };
+}
+
+export class NotificationSendForbiddenError extends ForbiddenError {
+	constructor() {
+		super(
+			"Notification sending is prohibited in read-only or strict plan mode, or when the narrator no longer exists.",
+		);
+	}
+}
+
+async function assertNotificationSendAllowed(narratorId: string): Promise<void> {
+	// Explicit retry approval can bypass permissionHandler. Re-read the live hard
+	// ceiling here instead of trusting the authorization or mode of the first attempt.
+	const [narrator] = await db
+		.select({
+			permissionMode: narrators.permissionMode,
+			traits: narrators.traits,
+			relaxedPlan: narrators.relaxedPlan,
+		})
+		.from(narrators)
+		.where(eq(narrators.id, narratorId))
+		.limit(1);
+	if (
+		!narrator ||
+		narrator.permissionMode === "readOnly" ||
+		(isPlanModeTrait(narrator.traits) &&
+			!resolveEffectiveRelaxedPlan(narrator.permissionMode, narrator.relaxedPlan))
+	) {
+		throw new NotificationSendForbiddenError();
+	}
+}
+/** Explicit sends deliberately do not consult notifyOnDone / notifyOnWaiting or recent tabs. */
+export async function sendUserNotification(
+	input: NotificationTarget & {
+		title: string;
+		message: string;
+		channels?: NotificationChannel[];
+	},
+	context: { narratorId: string; signal?: AbortSignal },
+) {
+	if (
+		!input.title?.trim() ||
+		input.title.length > 120 ||
+		!input.message?.trim() ||
+		input.message.length > 4000
+	) {
+		throw new Error("title must contain 1-120 characters and message 1-4000 characters");
+	}
+	if (
+		input.channels &&
+		(input.channels.length < 1 ||
+			input.channels.length > 2 ||
+			input.channels.some((channel) => !CHANNELS.includes(channel)))
+	) {
+		throw new Error("channels must contain 1-2 dingtalk/feishu entries");
+	}
+	await assertNotificationSendAllowed(context.narratorId);
+	const user = await findNotificationUser(input, true);
+	const states = channelStates(user);
+	const requested = input.channels
+		? [...new Set(input.channels)]
+		: states.filter((state) => state.available).map((state) => state.channel);
+	const results = await Promise.all(
+		requested.map(async (channel): Promise<NotificationDeliveryResult> => {
+			const state = states.find((state) => state.channel === channel);
+			if (!state?.available) {
+				const result: NotificationDeliveryResult = {
+					channel,
+					status: "not_sent",
+					reason: state?.configured ? "disabled" : "not_configured",
+				};
+				logger.info("Webhook notification delivery", {
+					source: "narrator",
+					narratorId: context.narratorId,
+					userId: user.user_id,
+					channel,
+					durationMs: 0,
+					status: result.status,
+					reason: result.reason,
+				});
+				return result;
+			}
+			return deliverNotification({
+				channel,
+				webhook: (channel === "dingtalk" ? user.dingtalkWebhook : user.feishuWebhook) ?? "",
+				secret: (channel === "dingtalk" ? user.dingtalkSecret : user.feishuSecret) ?? "",
+				title: input.title,
+				message: input.message,
+				signal: context.signal,
+				source: "narrator",
+				narratorId: context.narratorId,
+				userId: user.user_id,
+			});
+		}),
+	);
+	const successes = results.filter((result) => result.status === "success").length;
+	return {
+		user_id: user.user_id,
+		username: user.username,
+		status:
+			successes === results.length && results.length > 0
+				? "success"
+				: successes > 0
+					? "partial_failure"
+					: results.some((result) => result.status === "failed")
+						? "failed"
+						: "not_sent",
+		...(results.length === 0 ? { reason: "no_available_channels" } : {}),
+		results,
+	};
 }
 
 async function sendDingtalk(
 	webhook: string,
 	secret: string,
 	title: string,
-	text: string,
+	message: string,
 ): Promise<void> {
-	const url = buildDingtalkUrl(webhook, secret);
-	const res = await fetch(url, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({
-			msgtype: "markdown",
-			markdown: { title, text },
-		}),
+	const result = await deliverNotification({
+		channel: "dingtalk",
+		webhook,
+		secret,
+		title,
+		message,
+		source: "test",
 	});
-	if (!res.ok) {
-		throw new Error(`DingTalk webhook failed: ${res.status} ${await res.text()}`);
-	}
-}
-
-// --- Feishu helpers ---
-
-function buildFeishuSign(timestamp: string, secret: string): string {
-	const stringToSign = `${timestamp}\n${secret}`;
-	return createHmac("sha256", stringToSign).update("").digest("base64");
+	if (result.status !== "success") throw new Error(`Notification failed: ${result.reason}`);
 }
 
 async function sendFeishu(
 	webhook: string,
 	secret: string,
 	title: string,
-	content: string,
+	message: string,
 ): Promise<void> {
-	const timestamp = Math.floor(Date.now() / 1000).toString();
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON body
-	const body: any = {
-		msg_type: "interactive",
-		card: {
-			header: {
-				title: { tag: "plain_text", content: title },
-			},
-			elements: [{ tag: "markdown", content }],
-		},
-	};
-	if (secret) {
-		body.timestamp = timestamp;
-		body.sign = buildFeishuSign(timestamp, secret);
-	}
-	const res = await fetch(webhook, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify(body),
+	const result = await deliverNotification({
+		channel: "feishu",
+		webhook,
+		secret,
+		title,
+		message,
+		source: "test",
 	});
-	if (!res.ok) {
-		throw new Error(`Feishu webhook failed: ${res.status} ${await res.text()}`);
-	}
+	if (result.status !== "success") throw new Error(`Notification failed: ${result.reason}`);
 }
 
 // --- Test helpers ---
@@ -188,42 +324,33 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 		if (reason === "done" && !pref.notifyOnDone) continue;
 		if (reason === "waiting_permission" && !pref.notifyOnWaiting) continue;
 
-		const promises: Promise<void>[] = [];
-
+		const promises: Promise<NotificationDeliveryResult>[] = [];
+		const context = { source: "automatic" as const, narratorId, userId: pref.userId };
 		if (pref.notifyDingtalkEnabled && pref.notifyDingtalkWebhook) {
 			promises.push(
-				sendDingtalk(
-					pref.notifyDingtalkWebhook,
-					pref.notifyDingtalkSecret,
-					`NarraFork: ${narratorTitle}`,
-					markdownText,
-				),
+				deliverNotification({
+					...context,
+					channel: "dingtalk",
+					webhook: pref.notifyDingtalkWebhook,
+					secret: pref.notifyDingtalkSecret,
+					title: `NarraFork: ${narratorTitle}`,
+					message: markdownText,
+				}),
 			);
 		}
-
 		if (pref.notifyFeishuEnabled && pref.notifyFeishuWebhook) {
 			promises.push(
-				sendFeishu(
-					pref.notifyFeishuWebhook,
-					pref.notifyFeishuSecret,
-					"NarraFork Notification",
-					markdownText,
-				),
+				deliverNotification({
+					...context,
+					channel: "feishu",
+					webhook: pref.notifyFeishuWebhook,
+					secret: pref.notifyFeishuSecret,
+					title: "NarraFork Notification",
+					message: markdownText,
+				}),
 			);
 		}
-
-		if (promises.length > 0) {
-			const results = await Promise.allSettled(promises);
-			for (const r of results) {
-				if (r.status === "rejected") {
-					logger.error("Webhook notification failed", {
-						narratorId,
-						userId: pref.userId,
-						error: r.reason instanceof Error ? r.reason.message : String(r.reason),
-					});
-				}
-			}
-		}
+		await Promise.all(promises);
 	}
 }
 

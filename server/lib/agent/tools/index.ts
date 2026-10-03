@@ -25,6 +25,7 @@ import { knowledgeReviewTool } from "./knowledge-review";
 import { learningGuideTool } from "./learning-guide";
 import { mcpAdminTool } from "./mcp-admin";
 import { narraforkAdminTool } from "./narrafork-admin";
+import { notificationTool } from "./notification";
 import { packActivateTool, packDeactivateTool, packListTool } from "./pack";
 import { extractPipelineTool, startPipelineTool } from "./pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
@@ -59,6 +60,7 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Eval", evalTool],
 	["Terminal", terminalTool],
 	["ShareFile", shareFileTool],
+	["Notification", notificationTool],
 	["Recall", recallTool],
 	["Browser", browserTool],
 	["ForkNarrator", forkNarratorTool],
