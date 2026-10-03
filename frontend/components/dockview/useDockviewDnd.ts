@@ -18,6 +18,8 @@ import {
 	type DropZoneThresholds,
 	hitTestGroups,
 	intentToPosition,
+	type NativeDropEvent,
+	nativeContentPanelId,
 	resolveNativeDrop,
 	toIndicator,
 } from "./drop-intent";
@@ -275,6 +277,29 @@ export function dropExistingPanel(
 		panel.api.moveTo({ group, position: intentToPosition(target.intent) });
 	}
 	panel.api.setActive();
+}
+
+/** Commit a local native content drop without falling back to a stale native target. */
+export function dropNativePanel(
+	api: DockviewApi,
+	event: NativeDropEvent & { defaultPrevented: boolean; preventDefault(): void },
+	thresholds?: DropZoneThresholds,
+	enableSwapZone = true,
+): boolean {
+	if (event.defaultPrevented || !nativeContentPanelId(api, event)) return false;
+	// We own this content gesture even when the release is outside every group.
+	// Returning to Dockview then would commit its latched hover position instead.
+	event.preventDefault();
+	const resolved = resolveNativeDrop(api, event, thresholds, enableSwapZone, "release");
+	if (resolved) {
+		const { panelId, hit } = resolved;
+		dropExistingPanel(api, panelId, {
+			groupId: hit.group.id,
+			intent: hit.intent,
+			targetPanelId: hit.targetPanelId,
+		});
+	}
+	return true;
 }
 
 export function useDockviewDnd(options: UseDockviewDndOptions): UseDockviewDndResult {

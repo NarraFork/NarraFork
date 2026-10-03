@@ -2054,6 +2054,8 @@ function TabItemBody({
 					leftSection={
 						<span
 							style={{
+								display: "flex",
+								alignItems: "center",
 								cursor: dragNarratorId ? "grab" : undefined,
 								// Long-press activation belongs to the same touch sensor as the body.
 								touchAction: "pan-y",
@@ -2212,7 +2214,7 @@ function TabIndicators({ tab, t }: TabIndicatorsProps) {
 					position="right"
 				>
 					<Group gap={1} wrap="nowrap">
-						<IconTerminal2 size={11} style={{ opacity: 0.6 }} />
+						<IconTerminal2 size={11} style={{ opacity: 0.6, transform: "translateY(-1px)" }} />
 						<Text size="xs" c="dimmed" lh={1}>
 							{tab.activeTerminalCount}
 						</Text>

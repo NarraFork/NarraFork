@@ -1,4 +1,6 @@
 import { z } from "zod/v4";
+import { getSearchExecutionScope, matchesSearchExecutionScope } from "../../search/execution-scope";
+import { usesSideRequestNativeSearch } from "../../search/native";
 import { executeSearch, hasUsableFunctionSearchChannel } from "../../search/router";
 
 export { isAbortError, withSearchTimeout } from "../../search/timeout";
@@ -65,7 +67,12 @@ export const webSearchTool: ToolDefinition = {
 		recency_days: looseNumber("Prefer results from this many recent days"),
 		max_results: looseNumber("Maximum number of results requested"),
 	}),
-	isAvailable: () => hasUsableFunctionSearchChannel(),
+	isAvailable: () => {
+		const scope = getSearchExecutionScope();
+		return scope
+			? usesSideRequestNativeSearch(scope.provider, scope.model)
+			: hasUsableFunctionSearchChannel();
+	},
 	async execute(args, ctx): Promise<ToolResult> {
 		const parsed = args as {
 			query: string;
@@ -77,7 +84,29 @@ export const webSearchTool: ToolDefinition = {
 		};
 
 		try {
-			const result = await executeSearch({
+			const scope = getSearchExecutionScope();
+			// Search runtimes must never re-enter the ordinary channel router.
+			const searchOnly = ctx.runtimePolicy?.searchOnly === true;
+			if (
+				scope &&
+				(!ctx.provider || !ctx.model || !matchesSearchExecutionScope(ctx.provider, ctx.model))
+			) {
+				throw new Error("WebSearch provider/model does not match the search execution scope");
+			}
+			if (
+				(scope || searchOnly) &&
+				!usesSideRequestNativeSearch(
+					scope?.provider ?? ctx.provider ?? "",
+					scope?.model ?? ctx.model,
+				)
+			) {
+				throw new Error("This search runtime has no native side-request search provider");
+			}
+			const search =
+				scope || searchOnly
+					? (await import("../../search/router")).executeNativeSearch
+					: executeSearch;
+			const result = await search({
 				query: parsed.query,
 				purpose: parsed.purpose,
 				allowedDomains: parsed.allowed_domains,

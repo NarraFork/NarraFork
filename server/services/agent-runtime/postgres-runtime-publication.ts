@@ -65,6 +65,7 @@ import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { withPgRetry } from "../../db/pg-retry";
 import {
 	backgroundTasks,
+	runtimeAwaitedTerminalConsumptions as consumptions,
 	narratorBufferedMessages as mailbox,
 	narratorMessages as messages,
 	narrators,
@@ -93,6 +94,17 @@ import {
 	type PublicationRun,
 	publicationDedupeKey,
 } from "./publication-outbox";
+import {
+	AGENT_RESULT_JSON_MAX_BYTES,
+	AGENT_RESULT_OUTPUT_CHARS,
+	type AgentTerminalResult,
+	type AgentTerminalResultReadOptions,
+	type AwaitedTerminalConsumeOptions,
+	agentSourceResultRef,
+	decodeAgentTerminalSnapshot,
+	decodeRunAssistantProjection,
+	parseRunSourceBoundary,
+} from "./publication-result";
 import type { PgRuntimeTx, RuntimeQueuePort } from "./runtime-queue-port";
 import { translateWriteError } from "./runtime-write";
 
@@ -176,6 +188,12 @@ export interface PgPublicationTxPrimitives {
 		source: LegacyPublicationSource,
 		admission: Readonly<LegacyCompletionAdmission> | undefined,
 	) => Promise<LegacyCompletionRegistration>;
+	/** Transaction-local consumption; caller prelocks narrator rows before source persistence. */
+	readonly consumeAwaitedTerminal: (
+		tx: PgRuntimeTx,
+		run: PublicationRun,
+		options?: AwaitedTerminalConsumeOptions,
+	) => Promise<void>;
 	/** Post-commit evidence freeze for a completed registration; never inside a section. */
 	readonly freezeLegacyCompletionEvidence: (admission: Readonly<LegacyCompletionAdmission>) => void;
 }
@@ -223,6 +241,7 @@ export interface PgTerminalCommitInput {
 	/** The producer's result text; the agent kind snapshots it into a message/ref. */
 	readonly text: string;
 	readonly summary: string;
+	readonly delivery?: "background" | "foreground";
 }
 
 export interface PgLegacyTaskNoticeInput {
@@ -484,20 +503,31 @@ export function createPostgresRuntimePublication(
 			.from(outbox)
 			.where(eq(outbox.dedupeKey, publicationDedupeKey(run, "terminal")))
 			.limit(1);
-		const boundary = source[0]?.resultRef?.startsWith("source_after:")
-			? Number(source[0].resultRef.slice(13))
-			: undefined;
+		const consumed = await tx
+			.select({ sourceResultRef: consumptions.sourceResultRef })
+			.from(consumptions)
+			.where(
+				and(
+					eq(consumptions.producerKind, run.producerKind),
+					eq(consumptions.taskId, run.taskId),
+					eq(consumptions.logicalRunId, run.logicalRunId),
+					eq(consumptions.recipientId, run.recipientId),
+				),
+			)
+			.limit(1);
+		const capturedSourceRef = agentSourceResultRef(consumed[0]?.sourceResultRef);
+		const boundary = parseRunSourceBoundary(source[0]?.resultRef);
 		const assistant =
-			boundary !== undefined && Number.isSafeInteger(boundary)
+			!capturedSourceRef && boundary !== null
 				? (
 						await tx
-							.select({ id: messages.id, role: messages.role })
+							.select({ id: messages.id, role: messages.role, narratorId: messages.narratorId })
 							.from(refs)
 							.innerJoin(messages, eq(messages.id, refs.messageId))
 							.where(and(eq(refs.narratorId, run.taskId), gt(refs.seq, boundary)))
 							.orderBy(desc(refs.seq))
 							.limit(L.pageSize)
-					).find((row) => row.role === "assistant")
+					).find((row) => row.role === "assistant" && row.narratorId === run.taskId)
 				: undefined;
 		// Capture only the already-supported idle display projection. The complete result
 		// remains in its existing source; later semantic edits must not change this receipt.
@@ -521,9 +551,11 @@ export function createPostgresRuntimePublication(
 						logicalRunId: run.logicalRunId,
 						truncated,
 						originalBytes,
-						sourceResultRef: assistant
-							? `message:${assistant.id}`
-							: `background_task:${run.taskId}:${run.logicalRunId}`,
+						sourceResultRef:
+							capturedSourceRef ??
+							(assistant
+								? `message:${assistant.id}`
+								: `background_task:${run.taskId}:${run.logicalRunId}`),
 					},
 				},
 			],
@@ -537,7 +569,149 @@ export function createPostgresRuntimePublication(
 		};
 	}
 
+	async function readAssistantSource(
+		run: PublicationRun,
+		messageId: string,
+	): Promise<AgentTerminalResult | null> {
+		const projection = await db
+			.select({
+				plain: sql<
+					string | null
+				>`CASE WHEN ${messages.originalContentJson} IS NULL THEN substring(${messages.contentText} from 1 for ${AGENT_RESULT_OUTPUT_CHARS + 1}) ELSE NULL END`,
+				json: sql<
+					string | null
+				>`CASE WHEN octet_length(COALESCE(${messages.originalContentJson}, ${messages.contentJson})) <= ${AGENT_RESULT_JSON_MAX_BYTES} THEN COALESCE(${messages.originalContentJson}, ${messages.contentJson}) ELSE NULL END`,
+			})
+			.from(messages)
+			.where(
+				and(
+					eq(messages.id, messageId),
+					eq(messages.narratorId, run.taskId),
+					eq(messages.role, "assistant"),
+				),
+			)
+			.limit(1);
+		const result = projection[0]
+			? decodeRunAssistantProjection(projection[0].plain, projection[0].json)
+			: null;
+		const sourceResultRef = agentSourceResultRef(`message:${messageId}`);
+		return result ? { ...result, ...(sourceResultRef ? { sourceResultRef } : {}) } : null;
+	}
+	async function readAgentTerminalResult(
+		run: PublicationRun,
+		readOptions: AgentTerminalResultReadOptions = {},
+	): Promise<AgentTerminalResult | null> {
+		if (run.producerKind !== "agent") return null;
+		const keys = (["completed", "failed", "timed_out", "cancelled"] as const).map((event) =>
+			publicationDedupeKey(run, event),
+		);
+		const intents = await db
+			.select({ eventKind: outbox.eventKind, state: outbox.state, resultRef: outbox.resultRef })
+			.from(outbox)
+			.where(
+				and(
+					eq(outbox.producerKind, "agent"),
+					eq(outbox.taskId, run.taskId),
+					eq(outbox.logicalRunId, run.logicalRunId),
+					eq(outbox.recipientId, run.recipientId),
+					ne(outbox.eventKind, "started"),
+				),
+			)
+			.limit(1);
+		const intent = intents[0];
+		const deliveries = await db
+			.select({ id: mailbox.id })
+			.from(mailbox)
+			.where(
+				and(
+					eq(mailbox.narratorId, run.recipientId),
+					eq(mailbox.kind, "task_notice"),
+					eq(mailbox.noticeKind, "agent"),
+					inArray(mailbox.dedupeKey, keys),
+				),
+			)
+			.limit(1);
+		const consumed = await db
+			.select({ taskId: consumptions.taskId, sourceResultRef: consumptions.sourceResultRef })
+			.from(consumptions)
+			.where(
+				and(
+					eq(consumptions.producerKind, "agent"),
+					eq(consumptions.taskId, run.taskId),
+					eq(consumptions.logicalRunId, run.logicalRunId),
+					eq(consumptions.recipientId, run.recipientId),
+				),
+			)
+			.limit(1);
+		if (
+			(intent && intent.state !== "reserved" && intent.eventKind !== "terminal") ||
+			deliveries[0] ||
+			consumed[0]
+		) {
+			const receipt = await db
+				.select({
+					json: sql<
+						string | null
+					>`CASE WHEN octet_length(COALESCE(${messages.originalContentJson}, ${messages.contentJson})) <= ${AGENT_RESULT_JSON_MAX_BYTES} THEN COALESCE(${messages.originalContentJson}, ${messages.contentJson}) ELSE NULL END`,
+				})
+				.from(messages)
+				.where(
+					and(
+						eq(messages.id, `publication-result:${run.logicalRunId}`),
+						eq(messages.narratorId, run.taskId),
+						eq(messages.role, "disp"),
+					),
+				)
+				.limit(1);
+			const result = decodeAgentTerminalSnapshot(receipt[0]?.json ?? null, run.logicalRunId);
+			if (result) return result;
+			const exactSource = agentSourceResultRef(consumed[0]?.sourceResultRef);
+			return exactSource ? readAssistantSource(run, exactSource.slice(8)) : null;
+		}
+		if (
+			readOptions.settledRunId !== run.logicalRunId ||
+			intent?.state !== "reserved" ||
+			intent.eventKind !== "terminal" ||
+			!intent.resultRef?.startsWith("source_after:")
+		)
+			return null;
+		const boundary = parseRunSourceBoundary(intent.resultRef);
+		if (boundary === null) return null;
+		const settledActor = async () => {
+			const rows = await db
+				.select({
+					logicalRunId: narrators.logicalRunId,
+					status: narrators.status,
+					parentNarratorId: narrators.parentNarratorId,
+				})
+				.from(narrators)
+				.where(eq(narrators.id, run.taskId))
+				.limit(1);
+			const actor = rows[0];
+			return (
+				actor?.logicalRunId === run.logicalRunId &&
+				actor.status === "idle" &&
+				actor.parentNarratorId === run.recipientId
+			);
+		};
+		if (!(await settledActor())) return null;
+		const candidates = await db
+			.select({ id: messages.id, role: messages.role, narratorId: messages.narratorId })
+			.from(refs)
+			.innerJoin(messages, eq(messages.id, refs.messageId))
+			.where(and(eq(refs.narratorId, run.taskId), gt(refs.seq, boundary)))
+			.orderBy(desc(refs.seq))
+			.limit(L.pageSize);
+		const assistant = candidates.find(
+			(row) => row.role === "assistant" && row.narratorId === run.taskId,
+		);
+		if (!assistant) return null;
+		const result = await readAssistantSource(run, assistant.id);
+		return (await settledActor()) ? result : null;
+	}
+
 	return {
+		readAgentTerminalResult,
 		/**
 		 * Agent start admission: logical run, slot reservation, the `source_after`
 		 * result boundary and the task-row link commit in ONE section.
@@ -556,8 +730,56 @@ export function createPostgresRuntimePublication(
 			taskRow?: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId">;
 		}): Promise<PublicationRun> {
 			return runComposite("publication.startAgentRun", async (tx) => {
+				let resumeRunId = input.resumeRunId;
+				if (input.taskRow && resumeRunId === undefined) {
+					// Actor first: serialize with explicit run starts before adopting its identity.
+					// Do not use getAgentRun here: a missing id is a new start, not legacy admission.
+					await tx.execute(sql`SET LOCAL lock_timeout = '2000ms'`);
+					const actor = await tx
+						.select({ logicalRunId: narrators.logicalRunId })
+						.from(narrators)
+						.where(eq(narrators.id, input.narratorId))
+						.for("update");
+					const currentRunId = actor[0]?.logicalRunId;
+					if (currentRunId) {
+						// Same recipient-first protocol as consume/reserve/commit before examining
+						// the reservation: Await cannot revoke it between adoption and reserve.
+						await tx
+							.select({ id: narrators.id })
+							.from(narrators)
+							.where(eq(narrators.id, input.parentNarratorId))
+							.for("update");
+						const reservation = await tx
+							.select({ id: outbox.id })
+							.from(outbox)
+							.where(
+								and(
+									eq(outbox.producerKind, "agent"),
+									eq(outbox.taskId, input.narratorId),
+									eq(outbox.logicalRunId, currentRunId),
+									eq(outbox.recipientId, input.parentNarratorId),
+									eq(outbox.eventKind, "terminal"),
+									eq(outbox.state, "reserved"),
+								),
+							)
+							.limit(1);
+						const consumed = await tx
+							.select({ taskId: consumptions.taskId })
+							.from(consumptions)
+							.where(
+								and(
+									eq(consumptions.producerKind, "agent"),
+									eq(consumptions.taskId, input.narratorId),
+									eq(consumptions.logicalRunId, currentRunId),
+									eq(consumptions.recipientId, input.parentNarratorId),
+								),
+							)
+							.limit(1);
+						if (reservation[0] && !consumed[0]) resumeRunId = currentRunId;
+					}
+				}
 				const logicalRunId = await primitives.persistLogicalRun(tx, input.narratorId, {
-					...(input.resumeRunId === undefined ? {} : { resumeRunId: input.resumeRunId }),
+					...(resumeRunId === undefined ? {} : { resumeRunId }),
 				});
 				const run: PublicationRun = {
 					producerKind: "agent",
@@ -569,7 +791,7 @@ export function createPostgresRuntimePublication(
 					started: input.started,
 				});
 				if (reservation.status === "full") throw capacityError();
-				if (!input.resumeRunId) {
+				if (!resumeRunId) {
 					// A stable ref boundary, not millisecond timestamps: two runs may start in
 					// the same ms. An empty narrator's watermark is the EMPTY_TOP sentinel
 					// (= base 0 minus one), NOT 0 — the first ref of an empty narrator claims
@@ -713,7 +935,28 @@ export function createPostgresRuntimePublication(
 			if (input.run.producerKind !== "agent")
 				throw new Error("Agent terminal commit requires an agent run");
 			const composite = await runComposite("publication.commitAgentTerminal", async (tx) => {
+				// Narrators precede outbox/mailbox locks, in the same order as refs append.
+				await lockPgNarratorRefs(tx, [input.run.taskId, input.run.recipientId]);
+				const existing =
+					input.delivery === "foreground"
+						? await tx
+								.select({ id: messages.id })
+								.from(messages)
+								.where(eq(messages.id, `publication-result:${input.run.logicalRunId}`))
+								.limit(1)
+						: [];
 				const section = await persistResultSection(tx, input.run, input.text);
+				if (input.delivery === "foreground") {
+					await primitives.consumeAwaitedTerminal(tx, input.run);
+					return {
+						commit: {
+							status: existing[0] ? ("duplicate" as const) : ("committed" as const),
+							deliveryId: null,
+							arrivalSeq: null,
+						},
+						needsSeqFloorMark: section.needsSeqFloorMark,
+					};
+				}
 				const commit = await primitives.commitIntent(tx, {
 					...input.run,
 					eventKind: input.eventKind,

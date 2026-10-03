@@ -1,4 +1,12 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+	STREAMING_EDIT_ORIGIN_MAX_CODE_UNITS,
+	type StreamingEditOrigin,
+	validateStreamingEditOrigin,
+} from "@shared/streaming-edit-origin";
 import { z } from "zod/v4";
 import type { ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
@@ -67,7 +75,7 @@ mock.module("../provider", () => ({
 		model: "test:model",
 	}),
 }));
-const { agentLoop } = await import("../loop");
+const { agentLoop, resolveStreamingEditMetadata } = await import("../loop");
 
 for (const name of names) {
 	toolRegistry.register({
@@ -148,6 +156,138 @@ function run(
 function expectSuccess(events: AgentEvent[]) {
 	expect(events.filter((event) => event.type === "error")).toEqual([]);
 }
+
+describe("trusted streaming Edit origins", () => {
+	for (const changeAtStop of [false, true]) {
+		test(`20k pre-match survives final input without rebinding (changed=${changeAtStop})`, async () => {
+			const dir = await mkdtemp(join(tmpdir(), "nf-edit-origin-"));
+			try {
+				const old = `${"h".repeat(20_000)}\nold`;
+				const input = {
+					value: "origin",
+					file_path: "a.ts",
+					old_string: old,
+					_streamingMetadata: { startLine: 999 },
+					_streamingEditOrigin: { startLine: 999 },
+					new_string: "new",
+				};
+				await writeFile(join(dir, "a.ts"), `${"prefix\n".repeat(41)}${old}\nend`);
+				script = async function* () {
+					yield { toolUseChunk: { toolUseId: "edit-origin", name: "Edit" } };
+					yield {
+						toolUseChunk: {
+							toolUseId: "edit-origin",
+							input: JSON.stringify(input).replace(/"new"\}$/, '"'),
+						},
+					};
+					yield {
+						toolUseChunk: {
+							toolUseId: "edit-origin",
+							input: changeAtStop ? 'new","old_string":"CHANGED"}' : 'new"}',
+							stop: true,
+						},
+					};
+				};
+				const events = await run({ cwd: dir });
+				const preview = events.find(
+					(event) => event.type === "tool_use_chunk" && event.metadata?.startLine === 42,
+				);
+				expect(preview).toBeDefined();
+				const startedEvent = events.find(
+					(event) => event.type === "tool_call" && event.toolUseId === "edit-origin",
+				);
+				if (startedEvent?.type !== "tool_call") throw new Error("missing tool_call");
+				expect(startedEvent.input).not.toHaveProperty("_streamingMetadata");
+				expect(startedEvent.input).not.toHaveProperty("_streamingEditOrigin");
+				if (changeAtStop) expect(startedEvent.streamingEditOrigin).toBeUndefined();
+				else {
+					expect(startedEvent.streamingEditOrigin).toMatchObject({
+						toolUseId: "edit-origin",
+						filePath: "a.ts",
+						device: "local",
+						startLine: 42,
+					});
+					expect(
+						validateStreamingEditOrigin(
+							startedEvent.streamingEditOrigin,
+							"edit-origin",
+							startedEvent.input,
+						),
+					).toBeDefined();
+				}
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		});
+	}
+	test("non-streaming model input cannot mint or persist origin annotations", async () => {
+		script = async function* () {
+			yield {
+				toolUses: [
+					tool("Edit", "batch-origin", 0, {
+						file_path: "a.ts",
+						old_string: "old",
+						new_string: "new",
+						_streamingMetadata: { startLine: 999 },
+						_streamingEditOrigin: { startLine: 999 },
+					}),
+				],
+			};
+		};
+		const events = await run();
+		const call = events.find((event) => event.type === "tool_call");
+		if (call?.type !== "tool_call") throw new Error("missing tool_call");
+		expect(call.streamingEditOrigin).toBeUndefined();
+		expect(call.input).not.toHaveProperty("_streamingMetadata");
+		expect(call.input).not.toHaveProperty("_streamingEditOrigin");
+		const block = events.find(
+			(event) => event.type === "block_complete" && event.block.type === "tool_use",
+		);
+		if (block?.type !== "block_complete" || block.block.type !== "tool_use")
+			throw new Error("missing persisted block");
+		expect(block.block.input).not.toHaveProperty("_streamingMetadata");
+	});
+	test("local matcher cannot issue evidence for remote/default-remote, unmatched or over-budget inputs", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "nf-edit-origin-"));
+		try {
+			await writeFile(join(dir, "a.ts"), `${"prefix\n".repeat(41)}old\nline`);
+			const acc: {
+				name: string;
+				extractedFields: Record<string, string>;
+				streamingEditOrigin?: StreamingEditOrigin;
+			} = {
+				name: "Edit",
+				extractedFields: { file_path: "a.ts", old_string: "old\r\nline" },
+			};
+			expect(await resolveStreamingEditMetadata(acc, dir, "edit", "remote")).toBeUndefined();
+			expect(acc.streamingEditOrigin).toBeUndefined();
+			acc.extractedFields.device = "remote";
+			expect(await resolveStreamingEditMetadata(acc, dir, "edit")).toBeUndefined();
+			acc.extractedFields.device = "local";
+			expect(await resolveStreamingEditMetadata(acc, dir, "edit")).toMatchObject({
+				startLine: 42,
+				endLine: 43,
+			});
+			expect(
+				validateStreamingEditOrigin(acc.streamingEditOrigin, "edit", {
+					file_path: "a.ts",
+					old_string: "old\nline",
+					device: "local",
+				}),
+			).toBeDefined();
+			delete acc.streamingEditOrigin;
+			acc.extractedFields.old_string = "not present";
+			expect(await resolveStreamingEditMetadata(acc, dir, "edit")).toMatchObject({
+				matchStatus: "unmatched",
+			});
+			expect(acc.streamingEditOrigin).toBeUndefined();
+			acc.extractedFields.old_string = "x".repeat(STREAMING_EDIT_ORIGIN_MAX_CODE_UNITS + 1);
+			expect(await resolveStreamingEditMetadata(acc, dir, "edit")).toBeUndefined();
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+});
 
 describe("per-response tool call limit", () => {
 	for (const shape of ["batch", "chunks"] as const) {

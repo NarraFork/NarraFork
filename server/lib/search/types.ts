@@ -17,6 +17,8 @@ export interface SearchRequest {
 	model?: string;
 	/** User who triggered the requesting turn (for the search-subagent channel). */
 	userId?: string | null;
+	/** Server-owned settings probe; never accepted from a WebSearch tool call. */
+	testMode?: boolean;
 }
 
 export interface SearchResultItem {

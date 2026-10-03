@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ModelMetadata } from "@shared/model-catalog/schema/catalog";
 import { setNugCachedModels } from "../../nug-model-cache";
+import { withSearchExecutionScope } from "../../search/execution-scope";
 import {
 	supportsNativeSearch,
 	usesInlineNativeSearch,
@@ -371,6 +372,49 @@ describe("actual provider request bodies", () => {
 });
 
 describe("native search and context policy", () => {
+	test("search scope injects native search into a direct Codex-compatible request with native disabled globally", async () => {
+		setMetadata({ nativeSearch: { supported: true } });
+		settings.search = {
+			...settings.search,
+			customProviders: [],
+			channels: [{ id: "native", kind: "native", enabled: false }],
+		};
+		const provider = new OpenAIProvider({
+			...config,
+			apiMode: "codex",
+			codexWebSocket: false,
+			codexImageGeneration: false,
+		});
+		const scoped = await withSearchExecutionScope(
+			{ provider: config.prefix, model, maxTurns: 2 },
+			() => captureChat(provider),
+		);
+		expect(scoped.tools.some((tool: { type: string }) => tool.type === "web_search")).toBe(true);
+		const normal = await captureChat(provider);
+		expect(normal.tools.some((tool: { type: string }) => tool.type === "web_search")).toBe(false);
+	});
+	test("NUG Codex native search uses provider identity, not the reasoning channel identity", async () => {
+		const nugConfig = { ...config, id: "scope-nug", prefix: "scope-nug" };
+		settings.nugProviders = [nugConfig];
+		setNugCachedModels(nugConfig.id, [
+			{ id: "channel:opaque", channel: "channel", channelType: "codex", model: "opaque" },
+		]);
+		settings.search = {
+			...settings.search,
+			customProviders: [],
+			channels: [{ id: "native", kind: "native", enabled: false }],
+		};
+		const scopedModel = `${nugConfig.prefix}:channel:opaque`;
+		const provider = new NugProvider(nugConfig);
+		const scoped = await withSearchExecutionScope(
+			{ provider: nugConfig.prefix, model: scopedModel, maxTurns: 2 },
+			() => captureChat(provider, { model: scopedModel }),
+		);
+		expect(scoped.model).toBe("channel:opaque");
+		expect(scoped.tools.some((tool: { type: string }) => tool.type === "web_search")).toBe(true);
+		const normal = await captureChat(provider, { model: scopedModel });
+		expect(normal.tools.some((tool: { type: string }) => tool.type === "web_search")).toBe(false);
+	});
 	test("Codex model gating removes inline search but retains ordinary WebSearch", async () => {
 		setMetadata({ nativeSearch: { supported: false } });
 		settings.search = {

@@ -3,6 +3,8 @@ import { BASH_TOOL_NAME } from "@server/lib/agent/tool-name";
 /** Server-resolved capabilities, not model-supplied authorization or lifecycle hooks. */
 export interface RuntimePolicy {
 	readonly variant: "primary" | "subagent";
+	/** Search tools may only call the selected provider directly, never the channel router. */
+	readonly searchOnly?: boolean;
 	readonly tools: {
 		readonly builtin: "all" | readonly string[];
 		readonly mcp: "none" | "readOnly" | "nonDenied";
@@ -46,7 +48,14 @@ const READ_TOOLS = Object.freeze([
 	"Send",
 ]);
 const GENERAL_TOOLS = Object.freeze([...READ_TOOLS, "Write", "Edit", "Skill"]);
-const SEARCH_TOOLS = Object.freeze(["WebFetch", "TeamStatus", "Await", "ContextAsk", "Send"]);
+const SEARCH_TOOLS = Object.freeze([
+	"WebSearch",
+	"WebFetch",
+	"TeamStatus",
+	"Await",
+	"ContextAsk",
+	"Send",
+]);
 
 export function resolveRuntimePolicy(input: RuntimePolicyInput): RuntimePolicy {
 	const primary = input.variant === "primary";
@@ -90,6 +99,7 @@ export function resolveRuntimePolicy(input: RuntimePolicyInput): RuntimePolicy {
 	}
 	return Object.freeze({
 		variant: input.variant,
+		searchOnly: !primary && input.subagentType === "search",
 		tools: Object.freeze({
 			builtin: builtin === "all" ? builtin : Object.freeze(builtin),
 			mcp,

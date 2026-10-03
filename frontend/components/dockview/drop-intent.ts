@@ -156,34 +156,44 @@ export function hitTestGroups(
 	return null;
 }
 
-/** Shared by native drop previews and releases; Dockview's center is NOT our swap zone. */
-export function resolveNativeDrop(
-	api: DockviewApi,
-	event: {
-		kind: string;
-		group: DockviewGroupPanel | undefined;
-		nativeEvent: { clientX: number; clientY: number };
-		getData(): { viewId: string; panelId: string | null; tabGroupId?: string } | undefined;
-	},
-	thresholds?: DropZoneThresholds,
-	enableSwapZone = true,
-): { panelId: string; hit: GroupHit } | null {
+export interface NativeDropEvent {
+	kind: string;
+	group: DockviewGroupPanel | undefined;
+	nativeEvent: { clientX: number; clientY: number };
+	getData(): { viewId: string; panelId: string | null; tabGroupId?: string } | undefined;
+}
+
+/** Leave tab sorting, whole-group moves and foreign/external payloads to Dockview. */
+export function nativeContentPanelId(api: DockviewApi, event: NativeDropEvent): string | null {
 	const data = event.getData();
-	// Leave tab sorting, whole-group moves and foreign/external payloads to Dockview.
 	if (event.kind !== "content" || !data?.panelId || data.tabGroupId || data.viewId !== api.id) {
 		return null;
 	}
-	if (!api.getPanel(data.panelId)) return null;
+	return api.getPanel(data.panelId) ? data.panelId : null;
+}
+
+/** Shared by native drop previews and releases; Dockview's center is NOT our swap zone. */
+export function resolveNativeDrop(
+	api: DockviewApi,
+	event: NativeDropEvent,
+	thresholds?: DropZoneThresholds,
+	enableSwapZone = true,
+	phase: "preview" | "release" = "preview",
+): { panelId: string; hit: GroupHit } | null {
+	const panelId = nativeContentPanelId(api, event);
+	if (!panelId) return null;
 	const hit = hitTestGroups(
 		api,
 		event.nativeEvent.clientX,
 		event.nativeEvent.clientY,
-		data.panelId,
+		panelId,
 		thresholds,
 	);
-	if (!hit || hit.group.id !== event.group?.id) return null;
+	// Dockview dispatches a release through its last hover target. That group may
+	// already be stale; never let it override the actual release coordinates.
+	if (!hit || (phase === "preview" && hit.group.id !== event.group?.id)) return null;
 	if (!enableSwapZone && hit.intent === "swap") hit.intent = "merge";
-	return { panelId: data.panelId, hit };
+	return { panelId, hit };
 }
 
 /** Compute the highlight rectangle for a group hit, relative to the root. */

@@ -8,6 +8,7 @@ import { I18nextProvider } from "react-i18next";
 import { SAFE_AREA_INSET_LEFT, SAFE_AREA_INSET_RIGHT } from "../../../lib/safe-area";
 import enNarrator from "../../../locales/en/narrator.json";
 import zhNarrator from "../../../locales/zh-CN/narrator.json";
+import { createPlanReflectionStatusAction } from "../interaction/PlanReflectionStatusControl";
 import {
 	BackgroundTasksStatusButton,
 	NARRATOR_STATUS_RESERVED_TEXT_WIDTH_PX,
@@ -662,6 +663,56 @@ describe("BackgroundTasksStatusButton", () => {
 });
 
 describe("NarratorStatusToolbar", () => {
+	test("keeps the reflection switch reachable in overflow and restores it inline", async () => {
+		const onChange = mock(() => {});
+		const reflection = createPlanReflectionStatusAction({
+			hasPlanTrait: true,
+			supported: true,
+			isWorkspacePreview: false,
+			effective: false,
+			globalDefault: true,
+			disabled: false,
+			onChange,
+			t: (key) => enNarrator[key as keyof typeof enNarrator] as string,
+		});
+		if (!reflection) throw new Error("Missing reflection action");
+		const action: NarratorStatusToolbarAction = {
+			...reflection,
+			render: (mode) =>
+				mode === "inline" ? (
+					<div data-measure-width="160">{reflection.render(mode)}</div>
+				) : (
+					reflection.render(mode)
+				),
+		};
+		await renderToolbar(400, [action]);
+		await triggerResize();
+		expect(document.querySelector('[data-toolbar-action="plan-reflection"]')).not.toBeNull();
+		expect(document.querySelector('[data-testid="narrator-status-more"]')).toBeNull();
+
+		await renderToolbar(180, [action]);
+		await triggerResize();
+		expect(document.querySelector('[data-toolbar-action="plan-reflection"]')).toBeNull();
+		const more = document.querySelector<HTMLElement>('[data-testid="narrator-status-more"]');
+		if (!more) throw new Error("Missing overflow entry");
+		await act(async () => more.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+		const input = document.querySelector<HTMLInputElement>(
+			'input[aria-label="Reflection approval off"]',
+		);
+		if (!input) throw new Error("Missing overflow reflection switch");
+		expect(input.closest("button")).toBeNull();
+		await act(async () => {
+			input.checked = true;
+			input.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+		});
+		expect(onChange).toHaveBeenCalledWith("inherit");
+
+		await renderToolbar(400, [action]);
+		await triggerResize();
+		expect(document.querySelector('[data-toolbar-action="plan-reflection"]')).not.toBeNull();
+		expect(document.querySelector('[data-testid="narrator-status-more"]')).toBeNull();
+	});
+
 	test("shows no more button at full width and restores after a resize", async () => {
 		const onTerminal = mock(() => {});
 		const actions = makeActions(onTerminal);

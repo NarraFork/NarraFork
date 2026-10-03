@@ -636,6 +636,16 @@ export function resolvePermissionDecision(
 		return resolveChapterGitIssueDecision(effectiveMode);
 	}
 
+	// A tool allowlist must not turn a read-only/strict-plan session into an
+	// external notification sender. Unknown actions are conservatively mutating.
+	if (
+		toolName === "Notification" &&
+		input.action !== "list_channels" &&
+		effectiveMode === "readOnly"
+	) {
+		return "deny";
+	}
+
 	const whitelistDecision = resolveWhitelistDecision(
 		toolName,
 		input,
@@ -714,6 +724,16 @@ export function resolvePermissionDecision(
 	if (toolName === "ScheduledTask") {
 		if (isScheduledTaskReadAction(input.action)) return "allow";
 		if (effectiveMode === "readOnly" || effectiveMode === "dontAsk") return "deny";
+		return "ask";
+	}
+
+	// Notification only exposes non-secret channel metadata for reads. Sending
+	// is an external side effect: use ordinary approval/allowlist/bypass semantics.
+	if (toolName === "Notification") {
+		if (input.action === "list_channels") return "allow";
+		if (input.action === "send" && opts.notificationPolicy?.allowSend === true) return "allow";
+		if (effectiveMode === "bypassPermissions") return "allow";
+		if (effectiveMode === "dontAsk") return "deny";
 		return "ask";
 	}
 
@@ -914,6 +934,7 @@ const READ_ONLY_TOOLS = [
  */
 function isReadOnlyCall(toolName: string, input: Record<string, unknown>): boolean {
 	if (READ_ONLY_TOOLS.includes(toolName)) return true;
+	if (toolName === "Notification") return input.action === "list_channels";
 	return toolName === "StructSed" && input.dry_run !== false;
 }
 
@@ -1054,6 +1075,7 @@ export interface PermissionDecisionOpts {
 	/** Legacy compatibility fields; routed main flow uses executionContext. */
 	executionBackend?: ExecutionBackend;
 	executionTarget?: Readonly<ToolExecutionTarget>;
+	notificationPolicy?: { allowSend?: boolean };
 	webFetchPolicy?: {
 		allowAll?: boolean;
 		whitelist?: Array<{ pattern: string; enabled?: boolean }>;
@@ -4017,6 +4039,7 @@ export async function handlePermission(
 					projectGitPath: compiledPolicy.projectGitPath ?? undefined,
 					executionBackend: executionContext?.backend,
 					executionTarget: initialExecutionTarget,
+					notificationPolicy: settings.agent.notificationPolicy,
 					webFetchPolicy: settings.agent.webFetchPolicy,
 				});
 	logger.debug("Permission decision", {

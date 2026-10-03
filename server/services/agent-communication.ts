@@ -25,6 +25,7 @@ import {
 } from "./agent-reply-waiter";
 import { enqueueInboxAgent, inboxDelivery, wakeInboxIfEligible } from "./agent-runtime/inbox";
 import { getExecutionOwner } from "./agent-runtime/ownership";
+import { getRuntimePublicationService, type PublicationRun } from "./agent-runtime/publication";
 import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
 import { getSubagentFinalText } from "./narrator-session";
@@ -118,6 +119,9 @@ export interface AwaitAgentResult {
 	status: string;
 	output: string;
 	formatted: string;
+	terminalResultReceived?: boolean;
+	publicationRun?: PublicationRun;
+	sourceResultRef?: string;
 }
 
 export interface SendTargetResult extends SendDeliveryTarget {
@@ -723,6 +727,7 @@ async function buildAwaitAgentResult(
 	status: string,
 	output: string | null | undefined,
 	knownLabel?: string,
+	receipt?: Pick<AwaitAgentResult, "terminalResultReceived" | "publicationRun" | "sourceResultRef">,
 ): Promise<AwaitAgentResult> {
 	let recentActivity: string | undefined;
 	if (status === "timeout" || status === "running") {
@@ -742,6 +747,13 @@ async function buildAwaitAgentResult(
 		status,
 		output: output ?? "(no output)",
 		formatted: formatAgentAwaitResult(label, status, output ?? null, recentActivity),
+		...(receipt
+			? {
+					terminalResultReceived: receipt.terminalResultReceived,
+					publicationRun: receipt.publicationRun,
+					sourceResultRef: receipt.sourceResultRef,
+				}
+			: {}),
 	};
 }
 
@@ -779,21 +791,87 @@ function subagentRunHasSettled(
 	return true;
 }
 
+type SubagentWaitResult = Pick<
+	AwaitAgentResult,
+	"status" | "output" | "terminalResultReceived" | "publicationRun" | "sourceResultRef"
+>;
+
+/** Never pair a later run lookup with an earlier assistant result. */
+async function readSubagentTerminal(
+	subagentId: string,
+	parentNarratorId: string,
+	current: Narrator,
+	observedRunningRunId?: string | null,
+): Promise<SubagentWaitResult> {
+	const run: PublicationRun | undefined = current.logicalRunId
+		? {
+				producerKind: "agent",
+				taskId: subagentId,
+				recipientId: parentNarratorId,
+				logicalRunId: current.logicalRunId,
+			}
+		: undefined;
+	// A matching narrator epoch is not proof that its last assistant belongs to
+	// that epoch: an early failed continuation may still have only the old reply.
+	// Require this run's immutable terminal source, or a post-boundary assistant
+	// after the waiter observed this same run transition from running to settled.
+	const terminalObserved = run !== undefined && observedRunningRunId === run.logicalRunId;
+	const terminal = run
+		? await getRuntimePublicationService()
+				.readAgentTerminalResult(run, {
+					settledRunId: terminalObserved ? run.logicalRunId : undefined,
+				})
+				.catch((error) => {
+					logger.warn("Failed to read run-bound Await result", { run, error: String(error) });
+					return null;
+				})
+		: null;
+	const output =
+		terminal?.output ??
+		(run
+			? "(no output for this run)"
+			: current.isBackground && current.backgroundStatus
+				? (current.backgroundResult ?? "(no output)")
+				: await getSubagentFinalText(subagentId));
+	const latest = await narratorService.getById(subagentId);
+	const status = settledSubagentStatus(
+		current,
+		current.isBackground && current.backgroundStatus && current.backgroundStatus !== "running"
+			? current.backgroundStatus
+			: "completed",
+	);
+	const terminalResultReceived =
+		terminal !== null &&
+		status !== "taken_over" &&
+		subagentRunHasSettled(subagentId, current.status, parseSubstatus(current.substatus)) &&
+		subagentRunHasSettled(subagentId, latest.status, parseSubstatus(latest.substatus)) &&
+		current.logicalRunId === latest.logicalRunId;
+	return {
+		status,
+		output,
+		...(terminalResultReceived
+			? {
+					terminalResultReceived: true,
+					publicationRun: run,
+					sourceResultRef: terminal?.sourceResultRef,
+				}
+			: {}),
+	};
+}
+
 export async function waitForSubagentResult(opts: {
 	subagentId: string;
 	parentNarratorId: string;
 	timeoutMs?: number;
 	signal?: AbortSignal;
-}): Promise<{ status: string; output: string }> {
+}): Promise<SubagentWaitResult> {
 	const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const current = await narratorService.getById(opts.subagentId);
 	if (current.status !== "working" && current.status !== "waiting") {
-		return {
-			status: settledSubagentStatus(current),
-			output: await getSubagentFinalText(opts.subagentId),
-		};
+		return readSubagentTerminal(opts.subagentId, opts.parentNarratorId, current);
 	}
 
+	const observedRunningRunId = current.logicalRunId;
 	return new Promise((resolve) => {
 		let settled = false;
 		let timer: ReturnType<typeof setTimeout> | undefined;
@@ -807,13 +885,33 @@ export async function waitForSubagentResult(opts: {
 			opts.signal?.removeEventListener("abort", onAbort);
 		};
 
-		const finish = async (status: string) => {
-			const [output, latest] = await Promise.all([
-				getSubagentFinalText(opts.subagentId).catch(() => "(no output)"),
-				narratorService.getById(opts.subagentId).catch(() => null),
-			]);
-			cleanup();
-			resolve({ status: latest ? settledSubagentStatus(latest, status) : status, output });
+		let finishing = false;
+		const finish = async (_status: string) => {
+			if (settled || finishing) return;
+			finishing = true;
+			try {
+				const current = await narratorService.getById(opts.subagentId);
+				if (
+					!subagentRunHasSettled(opts.subagentId, current.status, parseSubstatus(current.substatus))
+				)
+					return;
+				const result = await readSubagentTerminal(
+					opts.subagentId,
+					opts.parentNarratorId,
+					current,
+					observedRunningRunId,
+				);
+				if (settled) return; // Interrupt/timeout wins while result reads are in flight.
+				cleanup();
+				resolve(result);
+			} catch (err) {
+				logger.warn("Failed to read subagent terminal result", {
+					subagentId: opts.subagentId,
+					error: String(err),
+				});
+			} finally {
+				finishing = false;
+			}
 		};
 
 		const onCompleted = (event: { narratorId: string; parentNarratorId: string }) => {
@@ -958,30 +1056,22 @@ async function awaitBackgroundAgentTask(opts: AwaitAgentInput) {
 	const subagentId = task.subagentNarratorId ?? task.id;
 	notifyTargetResolved(opts, subagentId);
 	const current = await narratorService.getById(subagentId).catch(() => null);
+	if (current && isTakenOver(subagentId)) return null;
 	if (current && task.status !== "running" && !current.isBackground) {
 		// The background task row is from a previous run. The same subagent may have
 		// since been continued via Send, so fall through to narrator-state waiting.
 		return null;
 	}
 
-	if (task.status === "running") {
-		const { signal, relabel } = buildAwaitTimeoutContext(opts);
-		const waited = await backgroundTaskService.waitForCompletion(
-			task.id,
-			opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-			signal,
-		);
-		return {
-			id: subagentId,
-			status: relabel(waited.status),
-			output: waited.output,
-		};
-	}
-	return {
-		id: subagentId,
-		status: task.status === "timeout" ? "timed_out" : task.status,
-		output: task.output,
-	};
+	// The terminal row can restart before the waiter rechecks it. Both paths must
+	// use the same deadline signal and preserve the waiter's exact result/run receipt.
+	const { signal, relabel } = buildAwaitTimeoutContext(opts);
+	const waited = await backgroundTaskService.waitForCompletion(
+		task.id,
+		opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+		signal,
+	);
+	return { id: subagentId, ...waited, status: relabel(waited.status) };
 }
 
 export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<AwaitAgentResult> {
@@ -995,6 +1085,8 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 			background.id,
 			background.status,
 			background.output,
+			undefined,
+			background,
 		);
 	}
 
@@ -1004,8 +1096,14 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 	notifyTargetResolved(opts, target.id);
 	// The narrator row is in hand, so the label needs no extra query.
 	const label = agentLabelFromNarrator(target, scope.teamParentId);
-	const build = (status: string, output: string | null | undefined) =>
-		buildAwaitAgentResult(scope.teamParentId, target.id, status, output, label);
+	const build = (
+		status: string,
+		output: string | null | undefined,
+		receipt?: Pick<
+			AwaitAgentResult,
+			"terminalResultReceived" | "publicationRun" | "sourceResultRef"
+		>,
+	) => buildAwaitAgentResult(scope.teamParentId, target.id, status, output, label, receipt);
 	if (target.isBackground && target.backgroundStatus === "running") {
 		const { signal, relabel } = buildAwaitTimeoutContext(opts);
 		const waited = await waitForBackgroundTask(
@@ -1013,10 +1111,25 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 			opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
 			signal,
 		);
+		// Legacy background completion events have no run. Verify their result against
+		// the same narrator epoch captured BEFORE waiting, never getAgentRun afterward.
+		const latest = await narratorService.getById(target.id).catch(() => null);
+		if (
+			["completed", "failed", "cancelled", "timed_out"].includes(waited.status) &&
+			latest &&
+			target.logicalRunId === latest.logicalRunId
+		) {
+			const terminal = await readSubagentTerminal(
+				target.id,
+				scope.teamParentId,
+				latest,
+				target.status === "working" || target.status === "waiting"
+					? target.logicalRunId
+					: undefined,
+			);
+			return build(relabel(waited.status), terminal.output, terminal);
+		}
 		return build(relabel(waited.status), waited.result);
-	}
-	if (target.isBackground && target.backgroundStatus) {
-		return build(target.backgroundStatus, target.backgroundResult);
 	}
 	if (target.status === "working" || target.status === "waiting") {
 		// If the subagent is being taken over by the user, do not block waiting for
@@ -1031,9 +1144,10 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 			timeoutMs: opts.timeoutMs,
 			signal,
 		});
-		return build(relabel(waited.status), waited.output);
+		return build(relabel(waited.status), waited.output, waited);
 	}
-	return build(settledSubagentStatus(target), await getSubagentFinalText(target.id));
+	const terminal = await readSubagentTerminal(target.id, scope.teamParentId, target);
+	return build(terminal.status, terminal.output, terminal);
 }
 
 export async function awaitAgentResult(opts: AwaitAgentInput): Promise<string> {

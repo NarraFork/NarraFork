@@ -85,6 +85,7 @@ import { WriteConflictError } from "../../db/backend/write-port";
 import { withPgRetry } from "../../db/pg-retry";
 import {
 	backgroundTasks,
+	runtimeAwaitedTerminalConsumptions as consumptions,
 	narratorBufferedMessages as mailbox,
 	narratorMessageRefs,
 	narrators,
@@ -94,8 +95,15 @@ import {
 } from "../../db/postgres-schema";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
+import { lockPgNarratorRefs, restrictPgNarratorLocks } from "../narrator-refs/postgres-store";
 import { MAILBOX_LIMITS as L } from "./limits";
-import { boundedError, boundedJson, mailboxDedupeKey, pointer } from "./mailbox-shared";
+import {
+	AWAITED_TERMINAL_CONSUMED_REASON,
+	boundedError,
+	boundedJson,
+	mailboxDedupeKey,
+	pointer,
+} from "./mailbox-shared";
 import type {
 	MailboxClaim,
 	MailboxInput,
@@ -116,6 +124,7 @@ import {
 	type PublicationRun,
 	publicationDedupeKey,
 } from "./publication-outbox";
+import { type AwaitedTerminalConsumeOptions, agentSourceResultRef } from "./publication-result";
 import {
 	bindRuntimeQueue,
 	getRuntimeQueuePort,
@@ -226,10 +235,13 @@ export interface PgClaimOwner {
  * recipient message + ref through the SAME `tx`, and it must still use the reserved
  * message identity.
  */
-export type PgMaterializer = (
+export type PgMaterializer = ((
 	tx: PgRuntimeTx,
 	row: PgMailboxRow,
-) => MaterializedBinding | Promise<MaterializedBinding>;
+) => MaterializedBinding | Promise<MaterializedBinding>) & {
+	/** Read-only planning before any narrator/claim locks. Omission means recipient-only. */
+	planNarratorLocks?: (tx: PgRuntimeTx, claim: MailboxClaim) => Promise<readonly string[]>;
+};
 
 /**
  * Fail-closed verdict for the schema-dependent legacy surface. Raised by the
@@ -425,7 +437,7 @@ function claimWhere(claim: MailboxClaim) {
 }
 
 async function requireClaim(tx: PgRuntimeTx, claim: MailboxClaim): Promise<PgMailboxRow> {
-	const rows = await tx.select().from(mailbox).where(claimWhere(claim));
+	const rows = await tx.select().from(mailbox).where(claimWhere(claim)).for("update");
 	const row = rows[0];
 	if (!row) throw new Error("Stale mailbox claim");
 	return row;
@@ -1072,11 +1084,104 @@ export function createPostgresRuntimeQueue(
 		return claimed;
 	}
 
+	/** One lock order for Await/commit/transfer/materialize: recipient BEFORE outbox/mailbox.
+	 * Held until transaction commit, including an async materializer's history writes. */
+	async function lockPublicationRecipient(tx: PgRuntimeTx, recipientId: string): Promise<boolean> {
+		// Bound lock waits; withPgRetry replays the whole atomic section on 55P03.
+		await tx.execute(sql`SET LOCAL lock_timeout = '2000ms'`);
+		const rows = await tx
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(eq(narrators.id, recipientId))
+			.for("update");
+		return !!rows[0];
+	}
+	async function isAwaitedTerminal(tx: PgRuntimeTx, run: PublicationRun): Promise<boolean> {
+		const rows = await tx
+			.select({ taskId: consumptions.taskId })
+			.from(consumptions)
+			.where(
+				and(
+					eq(consumptions.producerKind, run.producerKind),
+					eq(consumptions.taskId, run.taskId),
+					eq(consumptions.logicalRunId, run.logicalRunId),
+					eq(consumptions.recipientId, run.recipientId),
+				),
+			)
+			.limit(1);
+		return !!rows[0];
+	}
+	async function consumeAwaitedTerminalSection(
+		tx: PgRuntimeTx,
+		run: PublicationRun,
+		options: AwaitedTerminalConsumeOptions = {},
+	): Promise<void> {
+		assertPgRun(run);
+		if (!(await lockPublicationRecipient(tx, run.recipientId))) return;
+		const sourceResultRef = agentSourceResultRef(options.sourceResultRef);
+		if (options.sourceResultRef !== undefined && !sourceResultRef)
+			throw new Error("Invalid awaited result source reference");
+		await tx
+			.insert(consumptions)
+			.values({ ...run, consumedAt: now(), sourceResultRef: sourceResultRef ?? null })
+			.onConflictDoUpdate({
+				target: [
+					consumptions.producerKind,
+					consumptions.taskId,
+					consumptions.logicalRunId,
+					consumptions.recipientId,
+				],
+				set: {
+					sourceResultRef: sql`COALESCE(${consumptions.sourceResultRef}, ${sourceResultRef ?? null})`,
+				},
+			});
+		await tx
+			.delete(outbox)
+			.where(
+				and(
+					runWhere(run),
+					inArray(outbox.eventKind, ["terminal", "completed", "failed", "timed_out", "cancelled"]),
+				),
+			);
+		const keys = (["completed", "failed", "timed_out", "cancelled"] as const).map((event) =>
+			publicationDedupeKey(run, event),
+		);
+		await tx
+			.update(mailbox)
+			.set({
+				state: "cancelled",
+				...releasedPayload,
+				claimToken: null,
+				claimEpoch: null,
+				claimedAt: null,
+				lastError: AWAITED_TERMINAL_CONSUMED_REASON,
+				updatedAt: now(),
+			})
+			.where(
+				and(
+					eq(mailbox.narratorId, run.recipientId),
+					eq(mailbox.kind, "task_notice"),
+					eq(mailbox.noticeKind, run.producerKind),
+					inArray(mailbox.dedupeKey, keys),
+					inArray(mailbox.state, ["queued", "claimed", "failed"]),
+					isNull(mailbox.recipientRefId),
+					isNull(mailbox.currentMessageId),
+				),
+			);
+	}
 	async function materializeSection(
 		tx: PgRuntimeTx,
 		claim: MailboxClaim,
 		materializer: PgMaterializer,
 	): Promise<PgMailboxRow> {
+		const dependencies = (await materializer.planNarratorLocks?.(tx, claim)) ?? [];
+		if (dependencies.length > L.pageSize)
+			throw new Error("Materializer narrator lock budget exceeded");
+		const narratorIds = [...new Set([claim.narratorId, ...dependencies])].sort();
+		await tx.execute(sql`SET LOCAL lock_timeout = '2000ms'`);
+		await lockPgNarratorRefs(tx, narratorIds);
+		restrictPgNarratorLocks(tx, narratorIds);
+		// Revalidate state/token/epoch under the claim row lock, AFTER all narrator locks.
 		const row = await requireClaim(tx, claim);
 		const binding = await materializer(tx, row);
 		if (binding.messageId !== row.recipientMessageId)
@@ -1249,7 +1354,14 @@ export function createPostgresRuntimeQueue(
 			throw new Error("Unknown legacy source can only use its failure slot");
 		if (run.logicalRunId.startsWith("legacy:completed:"))
 			throw new Error("Legacy completion can only use its captured event slot");
-		const events = options.started ? (["started", "terminal"] as const) : (["terminal"] as const);
+		await lockPublicationRecipient(tx, run.recipientId);
+		const events = (await isAwaitedTerminal(tx, run))
+			? options.started
+				? (["started"] as const)
+				: []
+			: options.started
+				? (["started", "terminal"] as const)
+				: (["terminal"] as const);
 		const existing = await tx
 			.select({ event: outbox.eventKind })
 			.from(outbox)
@@ -1332,6 +1444,9 @@ export function createPostgresRuntimeQueue(
 			throw new Error("Unknown legacy source can only publish failed outcome");
 		if (!["started", "completed", "failed", "timed_out", "cancelled"].includes(intent.eventKind))
 			throw new Error("Invalid publication event identity");
+		await lockPublicationRecipient(tx, intent.recipientId);
+		if (intent.eventKind !== "started" && (await isAwaitedTerminal(tx, intent)))
+			return { status: "duplicate", deliveryId: null, arrivalSeq: null };
 		const dedupeKey = publicationDedupeKey(intent, intent.eventKind);
 		const delivered = await tx
 			.select({ deliveryId: mailbox.deliveryId, arrivalSeq: mailbox.arrivalSeq })
@@ -1365,12 +1480,16 @@ export function createPostgresRuntimeQueue(
 						and(runWhere(intent), eq(outbox.eventKind, "terminal"), eq(outbox.state, "reserved")),
 					)
 			)[0];
-		if (!slot || (intent.eventKind === "started" && slot.eventKind !== "started"))
-			throw new Error("Publication requires a startup reservation");
 		const recipient = await tx
 			.select({ id: narrators.id })
 			.from(narrators)
 			.where(eq(narrators.id, intent.recipientId));
+		// Await receipts cascade with their recipient; delayed terminal commits remain
+		// harmless after deletion, while existing reservations retain failed receipts.
+		if (!slot && !recipient[0] && intent.eventKind !== "started")
+			return { status: "duplicate", deliveryId: null, arrivalSeq: null };
+		if (!slot || (intent.eventKind === "started" && slot.eventKind !== "started"))
+			throw new Error("Publication requires a startup reservation");
 		// A reserved slot can be marked undeliverable without revoking the running producer's
 		// right to commit its terminal result. lastError on a reservation is only set by failRecipient.
 		const recipientFailure =
@@ -1411,9 +1530,10 @@ export function createPostgresRuntimeQueue(
 		status: "empty" | "full" | "transferred" | "recipient_failed";
 		deliveryId?: string;
 	}> {
-		// FOR UPDATE SKIP LOCKED: two consumers draining the same recipient never block on
-		// each other's head — the loser takes the next pending event. The row lock then
-		// carries the INSERT…DELETE pair below.
+		await lockPublicationRecipient(tx, recipientId);
+		// The recipient lock serializes consumption and transfer; retain SKIP LOCKED
+		// for unrelated maintenance owners of outbox rows. The row lock then carries
+		// the INSERT…DELETE pair below.
 		const heads = await tx
 			.select()
 			.from(outbox)
@@ -1674,6 +1794,8 @@ export function createPostgresRuntimeQueue(
 					state: string;
 					currentMessageId: string | null;
 					recipientMessageId: string | null;
+					kind: string;
+					lastError: string | null;
 			  }
 			| undefined
 		> {
@@ -1684,6 +1806,8 @@ export function createPostgresRuntimeQueue(
 					state: mailbox.state,
 					currentMessageId: mailbox.currentMessageId,
 					recipientMessageId: mailbox.recipientMessageId,
+					kind: mailbox.kind,
+					lastError: mailbox.lastError,
 				})
 				.from(mailbox)
 				.where(and(eq(mailbox.id, id), eq(mailbox.narratorId, narratorId)));
@@ -2317,6 +2441,14 @@ export function createPostgresRuntimeQueue(
 	};
 
 	const outboxStore = {
+		consumeAwaitedTerminal(
+			run: PublicationRun,
+			options: AwaitedTerminalConsumeOptions = {},
+		): Promise<void> {
+			return runSection("outbox.consumeAwaitedTerminal", (tx) =>
+				consumeAwaitedTerminalSection(tx, run, options),
+			);
+		},
 		reserveRunSlots(
 			run: PublicationRun,
 			options: { started?: boolean } = {},
@@ -3244,6 +3376,7 @@ export function createPostgresRuntimeQueue(
 		): Promise<{ status: "reserved"; logicalRunId: string } | { status: "full" }> =>
 			reserveRunSlotsSection(tx, run, options),
 		commitIntent: (tx: PgRuntimeTx, intent: PublicationIntent) => commitIntentSection(tx, intent),
+		consumeAwaitedTerminal: consumeAwaitedTerminalSection,
 		registerLegacyRunningRunSlots: (
 			tx: PgRuntimeTx,
 			source: LegacyPublicationSource,

@@ -1,17 +1,13 @@
-import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, it, mock } from "bun:test";
-import { drizzle } from "drizzle-orm/bun-sqlite";
-import * as relations from "../../../server/db/relations";
-import * as schema from "../../../server/db/schema";
+import { getTestDb } from "../../setup";
 
 // narrator-session.ts touches the db module at import time via its dependency
-// graph, so provide an in-memory stub before importing (mirrors the interrupt
-// finalization test). The function under test is pure and does not hit the DB.
-const sqlite = new Database(":memory:");
-const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
+// graph, including runtime-publication initialization. Use the complete isolated
+// schema so those imports can initialize even though the evaluated function is pure.
+const { db, sqlite } = getTestDb();
 // Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
 const realDbModule = { ...(await import("../../../server/db")) };
-mock.module("../../../server/db", () => ({ db, sqlite }));
+mock.module("../../../server/db", () => ({ ...realDbModule, db, sqlite }));
 
 const { evaluateRerunnableToolCall } = await import("../../../server/services/narrator-session");
 

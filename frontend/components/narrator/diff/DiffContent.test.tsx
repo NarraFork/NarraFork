@@ -10,6 +10,7 @@ import {
 import { layoutDiffRows } from "@shared/pretext-layout/diff-layout";
 import { createSourceText, trimSourceText } from "@shared/pretext-layout/source-text";
 import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
+import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
 import { parseHTML } from "linkedom";
 import { useLayoutEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -536,10 +537,23 @@ describe("DiffContent permanent viewport", () => {
 			extractedFields: { new_string: input.new_string },
 		});
 		await renderChunk();
-		applyStreamingToolStarted(store, { toolUseId: "edit", toolName: "Edit", input });
+		applyStreamingToolStarted(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			input,
+			streamingEditOrigin: createStreamingEditOrigin("edit", input, {
+				startLine: 445,
+				endLine: 447,
+				matchStatus: "matched",
+			}),
+		});
 		await renderChunk();
+		expect(canvas().querySelector("[data-diff-gutter]")?.textContent).toMatch(/445\s+445/);
+		expect(canvas().textContent).not.toContain("~");
 		applyStreamingToolExecuting(store, { toolUseId: "edit" });
 		await renderChunk();
+		expect(canvas().querySelector("[data-diff-gutter]")?.textContent).toMatch(/445\s+445/);
+		expect(canvas().textContent).not.toContain("~");
 		applyStreamingToolCompleted(store, {
 			toolUseId: "edit",
 			status: "success",

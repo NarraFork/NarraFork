@@ -2405,6 +2405,7 @@ async function collectWebSearchStream(
 	const textByIndex = new Map<number, string>();
 	const sources: Array<{ title?: string; url?: string }> = [];
 	const seenUrls = new Set<string>();
+	let hasSearchResultEvidence = false;
 	let stopReason: string | undefined;
 
 	const handleEvent = (event: AnthropicStreamEvent): void => {
@@ -2423,6 +2424,9 @@ async function collectWebSearchStream(
 				textByIndex.set(idx, block.text ?? "");
 			} else if (block.type === "web_search_tool_result") {
 				if (Array.isArray(block.content)) {
+					// A completed result block proves execution, even with zero matches.
+					// Neither assistant prose/URLs nor server_tool_use alone proves it.
+					hasSearchResultEvidence = true;
 					for (const row of block.content) {
 						if (row.url && seenUrls.has(row.url)) continue;
 						if (row.url) seenUrls.add(row.url);
@@ -2477,15 +2481,17 @@ async function collectWebSearchStream(
 		.map(([, value]) => value)
 		.join("\n")
 		.trim();
-	if (!text && sources.length === 0) {
-		// An empty stream is a failed search, not an empty answer: report it as a
-		// channel error so the fallback chain runs. max_tokens here means the
-		// budget was exhausted before any text block appeared.
+	if (!hasSearchResultEvidence && !text && sources.length === 0) {
+		// No completed search and no content: preserve the upstream stop reason
+		// for diagnosis. A genuine empty result block is still a valid search.
 		throw new Error(
 			stopReason && stopReason !== "end_turn"
 				? `Anthropic web search returned no content (stop_reason: ${stopReason})`
 				: "Anthropic web search returned no content",
 		);
+	}
+	if (!hasSearchResultEvidence) {
+		throw new Error("Anthropic web search returned no search result evidence");
 	}
 	return { text, sources };
 }

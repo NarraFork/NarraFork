@@ -9,12 +9,27 @@
  * mode this module exists to prevent, and the reason it is asserted explicitly.
  */
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import type {
 	SubagentActivitySummary,
 	SubagentToolCallHeader,
 	TreeMessage,
 } from "@frontend/lib/api";
+import { sha256 as nobleSHA256 } from "@noble/hashes/sha2.js";
+import { projectDiffDocument } from "@shared/pretext-layout/diff-core";
+import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
+import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
+import {
+	buildTopLevelStreamingChunksMsg,
+	topLevelStreamingChunkToToolFields,
+} from "../narrator-message-helpers";
+import {
+	applyStreamingToolChunk,
+	applyStreamingToolCompleted,
+	applyStreamingToolStarted,
+	createStreamingToolStore,
+} from "./streaming-tool-chunks";
+import { toolCompletedPatch, toolExecutingPatch, toolStartedPatch } from "./vlist-live-events";
 import {
 	composeLivePatches,
 	patchReflection,
@@ -71,6 +86,217 @@ function assistantWithTools(id: string, tools: readonly ToolSeed[]): TreeMessage
 		children: [],
 	};
 }
+
+describe("persisted Edit origin handoff", () => {
+	it("keeps verified file rows on both storage sites until the result overrides them", () => {
+		const input = {
+			file_path: "/a.ts",
+			old_string: `${"h".repeat(20_000)}\nold`,
+			new_string: "new",
+		};
+		const streamingEditOrigin = createStreamingEditOrigin("edit", input, {
+			startLine: 42,
+			endLine: 43,
+			matchStatus: "matched",
+		});
+		if (!streamingEditOrigin) throw new Error("missing fixture origin");
+		let messages: readonly TreeMessage[] = [
+			assistantWithTools("m", [
+				{
+					toolUseId: "edit",
+					toolName: "Edit",
+					status: "streaming",
+					inputJson: {
+						_streamingFields: {
+							file_path: input.file_path,
+							old_string: input.old_string.slice(-16_000),
+						},
+						_streamingMetadata: { startLine: 42, endLine: 42, matchStatus: "matched" },
+						_streamingFieldName: "new_string",
+						_streamingFieldValue: "new",
+					},
+				},
+			]),
+		];
+		function assertRows(startLine: number) {
+			const row = messages[0].toolCalls?.[0];
+			const block = messages[0].contentJson?.[0] as unknown as typeof row;
+			for (const record of [row, block]) {
+				if (!record) throw new Error("missing tool representation");
+				const detail = classifyToolDetail({
+					toolUseId: "edit",
+					toolName: "Edit",
+					category: "file",
+					inputJson: record.inputJson,
+					metadata: (record as { _metadata?: Record<string, unknown> })._metadata,
+					status: record.status,
+				});
+				const body = detail?.sections.find((section) => section.key === "input.edit")?.body;
+				if (body?.kind !== "capped" || !body.diffDocument) throw new Error("missing diff");
+				expect(projectDiffDocument(body.diffDocument, { startRow: 0 }).lines[0]?.oldLineNo).toBe(
+					startLine,
+				);
+			}
+		}
+		assertRows(42);
+		messages = toolExecutingPatch("edit")(messages).messages;
+		messages = toolStartedPatch({ toolUseId: "edit", input, streamingEditOrigin })(
+			messages,
+		).messages;
+		assertRows(42);
+		expect(messages[0].toolCalls?.[0].status).toBe("running");
+		expect(messages[0].toolCalls?.[0].inputJson).not.toHaveProperty("_streamingFieldValue");
+		messages = toolCompletedPatch({
+			toolUseId: "edit",
+			status: "success",
+			metadata: { startLine: 80 },
+		})(messages).messages;
+		assertRows(80);
+	});
+	it("both live paths hash once per started/updatedInput, never for deltas or renders", () => {
+		const input = {
+			file_path: "/a.ts",
+			old_string: `${"h".repeat(20_000)}\nold`,
+			new_string: "new",
+		};
+		const streamingEditOrigin = createStreamingEditOrigin("edit", input, {
+			startLine: 42,
+			matchStatus: "matched",
+		});
+		if (!streamingEditOrigin) throw new Error("missing fixture origin");
+		const store = createStreamingToolStore();
+		let messages: readonly TreeMessage[] = [
+			assistantWithTools("m", [{ toolUseId: "edit", toolName: "Edit" }]),
+		];
+		const spy = spyOn(nobleSHA256, "create");
+		try {
+			applyStreamingToolStarted(store, {
+				toolUseId: "edit",
+				toolName: "Edit",
+				input,
+				streamingEditOrigin,
+			});
+			messages = toolStartedPatch({ toolUseId: "edit", input, streamingEditOrigin })(
+				messages,
+			).messages;
+			for (let i = 0; i < 3; i++) {
+				applyStreamingToolChunk(store, {
+					toolUseId: "edit",
+					toolName: "Edit",
+					inputCharsTotal: i,
+					streamingField: { name: "new_string", delta: "x" },
+				});
+				const chunk = store.get("edit");
+				if (!chunk) throw new Error("missing Edit");
+				topLevelStreamingChunkToToolFields(chunk);
+				buildTopLevelStreamingChunksMsg([chunk], "n", null);
+			}
+			expect(spy).toHaveBeenCalledTimes(1);
+			const updatedInput = { ...input, new_string: "newer" };
+			applyStreamingToolCompleted(store, { toolUseId: "edit", status: "success", updatedInput });
+			messages = toolCompletedPatch({ toolUseId: "edit", status: "success", updatedInput })(
+				messages,
+			).messages;
+			expect(messages[0].toolCalls?.[0].inputJson).toMatchObject({
+				_streamingMetadata: { startLine: 42 },
+			});
+			expect(spy).toHaveBeenCalledTimes(2);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+	it("snapshot/no-preview evidence and updatedInput share validation on both storage sites", () => {
+		const input = {
+			file_path: "/a.ts",
+			old_string: `${"h".repeat(20_000)}\nold`,
+			new_string: "new",
+		};
+		const streamingEditOrigin = createStreamingEditOrigin("edit", input, {
+			startLine: 42,
+			endLine: 43,
+			matchStatus: "matched",
+		});
+		if (!streamingEditOrigin) throw new Error("missing fixture origin");
+		function assertOrigin(messages: readonly TreeMessage[], line: number | undefined) {
+			const row = messages[0].toolCalls?.[0];
+			const block = messages[0].contentJson?.[0] as unknown as typeof row;
+			for (const record of [row, block]) {
+				if (!record) throw new Error("missing tool");
+				const detail = classifyToolDetail({
+					toolUseId: "edit",
+					toolName: "Edit",
+					category: "file",
+					inputJson: record.inputJson,
+					status: record.status,
+				});
+				const body = detail?.sections.find((section) => section.key === "input.edit")?.body;
+				if (body?.kind !== "capped" || !body.diffDocument) throw new Error("missing diff");
+				expect(body.diffDocument.startLine).toBe(line);
+				if (line !== undefined)
+					expect(projectDiffDocument(body.diffDocument, { startRow: 0 }).lines[0]?.oldLineNo).toBe(
+						line,
+					);
+			}
+		}
+		for (const updatedInput of [
+			{ ...input, old_string: input.old_string.replaceAll("\n", "\r\n") },
+			{ ...input, old_string: `H${input.old_string.slice(1)}` },
+			{ ...input, old_string: input.old_string.replaceAll("\n", "\r") },
+			{ ...input, file_path: "/b.ts" },
+			{ ...input, replace_all: true },
+			{ ...input, device: "remote" },
+		]) {
+			let messages: readonly TreeMessage[] = [
+				assistantWithTools("m", [{ toolUseId: "edit", toolName: "Edit", inputJson: {} }]),
+			];
+			messages = toolExecutingPatch("edit")(messages).messages;
+			messages = toolStartedPatch({ toolUseId: "edit", input: { ...input }, streamingEditOrigin })(
+				messages,
+			).messages;
+			assertOrigin(messages, 42);
+			messages = toolCompletedPatch({ toolUseId: "edit", status: "success", updatedInput })(
+				messages,
+			).messages;
+			assertOrigin(messages, updatedInput.old_string.includes("\r\n") ? 42 : undefined);
+		}
+		for (const invalid of [
+			undefined,
+			{ ...streamingEditOrigin, startLine: -1 },
+			{ ...streamingEditOrigin, matchStatus: "unmatched" as "matched" },
+		]) {
+			const messages = [
+				assistantWithTools("m", [{ toolUseId: "edit", toolName: "Edit", inputJson: {} }]),
+			];
+			const patched = toolStartedPatch({
+				toolUseId: "edit",
+				input: { ...input, _streamingMetadata: { startLine: 999 } },
+				streamingEditOrigin: invalid,
+			})(messages).messages;
+			assertOrigin(patched, undefined);
+		}
+	});
+	it("drops preview positioning when complete parameters change the search target", () => {
+		const messages = [
+			assistantWithTools("m", [
+				{
+					toolUseId: "edit",
+					toolName: "Edit",
+					inputJson: {
+						file_path: "/a.ts",
+						old_string: "old",
+						_streamingMetadata: { startLine: 42 },
+					},
+				},
+			]),
+		];
+		const patched = toolStartedPatch({
+			toolUseId: "edit",
+			input: { file_path: "/a.ts", old_string: "other", new_string: "new" },
+		})(messages).messages;
+		expect(patched[0].toolCalls?.[0].inputJson).not.toHaveProperty("_streamingMetadata");
+		expect(patched[0].contentJson?.[0]).toMatchObject({ inputJson: { old_string: "other" } });
+	});
+});
 
 /** Read the patched status off BOTH storage sites for one toolUseId. */
 function readStatuses(

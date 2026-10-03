@@ -3382,6 +3382,34 @@ export const runtimePublicationOutbox = sqliteTable(
 	],
 );
 
+/** Await is a durable terminal-consumption authority, independent of mailbox GC and task cleanup.
+ * No task FK: agent task ids may be reused for later logical runs. Recipient deletion is
+ * the only safe lifetime boundary (late publishers then have no recipient to notify).
+ */
+export const runtimeAwaitedTerminalConsumptions = sqliteTable(
+	"runtime_awaited_terminal_consumptions",
+	{
+		producerKind: text("producer_kind", { enum: ["agent", "bash"] }).notNull(),
+		taskId: text("task_id").notNull(),
+		logicalRunId: text("logical_run_id").notNull(),
+		recipientId: text("recipient_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		consumedAt: text("consumed_at").notNull(),
+		/** Exact source already read by Await; never recomputed from a later actor run. Max 512B. */
+		sourceResultRef: text("source_result_ref"),
+	},
+	(table) => [
+		uniqueIndex("idx_runtime_awaited_terminal_run").on(
+			table.producerKind,
+			table.taskId,
+			table.logicalRunId,
+			table.recipientId,
+		),
+		index("idx_runtime_awaited_terminal_recipient").on(table.recipientId),
+	],
+);
+
 // === hooks ===
 export const hooks = sqliteTable(
 	"hooks",

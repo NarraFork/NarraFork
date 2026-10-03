@@ -3314,8 +3314,14 @@ const narratorMessageQueriesUnlocked = {
 				contentText: true,
 				parentToolUseId: true,
 				messageUuid: true,
+				createdBy: true,
+				origin: true,
+				originLabel: true,
 			},
 			with: {
+				// Only public identity fields, never credentials or the complete user row.
+				creator: { columns: { username: true } },
+				narrator: { columns: { title: true } },
 				toolCalls: {
 					columns: {
 						id: true,
@@ -3399,7 +3405,11 @@ const narratorMessageQueriesUnlocked = {
 		const messageIds = refRows.map((r) => r.messageId);
 		const messages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true },
+			with: {
+				toolCalls: true,
+				creator: { columns: { username: true } },
+				narrator: { columns: { title: true } },
+			},
 		});
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));

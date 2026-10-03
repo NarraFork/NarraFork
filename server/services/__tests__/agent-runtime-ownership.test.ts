@@ -4,6 +4,12 @@ import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import {
+	consumeSearchExecutionTurn,
+	getSearchExecutionScope,
+	withSearchExecutionScope,
+} from "../../lib/search/execution-scope";
+import type { ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
 import type { SubagentExecOptions } from "../subagent-executor";
 
@@ -17,9 +23,8 @@ const sessionModule = await import("../narrator-session");
 const { runAgentLoop } = sessionModule;
 const executorModule = await import("../subagent-executor");
 const { executeSubagent, buildSubagentEventContext } = executorModule;
-const { executeBackgroundTask, startForegroundRun, startContinuedSubagent } = await import(
-	"../subagent-runner"
-);
+const { executeBackgroundTask, runForegroundLoop, startForegroundRun, startContinuedSubagent } =
+	await import("../subagent-runner");
 const state = await import("../narrator-session-state");
 const { narratorService } = await import("../narrator-service");
 const passExecutor = await import("../narrator-executor");
@@ -319,6 +324,212 @@ describe("shared execution owner through real entry adapters", () => {
 });
 
 describe("runner owns the entire finalization and publication", () => {
+	test("search channel failures reject only after releasing the child execution owner", async () => {
+		spyOn(passExecutor, "executeAgentLoop").mockResolvedValue({
+			shouldUpdateTitle: false,
+			completedNaturally: false,
+			completedAssistantTurn: false,
+			finalText: "native provider failed",
+			hasError: true,
+		});
+		await expect(
+			withSearchExecutionScope({ provider: "test", model: "test:model", maxTurns: 2 }, () =>
+				runForegroundLoop({
+					...child(),
+					subagentType: "search",
+					subagentId: CHILD,
+					initialHistory: [],
+					customDef: null,
+				}),
+			),
+		).rejects.toThrow("native provider failed");
+		expect(getExecutionOwner(CHILD)).toBeUndefined();
+		expect(getSearchExecutionScope()).toBeUndefined();
+	});
+	test("search turn exhaustion cannot start a fresh continuation pass", async () => {
+		settings.agent.autoContinuationMode = "always";
+		const execute = spyOn(passExecutor, "executeAgentLoop").mockImplementation(async () => {
+			consumeSearchExecutionTurn();
+			return {
+				shouldUpdateTitle: false,
+				completedNaturally: false,
+				completedAssistantTurn: false,
+				finalText: "incomplete search",
+				hasError: true,
+				maxTurnsExceeded: true,
+			};
+		});
+		await expect(
+			withSearchExecutionScope({ provider: "test", model: "test:model", maxTurns: 1 }, () =>
+				runForegroundLoop({
+					...child(),
+					subagentType: "search",
+					subagentId: CHILD,
+					initialHistory: [],
+					customDef: null,
+				}),
+			),
+		).rejects.toThrow("turn budget exhausted");
+		expect(execute).toHaveBeenCalledTimes(1);
+		expect(getExecutionOwner(CHILD)).toBeUndefined();
+	});
+	const upstreamDiagnostics = {
+		schema: "narrafork.error-diagnostics.v1" as const,
+		statusCode: 503,
+		requestId: "last-budgeted-request",
+	};
+	const exhaustedFailures: Array<{
+		name: string;
+		pass: Partial<ExecuteLoopResult>;
+		message: string;
+		errorCode?: string;
+		diagnostics?: typeof upstreamDiagnostics;
+	}> = [
+		{
+			name: "silent disconnect",
+			pass: { silentDisconnect: true },
+			message: "Codex WebSocket silent disconnect",
+		},
+		{
+			name: "payment required",
+			pass: {
+				paymentRequired: { message: "Insufficient upstream balance", resumeAction: "retry" },
+			},
+			message: "Insufficient upstream balance",
+			errorCode: "payment_required",
+		},
+		{
+			name: "retryable error with unlimited retry permission",
+			pass: {
+				retryableError: "Upstream connection reset",
+				retryableErrorCode: "ECONNRESET",
+				retryableDiagnostics: upstreamDiagnostics,
+				bypassRetryLimit: true,
+			},
+			message: "Upstream connection reset",
+			errorCode: "ECONNRESET",
+			diagnostics: upstreamDiagnostics,
+		},
+		{
+			name: "model unavailable",
+			pass: {
+				modelUnavailable: {
+					message: "Upstream credentials unavailable",
+					provider: "test",
+					model: "test:model",
+					diagnostics: upstreamDiagnostics,
+				},
+			},
+			message: "Upstream credentials unavailable",
+			diagnostics: upstreamDiagnostics,
+		},
+		{
+			name: "ordinary upstream error despite a done signal",
+			pass: {
+				hasError: true,
+				completedNaturally: true,
+				finalText: "Error: Upstream rejected tool state",
+				errorCode: "invalid_tool_state",
+				errorDiagnostics: upstreamDiagnostics,
+			},
+			message: "Error: Upstream rejected tool state",
+			errorCode: "invalid_tool_state",
+			diagnostics: upstreamDiagnostics,
+		},
+		{
+			name: "aborted pass",
+			pass: { aborted: true },
+			message: "Aborted",
+		},
+		{
+			name: "context overflow",
+			pass: { contextLengthExceeded: true },
+			message: "Error: context length exceeded",
+		},
+		...[
+			{
+				name: "output truncation",
+				pass: { interrupted: true, interruptedReason: "completion_limit" },
+			},
+			{
+				name: "resumable error",
+				pass: { interrupted: true, interruptedReason: "resumable_error" },
+			},
+			{ name: "completed assistant turn without done", pass: {} },
+			{ name: "missing natural completion signal", pass: { completedNaturally: undefined } },
+			{ name: "max turns without hasError", pass: { maxTurnsExceeded: true } },
+		].map(({ name, pass }) => ({
+			name,
+			pass: pass as Partial<ExecuteLoopResult>,
+			message: "Search execution turn budget exhausted",
+		})),
+	];
+	for (const failure of exhaustedFailures) {
+		test(`search budget exhaustion rejects ${failure.name} without replay`, async () => {
+			settings.agent.autoContinuationMode = "always";
+			const update = spyOn(narratorService, "updateStatus");
+			const execute = spyOn(passExecutor, "executeAgentLoop").mockImplementation(async () => {
+				expect(getSearchExecutionScope()?.remainingTurns).toBe(1);
+				consumeSearchExecutionTurn();
+				return {
+					shouldUpdateTitle: false,
+					completedNaturally: false,
+					completedAssistantTurn: true,
+					finalText: "partial output must not become a successful answer",
+					hasError: false,
+					...failure.pass,
+				};
+			});
+			await expect(
+				withSearchExecutionScope({ provider: "test", model: "test:model", maxTurns: 1 }, () =>
+					runForegroundLoop({
+						...child(),
+						subagentType: "search",
+						subagentId: CHILD,
+						initialHistory: [],
+						customDef: null,
+					}),
+				),
+			).rejects.toThrow(failure.message);
+			expect(update).toHaveBeenCalledWith(CHILD, "idle", {
+				substatus: ["error"],
+				errorMessage: failure.message,
+				errorCode: failure.errorCode,
+				diagnostics: failure.diagnostics,
+			});
+			expect(execute).toHaveBeenCalledTimes(1);
+			expect(getExecutionOwner(CHILD)).toBeUndefined();
+			expect(getSearchExecutionScope()).toBeUndefined();
+		});
+	}
+	for (const finalText of ["natural search answer", ""]) {
+		test(`search budget permits explicit natural completion with ${finalText ? "text" : "empty text"}`, async () => {
+			settings.agent.autoContinuationMode = "always";
+			const execute = spyOn(passExecutor, "executeAgentLoop").mockImplementation(async () => {
+				consumeSearchExecutionTurn();
+				return {
+					shouldUpdateTitle: false,
+					completedNaturally: true,
+					completedAssistantTurn: true,
+					finalText,
+					hasError: false,
+				};
+			});
+			await expect(
+				withSearchExecutionScope({ provider: "test", model: "test:model", maxTurns: 1 }, () =>
+					runForegroundLoop({
+						...child(),
+						subagentType: "search",
+						subagentId: CHILD,
+						initialHistory: [],
+						customDef: null,
+					}),
+				),
+			).resolves.toBeString();
+			expect(execute).toHaveBeenCalledTimes(1);
+			expect(getExecutionOwner(CHILD)).toBeUndefined();
+		});
+	}
 	for (const background of [false, true]) {
 		test(`${background ? "background" : "foreground"} refuses competing starts while finalizer is awaiting`, async () => {
 			const directExecutor = executeSubagent;

@@ -120,7 +120,7 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 
 	return (
 		<Box style={{ position: "relative", flexShrink: 0 }}>
-			{/* Thin resize line at the Git boundary; the line itself is the drag target. */}
+			{/* Resize boundary; preview/progress/queue rows already draw their own top border. */}
 			<Box
 				onPointerDown={startBottomSpacingResize}
 				role="separator"
@@ -135,7 +135,13 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 					cursor: "ns-resize",
 					touchAction: "none",
 					zIndex: 100,
-					borderTop: "1px solid var(--mantine-color-default-border)",
+					borderTop:
+						hasImages ||
+						props.attachedTextFiles.length > 0 ||
+						(props.sendingState?.attachmentCount ?? 0) > 0 ||
+						props.queueDeps.queuedMessages.length > 0
+							? undefined
+							: "1px solid var(--mantine-color-default-border)",
 				}}
 			/>
 
@@ -182,7 +188,10 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 			)}
 
 			{/* Status bar */}
-			<NarratorInteractionStatusBar {...statusBar} />
+			<NarratorInteractionStatusBar
+				{...statusBar}
+				borderTop={props.chapterId || props.onOpenGitPanel ? undefined : statusBar.borderTop}
+			/>
 
 			{/* Input */}
 			{props.common.isWorkspacePreview ? null : props.isChapterMerged ? (

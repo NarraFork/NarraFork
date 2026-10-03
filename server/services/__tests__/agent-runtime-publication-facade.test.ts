@@ -45,6 +45,8 @@ test("every database operation fails closed with a precise error", () => {
 				undefined as never,
 			),
 		hasPendingSource: () => facade.hasPendingSource(run),
+		consumeAwaitedTerminal: () => facade.consumeAwaitedTerminal(run),
+		readAgentTerminalResult: () => facade.readAgentTerminalResult(run),
 		flushRecipient: () => facade.flushRecipient("p"),
 		flushPage: () => facade.flushPage(),
 		schedule: () => facade.schedule(),

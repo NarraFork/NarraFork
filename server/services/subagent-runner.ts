@@ -1366,6 +1366,7 @@ interface ForegroundLoopInput {
 	userId?: string | null;
 	systemPrompt: string;
 	initialHistory: unknown[];
+	initialCurrentText?: string;
 	initialTrailingToolResults?: unknown[];
 	customDef: Awaited<ReturnType<typeof customSubagentService.loadByName>> | null;
 	rebuildSystemPrompt?: (contextSummary?: string | null) => Promise<string>;
@@ -1623,6 +1624,7 @@ function startForegroundRunUnlocked(
 					userId: currentUserId,
 					systemPrompt: currentSystemPrompt,
 					initialHistory: currentHistory,
+					initialCurrentText: input.initialCurrentText,
 					initialTrailingToolResults: currentTrailingToolResults,
 					customDef,
 					rebuildSystemPrompt,
@@ -1711,15 +1713,37 @@ function startForegroundRunUnlocked(
 					});
 				}
 				clearTakenOver(subagentId);
+				// Only the initial foreground scope owns delivery. Borrowed continuation
+				// owners publish through the outer conclusion/resume chain (all matrix cases).
+				if (!detachSetupSucceeded && releaseOnTerminal) {
+					try {
+						await getRuntimePublicationService().commitAgentTerminal({
+							run: publicationRun,
+							eventKind: timedOut
+								? "timed_out"
+								: hasError
+									? "failed"
+									: wasInterrupted
+										? "cancelled"
+										: "completed",
+							text: finalText || "(no output)",
+							summary: "Foreground agent result delivered",
+							delivery: "foreground",
+						});
+					} catch (error) {
+						publicationCommitError = error;
+					}
+				}
 				try {
-					await finalizeSubagent(
-						subagentId,
-						parentNarratorId,
-						toolUseId,
-						hasError,
-						hasError ? finalText : null,
-						{ interrupted: wasInterrupted, timedOut, owner },
-					);
+					if (!publicationCommitError)
+						await finalizeSubagent(
+							subagentId,
+							parentNarratorId,
+							toolUseId,
+							hasError,
+							hasError ? finalText : null,
+							{ interrupted: wasInterrupted, timedOut, owner },
+						);
 
 					// Bind the result to the subagent's last assistant message
 					const resultMsgId = await getSubagentResultMessageId(subagentId);
@@ -1801,7 +1825,18 @@ function startForegroundRunUnlocked(
 			backgroundTaskService.notifyDerivedStatusChanged(parentNarratorId, subagentId);
 			if (publicationCommitError) {
 				terminalPublished = true;
-				if (releaseOnTerminal) releaseSubagentPublicationOwner(owner, false);
+				if (releaseOnTerminal) {
+					try {
+						await getRuntimePublicationService().releaseUnusedRunSlots(publicationRun);
+					} catch (error) {
+						logger.warn("Failed to release rejected foreground publication slots", {
+							subagentId,
+							error: String(error),
+						});
+					} finally {
+						releaseSubagentPublicationOwner(owner, false);
+					}
+				}
 				rejectTerminal(publicationCommitError);
 				if (!foregroundPublished) rejectForeground(publicationCommitError);
 			} else
@@ -1871,7 +1906,18 @@ function startForegroundRunUnlocked(
 
 /** Compatibility wrapper that preserves the legacy model-tool text boundary. */
 export async function runForegroundLoop(input: ForegroundLoopInput): Promise<string> {
-	return (await startForegroundRun(input).foreground).output;
+	const { getSearchExecutionScope } = await import("../lib/search/execution-scope");
+	const handle = startForegroundRun(input);
+	if (getSearchExecutionScope()) {
+		// A channel failure must reach the search router so the next channel can run.
+		// Wait for lifecycle finalization, not just the legacy tagged text result.
+		const [, terminal] = await Promise.all([handle.foreground, handle.terminal]);
+		if (terminal.hasError || terminal.interrupted || terminal.timedOut) {
+			throw new Error(terminal.finalText || "Search subagent failed");
+		}
+		return terminal.output;
+	}
+	return (await handle.foreground).output;
 }
 
 // === Subagent runner ===
@@ -2093,10 +2139,20 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	}
 
 	// 2. Persist subagent's user message (linked to parent's tool_use)
-	await narratorService.persistSubagentUserMessage(subagentId, prompt, toolUseId).catch((error) => {
-		updateLease.release();
-		throw error;
-	});
+	await narratorService
+		.persistSubagentUserMessage(subagentId, prompt, toolUseId, {
+			createdBy: userId,
+			sender: {
+				id: parentNarratorId,
+				title: parent.title,
+				label: parent.title || "parent",
+				isParent: true,
+			},
+		})
+		.catch((error) => {
+			updateLease.release();
+			throw error;
+		});
 
 	// Broadcast subagent_started after persist so the frontend only sees it
 	// when the subagent record is fully consistent (narrator + user message).
@@ -2563,6 +2619,7 @@ async function startContinuedSubagentUnlocked(
 		if (input.mailboxInput && !mailboxInput)
 			throw new ValidationError("Mailbox head is not available for this wake");
 		const currentInput =
+			mailboxInput?.currentInput ??
 			mailboxInput?.prompt ??
 			projectFileReferenceText(
 				userMessage?.contentText ?? prompt ?? "",
@@ -2634,6 +2691,8 @@ async function startContinuedSubagentUnlocked(
 							: (input.createdBy ?? null),
 				systemPrompt,
 				initialHistory: rebuilt.history,
+				initialCurrentText:
+					mailboxInput?.prompt ?? ("currentText" in rebuilt ? rebuilt.currentText : undefined),
 				initialTrailingToolResults: rebuilt.trailingToolResults,
 				customDef,
 				rebuildSystemPrompt,

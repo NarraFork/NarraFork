@@ -12,7 +12,7 @@ import {
 } from "../../db/schema";
 import { eventBus } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
-import { runtimePublication } from "../agent-runtime/publication";
+import { getRuntimePublicationService, runtimePublication } from "../agent-runtime/publication";
 import { backgroundTaskService } from "../background-task-service";
 import * as session from "../narrator-session";
 import * as executor from "../subagent-executor";
@@ -99,8 +99,147 @@ async function fixture(background: boolean) {
 			subagentType: "general",
 			toolUseId,
 		});
-	return { parent, child, toolCallId, run };
+	return { parent, child, toolCallId, toolUseId, run };
 }
+
+describe("initial foreground publication", () => {
+	for (const { failure, executionFailure } of [
+		{ failure: false, executionFailure: false },
+		{ failure: false, executionFailure: true },
+		{ failure: true, executionFailure: true },
+	])
+		test(`commit barrier and terminal settle (failure=${failure}, executionFailure=${executionFailure})`, async () => {
+			const f = await fixture(false);
+			const { startForegroundRun, listRunningSubagentExecutions } = await import(
+				"../subagent-runner"
+			);
+			const { getExecutionOwner } = await import("../agent-runtime/ownership");
+			const { awaitAgentResultDetailed } = await import("../agent-communication");
+			const facade = getRuntimePublicationService();
+			const gate = Promise.withResolvers<void>();
+			const entered = Promise.withResolvers<void>();
+			let completions = 0,
+				wakes = 0;
+			const watch: Parameters<typeof eventBus.onAny>[0] = (event) => {
+				if (event.type === "narrator:subagent_completed" && event.narratorId === f.child)
+					completions++;
+			};
+			eventBus.onAny(watch);
+			runtimePublication.setWake(() => {
+				wakes++;
+			});
+			const output = executionFailure
+				? "FOREGROUND FAILURE WITHOUT ASSISTANT"
+				: "FOREGROUND SUCCESS";
+			const execute = spyOn(executor, "executeSubagent").mockImplementation(async () => {
+				db.update(narrators).set({ status: "working" }).where(eq(narrators.id, f.child)).run();
+				if (!executionFailure) {
+					const id = generateId();
+					db.insert(narratorMessages)
+						.values({
+							id,
+							narratorId: f.child,
+							role: "assistant",
+							contentText: output,
+							contentJson: [{ type: "text", text: output }],
+							createdAt: new Date().toISOString(),
+						})
+						.run();
+					db.insert(narratorMessageRefs)
+						.values({ id: generateId(), narratorId: f.child, messageId: id, seq: 2 })
+						.run();
+				}
+				return {
+					finalText: output,
+					hasError: executionFailure,
+					allowInboxWake: false,
+					finalUserId: null,
+				};
+			});
+			const original = facade.commitAgentTerminal;
+			const commit = spyOn(facade, "commitAgentTerminal").mockImplementation(async (input) => {
+				entered.resolve();
+				await gate.promise;
+				if (failure) throw new Error("foreground receipt unavailable");
+				return original(input);
+			});
+			try {
+				const run = startForegroundRun({
+					publicationRun: f.run,
+					subagentId: f.child,
+					parentNarratorId: f.parent,
+					toolUseId: f.toolUseId,
+					subagentType: "general",
+					prompt: "test",
+					cwd: process.cwd(),
+					model: "claude-sonnet-4-6",
+					provider: "anthropic",
+					systemPrompt: "test",
+					customDef: null,
+					locale: "en",
+					signal: new AbortController().signal,
+					initialHistory: [],
+				});
+				// Register rejection handlers immediately: both foreground and terminal must settle.
+				const terminal = run.terminal.then(
+					(value) => value,
+					(error) => error,
+				);
+				const foreground = run.foreground.then(
+					(value) => value,
+					(error) => error,
+				);
+				await entered.promise;
+				expect(completions).toBe(0);
+				expect(db.select().from(narrators).where(eq(narrators.id, f.child)).get()?.status).toBe(
+					"working",
+				);
+				gate.resolve();
+				if (failure) {
+					expect(await terminal).toBeInstanceOf(Error);
+					expect(await foreground).toBeInstanceOf(Error);
+					expect(completions).toBe(0);
+				} else {
+					expect(await terminal).toMatchObject({ finalText: output });
+					await foreground;
+					expect(completions).toBe(1);
+					for (let i = 0; i < 2; i++)
+						expect(
+							await awaitAgentResultDetailed({
+								callerNarratorId: f.parent,
+								id: f.child,
+								timeoutMs: 100,
+								signal: new AbortController().signal,
+							}),
+						).toMatchObject({ terminalResultReceived: true, publicationRun: f.run });
+				}
+				expect(getExecutionOwner(f.child)).toBeUndefined();
+				expect(listRunningSubagentExecutions().some((row) => row.subagentId === f.child)).toBe(
+					false,
+				);
+				expect(
+					db
+						.select()
+						.from(runtimePublicationOutbox)
+						.where(eq(runtimePublicationOutbox.logicalRunId, f.run.logicalRunId))
+						.all(),
+				).toHaveLength(0);
+				expect(
+					db
+						.select()
+						.from(narratorBufferedMessages)
+						.where(eq(narratorBufferedMessages.narratorId, f.parent))
+						.all(),
+				).toHaveLength(0);
+				expect(wakes).toBe(0);
+			} finally {
+				gate.resolve();
+				execute.mockRestore();
+				commit.mockRestore();
+				eventBus.offAny(watch);
+			}
+		});
+});
 
 describe("resume preparation reservation cleanup", () => {
 	for (const phase of ["history", "attachment"] as const) {

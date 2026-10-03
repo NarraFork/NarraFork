@@ -21,6 +21,8 @@ interface PathInputBaseProps {
 	leftSection?: React.ReactNode;
 	rightSection?: React.ReactNode;
 	rightSectionWidth?: number;
+	/** Preferred side for path suggestions; top keeps actions below the input accessible. */
+	dropdownPosition?: "top" | "bottom";
 	/** Called after the dropdown closes on blur, for callers that persist on blur. */
 	onBlur?: () => void;
 	/**
@@ -75,6 +77,7 @@ export function PathInput(props: PathInputProps) {
 		leftSection,
 		rightSection: rightSectionProp,
 		rightSectionWidth,
+		dropdownPosition = "bottom",
 		onBlur,
 		onSubmit,
 	} = props;
@@ -231,7 +234,13 @@ export function PathInput(props: PathInputProps) {
 	};
 
 	return (
-		<Combobox store={combobox} onOptionSubmit={handleOptionSubmit} withinPortal>
+		<Combobox
+			store={combobox}
+			onOptionSubmit={handleOptionSubmit}
+			position={dropdownPosition}
+			middlewares={{ flip: dropdownPosition !== "top" }}
+			withinPortal
+		>
 			<Combobox.Target>
 				<TextInput
 					ref={inputRef}

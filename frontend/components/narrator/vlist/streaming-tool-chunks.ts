@@ -32,6 +32,10 @@ import {
 	type SendDeliveryReceipt,
 } from "@shared/communication-tool";
 import { isTextDocumentRef } from "@shared/pretext-layout/tool-detail";
+import {
+	handoffStreamingEditOrigin,
+	type StreamingEditOrigin,
+} from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import {
 	isLiveToolStatusRegression,
@@ -226,6 +230,7 @@ export function applyStreamingToolChunk(store: StreamingToolStore, event: ToolCh
 }
 
 export interface ToolStartedEvent {
+	streamingEditOrigin?: StreamingEditOrigin;
 	toolUseId: string;
 	toolName: string;
 	streamStartedAt?: number;
@@ -296,13 +301,13 @@ export function applyStreamingToolStarted(
 		_status: resolveLiveToolStatus(existing?._status, "initializing"),
 		...(event.input
 			? {
-					_input: event.input,
-					...(document
-						? {
-								textDocument: event.input
-									.textDocument as import("@shared/pretext-layout/text-document").TextDocumentRef,
-							}
-						: {}),
+					_input: handoffStreamingEditOrigin(
+						event.toolUseId,
+						event.input,
+						event.streamingEditOrigin,
+						existing?._input,
+					) as Record<string, unknown>,
+					...(document ? { textDocument: document } : {}),
 					streamingFieldRanges: completeStreamingFieldRanges(existing, event.input),
 				}
 			: {}),
@@ -456,12 +461,14 @@ export function applyStreamingToolCompleted(
 		...(event.durationMs != null ? { _durationMs: event.durationMs } : {}),
 		...(event.updatedInput
 			? {
-					_input: event.updatedInput,
+					_input: handoffStreamingEditOrigin(
+						event.toolUseId,
+						event.updatedInput,
+						undefined,
+						existing?._input,
+					) as Record<string, unknown>,
 					...(isTextDocumentRef(event.updatedInput.textDocument)
-						? {
-								textDocument: event.updatedInput
-									.textDocument as import("@shared/pretext-layout/text-document").TextDocumentRef,
-							}
+						? { textDocument: event.updatedInput.textDocument }
 						: {}),
 					streamingFieldRanges: completeStreamingFieldRanges(existing, event.updatedInput),
 				}

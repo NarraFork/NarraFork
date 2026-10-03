@@ -465,7 +465,13 @@ describe("postgres runtime queue: producer-half admission/read surface (P2)", ()
 
 	test("read-only probes answer directly from the handle and never open a transaction", async () => {
 		const attempts = { count: 0 };
-		const row = { state: "materialized", currentMessageId: "m9", recipientMessageId: "m0" };
+		const row = {
+			state: "materialized",
+			currentMessageId: "m9",
+			recipientMessageId: "m0",
+			kind: "task_notice",
+			lastError: null,
+		};
 		const store = createPostgresRuntimeQueue(fakeDb({ errors: [], selectRows: [row], attempts }));
 		expect(await store.mailbox.getStateById("m1", "n1")).toBe(row);
 		expect(await store.mailbox.hasQueuedKind("n1", [])).toBe(false);

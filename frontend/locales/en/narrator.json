@@ -588,6 +588,8 @@
 	"dangerReflectionLevel_standard": "Medium",
 	"dangerReflectionLevel_strict": "Strict",
 	"planReflectionShort": "Plan reflection",
+	"planReflectionApprovalOff": "Reflection approval off",
+	"planReflectionApprovalOn": "Reflection approval on",
 	"dangerReflectionShort": "Danger reflection",
 	"override_inherit": "Inherit global",
 	"override_followDefault": "Follow default",

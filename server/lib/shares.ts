@@ -115,6 +115,18 @@ export function getShare(id: string): ShareRecord | null {
 	return record;
 }
 
+/** Revoke registry access without touching files; callers may remove large artifacts asynchronously. */
+export function revokeShareRegistry(id: string): ShareRecord | null {
+	const record = shares.get(id) ?? null;
+	shares.delete(id);
+	const timer = timers.get(id);
+	if (timer) {
+		clearTimeout(timer);
+		timers.delete(id);
+	}
+	return record;
+}
+
 export function deleteShare(id: string): void {
 	const record = shares.get(id);
 	if (record) {

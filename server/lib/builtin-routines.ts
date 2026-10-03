@@ -92,6 +92,17 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 		},
 	},
 	{
+		id: "notification",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "Notification",
+			descriptionEn:
+				"Query a user's DingTalk/Feishu channels and send agent-initiated notifications",
+			descriptionZh: "查询指定用户的钉钉/飞书渠道，并由 agent 主动发送通知",
+		},
+	},
+	{
 		id: "recall",
 		type: "tool",
 		category: "tools",

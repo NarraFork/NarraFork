@@ -1,5 +1,11 @@
 import { resolve } from "node:path";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
+import {
+	createStreamingEditOrigin,
+	STREAMING_EDIT_ORIGIN_MAX_CODE_UNITS,
+	type StreamingEditOrigin,
+	validateStreamingEditOrigin,
+} from "@shared/streaming-edit-origin";
 import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-injection";
 import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec-task-service";
 import { specVfsService } from "../../services/spec-vfs-service";
@@ -22,7 +28,13 @@ import { withModelMetadataSnapshotIterator } from "../model-catalog";
 import { captureReferencePricingSnapshot } from "../model-pricing";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
-import { shouldUseNativeSearch } from "../search/native";
+import {
+	consumeSearchExecutionTurn,
+	getSearchExecutionScope,
+	matchesSearchExecutionScope,
+	SearchExecutionBudgetExceededError,
+} from "../search/execution-scope";
+import { shouldUseNativeSearch, usesSideRequestNativeSearch } from "../search/native";
 import { hasUsableFunctionSearchChannelFor } from "../search/router";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { sideCarBodyWithText } from "../sidecar-templates";
@@ -149,7 +161,7 @@ export function filterDeviceTools(
 /** Per-tool mapping: which fields to extract, and which are "large" (streamed incrementally) */
 const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = {
 	Write: { short: ["file_path"], large: ["content"] },
-	Edit: { short: ["file_path", "replace_all"], large: ["old_string", "new_string"] },
+	Edit: { short: ["file_path", "device", "replace_all"], large: ["old_string", "new_string"] },
 	Bash: { short: ["description"], large: ["command"] },
 	Grep: { short: ["pattern", "path", "glob", "output_mode", "type"], large: [] },
 	Glob: { short: ["pattern", "path"], large: [] },
@@ -186,6 +198,7 @@ interface StreamingToolAccumulator {
 	extractedFields?: Record<string, string>;
 	pendingShort: Record<string, string>;
 	streamingMetadata?: Record<string, unknown>;
+	streamingEditOrigin?: StreamingEditOrigin;
 	metadataAttempted?: boolean;
 	lastYieldedAt: number;
 	outputIndex?: number;
@@ -197,14 +210,29 @@ function normalizeLineEndings(text: string): string {
 	return text.replaceAll("\r\n", "\n");
 }
 
-async function resolveStreamingEditMetadata(
-	acc: { name: string; extractedFilePath?: string; extractedFields?: Record<string, string> },
+export async function resolveStreamingEditMetadata(
+	acc: {
+		name: string;
+		extractedFilePath?: string;
+		extractedFields?: Record<string, string>;
+		streamingEditOrigin?: StreamingEditOrigin;
+	},
 	cwd: string,
+	toolUseId: string,
+	defaultDeviceId = "local",
 ): Promise<Record<string, unknown> | undefined> {
 	if (acc.name !== "Edit") return undefined;
 	const filePath = acc.extractedFilePath ?? acc.extractedFields?.file_path;
 	const oldString = acc.extractedFields?.old_string;
-	if (!filePath || oldString == null || oldString === "") return undefined;
+	const device = acc.extractedFields?.device ?? defaultDeviceId;
+	// This matcher reads local files only. Never borrow a local path for a remote tool.
+	if (
+		device !== "local" ||
+		!filePath ||
+		!oldString ||
+		oldString.length > STREAMING_EDIT_ORIGIN_MAX_CODE_UNITS
+	)
+		return undefined;
 
 	try {
 		const resolvedPath = resolve(cwd, filePath);
@@ -214,11 +242,23 @@ async function resolveStreamingEditMetadata(
 		const replaceAll = acc.extractedFields?.replace_all === "true";
 		const match = findReplaceMatch(content, normalizedOld, replaceAll);
 		const lineCount = normalizedOld.split("\n").length;
-		return {
+		const metadata = {
 			startLine: match.startLine,
 			endLine: match.startLine + lineCount - 1,
 			matchStatus: "matched",
 		};
+		acc.streamingEditOrigin = createStreamingEditOrigin(
+			toolUseId,
+			{
+				file_path: filePath,
+				old_string: oldString,
+				device,
+				replace_all: replaceAll,
+			},
+			metadata,
+			device,
+		);
+		return metadata;
 	} catch (err) {
 		return {
 			matchStatus: "unmatched",
@@ -2245,7 +2285,11 @@ async function* agentLoopInMetadataSnapshot(
 	let provider = resolvedProvider.adapter;
 	let effectiveModel = resolvedProvider.model;
 	let effectiveProvider = resolvedProvider.provider;
-	const maxTurns = config.maxTurns ?? settings.agent.maxTurns;
+	const searchScope = getSearchExecutionScope();
+	const maxTurns = Math.min(
+		config.maxTurns ?? settings.agent.maxTurns,
+		searchScope?.remainingTurns ?? Number.POSITIVE_INFINITY,
+	);
 	const locale = (config.locale as Locale) ?? "en";
 
 	// Permission checks must be serialized even when tools themselves are parallel-safe.
@@ -2334,7 +2378,10 @@ async function* agentLoopInMetadataSnapshot(
 			// session, so a native-only channel list would otherwise advertise a tool
 			// that always errors on non-opted providers).
 			resolved.some((t) => t.name === "WebSearch") &&
-			!hasUsableFunctionSearchChannelFor(providerName)
+			!(searchScope || config.runtimePolicy?.searchOnly
+				? (!searchScope || matchesSearchExecutionScope(providerName, modelName)) &&
+					usesSideRequestNativeSearch(providerName, modelName)
+				: hasUsableFunctionSearchChannelFor(providerName))
 		) {
 			resolved = resolved.filter((t) => t.name !== "WebSearch");
 		}
@@ -2887,6 +2934,12 @@ async function* agentLoopInMetadataSnapshot(
 				return identity;
 			};
 			const markCompletedToolUse = (tu: AgentToolUse): ToolOrderIdentity => {
+				// These are UI-only annotations, not Edit parameters. Strip model-authored
+				// claims before persistence too (including the non-streaming provider path).
+				if (tu.name === "Edit" && tu.input && typeof tu.input === "object") {
+					delete tu.input._streamingMetadata;
+					delete tu.input._streamingEditOrigin;
+				}
 				const identity = registerToolOrderIdentity(tu, isStrictSerial(tu));
 				if (tu.outputIndex == null && identity.outputIndex != null) {
 					tu.outputIndex = identity.outputIndex;
@@ -3006,13 +3059,18 @@ async function* agentLoopInMetadataSnapshot(
 					const oldString = acc.stream.getField("old_string");
 					if (oldString != null) {
 						acc.metadataAttempted = true;
+						const metadataAcc = {
+							...acc,
+							extractedFields: { ...acc.extractedFields, old_string: oldString },
+						};
 						acc.streamingMetadata = await resolveStreamingEditMetadata(
-							{
-								...acc,
-								extractedFields: { ...acc.extractedFields, old_string: oldString },
-							},
+							metadataAcc,
 							config.cwd,
+							id,
+							config.defaultDeviceId ?? "local",
 						);
+						// The matcher mints evidence on its argument; keep it on the real accumulator.
+						acc.streamingEditOrigin = metadataAcc.streamingEditOrigin;
 					}
 				}
 				const fields = acc.stream.drainFields();
@@ -3050,6 +3108,7 @@ async function* agentLoopInMetadataSnapshot(
 				acc.pendingShort = {};
 				acc.metadataAttempted = false;
 				acc.streamingMetadata = undefined;
+				acc.streamingEditOrigin = undefined;
 			}
 			function collectShortFields(acc: StreamingToolAccumulator): boolean {
 				const dirty = acc.stream.takeShortFields();
@@ -3990,6 +4049,20 @@ async function* agentLoopInMetadataSnapshot(
 					});
 					const toolSnapshot = requestToolSnapshots.get(config);
 					if (toolSnapshot) requestToolSnapshots.set(toolConfig, toolSnapshot);
+					if (searchScope) {
+						if (!matchesSearchExecutionScope(effectiveProvider, effectiveModel)) {
+							yield {
+								type: "error",
+								message: "Search execution provider/model changed outside its scope",
+							};
+							return;
+						}
+						if (searchScope.remainingTurns <= 0) {
+							yield { type: "error", message: new SearchExecutionBudgetExceededError().message };
+							return;
+						}
+						consumeSearchExecutionTurn();
+					}
 					const stream = provider.chat({
 						conversationId: config.conversationId,
 						content,
@@ -4414,6 +4487,10 @@ async function* agentLoopInMetadataSnapshot(
 									if (stop) {
 										yield* flushToolInput(id, acc);
 										const parsedInput = acc.stream.finish();
+										const streamingEditOrigin =
+											(parsedInput?.device ?? config.defaultDeviceId ?? "local") === "local"
+												? validateStreamingEditOrigin(acc.streamingEditOrigin, id, parsedInput)
+												: undefined;
 										const tu: AgentToolUse = {
 											toolUseId: id,
 											name: acc.name,
@@ -4477,6 +4554,7 @@ async function* agentLoopInMetadataSnapshot(
 											toolUseId: id,
 											toolName: tu.name,
 											input: parsedInput,
+											streamingEditOrigin,
 											streamStartedAt: acc.startedAt,
 											streamCompletedAt: acc.streamCompletedAt,
 										};
@@ -6886,5 +6964,8 @@ async function* agentLoopInMetadataSnapshot(
 		}
 	}
 
+	if (searchScope) {
+		yield { type: "error", message: new SearchExecutionBudgetExceededError().message };
+	}
 	yield { type: "max_turns_exceeded", maxTurns };
 }

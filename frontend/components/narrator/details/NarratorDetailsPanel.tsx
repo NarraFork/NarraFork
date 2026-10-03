@@ -1136,6 +1136,7 @@ function NarratorDetailsContent({
 							onChange={setCwdValue}
 							placeholder={t("details.cwdPlaceholder")}
 							description={t("details.cwdDescription")}
+							dropdownPosition="top"
 							disabled={updateCwdMutation.isPending}
 						/>
 						<Group justify="flex-end" gap="xs">

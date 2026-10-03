@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import type { FileReferenceContext } from "@shared/file-reference";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
+import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import {
 	projectSubagentToolInputSummary,
 	type SubagentToolInputSummary,
@@ -453,6 +454,7 @@ export interface ToolChunkSnapshot {
 	executing?: boolean;
 	/** Input payload from tool_started */
 	input?: unknown;
+	streamingEditOrigin?: StreamingEditOrigin;
 	/** Timestamp from tool_started */
 	streamStartedAt?: number;
 	/** Timestamp sampled when the provider finished streaming tool input. */
@@ -1441,7 +1443,10 @@ export async function processEvent(
 					toolName: event.toolName,
 					inputCharsTotal: existing?.inputCharsTotal ?? 0,
 					started: true,
-					...(!ctx.parentToolUseId && { input: boundedWriteInput(event.input, inputDocument) }),
+					...(!ctx.parentToolUseId && {
+						input: boundedWriteInput(event.input, inputDocument),
+						streamingEditOrigin: event.streamingEditOrigin,
+					}),
 					...(!ctx.parentToolUseId && inputDocument ? { inputDocument } : {}),
 					...summaryField,
 					streamStartedAt: event.streamStartedAt,
@@ -1455,6 +1460,7 @@ export async function processEvent(
 				toolUseId: event.toolUseId,
 				toolName: event.toolName,
 				input: boundedWriteInput(event.input, inputDocument),
+				streamingEditOrigin: event.streamingEditOrigin,
 				...(inputDocument ? { inputDocument } : {}),
 				streamStartedAt: event.streamStartedAt,
 				streamCompletedAt: event.streamCompletedAt,

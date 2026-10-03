@@ -284,6 +284,7 @@ export function useVListLivePatches(
 				input,
 				rawParent,
 				meta,
+				streamingEditOrigin,
 			) => {
 				const parentToolUseId = routeParent(rawParent);
 				if (parentToolUseId) {
@@ -309,8 +310,23 @@ export function useVListLivePatches(
 						...(streamStartedAt != null ? { streamStartedAt } : {}),
 						...(streamCompletedAt != null ? { streamCompletedAt } : {}),
 						...(input ? { input } : {}),
+						...(streamingEditOrigin ? { streamingEditOrigin } : {}),
 					}),
 				);
+			},
+			onStreamingSnapshot: (snapshot) => {
+				for (const chunk of snapshot.toolChunks) {
+					if ((!isSubagent && chunk.parentToolUseId) || !chunk.started) continue;
+					enqueue(
+						toolStartedPatch({
+							toolUseId: chunk.toolUseId,
+							input: chunk.input as Record<string, unknown> | undefined,
+							streamStartedAt: chunk.streamStartedAt,
+							streamingEditOrigin: chunk.streamingEditOrigin,
+						}),
+					);
+					if (chunk.executing) enqueue(toolExecutingPatch(chunk.toolUseId));
+				}
 			},
 			onToolCompleted: (
 				toolUseId,

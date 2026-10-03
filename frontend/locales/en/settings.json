@@ -1240,6 +1240,7 @@
 	"contextWindowPlaceholder": "e.g. 272000",
 	"contextWindowSuffix": "tokens",
 	"notificationSection": "Notifications",
+	"notifyAutomaticTriggersDesc": "The completion and permission switches below control automatic notifications only. Turning them off does not disable configured channels. The optional Notification tool can independently list channels or send to an exact user_id or username via enabled DingTalk and Feishu channels; it does not send browser or sound notifications.",
 	"notifyOnDone": "Notify when narrator finishes",
 	"notifyOnDoneDesc": "Trigger notification when a narrator in your sidebar tabs completes its task",
 	"notifyOnWaiting": "Notify when narrator needs permission",

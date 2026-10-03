@@ -1,13 +1,47 @@
+import { logger } from "@server/lib/logger";
 import {
 	type RuntimeAwaitTarget,
 	runtimeAwaitTargets,
 	runtimePolicyForContext,
 } from "@server/services/agent-runtime/policy";
+import {
+	getRuntimePublicationService,
+	type PublicationRun,
+} from "@server/services/agent-runtime/publication";
 import { SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR } from "@server/services/subagent-communication-policy";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
+
+async function consumeTerminalResult(result: {
+	status: string;
+	terminalResultReceived?: boolean;
+	publicationRun?: PublicationRun;
+	sourceResultRef?: string;
+}): Promise<void> {
+	if (
+		!result.terminalResultReceived ||
+		!result.publicationRun ||
+		["timeout", "aborted", "running", "taken_over"].includes(result.status)
+	)
+		return;
+	try {
+		const publication = await getRuntimePublicationService();
+		if (result.sourceResultRef !== undefined) {
+			await publication.consumeAwaitedTerminal(result.publicationRun, {
+				sourceResultRef: result.sourceResultRef,
+			});
+		} else {
+			await publication.consumeAwaitedTerminal(result.publicationRun);
+		}
+	} catch (error) {
+		logger.warn("Failed to consume Await terminal notification; preserving result", {
+			run: result.publicationRun,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
 
 const DEFAULT_TIMEOUT_MS = 600_000;
 const MAX_AWAIT_TIMEOUT_MS = 86_400_000; // 24h — matches the update_timeout WS validator cap
@@ -253,6 +287,7 @@ export const awaitTool: ToolDefinition = {
 						void broadcastAwaitAgentResolved(ctx.narratorId, toolUseId, subagentNarratorId);
 					},
 				});
+				if (!combinedSignal.aborted) await consumeTerminalResult(result);
 				return {
 					output: result.formatted,
 					metadata: {
@@ -373,6 +408,7 @@ export const awaitTool: ToolDefinition = {
 						combinedSignal,
 					);
 			const status = relabel(result.status);
+			if (type === "bash" && !combinedSignal.aborted) await consumeTerminalResult(result);
 			// A bash task id is a nanoid too, so the alias is the readable handle. Bash
 			// always registers one; if a row somehow lacks it, keep the full id rather
 			// than inventing a prefix — unlike a subagent id, a task id is looked up by

@@ -1,5 +1,6 @@
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
 import { eq } from "drizzle-orm";
 import { getTestDb } from "../../../tests/setup";
 import {
@@ -560,6 +561,44 @@ describe("assistant file-reference provenance", () => {
 });
 
 describe("narrator event handler streaming snapshot", () => {
+	test("trusted Edit origin travels in tool_started and reconnect snapshot, never model metadata", async () => {
+		const ctx = makeMainContext();
+		const input = {
+			file_path: "a.ts",
+			old_string: "h".repeat(20_000),
+			new_string: "new",
+			_streamingMetadata: { startLine: 999 },
+		};
+		const streamingEditOrigin = createStreamingEditOrigin("edit-origin", input, {
+			startLine: 42,
+			matchStatus: "matched",
+		});
+		if (!streamingEditOrigin) throw new Error("missing fixture origin");
+		await processEvent(
+			{ type: "tool_call", toolUseId: "edit-origin", toolName: "Edit", input, streamingEditOrigin },
+			ctx,
+		);
+		const frame = broadcastMessages.find(
+			(value) => (value as Record<string, unknown>).type === "tool_started",
+		) as Record<string, unknown>;
+		expect(frame.streamingEditOrigin).toEqual(streamingEditOrigin);
+		expect(
+			getStreamingSnapshot(ctx.narratorId)?.toolChunks.get("edit-origin")?.streamingEditOrigin,
+		).toEqual(streamingEditOrigin);
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId: "model-only",
+				toolName: "Edit",
+				input: { ...input, streamingEditOrigin },
+			},
+			ctx,
+		);
+		expect(
+			getStreamingSnapshot(ctx.narratorId)?.toolChunks.get("model-only")?.streamingEditOrigin,
+		).toBeUndefined();
+		clearStreamingSnapshot(ctx.narratorId);
+	});
 	test("子代理直接 tool_call 向父级发送精简路由身份，self 保留完整 input", async () => {
 		const ctx = makeSubagentContext();
 		ctx.toolCallIdsMap?.set("direct-tool-call", "tc-direct");

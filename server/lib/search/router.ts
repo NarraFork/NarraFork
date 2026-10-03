@@ -1,4 +1,3 @@
-
 import { logger } from "../logger";
 import {
 	getAnthropicProviderConfig,
@@ -13,6 +12,7 @@ import type {
 	SearchChannelConfig,
 } from "../settings/types";
 import { executeCustomSearchProvider, isCustomSearchProviderUsable } from "./adapters/index";
+import { withSearchExecutionScope } from "./execution-scope";
 import {
 	hasSideRequestNativeSearchProvider,
 	supportsNativeSearch,
@@ -24,7 +24,12 @@ import {
 	DEFAULT_SEARCH_TIMEOUT_MS,
 	getNormalizedSearchChannels,
 } from "./settings";
-import { isAbortError, withSearchTimeout } from "./timeout";
+import {
+	isAbortError,
+	SearchSubagentCleanupTimeoutError,
+	withSearchSubagentTimeout,
+	withSearchTimeout,
+} from "./timeout";
 import type { SearchChannelResult, SearchExecutionResult, SearchRequest } from "./types";
 
 /**
@@ -97,8 +102,9 @@ async function nugMcpSearch(
 	channel: SearchChannelConfig,
 	request: SearchRequest,
 	signal: AbortSignal,
+	settingsConfig: NarraForkSettings = settings,
 ): Promise<SearchChannelResult> {
-	const config = findNugProvider(channel);
+	const config = findNugProvider(channel, settingsConfig);
 	if (!config || config.disabled || !config.apiKey || !config.baseUrl) {
 		throw new Error("NUG provider is not configured or is disabled");
 	}
@@ -118,7 +124,12 @@ async function nugMcpSearch(
 	}
 	const mcp = (await response.json()) as McpResponse;
 	const parsed = textFromMcpResponse(mcp);
-	return { channelId: channel.id, channelLabel: channelLabel(channel), text: parsed.text };
+	if (parsed.isError) throw new Error(parsed.text);
+	return {
+		channelId: channel.id,
+		channelLabel: channelLabel(channel, settingsConfig),
+		text: parsed.text,
+	};
 }
 
 /**
@@ -138,27 +149,24 @@ function isSubagentChannelUsable(channel: SearchChannelConfig): boolean {
 	let model: string;
 	try {
 		model = resolveEffectiveModel(channel.model);
+		const provider = resolveProvider(model);
+		return supportsNativeSearch(provider, model);
 	} catch {
 		return false;
 	}
-	const provider = resolveProvider(model);
-	return supportsNativeSearch(provider, model);
 }
 
 async function searchSubagent(
 	channel: SearchChannelConfig,
 	request: SearchRequest,
 ): Promise<SearchChannelResult> {
-	if (!request.purpose) {
-		throw new Error("Search subagent requires a purpose");
+	if (!request.purpose?.trim()) throw new Error("Search subagent requires a purpose");
+	if (!channel.model) throw new Error("Search subagent model is not configured");
+	const model = resolveEffectiveModel(channel.model);
+	const provider = resolveProvider(model);
+	if (!supportsNativeSearch(provider, model)) {
+		throw new Error(`Search subagent model ${model} does not support native search`);
 	}
-	if (!isSubagentChannelUsable(channel)) {
-		throw new Error("Search subagent model is not configured or does not support native search");
-	}
-	if (!request.parentNarratorId || !request.parentToolUseId || !request.cwd) {
-		throw new Error("Search subagent requires narrator context");
-	}
-	const { runSubagent } = await import("../../services/subagent-runner");
 	const prompt = [
 		`Search query: ${request.query}`,
 		`Purpose: ${request.purpose}`,
@@ -168,24 +176,40 @@ async function searchSubagent(
 			? `Prefer results from the last ${request.recencyDays} days.`
 			: null,
 		request.maxResults != null ? `Return at most ${request.maxResults} key results.` : null,
-		"Return a concise answer with sources as markdown links when available.",
+		"Use web search before answering. Return a concise answer with sources as markdown links.",
 	]
 		.filter(Boolean)
 		.join("\n");
-	const text = await runSubagent({
-		parentNarratorId: request.parentNarratorId,
-		toolUseId: request.parentToolUseId,
-		subagentType: "search",
-		prompt,
-		cwd: request.cwd,
-		title: `Search: ${request.query.slice(0, 60)}`,
-		signal: request.signal ?? new AbortController().signal,
-		locale: request.locale ?? "en",
-		model: channel.model,
-		reasoningEffort: channel.reasoningEffort,
-		background: false,
-		userId: request.userId ?? null,
-	});
+	const text = await withSearchExecutionScope(
+		{ provider, model, maxTurns: channel.maxTurns ?? 4 },
+		async () => {
+			if (request.testMode) {
+				const { runSearchProbe } = await import("./subagent-probe");
+				return runSearchProbe({ ...channel, model }, request, prompt);
+			}
+			if (!request.parentNarratorId || !request.parentToolUseId || !request.cwd) {
+				throw new Error("Search subagent requires narrator context");
+			}
+			const { runSubagent } = await import("../../services/subagent-runner");
+			return runSubagent({
+				parentNarratorId: request.parentNarratorId,
+				toolUseId: request.parentToolUseId,
+				subagentType: "search",
+				prompt,
+				cwd: request.cwd,
+				title: `Search: ${request.query.slice(0, 60)}`,
+				signal: request.signal ?? new AbortController().signal,
+				timeoutMs:
+					channel.timeoutMs ?? settings.search?.defaultTimeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS,
+				locale: request.locale ?? "en",
+				model,
+				reasoningEffort: channel.reasoningEffort,
+				background: false,
+				userId: request.userId ?? null,
+			});
+		},
+	);
+	if (!text.trim()) throw new Error("Search subagent returned no results");
 	return { channelId: channel.id, channelLabel: channelLabel(channel), text };
 }
 
@@ -232,16 +256,20 @@ async function nativeSideRequestSearch(
 	};
 }
 
-function channelTimeout(channel: SearchChannelConfig): number {
+function channelTimeout(
+	channel: SearchChannelConfig,
+	config: NarraForkSettings = settings,
+): number {
 	let declaredTimeout: number | undefined;
-	if (channel.kind === "custom-api") declaredTimeout = findCustomProvider(channel)?.timeoutMs;
+	if (channel.kind === "custom-api")
+		declaredTimeout = findCustomProvider(channel, config)?.timeoutMs;
 	// A plugin declares its timeout in the manifest rather than in host settings.
 	else if (channel.kind === "plugin")
 		declaredTimeout = findExtraSearchChannel(channel.id)?.timeoutMs;
 	return (
 		channel.timeoutMs ??
 		declaredTimeout ??
-		settings.search?.defaultTimeoutMs ??
+		config.search?.defaultTimeoutMs ??
 		DEFAULT_SEARCH_TIMEOUT_MS
 	);
 }
@@ -249,16 +277,17 @@ function channelTimeout(channel: SearchChannelConfig): number {
 async function runChannel(
 	channel: SearchChannelConfig,
 	request: SearchRequest,
+	config: NarraForkSettings = settings,
 ): Promise<SearchChannelResult> {
 	switch (channel.kind) {
 		case "nug-mcp":
 			return withSearchTimeout(
 				request.signal,
-				(signal) => nugMcpSearch(channel, request, signal),
-				channelTimeout(channel),
+				(signal) => nugMcpSearch(channel, request, signal, config),
+				channelTimeout(channel, config),
 			);
 		case "custom-api": {
-			const provider = findCustomProvider(channel);
+			const provider = findCustomProvider(channel, config);
 			if (!provider) throw new Error("Custom search provider is not configured");
 			return withSearchTimeout(
 				request.signal,
@@ -270,7 +299,7 @@ async function runChannel(
 						request,
 						signal,
 					}),
-				channelTimeout(channel),
+				channelTimeout(channel, config),
 			);
 		}
 		case "plugin":
@@ -282,15 +311,23 @@ async function runChannel(
 					// label so a stale registry entry cannot relabel the attempt record.
 					return { ...result, channelId: channel.id, channelLabel: channelLabel(channel) };
 				},
-				channelTimeout(channel),
+				channelTimeout(channel, config),
 			);
 		case "subagent":
-			return searchSubagent(channel, request);
+			return (request.testMode ? withSearchTimeout : withSearchSubagentTimeout)(
+				request.signal,
+				(signal) =>
+					searchSubagent(
+						{ ...channel, timeoutMs: channelTimeout(channel, config) },
+						{ ...request, signal },
+					),
+				channelTimeout(channel, config),
+			);
 		case "native":
 			return withSearchTimeout(
 				request.signal,
 				(signal) => nativeSideRequestSearch(channel, request, signal),
-				channelTimeout(channel),
+				channelTimeout(channel, config),
 			);
 	}
 }
@@ -400,6 +437,12 @@ export async function executeSearch(request: SearchRequest): Promise<SearchExecu
 			};
 		} catch (err) {
 			if (request.signal?.aborted || isAbortError(err)) throw err;
+			if (err instanceof SearchSubagentCleanupTimeoutError) {
+				logger.warn("Stopping search fallback while subagent cleanup is pending", {
+					channelId: channel.id,
+				});
+				throw err;
+			}
 			const message = err instanceof Error ? err.message : String(err);
 			attempts.push({ channelId: channel.id, channelLabel: label, error: message });
 			logger.warn("Search channel failed, trying next channel", {
@@ -416,4 +459,63 @@ export async function executeSearch(request: SearchRequest): Promise<SearchExecu
 		)
 		.join("; ");
 	throw new Error(`No usable web search channel succeeded${details ? ` (${details})` : ""}`);
+}
+
+/** Search subagents use their own provider, never recurse through the channel router. */
+export async function executeNativeSearch(request: SearchRequest): Promise<SearchExecutionResult> {
+	const channel: SearchChannelConfig = { id: "native", kind: "native", enabled: true };
+	const result = await withSearchTimeout(request.signal, (signal) =>
+		nativeSideRequestSearch(channel, request, signal),
+	);
+	return {
+		...result,
+		text: truncateSearchOutput(result.text),
+		attempts: [{ channelId: channel.id, channelLabel: channelLabel(channel) }],
+	};
+}
+
+/** Explicit settings probes bypass enabled, not validation or provider capability checks. */
+export async function testSearchChannel(
+	request: SearchRequest,
+	draft: { channel?: SearchChannelConfig; customProvider?: CustomSearchProviderConfig } = {},
+): Promise<SearchExecutionResult> {
+	const channel =
+		draft.channel ??
+		getNormalizedSearchChannels(settings).find((item) => item.id === request.channelId);
+	if (!channel)
+		throw new Error(`Search channel ${request.channelId ?? "(unspecified)"} does not exist`);
+	if (request.channelId && channel.id !== request.channelId)
+		throw new Error("Search channel ID does not match the draft");
+	if (channel.kind === "native")
+		throw new Error("Model native search must be tested in a model session");
+	if (
+		draft.customProvider &&
+		(channel.kind !== "custom-api" || draft.customProvider.id !== channel.providerId)
+	) {
+		throw new Error("Custom search provider does not match the channel");
+	}
+	// Copy only the search configuration; never mutate the shared settings singleton.
+	const config: NarraForkSettings = {
+		...settings,
+		search: {
+			...settings.search,
+			channels: [channel],
+			customProviders: draft.customProvider
+				? [draft.customProvider]
+				: (settings.search?.customProviders ?? []),
+		},
+	};
+	const label = channelLabel(channel, config);
+	try {
+		const result = await runChannel(channel, { ...request, testMode: true }, config);
+		return {
+			...result,
+			channelLabel: label,
+			text: truncateSearchOutput(result.text, config),
+			attempts: [{ channelId: channel.id, channelLabel: label }],
+		};
+	} catch (err) {
+		if (request.signal?.aborted || isAbortError(err)) throw err;
+		throw new Error(`${label}: ${err instanceof Error ? err.message : String(err)}`);
+	}
 }

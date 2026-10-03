@@ -172,6 +172,9 @@ export function NotificationSection({ userPrefs, updateUserPref }: NotificationS
 	return (
 		<Stack>
 			{/* Trigger toggles */}
+			<Text size="sm" c="dimmed">
+				{t("notifyAutomaticTriggersDesc")}
+			</Text>
 			<Switch
 				label={t("notifyOnDone")}
 				description={t("notifyOnDoneDesc")}

@@ -599,7 +599,14 @@ describe("queued exit survives subsequent phase transitions", () => {
 				try {
 					draw("queued");
 					expect(host.querySelector(`.${classes.queued}`)).not.toBeNull();
+					if (surface === "card") {
+						expect(host.querySelector("[data-nf-card-header] .tabler-icon-clock")).not.toBeNull();
+						expect(host.querySelector("[data-nf-card-header] .vlist-spin")).toBeNull();
+					}
 					draw(next);
+					if (surface === "card" && next === "reflecting") {
+						expect(host.querySelector("[data-nf-card-header] .tabler-icon-shield")).not.toBeNull();
+					}
 					expect(host.querySelector(`.${classes.queued_out}`)).not.toBeNull();
 					const finalPhase = next === "running" ? "success" : "running";
 					draw(finalPhase);

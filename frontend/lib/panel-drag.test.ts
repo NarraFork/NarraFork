@@ -166,6 +166,40 @@ describe("startPanelDrag subject classification", () => {
 		(globalThis as any).document = prevDocument;
 	});
 
+	test("immediate release uses pointerup coordinates, not the last hover", () => {
+		const ends: Array<PanelDragState | null> = [];
+		const offEnd = onPanelDragEnd((state) => ends.push(state));
+		try {
+			startPanelDrag({ panelId: "p1", id: "narr_1", title: "T", x: 0, y: 0 });
+			dispatch("pointermove", 40, 20);
+			dispatch("pointerup", 900, 700);
+			expect(ends).toHaveLength(1);
+			expect(ends[0]).toMatchObject({ panelId: "p1", x: 900, y: 700 });
+			expect(getPanelDrag()).toBeNull();
+		} finally {
+			offEnd();
+			cancelDrag();
+		}
+	});
+
+	test("pointercancel clears a live drag without committing its hover", () => {
+		const ends: Array<PanelDragState | null> = [];
+		const offEnd = onPanelDragEnd((state) => ends.push(state));
+		try {
+			startPanelDrag({ panelId: "p1", id: "narr_1", title: "T", x: 0, y: 0 });
+			dispatch("pointermove", 40, 20);
+			dispatch("pointercancel", 40, 20);
+			dispatch("pointerup", 40, 20);
+			expect(ends).toEqual([null]);
+			expect(getPanelDrag()).toBeNull();
+			expect(document.body.style.cursor).toBe("");
+			expect(document.body.style.userSelect).toBe("");
+		} finally {
+			offEnd();
+			cancelDrag();
+		}
+	});
+
 	test("explicit subjectKind=tool is carried into the drag state", () => {
 		let final: PanelDragState | null = null;
 		const offEnd = onPanelDragEnd((s) => {

@@ -44,6 +44,24 @@ describe("browser handoff persistence", () => {
 		expect(existsSync(_internal.HANDOFF_PATH)).toBe(false);
 	});
 
+	test("preserves bounded interruption IDs and rejects malformed markers", () => {
+		writeBrowserHandoff({
+			wsEndpoints: {},
+			sessions: [
+				sampleSession({ sessionId: "legacy" }),
+				sampleSession({ sessionId: "interrupted", interruptedProfileId: "safe_ID-1" }),
+				sampleSession({ sessionId: "unsafe", interruptedProfileId: "../private" }),
+				sampleSession({ sessionId: "oversize", interruptedProfileId: "x".repeat(65) }),
+			],
+		});
+		const consumed = consumeBrowserHandoff();
+		expect(consumed?.sessions.map((session) => session.sessionId)).toEqual([
+			"legacy",
+			"interrupted",
+		]);
+		expect(consumed?.sessions[1]?.interruptedProfileId).toBe("safe_ID-1");
+	});
+
 	test("writes CDP endpoints with private filesystem permissions", () => {
 		writeBrowserHandoff({
 			wsEndpoints: { headless: "ws://127.0.0.1:1234/devtools/browser/private" },

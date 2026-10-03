@@ -44,6 +44,9 @@ function isHandoffSession(value: unknown): value is BrowserSessionHandoff {
 		typeof v.url === "string" &&
 		typeof v.currentPageUrl === "string" &&
 		typeof v.contextId === "string" &&
+		(v.interruptedProfileId === undefined ||
+			(typeof v.interruptedProfileId === "string" &&
+				/^[A-Za-z0-9_-]{1,64}$/.test(v.interruptedProfileId))) &&
 		typeof v.headless === "boolean" &&
 		typeof v.ttlMs === "number" &&
 		typeof v.networkCaptureEnabled === "boolean"

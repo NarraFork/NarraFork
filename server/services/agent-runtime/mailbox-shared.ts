@@ -15,6 +15,29 @@ import { generateId } from "../../lib/id";
 import { MAILBOX_LIMITS as L } from "./limits";
 import type { MailboxInput } from "./mailbox-types";
 
+/** Durable cancellation disposition shared by both adapters and the history consumer. */
+export const AWAITED_TERMINAL_CONSUMED_REASON = "Terminal result consumed by Await";
+
+/** Only Await's revoked task notice is a benign projection skip; ordinary claim errors
+ * (including cancelled user/Send rows) must retain their failure handling. */
+export function isAwaitedTerminalConsumption(
+	row:
+		| {
+				state: string;
+				kind: string;
+				lastError: string | null;
+				currentMessageId: string | null;
+		  }
+		| undefined,
+): boolean {
+	return (
+		row?.state === "cancelled" &&
+		row.kind === "task_notice" &&
+		row.lastError === AWAITED_TERMINAL_CONSUMED_REASON &&
+		row.currentMessageId === null
+	);
+}
+
 /** JSON-encode with a hard byte ceiling; oversized metadata is rejected, never truncated. */
 export function boundedJson(value: unknown, limit: number): string {
 	const json = JSON.stringify(value);

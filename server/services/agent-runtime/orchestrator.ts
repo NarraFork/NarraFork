@@ -15,6 +15,7 @@ import {
 	acknowledgePipelineExitConfirmation,
 	clearPipelineStateIfActive,
 } from "../../lib/agent/pipeline-state";
+import { projectMessageSenderText } from "../../lib/agent/sender-projection";
 import { detectShell } from "../../lib/agent/shell";
 import { getMissingWorkingDirectoryRecovery, SHELL_TOOL_NAME } from "../../lib/agent/tools/bash";
 import { clearBehaviorFenceEditGrant } from "../../lib/agent/tools/behavior-fence-grant";
@@ -51,6 +52,10 @@ import { resolveKnownUnavailableNugModel } from "../../lib/nug-model-availabilit
 import { markNugCachedModelUnavailable } from "../../lib/nug-model-cache";
 import { resolveEffectiveRelaxedPlan } from "../../lib/permission-modes";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../../lib/prompt-i18n";
+import {
+	getSearchExecutionScope,
+	SearchExecutionBudgetExceededError,
+} from "../../lib/search/execution-scope";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getAutoCompactKeepPairs,
@@ -1484,7 +1489,10 @@ export async function runAgentLoopUnlocked(
 			// Run one agent loop pass
 
 			// Preserve the exact prepared packet: a pure tool replay never gets synthetic text.
-			let effectiveText = usesInitialHistory ? runState.input.text : preparedHistory.currentText;
+			let effectiveText =
+				usesInitialHistory && profile.kind === "subagent"
+					? (profile.initialCurrentText ?? preparedHistory.currentInputText)
+					: preparedHistory.currentText;
 			const _isPureToolResultReplay = !effectiveText.trim() && trailingToolResults.length > 0;
 
 			// Passive knowledge injection (point A): when this turn carries real user text,
@@ -1533,7 +1541,7 @@ export async function runAgentLoopUnlocked(
 								hits,
 							});
 							for (const h of hits) knowledgeInjectedIds.add(h.entryId);
-							effectiveText = `${effectiveText}\n\n${block}`;
+							effectiveText = `${effectiveText}\n\n${projectMessageSenderText(knowledgeMessage, block)}`;
 						}
 					}
 				} catch (err) {
@@ -1760,6 +1768,55 @@ export async function runAgentLoopUnlocked(
 			runState.hitMaxTurns = result.maxTurnsExceeded === true;
 
 			runState.totalTokens += accountTokenUsageForTurn(active);
+			const searchScope = getSearchExecutionScope();
+			if (searchScope && (searchScope.remainingTurns <= 0 || result.maxTurnsExceeded)) {
+				// No retry/spec/goal continuation can acquire a fresh budget implicitly.
+				const completedNaturally =
+					result.completedNaturally === true &&
+					!result.hasError &&
+					!result.maxTurnsExceeded &&
+					!result.aborted &&
+					!result.interrupted &&
+					!result.contextLengthExceeded &&
+					!result.silentDisconnect &&
+					!result.paymentRequired &&
+					!result.modelUnavailable &&
+					!result.retryableError;
+				if (!completedNaturally) {
+					// Recovery signals often leave hasError=false and finalText contains
+					// partial assistant output, not the upstream failure. Keep their specific
+					// error instead of masking it with the exhausted-budget fallback.
+					const message =
+						result.paymentRequired?.message ||
+						result.modelUnavailable?.message ||
+						result.retryableError ||
+						(result.hasError && !result.maxTurnsExceeded ? result.finalText : "") ||
+						(result.silentDisconnect ? "Codex WebSocket silent disconnect" : "") ||
+						(result.contextLengthExceeded ? "Error: context length exceeded" : "") ||
+						(result.aborted ? "Aborted" : "") ||
+						new SearchExecutionBudgetExceededError().message;
+					const errorCode = result.paymentRequired
+						? "payment_required"
+						: (result.retryableErrorCode ?? result.errorCode);
+					const diagnostics =
+						result.modelUnavailable?.diagnostics ??
+						result.retryableDiagnostics ??
+						result.errorDiagnostics;
+					runState.hadError = true;
+					runState.finalText = message;
+					await narratorService.updateStatus(narratorId, "idle", {
+						substatus: ["error"],
+						errorMessage: message,
+						errorCode,
+						diagnostics,
+					});
+					active.events.emit("event", {
+						type: "error",
+						data: { message, errorCode, diagnostics },
+					});
+				}
+				break;
+			}
 
 			// Suppress runaway auto-continuation when a continuation pass makes no effective
 			// progress: either it called no tools, or it repeatedly hit the same protected-task

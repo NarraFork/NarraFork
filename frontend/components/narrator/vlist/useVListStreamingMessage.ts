@@ -555,6 +555,7 @@ export function useVListStreamingMessage(
 				input,
 				rawParentToolUseId,
 				meta,
+				streamingEditOrigin,
 				inputDocument,
 			) => {
 				if (!isSubagent && rawParentToolUseId) return;
@@ -585,6 +586,7 @@ export function useVListStreamingMessage(
 								}
 							: {}),
 						...(meta ? { metadata: meta as Record<string, unknown> } : {}),
+						...(streamingEditOrigin ? { streamingEditOrigin } : {}),
 					})
 				)
 					flush();

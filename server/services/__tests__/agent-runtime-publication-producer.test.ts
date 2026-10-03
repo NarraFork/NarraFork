@@ -72,6 +72,89 @@ afterAll(() => {
 });
 
 describe("real task producers use publication outbox", () => {
+	test("task registration adopts the actor run and preserves its boundary; ordinary starts still replace it", async () => {
+		const first = publisher.startAgentRun({ narratorId: "child", parentNarratorId: "parent" });
+		// Registration must not move the first run's boundary past already-produced output.
+		db.insert(narratorMessages)
+			.values({
+				id: "during-run",
+				narratorId: "child",
+				role: "assistant",
+				contentJson: [],
+				createdAt: time,
+			})
+			.run();
+		db.insert(narratorMessageRefs)
+			.values({ id: "during-run-ref", narratorId: "child", messageId: "during-run", seq: 0 })
+			.run();
+		const task = await tasks.createAgentTask({
+			id: "child",
+			subagentNarratorId: "child",
+			parentNarratorId: "parent",
+			subagentType: "general",
+		});
+		expect(task.logicalRunId).toBe(first.logicalRunId);
+		expect(db.select().from(narrators).where(eq(narrators.id, "child")).get()?.logicalRunId).toBe(
+			first.logicalRunId,
+		);
+		expect(db.select().from(runtimePublicationOutbox).all()).toHaveLength(1);
+		expect(db.select().from(runtimePublicationOutbox).all()[0].resultRef).toBe("source_after:-1");
+		const taskRow = {
+			id: "projection",
+			parentNarratorId: "parent",
+			type: "agent" as const,
+			status: "running" as const,
+			startedAt: time,
+			createdAt: time,
+			updatedAt: time,
+		};
+		expect(() =>
+			publisher.startAgentRun({
+				narratorId: "child",
+				parentNarratorId: "parent",
+				taskRow,
+				resumeRunId: "explicit-stale-run",
+			}),
+		).toThrow("Stale logical run recovery");
+		const second = publisher.startAgentRun({ narratorId: "child", parentNarratorId: "parent" });
+		expect(second.logicalRunId).not.toBe(first.logicalRunId);
+		expect(db.select().from(narrators).where(eq(narrators.id, "child")).get()?.logicalRunId).toBe(
+			second.logicalRunId,
+		);
+		expect((await tasks.getById("child"))?.logicalRunId).toBe(second.logicalRunId);
+	});
+	test("new task admission does not adopt the actor's old terminal or consumed run", async () => {
+		const old = publisher.startAgentRun({ narratorId: "child", parentNarratorId: "parent" });
+		db.transaction((tx) =>
+			publisher.commit(
+				{
+					...old,
+					eventKind: "completed",
+					resultRef: publisher.persistResult(old, "OLD RESULT", tx),
+					summary: "old",
+				},
+				tx,
+			),
+		);
+		publisher.consumeAwaitedTerminal(old);
+		const task = await tasks.createAgentTask({
+			id: "child",
+			subagentNarratorId: "child",
+			parentNarratorId: "parent",
+			subagentType: "general",
+		});
+		if (!task.logicalRunId) throw new Error("New task needs a logical run");
+		expect(task.logicalRunId).not.toBe(old.logicalRunId);
+		expect(db.select().from(narrators).where(eq(narrators.id, "child")).get()?.logicalRunId).toBe(
+			task.logicalRunId,
+		);
+		expect(db.select().from(runtimePublicationOutbox).all()).toHaveLength(1);
+		expect(db.select().from(runtimePublicationOutbox).all()[0].logicalRunId).toBe(
+			task.logicalRunId,
+		);
+		expect(publisher.readAgentTerminalResult(old)).toEqual({ output: "OLD RESULT" });
+	});
+
 	test("101st Bash completion is terminal while full mailbox retains its intent and immutable source", async () => {
 		fill("bash");
 		await startBash("last");
