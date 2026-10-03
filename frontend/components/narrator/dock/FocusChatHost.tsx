@@ -210,17 +210,25 @@ function StableFocusChatHost({
 	const mobileRef = useRef<HTMLDivElement>(null);
 	const initialMobile = useRef(isMobile);
 	const currentSlot = useRef<ChatSlot | null>(null);
+	const headerPointerHandler = useRef<FocusChatChrome["onHeaderPointerDown"]>(undefined);
+	// A late dock registration must not change the desktop chat's pointer prop.
+	// Keep its identity for this narrator while dispatching to the LIVE slot handler.
+	const [desktopPointerDelegate] = useState(() => (event: PointerEvent) => {
+		headerPointerHandler.current?.(event);
+	});
 	const pendingRestore = useRef<(() => void) | null>(null);
 	const [slot, setSlot] = useState<ChatSlot | null>(null);
 	const bridge = useMemo<ChatSlotBridge>(
 		() => ({
 			register(next) {
 				currentSlot.current = next;
+				headerPointerHandler.current = next.onHeaderPointerDown;
 				setSlot(next);
 				return () => {
 					// A replaced slot's late cleanup must not evict its successor.
 					if (currentSlot.current !== next) return;
 					currentSlot.current = null;
+					headerPointerHandler.current = undefined;
 					setSlot(null);
 					if (container.parentElement === next.element && mobileRef.current) {
 						pendingRestore.current ??= captureDomState(container);
@@ -230,12 +238,9 @@ function StableFocusChatHost({
 			},
 			update(next) {
 				if (currentSlot.current?.element !== next.element) return;
-				setSlot((previous) =>
-					previous?.compact === next.compact &&
-					previous.onHeaderPointerDown === next.onHeaderPointerDown
-						? previous
-						: next,
-				);
+				// Do not replace currentSlot: register's cleanup owns that exact object.
+				headerPointerHandler.current = next.onHeaderPointerDown;
+				setSlot((previous) => (previous?.compact === next.compact ? previous : next));
 			},
 		}),
 		[container],
@@ -277,7 +282,11 @@ function StableFocusChatHost({
 					{renderChat(
 						isMobile
 							? { compact: false }
-							: { ...(slot ?? { compact: true }), onViewSubagentSession: dock?.openSubagentPanel },
+							: {
+									compact: slot?.compact ?? true,
+									onHeaderPointerDown: desktopPointerDelegate,
+									onViewSubagentSession: dock?.openSubagentPanel,
+								},
 					)}
 				</NarratorDockContext.Provider>,
 				container,

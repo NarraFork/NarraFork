@@ -535,6 +535,7 @@ it("bounds production row caches through repeated mounts/trims and narrator swit
 		pendingTrimSweepRef: { current: true },
 		appliedMessageRevisionRef: { current: 10 },
 		initialRevisionSyncRef: { current: false },
+		textReadingDetachedRef: { current: true },
 		setMessageRevision: () => {},
 		setClosingRows: () => {},
 		narratorId: "next-narrator",
@@ -588,6 +589,7 @@ it("bounds production row caches through repeated mounts/trims and narrator swit
 		expect(state.resizeFormHeightsRef.current.size).toBe(1);
 	}
 	reset(runtime, state, []);
+	expect(state.textReadingDetachedRef.current).toBe(false);
 	for (const map of rowMaps) expect(map.size).toBe(0);
 	expect(state.resizeDirtyKeysRef.current.size).toBe(0);
 	expect(state.resizeFormHeightsRef.current.size).toBe(1);

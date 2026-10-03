@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { parseHTML } from "linkedom";
-import { act, useEffect, useState } from "react";
+import { act, memo, type PointerEvent, useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import {
 	createFocusChatDockView,
@@ -17,6 +17,8 @@ let unmounts: number;
 let fallbackMounts: number;
 let desktopMounts: number;
 let desktopUnmounts: number;
+let chatRenders: number;
+let chatChrome: FocusChatChrome | null;
 let active: HTMLElement | null;
 let moves: number;
 let selected: {
@@ -70,6 +72,12 @@ function Chat({
 	);
 }
 
+const MemoChatProbe = memo(function ChatProbe(props: FocusChatChrome & { narratorId: string }) {
+	chatRenders++;
+	chatChrome = props;
+	return <Chat {...props} />;
+});
+
 function Fallback() {
 	useEffect(() => {
 		fallbackMounts++;
@@ -100,25 +108,30 @@ function Harness({
 	slots = mobile ? [] : ["desktop"],
 	compact = true,
 	trackDesktopTools = false,
+	handlers = {},
 }: {
 	narratorId?: string;
 	mobile?: boolean;
 	slots?: string[];
 	compact?: boolean;
 	trackDesktopTools?: boolean;
+	handlers?: Record<string, FocusChatChrome["onHeaderPointerDown"]>;
 }) {
 	return (
 		<NarratorDockProvider key={narratorId} narratorId={narratorId}>
 			<FocusChatHost
 				narratorId={narratorId}
 				isMobile={mobile}
-				renderChat={(chrome) => <Chat narratorId={narratorId} {...chrome} />}
+				renderChat={(chrome) => <MemoChatProbe narratorId={narratorId} {...chrome} />}
 			>
 				{trackDesktopTools && !mobile && <DesktopProbe compact={compact} />}
 				{!trackDesktopTools &&
 					slots.map((id) => (
 						<div key={id} data-desktop={id}>
-							<FocusChatSlot compact={compact} onHeaderPointerDown={drag}>
+							<FocusChatSlot
+								compact={compact}
+								onHeaderPointerDown={id in handlers ? handlers[id] : drag}
+							>
 								<Fallback />
 							</FocusChatSlot>
 						</div>
@@ -143,6 +156,8 @@ beforeEach(() => {
 	fallbackMounts = 0;
 	desktopMounts = 0;
 	desktopUnmounts = 0;
+	chatRenders = 0;
+	chatChrome = null;
 	moves = 0;
 	active = null;
 	selected = { anchorNode: null, anchorOffset: 0, focusNode: null, focusOffset: 0 };
@@ -202,6 +217,20 @@ afterEach(async () => {
 
 async function render(props: Parameters<typeof Harness>[0] = {}) {
 	await act(async () => root.render(<Harness {...props} />));
+}
+
+function desktopPointer() {
+	const handler = chatChrome?.onHeaderPointerDown;
+	if (!handler) throw new Error("Missing desktop pointer delegate");
+	return handler;
+}
+
+async function pointerDown() {
+	await act(async () => {
+		host
+			.querySelector("[data-header]")
+			?.dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+	});
 }
 
 function input() {
@@ -285,6 +314,134 @@ describe("focus chat stable portal owner", () => {
 		expect(host.querySelector("[data-focus-chat-container]")).not.toBe(oldContainer);
 		expect(input().value).toBe("");
 		expect(host.querySelector("[data-chat]")?.getAttribute("data-dock")).toBe("second");
+	});
+
+	test("lazy desktop registration keeps the memo chat pointer prop and DOM stable", async () => {
+		const calls: string[] = [];
+		await render();
+		await draftAndFocus();
+		const textarea = input();
+		const chat = host.querySelector("[data-chat]");
+		const selection = { ...selected };
+		expect(chatChrome?.onHeaderPointerDown).toBeUndefined();
+		await render({ mobile: false, slots: [] });
+		const pointer = desktopPointer();
+		const desktopRenders = chatRenders;
+		// The desktop delegate is present even while the chat is parked without a slot.
+		expect(() => pointer({} as PointerEvent)).not.toThrow();
+		await render({
+			mobile: false,
+			slots: ["late"],
+			handlers: { late: () => calls.push("late") },
+		});
+		expect(desktopPointer()).toBe(pointer);
+		expect(chatRenders).toBe(desktopRenders);
+		await pointerDown();
+		expect(calls).toEqual(["late"]);
+		expect(host.querySelector("[data-chat]")).toBe(chat);
+		expect(input()).toBe(textarea);
+		expect(input().value).toBe("unsent draft");
+		expect(active).toBe(textarea);
+		expect(selected).toEqual(selection);
+		expect(viewport().scrollTop).toBe(487);
+		expect(mounts).toBe(1);
+		await render();
+		expect(chatChrome?.onHeaderPointerDown).toBeUndefined();
+		expect(() => pointer({} as PointerEvent)).not.toThrow();
+		expect(calls).toEqual(["late"]);
+	});
+
+	test("same-slot callback changes dispatch live without rerendering memo chat", async () => {
+		const calls: string[] = [];
+		const first = (event: PointerEvent) => {
+			expect(event.currentTarget === host.querySelector("[data-header]")).toBe(true);
+			calls.push("first");
+		};
+		const second = () => calls.push("second");
+		await render({ mobile: false, handlers: { desktop: first } });
+		const pointer = desktopPointer();
+		const initialRenders = chatRenders;
+		await pointerDown();
+		await render({ mobile: false, handlers: { desktop: second } });
+		expect(desktopPointer()).toBe(pointer);
+		expect(chatRenders).toBe(initialRenders);
+		await pointerDown();
+		expect(calls).toEqual(["first", "second"]);
+		await render({ mobile: false, handlers: { desktop: undefined } });
+		expect(desktopPointer()).toBe(pointer);
+		expect(chatRenders).toBe(initialRenders);
+		await pointerDown();
+		expect(calls).toEqual(["first", "second"]);
+		await render({ mobile: false, compact: false, handlers: { desktop: second } });
+		expect(chatRenders).toBe(initialRenders + 1);
+		expect(chatChrome?.compact).toBe(false);
+		expect(desktopPointer()).toBe(pointer);
+		await pointerDown();
+		expect(calls).toEqual(["first", "second", "second"]);
+		// Updating compact must not replace the object owned by registration cleanup.
+		await render({ mobile: false, compact: false, slots: [] });
+		await pointerDown();
+		expect(calls).toEqual(["first", "second", "second"]);
+	});
+
+	test("slot replacement ignores stale updates and cleanup but clears the current handler", async () => {
+		const calls: string[] = [];
+		const old = () => calls.push("old");
+		const fresh = () => calls.push("new");
+		const staleUpdate = () => calls.push("stale");
+		await render({ mobile: false, slots: ["old"], handlers: { old } });
+		const pointer = desktopPointer();
+		await pointerDown();
+		const initialRenders = chatRenders;
+		await render({ mobile: false, slots: ["old", "new"], handlers: { old, new: fresh } });
+		await pointerDown();
+		await render({
+			mobile: false,
+			slots: ["old", "new"],
+			handlers: { old: staleUpdate, new: fresh },
+		});
+		await pointerDown();
+		await render({ mobile: false, slots: ["new"], handlers: { new: fresh } });
+		await pointerDown();
+		expect(desktopPointer()).toBe(pointer);
+		expect(chatRenders).toBe(initialRenders);
+		expect(calls).toEqual(["old", "new", "new", "new"]);
+		await render({ mobile: false, slots: [] });
+		await pointerDown();
+		expect(desktopPointer()).toBe(pointer);
+		expect(chatRenders).toBe(initialRenders);
+		expect(calls).toEqual(["old", "new", "new", "new"]);
+	});
+
+	test("removing the newest slot does not fall back to an older registered handler", async () => {
+		const calls: string[] = [];
+		const old = () => calls.push("old");
+		const fresh = () => calls.push("new");
+		await render({ mobile: false, slots: ["old", "new"], handlers: { old, new: fresh } });
+		const pointer = desktopPointer();
+		await pointerDown();
+		await render({ mobile: false, slots: ["old"], handlers: { old } });
+		await pointerDown();
+		expect(desktopPointer()).toBe(pointer);
+		expect(calls).toEqual(["new"]);
+	});
+
+	test("pointer delegates belong to one narrator and cannot dispatch to its successor", async () => {
+		const calls: string[] = [];
+		await render({ mobile: false, handlers: { desktop: () => calls.push("first") } });
+		const pointer = desktopPointer();
+		await pointerDown();
+		await render({
+			narratorId: "second",
+			mobile: false,
+			handlers: { desktop: () => calls.push("second") },
+		});
+		expect(desktopPointer()).not.toBe(pointer);
+		pointer({} as PointerEvent);
+		await pointerDown();
+		expect(calls).toEqual(["first", "second"]);
+		expect(mounts).toBe(2);
+		expect(unmounts).toBe(1);
 	});
 
 	test("compact/header updates do not move the container or recreate chat", async () => {
@@ -426,7 +583,6 @@ describe("focus chat stable portal owner", () => {
 });
 
 test("chat command context avoids outbound publication feedback but reads live data", async () => {
-	const { memo } = await import("react");
 	let raw: ReturnType<typeof useNarratorDockContext> | undefined;
 	let chat: ReturnType<typeof useNarratorDockContext> | undefined;
 	let chatRenders = 0;
@@ -439,16 +595,23 @@ test("chat command context avoids outbound publication feedback but reads live d
 		chatRenders++;
 		return <div data-command-chat />;
 	});
-	await act(async () =>
-		root.render(
-			<NarratorDockProvider narratorId="first">
-				<CaptureRaw />
-				<FocusChatHost narratorId="first" isMobile={false} renderChat={() => <ChatProbe />}>
-					<DesktopProbe compact />
-				</FocusChatHost>
-			</NarratorDockProvider>,
-		),
-	);
+	async function renderDock(onBack?: () => void, highlightMessageId?: string) {
+		await act(async () =>
+			root.render(
+				<NarratorDockProvider
+					narratorId="first"
+					onBack={onBack}
+					highlightMessageId={highlightMessageId}
+				>
+					<CaptureRaw />
+					<FocusChatHost narratorId="first" isMobile={false} renderChat={() => <ChatProbe />}>
+						<DesktopProbe compact />
+					</FocusChatHost>
+				</NarratorDockProvider>,
+			),
+		);
+	}
+	await renderDock();
 	if (!raw || !chat) throw new Error("Missing test dock context");
 	const initialChat = chat;
 	const initialRenders = chatRenders;
@@ -457,6 +620,14 @@ test("chat command context avoids outbound publication feedback but reads live d
 	expect(chatRenders).toBe(initialRenders);
 	expect(chat.browserInfo.sessionCount).toBe(4);
 	expect(raw.browserInfo.sessionCount).toBe(4);
+	const onBack = () => {};
+	await renderDock(onBack, "selected-message");
+	if (!chat || !raw) throw new Error("Missing updated dock context");
+	expect(chat).not.toBe(initialChat);
+	expect(chatRenders).toBe(initialRenders + 1);
+	expect(chat.onBack).toBe(onBack);
+	expect(chat.highlightMessageId).toBe("selected-message");
+	expect(chat.browserInfo.sessionCount).toBe(4);
 
 	const read = createFocusChatDockView();
 	const baseline = read(raw);

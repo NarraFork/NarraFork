@@ -1,8 +1,7 @@
-import { useMediaQuery } from "@mantine/hooks";
 import { useRouter } from "@tanstack/react-router";
 import { useEffect, useRef } from "react";
 import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../lib/history-state";
-import { MOBILE_VIEWPORT_MEDIA_QUERY } from "../lib/responsive";
+import { useMobileViewport } from "./useMobileViewport";
 
 /**
  * Give a mobile Drawer one same-URL history entry so the system Back action closes it before
@@ -14,7 +13,7 @@ import { MOBILE_VIEWPORT_MEDIA_QUERY } from "../lib/responsive";
  */
 export function useMobileDrawerHistory(opened: boolean, onClose: () => void): void {
 	const router = useRouter();
-	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
+	const isMobile = useMobileViewport();
 	const onCloseRef = useRef(onClose);
 	onCloseRef.current = onClose;
 	const history = router?.history;

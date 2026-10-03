@@ -40,6 +40,7 @@ import { NarratorDock } from "../../components/narrator/dock/NarratorDock";
 import { NarratorDockProvider } from "../../components/narrator/dock/NarratorDockContext";
 import { useChapter } from "../../hooks/useChapters";
 import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
+import { useMobileTerminalDrawerOpen } from "../../hooks/useMobileTerminalDrawerOpen";
 import { useNarrator } from "../../hooks/useNarrator";
 import { useTerminalCapability } from "../../hooks/usePlatform";
 import {
@@ -226,7 +227,7 @@ function NarratorDetailPage() {
 	const hasRunningTerminal = (existingTerminals ?? []).some((t: any) => t.status === "running");
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const runningCount = (existingTerminals ?? []).filter((t: any) => t.status === "running").length;
-	const createTerminal = useCreateNarratorTerminal(narratorId);
+	const { mutate: createTerminal } = useCreateNarratorTerminal(narratorId);
 	const terminalCapability = useTerminalCapability();
 	const terminalSupported = terminalCapability.supported;
 
@@ -249,12 +250,12 @@ function NarratorDetailPage() {
 	useMobileDrawerHistory(specDrawerOpened, closeSpecDrawer);
 
 	// Mobile: open drawer and auto-create terminal if none running
-	const openDrawerWithTerminal = useCallback(() => {
-		if (terminalSupported && !hasRunningTerminal) {
-			createTerminal.mutate({ name: "Terminal 1" });
-		}
-		openDrawer();
-	}, [terminalSupported, hasRunningTerminal, createTerminal, openDrawer]);
+	const openDrawerWithTerminal = useMobileTerminalDrawerOpen({
+		terminalSupported,
+		hasRunningTerminal,
+		createTerminal,
+		openDrawer,
+	});
 	const writeToTerminalRef = useRef<((text: string) => void) | null>(null);
 	const appendInputRef = useRef<((text: string) => void) | null>(null);
 
