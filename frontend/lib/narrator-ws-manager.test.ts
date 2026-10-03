@@ -9,6 +9,45 @@ import {
 	shouldDeliverToListener,
 } from "./narrator-ws-manager";
 
+describe("complete input document lane ordering", () => {
+	test("snapshot and seal descriptors are not overtaken by immediate live input deltas", async () => {
+		const manager = new NarratorWSManager();
+		const ref = {
+			id: "source",
+			epoch: "epoch",
+			length: 4,
+			revision: 1,
+			complete: false,
+			originKnown: true,
+		};
+		const seen: Array<Record<string, unknown>> = [];
+		manager.addListener({ narratorIds: ["n1"] }, (frame) => seen.push(frame));
+		const route = manager as unknown as { _dispatch: (frame: Record<string, unknown>) => void };
+		const snapshot = {
+			type: "streaming_snapshot",
+			narratorId: "n1",
+			toolChunks: [{ inputDocument: { ref, offset: 4 } }],
+		};
+		const live = {
+			type: "tool_use_chunk",
+			narratorId: "n1",
+			inputDocument: { ref: { ...ref, length: 8, revision: 2 }, offset: 4 },
+			streamingField: { name: "content", delta: "tail", offset: 4 },
+		};
+		const seal = {
+			type: "tool_started",
+			narratorId: "n1",
+			inputDocument: { ref: { ...ref, length: 8, revision: 3, complete: true }, offset: 8 },
+		};
+		route._dispatch(snapshot);
+		route._dispatch(live);
+		route._dispatch(seal);
+		expect(seen).toEqual([snapshot, live, seal]);
+		await Promise.resolve();
+		expect(seen).toHaveLength(3);
+	});
+});
+
 describe("COW replacement aliases", () => {
 	test("forwards every old/new identity alias from WS frames", () => {
 		expect(

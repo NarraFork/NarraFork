@@ -921,6 +921,10 @@ function sourcePointRevision(value: unknown): string {
 /** Content-signature revision of one NON-composite detail body. */
 function leafTextRevision(d: Record<string, unknown>): string {
 	let rev = "";
+	if (d.textDocument && typeof d.textDocument === "object") {
+		const doc = d.textDocument as Record<string, unknown>;
+		rev += `|doc:${doc.id}:${doc.epoch}:${doc.revision}:${doc.length}:${doc.complete}`;
+	}
 	if (typeof d.text === "string") rev += `|tx:${textSignature(d.text)}`;
 	for (const key of [
 		"id",
@@ -935,6 +939,11 @@ function leafTextRevision(d: Record<string, unknown>): string {
 		"kind",
 	] as const) {
 		if (d[key] != null) rev += `|${key}:${textSignature(String(d[key]))}`;
+	}
+	if (d.textDocumentError === true) rev += "|docError:1";
+	if (d.textDocumentSource && typeof d.textDocumentSource === "object") {
+		const source = d.textDocumentSource as Record<string, unknown>;
+		rev += `|docSource:${source.narratorId}:${source.toolUseId}:${source.toolCallId}:${source.messageId}:${source.executionAttempt}`;
 	}
 	if (d.live === true) rev += "|live:1";
 	if (d.textTruncated === true) rev += "|cut:1";

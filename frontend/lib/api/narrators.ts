@@ -4,6 +4,12 @@ import type { BackgroundTaskListPage } from "@shared/background-task-list";
 import type { FileChangeEvidenceUncertaintyWarning } from "@shared/file-change-protocol";
 import type { FileReference } from "@shared/file-reference";
 import type { HumanAttentionPage } from "@shared/human-attention";
+import {
+	TEXT_DOCUMENT_PACKET_BYTES,
+	TEXT_DOCUMENT_PAGE_CHARS,
+	type TextDocumentRange,
+	type TextDocumentRef,
+} from "@shared/pretext-layout/text-document";
 import type { SubagentModelPools, SubagentModelUse } from "@shared/subagent-model-policy";
 import type { ToolEditPreview } from "@shared/tool-edit-preview";
 import {
@@ -43,6 +49,97 @@ import type {
 	WhitelistDir,
 } from "./types";
 import { normalizeRuleTargetSelector, selectorToLegacyDeviceScope } from "./types";
+
+/** Bounded source lane: timeout, packet bytes and caller cancellation are independent of document size. */
+async function requestTextDocumentJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+	const controller = new AbortController();
+	const abort = () => controller.abort(signal?.reason);
+	const timer = setTimeout(
+		() => controller.abort(new Error("Text document read timed out")),
+		10_000,
+	);
+	signal?.addEventListener("abort", abort, { once: true });
+	if (signal?.aborted) abort();
+	try {
+		const response = await authorizedFetch(`${apiBase()}${path}`, { signal: controller.signal });
+		if (!response.ok) {
+			const error = await readFetchError(response, "Text document read failed");
+			throw new ApiError(error.message, response.status, error.data);
+		}
+		const reader = response.body?.getReader();
+		if (!reader) throw new Error("Text document response has no body");
+		const decoder = new TextDecoder();
+		let bytes = 0;
+		let text = "";
+		try {
+			while (true) {
+				const chunk = await reader.read();
+				if (chunk.done) break;
+				bytes += chunk.value.byteLength;
+				if (bytes > TEXT_DOCUMENT_PACKET_BYTES)
+					throw new Error("Text document packet limit exceeded");
+				text += decoder.decode(chunk.value, { stream: true });
+			}
+			return JSON.parse(text + decoder.decode()) as T;
+		} finally {
+			await reader.cancel().catch(() => {});
+			reader.releaseLock();
+		}
+	} finally {
+		clearTimeout(timer);
+		signal?.removeEventListener("abort", abort);
+	}
+}
+
+export interface WriteDocumentSourceReference {
+	toolCallId: string;
+	messageId: string;
+	executionAttempt: number;
+}
+
+export function getTextDocumentRange(
+	narratorId: string,
+	refId: string,
+	offset = 0,
+	limit = TEXT_DOCUMENT_PAGE_CHARS,
+	signal?: AbortSignal,
+): Promise<TextDocumentRange> {
+	const query = new URLSearchParams({
+		offset: String(offset),
+		limit: String(Math.min(limit, TEXT_DOCUMENT_PAGE_CHARS)),
+	});
+	return requestTextDocumentJson(
+		`/narrators/${encodeURIComponent(narratorId)}/text-documents/${encodeURIComponent(refId)}?${query}`,
+		signal,
+	);
+}
+
+export function ensureWriteDocumentSource(
+	narratorId: string,
+	toolUseId: string,
+	reference: WriteDocumentSourceReference,
+	signal?: AbortSignal,
+): Promise<TextDocumentRef> {
+	const query = new URLSearchParams({
+		toolCallId: reference.toolCallId,
+		messageId: reference.messageId,
+		executionAttempt: String(reference.executionAttempt),
+	});
+	return requestTextDocumentJson(
+		`/narrators/${encodeURIComponent(narratorId)}/tool-calls/${encodeURIComponent(toolUseId)}/input-document?${query}`,
+		signal,
+	);
+}
+
+export function readTextDocumentRange(
+	ref: TextDocumentRef,
+	offset: number,
+	limit: number,
+	signal?: AbortSignal,
+) {
+	if (!ref.source?.narratorId) return Promise.reject(new Error("Text document owner is missing"));
+	return getTextDocumentRange(ref.source.narratorId, ref.id, offset, limit, signal);
+}
 
 /** Persisted row identity; a provider's tool-use id alone need not be unique. */
 export interface ToolCallDetailRef {
@@ -446,6 +543,9 @@ export interface NarratorCustomTraits {
 }
 
 export const narratorsApi = {
+	getTextDocumentRange,
+	ensureWriteDocumentSource,
+	readTextDocumentRange,
 	listNarrators: (opts?: {
 		chapterId?: string;
 		standalone?: boolean;

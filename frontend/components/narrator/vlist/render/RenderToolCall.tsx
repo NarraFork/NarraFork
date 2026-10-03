@@ -87,6 +87,9 @@ import { resolveToolRowStatusMark, TraceRowStatusGlyph } from "./trace-row-statu
 import "../vlist-markdown.css";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
+import { DocumentCodeBody } from "../../content/DocumentCodeBody";
+import { DocumentSourceStatus } from "../../content/DocumentSourceStatus";
+import { queueDocumentFind } from "../../content/document-find-intent";
 import { TokenFlowText } from "../../content/TokenLines";
 import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
 import { AutoFollowScroll } from "../../scroll/AutoFollowScroll";
@@ -97,6 +100,7 @@ import {
 	DETAIL_BOX_PADDING_X,
 	DETAIL_BOX_PADDING_Y,
 	DETAIL_TOP_MARGIN,
+	detailBodyFont,
 	detailBodyFontSize,
 	detailContentLineHeight,
 	ENTRY_SNIPPET_MAX_LINES,
@@ -1924,12 +1928,32 @@ export function RenderToolBody({
 			{(onReaderProgress) => (
 				<AutoFollowScroll
 					bodyId={model.id}
+					onKeyDown={(event) => {
+						if (
+							!model.textDocumentSource ||
+							!(event.ctrlKey || event.metaKey) ||
+							event.altKey ||
+							event.shiftKey ||
+							event.key.toLowerCase() !== "f" ||
+							(event.target instanceof Element &&
+								event.target.closest("input,textarea,[contenteditable=true]"))
+						)
+							return;
+						event.preventDefault();
+						event.stopPropagation();
+						queueDocumentFind(model.textDocumentSource);
+						if (viewTarget) viewControls?.requestFullPayload?.(viewTarget);
+					}}
 					live={model.live}
 					revision={model.revision}
 					followTarget={model.followTarget.kind === "diff-row" ? "row" : "end"}
-					layout={model.format === "diff" ? { width: contentWidth, height } : undefined}
+					layout={
+						model.format === "diff" || model.textDocument
+							? { width: contentWidth, height }
+							: undefined
+					}
 					contentPadding={
-						model.format === "diff"
+						model.format === "diff" || model.textDocument
 							? { x: DETAIL_BOX_PADDING_X, y: DETAIL_BOX_PADDING_Y }
 							: undefined
 					}
@@ -1954,7 +1978,25 @@ export function RenderToolBody({
 							: { whiteSpace: "pre" }),
 					}}
 				>
-					{model.format === "diff" ? (
+					{model.textDocumentSource ? (
+						<DocumentSourceStatus
+							failed={model.textDocumentError}
+							onRetry={
+								viewTarget ? () => viewControls?.requestFullPayload?.(viewTarget) : undefined
+							}
+						/>
+					) : null}
+					{model.textDocument ? (
+						<DocumentCodeBody
+							document={model.textDocument}
+							language={resolveDetailLang(model)}
+							wordWrap={wordWrap}
+							font={detailBodyFont()}
+							fontRevision={typographyMetrics().revision}
+							lineHeight={detailContentLineHeight()}
+							letterSpacing={letterSpacingForFont(detailBodyFont())}
+						/>
+					) : model.format === "diff" ? (
 						<DiffContent
 							document={model.diffDocument}
 							language={resolveDetailLang(model)}

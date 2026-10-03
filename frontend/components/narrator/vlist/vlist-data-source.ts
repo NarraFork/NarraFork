@@ -35,6 +35,10 @@ export interface VListToolDetailPayload {
 }
 
 export interface VListDataSource {
+	/** Complete Write fields, using this surface's existing authorization policy. */
+	fetchTextDocumentRange?: import("@shared/pretext-layout/text-document").TextDocumentRangeReader;
+	/** Lazily recover a persisted Write as a pageable source instead of a giant detail payload. */
+	ensureWriteDocumentSource?: import("../content/useWriteDocumentSources").WriteDocumentSourceEnsurer;
 	/**
 	 * Viewer identity for bubble side resolution (isSelf). `null` means "every
 	 * user bubble is somebody else's" — the anonymous share reading a session.

@@ -53,6 +53,141 @@ const PARENT_NARRATOR_ID = "parent-narrator";
 const SUBAGENT_NARRATOR_ID = "subagent-narrator";
 const PARENT_TOOL_USE_ID = "parent-tool-use";
 
+describe("Write complete input source routing", () => {
+	test("child source and descriptor go only to self; parent remains a bounded summary", async () => {
+		const ctx = makeSubagentContext();
+		await processEvent(
+			{
+				type: "tool_use_chunk",
+				toolUseId: "write-private",
+				toolName: "Write",
+				inputCharsTotal: 20,
+				streamingField: {
+					name: "content",
+					delta: "private\r\n\ud800",
+					startsField: true,
+					offset: 0,
+				},
+			},
+			ctx,
+		);
+		const messages = broadcastMessages as Array<Record<string, unknown>>;
+		const parent = messages[broadcastTargets.indexOf(PARENT_NARRATOR_ID)];
+		const self = messages[broadcastTargets.indexOf(SUBAGENT_NARRATOR_ID)];
+		expect(parent).not.toHaveProperty("inputDocument");
+		expect(parent).not.toHaveProperty("streamingField");
+		expect(self.inputDocument).toBeDefined();
+		const descriptor =
+			getStreamingSnapshot(SUBAGENT_NARRATOR_ID)?.toolChunks.get("write-private")?.inputDocument;
+		expect(descriptor?.ref.length).toBe(10);
+		expect(descriptor?.ref.source?.narratorId).toBe(SUBAGENT_NARRATOR_ID);
+		expect(
+			JSON.stringify(getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get("write-private")),
+		).not.toContain("private\\r");
+		const { toolInputStreamSource } = await import("../tool-input-stream-source");
+		if (!descriptor) throw new Error("missing descriptor");
+		expect(
+			(await toolInputStreamSource.getTextDocumentRange(SUBAGENT_NARRATOR_ID, descriptor.ref.id))
+				.text,
+		).toBe("private\r\n\ud800");
+		await expect(
+			toolInputStreamSource.getTextDocumentRange(PARENT_NARRATOR_ID, descriptor.ref.id),
+		).rejects.toMatchObject({ statusCode: 404 });
+	});
+
+	test("field closure before persistence stays readable without putting complete content in started/snapshot", async () => {
+		const ctx = makeMainContext();
+		await processEvent(
+			{
+				type: "tool_use_chunk",
+				toolUseId: "write-seal",
+				toolName: "Write",
+				inputCharsTotal: 7,
+				streamingField: { name: "content", delta: "before", offset: 0, startsField: true },
+			},
+			ctx,
+		);
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId: "write-seal",
+				toolName: "Write",
+				input: { file_path: "file.txt", content: "beforeafter" },
+			},
+			ctx,
+		);
+		const started = (broadcastMessages as Array<Record<string, unknown>>).find(
+			(message) => message.type === "tool_started",
+		);
+		expect(started?.input).toEqual({ file_path: "file.txt" });
+		const descriptor =
+			getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get("write-seal")?.inputDocument;
+		expect(descriptor?.ref.complete).toBe(true);
+		expect(
+			JSON.stringify(getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get("write-seal")),
+		).not.toContain("beforeafter");
+		const { toolInputStreamSource } = await import("../tool-input-stream-source");
+		if (!descriptor) throw new Error("missing descriptor");
+		expect(
+			(await toolInputStreamSource.getTextDocumentRange(PARENT_NARRATOR_ID, descriptor.ref.id))
+				.text,
+		).toBe("beforeafter");
+	});
+
+	test("startsField restart explicitly switches epoch instead of appending into an old decoded field", async () => {
+		const ctx = makeMainContext();
+		const chunk = {
+			type: "tool_use_chunk" as const,
+			toolUseId: "restarted-field",
+			toolName: "Write",
+			inputCharsTotal: 5,
+			streamingField: { name: "content", delta: "first", offset: 0, startsField: true },
+		};
+		await processEvent(chunk, ctx);
+		const first = getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get(chunk.toolUseId)
+			?.inputDocument?.ref;
+		await processEvent(
+			{ ...chunk, streamingField: { ...chunk.streamingField, delta: "replacement" } },
+			ctx,
+		);
+		const next = getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get(chunk.toolUseId)
+			?.inputDocument?.ref;
+		expect(next?.epoch).not.toBe(first?.epoch);
+		const { toolInputStreamSource } = await import("../tool-input-stream-source");
+		if (!next) throw new Error("missing descriptor");
+		expect(
+			(await toolInputStreamSource.getTextDocumentRange(PARENT_NARRATOR_ID, next.id)).text,
+		).toBe("replacement");
+	});
+
+	test("discarded provider id retry changes source identity and retires the abandoned source", async () => {
+		const ctx = makeMainContext();
+		const chunk = {
+			type: "tool_use_chunk" as const,
+			toolUseId: "same-provider-id",
+			toolName: "Write",
+			inputCharsTotal: 5,
+			streamingField: { name: "content", delta: "first", offset: 0, startsField: true },
+		};
+		await processEvent(chunk, ctx);
+		const first = getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get(chunk.toolUseId)
+			?.inputDocument?.ref;
+		await processEvent({ type: "tool_use_discarded", toolUseIds: [chunk.toolUseId] }, ctx);
+		await processEvent(
+			{ ...chunk, streamingField: { ...chunk.streamingField, delta: "retry" } },
+			ctx,
+		);
+		const next = getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get(chunk.toolUseId)
+			?.inputDocument?.ref;
+		expect(first?.id).not.toBe(next?.id);
+		const { toolInputStreamSource } = await import("../tool-input-stream-source");
+		if (!first) throw new Error("missing descriptor");
+		await expect(
+			toolInputStreamSource.getTextDocumentRange(PARENT_NARRATOR_ID, first.id),
+		).rejects.toMatchObject({ statusCode: 404 });
+	});
+});
+
 describe("request attribution", () => {
 	test("subagent request keeps its event owner rather than the later pass owner", async () => {
 		const ctx = makeSubagentContext();

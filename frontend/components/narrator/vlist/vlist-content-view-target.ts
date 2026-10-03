@@ -20,6 +20,7 @@ export interface VListViewTarget {
 	slot: string;
 	owner: VListViewOwner;
 	model?: ToolCappedDetail;
+	textDocument?: import("@shared/pretext-layout/text-document").TextDocumentRef;
 	kind: VListViewKind;
 	fileReferenceContext?: FileReferenceContext | null;
 	title?: string;
@@ -59,6 +60,7 @@ function targetFromModel(
 		slot: model.source,
 		owner: viewOwner(owner),
 		model,
+		...(model.textDocument ? { textDocument: model.textDocument } : {}),
 		kind: model.format === "text" ? "code" : model.format,
 		text: model.text ?? "",
 		...(title ? { title } : {}),
@@ -243,6 +245,13 @@ export function sameViewTarget(a: VListViewTarget, b: VListViewTarget): boolean 
 			target.rowShowsPrefix,
 			target.sourceInline,
 			target.fileReferenceContext,
+			target.textDocument && [
+				target.textDocument.id,
+				target.textDocument.epoch,
+				target.textDocument.revision,
+				target.textDocument.length,
+				target.textDocument.complete,
+			],
 			model?.source,
 			model?.format,
 			model?.live,
@@ -250,6 +259,8 @@ export function sameViewTarget(a: VListViewTarget, b: VListViewTarget): boolean 
 			model?.range,
 			model?.followTarget,
 			model?.sourcePath,
+			model?.textDocumentSource,
+			model?.textDocumentError,
 			model?.diffDocument?.revision,
 			model?.diffDocument?.focus,
 			model?.diffDocument?.oldSource.range,

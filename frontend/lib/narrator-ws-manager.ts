@@ -1964,7 +1964,13 @@ export class NarratorWSManager {
 
 		// Latency-sensitive messages (streaming) are dispatched immediately —
 		// their consumers already have RAF-based batching.
-		if (msgType && NarratorWSManager.IMMEDIATE_TYPES.has(msgType)) {
+		const hasInputDocument =
+			!!data.inputDocument ||
+			(msgType === "streaming_snapshot" &&
+				Array.isArray(data.toolChunks) &&
+				data.toolChunks.some((chunk) => chunk?.inputDocument));
+		// Source snapshot/seal watermarks must not be overtaken by immediate live deltas.
+		if (hasInputDocument || (msgType && NarratorWSManager.IMMEDIATE_TYPES.has(msgType))) {
 			this._dispatchImmediate(data);
 			return;
 		}

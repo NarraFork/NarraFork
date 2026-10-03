@@ -11,6 +11,7 @@ import type {
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
+import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
 import type { ProgressPhase } from "@shared/progress-phase";
 import type { NarratorWsSubscriptionLimitError, RecentTabsDelta } from "@shared/recent-tabs";
 import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
@@ -633,6 +634,7 @@ export type NarratorServerMessage =
 			subagentNarratorId?: string;
 			toolName: string;
 			input?: unknown;
+			inputDocument?: TextDocumentStreamUpdate;
 			streamStartedAt?: number;
 			streamCompletedAt?: number;
 			parentToolUseId?: string;
@@ -657,7 +659,14 @@ export type NarratorServerMessage =
 			extractedFields?: Record<string, string>;
 			metadata?: Record<string, unknown>;
 			/** Incremental delta of the large streaming field */
-			streamingField?: { name: string; delta: string; startsField?: boolean };
+			streamingField?: {
+				name: string;
+				delta: string;
+				startsField?: boolean;
+				offset?: number;
+				complete?: boolean;
+			};
+			inputDocument?: TextDocumentStreamUpdate;
 			/**
 			 * Child-row label for the parent card's "recent calls" list. Built from the
 			 * fields the streaming JSON parser has already extracted, so the row can be

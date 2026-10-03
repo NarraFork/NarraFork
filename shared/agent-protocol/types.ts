@@ -255,6 +255,8 @@ export interface ParsedStreamEvent {
 		toolUseId: string;
 		name?: string;
 		input?: string;
+		/** Authoritative arguments at a provider completion boundary, not necessarily an append. */
+		finalInput?: string;
 		stop?: boolean;
 		/** Provider-native content block index (e.g. Anthropic SSE event.index). */
 		outputIndex?: number;

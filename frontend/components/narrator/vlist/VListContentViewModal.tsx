@@ -37,6 +37,7 @@ import { useRouter } from "@tanstack/react-router";
 import { type CSSProperties, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../../../lib/history-state";
+import { DocumentCopyButton } from "../content/DocumentCopyButton";
 import { clampViewText, isMarkdownTarget, VListViewBody } from "./vlist-content-view-body";
 import type { VListViewTarget } from "./vlist-content-view-target";
 
@@ -81,7 +82,7 @@ export function VListContentViewModal({
 	const bodyRef = useRef<HTMLDivElement>(null);
 	const isMarkdown = isMarkdownTarget(target);
 
-	const clamped = clampViewText(target.text);
+	const clamped = target.textDocument ? { text: "", clamped: false } : clampViewText(target.text);
 	// The body can be incomplete for two independent reasons: the payload itself
 	// was a server-side prefix (`target.truncated`), or this modal clamped it to
 	// stay responsive. Either way the reader gets a notice, so a partial body is
@@ -220,21 +221,41 @@ export function VListContentViewModal({
 					</ActionIcon>
 				</Tooltip>
 				{/* Copy always writes the FULL text, never the clamped preview. */}
-				<CopyButton value={target.text}>
-					{({ copied, copy }) => (
-						<Tooltip label={copied ? t("copied") : t("copy")} withArrow position="top">
-							<ActionIcon
-								size={isMobile ? "lg" : "xs"}
-								variant="filled"
-								color={copied ? "teal" : "gray"}
-								onClick={copy}
-								aria-label={copied ? t("copied") : t("copy")}
-							>
-								<IconCopy size={isMobile ? 18 : 12} />
-							</ActionIcon>
-						</Tooltip>
-					)}
-				</CopyButton>
+				{target.textDocument ? (
+					<DocumentCopyButton document={target.textDocument} size={isMobile ? "lg" : "xs"} />
+				) : target.model?.textDocumentSource ? (
+					<Tooltip
+						label={tNarrator(
+							target.model.textDocumentError ? "documentLoadFailed" : "documentLoading",
+						)}
+						withArrow
+						position="top"
+					>
+						<ActionIcon
+							size={isMobile ? "lg" : "xs"}
+							disabled
+							aria-label={tNarrator("documentLoading")}
+						>
+							<IconCopy size={isMobile ? 18 : 12} />
+						</ActionIcon>
+					</Tooltip>
+				) : (
+					<CopyButton value={target.text}>
+						{({ copied, copy }) => (
+							<Tooltip label={copied ? t("copied") : t("copy")} withArrow position="top">
+								<ActionIcon
+									size={isMobile ? "lg" : "xs"}
+									variant="filled"
+									color={copied ? "teal" : "gray"}
+									onClick={copy}
+									aria-label={copied ? t("copied") : t("copy")}
+								>
+									<IconCopy size={isMobile ? 18 : 12} />
+								</ActionIcon>
+							</Tooltip>
+						)}
+					</CopyButton>
+				)}
 				{isMobile ? (
 					<Tooltip label={t("landscape")} withArrow position="top">
 						<ActionIcon

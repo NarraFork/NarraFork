@@ -980,7 +980,11 @@ export interface AdapterContext {
 	 * the document (the measure cache keys on the body length, so the taller card is
 	 * re-measured rather than served stale).
 	 */
-	resolveFullToolInput?: (toolUseId: string | undefined, ref?: AdapterToolDetailRef) => unknown;
+	resolveFullToolInput?: (
+		toolUseId: string | undefined,
+		ref?: AdapterToolDetailRef,
+		writeInput?: unknown,
+	) => unknown;
 	resolveFullToolOutput?: (toolUseId: string | undefined, ref?: AdapterToolDetailRef) => unknown;
 	/**
 	 * A LIVE pending permission's `suggestions`, which win over the tool call's
@@ -4462,8 +4466,16 @@ const completedEditInputs = new WeakMap<
 >();
 
 function withFullInput(item: AdapterToolItem, ctx: AdapterContext): unknown {
-	if (!ctx.resolveFullToolInput || !hasTruncatedLeaf(item.tc.inputJson)) return item.tc.inputJson;
-	const full = ctx.resolveFullToolInput(item.tc.toolUseId, resolveToolDetailRef(item));
+	if (
+		!ctx.resolveFullToolInput ||
+		(item.tc.toolName !== "Write" && !hasTruncatedLeaf(item.tc.inputJson))
+	)
+		return item.tc.inputJson;
+	const full = ctx.resolveFullToolInput(
+		item.tc.toolUseId,
+		resolveToolDetailRef(item),
+		item.tc.toolName === "Write" ? item.tc.inputJson : undefined,
+	);
 	if (full == null) return item.tc.inputJson;
 	const original = item.tc.inputJson;
 	if (

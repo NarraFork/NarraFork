@@ -4,6 +4,7 @@ import { IconArrowDown, IconFocus2 } from "@tabler/icons-react";
 import {
 	type CSSProperties,
 	createContext,
+	type KeyboardEventHandler,
 	type ReactNode,
 	type RefObject,
 	useCallback,
@@ -49,6 +50,8 @@ export interface ContentViewport {
 	live: boolean;
 	following: boolean;
 	isFollowing: () => boolean;
+	/** Selection and explicit source navigation are reader intent, not follow corrections. */
+	pauseFollowing: () => void;
 	setRowTarget: (target: ContentRowTarget | null) => void;
 	notifyLayout: () => void;
 	/** Instant coordinate correction, recorded so its scroll echo cannot detach. */
@@ -76,6 +79,7 @@ export interface AutoFollowScrollProps extends Omit<BoxProps, "children" | "styl
 	contentStyle?: CSSProperties;
 	style?: CSSProperties;
 	onReaderProgress?: (viewport: HTMLElement, snapshot: ContentViewportSnapshot) => void;
+	onKeyDown?: KeyboardEventHandler<HTMLDivElement>;
 	children: ReactNode;
 }
 
@@ -509,6 +513,7 @@ function ContentScrollSession({
 			live,
 			following,
 			isFollowing: () => followingRef.current,
+			pauseFollowing: pause,
 			setRowTarget,
 			notifyLayout,
 			scrollTo: write,
@@ -521,6 +526,7 @@ function ContentScrollSession({
 			setContentSize,
 			live,
 			following,
+			pause,
 			setRowTarget,
 			notifyLayout,
 			write,

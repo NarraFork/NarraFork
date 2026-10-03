@@ -56,6 +56,7 @@ import {
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { sanitizeHeaders } from "./request-dump";
 import { parseJsonResponseWithBody } from "./response-body";
+import { ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import { resolveToolJsonSchema } from "./tool-registry";
 import {
 	type AgentToolUse,
@@ -741,7 +742,8 @@ interface ToolAccumEntry {
 	outputIndex?: number;
 	id: string;
 	name: string;
-	args: string;
+	args?: string;
+	inputStream?: ToolInputStream;
 	emitted: boolean;
 }
 
@@ -2654,16 +2656,6 @@ export async function* parseAnthropicSSEStream(
 	}
 }
 
-/** Try to parse a string as JSON. Returns true if valid. */
-function isParsableJson(s: string): boolean {
-	try {
-		JSON.parse(s);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
 /** Accumulator for thinking block signature (keyed by content_block index). */
 type ThinkingAccumEntry = { signature: string; blockIndex: number };
 
@@ -2785,7 +2777,7 @@ export function parseAnthropicEvent(
 			toolAccum.set(idx, {
 				id: block.id,
 				name: block.name,
-				args: "",
+				inputStream: new ToolInputStream(),
 				emitted: false,
 				outputIndex: idx,
 			});
@@ -2937,7 +2929,7 @@ export function parseAnthropicEvent(
 
 			const acc = toolAccum.get(idx);
 			if (acc && !acc.emitted) {
-				acc.args += event.delta.partial_json;
+				toolInputStreamFor(acc).feed(event.delta.partial_json);
 				const results: ParsedStreamEvent[] = [
 					{
 						toolUseChunk: {
@@ -2950,7 +2942,7 @@ export function parseAnthropicEvent(
 					},
 				];
 				// Early completion if args form valid JSON
-				if (isParsableJson(acc.args)) {
+				if (toolInputStreamFor(acc).hasCompleteInput()) {
 					results.push({
 						toolUseChunk: {
 							toolUseId: acc.id,

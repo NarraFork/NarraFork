@@ -7,7 +7,12 @@ import { act, StrictMode, useLayoutEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import narratorLocale from "../../../locales/en/narrator.json";
-import { AutoFollowScroll, type ContentRowTarget, useContentViewport } from "./AutoFollowScroll";
+import {
+	AutoFollowScroll,
+	type ContentRowTarget,
+	type ContentViewport,
+	useContentViewport,
+} from "./AutoFollowScroll";
 
 let root: Root;
 let container: HTMLDivElement;
@@ -164,6 +169,13 @@ function Target({ value }: { value: ContentRowTarget | null }) {
 	}, [ctx, value]);
 	return null;
 }
+function ReaderProbe({ onViewport }: { onViewport: (value: ContentViewport) => void }) {
+	const value = useContentViewport();
+	useLayoutEffect(() => {
+		if (value) onViewport(value);
+	}, [value, onViewport]);
+	return null;
+}
 async function render(opts: {
 	lines?: number;
 	live?: boolean;
@@ -172,6 +184,7 @@ async function render(opts: {
 	target?: ContentRowTarget | null;
 	revision?: string;
 	onReaderProgress?: (node: HTMLElement) => void;
+	onViewport?: (value: ContentViewport) => void;
 }) {
 	const content = (
 		<MantineProvider>
@@ -189,6 +202,7 @@ async function render(opts: {
 						<input data-input="true" />
 					</div>
 					{"target" in opts && <Target value={opts.target ?? null} />}
+					{opts.onViewport && <ReaderProbe onViewport={opts.onViewport} />}
 				</AutoFollowScroll>
 			</I18nextProvider>
 		</MantineProvider>
@@ -463,5 +477,29 @@ describe("changed-row targets are not the whole diff bottom", () => {
 		await settle();
 		expect(viewport().scrollTop).toBeLessThanOrEqual(400);
 		expect(viewport().dataset.following).toBe("true");
+	});
+});
+
+describe("document selection and source navigation", () => {
+	test("explicit reader pause survives new text and final settlement", async () => {
+		let reader: ContentViewport | undefined;
+		const onViewport = (value: ContentViewport) => {
+			reader = value;
+		};
+		await render({ lines: 100, onViewport });
+		await settle();
+		expect(reader?.isFollowing()).toBe(true);
+		await act(async () => {
+			reader?.pauseFollowing();
+			reader?.scrollTo(60);
+		});
+		await render({ lines: 200, onViewport });
+		await settle();
+		expect(reader?.isFollowing()).toBe(false);
+		expect(viewport().scrollTop).toBe(60);
+		await render({ lines: 200, live: false, revision: "sealed", onViewport });
+		await settle();
+		expect(viewport().scrollTop).toBe(60);
+		expect(reader?.isFollowing()).toBe(false);
 	});
 });

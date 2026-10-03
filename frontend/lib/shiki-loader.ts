@@ -7,7 +7,7 @@
  * highlighter small; grammar and theme modules are loaded only when requested.
  */
 
-import type { BundledLanguage, ThemedToken } from "shiki";
+import type { BundledLanguage, GrammarState, RegexEngine, ThemedToken } from "shiki";
 import { createHighlighterCore } from "shiki/core";
 import { createOnigurumaEngine } from "shiki/engine/oniguruma";
 import { assetUrl } from "./base-path";
@@ -18,9 +18,119 @@ export function createShikiOnigurumaEngine() {
 	return createOnigurumaEngine(import("shiki/wasm"));
 }
 
-interface ShikiHighlightOptions {
+/**
+ * Equivalent current-position fast path for Oniguruma's ordered pattern scanner.
+ * The aggregate scanner otherwise searches every candidate across the rest of a
+ * long line before selecting an identifier already at startPosition (quadratic
+ * for JS/TS declaration rules). A match at startPosition cannot be beaten by a
+ * later candidate; probing in original order also preserves ties/capture indices.
+ * The optional probe compiler must use strict Oniguruma-to-ES conversion. Only
+ * wholly native groups are probed with sticky exec at the EXACT original start;
+ * unsupported/emulated patterns, anchors, reset-start and custom find options
+ * retain the untouched Oniguruma aggregate scanner/cache. No text is sliced.
+ */
+export function withCurrentPositionFastPath(
+	engine: RegexEngine,
+	compileNative?: (pattern: string) => RegExp,
+): RegexEngine {
+	if (!compileNative) return engine;
+	const cache = new Map<string, RegExp>();
+	const hasNonAscii = (text: string) => {
+		for (let index = 0; index < text.length; index++)
+			if (text.charCodeAt(index) > 0x7f) return true;
+		return false;
+	};
+	return {
+		...engine,
+		createScanner(patterns) {
+			const fallback = engine.createScanner(patterns);
+			// No dropped rules, emulation, recursive approximation or altered anchors.
+			if (
+				patterns.some(
+					(pattern) =>
+						typeof pattern !== "string" || /\(\?[a-z-]*s/.test(pattern) || /\\[KGg]/.test(pattern),
+				)
+			)
+				return fallback;
+			let sticky: RegExp[];
+			try {
+				sticky = (patterns as string[]).map((pattern) => {
+					let regex = cache.get(pattern);
+					if (!regex) {
+						const compiled = compileNative(pattern);
+						if (compiled.constructor !== RegExp || !compiled.hasIndices)
+							throw new Error("Native strict regex required");
+						regex = new RegExp(compiled.source, `${compiled.flags.replace(/[gy]/g, "")}y`);
+						cache.set(pattern, regex);
+					}
+					return regex;
+				});
+			} catch {
+				return fallback;
+			}
+			return {
+				dispose() {
+					fallback.dispose?.();
+				},
+				findNextMatchSync(...args) {
+					if (args[2]) return fallback.findNextMatchSync(...args);
+					const input = args[0];
+					const text = typeof input === "string" ? input : input.content;
+					const position = args[1];
+					// UTF16 starts inside a surrogate pair are native-engine territory.
+					if (
+						position > 0 &&
+						/[\ud800-\udbff]/.test(text[position - 1]) &&
+						/[\udc00-\udfff]/.test(text[position] ?? "")
+					)
+						return fallback.findNextMatchSync(...args);
+					for (let index = 0; index < sticky.length; index++) {
+						sticky[index].lastIndex = position;
+						const match = sticky[index].exec(text);
+						if (!match || match.index !== position || !match.indices) continue;
+						const nativeInput = input as typeof input & {
+							convertUtf8OffsetToUtf16?: (offset: number) => number;
+						};
+						const missing =
+							typeof input === "string"
+								? hasNonAscii(text)
+									? text.length
+									: 0xffffffff
+								: (nativeInput.convertUtf8OffsetToUtf16?.(0xffffffff) ?? 0xffffffff);
+						return {
+							index,
+							captureIndices: match.indices.map((range) =>
+								range
+									? { start: range[0], end: range[1], length: range[1] - range[0] }
+									: { start: missing, end: missing, length: 0 },
+							),
+						};
+					}
+					// All other searches use the original aggregate and its native cache.
+					return fallback.findNextMatchSync(...args);
+				},
+			};
+		},
+	};
+}
+
+export async function createShikiDocumentEngine(): Promise<RegexEngine> {
+	const [engine, { defaultJavaScriptRegexConstructor }] = await Promise.all([
+		createShikiOnigurumaEngine(),
+		import("shiki/engine/javascript"),
+	]);
+	return withCurrentPositionFastPath(engine, (pattern) =>
+		defaultJavaScriptRegexConstructor(pattern, {
+			accuracy: "strict",
+			lazyCompileLength: Infinity,
+		}),
+	);
+}
+
+export interface ShikiHighlightOptions {
 	lang: BundledLanguage;
 	theme: string;
+	grammarState?: GrammarState;
 	tokenizeMaxLineLength?: number;
 	tokenizeTimeLimit?: number;
 }
@@ -32,7 +142,7 @@ export interface ShikiModule {
 	codeToTokens: (
 		code: string,
 		options: ShikiHighlightOptions,
-	) => Promise<{ tokens: ThemedToken[][] }>;
+	) => Promise<{ tokens: ThemedToken[][]; grammarState?: GrammarState }>;
 }
 
 // Grammars/themes are emitted by the Vite config as standalone runtime assets,
@@ -252,4 +362,53 @@ export function loadShiki(): Promise<ShikiModule | null> {
  */
 export function getCachedShiki(): ShikiModule | null {
 	return shikiCache;
+}
+
+/** Independent worker instance. Never consults document/assetUrl or the code-block cache. */
+export async function createWorkerShiki(
+	absoluteAppBase: string,
+	importAsset: (url: string) => Promise<unknown> = (url) => import(/* @vite-ignore */ url),
+): Promise<ShikiModule> {
+	const base = new URL(absoluteAppBase);
+	if (!/^https?:$/.test(base.protocol) || !base.pathname.endsWith("/")) {
+		throw new Error("Shiki Worker requires an absolute, trailing-slash app mount URL");
+	}
+	const core = await createHighlighterCore({
+		engine: await createShikiDocumentEngine(),
+		langs: [],
+		themes: [],
+	});
+	const ensureLanguage = createShikiLanguageEnsurer(
+		languageAliases,
+		(id) => importAsset(new URL(`shiki/langs/${id}.mjs`, base).href),
+		(language) => core.loadLanguage(language as Parameters<typeof core.loadLanguage>[0]),
+	);
+	const loadTheme = createShikiThemeEnsurer(
+		(theme) => {
+			if (!/^[\w-]+$/.test(theme)) throw new Error("Invalid Shiki theme");
+			return importAsset(new URL(`shiki/themes/${theme}.mjs`, base).href);
+		},
+		(theme) => core.loadTheme(theme as Parameters<typeof core.loadTheme>[0]),
+	);
+	async function optionsFor(options: ShikiHighlightOptions) {
+		const plain = ["text", "plaintext", "txt"].includes(options.lang);
+		const [language, ready] = await Promise.all([
+			plain ? Promise.resolve("text") : ensureLanguage(options.lang),
+			loadTheme(options.theme),
+		]);
+		if (!language || !ready)
+			throw new Error("Shiki Worker language or theme unavailable; retry available");
+		return {
+			...options,
+			lang: language as BundledLanguage,
+			// Only worker tokenization disables TextMate's silent 500ms early stop.
+			tokenizeMaxLineLength: 0,
+			tokenizeTimeLimit: 0,
+		};
+	}
+	return {
+		bundledLanguages,
+		codeToHtml: async (code, options) => core.codeToHtml(code, await optionsFor(options)),
+		codeToTokens: async (code, options) => core.codeToTokens(code, await optionsFor(options)),
+	};
 }

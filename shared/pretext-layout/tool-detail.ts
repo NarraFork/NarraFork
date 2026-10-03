@@ -119,6 +119,44 @@ export type ToolBodyFollowTarget =
 	| { kind: "end" }
 	| { kind: "diff-row"; focus: DiffSourcePoint | null };
 
+/** Runtime boundary for the renderer marker; arbitrary tool-input objects are not references. */
+export function isTextDocumentRef(
+	value: unknown,
+): value is import("./text-document").TextDocumentRef {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const ref = value as Record<string, unknown>;
+	if (
+		typeof ref.id !== "string" ||
+		!ref.id ||
+		typeof ref.epoch !== "string" ||
+		!ref.epoch ||
+		!Number.isSafeInteger(ref.length) ||
+		(ref.length as number) < 0 ||
+		!Number.isSafeInteger(ref.revision) ||
+		(ref.revision as number) < 0 ||
+		typeof ref.complete !== "boolean" ||
+		typeof ref.originKnown !== "boolean" ||
+		(ref.preview !== undefined && typeof ref.preview !== "string")
+	)
+		return false;
+	if (ref.source !== undefined) {
+		if (!ref.source || typeof ref.source !== "object" || Array.isArray(ref.source)) return false;
+		const source = ref.source as Record<string, unknown>;
+		if (
+			typeof source.narratorId !== "string" ||
+			typeof source.toolUseId !== "string" ||
+			typeof source.field !== "string"
+		)
+			return false;
+		if (
+			source.executionAttempt !== undefined &&
+			(!Number.isSafeInteger(source.executionAttempt) || (source.executionAttempt as number) < 0)
+		)
+			return false;
+	}
+	return true;
+}
+
 /** One canonical body descriptor. Geometry and viewport reading state live elsewhere. */
 export interface ToolCappedDetail {
 	kind: "capped";
@@ -130,6 +168,11 @@ export interface ToolCappedDetail {
 	range?: SourceTextRange;
 	revision?: string | number;
 	diffDocument?: DiffDocument;
+	/** Complete Write source; text is only its bounded measurement preview. */
+	textDocument?: import("./text-document").TextDocumentRef;
+	/** Pending historical source identity; UI never mistakes its preview for a full document. */
+	textDocumentSource?: import("./text-document").TextDocumentSource;
+	textDocumentError?: boolean;
 	/** Height budget only; labels and presentation never derive from it. */
 	cap: DetailCapKind;
 	/** Estimated content line count (× DETAIL_CONTENT_LINE_HEIGHT). */
@@ -869,7 +912,11 @@ export function describeToolBody(
 		: metadata?._streamingOutputRange;
 	return {
 		...body,
-		id: toolBodyId(input.toolUseId ?? `preview:${input.previewId}`, body.source, input.occurrence),
+		id: toolBodyId(
+			body.textDocument?.id ?? input.toolUseId ?? `preview:${input.previewId}`,
+			body.source,
+			body.textDocument ? undefined : input.occurrence,
+		),
 		live: body.format !== "media" && live,
 		...(isSourceTextRange(range) ? { range } : {}),
 		...(body.diffDocument
@@ -1309,15 +1356,39 @@ function classifyFile(
 			}),
 		]);
 	}
-	const text = readLeafText(fields.content);
+	const textDocument =
+		toolName === "Write" && isTextDocumentRef(fields.textDocument)
+			? fields.textDocument
+			: undefined;
+	const text = textDocument
+		? (textDocument.preview ?? readLeafText(fields.content)?.slice(0, 2048) ?? "")
+		: readLeafText(fields.content);
 	return sections([
 		section("meta.file", undefined, metaRows([pathRow(fp)])),
-		textSection("input.content", text === undefined ? undefined : fields.content, "input", {
-			cap: inputLive ? "streaming" : "code",
-			text,
-			format: "code",
-			...(fp ? { codeLangPath: fp } : {}),
-		}),
+		textSection(
+			"input.content",
+			textDocument ? text : text === undefined ? undefined : fields.content,
+			"input",
+			{
+				cap: inputLive ? "streaming" : "code",
+				text,
+				...(textDocument
+					? { textDocument, revision: textDocument.revision, textTruncated: false }
+					: toolName === "Write" &&
+							fields.textDocumentSource &&
+							typeof fields.textDocumentSource === "object"
+						? {
+								textDocumentSource:
+									fields.textDocumentSource as import("./text-document").TextDocumentSource,
+							}
+						: {}),
+				...(toolName === "Write" && fields.textDocumentError === true
+					? { textDocumentError: true }
+					: {}),
+				format: "code",
+				...(fp ? { codeLangPath: fp } : {}),
+			},
+		),
 	]);
 }
 

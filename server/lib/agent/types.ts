@@ -486,6 +486,10 @@ export type AgentEvent =
 				delta: string;
 				/** True at the JSON string's start, false for a continuation; absent means unknown. */
 				startsField?: boolean;
+				/** Decoded raw UTF-16 offset before this delta (CRLF is not normalized). */
+				offset?: number;
+				/** True when the JSON string closed, including an empty final delta. */
+				complete?: boolean;
 			};
 	  }
 	| {

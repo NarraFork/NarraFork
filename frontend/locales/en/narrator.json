@@ -1,5 +1,17 @@
 {
 	"you": "You",
+	"documentCodeBody": "Complete source code",
+	"documentFind": "Find in full source",
+	"documentFindPrevious": "Previous match",
+	"documentFindNext": "Next match",
+	"documentFindClose": "Close search",
+	"documentNotFound": "No matches in the source yet",
+	"documentSearchFailed": "Search failed. Try again.",
+	"documentCopyFailed": "Copy failed. Check clipboard permission and try again.",
+	"documentLoadFailed": "Unable to load or highlight the complete source.",
+	"documentRetry": "Retry",
+	"documentLoading": "Loading the complete source…",
+	"documentHighlightPending": "Updating syntax highlighting…",
 	"textPreview": {
 		"expand": "Expand content",
 		"collapse": "Collapse text",

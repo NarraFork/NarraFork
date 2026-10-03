@@ -1,5 +1,6 @@
-import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { z } from "zod/v4";
+import { diskSpaceMonitor } from "../../disk-safety";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, CodexRebuildHistoryRetryError } from "../codex-errors";
 import type { ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
@@ -25,7 +26,13 @@ let providerScenario:
 let providerAttempts = 0;
 let streamingBoundaryClock = 0;
 let streamingBoundaryTool = "Write";
-let streamingBoundaryChunks: Array<{ input: string; advanceMs?: number; stop?: boolean }> = [];
+let streamingBoundaryChunks: Array<{
+	input?: string;
+	finalInput?: string;
+	flatInput?: Record<string, unknown>;
+	advanceMs?: number;
+	stop?: boolean;
+}> = [];
 const executedToolValues: string[] = [];
 const completedToolValues: string[] = [];
 const formattedToolResultOrder: string[] = [];
@@ -43,6 +50,30 @@ function createGate() {
 	});
 	return { promise, resolve };
 }
+
+interface ParallelPreflightGate {
+	firstPath: string;
+	secondPath: string;
+	firstHeld: boolean;
+	firstRelease: ReturnType<typeof createGate>;
+	secondStarted: ReturnType<typeof createGate>;
+}
+let parallelPreflight: ParallelPreflightGate | undefined;
+const diskAssessment = spyOn(diskSpaceMonitor, "assess");
+beforeEach(() => {
+	parallelPreflight = undefined;
+	// These fake tools exercise loop barriers, not host disk health. Real statfs/ancestor
+	// lookup latency can invert parallel execute() entry even on unchanged HEAD. Keep
+	// all original order assertions; inject controlled preflight latency in the cases below.
+	diskAssessment.mockImplementation(async (path) => {
+		const gate = parallelPreflight;
+		if (gate && path.split(/[\\/]/).at(-1) === gate.firstPath) {
+			gate.firstHeld = true;
+			await gate.firstRelease.promise;
+		}
+		return { path, level: "ok", space: null };
+	});
+});
 
 let serialToolsCompleted: ReturnType<typeof createGate> | undefined;
 let parallelToolsStarted = createGate();
@@ -74,13 +105,22 @@ const testProvider: ProviderAdapter = {
 			});
 		}
 		if (providerScenario === "streaming_field_boundaries") {
-			for (const { input, advanceMs = 0, stop } of streamingBoundaryChunks) {
+			for (const { input, finalInput, flatInput, advanceMs = 0, stop } of streamingBoundaryChunks) {
 				streamingBoundaryClock += advanceMs;
+				if (flatInput) {
+					yield {
+						toolUses: [
+							{ toolUseId: "tu_field_boundaries", name: streamingBoundaryTool, input: flatInput },
+						],
+					};
+					continue;
+				}
 				yield {
 					toolUseChunk: {
 						toolUseId: "tu_field_boundaries",
 						name: streamingBoundaryTool,
 						input,
+						...(finalInput != null && { finalInput }),
 						stop,
 					},
 				};
@@ -334,6 +374,8 @@ toolRegistry.register({
 	parameters: z.object({ file_path: z.string() }),
 	execute: async (args) => {
 		executedToolValues.push(`read:${args.file_path}`);
+		const preflight = parallelPreflight;
+		if (preflight && preflight.secondPath === args.file_path) preflight.secondStarted.resolve();
 		if (
 			providerScenario === "interleaved_tool_chunk_order" &&
 			args.file_path === "ordered.txt" &&
@@ -384,6 +426,8 @@ toolRegistry.register({
 });
 
 afterAll(() => {
+	parallelPreflight?.firstRelease.resolve();
+	diskAssessment.mockRestore();
 	releasePendingToolIfAny();
 	releaseParallelAbortTools();
 	mock.module("../provider", () => realProviderModule);
@@ -714,6 +758,102 @@ describe("agentLoop abort result draining", () => {
 		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
 	});
 
+	for (const abortAfterFirstResult of [false, true]) {
+		test(
+			abortAfterFirstResult
+				? "受控逆序磁盘预检：并行完成后中断不重复 drain，也不启动后续串行工具"
+				: "受控逆序磁盘预检：soft-stop 仍等待完整并行组，并按调用顺序组装模型结果",
+			async () => {
+				providerScenario = abortAfterFirstResult
+					? "parallel_then_serial_abort"
+					: "soft_stop_parallel";
+				providerAttempts = 0;
+				executedToolValues.length = 0;
+				completedToolValues.length = 0;
+				formattedToolResultOrder.length = 0;
+				parallelToolsStarted = createGate();
+				const gate: ParallelPreflightGate = {
+					firstPath: abortAfterFirstResult ? "parallel-1.txt" : "first.txt",
+					secondPath: abortAfterFirstResult ? "parallel-2.txt" : "second.txt",
+					firstHeld: false,
+					firstRelease: createGate(),
+					secondStarted: createGate(),
+				};
+				parallelPreflight = gate;
+				const firstId = abortAfterFirstResult ? "tu_parallel_abort_1" : "tu_read_1";
+				const secondId = abortAfterFirstResult ? "tu_parallel_abort_2" : "tu_read_2";
+				const serialId = abortAfterFirstResult ? "tu_serial_after_parallel" : "tu_stop_3";
+				const permissionOrder: string[] = [];
+				const ac = new AbortController();
+				const events: AgentEvent[] = [];
+				let stopRequested = false;
+				let heldWhenSecondStarted = false;
+				const observeSecond = gate.secondStarted.promise.then(() => {
+					heldWhenSecondStarted = gate.firstHeld;
+					// Abort fixture waits until both execute() calls installed their resolvers.
+					// The soft-stop fixture instead holds first until second's result is delivered.
+					if (abortAfterFirstResult) gate.firstRelease.resolve();
+				});
+				const releaseReads = abortAfterFirstResult
+					? parallelToolsStarted.promise.then(releaseParallelAbortTools)
+					: Promise.resolve();
+				try {
+					for await (const event of agentLoop(
+						makeConfig(ac.signal, {
+							deferEagerToolsForSafeStop: !abortAfterFirstResult,
+							shouldStop: () => stopRequested,
+							permissionHandler: async (_name, _input, id) => {
+								permissionOrder.push(id);
+								return { behavior: "allow" };
+							},
+						}),
+						"parallel preflight completes out of order",
+						[],
+					)) {
+						events.push(event);
+						if (event.type !== "tool_result" || event.toolUseId !== secondId) continue;
+						if (abortAfterFirstResult) ac.abort();
+						else {
+							expect(gate.firstHeld).toBe(true);
+							expect(executedToolValues).toEqual([`read:${gate.secondPath}`]);
+							stopRequested = true;
+							gate.firstRelease.resolve();
+						}
+					}
+					await observeSecond;
+					await releaseReads;
+					expect(heldWhenSecondStarted).toBe(true);
+					expect(permissionOrder).toEqual([firstId, secondId]);
+					expect(executedToolValues).toEqual([`read:${gate.secondPath}`, `read:${gate.firstPath}`]);
+					expect(completedToolValues).toEqual([
+						`read:${gate.secondPath}`,
+						`read:${gate.firstPath}`,
+					]);
+					const results = events.filter(
+						(event): event is Extract<AgentEvent, { type: "tool_result" }> =>
+							event.type === "tool_result",
+					);
+					const ids = results.map((event) => event.toolUseId);
+					expect(ids).toEqual([secondId, firstId, serialId]);
+					expect(new Set(ids).size).toBe(ids.length);
+					expect(results.slice(0, 2).map((event) => event.isError)).toEqual([false, false]);
+					expect(providerAttempts).toBe(1);
+					if (abortAfterFirstResult) {
+						expect(results[2]).toMatchObject({ isError: true, durationMs: 0 });
+						expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
+					} else {
+						expect(results[2]?.metadata).toEqual({ skippedForSoftStop: true });
+						expect(formattedToolResultOrder).toEqual([firstId, secondId, serialId]);
+						expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
+					}
+				} finally {
+					gate.firstRelease.resolve();
+					releaseParallelAbortTools();
+				}
+			},
+		);
+	}
+
 	test("交错 tool chunks 以 start 的 outputIndex 建立严格屏障和模型顺序", async () => {
 		providerScenario = "interleaved_tool_chunk_order";
 		providerAttempts = 0;
@@ -887,7 +1027,9 @@ describe("agentLoop abort result draining", () => {
 				{ input: '{"file_path":"split.txt","content":"\\u0' },
 				{ input: "041tail", stop: true },
 			],
-			expected: [{ name: "content", delta: "Atail", startsField: true }],
+			expected: [
+				{ name: "content", delta: "Atail", startsField: true, offset: 0, complete: false },
+			],
 		},
 		{
 			name: "已发送首段后 stop flush 的续段标记 false",
@@ -897,8 +1039,8 @@ describe("agentLoop abort result draining", () => {
 				{ input: "tail", stop: true },
 			],
 			expected: [
-				{ name: "content", delta: "first", startsField: true },
-				{ name: "content", delta: "tail", startsField: false },
+				{ name: "content", delta: "first", startsField: true, offset: 0, complete: false },
+				{ name: "content", delta: "tail", startsField: false, offset: 5, complete: false },
 			],
 		},
 		{
@@ -909,7 +1051,9 @@ describe("agentLoop abort result draining", () => {
 				{ input: '"content":"first' },
 				{ input: "tail", advanceMs: 50 },
 			],
-			expected: [{ name: "content", delta: "firsttail", startsField: true }],
+			expected: [
+				{ name: "content", delta: "firsttail", startsField: true, offset: 0, complete: false },
+			],
 		},
 		{
 			name: "Edit 切换字段后重置起点，起始转义完成前不消耗标记",
@@ -922,10 +1066,11 @@ describe("agentLoop abort result draining", () => {
 				{ input: "tail", advanceMs: 50 },
 			],
 			expected: [
-				{ name: "old_string", delta: "old", startsField: true },
-				{ name: "old_string", delta: "tail", startsField: false },
-				{ name: "new_string", delta: "\nnew", startsField: true },
-				{ name: "new_string", delta: "tail", startsField: false },
+				{ name: "old_string", delta: "old", startsField: true, offset: 0, complete: false },
+				{ name: "old_string", delta: "tail", startsField: false, offset: 3, complete: false },
+				{ name: "old_string", delta: "", startsField: false, offset: 7, complete: true },
+				{ name: "new_string", delta: "\nnew", startsField: true, offset: 0, complete: false },
+				{ name: "new_string", delta: "tail", startsField: false, offset: 4, complete: false },
 			],
 		},
 	]) {
@@ -949,6 +1094,116 @@ describe("agentLoop abort result draining", () => {
 				}
 				expect(providerAttempts).toBe(1);
 				expect(deltas).toEqual(scenario.expected);
+			} finally {
+				clock.mockRestore();
+			}
+		});
+	}
+
+	for (const scenario of [
+		{
+			name: "同 chunk 关闭旧字段并完成新字段不会丢尾段",
+			tool: "Edit",
+			chunks: [
+				{ input: '{"file_path":"split.txt","old_string":"old' },
+				{ input: 'tail","new_string":"new\\r\\n\\ud83d\\ude00"}', stop: true },
+			],
+			final: { file_path: "split.txt", old_string: "oldtail", new_string: "new\r\n😀" },
+		},
+		{
+			name: "Gemini 整包参数经过相同字段与完成管线",
+			tool: "Write",
+			chunks: [
+				{ input: JSON.stringify({ file_path: "split.txt", content: "whole\r\n😀" }), stop: true },
+			],
+			final: { file_path: "split.txt", content: "whole\r\n😀" },
+		},
+		{
+			name: "非 append 最终 snapshot 重置字段而不污染完整执行输入",
+			tool: "Write",
+			chunks: [
+				{ input: '{"file_path":"split.txt","content":"draft' },
+				{ finalInput: '{"file_path":"split.txt","content":"final"}', stop: true },
+			],
+			final: { file_path: "split.txt", content: "final" },
+		},
+		{
+			name: "最终 snapshot 确为前缀续写时只发送新 suffix",
+			tool: "Write",
+			chunks: [
+				{ input: '{"file_path":"split.txt","content":"a' },
+				{ finalInput: '{"file_path":"split.txt","content":"abc"}', stop: true },
+			],
+			final: { file_path: "split.txt", content: "abc" },
+		},
+		{
+			name: "flat toolUses 接管前补齐并 flush 未发送字段尾段",
+			tool: "Write",
+			chunks: [
+				{ input: '{"file_path":"split.txt","content":"a' },
+				{ flatInput: { file_path: "split.txt", content: "abc" } },
+			],
+			final: { file_path: "split.txt", content: "abc" },
+		},
+		{
+			name: "content 完成后短字段变化不反复广播累计全文",
+			tool: "Write",
+			chunks: [
+				{ input: '{"content":"large-body",' },
+				{ input: '"file_path":"split.txt"', advanceMs: 50 },
+				{ input: "}", stop: true },
+			],
+			final: { file_path: "split.txt", content: "large-body" },
+		},
+	]) {
+		test(scenario.name, async () => {
+			providerScenario = "streaming_field_boundaries";
+			providerAttempts = 0;
+			streamingBoundaryTool = scenario.tool;
+			streamingBoundaryChunks = scenario.chunks;
+			streamingBoundaryClock = Date.now();
+			const clock = spyOn(Date, "now").mockImplementation(() => streamingBoundaryClock);
+			const events: AgentEvent[] = [];
+			try {
+				for await (const event of agentLoop(
+					makeConfig(new AbortController().signal),
+					"stream complete tool",
+					[],
+				)) {
+					events.push(event);
+					if (event.type === "tool_call") break;
+				}
+				const fields: Record<string, string> = {};
+				const completed = new Set<string>();
+				for (const event of events) {
+					if (event.type !== "tool_use_chunk") continue;
+					expect(event.extractedFields?.content).toBeUndefined();
+					expect(event.extractedFields?.old_string).toBeUndefined();
+					expect(event.extractedFields?.new_string).toBeUndefined();
+					const field = event.streamingField;
+					if (!field) continue;
+					if (field.startsField) fields[field.name] = "";
+					expect(field.offset).toBe(fields[field.name]?.length ?? 0);
+					fields[field.name] = (fields[field.name] ?? "") + field.delta;
+					if (field.complete) completed.add(field.name);
+				}
+				for (const name of scenario.tool === "Edit" ? ["old_string", "new_string"] : ["content"]) {
+					const expected = (scenario.final as Record<string, string | undefined>)[name];
+					if (expected === undefined) throw new Error(`Missing fixture field: ${name}`);
+					expect(fields[name]).toBe(expected);
+					expect(completed.has(name)).toBe(true);
+				}
+				const call = events.find((event) => event.type === "tool_call");
+				expect(call?.type === "tool_call" && call.input).toEqual(scenario.final);
+				expect(events.findIndex((event) => event.type === "block_complete")).toBeLessThan(
+					events.findIndex((event) => event.type === "tool_call"),
+				);
+				if (scenario.name.includes("suffix")) {
+					const starts = events.filter(
+						(event) => event.type === "tool_use_chunk" && event.streamingField?.startsField,
+					);
+					expect(starts).toHaveLength(1);
+				}
 			} finally {
 				clock.mockRestore();
 			}

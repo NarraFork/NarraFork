@@ -79,6 +79,7 @@ import {
 	type ToolAdmissionState,
 	type ToolExecResult,
 } from "./tool-executor";
+import { ToolInputStream } from "./tool-input-stream";
 import { canonicalizeToolName, isBashToolName, isValidToolName } from "./tool-name";
 import { toolRegistry } from "./tool-registry";
 import {
@@ -157,146 +158,6 @@ export function filterDeviceTools(
 // requiring a complete JSON object. Used to provide structured
 // field data to the frontend instead of raw JSON.
 
-/** Find the unescaped closing quote in a JSON string value. Returns -1 if not found. */
-function findClosingQuote(s: string, start: number): number {
-	for (let i = start; i < s.length; i++) {
-		if (s.charCodeAt(i) === 0x5c /* \ */) {
-			i++; // skip escaped char
-			continue;
-		}
-		if (s.charCodeAt(i) === 0x22 /* " */) return i;
-	}
-	return -1;
-}
-
-/** Decode JSON string escapes, withholding an incomplete trailing escape until a later chunk. */
-function decodeJsonStringFragment(s: string): { text: string; consumedChars: number } {
-	let text = "";
-	let i = 0;
-	while (i < s.length) {
-		const ch = s[i];
-		if (ch !== "\\") {
-			text += ch;
-			i++;
-			continue;
-		}
-
-		if (i + 1 >= s.length) break;
-		const escaped = s[i + 1];
-		switch (escaped) {
-			case '"':
-				text += '"';
-				i += 2;
-				break;
-			case "\\":
-				text += "\\";
-				i += 2;
-				break;
-			case "/":
-				text += "/";
-				i += 2;
-				break;
-			case "b":
-				text += "\b";
-				i += 2;
-				break;
-			case "f":
-				text += "\f";
-				i += 2;
-				break;
-			case "n":
-				text += "\n";
-				i += 2;
-				break;
-			case "r":
-				text += "\r";
-				i += 2;
-				break;
-			case "t":
-				text += "\t";
-				i += 2;
-				break;
-			case "u": {
-				const hex = s.slice(i + 2, i + 6);
-				if (hex.length < 4) return { text, consumedChars: i };
-				if (!/^[0-9a-fA-F]{4}$/.test(hex)) {
-					text += `\\${escaped}`;
-					i += 2;
-					break;
-				}
-				text += String.fromCharCode(Number.parseInt(hex, 16));
-				i += 6;
-				break;
-			}
-			default:
-				// Preserve malformed escapes rather than dropping user-visible text.
-				text += `\\${escaped}`;
-				i += 2;
-		}
-	}
-	return { text, consumedChars: i };
-}
-
-/** Unescape JSON string content. Incomplete trailing escapes are preserved for completed fields. */
-function unescapeJsonString(s: string): string {
-	const decoded = decodeJsonStringFragment(s);
-	return decoded.consumedChars === s.length
-		? decoded.text
-		: decoded.text + s.slice(decoded.consumedChars);
-}
-
-interface ExtractedFieldsResult {
-	/** Completed short fields (key → unescaped value) */
-	fields: Record<string, string>;
-	/** The field currently being written (no closing quote yet), or null */
-	activeField: { name: string; rawStart: number } | null;
-}
-
-/**
- * Extract selected fields from an incomplete JSON object.
- * Scans for `"key": "value"` patterns, handling escaped quotes correctly, and also
- * captures completed primitive values such as booleans for short fields.
- * Returns completed fields and identifies the currently-streaming string field.
- */
-function extractJsonFields(raw: string, wantedKeys: ReadonlySet<string>): ExtractedFieldsResult {
-	const fields: Record<string, string> = {};
-	let activeField: ExtractedFieldsResult["activeField"] = null;
-
-	// Match `"key" :` patterns
-	const keyRe = /"(\w+)"\s*:\s*/g;
-	for (;;) {
-		const m = keyRe.exec(raw);
-		if (m === null) break;
-		const key = m[1];
-		if (!wantedKeys.has(key)) continue;
-		const afterColon = m.index + m[0].length;
-		if (afterColon >= raw.length) continue;
-		if (raw.charCodeAt(afterColon) !== 0x22 /* " */) {
-			const primitiveMatch = raw
-				.slice(afterColon)
-				.match(/^(true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/);
-			if (primitiveMatch) {
-				fields[key] = primitiveMatch[1];
-				keyRe.lastIndex = afterColon + primitiveMatch[0].length;
-			}
-			continue;
-		}
-		const valueStart = afterColon + 1;
-		const closeQuote = findClosingQuote(raw, valueStart);
-		if (closeQuote !== -1) {
-			// Complete field
-			fields[key] = unescapeJsonString(raw.slice(valueStart, closeQuote));
-			// Advance past this field so we don't re-match inside the value
-			keyRe.lastIndex = closeQuote + 1;
-		} else {
-			// No closing quote — this field is still being written
-			activeField = { name: key, rawStart: valueStart };
-			break; // Nothing meaningful after an incomplete string value
-		}
-	}
-	return { fields, activeField };
-}
-
 /** Per-tool mapping: which fields to extract, and which are "large" (streamed incrementally) */
 const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = {
 	Write: { short: ["file_path"], large: ["content"] },
@@ -327,20 +188,22 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 	AskUserQuestion: { short: ["async", "withdraw"], large: [] },
 };
 
-function getToolWantedKeys(toolName: string): Set<string> {
-	const config = TOOL_FIELD_CONFIG[toolName];
-	if (!config) return new Set();
-	return new Set([...config.short, ...config.large]);
-}
-
-/** Tools whose input is short enough that streaming JSON parsing adds no value.
- *  We still emit tool_use_chunk events (so the frontend shows the shimmer),
- *  but skip extractJsonFields / streaming field extraction entirely.
- *  Tools with short fields (e.g. Grep.pattern, Read.file_path) still need extraction. */
-function isShortInputTool(name: string): boolean {
-	const config = TOOL_FIELD_CONFIG[name];
-	if (!config) return true; // not in config → short by default
-	return config.large.length === 0 && config.short.length === 0;
+interface StreamingToolAccumulator {
+	name: string;
+	stream: ToolInputStream;
+	totalChars: number;
+	startedAt: number;
+	streamCompletedAt?: number;
+	extractedFilePath?: string;
+	extractedFields?: Record<string, string>;
+	pendingShort: Record<string, string>;
+	streamingMetadata?: Record<string, unknown>;
+	streamingEditOrigin?: StreamingEditOrigin;
+	metadataAttempted?: boolean;
+	lastYieldedAt: number;
+	outputIndex?: number;
+	thoughtSignature?: string;
+	thoughtSignatureSource?: string;
 }
 
 function normalizeLineEndings(text: string): string {
@@ -3187,32 +3050,73 @@ async function* agentLoopInMetadataSnapshot(
 			// Track tool calls whose input was broken (output cut off mid-stream)
 			const brokenToolUseIds = new Set<string>();
 			// Accumulator for streaming tool use events (input arrives in chunks)
-			const toolUseAccum = new Map<
-				string,
-				{
-					name: string;
-					inputChunks: string[];
-					totalChars: number;
-					startedAt: number;
-					streamCompletedAt?: number;
-					extractedFilePath?: string;
-					extractedFields?: Record<string, string>;
-					/** Metadata derived while tool input is still streaming (e.g. Edit match line). */
-					streamingMetadata?: Record<string, unknown>;
-					streamingEditOrigin?: StreamingEditOrigin;
-					/** Name of the large field currently being streamed */
-					activeStreamingField?: string;
-					/** How many raw chars of the active field have been decoded and emitted so far */
-					streamingFieldYielded: number;
-					lastYieldedAt: number;
-					/** Provider-native content block index for interleaved ordering. */
-					outputIndex?: number;
-					/** Gemini 3 thought signature attached to this functionCall part. */
-					thoughtSignature?: string;
-					/** Upstream identity that minted the Gemini thought signature. */
-					thoughtSignatureSource?: string;
+			const toolUseAccum = new Map<string, StreamingToolAccumulator>();
+			async function* flushToolInput(
+				id: string,
+				acc: StreamingToolAccumulator,
+			): AsyncGenerator<AgentEvent> {
+				if (!acc.metadataAttempted && acc.name === "Edit" && acc.extractedFilePath) {
+					const oldString = acc.stream.getField("old_string");
+					if (oldString != null) {
+						acc.metadataAttempted = true;
+						const metadataAcc = {
+							...acc,
+							extractedFields: { ...acc.extractedFields, old_string: oldString },
+						};
+						acc.streamingMetadata = await resolveStreamingEditMetadata(
+							metadataAcc,
+							config.cwd,
+							id,
+							config.defaultDeviceId ?? "local",
+						);
+						// The matcher mints evidence on its argument; keep it on the real accumulator.
+						acc.streamingEditOrigin = metadataAcc.streamingEditOrigin;
+					}
 				}
-			>();
+				const fields = acc.stream.drainFields();
+				const dirty = acc.pendingShort;
+				acc.pendingShort = {};
+				acc.lastYieldedAt = Date.now();
+				const base = {
+					type: "tool_use_chunk" as const,
+					toolUseId: id,
+					toolName: acc.name,
+					inputCharsTotal: acc.totalChars,
+					...(acc.extractedFilePath && {
+						extractedFilePath: acc.extractedFilePath,
+						contentCharsReceived: Math.max(
+							0,
+							acc.totalChars - `"file_path":"${acc.extractedFilePath}",`.length,
+						),
+					}),
+					...(Object.keys(dirty).length > 0 && { extractedFields: dirty }),
+					...(acc.streamingMetadata && { metadata: acc.streamingMetadata }),
+				};
+				// A chunk can close multiple fields. Preserve their order as individual events.
+				if (fields.length === 0) yield base;
+				else for (const streamingField of fields) yield { ...base, streamingField };
+			}
+			function resetToolInput(acc: StreamingToolAccumulator, snapshot: string): void {
+				acc.stream = new ToolInputStream(
+					TOOL_FIELD_CONFIG[acc.name]?.short,
+					TOOL_FIELD_CONFIG[acc.name]?.large,
+				);
+				acc.stream.feed(snapshot);
+				acc.totalChars = acc.stream.totalChars;
+				acc.extractedFields = undefined;
+				acc.extractedFilePath = undefined;
+				acc.pendingShort = {};
+				acc.metadataAttempted = false;
+				acc.streamingMetadata = undefined;
+				acc.streamingEditOrigin = undefined;
+			}
+			function collectShortFields(acc: StreamingToolAccumulator): boolean {
+				const dirty = acc.stream.takeShortFields();
+				Object.assign(acc.pendingShort, dirty);
+				acc.extractedFields = { ...acc.extractedFields, ...dirty };
+				if (dirty.file_path != null) acc.extractedFilePath = dirty.file_path;
+				return Object.keys(dirty).length > 0;
+			}
 			// Accumulator for native web search calls (Codex web_search tool)
 			const webSearchAccum = new Map<
 				string,
@@ -4407,6 +4311,22 @@ async function* agentLoopInMetadataSnapshot(
 							for (const tu of parsed.toolUses) {
 								throwIfUserAborted();
 								tu.name = canonicalizeToolName(tu.name);
+								const pendingInput = toolUseAccum.get(tu.toolUseId);
+								if (pendingInput) {
+									if (tu.input != null && typeof tu.input === "object" && !("_raw" in tu.input)) {
+										const snapshot = JSON.stringify(tu.input);
+										const prefix = pendingInput.stream.materializeRaw();
+										if (snapshot.startsWith(prefix))
+											pendingInput.stream.feed(snapshot.slice(prefix.length));
+										else if (JSON.stringify(pendingInput.stream.finish()) !== snapshot) {
+											yield* flushToolInput(tu.toolUseId, pendingInput);
+											resetToolInput(pendingInput, snapshot);
+										}
+										pendingInput.totalChars = pendingInput.stream.totalChars;
+										collectShortFields(pendingInput);
+									}
+									yield* flushToolInput(tu.toolUseId, pendingInput);
+								}
 								const identity = markCompletedToolUse(tu);
 								// Skip duplicates — the streaming path may have already
 								// completed this tool call via toolUseChunk stop. Preserve any
@@ -4505,9 +4425,12 @@ async function* agentLoopInMetadataSnapshot(
 									} else {
 										toolUseAccum.set(id, {
 											name,
-											inputChunks: [],
+											stream: new ToolInputStream(
+												TOOL_FIELD_CONFIG[name]?.short,
+												TOOL_FIELD_CONFIG[name]?.large,
+											),
 											totalChars: 0,
-											streamingFieldYielded: 0,
+											pendingShort: {},
 											startedAt: Date.now(),
 											lastYieldedAt: Date.now(),
 											outputIndex: parsed.toolUseChunk.outputIndex,
@@ -4525,6 +4448,7 @@ async function* agentLoopInMetadataSnapshot(
 								}
 								const acc = toolUseAccum.get(id);
 								if (acc) {
+									if (stop) acc.streamCompletedAt = Date.now();
 									if (parsed.toolUseChunk.outputIndex != null) {
 										acc.outputIndex = parsed.toolUseChunk.outputIndex;
 									}
@@ -4534,223 +4458,35 @@ async function* agentLoopInMetadataSnapshot(
 										acc.thoughtSignature = chunkThoughtSignature;
 										acc.thoughtSignatureSource = chunkThoughtSignatureSource;
 									}
-									const shortInput = isShortInputTool(acc.name);
-									if (typeof input === "string") {
-										acc.inputChunks.push(input);
-										acc.totalChars += input.length;
-
-										// Short-input tools: skip field extraction, just throttle the chunk event
-										if (shortInput) {
-											const now = Date.now();
-											if (now - acc.lastYieldedAt >= 50) {
-												acc.lastYieldedAt = now;
-												yield {
-													type: "tool_use_chunk",
-													toolUseId: id,
-													toolName: acc.name,
-													inputCharsTotal: acc.totalChars,
-												};
-											}
+									// finalInput is an authoritative snapshot, never an append delta.
+									const finalInput = parsed.toolUseChunk.finalInput;
+									if (typeof finalInput === "string") {
+										const prefix = acc.stream.materializeRaw();
+										if (finalInput.startsWith(prefix)) {
+											// The authoritative snapshot can seal an actual append-only prefix.
+											acc.stream.feed(finalInput.slice(prefix.length));
 										} else {
-											// Extract structured fields from the incomplete JSON
-											const raw = acc.inputChunks.join("");
-											const wantedKeys = getToolWantedKeys(acc.name);
-											let fieldsChanged = false;
-
-											if (wantedKeys.size > 0) {
-												const result = extractJsonFields(raw, wantedKeys);
-
-												// Update completed short fields
-												for (const [key, value] of Object.entries(result.fields)) {
-													if (!acc.extractedFields) acc.extractedFields = {};
-													if (acc.extractedFields[key] !== value) {
-														acc.extractedFields[key] = value;
-														fieldsChanged = true;
-													}
-												}
-
-												// Update file_path shortcut (used by header summary)
-												if (result.fields.file_path && !acc.extractedFilePath) {
-													acc.extractedFilePath = result.fields.file_path;
-													fieldsChanged = true;
-												}
-
-												// Track the active streaming field
-												if (result.activeField) {
-													if (acc.activeStreamingField !== result.activeField.name) {
-														acc.streamingFieldYielded = 0;
-													}
-													acc.activeStreamingField = result.activeField.name;
-												}
-											}
-
-											if (
-												!acc.streamingMetadata &&
-												acc.name === "Edit" &&
-												acc.extractedFields?.old_string != null &&
-												(acc.extractedFilePath || acc.extractedFields.file_path)
-											) {
-												acc.streamingMetadata = await resolveStreamingEditMetadata(
-													acc,
-													config.cwd,
-													id,
-													config.defaultDeviceId ?? "local",
-												);
-												fieldsChanged = true;
-											}
-
-											// Throttle: yield at most once per 50ms per tool.
-
-											// Bypass throttle when fields change so the frontend
-											// can display them immediately.
-											const now = Date.now();
-											if (fieldsChanged || now - acc.lastYieldedAt >= 50) {
-												acc.lastYieldedAt = now;
-
-												// Calculate content chars (total minus file_path JSON overhead)
-												let contentChars = acc.totalChars;
-												if (acc.extractedFilePath) {
-													const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`
-														.length;
-													contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
-												}
-
-												// Compute streaming field delta
-												let streamingField:
-													| { name: string; delta: string; startsField?: boolean }
-													| undefined;
-												if (acc.activeStreamingField && wantedKeys.size > 0) {
-													const sfResult = extractJsonFields(raw, wantedKeys);
-													if (
-														sfResult.activeField &&
-														sfResult.activeField.name === acc.activeStreamingField
-													) {
-														const fullRaw = raw.slice(sfResult.activeField.rawStart);
-														if (fullRaw.length > acc.streamingFieldYielded) {
-															const decoded = decodeJsonStringFragment(
-																fullRaw.slice(acc.streamingFieldYielded),
-															);
-															if (decoded.text) {
-																streamingField = {
-																	name: acc.activeStreamingField,
-																	delta: decoded.text,
-																	startsField: acc.streamingFieldYielded === 0,
-																};
-															}
-															acc.streamingFieldYielded += decoded.consumedChars;
-														}
-													}
-												}
-
-												yield {
-													type: "tool_use_chunk",
-													toolUseId: id,
-													toolName: acc.name,
-													inputCharsTotal: acc.totalChars,
-													...(acc.extractedFilePath && {
-														extractedFilePath: acc.extractedFilePath,
-													}),
-													...(acc.extractedFilePath && {
-														contentCharsReceived: contentChars,
-													}),
-													...(acc.extractedFields && {
-														extractedFields: acc.extractedFields,
-													}),
-													...(acc.streamingMetadata && { metadata: acc.streamingMetadata }),
-													...(streamingField && { streamingField }),
-												};
-											}
+											yield* flushToolInput(id, acc);
+											resetToolInput(acc, finalInput);
 										}
+									} else if (typeof input === "string") acc.stream.feed(input);
+									else if (input != null) {
+										// Gemini and other whole-input providers use the same field pipeline.
+										acc.stream.feed(JSON.stringify(input));
+									}
+									acc.totalChars = acc.stream.totalChars;
+									const fieldsChanged = collectShortFields(acc);
+									if (
+										!stop &&
+										(fieldsChanged ||
+											acc.stream.hasClosedFields ||
+											Date.now() - acc.lastYieldedAt >= 50)
+									) {
+										yield* flushToolInput(id, acc);
 									}
 									if (stop) {
-										// Sample before the final Edit metadata read and any downstream awaits.
-										// This is the provider-input boundary, not the later tool_call delivery time.
-										acc.streamCompletedAt = Date.now();
-										const stopRaw = acc.inputChunks.join("");
-
-										// Short-input tools: skip field extraction on stop too
-										if (shortInput) {
-											yield {
-												type: "tool_use_chunk",
-												toolUseId: id,
-												toolName: acc.name,
-												inputCharsTotal: acc.totalChars,
-											};
-										} else {
-											// Final yield: flush any remaining streaming field delta
-											const stopWantedKeys = getToolWantedKeys(acc.name);
-											if (
-												!acc.streamingMetadata &&
-												acc.name === "Edit" &&
-												acc.extractedFields?.old_string != null &&
-												(acc.extractedFilePath || acc.extractedFields.file_path)
-											) {
-												acc.streamingMetadata = await resolveStreamingEditMetadata(
-													acc,
-													config.cwd,
-													id,
-													config.defaultDeviceId ?? "local",
-												);
-											}
-											let streamingField:
-												| { name: string; delta: string; startsField?: boolean }
-												| undefined;
-
-											if (acc.activeStreamingField && stopWantedKeys.size > 0) {
-												const sfResult = extractJsonFields(stopRaw, stopWantedKeys);
-												if (
-													sfResult.activeField &&
-													sfResult.activeField.name === acc.activeStreamingField
-												) {
-													const fullRaw = stopRaw.slice(sfResult.activeField.rawStart);
-													if (fullRaw.length > acc.streamingFieldYielded) {
-														const decoded = decodeJsonStringFragment(
-															fullRaw.slice(acc.streamingFieldYielded),
-														);
-														if (decoded.text) {
-															streamingField = {
-																name: acc.activeStreamingField,
-																delta: decoded.text,
-																startsField: acc.streamingFieldYielded === 0,
-															};
-														}
-														acc.streamingFieldYielded += decoded.consumedChars;
-													}
-												}
-											}
-
-											let contentChars = acc.totalChars;
-											if (acc.extractedFilePath) {
-												const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
-												contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
-											}
-											yield {
-												type: "tool_use_chunk",
-												toolUseId: id,
-												toolName: acc.name,
-												inputCharsTotal: acc.totalChars,
-												...(acc.extractedFilePath && {
-													extractedFilePath: acc.extractedFilePath,
-												}),
-												...(acc.extractedFilePath && {
-													contentCharsReceived: contentChars,
-												}),
-												...(acc.extractedFields && {
-													extractedFields: acc.extractedFields,
-												}),
-												...(acc.streamingMetadata && { metadata: acc.streamingMetadata }),
-												...(streamingField && { streamingField }),
-											};
-										}
-
-										let parsedInput: Record<string, unknown> = {};
-										if (stopRaw) {
-											try {
-												parsedInput = JSON.parse(stopRaw);
-											} catch {
-												parsedInput = { _raw: stopRaw };
-											}
-										}
+										yield* flushToolInput(id, acc);
+										const parsedInput = acc.stream.finish();
 										const streamingEditOrigin =
 											(parsedInput?.device ?? config.defaultDeviceId ?? "local") === "local"
 												? validateStreamingEditOrigin(acc.streamingEditOrigin, id, parsedInput)

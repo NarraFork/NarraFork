@@ -5,6 +5,7 @@ import {
 	type SubagentModelInheritance,
 } from "@shared/model-inheritance";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
 import { readStreamingEditOrigin, type StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import {
@@ -538,6 +539,7 @@ export interface NarratorWSCallbacks {
 		parentToolUseId?: string,
 		meta?: SubagentToolEventMeta,
 		streamingEditOrigin?: StreamingEditOrigin,
+		inputDocument?: TextDocumentStreamUpdate,
 	) => void;
 	onToolUseChunk?: (
 		toolUseId: string,
@@ -548,8 +550,15 @@ export interface NarratorWSCallbacks {
 		contentCharsReceived?: number,
 		extractedFields?: Record<string, string>,
 		metadata?: Record<string, unknown>,
-		streamingField?: { name: string; delta: string; startsField?: boolean },
+		streamingField?: {
+			name: string;
+			delta: string;
+			startsField?: boolean;
+			offset?: number;
+			complete?: boolean;
+		},
 		meta?: SubagentToolEventMeta,
+		inputDocument?: TextDocumentStreamUpdate,
 	) => void;
 	onToolCompleted?: (
 		toolUseId: string,
@@ -879,6 +888,7 @@ export interface NarratorWSCallbacks {
 			inputCharsTotal: number;
 			parentToolUseId?: string;
 			extractedFilePath?: string;
+			inputDocument?: TextDocumentStreamUpdate;
 			contentCharsReceived?: number;
 			extractedFields?: Record<string, string>;
 			metadata?: Record<string, unknown>;
@@ -1183,6 +1193,7 @@ export function useNarratorWS(
 							data.parentToolUseId as string | undefined,
 							subagentToolEventMeta(data),
 							readStreamingEditOrigin(data.streamingEditOrigin),
+							data.inputDocument as TextDocumentStreamUpdate | undefined,
 						);
 						break;
 					case "tool_use_chunk":
@@ -1196,9 +1207,16 @@ export function useNarratorWS(
 							data.extractedFields as Record<string, string> | undefined,
 							data.metadata as Record<string, unknown> | undefined,
 							data.streamingField as
-								| { name: string; delta: string; startsField?: boolean }
+								| {
+										name: string;
+										delta: string;
+										startsField?: boolean;
+										offset?: number;
+										complete?: boolean;
+								  }
 								| undefined,
 							subagentToolEventMeta(data),
+							data.inputDocument as TextDocumentStreamUpdate | undefined,
 						);
 						break;
 					case "tool_completed":
@@ -1783,6 +1801,7 @@ export function useNarratorWS(
 								inputCharsTotal: number;
 								parentToolUseId?: string;
 								extractedFilePath?: string;
+								inputDocument?: TextDocumentStreamUpdate;
 								contentCharsReceived?: number;
 								extractedFields?: Record<string, string>;
 								metadata?: Record<string, unknown>;

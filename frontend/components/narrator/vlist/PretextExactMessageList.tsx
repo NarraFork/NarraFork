@@ -57,6 +57,17 @@ import {
 	useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { recoveringDocumentRangeReader } from "../content/document-range-recovery";
+import {
+	bindWriteDocumentReader,
+	documentSourceInput,
+	documentWriteInput,
+} from "../content/document-source";
+import {
+	isExactWriteDocumentPin,
+	useWriteDocumentSources,
+	type WriteDocumentSourceEnsurer,
+} from "../content/useWriteDocumentSources";
 import { HistoryRecoveryPanel } from "../HistoryRecoveryPanel";
 import { ManualOlderHistoryLoad } from "../history/ManualOlderHistoryLoad";
 import {
@@ -1868,12 +1879,84 @@ export const PretextExactMessageList = memo(
 				narratorId: string;
 				requests: readonly VListToolDetailRequest[];
 			}>({ narratorId, requests: [] });
+			const [visibleWriteSourceRequests, setVisibleWriteSourceRequests] = useState<{
+				narratorId: string;
+				requests: readonly VListToolDetailRequest[];
+			}>({ narratorId, requests: [] });
+			const rawTextDocumentRangeReader =
+				dataSource?.fetchTextDocumentRange ?? narratorsApi.readTextDocumentRange;
+			const ensureNarratorWriteSource = useCallback<WriteDocumentSourceEnsurer>(
+				(owner, toolUseId, pin, signal) => {
+					if (!isExactWriteDocumentPin(pin))
+						return Promise.reject(new Error("Exact Write document source identity is missing"));
+					return narratorsApi.ensureWriteDocumentSource(owner, toolUseId, pin, signal);
+				},
+				[],
+			);
+			const ensureWriteSource =
+				dataSource?.ensureWriteDocumentSource ??
+				(dataSource?.fetchToolDetail ? undefined : ensureNarratorWriteSource);
+			const textDocumentRangeReader = useMemo(
+				() => recoveringDocumentRangeReader(rawTextDocumentRangeReader, ensureWriteSource),
+				[rawTextDocumentRangeReader, ensureWriteSource],
+			);
+			const writeSourceRequests = useMemo(
+				() => [
+					...(visibleWriteSourceRequests.narratorId === narratorId
+						? visibleWriteSourceRequests.requests
+						: []),
+					...(truncatedToolCalls.narratorId === narratorId ? truncatedToolCalls.requests : []),
+				],
+				[narratorId, visibleWriteSourceRequests, truncatedToolCalls],
+			);
+			const writeSources = useWriteDocumentSources(
+				narratorId,
+				writeSourceRequests,
+				ensureWriteSource,
+				textDocumentRangeReader,
+			);
+			const fullDetailRequests = useMemo(
+				() =>
+					truncatedToolCalls.narratorId === narratorId
+						? truncatedToolCalls.requests.filter(
+								(request) =>
+									!ensureWriteSource ||
+									!isExactWriteDocumentPin(request) ||
+									!writeSources.isWrite(request.toolUseId, request),
+							)
+						: [],
+				[narratorId, truncatedToolCalls, ensureWriteSource, writeSources.isWrite],
+			);
 			const { resolveFullToolInput, resolveFullToolOutput, resolveToolDetailStatus } =
-				useVListToolDetails(
+				useVListToolDetails(narratorId, fullDetailRequests, dataSource?.fetchToolDetail);
+			const resolveDocumentToolInput = useCallback(
+				(
+					toolUseId: string | undefined,
+					ref?: import("./vlist-data-source").VListToolDetailRef,
+					writeInput?: unknown,
+				) => {
+					const full = resolveFullToolInput(toolUseId, ref);
+					if (writeInput === undefined || !toolUseId) return full;
+					writeSources.noteWrite(toolUseId, ref);
+					const source = writeSources.resolve(toolUseId, ref);
+					if (source) return documentSourceInput(writeInput, source);
+					const projected = bindWriteDocumentReader(
+						documentWriteInput(narratorId, toolUseId, full ?? writeInput, ref),
+						textDocumentRangeReader,
+					);
+					return writeSources.hasError(toolUseId, ref) && projected && typeof projected === "object"
+						? { ...projected, textDocumentError: true }
+						: projected;
+				},
+				[
 					narratorId,
-					truncatedToolCalls.narratorId === narratorId ? truncatedToolCalls.requests : [],
-					dataSource?.fetchToolDetail,
-				);
+					resolveFullToolInput,
+					writeSources.noteWrite,
+					writeSources.resolve,
+					writeSources.hasError,
+					textDocumentRangeReader,
+				],
+			);
 			// Header terminate control: interrupting the narrator is what actually stops a
 			// running shell / MCP tool (the chunked control does the same).
 			//
@@ -2050,7 +2133,7 @@ export const PretextExactMessageList = memo(
 				resolvePermissionFormHeight,
 				resolvePendingPlan,
 				resolvePendingPermissionSuggestions,
-				resolveFullToolInput,
+				resolveFullToolInput: resolveDocumentToolInput,
 				resolveFullToolOutput,
 				showTokenUsage,
 				compactUsageLines: layoutCompactUsageLines,
@@ -2649,9 +2732,13 @@ export const PretextExactMessageList = memo(
 			// SYNCHRONOUSLY: the channel below treats `requestFullPayload` as fire-and-
 			// forget, so handing it a thunk factory (as the removed per-row notice-line
 			// prop once consumed) marks nothing and the fetch never starts.
-			const requestRowFullPayload = useCallback((owner: VListViewOwner) => {
-				setInteraction((prev) => markVListFullPayloadRequested(prev, ownerRequestKey(owner)));
-			}, []);
+			const requestRowFullPayload = useCallback(
+				(owner: VListViewOwner) => {
+					writeSources.retryErrors();
+					setInteraction((prev) => markVListFullPayloadRequested(prev, ownerRequestKey(owner)));
+				},
+				[writeSources.retryErrors],
+			);
 
 			// Fullscreen content viewer: per-body wrap / source state plus the single open
 			// target. Deliberately NOT part of `VListInteractionState` — that object feeds
@@ -2902,6 +2989,43 @@ export const PretextExactMessageList = memo(
 			);
 			const visibleRef = useRef(visible);
 			visibleRef.current = visible;
+			// Descriptor-only hydration is bounded to mounted Write bodies. It does not
+			// change the explicit engagement gate of legacy full-payload downloads.
+			useEffect(() => {
+				if (!ensureWriteSource) return;
+				const requests: VListToolDetailRequest[] = [];
+				const consider = (card: MeasuredToolCall, data: unknown) => {
+					if (
+						card.toolName !== "Write" ||
+						!card.toolUseId ||
+						!card.detail?.sections.some(
+							(section) =>
+								section.measuredBody.model.kind === "capped" &&
+								!section.measuredBody.model.textDocument,
+						)
+					)
+						return;
+					requests.push(toolDetailRequestFromData(card.toolUseId, data));
+				};
+				for (let index = visible.start; index < visible.end; index++) {
+					const item = renderItems[index];
+					if (!item) continue;
+					if (item.spec.kind === "tool-call")
+						consider(item.measured as MeasuredToolCall, item.spec.data);
+					else if (TRACE_ROW_INTERACTION_KINDS.has(item.spec.kind))
+						for (const row of (item.measured as MeasuredCollapsibleTrace).rows)
+							if (row.cardMeasured && row.cardKind !== "subagent-card")
+								consider(
+									row.cardMeasured as MeasuredToolCall,
+									resolveTraceRowCardData(item, row.itemIndex),
+								);
+				}
+				setVisibleWriteSourceRequests((previous) =>
+					previous.narratorId === narratorId && sameToolDetailRequests(previous.requests, requests)
+						? previous
+						: { narratorId, requests },
+				);
+			}, [ensureWriteSource, narratorId, visible.start, visible.end, renderItems]);
 			const exactLayoutRef = useRef(exactLayout);
 			exactLayoutRef.current = exactLayout;
 
@@ -3954,6 +4078,7 @@ export const PretextExactMessageList = memo(
 				enabled: isActive,
 				isSubagent,
 				committedMessages: pretextDocument.messages,
+				fetchTextDocumentRange: textDocumentRangeReader,
 			});
 			const publishStreamingMessage = pretextDocument.setStreamingMessage;
 			useEffect(() => {

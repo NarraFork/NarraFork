@@ -22,6 +22,11 @@ import {
 	type VerifiedPublicShare,
 	verifyPublicShare,
 } from "../services/public-narrator-share-service";
+import {
+	parseHistoricalWriteDocumentReference,
+	parseTextDocumentRangeQuery,
+	toolInputStreamSource,
+} from "../services/tool-input-stream-source";
 
 /** Bounded at the stream, even when Content-Length is absent or dishonest. */
 export async function readPublicShareJson(request: Request): Promise<unknown> {
@@ -205,6 +210,34 @@ publicNarratorShareRoutes.get("/:shareId/pretext-document", async (c) => {
 	revalidatePublicShare(auth);
 	return c.json(result);
 });
+publicNarratorShareRoutes.get("/:shareId/tool-calls/:toolUseId/input-document", async (c) => {
+	const auth = c.get("publicShare");
+	const reference = parseHistoricalWriteDocumentReference(c.req.query());
+	const ref = await toolInputStreamSource.ensureWriteDocumentSource(
+		auth.narratorId,
+		c.req.param("toolUseId"),
+		reference,
+		c.req.raw.signal,
+	);
+	revalidatePublicShare(auth);
+	return c.json(ref);
+});
+
+publicNarratorShareRoutes.get("/:shareId/text-documents/:refId", async (c) => {
+	const auth = c.get("publicShare");
+	const { offset, limit } = parseTextDocumentRangeQuery(c.req.query());
+	const range = await toolInputStreamSource.getTextDocumentRange(
+		auth.narratorId,
+		c.req.param("refId"),
+		offset,
+		limit,
+		c.req.raw.signal,
+	);
+	// Revocation/expiry during asynchronous disk I/O must not return any source bytes.
+	revalidatePublicShare(auth);
+	return c.json(range);
+});
+
 publicNarratorShareRoutes.get("/:shareId/message-location/:messageId", async (c) => {
 	const auth = c.get("publicShare");
 	const location = await narratorService.getMessageLocation(

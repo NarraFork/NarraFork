@@ -90,6 +90,11 @@ scripts/lib/__tests__/*
 # Reproducible tool-body follow regression harness; reports remain under .narrafork/.
 !scripts/smoke-tool-content-follow.ts
 !scripts/smoke-tool-content-follow-fixture.tsx
+# Reproducible long Write streaming fixture; before/after reports remain ignored.
+!scripts/smoke-write-stream.ts
+!scripts/smoke-write-stream-fixture.tsx
+!scripts/smoke-write-stream-data.ts
+!scripts/smoke-write-stream-data.test.ts
 !scripts/smoke-vlist-text-preview.ts
 !scripts/smoke-vlist-text-preview-fixture.tsx
 # Monaco regression sources are required in fresh clones; generated reports stay ignored.
