@@ -220,6 +220,8 @@ for (const variant of ["chapter", "standalone"] as const) {
 			);
 			await flush();
 		});
+		expect(container.textContent).not.toContain("current-workspace");
+		expect(container.textContent).not.toContain("local:");
 		const dialog = document.querySelector<HTMLElement>("[data-worktree-dialog]");
 		if (!dialog) throw new Error("Missing worktree dialog portal");
 		await act(async () => {
