@@ -1019,6 +1019,10 @@ export const PretextExactMessageList = memo(
 						contextAskOutputChars: t("contextAskOutputChars", { count: "{count}" }),
 						contextAskQuestions: t("contextAskQuestions", { count: "{count}" }),
 						contextAskStatusSummary: t("contextAskStatusSummary"),
+						workspaceCreate: t("workspaceCreate"),
+						workspaceList: t("workspaceList"),
+						workspaceSwitch: t("workspaceSwitch"),
+						workspaceDevice: t("workspaceDevice"),
 					});
 				},
 				[t],

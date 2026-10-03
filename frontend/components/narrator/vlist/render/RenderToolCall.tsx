@@ -275,6 +275,7 @@ export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	skill: "grape",
 	browser: "teal",
 	knowledge: "grape",
+	workspace: "gray",
 	generic: "gray",
 };
 

@@ -54,3 +54,21 @@ export interface WorktreeListResult {
 		reason?: string;
 	};
 }
+
+/** Bounded display metadata survives leaf projection without parsing truncated JSON. */
+export function worktreeListPreview(result: WorktreeListResult) {
+	const maxEntries = 100;
+	let truncated = result.truncated || result.entries.length > maxEntries;
+	const clip = (value: string, limit: number) => {
+		if (value.length <= limit) return value;
+		truncated = true;
+		return `${value.slice(0, limit - 1)}…`;
+	};
+	const entries = result.entries.slice(0, maxEntries).map((entry) => ({
+		path: clip(entry.path, 1024),
+		branch: entry.branch === null ? null : clip(entry.branch, 256),
+		detached: entry.detached,
+	}));
+	// At most 100 rows × (1024 + 256) chars, below the aggregate projection budget.
+	return { entries, truncated };
+}

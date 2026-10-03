@@ -357,6 +357,18 @@ export function useVListLabels(): VListLabels {
 			// ── read-only AskUserQuestion replay ────────────────────────────────────
 			// These prefixes wrap together with the answer text, so they are MEASURED
 			// (adapter labels) rather than substituted by the render layer.
+			workspaceCreate: t("workspaceCreate"),
+			workspaceList: t("workspaceList"),
+			workspaceSwitch: t("workspaceSwitch"),
+			workspaceDevice: t("workspaceDevice"),
+			workspaceCreated: t("workspaceCreated"),
+			workspaceFailed: t("workspaceFailed"),
+			workspaceUnknown: t("workspaceUnknown"),
+			workspaceChanged: t("workspaceChanged"),
+			workspaceUnchanged: t("workspaceUnchanged"),
+			workspaceEmpty: t("workspaceEmpty"),
+			workspaceTruncated: t("workspaceTruncated"),
+			workspaceDetached: t("workspaceDetached"),
 			backgroundTaskStarted: t("backgroundTaskStarted"),
 			sendAwaitReply: t("sendAwaitReply"),
 			communicationBroadcast: t("communicationBroadcast"),
