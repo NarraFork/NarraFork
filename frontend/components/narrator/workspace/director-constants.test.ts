@@ -3,7 +3,10 @@ import {
 	computeDirectorFrames,
 	DEFAULT_DIRECTOR_PRIMARY_RATIO,
 	DIRECTOR_PADDING,
+	DIRECTOR_SECONDARY_MAX_PORTRAIT,
+	DIRECTOR_SECONDARY_TARGET_PORTRAIT_WIDTH,
 	type DirectorLeaf,
+	directorRailIndexAtX,
 	isDirectorRenderablePanel,
 	MAX_DIRECTOR_PRIMARY_RATIO,
 	MIN_DIRECTOR_PRIMARY_RATIO,
@@ -130,7 +133,7 @@ describe("computeDirectorFrames", () => {
 		expect(secondaryFrames[1].top).toBeGreaterThan(secondaryFrames[0].top);
 	});
 
-	test("portrait → rail on top, primary below; secondaries laid out in a grid", () => {
+	test("portrait → rail on top, primary below; secondaries in one row", () => {
 		const { railThickness, primaryFrame, secondaryFrames } = computeDirectorFrames({
 			width: 600,
 			height: 1000,
@@ -143,6 +146,72 @@ describe("computeDirectorFrames", () => {
 		expect(primaryFrame.top).toBe(300 + DIRECTOR_PADDING);
 		expect(primaryFrame.width).toBe(600 - DIRECTOR_PADDING * 2);
 		expect(secondaryFrames).toHaveLength(3);
+		// One row: every preview shares the rail's top edge and full rail height,
+		// strictly marching right — never wrapping into a grid.
+		for (const frame of secondaryFrames) {
+			expect(frame.top).toBe(DIRECTOR_PADDING);
+			expect(frame.height).toBe(300 - DIRECTOR_PADDING * 2);
+		}
+		expect(secondaryFrames[1].top).toBe(secondaryFrames[0].top);
+		expect(secondaryFrames[1].left).toBeGreaterThan(secondaryFrames[0].left);
+		expect(secondaryFrames[2].left).toBeGreaterThan(secondaryFrames[1].left);
+		// Everything fits: the row shares the rail width exactly (no scrolling).
+		const last = secondaryFrames[secondaryFrames.length - 1];
+		expect(Math.round(last.left + last.width + DIRECTOR_PADDING)).toBe(600);
+	});
+
+	test("portrait → an overflowing rail holds the target width instead of wrapping", () => {
+		const { secondaryFrames } = computeDirectorFrames({
+			width: 390,
+			height: 844,
+			isLandscape: false,
+			secondaryCount: 8,
+			primaryRatio: 0.7,
+		});
+		expect(secondaryFrames).toHaveLength(8);
+		// Sharing 390px across 8 previews would crush them to ~40px; the row holds
+		// the 140px target width and overflows instead (the surface scrolls it).
+		for (const frame of secondaryFrames) {
+			expect(frame.width).toBe(DIRECTOR_SECONDARY_TARGET_PORTRAIT_WIDTH);
+			expect(frame.top).toBe(DIRECTOR_PADDING);
+		}
+		const last = secondaryFrames[secondaryFrames.length - 1];
+		expect(last.left + last.width).toBeGreaterThan(390);
+	});
+
+	test("portrait → a lone secondary caps at the max width instead of filling the rail", () => {
+		const { secondaryFrames } = computeDirectorFrames({
+			width: 1000,
+			height: 700,
+			isLandscape: false,
+			secondaryCount: 1,
+			primaryRatio: 0.7,
+		});
+		expect(secondaryFrames).toHaveLength(1);
+		expect(secondaryFrames[0].width).toBe(DIRECTOR_SECONDARY_MAX_PORTRAIT);
+		expect(secondaryFrames[0].left).toBe(DIRECTOR_PADDING);
+	});
+});
+
+describe("directorRailIndexAtX", () => {
+	// Mirrors the single-row portrait frames: 140px items, 8px gaps, 8px padding.
+	const frames = [0, 1, 2].map((i) => ({
+		left: 8 + i * 148,
+		top: 8,
+		width: 140,
+		height: 200,
+	}));
+
+	test("hits a frame, misses the gaps, and stays inside the row", () => {
+		expect(directorRailIndexAtX(frames, 8)).toBe(0);
+		expect(directorRailIndexAtX(frames, 100)).toBe(0);
+		expect(directorRailIndexAtX(frames, 148)).toBe(0); // right edge inclusive
+		expect(directorRailIndexAtX(frames, 152)).toBe(-1); // the 8px gap activates nothing
+		expect(directorRailIndexAtX(frames, 160)).toBe(1);
+		expect(directorRailIndexAtX(frames, 400)).toBe(2);
+		expect(directorRailIndexAtX(frames, 7)).toBe(-1); // left padding
+		expect(directorRailIndexAtX(frames, 500)).toBe(-1); // past the row
+		expect(directorRailIndexAtX([], 10)).toBe(-1);
 	});
 });
 

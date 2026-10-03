@@ -42,6 +42,10 @@ export function NarratorPanelHeaderTitle({
 		handleTitleKeyDown,
 	} = useTitleEditing({ narratorId, narrator, t });
 	const displayTitle = narrator?.title || t("untitled");
+	// hostOwnsTitle: the host paints the title, nothing renders here. Preview:
+	// still renders the title, but skips the pretext pass (previews stay
+	// lightweight) — so no fixed box width, the text shrinks naturally with an
+	// ellipsis instead of being measured to the full title.
 	const ownsTitleChrome = hostOwnsTitle || isWorkspacePreview;
 	const boxWidth = ownsTitleChrome ? 0 : titleFullWidth;
 
@@ -54,9 +58,13 @@ export function NarratorPanelHeaderTitle({
 				alignItems: "center",
 				gap: 4,
 				flexWrap: "nowrap",
-				// Shrink-to-fit: total = fixed title box + action icons. Tools never
-				// flex this down — they are omitted by resolveHeaderLayoutAfterTitle.
-				flex: "0 0 auto",
+				// Non-preview: shrink-to-fit at the fixed pretext width — tools never
+				// flex this down (they are omitted by resolveHeaderLayoutAfterTitle).
+				// Preview: no fixed width to lean on; the slot itself must be the
+				// shrinkable one, or the Text's maxWidth/ellipsis chain has nothing
+				// to resolve against and long titles hard-clip mid-character.
+				flex: isWorkspacePreview ? "0 1 auto" : "0 0 auto",
+				minWidth: isWorkspacePreview ? 0 : undefined,
 			}}
 		>
 			{hostOwnsTitle ? null : editingTitle && !isWorkspacePreview ? (
@@ -75,14 +83,23 @@ export function NarratorPanelHeaderTitle({
 					fw={500}
 					onDoubleClick={isWorkspacePreview ? undefined : startEditingTitle}
 					style={{
-						// FIXED full-title width from pretext — not flex:auto.
-						flex: "0 0 auto",
-						width: boxWidth,
-						maxWidth: boxWidth,
 						overflow: "hidden",
 						textOverflow: "ellipsis",
 						whiteSpace: "nowrap",
 						cursor: isWorkspacePreview ? "default" : "pointer",
+						...(isWorkspacePreview
+							? {
+									// Unmeasured preview: natural shrink-to-fit width.
+									flex: "0 1 auto",
+									minWidth: 0,
+									maxWidth: "100%",
+								}
+							: {
+									// FIXED full-title width from pretext — not flex:auto.
+									flex: "0 0 auto",
+									width: boxWidth,
+									maxWidth: boxWidth,
+								}),
 					}}
 					title={displayTitle}
 				>
