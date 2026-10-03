@@ -341,7 +341,9 @@ describe("deliverInjection — schedule", () => {
 			source: "silent_progress",
 			schedule: "onNextTurn",
 		});
-		expect(result.turnText).toBe("you have made 20 tool calls");
+		expect(result.turnText).toBe(
+			'<sender kind="system" id="silent_progress" name="silent_progress" />\nyou have made 20 tool calls',
+		);
 		expect(result.messageId).not.toBeNull();
 		expect(wakes).toEqual([]);
 		expect(softStops).toEqual([]);

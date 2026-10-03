@@ -149,7 +149,7 @@ describe("tool-call limit stops the real runtime without locking later user turn
 			if (!nextOwner) throw new Error("Missing new user-turn owner");
 			execute.mockImplementation(async (options) => {
 				expect(options.config.signal.aborted).toBe(false);
-				expect(options.userText).toBe("new explicit user input");
+				expect(options.userText).toBe('<sender kind="system" />\nnew explicit user input');
 				return {
 					finalText: "finished",
 					hasError: false,

@@ -24,6 +24,8 @@ export interface SubagentRuntimeProfile {
 	initialModel?: string;
 	rebuildSystemPrompt?: (contextSummary?: string | null) => Promise<string>;
 	initialHistory: unknown[];
+	/** Host-prepared current packet paired with initialHistory; never raw caller text. */
+	initialCurrentText?: string;
 	initialTrailingToolResults?: unknown[];
 	initialPrePromptBashCommand?: string;
 	control?: RuntimeForegroundControl;

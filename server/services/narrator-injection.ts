@@ -63,6 +63,7 @@ import type { SideCarBody } from "@shared/sidecar-body";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages } from "../db/schema";
+import { projectMessageSenderText } from "../lib/agent/sender-projection";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
@@ -369,7 +370,7 @@ async function deliverInjectionUnlocked(
 
 	const result: DeliverInjectionResult = {
 		messageId: message.id,
-		turnText: schedule === "onNextTurn" ? content : null,
+		turnText: schedule === "onNextTurn" ? projectMessageSenderText(message, content) : null,
 		started: false,
 		interjected: false,
 	};
