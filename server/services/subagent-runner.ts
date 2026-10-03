@@ -432,13 +432,6 @@ async function isBackgroundTaskCancelled(taskId: string): Promise<boolean> {
 	return task?.status === "cancelled";
 }
 
-type ResumedBackgroundTaskNotice = {
-	subagentId: string;
-	parentNarratorId: string;
-	subagent: Awaited<ReturnType<typeof narratorService.getById>>;
-	locale: Locale;
-};
-
 /** How a resumed background continuation's ending is recorded and announced. */
 export interface ResumedBackgroundTaskNoticePlan {
 	/** Terminal status written to the task row. Always decided, whoever announces it. */
@@ -483,28 +476,20 @@ export interface ResumedBackgroundTaskAnnouncement {
  *   separately anyway: the two are independent inputs, and a run that preserved
  *   background while still publishing a conclusion would otherwise be announced by
  *   both producers with nothing to signal the collision.
- * - A user interrupt still delivers (the "restarted" notice has to be closed out, and
- *   a cancelled row is the honest outcome) but must not wake: spending a parent turn
+ * - A user interrupt still delivers the cancelled outcome but must not wake:
+ *   spending a parent turn
  *   on work the user just stopped is the opposite of what they asked for.
  *
- * ## Why the notice is a POINTER, and why it fires from the resume path
+ * ## Completion content and ordering
  *
- * The remaining case — every user-driven resume — does publish the result:
- * `deliverCompletedResume` rewrites the historical Agent `tool_result`, and NarraFork
- * rebuilds the whole history from rows on every request (`outputToText(tc.outputJson)`
- * in each provider's buildHistory), so the parent reads the new output on its next
- * turn. What it does NOT have is a next turn — it is idle, and nothing else wakes it.
+ * `deliverCompletedResume` updates the historical Agent tool result, but each
+ * completion must also carry this run's result in the parent's current turn and
+ * reader sidecar. A saved historical result is not a substitute for that notice.
  *
- * So `deliver` means "wake the parent to read the conclusion it already has", not
- * "hand it the result". Carrying the text as well would put the same output in one
- * request twice, once as the rewritten tool result and once as an injected row.
- *
- * ⚠️ That also fixes the ORDER: this runner's terminal chain completes BEFORE
- * `deliverCompletedResume` runs, so waking from here would hand the parent a request
- * built from the SUPERSEDED tool result — the exact confusion the notice exists to
- * prevent, and invisible because the row would look correct. The plan is therefore
- * returned to the resume path (`announceResumedBackgroundTask`), which fires it after
- * the conclusion is persisted.
+ * The runner's terminal chain completes BEFORE `deliverCompletedResume`, so the
+ * announcement is returned to the resume path. Publication is committed with the
+ * conclusion before scheduling a wake, preventing stale results and duplicate
+ * terminal deliveries.
  */
 export function planResumedBackgroundTaskNotice(input: {
 	preserveBackground?: boolean;
@@ -533,78 +518,12 @@ export function planResumedBackgroundTaskNotice(input: {
 }
 
 /**
- * Tell the parent that a task it already collected a result for is running again,
- * because somebody resumed it by hand.
- *
- * The parent's transcript holds a settled `<background_task_id>` tool result for this
- * task, and every later write lands AFTER the run ends: `finalizeResumedAgentTask`
- * rewrites the task row, `updateToolCallConclusion` rewrites the historical tool
- * result. Both are read on the parent's next turn (history is rebuilt from rows), but
- * neither exists WHILE the continuation is in flight — so without this row a parent
- * that takes a turn mid-continuation still reasons from the superseded result, and an
- * `Await` it issues looks like it is waiting on something already finished.
- *
- * `schedule: "none"` on purpose: "a run restarted" carries nothing to act on, so an
- * idle parent is left alone and a running one reads the row on its next pass. The
- * result itself arrives through the rewritten tool result, or through the completion
- * notice when this run does not rewrite one.
- */
-async function notifyParentOfResumedBackgroundTask(
-	notice: ResumedBackgroundTaskNotice,
-): Promise<void> {
-	const { subagentId, parentNarratorId, subagent, locale } = notice;
-	{
-		const alias = agentLabelFromNarrator(subagent, parentNarratorId);
-		const title = subagent.title?.trim() || alias;
-		const isZh = locale === "zh-CN";
-		const content = isZh
-			? `[系统] 后台代理"${title}"（ID: ${alias}）已被重新启动，正在再次运行。` +
-				`它先前的结果已经作废；请用 Await({ type: "agent", id: "${alias}" }) 获取新的结果。`
-			: `[System] Background agent "${title}" (ID: ${alias}) has been restarted and is running again. ` +
-				`Its earlier result is superseded; use Await({ type: "agent", id: "${alias}" }) for the new one.`;
-		if (resolveRuntimeQueueBackend() === "postgres") {
-			const pub = getRuntimePublicationService();
-			const run = await pub.getAgentRun(subagentId, parentNarratorId);
-			await pub.commit({
-				...run,
-				eventKind: "started",
-				resultRef: `narrator:${subagentId}:${run.logicalRunId}`,
-				summary: content,
-			});
-			pub.schedule();
-		} else {
-			const run = runtimePublication.getAgentRun(subagentId, parentNarratorId);
-			runAtomicWrite(db, "subagent-runner.notifyResumedBackgroundTask", (tx) =>
-				runtimePublication.commit(
-					{
-						...run,
-						eventKind: "started",
-						resultRef: `narrator:${subagentId}:${run.logicalRunId}`,
-						summary: content,
-					},
-					tx,
-				),
-			);
-			runtimePublication.schedule();
-		}
-	}
-}
-
-/**
  * Tell the parent that a manually resumed background task has ENDED, and wake it to
  * read the conclusion.
  *
- * ⚠️ Call this only AFTER the run's conclusion is persisted. It carries no result on
- * purpose — `deliverCompletedResume` has already rewritten the historical Agent
- * `tool_result`, which the parent re-reads on its next turn because history is rebuilt
- * from rows. What was missing is that next turn: an idle parent had nothing to wake it,
- * so a task the user resumed by hand ended silently as far as the agent was concerned.
- * Waking before the rewrite lands would build that turn from the superseded result.
- *
- * Hence a pointer: this row says the run ended and how, and the model reads the output
- * from the tool result it already holds. Repeating the text would put the same output
- * in one request twice, and the previous `<background_task_id>` result would then have
- * two contradictory-looking successors.
+ * Call this only AFTER the conclusion and its immutable result publication are
+ * persisted. The completion notice carries this run's result for both the parent
+ * model and the reader; scheduling before persistence could expose stale output.
  *
  * `schedule: "wakeIfIdle"` is what makes it a wake rather than a broadcast: a running
  * parent picks the row up on its next pass, and the gating (continuation lock, idle in
@@ -669,7 +588,7 @@ async function commitPgResumedBackgroundTaskAnnouncement(
 		run,
 		eventKind,
 		text: finalText,
-		summary: `[System] Agent "${title}" (ID: ${alias}) ${notice.status}. Its restarted run has ended; use Await({ type: "agent", id: "${alias}" }) for the stored result.`,
+		summary: `[System] Agent "${title}" (ID: ${alias}) ${notice.status}. Its restarted run has ended.`,
 	});
 }
 
@@ -702,8 +621,8 @@ function commitSqliteResumedBackgroundTaskAnnouncement(
 		{
 			...run,
 			eventKind: publicationEvent(notice.status),
-			resultRef: `conclusion:${runtimePublication.persistResult(run, finalText, tx)}`,
-			summary: `[System] Agent "${title}" (ID: ${alias}) ${notice.status}. Its restarted run has ended; use Await({ type: "agent", id: "${alias}" }) for the stored result.`,
+			resultRef: runtimePublication.persistResult(run, finalText, tx),
+			summary: `[System] Agent "${title}" (ID: ${alias}) ${notice.status}. Its restarted run has ended.`,
 		},
 		tx,
 	);
@@ -2548,7 +2467,6 @@ async function startContinuedSubagentUnlocked(
 			narratorId: subagentId,
 			parentNarratorId,
 			resumeRunId: input.resumeLogicalRunId,
-			started: !!priorTaskVersion,
 		});
 		// 2. Mark subagent as working (in-place, no fork)
 		if (original.isBackground && !input.preserveBackground) {
@@ -2649,16 +2567,8 @@ async function startContinuedSubagentUnlocked(
 			// continuation — a taken-over task keeps reading "cancelled" while the user
 			// is watching it run.
 			backgroundTaskService.notifyDerivedStatusChanged(parentNarratorId, subagentId);
-			// The parent agent is a separate audience from the panel: it holds a finished
-			// `<background_task_id>` tool result and has no way to learn that the task is
-			// running again. Told without waking it — "someone took this over" is not
-			// actionable, so spending a turn on it would be noise.
-			await notifyParentOfResumedBackgroundTask({
-				subagentId,
-				parentNarratorId,
-				subagent: original,
-				locale: locale as Locale,
-			});
+			// Only publish the eventual result; task-panel status updates do not create
+			// a parent mailbox notice or consume model context when execution starts.
 		}
 		if (backgroundAbortController) {
 			getBackgroundAbortControllers().set(subagentId, backgroundAbortController);

@@ -1472,11 +1472,12 @@ function classifyBash(
 			undefined,
 			backgroundTaskId
 				? metaRows([
-						badgeRow(
-							chips([chip(backgroundTaskId, "blue")]),
-							labels?.backgroundTaskStarted ??
+						{
+							text:
+								labels?.backgroundTaskStarted ??
 								"Started in the background; see Background tasks for progress.",
-						),
+							dimmed: true,
+						},
 					])
 				: null,
 		),

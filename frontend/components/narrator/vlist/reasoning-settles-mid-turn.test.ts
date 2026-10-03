@@ -20,8 +20,13 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import type { TreeMessage } from "@frontend/lib/api/types";
+import type { NarratorMsg } from "../narrator-panel-types";
+import type { MeasuredReasoning } from "./measure/measure-reasoning";
 import { installCanvasStub } from "./measure/test-canvas-stub";
+import { buildPretextDocumentLayout } from "./pretext-document-layout";
 import { type AdapterSegment, adaptSegment } from "./segment-adapter";
+import { projectPendingEmptyReasoning } from "./streaming-handoff";
 
 beforeAll(() => {
 	installCanvasStub();
@@ -165,4 +170,51 @@ describe("the folded L1/L2 trace drops the live tail when a run settles", () => 
 		const tails = await foldedRowTail(-1, 0);
 		expect(tails.every((tail) => tail == null)).toBe(true);
 	});
+});
+
+describe("the latest sealed empty reasoning stays live at every LOD", () => {
+	for (const lod of [1, 2, 3, 4, 5] as const) {
+		it(`shows exactly one waiting shimmer at L${lod} and stops when inactive`, () => {
+			const messages = ["empty-r1", "empty-r2"].map(
+				(id, seq) =>
+					({
+						id,
+						seq,
+						role: "assistant",
+						parentToolUseId: null,
+						contentJson: [{ type: "reasoning", id: `${id}-block`, text: "", revision: 1 }],
+						toolCalls: [],
+						children: [],
+					}) as unknown as TreeMessage,
+			);
+			const layout = (active: boolean) =>
+				buildPretextDocumentLayout(
+					projectPendingEmptyReasoning(messages, active) as unknown as NarratorMsg[],
+					{
+						lod,
+						contentWidth: 800,
+						widthBucket: "800",
+						layoutRevision: `empty-${lod}-${active}`,
+						documentRevision: `empty-${lod}`,
+					},
+				);
+			const shimmerCount = (active: boolean) =>
+				layout(active).items.reduce((count, item) => {
+					if (item.spec.kind === "reasoning") {
+						return count + Number((item.measured as MeasuredReasoning).form === "streaming");
+					}
+					if (item.spec.kind === "activity-trace") {
+						return (
+							count +
+							(item.spec.data as { items: { shimmer?: boolean }[] }).items.filter(
+								(row) => row.shimmer,
+							).length
+						);
+					}
+					return count;
+				}, 0);
+			expect(shimmerCount(true)).toBe(1);
+			expect(shimmerCount(false)).toBe(0);
+		});
+	}
 });

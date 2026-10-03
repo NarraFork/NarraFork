@@ -132,7 +132,7 @@ for (const official of [false, true]) {
 				currentInput: "current accepted human request",
 			});
 			expect(textOf(prepared.history)).toContain(`${previousMarker}\nhistorical human request`);
-			expect(textOf(prepared.history)).toContain(`${primary}\nhistorical agent response`);
+			expect(textOf(prepared.history)).toContain("historical agent response");
 			expect(textOf(prepared.history)).not.toContain(currentMarker);
 			expect(prepared.currentText).toBe(`${currentMarker}\ncurrent accepted human request`);
 			expect(prepared.sourceMessages.map((row) => row.id)).toEqual([
@@ -156,7 +156,7 @@ for (const official of [false, true]) {
 				"primary",
 			);
 			expect(textOf(direct.history)).toContain(`${previousMarker}\nhistorical human request`);
-			expect(textOf(direct.history)).toContain(`${primary}\nhistorical agent response`);
+			expect(textOf(direct.history)).toContain("historical agent response");
 			expectNoAccountSecrets(direct);
 			expect(storageSnapshot()).toBe(before);
 		});
@@ -287,7 +287,8 @@ test("fork references retain the source narrator as assistant author", async () 
 	expect(prepared.sourceMessages.find((row) => row.id === assistant.id)?.narratorId).toBe(
 		"primary",
 	);
-	expect(textOf(prepared.history)).toContain(`${primary}\nshared primary response`);
+	expect(textOf(prepared.history)).toContain("shared primary response");
+	expect(textOf(prepared.history)).not.toContain(primary);
 	expect(textOf(prepared.history)).not.toContain('id="fork"');
 	expect(prepared.currentText).toBe(`${bob}\nshared current Bob request`);
 	expect(storageSnapshot()).toBe(before);
@@ -390,7 +391,8 @@ test("compact input retains human and agent authorship without changing stored r
 		expect(result.summary).toBe("Attributed compact summary");
 		expect(entriesText).toContain(`${alice}\nAlice requested this`);
 		expect(entriesText).toContain(`${bob}\nBob requested something else`);
-		expect(entriesText).toContain(`${primary}\nPrimary answered`);
+		expect(entriesText).toContain("Primary answered");
+		expect(entriesText).not.toContain(primary);
 		expect(summaryInstructions).toContain("Preserve known sender ids");
 		expect(storageSnapshot()).toBe(before);
 	} finally {

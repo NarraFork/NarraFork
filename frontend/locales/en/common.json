@@ -23,6 +23,8 @@
 		"repairFailed": "Repair did not complete successfully. Check again or handle the directory manually."
 	},
 	"dockTabs": {
+		"revealInExplorer": "Show in File Manager",
+		"revealFailed": "Could not open the file manager",
 		"all": "Close all (keep main narrators)",
 		"left": "Close tabs to the left",
 		"right": "Close tabs to the right",

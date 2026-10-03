@@ -23,6 +23,8 @@
 		"repairFailed": "修复未成功完成，请重新检查或人工处理目录。"
 	},
 	"dockTabs": {
+		"revealInExplorer": "在资源管理器中查看",
+		"revealFailed": "无法打开资源管理器",
 		"all": "关闭全部（保留主叙述者）",
 		"left": "关闭左侧",
 		"right": "关闭右侧",

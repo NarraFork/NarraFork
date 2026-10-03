@@ -117,7 +117,8 @@ export function projectSenderText(text: string, value: MessageSender): string {
 
 /** Share attribution with live/custom input while retaining every original byte. */
 export function projectMessageSenderText(message: SenderMessage, text: string): string {
-	if (!text || message.role === "disp" || message.role === "system") return text;
+	if (!text || message.role === "assistant" || message.role === "disp" || message.role === "system")
+		return text;
 	const items = inboundItems(message);
 	if (items.length <= 1) return projectSenderText(text, resolveMessageSender(message));
 	// Match only exact structured item payloads, never parse a sender-like string.
@@ -160,6 +161,7 @@ type ProjectedMessage = SenderMessage & { [projected]?: true };
 export function projectMessageSenderForModel<T extends SenderMessage>(message: T): T {
 	if (
 		(message as ProjectedMessage)[projected] ||
+		message.role === "assistant" ||
 		message.role === "disp" ||
 		message.role === "system"
 	)

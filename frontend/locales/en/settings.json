@@ -1,5 +1,7 @@
 {
 	"title": "Settings",
+	"treatAsLocalAccess": "Treat access as local and show file manager menus",
+	"treatAsLocalAccessDesc": "Show file manager menus even when accessing through a domain or LAN address. The file manager opens on the NarraFork server, not on the browser's device. Enable only when both are on the same machine. This preference applies to all browsers signed in as this user; remote executor files remain excluded.",
 	"workspaceMaintenanceExplanation": "This legacy owner has no verifiable process identity. Maintenance reserves the entire workspace for five minutes without renewal. You must stop old instances and any external writer first. Your attestation is not proof that execution ended; current-file observations cannot reconstruct historical success.",
 	"workspaceMaintenanceWritersStopped": "I have stopped all old instances and potentially surviving external write processes.",
 	"workspaceMaintenanceReason": "Maintenance reason and checks performed",

@@ -187,13 +187,12 @@ describe("formatBackgroundCompletionNotifications", () => {
 		}
 	});
 
-	it("notice-only completions describe saved results without repeating them", () => {
-		const task = notification({ noticeText: "run ended", result: "private result" });
+	it("resumed completions show their result in both model text and reader preview", () => {
+		const task = notification({ result: "本轮复核结果" });
 		const text = formatBackgroundCompletionNotifications([task]);
-		expect(text).toContain("result was saved");
-		expect(text).toContain("Await(");
-		expect(text).not.toContain("private result");
-		expect(backgroundAgentNoticePreview(task, "zh-CN")).toContain("结果已保存");
+		expect(text).toContain("本轮复核结果");
+		expect(text).not.toContain("Await(");
+		expect(backgroundAgentNoticePreview(task, "zh-CN")).toBe("本轮复核结果");
 	});
 
 	it("empty results are not missing and reader previews stay bounded", () => {

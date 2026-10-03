@@ -61,6 +61,7 @@ async function withStream(
 		raf: () => Promise<void>;
 		text: () => string;
 		animationCount: () => number;
+		thinkingShimmerCount: () => number;
 		animationText: () => string;
 		showOnlyKeys: (keys: readonly string[] | null) => Promise<void>;
 		coordinator: PretextLayoutCoordinator;
@@ -70,9 +71,14 @@ async function withStream(
 	{
 		animateStreaming = false,
 		textExpanded = false,
-	}: { animateStreaming?: boolean; textExpanded?: boolean } = {},
+		keepEmptyReasoningLive = false,
+	}: {
+		animateStreaming?: boolean;
+		textExpanded?: boolean;
+		keepEmptyReasoningLive?: boolean;
+	} = {},
 ) {
-	const build = { ...BUILD, isTextExpanded: () => textExpanded };
+	const build = { ...BUILD, keepEmptyReasoningLive, isTextExpanded: () => textExpanded };
 	let mountEpoch = ++nextMountEpoch;
 	// Keep active tokens alive while measuring/rendering the large snapshot fixture.
 	const clock = animateStreaming ? spyOn(Date, "now").mockReturnValue(Date.now()) : null;
@@ -216,6 +222,7 @@ async function withStream(
 			coordinator,
 			text: () => container.textContent ?? "",
 			animationCount: () => container.querySelectorAll("span.vlist-anim-token").length,
+			thinkingShimmerCount: () => container.querySelectorAll(".nf-trace-shimmer--stream").length,
 			animationText: () =>
 				Array.from(container.querySelectorAll("span.vlist-anim-token"))
 					.map((span) => span.textContent ?? "")
@@ -894,5 +901,62 @@ describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
 			await h.raf();
 			expect(h.live()).toBeNull();
 		});
+	});
+});
+
+describe("hidden reasoning waiting shimmer through WS / coordinator / DOM", () => {
+	it("keeps a sealed empty block thinking until answer text actually starts", async () => {
+		await withStream(
+			async (h) => {
+				const empty = content("reasoning", "hidden-r", "");
+				await h.commit([empty], true);
+				await h.raf();
+				expect(h.live()).toBeNull();
+				expect(h.text()).toContain("thinking");
+				expect(h.thinkingShimmerCount()).toBe(1);
+				await h.raf();
+				expect(h.thinkingShimmerCount()).toBe(1);
+				await h.delta(content("text", "answer", "Answer started"));
+				await h.raf();
+				expect(h.text()).toContain("Answer started");
+				expect(h.thinkingShimmerCount()).toBe(0);
+			},
+			{ keepEmptyReasoningLive: true },
+		);
+	});
+
+	it("stops the waiting shimmer as soon as tool arguments start", async () => {
+		await withStream(
+			async (h) => {
+				await h.commit([content("reasoning", "hidden-r", "")], true);
+				await h.raf();
+				expect(h.text()).toContain("thinking");
+				await h.frame({
+					type: "tool_use_chunk",
+					toolUseId: "new-tool",
+					toolName: "Read",
+					inputCharsTotal: 1,
+				});
+				await h.raf();
+				expect(h.text()).not.toContain("thinking");
+			},
+			{ keepEmptyReasoningLive: true },
+		);
+	});
+
+	it("stops the waiting shimmer on the active-to-idle rebuild without a new message", async () => {
+		await withStream(
+			async (h) => {
+				await h.commit([content("reasoning", "hidden-r", "")], true);
+				await h.raf();
+				expect(h.thinkingShimmerCount()).toBe(1);
+				await act(async () => {
+					h.coordinator.rebuild({ ...BUILD, keepEmptyReasoningLive: false });
+				});
+				expect(h.thinkingShimmerCount()).toBe(0);
+				expect(h.text()).not.toContain("thinking");
+			},
+			{ keepEmptyReasoningLive: true },
+		);
 	});
 });

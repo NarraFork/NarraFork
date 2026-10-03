@@ -55,6 +55,7 @@ import {
 } from "../db/schema";
 import { summaryGenerate } from "../lib/agent";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
+import { generateWithFirstTokenTimeout } from "../lib/agent/generate-first-token-timeout";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
@@ -1597,25 +1598,30 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 	// Resolve the model (default follows summaryModel via __summary__)
 	const model = resolveEffectiveModel(settings.agent.promptOptimizeModel);
 
-	// Call LLM with 30s timeout
-	const signal = AbortSignal.timeout(30000);
-	let result: string;
-	try {
-		const generated = await summaryGenerate(
-			taggedContent,
-			systemInstruction,
-			{ narratorId, kind: "optimize" },
-			signal,
-			undefined,
-			model, // modelOverride parameter
-		);
-		result = generated.text;
-	} catch (err) {
-		if ((err as Error).name === "AbortError" || (err as Error).name === "TimeoutError") {
-			throw new ValidationError("Optimization timed out after 30 seconds");
+	// Follow the configured first-token budget; output clears the timer. Request
+	// cancellation remains connected to the provider throughout generation.
+	const generated = await generateWithFirstTokenTimeout(
+		(options) =>
+			summaryGenerate(
+				taggedContent,
+				systemInstruction,
+				{ narratorId, kind: "optimize" },
+				options.signal,
+				options.onTextDelta,
+				model,
+				undefined,
+				false,
+				options.onReasoningDelta,
+			),
+		settings.agent.firstTokenTimeoutMs,
+		c.req.raw.signal,
+	).catch((err: unknown) => {
+		if (err instanceof Error && err.name === "TimeoutError") {
+			throw new ValidationError(err.message);
 		}
 		throw err;
-	}
+	});
+	let result = generated.text;
 
 	// Post-process: trim, remove wrapping quotes/code fences
 	result = result.trim();

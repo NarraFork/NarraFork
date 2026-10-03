@@ -23,9 +23,10 @@
  */
 
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
+import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "@frontend/lib/use-match-media";
 import { ActionIcon, CopyButton, Tooltip } from "@mantine/core";
 import { IconCheck, IconCopy } from "@tabler/icons-react";
-import { type CSSProperties, useEffect, useState } from "react";
+import type { CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
 import { useRenderInteractive } from "../lod/RenderLodCtx";
 import { MESSAGE_SELECTION_IGNORE_ATTR } from "../message/MessageSelectionCtx";
@@ -34,47 +35,6 @@ import { type CodeCopyPlacement, VIEW_ACTION_BAR_GAP } from "./vlist-content-vie
 const ICON_SIZE = 12;
 /** Larger glyph for the touch variant, matching its larger button. */
 const TOUCH_ICON_SIZE = 14;
-
-/**
- * A pointer that cannot hover. The whole reveal-on-hover contract below is
- * unreachable on such a device, so the overlay stays painted instead.
- *
- * Same query NarratorPanel uses for its own touch branch; `hover: none` alone
- * would miss a coarse pointer that still reports hover support, and
- * `pointer: coarse` alone would miss a hoverless fine pointer (a TV remote).
- */
-const TOUCH_POINTER_MEDIA_QUERY = "(hover: none), (pointer: coarse)";
-
-/**
- * Read one media query, synchronously on the first render.
- *
- * Deliberately NOT Mantine's `useMediaQuery`: several vlist suites replace the
- * whole `@mantine/hooks` module with a stub that hardcodes `useMediaQuery: () =>
- * false`, and `mock.module` leaks across files under `bun test`. Depending on it
- * here would make this component's touch branch untestable — and, worse, silently
- * dead in whichever suites happen to run after such a mock. The subscription is
- * six lines, so owning it costs less than the coupling.
- *
- * The first value is read during render (not in an effect) because a phone reader
- * would otherwise watch the button appear one frame late.
- */
-function useMatchMedia(query: string): boolean {
-	const [matches, setMatches] = useState(() => {
-		if (typeof window === "undefined") return false;
-		return window.matchMedia?.(query).matches === true;
-	});
-	useEffect(() => {
-		const list = window.matchMedia?.(query);
-		if (!list) return;
-		setMatches(list.matches);
-		const onChange = (event: MediaQueryListEvent) => setMatches(event.matches);
-		// `addListener` is the Safari < 14 spelling; both are optional on the stubs
-		// the test suites install, hence the guards.
-		list.addEventListener?.("change", onChange);
-		return () => list.removeEventListener?.("change", onChange);
-	}, [query]);
-	return matches;
-}
 
 /**
  * Whether this panel must paint a permanently visible, finger-sized copy button,
@@ -92,12 +52,12 @@ function useTouchCopyMode(): { alwaysVisible: boolean; barCanCover: boolean } {
 	return {
 		// Reveal-on-hover is unreachable → paint it and leave it painted.
 		alwaysVisible: touchPointer,
-		// `VListContentViewHost` mounts its bar only on a non-mobile viewport, so on a
-		// mobile one the panel's top corner is free — and the `hidden` outcome would
-		// delete the only copy affordance a phone reader has. A desktop-width touch
-		// screen keeps the dodges: there the bar really can appear (browsers emulate
-		// `mouseenter` on tap) and would cover the button.
-		barCanCover: !mobileViewport,
+		// `VListContentViewHost` mounts its bar only for a hoverable pointer on a
+		// non-mobile viewport: it ignores the `mouseenter` a browser synthesizes on
+		// tap, so a touch pointer can NEVER summon the bar, however wide the screen.
+		// Where no bar can appear, the panel's top corner is free — and the `hidden`
+		// outcome would delete the only copy affordance a touch reader has.
+		barCanCover: !mobileViewport && !touchPointer,
 	};
 }
 

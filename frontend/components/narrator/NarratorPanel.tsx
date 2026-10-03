@@ -295,6 +295,7 @@ function NarratorPanelBody({
 	// provider these all fall back to the legacy prop callbacks.
 	const dock = useNarratorDockContext();
 	const pluginSurface = usePluginUiSurface();
+	const workspaceId = pluginSurface?.hostContext.workspaceId;
 	// Effective sidebar callbacks: prefer explicit props, else route through dock.
 	const effOnFileModPropsChange = onFileModPropsChange ?? dock?.setFileModProps;
 	const effOnDetailsPropsChange = onDetailsPropsChange ?? dock?.setDetailsProps;
@@ -2985,7 +2986,7 @@ function NarratorPanelBody({
 										) : (
 											<NarratorPanelCompactContext.Consumer>
 												{(compact) =>
-													compact ? (
+													compact || workspaceId ? (
 														<ActionIcon
 															size="sm"
 															variant="subtle"
@@ -2994,7 +2995,9 @@ function NarratorPanelBody({
 																navigate({
 																	to: "/narrators/$narratorId",
 																	params: { narratorId },
-																	search: { from: "graph" },
+																	search: workspaceId
+																		? { from: "workspace", workspaceId }
+																		: { from: "graph" },
 																})
 															}
 														>

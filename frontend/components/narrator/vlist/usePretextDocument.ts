@@ -43,6 +43,8 @@ export interface PretextDocumentView {
 
 export interface UsePretextDocumentOptions {
 	enabled?: boolean;
+	/** Keep the trailing empty reasoning live while the narrator is active. */
+	keepEmptyReasoningLive?: boolean;
 	/**
 	 * A subagent page treats its own (parent-pointing) messages as top-level, which
 	 * decides whether an arriving child message may be appended locally.
@@ -364,6 +366,8 @@ export function usePretextDocument(
 	const buildOptions = useMemo<PretextLayoutBuildOptions>(
 		() => ({
 			lod: options.lod,
+			keepEmptyReasoningLive: options.keepEmptyReasoningLive,
+			isSubagent: options.isSubagent,
 			widthBucket: options.widthBucket,
 			contentWidth: options.contentWidth,
 			viewportHeight: options.viewportHeight,
@@ -407,6 +411,8 @@ export function usePretextDocument(
 			formatUsageNumber: options.formatUsageNumber,
 		}),
 		[
+			options.keepEmptyReasoningLive,
+			options.isSubagent,
 			options.bottomPadding,
 			// The preference changes the item list. The breakpoint here is already
 			// settled; its live value belongs to the bounded preview, not this build.

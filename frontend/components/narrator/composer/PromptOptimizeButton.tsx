@@ -1,8 +1,8 @@
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import { ActionIcon, Menu, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { IconSparkles } from "@tabler/icons-react";
-import { useRef, useState } from "react";
+import { IconSparkles, IconX } from "@tabler/icons-react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 export interface PromptOptimizeButtonProps {
@@ -32,16 +32,25 @@ export function PromptOptimizeButton({
 	const { t } = useTranslation("narrator");
 	const [loading, setLoading] = useState(false);
 	const abortControllerRef = useRef<AbortController | null>(null);
-	const originalTextRef = useRef<string>("");
+	const cancelOptimize = () => {
+		abortControllerRef.current?.abort();
+		abortControllerRef.current = null;
+		setLoading(false);
+	};
+	// biome-ignore lint/correctness/useExhaustiveDependencies: Changing the narrator invalidates its pending optimization.
+	useEffect(() => {
+		setLoading(false);
+		return () => {
+			abortControllerRef.current?.abort();
+			abortControllerRef.current = null;
+		};
+	}, [narratorId]);
 
 	const handleOptimize = async (style: OptimizeStyle) => {
 		const text = getText();
 		if (!text.trim()) {
 			return; // Silently ignore empty input
 		}
-
-		// Save original for undo
-		originalTextRef.current = text;
 
 		// Remember style choice
 		try {
@@ -63,6 +72,7 @@ export function PromptOptimizeButton({
 			const result = await narratorsApi.optimizePrompt(narratorId, text, style, {
 				signal: controller.signal,
 			});
+			if (controller.signal.aborted || abortControllerRef.current !== controller) return;
 			applyOptimized(result.text);
 
 			// Show success notification with undo
@@ -73,7 +83,11 @@ export function PromptOptimizeButton({
 				withCloseButton: true,
 			});
 		} catch (err) {
-			if ((err as Error).name === "AbortError") {
+			if (
+				controller.signal.aborted ||
+				abortControllerRef.current !== controller ||
+				(err as Error).name === "AbortError"
+			) {
 				return; // User cancelled, don't show error
 			}
 			notifications.show({
@@ -82,10 +96,29 @@ export function PromptOptimizeButton({
 				color: "red",
 			});
 		} finally {
-			setLoading(false);
-			abortControllerRef.current = null;
+			if (abortControllerRef.current === controller) {
+				setLoading(false);
+				abortControllerRef.current = null;
+			}
 		}
 	};
+
+	if (loading) {
+		return (
+			<Tooltip label={t("optimizeCancel")} position="top" withArrow>
+				<ActionIcon
+					size={size}
+					variant="subtle"
+					color="red"
+					aria-label={t("optimizeCancel")}
+					onClick={cancelOptimize}
+					mb={4}
+				>
+					<IconX size={16} />
+				</ActionIcon>
+			</Tooltip>
+		);
+	}
 
 	return (
 		<Menu position="top" withArrow withinPortal>

@@ -2,8 +2,8 @@
  * GitCommitGraph — Stage 3 UI harness.
  *
  * Guards the collapsible graph strip under Git changes: default expansion,
- * collapse persistence, HEAD branch badge, and topology degradation when
- * `parents` is missing (old remotes).
+ * collapse persistence, and topology degradation when `parents` is missing
+ * (old remotes).
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
@@ -362,24 +362,6 @@ describe("GitCommitGraph", () => {
 		expect(textOf(container)).toContain("Graph");
 		expect(textOf(container)).not.toContain("feat: stage commit graph");
 		expect(headerByLabel(container, "Expand graph")).toBeTruthy();
-
-		queryClient.clear();
-	});
-
-	test("3. HEAD row shows the branch badge", async () => {
-		const chapterId = "chapter-graph-badge";
-		stubGitApi();
-		const qc = new QueryClient({
-			defaultOptions: {
-				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
-				mutations: { retry: false },
-			},
-		});
-		qc.setQueryData(["gitStatus", chapterId], makeStatus());
-		const { container, queryClient } = renderGraph(chapterId, qc);
-		await waitFor(() => textOf(container).includes("feature/graph"));
-
-		expect(textOf(container)).toContain("feature/graph");
 
 		queryClient.clear();
 	});

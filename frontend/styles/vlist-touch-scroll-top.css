@@ -1,0 +1,23 @@
+/*
+ * vlist-touch-scroll-top.css — the mount fade of the touch scroll-to-top button.
+ *
+ * The button (`VListTouchScrollTopButton`) fades IN via this keyframe, applied as
+ * a constant `animation` that runs exactly once on mount (the property value
+ * never changes afterwards, so it can never restart); fade-OUT and linger
+ * re-entries are plain `opacity` transitions on the same element. Driving the
+ * entrance from the compositor instead of a rAF-flipped React state costs no
+ * commit per button mount.
+ *
+ * ── WHY THIS IS A GLOBAL STYLESHEET ──────────────────────────────────────────
+ * Inline styles cannot declare @keyframes, and the vlist keeps its modules free
+ * of runtime <style> injection (same precedent as card-shimmer.css).
+ */
+
+@keyframes nf-vlist-touch-scroll-top-in {
+	from {
+		opacity: 0;
+	}
+	to {
+		opacity: 1;
+	}
+}

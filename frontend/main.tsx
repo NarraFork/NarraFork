@@ -31,6 +31,9 @@ import "@frontend/styles/toast.css";
 // each stylesheet's header.
 import "@frontend/styles/card-shimmer.css";
 import "@frontend/styles/trace-shimmer.css";
+// The touch scroll-to-top button's mount fade — a keyframe inline styles cannot
+// declare; see the stylesheet's header.
+import "@frontend/styles/vlist-touch-scroll-top.css";
 
 /*
  * Deep import rather than the `components/plugins` barrel, for the same reason as the

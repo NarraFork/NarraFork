@@ -1836,6 +1836,7 @@
 		"reflection": "反思 · 已转人工"
 	},
 	"optimizePrompt": "优化提示词",
+	"optimizeCancel": "取消优化",
 	"optimizeStyleLabel": "选择优化风格",
 	"optimizeStyleClarify": "更详细",
 	"optimizeStyleConcise": "更简洁",

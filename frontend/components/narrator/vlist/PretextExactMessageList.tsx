@@ -2087,6 +2087,7 @@ export const PretextExactMessageList = memo(
 			);
 			const pretextDocument = usePretextDocument(narratorId, {
 				lod,
+				keepEmptyReasoningLive: isActive,
 				labels: vlistLabels,
 				labelsRevision,
 				widthBucket: String(Math.round(contentWidth)),

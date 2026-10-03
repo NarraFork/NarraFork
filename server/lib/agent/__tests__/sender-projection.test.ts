@@ -194,6 +194,20 @@ describe("sender markers", () => {
 });
 
 describe("model projection", () => {
+	test("assistant messages retain their original text and blocks without sender markers", () => {
+		const input = message({
+			role: "assistant",
+			contentText: "my response",
+			contentJson: [
+				{ type: "text", text: "my response" },
+				{ type: "thinking", thinking: "reasoning" },
+				{ type: "tool_use", id: "t", name: "Read", input: {} },
+			],
+		});
+		expect(projectMessageSenderText(input, "my response")).toBe("my response");
+		expect(projectMessageSenderForModel(input)).toBe(input);
+	});
+
 	test("immutable update keeps multimodal metadata and text precedence", () => {
 		const image = { type: "image", imageId: "picture", source: { type: "base64", data: "bytes" } };
 		const thinking = { type: "thinking", thinking: "secret" };

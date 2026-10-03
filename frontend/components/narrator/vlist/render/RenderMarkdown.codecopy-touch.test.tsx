@@ -272,14 +272,17 @@ describe("fenced code copy button on a touch pointer", () => {
 });
 
 describe("fenced code copy button on a desktop-width touch screen", () => {
-	it("still dodges the row action bar, which a tap can summon there", async () => {
-		// A hoverable-viewport touch device (tablet in landscape, touchscreen laptop)
-		// DOES get the row bar — browsers synthesize `mouseenter` on tap — so the
-		// leading panel must keep stepping aside. Only the visibility changes.
+	it("keeps the top corner: no tap can summon the row action bar there", async () => {
+		// A hoverable-viewport touch device (tablet in landscape) used to keep the
+		// desktop dodge because browsers synthesize `mouseenter` on tap, summoning
+		// the row bar. The host now ignores synthesized hover on a touch pointer
+		// (it popped the bar up mid-gesture and swapped the big scroll-to-top
+		// button for the bar's small one), so no bar can ever appear and the dodge
+		// would only drag the button away from the panel's head.
 		mediaState = { touchPointer: true, mobileViewport: false };
 		const view = await renderMarkdownBody(`\`\`\`js\n${CODE}\n\`\`\``);
 		const overlay = copyOverlay(view.container);
-		expect(overlay?.getAttribute("data-vlist-code-copy-placement")).toBe("bottom-right");
+		expect(overlay?.getAttribute("data-vlist-code-copy-placement")).toBe("top-right");
 		expect(overlay?.style.visibility).toBe("visible");
 		view.unmount();
 	});

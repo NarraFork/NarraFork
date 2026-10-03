@@ -10,8 +10,6 @@ const MAX_BACKGROUND_RESULT_CHARS = 12_000;
 export interface CompletedBgSubagentNotification {
 	/** Initiating user of the completed execution, never inferred from its parent. */
 	userId?: string | null;
-	/** Pointer-only notice for a resumed run whose result is already in its tool call. */
-	noticeText?: string;
 	/** Real subagent narrator id (also the background task row id). */
 	id: string;
 	/**
@@ -60,11 +58,6 @@ export function backgroundAgentNoticePreview(
 	if (task.status === "started" || task.status === "running") {
 		return zh ? "子代理已开始执行。" : "Agent has started.";
 	}
-	if (task.noticeText != null) {
-		return zh
-			? "本次执行已结束，结果已保存。可查看子代理结果；此通知不重复附带全文。"
-			: "This run has ended and its result was saved. View the agent result; this notice does not repeat it.";
-	}
 	return (
 		task.result?.slice(0, MAX_BACKGROUND_RESULT_CHARS) ??
 		(zh
@@ -85,9 +78,6 @@ export function formatBackgroundCompletionNotifications(
 		const header = `[System] Background agent "${task.title}" (ID: ${ref}) ${task.status}.`;
 		if (task.status === "started" || task.status === "running") {
 			return `${header}\n${backgroundAgentNoticePreview(task)}`;
-		}
-		if (task.noticeText != null) {
-			return `${header}\n${backgroundAgentNoticePreview(task)}\nUse Await({ type: "agent", id: "${ref}" }) to see the stored result.\nUse Send({ id: "${ref}", message }) to continue.`;
 		}
 		const missing = task.result == null;
 		const truncated =

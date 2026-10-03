@@ -224,8 +224,10 @@ export function projectPendingInjection(
 			.from(narrators)
 			.where(eq(narrators.id, metadata.taskId))
 			.get();
-		const noticeOnly = metadata.resultRef?.startsWith("conclusion:") ?? false;
-		const resultRef = noticeOnly
+		// Older resumed runs used a conclusion prefix to suppress their result.
+		// Keep those immutable snapshots readable just like ordinary completions.
+		const legacyConclusion = metadata.resultRef?.startsWith("conclusion:") ?? false;
+		const resultRef = legacyConclusion
 			? metadata.resultRef?.slice("conclusion:".length)
 			: metadata.resultRef;
 		const originalSnapshot = resultRef?.startsWith("message-original:") ?? false;
@@ -236,7 +238,7 @@ export function projectPendingInjection(
 				: undefined;
 		// Preserve the idle consumer's bounded long result without reading an unbounded source field.
 		const result =
-			resultMessageId && !noticeOnly && status !== "started"
+			resultMessageId && status !== "started"
 				? db
 						.select({
 							text: originalSnapshot
@@ -257,7 +259,6 @@ export function projectPendingInjection(
 				title: task?.title ?? narrator?.title ?? metadata.taskId,
 				status,
 				resultPreview: row.text,
-				...(noticeOnly ? { noticeText: row.text } : {}),
 				result: result?.slice(0, 12000),
 				resultTruncated: !!result && result.length > 12000,
 				resultMessageId,

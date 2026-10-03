@@ -118,10 +118,17 @@ export interface FloatState {
 	top: number;
 	/** Viewport `right` for the fixed bar; only meaningful when floating. */
 	right: number;
+	/**
+	 * The body's own height (px); only meaningful when floating (0 placeholder
+	 * otherwise). Consumers that gate affordances on body size — the touch
+	 * scroll-to-top button ignores short bodies — read it from here rather than
+	 * re-measuring.
+	 */
+	bodyHeight: number;
 }
 
-const PARKED: FloatState = { mode: "parked", top: 0, right: 0 };
-const HIDDEN: FloatState = { mode: "hidden", top: 0, right: 0 };
+const PARKED: FloatState = { mode: "parked", top: 0, right: 0, bodyHeight: 0 };
+const HIDDEN: FloatState = { mode: "hidden", top: 0, right: 0, bodyHeight: 0 };
 
 /**
  * Resolve the bar's mode (and, when floating, its viewport coordinates).
@@ -154,6 +161,7 @@ export function resolveFloatState(
 		mode: "floating",
 		top: scrollerTop + gap,
 		right: Math.max(gap, viewportWidth - bodyRight + gap),
+		bodyHeight: bodyBottom - bodyTop,
 	};
 }
 

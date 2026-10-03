@@ -1,5 +1,7 @@
 {
 	"title": "设置",
+	"treatAsLocalAccess": "视作本地访问，提供打开文件管理器的菜单",
+	"treatAsLocalAccessDesc": "即使通过域名或局域网地址访问，也显示打开文件管理器的菜单。文件管理器在 NarraFork 服务器上打开，而不是浏览器所在设备上；仅在两者为同一台机器时开启。此偏好适用于当前用户的所有浏览器，远程执行设备文件仍不支持。",
 	"workspaceMaintenanceExplanation": "该旧所有者没有可核验的进程身份。维护将保留整个工作区五分钟且不可续期。请先停止旧实例和所有可能存活的外部写入进程。管理员声明不等于执行已结束的证明；当前文件观测也不能还原历史执行成功与否。",
 	"workspaceMaintenanceWritersStopped": "我已停止全部旧实例以及可能存活的外部写入进程。",
 	"workspaceMaintenanceReason": "维护原因与已完成的检查",

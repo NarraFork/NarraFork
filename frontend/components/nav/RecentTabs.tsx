@@ -4,7 +4,7 @@ import {
 	groupRecentTabsByDirectory,
 	type RecentTabRow,
 } from "@frontend/hooks/recent-tab-directory-groups";
-import { isLoopbackBrowserOrigin } from "@frontend/lib/local-origin";
+import { canRevealFromBrowser } from "@frontend/lib/local-origin";
 import {
 	getEffectiveNarratorDisplay,
 	type StatusShape,
@@ -835,13 +835,9 @@ export function RecentTabList({
 	);
 
 	const fsRevealCapability = useFsRevealCapability();
-	/**
-	 * Reveal opens a file manager window on the *server* host, so it is only offered when
-	 * the browser is on that same machine. Remote users would get a silent success (or a
-	 * window on someone else's desktop), which is worse than not seeing the option.
-	 * The origin cannot change without a page load, so this is computed once.
-	 */
-	const canRevealFromThisBrowser = useMemo(() => isLoopbackBrowserOrigin(), []);
+	// Reveal runs on the server desktop. Explicit user opt-in also supports a local
+	// browser accessing that server through a domain or LAN IP; react to preference changes.
+	const canRevealFromThisBrowser = canRevealFromBrowser(userPrefsForGrouping?.treatAsLocalAccess);
 	const revealAvailable = fsRevealCapability.supported && canRevealFromThisBrowser;
 
 	const handleReveal = useCallback(async () => {

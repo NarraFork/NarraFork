@@ -5,6 +5,7 @@ import {
 	IconCheck,
 	IconMessageCircle,
 	IconSparkles,
+	IconX,
 } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 
@@ -47,6 +48,7 @@ export interface TextareaOptimizeControlsProps {
 	withContext: boolean;
 	onToggleContext: () => void;
 	onOptimize: (style: OptimizeStyle) => void;
+	onCancelOptimize: () => void;
 	onExpand?: () => void;
 	/** Number of context messages (for display in hint), default 10 */
 	contextMessageCount?: number;
@@ -60,78 +62,92 @@ export function TextareaOptimizeControls(props: TextareaOptimizeControlsProps) {
 
 	return (
 		<Group gap={4} wrap="nowrap" pr={8} style={{ pointerEvents: "auto" }}>
-			<Menu position="top-end" withArrow withinPortal offset={{ mainAxis: 8, crossAxis: 8 }}>
-				<Menu.Target>
-					<Tooltip label={t("optimizePrompt")} position="top">
-						<ActionIcon
-							size="sm"
-							variant="subtle"
-							color="gray"
-							disabled={props.disabled || props.loading}
-							loading={props.loading}
-						>
-							<IconSparkles size={16} />
-						</ActionIcon>
-					</Tooltip>
-				</Menu.Target>
-				<Menu.Dropdown>
-					<Menu.Label>{t("optimizeStyleLabel")}</Menu.Label>
-					<Menu.Item onClick={() => props.onOptimize("clarify")}>
-						{t("optimizeStyleClarify")}
-					</Menu.Item>
-					<Menu.Item onClick={() => props.onOptimize("concise")}>
-						{t("optimizeStyleConcise")}
-					</Menu.Item>
-					<Menu.Item onClick={() => props.onOptimize("structured")}>
-						{t("optimizeStyleStructured")}
-					</Menu.Item>
-					<Menu.Item onClick={() => props.onOptimize("translate_en")}>
-						{t("optimizeStyleTranslateEn")}
-					</Menu.Item>
-					<Menu.Divider />
-					<Menu.Item
-						leftSection={<IconMessageCircle size={16} />}
-						rightSection={props.withContext ? <IconCheck size={16} /> : null}
-						onClick={props.onToggleContext}
+			{props.loading ? (
+				<Tooltip label={t("optimizeCancel")} position="top">
+					<ActionIcon
+						size="sm"
+						variant="subtle"
+						color="red"
+						aria-label={t("optimizeCancel")}
+						onClick={props.onCancelOptimize}
 					>
-						{t("optimizeWithContext")}
-					</Menu.Item>
-					{props.onContextMessageCountChange && (
-						<Menu.Item closeMenuOnClick={false}>
-							<NumberInput
-								label={t("optimizeContextMessageCount")}
-								description={t("optimizeContextMessageCountHint")}
-								value={contextCount}
-								onChange={(v) => {
-									if (typeof v === "number" && props.onContextMessageCountChange) {
-										props.onContextMessageCountChange(v);
-									}
-								}}
-								min={1}
-								max={50}
-								step={1}
-								size="xs"
-								styles={{
-									root: { width: "100%" },
-								}}
-								onMouseDown={(e) => {
-									// Prevent Menu's mousedown handler from interfering with input focus
-									e.stopPropagation();
-								}}
-								onClick={(e) => {
-									// Also prevent click propagation
-									e.stopPropagation();
-								}}
-							/>
+						<IconX size={16} />
+					</ActionIcon>
+				</Tooltip>
+			) : (
+				<Menu position="top-end" withArrow withinPortal offset={{ mainAxis: 8, crossAxis: 8 }}>
+					<Menu.Target>
+						<Tooltip label={t("optimizePrompt")} position="top">
+							<ActionIcon
+								size="sm"
+								variant="subtle"
+								color="gray"
+								disabled={props.disabled || props.loading}
+								loading={props.loading}
+							>
+								<IconSparkles size={16} />
+							</ActionIcon>
+						</Tooltip>
+					</Menu.Target>
+					<Menu.Dropdown>
+						<Menu.Label>{t("optimizeStyleLabel")}</Menu.Label>
+						<Menu.Item onClick={() => props.onOptimize("clarify")}>
+							{t("optimizeStyleClarify")}
 						</Menu.Item>
-					)}
-					<Text size="xs" c="dimmed" px="sm" py={4} style={{ maxWidth: 280 }}>
-						{props.withContext
-							? t("optimizeWithContextHintEnabled", { count: contextCount })
-							: t("optimizeWithContextHint")}
-					</Text>
-				</Menu.Dropdown>
-			</Menu>
+						<Menu.Item onClick={() => props.onOptimize("concise")}>
+							{t("optimizeStyleConcise")}
+						</Menu.Item>
+						<Menu.Item onClick={() => props.onOptimize("structured")}>
+							{t("optimizeStyleStructured")}
+						</Menu.Item>
+						<Menu.Item onClick={() => props.onOptimize("translate_en")}>
+							{t("optimizeStyleTranslateEn")}
+						</Menu.Item>
+						<Menu.Divider />
+						<Menu.Item
+							leftSection={<IconMessageCircle size={16} />}
+							rightSection={props.withContext ? <IconCheck size={16} /> : null}
+							onClick={props.onToggleContext}
+						>
+							{t("optimizeWithContext")}
+						</Menu.Item>
+						{props.onContextMessageCountChange && (
+							<Menu.Item closeMenuOnClick={false}>
+								<NumberInput
+									label={t("optimizeContextMessageCount")}
+									description={t("optimizeContextMessageCountHint")}
+									value={contextCount}
+									onChange={(v) => {
+										if (typeof v === "number" && props.onContextMessageCountChange) {
+											props.onContextMessageCountChange(v);
+										}
+									}}
+									min={1}
+									max={50}
+									step={1}
+									size="xs"
+									styles={{
+										root: { width: "100%" },
+									}}
+									onMouseDown={(e) => {
+										// Prevent Menu's mousedown handler from interfering with input focus
+										e.stopPropagation();
+									}}
+									onClick={(e) => {
+										// Also prevent click propagation
+										e.stopPropagation();
+									}}
+								/>
+							</Menu.Item>
+						)}
+						<Text size="xs" c="dimmed" px="sm" py={4} style={{ maxWidth: 280 }}>
+							{props.withContext
+								? t("optimizeWithContextHintEnabled", { count: contextCount })
+								: t("optimizeWithContextHint")}
+						</Text>
+					</Menu.Dropdown>
+				</Menu>
+			)}
 
 			{props.onExpand && (
 				<Tooltip label={t("expandComposer")} position="top">

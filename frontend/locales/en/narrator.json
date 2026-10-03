@@ -1838,6 +1838,7 @@
 		"reflection": "Reflection · human decision"
 	},
 	"optimizePrompt": "Optimize prompt",
+	"optimizeCancel": "Cancel optimization",
 	"optimizeStyleLabel": "Choose optimization style",
 	"optimizeStyleClarify": "Make it clearer",
 	"optimizeStyleConcise": "Make it concise",

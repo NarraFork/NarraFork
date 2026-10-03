@@ -108,6 +108,8 @@ function NarratorDetailPage() {
 	// biome-ignore lint/suspicious/noExplicitAny: loose search params
 	const search = useSearch({ strict: false }) as any;
 	const from = search?.from as string | undefined;
+	const workspaceId = search?.workspaceId as string | undefined;
+	const fromWorkspace = from === "workspace" && !!workspaceId;
 	const scrollToMessageId = search?.scrollTo as string | undefined;
 	const location = useLocation();
 	const hashMessageId = location.hash?.startsWith("msg-") ? location.hash.slice(4) : undefined;
@@ -290,9 +292,14 @@ function NarratorDetailPage() {
 	}, [navigate, projectId, chapterId]);
 	const showMinimize = from === "graph" && !!projectId && !!chapterId;
 
-	// Subagent back navigation: return to parent narrator, or to graph if opened from graph
+	// Return to the originating workspace before applying subagent navigation defaults.
 	const onBack = useCallback(() => {
-		if (isSubagent) {
+		if (fromWorkspace && workspaceId) {
+			navigate({
+				to: "/narrators/workspace/$workspaceId",
+				params: { workspaceId },
+			});
+		} else if (isSubagent) {
 			if (from === "graph" && parentProjectId && parentChapterId) {
 				navigate({
 					to: "/projects/$projectId",
@@ -311,7 +318,16 @@ function NarratorDetailPage() {
 		} else {
 			navigate({ to: ".." });
 		}
-	}, [isSubagent, from, parentProjectId, parentChapterId, parentNarratorId, navigate]);
+	}, [
+		fromWorkspace,
+		workspaceId,
+		isSubagent,
+		from,
+		parentProjectId,
+		parentChapterId,
+		parentNarratorId,
+		navigate,
+	]);
 
 	const [forkMessageId, setForkMessageId] = useState<string | null>(null);
 	const handleForkFromMessage = useCallback(
@@ -441,7 +457,7 @@ function NarratorDetailPage() {
 			chapterId={chapterId}
 			onForkFromMessage={chapterId ? handleForkFromMessage : null}
 			highlightMessageId={highlightMessageId}
-			onBack={isSubagent ? onBack : null}
+			onBack={isSubagent || fromWorkspace ? onBack : null}
 			onMinimize={showMinimize ? onMinimize : null}
 		>
 			<Box
@@ -488,7 +504,7 @@ function NarratorDetailPage() {
 										: undefined
 								}
 								onMinimize={showMinimize ? onMinimize : undefined}
-								onBack={isSubagent ? onBack : undefined}
+								onBack={isSubagent || fromWorkspace ? onBack : undefined}
 								specPanelOpen={isMobile ? specDrawerOpened : undefined}
 								onToggleSpecPanel={
 									isMobile ? (specDrawerOpened ? closeSpecDrawer : openSpecDrawer) : undefined

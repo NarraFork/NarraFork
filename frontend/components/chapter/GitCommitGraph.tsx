@@ -1,4 +1,4 @@
-import { ActionIcon, Badge, Box, Button, Group, Loader, ScrollArea, Text } from "@mantine/core";
+import { ActionIcon, Box, Button, Group, Loader, ScrollArea, Text } from "@mantine/core";
 import { IconChevronDown, IconChevronRight, IconRefresh } from "@tabler/icons-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -52,11 +52,9 @@ const GRAPH_HEADER_HEIGHT = 34;
 export function GitCommitGraph({
 	target,
 	headSha: headShaProp,
-	branch: branchProp,
 }: {
 	target: GitTarget;
 	headSha?: string;
-	branch?: string;
 }) {
 	const { t } = useTranslation("git");
 	const { collapsed, toggle } = useGitGraphCollapsed(target);
@@ -64,7 +62,6 @@ export function GitCommitGraph({
 	const workspaceKey = gitTargetKey(target) ?? "";
 	const statusQuery = useGitStatus(target);
 	const headSha = headShaProp ?? statusQuery.data?.headSha;
-	const branch = branchProp ?? statusQuery.data?.branch;
 
 	const [commits, setCommits] = useState<GitLogEntry[]>([]);
 	/**
@@ -375,11 +372,6 @@ export function GitCommitGraph({
 										<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
 											{row.commit.author}
 										</Text>
-										{row.isHead && branch ? (
-											<Badge size="xs" color="blue" variant="light">
-												{branch}
-											</Badge>
-										) : null}
 									</Group>
 								);
 							})}

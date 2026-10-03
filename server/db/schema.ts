@@ -1899,6 +1899,10 @@ export const userPreferences = sqliteTable("user_preferences", {
 		.notNull()
 		.default(true),
 	fastModeDefault: integer("fast_mode_default", { mode: "boolean" }).notNull().default(false),
+	/** Explicit user override for server-desktop file manager menus. */
+	treatAsLocalAccess: integer("treat_as_local_access", { mode: "boolean" })
+		.notNull()
+		.default(false),
 	language: text("language").$type<Locale>().notNull().default(DEFAULT_LOCALE),
 	wordWrapMarkdown: integer("word_wrap_markdown", { mode: "boolean" }).notNull().default(true),
 	wordWrapCode: integer("word_wrap_code", { mode: "boolean" }).notNull().default(true),

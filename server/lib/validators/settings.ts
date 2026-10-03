@@ -204,6 +204,7 @@ export const updateUserPreferencesSchema = z.object({
 		.min(TYPOGRAPHY_RANGE.paragraphScalePercent.min)
 		.max(TYPOGRAPHY_RANGE.paragraphScalePercent.max)
 		.optional(),
+	treatAsLocalAccess: z.boolean().optional(),
 	addSubagentToRecentTabs: z.boolean().optional(),
 	recentTabsGroupMode: z.enum(["flat", "directory"]).optional(),
 	// Notification preferences
