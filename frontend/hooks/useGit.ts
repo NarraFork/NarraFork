@@ -23,6 +23,7 @@ import { GitWorkspaceSubscriptions } from "../lib/git-workspace-subscription";
 import { type ListenerHandle, narratorWSManager } from "../lib/narrator-ws-manager";
 import { observePageLifecycle } from "../lib/page-lifecycle";
 import { useNarrator } from "./useNarrator";
+import { useWorkspaceContext } from "./useWorkspaceContext";
 
 export type {
 	CurrentDiffFile,
@@ -236,13 +237,15 @@ async function readWorkspace<T>(
 export function useGitWorkspace(narratorId: string | null | undefined, revision?: unknown) {
 	const qc = useQueryClient();
 	const { data: narrator } = useNarrator(narratorId ?? "");
+	const { data: executionContext } = useWorkspaceContext(narratorId ?? "");
 	useEffect(() => (narratorId ? subscribeGitAccess(qc) : undefined), [qc, narratorId]);
-	const context = revision ?? [
-		narrator?.cwd,
-		narrator?.chapterId,
-		narrator?.contextProjectId,
-		narrator?.defaultDeviceId,
-	];
+	const context = revision ??
+		executionContext?.contextKey ?? [
+			narrator?.cwd,
+			narrator?.chapterId,
+			narrator?.contextProjectId,
+			narrator?.defaultDeviceId,
+		];
 	const query = useQuery({
 		queryKey: ["gitWorkspace", narratorId, context],
 		queryFn: ({ signal }) => api.getGitWorkspace(narratorId as string, signal),

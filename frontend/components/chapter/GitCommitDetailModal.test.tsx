@@ -309,9 +309,14 @@ beforeEach(async () => {
 	// Uncontrolled previews now load the first file as soon as detail arrives.
 	spyOn(api, "getGitCommitDiff").mockResolvedValue(textPatch("DEFAULT_PATCH"));
 	// No unmocked network request should silently reach a live NarraFork instance.
-	spyOn(globalThis, "fetch").mockImplementation(async () => {
-		throw new Error("Unexpected network request");
-	});
+	spyOn(globalThis, "fetch").mockImplementation(
+		Object.assign(
+			async () => {
+				throw new Error("Unexpected network request");
+			},
+			{ preconnect: () => {} },
+		),
+	);
 });
 
 afterEach(async () => {

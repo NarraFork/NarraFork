@@ -299,9 +299,14 @@ beforeEach(async () => {
 		diff: "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+PRIVATE_PATCH\n",
 		truncated: false,
 	});
-	spyOn(globalThis, "fetch").mockImplementation(async () => {
-		throw new Error("Unexpected network request");
-	});
+	spyOn(globalThis, "fetch").mockImplementation(
+		Object.assign(
+			async () => {
+				throw new Error("Unexpected network request");
+			},
+			{ preconnect: () => {} },
+		),
+	);
 });
 afterEach(async () => {
 	root.unmount();

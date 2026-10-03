@@ -84,6 +84,11 @@ import {
 import { useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
+import {
+	useUpdateExecutionDevice,
+	useWorkspaceContext,
+	workspaceFileTarget,
+} from "../../hooks/useWorkspaceContext";
 import { ApiError, api } from "../../lib/api";
 import type { RevertScope } from "../../lib/api/narrators";
 import { statusRegistry } from "../../lib/constants";
@@ -106,6 +111,7 @@ import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
+import { NarratorCompatibilityEntry } from "../project/NarratorCompatibilityEntry";
 import {
 	BackgroundTasksDrawerHost,
 	useBackgroundTasksButton,
@@ -369,6 +375,7 @@ function NarratorPanelBody({
 	} = useAllModels();
 	const modelCardIndex = useModelCardIndex();
 	const { data: currentUser } = useCurrentUser();
+	const { data: workspaceContext } = useWorkspaceContext(narratorId);
 	const currentUserId = currentUser?.id ? String(currentUser.id) : null;
 	const { data: userPrefs } = useUserPreferences();
 	const updateUserPrefs = useUpdateUserPreferences();
@@ -456,19 +463,9 @@ function NarratorPanelBody({
 		// 设备列表变化缓慢, 60s 轮询足够
 		refetchInterval: 60_000,
 	});
-	const updateExecutionDeviceMutation = useMutation({
-		mutationFn: (deviceId: string | null) => api.updateNarratorDefaultDevice(narratorId, deviceId),
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["narratorExecutionDevices", narratorId] });
-			qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
-			qc.resetQueries({ queryKey: ["gitWorkspace", narratorId] });
-		},
-		onError: (error) =>
-			notifications.show({
-				color: "red",
-				message: error instanceof Error ? error.message : String(error),
-			}),
-	});
+	const updateExecutionDeviceMutation = useUpdateExecutionDevice(narratorId, (error) =>
+		notifications.show({ color: "red", message: error.message }),
+	);
 	const updateSettingsMutation = useMutation({
 		mutationFn: api.updateSettings,
 		onSuccess: (data) => {
@@ -1899,20 +1896,11 @@ function NarratorPanelBody({
 	const addFileReference = useCallback((reference: FileReference) => {
 		composerRef.current?.addFileReference(reference);
 	}, []);
-	const fileReferenceDevice = executionDevicesQuery.data
-		? (executionDevicesQuery.data.defaultDeviceId ?? "local")
-		: undefined;
-	const fileReferenceCwd =
-		fileReferenceDevice === "local"
-			? (fetchedNarrator?.cwd ?? narrator?.cwd ?? chapterWorktreePath)
-			: executionDevicesQuery.data?.devices.find((device) => device.id === fileReferenceDevice)
-					?.defaultCwd;
+	// Never pair a freshly selected device with a cached local cwd. The server's
+	// single revisioned snapshot owns # references, the file tree and default cwd.
 	const fileReferenceContext = useMemo<FileReferenceContext | null>(
-		() =>
-			fileReferenceDevice && fileReferenceCwd
-				? { deviceId: fileReferenceDevice, cwd: fileReferenceCwd }
-				: null,
-		[fileReferenceDevice, fileReferenceCwd],
+		() => workspaceFileTarget(workspaceContext),
+		[workspaceContext],
 	);
 	const fileReferenceScope = useMemo<FileReferenceScopeValue>(
 		() => ({
@@ -2922,7 +2910,7 @@ function NarratorPanelBody({
 					    fixed title @ pretext W, then only tools that fit after it. */}
 					<NarratorHeaderLayout
 						titleFullWidth={headerTitleFullWidth}
-						showBack={!isWorkspacePreview}
+						showBack={!isWorkspacePreview && !onMinimize && !chapterId}
 						showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
 						surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
 						showClose={!!onClose}
@@ -2944,13 +2932,9 @@ function NarratorPanelBody({
 									}}
 								>
 									{!isWorkspacePreview &&
-										(onMinimize ? (
-											<Tooltip label={t("backToGraph")} position="right">
-												<ActionIcon size="sm" variant="subtle" color="gray" onClick={onMinimize}>
-													<IconArrowsMinimize size={16} />
-												</ActionIcon>
-											</Tooltip>
-										) : onBack ? (
+										!onMinimize &&
+										!chapterId &&
+										(onBack ? (
 											<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
 												<IconArrowLeft size={16} />
 											</ActionIcon>
@@ -2977,7 +2961,6 @@ function NarratorPanelBody({
 																navigate({
 																	to: "/narrators/$narratorId",
 																	params: { narratorId },
-																	search: { from: "graph" },
 																})
 															}
 														>
@@ -3040,6 +3023,17 @@ function NarratorPanelBody({
 										archiveMutation={archiveMutation}
 										dock={dock}
 										mockStreamEnabled={mockStreamEnabled}
+										compatibilityEntry={
+											<Suspense fallback={null}>
+												<NarratorCompatibilityEntry
+													projectId={
+														workspaceContext?.contextProjectId ??
+														projectId ??
+														narrator?.contextProjectId
+													}
+												/>
+											</Suspense>
+										}
 										onClose={onClose}
 										visibleToolCount={headerLayout.visibleToolCount}
 										unmeasured={headerLayout.unmeasured}

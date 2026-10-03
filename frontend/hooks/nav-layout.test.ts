@@ -1,7 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import { CUSTOMIZABLE_NAV_IDS, NAV_DIVIDER_ID } from "@shared/nav-layout";
 import { CUSTOMIZABLE_NAV_ITEMS } from "../components/nav/nav-items";
-import { DEFAULT_NAV_ENTRIES, mergeNavLayout, toPersistedNavLayout } from "./nav-layout";
+import {
+	DEFAULT_NAV_ENTRIES,
+	mergeNavLayout,
+	projectNavLayout,
+	restoreRetiredNavEntries,
+	toPersistedNavLayout,
+} from "./nav-layout";
 
 /** Ids on each side of the divider, in order. */
 function split(entries: ReturnType<typeof mergeNavLayout>): {
@@ -32,8 +38,9 @@ describe("nav layout defaults", () => {
 		expect(CUSTOMIZABLE_NAV_ITEMS.find((def) => def.id === "learn")?.to).toBe("/learn");
 	});
 
-	it("keeps projects surfaced — it is the app's primary destination", () => {
+	it("keeps the historical project preference but removes its presentation", () => {
 		expect(split(DEFAULT_NAV_ENTRIES).visible).toContain("projects");
+		expect(split(projectNavLayout(DEFAULT_NAV_ENTRIES)).visible).not.toContain("projects");
 	});
 
 	it("applies the same defaults to a user with no persisted layout", () => {
@@ -158,5 +165,38 @@ describe("nav layout merge", () => {
 			items: [{ id: "projects" }, { id: NAV_DIVIDER_ID }, { id: "learn" }],
 		});
 		expect(mergeNavLayout(toPersistedNavLayout(entries))).toEqual(entries);
+	});
+});
+
+describe("retired navigation presentation, shared by desktop and mobile", () => {
+	it.each([
+		undefined,
+		{ items: [{ id: "projects" }, { id: "messages" }, { id: NAV_DIVIDER_ID }] },
+		{ items: [{ id: "messages" }, { id: NAV_DIVIDER_ID }, { id: "projects" }] },
+		{
+			items: [
+				{ id: "projects", hidden: false },
+				{ id: "learn", hidden: true },
+			],
+		},
+	])("filters both the sidebar and overflow without rewriting preferences: %j", (preferences) => {
+		const before = structuredClone(preferences);
+		const stored = mergeNavLayout(preferences);
+		const projected = projectNavLayout(stored);
+		expect(split(projected).visible).not.toContain("projects");
+		expect(split(projected).tucked).not.toContain("projects");
+		expect(preferences).toEqual(before);
+		expect(restoreRetiredNavEntries(projected, stored)).toEqual(stored);
+	});
+
+	it("preserves a retired id when saving an explicit reorder", () => {
+		const stored = mergeNavLayout({
+			items: [{ id: "projects" }, { id: "learn" }, { id: "messages" }, { id: NAV_DIVIDER_ID }],
+		});
+		const projected = projectNavLayout(stored);
+		const reordered = [projected[1], projected[0], ...projected.slice(2)];
+		const saved = restoreRetiredNavEntries(reordered, stored);
+		expect(saved[0]).toEqual({ kind: "item", id: "projects" });
+		expect(projectNavLayout(saved)).toEqual(reordered);
 	});
 });

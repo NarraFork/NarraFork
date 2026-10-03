@@ -629,14 +629,10 @@ function AuthenticatedLayout() {
 		navigate({ to: "/settings/agent", hash: "request-dump-enabled" });
 	};
 
-	// Check if the first tab in each group is active — used for connected border-radius
-	const projectTabs = tabs.filter((t) => t.type === "project");
+	// Only session tabs are projected; persisted project visits are left untouched.
 	const narratorTabs = tabs.filter((t) => t.type !== "project");
-	const firstProjectTabActive = projectTabs.length > 0 && isTabActive(projectTabs[0], pathname);
 	const firstNarratorTabActive = narratorTabs.length > 0 && isTabActive(narratorTabs[0], pathname);
 
-	// Whether the projects section is visible (can be tucked into the overflow menu)
-	const projectsVisible = navVisibleItems.some((item) => item.id === "projects");
 	const secondaryNavDefs = new Map(CUSTOMIZABLE_NAV_ITEMS.map((def) => [def.id, def]));
 	// The Navbar's gutter for the three sides that are not the bottom edge. The bottom
 	// edge is owned by the `data-safe-area` spacer, which folds this same value into a
@@ -816,51 +812,7 @@ function AuthenticatedLayout() {
 									leftSection={<IconDashboard size={16} />}
 								/>
 							</Tooltip>
-							{projectsVisible && (
-								<Tooltip label={t("projects")} position="right" disabled={!navCollapsed}>
-									<NavLink
-										component={Link}
-										to="/projects"
-										label={navCollapsed ? undefined : t("projects")}
-										leftSection={<IconFolders size={16} />}
-										styles={
-											firstProjectTabActive
-												? {
-														root: {
-															borderBottomLeftRadius: 0,
-															borderBottomRightRadius: 0,
-														},
-													}
-												: undefined
-										}
-										rightSection={
-											navCollapsed ? undefined : tabs.some((t) => t.type === "project") ? (
-												<Tooltip label={t("clearProjects")} position="right" withArrow>
-													<ActionIcon
-														size={28}
-														variant="subtle"
-														color="gray"
-														onClick={(e: React.MouseEvent) => {
-															e.preventDefault();
-															e.stopPropagation();
-															clearTabs("projects", activeTabKey);
-														}}
-														aria-label={t("clearProjects")}
-													>
-														<IconClearAll size={16} />
-													</ActionIcon>
-												</Tooltip>
-											) : undefined
-										}
-									/>
-								</Tooltip>
-							)}
 						</Box>
-						{projectsVisible && !navCollapsed && (
-							<Box style={{ overflow: "auto", minHeight: 0 }}>
-								<RecentTabList filter="project" firstTabConnected />
-							</Box>
-						)}
 						<Box>
 							<Tooltip label={t("narrators")} position="right" disabled={!navCollapsed}>
 								<NavLink

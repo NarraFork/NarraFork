@@ -55,6 +55,7 @@ export function useNarrators(opts?: {
 }
 
 export function useNarratorsPaginated(opts?: {
+	projectId?: string;
 	standalone?: boolean | "all";
 	status?: string;
 	filter?: string;

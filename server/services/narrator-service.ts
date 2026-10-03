@@ -6,12 +6,14 @@ import { foldHandle } from "@shared/narrator-handle";
 import { and, desc, eq, inArray, isNotNull, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
+	aclGrants,
 	apiRequests,
 	backgroundTasks,
 	benchmarkTaskResults,
 	chapterCommits,
 	chapters,
 	gatewaySessionMappings,
+	integrationResourceBindings,
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
 	narratorBufferedMessages,
@@ -38,9 +40,7 @@ import {
 	type AutoContinuationOverride,
 	type BooleanOverride,
 	type DangerReflectionOverride,
-	normalizeAutoContinuationOverride,
 	normalizeBooleanOverride,
-	normalizeDangerReflectionOverride,
 } from "../lib/boolean-override";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { NotFoundError, ValidationError } from "../lib/errors";
@@ -116,6 +116,7 @@ import {
 	deleteRecipientMessageRefs,
 	narratorPersistence,
 } from "./narrator-persistence";
+import { resolveNarratorProjectId } from "./narrator-project";
 import {
 	claimNextRefSeq,
 	initializeRefSeqFloor,
@@ -123,6 +124,7 @@ import {
 } from "./narrator-refs/seq-store";
 import { materializeChildrenOf } from "./narrator-refs-backfill";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
+import { resolveSkillContextForNarrator } from "./skill-service";
 import { specVfsService } from "./spec-vfs-service";
 import { removeTabFromAllUsers } from "./user-preferences-service";
 
@@ -1196,6 +1198,125 @@ async function insertSpecClearedCarryoverCard(narratorId: string): Promise<void>
 
 type NarratorInsertExecutor = Pick<typeof db, "insert">;
 
+/** A fork keeps execution constraints and explicit audiences, but not named/task identity. */
+function forkTraits(parent: typeof narrators.$inferSelect, chapterId: string | null): string[] {
+	const excluded = new Set(["standalone", "named", "scheduled", "background"]);
+	return [
+		...(chapterId ? [] : ["standalone"]),
+		...parseTraits(parent.traits).filter((trait) => !excluded.has(trait)),
+	];
+}
+
+function copyForkAccessAndRules(
+	tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+	parentId: string,
+	childId: string,
+) {
+	// Refuse oversized profiles rather than silently dropping restrictions or monopolizing SQLite.
+	const copied = <T extends { id: string }>(rows: T[]): T[] => {
+		if (rows.length > 1_000) throw new ValidationError("Fork access profile exceeds limit");
+		return rows.map((row) => ({ ...row, id: generateId() }));
+	};
+	// Keep authority provenance atomically with its frozen snapshot. A missing/revoked
+	// authority must continue failing closed in the child, never become ordinary access.
+	const provenance = tx.query.integrationResourceBindings
+		.findFirst({
+			where: and(
+				eq(integrationResourceBindings.resourceType, "narrator"),
+				eq(integrationResourceBindings.resourceId, parentId),
+			),
+		})
+		.sync();
+	if (provenance)
+		integrationResourceBindingService.createInTransaction(tx, {
+			resourceType: "narrator",
+			resourceId: childId,
+			sourceType: provenance.sourceType,
+			sourceId: provenance.sourceId,
+			authorityType: provenance.authorityType,
+			authorityId: provenance.authorityId,
+			state: provenance.state,
+			metadataJson: provenance.metadataJson,
+		});
+	const grants = copied(
+		tx
+			.select()
+			.from(aclGrants)
+			.where(and(eq(aclGrants.scopeType, "narrator"), eq(aclGrants.scopeId, parentId)))
+			.limit(1_001)
+			.all(),
+	);
+	if (grants.length)
+		tx.insert(aclGrants)
+			.values(grants.map((row) => ({ ...row, scopeId: childId })))
+			.run();
+	const whiteDirs = copied(
+		tx
+			.select()
+			.from(narratorWhitelistDirs)
+			.where(eq(narratorWhitelistDirs.narratorId, parentId))
+			.limit(1_001)
+			.all(),
+	);
+	if (whiteDirs.length)
+		tx.insert(narratorWhitelistDirs)
+			.values(whiteDirs.map((row) => ({ ...row, narratorId: childId })))
+			.run();
+	const blackDirs = copied(
+		tx
+			.select()
+			.from(narratorBlacklistDirs)
+			.where(eq(narratorBlacklistDirs.narratorId, parentId))
+			.limit(1_001)
+			.all(),
+	);
+	if (blackDirs.length)
+		tx.insert(narratorBlacklistDirs)
+			.values(blackDirs.map((row) => ({ ...row, narratorId: childId })))
+			.run();
+	const whiteCmds = copied(
+		tx
+			.select()
+			.from(narratorWhitelistCmds)
+			.where(eq(narratorWhitelistCmds.narratorId, parentId))
+			.limit(1_001)
+			.all(),
+	);
+	if (whiteCmds.length)
+		tx.insert(narratorWhitelistCmds)
+			.values(whiteCmds.map((row) => ({ ...row, narratorId: childId })))
+			.run();
+	const blackCmds = copied(
+		tx
+			.select()
+			.from(narratorBlacklistCmds)
+			.where(eq(narratorBlacklistCmds.narratorId, parentId))
+			.limit(1_001)
+			.all(),
+	);
+	if (blackCmds.length)
+		tx.insert(narratorBlacklistCmds)
+			.values(blackCmds.map((row) => ({ ...row, narratorId: childId })))
+			.run();
+}
+
+async function resolveForkExecutionContext(parent: typeof narrators.$inferSelect) {
+	const context = await resolveSkillContextForNarrator(parent.id);
+	const committedContext =
+		parent.workspaceContext?.revision === parent.workspaceRevision &&
+		parent.workspaceContext.deviceId === (parent.defaultDeviceId ?? "local")
+			? parent.workspaceContext
+			: null;
+	return {
+		cwd: parent.cwd || committedContext?.cwd || context.cwd,
+		defaultDeviceId: parent.defaultDeviceId,
+		enabledTools: parent.enabledTools,
+		isAskInPassing: parent.isAskInPassing,
+		contextProjectId: await resolveNarratorProjectId(parent),
+		oauthPolicySnapshotJson: parent.oauthPolicySnapshotJson,
+	};
+}
+
 export interface PreparedNarratorCreation {
 	row: typeof narrators.$inferInsert;
 	handle: string | null;
@@ -2106,6 +2227,8 @@ export const narratorService = {
 				| "readOnly"
 				| "dontAsk";
 
+			const executionContext = await resolveForkExecutionContext(parent);
+
 			// Fork inserts the narrator row first, then initializeRefSeqFloor — do not pre-raise
 			// a not-yet-inserted id. withSeqFloorRaiseScope marks after the tx commits because
 			// initializeRefSeqFloor records into the active raise scope.
@@ -2120,7 +2243,8 @@ export const narratorService = {
 							chapterId: null,
 							type: "primary",
 							variant: "primary",
-							traits: ["standalone"],
+							traits: forkTraits(parent, null),
+							...executionContext,
 							model: storedModel,
 							systemPrompt: parent.systemPrompt,
 							permissionMode: resolvedPermMode,
@@ -2149,12 +2273,13 @@ export const narratorService = {
 							inheritMode: "full",
 							status: "idle",
 							title: opts?.title ?? null,
-							cwd: parent.cwd ?? null,
 							createdAt: now,
 							updatedAt: now,
 						})
 						.returning()
 						.get();
+
+					copyForkAccessAndRules(tx, parentNarratorId, id);
 
 					// Re-read selected refs in this synchronous transaction. A compact can
 					// finalize after the request preflight; only the state visible here may be
@@ -2202,6 +2327,7 @@ export const narratorService = {
 		forkMessageUuid: string | null,
 		opts?: {
 			title?: string;
+			model?: string;
 			newChapterId?: string;
 			inheritMode?: "full" | "compressed" | "fresh";
 			userId?: string | null;
@@ -2303,12 +2429,13 @@ export const narratorService = {
 				}
 			}
 
-			const storedModel = parent.model ?? FOLLOW_DEFAULT_MODEL;
+			const storedModel = opts?.model ?? parent.model ?? FOLLOW_DEFAULT_MODEL;
 			// Inherit the parent's explicit override if any; otherwise store null
 			// (follow the global default). Never固化 the resolved default here.
 			const resolvedReasoningEffort = parent.reasoningEffort ?? null;
 
-			const forkTraits2: string[] = targetChapterId ? [] : ["standalone"];
+			const forkTraits2 = forkTraits(parent, targetChapterId);
+			const executionContext = await resolveForkExecutionContext(parent);
 
 			// Same as forkFromMessages: insert first, initializeRefSeqFloor after refs land.
 			const newNarrator = withSeqFloorRaiseScope(() =>
@@ -2323,6 +2450,9 @@ export const narratorService = {
 							type: "primary",
 							variant: "primary",
 							traits: forkTraits2,
+							...executionContext,
+							// A new chapter supplies its own project and effective workspace.
+							...(targetChapterId ? { contextProjectId: null, cwd: null } : {}),
 							model: storedModel,
 							systemPrompt,
 							permissionMode: resolvedPermMode,
@@ -2353,7 +2483,6 @@ export const narratorService = {
 							contextSummary,
 							status: "idle",
 							title: opts?.title ?? null,
-							cwd: parent.cwd ?? null,
 							createdAt: now,
 							updatedAt: now,
 						})
@@ -2582,98 +2711,7 @@ export const narratorService = {
 							.run();
 					}
 
-					// Copy all four per-narrator permission rule sets from the parent, preserving the
-					// canonical selector and its legacy mirror so every fork inherits one execution profile.
-					const parentWhitelistDirs = tx
-						.select()
-						.from(narratorWhitelistDirs)
-						.where(eq(narratorWhitelistDirs.narratorId, parentNarratorId))
-						.all();
-					if (parentWhitelistDirs.length > 0) {
-						tx.insert(narratorWhitelistDirs)
-							.values(
-								parentWhitelistDirs.map((dir) => ({
-									id: generateId(),
-									narratorId: id,
-									path: dir.path,
-									accessLevel: dir.accessLevel,
-									enabled: dir.enabled,
-									targetKind: dir.targetKind,
-									targetValue: dir.targetValue,
-									deviceScope: dir.deviceScope,
-									createdAt: now,
-								})),
-							)
-							.run();
-					}
-
-					const parentBlacklistDirs = tx
-						.select()
-						.from(narratorBlacklistDirs)
-						.where(eq(narratorBlacklistDirs.narratorId, parentNarratorId))
-						.all();
-					if (parentBlacklistDirs.length > 0) {
-						tx.insert(narratorBlacklistDirs)
-							.values(
-								parentBlacklistDirs.map((dir) => ({
-									id: generateId(),
-									narratorId: id,
-									path: dir.path,
-									denyLevel: dir.denyLevel,
-									enabled: dir.enabled,
-									targetKind: dir.targetKind,
-									targetValue: dir.targetValue,
-									deviceScope: dir.deviceScope,
-									createdAt: now,
-								})),
-							)
-							.run();
-					}
-
-					const parentWhitelistCmds = tx
-						.select()
-						.from(narratorWhitelistCmds)
-						.where(eq(narratorWhitelistCmds.narratorId, parentNarratorId))
-						.all();
-					if (parentWhitelistCmds.length > 0) {
-						tx.insert(narratorWhitelistCmds)
-							.values(
-								parentWhitelistCmds.map((cmd) => ({
-									id: generateId(),
-									narratorId: id,
-									pattern: cmd.pattern,
-									enabled: cmd.enabled,
-									targetKind: cmd.targetKind,
-									targetValue: cmd.targetValue,
-									deviceScope: cmd.deviceScope,
-									createdAt: now,
-								})),
-							)
-							.run();
-					}
-
-					const parentBlacklistCmds = tx
-						.select()
-						.from(narratorBlacklistCmds)
-						.where(eq(narratorBlacklistCmds.narratorId, parentNarratorId))
-						.all();
-					if (parentBlacklistCmds.length > 0) {
-						tx.insert(narratorBlacklistCmds)
-							.values(
-								parentBlacklistCmds.map((cmd) => ({
-									id: generateId(),
-									narratorId: id,
-									pattern: cmd.pattern,
-									denyPrompt: cmd.denyPrompt,
-									enabled: cmd.enabled,
-									targetKind: cmd.targetKind,
-									targetValue: cmd.targetValue,
-									deviceScope: cmd.deviceScope,
-									createdAt: now,
-								})),
-							)
-							.run();
-					}
+					copyForkAccessAndRules(tx, parentNarratorId, id);
 
 					const finalNarrator = tx.query.narrators
 						.findFirst({ where: eq(narrators.id, id) })
@@ -2805,53 +2843,13 @@ export const narratorService = {
 			}
 
 			if (mode === "fresh") {
-				const newNarrator = await this.create({
-					chapterId: null,
-					model: opts?.model ?? parent.model ?? undefined,
-					systemPrompt: parent.systemPrompt ?? undefined,
-					permissionMode: parent.permissionMode ?? undefined,
-					cwd: parent.cwd ?? undefined,
-					reasoningEffort: parent.reasoningEffort as
-						| "none"
-						| "low"
-						| "medium"
-						| "high"
-						| "xhigh"
-						| null
-						| undefined,
-					fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
-					relaxedPlan: parent.relaxedPlan ?? undefined,
-					planReflectionAutoApproveOverride: normalizeBooleanOverride(
-						parent.planReflectionAutoApproveOverride,
-					),
-					dangerReflectionOverride: normalizeDangerReflectionOverride(
-						parent.dangerReflectionOverride,
-					),
-					autoContinuationOverride: normalizeAutoContinuationOverride(
-						parent.autoContinuationOverride,
-					),
-					behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
-					behaviorFenceAttachOverride: normalizeBooleanOverride(parent.behaviorFenceAttachOverride),
-					title: opts?.title ?? undefined,
-					// A tool-initiated fork belongs to whoever owns the session that spawned
-					// it — the model has no identity of its own to attribute it to. Both
-					// audiences come along so the fork is never reachable more widely than
-					// the session it came from.
-					ownerUserId: parent.ownerUserId,
-					visibility: parent.visibility,
-					writeAudience: parent.writeAudience,
+				return this.forkNarrator(parentNarratorId, null, {
+					title: opts?.title,
+					model: opts?.model,
+					inheritMode: "fresh",
+					userId: opts?.userId,
+					locale: opts?.locale,
 				});
-				eventBus.emit({
-					type: "narrator:forked",
-					narratorId: newNarrator.id,
-					parentNarratorId,
-				});
-				broadcastToNarrator(parentNarratorId, {
-					type: "narrator_forked",
-					narratorId: newNarrator.id,
-					parentNarratorId,
-				});
-				return newNarrator;
 			}
 
 			const latestMsgUuid = await this.getLatestMessageUuid(parentNarratorId);

@@ -211,6 +211,7 @@ import {
 	markPendingStopTakeover,
 } from "../subagent-takeover";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
+import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
 import { resolveEffectiveTraits } from "../trait-layer-service";
 import { buildTreeSnapshotExecutionHooks, FILE_MUTATING_TOOLS } from "../tree-snapshot-loop-hooks";
 import {
@@ -548,6 +549,13 @@ export async function runAgentLoopUnlocked(
 			// Rebuild system prompt each iteration so AGENTS.md/CLAUDE.md changes are picked up.
 			const modelVersionBeforeLoad = active._modelRefreshVersion;
 			const freshNarrator = await narratorService.getById(narratorId);
+			if (profile.kind === "primary" || active._workspaceContext) {
+				if (active._workspaceInstallFailed)
+					throw new Error("Workspace context installation requires session recovery");
+				const { workspaceContextService } = await import("../workspace-context-service");
+				active._workspaceContext = await workspaceContextService.get(narratorId);
+				active._workspacePassInvalidated = false;
+			}
 			const oauthRuntime = await assertOAuthNarratorRuntimeActive(
 				narratorId,
 				active._currentUserId,
@@ -1124,6 +1132,7 @@ export async function runAgentLoopUnlocked(
 			const availableDevices = turnSessionDevices;
 
 			let toolCallLimitExceeded = false;
+			const passWorkspaceContext = active._workspaceContext;
 			const config: import("../../lib/agent").AgentConfig = {
 				runtimePolicy,
 				narratorId,
@@ -1131,6 +1140,29 @@ export async function runAgentLoopUnlocked(
 				model: resolved.model,
 				provider: resolved.provider,
 				cwd: active.cwd,
+				workspaceContext: passWorkspaceContext,
+				assertWorkspaceCurrent: passWorkspaceContext
+					? () => {
+							if (
+								active._workspaceInstallFailed ||
+								active._workspacePassInvalidated ||
+								active._workspaceContext?.revision !== passWorkspaceContext.revision ||
+								active._workspaceContext?.contextKey !== passWorkspaceContext.contextKey
+							)
+								throw new Error("Workspace changed; this old pass cannot start more tools");
+						}
+					: undefined,
+				switchWorkingDirectory:
+					profile.kind === "primary" && !oauthRuntime
+						? async (request) => {
+								const { workspaceContextService } = await import("../workspace-context-service");
+								return workspaceContextService.switch(narratorId, request, {
+									origin: "agent",
+									active,
+									userId: active._currentUserId,
+								});
+							}
+						: undefined,
 				systemPrompt: active.systemPrompt ?? undefined,
 				locale,
 				signal: active.abortController.signal,
@@ -1181,9 +1213,8 @@ export async function runAgentLoopUnlocked(
 				skillScopeKey: active._skillScopeKey ?? undefined,
 				userId: active._currentUserId ?? null,
 				projectId: oauthRuntime?.projectId ?? active._projectId ?? null,
-				get defaultDeviceId() {
-					return active._defaultDeviceId ?? null;
-				},
+				// A pass owns its device identity; selection changes only affect the next pass.
+				defaultDeviceId: active._defaultDeviceId ?? null,
 				availableDevices,
 				setDefaultDevice: oauthRuntime
 					? async (deviceId) => {
@@ -1234,6 +1265,13 @@ export async function runAgentLoopUnlocked(
 				disabledTools: active._disabledTools,
 				allowedTools: oauthRuntime ? new Set(oauthRuntime.allowedTools) : undefined,
 				allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
+				onToolExecutionFinalAuthorization: buildFinalToolStartAuthorization({
+					narratorId,
+					cwd: active.cwd,
+					signal: active.abortController.signal,
+					userId: active._currentUserId,
+					reviewReadOnlyBash: profile.kind === "subagent" && profile.subagentType === "review",
+				}),
 				runtimeAuthorizationGuard: oauthRuntime
 					? async () => {
 							await assertOAuthNarratorRuntimeActive(narratorId, active._currentUserId);
@@ -1425,6 +1463,7 @@ export async function runAgentLoopUnlocked(
 					);
 				},
 				shouldStop: () => {
+					if (active._workspacePassInvalidated || active._workspaceInstallFailed) return true;
 					if (profile.kind === "subagent" && shouldStopSubagentForBufferedMessageSync(narratorId)) {
 						active._bufferSoftStopTaken = true;
 						return true;
@@ -1739,6 +1778,18 @@ export async function runAgentLoopUnlocked(
 				hooks,
 			});
 			runState.lastPass = result;
+			if (
+				active._workspacePassInvalidated &&
+				!active._workspaceInstallFailed &&
+				!active.abortController.signal.aborted
+			) {
+				// Rebuild config, permissions, skills, prompt and file-reference lanes together.
+				active._workspacePassInvalidated = false;
+				runState.input.text =
+					"Working directory changed. Continue using the newly installed workspace context; unstarted calls from the previous pass were not executed.";
+				runState.input.images = undefined;
+				continue;
+			}
 			if (toolCallLimitExceeded) {
 				// Stop before any retry, review/task continuation or buffered-message replay.
 				// A new explicit user turn can still start normally; no persistent latch.

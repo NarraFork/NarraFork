@@ -1,5 +1,7 @@
 {
 	"title": "设置",
+	"permissionRuleAutoApprove": "自动审批权限规则申请",
+	"permissionRuleAutoApproveDesc": "仅管理员可开启，默认关闭。开启且叙述者处于「全部允许」模式时，申请仍强制独立的严格反思，不受普通危险反思级别影响；否则须人工批准。不会绕过继承的拒绝规则或能力上限。",
 	"workspaceMaintenanceExplanation": "该旧所有者没有可核验的进程身份。维护将保留整个工作区五分钟且不可续期。请先停止旧实例和所有可能存活的外部写入进程。管理员声明不等于执行已结束的证明；当前文件观测也不能还原历史执行成功与否。",
 	"workspaceMaintenanceWritersStopped": "我已停止全部旧实例以及可能存活的外部写入进程。",
 	"workspaceMaintenanceReason": "维护原因与已完成的检查",
@@ -654,7 +656,7 @@
 	"modelsSection": "模型",
 	"providerAgentModeUnsupportedTitle": "部分供应商无法运行代理会话",
 	"providerAgentModeUnsupportedDesc": "当前后端声明以下供应商不可用于 agent mode：{{providers}}。这些模型会从代理模型选择器中隐藏，但仍会保留在供应商设置中。",
-	"chaptersAndContainersSection": "章节与容器",
+	"chaptersAndContainersSection": "worktree、快照与已有容器",
 	"chapterSplitUnsupported": "当前后端运行时不支持章节拆分。",
 	"chapterContainersUnsupportedTitle": "容器设置不可用",
 	"chapterContainersUnsupported": "当前后端运行时不支持容器设置。",

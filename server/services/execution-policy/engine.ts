@@ -25,6 +25,7 @@ export interface ResolvedExecutionPolicy extends CompiledExecutionPolicy {
 interface LoadedCacheEntry {
 	narratorId: string;
 	ownerNarratorId?: string;
+	inheritedNarratorIds?: string[];
 	settingsRevision: number;
 	promise: Promise<LoadedExecutionPolicy>;
 }
@@ -32,6 +33,7 @@ interface LoadedCacheEntry {
 interface CompiledCacheEntry {
 	narratorId: string;
 	ownerNarratorId?: string;
+	inheritedNarratorIds?: string[];
 	settingsRevision: number;
 	promise: Promise<ResolvedExecutionPolicy>;
 	controller: AbortController;
@@ -95,6 +97,7 @@ export function executionPolicyRevision(policy: LoadedExecutionPolicy): string {
 				commandWhitelist: policy.commandWhitelist,
 				commandBlacklist: policy.commandBlacklist,
 				ownerNarratorId: policy.ownerNarratorId,
+				inheritedNarratorIds: policy.inheritedNarratorIds,
 				projectId: policy.projectId,
 				projectGitPath: policy.projectGitPath,
 				settingsRevision: policy.settingsRevision,
@@ -170,6 +173,7 @@ export class ExecutionPolicyEngine {
 		entry.promise = executionPolicyRepository.load(narratorId).then(
 			(policy) => {
 				entry.ownerNarratorId = policy.ownerNarratorId;
+				entry.inheritedNarratorIds = policy.inheritedNarratorIds;
 				return policy;
 			},
 			(error) => {
@@ -210,6 +214,7 @@ export class ExecutionPolicyEngine {
 		const entry: CompiledCacheEntry = {
 			narratorId,
 			ownerNarratorId: loaded.ownerNarratorId,
+			inheritedNarratorIds: loaded.inheritedNarratorIds,
 			settingsRevision,
 			promise: Promise.resolve(undefined as never),
 			controller: new AbortController(),
@@ -259,16 +264,15 @@ export class ExecutionPolicyEngine {
 
 	/** Invalidate a narrator and every cached subagent whose rules are owned by it. */
 	invalidate(narratorId: string): void {
-		for (const [key, entry] of this.loadedCache) {
-			if (entry.narratorId === narratorId || entry.ownerNarratorId === narratorId) {
-				this.loadedCache.delete(key);
-			}
-		}
-		for (const [key, entry] of this.compiledCache) {
-			if (entry.narratorId === narratorId || entry.ownerNarratorId === narratorId) {
-				this.compiledCache.delete(key);
-			}
-		}
+		// Pending loads do not yet know their ancestors: conservatively evict them.
+		const affected = (entry: LoadedCacheEntry | CompiledCacheEntry) =>
+			!entry.ownerNarratorId ||
+			entry.narratorId === narratorId ||
+			entry.ownerNarratorId === narratorId ||
+			entry.inheritedNarratorIds?.includes(narratorId);
+		for (const [key, entry] of this.loadedCache) if (affected(entry)) this.loadedCache.delete(key);
+		for (const [key, entry] of this.compiledCache)
+			if (affected(entry)) this.compiledCache.delete(key);
 	}
 
 	clear(): void {

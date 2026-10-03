@@ -139,6 +139,26 @@ function annotateSettings(
 // Tool definition
 // ---------------------------------------------------------------------------
 
+export function isPermissionRuleAutoApproveMutation(
+	action: string,
+	path?: string,
+	value?: Record<string, unknown>,
+): boolean {
+	if (action === "reset_setting") {
+		return !path || path === "agent" || path === "agent.permissionRuleAutoApprove";
+	}
+	if (action !== "update_settings" || !value) return false;
+	if (Object.hasOwn(value, "agent.permissionRuleAutoApprove")) return true;
+	if (!Object.hasOwn(value, "agent")) return false;
+	const agent = value.agent;
+	return (
+		!agent ||
+		typeof agent !== "object" ||
+		Array.isArray(agent) ||
+		Object.hasOwn(agent, "permissionRuleAutoApprove")
+	);
+}
+
 export const narraforkAdminTool: ToolDefinition = {
 	name: "NarraForkAdmin",
 	description:
@@ -173,6 +193,15 @@ export const narraforkAdminTool: ToolDefinition = {
 			value?: Record<string, unknown>;
 		};
 
+		// Application authorization guard, not an OS sandbox. Only the authenticated
+		// administrator settings route can change this opt-in, never an agent tool.
+		if (isPermissionRuleAutoApproveMutation(action, path, value)) {
+			return {
+				output:
+					"permissionRuleAutoApprove can only be changed by a human administrator in settings.",
+				isError: true,
+			};
+		}
 		const settingsMod = await getSettingsModule();
 
 		switch (action) {

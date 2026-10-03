@@ -32,6 +32,7 @@ import { DiffView } from "../diff/DiffView";
 import { MESSAGE_SELECTION_IGNORE_ATTR } from "../message/MessageSelectionCtx";
 import { AskUserQuestionBanner, coerceQuestions } from "../question/AskUserQuestionBanner";
 import { FileModDrawerCtx, PermEnterHintCtx } from "../tool-call/tool-call-contexts";
+import { PermissionRuleRequestDetails } from "./PermissionRuleRequestDetails";
 
 const noop = () => {};
 
@@ -423,51 +424,56 @@ export function InlinePermission({
 			    its routed "target" is just the plan file the platform already read.
 			    Showing device/cwd/lexical/canonical paths there is noise, and the
 			    block's variable height fought the plan card's measured geometry. */}
-			{permissionTargetDeviceId && !isExitPlan && (
-				<Paper withBorder p="xs" mb="xs" radius="sm">
-					<Group gap="xs" mb={permissionTargetCwd || permissionLexicalPath ? 4 : 0} wrap="wrap">
-						<Text size="xs" fw={600}>
-							{t("executionTarget")}
-						</Text>
-						<Badge
-							size="xs"
-							variant="light"
-							color={permissionTargetDeviceId === "local" ? "gray" : "indigo"}
-						>
-							{permissionTargetDeviceId === "local"
-								? t("executionTargetLocal")
-								: permissionTargetDeviceId}
-						</Badge>
-						{permissionTarget?.pathFlavor && (
-							<Badge size="xs" variant="outline" color="blue">
-								{t("executionTargetPathFlavor", { flavor: permissionTarget.pathFlavor })}
-							</Badge>
-						)}
-						{permissionTarget?.runtimeGeneration != null && (
-							<Badge size="xs" variant="outline" color="grape">
-								{t("executionTargetRuntimeGeneration", {
-									generation: permissionTarget.runtimeGeneration,
-								})}
-							</Badge>
-						)}
-					</Group>
-					{permissionTargetCwd && (
-						<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
-							{t("executionTargetCwd", { cwd: permissionTargetCwd })}
-						</Text>
-					)}
-					{permissionLexicalPath && (
-						<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
-							{t("executionTargetLexicalPath", { path: permissionLexicalPath })}
-						</Text>
-					)}
-					{permissionTarget?.canonicalPath && (
-						<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
-							{t("executionTargetCanonicalPath", { path: permissionTarget.canonicalPath })}
-						</Text>
-					)}
-				</Paper>
+			{permission.toolName === "RequestPermissionRule" && (
+				<PermissionRuleRequestDetails permission={permission} />
 			)}
+			{permissionTargetDeviceId &&
+				!isExitPlan &&
+				permission.toolName !== "RequestPermissionRule" && (
+					<Paper withBorder p="xs" mb="xs" radius="sm">
+						<Group gap="xs" mb={permissionTargetCwd || permissionLexicalPath ? 4 : 0} wrap="wrap">
+							<Text size="xs" fw={600}>
+								{t("executionTarget")}
+							</Text>
+							<Badge
+								size="xs"
+								variant="light"
+								color={permissionTargetDeviceId === "local" ? "gray" : "indigo"}
+							>
+								{permissionTargetDeviceId === "local"
+									? t("executionTargetLocal")
+									: permissionTargetDeviceId}
+							</Badge>
+							{permissionTarget?.pathFlavor && (
+								<Badge size="xs" variant="outline" color="blue">
+									{t("executionTargetPathFlavor", { flavor: permissionTarget.pathFlavor })}
+								</Badge>
+							)}
+							{permissionTarget?.runtimeGeneration != null && (
+								<Badge size="xs" variant="outline" color="grape">
+									{t("executionTargetRuntimeGeneration", {
+										generation: permissionTarget.runtimeGeneration,
+									})}
+								</Badge>
+							)}
+						</Group>
+						{permissionTargetCwd && (
+							<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+								{t("executionTargetCwd", { cwd: permissionTargetCwd })}
+							</Text>
+						)}
+						{permissionLexicalPath && (
+							<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+								{t("executionTargetLexicalPath", { path: permissionLexicalPath })}
+							</Text>
+						)}
+						{permissionTarget?.canonicalPath && (
+							<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+								{t("executionTargetCanonicalPath", { path: permissionTarget.canonicalPath })}
+							</Text>
+						)}
+					</Paper>
+				)}
 			{permission.toolName === "StructSed" && <StructSedChangePreview permission={permission} />}
 			{planEdited && !editing && (
 				<Badge size="xs" color="indigo" variant="light" mb={4}>
@@ -521,7 +527,11 @@ export function InlinePermission({
 						const btns: PermButton[] = [];
 						if (!editing) {
 							btns.push({
-								label: isExitPlan ? t("planExecute") : tc("allow"),
+								label: isExitPlan
+									? t("planExecute")
+									: permission.toolName === "RequestPermissionRule"
+										? t("permissionRuleRequest.approve")
+										: tc("allow"),
 								color: "green",
 								onClick: () => handleAllow(),
 							});
@@ -558,7 +568,12 @@ export function InlinePermission({
 						}
 						if (!editing) {
 							btns.push({
-								label: isExitPlan && feedback.trim() ? t("planRevise") : tc("deny"),
+								label:
+									isExitPlan && feedback.trim()
+										? t("planRevise")
+										: permission.toolName === "RequestPermissionRule"
+											? t("permissionRuleRequest.deny")
+											: tc("deny"),
 								color: "red",
 								variant: "light",
 								onClick: () => {

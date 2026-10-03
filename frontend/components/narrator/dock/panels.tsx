@@ -1122,9 +1122,13 @@ export function FileTreeDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 			// Routed through the dock's existing multi-instance file viewer rather than a
 			// viewer of our own: re-opening the same path must focus the panel that is
 			// already showing it, and that dedup lives in `openFilePanel`.
-			openFilePanel?.(absolutePath, fileName, { sourcePanelId: props.api.id });
+			openFilePanel?.(absolutePath, fileName, {
+				sourcePanelId: props.api.id,
+				fileNarratorId: narratorId,
+				deviceId: "local",
+			});
 		},
-		[openFilePanel, props.api.id],
+		[openFilePanel, props.api.id, narratorId],
 	);
 
 	return (

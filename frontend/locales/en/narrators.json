@@ -1,11 +1,16 @@
 {
+	"legacyRoute": {
+		"denied": "You do not have access to this session.",
+		"missing": "This session no longer exists.",
+		"error": "Could not load this session. Please try again later."
+	},
 	"title": "Narrators",
 	"newNarrator": "New Narrator",
 	"noNarrators": "No narrators found. Create one to start a conversation.",
 	"narratorId": "Narrator {{id}}",
 	"narratorMeta": "{{model}} · {{count}} messages",
-	"newNarratorModal": "New Standalone Narrator",
-	"newNarratorDescription": "Create a standalone AI narrator not bound to any chapter. Useful for general questions and explorations.",
+	"newNarratorModal": "New Session",
+	"newNarratorDescription": "Start a conversation directly. A project is not required; choose a working directory if needed.",
 	"createNarrator": "Create Narrator",
 	"narratorNotFound": "Narrator not found",
 	"workingDirectory": "Working Directory",

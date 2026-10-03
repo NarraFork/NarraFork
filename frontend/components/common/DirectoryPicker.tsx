@@ -65,6 +65,9 @@ const MAX_DIRECTORY_ENTRIES = 1_000;
 const FS_SHORTCUTS_QUERY_GC_TIME_MS = 60_000;
 
 interface DirectoryPickerProps {
+	/** Select parent + an uncreated leaf; never mkdir or return an existing directory. */
+	mode?: "existing" | "newTarget";
+	newTargetError?: string;
 	value: string;
 	onChange: (path: string) => void;
 	label?: string;
@@ -80,6 +83,8 @@ interface DirectoryPickerProps {
 }
 
 export function DirectoryPicker({
+	mode = "existing",
+	newTargetError,
 	value,
 	onChange,
 	label,
@@ -102,7 +107,12 @@ export function DirectoryPicker({
 
 	const handleOpen = () => {
 		if (!browseSupported) return;
-		setBrowsePath(value || undefined);
+		if (mode === "newTarget" && value) {
+			const parent = value.replace(/[/\\][^/\\]+$/, "");
+			setBrowsePath(
+				/^[a-z]:$/i.test(parent) ? `${parent}${value.includes("\\") ? "\\" : "/"}` : parent || "/",
+			);
+		} else setBrowsePath(value || undefined);
 		open();
 	};
 
@@ -160,6 +170,8 @@ export function DirectoryPicker({
 				styles={DIRECTORY_BROWSER_MODAL_STYLES}
 			>
 				<DirectoryBrowser
+					mode={mode}
+					newTargetError={newTargetError}
 					initialPath={browsePath}
 					onSelect={handleSelect}
 					onCancel={close}
@@ -258,6 +270,8 @@ function SortableFavoriteNav({
 // ── Directory Browser (modal content) ────────────────────────────────────────
 
 interface DirectoryBrowserProps {
+	mode?: "existing" | "newTarget";
+	newTargetError?: string;
 	initialPath?: string;
 	onSelect: (path: string) => void;
 	onCancel: () => void;
@@ -265,6 +279,8 @@ interface DirectoryBrowserProps {
 }
 
 export function DirectoryBrowser({
+	mode = "existing",
+	newTargetError,
 	initialPath,
 	onSelect,
 	onCancel,
@@ -281,7 +297,7 @@ export function DirectoryBrowser({
 	const browseSupported = fsCapability.browse.supported;
 	const browseUnavailableReason = fsCapability.browse.reason ?? t("fileSystemBrowseUnavailable");
 	const shortcutsSupported = fsCapability.shortcuts.supported;
-	const mkdirSupported = fsCapability.mkdir.supported;
+	const mkdirSupported = mode !== "newTarget" && fsCapability.mkdir.supported;
 	const mkdirUnsupportedReason = fsCapability.mkdir.reason ?? t("fileSystemMkdirUnavailable");
 
 	// Editable path bar state
@@ -334,13 +350,37 @@ export function DirectoryBrowser({
 	}, []);
 
 	const { data, isLoading, error } = useQuery({
-		queryKey: ["fs-browse", currentPath, showHidden],
-		queryFn: () => api.fsBrowse(currentPath, { showHidden }),
+		queryKey: ["fs-browse", currentPath, showHidden, mode],
+		queryFn: () =>
+			api.fsBrowse(currentPath, {
+				showHidden: mode === "newTarget" || showHidden,
+				includeFiles: mode === "newTarget",
+			}),
 		enabled: browseSupported,
 		gcTime: 30_000,
 	});
-	const displayedEntries = data?.entries.slice(0, MAX_DIRECTORY_ENTRIES) ?? [];
-	const hiddenEntryCount = Math.max(0, (data?.entries.length ?? 0) - displayedEntries.length);
+	const directoryEntries = data?.entries.filter((entry) => entry.isDirectory !== false) ?? [];
+	const displayedEntries = directoryEntries.slice(0, MAX_DIRECTORY_ENTRIES);
+	const hiddenEntryCount = Math.max(0, directoryEntries.length - displayedEntries.length);
+	const leaf = newFolderName.trim();
+	const windowsPath =
+		/^[a-z]:[/\\]/i.test(data?.path ?? "") || (data?.path ?? "").startsWith("\\\\");
+	const validLeaf =
+		!!leaf &&
+		leaf !== "." &&
+		leaf !== ".." &&
+		!/[/\\]/.test(leaf) &&
+		Array.from(leaf).every((character) => character.charCodeAt(0) >= 32) &&
+		(!windowsPath ||
+			(!/[<>:"|?*]|[. ]$/.test(leaf) &&
+				!/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(leaf)));
+	const existingLeaf = data?.entries.some((entry) =>
+		windowsPath ? entry.name.toLowerCase() === leaf.toLowerCase() : entry.name === leaf,
+	);
+	const targetPath =
+		validLeaf && !existingLeaf && data?.path && data.entries.length < MAX_DIRECTORY_ENTRIES
+			? `${data.path.replace(/[/\\]+$/, "")}${windowsPath ? "\\" : "/"}${leaf}`
+			: undefined;
 
 	const isFavorited = favorites.some((f) => f.path === (data?.path ?? ""));
 
@@ -459,9 +499,10 @@ export function DirectoryBrowser({
 
 	const handleEntryDoubleClick = useCallback(
 		(entryPath: string) => {
-			onSelect(entryPath);
+			if (mode === "newTarget") navigateTo(entryPath);
+			else onSelect(entryPath);
 		},
-		[onSelect],
+		[onSelect, mode, navigateTo],
 	);
 
 	return (
@@ -824,10 +865,27 @@ export function DirectoryBrowser({
 					<Button variant="default" size="sm" onClick={onCancel}>
 						{t("cancel")}
 					</Button>
+					{mode === "newTarget" && (
+						<TextInput
+							aria-label={t("newFolderPlaceholder")}
+							placeholder={t("newFolderPlaceholder")}
+							value={newFolderName}
+							maxLength={255}
+							onChange={(event) => setNewFolderName(event.currentTarget.value)}
+							error={
+								leaf && !targetPath
+									? (newTargetError ?? t("fileSystemMkdirUnavailable"))
+									: undefined
+							}
+						/>
+					)}
 					<Button
 						size="sm"
-						onClick={() => data?.path && onSelect(data.path)}
-						disabled={!data?.path}
+						onClick={() => {
+							const path = mode === "newTarget" ? targetPath : data?.path;
+							if (path) onSelect(path);
+						}}
+						disabled={mode === "newTarget" ? !targetPath : !data?.path}
 					>
 						{t("selectThisDirectory")}
 					</Button>

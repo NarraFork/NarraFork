@@ -24,6 +24,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { isInsidePath } from "../lib/platform-path";
+import { resolveNarratorProjectId } from "./narrator-project";
 
 export type SkillSource = "global" | "project" | "workspace";
 
@@ -966,28 +967,28 @@ export async function loadSkillByNameForContext(
 export async function resolveSkillContextForNarrator(narratorId: string): Promise<SkillContext> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true, cwd: true },
+		columns: { chapterId: true, contextProjectId: true, cwd: true },
 	});
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 
-	if (!narrator.chapterId) {
-		return { projectGitPath: null, cwd: narrator.cwd || homedir() };
-	}
-
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, narrator.chapterId),
-		columns: { projectId: true, worktreePath: true },
-	});
-	if (!chapter) return { projectGitPath: null, cwd: narrator.cwd || homedir() };
-
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, chapter.projectId),
-		columns: { gitPath: true },
-	});
+	// Use the same explicit project resolution as ACL/traits; cwd never implies membership.
+	const projectId = await resolveNarratorProjectId(narrator);
+	const chapter = narrator.chapterId
+		? await db.query.chapters.findFirst({
+				where: eq(chapters.id, narrator.chapterId),
+				columns: { worktreePath: true },
+			})
+		: null;
+	const project = projectId
+		? await db.query.projects.findFirst({
+				where: eq(projects.id, projectId),
+				columns: { gitPath: true },
+			})
+		: null;
 	const projectGitPath = project?.gitPath ?? null;
 	return {
 		projectGitPath,
-		cwd: narrator.cwd || chapter.worktreePath || projectGitPath || homedir(),
+		cwd: narrator.cwd || chapter?.worktreePath || projectGitPath || homedir(),
 	};
 }
 

@@ -17,6 +17,7 @@ import {
 	useStatusBarProps,
 } from "./interaction/use-status-bar-props";
 import { useNarratorPanelCompact } from "./panels/compact-context";
+import { PermissionRuleResultNotice } from "./permission/PermissionRuleResultNotice";
 
 /**
  * Context shared by several of the interaction area's sub-regions (status bar,
@@ -92,6 +93,8 @@ export interface NarratorInteractionAreaProps {
 
 export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 	const { t } = useTranslation("narrator");
+	const retainWorktreeRequirement = (text: string) =>
+		props.composerRowProps.composerRef.current?.appendText(text);
 	const bottomSpacing = useBottomSpacing();
 	// Assemble the status-bar props here (computing the model/reasoning/codex/
 	// permission control sub-objects via the control hooks) instead of in the panel.
@@ -175,7 +178,12 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 
 			{/* Chapter bar — clicking the info strip opens the Git view. */}
 			{props.chapterId && (
-				<ChapterBar chapterId={props.chapterId} onOpenGitPanel={props.onOpenGitPanel} />
+				<ChapterBar
+					chapterId={props.chapterId}
+					narratorId={props.common.narratorId}
+					onOpenGitPanel={props.onOpenGitPanel}
+					onRequirement={retainWorktreeRequirement}
+				/>
 			)}
 
 			{/* Standalone narrators have no chapter bar; offer the git workspace strip instead. */}
@@ -184,10 +192,18 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 					<NarratorGitBar
 						narratorId={props.common.narratorId}
 						onOpenGitPanel={props.onOpenGitPanel}
+						onRequirement={retainWorktreeRequirement}
 					/>
 				</Box>
 			)}
 
+			{/* Policy activation is shown only after a successful execution receipt. */}
+			{!props.common.isWorkspacePreview && (
+				<PermissionRuleResultNotice
+					key={props.common.narratorId}
+					narratorId={props.common.narratorId}
+				/>
+			)}
 			{/* Status bar */}
 			<NarratorInteractionStatusBar
 				{...statusBar}

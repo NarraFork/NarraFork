@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { resolve } from "node:path";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import {
 	type FileReference,
@@ -129,7 +129,7 @@ import {
 import { isPermissionMode, PERMISSION_MODES } from "../lib/permission-modes";
 import { buildPlanFileRelPath } from "../lib/plan-file-path";
 import { getHome } from "../lib/platform";
-import { isInsidePath } from "../lib/platform-path";
+import { requireProjectAccess } from "../lib/project-access";
 import {
 	buildSetupAssistantSystemPrompt,
 	formatDependencyBriefing,
@@ -198,7 +198,6 @@ import {
 	updateBlacklistCmdSchema,
 	updateBlacklistDirSchema,
 	updateBufferedMessageSchema,
-	updateNarratorCwdSchema,
 	updateNarratorDraftSchema,
 	updateNarratorHandleSchema,
 	updateNarratorModelSchema,
@@ -373,7 +372,6 @@ import {
 	toBufferSummary,
 	updateActiveBlockedSkills,
 	updateActiveDisabledTools,
-	updateActiveNarratorCwdAndSkillContext,
 	updateBufferedMessage,
 	updateNarratorModel,
 	updateNarratorPermissionMode,
@@ -447,6 +445,7 @@ import {
 } from "../services/tool-input-stream-source";
 import { usageHistoryService } from "../services/usage-history-service";
 import { syncNarratorDraftToRecentTabs } from "../services/user-preferences-service";
+import { assertWorkspaceHistoryRevertSupported } from "../services/workspace-context-service";
 import {
 	broadcastToNarrator,
 	broadcastToUser,
@@ -454,6 +453,7 @@ import {
 	getNarratorPresenceBatch,
 } from "../websocket/narrator-ws";
 import { fileReferenceRoutes } from "./narrator-file-references";
+import { narratorWorkspaceContextRoutes } from "./narrator-workspace-context";
 
 function parseNewCommand(message: string): { rawCommand: string; initialMessage: string } | null {
 	const match = message.trim().match(/^\/new(?:\s+([\s\S]*))?$/);
@@ -702,6 +702,13 @@ narratorRoutes.use("/:id/*", async (c, next) => {
 			? ("read" as const)
 			: ("write" as const);
 	await requireNarratorAccess(c, id, need);
+	// M0 intentionally has no reinterpretation of historical tree hashes in a new directory.
+	// Refuse before any mutation/interrupt; frozen file references remain readable.
+	if (
+		need === "write" &&
+		/^(?:rollback\/|revert(?:$|[-/])|unrevert$|resume(?:$|\/)|messages\/)/.test(subPath)
+	)
+		await assertWorkspaceHistoryRevertSupported(id);
 	// Apply owns its exclusive admission through whenSettled; wrapping it in shared
 	// work would deadlock it. Preview remains a shared read/selection operation and
 	// must not interrupt an active narrator before confirmation.
@@ -850,8 +857,13 @@ narratorRoutes.get("/", async (c) => {
 	const userId = c.get("user").sub;
 	const chapterId = c.req.query("chapterId");
 	const standalone = c.req.query("standalone");
+	const projectId = c.req.query("projectId")?.trim();
+	if (projectId !== undefined) {
+		if (!projectId || projectId.length > 128) throw new ValidationError("Invalid projectId");
+		await requireProjectAccess(c, projectId, "read");
+	}
 
-	if (standalone === "true" || standalone === "all") {
+	if (standalone === "true" || standalone === "all" || projectId) {
 		// Paginated session list
 		// standalone=true: only standalone (chapterId IS NULL)
 		// standalone=all: all sessions (standalone + chapter-bound)
@@ -896,6 +908,19 @@ narratorRoutes.get("/", async (c) => {
 			conditions.push(isNotNull(narrators.chapterId));
 		}
 		// standalone=all with no filter: show all
+		if (projectId) {
+			conditions.push(
+				or(
+					and(isNull(narrators.chapterId), eq(narrators.contextProjectId, projectId)),
+					exists(
+						db
+							.select({ id: chapters.id })
+							.from(chapters)
+							.where(and(eq(chapters.id, narrators.chapterId), eq(chapters.projectId, projectId))),
+					),
+				),
+			);
+		}
 
 		// Filter: has active terminals
 		if (hasTerminals) {
@@ -4549,7 +4574,12 @@ narratorRoutes.patch("/:id/default-device", async (c) => {
 	if (value !== null && value !== undefined && typeof value !== "string") {
 		throw new ValidationError("deviceId must be a string or null");
 	}
-	return c.json(await setNarratorDefaultDevice(c.req.param("id"), value ?? null));
+	return c.json(
+		await setNarratorDefaultDevice(c.req.param("id"), value ?? null, {
+			origin: "http",
+			userId: c.get("user").sub,
+		}),
+	);
 });
 
 // Update model
@@ -4965,72 +4995,12 @@ narratorRoutes.patch("/:id/handle", async (c) => {
 	return c.json(publicNarratorResponse(updated));
 });
 
-// Update narrator working directory
-narratorRoutes.patch("/:id/cwd", async (c) => {
-	const id = c.req.param("id");
-	const parsed = updateNarratorCwdSchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
-
-	let cwd = parsed.data.cwd.trim();
-	if (!isAbsolute(cwd)) {
-		throw new ValidationError("cwd must be an absolute path");
-	}
-
-	const narrator = await narratorService.getById(id);
-	const chapter = narrator.chapterId
-		? await db.query.chapters.findFirst({
-				where: eq(chapters.id, narrator.chapterId),
-				columns: { worktreePath: true },
-			})
-		: null;
-	if (narrator.chapterId && !chapter?.worktreePath) {
-		throw new ValidationError("The current chapter has no active worktree");
-	}
-
-	// Validate path exists/access and resolve symlinks before enforcing the
-	// chapter worktree boundary.
-	let canonicalCwd: string;
-	try {
-		const { access, constants, realpath } = await import("node:fs/promises");
-		await access(cwd, constants.R_OK | constants.X_OK);
-		canonicalCwd = await realpath(cwd);
-		if (chapter?.worktreePath) {
-			const canonicalWorktree = await realpath(chapter.worktreePath);
-			if (!isInsidePath(canonicalWorktree, canonicalCwd)) {
-				throw new ValidationError("cwd must be inside the current chapter worktree");
-			}
-		}
-	} catch (error) {
-		if (error instanceof ValidationError) throw error;
-		const message =
-			error instanceof Error
-				? error.message
-				: "Working directory does not exist or is not accessible";
-		throw new ValidationError(message);
-	}
-	cwd = canonicalCwd;
-
-	const previousCwd = narrator.cwd?.trim() || null;
-	if (previousCwd === cwd) {
-		return c.json({ ok: true, cwd, changed: false });
-	}
-
-	await narratorService.updateCwd(id, cwd);
-	await updateActiveNarratorCwdAndSkillContext(id, cwd);
-
-	const userId = c.get("user").sub;
-	const locale = await getUserLanguage(userId);
-	const reminder =
-		locale === "zh-CN"
-			? previousCwd
-				? `工作目录已更新：${previousCwd} → ${cwd}`
-				: `工作目录已设置为：${cwd}`
-			: previousCwd
-				? `Working directory updated: ${previousCwd} → ${cwd}`
-				: `Working directory set to: ${cwd}`;
-	await narratorService.persistDisplayMessage(id, reminder);
-
-	return c.json({ ok: true, cwd, changed: true });
+narratorRoutes.route("/", narratorWorkspaceContextRoutes);
+narratorRoutes.get("/:id/permission-rule-requests", async (c) => {
+	const { listPermissionRuleRequests } = await import(
+		"../services/permission-rule-request-service"
+	);
+	return c.json(await listPermissionRuleRequests(c.req.param("id"), c.req.query()));
 });
 
 // Regenerate narrator title via AI

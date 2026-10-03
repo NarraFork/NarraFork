@@ -1,11 +1,21 @@
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { isParentSelector } from "@shared/communication-tool";
 import type { ProgressSnapshot } from "@shared/progress-phase";
-import { and, eq } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db";
-import { narratorMessages, narrators, narratorToolCalls, remoteDevices } from "../db/schema";
+import {
+	integrationAuthorities,
+	integrationCapabilityGrants,
+	integrationResourceBindings,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	oauthClients,
+	remoteDevices,
+} from "../db/schema";
 import type {
 	DangerInfo,
 	DangerSeverity,
@@ -48,16 +58,26 @@ import {
 } from "../lib/agent/tools/plan-mode";
 import { isScheduledTaskReadAction } from "../lib/agent/tools/scheduled-task-actions";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
-import type { ToolExecutionTarget } from "../lib/agent/types";
+import type {
+	ToolCallBinding,
+	ToolExecutionOperation,
+	ToolExecutionPlan,
+	ToolExecutionTarget,
+} from "../lib/agent/types";
 import {
 	type DangerReflectionLevel,
 	normalizeDangerReflectionLevel,
 	resolveDangerReflectionLevel,
 } from "../lib/boolean-override";
+import { AppError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { isPlanModeTrait, isSubagentVariant } from "../lib/narrator-utils";
-import type { DeviceAccessPolicy } from "../lib/oauth-client-policy";
+import {
+	type DeviceAccessPolicy,
+	intersectOAuthClientPolicies,
+	oauthClientPolicySchema,
+} from "../lib/oauth-client-policy";
 import { resolveEffectiveRelaxedPlan } from "../lib/permission-modes";
 import {
 	buildLegacyPlanFileRelPath,
@@ -68,7 +88,7 @@ import {
 } from "../lib/plan-file-path";
 import { isInsidePath, normalizePathForOS, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
-import { settings } from "../lib/settings";
+import { narraforkDir, settings } from "../lib/settings";
 import { assertToolSpecPaths, toolSpecPathError } from "../lib/spec-uri";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 
@@ -82,10 +102,15 @@ import { backgroundTaskService } from "./background-task-service";
 import { commandPatternMatches } from "./execution-policy/command-policy";
 import type { CompiledExecutionPolicy } from "./execution-policy/compiler";
 import { compileExecutionPolicy } from "./execution-policy/compiler";
-import { executionPolicyEngine, type ResolvedExecutionPolicy } from "./execution-policy/engine";
+import {
+	executionPolicyEngine,
+	executionPolicyRevision,
+	type ResolvedExecutionPolicy,
+} from "./execution-policy/engine";
 import { registerExecutionPolicyPendingReprocessor } from "./execution-policy/events";
 import { normalizeExecutionPolicyRuleSet } from "./execution-policy/normalize";
 import { resolveCanonicalPaths } from "./execution-policy/path-probes";
+import { executionPolicyRepository } from "./execution-policy/repository";
 import {
 	createExecutionTargetContext,
 	executionTargetContextKey,
@@ -103,7 +128,7 @@ import type {
 } from "./execution-policy/types";
 import { notifyHumanAttentionChanged } from "./human-attention-events";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
-import { narratorPersistence } from "./narrator-persistence";
+import { narratorPersistence, reconstructToolExecutionTargets } from "./narrator-persistence";
 import { narratorService } from "./narrator-service";
 import {
 	activeNarrators,
@@ -123,9 +148,26 @@ import {
 	pendingPlanDiff,
 	planModeAskedOnce,
 } from "./narrator-session-state";
+import {
+	completePermissionRuleRequestReflection as completeRuleReflection,
+	failPermissionRuleRequest,
+	PERMISSION_RULE_REQUEST_TTL_MS,
+	type PermissionRuleReflectionCompletion,
+	preparePermissionRuleRequest,
+	recordPermissionRuleRequestDecision,
+	terminatePermissionRuleRequest,
+	validatePermissionRuleRequestApproval,
+} from "./permission-rule-request-service";
 import { broadcastReflectionFrame } from "./reflection-broadcast";
 import { SPEC_TASKS_PATH } from "./spec-task-service";
 import { specVfsService } from "./spec-vfs-service";
+
+// An exact tool-call attempt owns this receipt. Never use the generic danger cache.
+const permissionRuleRequestPauses = new Map<
+	string,
+	{ requestId: string; automatic: boolean; settling: boolean }
+>();
+
 import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
 
 // Preserve the original execution receipt and ACL ceiling while the SAME prompt is reprocessed.
@@ -155,6 +197,7 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 		case "Write":
 		case "Edit":
 		case "NotebookEdit":
+		case "StructSed":
 		case "StructView":
 			return typeof input.file_path === "string" ? [input.file_path] : [];
 		case "ShareFile":
@@ -478,6 +521,12 @@ export function resolvePermissionDecision(
 		if (meta) meta.blacklistReason = specError;
 		return "deny";
 	}
+	if (
+		toolName === "Worktree" &&
+		((input.action !== "list" && input.action !== "create") ||
+			(reviewReadOnlyBash && input.action !== "list"))
+	)
+		return "deny";
 	const compiledPolicy = compiledPolicyForDecision(opts);
 	const context = executionContext ?? compiledPolicy.targetContext;
 	const effectiveMode = planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;
@@ -851,7 +900,7 @@ function resolveBlacklistDecision(
 				? bashAnalysis?.hasWriteOperation
 					? "write"
 					: "read"
-				: READ_ONLY_TOOLS.includes(toolName)
+				: isReadOnlyCall(toolName, input)
 					? "read"
 					: "write";
 	const paths =
@@ -935,6 +984,7 @@ const READ_ONLY_TOOLS = [
 function isReadOnlyCall(toolName: string, input: Record<string, unknown>): boolean {
 	if (READ_ONLY_TOOLS.includes(toolName)) return true;
 	if (toolName === "Notification") return input.action === "list_channels";
+	if (toolName === "Worktree") return input.action === "list";
 	return toolName === "StructSed" && input.dry_run !== false;
 }
 
@@ -1222,6 +1272,29 @@ function isStructuralPath(absPath: string, projectGitPath: string): string | nul
 	return null;
 }
 
+/** Resolve existing symlinks, including a symlinked parent of a not-yet-created file. */
+function canonicalHostPath(path: string): string {
+	const suffix: string[] = [];
+	let current = resolve(path);
+	for (let depth = 0; depth < 128; depth++) {
+		try {
+			return resolve(realpathSync(current), ...suffix);
+		} catch (error) {
+			if (
+				!(error instanceof Error) ||
+				!("code" in error) ||
+				(error.code !== "ENOENT" && error.code !== "ENOTDIR")
+			)
+				throw error;
+			const parent = dirname(current);
+			if (parent === current) throw error;
+			suffix.unshift(basename(current));
+			current = parent;
+		}
+	}
+	throw new Error("Host path identity budget exceeded");
+}
+
 function resolveProtectedPathDeny(
 	toolName: string,
 	input: Record<string, unknown>,
@@ -1251,6 +1324,28 @@ function resolveProtectedPathDeny(
 		);
 		if (isGitInternalPath(absPath, targetOS)) {
 			return `Write to .git directory is forbidden: ${absPath}`;
+		}
+		// Only the host configuration is trusted to enable security switches. Reads and
+		// trusted settings APIs remain available; another device's same path is unrelated.
+		const hostTarget =
+			(backend?.kind ?? "local") === "local" &&
+			(executionContext?.target.deviceId ?? executionTarget?.deviceId ?? LOCAL_DEVICE_ID) ===
+				LOCAL_DEVICE_ID &&
+			targetPaths.flavor !== "spec";
+		if (hostTarget && !isReadOnlyCall(toolName, input)) {
+			try {
+				const configuration = resolve(narraforkDir, "settings.json");
+				const lexical = targetPaths.resolve(targetCwd, filePath);
+				const protectedPaths = [configuration, canonicalHostPath(configuration)];
+				if (
+					[lexical, absPath, canonicalHostPath(lexical)].some((candidate) =>
+						protectedPaths.some((protectedPath) => targetPaths.equals(candidate, protectedPath)),
+					)
+				)
+					return "Agent file writes to the host security settings file are forbidden; use the trusted settings API";
+			} catch {
+				return "Cannot verify host security settings path identity";
+			}
 		}
 		return null;
 	}
@@ -3396,6 +3491,8 @@ function permissionPrimaryPath(
 		toolName === "Read" ||
 		toolName === "Write" ||
 		toolName === "Edit" ||
+		toolName === "NotebookEdit" ||
+		toolName === "StructSed" ||
 		toolName === "StructView"
 	) {
 		return typeof input.file_path === "string" ? input.file_path : undefined;
@@ -3583,6 +3680,565 @@ export interface RuntimePermissionConstraint {
 	grantId?: string;
 }
 
+export interface FinalToolPermissionCheck {
+	narratorId: string;
+	toolName: string;
+	input: Record<string, unknown>;
+	toolUseId: string;
+	binding: ToolCallBinding;
+	executionBackend?: ExecutionBackend;
+	executionTarget?: Readonly<ToolExecutionTarget>;
+	executionPlan?: ToolExecutionPlan;
+	/** Trusted multi-endpoint operation, never accepted from tool input. */
+	endpointOperation?: ToolExecutionOperation;
+	cwd?: string;
+	signal?: AbortSignal;
+	runtimeConstraint?: RuntimePermissionConstraint;
+	reviewReadOnlyBash?: boolean;
+}
+export interface FinalToolPermissionFence {
+	assertStillCurrent(): void;
+}
+const FINAL_PERMISSION_INPUT_MAX_BYTES = 512 * 1024;
+function finalPermissionDeny(message: string): never {
+	throw new AppError(
+		`Final tool permission denied: ${message}`,
+		403,
+		"FINAL_TOOL_PERMISSION_DENIED",
+	);
+}
+function captureFinalOAuthAuthority(check: FinalToolPermissionCheck) {
+	const constraint = check.runtimeConstraint;
+	if (!constraint) return null;
+	if (!constraint.oauthClientId || !constraint.grantId)
+		finalPermissionDeny("missing OAuth authority identity");
+	const authority = db
+		.select({
+			id: integrationAuthorities.id,
+			state: integrationAuthorities.state,
+			kind: integrationAuthorities.kind,
+			integrationId: integrationAuthorities.integrationId,
+			integrationType: integrationAuthorities.integrationType,
+			ownerUserId: integrationAuthorities.ownerUserId,
+			expiresAt: integrationAuthorities.expiresAt,
+			policy: integrationAuthorities.policyJson,
+		})
+		.from(integrationAuthorities)
+		.where(eq(integrationAuthorities.id, constraint.grantId))
+		.get();
+	const client = db
+		.select({
+			id: oauthClients.id,
+			revokedAt: oauthClients.revokedAt,
+			publicClient: oauthClients.publicClient,
+			scopes: oauthClients.scopes,
+			policy: oauthClients.policyJson,
+		})
+		.from(oauthClients)
+		.where(eq(oauthClients.id, constraint.oauthClientId))
+		.get();
+	const provenance = db
+		.select({
+			state: integrationResourceBindings.state,
+			sourceId: integrationResourceBindings.sourceId,
+			sourceType: integrationResourceBindings.sourceType,
+			authorityId: integrationResourceBindings.authorityId,
+			authorityType: integrationResourceBindings.authorityType,
+			revision: integrationResourceBindings.revision,
+		})
+		.from(integrationResourceBindings)
+		.where(
+			and(
+				eq(integrationResourceBindings.resourceType, "narrator"),
+				eq(integrationResourceBindings.resourceId, check.narratorId),
+			),
+		)
+		.get();
+	const snapshot = db
+		.select({
+			policy: sql<string | null>`json_extract(${narrators.oauthPolicySnapshotJson}, '$.policy')`,
+			deviceIds: sql<
+				string | null
+			>`json_extract(${narrators.oauthPolicySnapshotJson}, '$.deviceIds')`,
+			defaultDeviceId: narrators.defaultDeviceId,
+		})
+		.from(narrators)
+		.where(eq(narrators.id, check.narratorId))
+		.get();
+	const now = new Date().toISOString();
+	const grants = db
+		.select({
+			id: integrationCapabilityGrants.id,
+			expiresAt: integrationCapabilityGrants.expiresAt,
+		})
+		.from(integrationCapabilityGrants)
+		.where(
+			and(
+				eq(integrationCapabilityGrants.authorityId, constraint.grantId),
+				eq(integrationCapabilityGrants.capabilityId, "narrator.send_message"),
+				isNull(integrationCapabilityGrants.revokedAt),
+				or(
+					isNull(integrationCapabilityGrants.expiresAt),
+					gt(integrationCapabilityGrants.expiresAt, now),
+				),
+			),
+		)
+		.limit(2001)
+		.all();
+	if (
+		!authority ||
+		authority.state !== "active" ||
+		authority.kind !== "oauth_grant" ||
+		authority.integrationType !== "oauth_client" ||
+		authority.integrationId !== constraint.oauthClientId ||
+		!authority.ownerUserId ||
+		(authority.expiresAt !== null &&
+			(!Number.isFinite(Date.parse(authority.expiresAt)) ||
+				Date.parse(authority.expiresAt) <= Date.now())) ||
+		!client ||
+		client.revokedAt !== null ||
+		!client.publicClient ||
+		!client.scopes.includes("narrator.send_message") ||
+		!provenance ||
+		provenance.state !== "active" ||
+		provenance.sourceType !== "oauth_client" ||
+		provenance.sourceId !== constraint.oauthClientId ||
+		provenance.authorityType !== "oauth_grant" ||
+		provenance.authorityId !== constraint.grantId ||
+		!snapshot?.policy ||
+		grants.length === 0 ||
+		grants.length > 2000
+	)
+		finalPermissionDeny("OAuth authority was revoked or expired");
+	const policy = intersectOAuthClientPolicies(
+		oauthClientPolicySchema.parse(client.policy),
+		oauthClientPolicySchema.parse(authority.policy),
+		oauthClientPolicySchema.parse(JSON.parse(snapshot.policy)),
+	);
+	if (!policy) finalPermissionDeny("OAuth policy intersection is empty");
+	if (
+		!policy.allowedPermissionModes.includes(constraint.permissionMode) ||
+		stableJson(policy.deviceAccess) !== stableJson(constraint.deviceAccess) ||
+		policy.allowKnowledgeWrite !== constraint.allowKnowledgeWrite ||
+		policy.allowRobotDiagnosticPreset !== !!constraint.useRobotDiagnosticPreset
+	) {
+		finalPermissionDeny("OAuth policy ceiling changed");
+	}
+	const ids: unknown = JSON.parse(snapshot.deviceIds ?? "[]");
+	if (
+		!Array.isArray(ids) ||
+		ids.length === 0 ||
+		ids.length > 128 ||
+		ids.some((id) => typeof id !== "string") ||
+		!snapshot.defaultDeviceId ||
+		!ids.includes(snapshot.defaultDeviceId)
+	)
+		finalPermissionDeny("invalid OAuth device snapshot");
+	const devices = db
+		.select({ id: remoteDevices.id, revokedAt: remoteDevices.revokedAt })
+		.from(remoteDevices)
+		.where(inArray(remoteDevices.id, ids as string[]))
+		.limit(129)
+		.all();
+	const bindings = db
+		.select({
+			resourceId: integrationResourceBindings.resourceId,
+			state: integrationResourceBindings.state,
+			sourceId: integrationResourceBindings.sourceId,
+			sourceType: integrationResourceBindings.sourceType,
+			authorityType: integrationResourceBindings.authorityType,
+			authorityId: integrationResourceBindings.authorityId,
+			revision: integrationResourceBindings.revision,
+		})
+		.from(integrationResourceBindings)
+		.where(
+			and(
+				eq(integrationResourceBindings.resourceType, "device"),
+				inArray(integrationResourceBindings.resourceId, ids as string[]),
+			),
+		)
+		.limit(129)
+		.all();
+	for (const id of ids) {
+		const device = devices.find((item) => item.id === id),
+			binding = bindings.find((item) => item.resourceId === id);
+		if (
+			!device ||
+			device.revokedAt !== null ||
+			!binding ||
+			binding.state !== "active" ||
+			binding.sourceType !== "oauth_client" ||
+			binding.sourceId !== constraint.oauthClientId ||
+			binding.authorityType !== "oauth_grant" ||
+			binding.authorityId !== constraint.grantId
+		)
+			finalPermissionDeny("OAuth device binding was revoked");
+	}
+	return { authority, client, provenance, snapshot, grants, devices, bindings };
+}
+function finalPermissionSnapshot(check: FinalToolPermissionCheck) {
+	const narrator = db
+		.select({
+			id: narrators.id,
+			chapterId: narrators.chapterId,
+			contextProjectId: narrators.contextProjectId,
+			parentNarratorId: narrators.parentNarratorId,
+			cwd: narrators.cwd,
+			workspaceRevision: narrators.workspaceRevision,
+			defaultDeviceId: narrators.defaultDeviceId,
+			permissionMode: narrators.permissionMode,
+			relaxedPlan: narrators.relaxedPlan,
+			traits: narrators.traits,
+			variant: narrators.variant,
+			planFileId: narrators.planFileId,
+			previousPermissionMode: narrators.previousPermissionMode,
+		})
+		.from(narrators)
+		.where(eq(narrators.id, check.narratorId))
+		.get();
+	const call = db
+		.select({
+			id: narratorToolCalls.id,
+			narratorId: narratorToolCalls.narratorId,
+			toolUseId: narratorToolCalls.toolUseId,
+			toolName: narratorToolCalls.toolName,
+			attempt: narratorToolCalls.executionAttempt,
+			version: narratorToolCalls.executionIdentityVersion,
+			origin: narratorToolCalls.executionOriginToolCallId,
+			status: narratorToolCalls.status,
+			decidedBy: narratorToolCalls.permissionDecidedBy,
+			decidedAt: narratorToolCalls.permissionDecidedAt,
+			deviceId: narratorToolCalls.executionDeviceId,
+			cwd: narratorToolCalls.executionCwd,
+			pathFlavor: narratorToolCalls.executionPathFlavor,
+			path: narratorToolCalls.canonicalFilePath,
+			resolvedPath: narratorToolCalls.resolvedFilePath,
+			generation: narratorToolCalls.runtimeGeneration,
+			targets: narratorToolCalls.executionTargetsJson,
+			selectionSource: narratorToolCalls.deviceSelectionSource,
+			// Single-row detail budget; never copy an arbitrarily large Write body into the guard.
+			persistedInput: sql<
+				string | null
+			>`CASE WHEN length(CAST(${narratorToolCalls.inputJson} AS BLOB)) <= ${FINAL_PERMISSION_INPUT_MAX_BYTES} THEN ${narratorToolCalls.inputJson} ELSE NULL END`,
+		})
+		.from(narratorToolCalls)
+		.where(
+			and(
+				eq(narratorToolCalls.id, check.binding.toolCallId),
+				eq(narratorToolCalls.narratorId, check.narratorId),
+				eq(narratorToolCalls.toolUseId, check.toolUseId),
+			),
+		)
+		.get();
+	if (
+		!narrator ||
+		!call ||
+		call.attempt !== check.binding.attempt ||
+		call.version !== 1 ||
+		call.origin !== null ||
+		(call.toolName !== check.toolName &&
+			!(isBashToolName(call.toolName) && isBashToolName(check.toolName)))
+	) {
+		finalPermissionDeny("stale actor/tool execution binding");
+	}
+	if (
+		call.status !== "running" ||
+		!call.decidedAt ||
+		!["auto", "user", "reflection"].includes(call.decidedBy ?? "")
+	) {
+		finalPermissionDeny("the exact tool attempt has no persisted approval");
+	}
+	const policy = executionPolicyRepository.loadNow(check.narratorId);
+	const policyRevision = executionPolicyRevision(policy);
+	const oauthAuthority = captureFinalOAuthAuthority(check);
+	const revision = createHash("sha256")
+		.update(stableJson({ narrator, call, policyRevision, oauthAuthority }))
+		.digest("hex");
+	return { narrator, call, policy, policyRevision, revision };
+}
+
+/** Read-only authorization gate. It never prompts, writes permission decisions or consumes receipts. */
+export async function recheckFinalToolExecutionPermission(
+	check: FinalToolPermissionCheck,
+): Promise<FinalToolPermissionFence> {
+	check.signal?.throwIfAborted();
+	if (check.executionPlan?.kind === "multi") {
+		if (check.runtimeConstraint)
+			finalPermissionDeny(
+				"OAuth cannot authorize a multi-target operation with one capability context",
+			);
+		if (check.executionPlan.endpoints.length === 0 || check.executionPlan.endpoints.length > 16)
+			finalPermissionDeny("invalid or excessive endpoint plan");
+		const fences: FinalToolPermissionFence[] = [];
+		for (const endpoint of check.executionPlan.endpoints) {
+			fences.push(
+				await recheckFinalToolExecutionPermission({
+					...check,
+					executionPlan: undefined,
+					endpointOperation: endpoint.operation,
+					executionTarget: endpoint.target,
+					executionBackend: resolveBackend({ requested: endpoint.target.deviceId }),
+				}),
+			);
+		}
+		return {
+			assertStillCurrent() {
+				for (const fence of fences) fence.assertStillCurrent();
+			},
+		};
+	}
+	await narratorPersistence.validateToolCallBinding(
+		check.narratorId,
+		check.toolUseId,
+		check.binding,
+	);
+	const before = finalPermissionSnapshot(check);
+	const routed = isRoutedPermissionTool(check.toolName);
+	let context: ExecutionTargetContext | null = null;
+	if (routed) {
+		if (!check.executionBackend || !check.executionTarget)
+			finalPermissionDeny("missing frozen execution target");
+		context = await freezePermissionExecutionContext({
+			toolName: check.toolName,
+			toolInput: check.input,
+			backend: check.executionBackend,
+			target: { ...check.executionTarget },
+		});
+		const row = before.call;
+		const registered = reconstructToolExecutionTargets({
+			executionDeviceId: row.deviceId,
+			executionCwd: row.cwd,
+			executionPathFlavor: row.pathFlavor,
+			resolvedFilePath: row.resolvedPath,
+			canonicalFilePath: row.path,
+			runtimeGeneration: row.generation,
+			executionTargetsJson: row.targets,
+			deviceSelectionSource: row.selectionSource,
+		});
+		const frozen = context;
+		if (
+			!registered.some(
+				(target) =>
+					target.deviceId === frozen.target.deviceId &&
+					target.backendKind === frozen.target.backendKind &&
+					frozen.paths.equals(target.cwd, frozen.target.cwd) &&
+					(!target.pathFlavor || target.pathFlavor === frozen.target.pathFlavor) &&
+					(target.runtimeGeneration ?? 0) === frozen.target.runtimeGeneration &&
+					(!frozen.target.canonicalPath ||
+						frozen.paths.equals(
+							target.canonicalPath ?? target.resolvedFilePath ?? "",
+							frozen.target.canonicalPath,
+						)),
+			)
+		) {
+			finalPermissionDeny("persisted device/directory/path differs from the frozen target");
+		}
+	}
+	const primaryInputPath = permissionPrimaryPath(check.toolName, check.input);
+	if (
+		context &&
+		primaryInputPath &&
+		!context.paths.equals(
+			context.paths.resolve(context.target.cwd, primaryInputPath),
+			context.target.lexicalPath ??
+				context.target.resolvedFilePath ??
+				context.target.canonicalPath ??
+				"",
+		)
+	) {
+		finalPermissionDeny("input path differs from the frozen target");
+	}
+	// Small inputs, particularly commands and manual single-call approvals, must be byte-semantically bound.
+	if (before.call.persistedInput !== null) {
+		let persisted: unknown;
+		try {
+			persisted = JSON.parse(before.call.persistedInput);
+		} catch {
+			finalPermissionDeny("invalid persisted input");
+		}
+		if (stableJson(persisted) !== stableJson(check.input))
+			finalPermissionDeny("approved input changed");
+	} else if (
+		before.call.decidedBy !== "auto" ||
+		check.toolName !== "Write" ||
+		!context?.target.canonicalPath ||
+		!primaryInputPath
+	) {
+		finalPermissionDeny("approval input exceeds the bounded identity verification budget");
+	}
+	const cwd = context?.target.cwd ?? check.cwd ?? before.narrator.cwd;
+	if (!cwd) finalPermissionDeny("missing execution directory");
+	const constraint = check.runtimeConstraint;
+	if (constraint && check.toolName === "RequestPermissionRule")
+		finalPermissionDeny("OAuth cannot mutate narrator permission rules");
+	if (
+		constraint &&
+		(check.toolName === "KnowledgeCreate" || check.toolName === "KnowledgeEdit") &&
+		(!constraint.allowKnowledgeWrite ||
+			check.input.action === "transfer_owner" ||
+			check.input.action === "transfer_collection_owner")
+	) {
+		finalPermissionDeny("OAuth knowledge capability ceiling");
+	}
+	let analysis: BashAnalysis | undefined;
+	if (isBashToolName(check.toolName) && typeof check.input.command === "string") {
+		analysis = await analyzeShellCommand(
+			check.input.command,
+			cwd,
+			resolvePermissionShellType(context?.backend),
+			!!before.narrator.chapterId,
+			context?.paths ?? localPathSemantics,
+		);
+		if (context) analysis = await canonicalizeShellAnalysisPaths(analysis, context, check.signal);
+		if (analysis.commands.length === 0)
+			finalPermissionDeny("command analysis produced no executable command");
+	}
+	let deviceLevel: "denied" | "readOnly" | "readWrite" | undefined;
+	if (constraint && context) {
+		if (!constraint.deviceAccess || !constraint.oauthClientId || !constraint.grantId)
+			finalPermissionDeny("missing OAuth device capability");
+		const group = await classifyDeviceAccessGroup(context.target.deviceId, {
+			oauthClientId: constraint.oauthClientId,
+			grantId: constraint.grantId,
+		});
+		context = withExecutionDeviceClass(context, group);
+		deviceLevel = constraint.deviceAccess[group];
+		if (
+			deviceLevel === "denied" ||
+			(deviceLevel !== "readWrite" &&
+				(WRITE_TOOLS.has(check.toolName) || analysis?.hasWriteOperation))
+		) {
+			finalPermissionDeny("OAuth device capability ceiling");
+		}
+	}
+	executionPolicyEngine.invalidate(check.narratorId);
+	const policy = await executionPolicyEngine.compile(
+		check.narratorId,
+		context,
+		constraint?.useRobotDiagnosticPreset ? ["robotDiagnostic"] : [],
+		check.signal,
+	);
+	const expectedPolicy = createHash("sha256")
+		.update(
+			`${before.policyRevision}:${constraint?.useRobotDiagnosticPreset ? "robotDiagnostic" : "none"}`,
+		)
+		.digest("hex");
+	if (policy.revision !== expectedPolicy)
+		finalPermissionDeny("policy changed during final compilation");
+	if (analysis?.isCatastrophic) finalPermissionDeny("catastrophic command");
+	const decisionTool =
+		check.endpointOperation === "read" || check.endpointOperation === "search"
+			? "Read"
+			: check.endpointOperation === "write"
+				? "Write"
+				: check.toolName;
+	const decisionInput =
+		decisionTool !== check.toolName && context
+			? { ...check.input, file_path: executionTargetPolicyPath(context) }
+			: check.input;
+	const protectedReason = resolveProtectedPathDeny(
+		decisionTool,
+		decisionInput,
+		cwd,
+		policy.projectGitPath ?? undefined,
+		analysis,
+		context,
+		context?.backend,
+		context?.target,
+	);
+	if (protectedReason) finalPermissionDeny(protectedReason);
+	// Run deny layers before ALL shortcuts (including designated plan-file allowance).
+	if (
+		analysis &&
+		policy.evaluateCommands(analysis.commands.map((command) => command.tokens)).decision === "deny"
+	) {
+		finalPermissionDeny("latest command blacklist matches this call");
+	}
+	const pathDeny = resolveBlacklistDecision(
+		decisionTool,
+		decisionInput,
+		cwd,
+		policy,
+		analysis,
+		context,
+	);
+	if (pathDeny) finalPermissionDeny(pathDeny.reason);
+	const mode =
+		constraint && context
+			? deviceLevel === "readWrite"
+				? "bypassPermissions"
+				: "readOnly"
+			: constraint && (check.toolName === "KnowledgeCreate" || check.toolName === "KnowledgeEdit")
+				? "bypassPermissions"
+				: (constraint?.permissionMode ?? before.narrator.permissionMode ?? "default");
+	const review = check.reviewReadOnlyBash || before.narrator.variant === "subagent:review";
+	if (
+		review &&
+		!isTaskStateMaintenanceTool(check.toolName, check.input) &&
+		(WRITE_TOOLS.has(decisionTool) || check.toolName === "RequestPermissionRule")
+	)
+		finalPermissionDeny("review capability ceiling");
+	const sendInScope =
+		check.toolName === "Send" &&
+		(await shouldAutoAllowSendWithinScope(check.narratorId, before.narrator, check.input));
+	let dedicatedRuleApproval = false;
+	if (check.toolName === "RequestPermissionRule") {
+		if (!context) finalPermissionDeny("missing dedicated rule request execution context");
+		await validatePermissionRuleRequestApproval(
+			{ narratorId: check.narratorId, toolUseId: check.toolUseId, binding: check.binding },
+			check.input,
+			context,
+		);
+		dedicatedRuleApproval = true;
+	}
+	// The dedicated receipt grants only this rule insertion, never generic Write/Bash.
+	// All latest deny layers and hard capability ceilings above still precede it.
+	const decision =
+		dedicatedRuleApproval || sendInScope
+			? "allow"
+			: resolvePermissionDecision({
+					toolName: decisionTool,
+					input: decisionInput,
+					permMode: mode,
+					cwd,
+					bashAnalysis: analysis,
+					isChapter: !!before.narrator.chapterId,
+					compiledPolicy: policy,
+					executionContext: context,
+					projectGitPath: policy.projectGitPath ?? undefined,
+					planMode: constraint ? false : isPlanModeTrait(before.narrator.traits),
+					relaxedPlan: constraint
+						? false
+						: resolveEffectiveRelaxedPlan(mode, before.narrator.relaxedPlan),
+					planFileId: before.narrator.planFileId ?? undefined,
+					planFilePath: activeNarrators.get(check.narratorId)?._planFilePath,
+					reviewReadOnlyBash: review,
+					notificationPolicy: settings.agent.notificationPolicy,
+					webFetchPolicy: settings.agent.webFetchPolicy,
+				});
+	if (
+		decision === "deny" ||
+		decision === "fatal" ||
+		(decision === "ask" && before.call.decidedBy === "auto")
+	) {
+		finalPermissionDeny("current policy no longer authorizes the original automatic approval");
+	}
+	const assertStillCurrent = () => {
+		check.signal?.throwIfAborted();
+		if (
+			context &&
+			context.backend.runtimeGeneration !== undefined &&
+			context.backend.runtimeGeneration !== context.target.runtimeGeneration
+		) {
+			finalPermissionDeny("execution device generation changed");
+		}
+		if (finalPermissionSnapshot(check).revision !== before.revision)
+			finalPermissionDeny("authorization changed before the tool body started");
+	};
+	assertStillCurrent();
+	return { assertStillCurrent };
+}
+
 /** The concrete execution groups used by routed OAuth tools. */
 export type DeviceAccessGroup = "host" | "global" | "selfRegistered";
 
@@ -3734,6 +4390,27 @@ export async function handlePermission(
 		: resolveEffectiveRelaxedPlan(permMode, narrator?.relaxedPlan);
 	const isPlanMode = runtimeConstraint ? false : isPlanModeTrait(narrator?.traits);
 	const isChapter = !!narrator?.chapterId;
+
+	if (toolName === "RequestPermissionRule") {
+		if (runtimeConstraint || reviewReadOnlyBash || !binding || !executionContext) {
+			return {
+				behavior: "deny",
+				message: "Permission rule requests require an exact unconstrained frozen execution binding",
+			};
+		}
+		return handlePermissionRuleRequest({
+			narratorId,
+			signal,
+			input,
+			toolUseId,
+			cwd,
+			locale,
+			wsTarget,
+			parentToolUseId,
+			options: options as PermissionHandlerOptions,
+			context: executionContext,
+		});
+	}
 
 	let effectiveInput = input;
 	let exitPlanResolvedFromFile = false;
@@ -4679,6 +5356,259 @@ export async function handlePermission(
 	});
 }
 
+async function handlePermissionRuleRequest(args: {
+	narratorId: string;
+	signal: AbortSignal;
+	input: Record<string, unknown>;
+	toolUseId: string;
+	cwd: string;
+	locale: Locale;
+	wsTarget: string;
+	parentToolUseId?: string;
+	options: PermissionHandlerOptions;
+	context: ExecutionTargetContext;
+}): Promise<PermissionResult> {
+	const {
+		narratorId,
+		signal,
+		toolUseId,
+		cwd,
+		locale,
+		wsTarget,
+		parentToolUseId,
+		options,
+		context,
+	} = args;
+	const binding = options.toolCallBinding;
+	if (!binding) return { behavior: "deny", message: "Missing exact rule-request tool binding" };
+	let prepared: Awaited<ReturnType<typeof preparePermissionRuleRequest>>;
+	try {
+		signal.throwIfAborted();
+		prepared = await preparePermissionRuleRequest(
+			{ narratorId, toolUseId, binding },
+			args.input,
+			context,
+		);
+		await options.onInputResolved?.(prepared.input);
+	} catch (error) {
+		return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
+	}
+	const id = binding.toolCallId;
+	const input = prepared.input as Record<string, unknown>;
+	const routing = permissionRoutingIdentity(narratorId, wsTarget, parentToolUseId);
+	const risk: DangerInfo = {
+		severity: "high",
+		summary: "Persist a narrator permission rule",
+		details: [
+			`Rule: ${prepared.rule.ruleType}`,
+			`Device: ${input.device}`,
+			`Reason: ${input.reason}`,
+			`Proposal hash: ${prepared.proposalHash}`,
+		],
+		consequences: [
+			"Future calls may be authorized without repeated prompts. Inherited deny rules and hard capability ceilings remain enforced.",
+		],
+		saferAlternatives: ["Keep the rule absent and approve individual calls."],
+	};
+	try {
+		await db
+			.update(narratorToolCalls)
+			.set({
+				status: "pending",
+				inputJson: input,
+				permissionStartedAt: new Date().toISOString(),
+				permissionDecisionReason: `Permission rule request: ${input.reason}`,
+				permissionSuggestions: [
+					{
+						type: "permission_rule_request",
+						requestId: prepared.requestId,
+						proposalHash: prepared.proposalHash,
+						scope: "narrator",
+						deviceId: input.device,
+						...(prepared.automatic
+							? { purpose: "permissionRuleRequest", reflectionLevel: "strict" }
+							: {}),
+					},
+				],
+			})
+			.where(eq(narratorToolCalls.id, id));
+	} catch (error) {
+		failPermissionRuleRequest(prepared.requestId, String(error));
+		return { behavior: "deny", message: "Permission rule request persistence failed" };
+	}
+	let cleanup = () => {};
+	const decision = new Promise<PermissionResult>((resolve) => {
+		const abort = () => {
+			pendingDangerReflections.get(id)?.reflectionAbortController?.abort();
+			try {
+				terminatePermissionRuleRequest({
+					narratorId,
+					toolCallId: binding.toolCallId,
+					attempt: binding.attempt,
+					status: "cancelled",
+					reason: signal.aborted
+						? "Permission rule request aborted"
+						: "Permission rule request timed out",
+				});
+			} catch {}
+			cleanup();
+			resolve({ behavior: "deny", message: "Permission rule request cancelled or timed out" });
+		};
+		const timer = setTimeout(abort, PERMISSION_RULE_REQUEST_TTL_MS);
+		cleanup = () => {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", abort);
+			if (pendingPermissions.delete(id))
+				eventBus.emit({
+					type: "narrator:attention_resolved",
+					narratorId,
+					reason: "waiting_permission",
+				});
+			pendingDangerReflections.delete(id);
+			permissionRuleRequestPauses.delete(id);
+			notifyHumanAttentionChanged();
+		};
+		signal.addEventListener("abort", abort, { once: true });
+		permissionRuleRequestPauses.set(id, {
+			requestId: prepared.requestId,
+			automatic: prepared.automatic,
+			settling: false,
+		});
+		if (prepared.automatic) {
+			pendingDangerReflections.set(id, {
+				narratorId,
+				requestId: id,
+				toolCallId: id,
+				toolUseId,
+				toolName: "RequestPermissionRule",
+				broadcastTargetId: wsTarget,
+				parentToolUseId,
+				input,
+				fingerprint: prepared.proposalHash,
+				danger: risk,
+				startedAt: Date.now(),
+				resolve,
+				cleanup,
+			});
+		} else {
+			pendingPermissions.set(id, {
+				narratorId,
+				toolName: "RequestPermissionRule",
+				toolUseId,
+				broadcastTargetId: wsTarget,
+				parentToolUseId,
+				input,
+				cwd,
+				locale,
+				signal,
+				executionTarget: snapshotExecutionTarget(context.target),
+				attentionEmitted: true,
+				resolve,
+				cleanup,
+			});
+		}
+		if (signal.aborted) abort();
+	});
+	if (signal.aborted) return decision;
+	await narratorService.updateStatus(
+		narratorId,
+		"waiting",
+		prepared.automatic ? { substatus: ["reflecting"] } : undefined,
+	);
+	notifyHumanAttentionChanged();
+	if (prepared.automatic) {
+		broadcastReflectionFrame(
+			{ narratorId, broadcastTargetId: wsTarget, parentToolUseId },
+			{
+				type: "danger_reflection_started",
+				requestId: id,
+				toolUseId,
+				toolName: "RequestPermissionRule",
+				danger: risk,
+			},
+		);
+		return {
+			behavior: "dangerReflection",
+			requestId: id,
+			danger: risk,
+			fingerprint: prepared.proposalHash,
+			reflectionLevel: "strict",
+			purpose: "permissionRuleRequest",
+			input,
+			decision,
+		};
+	}
+	broadcastToNarrator(wsTarget, {
+		type: "permission_request",
+		narratorId: wsTarget,
+		request: {
+			id,
+			...routing,
+			toolName: "RequestPermissionRule",
+			toolUseId,
+			inputJson: input,
+			decisionReason: `Permission rule request: ${input.reason}`,
+			executionDeviceId: context.target.deviceId,
+			executionCwd: context.target.cwd,
+			resolvedFilePath: "path" in prepared.input ? prepared.input.path : null,
+			deviceSelectionSource: context.target.selectionSource,
+		},
+	});
+	eventBus.emit({ type: "narrator:permission_request", narratorId, requestId: id });
+	eventBus.emit({ type: "narrator:attention", narratorId, reason: "waiting_permission" });
+	options.onAwaitingUserDecision?.();
+	return decision;
+}
+
+/** Called ONLY by the strict loop completion boundary, never by textual fallback. */
+export async function completePermissionRuleRequestReflection(
+	requestId: string,
+	result: PermissionRuleReflectionCompletion,
+): Promise<boolean> {
+	const state = permissionRuleRequestPauses.get(requestId);
+	const pause = pendingDangerReflections.get(requestId);
+	if (!state?.automatic || !pause || state.settling) return false;
+	state.settling = true;
+	let approved = false;
+	try {
+		approved = completeRuleReflection(state.requestId, result);
+		await db
+			.update(narratorToolCalls)
+			.set({
+				status: approved ? "running" : "fail",
+				permissionDecidedBy: "reflection",
+				permissionDecidedAt: new Date().toISOString(),
+				permissionDecisionReason: approved
+					? "Strict rule-request reflection completed"
+					: "Strict rule-request reflection failed",
+			})
+			.where(eq(narratorToolCalls.id, pause.toolCallId));
+	} catch {
+		approved = false;
+		try {
+			failPermissionRuleRequest(state.requestId, "Strict receipt persistence failed");
+		} catch {}
+	}
+	pause.cleanup();
+	broadcastReflectionFrame(pause, {
+		type: "danger_reflection_resolved",
+		requestId,
+		toolUseId: pause.toolUseId,
+		decision: approved ? "allow" : "deny",
+		reason: approved
+			? "Strict rule-request reflection completed"
+			: "Strict rule-request reflection failed",
+		...(!approved ? { failed: true } : {}),
+	});
+	pause.resolve(
+		approved
+			? { behavior: "allow", updatedInput: pause.input }
+			: { behavior: "deny", message: "Strict permission rule reflection failed" },
+	);
+	await narratorService.updateStatus(pause.narratorId, "working").catch(() => {});
+	return approved;
+}
+
 export interface ResolvePermissionOpts {
 	denyMessage?: string;
 	answers?: Record<string, string>;
@@ -4893,6 +5823,59 @@ export async function resolvePermission(
 			pendingKeys: [...pendingPermissions.keys()],
 		});
 		return false;
+	}
+
+	if (pending.toolName === "RequestPermissionRule") {
+		const state = permissionRuleRequestPauses.get(requestId);
+		if (
+			!state ||
+			state.automatic ||
+			state.settling ||
+			decidedBy !== "user" ||
+			!userId ||
+			answers ||
+			updatedPlan !== undefined ||
+			deferAsync
+		)
+			return false;
+		state.settling = true;
+		let approved = false;
+		try {
+			if (
+				!recordPermissionRuleRequestDecision(state.requestId, decision, "user", userId, denyMessage)
+			)
+				return false;
+			await db
+				.update(narratorToolCalls)
+				.set({
+					status: decision === "allow" ? "running" : "fail",
+					permissionDecidedBy: "user",
+					permissionDecidedAt: new Date().toISOString(),
+				})
+				.where(eq(narratorToolCalls.id, requestId));
+			approved = decision === "allow";
+		} catch {
+			try {
+				failPermissionRuleRequest(state.requestId, "Human approval persistence failed");
+			} catch {}
+		} finally {
+			pending.cleanup();
+			broadcastToNarrator(pending.broadcastTargetId, {
+				type: "permission_resolved",
+				narratorId: pending.broadcastTargetId,
+				requestId,
+				toolUseId: pending.toolUseId,
+				decision: approved ? "allow" : "deny",
+				...pendingPermissionRoutingIdentity(pending),
+			});
+			pending.resolve(
+				approved
+					? { behavior: "allow", updatedInput: pending.input }
+					: { behavior: "deny", message: denyMessage ?? "Permission rule request rejected" },
+			);
+		}
+		await narratorService.updateStatus(pending.narratorId, "working").catch(() => {});
+		return true;
 	}
 
 	logger.debug("Resolving permission", {
@@ -5506,6 +6489,25 @@ export async function confirmDangerReflection(
 	const pause = pendingDangerReflections.get(requestId);
 	if (!pause) return false;
 	if (decidedBy === "reflection" && pause.reflectionStoppedByUser) return false;
+	const ruleRequest = permissionRuleRequestPauses.get(requestId);
+	if (ruleRequest) {
+		if (decidedBy !== "reflection" || ruleRequest.settling) return false;
+		try {
+			return recordPermissionRuleRequestDecision(
+				ruleRequest.requestId,
+				"allow",
+				"reflection",
+				undefined,
+				reflection,
+			);
+		} catch {
+			await completePermissionRuleRequestReflection(requestId, {
+				completedNormally: false,
+				validToolDecision: false,
+			});
+			return false;
+		}
+	}
 	pause.cleanup();
 	const reason = reflection?.trim() || pause.danger.summary;
 	const result: PermissionResult = { behavior: "allow", updatedInput: pause.input };
@@ -5583,6 +6585,26 @@ export async function cancelDangerReflection(
 	const pause = pendingDangerReflections.get(requestId);
 	if (!pause) return false;
 	if (decidedBy === "reflection" && pause.reflectionStoppedByUser) return false;
+	const ruleRequest = permissionRuleRequestPauses.get(requestId);
+	if (ruleRequest) {
+		pause.reflectionAbortController?.abort();
+		try {
+			failPermissionRuleRequest(
+				ruleRequest.requestId,
+				reason ?? "Permission rule reflection cancelled",
+			);
+		} catch {}
+		pause.cleanup();
+		pause.resolve({ behavior: "deny", message: reason ?? "Permission rule reflection cancelled" });
+		broadcastReflectionFrame(pause, {
+			type: "danger_reflection_resolved",
+			requestId,
+			toolUseId: pause.toolUseId,
+			decision: "deny",
+			reason: reason ?? "Permission rule reflection cancelled",
+		});
+		return true;
+	}
 	pause.cleanup();
 	const message =
 		reason?.trim() ||

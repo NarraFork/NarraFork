@@ -26,23 +26,25 @@ export function GitCommitPreviewPage(props: Props) {
 				<Group justify="space-between">
 					<Title order={2}>{t("commitPreview.title", { sha: props.sha.slice(0, 7) })}</Title>
 					{props.narratorId !== undefined ? (
-						<Button
-							component={Link}
+						<Link
 							to="/narrators/$narratorId"
 							params={{ narratorId: props.narratorId }}
-							variant="subtle"
+							style={{ textDecoration: "none" }}
 						>
-							{t("commitPreview.page.backNarrator", { defaultValue: "Back to narrator" })}
-						</Button>
+							<Button component="span" variant="subtle">
+								{t("commitPreview.page.backNarrator", { defaultValue: "Back to narrator" })}
+							</Button>
+						</Link>
 					) : (
-						<Button
-							component={Link}
+						<Link
 							to="/chapters/$chapterId"
 							params={{ chapterId: props.chapterId }}
-							variant="subtle"
+							style={{ textDecoration: "none" }}
 						>
-							{t("commitPreview.page.backChapter", { defaultValue: "Back to chapter" })}
-						</Button>
+							<Button component="span" variant="subtle">
+								{t("commitPreview.page.backChapter", { defaultValue: "Back to chapter" })}
+							</Button>
+						</Link>
 					)}
 				</Group>
 				{!valid ? (

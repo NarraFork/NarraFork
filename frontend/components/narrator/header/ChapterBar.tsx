@@ -1,30 +1,31 @@
 import { useChapterGitStatus } from "@frontend/hooks/useChapterGitStatus";
-import { useChapter, useUpdateChapter } from "@frontend/hooks/useChapters";
+import { useChapter } from "@frontend/hooks/useChapters";
 import { useContainers } from "@frontend/hooks/useContainers";
 import { gitWorkspaceTarget, useGitStatus, useGitWorkspace } from "@frontend/hooks/useGit";
 import { useChapterContainersCapability } from "@frontend/hooks/usePlatform";
+import { useWorkspaceContext } from "@frontend/hooks/useWorkspaceContext";
 import { type ApiError, api } from "@frontend/lib/api";
-import { CHAPTER_ROLE_ICONS, statusRegistry } from "@frontend/lib/constants";
-import { ActionIcon, Badge, Collapse, Group, Menu, Text, Tooltip } from "@mantine/core";
+import { statusRegistry } from "@frontend/lib/constants";
+import { ActionIcon, Badge, Drawer, Group, Menu, Stack, Text, Tooltip } from "@mantine/core";
 import {
 	IconGitBranch,
 	IconGitCommit,
 	IconGitFork,
 	IconGitMerge,
-	IconGraph,
 	IconMoon,
 	IconPackage,
 	IconSettings,
 	IconSun,
 } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useNavigate } from "@tanstack/react-router";
 import type React from "react";
 import { lazy, Suspense, useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { NarratorCompatibilityEntry } from "../../project/NarratorCompatibilityEntry";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import classes from "./ChapterBar.module.css";
 import { isActivationKey, isTextSelectionGesture } from "./chapter-bar-git-trigger";
+import { NarratorWorktreeControls } from "./NarratorWorktreeControls";
 
 // Lazy-loaded heavy panels and modals — only needed when user opens them
 const ChapterForkModal = lazy(() =>
@@ -65,16 +66,22 @@ const PodmanInstallModal = lazy(() =>
 export function NarratorGitBar({
 	narratorId,
 	onOpenGitPanel,
+	onRequirement,
 }: {
 	narratorId: string;
 	onOpenGitPanel: () => void;
+	onRequirement?: (text: string) => void;
 }) {
 	const { t } = useTranslation("git");
 	const workspace = useGitWorkspace(narratorId);
+	const { data: executionContext } = useWorkspaceContext(narratorId);
 	const target = !workspace.isError ? gitWorkspaceTarget(narratorId, workspace.data) : null;
 	const status = useGitStatus(target);
 	const workspaceState = workspace.data?.state;
-	if (!workspace.isError && (workspace.isPending || workspaceState === "not_git")) {
+	if (
+		!workspace.isError &&
+		((workspace.isPending && !executionContext?.git) || workspaceState === "not_git")
+	) {
 		return null;
 	}
 	return (
@@ -124,6 +131,23 @@ export function NarratorGitBar({
 					</Badge>
 				</Tooltip>
 			)}
+			{executionContext && (
+				<Text
+					size="xs"
+					c="dimmed"
+					ff="monospace"
+					truncate
+					title={`${executionContext.deviceId}: ${executionContext.cwd}`}
+					style={{ flex: 1, minWidth: 0 }}
+				>
+					{executionContext.deviceId}: {executionContext.cwd}
+				</Text>
+			)}
+			<NarratorWorktreeControls
+				key={narratorId}
+				narratorId={narratorId}
+				onRequirement={onRequirement}
+			/>
 			{target && !workspace.data?.capabilities.write && (
 				<Text size="xs" c="dimmed">
 					{t("workspace.readOnly")}
@@ -143,14 +167,20 @@ interface ChapterBarProps {
 	 * without the panel around it.
 	 */
 	onOpenGitPanel?: () => void;
+	onRequirement?: (text: string) => void;
 }
 
-export function ChapterBar({ chapterId, narratorId, onOpenGitPanel }: ChapterBarProps) {
+export function ChapterBar({
+	chapterId,
+	narratorId,
+	onOpenGitPanel,
+	onRequirement,
+}: ChapterBarProps) {
 	const { t } = useTranslation("chapters");
 	const { t: tn } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
-	const navigate = useNavigate();
 	const { data: chapter } = useChapter(chapterId);
+	const { data: executionContext } = useWorkspaceContext(narratorId ?? "");
 	const workspaceQuery = useGitWorkspace(narratorId);
 	const { data: workspaceStatus } = useGitStatus(
 		narratorId && !workspaceQuery.isError
@@ -175,7 +205,6 @@ export function ChapterBar({ chapterId, narratorId, onOpenGitPanel }: ChapterBar
 		containerCapability.supported && containerCapability.routes.list ? chapterId : "",
 	);
 	const qc = useQueryClient();
-	const updateChapter = useUpdateChapter();
 	const dormantChapter = useMutation({
 		mutationFn: () => api.dormantChapter(chapterId),
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["chapters", chapterId] }),
@@ -227,10 +256,15 @@ export function ChapterBar({ chapterId, narratorId, onOpenGitPanel }: ChapterBar
 
 	if (!chapter) return null;
 
-	const roleIcon = CHAPTER_ROLE_ICONS[chapter.role] || "";
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic container entity
 	const runningContainers = containers?.filter((c: any) => c.status === "running") ?? [];
 	const hasContainers = !!chapter.containerConfig;
+	const containerSource = tn("worktree.legacyContainerSource", {
+		title: chapter.title,
+		chapterId,
+		path: chapter.worktreePath || tn("worktree.legacyPathUnavailable"),
+	});
+	const containerTargetDescription = `${containerSource}\n${tn("worktree.legacyContainerWarning")}`;
 
 	return (
 		<>
@@ -261,7 +295,6 @@ export function ChapterBar({ chapterId, narratorId, onOpenGitPanel }: ChapterBar
 					onClick={openGitPanel ? handleGitTriggerClick : undefined}
 					onKeyDown={openGitPanel ? handleGitTriggerKeyDown : undefined}
 				>
-					{roleIcon && <Text size="xs">{roleIcon}</Text>}
 					<Text size="xs" fw={500} truncate>
 						{chapter.title}
 					</Text>
@@ -312,6 +345,17 @@ export function ChapterBar({ chapterId, narratorId, onOpenGitPanel }: ChapterBar
 								)}
 							</Group>
 						)}
+					{executionContext && (
+						<Text
+							size="xs"
+							c="dimmed"
+							ff="monospace"
+							truncate
+							title={`${executionContext.deviceId}: ${executionContext.cwd}`}
+						>
+							{executionContext.deviceId}: {executionContext.cwd}
+						</Text>
+					)}
 					{chapter.status !== "active" && (
 						<Badge
 							size="xs"
@@ -325,84 +369,80 @@ export function ChapterBar({ chapterId, narratorId, onOpenGitPanel }: ChapterBar
 
 				{/* Right: action menus */}
 				<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-					{/* Git fork/merge menu */}
+					{narratorId && (
+						<NarratorWorktreeControls
+							key={narratorId}
+							narratorId={narratorId}
+							onRequirement={onRequirement}
+						/>
+					)}
+
+					{/* Chapter settings menu */}
 					<Menu position="top-end" withinPortal>
 						<Menu.Target>
-							<Tooltip label={tn("chapterBar.git")}>
-								<ActionIcon variant="subtle" color="gray" size="sm">
-									<IconGitFork size={15} />
+							<Tooltip label={tn("worktree.legacyResources")}>
+								<ActionIcon
+									variant="subtle"
+									color="gray"
+									size="sm"
+									aria-label={tn("worktree.legacyResources")}
+								>
+									<IconSettings size={15} />
 								</ActionIcon>
 							</Tooltip>
 						</Menu.Target>
 						<Menu.Dropdown>
-							<Menu.Label>{tn("chapterBar.git")}</Menu.Label>
+							<Menu.Label>{tn("worktree.legacyResources")}</Menu.Label>
+							<Menu.Label style={{ maxWidth: 320, whiteSpace: "normal", overflowWrap: "anywhere" }}>
+								{containerSource}
+							</Menu.Label>
+							<Menu.Item
+								leftSection={<IconPackage size={14} />}
+								disabled={!containerCapability.supported}
+								title={
+									!containerCapability.supported
+										? containerUnsupportedReason
+										: containerTargetDescription
+								}
+								rightSection={
+									runningContainers.length ? (
+										<Badge size="xs" color="green">
+											{runningContainers.length}
+										</Badge>
+									) : undefined
+								}
+								onClick={() => {
+									if (!containerCapability.supported) return;
+									if (hasContainers) setContainerPanelOpen(true);
+									else setContainerConfigOpen(true);
+								}}
+							>
+								{tn("chapterBar.containers")}
+							</Menu.Item>
+							<Menu.Item
+								leftSection={<IconSettings size={14} />}
+								disabled={!containerCapability.supported}
+								title={containerTargetDescription}
+								onClick={() => {
+									if (containerCapability.supported) setContainerConfigOpen(true);
+								}}
+							>
+								{tn("worktree.legacyContainerConfigure")}
+							</Menu.Item>
+							<Menu.Divider />
 							<Menu.Item
 								leftSection={<IconGitFork size={14} />}
 								onClick={() => setForkModalOpen(true)}
 							>
 								{t("fork")}
 							</Menu.Item>
-							<Menu.Divider />
 							<Menu.Item
 								leftSection={<IconGitMerge size={14} />}
 								onClick={() => setMergeModalOpen(true)}
 							>
 								{t("merge")}
 							</Menu.Item>
-						</Menu.Dropdown>
-					</Menu>
-
-					{/* Container toggle + menu */}
-					<Tooltip
-						label={
-							containerCapability.supported
-								? tn("chapterBar.containers")
-								: containerUnsupportedReason
-						}
-					>
-						<ActionIcon
-							variant={containerPanelOpen ? "light" : "subtle"}
-							color={runningContainers.length > 0 ? "green" : "gray"}
-							size="sm"
-							disabled={!containerCapability.supported}
-							onClick={() => {
-								if (!containerCapability.supported) return;
-								if (hasContainers) {
-									setContainerPanelOpen(!containerPanelOpen);
-								} else {
-									setContainerConfigOpen(true);
-								}
-							}}
-						>
-							<IconPackage size={15} />
-						</ActionIcon>
-					</Tooltip>
-
-					{/* Chapter settings menu */}
-					<Menu position="top-end" withinPortal>
-						<Menu.Target>
-							<Tooltip label={tn("chapterBar.settings")}>
-								<ActionIcon variant="subtle" color="gray" size="sm">
-									<IconSettings size={15} />
-								</ActionIcon>
-							</Tooltip>
-						</Menu.Target>
-						<Menu.Dropdown>
-							{!chapter.isRoot && (
-								<>
-									<Menu.Label>{tn("chapterBar.setRole")}</Menu.Label>
-									{(["branch", "exploration"] as const).map((role) => (
-										<Menu.Item
-											key={role}
-											disabled={chapter.role === role}
-											onClick={() => updateChapter.mutate({ id: chapterId, data: { role } })}
-										>
-											{CHAPTER_ROLE_ICONS[role]} {t(`role.${role}`)}
-										</Menu.Item>
-									))}
-									<Menu.Divider />
-								</>
-							)}
+							<Menu.Divider />
 							{chapter.status === "active" && (
 								<Menu.Item
 									leftSection={<IconMoon size={14} />}
@@ -416,38 +456,40 @@ export function ChapterBar({ chapterId, narratorId, onOpenGitPanel }: ChapterBar
 									{t("wake")}
 								</Menu.Item>
 							)}
-							<Menu.Item
-								leftSection={<IconGraph size={14} />}
-								onClick={() =>
-									navigate({
-										to: "/projects/$projectId",
-										params: { projectId: chapter.projectId },
-									})
-								}
-							>
-								{tn("chapterBar.openInGraph")}
-							</Menu.Item>
+							<Suspense fallback={null}>
+								<NarratorCompatibilityEntry projectId={chapter.projectId} />
+							</Suspense>
 						</Menu.Dropdown>
 					</Menu>
 				</Group>
 			</Group>
 
-			{/* Container panel collapse */}
-			<Collapse expanded={containerCapability.supported && containerPanelOpen && hasContainers}>
-				<div
-					style={{
-						borderBottom: "1px solid var(--mantine-color-default-border)",
-					}}
-				>
-					<Suspense fallback={null}>
-						<ContainerPanel
-							chapterId={chapterId}
-							onOpenConfig={() => setContainerConfigOpen(true)}
-							onContainerError={handleContainerError}
-						/>
-					</Suspense>
-				</div>
-			</Collapse>
+			{/* Existing chapter resources are intentionally separate from the current workspace Git row. */}
+			<Drawer
+				opened={containerCapability.supported && containerPanelOpen && hasContainers}
+				onClose={() => setContainerPanelOpen(false)}
+				position="right"
+				size="lg"
+				title={tn("worktree.legacyContainerTitle")}
+			>
+				<Stack gap="xs">
+					<Text size="sm" fw={600} c="orange" style={{ overflowWrap: "anywhere" }}>
+						{containerSource}
+					</Text>
+					<Text size="xs" c="dimmed">
+						{tn("worktree.legacyContainerWarning")}
+					</Text>
+					{containerPanelOpen && containerCapability.supported && hasContainers && (
+						<Suspense fallback={null}>
+							<ContainerPanel
+								chapterId={chapterId}
+								onOpenConfig={() => setContainerConfigOpen(true)}
+								onContainerError={handleContainerError}
+							/>
+						</Suspense>
+					)}
+				</Stack>
+			</Drawer>
 
 			{/* Modals */}
 			{forkModalOpen && (
@@ -475,6 +517,7 @@ export function ChapterBar({ chapterId, narratorId, onOpenGitPanel }: ChapterBar
 					<ContainerConfigModal
 						chapterId={chapterId}
 						currentConfig={chapter.containerConfig}
+						targetDescription={containerTargetDescription}
 						opened={containerConfigOpen}
 						onClose={() => setContainerConfigOpen(false)}
 					/>

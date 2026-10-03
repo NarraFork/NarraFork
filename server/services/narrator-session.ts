@@ -179,6 +179,7 @@ import {
 } from "./subagent-manual-override";
 import { resolveSubagentModelForRun, subagentRunReasoningEffort } from "./subagent-model";
 import { isTakenOver } from "./subagent-takeover";
+import { buildFinalToolStartAuthorization } from "./tool-final-start-authorization";
 import { resolveEffectiveTraits } from "./trait-layer-service";
 import { worktreeWatcher } from "./worktree-watcher";
 
@@ -509,7 +510,12 @@ export async function applySessionDefaultDevice(
 	active: ActiveNarrator,
 	deviceId: string | null,
 ): Promise<boolean> {
-	return commitNarratorDefaultDevice(narratorId, active, deviceId);
+	await setNarratorDefaultDevice(narratorId, deviceId, {
+		origin: "agent",
+		active,
+		userId: active._currentUserId,
+	});
+	return true;
 }
 
 /**
@@ -548,24 +554,34 @@ export async function getNarratorExecutionDeviceState(narratorId: string): Promi
 export async function setNarratorDefaultDevice(
 	narratorId: string,
 	requestedDeviceId: string | null,
-): Promise<{ defaultDeviceId: string | null }> {
+	options: import("./workspace-context-service").WorkspaceSwitchOptions = { origin: "http" },
+): Promise<{
+	defaultDeviceId: string | null;
+	current: import("@shared/workspace-context").WorkspaceContext;
+}> {
 	const runtime = await assertOAuthNarratorRuntimeActive(narratorId);
 	const projectId = await resolveNarratorProjectId(narratorId);
-	const projectDevices = (await resolveSessionDevices(projectId)) ?? [];
+	const projectDevices = (await resolveSessionDevices(projectId, options.userId)) ?? [];
 	const devices = runtime ? filterOAuthSessionDevices(projectDevices, runtime) : projectDevices;
 	const resolvedDeviceId = resolveNarratorDefaultDeviceRequest(requestedDeviceId, devices, {
 		allowLocal: !runtime,
 		...(runtime ? { authorizedDeviceIds: new Set(runtime.deviceIds) } : {}),
 	});
 
-	const active = activeNarrators.get(narratorId);
-	const committed = await commitNarratorDefaultDevice(
-		narratorId,
-		active?.alive ? active : null,
-		resolvedDeviceId,
-	);
-	if (!committed) throw new NotFoundError("Narrator", narratorId);
-	return { defaultDeviceId: resolvedDeviceId };
+	const { workspaceContextService } = await import("./workspace-context-service");
+	const { current } = await workspaceContextService.switchDevice(narratorId, resolvedDeviceId, {
+		...options,
+		validateDevice: async () => {
+			const latestRuntime = await assertOAuthNarratorRuntimeActive(narratorId);
+			const latestProjectId = await resolveNarratorProjectId(narratorId);
+			const latestDevices = (await resolveSessionDevices(latestProjectId, options.userId)) ?? [];
+			resolveNarratorDefaultDeviceRequest(resolvedDeviceId, latestDevices, {
+				allowLocal: !latestRuntime,
+				...(latestRuntime ? { authorizedDeviceIds: new Set(latestRuntime.deviceIds) } : {}),
+			});
+		},
+	});
+	return { defaultDeviceId: resolvedDeviceId, current };
 }
 
 export async function executeQueuedNewCommand(
@@ -5057,6 +5073,13 @@ async function reExecuteDeniedToolCallUnlocked(
 					reviewReadOnlyBash: isSubagent && narrator.subagentType === "review",
 					allowedTools: oauthRuntime ? new Set(oauthRuntime.allowedTools) : undefined,
 					allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
+					onToolExecutionFinalAuthorization: buildFinalToolStartAuthorization({
+						narratorId,
+						cwd: active.cwd,
+						signal: active.abortController.signal,
+						userId: active._currentUserId,
+						reviewReadOnlyBash: isSubagent && narrator.subagentType === "review",
+					}),
 					runtimeAuthorizationGuard: oauthRuntime
 						? async () => {
 								await assertOAuthNarratorRuntimeActive(narratorId, active._currentUserId);
@@ -7413,6 +7436,21 @@ export interface NarratorStartupProtectionSets {
 }
 
 /** Clean up stale in-progress states left by a previous server run. */
+/** Bounded audit maintenance, also used by isolated restart fixtures. */
+export async function recoverPermissionRuleRequestAuditsOnStartup(): Promise<void> {
+	const { recoverPermissionRuleRequests } = await import("./permission-rule-request-service");
+	let after: string | undefined;
+	do {
+		const page = recoverPermissionRuleRequests({
+			after,
+			limit: 100,
+			reason: "Interrupted by server restart",
+		});
+		after = page.nextCursor;
+		if (after) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+	} while (after);
+}
+
 export async function recoverOnStartup(
 	protection: NarratorStartupProtectionSets = {},
 ): Promise<void> {
@@ -7428,6 +7466,10 @@ export async function recoverOnStartup(
 	// On restart (or hot reload), old fs.watch handles may leak if the previous
 	// process didn't shut down cleanly, causing phantom CPU usage from inotify.
 	worktreeWatcher.shutdown();
+
+	// A restart invalidates attempt-bound approval authority, including approved
+	// rows whose tool had not reached consume. Never apply yesterday's receipt.
+	await recoverPermissionRuleRequestAuditsOnStartup();
 
 	const now = new Date().toISOString();
 	// Legacy status migrations (from older DB versions).
