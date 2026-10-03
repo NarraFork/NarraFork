@@ -30,6 +30,7 @@ import type { NarratorMsg } from "../narrator-panel-types";
 import { type AdapterSegment, adaptSegments } from "./segment-adapter";
 import {
 	buildToolDetailRevision,
+	buildToolDetailStatusRevision,
 	mergeToolDetailPayloads,
 	sameToolDetailRequests,
 	type ToolDetailQueryResult,
@@ -239,6 +240,43 @@ describe("buildToolDetailRevision", () => {
 		expect(buildToolDetailRevision(["b", "a"], [], [])).toBe(
 			buildToolDetailRevision(["a", "b"], [], []),
 		);
+	});
+});
+
+describe("full payload loading state", () => {
+	test("tracks pending and failed requests without including server errors or payload bytes", () => {
+		expect(
+			JSON.parse(
+				buildToolDetailStatusRevision(
+					["a", "b", "c"],
+					[{}, { isError: true }, { data: { inputJson: "private full source" } }],
+				),
+			),
+		).toEqual([
+			["a", "loading"],
+			["b", "error"],
+		]);
+		expect(buildToolDetailStatusRevision([], [])).toBe("[]");
+	});
+
+	test("a failed fetch is not reported as loading forever and preserves layout resolvers", async () => {
+		let rejectRequest: ((reason: Error) => void) | undefined;
+		narratorsApi.getToolCallDetail = () =>
+			new Promise((_resolve, reject) => {
+				rejectRequest = reject;
+			});
+		await render({ narratorId: "owner", toolUseIds: ["failure"], tick: 0 });
+		const pending = renders.at(-1);
+		expect(pending?.resolveToolDetailStatus("failure")).toEqual({ loading: true });
+		rejectRequest?.(new Error("private server path must not reach the row"));
+		await settle();
+		const failed = renders.at(-1);
+		expect(failed?.resolveToolDetailStatus("failure")).toEqual({
+			loading: false,
+			error: "full-tool-payload-unavailable",
+		});
+		expect(failed?.resolveFullToolInput).toBe(pending?.resolveFullToolInput);
+		expect(failed?.resolveFullToolOutput).toBe(pending?.resolveFullToolOutput);
 	});
 });
 

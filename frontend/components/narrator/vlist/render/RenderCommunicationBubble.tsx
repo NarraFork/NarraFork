@@ -10,11 +10,19 @@ import type { MeasuredCommunicationBubble } from "../measure/measure-communicati
 import {
 	INJECTION_BUBBLE_PADDING,
 	INJECTION_HEADER_HEIGHT,
+	INJECTION_NOTE_GAP,
 } from "../measure/measure-injection-bubble";
 import { typographyMetrics } from "../pretext-fonts";
-import { RenderMarkdown } from "./RenderMarkdown";
+import { hasUnpredictableBlock } from "../vlist-unpredictable-blocks";
+import { RenderTextPreview, type TextPreviewLabels } from "./RenderTextPreview";
 
 export interface RenderCommunicationBubbleProps {
+	textPreviewLabels?: TextPreviewLabels;
+	fullTextLoading?: boolean;
+	fullTextError?: string;
+	onToggleTextExpanded?: (bodyKey?: string) => void;
+	/** Accepted for the shared host contract; expanded unknown rows use outer reporting. */
+	onUnknownHeight?: (height: number) => void;
 	measured: MeasuredCommunicationBubble;
 	data?: Partial<
 		Pick<
@@ -34,8 +42,23 @@ export function RenderCommunicationBubble({
 	header,
 	onOpenRecipient,
 	onViewFull,
+	textPreviewLabels,
+	onToggleTextExpanded,
+	fullTextLoading,
+	fullTextError,
+	onUnknownHeight,
 }: RenderCommunicationBubbleProps) {
 	const metrics = typographyMetrics();
+	const textExpanded = measured.textPreview?.expanded === true;
+	const dynamicBody = textExpanded && hasUnpredictableBlock(measured.blocks);
+	// Fetch state must not disable a local collapse. Only another expansion/fetch
+	// is blocked while the first payload request is still pending.
+	const toggleTextExpanded = fullTextLoading && !textExpanded ? undefined : onToggleTextExpanded;
+	const viewFullAction = onToggleTextExpanded
+		? toggleTextExpanded
+		: fullTextLoading
+			? undefined
+			: onViewFull;
 	const textLine: CSSProperties = {
 		font: metrics.font.xs,
 		lineHeight: `${metrics.line.xs}px`,
@@ -45,9 +68,11 @@ export function RenderCommunicationBubble({
 	};
 	const footerLine: CSSProperties = {
 		...textLine,
-		position: "absolute",
-		left: INJECTION_BUBBLE_PADDING,
-		right: INJECTION_BUBBLE_PADDING,
+		position: dynamicBody ? "relative" : "absolute",
+		left: dynamicBody ? undefined : INJECTION_BUBBLE_PADDING,
+		right: dynamicBody ? undefined : INJECTION_BUBBLE_PADDING,
+		marginTop: dynamicBody ? INJECTION_NOTE_GAP : undefined,
+		display: dynamicBody ? "block" : undefined,
 		height: metrics.line.xs,
 	};
 	const chipStyle: CSSProperties = {
@@ -76,7 +101,8 @@ export function RenderCommunicationBubble({
 				style={{
 					position: "relative",
 					width: measured.usedWidth,
-					height: measured.height,
+					height: dynamicBody ? undefined : measured.height,
+					minHeight: dynamicBody ? measured.height : undefined,
 					padding: INJECTION_BUBBLE_PADDING,
 					borderRadius: 8,
 					// Outgoing messages are tinted; incoming injections keep their neutral frame.
@@ -161,25 +187,44 @@ export function RenderCommunicationBubble({
 				<div
 					data-vlist-communication-body
 					style={{
-						position: "absolute",
-						top: measured.bodyTop,
-						left: INJECTION_BUBBLE_PADDING,
-						right: INJECTION_BUBBLE_PADDING,
-						height: measured.bodyHeight,
-						// Native scrollbars must not steal width from the pre-measured lines.
-						scrollbarWidth: "none",
-						overflowY: "auto",
-						overflowX: "hidden",
+						position: dynamicBody ? "relative" : "absolute",
+						top: dynamicBody ? undefined : measured.bodyTop,
+						left: dynamicBody ? undefined : INJECTION_BUBBLE_PADDING,
+						right: dynamicBody ? undefined : INJECTION_BUBBLE_PADDING,
+						marginTop: dynamicBody ? measured.bodyTop - INJECTION_BUBBLE_PADDING : undefined,
+						width: dynamicBody ? measured.contentWidth : undefined,
+						height: dynamicBody ? undefined : measured.bodyHeight,
+						// Expanded unknown content contributes its real height, including
+						// body controls and footers, to the host's outer row reporter.
+						overflowY: dynamicBody ? undefined : "hidden",
+						overflowX: dynamicBody ? undefined : "hidden",
 					}}
 				>
-					<RenderMarkdown measured={{ ...measured, height: measured.frame.contentHeight }} />
+					<RenderTextPreview
+						measured={measured}
+						textPreviewLabels={
+							fullTextLoading && !textExpanded
+								? {
+										...textPreviewLabels,
+										expand: textPreviewLabels?.loading ?? "Loading…",
+										collapse: textPreviewLabels?.loading ?? "Loading…",
+									}
+								: textPreviewLabels
+						}
+						onToggleTextExpanded={toggleTextExpanded}
+						onUnknownHeight={dynamicBody ? undefined : onUnknownHeight}
+					/>
 				</div>
 				{failed ? (
 					<div
 						data-vlist-communication-error
 						role="status"
 						title={measured.errorText || labels?.communicationError}
-						style={{ ...footerLine, top: measured.errorTop, color: "var(--mantine-color-red-6)" }}
+						style={{
+							...footerLine,
+							top: dynamicBody ? undefined : measured.errorTop,
+							color: "var(--mantine-color-red-6)",
+						}}
 					>
 						{measured.errorText || labels?.communicationError || "Error"}
 					</div>
@@ -191,7 +236,7 @@ export function RenderCommunicationBubble({
 						title={measured.warningText}
 						style={{
 							...footerLine,
-							top: measured.warningTop,
+							top: dynamicBody ? undefined : measured.warningTop,
 							color: "var(--mantine-color-dimmed)",
 						}}
 					>
@@ -202,26 +247,31 @@ export function RenderCommunicationBubble({
 					<button
 						type="button"
 						data-vlist-communication-view-full
-						disabled={!onViewFull}
+						disabled={!viewFullAction}
+						aria-busy={fullTextLoading || undefined}
 						onClick={(event) => {
 							event.stopPropagation();
-							onViewFull?.();
+							viewFullAction?.();
 						}}
 						style={{
 							...footerLine,
-							top: measured.viewFullTop,
+							top: dynamicBody ? undefined : measured.viewFullTop,
 							border: 0,
 							padding: 0,
 							background: "none",
 							color: "var(--mantine-color-dimmed)",
 							textAlign: "left",
-							cursor: onViewFull ? "pointer" : "default",
+							cursor: viewFullAction ? "pointer" : "default",
 						}}
 					>
 						<span data-vlist-communication-truncated aria-hidden="true">
 							… ·{" "}
 						</span>
-						{labels?.communicationViewFull ?? "View full message"}
+						{fullTextLoading
+							? (textPreviewLabels?.loading ?? "Loading…")
+							: fullTextError
+								? (textPreviewLabels?.loadFailed ?? fullTextError)
+								: (labels?.communicationTruncated ?? "Source was truncated")}
 					</button>
 				) : null}
 			</div>

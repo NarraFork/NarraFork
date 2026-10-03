@@ -68,12 +68,16 @@ describe("communication bubble geometry", () => {
 	test("caps parsed text and visible height independently", () => {
 		const message = "long message paragraph\n\n".repeat(4000);
 		const measured = measureCommunicationBubble({ message }, 400);
-		expect(measured.measuredMarkdown).toBe(limitCommunicationPreview(message).text);
+		expect(measured.measuredMarkdown).toBe(message.slice(0, COMMUNICATION_BODY_MAX_CHARS));
 		expect(measured.measuredMarkdown.length).toBeLessThanOrEqual(COMMUNICATION_BODY_MAX_CHARS);
-		expect(measured.measuredMarkdown.split("\n").length).toBe(COMMUNICATION_PREVIEW_MAX_LINES);
-		expect(measured.bodyHeight).toBe(COMMUNICATION_BODY_MAX_HEIGHT);
-		expect(measured.isTruncated).toBe(true);
-		expect(measured.viewFullTop).toBeGreaterThan(measured.bodyTop + measured.bodyHeight);
+		expect(measured.frame.contentHeight).toBe(COMMUNICATION_BODY_MAX_HEIGHT);
+		expect(measured.bodyHeight).toBe(
+			COMMUNICATION_BODY_MAX_HEIGHT + (measured.textPreview?.buttonHeight ?? 0),
+		);
+		expect(measured.textPreview?.sourceText).toBe(message);
+		expect(measured.textPreview?.clipped).toBe(true);
+		expect(measured.isTruncated).toBe(false);
+		expect(measured.viewFullTop).toBe(-1);
 		expect(measured.height).toBeLessThan(600);
 	});
 
@@ -85,7 +89,12 @@ describe("communication bubble geometry", () => {
 
 	test("error line stays below the capped message and before the viewer action", () => {
 		const measured = measureCommunicationBubble(
-			{ message: "body\n\n".repeat(2000), status: "error", error: "delivery failed ".repeat(500) },
+			{
+				message: "body\n\n".repeat(2000),
+				sourceTruncated: true,
+				status: "error",
+				error: "delivery failed ".repeat(500),
+			},
 			500,
 		);
 		expect(measured.errorTop).toBeGreaterThan(measured.bodyTop + measured.bodyHeight);

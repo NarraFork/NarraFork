@@ -98,6 +98,7 @@ const PROP_KEYS = {
 	specTaskLive: true,
 	onQuoteJump: true,
 	onFetchAttachment: true,
+	resolveToolDetailStatus: true,
 } satisfies Record<keyof ExactRowProps, true>;
 
 describe("window row element frames", () => {

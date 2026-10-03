@@ -54,7 +54,7 @@ import {
 	SPACING,
 	typographyMetrics,
 } from "../pretext-fonts";
-import { measureMarkdown } from "./measure-markdown";
+import { measureTextPreview } from "./measure-text-preview";
 
 // ── Chrome constants (px) — from CONTRACT.md §4 + ReasoningBlock / CountLine ──
 /** Group py={2} on every header / count / streaming row. */
@@ -124,6 +124,7 @@ export interface ReasoningBlockData {
 }
 
 export interface ReasoningExpandState {
+	textExpanded?: boolean;
 	/** Whether the block is expanded (resolved upstream from LOD + user pref). */
 	expanded?: boolean;
 	/**
@@ -278,7 +279,9 @@ export function measureReasoning(
 
 	// Expanded: header row + body (markdown at sm, see file header note).
 	const innerWidth = reasoningBodyInnerWidth(contentWidth);
-	const md = measureMarkdown(displayText, innerWidth, {
+	const md = measureTextPreview(displayText, innerWidth, {
+		textExpanded: expandState.textExpanded,
+		direction: data.isStreaming ? "tail" : "head",
 		...(expandState.preparedBlocks ? { preparedBlocks: expandState.preparedBlocks } : {}),
 	});
 	const withToggle = hasTranslation(data);
@@ -286,10 +289,11 @@ export function measureReasoning(
 
 	const bodyTop = headerH;
 	const bodyLeft = REASONING_BODY_PADDING_LEFT + REASONING_BODY_BORDER_LEFT;
-	const height = headerH + REASONING_BODY_PADDING_Y * 2 + md.frame.contentHeight + toggleHeight;
+	const height = headerH + REASONING_BODY_PADDING_Y * 2 + md.height + toggleHeight;
 
 	return {
 		height,
+		textPreview: md.textPreview,
 		// Body markdown blocks/frame flow through to the renderer (RenderMarkdown).
 		blocks: md.blocks,
 		frame: md.frame,

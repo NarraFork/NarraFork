@@ -32,6 +32,114 @@ function elementType(node: React.ReactNode): unknown {
 }
 
 describe("render-registry dispatch", () => {
+	it("keeps read-only ExactRow text disclosure live and rebinds callbacks by spec key", async () => {
+		const { parseHTML } = await import("linkedom");
+		const { act } = await import("react");
+		const { createRoot } = await import("react-dom/client");
+		const { MantineProvider } = await import("@mantine/core");
+		const { installCanvasStub } = await import("./measure/test-canvas-stub");
+		installCanvasStub();
+		const { window: win } = parseHTML("<!doctype html><html><body></body></html>");
+		Object.assign(globalThis, {
+			window: win,
+			document: win.document,
+			navigator: win.navigator,
+			HTMLElement: win.HTMLElement,
+			Element: win.Element,
+			Node: win.Node,
+			IS_REACT_ACT_ENVIRONMENT: true,
+		});
+		const { ExactRow } = await import("./ExactRow");
+		const { measureInjectionBubble } = await import("./measure/measure-injection-bubble");
+		const markdown = "line of full content\n\n".repeat(500);
+		const measured = measureInjectionBubble({ markdown }, 400, 5);
+		const host = document.createElement("div");
+		document.body.appendChild(host);
+		const root = createRoot(host);
+		const calls: string[] = [];
+		let bubbled = 0;
+
+		const labels = { textPreview: { expand: "展开内容", collapse: "收起正文" } };
+		const tree = (key: string) => (
+			<MantineProvider>
+				<fieldset
+					onKeyDown={() => {}}
+					onClick={() => {
+						bubbled++;
+					}}
+				>
+					<ExactRow
+						item={{ spec: { kind: "injection-bubble", key, data: { markdown } }, measured }}
+						top={0}
+						height={measured.height}
+						hitHeight={measured.height}
+						contentWidth={400}
+						itemId={undefined}
+						sourceIds={[]}
+						interactionSig="read-only"
+						toggles={{
+							onToggle: () => {},
+							onToggleItems: () => {},
+							onToggleEarlier: () => {},
+							onToggleRow: () => {},
+							onToggleTranslation: () => {},
+							onTogglePrompt: () => {},
+							onToggleFileChanges: () => {},
+							onToggleTextExpanded: () => calls.push(key),
+						}}
+						renderLabels={labels as never}
+						narratorId="public-share"
+					/>
+				</fieldset>
+			</MantineProvider>
+		);
+		try {
+			await act(async () => {
+				root.render(tree("first"));
+			});
+			expect(host.querySelector("[data-block-id]")).toBeNull();
+			const first = host.querySelector("[data-vlist-text-preview-toggle]");
+			if (!first) throw new Error("Missing read-only text preview toggle");
+			expect(first.textContent).toBe("展开内容");
+			await act(async () => {
+				first.dispatchEvent(new win.Event("click", { bubbles: true }));
+			});
+			await act(async () => {
+				root.render(tree("second"));
+			});
+			await act(async () => {
+				host
+					.querySelector("[data-vlist-text-preview-toggle]")
+					?.dispatchEvent(new win.Event("click", { bubbles: true }));
+			});
+			expect(calls).toEqual(["first", "second"]);
+			expect(bubbled).toBe(0);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			host.remove();
+		}
+	});
+
+	it.each([
+		"injection-bubble",
+		"communication-bubble",
+		"reasoning",
+		"reasoning-steps",
+		"activity-trace",
+	] as const)("forwards reader-only text preview controls to %s", (kind) => {
+		const labels = { expand: "展开内容", collapse: "收起正文" };
+		const toggle = (_bodyKey?: string) => {};
+		const node = unwrapScope(
+			renderElement(kind, STUB, { textPreviewLabels: labels, onToggleTextExpanded: toggle }),
+		);
+		expect(isValidElement(node)).toBe(true);
+		const props = (node as React.ReactElement<Record<string, unknown>>).props;
+		expect(props.textPreviewLabels).toBe(labels);
+		expect(props.onToggleTextExpanded).toBe(toggle);
+	});
+
 	it("returns a valid React element for every registered kind", () => {
 		for (const kind of VLIST_ELEMENT_KINDS) {
 			const extra: RenderExtra = kindExtra(kind);

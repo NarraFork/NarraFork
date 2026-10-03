@@ -106,13 +106,63 @@ describe("hostsUnpredictableBlock", () => {
 		expect(hostsUnpredictableBlock("reasoning", measured([]))).toBe(false);
 	});
 
+	it("a preview's fixed body viewport cannot acquire a full-content override", () => {
+		const element = measured([unknown("mermaid")]);
+		element.textPreview = {
+			sourceText: "```mermaid\ngraph TD; A-->B;\n```",
+			previewText: "```mermaid\ngraph TD; A-->B;\n```",
+			charCount: 35,
+			expanded: false,
+			clipped: true,
+			direction: "head",
+			plainText: false,
+			bodyHeight: 240,
+			buttonHeight: 25,
+			sourceStart: 0,
+		};
+		for (const kind of ["reasoning", "injection-bubble", "communication-bubble"]) {
+			expect(hostsUnpredictableBlock(kind, element)).toBe(false);
+			expect(
+				hostsUnpredictableBlock(kind, {
+					...element,
+					textPreview: { ...element.textPreview, expanded: true },
+				}),
+			).toBe(true);
+		}
+		for (const kind of ["activity-trace", "reasoning-steps"]) {
+			const trace = { ...measured([]), rows: [{ expanded: true, body: element }] };
+			expect(hostsUnpredictableBlock(kind, trace)).toBe(false);
+			expect(
+				hostsUnpredictableBlock(kind, {
+					...trace,
+					rows: [
+						{
+							expanded: true,
+							body: { ...element, textPreview: { ...element.textPreview, expanded: true } },
+						},
+					],
+				} as MeasuredElement),
+			).toBe(true);
+			// An embedded tool card's own fixed viewport is not a reasoning body.
+			expect(
+				hostsUnpredictableBlock(kind, {
+					...trace,
+					rows: [{ cardMeasured: element }],
+				} as MeasuredElement),
+			).toBe(false);
+		}
+	});
+
 	it("keeps the forwarding-kind set minimal and explicit", () => {
 		expect([...UNKNOWN_HEIGHT_FORWARDING_KINDS].sort()).toEqual([
+			"activity-trace",
+			"communication-bubble",
 			"injection-bubble",
 			"markdown",
 			"message-bubble",
 			"plan-card",
 			"reasoning",
+			"reasoning-steps",
 		]);
 	});
 });

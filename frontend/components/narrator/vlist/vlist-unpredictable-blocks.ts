@@ -45,14 +45,38 @@ export function hasUnpredictableBlock(blocks: readonly PreparedBlock[]): boolean
  * True when a measured element hosts an unpredictable block AND its render path
  * actually forwards `onUnknownHeight`.
  *
- * The kind gate matters: only `markdown`, `message-bubble`, `reasoning` and
- * `plan-card` forward the callback (see render-registry). A tool card holds its
- * bodies in capped, internally scrolling boxes and deliberately does NOT forward it
+ * The kind gate matters: only the explicit forwarding kinds below participate
+ * (see render-registry). Expanded trace bodies use their own local reflow before
+ * reporting the whole row. A tool card holds its bodies in capped, internally
+ * scrolling boxes and deliberately does NOT forward it
  * — marking such a row dynamic would drop its fixed-height clip and let the card
  * decide its own height, which is exactly what the cap exists to prevent.
  */
 export function hostsUnpredictableBlock(kind: string, measured: MeasuredElement): boolean {
 	if (!UNKNOWN_HEIGHT_FORWARDING_KINDS.has(kind)) return false;
+	if (kind === "activity-trace" || kind === "reasoning-steps") {
+		// Tool cards deliberately keep their own capped geometry. Only a reader's
+		// explicitly expanded reasoning body can make the trace dynamic.
+		const rows = (
+			measured as MeasuredElement & {
+				rows?: { expanded?: boolean; body?: MeasuredElement | null }[];
+			}
+		).rows;
+		return (
+			rows?.some(
+				(row) =>
+					row.expanded === true &&
+					row.body?.textPreview?.expanded === true &&
+					hasUnpredictableBlock(row.body.blocks),
+			) ?? false
+		);
+	}
+	// A text preview owns a fixed body viewport, even when it contains a diagram.
+	// Admitting it to the dynamic set would let the post-paint override replace
+	// the capped height with the full content height. Explicit expansion restores
+	// the existing controlled exception; editors and permission forms use their
+	// own dynamic-row gates and are intentionally unaffected.
+	if (measured.textPreview && !measured.textPreview.expanded) return false;
 	return hasUnpredictableBlock(measured.blocks);
 }
 
@@ -73,4 +97,7 @@ export const UNKNOWN_HEIGHT_FORWARDING_KINDS: ReadonlySet<string> = new Set([
 	// the flowing path while the row stays a fixed clip box and the diagram is cut off
 	// with nobody able to report the correction.
 	"injection-bubble",
+	"communication-bubble",
+	"activity-trace",
+	"reasoning-steps",
 ]);

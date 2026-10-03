@@ -17,6 +17,61 @@ beforeAll(() => {
 	installCanvasStub();
 });
 
+describe("text preview cache keys", () => {
+	it("budgets the full preview source and nested trace bodies, not visible geometry", async () => {
+		const { retainedBodySourceChars, MeasureCache } = await import("./measure-cache");
+		const sourceText = "x".repeat(200);
+		const stub = {
+			height: 20,
+			blocks: [],
+			frame: { blocks: [], contentHeight: 20, usedWidth: 10 },
+			contentWidth: 10,
+			usedWidth: 10,
+		};
+		const body = { ...stub, textPreview: { sourceText } };
+		expect(retainedBodySourceChars(body)).toBe(200);
+		expect(retainedBodySourceChars({ rows: [{ body }] })).toBe(200);
+		const cache = new MeasureCache(100, 100);
+		cache.set("oversized-preview", body as never);
+		expect(cache.size).toBe(0);
+	});
+
+	it("invalidates hydration hidden behind an identical communication preview", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const data = (text: string, truncated: boolean) => ({
+			message: "prefix",
+			messageTruncated: true,
+			messageBody: { text, textTruncated: truncated },
+		});
+		expect(extractDataRevision(data("prefix first", true))).not.toBe(
+			extractDataRevision(data("prefix second", false)),
+		);
+	});
+
+	it("keys direct text expansion independently from card expansion", async () => {
+		const { buildCacheKey } = await import("./measure-cache");
+		const key = (opts: Record<string, unknown>) => buildCacheKey("body", "reasoning", 400, 5, opts);
+		expect(key({ expanded: true, textExpanded: false })).not.toBe(
+			key({ expanded: true, textExpanded: true }),
+		);
+	});
+
+	it("treats trace body keys as a set without comma or ordering collisions", async () => {
+		const { buildCacheKey } = await import("./measure-cache");
+		const key = (keys: string[]) =>
+			buildCacheKey("trace", "activity-trace", 400, 2, { textExpandedKeys: keys });
+		expect(key(["b", "a"])).toBe(key(["a", "b", "a"]));
+		expect(key(["a,b"])).not.toBe(key(["a", "b"]));
+		expect(key(["0"])).not.toBe(key(["1"]));
+	});
+
+	it("invalidates same-length edits to a trace's original body", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const data = (body: string) => ({ steps: [{ key: "seg0", title: "step", body }] });
+		expect(extractDataRevision(data("first"))).not.toBe(extractDataRevision(data("other")));
+	});
+});
+
 describe("mixed action-card append cache locality", () => {
 	it.each([
 		"tool",

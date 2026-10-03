@@ -70,9 +70,17 @@ export function sameToolDetailRequests(
 	);
 }
 
+export interface ToolDetailLoadStatus {
+	loading: boolean;
+	/** Opaque failure marker; the row supplies a localized explanation. */
+	error?: string;
+}
+
 export type UseVListToolDetailsResult = Required<
 	Pick<AdapterContext, "resolveFullToolInput" | "resolveFullToolOutput">
->;
+> & {
+	resolveToolDetailStatus: (toolUseId: string, ref?: ToolCallDetailRef) => ToolDetailLoadStatus;
+};
 
 /** Use the same identity for React Query, retention, and adapter lookups. */
 export function toolDetailIdentityKey(toolUseId: string, ref?: ToolCallDetailRef): string {
@@ -81,7 +89,22 @@ export function toolDetailIdentityKey(toolUseId: string, ref?: ToolCallDetailRef
 
 export type ToolDetailQueryResult = {
 	data?: { inputJson?: unknown; outputJson?: unknown } | undefined;
+	isError?: boolean;
 };
+
+/** A comparable status signal, separate from the settled-payload revision. */
+export function buildToolDetailStatusRevision(
+	identityKeys: readonly string[],
+	results: readonly ToolDetailQueryResult[],
+): string {
+	return JSON.stringify(
+		identityKeys.flatMap((key, index) => {
+			const result = results[index];
+			if (result?.data) return [];
+			return [[key, result?.isError ? "error" : "loading"]];
+		}),
+	);
+}
 
 /**
  * Which exact identity keys currently have a settled payload, as a plain string.
@@ -185,12 +208,15 @@ export function useVListToolDetails(
 		(results: readonly ToolDetailQueryResult[]) => {
 			const merged = mergeToolDetailPayloads(payloads.current, wantedKeys, results);
 			payloads.current = merged;
-			return buildToolDetailRevision([...merged.keys()], wantedKeys, results);
+			return {
+				revision: buildToolDetailRevision([...merged.keys()], wantedKeys, results),
+				statusRevision: buildToolDetailStatusRevision(wantedKeys, results),
+			};
 		},
 		[payloads, wantedKeys],
 	);
 
-	const revision = useQueries({
+	const snapshot = useQueries({
 		queries: wanted.map((request) => ({
 			queryKey: toolCallDetailQueryKey(narratorId, request.toolUseId, request),
 			queryFn: ({ signal }: { signal: AbortSignal }) =>
@@ -204,19 +230,36 @@ export function useVListToolDetails(
 		combine,
 	});
 
-	return useMemo<UseVListToolDetailsResult>(() => {
-		// Retain bodies even after their now-untruncated cards leave the wanted set.
-		// Only a new settled identity (or narrator) changes these resolver functions.
-		void revision;
+	const resolvers = useMemo(() => {
+		// Loading/error updates must not rebuild prepared layout: only settled
+		// payloads change these two adapter-facing function identities.
+		void snapshot.revision;
 		return {
-			resolveFullToolInput: (toolUseId, ref) =>
+			resolveFullToolInput: (toolUseId: string | undefined, ref?: ToolCallDetailRef) =>
 				toolUseId
 					? payloads.current.get(toolDetailIdentityKey(toolUseId, ref))?.inputJson
 					: undefined,
-			resolveFullToolOutput: (toolUseId, ref) =>
+			resolveFullToolOutput: (toolUseId: string | undefined, ref?: ToolCallDetailRef) =>
 				toolUseId
 					? payloads.current.get(toolDetailIdentityKey(toolUseId, ref))?.outputJson
 					: undefined,
 		};
-	}, [payloads, revision]);
+	}, [payloads, snapshot.revision]);
+
+	const resolveToolDetailStatus = useMemo(() => {
+		const status = new Map<string, string>(JSON.parse(snapshot.statusRevision));
+		return (toolUseId: string, ref?: ToolCallDetailRef): ToolDetailLoadStatus => {
+			const key = toolDetailIdentityKey(toolUseId, ref);
+			if (payloads.current.has(key)) return { loading: false };
+			const state = status.get(key);
+			return state === "error"
+				? { loading: false, error: "full-tool-payload-unavailable" }
+				: { loading: state === "loading" };
+		};
+	}, [payloads, snapshot.statusRevision]);
+
+	return useMemo(
+		() => ({ ...resolvers, resolveToolDetailStatus }),
+		[resolvers, resolveToolDetailStatus],
+	);
 }

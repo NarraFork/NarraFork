@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 dist/
 # Required bundled model metadata, imported directly by the runtime.
 !shared/model-catalog/dist/
@@ -95,6 +95,8 @@ scripts/lib/__tests__/*
 !scripts/smoke-write-stream-fixture.tsx
 !scripts/smoke-write-stream-data.ts
 !scripts/smoke-write-stream-data.test.ts
+!scripts/smoke-vlist-text-preview.ts
+!scripts/smoke-vlist-text-preview-fixture.tsx
 # Monaco regression sources are required in fresh clones; generated reports stay ignored.
 !scripts/smoke-monaco-large-file*.ts
 !scripts/smoke-monaco-large-file*.tsx

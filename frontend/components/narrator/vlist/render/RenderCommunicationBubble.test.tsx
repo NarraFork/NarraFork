@@ -113,7 +113,7 @@ describe("outgoing communication bubble", () => {
 		expect(chip?.props.onContextMenu).toBeUndefined();
 	});
 
-	test("long message keeps errors visible and opens full text through the host", () => {
+	test("long message keeps errors visible and offers an in-place disclosure", () => {
 		const longData = {
 			...data,
 			message: "paragraph\n\n".repeat(4000),
@@ -121,32 +121,35 @@ describe("outgoing communication bubble", () => {
 			error: "Recipient unavailable",
 		};
 		const measured = measureCommunicationBubble(longData, 800);
-		let opened = false;
 		const props = {
 			measured,
 			data: longData,
-			onViewFull: () => {
-				opened = true;
-			},
+			textPreviewLabels: { expand: "展开内容", collapse: "收起内容" },
+			onToggleTextExpanded: () => {},
 		};
 		const document = render(props);
 		expect(
 			document.querySelector("[data-vlist-communication-body]")?.getAttribute("style"),
-		).toContain("height:480px");
+		).toContain(`height:${measured.bodyHeight}px`);
 		expect(document.querySelector("[data-vlist-communication-error]")?.textContent).toBe(
 			"Recipient unavailable",
 		);
-		expect(document.querySelector("[data-vlist-communication-view-full]")?.textContent).toBe(
-			"… · 查看全文",
+		expect(document.querySelector("[data-vlist-communication-view-full]")).toBeNull();
+		expect(document.querySelector("[data-vlist-text-preview-toggle]")?.textContent).toBe(
+			"展开内容",
 		);
-		expect(document.querySelector("[data-vlist-communication-truncated]")?.textContent).toBe(
-			"… · ",
-		);
-		const action = marker(RenderCommunicationBubble(props), "data-vlist-communication-view-full");
-		(action?.props.onClick as (event: { stopPropagation: () => void }) => void)({
-			stopPropagation: () => {},
+		expect(
+			document.querySelector("[data-vlist-text-preview-toggle]")?.getAttribute("aria-expanded"),
+		).toBe("false");
+		expect(document.querySelectorAll("[data-vlist-line]").length).toBeLessThanOrEqual(12);
+		const expanded = render({
+			...props,
+			measured: measureCommunicationBubble(longData, 800, 4, { textExpanded: true }),
 		});
-		expect(opened).toBe(true);
+		expect(expanded.querySelector("[data-vlist-text-preview-toggle]")?.textContent).toBe(
+			"收起内容",
+		);
+		expect(expanded.querySelectorAll("[data-vlist-line]").length).toBeGreaterThan(12);
 	});
 
 	test("broadcast, unknown recipients, await and cancelled states retain localized labels", () => {

@@ -4,6 +4,10 @@ export interface VListInteractionState {
 	lod: RenderLod;
 	/** Normal card/reasoning preference; survives LOD changes. */
 	expanded: ReadonlyMap<string, boolean>;
+	/** Full body preference, independent of card folds, LOD and payload fetching. */
+	textExpanded: ReadonlySet<string>;
+	/** Raw row/body keys associated with a durable lifecycle preference. */
+	textExpansionOwners: ReadonlyMap<string, string>;
 	/** Temporary force-open state for L4 / old-L5 cards; reset on LOD change. */
 	lodUserOverrides: ReadonlySet<string>;
 	showEarlier: ReadonlySet<string>;
@@ -79,6 +83,8 @@ export function createVListInteractionState(lod: RenderLod): VListInteractionSta
 	return {
 		lod,
 		expanded: new Map(),
+		textExpanded: new Set(),
+		textExpansionOwners: new Map(),
 		lodUserOverrides: new Set(),
 		showEarlier: new Set(),
 		expandedRows: new Map(),
@@ -98,6 +104,8 @@ export function resetVListInteractionStateForLod(
 	return {
 		...createVListInteractionState(lod),
 		expanded: state.expanded,
+		textExpanded: state.textExpanded,
+		textExpansionOwners: state.textExpansionOwners,
 		showOriginal: state.showOriginal,
 		// A CONTENT preference, like `expanded`/`showOriginal`, not a fold state:
 		// after an LOD change the reader still wants that full payload, and dropping
@@ -109,6 +117,70 @@ export function resetVListInteractionStateForLod(
 		// Survives an LOD change like every other reader-owned fold state.
 		fileChangesOpen: state.fileChangesOpen,
 	};
+}
+
+/** Tuple encoding avoids collisions between a direct body and arbitrary trace row keys. */
+export function textExpansionKey(specKey: string, bodyKey?: string): string {
+	return JSON.stringify([specKey, bodyKey ?? null]);
+}
+
+export function isVListTextExpanded(
+	state: VListInteractionState,
+	specKey: string,
+	bodyKey?: string,
+): boolean {
+	return state.textExpanded.has(textExpansionKey(specKey, bodyKey));
+}
+
+/** A row-local memo term: changes to another spec's body must not repaint this row. */
+export function textExpansionSignature(state: VListInteractionState, specKey: string): string {
+	const prefix = `${JSON.stringify([specKey]).slice(0, -1)},`;
+	return JSON.stringify([...state.textExpanded].filter((key) => key.startsWith(prefix)).sort());
+}
+
+export function toggleVListTextExpanded(
+	state: VListInteractionState,
+	specKey: string,
+	bodyKey?: string,
+): VListInteractionState {
+	return setVListTextExpanded(
+		state,
+		specKey,
+		!isVListTextExpanded(state, specKey, bodyKey),
+		bodyKey,
+	);
+}
+
+/** Set both the clicked row and its durable body identity; collapse clears every
+ * registered hand-off alias so an old live row cannot retain a stale true value.
+ */
+export function setVListTextExpanded(
+	state: VListInteractionState,
+	specKey: string,
+	expanded: boolean,
+	bodyKey?: string,
+	canonicalSpecKey = specKey,
+	// Explicit null addresses a canonical DIRECT body from a raw trace row slot.
+	canonicalBodyKey: string | null = bodyKey ?? null,
+): VListInteractionState {
+	const raw = textExpansionKey(specKey, bodyKey);
+	const canonical = textExpansionKey(canonicalSpecKey, canonicalBodyKey ?? undefined);
+	const next = new Set(state.textExpanded);
+	const owners = new Map(state.textExpansionOwners);
+	if (expanded) {
+		next.add(raw);
+		next.add(canonical);
+		if (raw !== canonical) owners.set(raw, canonical);
+	} else {
+		next.delete(raw);
+		next.delete(canonical);
+		for (const [key, owner] of owners) {
+			if (owner !== canonical) continue;
+			next.delete(key);
+			owners.delete(key);
+		}
+	}
+	return { ...state, textExpanded: next, textExpansionOwners: owners };
 }
 
 export function setVListExpanded(

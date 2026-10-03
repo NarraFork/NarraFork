@@ -42,7 +42,7 @@ import {
 	type VListViewTarget,
 } from "./vlist-content-view-target";
 import type { VListEditRole } from "./vlist-edit-target";
-import type { VListInteractionState } from "./vlist-interaction-state";
+import { textExpansionSignature, type VListInteractionState } from "./vlist-interaction-state";
 import type { VListItem } from "./vlist-pipeline";
 import type { VListRowActionTarget, VListRowToolActions } from "./vlist-row-actions";
 import { sameBoundActionKeys, sameNumberList } from "./vlist-row-payload-reuse";
@@ -396,7 +396,7 @@ export function rowInteractionSig(state: VListInteractionState, key: string): st
 	// The file-list fold changes how many rows are DRAWN, so it must move the opts
 	// signature — otherwise expanding it would not re-measure the card.
 	const fileChangesOpen = state.fileChangesOpen.has(key) ? 1 : 0;
-	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${traceRowsSig}:${promptOpen}:${fileChangesOpen}`;
+	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${traceRowsSig}:${promptOpen}:${fileChangesOpen}:${textExpansionSignature(state, key)}`;
 }
 
 /**
@@ -491,6 +491,8 @@ export interface RowToggles {
 	onToggleRow: (rowIndex: number, rowKey?: string) => void;
 	/** Flip a translated body between its translation and the original. */
 	onToggleTranslation: () => void;
+	/** Full body expansion, not the card/trace-row fold. */
+	onToggleTextExpanded?: (bodyKey?: string) => void;
 	/**
 	 * Fold / unfold a subagent card's PROMPT body — a second, independent fold
 	 * inside the card (parity with the chunked SubagentCard's `showPrompt`).

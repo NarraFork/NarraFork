@@ -51,7 +51,7 @@ import {
 	IconDots,
 	IconTool,
 } from "@tabler/icons-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "../vlist-markdown.css";
 import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
 import {
@@ -76,12 +76,19 @@ import {
 	type TraceVariant,
 	traceMetrics,
 } from "../measure/measure-tool-run";
+import type { MeasuredElement } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
+import {
+	applyTraceUnknownHeights,
+	isExpandedUnknownTraceBody,
+	retainTraceUnknownHeights,
+	type TraceUnknownBodyHeights,
+} from "../vlist-trace-unknown-heights";
 import { CategoryChip } from "./category-chip";
 import { categoryIcon } from "./category-icons";
 import { DiffStatsText } from "./diff-stats-text";
 import { activateOnKey, swallowSelectionClick } from "./key-activate";
-import { RenderMarkdown } from "./RenderMarkdown";
+import { RenderTextPreview, type TextPreviewLabels } from "./RenderTextPreview";
 import { CATEGORY_COLOR, ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
 import {
 	isTerminalToolRowStatus,
@@ -239,6 +246,10 @@ export type TraceRowLiveTails = ReadonlyMap<string, { charCount: number; tail: s
 export type TraceRowCardSlot = (row: MeasuredTraceRow) => React.ReactNode | null;
 
 interface RenderToolRunProps {
+	/** Controlled correction for fully expanded unpredictable markdown, including trace chrome. */
+	onUnknownHeight?: (height: number) => void;
+	textPreviewLabels?: TextPreviewLabels;
+	onToggleTextExpanded?: (bodyKey?: string) => void;
 	measured: MeasuredCollapsibleTrace;
 	labels?: TraceRenderLabels;
 	/** Row icon slot injected by the caller (keeps @tabler category icons out of
@@ -309,7 +320,82 @@ interface RenderToolRunProps {
  * height; the header band, toggle row, and item rows (+ expanded bodies) are
  * absolutely positioned at their measured tops.
  */
-export function RenderToolRun({
+export function RenderToolRun(props: RenderToolRunProps) {
+	// Keep this dispatcher hook-free: ordinary traces are also rendered directly
+	// by pure callers. Only this controlled exception mounts a stateful boundary.
+	return props.measured.rows.some(isExpandedUnknownTraceBody) ? (
+		<UnknownHeightTrace {...props} />
+	) : (
+		RenderMeasuredToolRun(props)
+	);
+}
+
+function UnknownHeightTrace(props: RenderToolRunProps) {
+	const [heights, setHeights] = useState<TraceUnknownBodyHeights>(() => new Map());
+	const committedRef = useRef(props.measured);
+	const observingRef = useRef(true);
+	const callbackCache = useRef(
+		new Map<string, { body: MeasuredElement; report: (height: number) => void }>(),
+	);
+	useLayoutEffect(() => {
+		observingRef.current = true;
+		committedRef.current = props.measured;
+		setHeights((previous) => retainTraceUnknownHeights(props.measured, previous));
+		return () => {
+			observingRef.current = false;
+		};
+	}, [props.measured]);
+	const report = useCallback((key: string, body: MeasuredElement, height: number) => {
+		if (!observingRef.current) return;
+		const current = committedRef.current;
+		const row = current.rows.find((candidate) => candidate.key === key);
+		if (
+			row?.body !== body ||
+			!isExpandedUnknownTraceBody(row) ||
+			!Number.isFinite(height) ||
+			height <= 0
+		)
+			return;
+		const rounded = Math.round(height);
+		setHeights((previous) => {
+			const retained = retainTraceUnknownHeights(current, previous);
+			const old = retained.get(key);
+			if (Math.abs((old?.height ?? body.frame.contentHeight) - rounded) <= 1) return retained;
+			const next = new Map(retained);
+			next.set(key, { originalBodyRef: body, height: rounded });
+			return next;
+		});
+	}, []);
+	const reporters = useMemo(() => {
+		const next = new Map<string, (height: number) => void>();
+		const active = new Set<string>();
+		for (const row of props.measured.rows) {
+			if (!isExpandedUnknownTraceBody(row) || !row.body) continue;
+			const body = row.body;
+			active.add(row.key);
+			let cached = callbackCache.current.get(row.key);
+			if (cached?.body !== body) {
+				cached = { body, report: (height) => report(row.key, body, height) };
+				callbackCache.current.set(row.key, cached);
+			}
+			next.set(row.key, cached.report);
+		}
+		for (const key of callbackCache.current.keys()) {
+			if (!active.has(key)) callbackCache.current.delete(key);
+		}
+		return next;
+	}, [props.measured, report]);
+	const measured = useMemo(
+		() => applyTraceUnknownHeights(props.measured, heights),
+		[props.measured, heights],
+	);
+	useLayoutEffect(() => {
+		props.onUnknownHeight?.(measured.height);
+	}, [measured.height, props.onUnknownHeight]);
+	return RenderMeasuredToolRun({ ...props, measured, bodyHeightReporters: reporters });
+}
+
+function RenderMeasuredToolRun({
 	measured,
 	labels = {},
 	rowIcon,
@@ -323,7 +409,10 @@ export function RenderToolRun({
 	animateStreaming,
 	animKeyBase,
 	animScope,
-}: RenderToolRunProps) {
+	textPreviewLabels,
+	onToggleTextExpanded,
+	bodyHeightReporters,
+}: RenderToolRunProps & { bodyHeightReporters?: ReadonlyMap<string, (height: number) => void> }) {
 	if (measured.itemCount === 0) return null;
 	const { header, toggle, rows, variant } = measured;
 	const headerColor = variantHeaderColor(variant);
@@ -420,6 +509,9 @@ export function RenderToolRun({
 				<TraceRowView
 					key={row.key}
 					row={row}
+					onBodyUnknownHeight={bodyHeightReporters?.get(row.key)}
+					textPreviewLabels={textPreviewLabels}
+					onToggleTextExpanded={onToggleTextExpanded}
 					rowIcon={rowIcon}
 					onToggleRow={onToggleRow}
 					rowInteraction={rowInteraction}
@@ -785,7 +877,13 @@ function TraceRowView({
 	animateStreaming,
 	animKeyBase,
 	animScope,
+	textPreviewLabels,
+	onToggleTextExpanded,
+	onBodyUnknownHeight,
 }: {
+	onBodyUnknownHeight?: (height: number) => void;
+	textPreviewLabels?: TextPreviewLabels;
+	onToggleTextExpanded?: (bodyKey?: string) => void;
 	row: MeasuredTraceRow;
 	rowIcon?: (row: MeasuredTraceRow) => React.ReactNode;
 	onToggleRow?: (itemIndex: number, rowKey: string) => void;
@@ -1074,8 +1172,12 @@ function TraceRowView({
 						opacity: 0.75,
 					}}
 				>
-					<RenderMarkdown
+					<RenderTextPreview
+						textPreviewLabels={textPreviewLabels}
+						onToggleTextExpanded={onToggleTextExpanded}
+						bodyKey={row.key ?? String(row.itemIndex)}
 						measured={row.body}
+						onUnknownHeight={onBodyUnknownHeight}
 						animateStreaming={animateStreaming}
 						sealOnMount
 						animKeyBase={animKeyBase}

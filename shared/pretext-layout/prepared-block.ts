@@ -26,6 +26,7 @@
 
 import type { PreparedTextWithSegments } from "@chenglou/pretext";
 import type { PreparedRichInline } from "@chenglou/pretext/rich-inline";
+import type { TextPreview } from "./text-preview";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Render LOD (mirrors RenderLodCtx). Height models MUST take LOD as input.
@@ -122,6 +123,8 @@ export interface InlineMathFragment {
 
 /** Fenced code block (pre-wrap monospace). */
 export interface PreparedCodeBlock extends PreparedBlockBase {
+	/** null means only a preview is available: never offer it as full code. */
+	copyText?: string | null;
 	kind: "code";
 	/** pretext prepared pre-wrap text with segments. */
 	prepared: PreparedTextWithSegments;
@@ -252,6 +255,10 @@ export type PreparedBlock =
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface BlockFrame {
+	/** Local vertical offset skipped by a bounded tail render. */
+	renderOffset?: number;
+	/** Materialize only the visible lines/cells, never hidden body content. */
+	renderLimited?: boolean;
 	/** Index into the source PreparedBlock[]. */
 	index: number;
 	/** Resolved top offset (px) within the element content box. */
@@ -276,6 +283,8 @@ export interface ElementFrame {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface MeasuredElement {
+	/** Shared bounded-body preview contract; outer chrome remains independent. */
+	textPreview?: TextPreview;
 	/** Total element height (px), including the element's own outer chrome. */
 	height: number;
 	/** The prepared blocks (for later render materialization). */

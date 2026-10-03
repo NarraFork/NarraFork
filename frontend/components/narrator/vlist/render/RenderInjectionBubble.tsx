@@ -38,12 +38,15 @@ import {
 	INJECTION_HEADER_HEIGHT,
 } from "../measure/measure-injection-bubble";
 import { typographyMetrics } from "../pretext-fonts";
-import { RenderMarkdown } from "./RenderMarkdown";
+import { hasUnpredictableBlock } from "../vlist-unpredictable-blocks";
 import { RenderSpecTask } from "./RenderSpecTask";
 import { RenderSystemSimple } from "./RenderSystemSimple";
 import { RenderSystemText } from "./RenderSystemText";
+import { RenderTextPreview, type TextPreviewLabels } from "./RenderTextPreview";
 
 export interface RenderInjectionBubbleProps {
+	textPreviewLabels?: TextPreviewLabels;
+	onToggleTextExpanded?: (bodyKey?: string) => void;
 	measured: MeasuredInjectionBubble;
 	/**
 	 * Speaker row (avatar + name + markers), built by the integration layer. When
@@ -93,7 +96,11 @@ export function RenderInjectionBubble({
 	payloadLive,
 	onUnknownHeight,
 	payloadSlots,
+	textPreviewLabels,
+	onToggleTextExpanded,
 }: RenderInjectionBubbleProps) {
+	const dynamicBody =
+		measured.textPreview?.expanded === true && hasUnpredictableBlock(measured.blocks);
 	return (
 		// Left, always: this is somebody else's voice. The reader's own turns are the
 		// only thing that earns the right-hand side.
@@ -103,7 +110,8 @@ export function RenderInjectionBubble({
 				style={{
 					position: "relative",
 					width: measured.usedWidth,
-					height: measured.height,
+					height: dynamicBody ? undefined : measured.height,
+					minHeight: dynamicBody ? measured.height : undefined,
 					padding: INJECTION_BUBBLE_PADDING,
 					// Same radius as a user bubble: an injection is a message in the same
 					// conversation, so it must not look like a different species of object.
@@ -129,20 +137,23 @@ export function RenderInjectionBubble({
 				<div
 					data-vlist-injection-body
 					style={{
-						position: "absolute",
-						top: measured.bodyTop,
-						left: INJECTION_BUBBLE_PADDING,
+						position: dynamicBody ? "relative" : "absolute",
+						top: dynamicBody ? undefined : measured.bodyTop,
+						left: dynamicBody ? undefined : INJECTION_BUBBLE_PADDING,
+						marginTop: dynamicBody ? measured.bodyTop - INJECTION_BUBBLE_PADDING : undefined,
 						// The MEASURED wrap width. See the module header on why this is not
 						// derived from the frame.
 						width: measured.contentWidth,
 					}}
 				>
 					<InjectionBody
+						textPreviewLabels={textPreviewLabels}
+						onToggleTextExpanded={onToggleTextExpanded}
 						measured={measured}
 						payloadData={payloadData}
 						payloadLive={payloadLive}
 						payloadSlots={payloadSlots}
-						onUnknownHeight={onUnknownHeight}
+						onUnknownHeight={dynamicBody ? undefined : onUnknownHeight}
 					/>
 				</div>
 				{/*
@@ -157,10 +168,11 @@ export function RenderInjectionBubble({
 					<div
 						data-vlist-injection-note
 						style={{
-							position: "absolute",
-							top: measured.noteTop,
-							left: INJECTION_BUBBLE_PADDING,
-							right: INJECTION_BUBBLE_PADDING,
+							position: dynamicBody ? "relative" : "absolute",
+							top: dynamicBody ? undefined : measured.noteTop,
+							left: dynamicBody ? undefined : INJECTION_BUBBLE_PADDING,
+							right: dynamicBody ? undefined : INJECTION_BUBBLE_PADDING,
+							marginTop: dynamicBody ? 4 : undefined,
 							height: typographyMetrics().line.xs,
 							// All three read live. Previously these were three different sources —
 							// a scaled `height`, a frozen 12px `font`, and a unitless baseline
@@ -202,7 +214,11 @@ function InjectionBody({
 	payloadLive,
 	payloadSlots,
 	onUnknownHeight,
+	textPreviewLabels,
+	onToggleTextExpanded,
 }: {
+	textPreviewLabels?: TextPreviewLabels;
+	onToggleTextExpanded?: (bodyKey?: string) => void;
 	measured: MeasuredInjectionBubble;
 	payloadData?: unknown;
 	payloadLive?: boolean;
@@ -210,7 +226,15 @@ function InjectionBody({
 	onUnknownHeight?: (height: number) => void;
 }) {
 	if (measured.bodyForm === "markdown") {
-		return <RenderMarkdown measured={measured} onUnknownHeight={onUnknownHeight} />;
+		return (
+			<RenderTextPreview
+				controlWidth={Math.max(1, measured.usedWidth - INJECTION_BUBBLE_PADDING * 2)}
+				measured={measured}
+				onUnknownHeight={onUnknownHeight}
+				textPreviewLabels={textPreviewLabels}
+				onToggleTextExpanded={onToggleTextExpanded}
+			/>
+		);
 	}
 	const kind = measured.payloadKind;
 	if (!kind) return null;

@@ -1,7 +1,20 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { NarratorMsg } from "../narrator-panel-types";
+import type { MeasuredCollapsibleTrace } from "./measure/measure-tool-run";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { buildPretextDocumentLayout, createLongestPrefixLookup } from "./pretext-document-layout";
+import {
+	type ElementSpec,
+	resolveTextExpansionPreference,
+	textExpansionStateKey,
+} from "./segment-adapter";
+import {
+	createVListInteractionState,
+	isVListTextExpanded,
+	resetVListInteractionStateForLod,
+	setVListTextExpanded,
+	type VListInteractionState,
+} from "./vlist-interaction-state";
 
 beforeAll(() => {
 	installCanvasStub();
@@ -73,7 +86,326 @@ function historyFixture(count: number): NarratorMsg[] {
 	});
 }
 
+function reasoningBodyMessage(
+	id = "reasoning-body",
+	blockId: string | undefined = "reason-body-1",
+	structured = true,
+): NarratorMsg {
+	return {
+		...message(id, 1, "assistant", ""),
+		contentJson: [
+			{
+				type: "reasoning",
+				...(blockId ? { id: blockId } : {}),
+				text: `${structured ? "**First**\n\n" : ""}${"long body ".repeat(1000)}`,
+			},
+		],
+	} as unknown as NarratorMsg;
+}
+
+function buildReasoningBodyLayout(
+	messages: NarratorMsg[],
+	state: VListInteractionState,
+	lod: 2 | 5,
+) {
+	return buildPretextDocumentLayout(messages, {
+		layoutRevision: "body-lod-regression",
+		documentRevision: 1,
+		lod,
+		widthBucket: "640",
+		contentWidth: 640,
+		isExpanded: () => true,
+		expandedRows: () => [0, 1],
+		isRowExpanded: () => true,
+		isTextExpanded: (key, bodyKey) => isVListTextExpanded(state, key, bodyKey),
+	});
+}
+
+/** Mirrors the click's identity resolution, without mounting the query/WS shell. */
+function setReasoningBodyExpanded(
+	state: VListInteractionState,
+	spec: ElementSpec,
+	bodyKey: string | undefined,
+	expanded: boolean,
+) {
+	const preference = resolveTextExpansionPreference(spec, bodyKey);
+	return setVListTextExpanded(
+		state,
+		spec.key,
+		expanded,
+		bodyKey,
+		preference.specKey,
+		preference.bodyKey ?? null,
+	);
+}
+
+function traceBodyExpanded(item: { measured: unknown }, index = 0) {
+	return (item.measured as MeasuredCollapsibleTrace).rows[index]?.body?.textPreview?.expanded;
+}
+
+function activityBody(messages: NarratorMsg[], state: VListInteractionState) {
+	const item = buildReasoningBodyLayout(messages, state, 2).items.find(
+		(item) => item.spec.kind === "activity-trace",
+	);
+	if (!item) throw new Error("missing activity trace");
+	return item;
+}
+
+function reasoningBodies(messages: NarratorMsg[], state: VListInteractionState) {
+	return buildReasoningBodyLayout(messages, state, 5).items.filter(
+		(item) => item.spec.kind === "reasoning-steps",
+	);
+}
+
+function reasoningBody(messages: NarratorMsg[], state: VListInteractionState, index = 0) {
+	const item = reasoningBodies(messages, state)[index];
+	if (!item) throw new Error("missing reasoning steps body");
+	return item;
+}
+
+function traceBodyKey(item: { measured: unknown }, index = 0): string {
+	const key = (item.measured as MeasuredCollapsibleTrace).rows[index]?.key;
+	if (!key) throw new Error("missing trace body key");
+	return key;
+}
+
 describe("buildPretextDocumentLayout", () => {
+	it("keeps a durable reasoning step's full body when LOD5 folds into an LOD2 activity row", () => {
+		const messages = [reasoningBodyMessage()];
+		let state = createVListInteractionState(5);
+		const build = (lod: 2 | 5) => buildReasoningBodyLayout(messages, state, lod);
+		const high = build(5).items.find((item) => item.spec.kind === "reasoning-steps");
+		if (!high) throw new Error("missing reasoning steps");
+		state = setVListTextExpanded(
+			state,
+			high.spec.key,
+			true,
+			"seg0",
+			textExpansionStateKey(high.spec.key, high.spec.lifecycleId),
+		);
+		expect(
+			(build(5).items[0]?.measured as MeasuredCollapsibleTrace).rows[0]?.body?.textPreview
+				?.expanded,
+		).toBe(true);
+		state = resetVListInteractionStateForLod(state, 2);
+		const low = build(2).items.find((item) => item.spec.kind === "activity-trace");
+		if (!low) throw new Error("missing activity trace");
+		expect(traceBodyExpanded(low)).toBe(true);
+		const lowBodyKey = traceBodyKey(low);
+		expect(lowBodyKey).not.toBe("seg0");
+		expect(resolveTextExpansionPreference(low.spec, lowBodyKey)).toEqual({
+			specKey: "text-lifecycle:blk:reason-body-1",
+			bodyKey: "seg0",
+		});
+		state = setReasoningBodyExpanded(state, low.spec, lowBodyKey, false);
+		expect(traceBodyExpanded(activityBody(messages, state))).toBe(false);
+		state = resetVListInteractionStateForLod(state, 5);
+		expect(traceBodyExpanded(reasoningBody(messages, state))).toBe(false);
+		expect(isVListTextExpanded(state, high.spec.key, "seg0")).toBe(false);
+		state = resetVListInteractionStateForLod(state, 2);
+		expect(traceBodyExpanded(activityBody(messages, state))).toBe(false);
+	});
+
+	it("maps each low-LOD step to its own durable run and slot without changing row identities", () => {
+		const long = "long reasoning body ".repeat(600);
+		const messages = [
+			{
+				...message("multi-body", 1, "assistant", ""),
+				contentJson: [
+					{ type: "reasoning", id: "run-a", text: `**A first**\n\n${long}` },
+					{ type: "reasoning", id: "run-a-next", text: `**A second**\n\n${long}` },
+					{
+						type: "tool_use",
+						id: "between-runs",
+						name: "Read",
+						input: { file_path: "/a.ts" },
+						status: "completed",
+					},
+					{
+						type: "reasoning",
+						id: "run-b",
+						text: `**B first**\n\n${long}\n\n**B second**\n\n${long}`,
+					},
+				],
+			},
+		] as unknown as NarratorMsg[];
+		let state = createVListInteractionState(2);
+		const low = activityBody(messages, state);
+		const originalRows = (low.measured as MeasuredCollapsibleTrace).rows;
+		expect(originalRows).toHaveLength(5);
+		expect(low.spec.lifecycleId).toBeUndefined();
+		const secondA = traceBodyKey(low, 1);
+		const firstB = traceBodyKey(low, 3);
+		expect(resolveTextExpansionPreference(low.spec, secondA)).toEqual({
+			specKey: "text-lifecycle:blk:run-a",
+			bodyKey: "seg1",
+		});
+		expect(resolveTextExpansionPreference(low.spec, firstB)).toEqual({
+			specKey: "text-lifecycle:blk:run-b",
+			bodyKey: "seg0",
+		});
+		// Tool drill-down retains the raw trace/row boundary.
+		expect(resolveTextExpansionPreference(low.spec, traceBodyKey(low, 2))).toEqual({
+			specKey: low.spec.key,
+			bodyKey: traceBodyKey(low, 2),
+		});
+		state = setReasoningBodyExpanded(state, low.spec, secondA, true);
+		state = setReasoningBodyExpanded(state, low.spec, firstB, true);
+		const openedLow = activityBody(messages, state);
+		expect([0, 1, 3, 4].map((i) => traceBodyExpanded(openedLow, i))).toEqual([
+			false,
+			true,
+			true,
+			false,
+		]);
+		expect(
+			(openedLow.measured as MeasuredCollapsibleTrace).rows.map((row) => [
+				row.key,
+				row.unitId,
+				row.identity,
+			]),
+		).toEqual(originalRows.map((row) => [row.key, row.unitId, row.identity]));
+		state = resetVListInteractionStateForLod(state, 5);
+		const high = reasoningBodies(messages, state);
+		expect(high).toHaveLength(2);
+		const [first, second] = high;
+		if (!first || !second) throw new Error("missing independent reasoning runs");
+		expect([
+			traceBodyExpanded(first, 0),
+			traceBodyExpanded(first, 1),
+			traceBodyExpanded(second, 0),
+			traceBodyExpanded(second, 1),
+		]).toEqual([false, true, true, false]);
+		state = setReasoningBodyExpanded(state, first.spec, "seg1", false);
+		state = resetVListInteractionStateForLod(state, 2);
+		const closedA = activityBody(messages, state);
+		expect(traceBodyExpanded(closedA, 1)).toBe(false);
+		expect(traceBodyExpanded(closedA, 3)).toBe(true);
+		expect(isVListTextExpanded(state, low.spec.key, secondA)).toBe(false);
+	});
+
+	it("maps an untitled reasoning row to the high-LOD direct body slot", () => {
+		const messages = [reasoningBodyMessage("plain-body", "durable-plain-body", false)];
+		let state = createVListInteractionState(5);
+		const highBody = () => {
+			const item = buildReasoningBodyLayout(messages, state, 5).items.find(
+				(item) => item.spec.kind === "reasoning",
+			);
+			if (!item) throw new Error("missing plain reasoning body");
+			return item;
+		};
+		const high = highBody();
+		state = setReasoningBodyExpanded(state, high.spec, undefined, true);
+		state = resetVListInteractionStateForLod(state, 2);
+		const low = activityBody(messages, state);
+		expect(traceBodyExpanded(low)).toBe(true);
+		expect(resolveTextExpansionPreference(low.spec, traceBodyKey(low))).toEqual({
+			specKey: "text-lifecycle:blk:durable-plain-body",
+			bodyKey: undefined,
+		});
+		state = setReasoningBodyExpanded(state, low.spec, traceBodyKey(low), false);
+		state = resetVListInteractionStateForLod(state, 5);
+		expect(highBody().measured.textPreview?.expanded).toBe(false);
+		state = setReasoningBodyExpanded(state, low.spec, traceBodyKey(low), true);
+		expect(highBody().measured.textPreview?.expanded).toBe(true);
+	});
+
+	it("keeps live/persisted step preferences but isolates new blocks reusing synthetic keys", () => {
+		let state = createVListInteractionState(5);
+		const liveMessages = [reasoningBodyMessage("__streaming__", "durable-live-body")];
+		const live = reasoningBody(liveMessages, state);
+		expect(live.spec.lifecycleId).toBe("blk:durable-live-body");
+		state = setReasoningBodyExpanded(state, live.spec, "seg0", true);
+		const liveLow = activityBody(liveMessages, state);
+		expect(resolveTextExpansionPreference(liveLow.spec, traceBodyKey(liveLow))).toEqual(
+			resolveTextExpansionPreference(live.spec, "seg0"),
+		);
+		const persistedMessages = [reasoningBodyMessage("persisted-body", "durable-live-body")];
+		state = resetVListInteractionStateForLod(state, 2);
+		const persisted = activityBody(persistedMessages, state);
+		expect(traceBodyExpanded(persisted)).toBe(true);
+		// The next live block reuses both the old direct key and run-ordinal row key.
+		const nextMessages = [reasoningBodyMessage("__streaming__", "next-live-body")];
+		const nextHigh = reasoningBody(nextMessages, state);
+		expect(nextHigh.spec.key).toBe(live.spec.key);
+		expect(traceBodyExpanded(nextHigh)).toBe(false);
+		const nextLow = activityBody(nextMessages, state);
+		expect(traceBodyKey(nextLow)).toBe(traceBodyKey(liveLow));
+		expect(nextLow.spec.textBodyPreferences).not.toEqual(liveLow.spec.textBodyPreferences);
+		state = setReasoningBodyExpanded(state, persisted.spec, traceBodyKey(persisted), false);
+		expect(isVListTextExpanded(state, live.spec.key, "seg0")).toBe(false);
+		expect(traceBodyExpanded(reasoningBody(persistedMessages, state))).toBe(false);
+		state = setReasoningBodyExpanded(state, persisted.spec, traceBodyKey(persisted), true);
+		const replacementMessages = [reasoningBodyMessage("persisted-body", "replacement-block")];
+		const replacement = activityBody(replacementMessages, state);
+		expect(replacement.spec.key).not.toBe(persisted.spec.key);
+		expect(traceBodyKey(replacement)).toBe(traceBodyKey(persisted));
+		expect(traceBodyExpanded(replacement)).toBe(false);
+		state = resetVListInteractionStateForLod(state, 5);
+		expect(traceBodyExpanded(reasoningBody(persistedMessages, state))).toBe(true);
+		expect(traceBodyExpanded(reasoningBody(nextMessages, state))).toBe(false);
+	});
+
+	it("isolates replacement reasoning blocks even when a leading tool keeps the trace and row keys unchanged", () => {
+		const messagesFor = (blockId: string) => {
+			const msg = reasoningBodyMessage("same-trace", blockId);
+			return [
+				{
+					...msg,
+					contentJson: [
+						{
+							type: "tool_use",
+							id: "leading-tool",
+							name: "Read",
+							input: { file_path: "/a.ts" },
+							status: "completed",
+						},
+						...(msg.contentJson as unknown[]),
+					],
+				},
+			] as unknown as NarratorMsg[];
+		};
+		let state = createVListInteractionState(2);
+		const oldMessages = messagesFor("previous-reasoning");
+		const old = activityBody(oldMessages, state);
+		const rowKey = traceBodyKey(old, 1);
+		state = setReasoningBodyExpanded(state, old.spec, rowKey, true);
+		expect(traceBodyExpanded(activityBody(oldMessages, state), 1)).toBe(true);
+		const newMessages = messagesFor("replacement-reasoning");
+		const next = activityBody(newMessages, state);
+		expect(next.spec.key).toBe(old.spec.key);
+		expect(traceBodyKey(next, 1)).toBe(rowKey);
+		expect(traceBodyExpanded(next, 1)).toBe(false);
+		state = resetVListInteractionStateForLod(state, 5);
+		expect(traceBodyExpanded(reasoningBody(oldMessages, state))).toBe(true);
+		expect(traceBodyExpanded(reasoningBody(newMessages, state))).toBe(false);
+	});
+
+	it.each([
+		"",
+		"streaming:reasoning:0",
+	])("does not guess canonical identities for legacy/synthetic block %s", (blockId) => {
+		const messages = [reasoningBodyMessage("legacy-body", blockId)];
+		let state = createVListInteractionState(5);
+		const high = reasoningBody(messages, state);
+		expect(high.spec.lifecycleId).toBeUndefined();
+		state = setReasoningBodyExpanded(state, high.spec, "seg0", true);
+		state = resetVListInteractionStateForLod(state, 2);
+		const low = activityBody(messages, state);
+		expect(low.spec.textBodyPreferences).toBeUndefined();
+		expect(traceBodyExpanded(low)).toBe(false);
+		expect(resolveTextExpansionPreference(low.spec, traceBodyKey(low))).toEqual({
+			specKey: low.spec.key,
+			bodyKey: traceBodyKey(low),
+		});
+		state = setReasoningBodyExpanded(state, low.spec, traceBodyKey(low), true);
+		expect(traceBodyExpanded(activityBody(messages, state))).toBe(true);
+		state = setReasoningBodyExpanded(state, low.spec, traceBodyKey(low), false);
+		state = resetVListInteractionStateForLod(state, 5);
+		// Raw high/low legacy scopes intentionally stay separate, with no migration.
+		expect(traceBodyExpanded(reasoningBody(messages, state))).toBe(true);
+	});
+
 	it("creates one exact layout manifest from the complete ordered message input", () => {
 		const built = buildPretextDocumentLayout(
 			[message("m0", 0, "user", "hello"), message("m1", 1, "assistant", "# answer\n\nbody")],

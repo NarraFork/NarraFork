@@ -12,6 +12,12 @@
 	"documentRetry": "重试",
 	"documentLoading": "正在加载完整原文…",
 	"documentHighlightPending": "正在更新语法高亮…",
+	"textPreview": {
+		"expand": "展开内容",
+		"collapse": "收起正文",
+		"loading": "正在加载完整内容…",
+		"loadFailed": "完整内容加载失败"
+	},
 	"historyRecovery": {
 		"title": "历史过大，无法显示",
 		"description": "有消息包含过多工具调用或过大内容，历史聚合无法加载。删除超长消息（及其后所有消息）即可恢复访问。",

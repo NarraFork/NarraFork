@@ -56,6 +56,7 @@ export interface UsePretextDocumentOptions {
 	topPadding?: number;
 	bottomPadding?: number;
 	isExpanded?: (key: string) => boolean | undefined;
+	isTextExpanded?: (specKey: string, bodyKey?: string) => boolean;
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
@@ -346,6 +347,7 @@ export function usePretextDocument(
 			topPadding: options.topPadding ?? 16,
 			bottomPadding: options.bottomPadding ?? 16,
 			isExpanded: options.isExpanded,
+			isTextExpanded: options.isTextExpanded,
 			isLodUserOverride: options.isLodUserOverride,
 			showEarlier: options.showEarlier,
 			expandedRows: options.expandedRows,
@@ -396,6 +398,7 @@ export function usePretextDocument(
 			options.gap,
 			options.segmentGap,
 			options.isExpanded,
+			options.isTextExpanded,
 			options.isLodUserOverride,
 			options.labels,
 			options.labelsRevision,
