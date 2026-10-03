@@ -1,5 +1,5 @@
 import { Button, Card, Group, Text } from "@mantine/core";
-import { IconClock, IconMessage, IconPlus, IconTerminal2 } from "@tabler/icons-react";
+import { IconClock, IconMessage, IconTerminal2 } from "@tabler/icons-react";
 import { Link } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 
@@ -12,22 +12,11 @@ export function QuickActions() {
 				{t("quickActions")}
 			</Text>
 			<Group>
-				<Button
-					variant="light"
-					leftSection={<IconPlus size={16} />}
-					component={Link}
-					to="/projects"
-				>
-					{t("newProject")}
-				</Button>
-				<Button
-					variant="light"
-					leftSection={<IconMessage size={16} />}
-					component={Link}
-					to="/narrators"
-				>
-					{t("newSession")}
-				</Button>
+				<Link to="/narrators" search={{ create: true }} style={{ textDecoration: "none" }}>
+					<Button component="span" variant="light" leftSection={<IconMessage size={16} />}>
+						{t("newSession")}
+					</Button>
+				</Link>
 				<Button
 					variant="light"
 					leftSection={<IconClock size={16} />}

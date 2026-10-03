@@ -1,11 +1,16 @@
 {
+	"legacyRoute": {
+		"denied": "你无权访问该会话。",
+		"missing": "该会话已不存在。",
+		"error": "会话加载失败，请稍后重试。"
+	},
 	"title": "叙述者列表",
 	"newNarrator": "新建叙述者",
 	"noNarrators": "暂无叙述者。创建一个以开始对话。",
 	"narratorId": "叙述者 {{id}}",
 	"narratorMeta": "{{model}} · {{count}} 条消息",
-	"newNarratorModal": "新建独立叙述者",
-	"newNarratorDescription": "创建一个不绑定任何章节的独立 AI 叙述者。适用于一般问题和探索。",
+	"newNarratorModal": "新建会话",
+	"newNarratorDescription": "直接开始对话，无需创建项目；按需选择工作目录即可。",
 	"createNarrator": "创建叙述者",
 	"narratorNotFound": "叙述者未找到",
 	"workingDirectory": "工作目录",

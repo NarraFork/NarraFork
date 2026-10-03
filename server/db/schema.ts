@@ -24,6 +24,75 @@ import {
 } from "drizzle-orm/sqlite-core";
 import type { ToolExecutionPlan, ToolExecutionTarget } from "../lib/agent/types";
 
+/** Attempt-bound permission proposals; authorization is consumed only after a valid decision. */
+export const permissionRuleRequests = sqliteTable(
+	"permission_rule_requests",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		toolCallId: text("tool_call_id")
+			.notNull()
+			.references(() => narratorToolCalls.id, { onDelete: "cascade" }),
+		toolUseId: text("tool_use_id").notNull(),
+		attempt: integer("attempt").notNull(),
+		proposalJson: text("proposal_json", { mode: "json" })
+			.$type<{ input: Record<string, unknown>; rule: Record<string, unknown> }>()
+			.notNull(),
+		proposalHash: text("proposal_hash").notNull(),
+		reason: text("reason").notNull(),
+		scope: text("scope", { enum: ["narrator"] })
+			.notNull()
+			.default("narrator"),
+		deviceId: text("device_id").notNull(),
+		contextRevision: text("context_revision").notNull(),
+		status: text("status", {
+			enum: ["pending", "approved", "denied", "applied", "alreadyExists", "failed", "cancelled"],
+		})
+			.notNull()
+			.default("pending"),
+		ruleId: text("rule_id"),
+		approvalSource: text("approval_source", { enum: ["user", "reflection"] }),
+		approvalUserId: text("approval_user_id"),
+		reflectionConclusion: text("reflection_conclusion"),
+		error: text("error"),
+		createdAt: text("created_at").notNull().default(sql`(datetime('now'))`),
+		updatedAt: text("updated_at").notNull().default(sql`(datetime('now'))`),
+	},
+	(table) => [
+		uniqueIndex("uq_permission_rule_request_attempt").on(table.toolCallId, table.attempt),
+		index("idx_permission_rule_request_narrator_created").on(
+			table.narratorId,
+			table.createdAt,
+			table.id,
+		),
+	],
+);
+
+/** Durable resource inventory, retained even after its owning narrator is deleted. */
+export const narratorWorktreeResources = sqliteTable(
+	"narrator_worktree_resources",
+	{
+		id: text("id").primaryKey(),
+		ownerNarratorId: text("owner_narrator_id").references(() => narrators.id, {
+			onDelete: "set null",
+		}),
+		deviceId: text("device_id").notNull(),
+		repositoryKey: text("repository_key").notNull(),
+		/** Canonical backend path; never derive cleanup ownership from chapters alone. */
+		worktreePath: text("worktree_path").notNull(),
+		state: text("state", { enum: ["preparing", "ready", "unknown"] }).notNull(),
+		createRequestId: text("create_request_id").notNull(),
+		createdAt: text("created_at").notNull().default(sql`(datetime('now'))`),
+		updatedAt: text("updated_at").notNull().default(sql`(datetime('now'))`),
+	},
+	(table) => [
+		uniqueIndex("uq_narrator_worktree_resource_path").on(table.deviceId, table.worktreePath),
+		index("idx_narrator_worktree_resource_owner").on(table.ownerNarratorId),
+	],
+);
+
 // === projects ===
 export const projects = sqliteTable("projects", {
 	id: text("id").primaryKey(),
@@ -558,6 +627,12 @@ export const narrators = sqliteTable(
 		substatus: text("substatus").notNull().default("[]"),
 		planMode: integer("plan_mode", { mode: "boolean" }).notNull().default(false),
 		cwd: text("cwd"),
+		/** Monotonic CAS identity of the narrator's execution workspace (not layout workspace). */
+		workspaceRevision: integer("workspace_revision").notNull().default(0),
+		/** Prepared identity committed atomically with cwd; used to recover failed runtime installation. */
+		workspaceContext: text("workspace_context", { mode: "json" }).$type<
+			import("@shared/workspace-context").WorkspaceContext
+		>(),
 		errorMessage: text("error_message"),
 		/**
 		 * Whether the last failure is worth retrying, when the provider diagnostics said so.

@@ -86,6 +86,25 @@ export function mergeNavLayout(persisted: unknown): NavLayoutEntry[] {
 	];
 }
 
+/** Presentation only: keep retired ids in stored preferences, never expose canvas entry points. */
+export function projectNavLayout(entries: readonly NavLayoutEntry[]): NavLayoutEntry[] {
+	return entries.filter((entry) => entry.kind === "divider" || entry.id !== "projects");
+}
+
+/** Preserve retired preferences when the reader reorders the visible navigation. */
+export function restoreRetiredNavEntries(
+	projected: readonly NavLayoutEntry[],
+	stored: readonly NavLayoutEntry[],
+): NavLayoutEntry[] {
+	const next = projectNavLayout(projected);
+	for (const [index, entry] of stored.entries()) {
+		if (entry.kind === "item" && entry.id === "projects") {
+			next.splice(Math.min(index, next.length), 0, entry);
+		}
+	}
+	return next;
+}
+
 /** Serialize entries to the persisted JSON shape (flat ids, divider marker included). */
 export function toPersistedNavLayout(entries: readonly NavLayoutEntry[]): {
 	items: Array<{ id: string }>;

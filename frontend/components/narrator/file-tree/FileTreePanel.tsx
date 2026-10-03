@@ -15,8 +15,9 @@
 import { Center, Text } from "@mantine/core";
 import { useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { useFileTreeStatus, useNarrator } from "../../../hooks/useNarrator";
+import { useFileTreeStatus } from "../../../hooks/useNarrator";
 import { useNarratorWS } from "../../../hooks/useNarratorWS";
+import { useWorkspaceContext } from "../../../hooks/useWorkspaceContext";
 import { FileTreeContent } from "./FileTreeContent";
 import type { TreeChange } from "./tree-patch";
 import { buildTreeLineStats } from "./tree-store";
@@ -31,13 +32,20 @@ export interface FileTreePanelProps {
 
 export function FileTreePanel({ narratorId, onOpenFile, showHidden = false }: FileTreePanelProps) {
 	const { t } = useTranslation("narrator");
-	const { data: narrator } = useNarrator(narratorId);
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator entity
-	const root = ((narrator as any)?.cwd as string | undefined)?.trim() ?? "";
+	const contextQuery = useWorkspaceContext(narratorId);
+	const context = contextQuery.data;
+	const root = context?.deviceId === "local" ? context.cwd.trim() : "";
+	const treeIdentity = JSON.stringify([
+		narratorId,
+		context?.contextKey,
+		context?.revision,
+		context?.deviceId,
+		root,
+	]);
 	const { data: fileTreeStatus, refetch: refetchFileTreeStatus } = useFileTreeStatus(
 		narratorId,
 		!!root,
-		root,
+		treeIdentity,
 	);
 	const lineStats = useMemo(
 		() => buildTreeLineStats(fileTreeStatus?.files ?? []),
@@ -52,18 +60,25 @@ export function FileTreePanel({ narratorId, onOpenFile, showHidden = false }: Fi
 	const ingestRef = useRef<((changes: readonly TreeChange[], truncated: boolean) => void) | null>(
 		null,
 	);
+	const registration = useRef({ key: treeIdentity, token: {} });
+	if (registration.current.key !== treeIdentity) {
+		registration.current = { key: treeIdentity, token: {} };
+		ingestRef.current = null;
+	}
+	const owner = registration.current;
 	const registerIngest = useCallback(
 		(ingest: (changes: readonly TreeChange[], truncated: boolean) => void) => {
-			ingestRef.current = ingest;
+			if (registration.current.token === owner.token) ingestRef.current = ingest;
 		},
-		[],
+		[owner],
 	);
 
 	useNarratorWS(narratorId, {
-		onWorkspacePathsChanged: ({ changes, truncated }) => {
-			// Dropped when the tree has not mounted its store yet: there is nothing to
-			// patch, and the first read will see the current filesystem anyway.
-			ingestRef.current?.(changes, truncated);
+		onWorkspacePathsChanged: () => {
+			// Legacy path events carry no workspace identity. A queued old-root delete
+			// must never evict a new-root entry: revalidate the CURRENT tree instead.
+			// Reads are bounded and guarded against late responses in useFileTree.
+			ingestRef.current?.([], true);
 			refreshLineStats();
 		},
 		// Stage/unstage/commit can change the Git figures without changing file bytes,
@@ -75,7 +90,11 @@ export function FileTreePanel({ narratorId, onOpenFile, showHidden = false }: Fi
 		return (
 			<Center h="100%" p="md">
 				<Text size="sm" c="dimmed" ta="center">
-					{t("fileTree.noRoot")}
+					{contextQuery.error
+						? contextQuery.error.message
+						: context && context.deviceId !== "local"
+							? t("fileTree.remoteUnsupported")
+							: t("fileTree.noRoot")}
 				</Text>
 			</Center>
 		);
@@ -85,7 +104,8 @@ export function FileTreePanel({ narratorId, onOpenFile, showHidden = false }: Fi
 		<FileTreeContent
 			// Keyed by root: a narrator whose cwd changes must start a fresh tree rather
 			// than patch entries that were relative to the previous root.
-			key={root}
+			key={treeIdentity}
+			contextKey={treeIdentity}
 			root={root}
 			showHidden={showHidden}
 			lineStats={lineStats}

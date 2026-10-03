@@ -9,13 +9,15 @@ import {
 	projects,
 } from "@server/db/schema";
 import { getSettingsRevision, settings } from "@server/lib/settings";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { mergeExecutionPolicyRuleSets, normalizeExecutionPolicyRuleSet } from "./normalize";
 import type { ExecutionPolicyRuleSet, LegacyExecutionPolicyRuleSet } from "./types";
 
 export interface LoadedExecutionPolicy extends ExecutionPolicyRuleSet {
 	narratorId: string;
 	ownerNarratorId: string;
+	/** Includes this narrator and its subagent ancestors, never siblings. */
+	inheritedNarratorIds?: string[];
 	projectId: string | null;
 	projectGitPath: string | null;
 	settingsRevision: number;
@@ -23,79 +25,116 @@ export interface LoadedExecutionPolicy extends ExecutionPolicyRuleSet {
 
 export class ExecutionPolicyRepository {
 	async load(narratorId: string): Promise<LoadedExecutionPolicy> {
-		const [narrator] = await db
-			.select({
-				id: narrators.id,
-				chapterId: narrators.chapterId,
-				type: narrators.type,
-				parentNarratorId: narrators.parentNarratorId,
-			})
-			.from(narrators)
-			.where(eq(narrators.id, narratorId))
-			.limit(1);
-		if (!narrator) throw new Error(`Narrator not found: ${narratorId}`);
+		return this.loadNow(narratorId);
+	}
 
-		const ownerNarratorId =
-			narrator.type === "subagent" && narrator.parentNarratorId
-				? narrator.parentNarratorId
-				: narrator.id;
+	/** Bounded synchronous snapshot, also usable inside the final request transaction. */
+	loadNow(narratorId: string, store: Pick<typeof db, "select"> = db): LoadedExecutionPolicy {
+		const inheritedNarratorIds: string[] = [];
+		let next: string | null = narratorId;
 		let projectId: string | null = null;
-		let projectGitPath: string | null = null;
-		let projectRules: LegacyExecutionPolicyRuleSet | undefined;
-		if (narrator.chapterId) {
-			const [chapter] = await db
-				.select({ projectId: chapters.projectId })
-				.from(chapters)
-				.where(eq(chapters.id, narrator.chapterId))
-				.limit(1);
-			projectId = chapter?.projectId ?? null;
-			if (projectId) {
-				const [project] = await db
-					.select({ chapterSettings: projects.chapterSettings, gitPath: projects.gitPath })
-					.from(projects)
-					.where(eq(projects.id, projectId))
-					.limit(1);
-				projectGitPath = project?.gitPath ?? null;
-				projectRules = (project?.chapterSettings ?? undefined) as
-					| LegacyExecutionPolicyRuleSet
-					| undefined;
+		const contextProjects = new Set<string>();
+		while (next) {
+			if (inheritedNarratorIds.includes(next) || inheritedNarratorIds.length >= 16) {
+				throw new Error("Invalid or excessive permission inheritance chain");
 			}
+			const narrator = store
+				.select({
+					id: narrators.id,
+					chapterId: narrators.chapterId,
+					contextProjectId: narrators.contextProjectId,
+					variant: narrators.variant,
+					parentNarratorId: narrators.parentNarratorId,
+				})
+				.from(narrators)
+				.where(eq(narrators.id, next))
+				.get();
+			if (!narrator) throw new Error(`Narrator not found: ${next}`);
+			inheritedNarratorIds.push(narrator.id);
+			// The chapter owns project context. contextProjectId is an explicit
+			// standalone fallback, not a replacement and never inferred from cwd.
+			let effectiveProjectId = narrator.contextProjectId;
+			if (narrator.chapterId) {
+				const chapter = store
+					.select({ projectId: chapters.projectId })
+					.from(chapters)
+					.where(eq(chapters.id, narrator.chapterId))
+					.get();
+				if (!chapter) throw new Error("Permission chapter context no longer exists");
+				effectiveProjectId = chapter.projectId;
+			}
+			projectId ??= effectiveProjectId;
+			if (effectiveProjectId) contextProjects.add(effectiveProjectId);
+			next = narrator.variant.startsWith("subagent:") ? narrator.parentNarratorId : null;
 		}
-
-		const [whitelistDirs, blacklistDirs, commandWhitelist, commandBlacklist] = await Promise.all([
-			db
+		const ownerNarratorId = inheritedNarratorIds.at(-1) ?? narratorId;
+		let projectGitPath: string | null = null;
+		const projectRuleSets: ExecutionPolicyRuleSet[] = [];
+		for (const contextProjectId of contextProjects) {
+			const project = store
+				.select({ chapterSettings: projects.chapterSettings, gitPath: projects.gitPath })
+				.from(projects)
+				.where(eq(projects.id, contextProjectId))
+				.get();
+			if (!project) throw new Error("Permission project context no longer exists");
+			if (contextProjectId === projectId) projectGitPath = project.gitPath;
+			// Switching a child's context cannot erase the parent's project deny layer.
+			projectRuleSets.push(
+				normalizeExecutionPolicyRuleSet(
+					project.chapterSettings as LegacyExecutionPolicyRuleSet,
+					"project",
+				),
+			);
+		}
+		const [whitelistDirs, blacklistDirs, commandWhitelist, commandBlacklist] = [
+			store
 				.select()
 				.from(narratorWhitelistDirs)
-				.where(eq(narratorWhitelistDirs.narratorId, ownerNarratorId)),
-			db
+				.where(inArray(narratorWhitelistDirs.narratorId, inheritedNarratorIds))
+				.limit(2001)
+				.all(),
+			store
 				.select()
 				.from(narratorBlacklistDirs)
-				.where(eq(narratorBlacklistDirs.narratorId, ownerNarratorId)),
-			db
+				.where(inArray(narratorBlacklistDirs.narratorId, inheritedNarratorIds))
+				.limit(2001)
+				.all(),
+			store
 				.select()
 				.from(narratorWhitelistCmds)
-				.where(eq(narratorWhitelistCmds.narratorId, ownerNarratorId)),
-			db
+				.where(inArray(narratorWhitelistCmds.narratorId, inheritedNarratorIds))
+				.limit(2001)
+				.all(),
+			store
 				.select()
 				.from(narratorBlacklistCmds)
-				.where(eq(narratorBlacklistCmds.narratorId, ownerNarratorId)),
-		]);
-
-		const globalRules = normalizeExecutionPolicyRuleSet(settings.agent, "global");
-		const normalizedProjectRules = normalizeExecutionPolicyRuleSet(projectRules, "project");
-		const narratorRules = normalizeExecutionPolicyRuleSet(
-			{ whitelistDirs, blacklistDirs, commandWhitelist, commandBlacklist },
-			"narrator",
-		);
+				.where(inArray(narratorBlacklistCmds.narratorId, inheritedNarratorIds))
+				.limit(2001)
+				.all(),
+		] as const;
+		if (
+			[whitelistDirs, blacklistDirs, commandWhitelist, commandBlacklist].some(
+				(rows) => rows.length > 2000,
+			)
+		) {
+			throw new Error("Permission rule budget exceeded");
+		}
 		return {
 			narratorId,
 			ownerNarratorId,
+			inheritedNarratorIds,
 			projectId,
 			projectGitPath,
 			settingsRevision: getSettingsRevision(),
-			...mergeExecutionPolicyRuleSets(globalRules, normalizedProjectRules, narratorRules),
+			...mergeExecutionPolicyRuleSets(
+				normalizeExecutionPolicyRuleSet(settings.agent, "global"),
+				...projectRuleSets,
+				normalizeExecutionPolicyRuleSet(
+					{ whitelistDirs, blacklistDirs, commandWhitelist, commandBlacklist },
+					"narrator",
+				),
+			),
 		};
 	}
 }
-
 export const executionPolicyRepository = new ExecutionPolicyRepository();

@@ -1219,7 +1219,9 @@ describe("mobile safe-area layout contract", () => {
 		expect(narratorRoute.match(/h=\{APP_SHELL_FULL_BLEED_HEIGHT\}/g)?.length).toBe(1);
 		expect(narratorRoute).toContain("<FocusChatHost");
 		expect(workspaceRoute.match(/h=\{APP_SHELL_FULL_BLEED_HEIGHT\}/g)?.length).toBe(2);
-		expect(projectRoute).toContain("height: APP_SHELL_CONTENT_HEIGHT");
+		// The compatibility page now uses natural document flow inside Main instead of a fixed canvas.
+		expect(projectRoute).toContain("<ProjectCompatibilityPanel");
+		expect(projectRoute).not.toContain("APP_SHELL_FULL_BLEED_HEIGHT");
 		for (const route of [narratorRoute, workspaceRoute, projectRoute]) {
 			expect(route).not.toContain("APP_SHELL_SAFE_VIEWPORT_HEIGHT");
 			expect(route).not.toContain("APP_SHELL_PADDED_SAFE_VIEWPORT_HEIGHT");

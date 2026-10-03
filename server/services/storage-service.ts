@@ -1,6 +1,6 @@
 import type { Dirent } from "node:fs";
 import { existsSync } from "node:fs";
-import { lstat, readdir, rm, stat } from "node:fs/promises";
+import { lstat, opendir, readdir, realpath, rm, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { db } from "../db";
@@ -12,6 +12,7 @@ import {
 	narrators,
 	projects,
 } from "../db/schema";
+import { localBackend } from "../lib/agent/execution/registry";
 import { MALFORMED_REQUEST_DUMP_DIR } from "../lib/agent/malformed-request-dump";
 import { REQUEST_DUMP_SPILL_DIR } from "../lib/api-request-dump-store";
 import {
@@ -25,13 +26,21 @@ import { getNarraforkHome, getNarraforkPath } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 import { contentJsonHasImageBlocks, getUploadsDir } from "../lib/uploads";
 import { dropRecentlyAttributed } from "./file-attribution-service";
-import { gitService } from "./git-service";
 import { dropStatus } from "./git-status-cache";
+import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
+import { readWorktreeReceiptProtection } from "./narrator-worktree-journal";
+import {
+	isRegisteredNarratorWorktree,
+	narratorWorktreeResourceRegistry,
+	readLegacyNarratorWorktreeProtection,
+} from "./narrator-worktree-resources";
+import { parseWorktreePorcelain } from "./narrator-worktree-service";
 import {
 	DatabaseStorageScanCancelledError,
 	DatabaseStorageUnsupportedError,
 } from "./storage/database-storage-port";
 import { databaseStoragePort } from "./storage/store";
+import { withWorkspaceRepositoryLock } from "./workspace-context-service";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -1020,69 +1029,199 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 	let freedBytes = 0;
 
 	try {
+		// Caps bound work, not ownership: unvisited projects are simply left untouched.
 		const allProjects = db
 			.select({ id: projects.id, gitPath: projects.gitPath })
 			.from(projects)
+			.orderBy(projects.id)
+			.limit(64)
 			.all();
-
+		const deadline = performance.now() + 30_000;
+		const gitEnv = {
+			...process.env,
+			GIT_DIR: undefined,
+			GIT_COMMON_DIR: undefined,
+			GIT_WORK_TREE: undefined,
+			GIT_INDEX_FILE: undefined,
+		};
 		for (const proj of allProjects) {
-			if (!proj.gitPath) continue;
+			if (!proj.gitPath || performance.now() > deadline) continue;
+			const probe = await probeLocalGitWorkspace(proj.gitPath);
+			if (
+				probe.state !== "ready" ||
+				!probe.rootPath ||
+				!probe.repositoryPath ||
+				!localBackend.paths.equals(probe.rootPath, await realpath(proj.gitPath))
+			)
+				continue;
 			const wtDir = resolve(proj.gitPath, ".worktrees");
-			if (!existsSync(wtDir)) continue;
-
-			// Get active chapter worktree paths for this project
-			const activeChapters = db
-				.select({ worktreePath: chapters.worktreePath })
-				.from(chapters)
-				.where(eq(chapters.projectId, proj.id))
-				.all()
-				.map((c) => c.worktreePath)
-				.filter(Boolean) as string[];
-
-			const activePaths = new Set(activeChapters);
-
-			const entries = await readdir(wtDir, { withFileTypes: true });
-			for (const entry of entries) {
-				if (!entry.isDirectory()) continue;
-				const fullPath = resolve(wtDir, entry.name);
-				if (!activePaths.has(fullPath)) {
-					const size = await dirSize(fullPath);
-					// Try git worktree remove first to keep .git/worktrees clean
-					try {
-						await gitService.removeWorktree(proj.gitPath, fullPath);
-					} catch {
-						// Fallback to direct removal if git command fails
-						await rm(fullPath, { recursive: true, force: true });
-					}
-					// The worktree's snapshot shadow repo is keyed by its path, so it is
-					// unreachable once the worktree is gone and would leak otherwise.
-					//
-					// Deliberately not forced. "No active chapter claims this directory" is
-					// not the same as "no chapter wants this history": a dormant chapter has
-					// no `worktreePath`, and if its worktree removal had failed the directory
-					// would still be here — sweeping it would then delete that chapter's
-					// entire snapshot lineage. The guard inside `destroy` declines those.
-					await worktreeTreeSnapshot.destroy(fullPath).catch((err) =>
-						logger.debug("Failed to remove tree snapshots for orphaned worktree", {
-							path: fullPath,
-							error: String(err),
-						}),
-					);
-					// Same reason, for the status/boundary caches keyed by that path: the
-					// directory is gone, so nothing can read those entries again.
-					dropStatus(fullPath);
-					dropRecentlyAttributed(fullPath);
-					removed++;
-					freedBytes += size;
-					logger.info("Removed orphaned worktree", { path: fullPath, size });
-				}
-			}
-
-			// Prune stale worktree references
 			try {
-				await gitService.pruneWorktrees(proj.gitPath);
-			} catch {
-				// Non-critical — skip
+				// Same identity/lock as narrator creation, including the pre-registration window.
+				await withWorkspaceRepositoryLock(
+					gitWorkspaceIdentity(localBackend, probe.repositoryPath),
+					async () => {
+						const parent = await lstat(wtDir).catch(() => null);
+						if (
+							!parent?.isDirectory() ||
+							parent.isSymbolicLink() ||
+							(await realpath(wtDir)) !== wtDir
+						)
+							return;
+						const receipts = await readWorktreeReceiptProtection(
+							getNarraforkPath("worktree-requests"),
+						);
+						if (!receipts.complete) return;
+						const legacy = await readLegacyNarratorWorktreeProtection(deadline);
+						if (!legacy.complete) return;
+						// Never treat a capped porcelain prefix as proof that a worktree is absent.
+						const list = await safeSpawn({
+							cmd: [
+								"git",
+								"--no-optional-locks",
+								"-C",
+								proj.gitPath ?? "",
+								"worktree",
+								"list",
+								"--porcelain",
+								"-z",
+							],
+							timeout: 5000,
+							maxOutputBytes: 128 * 1024,
+							env: gitEnv,
+						});
+						if (list.exitCode !== 0 || list.stdoutTruncated || list.stderrTruncated) return;
+						const registered = parseWorktreePorcelain(list.stdout);
+						if (registered.truncated) return;
+						const candidates: string[] = [];
+						let count = 0;
+						for await (const entry of await opendir(wtDir)) {
+							if (++count > 512 || performance.now() > deadline) return;
+							if (entry.isDirectory()) candidates.push(resolve(wtDir, entry.name));
+						}
+						for (const fullPath of candidates) {
+							if (performance.now() > deadline) break;
+							// ALL resource states survive narrator deletion. Errors (e.g. an unmigrated
+							// registry) abort the repo sweep, rather than making ownership disappear.
+							if (
+								isRegisteredNarratorWorktree(fullPath) ||
+								[...receipts.paths].some((path) => localBackend.paths.contains(fullPath, path))
+							)
+								continue;
+							const chapter = db
+								.select({ id: chapters.id })
+								.from(chapters)
+								.where(eq(chapters.worktreePath, fullPath))
+								.limit(1)
+								.get();
+							if (chapter) continue;
+							// Legacy switched sessions may predate receipts/registry. Protect ancestor
+							// directories too, e.g. a narrator running in a worktree subdirectory.
+							const cwdOwner = legacy.owners.find((owner) =>
+								localBackend.paths.contains(fullPath, owner.path),
+							);
+							if (cwdOwner) {
+								// Adopt legacy ordinary workspaces before their last session row can
+								// disappear. This is inventory preservation, not creation/reconciliation.
+								if (
+									registered.entries.some((item) =>
+										localBackend.paths.equals(item.path, fullPath),
+									) &&
+									(await realpath(fullPath)) === fullPath
+								) {
+									const resource = {
+										ownerNarratorId: cwdOwner.narratorId,
+										deviceId: "local",
+										repositoryKey: gitWorkspaceIdentity(localBackend, probe.repositoryPath ?? ""),
+										worktreePath: fullPath,
+										createRequestId: `legacy-cwd-${cwdOwner.narratorId}`,
+									};
+									await narratorWorktreeResourceRegistry.register(resource);
+									await narratorWorktreeResourceRegistry.setState(resource, "unknown");
+								}
+								continue;
+							}
+							const entry = registered.entries.find((item) =>
+								localBackend.paths.equals(item.path, fullPath),
+							);
+							const leaf = localBackend.paths.basename(fullPath);
+							// Only the old, positively identifiable chapter convention is eligible.
+							// Unknown directories, ordinary narrators and unverifiable Git state fail closed.
+							if (
+								!entry ||
+								entry.locked ||
+								entry.prunable ||
+								!/^[a-z0-9-]+-[A-Za-z0-9_-]{6}$/.test(leaf) ||
+								entry.branch !== `refs/heads/chapter/${leaf}`
+							)
+								continue;
+							if (
+								db
+									.select({ id: chapters.id })
+									.from(chapters)
+									.where(eq(chapters.branch, `chapter/${leaf}`))
+									.limit(1)
+									.get()
+							)
+								continue;
+							if ((await realpath(fullPath)) !== fullPath) continue;
+							const identity = await probeLocalGitWorkspace(fullPath);
+							if (
+								identity.state !== "ready" ||
+								!identity.rootPath ||
+								!identity.repositoryPath ||
+								!localBackend.paths.equals(identity.rootPath, fullPath) ||
+								!localBackend.paths.equals(identity.repositoryPath, probe.repositoryPath ?? "")
+							)
+								continue;
+							const clean = await safeSpawn({
+								cmd: [
+									"git",
+									"--no-optional-locks",
+									"-C",
+									fullPath,
+									"status",
+									"--porcelain=v1",
+									"-z",
+									"--untracked-files=all",
+									"--ignored",
+								],
+								timeout: 5000,
+								maxOutputBytes: 128 * 1024,
+							});
+							if (
+								clean.exitCode !== 0 ||
+								clean.stdoutTruncated ||
+								clean.stderrTruncated ||
+								clean.stdout !== ""
+							)
+								continue;
+							const size = await dirSize(fullPath);
+							// No --force and no rm fallback. Git must prove this clean registered
+							// chapter worktree is removable; a late dirty write makes remove fail.
+							const deletion = await safeSpawn({
+								cmd: ["git", "-C", proj.gitPath ?? "", "worktree", "remove", "--", fullPath],
+								timeout: 10_000,
+								maxOutputBytes: 32 * 1024,
+								env: gitEnv,
+							});
+							if (deletion.exitCode !== 0) continue;
+							await worktreeTreeSnapshot.destroy(fullPath).catch(() => {});
+							dropStatus(fullPath);
+							dropRecentlyAttributed(fullPath);
+							removed++;
+							freedBytes += size;
+							logger.info("Removed verified clean orphaned chapter worktree", {
+								path: fullPath,
+								size,
+							});
+						}
+					},
+				);
+			} catch (err) {
+				logger.warn("Skipped unverifiable or busy worktree repository during cleanup", {
+					projectId: proj.id,
+					error: String(err),
+				});
 			}
 		}
 	} catch (err) {

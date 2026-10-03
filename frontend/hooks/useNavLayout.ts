@@ -7,6 +7,8 @@ import {
 	mergeNavLayout,
 	NAV_DIVIDER_ID,
 	type NavLayoutEntry,
+	projectNavLayout,
+	restoreRetiredNavEntries,
 	toPersistedNavLayout,
 } from "./nav-layout";
 import { useUpdateUserPreferences, useUserPreferences } from "./useUserPreferences";
@@ -38,10 +40,11 @@ export function useNavLayout() {
 	const updatePrefs = useUpdateUserPreferences();
 	const queryClient = useQueryClient();
 
-	const entries = useMemo<NavLayoutEntry[]>(
+	const storedEntries = useMemo<NavLayoutEntry[]>(
 		() => (prefs ? mergeNavLayout(prefs.navLayout) : DEFAULT_NAV_ENTRIES),
 		[prefs],
 	);
+	const entries = useMemo(() => projectNavLayout(storedEntries), [storedEntries]);
 
 	const dividerIndex = useMemo(
 		() => entries.findIndex((entry) => entry.kind === "divider"),
@@ -58,7 +61,7 @@ export function useNavLayout() {
 
 	const saveLayout = useCallback(
 		(nextEntries: NavLayoutEntry[]) => {
-			const persisted = toPersistedNavLayout(nextEntries);
+			const persisted = toPersistedNavLayout(restoreRetiredNavEntries(nextEntries, storedEntries));
 			const previous = queryClient.getQueryData<Preferences>(["user-preferences"]);
 			// Optimistic update
 			if (previous) {
@@ -78,7 +81,7 @@ export function useNavLayout() {
 				},
 			);
 		},
-		[queryClient, updatePrefs],
+		[queryClient, updatePrefs, storedEntries],
 	);
 
 	return { entries, visibleItems, dividerIndex, saveLayout };

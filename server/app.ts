@@ -10,6 +10,7 @@ import { DiskSpaceError, isDiskFullError } from "./lib/disk-safety";
 import { catalogError } from "./lib/errors";
 import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
+import { narratorPrincipalOf } from "./lib/narrator-access";
 import { getRuntimeEnvironment } from "./lib/platform";
 import { handleGracefullyShutdownRequest } from "./lib/server-restart";
 import { settings } from "./lib/settings";
@@ -50,6 +51,7 @@ import licenseRoutes from "./routes/licenses";
 import { mcpRoutes } from "./routes/mcp";
 import { modelCardRoutes } from "./routes/model-cards";
 import { modelCatalogRoutes } from "./routes/model-catalog";
+import { createNarratorWorktreeRoutes } from "./routes/narrator-worktrees";
 import { narratorRoutes } from "./routes/narrators";
 import { notificationSoundRoutes } from "./routes/notification-sounds";
 import { notificationRoutes } from "./routes/notifications";
@@ -89,6 +91,7 @@ import { userPreferencesRoutes } from "./routes/user-preferences";
 import { vnetRoutes } from "./routes/vnet";
 import { volumeSnapshotRoutes } from "./routes/volume-snapshots";
 import { workspaceRoutes } from "./routes/workspaces";
+import { narratorWorktreeService } from "./services/narrator-worktree-runtime";
 
 export interface AppEnv {
 	Bindings: {
@@ -362,6 +365,11 @@ app.route("/api/chapter-edges", chapterEdgeRoutes);
 app.route("/api/chat", chatRoutes);
 app.route("/api/narrators", publicNarratorShareManagementRoutes);
 app.route("/api/narrators", editorDocumentRoutes);
+// Worktree paths must precede the generic Git router's workspace middleware.
+app.route(
+	"/api/narrators",
+	createNarratorWorktreeRoutes(narratorWorktreeService, narratorPrincipalOf),
+);
 app.route("/api/narrators", narratorGitRoutes);
 app.route("/api/narrators", narratorRoutes);
 app.route("/api/narrators", specRoutes);

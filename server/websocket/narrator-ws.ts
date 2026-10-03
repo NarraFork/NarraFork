@@ -74,6 +74,7 @@ import {
 	updateBufferedMessage,
 } from "../services/narrator-session";
 import { addStatsSubscriber, removeStatsSubscriber } from "../services/output-stats";
+import { permissionPolicyChanges } from "../services/permission-rule-service";
 import { assertChapterProjectAccess, canReadProject } from "../services/project-acl";
 import type { PublicShareConnectionLease } from "../services/public-narrator-share-connections";
 import {
@@ -687,6 +688,16 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 	// Mirror to eventBus so non-WS consumers (e.g. IM gateway) can react.
 	eventBus.emit({ type: "narrator:message_broadcast", narratorId, message });
 }
+
+// Replace the callback on hot reload; a hotOnce listener would retain the old emitter.
+const permissionPolicyBridge = hotSafe<{ dispose?: () => void }>(
+	"narrafork.permissionPolicyWsBridge",
+	() => ({}),
+);
+permissionPolicyBridge.dispose?.();
+permissionPolicyBridge.dispose = permissionPolicyChanges.on((event) => {
+	broadcastToNarrator(event.narratorId, event);
+});
 
 function withSubscriptionRequestId<T extends Record<string, unknown>>(
 	message: T,

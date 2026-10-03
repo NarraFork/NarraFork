@@ -1,6 +1,6 @@
 import { ActionIcon, Group, Tooltip } from "@mantine/core";
 import { IconFlask, IconX } from "@tabler/icons-react";
-import { memo, useMemo } from "react";
+import { memo, type ReactNode, useMemo } from "react";
 import type { NarratorDockContextValue } from "../dock/NarratorDockContext";
 import { NarratorToolbarItem, type NarratorToolbarItemProps } from "./NarratorToolbarItem";
 import { NarratorToolbarOverflowMenu } from "./NarratorToolbarOverflowMenu";
@@ -16,6 +16,7 @@ export interface HeaderToolbarProps extends Omit<NarratorToolbarItemProps, "def"
 	archiveMutation: { isPending: boolean };
 	dock: NarratorDockContextValue | null;
 	mockStreamEnabled: boolean;
+	compatibilityEntry?: ReactNode;
 	onClose?: () => void;
 	/**
 	 * How many surfaced tools fit AFTER the full pretext-measured title reserved
@@ -99,6 +100,7 @@ export const HeaderToolbar = memo(function HeaderToolbar(props: HeaderToolbarPro
 				renderInlineOptions={renderToolbarInlineOptions}
 				onArchive={openArchiveConfirm}
 				archiveLoading={archiveMutation.isPending}
+				compatibilityEntry={props.compatibilityEntry}
 			/>
 			{onClose && (
 				<Tooltip label={t("closePanel")}>

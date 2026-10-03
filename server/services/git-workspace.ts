@@ -121,6 +121,8 @@ export async function resolveNarratorGitTarget(
 		columns: {
 			id: true,
 			cwd: true,
+			workspaceRevision: true,
+			workspaceContext: true,
 			chapterId: true,
 			contextProjectId: true,
 			defaultDeviceId: true,
@@ -143,7 +145,13 @@ export async function resolveNarratorGitTarget(
 		: undefined;
 	if (projectId && !project) throw new NotFoundError("Project", projectId);
 	const active = activeNarrators.get(narratorId);
+	const committedContext =
+		narrator.workspaceContext?.revision === narrator.workspaceRevision &&
+		narrator.workspaceContext.deviceId === "local"
+			? narrator.workspaceContext
+			: null;
 	const localCwd =
+		committedContext?.cwd ??
 		active?.cwd ??
 		resolveNarratorSessionCwd(narrator.cwd, chapter?.worktreePath, project?.gitPath, getHome());
 	const deviceId = active

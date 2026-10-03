@@ -683,6 +683,8 @@ export interface NarraForkSettings {
 		planReflectionAllowAutoCompact: boolean;
 		/** Let AskUserQuestion auto-answer with reflection after a timeout in bypass-permissions mode. */
 		questionReflectionEnabled: boolean;
+		/** Human-admin opt-in; strict bound reflection is required even when danger reflection is off. */
+		permissionRuleAutoApprove: boolean;
 		/** Timeout in milliseconds before AskUserQuestion auto-answer reflection runs. */
 		questionReflectionTimeoutMs: number;
 		/** Danger reflection policy level for bypass-permissions operations. */

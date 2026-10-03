@@ -34,6 +34,9 @@ function SettingsAgentPage() {
 		<Stack>
 			<Title order={3}>{t("agentSection")}</Title>
 			<AgentSection
+				isAdmin={currentUser?.role === "admin"}
+				permissionRuleAutoApprove={is.permissionRuleAutoApprove}
+				setPermissionRuleAutoApprove={is.setPermissionRuleAutoApprove}
 				permissionMode={is.permissionMode}
 				setPermissionMode={is.setPermissionMode}
 				maxTurns={is.maxTurns}

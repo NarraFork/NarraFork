@@ -1,5 +1,5 @@
 import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
-import { Box, Center, Drawer, Group, Loader, Text } from "@mantine/core";
+import { Alert, Box, Center, Drawer, Group, Loader, Text } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import {
 	createFileRoute,
@@ -16,6 +16,7 @@ import { ChapterForkModal } from "../../components/chapter/ChapterForkModal";
 import { clearHighlightCache } from "../../components/narrator/markdown/highlight-cache";
 import { serializeSeedEnvelope } from "../../components/narrator/panels/layout-envelope";
 import { twoNarratorWorkspaceSeed } from "../../components/narrator/workspace/dockview-layout";
+import { legacyRouteErrorKey } from "../../components/project/legacy-chapter-redirect";
 import { clearShikiTokenCache } from "../../lib/shiki-token-cache";
 
 // Lazy-loaded heavy panels — not needed for first paint (mobile drawers)
@@ -60,6 +61,7 @@ import {
 	type PanelDragState,
 } from "../../lib/panel-drag";
 import {
+	APP_SHELL_CONTENT_HEIGHT,
 	APP_SHELL_FULL_BLEED_HEIGHT,
 	SAFE_AREA_DRAWER_BODY_STYLE,
 	safeAreaDrawerBodyHeight,
@@ -118,7 +120,12 @@ function NarratorDetailPage() {
 	const isMobile = useMobileViewport();
 
 	// Fetch narrator data for recent tab tracking
-	const { data: narrator } = useNarrator(narratorId);
+	const {
+		data: narrator,
+		error: narratorError,
+		isLoading: narratorLoading,
+	} = useNarrator(narratorId);
+	const { t: tns } = useTranslation("narrators");
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const isSubagent = !!(narrator as any)?.variant?.startsWith("subagent:");
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -448,6 +455,19 @@ function NarratorDetailPage() {
 	const mergedRef = useCallback((el: HTMLDivElement | null) => {
 		pageBoxRef.current = el;
 	}, []);
+
+	if (narratorLoading)
+		return (
+			<Center h={APP_SHELL_CONTENT_HEIGHT}>
+				<Loader />
+			</Center>
+		);
+	if (narratorError || !narrator)
+		return (
+			<Alert color="red">
+				{tns(`legacyRoute.${narratorError ? legacyRouteErrorKey(narratorError) : "missing"}`)}
+			</Alert>
+		);
 
 	// The provider and portal owner never cross the responsive identity boundary.
 	return (

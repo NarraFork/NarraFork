@@ -235,12 +235,25 @@ export function buildTreeSnapshotExecutionHooks(
 	opts: TreeSnapshotHookOptions,
 ): Pick<AgentConfig, "onToolExecutionBefore" | "onToolExecutionAfter"> {
 	if (!opts.isInGitRepo) return {};
+	// Background completions may arrive after the primary switched cwd. The capture
+	// pair must remain attached to the pass that admitted the original attempt.
+	const sourceSession = opts.session;
+	const passCwd = sourceSession.cwd;
+	sourceSession._treeHashBefore ??= new Map();
+	const beforeHashes = sourceSession._treeHashBefore;
 	const calls = new WeakMap<AgentToolUse, ReturnType<typeof buildTreeSnapshotEventHooks>>();
 	return {
 		onToolExecutionBefore: async (context) => {
 			if (!FILE_MUTATING_TOOLS.has(context.toolUse.name)) return;
 			const hooks = buildTreeSnapshotEventHooks({
 				...opts,
+				session: {
+					cwd: passCwd,
+					// SwitchDevice retains its existing within-pass behavior. Freeze its
+					// selected default at this attempt, not when the pass was built.
+					_defaultDeviceId: sourceSession._defaultDeviceId,
+					_treeHashBefore: beforeHashes,
+				},
 				binding: context.binding,
 				executionTarget: context.executionTarget,
 			});

@@ -12,6 +12,7 @@ import {
 } from "@shared/pretext-layout/text-document";
 import type { SubagentModelPools, SubagentModelUse } from "@shared/subagent-model-policy";
 import type { ToolEditPreview } from "@shared/tool-edit-preview";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import {
 	ApiError,
 	absorbRenewedToken,
@@ -563,6 +564,7 @@ export const narratorsApi = {
 		return request<ApiEntity[]>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
 	listNarratorsPaginated: (opts?: {
+		projectId?: string;
 		standalone?: boolean | "all";
 		status?: string;
 		filter?: string;
@@ -576,6 +578,7 @@ export const narratorsApi = {
 		hasViewers?: boolean;
 	}) => {
 		const params = new URLSearchParams();
+		if (opts?.projectId) params.set("projectId", opts.projectId);
 		if (opts?.standalone === "all") params.set("standalone", "all");
 		else if (opts?.standalone) params.set("standalone", "true");
 		if (opts?.status) params.set("status", opts.status);
@@ -1227,10 +1230,13 @@ export const narratorsApi = {
 		return request<RemoteDirectoryListing>(`/narrators/${id}/device-browse?${params}`);
 	},
 	updateNarratorDefaultDevice: (id: string, deviceId: string | null) =>
-		request<{ defaultDeviceId: string | null }>(`/narrators/${id}/default-device`, {
-			method: "PATCH",
-			body: JSON.stringify({ deviceId }),
-		}),
+		request<{ defaultDeviceId: string | null; current?: WorkspaceContext }>(
+			`/narrators/${id}/default-device`,
+			{
+				method: "PATCH",
+				body: JSON.stringify({ deviceId }),
+			},
+		),
 	updateNarratorPermissionMode: (id: string, permissionMode: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/permission-mode`, {
 			method: "PATCH",

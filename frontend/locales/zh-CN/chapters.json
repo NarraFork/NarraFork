@@ -1,4 +1,12 @@
 {
+	"legacyRoute": {
+		"denied": "你无权访问该旧资源，请使用有权限的账户登录。",
+		"missing": "该旧资源已不存在。",
+		"error": "旧资源加载失败，请稍后重试。",
+		"empty": "该资源没有主会话；未创建任何新会话，仍可访问原有配置。",
+		"configuration": "打开兼容配置",
+		"sessions": "会话列表"
+	},
 	"title": "章节",
 	"newChapter": "新建章节",
 	"viewGraph": "查看图谱",

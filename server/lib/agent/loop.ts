@@ -1269,6 +1269,8 @@ export async function runReflectionLoop(
 			// Keep systemPrompt available to dynamic tool definitions; suppress only injection.
 			getRuntimeSettingsOverride: undefined,
 			getModelOverride: undefined,
+			// Auxiliary decision tools are not the original filesystem execution attempt.
+			onToolExecutionFinalAuthorization: undefined,
 			// Reflection is an auxiliary call: follow the user's retry policy but
 			// hard-cap attempts (e.g. don't inherit an infinite/-1 or oversized
 			// maxTransientRetries from the parent primary loop).
@@ -1376,6 +1378,13 @@ export async function runReflectionLoop(
 				});
 			}
 		}
+		if (
+			reflectionLoop.context.purpose === "permissionRuleRequest" &&
+			(abortController.signal.aborted || pendingApiRequests.size > 0)
+		)
+			observed.errors.push(
+				"Permission rule reflection did not finish its provider request normally",
+			);
 		observed.failureSummary = summarizeReflectionFailure(observed);
 		if (observed.toolCalls.length === 0 || observed.toolResults.some((result) => result.isError)) {
 			logger.warn(`${label} completed without a successful reflection tool decision`, {
@@ -1414,6 +1423,7 @@ async function runDangerReflectionLoop(
 			allowedTools: [...DANGER_REFLECTION_TOOLS],
 			context: {
 				kind: "dangerReflection",
+				purpose: pause.purpose,
 				requestId: pause.requestId,
 				toolUseId: toolUse.toolUseId,
 				data: {
@@ -1555,7 +1565,7 @@ async function discardDangerReflectionRuntimeState(requestId: string): Promise<v
 	}
 }
 
-async function resolveDangerReflectionDecision(
+export async function resolveDangerReflectionDecision(
 	config: AgentConfig,
 	history: unknown[],
 	pause: DangerReflectionPermission,
@@ -1609,6 +1619,40 @@ async function resolveDangerReflectionDecision(
 		.finally(() => {
 			reflectionDone = true;
 		});
+	if (pause.purpose === "permissionRuleRequest") {
+		// Confirm is only a candidate in this domain. Await clean provider/loop completion
+		// before letting the permission service persist approval and consume the receipt.
+		const observed = await reflectionPromise;
+		const completedNormally =
+			!config.signal.aborted &&
+			!reflectionAbort.signal.aborted &&
+			observed.errors.length === 0 &&
+			observed.invalidStates.length === 0;
+		const validToolDecision =
+			observed.toolResults.filter(
+				(result) => result.toolName === "DangerConfirm" && !result.isError,
+			).length === 1 &&
+			!observed.toolResults.some((result) => result.isError || result.toolName === "DangerCancel");
+		const { completePermissionRuleRequestReflection, cancelDangerReflection } = await import(
+			"@server/services/narrator-permission"
+		);
+		const completed = await completePermissionRuleRequestReflection(pause.requestId, {
+			completedNormally,
+			validToolDecision,
+			usedTextFallback: false,
+		});
+		if (!completed && !(await isDangerReflectionWaitingForUser(pause.requestId))) {
+			await cancelDangerReflection(
+				pause.requestId,
+				"Permission rule reflection did not complete with a valid tool decision",
+				undefined,
+				{ failed: true },
+			);
+		}
+		const decision = await pause.decision;
+		await discardDangerReflectionRuntimeState(pause.requestId);
+		return decision;
+	}
 	const decision = await Promise.race([
 		pause.decision.finally(() => reflectionAbort.abort()),
 		reflectionPromise.then(async (observed) => {

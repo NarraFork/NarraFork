@@ -697,6 +697,8 @@ export async function executeTool(
 			config.toolExecutionBindings?.get(tu),
 	);
 	admissionState.toolCallBinding = toolCallBinding;
+	let permissionRuleTerminationReason =
+		"Permission rule request finished without consuming its approval";
 	// A direct persisted recovery uses the exact same path as a loop receipt.
 	if (toolCallBinding && !config.toolExecutionBindings?.has(tu)) {
 		config.toolExecutionBindings ??= new WeakMap();
@@ -706,11 +708,11 @@ export async function executeTool(
 	// Unified update admission is deliberately the first executable guard. Live loop callers
 	// reach this point only after the tool-use block has a stable narrator_tool_calls row.
 	// A boolean alone is not admission authority: only the registered grant closes the phase race.
-	if (!admissionState.startGrant) {
-		await preAdmitToolExecution(tu, config, { state: admissionState });
-	}
-
 	try {
+		if (!admissionState.startGrant) {
+			await preAdmitToolExecution(tu, config, { state: admissionState });
+		}
+		config.assertWorkspaceCurrent?.();
 		const tool = toolRegistry.get(tu.name);
 
 		// Defense-in-depth: when unified native search is enabled for this provider/model,
@@ -893,6 +895,17 @@ export async function executeTool(
 					onAwaitingUserDecision: releaseAdmissionForUserDecisionWait(admissionState),
 					onInputResolved: frozenExecution
 						? async (resolvedInput) => {
+								if (config.requireToolCallBinding && toolCallBinding) {
+									const { persistPermissionResolvedInput } = await import(
+										"@server/services/tool-final-start-authorization"
+									);
+									await persistPermissionResolvedInput(
+										config.narratorId,
+										tu.toolUseId,
+										toolCallBinding,
+										resolvedInput,
+									);
+								}
 								const refined = await resolveAndPersistFrozenExecutionTarget(
 									tu,
 									config,
@@ -1140,6 +1153,18 @@ export async function executeTool(
 			defaultDeviceId: config.defaultDeviceId,
 			allowLocalExecution: config.allowLocalExecution,
 			setDefaultDevice: config.setDefaultDevice,
+			workspaceContext: config.workspaceContext,
+			switchWorkingDirectory: config.switchWorkingDirectory,
+			assertWorkspaceCurrent: config.assertWorkspaceCurrent,
+			recheckAuthorization: async () => {
+				config.signal.throwIfAborted();
+				config.assertWorkspaceCurrent?.();
+				await config.runtimeAuthorizationGuard?.();
+				if (ctx.toolCallBinding && config.onInternalReadAuthorization)
+					await config.onInternalReadAuthorization(tu.toolUseId, ctx.toolCallBinding);
+				config.signal.throwIfAborted();
+				config.assertWorkspaceCurrent?.();
+			},
 		};
 
 		// Wire up emitLongRunning: notify UI when a process exceeds 60s
@@ -1378,7 +1403,29 @@ export async function executeTool(
 					}
 					claimingExecution = false;
 				}
+				// An update-admission wait can outlive an actor/grant or workspace change.
+				// Recheck at the actual body boundary, not only before permission handling.
+				await config.runtimeAuthorizationGuard?.();
+				let authorizeFinalStart = config.onToolExecutionFinalAuthorization;
+				if (!authorizeFinalStart && config.requireToolCallBinding && !config.reflectionLoop) {
+					// Durable recovery/direct runners must not silently omit the production gate.
+					const { buildFinalToolStartAuthorization } = await import(
+						"@server/services/tool-final-start-authorization"
+					);
+					authorizeFinalStart = buildFinalToolStartAuthorization(config);
+				}
+				const finalTicket = authorizeFinalStart
+					? await authorizeFinalStart({
+							...lifecycle,
+							executionBackend: frozenExecution?.backend,
+							executionPlan: frozenExecution?.plan,
+							approvedPermission: permission,
+						})
+					: undefined;
+				if (authorizeFinalStart && typeof finalTicket?.assertStillCurrent !== "function")
+					throw new Error("Final authorization did not return a synchronous policy fence");
 				config.signal.throwIfAborted();
+				config.assertWorkspaceCurrent?.();
 				// Only actual execution is painted as running; captures are preparation.
 				if (config.onEvent) {
 					const onEvent = config.onEvent;
@@ -1389,6 +1436,10 @@ export async function executeTool(
 						onEvent({ type: "tool_progress", toolUseId: tu.toolUseId, elapsed });
 					}, PROGRESS_INTERVAL_MS);
 				}
+				// No await or observer callback may sit between these fences and invocation.
+				config.signal.throwIfAborted();
+				config.assertWorkspaceCurrent?.();
+				finalTicket?.assertStillCurrent();
 				result = normalizeDiskToolResult(
 					await tool.execute(effectiveInput, ctx),
 					ctx.executionTarget?.canonicalPath ?? ctx.cwd,
@@ -1499,6 +1550,7 @@ export async function executeTool(
 				pipelineExitConfirmationStateId,
 			};
 		} catch (err) {
+			permissionRuleTerminationReason = err instanceof Error ? err.message : String(err);
 			// A failed durable claim must still reject (not become a normal tool result).
 			if (claimingExecution) throw err;
 			const diskError = diskToolError(
@@ -1528,8 +1580,27 @@ export async function executeTool(
 				pendingOutputTimer = undefined;
 			}
 		}
+	} catch (error) {
+		permissionRuleTerminationReason = error instanceof Error ? error.message : String(error);
+		throw error;
 	} finally {
 		releaseToolAdmissionState(admissionState);
+		if (tu.name === "RequestPermissionRule" && toolCallBinding) {
+			// Final deny, abort, routing failures and every early return must close an
+			// unconsumed approval. The service CAS protects applied/existing/denied receipts.
+			const { terminatePermissionRuleRequest } = await import(
+				"@server/services/permission-rule-request-service"
+			);
+			terminatePermissionRuleRequest({
+				narratorId: config.narratorId,
+				toolCallId: toolCallBinding.toolCallId,
+				attempt: toolCallBinding.attempt,
+				status: config.signal.aborted ? "cancelled" : "failed",
+				reason: config.signal.aborted
+					? "Permission rule request interrupted before execution completed"
+					: permissionRuleTerminationReason,
+			});
+		}
 	}
 }
 

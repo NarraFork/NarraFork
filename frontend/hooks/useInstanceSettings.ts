@@ -67,6 +67,7 @@ export interface InstanceSettingsState {
 	defaultStartInPlanMode: boolean;
 	defaultRelaxedPlan: boolean;
 	planModeAllowInlinePlan: boolean;
+	permissionRuleAutoApprove: boolean;
 	planReflectionAutoApprove: boolean;
 	planReflectionAllowAutoCompact: boolean;
 	questionReflectionEnabled: boolean;
@@ -186,6 +187,7 @@ function makeDefaults(): InstanceSettingsState {
 		defaultStartInPlanMode: false,
 		defaultRelaxedPlan: false,
 		planModeAllowInlinePlan: true,
+		permissionRuleAutoApprove: false,
 		planReflectionAutoApprove: false,
 		planReflectionAllowAutoCompact: false,
 		questionReflectionEnabled: false,
@@ -298,6 +300,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				requestDumpErrorsOnly: settings.agent?.requestDumpErrorsOnly ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
 				planModeAllowInlinePlan: settings.agent?.planModeAllowInlinePlan ?? true,
+				permissionRuleAutoApprove: settings.agent?.permissionRuleAutoApprove ?? false,
 				planReflectionAutoApprove: settings.agent?.planReflectionAutoApprove ?? false,
 				planReflectionAllowAutoCompact: settings.agent?.planReflectionAllowAutoCompact ?? false,
 				questionReflectionEnabled: settings.agent?.questionReflectionEnabled ?? false,
@@ -429,6 +432,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					defaultStartInPlanMode: state.defaultStartInPlanMode,
 					defaultRelaxedPlan: state.defaultRelaxedPlan,
 					planModeAllowInlinePlan: state.planModeAllowInlinePlan,
+					permissionRuleAutoApprove: state.permissionRuleAutoApprove,
 					planReflectionAutoApprove: state.planReflectionAutoApprove,
 					planReflectionAllowAutoCompact: state.planReflectionAllowAutoCompact,
 					questionReflectionEnabled: state.questionReflectionEnabled,

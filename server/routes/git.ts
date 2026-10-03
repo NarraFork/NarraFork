@@ -35,13 +35,15 @@ import {
 	collectGitAttributionScopes,
 	redactGitModificationView,
 } from "../services/git-workspace-attribution";
+import {
+	withWorkspaceRepositoryLock,
+	workspaceContextService,
+} from "../services/workspace-context-service";
 import { getWorkspaceModificationView } from "../services/workspace-modification-view";
 
 export { validateFilePaths } from "../services/git-management-service";
 
 type GitEnv = { Variables: { gitTarget: GitWorkspaceTarget } };
-// No waiting queue: shared refs/stash mutations fail quickly across linked worktrees.
-const writingRepositories = new Set<string>();
 
 function modificationCursor(c: Context) {
 	const cursorAt = c.req.query("cursorAt");
@@ -165,19 +167,22 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 				);
 		};
 		const lockKey = need === "write" ? target.workspace.repositoryKey : null;
-		if (lockKey && writingRepositories.has(lockKey))
-			throw new AppError(
-				"Another Git write is in progress in this repository",
-				409,
-				"GIT_WORKSPACE_BUSY",
-			);
-		if (lockKey) writingRepositories.add(lockKey);
 		c.set("gitTarget", target);
 		const started = performance.now();
+		const run = () => withGitRequestContext(c.req.raw.signal, next, target.beforeWrite);
+		const write = () => (lockKey ? withWorkspaceRepositoryLock(lockKey, run) : run());
 		try {
-			await withGitRequestContext(c.req.raw.signal, next, target.beforeWrite);
+			if (source === "narrator" && need === "write" && target.workspace.deviceId === "local") {
+				const id = c.req.param("id") ?? "";
+				const context = await workspaceContextService.get(id);
+				await workspaceContextService.withRevision(
+					id,
+					context.revision,
+					target.workspace.workspaceKey ?? undefined,
+					write,
+				);
+			} else await write();
 		} finally {
-			if (lockKey) writingRepositories.delete(lockKey);
 			if (need === "write" || performance.now() - started > 1000)
 				logger.info("Git workspace request", {
 					operation: c.req.path.split("/").pop(),

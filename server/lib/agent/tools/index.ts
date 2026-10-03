@@ -32,6 +32,7 @@ import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
 import { pluginInstallTool } from "./plugin-install";
 import { readTool } from "./read";
 import { recallTool } from "./recall";
+import { requestPermissionRuleTool } from "./request-permission-rule";
 import { scheduledTaskTool } from "./scheduled-task";
 import { scheduledTaskAdminTool } from "./scheduled-task-admin";
 import { sendTool } from "./send";
@@ -40,6 +41,7 @@ import { skillTool } from "./skill";
 import { structSedTool } from "./struct-sed";
 import { structViewTool } from "./struct-view";
 import { switchDeviceTool } from "./switch-device";
+import { switchWorkingDirectoryTool } from "./switch-working-directory";
 import { agentTool } from "./task";
 import { taskReflectConfirmTool, taskReflectReviseTool } from "./task-reflection";
 import { teamStatusTool } from "./team-status";
@@ -47,6 +49,7 @@ import { terminalTool } from "./terminal";
 import { transferFileTool } from "./transfer-file";
 import { webFetchTool } from "./web-fetch";
 import { webSearchTool } from "./web-search";
+import { worktreeTool } from "./worktree";
 import { writeTool } from "./write";
 
 /**
@@ -140,6 +143,9 @@ const coreProvider: ToolProvider = {
 			knowledgeReadTool,
 			knowledgeLibraryTool,
 			switchDeviceTool,
+			switchWorkingDirectoryTool,
+			worktreeTool,
+			requestPermissionRuleTool,
 			transferFileTool,
 			dangerConfirmTool,
 			dangerCancelTool,
