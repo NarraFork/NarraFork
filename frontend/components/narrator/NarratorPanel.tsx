@@ -110,16 +110,11 @@ import {
 	BackgroundTasksDrawerHost,
 	useBackgroundTasksButton,
 } from "./background/BackgroundTasksDrawer";
-import {
-	COMPACTING_MARKER_ATTR,
-	CompactSummaryModal,
-	CompactSummaryModalCtx,
-} from "./compact/compact-summary-modal";
+import { COMPACTING_MARKER_ATTR, CompactSummaryModalCtx } from "./compact/compact-summary-modal";
 import { useCompactSummaryModal } from "./compact/use-compact-summary-modal";
 import type { FileReferenceScopeValue } from "./composer/FileReferenceScope";
 import type { NarratorComposerHandle, NarratorRemoteDraft } from "./composer/NarratorComposer";
 import { ContentViewerEnvironmentProvider } from "./content/ContentViewer";
-import { ContextThresholdSettingsModal } from "./context-management/ContextThresholdSettingsModal";
 import {
 	type ContextManagementDraft,
 	DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
@@ -145,7 +140,6 @@ import {
 	normalizeDangerReflectionLevel,
 	normalizeDangerReflectionOverride,
 } from "./interaction/reflection-types";
-import { SetGlobalModelModal } from "./interaction/SetGlobalModelModal";
 import { useComposerAttachments } from "./interaction/use-composer-attachments";
 import { useComposerFileIngest } from "./interaction/use-composer-file-ingest";
 import { useInternalFileViewer } from "./interaction/use-internal-file-viewer";
@@ -180,8 +174,13 @@ import {
 	createResponsiveNarratorPanel,
 	NarratorPanelCompactContext,
 } from "./panels/compact-context";
-import { LeakedToolCallModal } from "./permission/LeakedToolCallModal";
-import { RevertActionConfirmModal } from "./permission/RevertScopeConfirmModal";
+import {
+	CompactSummaryModal,
+	ContextThresholdSettingsModal,
+	LeakedToolCallModal,
+	RevertActionConfirmModal,
+	SetGlobalModelModal,
+} from "./panels/memoized-dialogs";
 import { compactProgressLabel } from "./progress-label";
 import { SwipeAnchorOverlay } from "./scroll/SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./scroll/selection-anchor-overlay";
@@ -478,13 +477,15 @@ function NarratorPanelBody({
 			qc.invalidateQueries({ queryKey: ["contextThresholds"] });
 		},
 	});
+	// Mutation result objects are render snapshots; the mutation method is stable.
+	const mutateSettings = updateSettingsMutation.mutate;
 	// Which global model the "edit" modal is targeting ("default" | "summary" | null).
 	const [globalModelEditTarget, setGlobalModelEditTarget] = useState<"default" | "summary" | null>(
 		null,
 	);
 	const handleSetDefaultModel = useCallback(
 		(model: string) => {
-			updateSettingsMutation.mutate(
+			mutateSettings(
 				{ agent: { defaultModel: model } },
 				{
 					onSuccess: () => {
@@ -494,11 +495,11 @@ function NarratorPanelBody({
 				},
 			);
 		},
-		[updateSettingsMutation, t],
+		[mutateSettings, t],
 	);
 	const handleSetSummaryModel = useCallback(
 		(model: string) => {
-			updateSettingsMutation.mutate(
+			mutateSettings(
 				{ agent: { summaryModel: model } },
 				{
 					onSuccess: () => {
@@ -508,7 +509,7 @@ function NarratorPanelBody({
 				},
 			);
 		},
-		[updateSettingsMutation, t],
+		[mutateSettings, t],
 	);
 	// Re-fetch one NUG gateway's model catalog straight from the model menu. This
 	// is also how a stale "temporarily unavailable" flag gets cleared, since a
@@ -1555,7 +1556,7 @@ function NarratorPanelBody({
 	const handleSaveContextThresholdSettings = useCallback(
 		// `normalized` is already clamped/rounded by the modal.
 		(normalized: ContextManagementDraft) => {
-			updateSettingsMutation.mutate(
+			mutateSettings(
 				{
 					agent: {
 						contextThresholds: normalized.contextThresholds,
@@ -1570,7 +1571,7 @@ function NarratorPanelBody({
 				},
 			);
 		},
-		[closeContextThresholdSettings, t, updateSettingsMutation],
+		[closeContextThresholdSettings, t, mutateSettings],
 	);
 	const isPlanning = hasPlanTrait && narrator?.status === "working";
 	const isRetrying = !!retryInfo;
@@ -2686,6 +2687,22 @@ function NarratorPanelBody({
 		[toolbarInlineControls, toolbarController, narratorId, toolbarBadgeCounts, t],
 	);
 
+	const closeLeakedToolCallModal = useCallback(
+		() => setLeakedToolEvent(null),
+		[setLeakedToolEvent],
+	);
+	const closeGlobalModelModal = useCallback(() => setGlobalModelEditTarget(null), []);
+	const openGlobalAgentSettings = useCallback(
+		() => navigate({ to: "/settings/agent" }),
+		[navigate],
+	);
+	const cancelRollback = useCallback(() => {
+		if (!revertHistorySubmitting) setPendingRollback(null);
+	}, [revertHistorySubmitting, setPendingRollback]);
+	const cancelBlockDelete = useCallback(() => {
+		if (!revertHistorySubmitting) setPendingBlockDelete(null);
+	}, [revertHistorySubmitting, setPendingBlockDelete]);
+
 	if (!narrator) return <NarratorPanelSkeleton />;
 
 	const statusBarDisplay = getNarratorStatusBarDisplay({
@@ -3053,7 +3070,7 @@ function NarratorPanelBody({
 					<LeakedToolCallModal
 						narratorId={narratorId}
 						event={leakedToolEvent}
-						onClose={() => setLeakedToolEvent(null)}
+						onClose={closeLeakedToolCallModal}
 					/>
 
 					<Modal
@@ -3104,7 +3121,7 @@ function NarratorPanelBody({
 						onSave={handleSaveContextThresholdSettings}
 						saving={updateSettingsMutation.isPending}
 						canSave={!!settingsData}
-						onOpenGlobalSettings={() => navigate({ to: "/settings/agent" })}
+						onOpenGlobalSettings={openGlobalAgentSettings}
 					/>
 
 					{/* Keep the Details drawer mounted (only gate on context, not on
@@ -3686,9 +3703,7 @@ function NarratorPanelBody({
 				pending={pendingRollback}
 				submitting={revertHistorySubmitting}
 				onConfirm={confirmRollback}
-				onCancel={() => {
-					if (!revertHistorySubmitting) setPendingRollback(null);
-				}}
+				onCancel={cancelRollback}
 			/>
 			<RevertActionConfirmModal
 				narratorId={narratorId}
@@ -3696,9 +3711,7 @@ function NarratorPanelBody({
 				pending={pendingBlockDelete}
 				submitting={revertHistorySubmitting}
 				onConfirm={confirmBlockDelete}
-				onCancel={() => {
-					if (!revertHistorySubmitting) setPendingBlockDelete(null);
-				}}
+				onCancel={cancelBlockDelete}
 			/>
 			<SetGlobalModelModal
 				opened={globalModelEditTarget != null}
@@ -3706,7 +3719,7 @@ function NarratorPanelBody({
 				groupedModels={groupedModels}
 				currentValue={globalModelEditTarget === "summary" ? summaryModelValue : defaultModelValue}
 				saving={updateSettingsMutation.isPending}
-				onClose={() => setGlobalModelEditTarget(null)}
+				onClose={closeGlobalModelModal}
 				onConfirm={
 					globalModelEditTarget === "summary" ? handleSetSummaryModel : handleSetDefaultModel
 				}

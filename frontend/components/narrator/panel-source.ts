@@ -41,6 +41,7 @@ export const PANEL_MODULES = [
 	"interaction/SetGlobalModelModal.tsx",
 	"interaction/TurnElapsedTime.tsx",
 	"narrator-panel-overrides.ts",
+	"panels/memoized-dialogs.tsx",
 	"useNarratorAsyncQuestionSlots.ts",
 ] as const;
 
