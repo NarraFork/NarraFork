@@ -1991,29 +1991,31 @@ function adaptMessage(
 				placement: "trailing",
 				text: usageLines.trailing,
 				...(usageLines.trailingSecondary ? { secondaryText: usageLines.trailingSecondary } : {}),
+				responsiveLines: usageLines.responsiveLines,
 			},
 		});
 	}
 	return specs;
 }
 
-/**
- * Resolve the per-turn usage lines for a message, or null when none should be
- * drawn.
- *
- * Gated on the reader's preference FIRST so a disabled toggle costs nothing and,
- * more importantly, emits no specs — keeping the item list identical to a build
- * without the feature. The streaming placeholder is excluded because its usage
- * is not accounted until the turn is persisted; letting a row appear mid-stream
- * would grow the live tail for a reason unrelated to the arriving text.
- */
 function resolveAdapterTurnUsage(msg: AdapterMessage, ctx: AdapterContext) {
-	if (!ctx.showTokenUsage) return null;
-	if (msg.id === "__streaming__") return null;
-	return resolveTurnUsageLines(msg, {
-		mobile: ctx.compactUsageLines,
+	if (!ctx.showTokenUsage || msg.id === "__streaming__") return null;
+	const desktop = resolveTurnUsageLines(msg, { formatNumber: ctx.formatUsageNumber });
+	if (!desktop) return null;
+	const mobile = resolveTurnUsageLines(msg, {
+		mobile: true,
 		formatNumber: ctx.formatUsageNumber,
 	});
+	// Both presentations are short, preformatted strings. The resize preview can
+	// select them without re-adapting this message or touching the historical body.
+	const responsiveLines = {
+		desktop: { text: desktop.trailing ?? "" },
+		mobile: {
+			text: mobile?.trailing ?? "",
+			...(mobile?.trailingSecondary ? { secondaryText: mobile.trailingSecondary } : {}),
+		},
+	};
+	return { ...(ctx.compactUsageLines ? mobile : desktop), responsiveLines };
 }
 
 /**

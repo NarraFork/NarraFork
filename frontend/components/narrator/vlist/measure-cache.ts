@@ -366,6 +366,10 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// spec.key and usually the role, so without this the measured body stays the
 	// pre-edit one (the gap chat's own measure cache key already closed).
 	if (typeof d.editedAt === "string") rev += `|ea:${d.editedAt}`;
+	if (d.placement === "trailing") {
+		// The same-width breakpoint preview can add/remove the second usage line.
+		rev += `|us:${typeof d.secondaryText === "string" ? textSignature(d.secondaryText) : "-"}`;
+	}
 	// Communication bodies can finish streaming or hydrate without changing status.
 	// Re-key the bounded measured text and both independently reserved footer rows.
 	if (typeof d.message === "string") {

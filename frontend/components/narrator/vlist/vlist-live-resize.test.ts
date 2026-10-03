@@ -448,3 +448,77 @@ describe("resolveWidthSettle pending-preview compatibility", () => {
 		});
 	}
 });
+
+describe("responsive presentation in the resize controller", () => {
+	it("previews same-width breakpoint changes and commits once on release", () => {
+		const h = createHarness();
+		h.resize({ presentationKey: "desktop" });
+		expectIdle(h);
+		for (const presentationKey of ["mobile", "desktop", "mobile"]) {
+			h.resize({ presentationKey, height: 650 });
+			h.clock.frame();
+			h.clock.advance(16);
+			expect(h.committedWidth).toBe(700);
+			expect(h.commits).toHaveLength(0);
+			expect(h.controller.isPending()).toBe(true);
+		}
+		expect(h.previews.map((size) => size.presentationKey)).toEqual(["mobile", "desktop", "mobile"]);
+		h.controller.release();
+		expect(h.commits).toEqual([
+			{ width: 700, boxWidth: 732, height: 650, presentationKey: "mobile" },
+		]);
+		h.resize({ height: 620 });
+		expectIdle(h);
+	});
+
+	it("restarts quiet time for a breakpoint change, but not height-only traffic", () => {
+		const h = createHarness();
+		h.down = false;
+		h.resize({ presentationKey: "desktop" });
+		h.resize({ presentationKey: "mobile" });
+		h.clock.frame();
+		h.clock.advance(WIDTH_SETTLE_DELAY_MS - 1);
+		h.resize({ presentationKey: "desktop" });
+		h.clock.frame();
+		h.clock.advance(WIDTH_SETTLE_DELAY_MS - 1);
+		h.resize({ height: 600 });
+		expect(h.commits).toHaveLength(0);
+		h.clock.advance(1);
+		expect(h.commits).toHaveLength(1);
+		expect(h.commits[0]?.presentationKey).toBe("desktop");
+		expectIdle(h);
+	});
+});
+
+describe("hidden persistent chat slots", () => {
+	it("ignores initial zero geometry and initializes only after the host is visible", () => {
+		const h = createHarness({ initialWidth: 0 });
+		h.resize({ width: 1, boxWidth: 0, height: 0 });
+		expect(h.initial).toHaveLength(0);
+		expect(h.committedWidth).toBe(0);
+		expectIdle(h);
+		h.resize({ width: 700, boxWidth: 732, height: 700 });
+		expect(h.initial).toHaveLength(1);
+		expect(h.committedWidth).toBe(700);
+	});
+
+	it("does not measure or settle a queued preview against a hidden parking slot", () => {
+		const h = createHarness();
+		h.controller.observe();
+		h.resize({ width: 600, boxWidth: 632 });
+		h.resize({ width: 1, boxWidth: 0, height: 0 });
+		h.clock.frame();
+		expect(h.previews).toHaveLength(0);
+		h.controller.release();
+		h.clock.advance(WIDTH_POINTER_BACKSTOP_MS);
+		expect(h.commits).toHaveLength(0);
+		expect(h.committedWidth).toBe(700);
+		h.resize({ width: 600, boxWidth: 632, height: 700 });
+		h.clock.frame();
+		expect(h.previews).toHaveLength(1);
+		h.controller.release();
+		expect(h.commits).toHaveLength(1);
+		expect(h.commits[0]?.width).toBe(600);
+		expectIdle(h);
+	});
+});

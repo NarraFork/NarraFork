@@ -9,6 +9,8 @@ export interface VListResizeSize {
 	width: number;
 	boxWidth: number;
 	height: number;
+	/** A breakpoint can change local rows even when the reading column is capped. */
+	presentationKey?: string;
 }
 
 export interface VListResizeController {
@@ -27,6 +29,7 @@ export interface VListResizeController {
 export function createVListResizeController(options: {
 	readSize: () => VListResizeSize;
 	getCommittedWidth: () => number;
+	getCommittedPresentationKey?: () => string | undefined;
 	pointerDown: () => boolean;
 	onInitial: (size: VListResizeSize) => void;
 	onPreview: (size: VListResizeSize) => boolean;
@@ -49,6 +52,9 @@ export function createVListResizeController(options: {
 	let observedWidth: number | undefined;
 	let committedBoxWidth: number | undefined;
 	let recentCommittedWidths: readonly number[] = [];
+	let presentationInitialized = false;
+	let observedPresentationKey: string | undefined;
+	let committedPresentationKey: string | undefined;
 
 	function stop(): void {
 		generation++;
@@ -68,7 +74,11 @@ export function createVListResizeController(options: {
 			frame = null;
 			let needsMore: boolean;
 			try {
-				needsMore = options.onPreview(options.readSize());
+				const size = options.readSize();
+				// A preserved chat can park in a hidden slot while its dock is mounting.
+				// Zero geometry is not a reading width; wait for the next visible observer.
+				if (size.boxWidth <= 0 || size.height <= 0) return;
+				needsMore = options.onPreview(size);
 			} catch (error) {
 				// Surface the original diagnostic, but do not repeatedly retry a broken
 				// callback on every frame/observer/refresh. The settle timer still converges.
@@ -82,13 +92,27 @@ export function createVListResizeController(options: {
 	function evaluate(trigger: WidthSettleTrigger): void {
 		if (disposed) return;
 		const size = options.readSize();
+		if (size.boxWidth <= 0 || size.height <= 0) return;
 		const committedWidth = options.getCommittedWidth();
 		const widthChanged = observedWidth !== Math.round(size.width);
-		if (trigger === "observer") observedWidth = Math.round(size.width);
+		if (!presentationInitialized) {
+			presentationInitialized = true;
+			committedPresentationKey = options.getCommittedPresentationKey
+				? options.getCommittedPresentationKey()
+				: size.presentationKey;
+			observedPresentationKey = size.presentationKey;
+		}
+		const presentationChanged = observedPresentationKey !== size.presentationKey;
+		const presentationPending = committedPresentationKey !== size.presentationKey;
+		if (trigger === "observer") {
+			observedWidth = Math.round(size.width);
+			observedPresentationKey = size.presentationKey;
+		}
 
 		if (trigger === "observer" && committedWidth === 0) {
 			stop();
 			committedBoxWidth = size.boxWidth;
+			committedPresentationKey = size.presentationKey;
 			recentCommittedWidths = pushCommittedWidth([], size.width);
 			options.onInitial(size);
 			return;
@@ -100,8 +124,9 @@ export function createVListResizeController(options: {
 			trigger,
 			// Capture-phase pointerup/cancel may run before the tracker clears its flag.
 			pointerDown: trigger === "gesture-end" ? false : options.pointerDown(),
-			hasPendingPreview: pending,
-			recentCommittedWidths,
+			hasPendingPreview: pending || presentationPending,
+			// A breakpoint is external presentation input, not scrollbar feedback.
+			recentCommittedWidths: presentationPending ? [] : recentCommittedWidths,
 			boxWidth: size.boxWidth,
 			committedBoxWidth,
 		});
@@ -111,6 +136,7 @@ export function createVListResizeController(options: {
 				recentCommittedWidths = [];
 			}
 			committedBoxWidth = size.boxWidth;
+			committedPresentationKey = size.presentationKey;
 			recentCommittedWidths = pushCommittedWidth(recentCommittedWidths, size.width);
 			options.onCommit(size);
 			return;
@@ -122,7 +148,7 @@ export function createVListResizeController(options: {
 		pending = true;
 		// Height-only observer traffic and scroll/snapshot refreshes must not postpone
 		// settling forever. Only a new width restarts the idle deadline.
-		if (widthChanged || timer === null) {
+		if (widthChanged || presentationChanged || timer === null) {
 			if (timer !== null) clearTimer(timer);
 			const scheduledGeneration = generation;
 			timer = setTimer(() => {

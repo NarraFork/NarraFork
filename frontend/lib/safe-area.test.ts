@@ -316,11 +316,9 @@ describe("mobile safe-area layout contract", () => {
 			Bun.file(new URL("../components/ruler/RulerFlow.tsx", import.meta.url)).text(),
 		]);
 
-		const mobileBranch = route.slice(
-			route.indexOf("// Mobile layout"),
-			route.indexOf("// Desktop"),
-		);
-		expect(mobileBranch).toContain("ownsHorizontalSafeArea");
+		// One persistent chat now serves both layouts. Ownership must still be
+		// explicitly gated on mobile, not permanently enabled on its shared host.
+		expect(route).toContain("ownsHorizontalSafeArea={isMobile}");
 		expect(route.match(/ownsHorizontalSafeArea/g)).toHaveLength(1);
 		expect(workspacePanels).not.toContain("ownsHorizontalSafeArea");
 		expect(dockPanels).not.toContain("ownsHorizontalSafeArea");
@@ -1166,7 +1164,10 @@ describe("mobile safe-area layout contract", () => {
 		// Full-bleed routes (they cancel Main's padding with negative margins) vs routes
 		// that stay inside Main's content box. Both derive from Main; neither re-derives
 		// the viewport or the insets.
-		expect(narratorRoute.match(/h=\{APP_SHELL_FULL_BLEED_HEIGHT\}/g)?.length).toBe(2);
+		// The responsive narrator keeps a single full-bleed host instead of two
+		// identical mobile/desktop branches; both layouts inherit its height.
+		expect(narratorRoute.match(/h=\{APP_SHELL_FULL_BLEED_HEIGHT\}/g)?.length).toBe(1);
+		expect(narratorRoute).toContain("<FocusChatHost");
 		expect(workspaceRoute.match(/h=\{APP_SHELL_FULL_BLEED_HEIGHT\}/g)?.length).toBe(2);
 		expect(projectRoute).toContain("height: APP_SHELL_CONTENT_HEIGHT");
 		for (const route of [narratorRoute, workspaceRoute, projectRoute]) {

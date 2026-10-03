@@ -26,7 +26,11 @@ export function usePanelCompact(): {
 		roRef.current?.disconnect();
 		if (!el) return;
 		const ro = new ResizeObserver((entries) => {
-			setCompact((entries[0]?.contentRect.width ?? 0) < COMPACT_WIDTH_THRESHOLD);
+			const width = entries[0]?.contentRect.width ?? 0;
+			// A retained desktop dock is off-layout on mobile. Keep its last visible
+			// chrome until it is shown again, rather than publishing a false breakpoint.
+			if (width <= 0) return;
+			setCompact(width < COMPACT_WIDTH_THRESHOLD);
 		});
 		ro.observe(el);
 		roRef.current = ro;

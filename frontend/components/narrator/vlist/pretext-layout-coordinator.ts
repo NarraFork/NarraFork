@@ -474,6 +474,7 @@ export class PretextLayoutCoordinator {
 			dirtyKeys?: ReadonlySet<string>;
 			resolvePermissionForm?: ResizePermissionResolver;
 			onMeasuredKeys?: (keys: ReadonlySet<string>) => void;
+			compactUsageLines?: boolean;
 		},
 	): boolean {
 		const current = this.current;
@@ -495,6 +496,7 @@ export class PretextLayoutCoordinator {
 			heightOverrides,
 			dirtyKeys: options?.dirtyKeys,
 			resolvePermissionForm: options?.resolvePermissionForm,
+			compactUsageLines: options?.compactUsageLines,
 			measure: measureElementCached,
 		});
 		const targetWidth = Math.max(1, Math.round(width));

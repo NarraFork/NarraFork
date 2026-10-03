@@ -57,10 +57,19 @@ function message(narratorId: string, seq: number, text: string): TreeMessage {
 function pageAPI(
 	count = 100,
 	text = "An actual historical response that wraps at narrow widths. ".repeat(8),
+	withUsage = false,
 ) {
 	const narratorId = `resize-coordinator-${++fixtureId}`;
 	const messageVersion = fixtureId;
-	const messages = Array.from({ length: count }, (_, seq) => message(narratorId, seq, text));
+	const messages = Array.from({ length: count }, (_, seq) => ({
+		...message(narratorId, seq, text),
+		...(withUsage
+			? {
+					turnUsageJson: { input_tokens: 100, output_tokens: 20, cached_input_tokens: 8 },
+					costUsd: 0.5,
+				}
+			: {}),
+	}));
 	const requests: Parameters<PretextDocumentFetchPage>[1][] = [];
 	const fetchPage: PretextDocumentFetchPage = async (id, options) => {
 		expect(id).toBe(narratorId);
@@ -745,4 +754,59 @@ describe("coordinator width previews with the real paginated document API", () =
 			expect(layoutGeometry(preview)).toEqual(saved);
 		});
 	}
+});
+
+describe("usage breakpoint previews keep the historical semantic baseline", () => {
+	it("updates only local usage specs at the same width, then fully settles without refetching", async () => {
+		const build = { ...BUILD, showTokenUsage: true, compactUsageLines: false };
+		const { coordinator, api } = await loaded(pageAPI(100, "one line", true), build);
+		const before = ready(coordinator);
+		const requests = api.requests.length;
+		const view = topView();
+		coordinator.previewWidth(860, () => view, undefined, { compactUsageLines: true });
+		const local = ready(coordinator);
+		expect(local.input).toBe(before.input);
+		expect(local.semanticItems).toBe(before.semanticItems);
+		expect(local.semanticManifest).toBe(before.semanticManifest);
+		expect(local.resizePreview).toBe(true);
+		expect(local.resizeMeasuredCount).toBeGreaterThan(0);
+		expect(local.resizeMeasuredCount).toBeLessThanOrEqual(64);
+		const changed = local.items.filter((item, i) => item !== before.items[i]);
+		expect(changed.every((item) => item.spec.kind === "turn-usage")).toBe(true);
+		expect(local.items.at(-1)).toBe(before.items.at(-1));
+		expect(api.requests).toHaveLength(requests);
+
+		const settled = { ...build, compactUsageLines: true };
+		coordinator.finishResize(settled, { ...view, scrollTop: local.scrollTop ?? 0 });
+		const after = ready(coordinator);
+		expect(after.resizePreview).not.toBe(true);
+		expectFullBuild(after, settled);
+		expect(api.requests).toHaveLength(requests);
+	});
+
+	it("keeps a queued older page valid across a responsive preview and settlement", async () => {
+		const api = pageAPI(80, "one line", true);
+		const gate = fetchGate();
+		const build = { ...BUILD, showTokenUsage: true, compactUsageLines: false };
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load(
+			api.narratorId,
+			build,
+			{
+				firstScreenPageSize: 20,
+				fetchPage: async (id, options) => {
+					if (options.beforeSeq != null) await gate.promise;
+					return api.fetchPage(id, options);
+				},
+			},
+			undefined,
+			260,
+		);
+		const pending = coordinator.loadOlder(build, topView);
+		coordinator.previewWidth(860, topView, undefined, { compactUsageLines: true });
+		coordinator.finishResize({ ...build, compactUsageLines: true }, topView());
+		gate.release();
+		expect(await pending).toBeGreaterThan(0);
+		expectFullBuild(ready(coordinator), { ...build, compactUsageLines: true });
+	});
 });

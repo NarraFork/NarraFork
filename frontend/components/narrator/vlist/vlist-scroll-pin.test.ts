@@ -19,6 +19,7 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { resolveOlderHistoryAutoLoad } from "../history/older-history-auto-load";
 import { installCanvasStub } from "./measure/test-canvas-stub";
+import { sliceBracketedRegion } from "./source-slice";
 
 beforeAll(() => {
 	installCanvasStub();
@@ -370,10 +371,8 @@ describe("smooth bottom-follow wiring (vlist-smooth-follow)", () => {
 
 	it("non-glide corrections still land instantly and kill any chase in flight", async () => {
 		const source = await shell();
-		const correction = source.slice(
-			source.indexOf("const onScrollTopCorrection = useCallback("),
-			source.indexOf("const onScrollTopCorrection = useCallback(") + 1200,
-		);
+		const correction = sliceBracketedRegion(source, "const onScrollTopCorrection = useCallback(");
+		if (correction === null) throw new Error("Missing scroll correction callback");
 		// Anchored rebuilds / fold / LOD / removals keep their committed-geometry
 		// semantics: same instant write as before, and no chase survives them.
 		expect(correction).toContain("getSmoothFollower().cancel();");
@@ -429,11 +428,13 @@ describe("smooth bottom-follow wiring (vlist-smooth-follow)", () => {
 		// Without this the chase's own lag makes every streaming commit capture an
 		// ITEM anchor, whose correction cancels the chase it should feed (thrash).
 		const source = await shell();
-		const view = source.slice(
-			source.indexOf("const readCurrentView = useCallback("),
-			source.indexOf("const readCurrentView = useCallback(") + 1200,
-		);
-		expect(view).toContain("smoothFollowerRef.current?.isActive()");
+		const view = sliceBracketedRegion(source, "const readCurrentView = useCallback(");
+		if (view === null) throw new Error("Missing live view callback");
+		expect(view).toContain("const view = readViewportView();");
+		const viewportView = sliceBracketedRegion(source, "const readViewportView = useCallback(");
+		if (viewportView === null) throw new Error("Missing visible viewport view callback");
+		expect(viewportView).toContain("visibleViewportRef.current.read(");
+		expect(viewportView).toContain("smoothFollowerRef.current?.isActive()");
 	});
 
 	it("the chase never outlives the shell", async () => {

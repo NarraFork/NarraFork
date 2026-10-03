@@ -52,7 +52,9 @@ describe("production resize handler wiring", () => {
 		const preview = region(options, "onPreview: ({ width, height }) => {");
 		expect(preview).not.toMatch(/setLayoutHeight|setContentWidth/);
 		expect(preview).toMatch(/setViewportHeight\(height\)/);
-		expect(preview).toContain("pretextDocumentRef.current.previewWidth(width)");
+		expect(preview).toContain(
+			"pretextDocumentRef.current.previewWidth(width, mobileViewportRef.current)",
+		);
 	});
 
 	it("lets observer height reach the build only after controller.observe says not pending", () => {
@@ -110,7 +112,9 @@ describe("production resize handler wiring", () => {
 		expect(options).toMatch(/pointerDown:\s*\(\)\s*=>\s*pointerTracker\.isDown\(\)/);
 		expect(source).toMatch(/pretextDocumentRef\.current\s*=\s*pretextDocument\s*;/);
 		const preview = region(options, "onPreview: ({ width, height }) => {");
-		expect(preview).toContain("pretextDocumentRef.current.previewWidth(width)");
+		expect(preview).toContain(
+			"pretextDocumentRef.current.previewWidth(width, mobileViewportRef.current)",
+		);
 		expect(preview).not.toMatch(/\bpretextDocument\.previewWidth/);
 	});
 
@@ -169,7 +173,9 @@ describe("production resize handler wiring", () => {
 		const effect = resizeEffect(shell());
 		expect(effect).toMatch(/const\s+node\s*=\s*viewportNode\s*;/);
 		expect(effect).not.toMatch(/const\s+node\s*=\s*viewportRef\.current\s*;/);
-		expect(effect).toMatch(/\[viewportNode,\s*centeredColumn\]/);
+		expect(effect).toMatch(
+			/\[viewportNode,\s*centeredColumn,\s*readViewportView,\s*writeScrollTop\]/,
+		);
 	});
 
 	it("mirrors the viewport node into state from the ref callback", () => {

@@ -5,6 +5,7 @@ import {
 	restorePretextLayoutAnchor,
 } from "@shared/pretext-layout";
 import type { MeasureElement, VListItem } from "@shared/pretext-layout/layout-pipeline";
+import { reflowTurnUsageData } from "@shared/pretext-layout/turn-usage";
 import type { RenderLod } from "./prepared-block";
 import { type ResizePermissionResolver, reflowPermissionForms } from "./vlist-resize-permission";
 
@@ -32,6 +33,8 @@ export interface ResizePreviewInput {
 	/** A local form-height report invalidates just its row, even at the same width. */
 	dirtyKeys?: ReadonlySet<string>;
 	resolvePermissionForm?: ResizePermissionResolver;
+	/** Responsive usage rows are local presentation, not historical semantics. */
+	compactUsageLines?: boolean;
 	maxItems?: number;
 	overscan?: number;
 }
@@ -95,14 +98,22 @@ export function previewResize(input: ResizePreviewInput) {
 		if (changedKeys.size >= maxItems) break;
 		const item = items[itemIndex];
 		if (!item) continue;
+		const presentationData =
+			item.spec.kind === "turn-usage"
+				? reflowTurnUsageData(item.spec.data, input.compactUsageLines)
+				: item.spec.data;
 		if (
 			Math.round(item.contentWidth ?? input.committedWidth) === width &&
+			presentationData === item.spec.data &&
 			!input.dirtyKeys?.has(item.spec.key)
 		)
 			continue;
-		if (Math.round(item.contentWidth ?? input.committedWidth) !== width)
+		if (
+			Math.round(item.contentWidth ?? input.committedWidth) !== width ||
+			presentationData !== item.spec.data
+		)
 			changedWidths.add(item.spec.key);
-		const data = reflowPermissionForms(item.spec.data, width, input.resolvePermissionForm);
+		const data = reflowPermissionForms(presentationData, width, input.resolvePermissionForm);
 		const spec = data === item.spec.data ? item.spec : { ...item.spec, data };
 		const measured = measure(
 			spec.kind,
@@ -129,6 +140,8 @@ export function previewResize(input: ResizePreviewInput) {
 		if (
 			item &&
 			(Math.round(item.contentWidth ?? input.committedWidth) !== width ||
+				(item.spec.kind === "turn-usage" &&
+					reflowTurnUsageData(item.spec.data, input.compactUsageLines) !== item.spec.data) ||
 				(input.dirtyKeys?.has(item.spec.key) && !changedKeys.has(item.spec.key)))
 		) {
 			needsMore = true;

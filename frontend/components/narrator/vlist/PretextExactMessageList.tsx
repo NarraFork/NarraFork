@@ -13,6 +13,7 @@
 
 import { useCurrentUser } from "@frontend/hooks/useAuth";
 import { useLocalPref } from "@frontend/hooks/useLocalPref";
+import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
 import { useInterruptNarrator, useResumeRecoverySubagents } from "@frontend/hooks/useNarrator";
 import { type NarratorWSCallbacks, useNarratorWS } from "@frontend/hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "@frontend/hooks/usePlatform";
@@ -27,14 +28,12 @@ import {
 	resolveNarratorColumnWidth,
 } from "@frontend/lib/narrator-content-column";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
-import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import {
 	createSmoothFollower,
 	type SmoothFollower,
 	shouldSmoothFollow,
 } from "@frontend/lib/smooth-scroll";
 import { Anchor, Box, Group, Loader, Text } from "@mantine/core";
-import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { resolveVisibleWindow } from "@shared/pretext-layout";
 import { liveTailSignature } from "@shared/pretext-layout/reasoning-live-tail";
@@ -330,6 +329,7 @@ import {
 	type VListUserMarker,
 } from "./vlist-user-markers";
 import { mergePinnedRowIndices, resolvePinnedRowIndices } from "./vlist-virtualization";
+import { createVListVisibleViewport } from "./vlist-visible-viewport";
 import { createVisualStateStore } from "./vlist-visual-state";
 import type { WindowRowProjection } from "./vlist-window-row-reuse";
 
@@ -634,6 +634,20 @@ export const PretextExactMessageList = memo(
 			const [viewportHeight, setViewportHeight] = useState(0);
 			const viewportHeightRef = useRef(0);
 			viewportHeightRef.current = viewportHeight;
+			const visibleViewportRef = useRef(createVListVisibleViewport());
+			const readViewportView = useCallback(
+				() =>
+					visibleViewportRef.current.read(
+						viewportRef.current,
+						{
+							scrollTop: scrollTopRef.current,
+							viewportHeight: viewportHeightRef.current,
+							pinnedToBottom: pinnedToBottomRef.current,
+						},
+						smoothFollowerRef.current?.isActive() === true,
+					),
+				[],
+			);
 			// 0 = NOT YET MEASURED, and it is a sentinel rather than a plausible width on
 			// purpose.
 			//
@@ -645,6 +659,11 @@ export const PretextExactMessageList = memo(
 			// (narratorColumnPlaceholderStyle) and the rows only render once
 			// `hasRenderableLayout` is true, by which time the layout effect below has
 			// committed the measured width.
+			const isMobileViewport = useMobileViewport();
+			const mobileViewportRef = useRef(isMobileViewport);
+			mobileViewportRef.current = isMobileViewport;
+			const [layoutCompactUsageLines, setLayoutCompactUsageLines] = useState(isMobileViewport);
+			const committedCompactUsageLinesRef = useRef(isMobileViewport);
 			const [contentWidth, setContentWidth] = useState(0);
 			const [widthCommitEpoch, setWidthCommitEpoch] = useState(0);
 			// Exact viewport height can change live; only the finished height reaches the full build.
@@ -705,7 +724,10 @@ export const PretextExactMessageList = memo(
 			 */
 			const writeScrollTopCore = useCallback((nextTop: number, advanceState: boolean) => {
 				const node = viewportRef.current;
-				if (!node) return;
+				if (!node || !visibleViewportRef.current.isVisible(node)) {
+					smoothFollowerRef.current?.cancel();
+					return;
+				}
 				const target = Math.max(0, nextTop);
 				node.scrollTop = target;
 				// Read back: the container clamps, so the settled value is what future scroll
@@ -715,6 +737,7 @@ export const PretextExactMessageList = memo(
 				suppressedScrollTopRef.current = settled;
 				scrollTopRef.current = settled;
 				scrollViewportHeightRef.current = node.clientHeight;
+				visibleViewportRef.current.recordScrollTop(settled);
 				if (advanceState) setScrollTop(settled);
 				requestAnimationFrame(() => {
 					suppressScrollStateRef.current = false;
@@ -743,9 +766,14 @@ export const PretextExactMessageList = memo(
 				let follower = smoothFollowerRef.current;
 				if (!follower) {
 					follower = createSmoothFollower({
-						readCurrent: () => viewportRef.current?.scrollTop ?? 0,
-						readTarget: () => getScrollBottomTarget(viewportRef.current),
-						getViewportHeight: () => viewportRef.current?.clientHeight ?? 0,
+						readCurrent: () => readViewportView().scrollTop,
+						readTarget: () => {
+							const node = viewportRef.current;
+							return visibleViewportRef.current.isVisible(node)
+								? getScrollBottomTarget(node)
+								: readViewportView().scrollTop;
+						},
+						getViewportHeight: () => readViewportView().viewportHeight,
 						writeInstant: (value) => writeScrollTop(value),
 						writeChase: (value) => writeChaseScrollTop(value),
 						canAnimate: shouldSmoothFollow,
@@ -753,12 +781,25 @@ export const PretextExactMessageList = memo(
 					smoothFollowerRef.current = follower;
 				}
 				return follower;
-			}, [writeScrollTop, writeChaseScrollTop]);
+			}, [readViewportView, writeScrollTop, writeChaseScrollTop]);
 			// A chase in flight never survives the shell going away.
 			useEffect(() => () => smoothFollowerRef.current?.cancel(), []);
 
 			const onScrollTopCorrection = useCallback(
 				(nextTop: number, anchorKind: "bottom" | "item", smoothFollow?: boolean) => {
+					if (!visibleViewportRef.current.isVisible(viewportRef.current)) {
+						getSmoothFollower().cancel();
+						visibleViewportRef.current.deferCorrection(
+							applyExactScrollCorrection(nextTop, anchorKind, footerHeightRef.current),
+							anchorKind,
+							readViewportView(),
+						);
+						return;
+					}
+					const node = viewportRef.current;
+					if (node) {
+						visibleViewportRef.current.resume(node, pinnedToBottomRef.current, writeScrollTop);
+					}
 					// A bottom correction stamped smooth answers TAIL GROWTH (streaming row,
 					// appended message, live patch at the tail): glide the pinned viewport to
 					// the live bottom instead of snapping every committed row up a delta per
@@ -773,7 +814,7 @@ export const PretextExactMessageList = memo(
 					getSmoothFollower().cancel();
 					writeScrollTop(applyExactScrollCorrection(nextTop, anchorKind, footerHeightRef.current));
 				},
-				[getSmoothFollower, writeScrollTop],
+				[getSmoothFollower, readViewportView, writeScrollTop],
 			);
 			const [interaction, setInteraction] = useState<VListInteractionState>(() =>
 				createVListInteractionState(lod),
@@ -985,28 +1026,21 @@ export const PretextExactMessageList = memo(
 				[],
 			);
 			const readCurrentView = useCallback(() => {
-				const node = viewportRef.current;
-				const scrollTop = node?.scrollTop ?? scrollTopRef.current;
+				// A parked display:none node has no reading geometry. Semantic patches
+				// keep the last visible view (plus deferred anchored corrections).
+				// An active chase still counts as pinned while its visible box lags.
+				const view = readViewportView();
 				return {
-					scrollTop,
-					viewportHeight: node?.clientHeight ?? viewportHeightRef.current,
-					// Mid-chase the viewport lags BEHIND the bottom by the glide residual, so
-					// the raw geometric reading would report "not pinned" while the reader is
-					// in fact following — every streaming commit would then capture an ITEM
-					// anchor, and its correction would cancel the chase it should feed. An
-					// active chase IS the bottom pin in motion.
-					pinnedToBottom:
-						!textReadingDetachedRef.current &&
-						(node
-							? getDistanceFromBottom(node) <= BOTTOM_DISTANCE_EPSILON ||
-								smoothFollowerRef.current?.isActive() === true
-							: pinnedToBottomRef.current),
+					...view,
+					// Reading expanded text stays detached even if a shorter viewport
+					// happens to place its preserved position at the geometric bottom.
+					pinnedToBottom: !textReadingDetachedRef.current && view.pinnedToBottom,
 					// Document offset of the point the LOD gesture is centered on, so the
 					// rebuild anchors THAT content instead of the viewport top. Stale points
 					// are dropped by resolveLodFocusOffset (see the gesture wiring below).
-					focusOffset: resolveLodFocusOffset(lodFocusRef.current, Date.now(), scrollTop),
+					focusOffset: resolveLodFocusOffset(lodFocusRef.current, Date.now(), view.scrollTop),
 				};
-			}, []);
+			}, [readViewportView]);
 
 			// Per-key measured lookup so stable toggle callbacks can read current state at
 			// click time without depending on render-time closures. Populated below from
@@ -1445,6 +1479,7 @@ export const PretextExactMessageList = memo(
 							smoothFollowerRef.current?.cancel();
 							textReadingDetachedRef.current = true;
 							pinnedToBottomRef.current = false;
+							visibleViewportRef.current.setPinned(false);
 							setPinnedToBottom(false);
 							captureFoldBefore(key);
 							setInteraction((prev) => {
@@ -1942,10 +1977,8 @@ export const PretextExactMessageList = memo(
 				isFetched: userPrefsFetched,
 			} = useUserPreferences();
 			const showTokenUsage = userPrefs?.showTokenUsage ?? false;
-			// The chunked path splits the trailing usage summary with CSS breakpoints, which
-			// a zero-DOM height model cannot see — so the breakpoint is resolved here and
-			// becomes an explicit measure input (one line vs two).
-			const isMobileViewport = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
+			// During a resize, the live breakpoint selects visible usage specs locally.
+			// Only the settled breakpoint reaches the full document build below.
 			// Height as the LAYOUT sees it (see the buildOptions comment below). Derived here
 			// so the value handed to the document hook only changes at bucket boundaries.
 			const layoutViewportHeight = bucketViewportHeight(layoutHeight);
@@ -2020,7 +2053,7 @@ export const PretextExactMessageList = memo(
 				resolveFullToolInput,
 				resolveFullToolOutput,
 				showTokenUsage,
-				compactUsageLines: isMobileViewport,
+				compactUsageLines: layoutCompactUsageLines,
 				formatUsageNumber: formatLocaleNumber,
 				onScrollTopCorrection,
 				isSubagent,
@@ -4055,22 +4088,29 @@ export const PretextExactMessageList = memo(
 						width: resolveNarratorColumnWidth(node.clientWidth, PAGE_PADDING, centeredColumn),
 						boxWidth: node.offsetWidth,
 						height: node.clientHeight,
+						presentationKey: mobileViewportRef.current ? "mobile" : "desktop",
 					}),
 					getCommittedWidth: () => committedContentWidthRef.current,
+					getCommittedPresentationKey: () =>
+						committedCompactUsageLinesRef.current ? "mobile" : "desktop",
 					pointerDown: () => pointerTracker.isDown(),
 					onInitial: ({ width, height }) => {
 						committedContentWidthRef.current = width;
 						setContentWidth(width);
+						committedCompactUsageLinesRef.current = mobileViewportRef.current;
+						setLayoutCompactUsageLines(mobileViewportRef.current);
 						setViewportHeight(height);
 						setLayoutHeight(height);
 					},
 					onPreview: ({ width, height }) => {
 						setViewportHeight(height);
-						return pretextDocumentRef.current.previewWidth(width);
+						return pretextDocumentRef.current.previewWidth(width, mobileViewportRef.current);
 					},
 					onCommit: ({ width, height }) => {
 						committedContentWidthRef.current = width;
 						setContentWidth(width);
+						committedCompactUsageLinesRef.current = mobileViewportRef.current;
+						setLayoutCompactUsageLines(mobileViewportRef.current);
 						setViewportHeight(height);
 						setLayoutHeight(height);
 						// Width equality is NOT completion: off-screen frames may still be stale.
@@ -4079,6 +4119,13 @@ export const PretextExactMessageList = memo(
 				});
 				resizeControllerRef.current = controller;
 				const measure = () => {
+					// The stable chat temporarily parks off-layout while a dock slot mounts.
+					// Do not commit a one-pixel reading width or zero plan-detail cap.
+					if (!visibleViewportRef.current.isVisible(node)) return;
+					// Replay hidden anchored commits before the resize coordinator reads
+					// the restored viewport, even when its width/height did not change.
+					visibleViewportRef.current.resume(node, pinnedToBottomRef.current, writeScrollTop);
+					readViewportView();
 					controller.observe();
 					// Live height feeds the window, not full-build params during a width preview.
 					if (!controller.isPending()) {
@@ -4095,7 +4142,13 @@ export const PretextExactMessageList = memo(
 					controller.dispose();
 					if (resizeControllerRef.current === controller) resizeControllerRef.current = null;
 				};
-			}, [viewportNode, centeredColumn]);
+			}, [viewportNode, centeredColumn, readViewportView, writeScrollTop]);
+			// A capped column may keep the same width across a viewport breakpoint.
+			// Notify the controller explicitly rather than relying on ResizeObserver.
+			useLayoutEffect(() => {
+				void isMobileViewport;
+				resizeControllerRef.current?.observe();
+			}, [isMobileViewport]);
 			// Re-preview a newly committed semantic snapshot or new window, including an
 			// asynchronous page/font/stream update that replaced the previous preview.
 			useLayoutEffect(() => {
@@ -4121,7 +4174,10 @@ export const PretextExactMessageList = memo(
 					setFooterHeight(0);
 					return;
 				}
-				const measure = () => setFooterHeight(Math.max(0, node.offsetHeight));
+				const measure = () => {
+					if (!visibleViewportRef.current.isVisible(viewportRef.current)) return;
+					setFooterHeight(Math.max(0, node.offsetHeight));
+				};
 				measure();
 				if (typeof ResizeObserver === "undefined") return;
 				const observer = new ResizeObserver(measure);
@@ -4153,6 +4209,7 @@ export const PretextExactMessageList = memo(
 					// frame and cut every streaming glide short. While a chase is active this
 					// yields to it — the chase re-reads the live bottom every frame, so the
 					// growth this effect is answering is already part of its target.
+					if (!visibleViewportRef.current.isVisible(viewportRef.current)) return;
 					if (smoothFollowerRef.current?.isActive() === true) return;
 					writeScrollTop(getScrollBottomTarget(viewportRef.current));
 				});
@@ -4221,7 +4278,10 @@ export const PretextExactMessageList = memo(
 			const processScrollFrame = useCallback(() => {
 				scrollRafRef.current = 0;
 				const node = viewportRef.current;
-				if (!node) return;
+				// A queued scroll rAF can run after the host parks in display:none.
+				// Zero geometry must not change pin, unread count, intent or window.
+				if (!node || !visibleViewportRef.current.isVisible(node)) return;
+				visibleViewportRef.current.resume(node, pinnedToBottomRef.current, writeScrollTop);
 				const previousTop = scrollTopRef.current;
 				const nextTop = node.scrollTop;
 				const liveViewportHeight = node.clientHeight;
@@ -4316,6 +4376,7 @@ export const PretextExactMessageList = memo(
 				// have moved the position, and the window must be resolved for where the
 				// viewport now IS (a stale value would mount the band the reader just left).
 				const settledTop = scrollTopRef.current;
+				readViewportView();
 				resizeControllerRef.current?.refresh();
 				const layout = exactLayoutRef.current;
 				if (!layout) return;
@@ -4326,6 +4387,7 @@ export const PretextExactMessageList = memo(
 				}
 			}, [
 				maybeAutoLoadOlder,
+				readViewportView,
 				onAtBottomChange,
 				onUnreadCountChange,
 				viewportHeight,
@@ -4351,18 +4413,28 @@ export const PretextExactMessageList = memo(
 					getSmoothFollower().cancel();
 					textReadingDetachedRef.current = false;
 					pinnedToBottomRef.current = true;
+					visibleViewportRef.current.setPinned(true);
 					setPinnedToBottom(true);
-					if (instant) writeScrollTop(getScrollBottomTarget(viewportRef.current));
-					else
-						requestAnimationFrame(() => writeScrollTop(getScrollBottomTarget(viewportRef.current)));
+					const land = () => {
+						const node = viewportRef.current;
+						if (!node || !visibleViewportRef.current.isVisible(node)) {
+							visibleViewportRef.current.deferCorrection(0, "bottom", readViewportView());
+							return;
+						}
+						visibleViewportRef.current.resume(node, true, writeScrollTop);
+						writeScrollTop(getScrollBottomTarget(node));
+					};
+					if (instant) land();
+					else requestAnimationFrame(land);
 				},
-				[getSmoothFollower, writeScrollTop],
+				[getSmoothFollower, readViewportView, writeScrollTop],
 			);
 			const detachFromBottom = useCallback(() => {
 				// Reader intent (wheel-up): the chase must die with the pin, or its next
 				// frame re-writes scrollTop and pulls the reader back down.
 				getSmoothFollower().cancel();
 				pinnedToBottomRef.current = false;
+				visibleViewportRef.current.setPinned(false);
 				setPinnedToBottom(false);
 			}, [getSmoothFollower]);
 
@@ -4404,6 +4476,7 @@ export const PretextExactMessageList = memo(
 					// immediately pull the reader back to the tail.
 					getSmoothFollower().cancel();
 					pinnedToBottomRef.current = false;
+					visibleViewportRef.current.setPinned(false);
 					setPinnedToBottom(false);
 					writeScrollTop(resolveVListUserMarkerScrollTop(marker.top, VLIST_USER_MARKER_JUMP_LEAD));
 				},
@@ -4413,6 +4486,7 @@ export const PretextExactMessageList = memo(
 				(marker: VListCompactMarker) => {
 					getSmoothFollower().cancel();
 					pinnedToBottomRef.current = false;
+					visibleViewportRef.current.setPinned(false);
 					setPinnedToBottom(false);
 					writeScrollTop(resolveVListUserMarkerScrollTop(marker.top, VLIST_USER_MARKER_JUMP_LEAD));
 				},
@@ -4554,6 +4628,7 @@ export const PretextExactMessageList = memo(
 						const element = mountedJumpTarget(node, domIds, targetIds);
 						if (!element) return false;
 						pinnedToBottomRef.current = false;
+						visibleViewportRef.current.setPinned(false);
 						setPinnedToBottom(false);
 						// Restrict the reveal to this list, including repeated jumps to a mounted
 						// row. Native scrollIntoView can also scroll the panel/page ancestors.
@@ -4574,6 +4649,7 @@ export const PretextExactMessageList = memo(
 							if (itemIndex == null) continue;
 							const targetTop = index.itemStart(itemIndex) - Math.max(0, node.clientHeight / 2);
 							pinnedToBottomRef.current = false;
+							visibleViewportRef.current.setPinned(false);
 							setPinnedToBottom(false);
 							writeScrollTop(targetTop);
 							await waitAnimationFrame();
@@ -4649,6 +4725,7 @@ export const PretextExactMessageList = memo(
 						// tail on every commit (commitPrependLayout's pinned branch), fighting the
 						// jump. A jump is an explicit reading action, so unpin first.
 						pinnedToBottomRef.current = false;
+						visibleViewportRef.current.setPinned(false);
 						setPinnedToBottom(false);
 						const added = await loadOlderAsyncRef.current().catch(() => 0);
 						if (cancelled()) return false;

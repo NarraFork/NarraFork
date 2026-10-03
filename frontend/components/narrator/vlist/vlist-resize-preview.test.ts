@@ -28,7 +28,9 @@ function fixture({
 	width = 860,
 	text = "A real paragraph whose words must wrap differently as the column changes. ".repeat(8),
 	gapAfter,
+	withUsage = false,
 }: {
+	withUsage?: boolean;
 	count?: number;
 	width?: number;
 	text?: string;
@@ -40,12 +42,19 @@ function fixture({
 			id: `resize-${seq}`,
 			role: "assistant",
 			contentJson: [{ type: "text", text }],
+			...(withUsage
+				? {
+						turnUsageJson: { input_tokens: 100, output_tokens: 20, cached_input_tokens: 8 },
+						costUsd: 0.5,
+					}
+				: {}),
 		},
 	}));
 	const options = {
 		contentWidth: width,
 		lod: 5 as const,
 		documentRevision: `resize-fixture-${++fixtureRevision}`,
+		showTokenUsage: withUsage,
 		gap: 4,
 		topPadding: 16,
 		bottomPadding: 24,
@@ -56,7 +65,7 @@ function fixture({
 			itemKey: item.spec.key,
 			firstSeq: seq,
 			lastSeq: seq,
-			sourceMessageIds: [`resize-${seq}`],
+			sourceMessageIds: [`resize-${withUsage ? Math.floor(seq / 3) : seq}`],
 			kind: item.spec.kind,
 			gapAfter: gapAfter?.(seq),
 			measured: item.measured,
@@ -70,7 +79,7 @@ function fixture({
 			metrics: { topPadding: 16, itemGap: 4, bottomPadding: 24 },
 		},
 	);
-	expect(computed.items).toHaveLength(count);
+	expect(computed.items).toHaveLength(count * (withUsage ? 3 : 1));
 	return { index: built.index, items: computed.items, committedWidth: width };
 }
 
@@ -400,4 +409,81 @@ it("a same-width dirty refresh retains valid dynamic overrides when restoring th
 	expect(result.changedKeys.has(key)).toBe(true);
 	expect(result.scrollTop).toBe(100);
 	expect(base.items[0]?.contentWidth).toBe(result.items[0]?.contentWidth);
+});
+
+describe("bounded usage presentation reflow", () => {
+	for (const pinnedToBottom of [false, true]) {
+		it(`changes only visible usage rows at the same width, pinned=${pinnedToBottom}`, () => {
+			const base = fixture({ text: "one line", withUsage: true });
+			const view = {
+				scrollTop: pinnedToBottom ? base.index.totalHeight - 120 : base.index.itemStart(90) + 2,
+				viewportHeight: 120,
+				pinnedToBottom,
+			};
+			const anchor = capturePretextLayoutAnchor(base.index, view.scrollTop, 120, pinnedToBottom);
+			const { measure, calls } = measuredCalls();
+			const mobile = preview(base, { width: 860, compactUsageLines: true, view, measure });
+			expect(calls.length).toBeGreaterThan(0);
+			expect(calls.length).toBeLessThanOrEqual(64);
+			expect(calls.every((call) => call.key?.endsWith("usage-trailing"))).toBe(true);
+			for (const [i, item] of mobile.items.entries()) {
+				if (item === base.items[i]) continue;
+				expect(item.spec.kind).toBe("turn-usage");
+				expect(item.spec.data).toMatchObject({ secondaryText: "8 cache hit · $0.5000" });
+				expect(item.measured.height).toBeGreaterThan(base.items[i]?.measured.height);
+			}
+			expect(mobile.items[0]).toBe(base.items[0]);
+			expect(mobile.scrollTop).toBe(restorePretextLayoutAnchor(anchor, mobile.index, 120));
+			const currentView = { ...view, scrollTop: mobile.scrollTop };
+			const unchanged = preview(
+				{ ...base, ...mobile },
+				{
+					width: 860,
+					compactUsageLines: true,
+					view: currentView,
+				},
+			);
+			expect(unchanged.changedKeys.size).toBe(0);
+			expect(unchanged.items).toBe(mobile.items);
+			const desktop = preview(
+				{ ...base, ...mobile },
+				{
+					width: 860,
+					compactUsageLines: false,
+					view: currentView,
+				},
+			);
+			expect(desktop.changedKeys.size).toBeGreaterThan(0);
+			for (const [i, item] of desktop.items.entries()) {
+				if (item === mobile.items[i]) continue;
+				expect(item.spec.kind).toBe("turn-usage");
+				expect((item.spec.data as { secondaryText?: string }).secondaryText).toBeUndefined();
+				expect(item.measured.height).toBe(base.items[i]?.measured.height);
+			}
+			// Rows that left the buffer keep their previous presentation until settle.
+			const mobileAnchor = capturePretextLayoutAnchor(
+				mobile.index,
+				mobile.scrollTop,
+				120,
+				pinnedToBottom,
+			);
+			expect(desktop.scrollTop).toBe(restorePretextLayoutAnchor(mobileAnchor, desktop.index, 120));
+		});
+	}
+
+	it("bounds a dense same-width breakpoint update and continues unfinished batches", () => {
+		const base = fixture({ text: "one line", withUsage: true });
+		const view = {
+			scrollTop: 0,
+			viewportHeight: base.index.totalHeight * 2,
+			pinnedToBottom: false,
+		};
+		const first = preview(base, { width: 860, compactUsageLines: true, view });
+		expect(first.changedKeys.size).toBe(64);
+		expect(first.needsMore).toBe(true);
+		const second = preview({ ...base, ...first }, { width: 860, compactUsageLines: true, view });
+		expect(second.changedKeys.size).toBe(36);
+		expect(second.needsMore).toBe(false);
+		expect(second.items[2]).toBe(first.items[2]);
+	});
 });

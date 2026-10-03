@@ -1,6 +1,6 @@
-import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
+import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
 import { Box, Center, Drawer, Group, Loader, Text } from "@mantine/core";
-import { useDisclosure, useMediaQuery } from "@mantine/hooks";
+import { useDisclosure } from "@mantine/hooks";
 import {
 	createFileRoute,
 	useLocation,
@@ -10,7 +10,7 @@ import {
 } from "@tanstack/react-router";
 import type { Direction } from "dockview-react";
 import type React from "react";
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, memo, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChapterForkModal } from "../../components/chapter/ChapterForkModal";
 import { clearHighlightCache } from "../../components/narrator/markdown/highlight-cache";
@@ -31,10 +31,11 @@ const SpecPanel = lazy(() =>
 );
 const NarratorPanel = lazy(() =>
 	import("../../components/narrator/NarratorPanel").then((m) => ({
-		default: m.NarratorPanel,
+		default: memo(m.NarratorPanel),
 	})),
 );
 
+import { FocusChatHost } from "../../components/narrator/dock/FocusChatHost";
 import { NarratorDock } from "../../components/narrator/dock/NarratorDock";
 import { NarratorDockProvider } from "../../components/narrator/dock/NarratorDockContext";
 import { useChapter } from "../../hooks/useChapters";
@@ -111,7 +112,7 @@ function NarratorDetailPage() {
 	const hashMessageId = location.hash?.startsWith("msg-") ? location.hash.slice(4) : undefined;
 	// scrollTo search param takes precedence over hash-based highlight
 	const highlightMessageId = scrollToMessageId ?? hashMessageId;
-	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY);
+	const isMobile = useMobileViewport();
 
 	// Fetch narrator data for recent tab tracking
 	const { data: narrator } = useNarrator(narratorId);
@@ -431,44 +432,137 @@ function NarratorDetailPage() {
 		pageBoxRef.current = el;
 	}, []);
 
-	// Mobile layout
-	if (isMobile) {
-		return (
+	// The provider and portal owner never cross the responsive identity boundary.
+	return (
+		<NarratorDockProvider
+			key={narratorId}
+			narratorId={narratorId}
+			chapterId={chapterId}
+			onForkFromMessage={chapterId ? handleForkFromMessage : null}
+			highlightMessageId={highlightMessageId}
+			onBack={isSubagent ? onBack : null}
+			onMinimize={showMinimize ? onMinimize : null}
+		>
 			<Box
+				ref={mergedRef}
 				h={APP_SHELL_FULL_BLEED_HEIGHT}
 				mx="calc(var(--mantine-spacing-md) * -1)"
 				my="calc(var(--mantine-spacing-md) * -1)"
-				style={{ display: "flex", flexDirection: "column", position: "relative" }}
+				style={{
+					display: "flex",
+					flexDirection: "column",
+					position: "relative",
+					overflow: "hidden",
+					isolation: "isolate",
+				}}
 			>
-				<Box style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
-					<Suspense
-						fallback={
-							<Center h="100%">
-								<Loader size="sm" />
-							</Center>
-						}
-					>
-						<NarratorPanel
-							key={narratorId}
-							narratorId={narratorId}
-							narrator={narrator}
-							ownsHorizontalSafeArea
-							highlightMessageId={highlightMessageId}
-							onForkFromMessage={chapterId ? handleForkFromMessage : undefined}
-							onSendToTerminal={isSubagent ? undefined : handleSendToTerminal}
-							appendInputRef={isSubagent ? undefined : appendInputRef}
-							terminalOpen={isSubagent ? undefined : drawerOpened}
-							onToggleTerminal={
-								isSubagent ? undefined : drawerOpened ? closeDrawer : openDrawerWithTerminal
+				<FocusChatHost
+					narratorId={narratorId}
+					isMobile={isMobile}
+					renderChat={({ compact, onHeaderPointerDown, onViewSubagentSession }) => (
+						<Suspense
+							fallback={
+								<Center h="100%">
+									<Loader size="sm" />
+								</Center>
 							}
-							onMinimize={showMinimize ? onMinimize : undefined}
-							onBack={isSubagent ? onBack : undefined}
-							specPanelOpen={specDrawerOpened}
-							onToggleSpecPanel={specDrawerOpened ? closeSpecDrawer : openSpecDrawer}
-						/>
-					</Suspense>
-				</Box>
+						>
+							<NarratorPanel
+								narratorId={narratorId}
+								narrator={narrator}
+								ownsHorizontalSafeArea={isMobile}
+								compact={compact}
+								onHeaderPointerDown={isMobile ? undefined : onHeaderPointerDown}
+								onViewSubagentSession={onViewSubagentSession}
+								highlightMessageId={highlightMessageId}
+								onForkFromMessage={chapterId ? handleForkFromMessage : undefined}
+								onSendToTerminal={isMobile && !isSubagent ? handleSendToTerminal : undefined}
+								appendInputRef={isMobile && !isSubagent ? appendInputRef : undefined}
+								terminalOpen={isMobile && !isSubagent ? drawerOpened : undefined}
+								onToggleTerminal={
+									isMobile && !isSubagent
+										? drawerOpened
+											? closeDrawer
+											: openDrawerWithTerminal
+										: undefined
+								}
+								onMinimize={showMinimize ? onMinimize : undefined}
+								onBack={isSubagent ? onBack : undefined}
+								specPanelOpen={isMobile ? specDrawerOpened : undefined}
+								onToggleSpecPanel={
+									isMobile ? (specDrawerOpened ? closeSpecDrawer : openSpecDrawer) : undefined
+								}
+							/>
+						</Suspense>
+					)}
+				>
+					{!isMobile && <NarratorDock device="desktop" />}
+					{isMobile && (
+						<>
+							{/* Mobile terminal drawer */}
+							<Drawer
+								opened={drawerOpened}
+								onClose={closeDrawer}
+								position="right"
+								size="100%"
+								title={
+									<Text size="sm" fw={600} truncate>
+										{tt("terminal")}
+									</Text>
+								}
+								closeButtonProps={{ size: "sm" }}
+								styles={MOBILE_DRAWER_STYLES}
+							>
+								<Suspense
+									fallback={
+										<Center h="100%">
+											<Loader size="sm" />
+										</Center>
+									}
+								>
+									<NarratorTerminal
+										narratorId={narratorId}
+										onSendToChat={handleSendToChat}
+										onWriteRef={handleWriteRef}
+										onExit={handleTerminalExit}
+									/>
+								</Suspense>
+							</Drawer>
 
+							{/* Mobile spec drawer — chromeless panel; title + save/reload live in
+				    the drawer header (mirrors the desktop dock). */}
+							<Drawer
+								opened={specDrawerOpened}
+								onClose={() => {
+									closeSpecDrawer();
+								}}
+								position="right"
+								size="100%"
+								title={
+									<Group gap="xs" wrap="nowrap" style={{ flex: 1 }}>
+										<Text size="sm" fw={600} truncate style={{ flex: 1 }}>
+											{tn("spec.title")}
+										</Text>
+									</Group>
+								}
+								closeButtonProps={{ size: "sm" }}
+								styles={MOBILE_DRAWER_STYLES}
+							>
+								<Suspense
+									fallback={
+										<Center h="100%">
+											<Loader size="sm" />
+										</Center>
+									}
+								>
+									<SpecPanel narratorId={narratorId} onClose={closeSpecDrawer} chromeless />
+								</Suspense>
+							</Drawer>
+						</>
+					)}
+				</FocusChatHost>
+
+				{/* Drop zone overlay for drag-to-split (drag another narrator here) */}
 				{chapterId && forkMessageId && (
 					<ChapterForkModal
 						chapterId={chapterId}
@@ -479,116 +573,21 @@ function NarratorDetailPage() {
 					/>
 				)}
 
-				{/* Mobile terminal drawer */}
-				<Drawer
-					opened={drawerOpened}
-					onClose={closeDrawer}
-					position="right"
-					size="100%"
-					title={
-						<Text size="sm" fw={600} truncate>
-							{tt("terminal")}
-						</Text>
-					}
-					closeButtonProps={{ size: "sm" }}
-					styles={MOBILE_DRAWER_STYLES}
-				>
-					<Suspense
-						fallback={
-							<Center h="100%">
-								<Loader size="sm" />
-							</Center>
-						}
-					>
-						<NarratorTerminal
-							narratorId={narratorId}
-							onSendToChat={handleSendToChat}
-							onWriteRef={handleWriteRef}
-							onExit={handleTerminalExit}
-						/>
-					</Suspense>
-				</Drawer>
-
-				{/* Mobile spec drawer — chromeless panel; title + save/reload live in
-				    the drawer header (mirrors the desktop dock). */}
-				<Drawer
-					opened={specDrawerOpened}
-					onClose={() => {
-						closeSpecDrawer();
-					}}
-					position="right"
-					size="100%"
-					title={
-						<Group gap="xs" wrap="nowrap" style={{ flex: 1 }}>
-							<Text size="sm" fw={600} truncate style={{ flex: 1 }}>
-								{tn("spec.title")}
-							</Text>
-						</Group>
-					}
-					closeButtonProps={{ size: "sm" }}
-					styles={MOBILE_DRAWER_STYLES}
-				>
-					<Suspense
-						fallback={
-							<Center h="100%">
-								<Loader size="sm" />
-							</Center>
-						}
-					>
-						<SpecPanel narratorId={narratorId} onClose={closeSpecDrawer} chromeless />
-					</Suspense>
-				</Drawer>
+				{dropSide && (
+					<Box
+						style={{
+							position: "absolute",
+							...DROP_OVERLAY_STYLES[dropSide],
+							backgroundColor: "var(--mantine-color-indigo-9)",
+							opacity: 0.2,
+							borderRadius: 4,
+							pointerEvents: "none",
+							transition: "all 100ms ease",
+							zIndex: 100,
+						}}
+					/>
+				)}
 			</Box>
-		);
-	}
-
-	// Desktop layout: unified dockview surface. Child narrators use the same
-	// surface so opening a nested subagent follows the shared secondary-tab rule.
-	return (
-		<Box
-			ref={mergedRef}
-			h={APP_SHELL_FULL_BLEED_HEIGHT}
-			mx="calc(var(--mantine-spacing-md) * -1)"
-			my="calc(var(--mantine-spacing-md) * -1)"
-			style={{ position: "relative", overflow: "hidden", isolation: "isolate" }}
-		>
-			<NarratorDockProvider
-				key={narratorId}
-				narratorId={narratorId}
-				chapterId={chapterId}
-				onForkFromMessage={chapterId ? handleForkFromMessage : null}
-				highlightMessageId={highlightMessageId}
-				onBack={isSubagent ? onBack : null}
-				onMinimize={showMinimize ? onMinimize : null}
-			>
-				<NarratorDock device="desktop" />
-			</NarratorDockProvider>
-
-			{/* Drop zone overlay for drag-to-split (drag another narrator here) */}
-			{chapterId && forkMessageId && (
-				<ChapterForkModal
-					chapterId={chapterId}
-					chapterStatus={(chapter as { status?: string } | undefined)?.status}
-					forkAtMessageId={forkMessageId}
-					opened
-					onClose={() => setForkMessageId(null)}
-				/>
-			)}
-
-			{dropSide && (
-				<Box
-					style={{
-						position: "absolute",
-						...DROP_OVERLAY_STYLES[dropSide],
-						backgroundColor: "var(--mantine-color-indigo-9)",
-						opacity: 0.2,
-						borderRadius: 4,
-						pointerEvents: "none",
-						transition: "all 100ms ease",
-						zIndex: 100,
-					}}
-				/>
-			)}
-		</Box>
+		</NarratorDockProvider>
 	);
 }

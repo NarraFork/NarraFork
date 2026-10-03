@@ -292,7 +292,13 @@ describe("PretextExactMessageList", () => {
 		expect(source).toContain("const resolveExactToolColor = useCallback");
 		expect(source).toContain("resolveToolColor: resolveExactToolColor");
 		expect(source).toContain("getCurrentView: readCurrentView");
-		expect(source).toContain("const scrollTop = node?.scrollTop ?? scrollTopRef.current");
+		const liveView = sliceBracketedRegion(source, "const readCurrentView = useCallback(");
+		expect(liveView).toContain("const view = readViewportView();");
+		const visibleView = sliceBracketedRegion(source, "const readViewportView = useCallback(");
+		expect(visibleView).toContain("visibleViewportRef.current.read(");
+		expect(visibleView).toContain("viewportRef.current");
+		expect(visibleView).toContain("scrollTop: scrollTopRef.current");
+		expect(visibleView).toContain("viewportHeight: viewportHeightRef.current");
 		// An LOD gesture must report the point it is centered on, so the rebuild
 		// re-anchors THAT content instead of yanking the viewport top into place.
 		expect(source).toContain("focusOffset: resolveLodFocusOffset(");

@@ -178,7 +178,7 @@ export interface UsePretextDocumentResult {
 	resizeMeasuredCount: number;
 	resizeRevision: number;
 	/** Width-only preview at the LIVE view, returning whether another bounded batch is needed. */
-	previewWidth: (width: number) => boolean;
+	previewWidth: (width: number, compactUsageLines?: boolean) => boolean;
 	scrollTopCorrection?: number;
 	scrollTopCorrectionKind?: PretextLayoutAnchor["kind"];
 	/** True when the correction answers tail growth and may glide (vlist-smooth-follow). */
@@ -408,9 +408,8 @@ export function usePretextDocument(
 		}),
 		[
 			options.bottomPadding,
-			// Both usage inputs change the emitted item list, so a rebuild is required
-			// (not merely a re-measure) when the reader flips the preference or rotates
-			// a phone across the breakpoint.
+			// The preference changes the item list. The breakpoint here is already
+			// settled; its live value belongs to the bounded preview, not this build.
 			options.showTokenUsage,
 			options.compactUsageLines,
 			options.formatUsageNumber,
@@ -877,12 +876,12 @@ export function usePretextDocument(
 		[coordinator, options.getCurrentView],
 	);
 	const previewWidth = useCallback(
-		(width: number) =>
+		(width: number, compactUsageLines?: boolean) =>
 			coordinator?.previewWidth(
 				width,
 				() => resolvePretextDocumentView(viewRef.current, options.getCurrentView),
 				heightOverridesReaderRef.current?.(),
-				resizeInputsReaderRef.current?.(),
+				{ ...resizeInputsReaderRef.current?.(), compactUsageLines },
 			) ?? false,
 		[coordinator, options.getCurrentView],
 	);

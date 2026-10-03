@@ -58,9 +58,18 @@ describe("resize inputs cannot reach the full layout at pixel resolution", () =>
 	});
 
 	it("keeps using the EXACT height for scroll anchoring", () => {
-		expect(shellModule("PretextExactMessageList.tsx")).toMatch(
-			/viewportHeight:\s*node\?\.clientHeight\s*\?\?\s*viewportHeightRef/,
+		const shell = shellModule("PretextExactMessageList.tsx");
+		expect(region(shell, "const readCurrentView = useCallback(() => {")).toContain(
+			"readViewportView()",
 		);
+		expect(region(shell, "const readViewportView = useCallback(")).toContain(
+			"visibleViewportRef.current.read(",
+		);
+		// Visible geometry is now owned by the parking-aware helper. It must still
+		// read exact clientHeight, never the full-build height bucket.
+		const helper = readVlistFile("vlist-visible-viewport.ts");
+		expect(helper).toMatch(/viewportHeight:\s*node\.clientHeight/);
+		expect(helper).not.toContain("bucketViewportHeight");
 	});
 
 	it("publishes global contentWidth only from onInitial and onCommit", () => {
@@ -83,8 +92,12 @@ describe("resize inputs cannot reach the full layout at pixel resolution", () =>
 		const preview = region(resizeOptions(), "onPreview: ({ width, height }) => {");
 		expect(preview.match(/setViewportHeight\s*\(/g)).toHaveLength(1);
 		expect(preview).toMatch(/setViewportHeight\(height\)/);
-		expect(preview).toMatch(/return\s+pretextDocumentRef\.current\.previewWidth\(width\)/);
-		expect(preview).not.toMatch(/setContentWidth|setLayoutHeight|setWidthCommitEpoch/);
+		expect(preview).toMatch(
+			/return\s+pretextDocumentRef\.current\.previewWidth\(width,\s*mobileViewportRef\.current\)/,
+		);
+		expect(preview).not.toMatch(
+			/setContentWidth|setLayoutHeight|setWidthCommitEpoch|setLayoutCompactUsageLines/,
+		);
 		expect(preview).not.toMatch(/committedContentWidthRef\.current\s*=/);
 	});
 
@@ -200,4 +213,20 @@ describe("resize inputs cannot reach the full layout at pixel resolution", () =>
 			expect(shellSource()).toContain(readVlistFile(path));
 		}
 	});
+});
+
+it("commits the usage breakpoint only alongside final geometry and previews its live value", () => {
+	const options = documentHookOptions();
+	expect(options).toMatch(/compactUsageLines:\s*layoutCompactUsageLines/);
+	expect(options).not.toMatch(/compactUsageLines:\s*isMobileViewport/);
+	for (const name of ["onInitial", "onCommit"]) {
+		expect(region(resizeOptions(), `${name}: ({ width, height }) => {`)).toContain(
+			"setLayoutCompactUsageLines(mobileViewportRef.current)",
+		);
+	}
+	expect(region(resizeOptions(), "readSize: () => ({")).toContain("presentationKey:");
+	// The capped-column case may not get an observer notification at all.
+	expect(shellModule("PretextExactMessageList.tsx")).toMatch(
+		/resizeControllerRef\.current\?\.observe\(\);\s*},\s*\[isMobileViewport\]\)/,
+	);
 });

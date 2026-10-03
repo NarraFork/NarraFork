@@ -180,3 +180,28 @@ export function resolveTurnUsageLines(
 	if (leading == null && trailing == null) return null;
 	return { leading, trailing, trailingSecondary };
 }
+
+/** Preformatted, height-bounded alternatives; no message adaptation during resize. */
+export interface TurnUsagePresentation {
+	text: string;
+	secondaryText?: string;
+}
+
+export interface ResponsiveTurnUsageData extends TurnUsagePresentation {
+	placement: "trailing";
+	responsiveLines: {
+		desktop: TurnUsagePresentation;
+		mobile: TurnUsagePresentation;
+	};
+}
+
+/** Preserve reference identity when the requested presentation is already painted. */
+export function reflowTurnUsageData(data: unknown, compact: boolean | undefined): unknown {
+	if (compact == null || data == null || typeof data !== "object") return data;
+	const row = data as Partial<ResponsiveTurnUsageData>;
+	if (row.placement !== "trailing" || !row.responsiveLines) return data;
+	const lines = compact ? row.responsiveLines.mobile : row.responsiveLines.desktop;
+	if (row.text === lines.text && row.secondaryText === lines.secondaryText) return data;
+	const { secondaryText: _previousSecondary, ...rest } = row;
+	return { ...rest, ...lines };
+}
