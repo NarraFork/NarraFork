@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, setSystemTime, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { getTestDb } from "../../../tests/setup";
 
@@ -981,45 +981,59 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			});
 		});
 
-		test("timeout during a claim is deferred and then settled as terminal", async () => {
-			const waiting = waitForManualOverride(
-				SUBAGENT_ID,
-				new AbortController().signal,
-				"parent-narrator",
-				"tool-use-id",
-				{ timeoutMs: 5 },
-			);
-			const claim = claimManualOverride(SUBAGENT_ID, "detach");
-			expect(claim).not.toBeNull();
-			if (!claim) throw new Error("expected detach claim");
-			await Bun.sleep(10);
-			expect(getManualOverrideRuntime(SUBAGENT_ID)?.pendingTerminal).toMatchObject({
-				action: "finish",
-				hasError: true,
-			});
-			settleManualOverrideClaim(claim, {
-				action: "finish",
-				finalText: "detach finished",
-				hasError: false,
-			});
-			await expect(waiting).resolves.toMatchObject({
-				action: "finish",
-				finalText: "Manual override timed out after 2 hours",
-				hasError: true,
-			});
+		test("manual override never schedules a timeout and survives more than two hours", async () => {
+			const timerSpy = spyOn(globalThis, "setTimeout");
+			try {
+				const waiting = waitForManualOverride(
+					SUBAGENT_ID,
+					new AbortController().signal,
+					"parent-narrator",
+					"tool-use-id",
+				);
+				expect(timerSpy).not.toHaveBeenCalled();
+				let settled = false;
+				void waiting.then(() => {
+					settled = true;
+				});
+				setSystemTime(Date.now() + 3 * 60 * 60 * 1000);
+				await Promise.resolve();
+				expect(settled).toBe(false);
+				expect(getManualOverrideRuntime(SUBAGENT_ID)?.phase).toBe("waiting");
+				const claim = claimManualOverride(SUBAGENT_ID, "detach");
+				if (!claim) throw new Error("expected detach claim");
+				setSystemTime(Date.now() + 3 * 60 * 60 * 1000);
+				await Promise.resolve();
+				expect(settled).toBe(false);
+				expect(getManualOverrideRuntime(SUBAGENT_ID)?.pendingTerminal).toBeNull();
+				expect(timerSpy).not.toHaveBeenCalled();
+				settleManualOverrideClaim(claim, {
+					action: "finish",
+					finalText: "detach finished",
+					hasError: false,
+				});
+				await expect(waiting).resolves.toEqual({
+					action: "finish",
+					finalText: "detach finished",
+					hasError: false,
+				});
+			} finally {
+				timerSpy.mockRestore();
+				setSystemTime();
+				clearManualOverrideRuntimes();
+			}
 		});
 
-		test("an old timeout callback cannot delete a replacement runtime", async () => {
+		test("an old parent abort cannot delete a replacement runtime", async () => {
+			const oldParent = new AbortController();
 			const first = waitForManualOverride(
 				SUBAGENT_ID,
-				new AbortController().signal,
+				oldParent.signal,
 				"parent-narrator",
 				"tool-use-id",
-				{ timeoutMs: 5 },
 			);
 			expect(
 				resumeManualOverride(SUBAGENT_ID, {
-					prompt: "finish before old timer",
+					prompt: "finish before parent abort",
 					history: [],
 					trailingToolResults: [],
 				}),
@@ -1033,7 +1047,7 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 				"tool-use-id-2",
 			);
 			const replacementId = getManualOverrideRuntime(SUBAGENT_ID)?.entryId;
-			await Bun.sleep(10);
+			oldParent.abort();
 			expect(getManualOverrideRuntime(SUBAGENT_ID)?.entryId).toBe(replacementId);
 			expect(
 				resumeManualOverride(SUBAGENT_ID, {

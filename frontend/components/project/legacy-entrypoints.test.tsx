@@ -258,7 +258,7 @@ describe("ordinary entry points and retained legacy sessions", () => {
 			])
 				expect(source).not.toContain(forbidden);
 		}
-		const shell = readFileSync(new URL("../AppRootLayout.tsx", import.meta.url), "utf8");
+		const shell = readFileSync(new URL("../AuthenticatedAppLayout.tsx", import.meta.url), "utf8");
 		expect(shell).not.toContain('filter="project"');
 		expect(shell).not.toContain('to="/projects"');
 	});

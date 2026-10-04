@@ -723,7 +723,7 @@ describe("shared GitCommitPreview interactions", () => {
 	test.each([
 		"/nf/",
 		"/proxy/7778/",
-	])("native links and copied links retain mount %s", async (base) => {
+	])("native window links and copied links retain mount %s", async (base) => {
 		Object.defineProperty(document, "baseURI", {
 			configurable: true,
 			value: `https://preview.example${base}`,
@@ -739,20 +739,26 @@ describe("shared GitCommitPreview interactions", () => {
 		await waitForFiles();
 		const preview = element("[data-commit-open-page]").getAttribute("href") ?? "";
 		expect(new URL(preview, location.origin).pathname).toBe(
-			`${base}git/narrators/${TARGET.narratorId}/commits/${SHA_A}`,
+			`${base}windows/git/narrators/${TARGET.narratorId}/commits/${SHA_A}`,
 		);
 		expect(element(`[data-commit-parent="${PARENT}"]`).getAttribute("href")).toContain(
-			`${base}git/narrators/${TARGET.narratorId}/commits/${PARENT}`,
+			`${base}windows/git/narrators/${TARGET.narratorId}/commits/${PARENT}`,
 		);
 		click("[data-commit-copy-link]");
 		await waitFor(() => writeText.mock.calls.length === 1, "copied mounted link");
 		expect(writeText.mock.calls[0]?.[0]).toBe(`${location.origin}${preview}`);
 	});
-	test("copies the full SHA and an absolute link with the current file and workspace", async () => {
+	test.each([
+		"modal",
+		"page",
+		"window",
+	] as const)("%s copies a consistent absolute link with the current file and workspace", async (mode) => {
 		spyOn(api, "getGitCommitDetail").mockResolvedValue(detail());
 		const writeText = mock(async (_value: string) => {});
 		Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
-		renderUi(<GitCommitPreview target={TARGET} sha={SHA_A} selectedPath={RENAMED_FILE} />);
+		renderUi(
+			<GitCommitPreview target={TARGET} sha={SHA_A} selectedPath={RENAMED_FILE} mode={mode} />,
+		);
 		await waitForFiles();
 		click('[aria-label="Copy full SHA"]');
 		await waitFor(() => writeText.mock.calls.length === 1, "copied SHA");
@@ -761,7 +767,9 @@ describe("shared GitCommitPreview interactions", () => {
 		await waitFor(() => writeText.mock.calls.length === 2, "copied link");
 		const url = new URL(writeText.mock.calls[1]?.[0] ?? "");
 		expect(url.origin).toBe("https://preview.example");
-		expect(url.pathname).toContain(SHA_A);
+		expect(url.pathname).toBe(
+			`${mode === "page" ? "" : "/windows"}/git/narrators/${TARGET.narratorId}/commits/${SHA_A}`,
+		);
 		expect(url.searchParams.get("file")).toBe(RENAMED_FILE);
 		expect(url.searchParams.get("workspaceKey")).toBe(TARGET.workspaceKey);
 	});

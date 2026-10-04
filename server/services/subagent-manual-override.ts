@@ -2,8 +2,8 @@ import { generateId } from "../lib/id";
 
 // === Manual override state ===
 // A suspended foreground runner remains alive while the user prepares a resume,
-// finish, or detach action. Actions use a claim-and-settle protocol so timeout /
-// parent-abort callbacks cannot delete or resolve a newer runtime entry.
+// finish, or detach action, with no automatic timeout. Actions use a claim-and-settle
+// protocol so parent-abort callbacks cannot delete or resolve a newer runtime entry.
 
 export type ManualOverrideResult =
 	| {
@@ -36,7 +36,6 @@ export interface ManualOverrideEntry {
 	subagentId: string;
 	createdAt: number;
 	claimedAt: number | null;
-	timer: ReturnType<typeof setTimeout>;
 	onParentAbort: () => void;
 }
 
@@ -58,11 +57,7 @@ export function isManualOverride(subagentId: string): boolean {
 	return getManualOverrideMap().has(subagentId);
 }
 
-/** Maximum time to wait for manual override before timing out (2 hours). */
-export const MANUAL_OVERRIDE_TIMEOUT_MS = 2 * 60 * 60 * 1000;
-
 function cleanupEntryResources(entry: ManualOverrideEntry): void {
-	clearTimeout(entry.timer);
 	entry.parentSignal.removeEventListener("abort", entry.onParentAbort);
 }
 
@@ -81,9 +76,9 @@ function settleEntry(entry: ManualOverrideEntry, result: ManualOverrideResult): 
 }
 
 /**
- * Record a terminal event from timeout/parent-abort. If an action currently owns
+ * Record a terminal event from parent abort. If an action currently owns
  * the entry, defer terminal settlement until that claim finishes. This prevents
- * an old timer from deleting a replacement entry and makes terminal events win
+ * an old abort callback from deleting a replacement entry and makes terminal events win
  * over a resume/detach that was still preparing asynchronously.
  */
 function recordTerminal(entry: ManualOverrideEntry, result: ManualOverrideResult): boolean {
@@ -136,7 +131,7 @@ export function settleManualOverrideClaim(
 	return settleEntry(entry, entry.pendingTerminal ?? result);
 }
 
-/** Release a failed preparation back to waiting, unless timeout/abort already became terminal. */
+/** Release a failed preparation back to waiting, unless parent abort already became terminal. */
 export function releaseManualOverrideClaim(claim: ManualOverrideClaim): boolean {
 	const entry = getClaimedEntry(claim);
 	if (!entry) return false;
@@ -197,7 +192,7 @@ export function cleanupManualOverrideRuntime(
 	});
 }
 
-/** Test/process cleanup that also removes timers and abort listeners. */
+/** Test/process cleanup that also removes abort listeners. */
 export function clearManualOverrideRuntimes(): void {
 	for (const entry of [...getManualOverrideMap().values()]) {
 		settleEntry(entry, {
@@ -209,14 +204,13 @@ export function clearManualOverrideRuntimes(): void {
 }
 
 /**
- * Block until the user resumes/finishes the runner, or the parent is interrupted / timeout.
+ * Block until the user resumes/finishes the runner, or the parent is interrupted.
  */
 export function waitForManualOverride(
 	subagentId: string,
 	parentSignal: AbortSignal,
 	parentNarratorId: string,
 	toolUseId: string,
-	options?: { timeoutMs?: number },
 ): Promise<ManualOverrideResult> {
 	return new Promise<ManualOverrideResult>((resolve) => {
 		const existing = getManualOverrideMap().get(subagentId);
@@ -249,13 +243,6 @@ export function waitForManualOverride(
 				hasError: true,
 			});
 		};
-		entry.timer = setTimeout(() => {
-			recordTerminal(entry, {
-				action: "finish",
-				finalText: "Manual override timed out after 2 hours",
-				hasError: true,
-			});
-		}, options?.timeoutMs ?? MANUAL_OVERRIDE_TIMEOUT_MS);
 
 		getManualOverrideMap().set(subagentId, entry);
 		if (parentSignal.aborted) {

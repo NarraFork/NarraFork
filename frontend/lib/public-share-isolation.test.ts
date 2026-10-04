@@ -49,9 +49,12 @@ describe("public narrator share entry isolation", () => {
 	test("root bypass does not depend on whether an existing JWT is valid", () => {
 		const root = entrySource("components/AppRootLayout.tsx");
 		expect(root).toContain(
-			"isLoginPage || isOAuthConsentPage || isPublicNarratorSharePath(location.pathname)",
+			'pathname === "/login" || pathname === "/oauth/authorize" || isPublicNarratorSharePath(pathname)',
 		);
-		expect(root).not.toContain("isPublicNarratorSharePath(location.pathname) && !getToken()");
+		expect(root).toMatch(
+			/if \(publicSurface \|\| isStandaloneWindowPath\(pathname\) \|\| \(publicPage && !getToken\(\)\)\)\s*return <Outlet \/>;/,
+		);
+		expect(root).not.toContain("isPublicNarratorSharePath(pathname) && !getToken()");
 	});
 	test("public bootstrap does not install authenticated hosts", () => {
 		const main = entrySource("main.tsx");

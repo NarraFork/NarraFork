@@ -49,7 +49,11 @@ describe("commit preview navigation", () => {
 				const internal = buildCommitPreviewHref(target, SHA, file);
 				const browser = buildCommitPreviewBrowserHref(target, SHA, file);
 				expect(internal.startsWith("/git/")).toBe(true);
-				expect(browser).toBe(`${base}${internal.slice(1)}`);
+				expect(browser).toBe(`${base}windows${internal}`);
+				expect(buildCommitPreviewBrowserHref(target, SHA, file, "page")).toBe(
+					`${base}${internal.slice(1)}`,
+				);
+				expect(buildCommitPreviewBrowserHref(target, SHA, file, "window")).toBe(browser);
 				const url = new URL(browser, "https://example.test");
 				expect(validateCommitPreviewSearch(defaultParseSearch(url.search))).toEqual({
 					file,
@@ -58,6 +62,25 @@ describe("commit preview navigation", () => {
 			}
 		}
 	});
+	test("explicit window URLs retain their owner, exact search and parent workspace pin", () => {
+		for (const target of ["chapter /#", TARGET]) {
+			for (const file of [undefined, "123", "目录/new +#?% name.ts"]) {
+				const legacy = buildCommitPreviewHref(target, SHA, file, "page");
+				const windowHref = buildCommitPreviewHref(target, SHA, file, "window");
+				expect(windowHref).toBe(`/windows${legacy}`);
+				expect(windowHref).not.toContain(TARGET.rootPath);
+				expect(
+					validateCommitPreviewSearch(
+						defaultParseSearch(new URL(windowHref, "https://example.test").search),
+					),
+				).toEqual({
+					file,
+					workspaceKey: typeof target === "string" ? undefined : target.workspaceKey,
+				});
+			}
+		}
+	});
+
 	test("chapter links retain the legacy target and do not leak host paths or capabilities", () => {
 		const href = buildCommitPreviewHref("chapter /#", SHA);
 		expect(href).toBe(`/git/chapters/chapter%20%2F%23/commits/${SHA}`);

@@ -100,6 +100,13 @@ export function getNamespacesForPath(pathname: string): Namespace[] {
 	const path = normalizePathname(pathname);
 	if (path.startsWith("/shared/narrators/")) return ["common", "errors", "publicShare"];
 
+	// Private windows share auth/theme, not the navigation's translation bundles.
+	if (path === "/windows" || path.startsWith("/windows/")) {
+		const gitWindow =
+			path.startsWith("/windows/git/narrators/") || path.startsWith("/windows/git/chapters/");
+		return gitWindow ? ["common", "errors", "git"] : ["common", "errors"];
+	}
+
 	const publicNamespaces = PUBLIC_PATH_NAMESPACES.get(path);
 	if (publicNamespaces) return publicNamespaces;
 

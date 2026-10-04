@@ -85,7 +85,9 @@ mock.module("../narrator-service", () => ({
 const service = await import("../permission-rule-request-service");
 const permission = await import("../narrator-permission");
 const { requestPermissionRuleTool } = await import("../../lib/agent/tools/request-permission-rule");
-const { toolRegistry } = await import("../../lib/agent/tool-registry");
+const { toolRegistry, resolveToolJsonSchema, zodToJsonSchema } = await import(
+	"../../lib/agent/tool-registry"
+);
 toolRegistry.register(requestPermissionRuleTool);
 const { pendingPermissions, pendingDangerReflections } = await import("../narrator-session-state");
 const { executionPolicyEngine } = await import("../execution-policy/engine");
@@ -562,6 +564,36 @@ async function start(identity: Awaited<ReturnType<typeof seed>>, input: Record<s
 		},
 	);
 }
+describe("permission request tool schema compatibility", () => {
+	test("exports an object root without dropping discriminated union constraints", () => {
+		const original = zodToJsonSchema(service.requestPermissionRuleSchema);
+		const exported = resolveToolJsonSchema(requestPermissionRuleTool);
+		expect(exported.type).toBe("object");
+		expect(exported).toEqual({ ...original, type: "object" });
+		expect(exported.anyOf).toHaveLength(4);
+	});
+
+	test("runtime validation still accepts all four rule types and rejects unsafe inputs", () => {
+		const reason = "Schema compatibility regression test";
+		for (const input of [
+			{ reason, ruleType: "directoryWhitelist", path: "/workspace", accessLevel: "readOnly" },
+			{ reason, ruleType: "directoryBlacklist", path: "/workspace", denyLevel: "denyAll" },
+			{ reason, ruleType: "commandWhitelist", pattern: "bun test *" },
+			{ reason, ruleType: "commandBlacklist", pattern: "rm *" },
+		]) {
+			expect(requestPermissionRuleTool.parameters.safeParse(input).success).toBe(true);
+		}
+		for (const input of [
+			{ reason, ruleType: "commandWhitelist" },
+			{ reason, ruleType: "commandWhitelist", pattern: "bun test *", path: "/workspace" },
+			{ reason, ruleType: "directoryWhitelist", path: "/workspace", accessLevel: "invalid" },
+			{ reason, scope: "project", ruleType: "commandWhitelist", pattern: "bun test *" },
+		]) {
+			expect(requestPermissionRuleTool.parameters.safeParse(input).success).toBe(false);
+		}
+	});
+});
+
 describe("attempt-bound permission requests", () => {
 	for (const kind of ["Write", "Edit", "StructSed"] as const)
 		for (const symlink of [false, true])

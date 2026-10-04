@@ -198,7 +198,7 @@ describe("mobile safe-area layout contract", () => {
 		// `--app-shell-header-height` by hand left the header at 92 while Main's padding
 		// stayed 116 — a 24px hole between them. So the height must arrive via the prop.
 		const appShell = await Bun.file(
-			new URL("../components/AppRootLayout.tsx", import.meta.url),
+			new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url),
 		).text();
 		expect(appShell).toContain("header={{ height: APP_SHELL_HEADER_HEIGHT }}");
 		expect(appShell).not.toContain("--app-shell-header-height");
@@ -363,7 +363,7 @@ describe("mobile safe-area layout contract", () => {
 		// The pairing only holds if AppShell.Navbar actually applies both halves as one
 		// responsive pair; a `top` that drifts from the height is the failure this guards.
 		const appShell = await Bun.file(
-			new URL("../components/AppRootLayout.tsx", import.meta.url),
+			new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url),
 		).text();
 		const navbarProps = appShell.slice(
 			appShell.indexOf("<AppShell.Navbar"),
@@ -410,7 +410,7 @@ describe("mobile safe-area layout contract", () => {
 		expect(APP_SHELL_MAIN_PADDING_BOTTOM).not.toContain("+");
 
 		const appShell = await Bun.file(
-			new URL("../components/AppRootLayout.tsx", import.meta.url),
+			new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url),
 		).text();
 		const navbarProps = appShell.slice(
 			appShell.indexOf("<AppShell.Navbar"),
@@ -1136,7 +1136,7 @@ describe("mobile safe-area layout contract", () => {
 			providersRoute,
 			loginRoute,
 		] = await Promise.all([
-			Bun.file(new URL("../components/AppRootLayout.tsx", import.meta.url)).text(),
+			Bun.file(new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../components/narrator/content/ContentViewer.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/chapters/$chapterId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/settings.tsx", import.meta.url)).text(),
@@ -1175,7 +1175,7 @@ describe("mobile safe-area layout contract", () => {
 			narratorPanel,
 			safeArea,
 		] = await Promise.all([
-			Bun.file(new URL("../components/AppRootLayout.tsx", import.meta.url)).text(),
+			Bun.file(new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/narrators/$narratorId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/narrators/workspace/$workspaceId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/projects/$projectId.tsx", import.meta.url)).text(),

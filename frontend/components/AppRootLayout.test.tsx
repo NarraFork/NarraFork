@@ -22,7 +22,7 @@ mock.module("../lib/history-state", () => ({
 		};
 	},
 }));
-const { MobileNavbarEffects } = await import("./AppRootLayout");
+const { MobileNavbarEffects } = await import("./AuthenticatedAppLayout");
 
 let root: Root;
 let mobile: boolean;

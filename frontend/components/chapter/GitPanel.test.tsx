@@ -207,7 +207,7 @@ function stubInteractiveGitApi(calls: Array<{ name: string; body?: unknown }>) {
 	// non-empty stub the expanded graph hangs on the real HTTP timeout.
 	api.getGitLog = async () => [
 		{
-			sha: "abc1234",
+			sha: "abc1234".padEnd(40, "0"),
 			shortSha: "abc1234",
 			message: "feat: seed commit for graph strip",
 			author: "tester",
@@ -336,7 +336,7 @@ describe("GitPanel", () => {
 		api.getGitStatus = async () => makeStatus();
 		api.getGitLog = async () => [
 			{
-				sha: "abc1234",
+				sha: "abc1234".padEnd(40, "0"),
 				shortSha: "abc1234",
 				message: "feat: seed commit for graph strip",
 				author: "tester",

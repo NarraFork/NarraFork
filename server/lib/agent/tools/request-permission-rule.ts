@@ -4,6 +4,7 @@ import {
 	failPermissionRuleRequest,
 	requestPermissionRuleSchema,
 } from "@server/services/permission-rule-request-service";
+import { zodToJsonSchema } from "../tool-registry";
 import type { ToolDefinition } from "../types";
 
 export const requestPermissionRuleTool: ToolDefinition = {
@@ -26,6 +27,9 @@ export const requestPermissionRuleTool: ToolDefinition = {
 		"Human approval is required unless a human administrator has enabled permissionRuleAutoApprove in bypassPermissions, " +
 		"which still requires strict dedicated reflection. This is an application guard, not an OS sandbox.",
 	parameters: requestPermissionRuleSchema,
+	// Compatible APIs require an explicit object root even for object-only unions.
+	// Keep every union branch intact, including its strict field constraints.
+	rawJsonSchema: { ...zodToJsonSchema(requestPermissionRuleSchema), type: "object" },
 	async execute(args, ctx) {
 		if (
 			!ctx.toolCallBinding ||

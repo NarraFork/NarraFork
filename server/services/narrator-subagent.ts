@@ -85,7 +85,6 @@ export {
 	interruptManualOverride,
 	isManualOverride,
 	listStaleManualOverrideRuntimes,
-	MANUAL_OVERRIDE_TIMEOUT_MS,
 	type ManualOverrideClaim,
 	type ManualOverrideClaimPhase,
 	type ManualOverrideEntry,

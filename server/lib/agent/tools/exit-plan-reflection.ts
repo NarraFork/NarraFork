@@ -172,6 +172,9 @@ async function markExitPlanReflectionStatus(
 					inputJson: pending.inputJson,
 					permissionDecisionReason: message,
 					permissionSuggestions: planReflectionSuggestions(pending, status, message, compactAfter),
+					// A confirmed reflection skips the normal permission handler. Persist its
+					// approval source too, so the final-start gate can verify the receipt.
+					...(status === "confirmed" ? { permissionDecidedBy: "reflection" } : {}),
 					...(status !== "running" && status !== "awaiting_user"
 						? { permissionDecidedAt: new Date().toISOString() }
 						: {}),

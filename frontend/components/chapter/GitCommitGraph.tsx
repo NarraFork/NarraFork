@@ -1,4 +1,13 @@
-import { ActionIcon, Box, Button, Group, Loader, ScrollArea, Text } from "@mantine/core";
+import {
+	ActionIcon,
+	Box,
+	Button,
+	Group,
+	Loader,
+	ScrollArea,
+	Text,
+	UnstyledButton,
+} from "@mantine/core";
 import { IconChevronDown, IconChevronRight, IconRefresh } from "@tabler/icons-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -11,7 +20,9 @@ import {
 	useGitGraphHeight,
 } from "../../hooks/useGitGraphHeight";
 import { api } from "../../lib/api";
-import { type GitLogEntry, type GitTarget, gitTargetKey } from "../../lib/api/git";
+import { type GitLogEntry, type GitTarget, gitBasePath, gitTargetKey } from "../../lib/api/git";
+import { buildCommitPreviewBrowserHref } from "../../lib/git-commit-preview-navigation";
+import { GitCommitDetailModal } from "./GitCommitDetailModal";
 import {
 	buildRowCircles,
 	buildRowSvgPaths,
@@ -60,6 +71,12 @@ export function GitCommitGraph({
 	const { collapsed, toggle } = useGitGraphCollapsed(target);
 	const { height: panelHeight, setHeight: setPanelHeight } = useGitGraphHeight(target);
 	const workspaceKey = gitTargetKey(target) ?? "";
+	const previewTargetKey = JSON.stringify([gitBasePath(target), workspaceKey]);
+	const [preview, setPreview] = useState<{ sha: string; targetKey: string } | null>(null);
+	const previewSha = preview?.targetKey === previewTargetKey ? preview.sha : null;
+	useEffect(() => {
+		setPreview((current) => (current?.targetKey === previewTargetKey ? current : null));
+	}, [previewTargetKey]);
 	const statusQuery = useGitStatus(target);
 	const headSha = headShaProp ?? statusQuery.data?.headSha;
 
@@ -330,49 +347,70 @@ export function GitCommitGraph({
 								const paths = buildRowSvgPaths(row);
 								const circles = buildRowCircles(row);
 								return (
-									<Group key={row.commit.sha} wrap="nowrap" h={GRAPH_ROW_HEIGHT} gap={8} px={6}>
-										<Box style={{ flexShrink: 0, height: GRAPH_ROW_HEIGHT, width }}>
-											<svg
-												width={width}
-												height={GRAPH_ROW_HEIGHT}
-												aria-hidden
-												role="presentation"
-												style={{ display: "block", overflow: "visible" }}
+									<UnstyledButton
+										key={row.commit.sha}
+										component="a"
+										href={buildCommitPreviewBrowserHref(target, row.commit.sha)}
+										aria-label={t("commitPreview.open", { sha: row.commit.shortSha })}
+										data-commit-row={row.commit.sha}
+										style={{ display: "block", width: "100%" }}
+										onClick={(event) => {
+											if (
+												event.button > 0 ||
+												event.metaKey ||
+												event.ctrlKey ||
+												event.shiftKey ||
+												event.altKey
+											)
+												return;
+											event.preventDefault();
+											setPreview({ sha: row.commit.sha, targetKey: previewTargetKey });
+										}}
+									>
+										<Group wrap="nowrap" h={GRAPH_ROW_HEIGHT} gap={8} px={6}>
+											<Box style={{ flexShrink: 0, height: GRAPH_ROW_HEIGHT, width }}>
+												<svg
+													width={width}
+													height={GRAPH_ROW_HEIGHT}
+													aria-hidden
+													role="presentation"
+													style={{ display: "block", overflow: "visible" }}
+												>
+													{paths.map((path) => (
+														<path
+															key={path.d}
+															d={path.d}
+															stroke={path.stroke}
+															strokeWidth={2}
+															fill="none"
+														/>
+													))}
+													{circles.map((circle) => (
+														<circle
+															key={`${circle.cx}:${circle.cy}:${circle.r}:${circle.fill}:${circle.hollow ? "h" : "s"}`}
+															cx={circle.cx}
+															cy={circle.cy}
+															r={circle.r}
+															strokeWidth={circle.strokeWidth}
+															fill={circle.hollow ? "var(--mantine-color-body)" : circle.fill}
+															stroke={circle.hollow ? "none" : circle.fill}
+														/>
+													))}
+												</svg>
+											</Box>
+											<Text
+												size="xs"
+												truncate
+												fw={row.isHead ? 600 : 400}
+												style={{ flex: 1, minWidth: 0 }}
 											>
-												{paths.map((path) => (
-													<path
-														key={path.d}
-														d={path.d}
-														stroke={path.stroke}
-														strokeWidth={2}
-														fill="none"
-													/>
-												))}
-												{circles.map((circle) => (
-													<circle
-														key={`${circle.cx}:${circle.cy}:${circle.r}:${circle.fill}:${circle.hollow ? "h" : "s"}`}
-														cx={circle.cx}
-														cy={circle.cy}
-														r={circle.r}
-														strokeWidth={circle.strokeWidth}
-														fill={circle.hollow ? "var(--mantine-color-body)" : circle.fill}
-														stroke={circle.hollow ? "none" : circle.fill}
-													/>
-												))}
-											</svg>
-										</Box>
-										<Text
-											size="xs"
-											truncate
-											fw={row.isHead ? 600 : 400}
-											style={{ flex: 1, minWidth: 0 }}
-										>
-											{clampMessage(row.commit.message)}
-										</Text>
-										<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-											{row.commit.author}
-										</Text>
-									</Group>
+												{clampMessage(row.commit.message)}
+											</Text>
+											<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+												{row.commit.author}
+											</Text>
+										</Group>
+									</UnstyledButton>
 								);
 							})}
 							{canLoadMore ? (
@@ -391,6 +429,12 @@ export function GitCommitGraph({
 					)}
 				</ScrollArea>
 			)}
+			<GitCommitDetailModal
+				key={previewTargetKey}
+				target={target}
+				sha={previewSha}
+				onClose={() => setPreview(null)}
+			/>
 		</Box>
 	);
 }

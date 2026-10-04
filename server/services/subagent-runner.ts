@@ -88,6 +88,8 @@ import {
 	consumePendingBackgroundFinalize,
 	isBackgroundTakenOver,
 	isTakenOver,
+	markTakenOver,
+	TAKEN_OVER_SUBSTATUS,
 } from "./subagent-takeover";
 import { broadcastSubagentTakeoverChanged } from "./subagent-takeover-broadcast";
 import { clearTeamInbox } from "./subagent-team";
@@ -1857,6 +1859,8 @@ export interface RunSubagentInput {
 	model?: string;
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 	background?: boolean;
+	/** Launch non-blocking, with the result held for further user interaction. */
+	takeoverByUser?: boolean;
 	alias?: string;
 	/**
 	 * User who triggered the parent turn that spawned this subagent. Flows into
@@ -1892,11 +1896,11 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		timeoutMs: requestedTimeoutMs,
 		model: explicitModel,
 		reasoningEffort,
-		background,
 		alias,
 		userId,
 		updateExecutionLease,
 	} = input;
+	const background = input.background === true || input.takeoverByUser === true;
 	const timeoutMs =
 		requestedTimeoutMs === 0 ? 0 : normalizeOptionalExecutionTimeout(requestedTimeoutMs);
 
@@ -2091,6 +2095,20 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 
 	if (background) {
 		let bgAbort: AbortController;
+		const cleanupFailedStart = async () => {
+			if (input.takeoverByUser) {
+				clearTakenOver(subagentId);
+				await narratorService.removeSubstatus(subagentId, TAKEN_OVER_SUBSTATUS).catch(() => {});
+				await broadcastSubagentTakeoverChanged({
+					parentNarratorId,
+					subagentNarratorId: subagentId,
+					takenOver: false,
+					toolUseId,
+				});
+			}
+			await cancelBackgroundTask(subagentId).catch(() => {});
+			updateLease.release();
+		};
 		try {
 			// --- Background mode: fire-and-forget ---
 
@@ -2140,41 +2158,69 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				alias: aliasRegistration.alias,
 				title,
 			});
+
+			if (input.takeoverByUser) {
+				// Establish the hold BEFORE mounting the runner: even an immediately
+				// completed initial prompt must never publish a completion to the parent.
+				markTakenOver(subagentId, { background: true });
+				await narratorService.addSubstatus(subagentId, TAKEN_OVER_SUBSTATUS);
+				broadcastToNarrator(parentNarratorId, {
+					type: "subagent_status_changed",
+					narratorId: parentNarratorId,
+					subagentNarratorId: subagentId,
+					status: subagent.status,
+					substatus: [TAKEN_OVER_SUBSTATUS],
+				});
+				await broadcastSubagentTakeoverChanged({
+					parentNarratorId,
+					subagentNarratorId: subagentId,
+					takenOver: true,
+					toolUseId,
+				});
+			}
+
+			// Resolve the child's trusted root before handing off the startup lease.
+			await withNarratorWorkAdmission(subagentId, async () => {
+				void executeBackgroundTask({
+					narratorId: subagentId,
+					parentNarratorId,
+					toolUseId,
+					subagentType,
+					prompt,
+					cwd,
+					model,
+					provider,
+					locale,
+					signal: bgAbort.signal,
+					timeoutMs,
+					userId: userId ?? null,
+					systemPrompt,
+					initialHistory: [],
+					customDef,
+					rebuildSystemPrompt,
+					updateLease,
+				}).catch(async (err) => {
+					// Admission may reject before the background runner owns the child.
+					// Do not leave a user takeover parked with no execution to finish it.
+					if (input.takeoverByUser) await cleanupFailedStart();
+					logger.error("Background task unexpected error", {
+						subagentId,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				});
+			});
 		} catch (error) {
-			updateLease.release();
+			await cleanupFailedStart();
 			throw error;
 		}
 
-		// Resolve the child's trusted root before handing off the startup lease.
-		await withNarratorWorkAdmission(subagentId, async () => {
-			void executeBackgroundTask({
-				narratorId: subagentId,
-				parentNarratorId,
-				toolUseId,
-				subagentType,
-				prompt,
-				cwd,
-				model,
-				provider,
-				locale,
-				signal: bgAbort.signal,
-				timeoutMs,
-				userId: userId ?? null,
-				systemPrompt,
-				initialHistory: [],
-				customDef,
-				rebuildSystemPrompt,
-				updateLease,
-			}).catch((err) => {
-				logger.error("Background task unexpected error", {
-					subagentId,
-					error: err instanceof Error ? err.message : String(err),
-				});
-			});
-		});
-
 		let output =
-			buildBackgroundAgentStartOutput(aliasRegistration.alias) +
+			(input.takeoverByUser
+				? `<background_task_id>${aliasRegistration.alias}</background_task_id>\n\n` +
+					"Background task started. User takeover is already active. The initial prompt runs independently; " +
+					"turn completion will not notify or wake the parent. " +
+					"The user can continue interacting until they explicitly end takeover. Do not automatically Await this agent."
+				: buildBackgroundAgentStartOutput(aliasRegistration.alias)) +
 			formatSubagentModelFallbackNote(inheritance);
 		if (aliasRegistration.conflicted) {
 			output +=
