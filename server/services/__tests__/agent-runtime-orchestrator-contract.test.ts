@@ -14,6 +14,7 @@ import {
 	users,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import { createAgentMessageDelivery } from "../agent-message-delivery";
 import type { RuntimeProfile } from "../agent-runtime/input";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
@@ -45,7 +46,7 @@ const { ProxyAbortController } = await import("../subagent-detach");
 const { resetForegroundTurn } = await import("../agent-runtime/control");
 const { isExecutionSuspended } = await import("../agent-runtime/ownership");
 const { createPublicationOutbox } = await import("../agent-runtime/publication-outbox");
-const { bufferSubagentUserMessage } = await import("../subagent-executor");
+const { bufferSubagentUserMessage, executeSubagent } = await import("../subagent-executor");
 const MODEL = "orchestratorfixture:model";
 const adapter: ProviderAdapter = {
 	formatTools: () => [],
@@ -270,7 +271,105 @@ describe("real shared orchestrator profile contract", () => {
 			}
 		});
 	}
+	test("executeSubagent entry inherits runtime character hooks and excludes legacy summary", async () => {
+		const summary = "入口历史摘要😀";
+		const finalPrompt = `actual entry custom policy\n${summary}\nfinal rules`;
+		db.update(narrators)
+			.set({ contextSummary: summary, contextSummaryChars: 0 })
+			.where(eq(narrators.id, "contract-child"))
+			.run();
+		const pass = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+			expect(options.config.systemPrompt).toBe(finalPrompt);
+			await options.config.onToolsCharacters?.(456);
+			return finished;
+		});
+		const result = await executeSubagent({
+			narratorId: "contract-child",
+			parentNarratorId: "contract-parent",
+			toolUseId: "origin-agent",
+			subagentType: "general",
+			prompt: "entry input",
+			cwd: process.env.HOME as string,
+			model: MODEL,
+			provider: "orchestratorfixture",
+			locale: "en",
+			signal: new AbortController().signal,
+			systemPrompt: finalPrompt,
+			initialHistory: [],
+		});
+		expect(result.hasError).toBe(false);
+		expect(pass).toHaveBeenCalledTimes(1);
+		expect(
+			db.select().from(narrators).where(eq(narrators.id, "contract-child")).get(),
+		).toMatchObject({
+			contextSystemChars: finalPrompt.length - summary.length,
+			contextToolsChars: 456,
+			contextSummaryChars: 0,
+		});
+	});
+
 	for (const profile of profiles) {
+		test(`${profile.kind}: clearing compact summary clears its character cache without changing history version`, async () => {
+			const h = fixture(profile, [
+				async (options) => {
+					const before = db
+						.select()
+						.from(narrators)
+						.where(eq(narrators.id, h.session.narratorId))
+						.get();
+					expect(before?.contextSummaryChars).toBe(6);
+					expect(options.hooks?.onClearCompactSummary).toBeFunction();
+					await options.hooks?.onClearCompactSummary?.();
+					const after = db
+						.select()
+						.from(narrators)
+						.where(eq(narrators.id, h.session.narratorId))
+						.get();
+					expect(after?.contextSummary).toBeNull();
+					expect(after?.contextSummaryChars).toBe(0);
+					expect(after?.messageVersion).toBe(before?.messageVersion);
+					return finished;
+				},
+			]);
+			db.update(narrators)
+				.set({ contextSummary: "cached", contextSummaryChars: 6 })
+				.where(eq(narrators.id, h.session.narratorId))
+				.run();
+			expect((await h.run()).hasError).toBe(false);
+		});
+
+		test(`${profile.kind}: final prompt and bound tools character callback reach runtime cache`, async () => {
+			const summary = "持久摘要😀";
+			const selectedProfile: RuntimeProfile =
+				profile.kind === "primary"
+					? profile
+					: {
+							...profile,
+							rebuildSystemPrompt: async (text) =>
+								`actual custom subagent prompt\n${text ?? ""}\npolicy`,
+						};
+			const h = fixture(selectedProfile, [
+				async (options) => {
+					await options.config.onToolsCharacters?.(321);
+					const row = db
+						.select()
+						.from(narrators)
+						.where(eq(narrators.id, h.session.narratorId))
+						.get();
+					expect(row?.contextSystemChars).toBe(
+						(options.config.systemPrompt?.length ?? 0) - summary.length,
+					);
+					expect(row?.contextToolsChars).toBe(321);
+					return finished;
+				},
+			]);
+			db.update(narrators)
+				.set({ contextSummary: summary, contextSummaryChars: 0 })
+				.where(eq(narrators.id, h.session.narratorId))
+				.run();
+			expect((await h.run()).hasError).toBe(false);
+		});
+
 		test(`${profile.kind}: production detached callback persists after the loop has returned`, async () => {
 			const h = fixture(profile, [finished]);
 			await h.run();
@@ -480,12 +579,24 @@ describe("real shared orchestrator profile contract", () => {
 						recipientId: h.session.narratorId,
 						logicalRunId: "after-tools-run",
 					};
+					// Completion notices project the immutable result snapshot, not the
+					// intent's scheduling summary. Seed the same pointer a real producer uses.
+					db.insert(narratorMessages)
+						.values({
+							id: "after-tools-result",
+							narratorId: "contract-parent",
+							role: "assistant",
+							contentJson: [{ type: "text", text: "after-tools ready" }],
+							contentText: "after-tools ready",
+							createdAt: new Date().toISOString(),
+						})
+						.run();
 					store.reserveRunSlots(run);
 					store.commitIntent({
 						...run,
 						eventKind: "completed",
 						summary: "after-tools ready",
-						resultRef: "narrator:contract-parent:after-tools-run",
+						resultRef: "message-original:after-tools-result",
 					});
 					store.transferNext(h.session.narratorId, "agent");
 					const injection = await options.config.getAfterToolsInjections?.();
@@ -560,15 +671,54 @@ describe("real shared orchestrator profile contract", () => {
 		});
 	}
 
-	test("same-principal child input can adopt after tools with real dual placement and no new pass", async () => {
+	test("same-principal child Send input can adopt after tools with real dual placement and no new pass", async () => {
 		const ws = await import("../../websocket/narrator-ws");
 		const broadcast = spyOn(ws, "broadcastToNarrator").mockImplementation(() => {});
 		const text = "same principal after-tools input";
 		const h = fixture(profiles[1], [
 			async (options) => {
+				// Direct human input has an explicit queue mode and restarts a pass.
+				// The in-pass conversational path is a receipted parent Send delivery.
+				const now = new Date().toISOString();
+				db.insert(narratorMessages)
+					.values({
+						id: "after-tools-send",
+						narratorId: "contract-parent",
+						role: "assistant",
+						contentJson: [],
+						createdAt: now,
+					})
+					.run();
+				db.insert(narratorToolCalls)
+					.values({
+						id: "after-tools-send-call",
+						narratorId: "contract-parent",
+						messageId: "after-tools-send",
+						toolUseId: "after-tools-send-use",
+						toolName: "Send",
+						status: "running",
+						executionAttempt: 1,
+						executionIdentityVersion: 1,
+						createdAt: now,
+					})
+					.run();
+				const delivery = createAgentMessageDelivery(
+					"contract-child",
+					{
+						id: "contract-parent",
+						title: "Parent",
+						label: "parent",
+						type: "primary",
+						isParent: true,
+					},
+					"after-tools-send-use",
+					text,
+					{ toolCallId: "after-tools-send-call", attempt: 1 },
+				);
 				const accepted = await bufferSubagentUserMessage("contract-child", text, {
 					createdBy: "principal-a",
 					requestSoftStop: false,
+					delivery,
 				});
 				expect(accepted.ok).toBe(true);
 				expect(options.config.shouldStop?.()).toBe(false);

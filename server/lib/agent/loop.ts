@@ -2471,9 +2471,22 @@ async function* agentLoopInMetadataSnapshot(
 		return resolved;
 	}
 
+	async function reportToolsCharacters(formattedTools: unknown): Promise<void> {
+		if (!config.onToolsCharacters) return;
+		try {
+			await config.onToolsCharacters(JSON.stringify(formattedTools).length);
+		} catch (error) {
+			logger.warn("Failed to store context tool characters", {
+				narratorId: config.narratorId,
+				error: String(error),
+			});
+		}
+	}
+
 	let tools =
 		inheritedTools?.tools ??
 		provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
+	await reportToolsCharacters(tools);
 	/**
 	 * The plan-mode tool-description state `tools` was formatted with.
 	 *
@@ -2810,6 +2823,7 @@ async function* agentLoopInMetadataSnapshot(
 				config.provider = newResolved.provider;
 				if (providerChanged || modelChanged) {
 					tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
+					await reportToolsCharacters(tools);
 					// This re-format already applied the current plan-mode state; record it so the
 					// turn-boundary check does not immediately redo the same work.
 					toolsPlanModeDisabled = planModeDisablesTools();
@@ -2914,6 +2928,7 @@ async function* agentLoopInMetadataSnapshot(
 				if (!inheritedTools && planModeDisabledNow !== toolsPlanModeDisabled) {
 					toolsPlanModeDisabled = planModeDisabledNow;
 					tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
+					await reportToolsCharacters(tools);
 					logger.info("Re-formatted tools after a mid-loop plan-mode change", {
 						narratorId: config.narratorId,
 						planModeDisablesTools: planModeDisabledNow,

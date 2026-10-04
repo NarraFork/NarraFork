@@ -1,6 +1,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
+import { queueContextCharacterRefresh } from "../lib/context-characters";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import {
@@ -102,6 +103,7 @@ function persistUnboundLegacyAgentMessage(
 				origin: "system",
 				contentText: text,
 				contentJson: [{ type: "text", text }],
+				contextCharsJson: { segments: [] },
 				createdAt: new Date().toISOString(),
 			})
 			.run();
@@ -111,6 +113,7 @@ function persistUnboundLegacyAgentMessage(
 			.values({ id: generateId(), narratorId, messageId, seq: claimNextRefSeq(tx, narratorId) })
 			.run();
 	});
+	queueContextCharacterRefresh(narratorId);
 }
 
 /** Compatibility transfer is one-shot: remove only after its durable acceptance succeeds. */

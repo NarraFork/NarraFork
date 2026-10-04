@@ -284,6 +284,7 @@ import {
 	retryBufferedMessage,
 	updateBufferedMessageMode,
 } from "../services/narrator-buffer";
+import { getNarratorContextComposition } from "../services/narrator-context-composition";
 import {
 	getNarratorDraft,
 	getNarratorIdsWithDraft,
@@ -745,6 +746,13 @@ narratorRoutes.use("/:id", async (c, next) => {
 });
 
 narratorRoutes.route("/:id/file-references", fileReferenceRoutes);
+
+// The /:id/* middleware above enforces requireNarratorAccess(..., "read").
+narratorRoutes.get("/:id/context-composition", async (c) => {
+	return c.json(
+		await getNarratorContextComposition(c.req.param("id"), c.req.raw.signal, c.req.query("cursor")),
+	);
+});
 
 /**
  * Gate for the routes keyed by a permission request id.
@@ -5307,6 +5315,7 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 					},
 				],
 				contentText: buildAskInPassingContentText(),
+				contextCharsJson: { segments: [] },
 				createdBy: userId,
 				createdAt: now,
 			})
@@ -5430,7 +5439,11 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	const resolvedContentText = buildAskInPassingContentText(question);
 	const updatedMsg = db.transaction((tx) => {
 		tx.update(narratorMessages)
-			.set({ contentJson: resolvedContentJson, contentText: resolvedContentText })
+			.set({
+				contentJson: resolvedContentJson,
+				contentText: resolvedContentText,
+				contextCharsJson: { segments: [] },
+			})
 			.where(eq(narratorMessages.id, pendingMessageId))
 			.run();
 

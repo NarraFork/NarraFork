@@ -58,6 +58,8 @@ export interface BuildPromptOptions {
 export interface BuildPromptResult {
 	prompt: string | null;
 	usedCompactSummary: boolean;
+	/** Exact construction offsets, not a heading/text heuristic. */
+	summaryRange?: { start: number; end: number };
 }
 
 /**
@@ -116,6 +118,7 @@ export async function buildEffectiveSystemPrompt(
 	// Fall back to global default system prompt when basePrompt is null
 	let prompt = basePrompt ?? defaultSystemPrompt ?? null;
 	let usedCompactSummary = false;
+	let summaryRange: BuildPromptResult["summaryRange"];
 
 	// 1. Inject compact summary if available
 	if (contextSummary) {
@@ -123,6 +126,7 @@ export async function buildEffectiveSystemPrompt(
 		const base = prompt ?? "";
 		const sep = base ? "\n\n" : "";
 		prompt = `${base}${sep}## Conversation Context\n\n${contextSummary}`;
+		summaryRange = { start: base.length, end: prompt.length };
 	}
 
 	// Static interpretation rules; per-message identities stay in their own text.
@@ -311,5 +315,5 @@ export async function buildEffectiveSystemPrompt(
 		)}`;
 	}
 
-	return { prompt, usedCompactSummary };
+	return { prompt, usedCompactSummary, ...(summaryRange ? { summaryRange } : {}) };
 }

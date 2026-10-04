@@ -299,6 +299,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 				id: messageId,
 				narratorId,
 				role: "disp",
+				contextCharsJson: { segments: [] },
 				origin: "system",
 				contentText: storedText,
 				contentJson: [
@@ -657,6 +658,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 							id: messageId,
 							narratorId: recipientId,
 							role: "disp",
+							contextCharsJson: { segments: [] },
 							origin: "system",
 							contentText: text,
 							contentJson: [{ type: "text", text }],

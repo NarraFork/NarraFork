@@ -38,6 +38,10 @@ import type { SideCarAsyncQuestionAnswer, SideCarBody } from "@shared/sidecar-bo
 import { and, desc, eq, inArray, lt, or, type SQLWrapper, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorQuestions, narrators, narratorToolCalls } from "../db/schema";
+import {
+	measureSerializedCharacters,
+	queueContextCharacterRefresh,
+} from "../lib/context-characters";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
@@ -650,7 +654,7 @@ async function mirrorAnswersToToolCall(
 	try {
 		const call = await db.query.narratorToolCalls.findFirst({
 			where: eq(narratorToolCalls.id, toolCallId),
-			columns: { id: true, inputJson: true },
+			columns: { id: true, narratorId: true, messageId: true, inputJson: true },
 		});
 		if (!call) return;
 		const input =
@@ -661,8 +665,14 @@ async function mirrorAnswersToToolCall(
 			.update(narratorToolCalls)
 			.set({
 				inputJson: { ...input, answers, ...(annotations ? { annotations } : {}) },
+				inputChars: measureSerializedCharacters({
+					...input,
+					answers,
+					...(annotations ? { annotations } : {}),
+				}),
 			})
 			.where(eq(narratorToolCalls.id, toolCallId));
+		queueContextCharacterRefresh(call.narratorId, call.messageId);
 	} catch (err) {
 		logger.warn("Failed to mirror async question answers onto the tool call", {
 			toolCallId,

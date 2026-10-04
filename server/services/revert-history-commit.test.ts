@@ -2,14 +2,20 @@ import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { FILE_CHANGE_LIMITS, type FileChangeRevertSelector } from "@shared/file-change-protocol";
 import { eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { sqlite as isolatedTemplate } from "../db";
 import * as schema from "../db/schema";
+import { measureMessageCharacters } from "../lib/context-characters";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-identity";
 import type { NarratorAclRow, NarratorPrincipal } from "./narrator-acl";
-import { type PreparedRevertHistory, RevertHistoryCommitService } from "./revert-history-commit";
+import {
+	type PreparedRevertHistory,
+	REWRITE_WORKER,
+	RevertHistoryCommitService,
+} from "./revert-history-commit";
 import { RevertSelectionService } from "./revert-selection-service";
 
 // Actual schema/FKs/generated columns, with a real independent root and actual collector.
@@ -383,6 +389,79 @@ function question(toolCallId: string, id = `question-${serial++}`) {
 	return id;
 }
 
+for (const role of ["assistant", "user", "sys", "system", "disp", "other"]) {
+	test(`rewrite worker context characters match the shared helper for ${role}`, async () => {
+		const retained: Array<Record<string, unknown>> = [
+			{ type: "text", text: "中文😀" },
+			{ type: "text", text: "adjacent" },
+			{ type: "thinking", thinking: "think" },
+			{ type: "tool_use", id: "kept-tool", name: "Read", input: { text: "not counted" } },
+			{ type: "tool_result", content: "not counted either" },
+			{ type: "image", source: { data: "binary not counted" } },
+			{ type: "redacted_thinking", data: "hidden" },
+			{ type: "info", text: "display only" },
+			{ type: "error", text: "display only" },
+			{ type: "compact", status: "compacted", summary: "narrator row already counts this" },
+			{ type: "segment_compact", status: "compacted", summary: "摘要😀" },
+			{ type: "segment_compact", status: "compacting", summary: "not final" },
+			{ type: "segment_compact", status: "failed", summary: "not final" },
+			{ type: "file_reference", snapshotText: "inline snapshot" },
+			{ type: "text_file", chars: 7 },
+			{ type: "text_file", contentChars: 9 },
+			{ type: "text_file", text: "actual text", chars: 999, contentChars: 999 },
+			{ type: "text_file", content: "content priority", chars: 999 },
+			{ type: "text_file", chars: -1 },
+			{ type: "text_file", chars: 0.5 },
+			{ type: "text_file", filename: "legacy.txt", size: 9000 },
+			{ type: "attachment", source: { text: "source text" } },
+			{ type: "document", content: "document text" },
+			{ type: "text", text: "after attachment" },
+			{ type: "tool_use", id: "second-tool", name: "Bash", input: { command: "not counted" } },
+			{ type: "system_injection", modelText: "native projection", text: "display projection" },
+			{ type: "reasoning", text: "reasoning text" },
+		];
+		const content = [...retained, { type: "text", text: "removed" }];
+		const body = JSON.stringify(content);
+		const contentDigest = hash(body);
+		const fixed = content.map((block, i) => {
+			const digest = hash(JSON.stringify(block));
+			return {
+				key: hash(JSON.stringify(["char-message", contentDigest, i, digest])),
+				digest,
+				type: block.type,
+				toolUseId: block.type === "tool_use" ? block.id : null,
+				action: i === retained.length ? "remove" : "retain",
+			};
+		});
+		const worker = new Worker(REWRITE_WORKER, { eval: true });
+		try {
+			const response = new Promise<{ contextCharsJson: string; error?: string }>(
+				(resolve, reject) => {
+					worker.once("message", resolve);
+					worker.once("error", reject);
+				},
+			);
+			worker.postMessage({
+				message: {
+					id: "char-message",
+					contentDigest,
+					blockCount: content.length,
+					removedBlockCount: 1,
+				},
+				blocks: fixed,
+				body,
+				role,
+				limit: FILE_CHANGE_LIMITS.historyCowBytes,
+			});
+			const result = await response;
+			expect(result.error).toBeUndefined();
+			expect(JSON.parse(result.contextCharsJson)).toEqual(measureMessageCharacters(role, retained));
+		} finally {
+			await worker.terminate();
+		}
+	});
+}
+
 describe("fixed selector history application", () => {
 	for (const kind of ["all", "from_seq", "messages"] as const)
 		test(`${kind} removes exactly the fixed refs/messages`, async () => {
@@ -415,6 +494,19 @@ describe("fixed selector history application", () => {
 			await prepare({ kind: "after_block", messageId: target.messageId, keepThroughBlockIndex: 1 }),
 		);
 		expect(JSON.parse(body(target.messageId))).toHaveLength(2);
+		expect(
+			query<{ context_chars_json: string }>(
+				"SELECT context_chars_json FROM narrator_messages WHERE id=?",
+				target.messageId,
+			)[0].context_chars_json,
+		).toBe(
+			JSON.stringify({
+				segments: [
+					{ category: "assistant", chars: 4 },
+					{ category: "toolCall", chars: 0, toolUseId: "a" },
+				],
+			}),
+		);
 		expect(body(later)).toBeUndefined();
 		expect(query<{ id: string }>("SELECT id FROM narrator_tool_calls").map((r) => r.id)).toEqual([
 			target.tools[0],
