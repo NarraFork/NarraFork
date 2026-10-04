@@ -377,6 +377,8 @@ export const buildPlatform = ${JSON.stringify(platform.platformId)};
 			"./server/services/editor-document-worker.ts",
 			"./server/lib/browser/memory-snapshot-worker.ts",
 			"./server/lib/browser/memory-profile-worker.ts",
+			// Share HTML cleaning runs off-thread, including in compiled distributions.
+			"./server/lib/share-preview-worker.ts",
 			// Revert manifest validation also runs in a Worker; Worker URLs are not bundled imports.
 			"./server/services/revert-transaction-manifest-worker.ts",
 			"--compile",
