@@ -26,6 +26,7 @@ import {
 	normalizeDirectorPrimaryRatio,
 } from "./director-constants";
 import { PANEL_COMPONENT, type WorkspacePanelParams } from "./panel-types";
+import { pruneWorkspaceLayout } from "./workspace-panel-set";
 
 /** Current envelope schema version. */
 export const WORKSPACE_LAYOUT_VERSION = 2 as const;
@@ -111,16 +112,41 @@ export function twoNarratorWorkspaceSeed(
 
 // ── Serialization ──
 
-/** Serialize the current Dockview layout + director state into the envelope string. */
+/** Serialize durable arrangement only; transient ids belong to the live surface, not params. */
 export function serializeWorkspaceLayout(
 	api: DockviewApi,
 	director: WorkspaceDirectorState,
+	transientPanelIds?: ReadonlySet<string>,
+	durableActiveGroupId?: string | null,
 ): string {
+	let layout = stripNavigationFromLayout(api.toJSON());
+	if (transientPanelIds?.size || durableActiveGroupId !== undefined) {
+		layout = pruneWorkspaceLayout(layout, transientPanelIds ?? new Set(), {
+			allowEmptyGrid: true,
+			activeGroup: durableActiveGroupId,
+		}) ?? {
+			grid: {
+				width: layout.grid?.width ?? 0,
+				height: layout.grid?.height ?? 0,
+				orientation: layout.grid?.orientation ?? "HORIZONTAL",
+				root: { type: "branch", data: [] },
+			},
+			panels: {},
+		};
+	}
+	// Dockview omits absent collections, but pruning can leave empty ones. Use the
+	// same canonical shape before and after temporary windows so saves stay byte-stable.
+	if (layout.floatingGroups?.length === 0) delete layout.floatingGroups;
+	if (layout.popoutGroups?.length === 0) delete layout.popoutGroups;
+	if (layout.edgeGroups && Object.keys(layout.edgeGroups).length === 0) delete layout.edgeGroups;
 	const envelope: WorkspaceLayoutEnvelope = {
 		version: WORKSPACE_LAYOUT_VERSION,
 		kind: "dockview",
-		layout: stripNavigationFromLayout(api.toJSON()),
-		director,
+		layout,
+		director:
+			director.primaryPanelId && transientPanelIds?.has(director.primaryPanelId)
+				? { ...director, primaryPanelId: null }
+				: director,
 	};
 	return JSON.stringify(envelope);
 }

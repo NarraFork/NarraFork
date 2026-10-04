@@ -201,6 +201,7 @@ import {
 } from "./tool-call/tool-call-contexts";
 import { useNarratorAsyncQuestionSlots } from "./useNarratorAsyncQuestionSlots";
 import { useNarratorPanelWS } from "./useNarratorPanelWS";
+import { useWorkspaceDock } from "./workspace/workspace-dock";
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
 
@@ -300,6 +301,7 @@ function NarratorPanelBody({
 	// bridges chat input to it, so sibling tool panels can consume it. Outside a
 	// provider these all fall back to the legacy prop callbacks.
 	const dock = useNarratorDockContext();
+	const workspaceDock = useWorkspaceDock();
 	const pluginSurface = usePluginUiSurface();
 	const workspaceId = pluginSurface?.hostContext.workspaceId;
 	// Effective sidebar callbacks: prefer explicit props, else route through dock.
@@ -1417,6 +1419,15 @@ function NarratorPanelBody({
 			version: string;
 			hash: string;
 		}) => {
+			if (workspaceDock && pluginSurface) {
+				workspaceDock.openPluginPanel(narratorId, pick, {
+					...pluginSurface.hostContext,
+					narratorId,
+					chapterId,
+					projectId,
+				});
+				return;
+			}
 			const api = dockApiRef?.current;
 			if (!api) return;
 			// A plugin contribution is a singleton per narrator surface: re-picking it
@@ -1447,7 +1458,7 @@ function NarratorPanelBody({
 			});
 			api.addPanel(request);
 		},
-		[dockApiRef, pluginSurface, narratorId, chapterId, projectId],
+		[dockApiRef, pluginSurface, narratorId, chapterId, projectId, workspaceDock],
 	);
 	const [deletePreviewMessageId, setDeletePreviewMessageId] = useState<string | null>(null);
 	const [pendingDeleteCallback, setPendingDeleteCallback] = useState<(() => void) | null>(null);

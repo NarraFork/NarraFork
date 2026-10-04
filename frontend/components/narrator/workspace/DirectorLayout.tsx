@@ -28,6 +28,7 @@ import { type PluginDockPanelHostApi, PluginDockPanelView } from "../../plugins/
 import { PluginUiSurfaceProvider } from "../../plugins/PluginUiSurfaceContext";
 import type { PluginDockPanelParams } from "../../plugins/protocol";
 import { WebviewPanel } from "../browser/WebviewPanel";
+import { NarratorDockContext } from "../dock/NarratorDockContext";
 import { NarratorPanel } from "../NarratorPanel";
 import { usePanelCompact } from "../panels/shared";
 import type { WebviewLeafConfig } from "../split-tree";
@@ -43,6 +44,7 @@ import {
 	previewScaleForWidth,
 	resolvePrimaryLeaf,
 } from "./director-constants";
+import { useWorkspaceNarratorDockValue } from "./workspace-dock";
 
 const WorkspaceTerminalPanel = lazy(() =>
 	import("../../terminal/WorkspaceTerminalPanel").then((m) => ({
@@ -61,7 +63,7 @@ export interface DirectorLayoutProps {
 	onPreviewRatio: (ratio: number) => void;
 	/** Commit the ratio when the drag ends (persisted). */
 	onCommitRatio: (ratio: number) => void;
-	/** Open a child session in the narrator's secondary area and return to grid. */
+	/** Open a child session on the workspace resource surface without leaving Director. */
 	onViewSubagentSession: (
 		hostNarratorId: string,
 		subagentNarratorId: string,
@@ -137,6 +139,12 @@ function DirectorPanelContent({
 }) {
 	const params = leaf.params;
 	const narratorId = params.panelType === "narrator" ? params.narratorId : "";
+	// Only the live primary participates in the narrator/resource bridge. Previews
+	// retain their lightweight behaviour and cannot publish over the primary.
+	const dockValue = useWorkspaceNarratorDockValue(
+		isPrimary ? narratorId : "",
+		isPrimary ? leaf.id : undefined,
+	);
 
 	const handleWebviewConfigChange = useCallback(
 		(config: WebviewLeafConfig) => onUpdateWebviewConfig(leaf.id, config),
@@ -185,19 +193,21 @@ function DirectorPanelContent({
 
 	// Narrator. Secondary panels render as lightweight previews.
 	return (
-		<Box style={{ height: "100%", overflow: "hidden" }}>
-			<NarratorPanel
-				key={narratorId}
-				narratorId={narratorId}
-				compact={compact}
-				onClose={onClose}
-				onViewSubagentSession={(subagentNarratorId, messageId) =>
-					onViewSubagentSession(narratorId, subagentNarratorId, messageId)
-				}
-				workspacePreview={!isPrimary}
-				suppressAutoFocusOnPromote={suppressAutoFocusOnPromote}
-			/>
-		</Box>
+		<NarratorDockContext.Provider value={isPrimary ? dockValue : null}>
+			<Box style={{ height: "100%", overflow: "hidden" }}>
+				<NarratorPanel
+					key={narratorId}
+					narratorId={narratorId}
+					compact={compact}
+					onClose={onClose}
+					onViewSubagentSession={(subagentNarratorId, messageId) =>
+						onViewSubagentSession(narratorId, subagentNarratorId, messageId)
+					}
+					workspacePreview={!isPrimary}
+					suppressAutoFocusOnPromote={suppressAutoFocusOnPromote}
+				/>
+			</Box>
+		</NarratorDockContext.Provider>
 	);
 }
 
@@ -244,6 +254,7 @@ function DirectorLeafHost({
 
 	return (
 		<Box
+			data-workspace-panel-id={leaf.id}
 			style={{
 				position: "absolute",
 				// Portrait rail hosts read their left through the imperative scroll

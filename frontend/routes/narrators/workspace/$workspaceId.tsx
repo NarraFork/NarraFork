@@ -120,7 +120,6 @@ function WorkspacePage() {
 	const handleViewSubagentSession = useCallback(
 		(hostNarratorId: string, subagentNarratorId: string, messageId?: string) => {
 			directorControlRef.current?.openSubagentPanel(hostNarratorId, subagentNarratorId, messageId);
-			setDirectorMode(false);
 		},
 		[],
 	);
@@ -283,15 +282,15 @@ function WorkspacePage() {
 						</ActionIcon>
 					</Center>
 				)}
-				{/* Keep Dockview mounted for its API and persisted layout, but remove it from
-				    the visual and hit-test trees while DirectorLayout owns the surface. */}
+				{/* Director shares the workspace provider and stacking surface with native
+				    floating resources. Only the empty workspace hides the entire dock. */}
 				<Box
-					aria-hidden={directorMode || panels.length === 0 || undefined}
+					aria-hidden={panels.length === 0 || undefined}
 					style={{
 						height: "100%",
 						width: "100%",
-						visibility: directorMode || panels.length === 0 ? "hidden" : "visible",
-						pointerEvents: directorMode || panels.length === 0 ? "none" : undefined,
+						visibility: panels.length === 0 ? "hidden" : "visible",
+						pointerEvents: panels.length === 0 ? "none" : undefined,
 					}}
 				>
 					<DockviewWorkspace
@@ -303,24 +302,26 @@ function WorkspacePage() {
 						onMembershipChanged={handleMembershipChanged}
 						onPanelsChange={handlePanelsChange}
 						onDirectorStateChange={handleDirectorStateChange}
+						directorOverlay={
+							directorMode ? (
+								<DirectorLayout
+									workspaceId={workspaceId}
+									leaves={directorLeaves}
+									primaryPanelId={primaryPanelId}
+									primaryRatio={ratioDraft ?? primaryRatio}
+									onActivate={handleActivate}
+									onPreviewRatio={handlePreviewRatio}
+									onCommitRatio={handleCommitRatio}
+									onViewSubagentSession={handleViewSubagentSession}
+									onClosePanel={handleClosePanel}
+									onUpdateWebviewConfig={handleUpdateWebviewConfig}
+									onUpdatePluginParams={handleUpdatePluginParams}
+									onSetPanelTitle={handleSetPanelTitle}
+								/>
+							) : null
+						}
 					/>
 				</Box>
-				{directorMode && (
-					<DirectorLayout
-						workspaceId={workspaceId}
-						leaves={directorLeaves}
-						primaryPanelId={primaryPanelId}
-						primaryRatio={ratioDraft ?? primaryRatio}
-						onActivate={handleActivate}
-						onPreviewRatio={handlePreviewRatio}
-						onCommitRatio={handleCommitRatio}
-						onViewSubagentSession={handleViewSubagentSession}
-						onClosePanel={handleClosePanel}
-						onUpdateWebviewConfig={handleUpdateWebviewConfig}
-						onUpdatePluginParams={handleUpdatePluginParams}
-						onSetPanelTitle={handleSetPanelTitle}
-					/>
-				)}
 			</Box>
 		</Box>
 	);

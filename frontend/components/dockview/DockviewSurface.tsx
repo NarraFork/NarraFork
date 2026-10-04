@@ -106,6 +106,8 @@ export interface DockviewSurfaceProps {
 	 * Leave unset to inherit dockview's default.
 	 */
 	defaultRenderer?: "always" | "onlyWhenVisible";
+	/** Keep temporary workspace windows inside the available surface. */
+	floatingGroupBounds?: "boundedWithinViewport";
 	/**
 	 * Per-panel tab renderers, keyed by the `tabComponent` name a panel is added
 	 * with. Used e.g. to give the focus dock's chat panel a close-less tab so the
@@ -150,6 +152,7 @@ export function DockviewSurface({
 	themeless,
 	apiRef: externalApiRef,
 	defaultRenderer,
+	floatingGroupBounds,
 	tabComponents,
 	surfaceId,
 }: DockviewSurfaceProps) {
@@ -252,6 +255,7 @@ export function DockviewSurface({
 					onDidDrop={handleDidDrop}
 					onWillDrop={handleWillDrop}
 					defaultRenderer={defaultRenderer}
+					floatingGroupBounds={floatingGroupBounds}
 				/>
 				{dropIndicator && (
 					<Box
