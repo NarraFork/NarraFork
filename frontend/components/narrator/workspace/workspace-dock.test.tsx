@@ -861,7 +861,6 @@ describe("real workspace Dockview resource lifecycle", () => {
 		mock.module("../dock/panels", () => ({
 			BrowserDockPanel: ResourceWrapper,
 			DetailsDockPanel: ResourceWrapper,
-			FileModDockPanel: ResourceWrapper,
 			FileTreeDockPanel: ResourceWrapper,
 			FileDockPanel: ResourceWrapper,
 			GitDockPanel: ResourceWrapper,

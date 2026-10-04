@@ -20,6 +20,18 @@ import {
 } from "./NarratorDockContext";
 import { bindFilePanelExitGuard } from "./panels";
 
+function narratorHostFixture(narratorId: string) {
+	return {
+		id: `workspace-narrator-${narratorId}`,
+		params: { panelType: "narrator", narratorId },
+		group: {
+			id: `narrator-group-${narratorId}`,
+			api: { boundingBox: { left: 0, top: 0, width: 800, height: 600 } },
+		},
+		api: { location: { type: "grid" }, setActive: mock(() => {}) },
+	};
+}
+
 /**
  * A file panel's dockview id is derived from a HASH of its path, never from the
  * path itself: paths carry separators, spaces and non-ASCII and can be long, all
@@ -78,7 +90,7 @@ describe("fileDockPanelId", () => {
 
 	it("does not collide with the singleton tool panel ids", () => {
 		// Singleton panels use `ndock-<kind>`; a file panel must never produce one.
-		for (const kind of ["chat", "terminal", "details", "filemod", "spec", "git"]) {
+		for (const kind of ["chat", "terminal", "details", "spec", "git"]) {
 			expect(fileDockPanelId(`/x/${kind}`)).not.toBe(`ndock-${kind}`);
 		}
 	});
@@ -275,14 +287,21 @@ describe("device-scoped navigation", () => {
 			{
 				id: string;
 				params: FilePanelParams;
-				api: { setActive: () => void; updateParameters: (params: FilePanelParams) => void };
+				group: { id: string };
+				api: {
+					location: { type: "grid" | "floating" };
+					setActive: () => void;
+					updateParameters: (params: FilePanelParams) => void;
+				};
 			}
 		>();
 		const add = (id: string, params: FilePanelParams) => {
 			const panel = {
 				id,
 				params,
+				group: { id: `file-group-${id}` },
 				api: {
+					location: { type: "floating" as const },
 					setActive: () => {},
 					updateParameters: (next: FilePanelParams) => {
 						panel.params = next;
@@ -292,10 +311,13 @@ describe("device-scoped navigation", () => {
 			panels.set(id, panel);
 		};
 		add(id, { panelType: "file", filePath: path });
+		const narrator = narratorHostFixture("n");
 		const api = {
-			getPanel: (id: string) => panels.get(id),
+			width: 1200,
+			height: 800,
+			getPanel: (id: string) => (id === narrator.id ? narrator : panels.get(id)),
 			get panels() {
-				return [...panels.values()];
+				return [narrator, ...panels.values()];
 			},
 			addPanel: (panel: { id: string; params: FilePanelParams }) => add(panel.id, panel.params),
 		} as unknown as DockviewApi;
@@ -468,22 +490,29 @@ describe("historical file panels", () => {
 				{
 					id: string;
 					params: FilePanelParams;
+					group: { id: string };
 					api: {
+						location: { type: "floating" };
 						setActive: ReturnType<typeof mock>;
 						updateParameters: (params: FilePanelParams) => void;
 					};
 				}
 			>();
+			const narrator = narratorHostFixture("host");
 			const api = {
-				getPanel: (id: string) => panels.get(id),
+				width: 1200,
+				height: 800,
+				getPanel: (id: string) => (id === narrator.id ? narrator : panels.get(id)),
 				get panels() {
-					return [...panels.values()];
+					return [narrator, ...panels.values()];
 				},
 				addPanel: ({ id, params }: { id: string; params: FilePanelParams }) => {
 					const panel = {
 						id,
 						params,
+						group: { id: `file-group-${id}` },
 						api: {
+							location: { type: "floating" as const },
 							setActive: mock(() => {}),
 							updateParameters: (next: FilePanelParams) => {
 								panel.params = next;

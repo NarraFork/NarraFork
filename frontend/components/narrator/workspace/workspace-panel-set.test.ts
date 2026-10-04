@@ -69,6 +69,41 @@ function layoutWith(
 	} as unknown as SerializedDockview;
 }
 
+test("retired filemod is dropped even when its host remains a member", () => {
+	const layout = layoutWith([
+		narratorEntry("a"),
+		{ id: "old", params: { panelType: "narrator-tool", toolType: "filemod", narratorId: "a" } },
+		{ id: "tree", params: { panelType: "narrator-tool", toolType: "filetree", narratorId: "a" } },
+	]);
+	const plan = reconcileLayoutWithPanels({ panels: [narratorMember("a", 0)], layout });
+	expect(plan.droppedPanelIds).toEqual(["old"]);
+	expect(plan.appended).toEqual([]);
+	expect(gridViews(plan.layout)).toEqual(["a", "tree"]);
+	expect(layout.panels.old).toBeDefined();
+});
+
+test("retired-only main grid does not reset a surviving floating narrator", () => {
+	const layout = layoutWith([
+		{ id: "old", params: { panelType: "narrator-tool", toolType: "filemod", narratorId: "a" } },
+	]);
+	layout.panels.a = {
+		id: "a",
+		contentComponent: "narrator",
+		params: { panelType: "narrator", narratorId: "a" },
+	};
+	layout.floatingGroups = [
+		{
+			data: { id: "float", views: ["a"], activeView: "a" },
+			position: { left: 1, top: 2, width: 400, height: 300 },
+		},
+	];
+	const plan = reconcileLayoutWithPanels({ panels: [narratorMember("a", 0)], layout });
+	expect(plan.layout).not.toBeNull();
+	expect(plan.layout?.floatingGroups).toEqual(layout.floatingGroups);
+	expect(plan.appended).toEqual([]);
+	expect(plan.layout?.activeGroup).toBe("float");
+});
+
 function narratorEntry(narratorId: string) {
 	return { id: narratorId, params: { panelType: "narrator", narratorId } };
 }

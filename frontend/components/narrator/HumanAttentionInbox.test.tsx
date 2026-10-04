@@ -731,7 +731,7 @@ describe("human attention decisions", () => {
 		expect(approve).toHaveBeenCalledTimes(1);
 	});
 
-	test("Write/Edit show full old/new input and task mutations; file review opens actual owner and never registers the inline Enter handler", async () => {
+	test("Write/Edit show full old/new input and task mutations; session link opens actual owner and never registers the inline Enter handler", async () => {
 		const write = item("write", {
 			toolName: "Write",
 			narratorId: "child-owner",
@@ -781,7 +781,8 @@ describe("human attention decisions", () => {
 		expect(row(edit.id).textContent).not.toContain("task_reflection");
 		expect(row(edit.id).textContent).not.toContain("awaiting_user");
 		expect(actions).toHaveLength(0);
-		await click(narratorEn.fileMod_viewInPanel, row(write.id));
+		expect(row(write.id).textContent).not.toContain("Review in panel");
+		await click(narratorEn.humanAttentionOpenSession, row(write.id));
 		expect(router.navigate).toHaveBeenCalledWith({
 			to: "/narrators/$narratorId",
 			params: { narratorId: "child-owner" },

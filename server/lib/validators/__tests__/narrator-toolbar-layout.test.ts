@@ -33,6 +33,22 @@ describe("narratorToolbarLayout id whitelist", () => {
 		);
 	});
 
+	it("filters the retired filemod id from old clients without dropping other preferences", () => {
+		const parsed = updateUserPreferencesSchema.parse({
+			fastModeDefault: true,
+			narratorToolbarLayout: {
+				items: [{ id: "git" }, { id: "filemod" }, { id: "__divider__" }, { id: "filetree" }],
+			},
+		});
+		expect(parsed.fastModeDefault).toBe(true);
+		expect(parsed.narratorToolbarLayout?.items).toEqual([
+			{ id: "git" },
+			{ id: "__divider__" },
+			{ id: "filetree" },
+		]);
+		expect(NARRATOR_TOOLBAR_IDS as readonly string[]).not.toContain("filemod");
+	});
+
 	it("rejects an id absent from the shared registry", () => {
 		expect(() =>
 			updateUserPreferencesSchema.parse({

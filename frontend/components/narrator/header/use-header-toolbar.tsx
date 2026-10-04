@@ -51,7 +51,6 @@ export interface UseHeaderToolbarOptions {
 	// Active-state inputs.
 	mobileTasksOpen: boolean;
 	mobileToolPanel: MobileToolPanelKind | null;
-	fileModDrawerOpened: boolean;
 	detailsOpened: boolean;
 	terminalToolOpened: boolean;
 	specToolOpened: boolean;
@@ -59,7 +58,6 @@ export interface UseHeaderToolbarOptions {
 	// Activation actions.
 	setMobileTasksOpen: Dispatch<SetStateAction<boolean>>;
 	setMobileToolPanel: Dispatch<SetStateAction<MobileToolPanelKind | null>>;
-	setFileModDrawerOpened: Dispatch<SetStateAction<boolean>>;
 	toggleDetails: () => void;
 	toggleTerminalTool: () => void;
 	toggleSpecTool: () => void;
@@ -110,13 +108,11 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 		executionDevicesQuery,
 		mobileTasksOpen,
 		mobileToolPanel,
-		fileModDrawerOpened,
 		detailsOpened,
 		terminalToolOpened,
 		specToolOpened,
 		setMobileTasksOpen,
 		setMobileToolPanel,
-		setFileModDrawerOpened,
 		toggleDetails,
 		toggleTerminalTool,
 		toggleSpecTool,
@@ -196,8 +192,6 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 			switch (id) {
 				case "tasks":
 					return dock ? dock.openToolTypes.has("tasks") : mobileTasksOpen;
-				case "filemod":
-					return fileModDrawerOpened;
 				case "details":
 					return detailsOpened;
 				case "terminal":
@@ -218,15 +212,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 					return false;
 			}
 		},
-		[
-			dock,
-			mobileTasksOpen,
-			fileModDrawerOpened,
-			detailsOpened,
-			terminalToolOpened,
-			specToolOpened,
-			mobileToolPanel,
-		],
+		[dock, mobileTasksOpen, detailsOpened, terminalToolOpened, specToolOpened, mobileToolPanel],
 	);
 
 	/**
@@ -245,9 +231,6 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "tasks":
 					if (dock) dock.toggleToolPanel("tasks");
 					else setMobileTasksOpen((v) => !v);
-					return;
-				case "filemod":
-					setFileModDrawerOpened((v: boolean) => !v);
 					return;
 				case "details":
 					toggleDetails();
@@ -284,7 +267,6 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 			dock,
 			setMobileTasksOpen,
 			setMobileToolPanel,
-			setFileModDrawerOpened,
 			toggleDetails,
 			onOpenTerminalPanel,
 			toggleTerminalTool,

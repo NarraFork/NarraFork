@@ -20,7 +20,6 @@ import { NarratorDockContext } from "../dock/NarratorDockContext";
 import {
 	BrowserDockPanel as BrowserToolAdapter,
 	DetailsDockPanel as DetailsToolAdapter,
-	FileModDockPanel as FileModToolAdapter,
 	FileTreeDockPanel as FileTreeToolAdapter,
 	FileDockPanel as FileViewerAdapter,
 	GitDockPanel as GitToolAdapter,
@@ -164,7 +163,7 @@ function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
 }
 
 /**
- * Narrator-scoped tool panel adapter (terminal / details / filemod / spec /
+ * Narrator-scoped tool panel adapter (terminal / details / spec /
  * git / browser). Reuses the focus dock's tool adapters verbatim — they read
  * `narratorId` / `chapterId` and published props from the dock context, so we
  * just provide a per-narrator context and delegate by `toolType`.
@@ -206,9 +205,6 @@ function NarratorToolDockPanel(props: IDockviewPanelProps<NarratorToolPanelParam
 			break;
 		case "details":
 			inner = <DetailsToolAdapter {...toolProps} />;
-			break;
-		case "filemod":
-			inner = <FileModToolAdapter {...toolProps} />;
 			break;
 		case "spec":
 			inner = <SpecToolAdapter {...toolProps} />;

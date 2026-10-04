@@ -8,7 +8,7 @@
  * "docked" and a "standalone" variant.
  *
  * Only the panels in `DETACHABLE_PANEL_KINDS` are supported. The ones that take
- * their data from chat-published context (`details`, `filemod`) are excluded
+ * their data from chat-published context (`details`) are excluded
  * precisely because this value cannot supply it.
  */
 
@@ -68,10 +68,8 @@ export function createDetachedPanelDockValue(input: {
 		apiRef,
 
 		// Published state: the detachable set contains no consumer of these (their
-		// consumers, details/filemod, are excluded exactly because they need a chat
+		// consumer, details, are excluded exactly because they need a chat
 		// panel publishing into the same provider).
-		fileModProps: null,
-		setFileModProps: () => {},
 		detailsProps: null,
 		setDetailsProps: () => {},
 		browserInfo: { sessionCount: 0, visualChange: null },
