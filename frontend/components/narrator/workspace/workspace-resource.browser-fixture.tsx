@@ -5,13 +5,19 @@ import {
 	DockviewReact,
 	type IDockviewPanelHeaderProps,
 	type IDockviewPanelProps,
+	type SerializedDockview,
 } from "dockview-react";
 import { createInstance } from "i18next";
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { type ReactNode, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
+import { onPanelDragEnd, onPanelDragMove } from "../../../lib/panel-drag";
 import narratorTranslations from "../../../locales/en/narrators.json";
+import { ToolPanelShell } from "../dock/panels";
+import { useNarratorPanelVisible } from "../narrator-panel-visibility";
+import { DEFAULT_DIRECTOR_STATE, serializeWorkspaceLayout } from "./dockview-layout";
 import type { WorkspacePanelParams } from "./panel-types";
+import { WorkspaceResourceFrame } from "./WorkspaceResourceFrame";
 import { WorkspaceResourceTab } from "./WorkspaceResourceTab";
 import {
 	createWorkspaceDockStore,
@@ -24,8 +30,11 @@ import "dockview-react/dist/styles/dockview.css";
 import "../../dockview/theme.css";
 import "./workspace-resource.css";
 
-// The production store/header/CSS and native Dockview mounts are real. Only
-// panel bodies and the Director background are mocked: no backend or WS.
+// The production store, WorkspaceResourceFrame, ToolPanelShell/header/drag,
+// theme CSS, Query/Locale providers and native Dockview mounts are real. Only
+// transport-heavy resource bodies and the Director background are mocked.
+// Subagent uses the same real common header shell with a mocked child body;
+// this does not claim to exercise the full session/query/WS implementation.
 export type ResourceKind = "terminal" | "browser" | "subagent";
 const apiRef: { current: DockviewApi | null } = { current: null };
 const store = createWorkspaceDockStore(apiRef);
@@ -33,10 +42,18 @@ const mounts: Record<string, number> = {};
 const cleanups: Record<string, number> = {};
 const bodyClicks: Record<string, number> = {};
 const titleClicks: Record<string, number> = {};
+const headerPointerDowns: Record<string, number> = {};
+const consumedHeaders = new Set<string>();
 let nextInstance = 0;
 let reveals = 0;
 let overlayClicks = 0;
 let ready = false;
+let normalDragMoves = 0;
+let normalDragDrops = 0;
+onPanelDragMove(() => normalDragMoves++);
+onPanelDragEnd((state) => {
+	if (state) normalDragDrops++;
+});
 const escapeDecisions: { closed: boolean; prevented: boolean; target: string | null }[] = [];
 
 const client = new QueryClient({
@@ -75,11 +92,29 @@ function ResourceButtons({ director = false }: { director?: boolean }) {
 					Open {kind}
 				</button>
 			))}
+			<button
+				type="button"
+				data-toggle={`${director ? "director" : "grid"}-terminal`}
+				onClick={() => store.toggleToolPanel("narrator-a", "terminal", null)}
+			>
+				Toggle terminal
+			</button>
 		</div>
 	);
 }
 
-function MockPanel({ api, params }: IDockviewPanelProps<WorkspacePanelParams>) {
+function BodyVisibilityProbe({ children }: { children: ReactNode }) {
+	const visible = useNarratorPanelVisible();
+	return <div data-resource-visible={String(visible)}>{children}</div>;
+}
+
+export function consumeHeaderPointerDown(id: string, consume: boolean) {
+	if (consume) consumedHeaders.add(id);
+	else consumedHeaders.delete(id);
+}
+
+function MockPanel(props: IDockviewPanelProps<WorkspacePanelParams>) {
+	const { api, params } = props;
 	const [instance] = useState(() => ++nextInstance);
 	const [clicks, setClicks] = useState(0);
 	const title =
@@ -99,8 +134,8 @@ function MockPanel({ api, params }: IDockviewPanelProps<WorkspacePanelParams>) {
 	useEffect(() => {
 		api.setTitle(title);
 	}, [api, title]);
-	return (
-		<section data-panel={api.id} data-instance={instance} style={{ height: "100%", padding: 12 }}>
+	const body = (
+		<div style={{ padding: 12 }}>
 			{params.panelType === "narrator" && params.narratorId === "narrator-a" && <ResourceButtons />}
 			<button
 				type="button"
@@ -157,6 +192,40 @@ function MockPanel({ api, params }: IDockviewPanelProps<WorkspacePanelParams>) {
 						Consume Escape
 					</button>
 				</div>
+			)}
+		</div>
+	);
+	return (
+		<section
+			data-panel={api.id}
+			data-instance={instance}
+			style={{ height: "100%" }}
+			onPointerDownCapture={(event) => {
+				if ((event.target as Element).closest(".nf-panel-header")) {
+					headerPointerDowns[api.id] = (headerPointerDowns[api.id] ?? 0) + 1;
+					// Simulate an earlier consumer, without replacing the real header handler.
+					if (consumedHeaders.has(api.id)) event.preventDefault();
+				}
+			}}
+			onClickCapture={(event) => {
+				if ((event.target as Element).closest(".nf-panel-header")) {
+					titleClicks[api.id] = (titleClicks[api.id] ?? 0) + 1;
+				}
+			}}
+		>
+			{params.panelType === "narrator" ? (
+				body
+			) : (
+				<WorkspaceResourceFrame props={props}>
+					<ToolPanelShell
+						title={title}
+						props={props}
+						subjectId={api.id}
+						detachKind={params.panelType === "narrator-tool" ? params.toolType : "subagent"}
+					>
+						<BodyVisibilityProbe>{body}</BodyVisibilityProbe>
+					</ToolPanelShell>
+				</WorkspaceResourceFrame>
 			)}
 		</section>
 	);
@@ -244,13 +313,15 @@ function Harness() {
 									params: { panelType: "narrator", narratorId: "narrator-a" },
 									title: "Alice",
 								});
-								api.addPanel({
-									id: "source-b",
-									component: "narrator",
-									params: { panelType: "narrator", narratorId: "narrator-b" },
-									title: "Bob",
-									position: { referencePanel: "source-a", direction: "right" },
-								});
+								if (new URLSearchParams(location.search).get("slots") !== "1") {
+									api.addPanel({
+										id: "source-b",
+										component: "narrator",
+										params: { panelType: "narrator", narratorId: "narrator-b" },
+										title: "Bob",
+										position: { referencePanel: "source-a", direction: "right" },
+									});
+								}
 								ready = true;
 							}}
 						/>
@@ -292,10 +363,14 @@ export function snapshot() {
 		ready,
 		director: store.getDirectorActive(),
 		reveals,
+		normalDragMoves,
+		normalDragDrops,
 		overlayClicks,
 		escapeDecisions: [...escapeDecisions],
 		temporary: [...store.getTemporaryPanelIds()],
 		activePanel: api?.activePanel?.id,
+		singleGridSlot: store.hasSingleGridSlot(),
+		rootGrid: api?.toJSON().grid,
 		grid: (api?.groups ?? [])
 			.filter((group) => group.api.location.type === "grid")
 			.map((group) => ({
@@ -307,10 +382,25 @@ export function snapshot() {
 			id: panel.id,
 			group: panel.group.id,
 			location: panel.api.location.type,
+			headerHidden: panel.group.header.hidden,
+			managedPreview: store.isManagedPreview(panel.id),
+			activePreview: store.isActivePreview(panel.id),
+			providerVisible:
+				document
+					.querySelector(`[data-panel="${panel.id}"] [data-resource-visible]`)
+					?.getAttribute("data-resource-visible") === "true",
+			nativeHostInert:
+				panel.group.element.closest<HTMLElement>(".dv-resize-container")?.inert ?? false,
+			bodyOverlayInert:
+				document
+					.querySelector(`[data-panel="${panel.id}"]`)
+					?.closest<HTMLElement>(".dv-render-overlay")?.inert ?? false,
+			groupBounds: rect(panel.group.element),
 			mounts: mounts[panel.id] ?? 0,
 			cleanups: cleanups[panel.id] ?? 0,
 			bodyClicks: bodyClicks[panel.id] ?? 0,
 			titleClicks: titleClicks[panel.id] ?? 0,
+			headerPointerDowns: headerPointerDowns[panel.id] ?? 0,
 			instance: document.querySelector(`[data-panel="${panel.id}"]`)?.getAttribute("data-instance"),
 			visible:
 				document
@@ -323,6 +413,21 @@ export function snapshot() {
 function rect(element: Element) {
 	const { left, top, width, height } = element.getBoundingClientRect();
 	return { left, top, width, height };
+}
+
+export function durableLayout(): SerializedDockview {
+	return JSON.parse(
+		serializeWorkspaceLayout(
+			nativeDockviewApi(),
+			DEFAULT_DIRECTOR_STATE,
+			store.getTemporaryPanelIds(),
+		),
+	).layout;
+}
+
+export function nativeDockviewApi() {
+	if (!apiRef.current) throw new Error("Native Dockview not mounted");
+	return apiRef.current;
 }
 
 export function nativeFloatingBounds() {

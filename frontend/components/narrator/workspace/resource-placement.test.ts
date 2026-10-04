@@ -6,6 +6,7 @@ import {
 	type ResourceGroupRect,
 	rankResourceTargetGroups,
 	rankResourceTargets,
+	resourceDrawerBounds,
 	resourceSplitDirection,
 	selectResourceTargetGroup,
 } from "./resource-placement";
@@ -303,5 +304,32 @@ describe("explicit source split", () => {
 				{ resourceMinimum: { width: 100, height: Number.NaN } },
 			),
 		).toBeNull();
+	});
+});
+
+describe("right drawer bounds", () => {
+	test("anchors to the right at full workspace height", () => {
+		expect(resourceDrawerBounds(1200, 838)).toEqual({
+			position: { right: 0, top: 0 },
+			width: 560,
+			height: 838,
+		});
+	});
+	test("narrow workspaces clamp width without losing full height", () => {
+		expect(resourceDrawerBounds(372, 410)).toEqual({
+			position: { right: 0, top: 0 },
+			width: 372,
+			height: 410,
+		});
+	});
+	test("invalid dimensions are not a usable drawer", () => {
+		for (const [width, height] of [
+			[0, 100],
+			[100, 0],
+			[-1, 100],
+			[NaN, 100],
+			[100, Infinity],
+		])
+			expect(resourceDrawerBounds(width, height)).toBeNull();
 	});
 });

@@ -48,6 +48,7 @@ import {
 	type FilePanelOpener,
 	useFilePanelSourceOpener,
 } from "../file-panel/file-panel-navigation";
+import { usePanelHeaderControls } from "../panels/panel-header-controls";
 import {
 	type FilePanelParams,
 	filePanelBaseName,
@@ -148,7 +149,7 @@ function PluginDockPanel(props: PluginDockPanelProps) {
  * docked panel shares one uniform header. Full toolbars (terminal tabs, spec
  * file tabs) stay as the panel's content top row, not here.
  */
-function ToolPanelHeader({
+export function ToolPanelHeader({
 	title,
 	icon,
 	actions,
@@ -161,6 +162,7 @@ function ToolPanelHeader({
 	onPointerDown: (e: React.PointerEvent) => void;
 	onClose: () => void;
 }) {
+	const controls = usePanelHeaderControls();
 	return (
 		<Group
 			gap="xs"
@@ -194,6 +196,7 @@ function ToolPanelHeader({
 					{actions}
 				</Group>
 			) : null}
+			{controls?.pinAction}
 			<Tooltip label="Close" withinPortal>
 				<ActionIcon className="nodrag" size="sm" variant="subtle" color="gray" onClick={onClose}>
 					<IconX size={16} />
@@ -204,7 +207,7 @@ function ToolPanelHeader({
 }
 
 /** Wrap tool-panel content with the shared header + a flex column layout. */
-function ToolPanelShell({
+export function ToolPanelShell({
 	title,
 	icon,
 	actions,

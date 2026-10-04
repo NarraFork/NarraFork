@@ -1,7 +1,9 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { installCanvasStub } from "../vlist/measure/test-canvas-stub";
 import {
+	HEADER_CLOSE_WIDTH_PX,
 	HEADER_LEADING_GAP_PX,
+	HEADER_PIN_WIDTH_PX,
 	HEADER_ROW_PADDING_PX,
 	HEADER_TITLE_TEXT_FALLBACK_PX,
 	HEADER_TITLE_TEXT_MAX_PX,
@@ -83,6 +85,57 @@ describe("resolveHeaderLayoutAfterTitle — tools fit AFTER full title", () => {
 		});
 		expect(withClose.visibleToolCount).toBe(4);
 		expect(withClose.slackPx).toBe(24);
+	});
+
+	test("host pin reserves exactly 28px plus its gap without inflating the sm close", () => {
+		const input = {
+			rowWidth: 520,
+			titleFullWidth,
+			showBack: true,
+			showTitleActions: true,
+			surfacedToolCount: 10,
+			showClose: true,
+		};
+		const plain = resolveHeaderLayoutAfterTitle(input);
+		const pinned = resolveHeaderLayoutAfterTitle({ ...input, showPin: true });
+		expect(HEADER_CLOSE_WIDTH_PX).toBe(22);
+		expect(HEADER_PIN_WIDTH_PX).toBe(28);
+		expect(pinned.titleWidth).toBe(titleFullWidth);
+		expect(pinned.visibleToolCount).toBe(3);
+		expect(pinned.slackPx).toBe(18);
+		// Removing tools adds back 32px each; the pin independently costs 28+10.
+		expect(
+			plain.slackPx + (plain.visibleToolCount - pinned.visibleToolCount) * 32 - pinned.slackPx,
+		).toBe(HEADER_PIN_WIDTH_PX + HEADER_TOOLBAR_GAP_PX);
+		expect(resolveHeaderLayoutAfterTitle({ ...input, showClose: false, showPin: true })).toEqual(
+			resolveHeaderLayoutAfterTitle({ ...input, showClose: false }),
+		);
+	});
+
+	test("pin and close fit after the full title by collapsing tools first", () => {
+		const input = {
+			titleFullWidth,
+			showBack: true,
+			showTitleActions: true,
+			surfacedToolCount: 10,
+			showClose: true,
+			showPin: true,
+		};
+		// chrome206 + title200 + three 32px tools: exact fit, no inflated close.
+		expect(resolveHeaderLayoutAfterTitle({ ...input, rowWidth: 502 })).toMatchObject({
+			titleWidth: titleFullWidth,
+			visibleToolCount: 3,
+			slackPx: 0,
+		});
+		expect(resolveHeaderLayoutAfterTitle({ ...input, rowWidth: 501 })).toMatchObject({
+			titleWidth: titleFullWidth,
+			visibleToolCount: 2,
+			slackPx: 31,
+		});
+		const narrow = resolveHeaderLayoutAfterTitle({ ...input, rowWidth: 350 });
+		expect(narrow.titleWidth).toBe(144);
+		expect(narrow.visibleToolCount).toBe(0);
+		expect(narrow.titleWidth + 206).toBe(350);
 	});
 
 	test("narrow row still prioritizes title over tools", () => {
