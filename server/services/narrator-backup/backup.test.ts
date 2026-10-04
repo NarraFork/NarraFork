@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ContextCharStats } from "@shared/context-composition";
 import { NARRATOR_BACKUP_LIMITS as LIMITS, type NarratorBackupJob } from "@shared/narrator-backup";
 import { readNarratorBackupArtifact } from "./artifact";
 import { BACKUP_TABLES, type BackupTable, backupColumns } from "./contract";
@@ -48,6 +49,12 @@ async function fixture() {
 			"next_seq",
 			"refs_backfill_cursor",
 			"workspace_revision",
+			"context_summary_chars",
+			"context_system_chars",
+			"context_tools_chars",
+			"context_char_revision",
+			"input_chars",
+			"output_chars",
 			"enabled",
 			"is_background",
 			"execution_attempt",
@@ -188,6 +195,92 @@ test("pure standalone archive roundtrip preserves IDs/content/seq/ACL and restor
 			.get(),
 	).toEqual({ execution_origin_tool_call_id: "tool", execution_attempt: 0, status: "fail" });
 	expect(config.databasePath).not.toContain("/.narrafork/narrafork.db");
+});
+
+test("archive roundtrip preserves canonical context characters and segments without derived caches", async () => {
+	const { db, request } = await fixture();
+	const counts = {
+		context_summary_chars: 137,
+		context_system_chars: 251,
+		context_tools_chars: 389,
+		context_char_revision: 11,
+	};
+	const toolCounts = { input_chars: 1021, output_chars: 2033 };
+	// Write-time statistics need not match the current body; never reconstruct them on restore.
+	const stats: ContextCharStats = {
+		segments: [
+			{ category: "assistant", chars: 321 },
+			{ category: "toolCall", chars: 0, toolUseId: "use" },
+			{ category: "toolResult", chars: 0, toolUseId: "use" },
+			{ category: "attachment", chars: 47 },
+		],
+	};
+	const statsJson = JSON.stringify(stats, null, "\t");
+	const cacheJson = JSON.stringify({
+		generation: "derived-generation",
+		revision: "derived-revision",
+		pageCount: 1,
+		totalChars: 368,
+		totals: [
+			{ category: "assistant", chars: 321 },
+			{ category: "attachment", chars: 47 },
+		],
+	});
+	db.run("ALTER TABLE narrators ADD COLUMN context_char_cache_json TEXT");
+	db.run(
+		"CREATE TABLE narrator_context_char_pages(id TEXT PRIMARY KEY,narrator_id TEXT NOT NULL REFERENCES narrators(id) ON DELETE CASCADE,generation TEXT NOT NULL,page INTEGER NOT NULL,segments_json TEXT NOT NULL,UNIQUE(narrator_id,generation,page))",
+	);
+	db.prepare(
+		"UPDATE narrators SET context_summary_chars=?,context_system_chars=?,context_tools_chars=?,context_char_revision=?,context_char_cache_json=? WHERE id='solo'",
+	).run(
+		counts.context_summary_chars,
+		counts.context_system_chars,
+		counts.context_tools_chars,
+		counts.context_char_revision,
+		cacheJson,
+	);
+	db.prepare("UPDATE narrator_messages SET context_chars_json=? WHERE id='message'").run(statsJson);
+	db.prepare("UPDATE narrator_tool_calls SET input_chars=?,output_chars=? WHERE id='tool'").run(
+		toolCounts.input_chars,
+		toolCounts.output_chars,
+	);
+	db.prepare("INSERT INTO narrator_context_char_pages VALUES(?,?,?,?,?)").run(
+		"derived-page",
+		"solo",
+		"derived-generation",
+		0,
+		JSON.stringify(stats.segments),
+	);
+	const narratorCounts = db.prepare(
+		"SELECT context_summary_chars,context_system_chars,context_tools_chars,context_char_revision FROM narrators WHERE id='solo'",
+	);
+	const toolCharacters = db.prepare(
+		"SELECT input_chars,output_chars FROM narrator_tool_calls WHERE id='tool'",
+	);
+	const messageCharacters = db.prepare(
+		"SELECT context_chars_json FROM narrator_messages WHERE id='message'",
+	);
+	const cache = db.prepare("SELECT context_char_cache_json FROM narrators WHERE id='solo'");
+	const pages = db.prepare("SELECT * FROM narrator_context_char_pages");
+	const originalPages = pages.all();
+	const { digest } = (await runBackupWorker(request())) as { digest: string };
+	const artifact = readNarratorBackupArtifact(request().artifactPath ?? "", () => {});
+	expect(artifact.state.rows.narrators?.[0]).toMatchObject(counts);
+	expect(artifact.state.rows.narrator_messages?.[0]?.context_chars_json).toBe(statsJson);
+	expect(artifact.state.rows.narrator_tool_calls?.[0]).toMatchObject(toolCounts);
+	expect(artifact.manifest.columns.narrators).not.toContain("context_char_cache_json");
+	expect(artifact.state.rows.narrators?.[0]).not.toHaveProperty("context_char_cache_json");
+	expect(Object.keys(artifact.manifest.columns)).not.toContain("narrator_context_char_pages");
+	expect(Object.keys(artifact.state.rows)).not.toContain("narrator_context_char_pages");
+	expect(cache.get()).toEqual({ context_char_cache_json: cacheJson });
+	expect(pages.all()).toEqual(originalPages);
+	deleteConversation(db);
+	await runBackupWorker(request({ action: "restore", expectedDigest: digest }));
+	expect(narratorCounts.get()).toEqual(counts);
+	expect(messageCharacters.get()).toEqual({ context_chars_json: statsJson });
+	expect(toolCharacters.get()).toEqual(toolCounts);
+	expect(cache.get()).toEqual({ context_char_cache_json: null });
+	expect(pages.all()).toEqual([]);
 });
 
 test("existing active/archived IDs reject, no skip-success and no partial import", async () => {

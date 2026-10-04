@@ -323,6 +323,11 @@ export const narrators = pgTable(
 		originToolCallId: text("origin_tool_call_id"),
 		subagentOriginKind: text("subagent_origin_kind"),
 		contextSummary: text("context_summary"),
+		contextSummaryChars: integer("context_summary_chars").notNull().default(0),
+		contextSystemChars: integer("context_system_chars").notNull().default(0),
+		contextToolsChars: integer("context_tools_chars").notNull().default(0),
+		contextCharRevision: integer("context_char_revision").notNull().default(0),
+		contextCharCacheJson: jsonText("context_char_cache_json"),
 		model: text("model").default("claude-sonnet-4.5"),
 		pendingModelRestore: text("pending_model_restore"),
 		systemPrompt: text("system_prompt"),
@@ -707,6 +712,26 @@ export const specProtectedTasks = pgTable(
 	],
 );
 
+export const narratorContextCharPages = pgTable(
+	"narrator_context_char_pages",
+	{
+		id: text("id").primaryKey().notNull(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+		generation: text("generation").notNull(),
+		page: integer("page").notNull(),
+		segmentsJson: jsonText("segments_json").notNull(),
+	},
+	(table) => [
+		uniqueIndex("context_char_pages_generation_page_idx").on(
+			table.narratorId,
+			table.generation,
+			table.page,
+		),
+	],
+);
+
 export const narratorMessages = pgTable(
 	"narrator_messages",
 	{
@@ -719,6 +744,7 @@ export const narratorMessages = pgTable(
 		role: text("role").notNull(),
 		contentJson: jsonText("content_json").notNull(),
 		contentText: text("content_text"),
+		contextCharsJson: jsonText("context_chars_json"),
 		tokensIn: integer("tokens_in"),
 		costUsd: doublePrecision("cost_usd"),
 		costStatus: text("cost_status"),
@@ -807,6 +833,8 @@ export const narratorToolCalls = pgTable(
 		toolName: text("tool_name").notNull(),
 		inputJson: jsonText("input_json"),
 		outputJson: jsonText("output_json"),
+		inputChars: integer("input_chars").notNull().default(0),
+		outputChars: integer("output_chars").notNull().default(0),
 		executionDeviceId: text("execution_device_id"),
 		executionCwd: text("execution_cwd"),
 		executionPathFlavor: text("execution_path_flavor"),
@@ -1090,6 +1118,7 @@ export const userPreferences = pgTable("user_preferences", {
 	userId: text("user_id").notNull().unique(),
 	autoLoadOlderMessages: boolean("auto_load_older_messages").notNull().default(true),
 	fastModeDefault: boolean("fast_mode_default").notNull().default(false),
+	treatAsLocalAccess: boolean("treat_as_local_access").notNull().default(false),
 	language: text("language").notNull().default("en"),
 	wordWrapMarkdown: boolean("word_wrap_markdown").notNull().default(true),
 	wordWrapCode: boolean("word_wrap_code").notNull().default(true),
@@ -3646,8 +3675,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 114,
-  "columnCount": 1645,
+  "tableCount": 115,
+  "columnCount": 1659,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -5576,6 +5605,60 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "contextSummary",
           "name": "context_summary",
           "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "contextSummaryChars",
+          "name": "context_summary_chars",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "contextSystemChars",
+          "name": "context_system_chars",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "contextToolsChars",
+          "name": "context_tools_chars",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "contextCharRevision",
+          "name": "context_char_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "contextCharCacheJson",
+          "name": "context_char_cache_json",
+          "kind": "text",
+          "mode": "json",
           "pgType": "text",
           "notNull": false,
           "primary": false,
@@ -7871,6 +7954,81 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "primaryKeys": []
     },
     {
+      "exportName": "narratorContextCharPages",
+      "name": "narrator_context_char_pages",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_context_char_pages_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "generation",
+          "name": "generation",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "page",
+          "name": "page",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "segmentsJson",
+          "name": "segments_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "context_char_pages_generation_page_idx",
+          "columns": [
+            "narratorId",
+            "generation",
+            "page"
+          ],
+          "unique": true
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
       "exportName": "narratorMessages",
       "name": "narrator_messages",
       "columns": [
@@ -7939,6 +8097,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "contentText",
           "name": "content_text",
           "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "contextCharsJson",
+          "name": "context_chars_json",
+          "kind": "text",
+          "mode": "json",
           "pgType": "text",
           "notNull": false,
           "primary": false,
@@ -8525,6 +8693,28 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": false,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "inputChars",
+          "name": "input_chars",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "outputChars",
+          "name": "output_chars",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
         },
         {
           "property": "executionDeviceId",
@@ -10184,6 +10374,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "fastModeDefault",
           "name": "fast_mode_default",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
+          "property": "treatAsLocalAccess",
+          "name": "treat_as_local_access",
           "kind": "integer",
           "mode": "boolean",
           "pgType": "boolean",
