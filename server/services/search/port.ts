@@ -32,9 +32,9 @@
  * ------------------------
  * Every method returns a Promise, because a networked backend cannot produce its rows
  * synchronously, and a port that only a synchronous driver can satisfy would pin search to
- * SQLite forever. The SQLite implementation still runs its queries synchronously (the
- * `bun:sqlite` driver is synchronous) and merely wraps the result — the async boundary is
- * the contract, not the work.
+ * SQLite forever. The SQLite implementation executes its synchronous driver queries in
+ * a dedicated worker; callers await genuinely asynchronous work instead of blocking the
+ * HTTP thread. Query signals are forwarded to the executor for cancellation.
  *
  * The consequence for callers is load-bearing and enforced by the type system: a store
  * result that is not awaited is a Promise, and every place rows are consumed (indexed,

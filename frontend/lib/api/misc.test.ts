@@ -33,6 +33,25 @@ describe("misc APIs", () => {
 		});
 	}
 
+	test("sends optional search sort without changing legacy requests", async () => {
+		installEnvironment(new Response());
+		const urls: string[] = [];
+		Object.defineProperty(g, "fetch", {
+			value: async (input: string) => {
+				urls.push(input);
+				return Response.json({ results: [] });
+			},
+			configurable: true,
+		});
+		await api.search("中文", "chapters", "time");
+		await api.search("ab", "messages", "relevance");
+		await api.search("legacy", "chapters");
+		expect(urls[0]).toContain("q=%E4%B8%AD%E6%96%87&entities=chapters&sort=time");
+		expect(urls[1]).toContain("q=ab&entities=messages&sort=relevance");
+		expect(urls[2]).toContain("q=legacy&entities=chapters");
+		expect(urls[2]).not.toContain("sort=");
+	});
+
 	test("preserves search degraded metadata", async () => {
 		installEnvironment(
 			new Response(

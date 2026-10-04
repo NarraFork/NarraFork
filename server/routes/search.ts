@@ -22,7 +22,8 @@ searchRoutes.get("/", async (c) => {
 	}
 
 	const rawLimit = Number.parseInt(c.req.query("limit") ?? "50", 10);
-	const limit = Math.min(Number.isNaN(rawLimit) ? 50 : rawLimit, 100);
+	const limit = Math.max(1, Math.min(Number.isNaN(rawLimit) ? 50 : rawLimit, 100));
+	const sort = c.req.query("sort") === "time" ? "time" : "relevance";
 
 	const user = c.get("user");
 	const principal = { userId: user.sub, isAdmin: user.role === "admin" };
@@ -32,6 +33,8 @@ searchRoutes.get("/", async (c) => {
 		query,
 		entities,
 		limit,
+		sort,
+		signal: c.req.raw.signal,
 		// Narrator and message hits are filtered to what this user may read; chapter
 		// hits are unaffected (chapters have no per-user ACL).
 		principal,
@@ -41,9 +44,15 @@ searchRoutes.get("/", async (c) => {
 	// cannot ride along in the SQL search. Merged here and re-sorted with
 	// the shared comparator so one ordering governs the whole response.
 	if (entities.includes("knowledge")) {
-		const knowledgeResults = await searchService.searchKnowledge({ query, limit, principal });
+		const knowledgeResults = await searchService.searchKnowledge({
+			query,
+			limit,
+			principal,
+			sort,
+			signal: c.req.raw.signal,
+		});
 		if (knowledgeResults.length > 0) {
-			return c.json({ results: sortSearchResults([...results, ...knowledgeResults]) });
+			return c.json({ results: sortSearchResults([...results, ...knowledgeResults], sort) });
 		}
 	}
 
