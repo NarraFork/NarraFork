@@ -26,6 +26,7 @@ export interface UpdateCoordinationStatus {
 	phase: UpdatePhase;
 	scheduled: boolean;
 	targetVersion?: string;
+	operation?: "update" | "system_shutdown";
 	updateEpoch?: string;
 	pendingBackgroundBashCount: number;
 	pendingOrdinaryExecutionCount: number;
@@ -67,6 +68,8 @@ export interface PlannedUpdateRecoverySnapshot {
 	 * before the replacement was spawned, and on those written by older binaries.
 	 */
 	handoffMarkerNonce?: string;
+	/** Explicit one-shot authorization for a user-started process after system preparation. */
+	resumeOnNextStartup?: boolean;
 	/**
 	 * Written by a FAILED update attempt purely to preserve diagnostics.
 	 *
@@ -84,6 +87,8 @@ interface WritablePlannedUpdateRecoverySnapshot {
 	targetVersion?: string;
 	capturedAt: string;
 	handoffMarkerNonce?: string;
+	/** Explicit one-shot authorization for a user-started process after system preparation. */
+	resumeOnNextStartup?: boolean;
 	evidenceOnly?: boolean;
 	narrators: NarratorRecoveryTarget[];
 }
@@ -110,6 +115,7 @@ export interface UpdateCheckpointActivityLease {
 interface CoordinatorState {
 	phase: UpdatePhase;
 	targetVersion?: string;
+	operation?: "update" | "system_shutdown";
 	updateEpoch?: string;
 	error?: string;
 	errorKind?: "failed" | "cancelled";
@@ -294,6 +300,7 @@ function resolveStatus(): UpdateCoordinationStatus {
 	return {
 		phase: state.phase,
 		scheduled: state.phase !== "idle",
+		operation: state.operation,
 		...(state.targetVersion ? { targetVersion: state.targetVersion } : {}),
 		...(state.updateEpoch ? { updateEpoch: state.updateEpoch } : {}),
 		pendingBackgroundBashCount,
@@ -754,8 +761,12 @@ export function registerNarratorLoop(
 	};
 }
 
-export function scheduleUpdate(targetVersion?: string): UpdateCoordinationStatus {
+export function scheduleUpdate(
+	targetVersion?: string,
+	operation: "update" | "system_shutdown" = "update",
+): UpdateCoordinationStatus {
 	if (state.phase !== "idle") return resolveStatus();
+	state.operation = operation;
 	state.phase = "draining_background_bash";
 	state.targetVersion = targetVersion;
 	state.updateEpoch = generateUpdateEpoch();
@@ -848,6 +859,7 @@ export function failScheduledUpdate(
 	options: { cancelled?: boolean } = {},
 ): UpdateCoordinationStatus {
 	state.phase = "idle";
+	state.operation = undefined;
 	state.targetVersion = undefined;
 	state.updateEpoch = undefined;
 	state.cancelRequestedEpoch = undefined;
@@ -937,6 +949,7 @@ export function parsePlannedUpdateRecoverySnapshot(
 			? { handoffMarkerNonce: parsed.handoffMarkerNonce }
 			: {}),
 		...(parsed.evidenceOnly === true ? { evidenceOnly: true } : {}),
+		...(parsed.resumeOnNextStartup === true ? { resumeOnNextStartup: true } : {}),
 		narrators,
 	};
 }
@@ -1058,10 +1071,16 @@ export type RecoveryManifestRejection =
  * nonce there would silently drop the one legitimate resume during the upgrade that introduces it.
  */
 export function classifyRecoveryManifestOwnership(
-	snapshot: Pick<PlannedUpdateRecoverySnapshot, "handoffMarkerNonce" | "evidenceOnly">,
+	snapshot: Pick<
+		PlannedUpdateRecoverySnapshot,
+		"handoffMarkerNonce" | "evidenceOnly" | "resumeOnNextStartup"
+	>,
 	handoff: { markerNonce?: string } | null,
 ): { owned: true } | { owned: false; reason: RecoveryManifestRejection } {
 	if (snapshot.evidenceOnly) return { owned: false, reason: "evidence_only" };
+	if (snapshot.resumeOnNextStartup && !snapshot.handoffMarkerNonce && !handoff) {
+		return { owned: true };
+	}
 	if (!handoff) return { owned: false, reason: "not_a_replacement_process" };
 	if (!snapshot.handoffMarkerNonce) return { owned: true };
 	if (snapshot.handoffMarkerNonce !== handoff.markerNonce) {
@@ -1108,6 +1127,7 @@ export function resetUpdateCoordinationForTests(): void {
 	checkpointFenceWaiters = [];
 	for (const waiter of pending) waiter.resolve();
 	state.phase = "idle";
+	state.operation = undefined;
 	state.targetVersion = undefined;
 	state.updateEpoch = undefined;
 	state.error = undefined;
