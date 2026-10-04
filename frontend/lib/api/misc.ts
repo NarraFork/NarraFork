@@ -102,8 +102,16 @@ export const miscApi = {
 		),
 
 	// Search
-	search: (q: string, entities = "chapters,messages") =>
-		request<SearchResponse>(`/search?q=${encodeURIComponent(q)}&entities=${entities}`),
+	search: (
+		q: string,
+		entities = "chapters,messages",
+		sort?: "time" | "relevance",
+		signal?: AbortSignal,
+	) =>
+		request<SearchResponse>(
+			`/search?q=${encodeURIComponent(q)}&entities=${entities}${sort ? `&sort=${sort}` : ""}`,
+			{ signal },
+		),
 
 	// Favorite Directories
 	listFavoriteDirectories: () => request<ApiEntity[]>("/favorites"),

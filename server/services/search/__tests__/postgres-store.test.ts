@@ -335,6 +335,47 @@ function expectRankOrdered(rows: readonly { rank: number | null }[], label: stri
 	}
 }
 
+describe("PostgreSQL knowledge time ordering", () => {
+	for (const strategy of ["index", "substring"] as const) {
+		for (const draft of [false, true]) {
+			test(`${strategy} ${draft ? "draft" : "main"} orders before LIMIT with stable entry IDs`, async () => {
+				let statement = "";
+				let bound: unknown[] = [];
+				const store = createPostgresSearchStore({
+					async unsafe(sql, params) {
+						statement = sql;
+						bound = params ?? [];
+						return [];
+					},
+				});
+				if (draft) {
+					await store.searchKnowledgeDrafts({
+						...draftQuery("needle", strategy),
+						sort: "time",
+						limit: 2,
+					});
+				} else {
+					await store.searchKnowledgeEntries(
+						knowledge("needle", strategy, {
+							sort: "time",
+							limit: 2,
+						}),
+					);
+				}
+				expect(statement).toContain(
+					`ORDER BY ${draft ? "d" : "e"}.updated_at DESC, e.id ASC LIMIT`,
+				);
+				expect(bound.at(-1)).toBe(2);
+				if (draft) {
+					expect(statement).toContain("e.created_at, d.updated_at");
+					expect(statement).toContain("AND d.author_user_id =");
+					expect(bound).toContain("u-author");
+				}
+			});
+		}
+	}
+});
+
 describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 	test.skipIf(process.env.PG_INTEGRATION !== "1")(
 		"returns the same rows from both backends over one fixture",

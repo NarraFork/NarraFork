@@ -423,6 +423,7 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 	],
 	["server/lib/db-resilience.ts", "WAL recovery and `sqlite3 .recover` CLI fallback"],
 	["server/lib/db-worker/worker-entry.ts", "read-only SQLite worker connection"],
+	["server/lib/db-worker/search-query.ts", "bounded read-only SQLite search worker execution"],
 	["server/lib/db-worker/storage-scan-runner.ts", "SQLite storage scan budgets"],
 	["server/services/storage-scan-queries.ts", "`dbstat`/page-level SQLite storage accounting"],
 	["server/services/database-cleanup-service.ts", "SQLite VACUUM / page accounting maintenance"],
@@ -475,6 +476,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/db-resilience.ts": ["driver", "sqliteCli", "pragma", "sqliteCatalog", "errorCode"],
 	"server/lib/db-worker/storage-scan-runner.ts": ["driver", "fts5"],
 	"server/lib/db-worker/worker-entry.ts": ["driver", "pragma"],
+	"server/lib/db-worker/search-query.ts": ["driver"],
+	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
 	"server/lib/project-db.ts": ["driver", "pragma"],
 	"server/routes/storage.ts": ["vacuum"],
 	"server/routes/user-preferences.ts": ["handle"],
@@ -575,7 +578,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// second backend implements the same `SearchStore` contract and this file stops being the
 	// answer. `search-service.ts`, `knowledge-service.ts` and the Recall tool used to carry these
 	// four capabilities between them; they no longer do.
-	"server/services/search/sqlite-store.ts": ["driver", "handle", "rowid", "fts5"],
+	"server/services/search/sqlite-store.ts": ["rowid", "fts5"],
 	"server/services/snapshot-capture-receipts.ts": ["nativeClient", "pragma"],
 	"server/services/storage-scan-queries.ts": [
 		"driver",

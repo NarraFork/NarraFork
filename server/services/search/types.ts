@@ -43,6 +43,9 @@ export interface SearchViewer {
  */
 export type SearchStrategy = "index" | "substring";
 
+/** Candidate ordering must be applied before limiting the result set. */
+export type SearchSort = "time" | "relevance";
+
 /**
  * Backend-reported relevance for a row, lower being a better match.
  *
@@ -134,6 +137,8 @@ export const PREVIEW_CHARS = 240;
  * content the viewer may not read.
  */
 export interface EntitySearchQuery {
+	signal?: AbortSignal;
+	sort?: SearchSort;
 	text: string;
 	strategy: SearchStrategy;
 	limit: number;
@@ -147,6 +152,7 @@ export interface EntitySearchQuery {
  * single-narrator behaviour exactly.
  */
 export interface TimelineSearchQuery {
+	signal?: AbortSignal;
 	narratorId: string;
 	text: string;
 	strategy: SearchStrategy;
@@ -162,6 +168,7 @@ export interface TimelineSearchQuery {
  * inclusive ISO bounds.
  */
 export interface RecallSearchQuery {
+	signal?: AbortSignal;
 	text: string;
 	strategy: SearchStrategy;
 	limit: number;
@@ -185,6 +192,8 @@ export type KnowledgeMatchMode = "and" | "or";
  * means "match every row", which is how the knowledge UI lists recent entries.
  */
 export interface KnowledgeSearchQuery {
+	signal?: AbortSignal;
+	sort?: SearchSort;
 	indexText: string;
 	substringText: string;
 	strategy: SearchStrategy;
@@ -215,6 +224,7 @@ export interface KnowledgeDraftSearchQuery extends KnowledgeSearchQuery {
 
 /** Which entries one author currently shadows with a draft. */
 export interface ShadowedEntryQuery {
+	signal?: AbortSignal;
 	authorUserId: string;
 	draftStatus: string;
 	limit: number;

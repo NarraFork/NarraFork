@@ -11,6 +11,12 @@ import { getTestDb } from "../../setup";
 const { db, sqlite } = getTestDb();
 mock.module("../../../server/db", () => ({ db, sqlite }));
 
+const { createSqliteSearchStore } = await import("../../../server/services/search/sqlite-store");
+const searchStore = createSqliteSearchStore(async (sql, params) =>
+	sqlite.prepare<Record<string, unknown>, Array<string | number | null>>(sql).all(...params),
+);
+mock.module("../../../server/services/search/backend", () => ({ searchStore }));
+
 // The FTS virtual table + sync triggers are created at runtime (not via
 // migrations), so mirror production init here before exercising the FTS path.
 const { ensureFts } = await import("../../../server/db/fts");

@@ -805,6 +805,7 @@ const ACTIVE_DRAFT_STATUS = "active";
 const DRAFT_SHADOW_MAX = 200;
 
 type SearchOpts = {
+	signal?: AbortSignal;
 	q?: string;
 	collectionId?: string;
 	/** Restrict to collections in this project PLUS global (project_id IS NULL) collections. */
@@ -812,6 +813,7 @@ type SearchOpts = {
 	tag?: string;
 	limit?: number;
 	match?: "and" | "or";
+	sort?: "time" | "relevance";
 	/** Restrict the FTS match to a single column (e.g. "current_keywords" for passive injection). */
 	field?: string;
 	/** When set, the caller's own active drafts shadow the main version (working-copy view). */
@@ -826,14 +828,15 @@ type SearchOpts = {
  * FTS operator still matches literally there. Deriving both in one place keeps that
  * distinction from being re-decided (differently) in each branch.
  *
- * The substring path also takes a TIGHTER limit, because it is unindexed and runs on the main
- * thread — an unbounded contains-scan is exactly the shape the performance rules forbid.
+ * The substring path keeps a tighter result limit because contains-matches can be broad.
+ * SQLite executes the scan in a read worker; the limit bounds the transferred results.
  */
 function searchNeedles(opts: SearchOpts, limit: number) {
 	const raw = (opts.q ?? "").trim();
 	const safe = sanitizeQuery(raw);
 	const strategy: SearchStrategy = canUseIndex(safe) ? "index" : "substring";
 	return {
+		signal: opts.signal,
 		indexText: safe,
 		substringText: raw,
 		strategy,
@@ -849,6 +852,7 @@ async function searchMain(
 ): Promise<KnowledgeSearchRow[]> {
 	return searchStore.searchKnowledgeEntries({
 		...searchNeedles(opts, limit),
+		sort: opts.sort,
 		collectionId: opts.collectionId,
 		projectId: opts.projectId,
 		match: opts.match ?? "and",
@@ -866,6 +870,7 @@ async function searchDrafts(
 ): Promise<KnowledgeSearchRow[]> {
 	return searchStore.searchKnowledgeDrafts({
 		...searchNeedles(opts, limit),
+		sort: opts.sort,
 		collectionId: opts.collectionId,
 		projectId: opts.projectId,
 		match: opts.match ?? "and",
@@ -1031,6 +1036,7 @@ async function search(opts: SearchOpts) {
 	// set (their draft entry ids) is excluded from the main search and supplied by the draft
 	// search instead — the two sets are identical, so the results never overlap (no dedup).
 	const shadowedEntryIds = await searchStore.listShadowedEntryIds({
+		signal: opts.signal,
 		authorUserId: opts.draftUserId,
 		draftStatus: ACTIVE_DRAFT_STATUS,
 		limit: DRAFT_SHADOW_MAX,
@@ -1049,8 +1055,16 @@ async function search(opts: SearchOpts) {
 	const draftRows = await searchDrafts(opts, opts.draftUserId, limit);
 	const mainRows = await searchMain(opts, limit, shadowedEntryIds);
 
-	// Draft hits first, then main hits; truncate to the caller's limit.
-	const mapped = [...draftRows, ...mainRows].map(mapRow);
+	// Relevance preserves draft-first ordering. Recency must merge both bounded,
+	// time-ordered result sets before truncating, or old drafts crowd out newer main hits.
+	const merged = [...draftRows, ...mainRows];
+	if (opts.sort === "time") {
+		merged.sort((a, b) => {
+			const time = b.updatedAt.localeCompare(a.updatedAt);
+			return time || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+		});
+	}
+	const mapped = merged.map(mapRow);
 	const tag = opts.tag;
 	const filtered = tag ? mapped.filter((r) => r.tags.includes(tag)) : mapped;
 	return filtered.slice(0, limit);

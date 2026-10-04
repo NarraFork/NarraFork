@@ -1,7 +1,6 @@
 import {
 	Alert,
 	Badge,
-	Button,
 	Card,
 	Group,
 	Loader,
@@ -12,7 +11,7 @@ import {
 	Title,
 } from "@mantine/core";
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { useSearch } from "../hooks/useSearch";
 import { formatSmartTime } from "../lib/format";
@@ -23,6 +22,7 @@ import {
 	normalizeSearchSort,
 	normalizeSearchType,
 	type SearchSortMode,
+	sortVisibleSearchResults,
 	summarizeSearchRuntimeState,
 } from "../lib/search-utils";
 
@@ -98,40 +98,18 @@ export const Route = createFileRoute("/search")({
 function SearchPage() {
 	const { q, type = "all", sort = DEFAULT_SEARCH_SORT } = Route.useSearch();
 	const navigate = Route.useNavigate();
-	const [forceSearch, setForceSearch] = useState(false);
-	const { data, isLoading, isShortQuery } = useSearch(
-		q ?? "",
-		"chapters,messages,narrators,knowledge",
-		forceSearch,
-	);
+	const { data, isLoading } = useSearch(q ?? "", "chapters,messages,narrators,knowledge", sort);
 	const { t } = useTranslation("search");
 	const searchRuntimeStatus = useMemo(() => summarizeSearchRuntimeState(data), [data]);
 	const translateSearchEnum = (prefix: string, value: string) =>
 		t(`${prefix}_${value}`, { defaultValue: humanizeEnumValue(value) });
-	const results = useMemo(() => {
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const items = ((data?.results ?? []) as any[]).filter((result) =>
-			type === "all" ? true : result.type === type,
-		);
-		if (sort === "title") {
-			return items
-				.map((result) => ({
-					result,
-					title: getSearchResultDisplayTitle(result, (id) => t("resultUntitled", { id })),
-				}))
-				.sort((a, b) => a.title.localeCompare(b.title))
-				.map(({ result }) => result);
-		}
-		return [...items].sort((a, b) => {
-			if (sort === "time") {
-				const bTime = Date.parse(b.updatedAt ?? b.createdAt ?? b.lastMessageAt ?? "") || 0;
-				const aTime = Date.parse(a.updatedAt ?? a.createdAt ?? a.lastMessageAt ?? "") || 0;
-				return bTime - aTime;
-			}
-			if (sort === "type") return String(a.type).localeCompare(String(b.type));
-			return (b.matchScore ?? 0) - (a.matchScore ?? 0);
-		});
-	}, [data?.results, type, sort, t]);
+	const results = useMemo(
+		() =>
+			sortVisibleSearchResults(data?.results ?? [], normalizeSearchType(type), sort, (id) =>
+				t("resultUntitled", { id }),
+			),
+		[data?.results, type, sort, t],
+	);
 	const counts = useMemo(() => {
 		return ((data?.results ?? []) as Array<{ type?: string }>).reduce(
 			(acc, result) => {
@@ -177,12 +155,6 @@ function SearchPage() {
 		[displayedResults, t],
 	);
 	const hiddenResultCount = results.length - displayedResults.length;
-
-	// Reset force when query changes
-	// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally reset on q change
-	useEffect(() => {
-		setForceSearch(false);
-	}, [q]);
 
 	return (
 		<Stack>
@@ -256,16 +228,7 @@ function SearchPage() {
 				</Group>
 			) : null}
 
-			{isShortQuery && !forceSearch ? (
-				<Alert color="yellow" radius="md">
-					<Group>
-						<Text size="sm">{t("shortQueryHint")}</Text>
-						<Button size="xs" variant="light" onClick={() => setForceSearch(true)}>
-							{t("searchAnyway")}
-						</Button>
-					</Group>
-				</Alert>
-			) : isLoading ? (
+			{isLoading ? (
 				<Loader />
 			) : !data?.results?.length ? (
 				<Text c="dimmed">{q ? t("noResults") : t("enterQuery")}</Text>

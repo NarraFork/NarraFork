@@ -628,6 +628,9 @@ async function dispatch(
 				s.pending.delete(requestId);
 				releaseWorker(worker);
 				settleReject(new Error("database read task aborted"));
+				// Cancellation may have happened while this worker was starting. Wake callers
+				// that queued behind its startup reservation now that the worker is idle.
+				drainQueue();
 				return;
 			}
 			options.signal.addEventListener(
