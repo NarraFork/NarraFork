@@ -1,33 +1,8 @@
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
+import { getSettingsNavGroups, type SettingsNavItem } from "@frontend/lib/settings-nav";
 import { Alert, Box, NavLink, Text } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
-import {
-	IconApps,
-	IconBell,
-	IconBox,
-	IconBrain,
-	IconChevronRight,
-	IconCloud,
-	IconCpu,
-	IconDatabase,
-	IconInfoCircle,
-	IconKey,
-	IconPalette,
-	IconPlayerPlay,
-	IconPlugConnected,
-	IconPuzzle,
-	IconReceipt2,
-	IconRoute,
-	IconSearch,
-	IconServer,
-	IconShield,
-	IconShieldLock,
-	IconSitemap,
-	IconTerminal2,
-	IconUser,
-	IconUsers,
-	IconWand,
-} from "@tabler/icons-react";
+import { IconChevronRight, IconShieldLock, IconWand } from "@tabler/icons-react";
 import { createFileRoute, Link, Navigate } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
@@ -56,138 +31,41 @@ function MobileSettingsNav() {
 		window.dispatchEvent(new CustomEvent("narrafork:open-wizard"));
 	};
 
-	const personalItems = [
-		{ to: "/settings/profile", label: t("profileSection"), icon: <IconUser size={20} /> },
-		{ to: "/settings/security", label: t("securitySection"), icon: <IconShieldLock size={20} /> },
-		{
-			to: "/settings/integrations",
-			label: t("integrationsSection"),
-			icon: <IconRoute size={20} />,
-		},
-		{
-			to: "/settings/connected-apps",
-			label: t("connectedAppsSection"),
-			icon: <IconPlugConnected size={20} />,
-		},
-		{
-			to: "/settings/notifications",
-			label: t("notificationSection"),
-			icon: <IconBell size={20} />,
-		},
-		{
-			to: "/settings/appearance",
-			label: t("appearanceSection"),
-			icon: <IconPalette size={20} />,
-		},
-		// Plugins are visible to all users: the page lists plugins and lets anyone
-		// install/manage theme-only ones (server enforces admin for other tiers).
-		{ to: "/settings/plugins", label: t("pluginsSection"), icon: <IconPuzzle size={20} /> },
-	];
+	// Shared with the desktop sidebar (`routes/settings.tsx`). This list used to be
+	// a second hand-maintained copy and silently dropped gateway / devices /
+	// execution-log; both surfaces must render from `settings-nav`.
+	const { personal, enhancements, instance } = getSettingsNavGroups();
 
-	// Grammar caching was missing from this list entirely, so on a phone the page could not
-	// be reached at all — the sidebar it lived in is hidden below `sm`.
-	const enhancementItems = [
-		{ to: "/settings/grammars", label: t("grammarsSection"), icon: <IconSitemap size={20} /> },
-	];
-
-	const instanceItems = [
-		{ to: "/settings/providers", label: t("providersSection"), icon: <IconCloud size={20} /> },
-		{ to: "/settings/models", label: t("modelsSection"), icon: <IconCpu size={20} /> },
-		{ to: "/settings/agent", label: t("agentSection"), icon: <IconBrain size={20} /> },
-		{ to: "/settings/search", label: t("searchSection"), icon: <IconSearch size={20} /> },
-		{
-			to: "/settings/proxy",
-			label: t("proxyManagementSection"),
-			icon: <IconShield size={20} />,
-		},
-		{
-			to: "/settings/chapters",
-			label: t("chaptersAndContainersSection"),
-			icon: <IconBox size={20} />,
-		},
-		{
-			to: "/settings/server",
-			label: t("serverAndSystemSection"),
-			icon: <IconServer size={20} />,
-		},
-		{
-			to: "/settings/authentication",
-			label: t("authenticationSection"),
-			icon: <IconKey size={20} />,
-		},
-		{
-			to: "/settings/oauth-apps",
-			label: t("oauthAppsSection"),
-			icon: <IconApps size={20} />,
-		},
-		{ to: "/settings/users", label: t("usersSection"), icon: <IconUsers size={20} /> },
-		{
-			to: "/settings/terminals",
-			label: t("terminalsSection"),
-			icon: <IconTerminal2 size={20} />,
-		},
-		{ to: "/settings/storage", label: t("storageSection"), icon: <IconDatabase size={20} /> },
-		{
-			to: "/settings/runtime",
-			label: t("runtimeSection"),
-			icon: <IconPlayerPlay size={20} />,
-		},
-		{ to: "/settings/usage", label: t("usageSection"), icon: <IconReceipt2 size={20} /> },
-		{
-			to: "/settings/about",
-			label: t("versionSection"),
-			icon: <IconInfoCircle size={20} />,
-		},
-	];
+	const renderNavItem = (item: SettingsNavItem) => (
+		<NavLink
+			key={item.to}
+			component={Link}
+			to={item.to}
+			label={t(item.labelKey)}
+			leftSection={<item.Icon size={20} />}
+			rightSection={<IconChevronRight size={16} stroke={1.5} />}
+			variant="subtle"
+		/>
+	);
 
 	return (
 		<Box px="xs" py="sm">
 			<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pb={4}>
 				{t("personalGroup")}
 			</Text>
-			{personalItems.map((item) => (
-				<NavLink
-					key={item.to}
-					component={Link}
-					to={item.to}
-					label={item.label}
-					leftSection={item.icon}
-					rightSection={<IconChevronRight size={16} stroke={1.5} />}
-					variant="subtle"
-				/>
-			))}
+			{personal.map(renderNavItem)}
 
 			<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
 				{t("enhancementsGroup")}
 			</Text>
-			{enhancementItems.map((item) => (
-				<NavLink
-					key={item.to}
-					component={Link}
-					to={item.to}
-					label={item.label}
-					leftSection={item.icon}
-					rightSection={<IconChevronRight size={16} stroke={1.5} />}
-					variant="subtle"
-				/>
-			))}
+			{enhancements.map(renderNavItem)}
 
 			{isAdmin && (
 				<>
 					<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
 						{t("instanceGroup")}
 					</Text>
-					{instanceItems.map((item) => (
-						<NavLink
-							key={item.to}
-							component={Link}
-							to={item.to}
-							label={item.label}
-							leftSection={item.icon}
-							rightSection={<IconChevronRight size={16} stroke={1.5} />}
-							variant="subtle"
-						/>
-					))}
+					{instance.map(renderNavItem)}
 					<NavLink
 						label={t("wizardReopen")}
 						leftSection={<IconWand size={20} />}
