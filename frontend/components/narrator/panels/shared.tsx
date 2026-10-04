@@ -8,6 +8,7 @@ import type { IDockviewPanelProps } from "dockview-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { type PanelDragSubjectKind, startPanelDrag } from "../../../lib/panel-drag";
 import { useDockviewSurfaceId } from "../../dockview";
+import { usePanelHeaderControls } from "./panel-header-controls";
 
 /** Width (px) below which a chat panel should use its compact toolbar layout. */
 export const COMPACT_WIDTH_THRESHOLD = 640;
@@ -113,11 +114,13 @@ export function usePanelHeaderDrag(
 	// Stamped onto the drag so a surface receiving the drop can tell "my own panel
 	// being rearranged" from "a panel belonging to another surface" — panel ids are
 	// global, so without it a foreign id would resolve against the wrong api.
+	const controls = usePanelHeaderControls();
 	const surfaceId = useDockviewSurfaceId();
 	const toolKind = detach?.toolKind;
 	const resourceId = detach?.resourceId;
 	return useCallback(
 		(e: React.PointerEvent) => {
+			if (controls?.onPointerDown?.(e)) return;
 			startPanelDrag({
 				panelId: props.api.id,
 				id: subjectId,
@@ -131,6 +134,6 @@ export function usePanelHeaderDrag(
 				y: e.clientY,
 			});
 		},
-		[props.api, subjectId, subjectKind, surfaceId, toolKind, resourceId],
+		[controls, props.api, subjectId, subjectKind, surfaceId, toolKind, resourceId],
 	);
 }

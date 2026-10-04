@@ -8,7 +8,7 @@ import {
 	type SerializedDockview,
 } from "dockview-react";
 import { parseHTML } from "linkedom";
-import { act, useEffect, useState } from "react";
+import { act, type ReactNode, useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import type { PluginContributionPick } from "../../plugins/PluginContributionPicker";
 import { DEFAULT_DIRECTOR_STATE, serializeWorkspaceLayout } from "./dockview-layout";
@@ -176,6 +176,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+	store.disposeTemporaryResourceChrome();
 	for (const disposable of disposables) disposable.dispose();
 	await act(async () => root.unmount());
 	container.remove();
@@ -344,7 +345,25 @@ describe("real workspace Dockview resource lifecycle", () => {
 		}
 		expect(layoutEvents).toBeGreaterThan(events);
 		expect(store.getTemporaryPanelIds().size).toBe(5);
-		expect(api.toJSON().floatingGroups).toHaveLength(1);
+		expect(api.toJSON().floatingGroups).toHaveLength(5);
+		expect(
+			new Set(
+				api.panels.filter((panel) => store.isTemporary(panel.id)).map((panel) => panel.group.id),
+			).size,
+		).toBe(5);
+		for (const panel of api.panels.filter((panel) => store.isTemporary(panel.id))) {
+			expect(panel.group.panels).toEqual([panel]);
+			expect(panel.group.header.hidden).toBe(true);
+			// Each native group still owns its renderer; only the current managed
+			// preview is exposed above the workspace, without unmounting siblings.
+			expect(panel.api.isVisible).toBe(true);
+			expect(store.isActivePreview(panel.id)).toBe(panel === api.activePanel);
+			expect(
+				panel.group.element
+					.closest(".dv-resize-container")
+					?.classList.contains("workspace-resource-inactive-preview"),
+			).toBe(panel !== api.activePanel);
+		}
 		expect(reveals).toBe(0);
 		for (let index = 0; index < count; index++)
 			expect(api.getPanel(`n${index}`)?.api.isVisible).toBe(true);
@@ -369,6 +388,7 @@ describe("real workspace Dockview resource lifecycle", () => {
 		expect(cleanups.get(id) ?? 0).toBe(0);
 		expect(store.isTemporary(id)).toBe(false);
 		expect(panel?.group).toBe(target.group);
+		expect(panel?.group.header.hidden).toBe(false);
 		expect(gridSizes()).toEqual(before);
 		expect(api.getPanel("n0")?.api.isVisible).toBe(true);
 		expect(reveals).toBeGreaterThan(0);
@@ -383,26 +403,116 @@ describe("real workspace Dockview resource lifecycle", () => {
 		expect(content(id)).toBe(node);
 	});
 
-	test("one narrator group refuses implicit pin; only explicit createSplit adds a grid group", async () => {
+	test("single grid slot pins directly into a right split without replacing the resource", async () => {
 		await mountWorkspace(1);
 		await change(() => store.openToolPanel("n0", "terminal", null));
 		const id = workspaceToolPanelId("n0", "terminal");
-		const panel = api.getPanel(id);
+		const panel = requiredPanel(id);
 		const node = content(id);
-		const before = gridSizes();
+		const source = requiredPanel("n0");
 		expect(store.getPinTargets(id)).toEqual([]);
-		expect(store.canCreateResourceSplit(id)).toBe(true);
-		await change(() => expect(store.pinResource(id)).toBe(false));
-		expect(gridSizes()).toEqual(before);
-		expect(store.isTemporary(id)).toBe(true);
-		expect(reveals).toBe(0);
-		await change(() => expect(store.pinResource(id, undefined, true)).toBe(true));
+		expect(store.hasSingleGridSlot()).toBe(true);
+		expect(store.canPinResource(id)).toBe(true);
+		expect(panel.group.header.hidden).toBe(true);
+		await change(() => expect(store.pinResource(id)).toBe(true));
 		expect(gridSizes()).toHaveLength(2);
+		expect(store.hasSingleGridSlot()).toBe(false);
 		expect(api.getPanel(id)).toBe(panel);
 		expect(content(id)).toBe(node);
 		expect(mounts.get(id)).toBe(1);
-		expect(api.getPanel("n0")?.api.isVisible).toBe(true);
+		expect(cleanups.get(id) ?? 0).toBe(0);
+		expect(source.api.isVisible).toBe(true);
+		expect(panel.group).not.toBe(source.group);
+		expect(panel.group.api.location.type).toBe("grid");
+		expect(panel.group.header.hidden).toBe(false);
+		expect(panel.group.element.getBoundingClientRect().left).toBeGreaterThan(
+			source.group.element.getBoundingClientRect().left,
+		);
 		expect(store.isTemporary(id)).toBe(false);
+		expect(store.canPinResource(id)).toBe(false);
+		expect(reveals).toBe(1);
+	});
+
+	test.each([
+		"durable",
+		"temporary",
+	] as const)("mixed floating group with %s restores native tabs instead of hiding other members", async (kind) => {
+		await mountWorkspace();
+		await change(() => store.openToolPanel("n0", "terminal", null));
+		const id = workspaceToolPanelId("n0", "terminal");
+		const resource = requiredPanel(id);
+		const group = resource.group;
+		expect(group.header.hidden).toBe(true);
+		if (kind === "temporary") await change(() => store.openFilePanel("n0", "/repo/mixed.ts"));
+		const companion =
+			kind === "durable"
+				? requiredPanel("n0")
+				: requiredPanel(workspaceFilePanelId("n0", "/repo/mixed.ts"));
+		await change(() => companion.api.moveTo({ group, position: "center" }));
+		expect(group.panels).toContain(resource);
+		expect(group.panels).toContain(companion);
+		expect(group.header.hidden).toBe(false);
+		expect(store.isManagedPreview(id)).toBe(false);
+		expect(group.element.classList.contains("workspace-resource-floating-group")).toBe(false);
+		expect(
+			api.toJSON().floatingGroups?.find((entry) => entry.data?.id === group.id)?.data?.hideHeader ??
+				false,
+		).toBe(false);
+		if (kind === "durable") {
+			const saved = serializedLayout();
+			const savedGroup = saved.floatingGroups?.find((entry) => entry.data?.views.includes("n0"));
+			expect(savedGroup?.data?.views).toEqual(["n0"]);
+			expect(savedGroup?.data?.hideHeader ?? false).toBe(false);
+			await change(() => api.fromJSON(saved));
+			expect(requiredPanel("n0").group.header.hidden).toBe(false);
+			expect(requiredPanel("n0").api.isVisible).toBe(true);
+		}
+	});
+
+	test.each([
+		"active",
+		"pin",
+		"close",
+	] as const)("temporary capture/restore retains %s preview state without resurrecting hidden resources", async (action) => {
+		await mountWorkspace();
+		await change(() => {
+			store.openToolPanel("n0", "terminal", null);
+			store.openToolPanel("n0", "browser", null);
+		});
+		const a = workspaceToolPanelId("n0", "terminal");
+		const b = workspaceToolPanelId("n0", "browser");
+		expect(store.isActivePreview(a)).toBe(false);
+		expect(store.isActivePreview(b)).toBe(true);
+		if (action === "pin") await change(() => store.pinResource(b));
+		else if (action === "close") await change(() => requiredPanel(b).api.close());
+		const captured = store.captureTemporaryResources();
+		expect(captured.filter((entry) => entry.wasActive).map((entry) => entry.id)).toEqual(
+			action === "active" ? [b] : [],
+		);
+		const saved = serializedLayout();
+		await change(() => api.fromJSON(saved));
+		await change(() => store.restoreTemporaryResources(captured));
+		expect(store.isActivePreview(a)).toBe(false);
+		expect(store.isActivePreview(b)).toBe(action === "active");
+		expect(
+			requiredPanel(a)
+				.group.element.closest(".dv-resize-container")
+				?.classList.contains("workspace-resource-inactive-preview"),
+		).toBe(true);
+		const restored = requiredPanel(a);
+		const restoredNode = content(a);
+		await change(() => {
+			if (action === "close") store.toggleToolPanel("n0", "terminal", null);
+			else store.openToolPanel("n0", "terminal", null);
+		});
+		expect(requiredPanel(a)).toBe(restored);
+		expect(content(a)).toBe(restoredNode);
+		expect(store.isActivePreview(a)).toBe(true);
+		expect(
+			requiredPanel(a)
+				.group.element.closest(".dv-resize-container")
+				?.classList.contains("workspace-resource-inactive-preview"),
+		).toBe(false);
 	});
 
 	test("native drag into a grid reconciles as pin without replacing the renderer", async () => {
@@ -437,6 +547,12 @@ describe("real workspace Dockview resource lifecycle", () => {
 		});
 		expect(api.panels).toHaveLength(12);
 		expect(store.getTemporaryPanelIds().size).toBe(10);
+		expect(api.toJSON().floatingGroups).toHaveLength(10);
+		expect(
+			new Set(
+				api.panels.filter((panel) => store.isTemporary(panel.id)).map((panel) => panel.group.id),
+			).size,
+		).toBe(10);
 		const panels = [...api.panels];
 		for (const owner of ["n0", "n1"]) {
 			const owned = panels.filter(
@@ -859,6 +975,9 @@ describe("real workspace Dockview resource lifecycle", () => {
 		mock.module("../browser/WebviewPanel", () => ({ WebviewPanel: () => null }));
 		mock.module("../../plugins/PluginDockPanel", () => ({ PluginDockPanel: ResourceWrapper }));
 		mock.module("../dock/panels", () => ({
+			// This unit test only measures adapter/leaf lifetime. The browser suite
+			// separately mounts the real ToolPanelShell/header/drag implementation.
+			ToolPanelShell: ({ children }: { children: ReactNode }) => <>{children}</>,
 			BrowserDockPanel: ResourceWrapper,
 			DetailsDockPanel: ResourceWrapper,
 			FileModDockPanel: ResourceWrapper,

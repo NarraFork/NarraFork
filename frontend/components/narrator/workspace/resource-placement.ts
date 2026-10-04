@@ -258,3 +258,13 @@ export function resourceSplitDirection(
 ): ResourceSplitPlacement["direction"] | null {
 	return computeResourceSplitPlacement(source, options)?.direction ?? null;
 }
+
+/** Default preview is a non-modal right drawer, not a centered small window. */
+export function resourceDrawerBounds(width: number, height: number) {
+	if (!validSize({ width, height })) return null;
+	return {
+		position: { right: 0, top: 0 } as const,
+		width: Math.min(RESOURCE_FLOATING_SIZE.width, width),
+		height,
+	};
+}

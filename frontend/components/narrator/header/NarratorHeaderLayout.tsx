@@ -6,6 +6,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { usePanelHeaderControls } from "../panels/panel-header-controls";
 import {
 	HEADER_LEADING_GAP_PX,
 	HEADER_ROW_PADDING_PX,
@@ -20,7 +21,7 @@ export type NarratorHeaderLayoutSnapshot = Pick<
 	"titleWidth" | "visibleToolCount" | "unmeasured"
 >;
 
-type Props = Omit<HeaderAfterTitleInput, "rowWidth"> & {
+type Props = Omit<HeaderAfterTitleInput, "rowWidth" | "showPin"> & {
 	children: (layout: NarratorHeaderLayoutSnapshot) => ReactNode;
 	onHeaderPointerDown?: (event: PointerEvent<HTMLDivElement>) => void;
 };
@@ -55,6 +56,11 @@ export function NarratorHeaderLayout({
 	onHeaderPointerDown,
 	children,
 }: Props) {
+	const controls = usePanelHeaderControls();
+	const showPin = showClose && !!controls?.pinAction;
+	// Dock adapters already consume host gestures in usePanelHeaderDrag. Only
+	// fall back to the host callback when no adapter supplied a drag handler.
+	const handleHeaderPointerDown = onHeaderPointerDown ?? controls?.onPointerDown;
 	const rowRef = useRef<HTMLDivElement>(null);
 	const lastWidth = useRef(0);
 	const [layout, setLayout] = useState(() =>
@@ -65,6 +71,7 @@ export function NarratorHeaderLayout({
 			showBack,
 			showTitleActions,
 			showClose,
+			showPin,
 		}),
 	);
 	const published = useRef(layout);
@@ -80,11 +87,12 @@ export function NarratorHeaderLayout({
 			showBack,
 			showTitleActions,
 			showClose,
+			showPin,
 		});
 		if (sameLayout(published.current, next)) return;
 		published.current = next;
 		setLayout(next);
-	}, [titleFullWidth, surfacedToolCount, showBack, showTitleActions, showClose]);
+	}, [titleFullWidth, surfacedToolCount, showBack, showTitleActions, showClose, showPin]);
 
 	useLayoutEffect(() => {
 		const row = rowRef.current;
@@ -115,7 +123,7 @@ export function NarratorHeaderLayout({
 		<div
 			ref={rowRef}
 			data-narrator-header-layout
-			className={onHeaderPointerDown ? "nf-panel-header" : undefined}
+			className={handleHeaderPointerDown ? "nf-panel-header" : undefined}
 			style={{
 				display: "flex",
 				alignItems: "center",
@@ -125,14 +133,14 @@ export function NarratorHeaderLayout({
 				borderBottom: "1px solid var(--mantine-color-default-border)",
 				flexShrink: 0,
 				overflow: "hidden",
-				cursor: onHeaderPointerDown ? "grab" : undefined,
+				cursor: handleHeaderPointerDown ? "grab" : undefined,
 			}}
 			onPointerDown={
-				onHeaderPointerDown
+				handleHeaderPointerDown
 					? (event) => {
 							const target = event.target as HTMLElement;
 							if (target.closest("button, a, input, select, textarea, [role='button']")) return;
-							onHeaderPointerDown(event);
+							handleHeaderPointerDown(event);
 						}
 					: undefined
 			}
