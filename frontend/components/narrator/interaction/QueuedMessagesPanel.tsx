@@ -23,7 +23,7 @@ export interface QueuedMessagesData {
 	editingQueuedId: string | null;
 	handleDragEndQueued: (event: DragEndEvent) => void;
 	handleMoveQueued: (id: string, direction: -1 | 1) => void;
-	handleChangeMode: (id: string, mode: QueueMode) => Promise<void>;
+	handleChangeMode: (id: string, mode: QueueMode) => Promise<boolean> | Promise<void>;
 	handleSaveEditQueued: (
 		msg: BufferMessageSummary,
 		text: string,

@@ -32,7 +32,10 @@ import { notifications } from "@mantine/notifications";
 import type { FileReference } from "@shared/file-reference";
 import { isTextFile, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
 import {
+	IconArrowForwardUp,
+	IconBolt,
 	IconCheck,
+	IconClock,
 	IconDotsVertical,
 	IconFile,
 	IconGripVertical,
@@ -98,7 +101,8 @@ export interface QueuedMessageRowProps {
 	showAuthor?: boolean;
 	canMoveUp?: boolean;
 	canMoveDown?: boolean;
-	onChangeMode: (id: string, mode: QueueMode) => Promise<void>;
+	/** false rejects the action; void remains compatible with external row hosts. */
+	onChangeMode: (id: string, mode: QueueMode) => Promise<boolean> | Promise<void>;
 	onMove: (id: string, direction: -1 | 1) => void;
 	onClearAll?: () => void;
 }
@@ -195,9 +199,50 @@ export function QueuedMessageRow({
 	const failed = msg.state === "failed";
 	const [retrying, setRetrying] = useState(false);
 	const retryingRef = useRef(false);
+	const [changingMode, setChangingMode] = useState<QueueMode | null>(null);
+	const changingModeRef = useRef(false);
+	const [urgentRequested, setUrgentRequested] = useState(false);
+	const urgentRequestedRef = useRef(false);
+	const urgentCommitted = mode === "interrupt" || urgentRequested;
+	const nextMode = mode === "turn" ? "tool" : "turn";
+	const toggleLabel = t(mode === "turn" ? "queuedSwitchToGuidance" : "queuedSwitchToNextStep");
+	const urgentLabel = t(
+		urgentCommitted && !failed ? "queuedUrgentRequested" : "queuedSendUrgently",
+	);
+	const changeMode = async (next: QueueMode) => {
+		if (
+			changingModeRef.current ||
+			retryingRef.current ||
+			urgentRequestedRef.current ||
+			mode === "interrupt" ||
+			isEditing ||
+			(next === "interrupt" && failed)
+		)
+			return;
+		changingModeRef.current = true;
+		setChangingMode(next);
+		try {
+			const accepted = await onChangeMode(msg.id, next);
+			if (accepted !== false && next === "interrupt") {
+				// Lock immediately after acceptance, even before the authoritative WS
+				// snapshot removes the row or changes its mode. Urgent cannot be undone.
+				urgentRequestedRef.current = true;
+				setUrgentRequested(true);
+			}
+		} catch (error) {
+			notifications.show({
+				color: "red",
+				title: t("queuedModeFailed"),
+				message: error instanceof Error ? error.message : String(error),
+			});
+		} finally {
+			changingModeRef.current = false;
+			setChangingMode(null);
+		}
+	};
 	const [retryError, setRetryError] = useState<string | null>(null);
 	const retry = async () => {
-		if (retryingRef.current || !failed) return;
+		if (retryingRef.current || changingModeRef.current || !failed) return;
 		retryingRef.current = true;
 		setRetrying(true);
 		setRetryError(null);
@@ -514,19 +559,52 @@ export function QueuedMessageRow({
 						color="red"
 						variant="light"
 						loading={retrying}
-						disabled={retrying}
+						disabled={retrying || changingMode !== null}
 						onClick={() => void retry()}
 					>
 						{t("queuedRetry")}
 					</Button>
 				)}
+				{!urgentCommitted && (
+					<Tooltip label={toggleLabel} withinPortal>
+						<ActionIcon
+							size="sm"
+							variant="subtle"
+							color={mode === "turn" ? "indigo" : "gray"}
+							aria-label={toggleLabel}
+							disabled={retrying || changingMode !== null}
+							loading={changingMode !== null && changingMode !== "interrupt"}
+							onClick={() => void changeMode(nextMode)}
+						>
+							{mode === "turn" ? <IconArrowForwardUp size={14} /> : <IconClock size={14} />}
+						</ActionIcon>
+					</Tooltip>
+				)}
+				<Tooltip
+					label={urgentCommitted ? urgentLabel : `${urgentLabel}. ${t("queuedInterruptWarning")}`}
+					withinPortal
+					multiline
+					maw={260}
+				>
+					<ActionIcon
+						size="sm"
+						variant="subtle"
+						color="orange"
+						aria-label={urgentLabel}
+						disabled={failed || retrying || changingMode !== null || urgentCommitted}
+						loading={changingMode === "interrupt"}
+						onClick={() => void changeMode("interrupt")}
+					>
+						<IconBolt size={14} />
+					</ActionIcon>
+				</Tooltip>
 				<Menu withinPortal position="top-end">
 					<Menu.Target>
 						<ActionIcon
 							size="sm"
 							variant="subtle"
 							color="gray"
-							disabled={retrying}
+							disabled={retrying || changingMode !== null}
 							aria-label={t("queuedActions")}
 						>
 							<IconDotsVertical size={14} />
@@ -536,21 +614,7 @@ export function QueuedMessageRow({
 						<Menu.Item leftSection={<IconPencil size={14} />} onClick={() => onStartEdit(msg)}>
 							{editLabel}
 						</Menu.Item>
-						<Menu.Label>{t("queuedChangeMode")}</Menu.Label>
-						{(["turn", "tool", "interrupt"] as const).map((nextMode) => (
-							<Menu.Item
-								key={nextMode}
-								disabled={mode === nextMode}
-								onClick={() => void onChangeMode(msg.id, nextMode)}
-							>
-								<Text size="sm">{t(`queueMode_${nextMode}`)}</Text>
-								{nextMode === "interrupt" && (
-									<Text size="xs" c="dimmed">
-										{t("queuedInterruptWarning")}
-									</Text>
-								)}
-							</Menu.Item>
-						))}
+
 						{mode === "turn" && (
 							<>
 								<Menu.Divider />

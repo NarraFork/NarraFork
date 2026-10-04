@@ -97,11 +97,30 @@ test("expansion remains user controlled as queue shrinks and grows", async () =>
 test("mode switch and accessible movement call API and refresh authoritative state", async () => {
 	const mode = spyOn(api, "setBufferedMessageMode").mockResolvedValue({ ok: true });
 	const reorder = spyOn(api, "reorderBufferedMessages").mockResolvedValue({ ok: true });
-	await act(async () => actions.handleChangeMode("a", "interrupt"));
+	let accepted: boolean | undefined;
+	await act(async () => {
+		accepted = await actions.handleChangeMode("a", "interrupt");
+	});
+	expect(accepted).toBe(true);
 	expect(mode).toHaveBeenCalledWith("n", "a", "interrupt");
 	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
 	await act(async () => actions.handleMoveQueued("b", -1));
 	expect(reorder).toHaveBeenCalledWith("n", ["b", "guide", "a"]);
+});
+
+test("rejected mode changes do not claim urgent delivery or lose queue data", async () => {
+	spyOn(api, "setBufferedMessageMode").mockRejectedValue(new Error("Message was claimed"));
+	const snapshot = queue;
+	let accepted: boolean | undefined;
+	await act(async () => {
+		accepted = await actions.handleChangeMode("a", "interrupt");
+	});
+	expect(accepted).toBe(false);
+	expect(queue).toBe(snapshot);
+	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
+	expect(notifications.show).toHaveBeenCalledWith(
+		expect.objectContaining({ title: "queuedModeFailed" }),
+	);
 });
 
 test("edit conflict after consumption refreshes state without resurrecting the message", async () => {
