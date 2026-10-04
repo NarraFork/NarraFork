@@ -60,6 +60,46 @@ describe("measureMessageBubble — assistant", () => {
 });
 
 describe("measureMessageBubble — user", () => {
+	it("shrink-wraps short chat Markdown while reserving the exact painted body height", async () => {
+		const { measureMessageBubble, USER_BUBBLE_PADDING } = await import("./measure-message-bubble");
+		const { measureMarkdown } = await import("./measure-markdown");
+		for (const hasHeader of [true, false]) {
+			for (const text of ["hello", "测试消息", "**bold** and `code`", "first\n\nsecond"]) {
+				const bubble = measureMessageBubble(
+					{ role: "user", text, bodyFormat: "markdown", hasHeader },
+					650,
+				);
+				const block = bubble.blocks[0];
+				if (block?.kind !== "fixed") throw new Error("expected Markdown body");
+				const body = block.data?.measured as ReturnType<typeof measureMarkdown>;
+				expect(bubble.usedWidth).toBeLessThan(650);
+				expect(body.contentWidth + 2 * USER_BUBBLE_PADDING).toBe(bubble.usedWidth);
+				expect(body.height).toBeGreaterThan(0);
+				expect(block.height).toBe(measureMarkdown(text, body.contentWidth).height);
+				expect(bubble.frame.contentHeight).toBe(block.height);
+			}
+		}
+	});
+
+	it("keeps a screenshot's width and stacks wrapped Markdown below it", async () => {
+		const { measureMessageBubble, USER_BUBBLE_PADDING } = await import("./measure-message-bubble");
+		const bubble = measureMessageBubble(
+			{
+				role: "user",
+				text: "caption",
+				bodyFormat: "markdown",
+				attachments: [{ type: "image", width: 500, height: 300 }],
+			},
+			650,
+		);
+		const image = bubble.blocks[0];
+		const block = bubble.blocks[1];
+		if (image?.kind !== "fixed" || block?.kind !== "fixed") throw new Error("expected blocks");
+		expect(bubble.usedWidth).toBe(500 + 2 * USER_BUBBLE_PADDING);
+		expect(block.displayWidth).toBe(500);
+		expect(bubble.frame.blocks[1]?.top).toBeGreaterThanOrEqual(image.height);
+	});
+
 	it("chat Markdown reserves the renderer's exact body box alongside quote and attachment", async () => {
 		const { measureMessageBubble, USER_BUBBLE_PADDING, USER_HEADER_HEIGHT, USER_HEADER_BODY_GAP } =
 			await import("./measure-message-bubble");

@@ -455,12 +455,30 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 		// An attachment-only message has no text block at all (an empty pre-wrap block
 		// would still reserve one line, leaving a blank gap under the image).
 		if (input.bodyFormat === "markdown" && input.text.length > 0) {
-			const body = measureMarkdown(input.text, innerWidth);
+			let body = measureMarkdown(input.text, innerWidth);
+			// Paragraph-only chat messages should hug their content, like plain user
+			// turns. A full-column bubble makes self/other alignment indistinguishable.
+			// Keep structural Markdown (tables, code, media, etc.) at the column width.
+			if (body.blocks.every((block) => block.kind === "inline")) {
+				const bodyWidth = Math.min(
+					innerWidth,
+					Math.max(
+						1,
+						Math.ceil(body.usedWidth),
+						input.hasHeader !== false ? USER_HEADER_MIN_CONTENT_WIDTH : 0,
+						hasAttachments ? USER_ATTACHMENT_MIN_CONTENT_WIDTH : 0,
+						...blocks.map((block) => (block.kind === "fixed" ? (block.displayWidth ?? 0) : 0)),
+					),
+				);
+				// Re-measure at the width we actually paint. Rounding a natural width
+				// down can otherwise introduce an extra line outside the reserved box.
+				body = measureMarkdown(input.text, bodyWidth, { preparedBlocks: body.blocks });
+			}
 			blocks.push({
 				kind: "fixed",
 				tag: "user-markdown",
 				height: body.height,
-				displayWidth: innerWidth,
+				displayWidth: body.contentWidth,
 				marginTop: blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP,
 				data: { measured: body },
 				contentLeft: 0,
