@@ -521,12 +521,17 @@ export function resolvePermissionDecision(
 		if (meta) meta.blacklistReason = specError;
 		return "deny";
 	}
-	if (
-		toolName === "Worktree" &&
-		((input.action !== "list" && input.action !== "create") ||
-			(reviewReadOnlyBash && input.action !== "list"))
-	)
-		return "deny";
+	if (toolName === "Worktree") {
+		if (input.action !== "list" && input.action !== "create") {
+			if (meta)
+				meta.blacklistReason = 'Invalid Worktree parameters: action must be "list" or "create".';
+			return "deny";
+		}
+		if (reviewReadOnlyBash && input.action !== "list") {
+			if (meta) meta.blacklistReason = "Review mode: Worktree only supports the list action.";
+			return "deny";
+		}
+	}
 	const compiledPolicy = compiledPolicyForDecision(opts);
 	const context = executionContext ?? compiledPolicy.targetContext;
 	const effectiveMode = planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;

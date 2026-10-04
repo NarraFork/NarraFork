@@ -1964,6 +1964,90 @@ describe("real requireAuth and conjunctive ACL", () => {
 });
 
 describe("backend scope and namespace guards", () => {
+	async function switchWorkspace(cwd: string, expectedRevision: number) {
+		const response = await http("workspace-context/switch", "POST", {
+			expectedRevision,
+			requestId: randomUUID(),
+			target: { deviceId: "local", cwd },
+		});
+		const body = await response.json();
+		expect(response.status, JSON.stringify(body)).toBe(200);
+		expect(body.current.revision).toBe(expectedRevision + 1);
+	}
+
+	test("scoped rollback previews and applies after switching away and back", async () => {
+		const { path } = await fixture();
+		const identity = effects()[0].identityJson;
+		const other = join(workspace, "other");
+		await mkdir(other);
+		await switchWorkspace(other, 0);
+		await switchWorkspace(workspace, 1);
+		const before = history();
+		expect((await prepared()).expectedFileCount).toBe(1);
+		const plan = await actionPrepared("revert_files");
+		const response = await http(`revert-plans/${plan.id}/files`);
+		expect(response.status).toBe(200);
+		const page = await response.json();
+		expect(page.items).toHaveLength(1);
+		expect(page.items[0].identityJson).toEqual(identity);
+		await committed(plan, "revert_files");
+		expect(await readFile(path, "utf8")).toBe("old\n");
+		expect(history()).toBe(before);
+	});
+
+	test("scoped rollback restores writes made in the newly selected workspace", async () => {
+		const previous = workspace;
+		const previousFile = join(previous, "file.txt");
+		await writeFile(previousFile, "previous workspace\n");
+		const selected = join(previous, "selected");
+		await mkdir(selected);
+		await switchWorkspace(selected, 0);
+		try {
+			workspace = selected;
+			const { path } = await fixture();
+			const before = history();
+			const plan = await actionPrepared("revert_files");
+			expect(plan.expectedFileCount).toBe(1);
+			await committed(plan, "revert_files");
+			expect(await readFile(path, "utf8")).toBe("old\n");
+			expect(await readFile(previousFile, "utf8")).toBe("previous workspace\n");
+			expect(history()).toBe(before);
+		} finally {
+			workspace = previous;
+		}
+	});
+
+	test("scoped rollback after switching refuses old files outside the new write boundary", async () => {
+		const { path } = await fixture();
+		const other = join(workspace, "other");
+		await mkdir(other);
+		const sameName = join(other, "file.txt");
+		await writeFile(sameName, "different workspace\n");
+		await switchWorkspace(other, 0);
+		const before = history();
+		await refused(await prepare(), "REVERT_PREVIEW_FILE_ACCESS_DENIED");
+		const response = await actionPreview("revert_files");
+		expect(response.status).toBe(403);
+		expect((await response.json()).code).toBe("REVERT_PREVIEW_FILE_ACCESS_DENIED");
+		expect(await readFile(path, "utf8")).toBe("new\n");
+		expect(await readFile(sameName, "utf8")).toBe("different workspace\n");
+		expect(history()).toBe(before);
+	});
+
+	test("scoped rollback apply rechecks the write boundary after a real workspace switch", async () => {
+		const { path } = await fixture();
+		const plan = await actionPrepared("revert_files");
+		const other = join(workspace, "other");
+		await mkdir(other);
+		await switchWorkspace(other, 0);
+		const before = history();
+		const response = await apply(plan, "revert_files");
+		expect(response.status).toBe(403);
+		expect((await response.json()).code).toBe("REVERT_PREVIEW_FILE_ACCESS_DENIED");
+		expect(await readFile(path, "utf8")).toBe("new\n");
+		expect(history()).toBe(before);
+		expect(journalFiles(plan).every((file) => file.receiptJson === null)).toBe(true);
+	});
 	test("outside cwd is refused without implicit confirmation; configured writable roots allow it", async () => {
 		const outside = await mkdtemp(join(testEnvironment.isolatedHome, "outside-preview-"));
 		restorers.push(() => rm(outside, { recursive: true, force: true }));

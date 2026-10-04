@@ -1,6 +1,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, narratorToolCalls } from "../db/schema";
+import { shouldDisablePlanReflectionReview } from "../lib/agent/tools/plan-mode";
 import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
 import { generateId } from "../lib/id";
 import { addTrait, parseTraits, removeTrait } from "../lib/narrator-utils";
@@ -91,6 +92,7 @@ export interface PlanModeStateResult {
 	changed: boolean;
 	relaxedPlan: boolean;
 	relaxedPlanChanged: boolean;
+	planReflectionDisabled?: boolean;
 }
 
 export interface EnterPlanModeToolResultCommit {
@@ -282,7 +284,7 @@ export async function commitPreparedEnterPlanModeResult(
 						eq(narratorToolCalls.toolUseId, prepared.toolUseId),
 						eq(narratorToolCalls.toolName, "EnterPlanMode"),
 					),
-					columns: { id: true, status: true },
+					columns: { id: true, status: true, inputJson: true },
 				})
 				.sync();
 			if (!toolCall || !["initializing", "pending", "running"].includes(toolCall.status)) {
@@ -310,6 +312,14 @@ export async function commitPreparedEnterPlanModeResult(
 			const completedAt =
 				typeof result.completedAt === "number" ? new Date(result.completedAt).toISOString() : now;
 			const inputOverride = result.brokenInputOverride ?? result.updatedInput;
+			// Read the exact call's effective input, not the shared prepared plan identity.
+			// Commit the override atomically: failed/denied calls must not alter reflection.
+			const effectiveInput = inputOverride ?? toolCall.inputJson;
+			const planReflectionDisabled =
+				typeof effectiveInput === "object" &&
+				effectiveInput !== null &&
+				"disableReflectionReview" in effectiveInput &&
+				shouldDisablePlanReflectionReview(effectiveInput.disableReflectionReview);
 
 			tx.update(narratorToolCalls)
 				.set({
@@ -337,6 +347,7 @@ export async function commitPreparedEnterPlanModeResult(
 					previousPermissionMode,
 					planFileId,
 					relaxedPlan,
+					...(planReflectionDisabled ? { planReflectionAutoApproveOverride: "off" as const } : {}),
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
@@ -352,6 +363,7 @@ export async function commitPreparedEnterPlanModeResult(
 				changed,
 				relaxedPlan,
 				relaxedPlanChanged,
+				planReflectionDisabled,
 			};
 		});
 		// The in-memory identity is consumed only after SQLite commits. A transaction

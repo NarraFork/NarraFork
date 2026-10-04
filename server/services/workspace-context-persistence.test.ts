@@ -1,10 +1,21 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { chapters, narratorBlacklistDirs, narrators, projects, users } from "../db/schema";
+import { ZodError } from "zod";
+import {
+	chapters,
+	narratorBlacklistDirs,
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	projects,
+	users,
+} from "../db/schema";
 import { localBackend, setRemoteBackendResolver } from "../lib/agent/execution/registry";
 import { switchDeviceTool } from "../lib/agent/tools/switch-device";
 import type { ToolContext } from "../lib/agent/types";
@@ -35,7 +46,8 @@ function app(actor: string) {
 					code: error instanceof AppError ? error.code : "TEST_ERROR",
 				}),
 				{
-					status: error instanceof AppError ? error.statusCode : 500,
+					status:
+						error instanceof AppError ? error.statusCode : error instanceof ZodError ? 400 : 500,
 					headers: { "content-type": "application/json" },
 				},
 			),
@@ -47,6 +59,7 @@ let root: string;
 let id: string;
 let owner: string;
 let projectId: string;
+const restorers: (() => void)[] = [];
 beforeEach(async () => {
 	root = await mkdtemp(join(tmpdir(), "workspace-context-persistence-"));
 	await mkdir(join(root, "old"));
@@ -80,7 +93,12 @@ beforeEach(async () => {
 	});
 });
 afterEach(async () => {
+	for (const restore of restorers.splice(0).reverse()) restore();
+	activeNarrators.delete(id);
 	executionPolicyEngine.invalidate(id);
+	await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, id));
+	await db.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, id));
+	await db.delete(narratorMessages).where(eq(narratorMessages.narratorId, id));
 	await db.delete(narrators).where(eq(narrators.id, id));
 	await db.delete(projects).where(eq(projects.id, projectId));
 	await db.delete(users).where(eq(users.id, owner));
@@ -414,5 +432,267 @@ describe("real SQLite workspace CAS", () => {
 		});
 		expect(row?.cwd).toBe(join(root, "old"));
 		expect(row?.workspaceRevision).toBe(0);
+	});
+});
+
+describe("history-only HTTP actions after a workspace switch", () => {
+	async function fixture() {
+		const user = generateId();
+		const answer = generateId();
+		const later = generateId();
+		const toolUseId = generateId();
+		const oldFile = join(root, "old", "kept.txt");
+		const newFile = join(root, "new", "kept.txt");
+		await writeFile(oldFile, "old workspace bytes\n");
+		await writeFile(newFile, "new workspace bytes\n");
+		const rows = [
+			{
+				id: user,
+				role: "user" as const,
+				contentText: "retry this request",
+				contentJson: [{ type: "text", text: "retry this request" }],
+			},
+			{
+				id: answer,
+				role: "assistant" as const,
+				contentText: null,
+				contentJson: [
+					{ type: "text", text: "keep this text" },
+					{
+						type: "tool_use",
+						id: toolUseId,
+						name: "Write",
+						input: { file_path: oldFile, content: "changed" },
+					},
+				],
+			},
+			{
+				id: later,
+				role: "assistant" as const,
+				contentText: "later response",
+				contentJson: [{ type: "text", text: "later response" }],
+			},
+		];
+		for (const [seq, row] of rows.entries()) {
+			await db
+				.insert(narratorMessages)
+				.values({ ...row, narratorId: id, createdAt: new Date().toISOString() });
+			await db
+				.insert(narratorMessageRefs)
+				.values({ id: generateId(), narratorId: id, messageId: row.id, seq });
+		}
+		// Deliberately no journal/snapshot evidence: a file preview cannot authorize
+		// restoring this tool, but history-only actions must not need that evidence.
+		await db.insert(narratorToolCalls).values({
+			id: generateId(),
+			narratorId: id,
+			messageId: answer,
+			toolUseId,
+			toolName: "Write",
+			inputJson: { file_path: oldFile, content: "changed" },
+			status: "success",
+			executionDeviceId: "local",
+			executionCwd: join(root, "old"),
+			resolvedFilePath: oldFile,
+			createdAt: new Date().toISOString(),
+		});
+		await change(join(root, "new"));
+		return { user, answer, later, oldFile, newFile };
+	}
+
+	type Fixture = Awaited<ReturnType<typeof fixture>>;
+	type Action = "rollback" | "message" | "block" | "batch";
+	function request(f: Fixture, action: Action, skipRevert?: boolean) {
+		const base = `/api/narrators/${id}`;
+		const headers = { "content-type": "application/json" };
+		const opts = skipRevert === undefined ? {} : { skipRevert };
+		if (action === "rollback")
+			return {
+				path: `${base}/rollback/${f.user}`,
+				init: { method: "POST", headers, body: JSON.stringify({ blockIndex: 0, ...opts }) },
+			};
+		if (action === "batch")
+			return {
+				path: `${base}/messages/batch-blocks`,
+				init: {
+					method: "DELETE",
+					headers,
+					body: JSON.stringify({
+						blocks: [
+							{ messageId: f.answer, blockIndex: 1 },
+							{ messageId: f.later, blockIndex: 0 },
+						],
+						...opts,
+					}),
+				},
+			};
+		const path =
+			action === "message"
+				? `${base}/messages/${f.answer}`
+				: `${base}/messages/${f.answer}/blocks/1`;
+		return { path: `${path}${skipRevert ? "?skipRevert=1" : ""}`, init: { method: "DELETE" } };
+	}
+
+	async function forbidFileRollback() {
+		const preview = await import("./revert-planner-local-access");
+		const scoped = await import("./narrator-scoped-revert");
+		const snapshot = await import("./snapshot-revert");
+		const forbidden = () => {
+			throw new Error("History-only operation accessed file rollback");
+		};
+		const spies = [
+			spyOn(preview, "prepareLocalRevertAction").mockImplementation(forbidden),
+			spyOn(preview, "prepareLocalRevertPlan").mockImplementation(forbidden),
+			spyOn(preview, "applyLocalRevertPlan").mockImplementation(forbidden),
+			spyOn(scoped, "revertNarratorScopedForMessages").mockImplementation(forbidden),
+			spyOn(snapshot, "revertForMessagesTree").mockImplementation(forbidden),
+		];
+		for (const spy of spies) restorers.push(() => spy.mockRestore());
+		return spies;
+	}
+
+	async function refs() {
+		return (
+			await db.query.narratorMessageRefs.findMany({
+				where: eq(narratorMessageRefs.narratorId, id),
+				columns: { messageId: true, segmentCompactId: true },
+				orderBy: narratorMessageRefs.seq,
+			})
+		)
+			.filter((row) => row.segmentCompactId === null)
+			.map((row) => row.messageId);
+	}
+	async function assertFiles(f: Fixture) {
+		expect(await readFile(f.oldFile, "utf8")).toBe("old workspace bytes\n");
+		expect(await readFile(f.newFile, "utf8")).toBe("new workspace bytes\n");
+	}
+
+	test.each([
+		"rollback",
+		"message",
+		"block",
+		"batch",
+	] as const)("%s with skipRevert changes only history despite missing file evidence", async (action) => {
+		const f = await fixture();
+		const spies = await forbidFileRollback();
+		const req = request(f, action, true);
+		const response = await app(owner).request(req.path, req.init);
+		const body = await response.json();
+		expect(response.status, JSON.stringify(body)).toBe(200);
+		expect(body.ok).toBe(true);
+		if (action === "rollback" || action === "message") expect(await refs()).toEqual([f.user]);
+		else {
+			expect(await refs()).toEqual(
+				action === "block" ? [f.user, f.answer, f.later] : [f.user, f.answer],
+			);
+			const remaining = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, f.answer),
+				columns: { contentJson: true },
+			});
+			expect(remaining?.contentJson).toEqual([{ type: "text", text: "keep this text" }]);
+		}
+		for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+		await assertFiles(f);
+	});
+
+	for (const skipRevert of [undefined, false]) {
+		test.each([
+			"rollback",
+			"message",
+			"block",
+			"batch",
+		] as const)(`%s still refuses legacy file restoration (skipRevert=${skipRevert}) before interruption`, async (action) => {
+			const f = await fixture();
+			const before = await refs();
+			const session = await import("./narrator-session");
+			const interrupt = spyOn(session, "interruptAndWaitForIdle").mockRejectedValue(
+				new Error("must not interrupt"),
+			);
+			restorers.push(() => interrupt.mockRestore());
+			const req = request(f, action, skipRevert);
+			const response = await app(owner).request(req.path, req.init);
+			expect(response.status).toBe(409);
+			expect((await response.json()).code).toBe("WORKSPACE_REVERT_UNSUPPORTED");
+			expect(interrupt).not.toHaveBeenCalled();
+			expect(await refs()).toEqual(before);
+			await assertFiles(f);
+		});
+	}
+
+	test.each([
+		"rollback",
+		"message",
+		"block",
+		"batch",
+	] as const)("%s history-only still requires write access", async (action) => {
+		const f = await fixture();
+		const before = await refs();
+		const req = request(f, action, true);
+		const response = await app("unrelated-user").request(req.path, req.init);
+		expect([403, 404]).toContain(response.status);
+		expect(await refs()).toEqual(before);
+		await assertFiles(f);
+	});
+
+	test("history-only requests do not bypass parameter validation or exclusive history admission", async () => {
+		const f = await fixture();
+		const before = await refs();
+		const invalid = await app(owner).request(`/api/narrators/${id}/rollback/${f.user}`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ blockIndex: -1, skipRevert: true }),
+		});
+		expect(invalid.status).toBe(400);
+		const { reserveNarratorRevertAdmission } = await import("./narrator-session-state");
+		const reservation = reserveNarratorRevertAdmission(id);
+		try {
+			const req = request(f, "message", true);
+			const response = await app(owner).request(req.path, req.init);
+			expect(response.status).toBe(409);
+			expect((await response.json()).code).toBe("NARRATOR_REVERT_IN_PROGRESS");
+		} finally {
+			reservation.release();
+		}
+		expect(await refs()).toEqual(before);
+		await assertFiles(f);
+	});
+
+	test("HTTP retry reaches the model start boundary without any file rollback dependency", async () => {
+		const f = await fixture();
+		const { narratorService } = await import("./narrator-service");
+		// Simulate a previous history-only rollback; retry must preserve its file state.
+		await narratorService.deleteMessagesAfter(id, f.user, { skipRevert: true });
+		const before = await refs();
+		const spies = await forbidFileRollback();
+		activeNarrators.set(id, {
+			narratorId: id,
+			conversationId: "test",
+			cwd: join(root, "new"),
+			model: "test:model",
+			provider: "test",
+			systemPrompt: null,
+			events: new EventEmitter(),
+			alive: true,
+			locale: "en",
+			abortController: new AbortController(),
+			_enabledOptionalTools: new Set(),
+			_disabledTools: new Set(),
+			_blockedSkills: { all: false, names: new Set() },
+			_substatus: new Set(),
+		} as ActiveNarrator);
+		const reachedStart = new Error("test reached model start");
+		const start = spyOn(narratorService, "updateStatus").mockImplementation(async (_id, status) => {
+			expect(status).toBe("working");
+			throw reachedStart;
+		});
+		restorers.push(() => start.mockRestore());
+		const response = await app(owner).request(`/api/narrators/${id}/retry`, { method: "POST" });
+		// Stop at the real start boundary so tests cannot dispatch a provider request.
+		expect(response.status).toBe(500);
+		expect((await response.json()).error).toBe(reachedStart.message);
+		expect(start).toHaveBeenCalledTimes(1);
+		for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+		expect(await refs()).toEqual(before);
+		await assertFiles(f);
 	});
 });

@@ -703,11 +703,19 @@ narratorRoutes.use("/:id/*", async (c, next) => {
 			? ("read" as const)
 			: ("write" as const);
 	await requireNarratorAccess(c, id, need);
-	// M0 intentionally has no reinterpretation of historical tree hashes in a new directory.
-	// Refuse before any mutation/interrupt; frozen file references remain readable.
+	// Legacy rollback cannot reinterpret historical trees under a new cwd. Scoped plans
+	// instead bind recorded file identities and recheck the current write boundary on
+	// preview and apply, so a prior workspace switch alone must not disable them.
+	// Mixed history/file handlers below check only after parsing skipRevert; their
+	// history-only branch (and retry) must never depend on file restoration support.
+	const scopedRevert =
+		subPath === "revert-action-preview" ||
+		subPath === "revert-plans" ||
+		/^revert-plans\/[^/]+\/apply$/.test(subPath);
 	if (
 		need === "write" &&
-		/^(?:rollback\/|revert(?:$|[-/])|unrevert$|resume(?:$|\/)|messages\/)/.test(subPath)
+		!scopedRevert &&
+		/^(?:revert(?:$|[-/])|unrevert$|resume(?:$|\/))/.test(subPath)
 	)
 		await assertWorkspaceHistoryRevertSupported(id);
 	// Apply owns its exclusive admission through whenSettled; wrapping it in shared
@@ -2598,6 +2606,7 @@ narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
 	const id = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	const { blockIndex, skipRevert, scope } = rollbackToBlockSchema.parse(await c.req.json());
+	if (skipRevert !== true) await assertWorkspaceHistoryRevertSupported(id);
 
 	const narrator = await narratorService.getById(id);
 
@@ -3623,6 +3632,7 @@ narratorRoutes.delete("/:id/messages/batch-blocks", async (c) => {
 	const body = await c.req.json();
 	const { batchDeleteBlocksSchema } = await import("../lib/validators");
 	const { blocks, skipRevert, scope } = batchDeleteBlocksSchema.parse(body);
+	if (skipRevert !== true) await assertWorkspaceHistoryRevertSupported(narratorId);
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessageBlocks(narratorId, blocks, {
 		skipRevert,
@@ -3643,6 +3653,7 @@ narratorRoutes.delete("/:id/messages/:messageId/blocks/:blockIndex", async (c) =
 	// The narrator scope is the default and refuses on conflict, so the caller needs
 	// a way to ask for the wider one its error suggests.
 	const scope = revertScopeSchema.parse(c.req.query("scope"));
+	if (!skipRevert) await assertWorkspaceHistoryRevertSupported(narratorId);
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessageBlock(narratorId, messageId, blockIndex, {
 		skipRevert,
@@ -3659,6 +3670,7 @@ narratorRoutes.delete("/:id/messages/:messageId", async (c) => {
 	// The narrator scope is the default and can refuse on conflict; the caller needs a
 	// way to act on that refusal, so the widening choice must be expressible here too.
 	const scope = revertScopeSchema.parse(c.req.query("scope"));
+	if (!skipRevert) await assertWorkspaceHistoryRevertSupported(narratorId);
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessage(narratorId, messageId, {
 		skipRevert,

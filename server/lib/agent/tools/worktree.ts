@@ -4,6 +4,7 @@ import type { NarratorPrincipal } from "../../../services/narrator-acl";
 import type { NarratorWorktreeService } from "../../../services/narrator-worktree-service";
 import { AppError } from "../../errors";
 import { worktreeCreateSchema, worktreeListSchema } from "../../validators/narrator-worktrees";
+import { zodToJsonSchema } from "../tool-registry";
 import type { ToolContext, ToolDefinition } from "../types";
 
 export const worktreeToolSchema = z.discriminatedUnion("action", [
@@ -28,6 +29,26 @@ export function createWorktreeTool<Principal>(
 			"A result of unknown is NOT proof of failure: never blindly retry with a new ID or clean up. " +
 			"Remote execution, removal and pruning are unsupported.",
 		parameters: worktreeToolSchema,
+		// Providers/gateways may discard parameters of a root anyOf schema. Advertise
+		// a flat object, but keep the discriminated union for strict execution validation.
+		rawJsonSchema: zodToJsonSchema(
+			z.object({
+				...worktreeCreateSchema.shape,
+				action: z.enum(["list", "create"]),
+				expectedRevision: worktreeCreateSchema.shape.expectedRevision
+					.optional()
+					.describe("Required for create: current workspace revision."),
+				requestId: worktreeCreateSchema.shape.requestId
+					.optional()
+					.describe("Required for create: unique request ID; reuse on retries."),
+				destinationPath: worktreeCreateSchema.shape.destinationPath
+					.optional()
+					.describe("Required for create: absolute destination inside the repository root."),
+				branch: worktreeCreateSchema.shape.branch
+					.optional()
+					.describe("Required for create: new/existing branch; existing requires name."),
+			}),
+		),
 		executionRouting: {
 			kind: "single",
 			resolve: (input) => ({

@@ -9,6 +9,7 @@ import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
 import { broadcastSpecChanged } from "../../../services/spec-broadcast";
 import { specVfsService } from "../../../services/spec-vfs-service";
 import { toolSpecPathError } from "../../spec-uri";
+import { rethrowConfirmedToolDiskError } from "../disk-safety";
 import { readCompleteFileBytes } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
@@ -586,6 +587,7 @@ export const editTool: ToolDefinition = {
 					},
 				};
 			} catch (err) {
+				rethrowConfirmedToolDiskError(err, ctx, true);
 				return {
 					output: `Error editing ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
 					isError: true,
@@ -785,6 +787,7 @@ export const editTool: ToolDefinition = {
 				};
 			});
 		} catch (err) {
+			rethrowConfirmedToolDiskError(err, ctx, true);
 			return {
 				output:
 					err instanceof LocalFileValidationError && err.toolOutput

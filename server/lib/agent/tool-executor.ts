@@ -12,7 +12,7 @@ import { logger } from "../logger";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
 import { assertSpecPath, assertToolSpecPaths, toolSpecPathError } from "../spec-uri";
-import { checkToolDiskSafety, diskToolError, normalizeDiskToolResult } from "./disk-safety";
+import { checkToolDiskSafety, diskToolError } from "./disk-safety";
 import type { ExecutionBackend } from "./execution/backend";
 import { LOCAL_DEVICE_ID } from "./execution/backend";
 import { targetPathSemantics, toolBaseCwd } from "./execution/path-resolve";
@@ -1440,11 +1440,10 @@ export async function executeTool(
 				config.signal.throwIfAborted();
 				config.assertWorkspaceCurrent?.();
 				finalTicket?.assertStillCurrent();
-				result = normalizeDiskToolResult(
-					await tool.execute(effectiveInput, ctx),
-					ctx.executionTarget?.canonicalPath ?? ctx.cwd,
-					ctx.locale,
-				);
+				// Tool output is untrusted text (including test names and source excerpts),
+				// not evidence of a host storage failure, even when the command exits nonzero.
+				// Only the preflight above and thrown storage errors below may trip the guard.
+				result = await tool.execute(effectiveInput, ctx);
 				result.output += diskCheck.notice;
 			} catch (error) {
 				executionError = error;
@@ -1555,8 +1554,8 @@ export async function executeTool(
 			if (claimingExecution) throw err;
 			const diskError = diskToolError(
 				err,
-				ctx.executionTarget?.canonicalPath ?? ctx.cwd,
 				ctx.locale,
+				ctx.executionTarget?.backendKind === "local",
 			);
 			return {
 				output:

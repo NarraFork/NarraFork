@@ -33,6 +33,7 @@ import { LocalFileValidationError } from "../../../../services/file-change-local
 import { executeLocalFileChange } from "../../../../services/file-change-runtime";
 import { prepareRemoteStructSedChange } from "../../../../services/struct-sed-remote-change";
 import { toolSpecPathError } from "../../../spec-uri";
+import { rethrowConfirmedToolDiskError } from "../../disk-safety";
 import { withDeviceParam } from "../../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../../execution/path-resolve";
 import { getToolBackend } from "../../execution/tool-backend";
@@ -854,6 +855,7 @@ export const structSedTool: ToolDefinition = {
 			}
 			return recorded;
 		} catch (err) {
+			rethrowConfirmedToolDiskError(err, ctx, true);
 			return {
 				output: `Error editing ${filePath}: ${err instanceof Error ? err.message : String(err)}${fileChangeDiagnosticSuffix(err)}`,
 				isError: true,

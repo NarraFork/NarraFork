@@ -31,6 +31,7 @@ beforeEach(() => {
 	for (const [key, value] of Object.entries({
 		window,
 		document: window.document,
+		localStorage: { getItem: () => null },
 		IS_REACT_ACT_ENVIRONMENT: true,
 	})) {
 		originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
@@ -259,6 +260,39 @@ describe("narrator interrupt send", () => {
 		expect(send.mock.calls[0]?.[4]).toBe(true);
 		expect(send.mock.calls[0]?.[8]).toBeUndefined();
 		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
+	});
+});
+
+describe("narrator retry without file rollback", () => {
+	test.each([200, 503])("retry only calls the retry API (HTTP %s)", async (status) => {
+		const retryFetch = spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(
+				JSON.stringify(status === 200 ? { ok: true } : { error: "fixture retry failed" }),
+				{ status, headers: { "content-type": "application/json" } },
+			),
+		);
+		try {
+			await render({ isActive: false, canRetryLastUserMessage: true });
+			await act(async () => actions.handleRetry());
+			// Observe the real API helper's entire HTTP surface, so any file preview,
+			// plan-file lookup, apply or legacy rollback would be an extra request.
+			expect(retryFetch).toHaveBeenCalledTimes(1);
+			expect(retryFetch.mock.calls[0]).toEqual([
+				"/api/narrators/n/retry",
+				expect.objectContaining({ method: "POST" }),
+			]);
+			expect(send).not.toHaveBeenCalled();
+			expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
+			if (status === 200) expect(notify).not.toHaveBeenCalled();
+			else
+				expect(notify).toHaveBeenCalledWith({
+					title: "Error",
+					message: "fixture retry failed",
+					color: "red",
+				});
+		} finally {
+			retryFetch.mockRestore();
+		}
 	});
 });
 

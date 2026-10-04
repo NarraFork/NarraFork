@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { LocalBackend } from "../lib/agent/execution/local-backend";
-import { createWorktreeTool } from "../lib/agent/tools/worktree";
+import { resolveToolJsonSchema } from "../lib/agent/tool-registry";
+import { createWorktreeTool, worktreeToolSchema } from "../lib/agent/tools/worktree";
 import type { ToolContext } from "../lib/agent/types";
 import { AppError } from "../lib/errors";
 import { safeSpawn } from "../lib/spawn";
@@ -651,6 +652,33 @@ describe("local worktree list/create fixtures", () => {
 		expect(result.outcome).toBe("created");
 		expect((await service.create("actor", "narrator", request, signal())).outcome).toBe("created");
 		expect(writes).toBe(1);
+	});
+
+	test("Worktree provider schema exposes top-level parameters without weakening validation", () => {
+		const schema = resolveToolJsonSchema(createWorktreeTool(service, async () => "actor"));
+		expect(schema.type).toBe("object");
+		expect(schema.anyOf).toBeUndefined();
+		expect(schema.required).toEqual(["workspaceKey", "action"]);
+		const properties = schema.properties as Record<string, Record<string, unknown>>;
+		expect(properties.action.enum).toEqual(["list", "create"]);
+		for (const field of ["expectedRevision", "requestId", "destinationPath", "branch"]) {
+			expect(properties[field].description).toContain("Required for create");
+		}
+		expect(
+			worktreeToolSchema.safeParse({ action: "list", workspaceKey: "workspace" }).success,
+		).toBe(true);
+		expect(worktreeToolSchema.safeParse({ action: "create", ...proposal() }).success).toBe(true);
+		expect(worktreeToolSchema.safeParse({}).success).toBe(false);
+		expect(
+			worktreeToolSchema.safeParse({ action: "create", workspaceKey: "workspace" }).success,
+		).toBe(false);
+		expect(
+			worktreeToolSchema.safeParse({
+				action: "create",
+				...proposal(),
+				branch: { kind: "existing" },
+			}).success,
+		).toBe(false);
 	});
 
 	test("Worktree tool returns unknown as an explicit error outcome, not created", async () => {

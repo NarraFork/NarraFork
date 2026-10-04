@@ -959,6 +959,69 @@ describe("pending permission execution identity", () => {
 	});
 });
 
+describe("Worktree permission validation", () => {
+	test("empty input returns parameter error rather than non-interactive denial", async () => {
+		const narratorId = "worktree-empty-input";
+		const toolUseId = "worktree-empty-input-use";
+		await seedPermissionRequest({
+			narratorId,
+			messageId: "worktree-empty-input-message",
+			toolCallId: "worktree-empty-input-call",
+			toolUseId,
+			toolName: "Worktree",
+			input: {},
+			permissionMode: "bypassPermissions",
+		});
+		const result = await handlePermission(
+			narratorId,
+			new AbortController().signal,
+			"Worktree",
+			{},
+			toolUseId,
+			"/workspace",
+			"zh-CN",
+			undefined,
+			{
+				executionBackend: localBackend,
+				executionTarget: frozenTarget(localBackend, { cwd: "/workspace" }),
+			},
+		);
+		expect(result.behavior).toBe("deny");
+		if (result.behavior !== "deny") throw new Error("Expected denial");
+		expect(result.message).toContain("Invalid Worktree parameters");
+		expect(result.message).not.toContain("非交互式");
+	});
+	for (const action of [undefined, "remove"]) {
+		test(`invalid action ${action} reports parameter error in bypass mode`, () => {
+			const meta: { blacklistReason?: string } = {};
+			expect(
+				resolvePermissionDecision({
+					toolName: "Worktree",
+					input: action === undefined ? {} : { action },
+					permMode: "bypassPermissions",
+					cwd: "/local/work",
+					meta,
+				}),
+			).toBe("deny");
+			expect(meta.blacklistReason).toContain("Invalid Worktree parameters");
+		});
+	}
+	test("review mode still rejects create with an explicit reason", () => {
+		const meta: { blacklistReason?: string } = {};
+		expect(
+			resolvePermissionDecision({
+				toolName: "Worktree",
+				input: { action: "create" },
+				permMode: "bypassPermissions",
+				cwd: "/local/work",
+				reviewReadOnlyBash: true,
+				meta,
+			}),
+		).toBe("deny");
+		expect(meta.blacklistReason).toContain("Review mode");
+	});
+});
+
 describe("Dynamic Spec writes are never redirected to a filesystem path", () => {
 	// Both redirects below rewrote `file_path` before the decision. The execution target was
 	// already frozen with the spec grammar, so the rewritten posix path made the executor

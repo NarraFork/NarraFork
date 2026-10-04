@@ -883,6 +883,13 @@ export async function runAgentLoopUnlocked(
 							relaxedPlan: true,
 						});
 					}
+					if (planState.planReflectionDisabled) {
+						broadcastToNarrator(narratorId, {
+							type: "reflection_overrides_changed",
+							narratorId,
+							planReflectionAutoApproveOverride: "off",
+						});
+					}
 					active._preparedPlanModes?.delete(toolCallId);
 				},
 				onEnterPlanModeFailed: async (toolCallId, toolUseId) => {

@@ -1066,26 +1066,72 @@ describe("fixed plan apply and history-only branches", () => {
 			assertUnavailable();
 		});
 
-		test(`${selectedAction} keep-files sends only the explicit legacy history operation`, async () => {
-			action = selectedAction;
-			execute = true;
-			respond = normalResponse;
-			await renderAction();
-			await click(button(props.messagesOnlyLabel));
-			expect(confirmations).toEqual([{ skipRevert: true }]);
-			expect(requestsTo("/apply")).toHaveLength(0);
-			const history = requests.at(-1);
-			if (action === "rollback_to_block") {
-				expect(history?.url.pathname).toBe("/api/narrators/narrator-test/rollback/message-1");
-				expect(history?.body).toEqual({ blockIndex: 3, skipRevert: true });
-			} else {
-				expect(history?.method).toBe("DELETE");
-				expect(history?.url.pathname).toBe(
-					"/api/narrators/narrator-test/messages/message-1/blocks/3",
-				);
-				expect(history?.url.searchParams.get("skipRevert")).toBe("1");
-			}
-		});
+		for (const previewState of [
+			"ready",
+			"preview_failed",
+			"files_failed",
+			"preview_loading",
+			"files_loading",
+			"pagination_loading",
+			"incomplete",
+		] as const) {
+			test(`${selectedAction} keep-files sends only the legacy history operation (${previewState})`, async () => {
+				action = selectedAction;
+				execute = true;
+				const deferred = deferredResponse();
+				respond = (request) => {
+					if (request.url.pathname.endsWith("/revert-action-preview")) {
+						if (previewState === "preview_failed")
+							return reply({ error: "fixture preview failed" }, 503);
+						if (previewState === "preview_loading") return deferred.promise;
+					}
+					if (request.url.pathname.endsWith("/files")) {
+						if (previewState === "files_failed")
+							return reply({ error: "fixture files failed" }, 503);
+						if (previewState === "files_loading") return deferred.promise;
+						if (previewState === "pagination_loading")
+							return request.url.searchParams.has("cursor")
+								? deferred.promise
+								: filesReply([planFile(0)], true);
+						if (previewState === "incomplete") return filesReply([planFile(0)]);
+					}
+					return normalResponse(request);
+				};
+				await renderAction();
+				if (previewState === "pagination_loading")
+					await waitFor(() => requestsTo("/files").length === 2);
+				if (previewState !== "ready") assertUnavailable();
+				if (previewState === "preview_failed" || previewState === "files_failed")
+					expect(document.body.textContent).toContain(en.revertPlanPreviewFailed);
+				if (previewState === "incomplete")
+					expect(document.body.textContent).toContain(en.revertScopePreviewTruncated);
+				const previewRequests = [...requests];
+				await click(button(props.messagesOnlyLabel));
+				expect(confirmations).toEqual([{ skipRevert: true }]);
+				expect(applyErrors).toEqual([]);
+				expect(requestsTo("/apply")).toHaveLength(0);
+				// Clicking history-only adds exactly one independent legacy request:
+				// no plan apply, preview reload or file-page refetch is permitted.
+				expect(requests).toHaveLength(previewRequests.length + 1);
+				expect(requests.slice(0, -1)).toEqual(previewRequests);
+				const history = requests.at(-1);
+				if (action === "rollback_to_block") {
+					expect(history?.method).toBe("POST");
+					expect(history?.url.pathname).toBe("/api/narrators/narrator-test/rollback/message-1");
+					expect(history?.body).toEqual({ blockIndex: 3, skipRevert: true });
+				} else {
+					expect(history?.method).toBe("DELETE");
+					expect(history?.url.pathname).toBe(
+						"/api/narrators/narrator-test/messages/message-1/blocks/3",
+					);
+					expect(history?.url.searchParams.get("skipRevert")).toBe("1");
+				}
+				deferred.resolve(reply({ error: "fixture late preview failure" }, 503));
+				await flush();
+				expect(requests).toHaveLength(previewRequests.length + 1);
+				expect(applyErrors).toEqual([]);
+			});
+		}
 	}
 
 	for (const [status, explanation] of [
