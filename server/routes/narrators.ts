@@ -228,7 +228,6 @@ import {
 	scanBrokenModelNarrators,
 	undoLastBrokenModelMigration,
 } from "../services/broken-model-migration-service";
-import { chapterFork } from "../services/chapter-fork";
 import type {
 	BashCommandResult,
 	BlockAllSkillsResult,
@@ -1095,9 +1094,15 @@ narratorRoutes.get("/", async (c) => {
 					running: sql<number>`SUM(CASE WHEN ${containerInstances.status} = 'running' THEN 1 ELSE 0 END)`,
 				})
 				.from(containerInstances)
-				.where(sql`${containerInstances.chapterId} IN ${chapterIds}`)
+				.where(
+					and(
+						sql`${containerInstances.chapterId} IN ${chapterIds}`,
+						isNull(containerInstances.worktreeResourceId),
+					),
+				)
 				.groupBy(containerInstances.chapterId);
 			for (const row of containerRows) {
+				if (row.chapterId === null) continue;
 				containerCounts.set(row.chapterId, {
 					total: row.total,
 					running: row.running ?? 0,
@@ -5207,10 +5212,19 @@ narratorRoutes.post("/:id/fork-messages", async (c) => {
 	return c.json(publicNarratorResponse(newNarrator), 201);
 });
 
-// Fork standalone narrator (chapter-bound narrators must fork via chapter fork)
+// Ordinary fork always creates an independent narrator, including chapter-bound sources.
 narratorRoutes.post("/:id/fork", async (c) => {
 	const id = c.req.param("id");
 	const body = await c.req.json();
+	if (
+		body &&
+		typeof body === "object" &&
+		["worktreeSource", "commitSha"].some((key) => Object.hasOwn(body, key))
+	)
+		throw new ValidationError(
+			"worktreeSource and commitSha are unsupported by ordinary narrator forks",
+			"NARRATOR_WORKTREE_FORK_UNSUPPORTED",
+		);
 	const parsed = forkNarratorSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const newNarrator = await narratorService.forkNarrator(id, parsed.data.forkMessageUuid ?? null, {
@@ -5218,6 +5232,7 @@ narratorRoutes.post("/:id/fork", async (c) => {
 		userId: c.get("user").sub,
 		inheritMode: parsed.data.inheritMode ?? "full",
 		forkMessageId: parsed.data.forkMessageId,
+		standalone: true,
 	});
 	return c.json(publicNarratorResponse(newNarrator), 201);
 });
@@ -5535,29 +5550,48 @@ narratorRoutes.post("/:id/promote", async (c) => {
 				.set({
 					isAskInPassing: false,
 					traits: unlockedTraits,
-					permissionMode: "default",
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, id));
 		});
 
-		await updateNarratorPermissionMode(id, "default");
+		// Promotion removes the ask label, never broadens the existing execution policy.
+		await updateNarratorPermissionMode(id, narrator.permissionMode ?? "readOnly");
 
 		const updated = await narratorService.getById(id);
 		broadcastToNarrator(id, {
 			type: "permission_mode_changed",
 			narratorId: id,
-			permissionMode: "default",
+			permissionMode: updated.permissionMode ?? "readOnly",
 		});
 
-		return c.json({ type: "unlocked", narrator: publicNarratorResponse(updated) });
+		return c.json({
+			type: "unlocked",
+			narratorId: updated.id,
+			narrator: publicNarratorResponse(updated),
+		});
 	}
 
-	// Chapter-bound narrator: fork a new chapter
-	const chapter = await chapterFork.fork(narrator.chapterId, {
+	// Promotion no longer creates a chapter/worktree; the source remains an audit record.
+	const forkedNarrator = await narratorService.forkStandaloneFromTool(id, "fork", {
 		inheritMode: "full",
-		worktreeSource: "workspace",
+		userId: c.get("user").sub,
 	});
+
+	// The fork inherits traits; clear only the ask label on the new ordinary narrator,
+	// preserving its existing readOnly/OAuth/review permission restrictions.
+	await narratorTraitsLock.acquire(forkedNarrator.id, async () => {
+		const current = await narratorService.getById(forkedNarrator.id);
+		await db
+			.update(narrators)
+			.set({
+				isAskInPassing: false,
+				traits: removeTrait(parseTraits(current.traits), "ask-in-passing"),
+				updatedAt: new Date().toISOString(),
+			})
+			.where(eq(narrators.id, forkedNarrator.id));
+	});
+	const promotedNarrator = await narratorService.getById(forkedNarrator.id);
 
 	// Mark the original ask-in-passing narrator as promoted so the UI
 	// no longer shows it as locked.  We keep permissionMode as readOnly
@@ -5575,7 +5609,11 @@ narratorRoutes.post("/:id/promote", async (c) => {
 			.where(eq(narrators.id, id));
 	});
 
-	return c.json({ type: "forked", chapter });
+	return c.json({
+		type: "forked",
+		narratorId: promotedNarrator.id,
+		narrator: publicNarratorResponse(promotedNarrator),
+	});
 });
 
 // Get pending permissions

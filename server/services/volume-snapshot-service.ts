@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import {
 	chapters,
@@ -15,6 +15,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
+import { assertLegacyRuntimeOwner } from "./worktree-resource-owner";
 
 /**
  * Per-container mutex — guards snapshot create/apply/delete for the same chapter+service.
@@ -51,12 +52,14 @@ async function resolveContainerId(chapterId: string, serviceName: string): Promi
 	const instance = await db.query.containerInstances.findFirst({
 		where: and(
 			eq(containerInstances.chapterId, chapterId),
+			isNull(containerInstances.worktreeResourceId),
 			and(
 				eq(containerInstances.serviceName, serviceName),
 				eq(containerInstances.status, "running"),
 			),
 		),
 	});
+	if (instance) assertLegacyRuntimeOwner(instance);
 	if (!instance?.containerId) {
 		throw new ValidationError(
 			`No running container found for service "${serviceName}" in this chapter`,
@@ -77,7 +80,12 @@ export const volumeSnapshotService = {
 		name: string;
 		description?: string;
 		userId?: string;
+		sourceWorktreeResourceId?: string;
 	}) {
+		assertLegacyRuntimeOwner({
+			chapterId: opts.chapterId,
+			worktreeResourceId: opts.sourceWorktreeResourceId,
+		});
 		const { projectId, chapterId, serviceName, containerPath, name, description, userId } = opts;
 
 		// Verify chapter belongs to project
@@ -173,7 +181,16 @@ export const volumeSnapshotService = {
 	/**
 	 * Apply a snapshot to a target chapter's container.
 	 */
-	async applySnapshot(opts: { snapshotId: string; targetChapterId: string; userId?: string }) {
+	async applySnapshot(opts: {
+		snapshotId: string;
+		targetChapterId: string;
+		userId?: string;
+		targetWorktreeResourceId?: string;
+	}) {
+		assertLegacyRuntimeOwner({
+			chapterId: opts.targetChapterId,
+			worktreeResourceId: opts.targetWorktreeResourceId,
+		});
 		const { snapshotId, targetChapterId, userId } = opts;
 
 		const snapshot = await db.query.volumeSnapshots.findFirst({

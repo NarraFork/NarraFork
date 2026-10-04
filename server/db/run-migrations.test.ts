@@ -560,15 +560,38 @@ describe("terminal_view_state cascade deletes (real migration replay)", () => {
 				)
 				.all() as Array<{ name: string }>
 		).map((row) => row.name);
-		// The two unique indexes lead with user_id, so they cannot serve FK enforcement or the
-		// bulk cleanup deletes keyed only on chapter_id/narrator_id — hence the two single-column
-		// covering indexes added in 0094. All four must survive the table rebuild.
+		// User-leading unique indexes cannot cover FK enforcement or cleanup keyed only on
+		// chapter/narrator/resource. Preserve the legacy four and the two added in 0189.
 		expect(indexes).toEqual([
 			"idx_view_state_chapter",
 			"idx_view_state_narrator",
+			"idx_view_state_resource",
 			"idx_view_state_user_chapter",
 			"idx_view_state_user_narrator",
+			"idx_view_state_user_resource",
 		]);
+		const definitions = sqlite.prepare("PRAGMA index_list(terminal_view_state)").all() as Array<{
+			name: string;
+			unique: number;
+		}>;
+		const byName = new Map(definitions.map((definition) => [definition.name, definition]));
+		for (const [name, columns, unique] of [
+			["idx_view_state_chapter", ["chapter_id"], 0],
+			["idx_view_state_narrator", ["narrator_id"], 0],
+			["idx_view_state_resource", ["worktree_resource_id"], 0],
+			["idx_view_state_user_chapter", ["user_id", "chapter_id"], 1],
+			["idx_view_state_user_narrator", ["user_id", "narrator_id"], 1],
+			["idx_view_state_user_resource", ["user_id", "worktree_resource_id"], 1],
+		] as const) {
+			const fields = sqlite.prepare(`PRAGMA index_info(${name})`).all() as Array<{
+				seqno: number;
+				name: string;
+			}>;
+			expect(
+				fields.sort((left, right) => left.seqno - right.seqno).map((field) => field.name),
+			).toEqual([...columns]);
+			expect(byName.get(name)?.unique).toBe(unique);
+		}
 	});
 
 	test("deleting a chapter cascades to its terminal_view_state rows", async () => {

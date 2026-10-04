@@ -1866,7 +1866,7 @@ export const narratorsApi = {
 			`/narrators/${narratorId}/permission-file-preview?toolUseId=${encodeURIComponent(toolUseId)}`,
 		),
 
-	// Narrator Fork (standalone sessions only).
+	// Ordinary conversation fork (standalone output, including legacy chapter sources).
 	// The fork point is identified by the local narrator message id: only
 	// assistant messages carry an SDK uuid, so a uuid-only contract cannot fork
 	// from a user message.
@@ -1907,7 +1907,7 @@ export const narratorsApi = {
 			method: "DELETE",
 		}),
 	promoteNarrator: (narratorId: string) =>
-		request<{ type: "unlocked" | "forked"; narrator?: ApiEntity; chapter?: ApiEntity }>(
+		request<{ type: "unlocked" | "forked"; narratorId: string; narrator?: ApiEntity }>(
 			`/narrators/${narratorId}/promote`,
 			{ method: "POST" },
 		),

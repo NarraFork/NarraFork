@@ -39,6 +39,7 @@ import {
 	narrators,
 	narratorToolCalls,
 	projects,
+	users,
 } from "@server/db/schema";
 import { ValidationError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
@@ -47,6 +48,8 @@ import { ProjectArchiveFile } from "@server/services/project-archive/archive-fil
 import { fullSync } from "@server/services/project-db-sync";
 import { importProject } from "@server/services/project-import";
 import { eq, inArray } from "drizzle-orm";
+import { Hono } from "hono";
+import { projectDbRoutes } from "../../../routes/project-db";
 
 const tempDirs: string[] = [];
 const createdProjects: string[] = [];
@@ -435,6 +438,41 @@ describe("export writes a real, self-describing SQLite file", () => {
 });
 
 describe("import reads the archive back into the main database", () => {
+	test("HTTP legacy import reaches the real private worker and returns archived state", async () => {
+		const fixture = await createFixture("nf-archive-http-worker-");
+		await fullSync(fixture.projectId);
+		await forgetProject(fixture);
+		const userId = generateId();
+		await db.insert(users).values({
+			id: userId,
+			username: `worker-${userId}`,
+			passwordHash: "fixture-only",
+			createdAt: new Date().toISOString(),
+		});
+		try {
+			const app = new Hono();
+			app.use("*", async (c, next) => {
+				c.set("user", { sub: userId, role: "user", iat: 0, exp: 2_147_483_647 });
+				await next();
+			});
+			app.route("/api/projects", projectDbRoutes);
+			const response = await app.request("/api/projects/import", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ gitPath: fixture.gitPath }),
+			});
+			expect(response.status).toBe(201);
+			expect(await response.json()).toMatchObject({ projectId: fixture.projectId, skipped: false });
+			const restored = await db.query.narrators.findFirst({
+				where: eq(narrators.id, fixture.narratorId),
+			});
+			expect(restored?.status).toBe("archived");
+			expect(restored?.permissionMode).toBe("readOnly");
+			expect(restored?.isBackground).toBe(false);
+		} finally {
+			await db.delete(users).where(eq(users.id, userId));
+		}
+	});
 	test("a full round trip restores the conversation graph", async () => {
 		const fixture = await createFixture("nf-arc-round-");
 		await fullSync(fixture.projectId);

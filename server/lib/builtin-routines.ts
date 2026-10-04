@@ -128,8 +128,8 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 		category: "tools",
 		tool: {
 			toolName: "ForkNarrator",
-			descriptionEn: "Fork the current narrator session into a new chapter",
-			descriptionZh: "将当前叙述者会话分叉到新章节",
+			descriptionEn: "Fork the current conversation into an independent narrator (no new worktree)",
+			descriptionZh: "将当前会话分叉为独立叙述者（不新建工作区）",
 		},
 	},
 	{

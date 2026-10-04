@@ -404,11 +404,15 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 107 tables and 1540 columns", () => {
-		expect(target.tables.length).toBe(107);
-		// 1537 SQLite-derived columns (1536 + narrators.next_seq) plus the three PG-only
-		// insert_seq identity columns from the generator overlay.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1540);
+	test("covers 115 tables and 1659 columns including resource inventory", () => {
+		expect(target.tables.length).toBe(115);
+		// 1656 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1659);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_worktree_resources")
+				?.columns.map((column) => column.property),
+		).toContain("scopeOwnerUserId");
 	});
 
 	test("the PG-only insert_seq identity columns are present on exactly the three ordinal tables", () => {

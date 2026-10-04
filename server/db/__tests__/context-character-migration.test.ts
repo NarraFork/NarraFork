@@ -9,9 +9,11 @@ test("字符统计迁移保持旧数据不变且缓存初值为0", async () => {
 		db.exec(`CREATE TABLE narrators (id TEXT PRIMARY KEY);
 		CREATE TABLE narrator_messages (id TEXT PRIMARY KEY, content_json TEXT);
 		CREATE TABLE narrator_tool_calls (id TEXT PRIMARY KEY, input_json TEXT, output_json TEXT);
+		CREATE TABLE user_preferences (id TEXT PRIMARY KEY NOT NULL);
 		INSERT INTO narrators VALUES ('old');
 		INSERT INTO narrator_messages VALUES ('old','not-json-old-body');
-		INSERT INTO narrator_tool_calls VALUES ('old','old-input','old-output');`);
+		INSERT INTO narrator_tool_calls VALUES ('old','old-input','old-output');
+		INSERT INTO user_preferences VALUES ('old-preference');`);
 		let migration: string | undefined;
 		const folder = fileURLToPath(new URL("../../../drizzle/", import.meta.url));
 		// drizzle-kit chooses a random suffix; never bind the test to that filename.
@@ -34,9 +36,11 @@ test("字符统计迁移保持旧数据不变且缓存初值为0", async () => {
 		).toEqual({ body: "not-json-old-body", chars: null });
 		expect(
 			db
-				.query("SELECT input_chars AS input, output_chars AS output FROM narrator_tool_calls")
+				.query(
+					"SELECT input_json AS inputBody, output_json AS outputBody, input_chars AS input, output_chars AS output FROM narrator_tool_calls",
+				)
 				.get(),
-		).toEqual({ input: 0, output: 0 });
+		).toEqual({ inputBody: "old-input", outputBody: "old-output", input: 0, output: 0 });
 		expect(
 			db
 				.query(
@@ -44,6 +48,25 @@ test("字符统计迁移保持旧数据不变且缓存初值为0", async () => {
 				)
 				.get(),
 		).toEqual({ summary: 0, system: 0, tools: 0, revision: 0, cache: null });
+		expect(
+			db.query("SELECT id, treat_as_local_access AS localAccess FROM user_preferences").get(),
+		).toEqual({ id: "old-preference", localAccess: 0 });
+		// The same complete migration must create the page table and enforce its index and FK.
+		db.exec(
+			"INSERT INTO narrator_context_char_pages VALUES ('page-old', 'old', 'generation', 0, '[]')",
+		);
+		expect(() =>
+			db.exec(
+				"INSERT INTO narrator_context_char_pages VALUES ('page-duplicate', 'old', 'generation', 0, '[]')",
+			),
+		).toThrow();
+		expect(() =>
+			db.exec(
+				"INSERT INTO narrator_context_char_pages VALUES ('page-orphan', 'missing', 'generation', 1, '[]')",
+			),
+		).toThrow();
+		db.exec("DELETE FROM narrators WHERE id = 'old'");
+		expect(db.query("SELECT id FROM narrator_context_char_pages").all()).toEqual([]);
 	} finally {
 		db.close();
 	}

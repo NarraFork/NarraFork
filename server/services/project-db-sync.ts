@@ -48,8 +48,10 @@
 import type { Database } from "bun:sqlite";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { eq } from "drizzle-orm";
-import { db } from "../db";
+import { NARRATOR_BACKUP_LIMITS } from "@shared/narrator-backup";
+import { and, eq, gt } from "drizzle-orm";
+import { activeDatabaseBackend, db } from "../db";
+import { getDbPath } from "../db/connection";
 import {
 	chapters,
 	explorationGroups,
@@ -61,6 +63,7 @@ import type { NarraForkEvent } from "../lib/event-bus";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { projectDbManager } from "../lib/project-db";
+import type { BackupActor } from "./narrator-backup/contract";
 import {
 	copyTable,
 	distinctIds,
@@ -70,6 +73,7 @@ import {
 	readAllRows,
 	replaceTables,
 } from "./project-archive/export-rows";
+import { exportLegacyProjectOnWorker } from "./project-archive/legacy-sync-job";
 import type { ArchiveTable } from "./project-archive/manifest";
 import { projectArchiveMainStore as mainStore } from "./project-archive/store";
 import { createNarratorSyncScheduler } from "./project-db-sync-scheduler";
@@ -83,6 +87,19 @@ async function projectIdForChapter(chapterId: string): Promise<string | null> {
 		columns: { projectId: true },
 	});
 	return row?.projectId ?? null;
+}
+
+/** Context affiliation is explicit; cwd is never an ownership heuristic. */
+async function projectIdsForNarrator(narratorId: string): Promise<string[]> {
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { chapterId: true, contextProjectId: true },
+	});
+	if (!narrator) return [];
+	const chapterProject = narrator.chapterId ? await projectIdForChapter(narrator.chapterId) : null;
+	return [
+		...new Set([chapterProject, narrator.contextProjectId].filter((id): id is string => !!id)),
+	];
 }
 
 const PROJECT_TOOL_CALL_TARGET_COLUMNS = [
@@ -157,7 +174,7 @@ async function replaceById(
 // === Sync functions ===
 
 /** Sync a single project record. */
-async function syncProject(projectId: string): Promise<void> {
+export async function syncProject(projectId: string): Promise<void> {
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) return;
 	await copyById(pdb, "projects", "id", [projectId]);
@@ -203,16 +220,10 @@ async function syncChapterCommits(chapterId: string, control: ExportControl = {}
 
 /** Sync a single narrator record. */
 async function syncNarrator(narratorId: string): Promise<void> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true },
-	});
-	if (!narrator?.chapterId) return;
-	const projectId = await projectIdForChapter(narrator.chapterId);
-	if (!projectId) return;
-	const pdb = await getProjectDb(projectId);
-	if (!pdb) return;
-	await copyById(pdb, "narrators", "id", [narratorId]);
+	for (const projectId of await projectIdsForNarrator(narratorId)) {
+		const pdb = await getProjectDb(projectId);
+		if (pdb) await copyById(pdb, "narrators", "id", [narratorId]);
+	}
 }
 
 /** What one incremental message sync looked at and copied — used for slow-sync diagnostics. */
@@ -231,13 +242,17 @@ interface NarratorMessageSyncStats {
  * restored on import.
  */
 async function syncNarratorMessages(narratorId: string): Promise<NarratorMessageSyncStats | null> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true },
-	});
-	if (!narrator?.chapterId) return null;
-	const projectId = await projectIdForChapter(narrator.chapterId);
-	if (!projectId) return null;
+	let stats: NarratorMessageSyncStats | null = null;
+	for (const projectId of await projectIdsForNarrator(narratorId)) {
+		stats = await syncNarratorMessagesIntoProject(narratorId, projectId);
+	}
+	return stats;
+}
+
+async function syncNarratorMessagesIntoProject(
+	narratorId: string,
+	projectId: string,
+): Promise<NarratorMessageSyncStats | null> {
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) return null;
 
@@ -251,23 +266,43 @@ async function syncNarratorMessages(narratorId: string): Promise<NarratorMessage
 	// Nor is "ref counts are equal, nothing to do" usable: this path only appends, so refs the
 	// main database has since deleted stay in the archive until the next full sync, and an equal
 	// count can hide exactly as many new refs as there are stale ones.
-	const syncedIds = new Set(
-		(
-			pdb
-				.prepare("SELECT message_id FROM narrator_message_refs WHERE narrator_id = ?")
-				.all(narratorId) as Array<{ message_id: string }>
-		).map((row) => row.message_id),
-	);
+	const syncedIds = new Set<string>();
+	let archivedAfter = "";
+	for (;;) {
+		const page = pdb
+			.prepare(
+				"SELECT id,message_id FROM narrator_message_refs WHERE narrator_id=? AND id>? ORDER BY id LIMIT 500",
+			)
+			.all(narratorId, archivedAfter) as { id: string; message_id: string }[];
+		if (!page.length) break;
+		for (const ref of page) syncedIds.add(ref.message_id);
+		archivedAfter = page.at(-1)?.id ?? archivedAfter;
+		if (syncedIds.size > 100_000)
+			throw new Error("Project incremental backup reference budget exceeded");
+	}
 
 	// ONE narrow read of (id, message_id), NOT the paged full-row `readAllRows`. A paged read
 	// filtered by narrator and ordered by primary key re-sorts the narrator's whole ref set for
 	// every page — O(N²/page) — which on a working narrator with ~90k refs held the event loop
 	// for ~10s on every debounced sync. The two ids per ref are all the diff needs; the full rows
 	// of only the NEW refs are fetched below, by primary key.
-	const mainRefs = await db
-		.select({ id: narratorMessageRefs.id, messageId: narratorMessageRefs.messageId })
-		.from(narratorMessageRefs)
-		.where(eq(narratorMessageRefs.narratorId, narratorId));
+	const mainRefs: { id: string; messageId: string }[] = [];
+	let mainAfter = "";
+	for (;;) {
+		const page = await db
+			.select({ id: narratorMessageRefs.id, messageId: narratorMessageRefs.messageId })
+			.from(narratorMessageRefs)
+			.where(
+				and(eq(narratorMessageRefs.narratorId, narratorId), gt(narratorMessageRefs.id, mainAfter)),
+			)
+			.orderBy(narratorMessageRefs.id)
+			.limit(500);
+		if (!page.length) break;
+		mainRefs.push(...page);
+		mainAfter = page.at(-1)?.id ?? mainAfter;
+		if (mainRefs.length > 100_000)
+			throw new Error("Project incremental backup reference budget exceeded");
+	}
 	const newRefs = mainRefs.filter((ref) => !syncedIds.has(ref.messageId));
 	const stats: NarratorMessageSyncStats = {
 		mainRefs: mainRefs.length,
@@ -411,10 +446,41 @@ async function deleteChapterFromProjectDb(chapterId: string, projectId: string):
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) return;
 
-	const narratorRows = pdb
-		.prepare("SELECT id FROM narrators WHERE chapter_id = ?")
-		.all(chapterId) as { id: string }[];
-	const narratorIds = narratorRows.map((n) => n.id);
+	const narratorIds: string[] = [];
+	let after = "";
+	for (;;) {
+		const page = pdb
+			.prepare("SELECT id FROM narrators WHERE chapter_id = ? AND id > ? ORDER BY id LIMIT 500")
+			.all(chapterId, after) as { id: string }[];
+		if (!page.length) break;
+		for (const candidate of page) {
+			const live = await mainStore.readRows({
+				table: "narrators",
+				filter: { column: "id", values: [candidate.id] },
+				limit: 1,
+			});
+			if (live.rows.length) {
+				// The narrator survived detachment: keep its refs/messages and copy the new affiliation.
+				await copyById(pdb, "narrators", "id", [candidate.id]);
+			} else {
+				const shared = pdb
+					.prepare(
+						"SELECT 1 FROM narrator_messages m JOIN narrator_message_refs r ON r.message_id=m.id WHERE m.narrator_id=? AND r.narrator_id<>? LIMIT 1",
+					)
+					.get(candidate.id, candidate.id);
+				if (shared) {
+					pdb.run("UPDATE narrators SET chapter_id=NULL,status='archived' WHERE id=?", [
+						candidate.id,
+					]);
+					logger.warn("Retaining shared history author after chapter deletion", {
+						projectId,
+						narratorId: candidate.id,
+					});
+				} else narratorIds.push(candidate.id);
+			}
+		}
+		after = page.at(-1)?.id ?? after;
+	}
 
 	const tx = pdb.transaction(() => {
 		if (narratorIds.length > 0) {
@@ -422,7 +488,7 @@ async function deleteChapterFromProjectDb(chapterId: string, projectId: string):
 			const ph = narratorIds.map(() => "?").join(",");
 			pdb.run(`DELETE FROM narrator_tool_calls WHERE narrator_id IN (${ph})`, narratorIds);
 			pdb.run(`DELETE FROM narrator_message_refs WHERE narrator_id IN (${ph})`, narratorIds);
-			pdb.run("DELETE FROM narrators WHERE chapter_id = ?", [chapterId]);
+			pdb.run(`DELETE FROM narrators WHERE id IN (${ph})`, narratorIds);
 		}
 
 		pdb.run("DELETE FROM chapter_commits WHERE chapter_id = ?", [chapterId]);
@@ -463,6 +529,10 @@ async function deleteChapterFromProjectDb(chapterId: string, projectId: string):
  */
 export interface FullSyncOptions {
 	readonly signal?: AbortSignal;
+	/** Public/full exports revalidate the authenticated closure in the worker snapshot. */
+	readonly actor?: BackupActor;
+	/** Isolated contract tests may use the injected inline main-store port. */
+	readonly worker?: boolean;
 	/** Relative budget in ms, converted to an absolute deadline once, at entry. */
 	readonly timeoutMs?: number;
 }
@@ -474,6 +544,25 @@ export async function fullSync(
 ): Promise<{ tables: Record<string, number> }> {
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) throw new Error(`Cannot open project DB for project ${projectId}`);
+	if (options.worker ?? process.env.NODE_ENV !== "test") {
+		return exportLegacyProjectOnWorker(
+			{
+				databasePath: getDbPath(),
+				archivePath: pdb.filename,
+				projectId,
+				backend: activeDatabaseBackend === "postgres" ? "postgres" : "sqlite",
+				postgresUrl:
+					activeDatabaseBackend === "postgres"
+						? (process.env.NF_DATABASE_URL ?? process.env.DATABASE_URL)
+						: undefined,
+				actor: options.actor,
+				deadline:
+					Date.now() +
+					Math.min(options.timeoutMs ?? NARRATOR_BACKUP_LIMITS.jobMs, NARRATOR_BACKUP_LIMITS.jobMs),
+			},
+			options.signal,
+		);
+	}
 
 	// One deadline for the whole export rather than one per table: a per-table budget would let a
 	// project with many tables run for an unbounded total.
@@ -525,31 +614,38 @@ export async function fullSync(
 	// reader between the delete and the refill finds the project's narrators missing, and a
 	// failure while reading them leaves the archive permanently short of narrators the main
 	// database still has.
-	const narratorClear =
-		chapterIds.length > 0
-			? [
-					{
-						// chapterIds are nanoid strings from a DB query — safe to interpolate as
-						// placeholders.
-						sql: `DELETE FROM narrators WHERE chapter_id NOT IN (${chapterIds
-							.map(() => "?")
-							.join(",")}) OR chapter_id IS NULL`,
-						params: chapterIds,
-					},
-				]
-			: [{ sql: "DELETE FROM narrators", params: [] }];
-
-	// Ids come from the MAIN database, so `counts.narrators` keeps meaning "narrators the main
-	// database has" rather than "rows the archive ended up with".
-	let narratorIds: string[] = [];
-	if (chapterIds.length > 0) {
-		narratorIds = (
-			await readAllRows(mainStore, "narrators", {
+	// Only explicitly attributed scopes may be replaced. NULL chapter is NOT proof that
+	// a narrator was deleted: ordinary/context-only sessions deliberately have no chapter.
+	const narratorClear: { sql: string; params: string[] }[] = [
+		{ sql: "DELETE FROM narrators WHERE context_project_id = ?", params: [projectId] },
+	];
+	if (chapterIds.length)
+		narratorClear.push({
+			sql: `DELETE FROM narrators WHERE chapter_id IN (${chapterIds.map(() => "?").join(",")})`,
+			params: chapterIds,
+		});
+	const contextNarrators = await readAllRows(mainStore, "narrators", {
+		filter: { column: "context_project_id", values: [projectId] },
+		...control,
+	});
+	const chapterNarrators = chapterIds.length
+		? await readAllRows(mainStore, "narrators", {
 				filter: { column: "chapter_id", values: chapterIds },
 				...control,
 			})
-		).map((row) => String(row.id));
-	}
+		: [];
+	const narratorIds = [
+		...new Set([...contextNarrators, ...chapterNarrators].map((row) => String(row.id))),
+	];
+	const unknownLegacy = pdb
+		.prepare(
+			"SELECT id FROM narrators WHERE chapter_id IS NULL AND context_project_id IS NULL LIMIT 1",
+		)
+		.get();
+	if (unknownLegacy)
+		logger.warn("Retaining project archive narrators with unknown legacy affiliation", {
+			projectId,
+		});
 	await replaceById(pdb, "narrators", "id", narratorIds, narratorClear, control);
 	for (const narratorId of narratorIds) {
 		await fullSyncNarratorMessages(narratorId, pdb, control);
@@ -616,7 +712,7 @@ function debouncedNarratorSync(narratorId: string): void {
 }
 
 /** Internal entry points exposed for tests only. */
-export const __testing = { syncNarratorMessages };
+export const __testing = { syncNarratorMessages, runNarratorSync };
 
 async function handleEvent(event: NarraForkEvent): Promise<void> {
 	switch (event.type) {

@@ -70,6 +70,13 @@ scripts/lib/__tests__/*
 !scripts/generate-postgres-schema.ts
 !scripts/check-postgres-schema-parity.ts
 !scripts/finalize-postgres-seq-counter-migration.ts
+# Canonical SQLite schema generation must be reproducible in fresh clones.
+!scripts/generate-sqlite-migrations.ts
+!scripts/finalize-sqlite-resource-migration.ts
+!scripts/lib/__tests__/finalize-sqlite-resource-migration.test.ts
+!scripts/lib/__tests__/generate-sqlite-migrations.test.ts
+!scripts/lib/sqlite-generation-lock.ts
+!scripts/lib/__tests__/sqlite-generation-lock.test.ts
 !scripts/lib/__tests__/generate-postgres-schema.test.ts
 !scripts/lib/__tests__/check-postgres-schema-parity.test.ts
 !scripts/lib/__tests__/finalize-postgres-seq-counter-migration.test.ts

@@ -72,6 +72,19 @@ import { getNarraforkPath } from "../lib/narrafork-home";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
 import { snapshotCaptureReceipts } from "./snapshot-capture-receipts";
+import { treeSnapshotPhysicalDir as shadowDir, treeSnapshotKey } from "./tree-snapshot-paths";
+
+export { treeSnapshotKey } from "./tree-snapshot-paths";
+
+import {
+	assertLifecycleProtectionCurrent,
+	confirmLifecyclePathCreated,
+	confirmLifecyclePathRemoved,
+	isResourceProtectionError,
+	lifecycleCreationPath,
+	revalidateLifecycleTarget,
+	withProtectionReservation,
+} from "./worktree-lifecycle-guard";
 import { clearClaims } from "./worktree-write-claims";
 
 export {
@@ -341,23 +354,6 @@ export class TreeRestoreError extends TreeSnapshotError {
 		super(message, cause);
 		this.name = "TreeRestoreError";
 	}
-}
-
-/** Canonical key for one worktree on one device. */
-export function treeSnapshotKey(deviceId: string, worktreePath: string): string {
-	return `${deviceId}\u0000${normalizePathForComparison(worktreePath)}`;
-}
-
-/**
- * Shadow repo location for a worktree.
- *
- * The directory name is a hash of the canonical key rather than the path itself:
- * worktree paths exceed filename limits, contain separators, and differ in case
- * across platforms.
- */
-function shadowDir(deviceId: string, worktreePath: string): string {
-	const digest = createHash("sha256").update(treeSnapshotKey(deviceId, worktreePath)).digest("hex");
-	return resolve(SHADOW_ROOT, digest.slice(0, 32));
 }
 
 interface GitResult {
@@ -1109,24 +1105,59 @@ async function syncExcludesIfStale(dir: string, worktreePath: string): Promise<v
 
 /** Create the shadow bare repo if absent. */
 async function ensureShadowRepo(dir: string, worktreePath: string): Promise<void> {
+	// A retirement may take its final snapshot before removing the checkout.
+	// Record that trusted creation rather than accepting arbitrary inode changes.
+	dir = await lifecycleCreationPath(dir);
 	if (existsSync(resolve(dir, "HEAD"))) {
 		await syncExcludesIfStale(dir, worktreePath);
 		return;
 	}
-	mkdirSync(dir, { recursive: true });
-	// `git init --bare` rejects --work-tree, so this cannot go through runGit.
-	const result = await safeSpawn({
-		cmd: ["git", "init", "--bare", dir],
-		timeout: GIT_TIMEOUT_MS,
-		maxOutputBytes: GIT_MAX_OUTPUT_BYTES,
-	});
-	if (result.exitCode !== 0) {
-		// Remove the half-created directory so it is not mistaken for a valid repo.
-		rmSync(dir, { recursive: true, force: true });
-		throw new TreeSnapshotError(`shadow repo init failed: ${result.stderr.trim()}`);
-	}
-	await syncExcludes(dir, worktreePath);
-	excludeMtimes.delete(dir);
+	await withProtectionReservation(
+		[{ deviceId: LOCAL_DEVICE_ID, path: dir }],
+		"shadow initialization",
+		async () => {
+			dir = await revalidateLifecycleTarget(dir);
+			if (existsSync(resolve(dir, "HEAD"))) {
+				await syncExcludesIfStale(dir, worktreePath);
+				return;
+			}
+			mkdirSync(resolve(dir, ".."), { recursive: true });
+			// An exclusive leaf mkdir, not recursive mkdir's first ancestor, proves
+			// this attempt created D. Pre-existing invalid repos are never disposable.
+			let createdDirectory = false;
+			try {
+				mkdirSync(dir);
+				createdDirectory = true;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			}
+			if (createdDirectory) {
+				const born = lstatSync(dir);
+				if (!born.isDirectory()) throw new TreeSnapshotError("shadow birth is not a directory");
+				await confirmLifecyclePathCreated(dir, `${born.dev}:${born.ino}`);
+			} else dir = await revalidateLifecycleTarget(dir);
+			// `git init --bare` rejects --work-tree, so this cannot go through runGit.
+			const result = await safeSpawn({
+				cmd: ["git", "init", "--bare", dir],
+				timeout: GIT_TIMEOUT_MS,
+				maxOutputBytes: GIT_MAX_OUTPUT_BYTES,
+			});
+			if (result.exitCode !== 0) {
+				if (createdDirectory) {
+					await assertLifecycleProtectionCurrent(
+						[{ deviceId: LOCAL_DEVICE_ID, path: dir }],
+						"shadow initialization rollback",
+					);
+					const frozenDir = await revalidateLifecycleTarget(dir);
+					rmSync(frozenDir, { recursive: true, force: true });
+					await confirmLifecyclePathRemoved(frozenDir);
+				}
+				throw new TreeSnapshotError(`shadow repo init failed: ${result.stderr.trim()}`);
+			}
+			await syncExcludes(dir, worktreePath);
+			excludeMtimes.delete(dir);
+		},
+	);
 }
 
 /**
@@ -3581,42 +3612,66 @@ export const worktreeTreeSnapshot = {
 		options?: { force?: boolean },
 	): Promise<boolean> {
 		const dir = shadowDir(deviceId, worktreePath);
-		if (!options?.force && (await isShadowRepoClaimed(deviceId, worktreePath))) {
-			logger.warn("Kept a tree-snapshot repo that a chapter still references", {
-				worktreePath,
-			});
-			return false;
-		}
-		if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
-		// A warm-up scanning the just-removed directory is pointless and its failure
-		// would otherwise start a cooldown a recreated worktree at this path inherits.
-		// Abort it, drop the in-flight entry so no caller shares a doomed scan, and
-		// clear any cooldown set before the destroy was decided.
-		preemptWarmCapture(dir);
-		warmupInFlight.delete(dir);
-		warmupCooldownUntil.delete(dir);
-		excludeMtimes.delete(dir);
-		// The force-add memo describes an index inside the directory just removed. A
-		// recreated worktree at the same path hashes to the same shadow dir, so a leftover
-		// entry would make its first capture skip staging tracked-but-ignored paths.
-		trackedIgnoredCache.delete(dir);
-		// The recorded hashes describe a repository that no longer exists, so leaving
-		// them behind means every later reader has to probe the filesystem to discover
-		// they are dangling. The doc comment always claimed this happened; it did not.
-		await db
-			.delete(worktreeTreeSnapshots)
-			.where(
-				and(
-					eq(worktreeTreeSnapshots.deviceId, deviceId),
-					eq(worktreeTreeSnapshots.worktreePath, normalizePathForComparison(worktreePath)),
-				),
+		try {
+			return await withProtectionReservation(
+				[
+					{ deviceId, path: worktreePath, shadowKey: treeSnapshotKey(deviceId, worktreePath) },
+					{ deviceId, path: dir },
+				],
+				"shadow destroy",
+				async () =>
+					acquireShadowStructural(dir, async () => {
+						if (!options?.force && (await isShadowRepoClaimed(deviceId, worktreePath))) {
+							logger.warn("Kept a tree-snapshot repo that a chapter still references", {
+								worktreePath,
+							});
+							return false;
+						}
+						const frozenDir = await revalidateLifecycleTarget(dir);
+						if (existsSync(frozenDir)) rmSync(frozenDir, { recursive: true, force: true });
+						await confirmLifecyclePathRemoved(frozenDir);
+						// A warm-up scanning the just-removed directory is pointless and its failure
+						// would otherwise start a cooldown a recreated worktree at this path inherits.
+						// Abort it, drop the in-flight entry so no caller shares a doomed scan, and
+						// clear any cooldown set before the destroy was decided.
+						preemptWarmCapture(dir);
+						warmupInFlight.delete(dir);
+						warmupCooldownUntil.delete(dir);
+						excludeMtimes.delete(dir);
+						// The force-add memo describes an index inside the directory just removed. A
+						// recreated worktree at the same path hashes to the same shadow dir, so a leftover
+						// entry would make its first capture skip staging tracked-but-ignored paths.
+						trackedIgnoredCache.delete(dir);
+						// The recorded hashes describe a repository that no longer exists, so leaving
+						// them behind means every later reader has to probe the filesystem to discover
+						// they are dangling. The doc comment always claimed this happened; it did not.
+						await db
+							.delete(worktreeTreeSnapshots)
+							.where(
+								and(
+									eq(worktreeTreeSnapshots.deviceId, deviceId),
+									eq(worktreeTreeSnapshots.worktreePath, normalizePathForComparison(worktreePath)),
+								),
+							);
+						// The in-memory write declarations describe this same directory, so they die
+						// with it. Cleared here rather than at each call site because a leftover entry
+						// would keep answering overlap questions for a path that no longer exists — and
+						// a recreated worktree at the same path would inherit them.
+						clearClaims(worktreePath);
+						return true;
+					}),
+				undefined,
+				[dir],
 			);
-		// The in-memory write declarations describe this same directory, so they die
-		// with it. Cleared here rather than at each call site because a leftover entry
-		// would keep answering overlap questions for a path that no longer exists — and
-		// a recreated worktree at the same path would inherit them.
-		clearClaims(worktreePath);
-		return true;
+		} catch (error) {
+			if (
+				!options?.force &&
+				isResourceProtectionError(error) &&
+				error.inspection?.status === "protected"
+			)
+				return false;
+			throw error;
+		}
 	},
 
 	/**
