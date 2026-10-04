@@ -8,6 +8,7 @@ import {
 	IconTool,
 } from "@tabler/icons-react";
 
+import { useState } from "react";
 import { useInputMenu } from "../../../hooks/useInputMenu";
 
 export type QueueMode = "turn" | "tool" | "interrupt";
@@ -97,6 +98,7 @@ function SendOptionsMenuContent({
 	onSendWithMode,
 	t,
 }: SendOptionsMenuContentProps) {
+	const [configureKeys, setConfigureKeys] = useState(false);
 	if (compacting && hasInput) {
 		return (
 			<>
@@ -116,7 +118,7 @@ function SendOptionsMenuContent({
 			</>
 		);
 	}
-	if (hasInput) {
+	if (!configureKeys) {
 		return (
 			<>
 				<Menu.Label>{t("sendCurrentInputSection")}</Menu.Label>
@@ -131,11 +133,18 @@ function SendOptionsMenuContent({
 						t={t}
 					/>
 				))}
+				<Menu.Divider />
+				<Menu.Item closeMenuOnClick={false} onClick={() => setConfigureKeys(true)}>
+					{t("sendKeySettings")}
+				</Menu.Item>
 			</>
 		);
 	}
 	return (
 		<>
+			<Menu.Item closeMenuOnClick={false} onClick={() => setConfigureKeys(false)}>
+				{t("sendCurrentInputSection")}
+			</Menu.Item>
 			<Menu.Label>{t("enterKeySection")}</Menu.Label>
 			{QUEUE_MODES.map((mode) => (
 				<QueueModeMenuItem

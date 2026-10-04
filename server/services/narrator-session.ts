@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
+import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { isDanglingReasoningOnlyAssistantMessage } from "@shared/reasoning-content";
@@ -3387,6 +3388,8 @@ export interface UserMessageAdmissionOptions {
 	fileReferences?: FileReferenceSnapshot[];
 	priority?: boolean;
 	interrupt?: boolean;
+	/** Explicit intent, compatible with legacy priority/interrupt callers. */
+	queueMode?: "turn" | "tool" | "interrupt";
 	executionIntent?: BufferedMessage["executionIntent"];
 	/** Compaction policy may require durable acceptance without starting a loop. */
 	queueOnly?: boolean;
@@ -3447,6 +3450,8 @@ export async function acceptUserMessage(
 	options: UserMessageAdmissionOptions = {},
 ): Promise<UserMessageAdmissionResult> {
 	const locale = options.locale ?? "en";
+	const queueMode =
+		options.queueMode ?? (options.interrupt ? "interrupt" : options.priority ? "tool" : "turn");
 	const result = await withNarratorStartAdmission(
 		narratorId,
 		async (): Promise<UserMessageAdmissionResult> => {
@@ -3468,11 +3473,12 @@ export async function acceptUserMessage(
 					options.userId,
 					options.creator,
 					options.textFiles,
-					options.priority || options.interrupt ? "front" : "back",
+					queueMode !== "turn" ? "front" : "back",
 					options.preBashCommand,
 					options.fileReferences,
-					"stack",
+					"fifo",
 					options.executionIntent,
+					queueMode,
 				);
 				if (!accepted.ok) throw new ValidationError("Message queue is full");
 				const queued = {
@@ -3484,14 +3490,14 @@ export async function acceptUserMessage(
 				// must not make HTTP callers retry the same input or discard its attachments.
 				let claimed: RuntimeMailboxRow | undefined;
 				try {
-					if (options.interrupt && busy) {
+					if (queueMode === "interrupt" && busy) {
 						const ownerUnchanged = getExecutionOwner(narratorId) === oldOwner;
 						const controllerUnchanged =
 							activeNarrators.get(narratorId)?.abortController === oldController;
 						const recoveryUnchanged = plannedUpdateRecoveryControls.get(narratorId) === oldRecovery;
 						if (ownerUnchanged && controllerUnchanged && recoveryUnchanged)
 							interruptNarrator(narratorId);
-					} else if (options.priority && busy) {
+					} else if (queueMode === "tool" && busy) {
 						requestBufferedMessageSoftStop(narratorId);
 					}
 					if (busy) await reconcileRunningStatus(narratorId);
@@ -6999,6 +7005,20 @@ export function hasPendingBufferedWork(narratorId: string): boolean {
 	return getBufferedMessages(narratorId).length > 0;
 }
 
+/** A queued next-step or failed input must never keep a guidance stop armed. */
+export function hasPendingBufferedGuidance(narratorId: string): boolean {
+	if (resolveRuntimeQueueBackend() === "postgres") {
+		// Updated after durable admission, queue mutations and consumption. The
+		// synchronous loop boundary must not inspect the PostgreSQL mailbox.
+		return activeNarrators.get(narratorId)?._bufferGuidancePending === true;
+	}
+	return getBufferedMessages(narratorId).some(
+		(message) =>
+			message.state !== "failed" &&
+			resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
+	);
+}
+
 /**
  * Decide whether the agent loop should soft-stop at the current tool boundary.
  *
@@ -7045,7 +7065,27 @@ export function requestBufferedMessageSoftStop(narratorId: string): boolean {
 	const active = activeNarrators.get(narratorId);
 	if (!active?.alive) return false;
 	active._bufferSoftStop = true;
+	active._bufferGuidancePending = true;
+	active._guidanceAbortController?.abort(new Error("Immediate guidance requested"));
 	return true;
+}
+
+export function applyBufferedQueueModeControl(
+	narratorId: string,
+	mode: "turn" | "tool" | "interrupt",
+	hasPendingGuidance = true,
+	targetQueued = true,
+): void {
+	const active = activeNarrators.get(narratorId);
+	if (active) active._bufferGuidancePending = hasPendingGuidance;
+	if (!targetQueued) return;
+	if (mode === "turn") {
+		clearBufferedMessageSoftStopIfIdle(narratorId, hasPendingGuidance);
+		return;
+	}
+	if (!isNarratorRuntimeBusy(narratorId) && !isLoopRunning(narratorId)) return;
+	if (mode === "interrupt") interruptNarrator(narratorId);
+	else requestBufferedMessageSoftStop(narratorId);
 }
 
 /**
@@ -7066,22 +7106,20 @@ export function requestBufferedMessageSoftStop(narratorId: string): boolean {
  */
 export function rearmCutInSoftStopBeforeContinuing(active: ActiveNarrator): void {
 	if (!active._bufferSoftStopTaken) return;
-	if (!hasPendingBufferedWork(active.narratorId)) return;
+	if (!hasPendingBufferedGuidance(active.narratorId)) return;
 	active._bufferSoftStopTaken = false;
 	active._bufferSoftStop = true;
 }
 
-/**
- * Drop a pending soft-stop request when its queued input is gone (cancelled or
- * fully consumed). Without this the flag survives until the next tool boundary
- * and ends the turn with nothing to resume, which looks like the narrator
- * stopping on its own right after the current tool call.
- */
-export function clearBufferedMessageSoftStopIfIdle(narratorId: string): void {
+export function clearBufferedMessageSoftStopIfIdle(
+	narratorId: string,
+	pendingGuidance?: boolean,
+): void {
 	const active = activeNarrators.get(narratorId);
-	if (!active?._bufferSoftStop) return;
-	if (hasPendingBufferedWork(narratorId)) return;
-	active._bufferSoftStop = false;
+	if (!active) return;
+	const pending = pendingGuidance ?? hasPendingBufferedGuidance(narratorId);
+	active._bufferGuidancePending = pending;
+	if (!pending && active._bufferSoftStop) active._bufferSoftStop = false;
 }
 
 // === Dynamic narrator controls ===

@@ -9,6 +9,12 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
+import {
+	type BufferQueueMode,
+	bufferedModePatch,
+	ordinaryBufferReorder,
+	resolveBufferQueueMode,
+} from "@shared/buffer-queue-mode";
 import type { FileReference, FileReferenceSnapshot } from "@shared/file-reference";
 import { MAX_EDIT_TEXT_FILES_PER_MESSAGE, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
@@ -283,6 +289,7 @@ function ensureStagingDirectory(id: string): string {
 	return dir;
 }
 interface StagingMetadata {
+	queueMode?: BufferQueueMode;
 	executionIntent?: BufferedMessage["executionIntent"];
 	stagingId?: string;
 	fileReferencesPath?: string;
@@ -448,6 +455,7 @@ export function projectMailboxUserMessage(row: RuntimeMailboxRow): BufferedMessa
 	const metadata = json<StagingMetadata>(row.metadataJson, {});
 	return {
 		executionIntent: metadata.executionIntent,
+		queueMode: resolveBufferQueueMode(metadata.queueMode, row.priority),
 		id: row.id,
 		state: row.state === "failed" ? "failed" : "queued",
 		error: row.lastError,
@@ -554,6 +562,7 @@ export async function enqueueBufferedMessage(
 	fileReferences?: FileReferenceSnapshot[],
 	frontOrder: "stack" | "fifo" = "stack",
 	executionIntent?: BufferedMessage["executionIntent"],
+	queueMode?: BufferQueueMode,
 ): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
 	const stagingId = generateShortId();
 	const refs = freezeFileReferenceSnapshots(fileReferences);
@@ -576,7 +585,8 @@ export async function enqueueBufferedMessage(
 			payloadRef = { storage: "buffered_file", path, byteSize: bytes, ownership: "mailbox" };
 		}
 		let fileReferencesJson = refs.length ? JSON.stringify(refs) : null;
-		const metadata: StagingMetadata = { stagingId, executionIntent };
+		const metadata: StagingMetadata = { stagingId, executionIntent, queueMode };
+		if (queueMode) frontOrder = "fifo";
 		if (commandText && Buffer.byteLength(commandText) > MAILBOX_LIMITS.metadataBytes / 8) {
 			metadata.commandTextPath = await writeStagingText(stagingId, "command", commandText);
 			commandText = null;
@@ -898,12 +908,16 @@ export async function removeBufferedMessage(
 	cleanupBufferedTextFiles(id);
 	return true;
 }
-export async function reorderBufferedMessages(narratorId: string, ids: string[]): Promise<boolean> {
+export async function updateBufferedMessageMode(
+	narratorId: string,
+	messageId: string,
+	mode: BufferQueueMode,
+): Promise<boolean> {
 	const port = pgQueue();
-	if (port) return port.mailbox.reorderUserPending(narratorId, ids);
+	if (port) return port.mailbox.updateUserBufferedMode(narratorId, messageId, mode);
 	return db.transaction((tx) => {
 		const rows = tx
-			.select({ id: mailbox.id })
+			.select()
 			.from(mailbox)
 			.where(
 				and(
@@ -914,17 +928,49 @@ export async function reorderBufferedMessages(narratorId: string, ids: string[])
 			)
 			.limit(MAILBOX_LIMITS.userPending)
 			.all();
-		if (
-			!rows.length ||
-			ids.length !== rows.length ||
-			new Set(ids).size !== ids.length ||
-			rows.some((row) => !ids.includes(row.id))
-		)
-			return false;
-		// Explicit user ordering supersedes front-insertion priority. Clear the badge
-		// too, so display, peek and claim agree without changing other input kinds.
-		for (const [seq, id] of ids.entries())
-			tx.update(mailbox).set({ seq, priority: false }).where(eq(mailbox.id, id)).run();
+		const row = rows.find((row) => row.id === messageId);
+		if (!row) return false;
+		return (
+			tx
+				.update(mailbox)
+				.set({
+					...bufferedModePatch(row, rows, mode),
+					contentRevision: row.contentRevision + 1,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(
+					and(
+						eq(mailbox.id, row.id),
+						inArray(mailbox.state, pending),
+						eq(mailbox.contentRevision, row.contentRevision),
+					),
+				)
+				.returning({ id: mailbox.id })
+				.all().length === 1
+		);
+	});
+}
+
+export async function reorderBufferedMessages(narratorId: string, ids: string[]): Promise<boolean> {
+	const port = pgQueue();
+	if (port) return port.mailbox.reorderUserPending(narratorId, ids);
+	return db.transaction((tx) => {
+		const rows = tx
+			.select()
+			.from(mailbox)
+			.where(
+				and(
+					eq(mailbox.narratorId, narratorId),
+					eq(mailbox.kind, "user_input"),
+					inArray(mailbox.state, pending),
+				),
+			)
+			.limit(MAILBOX_LIMITS.userPending)
+			.all();
+		const ordinary = ordinaryBufferReorder(rows, ids);
+		if (!rows.length || !ordinary) return false;
+		for (const [seq, id] of ordinary.entries())
+			tx.update(mailbox).set({ seq }).where(eq(mailbox.id, id)).run();
 		return true;
 	});
 }
@@ -1028,6 +1074,7 @@ export interface BufferedTextFileSummary {
 	size: number;
 }
 export interface BufferMessageSummary {
+	queueMode?: BufferQueueMode;
 	state?: "queued" | "failed";
 	error?: string | null;
 	id: string;
@@ -1053,6 +1100,7 @@ export function toBufferSummary(
 		| "_savedFiles"
 		| "creator"
 		| "priority"
+		| "queueMode"
 		| "fileReferences"
 	>[],
 ): BufferMessageSummary[] {
@@ -1089,5 +1137,6 @@ export function toBufferSummary(
 		})(),
 		creator: m.creator ?? null,
 		priority: m.priority || undefined,
+		queueMode: resolveBufferQueueMode(m.queueMode, m.priority),
 	}));
 }

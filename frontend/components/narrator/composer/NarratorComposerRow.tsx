@@ -88,7 +88,6 @@ export interface NarratorComposerRowProps {
 
 export function NarratorComposerRow(props: NarratorComposerRowProps) {
 	const { t } = useTranslation("narrator");
-	const { t: tc } = useTranslation("common");
 
 	const hasInput = props.composerHasText;
 	const hasAttachments = props.composerHasAttachments;
@@ -256,11 +255,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 								}}
 							/>
 						)}
-						<span style={{ position: "relative" }}>
-							{props.queuedMessagesCount > 0
-								? `${t("queue")} (${props.queuedMessagesCount})`
-								: t("queue")}
-						</span>
+						<span style={{ position: "relative" }}>{t(`queueMode_${props.enterQueueMode}`)}</span>
 					</Button>
 				</Tooltip>,
 			);
@@ -274,7 +269,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 				disabled={!hasInput && !hasAttachments}
 				loading={props.isSending}
 			>
-				{tc("send")}
+				{t(`queueMode_${props.enterQueueMode}`)}
 			</Button>,
 		);
 	};

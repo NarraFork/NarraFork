@@ -291,6 +291,8 @@ export type ToolExecutionRouting =
 	  };
 
 export interface PermissionHandlerOptions {
+	/** Per-call preparation cancellation; prefer this over the whole-run signal. */
+	signal?: AbortSignal;
 	/** Exact execution row; never resolve a different row by provider toolUseId. */
 	toolCallBinding?: ToolCallBinding;
 	/** Suppress user-facing attention for an internally resumed permission flow. */
@@ -1205,6 +1207,14 @@ export interface AgentConfig {
 	 * the loop exits gracefully and marks later tool calls in the turn as skipped.
 	 */
 	shouldStop?: () => boolean;
+	/** Event-driven immediate guidance: cancel the provider and unstarted preparation,
+	 * but drain actual running tools. Supply a fresh signal for each loop invocation. */
+	guidanceSignal?: AbortSignal;
+	/** Urgent guidance: cancel provider and tool IO, then persist results and soft-stop.
+	 * Unlike signal, this does not mark the whole narrator run as user-interrupted. */
+	urgentGuidanceSignal?: AbortSignal;
+	/** Internal synchronous boundary after the final fences, immediately before tool.execute. */
+	onToolExecutionInvoking?: (toolUse: AgentToolUse) => void;
 	/**
 	 * Disable streaming-time eager tool execution so shouldStop boundaries can
 	 * guarantee that later serial tools have not already started.

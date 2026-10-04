@@ -11,7 +11,12 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { api } from "../../../lib/api";
 import en from "../../../locales/en/narrator.json";
+import { ImageViewerContext } from "../../common/image-viewer-context";
 import { QueuedAttachmentPreview, QueuedMessageRow } from "../interaction/QueuedMessageRow";
+import {
+	QueuedMessagesPanel,
+	type QueuedMessagesPanelProps,
+} from "../interaction/QueuedMessagesPanel";
 import type { QueuedEditPayload } from "../interaction/queued-attachment-edit";
 import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
 import { MessageEditorPanel, type MessageEditorPanelProps } from "./MessageEditorPanel";
@@ -129,7 +134,9 @@ async function render(child: ReactNode) {
 								},
 							}}
 						>
-							{child}
+							<ImageViewerContext.Provider value={{ open: () => {} }}>
+								{child}
+							</ImageViewerContext.Provider>
 						</EditingMessageCtx.Provider>
 					</MantineProvider>
 				</QueryClientProvider>
@@ -325,8 +332,8 @@ for (const mode of ["message", "queued"] as const) {
 						onRetry={async () => ({ ok: true, resumed: false })}
 						cancelBufferLabel="Cancel"
 						editLabel="Edit"
-						priorityLabel="Priority"
-						priorityNextRequestLabel="Next"
+						onChangeMode={async () => {}}
+						onMove={() => {}}
 					/>
 				);
 			await render(view());
@@ -491,8 +498,8 @@ function queueRow(overrides: Partial<ComponentProps<typeof QueuedMessageRow>> = 
 			onRetry={(id) => api.retryBufferedMessage("target-narrator", id)}
 			cancelBufferLabel="Cancel"
 			editLabel="Edit"
-			priorityLabel="Priority"
-			priorityNextRequestLabel="Next"
+			onChangeMode={async () => {}}
+			onMove={() => {}}
 			{...overrides}
 		/>
 	);
@@ -504,6 +511,8 @@ describe("failed queued message retry UI", () => {
 		expect(document.body.textContent).toContain(en.queuedFailed);
 		expect(document.body.textContent).toContain("Provider refused request");
 		expect(document.body.textContent).toContain("Original input");
+		expect(document.body.textContent).not.toContain("#file:a.ts:2-2");
+		await click(button(en.queuedAttachments.replace("{{count}}", "1")));
 		expect(document.body.textContent).toContain("#file:a.ts:2-2");
 		expect(button(en.queuedRetry).disabled).toBe(false);
 		for (const state of ["queued", undefined] as const) {
@@ -561,6 +570,7 @@ describe("failed queued message retry UI", () => {
 		});
 		try {
 			await render(queueRow());
+			await click(button(en.queuedAttachments.replace("{{count}}", "1")));
 			const retry = button(en.queuedRetry);
 			await act(async () => {
 				retry.dispatchEvent(new Event("click", { bubbles: true }));
@@ -629,8 +639,13 @@ describe("failed queued message retry UI", () => {
 		expect(cancelEdit).toHaveBeenCalledTimes(1);
 		expect(retry).not.toHaveBeenCalled();
 		await render(queueRow({ onRetry: retry, onRemove: remove }));
-		const cancel = document.querySelector('button[title="Cancel"]');
-		if (!cancel) throw new Error("Cancel button missing");
+		const menu = document.querySelector(`button[aria-label="${en.queuedActions}"]`);
+		if (!menu) throw new Error("Queue menu button missing");
+		await click(menu);
+		const cancel = Array.from(document.querySelectorAll('[role="menuitem"]')).find(
+			(item) => item.textContent === "Cancel",
+		);
+		if (!cancel) throw new Error("Cancel menu item missing");
 		await click(cancel);
 		expect(remove).toHaveBeenCalledWith("queue-message");
 		expect(retry).not.toHaveBeenCalled();
@@ -669,8 +684,8 @@ describe("queued reference attachment editor", () => {
 				onRetry={async () => ({ ok: true, resumed: false })}
 				cancelBufferLabel="Cancel"
 				editLabel="Edit"
-				priorityLabel="Priority"
-				priorityNextRequestLabel="Next"
+				onChangeMode={async () => {}}
+				onMove={() => {}}
 			/>,
 		);
 		await click(button(`${en.removeFile}: a.ts`));
@@ -682,5 +697,260 @@ describe("queued reference attachment editor", () => {
 		expect(cancel).not.toHaveBeenCalled();
 		await click(button(`${en.removeFile}: a.ts`));
 		expect(save.disabled).toBe(true);
+	});
+});
+
+function queuePanel(overrides: Partial<QueuedMessagesPanelProps> = {}) {
+	return (
+		<QueuedMessagesPanel
+			queuedMessages={[]}
+			queueExpanded
+			editingQueuedId={null}
+			setQueueExpanded={() => {}}
+			handleDragEndQueued={() => {}}
+			handleMoveQueued={() => {}}
+			handleChangeMode={async () => {}}
+			handleSaveEditQueued={async () => true}
+			handleCancelEditQueued={() => {}}
+			handleStartEditQueued={() => {}}
+			handleRemoveQueued={() => {}}
+			handleRetryQueued={async () => ({ ok: true, resumed: false })}
+			handleCancelAllQueued={() => {}}
+			{...overrides}
+		/>
+	);
+}
+
+describe("real queued panel composition", () => {
+	for (const change of [
+		"cancel head",
+		"consume head",
+		"split segment",
+		"merge segments",
+		"change edited mode",
+		"move ordinary head",
+		"drag ordinary head",
+		"collapsed single grows while editing",
+	] as const) {
+		test(`unsaved body, new attachments and undo survive ${change}`, async () => {
+			let messages: QueuedMessagesPanelProps["queuedMessages"] = [
+				{ id: "head", text: "Head", queueMode: "turn", imageCount: 0, bufferedAt: "now" },
+				{ id: "edited", text: "Original", queueMode: "turn", imageCount: 0, bufferedAt: "now" },
+				{ id: "tail", text: "Tail", queueMode: "turn", imageCount: 0, bufferedAt: "now" },
+			];
+			if (change === "merge segments") messages[0].queueMode = "tool";
+			const collapsedSingle = change === "collapsed single grows while editing";
+			if (collapsedSingle) messages = [messages[1]];
+			let editingQueuedId: string | null = "edited";
+			const setQueueExpanded = mock((_expanded: boolean) => {});
+			const save = mock(
+				async (
+					_msg: unknown,
+					_text: string,
+					_payload: Parameters<QueuedMessagesPanelProps["handleSaveEditQueued"]>[2],
+				) => false,
+			);
+			const view = () =>
+				queuePanel({
+					queuedMessages: messages,
+					editingQueuedId,
+					queueExpanded: !collapsedSingle,
+					setQueueExpanded,
+					handleSaveEditQueued: save,
+					handleRemoveQueued: (id) => {
+						messages = messages.filter((message) => message.id !== id);
+					},
+					handleMoveQueued: (id, direction) => {
+						const index = messages.findIndex((message) => message.id === id);
+						const nextIndex = index + direction;
+						if (index < 0 || nextIndex < 0 || nextIndex >= messages.length) return;
+						messages = [...messages];
+						[messages[index], messages[nextIndex]] = [messages[nextIndex], messages[index]];
+					},
+				});
+			await render(view());
+			await editRange(0, "Original".length, "Unsaved body");
+			const image = new File(["gif"], "draft.gif", { type: "image/gif" });
+			const textFile = new File(["draft content"], "draft.txt", { type: "text/plain" });
+			await act(async () => {
+				const { textarea, props } = textareaProps();
+				props.onPaste?.({
+					currentTarget: textarea,
+					clipboardData: {
+						items: [image, textFile].map((file) => ({
+							kind: "file",
+							type: file.type,
+							getAsFile: () => file,
+						})),
+					},
+					preventDefault() {},
+				} as unknown as Parameters<NonNullable<typeof props.onPaste>>[0]);
+				await flush();
+			});
+			const textareaBefore = textareaProps().textarea;
+			if (change === "cancel head" || change === "move ordinary head") {
+				const menu = document.querySelectorAll(`button[aria-label="${en.queuedActions}"]`)[1];
+				if (!menu) throw new Error("Head row menu missing");
+				await click(menu);
+				const label = change === "cancel head" ? en.cancelBuffer : en.queuedMoveDown;
+				const action = Array.from(document.querySelectorAll('[role="menuitem"]')).find(
+					(node) => node.textContent === label,
+				);
+				if (!action) throw new Error(`Head action missing: ${label}`);
+				await click(action);
+			} else if (collapsedSingle) {
+				messages = [
+					...messages,
+					{ id: "new", text: "New arrival", queueMode: "turn", imageCount: 0, bufferedAt: "later" },
+				];
+			} else if (change === "consume head") {
+				messages = messages.slice(1);
+			} else if (change === "drag ordinary head") {
+				// The parent applies a drag's resulting authoritative queue order.
+				messages = [messages[1], messages[2], messages[0]];
+			} else if (change === "change edited mode") {
+				messages = messages.map((message) =>
+					message.id === "edited" ? { ...message, queueMode: "interrupt" } : message,
+				);
+			} else {
+				messages = messages.map((message) =>
+					message.id === "head"
+						? { ...message, queueMode: change === "split segment" ? "tool" : "turn" }
+						: message,
+				);
+			}
+			// A buffer_set also replaces summary objects; this must not re-seed drafts.
+			messages = messages.map((message) => ({ ...message }));
+			await render(view());
+			expect(host?.querySelector("textarea")).not.toBeNull();
+			expect(textareaProps().textarea.value).toBe("Unsaved body");
+			expect(textareaProps().textarea).toBe(textareaBefore);
+			expect(host?.querySelector('img[alt="draft.gif"]')).not.toBeNull();
+			expect(host?.textContent).toContain("draft.txt");
+			await editorKey("Enter");
+			expect(save).toHaveBeenCalledTimes(1);
+			expect(save.mock.calls[0][1]).toBe("Unsaved body");
+			expect(save.mock.calls[0][2].newImages).toEqual([image]);
+			expect(save.mock.calls[0][2].newTextFiles).toEqual([textFile]);
+			await editorKey("z", true);
+			expect(textareaProps().textarea.value).toBe("Original");
+			if (collapsedSingle) {
+				const toggle = host?.querySelector<HTMLButtonElement>("[data-queue-summary] button");
+				if (!toggle) throw new Error("Queue visibility toggle missing");
+				// Editing pins the list open and disables manual collapse until editing ends.
+				expect(toggle.getAttribute("aria-expanded")).toBe("true");
+				expect(toggle.disabled).toBe(true);
+				await click(toggle);
+				expect(setQueueExpanded).not.toHaveBeenCalled();
+				expect(textareaProps().textarea).toBe(textareaBefore);
+				editingQueuedId = null;
+				await render(view());
+				// Once editing ends, the unchanged user's collapsed preference takes effect.
+				expect(host?.querySelector("textarea")).toBeNull();
+				expect(toggle.getAttribute("aria-expanded")).toBe("false");
+				expect(toggle.disabled).toBe(false);
+				expect(host?.textContent).not.toContain("New arrival");
+				expect(setQueueExpanded).not.toHaveBeenCalled();
+			}
+		});
+	}
+	test("two-line message preview expands by pointer and keyboard without losing text", async () => {
+		const fullText = "First line\nSecond line\nThird line\nFourth line";
+		await render(
+			queueRow({ msg: { id: "long", text: fullText, imageCount: 0, bufferedAt: "now" } }),
+		);
+		const preview = document.querySelector<HTMLButtonElement>(
+			`button[aria-label="${en.queuedExpandText}"]`,
+		);
+		if (!preview) throw new Error("Expandable message preview missing");
+		expect(preview.getAttribute("aria-expanded")).toBe("false");
+		expect(preview.getAttribute("data-line-clamp")).toBe("true");
+		await click(preview);
+		expect(preview.getAttribute("aria-expanded")).toBe("true");
+		expect(preview.hasAttribute("data-line-clamp")).toBe(false);
+		expect(preview.textContent).toBe(fullText);
+		for (const key of ["Enter", " "]) {
+			await act(async () => {
+				const event = new Event("keydown", { bubbles: true, cancelable: true });
+				Object.defineProperty(event, "key", { value: key });
+				preview.dispatchEvent(event);
+			});
+			expect(preview.getAttribute("aria-expanded")).toBe(key === "Enter" ? "false" : "true");
+		}
+		expect(preview.getAttribute("aria-expanded")).toBe("true");
+		expect(preview.getAttribute("aria-label")).toBe(en.queuedCollapseText);
+	});
+
+	test("guidance modes have distinct borders and labels; only ordinary edit has a drag handle", async () => {
+		for (const [mode, color] of [
+			["turn", "default-border"],
+			["tool", "indigo-4"],
+			["interrupt", "orange-5"],
+		] as const) {
+			const msg = { id: mode, queueMode: mode, text: "Message", imageCount: 0, bufferedAt: "now" };
+			await render(queuePanel({ queuedMessages: [msg] }));
+			const body = host?.querySelector(`[data-queue-mode="${mode}"]`);
+			expect(body?.getAttribute("style")).toContain(`var(--mantine-color-${color})`);
+			expect(host?.textContent).toContain(en[`queueMode_${mode}`]);
+			await render(queueRow({ msg, isEditing: true }));
+			expect(host?.querySelector("[data-queue-drag-handle]") !== null).toBe(mode === "turn");
+		}
+	});
+	test("mixed guidance preserves FIFO and only consecutive modes share headings", async () => {
+		const modes = ["tool", "interrupt", "tool", "tool", "turn"] as const;
+		await render(
+			queuePanel({
+				queuedMessages: modes.map((queueMode, index) => ({
+					id: `fifo-${index}`,
+					text: `FIFO message ${index}`,
+					queueMode,
+					bufferedAt: "now",
+					imageCount: 0,
+				})),
+			}),
+		);
+		const content = host?.textContent ?? "";
+		for (let index = 0; index < modes.length - 1; index++) {
+			expect(content.indexOf(`FIFO message ${index}`)).toBeLessThan(
+				content.indexOf(`FIFO message ${index + 1}`),
+			);
+		}
+		// Summary has aggregate counts, list headings represent four consecutive segments.
+		const headings = Array.from(host?.querySelectorAll("p") ?? []).filter((node) =>
+			[en.queueMode_tool, en.queueMode_interrupt, en.queueMode_turn].includes(
+				node.textContent ?? "",
+			),
+		);
+		expect(headings.map((node) => node.textContent)).toEqual([
+			en.queueMode_tool,
+			en.queueMode_interrupt,
+			en.queueMode_tool,
+			en.queueMode_turn,
+		]);
+	});
+
+	test("single message has no duplicate summary and clear lives in its row menu", async () => {
+		const clear = mock(() => {});
+		await render(
+			queuePanel({
+				queueExpanded: false,
+				handleCancelAllQueued: clear,
+				queuedMessages: [
+					{ id: "only", text: "Only message", queueMode: "tool", imageCount: 0, bufferedAt: "now" },
+				],
+			}),
+		);
+		expect(host?.querySelector("[data-queue-summary]")).toBeNull();
+		expect(host?.textContent).toContain("Only message");
+		expect((host?.textContent ?? "").split(en.queueMode_tool)).toHaveLength(2);
+		const menu = document.querySelector(`button[aria-label="${en.queuedActions}"]`);
+		if (!menu) throw new Error("Row menu missing");
+		await click(menu);
+		const clearItem = Array.from(document.querySelectorAll('[role="menuitem"]')).find(
+			(node) => node.textContent === en.clearAllQueued,
+		);
+		if (!clearItem) throw new Error("Single-row clear action missing");
+		await click(clearItem);
+		expect(clear).toHaveBeenCalledTimes(1);
 	});
 });

@@ -132,6 +132,7 @@ describe("narrator interrupt send", () => {
 			expect.any(AbortSignal),
 			[reference],
 			true,
+			"interrupt",
 		]);
 		expect(queue.map((message) => message.id)).toEqual(["replacement", "existing"]);
 		expect(queue[0]).toMatchObject({ priority: true, fileReferences: [reference] });
@@ -161,6 +162,7 @@ describe("narrator interrupt send", () => {
 			expect.any(AbortSignal),
 			[reference],
 			mode === "interrupt" ? true : undefined,
+			mode,
 		]);
 		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
 		expect(queue.map((message) => message.id)).toEqual(
@@ -192,12 +194,13 @@ describe("narrator interrupt send", () => {
 	test.each([
 		false,
 		true,
-	])("idle subagent never carries hard-interrupt intent (takenOver=%s)", async (isTakenOver) => {
+	])("idle subagent preserves urgent guidance intent (takenOver=%s)", async (isTakenOver) => {
 		await render({ isActive: false, isSubagent: true, isTakenOver });
 		await act(async () => actions.handleSend());
 		expect(send).toHaveBeenCalledTimes(1);
 		expect(send.mock.calls[0]?.[4]).toBe(true);
-		expect(send.mock.calls[0]?.[8]).toBeUndefined();
+		expect(send.mock.calls[0]?.[8]).toBe(true);
+		expect(send.mock.calls[0]?.[9]).toBe("interrupt");
 		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
 	});
 
@@ -253,12 +256,13 @@ describe("narrator interrupt send", () => {
 	test.each([
 		false,
 		true,
-	])("subagent preserves existing queue behavior (takenOver=%s)", async (isTakenOver) => {
+	])("subagent uses one durable urgent guidance request (takenOver=%s)", async (isTakenOver) => {
 		await render({ isSubagent: true, isTakenOver });
 		await act(async () => actions.handleSend());
 		expect(send).toHaveBeenCalledTimes(1);
 		expect(send.mock.calls[0]?.[4]).toBe(true);
-		expect(send.mock.calls[0]?.[8]).toBeUndefined();
+		expect(send.mock.calls[0]?.[8]).toBe(true);
+		expect(send.mock.calls[0]?.[9]).toBe("interrupt");
 		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
 	});
 });

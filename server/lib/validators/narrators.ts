@@ -154,11 +154,15 @@ export const codexFingerprintSchema = z.object({
 	extraHeaders: z.record(z.string(), z.string().max(2048)).optional(),
 });
 
+export const bufferQueueModeSchema = z.enum(["turn", "tool", "interrupt"]);
+export const updateBufferedMessageModeSchema = z.object({ mode: bufferQueueModeSchema }).strict();
+
 export const sendMessageSchema = z
 	.object({
 		message: z.string().default(""),
 		priority: z.boolean().optional(),
 		interrupt: z.boolean().optional(),
+		queueMode: bufferQueueModeSchema.optional(),
 		fileReferences: fileReferencesSchema.optional(),
 	})
 	.refine((body) => !!body.message.trim() || !!body.fileReferences?.length, {

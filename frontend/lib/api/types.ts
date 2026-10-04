@@ -928,6 +928,8 @@ export interface BufferMessageSummary {
 	fileReferences?: FileReference[];
 	creator?: BufferCreator | null;
 	priority?: boolean;
+	/** Explicit sending intent; older servers only provide priority. */
+	queueMode?: "turn" | "tool" | "interrupt";
 }
 
 export interface TreeMessage {

@@ -7,7 +7,7 @@ import {
 import { Hono } from "hono";
 import { AppError, ValidationError } from "../../lib/errors";
 import { parseFileReferenceInput } from "../../lib/file-reference-input";
-import { sendMessageSchema } from "../../lib/validators/narrators";
+import { bufferQueueModeSchema, sendMessageSchema } from "../../lib/validators/narrators";
 
 // Run the real parser/HTTP handler with injected service boundaries, without
 // initializing the database or mocking process-global agent modules.
@@ -94,6 +94,7 @@ function fixture(
 		ValidationError,
 		parseFileReferenceInput,
 		sendMessageSchema,
+		bufferQueueModeSchema,
 		MAX_EDIT_IMAGES_PER_MESSAGE,
 		MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 		fileReferenceMessageForDisplay,
@@ -228,6 +229,37 @@ function multipart(interrupt?: string) {
 }
 
 describe("primary HTTP message admission", () => {
+	test.each([
+		"turn",
+		"tool",
+		"interrupt",
+	] as const)("explicit JSON mode %s overrides legacy flags", async (queueMode) => {
+		const f = fixture({ buffered: true });
+		expect(
+			(await f.post({ message: "hello", queueMode, priority: true, interrupt: true })).status,
+		).toBe(202);
+		const admission = f.accept.mock.calls[0]?.[2];
+		expect(admission?.queueMode).toBe(queueMode);
+		expect(admission?.priority).toBe(queueMode !== "turn");
+		expect(admission?.interrupt).toBe(queueMode === "interrupt");
+	});
+	test("multipart explicit turn survives parsing and disables urgent flags", async () => {
+		const f = fixture({ buffered: true });
+		const body = multipart("true");
+		body.set("queueMode", "turn");
+		body.set("priority", "true");
+		expect((await f.post(body)).status).toBe(202);
+		expect(f.accept.mock.calls[0]?.[2].queueMode).toBe("turn");
+		expect(f.accept.mock.calls[0]?.[2].interrupt).toBe(false);
+		expect(f.accept.mock.calls[0]?.[2].priority).toBe(false);
+	});
+	test("invalid multipart mode is rejected before upload writes", async () => {
+		const f = fixture();
+		const body = multipart();
+		body.set("queueMode", "urgent");
+		expect((await f.post(body)).status).toBe(400);
+		expect(f.accept).not.toHaveBeenCalled();
+	});
 	test.each([
 		true,
 		false,

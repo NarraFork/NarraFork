@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
+import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import {
 	type FileReference,
@@ -169,6 +170,7 @@ import {
 	asyncQuestionAnswerSchema,
 	asyncQuestionListQuerySchema,
 	browserInteractSchema,
+	bufferQueueModeSchema,
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,
 	createNarratorSchema,
@@ -198,6 +200,7 @@ import {
 	suggestAnswersSchema,
 	updateBlacklistCmdSchema,
 	updateBlacklistDirSchema,
+	updateBufferedMessageModeSchema,
 	updateBufferedMessageSchema,
 	updateNarratorDraftSchema,
 	updateNarratorHandleSchema,
@@ -279,6 +282,7 @@ import {
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
 	retryBufferedMessage,
+	updateBufferedMessageMode,
 } from "../services/narrator-buffer";
 import {
 	getNarratorDraft,
@@ -478,11 +482,15 @@ export async function parseMessageRequest(
 	textFiles: File[];
 	priority?: boolean;
 	interrupt?: boolean;
+	queueMode?: import("@shared/buffer-queue-mode").BufferQueueMode;
 	fileReferences?: FileReference[];
 }> {
 	const contentType = c.req.header("content-type") ?? "";
 	if (contentType.includes("multipart/form-data")) {
 		const formData = await c.req.formData();
+		const rawMode = formData.get("queueMode");
+		const modeResult = bufferQueueModeSchema.optional().safeParse(rawMode ?? undefined);
+		if (!modeResult.success) throw new ValidationError(modeResult.error.message);
 		const rawMessage = formData.get("message");
 		const message = typeof rawMessage === "string" ? rawMessage : "";
 		const fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
@@ -540,6 +548,7 @@ export async function parseMessageRequest(
 			textFiles: textFileEntries,
 			priority: priority || undefined,
 			interrupt: formData.get("interrupt") === "true" || undefined,
+			queueMode: modeResult.data,
 			fileReferences,
 		};
 	}
@@ -552,6 +561,7 @@ export async function parseMessageRequest(
 		textFiles: [],
 		priority: parsed.data.priority,
 		interrupt: parsed.data.interrupt,
+		queueMode: parsed.data.queueMode,
 		fileReferences: parsed.data.fileReferences,
 	};
 }
@@ -1895,13 +1905,17 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		images,
 		textFiles,
 		priority: requestedPriority,
-		interrupt,
+		interrupt: requestedInterrupt,
+		queueMode,
 		fileReferences,
 	} = await parseMessageRequest(c, id);
-	// Hard interruption is a primary-narrator intent; subagents keep their existing queue contract.
-	const priority = isSubagentVariant(narrator.variant)
-		? requestedPriority
-		: requestedPriority || interrupt;
+	// Explicit mode wins over legacy booleans; omission retains existing callers.
+	const interrupt = queueMode ? queueMode === "interrupt" : requestedInterrupt;
+	const priority = queueMode
+		? queueMode !== "turn"
+		: isSubagentVariant(narrator.variant)
+			? requestedPriority
+			: requestedPriority || interrupt;
 	const userId = c.get("user").sub;
 	// Only a successfully persisted message/queue owns these uploads. In particular,
 	// a rejected reference must not strand images saved by multipart parsing.
@@ -1963,6 +1977,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				commandText: message,
 				locale: await getUserLanguage(userId),
 				interrupt: true,
+				queueMode,
 				executionIntent: { controlCommand: true },
 			});
 			// Controls do not consume attachments; retain the direct path's cleanup.
@@ -2236,6 +2251,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					createdBy: userId,
 					prePromptBashCommand,
 					priority,
+					queueMode,
 					requestSoftStop: !takenOver,
 					fileReferences: snapshots,
 				});
@@ -2326,6 +2342,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			fileReferences: snapshots,
 			priority,
 			interrupt,
+			queueMode,
 			queueOnly: queueBehindCompaction,
 			executionIntent: modelOverride?.model ? { modelOverride } : undefined,
 		});
@@ -3137,19 +3154,79 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	return c.json({ ok: true });
 });
 
+/** Called under start admission; only signal owners, never await their finalizers. */
+async function applyPendingBufferModeControl(
+	id: string,
+	mid: string,
+	mode: import("@shared/buffer-queue-mode").BufferQueueMode,
+	child: boolean,
+): Promise<void> {
+	const applyControl = child
+		? (await import("../services/subagent-executor")).applySubagentBufferedQueueModeControl
+		: (await import("../services/narrator-session")).applyBufferedQueueModeControl;
+	// Always consult async authority: PostgreSQL must not fall into SQLite probes.
+	// Resolve imports first so there is no async gap between authority and signaling.
+	const remaining = await getBufferedMessagesAsync(id);
+	const target = remaining.find((message) => message.id === mid);
+	const targetQueued = target !== undefined && target.state !== "failed";
+	const effectiveMode = target ? resolveBufferQueueMode(target.queueMode, target.priority) : mode;
+	const hasPendingGuidance = remaining.some(
+		(message) =>
+			message.state !== "failed" &&
+			resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
+	);
+	applyControl(id, effectiveMode, hasPendingGuidance, targetQueued);
+}
+
+// Changing a queued mode never mutates or retries its durable payload.
+narratorRoutes.patch("/:id/buffer/:mid/mode", async (c) => {
+	const id = c.req.param("id");
+	const mid = c.req.param("mid");
+	const parsed = updateBufferedMessageModeSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { withNarratorStartAdmission } = await import("../services/narrator-session-state");
+	const narrator = await narratorService.getById(id);
+	await withNarratorStartAdmission(id, async () => {
+		if (!(await updateBufferedMessageMode(id, mid, parsed.data.mode))) {
+			throw new AppError("Buffered message was claimed or is no longer pending", 409, "CONFLICT");
+		}
+		await applyPendingBufferModeControl(
+			id,
+			mid,
+			parsed.data.mode,
+			isSubagentVariant(narrator.variant),
+		);
+	});
+	await broadcastBufferQueue(id);
+	return c.json({ ok: true });
+});
+
 // Explicit retry retains the stable mailbox/recipient identity and resets failed attempts.
 narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 	const id = c.req.param("id");
 	const mid = c.req.param("mid");
-	let retried: boolean;
-	try {
-		retried = await retryBufferedMessage(id, mid);
-	} catch (error) {
-		throw new ValidationError(
-			error instanceof Error ? error.message : "Buffered payload unavailable",
+	const { withNarratorStartAdmission } = await import("../services/narrator-session-state");
+	const narrator = await narratorService.getById(id);
+	await withNarratorStartAdmission(id, async () => {
+		// Retain mode before the transition: the recovered row may be claimed immediately.
+		const previous = (await getBufferedMessagesAsync(id)).find((message) => message.id === mid);
+		let retried: boolean;
+		try {
+			retried = await retryBufferedMessage(id, mid);
+		} catch (error) {
+			throw new ValidationError(
+				error instanceof Error ? error.message : "Buffered payload unavailable",
+			);
+		}
+		if (!retried) throw new ValidationError("Only a failed user message can be retried");
+		// A control failure must not roll back or repeat this committed durable transition.
+		await applyPendingBufferModeControl(
+			id,
+			mid,
+			resolveBufferQueueMode(previous?.queueMode, previous?.priority),
+			isSubagentVariant(narrator.variant),
 		);
-	}
-	if (!retried) throw new ValidationError("Only a failed user message can be retried");
+	});
 	const { wakeInboxIfEligible } = await import("../services/agent-runtime/inbox");
 	const resumed = await wakeInboxIfEligible(id);
 	await broadcastBufferQueue(id);
@@ -3164,8 +3241,16 @@ narratorRoutes.delete("/:id/buffer/:mid", async (c) => {
 	// state; the primary counterpart is cleared below for the same queue identity.
 	const { removeSubagentBufferedMessage } = await import("../services/narrator-subagent");
 	const ok = await removeSubagentBufferedMessage(id, mid);
-	if (ok) clearBufferedMessageSoftStopIfIdle(id);
 	if (!ok) throw new NotFoundError("Buffered message", mid);
+	const remaining = await getBufferedMessagesAsync(id);
+	clearBufferedMessageSoftStopIfIdle(
+		id,
+		remaining.some(
+			(message) =>
+				message.state !== "failed" &&
+				resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
+		),
+	);
 	await broadcastBufferQueue(id);
 	return c.json({ ok: true });
 });
@@ -3188,8 +3273,16 @@ narratorRoutes.delete("/:id/buffer", async (c) => {
 	// One persistent cancellation, plus each actor adapter's ephemeral soft stop.
 	const { clearSubagentBufferedMessages } = await import("../services/narrator-subagent");
 	await clearSubagentBufferedMessages(id);
-	clearBufferedMessageSoftStopIfIdle(id);
-	broadcastToNarrator(id, { type: "buffer_set", narratorId: id, messages: [] });
+	const remaining = await getBufferedMessagesAsync(id);
+	clearBufferedMessageSoftStopIfIdle(
+		id,
+		remaining.some(
+			(message) =>
+				message.state !== "failed" &&
+				resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
+		),
+	);
+	await broadcastBufferQueue(id);
 	return c.json({ ok: true });
 });
 
