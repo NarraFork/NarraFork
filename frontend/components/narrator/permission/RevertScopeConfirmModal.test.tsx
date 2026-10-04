@@ -1031,13 +1031,7 @@ describe("fixed plan apply and history-only branches", () => {
 			const apply = deferredResponse();
 			respond = (request) =>
 				request.url.pathname.endsWith("/apply") ? apply.promise : normalResponse(request);
-			const resources = [
-				"messages",
-				"file-modifications",
-				"file-diff",
-				"file-tree-status",
-				"tool-calls",
-			];
+			const resources = ["messages", "file-tree-status", "tool-calls"];
 			for (const resource of resources)
 				queryClient.setQueryData(["narrators", "narrator-test", resource], {});
 			await renderAction();

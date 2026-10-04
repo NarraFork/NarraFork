@@ -107,65 +107,7 @@ export function useFileTreeStatus(narratorId: string, enabled = true, root?: str
 	});
 }
 
-// --- File modifications ---
-
-export function useFileModifications(
-	narratorId: string,
-	enabled = true,
-	upToMessageId?: string | null,
-	fromMessageId?: string | null,
-) {
-	return useQuery({
-		queryKey: [
-			"narrators",
-			narratorId,
-			"file-modifications",
-			fromMessageId ?? "start",
-			upToMessageId ?? "all",
-		],
-		queryFn: () =>
-			api.getFileModifications(narratorId, upToMessageId ?? undefined, fromMessageId ?? undefined),
-		enabled,
-		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
-	});
-}
-
-export function useFileDiff(
-	narratorId: string,
-	snapshotId: string,
-	enabled = false,
-	upToMessageId?: string | null,
-	fromMessageId?: string | null,
-) {
-	return useQuery({
-		queryKey: [
-			"narrators",
-			narratorId,
-			"file-diff",
-			snapshotId,
-			fromMessageId ?? "start",
-			upToMessageId ?? "all",
-		],
-		queryFn: () =>
-			api.getFileDiff(
-				narratorId,
-				snapshotId,
-				upToMessageId ?? undefined,
-				fromMessageId ?? undefined,
-			),
-		enabled: enabled && !!snapshotId,
-		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
-	});
-}
-
-export function useDeletePreview(narratorId: string, messageId: string | null, enabled = false) {
-	return useQuery({
-		queryKey: ["narrators", narratorId, "delete-preview", messageId],
-		queryFn: () => api.getDeletePreview(narratorId, messageId as string),
-		enabled: enabled && !!messageId,
-		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
-	});
-}
+// --- File rollback previews ---
 
 export function useRollbackPreview(
 	narratorId: string,
@@ -562,13 +504,7 @@ export function useRevertHistoryAction(narratorId: string) {
 		},
 		onSettled: () => {
 			// A lost response or a compensated result can still change what is visible.
-			for (const resource of [
-				"messages",
-				"file-modifications",
-				"file-diff",
-				"file-tree-status",
-				"tool-calls",
-			]) {
+			for (const resource of ["messages", "file-tree-status", "tool-calls"]) {
 				void qc.invalidateQueries({ queryKey: ["narrators", narratorId, resource] });
 			}
 		},
@@ -585,27 +521,6 @@ export function usePermissionFilePreview(
 		queryFn: () => api.getPermissionFilePreview(narratorId, toolUseId as string),
 		enabled: enabled && !!toolUseId,
 		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
-	});
-}
-
-export function useRevertFile(narratorId: string) {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: (target: { deviceId: string; filePath: string }) =>
-			api.revertFile(narratorId, target),
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["narrators", narratorId, "file-modifications"] });
-		},
-	});
-}
-
-export function useUnrevertAll(narratorId: string) {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: () => api.unrevertAll(narratorId),
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["narrators", narratorId, "file-modifications"] });
-		},
 	});
 }
 

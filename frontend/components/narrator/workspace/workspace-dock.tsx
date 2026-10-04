@@ -39,10 +39,7 @@ import type { PluginUiSessionContext } from "../../plugins/PluginUiSurfaceContex
 import { PluginUiSurfaceProvider } from "../../plugins/PluginUiSurfaceContext";
 import { filePanelIdentity, type NarratorToolPanelType } from "../dock/dock-panel-types";
 import type { NarratorBrowserInfo, NarratorDockContextValue } from "../dock/NarratorDockContext";
-import type {
-	FileModPanelExternalProps,
-	NarratorDetailsPanelExternalProps,
-} from "../narrator-panel-types";
+import type { NarratorDetailsPanelExternalProps } from "../narrator-panel-types";
 import { focusMessagePanel } from "../panels/focus-message-panel";
 import {
 	type FileOpenOptions,
@@ -60,7 +57,6 @@ import {
 
 /** The published + bridged state we shard per narrator. */
 interface NarratorDockShard {
-	fileModProps: FileModPanelExternalProps | null;
 	fileReferenceSelection: FileReferenceEditorSelection | null;
 	detailsProps: NarratorDetailsPanelExternalProps | null;
 	browserInfo: NarratorBrowserInfo;
@@ -71,7 +67,6 @@ const EMPTY_TOOL_TYPES: ReadonlySet<NarratorToolPanelType> = new Set();
 
 function emptyShard(): NarratorDockShard {
 	return {
-		fileModProps: null,
 		fileReferenceSelection: null,
 		detailsProps: null,
 		browserInfo: { sessionCount: 0, visualChange: null },
@@ -215,11 +210,6 @@ export class WorkspaceDockStore {
 		const prev = this.getSnapshot(narratorId);
 		this.shards.set(narratorId, { ...prev, ...patch });
 		this.emit(narratorId);
-	}
-
-	setFileModProps(narratorId: string, props: FileModPanelExternalProps | null) {
-		if (this.getSnapshot(narratorId).fileModProps === props) return;
-		this.patch(narratorId, { fileModProps: props });
 	}
 
 	setDetailsProps(narratorId: string, props: NarratorDetailsPanelExternalProps | null) {
@@ -937,13 +927,11 @@ export function useWorkspaceNarratorDockValue(
 
 	// Stable methods (keyed on store + narrator only, NOT on the reactive shard)
 	// so consumers that key effects on callback identity — e.g. NarratorPanel's
-	// file-mod / details / browser publish effects — don't re-run on every shard
+	// details / browser publish effects — don't re-run on every shard
 	// update. Mirrors the focus page's stable `useState` setters.
 	const methods = useMemo(() => {
 		if (!store) return null;
 		return {
-			setFileModProps: (props: FileModPanelExternalProps | null) =>
-				store.setFileModProps(narratorId, props),
 			setDetailsProps: (props: NarratorDetailsPanelExternalProps | null) =>
 				store.setDetailsProps(narratorId, props),
 			setBrowserInfo: (info: NarratorBrowserInfo) => store.setBrowserInfo(narratorId, info),
@@ -996,7 +984,6 @@ export function useWorkspaceNarratorDockValue(
 			onBack: null,
 			onMinimize: null,
 			apiRef: store.apiRef,
-			fileModProps: shard.fileModProps,
 			fileReferenceSelection: shard.fileReferenceSelection,
 			detailsProps: shard.detailsProps,
 			browserInfo: shard.browserInfo,

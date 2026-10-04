@@ -24,39 +24,16 @@ import {
 	Text,
 	Textarea,
 } from "@mantine/core";
-import { IconFileCode } from "@tabler/icons-react";
-import { type CSSProperties, type ReactNode, useContext, useEffect, useRef, useState } from "react";
+import { type CSSProperties, useContext, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarratorPermissionsCapability } from "../../../hooks/usePlatform";
 import { DiffView } from "../diff/DiffView";
 import { MESSAGE_SELECTION_IGNORE_ATTR } from "../message/MessageSelectionCtx";
 import { AskUserQuestionBanner, coerceQuestions } from "../question/AskUserQuestionBanner";
-import { FileModDrawerCtx, PermEnterHintCtx } from "../tool-call/tool-call-contexts";
+import { PermEnterHintCtx } from "../tool-call/tool-call-contexts";
 import { PermissionRuleRequestDetails } from "./PermissionRuleRequestDetails";
 
 const noop = () => {};
-
-// Mirrors the tool taxonomy in ToolCallCard.tsx: permission for these tools may
-// surface the file-modifications drawer entry point.
-const EDIT_TOOLS = new Set(["Edit", "Write", "StructSed"]);
-
-// --- "Review in panel" button for Write/Edit permissions ---
-
-function ReviewInPanelButton() {
-	const { t } = useTranslation("narrator");
-	const { openForApproval } = useContext(FileModDrawerCtx);
-	return (
-		<Button
-			size="sm"
-			color="indigo"
-			variant="subtle"
-			leftSection={<IconFileCode size={14} />}
-			onClick={openForApproval}
-		>
-			{t("fileMod_viewInPanel")}
-		</Button>
-	);
-}
 
 // --- StructSed change preview ---
 
@@ -150,13 +127,11 @@ function PermButtonBar({
 	focusIndex,
 	setButtonCount,
 	registerActions,
-	suffix,
 }: {
 	buttons: PermButton[];
 	focusIndex: number | null;
 	setButtonCount: (n: number) => void;
 	registerActions: (actions: (() => void)[]) => void;
-	suffix?: ReactNode;
 }) {
 	useEffect(() => {
 		setButtonCount(buttons.length);
@@ -192,7 +167,6 @@ function PermButtonBar({
 					</Button>
 				);
 			})}
-			{suffix}
 		</Group>
 	);
 }
@@ -586,7 +560,6 @@ export function InlinePermission({
 					})()}
 					setButtonCount={isActivePermission ? setButtonCount : noop}
 					registerActions={isActivePermission ? registerActions : noop}
-					suffix={!editing && EDIT_TOOLS.has(permission.toolName) ? <ReviewInPanelButton /> : null}
 				/>
 			)}
 			{isExitPlan && (

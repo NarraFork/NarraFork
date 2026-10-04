@@ -29,7 +29,6 @@ describe("isSyntheticSubjectId", () => {
 			"__spec__",
 			"__git__",
 			"__terminal__",
-			"__filemod__",
 			"__details__",
 			"__browser__",
 			"__webview__",

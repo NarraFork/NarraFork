@@ -160,7 +160,7 @@ describe("responsive narrator compact boundary", () => {
 			{ onBack: () => {} },
 			{ onForkFromMessage: () => {} },
 			{ onToggleDetailsPanel: () => {} },
-			{ onFileModPropsChange: () => {} },
+			{ onDetailsPropsChange: () => {} },
 		];
 		for (const change of changes) {
 			const count = renders.body;
