@@ -88,10 +88,11 @@ export interface NarratorComposerRowProps {
 
 export function NarratorComposerRow(props: NarratorComposerRowProps) {
 	const { t } = useTranslation("narrator");
+	const { t: tc } = useTranslation("common");
 
 	const hasInput = props.composerHasText;
 	const hasAttachments = props.composerHasAttachments;
-	const sendLabel = props.isActive ? t(`queueMode_${props.enterQueueMode}`) : t("send");
+	const sendLabel = props.isActive ? t(`queueMode_${props.enterQueueMode}`) : tc("send");
 
 	// Wrap a primary button as the right segment of the split send-options control
 	const withSendOptions = (
