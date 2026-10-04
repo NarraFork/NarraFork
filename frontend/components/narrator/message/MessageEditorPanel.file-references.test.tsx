@@ -505,6 +505,83 @@ function queueRow(overrides: Partial<ComponentProps<typeof QueuedMessageRow>> = 
 	);
 }
 
+describe("inline queued message mode actions", () => {
+	const queued = {
+		id: "queue-message",
+		text: "Keep this input",
+		bufferedAt: "now",
+		imageCount: 0,
+		state: "queued" as const,
+		fileReferences: [reference],
+	};
+
+	test("switches between next step and guidance with one visible button", async () => {
+		const change = mock(async (_id: string, _mode: "turn" | "tool" | "interrupt") => {});
+		await render(queueRow({ msg: queued, onChangeMode: change }));
+		await click(button(en.queuedSwitchToGuidance));
+		expect(change.mock.calls).toEqual([[queued.id, "tool"]]);
+		await render(queueRow({ msg: { ...queued, queueMode: "tool" }, onChangeMode: change }));
+		await click(button(en.queuedSwitchToNextStep));
+		expect(change.mock.calls).toEqual([
+			[queued.id, "tool"],
+			[queued.id, "turn"],
+		]);
+		expect(document.body.textContent).toContain(queued.text);
+	});
+
+	test("urgent is one-way and simultaneous clicks cannot submit twice", async () => {
+		const pending = Promise.withResolvers<void>();
+		const change = mock((_id: string, _mode: "turn" | "tool" | "interrupt") => pending.promise);
+		await render(queueRow({ msg: queued, onChangeMode: change }));
+		const urgent = button(en.queuedSendUrgently);
+		const toggle = button(en.queuedSwitchToGuidance);
+		await act(async () => {
+			urgent.dispatchEvent(new Event("click", { bubbles: true }));
+			urgent.dispatchEvent(new Event("click", { bubbles: true }));
+			toggle.dispatchEvent(new Event("click", { bubbles: true }));
+			await flush();
+		});
+		expect(change.mock.calls).toEqual([[queued.id, "interrupt"]]);
+		expect(urgent.disabled).toBe(true);
+		expect(toggle.disabled).toBe(true);
+		await act(async () => {
+			pending.resolve();
+			await flush();
+		});
+		expect(button(en.queuedUrgentRequested).disabled).toBe(true);
+		expect(document.querySelector(`button[aria-label="${en.queuedSwitchToGuidance}"]`)).toBeNull();
+		expect(document.querySelector(`button[aria-label="${en.queuedSwitchToNextStep}"]`)).toBeNull();
+		expect(change).toHaveBeenCalledTimes(1);
+	});
+
+	test("already urgent rows have no switch-back action", async () => {
+		const change = mock(async (_id: string, _mode: "turn" | "tool" | "interrupt") => {});
+		await render(queueRow({ msg: { ...queued, queueMode: "interrupt" }, onChangeMode: change }));
+		expect(button(en.queuedUrgentRequested).disabled).toBe(true);
+		expect(document.querySelector(`button[aria-label="${en.queuedSwitchToNextStep}"]`)).toBeNull();
+		expect(change).not.toHaveBeenCalled();
+	});
+
+	test("an unsuccessful urgent request releases buttons and retains content", async () => {
+		const change = mock(async (_id: string, _mode: "turn" | "tool" | "interrupt") => false);
+		await render(queueRow({ msg: queued, onChangeMode: change }));
+		await click(button(en.queuedSendUrgently));
+		expect(button(en.queuedSendUrgently).disabled).toBe(false);
+		expect(button(en.queuedSwitchToGuidance).disabled).toBe(false);
+		expect(document.body.textContent).toContain(queued.text);
+		await click(button(en.queuedAttachments.replace("{{count}}", "1")));
+		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+	});
+
+	test("failed messages cannot urgently stop work before an explicit retry", async () => {
+		const change = mock(async (_id: string, _mode: "turn" | "tool" | "interrupt") => {});
+		await render(queueRow({ onChangeMode: change }));
+		expect(button(en.queuedSendUrgently).disabled).toBe(true);
+		expect(button(en.queuedSwitchToGuidance).disabled).toBe(false);
+		await click(button(en.queuedSwitchToGuidance));
+		expect(change.mock.calls).toEqual([["queue-message", "tool"]]);
+	});
+});
 describe("failed queued message retry UI", () => {
 	test("failed rows show full reason, input, attachments and explicit retry; queued/legacy rows do not", async () => {
 		await render(queueRow());

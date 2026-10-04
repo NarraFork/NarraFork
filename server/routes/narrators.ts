@@ -3160,7 +3160,7 @@ async function applyPendingBufferModeControl(
 	mid: string,
 	mode: import("@shared/buffer-queue-mode").BufferQueueMode,
 	child: boolean,
-): Promise<void> {
+): Promise<boolean> {
 	const applyControl = child
 		? (await import("../services/subagent-executor")).applySubagentBufferedQueueModeControl
 		: (await import("../services/narrator-session")).applyBufferedQueueModeControl;
@@ -3176,6 +3176,7 @@ async function applyPendingBufferModeControl(
 			resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
 	);
 	applyControl(id, effectiveMode, hasPendingGuidance, targetQueued);
+	return targetQueued && effectiveMode !== "turn";
 }
 
 // Changing a queued mode never mutates or retries its durable payload.
@@ -3186,17 +3187,23 @@ narratorRoutes.patch("/:id/buffer/:mid/mode", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const { withNarratorStartAdmission } = await import("../services/narrator-session-state");
 	const narrator = await narratorService.getById(id);
+	let shouldWake = false;
 	await withNarratorStartAdmission(id, async () => {
 		if (!(await updateBufferedMessageMode(id, mid, parsed.data.mode))) {
 			throw new AppError("Buffered message was claimed or is no longer pending", 409, "CONFLICT");
 		}
-		await applyPendingBufferModeControl(
+		shouldWake = await applyPendingBufferModeControl(
 			id,
 			mid,
 			parsed.data.mode,
 			isSubagentVariant(narrator.variant),
 		);
 	});
+	if (shouldWake) {
+		// Admission must be released before waking; existing owners retain delivery responsibility.
+		const { wakeInboxIfEligible } = await import("../services/agent-runtime/inbox");
+		await wakeInboxIfEligible(id);
+	}
 	await broadcastBufferQueue(id);
 	return c.json({ ok: true });
 });

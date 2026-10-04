@@ -197,12 +197,15 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 			try {
 				await api.setBufferedMessageMode(narratorId, id, mode);
 				reconcileBufferedMessages();
+				return true;
 			} catch (error) {
 				notifications.show({
 					color: "red",
 					title: t("queuedModeFailed"),
 					message: error instanceof Error ? error.message : String(error),
 				});
+				reconcileBufferedMessages();
+				return false;
 			}
 		},
 		[narratorId, reconcileBufferedMessages, t],

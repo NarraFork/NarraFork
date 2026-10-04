@@ -33,6 +33,7 @@ function fixture(
 		claimedAfterRetry?: boolean;
 		retryError?: string;
 		controlError?: boolean;
+		wakeResult?: boolean;
 	} = {},
 ) {
 	let rows = options.rows ?? [{ id: "message", state: "queued", queueMode: "turn" }];
@@ -89,7 +90,7 @@ function fixture(
 		wakeInboxIfEligible: async () => {
 			expect(locked).toBe(false);
 			order.push("wake");
-			return false; // Existing owner is busy; the control signal must do the work.
+			return options.wakeResult ?? false; // Busy owners leave delivery to their finalizer.
 		},
 
 		removeSubagentBufferedMessage: async (_id: string, mid: string) => {
@@ -225,12 +226,22 @@ describe("buffer retry HTTP mutation", () => {
 });
 
 describe("buffer mode HTTP mutation", () => {
-	test("queued mode changes use async authority under admission and broadcast after unlock", async () => {
-		const f = fixture();
-		const response = await f.mode({ mode: "interrupt" });
-		expect(response.status).toBe(200);
-		expect(await response.json()).toEqual({ ok: true });
-		expect(f.controls).toEqual([["session", "interrupt", true, true]]);
+	for (const mode of ["tool", "interrupt"] as const) {
+		for (const wakeResult of [true, false]) {
+			test(`${wakeResult ? "idle" : "busy"} queued ${mode} mode wakes after admission unlock`, async () => {
+				const f = fixture({ wakeResult });
+				const response = await f.mode({ mode });
+				expect(response.status).toBe(200);
+				expect(await response.json()).toEqual({ ok: true });
+				expect(f.controls).toEqual([["session", mode, true, true]]);
+				expect(f.order).toEqual(["mutation", "read", "wake", "broadcast"]);
+			});
+		}
+	}
+	test("queued turn mode never wakes even with an idle owner", async () => {
+		const f = fixture({ wakeResult: true });
+		expect((await f.mode({ mode: "turn" })).status).toBe(200);
+		expect(f.controls).toEqual([["session", "turn", false, true]]);
 		expect(f.order).toEqual(["mutation", "read", "broadcast"]);
 	});
 	test("claimed, consumed or missing target yields conflict without controls or broadcast", async () => {
@@ -239,11 +250,19 @@ describe("buffer mode HTTP mutation", () => {
 		expect(f.controls).toEqual([]);
 		expect(f.order).toEqual(["mutation"]);
 	});
-	test("failed mode changes never ask helper to cancel execution", async () => {
-		const f = fixture({ rows: [{ id: "message", state: "failed", queueMode: "turn" }] });
-		expect((await f.mode({ mode: "interrupt" })).status).toBe(200);
-		expect(f.controls).toEqual([["session", "interrupt", false, false]]);
-	});
+	for (const mode of ["tool", "interrupt", "turn"] as const) {
+		test(`failed ${mode} mode changes metadata without cancellation, retry or wake`, async () => {
+			const f = fixture({
+				wakeResult: true,
+				rows: [{ id: "message", state: "failed", queueMode: "turn" }],
+			});
+			expect((await f.mode({ mode })).status).toBe(200);
+			expect(f.controls).toEqual([["session", mode, false, false]]);
+			expect(f.order).toEqual(["mutation", "read", "broadcast"]);
+			expect(f.retryMutation).not.toHaveBeenCalled();
+			expect(f.rows()).toEqual([{ id: "message", state: "failed", queueMode: mode }]);
+		});
+	}
 	test("downgrade preserves other queued guidance but ignores failed guidance", async () => {
 		for (const state of ["queued", "failed"] as const) {
 			const f = fixture({
