@@ -51,6 +51,10 @@ import { projectReadAdapter } from "../services/read";
 import { collectAllPages, parseLimitQuery, singlePage } from "../services/read/read-collect";
 import { terminalService } from "../services/terminal-service";
 import { removeTabFromAllUsers } from "../services/user-preferences-service";
+import {
+	isResourceProtectionError,
+	withProjectRetirement,
+} from "../services/worktree-lifecycle-guard";
 
 export const projectRoutes = new Hono();
 
@@ -453,200 +457,211 @@ projectRoutes.delete("/:id", async (c) => {
 	// and conversation, so it sits in the management tier rather than write.
 	const project = await requireProjectAccess(c, id, "manage");
 
-	await propagateOAuthProjectRemoval(id);
+	return withProjectRetirement(
+		id,
+		project.gitPath,
+		async () => {
+			await propagateOAuthProjectRemoval(id);
 
-	const projectChapters = await db.query.chapters.findMany({
-		where: eq(chapters.projectId, id),
-		// Loads every chapter in the project, so skip the per-node UI blobs.
-		columns: { dockLayoutJson: false, detachedPanelsJson: false },
-	});
-
-	// Remove non-root chapters first, then root chapters — full resource cleanup for all
-	const nonRoot = projectChapters.filter((ch) => !ch.isRoot);
-	const root = projectChapters.filter((ch) => ch.isRoot);
-
-	for (const chapter of nonRoot) {
-		try {
-			await chapterService.removeForProjectDeletion(chapter.id, project.gitPath);
-		} catch (err) {
-			logger.warn("Failed to remove chapter during project delete", {
-				chapterId: chapter.id,
-				error: String(err),
+			const projectChapters = await db.query.chapters.findMany({
+				where: eq(chapters.projectId, id),
+				// Loads every chapter in the project, so skip the per-node UI blobs.
+				columns: { dockLayoutJson: false, detachedPanelsJson: false },
 			});
-		}
-	}
-	for (const chapter of root) {
-		try {
-			await chapterService.removeForProjectDeletion(chapter.id, project.gitPath);
-		} catch (err) {
-			logger.warn("Failed to remove root chapter during project delete", {
-				chapterId: chapter.id,
-				error: String(err),
-			});
-		}
-	}
 
-	// Clean up exploration groups (should cascade, but be explicit)
-	await db.delete(explorationGroups).where(eq(explorationGroups.projectId, id));
+			// Remove non-root chapters first, then root chapters — full resource cleanup for all
+			const nonRoot = projectChapters.filter((ch) => !ch.isRoot);
+			const root = projectChapters.filter((ch) => ch.isRoot);
 
-	// Prune any leftover worktrees in the git repo
-	if (project.gitPath) {
-		try {
-			await gitService.pruneWorktrees(project.gitPath);
-		} catch (err) {
-			logger.warn("Failed to prune worktrees during project delete", {
-				error: String(err),
-			});
-		}
-	}
-
-	// Fallback cleanup: ensure all FK-dependent rows are gone even if
-	// removeForProjectDeletion partially failed for some chapters.
-	const remainingChapterIds = (
-		await db.query.chapters.findMany({
-			where: eq(chapters.projectId, id),
-			columns: { id: true },
-		})
-	).map((ch) => ch.id);
-
-	if (remainingChapterIds.length > 0) {
-		// Host-side cleanup first, and this is no longer optional.
-		//
-		// These chapters are the ones whose `removeForProjectDeletion` threw, so their
-		// containers and terminals are still running and their ports still allocated.
-		// The rows below used to be deleted with `chapter_id` at `ON DELETE NO ACTION`,
-		// where a surviving container row made `DELETE FROM chapters` fail loudly — ugly,
-		// but it kept the host and the database describing the same world. Those FKs now
-		// cascade, so deleting the rows silently succeeds and leaves a Podman container
-		// running against a project that no longer exists, holding a port nothing will
-		// ever release. Best-effort per chapter: one host that refuses to stop must not
-		// strand the whole project as undeletable.
-		for (const chapterId of remainingChapterIds) {
-			try {
-				await terminalService.cleanupForChapter(chapterId);
-			} catch (err) {
-				logger.warn("Failed to stop terminals during project delete fallback", {
-					chapterId,
-					error: String(err),
-				});
+			for (const chapter of nonRoot) {
+				try {
+					await chapterService.removeForProjectDeletion(chapter.id, project.gitPath);
+				} catch (err) {
+					if (isResourceProtectionError(err)) throw err;
+					logger.warn("Failed to remove chapter during project delete", {
+						chapterId: chapter.id,
+						error: String(err),
+					});
+				}
 			}
-			try {
-				await containerService.removeChapterContainers(chapterId, { deleteVolumes: true });
-			} catch (err) {
-				logger.warn("Failed to remove containers during project delete fallback", {
-					chapterId,
-					error: String(err),
-				});
+			for (const chapter of root) {
+				try {
+					await chapterService.removeForProjectDeletion(chapter.id, project.gitPath);
+				} catch (err) {
+					if (isResourceProtectionError(err)) throw err;
+					logger.warn("Failed to remove root chapter during project delete", {
+						chapterId: chapter.id,
+						error: String(err),
+					});
+				}
 			}
-		}
 
-		const remainingNarratorIds = (
-			await db.query.narrators.findMany({
-				where: inArray(narrators.chapterId, remainingChapterIds),
-				columns: { id: true },
-			})
-		).map((n) => n.id);
+			// Clean up exploration groups (should cascade, but be explicit)
+			await db.delete(explorationGroups).where(eq(explorationGroups.projectId, id));
 
-		// Also collect standalone child narrators (subagents) whose parent belongs to this project
-		let allNarratorIds = [...remainingNarratorIds];
-		if (allNarratorIds.length > 0) {
-			const childNarrators = (
-				await db.query.narrators.findMany({
-					where: inArray(narrators.parentNarratorId, allNarratorIds),
+			// Prune any leftover worktrees in the git repo
+			if (project.gitPath) {
+				try {
+					await gitService.pruneWorktrees(project.gitPath);
+				} catch (err) {
+					logger.warn("Failed to prune worktrees during project delete", {
+						error: String(err),
+					});
+				}
+			}
+
+			// Fallback cleanup: ensure all FK-dependent rows are gone even if
+			// removeForProjectDeletion partially failed for some chapters.
+			const remainingChapterIds = (
+				await db.query.chapters.findMany({
+					where: eq(chapters.projectId, id),
 					columns: { id: true },
 				})
-			).map((n) => n.id);
-			allNarratorIds = [...new Set([...allNarratorIds, ...childNarrators])];
-		}
-		for (const narratorId of allNarratorIds) {
-			await integrationResourceBindingService.markDeleted("narrator", narratorId);
-		}
+			).map((ch) => ch.id);
 
-		db.transaction((tx) => {
-			if (allNarratorIds.length > 0) {
-				// Break narrator self-references. `refsInheritedFrom` is one too: a lazy
-				// fork points at the ancestor still holding its pre-compact refs, and the
-				// FK would otherwise block deleting that ancestor.
-				tx.update(narrators)
-					.set({
-						parentNarratorId: null,
-						forkMessageId: null,
-						refsInheritedFrom: null,
-						refsBackfillCursor: null,
+			if (remainingChapterIds.length > 0) {
+				// Host-side cleanup first, and this is no longer optional.
+				//
+				// These chapters are the ones whose `removeForProjectDeletion` threw, so their
+				// containers and terminals are still running and their ports still allocated.
+				// The rows below used to be deleted with `chapter_id` at `ON DELETE NO ACTION`,
+				// where a surviving container row made `DELETE FROM chapters` fail loudly — ugly,
+				// but it kept the host and the database describing the same world. Those FKs now
+				// cascade, so deleting the rows silently succeeds and leaves a Podman container
+				// running against a project that no longer exists, holding a port nothing will
+				// ever release. Best-effort per chapter: one host that refuses to stop must not
+				// strand the whole project as undeletable.
+				for (const chapterId of remainingChapterIds) {
+					try {
+						await terminalService.cleanupForChapter(chapterId);
+					} catch (err) {
+						if (isResourceProtectionError(err)) throw err;
+						logger.warn("Failed to stop terminals during project delete fallback", {
+							chapterId,
+							error: String(err),
+						});
+					}
+					try {
+						await containerService.removeChapterContainers(chapterId, { deleteVolumes: true });
+					} catch (err) {
+						if (isResourceProtectionError(err)) throw err;
+						logger.warn("Failed to remove containers during project delete fallback", {
+							chapterId,
+							error: String(err),
+						});
+					}
+				}
+
+				const remainingNarratorIds = (
+					await db.query.narrators.findMany({
+						where: inArray(narrators.chapterId, remainingChapterIds),
+						columns: { id: true },
 					})
-					.where(inArray(narrators.id, allNarratorIds))
-					.run();
+				).map((n) => n.id);
 
-				// Delete tables referencing narrators / messages
-				tx.delete(terminalViewState)
-					.where(inArray(terminalViewState.narratorId, allNarratorIds))
-					.run();
-				tx.delete(terminals).where(inArray(terminals.narratorId, allNarratorIds)).run();
-				tx.delete(narratorToolCalls)
-					.where(inArray(narratorToolCalls.narratorId, allNarratorIds))
-					.run();
-				tx.delete(narratorMessageRefs)
-					.where(inArray(narratorMessageRefs.narratorId, allNarratorIds))
-					.run();
-				tx.delete(narratorMessages)
-					.where(inArray(narratorMessages.narratorId, allNarratorIds))
-					.run();
-				tx.delete(narrators).where(inArray(narrators.id, allNarratorIds)).run();
+				// Also collect standalone child narrators (subagents) whose parent belongs to this project
+				let allNarratorIds = [...remainingNarratorIds];
+				if (allNarratorIds.length > 0) {
+					const childNarrators = (
+						await db.query.narrators.findMany({
+							where: inArray(narrators.parentNarratorId, allNarratorIds),
+							columns: { id: true },
+						})
+					).map((n) => n.id);
+					allNarratorIds = [...new Set([...allNarratorIds, ...childNarrators])];
+				}
+				for (const narratorId of allNarratorIds) {
+					await integrationResourceBindingService.markDeleted("narrator", narratorId);
+				}
+
+				db.transaction((tx) => {
+					if (allNarratorIds.length > 0) {
+						// Break narrator self-references. `refsInheritedFrom` is one too: a lazy
+						// fork points at the ancestor still holding its pre-compact refs, and the
+						// FK would otherwise block deleting that ancestor.
+						tx.update(narrators)
+							.set({
+								parentNarratorId: null,
+								forkMessageId: null,
+								refsInheritedFrom: null,
+								refsBackfillCursor: null,
+							})
+							.where(inArray(narrators.id, allNarratorIds))
+							.run();
+
+						// Delete tables referencing narrators / messages
+						tx.delete(terminalViewState)
+							.where(inArray(terminalViewState.narratorId, allNarratorIds))
+							.run();
+						tx.delete(terminals).where(inArray(terminals.narratorId, allNarratorIds)).run();
+						tx.delete(narratorToolCalls)
+							.where(inArray(narratorToolCalls.narratorId, allNarratorIds))
+							.run();
+						tx.delete(narratorMessageRefs)
+							.where(inArray(narratorMessageRefs.narratorId, allNarratorIds))
+							.run();
+						tx.delete(narratorMessages)
+							.where(inArray(narratorMessages.narratorId, allNarratorIds))
+							.run();
+						tx.delete(narrators).where(inArray(narrators.id, allNarratorIds)).run();
+					}
+
+					// Delete tables referencing chapters
+					tx.delete(terminalViewState)
+						.where(inArray(terminalViewState.chapterId, remainingChapterIds))
+						.run();
+					tx.delete(terminals).where(inArray(terminals.chapterId, remainingChapterIds)).run();
+					tx.delete(containerInstances)
+						.where(inArray(containerInstances.chapterId, remainingChapterIds))
+						.run();
+					tx.delete(portAllocations)
+						.where(inArray(portAllocations.chapterId, remainingChapterIds))
+						.run();
+					tx.delete(mergeSessions)
+						.where(inArray(mergeSessions.targetChapterId, remainingChapterIds))
+						.run();
+
+					// Break chapter self-references before deleting
+					tx.update(chapters)
+						.set({ parentChapterId: null, mergedIntoChapterId: null })
+						.where(inArray(chapters.id, remainingChapterIds))
+						.run();
+					tx.delete(chapters).where(inArray(chapters.id, remainingChapterIds)).run();
+				});
 			}
 
-			// Delete tables referencing chapters
-			tx.delete(terminalViewState)
-				.where(inArray(terminalViewState.chapterId, remainingChapterIds))
-				.run();
-			tx.delete(terminals).where(inArray(terminals.chapterId, remainingChapterIds)).run();
-			tx.delete(containerInstances)
-				.where(inArray(containerInstances.chapterId, remainingChapterIds))
-				.run();
-			tx.delete(portAllocations)
-				.where(inArray(portAllocations.chapterId, remainingChapterIds))
-				.run();
-			tx.delete(mergeSessions)
-				.where(inArray(mergeSessions.targetChapterId, remainingChapterIds))
-				.run();
-
-			// Break chapter self-references before deleting
-			tx.update(chapters)
-				.set({ parentChapterId: null, mergedIntoChapterId: null })
-				.where(inArray(chapters.id, remainingChapterIds))
-				.run();
-			tx.delete(chapters).where(inArray(chapters.id, remainingChapterIds)).run();
-		});
-	}
-
-	const deviceRevokedAt = new Date().toISOString();
-	await db
-		.update(narrators)
-		.set({ contextProjectId: null, updatedAt: deviceRevokedAt })
-		.where(eq(narrators.contextProjectId, id));
-	await db
-		.update(remoteDevices)
-		.set({
-			projectId: null,
-			status: "offline",
-			revokedAt: deviceRevokedAt,
-			updatedAt: deviceRevokedAt,
-		})
-		.where(eq(remoteDevices.projectId, id));
-	await db.delete(projects).where(eq(projects.id, id));
-	removeTabFromAllUsers("project", id).catch((err) => {
-		logger.warn("Failed to remove project tab from users", {
-			projectId: id,
-			error: String(err),
-		});
-	});
-	if (project.proxyDomain) {
-		refreshContainerProxyCache().catch((err) => {
-			logger.warn("Failed to refresh container proxy cache after project delete", {
-				projectId: id,
-				error: String(err),
+			const deviceRevokedAt = new Date().toISOString();
+			await db
+				.update(narrators)
+				.set({ contextProjectId: null, updatedAt: deviceRevokedAt })
+				.where(eq(narrators.contextProjectId, id));
+			await db
+				.update(remoteDevices)
+				.set({
+					projectId: null,
+					status: "offline",
+					revokedAt: deviceRevokedAt,
+					updatedAt: deviceRevokedAt,
+				})
+				.where(eq(remoteDevices.projectId, id));
+			await db.delete(projects).where(eq(projects.id, id));
+			removeTabFromAllUsers("project", id).catch((err) => {
+				logger.warn("Failed to remove project tab from users", {
+					projectId: id,
+					error: String(err),
+				});
 			});
-		});
-	}
-	logger.info("Project deleted", { projectId: id, name: project.name });
-	return c.json({ ok: true });
+			if (project.proxyDomain) {
+				refreshContainerProxyCache().catch((err) => {
+					logger.warn("Failed to refresh container proxy cache after project delete", {
+						projectId: id,
+						error: String(err),
+					});
+				});
+			}
+			logger.info("Project deleted", { projectId: id, name: project.name });
+			return c.json({ ok: true });
+		},
+		c.req.raw.signal,
+	);
 });

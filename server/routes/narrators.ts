@@ -1094,9 +1094,15 @@ narratorRoutes.get("/", async (c) => {
 					running: sql<number>`SUM(CASE WHEN ${containerInstances.status} = 'running' THEN 1 ELSE 0 END)`,
 				})
 				.from(containerInstances)
-				.where(sql`${containerInstances.chapterId} IN ${chapterIds}`)
+				.where(
+					and(
+						sql`${containerInstances.chapterId} IN ${chapterIds}`,
+						isNull(containerInstances.worktreeResourceId),
+					),
+				)
 				.groupBy(containerInstances.chapterId);
 			for (const row of containerRows) {
+				if (row.chapterId === null) continue;
 				containerCounts.set(row.chapterId, {
 					total: row.total,
 					running: row.running ?? 0,

@@ -20,6 +20,14 @@ import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
 import { closeNarrator, sendMessage, updateNarratorChapterRole } from "./narrator-session";
 import {
+	compensateLegacyCreation,
+	isResourceProtectionError,
+	recordChapterCreated,
+	recordChapterNarratorCreated,
+	withChapterCreation,
+	withLegacyRetirement,
+} from "./worktree-lifecycle-guard";
+import {
 	SNAPSHOT_BASE_REF,
 	SNAPSHOT_HEAD_REF,
 	treeSnapshotKey,
@@ -70,197 +78,202 @@ export const reviewService = {
 		});
 		if (!project?.gitPath) throw new ValidationError("Project has no git repository configured");
 		const gitPath = project.gitPath;
+		return withChapterCreation(project.id, gitPath, async () => {
+			// Get source HEAD commit
+			const sourceWorktree = source.worktreePath ?? gitPath;
+			const sourceHeadSha = await gitService.getHeadCommit(sourceWorktree);
 
-		// Get source HEAD commit
-		const sourceWorktree = source.worktreePath ?? gitPath;
-		const sourceHeadSha = await gitService.getHeadCommit(sourceWorktree);
+			// Generate names
+			const autoTitle = `Review: ${source.title.slice(0, 160)}`;
+			const title = input.title || autoTitle;
+			const slug = slugify(title);
+			const shortId = generateShortId(6);
+			const branchName = `review/${slug}-${shortId}`;
+			const worktreePath = resolve(gitPath, ".worktrees", `${slug}-${shortId}`);
+			const now = new Date().toISOString();
+			const id = generateId();
 
-		// Generate names
-		const autoTitle = `Review: ${source.title.slice(0, 160)}`;
-		const title = input.title || autoTitle;
-		const slug = slugify(title);
-		const shortId = generateShortId(6);
-		const branchName = `review/${slug}-${shortId}`;
-		const worktreePath = resolve(gitPath, ".worktrees", `${slug}-${shortId}`);
-		const now = new Date().toISOString();
-		const id = generateId();
+			// Compute position (anchor to same commit as source, auto-avoid existing chapters)
+			const NODE_CROSS_SIZE = 100;
+			const resolvedAnchor = input.anchorCommitSha ?? source.anchorCommitSha ?? sourceHeadSha;
+			const anchorCommitSha = resolvedAnchor;
+			const axisOffset = input.axisOffset ?? source.axisOffset ?? 0;
 
-		// Compute position (anchor to same commit as source, auto-avoid existing chapters)
-		const NODE_CROSS_SIZE = 100;
-		const resolvedAnchor = input.anchorCommitSha ?? source.anchorCommitSha ?? sourceHeadSha;
-		const anchorCommitSha = resolvedAnchor;
-		const axisOffset = input.axisOffset ?? source.axisOffset ?? 0;
-
-		let crossOffset: number;
-		if (input.crossOffset != null) {
-			crossOffset = input.crossOffset;
-		} else {
-			// Find first free slot at this anchor commit
-			const existing = await db
-				.select({ crossOffset: chapters.crossOffset })
-				.from(chapters)
-				.where(eq(chapters.anchorCommitSha, resolvedAnchor));
-			const occupied = new Set(
-				existing.map((r) => Math.round((r.crossOffset ?? 0) / NODE_CROSS_SIZE)),
-			);
-			let slot = 0;
-			while (occupied.has(slot)) slot++;
-			crossOffset = slot * NODE_CROSS_SIZE;
-		}
-
-		const rollback: Array<() => Promise<void>> = [];
-
-		try {
-			// Step 1: Create git branch + worktree from source HEAD
-			await gitService.createBranch(gitPath, branchName, sourceHeadSha);
-			rollback.push(() => gitService.deleteBranch(gitPath, branchName));
-
-			await gitService.createWorktree(gitPath, worktreePath, branchName);
-			rollback.push(() => gitService.removeWorktree(gitPath, worktreePath));
-			// `transferWorkingState` creates a shadow repository for this worktree and points
-			// `refs/nf/head` into it, and a rollback that only removed the worktree left it
-			// stranded forever: `gcAll` deletes only directories missing a HEAD (this one has
-			// one), and the orphan sweep only walks `.worktrees` directories still present on
-			// disk (rollback just deleted this one). Registered before the repo exists so it
-			// covers every later failure point; `destroy` on a missing directory is a no-op,
-			// and `force` is needed because the chapter row would otherwise be read as an
-			// owner of this key.
-			rollback.push(async () => {
-				await worktreeTreeSnapshot.destroy(worktreePath, undefined, { force: true });
-			});
-
-			// Step 1.5: Reproduce the source's working state, so the reviewer sees what the
-			// author is actually looking at rather than only the last commit.
-			const transferred = await this.transferWorkingState(sourceWorktree, worktreePath);
-
-			// Step 2: Create chapter record
-			const [chapter] = await db
-				.insert(chapters)
-				.values({
-					id,
-					projectId: source.projectId,
-					title,
-					status: "active",
-					role: "review",
-					branch: branchName,
-					worktreePath,
-					baseBranch: source.branch,
-					parentChapterId: sourceChapterId,
-					reviewSourceChapterId: sourceChapterId,
-					reviewStatus: "reviewing",
-					forkPoint: { commitSha: sourceHeadSha },
-					startCommitSha: sourceHeadSha,
-					headCommitSha: sourceHeadSha,
-					// Recorded here rather than left to the first tool call, so the review
-					// workspace has a DAG position from the moment it exists: without one it
-					// cannot be forked from, and the orphan sweep cannot tell its shadow
-					// repository from an abandoned one.
-					snapshotCommitSha: transferred.snapshotCommitSha,
-					snapshotShadowKey: treeSnapshotKey(LOCAL_DEVICE_ID, worktreePath),
-					anchorCommitSha,
-					axisOffset,
-					crossOffset,
-					graphX: input.graphX ?? null,
-					graphY: input.graphY ?? null,
-					lastAccessedAt: now,
-					createdAt: now,
-					updatedAt: now,
-				})
-				.returning();
-			rollback.push(async () => {
-				await db.delete(chapters).where(eq(chapters.id, id));
-			});
-
-			// Step 3: Create review edge
-			const edgeId = generateId();
-			await db.insert(chapterEdges).values({
-				id: edgeId,
-				projectId: source.projectId,
-				sourceId: sourceChapterId,
-				targetId: id,
-				type: "review",
-				metadata: { commitSha: sourceHeadSha },
-				createdAt: now,
-			});
-
-			// Step 4: Copy commit history
-			try {
-				await commitSyncService.copyCommitsForFork(sourceChapterId, id, sourceHeadSha);
-			} catch (err) {
-				logger.warn("Failed to copy commit history for review (non-fatal)", {
-					sourceChapterId,
-					reviewChapterId: id,
-					error: String(err),
-				});
+			let crossOffset: number;
+			if (input.crossOffset != null) {
+				crossOffset = input.crossOffset;
+			} else {
+				// Find first free slot at this anchor commit
+				const existing = await db
+					.select({ crossOffset: chapters.crossOffset })
+					.from(chapters)
+					.where(eq(chapters.anchorCommitSha, resolvedAnchor));
+				const occupied = new Set(
+					existing.map((r) => Math.round((r.crossOffset ?? 0) / NODE_CROSS_SIZE)),
+				);
+				let slot = 0;
+				while (occupied.has(slot)) slot++;
+				crossOffset = slot * NODE_CROSS_SIZE;
 			}
 
-			// Step 5: Get diff for system prompt context
-			const diffContext = await this.buildDiffContext(gitPath, source, sourceHeadSha);
-			const systemPrompt = buildReviewSystemPrompt(diffContext, input.locale);
+			return withChapterCreation(
+				project.id,
+				gitPath,
+				async () => {
+					const rollback: Array<() => Promise<void>> = [];
 
-			// Step 6: Create fresh narrator with review prompt. Apply the configured
-			// review subagent default model when set; empty string falls back to the
-			// global default via FOLLOW_DEFAULT_MODEL inside narratorService.create.
-			const reviewModel = settings.agent.subagentModels?.review || undefined;
-			const narrator = await narratorService.create({
-				chapterId: id,
-				type: "primary",
-				cwd: worktreePath,
-				systemPrompt,
-				ownerUserId: input.createdByUserId ?? null,
-				...(reviewModel ? { model: reviewModel } : {}),
-			});
-			rollback.push(async () => {
-				await narratorService.remove(narrator.id);
-			});
+					try {
+						// Step 1: Create git branch + worktree from source HEAD
+						await gitService.createBranch(gitPath, branchName, sourceHeadSha);
+						rollback.push(() => gitService.deleteBranch(gitPath, branchName));
 
-			logger.info("Review node created", {
-				id,
-				sourceChapterId,
-				branch: branchName,
-				sourceHeadSha,
-			});
+						await gitService.createWorktree(gitPath, worktreePath, branchName);
+						rollback.push(() => gitService.removeWorktree(gitPath, worktreePath));
+						// `transferWorkingState` creates a shadow repository for this worktree and points
+						// `refs/nf/head` into it, and a rollback that only removed the worktree left it
+						// stranded forever: `gcAll` deletes only directories missing a HEAD (this one has
+						// one), and the orphan sweep only walks `.worktrees` directories still present on
+						// disk (rollback just deleted this one). Registered before the repo exists so it
+						// covers every later failure point; `destroy` on a missing directory is a no-op,
+						// and `force` is needed because the chapter row would otherwise be read as an
+						// owner of this key.
+						rollback.push(async () => {
+							await worktreeTreeSnapshot.destroy(worktreePath, undefined, { force: true });
+						});
 
-			eventBus.emit({
-				type: "review:created",
-				reviewChapterId: id,
-				sourceChapterId,
-			});
+						// Step 1.5: Reproduce the source's working state, so the reviewer sees what the
+						// author is actually looking at rather than only the last commit.
+						const transferred = await this.transferWorkingState(sourceWorktree, worktreePath);
 
-			// Step 7: Auto-start the review by sending the initial message.
-			// Awaited so that a failure triggers the outer catch → rollback.
-			// A review that can't start is useless — better to roll back cleanly.
-			const locale = input.locale ?? "en";
-			const startMsg = getReviewStartMessage(locale);
-			// Kickoff prompt generated by the review service, not typed by a user.
-			await sendMessage(
-				narrator.id,
-				startMsg,
-				undefined,
-				locale,
-				false,
-				null,
-				null,
-				undefined,
-				null,
-				{
-					origin: "system",
-					originLabel: formatOriginLabel("review"),
+						// Step 2: Create chapter record
+						const [chapter] = await db
+							.insert(chapters)
+							.values({
+								id,
+								projectId: source.projectId,
+								title,
+								status: "active",
+								role: "review",
+								branch: branchName,
+								worktreePath,
+								baseBranch: source.branch,
+								parentChapterId: sourceChapterId,
+								reviewSourceChapterId: sourceChapterId,
+								reviewStatus: "reviewing",
+								forkPoint: { commitSha: sourceHeadSha },
+								startCommitSha: sourceHeadSha,
+								headCommitSha: sourceHeadSha,
+								// Recorded here rather than left to the first tool call, so the review
+								// workspace has a DAG position from the moment it exists: without one it
+								// cannot be forked from, and the orphan sweep cannot tell its shadow
+								// repository from an abandoned one.
+								snapshotCommitSha: transferred.snapshotCommitSha,
+								snapshotShadowKey: treeSnapshotKey(LOCAL_DEVICE_ID, worktreePath),
+								anchorCommitSha,
+								axisOffset,
+								crossOffset,
+								graphX: input.graphX ?? null,
+								graphY: input.graphY ?? null,
+								lastAccessedAt: now,
+								createdAt: now,
+								updatedAt: now,
+							})
+							.returning();
+						recordChapterCreated(id);
+						rollback.push(async () => {
+							await db.delete(chapters).where(eq(chapters.id, id));
+						});
+
+						// Step 3: Create review edge
+						const edgeId = generateId();
+						await db.insert(chapterEdges).values({
+							id: edgeId,
+							projectId: source.projectId,
+							sourceId: sourceChapterId,
+							targetId: id,
+							type: "review",
+							metadata: { commitSha: sourceHeadSha },
+							createdAt: now,
+						});
+
+						// Step 4: Copy commit history
+						try {
+							await commitSyncService.copyCommitsForFork(sourceChapterId, id, sourceHeadSha);
+						} catch (err) {
+							if (isResourceProtectionError(err)) throw err;
+							logger.warn("Failed to copy commit history for review (non-fatal)", {
+								sourceChapterId,
+								reviewChapterId: id,
+								error: String(err),
+							});
+						}
+
+						// Step 5: Get diff for system prompt context
+						const diffContext = await this.buildDiffContext(gitPath, source, sourceHeadSha);
+						const systemPrompt = buildReviewSystemPrompt(diffContext, input.locale);
+
+						// Step 6: Create fresh narrator with review prompt. Apply the configured
+						// review subagent default model when set; empty string falls back to the
+						// global default via FOLLOW_DEFAULT_MODEL inside narratorService.create.
+						const reviewModel = settings.agent.subagentModels?.review || undefined;
+						const narrator = await narratorService.create({
+							chapterId: id,
+							type: "primary",
+							cwd: worktreePath,
+							systemPrompt,
+							ownerUserId: input.createdByUserId ?? null,
+							...(reviewModel ? { model: reviewModel } : {}),
+						});
+						recordChapterNarratorCreated(narrator.id);
+						rollback.push(async () => {
+							await narratorService.remove(narrator.id);
+						});
+
+						logger.info("Review node created", {
+							id,
+							sourceChapterId,
+							branch: branchName,
+							sourceHeadSha,
+						});
+
+						eventBus.emit({
+							type: "review:created",
+							reviewChapterId: id,
+							sourceChapterId,
+						});
+
+						// Step 7: Auto-start the review by sending the initial message.
+						// Awaited so that a failure triggers the outer catch → rollback.
+						// A review that can't start is useless — better to roll back cleanly.
+						const locale = input.locale ?? "en";
+						const startMsg = getReviewStartMessage(locale);
+						// Kickoff prompt generated by the review service, not typed by a user.
+						await sendMessage(
+							narrator.id,
+							startMsg,
+							undefined,
+							locale,
+							false,
+							null,
+							null,
+							undefined,
+							null,
+							{
+								origin: "system",
+								originLabel: formatOriginLabel("review"),
+							},
+						);
+
+						return chapter;
+					} catch (err) {
+						logger.error("Review creation failed, rolling back", { error: String(err) });
+						await compensateLegacyCreation(id, worktreePath, rollback);
+						throw err;
+					}
 				},
+				worktreePath,
 			);
-
-			return chapter;
-		} catch (err) {
-			logger.error("Review creation failed, rolling back", { error: String(err) });
-			for (const fn of rollback.reverse()) {
-				try {
-					await fn();
-				} catch (rollbackErr) {
-					logger.error("Rollback step failed", { error: String(rollbackErr) });
-				}
-			}
-			throw err;
-		}
+		});
 	},
 
 	/**
@@ -304,6 +317,7 @@ export const reviewService = {
 				}
 			}
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			logger.warn("Failed to get committed diff for review context", { error: String(err) });
 		}
 
@@ -324,6 +338,7 @@ export const reviewService = {
 					}
 				}
 			} catch (err) {
+				if (isResourceProtectionError(err)) throw err;
 				logger.warn("Failed to get uncommitted diff for review context", {
 					error: String(err),
 				});
@@ -445,6 +460,7 @@ export const reviewService = {
 				return { clean: false, message };
 			});
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			logger.error("Failed to check/restore review git state", {
 				reviewChapterId,
 				error: String(err),
@@ -532,54 +548,59 @@ export const reviewService = {
 			where: eq(projects.id, chapter.projectId),
 		});
 
-		// Interrupt any running narrators before removing git resources
-		const chapterNarrators = await db.query.narrators.findMany({
-			where: eq(narrators.chapterId, reviewChapterId),
+		return withLegacyRetirement([reviewChapterId], "review dismiss", async () => {
+			// Interrupt any running narrators before removing git resources
+			const chapterNarrators = await db.query.narrators.findMany({
+				where: eq(narrators.chapterId, reviewChapterId),
+			});
+			for (const n of chapterNarrators) {
+				closeNarrator(n.id);
+			}
+
+			// Clean up git resources
+			if (chapter.worktreePath && project?.gitPath) {
+				try {
+					await gitService.removeWorktree(project.gitPath, chapter.worktreePath);
+				} catch (err) {
+					if (isResourceProtectionError(err)) throw err;
+					logger.warn("Failed to remove review worktree", { error: String(err) });
+				}
+				try {
+					await gitService.deleteBranch(project.gitPath, chapter.branch);
+				} catch (err) {
+					if (isResourceProtectionError(err)) throw err;
+					logger.warn("Failed to delete review branch", { error: String(err) });
+				}
+				// The review workspace now has a shadow repository of its own, and the chapter
+				// row that claims it is about to go. `force` is required for exactly that
+				// reason: the ownership guard reads the row being deleted.
+				await worktreeTreeSnapshot
+					.destroy(chapter.worktreePath, undefined, { force: true })
+					.catch((err) => {
+						if (isResourceProtectionError(err)) throw err;
+						logger.debug("Failed to remove review tree snapshots", { error: String(err) });
+					});
+			}
+
+			// Archive narrators (already closed above)
+			for (const n of chapterNarrators) {
+				await narratorService.updateStatus(n.id, "archived");
+			}
+
+			const now = new Date().toISOString();
+			await db
+				.update(chapters)
+				.set({
+					reviewStatus: "dismissed",
+					status: "abandoned",
+					worktreePath: null,
+					updatedAt: now,
+				})
+				.where(eq(chapters.id, reviewChapterId));
+
+			eventBus.emit({ type: "review:dismissed", reviewChapterId });
+			logger.info("Review dismissed", { reviewChapterId });
 		});
-		for (const n of chapterNarrators) {
-			closeNarrator(n.id);
-		}
-
-		// Clean up git resources
-		if (chapter.worktreePath && project?.gitPath) {
-			try {
-				await gitService.removeWorktree(project.gitPath, chapter.worktreePath);
-			} catch (err) {
-				logger.warn("Failed to remove review worktree", { error: String(err) });
-			}
-			try {
-				await gitService.deleteBranch(project.gitPath, chapter.branch);
-			} catch (err) {
-				logger.warn("Failed to delete review branch", { error: String(err) });
-			}
-			// The review workspace now has a shadow repository of its own, and the chapter
-			// row that claims it is about to go. `force` is required for exactly that
-			// reason: the ownership guard reads the row being deleted.
-			await worktreeTreeSnapshot
-				.destroy(chapter.worktreePath, undefined, { force: true })
-				.catch((err) =>
-					logger.debug("Failed to remove review tree snapshots", { error: String(err) }),
-				);
-		}
-
-		// Archive narrators (already closed above)
-		for (const n of chapterNarrators) {
-			await narratorService.updateStatus(n.id, "archived");
-		}
-
-		const now = new Date().toISOString();
-		await db
-			.update(chapters)
-			.set({
-				reviewStatus: "dismissed",
-				status: "abandoned",
-				worktreePath: null,
-				updatedAt: now,
-			})
-			.where(eq(chapters.id, reviewChapterId));
-
-		eventBus.emit({ type: "review:dismissed", reviewChapterId });
-		logger.info("Review dismissed", { reviewChapterId });
 	},
 
 	/**
@@ -617,85 +638,91 @@ export const reviewService = {
 
 		const now = new Date().toISOString();
 
-		// Re-parent the review narrator as a subagent of the source narrator
-		// Also update cwd to source chapter's worktree since the review worktree will be removed
-		const sourceChapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, chapter.reviewSourceChapterId),
-			columns: { worktreePath: true },
-		});
-		await db
-			.update(narrators)
-			.set({
-				type: "subagent",
-				variant: "subagent:review",
-				subagentType: "review",
-				parentNarratorId: sourceNarrator.id,
-				chapterId: chapter.reviewSourceChapterId,
-				cwd: sourceChapter?.worktreePath ?? sourceNarrator.cwd,
-				updatedAt: now,
-			})
-			.where(eq(narrators.id, reviewNarrator.id));
+		const sourceChapterId = chapter.reviewSourceChapterId;
+		return withLegacyRetirement([reviewChapterId], "review convert", async () => {
+			// Re-parent the review narrator as a subagent of the source narrator
+			// Also update cwd to source chapter's worktree since the review worktree will be removed
+			const sourceChapter = await db.query.chapters.findFirst({
+				where: eq(chapters.id, sourceChapterId),
+				columns: { worktreePath: true },
+			});
+			await db
+				.update(narrators)
+				.set({
+					type: "subagent",
+					variant: "subagent:review",
+					subagentType: "review",
+					parentNarratorId: sourceNarrator.id,
+					chapterId: chapter.reviewSourceChapterId,
+					cwd: sourceChapter?.worktreePath ?? sourceNarrator.cwd,
+					updatedAt: now,
+				})
+				.where(eq(narrators.id, reviewNarrator.id));
 
-		// Use updateStatus to ensure event bus + WS broadcast
-		await narratorService.updateStatus(reviewNarrator.id, "idle", {
-			substatus: ["unread"],
-		});
+			// Use updateStatus to ensure event bus + WS broadcast
+			await narratorService.updateStatus(reviewNarrator.id, "idle", {
+				substatus: ["unread"],
+			});
 
-		// Clean up review chapter's git resources
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, chapter.projectId),
-		});
-		if (chapter.worktreePath && project?.gitPath) {
-			try {
-				await gitService.removeWorktree(project.gitPath, chapter.worktreePath);
-			} catch (err) {
-				logger.warn("Failed to remove review worktree during conversion", {
-					error: String(err),
-				});
-			}
-			try {
-				await gitService.deleteBranch(project.gitPath, chapter.branch);
-			} catch (err) {
-				logger.warn("Failed to delete review branch during conversion", {
-					error: String(err),
-				});
-			}
-			// Same reasoning as `deleteReview`: the workspace is gone and the row that
-			// claims its shadow repository is being emptied, so nothing will read the
-			// lineage again.
-			await worktreeTreeSnapshot
-				.destroy(chapter.worktreePath, undefined, { force: true })
-				.catch((err) =>
-					logger.debug("Failed to remove review tree snapshots during conversion", {
+			// Clean up review chapter's git resources
+			const project = await db.query.projects.findFirst({
+				where: eq(projects.id, chapter.projectId),
+			});
+			if (chapter.worktreePath && project?.gitPath) {
+				try {
+					await gitService.removeWorktree(project.gitPath, chapter.worktreePath);
+				} catch (err) {
+					if (isResourceProtectionError(err)) throw err;
+					logger.warn("Failed to remove review worktree during conversion", {
 						error: String(err),
-					}),
-				);
-		}
+					});
+				}
+				try {
+					await gitService.deleteBranch(project.gitPath, chapter.branch);
+				} catch (err) {
+					if (isResourceProtectionError(err)) throw err;
+					logger.warn("Failed to delete review branch during conversion", {
+						error: String(err),
+					});
+				}
+				// Same reasoning as `deleteReview`: the workspace is gone and the row that
+				// claims its shadow repository is being emptied, so nothing will read the
+				// lineage again.
+				await worktreeTreeSnapshot
+					.destroy(chapter.worktreePath, undefined, { force: true })
+					.catch((err) => {
+						if (isResourceProtectionError(err)) throw err;
+						logger.debug("Failed to remove review tree snapshots during conversion", {
+							error: String(err),
+						});
+					});
+			}
 
-		// Update review chapter status
-		await db
-			.update(chapters)
-			.set({
-				reviewStatus: "converted",
-				status: "abandoned",
-				worktreePath: null,
-				updatedAt: now,
-			})
-			.where(eq(chapters.id, reviewChapterId));
+			// Update review chapter status
+			await db
+				.update(chapters)
+				.set({
+					reviewStatus: "converted",
+					status: "abandoned",
+					worktreePath: null,
+					updatedAt: now,
+				})
+				.where(eq(chapters.id, reviewChapterId));
 
-		eventBus.emit({
-			type: "review:converted",
-			reviewChapterId,
-			action: "subagent",
+			eventBus.emit({
+				type: "review:converted",
+				reviewChapterId,
+				action: "subagent",
+			});
+
+			logger.info("Review converted to subagent", {
+				reviewChapterId,
+				reviewNarratorId: reviewNarrator.id,
+				sourceNarratorId: sourceNarrator.id,
+			});
+
+			return reviewNarrator;
 		});
-
-		logger.info("Review converted to subagent", {
-			reviewChapterId,
-			reviewNarratorId: reviewNarrator.id,
-			sourceNarratorId: sourceNarrator.id,
-		});
-
-		return reviewNarrator;
 	},
 
 	/**
@@ -807,6 +834,7 @@ export const reviewService = {
 				return { snapshotCommitSha: baseline, viaSnapshot: true, baselineCommitSha: baseline };
 			}
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			logger.warn("Snapshot transfer into the review worktree failed; copying dirty files", {
 				sourceWorktree,
 				targetWorktree,
@@ -861,6 +889,7 @@ export const reviewService = {
 			await worktreeTreeSnapshot.setRef(worktreePath, SNAPSHOT_BASE_REF, advanced.commitSha);
 			return advanced.commitSha;
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			logger.warn("Could not record the review baseline snapshot", {
 				worktreePath,
 				error: String(err),
@@ -930,6 +959,7 @@ export const reviewService = {
 					await Bun.write(dstPath, content);
 					copied++;
 				} catch (err) {
+					if (isResourceProtectionError(err)) throw err;
 					// Skip files that can't be read (e.g. broken symlinks)
 					logger.debug("Failed to copy dirty file for review", {
 						filePath,
@@ -945,6 +975,7 @@ export const reviewService = {
 				});
 			}
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			// Non-fatal: review can still work with committed-only state
 			logger.warn("Failed to copy dirty files for review (non-fatal)", {
 				error: String(err),

@@ -368,16 +368,17 @@ describe("production worktree storage cleanup", () => {
 				.from(narratorWorktreeResources)
 				.where(eq(narratorWorktreeResources.worktreePath, path))
 				.get();
-			expect(resource).toEqual({
-				createRequestId: `legacy-cwd-${narratorId}`,
-				ownerNarratorId: narratorId,
-				state: "unknown",
-			});
+			// Cleanup only observes protection evidence; it never invents durable ownership.
+			expect(resource).toBeUndefined();
 		}
+		// Without a durable receipt/inventory, deleted cwd owners leave no ownership
+		// evidence. Their actual dirty bytes still disqualify them from orphan cleanup.
+		for (const path of [cwdPath, contextPath]) await dirty(path);
 		await db.delete(narrators).where(eq(narrators.id, narratorId));
 		await cleanupOrphanedWorktrees();
-		for (const path of [receiptPath, cwdPath, contextPath])
-			expect(await Bun.file(join(path, "tracked.txt")).exists()).toBe(true);
+		for (const path of [cwdPath, contextPath]) await assertDirty(path);
+		// Receipt protection remains independently durable even for this CLEAN worktree.
+		expect(await readFile(join(receiptPath, "tracked.txt"), "utf8")).toBe("initial\n");
 	});
 
 	test("create/cleanup repository race protects the window before inventory and interrupted preparing registration", async () => {

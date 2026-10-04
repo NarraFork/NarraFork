@@ -1,6 +1,6 @@
-import { and, eq, isNotNull } from "drizzle-orm";
+import { and, eq, isNotNull, isNull, sql } from "drizzle-orm";
 import { db } from "../db";
-import { containerInstances, projects } from "../db/schema";
+import { chapters, containerInstances, projects } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
@@ -35,6 +35,65 @@ let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 // Cache management
 // ---------------------------------------------------------------------------
 
+// Inspection is asynchronous, so bind its result to the *original* FK domain,
+// incarnation, state generation and chapter/project authority, not merely a reusable ID.
+const legacyContainerProjection = {
+	id: containerInstances.id,
+	chapterId: containerInstances.chapterId,
+	worktreeResourceId: containerInstances.worktreeResourceId,
+	containerId: containerInstances.containerId,
+	serviceName: containerInstances.serviceName,
+	status: containerInstances.status,
+	hostPort: containerInstances.hostPort,
+	containerPort: containerInstances.containerPort,
+	proxyLabel: containerInstances.proxyLabel,
+	containerIp: containerInstances.containerIp,
+	volumeName: containerInstances.volumeName,
+	createdAt: containerInstances.createdAt,
+	updatedAt: containerInstances.updatedAt,
+	projectId: chapters.projectId,
+	chapterCreatedAt: chapters.createdAt,
+	chapterUpdatedAt: chapters.updatedAt,
+	projectOwnerUserId: projects.ownerUserId,
+	projectUpdatedAt: projects.updatedAt,
+	proxyDomain: projects.proxyDomain,
+};
+type LegacyContainerSnapshot = typeof containerInstances.$inferSelect & {
+	projectId: string;
+	chapterCreatedAt: string;
+	chapterUpdatedAt: string;
+	projectOwnerUserId: string | null;
+	projectUpdatedAt: string;
+	proxyDomain: string | null;
+};
+
+function legacyContainerCAS(inst: LegacyContainerSnapshot) {
+	return and(
+		eq(containerInstances.id, inst.id),
+		isNull(containerInstances.worktreeResourceId),
+		sql`${containerInstances.chapterId} is ${inst.chapterId}`,
+		sql`${containerInstances.containerId} is ${inst.containerId}`,
+		eq(containerInstances.createdAt, inst.createdAt),
+		eq(containerInstances.updatedAt, inst.updatedAt),
+		eq(containerInstances.status, inst.status),
+		eq(containerInstances.serviceName, inst.serviceName),
+		sql`${containerInstances.containerIp} is ${inst.containerIp}`,
+		sql`${containerInstances.containerPort} is ${inst.containerPort}`,
+		sql`${containerInstances.hostPort} is ${inst.hostPort}`,
+		sql`${containerInstances.proxyLabel} is ${inst.proxyLabel}`,
+		sql`${containerInstances.volumeName} is ${inst.volumeName}`,
+		sql`exists (select 1 from ${chapters} inner join ${projects}
+			on ${projects.id} = ${chapters.projectId}
+			where ${chapters.id} = ${inst.chapterId}
+			and ${chapters.projectId} = ${inst.projectId}
+			and ${chapters.createdAt} = ${inst.chapterCreatedAt}
+			and ${chapters.updatedAt} = ${inst.chapterUpdatedAt}
+			and ${projects.ownerUserId} is ${inst.projectOwnerUserId}
+			and ${projects.updatedAt} = ${inst.projectUpdatedAt}
+			and ${projects.proxyDomain} is ${inst.proxyDomain})`,
+	);
+}
+
 /** Load all active proxy targets from DB into cache, reconciling with actual container state. */
 export async function refreshCache(): Promise<void> {
 	cache.clear();
@@ -51,66 +110,67 @@ export async function refreshCache(): Promise<void> {
 
 	// Load running container instances with proxy info
 	const instances = await db
-		.select({
-			id: containerInstances.id,
-			containerId: containerInstances.containerId,
-			proxyLabel: containerInstances.proxyLabel,
-			containerIp: containerInstances.containerIp,
-			containerPort: containerInstances.containerPort,
-			chapterId: containerInstances.chapterId,
-			serviceName: containerInstances.serviceName,
-		})
+		.select(legacyContainerProjection)
 		.from(containerInstances)
+		.innerJoin(chapters, eq(chapters.id, containerInstances.chapterId))
+		.innerJoin(projects, eq(projects.id, chapters.projectId))
 		.where(
 			and(
 				eq(containerInstances.status, "running"),
+				isNull(containerInstances.worktreeResourceId),
+				isNotNull(containerInstances.chapterId),
 				isNotNull(containerInstances.proxyLabel),
 				isNotNull(containerInstances.containerPort),
 			),
 		);
 
 	for (const inst of instances) {
-		if (!inst.proxyLabel || inst.containerPort == null) continue;
+		// Resource-owned rows never enter legacy inspect/cache or chapter namespace.
+		if (
+			inst.worktreeResourceId != null ||
+			!inst.chapterId ||
+			!inst.proxyLabel ||
+			inst.containerPort == null
+		)
+			continue;
 
-		// Reconcile: verify container is actually running and refresh IP
-		if (inst.containerId) {
-			const live = await inspectContainerState(inst.containerId);
-			if (!live.running) {
-				// Container is gone or stopped — update DB and skip
-				logger.info("Reconcile: container no longer running, updating DB", {
-					containerId: inst.containerId,
+		const live = inst.containerId ? await inspectContainerState(inst.containerId) : null;
+		// No await between the final CAS and cache insertion: a stale inspect must
+		// neither mutate a replacement row nor overwrite/delete its newer cache entry.
+		db.transaction((tx) => {
+			const predicate = legacyContainerCAS(inst);
+			const current = tx
+				.select({ id: containerInstances.id })
+				.from(containerInstances)
+				.where(predicate)
+				.get();
+			if (!current) return;
+			if (live && !live.running) {
+				tx.update(containerInstances)
+					.set({ status: "stopped", updatedAt: new Date().toISOString() })
+					.where(predicate)
+					.run();
+				return;
+			}
+			const ip = live?.ip || inst.containerIp;
+			if (ip && ip !== inst.containerIp) {
+				const result = tx
+					.update(containerInstances)
+					.set({ containerIp: ip, updatedAt: new Date().toISOString() })
+					.where(predicate)
+					.returning({ id: containerInstances.id })
+					.all();
+				if (result.length !== 1) return;
+			}
+			if (ip && inst.proxyLabel && inst.containerPort != null && inst.chapterId) {
+				cache.set(inst.proxyLabel.toLowerCase(), {
+					containerIp: ip,
+					containerPort: inst.containerPort,
 					chapterId: inst.chapterId,
 					serviceName: inst.serviceName,
 				});
-				await db
-					.update(containerInstances)
-					.set({ status: "stopped", updatedAt: new Date().toISOString() })
-					.where(eq(containerInstances.id, inst.id));
-				continue;
 			}
-			// Update IP if it changed
-			if (live.ip && live.ip !== inst.containerIp) {
-				logger.info("Reconcile: container IP changed, updating DB", {
-					containerId: inst.containerId,
-					oldIp: inst.containerIp,
-					newIp: live.ip,
-				});
-				await db
-					.update(containerInstances)
-					.set({ containerIp: live.ip, updatedAt: new Date().toISOString() })
-					.where(eq(containerInstances.id, inst.id));
-				inst.containerIp = live.ip;
-			}
-		}
-
-		if (inst.containerIp) {
-			cache.set(inst.proxyLabel.toLowerCase(), {
-				containerIp: inst.containerIp,
-				containerPort: inst.containerPort,
-				chapterId: inst.chapterId,
-				serviceName: inst.serviceName,
-			});
-		}
+		});
 	}
 
 	logger.info("Proxy cache refreshed", {
@@ -165,27 +225,32 @@ async function inspectContainerState(containerId: string): Promise<ContainerLive
  */
 export async function reconcileContainerStates(): Promise<void> {
 	const running = await db
-		.select({
-			id: containerInstances.id,
-			containerId: containerInstances.containerId,
-			chapterId: containerInstances.chapterId,
-			serviceName: containerInstances.serviceName,
-		})
+		.select(legacyContainerProjection)
 		.from(containerInstances)
-		.where(eq(containerInstances.status, "running"));
+		.innerJoin(chapters, eq(chapters.id, containerInstances.chapterId))
+		.innerJoin(projects, eq(projects.id, chapters.projectId))
+		.where(
+			and(
+				eq(containerInstances.status, "running"),
+				isNull(containerInstances.worktreeResourceId),
+				isNotNull(containerInstances.chapterId),
+			),
+		);
 
 	if (running.length === 0) return;
 
 	let staleCount = 0;
 	for (const inst of running) {
-		if (!inst.containerId) continue;
+		if (inst.worktreeResourceId != null || !inst.chapterId || !inst.containerId) continue;
 		const live = await inspectContainerState(inst.containerId);
 		if (!live.running) {
-			await db
+			const result = db
 				.update(containerInstances)
 				.set({ status: "stopped", updatedAt: new Date().toISOString() })
-				.where(eq(containerInstances.id, inst.id));
-			staleCount++;
+				.where(legacyContainerCAS(inst))
+				.returning({ id: containerInstances.id })
+				.all();
+			staleCount += result.length;
 		}
 	}
 
@@ -219,7 +284,7 @@ function resolveLabel(host: string): string | null {
 	return null;
 }
 
-function resolveTarget(host: string): ProxyTarget | null {
+export function resolveTarget(host: string): ProxyTarget | null {
 	const label = resolveLabel(host);
 	if (!label) return null;
 	return cache.get(label) ?? null;

@@ -1,11 +1,16 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { terminalViewState } from "../db/schema";
 import { generateId } from "../lib/id";
+import { assertLegacyRuntimeOwner } from "./worktree-resource-owner";
 
 export const terminalViewService = {
 	async get(userId: string, opts: { chapterId?: string; narratorId?: string }) {
-		const conditions = [eq(terminalViewState.userId, userId)];
+		assertLegacyRuntimeOwner(opts);
+		const conditions = [
+			eq(terminalViewState.userId, userId),
+			isNull(terminalViewState.worktreeResourceId),
+		];
 		if (opts.chapterId) {
 			conditions.push(eq(terminalViewState.chapterId, opts.chapterId));
 		} else if (opts.narratorId) {

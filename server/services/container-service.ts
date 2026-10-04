@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, containerInstances, projects } from "../db/schema";
 import { containerLock } from "../lib/async-mutex";
@@ -975,7 +975,14 @@ export const containerService = {
 
 			// Record container instances (clear stale records first)
 			try {
-				await db.delete(containerInstances).where(eq(containerInstances.chapterId, chapterId));
+				await db
+					.delete(containerInstances)
+					.where(
+						and(
+							eq(containerInstances.chapterId, chapterId),
+							isNull(containerInstances.worktreeResourceId),
+						),
+					);
 				await this._recordContainerInstances(
 					chapterId,
 					worktreePath,
@@ -1042,7 +1049,12 @@ export const containerService = {
 			await db
 				.update(containerInstances)
 				.set({ status: "paused", updatedAt: now })
-				.where(eq(containerInstances.chapterId, chapterId));
+				.where(
+					and(
+						eq(containerInstances.chapterId, chapterId),
+						isNull(containerInstances.worktreeResourceId),
+					),
+				);
 
 			eventBus.emit({ type: "container:paused", chapterId });
 			logger.info("Chapter containers paused", { chapterId });
@@ -1071,7 +1083,12 @@ export const containerService = {
 			await db
 				.update(containerInstances)
 				.set({ status: "running", updatedAt: now })
-				.where(eq(containerInstances.chapterId, chapterId));
+				.where(
+					and(
+						eq(containerInstances.chapterId, chapterId),
+						isNull(containerInstances.worktreeResourceId),
+					),
+				);
 
 			eventBus.emit({ type: "container:resumed", chapterId });
 			logger.info("Chapter containers unpaused", { chapterId });
@@ -1109,7 +1126,12 @@ export const containerService = {
 			await db
 				.update(containerInstances)
 				.set({ status: "stopped", updatedAt: now })
-				.where(eq(containerInstances.chapterId, chapterId));
+				.where(
+					and(
+						eq(containerInstances.chapterId, chapterId),
+						isNull(containerInstances.worktreeResourceId),
+					),
+				);
 
 			eventBus.emit({ type: "container:stopped", chapterId });
 			logger.info("Chapter containers stopped", { chapterId });
@@ -1135,7 +1157,10 @@ export const containerService = {
 
 			// Check if this chapter was using proxy mode (has proxyLabel records)
 			const existingInstances = await db.query.containerInstances.findMany({
-				where: eq(containerInstances.chapterId, chapterId),
+				where: and(
+					eq(containerInstances.chapterId, chapterId),
+					isNull(containerInstances.worktreeResourceId),
+				),
 				columns: { proxyLabel: true },
 			});
 			const wasProxyMode = existingInstances.some((i) => !!i.proxyLabel);
@@ -1158,7 +1183,14 @@ export const containerService = {
 			}
 
 			// Clean up DB records regardless
-			await db.delete(containerInstances).where(eq(containerInstances.chapterId, chapterId));
+			await db
+				.delete(containerInstances)
+				.where(
+					and(
+						eq(containerInstances.chapterId, chapterId),
+						isNull(containerInstances.worktreeResourceId),
+					),
+				);
 			// Only release ports if not in proxy mode
 			if (!wasProxyMode) {
 				await portAllocator.release(chapterId);
@@ -1199,7 +1231,10 @@ export const containerService = {
 	/** List container instances for a chapter from DB. */
 	async listByChapter(chapterId: string) {
 		return db.query.containerInstances.findMany({
-			where: eq(containerInstances.chapterId, chapterId),
+			where: and(
+				eq(containerInstances.chapterId, chapterId),
+				isNull(containerInstances.worktreeResourceId),
+			),
 		});
 	},
 

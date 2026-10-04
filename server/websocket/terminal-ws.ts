@@ -131,6 +131,20 @@ export const handleTerminalWS = {
 			logger.warn("Invalid terminal WS message", {
 				error: result.error.message,
 			});
+			if (parsed && typeof parsed === "object" && "type" in parsed && parsed.type === "create") {
+				try {
+					ws.send(
+						JSON.stringify({
+							type: "error",
+							terminalId: "",
+							code: "VALIDATION_ERROR",
+							message: result.error.message,
+						}),
+					);
+				} catch {
+					// connection may be dead
+				}
+			}
 			return;
 		}
 		const msg = result.data;
