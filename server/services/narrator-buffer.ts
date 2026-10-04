@@ -19,7 +19,8 @@ import type { FileReference, FileReferenceSnapshot } from "@shared/file-referenc
 import { MAX_EDIT_TEXT_FILES_PER_MESSAGE, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
-import { narratorBufferedMessages as mailbox, narrators } from "../db/schema";
+import { users as pgUsers } from "../db/postgres-schema";
+import { narratorBufferedMessages as mailbox, narrators, users } from "../db/schema";
 import {
 	copyFileReference,
 	freezeFileReferenceSnapshots,
@@ -516,6 +517,37 @@ export function getBufferedMessages(narratorId: string): BufferedMessage[] {
 		.map(projectMailboxUserMessage);
 }
 
+/** Public user identity only; never read credentials or infer an author from a narrator owner. */
+async function loadBufferCreators(createdBy: readonly string[]): Promise<BufferCreator[]> {
+	const ids = [...new Set(createdBy)].slice(0, MAILBOX_LIMITS.userPending);
+	if (!ids.length) return [];
+	// The SQLite db is a fail-closed proxy on PG. Use the already-started canonical
+	// runtime directly, with its PG schema, rather than probing the SQLite handle.
+	const { postgresRuntime } = await import("../db");
+	if (postgresRuntime) {
+		return await postgresRuntime.client.db
+			.select({
+				id: pgUsers.id,
+				username: pgUsers.username,
+				avatarColor: pgUsers.avatarColor,
+				avatarImageId: pgUsers.avatarImageId,
+			})
+			.from(pgUsers)
+			.where(inArray(pgUsers.id, ids))
+			.limit(ids.length);
+	}
+	return await db
+		.select({
+			id: users.id,
+			username: users.username,
+			avatarColor: users.avatarColor,
+			avatarImageId: users.avatarImageId,
+		})
+		.from(users)
+		.where(inArray(users.id, ids))
+		.limit(ids.length);
+}
+
 /** Backend-neutral async projection used by production callers on both SQLite and PG. */
 export async function getBufferedMessagesAsync(narratorId: string): Promise<BufferedMessage[]> {
 	const port = pgQueue();
@@ -538,7 +570,18 @@ export async function getBufferedMessagesAsync(narratorId: string): Promise<Buff
 				.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(mailbox.arrivalSeq))
 				.limit(MAILBOX_LIMITS.userPending)
 				.all();
-	return rows.map(projectMailboxUserMessage);
+	const messages = rows.map(projectMailboxUserMessage);
+	const missingAuthors = messages.flatMap((message) =>
+		!message.creator && message.createdBy ? [message.createdBy] : [],
+	);
+	const creators = new Map(
+		(await loadBufferCreators(missingAuthors)).map((creator) => [creator.id, creator]),
+	);
+	for (const message of messages) {
+		if (!message.creator && message.createdBy)
+			message.creator = creators.get(message.createdBy) ?? null;
+	}
+	return messages;
 }
 /** Busy admission is intentionally outside the shared durable producer. */
 export async function pushBufferedMessage(
@@ -574,6 +617,7 @@ export async function enqueueBufferedMessage(
 	let port: RuntimeQueuePort | undefined;
 	let admittedOwnerId: string | undefined;
 	try {
+		if (!creator && createdBy) creator = (await loadBufferCreators([createdBy]))[0] ?? null;
 		saved = await persistBufferedTextFiles(stagingId, textFiles ?? []);
 		const bytes = Buffer.byteLength(text);
 		if (bytes > MAX_BUFFERED_PAYLOAD_BYTES) throw new Error("Buffered input exceeds size limit");

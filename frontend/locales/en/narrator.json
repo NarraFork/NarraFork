@@ -384,6 +384,8 @@
 	"queueMode_interrupt_desc": "Stop running tools and immediately guide the current task; existing changes are not rolled back",
 	"sendKeySettings": "Keyboard shortcuts",
 	"queuedActions": "Queued message actions",
+	"queuedSenderUnknown": "Unknown sender",
+	"queuedDoubleClickEdit": "Double-click to edit",
 	"queuedChangeMode": "Change send mode",
 	"queuedSwitchToGuidance": "Switch to live guidance",
 	"queuedSwitchToNextStep": "Switch to continue after completion",
