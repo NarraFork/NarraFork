@@ -1,6 +1,11 @@
 import { createWriteStream, existsSync, statSync } from "node:fs";
 import { basename, dirname, relative, resolve } from "node:path";
 import { z } from "zod/v4";
+import {
+	classifySharePreview,
+	isShareText,
+	SHARE_HTML_MAX_BYTES,
+} from "../../../../shared/share-preview";
 import { generateShortId } from "../../id";
 import { settings } from "../../settings";
 import { createShare, getMaxShareSizeBytes, getShareDir } from "../../shares";
@@ -209,7 +214,7 @@ export const shareFileTool: ToolDefinition = {
 			.describe(
 				"Whether to enable inline preview in the frontend card. " +
 					"When true, the shared file will be rendered directly in the chat " +
-					"(supports images, videos, PDFs, and sanitized HTML). " +
+					"(supports images, browser-playable video/audio, PDFs, sanitized HTML, and UTF-8 text/code/JSON/Markdown). Unsupported types return an explicit preview notice; media is streamed without transcoding. " +
 					"Ignored for compressed archives and multi-file shares. " +
 					"Default: false.",
 			),
@@ -229,7 +234,7 @@ export const shareFileTool: ToolDefinition = {
 
 		// ── Multi-file mode: zip packaging ──────────────────────────────────
 		if (isMulti) {
-			return handleMultiFile(inputPath, ctx);
+			return handleMultiFile(inputPath, ctx, preview);
 		}
 
 		// ── Single path mode (original behaviour) ──────────────────────────
@@ -242,6 +247,7 @@ export const shareFileTool: ToolDefinition = {
 async function handleMultiFile(
 	inputPaths: string[],
 	ctx: { cwd: string; narratorId: string },
+	preview?: boolean,
 ): Promise<ToolResult> {
 	if (inputPaths.length === 0) {
 		return { output: "No paths provided.", isError: true };
@@ -313,7 +319,8 @@ async function handleMultiFile(
 				`Filename: ${finalName}\n` +
 				`Files packaged: ${fileCount}\n` +
 				`Size: ${formatSize(finalStat.size)}\n` +
-				`Expires: ${record.expiresAt.toISOString()} (${expiryHours}h from now)`,
+				`Expires: ${record.expiresAt.toISOString()} (${expiryHours}h from now)` +
+				(preview ? "\nPreview unavailable (compressed). Please download the archive." : ""),
 			title: `Shared: ${finalName} (${fileCount} files)`,
 			metadata: {
 				shareId: record.id,
@@ -328,6 +335,8 @@ async function handleMultiFile(
 				compressed: true,
 				format: "zip" as const,
 				fileCount,
+				previewRequested: !!preview,
+				...(preview ? { previewType: "unsupported", previewReason: "compressed" } : {}),
 			},
 		};
 	} catch (err) {
@@ -340,29 +349,7 @@ async function handleMultiFile(
 
 // ── Previewable file extensions ──────────────────────────────────────────────
 
-const PREVIEW_IMAGE_EXTS = new Set([
-	".jpg",
-	".jpeg",
-	".png",
-	".gif",
-	".webp",
-	".svg",
-	".avif",
-	".bmp",
-	".ico",
-]);
-const PREVIEW_VIDEO_EXTS = new Set([".mp4", ".webm", ".mov", ".ogg"]);
-const PREVIEW_PDF_EXTS = new Set([".pdf"]);
-const PREVIEW_HTML_EXTS = new Set([".html", ".htm"]);
-
-function getPreviewType(filename: string): "image" | "video" | "pdf" | "html" | null {
-	const ext = filename.toLowerCase().replace(/^.*(\.[^.]+)$/, "$1");
-	if (PREVIEW_IMAGE_EXTS.has(ext)) return "image";
-	if (PREVIEW_VIDEO_EXTS.has(ext)) return "video";
-	if (PREVIEW_PDF_EXTS.has(ext)) return "pdf";
-	if (PREVIEW_HTML_EXTS.has(ext)) return "html";
-	return null;
-}
+// Preview types and MIME are shared with the route and UI (shared/share-preview.ts).
 
 // ── Single-path handler (original logic) ─────────────────────────────────────
 
@@ -446,8 +433,24 @@ async function handleSinglePath(
 
 		// Determine preview capability: only for raw (uncompressed) single files
 		const canPreview = !isDir && !compress && !!preview;
-		const previewType = canPreview ? getPreviewType(finalName) : null;
+		let capability = classifySharePreview(finalName);
+		if (canPreview && capability.kind === "text") {
+			const prefix = new Uint8Array(await Bun.file(storagePath).slice(0, 4096).arrayBuffer());
+			if (!isShareText(prefix, finalStat.size <= 4096))
+				capability = { kind: "unsupported", mime: "application/octet-stream" };
+		}
+		const tooLarge = capability.kind === "html" && finalStat.size > SHARE_HTML_MAX_BYTES;
+		const previewType =
+			canPreview && !tooLarge && capability.kind !== "unsupported" ? capability.kind : null;
 		const previewUrl = previewType ? `/api/shares/${record.id}/preview` : null;
+		const previewReason =
+			preview && !previewUrl
+				? !canPreview
+					? "compressed"
+					: tooLarge
+						? "tooLarge"
+						: "unsupported"
+				: undefined;
 
 		// For image previews, forward the intrinsic pixel size so the frontend can
 		// reserve an aspect-ratio box instead of a fixed placeholder height. Only a
@@ -479,7 +482,11 @@ async function handleSinglePath(
 				`Filename: ${finalName}\n` +
 				`Size: ${formatSize(finalStat.size)}\n` +
 				`Expires: ${record.expiresAt.toISOString()} (${expiryHours}h from now)` +
-				(previewUrl ? `\nPreview: enabled (${previewType})` : ""),
+				(previewUrl
+					? `\nPreview: enabled (${previewType}); playback depends on browser support.`
+					: previewReason
+						? `\nPreview unavailable (${previewReason}). Please download the file.`
+						: ""),
 			title: `Shared: ${finalName}`,
 			metadata: {
 				shareId: record.id,
@@ -493,7 +500,11 @@ async function handleSinglePath(
 				isDirectory: isDir,
 				compressed: isDir || !!compress,
 				format,
+				previewRequested: !!preview,
+				...(previewReason ? { previewReason, previewType: "unsupported" } : {}),
 				...(previewUrl && {
+					previewMime: capability.mime,
+					textFormat: capability.textFormat,
 					preview: true,
 					previewType,
 					previewUrl,

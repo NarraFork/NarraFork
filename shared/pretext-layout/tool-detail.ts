@@ -14,6 +14,7 @@
  */
 
 import { hasUsablePlanBody } from "../plan-reference";
+import { classifySharePreview, type SharePreviewRef, sharePreviewHeight } from "../share-preview";
 import { readBackgroundTaskId, stripAwaitAgentEnvelope } from "../subagent-result-text";
 import {
 	deriveToolProgress,
@@ -200,6 +201,8 @@ export interface ToolCappedDetail {
 	 * aspect-fitted content height over the fixed fallback).
 	 */
 	media?: ToolMediaRef;
+	/** Typed share body; never route non-images through VListImage. */
+	sharePreview?: SharePreviewRef;
 	/**
 	 * True when `text` is only a PREFIX of the real body (a truncated leaf).
 	 *
@@ -2630,6 +2633,12 @@ function classifyShare(
 	}
 	const filename = readLeafText(metadata.filename) ?? "file";
 	const downloadUrl = metadata.downloadUrl;
+	const capability =
+		metadata.previewType === "unsupported" ||
+		metadata.compressed === true ||
+		metadata.isDirectory === true
+			? { kind: "unsupported" as const, mime: "application/octet-stream" }
+			: classifySharePreview(filename);
 	const sizeFormatted = readLeafText(metadata.sizeFormatted);
 	const fileCount = typeof metadata.fileCount === "number" ? metadata.fileCount : undefined;
 	const expiryHours = typeof metadata.expiryHours === "number" ? metadata.expiryHours : undefined;
@@ -2650,7 +2659,10 @@ function classifyShare(
 					"violet",
 				),
 				chip(fileCount != null && fileCount > 0 ? `${fileCount} files` : undefined, "cyan"),
-				chip(metadata.preview === true ? "preview" : undefined, "teal"),
+				chip(
+					metadata.preview === true && capability.kind !== "unsupported" ? "preview" : undefined,
+					"teal",
+				),
 				chip(expiryHours != null ? `${expiryHours}h` : undefined, "yellow"),
 			]),
 			actions: [
@@ -2659,8 +2671,20 @@ function classifyShare(
 			],
 		},
 	]);
-	const sharePreviewUrl = readLeafText(metadata.previewUrl);
-	if (metadata.preview === true && sharePreviewUrl !== undefined) {
+	const legacyRequested =
+		!Object.hasOwn(metadata, "previewRequested") &&
+		inputJson !== null &&
+		typeof inputJson === "object" &&
+		(inputJson as Record<string, unknown>).preview === true;
+	const previewRequested = metadata.previewRequested === true || legacyRequested;
+	const sharePreviewUrl =
+		readLeafText(metadata.previewUrl) ??
+		(previewRequested &&
+		capability.kind !== "unsupported" &&
+		/^\/api\/shares\/[\w-]+$/.test(downloadUrl)
+			? `${downloadUrl}/preview`
+			: undefined);
+	if ((metadata.preview === true && sharePreviewUrl !== undefined) || previewRequested) {
 		return sections([
 			section("meta.share", undefined, header),
 			section(
@@ -2668,8 +2692,30 @@ function classifyShare(
 				undefined,
 				capped("output.main", "media", {
 					format: "media",
-					contentPx: MEDIA_IMAGE_CONTENT_PX,
-					media: { previewUrl: sharePreviewUrl, filename, ...mediaDimensions(metadata) },
+					contentPx:
+						capability.kind === "image"
+							? MEDIA_IMAGE_CONTENT_PX
+							: sharePreviewHeight(capability.kind, 480),
+					...(capability.kind === "image"
+						? { media: { previewUrl: sharePreviewUrl, filename, ...mediaDimensions(metadata) } }
+						: {}),
+					sharePreview: {
+						...capability,
+						filename,
+						url: sharePreviewUrl,
+						downloadUrl,
+						expiresAt: readLeafText(metadata.expiresAt),
+						reason:
+							metadata.previewReason === "tooLarge"
+								? "tooLarge"
+								: metadata.previewReason === "compressed" ||
+										metadata.compressed === true ||
+										metadata.isDirectory === true
+									? "compressed"
+									: capability.kind === "unsupported"
+										? "unsupported"
+										: undefined,
+					},
 				}),
 			),
 		]);

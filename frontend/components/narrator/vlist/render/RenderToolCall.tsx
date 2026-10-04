@@ -141,6 +141,7 @@ import { FragmentGap, LineFragments } from "./line-fragments";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
 import { type ReflectionNoticeLabels, RenderReflectionNotice } from "./RenderReflectionNotice";
+import { ShareFilePreview } from "./ShareFilePreview";
 import { readExactDisplayBox, VListImage } from "./vlist-image";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1908,6 +1909,16 @@ export function RenderToolBody({
 		);
 	if (model.format === "media") {
 		const block = blocks[0];
+		if (model.sharePreview) {
+			const box = block?.kind === "fixed" ? readExactDisplayBox(block.data) : null;
+			return (
+				<ShareFilePreview
+					preview={model.sharePreview}
+					height={height}
+					displayWidth={box?.displayWidth}
+				/>
+			);
+		}
 		return model.media ? (
 			<VListImage
 				media={model.media}
