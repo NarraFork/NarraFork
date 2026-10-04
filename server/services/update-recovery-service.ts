@@ -46,6 +46,7 @@ import {
 	consumePlannedUpdateRecoverySnapshot,
 	type PlannedUpdateRecoverySnapshot,
 	removePlannedUpdateRecoverySnapshot,
+	writePlannedUpdateRecoverySnapshot,
 } from "./update-coordinator";
 
 export const CLAIM_LEASE_MS = 5 * 60_000;
@@ -702,6 +703,15 @@ export async function getPlannedUpdateStartupProtection(): Promise<{
 		});
 		removePlannedUpdateRecoverySnapshot({ expectedEpoch: snapshot.updateEpoch });
 		return { snapshot: null, protection: EMPTY_PROTECTION, severedNarratorIds: new Set() };
+	}
+
+	if (snapshot.resumeOnNextStartup) {
+		// Claim before mounting any owner. Keep evidence for this recovery pass, but a later
+		// ordinary boot must not replay the authorization if recovery crashes or fails.
+		writePlannedUpdateRecoverySnapshot(
+			{ ...snapshot, resumeOnNextStartup: false, evidenceOnly: true },
+			{ expectedEpoch: snapshot.updateEpoch },
+		);
 	}
 
 	return {

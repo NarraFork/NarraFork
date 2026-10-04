@@ -12,6 +12,11 @@
  */
 export type ShutdownStepOutcome = "ok" | "timeout" | "failed";
 
+/** Only checkpoint-backed exits may leave recoverable processes/browser sessions alive. */
+export function preservesRecoveryOnShutdown(reason: string): boolean {
+	return reason === "replacement_started" || reason === "system_prepared_shutdown";
+}
+
 export interface ShutdownStepRecord {
 	label: string;
 	outcome: ShutdownStepOutcome;

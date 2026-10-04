@@ -1414,6 +1414,9 @@ export async function applyUpdate(options: { targetVersion?: string } = {}): Pro
 	}
 
 	const existing = getUpdateCoordinationStatus();
+	if (existing.scheduled && existing.operation === "system_shutdown") {
+		return { success: false, error: "System shutdown preparation is already scheduled" };
+	}
 	if (existing.scheduled) {
 		return {
 			success: true,
@@ -1469,10 +1472,20 @@ function preserveFailedUpdateRecoveryEvidence(options: {
 	updateEpoch: string;
 	targetVersion: string;
 }): void {
-	const existing = consumePlannedUpdateRecoverySnapshot();
-	if (existing?.updateEpoch === options.updateEpoch) return;
-
 	try {
+		const existing = consumePlannedUpdateRecoverySnapshot();
+		if (existing?.updateEpoch === options.updateEpoch) {
+			// A cancelled manual preparation must not leave a valid next-start authorization
+			// behind when continuation cleanup fails. Retain diagnostics, revoke resume permission.
+			if (existing.resumeOnNextStartup) {
+				writePlannedUpdateRecoverySnapshot(
+					{ ...existing, resumeOnNextStartup: false, evidenceOnly: true },
+					{ expectedEpoch: options.updateEpoch },
+				);
+			}
+			return;
+		}
+
 		const captured = capturePlannedUpdateRecoverySnapshot();
 		writePlannedUpdateRecoverySnapshot(
 			{
@@ -1525,6 +1538,15 @@ export async function failPreparedUpdateAttempt(options: {
 
 	cancelGracefulRestartSession();
 	try {
+		const manifest = consumePlannedUpdateRecoverySnapshot();
+		if (manifest?.updateEpoch === options.updateEpoch && manifest.resumeOnNextStartup) {
+			// Revoke before async cleanup and before best-effort unlink. A failed unlink must
+			// never leave cancelled work authorized to resume on the next manual startup.
+			writePlannedUpdateRecoverySnapshot(
+				{ ...manifest, resumeOnNextStartup: false, evidenceOnly: true },
+				{ expectedEpoch: options.updateEpoch },
+			);
+		}
 		const cancelledCount = await toolContinuationService.cancelEpoch(
 			options.updateEpoch,
 			options.error,
@@ -1600,7 +1622,7 @@ export function cancelPreparedUpdate(reason?: string): {
 	status: UpdateCoordinationStatus;
 } {
 	const before = getUpdateCoordinationStatus();
-	if (!before.scheduled || !before.updateEpoch) {
+	if (!before.scheduled || !before.updateEpoch || before.operation === "system_shutdown") {
 		return { cancelled: false, status: before };
 	}
 	// Cancelling during `restarting` would leave the already-spawned replacement racing this
@@ -1635,7 +1657,7 @@ export function shutdownForManualUpdate(options: { reason: string }): {
 	newBinaryPath?: string;
 } {
 	const before = getUpdateCoordinationStatus();
-	if (before.phase === "restarting") {
+	if (before.operation === "system_shutdown" || before.phase === "restarting") {
 		return {
 			success: false,
 			error: "A replacement server is already starting; wait for it to finish",

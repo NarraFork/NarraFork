@@ -60,6 +60,7 @@ let _restartFn: RestartFn | null = null;
 let _runtimeAddressGetter: RuntimeAddressGetter | null = null;
 let _gracefulShutdownFn: GracefulShutdownFn | null = null;
 let _operatorShutdownFn: OperatorShutdownFn | null = null;
+let _operatorShutdownPending = false;
 let _gracefulRestartSession: GracefulRestartSession | null = null;
 
 /** Called by server/main.ts to register the in-process restart implementation. */
@@ -85,6 +86,7 @@ export function registerGracefulShutdownHandler(fn: GracefulShutdownFn): void {
  */
 export function registerOperatorShutdownHandler(fn: OperatorShutdownFn | null): void {
 	_operatorShutdownFn = fn;
+	if (!fn) _operatorShutdownPending = false;
 }
 
 /**
@@ -94,7 +96,7 @@ export function registerOperatorShutdownHandler(fn: OperatorShutdownFn | null): 
  * route can answer with a real reason instead of reporting a shutdown that never happens.
  */
 export function canOperatorShutdown(): boolean {
-	return _operatorShutdownFn !== null;
+	return _operatorShutdownFn !== null && !_operatorShutdownPending;
 }
 
 /**
@@ -117,12 +119,16 @@ const OPERATOR_SHUTDOWN_RESPONSE_GRACE_MS = 300;
  */
 export function scheduleOperatorShutdown(options: { reason: string }): boolean {
 	const fn = _operatorShutdownFn;
+	if (_operatorShutdownPending) return false;
 	if (!fn) {
 		logger.error("Operator shutdown requested but no handler registered", {
 			reason: options.reason,
 		});
 		return false;
 	}
+	// Own the response grace window atomically, before any other lifecycle request can
+	// promise a checkpoint that this already-scheduled teardown would cut short.
+	_operatorShutdownPending = true;
 	logger.info("Operator shutdown scheduled", {
 		reason: options.reason,
 		graceMs: OPERATOR_SHUTDOWN_RESPONSE_GRACE_MS,
