@@ -64,6 +64,64 @@ function fakeDb(options: {
 	} as unknown as BunSQLDatabase;
 }
 
+describe("postgres queue mode atomic mutations", () => {
+	test("mode patches preserve payload metadata and return false for a lost CAS", async () => {
+		for (const won of [true, false]) {
+			let selections = 0;
+			let patch: Record<string, unknown> = {};
+			const row = {
+				id: "m1",
+				seq: 2,
+				priority: false,
+				contentRevision: 4,
+				metadataJson: JSON.stringify({
+					stagingId: "kept",
+					executionIntent: { controlCommand: true },
+				}),
+			};
+			const tx = {
+				select: () => fakeSelect(++selections === 1 ? [{ id: "n1" }] : [row]),
+				update: () => ({
+					set: (value: Record<string, unknown>) => {
+						patch = value;
+						return {
+							where: () => ({ returning: () => Promise.resolve(won ? [{ id: "m1" }] : []) }),
+						};
+					},
+				}),
+			};
+			const store = createPostgresRuntimeQueue({
+				transaction: (section: (tx: unknown) => unknown) => section(tx),
+			} as unknown as BunSQLDatabase);
+			expect(await store.mailbox.updateUserBufferedMode("n1", "m1", "interrupt")).toBe(won);
+			expect(patch.contentRevision).toBe(5);
+			expect(patch.priority).toBe(true);
+			expect(JSON.parse(patch.metadataJson as string)).toEqual({
+				stagingId: "kept",
+				queueMode: "interrupt",
+				executionIntent: { controlCommand: true },
+			});
+			expect(patch.text).toBeUndefined();
+			expect(patch.payloadRefJson).toBeUndefined();
+			expect(patch.state).toBeUndefined();
+		}
+	});
+	test("claimed or missing messages cannot mutate", async () => {
+		let updates = 0;
+		const store = createPostgresRuntimeQueue({
+			transaction: (section: (tx: unknown) => unknown) =>
+				section({
+					select: () => fakeSelect([]),
+					update: () => {
+						updates++;
+					},
+				}),
+		} as unknown as BunSQLDatabase);
+		expect(await store.mailbox.updateUserBufferedMode("n1", "gone", "turn")).toBe(false);
+		expect(updates).toBe(0);
+	});
+});
+
 describe("postgres runtime queue boundary: whole-section retry and error vocabulary", () => {
 	test("retryable SQLSTATE (40001) replays the whole section, then rethrows the ORIGINAL error", async () => {
 		const attempts = { count: 0 };

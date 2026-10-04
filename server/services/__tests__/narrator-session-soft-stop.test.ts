@@ -7,8 +7,11 @@ const { db, sqlite } = getTestDb();
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const {
+	applyBufferedQueueModeControl,
 	clearBufferedMessageSoftStopIfIdle,
 	evaluateSoftStopRequest,
+	hasPendingBufferedGuidance,
+	hasPendingBufferedWork,
 	rearmCutInSoftStopBeforeContinuing,
 	requestBufferedMessageSoftStop,
 } = await import("../narrator-session");
@@ -46,7 +49,16 @@ async function grantedCutInStop(): Promise<ActiveNarrator> {
 }
 
 async function queueMessage(text = "cut in"): Promise<string> {
-	const entry = await pushBufferedMessage(NARRATOR_ID, text);
+	const entry = await pushBufferedMessage(
+		NARRATOR_ID,
+		text,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		"front",
+	);
 	expect(entry.ok).toBe(true);
 	expect(getBufferedMessages(NARRATOR_ID).some((message) => message.id === entry.id)).toBe(true);
 	return entry.id;
@@ -237,5 +249,41 @@ describe("clearBufferedMessageSoftStopIfIdle", () => {
 
 	test("does not throw for an unknown narrator", () => {
 		expect(() => clearBufferedMessageSoftStopIfIdle("no-such-narrator")).not.toThrow();
+	});
+});
+
+describe("immediate guidance controls", () => {
+	test("cancels the request without aborting the narrator/tool owner", async () => {
+		const active = registerActiveNarrator();
+		active.abortController = new AbortController();
+		active._guidanceAbortController = new AbortController();
+		await queueMessage();
+		expect(requestBufferedMessageSoftStop(NARRATOR_ID)).toBe(true);
+		expect(active._guidanceAbortController.signal.aborted).toBe(true);
+		expect(active.abortController.signal.aborted).toBe(false);
+		expect(active._bufferGuidancePending).toBe(true);
+	});
+
+	test("remaining next-step inputs do not keep a cancelled guidance stop armed", async () => {
+		const active = registerActiveNarrator();
+		const guide = await queueMessage();
+		await pushBufferedMessage(NARRATOR_ID, "next task");
+		requestBufferedMessageSoftStop(NARRATOR_ID);
+		await removeBufferedMessage(NARRATOR_ID, guide);
+		clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
+		expect(hasPendingBufferedWork(NARRATOR_ID)).toBe(true);
+		expect(hasPendingBufferedGuidance(NARRATOR_ID)).toBe(false);
+		expect(active._bufferSoftStop).toBe(false);
+		expect(active._bufferGuidancePending).toBe(false);
+	});
+
+	test("changing a failed input to urgent does not cancel the current owner", () => {
+		const active = registerActiveNarrator();
+		active.abortController = new AbortController();
+		active._guidanceAbortController = new AbortController();
+		applyBufferedQueueModeControl(NARRATOR_ID, "interrupt", false, false);
+		expect(active.abortController.signal.aborted).toBe(false);
+		expect(active._guidanceAbortController.signal.aborted).toBe(false);
+		expect(active._bufferSoftStop).toBeUndefined();
 	});
 });

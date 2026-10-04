@@ -112,6 +112,8 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 		handleRemoveQueued,
 		handleRetryQueued,
 		handleDragEndQueued,
+		handleMoveQueued,
+		handleChangeMode,
 		editingQueuedId,
 		queueExpanded,
 		setQueueExpanded,
@@ -151,6 +153,8 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 				setQueueExpanded={setQueueExpanded}
 				editingQueuedId={editingQueuedId}
 				handleDragEndQueued={handleDragEndQueued}
+				handleMoveQueued={handleMoveQueued}
+				handleChangeMode={handleChangeMode}
 				handleSaveEditQueued={handleSaveEditQueued}
 				handleCancelEditQueued={handleCancelEditQueued}
 				handleStartEditQueued={handleStartEditQueued}

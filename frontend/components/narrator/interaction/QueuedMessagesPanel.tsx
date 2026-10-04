@@ -8,25 +8,22 @@ import {
 	useSensors,
 } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
-import { Badge, Button, Group, Stack, Text } from "@mantine/core";
-import { IconBolt, IconChevronDown, IconChevronUp } from "@tabler/icons-react";
+import { ActionIcon, Button, Group, Menu, Stack, Text } from "@mantine/core";
+import { IconChevronDown, IconChevronUp, IconDotsVertical } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import type { BufferMessageSummary } from "../../../lib/api";
-import { QueuedAttachmentPreview, QueuedMessageRow } from "./QueuedMessageRow";
+import type { QueueMode } from "../composer/SendOptionsSplitButton";
+import { QueuedMessageRow } from "./QueuedMessageRow";
+import { queuedMessageMode } from "./queue-message-mode";
 
-/** Number of queued messages before the queue collapses into a summary bar. */
-const QUEUE_COLLAPSE_THRESHOLD = 2;
-
-/**
- * The queue state + handlers, assembled once by the panel and threaded through
- * NarratorInteractionArea as a single `queue` group (mirrors `statusBarInputs`).
- */
 export interface QueuedMessagesData {
 	queuedMessages: BufferMessageSummary[];
 	queueExpanded: boolean;
 	setQueueExpanded: (expanded: boolean) => void;
 	editingQueuedId: string | null;
 	handleDragEndQueued: (event: DragEndEvent) => void;
+	handleMoveQueued: (id: string, direction: -1 | 1) => void;
+	handleChangeMode: (id: string, mode: QueueMode) => Promise<void>;
 	handleSaveEditQueued: (
 		msg: BufferMessageSummary,
 		text: string,
@@ -43,149 +40,126 @@ export interface QueuedMessagesData {
 	handleRetryQueued: (id: string) => Promise<{ ok: true; resumed: boolean }>;
 	handleCancelAllQueued: () => void;
 }
-
 export type QueuedMessagesPanelProps = QueuedMessagesData;
 
-/**
- * The queued-messages region above the composer: a collapsed summary bar past the
- * collapse threshold, or the full drag-reorderable list. Owns its own DnD sensors.
- */
 export function QueuedMessagesPanel(props: QueuedMessagesPanelProps) {
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
-
 	const sensors = useSensors(
 		useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
 		useSensor(TouchSensor, { activationConstraint: { delay: 100, tolerance: 5 } }),
 	);
-
 	if (props.queuedMessages.length === 0) return null;
-
+	// Consecutive segments preserve the authoritative FIFO order across guidance modes.
+	const groups: { mode: QueueMode; messages: BufferMessageSummary[] }[] = [];
+	for (const message of props.queuedMessages) {
+		const mode = queuedMessageMode(message);
+		const previous = groups[groups.length - 1];
+		if (previous?.mode === mode) previous.messages.push(message);
+		else groups.push({ mode, messages: [message] });
+	}
+	const counts = (["turn", "tool", "interrupt"] as const)
+		.map((mode) => ({
+			mode,
+			count: props.queuedMessages.filter((message) => queuedMessageMode(message) === mode).length,
+		}))
+		.filter(({ count }) => count > 0);
+	const ordinaryIds = props.queuedMessages
+		.filter((message) => queuedMessageMode(message) === "turn")
+		.map((message) => message.id);
+	const single = props.queuedMessages.length === 1;
+	const hasActiveEditor =
+		typeof props.editingQueuedId === "string" &&
+		props.queuedMessages.some((msg) => msg.id === props.editingQueuedId);
+	// Pin an active editor open, including single-to-multiple queue transitions.
+	// Manual collapse is unavailable until editing ends; keep the user's preference unchanged.
+	const listVisible = props.queueExpanded || single || hasActiveEditor;
+	const failures = props.queuedMessages.filter((msg) => msg.state === "failed").length;
+	const multipleAuthors =
+		new Set(props.queuedMessages.map((msg) => msg.creator?.id).filter(Boolean)).size > 1;
 	return (
 		<Stack
 			gap={0}
-			style={{
-				borderTop: "1px solid var(--mantine-color-default-border)",
-				flexShrink: 0,
-			}}
+			style={{ borderTop: "1px solid var(--mantine-color-default-border)", flexShrink: 0 }}
 		>
-			{props.queuedMessages.length > QUEUE_COLLAPSE_THRESHOLD && !props.queueExpanded ? (
-				/* Collapsed summary bar */
-				<Group
-					component="button"
-					px="md"
-					py={4}
-					gap="xs"
-					wrap="nowrap"
-					bg="var(--mantine-color-blue-light)"
-					style={{ cursor: "pointer", border: "none", width: "100%", textAlign: "left" }}
-					onClick={() => props.setQueueExpanded(true)}
-					aria-expanded={false}
-					aria-label={t("queuedCount", { count: props.queuedMessages.length })}
-				>
-					<IconChevronUp size={14} color="var(--mantine-color-blue-5)" />
-					<Text size="xs" c="blue" fw={500} style={{ flexShrink: 0 }}>
-						{t("queuedCount", { count: props.queuedMessages.length })}
-					</Text>
-					{props.queuedMessages.some((msg) => msg.state === "failed") && (
-						<Badge color="red" size="xs" style={{ flexShrink: 0 }}>
-							{t("queuedFailedCount", {
-								count: props.queuedMessages.filter((msg) => msg.state === "failed").length,
-							})}
-						</Badge>
-					)}
-					<QueuedAttachmentPreview
-						images={props.queuedMessages[0].images ?? []}
-						textFiles={props.queuedMessages[0].textFiles ?? []}
-					/>
-					{props.queuedMessages[0].priority && (
-						<Badge
-							size="xs"
-							color="orange"
-							variant="light"
-							leftSection={<IconBolt size={10} />}
-							style={{ flexShrink: 0 }}
-						>
-							{t("queuedPriorityNextRequest")}
-						</Badge>
-					)}
-					<Text size="xs" c="dimmed" truncate style={{ flex: 1 }}>
-						{props.queuedMessages[0].text}
-					</Text>
+			{!single && (
+				<Group px="md" py={2} gap="xs" wrap="wrap" data-queue-summary>
 					<Button
 						size="compact-xs"
 						variant="subtle"
-						color="red"
-						onClick={(e) => {
-							e.stopPropagation();
-							props.handleCancelAllQueued();
-						}}
+						color="gray"
+						onClick={() => props.setQueueExpanded(!props.queueExpanded)}
+						disabled={hasActiveEditor}
+						aria-expanded={listVisible}
+						leftSection={listVisible ? <IconChevronDown size={12} /> : <IconChevronUp size={12} />}
 					>
-						{t("clearAllQueued")}
+						{t("queuedCount", { count: props.queuedMessages.length })}
 					</Button>
+					<Text
+						size="xs"
+						c="dimmed"
+						style={{ flex: "1 1 140px", minWidth: 0, overflowWrap: "anywhere" }}
+					>
+						{counts.map(({ mode, count }) => `${t(`queueMode_${mode}`)} ${count}`).join(" · ")}
+					</Text>
+					{failures > 0 && (
+						<Text size="xs" c="red">
+							{t("queuedFailedCount", { count: failures })}
+						</Text>
+					)}
+					<Menu position="top-end" withinPortal>
+						<Menu.Target>
+							<ActionIcon variant="subtle" color="gray" size="sm" aria-label={t("queuedActions")}>
+								<IconDotsVertical size={14} />
+							</ActionIcon>
+						</Menu.Target>
+						<Menu.Dropdown>
+							<Menu.Item color="red" onClick={props.handleCancelAllQueued}>
+								{t("clearAllQueued")}
+							</Menu.Item>
+						</Menu.Dropdown>
+					</Menu>
 				</Group>
-			) : (
-				/* Expanded full list */
-				<>
+			)}
+			{listVisible && (
+				<Stack gap={0} style={{ maxHeight: "min(32vh, 280px)", overflowY: "auto" }}>
 					<DndContext
 						sensors={sensors}
 						collisionDetection={closestCenter}
 						onDragEnd={props.handleDragEndQueued}
 					>
-						<SortableContext
-							items={props.queuedMessages.map((m) => m.id)}
-							strategy={verticalListSortingStrategy}
-						>
-							{props.queuedMessages.map((msg, index) => (
-								<QueuedMessageRow
-									key={msg.id}
-									msg={msg}
-									index={index}
-									isEditing={props.editingQueuedId === msg.id}
-									onSaveEdit={props.handleSaveEditQueued}
-									onCancelEdit={props.handleCancelEditQueued}
-									onStartEdit={props.handleStartEditQueued}
-									onRemove={props.handleRemoveQueued}
-									onRetry={props.handleRetryQueued}
-									cancelBufferLabel={t("cancelBuffer")}
-									editLabel={tc("edit")}
-									priorityLabel={t("queuedPriority")}
-									priorityNextRequestLabel={t("queuedPriorityNextRequest")}
-								/>
-							))}
+						<SortableContext items={ordinaryIds} strategy={verticalListSortingStrategy}>
+							{/* Rows stay keyed siblings even when FIFO segments split, merge or lose a head.
+							    A keyed group wrapper would remount them and discard unsaved edits. */}
+							{groups.flatMap(({ mode, messages }) => [
+								<Text key={`heading:${messages[0].id}`} size="xs" c="dimmed" px="md" py={2}>
+									{t(`queueMode_${mode}`)}
+								</Text>,
+								...messages.map((msg, index) => (
+									<QueuedMessageRow
+										key={msg.id}
+										msg={msg}
+										index={index}
+										showAuthor={multipleAuthors}
+										canMoveUp={ordinaryIds.indexOf(msg.id) > 0}
+										canMoveDown={ordinaryIds.indexOf(msg.id) < ordinaryIds.length - 1}
+										onClearAll={single ? props.handleCancelAllQueued : undefined}
+										isEditing={props.editingQueuedId === msg.id}
+										onSaveEdit={props.handleSaveEditQueued}
+										onCancelEdit={props.handleCancelEditQueued}
+										onStartEdit={props.handleStartEditQueued}
+										onRemove={props.handleRemoveQueued}
+										onRetry={props.handleRetryQueued}
+										onChangeMode={props.handleChangeMode}
+										onMove={props.handleMoveQueued}
+										cancelBufferLabel={t("cancelBuffer")}
+										editLabel={tc("edit")}
+									/>
+								)),
+							])}
 						</SortableContext>
 					</DndContext>
-					{props.queuedMessages.length > 1 && (
-						<Group
-							px="md"
-							py={2}
-							justify="flex-end"
-							gap="xs"
-							style={{ backgroundColor: "var(--mantine-color-blue-light)" }}
-						>
-							{props.queuedMessages.length > QUEUE_COLLAPSE_THRESHOLD && (
-								<Button
-									size="compact-xs"
-									variant="subtle"
-									color="blue"
-									onClick={() => props.setQueueExpanded(false)}
-									leftSection={<IconChevronDown size={12} />}
-									style={{ marginRight: "auto" }}
-								>
-									{t("collapseQueue")}
-								</Button>
-							)}
-							<Button
-								size="compact-xs"
-								variant="subtle"
-								color="red"
-								onClick={props.handleCancelAllQueued}
-							>
-								{t("clearAllQueued")}
-							</Button>
-						</Group>
-					)}
-				</>
+				</Stack>
 			)}
 		</Stack>
 	);

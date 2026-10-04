@@ -10,20 +10,19 @@
  * in edit mode by the parent (`isEditing`), which decides when to unmount. The
  * parent keeps just the id of the row being edited.
  *
- * Attachment previews are shown in BOTH modes on purpose. A count alone ("2
- * images") made it impossible to tell two pending messages apart, or to notice
- * that the wrong screenshot had been attached, until the message had already run.
+ * Idle rows show attachment counts; users can expand previews on demand.
+ * Edit mode always shows the retained and newly selected attachments.
  */
 
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import {
 	ActionIcon,
-	Badge,
 	Box,
 	Button,
 	CloseButton,
 	Group,
+	Menu,
 	Stack,
 	Text,
 	Textarea,
@@ -33,8 +32,8 @@ import { notifications } from "@mantine/notifications";
 import type { FileReference } from "@shared/file-reference";
 import { isTextFile, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
 import {
-	IconBolt,
 	IconCheck,
+	IconDotsVertical,
 	IconFile,
 	IconGripVertical,
 	IconPaperclip,
@@ -48,7 +47,6 @@ import type {
 	BufferedTextFileSummary,
 	BufferMessageSummary,
 } from "../../../lib/api/types";
-import { UserAvatar } from "../../UserAvatar";
 import {
 	EditNewImageThumb,
 	EditTextFileChip,
@@ -59,12 +57,14 @@ import {
 	type FileReferenceInput,
 	fileReferenceToken,
 } from "../composer/file-reference-input";
+import type { QueueMode } from "../composer/SendOptionsSplitButton";
 import {
 	ACCEPTED_TYPES,
 	MAX_IMAGE_LONG_EDGE,
 	MAX_IMAGE_SIZE,
 	resizeImageIfNeeded,
 } from "../narrator-panel-types";
+import { queuedMessageMode } from "./queue-message-mode";
 import {
 	buildQueuedEditPayload,
 	canSubmitQueuedEdit,
@@ -95,8 +95,12 @@ export interface QueuedMessageRowProps {
 	onRetry: (id: string) => Promise<{ ok: true; resumed: boolean }>;
 	cancelBufferLabel: string;
 	editLabel: string;
-	priorityLabel: string;
-	priorityNextRequestLabel: string;
+	showAuthor?: boolean;
+	canMoveUp?: boolean;
+	canMoveDown?: boolean;
+	onChangeMode: (id: string, mode: QueueMode) => Promise<void>;
+	onMove: (id: string, direction: -1 | 1) => void;
+	onClearAll?: () => void;
 }
 
 /** Read-only attachment strip for the collapsed/idle row. */
@@ -160,19 +164,34 @@ export function QueuedMessageRow({
 	onRetry,
 	cancelBufferLabel,
 	editLabel,
-	priorityLabel,
-	priorityNextRequestLabel,
+	showAuthor,
+	canMoveUp,
+	canMoveDown,
+	onChangeMode,
+	onMove,
+	onClearAll,
 }: QueuedMessageRowProps) {
 	const { t } = useTranslation("narrator");
+	const mode = queuedMessageMode(msg);
+	const [attachmentsExpanded, setAttachmentsExpanded] = useState(false);
+	const [textExpanded, setTextExpanded] = useState(false);
+	const borderColor =
+		mode === "interrupt"
+			? "var(--mantine-color-orange-5)"
+			: mode === "tool"
+				? "var(--mantine-color-indigo-4)"
+				: "var(--mantine-color-default-border)";
+	const attachmentCount =
+		(msg.images?.length ?? 0) + (msg.textFiles?.length ?? 0) + (msg.fileReferences?.length ?? 0);
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: msg.id,
+		disabled: mode !== "turn" || isEditing,
 	});
 	const style = {
 		transform: CSS.Transform.toString(transform),
 		transition,
 		opacity: isDragging ? 0.5 : 1,
 	};
-	const priorityText = index === 0 ? priorityNextRequestLabel : priorityLabel;
 	const failed = msg.state === "failed";
 	const [retrying, setRetrying] = useState(false);
 	const retryingRef = useRef(false);
@@ -397,6 +416,7 @@ export function QueuedMessageRow({
 		<div
 			{...attributes}
 			{...listeners}
+			data-queue-drag-handle
 			style={{
 				cursor: "grab",
 				display: "flex",
@@ -421,49 +441,71 @@ export function QueuedMessageRow({
 				py={4}
 				gap="xs"
 				wrap="nowrap"
-				bg="var(--mantine-color-blue-light)"
+				bg="var(--mantine-color-default-hover)"
 			>
-				{dragHandle(<IconGripVertical size={14} color="var(--mantine-color-dimmed)" />)}
-				{msg.creator ? (
-					<UserAvatar
-						username={msg.creator.username}
-						avatarColor={msg.creator.avatarColor}
-						avatarImageId={msg.creator.avatarImageId}
-						userId={msg.creator.id}
-						size={16}
-						showTooltip={false}
-					/>
-				) : (
-					<Box w={16} h={16} style={{ flexShrink: 0 }} />
-				)}
-				<QueuedAttachmentPreview
-					images={msg.images ?? []}
-					textFiles={msg.textFiles ?? []}
-					fileReferences={msg.fileReferences}
-				/>
-				{msg.priority && (
-					<Badge
+				{mode === "turn" &&
+					dragHandle(<IconGripVertical size={14} color="var(--mantine-color-dimmed)" />)}
+				<Stack
+					gap={2}
+					data-queue-mode={mode}
+					style={{
+						flex: 1,
+						minWidth: 0,
+						borderLeft: `2px solid ${borderColor}`,
+						paddingLeft: 8,
+					}}
+				>
+					{showAuthor && msg.creator && (
+						<Text size="xs" c="dimmed">
+							{msg.creator.username}
+						</Text>
+					)}
+					<Text
+						component="button"
+						type="button"
 						size="xs"
-						color="orange"
-						variant="light"
-						leftSection={<IconBolt size={10} />}
-						style={{ flexShrink: 0 }}
+						lineClamp={textExpanded ? undefined : 2}
+						aria-expanded={textExpanded}
+						aria-label={t(textExpanded ? "queuedCollapseText" : "queuedExpandText")}
+						onClick={() => setTextExpanded((expanded) => !expanded)}
+						onKeyDown={(event) => {
+							if (event.key === "Enter" || event.key === " ") {
+								event.preventDefault();
+								setTextExpanded((expanded) => !expanded);
+							}
+						}}
+						style={{
+							overflowWrap: "anywhere",
+							whiteSpace: "pre-wrap",
+							border: 0,
+							padding: 0,
+							background: "transparent",
+							color: "inherit",
+							textAlign: "left",
+							cursor: "pointer",
+						}}
 					>
-						{priorityText}
-					</Badge>
-				)}
-				<Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
-					<Text size="xs" truncate style={{ overflowWrap: "anywhere" }}>
 						{msg.text}
 					</Text>
-					<Badge
-						size="xs"
-						variant="light"
-						color={failed ? "red" : "blue"}
-						style={{ alignSelf: "flex-start" }}
-					>
-						{failed ? t("queuedFailed") : t("status_queued")}
-					</Badge>
+					{attachmentCount > 0 && (
+						<Button
+							size="compact-xs"
+							variant="subtle"
+							color="gray"
+							style={{ alignSelf: "flex-start" }}
+							onClick={() => setAttachmentsExpanded(!attachmentsExpanded)}
+							aria-expanded={attachmentsExpanded}
+						>
+							{t("queuedAttachments", { count: attachmentCount })}
+						</Button>
+					)}
+					{attachmentsExpanded && (
+						<QueuedAttachmentPreview
+							images={msg.images ?? []}
+							textFiles={msg.textFiles ?? []}
+							fileReferences={msg.fileReferences}
+						/>
+					)}
 					{failureNotice}
 				</Stack>
 				{failed && (
@@ -478,17 +520,59 @@ export function QueuedMessageRow({
 						{t("queuedRetry")}
 					</Button>
 				)}
-				<ActionIcon
-					size="xs"
-					variant="subtle"
-					color="blue"
-					onClick={() => onStartEdit(msg)}
-					disabled={retrying}
-					title={editLabel}
-				>
-					<IconPencil size={12} />
-				</ActionIcon>
-				<CloseButton size="xs" onClick={() => onRemove(msg.id)} title={cancelBufferLabel} />
+				<Menu withinPortal position="top-end">
+					<Menu.Target>
+						<ActionIcon
+							size="sm"
+							variant="subtle"
+							color="gray"
+							disabled={retrying}
+							aria-label={t("queuedActions")}
+						>
+							<IconDotsVertical size={14} />
+						</ActionIcon>
+					</Menu.Target>
+					<Menu.Dropdown>
+						<Menu.Item leftSection={<IconPencil size={14} />} onClick={() => onStartEdit(msg)}>
+							{editLabel}
+						</Menu.Item>
+						<Menu.Label>{t("queuedChangeMode")}</Menu.Label>
+						{(["turn", "tool", "interrupt"] as const).map((nextMode) => (
+							<Menu.Item
+								key={nextMode}
+								disabled={mode === nextMode}
+								onClick={() => void onChangeMode(msg.id, nextMode)}
+							>
+								<Text size="sm">{t(`queueMode_${nextMode}`)}</Text>
+								{nextMode === "interrupt" && (
+									<Text size="xs" c="dimmed">
+										{t("queuedInterruptWarning")}
+									</Text>
+								)}
+							</Menu.Item>
+						))}
+						{mode === "turn" && (
+							<>
+								<Menu.Divider />
+								<Menu.Item disabled={!canMoveUp} onClick={() => onMove(msg.id, -1)}>
+									{t("queuedMoveUp")}
+								</Menu.Item>
+								<Menu.Item disabled={!canMoveDown} onClick={() => onMove(msg.id, 1)}>
+									{t("queuedMoveDown")}
+								</Menu.Item>
+							</>
+						)}
+						<Menu.Divider />
+						<Menu.Item color="red" onClick={() => onRemove(msg.id)}>
+							{cancelBufferLabel}
+						</Menu.Item>
+						{onClearAll && (
+							<Menu.Item color="red" onClick={onClearAll}>
+								{t("clearAllQueued")}
+							</Menu.Item>
+						)}
+					</Menu.Dropdown>
+				</Menu>
 			</Group>
 		);
 	}
@@ -505,13 +589,14 @@ export function QueuedMessageRow({
 			gap="xs"
 			align="flex-start"
 			wrap="nowrap"
-			bg="var(--mantine-color-blue-light)"
+			bg="var(--mantine-color-default-hover)"
 		>
-			{dragHandle(
-				<Text size="xs" c="dimmed" w={16} ta="center">
-					{index + 1}
-				</Text>,
-			)}
+			{mode === "turn" &&
+				dragHandle(
+					<Text size="xs" c="dimmed" w={16} ta="center">
+						{index + 1}
+					</Text>,
+				)}
 			<Stack gap={6} style={{ flex: 1, minWidth: 0 }}>
 				{failureNotice}
 				<Textarea

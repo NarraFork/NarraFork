@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { KIMI_QUOTA_EXHAUSTED } from "@shared/agent-protocol/quota-exhausted";
+import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
 import { formatOriginLabel } from "@shared/message-origin";
@@ -150,7 +151,7 @@ import {
 	getLatestSubagentParentToolUseId,
 	getSubagentFinalText,
 	getSubagentResultMessageId,
-	hasPendingBufferedWork,
+	hasPendingBufferedGuidance,
 	inheritedModelRuntime,
 	maybeStartContinuation,
 	parseQueuedGoalCommand,
@@ -504,6 +505,13 @@ export async function runAgentLoopUnlocked(
 
 	try {
 		while (active.alive && owner.isCurrent()) {
+			// Request-only control has one pass lifetime; a new pass must never inherit
+			// an already-consumed guidance abort from the preceding request.
+			active._guidanceAbortController = new AbortController();
+			active._urgentGuidanceAbortController = new AbortController();
+			if (active._bufferSoftStop && hasPendingBufferedGuidance(narratorId)) {
+				active._guidanceAbortController.abort(new Error("Immediate guidance requested"));
+			}
 			if (runState.pendingPrePromptBashCommand && !active.abortController.signal.aborted) {
 				const command = runState.pendingPrePromptBashCommand;
 				runState.pendingPrePromptBashCommand = undefined;
@@ -1173,6 +1181,8 @@ export async function runAgentLoopUnlocked(
 				systemPrompt: active.systemPrompt ?? undefined,
 				locale,
 				signal: active.abortController.signal,
+				guidanceSignal: active._guidanceAbortController.signal,
+				urgentGuidanceSignal: active._urgentGuidanceAbortController.signal,
 				chapterId: active._chapterId,
 				parentNarratorId: saParentNarratorId,
 				parentToolUseId: saParentToolUseId,
@@ -1323,7 +1333,7 @@ export async function runAgentLoopUnlocked(
 				permissionHandler: (toolName, input, toolUseId, options) =>
 					handlePermission(
 						narratorId,
-						active.abortController.signal,
+						options?.signal ?? active.abortController.signal,
 						toolName,
 						input,
 						toolUseId,
@@ -1470,6 +1480,13 @@ export async function runAgentLoopUnlocked(
 					);
 				},
 				shouldStop: () => {
+					// Cancellation is irreversible even when the queued guidance has since
+					// been removed/downgraded. Record the actual pass interruption using
+					// its captured signals, independently of whether input remains. This
+					// keeps ordinary next steps behind recovery of the unfinished work.
+					if (config.guidanceSignal?.aborted || config.urgentGuidanceSignal?.aborted) {
+						active._bufferSoftStopTaken = true;
+					}
 					if (active._workspacePassInvalidated || active._workspaceInstallFailed) return true;
 					if (profile.kind === "subagent" && shouldStopSubagentForBufferedMessageSync(narratorId)) {
 						active._bufferSoftStopTaken = true;
@@ -1478,7 +1495,7 @@ export async function runAgentLoopUnlocked(
 					const decision = evaluateSoftStopRequest({
 						feedbackSoftStop: active._feedbackSoftStop,
 						bufferSoftStop: active._bufferSoftStop,
-						hasPendingBufferedWork: hasPendingBufferedWork(narratorId),
+						hasPendingBufferedWork: hasPendingBufferedGuidance(narratorId),
 					});
 					active._feedbackSoftStop = decision.feedbackSoftStop;
 					active._bufferSoftStop = decision.bufferSoftStop;
@@ -2537,6 +2554,7 @@ export async function runAgentLoopUnlocked(
 				!active.abortController.signal.aborted
 			) {
 				const input = await consumeNextBufferedSubagentMessage({
+					onlyGuidance: active._bufferSoftStopTaken === true,
 					narratorId,
 					parentNarratorId: profile.parentNarratorId,
 					toolUseId: profile.parentToolUseId,
@@ -2566,12 +2584,16 @@ export async function runAgentLoopUnlocked(
 				const bufferedRow = await withNarratorMutationAdmission(narratorId, async () => {
 					if (active.abortController.signal.aborted) return undefined;
 					return claimInboxHead(narratorId, (candidate) => {
+						if (
+							active.abortController.signal.aborted ||
+							candidate.kind !== "user_input" ||
+							(active._bufferSoftStopTaken && bufferedRowMode(candidate) === "turn")
+						)
+							return false;
+						// A blocked ordinary next step must not end unfinished recovery
+						// merely because its later execution needs a fresh owner/model.
 						requiresFreshTurn = mailboxInputRequiresFreshTurn(candidate);
-						return (
-							!active.abortController.signal.aborted &&
-							candidate.kind === "user_input" &&
-							!requiresFreshTurn
-						);
+						return !requiresFreshTurn;
 					});
 				});
 				// Let the finalizer restore the previous model and release its epoch first.
@@ -2607,6 +2629,14 @@ export async function runAgentLoopUnlocked(
 					}
 					// Broadcast which message was consumed + remaining queue snapshot
 					const remaining = toBufferSummary(await getBufferedMessagesAsync(narratorId));
+					active._bufferGuidancePending = remaining.some(
+						(message) =>
+							message.state !== "failed" &&
+							resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
+					);
+					// Materialize accumulated guidance before starting another model
+					// request, so one request sees the whole FIFO batch.
+					active._bufferSoftStop = active._bufferGuidancePending;
 					broadcastToNarrator(narratorId, {
 						type: "buffer_consumed",
 						narratorId,

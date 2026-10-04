@@ -91,7 +91,10 @@ beforeEach(async () => {
 		Element: window.Element,
 		Node: window.Node,
 		Event: window.Event,
-		requestAnimationFrame: (): number => 1,
+		requestAnimationFrame: (callback: FrameRequestCallback): number => {
+			queueMicrotask(() => callback(performance.now()));
+			return 1;
+		},
 		cancelAnimationFrame: (): void => {},
 		matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
 		ResizeObserver: class {
@@ -173,12 +176,61 @@ describe("NarratorComposerRow takeover input visibility", () => {
 		expect(host.querySelector("[data-testid='composer-input']")).not.toBeNull();
 		expect(host.textContent).not.toContain("Take over");
 		// Active + canCutInLine → queue cluster, not takeover-only row.
-		expect(host.textContent).toContain("Queue");
+		expect(host.textContent).toContain("queueMode_turn");
 	});
 
 	test("taken-over subagent keeps input and shows stop-takeover", async () => {
 		await renderRow(baseProps({ isTakenOver: true, canTakeover: false, isActive: true }));
 		expect(host.querySelector("[data-testid='composer-input']")).not.toBeNull();
 		expect(host.textContent).toContain("Stop takeover");
+	});
+
+	for (const hasText of [false, true]) {
+		test(`send menu has three fixed actions with draft=${hasText}, shortcuts stay separate`, async () => {
+			const send = mock(() => {});
+			const configure = mock(() => {});
+			await renderRow(
+				baseProps({
+					composerHasText: hasText,
+					onSendWithMode: send,
+					onUpdateEnterQueueMode: configure,
+				}),
+			);
+			const trigger = document.querySelector('button[aria-label="sendOptions"]');
+			if (!trigger) throw new Error("Send menu missing");
+			await act(async () => trigger.dispatchEvent(new Event("click", { bubbles: true })));
+			const items = () => Array.from(document.querySelectorAll('[role="menuitem"]'));
+			expect(items().filter((item) => item.textContent?.startsWith("queueMode_"))).toHaveLength(3);
+			expect(document.body.textContent).not.toContain("enterKeySection");
+			const shortcuts = items().find((item) => item.textContent === "sendKeySettings");
+			if (!shortcuts) throw new Error("Shortcut settings missing");
+			await act(async () => shortcuts.dispatchEvent(new Event("click", { bubbles: true })));
+			expect(document.body.textContent).toContain("enterKeySection");
+			expect(document.body.textContent).toContain("ctrlEnterKeySection");
+			expect(send).not.toHaveBeenCalled();
+			expect(configure).not.toHaveBeenCalled();
+			const back = items().find((item) => item.textContent === "sendCurrentInputSection");
+			if (!back) throw new Error("Back to send actions missing");
+			await act(async () => back.dispatchEvent(new Event("click", { bubbles: true })));
+			const guidance = items().find((item) => item.textContent?.startsWith("queueMode_tool"));
+			if (!guidance) throw new Error("Guidance action missing");
+			await act(async () => guidance.dispatchEvent(new Event("click", { bubbles: true })));
+			expect(send).toHaveBeenCalledWith("tool");
+			expect(configure).not.toHaveBeenCalled();
+		});
+	}
+
+	test("primary action uses custom Enter mode and compaction retains wait/run choices", async () => {
+		await renderRow(baseProps({ composerHasText: true, enterQueueMode: "tool" }));
+		expect(host.textContent).toContain("queueMode_tool");
+		await renderRow(
+			baseProps({ composerHasText: true, showCompactQueueChoice: true, canCutInLine: false }),
+		);
+		const trigger = document.querySelector('button[aria-label="sendOptions"]');
+		if (!trigger) throw new Error("Send menu missing");
+		await act(async () => trigger.dispatchEvent(new Event("click", { bubbles: true })));
+		expect(document.body.textContent).toContain("compactQueueMode_wait");
+		expect(document.body.textContent).toContain("compactQueueMode_now");
+		expect(document.body.textContent).not.toContain("queueMode_tool_desc");
 	});
 });

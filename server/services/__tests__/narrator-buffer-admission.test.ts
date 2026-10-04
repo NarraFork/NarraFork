@@ -31,7 +31,14 @@ const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
-const { getBufferedMessages, pushBufferedMessage } = await import("../narrator-buffer");
+const {
+	getBufferedMessages,
+	pushBufferedMessage,
+	enqueueBufferedMessage,
+	updateBufferedMessageMode,
+	reorderBufferedMessages,
+	toBufferSummary,
+} = await import("../narrator-buffer");
 const { activeNarrators, claimNarratorRuntime, pendingDangerReflections, pendingPermissions } =
 	await import("../narrator-session-state");
 
@@ -70,6 +77,76 @@ afterEach(() => {
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+});
+
+describe("durable queue modes", () => {
+	async function enqueue(text: string, mode: "turn" | "tool" | "interrupt") {
+		return enqueueBufferedMessage(
+			NARRATOR_ID,
+			text,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			mode === "turn" ? "back" : "front",
+			undefined,
+			undefined,
+			"stack",
+			undefined,
+			mode,
+		);
+	}
+	test("guidance is FIFO, persisted and authoritative in summaries", async () => {
+		await enqueue("ordinary", "turn");
+		await enqueue("first guide", "tool");
+		await enqueue("second guide", "interrupt");
+		const messages = getBufferedMessages(NARRATOR_ID);
+		expect(messages.map((m) => m.text)).toEqual(["first guide", "second guide", "ordinary"]);
+		expect(toBufferSummary(messages).map((m) => m.queueMode)).toEqual([
+			"tool",
+			"interrupt",
+			"turn",
+		]);
+	});
+	test("mode changes append to destination and retain failed payload", async () => {
+		const first = await enqueue("first", "turn");
+		const second = await enqueue("second", "tool");
+		await enqueue("third", "turn");
+		db.update(narratorBufferedMessages)
+			.set({ state: "failed", lastError: "test failure" })
+			.where(eq(narratorBufferedMessages.id, first.id))
+			.run();
+		expect(await updateBufferedMessageMode(NARRATOR_ID, first.id, "interrupt")).toBe(true);
+		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.text)).toEqual([
+			"second",
+			"first",
+			"third",
+		]);
+		const failed = getBufferedMessages(NARRATOR_ID).find((m) => m.id === first.id);
+		expect(failed?.state).toBe("failed");
+		expect(failed?.error).toBe("test failure");
+		expect(await updateBufferedMessageMode(NARRATOR_ID, second.id, "turn")).toBe(true);
+		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.text)).toEqual([
+			"first",
+			"third",
+			"second",
+		]);
+	});
+	test("only ordinary rows reorder; claimed messages reject mode mutations", async () => {
+		const guide = await enqueue("guide", "tool");
+		const a = await enqueue("a", "turn");
+		const b = await enqueue("b", "turn");
+		expect(await reorderBufferedMessages(NARRATOR_ID, [b.id, guide.id, a.id])).toBe(false);
+		expect(await reorderBufferedMessages(NARRATOR_ID, [guide.id, b.id, a.id])).toBe(true);
+		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.text)).toEqual(["guide", "b", "a"]);
+		expect(await reorderBufferedMessages(NARRATOR_ID, [a.id, b.id])).toBe(true);
+		db.update(narratorBufferedMessages)
+			.set({ state: "claimed" })
+			.where(eq(narratorBufferedMessages.id, guide.id))
+			.run();
+		expect(await updateBufferedMessageMode(NARRATOR_ID, guide.id, "turn")).toBe(false);
+	});
 });
 
 describe("pushBufferedMessage — loop-less runtime owners can hold a queue", () => {

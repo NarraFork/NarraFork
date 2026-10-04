@@ -160,6 +160,12 @@ export interface ActiveNarrator {
 	_feedbackSoftStop?: boolean;
 	/** Soft-stop flag: set when a priority buffered message should run after current tools finish. */
 	_bufferSoftStop?: boolean;
+	/** Authoritative pending-guidance snapshot for synchronous PostgreSQL stop checks. */
+	_bufferGuidancePending?: boolean;
+	/** Per-pass request-only cancellation; never cancels already-running tools. */
+	_guidanceAbortController?: AbortController;
+	/** Urgent guidance cancels tools without ending the child runner/takeover. */
+	_urgentGuidanceAbortController?: AbortController;
 	/**
 	 * Set when the current agent-loop pass actually ended early because of a buffered
 	 * soft stop. If the queued input is gone by the time the pass returns (the user
@@ -322,6 +328,7 @@ export interface BufferedExecutionIntent {
 }
 
 export interface BufferedMessage {
+	queueMode?: import("@shared/buffer-queue-mode").BufferQueueMode;
 	executionIntent?: BufferedExecutionIntent;
 	id: string;
 	text: string;

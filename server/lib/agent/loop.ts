@@ -1259,7 +1259,8 @@ export async function runReflectionLoop(
 		retries: 0,
 	};
 	const onParentAbort = () => abortController.abort();
-	parentConfig.signal.addEventListener("abort", onParentAbort, { once: true });
+	if (parentConfig.signal.aborted) onParentAbort();
+	else parentConfig.signal.addEventListener("abort", onParentAbort, { once: true });
 	try {
 		const reflectionConfig: AgentConfig = {
 			...parentConfig,
@@ -1286,6 +1287,9 @@ export async function runReflectionLoop(
 			onCompletedToolCount: undefined,
 			silentToolCallThreshold: -1,
 			shouldStop: undefined,
+			guidanceSignal: undefined,
+			urgentGuidanceSignal: undefined,
+			onToolExecutionInvoking: undefined,
 			// Declaration filtering remains inherited; execution uses the gate's hard ceiling.
 			allowedTools: new Set(reflectionLoop.allowedTools),
 			disabledTools: undefined,
@@ -1753,6 +1757,12 @@ async function resolveExitPlanModeReflection(
 		inputJson: resolvedInput.input,
 		abortController: reflectionAbort,
 	});
+	const onPreparationAbort = () => {
+		reflectionAbort.abort(config.signal.reason);
+		void cancelExitPlanReflection(requestId, "Tool preparation cancelled");
+	};
+	if (config.signal.aborted) onPreparationAbort();
+	else config.signal.addEventListener("abort", onPreparationAbort, { once: true });
 	await markExitPlanReflectionStarted(requestId);
 	let reflectionDone = false;
 	const reflectionPromise = runExitPlanModeReflectionLoop(
@@ -1810,6 +1820,7 @@ async function resolveExitPlanModeReflection(
 			logger.warn("ExitPlanMode reflection loop cleanup failed", { err: String(err) });
 		});
 	}
+	config.signal.removeEventListener("abort", onPreparationAbort);
 	cleanupExitPlanReflection(requestId);
 	return { decision, input: resolvedInput.input };
 }
@@ -2079,6 +2090,12 @@ async function resolveTaskReflection(
 		mutations: analysis.protectedMutations,
 		abortController: reflectionAbort,
 	});
+	const onPreparationAbort = () => {
+		reflectionAbort.abort(config.signal.reason);
+		void reviseTaskReflection(requestId, "Tool preparation cancelled", undefined, "user");
+	};
+	if (config.signal.aborted) onPreparationAbort();
+	else config.signal.addEventListener("abort", onPreparationAbort, { once: true });
 	await markTaskReflectionStarted(requestId);
 	let reflectionDone = false;
 	const reflectionPromise = runTaskReflectionLoop(
@@ -2134,6 +2151,7 @@ async function resolveTaskReflection(
 			logger.warn("Task reflection loop cleanup failed", { err: String(err) });
 		});
 	}
+	config.signal.removeEventListener("abort", onPreparationAbort);
 	cleanupTaskReflection(requestId);
 	return { decision, input, mutations: analysis.protectedMutations };
 }
@@ -2311,6 +2329,10 @@ async function* agentLoopInMetadataSnapshot(
 	initialToolResults?: unknown[],
 	images?: Array<{ format: string; base64: string }>,
 ): AsyncGenerator<AgentEvent> {
+	const guidanceSignal =
+		config.guidanceSignal && config.urgentGuidanceSignal
+			? AbortSignal.any([config.guidanceSignal, config.urgentGuidanceSignal])
+			: (config.guidanceSignal ?? config.urgentGuidanceSignal);
 	// Each loop owns its receipts. Nested reflection loops must not inherit a parent's row.
 	const executionBindings = new WeakMap<AgentToolUse, import("./types").ToolCallBinding>();
 	config.toolExecutionBindings = executionBindings;
@@ -2846,6 +2868,21 @@ async function* agentLoopInMetadataSnapshot(
 			yield { type: "error", message: "Aborted" };
 			return;
 		}
+		if (guidanceSignal?.aborted) {
+			// FIFO guidance may intentionally enter a pass already stopped. Consume the
+			// host flag and preserve pending input without activating provider/preflight IO.
+			config.shouldStop?.();
+			const isFirstTurn = turnIndex === 0;
+			provider.pushUserTurn(
+				history,
+				isFirstTurn ? userText : nextTurnContent,
+				effectiveModel,
+				isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+				isFirstTurn ? images : undefined,
+			);
+			yield { type: "turn_complete", turnIndex };
+			return;
+		}
 		// A reflection sub-loop runs inside the parent's tool admission, so it must not be
 		// parked behind the update gate — see beginNarratorResponseActivity for the deadlock.
 		const responseActivity = await beginNarratorResponseActivity(config.narratorId, config.signal, {
@@ -2920,7 +2957,11 @@ async function* agentLoopInMetadataSnapshot(
 			// Tool cancellation is independent from the caller's user-interrupt signal.
 			const toolAbort = new AbortController();
 			// Preserve live runtime setting updates on the original config during retries.
-			const toolSignal = AbortSignal.any([config.signal, toolAbort.signal]);
+			const toolSignal = AbortSignal.any([
+				config.signal,
+				toolAbort.signal,
+				...(config.urgentGuidanceSignal ? [config.urgentGuidanceSignal] : []),
+			]);
 			const toolConfig = new Proxy(config, {
 				get(target, key, receiver) {
 					return key === "signal" ? toolSignal : Reflect.get(target, key, receiver);
@@ -3020,6 +3061,11 @@ async function* agentLoopInMetadataSnapshot(
 			 * the turn the caller already agreed to end.
 			 */
 			const observeSoftStopForTurn = (): boolean => {
+				if (!gracefulStopRequested && guidanceSignal?.aborted) {
+					// Consume the host's one-shot flag too, so the next pass is not stopped again.
+					config.shouldStop?.();
+					gracefulStopRequested = true;
+				}
 				if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
 				return gracefulStopRequested;
 			};
@@ -3034,9 +3080,48 @@ async function* agentLoopInMetadataSnapshot(
 			const startToolExecution = (tu: AgentToolUse): Promise<ToolExecResult> => {
 				const existing = earlyExecMap.get(tu.toolUseId);
 				if (existing) return existing;
+				const preparationAbort = new AbortController();
+				const onGuidance = () =>
+					preparationAbort.abort(new Error("Stopped for immediate guidance"));
+				const removeGuidance = () => guidanceSignal?.removeEventListener("abort", onGuidance);
+				if (guidanceSignal?.aborted) onGuidance();
+				else guidanceSignal?.addEventListener("abort", onGuidance, { once: true });
+				const preparationSignal = AbortSignal.any([toolSignal, preparationAbort.signal]);
+				const invocationConfig = new Proxy(toolConfig, {
+					get(target, key, receiver) {
+						if (key === "signal") return preparationSignal;
+						if (key === "permissionHandler") {
+							return ((name, input, id, options) =>
+								target.permissionHandler(name, input, id, {
+									...options,
+									signal: preparationSignal,
+								})) satisfies AgentConfig["permissionHandler"];
+						}
+						if (key === "onToolExecutionInvoking") {
+							return (tool: AgentToolUse) => {
+								// No await between this synchronous boundary and tool.execute.
+								preparationSignal.throwIfAborted();
+								removeGuidance();
+								target.onToolExecutionInvoking?.(tool);
+							};
+						}
+						return Reflect.get(target, key, receiver);
+					},
+				});
 				const execution = settleToolExecutionResult(
-					executeToolAfterReflections(tu, toolConfig, history, locale),
-				);
+					executeToolAfterReflections(tu, invocationConfig, history, locale),
+				)
+					.then((result) =>
+						preparationAbort.signal.aborted
+							? {
+									...result,
+									output: getToolMessage("skippedForSoftStop", locale),
+									isError: true,
+									metadata: { ...result.metadata, skippedForSoftStop: true },
+								}
+							: result,
+					)
+					.finally(removeGuidance);
 				earlyExecMap.set(tu.toolUseId, execution);
 				void execution.then((result) => {
 					settledResults.set(tu.toolUseId, result);
@@ -3044,19 +3129,22 @@ async function* agentLoopInMetadataSnapshot(
 				});
 				return execution;
 			};
-			async function waitForToolOrAbort<T>(execution: Promise<T>): Promise<T | null> {
-				if (config.signal.aborted) return null;
+			async function waitForToolOrAbort<T>(
+				execution: Promise<T>,
+				signal = toolWaitAbortSignal,
+			): Promise<T | null> {
+				if (signal.aborted) return null;
 				let onAbort = () => {};
 				try {
 					return await Promise.race([
 						execution,
 						new Promise<null>((resolve) => {
 							onAbort = () => resolve(null);
-							config.signal.addEventListener("abort", onAbort, { once: true });
+							signal.addEventListener("abort", onAbort, { once: true });
 						}),
 					]);
 				} finally {
-					config.signal.removeEventListener("abort", onAbort);
+					signal.removeEventListener("abort", onAbort);
 				}
 			}
 			const pumpStreamingTools = (): void => {
@@ -3269,11 +3357,21 @@ async function* agentLoopInMetadataSnapshot(
 				}
 			}
 
+			const toolWaitAbortSignal = config.urgentGuidanceSignal
+				? AbortSignal.any([config.signal, config.urgentGuidanceSignal])
+				: config.signal;
 			async function* drainStartedEarlyToolResults(): AsyncGenerator<AgentEvent> {
 				for (const tu of toolUses) {
 					const earlyPromise = earlyExecMap.get(tu.toolUseId);
 					if (earlyPromise && !settledResults.has(tu.toolUseId)) {
-						settledResults.set(tu.toolUseId, await earlyPromise);
+						const result = await waitForToolOrAbort(earlyPromise, toolWaitAbortSignal);
+						if (!result) {
+							// Urgent guidance/hard interruption may not wait for a tool which ignores
+							// cancellation. The abort drain owns its late persistence, not a fake result.
+							yield* drainEarlyToolResultsAfterAbort();
+							return;
+						}
+						settledResults.set(tu.toolUseId, result);
 					}
 				}
 				yield* drainSettledEarlyToolResults();
@@ -3973,6 +4071,14 @@ async function* agentLoopInMetadataSnapshot(
 					: undefined;
 
 				const attemptAbort = new AbortController();
+				const guidanceStop = new Error("Stopped for immediate guidance");
+				const onGuidanceAbort = () => {
+					observeSoftStopForTurn();
+					streamExecutionOpen = false;
+					attemptAbort.abort(guidanceStop);
+				};
+				if (guidanceSignal?.aborted) onGuidanceAbort();
+				else guidanceSignal?.addEventListener("abort", onGuidanceAbort, { once: true });
 				const configuredToolLimit = config.maxToolCallsPerResponse ?? 32;
 				const toolCallLimit = Number.isFinite(configuredToolLimit)
 					? Math.min(128, Math.max(1, Math.floor(configuredToolLimit)))
@@ -4128,6 +4234,7 @@ async function* agentLoopInMetadataSnapshot(
 
 					streamExecutionOpen = true;
 					for await (const parsed of stream) {
+						if (guidanceSignal?.aborted) throw guidanceStop;
 						throwIfUserAborted();
 						// Stop dispatch before yielding/awaiting error publication. A finishing
 						// tool must not release more queued work while failure handling runs.
@@ -5249,6 +5356,12 @@ async function* agentLoopInMetadataSnapshot(
 						yield { type: "error", message: "Aborted" };
 						return;
 					}
+					if (guidanceSignal?.aborted) {
+						observeSoftStopForTurn();
+						// Guidance is not a transport fault. Finalize this partial turn below,
+						// without replay/retry or cancelling tools whose bodies already began.
+						break;
+					}
 					if (firstTokenTimeoutTriggered) {
 						requestDiagnostics = normalizeApiRequestDiagnostics({
 							source: "agent",
@@ -5755,9 +5868,14 @@ async function* agentLoopInMetadataSnapshot(
 					clearFirstTokenTimer();
 					clearStreamIdleTimer();
 					config.signal.removeEventListener("abort", onParentAbort);
+					guidanceSignal?.removeEventListener("abort", onGuidanceAbort);
 					startFirstTokenTimerForAttempt = undefined;
 				}
 
+				if (guidanceSignal?.aborted) {
+					observeSoftStopForTurn();
+					break;
+				}
 				if (firstTokenTimeoutTriggered) {
 					requestDiagnostics = normalizeApiRequestDiagnostics({
 						source: "agent",
@@ -6485,6 +6603,28 @@ async function* agentLoopInMetadataSnapshot(
 				}
 			}
 
+			// A request cancelled before producing content must not persist an empty
+			// assistant turn (some providers reject it when history is replayed).
+			if (
+				guidanceSignal?.aborted &&
+				!assistantText &&
+				toolUses.length === 0 &&
+				!collectReasoningBlocks(reasoningBlockMap) &&
+				!collectCompletedWebSearches(webSearchAccum) &&
+				!collectCompletedImageGenerations(imageGenAccum)
+			) {
+				responseActivity.release();
+				provider.pushUserTurn(
+					history,
+					isFirstTurn ? userText : content,
+					effectiveModel,
+					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					isFirstTurn ? images : undefined,
+				);
+				yield { type: "turn_complete", turnIndex };
+				return;
+			}
+
 			// Yield the complete assistant message on every successful turn. Event consumers
 			// rely on this to finalize persistence, broadcast the message, run hooks, and update titles.
 			yield {
@@ -6502,6 +6642,70 @@ async function* agentLoopInMetadataSnapshot(
 			// The provider response is now complete and every produced tool has a stable row.
 			// Tool execution may remain paused behind phase two without holding the response fence.
 			responseActivity.release();
+
+			if (guidanceSignal?.aborted) {
+				observeSoftStopForTurn();
+				yield* drainStartedEarlyToolResults();
+				if (config.signal.aborted) {
+					yield { type: "error", message: "Aborted" };
+					return;
+				}
+				// Still-running detached calls retain their real pending rows. Do not fabricate
+				// skipped results or replay their incomplete pairs into model-facing history.
+				const guidanceTools = toolUses.filter((tu) => !detachedToolResults.has(tu.toolUseId));
+				const guidanceResults: unknown[] = [];
+				for (const tu of guidanceTools) {
+					const result = settledResults.get(tu.toolUseId) ?? {
+						output: getToolMessage("skippedForSoftStop", locale),
+						isError: true,
+						durationMs: 0,
+						completedAt: Date.now(),
+						metadata: { skippedForSoftStop: true },
+					};
+					if (!yieldedToolResults.has(tu.toolUseId)) {
+						yieldedToolResults.add(tu.toolUseId);
+						yield earlyToolResultEvent(tu, result);
+					}
+					guidanceResults.push(
+						provider.formatToolResult(
+							turnToolUseIdRemap.get(tu.toolUseId) ?? tu.toolUseId,
+							result.output,
+							result.isError ?? false,
+							result.images,
+							tu.name,
+						),
+					);
+				}
+				provider.pushUserTurn(
+					history,
+					isFirstTurn ? userText : content,
+					effectiveModel,
+					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					isFirstTurn ? images : undefined,
+				);
+				if (
+					assistantText ||
+					guidanceTools.length > 0 ||
+					collectReasoningBlocks(reasoningBlockMap)
+				) {
+					provider.pushAssistantTurn(
+						history,
+						assistantText,
+						toHistoryToolUses(guidanceTools),
+						collectReasoningBlocks(reasoningBlockMap),
+						collectCompletedWebSearches(webSearchAccum),
+						messageId,
+						collectCompletedImageGenerations(imageGenAccum),
+						textOutputIndex,
+						redactedThinkingBlocks,
+						orderedAssistantContent(toHistoryToolUses(guidanceTools)),
+					);
+				}
+				if (guidanceResults.length > 0)
+					provider.pushUserTurn(history, "", effectiveModel, guidanceResults);
+				yield { type: "turn_complete", turnIndex };
+				return;
+			}
 
 			if (hasOrphanedToolUses) {
 				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
@@ -6608,7 +6812,11 @@ async function* agentLoopInMetadataSnapshot(
 					const result = await waitForToolOrAbort(startToolExecution(tu));
 					if (!result) {
 						yield* drainEarlyToolResultsAfterAbort();
-						yield { type: "error", message: "Aborted" };
+						if (config.signal.aborted) yield { type: "error", message: "Aborted" };
+						else {
+							observeSoftStopForTurn();
+							yield { type: "turn_complete", turnIndex };
+						}
 						return;
 					}
 					if (result.broken) brokenToolUseIds.add(tu.toolUseId);
@@ -6735,7 +6943,11 @@ async function* agentLoopInMetadataSnapshot(
 						const winner = await waitForToolOrAbort(Promise.race(remaining));
 						if (!winner) {
 							yield* drainEarlyToolResultsAfterAbort();
-							yield { type: "error", message: "Aborted" };
+							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
+							else {
+								observeSoftStopForTurn();
+								yield { type: "turn_complete", turnIndex };
+							}
 							return;
 						}
 						const { i, result } = winner;
@@ -6852,7 +7064,16 @@ async function* agentLoopInMetadataSnapshot(
 							continue;
 						}
 
-						const result = await earlyPromise;
+						const result = await waitForToolOrAbort(earlyPromise);
+						if (!result) {
+							yield* drainEarlyToolResultsAfterAbort();
+							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
+							else {
+								observeSoftStopForTurn();
+								yield { type: "turn_complete", turnIndex };
+							}
+							return;
+						}
 						if (result.broken) brokenToolUseIds.add(remainingTool.toolUseId);
 						if (result.updatedInput) remainingTool.input = result.updatedInput;
 						await processToolResultInjections(remainingTool, result);

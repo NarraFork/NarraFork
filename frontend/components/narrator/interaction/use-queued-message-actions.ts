@@ -6,8 +6,8 @@ import type { BufferMessageSummary } from "../../../lib/api";
 import { api } from "../../../lib/api";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
 
-/** Number of queued messages before the queue collapses into a summary bar. */
-const QUEUE_COLLAPSE_THRESHOLD = 2;
+import type { QueueMode } from "../composer/SendOptionsSplitButton";
+import { moveQueuedTurn, queuedMessageMode } from "./queue-message-mode";
 
 export interface QueuedEditPayload {
 	keepImageIds: string[];
@@ -59,7 +59,6 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 		setQueuedMessages,
 		reconcileBufferedMessages,
 		cancelBuffer,
-		composerRef,
 		handleSendRef,
 		handleSendWithModeRef,
 		ctrlEnterQueueModeRef,
@@ -128,39 +127,23 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 	const handleCancelAllQueued = useCallback(() => {
 		if (queuedMessages.length > 0) {
 			cancelBuffer(narratorId);
-			// Restore the first queued message text to the input
-			composerRef.current?.restoreInput(
-				queuedMessages[0].text,
-				(queuedMessages[0].fileReferences ?? []).map((reference) => ({
-					...reference,
-					inputRange: undefined,
-				})),
-			);
 			setQueuedMessages([]);
 		}
-	}, [queuedMessages, cancelBuffer, narratorId, composerRef, setQueuedMessages]);
+	}, [queuedMessages, cancelBuffer, narratorId, setQueuedMessages]);
 
 	const handleRemoveQueued = useCallback(
 		(messageId: string) => {
-			const msg = queuedMessages.find((m) => m.id === messageId);
-			const snapshot = queuedMessages;
 			setQueuedMessages((prev) => prev.filter((m) => m.id !== messageId));
-			// If removing the only message, restore its text to input
-			if (queuedMessages.length === 1 && msg) {
-				composerRef.current?.restoreInput(
-					msg.text,
-					(msg.fileReferences ?? []).map((reference) => ({ ...reference, inputRange: undefined })),
-				);
-			}
-			api.removeBufferedMessage(narratorId, messageId).catch(() => {
-				// Rollback on failure
-				setQueuedMessages(snapshot);
-				if (queuedMessages.length === 1 && msg) {
-					composerRef.current?.restoreInput("", []);
-				}
+			api.removeBufferedMessage(narratorId, messageId).catch((error) => {
+				reconcileBufferedMessages();
+				notifications.show({
+					color: "red",
+					title: t("queuedRemoveFailed"),
+					message: error instanceof Error ? error.message : String(error),
+				});
 			});
 		},
-		[queuedMessages, setQueuedMessages, narratorId, composerRef],
+		[setQueuedMessages, narratorId, reconcileBufferedMessages, t],
 	);
 
 	const handleRetryQueued = useCallback(
@@ -173,37 +156,60 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 		[narratorId, reconcileBufferedMessages],
 	);
 
-	const handleDragEndQueued = useCallback(
-		(event: DragEndEvent) => {
-			const { active, over } = event;
-			if (!over || active.id === over.id) return;
-			const oldIndex = queuedMessages.findIndex((m) => m.id === active.id);
-			const newIndex = queuedMessages.findIndex((m) => m.id === over.id);
-			if (oldIndex === -1 || newIndex === -1) return;
-			const newOrder = [...queuedMessages];
-			const [moved] = newOrder.splice(oldIndex, 1);
-			newOrder.splice(newIndex, 0, moved);
-			const snapshot = queuedMessages;
+	const reorderQueued = useCallback(
+		(id: string, targetId: string) => {
+			const newOrder = moveQueuedTurn(queuedMessages, id, targetId);
+			if (newOrder === queuedMessages) return;
 			setQueuedMessages(newOrder);
 			api
 				.reorderBufferedMessages(
 					narratorId,
 					newOrder.map((m) => m.id),
 				)
-				.catch(() => {
-					setQueuedMessages(snapshot);
+				.catch((error) => {
+					reconcileBufferedMessages();
+					notifications.show({
+						color: "red",
+						title: t("queuedReorderFailed"),
+						message: error instanceof Error ? error.message : String(error),
+					});
 				});
 		},
-		[queuedMessages, narratorId, setQueuedMessages],
+		[queuedMessages, narratorId, setQueuedMessages, reconcileBufferedMessages, t],
+	);
+	const handleDragEndQueued = useCallback(
+		({ active, over }: DragEndEvent) => {
+			if (over) reorderQueued(String(active.id), String(over.id));
+		},
+		[reorderQueued],
+	);
+	const handleMoveQueued = useCallback(
+		(id: string, direction: -1 | 1) => {
+			const ordinary = queuedMessages.filter((m) => queuedMessageMode(m) === "turn");
+			const index = ordinary.findIndex((m) => m.id === id);
+			const target = index >= 0 ? ordinary[index + direction] : undefined;
+			if (target) reorderQueued(id, target.id);
+		},
+		[queuedMessages, reorderQueued],
+	);
+	const handleChangeMode = useCallback(
+		async (id: string, mode: QueueMode) => {
+			try {
+				await api.setBufferedMessageMode(narratorId, id, mode);
+				reconcileBufferedMessages();
+			} catch (error) {
+				notifications.show({
+					color: "red",
+					title: t("queuedModeFailed"),
+					message: error instanceof Error ? error.message : String(error),
+				});
+			}
+		},
+		[narratorId, reconcileBufferedMessages, t],
 	);
 
 	const [editingQueuedId, setEditingQueuedId] = useState<string | null>(null);
-	const [queueExpanded, setQueueExpanded] = useState(false);
-
-	// Auto-reset expanded state when queue shrinks to ≤2
-	useEffect(() => {
-		if (queuedMessages.length <= QUEUE_COLLAPSE_THRESHOLD) setQueueExpanded(false);
-	}, [queuedMessages.length]);
+	const [queueExpanded, setQueueExpanded] = useState(true);
 
 	const handleStartEditQueued = useCallback((msg: { id: string }) => {
 		setEditingQueuedId(msg.id);
@@ -230,17 +236,13 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 			text: string,
 			payload: QueuedEditPayload,
 		): Promise<boolean> => {
-			const snapshot = queuedMessages;
-			setQueuedMessages((prev) =>
-				prev.map((m) =>
-					m.id === msg.id ? { ...m, text, bufferedAt: new Date().toISOString() } : m,
-				),
-			);
+			setQueuedMessages((prev) => prev.map((m) => (m.id === msg.id ? { ...m, text } : m)));
 			try {
 				await api.updateBufferedMessage(narratorId, msg.id, text, payload);
+				reconcileBufferedMessages();
 				return true;
 			} catch (err) {
-				setQueuedMessages(snapshot);
+				reconcileBufferedMessages();
 				notifications.show({
 					color: "red",
 					title: t("editQueuedFailed"),
@@ -249,7 +251,7 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 				return false;
 			}
 		},
-		[queuedMessages, setQueuedMessages, narratorId, t],
+		[setQueuedMessages, narratorId, reconcileBufferedMessages, t],
 	);
 
 	// Fill the panel's bridge refs with the live handlers (render-time
@@ -271,6 +273,8 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 		handleRemoveQueued,
 		handleRetryQueued,
 		handleDragEndQueued,
+		handleMoveQueued,
+		handleChangeMode,
 		editingQueuedId,
 		queueExpanded,
 		setQueueExpanded,

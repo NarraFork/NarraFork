@@ -35,9 +35,13 @@ const provider: ProviderAdapter = {
 	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
-		providerCalls.push(params.content);
+		// Queue assertions address the task text, not the sender projection. Keep
+		// the real request signal/model while exposing the anonymous human body
+		// to fixture gates that otherwise never recognize their starting task.
+		const content = params.content.replace(/^<sender kind="human" \/>\n/, "");
+		providerCalls.push(content);
 		params.onRequestStart?.();
-		await beforeResponse?.(params);
+		await beforeResponse?.({ ...params, content });
 		yield { text: "mailbox send turn ran" };
 	},
 	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
@@ -64,12 +68,16 @@ const { bindRuntimeQueue } = await import("../agent-runtime/runtime-queue-port")
 const {
 	acceptUserMessage,
 	closeNarrator,
+	clearBufferedMessageSoftStopIfIdle,
 	ensureNarrator,
 	hasPendingBufferedWork,
 	sendMessage,
 	resumeNextBufferedMessage,
 } = await import("../narrator-session");
-const { enqueueBufferedMessage } = await import("../narrator-buffer");
+const { enqueueBufferedMessage, removeBufferedMessage, updateBufferedMessageMode } = await import(
+	"../narrator-buffer"
+);
+const { narratorService } = await import("../narrator-service");
 const { getExecutionOwner, tryClaimExecution } = await import("../agent-runtime/ownership");
 
 const now = new Date().toISOString();
@@ -690,6 +698,63 @@ test("uses awaited backend-neutral cleanup for buffered deliveries", async () =>
 	expect(source).not.toContain("cleanupBufferedTextFiles(");
 });
 
+test.each([
+	["remove", false],
+	["downgrade", false],
+	["remove", true],
+	["downgrade", true],
+] as const)("withdrawn guidance during preflight resumes original work before ordinary inputs (%s, fresh=%s)", async (operation, freshTurn) => {
+	const narratorId = `mailbox-preflight-guidance-${operation}-${freshTurn}`;
+	seedNarrator(narratorId);
+	const enteredPreflight = Promise.withResolvers<void>();
+	const releasePreflight = Promise.withResolvers<void>();
+	let reads = 0;
+	const originalHistory = narratorService.getModelHistorySinceLastCompact.bind(narratorService);
+	const historyRead = spyOn(narratorService, "getModelHistorySinceLastCompact").mockImplementation(
+		async (...args) => {
+			if (args[0] === narratorId && reads++ === 0) {
+				enteredPreflight.resolve();
+				await releasePreflight.promise;
+			}
+			return originalHistory(...args);
+		},
+	);
+	try {
+		await acceptUserMessage(narratorId, "unfinished original work");
+		await enteredPreflight.promise;
+		if (freshTurn) {
+			await acceptUserMessage(narratorId, "ordinary next step", {
+				executionIntent: { modelOverride: { model: "openai:next-model", mode: "permanent" } },
+			});
+		} else {
+			await enqueueBufferedMessage(narratorId, "ordinary next step");
+		}
+		const accepted = await acceptUserMessage(narratorId, "withdrawn guidance", {
+			queueMode: "tool",
+		});
+		if (!accepted.buffered) throw new Error("Expected busy guidance admission");
+		if (operation === "remove") {
+			expect(await removeBufferedMessage(narratorId, accepted.id)).toBe(true);
+		} else {
+			expect(await updateBufferedMessageMode(narratorId, accepted.id, "turn")).toBe(true);
+		}
+		clearBufferedMessageSoftStopIfIdle(narratorId, false);
+		expect(providerCalls).toEqual([]);
+		releasePreflight.resolve();
+		await waitForIdle(narratorId, operation === "remove" ? 2 : 3);
+		// The cancelled pass must recover the original task before consuming any
+		// ordinary next step; downgraded guidance is also just a later next step.
+		expect(providerCalls).toEqual(
+			operation === "remove"
+				? ["unfinished original work", "ordinary next step"]
+				: ["unfinished original work", "ordinary next step", "withdrawn guidance"],
+		);
+	} finally {
+		releasePreflight.resolve();
+		historyRead.mockRestore();
+		closeNarrator(narratorId);
+	}
+});
 afterAll(() => {
 	mock.module("../../lib/agent/provider", () => realProviderModule);
 	mock.restore();

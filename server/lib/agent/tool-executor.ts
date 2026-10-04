@@ -1443,6 +1443,7 @@ export async function executeTool(
 				// Tool output is untrusted text (including test names and source excerpts),
 				// not evidence of a host storage failure, even when the command exits nonzero.
 				// Only the preflight above and thrown storage errors below may trip the guard.
+				config.onToolExecutionInvoking?.(tu);
 				result = await tool.execute(effectiveInput, ctx);
 				result.output += diskCheck.notice;
 			} catch (error) {

@@ -3,7 +3,14 @@ import type { CSSProperties, ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { NarratorInteractionAreaProps } from "./NarratorInteractionArea";
 
+const MenuStub = Object.assign(({ children }: { children?: ReactNode }) => <div>{children}</div>, {
+	Target: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+	Dropdown: () => null,
+	Item: () => null,
+});
 mock.module("@mantine/core", () => ({
+	Menu: MenuStub,
+	ActionIcon: ({ children }: { children?: ReactNode }) => <button type="button">{children}</button>,
 	Box: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
 	Text: ({ children }: { children?: ReactNode }) => <span>{children}</span>,
 	Stack: ({ children, style }: { children?: ReactNode; style?: CSSProperties }) => (

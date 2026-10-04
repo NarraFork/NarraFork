@@ -1014,6 +1014,15 @@ export const narratorsApi = {
 		}
 		return (await res.json()) as { ok: boolean };
 	},
+	setBufferedMessageMode: (
+		narratorId: string,
+		messageId: string,
+		mode: "turn" | "tool" | "interrupt",
+	) =>
+		request<{ ok: true }>(
+			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/mode`,
+			{ method: "PATCH", body: JSON.stringify({ mode }) },
+		),
 	retryBufferedMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: true; resumed: boolean }>(
 			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/retry`,
@@ -1413,7 +1422,12 @@ export const narratorsApi = {
 		signal?: AbortSignal,
 		fileReferences?: FileReference[],
 		interrupt?: boolean,
+		queueMode?: "turn" | "tool" | "interrupt",
 	) => {
+		if (queueMode !== undefined) {
+			priority = queueMode !== "turn";
+			interrupt = queueMode === "interrupt";
+		}
 		// Interrupt-and-insert is one request; its replacement always has queue priority.
 		if (interrupt) priority = true;
 		const headers: Record<string, string> = {};
@@ -1433,6 +1447,7 @@ export const narratorsApi = {
 			}
 			if (priority) formData.append("priority", "true");
 			if (interrupt) formData.append("interrupt", "true");
+			if (queueMode !== undefined) formData.append("queueMode", queueMode);
 			if (fileReferences !== undefined) {
 				formData.append("fileReferences", JSON.stringify(fileReferences));
 			}
@@ -1451,6 +1466,7 @@ export const narratorsApi = {
 					message,
 					...(priority ? { priority: true } : {}),
 					...(interrupt ? { interrupt: true } : {}),
+					...(queueMode !== undefined ? { queueMode } : {}),
 					fileReferences,
 				}),
 				signal,

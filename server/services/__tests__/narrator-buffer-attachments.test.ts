@@ -481,7 +481,7 @@ describe("failed user recovery", () => {
 });
 
 describe("persistent staging ownership", () => {
-	test("manual mixed-priority reorder agrees with display, peek and claim", async () => {
+	test("ordinary-only reorder preserves guidance and agrees with display, peek and claim", async () => {
 		const { createMailboxStore } = await import("../agent-runtime/mailbox");
 		const { peekInbox } = await import("../agent-runtime/inbox");
 		const store = createMailboxStore(db);
@@ -503,12 +503,17 @@ describe("persistent staging ownership", () => {
 			later.id,
 		]);
 		expect((await peekInbox(NARRATOR_ID))?.id).toBe(priority.id);
-		const desired = [normal.id, priority.id, later.id];
+		expect(await reorderBufferedMessages(NARRATOR_ID, [normal.id, priority.id, later.id])).toBe(
+			false,
+		);
+		const desired = [priority.id, later.id, normal.id];
 		expect(await reorderBufferedMessages(NARRATOR_ID, desired)).toBe(true);
 		expect(getBufferedMessages(NARRATOR_ID).map((row) => row.id)).toEqual(desired);
-		expect(toBufferSummary(getBufferedMessages(NARRATOR_ID)).every((row) => !row.priority)).toBe(
-			true,
-		);
+		expect(toBufferSummary(getBufferedMessages(NARRATOR_ID)).map((row) => row.queueMode)).toEqual([
+			"tool",
+			"turn",
+			"turn",
+		]);
 		for (const id of desired) {
 			expect((await peekInbox(NARRATOR_ID))?.id).toBe(id);
 			const [claimed] = store.claimBatch(

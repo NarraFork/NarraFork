@@ -8,6 +8,7 @@ import { narratorWSManager } from "../../../lib/narrator-ws-manager";
 import { hasSendableComposerContent } from "../composer/composer-send-gate";
 import { trimFileReferenceInput } from "../composer/file-reference-input";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
+import type { QueueMode } from "../composer/SendOptionsSplitButton";
 import { revokeContentBlockPreviewUrls } from "../narrator-message-helpers";
 import type { ContentBlock } from "../narrator-panel-types";
 import type { BooleanOverride, DangerReflectionOverride } from "./reflection-types";
@@ -159,8 +160,6 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		reconcileBufferedMessages,
 		scrollToBottom,
 		isActive,
-		isSubagent,
-		isTakenOver,
 		showCompactQueueChoice,
 		canRetryLastUserMessage,
 		canContinueNarrator,
@@ -204,6 +203,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			imageCount: number,
 			priority?: boolean,
 			fileReferences?: FileReference[],
+			queueMode: QueueMode = priority ? "tool" : "turn",
 		) => {
 			if (!result?.buffered || !result.id) return false;
 
@@ -223,11 +223,18 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 							}
 						: null,
 				priority: priority || undefined,
+				queueMode,
 			};
 
 			setQueuedMessages((prev) => {
 				if (prev.some((m) => m.id === queuedMessage.id)) return prev;
-				return priority ? [queuedMessage, ...prev] : [...prev, queuedMessage];
+				if (!priority) return [...prev, queuedMessage];
+				// Guidance is FIFO within the priority lane, not a prepend stack.
+				const nextStepIndex = prev.findIndex(
+					(m) => (m.queueMode ?? (m.priority ? "tool" : "turn")) === "turn",
+				);
+				const index = nextStepIndex < 0 ? prev.length : nextStepIndex;
+				return [...prev.slice(0, index), queuedMessage, ...prev.slice(index)];
 			});
 
 			// A busy `/goal` is queued rather than applied immediately; tell the user
@@ -269,6 +276,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		priority?: boolean,
 		fileReferences: FileReference[] = [],
 		interrupt?: boolean,
+		queueMode: QueueMode = interrupt ? "interrupt" : priority ? "tool" : "turn",
 	) => {
 		if (interrupt) priority = true;
 		const optimisticBlocks: ContentBlock[] = [
@@ -298,6 +306,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				signal,
 				fileReferences,
 				interrupt,
+				queueMode,
 			);
 			// Handle /load tool response — not a real message, just a tool load confirmation
 			if (result?.loaded) {
@@ -329,7 +338,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				// Message was buffered — show it in the queue immediately.
 				// The WS buffer_set event can be missed when the subscription is not
 				// fully caught up, so also reconcile with REST.
-				applyBufferedSendResult(result, msg, images.length, priority, fileReferences);
+				applyBufferedSendResult(result, msg, images.length, priority, fileReferences, queueMode);
 				scrollToBottom(true);
 			} else if (result?.id) {
 				// Normal message — set narrator status to "working" optimistically.
@@ -359,6 +368,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		signal?: AbortSignal,
 		references?: FileReference[],
 		interrupt?: boolean,
+		queueMode: QueueMode = interrupt ? "interrupt" : priority ? "tool" : "turn",
 	): Promise<boolean> => {
 		if (interrupt) priority = true;
 		const draft = trimFileReferenceInput({
@@ -381,6 +391,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				signal,
 				fileReferences,
 				interrupt,
+				queueMode,
 			);
 			const buffered = applyBufferedSendResult(
 				result,
@@ -388,6 +399,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				images.length,
 				priority,
 				fileReferences,
+				queueMode,
 			);
 			composerRef.current?.commitDraftAfterSend();
 			clearAttachedFilesAndDraft();
@@ -547,30 +559,16 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			}
 
 			if (isActive) {
-				// A subagent that is still controlled by its parent must receive user input
-				// at the next safe post-tool boundary. Never wait for its whole task turn,
-				// and never use the generic interrupt route (which hard-stops subagents).
-				if (isSubagent && !isTakenOver) {
-					await doSendBuffered(msg, true, abortController.signal);
-					return;
-				}
-				// A taken-over subagent queues without a soft stop, so the "interrupt"
-				// mode's follow-up interrupt has nothing to hand over — and the generic
-				// interrupt route hard-stops subagents, which would end the takeover.
-				// Queue plainly; the runner drains the message when the turn suspends.
-				if (isSubagent) {
-					await doSendBuffered(msg, mode !== "turn", abortController.signal);
-					return;
-				}
-				if (mode === "turn") {
-					await doSendBuffered(msg, false, abortController.signal);
-				} else if (mode === "tool") {
-					await doSendBuffered(msg, true, abortController.signal);
-				} else {
-					// The server accepts the replacement before interrupting the old loop.
-					// One request preserves priority and avoids a stop/send race window.
-					await doSendBuffered(msg, true, abortController.signal, fileReferences, true);
-				}
+				// The server owns admission and runner identity for both primary and
+				// child narrators. All modes travel in the same durable send request.
+				await doSendBuffered(
+					msg,
+					mode !== "turn",
+					abortController.signal,
+					fileReferences,
+					mode === "interrupt" ? true : undefined,
+					mode,
+				);
 				return;
 			}
 			// Idle but compacting: the server decides queue-or-send, so this only has to
@@ -591,6 +589,8 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					abortController.signal,
 					mode !== "turn",
 					fileReferences,
+					undefined,
+					mode,
 				);
 				composerRef.current?.commitDraftAfterSend();
 				clearAttachedFilesAndDraft();
@@ -611,7 +611,8 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				abortController.signal,
 				mode !== "turn",
 				fileReferences,
-				!isSubagent && mode === "interrupt" ? true : undefined,
+				mode === "interrupt" ? true : undefined,
+				mode,
 			);
 			composerRef.current?.commitDraftAfterSend();
 			clearAttachedFilesAndDraft();
