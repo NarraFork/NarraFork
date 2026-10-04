@@ -14,6 +14,10 @@ import { parseHTML } from "linkedom";
 import { act, createRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import enCommon from "../../../locales/en/common.json";
+import enNarrator from "../../../locales/en/narrator.json";
+import zhCommon from "../../../locales/zh-CN/common.json";
+import zhNarrator from "../../../locales/zh-CN/narrator.json";
 import type { NarratorComposerRowProps } from "./NarratorComposerRow";
 
 mock.module("./NarratorComposer", () => ({
@@ -115,19 +119,10 @@ beforeEach(async () => {
 	instance = i18next.createInstance();
 	await instance.use(initReactI18next).init({
 		lng: "en",
+		// Use production resources: inventing narrator.send here hid the namespace regression.
 		resources: {
-			en: {
-				narrator: {
-					takeover: "Take over",
-					stopTakeover: "Stop takeover",
-					stopTakeoverHint: "hand result back",
-					attachFile: "Attach",
-					interrupt: "Interrupt",
-					queue: "Queue",
-					send: "Send",
-				},
-				common: { send: "Send" },
-			},
+			en: { narrator: enNarrator, common: enCommon },
+			"zh-CN": { narrator: zhNarrator, common: zhCommon },
 		},
 		react: { useSuspense: false },
 	});
@@ -175,10 +170,10 @@ describe("NarratorComposerRow idle send label", () => {
 					}),
 				);
 				const button = Array.from(host.querySelectorAll("button")).find(
-					(element) => element.textContent?.trim() === "Send",
+					(element) => element.textContent?.trim() === enCommon.send,
 				);
 				expect(button).toBeDefined();
-				expect(host.textContent).not.toContain(`queueMode_${mode}`);
+				expect(host.textContent).not.toContain(enNarrator[`queueMode_${mode}`]);
 				await act(async () => button?.dispatchEvent(new Event("click", { bubbles: true })));
 				expect(canCutInLine ? queueClick : send).toHaveBeenCalledTimes(1);
 			});
@@ -187,10 +182,10 @@ describe("NarratorComposerRow idle send label", () => {
 
 	test("finishing work changes the primary label from the queue mode to Send", async () => {
 		await renderRow(baseProps({ isActive: true, composerHasText: true }));
-		expect(host.textContent).toContain("queueMode_turn");
+		expect(host.textContent).toContain(enNarrator.queueMode_turn);
 		await renderRow(baseProps({ isActive: false, composerHasText: true, canCutInLine: false }));
-		expect(host.textContent).toContain("Send");
-		expect(host.textContent).not.toContain("queueMode_turn");
+		expect(host.textContent).toContain(enCommon.send);
+		expect(host.textContent).not.toContain(enNarrator.queueMode_turn);
 	});
 
 	test("idle attachment-only input shows Send, including background compaction", async () => {
@@ -204,11 +199,98 @@ describe("NarratorComposerRow idle send label", () => {
 				}),
 			);
 			const button = Array.from(host.querySelectorAll("button")).find(
-				(element) => element.textContent?.trim() === "Send",
+				(element) => element.textContent?.trim() === enCommon.send,
 			);
 			expect(button).toBeDefined();
 			expect(button?.disabled).toBe(false);
 		}
+	});
+});
+
+describe("NarratorComposerRow production language resources", () => {
+	for (const { language, common, narrator } of [
+		{ language: "en", common: enCommon, narrator: enNarrator },
+		{ language: "zh-CN", common: zhCommon, narrator: zhNarrator },
+	]) {
+		test(`${language}: idle Send and active queue modes use the correct namespaces`, async () => {
+			await act(async () => {
+				await instance.changeLanguage(language);
+			});
+			for (const mode of ["turn", "tool", "interrupt"] as const) {
+				await renderRow(
+					baseProps({
+						isActive: false,
+						composerHasText: true,
+						canCutInLine: false,
+						enterQueueMode: mode,
+					}),
+				);
+				expect(
+					Array.from(host.querySelectorAll("button")).some(
+						(button) => button.textContent?.trim() === common.send,
+					),
+				).toBe(true);
+				await renderRow(
+					baseProps({
+						isActive: true,
+						composerHasText: true,
+						canCutInLine: true,
+						enterQueueMode: mode,
+					}),
+				);
+				expect(
+					Array.from(host.querySelectorAll("button")).some(
+						(button) => button.textContent?.trim() === narrator[`queueMode_${mode}`],
+					),
+				).toBe(true);
+			}
+		});
+
+		test(`${language}: idle attachment/compaction sends are localized`, async () => {
+			await act(async () => {
+				await instance.changeLanguage(language);
+			});
+			await renderRow(
+				baseProps({
+					isActive: false,
+					composerHasAttachments: true,
+					canCutInLine: false,
+					showCompactQueueChoice: true,
+					queuedMessagesCount: 3,
+				}),
+			);
+			expect(
+				Array.from(host.querySelectorAll("button")).some(
+					(button) => button.textContent?.trim() === common.send,
+				),
+			).toBe(true);
+		});
+	}
+
+	test("switching languages updates the idle label without sending or remounting its button", async () => {
+		const send = mock(() => {});
+		const props = baseProps({
+			isActive: false,
+			composerHasText: true,
+			canCutInLine: false,
+			onSend: send,
+		});
+		await renderRow(props);
+		const findSend = (label: string) =>
+			Array.from(host.querySelectorAll("button")).find(
+				(button) => button.textContent?.trim() === label,
+			);
+		const original = findSend(enCommon.send);
+		expect(original).toBeDefined();
+		await act(async () => {
+			await instance.changeLanguage("zh-CN");
+		});
+		expect(findSend(zhCommon.send)).toBe(original);
+		await act(async () => {
+			await instance.changeLanguage("en");
+		});
+		expect(findSend(enCommon.send)).toBe(original);
+		expect(send).not.toHaveBeenCalled();
 	});
 });
 
@@ -230,7 +312,7 @@ describe("NarratorComposerRow takeover input visibility", () => {
 		expect(host.querySelector("[data-testid='composer-input']")).not.toBeNull();
 		expect(host.textContent).not.toContain("Take over");
 		// Active + canCutInLine → queue cluster, not takeover-only row.
-		expect(host.textContent).toContain("queueMode_turn");
+		expect(host.textContent).toContain(enNarrator.queueMode_turn);
 	});
 
 	test("taken-over subagent keeps input and shows stop-takeover", async () => {
@@ -250,23 +332,33 @@ describe("NarratorComposerRow takeover input visibility", () => {
 					onUpdateEnterQueueMode: configure,
 				}),
 			);
-			const trigger = document.querySelector('button[aria-label="sendOptions"]');
+			const trigger = document.querySelector(`button[aria-label="${enNarrator.sendOptions}"]`);
 			if (!trigger) throw new Error("Send menu missing");
 			await act(async () => trigger.dispatchEvent(new Event("click", { bubbles: true })));
 			const items = () => Array.from(document.querySelectorAll('[role="menuitem"]'));
-			expect(items().filter((item) => item.textContent?.startsWith("queueMode_"))).toHaveLength(3);
-			expect(document.body.textContent).not.toContain("enterKeySection");
-			const shortcuts = items().find((item) => item.textContent === "sendKeySettings");
+			expect(
+				items().filter((item) =>
+					[
+						enNarrator.queueMode_turn,
+						enNarrator.queueMode_tool,
+						enNarrator.queueMode_interrupt,
+					].some((label) => item.textContent?.startsWith(label)),
+				),
+			).toHaveLength(3);
+			expect(document.body.textContent).not.toContain(enNarrator.enterKeySection);
+			const shortcuts = items().find((item) => item.textContent === enNarrator.sendKeySettings);
 			if (!shortcuts) throw new Error("Shortcut settings missing");
 			await act(async () => shortcuts.dispatchEvent(new Event("click", { bubbles: true })));
-			expect(document.body.textContent).toContain("enterKeySection");
-			expect(document.body.textContent).toContain("ctrlEnterKeySection");
+			expect(document.body.textContent).toContain(enNarrator.enterKeySection);
+			expect(document.body.textContent).toContain(enNarrator.ctrlEnterKeySection);
 			expect(send).not.toHaveBeenCalled();
 			expect(configure).not.toHaveBeenCalled();
-			const back = items().find((item) => item.textContent === "sendCurrentInputSection");
+			const back = items().find((item) => item.textContent === enNarrator.sendCurrentInputSection);
 			if (!back) throw new Error("Back to send actions missing");
 			await act(async () => back.dispatchEvent(new Event("click", { bubbles: true })));
-			const guidance = items().find((item) => item.textContent?.startsWith("queueMode_tool"));
+			const guidance = items().find((item) =>
+				item.textContent?.startsWith(enNarrator.queueMode_tool),
+			);
 			if (!guidance) throw new Error("Guidance action missing");
 			await act(async () => guidance.dispatchEvent(new Event("click", { bubbles: true })));
 			expect(send).toHaveBeenCalledWith("tool");
@@ -276,15 +368,15 @@ describe("NarratorComposerRow takeover input visibility", () => {
 
 	test("primary action uses custom Enter mode and compaction retains wait/run choices", async () => {
 		await renderRow(baseProps({ composerHasText: true, enterQueueMode: "tool" }));
-		expect(host.textContent).toContain("queueMode_tool");
+		expect(host.textContent).toContain(enNarrator.queueMode_tool);
 		await renderRow(
 			baseProps({ composerHasText: true, showCompactQueueChoice: true, canCutInLine: false }),
 		);
-		const trigger = document.querySelector('button[aria-label="sendOptions"]');
+		const trigger = document.querySelector(`button[aria-label="${enNarrator.sendOptions}"]`);
 		if (!trigger) throw new Error("Send menu missing");
 		await act(async () => trigger.dispatchEvent(new Event("click", { bubbles: true })));
-		expect(document.body.textContent).toContain("compactQueueMode_wait");
-		expect(document.body.textContent).toContain("compactQueueMode_now");
-		expect(document.body.textContent).not.toContain("queueMode_tool_desc");
+		expect(document.body.textContent).toContain(enNarrator.compactQueueMode_wait);
+		expect(document.body.textContent).toContain(enNarrator.compactQueueMode_now);
+		expect(document.body.textContent).not.toContain(enNarrator.queueMode_tool_desc);
 	});
 });
