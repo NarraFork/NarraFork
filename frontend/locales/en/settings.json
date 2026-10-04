@@ -1411,7 +1411,7 @@
 	"codexBrowserAuthTimeout": "Browser authorization timed out",
 	"codexBrowserCallbackDesc": "The authorization redirects to {{redirectUri}}, which resolves on the machine running the browser. If the browser does not finish authorization on its own (the callback page fails to load, or NarraFork runs on another host), copy the full URL from the address bar and paste it here.",
 	"codexBrowserCallbackPlaceholder": "http://localhost:1455/auth/callback?code=...&state=...",
-	"codexBrowserCallbackServerDown": "The local callback server ({{redirectUri}}) failed to start, so the browser will show an unreachable page after authorization. That's fine — copy the full URL from the address bar and paste it below to finish.",
+	"codexBrowserCallbackServerDown": "The local callback server ({{redirectUri}}) is unavailable. The port may be reserved by Windows, occupied by another process, or unavailable for another reason. Continue authorization in the browser; after it redirects to the callback address, copy the full URL from the address bar and paste it below to try completing sign-in, even if the page cannot be reached.",
 	"codexBrowserCallbackSubmit": "Submit Callback URL",
 	"codexBrowserCallbackSuccessWithEmail": "Codex credential added: {{email}}",
 	"codexColName": "Name",
