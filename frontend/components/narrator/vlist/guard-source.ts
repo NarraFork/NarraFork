@@ -65,6 +65,8 @@ export const SHELL_MODULES = [
 	"vlist-exact-layout.ts",
 	"vlist-exact-row-state.ts",
 	"vlist-exact-scroll.ts",
+	"vlist-interaction-admission-context.tsx",
+	"vlist-interaction-admission.ts",
 	"vlist-live-resize.ts",
 	"vlist-morph-scroll-origin.ts",
 	"vlist-resize-permission.ts",

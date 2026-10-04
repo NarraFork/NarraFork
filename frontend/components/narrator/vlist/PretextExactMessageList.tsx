@@ -81,6 +81,7 @@ import type { MessageListHandle, MessageListTailMeta } from "../message/message-
 import { NarratorMessageListSkeleton } from "../NarratorMessageListSkeleton";
 import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
+import { useNarratorPanelVisible } from "../narrator-panel-visibility";
 import { getGlobalSwipeAnchor, subscribeGlobalSwipeAnchor } from "../scroll/swipeState";
 import {
 	getCategory,
@@ -213,6 +214,8 @@ import {
 	useInterruptGuardActions,
 } from "./vlist-injection-guard-actions";
 import type { InjectionNavigation } from "./vlist-injection-header";
+import { createVListInteractionAdmission } from "./vlist-interaction-admission";
+import { VListInteractionAdmissionContext } from "./vlist-interaction-admission-context";
 import {
 	createVListInteractionState,
 	isFileChangesOpenRow,
@@ -422,6 +425,8 @@ type ScrollRef = RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) 
 
 type PretextExactMessageListProps = {
 	narratorId: string;
+	/** Defer optional cold controllers by default; public read-only transcripts opt out. */
+	deferInteractions?: boolean;
 	isSubagent?: boolean;
 	/** Narrator is working/waiting → render the live streaming tail overlay. */
 	isActive?: boolean;
@@ -541,6 +546,7 @@ export const PretextExactMessageList = memo(
 		function PretextExactMessageList(props, ref) {
 			const {
 				narratorId,
+				deferInteractions = true,
 				isSubagent,
 				isActive = false,
 				scrollRef,
@@ -618,6 +624,19 @@ export const PretextExactMessageList = memo(
 			 * every COW alias when the event does name replacement identities.
 			 */
 			const compactProgressKeysRef = useRef<Map<string, boolean>>(new Map());
+			const panelVisible = useNarratorPanelVisible();
+			const interactionOwner = useMemo(
+				() => ({
+					narratorId,
+					admission: deferInteractions ? createVListInteractionAdmission() : null,
+				}),
+				[narratorId, deferInteractions],
+			);
+			const interactionAdmission = interactionOwner.admission;
+			const interactionAdmissionRef = useRef(interactionAdmission);
+			useLayoutEffect(() => {
+				interactionAdmissionRef.current = interactionAdmission;
+			}, [interactionAdmission]);
 			const pinnedToBottomRef = useRef(true);
 			// Explicit full-text reading is not a request to chase newly streamed text.
 			const textReadingDetachedRef = useRef(false);
@@ -694,6 +713,30 @@ export const PretextExactMessageList = memo(
 			const footerHeightRef = useRef(0);
 			footerHeightRef.current = footerHeight;
 			pinnedToBottomRef.current = pinnedToBottom;
+			useEffect(() => {
+				if (!interactionAdmission) return;
+				const syncAdmissionVisibility = () => {
+					if (!panelVisible || document.hidden) interactionAdmission.suspend();
+					else
+						interactionAdmission.resume(
+							pinnedToBottomRef.current && !textReadingDetachedRef.current,
+						);
+				};
+				syncAdmissionVisibility();
+				document.addEventListener("visibilitychange", syncAdmissionVisibility);
+				return () => {
+					document.removeEventListener("visibilitychange", syncAdmissionVisibility);
+					interactionAdmission.suspend();
+				};
+			}, [interactionAdmission, panelVisible]);
+			useEffect(() => {
+				if (!interactionAdmission || !viewportNode) return;
+				const onScrollEnd = (event: Event) => {
+					if (event.target === viewportNode) interactionAdmission.finishScroll();
+				};
+				viewportNode.addEventListener("scrollend", onScrollEnd);
+				return () => viewportNode.removeEventListener("scrollend", onScrollEnd);
+			}, [interactionAdmission, viewportNode]);
 
 			const assignViewport = useCallback(
 				(node: HTMLDivElement | null) => {
@@ -755,6 +798,14 @@ export const PretextExactMessageList = memo(
 					scrollTopRef.current = settled;
 					scrollViewportHeightRef.current = node.clientHeight;
 					visibleViewportRef.current.recordScrollTop(settled);
+					// Cache committed corrections for admission priority without mistaking
+					// anchoring/follow echoes for another reader gesture.
+					interactionAdmissionRef.current?.observeScroll({
+						scrollTop: settled,
+						viewportHeight: scrollViewportHeightRef.current,
+						atBottom: pinnedToBottomRef.current && !textReadingDetachedRef.current,
+						activity: false,
+					});
 					if (advanceState) setScrollTop(settled);
 					requestAnimationFrame(() => {
 						suppressScrollStateRef.current = false;
@@ -1497,6 +1548,7 @@ export const PretextExactMessageList = memo(
 							// clicked control before the item anchor is captured.
 							smoothFollowerRef.current?.cancel();
 							textReadingDetachedRef.current = true;
+							interactionAdmissionRef.current?.markHistoryIntent();
 							pinnedToBottomRef.current = false;
 							visibleViewportRef.current.setPinned(false);
 							setPinnedToBottom(false);
@@ -4477,6 +4529,14 @@ export const PretextExactMessageList = memo(
 					suppressedScrollTopRef.current,
 					nextTop,
 				);
+				// Classify before React mounts a new band. Only optional cold controllers
+				// subscribe to admission; this never invalidates the body/row element cache.
+				interactionAdmissionRef.current?.observeScroll({
+					scrollTop: nextTop,
+					viewportHeight: liveViewportHeight,
+					atBottom: effectiveAtBottom,
+					activity: !isEcho && !viewportResizedWhilePinned,
+				});
 				// Scrollbar drags and keyboard scrolling have no wheel/touch event to arm
 				// the history gate. Record their actual upward travel before testing it.
 				// Keyboard resize/focus adjustment is not a request to read older history.
@@ -4594,6 +4654,7 @@ export const PretextExactMessageList = memo(
 					// chase drifting in afterwards would fight the write.
 					getSmoothFollower().cancel();
 					textReadingDetachedRef.current = false;
+					interactionAdmissionRef.current?.setAtBottom(true);
 					pinnedToBottomRef.current = true;
 					visibleViewportRef.current.setPinned(true);
 					setPinnedToBottom(true);
@@ -4615,6 +4676,7 @@ export const PretextExactMessageList = memo(
 				// Reader intent (wheel-up): the chase must die with the pin, or its next
 				// frame re-writes scrollTop and pulls the reader back down.
 				getSmoothFollower().cancel();
+				interactionAdmissionRef.current?.markHistoryIntent();
 				pinnedToBottomRef.current = false;
 				visibleViewportRef.current.setPinned(false);
 				setPinnedToBottom(false);
@@ -4657,6 +4719,7 @@ export const PretextExactMessageList = memo(
 					// A jump is an explicit reading action: unpin so streaming output cannot
 					// immediately pull the reader back to the tail.
 					getSmoothFollower().cancel();
+					interactionAdmissionRef.current?.markHistoryIntent();
 					pinnedToBottomRef.current = false;
 					visibleViewportRef.current.setPinned(false);
 					setPinnedToBottom(false);
@@ -4667,6 +4730,7 @@ export const PretextExactMessageList = memo(
 			const handleCompactMarkerJump = useCallback(
 				(marker: VListCompactMarker) => {
 					getSmoothFollower().cancel();
+					interactionAdmissionRef.current?.markHistoryIntent();
 					pinnedToBottomRef.current = false;
 					visibleViewportRef.current.setPinned(false);
 					setPinnedToBottom(false);
@@ -4809,6 +4873,7 @@ export const PretextExactMessageList = memo(
 						if (!node) return false;
 						const element = mountedJumpTarget(node, domIds, targetIds);
 						if (!element) return false;
+						interactionAdmissionRef.current?.markHistoryIntent();
 						pinnedToBottomRef.current = false;
 						visibleViewportRef.current.setPinned(false);
 						setPinnedToBottom(false);
@@ -4830,6 +4895,7 @@ export const PretextExactMessageList = memo(
 							const itemIndex = jumpTargetItemIndex(index, messageId);
 							if (itemIndex == null) continue;
 							const targetTop = index.itemStart(itemIndex) - Math.max(0, node.clientHeight / 2);
+							interactionAdmissionRef.current?.markHistoryIntent();
 							pinnedToBottomRef.current = false;
 							visibleViewportRef.current.setPinned(false);
 							setPinnedToBottom(false);
@@ -4906,6 +4972,7 @@ export const PretextExactMessageList = memo(
 						// Paging upward while pinned to the bottom would re-snap the canvas to the
 						// tail on every commit (commitPrependLayout's pinned branch), fighting the
 						// jump. A jump is an explicit reading action, so unpin first.
+						interactionAdmissionRef.current?.markHistoryIntent();
 						pinnedToBottomRef.current = false;
 						visibleViewportRef.current.setPinned(false);
 						setPinnedToBottom(false);
@@ -5698,7 +5765,9 @@ export const PretextExactMessageList = memo(
 										/>
 									);
 								})}
-								{windowRowElements}
+								<VListInteractionAdmissionContext.Provider value={interactionAdmission}>
+									{windowRowElements}
+								</VListInteractionAdmissionContext.Provider>
 							</div>
 						) : (
 							// Loading / error placeholder. While the document is being fetched and

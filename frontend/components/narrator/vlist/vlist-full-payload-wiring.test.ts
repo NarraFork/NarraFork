@@ -66,10 +66,7 @@ describe("full-payload request wiring (inline auto-load + fullscreen)", () => {
 		expect(SHELL).not.toContain("getLoadFullPayload");
 		// The fixed wiring: a direct, stable marker callback.
 		expect(SHELL).toContain("useVListContentView({ requestFullPayload: requestRowFullPayload })");
-		const marker = sliceBracketedRegion(
-			SHELL,
-			"const requestRowFullPayload = useCallback((owner: VListViewOwner) => {",
-		);
+		const marker = sliceBracketedRegion(SHELL, "const requestRowFullPayload = useCallback(");
 		if (!marker) throw new Error("owner-based request callback not found");
 		// Location stays separate from body identity; marking still happens immediately.
 		expect(marker).toContain(

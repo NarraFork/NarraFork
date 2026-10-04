@@ -133,6 +133,7 @@ import type { BlockFrame, PreparedInlineBlock } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
 import { VListContentViewHost, type VListViewControls } from "../VListContentViewHost";
 import { findViewTarget, type VListViewTarget } from "../vlist-content-view-target";
+import { useDeferredInteractionMount } from "../vlist-interaction-admission-context";
 import { CategoryChip } from "./category-chip";
 import { categoryIcon } from "./category-icons";
 import { DiffStatsText, type DiffStatsValue } from "./diff-stats-text";
@@ -1050,9 +1051,45 @@ export function ToolTimingArea({
 	const [breakdownOpened, setBreakdownOpened] = useState(false);
 	const [editorOpened, setEditorOpened] = useState(false);
 	const pointerTypeRef = useRef<string | null>(null);
+	const triggerRef = useRef<HTMLButtonElement | null>(null);
 
 	const canEditTimeout = running && timeoutMs != null && onUpdateTimeout != null;
 	const showBreakdown = hasTimingDetails(timing);
+	const breakdownMount = useDeferredInteractionMount({
+		enabled: showBreakdown,
+		immediate: running || breakdownOpened || editorOpened,
+	});
+	const [breakdownPrimed, setBreakdownPrimed] = useState(showBreakdown && breakdownMount.ready);
+	useEffect(() => {
+		if (!showBreakdown || !breakdownMount.ready) {
+			setBreakdownPrimed(false);
+			return;
+		}
+		if (breakdownPrimed) return;
+		// Portal first mounts its closed Transition in a layout-effect update. Keep
+		// this cold request closed for one frame so first-open still fades in.
+		const frame = requestAnimationFrame(() => setBreakdownPrimed(true));
+		return () => cancelAnimationFrame(frame);
+	}, [showBreakdown, breakdownMount.ready, breakdownPrimed]);
+	useEffect(() => {
+		if (!breakdownOpened || breakdownPrimed) return;
+		// Mantine cannot dismiss an opened request while its cold Transition is still
+		// priming. Preserve Escape/outside cancellation during that single frame.
+		const outside = (event: Event) => {
+			if (!triggerRef.current?.contains(event.target as Node)) setBreakdownOpened(false);
+		};
+		const onPendingEscape = (event: KeyboardEvent) => {
+			if (event.key === "Escape") setBreakdownOpened(false);
+		};
+		document.addEventListener("mousedown", outside);
+		document.addEventListener("touchstart", outside);
+		document.addEventListener("keydown", onPendingEscape, true);
+		return () => {
+			document.removeEventListener("mousedown", outside);
+			document.removeEventListener("touchstart", outside);
+			document.removeEventListener("keydown", onPendingEscape, true);
+		};
+	}, [breakdownOpened, breakdownPrimed]);
 
 	// A closed editor must not linger once the tool stops running.
 	useEffect(() => {
@@ -1086,8 +1123,10 @@ export function ToolTimingArea({
 
 	const trigger = (
 		<UnstyledButton
+			ref={triggerRef}
 			type="button"
 			aria-label={ariaLabel}
+			onFocus={breakdownMount.ensure}
 			style={{
 				display: "inline-flex",
 				alignItems: "center",
@@ -1100,15 +1139,21 @@ export function ToolTimingArea({
 			}}
 			onPointerDown={(event: React.PointerEvent) => {
 				event.stopPropagation();
+				breakdownMount.ensure();
 				pointerTypeRef.current = event.pointerType;
 			}}
 			onPointerCancel={(event: React.PointerEvent) => {
 				event.stopPropagation();
 				pointerTypeRef.current = null;
 			}}
-			onKeyDown={(event: React.KeyboardEvent) => event.stopPropagation()}
+			onKeyDown={(event: React.KeyboardEvent) => {
+				event.stopPropagation();
+				if (event.key === "Escape") setBreakdownOpened(false);
+				else breakdownMount.ensure();
+			}}
 			onClick={(event: React.MouseEvent) => {
 				event.stopPropagation();
+				breakdownMount.ensure();
 				const pointerType = pointerTypeRef.current;
 				pointerTypeRef.current = null;
 				if (pointerType === "mouse" && canEditTimeout) {
@@ -1125,7 +1170,7 @@ export function ToolTimingArea({
 
 	const withBreakdown = showBreakdown ? (
 		<Popover
-			opened={breakdownOpened}
+			opened={breakdownOpened && breakdownPrimed}
 			onChange={setBreakdownOpened}
 			position="top"
 			withArrow
@@ -1133,16 +1178,18 @@ export function ToolTimingArea({
 			shadow="md"
 		>
 			<Popover.Target>{trigger}</Popover.Target>
-			<Popover.Dropdown
-				onPointerDown={(event) => event.stopPropagation()}
-				onClick={(event) => event.stopPropagation()}
-			>
-				<ToolTimingBreakdown
-					timing={timing as ToolTimingStamps}
-					displayDurationMs={durationMs}
-					labels={merged}
-				/>
-			</Popover.Dropdown>
+			{breakdownMount.ready ? (
+				<Popover.Dropdown
+					onPointerDown={(event) => event.stopPropagation()}
+					onClick={(event) => event.stopPropagation()}
+				>
+					<ToolTimingBreakdown
+						timing={timing as ToolTimingStamps}
+						displayDurationMs={durationMs}
+						labels={merged}
+					/>
+				</Popover.Dropdown>
+			) : null}
 		</Popover>
 	) : (
 		trigger
