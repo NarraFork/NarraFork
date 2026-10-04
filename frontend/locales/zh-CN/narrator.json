@@ -364,6 +364,8 @@
 	"queueMode_interrupt_desc": "中止正在运行的工具，立即将引导补充到当前任务；已产生的改动不会回滚",
 	"sendKeySettings": "快捷键设置",
 	"queuedActions": "消息队列操作",
+	"queuedSenderUnknown": "未知发送人",
+	"queuedDoubleClickEdit": "双击编辑",
 	"queuedChangeMode": "切换发送模式",
 	"queuedSwitchToGuidance": "改为即时引导",
 	"queuedSwitchToNextStep": "改为完成后继续",

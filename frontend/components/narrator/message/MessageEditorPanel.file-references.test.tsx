@@ -505,6 +505,217 @@ function queueRow(overrides: Partial<ComponentProps<typeof QueuedMessageRow>> = 
 	);
 }
 
+describe("visible queued message collaboration details", () => {
+	const queued = {
+		id: "queued-detail",
+		text: "Queued body",
+		state: "queued" as const,
+		bufferedAt: "now",
+		imageCount: 0,
+		creator: { id: "teammate-id", username: "teammate", avatarColor: "#5c7cfa" },
+	};
+
+	test("a single sender remains visible for one message and several messages by the same sender", async () => {
+		for (const count of [1, 2]) {
+			await render(
+				queuePanel({
+					queuedMessages: Array.from({ length: count }, (_, index) => ({
+						...queued,
+						id: `detail-${index}`,
+					})),
+				}),
+			);
+			const senders = document.querySelectorAll("[data-queue-sender]");
+			expect(senders).toHaveLength(count);
+			for (const sender of senders) expect(sender.textContent).toContain("teammate");
+		}
+	});
+
+	test("missing creator is explicit rather than silently attributed to the current user", async () => {
+		await render(queueRow({ msg: { ...queued, creator: null } }));
+		expect(document.querySelector("[data-queue-sender]")?.textContent).toContain(
+			en.queuedSenderUnknown,
+		);
+	});
+
+	test("all thumbnails, file names and references are visible without expanding attachments", async () => {
+		await render(
+			queueRow({
+				msg: {
+					...queued,
+					imageCount: 4,
+					images: Array.from({ length: 4 }, (_, index) => ({
+						imageId: `image-${index}`,
+						filename: `image-${index}.png`,
+						mediaType: "image/png",
+					})),
+					textFiles: [
+						{ index: 0, filename: "notes.txt", size: 12 },
+						{ index: 1, filename: "report.md", size: 8 },
+					],
+					fileReferences: [reference],
+				},
+			}),
+		);
+		expect(document.querySelector("[data-queue-attachment-preview]")).not.toBeNull();
+		expect(document.querySelectorAll("[data-queue-image]")).toHaveLength(4);
+		expect(document.body.textContent).toContain("notes.txt");
+		expect(document.body.textContent).toContain("report.md");
+		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+	});
+
+	test("remove is directly accessible and double-clicking it does not edit", async () => {
+		const remove = mock((_id: string) => {});
+		const edit = mock((_message: unknown) => {});
+		await render(queueRow({ msg: queued, onRemove: remove, onStartEdit: edit }));
+		const externalRemove = button("Cancel");
+		await click(externalRemove);
+		await act(async () => externalRemove.dispatchEvent(new Event("dblclick", { bubbles: true })));
+		expect(remove).toHaveBeenCalledWith(queued.id);
+		expect(remove).toHaveBeenCalledTimes(1);
+		expect(edit).not.toHaveBeenCalled();
+	});
+
+	test("double-clicking body or blank row space edits exactly once per gesture", async () => {
+		const edit = mock((_message: unknown) => {});
+		await render(queueRow({ msg: queued, onStartEdit: edit }));
+		await act(async () =>
+			button(en.queuedExpandText).dispatchEvent(new Event("dblclick", { bubbles: true })),
+		);
+		expect(edit).toHaveBeenCalledTimes(1);
+		expect(edit).toHaveBeenCalledWith(queued);
+		const row = document.querySelector("[data-queue-message-row]");
+		if (!row) throw new Error("Queued row missing");
+		await act(async () => row.dispatchEvent(new Event("dblclick", { bubbles: true })));
+		expect(edit).toHaveBeenCalledTimes(2);
+	});
+
+	test("double-clicking attachments or urgent controls cannot start editing", async () => {
+		const edit = mock((_message: unknown) => {});
+		await render(queueRow({ msg: { ...queued, fileReferences: [reference] }, onStartEdit: edit }));
+		const preview = document.querySelector("[data-queue-attachment-preview]");
+		if (!preview) throw new Error("Attachment preview missing");
+		await act(async () => {
+			preview.dispatchEvent(new Event("dblclick", { bubbles: true }));
+			button(en.queuedSendUrgently).dispatchEvent(new Event("dblclick", { bubbles: true }));
+		});
+		expect(edit).not.toHaveBeenCalled();
+	});
+});
+
+describe("queued collaboration gesture and image integration", () => {
+	test("double-click opens the real editor with sender, original text and attachments intact", async () => {
+		const message = {
+			id: "edit-by-double-click",
+			text: "Original queued text",
+			bufferedAt: "now",
+			imageCount: 0,
+			creator: { id: "peer", username: "peer" },
+			fileReferences: [reference],
+		};
+		let editingQueuedId: string | null = null;
+		const view = () =>
+			queuePanel({
+				queuedMessages: [message],
+				editingQueuedId,
+				handleStartEditQueued: (msg) => {
+					editingQueuedId = msg.id;
+				},
+			});
+		await render(view());
+		await act(async () =>
+			button(en.queuedExpandText).dispatchEvent(new Event("dblclick", { bubbles: true })),
+		);
+		expect<string | null>(editingQueuedId).toBe(message.id);
+		await render(view());
+		expect(textareaProps().textarea.value).toBe(message.text);
+		expect(document.querySelector("[data-queue-sender]")?.textContent).toContain("peer");
+		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+	});
+
+	test("mode changes in flight block double-click editing and external removal", async () => {
+		const pending = Promise.withResolvers<void>();
+		const edit = mock((_message: unknown) => {});
+		const remove = mock((_id: string) => {});
+		await render(
+			queueRow({
+				msg: { id: "pending-mode", text: "Queued", bufferedAt: "now", imageCount: 0 },
+				onChangeMode: () => pending.promise,
+				onStartEdit: edit,
+				onRemove: remove,
+			}),
+		);
+		await click(button(en.queuedSwitchToGuidance));
+		expect(button("Cancel").disabled).toBe(true);
+		await act(async () =>
+			button(en.queuedExpandText).dispatchEvent(new Event("dblclick", { bubbles: true })),
+		);
+		expect(edit).not.toHaveBeenCalled();
+		await act(async () => {
+			pending.resolve();
+			await flush();
+		});
+		expect(button("Cancel").disabled).toBe(false);
+		await act(async () =>
+			button(en.queuedExpandText).dispatchEvent(new Event("dblclick", { bubbles: true })),
+		);
+		expect(edit).toHaveBeenCalledTimes(1);
+	});
+
+	test("image previews fetch immediately using explicit or legacy narrator ownership", async () => {
+		const storage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: { getItem: () => null },
+		});
+		const fetchImplementation: typeof fetch = Object.assign(
+			async () => new Response(new Blob(["image bytes"], { type: "image/png" })),
+			{ preconnect: globalThis.fetch.preconnect },
+		);
+		const fetchImage = spyOn(globalThis, "fetch").mockImplementation(fetchImplementation);
+		try {
+			await render(
+				queuePanel({
+					narratorId: "queue-owner",
+					queuedMessages: [
+						{
+							id: "images",
+							text: "Images",
+							bufferedAt: "now",
+							imageCount: 2,
+							images: [
+								{ imageId: "legacy", filename: "legacy.png", mediaType: "image/png" },
+								{
+									imageId: "modern",
+									filename: "modern.png",
+									mediaType: "image/png",
+									uploadNarratorId: "upload-owner",
+								},
+							],
+						},
+					],
+				}),
+			);
+			const requests = fetchImage.mock.calls
+				.map(([url]) => String(url))
+				.filter((url) => url.includes("/uploads/"));
+			expect(requests).toEqual([
+				"/api/uploads/queue-owner/legacy",
+				"/api/uploads/upload-owner/modern",
+			]);
+			for (const filename of ["legacy.png", "modern.png"]) {
+				const image = document.querySelector(`img[alt="${filename}"]`);
+				expect(image).not.toBeNull();
+				expect(image?.getAttribute("src")).toStartWith("blob:");
+			}
+		} finally {
+			fetchImage.mockRestore();
+			if (storage) Object.defineProperty(globalThis, "localStorage", storage);
+			else Reflect.deleteProperty(globalThis, "localStorage");
+		}
+	});
+});
+
 describe("inline queued message mode actions", () => {
 	const queued = {
 		id: "queue-message",
@@ -569,7 +780,6 @@ describe("inline queued message mode actions", () => {
 		expect(button(en.queuedSendUrgently).disabled).toBe(false);
 		expect(button(en.queuedSwitchToGuidance).disabled).toBe(false);
 		expect(document.body.textContent).toContain(queued.text);
-		await click(button(en.queuedAttachments.replace("{{count}}", "1")));
 		expect(document.body.textContent).toContain("#file:a.ts:2-2");
 	});
 
@@ -588,8 +798,6 @@ describe("failed queued message retry UI", () => {
 		expect(document.body.textContent).toContain(en.queuedFailed);
 		expect(document.body.textContent).toContain("Provider refused request");
 		expect(document.body.textContent).toContain("Original input");
-		expect(document.body.textContent).not.toContain("#file:a.ts:2-2");
-		await click(button(en.queuedAttachments.replace("{{count}}", "1")));
 		expect(document.body.textContent).toContain("#file:a.ts:2-2");
 		expect(button(en.queuedRetry).disabled).toBe(false);
 		for (const state of ["queued", undefined] as const) {
@@ -647,7 +855,6 @@ describe("failed queued message retry UI", () => {
 		});
 		try {
 			await render(queueRow());
-			await click(button(en.queuedAttachments.replace("{{count}}", "1")));
 			const retry = button(en.queuedRetry);
 			await act(async () => {
 				retry.dispatchEvent(new Event("click", { bubbles: true }));

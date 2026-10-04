@@ -148,6 +148,7 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 
 			{/* Queued messages indicator */}
 			<QueuedMessagesPanel
+				narratorId={props.common.narratorId}
 				queuedMessages={props.queueDeps.queuedMessages}
 				queueExpanded={queueExpanded}
 				setQueueExpanded={setQueueExpanded}
