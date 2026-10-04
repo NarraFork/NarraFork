@@ -14,14 +14,14 @@
  * the focus page — but their tool panels open as dockview sibling tabs scoped
  * to the right narrator.
  *
- * Tool panels use a narrator-namespaced dockview id (`wtool_<nid>_<type>`) so
- * several clusters never collide, and `resolveToolPlacement` reuses the focus
- * page's "first tool splits right ~1/3, the rest tab into that group" rule
- * (referencing the narrator's own cell instead of a `chat` panel).
+ * Resources use narrator-namespaced panel ids so clusters never collide. New
+ * resources share a temporary native floating group; only an explicit pin or
+ * drag changes the durable grid. Pin targets are selected relative to the
+ * source, independently of resource ownership.
  */
 
 import type { FileReference, FileReferenceEditorSelection } from "@shared/file-reference";
-import type { DockviewApi } from "dockview-react";
+import type { AddPanelOptions, DockviewApi, IDockviewPanel } from "dockview-react";
 import {
 	createContext,
 	type ReactNode,
@@ -33,6 +33,9 @@ import {
 	useSyncExternalStore,
 } from "react";
 import { useNarrator } from "../../../hooks/useNarrator";
+import type { PluginContributionPick } from "../../plugins/PluginContributionPicker";
+import { buildPluginDockPanelOpenRequest } from "../../plugins/PluginContributionPicker";
+import type { PluginUiSessionContext } from "../../plugins/PluginUiSurfaceContext";
 import { PluginUiSurfaceProvider } from "../../plugins/PluginUiSurfaceContext";
 import { filePanelIdentity, type NarratorToolPanelType } from "../dock/dock-panel-types";
 import type { NarratorBrowserInfo, NarratorDockContextValue } from "../dock/NarratorDockContext";
@@ -47,9 +50,13 @@ import {
 	type KnowledgeEntryScope,
 	nextHighlightRequestId,
 } from "../panels/panel-kind";
-import { resolveFileBrowserPosition, resolveToolPlacement } from "../panels/tool-placement";
 import type { ToolEditReference } from "../tool-call/tool-edit-reference";
 import { PANEL_COMPONENT, type WorkspacePanelParams } from "./panel-types";
+import {
+	floatingResourceBounds,
+	rankResourceTargets,
+	resourceSplitDirection,
+} from "./resource-placement";
 
 /** The published + bridged state we shard per narrator. */
 interface NarratorDockShard {
@@ -150,6 +157,14 @@ export class WorkspaceDockStore {
 	// so it has its own listener set rather than the per-narrator shard listeners.
 	private directorActive = false;
 	private directorListeners = new Set<() => void>();
+	private temporary = new Map<
+		string,
+		{ hostNarratorId: string; sourcePanelId?: string; opener: Element | null }
+	>();
+	private resourceRevision = 0;
+	private resourceListeners = new Set<() => void>();
+	/** Bound by the surface; a successful pin reveals the saved grid. */
+	onRevealGrid: (() => void) | null = null;
 
 	constructor(apiRef: RefObject<DockviewApi | null>) {
 		this.apiRef = apiRef;
@@ -331,184 +346,363 @@ export class WorkspaceDockStore {
 	 * accumulate dead narrator entries. Returns true when it closed a panel.
 	 */
 	pruneOrphanedClusters(api: DockviewApi): boolean {
-		const narratorsWithCell = new Set<string>();
-		const secondaryHostIds = new Set<string>();
-		for (const panel of api.panels) {
-			const params = panel.params as WorkspacePanelParams | undefined;
-			if (params?.panelType === "narrator") narratorsWithCell.add(params.narratorId);
-			else if (params?.panelType === "narrator-tool") secondaryHostIds.add(params.narratorId);
-			else if (params?.panelType === "subagent") secondaryHostIds.add(params.hostNarratorId);
-			else if (params?.panelType === "file") secondaryHostIds.add(params.hostNarratorId);
-			else if (params?.panelType === "knowledge") secondaryHostIds.add(params.hostNarratorId);
-		}
-
-		// Close every secondary panel whose owning narrator cell is gone.
+		const narratorsWithCell = new Set(
+			api.panels.flatMap((panel) =>
+				panel.params?.panelType === "narrator" ? [panel.params.narratorId as string] : [],
+			),
+		);
 		let closedAny = false;
 		for (const panel of [...api.panels]) {
-			const params = panel.params as WorkspacePanelParams | undefined;
-			const hostNarratorId =
-				params?.panelType === "narrator-tool"
-					? params.narratorId
-					: params?.panelType === "subagent" ||
-							params?.panelType === "file" ||
-							params?.panelType === "knowledge"
-						? params.hostNarratorId
-						: null;
-			if (hostNarratorId && !narratorsWithCell.has(hostNarratorId)) {
+			const host = workspaceResourceOwner(panel.params as WorkspacePanelParams | undefined);
+			if (host && !narratorsWithCell.has(host)) {
+				this.forgetResource(panel.id);
 				panel.api.close();
 				closedAny = true;
 			}
 		}
-
-		// Release sharded state for narrators that have neither a cell nor a secondary panel.
-		for (const narratorId of [...this.shards.keys(), ...this.bridges.keys()]) {
-			if (narratorsWithCell.has(narratorId) || secondaryHostIds.has(narratorId)) continue;
-			// A live subscriber (its own useSyncExternalStore) would still hold a
-			// listener; only reclaim when nothing is listening for this narrator.
-			if (this.listeners.get(narratorId)?.size) continue;
+		for (const narratorId of new Set([...this.shards.keys(), ...this.bridges.keys()])) {
+			if (narratorsWithCell.has(narratorId) || this.listeners.get(narratorId)?.size) continue;
 			this.shards.delete(narratorId);
 			this.bridges.delete(narratorId);
 		}
 		return closedAny;
 	}
 
+	subscribeResources = (cb: () => void): (() => void) => {
+		this.resourceListeners.add(cb);
+		return () => {
+			this.resourceListeners.delete(cb);
+		};
+	};
+	getResourceRevision = (): number => this.resourceRevision;
+	private emitResources() {
+		this.resourceRevision++;
+		for (const cb of this.resourceListeners) cb();
+	}
+	getTemporaryPanelIds(): ReadonlySet<string> {
+		return new Set(this.temporary.keys());
+	}
+	isTemporary(id: string): boolean {
+		return this.temporary.has(id);
+	}
+
+	/** Keep transient descriptions across an externally requested layout rebuild. */
+	captureTemporaryResources() {
+		const api = this.apiRef.current;
+		if (!api) return [];
+		return [...this.temporary].flatMap(([id, origin]) => {
+			const panel = api.getPanel(id);
+			return panel
+				? [
+						{
+							id,
+							origin,
+							component: panel.view.contentComponent,
+							params: panel.params,
+							title: panel.api.title,
+						},
+					]
+				: [];
+		});
+	}
+	restoreTemporaryResources(
+		resources: ReturnType<WorkspaceDockStore["captureTemporaryResources"]>,
+	) {
+		const api = this.apiRef.current;
+		if (!api) return;
+		for (const resource of resources) {
+			if (!this.narratorPanel(resource.origin.hostNarratorId)) continue;
+			this.openResource(
+				resource.origin.hostNarratorId,
+				{
+					id: resource.id,
+					component: resource.component,
+					params: resource.params,
+					title: resource.title,
+				},
+				resource.origin.sourcePanelId,
+			);
+		}
+	}
+
+	private narratorPanel(narratorId: string) {
+		return this.apiRef.current?.panels.find(
+			(panel) => panel.params?.panelType === "narrator" && panel.params.narratorId === narratorId,
+		);
+	}
+	private sourcePanel(id: string) {
+		const origin = this.temporary.get(id);
+		if (!origin) return undefined;
+		const api = this.apiRef.current;
+		const explicit = origin.sourcePanelId ? api?.getPanel(origin.sourcePanelId) : undefined;
+		if (explicit?.api.location.type === "grid") return explicit;
+		const narrator = this.narratorPanel(origin.hostNarratorId);
+		return narrator?.api.location.type === "grid" ? narrator : undefined;
+	}
+	activateResource(panel: IDockviewPanel) {
+		if (panel.api.location.type !== "floating") this.onRevealGrid?.();
+		panel.api.setActive();
+	}
+
+	private openResource(
+		hostNarratorId: string,
+		request: Pick<AddPanelOptions, "id" | "component" | "params" | "title">,
+		sourcePanelId?: string,
+	) {
+		const api = this.apiRef.current;
+		if (!api) return;
+		const existing = api.getPanel(request.id);
+		if (existing) {
+			this.activateResource(existing);
+			return;
+		}
+		const narrator = this.narratorPanel(hostNarratorId);
+		if (!narrator) return;
+		// The caller's host, not global activePanel: Director's active narrator
+		// can differ from the hidden grid's last focused resource.
+		const source = sourcePanelId ? api.getPanel(sourcePanelId) : narrator;
+		this.temporary.set(request.id, {
+			hostNarratorId,
+			sourcePanelId: source?.api.location.type === "grid" ? source.id : narrator.id,
+			opener: typeof document === "undefined" ? null : document.activeElement,
+		});
+		const floating = api.panels.find(
+			(panel) => this.isTemporary(panel.id) && panel.api.location.type === "floating",
+		);
+		try {
+			api.addPanel({
+				...request,
+				tabComponent: "workspace-resource",
+				renderer: "always",
+				...(floating
+					? { position: { referenceGroup: floating.group } }
+					: {
+							floating:
+								floatingResourceBounds(api.width, api.height, narrator.group.api.boundingBox) ??
+								true,
+						}),
+			});
+			this.emitResources();
+		} catch (error) {
+			this.temporary.delete(request.id);
+			this.emitResources();
+			throw error;
+		}
+	}
+
+	openPluginPanel(
+		hostNarratorId: string,
+		pick: PluginContributionPick,
+		hostContext: PluginUiSessionContext,
+	) {
+		const api = this.apiRef.current;
+		if (!api) return;
+		const existing = api.panels.find((panel) => {
+			const params = panel.params as WorkspacePanelParams | undefined;
+			return (
+				params?.panelType === "plugin" &&
+				params.binding?.kind === "workspace-narrator" &&
+				params.binding.workspaceId === hostContext.workspaceId &&
+				workspaceResourceOwner(params) === hostNarratorId &&
+				params.pluginId === pick.pluginId &&
+				params.contributionId === pick.contributionId
+			);
+		});
+		if (existing) {
+			this.activateResource(existing);
+			return;
+		}
+		const { position: _position, ...request } = buildPluginDockPanelOpenRequest({
+			pick,
+			hostContext,
+			panels: [],
+		});
+		this.openResource(hostNarratorId, request);
+	}
+
+	/** Membership additions must never inherit a transient floating activeGroup. */
+	getMemberPosition(preferredGroupId?: string | null): AddPanelOptions["position"] {
+		const api = this.apiRef.current;
+		const preferred = api?.panels.find(
+			(panel) => panel.group.id === preferredGroupId && panel.api.location.type === "grid",
+		);
+		const grid = preferred ?? api?.panels.find((panel) => panel.api.location.type === "grid");
+		return grid ? { referenceGroup: grid.group } : { direction: "right" };
+	}
+	getPinTargets(id: string) {
+		const api = this.apiRef.current;
+		const source = this.sourcePanel(id);
+		const rect = source?.group.api.boundingBox;
+		if (!api || !source || !rect) return [];
+		const candidates = api.groups.flatMap((group) => {
+			const bounds = group.api.boundingBox;
+			return group.api.location.type === "grid" &&
+				group.api.isVisible &&
+				!group.api.locked &&
+				bounds &&
+				group !== source.group &&
+				!group.api.isMaximized()
+				? [{ id: group.id, ...bounds }]
+				: [];
+		});
+		return rankResourceTargets({ id: source.group.id, ...rect }, candidates).flatMap(
+			(candidate) => {
+				const group = api.panels.find((panel) => panel.group.id === candidate.id)?.group;
+				return group ? [{ group, title: group.activePanel?.api.title ?? group.id }] : [];
+			},
+		);
+	}
+	canCreateResourceSplit(id: string): boolean {
+		const source = this.sourcePanel(id);
+		const rect = source?.group.api.boundingBox;
+		return (
+			!!source && !source.group.api.isMaximized() && !!rect && resourceSplitDirection(rect) !== null
+		);
+	}
+	pinResource(id: string, targetGroupId?: string, createSplit = false): boolean {
+		const api = this.apiRef.current;
+		const panel = api?.getPanel(id);
+		if (!api || !panel || !this.isTemporary(id)) return false;
+		const source = this.sourcePanel(id);
+		const target = targetGroupId
+			? this.getPinTargets(id).find((entry) => entry.group.id === targetGroupId)
+			: this.getPinTargets(id)[0];
+		if (!source) return false;
+		const direction =
+			source.group.api.boundingBox && resourceSplitDirection(source.group.api.boundingBox);
+		try {
+			if (createSplit && direction && this.canCreateResourceSplit(id)) {
+				panel.api.moveTo({
+					group: source.group,
+					position: direction === "below" ? "bottom" : "right",
+				});
+			} else if (!createSplit && target) {
+				panel.api.moveTo({ group: target.group, position: "center" });
+			} else return false;
+			this.temporary.delete(id);
+			this.onRevealGrid?.();
+			panel.api.setActive();
+			this.emitResources();
+			return true;
+		} catch (error) {
+			console.warn("[workspace] failed to pin resource", { id, error });
+			return false;
+		}
+	}
+
+	/** Native drag into a grid is an explicit pin, not a new default placement. */
+	reconcileTemporaryResources() {
+		const api = this.apiRef.current;
+		if (!api) return;
+		let changed = false;
+		let reveal = false;
+		for (const id of this.temporary.keys()) {
+			const panel = api.getPanel(id);
+			if (!panel || panel.api.location.type !== "floating") {
+				this.temporary.delete(id);
+				changed = true;
+				if (panel) reveal = true;
+			}
+		}
+		if (reveal) this.onRevealGrid?.();
+		if (changed) this.emitResources();
+	}
+	/** Only an unconsumed Escape inside a temporary, non-editor surface dismisses it. */
+	closeFocusedTemporaryResource(event: KeyboardEvent): boolean {
+		if (
+			event.key !== "Escape" ||
+			event.defaultPrevented ||
+			event.altKey ||
+			event.ctrlKey ||
+			event.metaKey
+		)
+			return false;
+		const target = event.target;
+		if (
+			!(target instanceof Element) ||
+			target.closest(
+				"input, textarea, select, [contenteditable], .xterm, .monaco-editor, [role=menu], [role=dialog]:not(.dv-resize-container)",
+			)
+		)
+			return false;
+		const panel = this.apiRef.current?.panels.find(
+			(candidate) =>
+				this.isTemporary(candidate.id) &&
+				candidate.api.isVisible &&
+				candidate.api.location.type === "floating" &&
+				(candidate.view.content.element.contains(target) ||
+					candidate.group.element.contains(target)),
+		);
+		if (!panel) return false;
+		panel.api.close();
+		return true;
+	}
+	forgetResource(id: string) {
+		const origin = this.temporary.get(id);
+		if (!this.temporary.delete(id)) return;
+		this.emitResources();
+		if (origin?.opener?.isConnected && "focus" in origin.opener)
+			(origin.opener as HTMLElement).focus();
+	}
 	openToolPanel(
 		narratorId: string,
 		type: NarratorToolPanelType,
 		chapterId: string | null | undefined,
+		sourcePanelId?: string,
 	) {
-		const api = this.apiRef.current;
-		if (!api) return;
-		const id = workspaceToolPanelId(narratorId, type);
-		const existing = api.getPanel(id);
-		if (existing) {
-			existing.api.setActive();
-			return;
-		}
-
-		// The narrator's own cell is the cluster protagonist. Locate it by params
-		// (the panel id is not always the narratorId — seeded/migrated layouts use
-		// synthetic `dvp_*` ids), plus any existing secondary panel for THIS narrator
-		// to stack alongside; otherwise split a new secondary group to its right.
-		const narratorPanel = api.panels.find((p) => {
-			const params = p.params as WorkspacePanelParams | undefined;
-			return params?.panelType === "narrator" && params.narratorId === narratorId;
-		});
-		const existingSecondary = findClusterSecondary(api, narratorId);
-
-		const params: WorkspacePanelParams = {
-			panelType: "narrator-tool",
-			toolType: type,
+		this.openResource(
 			narratorId,
-			chapterId,
-		};
-		const placement = resolveToolPlacement({
-			hasSecondaryGroup: !!existingSecondary?.group,
-			hasChatPanel: !!narratorPanel,
-			surfaceWidth: api.width,
-		});
-
-		if (placement.mode === "within-secondary" && existingSecondary?.group) {
-			api.addPanel({
-				id,
+			{
+				id: workspaceToolPanelId(narratorId, type),
 				component: PANEL_COMPONENT.narratorTool,
-				params,
-				position: { referenceGroup: existingSecondary.group },
-			});
-			return;
-		}
-
-		if (placement.mode === "split-right" && narratorPanel) {
-			api.addPanel({
-				id,
-				component: PANEL_COMPONENT.narratorTool,
-				params,
-				initialWidth: placement.initialWidth,
-				position: { referencePanel: narratorPanel.id, direction: "right" },
-			});
-			return;
-		}
-
-		// Defensive fallback (narrator cell not found by id).
-		api.addPanel({ id, component: PANEL_COMPONENT.narratorTool, params });
+				params: { panelType: "narrator-tool", toolType: type, narratorId, chapterId },
+			},
+			sourcePanelId,
+		);
 	}
 
-	openSubagentPanel(hostNarratorId: string, subagentNarratorId: string, messageId?: string) {
+	openSubagentPanel(
+		hostNarratorId: string,
+		subagentNarratorId: string,
+		messageId?: string,
+		sourcePanelId?: string,
+	) {
 		const api = this.apiRef.current;
 		if (!api || !subagentNarratorId) return;
-		// A message can point to any primary already present in this workspace.
-		// Resolve by narrator identity, not panel id or the caller's host identity.
 		const primary = api.panels.find((panel) => {
 			const params = panel.params as WorkspacePanelParams | undefined;
 			return params?.panelType === "narrator" && params.narratorId === subagentNarratorId;
 		});
 		if (primary) {
+			this.activateResource(primary);
 			focusMessagePanel(api, primary, messageId, (id) =>
 				this.scrollToMessage(subagentNarratorId, id),
 			);
 			return;
 		}
-		const id = workspaceSubagentPanelId(hostNarratorId, subagentNarratorId);
-		const existing = api.getPanel(id);
-		if (existing) {
-			existing.api.setActive();
-			// Re-ask an already-open panel to jump. The request token is what makes a
-			// second click work; see `nextHighlightRequestId`.
-			if (messageId) {
-				existing.api.updateParameters({
-					panelType: "subagent",
-					hostNarratorId,
-					subagentNarratorId,
-					highlightMessageId: messageId,
-					highlightRequestId: nextHighlightRequestId(),
-				} satisfies WorkspacePanelParams);
-			}
-			return;
-		}
-
-		const narratorPanel = api.panels.find((panel) => {
-			const params = panel.params as WorkspacePanelParams | undefined;
-			return params?.panelType === "narrator" && params.narratorId === hostNarratorId;
-		});
-		const existingSecondary = findClusterSecondary(api, hostNarratorId);
 		const params: WorkspacePanelParams = {
 			panelType: "subagent",
 			hostNarratorId,
 			subagentNarratorId,
-			// One-shot jump request, delivered as a param because the panel does not exist
-			// yet; stripped before the layout is persisted (see stripIdentityFromLayout).
 			...(messageId
 				? { highlightMessageId: messageId, highlightRequestId: nextHighlightRequestId() }
 				: {}),
 		};
-		const placement = resolveToolPlacement({
-			hasSecondaryGroup: !!existingSecondary?.group,
-			hasChatPanel: !!narratorPanel,
-			surfaceWidth: api.width,
-		});
-
-		if (placement.mode === "within-secondary" && existingSecondary?.group) {
-			api.addPanel({
-				id,
-				component: PANEL_COMPONENT.subagent,
-				params,
-				position: { referenceGroup: existingSecondary.group },
-			});
+		const existing = api.getPanel(workspaceSubagentPanelId(hostNarratorId, subagentNarratorId));
+		if (existing) {
+			if (messageId) existing.api.updateParameters(params);
+			this.activateResource(existing);
 			return;
 		}
-
-		if (placement.mode === "split-right" && narratorPanel) {
-			api.addPanel({
-				id,
+		this.openResource(
+			hostNarratorId,
+			{
+				id: workspaceSubagentPanelId(hostNarratorId, subagentNarratorId),
 				component: PANEL_COMPONENT.subagent,
 				params,
-				initialWidth: placement.initialWidth,
-				position: { referencePanel: narratorPanel.id, direction: "right" },
-			});
-			return;
-		}
-
-		api.addPanel({ id, component: PANEL_COMPONENT.subagent, params });
+			},
+			sourcePanelId,
+		);
 	}
 
 	/**
@@ -526,13 +720,6 @@ export class WorkspaceDockStore {
 		const deviceId = options.deviceId ?? "local";
 		const fileNarratorId =
 			options.fileNarratorId === hostNarratorId ? undefined : options.fileNarratorId;
-		const navigation = {
-			deviceId,
-			fileNarratorId,
-			toolEdit: options.toolEdit,
-			selection: options.selection,
-			highlightRequestId: options.highlightRequestId ?? nextHighlightRequestId(),
-		};
 		const id = workspaceFilePanelId(
 			hostNarratorId,
 			filePath,
@@ -541,68 +728,31 @@ export class WorkspaceDockStore {
 			fileNarratorId,
 		);
 		const existing = api.getPanel(id);
-		if (existing) {
-			existing.api.updateParameters({
-				...(existing.params as FilePanelParams),
-				panelType: "file",
-				hostNarratorId,
-				filePath,
-				...navigation,
-				referenceOrigin:
-					(existing.params as FilePanelParams)?.referenceOrigin === true ||
-					options.referenceOrigin === true,
-				...(fileName ? { fileName } : {}),
-			});
-			existing.api.setActive();
-			return;
-		}
-
-		const narratorPanel = api.panels.find((panel) => {
-			const params = panel.params as WorkspacePanelParams | undefined;
-			return params?.panelType === "narrator" && params.narratorId === hostNarratorId;
-		});
-		const existingSecondary = findClusterSecondary(api, hostNarratorId);
 		const params: WorkspacePanelParams = {
+			...(existing?.params as FilePanelParams | undefined),
 			panelType: "file",
 			hostNarratorId,
 			filePath,
-			...navigation,
-			referenceOrigin: options.referenceOrigin === true,
+			deviceId,
+			fileNarratorId,
+			toolEdit: options.toolEdit,
+			selection: options.selection,
+			highlightRequestId: options.highlightRequestId ?? nextHighlightRequestId(),
+			referenceOrigin:
+				(existing?.params as FilePanelParams | undefined)?.referenceOrigin === true ||
+				options.referenceOrigin === true,
 			...(fileName ? { fileName } : {}),
 		};
-		const browserPosition = resolveFileBrowserPosition(api, options.sourcePanelId);
-		if (browserPosition) {
-			api.addPanel({ id, component: PANEL_COMPONENT.file, params, position: browserPosition });
+		if (existing) {
+			existing.api.updateParameters(params);
+			this.activateResource(existing);
 			return;
 		}
-		const placement = resolveToolPlacement({
-			hasSecondaryGroup: !!existingSecondary?.group,
-			hasChatPanel: !!narratorPanel,
-			surfaceWidth: api.width,
-		});
-
-		if (placement.mode === "within-secondary" && existingSecondary?.group) {
-			api.addPanel({
-				id,
-				component: PANEL_COMPONENT.file,
-				params,
-				position: { referenceGroup: existingSecondary.group },
-			});
-			return;
-		}
-
-		if (placement.mode === "split-right" && narratorPanel) {
-			api.addPanel({
-				id,
-				component: PANEL_COMPONENT.file,
-				params,
-				initialWidth: placement.initialWidth,
-				position: { referencePanel: narratorPanel.id, direction: "right" },
-			});
-			return;
-		}
-
-		api.addPanel({ id, component: PANEL_COMPONENT.file, params });
+		this.openResource(
+			hostNarratorId,
+			{ id, component: PANEL_COMPONENT.file, params },
+			options.sourcePanelId,
+		);
 	}
 
 	/**
@@ -613,55 +763,18 @@ export class WorkspaceDockStore {
 		hostNarratorId: string,
 		entryId: string,
 		scope: "global" | "personal" = "global",
+		sourcePanelId?: string,
 	) {
-		const api = this.apiRef.current;
-		if (!api || !entryId) return;
-		const id = workspaceKnowledgePanelId(hostNarratorId, entryId);
-		const existing = api.getPanel(id);
-		if (existing) {
-			existing.api.setActive();
-			return;
-		}
-
-		const narratorPanel = api.panels.find((panel) => {
-			const params = panel.params as WorkspacePanelParams | undefined;
-			return params?.panelType === "narrator" && params.narratorId === hostNarratorId;
-		});
-		const existingSecondary = findClusterSecondary(api, hostNarratorId);
-		const params: WorkspacePanelParams = {
-			panelType: "knowledge",
+		if (!entryId) return;
+		this.openResource(
 			hostNarratorId,
-			entryId,
-			scope,
-		};
-		const placement = resolveToolPlacement({
-			hasSecondaryGroup: !!existingSecondary?.group,
-			hasChatPanel: !!narratorPanel,
-			surfaceWidth: api.width,
-		});
-
-		if (placement.mode === "within-secondary" && existingSecondary?.group) {
-			api.addPanel({
-				id,
+			{
+				id: workspaceKnowledgePanelId(hostNarratorId, entryId),
 				component: PANEL_COMPONENT.knowledge,
-				params,
-				position: { referenceGroup: existingSecondary.group },
-			});
-			return;
-		}
-
-		if (placement.mode === "split-right" && narratorPanel) {
-			api.addPanel({
-				id,
-				component: PANEL_COMPONENT.knowledge,
-				params,
-				initialWidth: placement.initialWidth,
-				position: { referencePanel: narratorPanel.id, direction: "right" },
-			});
-			return;
-		}
-
-		api.addPanel({ id, component: PANEL_COMPONENT.knowledge, params });
+				params: { panelType: "knowledge", hostNarratorId, entryId, scope },
+			},
+			sourcePanelId,
+		);
 	}
 
 	closeToolPanel(narratorId: string, type: NarratorToolPanelType) {
@@ -676,39 +789,37 @@ export class WorkspaceDockStore {
 		narratorId: string,
 		type: NarratorToolPanelType,
 		chapterId: string | null | undefined,
+		sourcePanelId?: string,
 	) {
 		const existing = this.apiRef.current?.getPanel(workspaceToolPanelId(narratorId, type));
 		if (!existing) {
-			this.openToolPanel(narratorId, type, chapterId);
+			this.openToolPanel(narratorId, type, chapterId, sourcePanelId);
 			return;
 		}
-		if (!existing.api.isActive) {
-			existing.api.setActive();
+		if (
+			!existing.api.isActive ||
+			(this.directorActive && existing.api.location.type !== "floating")
+		) {
+			this.activateResource(existing);
 			return;
 		}
 		this.closeToolPanel(narratorId, type);
 	}
 }
 
-/**
- * Any already-open secondary panel of one narrator's cluster (tool / subagent /
- * file). Used to decide whether a newly-opened secondary stacks as a tab in the
- * existing group or splits a fresh one to the cell's right.
- */
-function findClusterSecondary(api: DockviewApi, hostNarratorId: string) {
-	return api.panels.find((panel) => {
-		const params = panel.params as WorkspacePanelParams | undefined;
-		if (!params) return false;
-		if (params.panelType === "narrator-tool") return params.narratorId === hostNarratorId;
-		if (
-			params.panelType === "subagent" ||
-			params.panelType === "file" ||
-			params.panelType === "knowledge"
-		) {
-			return params.hostNarratorId === hostNarratorId;
-		}
-		return false;
-	});
+/** Resource ownership is independent of its current layout group. */
+export function workspaceResourceOwner(params: WorkspacePanelParams | undefined): string | null {
+	if (!params) return null;
+	if (params.panelType === "narrator-tool") return params.narratorId;
+	if (
+		params.panelType === "subagent" ||
+		params.panelType === "file" ||
+		params.panelType === "knowledge"
+	)
+		return params.hostNarratorId;
+	if (params.panelType === "plugin" && params.binding?.kind === "workspace-narrator")
+		return params.binding.ownerNarratorId;
+	return null;
 }
 
 function sameToolSet(
@@ -802,7 +913,10 @@ export function useWorkspaceDirectorActive(): boolean {
  * both the narrator cell and its tool panels so they coordinate exactly like
  * the focus page. Returns null when rendered outside a `WorkspaceDockProvider`.
  */
-export function useWorkspaceNarratorDockValue(narratorId: string): NarratorDockContextValue | null {
+export function useWorkspaceNarratorDockValue(
+	narratorId: string,
+	sourcePanelId?: string,
+): NarratorDockContextValue | null {
 	const store = useWorkspaceDock();
 
 	const shard = useSyncExternalStore(
@@ -855,18 +969,21 @@ export function useWorkspaceNarratorDockValue(narratorId: string): NarratorDockC
 				if (api) store.refreshOpenToolTypes(api);
 			},
 			openToolPanel: (type: NarratorToolPanelType) =>
-				store.openToolPanel(narratorId, type, chapterIdRef.current),
+				store.openToolPanel(narratorId, type, chapterIdRef.current, sourcePanelId),
 			openSubagentPanel: (subagentNarratorId: string, messageId?: string) =>
-				store.openSubagentPanel(narratorId, subagentNarratorId, messageId),
+				store.openSubagentPanel(narratorId, subagentNarratorId, messageId, sourcePanelId),
 			openFilePanel: (filePath: string, fileName?: string, options?: FileOpenOptions) =>
-				store.openFilePanel(narratorId, filePath, fileName, options),
+				store.openFilePanel(narratorId, filePath, fileName, {
+					...options,
+					sourcePanelId: options?.sourcePanelId ?? sourcePanelId,
+				}),
 			openKnowledgePanel: (entryId: string, scope?: KnowledgeEntryScope) =>
-				store.openKnowledgePanel(narratorId, entryId, scope),
+				store.openKnowledgePanel(narratorId, entryId, scope, sourcePanelId),
 			closeToolPanel: (type: NarratorToolPanelType) => store.closeToolPanel(narratorId, type),
 			toggleToolPanel: (type: NarratorToolPanelType) =>
-				store.toggleToolPanel(narratorId, type, chapterIdRef.current),
+				store.toggleToolPanel(narratorId, type, chapterIdRef.current, sourcePanelId),
 		};
-	}, [store, narratorId]);
+	}, [store, narratorId, sourcePanelId]);
 
 	return useMemo<NarratorDockContextValue | null>(() => {
 		if (!store || !methods) return null;

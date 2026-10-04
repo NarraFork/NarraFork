@@ -196,95 +196,126 @@ export function reconcileLayoutWithPanels(input: {
 	// Prune rather than discard. Throwing the whole layout away because ONE stale
 	// entry survived would reset an arrangement the user built by hand — a visible
 	// regression every time a narrator is removed elsewhere.
+	const layout =
+		droppedPanelIds.length === 0
+			? (input.layout as SerializedDockview)
+			: pruneWorkspaceLayout(input.layout as SerializedDockview, new Set(droppedPanelIds));
 	return {
-		layout:
-			droppedPanelIds.length === 0
-				? (input.layout as SerializedDockview)
-				: pruneLayout(input.layout as SerializedDockview, new Set(droppedPanelIds)),
-		appended,
+		layout,
+		appended: layout ? appended : members,
 		droppedPanelIds,
 	};
 }
 
 /**
- * Remove named panels from a serialized layout, including their grid leaves.
- *
- * Dockview's `fromJSON` throws when a grid leaf references a panel id that is not in
- * `panels`, and that throw is what used to clear the surface entirely. So the grid
- * tree has to be rewritten in step with the panel map: leaves naming a dropped panel
- * lose that id, branches that end up empty collapse, and a group left with no views
- * is removed.
- *
- * Operates on a `structuredClone`; the caller's layout is never mutated.
+ * Prune panel references in every Dockview location on a clone of the layout.
+ * Membership restore falls back to its member list when the main grid is empty.
+ * Serialization may instead keep a legal empty root (including float-only layouts).
  */
-function pruneLayout(
+export function pruneWorkspaceLayout(
 	layout: SerializedDockview,
 	dropped: ReadonlySet<string>,
+	options: { allowEmptyGrid?: boolean; activeGroup?: string | null } = {},
 ): SerializedDockview | null {
 	let clone: SerializedDockview;
 	try {
 		clone = structuredClone(layout);
 	} catch {
-		// A layout holding something non-cloneable cannot be trusted as a restore
-		// source; the caller's member-only fallback is the safe answer.
 		return null;
 	}
 
-	const panels = (clone as unknown as { panels: Record<string, unknown> }).panels;
+	const panels = clone.panels;
+	if (!panels || !clone.grid?.root) return null;
 	for (const panelId of dropped) delete panels[panelId];
-	if (Object.keys(panels).length === 0) return null;
+	const keptPanels = new Set(Object.keys(panels));
+	const groupIds = new Set<string>();
 
-	const grid = (clone as unknown as { grid?: { root?: unknown } }).grid;
-	if (!grid?.root) return null;
-	const prunedRoot = pruneGridNode(grid.root, dropped);
-	if (!prunedRoot) return null;
-	grid.root = prunedRoot;
+	const pruneGroup = (value: unknown): Record<string, unknown> | null => {
+		if (!value || typeof value !== "object") return null;
+		const group = value as Record<string, unknown>;
+		const views = Array.isArray(group.views)
+			? group.views.filter((id): id is string => typeof id === "string" && keptPanels.has(id))
+			: [];
+		if (views.length === 0) return null;
+		group.views = views;
+		if (typeof group.activeView !== "string" || !views.includes(group.activeView)) {
+			group.activeView = views[0];
+		}
+		if (Array.isArray(group.tabGroups)) {
+			group.tabGroups = group.tabGroups.filter((value) => {
+				if (!value || typeof value !== "object") return false;
+				const tabGroup = value as Record<string, unknown>;
+				tabGroup.panelIds = Array.isArray(tabGroup.panelIds)
+					? tabGroup.panelIds.filter((id) => views.includes(id))
+					: [];
+				return (tabGroup.panelIds as unknown[]).length > 0;
+			});
+		}
+		if (typeof group.id === "string") groupIds.add(group.id);
+		return group;
+	};
 
-	// An active group that no longer exists would leave dockview activating nothing.
-	const activeGroup = (clone as unknown as { activeGroup?: unknown }).activeGroup;
-	if (typeof activeGroup === "string" && !gridContainsGroup(grid.root, activeGroup)) {
-		delete (clone as unknown as { activeGroup?: unknown }).activeGroup;
+	const pruneNode = (value: unknown): unknown | null => {
+		if (!value || typeof value !== "object") return null;
+		const node = value as Record<string, unknown>;
+		if (node.type === "branch" && Array.isArray(node.data)) {
+			node.data = node.data.map(pruneNode).filter((child) => child !== null);
+			return (node.data as unknown[]).length > 0 ? node : null;
+		}
+		if (node.type !== "leaf") return null;
+		const group = pruneGroup(node.data);
+		if (!group) return null;
+		node.data = group;
+		return node;
+	};
+
+	const root = pruneNode(clone.grid.root);
+	if (!root && !options.allowEmptyGrid) return null;
+	clone.grid.root = (root ?? { type: "branch", data: [] }) as typeof clone.grid.root;
+
+	// Both window forms are native Dockview formats: legacy single-group `data`
+	// and a nested `grid`. Never discard persistent floating windows wholesale.
+	const pruneWindows = <T extends { data?: unknown; grid?: { root: unknown } }>(
+		windows: T[],
+	): T[] =>
+		windows.filter((window) => {
+			if (window.grid) {
+				const root = pruneNode(window.grid.root);
+				if (!root) return false;
+				window.grid.root = root;
+				return true;
+			}
+			const group = pruneGroup(window.data);
+			if (!group) return false;
+			window.data = group;
+			return true;
+		});
+	if (clone.floatingGroups) clone.floatingGroups = pruneWindows(clone.floatingGroups);
+	if (clone.popoutGroups) clone.popoutGroups = pruneWindows(clone.popoutGroups);
+	if (clone.edgeGroups) {
+		for (const position of ["top", "bottom", "left", "right"] as const) {
+			const edge = clone.edgeGroups[position];
+			if (!edge) continue;
+			const group = pruneGroup(edge.group);
+			if (group) edge.group = group;
+			else delete clone.edgeGroups[position];
+		}
+	}
+	for (const window of clone.popoutGroups ?? []) {
+		if (window.gridReferenceGroup && !groupIds.has(window.gridReferenceGroup)) {
+			delete window.gridReferenceGroup;
+		}
+	}
+
+	// Insertion order prefers the fixed grid when temporary focus disappeared.
+	const activeGroup = options.activeGroup === undefined ? clone.activeGroup : options.activeGroup;
+	if (activeGroup && groupIds.has(activeGroup)) clone.activeGroup = activeGroup;
+	else {
+		const fallback = groupIds.values().next().value;
+		if (fallback) clone.activeGroup = fallback;
+		else delete clone.activeGroup;
 	}
 	return clone;
-}
-
-/** Prune one grid node, returning null when it holds nothing renderable. */
-function pruneGridNode(node: unknown, dropped: ReadonlySet<string>): unknown | null {
-	if (!node || typeof node !== "object") return null;
-	const record = node as Record<string, unknown>;
-
-	if (record.type === "branch") {
-		if (!Array.isArray(record.data)) return null;
-		const children = record.data
-			.map((child) => pruneGridNode(child, dropped))
-			.filter((child): child is unknown => child !== null);
-		if (children.length === 0) return null;
-		return { ...record, data: children };
-	}
-
-	if (record.type !== "leaf") return null;
-	const data = record.data as Record<string, unknown> | undefined;
-	if (!data) return null;
-	const views = Array.isArray(data.views) ? data.views : [];
-	const keptViews = views.filter((view) => typeof view === "string" && !dropped.has(view));
-	if (keptViews.length === 0) return null;
-	const activeView =
-		typeof data.activeView === "string" && keptViews.includes(data.activeView)
-			? data.activeView
-			: keptViews[0];
-	return { ...record, data: { ...data, views: keptViews, activeView } };
-}
-
-function gridContainsGroup(node: unknown, groupId: string): boolean {
-	if (!node || typeof node !== "object") return false;
-	const record = node as Record<string, unknown>;
-	if (record.type === "branch") {
-		return (
-			Array.isArray(record.data) && record.data.some((child) => gridContainsGroup(child, groupId))
-		);
-	}
-	const data = record.data as Record<string, unknown> | undefined;
-	return data?.id === groupId;
 }
 
 /**

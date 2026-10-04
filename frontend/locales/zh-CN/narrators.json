@@ -4,6 +4,14 @@
 		"missing": "该会话已不存在。",
 		"error": "会话加载失败，请稍后重试。"
 	},
+	"resourceFloat": {
+		"pin": "固定为「{{target}}」的标签页",
+		"pinDirector": "固定到「{{target}}」并切换网格视图",
+		"noNeighbour": "没有其他可用格子，可在菜单中明确新建并排格子",
+		"chooseTarget": "固定到其他格子",
+		"newSplit": "新建并排格子",
+		"pinFailed": "目标格子已不可用，已保留浮层。"
+	},
 	"title": "叙述者列表",
 	"newNarrator": "新建叙述者",
 	"noNarrators": "暂无叙述者。创建一个以开始对话。",

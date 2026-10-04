@@ -1,0 +1,49 @@
+/* Keep workspace resource layers local without trapping native floating groups
+ * below Director in a separate, lower Dockview stacking context. */
+.workspace-resource-surface {
+	isolation: isolate;
+}
+
+.workspace-resource-surface > [data-dockview-surface],
+.workspace-resource-surface > [data-dockview-surface] > .dockview-theme-narrafork,
+.workspace-resource-surface > [data-dockview-surface] > .dockview-theme-narrafork > .dv-shell {
+	z-index: auto;
+	isolation: auto;
+	transform: none;
+	will-change: auto;
+	contain: none;
+}
+
+/* Ordinary always-rendered content is at layer 1. Native floating titles and
+ * .dv-render-overlay-float retain Dockview's coordinated ~999 + aria-level
+ * layers, above Director. Do not assign a z-index to their parent host. */
+.workspace-resource-director > .workspace-resource-director-overlay {
+	z-index: 2;
+}
+
+/* 7.0.2's main grid is .dv-grid-view.dv-dockview. Floating groups also contain
+ * .dv-grid-view, so hiding that class alone would hide their native chrome.
+ * Keep layout/React mounts alive and only suppress the underlying grid. */
+.workspace-resource-director .dv-grid-view.dv-dockview,
+.workspace-resource-director .dv-render-overlay:not(.dv-render-overlay-float) {
+	/* biome-ignore lint/complexity/noImportantStyles: Director must override Dockview's runtime inline visibility. */
+	visibility: hidden !important;
+	/* biome-ignore lint/complexity/noImportantStyles: Keep the hidden grid inert despite Dockview's runtime inline pointer events. */
+	pointer-events: none !important;
+}
+
+/* The host itself must remain click-through between floating groups. Its
+ * children use Dockview's own visibility (including hidden tabs) and z-order;
+ * forcing visibility on .dv-render-overlay-float would reveal inactive tabs. */
+.workspace-resource-director .dv-floating-overlay-host {
+	pointer-events: none;
+}
+
+.workspace-resource-director .dv-floating-overlay-host > .dv-resize-container {
+	pointer-events: auto;
+}
+
+.workspace-resource-surface .workspace-resource-target {
+	outline: 2px solid var(--mantine-color-indigo-filled);
+	outline-offset: -2px;
+}
