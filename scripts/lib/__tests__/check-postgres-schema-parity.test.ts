@@ -404,10 +404,10 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 114 tables and 1645 columns including resource inventory", () => {
-		expect(target.tables.length).toBe(114);
-		// 1642 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1645);
+	test("covers 115 tables and 1659 columns including resource inventory", () => {
+		expect(target.tables.length).toBe(115);
+		// 1656 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1659);
 		expect(
 			target.tables
 				.find((table) => table.name === "narrator_worktree_resources")
