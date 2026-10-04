@@ -51,6 +51,11 @@ import {
 	narratorToolCalls,
 	narratorToolContinuations,
 } from "../db/schema";
+import {
+	measureMessageCharacters,
+	measureSummaryCharacters,
+	queueContextCharacterRefresh,
+} from "../lib/context-characters";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -805,6 +810,7 @@ function applyBlockDeletionTx(
 	const patch = {
 		contentJson: remaining,
 		contentText: contentText || null,
+		contextCharsJson: measureMessageCharacters(message.role, remaining, contentText),
 		// A file rollback invalidates the old message-level boundary; text-only and
 		// history-only edits do not change the captured filesystem observation.
 		...(!opts?.skipRevert && removedToolIds.length > 0
@@ -1160,7 +1166,7 @@ function deleteOutputlessAssistantMessage(
 	});
 }
 
-function isCompactLifecycleMessage(message: { contentJson: unknown }): boolean {
+export function isCompactLifecycleMessage(message: { contentJson: unknown }): boolean {
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
 	return blocks.some((block) => parseCompactMessageBlock(block) !== null);
 }
@@ -1519,6 +1525,7 @@ function insertFileHistoryCheckpoints(
 				narratorId,
 				role: "disp",
 				contentJson: [{ type: "file_history_checkpoint" }],
+				contextCharsJson: { segments: [] },
 				contentText: null,
 				createdAt: new Date().toISOString(),
 			})
@@ -4334,7 +4341,7 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async deleteCompactMessage(narratorId: string, messageId: string) {
-		return db.transaction((tx) => {
+		const result = db.transaction((tx) => {
 			// Resolve the message through the caller-owned ref. The message owner is
 			// intentionally ignored because forked narrators share immutable history.
 			const currentRef = tx.query.narratorMessageRefs
@@ -4394,6 +4401,7 @@ const narratorMessageQueriesUnlocked = {
 					...(compactBlock.status === "compacted"
 						? {
 								contextSummary: null,
+								contextSummaryChars: 0,
 								apiConversationId: null,
 							}
 						: {}),
@@ -4407,6 +4415,8 @@ const narratorMessageQueriesUnlocked = {
 				previousCompactExists: compactBlock.status === "compacted" && previousCompact.length > 0,
 			};
 		});
+		queueContextCharacterRefresh(narratorId);
+		return result;
 	},
 
 	async deleteMessage(
@@ -4855,7 +4865,7 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async updateCompactSummary(narratorId: string, messageId: string, summary: string) {
-		return db.transaction((tx) => {
+		const result = db.transaction((tx) => {
 			const ref = tx.query.narratorMessageRefs
 				.findFirst({
 					where: and(
@@ -4886,6 +4896,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narratorMessages)
 				.set({
 					contentJson: [newBlock],
+					contextCharsJson: { segments: [] },
 					contentText: `${prefix} ${summary.slice(0, 200)}...`,
 				})
 				.where(eq(narratorMessages.id, copied.messageId))
@@ -4894,6 +4905,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					contextSummary: summary,
+					contextSummaryChars: measureSummaryCharacters(summary),
 					apiConversationId: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
@@ -4902,6 +4914,8 @@ const narratorMessageQueriesUnlocked = {
 				.run();
 			return copied.messageId;
 		});
+		queueContextCharacterRefresh(narratorId, result);
+		return result;
 	},
 
 	async getPendingPermissions(narratorId: string) {

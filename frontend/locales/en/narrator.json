@@ -1,5 +1,28 @@
 {
 	"you": "You",
+	"contextComposition": {
+		"title": "Context window viewer",
+		"order": "Display order",
+		"byCategory": "Categories",
+		"bySequence": "Sequence",
+		"characters": "characters",
+		"refresh": "Refresh",
+		"retry": "Retry",
+		"loadMore": "Load more",
+		"loading": "Loading",
+		"error": "Load failed",
+		"categories": {
+			"system": "System rules",
+			"summary": "Summary",
+			"toolDefinition": "Tool definitions",
+			"user": "User messages",
+			"assistant": "Assistant messages",
+			"toolCall": "Tool calls",
+			"toolResult": "Tool results",
+			"attachment": "Attachments",
+			"other": "Other"
+		}
+	},
 	"sharePreview": {
 		"load": "Load preview",
 		"loading": "Loading preview…",

@@ -200,8 +200,12 @@ describe("reflection loop cacheable prefix", () => {
 			});
 			try {
 				captured = [];
+				const characters: number[] = [];
 				const config = {
 					...parentConfig(),
+					onToolsCharacters: (chars: number) => {
+						characters.push(chars);
+					},
 					maxTurns: 1,
 					planMode,
 					toolFilter: (tool: { name: string }) => tool.name === dynamicName,
@@ -221,6 +225,10 @@ describe("reflection loop cacheable prefix", () => {
 					},
 				});
 				expect(JSON.stringify(captured[1].tools)).toBe(JSON.stringify(parentTools));
+				expect(characters).toEqual([
+					JSON.stringify(parentTools).length,
+					JSON.stringify(captured[1].tools).length,
+				]);
 				expect(captured[1].identity).toEqual(captured[0].identity);
 				expect(resolutions).toBe(1);
 			} finally {

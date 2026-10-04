@@ -114,6 +114,46 @@ afterAll(() => {
 });
 
 describe("fork materializes only post-compact refs", () => {
+	test("full fork inherits cached characters while fresh fork stays zero without backfilling legacy messages", async () => {
+		const { tailMessageId } = await seedParentWithCompact();
+		await db
+			.update(narrators)
+			.set({
+				contextSummary: "legacy summary",
+				contextSummaryChars: 4,
+				contextSystemChars: 20,
+				contextToolsChars: 30,
+			})
+			.where(eq(narrators.id, "parent"));
+		const chars = { segments: [{ category: "assistant" as const, chars: 12 }] };
+		await db
+			.update(narratorMessages)
+			.set({ contextCharsJson: chars })
+			.where(eq(narratorMessages.id, tailMessageId));
+		const full = await narratorService.forkNarrator("parent", null, {
+			inheritMode: "full",
+			standalone: true,
+		});
+		expect(full.contextSummaryChars).toBe(4);
+		expect(full.contextSystemChars).toBe(20);
+		expect(full.contextToolsChars).toBe(30);
+		const sharedMessage = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, tailMessageId),
+		});
+		expect(sharedMessage?.contextCharsJson).toEqual(chars);
+		const legacyMessage = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, "parent-new-5"),
+		});
+		expect(legacyMessage?.contextCharsJson).toBeNull();
+		const fresh = await narratorService.forkNarrator("parent", null, {
+			inheritMode: "fresh",
+			standalone: true,
+		});
+		expect(fresh.contextSummaryChars).toBe(0);
+		expect(fresh.contextSystemChars).toBe(0);
+		expect(fresh.contextToolsChars).toBe(0);
+	});
+
 	test("copies the post-compact tail and records the backfill boundary", async () => {
 		const { tailMessageId } = await seedParentWithCompact();
 

@@ -12,6 +12,10 @@ import {
 	RECENT_TABS_WS_BATCH_SIZE,
 } from "@shared/recent-tabs";
 import type { ServerWebSocket } from "bun";
+import {
+	measureSerializedCharacters,
+	queueContextCharacterRefresh,
+} from "../lib/context-characters";
 import { toolInputStreamSource } from "../services/tool-input-stream-source";
 
 export const MAX_NARRATOR_SUBSCRIPTIONS_PER_CONNECTION =
@@ -2386,16 +2390,24 @@ export const handleNarratorWS = {
 					// so it survives page refresh.
 					try {
 						const row = db
-							.select({ id: narratorToolCalls.id, inputJson: narratorToolCalls.inputJson })
+							.select({
+								id: narratorToolCalls.id,
+								messageId: narratorToolCalls.messageId,
+								inputJson: narratorToolCalls.inputJson,
+							})
 							.from(narratorToolCalls)
 							.where(eq(narratorToolCalls.toolUseId, msg.toolUseId))
 							.get();
 						if (row) {
 							const input = row.inputJson && typeof row.inputJson === "object" ? row.inputJson : {};
 							db.update(narratorToolCalls)
-								.set({ inputJson: { ...input, timeout: newMs } })
+								.set({
+									inputJson: { ...input, timeout: newMs },
+									inputChars: measureSerializedCharacters({ ...input, timeout: newMs }),
+								})
 								.where(eq(narratorToolCalls.id, row.id))
 								.run();
+							queueContextCharacterRefresh(msg.narratorId, row.messageId);
 						}
 					} catch (err) {
 						logger.warn("Failed to persist updated timeout", {

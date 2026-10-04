@@ -786,7 +786,8 @@ export class RevertHistoryCommitService {
 		for (const [id, bytes] of messageSizes) {
 			const message = messageById.get(id);
 			if (!message) throw fail("MANIFEST_INVALID", "Unknown rewrite");
-			const columns = message.action === "copy_on_write" ? MESSAGE_COLUMNS : ["content_json"];
+			const columns =
+				message.action === "copy_on_write" ? MESSAGE_COLUMNS : ["content_json", "role"];
 			bodies.set(
 				id,
 				this.one<Row>(
@@ -816,7 +817,12 @@ export class RevertHistoryCommitService {
 			if (!original || typeof original.content_json !== "string")
 				throw fail("BODY_INVALID", "No raw body");
 			const selectedBlocks = blocks.get(message.id) ?? [];
-			const rewritten = await worker.rewrite(message, selectedBlocks, original.content_json);
+			const rewritten = await worker.rewrite(
+				message,
+				selectedBlocks,
+				original.content_json,
+				String(original.role),
+			);
 			this.check(work);
 			producedBytes += rewritten.bytes;
 			bound(producedBytes, FILE_CHANGE_LIMITS.historyCowBytes, "rewritten body bytes");
@@ -826,6 +832,7 @@ export class RevertHistoryCommitService {
 			const patch: Row = {
 				content_json: rewritten.body,
 				content_text: rewritten.text,
+				context_chars_json: rewritten.contextCharsJson,
 				...(invalidBoundary ? { tree_hash_after: null, snapshot_commit_sha: null } : {}),
 			};
 			if (message.action === "rewrite") {
@@ -1182,7 +1189,7 @@ function fail(code: string, message: string) {
 	return new RevertHistoryCommitError(code, message);
 }
 
-type Rewritten = { body: string; text: string | null; bytes: number };
+type Rewritten = { body: string; text: string | null; bytes: number; contextCharsJson: string };
 class RewriteWorker {
 	private worker: Worker | undefined;
 	private termination: Promise<number> | undefined;
@@ -1194,6 +1201,7 @@ class RewriteWorker {
 		message: RevertSelectionMessage,
 		blocks: RevertSelectionBlock[],
 		body: string,
+		role: string,
 	): Promise<Rewritten> {
 		this.signal.throwIfAborted();
 		if (!this.worker) {
@@ -1220,6 +1228,7 @@ class RewriteWorker {
 				message,
 				blocks,
 				body,
+				role,
 				limit: FILE_CHANGE_LIMITS.historyCowBytes,
 			});
 		});
@@ -1238,11 +1247,64 @@ class RewriteWorker {
 /** Parsing and hashing even a single 4MiB message runs off the main thread. Retained JSON
  * element substrings are copied verbatim (large numbers, escapes, whitespace and key order
  * survive); all other SQL JSON strings are copied without decoding/re-encoding at all. */
-const REWRITE_WORKER = `
+export const REWRITE_WORKER = `
 const { parentPort } = require('node:worker_threads');
 const { createHash } = require('node:crypto');
 const hash = value => createHash('sha256').update(value).digest('hex');
-parentPort.on('message', ({message, blocks, body, limit}) => {
+// Fixed worker implementation: no source-file imports or executable request payloads.
+// Representative block/role cases are compared against context-characters.ts in tests.
+function measureCharacters(role, blocks, contentText) {
+ if (role === 'disp') return {segments: []};
+ const segments = [];
+ const userTextParts = [];
+ const addChars = (category, chars) => {
+  if (!Number.isSafeInteger(chars) || chars <= 0) return;
+  const previous = segments[segments.length - 1];
+  if (previous && previous.category === category && !previous.toolUseId) previous.chars += chars;
+  else segments.push({category, chars});
+ };
+ const add = (category, text) => { if (typeof text === 'string') { if (category === 'user') userTextParts.push(text); addChars(category, text.length); } };
+ const category = role === 'user' ? 'user' : role === 'assistant' ? 'assistant' : role === 'sys' || role === 'system' ? 'system' : 'other';
+ for (const block of blocks) {
+  if (!block || typeof block !== 'object') continue;
+  switch (block.type) {
+   case 'tool_use': {
+    const toolUseId = typeof block.id === 'string' ? block.id : block.toolUseId;
+    if (typeof toolUseId === 'string') segments.push({category: 'toolCall', chars: 0, toolUseId});
+    break;
+   }
+   case 'tool_result': case 'image': case 'redacted_thinking': case 'info': case 'error': case 'compact':
+    break;
+   case 'segment_compact':
+    if (block.status !== 'compacting' && block.status !== 'failed') add('summary', block.summary);
+    break;
+   case 'file_reference':
+    add('attachment', block.snapshotText);
+    break;
+   case 'text_file': {
+    const text = block.text ?? block.content;
+    const chars = block.contentChars ?? block.chars;
+    if (typeof text === 'string') add('attachment', text);
+    else if (typeof chars === 'number') addChars('attachment', chars);
+    break;
+   }
+   case 'attachment': case 'document':
+    add('attachment', block.text ?? block.content ?? block.source?.text);
+    break;
+   case 'thinking':
+    add(category, block.thinking ?? block.text);
+    break;
+   default:
+    add(category, block.modelText ?? block.text);
+  }
+ }
+ if (role === 'user' && typeof contentText === 'string' && blocks.some(block => block?.type === 'text_file')) {
+  const body = userTextParts.join('\\n');
+  if (contentText.startsWith(body)) addChars('attachment', contentText.length - body.length);
+ }
+ return {segments};
+}
+parentPort.on('message', ({message, blocks, body, role, limit}) => {
  try {
   if (Buffer.byteLength(body) > limit || hash(body) !== message.contentDigest) throw Error('Raw body commitment changed');
   const parsed = JSON.parse(body);
@@ -1274,7 +1336,9 @@ parentPort.on('message', ({message, blocks, body, limit}) => {
   const rewritten = '[' + kept.join(',') + ']'; const text = texts.join('\\n') || null;
   const bytes = Buffer.byteLength(rewritten) + (text ? Buffer.byteLength(text) : 0);
   if (bytes > limit) throw Error('Rewritten body exceeds byte budget');
-  parentPort.postMessage({body: rewritten, text, bytes});
+  const retainedBlocks = parsed.filter((_, i) => blocks[i].action === 'retain');
+  const contextCharsJson = JSON.stringify(measureCharacters(role, retainedBlocks, text));
+  parentPort.postMessage({body: rewritten, text, bytes, contextCharsJson});
  } catch (error) { parentPort.postMessage({error: error.message}); }
 });
 `;

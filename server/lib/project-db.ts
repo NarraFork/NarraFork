@@ -33,6 +33,7 @@ const PROJECT_DB_SCHEMA_PATCHES: Array<{
 	{
 		table: "narrator_messages",
 		columns: [
+			{ name: "context_chars_json", type: "TEXT" },
 			{ name: "cost_status", type: "TEXT" },
 			{ name: "cost_missing_fields", type: "TEXT" },
 			{ name: "provider", type: "TEXT" },
@@ -50,6 +51,8 @@ const PROJECT_DB_SCHEMA_PATCHES: Array<{
 	{
 		table: "narrator_tool_calls",
 		columns: [
+			{ name: "input_chars", type: "INTEGER NOT NULL DEFAULT 0" },
+			{ name: "output_chars", type: "INTEGER NOT NULL DEFAULT 0" },
 			{ name: "execution_device_id", type: "TEXT" },
 			{ name: "execution_cwd", type: "TEXT" },
 			{ name: "resolved_file_path", type: "TEXT" },
@@ -59,6 +62,10 @@ const PROJECT_DB_SCHEMA_PATCHES: Array<{
 	{
 		table: "narrators",
 		columns: [
+			{ name: "context_summary_chars", type: "INTEGER NOT NULL DEFAULT 0" },
+			{ name: "context_system_chars", type: "INTEGER NOT NULL DEFAULT 0" },
+			{ name: "context_tools_chars", type: "INTEGER NOT NULL DEFAULT 0" },
+			{ name: "context_char_revision", type: "INTEGER NOT NULL DEFAULT 0" },
 			{ name: "substatus", type: "TEXT NOT NULL DEFAULT '[]'" },
 			{ name: "variant", type: "TEXT NOT NULL DEFAULT 'primary'" },
 			{ name: "traits", type: "TEXT NOT NULL DEFAULT '[]'" },
@@ -232,6 +239,10 @@ CREATE TABLE IF NOT EXISTS narrators (
 	reasoning_effort TEXT,
 	previous_permission_mode TEXT,
 	plan_file_id TEXT,
+	context_summary_chars INTEGER NOT NULL DEFAULT 0,
+	context_system_chars INTEGER NOT NULL DEFAULT 0,
+	context_tools_chars INTEGER NOT NULL DEFAULT 0,
+	context_char_revision INTEGER NOT NULL DEFAULT 0,
 	updated_at TEXT NOT NULL
 );
 
@@ -262,6 +273,7 @@ CREATE TABLE IF NOT EXISTS narrator_messages (
 	meter_usage REAL,
 	meter_unit TEXT,
 	commit_sha TEXT,
+	context_chars_json TEXT,
 	created_at TEXT NOT NULL
 );
 
@@ -281,6 +293,8 @@ CREATE TABLE IF NOT EXISTS narrator_tool_calls (
 	tool_name TEXT NOT NULL,
 	input_json TEXT,
 	output_json TEXT,
+	input_chars INTEGER NOT NULL DEFAULT 0,
+	output_chars INTEGER NOT NULL DEFAULT 0,
 	execution_device_id TEXT,
 	execution_cwd TEXT,
 	resolved_file_path TEXT,

@@ -121,6 +121,7 @@ import { useCompactSummaryModal } from "./compact/use-compact-summary-modal";
 import type { FileReferenceScopeValue } from "./composer/FileReferenceScope";
 import type { NarratorComposerHandle, NarratorRemoteDraft } from "./composer/NarratorComposer";
 import { ContentViewerEnvironmentProvider } from "./content/ContentViewer";
+import { ContextCompositionModal } from "./context-management/ContextCompositionModal";
 import {
 	type ContextManagementDraft,
 	DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
@@ -2594,6 +2595,7 @@ function NarratorPanelBody({
 		if (!revertHistorySubmitting) setPendingBlockDelete(null);
 	}, [revertHistorySubmitting, setPendingBlockDelete]);
 
+	const [contextCompositionOpened, setContextCompositionOpened] = useState(false);
 	if (!narrator) return <NarratorPanelSkeleton />;
 
 	const statusBarDisplay = getNarratorStatusBarDisplay({
@@ -2657,7 +2659,13 @@ function NarratorPanelBody({
 			: "Context";
 	const contextRingNode = (
 		<Box
+			component="button"
+			type="button"
+			aria-label={t("contextComposition.title")}
 			style={{
+				border: 0,
+				padding: 0,
+				background: "transparent",
 				position: "relative",
 				width: 24,
 				height: 24,
@@ -2710,68 +2718,83 @@ function NarratorPanelBody({
 	const contextIndicator = isWorkspacePreview ? (
 		contextRingNode
 	) : (
-		<Menu position="top-start">
-			<Menu.Target>{contextRingNode}</Menu.Target>
-			<Menu.Dropdown>
-				{contextStale && (
-					<Menu.Label c="orange" fz={10} style={{ maxWidth: 240, whiteSpace: "normal" }}>
-						{t("contextStaleHint")}
+		<>
+			{contextCompositionOpened && (
+				<ContextCompositionModal
+					opened={contextCompositionOpened}
+					onClose={() => setContextCompositionOpened(false)}
+					narratorId={narratorId}
+				/>
+			)}
+			<Menu position="top-start">
+				<Menu.Target>{contextRingNode}</Menu.Target>
+				<Menu.Dropdown>
+					<Menu.Item onClick={() => setContextCompositionOpened(true)}>
+						{t("contextComposition.title")}
+					</Menu.Item>
+					<Menu.Divider />
+					{contextStale && (
+						<Menu.Label c="orange" fz={10} style={{ maxWidth: 240, whiteSpace: "normal" }}>
+							{t("contextStaleHint")}
+						</Menu.Label>
+					)}
+					<Menu.Label c="dimmed" fz={10}>
+						{t("activeThresholds", {
+							compact: activeCompactStart ?? modelThresholds?.compactStart,
+						})}
 					</Menu.Label>
-				)}
-				<Menu.Label c="dimmed" fz={10}>
-					{t("activeThresholds", {
-						compact: activeCompactStart ?? modelThresholds?.compactStart,
-					})}
-				</Menu.Label>
-				<Menu.Item
-					leftSection={<IconSettings size={14} />}
-					c="dimmed"
-					fz="xs"
-					onClick={handleOpenContextThresholdSettings}
-				>
-					{t("thresholdSettings")}
-				</Menu.Item>
-				<Menu.Divider />
-				{hasContextData && (
-					<Menu.Label>
-						{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
-					</Menu.Label>
-				)}
-				{promptTokens != null && (
-					<Menu.Label>
-						{contextWindow != null
-							? t("contextUsageTokensWithWindow", {
-									tokens: formatLocaleNumber(promptTokens),
-									window: formatLocaleNumber(contextWindow),
-								})
-							: t("contextUsageTokens", {
-									tokens: formatLocaleNumber(promptTokens),
-								})}
-						{isEstimated && <span style={{ opacity: 0.6, marginLeft: 4 }}>({t("estimated")})</span>}
-					</Menu.Label>
-				)}
-				<Menu.Divider />
-				<Menu.Item
-					leftSection={<IconArrowsMinimize size={14} />}
-					onClick={() => {
-						// Compacting state will arrive via substatus_change WS event
-						api.triggerCompact(narratorId).catch((err) => {
-							handleCompactError(err);
-						});
-					}}
-				>
-					{t("triggerCompact")}
-				</Menu.Item>
-				<Menu.Item
-					leftSection={<IconEraser size={14} />}
-					onClick={() => {
-						api.clearContext(narratorId).catch(() => {});
-					}}
-				>
-					{t("clearContext")}
-				</Menu.Item>
-			</Menu.Dropdown>
-		</Menu>
+					<Menu.Item
+						leftSection={<IconSettings size={14} />}
+						c="dimmed"
+						fz="xs"
+						onClick={handleOpenContextThresholdSettings}
+					>
+						{t("thresholdSettings")}
+					</Menu.Item>
+					<Menu.Divider />
+					{hasContextData && (
+						<Menu.Label>
+							{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
+						</Menu.Label>
+					)}
+					{promptTokens != null && (
+						<Menu.Label>
+							{contextWindow != null
+								? t("contextUsageTokensWithWindow", {
+										tokens: formatLocaleNumber(promptTokens),
+										window: formatLocaleNumber(contextWindow),
+									})
+								: t("contextUsageTokens", {
+										tokens: formatLocaleNumber(promptTokens),
+									})}
+							{isEstimated && (
+								<span style={{ opacity: 0.6, marginLeft: 4 }}>({t("estimated")})</span>
+							)}
+						</Menu.Label>
+					)}
+					<Menu.Divider />
+					<Menu.Item
+						leftSection={<IconArrowsMinimize size={14} />}
+						onClick={() => {
+							// Compacting state will arrive via substatus_change WS event
+							api.triggerCompact(narratorId).catch((err) => {
+								handleCompactError(err);
+							});
+						}}
+					>
+						{t("triggerCompact")}
+					</Menu.Item>
+					<Menu.Item
+						leftSection={<IconEraser size={14} />}
+						onClick={() => {
+							api.clearContext(narratorId).catch(() => {});
+						}}
+					>
+						{t("clearContext")}
+					</Menu.Item>
+				</Menu.Dropdown>
+			</Menu>
+		</>
 	);
 
 	// Configuration controls stay fixed; movable tools follow the saved bottom order.

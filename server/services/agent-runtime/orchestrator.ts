@@ -32,6 +32,7 @@ import {
 	resolveAutoContinuationMode,
 	resolveBooleanOverride,
 } from "../../lib/boolean-override";
+import { queueContextCharacterRefresh } from "../../lib/context-characters";
 import { withDbRetry } from "../../lib/db-resilience";
 import { resolveInjectedDevices } from "../../lib/device-injection-trait";
 import { resolveFastModeForUser } from "../../lib/fast-mode";
@@ -236,6 +237,7 @@ import { buildRuntimeHistory } from "./history";
 import { createRuntimeRunState, type RuntimeProfile, type RuntimeRunOutcome } from "./input";
 import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
 import { resolveRuntimePolicy } from "./policy";
+import { countRuntimeSystemCharacters } from "./prompt-characters";
 import type { RuntimeRecoveryState, RuntimeRecoveryTransition } from "./transition";
 import { selectRuntimeInterruption, selectRuntimeRecovery } from "./transition";
 
@@ -681,7 +683,25 @@ export async function runAgentLoopUnlocked(
 			}
 			runState.firstPass = false;
 
-			const { prompt: freshSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
+			const storeRuntimeCharacters = async (values: {
+				systemChars?: number;
+				toolsChars?: number;
+			}) => {
+				try {
+					const { storeContextRuntimeCharacters } = await import("../narrator-context-composition");
+					await storeContextRuntimeCharacters(narratorId, values);
+				} catch (error) {
+					logger.warn("Failed to store context runtime characters", {
+						narratorId,
+						error: String(error),
+					});
+				}
+			};
+			const {
+				prompt: freshSystemPrompt,
+				usedCompactSummary,
+				summaryRange,
+			} = await buildSystemPrompt(
 				{
 					systemPrompt: oauthRuntime
 						? (oauthRuntime.systemPrompt ?? null)
@@ -709,6 +729,13 @@ export async function runAgentLoopUnlocked(
 						? await profile.rebuildSystemPrompt(freshNarrator.contextSummary)
 						: profile.systemPrompt
 					: freshSystemPrompt;
+			await storeRuntimeCharacters({
+				systemChars: countRuntimeSystemCharacters(
+					active.systemPrompt,
+					freshNarrator.contextSummary,
+					profile.kind === "primary" ? summaryRange : undefined,
+				),
+			});
 			active._usedCompactSummary = usedCompactSummary;
 
 			const eventContext: EventHandlerContext = createRuntimeEventContext({
@@ -780,15 +807,20 @@ export async function runAgentLoopUnlocked(
 				},
 				rebuildSystemPrompt: async () => {
 					const freshNarrator = await narratorService.getById(narratorId);
-					if (profile.kind === "subagent")
-						return profile.rebuildSystemPrompt
-							? profile.rebuildSystemPrompt(freshNarrator.contextSummary)
+					if (profile.kind === "subagent") {
+						const prompt = profile.rebuildSystemPrompt
+							? await profile.rebuildSystemPrompt(freshNarrator.contextSummary)
 							: profile.systemPrompt;
+						await storeRuntimeCharacters({
+							systemChars: countRuntimeSystemCharacters(prompt, freshNarrator.contextSummary),
+						});
+						return prompt;
+					}
 					const freshOAuthRuntime = await assertOAuthNarratorRuntimeActive(
 						narratorId,
 						active._currentUserId,
 					);
-					const { prompt } = await buildSystemPrompt(
+					const { prompt, summaryRange } = await buildSystemPrompt(
 						{
 							systemPrompt: freshOAuthRuntime
 								? (freshOAuthRuntime.systemPrompt ?? null)
@@ -809,6 +841,13 @@ export async function runAgentLoopUnlocked(
 						// model being told to write somewhere the gate then rejects.
 						active._planFilePath,
 					);
+					await storeRuntimeCharacters({
+						systemChars: countRuntimeSystemCharacters(
+							prompt,
+							freshNarrator.contextSummary,
+							summaryRange,
+						),
+					});
 					// NOTE: Do NOT set active.systemPrompt here — the returned value
 					// flows through onBeforeTurn → loop.ts which updates config.systemPrompt.
 					// Setting active.systemPrompt would create a second source of truth.
@@ -957,8 +996,13 @@ export async function runAgentLoopUnlocked(
 					if (!active._usedCompactSummary) return;
 					await db
 						.update(narrators)
-						.set({ contextSummary: null, updatedAt: new Date().toISOString() })
+						.set({
+							contextSummary: null,
+							contextSummaryChars: 0,
+							updatedAt: new Date().toISOString(),
+						})
 						.where(eq(narrators.id, narratorId));
+					queueContextCharacterRefresh(narratorId);
 					active._usedCompactSummary = false;
 				},
 				onToolResult: (event) => {
@@ -1179,6 +1223,7 @@ export async function runAgentLoopUnlocked(
 							}
 						: undefined,
 				systemPrompt: active.systemPrompt ?? undefined,
+				onToolsCharacters: (toolsChars) => storeRuntimeCharacters({ toolsChars }),
 				locale,
 				signal: active.abortController.signal,
 				guidanceSignal: active._guidanceAbortController.signal,

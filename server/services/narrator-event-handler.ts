@@ -28,6 +28,7 @@ import {
 	finishApiRequest,
 	startApiRequest,
 } from "../lib/api-request-tracker";
+import { measureMessageCharacters, queueContextCharacterRefresh } from "../lib/context-characters";
 import { updateCustomApiQuotaByPrefix } from "../lib/custom-api-quota-cache";
 import { withDbRetry } from "../lib/db-resilience";
 import { eventBus } from "../lib/event-bus";
@@ -1019,7 +1020,11 @@ async function discardAttemptPersistedBlocks(
 
 		await db
 			.update(narratorMessages)
-			.set({ contentJson: nextBlocks, contentText: contentText || null })
+			.set({
+				contentJson: nextBlocks,
+				contentText: contentText || null,
+				contextCharsJson: measureMessageCharacters("assistant", nextBlocks, contentText),
+			})
 			.where(eq(narratorMessages.id, partialId));
 
 		logger.info("Discarded persisted blocks of a replayed attempt", {
@@ -1037,6 +1042,7 @@ async function discardAttemptPersistedBlocks(
 		// Publish the truncated row (and bump the sync version, mirroring every other
 		// message mutation) so an attached client and a reconnecting one agree.
 		await bumpNarratorMessageVersion(narratorId);
+		queueContextCharacterRefresh(narratorId, partialId);
 		const updated = await db.query.narratorMessages.findFirst({
 			where: eq(narratorMessages.id, partialId),
 			with: { toolCalls: true },
@@ -2031,8 +2037,16 @@ export async function processEvent(
 				if (reorderedContent) {
 					await db
 						.update(narratorMessages)
-						.set({ contentJson: reorderedContent })
+						.set({
+							contentJson: reorderedContent,
+							contextCharsJson: measureMessageCharacters(
+								"assistant",
+								reorderedContent,
+								fullMessage.contentText,
+							),
+						})
 						.where(eq(narratorMessages.id, savedId));
+					queueContextCharacterRefresh(narratorId, savedId);
 					fullMessage = { ...fullMessage, contentJson: reorderedContent };
 				}
 			}

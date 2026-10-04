@@ -2,6 +2,10 @@ import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
 import {
+	measureSerializedCharacters,
+	queueContextCharacterRefresh,
+} from "../lib/context-characters";
+import {
 	flushRuntimePublications,
 	getRuntimePublicationService,
 } from "./agent-runtime/publication";
@@ -777,12 +781,13 @@ async function finalizeInterruptedRecoveryParent(
 	}
 	const ordinary = interruptedToolResults.filter((record) => record.kind !== "send_await");
 	if (ordinary.length > 0) {
-		await db
+		const changed = await db
 			.update(narratorToolCalls)
 			.set({
 				status: "fail",
 				errorMessage,
 				outputJson: getToolMessage("interruptedByUser", locale),
+				outputChars: measureSerializedCharacters(getToolMessage("interruptedByUser", locale)),
 				completedAt: new Date().toISOString(),
 			})
 			.where(
@@ -793,7 +798,9 @@ async function finalizeInterruptedRecoveryParent(
 					),
 					inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
 				),
-			);
+			)
+			.returning({ messageId: narratorToolCalls.messageId });
+		for (const row of changed) queueContextCharacterRefresh(narratorId, row.messageId);
 	}
 	await narratorService.updateStatus(narratorId, "idle", {
 		substatus: ["interrupted"],

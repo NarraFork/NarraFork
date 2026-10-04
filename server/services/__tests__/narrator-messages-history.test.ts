@@ -1,6 +1,12 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { narratorMessageRefs, narratorMessages, narratorToolCalls } from "../../db/schema";
+import {
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+} from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
 for (const statement of [
@@ -70,6 +76,32 @@ afterAll(() => {
 });
 
 describe("narrator model history projection", () => {
+	test("summary editing caches UTF-16 characters without counting the global marker twice", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "compact-chars",
+			narratorId: "n1",
+			seq: 1,
+			role: "system",
+			isCompact: true,
+			contentJson: [{ type: "compact", status: "compacted", summary: "legacy" }],
+		});
+		const updatedId = await narratorMessageQueries.updateCompactSummary(
+			"n1",
+			"compact-chars",
+			"中文😀",
+		);
+		const narrator = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
+		const marker = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, updatedId),
+		});
+		expect(narrator?.contextSummaryChars).toBe(4);
+		expect(marker?.contextCharsJson).toEqual({ segments: [] });
+		await narratorMessageQueries.deleteCompactMessage("n1", updatedId);
+		const cleared = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
+		expect(cleared?.contextSummaryChars).toBe(0);
+	});
+
 	test("model and compact input exclude persisted display receipts but retain sys", async () => {
 		await seedNarrator();
 		await seedMessage({

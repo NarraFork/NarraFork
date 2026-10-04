@@ -31,6 +31,7 @@ const ALLOWED_DESCRIPTION = "Reads a file; allowed in plan mode";
 
 /** Snapshot of each `formatTools` call: what the provider would have been sent. */
 const formatToolsCalls: Array<Array<{ name: string; description: string }>> = [];
+const formattedToolCharacters: number[] = [];
 
 /** Flipped by the test between turns, standing in for a manual toggle. */
 let livePlanMode = false;
@@ -43,6 +44,7 @@ const testProvider: ProviderAdapter = {
 				description: typeof tool.description === "string" ? tool.description : "",
 			})),
 		);
+		formattedToolCharacters.push(JSON.stringify(tools).length);
 		return tools;
 	},
 	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
@@ -139,10 +141,60 @@ async function drain(config: AgentConfig): Promise<AgentEvent[]> {
 
 function resetRun(): void {
 	formatToolsCalls.length = 0;
+	formattedToolCharacters.length = 0;
 	turnsServed = 0;
 }
 
 describe("plan mode tool descriptions", () => {
+	test("reports actual serialized tools once initially and again after a refresh", async () => {
+		resetRun();
+		livePlanMode = false;
+		const counts: number[] = [];
+		await drain(
+			makeLivePlanModeConfig({
+				onToolsCharacters: (chars) => {
+					counts.push(chars);
+				},
+				onBeforeTurn: async () => {
+					livePlanMode = true;
+					return null;
+				},
+			}),
+		);
+		expect(counts).toEqual(formattedToolCharacters);
+		expect(counts).toHaveLength(2);
+	});
+
+	test("does not count unchanged tools again on a later turn", async () => {
+		resetRun();
+		livePlanMode = false;
+		const counts: number[] = [];
+		await drain(
+			makeLivePlanModeConfig({
+				onToolsCharacters: (chars) => {
+					counts.push(chars);
+				},
+				onBeforeTurn: async () => null,
+			}),
+		);
+		expect(counts).toEqual(formattedToolCharacters);
+		expect(counts).toHaveLength(1);
+	});
+
+	test("a failed statistics callback does not interrupt the AI request", async () => {
+		resetRun();
+		livePlanMode = false;
+		const events = await drain(
+			makeLivePlanModeConfig({
+				onToolsCharacters: async () => {
+					throw new Error("statistics unavailable");
+				},
+			}),
+		);
+		expect(turnsServed).toBe(2);
+		expect(events.some((event) => event.type === "error")).toBe(false);
+	});
+
 	test("blanks forbidden tool descriptions when plan mode is on at pass start", async () => {
 		resetRun();
 		livePlanMode = true;

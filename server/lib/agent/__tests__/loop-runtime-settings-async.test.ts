@@ -184,9 +184,19 @@ describe("asynchronous runtime settings at real provider request boundaries", ()
 		expect(requests).toHaveLength(0);
 	});
 
-	test("existing synchronous overrides remain supported", async () => {
-		await drain(config({ getRuntimeSettingsOverride: () => ({ model: B }) }));
+	test("existing synchronous overrides remain supported and count the refreshed tools", async () => {
+		const characters: number[] = [];
+		await drain(
+			config({
+				getRuntimeSettingsOverride: () => ({ model: B }),
+				onToolsCharacters: (chars) => {
+					characters.push(chars);
+				},
+			}),
+		);
 		expect(requests.map((request) => request.model)).toEqual([B]);
+		expect(characters).toHaveLength(2);
+		expect(characters.at(-1)).toBe(JSON.stringify(requests[0].tools).length);
 	});
 
 	test("a failing retry probe is treated as no pending switch instead of aborting the turn", async () => {
