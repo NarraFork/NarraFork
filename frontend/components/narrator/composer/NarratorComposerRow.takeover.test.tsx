@@ -158,6 +158,60 @@ async function renderRow(props: NarratorComposerRowProps) {
 	});
 }
 
+describe("NarratorComposerRow idle send label", () => {
+	for (const mode of ["turn", "tool", "interrupt"] as const) {
+		for (const canCutInLine of [false, true]) {
+			test(`idle input shows Send for ${mode} preference, cut-in=${canCutInLine}`, async () => {
+				const send = mock(() => {});
+				const queueClick = mock(() => {});
+				await renderRow(
+					baseProps({
+						isActive: false,
+						composerHasText: true,
+						enterQueueMode: mode,
+						canCutInLine,
+						onSend: send,
+						handleQueueClick: queueClick,
+					}),
+				);
+				const button = Array.from(host.querySelectorAll("button")).find(
+					(element) => element.textContent?.trim() === "Send",
+				);
+				expect(button).toBeDefined();
+				expect(host.textContent).not.toContain(`queueMode_${mode}`);
+				await act(async () => button?.dispatchEvent(new Event("click", { bubbles: true })));
+				expect(canCutInLine ? queueClick : send).toHaveBeenCalledTimes(1);
+			});
+		}
+	}
+
+	test("finishing work changes the primary label from the queue mode to Send", async () => {
+		await renderRow(baseProps({ isActive: true, composerHasText: true }));
+		expect(host.textContent).toContain("queueMode_turn");
+		await renderRow(baseProps({ isActive: false, composerHasText: true, canCutInLine: false }));
+		expect(host.textContent).toContain("Send");
+		expect(host.textContent).not.toContain("queueMode_turn");
+	});
+
+	test("idle attachment-only input shows Send, including background compaction", async () => {
+		for (const compacting of [false, true]) {
+			await renderRow(
+				baseProps({
+					isActive: false,
+					composerHasAttachments: true,
+					canCutInLine: false,
+					showCompactQueueChoice: compacting,
+				}),
+			);
+			const button = Array.from(host.querySelectorAll("button")).find(
+				(element) => element.textContent?.trim() === "Send",
+			);
+			expect(button).toBeDefined();
+			expect(button?.disabled).toBe(false);
+		}
+	});
+});
+
 describe("NarratorComposerRow takeover input visibility", () => {
 	test("canTakeover empty subagent keeps the input and paints Take over", async () => {
 		await renderRow(baseProps({ canTakeover: true, isActive: true }));
