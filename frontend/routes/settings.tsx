@@ -9,36 +9,7 @@ import {
 	Text,
 	Transition,
 } from "@mantine/core";
-import {
-	IconApps,
-	IconArrowLeft,
-	IconBell,
-	IconBox,
-	IconBrain,
-	IconCloud,
-	IconCpu,
-	IconDatabase,
-	IconDeviceLaptop,
-	IconHistory,
-	IconInfoCircle,
-	IconKey,
-	IconMessageCircle,
-	IconPalette,
-	IconPlayerPlay,
-	IconPlugConnected,
-	IconPuzzle,
-	IconReceipt2,
-	IconRoute,
-	IconSearch,
-	IconServer,
-	IconShield,
-	IconShieldLock,
-	IconSitemap,
-	IconTerminal2,
-	IconUser,
-	IconUsers,
-	IconWand,
-} from "@tabler/icons-react";
+import { IconArrowLeft, IconShieldLock, IconWand } from "@tabler/icons-react";
 import { createFileRoute, Link, Navigate, Outlet, useRouterState } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../hooks/useAuth";
@@ -48,6 +19,12 @@ import {
 	useSettingsValidationCapability,
 } from "../hooks/usePlatform";
 import { APP_VIEWPORT_BOTTOM, SAFE_AREA_INSET_BOTTOM } from "../lib/safe-area";
+import {
+	getSettingsNavGroups,
+	getVisibleSettingsNavItems,
+	isAdminPath,
+	type SettingsNavItem,
+} from "../lib/settings-nav";
 
 export const Route = createFileRoute("/settings")({
 	component: SettingsLayout,
@@ -55,45 +32,6 @@ export const Route = createFileRoute("/settings")({
 
 /** Viewport minus the header offset and Main's own vertical gutters. */
 const SETTINGS_SIDEBAR_HEIGHT = `calc(${APP_VIEWPORT_BOTTOM} - 92px)`;
-
-interface NavItem {
-	to: string;
-	label: string;
-	icon: React.ReactNode;
-}
-
-/** Paths that require admin role */
-const ADMIN_PATHS = new Set([
-	"/settings/providers",
-	"/settings/search",
-	"/settings/proxy",
-	"/settings/chapters",
-	"/settings/server",
-	// Models and agent defaults are instance-wide (PATCH /api/settings), not per-user.
-	"/settings/models",
-	"/settings/agent",
-	"/settings/authentication",
-	"/settings/oauth-apps",
-	"/settings/users",
-	"/settings/terminals",
-	// NOT admin-only: any user may register and manage their own remote devices.
-	// The page hides the admin-only actions (transfers, global scope) itself, and
-	// the API enforces the same boundary per endpoint.
-	"/settings/storage",
-	"/settings/runtime",
-	"/settings/usage",
-	"/settings/execution-log",
-	"/settings/plugins",
-]);
-
-/** Exact match or sub-path of an admin-only page (e.g. /settings/plugins/:id). */
-function isAdminPath(pathname: string): boolean {
-	if (ADMIN_PATHS.has(pathname)) return true;
-	for (const adminPath of ADMIN_PATHS) {
-		if (pathname.startsWith(`${adminPath}/`)) return true;
-	}
-	return false;
-}
 
 function SettingsLayout() {
 	const { data: user } = useCurrentUser();
@@ -108,93 +46,10 @@ function SettingsLayout() {
 		window.dispatchEvent(new CustomEvent("narrafork:open-wizard"));
 	};
 
-	const personalItems: NavItem[] = [
-		{ to: "/settings/profile", label: t("profileSection"), icon: <IconUser size={18} /> },
-		{ to: "/settings/security", label: t("securitySection"), icon: <IconShieldLock size={18} /> },
-		{
-			to: "/settings/integrations",
-			label: t("integrationsSection"),
-			icon: <IconRoute size={18} />,
-		},
-		{
-			to: "/settings/connected-apps",
-			label: t("connectedAppsSection"),
-			icon: <IconPlugConnected size={18} />,
-		},
-		{
-			to: "/settings/notifications",
-			label: t("notificationSection"),
-			icon: <IconBell size={18} />,
-		},
-		{ to: "/settings/appearance", label: t("appearanceSection"), icon: <IconPalette size={18} /> },
-		{
-			to: "/settings/gateway",
-			label: t("gatewaySection"),
-			icon: <IconMessageCircle size={18} />,
-		},
-		// Personal, not instance-wide: a user registers their own machines here and
-		// sees only the devices they registered. Admins still get the full list.
-		{ to: "/settings/devices", label: t("devicesSection"), icon: <IconDeviceLaptop size={18} /> },
-	];
-
-	// Capability toggles rather than personal preferences. Grammar caching sat among
-	// account/notification/appearance settings, where it read as a preference; it decides
-	// whether structural tooling works at all, which is a different kind of thing.
-	// Still not admin-only: the grammar cache is a shared parser asset (like ripgrep), and
-	// gating it would leave non-admins stuck with heuristic structural output.
-	const enhancementItems: NavItem[] = [
-		{ to: "/settings/grammars", label: t("grammarsSection"), icon: <IconSitemap size={18} /> },
-	];
-
-	const instanceItems: NavItem[] = [
-		{ to: "/settings/providers", label: t("providersSection"), icon: <IconCloud size={18} /> },
-		{ to: "/settings/models", label: t("modelsSection"), icon: <IconCpu size={18} /> },
-		{ to: "/settings/agent", label: t("agentSection"), icon: <IconBrain size={18} /> },
-		{ to: "/settings/search", label: t("searchSection"), icon: <IconSearch size={18} /> },
-		{
-			to: "/settings/proxy",
-			label: t("proxyManagementSection"),
-			icon: <IconShield size={18} />,
-		},
-		{
-			to: "/settings/chapters",
-			label: t("chaptersAndContainersSection"),
-			icon: <IconBox size={18} />,
-		},
-		{ to: "/settings/server", label: t("serverAndSystemSection"), icon: <IconServer size={18} /> },
-		{
-			to: "/settings/authentication",
-			label: t("authenticationSection"),
-			icon: <IconKey size={18} />,
-		},
-		{
-			to: "/settings/oauth-apps",
-			label: t("oauthAppsSection"),
-			icon: <IconApps size={18} />,
-		},
-		{ to: "/settings/users", label: t("usersSection"), icon: <IconUsers size={18} /> },
-		{
-			to: "/settings/terminals",
-			label: t("terminalsSection"),
-			icon: <IconTerminal2 size={18} />,
-		},
-		{ to: "/settings/storage", label: t("storageSection"), icon: <IconDatabase size={18} /> },
-		{ to: "/settings/runtime", label: t("runtimeSection"), icon: <IconPlayerPlay size={18} /> },
-		{ to: "/settings/plugins", label: t("pluginsSection"), icon: <IconPuzzle size={18} /> },
-		{ to: "/settings/usage", label: t("usageSection"), icon: <IconReceipt2 size={18} /> },
-		{
-			to: "/settings/execution-log",
-			label: t("executionLogSection"),
-			icon: <IconHistory size={18} />,
-		},
-		{ to: "/settings/about", label: t("versionSection"), icon: <IconInfoCircle size={18} /> },
-	];
-
-	// Enhancements belong here for every user, not just admins: forgetting a group in this
-	// list is what makes the mobile picker and the active-item highlight silently skip it.
-	const allVisibleItems = isAdmin
-		? [...personalItems, ...enhancementItems, ...instanceItems]
-		: [...personalItems, ...enhancementItems];
+	// Shared with the mobile picker (`routes/settings/index.tsx`) so a new page
+	// cannot appear on one surface and silently miss the other.
+	const { personal, enhancements, instance } = getSettingsNavGroups();
+	const allVisibleItems = getVisibleSettingsNavItems(isAdmin);
 
 	// Find current page label for mobile back header
 	const currentItem = allVisibleItems.find((item) => pathname === item.to);
@@ -203,6 +58,18 @@ function SettingsLayout() {
 	if (user && !isAdmin && isAdminPath(pathname)) {
 		return <Navigate to="/settings/profile" replace />;
 	}
+
+	const renderNavItem = (item: SettingsNavItem) => (
+		<NavLink
+			key={item.to}
+			component={Link}
+			to={item.to}
+			label={t(item.labelKey)}
+			leftSection={<item.Icon size={18} />}
+			active={pathname === item.to}
+			variant="light"
+		/>
+	);
 
 	return (
 		<InstanceSettingsProvider value={instanceSettings}>
@@ -233,49 +100,19 @@ function SettingsLayout() {
 						<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="sm" pb={4}>
 							{t("personalGroup")}
 						</Text>
-						{personalItems.map((item) => (
-							<NavLink
-								key={item.to}
-								component={Link}
-								to={item.to}
-								label={item.label}
-								leftSection={item.icon}
-								active={pathname === item.to}
-								variant="light"
-							/>
-						))}
+						{personal.map(renderNavItem)}
 
 						<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
 							{t("enhancementsGroup")}
 						</Text>
-						{enhancementItems.map((item) => (
-							<NavLink
-								key={item.to}
-								component={Link}
-								to={item.to}
-								label={item.label}
-								leftSection={item.icon}
-								active={pathname === item.to}
-								variant="light"
-							/>
-						))}
+						{enhancements.map(renderNavItem)}
 
 						{isAdmin && (
 							<>
 								<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
 									{t("instanceGroup")}
 								</Text>
-								{instanceItems.map((item) => (
-									<NavLink
-										key={item.to}
-										component={Link}
-										to={item.to}
-										label={item.label}
-										leftSection={item.icon}
-										active={pathname === item.to}
-										variant="light"
-									/>
-								))}
+								{instance.map(renderNavItem)}
 								<NavLink
 									label={t("wizardReopen")}
 									leftSection={<IconWand size={18} />}
@@ -329,7 +166,7 @@ function SettingsLayout() {
 							>
 								<IconArrowLeft size={18} />
 								<Text size="sm" fw={500}>
-									{currentItem.label}
+									{t(currentItem.labelKey)}
 								</Text>
 							</Link>
 						</Box>

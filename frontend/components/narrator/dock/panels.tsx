@@ -6,7 +6,6 @@
  *   - chat     → NarratorPanel (primary)
  *   - terminal → NarratorTerminal (with a header bar)
  *   - details  → NarratorDetailsPanel (inline) — props from dock context
- *   - filemod  → FileModificationsPanel — props from dock context
  *   - spec     → SpecPanel
  *   - git      → GitPanel (resolves narrator workspace; chapter adapter retained)
  *   - browser  → BrowserPanel — session info from dock context
@@ -19,7 +18,6 @@ import { ActionIcon, Badge, Box, Center, Group, Loader, Text, Tooltip } from "@m
 import { notifications } from "@mantine/notifications";
 import type { FileReferenceEditorSelection, FileTarget } from "@shared/file-reference";
 import {
-	IconFileCode,
 	IconFileText,
 	IconFlask,
 	IconFolder,
@@ -79,11 +77,6 @@ const BackgroundTasksPanel = lazy(() =>
 );
 const BrowserPanel = lazy(() =>
 	import("../browser/BrowserPanel").then((m) => ({ default: m.BrowserPanel })),
-);
-const FileModificationsPanel = lazy(() =>
-	import("../file-panel/FileModificationsDrawer").then((m) => ({
-		default: m.FileModificationsPanel,
-	})),
 );
 const SpecPanel = lazy(() => import("../spec/SpecPanel").then((m) => ({ default: m.SpecPanel })));
 const AppearancePanel = lazy(() =>
@@ -576,46 +569,6 @@ export function DetailsDockPanel(props: IDockviewPanelProps<NarratorBoundPanelPa
 					opened
 					onClose={close}
 					displayMode="inline"
-					chromeless
-				/>
-			</LazyPanelBoundary>
-		</ToolPanelShell>
-	);
-}
-
-// ── File modifications ──
-export function FileModDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
-	const { t } = useTranslation("narrator");
-	const dock = useNarratorDockContext();
-	// Live context is the source of truth (see ChatDockPanel note).
-	const narratorId = dock?.narratorId ?? props.params.narratorId;
-	const fileModProps = dock?.fileModProps;
-	const close = useCallback(() => props.api.close(), [props.api]);
-
-	// Sync Dockview tab title with localization
-	useLayoutEffect(() => {
-		const title = t("fileMod_title");
-		if (title && title !== props.api.title) {
-			props.api.setTitle(title);
-		}
-	}, [t, props.api]);
-
-	return (
-		<ToolPanelShell
-			title={t("fileMod_title")}
-			icon={<IconFileCode size={16} color="var(--mantine-color-dimmed)" />}
-			props={props}
-			subjectId="__filemod__"
-		>
-			<LazyPanelBoundary>
-				<FileModificationsPanel
-					narratorId={narratorId}
-					onClose={close}
-					pendingPermission={fileModProps?.pendingPermission}
-					onPermissionDecision={fileModProps?.onPermissionDecision}
-					deletePreviewMessageId={fileModProps?.deletePreviewMessageId}
-					onConfirmDelete={fileModProps?.onConfirmDelete}
-					onCancelDelete={fileModProps?.onCancelDelete}
 					chromeless
 				/>
 			</LazyPanelBoundary>
@@ -1204,7 +1157,6 @@ export const narratorDockComponents: Record<
 	chat: ChatDockPanel,
 	terminal: TerminalDockPanel,
 	details: DetailsDockPanel,
-	filemod: FileModDockPanel,
 	spec: SpecDockPanel,
 	git: GitDockPanel,
 	browser: BrowserDockPanel,

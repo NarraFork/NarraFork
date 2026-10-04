@@ -16,7 +16,10 @@
 
 import type { DockviewApi, SerializedDockview } from "dockview-react";
 import { dockPanelId, NARRATOR_DOCK_COMPONENT } from "../../narrator/dock/dock-panel-types";
-import { isRestorableLayout, stripIdentityFromLayout } from "../../narrator/panels/layout-envelope";
+import {
+	removeRetiredFilemodPanels,
+	stripIdentityFromLayout,
+} from "../../narrator/panels/layout-envelope";
 
 /** Current envelope schema version. */
 export const CHAPTER_DOCK_LAYOUT_VERSION = 1 as const;
@@ -50,9 +53,7 @@ export function parseChapterDockLayout(raw: string | null | undefined): Serializ
 	if (!raw) return null;
 	try {
 		const parsed = JSON.parse(raw);
-		if (isEnvelope(parsed) && isRestorableLayout(parsed.layout)) {
-			return parsed.layout;
-		}
+		if (isEnvelope(parsed)) return removeRetiredFilemodPanels(parsed.layout);
 	} catch {
 		// Unparseable → fall through to the default layout.
 	}

@@ -46,11 +46,26 @@ async function fixture(
 	await safeSpawn({ cmd: ["git", "init"], cwd: repo, timeout: 15_000 });
 	const narratorId = generateId();
 	const messageId = generateId();
+	const previewMessageId = generateId();
 	const toolUseId = generateId();
 	const now = new Date().toISOString();
 	const file = join(repo, "a.txt");
 	await db.insert(narrators).values({ id: narratorId, cwd: repo, createdAt: now, updatedAt: now });
 	ids.push(narratorId);
+	// Rollback keeps the boundary turn and previews every subsequent tool operation.
+	await db.insert(narratorMessages).values({
+		id: previewMessageId,
+		narratorId,
+		role: "user",
+		contentJson: [{ type: "text", text: "Update the file" }],
+		createdAt: now,
+	});
+	await db.insert(narratorMessageRefs).values({
+		id: generateId(),
+		narratorId,
+		messageId: previewMessageId,
+		seq: 0,
+	});
 	await db.insert(narratorMessages).values({
 		id: messageId,
 		narratorId,
@@ -116,7 +131,7 @@ async function fixture(
 		createdAt: now,
 	});
 	writeFileSync(file, "USER SAVED AFTERWARDS\n");
-	return { narratorId, messageId, file, repo };
+	return { narratorId, messageId, previewMessageId, file, repo };
 }
 
 function request(id: string, endpoint: string, body: unknown = {}) {
@@ -183,9 +198,31 @@ describe("M0 rollback route safety", () => {
 		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
 	});
 
-	test("single-file revert cannot overwrite a user's save from a first-touch baseline", async () => {
+	test("retired file-panel routes are unavailable and cannot overwrite a user's save", async () => {
 		const f = await fixture(false, "fail");
-		await assertUnavailable(await request(f.narratorId, "revert-file", { filePath: f.file }));
+		for (const endpoint of [
+			"file-modifications",
+			"patches",
+			"patches/retired-snapshot/diff",
+			`delete-preview?messageId=${f.messageId}`,
+		]) {
+			const response = await app.request(`/api/narrators/${f.narratorId}/${endpoint}`);
+			expect(response.status).toBe(404);
+		}
+		expect((await request(f.narratorId, "revert-file", { filePath: f.file })).status).toBe(404);
+		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
+	});
+
+	test("single-block preview remains available without advertising unsafe legacy rollback", async () => {
+		const f = await fixture(true);
+		const response = await app.request(
+			`/api/narrators/${f.narratorId}/block-delete-preview?messageId=${f.messageId}&blockIndex=0`,
+		);
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({
+			available: false,
+			reason: "legacy_unverified",
+		});
 		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
 	});
 
@@ -196,7 +233,7 @@ describe("M0 rollback route safety", () => {
 	] as const)("an orphaned %s tool reports missing completion evidence without changing its status", async (status) => {
 		const f = await fixture(false, status);
 		const response = await app.request(
-			`/api/narrators/${f.narratorId}/delete-preview?messageId=${f.messageId}`,
+			`/api/narrators/${f.narratorId}/rollback-preview?messageId=${f.previewMessageId}`,
 		);
 		expect(response.status).toBe(200);
 		expect((await response.json()).narratorScope).toMatchObject({
@@ -222,7 +259,7 @@ describe("M0 rollback route safety", () => {
 			_loopRunning: true,
 		} as ActiveNarrator);
 		const response = await app.request(
-			`/api/narrators/${f.narratorId}/delete-preview?messageId=${f.messageId}`,
+			`/api/narrators/${f.narratorId}/rollback-preview?messageId=${f.previewMessageId}`,
 		);
 		expect(response.status).toBe(200);
 		expect((await response.json()).narratorScope).toMatchObject({
@@ -236,7 +273,7 @@ describe("M0 rollback route safety", () => {
 	test("operation-backed preview names the disconnected executor and still refuses mutation", async () => {
 		const f = await fixture(false, "success", true);
 		const response = await app.request(
-			`/api/narrators/${f.narratorId}/delete-preview?messageId=${f.messageId}`,
+			`/api/narrators/${f.narratorId}/rollback-preview?messageId=${f.previewMessageId}`,
 		);
 		expect(response.status).toBe(200);
 		expect((await response.json()).narratorScope).toMatchObject({
@@ -261,7 +298,7 @@ describe("M0 rollback route safety", () => {
 	test("preview cannot advertise a legacy workspace snapshot as an available fallback", async () => {
 		const f = await fixture(true);
 		const response = await app.request(
-			`/api/narrators/${f.narratorId}/delete-preview?messageId=${f.messageId}`,
+			`/api/narrators/${f.narratorId}/rollback-preview?messageId=${f.previewMessageId}`,
 		);
 		expect(response.status).toBe(200);
 		const preview = await response.json();

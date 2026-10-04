@@ -30,6 +30,7 @@
 
 import type { SerializedDockview } from "dockview-react";
 import { filePanelIdentity } from "../../narrator/dock/dock-panel-types";
+import { removeRetiredFilemodPanels } from "../../narrator/panels/layout-envelope";
 import { filePanelResourceId, filePanelResourceParams } from "../../narrator/panels/panel-kind";
 import {
 	isToolEditReference,
@@ -235,7 +236,10 @@ function parseNode(value: unknown): DetachedNode | null {
 	const geometry = { id: v.id, x: v.x, y: v.y, w: v.w, h: v.h };
 
 	// v3: a real dockview layout.
-	if (isLayout(v.layout)) return { ...geometry, layout: v.layout };
+	if (isLayout(v.layout)) {
+		const layout = removeRetiredFilemodPanels(v.layout);
+		return layout ? { ...geometry, layout } : null;
+	}
 
 	// v2: a `panels[]` list. v1: the entry itself described a single panel.
 	const rawPanels = Array.isArray(v.panels)

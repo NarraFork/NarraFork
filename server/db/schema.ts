@@ -1,4 +1,9 @@
 import type {
+	ContextCharCache,
+	ContextCharStats,
+	ContextSegment,
+} from "@shared/context-composition";
+import type {
 	FileChangeActor,
 	FileChangeExecutionBinding,
 	FileChangeExecutionReceipt,
@@ -560,6 +565,13 @@ export const narrators = sqliteTable(
 		/** Explicit creation provenance; NULL means unknown legacy origin. */
 		subagentOriginKind: text("subagent_origin_kind", { enum: ["tool", "standalone"] }),
 		contextSummary: text("context_summary"),
+		contextSummaryChars: integer("context_summary_chars").notNull().default(0),
+		contextSystemChars: integer("context_system_chars").notNull().default(0),
+		contextToolsChars: integer("context_tools_chars").notNull().default(0),
+		contextCharRevision: integer("context_char_revision").notNull().default(0),
+		contextCharCacheJson: text("context_char_cache_json", {
+			mode: "json",
+		}).$type<ContextCharCache>(),
 		model: text("model").default("claude-sonnet-4.5"),
 		/** When set, the model should be restored to this value after the current turn completes.
 		 *  Used by temporary model override on slash commands. Cleared after restore. */
@@ -1396,6 +1408,22 @@ export const specProtectedTasks = sqliteTable(
 );
 
 // === narrator_messages ===
+export const narratorContextCharPages = sqliteTable(
+	"narrator_context_char_pages",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		generation: text("generation").notNull(),
+		page: integer("page").notNull(),
+		segmentsJson: text("segments_json", { mode: "json" }).$type<ContextSegment[]>().notNull(),
+	},
+	(t) => [
+		uniqueIndex("context_char_pages_generation_page_idx").on(t.narratorId, t.generation, t.page),
+	],
+);
+
 export const narratorMessages = sqliteTable(
 	"narrator_messages",
 	{
@@ -1408,6 +1436,7 @@ export const narratorMessages = sqliteTable(
 		role: text("role", { enum: ["user", "assistant", "system", "sys", "disp"] }).notNull(),
 		contentJson: text("content_json", { mode: "json" }).notNull(),
 		contentText: text("content_text"),
+		contextCharsJson: text("context_chars_json", { mode: "json" }).$type<ContextCharStats>(),
 		tokensIn: integer("tokens_in"),
 		costUsd: real("cost_usd"),
 		/** Null marks an untouched historical record. */
@@ -1552,6 +1581,8 @@ export const narratorToolCalls = sqliteTable(
 		toolName: text("tool_name").notNull(),
 		inputJson: text("input_json", { mode: "json" }),
 		outputJson: text("output_json", { mode: "json" }),
+		inputChars: integer("input_chars").notNull().default(0),
+		outputChars: integer("output_chars").notNull().default(0),
 		/**
 		 * Actual execution target frozen before permission/execution.
 		 * "local" means the NarraFork server; a remote value is remote_devices.id.

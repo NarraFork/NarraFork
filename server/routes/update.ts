@@ -197,9 +197,8 @@ updateRoutes.post("/cancel", requireAuth, requireAdmin, (c) => {
  * response is returned first and teardown begins a moment later, because teardown terminates
  * in-flight requests — including this one.
  *
- * Deliberately not idempotent-safe against concurrent callers in any special way: a second
- * request arriving during the grace window simply schedules another shutdown, and
- * `performGracefulShutdown` already collapses that onto the single in-flight teardown.
+ * The operator-shutdown registry owns the response grace window atomically, so concurrent
+ * callers cannot promise a new recovery preparation before this teardown begins.
  */
 updateRoutes.post("/shutdown", requireAuth, requireAdmin, (c) => {
 	const result = shutdownForManualUpdate({ reason: "operator_requested" });

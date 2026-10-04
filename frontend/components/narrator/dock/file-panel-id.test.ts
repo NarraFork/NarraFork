@@ -20,6 +20,30 @@ import {
 } from "./NarratorDockContext";
 import { bindFilePanelExitGuard } from "./panels";
 
+// Navigation fixtures expose the real group/header/content contract used by
+// workspace preview coordination, while keeping these tests DOM-only.
+function fileGroupFixture(id: string) {
+	const { window } = parseHTML("<html><body></body></html>");
+	return {
+		id: `file-group-${id}`,
+		panels: [{ id }],
+		header: { hidden: false },
+		api: { location: { type: "floating" as const } },
+		element: window.document.createElement("div"),
+	};
+}
+function narratorHostFixture(narratorId: string) {
+	return {
+		id: `workspace-narrator-${narratorId}`,
+		params: { panelType: "narrator", narratorId },
+		group: {
+			id: `narrator-group-${narratorId}`,
+			api: { boundingBox: { left: 0, top: 0, width: 800, height: 600 } },
+		},
+		api: { location: { type: "grid" }, setActive: mock(() => {}) },
+	};
+}
+
 /**
  * A file panel's dockview id is derived from a HASH of its path, never from the
  * path itself: paths carry separators, spaces and non-ASCII and can be long, all
@@ -78,7 +102,7 @@ describe("fileDockPanelId", () => {
 
 	it("does not collide with the singleton tool panel ids", () => {
 		// Singleton panels use `ndock-<kind>`; a file panel must never produce one.
-		for (const kind of ["chat", "terminal", "details", "filemod", "spec", "git"]) {
+		for (const kind of ["chat", "terminal", "details", "spec", "git"]) {
 			expect(fileDockPanelId(`/x/${kind}`)).not.toBe(`ndock-${kind}`);
 		}
 	});
@@ -275,14 +299,23 @@ describe("device-scoped navigation", () => {
 			{
 				id: string;
 				params: FilePanelParams;
-				api: { setActive: () => void; updateParameters: (params: FilePanelParams) => void };
+				group: ReturnType<typeof fileGroupFixture>;
+				api: {
+					location: { type: "grid" | "floating" };
+					setActive: () => void;
+					updateParameters: (params: FilePanelParams) => void;
+				};
 			}
 		>();
 		const add = (id: string, params: FilePanelParams) => {
+			const group = fileGroupFixture(id);
 			const panel = {
 				id,
 				params,
+				group,
+				view: { content: { element: group.element.ownerDocument.createElement("div") } },
 				api: {
+					location: { type: "floating" as const },
 					setActive: () => {},
 					updateParameters: (next: FilePanelParams) => {
 						panel.params = next;
@@ -292,10 +325,16 @@ describe("device-scoped navigation", () => {
 			panels.set(id, panel);
 		};
 		add(id, { panelType: "file", filePath: path });
+		const narrator = narratorHostFixture("n");
 		const api = {
-			getPanel: (id: string) => panels.get(id),
+			width: 1200,
+			height: 800,
+			getPanel: (id: string) => (id === narrator.id ? narrator : panels.get(id)),
 			get panels() {
-				return [...panels.values()];
+				return [narrator, ...panels.values()];
+			},
+			get groups() {
+				return [narrator.group, ...[...panels.values()].map((panel) => panel.group)];
 			},
 			addPanel: (panel: { id: string; params: FilePanelParams }) => add(panel.id, panel.params),
 		} as unknown as DockviewApi;
@@ -468,22 +507,34 @@ describe("historical file panels", () => {
 				{
 					id: string;
 					params: FilePanelParams;
+					group: ReturnType<typeof fileGroupFixture>;
 					api: {
+						location: { type: "floating" };
 						setActive: ReturnType<typeof mock>;
 						updateParameters: (params: FilePanelParams) => void;
 					};
 				}
 			>();
+			const narrator = narratorHostFixture("host");
 			const api = {
-				getPanel: (id: string) => panels.get(id),
+				width: 1200,
+				height: 800,
+				getPanel: (id: string) => (id === narrator.id ? narrator : panels.get(id)),
 				get panels() {
-					return [...panels.values()];
+					return [narrator, ...panels.values()];
+				},
+				get groups() {
+					return [narrator.group, ...[...panels.values()].map((panel) => panel.group)];
 				},
 				addPanel: ({ id, params }: { id: string; params: FilePanelParams }) => {
+					const group = fileGroupFixture(id);
 					const panel = {
 						id,
 						params,
+						group,
+						view: { content: { element: group.element.ownerDocument.createElement("div") } },
 						api: {
+							location: { type: "floating" as const },
 							setActive: mock(() => {}),
 							updateParameters: (next: FilePanelParams) => {
 								panel.params = next;

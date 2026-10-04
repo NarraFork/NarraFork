@@ -40,6 +40,7 @@ import {
 	narratorToolCalls,
 } from "../db/schema";
 import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
+import { queueContextCharacterRefresh } from "../lib/context-characters";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
@@ -360,6 +361,7 @@ export function selectRecoveryCardCandidates(
 export const TOOL_CALL_RESET_FIELDS = {
 	status: "running" as const,
 	outputJson: null,
+	outputChars: 0,
 	errorMessage: null,
 	permissionDenyMessage: null,
 	permissionDecidedBy: null,
@@ -549,6 +551,7 @@ async function prepareAndStartRecovery(input: {
 			.set(TOOL_CALL_RESET_FIELDS)
 			.where(eq(narratorToolCalls.id, candidate.toolCallId));
 		const source = toolCallsById.get(candidate.toolCallId);
+		queueContextCharacterRefresh(narratorId, source?.messageId);
 		broadcastToNarrator(narratorId, {
 			type: "tool_started",
 			narratorId,

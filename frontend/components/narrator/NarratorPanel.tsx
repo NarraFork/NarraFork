@@ -121,6 +121,7 @@ import { useCompactSummaryModal } from "./compact/use-compact-summary-modal";
 import type { FileReferenceScopeValue } from "./composer/FileReferenceScope";
 import type { NarratorComposerHandle, NarratorRemoteDraft } from "./composer/NarratorComposer";
 import { ContentViewerEnvironmentProvider } from "./content/ContentViewer";
+import { ContextCompositionModal } from "./context-management/ContextCompositionModal";
 import {
 	type ContextManagementDraft,
 	DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
@@ -195,7 +196,6 @@ import { useMessageSelection } from "./selection/use-message-selection";
 import { revealSpecFile } from "./spec/spec-file-reveal";
 import {
 	AllowRetryCtx,
-	FileModDrawerCtx,
 	LatestTodosToolUseIdCtx,
 	PermEnterHintCtx,
 } from "./tool-call/tool-call-contexts";
@@ -213,11 +213,6 @@ const NarratorDetailsPanel = lazy(() =>
 
 const SpecPanel = lazy(() =>
 	import("./spec/SpecPanel").then((module) => ({ default: module.SpecPanel })),
-);
-const FileModificationsDrawer = lazy(() =>
-	import("./file-panel/FileModificationsDrawer").then((module) => ({
-		default: module.FileModificationsDrawer,
-	})),
 );
 // Body of the read-only file viewer. Shared with the `file` dock panel — the
 // drawer below is just the off-dock (mobile) host for the same content, so both
@@ -238,14 +233,6 @@ const PretextExactMessageList = lazy(() =>
 		default: module.PretextExactMessageList,
 	})),
 );
-
-/** Mount the lazy drawer only after it is first opened; keep it mounted on close. */
-export function shouldRenderFileModificationsDrawer(
-	opened: boolean,
-	hasBeenOpened: boolean,
-): boolean {
-	return opened || hasBeenOpened;
-}
 
 type CompactingMarkerKind = "context" | "segment";
 
@@ -281,9 +268,6 @@ function NarratorPanelBody({
 	onOpenTerminalPanel,
 	workspacePreview,
 	suppressAutoFocusOnPromote,
-	fileModPanelOpen,
-	onToggleFileModPanel,
-	onFileModPropsChange,
 	detailsPanelOpen,
 	onToggleDetailsPanel,
 	onDetailsPropsChange,
@@ -305,7 +289,6 @@ function NarratorPanelBody({
 	const pluginSurface = usePluginUiSurface();
 	const workspaceId = pluginSurface?.hostContext.workspaceId;
 	// Effective sidebar callbacks: prefer explicit props, else route through dock.
-	const effOnFileModPropsChange = onFileModPropsChange ?? dock?.setFileModProps;
 	const effOnDetailsPropsChange = onDetailsPropsChange ?? dock?.setDetailsProps;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterId = (narrator as any)?.chapterId as string | null | undefined;
@@ -1289,48 +1272,6 @@ function NarratorPanelBody({
 		effOnDetailsPropsChange(detailsPanelExternalProps);
 	}, [dock, detailsOpened, detailsPanelExternalProps, narrator, effOnDetailsPropsChange]);
 
-	// File modifications drawer/panel state
-	// When onToggleFileModPanel is provided (desktop sidebar mode), use external state;
-	// otherwise use internal state (mobile drawer / workspace fallback).
-	const [internalFileModOpen, setInternalFileModOpen] = useState(false);
-	const fileModDrawerOpened = dock
-		? dock.openToolTypes.has("filemod")
-		: onToggleFileModPanel
-			? (fileModPanelOpen ?? false)
-			: internalFileModOpen;
-	const [fileModDrawerHasOpened, setFileModDrawerHasOpened] = useState(false);
-	useEffect(() => {
-		if (fileModDrawerOpened) setFileModDrawerHasOpened(true);
-	}, [fileModDrawerOpened]);
-	const fileModPanelOpenRef = useRef(fileModPanelOpen ?? false);
-	fileModPanelOpenRef.current = fileModPanelOpen ?? false;
-	const externalSetFileModOpened = useCallback(
-		(v: boolean | ((prev: boolean) => boolean)) => {
-			if (!onToggleFileModPanel) return;
-			if (typeof v === "function") {
-				const next = v(fileModPanelOpenRef.current);
-				if (next !== fileModPanelOpenRef.current) onToggleFileModPanel();
-			} else if (v !== fileModPanelOpenRef.current) {
-				onToggleFileModPanel();
-			}
-		},
-		[onToggleFileModPanel],
-	);
-	const dockFileModToggle = useCallback(
-		(v: boolean | ((prev: boolean) => boolean)) => {
-			if (!dock) return;
-			const cur = dock.openToolTypes.has("filemod");
-			const next = typeof v === "function" ? v(cur) : v;
-			if (next !== cur) dock.toggleToolPanel("filemod");
-		},
-		[dock],
-	);
-	const setFileModDrawerOpened = dock
-		? dockFileModToggle
-		: onToggleFileModPanel
-			? externalSetFileModOpened
-			: setInternalFileModOpen;
-
 	// Spec toggle: three mutually-exclusive routes, in precedence order.
 	//  1. dock spec tab   — the unified surface, but ONLY for the dock's own base
 	//     narrator. When a subagent session is pushed into the dock, `dock.narratorId`
@@ -1460,8 +1401,6 @@ function NarratorPanelBody({
 		},
 		[dockApiRef, pluginSurface, narratorId, chapterId, projectId, workspaceDock],
 	);
-	const [deletePreviewMessageId, setDeletePreviewMessageId] = useState<string | null>(null);
-	const [pendingDeleteCallback, setPendingDeleteCallback] = useState<(() => void) | null>(null);
 
 	// ── Asynchronous questions (AskUserQuestion with `async: true`) ──────────
 	//
@@ -1479,44 +1418,6 @@ function NarratorPanelBody({
 		() => ({ ...renderPermCb, asyncQuestions: asyncQuestionSlots }),
 		[renderPermCb, asyncQuestionSlots],
 	);
-
-	// Get the first pending Write/Edit permission for the drawer
-	const firstEditPermission = useMemo(() => {
-		for (const perm of renderPermCb.pendingPermissions) {
-			if (perm.toolName === "Write" || perm.toolName === "Edit") {
-				return perm;
-			}
-		}
-		return null;
-	}, [renderPermCb.pendingPermissions]);
-
-	// Expose file-mod panel props to parent for desktop sidebar rendering
-	useEffect(() => {
-		if (effOnFileModPropsChange) {
-			effOnFileModPropsChange({
-				narratorId,
-				pendingPermission: firstEditPermission,
-				onPermissionDecision: renderPermCb.onPermissionDecision,
-				deletePreviewMessageId,
-				onConfirmDelete: () => {
-					pendingDeleteCallback?.();
-					setDeletePreviewMessageId(null);
-					setPendingDeleteCallback(null);
-				},
-				onCancelDelete: () => {
-					setDeletePreviewMessageId(null);
-					setPendingDeleteCallback(null);
-				},
-			});
-		}
-	}, [
-		effOnFileModPropsChange,
-		narratorId,
-		firstEditPermission,
-		renderPermCb.onPermissionDecision,
-		deletePreviewMessageId,
-		pendingDeleteCallback,
-	]);
 
 	const isWorking = narrator?.status === "working";
 	/**
@@ -1686,13 +1587,6 @@ function NarratorPanelBody({
 			latestSpecTasksToolUseId: chunkTailMeta.latestSpecTasksToolUseId ?? null,
 		}),
 		[isWorking, chunkTailMeta.latestSpecTasksToolUseId],
-	);
-
-	const fileModDrawerCtxValue = useMemo(
-		() => ({
-			openForApproval: () => setFileModDrawerOpened(true),
-		}),
-		[setFileModDrawerOpened],
 	);
 
 	// What the composer currently holds, split by ownership: the text flag comes
@@ -2599,7 +2493,7 @@ function NarratorPanelBody({
 	const headerHostCapabilities = useMemo<NarratorToolbarHost[]>(() => {
 		if (isWorkspacePreview) return ["inline"];
 		// A drawer host exists whenever this panel is not a lightweight preview: it
-		// either owns its own drawers (details / filemod / spec) or is handed one by
+		// either owns its own drawers (details / spec) or is handed one by
 		// the route (terminal), and MobileToolPanelHost covers the rest.
 		const caps: NarratorToolbarHost[] = ["inline", "drawer"];
 		if (dock) caps.push("dock");
@@ -2633,13 +2527,11 @@ function NarratorPanelBody({
 		executionDevicesQuery,
 		mobileTasksOpen,
 		mobileToolPanel,
-		fileModDrawerOpened,
 		detailsOpened,
 		terminalToolOpened,
 		specToolOpened,
 		setMobileTasksOpen,
 		setMobileToolPanel,
-		setFileModDrawerOpened,
 		toggleDetails,
 		toggleTerminalTool,
 		toggleSpecTool,
@@ -2703,6 +2595,7 @@ function NarratorPanelBody({
 		if (!revertHistorySubmitting) setPendingBlockDelete(null);
 	}, [revertHistorySubmitting, setPendingBlockDelete]);
 
+	const [contextCompositionOpened, setContextCompositionOpened] = useState(false);
 	if (!narrator) return <NarratorPanelSkeleton />;
 
 	const statusBarDisplay = getNarratorStatusBarDisplay({
@@ -2766,7 +2659,13 @@ function NarratorPanelBody({
 			: "Context";
 	const contextRingNode = (
 		<Box
+			component="button"
+			type="button"
+			aria-label={t("contextComposition.title")}
 			style={{
+				border: 0,
+				padding: 0,
+				background: "transparent",
 				position: "relative",
 				width: 24,
 				height: 24,
@@ -2819,68 +2718,83 @@ function NarratorPanelBody({
 	const contextIndicator = isWorkspacePreview ? (
 		contextRingNode
 	) : (
-		<Menu position="top-start">
-			<Menu.Target>{contextRingNode}</Menu.Target>
-			<Menu.Dropdown>
-				{contextStale && (
-					<Menu.Label c="orange" fz={10} style={{ maxWidth: 240, whiteSpace: "normal" }}>
-						{t("contextStaleHint")}
+		<>
+			{contextCompositionOpened && (
+				<ContextCompositionModal
+					opened={contextCompositionOpened}
+					onClose={() => setContextCompositionOpened(false)}
+					narratorId={narratorId}
+				/>
+			)}
+			<Menu position="top-start">
+				<Menu.Target>{contextRingNode}</Menu.Target>
+				<Menu.Dropdown>
+					<Menu.Item onClick={() => setContextCompositionOpened(true)}>
+						{t("contextComposition.title")}
+					</Menu.Item>
+					<Menu.Divider />
+					{contextStale && (
+						<Menu.Label c="orange" fz={10} style={{ maxWidth: 240, whiteSpace: "normal" }}>
+							{t("contextStaleHint")}
+						</Menu.Label>
+					)}
+					<Menu.Label c="dimmed" fz={10}>
+						{t("activeThresholds", {
+							compact: activeCompactStart ?? modelThresholds?.compactStart,
+						})}
 					</Menu.Label>
-				)}
-				<Menu.Label c="dimmed" fz={10}>
-					{t("activeThresholds", {
-						compact: activeCompactStart ?? modelThresholds?.compactStart,
-					})}
-				</Menu.Label>
-				<Menu.Item
-					leftSection={<IconSettings size={14} />}
-					c="dimmed"
-					fz="xs"
-					onClick={handleOpenContextThresholdSettings}
-				>
-					{t("thresholdSettings")}
-				</Menu.Item>
-				<Menu.Divider />
-				{hasContextData && (
-					<Menu.Label>
-						{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
-					</Menu.Label>
-				)}
-				{promptTokens != null && (
-					<Menu.Label>
-						{contextWindow != null
-							? t("contextUsageTokensWithWindow", {
-									tokens: formatLocaleNumber(promptTokens),
-									window: formatLocaleNumber(contextWindow),
-								})
-							: t("contextUsageTokens", {
-									tokens: formatLocaleNumber(promptTokens),
-								})}
-						{isEstimated && <span style={{ opacity: 0.6, marginLeft: 4 }}>({t("estimated")})</span>}
-					</Menu.Label>
-				)}
-				<Menu.Divider />
-				<Menu.Item
-					leftSection={<IconArrowsMinimize size={14} />}
-					onClick={() => {
-						// Compacting state will arrive via substatus_change WS event
-						api.triggerCompact(narratorId).catch((err) => {
-							handleCompactError(err);
-						});
-					}}
-				>
-					{t("triggerCompact")}
-				</Menu.Item>
-				<Menu.Item
-					leftSection={<IconEraser size={14} />}
-					onClick={() => {
-						api.clearContext(narratorId).catch(() => {});
-					}}
-				>
-					{t("clearContext")}
-				</Menu.Item>
-			</Menu.Dropdown>
-		</Menu>
+					<Menu.Item
+						leftSection={<IconSettings size={14} />}
+						c="dimmed"
+						fz="xs"
+						onClick={handleOpenContextThresholdSettings}
+					>
+						{t("thresholdSettings")}
+					</Menu.Item>
+					<Menu.Divider />
+					{hasContextData && (
+						<Menu.Label>
+							{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
+						</Menu.Label>
+					)}
+					{promptTokens != null && (
+						<Menu.Label>
+							{contextWindow != null
+								? t("contextUsageTokensWithWindow", {
+										tokens: formatLocaleNumber(promptTokens),
+										window: formatLocaleNumber(contextWindow),
+									})
+								: t("contextUsageTokens", {
+										tokens: formatLocaleNumber(promptTokens),
+									})}
+							{isEstimated && (
+								<span style={{ opacity: 0.6, marginLeft: 4 }}>({t("estimated")})</span>
+							)}
+						</Menu.Label>
+					)}
+					<Menu.Divider />
+					<Menu.Item
+						leftSection={<IconArrowsMinimize size={14} />}
+						onClick={() => {
+							// Compacting state will arrive via substatus_change WS event
+							api.triggerCompact(narratorId).catch((err) => {
+								handleCompactError(err);
+							});
+						}}
+					>
+						{t("triggerCompact")}
+					</Menu.Item>
+					<Menu.Item
+						leftSection={<IconEraser size={14} />}
+						onClick={() => {
+							api.clearContext(narratorId).catch(() => {});
+						}}
+					>
+						{t("clearContext")}
+					</Menu.Item>
+				</Menu.Dropdown>
+			</Menu>
+		</>
 	);
 
 	// Configuration controls stay fixed; movable tools follow the saved bottom order.
@@ -3172,55 +3086,53 @@ function NarratorPanelBody({
 							<CompactSummaryModalCtx.Provider value={compactSummaryModalCtxValue}>
 								<MessageSelectionCtx.Provider value={selectionCtxValue}>
 									<AllowRetryCtx.Provider value={allowRetryCtxValue}>
-										<FileModDrawerCtx.Provider value={fileModDrawerCtxValue}>
-											<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
-												<EditingMessageCtx.Provider value={editingMessageCtxValue}>
-													<RenderLodCtx.Provider value={renderLodCtxValue}>
-														{/* Same message-shaped skeleton the list itself shows while its
+										<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
+											<EditingMessageCtx.Provider value={editingMessageCtxValue}>
+												<RenderLodCtx.Provider value={renderLodCtxValue}>
+													{/* Same message-shaped skeleton the list itself shows while its
 													    document loads, so the lazy-chunk wait and the document wait
 													    look like one continuous placeholder (no blank → text flash).
 													    The column geometry comes from the shared helper rather than
 													    Mantine padding, so this fallback, the list's own placeholder
 													    and the real rows are all the same width — otherwise the
 													    mount stepped through two different column widths. */}
-														<Suspense
-															fallback={
-																<Box style={narratorColumnPlaceholderStyle(narratorCenteredColumn)}>
-																	<NarratorMessageListSkeleton />
-																</Box>
-															}
-														>
-															<PretextExactMessageList
-																ref={chunkListRef}
-																narratorId={narratorId}
-																isSubagent={isSubagent}
-																isActive={isActive}
-																scrollRef={chunkViewportRef}
-																contentRef={contentRef}
-																onAtBottomChange={setIsAtBottom}
-																onUnreadCountChange={setUnreadCount}
-																onTailMetaChange={handleMessageListTailMetaChange}
-																onLodStep={handleLodStep}
-																onSelectionResolverChange={setChunkSelectionResolver}
-																rowHandlers={vlistRowHandlers}
-																permCb={permCbWithAsyncQuestions}
-																hasChapter={hasChapter}
-																highlightMessageId={highlightMessageId}
-																highlightRequestId={highlightRequestId}
-																tailFooter={messageListTailFooter}
-															/>
-														</Suspense>
-													</RenderLodCtx.Provider>
-													<LodSwitchToast
-														lod={renderLod}
-														isDefault={renderLodIsDefault}
-														onSetAsDefault={setAsDefault}
-														onSelectLod={handleSelectLod}
-														pinned={lodIndicatorPinned}
-													/>
-												</EditingMessageCtx.Provider>
-											</LatestTodosToolUseIdCtx.Provider>
-										</FileModDrawerCtx.Provider>
+													<Suspense
+														fallback={
+															<Box style={narratorColumnPlaceholderStyle(narratorCenteredColumn)}>
+																<NarratorMessageListSkeleton />
+															</Box>
+														}
+													>
+														<PretextExactMessageList
+															ref={chunkListRef}
+															narratorId={narratorId}
+															isSubagent={isSubagent}
+															isActive={isActive}
+															scrollRef={chunkViewportRef}
+															contentRef={contentRef}
+															onAtBottomChange={setIsAtBottom}
+															onUnreadCountChange={setUnreadCount}
+															onTailMetaChange={handleMessageListTailMetaChange}
+															onLodStep={handleLodStep}
+															onSelectionResolverChange={setChunkSelectionResolver}
+															rowHandlers={vlistRowHandlers}
+															permCb={permCbWithAsyncQuestions}
+															hasChapter={hasChapter}
+															highlightMessageId={highlightMessageId}
+															highlightRequestId={highlightRequestId}
+															tailFooter={messageListTailFooter}
+														/>
+													</Suspense>
+												</RenderLodCtx.Provider>
+												<LodSwitchToast
+													lod={renderLod}
+													isDefault={renderLodIsDefault}
+													onSetAsDefault={setAsDefault}
+													onSelectLod={handleSelectLod}
+													pinned={lodIndicatorPinned}
+												/>
+											</EditingMessageCtx.Provider>
+										</LatestTodosToolUseIdCtx.Provider>
 									</AllowRetryCtx.Provider>
 								</MessageSelectionCtx.Provider>
 							</CompactSummaryModalCtx.Provider>
@@ -3546,35 +3458,6 @@ function NarratorPanelBody({
 						}}
 					/>
 					{/* ═══════════════════ End Bottom Interaction Area ═══════════════════ */}
-
-					{/* Only mount the lazy Drawer after its first open (mobile / workspace). */}
-					{!dock &&
-						!onToggleFileModPanel &&
-						shouldRenderFileModificationsDrawer(fileModDrawerOpened, fileModDrawerHasOpened) && (
-							<Suspense fallback={null}>
-								<FileModificationsDrawer
-									narratorId={narratorId}
-									opened={fileModDrawerOpened}
-									onClose={() => {
-										setFileModDrawerOpened(false);
-										setDeletePreviewMessageId(null);
-										setPendingDeleteCallback(null);
-									}}
-									pendingPermission={firstEditPermission}
-									onPermissionDecision={renderPermCb.onPermissionDecision}
-									deletePreviewMessageId={deletePreviewMessageId}
-									onConfirmDelete={() => {
-										pendingDeleteCallback?.();
-										setDeletePreviewMessageId(null);
-										setPendingDeleteCallback(null);
-									}}
-									onCancelDelete={() => {
-										setDeletePreviewMessageId(null);
-										setPendingDeleteCallback(null);
-									}}
-								/>
-							</Suspense>
-						)}
 
 					{/* Internal spec drawer — the third fallback when there is no dock spec
 					    tab (off-dock page) or the dock is showing a pushed subagent. Bound to

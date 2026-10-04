@@ -430,7 +430,6 @@ export function getToolCallFileIdentityStrict(
 export async function queryOrderedToolCalls(
 	narratorId: string,
 	maxSeq?: number,
-	opts?: { filePathOnly?: boolean },
 ): Promise<OrderedToolCall[]> {
 	const conditions = [
 		eq(narratorToolCalls.narratorId, narratorId),
@@ -441,58 +440,6 @@ export async function queryOrderedToolCalls(
 		),
 	];
 	if (maxSeq !== undefined) conditions.push(lte(narratorMessageRefs.seq, maxSeq));
-
-	if (opts?.filePathOnly) {
-		const rows = await db
-			.select({
-				toolUseId: narratorToolCalls.toolUseId,
-				toolName: narratorToolCalls.toolName,
-				filePath: sql<
-					string | null
-				>`CASE WHEN json_valid(${narratorToolCalls.inputJson}) THEN json_extract(${narratorToolCalls.inputJson}, '$.file_path') END`,
-				device: sql<
-					string | null
-				>`CASE WHEN json_valid(${narratorToolCalls.inputJson}) THEN json_extract(${narratorToolCalls.inputJson}, '$.device') END`,
-				executionDeviceId: narratorToolCalls.executionDeviceId,
-				executionCwd: narratorToolCalls.executionCwd,
-				executionPathFlavor: narratorToolCalls.executionPathFlavor,
-				resolvedFilePath: narratorToolCalls.resolvedFilePath,
-				canonicalFilePath: narratorToolCalls.canonicalFilePath,
-				runtimeGeneration: narratorToolCalls.runtimeGeneration,
-				executionTargetsJson: narratorToolCalls.executionTargetsJson,
-				isFileHistoryCheckpoint: narratorToolCalls.isFileHistoryCheckpoint,
-				status: narratorToolCalls.status,
-				messageId: narratorToolCalls.messageId,
-				seq: narratorMessageRefs.seq,
-				createdAt: narratorToolCalls.createdAt,
-			})
-			.from(narratorToolCalls)
-			.innerJoin(
-				narratorMessageRefs,
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-				),
-			)
-			.where(and(...conditions))
-			.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt));
-
-		if (rows.length >= TOOL_CALL_WARN_THRESHOLD) {
-			logger.warn("queryOrderedToolCalls returned large result set", {
-				narratorId,
-				count: rows.length,
-				threshold: TOOL_CALL_WARN_THRESHOLD,
-			});
-		}
-
-		return rows.map((row) => ({
-			...row,
-			inputJson:
-				row.filePath != null
-					? { file_path: row.filePath, ...(row.device != null && { device: row.device }) }
-					: null,
-		}));
-	}
 
 	const rows = (await db
 		.select({

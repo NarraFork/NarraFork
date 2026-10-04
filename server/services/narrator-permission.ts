@@ -69,6 +69,10 @@ import {
 	normalizeDangerReflectionLevel,
 	resolveDangerReflectionLevel,
 } from "../lib/boolean-override";
+import {
+	measureSerializedCharacters,
+	queueContextCharacterRefresh,
+} from "../lib/context-characters";
 import { AppError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
@@ -181,6 +185,22 @@ const pendingPermissionContexts = new WeakMap<
 >();
 
 // === Permission handling ===
+
+async function refreshPermissionContextCharacters(
+	narratorId: string,
+	toolCallId: string,
+): Promise<void> {
+	const row = await db.query.narratorToolCalls
+		.findFirst({ where: eq(narratorToolCalls.id, toolCallId), columns: { messageId: true } })
+		.catch((error: unknown) => {
+			logger.warn("Character refresh message identity unavailable", {
+				toolCallId,
+				error: String(error),
+			});
+			return undefined;
+		});
+	queueContextCharacterRefresh(narratorId, row?.messageId);
+}
 
 export function isInsideWorktree(cwd: string, filePath: string): boolean {
 	return isInsidePath(cwd, resolve(cwd, filePath));
@@ -3436,12 +3456,14 @@ async function validateOrRepairAskUserQuestionInput(
 			.set({
 				status: "fail",
 				inputJson: input,
+				inputChars: measureSerializedCharacters(input),
 				errorMessage: message,
 				permissionDecidedBy: "auto",
 				permissionDecidedAt: new Date().toISOString(),
 				permissionDecisionReason: "invalid_ask_user_question_input",
 			})
 			.where(and(eq(narratorToolCalls.id, permissionToolCallId)));
+		await refreshPermissionContextCharacters(narratorId, permissionToolCallId);
 		return { deny: { behavior: "deny", message, rawMessage: true } };
 	};
 
@@ -4860,11 +4882,13 @@ export async function handlePermission(
 			.set({
 				status: "pending",
 				inputJson: effectiveInput,
+				inputChars: measureSerializedCharacters(effectiveInput),
 				permissionStartedAt: now,
 				permissionDecisionReason: `Danger reflection: ${danger.summary}`,
 				permissionSuggestions: suggestions,
 			})
 			.where(eq(narratorToolCalls.id, requestId));
+		await refreshPermissionContextCharacters(narratorId, requestId);
 		await narratorService.updateStatus(narratorId, "waiting", {
 			substatus: ["reflecting"],
 		});
@@ -5224,10 +5248,12 @@ export async function handlePermission(
 		.set({
 			status: "pending",
 			inputJson: effectiveInput,
+			inputChars: measureSerializedCharacters(effectiveInput),
 			permissionStartedAt: new Date().toISOString(),
 			...(decisionReason ? { permissionDecisionReason: decisionReason } : {}),
 		})
 		.where(eq(narratorToolCalls.id, toolCallId));
+	await refreshPermissionContextCharacters(narratorId, toolCallId);
 	const pendingExecutionTarget = snapshotExecutionTarget(initialExecutionTarget);
 	if (isRoutedPermissionTool(toolName) && !pendingExecutionTarget) {
 		return {
@@ -5442,6 +5468,7 @@ async function handlePermissionRuleRequest(args: {
 			.set({
 				status: "pending",
 				inputJson: input,
+				inputChars: measureSerializedCharacters(input),
 				permissionStartedAt: new Date().toISOString(),
 				permissionDecisionReason: `Permission rule request: ${input.reason}`,
 				permissionSuggestions: [
@@ -5458,6 +5485,7 @@ async function handlePermissionRuleRequest(args: {
 				],
 			})
 			.where(eq(narratorToolCalls.id, id));
+		await refreshPermissionContextCharacters(narratorId, id);
 	} catch (error) {
 		failPermissionRuleRequest(prepared.requestId, String(error));
 		return { behavior: "deny", message: "Permission rule request persistence failed" };
@@ -5976,7 +6004,9 @@ export async function resolvePermission(
 				permissionDecidedBy: decidedBy,
 				permissionDecidedAt: now,
 				permissionDenyMessage: effectiveDenyMessage ?? null,
-				...(updatedInput ? { inputJson: updatedInput } : {}),
+				...(updatedInput
+					? { inputJson: updatedInput, inputChars: measureSerializedCharacters(updatedInput) }
+					: {}),
 				...(decision === "deny"
 					? {
 							errorMessage: effectiveDenyMessage || "Permission denied by user",
@@ -5984,6 +6014,7 @@ export async function resolvePermission(
 					: {}),
 			})
 			.where(eq(narratorToolCalls.id, requestId));
+		if (updatedInput) await refreshPermissionContextCharacters(pending.narratorId, requestId);
 	} catch (err) {
 		logger.error("Failed to persist permission decision; refusing execution", {
 			requestId,

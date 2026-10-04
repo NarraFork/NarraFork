@@ -18,6 +18,7 @@ import { projectsApi } from "./projects";
 import { scheduledTasksApi } from "./scheduled-tasks";
 import { settingsApi } from "./settings";
 import { specApi } from "./spec";
+import { systemLifecycleApi } from "./system-lifecycle";
 import { terminalsApi } from "./terminals";
 import { traitLayersApi } from "./trait-layers";
 import { workspaceContextApi } from "./workspace-context";
@@ -43,6 +44,7 @@ export const api = {
 	...modelCardsApi,
 	...knowledgeApi,
 	...specApi,
+	...systemLifecycleApi,
 	...devicesApi,
 	...traitLayersApi,
 	...oauthAppsApi,

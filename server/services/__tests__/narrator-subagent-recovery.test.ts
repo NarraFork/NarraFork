@@ -611,6 +611,7 @@ describe("TOOL_CALL_RESET_FIELDS", () => {
 	test("re-arms as running, never pending, so no phantom permission form appears", () => {
 		expect(TOOL_CALL_RESET_FIELDS.status).toBe("running");
 		expect(TOOL_CALL_RESET_FIELDS.status).not.toBe("pending");
+		expect(TOOL_CALL_RESET_FIELDS.outputChars).toBe(0);
 	});
 
 	test("clears every stale result and permission-decision field", () => {

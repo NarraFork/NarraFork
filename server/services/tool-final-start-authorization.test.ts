@@ -22,7 +22,10 @@ import { executionPolicyEngine } from "./execution-policy/engine";
 import { handlePermission } from "./narrator-permission";
 import { narratorPersistence } from "./narrator-persistence";
 import { permissionPolicyChanges, permissionRuleService } from "./permission-rule-service";
-import { buildFinalToolStartAuthorization } from "./tool-final-start-authorization";
+import {
+	buildFinalToolStartAuthorization,
+	persistPermissionResolvedInput,
+} from "./tool-final-start-authorization";
 
 const { db } = await import("../db");
 toolRegistry.register(writeTool);
@@ -172,6 +175,29 @@ async function missing(path: string) {
 // Only the awaited preparation hook is held. The permission handler, final-start
 // policy service, SQLite rows/cache invalidation and Write/Bash implementations are real.
 describe("real final-start policy after snapshot/slot waits", () => {
+	test("canonicalized tool input stores the new UTF-16 character cache atomically", async () => {
+		const f = await fixture("primary", "Write");
+		const updatedInput = { file_path: f.output, content: "中文😀" };
+		await persistPermissionResolvedInput(f.id, f.tu.toolUseId, f.binding, updatedInput);
+		const call = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, f.callId),
+		});
+		expect(call?.inputJson).toEqual(updatedInput);
+		expect(call?.inputChars).toBe(JSON.stringify(updatedInput).length);
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "success" })
+			.where(eq(narratorToolCalls.id, f.callId));
+		await expect(
+			persistPermissionResolvedInput(f.id, f.tu.toolUseId, f.binding, { content: "rejected" }),
+		).rejects.toThrow("expired/started");
+		const unchanged = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, f.callId),
+		});
+		expect(unchanged?.inputChars).toBe(call?.inputChars);
+		expect(unchanged?.inputJson).toEqual(updatedInput);
+	});
+
 	for (const kind of ["primary", "subagent"] as const)
 		for (const tool of ["Write", "Bash"] as const) {
 			test(`${kind} ${tool}: a newly added ancestor blacklist wins over the prior real allow`, async () => {

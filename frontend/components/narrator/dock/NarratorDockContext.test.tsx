@@ -198,26 +198,26 @@ describe("dock tool panel toggle", () => {
 
 	test("opens a closed panel", async () => {
 		bindApi();
-		await act(async () => dock.toggleToolPanel("filemod"));
-		expect(opened).toEqual([dockPanelId("filemod")]);
-		expect(present.has(dockPanelId("filemod"))).toBe(true);
+		await act(async () => dock.toggleToolPanel("spec"));
+		expect(opened).toEqual([dockPanelId("spec")]);
+		expect(present.has(dockPanelId("spec"))).toBe(true);
 	});
 
 	test("focuses an open panel that is not the active tab instead of closing it", async () => {
-		const filemod = mockToolPanel("filemod", false);
+		const spec = mockToolPanel("spec", false);
 		const tasks = mockToolPanel("tasks", true);
-		bindApi({ existing: [filemod, tasks] });
-		await act(async () => dock.toggleToolPanel("filemod"));
-		expect(filemod.api.isActive).toBe(true);
-		expect(present.has(dockPanelId("filemod"))).toBe(true);
+		bindApi({ existing: [spec, tasks] });
+		await act(async () => dock.toggleToolPanel("spec"));
+		expect(spec.api.isActive).toBe(true);
+		expect(present.has(dockPanelId("spec"))).toBe(true);
 		expect(opened).toEqual([]);
 	});
 
 	test("closes only when the panel is already the active tab", async () => {
-		const filemod = mockToolPanel("filemod", true);
-		bindApi({ existing: [filemod] });
-		await act(async () => dock.toggleToolPanel("filemod"));
-		expect(present.has(dockPanelId("filemod"))).toBe(false);
+		const spec = mockToolPanel("spec", true);
+		bindApi({ existing: [spec] });
+		await act(async () => dock.toggleToolPanel("spec"));
+		expect(present.has(dockPanelId("spec"))).toBe(false);
 		expect(opened).toEqual([]);
 	});
 });

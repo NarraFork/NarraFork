@@ -980,7 +980,6 @@ describe("real workspace Dockview resource lifecycle", () => {
 			ToolPanelShell: ({ children }: { children: ReactNode }) => <>{children}</>,
 			BrowserDockPanel: ResourceWrapper,
 			DetailsDockPanel: ResourceWrapper,
-			FileModDockPanel: ResourceWrapper,
 			FileTreeDockPanel: ResourceWrapper,
 			FileDockPanel: ResourceWrapper,
 			GitDockPanel: ResourceWrapper,

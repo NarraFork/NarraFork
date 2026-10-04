@@ -611,6 +611,53 @@ function sendAwaitSnapshot(input: {
 }
 
 describe("planned update recovery snapshot", () => {
+	test("manual startup claims prepared work once and resumes through existing recovery", async () => {
+		loadMode = "working";
+		setObservedRestartHandoffForTests(null);
+		updateCoordinator.writePlannedUpdateRecoverySnapshot({
+			version: 2,
+			updateEpoch: "manual-shutdown",
+			capturedAt: new Date().toISOString(),
+			resumeOnNextStartup: true,
+			narrators: [{ narratorId: "n1", locale: "en" }],
+		});
+		const startup = await getPlannedUpdateStartupProtection();
+		expect(startup.snapshot?.resumeOnNextStartup).toBe(true);
+		expect(startup.protection).toBe(startupProtection);
+		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toMatchObject({
+			evidenceOnly: true,
+			updateEpoch: "manual-shutdown",
+		});
+		expect(
+			updateCoordinator.consumePlannedUpdateRecoverySnapshot()?.resumeOnNextStartup,
+		).toBeUndefined();
+		const recovery = await restoreNarratorsAfterPlannedUpdate(startup);
+		await recovery?.completion;
+		expect(continueNarratorCalls).toBe(1);
+		expect(updateCoordinator.consumePlannedUpdateRecoverySnapshot()).toBeNull();
+		expect((await getPlannedUpdateStartupProtection()).snapshot).toBeNull();
+	});
+
+	test("failed manual recovery cannot authorize another ordinary boot", async () => {
+		loadMode = "working";
+		setObservedRestartHandoffForTests(null);
+		continueNarratorImpl = async () => {
+			throw new Error("recovery failed");
+		};
+		updateCoordinator.writePlannedUpdateRecoverySnapshot({
+			version: 2,
+			updateEpoch: "manual-failure",
+			capturedAt: new Date().toISOString(),
+			resumeOnNextStartup: true,
+			narrators: [{ narratorId: "n1", locale: "en" }],
+		});
+		const startup = await getPlannedUpdateStartupProtection();
+		const recovery = await restoreNarratorsAfterPlannedUpdate(startup);
+		await expect(recovery?.completion).rejects.toThrow("Failed to mount");
+		expect(continueNarratorCalls).toBe(1);
+		expect((await getPlannedUpdateStartupProtection()).snapshot).toBeNull();
+		expect(continueNarratorCalls).toBe(1);
+	});
 	test("loads startup protection from the manifest epoch before generic recovery", async () => {
 		updateCoordinator.writePlannedUpdateRecoverySnapshot({
 			version: 2,

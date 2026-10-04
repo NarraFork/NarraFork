@@ -33,7 +33,6 @@ import {
 import { type ReactNode, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useClipboard } from "../../hooks/useClipboard";
-import { formatLocaleDateTime } from "../../lib/intl-format";
 import {
 	type CurrentDiffFile,
 	type CurrentDiffTarget,
@@ -51,6 +50,7 @@ import { useGitFolderPrefs } from "../../hooks/useGitFolderPrefs";
 import { useGitStatusFilter } from "../../hooks/useGitStatusFilter";
 import { useGitViewMode } from "../../hooks/useGitViewMode";
 import { type GitTarget, gitCanWrite, gitTargetKey } from "../../lib/api/git";
+import { formatLocaleDateTime } from "../../lib/intl-format";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { buildAttributionLabels } from "./attribution-label";
 import { GitFileDiff } from "./GitFileDiff";
@@ -372,18 +372,18 @@ export function GitChangesTab({
 
 			<Group gap={6} px="xs" py={6} wrap="nowrap" style={{ flexShrink: 0 }}>
 				{/* Counts live on the section headers below; this title is just the panel name. */}
-				<Text size="sm" fw={600} style={{ flex: 1, minWidth: 0 }}>
+				<Text size="sm" fw={600} style={{ flexShrink: 0, flexGrow: status.branch ? 0 : 1 }}>
 					{t("panel.changes")}
 				</Text>
 				{status.branch && (
-					<Group gap={2} wrap="nowrap" style={{ minWidth: 0, maxWidth: "34%" }}>
+					<Group gap={2} wrap="nowrap" justify="flex-end" style={{ flex: 1, minWidth: 0 }}>
 						<Text
 							size="xs"
 							c="dimmed"
 							ff="monospace"
 							truncate
 							title={status.branch}
-							style={{ minWidth: 0, userSelect: "text" }}
+							style={{ minWidth: 0, flexShrink: 1, userSelect: "text" }}
 						>
 							{status.branch}
 						</Text>
@@ -393,6 +393,7 @@ export function GitChangesTab({
 								color={clipboard.copied ? "green" : "gray"}
 								size="sm"
 								aria-label={t("panel.copyBranch")}
+								style={{ flexShrink: 0 }}
 								onClick={() => clipboard.copy(status.branch)}
 							>
 								{clipboard.copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
@@ -400,7 +401,7 @@ export function GitChangesTab({
 						</Tooltip>
 					</Group>
 				)}
-				<Button.Group>
+				<Button.Group style={{ flexShrink: 0 }}>
 					<Button
 						size="compact-xs"
 						variant={viewMode === "tree" ? "filled" : "subtle"}

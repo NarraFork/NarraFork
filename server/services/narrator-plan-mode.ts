@@ -3,6 +3,10 @@ import { db } from "../db";
 import { narrators, narratorToolCalls } from "../db/schema";
 import { shouldDisablePlanReflectionReview } from "../lib/agent/tools/plan-mode";
 import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
+import {
+	measureSerializedCharacters,
+	queueContextCharacterRefresh,
+} from "../lib/context-characters";
 import { generateId } from "../lib/id";
 import { addTrait, parseTraits, removeTrait } from "../lib/narrator-utils";
 import { forcesRelaxedPlan, resolveEffectiveRelaxedPlan } from "../lib/permission-modes";
@@ -284,7 +288,7 @@ export async function commitPreparedEnterPlanModeResult(
 						eq(narratorToolCalls.toolUseId, prepared.toolUseId),
 						eq(narratorToolCalls.toolName, "EnterPlanMode"),
 					),
-					columns: { id: true, status: true, inputJson: true },
+					columns: { id: true, messageId: true, status: true, inputJson: true },
 				})
 				.sync();
 			if (!toolCall || !["initializing", "pending", "running"].includes(toolCall.status)) {
@@ -323,8 +327,11 @@ export async function commitPreparedEnterPlanModeResult(
 
 			tx.update(narratorToolCalls)
 				.set({
-					...(inputOverride ? { inputJson: inputOverride } : {}),
+					...(inputOverride
+						? { inputJson: inputOverride, inputChars: measureSerializedCharacters(inputOverride) }
+						: {}),
 					outputJson: result.output ?? null,
+					outputChars: measureSerializedCharacters(result.output ?? null),
 					status: "success",
 					durationMs: result.durationMs ?? null,
 					permissionStartedAt:
@@ -355,6 +362,7 @@ export async function commitPreparedEnterPlanModeResult(
 				.run();
 
 			return {
+				contextMessageId: toolCall.messageId,
 				traits: nextTraits,
 				planFileId,
 				planFilePath: buildPlanFileRelPath(planFileId),
@@ -368,8 +376,10 @@ export async function commitPreparedEnterPlanModeResult(
 		});
 		// The in-memory identity is consumed only after SQLite commits. A transaction
 		// failure leaves it pending so the same successful tool result can be retried.
+		const { contextMessageId, ...resultState } = state;
+		queueContextCharacterRefresh(narratorId, contextMessageId);
 		consumePendingPlanFileId(narratorId, prepared.planFileId);
-		return state;
+		return resultState;
 	});
 }
 

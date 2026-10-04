@@ -10,7 +10,8 @@
  * in edit mode by the parent (`isEditing`), which decides when to unmount. The
  * parent keeps just the id of the row being edited.
  *
- * Idle rows show attachment counts; users can expand previews on demand.
+ * Idle rows always identify their sender and show attachment previews directly.
+ * Double-clicking message content enters edit mode; actions/previews stay independent.
  * Edit mode always shows the retained and newly selected attachments.
  */
 
@@ -50,6 +51,7 @@ import type {
 	BufferedTextFileSummary,
 	BufferMessageSummary,
 } from "../../../lib/api/types";
+import { UserAvatar } from "../../UserAvatar";
 import {
 	EditNewImageThumb,
 	EditTextFileChip,
@@ -79,11 +81,10 @@ import {
 	seedQueuedEditAttachments,
 } from "./queued-attachment-edit";
 
-/** Thumbnails shown inline before collapsing the rest into a "+N" badge. */
-const INLINE_THUMB_LIMIT = 3;
-
 export interface QueuedMessageRowProps {
 	msg: BufferMessageSummary;
+	/** Legacy images without an explicit upload owner belong to this narrator. */
+	narratorId?: string;
 	index: number;
 	isEditing: boolean;
 	onStartEdit: (msg: BufferMessageSummary) => void;
@@ -98,7 +99,6 @@ export interface QueuedMessageRowProps {
 	onRetry: (id: string) => Promise<{ ok: true; resumed: boolean }>;
 	cancelBufferLabel: string;
 	editLabel: string;
-	showAuthor?: boolean;
 	canMoveUp?: boolean;
 	canMoveDown?: boolean;
 	/** false rejects the action; void remains compatible with external row hosts. */
@@ -107,58 +107,59 @@ export interface QueuedMessageRowProps {
 	onClearAll?: () => void;
 }
 
-/** Read-only attachment strip for the collapsed/idle row. */
 function QueuedAttachmentPreview({
+	narratorId,
 	images,
 	textFiles,
 	fileReferences = [],
 }: {
+	narratorId?: string;
 	images: BufferedImageSummary[];
 	textFiles: BufferedTextFileSummary[];
 	fileReferences?: FileReference[];
 }) {
-	const { t } = useTranslation("narrator");
 	if (images.length === 0 && textFiles.length === 0 && fileReferences.length === 0) return null;
-	const shown = images.slice(0, INLINE_THUMB_LIMIT);
-	const overflow = images.length - shown.length;
 	return (
-		<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-			{shown.map((image) => (
-				<QueuedImageThumb
+		<Group gap={4} wrap="wrap" data-queue-attachment-preview style={{ minWidth: 0 }}>
+			{images.map((image) => (
+				<Box
 					key={image.imageId}
-					imageId={image.imageId}
-					filename={image.filename}
-					uploadNarratorId={image.uploadNarratorId}
-				/>
+					data-queue-image={image.imageId}
+					title={image.filename ?? undefined}
+					style={{ flexShrink: 0 }}
+				>
+					<QueuedImageThumb
+						imageId={image.imageId}
+						filename={image.filename}
+						uploadNarratorId={image.uploadNarratorId ?? narratorId}
+						size={24}
+					/>
+				</Box>
 			))}
 			{fileReferences.map((reference) => (
-				<Tooltip key={reference.id} label={`${reference.deviceId}: ${reference.path}`}>
+				<Tooltip key={reference.id} label={`${reference.deviceId}: ${reference.path}`} withinPortal>
 					<Text size="xs" c="blue" truncate style={{ maxWidth: 160 }}>
 						{fileReferenceToken(reference)}
 					</Text>
 				</Tooltip>
 			))}
-			{overflow > 0 && (
-				<Text size="xs" c="blue">
-					{t("queuedMoreImages", { count: overflow })}
-				</Text>
-			)}
-			{textFiles.length > 0 && (
-				<Tooltip label={textFiles.map((file) => file.filename).join("\n")} multiline>
-					<Group gap={2} wrap="nowrap">
-						<IconFile size={14} color="var(--mantine-color-blue-5)" />
-						<Text size="xs" c="blue">
-							{textFiles.length}
+			{textFiles.map((file) => (
+				<Tooltip key={`${file.index}:${file.filename}`} label={file.filename} withinPortal>
+					<Group gap={2} wrap="nowrap" style={{ maxWidth: 160, minWidth: 0 }}>
+						<IconFile size={14} color="var(--mantine-color-blue-5)" style={{ flexShrink: 0 }} />
+						<Text size="xs" c="blue" truncate>
+							{file.filename}
 						</Text>
 					</Group>
 				</Tooltip>
-			)}
+			))}
 		</Group>
 	);
 }
 
 export function QueuedMessageRow({
 	msg,
+	narratorId,
 	index,
 	isEditing,
 	onStartEdit,
@@ -168,7 +169,6 @@ export function QueuedMessageRow({
 	onRetry,
 	cancelBufferLabel,
 	editLabel,
-	showAuthor,
 	canMoveUp,
 	canMoveDown,
 	onChangeMode,
@@ -177,7 +177,6 @@ export function QueuedMessageRow({
 }: QueuedMessageRowProps) {
 	const { t } = useTranslation("narrator");
 	const mode = queuedMessageMode(msg);
-	const [attachmentsExpanded, setAttachmentsExpanded] = useState(false);
 	const [textExpanded, setTextExpanded] = useState(false);
 	const borderColor =
 		mode === "interrupt"
@@ -185,8 +184,6 @@ export function QueuedMessageRow({
 			: mode === "tool"
 				? "var(--mantine-color-indigo-4)"
 				: "var(--mantine-color-default-border)";
-	const attachmentCount =
-		(msg.images?.length ?? 0) + (msg.textFiles?.length ?? 0) + (msg.fileReferences?.length ?? 0);
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: msg.id,
 		disabled: mode !== "turn" || isEditing,
@@ -240,6 +237,35 @@ export function QueuedMessageRow({
 			setChangingMode(null);
 		}
 	};
+	const canEdit = !isEditing && !retrying && changingMode === null && !urgentCommitted;
+	const startEditing = () => {
+		if (
+			isEditing ||
+			retryingRef.current ||
+			changingModeRef.current ||
+			urgentRequestedRef.current ||
+			mode === "interrupt"
+		)
+			return;
+		onStartEdit(msg);
+	};
+	const senderHeader = (
+		<Group gap={4} wrap="nowrap" data-queue-sender style={{ minWidth: 0 }}>
+			{msg.creator && (
+				<UserAvatar
+					username={msg.creator.username}
+					userId={msg.creator.id}
+					avatarColor={msg.creator.avatarColor}
+					avatarImageId={msg.creator.avatarImageId}
+					size={18}
+					showTooltip={false}
+				/>
+			)}
+			<Text size="xs" c="dimmed" truncate title={msg.creator?.username} style={{ minWidth: 0 }}>
+				{msg.creator?.username ?? t("queuedSenderUnknown")}
+			</Text>
+		</Group>
+	);
 	const [retryError, setRetryError] = useState<string | null>(null);
 	const retry = async () => {
 		if (retryingRef.current || changingModeRef.current || !failed) return;
@@ -487,6 +513,19 @@ export function QueuedMessageRow({
 				gap="xs"
 				wrap="nowrap"
 				bg="var(--mantine-color-default-hover)"
+				data-queue-message-row={msg.id}
+				onDoubleClick={(event) => {
+					const target = event.target;
+					if (!(target instanceof Element) || !event.currentTarget.contains(target)) return;
+					if (
+						target.closest(
+							"button, a, input, textarea, select, [role='button'], [data-queue-attachment-preview], [data-queue-drag-handle]",
+						)
+					)
+						return;
+					event.preventDefault();
+					startEditing();
+				}}
 			>
 				{mode === "turn" &&
 					dragHandle(<IconGripVertical size={14} color="var(--mantine-color-dimmed)" />)}
@@ -500,11 +539,7 @@ export function QueuedMessageRow({
 						paddingLeft: 8,
 					}}
 				>
-					{showAuthor && msg.creator && (
-						<Text size="xs" c="dimmed">
-							{msg.creator.username}
-						</Text>
-					)}
+					{senderHeader}
 					<Text
 						component="button"
 						type="button"
@@ -512,6 +547,12 @@ export function QueuedMessageRow({
 						lineClamp={textExpanded ? undefined : 2}
 						aria-expanded={textExpanded}
 						aria-label={t(textExpanded ? "queuedCollapseText" : "queuedExpandText")}
+						title={t("queuedDoubleClickEdit")}
+						onDoubleClick={(event) => {
+							event.preventDefault();
+							event.stopPropagation();
+							startEditing();
+						}}
 						onClick={() => setTextExpanded((expanded) => !expanded)}
 						onKeyDown={(event) => {
 							if (event.key === "Enter" || event.key === " ") {
@@ -532,25 +573,12 @@ export function QueuedMessageRow({
 					>
 						{msg.text}
 					</Text>
-					{attachmentCount > 0 && (
-						<Button
-							size="compact-xs"
-							variant="subtle"
-							color="gray"
-							style={{ alignSelf: "flex-start" }}
-							onClick={() => setAttachmentsExpanded(!attachmentsExpanded)}
-							aria-expanded={attachmentsExpanded}
-						>
-							{t("queuedAttachments", { count: attachmentCount })}
-						</Button>
-					)}
-					{attachmentsExpanded && (
-						<QueuedAttachmentPreview
-							images={msg.images ?? []}
-							textFiles={msg.textFiles ?? []}
-							fileReferences={msg.fileReferences}
-						/>
-					)}
+					<QueuedAttachmentPreview
+						narratorId={narratorId}
+						images={msg.images ?? []}
+						textFiles={msg.textFiles ?? []}
+						fileReferences={msg.fileReferences}
+					/>
 					{failureNotice}
 				</Stack>
 				{failed && (
@@ -611,7 +639,11 @@ export function QueuedMessageRow({
 						</ActionIcon>
 					</Menu.Target>
 					<Menu.Dropdown>
-						<Menu.Item leftSection={<IconPencil size={14} />} onClick={() => onStartEdit(msg)}>
+						<Menu.Item
+							leftSection={<IconPencil size={14} />}
+							disabled={!canEdit}
+							onClick={startEditing}
+						>
 							{editLabel}
 						</Menu.Item>
 
@@ -637,6 +669,19 @@ export function QueuedMessageRow({
 						)}
 					</Menu.Dropdown>
 				</Menu>
+				<Tooltip label={cancelBufferLabel} withinPortal>
+					<CloseButton
+						size="sm"
+						variant="subtle"
+						aria-label={cancelBufferLabel}
+						title={cancelBufferLabel}
+						disabled={retrying || changingMode !== null}
+						onClick={(event) => {
+							event.stopPropagation();
+							if (!retryingRef.current && !changingModeRef.current) onRemove(msg.id);
+						}}
+					/>
+				</Tooltip>
 			</Group>
 		);
 	}
@@ -662,6 +707,7 @@ export function QueuedMessageRow({
 					</Text>,
 				)}
 			<Stack gap={6} style={{ flex: 1, minWidth: 0 }}>
+				{senderHeader}
 				{failureNotice}
 				<Textarea
 					ref={textareaRef}
@@ -729,7 +775,7 @@ export function QueuedMessageRow({
 								<QueuedImageThumb
 									imageId={image.imageId}
 									filename={image.filename}
-									uploadNarratorId={image.uploadNarratorId}
+									uploadNarratorId={image.uploadNarratorId ?? narratorId}
 									size={44}
 								/>
 								<CloseButton

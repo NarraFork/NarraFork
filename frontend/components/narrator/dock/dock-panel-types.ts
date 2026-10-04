@@ -39,7 +39,6 @@ export const NARRATOR_DOCK_COMPONENT: Record<NarratorDockPanelType, string> = {
 	chat: PANEL_COMPONENT.chat,
 	terminal: PANEL_COMPONENT.terminal,
 	details: PANEL_COMPONENT.details,
-	filemod: PANEL_COMPONENT.filemod,
 	spec: PANEL_COMPONENT.spec,
 	git: PANEL_COMPONENT.git,
 	browser: PANEL_COMPONENT.browser,
@@ -131,7 +130,6 @@ export const NARRATOR_DOCK_DEFAULT_TITLE: Record<NarratorDockPanelType, string> 
 	chat: PANEL_DEFAULT_TITLE.chat,
 	terminal: PANEL_DEFAULT_TITLE.terminal,
 	details: PANEL_DEFAULT_TITLE.details,
-	filemod: PANEL_DEFAULT_TITLE.filemod,
 	spec: PANEL_DEFAULT_TITLE.spec,
 	git: PANEL_DEFAULT_TITLE.git,
 	browser: PANEL_DEFAULT_TITLE.browser,
@@ -150,7 +148,6 @@ export const NARRATOR_DOCK_DEFAULT_TITLE: Record<NarratorDockPanelType, string> 
 const NARRATOR_TOOL_PANEL_TYPES: ReadonlySet<string> = new Set([
 	"terminal",
 	"details",
-	"filemod",
 	"spec",
 	"git",
 	"browser",

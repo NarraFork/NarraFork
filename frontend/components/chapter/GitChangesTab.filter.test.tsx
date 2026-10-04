@@ -344,6 +344,25 @@ describe("GitChangesTab status filter", () => {
 		root = undefined;
 	});
 
+	test("branch name uses the remaining header space instead of a percentage cap", async () => {
+		const chapterId = "chapter-branch-width";
+		const client = makeClient();
+		const branch = "fix/dashboard-unrestricted-branch-name";
+		client.setQueryData(["gitStatus", chapterId], { ...makeMixedStatus(), branch });
+		const container = renderTab(chapterId, client);
+		await flushRender();
+
+		// linkedom has no layout engine; verify the rendered flex sizing contract.
+		const name = container.querySelector<HTMLElement>(`[title="${branch}"]`);
+		expect(name?.textContent).toBe(branch);
+		const group = name?.parentElement;
+		expect(group?.style.flex).toBe("1");
+		expect(group?.style.minWidth).toBe("0");
+		expect(group?.style.maxWidth || "").toBe("");
+		expect(name?.style.flexShrink).toBe("1");
+		client.clear();
+	});
+
 	test("offers one chip per kind of change, counting rows and nothing selected", async () => {
 		const chapterId = "chapter-filter-chips";
 		const client = makeClient();

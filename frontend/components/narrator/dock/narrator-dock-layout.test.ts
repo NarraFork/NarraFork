@@ -11,6 +11,38 @@ import {
 	saveNarratorDockLayout,
 } from "./narrator-dock-layout";
 
+test("loading a legacy filemod layout keeps chat and filetree and repairs group references", () => {
+	const layout = fakeLayout(["ndock-chat", "ndock-filemod", "ndock-filetree"], {
+		"ndock-chat": { panelType: "chat" },
+		"ndock-filemod": { panelType: "filemod" },
+		"ndock-filetree": { panelType: "filetree" },
+	});
+	layout.grid.root = {
+		type: "branch",
+		data: [
+			{
+				type: "leaf",
+				data: { id: "main", views: Object.keys(layout.panels), activeView: "ndock-filemod" },
+			},
+		],
+	};
+	mem.setItem("narrafork_ndock_n1_desktop", JSON.stringify({ version: 1, layout }));
+	const loaded = loadNarratorDockLayout("n1", "desktop");
+	expect(Object.keys(loaded?.panels ?? {})).toEqual(["ndock-chat", "ndock-filetree"]);
+	expect(loaded?.grid.root.data as unknown).toEqual([
+		{
+			type: "leaf",
+			data: { id: "main", views: ["ndock-chat", "ndock-filetree"], activeView: "ndock-chat" },
+		},
+	]);
+});
+
+test("loading a retired-only layout falls back to defaults", () => {
+	const layout = fakeLayout(["ndock-filemod"], { "ndock-filemod": { panelType: "filemod" } });
+	mem.setItem("narrafork_ndock_n1_desktop", JSON.stringify({ version: 1, layout }));
+	expect(loadNarratorDockLayout("n1", "desktop")).toBeNull();
+});
+
 // ── localStorage stub (bun test has no DOM) ──
 class MemoryStorage {
 	private store = new Map<string, string>();

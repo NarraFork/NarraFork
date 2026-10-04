@@ -44,6 +44,11 @@ import {
 	resolveAutoContinuationMode,
 } from "../lib/boolean-override";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
+import {
+	measureMessageCharacters,
+	measureSerializedCharacters,
+	queueContextCharacterRefresh,
+} from "../lib/context-characters";
 import { resolveInjectedDevices } from "../lib/device-injection-trait";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
@@ -1059,7 +1064,7 @@ export async function buildSystemPrompt(
 		allowLocalExecution?: boolean;
 	},
 	planFilePath?: string,
-): Promise<{ prompt: string | null; usedCompactSummary: boolean }> {
+): Promise<import("./narrator-prompt").BuildPromptResult> {
 	return buildEffectiveSystemPrompt({
 		basePrompt: narrator.systemPrompt,
 		cwd,
@@ -4829,6 +4834,7 @@ function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrat
 export const TOOL_CALL_RERUN_RESET_FIELDS = {
 	status: "initializing" as const,
 	outputJson: null,
+	outputChars: 0,
 	errorMessage: null,
 	permissionDenyMessage: null,
 	permissionDecidedBy: null,
@@ -6477,7 +6483,10 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 						(block) => block.type !== "tool_use" || !toolUseIds.has(block.id as string),
 					);
 					tx.update(narratorMessages)
-						.set({ contentJson: filtered })
+						.set({
+							contentJson: filtered,
+							contextCharsJson: measureMessageCharacters("assistant", filtered),
+						})
 						.where(eq(narratorMessages.id, partialId))
 						.run();
 				}
@@ -6491,6 +6500,7 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 				return true;
 			});
 
+			if (hasContent) queueContextCharacterRefresh(narratorId, partialId);
 			if (!hasContent) {
 				// Truly empty — safe to delete
 				await cleanupPartialMessage(partialId, narratorId);
@@ -6546,13 +6556,17 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 						(block) => block.type !== "tool_use" || !unexecutedToolUseIds.has(block.id as string),
 					);
 					tx.update(narratorMessages)
-						.set({ contentJson: filtered })
+						.set({
+							contentJson: filtered,
+							contextCharsJson: measureMessageCharacters("assistant", filtered),
+						})
 						.where(eq(narratorMessages.id, partialId))
 						.run();
 				}
 			}
 		});
 
+		queueContextCharacterRefresh(narratorId, partialId);
 		logger.info("Finalized partial message with executed tool calls", {
 			narratorId,
 			partialId,
@@ -6599,6 +6613,7 @@ async function markInterruptedToolCallsForMessageUnlocked(
 			status: "fail",
 			errorMessage: "Narrator interrupted by user",
 			outputJson: getToolMessage("interruptedByUser", locale),
+			outputChars: measureSerializedCharacters(getToolMessage("interruptedByUser", locale)),
 			completedAt: new Date().toISOString(),
 		})
 		.where(
@@ -6608,6 +6623,7 @@ async function markInterruptedToolCallsForMessageUnlocked(
 				inArray(narratorToolCalls.status, [...INTERRUPTABLE_TOOL_CALL_STATUSES]),
 			),
 		);
+	queueContextCharacterRefresh(narratorId, messageId);
 }
 
 /**
@@ -6623,12 +6639,13 @@ async function cleanupOrphanedToolCalls(narratorId: string, locale: Locale = "en
 }
 
 async function cleanupOrphanedToolCallsUnlocked(narratorId: string, locale: Locale): Promise<void> {
-	await db
+	const changed = await db
 		.update(narratorToolCalls)
 		.set({
 			status: "fail",
 			errorMessage: "Narrator interrupted by user",
 			outputJson: getToolMessage("interruptedByUser", locale),
+			outputChars: measureSerializedCharacters(getToolMessage("interruptedByUser", locale)),
 			completedAt: new Date().toISOString(),
 		})
 		.where(
@@ -6636,7 +6653,9 @@ async function cleanupOrphanedToolCallsUnlocked(narratorId: string, locale: Loca
 				eq(narratorToolCalls.narratorId, narratorId),
 				inArray(narratorToolCalls.status, [...INTERRUPTABLE_TOOL_CALL_STATUSES]),
 			),
-		);
+		)
+		.returning({ messageId: narratorToolCalls.messageId });
+	for (const row of changed) queueContextCharacterRefresh(narratorId, row.messageId);
 }
 
 /**
@@ -7649,6 +7668,7 @@ export async function recoverOnStartup(
 				status: "fail",
 				errorMessage: "Interrupted by server restart",
 				outputJson: getToolMessage("interruptedByServerRestart"),
+				outputChars: measureSerializedCharacters(getToolMessage("interruptedByServerRestart")),
 			})
 			.where(
 				inArray(
@@ -7656,6 +7676,8 @@ export async function recoverOnStartup(
 					staleToolCalls.map((toolCall) => toolCall.id),
 				),
 			);
+		for (const call of staleToolCalls)
+			queueContextCharacterRefresh(call.narratorId, call.messageId);
 		logger.info("Stale running tool calls marked as failed on startup", {
 			count: staleToolCalls.length,
 		});
@@ -7674,6 +7696,7 @@ export async function recoverOnStartup(
 				status: "fail",
 				errorMessage: "Interrupted by server restart",
 				outputJson: getToolMessage("interruptedByServerRestart"),
+				outputChars: measureSerializedCharacters(getToolMessage("interruptedByServerRestart")),
 			})
 			.where(
 				inArray(
@@ -7681,6 +7704,8 @@ export async function recoverOnStartup(
 					staleInitializing.map((toolCall) => toolCall.id),
 				),
 			);
+		for (const call of staleInitializing)
+			queueContextCharacterRefresh(call.narratorId, call.messageId);
 		logger.info("Stale initializing tool calls marked as failed on startup", {
 			count: staleInitializing.length,
 		});

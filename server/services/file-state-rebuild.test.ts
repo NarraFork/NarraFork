@@ -2111,7 +2111,7 @@ describe("device-aware file state rebuild", () => {
 		});
 	});
 
-	test("lightweight history queries preserve and reject unsafe legacy remote targets", async () => {
+	test("history queries preserve and reject unsafe legacy remote targets", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "nf-legacy-remote-query-"));
 		tempDirs.push(cwd);
 		const narratorId = await createNarrator(cwd);
@@ -2140,17 +2140,18 @@ describe("device-aware file state rebuild", () => {
 			inputJson: {
 				file_path: "relative.txt",
 				device: "legacy-remote",
-				content: "large body deliberately omitted by the lightweight query",
+				content: "recorded body remains available for file-state rebuilding",
 			},
 			status: "success",
 			createdAt,
 		});
 
-		const rows = await queryOrderedToolCalls(narratorId, undefined, { filePathOnly: true });
+		const rows = await queryOrderedToolCalls(narratorId);
 		expect(rows).toHaveLength(1);
 		expect(rows[0]?.inputJson).toEqual({
 			file_path: "relative.txt",
 			device: "legacy-remote",
+			content: "recorded body remains available for file-state rebuilding",
 		});
 		expect(() => groupByDeviceFileStrict(rows, cwd)).toThrow(
 			"targeted remote device legacy-remote",
@@ -2158,7 +2159,7 @@ describe("device-aware file state rebuild", () => {
 	});
 
 	/**
-	 * `/file-modifications` canonicalizes one identity per snapshot. Rebuilding the
+	 * File-state rebuilding canonicalizes one identity per snapshot. Rebuilding the
 	 * alias map inside that loop is O(snapshots × toolCalls) of synchronous work and
 	 * froze the event loop for ~4.3s on a 1436 × 7213 narrator. The hoisted form must
 	 * resolve every alias — lexical, canonical and case-folded — identically, or the
@@ -2188,9 +2189,7 @@ describe("device-aware file state rebuild", () => {
 			{ deviceId: "local", filePath: "/workspace/b.txt" },
 		);
 
-		const toolCalls = await queryOrderedToolCalls(narratorId, undefined, {
-			filePathOnly: true,
-		});
+		const toolCalls = await queryOrderedToolCalls(narratorId);
 		const aliases = buildCanonicalIdentityAliases(toolCalls, cwd);
 
 		// Includes the lexical alias, its case-folded variant and an unknown path that

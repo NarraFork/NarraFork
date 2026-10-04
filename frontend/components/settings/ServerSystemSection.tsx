@@ -21,6 +21,7 @@ import { PathInput } from "../common/PathInput";
 import type { UpdateModalData } from "../UpdateModal";
 import { BrandingSection } from "./BrandingSection";
 import { DependencyStatus } from "./DependencyStatus";
+import { SystemShutdownCard } from "./SystemShutdownCard";
 import { TlsSection } from "./TlsSection";
 
 const HOST_PRESETS = ["localhost", "127.0.0.1", "::1", "192.168.0.0", "0.0.0.0"];
@@ -112,6 +113,7 @@ export function ServerSystemSection({
 		<Stack>
 			{/* Server */}
 			<Title order={5}>{t("serverSubSection")}</Title>
+			<SystemShutdownCard />
 			{settingsFeatureCapability.storagePath && (
 				<Alert color="blue" variant="light" py={6} title={t("settingsStoragePathTitle")}>
 					{t("settingsStoragePathDesc", { path: settingsFeatureCapability.storagePath })}

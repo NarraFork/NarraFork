@@ -31,7 +31,7 @@ const FocusChatSlotContext = createContext<ChatSlotBridge | null>(null);
 // Outbound publications are read by sibling tool panels, not by the chat that
 // published them. Keep commands/selection reactive without feeding those state
 // publications back through the whole chat. Getters still expose the latest data.
-const CHAT_OUTBOUND_FIELDS = new Set(["fileModProps", "detailsProps", "browserInfo"]);
+const CHAT_OUTBOUND_FIELDS = new Set(["detailsProps", "browserInfo"]);
 
 export function createFocusChatDockView() {
 	let source: ReturnType<typeof useNarratorDockContext> = null;
@@ -54,9 +54,6 @@ export function createFocusChatDockView() {
 		const initial = dock;
 		view = {
 			...dock,
-			get fileModProps() {
-				return source?.fileModProps ?? null;
-			},
 			get detailsProps() {
 				return source?.detailsProps ?? null;
 			},

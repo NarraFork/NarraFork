@@ -43,7 +43,6 @@ import {
 	containerInstances,
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
-	narratorFileSnapshots,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -258,16 +257,12 @@ import { normalizePathKey, type PathFlavor, pathKeyContains } from "../services/
 import { captureFileReferences } from "../services/file-reference-service";
 import {
 	applyToolCall,
-	buildCanonicalIdentityAliases,
-	canonicalizeDeviceFileIdentityWith,
 	type DeviceFileIdentity,
 	type DeviceFileState,
 	deviceFileKey,
 	FileHistoryError,
 	getAffectedDeviceFilesStrict,
 	getToolCallFileIdentityStrict,
-	groupByDeviceFileStrict,
-	queryOrderedToolCalls,
 	rebuildDeviceFileState,
 	rebuildDeviceFileStatesExcluding,
 } from "../services/file-state-rebuild";
@@ -284,6 +279,7 @@ import {
 	retryBufferedMessage,
 	updateBufferedMessageMode,
 } from "../services/narrator-buffer";
+import { getNarratorContextComposition } from "../services/narrator-context-composition";
 import {
 	getNarratorDraft,
 	getNarratorIdsWithDraft,
@@ -745,6 +741,13 @@ narratorRoutes.use("/:id", async (c, next) => {
 });
 
 narratorRoutes.route("/:id/file-references", fileReferenceRoutes);
+
+// The /:id/* middleware above enforces requireNarratorAccess(..., "read").
+narratorRoutes.get("/:id/context-composition", async (c) => {
+	return c.json(
+		await getNarratorContextComposition(c.req.param("id"), c.req.raw.signal, c.req.query("cursor")),
+	);
+});
 
 /**
  * Gate for the routes keyed by a permission request id.
@@ -5307,6 +5310,7 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 					},
 				],
 				contentText: buildAskInPassingContentText(),
+				contextCharsJson: { segments: [] },
 				createdBy: userId,
 				createdAt: now,
 			})
@@ -5430,7 +5434,11 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	const resolvedContentText = buildAskInPassingContentText(question);
 	const updatedMsg = db.transaction((tx) => {
 		tx.update(narratorMessages)
-			.set({ contentJson: resolvedContentJson, contentText: resolvedContentText })
+			.set({
+				contentJson: resolvedContentJson,
+				contentText: resolvedContentText,
+				contextCharsJson: { segments: [] },
+			})
 			.where(eq(narratorMessages.id, pendingMessageId))
 			.run();
 
@@ -5909,100 +5917,6 @@ async function resolveSeqBoundaryStartedAt(
 	return earliest?.createdAt ?? null;
 }
 
-/** List file snapshots for a narrator */
-narratorRoutes.get("/:id/patches", async (c) => {
-	const narratorId = c.req.param("id");
-
-	// Project out originalContent (full file body) — the list only needs metadata.
-	// Full content is available via /patches/:id/diff.
-	const snapshots = await db.query.narratorFileSnapshots.findMany({
-		where: eq(narratorFileSnapshots.narratorId, narratorId),
-		orderBy: asc(narratorFileSnapshots.createdAt),
-		columns: { id: true, narratorId: true, deviceId: true, filePath: true, createdAt: true },
-		extras: {
-			originalExists:
-				sql<number>`CASE WHEN ${narratorFileSnapshots.originalContent} IS NOT NULL THEN 1 ELSE 0 END`.as(
-					"original_exists",
-				),
-		},
-	});
-
-	return c.json(
-		snapshots.map((s) => ({
-			id: s.id,
-			narratorId: s.narratorId,
-			deviceId: s.deviceId,
-			filePath: s.filePath,
-			createdAt: s.createdAt,
-			originalExists: Number(s.originalExists) === 1,
-		})),
-	);
-});
-
-/** Get the diff for a specific file snapshot (original vs current rebuilt state) */
-narratorRoutes.get("/:id/patches/:patchId/diff", async (c) => {
-	const narratorId = c.req.param("id");
-	const patchId = c.req.param("patchId");
-	const upToMessageId = c.req.query("upToMessageId");
-	const fromMessageId = c.req.query("fromMessageId");
-
-	const snap = await db.query.narratorFileSnapshots.findFirst({
-		where: and(
-			eq(narratorFileSnapshots.id, patchId),
-			eq(narratorFileSnapshots.narratorId, narratorId),
-		),
-	});
-	if (!snap) return c.json({ error: "Snapshot not found" }, 404);
-
-	const identity = { deviceId: snap.deviceId, filePath: snap.filePath };
-	// Resolve "from" boundary: file state at fromMessageId (used as the diff base)
-	let originalContent: string | null;
-	let currentContent: string | null;
-	try {
-		if (fromMessageId) {
-			const fromRef = await db.query.narratorMessageRefs.findFirst({
-				where: and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, fromMessageId),
-				),
-				columns: { seq: true },
-			});
-			if (!fromRef) return c.json({ error: "fromMessageId not found in this narrator" }, 404);
-			originalContent =
-				(await rebuildDeviceFileState(narratorId, identity, fromRef.seq)) ?? snap.originalContent;
-		} else {
-			originalContent = snap.originalContent;
-		}
-
-		// Resolve "to" boundary: file state at upToMessageId (or current)
-		if (upToMessageId) {
-			const ref = await db.query.narratorMessageRefs.findFirst({
-				where: and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, upToMessageId),
-				),
-				columns: { seq: true },
-			});
-			if (!ref) return c.json({ error: "Message not found in this narrator" }, 404);
-			currentContent =
-				(await rebuildDeviceFileState(narratorId, identity, ref.seq)) ?? snap.originalContent;
-		} else {
-			currentContent = await rebuildDeviceFileState(narratorId, identity);
-		}
-	} catch (error) {
-		// Replay divergence means this file cannot be reconstructed; surface it
-		// rather than rendering a diff against a wrong baseline.
-		return c.json(fileHistoryConflictBody(error), 409);
-	}
-
-	return c.json({
-		deviceId: snap.deviceId,
-		filePath: snap.filePath,
-		original: originalContent,
-		current: currentContent,
-	});
-});
-
 /** Durable preview only: these endpoints do not apply files or mutate history. */
 function revertPreviewJson(c: Context, value: unknown) {
 	const body = JSON.stringify(value);
@@ -6194,214 +6108,6 @@ narratorRoutes.get("/:id/file-tree-status", async (c) => {
 		totalFiles: status.totalFiles,
 		truncated: status.totalFiles > status.files.length,
 	});
-});
-
-/**
- * Newest top-level messages exposed as range boundaries by `/file-modifications`.
- *
- * The timeline only populates two dropdowns, so it does not need the narrator's whole
- * history: an unbounded one measured 30278 rows / ~2.8 MB of JSON on a long narrator,
- * and `JSON.stringify` on that is synchronous main-thread work on every refresh.
- */
-const FILE_MODIFICATION_TIMELINE_LIMIT = 500;
-
-/** Get aggregated file modification summary for a narrator */
-narratorRoutes.get("/:id/file-modifications", async (c) => {
-	const narratorId = c.req.param("id");
-	const upToMessageId = c.req.query("upToMessageId");
-	const fromMessageId = c.req.query("fromMessageId");
-
-	// Project out originalContent (full file body); only its presence is needed here.
-	const snapshots = await db.query.narratorFileSnapshots.findMany({
-		where: eq(narratorFileSnapshots.narratorId, narratorId),
-		orderBy: asc(narratorFileSnapshots.createdAt),
-		columns: { id: true, deviceId: true, filePath: true, createdAt: true },
-		extras: {
-			originalExists:
-				sql<number>`CASE WHEN ${narratorFileSnapshots.originalContent} IS NOT NULL THEN 1 ELSE 0 END`.as(
-					"original_exists",
-				),
-		},
-	});
-	if (snapshots.length === 0) return c.json({ files: [], timeline: [] });
-
-	// Always query all tool calls first to build the timeline.
-	// Only file_path is needed here (grouping + timeline), so skip loading the
-	// full inputJson (Write contains entire file bodies).
-	const allToolCalls = await queryOrderedToolCalls(narratorId, undefined, { filePathOnly: true });
-
-	// Timeline feeds the range-boundary dropdowns, so it is capped: a long narrator has
-	// tens of thousands of top-level messages (measured: 30278 rows / ~2.8 MB of JSON),
-	// and serializing that on every refresh is synchronous main-thread work for a picker
-	// nobody scrolls that far back in. The newest window is the useful one, so take the
-	// tail and re-sort ascending for the UI.
-	//
-	// The ref window is taken FIRST, as its own subquery, and only then joined to the
-	// message row for `role`/`createdAt`. Written the other way round — join first, then
-	// `ORDER BY ref.seq DESC LIMIT n` — the planner drove from `narrator_messages` through
-	// `idx_messages_parent_tool_use_lookup`, whose `parent_tool_use_id IS NULL` predicate
-	// matches ~90% of every message in the database, and sorted this narrator's entire ref
-	// set in a temp B-tree to read 500 rows: ~300ms. Driving from `idx_narrator_refs_seq`
-	// makes the ORDER BY free and lets the LIMIT stop the scan early: 3.3ms, identical rows.
-	// The EXISTS is not decoration here — with the join still in place the planner ignores
-	// it and keeps the bad plan, so this query needs the refs-first shape rather than a
-	// predicate swap (unlike the ref-only queries in narrator-session.ts).
-	const newestRefPage = db
-		.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-		.from(narratorMessageRefs)
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				exists(
-					db
-						.select({ one: sql`1` })
-						.from(narratorMessages)
-						.where(
-							and(
-								eq(narratorMessages.id, narratorMessageRefs.messageId),
-								isNull(narratorMessages.parentToolUseId),
-							),
-						),
-				),
-			),
-		)
-		.orderBy(desc(narratorMessageRefs.seq))
-		.limit(FILE_MODIFICATION_TIMELINE_LIMIT + 1)
-		.as("newest_ref_page");
-
-	const newestRefs = await db
-		.select({
-			messageId: newestRefPage.messageId,
-			seq: newestRefPage.seq,
-			role: narratorMessages.role,
-			createdAt: narratorMessages.createdAt,
-		})
-		.from(newestRefPage)
-		.innerJoin(narratorMessages, eq(narratorMessages.id, newestRefPage.messageId))
-		.orderBy(desc(newestRefPage.seq));
-
-	const timelineTruncated = newestRefs.length > FILE_MODIFICATION_TIMELINE_LIMIT;
-	const windowRefs = timelineTruncated
-		? newestRefs.slice(0, FILE_MODIFICATION_TIMELINE_LIMIT)
-		: newestRefs;
-	windowRefs.reverse();
-
-	// Pre-compute which messageIds have file edits
-	const editMessageIds = new Set(allToolCalls.map((tc) => tc.messageId));
-	const timeline = windowRefs.map((ref) => ({
-		messageId: ref.messageId,
-		createdAt: ref.createdAt,
-		seq: ref.seq,
-		role: ref.role,
-		hasEdits: editMessageIds.has(ref.messageId),
-	}));
-
-	// Boundaries are resolved against the database, not the capped timeline: a client
-	// may still hold a messageId from outside the window (a stale tab, a deep link),
-	// and silently dropping the filter there would return the full unfiltered range
-	// instead of the narrower one the caller asked for.
-	const resolveSeq = async (messageId: string): Promise<number | undefined> => {
-		const inWindow = timeline.find((entry) => entry.messageId === messageId);
-		if (inWindow) return inWindow.seq;
-		const [row] = await db
-			.select({ seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, messageId),
-				),
-			)
-			.limit(1);
-		return row?.seq;
-	};
-
-	// Resolve seq boundaries for range filtering
-	const fromSeq = fromMessageId ? await resolveSeq(fromMessageId) : undefined;
-	const toSeq = upToMessageId ? await resolveSeq(upToMessageId) : undefined;
-
-	// Filter tool calls to the [fromSeq, toSeq] range
-	const isRangeFiltered = fromSeq !== undefined || toSeq !== undefined;
-	const filteredToolCalls = allToolCalls.filter((tc) => {
-		if (fromSeq !== undefined && tc.seq <= fromSeq) return false;
-		if (toSeq !== undefined && tc.seq > toSeq) return false;
-		return true;
-	});
-
-	const legacyLocalCwd = await resolveNarratorCwd(narratorId);
-	let grouped: ReturnType<typeof groupByDeviceFileStrict>;
-	try {
-		grouped = groupByDeviceFileStrict(filteredToolCalls, legacyLocalCwd);
-	} catch (error) {
-		return c.json(fileHistoryConflictBody(error), 409);
-	}
-
-	// Built once for the whole snapshot set: canonicalizing per snapshot would rebuild
-	// this map on every iteration, which is O(snapshots × toolCalls) of synchronous work
-	// and froze the event loop for ~4.3s on a 1436 × 7213 narrator.
-	const canonicalAliases = buildCanonicalIdentityAliases(allToolCalls, legacyLocalCwd);
-
-	const files = snapshots
-		.map((snap) => {
-			const identity = canonicalizeDeviceFileIdentityWith(
-				{ deviceId: snap.deviceId, filePath: snap.filePath },
-				canonicalAliases,
-			);
-			const ops = grouped.get(deviceFileKey(identity))?.calls ?? [];
-			if (isRangeFiltered && ops.length === 0) return null; // hide files with no ops in filtered mode
-			return {
-				deviceId: identity.deviceId,
-				filePath: identity.filePath,
-				pathFlavor: identity.pathFlavor,
-				identityKey: identity.identityKey,
-				snapshotId: snap.id,
-				originalExists: Number(snap.originalExists) === 1,
-				editCount: ops.length,
-				lastModifiedAt: ops.length > 0 ? ops[ops.length - 1].createdAt : snap.createdAt,
-				operations: ops.map((op) => ({
-					toolUseId: op.toolUseId,
-					toolName: op.toolName,
-					messageId: op.messageId,
-					createdAt: op.createdAt,
-				})),
-			};
-		})
-		.filter(Boolean);
-
-	return c.json({ files, timeline, timelineTruncated });
-});
-
-/** Revert a single file to its original state (before narrator touched it) */
-narratorRoutes.post("/:id/revert-file", async (c) => {
-	const narratorId = c.req.param("id");
-	const body = await c.req.json<{ deviceId?: string; filePath: string }>();
-	if (!body.filePath) return c.json({ error: "filePath is required" }, 400);
-	const deviceId = body.deviceId ?? "local";
-
-	if (isNarratorActive(narratorId)) {
-		return c.json({ error: "Cannot revert while narrator is running" }, 409);
-	}
-
-	const snap = await db.query.narratorFileSnapshots.findFirst({
-		where: and(
-			eq(narratorFileSnapshots.narratorId, narratorId),
-			eq(narratorFileSnapshots.deviceId, deviceId),
-			eq(narratorFileSnapshots.filePath, body.filePath),
-		),
-		columns: { filePath: true },
-	});
-	if (!snap) return c.json({ error: "No snapshot found for this file" }, 404);
-	// First-touch text is viewing material, not a verified operation or an expected
-	// current version. Do not read the full baseline just to reject unsafe replay.
-	return c.json(
-		revertConflictBody(
-			unavailableSnapshotRevert(
-				"legacy_unverified: a first-touch text snapshot cannot safely authorize file rollback.",
-				snap.filePath,
-			),
-		),
-		409,
-	);
 });
 
 /**
@@ -6618,8 +6324,7 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 /**
  * Preview the files that deleting a single tool_use block would roll back.
  *
- * Separate from `/delete-preview`, which describes "this message and everything
- * after it". A block deletion reverses exactly one recorded call, so its preview
+ * A block deletion reverses exactly one recorded call, so its preview
  * has to come from the tool-use scope or it would overstate what is removed.
  *
  * Contents are attached because this response also backs the diff view; without
@@ -6674,96 +6379,6 @@ narratorRoutes.get("/:id/block-delete-preview", async (c) => {
 		conflicts: preview.conflicts,
 		...(preview.subagentWarning ? { subagentWarning: preview.subagentWarning } : {}),
 	});
-});
-
-/** Preview file changes that would be reverted if a message is deleted */
-narratorRoutes.get("/:id/delete-preview", async (c) => {
-	const narratorId = c.req.param("id");
-	const messageId = c.req.query("messageId");
-	if (!messageId) return c.json({ error: "messageId query param is required" }, 400);
-
-	const targetRef = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-		columns: { seq: true },
-	});
-	if (!targetRef) return c.json({ error: "Message not found" }, 404);
-
-	// The tree-snapshot path below only reports a count, so resolve that with an
-	// aggregate first. Loading the rows to call `.length` would pull every
-	// `input_json` — Write calls carry whole file bodies — for nothing.
-	const revertScopeFilter = and(
-		eq(narratorToolCalls.narratorId, narratorId),
-		eq(narratorToolCalls.status, "success"),
-		gte(narratorMessageRefs.seq, targetRef.seq),
-	);
-	const revertScopeJoin = and(
-		eq(narratorMessageRefs.narratorId, narratorId),
-		eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-	);
-
-	// Deletion reverts files too, so the preview describes both scopes — with file
-	// contents attached, because this response also backs the diff view.
-	const scopes = await buildRevertScopePreviews(narratorId, targetRef.seq, true);
-	if (scopes) {
-		const [counted] = await db
-			.select({ value: countFn() })
-			.from(narratorToolCalls)
-			.innerJoin(narratorMessageRefs, revertScopeJoin)
-			.where(revertScopeFilter);
-		return c.json({ ...scopes, toolCallCount: counted?.value ?? 0 });
-	}
-
-	// Find all tool calls at or after the target message. Only the replay path needs
-	// the recorded inputs, so this query stays behind the tree-snapshot branch.
-	const toolCallsToRevert = await db
-		.select({
-			toolUseId: narratorToolCalls.toolUseId,
-			toolName: narratorToolCalls.toolName,
-			inputJson: narratorToolCalls.inputJson,
-			executionDeviceId: narratorToolCalls.executionDeviceId,
-			executionCwd: narratorToolCalls.executionCwd,
-			executionPathFlavor: narratorToolCalls.executionPathFlavor,
-			resolvedFilePath: narratorToolCalls.resolvedFilePath,
-			canonicalFilePath: narratorToolCalls.canonicalFilePath,
-			runtimeGeneration: narratorToolCalls.runtimeGeneration,
-			executionTargetsJson: narratorToolCalls.executionTargetsJson,
-		})
-		.from(narratorToolCalls)
-		.innerJoin(narratorMessageRefs, revertScopeJoin)
-		.where(revertScopeFilter);
-
-	let affectedFiles: DeviceFileIdentity[];
-	try {
-		affectedFiles = getAffectedDeviceFilesStrict(
-			toolCallsToRevert,
-			await resolveNarratorCwd(narratorId),
-		);
-	} catch (error) {
-		return c.json(fileHistoryConflictBody(error), 409);
-	}
-	if (affectedFiles.length === 0) return c.json({ affectedFiles: [], toolCallCount: 0 });
-
-	const excludeIds = new Set(toolCallsToRevert.map((tc) => tc.toolUseId));
-	let currentStates: Map<string, DeviceFileState>;
-	let revertedStates: Map<string, DeviceFileState>;
-	try {
-		currentStates = await rebuildDeviceFileStatesExcluding(narratorId, affectedFiles, new Set());
-		revertedStates = await rebuildDeviceFileStatesExcluding(narratorId, affectedFiles, excludeIds);
-	} catch (error) {
-		return c.json(fileHistoryConflictBody(error), 409);
-	}
-
-	const affectedFilePreviews = affectedFiles.map((identity) => ({
-		...identity,
-		currentContent: currentStates.get(deviceFileKey(identity))?.content ?? null,
-		revertedContent: revertedStates.get(deviceFileKey(identity))?.content ?? null,
-		willBeDeleted: revertedStates.get(deviceFileKey(identity))?.content === null,
-	}));
-
-	return c.json({ affectedFiles: affectedFilePreviews, toolCallCount: toolCallsToRevert.length });
 });
 
 /** Preview file state for a pending Write/Edit permission request */

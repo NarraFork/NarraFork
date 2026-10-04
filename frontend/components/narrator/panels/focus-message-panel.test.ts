@@ -24,7 +24,12 @@ function fixture(active = false) {
 	const panel = {
 		id: "legacy-primary-panel-id",
 		params: { panelType: "narrator", narratorId: "primary" },
+		group: {
+			id: "primary-group",
+			api: { boundingBox: { left: 0, top: 0, width: 800, height: 600 } },
+		},
 		api: {
+			location: { type: "grid" },
 			isActive: active,
 			isVisible: active,
 			setActive: mock(() => {
@@ -36,6 +41,8 @@ function fixture(active = false) {
 	const panels = [panel];
 	const addPanel = mock(() => {});
 	const api = {
+		width: 1200,
+		height: 800,
 		panels,
 		getPanel: (id: string) => panels.find((p) => p.id === id),
 		addPanel,
@@ -90,21 +97,29 @@ describe("workspace tool panel toggle", () => {
 	type ToolPanel = {
 		id: string;
 		params: { panelType: string; narratorId: string };
-		api: { isActive: boolean; setActive: () => void; close: () => void };
+		group: { id: string };
+		api: {
+			location: { type: "floating" };
+			isActive: boolean;
+			setActive: () => void;
+			close: () => void;
+		};
 	};
 
 	function bindToolPanel(
 		api: { getPanel: (id: string) => unknown },
 		options: { panelType?: string; narratorId?: string; isActive?: boolean } = {},
 	) {
-		const panelType = options.panelType ?? "filemod";
+		const panelType = options.panelType ?? "git";
 		const narratorId = options.narratorId ?? "primary";
-		const id = workspaceToolPanelId(narratorId, panelType as "filemod");
+		const id = workspaceToolPanelId(narratorId, panelType as "git");
 		const closed = { value: false };
 		const panel: ToolPanel = {
 			id,
 			params: { panelType, narratorId },
+			group: { id: "tool-group" },
 			api: {
+				location: { type: "floating" },
 				isActive: options.isActive ?? false,
 				setActive: mock(() => {
 					panel.api.isActive = true;
@@ -123,7 +138,7 @@ describe("workspace tool panel toggle", () => {
 		const { api } = fixture();
 		const store = new WorkspaceDockStore({ current: api });
 		const { panel, closed } = bindToolPanel(api, { isActive: false });
-		store.toggleToolPanel("primary", "filemod", null);
+		store.toggleToolPanel("primary", "git", null);
 		expect(panel.api.setActive).toHaveBeenCalledTimes(1);
 		expect(closed.value).toBe(false);
 		expect(panel.api.isActive).toBe(true);
@@ -133,7 +148,7 @@ describe("workspace tool panel toggle", () => {
 		const { api } = fixture();
 		const store = new WorkspaceDockStore({ current: api });
 		const { panel, closed } = bindToolPanel(api, { isActive: true });
-		store.toggleToolPanel("primary", "filemod", null);
+		store.toggleToolPanel("primary", "git", null);
 		expect(panel.api.setActive).not.toHaveBeenCalled();
 		expect(closed.value).toBe(true);
 	});
@@ -177,7 +192,8 @@ describe("workspace primary reuse", () => {
 		const child = {
 			id: workspaceSubagentPanelId("primary", "child"),
 			params: { panelType: "subagent", subagentNarratorId: "child" },
-			api: { setActive: mock(() => {}), updateParameters },
+			group: { id: "child-group" },
+			api: { location: { type: "floating" }, setActive: mock(() => {}), updateParameters },
 		} as unknown as IDockviewPanel;
 		const getPanel = api.getPanel;
 		api.getPanel = (id) => (id === child.id ? child : getPanel(id));

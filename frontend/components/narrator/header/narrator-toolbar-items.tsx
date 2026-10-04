@@ -23,7 +23,6 @@ import {
 import {
 	IconBaselineDensityMedium,
 	IconDeviceDesktop,
-	IconFileCode,
 	IconFolder,
 	IconFolderPlus,
 	IconGitBranch,
@@ -96,11 +95,6 @@ const TOOLBAR_ITEM_DETAILS: Record<NarratorToolbarId, Omit<NarratorToolbarItemDe
 		// Already had both hosts: a dock panel and `BackgroundTasksDrawer`.
 		hosts: ["dock", "drawer"],
 		badge: "backgroundTasks",
-	},
-	filemod: {
-		labelKey: "fileMod_title",
-		icon: IconFileCode,
-		hosts: ["dock", "drawer"],
 	},
 	filetree: {
 		labelKey: "fileTree.title",

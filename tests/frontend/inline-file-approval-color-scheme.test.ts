@@ -1,5 +1,5 @@
 /**
- * The file-modifications panel must follow the active colour scheme.
+ * Inline file-change approval must follow the active colour scheme.
  *
  * `--mantine-color-dark-*` is a fixed palette ramp, not a semantic token: it
  * resolves to the same dark greys under both colour schemes. Using it for
@@ -26,16 +26,11 @@ const COMPONENT_DIR = join(
 	"frontend",
 	"components",
 	"narrator",
-	"file-panel",
+	"permission",
 );
 
-/** Every component that renders inside the "File modifications" panel. */
-const PANEL_COMPONENTS = [
-	"FileModificationsDrawer.tsx",
-	"FileSummaryTab.tsx",
-	"FileDeletePreviewTab.tsx",
-	"FileApprovalTab.tsx",
-];
+/** Inline approval remains the active file-change preview surface. */
+const PANEL_COMPONENTS = ["InlinePermission.tsx"];
 
 /**
  * A bare `var(--mantine-color-dark-N)` reference. A `light-dark(...)` pair is
@@ -90,18 +85,11 @@ describe("dark-ramp detection", () => {
 	});
 });
 
-describe("file-modifications panel colour scheme", () => {
+describe("inline file approval colour scheme", () => {
 	for (const fileName of PANEL_COMPONENTS) {
 		it(`${fileName} uses no scheme-independent dark palette variables`, () => {
 			const source = readFileSync(join(COMPONENT_DIR, fileName), "utf8");
 			expect(findDarkRampViolations(source)).toEqual([]);
 		});
 	}
-
-	it("keeps the full-file preview surface on a scheme-aware background", () => {
-		// This block renders raw file text, so an unreadable dark-on-dark (or
-		// dark-on-light) surface is a legibility bug, not just a cosmetic one.
-		const source = readFileSync(join(COMPONENT_DIR, "FileApprovalTab.tsx"), "utf8");
-		expect(source).toContain('backgroundColor: "var(--mantine-color-body)"');
-	});
 });

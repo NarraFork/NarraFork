@@ -2,6 +2,10 @@ import { and, asc, eq, inArray, isNull, or } from "drizzle-orm";
 import { db } from "../db";
 import { aclGrants, chapters, narrators, narratorToolCalls, projects, users } from "../db/schema";
 import type { AgentConfig, ToolCallBinding } from "../lib/agent/types";
+import {
+	measureSerializedCharacters,
+	queueContextCharacterRefresh,
+} from "../lib/context-characters";
 import { loadNarratorForAccess, NARRATOR_ACL_COLUMNS } from "./narrator-acl";
 
 /** Trusted permission-time canonicalization belongs to the exact unstarted receipt.
@@ -14,7 +18,7 @@ export async function persistPermissionResolvedInput(
 ): Promise<void> {
 	const changed = await db
 		.update(narratorToolCalls)
-		.set({ inputJson: input })
+		.set({ inputJson: input, inputChars: measureSerializedCharacters(input) })
 		.where(
 			and(
 				eq(narratorToolCalls.id, binding.toolCallId),
@@ -25,11 +29,12 @@ export async function persistPermissionResolvedInput(
 				inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
 			),
 		)
-		.returning({ id: narratorToolCalls.id });
+		.returning({ id: narratorToolCalls.id, messageId: narratorToolCalls.messageId });
 	if (changed.length !== 1)
 		throw new Error(
 			"Permission canonicalization cannot change an expired/started execution receipt",
 		);
+	queueContextCharacterRefresh(narratorId, changed[0].messageId);
 }
 
 import { assertOAuthNarratorRuntimeActive } from "./oauth-narrator-runtime-policy";

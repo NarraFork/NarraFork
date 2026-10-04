@@ -154,6 +154,31 @@ describe("update service failure cleanup", () => {
 		});
 	});
 
+	test("revokes manual startup authorization even when continuation cancellation fails", async () => {
+		const scheduled = scheduleUpdate(undefined, "system_shutdown");
+		if (!scheduled.updateEpoch) throw new Error("Expected epoch");
+		beginQuiescingTools();
+		writePlannedUpdateRecoverySnapshot({
+			version: 2,
+			updateEpoch: scheduled.updateEpoch,
+			capturedAt: new Date().toISOString(),
+			resumeOnNextStartup: true,
+			narrators: [],
+		});
+		toolContinuationService.cancelEpoch = async () => {
+			throw new Error("database unavailable");
+		};
+		await failPreparedUpdateAttempt({
+			updateEpoch: scheduled.updateEpoch,
+			targetVersion: "current",
+			error: "cancelled",
+			cancelled: true,
+		});
+		expect(consumePlannedUpdateRecoverySnapshot()).toMatchObject({ evidenceOnly: true });
+		expect(consumePlannedUpdateRecoverySnapshot()?.resumeOnNextStartup).toBeUndefined();
+		expect(getUpdateCoordinationStatus().scheduled).toBe(false);
+	});
+
 	test("preserves the manifest but still reopens the gate when epoch cancellation fails", async () => {
 		const scheduled = scheduleUpdate("3.0.0");
 		if (!scheduled.updateEpoch) throw new Error("Expected scheduled update epoch");

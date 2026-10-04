@@ -920,6 +920,8 @@ export interface AgentConfig {
 	provider: string;
 	cwd: string;
 	systemPrompt?: string;
+	/** Host telemetry for the actual provider-formatted tool payload; failures are non-fatal. */
+	onToolsCharacters?: (toolsChars: number) => void | Promise<void>;
 	locale?: string;
 	signal: AbortSignal;
 	/** Chapter ID the narrator belongs to (passed through to ToolContext) */

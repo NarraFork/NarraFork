@@ -17,6 +17,7 @@ import { QueuedMessageRow } from "./QueuedMessageRow";
 import { queuedMessageMode } from "./queue-message-mode";
 
 export interface QueuedMessagesData {
+	narratorId?: string;
 	queuedMessages: BufferMessageSummary[];
 	queueExpanded: boolean;
 	setQueueExpanded: (expanded: boolean) => void;
@@ -75,8 +76,6 @@ export function QueuedMessagesPanel(props: QueuedMessagesPanelProps) {
 	// Manual collapse is unavailable until editing ends; keep the user's preference unchanged.
 	const listVisible = props.queueExpanded || single || hasActiveEditor;
 	const failures = props.queuedMessages.filter((msg) => msg.state === "failed").length;
-	const multipleAuthors =
-		new Set(props.queuedMessages.map((msg) => msg.creator?.id).filter(Boolean)).size > 1;
 	return (
 		<Stack
 			gap={0}
@@ -139,8 +138,8 @@ export function QueuedMessagesPanel(props: QueuedMessagesPanelProps) {
 									<QueuedMessageRow
 										key={msg.id}
 										msg={msg}
+										narratorId={props.narratorId}
 										index={index}
-										showAuthor={multipleAuthors}
 										canMoveUp={ordinaryIds.indexOf(msg.id) > 0}
 										canMoveDown={ordinaryIds.indexOf(msg.id) < ordinaryIds.length - 1}
 										onClearAll={single ? props.handleCancelAllQueued : undefined}

@@ -19,6 +19,7 @@ import { asc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
 import { normalizeBooleanOverride } from "../lib/boolean-override";
+import { measureSummaryCharacters, queueContextCharacterRefresh } from "../lib/context-characters";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { legacyFastModeMirror } from "../lib/fast-mode";
@@ -205,6 +206,9 @@ export async function extractSubagentToPrimary(
 					inheritMode,
 					apiConversationId: null,
 					contextSummary,
+					contextSummaryChars: measureSummaryCharacters(contextSummary),
+					contextSystemChars: 0,
+					contextToolsChars: 0,
 					status: "idle",
 					title,
 					cwd: source.cwd ?? null,
@@ -229,6 +233,7 @@ export async function extractSubagentToPrimary(
 							messageUuid: null,
 							role: msg.role,
 							contentJson: msg.contentJson,
+							contextCharsJson: msg.contextCharsJson,
 							contentText: msg.contentText,
 							tokensIn: msg.tokensIn,
 							costUsd: msg.costUsd,
@@ -284,6 +289,7 @@ export async function extractSubagentToPrimary(
 						parentToolUseId: null,
 						role: "system",
 						contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
+						contextCharsJson: { segments: [] },
 						contentText:
 							locale === "zh-CN"
 								? `[来自子代理的压缩上下文：${source.title ?? sourceId}]`
@@ -310,6 +316,7 @@ export async function extractSubagentToPrimary(
 		}),
 	);
 
+	queueContextCharacterRefresh(id);
 	// Spec namespace fork is best-effort; extract must not fail on it.
 	const { specVfsService } = await import("./spec-vfs-service");
 	try {

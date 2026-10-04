@@ -43,6 +43,12 @@ import {
 	normalizeBooleanOverride,
 } from "../lib/boolean-override";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
+import {
+	measureMessageCharacters,
+	measureSerializedCharacters,
+	measureSummaryCharacters,
+	queueContextCharacterRefresh,
+} from "../lib/context-characters";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { fastModeOverrideFromLegacyInput, legacyFastModeMirror } from "../lib/fast-mode";
@@ -508,11 +514,17 @@ export async function handleLoadToolCommand(
 				narratorId,
 				role: "user",
 				contentJson: [{ type: "tool_loaded", toolName: displayToolName, text }],
+				contextCharsJson: measureMessageCharacters(
+					"user",
+					[{ type: "tool_loaded", toolName: displayToolName, text }],
+					text,
+				),
 				contentText: text,
 				createdAt: now,
 			})
 			.returning();
 		await appendMessageRef(narratorId, id);
+		queueContextCharacterRefresh(narratorId, id);
 		broadcastToNarrator(narratorId, {
 			type: "user_message",
 			narratorId,
@@ -578,11 +590,17 @@ export async function handleUnloadToolCommand(
 				narratorId,
 				role: "user",
 				contentJson: [{ type: "tool_unloaded", toolName: displayToolName, text }],
+				contextCharsJson: measureMessageCharacters(
+					"user",
+					[{ type: "tool_unloaded", toolName: displayToolName, text }],
+					text,
+				),
 				contentText: text,
 				createdAt: now,
 			})
 			.returning();
 		await appendMessageRef(narratorId, id);
+		queueContextCharacterRefresh(narratorId, id);
 		broadcastToNarrator(narratorId, {
 			type: "user_message",
 			narratorId,
@@ -936,6 +954,7 @@ export async function handleBashCommand(
 			narratorId,
 			role: "assistant",
 			contentJson: [toolUseBlock],
+			contextCharsJson: measureMessageCharacters("assistant", [toolUseBlock]),
 			contentText: null,
 			createdAt: now,
 		})
@@ -948,10 +967,12 @@ export async function handleBashCommand(
 		toolUseId,
 		toolName: "Bash",
 		inputJson: toolInput,
+		inputChars: measureSerializedCharacters(toolInput),
 		status: "running",
 		streamStartedAt: streamStartedAtIso,
 		createdAt: now,
 	});
+	queueContextCharacterRefresh(narratorId, assistantMsgId);
 
 	broadcastToNarrator(narratorId, {
 		type: "message",
@@ -1075,6 +1096,7 @@ export async function handleBashCommand(
 		.update(narratorMessages)
 		.set({
 			contentJson: [toolUseBlock, toolResultBlock],
+			contextCharsJson: measureMessageCharacters("assistant", [toolUseBlock, toolResultBlock]),
 			durationMs,
 		})
 		.where(eq(narratorMessages.id, assistantMsgId));
@@ -2247,6 +2269,8 @@ export const narratorService = {
 							...executionContext,
 							model: storedModel,
 							systemPrompt: parent.systemPrompt,
+							contextSystemChars: parent.contextSystemChars,
+							contextToolsChars: parent.contextToolsChars,
 							permissionMode: resolvedPermMode,
 							reasoningEffort: parent.reasoningEffort ?? null,
 							fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
@@ -2481,6 +2505,12 @@ export const narratorService = {
 							inheritMode,
 							apiConversationId,
 							contextSummary,
+							contextSummaryChars:
+								inheritMode === "full"
+									? parent.contextSummaryChars
+									: measureSummaryCharacters(contextSummary),
+							contextSystemChars: inheritMode === "full" ? parent.contextSystemChars : 0,
+							contextToolsChars: inheritMode === "full" ? parent.contextToolsChars : 0,
 							status: "idle",
 							title: opts?.title ?? null,
 							createdAt: now,
@@ -2693,6 +2723,7 @@ export const narratorService = {
 								narratorId: id,
 								role: "system",
 								contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
+								contextCharsJson: { segments: [] },
 								contentText: `[Compressed context from parent conversation]`,
 								createdAt: compactNow,
 							})
@@ -2721,6 +2752,7 @@ export const narratorService = {
 				}),
 			);
 
+			queueContextCharacterRefresh(id);
 			// fire-and-forget: spec fork 和 carryover 不阻塞 fork 响应
 			// fork 的成功不依赖这些副作用, 失败时记录到 narrators 表便于后续补偿
 			void (async () => {
