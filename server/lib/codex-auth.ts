@@ -17,6 +17,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { readResponseTextWithLimit } from "./agent/response-body";
 import { logger } from "./logger";
+import { findExcludingRange, readWindowsExcludedPortRangesAsync } from "./windows-excluded-ports";
 
 // === Constants ===
 
@@ -371,6 +372,32 @@ async function ensureOAuthServer(): Promise<{
 	if (oauthServer) {
 		const port = oauthServer.port ?? CALLBACK_PORT;
 		return { port, redirectUri: `http://localhost:${port}/auth/callback`, running: true };
+	}
+
+	// Re-read before each bind attempt: Windows exclusions can change between flows.
+	// Do not invoke Bun.serve for a known reservation (its failure can be asynchronous).
+	const excludedRange = findExcludingRange(
+		CALLBACK_PORT,
+		await readWindowsExcludedPortRangesAsync(),
+	);
+	// Another flow may have started the persistent server while netsh was running.
+	// TS retains the pre-await narrowing, so explicitly re-read the shared state.
+	const startedServer = oauthServer as ReturnType<typeof Bun.serve> | undefined;
+	if (startedServer) {
+		const port = startedServer.port ?? CALLBACK_PORT;
+		return { port, redirectUri: `http://localhost:${port}/auth/callback`, running: true };
+	}
+	if (excludedRange) {
+		oauthServerRunning = false;
+		logger.warn("Codex OAuth callback port is reserved by Windows; use manual callback", {
+			port: CALLBACK_PORT,
+			reservedRange: `${excludedRange.start}-${excludedRange.end}`,
+		});
+		return {
+			port: CALLBACK_PORT,
+			redirectUri: `http://localhost:${CALLBACK_PORT}/auth/callback`,
+			running: false,
+		};
 	}
 
 	// Use fixed port 1455 to match Go's RedirectURI.

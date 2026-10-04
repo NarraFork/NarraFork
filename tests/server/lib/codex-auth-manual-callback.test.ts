@@ -22,6 +22,8 @@ import {
 	parseCallbackParams,
 	startBrowserOAuth,
 } from "../../../server/lib/codex-auth";
+import { logger } from "../../../server/lib/logger";
+import * as excludedPorts from "../../../server/lib/windows-excluded-ports";
 
 // Never bind the real OAuth port or send a callback to a running NarraFork process.
 let callbackHandler!: (request: Request) => Response | Promise<Response>;
@@ -123,8 +125,55 @@ describe("getBrowserOAuthRedirectUri", () => {
 	});
 });
 
+describe("startBrowserOAuth with a Windows-reserved callback port", () => {
+	it("rechecks exclusions, never binds, and keeps manual callback available", async () => {
+		const read = spyOn(excludedPorts, "readWindowsExcludedPortRangesAsync");
+		const serve = serveSpy.mockClear().mockImplementation(() => {
+			throw new Error("Must not bind a reserved port");
+		});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			// Both ends are inclusive; a changed reservation must be read again.
+			for (const range of [
+				{ start: 1356, end: 1455 },
+				{ start: 1455, end: 1555 },
+			]) {
+				read.mockResolvedValue([range]);
+				const flow = await startBrowserOAuth();
+				flow.tokenPromise.catch(() => {});
+				try {
+					expect(serve).not.toHaveBeenCalled();
+					expect(flow.localCallbackServer).toBe(false);
+					expect(isBrowserOAuthServerRunning()).toBe(false);
+					expect(getBrowserOAuthRedirectUri()).toBe("http://localhost:1455/auth/callback");
+					expect(new URL(flow.authorizeUrl).searchParams.get("redirect_uri")).toBe(
+						"http://localhost:1455/auth/callback",
+					);
+					expect(hasPendingBrowserOAuth()).toBe(true);
+					await expect(
+						completeBrowserOAuthFromCallbackUrl("?code=abc&state=wrong"),
+					).rejects.toThrow("Callback state does not match");
+					expect(hasPendingBrowserOAuth()).toBe(true);
+					expect(warn).toHaveBeenCalledWith(
+						"Codex OAuth callback port is reserved by Windows; use manual callback",
+						{ port: 1455, reservedRange: `${range.start}-${range.end}` },
+					);
+				} finally {
+					cancelBrowserOAuth();
+				}
+			}
+			expect(read).toHaveBeenCalledTimes(2);
+		} finally {
+			read.mockRestore();
+			serveSpy.mockImplementation(serveStub);
+			warn.mockRestore();
+		}
+	});
+});
+
 describe("startBrowserOAuth with the callback port occupied", () => {
 	it("continues the flow without the local server instead of failing", async () => {
+		const read = spyOn(excludedPorts, "readWindowsExcludedPortRangesAsync").mockResolvedValue([]);
 		serveSpy.mockImplementationOnce(() => {
 			throw new Error("EADDRINUSE");
 		});
@@ -146,13 +195,15 @@ describe("startBrowserOAuth with the callback port occupied", () => {
 			}
 		} finally {
 			serveSpy.mockImplementation(serveStub);
+			read.mockRestore();
 		}
 	});
 });
 
 describe("completeBrowserOAuthFromCallbackUrl with the callback server running", () => {
 	it("still services pasted callbacks while the local listener is up", async () => {
-		// The mocked listener captures the real callback handler without binding a port.
+		// Capture the real callback handler without binding the host's OAuth port.
+		const read = spyOn(excludedPorts, "readWindowsExcludedPortRangesAsync").mockResolvedValue([]);
 		const flow = await startBrowserOAuth();
 		// The pending flow must be cancelled so its rejection is observed.
 		flow.tokenPromise.catch(() => {});
@@ -168,6 +219,7 @@ describe("completeBrowserOAuthFromCallbackUrl with the callback server running",
 			expect(hasPendingBrowserOAuth()).toBe(true);
 		} finally {
 			cancelBrowserOAuth();
+			read.mockRestore();
 		}
 	});
 });
