@@ -126,6 +126,32 @@ describe("reconcileCodexBrowserAuthState", () => {
 		).toEqual({});
 	});
 
+	it("keeps the panel visible for an automatic token exchange", () => {
+		expect(
+			reconcileCodexBrowserAuthState({
+				serverState: { pending: true, status: "exchanging", redirectUri: REDIRECT_URI },
+				knownRedirectUri: REDIRECT_URI,
+				submitting: false,
+			}),
+		).toEqual({ pending: true, redirectUri: REDIRECT_URI });
+	});
+
+	it("closes the paste panel after a terminal regional failure", () => {
+		expect(
+			reconcileCodexBrowserAuthState({
+				serverState: {
+					pending: false,
+					status: "failed",
+					errorCode: "region_unsupported",
+					error: "Configure a proxy",
+					redirectUri: REDIRECT_URI,
+				},
+				knownRedirectUri: REDIRECT_URI,
+				submitting: false,
+			}),
+		).toEqual({ pending: false });
+	});
+
 	it("still adopts a pending flow while submitting", () => {
 		expect(
 			reconcileCodexBrowserAuthState({

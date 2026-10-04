@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it, mock } from "bun:test";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { CodexOAuthError } from "../../../server/lib/codex-auth";
 import { AppError } from "../../../server/lib/errors";
 
 type CodexTier = "free" | "plus" | "team" | "k12" | "prolite" | "pro" | "other";
@@ -25,7 +26,7 @@ let codexImportedCredentials: unknown[] = [];
 let codexRemoveUnhealthyCalls = 0;
 let managerTierOrder = [...DEFAULT_CODEX_TIER_ORDER];
 let browserCallbackUrls: string[] = [];
-let browserCallbackError: string | null = null;
+let browserCallbackError: string | Error | null = null;
 
 function getEffectiveTierOrder(): CodexTier[] {
 	const effective = [...managerTierOrder];
@@ -94,7 +95,10 @@ mock.module("../../../server/lib/codex-manager", () => ({
 		}),
 		completeBrowserAuthFromCallbackUrl: async (callbackUrl: string) => {
 			browserCallbackUrls.push(callbackUrl);
-			if (browserCallbackError) throw new Error(browserCallbackError);
+			if (browserCallbackError)
+				throw browserCallbackError instanceof Error
+					? browserCallbackError
+					: new Error(browserCallbackError);
 			return { accountId: "acc-1", email: "user@example.com" };
 		},
 		getBrowserAuthState: () => ({
@@ -447,7 +451,30 @@ describe("codex browser OAuth manual callback", () => {
 		});
 
 		expect(res.status).toBe(400);
-		expect(await res.json()).toEqual({ error: "No pending browser authorization." });
+		expect(await res.json()).toEqual({
+			error: "No pending browser authorization.",
+			code: "invalid_callback",
+			restartRequired: false,
+		});
+	});
+
+	it("returns structured regional failures with a restart requirement", async () => {
+		browserCallbackError = new CodexOAuthError(
+			"region_unsupported",
+			"Configure a usable proxy",
+			true,
+		);
+		const res = await app.request("/auth/browser/callback", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ callbackUrl: "?code=abc" }),
+		});
+		expect(res.status).toBe(400);
+		expect(await res.json()).toEqual({
+			error: "Configure a usable proxy",
+			code: "region_unsupported",
+			restartRequired: true,
+		});
 	});
 
 	it("reports whether a browser flow is pending", async () => {

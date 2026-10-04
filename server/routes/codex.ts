@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { CodexOAuthError } from "../lib/codex-auth";
 import {
 	type CodexImportCredentialInput,
 	getCodexManager,
@@ -273,7 +274,14 @@ codexRoutes.post("/auth/browser/callback", async (c) => {
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		logger.warn("Failed to complete Codex browser OAuth from callback URL", { error: msg });
-		return c.json({ error: msg }, 400);
+		return c.json(
+			{
+				error: msg,
+				code: err instanceof CodexOAuthError ? err.code : "invalid_callback",
+				restartRequired: err instanceof CodexOAuthError && err.restartRequired,
+			},
+			400,
+		);
 	}
 });
 

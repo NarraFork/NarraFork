@@ -481,9 +481,14 @@ export const miscApi = {
 			body: JSON.stringify({ callbackUrl }),
 		}),
 	codexBrowserAuthState: () =>
-		request<{ pending: boolean; redirectUri: string; localCallbackServer?: boolean }>(
-			"/codex/auth/browser/state",
-		),
+		request<{
+			pending: boolean;
+			status?: string;
+			errorCode?: string;
+			error?: string;
+			redirectUri: string;
+			localCallbackServer?: boolean;
+		}>("/codex/auth/browser/state"),
 	codexDeviceAuthStart: () =>
 		request<{
 			deviceAuthId: string;
