@@ -171,6 +171,43 @@ describe("RenderMessageBubble — authorship decides the side", () => {
 	});
 });
 
+describe("RenderMessageBubble — chat Markdown geometry", () => {
+	test("short Markdown stays visible in a non-scrolling body on either side", () => {
+		const doc = setupDom();
+		currentContainer = doc.createElement("div") as unknown as HTMLElement;
+		doc.body.appendChild(currentContainer);
+		currentRoot = createRoot(currentContainer);
+		const m = measureMessageBubble(
+			{ role: "user", text: "**hello** team", bodyFormat: "markdown", hasHeader: false },
+			WIDTH,
+		);
+		for (const isSelf of [true, false]) {
+			act(() => {
+				currentRoot?.render(
+					<I18nextProvider i18n={testI18n}>
+						<MantineProvider>
+							{/* biome-ignore lint/a11y/useValidAriaRole: domain prop */}
+							<RenderMessageBubble role="user" measured={m} hasHeader={false} isSelf={isSelf} />
+						</MantineProvider>
+					</I18nextProvider>,
+				);
+			});
+			const wrapper = currentContainer.querySelector("div") as HTMLElement;
+			const bubble = wrapper.firstElementChild as HTMLElement;
+			const markdown = currentContainer.querySelector("[data-md-body]") as HTMLElement;
+			const body = markdown.parentElement as HTMLElement;
+			expect(wrapper.style.justifyContent).toBe(isSelf ? "flex-end" : "flex-start");
+			expect(Number.parseFloat(bubble.style.width)).toBeLessThan(WIDTH);
+			expect(body.style.width).toBe(markdown.style.width);
+			expect(body.style.height).toBe(markdown.style.height);
+			expect(Number.parseFloat(body.style.height)).toBeGreaterThan(0);
+			expect(body.style.overflow).toBe("hidden");
+			expect(markdown.textContent).toContain("hello");
+			expect(markdown.textContent).toContain("team");
+		}
+	});
+});
+
 describe("RenderMessageBubble — the side is height-neutral", () => {
 	test("both sides paint the SAME measured geometry", () => {
 		// The measure layer never learns who is reading, so one measurement serves both

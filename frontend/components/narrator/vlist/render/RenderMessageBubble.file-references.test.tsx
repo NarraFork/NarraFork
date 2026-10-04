@@ -163,7 +163,10 @@ describe("captured message file references", () => {
 		);
 		expect(body?.kind).toBe("fixed");
 		const bodyElement = container.querySelector("[data-md-body]")?.parentElement;
-		expect(Number.parseFloat(bodyElement?.style.width ?? "0")).toBe(measured.contentWidth);
+		expect(Number.parseFloat(bodyElement?.style.width ?? "0")).toBe(
+			body?.kind === "fixed" ? (body.displayWidth ?? -1) : -1,
+		);
+		expect(bodyElement?.style.overflow).toBe("hidden");
 		expect(Number.parseFloat(bodyElement?.style.height ?? "0")).toBe(
 			body?.kind === "fixed" ? body.height : -1,
 		);
