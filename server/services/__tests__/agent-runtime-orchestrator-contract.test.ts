@@ -145,6 +145,7 @@ const profiles: RuntimeProfile[] = [
 	{ kind: "primary" },
 	{
 		kind: "subagent",
+		executionSegmentId: "profile-child-run-segment",
 		parentNarratorId: "contract-parent",
 		parentToolUseId: "origin-agent",
 		subagentType: "general",
@@ -163,6 +164,9 @@ function fixture(
 	activeNarrators.set(id, session);
 	const calls: ExecuteLoopOptions[] = [];
 	spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+		expect(options.config.executionSegmentId).toBe(
+			profile.kind === "subagent" ? profile.executionSegmentId : undefined,
+		);
 		calls.push(options);
 		const step = script[calls.length - 1];
 		if (!step) throw new Error("Unexpected extra model pass");
@@ -280,10 +284,12 @@ describe("real shared orchestrator profile contract", () => {
 			.run();
 		const pass = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
 			expect(options.config.systemPrompt).toBe(finalPrompt);
+			expect(options.config.executionSegmentId).toBe("child-run-segment");
 			await options.config.onToolsCharacters?.(456);
 			return finished;
 		});
 		const result = await executeSubagent({
+			executionSegmentId: "child-run-segment",
 			narratorId: "contract-child",
 			parentNarratorId: "contract-parent",
 			toolUseId: "origin-agent",

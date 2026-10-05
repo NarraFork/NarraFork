@@ -6,7 +6,7 @@
  * provider tool-use id or timestamp alone is never treated as an attempt receipt.
  */
 import type { FileChangeIdentity } from "@shared/file-change-protocol";
-import { and, asc, eq, inArray, like, or } from "drizzle-orm";
+import { and, asc, eq, inArray, like, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/sqlite-core";
 import { db } from "../db";
 import {
@@ -242,13 +242,14 @@ export interface SubagentFileChangeQueryOptions {
 	/** A present null value explicitly means unknown; an absent entry resolves from DB. */
 	parentWorkspacesBySubagent?: ReadonlyMap<string, SubagentParentWorkspace | null>;
 	/** Parent Agent/Task execution boundary; missing/legacy boundaries cannot prove exact ownership. */
-	executionBoundariesBySubagent?: ReadonlyMap<string, SubagentExecutionBoundary>;
+	executionBoundariesBySubagent?: ReadonlyMap<string, SubagentExecutionBoundary | null>;
 }
 
 interface AggregateEntry {
 	changes: SubagentFileChanges;
 	files: Map<string, SubagentChangedFile>;
-	exactKeys: Set<string>;
+	exactEffectIds: Set<string>;
+	currentSegmentIds: Set<string>;
 	bashFiles: Set<string>;
 	hasLegacyFileEvidence: boolean;
 	hasExactEvidence: boolean;
@@ -263,25 +264,27 @@ async function collectExecutionSegments(rootSegmentId: string): Promise<{
 	truncated: boolean;
 }> {
 	const ids = new Set<string>();
-	const queue = [rootSegmentId];
+	let queue = [rootSegmentId];
 	let truncated = false;
 	while (queue.length > 0 && ids.size < MAX_EXACT_SEGMENTS) {
-		const id = queue.shift();
-		if (!id || ids.has(id)) continue;
-		ids.add(id);
+		const frontier = [...new Set(queue)].filter((id) => !ids.has(id));
+		if (!frontier.length) break;
+		const accepted = frontier.slice(0, MAX_EXACT_SEGMENTS - ids.size);
+		if (accepted.length < frontier.length) truncated = true;
+		for (const id of accepted) ids.add(id);
 		const children = await db
 			.select({ id: fileChangeExecutionSegments.id })
 			.from(fileChangeExecutionSegments)
-			.where(eq(fileChangeExecutionSegments.parentSegmentId, id))
+			.where(inArray(fileChangeExecutionSegments.parentSegmentId, accepted))
 			.limit(MAX_EXACT_SEGMENTS - ids.size + 1);
 		if (children.length > MAX_EXACT_SEGMENTS - ids.size) truncated = true;
-		queue.push(...children.slice(0, MAX_EXACT_SEGMENTS - ids.size).map((row) => row.id));
+		queue = children.slice(0, MAX_EXACT_SEGMENTS - ids.size).map((row) => row.id);
 	}
 	if (queue.length > 0) truncated = true;
 	return { ids, truncated };
 }
 
-function exactBoundaryUsable(boundary: SubagentExecutionBoundary | undefined): boolean {
+function exactBoundaryUsable(boundary: SubagentExecutionBoundary | null | undefined): boolean {
 	return (
 		typeof boundary?.sourceToolCallId === "string" &&
 		boundary.sourceToolCallId.length > 0 &&
@@ -305,6 +308,20 @@ async function addExactChanges(
 	workspaceByChild: Map<string, SubagentParentWorkspace | null>,
 ): Promise<void> {
 	const boundaries = options.executionBoundariesBySubagent ?? new Map();
+	if (!children.some((child) => exactBoundaryUsable(boundaries.get(child.id)))) {
+		for (const entry of entries.values()) entry.exactBoundaryUnavailable = true;
+		return;
+	}
+	// A caller-supplied tuple is not proof that this child's current run belongs
+	// to it. Reuse the durable run receipt validation, including the segment's
+	// real actor (which may be a peer rather than the child's publishing parent).
+	const currentOptions = await getCurrentSubagentFileChangeOptions(
+		children.map((child) => child.id),
+		options.parentNarratorId,
+	);
+	const verifiedBoundaries = currentOptions.executionBoundariesBySubagent;
+	const segmentIds = new Set<string>();
+	const segmentsByRoot = new Map<string, { ids: Set<string>; truncated: boolean }>();
 	for (const child of children) {
 		const entry = entries.get(child.id);
 		if (!entry) continue;
@@ -313,124 +330,164 @@ async function addExactChanges(
 			entry.exactBoundaryUnavailable = true;
 			continue;
 		}
-		const parentCall = await db
-			.select({ id: narratorToolCalls.id })
-			.from(narratorToolCalls)
-			.where(
-				and(
-					eq(narratorToolCalls.id, boundary.sourceToolCallId as string),
-					eq(narratorToolCalls.executionIdentityVersion, 1),
-					eq(narratorToolCalls.executionAttempt, boundary.executionAttempt as number),
-					eq(narratorToolCalls.executionSegmentId, boundary.executionSegmentId as string),
-				),
-			)
-			.limit(1);
-		if (parentCall.length === 0) {
+		const verified = verifiedBoundaries?.get(child.id);
+		if (
+			!verified ||
+			verified.sourceToolCallId !== boundary.sourceToolCallId ||
+			verified.executionAttempt !== boundary.executionAttempt ||
+			verified.executionIdentityVersion !== boundary.executionIdentityVersion ||
+			verified.executionSegmentId !== boundary.executionSegmentId
+		) {
 			entry.exactBoundaryUnavailable = true;
 			continue;
 		}
-		const segments = await collectExecutionSegments(boundary.executionSegmentId as string);
-		if (segments.truncated) entry.exactBoundaryUnavailable = true;
-		if (segments.ids.size === 0) continue;
-		const operations = await db
-			.select({
-				id: fileChangeOperations.id,
-				narratorId: fileChangeOperations.narratorId,
-				executionSegmentId: fileChangeOperations.executionSegmentId,
-				settlement: fileChangeOperations.settlement,
-				coverage: fileChangeOperations.coverage,
-				attributionGrade: fileChangeOperations.attributionGrade,
-				executionOutcome: fileChangeOperations.executionOutcome,
-			})
-			.from(fileChangeOperations)
-			.where(
-				and(
-					eq(fileChangeOperations.narratorId, child.id),
-					eq(fileChangeOperations.sourceKind, "tool"),
-					inArray(fileChangeOperations.executionSegmentId, [...segments.ids]),
-				),
-			)
-			.limit(MAX_EXACT_OPERATIONS + 1);
-		if (operations.length > MAX_EXACT_OPERATIONS) {
-			entry.changes.countsTruncated = true;
-			entry.exactBoundaryUnavailable = true;
-		}
-		const eligible = operations
-			.slice(0, MAX_EXACT_OPERATIONS)
-			.filter(
-				(operation) =>
-					operation.settlement === "settled" &&
-					operation.coverage === "complete" &&
-					operation.attributionGrade === "measured" &&
-					operation.executionOutcome !== "running",
-			);
-		if (eligible.length === 0) continue;
-		const effects = await db
-			.select({
-				operationId: fileChangeEffects.operationId,
-				identityJson: fileChangeEffects.identityJson,
-				linesAdded: fileChangeEffects.linesAdded,
-				linesRemoved: fileChangeEffects.linesRemoved,
-				outcome: fileChangeEffects.outcome,
-				phase: fileChangeEffects.phase,
-				settlement: fileChangeEffects.settlement,
-				attributionGrade: fileChangeEffects.attributionGrade,
-				workspacePath: fileChangeScopes.displayRoot,
-			})
-			.from(fileChangeEffects)
-			.innerJoin(fileChangeScopes, eq(fileChangeScopes.id, fileChangeEffects.scopeId))
-			.where(
-				and(
-					inArray(
-						fileChangeEffects.operationId,
-						eligible.map((operation) => operation.id),
-					),
-					eq(fileChangeEffects.phase, "apply"),
-					eq(fileChangeEffects.outcome, "changed"),
-					eq(fileChangeEffects.settlement, "settled"),
-					eq(fileChangeEffects.attributionGrade, "measured"),
-				),
-			)
-			.limit(MAX_EXACT_OPERATIONS + 1);
-		if (effects.length > MAX_EXACT_OPERATIONS) {
-			entry.changes.countsTruncated = true;
-			entry.exactBoundaryUnavailable = true;
-		}
-		for (const effect of effects.slice(0, MAX_EXACT_OPERATIONS)) {
-			const identity = effect.identityJson as FileChangeIdentity;
-			const filePath = identity.displayPath || identity.canonicalPath;
-			const workspacePath = effect.workspacePath || "";
-			const key = exactFileKey({ deviceId: identity.deviceId, workspacePath, filePath });
-			entry.exactKeys.add(key);
-			let file = entry.files.get(key);
-			if (!file) {
-				if (entry.files.size >= MAX_AGGREGATED_FILES) {
-					entry.changes.countsTruncated = true;
-					continue;
-				}
-				file = {
-					subagentNarratorId: child.id,
-					deviceId: identity.deviceId,
-					workspacePath,
-					filePath,
-					linesAdded: null,
-					linesRemoved: null,
-					editCount: 0,
-					unmeasuredCount: 0,
-					outsideParentWorkspace: outsideParentWorkspace(
-						{ deviceId: identity.deviceId, workspacePath },
-						workspaceByChild.get(child.id) ?? null,
-					),
-				};
-				entry.files.set(key, file);
+		const rootId = boundary.executionSegmentId as string;
+		let segments = segmentsByRoot.get(rootId);
+		if (!segments) {
+			const discovered =
+				segmentIds.size >= MAX_EXACT_SEGMENTS && !segmentIds.has(rootId)
+					? { ids: new Set<string>(), truncated: true }
+					: await collectExecutionSegments(rootId);
+			const accepted = new Set<string>();
+			let truncated = discovered.truncated;
+			for (const id of discovered.ids) {
+				// Overlapping lineages reuse their known ids without spending the
+				// global budget again. Only genuinely new segments count toward it.
+				if (segmentIds.has(id)) accepted.add(id);
+				else if (segmentIds.size < MAX_EXACT_SEGMENTS) {
+					segmentIds.add(id);
+					accepted.add(id);
+				} else truncated = true;
 			}
-			if (effect.linesAdded !== null) file.linesAdded = (file.linesAdded ?? 0) + effect.linesAdded;
-			if (effect.linesRemoved !== null)
-				file.linesRemoved = (file.linesRemoved ?? 0) + effect.linesRemoved;
-			file.editCount += 1;
-			if (effect.linesAdded === null || effect.linesRemoved === null) file.unmeasuredCount += 1;
-			entry.hasExactEvidence = true;
+			segments = { ids: accepted, truncated };
+			segmentsByRoot.set(rootId, segments);
 		}
+		// A multi-target Send shares one root, including its completeness result,
+		// even after that root has filled the entire unique-segment budget.
+		entry.currentSegmentIds = segments.ids;
+		if (segments.truncated) {
+			entry.exactBoundaryUnavailable = true;
+			entry.changes.countsTruncated = true;
+		}
+	}
+	if (!segmentIds.size) return;
+	const operations = await db
+		.select({
+			id: fileChangeOperations.id,
+			narratorId: fileChangeOperations.narratorId,
+			executionSegmentId: fileChangeOperations.executionSegmentId,
+			settlement: fileChangeOperations.settlement,
+			coverage: fileChangeOperations.coverage,
+			attributionGrade: fileChangeOperations.attributionGrade,
+			executionOutcome: fileChangeOperations.executionOutcome,
+		})
+		.from(fileChangeOperations)
+		.where(
+			and(
+				inArray(
+					fileChangeOperations.narratorId,
+					children.map((child) => child.id),
+				),
+				eq(fileChangeOperations.sourceKind, "tool"),
+				eq(fileChangeOperations.evidenceVersion, 2),
+				inArray(fileChangeOperations.executionSegmentId, [...segmentIds]),
+			),
+		)
+		.limit(MAX_EXACT_OPERATIONS + 1);
+	if (operations.length > MAX_EXACT_OPERATIONS) {
+		for (const entry of entries.values()) {
+			entry.changes.countsTruncated = true;
+			entry.exactBoundaryUnavailable = true;
+		}
+	}
+	const eligible = operations
+		.slice(0, MAX_EXACT_OPERATIONS)
+		.filter(
+			(operation) =>
+				operation.settlement === "settled" &&
+				operation.coverage === "complete" &&
+				operation.attributionGrade === "measured" &&
+				operation.executionOutcome !== "running" &&
+				!!operation.narratorId &&
+				!!operation.executionSegmentId &&
+				(entries.get(operation.narratorId)?.currentSegmentIds.has(operation.executionSegmentId) ??
+					false),
+		);
+	if (eligible.length === 0) return;
+	const ownerByOperation = new Map(
+		eligible.map((operation) => [operation.id, operation.narratorId as string]),
+	);
+	const effects = await db
+		.select({
+			effectId: fileChangeEffects.id,
+			operationId: fileChangeEffects.operationId,
+			identityJson: fileChangeEffects.identityJson,
+			linesAdded: fileChangeEffects.linesAdded,
+			linesRemoved: fileChangeEffects.linesRemoved,
+			outcome: fileChangeEffects.outcome,
+			phase: fileChangeEffects.phase,
+			settlement: fileChangeEffects.settlement,
+			attributionGrade: fileChangeEffects.attributionGrade,
+			workspacePath: fileChangeScopes.displayRoot,
+		})
+		.from(fileChangeEffects)
+		.innerJoin(fileChangeScopes, eq(fileChangeScopes.id, fileChangeEffects.scopeId))
+		.where(
+			and(
+				inArray(
+					fileChangeEffects.operationId,
+					eligible.map((operation) => operation.id),
+				),
+				eq(fileChangeEffects.phase, "apply"),
+				eq(fileChangeEffects.outcome, "changed"),
+				eq(fileChangeEffects.settlement, "settled"),
+				eq(fileChangeEffects.attributionGrade, "measured"),
+			),
+		)
+		.limit(MAX_EXACT_OPERATIONS + 1);
+	if (effects.length > MAX_EXACT_OPERATIONS) {
+		for (const entry of entries.values()) {
+			entry.changes.countsTruncated = true;
+			entry.exactBoundaryUnavailable = true;
+		}
+	}
+	for (const effect of effects.slice(0, MAX_EXACT_OPERATIONS)) {
+		const childId = ownerByOperation.get(effect.operationId);
+		const entry = childId ? entries.get(childId) : undefined;
+		if (!childId || !entry) continue;
+		const identity = effect.identityJson as FileChangeIdentity;
+		const filePath = identity.displayPath || identity.canonicalPath;
+		const workspacePath = effect.workspacePath || "";
+		const key = exactFileKey({ deviceId: identity.deviceId, workspacePath, filePath });
+		entry.exactEffectIds.add(effect.effectId);
+		let file = entry.files.get(key);
+		if (!file) {
+			if (entry.files.size >= MAX_AGGREGATED_FILES) {
+				entry.changes.countsTruncated = true;
+				continue;
+			}
+			file = {
+				subagentNarratorId: childId,
+				deviceId: identity.deviceId,
+				workspacePath,
+				filePath,
+				linesAdded: null,
+				linesRemoved: null,
+				editCount: 0,
+				unmeasuredCount: 0,
+				outsideParentWorkspace: outsideParentWorkspace(
+					{ deviceId: identity.deviceId, workspacePath },
+					workspaceByChild.get(childId) ?? null,
+				),
+			};
+			entry.files.set(key, file);
+		}
+		if (effect.linesAdded !== null) file.linesAdded = (file.linesAdded ?? 0) + effect.linesAdded;
+		if (effect.linesRemoved !== null)
+			file.linesRemoved = (file.linesRemoved ?? 0) + effect.linesRemoved;
+		file.editCount += 1;
+		if (effect.linesAdded === null || effect.linesRemoved === null) file.unmeasuredCount += 1;
+		entry.hasExactEvidence = true;
 	}
 }
 
@@ -443,7 +500,8 @@ async function queryChanges(ids: string[], options: SubagentFileChangeQueryOptio
 		entries.set(child.id, {
 			changes: emptyChanges(scopes.get(child.id)),
 			files: new Map(),
-			exactKeys: new Set(),
+			exactEffectIds: new Set(),
+			currentSegmentIds: new Set(),
 			bashFiles: new Set(),
 			hasLegacyFileEvidence: false,
 			hasExactEvidence: false,
@@ -469,8 +527,11 @@ async function queryChanges(ids: string[], options: SubagentFileChangeQueryOptio
 			linesAdded: fileAttributions.linesAdded,
 			linesRemoved: fileAttributions.linesRemoved,
 			changedAt: fileAttributions.changedAt,
+			effectId: fileAttributions.effectId,
+			operationSegmentId: fileChangeOperations.executionSegmentId,
 		})
 		.from(fileAttributions)
+		.leftJoin(fileChangeOperations, eq(fileChangeOperations.id, fileAttributions.operationId))
 		.where(
 			inArray(
 				fileAttributions.narratorId,
@@ -490,13 +551,21 @@ async function queryChanges(ids: string[], options: SubagentFileChangeQueryOptio
 			(scope?.completedAt && row.changedAt > scope.completedAt)
 		)
 			continue;
+		// Only a linked receipt can deduplicate an effect. Same-path legacy edits
+		// may be different operations and must remain visible as uncertain evidence.
+		if (row.effectId && entry.exactEffectIds.has(row.effectId)) continue;
+		if (
+			entry.currentSegmentIds.size > 0 &&
+			row.operationSegmentId &&
+			!entry.currentSegmentIds.has(row.operationSegmentId)
+		)
+			continue;
 		const key = subagentFileIdentityKey(row);
 		if (row.action === "bash") {
 			entry.bashFiles.add(key);
 			continue;
 		}
 		if (row.action !== "write" && row.action !== "edit") continue;
-		if (entry.exactKeys.has(key)) continue;
 		entry.hasLegacyFileEvidence = true;
 		let file = entry.files.get(key);
 		if (!file) {
@@ -566,11 +635,92 @@ export async function getFileChangesBySubagent(
 	return result;
 }
 
+/** Resolve current run windows independently of trusted parent receipts, in one bounded join. */
+export async function getCurrentSubagentFileChangeOptions(
+	ids: string[],
+	parentNarratorId?: string,
+): Promise<SubagentFileChangeQueryOptions> {
+	const requested = [...new Set(ids)].slice(0, MAX_SUBAGENT_QUERY_IDS);
+	const executionBoundariesBySubagent = new Map<string, SubagentExecutionBoundary | null>(
+		requested.map((id) => [id, null]),
+	);
+	const scopesBySubagent = new Map<string, SubagentFileChangeScope>();
+	if (!requested.length) return { executionBoundariesBySubagent, scopesBySubagent };
+	const parentSegment = alias(fileChangeExecutionSegments, "current_subagent_parent_segment");
+	const rows = await db
+		.select({
+			childId: narrators.id,
+			turnStartedAt: narrators.turnStartedAt,
+			runCompletedAt: narrators.backgroundCompletedAt,
+			segmentStartedAt: fileChangeExecutionSegments.createdAt,
+			sourceToolCallId: narratorToolCalls.id,
+			executionAttempt: narratorToolCalls.executionAttempt,
+			executionIdentityVersion: narratorToolCalls.executionIdentityVersion,
+			executionSegmentId: narratorToolCalls.executionSegmentId,
+			sourceToolUseId: narratorToolCalls.toolUseId,
+			startedAt: narratorToolCalls.executionStartedAt,
+			createdAt: narratorToolCalls.createdAt,
+			completedAt: narratorToolCalls.completedAt,
+		})
+		.from(narrators)
+		.leftJoin(
+			fileChangeExecutionSegments,
+			and(
+				eq(fileChangeExecutionSegments.narratorId, narrators.id),
+				eq(
+					fileChangeExecutionSegments.sourceInputId,
+					sql<string>`'subagent-run:' || ${narrators.logicalRunId}`,
+				),
+			),
+		)
+		.leftJoin(parentSegment, eq(parentSegment.id, fileChangeExecutionSegments.parentSegmentId))
+		.leftJoin(
+			narratorToolCalls,
+			and(
+				eq(narratorToolCalls.id, parentSegment.sourceToolCallId),
+				eq(narratorToolCalls.executionAttempt, parentSegment.sourceExecutionAttempt),
+				eq(narratorToolCalls.executionIdentityVersion, 1),
+				eq(narratorToolCalls.executionSegmentId, parentSegment.id),
+				eq(narratorToolCalls.narratorId, parentSegment.narratorId),
+			),
+		)
+		.where(
+			and(
+				inArray(narrators.id, requested),
+				subagentPredicate(),
+				parentNarratorId ? eq(narrators.parentNarratorId, parentNarratorId) : undefined,
+			),
+		)
+		.limit(MAX_SUBAGENT_QUERY_IDS * 2 + 1);
+	// Duplicate receipts are ambiguous; a truncated sample cannot prove uniqueness.
+	const receiptsComplete = rows.length <= MAX_SUBAGENT_QUERY_IDS * 2;
+	for (const row of rows.slice(0, MAX_SUBAGENT_QUERY_IDS * 2)) {
+		const uniqueReceipt =
+			receiptsComplete &&
+			rows.filter((candidate) => candidate.childId === row.childId).length === 1;
+		// Narrator timing remains useful even if the run is orphaned, its parent
+		// receipt is missing/stale, or duplicate segments prevent exact ownership.
+		scopesBySubagent.set(row.childId, {
+			sourceToolUseId: uniqueReceipt ? row.sourceToolUseId : null,
+			startedAt:
+				row.turnStartedAt ??
+				(uniqueReceipt ? row.segmentStartedAt : null) ??
+				row.startedAt ??
+				row.createdAt,
+			completedAt: row.runCompletedAt,
+		});
+		if (uniqueReceipt && row.sourceToolCallId && exactBoundaryUsable(row))
+			executionBoundariesBySubagent.set(row.childId, row);
+	}
+	return { parentNarratorId, executionBoundariesBySubagent, scopesBySubagent };
+}
+
 export interface ChildSubagentFileChangesOptions {
 	parentNarratorId: string;
 	childNarratorId: string;
 	scope: SubagentFileChangeScope;
 	parentWorkspace?: SubagentParentWorkspace | null;
+	executionBoundary?: SubagentExecutionBoundary | null;
 }
 
 /** Single-result entry point: never falls back to the whole parent team. */
@@ -581,6 +731,7 @@ export async function getChildSubagentFileChanges(
 	const entries = await getFileChangesBySubagent([childNarratorId], {
 		parentNarratorId,
 		scopesBySubagent: new Map([[childNarratorId, scope]]),
+		executionBoundariesBySubagent: new Map([[childNarratorId, options.executionBoundary ?? null]]),
 		...(parentWorkspace !== undefined
 			? { parentWorkspacesBySubagent: new Map([[childNarratorId, parentWorkspace]]) }
 			: {}),
@@ -693,7 +844,7 @@ export function formatSubagentFileChanges(changes: SubagentFileChanges): string 
 		lines.push(
 			`Time-window filter only: ${changes.scope.startedAt ?? "unknown start"} to ${changes.scope.completedAt ?? "unknown end"}; not proof of this attempt's changes.`,
 		);
-	} else if (changes.scope) {
+	} else if (changes.scope && changes.attributionScope === "legacy_unscoped") {
 		lines.push(
 			"Execution boundary unavailable: these are this child's legacy history, not verified changes from the current run.",
 		);

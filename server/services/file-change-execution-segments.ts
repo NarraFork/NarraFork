@@ -87,7 +87,11 @@ export function createFileChangeExecutionSegmentsService(db: SegmentDb) {
 						)
 						.limit(1)
 				: [];
-		if (existing[0]) return existing[0];
+		if (existing[0]) {
+			if (existing[0].parentSegmentId !== (input.parentSegmentId ?? null))
+				throw new Error("source segment parent conflicts with existing execution");
+			return existing[0];
+		}
 		const row = {
 			id: generateId(),
 			narratorId: input.narratorId,

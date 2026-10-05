@@ -99,8 +99,8 @@ import {
 // Pure in-memory state module (no imports of its own), so importing it here
 // cannot widen this file's already-delicate import cycle with narrator-service.
 import {
+	getCurrentSubagentFileChangeOptions,
 	getFileChangesBySubagent,
-	type SubagentExecutionBoundary,
 	type SubagentFileChanges,
 } from "./subagent-file-changes";
 import { getRecentSubagentModelInheritance } from "./subagent-model";
@@ -2172,7 +2172,6 @@ interface SubagentActivityOwner {
 	subagentNarratorId: string;
 	model: string | null;
 	reasoningEffort: string | null;
-	executionBoundary: SubagentExecutionBoundary;
 }
 
 /**
@@ -2316,14 +2315,10 @@ async function buildSubagentActivities(
 	}
 	const narratorIds = [...new Set(owners.map((owner) => owner.subagentNarratorId))];
 	const toolCallsByNarrator = await loadLatestSubagentToolCalls(narratorIds);
-	const executionBoundariesBySubagent = new Map(
-		owners.map((owner) => [owner.subagentNarratorId, owner.executionBoundary] as const),
-	);
+	const currentOptions = await getCurrentSubagentFileChangeOptions(narratorIds);
 	// One aggregate for EVERY card on the page. A per-card query here would turn
 	// opening a session with a dozen Agent calls into a query storm on a list path.
-	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds, {
-		executionBoundariesBySubagent,
-	});
+	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds, currentOptions);
 	for (const owner of owners) {
 		const effectiveReasoningEffort =
 			owner.reasoningEffort ??
@@ -2394,6 +2389,9 @@ function resolveAggregateScopeTx(tx: MessageTx, narratorId: string, toolUseIds: 
 						executionIdentityVersion: narratorToolCalls.executionIdentityVersion,
 						executionAttempt: narratorToolCalls.executionAttempt,
 						executionSegmentId: narratorToolCalls.executionSegmentId,
+						executionStartedAt: narratorToolCalls.executionStartedAt,
+						createdAt: narratorToolCalls.createdAt,
+						completedAt: narratorToolCalls.completedAt,
 						callerSeq: sql<
 							number | null
 						>`(SELECT aggregate_ref.seq FROM narrator_message_refs aggregate_ref
@@ -2573,12 +2571,6 @@ function resolveAggregateScopeTx(tx: MessageTx, narratorId: string, toolUseIds: 
 			subagentNarratorId: row.id,
 			model: row.model,
 			reasoningEffort: row.reasoningEffort,
-			executionBoundary: {
-				sourceToolCallId: parent.id,
-				executionAttempt: parent.executionAttempt ?? null,
-				executionIdentityVersion: parent.executionIdentityVersion ?? null,
-				executionSegmentId: parent.executionSegmentId ?? null,
-			},
 		});
 		ownerGroups.set(parentToolUseId, group);
 	}
