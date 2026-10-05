@@ -532,6 +532,58 @@ describe("snapshot animation through real WS / hook / coordinator / DOM", () => 
 });
 
 describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
+	it("keeps actual request identity through live deltas and checkpoint projection", async () => {
+		await withStream(async (h) => {
+			await h.frame({ type: "streaming_identity", model: "gpt-actual", provider: "openai" });
+			await h.delta(content("reasoning", "r", "Reasoning"));
+			await h.raf();
+			expect(h.live()).toMatchObject({ model: "gpt-actual", provider: "openai" });
+			await h.commit([content("reasoning", "r", "Reasoning")]);
+			await h.delta(content("text", "t", "Next"));
+			await h.raf();
+			expect(h.live()).toMatchObject({ model: "gpt-actual", provider: "openai" });
+			await h.frame({
+				type: "streaming_identity",
+				model: "child-model",
+				provider: "anthropic",
+				parentToolUseId: "child-tool",
+			});
+			await h.raf();
+			expect(h.live()).toMatchObject({ model: "gpt-actual", provider: "openai" });
+		});
+	});
+
+	it("restores request identity from snapshots and refreshes unchanged text on identity change", async () => {
+		await withStream(async (h) => {
+			const streamingBlocks = [content("reasoning", "r", "Reasoning")];
+			await h.frame({
+				type: "streaming_snapshot",
+				model: "gpt-reconnected",
+				provider: "openai",
+				streamingBlocks,
+				toolChunks: [],
+			});
+			await h.raf();
+			expect(h.live()).toMatchObject({ model: "gpt-reconnected", provider: "openai" });
+			await h.frame({
+				type: "streaming_snapshot",
+				model: "claude-reconnected",
+				provider: "anthropic",
+				streamingBlocks,
+				toolChunks: [],
+			});
+			await h.raf();
+			expect(h.live()).toMatchObject({ model: "claude-reconnected", provider: "anthropic" });
+			await h.frame({ type: "streaming_snapshot", streamingBlocks, toolChunks: [] });
+			await h.raf();
+			expect(h.live()).toMatchObject({ model: "claude-reconnected", provider: "anthropic" });
+			await h.frame({ type: "streaming_reset" });
+			await h.delta(content("text", "fresh", "Fresh"));
+			await h.raf();
+			expect(h.live()?.model).toBeUndefined();
+			expect(h.live()?.provider).toBeUndefined();
+		});
+	});
 	it("restores a name-only tool after switching back without another live event", async () => {
 		await withStream(async (h) => {
 			const chunk = { toolUseId: "quiet-write", toolName: "Write", inputCharsTotal: 0 };

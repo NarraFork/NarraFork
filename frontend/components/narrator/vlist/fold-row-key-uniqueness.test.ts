@@ -54,6 +54,7 @@ function toolMessage(messageId: string, toolUseId: string, status: string, strea
 function reasoningMessage(messageId: string, text: string) {
 	return {
 		id: messageId,
+		model: "gpt-5.6",
 		role: "assistant",
 		contentJson: [{ type: "reasoning", text }],
 		toolCalls: [],

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { usesStructuredReasoning } from "@shared/pretext-layout/reasoning-segments";
 import {
 	type ContentBlockLike,
 	getReasoningEncryptionState,
@@ -17,6 +18,36 @@ function joinParts(parts: string[]): string {
 function titles(segments: ReasoningSegment[]): (string | null)[] {
 	return segments.map((s) => s.title);
 }
+
+describe("usesStructuredReasoning — explicit GPT model ownership", () => {
+	test.each([
+		"gpt",
+		"gpt-5.6",
+		"GPT-5.6",
+		"openai:gpt-5.6",
+		"nug:openai:gpt-5.6",
+		"  codex:GPT-5.6  ",
+	])("accepts GPT model %s", (model) => {
+		expect(usesStructuredReasoning(model)).toBe(true);
+	});
+
+	test.each([
+		"claude-sonnet-4.6",
+		"anthropic:claude-opus-4.6",
+		"gemini-3",
+		"codex",
+		"o3",
+		"gptish",
+		"my-gpt-5.6",
+		"gpt-5.6:claude-sonnet-4.6",
+	])("keeps non-GPT model %s plain", (model) => {
+		expect(usesStructuredReasoning(model)).toBe(false);
+	});
+
+	test.each([undefined, null, "", "  ", "openai:"])("keeps unknown model %s plain", (model) => {
+		expect(usesStructuredReasoning(model)).toBe(false);
+	});
+});
 
 describe("parseReasoningSegments — codex parity", () => {
 	test("splits header and body when both present", () => {

@@ -523,6 +523,9 @@ export type SnapshotStreamingBlock =
 	  };
 
 export interface StreamingSnapshot {
+	/** Actual upstream request identity, not the narrator's configured defaults. */
+	model?: string;
+	provider?: string;
 	/** Ordered streaming blocks — preserves temporal order of reasoning, web_search, and text. */
 	streamingBlocks: SnapshotStreamingBlock[];
 	toolChunks: Map<string, ToolChunkSnapshot>;
@@ -736,6 +739,8 @@ function discardRetryableImageGenerationProgress(ctx: EventHandlerContext): bool
 	dualBroadcast(ctx, resetMessage);
 
 	const snapshotData = {
+		model: snap.model,
+		provider: snap.provider,
 		streamingBlocks: snap.streamingBlocks,
 		toolChunks: [...snap.toolChunks.values()],
 	};
@@ -3094,6 +3099,20 @@ export async function processEvent(
 		}
 
 		case "api_request_start": {
+			// This context is runtime state; durable checkpoints must use the same
+			// resolved request identity as the live row, not a configured model alias.
+			ctx.model = event.model;
+			ctx.provider = event.provider;
+			const snap = getOrCreateSnapshot(narratorId);
+			snap.model = event.model;
+			snap.provider = event.provider;
+			dualBroadcast(ctx, {
+				type: "streaming_identity",
+				narratorId: broadcastTargetId,
+				model: event.model,
+				provider: event.provider,
+				...(ctx.parentToolUseId ? { parentToolUseId: ctx.parentToolUseId } : {}),
+			});
 			const sourceContext = inputSourceContext(ctx);
 			if (sourceContext.attempt !== event.requestId) {
 				await toolInputStreamSource.discardUnpersisted(narratorId);

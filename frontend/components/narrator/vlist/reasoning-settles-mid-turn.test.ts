@@ -45,6 +45,7 @@ function liveSegment(
 		kind: "message",
 		msg: {
 			id: "__streaming__",
+			model: "gpt-5.6",
 			role: "assistant",
 			contentJson: blocks as never,
 			...(liveBlockIndex != null ? { liveBlockIndex } : {}),
@@ -101,6 +102,7 @@ describe("live reasoning settles once the model produces later content", () => {
 			kind: "message",
 			msg: {
 				id: "__streaming__",
+				model: "gpt-5.6",
 				role: "assistant",
 				contentJson: [
 					REASONING,
@@ -123,7 +125,7 @@ describe("live reasoning settles once the model produces later content", () => {
 	it("keeps a persisted message settled regardless of its shape", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: { id: "real-1", role: "assistant", contentJson: [REASONING] as never },
+			msg: { id: "real-1", model: "gpt-5.6", role: "assistant", contentJson: [REASONING] as never },
 		};
 		const spec = reasoningSpec(seg, 5);
 		const steps = (spec?.data as { steps: { shimmer?: boolean }[] }).steps;
@@ -139,6 +141,7 @@ describe("the folded L1/L2 trace drops the live tail when a run settles", () => 
 		const longReasoning = { type: "reasoning", text: `**分析步骤**\n\n${"长文本".repeat(120)}` };
 		const msg = {
 			id: "__streaming__",
+			model: "gpt-5.6",
 			role: "assistant",
 			contentJson: [longReasoning, TOOL] as never,
 			liveBlockIndex,

@@ -189,6 +189,88 @@ describe("Write complete input source routing", () => {
 });
 
 describe("request attribution", () => {
+	test("persists the actual request identity on the first content checkpoint", async () => {
+		const id = "request-checkpoint-identity";
+		const createdAt = new Date().toISOString();
+		await db
+			.insert(narrators)
+			.values({ id, type: "primary", inheritMode: "fresh", createdAt, updatedAt: createdAt });
+		let partialId: string | undefined;
+		const ctx: EventHandlerContext = {
+			...makeMainContext(),
+			narratorId: id,
+			broadcastTargetId: id,
+			model: "__default__",
+			provider: "configured-provider",
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (value) => {
+				partialId = value;
+			},
+		};
+		try {
+			await processEvent(
+				{
+					type: "api_request_start",
+					requestId: "checkpoint-request",
+					model: "gpt-resolved",
+					provider: "openai",
+				},
+				ctx,
+			);
+			expect(ctx).toMatchObject({ model: "gpt-resolved", provider: "openai" });
+			await processEvent(
+				{
+					type: "block_complete",
+					block: { type: "reasoning", id: "reason-checkpoint", text: "Actual reasoning" },
+				},
+				ctx,
+			);
+			expect(partialId).toBeDefined();
+			const persisted = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, partialId as string),
+			});
+			expect(persisted).toMatchObject({ model: "gpt-resolved", provider: "openai" });
+			expect(persisted?.contentJson).toMatchObject([
+				{ type: "reasoning", text: "Actual reasoning" },
+			]);
+		} finally {
+			clearStreamingSnapshot(id);
+			await cleanupFileContextNarrator(id);
+		}
+	});
+	test("publishes actual request identity to live clients and author reconnect snapshots", async () => {
+		for (const child of [false, true]) {
+			const ctx = child ? makeSubagentContext() : makeMainContext();
+			ctx.model = "configured-default";
+			ctx.provider = "configured-provider";
+			await processEvent(
+				{
+					type: "api_request_start",
+					requestId: `identity-${child}`,
+					model: child ? "gpt-child" : "gpt-actual",
+					provider: "actual-provider",
+				},
+				ctx,
+			);
+			expect(getStreamingSnapshot(ctx.narratorId)).toMatchObject({
+				model: child ? "gpt-child" : "gpt-actual",
+				provider: "actual-provider",
+			});
+			const identities = (broadcastMessages as Array<Record<string, unknown>>).filter(
+				(message) => message.type === "streaming_identity",
+			);
+			expect(identities.at(-1)).toMatchObject({
+				model: child ? "gpt-child" : "gpt-actual",
+				provider: "actual-provider",
+			});
+			if (child) {
+				expect(identities.at(-2)).toMatchObject({ parentToolUseId: PARENT_TOOL_USE_ID });
+				expect(identities.at(-1)).not.toHaveProperty("parentToolUseId");
+				expect(broadcastTargets.at(-1)).toBe(SUBAGENT_NARRATOR_ID);
+				expect(getStreamingSnapshot(PARENT_NARRATOR_ID)?.model).toBe("gpt-actual");
+			}
+		}
+	});
 	test("subagent request keeps its event owner rather than the later pass owner", async () => {
 		const ctx = makeSubagentContext();
 		ctx.userId = "later-user";
