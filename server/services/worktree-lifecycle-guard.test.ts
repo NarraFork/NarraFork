@@ -1,10 +1,13 @@
 import { describe, expect, mock, test } from "bun:test";
+import { normalizePathForComparison } from "../lib/platform-path";
 import {
 	assertWorkspaceAdmission,
+	canonicalWorkspaceAdmissionTarget,
 	createLifecycleGuard,
 	type LifecycleGuardPorts,
 	type ResourceClaim,
 	ResourceProtectionError,
+	withLifecycleGuardPorts,
 	withProtectionReservation,
 	withWorkspaceAdmission,
 } from "./worktree-lifecycle-guard";
@@ -17,6 +20,44 @@ function fixture(claims: ResourceClaim[] = [], complete = true) {
 	return { ports, guard: createLifecycleGuard(ports) };
 }
 const target = { path: "/real/worktree" };
+
+describe("canonical cwd spelling", () => {
+	test("Windows cwd keeps filesystem casing while ownership keys still ignore case", async () => {
+		const requested = "C:\\Users\\Alice\\MyProject";
+		const ports: LifecycleGuardPorts = {
+			canonicalAdmissionPath: async () => requested,
+			canonicalPath: async (path) => path.replaceAll("\\", "/").toLowerCase(),
+			readClaims: async () => ({
+				complete: true,
+				claims: [{ kind: "narrator", id: "owner", path: "c:/users/alice/myproject" }],
+			}),
+		};
+		const target = await withLifecycleGuardPorts(ports, () =>
+			canonicalWorkspaceAdmissionTarget({ deviceId: "local", path: requested }),
+		);
+		expect(target.canonicalCwd).toBe(requested);
+		expect(target.path).toBe(normalizePathForComparison(requested));
+		const guard = createLifecycleGuard(ports);
+		for (const path of [requested, requested.toUpperCase(), requested.toLowerCase()]) {
+			expect((await guard.inspect([{ path }], "delete")).status).toBe("protected");
+		}
+	});
+
+	test("remote cwd spelling is left untouched and does not probe local filesystem", async () => {
+		const canonicalPath = mock(async (path: string) => path.toLowerCase());
+		const ports: LifecycleGuardPorts = {
+			canonicalPath,
+			readClaims: async () => ({ complete: true, claims: [] }),
+		};
+		const path = "/Work/MyProject";
+		const target = await withLifecycleGuardPorts(ports, () =>
+			canonicalWorkspaceAdmissionTarget({ deviceId: "remote", path }),
+		);
+		expect(target.path).toBe(path);
+		expect(target.canonicalCwd).toBe(path);
+		expect(canonicalPath).not.toHaveBeenCalled();
+	});
+});
 
 describe("read-only lifecycle protection", () => {
 	for (const state of ["preparing", "ready", "unknown"]) {

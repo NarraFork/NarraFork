@@ -42,7 +42,7 @@ import { chapterSplit } from "./chapter-split";
 import { chapterWriteStore } from "./chapter-write/store";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
-import { narratorService } from "./narrator-service";
+import { narratorCreationWorkspaceTarget, narratorService } from "./narrator-service";
 import * as narratorSession from "./narrator-session";
 import { FileWorktreeJournal } from "./narrator-worktree-journal";
 import { narratorWorktreeResourceRegistry } from "./narrator-worktree-resources";
@@ -530,6 +530,57 @@ for (const protectedPrefix of [true, false]) {
 		}
 	});
 }
+
+test("creation persists the case-preserving cwd instead of the lifecycle comparison key", async () => {
+	const cwd = join(temporary, "MixedCaseProject");
+	await mkdir(cwd);
+	const expected = await realpath(cwd);
+	const created = await withLifecycleGuardPorts(
+		{
+			canonicalAdmissionPath: async (value) => realpath(value),
+			// Simulate Windows identity folding on any test host.
+			canonicalPath: async (value) => (await realpath(value)).toLowerCase(),
+			readClaims: async () => ({ complete: true, claims: [] }),
+		},
+		() => narratorService.create({ cwd, title: "preserve cwd spelling" }),
+	);
+	otherNarrators.push(created.id);
+	expect(created.cwd).toBe(expected);
+	expect(
+		db.select({ cwd: narrators.cwd }).from(narrators).where(eq(narrators.id, created.id)).get()
+			?.cwd,
+	).toBe(expected);
+});
+
+test("inherited committed workspace context keeps canonical path casing", async () => {
+	const cwd = join(temporary, "InheritedWorkspace");
+	await mkdir(cwd);
+	const expected = await realpath(cwd);
+	const row: Parameters<typeof narratorCreationWorkspaceTarget>[0] = {
+		chapterId: null,
+		contextProjectId: null,
+		cwd,
+		defaultDeviceId: "local",
+		workspaceContext: {
+			revision: 1,
+			deviceId: "local",
+			cwd,
+			pathFlavor: "posix",
+			contextKey: "case-fixture",
+			capabilities: { switchDirectory: true },
+		},
+	};
+	await withLifecycleGuardPorts(
+		{
+			canonicalAdmissionPath: async (value) => realpath(value),
+			canonicalPath: async (value) => (await realpath(value)).toLowerCase(),
+			readClaims: async () => ({ complete: true, claims: [] }),
+		},
+		() => narratorCreationWorkspaceTarget(row),
+	);
+	expect(row.cwd).toBe(expected);
+	expect(row.workspaceContext?.cwd).toBe(expected);
+});
 
 test("real local relative cwd stays a protected absolute host claim without poisoning unrelated retirement", async () => {
 	const created = await narratorService.create({ cwd: ".", title: "relative local compatibility" });

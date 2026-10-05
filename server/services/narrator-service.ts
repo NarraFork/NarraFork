@@ -1636,7 +1636,8 @@ export async function narratorCreationWorkspaceTarget(
 		repositoryKey: row.workspaceContext?.git?.repositoryKey,
 	});
 	// Store canonical explicit claims; cwd and committed context may be distinct devices.
-	if (row.cwd && target.path && localPathSemantics.isAbsolute(row.cwd)) row.cwd = target.path;
+	if (row.cwd && target.canonicalCwd && localPathSemantics.isAbsolute(row.cwd))
+		row.cwd = target.canonicalCwd;
 	const targets = [target];
 	if (row.workspaceContext) {
 		const context = row.workspaceContext;
@@ -1646,7 +1647,7 @@ export async function narratorCreationWorkspaceTarget(
 			scopeProjectId: context.contextProjectId ?? scopeProjectId,
 			repositoryKey: context.git?.repositoryKey,
 		});
-		row.workspaceContext = { ...context, cwd: contextTarget.path ?? context.cwd };
+		row.workspaceContext = { ...context, cwd: contextTarget.canonicalCwd ?? context.cwd };
 		targets.push(contextTarget);
 	}
 	return targets;
