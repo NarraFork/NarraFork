@@ -3,13 +3,21 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { act, type PropsWithChildren } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import type { SystemLifecycleNotice } from "../lib/api/system-lifecycle";
-import { systemLifecycleNoticeQueryKey } from "../lib/api/system-lifecycle";
+import type { SystemLifecycleNotice, SystemLifecycleStatus } from "../lib/api/system-lifecycle";
+import {
+	systemLifecycleNoticeQueryKey,
+	systemLifecycleStatusQueryKey,
+} from "../lib/api/system-lifecycle";
 
 const originalApi = { ...(await import("../lib/api")) };
 const originalAuth = { ...(await import("../hooks/useAuth")) };
 const originalI18n = { ...(await import("react-i18next")) };
 const originalMantine = { ...(await import("@mantine/core")) };
+const originalConfirm = { ...(await import("./common/confirm-dialog-context")) };
+mock.module("./common/confirm-dialog-context", () => ({
+	...originalConfirm,
+	useConfirmDialog: () => async () => false,
+}));
 // Only the floating-positioning shell is replaced: Linkedom has no layout engine.
 // The actual buttons, query updates and administrator action run unchanged.
 const TestPopover = Object.assign(({ children }: PropsWithChildren) => <div>{children}</div>, {
@@ -21,9 +29,25 @@ const { MantineProvider } = await import("@mantine/core");
 let role: "admin" | "user" | null = "admin";
 let notice: SystemLifecycleNotice;
 let calls = 0;
+let detailCalls = 0;
+let noticeCalls = 0;
 let cancellations = 0;
 let failure: Error | null = null;
 let noticeFailure: Error | null = null;
+function detailedStatus(): SystemLifecycleStatus {
+	return {
+		...notice,
+		coordination: {
+			phase: "quiescing_tools",
+			scheduled: true,
+			pendingBackgroundBashCount: 0,
+			pendingOrdinaryExecutionCount: 0,
+			resumableExecutionCount: 0,
+			pausedToolCount: 3,
+			blockers: [],
+		},
+	};
+}
 mock.module("../hooks/useAuth", () => ({
 	...originalAuth,
 	useCurrentUser: () => ({ data: role ? { role } : undefined }),
@@ -36,8 +60,15 @@ mock.module("../lib/api", () => ({
 	...originalApi,
 	api: {
 		...originalApi.api,
+		getSystemLifecycleStatus: async () => {
+			calls++;
+			detailCalls++;
+			if (noticeFailure) throw noticeFailure;
+			return detailedStatus();
+		},
 		getSystemLifecycleNotice: async () => {
 			calls++;
+			noticeCalls++;
 			if (noticeFailure) throw noticeFailure;
 			return notice;
 		},
@@ -50,6 +81,7 @@ mock.module("../lib/api", () => ({
 	},
 }));
 const { SystemMaintenanceBadge } = await import("./SystemMaintenanceBadge");
+const { SystemShutdownCard } = await import("./settings/SystemShutdownCard");
 const globals = new Map<string, PropertyDescriptor | undefined>();
 let root: Root | null = null;
 let container: HTMLElement;
@@ -62,6 +94,8 @@ beforeEach(() => {
 	role = "admin";
 	notice = { phase: "prepared", shutdownRequested: false };
 	calls = 0;
+	detailCalls = 0;
+	noticeCalls = 0;
 	cancellations = 0;
 	failure = null;
 	noticeFailure = null;
@@ -109,13 +143,14 @@ async function flush() {
 		await Bun.sleep(20);
 	});
 }
-async function render() {
+async function render(withSettings = false) {
 	root = createRoot(container);
 	await act(async () =>
 		root?.render(
 			<MantineProvider>
 				<QueryClientProvider client={client}>
 					<SystemMaintenanceBadge />
+					{withSettings && <SystemShutdownCard />}
 				</QueryClientProvider>
 			</MantineProvider>,
 		),
@@ -124,6 +159,24 @@ async function render() {
 }
 
 describe("global maintenance indication", () => {
+	test("header shows prepared as soon as the settings status finishes preparing", async () => {
+		notice.phase = "preparing";
+		await render(true);
+		expect(container.textContent).toContain("systemMaintenancePreparingDescription");
+		// The settings poll has finished, but the independent redacted notice is still stale.
+		await act(async () =>
+			client.setQueryData<SystemLifecycleStatus>(systemLifecycleStatusQueryKey, {
+				...detailedStatus(),
+				phase: "prepared",
+			}),
+		);
+		await flush();
+		expect(container.textContent).toContain("systemRecoveryPrepared");
+		expect(container.querySelector('button[title="systemMaintenancePaused"]')).not.toBeNull();
+		expect(container.textContent).toContain("systemMaintenancePausedDescription");
+		expect(container.textContent).not.toContain("systemMaintenancePreparingDescription");
+		expect(noticeCalls).toBe(0);
+	});
 	test.each(["idle", "failed"] as const)("no warning for inactive state %s", async (phase) => {
 		notice.phase = phase;
 		await render();
@@ -137,6 +190,38 @@ describe("global maintenance indication", () => {
 		expect(container.textContent).toContain("systemMaintenanceContactAdmin");
 		expect(container.textContent).not.toContain("systemMaintenanceResume");
 		expect(cancellations).toBe(0);
+		expect(detailCalls).toBe(0);
+		expect(noticeCalls).toBe(1);
+	});
+
+	test("ordinary users switch to prepared without requesting administrator status", async () => {
+		role = "user";
+		notice.phase = "preparing";
+		await render();
+		await act(async () =>
+			client.setQueryData(systemLifecycleNoticeQueryKey, {
+				phase: "prepared",
+				shutdownRequested: false,
+			}),
+		);
+		await flush();
+		expect(container.querySelector('button[title="systemMaintenancePaused"]')).not.toBeNull();
+		expect(container.textContent).toContain("systemMaintenancePausedDescription");
+		expect(container.textContent).not.toContain("systemMaintenancePreparingDescription");
+		expect(detailCalls).toBe(0);
+	});
+
+	test("settings cancellation removes the header even when the redacted notice is stale", async () => {
+		await render(true);
+		await act(async () =>
+			client.setQueryData(systemLifecycleStatusQueryKey, {
+				...detailedStatus(),
+				phase: "idle",
+			}),
+		);
+		await flush();
+		expect(container.querySelector('button[title="systemMaintenancePaused"]')).toBeNull();
+		expect(container.textContent).not.toContain("systemMaintenancePausedDescription");
 	});
 
 	test("administrator can resume from the header and update the settings card cache", async () => {
@@ -157,7 +242,8 @@ describe("global maintenance indication", () => {
 		await render();
 		expect(container.textContent).toContain("systemMaintenancePreparing");
 		await act(async () =>
-			client.setQueryData(systemLifecycleNoticeQueryKey, {
+			client.setQueryData(systemLifecycleStatusQueryKey, {
+				...detailedStatus(),
 				phase: "shutting_down",
 				shutdownRequested: true,
 			}),
@@ -184,7 +270,7 @@ describe("global maintenance indication", () => {
 		await render();
 		noticeFailure = new Error("network offline");
 		await act(async () => {
-			await client.invalidateQueries({ queryKey: systemLifecycleNoticeQueryKey });
+			await client.invalidateQueries({ queryKey: systemLifecycleStatusQueryKey });
 		});
 		expect(container.textContent).toContain("systemMaintenancePaused");
 	});

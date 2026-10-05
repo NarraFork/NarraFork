@@ -1,13 +1,17 @@
 import { Alert, Badge, Button, Group, Paper, Stack, Text } from "@mantine/core";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
+import { useSystemLifecycleStatus } from "../../hooks/useSystemLifecycleStatus";
 import { ApiError, api } from "../../lib/api";
-import { systemLifecycleNoticeQueryKey } from "../../lib/api/system-lifecycle";
+import {
+	systemLifecycleNoticeQueryKey,
+	systemLifecycleStatusQueryKey,
+} from "../../lib/api/system-lifecycle";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 
-const queryKey = ["system-lifecycle"];
+const queryKey = systemLifecycleStatusQueryKey;
 
 export function SystemShutdownCard() {
 	const { data: user } = useCurrentUser();
@@ -20,29 +24,7 @@ function AdminSystemShutdownCard() {
 	const confirm = useConfirmDialog();
 	const queryClient = useQueryClient();
 	const [confirming, setConfirming] = useState(false);
-	const statusQuery = useQuery({
-		queryKey,
-		queryFn: ({ signal }) => api.getSystemLifecycleStatus(signal),
-		enabled: (query) =>
-			query.state.data?.phase !== "shutting_down" &&
-			!(
-				query.state.data?.shutdownRequested &&
-				query.state.error &&
-				!(query.state.error instanceof ApiError)
-			),
-		refetchInterval: (query) =>
-			query.state.data?.phase === "shutting_down" ||
-			(query.state.data?.shutdownRequested &&
-				query.state.error &&
-				!(query.state.error instanceof ApiError))
-				? false
-				: 2_000,
-		// After shutdown is acknowledged, never mistake a reconnect for completion.
-		refetchOnWindowFocus: false,
-		refetchOnReconnect: false,
-		refetchOnMount: (query) => query.state.data?.phase !== "shutting_down",
-		retry: false,
-	});
+	const statusQuery = useSystemLifecycleStatus();
 	const action = useMutation({
 		mutationFn: (kind: "prepare" | "shutdown" | "cancel") => {
 			if (kind === "prepare") return api.prepareSystemRecovery();

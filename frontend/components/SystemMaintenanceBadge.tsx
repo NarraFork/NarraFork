@@ -3,18 +3,24 @@ import { IconPlayerPause } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../hooks/useAuth";
+import { useSystemLifecycleStatus } from "../hooks/useSystemLifecycleStatus";
 import { api } from "../lib/api";
-import { systemLifecycleNoticeQueryKey } from "../lib/api/system-lifecycle";
+import {
+	systemLifecycleNoticeQueryKey,
+	systemLifecycleStatusQueryKey,
+} from "../lib/api/system-lifecycle";
 
 /** Non-dismissible, global indication of the maintenance gate, not a narrator failure. */
 export function SystemMaintenanceBadge() {
 	const { t } = useTranslation("settings");
 	const { data: user } = useCurrentUser();
 	const client = useQueryClient();
+	const isAdmin = user?.role === "admin";
+	const lifecycle = useSystemLifecycleStatus(isAdmin);
 	const notice = useQuery({
 		queryKey: systemLifecycleNoticeQueryKey,
 		queryFn: ({ signal }) => api.getSystemLifecycleNotice(signal),
-		enabled: !!user,
+		enabled: !!user && !isAdmin,
 		refetchInterval: (query) => (query.state.data?.phase === "shutting_down" ? false : 2_000),
 		refetchIntervalInBackground: true,
 		retry: false,
@@ -24,16 +30,17 @@ export function SystemMaintenanceBadge() {
 		onSuccess: async ({ status }) => {
 			await Promise.all([
 				client.cancelQueries({ queryKey: systemLifecycleNoticeQueryKey }),
-				client.cancelQueries({ queryKey: ["system-lifecycle"] }),
+				client.cancelQueries({ queryKey: systemLifecycleStatusQueryKey }),
 			]);
 			client.setQueryData(systemLifecycleNoticeQueryKey, {
 				phase: status.phase,
 				shutdownRequested: status.shutdownRequested,
 			});
-			client.setQueryData(["system-lifecycle"], status);
+			client.setQueryData(systemLifecycleStatusQueryKey, status);
 		},
 	});
-	const status = notice.data;
+	// Administrators must not see a stale redacted notice disagreeing with the settings card.
+	const status = isAdmin ? lifecycle.data : notice.data;
 	if (!user || !status || !["preparing", "prepared", "shutting_down"].includes(status.phase)) {
 		return null;
 	}
