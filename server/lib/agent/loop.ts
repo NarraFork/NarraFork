@@ -1,4 +1,6 @@
 import { resolve } from "node:path";
+import type { ContextCharCache } from "@shared/context-composition";
+import type { ContextInputCharacters, ContextUsageSnapshot } from "@shared/context-usage";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import {
 	createStreamingEditOrigin,
@@ -22,6 +24,7 @@ import {
 	normalizeBooleanOverride,
 	resolveBooleanOverride,
 } from "../boolean-override";
+import { matchContextComposition, validInputCharacters } from "../context-usage-snapshot";
 import { resolveKimiQuotaWait } from "../kimi-quota-wait";
 import { logger } from "../logger";
 import { withModelMetadataSnapshotIterator } from "../model-catalog";
@@ -53,8 +56,8 @@ import {
 	isResumableError,
 	isRetryableError,
 } from "./error-handling";
-import { estimateTokens } from "./estimate-tokens";
 import { localPathSemantics } from "./execution/path-semantics";
+import { countInputCharacters } from "./input-characters";
 import {
 	buildMalformedCaptureRecord,
 	isMalformedRequestBodyError,
@@ -1156,6 +1159,7 @@ async function recordReflectionApiRequestEnd(
 			ttftMs: event.ttftMs ?? null,
 			durationMs: event.durationMs ?? null,
 			contextPercent: event.contextPercent ?? null,
+			contextSnapshot: event.contextSnapshot,
 			meterUsage: event.meterUsage ?? null,
 			meterUnit: event.meterUnit ?? null,
 			errorMessage: event.errorMessage ?? null,
@@ -1270,6 +1274,9 @@ export async function runReflectionLoop(
 			// Keep systemPrompt available to dynamic tool definitions; suppress only injection.
 			getRuntimeSettingsOverride: undefined,
 			getModelOverride: undefined,
+			// Auxiliary inputs cannot replace or pin the parent conversation's classification.
+			freezeContextComposition: undefined,
+			onToolsCharacters: undefined,
 			// Auxiliary decision tools are not the original filesystem execution attempt.
 			onToolExecutionFinalAuthorization: undefined,
 			// Reflection is an auxiliary call: follow the user's retry policy but
@@ -2474,7 +2481,8 @@ async function* agentLoopInMetadataSnapshot(
 	async function reportToolsCharacters(formattedTools: unknown): Promise<void> {
 		if (!config.onToolsCharacters) return;
 		try {
-			await config.onToolsCharacters(JSON.stringify(formattedTools).length);
+			const counts = await countInputCharacters({ tools: formattedTools }, config.signal);
+			if (counts) await config.onToolsCharacters(counts.toolsChars);
 		} catch (error) {
 			logger.warn("Failed to store context tool characters", {
 				narratorId: config.narratorId,
@@ -3443,6 +3451,28 @@ async function* agentLoopInMetadataSnapshot(
 				| undefined;
 			let requestContextPercent: number | undefined;
 			let upstreamContextPercent: number | undefined;
+			let requestRawContextWindow: number | undefined;
+			let inputCharacters: ContextInputCharacters | null = null;
+			let inputComposition: ContextCharCache | null = null;
+			let contextSnapshot: ContextUsageSnapshot | undefined;
+			function snapshotContext(
+				source: ContextUsageSnapshot["source"],
+				percentage: number | null,
+				window: number | null,
+				occupied: number | null,
+			): ContextUsageSnapshot {
+				contextSnapshot = {
+					requestId,
+					startedAt: new Date(requestStartTime || Date.now()).toISOString(),
+					source,
+					percentage,
+					contextWindow: window,
+					occupiedTokens: occupied,
+					inputCharacters,
+					composition: matchContextComposition(inputComposition, inputCharacters),
+				};
+				return contextSnapshot;
+			}
 			let requestMeterUsage: number | undefined;
 			let requestMeterUnit: string | undefined;
 			let sawMeaningfulResponse = false;
@@ -3599,7 +3629,8 @@ async function* agentLoopInMetadataSnapshot(
 			};
 
 			function getEstimatedUpstreamPromptTokens(): number | undefined {
-				const contextWindow = getModelContextWindow(effectiveModel, effectiveProvider);
+				const contextWindow =
+					requestRawContextWindow ?? getModelContextWindow(effectiveModel, effectiveProvider);
 				return upstreamContextPercent !== undefined && contextWindow
 					? Math.round((upstreamContextPercent / 100) * contextWindow)
 					: undefined;
@@ -3631,21 +3662,38 @@ async function* agentLoopInMetadataSnapshot(
 						})
 					: undefined;
 				requestDump?.setDiagnostics(diagnostics);
+				if (!contextSnapshot) {
+					const window = getModelContextWindow(effectiveModel, effectiveProvider);
+					if (window && inputCharacters) {
+						const occupied = Math.ceil(inputCharacters.totalChars * 0.3);
+						const percentage = (occupied / window) * 100;
+						requestContextPercent = Math.min(percentage, 100);
+						const snapshot = snapshotContext("estimate", percentage, window, occupied);
+						yield {
+							type: "context_usage",
+							percentage: requestContextPercent,
+							source: "estimate",
+							snapshot,
+							promptTokens: occupied,
+							contextWindow: window,
+							isEstimated: true,
+						};
+					}
+				}
 				yield {
 					type: "api_request_end",
 					requestId,
 					credentialId,
-					// Keep measured counts independent of window occupancy. Only replace
-					// missing/zero prompt placeholders with the upstream-derived estimate.
-					usage:
-						upstreamContextPercent !== undefined && !requestUsage?.promptTokens
-							? {
-									...requestUsage,
-									inputTokens: getEstimatedUpstreamPromptTokens(),
-									promptTokens: getEstimatedUpstreamPromptTokens(),
-									completionTokens: requestUsage?.completionTokens || estimateTokens(assistantText),
-								}
-							: requestUsage,
+					// Billing counters are never synthesized from occupancy.
+					usage: requestUsage,
+					contextSnapshot:
+						contextSnapshot ??
+						snapshotContext(
+							"estimate",
+							null,
+							getModelContextWindow(effectiveModel, effectiveProvider) ?? null,
+							null,
+						),
 					ttftMs: requestTtftMs,
 					durationMs: Date.now() - requestStartTime,
 					contextPercent: requestContextPercent,
@@ -4066,7 +4114,11 @@ async function* agentLoopInMetadataSnapshot(
 				requestStartPending = false;
 				requestTtftMs = undefined;
 				requestUsage = undefined;
+				inputCharacters = null;
+				inputComposition = null;
+				contextSnapshot = undefined;
 				upstreamContextPercent = undefined;
+				requestRawContextWindow = undefined;
 				requestContextPercent = undefined;
 				requestMeterUsage = undefined;
 				requestMeterUnit = undefined;
@@ -4244,6 +4296,19 @@ async function* agentLoopInMetadataSnapshot(
 						requestDump,
 						resetUpstreamSession,
 						onRequestStart: markRequestStarted,
+						onInputCharacters: (counts) => {
+							inputCharacters = validInputCharacters(counts);
+							try {
+								inputComposition =
+									config.freezeContextComposition?.(
+										inputCharacters,
+										requestId,
+										new Date(requestStartTime || Date.now()).toISOString(),
+									) ?? null;
+							} catch {
+								inputComposition = null;
+							}
+						},
 						...(isFirstTurn && images?.length ? { images } : {}),
 					});
 
@@ -4804,22 +4869,33 @@ async function* agentLoopInMetadataSnapshot(
 							};
 						}
 						if (
+							parsed.usage?.contextWindow != null &&
+							Number.isFinite(parsed.usage.contextWindow) &&
+							parsed.usage.contextWindow > 0
+						)
+							requestRawContextWindow = parsed.usage.contextWindow;
+						if (
 							parsed.contextUsagePercentage != null &&
 							Number.isFinite(parsed.contextUsagePercentage)
 						) {
 							receivedUsage = true;
 							// Upstream occupancy is independent of measured/billed token counts.
-							const ctxWin = getModelContextWindow(effectiveModel, effectiveProvider);
+							const ctxWin =
+								requestRawContextWindow ?? getModelContextWindow(effectiveModel, effectiveProvider);
 							upstreamContextPercent = Math.min(Math.max(parsed.contextUsagePercentage, 0), 100);
 							requestContextPercent = upstreamContextPercent;
 							const estimatedPromptTokens = getEstimatedUpstreamPromptTokens();
-							const estimatedCompletionTokens = estimateTokens(assistantText);
 							yield {
 								type: "context_usage",
 								percentage: upstreamContextPercent,
+								source: "upstream",
+								snapshot: snapshotContext(
+									"upstream",
+									upstreamContextPercent,
+									ctxWin ?? null,
+									estimatedPromptTokens ?? null,
+								),
 								promptTokens: estimatedPromptTokens,
-								inputTokens: estimatedPromptTokens,
-								completionTokens: estimatedCompletionTokens,
 								contextWindow: ctxWin ?? undefined,
 								isEstimated: true,
 							};
@@ -4895,10 +4971,41 @@ async function* agentLoopInMetadataSnapshot(
 								yield {
 									type: "context_usage",
 									percentage: requestContextPercent,
+									source: "usage",
+									snapshot: snapshotContext(
+										"usage",
+										percentage,
+										contextWindow,
+										parsed.usage.promptTokens,
+									),
 									...requestUsage,
 									contextWindow,
+									isEstimated: false,
 								};
 							}
+						}
+						if (
+							upstreamContextPercent !== undefined &&
+							requestRawContextWindow &&
+							(contextSnapshot as ContextUsageSnapshot | undefined)?.contextWindow !==
+								requestRawContextWindow
+						) {
+							const occupied = getEstimatedUpstreamPromptTokens();
+							const snapshot = snapshotContext(
+								"upstream",
+								upstreamContextPercent,
+								requestRawContextWindow,
+								occupied ?? null,
+							);
+							yield {
+								type: "context_usage",
+								percentage: upstreamContextPercent,
+								source: "upstream",
+								snapshot,
+								promptTokens: occupied,
+								contextWindow: requestRawContextWindow,
+								isEstimated: true,
+							};
 						}
 						if (parsed.webSearch) {
 							const ws = parsed.webSearch;
@@ -6513,22 +6620,7 @@ async function* agentLoopInMetadataSnapshot(
 			const toHistoryToolUses = (list: AgentToolUse[]): AgentToolUse[] =>
 				applyToolUseIdRemap(list, turnToolUseIdRemap);
 
-			// ── Estimate token usage when provider doesn't report it ──
-			// Some providers don't report token usage in their API responses.
-			// For these cases, we estimate based on text length to provide usage statistics.
-			if (!requestUsage && upstreamContextPercent === undefined) {
-				const historyText = JSON.stringify(history);
-				const systemText = config.systemPrompt ?? "";
-				const estimatedInputTokens =
-					estimateTokens(historyText) + estimateTokens(systemText) + estimateTokens(content);
-				const estimatedOutputTokens = estimateTokens(assistantText);
-
-				requestUsage = {
-					inputTokens: estimatedInputTokens,
-					promptTokens: estimatedInputTokens,
-					completionTokens: estimatedOutputTokens,
-				};
-			}
+			// No fabricated billing counters: occupancy estimates live only in contextSnapshot.
 
 			// Emit API request end event, retaining the failed stream's diagnostics.
 			yield* finishRequest(pendingResumableError?.message);
@@ -6543,28 +6635,7 @@ async function* agentLoopInMetadataSnapshot(
 			reasoningOnlyRetries = 0;
 			reasoningOnlyCompactAttempted = false;
 
-			// ── Fallback: estimate context usage when the provider reported nothing ──
-			if (!receivedUsage) {
-				const contextWindow = getModelContextWindow(effectiveModel, effectiveProvider);
-				if (contextWindow) {
-					// Estimate prompt tokens from history + system prompt + current turn content
-					const historyText = JSON.stringify(history);
-					const systemText = config.systemPrompt ?? "";
-					const estimatedPromptTokens =
-						estimateTokens(historyText) +
-						estimateTokens(systemText) +
-						estimateTokens(content) +
-						estimateTokens(assistantText);
-					const percentage = Math.min((estimatedPromptTokens / contextWindow) * 100, 100);
-					yield {
-						type: "context_usage",
-						percentage,
-						promptTokens: estimatedPromptTokens,
-						contextWindow,
-						isEstimated: true,
-					};
-				}
-			}
+			// The input-only fallback is emitted by finishRequest, before its matching end event.
 
 			// Detect orphaned tool uses — tool calls whose streaming input was cut off
 			// before receiving a stop signal (typically due to API max_tokens truncation).

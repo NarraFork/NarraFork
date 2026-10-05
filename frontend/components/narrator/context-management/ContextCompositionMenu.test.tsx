@@ -4,6 +4,7 @@ import {
 	emptyContextComposition,
 	groupContextSegments,
 } from "@shared/context-composition";
+import type { ContextUsageSnapshot } from "@shared/context-usage";
 import { parseHTML } from "linkedom";
 import { act, createElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -86,6 +87,24 @@ const data: ContextComposition = {
 	nextCursor: null,
 	pending: false,
 };
+function snapshot(tokens = 160_000, totalChars = 400, generation = "g"): ContextUsageSnapshot {
+	return {
+		requestId: "request",
+		startedAt: "2026-01-01",
+		source: "upstream",
+		percentage: (tokens / 1_000_000) * 100,
+		contextWindow: 1_000_000,
+		occupiedTokens: tokens,
+		inputCharacters: { totalChars, systemChars: 0, toolsChars: 0 },
+		composition: {
+			generation,
+			revision: "1",
+			pageCount: 1,
+			totalChars: data.totalChars,
+			totals: data.totals,
+		},
+	};
+}
 beforeEach(() => {
 	const { window } = parseHTML("<html><body><div id='root'></div></body></html>");
 	for (const [key, value] of Object.entries({
@@ -119,7 +138,11 @@ afterEach(async () => {
 async function render(value = data, onLoadMore?: () => void) {
 	await act(() =>
 		root.render(
-			createElement(ContextCompositionView, { data: value, totalTokens: 160_000, onLoadMore }),
+			createElement(ContextCompositionView, {
+				data: { ...value, usage: snapshot(160_000, value.totalChars) },
+				snapshot: snapshot(160_000, value.totalChars),
+				onLoadMore,
+			}),
 		),
 	);
 }
@@ -241,6 +264,83 @@ test("缓存换代后保留用户选择的顺序模式", async () => {
 	expect(bar().querySelectorAll("button").length).toBe(3);
 });
 
+test("完整字符分母校准，不将少量已缓存字符inflate为整桶", async () => {
+	const usage = snapshot(926_000, 4_000);
+	await act(() =>
+		root.render(
+			createElement(ContextCompositionView, { data: { ...data, usage }, snapshot: usage }),
+		),
+	);
+	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("46.3K · 50.0%");
+	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
+		"~926K",
+	);
+	expect(container.textContent?.match(/~/g)?.length).toBe(1);
+	const calibrated = {
+		...usage,
+		occupiedTokens: 510_800,
+		percentage: 51.08,
+		source: "usage" as const,
+	};
+	await act(() =>
+		root.render(
+			createElement(ContextCompositionView, { data: { ...data, usage }, snapshot: calibrated }),
+		),
+	);
+	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("25.5K · 50.0%");
+	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
+		"~510.8K",
+	);
+});
+
+test("刷新旧响应和跨世代不能校准新请求，估计有值不显示横杠", async () => {
+	const old = snapshot();
+	for (const live of [
+		{ ...snapshot(926_000), requestId: "new" },
+		snapshot(926_000, 400, "new-generation"),
+	]) {
+		await act(() =>
+			root.render(
+				createElement(ContextCompositionView, { data: { ...data, usage: old }, snapshot: live }),
+			),
+		);
+		expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain(" · — · 50.0%");
+		expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
+			"~926K",
+		);
+	}
+	const estimated = { ...snapshot(926_000), source: "estimate" as const };
+	await act(() =>
+		root.render(
+			createElement(ContextCompositionView, {
+				data: { ...data, usage: estimated },
+				snapshot: estimated,
+			}),
+		),
+	);
+	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
+		"~926K",
+	);
+	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("463K · 50.0%");
+});
+
+test("live有full chars但API尚无匹配usage时，不为旧条图跨请求校准", async () => {
+	await act(() =>
+		root.render(createElement(ContextCompositionView, { data, snapshot: snapshot(926_000) })),
+	);
+	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain(" · — · 50.0%");
+	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
+		"~926K",
+	);
+});
+
+test("遗留缺完整字符分母不使用缓存总数回退", async () => {
+	await act(() =>
+		root.render(createElement(ContextCompositionView, { data, totalTokens: 160_000 })),
+	);
+	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain(" · — · 50.0%");
+});
+
 test("用当前上游总量乘字符占比，并统一显示K/M/B", () => {
 	expect(contextTokenShare(100, 400, 425_814)).toBe(106453.5);
 	expect(formatContextTokens(contextTokenShare(100, 400, 425_814))).toBe("106.5K");
@@ -253,7 +353,7 @@ test("用当前上游总量乘字符占比，并统一显示K/M/B", () => {
 test("没有上游token时只显示横杠，不回退显示字符数", async () => {
 	await act(() => root.render(createElement(ContextCompositionView, { data, totalTokens: null })));
 	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
-		"~—",
+		"—",
 	);
 	expect(container.textContent).not.toContain("contextComposition.characters");
 	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain(" · — · 50.0%");
@@ -269,7 +369,12 @@ test("上游总token动态更新时，已选分类数字同步更新且只显示
 	});
 	expect(container.querySelector('[role="status"]')?.textContent).toContain("80K");
 	await act(() =>
-		root.render(createElement(ContextCompositionView, { data, totalTokens: 2_000_000 })),
+		root.render(
+			createElement(ContextCompositionView, {
+				data: { ...data, usage: snapshot() },
+				snapshot: snapshot(2_000_000),
+			}),
+		),
 	);
 	expect(container.querySelector('[role="status"]')?.textContent).toContain("1M");
 	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(

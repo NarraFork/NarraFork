@@ -711,6 +711,8 @@ export type AgentEvent =
 	  }
 	| {
 			type: "context_usage";
+			source?: import("@shared/context-usage").ContextUsageSource;
+			snapshot?: import("@shared/context-usage").ContextUsageSnapshot;
 			percentage: number;
 			promptTokens?: number;
 			inputTokens?: number;
@@ -773,6 +775,7 @@ export type AgentEvent =
 	  }
 	| {
 			type: "api_request_end";
+			contextSnapshot?: import("@shared/context-usage").ContextUsageSnapshot;
 			requestId: string;
 			credentialId?: string;
 			usage?: {
@@ -914,6 +917,12 @@ export interface AgentHistoryReplacement {
 }
 
 export interface AgentConfig {
+	/** Freeze an already-recorded numeric cache at input preparation; never rebuild on this path. */
+	freezeContextComposition?: (
+		counts: import("@shared/context-usage").ContextInputCharacters | null,
+		requestId: string,
+		startedAt: string,
+	) => import("@shared/context-composition").ContextCharCache | null;
 	narratorId: string;
 	conversationId: string;
 	model: string;

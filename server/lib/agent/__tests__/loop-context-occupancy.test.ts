@@ -1,17 +1,19 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
+import type { ContextInputCharacters } from "@shared/context-usage";
 import { getModelContextWindow } from "../../settings";
-import { estimateTokens } from "../estimate-tokens";
 import type { ParsedStreamEvent, ProviderAdapter } from "../provider";
 import { type AgentConfig, type AgentEvent, ApiError } from "../types";
 
 let attempts: Array<Array<ParsedStreamEvent | Error>> = [];
 let attempt = 0;
+let inputPlans: Array<ContextInputCharacters | null> = [];
 const model = "claude-sonnet-4-20250514";
 const adapter: ProviderAdapter = {
 	formatTools: (tools) => tools,
 	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
+		params.onInputCharacters?.(inputPlans[attempt] ?? null);
 		params.onRequestStart?.();
 		for (const event of attempts[attempt++] ?? []) {
 			if (event instanceof Error) throw event;
@@ -68,6 +70,7 @@ async function runWithConfig(
 		[],
 	))
 		events.push(event);
+	inputPlans = [];
 	return {
 		ends: events.filter((event) => event.type === "api_request_end"),
 		contexts: events.filter((event) => event.type === "context_usage"),
@@ -83,6 +86,85 @@ const text = { text: "The final answer contains enough text for a nonzero output
 const windowSize = getModelContextWindow(model, "anthropic") ?? 0;
 
 describe("independent upstream context occupancy", () => {
+	test("overflow display preserves token/window arithmetic without changing compact occupancy cap", async () => {
+		const { ends, contexts } = await run([
+			{
+				usage: { promptTokens: 1100, inputTokens: 1100, completionTokens: 1, contextWindow: 1000 },
+			},
+			text,
+		]);
+		expect(contexts.at(-1)?.percentage).toBe(100);
+		expect(contexts.at(-1)?.snapshot).toMatchObject({
+			occupiedTokens: 1100,
+			contextWindow: 1000,
+		});
+		expect(contexts.at(-1)?.snapshot?.percentage).toBeCloseTo(110, 10);
+		expect(ends.at(-1)?.contextPercent).toBe(100);
+		expect(ends.at(-1)?.contextSnapshot).toMatchObject({
+			occupiedTokens: 1100,
+			contextWindow: 1000,
+		});
+		expect(ends.at(-1)?.contextSnapshot?.percentage).toBeCloseTo(110, 10);
+	});
+	test("upstream 92.6% on a raw 1M window is 926K, independent of billed 510800", async () => {
+		inputPlans = [{ totalChars: 1_000_000, systemChars: 0, toolsChars: 0 }];
+		const { ends, contexts } = await run([
+			{
+				contextUsagePercentage: 92.6,
+				usage: { promptTokens: 510800, inputTokens: 510800, contextWindow: 1_000_000 },
+			},
+			text,
+		]);
+		expect(ends.at(-1)?.usage?.promptTokens).toBe(510800);
+		expect(ends.at(-1)?.contextSnapshot).toMatchObject({
+			source: "upstream",
+			percentage: 92.6,
+			contextWindow: 1_000_000,
+			occupiedTokens: 926000,
+			inputCharacters: { totalChars: 1_000_000 },
+		});
+		expect(contexts.at(-1)?.snapshot).toEqual(ends.at(-1)?.contextSnapshot);
+	});
+	test("real input-only usage yields 51.08% and clears estimated flag", async () => {
+		const { ends, contexts } = await run([
+			{ usage: { promptTokens: 510800, contextWindow: 1_000_000 } },
+			text,
+		]);
+		expect(ends.at(-1)?.contextSnapshot).toMatchObject({
+			source: "usage",
+			occupiedTokens: 510800,
+		});
+		expect(ends.at(-1)?.contextSnapshot?.percentage).toBeCloseTo(51.08, 10);
+		expect(contexts.at(-1)?.isEstimated).toBe(false);
+	});
+	test("fallback counts only the final full input and is saved before matching request end", async () => {
+		inputPlans = [{ totalChars: 1000, systemChars: 100, toolsChars: 10 }];
+		const { ends, contexts } = await run([text]);
+		expect(ends.at(-1)?.usage).toBeUndefined();
+		expect(ends.at(-1)?.contextSnapshot).toMatchObject({
+			source: "estimate",
+			occupiedTokens: 300,
+			inputCharacters: { totalChars: 1000 },
+		});
+		expect(contexts.at(-1)?.snapshot).toEqual(ends.at(-1)?.contextSnapshot);
+	});
+	test("retry cannot retain the prior attempt's full character denominator", async () => {
+		inputPlans = [{ totalChars: 1000, systemChars: 0, toolsChars: 0 }, null];
+		const { ends } = await run(
+			[measured, new ApiError(503, "upstream temporarily unavailable")],
+			[occupancy, text],
+		);
+		expect(ends[0]?.contextSnapshot?.inputCharacters?.totalChars).toBe(1000);
+		expect(ends[1]?.contextSnapshot?.inputCharacters).toBeNull();
+		expect(ends[1]?.contextSnapshot?.requestId).not.toBe(ends[0]?.contextSnapshot?.requestId);
+	});
+	test("zero full-input callback never borrows a known cache denominator", async () => {
+		inputPlans = [{ totalChars: 0, systemChars: 0, toolsChars: 0 }];
+		const { ends, contexts } = await run([text]);
+		expect(contexts).toHaveLength(0);
+		expect(ends.at(-1)?.contextSnapshot?.inputCharacters).toBeNull();
+		expect(ends.at(-1)?.contextSnapshot?.occupiedTokens).toBeNull();
+	});
 	test("explicit zero occupancy prevents compacting from stale high caller usage", async () => {
 		let compactCalls = 0;
 		const { ends } = await runWithConfig(
@@ -183,20 +265,22 @@ describe("independent upstream context occupancy", () => {
 			]);
 			expect(ends.at(-1)).toMatchObject({
 				contextPercent: clamped,
-				usage: {
-					promptTokens: Math.round((clamped / 100) * windowSize),
-					completionTokens: estimateTokens(`first ${text.text}`),
+				usage: { promptTokens: 0, completionTokens: 0 },
+				contextSnapshot: {
+					source: "upstream",
+					occupiedTokens: Math.round((clamped / 100) * windowSize),
 				},
 			});
 			expect(contexts.at(-1)).toMatchObject({ percentage: clamped, isEstimated: true });
 		});
 	}
 
-	test("percentage without usage uses final output", async () => {
+	test("percentage without usage never synthesizes billable counters", async () => {
 		const { ends } = await run([occupancy, text]);
-		expect(ends.at(-1)?.usage).toMatchObject({
-			promptTokens: Math.round(windowSize * 0.8),
-			completionTokens: estimateTokens(text.text),
+		expect(ends.at(-1)?.usage).toBeUndefined();
+		expect(ends.at(-1)?.contextSnapshot).toMatchObject({
+			source: "upstream",
+			occupiedTokens: Math.round(windowSize * 0.8),
 		});
 	});
 
@@ -205,16 +289,14 @@ describe("independent upstream context occupancy", () => {
 			const { ends, contexts } = await run([{ contextUsagePercentage: percent }, measured, text]);
 			expect(ends.at(-1)?.contextPercent).toBe((1200 / windowSize) * 100);
 			expect(contexts).toHaveLength(1);
-			expect(contexts[0]?.isEstimated).toBeUndefined();
+			expect(contexts[0]?.isEstimated).toBe(false);
 		});
 	}
 
-	test("zero placeholder before occupancy cannot suppress its estimate", async () => {
+	test("zero placeholder before occupancy remains a billing placeholder", async () => {
 		const { ends } = await run([placeholder, occupancy, text]);
-		expect(ends.at(-1)?.usage).toMatchObject({
-			promptTokens: Math.round(windowSize * 0.8),
-			completionTokens: estimateTokens(text.text),
-		});
+		expect(ends.at(-1)?.usage).toMatchObject(placeholder.usage);
+		expect(ends.at(-1)?.contextSnapshot?.occupiedTokens).toBe(Math.round(windowSize * 0.8));
 	});
 
 	test("non-finite events cannot replace an accepted occupancy", async () => {
@@ -235,10 +317,8 @@ describe("independent upstream context occupancy", () => {
 			[occupancy, text],
 		);
 		expect(ends).toHaveLength(2);
-		expect(ends[1]?.usage).toMatchObject({
-			promptTokens: Math.round(windowSize * 0.8),
-			completionTokens: estimateTokens(text.text),
-		});
+		expect(ends[1]?.usage).toBeUndefined();
+		expect(ends[1]?.contextSnapshot?.occupiedTokens).toBe(Math.round(windowSize * 0.8));
 		expect(ends[1]?.usage?.cachedInputTokens).toBeUndefined();
 	});
 
@@ -252,6 +332,6 @@ describe("independent upstream context occupancy", () => {
 		expect(ends[0]?.contextPercent).toBe(80);
 		expect(ends[1]?.contextPercent).toBe((1200 / windowSize) * 100);
 		expect(ends[1]?.usage).toMatchObject(measured.usage);
-		expect(contexts.at(-1)?.isEstimated).toBeUndefined();
+		expect(contexts.at(-1)?.isEstimated).toBe(false);
 	});
 });

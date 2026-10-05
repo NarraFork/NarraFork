@@ -11,15 +11,17 @@ import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { getEffectiveModelMetadata, withModelMetadataSnapshot } from "@server/lib/model-catalog";
 import { settings } from "@server/lib/settings";
-import type { ReferencePricingSnapshot } from "@shared/agent-protocol/types";
-import { captureReferencePricingSnapshot, cloneReferencePricingSnapshot } from "./model-pricing";
 import { calculateCostDetailed, type UsageData } from "@server/lib/usage-tracking";
 import { sliceToUtf8Budget, utf8Bytes, withinUtf8Budget } from "@server/lib/utf8-budget";
 import { recordCredentialUsage } from "@server/services/credential-usage-totals";
 import { insertApiRequestWithUserUsage } from "@server/services/user-usage-totals";
+import type { ReferencePricingSnapshot } from "@shared/agent-protocol/types";
+import type { ContextUsageSnapshot } from "@shared/context-usage";
 import { eq } from "drizzle-orm";
 import { diagnosticsFromError, normalizeApiRequestDiagnostics } from "./agent/error-diagnostics";
 import type { ApiRequestDiagnostics } from "./agent/types";
+import { boundedContextSnapshot } from "./context-usage-snapshot";
+import { captureReferencePricingSnapshot, cloneReferencePricingSnapshot } from "./model-pricing";
 
 export type ApiRequestKind =
 	| "narrator"
@@ -60,6 +62,7 @@ export interface ApiRequestHandle extends ApiRequestStartOptions {
 }
 
 export interface ApiRequestFinishOptions {
+	contextSnapshot?: ContextUsageSnapshot | null;
 	messageId?: string | null;
 	credentialId?: string | null;
 	usage?: UsageData | null;
@@ -94,9 +97,10 @@ export interface ApiRequestFinishOptions {
 export function startApiRequest(options: ApiRequestStartOptions): ApiRequestHandle {
 	return {
 		...options,
-		referencePricingSnapshot: options.referencePricingSnapshot === undefined
-			? captureReferencePricingSnapshot(options.model)
-			: cloneReferencePricingSnapshot(options.referencePricingSnapshot),
+		referencePricingSnapshot:
+			options.referencePricingSnapshot === undefined
+				? captureReferencePricingSnapshot(options.model)
+				: cloneReferencePricingSnapshot(options.referencePricingSnapshot),
 		userId: options.userId ?? null,
 		id: generateId(),
 		kind: options.kind ?? "internal",
@@ -474,7 +478,9 @@ export async function finishApiRequest(
 	options: ApiRequestFinishOptions = {},
 ): Promise<string> {
 	const usage = options.usage ?? null;
-	const cost = usage ? calculateCostDetailed(usage, handle.provider, handle.model, handle.referencePricingSnapshot) : null;
+	const cost = usage
+		? calculateCostDetailed(usage, handle.provider, handle.model, handle.referencePricingSnapshot)
+		: null;
 	const persistenceOptions =
 		normalizedDiagnostics(options) && !allowsFullRawDump(options)
 			? { ...options, rawDump: undefined }
@@ -516,6 +522,7 @@ export async function finishApiRequest(
 		costStatus: cost?.status ?? "unknown",
 		costMissingFields: cost?.missingFields ?? [],
 		contextPercent: options.contextPercent ?? null,
+		contextUsageSnapshotJson: boundedContextSnapshot(options.contextSnapshot),
 		meterUsage: options.meterUsage ?? null,
 		meterUnit: options.meterUnit ?? null,
 		errorMessage: options.errorMessage ?? null,

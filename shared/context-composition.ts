@@ -27,6 +27,8 @@ export interface ContextCharCache {
 	pageCount: number;
 	totalChars: number;
 	totals: ContextSegment[];
+	/** Request-specific fixed prefix projected over immutable base numeric pages. */
+	fixedPrefix?: { previous: ContextSegment[]; current: ContextSegment[] };
 }
 export interface ContextComposition {
 	generation: string | null;
@@ -35,6 +37,8 @@ export interface ContextComposition {
 	segments: ContextSegment[];
 	nextCursor: string | null;
 	pending: boolean;
+	/** Matched request occupancy and complete character calibration, if available. */
+	usage?: import("./context-usage").ContextUsageSnapshot | null;
 }
 export function safeCharacters(chars: number): number {
 	return Number.isFinite(chars) ? Math.max(0, Math.trunc(chars)) : 0;

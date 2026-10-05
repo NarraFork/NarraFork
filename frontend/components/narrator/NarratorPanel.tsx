@@ -1089,10 +1089,10 @@ function NarratorPanelBody({
 		setQueuedMessages,
 		reconcileBufferedMessages,
 		substatus,
+		contextSnapshot,
 		contextPercent,
 		promptTokens,
 		contextWindow,
-		isEstimated,
 		contextStale,
 		activeCompactStart,
 		compactProgress,
@@ -2717,7 +2717,8 @@ function NarratorPanelBody({
 	) : (
 		<ContextCompositionMenu
 			narratorId={narratorId}
-			totalTokens={isEstimated ? null : promptTokens}
+			totalTokens={promptTokens}
+			snapshot={contextSnapshot}
 			target={contextRingNode}
 		>
 			<Menu.Label c="dimmed" fz={10}>

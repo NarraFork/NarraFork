@@ -949,6 +949,7 @@ async function deleteBlockSelection(
 					.set({
 						...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
 						messageVersion: sql`${narrators.messageVersion} + 1`,
+						contextUsageSnapshotJson: null,
 						updatedAt: new Date().toISOString(),
 					})
 					.where(eq(narrators.id, narratorId))
@@ -1157,6 +1158,7 @@ function deleteOutputlessAssistantMessage(
 			.set({
 				apiConversationId: null,
 				messageVersion: sql`${narrators.messageVersion} + 1`,
+				contextUsageSnapshotJson: null,
 				messageStructureVersion: sql`${narrators.messageStructureVersion} + 1`,
 				updatedAt: new Date().toISOString(),
 			})
@@ -1462,6 +1464,7 @@ async function deleteMessageRange(
 			.set({
 				...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
 				messageVersion: sql`${narrators.messageVersion} + 1`,
+				contextUsageSnapshotJson: null,
 				updatedAt: new Date().toISOString(),
 			})
 			.where(eq(narrators.id, narratorId))
@@ -4398,6 +4401,7 @@ const narratorMessageQueriesUnlocked = {
 							}
 						: {}),
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: now,
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4467,6 +4471,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4531,6 +4536,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4586,6 +4592,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4632,6 +4639,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4703,6 +4711,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4726,6 +4735,7 @@ const narratorMessageQueriesUnlocked = {
 				.set({
 					errorMessage: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 				})
 				.where(eq(narrators.id, narratorId));
 			const narrator = await db.query.narrators.findFirst({
@@ -4773,6 +4783,7 @@ const narratorMessageQueriesUnlocked = {
 				.set({
 					errorMessage: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 				})
 				.where(eq(narrators.id, narratorId))
 				.run();
@@ -4900,6 +4911,7 @@ const narratorMessageQueriesUnlocked = {
 					contextSummaryChars: measureSummaryCharacters(summary),
 					apiConversationId: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: now,
 				})
 				.where(eq(narrators.id, narratorId))

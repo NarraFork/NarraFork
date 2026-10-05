@@ -3,6 +3,7 @@ import type {
 	ContextCharStats,
 	ContextSegment,
 } from "@shared/context-composition";
+import type { ContextUsageSnapshot } from "@shared/context-usage";
 import type {
 	FileChangeActor,
 	FileChangeExecutionBinding,
@@ -601,6 +602,9 @@ export const narrators = sqliteTable(
 		contextSystemChars: integer("context_system_chars").notNull().default(0),
 		contextToolsChars: integer("context_tools_chars").notNull().default(0),
 		contextCharRevision: integer("context_char_revision").notNull().default(0),
+		contextUsageSnapshotJson: text("context_usage_snapshot_json", {
+			mode: "json",
+		}).$type<ContextUsageSnapshot>(),
 		contextCharCacheJson: text("context_char_cache_json", {
 			mode: "json",
 		}).$type<ContextCharCache>(),
@@ -1743,6 +1747,17 @@ export const narratorToolCalls = sqliteTable(
 	},
 	(table) => [
 		index("idx_toolcalls_message").on(table.messageId),
+		// Numeric context keyset paging must not sort the entire message on every batch.
+		index("idx_toolcalls_context_id").on(table.messageId, table.id),
+		index("idx_toolcalls_context_order").on(table.messageId, table.createdAt, table.id),
+		// Latest attempts are scoped to the canonical message, not its current fork holder.
+		index("idx_toolcalls_context_latest").on(
+			table.messageId,
+			table.toolUseId,
+			table.executionAttempt,
+			table.createdAt,
+			table.id,
+		),
 		index("idx_toolcalls_tool_use_id").on(table.toolUseId),
 		index("idx_toolcalls_execution_device").on(table.executionDeviceId, table.createdAt),
 		index("idx_toolcalls_status").on(table.narratorId, table.status),
@@ -3350,6 +3365,10 @@ export const apiRequests = sqliteTable(
 		/** Null marks an untouched historical record. */
 		costStatus: text("cost_status", { enum: ["complete", "partial", "unknown"] }),
 		costMissingFields: text("cost_missing_fields", { mode: "json" }).$type<string[]>(),
+		// Occupancy snapshot is separate from billable counters. Old records remain null.
+		contextUsageSnapshotJson: text("context_usage_snapshot_json", {
+			mode: "json",
+		}).$type<ContextUsageSnapshot>(),
 		// 上下文使用率
 		contextPercent: real("context_percent"),
 		// Metering（NUG）
