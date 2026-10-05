@@ -28,13 +28,13 @@ describe("buffer queue mode kernel shared by SQLite and PostgreSQL", () => {
 		const guide = row("b", -1, true, "tool");
 		const patch = bufferedModePatch(ordinary, [ordinary, guide], "interrupt");
 		expect(patch.priority).toBe(true);
-		expect(patch.seq).toBeGreaterThan(guide.seq);
+		expect(patch.seq).toBeLessThan(guide.seq);
 		expect(JSON.parse(patch.metadataJson)).toEqual({
 			stagingId: "owned",
 			queueMode: "interrupt",
 			executionIntent: { controlCommand: true },
 		});
-		expect(bufferedModePatch(guide, [ordinary, guide], "interrupt").seq).toBe(guide.seq);
+		expect(bufferedModePatch(guide, [ordinary, guide], "interrupt").seq).toBeLessThan(guide.seq);
 		expect(bufferedModePatch(guide, [ordinary, guide], "turn").seq).toBeGreaterThan(ordinary.seq);
 	});
 	test("complete legacy lists and ordinary-only lists cannot reorder guidance", () => {

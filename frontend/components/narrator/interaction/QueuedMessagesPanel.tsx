@@ -15,10 +15,12 @@ import type { BufferMessageSummary } from "../../../lib/api";
 import type { QueueMode } from "../composer/SendOptionsSplitButton";
 import { QueuedMessageRow } from "./QueuedMessageRow";
 import { queuedMessageMode } from "./queue-message-mode";
+import type { UrgentDispatch } from "./use-queued-message-actions";
 
 export interface QueuedMessagesData {
 	narratorId?: string;
 	queuedMessages: BufferMessageSummary[];
+	urgentDispatches?: UrgentDispatch[];
 	queueExpanded: boolean;
 	setQueueExpanded: (expanded: boolean) => void;
 	editingQueuedId: string | null;
@@ -50,38 +52,85 @@ export function QueuedMessagesPanel(props: QueuedMessagesPanelProps) {
 		useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
 		useSensor(TouchSensor, { activationConstraint: { delay: 100, tolerance: 5 } }),
 	);
-	if (props.queuedMessages.length === 0) return null;
+	const urgent = (props.urgentDispatches ?? []).filter((entry) => entry.status !== "sent");
+	const trackedIds = new Set((props.urgentDispatches ?? []).map((entry) => entry.message.id));
+	for (const message of props.queuedMessages) {
+		if (
+			queuedMessageMode(message) === "interrupt" &&
+			!trackedIds.has(message.id) &&
+			message.id !== props.editingQueuedId
+		) {
+			urgent.push({ message, status: "failed" });
+		}
+	}
+	const queuedMessages = props.queuedMessages.filter(
+		(message) =>
+			(queuedMessageMode(message) !== "interrupt" || message.id === props.editingQueuedId) &&
+			!trackedIds.has(message.id),
+	);
+	if (queuedMessages.length === 0 && urgent.length === 0) return null;
 	// Consecutive segments preserve the authoritative FIFO order across guidance modes.
 	const groups: { mode: QueueMode; messages: BufferMessageSummary[] }[] = [];
-	for (const message of props.queuedMessages) {
-		const mode = queuedMessageMode(message);
+	for (const message of queuedMessages) {
+		// An asynchronous snapshot may change an open editor's mode. Keep that
+		// keyed editor in place until it closes; urgent controls are disabled there.
+		const rawMode = queuedMessageMode(message);
+		const mode = rawMode === "interrupt" ? "turn" : rawMode;
 		const previous = groups[groups.length - 1];
 		if (previous?.mode === mode) previous.messages.push(message);
 		else groups.push({ mode, messages: [message] });
 	}
-	const counts = (["turn", "tool", "interrupt"] as const)
+	const counts = (["turn", "tool"] as const)
 		.map((mode) => ({
 			mode,
-			count: props.queuedMessages.filter((message) => queuedMessageMode(message) === mode).length,
+			count: queuedMessages.filter((message) => queuedMessageMode(message) === mode).length,
 		}))
 		.filter(({ count }) => count > 0);
-	const ordinaryIds = props.queuedMessages
+	const ordinaryIds = queuedMessages
 		.filter((message) => queuedMessageMode(message) === "turn")
 		.map((message) => message.id);
-	const single = props.queuedMessages.length === 1;
+	const single = queuedMessages.length === 1;
 	const hasActiveEditor =
 		typeof props.editingQueuedId === "string" &&
-		props.queuedMessages.some((msg) => msg.id === props.editingQueuedId);
+		queuedMessages.some((msg) => msg.id === props.editingQueuedId);
 	// Pin an active editor open, including single-to-multiple queue transitions.
 	// Manual collapse is unavailable until editing ends; keep the user's preference unchanged.
 	const listVisible = props.queueExpanded || single || hasActiveEditor;
-	const failures = props.queuedMessages.filter((msg) => msg.state === "failed").length;
+	const failures = queuedMessages.filter((msg) => msg.state === "failed").length;
 	return (
 		<Stack
 			gap={0}
 			style={{ borderTop: "1px solid var(--mantine-color-default-border)", flexShrink: 0 }}
 		>
-			{!single && (
+			{urgent.length > 0 && (
+				<Stack
+					gap={0}
+					data-urgent-dispatches
+					style={{ maxHeight: "min(32vh, 280px)", overflowY: "auto" }}
+				>
+					{urgent.map((dispatch) => (
+						<QueuedMessageRow
+							key={dispatch.message.id}
+							msg={dispatch.message}
+							narratorId={props.narratorId}
+							index={0}
+							isEditing={false}
+							urgentStatus={dispatch.status === "sending" ? "sending" : "failed"}
+							urgentError={dispatch.error}
+							onSaveEdit={props.handleSaveEditQueued}
+							onCancelEdit={props.handleCancelEditQueued}
+							onStartEdit={props.handleStartEditQueued}
+							onRemove={props.handleRemoveQueued}
+							onRetry={props.handleRetryQueued}
+							onChangeMode={props.handleChangeMode}
+							onMove={props.handleMoveQueued}
+							cancelBufferLabel={t("cancelBuffer")}
+							editLabel={tc("edit")}
+						/>
+					))}
+				</Stack>
+			)}
+			{queuedMessages.length > 1 && (
 				<Group px="md" py={2} gap="xs" wrap="wrap" data-queue-summary>
 					<Button
 						size="compact-xs"
@@ -92,7 +141,7 @@ export function QueuedMessagesPanel(props: QueuedMessagesPanelProps) {
 						aria-expanded={listVisible}
 						leftSection={listVisible ? <IconChevronDown size={12} /> : <IconChevronUp size={12} />}
 					>
-						{t("queuedCount", { count: props.queuedMessages.length })}
+						{t("queuedCount", { count: queuedMessages.length })}
 					</Button>
 					<Text
 						size="xs"

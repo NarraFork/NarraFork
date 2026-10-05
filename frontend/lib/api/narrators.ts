@@ -1019,7 +1019,7 @@ export const narratorsApi = {
 		messageId: string,
 		mode: "turn" | "tool" | "interrupt",
 	) =>
-		request<{ ok: true }>(
+		request<{ ok: true; delivered?: boolean; messageId?: string }>(
 			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/mode`,
 			{ method: "PATCH", body: JSON.stringify({ mode }) },
 		),

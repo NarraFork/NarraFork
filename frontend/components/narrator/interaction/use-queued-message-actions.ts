@@ -9,6 +9,12 @@ import type { NarratorComposerHandle } from "../composer/NarratorComposer";
 import type { QueueMode } from "../composer/SendOptionsSplitButton";
 import { moveQueuedTurn, queuedMessageMode } from "./queue-message-mode";
 
+export interface UrgentDispatch {
+	message: BufferMessageSummary;
+	status: "sending" | "failed" | "sent";
+	error?: string;
+}
+
 export interface QueuedEditPayload {
 	keepImageIds: string[];
 	keepTextFiles: { index: number; filename: string }[];
@@ -68,6 +74,49 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 		t,
 	} = options;
 
+	const scopeRef = useRef({
+		narratorId,
+		dispatches: new Map<string, UrgentDispatch>(),
+	});
+	if (scopeRef.current.narratorId !== narratorId) {
+		scopeRef.current = { narratorId, dispatches: new Map() };
+	}
+	const [, refreshDispatches] = useState(0);
+	const dispatches = scopeRef.current.dispatches;
+	const rawIds = new Set(queuedMessages.map((message) => message.id));
+	const visibleQueuedMessages = queuedMessages.filter((message) => {
+		const status = dispatches.get(message.id)?.status;
+		return status !== "sending" && status !== "sent" && status !== "failed";
+	});
+	useEffect(() => {
+		const scope = scopeRef.current;
+		if (scope.narratorId !== narratorId) return;
+		const terminalIds = new Set(
+			[...scope.dispatches].filter(([, dispatch]) => dispatch.status === "sent").map(([id]) => id),
+		);
+		if (queuedMessages.some((message) => terminalIds.has(message.id))) {
+			setQueuedMessages((previous) => previous.filter((message) => !terminalIds.has(message.id)));
+		}
+	}, [narratorId, queuedMessages, setQueuedMessages]);
+	// Missing raw rows may only be claimed, not materialized: a failed claim can
+	// return to queued/failed. Only an explicit delivery receipt is terminal.
+	const urgentDispatches = [...dispatches.values()]
+		.filter(
+			(dispatch) =>
+				dispatch.status === "sending" ||
+				(dispatch.status === "failed" && rawIds.has(dispatch.message.id)),
+		)
+		.map((dispatch) =>
+			dispatch.status === "failed"
+				? {
+						...dispatch,
+						message:
+							queuedMessages.find((message) => message.id === dispatch.message.id) ??
+							dispatch.message,
+					}
+				: dispatch,
+		);
+
 	const [queueHoldProgress, setQueueHoldProgress] = useState(0);
 	const queueHoldTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 	const queueHoldFiredRef = useRef(false);
@@ -125,14 +174,25 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 	useEffect(() => cancelQueueHold, [cancelQueueHold]);
 
 	const handleCancelAllQueued = useCallback(() => {
-		if (queuedMessages.length > 0) {
-			cancelBuffer(narratorId);
+		const ordinary = queuedMessages.filter(
+			(m) => queuedMessageMode(m) !== "interrupt" && !scopeRef.current.dispatches.has(m.id),
+		);
+		if (ordinary.length === queuedMessages.length) {
+			if (ordinary.length > 0) cancelBuffer(narratorId);
 			setQueuedMessages([]);
+		} else {
+			const ids = new Set(ordinary.map((m) => m.id));
+			setQueuedMessages((prev) => prev.filter((m) => !ids.has(m.id)));
+			for (const id of ids) {
+				void api.removeBufferedMessage(narratorId, id).catch(() => reconcileBufferedMessages());
+			}
 		}
-	}, [queuedMessages, cancelBuffer, narratorId, setQueuedMessages]);
+	}, [queuedMessages, cancelBuffer, narratorId, setQueuedMessages, reconcileBufferedMessages]);
 
 	const handleRemoveQueued = useCallback(
 		(messageId: string) => {
+			const status = scopeRef.current.dispatches.get(messageId)?.status;
+			if (status === "sending" || status === "sent") return;
 			setQueuedMessages((prev) => prev.filter((m) => m.id !== messageId));
 			api.removeBufferedMessage(narratorId, messageId).catch((error) => {
 				reconcileBufferedMessages();
@@ -158,13 +218,32 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 
 	const reorderQueued = useCallback(
 		(id: string, targetId: string) => {
-			const newOrder = moveQueuedTurn(queuedMessages, id, targetId);
-			if (newOrder === queuedMessages) return;
-			setQueuedMessages(newOrder);
+			const dispatches = scopeRef.current.dispatches;
+			const reorderInput = queuedMessages.map((message) =>
+				dispatches.has(message.id) ? { ...message, queueMode: "interrupt" as const } : message,
+			);
+			const newOrder = moveQueuedTurn(reorderInput, id, targetId);
+			if (newOrder === reorderInput) return;
+			setQueuedMessages((previous) => {
+				const current = new Map(previous.map((message) => [message.id, message]));
+				const orderedIds = new Set(newOrder.map((message) => message.id));
+				// Never resurrect a row consumed between the action and React's state update.
+				return [
+					...newOrder.flatMap((message) => {
+						const live = current.get(message.id);
+						return live ? [live] : [];
+					}),
+					...previous.filter((message) => !orderedIds.has(message.id)),
+				];
+			});
 			api
 				.reorderBufferedMessages(
 					narratorId,
-					newOrder.map((m) => m.id),
+					newOrder
+						.filter(
+							(message) => queuedMessageMode(message) === "turn" && !dispatches.has(message.id),
+						)
+						.map((message) => message.id),
 				)
 				.catch((error) => {
 					reconcileBufferedMessages();
@@ -185,7 +264,9 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 	);
 	const handleMoveQueued = useCallback(
 		(id: string, direction: -1 | 1) => {
-			const ordinary = queuedMessages.filter((m) => queuedMessageMode(m) === "turn");
+			const ordinary = queuedMessages.filter(
+				(m) => queuedMessageMode(m) === "turn" && !scopeRef.current.dispatches.has(m.id),
+			);
 			const index = ordinary.findIndex((m) => m.id === id);
 			const target = index >= 0 ? ordinary[index + direction] : undefined;
 			if (target) reorderQueued(id, target.id);
@@ -194,29 +275,72 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 	);
 	const handleChangeMode = useCallback(
 		async (id: string, mode: QueueMode) => {
+			const scope = scopeRef.current;
+			const previous = scope.dispatches.get(id);
+			if (previous?.status === "sending" || previous?.status === "sent") return false;
+			const message = queuedMessages.find((m) => m.id === id) ?? previous?.message;
+			if (!message) return false;
+			if (mode === "interrupt") {
+				if (!scope.dispatches.has(id) && scope.dispatches.size >= 64) {
+					const evict = [...scope.dispatches].find(([, value]) => value.status !== "sending");
+					if (!evict) return false;
+					scope.dispatches.delete(evict[0]);
+				}
+				scope.dispatches.set(id, { message, status: "sending" });
+				refreshDispatches((n) => n + 1);
+			}
 			try {
-				await api.setBufferedMessageMode(narratorId, id, mode);
+				// Failed admission must be explicitly restored before requesting interruption.
+				if (mode === "interrupt" && message.state === "failed") {
+					await api.retryBufferedMessage(narratorId, id);
+					if (scopeRef.current !== scope) return false;
+				}
+				const response = await api.setBufferedMessageMode(narratorId, id, mode);
+				if (scopeRef.current !== scope) return false;
+				if (mode === "interrupt") {
+					if (response.delivered !== true) throw new Error(t("queuedUrgentUnconfirmed"));
+					scope.dispatches.set(id, { message, status: "sent" });
+					setQueuedMessages((prev) => prev.filter((m) => m.id !== id));
+					refreshDispatches((n) => n + 1);
+				}
 				reconcileBufferedMessages();
 				return true;
 			} catch (error) {
-				notifications.show({
-					color: "red",
-					title: t("queuedModeFailed"),
-					message: error instanceof Error ? error.message : String(error),
-				});
+				if (scopeRef.current !== scope) return false;
+				const detail = error instanceof Error ? error.message : String(error);
+				if (mode === "interrupt") {
+					scope.dispatches.set(id, {
+						...scope.dispatches.get(id),
+						message,
+						status: "failed",
+						error: detail,
+					});
+					refreshDispatches((n) => n + 1);
+				}
+				notifications.show({ color: "red", title: t("queuedModeFailed"), message: detail });
 				reconcileBufferedMessages();
 				return false;
 			}
 		},
-		[narratorId, reconcileBufferedMessages, t],
+		[narratorId, queuedMessages, setQueuedMessages, reconcileBufferedMessages, t],
 	);
 
 	const [editingQueuedId, setEditingQueuedId] = useState<string | null>(null);
 	const [queueExpanded, setQueueExpanded] = useState(true);
 
-	const handleStartEditQueued = useCallback((msg: { id: string }) => {
-		setEditingQueuedId(msg.id);
-	}, []);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: narrator changes invalidate the previous editor scope.
+	useEffect(() => setEditingQueuedId(null), [narratorId]);
+	const handleStartEditQueued = useCallback(
+		(msg: { id: string }) => {
+			if (
+				scopeRef.current.dispatches.has(msg.id) ||
+				queuedMessages.some((m) => m.id === msg.id && queuedMessageMode(m) === "interrupt")
+			)
+				return;
+			setEditingQueuedId(msg.id);
+		},
+		[queuedMessages],
+	);
 
 	const handleCancelEditQueued = useCallback(() => {
 		setEditingQueuedId(null);
@@ -259,7 +383,7 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 
 	// Fill the panel's bridge refs with the live handlers (render-time
 	// assignment mirrors the pattern the panel uses for its own send refs).
-	if (queuedEditRef) queuedEditRef.current = (id) => setEditingQueuedId(id);
+	if (queuedEditRef) queuedEditRef.current = (id) => handleStartEditQueued({ id });
 	if (queuedCancelRef) queuedCancelRef.current = handleRemoveQueued;
 	if (queuedRetryRef)
 		queuedRetryRef.current = (id) => {
@@ -267,6 +391,8 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 		};
 
 	return {
+		visibleQueuedMessages,
+		urgentDispatches,
 		queueHoldProgress,
 		startQueueHold,
 		cancelQueueHold,

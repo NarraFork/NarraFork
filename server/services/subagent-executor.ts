@@ -947,6 +947,18 @@ async function persistNextBufferedSubagentMessageAdmitted(opts: {
 		if (hadSoftStop) requestSubagentBufferedMessageSoftStop(narratorId);
 		throw error;
 	}
+	if (buffered.queueMode === "interrupt") {
+		// This mutation admission excludes new guidance producers. The urgent input
+		// now owns the next request: old tool guidance must not spend its soft stop
+		// against that fresh pass. Later guidance can arm a new stop after unlock.
+		// Do this before fallible presentation/cleanup: materialization is committed.
+		clearRuntimeBufferSoftStop(narratorId);
+		const active = activeNarrators.get(narratorId);
+		if (active) {
+			active._bufferSoftStop = false;
+			active._bufferSoftStopTaken = false;
+		}
+	}
 	try {
 		broadcastToNarrator(parentNarratorId, {
 			type: "user_message",

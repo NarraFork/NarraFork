@@ -19,7 +19,7 @@ export function bufferedRowMode(row: BufferedQueueRow): BufferQueueMode {
 	return resolveBufferQueueMode(JSON.parse(row.metadataJson ?? "{}").queueMode, row.priority);
 }
 
-/** Guidance is a single immutable FIFO group. Only ordinary inputs may be dragged. */
+/** Admission/mode changes own guidance order; only ordinary inputs may be dragged. */
 export function ordinaryBufferReorder(
 	rows: BufferedQueueRow[],
 	ids: readonly string[],
@@ -41,7 +41,7 @@ export function ordinaryBufferReorder(
 	return [...requested];
 }
 
-/** Moving between groups appends to the destination; unchanged modes keep their position. */
+/** Interrupt is hard-front; other group changes append and preserve existing guidance order. */
 export function bufferedModePatch(
 	row: BufferedQueueRow,
 	rows: BufferedQueueRow[],
@@ -50,12 +50,14 @@ export function bufferedModePatch(
 	const previous = bufferedRowMode(row);
 	const priority = mode !== "turn";
 	const seq =
-		(previous !== "turn") === priority
-			? row.seq
-			: Math.max(
-					0,
-					...rows.filter((r) => r.id !== row.id && r.priority === priority).map((r) => r.seq),
-				) + 1;
+		mode === "interrupt"
+			? Math.min(0, ...rows.filter((r) => r.priority).map((r) => r.seq)) - 1
+			: (previous !== "turn") === priority
+				? row.seq
+				: Math.max(
+						0,
+						...rows.filter((r) => r.id !== row.id && r.priority === priority).map((r) => r.seq),
+					) + 1;
 	return {
 		metadataJson: JSON.stringify({ ...JSON.parse(row.metadataJson ?? "{}"), queueMode: mode }),
 		priority,
