@@ -169,3 +169,39 @@ describe("installWcoTracking", () => {
 		expect(realm.root.hasAttribute(WCO_ATTRIBUTE)).toBe(false);
 	});
 });
+
+/*
+ * app-region hit-testing is geometric, not z-ordered: a floating element painted
+ * over the header's drag rect loses its clicks to window dragging unless its own
+ * rect is subtracted with `no-drag`. This guards the pairing between the three
+ * places that must agree — the CSS rule, the theme that stamps `nf-overlay-layer`
+ * onto Mantine floating parts (v9 has no stable component classes), and the two
+ * hand-rolled banners that carry `nf-top-banner`.
+ */
+describe("floating overlays above the WCO drag surface", () => {
+	test("wco.css subtracts every overlay hook from the drag region", async () => {
+		const css = await Bun.file(new URL("../styles/wco.css", import.meta.url)).text();
+		expect(css).toMatch(/html\[data-nf-wco\][^{]*\.nf-top-banner[^{]*\{/);
+		expect(css).toMatch(/html\[data-nf-wco\][^{]*\.nf-notifications-safe-area[^{]*\{/);
+		expect(css).toMatch(/html\[data-nf-wco\][^{]*\.nf-overlay-layer[^{]*\{/);
+		expect(css.match(/html\[data-nf-wco\][^{]*\.nf-overlay-layer[^{]*\{[^}]*\}/)?.[0]).toContain(
+			"-webkit-app-region: no-drag",
+		);
+	});
+
+	test("the theme stamps nf-overlay-layer on every Mantine floating part", async () => {
+		const theme = await Bun.file(new URL("./mantine-theme.ts", import.meta.url)).text();
+		for (const component of ["Modal", "Drawer", "Menu", "Popover", "HoverCard", "Combobox"]) {
+			expect(theme).toMatch(new RegExp(`${component}:\\s*\\{[^}]*nf-overlay-layer`));
+		}
+	});
+
+	test("the fixed top banners carry nf-top-banner", async () => {
+		const [versionBanner, connectionAlert] = await Promise.all([
+			Bun.file(new URL("../components/VersionUpdateBanner.tsx", import.meta.url)).text(),
+			Bun.file(new URL("../components/WSConnectionAlert.tsx", import.meta.url)).text(),
+		]);
+		expect(versionBanner).toContain("nf-top-banner");
+		expect(connectionAlert).toContain("nf-top-banner");
+	});
+});

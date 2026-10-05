@@ -115,3 +115,24 @@ html[data-nf-wco] .nf-wco-window-strip {
 	color: var(--mantine-color-dimmed);
 	user-select: none;
 }
+
+/*
+ * Floating layers above the drag surface must opt out of it explicitly.
+ *
+ * `-webkit-app-region` hit-testing is purely geometric: the browser subtracts
+ * no-drag rects from drag rects, ignoring paint order entirely. Anything painted
+ * over the header row's drag rect — a fixed banner, a toast, a modal overlay, a
+ * menu dropdown — therefore still loses its clicks to window dragging unless its
+ * own rect is subtracted. Z-index does not help.
+ *
+ *   - `.nf-top-banner`: the fixed version-update / WS-reconnect banners
+ *     (VersionUpdateBanner, WSConnectionAlert), centred inside the strip.
+ *   - `.nf-notifications-safe-area`: the toast stack (top-right, i.e. directly
+ *     under the window buttons on Windows).
+ *   - `.nf-overlay-layer`: injected by the theme (lib/mantine-theme.ts) onto
+ *     Modal/Drawer roots and Menu/Popover/HoverCard/Combobox dropdowns, because
+ *     Mantine v9 emits no stable component classes to target from here.
+ */
+html[data-nf-wco] :is(.nf-top-banner, .nf-notifications-safe-area, .nf-overlay-layer) {
+	-webkit-app-region: no-drag;
+}

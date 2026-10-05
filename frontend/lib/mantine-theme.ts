@@ -58,5 +58,23 @@ export const mantineTheme = createTheme({
 				},
 			},
 		},
+		/*
+		 * `nf-overlay-layer` marks every floating layer that can paint over the WCO
+		 * drag surface (the header row, or the standalone window strip). app-region
+		 * hit-testing is purely geometric: an overlay painted above a drag rect still
+		 * has its clicks consumed as a window drag unless its own rect is subtracted
+		 * with `no-drag`. Mantine v9 emits no stable component classes, so the hook
+		 * is injected from here; the matching rule lives in styles/wco.css.
+		 *
+		 * Modal/Drawer mark the root (its overlay covers the whole viewport, so while
+		 * one is open nothing can drag anyway — clicking the dimmed strip must reach
+		 * the overlay's click-to-dismiss); menus/popovers mark just the dropdown.
+		 */
+		Modal: { classNames: { root: "nf-overlay-layer" } },
+		Drawer: { classNames: { root: "nf-overlay-layer" } },
+		Menu: { classNames: { dropdown: "nf-overlay-layer" } },
+		Popover: { classNames: { dropdown: "nf-overlay-layer" } },
+		HoverCard: { classNames: { dropdown: "nf-overlay-layer" } },
+		Combobox: { classNames: { dropdown: "nf-overlay-layer" } },
 	},
 });

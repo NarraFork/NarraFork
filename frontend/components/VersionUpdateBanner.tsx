@@ -13,6 +13,7 @@ export function VersionUpdateBanner() {
 
 	return (
 		<Alert
+			className="nf-top-banner"
 			color="indigo"
 			variant="light"
 			withCloseButton

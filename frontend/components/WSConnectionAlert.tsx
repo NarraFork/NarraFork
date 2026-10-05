@@ -48,6 +48,7 @@ export function WSConnectionAlert() {
 
 	return (
 		<Alert
+			className="nf-top-banner"
 			color="red"
 			variant="filled"
 			icon={<IconPlugConnectedX size={18} />}
