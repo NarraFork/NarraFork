@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import type { SystemLifecycleStatus } from "../../lib/api/system-lifecycle";
+import type { SystemLifecycleNotice, SystemLifecycleStatus } from "../../lib/api/system-lifecycle";
 
 const originalApi = { ...(await import("../../lib/api")) };
 const originalAuth = { ...(await import("../../hooks/useAuth")) };
@@ -177,6 +177,10 @@ describe("SystemShutdownCard", () => {
 		await click("systemRecoveryPrepare");
 		expect(actions).toEqual(["prepare"]);
 		expect(container.textContent).toContain("systemRecoveryPrepared");
+		expect(client.getQueryData<SystemLifecycleNotice>(["system-lifecycle-notice"])).toEqual({
+			phase: "prepared",
+			shutdownRequested: false,
+		});
 		expect(button("systemRecoveryPrepare").disabled).toBe(true);
 		await click("systemRecoveryCancel");
 		expect(actions).toEqual(["prepare", "cancel"]);

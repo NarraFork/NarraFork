@@ -45,6 +45,17 @@ afterEach(() => {
 });
 
 describe("system lifecycle API", () => {
+	test("maintenance notice uses the redacted authenticated endpoint", async () => {
+		const expected = { phase: "prepared" as const, shutdownRequested: false };
+		responseBody = expected;
+		const controller = new AbortController();
+		expect(await systemLifecycleApi.getSystemLifecycleNotice(controller.signal)).toEqual(expected);
+		expect(calls[0]).toEqual({
+			url: "/api/system/lifecycle/notice",
+			method: undefined,
+			signal: controller.signal,
+		});
+	});
 	test("status is a bare response and passes query cancellation through", async () => {
 		const controller = new AbortController();
 		expect(await systemLifecycleApi.getSystemLifecycleStatus(controller.signal)).toEqual(status);

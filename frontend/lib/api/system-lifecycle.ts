@@ -15,12 +15,17 @@ export interface SystemLifecycleStatus {
 	};
 }
 
+export type SystemLifecycleNotice = Pick<SystemLifecycleStatus, "phase" | "shutdownRequested">;
+export const systemLifecycleNoticeQueryKey = ["system-lifecycle-notice"] as const;
+
 interface SystemLifecycleActionResult {
 	success: true;
 	status: SystemLifecycleStatus;
 }
 
 export const systemLifecycleApi = {
+	getSystemLifecycleNotice: (signal?: AbortSignal) =>
+		request<SystemLifecycleNotice>("/system/lifecycle/notice", { signal }),
 	getSystemLifecycleStatus: (signal?: AbortSignal) =>
 		request<SystemLifecycleStatus>("/system/lifecycle/status", { signal }),
 	prepareSystemRecovery: () =>

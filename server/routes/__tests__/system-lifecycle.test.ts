@@ -43,12 +43,27 @@ afterEach(() => {
 });
 function request(path: string, token?: string) {
 	return app.request(`/api/system/lifecycle/${path}`, {
-		method: path === "status" ? "GET" : "POST",
+		method: path === "status" || path === "notice" ? "GET" : "POST",
 		headers: token ? { Authorization: `Bearer ${token}` } : {},
 	});
 }
 
 describe("system lifecycle administrator API", () => {
+	test("all signed-in users can see a redacted maintenance notice but no diagnostics", async () => {
+		const status = spyOn(systemLifecycle, "status").mockReturnValue({
+			...systemLifecycle.status(),
+			phase: "prepared",
+			error: "private diagnostics",
+		});
+		restores.push(() => status.mockRestore());
+		expect((await request("notice")).status).toBe(401);
+		for (const token of [member, admin]) {
+			const response = await request("notice", token);
+			expect(response.status).toBe(200);
+			expect(response.headers.get("Cache-Control")).toBe("no-store");
+			expect(await response.json()).toEqual({ phase: "prepared", shutdownRequested: false });
+		}
+	});
 	test("all lifecycle endpoints reject unauthenticated and ordinary users", async () => {
 		// Spies prove authorization prevents even entering the controller.
 		const prepare = spyOn(systemLifecycle, "prepare");
