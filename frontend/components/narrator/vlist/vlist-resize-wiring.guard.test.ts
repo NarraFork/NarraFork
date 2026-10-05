@@ -1,6 +1,6 @@
 /**
- * Production resize wiring: preview may publish exact viewport geometry, but only
- * initial/commit and non-pending height observations feed the full layout. Scheduler
+ * Production resize wiring: wrapping is frozen; exact viewport height stays live.
+ * Only initial/commit and non-pending height observations feed the full layout. Scheduler
  * behaviour is tested against createVListResizeController in vlist-live-resize.test.ts,
  * not a reproduction of the shell handler.
  */
@@ -49,31 +49,27 @@ describe("production resize handler wiring", () => {
 			expect(callback).toMatch(/setViewportHeight\(height\)/);
 			expect(callback).toMatch(/setContentWidth\(width\)/);
 		}
-		const preview = region(options, "onPreview: ({ width, height }) => {");
-		expect(preview).not.toMatch(/setLayoutHeight|setContentWidth/);
-		expect(preview).toMatch(/setViewportHeight\(height\)/);
-		expect(preview).toContain(
-			"pretextDocumentRef.current.previewWidth(width, mobileViewportRef.current)",
-		);
+		expect(options).toContain('previewPolicy: "freeze"');
+		expect(options).toMatch(/onPreview:\s*\(\)\s*=>\s*false/);
+		expect(options).not.toContain(".previewWidth(");
 	});
 
 	it("lets observer height reach the build only after controller.observe says not pending", () => {
 		const measure = region(resizeEffect(shell()), "const measure = () => {");
 		const idle = region(measure, "if (!controller.isPending()) {");
-		expect(idle).toMatch(/setViewportHeight\(node\.clientHeight\)/);
+		expect(idle).not.toMatch(/setViewportHeight/);
 		expect(idle).toMatch(/setLayoutHeight\(node\.clientHeight\)/);
+		expect(measure.replace(idle, "")).toMatch(/setViewportHeight\(node\.clientHeight\)/);
 		expect(measure.indexOf("controller.observe();")).toBeGreaterThan(-1);
 		expect(measure.indexOf("controller.observe();")).toBeLessThan(measure.indexOf(idle));
-		// No second, ungated observer write hiding outside the positively owned branch.
-		expect(measure.replace(idle, "")).not.toMatch(
-			/setLayoutHeight|setViewportHeight|setContentWidth/,
-		);
+		// Live viewport height is outside the gate; no full-layout writes may escape it.
+		expect(measure.replace(idle, "")).not.toMatch(/setLayoutHeight|setContentWidth/);
 	});
 
 	it("accounts for every exact-height and layout-height write across the production shell", () => {
 		const source = shellSource();
-		// initial + commit + preview + idle observer; only preview excludes layoutHeight.
-		expect(source.match(/setViewportHeight\s*\(/g)).toHaveLength(4);
+		// Initial + commit + live observer. Only the idle observer updates layoutHeight.
+		expect(source.match(/setViewportHeight\s*\(/g)).toHaveLength(3);
 		expect(source.match(/setLayoutHeight\s*\(/g)).toHaveLength(3);
 	});
 
@@ -111,11 +107,8 @@ describe("production resize handler wiring", () => {
 		expect(options).toMatch(/getCommittedWidth:\s*\(\)\s*=>\s*committedContentWidthRef\.current/);
 		expect(options).toMatch(/pointerDown:\s*\(\)\s*=>\s*pointerTracker\.isDown\(\)/);
 		expect(source).toMatch(/pretextDocumentRef\.current\s*=\s*pretextDocument\s*;/);
-		const preview = region(options, "onPreview: ({ width, height }) => {");
-		expect(preview).toContain(
-			"pretextDocumentRef.current.previewWidth(width, mobileViewportRef.current)",
-		);
-		expect(preview).not.toMatch(/\bpretextDocument\.previewWidth/);
+		expect(options).toContain('previewPolicy: "freeze"');
+		expect(options).not.toContain(".previewWidth(");
 	});
 
 	it("uses an explicit commit epoch to finish a pending preview even at the starting width", () => {
@@ -191,6 +184,87 @@ describe("production resize handler wiring", () => {
 		expect(effect).toContain("createVListResizeController({");
 		expect(effect).toContain("ResizeObserver");
 		expect(effect).toContain("onCommit:");
+	});
+});
+
+describe("production permission height reporting during frozen resize", () => {
+	function permissionReporterHarness() {
+		type Entry = { requestId: string; height: number; width: number };
+		let published = new Map<string, Entry>();
+		let writes = 0;
+		let refreshes = 0;
+		const state = {
+			pendingRequestIdByToolUseIdRef: { current: new Map([["tool", "request"]]) },
+			rowWidthsRef: { current: new Map([["row", 700]]) },
+			resizeFormHeightsRef: { current: new Map<string, Entry>() },
+			resizeDirtyKeysRef: { current: new Set<string>() },
+			resizeControllerRef: {
+				current: {
+					isPending: () => true,
+					refresh: () => {
+						refreshes++;
+					},
+				},
+			},
+			setPermissionFormHeights: (update: (prev: Map<string, Entry>) => Map<string, Entry>) => {
+				published = update(published);
+				writes++;
+			},
+		};
+		const callback = region(shell(), "const reportPermissionFormHeight = useCallback(");
+		const code = new Bun.Transpiler({ loader: "ts" }).transformSync(`
+			const useCallback = (callback: unknown) => callback;
+			const { ${Object.keys(state).join(", ")} } = state;
+			${callback};
+			return reportPermissionFormHeight;
+		`);
+		const report = new Function("state", code)(state) as (
+			toolUseId: string,
+			height: number,
+			width: number,
+			rowKey: string,
+		) => void;
+		return {
+			state,
+			report,
+			get published() {
+				return published;
+			},
+			get writes() {
+				return writes;
+			},
+			get refreshes() {
+				return refreshes;
+			},
+		};
+	}
+
+	it("publishes changed form content at committed row width even while resize is pending", () => {
+		const h = permissionReporterHarness();
+		h.report("tool", 300.4, 700, "row");
+		expect(h.published.get("tool")).toEqual({ requestId: "request", height: 300, width: 700 });
+		h.report("tool", 340.4, 700, "row");
+		expect(h.published.get("tool")?.height).toBe(340);
+		expect(h.writes).toBe(2);
+		expect(h.refreshes).toBe(0);
+		expect(h.state.resizeDirtyKeysRef.current.size).toBe(0);
+	});
+
+	it("still rejects stale widths, missing requests and duplicate or invalid height reports", () => {
+		const h = permissionReporterHarness();
+		for (const height of [0, -1, Number.NaN, Number.POSITIVE_INFINITY])
+			h.report("tool", height, 700, "row");
+		h.report("missing-tool", 300, 700, "row");
+		h.report("tool", 300, 640, "row");
+		h.report("tool", 300, 700, "missing-row");
+		expect(h.writes).toBe(0);
+		h.report("tool", 300, 700, "row");
+		h.report("tool", 301, 700, "row");
+		expect(h.writes).toBe(1);
+		h.state.pendingRequestIdByToolUseIdRef.current.set("tool", "replacement");
+		h.report("tool", 300, 700, "row");
+		expect(h.writes).toBe(2);
+		expect(h.published.get("tool")?.requestId).toBe("replacement");
 	});
 });
 

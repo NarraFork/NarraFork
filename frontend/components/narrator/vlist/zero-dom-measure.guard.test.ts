@@ -51,6 +51,8 @@ const PURE_PATH_FILES = [
 	"vlist-tail-meta.ts",
 	"vlist-selection.ts",
 	"vlist-lod-gesture.ts",
+	"vlist-lod-morph-frame.ts",
+	"vlist-lod-morph-geometry.ts",
 	"vlist-virtualization.ts",
 	"vlist-pipeline.ts",
 	"vlist-resize-preview.ts",

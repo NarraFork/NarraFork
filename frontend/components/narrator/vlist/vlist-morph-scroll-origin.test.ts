@@ -262,8 +262,19 @@ describe("production animation-origin wiring", () => {
 			source.indexOf("Play LOD-switch morphs"),
 			source.indexOf("const pendingClosing = pendingLifecycleClosingRef.current"),
 		);
-		expect(lod).toContain("const scrollTop = readMorphScrollTop()");
-		before(lod, "lodMorphPrevRef.current = next", "if (!isLodSwitch");
+		const lodCall = sliceBracketedRegion(lod, "commitLodMorph(");
+		expect(lodCall).toContain("scrollTop: readMorphScrollTop()");
+		expect(lodCall).toContain("viewportHeight: viewportHeightRef.current");
+		expect(lodCall).toContain("frames: lodMorphFramesRef");
+		// The callable entry owns publication/gating; direct frame.test checks argument origins.
+		const commit = shellModule("vlist-lod-morph-commit.ts");
+		before(
+			commit,
+			"state.frames.current.commit(",
+			"if (!frames || playback.prefersReducedMotion())",
+		);
+		before(commit, "if (!frames || playback.prefersReducedMotion())", "planner.admit(");
+		before(commit, "if (!frames || playback.prefersReducedMotion())", "planner.buildSnapshots(");
 		before(source, "drillMorphPrevRef.current = next", "if (!revisionUnchanged");
 		const life = source.slice(
 			source.indexOf("const next = buildLifecycleSnapshot(sources)"),

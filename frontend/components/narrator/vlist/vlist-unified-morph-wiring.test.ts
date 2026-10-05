@@ -1,29 +1,24 @@
 /**
  * Wiring guards for the unified morph path.
  *
- * Read as source text, like the other `*-wiring` tests in this directory: the effects run
- * inside a component that needs a real layout to exercise, and the properties below are
- * structural (which reference is used, which order things happen in) rather than visual.
- *
- * These exist because the failures they guard are SILENT. A morph wired to the wrong
- * reference still produces plans, still animates something, and still passes every unit
- * test — the keyframe implementation did exactly that for several rounds while jumping
- * visibly on screen.
+ * Direct production-entry tests in `vlist-lod-morph-frame.test.ts` exercise admission,
+ * origin/height arguments, interruption, reclamation and preference handover. The shell
+ * still needs source guards for its persistent owners, React effects and DOM resolver.
+ * Entry assertions below follow the extracted host; none execute source-text snippets.
  */
 
 import { describe, expect, it } from "bun:test";
+import { shellModule } from "./guard-source";
+import { sliceBracketedRegion } from "./source-slice";
 
-const SHELL = await Bun.file(
-	new URL("./PretextExactMessageList.tsx", import.meta.url).pathname,
-).text();
+const SHELL = shellModule("PretextExactMessageList.tsx");
+const COMMIT = shellModule("vlist-lod-morph-commit.ts");
 
-/** The unified branch of the LOD morph effect. */
+/** The callable commit owns planning/playback; React lifecycle stays in the shell. */
 function unifiedBranch(): string {
-	const start = SHELL.indexOf("if (unifiedMorph) {");
-	expect(start).toBeGreaterThan(0);
-	const end = SHELL.indexOf("const plans = diffLodSnapshots(", start);
-	expect(end).toBeGreaterThan(start);
-	return SHELL.slice(start, end);
+	const branch = sliceBracketedRegion(COMMIT, "if (playback.unified) {");
+	if (!branch) throw new Error("Missing unified LOD commit branch");
+	return branch;
 }
 
 describe("unified morph: one timing owner", () => {
@@ -67,22 +62,24 @@ describe("unified morph: interruption is structural", () => {
 	 * FIRST applied no displacement and teleported — the "most rows don't animate" report.
 	 */
 	it("branches on isMoving, never on mere presence", () => {
+		// Direct commit tests in frame.test exercise moving and settled entries.
 		const branch = unifiedBranch();
-		expect(branch).toContain("store.isMoving(plan.unitId)");
-		expect(branch).not.toContain("if (!store.get(plan.unitId))");
+		expect(branch).toContain("playback.visualState.isMoving(plan.unitId)");
+		expect(branch).not.toContain(".get(plan.unitId)");
 	});
 
 	it("retargets a moving element and re-seeds a settled one", () => {
 		const branch = unifiedBranch();
-		// Moving → target only, so the visual position is preserved.
-		expect(branch).toContain("store.setTarget(plan.unitId, plan.target)");
-		// Settled → startFrom, which is the only call that moves an existing element.
-		expect(branch).toContain("store.startFrom(plan.unitId, initialStateFor(plan), plan.target)");
+		// Moving → target only; settled → initial displacement on every switch.
+		expect(branch).toContain("playback.visualState.setTarget(plan.unitId, plan.target)");
+		expect(branch).toContain(
+			"playback.visualState.startFrom(plan.unitId, initialStateFor(plan), plan.target)",
+		);
 	});
 
 	it("plans TARGETS, never keyframes", () => {
 		const branch = unifiedBranch();
-		expect(branch).toContain("planMorphTargets");
+		expect(branch).toContain("planner.planTargets(");
 		expect(branch).not.toContain("Keyframes");
 	});
 });
@@ -91,49 +88,64 @@ describe("unified morph: reclamation", () => {
 	it("retains the admitted set so unadmitted states can be swept", () => {
 		// Without this the store grows for the life of the session: a level switch churns
 		// elements constantly.
-		expect(unifiedBranch()).toContain("store.retain(ids)");
+		expect(unifiedBranch()).toContain("playback.visualState.retain(ids)");
 	});
 
 	it("kicks the driver, which is idempotent per commit", () => {
-		expect(unifiedBranch()).toContain("morphDriverRef.current?.kick()");
+		expect(unifiedBranch()).toContain("playback.driver?.kick()");
 	});
 });
 
 describe("unified morph: isolation from the keyframe path", () => {
-	it("keeps its own previous-frame ref", () => {
-		// Sharing `lodMorphPrevRef` would let a frame recorded by one path be diffed by the
-		// other, whose admission rules differ — a silent mispairing, not an error.
-		expect(SHELL).toContain("unifiedPrevRef");
+	it("derives unified admission independently from the shared document-space frames", () => {
+		const branch = unifiedBranch();
+		expect(branch).toContain("frames.before.geometry.unifiedElements");
+		expect(branch).toContain("frames.after.geometry.unifiedElements");
+		// frame.test checks the actual arguments: current height, independent origins.
+		for (const field of [
+			"frames.after.scrollTop",
+			"frames.after.viewportHeight",
+			"frames.before.scrollTop",
+		])
+			expect(branch).toContain(field);
+		expect(branch).not.toContain("planner.buildSnapshots(");
+		expect(branch).not.toContain("planner.diffSnapshots(");
+		const keyframeStart = COMMIT.indexOf("const before = planner.buildSnapshots(");
+		expect(keyframeStart).toBeGreaterThan(COMMIT.indexOf(branch));
+		const keyframe = COMMIT.slice(
+			keyframeStart,
+			COMMIT.indexOf("const plans = planner.diffSnapshots(", keyframeStart),
+		);
+		// Keyframes retain each frame's own origin AND height (not unified admission's policy).
+		for (const side of ["before", "after"]) {
+			for (const field of ["geometry.elements", "scrollTop", "viewportHeight"])
+				expect(keyframe).toContain(`frames.${side}.${field}`);
+		}
+		expect(keyframe).not.toContain("unifiedElements");
 	});
 
-	/**
-	 * THE BASELINE MUST ROLL FORWARD ON EVERY FRAME.
-	 *
-	 * Writing it inside the `unifiedMorph` branch put it AFTER the `isLodSwitch` guard, so it
-	 * was unreachable on ordinary frames and only ever recorded a frame that was already
-	 * mid-switch. Every switch then diffed against a stale, one-step-late snapshot and most
-	 * elements failed to pair — a large number of rows silently lost their animation, which is
-	 * the exact bug the rewrite exists to remove.
-	 */
-	it("admits and rolls the baseline BEFORE the isLodSwitch guard", () => {
-		const rollAt = SHELL.indexOf("unifiedPrevRef.current = unifiedElements");
-		const guardAt = SHELL.indexOf("if (!isLodSwitch || prefersReducedMotion()) return;");
+	it("commits the baseline BEFORE the playback gate and admits only inside the unified branch", () => {
+		const rollAt = COMMIT.indexOf("state.frames.current.commit(");
+		const guardAt = COMMIT.indexOf("if (!frames || playback.prefersReducedMotion())");
+		const branchAt = COMMIT.indexOf("if (playback.unified) {");
 		expect(rollAt).toBeGreaterThan(0);
-		expect(guardAt).toBeGreaterThan(0);
-		expect(rollAt).toBeLessThan(guardAt);
+		expect(guardAt).toBeGreaterThan(rollAt);
+		expect(branchAt).toBeGreaterThan(guardAt);
+		expect(unifiedBranch()).toContain("planner.admit(");
 	});
 
-	it("builds the baseline element list unconditionally, not lazily inside the branch", () => {
-		const admitAt = SHELL.indexOf("const unifiedElements = toMorphElements(");
-		const branchAt = SHELL.indexOf("if (unifiedMorph) {");
-		expect(admitAt).toBeGreaterThan(0);
-		expect(admitAt).toBeLessThan(branchAt);
+	it("takes both complete geometry arrays from the committed cache before descriptor publication", () => {
+		const getAt = COMMIT.indexOf("const geometry = state.geometry.current.get(source)");
+		const rollAt = COMMIT.indexOf("state.frames.current.commit(");
+		expect(getAt).toBeGreaterThan(0);
+		expect(rollAt).toBeGreaterThan(getAt);
+		for (const source of [SHELL, COMMIT]) expect(source).not.toContain("toMorphElements(");
 	});
 
 	it("returns before the keyframe planner runs", () => {
 		// Both paths must never plan the same switch: the two would fight over the same nodes.
 		expect(unifiedBranch().trimEnd().endsWith("}")).toBe(true);
-		expect(unifiedBranch()).toContain("return;");
+		expect(unifiedBranch()).toMatch(/return frames;\s*}$/);
 	});
 
 	it("is behind a default-OFF preference", () => {
@@ -143,32 +155,38 @@ describe("unified morph: isolation from the keyframe path", () => {
 	/**
 	 * FLIPPING THE PREFERENCE MUST HAND THE NODES OVER CLEANLY.
 	 *
-	 * `morphIdentitiesRef` is written ONLY inside the `unifiedMorph` branch. Turn the flag
+	 * The commit refreshes `morphIdentitiesRef` only in its unified branch. Turn the flag
 	 * off while a switch is converging and it keeps naming the last switch's identities
 	 * while the loop keeps writing their `transform` — at the same time the keyframe
 	 * planner starts animating those very nodes. Two owners of one property is the failure
-	 * `vlist-motion-scheduler.ts` exists to make impossible, and here it would be reached
-	 * by a settings toggle rather than by any code path a test walks.
-	 *
-	 * Silent in every other suite: the driver's own tests never mount, and no component
-	 * test toggles the preference mid-animation.
+	 * `vlist-motion-scheduler.ts` exists to make impossible. Direct commit tests now cover
+	 * the reset and descriptor preservation; this guard pins the React preference trigger
+	 * and the actual identity/driver refs passed to that tested entry.
 	 */
-	it("clears the identity set and stops the driver when the preference flips", () => {
-		const effectAt = SHELL.indexOf("morphIdentitiesRef.current = new Set();");
+	it("hands the identity/driver ports to reset playback when the preference flips", () => {
+		const resetAt = SHELL.indexOf("resetLodMorphPlayback(");
+		expect(resetAt).toBeGreaterThan(0);
+		const effectAt = SHELL.lastIndexOf("useEffect(() => {", resetAt);
 		expect(effectAt).toBeGreaterThan(0);
-		const window = SHELL.slice(effectAt, effectAt + 200);
-		expect(window).toContain("morphDriverRef.current?.stop()");
-		// Keyed on the flag itself: an effect with `[]` would only run on mount and a
-		// mid-session flip would go unnoticed, which is the whole case.
-		expect(window).toContain("}, [unifiedMorph]);");
+		const effect = sliceBracketedRegion(SHELL.slice(effectAt), "useEffect(");
+		expect(effect).toContain("resetLodMorphPlayback(morphIdentitiesRef, morphDriverRef.current)");
+		// Keyed on the flag, not just mount. Direct frame.test verifies reset preserves frames.
+		expect(effect).toContain("[unifiedMorph]");
+		const reset = sliceBracketedRegion(COMMIT, "export function resetLodMorphPlayback(");
+		expect(reset).toContain("identities: Slot<Set<string>>");
+		// Reset owns playback only: the frame baseline is not even an input.
+		expect(reset).not.toContain("frames");
+		const body = COMMIT.slice(COMMIT.indexOf("identities.current = new Set();"));
+		expect(body).toContain("driver?.stop()");
 	});
 
 	it("still honours reduced motion", () => {
 		// The guard sits above the branch, so it covers both paths.
-		const effectStart = SHELL.indexOf("const isLodSwitch =");
-		const branchStart = SHELL.indexOf("if (unifiedMorph) {");
-		const between = SHELL.slice(effectStart, branchStart);
-		expect(between).toContain("prefersReducedMotion()");
+		const effectStart = COMMIT.indexOf("const frames = state.frames.current.commit(");
+		const branchStart = COMMIT.indexOf("if (playback.unified) {");
+		expect(effectStart).toBeGreaterThan(0);
+		expect(branchStart).toBeGreaterThan(effectStart);
+		expect(COMMIT.slice(effectStart, branchStart)).toContain("playback.prefersReducedMotion()");
 	});
 });
 
@@ -224,7 +242,7 @@ describe("unified morph: DOM resolution", () => {
 
 	it("kicks the driver so the seeded state is painted in the same commit", () => {
 		// See the driver's own tests: scheduling alone paints one frame at the final position.
-		expect(SHELL).toContain("morphDriverRef.current?.kick()");
+		expect(COMMIT).toContain("playback.driver?.kick()");
 	});
 
 	it("escapes the identity before putting it in a selector", () => {

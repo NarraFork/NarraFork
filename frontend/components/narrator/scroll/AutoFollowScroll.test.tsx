@@ -11,6 +11,7 @@ import {
 	AutoFollowScroll,
 	type ContentRowTarget,
 	type ContentViewport,
+	type ContentViewportLayout,
 	useContentViewport,
 } from "./AutoFollowScroll";
 
@@ -23,6 +24,28 @@ let nextFrame = 0;
 let frames: Map<number, FrameRequestCallback>;
 let positions: WeakMap<object, number>;
 let writes: number[];
+const geometryKeys = [
+	"clientHeight",
+	"clientWidth",
+	"offsetWidth",
+	"scrollHeight",
+	"scrollWidth",
+	"scrollTop",
+	"scrollLeft",
+] as const;
+type GeometryReads = Record<(typeof geometryKeys)[number], number>;
+let geometryReads: GeometryReads;
+let leftPositions: WeakMap<object, number>;
+function resetGeometryReads() {
+	geometryReads = Object.fromEntries(geometryKeys.map((key) => [key, 0])) as GeometryReads;
+}
+function countGeometryRead(node: HTMLElement, key: (typeof geometryKeys)[number]) {
+	if (node.hasAttribute("data-content-scrollport")) geometryReads[key]++;
+}
+/** Setter clamping uses fixture data directly, never its own instrumented getters. */
+function fixtureScrollHeight(node: HTMLElement) {
+	return Number(node.querySelector("[data-lines]")?.getAttribute("data-lines") ?? 0) * 20;
+}
 let restore: Map<string, PropertyDescriptor | undefined>;
 /**
  * linkedom shares ONE `HTMLElement.prototype` across every `parseHTML` window, so
@@ -54,6 +77,8 @@ beforeEach(async () => {
 	nextFrame = 0;
 	frames = new Map();
 	positions = new WeakMap();
+	leftPositions = new WeakMap();
+	resetGeometryReads();
 	writes = [];
 	observers = [];
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
@@ -99,33 +124,64 @@ beforeEach(async () => {
 	const geometryProto = window.HTMLElement.prototype;
 	stubbedProto = geometryProto;
 	protoRestore = new Map(
-		["clientHeight", "clientWidth", "offsetWidth", "scrollHeight", "scrollTop"].map((key) => [
-			key,
-			Object.getOwnPropertyDescriptor(geometryProto, key),
-		]),
+		geometryKeys.map((key) => [key, Object.getOwnPropertyDescriptor(geometryProto, key)]),
 	);
 	Object.defineProperties(geometryProto, {
-		clientHeight: { configurable: true, get: () => 200 },
-		clientWidth: { configurable: true, get: () => 400 },
-		offsetWidth: { configurable: true, get: () => 400 },
+		clientHeight: {
+			configurable: true,
+			get() {
+				countGeometryRead(this, "clientHeight");
+				return 200;
+			},
+		},
+		clientWidth: {
+			configurable: true,
+			get() {
+				countGeometryRead(this, "clientWidth");
+				return 400;
+			},
+		},
+		offsetWidth: {
+			configurable: true,
+			get() {
+				countGeometryRead(this, "offsetWidth");
+				return 400;
+			},
+		},
 		scrollHeight: {
 			configurable: true,
 			get() {
-				return (
-					Number(
-						(this as HTMLElement).querySelector("[data-lines]")?.getAttribute("data-lines") ?? 0,
-					) * 20
-				);
+				countGeometryRead(this, "scrollHeight");
+				return fixtureScrollHeight(this);
+			},
+		},
+		scrollWidth: {
+			configurable: true,
+			get() {
+				countGeometryRead(this, "scrollWidth");
+				return 0;
+			},
+		},
+		scrollLeft: {
+			configurable: true,
+			get() {
+				countGeometryRead(this, "scrollLeft");
+				return leftPositions.get(this) ?? 0;
+			},
+			set(value: number) {
+				leftPositions.set(this, value);
 			},
 		},
 		scrollTop: {
 			configurable: true,
 			get() {
+				countGeometryRead(this, "scrollTop");
 				return positions.get(this) ?? 0;
 			},
 			set(value: number) {
 				const el = this as HTMLElement;
-				const next = Math.max(0, Math.min(value, el.scrollHeight - el.clientHeight));
+				const height = Object.getOwnPropertyDescriptor(el, "clientHeight")?.value ?? 200;
+				const next = Math.max(0, Math.min(value, fixtureScrollHeight(el) - height));
 				positions.set(this, next);
 				writes.push(next);
 			},
@@ -176,6 +232,14 @@ function ReaderProbe({ onViewport }: { onViewport: (value: ContentViewport) => v
 	}, [value, onViewport]);
 	return null;
 }
+function Extent({ size }: { size: ContentViewportLayout }) {
+	const ctx = useContentViewport();
+	const publish = ctx?.setContentSize;
+	useLayoutEffect(() => {
+		publish?.(size);
+	}, [publish, size]);
+	return null;
+}
 async function render(opts: {
 	lines?: number;
 	live?: boolean;
@@ -183,6 +247,8 @@ async function render(opts: {
 	strict?: boolean;
 	target?: ContentRowTarget | null;
 	revision?: string;
+	content?: string;
+	layout?: ContentViewportLayout;
 	onReaderProgress?: (node: HTMLElement) => void;
 	onViewport?: (value: ContentViewport) => void;
 }) {
@@ -194,13 +260,15 @@ async function render(opts: {
 					live={opts.live ?? true}
 					revision={opts.revision ?? String(opts.lines ?? 30)}
 					followTarget={"target" in opts ? "row" : "end"}
+					layout={opts.layout}
 					viewportStyle={{ height: 200 }}
 					onReaderProgress={opts.onReaderProgress}
 				>
 					<div data-lines={opts.lines ?? 30}>
-						Output
+						{opts.content ?? "Output"}
 						<input data-input="true" />
 					</div>
+					{opts.layout && <Extent size={{ width: 400, height: (opts.lines ?? 30) * 20 }} />}
 					{"target" in opts && <Target value={opts.target ?? null} />}
 					{opts.onViewport && <ReaderProbe onViewport={opts.onViewport} />}
 				</AutoFollowScroll>
@@ -248,6 +316,109 @@ function resumeButton() {
 	return container.querySelector<HTMLButtonElement>("button[aria-label]");
 }
 
+describe("unique cold first mounts", () => {
+	// Recorded against the unmodified cold-mount-baseline/AutoFollowScroll.tsx before optimizing.
+	// Budgets cap snapshots, not required reads: fewer reads are an improvement.
+	// Each snapshot reads six getters in DOM mode, two in modeled mode; writes read actualTop.
+	const scenarios: {
+		name: string;
+		live: boolean;
+		target?: ContentRowTarget | null;
+		layout?: ContentViewportLayout;
+		strict?: boolean;
+		baselineSnapshots: number;
+		maxSnapshots: number;
+	}[] = [
+		{ name: "historical end", live: false, baselineSnapshots: 12, maxSnapshots: 3 },
+		{
+			name: "historical row",
+			live: false,
+			target: { top: 240, bottom: 260 },
+			baselineSnapshots: 12,
+			maxSnapshots: 3,
+		},
+		{
+			name: "historical missing row",
+			live: false,
+			target: null,
+			baselineSnapshots: 12,
+			maxSnapshots: 3,
+		},
+		{ name: "live end", live: true, baselineSnapshots: 15, maxSnapshots: 8 },
+		{
+			name: "live row",
+			live: true,
+			target: { top: 240, bottom: 260 },
+			baselineSnapshots: 15,
+			maxSnapshots: 8,
+		},
+		{
+			name: "historical modeled",
+			live: false,
+			layout: { width: 400, height: 200 },
+			baselineSnapshots: 12,
+			maxSnapshots: 3,
+		},
+		{
+			name: "live modeled",
+			live: true,
+			layout: { width: 400, height: 200 },
+			baselineSnapshots: 15,
+			maxSnapshots: 8,
+		},
+		{
+			name: "historical StrictMode",
+			live: false,
+			strict: true,
+			baselineSnapshots: 21,
+			maxSnapshots: 6,
+		},
+	];
+	for (const scenario of scenarios) {
+		test(scenario.name, async () => {
+			for (let sample = 0; sample < 3; sample++) {
+				await act(async () => root.render(null));
+				resetGeometryReads();
+				writes = [];
+				await render({
+					...scenario,
+					lines: 50 + sample,
+					bodyId: `cold-${scenario.name}-${sample}`,
+					revision: `revision-${scenario.name}-${sample}`,
+					content: `Unique content for ${scenario.name}, instance ${sample}`,
+				});
+				const reads = { ...geometryReads };
+				const modeled = !!scenario.layout;
+				const readBudgets: GeometryReads = {
+					clientHeight: modeled ? 0 : scenario.maxSnapshots,
+					clientWidth: modeled ? 0 : scenario.maxSnapshots,
+					offsetWidth: 0,
+					scrollHeight: modeled ? 0 : scenario.maxSnapshots,
+					scrollWidth: modeled ? 0 : scenario.maxSnapshots,
+					scrollTop: scenario.maxSnapshots + (scenario.live ? 2 : 0),
+					scrollLeft: scenario.maxSnapshots,
+				};
+				const baselineTotal =
+					scenario.baselineSnapshots * (modeled ? 2 : 6) + (scenario.live ? 4 : 0);
+				for (const key of geometryKeys) {
+					const budget = readBudgets[key];
+					if (budget === 0) {
+						expect(reads[key]).toBe(0);
+					} else {
+						expect(reads[key]).toBeGreaterThanOrEqual(0);
+						expect(reads[key]).toBeLessThanOrEqual(budget);
+					}
+				}
+				expect(Object.values(reads).reduce((sum, count) => sum + count, 0)).toBeLessThan(
+					baselineTotal,
+				);
+				expect(viewport().dataset.following).toBe(String(scenario.live));
+				expect(writes.length).toBe(scenario.live ? 1 : 0);
+			}
+		});
+	}
+});
+
 describe("content lifecycle", () => {
 	test("a live body starts at its tail; a historical body stays at its head", async () => {
 		await render({ lines: 50 });
@@ -261,6 +432,89 @@ describe("content lifecycle", () => {
 		await settle();
 		expect(viewport().scrollTop).toBe(0);
 		expect(writes).toHaveLength(0);
+	});
+	test("historical notifications skip geometry but an explicit snapshot stays fresh", async () => {
+		let reader: ContentViewport | undefined;
+		await render({
+			live: false,
+			onViewport: (value) => {
+				reader = value;
+			},
+		});
+		resetGeometryReads();
+		await act(async () => reader?.notifyLayout());
+		expect(Object.values(geometryReads).every((count) => count === 0)).toBe(true);
+		viewport().querySelector("[data-lines]")?.setAttribute("data-lines", "80");
+		expect(reader?.getSnapshot().scrollHeight).toBe(1600);
+		expect(geometryReads.scrollHeight).toBe(1);
+		expect(writes).toHaveLength(0);
+	});
+	test("a historical body upgrades to live without replacing callbacks or native listeners", async () => {
+		let reader: ContentViewport | undefined;
+		const onViewport = (value: ContentViewport) => {
+			reader = value;
+		};
+		await render({ live: false, lines: 50, onViewport });
+		const node = viewport();
+		const initial = reader;
+		const nativeObserver = observers[0];
+		await render({ live: true, lines: 60, onViewport });
+		expect(viewport()).toBe(node);
+		expect(node.scrollTop).toBe(1000);
+		expect(reader?.isFollowing()).toBe(true);
+		await render({ live: false, lines: 70, onViewport });
+		await settle();
+		expect(node.scrollTop).toBe(1200);
+		expect(reader?.getSnapshot).toBe(initial?.getSnapshot);
+		expect(reader?.notifyLayout).toBe(initial?.notifyLayout);
+		expect(reader?.scrollTo).toBe(initial?.scrollTo);
+		expect(reader?.subscribeViewport).toBe(initial?.subscribeViewport);
+		expect(observers).toHaveLength(1);
+		expect(nativeObserver?.active).toBe(true);
+		resetGeometryReads();
+		await act(async () => reader?.notifyLayout());
+		expect(Object.values(geometryReads).every((count) => count === 0)).toBe(true);
+	});
+	test("final follow survives an unknown viewport height and reads the later commit", async () => {
+		await render({ lines: 50, layout: { width: 400, height: 0 } });
+		const node = viewport();
+		expect(node.scrollTop).toBe(0);
+		expect(writes).toHaveLength(0);
+		await render({ lines: 60, live: false, layout: { width: 400, height: 0 } });
+		expect(writes).toHaveLength(0);
+		await render({ lines: 70, live: false, layout: { width: 400, height: 200 } });
+		await settle();
+		expect(viewport()).toBe(node);
+		expect(node.scrollTop).toBe(1200);
+		await render({ lines: 80, live: false, layout: { width: 400, height: 200 } });
+		expect(node.scrollTop).toBe(1200);
+	});
+	test("StrictMode live replay releases listeners, observers, subscriptions and frames", async () => {
+		let reader: ContentViewport | undefined;
+		await render({
+			strict: true,
+			lines: 50,
+			onViewport: (value) => {
+				reader = value;
+			},
+		});
+		expect(viewport().scrollTop).toBe(800);
+		expect(observers.filter((observer) => observer.active)).toHaveLength(1);
+		const node = viewport();
+		const snapshots: number[] = [];
+		const unsubscribe = reader?.subscribeViewport((snapshot) => snapshots.push(snapshot.scrollTop));
+		await render({ strict: true, lines: 60 });
+		expect(frames.size).toBeGreaterThan(0);
+		await act(async () => root.render(null));
+		const count = snapshots.length;
+		expect(frames.size).toBe(0);
+		expect(observers.every((observer) => !observer.active)).toBe(true);
+		await event("scroll", {}, node);
+		await event("wheel", { deltaY: -100 }, node);
+		await act(async () => reader?.notifyLayout());
+		expect(frames.size).toBe(0);
+		expect(snapshots).toHaveLength(count);
+		unsubscribe?.();
 	});
 	test("growth has intermediate frames and lands exactly", async () => {
 		await render({ lines: 30 });
@@ -419,6 +673,33 @@ describe("reader intent wins over programmatic scrolling", () => {
 		await settle();
 		expect(viewport().scrollTop).toBe(150);
 	});
+	test("a clamped programmatic write records its actual top before an upward echo", async () => {
+		let reader: ContentViewport | undefined;
+		let progress = 0;
+		await render({
+			lines: 50,
+			onViewport: (value) => {
+				reader = value;
+			},
+			onReaderProgress: () => {
+				progress++;
+			},
+		});
+		await event("scroll"); // Consume the initial follow echo.
+		const node = viewport();
+		Object.defineProperty(node, "scrollTop", {
+			configurable: true,
+			get: () => positions.get(node) ?? 0,
+			set: (value: number) => {
+				positions.set(node, Math.min(value, 120));
+			},
+		});
+		await act(async () => reader?.scrollTo(500));
+		expect(node.scrollTop).toBe(120);
+		await event("scroll"); // Layout is unchanged and the actual top moved upwards.
+		expect(reader?.isFollowing()).toBe(true);
+		expect(progress).toBe(0);
+	});
 	test("programmatic scroll echoes never request historical content", async () => {
 		let reads = 0;
 		const onReaderProgress = () => {
@@ -464,6 +745,41 @@ describe("changed-row targets are not the whole diff bottom", () => {
 		await settle();
 		expect(viewport().scrollTop).toBe(0);
 		expect(writes).toHaveLength(0);
+	});
+	test("a settled pending resume waits for its own row instead of following the tail", async () => {
+		reduced = true;
+		let reader: ContentViewport | undefined;
+		const onViewport = (value: ContentViewport) => {
+			reader = value;
+		};
+		await render({ lines: 100, target: { top: 240, bottom: 260 }, onViewport });
+		await act(async () => {
+			reader?.pauseFollowing();
+			reader?.scrollTo(0);
+		});
+		await render({ lines: 100, live: false, target: null, onViewport });
+		const button = resumeButton();
+		if (!button) throw new Error("Resume control is missing");
+		const before = writes.length;
+		await event("click", {}, button);
+		expect(writes).toHaveLength(before);
+		expect(viewport().scrollTop).toBe(0);
+		await render({ lines: 100, live: false, target: { top: 900, bottom: 920 }, onViewport });
+		await settle();
+		expect(viewport().scrollTop).toBe(736);
+		expect(reader?.isFollowing()).toBe(true);
+	});
+	test("the final follow waits for a missing row, then ignores later settled targets", async () => {
+		reduced = true;
+		await render({ lines: 100, target: { top: 240, bottom: 260 } });
+		await render({ lines: 100, live: false, target: null });
+		expect(viewport().scrollTop).toBe(76);
+		await render({ lines: 100, live: false, target: { top: 900, bottom: 920 } });
+		await settle();
+		expect(viewport().scrollTop).toBe(736);
+		await render({ lines: 120, live: false, target: { top: 1700, bottom: 1720 } });
+		await settle();
+		expect(viewport().scrollTop).toBe(736);
 	});
 	test("a changed row above the viewport approaches upwards smoothly", async () => {
 		await render({ lines: 100, target: { top: 700, bottom: 720 } });

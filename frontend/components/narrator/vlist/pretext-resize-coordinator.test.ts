@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
 import { restorePretextLayoutAnchor } from "@shared/pretext-layout";
 import type { NarratorMsg } from "../narrator-panel-types";
+import type { MeasuredCollapsibleTrace } from "./measure/measure-tool-run";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { buildPretextDocumentLayout } from "./pretext-document-layout";
 import type { PretextDocumentFetchPage } from "./pretext-document-loader";
@@ -13,6 +14,9 @@ import {
 	type PretextLayoutCoordinatorSnapshot,
 } from "./pretext-layout-coordinator";
 import { projectStreamingDocument } from "./streaming-handoff";
+import { buildExactListLayout } from "./vlist-exact-layout";
+import { buildLodSnapshots } from "./vlist-lod-morph";
+import { buildLodMorphGeometry, createLodMorphGeometryCache } from "./vlist-lod-morph-geometry";
 import { indexWithHeightOverrides } from "./vlist-resize-preview";
 
 let disposeCanvas: () => void;
@@ -218,13 +222,59 @@ describe("coordinator width previews with the real paginated document API", () =
 		unsubscribe();
 	});
 
-	it("emits a new resize revision at a different width even when all affected heights stay equal", async () => {
-		const { coordinator } = await loaded(pageAPI(100, "short"));
+	it("invalidates LOD geometry on real same-height width previews without rewriting old frames", async () => {
+		const { coordinator, api } = await loaded(pageAPI(100, "short"));
 		const initial = ready(coordinator);
+		const layout = buildExactListLayout(initial.index);
+		if (!layout) throw new Error("missing exact layout");
+		const cache = createLodMorphGeometryCache();
+		const initialInput = {
+			narratorId: api.narratorId,
+			items: initial.items,
+			index: initial.index,
+			layout,
+		};
+		const initialGeometry = cache.get(initialInput);
+		const savedGeometry = structuredClone(initialGeometry);
+		const savedLayout = layoutGeometry(initial);
 		coordinator.previewWidth(700, topView);
 		const first = ready(coordinator);
+		const firstInput = { ...initialInput, items: first.items, index: first.index };
+		const firstGeometry = cache.get(firstInput);
+		expect(first.items).not.toBe(initial.items);
+		expect(firstGeometry).not.toBe(initialGeometry);
+		expect(firstGeometry.elements).not.toBe(initialGeometry.elements);
+		expect(firstGeometry).toEqual(buildLodMorphGeometry(firstInput));
+		const savedFirstGeometry = structuredClone(firstGeometry);
+		const savedFirstLayout = layoutGeometry(first);
 		coordinator.previewWidth(600, topView);
 		const second = ready(coordinator);
+		const secondInput = { ...firstInput, items: second.items, index: second.index };
+		const secondGeometry = cache.get(secondInput);
+		expect(second.items).not.toBe(first.items);
+		expect(secondGeometry).not.toBe(firstGeometry);
+		expect(secondGeometry.unifiedElements).not.toBe(firstGeometry.unifiedElements);
+		expect(secondGeometry).toEqual(buildLodMorphGeometry(secondInput));
+		expect(secondGeometry).toEqual(firstGeometry); // Equal heights still publish fresh measurements.
+		expect(initialGeometry).toEqual(savedGeometry);
+		expect(firstGeometry).toEqual(savedFirstGeometry);
+		expect(layoutGeometry(initial)).toEqual(savedLayout);
+		expect(layoutGeometry(first)).toEqual(savedFirstLayout);
+		for (const [position, item] of second.items.entries()) {
+			expect(second.index.itemByKey(item.spec.key)?.index).toBe(position);
+			expect(secondGeometry.elements[position]?.top).toBe(layout.items[position]?.top);
+			expect(secondGeometry.elements[position]?.height).toBeCloseTo(item.measured.height);
+		}
+		// Scroll/admission changes consume the same producer snapshot, not a new geometry source.
+		const atHead = buildLodSnapshots(secondGeometry.elements, 0, 260);
+		const scrolledGeometry = cache.get({ ...secondInput });
+		const afterScroll = buildLodSnapshots(scrolledGeometry.elements, 20, 260);
+		const firstKey = second.items[0]?.spec.unitId || second.items[0]?.spec.key;
+		if (!firstKey) throw new Error("missing first morph identity");
+		expect(scrolledGeometry).toBe(secondGeometry);
+		expect(afterScroll.get(firstKey)?.viewportTop).toBe(
+			(atHead.get(firstKey)?.viewportTop ?? 0) - 20,
+		);
 		expect(first.index).toBe(initial.index);
 		expect(second.index).toBe(first.index);
 		expect(second.resizeRevision).toBeGreaterThan(first.resizeRevision ?? 0);
@@ -236,6 +286,100 @@ describe("coordinator width previews with the real paginated document API", () =
 		const settledPreview = coordinator.getSnapshot();
 		expect(coordinator.previewWidth(600, topView)).toBe(false);
 		expect(coordinator.getSnapshot()).toBe(settledPreview);
+	});
+
+	it("refreshes nested LOD2 row geometry after same-height semantic publication with real tool input", async () => {
+		const api = pageAPI(3, "separator");
+		const tools = (seq: number, ids: string[]): TreeMessage => ({
+			...message(api.narratorId, seq, ""),
+			contentText: null,
+			contentJson: ids.map((id) => ({
+				type: "tool_use",
+				id,
+				name: "Bash",
+				input: { command: `pwd # ${id}` },
+				status: "completed",
+			})),
+			toolCalls: ids.map((id) => ({
+				toolUseId: id,
+				toolName: "Bash",
+				inputJson: { command: `pwd # ${id}` },
+				outputJson: null,
+				status: "success",
+			})),
+		});
+		api.messages[0] = tools(0, ["tool-a", "tool-b"]);
+		api.messages[2] = tools(2, ["tool-c", "tool-d"]);
+		const build = { ...BUILD, lod: 2 as const };
+		const { coordinator } = await loaded(api, build);
+		const initial = ready(coordinator);
+		const traces = initial.items.filter((item) => item.spec.kind === "activity-trace");
+		expect(traces).toHaveLength(2);
+		expect(traces.map((item) => (item.measured as MeasuredCollapsibleTrace).rows.length)).toEqual([
+			2, 2,
+		]);
+		const layout = buildExactListLayout(initial.index);
+		if (!layout) throw new Error("missing exact layout");
+		const cache = createLodMorphGeometryCache();
+		const input = {
+			narratorId: api.narratorId,
+			items: initial.items,
+			index: initial.index,
+			layout,
+		};
+		const oldGeometry = cache.get(input);
+		const savedGeometry = structuredClone(oldGeometry);
+		const savedLayout = layoutGeometry(initial);
+		expect(oldGeometry.elements.filter((element) => element.nested)).toHaveLength(4);
+		expect(coordinator.upsertMessage(tools(0, ["tool-b", "tool-a"]), false, topView)).toBe(true);
+		const published = ready(coordinator);
+		expectFullBuild(published, build);
+		expect(published.items).not.toBe(initial.items);
+		expect(published.index).not.toBe(initial.index);
+		expect(published.items.map((item) => item.measured.height)).toEqual(
+			initial.items.map((item) => item.measured.height),
+		);
+		expect(published.index.itemStarts).toEqual(initial.index.itemStarts);
+		const publishedInput = { ...input, items: published.items, index: published.index };
+		const fresh = cache.get(publishedInput);
+		expect(fresh).not.toBe(oldGeometry);
+		expect(fresh).toEqual(buildLodMorphGeometry(publishedInput));
+		// Swapping real tool rows changes their source positions, not the trace's outer height.
+		expect(
+			fresh.elements.filter((element) => element.nested).map((element) => element.unitId),
+		).toEqual(["tool-tool-b", "tool-tool-a", "tool-tool-c", "tool-tool-d"]);
+		const oldA = oldGeometry.elements.find((element) => element.unitId === "tool-tool-a");
+		const freshA = fresh.elements.find((element) => element.unitId === "tool-tool-a");
+		if (!oldA || !freshA) throw new Error("missing tool row morph geometry");
+		expect(freshA.top).toBeGreaterThan(oldA.top);
+		for (const item of published.items.filter((item) => item.spec.kind === "activity-trace")) {
+			const binding = published.index.itemByKey(item.spec.key);
+			if (!binding) throw new Error("missing trace key binding");
+			expect(published.items[binding.index]).toBe(item);
+			const box = layout.items[binding.index];
+			if (!box) throw new Error("missing bound trace box");
+			for (const row of (item.measured as MeasuredCollapsibleTrace).rows) {
+				const nested = fresh.elements.find(
+					(element) => element.nested && element.unitId === row.unitId,
+				);
+				expect(nested).toMatchObject({
+					top: box.top + row.top,
+					height: row.rowHeight,
+					clip: { top: box.top, bottom: box.bottom },
+					groupBox: { top: box.top, height: box.height },
+				});
+				expect(
+					fresh.unifiedElements.find((element) => element.nested && element.unitId === row.unitId),
+				).toMatchObject({
+					top: box.top + row.top,
+					height: row.rowHeight,
+					unitBox: { top: box.top, height: box.height },
+				});
+			}
+		}
+		expect(cache.get({ ...publishedInput })).toBe(fresh);
+		expect(oldGeometry).toEqual(savedGeometry);
+		expect(layoutGeometry(initial)).toEqual(savedLayout);
 	});
 
 	it("publishes an unmeasured display target without replaying a stale scroll correction", async () => {

@@ -1,7 +1,7 @@
 /**
  * Regression: global width/height writes used to re-render every mounted row on
  * every drag frame. Drive the production scheduler, not a copy of its state machine.
- * Local bounded-window previews are allowed; only initial/commit publish global state.
+ * Frozen production policy must not reflow even its mounted window during a drag.
  */
 import { describe, expect, it } from "bun:test";
 import { createVListResizeController, type VListResizeSize } from "./vlist-live-resize";
@@ -9,6 +9,7 @@ import { createVListResizeController, type VListResizeSize } from "./vlist-live-
 function createCallbackHarness() {
 	let size: VListResizeSize = { width: 700, boxWidth: 732, height: 700 };
 	let committedWidth = 0;
+	let pointerDown = true;
 	let nextFrame = 0;
 	let timer: (() => void) | null = null;
 	const frames = new Map<number, () => void>();
@@ -23,7 +24,8 @@ function createCallbackHarness() {
 	const controller = createVListResizeController({
 		readSize: () => ({ ...size }),
 		getCommittedWidth: () => committedWidth,
-		pointerDown: () => true,
+		previewPolicy: "freeze",
+		pointerDown: () => pointerDown,
 		onInitial: publish,
 		onPreview: (value) => {
 			previewHeights.push(value.height);
@@ -54,6 +56,10 @@ function createCallbackHarness() {
 		widthWrites,
 		heightWrites,
 		previewHeights,
+		release: () => {
+			pointerDown = false;
+			controller.release();
+		},
 		get committedWidth() {
 			return committedWidth;
 		},
@@ -75,8 +81,8 @@ function createCallbackHarness() {
 	};
 }
 
-describe("production resize controller: bounded previews, no full-layout state writes", () => {
-	it("does not publish either global width or height during a drag, even while previewing", () => {
+describe("production resize controller: frozen wrapping, live outer viewport", () => {
+	it("does not publish width, layout height or bounded previews during a drag", () => {
 		const h = createCallbackHarness();
 		for (let i = 1; i <= 80; i++) {
 			h.observe(700 - i, 700 + i);
@@ -85,9 +91,10 @@ describe("production resize controller: bounded previews, no full-layout state w
 		}
 		expect(h.widthWrites).toEqual([]);
 		expect(h.heightWrites).toEqual([]);
-		expect(h.previewHeights).toHaveLength(80);
-		expect(h.previewHeights.at(-1)).toBe(780);
-		h.controller.release();
+		expect(h.previewHeights).toEqual([]);
+		h.release();
+		expect(h.widthWrites).toEqual([]);
+		h.frame();
 		expect(h.widthWrites).toEqual([620]);
 		expect(h.heightWrites).toEqual([780]);
 		h.controller.dispose();

@@ -25,6 +25,7 @@ import { installCanvasStub } from "./measure/test-canvas-stub";
 import { buildPretextDocumentLayout } from "./pretext-document-layout";
 import { sliceBracketedRegion } from "./source-slice";
 import { createVListInteractionState, toggleVListLodUserOverride } from "./vlist-interaction-state";
+import { createLodMorphFrameBaseline } from "./vlist-lod-morph-frame";
 
 const DIR = import.meta.dir;
 
@@ -541,7 +542,7 @@ describe("fold transition: play happens before paint", () => {
 		for (const marker of [
 			"const capture = foldCaptureRef.current;", // fold
 			"buildDrillSnapshots(", // drill morph
-			"buildLodSnapshots(", // LOD morph
+			"commitLodMorph(", // LOD planner entry
 			"buildLifecycleSnapshot(", // lifecycle transition
 		]) {
 			const at = SHELL.indexOf(marker);
@@ -571,7 +572,7 @@ describe("lifecycle transition: wiring", () => {
 		for (const marker of [
 			"const capture = foldCaptureRef.current;",
 			"buildDrillSnapshots(",
-			"buildLodSnapshots(",
+			"commitLodMorph(",
 		]) {
 			expect(SHELL.indexOf(marker)).toBeLessThan(lifecycle);
 		}
@@ -800,15 +801,32 @@ describe("fold vs LOD morph: the toggle path cannot move the effective LOD", () 
 		expect(after.manifest.items).not.toEqual(before.manifest.items);
 	});
 
-	it("gates the LOD morph on a level MOVE, so a fold-only rebuild plays nothing", () => {
-		// The other half of the exclusion, asserted at the shell: were this gate ever
-		// relaxed to "any rebuild", the override toggle above would satisfy it and both
-		// controllers would write `transform` on the same node in one commit.
-		const start = SHELL.indexOf("const isLodSwitch =");
-		expect(start, "the LOD-switch gate is missing").toBeGreaterThan(0);
-		const body = SHELL.slice(start, SHELL.indexOf(";", start));
-		expect(body).toContain("lodMorphDocRevRef.current === docRev");
-		expect(body).toContain("lodMorphLodRef.current !== lod");
+	it("gates the LOD morph on a level MOVE, so a real fold-only rebuild plays nothing", () => {
+		const baseline = createLodMorphFrameBaseline();
+		const before = buildWithOverrides(new Set());
+		const after = buildWithOverrides(new Set(["tool-tu-m0"]));
+		const frame = {
+			narratorId: "fold-owner",
+			geometry: { elements: [], unifiedElements: [] },
+			documentRevision: 1,
+			scrollTop: 0,
+			viewportHeight: 600,
+			lod: before.manifest.lod,
+		};
+		baseline.commit(frame);
+		expect(baseline.commit({ ...frame, lod: after.manifest.lod, scrollTop: 100 })).toBeNull();
+		// Pin shell input forwarding; direct commit tests also verify zero fold-only planner calls.
+		const call = sliceBracketedRegion(SHELL, "commitLodMorph(");
+		expect(call).toContain("lod: pretextDocument.manifest?.lod ?? -1");
+		expect(call).toContain("documentRevision: foldRevisionOf(foldDocumentRevision)");
+		const source = shellModule("vlist-lod-morph-commit.ts");
+		const commit = sliceBracketedRegion(source, "state.frames.current.commit({");
+		expect(commit).toContain("lod: source.lod");
+		expect(commit).toContain("documentRevision: source.documentRevision");
+		const gateAt = source.indexOf("if (!frames || playback.prefersReducedMotion())");
+		expect(gateAt).toBeGreaterThan(source.indexOf("state.frames.current.commit("));
+		for (const planner of ["planner.admit(", "planner.buildSnapshots("])
+			expect(source.indexOf(planner)).toBeGreaterThan(gateAt);
 	});
 
 	it("states the exclusion at the toggle branch that looks like a level change", () => {
