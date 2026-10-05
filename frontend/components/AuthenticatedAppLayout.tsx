@@ -104,6 +104,7 @@ import { useNavBadges } from "./nav/use-nav-badges";
 import { NotificationBell } from "./notifications/NotificationBell";
 import { PluginPermissionRequestHost } from "./plugins-admin/PluginPermissionRequestHost";
 import { StartupRecoveryAlert } from "./StartupRecoveryAlert";
+import { SystemMaintenanceBadge } from "./SystemMaintenanceBadge";
 import { BrokenModelMigrationHost } from "./settings/BrokenModelMigrationHost";
 import { ProviderBaseUrlFixHost } from "./settings/ProviderBaseUrlFixHost";
 import { SummaryModelPickerHost } from "./settings/SummaryModelPickerHost";
@@ -505,6 +506,7 @@ export function AuthenticatedLayout() {
 							/>
 						</Tooltip>
 
+						<SystemMaintenanceBadge />
 						<UpdateBadge />
 						{requestDumpEnabled && (
 							<Tooltip

@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { ApiError, api } from "../../lib/api";
+import { systemLifecycleNoticeQueryKey } from "../../lib/api/system-lifecycle";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 
 const queryKey = ["system-lifecycle"];
@@ -55,6 +56,11 @@ function AdminSystemShutdownCard() {
 			// A status request started during the action must not overwrite its result.
 			await queryClient.cancelQueries({ queryKey });
 			queryClient.setQueryData(queryKey, result.status);
+			await queryClient.cancelQueries({ queryKey: systemLifecycleNoticeQueryKey });
+			queryClient.setQueryData(systemLifecycleNoticeQueryKey, {
+				phase: result.status.phase,
+				shutdownRequested: result.status.shutdownRequested,
+			});
 		},
 		retry: false,
 	});
