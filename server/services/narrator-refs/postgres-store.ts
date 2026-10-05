@@ -258,6 +258,8 @@ export async function persistPgMessageWithRef(
 		seq,
 		message: {
 			...created,
+			// PostgreSQL has not enabled character caching yet; legacy rows remain unknown.
+			contextCharsJson: null,
 			costStatus: created.costStatus as "complete" | "partial" | "unknown" | null,
 			costMissingFields: Array.isArray(created.costMissingFields)
 				? created.costMissingFields.filter((field): field is string => typeof field === "string")

@@ -1,5 +1,13 @@
 import type { GitCommitDetail, GitCommitPatch } from "@shared/git-commit-preview";
 import type { GitWorkspace } from "@shared/git-workspace";
+import type {
+	WorktreeCreateRequest,
+	WorktreeCreateResult,
+	WorktreeListResult,
+	WorktreePrepareRequest,
+	WorktreePrepareResult,
+	WorktreeReconcileRequest,
+} from "@shared/narrator-worktrees";
 import { request } from "./client";
 import type { ApiEntity } from "./types";
 
@@ -69,6 +77,27 @@ function gitRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 // Reads are cancellable by React Query; writes are never retried automatically.
 export const gitApi = {
+	listNarratorWorktrees: (id: string, workspaceKey: string, signal?: AbortSignal) =>
+		gitRequest<WorktreeListResult>(
+			`/narrators/${encodeURIComponent(id)}/git/worktrees?workspaceKey=${encodeURIComponent(workspaceKey)}`,
+			{ signal },
+		),
+	prepareNarratorWorktree: (id: string, input: WorktreePrepareRequest) =>
+		gitRequest<WorktreePrepareResult>(
+			`/narrators/${encodeURIComponent(id)}/git/worktrees/prepare`,
+			{ method: "POST", body: JSON.stringify(input) },
+		),
+	createNarratorWorktree: (id: string, input: WorktreeCreateRequest) =>
+		gitRequest<WorktreeCreateResult>(`/narrators/${encodeURIComponent(id)}/git/worktrees`, {
+			method: "POST",
+			body: JSON.stringify(input),
+		}),
+	/** Read-only receipt verification: POST is a bounded query, not another creation. */
+	reconcileNarratorWorktree: (id: string, input: WorktreeReconcileRequest) =>
+		gitRequest<WorktreeCreateResult>(
+			`/narrators/${encodeURIComponent(id)}/git/worktrees/reconcile`,
+			{ method: "POST", body: JSON.stringify(input) },
+		),
 	getGitWorkspace: (narratorId: string, signal?: AbortSignal) =>
 		gitRequest<GitWorkspace>(`/narrators/${encodeURIComponent(narratorId)}/git/workspace`, {
 			signal,

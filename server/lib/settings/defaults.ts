@@ -90,6 +90,7 @@ export const DEFAULTS: NarraForkSettings = {
 		planReflectionAutoApprove: false,
 		planReflectionAllowAutoCompact: false,
 		questionReflectionEnabled: false,
+		permissionRuleAutoApprove: false,
 		questionReflectionTimeoutMs: 300_000,
 		dangerReflectionLevel: "standard",
 		dangerReflectionEnabled: true,
@@ -602,6 +603,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"agent.questionReflectionEnabled": {
 		desc: "启用后，AskUserQuestion 在全部允许模式下等待超时仍未回答时，会自动运行 question reflection 并提交答案。",
+		type: "boolean",
+	},
+	"agent.permissionRuleAutoApprove": {
+		desc: "仅人类管理员可开启。全部允许模式的单条叙述者权限规则申请仍须绑定当前工具执行并完成严格危险反思；不受普通反思关闭或宽松档影响。应用授权防护，并非操作系统沙箱。默认关闭。",
 		type: "boolean",
 	},
 	"agent.questionReflectionTimeoutMs": {

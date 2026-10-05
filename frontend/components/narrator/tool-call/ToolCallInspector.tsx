@@ -19,6 +19,10 @@ import { useToolCallDetail } from "../../../hooks/useNarrator";
 import type { ExecutionTargetIdentity } from "../../../lib/api/types";
 import { formatDurationText, formatFullLocaleDateTime } from "../../../lib/format";
 import { ContentViewer } from "../content/ContentViewer";
+import {
+	PermissionRuleReceiptDetails,
+	readPermissionRuleReceipt,
+} from "../permission/PermissionRuleResultNotice";
 
 const MAX_JSON_PREVIEW_CHARS = 80_000;
 
@@ -28,6 +32,8 @@ interface ToolCallLike {
 	messageId?: string;
 	executionAttempt?: number;
 	toolName?: string;
+	/** Persisted owner; shared fork history must not relabel a rule as belonging to its viewer. */
+	narratorId?: string;
 	toolUseId?: string;
 	status?: string;
 	durationMs?: number | null;
@@ -408,6 +414,10 @@ export function ToolCallInspector({
 			...data,
 		};
 	}, [data, initialToolCall]);
+	const ruleReceipt =
+		toolCall?.toolName === "RequestPermissionRule"
+			? readPermissionRuleReceipt(toolCall.outputJson)
+			: null;
 	const executionTarget = useMemo<ExecutionTargetIdentity | null>(() => {
 		if (!toolCall) return null;
 		const canonical = toolCall.executionTarget ?? toolCall.executionTargets?.[0];
@@ -553,6 +563,12 @@ export function ToolCallInspector({
 					</Stack>
 				)}
 
+				{ruleReceipt && (
+					<PermissionRuleReceiptDetails
+						receipt={ruleReceipt}
+						narratorId={toolCall?.narratorId ?? narratorId}
+					/>
+				)}
 				<JsonSection title={t("toolCallInspector.input")} value={toolCall?.inputJson} />
 				<JsonSection title={t("toolCallInspector.output")} value={toolCall?.outputJson} />
 

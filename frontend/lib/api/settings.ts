@@ -287,6 +287,7 @@ export const settingsApi = {
 		request<{
 			autoLoadOlderMessages: boolean;
 			fastModeDefault: boolean;
+			treatAsLocalAccess: boolean;
 			language: Locale;
 			wordWrapMarkdown: boolean;
 			wordWrapCode: boolean;
@@ -349,6 +350,7 @@ export const settingsApi = {
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
 		fastModeDefault?: boolean;
+		treatAsLocalAccess?: boolean;
 		language?: Locale;
 		wordWrapMarkdown?: boolean;
 		wordWrapCode?: boolean;

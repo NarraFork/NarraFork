@@ -1,173 +1,157 @@
-import { readFileSync } from "node:fs";
-import { basename, extname } from "node:path";
+import { basename } from "node:path";
 import { Hono } from "hono";
-import sanitizeHtml from "sanitize-html";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import {
+	classifySharePreview,
+	isShareText,
+	SHARE_CONTENT_TIMEOUT_MS,
+	SHARE_HTML_CSP,
+	SHARE_HTML_MAX_BYTES,
+	SHARE_TEXT_MAX_BYTES,
+} from "../../shared/share-preview";
+import { AppError, NotFoundError, ValidationError } from "../lib/errors";
+import { logger } from "../lib/logger";
+import { decodeUtf8Prefix } from "../lib/read-file-capped";
+import { renderShareHtml } from "../lib/share-preview-html";
 import { getShare } from "../lib/shares";
 
 export const shareRoutes = new Hono();
-
-// ── MIME type mapping for preview ────────────────────────────────────────────
-
-const PREVIEW_MIME: Record<string, string> = {
-	".jpg": "image/jpeg",
-	".jpeg": "image/jpeg",
-	".png": "image/png",
-	".gif": "image/gif",
-	".webp": "image/webp",
-	".svg": "image/svg+xml",
-	".avif": "image/avif",
-	".bmp": "image/bmp",
-	".ico": "image/x-icon",
-	".mp4": "video/mp4",
-	".webm": "video/webm",
-	".mov": "video/quicktime",
-	".ogg": "video/ogg",
-	".pdf": "application/pdf",
-	".html": "text/html",
-	".htm": "text/html",
+const PREVIEW_HEADERS = {
+	"Cache-Control": "no-store",
+	"X-Content-Type-Options": "nosniff",
+	// Also protects direct navigation to SVG/HTML, not just iframe embedding.
+	"Content-Security-Policy": `sandbox; ${SHARE_HTML_CSP}`,
 };
 
-function getPreviewMime(filename: string): string | null {
-	const ext = extname(filename).toLowerCase();
-	return PREVIEW_MIME[ext] ?? null;
-}
-
-// ── Download endpoint ────────────────────────────────────────────────────────
-
-shareRoutes.get("/:shareId", async (c) => {
-	const { shareId } = c.req.param();
+async function shareFile(shareId: string) {
 	const record = getShare(shareId);
 	if (!record) throw new NotFoundError("Share", shareId);
-
 	const file = Bun.file(record.storagePath);
-	if (!(await file.exists())) {
-		throw new NotFoundError("Share file", shareId);
+	if (!(await file.exists())) throw new NotFoundError("Share file", shareId);
+	return { record, file };
+}
+
+/** A source-bounded read: never collect a whole text file and then truncate it. */
+async function textPrefix(file: ReturnType<typeof Bun.file>, limit: number, signal: AbortSignal) {
+	const started = performance.now();
+	const reader = file
+		.slice(0, limit + 1)
+		.stream()
+		.getReader();
+	const controller = AbortSignal.any([signal, AbortSignal.timeout(SHARE_CONTENT_TIMEOUT_MS)]);
+	const bytes = new Uint8Array(limit + 1);
+	let length = 0;
+	const abort = () => {
+		void reader.cancel().catch(() => {});
+	};
+	controller.addEventListener("abort", abort, { once: true });
+	try {
+		controller.throwIfAborted();
+		while (length < bytes.length) {
+			const { done, value } = await reader.read();
+			controller.throwIfAborted();
+			if (done) break;
+			const chunk = value.subarray(0, bytes.length - length);
+			bytes.set(chunk, length);
+			length += chunk.length;
+		}
+		return {
+			bytes: bytes.subarray(0, Math.min(length, limit)),
+			truncated: length > limit || file.size > limit,
+		};
+	} catch (error) {
+		if (controller.aborted)
+			throw new AppError(
+				"Text preview cancelled or timed out",
+				signal.aborted ? 499 : 504,
+				"SHARE_PREVIEW_TIMEOUT",
+			);
+		throw error;
+	} finally {
+		controller.removeEventListener("abort", abort);
+		await reader.cancel().catch(() => {});
+		const elapsedMs = performance.now() - started;
+		if (elapsedMs > 250) logger.warn("Slow share text preview", { elapsedMs, byteLimit: limit });
 	}
+}
 
-	const filename = record.originalName;
-	const base = basename(filename);
-	// RFC 5987 encoding for non-ASCII filenames
+shareRoutes.get("/:shareId", async (c) => {
+	const { record, file } = await shareFile(c.req.param("shareId"));
+	const base = basename(record.originalName);
 	const encodedFilename = encodeURIComponent(base).replace(/%20/g, "+");
-	// ASCII-safe fallback: replace non-ASCII chars with underscores
-	const asciiFallback = base.replace(/[^\x20-\x7E]/g, "_");
-
-	// Use BunFile directly as Response body — Bun natively handles it with
-	// correct Content-Length, enabling browsers to show download progress.
-	// (ReadableStream from file.stream() triggers chunked transfer encoding,
-	// which strips Content-Length and breaks progress reporting.)
+	const asciiFallback = base.replace(/[^\x20-\x7E]/g, "_").replace(/["\\]/g, "_");
 	return new Response(file, {
 		headers: {
 			"Content-Type": file.type || "application/octet-stream",
+			"Content-Length": String(file.size),
 			"Content-Disposition": `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodedFilename}`,
-			"Cache-Control": "no-cache",
+			"Cache-Control": "no-store",
+			"X-Content-Type-Options": "nosniff",
 		},
 	});
 });
 
-// ── Preview endpoint ─────────────────────────────────────────────────────────
+// Small preflight lets players/iframes distinguish missing shares from decoder failures.
+shareRoutes.get("/:shareId/preview-info", async (c) => {
+	const { record, file } = await shareFile(c.req.param("shareId"));
+	let preview = classifySharePreview(record.originalName);
+	if (preview.kind === "text") {
+		const prefix = await textPrefix(file, 4096, c.req.raw.signal);
+		if (!isShareText(prefix.bytes, !prefix.truncated))
+			preview = { kind: "unsupported", mime: "application/octet-stream" };
+	}
+	if (preview.kind === "unsupported")
+		throw new ValidationError("Preview not supported for this file type");
+	if (preview.kind === "html" && file.size > SHARE_HTML_MAX_BYTES)
+		throw new AppError(
+			"HTML preview exceeds 1 MiB; please download",
+			413,
+			"SHARE_PREVIEW_TOO_LARGE",
+		);
+	return c.json({ ...preview, size: file.size, expiresAt: record.expiresAt.toISOString() }, 200, {
+		"Cache-Control": "no-store",
+	});
+});
 
 shareRoutes.get("/:shareId/preview", async (c) => {
-	const { shareId } = c.req.param();
-	const record = getShare(shareId);
-	if (!record) throw new NotFoundError("Share", shareId);
-
-	const file = Bun.file(record.storagePath);
-	if (!(await file.exists())) {
-		throw new NotFoundError("Share file", shareId);
-	}
-
-	const mime = getPreviewMime(record.originalName);
-	if (!mime) {
-		// The share and its file both exist; only inline preview is unavailable for this
-		// type. A 400 also stops the client from retrying as if the share had expired.
-		// (As a NotFoundError `entity` this sentence went into "{entity} not found: {id}",
-		// which reads as nonsense in any language once that template is translated.)
+	const { record, file } = await shareFile(c.req.param("shareId"));
+	const preview = classifySharePreview(record.originalName);
+	if (preview.kind === "unsupported")
 		throw new ValidationError("Preview not supported for this file type");
+	if (preview.kind === "html") {
+		if (file.size > SHARE_HTML_MAX_BYTES)
+			throw new AppError(
+				"HTML preview exceeds 1 MiB; please download",
+				413,
+				"SHARE_PREVIEW_TOO_LARGE",
+			);
+		const html = await renderShareHtml(record.storagePath, c.req.raw.signal);
+		return new Response(html, { headers: { ...PREVIEW_HEADERS, "Content-Type": preview.mime } });
 	}
-
-	const contentType = mime;
-	const isHtml = contentType === "text/html";
-
-	if (isHtml) {
-		// Sanitize HTML before serving
-		const raw = readFileSync(record.storagePath, "utf-8");
-		const clean = sanitizeHtml(raw, {
-			allowedTags: sanitizeHtml.defaults.allowedTags.concat([
-				"img",
-				"video",
-				"audio",
-				"source",
-				"figure",
-				"figcaption",
-				"picture",
-				"details",
-				"summary",
-				"mark",
-				"time",
-				"main",
-				"nav",
-				"header",
-				"footer",
-				"section",
-				"article",
-				"aside",
-			]),
-			allowedAttributes: {
-				...sanitizeHtml.defaults.allowedAttributes,
-				img: ["src", "alt", "width", "height", "loading"],
-				video: ["src", "controls", "width", "height", "poster", "preload"],
-				audio: ["src", "controls", "preload"],
-				source: ["src", "type"],
-				a: ["href", "title", "target", "rel"],
-				"*": ["class", "id", "style"],
-			},
-			allowedSchemes: ["http", "https", "data"],
-			allowedStyles: {
-				"*": {
-					color: [/^#[0-9a-fA-F]{3,8}$/, /^rgb/, /^hsl/, /^[a-z]+$/],
-					"background-color": [/^#[0-9a-fA-F]{3,8}$/, /^rgb/, /^hsl/, /^[a-z]+$/],
-					"font-size": [/^\d+(\.\d+)?(px|em|rem|%)$/],
-					"font-weight": [/^\d{3}$/, /^(normal|bold|bolder|lighter)$/],
-					"text-align": [/^(left|right|center|justify)$/],
-					"text-decoration": [/^(none|underline|line-through|overline)$/],
-					margin: [/^-?\d+(\.\d+)?(px|em|rem|%)(\s+-?\d+(\.\d+)?(px|em|rem|%)){0,3}$/],
-					"margin-top": [/^-?\d+(\.\d+)?(px|em|rem|%)$/],
-					"margin-bottom": [/^-?\d+(\.\d+)?(px|em|rem|%)$/],
-					"margin-left": [/^-?\d+(\.\d+)?(px|em|rem|%)$/],
-					"margin-right": [/^-?\d+(\.\d+)?(px|em|rem|%)$/],
-					padding: [/^\d+(\.\d+)?(px|em|rem|%)(\s+\d+(\.\d+)?(px|em|rem|%)){0,3}$/],
-					"padding-top": [/^\d+(\.\d+)?(px|em|rem|%)$/],
-					"padding-bottom": [/^\d+(\.\d+)?(px|em|rem|%)$/],
-					"padding-left": [/^\d+(\.\d+)?(px|em|rem|%)$/],
-					"padding-right": [/^\d+(\.\d+)?(px|em|rem|%)$/],
-					border: [/^\d+(\.\d+)?px\s+(solid|dashed|dotted|double|none)/],
-					"border-radius": [/^\d+(\.\d+)?(px|em|rem|%)$/],
-					// display: intentionally omitted — prevents layout attacks (e.g. contents, fixed)
-					"max-width": [/^\d+(\.\d+)?(px|em|rem|%|vw)$/],
-					"max-height": [/^\d+(\.\d+)?(px|em|rem|%|vh)$/],
-					width: [/^\d+(\.\d+)?(px|em|rem|%|vw)$/],
-					height: [/^\d+(\.\d+)?(px|em|rem|%|vh)$/],
-				},
-			},
-		});
-
-		return new Response(clean, {
+	if (preview.kind === "text") {
+		const prefix = await textPrefix(file, SHARE_TEXT_MAX_BYTES, c.req.raw.signal);
+		if (!isShareText(prefix.bytes, !prefix.truncated))
+			throw new ValidationError("Preview not supported for binary content");
+		return new Response(decodeUtf8Prefix(prefix.bytes), {
 			headers: {
-				"Content-Type": "text/html; charset=utf-8",
-				"Content-Security-Policy":
-					"default-src 'none'; style-src 'unsafe-inline'; img-src data: https: http:;",
-				"Cache-Control": "no-cache",
+				...PREVIEW_HEADERS,
+				"Content-Type": preview.mime,
+				"X-Preview-Truncated": String(prefix.truncated),
 			},
 		});
 	}
-
-	// Non-HTML: serve inline with correct MIME type
+	// Bun's file response supplies bounded native streaming and Range/206/416.
+	// Keep the original BunFile, not .stream() or .arrayBuffer(), to retain this behavior.
 	return new Response(file, {
 		headers: {
-			"Content-Type": contentType,
+			...PREVIEW_HEADERS,
+			"Content-Type": preview.mime,
 			"Content-Disposition": "inline",
-			"Cache-Control": "private, max-age=3600",
+			"Content-Length": String(file.size),
+			"Accept-Ranges": "bytes",
+			// Native PDF viewers are disabled by CSP sandbox; PDF uses browser isolation.
+			...(preview.kind === "pdf"
+				? { "Content-Security-Policy": "default-src 'none'; base-uri 'none'; form-action 'none'" }
+				: {}),
 		},
 	});
 });

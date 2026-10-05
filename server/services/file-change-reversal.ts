@@ -32,6 +32,8 @@ export interface FileChangeReversalInput {
 	current: FileChangeState;
 	/** Complete, fixed selection for exactly this file. Never pass a sampled page. */
 	effects: readonly FileChangeReversalEffect[];
+	/** Explicit historical restoration, never an automatic merge fallback. */
+	recoveryMode?: "snapshot";
 	signal?: AbortSignal;
 }
 
@@ -69,7 +71,7 @@ export interface FileChangeReversalStep {
 	effectId: string;
 	mutationId: string;
 	scopeRevision: number;
-	method: "restore_before" | "merge" | "already_before" | "no_change";
+	method: "restore_before" | "restore_snapshot" | "merge" | "already_before" | "no_change";
 }
 
 export type FileChangeReversalResult =
@@ -166,6 +168,11 @@ export class FileChangeReversalCalculator {
 			let method: FileChangeReversalStep["method"];
 			if (effect.outcome === "no_change") {
 				method = "no_change";
+			} else if (input.recoveryMode === "snapshot") {
+				// Effects are ordered newest to oldest by durable scope revision. Every
+				// changed effect contributes its own measured before, including absence/mode.
+				desired = known(effect.before);
+				method = "restore_snapshot";
 			} else if (fileChangeStatesEqual(desired, effect.before)) {
 				method = "already_before";
 			} else if (fileChangeStatesEqual(desired, effect.observedAfter)) {
@@ -292,6 +299,8 @@ export class FileChangeReversalCalculator {
  * references and scalar values. No full-history JSON/string encoding/hash here;
  * that potentially 80 MiB work stays in the yielding prepare pass below. */
 function snapshotInput(input: FileChangeReversalInput): FileChangeReversalInput {
+	if (input.recoveryMode !== undefined && input.recoveryMode !== "snapshot")
+		throw new Refusal("invalid_input");
 	if (!Array.isArray(input.effects)) throw new Refusal("invalid_input");
 	// Check the complete input, BEFORE deduplication. Never consume a truncated prefix.
 	if (input.effects.length > FILE_CHANGE_LIMITS.historyToolRelatedChanges)
@@ -310,7 +319,12 @@ function snapshotInput(input: FileChangeReversalInput): FileChangeReversalInput 
 		}
 		effects[index] = copy;
 	}
-	return { identity, current, effects };
+	return {
+		identity,
+		current,
+		effects,
+		...(input.recoveryMode === undefined ? {} : { recoveryMode: input.recoveryMode }),
+	};
 }
 
 function cloneIdentity(identity: FileChangeIdentity): FileChangeIdentity {

@@ -45,6 +45,7 @@ import {
 } from "./file-change-runtime";
 import { narratorService } from "./narrator-service";
 import * as narratorState from "./narrator-session-state";
+import { collectRevertBlockers } from "./revert-blockers";
 import type { RevertPlanFileMetadata, RevertPlanSummary } from "./revert-plan-service";
 import { RevertPlannerLocalAccess } from "./revert-planner-local-access";
 import type { RevertSelectionResult } from "./revert-selection-service";
@@ -446,6 +447,15 @@ async function actionUnavailable(response: Response, action: RevertAction) {
 		executable: false;
 		unavailable: string;
 		historySummary: null;
+		recoveryMode?: "snapshot";
+		diagnostics: Array<{
+			code: string;
+			reason?: string;
+			filePath?: string;
+			effectId?: string;
+			operationId?: string;
+			toolCallId?: string;
+		}>;
 		blockers?: Array<{
 			kind: string;
 			toolCallId?: string;
@@ -456,7 +466,13 @@ async function actionUnavailable(response: Response, action: RevertAction) {
 		}>;
 	};
 	expect(response.headers.get("cache-control")).toBe("no-store");
-	const { blockers, ...rest } = body;
+	const { blockers, diagnostics, recoveryMode: _recoveryMode, ...rest } = body;
+	expect(diagnostics.length).toBeGreaterThan(0);
+	expect(diagnostics.length).toBeLessThanOrEqual(8);
+	for (const diagnostic of diagnostics) {
+		expect(diagnostic.code).toEqual(expect.any(String));
+		expect(diagnostic.filePath ?? "").not.toContain(workspace);
+	}
 	expect(rest).toEqual({
 		action,
 		plan: null,
@@ -494,8 +510,8 @@ function apply(
 		signal,
 	);
 }
-async function committed(plan: RevertPlanSummary, action: RevertAction) {
-	const response = await apply(plan, action);
+async function committed(plan: RevertPlanSummary, action: RevertAction, extra = {}) {
+	const response = await apply(plan, action, extra);
 	const body = await boundedJson(response);
 	expect(response.headers.get("cache-control")).toBe("no-store");
 	expect(body).toEqual({
@@ -1031,9 +1047,132 @@ describe("action-bound HTTP preview and real local execution", () => {
 		await human(path, "human replaced the tool hunk\n");
 		const before = history();
 		const disk = await readFile(path);
-		await actionUnavailable(await actionPreview("revert_files"), "revert_files");
+		const unavailable = await actionUnavailable(
+			await actionPreview("revert_files"),
+			"revert_files",
+		);
+		expect(unavailable.unavailable).toBe("file_conflict");
+		expect(unavailable.diagnostics[0]).toMatchObject({
+			code: "REVERT_PLANNER_REVERSAL_REFUSED",
+			reason: "merge_conflict",
+			filePath: "file.txt",
+		});
+		expect(unavailable.diagnostics[0].effectId).toEqual(expect.any(String));
 		expect(await readFile(path)).toEqual(disk);
 		expect(history()).toBe(before);
+	});
+	test("physically missing historical snapshot reports the exact file and reason instead of HTTP 500", async () => {
+		const { path, call } = await fixture();
+		const operation = db
+			.select({ id: schema.narratorToolCalls.fileChangeOperationId })
+			.from(schema.narratorToolCalls)
+			.where(eq(schema.narratorToolCalls.id, call.toolCallId))
+			.get();
+		if (!operation?.id) throw new Error("Missing fixture operation");
+		const effect = db
+			.select({ digest: schema.fileChangeEffects.beforeBlobDigest })
+			.from(schema.fileChangeEffects)
+			.where(eq(schema.fileChangeEffects.operationId, operation.id))
+			.get();
+		if (!effect?.digest) throw new Error("Missing before snapshot reference");
+		await unlink(
+			join(
+				getNarraforkHome(),
+				"file-change-blobs",
+				"sha256",
+				effect.digest.slice(0, 2),
+				effect.digest,
+			),
+		);
+		const before = history();
+		const failed = await actionUnavailable(await actionPreview("revert_files"), "revert_files");
+		expect(failed.unavailable).toBe("snapshot_missing");
+		expect(failed.diagnostics[0]).toMatchObject({
+			code: "REVERT_PLANNER_BLOB_NOT_FOUND",
+			reason: "blob_unavailable",
+			filePath: "file.txt",
+		});
+		expect(await readFile(path, "utf8")).toBe("new\n");
+		expect(history()).toBe(before);
+	});
+
+	test("conflicting formatted single Edit can restore its real snapshot after explicit confirmation", async () => {
+		const boundary = message("user", [{ type: "text", text: "change one setting" }]);
+		const path = join(workspace, "formatted.ts");
+		const original = "const value=1;\n";
+		await writeFile(path, original);
+		await edit(path, "value=1", "value=2");
+		await writeFile(path, "const value = 2; // formatter and later edit\n");
+		const conflict = await actionUnavailable(
+			await actionPreview("rollback_to_block", boundary, { blockIndex: 0 }),
+			"rollback_to_block",
+		);
+		expect(conflict.unavailable).toBe("file_conflict");
+		expect(conflict.diagnostics[0]).toMatchObject({
+			reason: "merge_conflict",
+			filePath: "formatted.ts",
+		});
+		const response = await boundedJson(
+			await actionPreview("rollback_to_block", boundary, {
+				blockIndex: 0,
+				recoveryMode: "snapshot",
+				idempotencyKey: "snapshot-recovery",
+			}),
+		);
+		expect(response.recoveryMode).toBe("snapshot");
+		const plan = response.plan as RevertPlanSummary;
+		expect(plan.status).toBe("prepared");
+		const before = history();
+		const active = startLiveWorkAfterPreview();
+		const denied = await boundedJson(await apply(plan, "rollback_to_block"), 409);
+		expect(denied.code).toContain("SNAPSHOT_CONFIRMATION_REQUIRED");
+		expect(active.abortController.signal.aborted).toBe(false);
+		expect(history()).toBe(before);
+		expect(await readFile(path, "utf8")).toBe("const value = 2; // formatter and later edit\n");
+		await committed(plan, "rollback_to_block", { acceptSnapshotRestore: true });
+		expect(await readFile(path, "utf8")).toBe(original);
+		expect(messageRefs().map((ref) => ref.messageId)).toEqual([boundary]);
+	});
+
+	test("snapshot recovery still preserves a newer change made after its fixed preview", async () => {
+		const { path } = await fixture();
+		await writeFile(path, "conflicting external contents\n");
+		const plan = await actionPrepared("revert_files", "__all__", { recoveryMode: "snapshot" });
+		await writeFile(path, "newer change after snapshot preview\n");
+		const before = history();
+		await boundedJson(await apply(plan, "revert_files", { acceptSnapshotRestore: true }), 409);
+		expect(await readFile(path, "utf8")).toBe("newer change after snapshot preview\n");
+		expect(history()).toBe(before);
+	});
+
+	test("unrelated file edits after preview do not invalidate the target file rollback", async () => {
+		const { path, call } = await fixture();
+		const unrelated = join(workspace, "unrelated.txt");
+		await writeFile(unrelated, "initial\n");
+		const plan = await actionPrepared("revert_files", call.messageId);
+		const fence = scope().fencingToken;
+		await human(unrelated, "human unrelated edit\n");
+		expect(scope().fencingToken).toBeGreaterThan(fence);
+		await committed(plan, "revert_files");
+		expect(await readFile(path, "utf8")).toBe("old\n");
+		expect(await readFile(unrelated, "utf8")).toBe("human unrelated edit\n");
+	});
+	test("untracked target edits during activity still conflict instead of being overwritten", async () => {
+		const { path } = await fixture();
+		const plan = await actionPrepared("revert_files");
+		const binding = localFileChangeRuntimeBinding();
+		if (!binding) throw new Error("Missing runtime");
+		const activity = runtime.coordinator.registerActivity({ scope: scope(), runtime: binding });
+		try {
+			await writeFile(path, "external target edit\n");
+			const before = history();
+			await boundedJson(await apply(plan, "revert_files"), 409);
+			expect(await readFile(path, "utf8")).toBe("external target edit\n");
+			expect(history()).toBe(before);
+			expect(journalFiles(plan).every((file) => file.receiptJson === null)).toBe(true);
+		} finally {
+			runtime.coordinator.endActivity(activity);
+		}
 	});
 	test("human edits after preview refuse the fixed plan rather than silently replanning", async () => {
 		const { path } = await fixture();
@@ -1214,25 +1353,18 @@ describe("action apply reauthorization and immutable admission", () => {
 		expect(active.alive).toBe(false);
 		expect(await readFile(path, "utf8")).toBe("old\n");
 	});
-	test("hot-upgrade refusal is preserved by preview and cannot interrupt or apply a prepared plan", async () => {
+	test("Bash tracking hot-upgrade state no longer disables explicit file recovery", async () => {
 		const { path, call } = await fixture();
 		const plan = await actionPrepared("delete_tool_block", call.messageId, { blockIndex: 1 });
-		const active = startLiveWorkAfterPreview();
-		const before = history();
 		const bash = await import("../lib/agent/tools/bash");
 		const guard = spyOn(bash, "assertBashActivityProtectionReady").mockImplementation(() => {
 			throw new AppError("Cold start required", 409, "REVERT_RUNTIME_RELOAD_REQUIRED");
 		});
 		try {
-			const preview = await boundedJson(await actionPreview("revert_files"));
-			expect(preview).toMatchObject({ plan: null, unavailable: "runtime_reload_required" });
-			const rejected = await boundedJson(await apply(plan, "delete_tool_block"), 409);
-			expect(rejected.code).toBe("REVERT_RUNTIME_RELOAD_REQUIRED");
-			expect(active.abortController.signal.aborted).toBe(false);
-			expect(narratorState.isNarratorRuntimeBusy(narratorId)).toBe(true);
-			expect(await readFile(path, "utf8")).toBe("new\n");
-			expect(history()).toBe(before);
-			expect(journalFiles(plan).every((file) => file.receiptJson === null)).toBe(true);
+			await actionPrepared("revert_files", "__all__", { idempotencyKey: "hot-upgrade-preview" });
+			await committed(plan, "delete_tool_block");
+			expect(guard).not.toHaveBeenCalled();
+			expect(await readFile(path, "utf8")).toBe("old\n");
 		} finally {
 			guard.mockRestore();
 		}
@@ -1964,6 +2096,90 @@ describe("real requireAuth and conjunctive ACL", () => {
 });
 
 describe("backend scope and namespace guards", () => {
+	async function switchWorkspace(cwd: string, expectedRevision: number) {
+		const response = await http("workspace-context/switch", "POST", {
+			expectedRevision,
+			requestId: randomUUID(),
+			target: { deviceId: "local", cwd },
+		});
+		const body = await response.json();
+		expect(response.status, JSON.stringify(body)).toBe(200);
+		expect(body.current.revision).toBe(expectedRevision + 1);
+	}
+
+	test("scoped rollback previews and applies after switching away and back", async () => {
+		const { path } = await fixture();
+		const identity = effects()[0].identityJson;
+		const other = join(workspace, "other");
+		await mkdir(other);
+		await switchWorkspace(other, 0);
+		await switchWorkspace(workspace, 1);
+		const before = history();
+		expect((await prepared()).expectedFileCount).toBe(1);
+		const plan = await actionPrepared("revert_files");
+		const response = await http(`revert-plans/${plan.id}/files`);
+		expect(response.status).toBe(200);
+		const page = await response.json();
+		expect(page.items).toHaveLength(1);
+		expect(page.items[0].identityJson).toEqual(identity);
+		await committed(plan, "revert_files");
+		expect(await readFile(path, "utf8")).toBe("old\n");
+		expect(history()).toBe(before);
+	});
+
+	test("scoped rollback restores writes made in the newly selected workspace", async () => {
+		const previous = workspace;
+		const previousFile = join(previous, "file.txt");
+		await writeFile(previousFile, "previous workspace\n");
+		const selected = join(previous, "selected");
+		await mkdir(selected);
+		await switchWorkspace(selected, 0);
+		try {
+			workspace = selected;
+			const { path } = await fixture();
+			const before = history();
+			const plan = await actionPrepared("revert_files");
+			expect(plan.expectedFileCount).toBe(1);
+			await committed(plan, "revert_files");
+			expect(await readFile(path, "utf8")).toBe("old\n");
+			expect(await readFile(previousFile, "utf8")).toBe("previous workspace\n");
+			expect(history()).toBe(before);
+		} finally {
+			workspace = previous;
+		}
+	});
+
+	test("scoped rollback after switching refuses old files outside the new write boundary", async () => {
+		const { path } = await fixture();
+		const other = join(workspace, "other");
+		await mkdir(other);
+		const sameName = join(other, "file.txt");
+		await writeFile(sameName, "different workspace\n");
+		await switchWorkspace(other, 0);
+		const before = history();
+		await refused(await prepare(), "REVERT_PREVIEW_FILE_ACCESS_DENIED");
+		const response = await actionPreview("revert_files");
+		expect(response.status).toBe(403);
+		expect((await response.json()).code).toBe("REVERT_PREVIEW_FILE_ACCESS_DENIED");
+		expect(await readFile(path, "utf8")).toBe("new\n");
+		expect(await readFile(sameName, "utf8")).toBe("different workspace\n");
+		expect(history()).toBe(before);
+	});
+
+	test("scoped rollback apply rechecks the write boundary after a real workspace switch", async () => {
+		const { path } = await fixture();
+		const plan = await actionPrepared("revert_files");
+		const other = join(workspace, "other");
+		await mkdir(other);
+		await switchWorkspace(other, 0);
+		const before = history();
+		const response = await apply(plan, "revert_files");
+		expect(response.status).toBe(403);
+		expect((await response.json()).code).toBe("REVERT_PREVIEW_FILE_ACCESS_DENIED");
+		expect(await readFile(path, "utf8")).toBe("new\n");
+		expect(history()).toBe(before);
+		expect(journalFiles(plan).every((file) => file.receiptJson === null)).toBe(true);
+	});
 	test("outside cwd is refused without implicit confirmation; configured writable roots allow it", async () => {
 		const outside = await mkdtemp(join(testEnvironment.isolatedHome, "outside-preview-"));
 		restorers.push(() => rm(outside, { recursive: true, force: true }));
@@ -2161,7 +2377,7 @@ describe("live/durable coordinator checks and unchanged state", () => {
 		expect(history()).toBe(before);
 		expect(await readFile(path, "utf8")).toBe("new\n");
 	});
-	test("actual active write lease blocks preview, without consuming another fence", async () => {
+	test("a live write lease does not block read-only preview or consume another fence", async () => {
 		const { path } = await fixture();
 		const ownScope = scope();
 		const binding = localFileChangeRuntimeBinding();
@@ -2183,85 +2399,70 @@ describe("live/durable coordinator checks and unchanged state", () => {
 		);
 		await started;
 		const fence = scope().fencingToken;
+		let plan: RevertPlanSummary;
 		try {
-			await refused(await prepare(), "REVERT_PLANNER_ACTIVE_WRITER");
+			plan = await actionPrepared("revert_files");
 			expect(scope().fencingToken).toBe(fence);
 		} finally {
 			release();
 			await writer;
 		}
-		expect((await prepared()).status).toBe("prepared");
-		expect(await readFile(path, "utf8")).toBe("new\n");
+		// Settlement advances the scope, but it did not change this file.
+		await committed(plan, "revert_files");
+		expect(await readFile(path, "utf8")).toBe("old\n");
 	});
-	test("registered activity remains a blocker without pretending the external filesystem is quiescent", async () => {
-		await fixture();
+	test("single Edit preview stays available but rollback safely refuses registered Bash activity", async () => {
+		const boundary = message("user", [{ type: "text", text: "edit one file" }]);
+		const path = join(workspace, "one-edit.txt");
+		await writeFile(path, "before\n");
+		await edit(path, "before", "after");
 		const ownScope = scope();
 		const binding = localFileChangeRuntimeBinding();
 		if (!binding) throw new Error("Missing runtime");
 		const activity = runtime.coordinator.registerActivity({ scope: ownScope, runtime: binding });
+		let plan: RevertPlanSummary;
 		try {
-			await refused(await prepare(), "REVERT_PLANNER_ACTIVE_WRITER");
-			expect(runtime.coordinator.capture(ownScope).externalFilesystemQuiescence).toBe("unknown");
-			const body = await actionUnavailable(await actionPreview("revert_files"), "revert_files");
-			expect(body.unavailable).toBe("pending_operations");
-			expect(body.blockers?.length).toBeGreaterThan(0);
-			// In-memory registerActivity has no durable tool row. Accept either the
-			// fallback marker or whatever live holder the collector could name.
+			plan = await actionPrepared("rollback_to_block", boundary, { blockIndex: 0 });
+			expect(plan.expectedFileCount).toBe(1);
+			const before = history();
+			const files = journalFiles(plan);
+			await boundedJson(await apply(plan, "rollback_to_block"), 409);
+			expect(await readFile(path, "utf8")).toBe("after\n");
+			expect(history()).toBe(before);
+			expect(journalFiles(plan)).toEqual(files);
 			expect(
-				body.blockers?.some((item) =>
-					[
-						"uncoordinated_activity",
-						"write_lease",
-						"pending_mutation",
-						"recovery_hold",
-						"scope_not_active",
-						"narrator_busy",
-						"pending_operation",
-					].includes(item.kind),
-				),
-				JSON.stringify(body.blockers),
-			).toBe(true);
-			// Fallback detail must be a stable short label, never error.message with paths.
-			for (const item of body.blockers ?? []) {
-				if (item.detail === undefined) continue;
-				expect(item.detail.length).toBeLessThanOrEqual(160);
-				expect(item.detail).not.toContain(workspace);
-			}
+				db
+					.select()
+					.from(schema.revertOperations)
+					.where(eq(schema.revertOperations.id, plan.id))
+					.get()?.status,
+			).toBe("prepared");
+			expect(runtime.coordinator.capture(ownScope).active.uncoordinatedActivities).toBe(1);
 		} finally {
 			runtime.coordinator.endActivity(activity);
 		}
+		// Rejection leaves the same prepared intent usable once the known writer settles.
+		await committed(plan, "rollback_to_block");
+		expect(await readFile(path, "utf8")).toBe("before\n");
+		expect(messageRefs().map((ref) => ref.messageId)).toEqual([boundary]);
 	});
-	test("a running tool call is named in blockers while ACTIVE_WRITER holds the workspace", async () => {
+	test("running tools remain diagnostic information rather than a blanket preview veto", async () => {
 		await fixture();
-		const ownScope = scope();
-		const binding = localFileChangeRuntimeBinding();
-		if (!binding) throw new Error("Missing runtime");
-		const call = await toolContext("Write", join(workspace, "busy.txt"), {
-			file_path: join(workspace, "busy.txt"),
-			content: "busy\n",
-		});
+		const call = unjournaledTool(join(workspace, "busy.txt"), "Bash");
 		db.update(schema.narratorToolCalls)
-			.set({
-				status: "running",
-				inputJson: { file_path: "busy.txt", description: "fixture write" },
-			})
+			.set({ status: "running", inputJson: { description: "fixture activity" } })
 			.where(eq(schema.narratorToolCalls.id, call.toolCallId))
 			.run();
-		const activity = runtime.coordinator.registerActivity({ scope: ownScope, runtime: binding });
-		try {
-			const body = await actionUnavailable(await actionPreview("revert_files"), "revert_files");
-			expect(body.unavailable).toBe("pending_operations");
-			const named = body.blockers?.find((item) => item.toolCallId === call.toolCallId);
-			expect(named).toMatchObject({ kind: "running_tool", toolName: "Write" });
-			expect(named?.detail).toContain("fixture write");
-			expect(named?.detail ?? "").not.toContain("busy.txt");
-			expect(named?.detail ?? "").not.toContain(workspace);
-		} finally {
-			runtime.coordinator.endActivity(activity);
-		}
+		const named = collectRevertBlockers(narratorId).find(
+			(item) => item.toolCallId === call.toolCallId,
+		);
+		expect(named).toMatchObject({ kind: "running_tool", toolName: "Bash" });
+		expect(named?.detail).toContain("fixture activity");
+		expect(named?.detail ?? "").not.toContain(workspace);
+		await actionPrepared("revert_files");
 	});
-	test("another old scope covering the same path cannot hide its durable recovery barrier", async () => {
-		await fixture();
+	test("durable recovery barriers are checked at apply rather than disabling preview", async () => {
+		const { path } = await fixture();
 		const previous = {
 			...scope(),
 			id: generateId(),
@@ -2275,9 +2476,14 @@ describe("live/durable coordinator checks and unchanged state", () => {
 				.where(eq(schema.fileChangeScopes.id, previous.id))
 				.run();
 		});
-		await refused(await prepare(), "REVERT_PLANNER_ACTIVE_WRITER");
+		const before = history();
+		const plan = await actionPrepared("revert_files");
+		await boundedJson(await apply(plan, "revert_files"), 409);
+		expect(await readFile(path, "utf8")).toBe("new\n");
+		expect(history()).toBe(before);
+		expect(journalFiles(plan).every((file) => file.receiptJson === null)).toBe(true);
 	});
-	test("activity between read and final guard invalidates a matching byte observation", async () => {
+	test("brief activity between read and final guard does not invalidate unchanged file bytes", async () => {
 		const { path } = await fixture();
 		const ownScope = scope();
 		const binding = localFileChangeRuntimeBinding();
@@ -2296,12 +2502,14 @@ describe("live/durable coordinator checks and unchanged state", () => {
 			}
 			return result;
 		});
+		let plan: RevertPlanSummary;
 		try {
-			await refused(await prepare(), "REVERT_PLANNER_STALE");
+			plan = await actionPrepared("revert_files");
 		} finally {
 			spy.mockRestore();
 		}
-		expect(await readFile(path, "utf8")).toBe("new\n");
+		await committed(plan, "revert_files");
+		expect(await readFile(path, "utf8")).toBe("old\n");
 	});
 	test("plan DB failure preserves disk and history and cannot advertise completion", async () => {
 		const { path } = await fixture();

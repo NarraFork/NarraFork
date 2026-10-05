@@ -763,6 +763,224 @@ describe("uncoordinated activity windows and conservative capture", () => {
 	});
 });
 
+describe("explicit rollback activity observation", () => {
+	test("strict stays the default while observe admits existing known activity", async () => {
+		const activity = coordinator.registerActivity(request());
+		await expect(coordinator.withRollback(request(), () => undefined)).rejects.toThrow(
+			errorCode("uncoordinated_activity"),
+		);
+		await coordinator.withRollback(request(scope, { activityPolicy: "observe" }), (lease) => {
+			expect(lease.activityPolicy).toBe("observe");
+			expect(Object.isFrozen(lease)).toBe(true);
+			expect(lease.overlappedUncoordinatedActivity).toBe(true);
+			lease.assertCurrent();
+			lease.registerMutation("guarded-restore");
+			lease.settle("guarded-restore", "applied");
+		});
+		coordinator.endActivity(activity);
+		await coordinator.withRollback(request(), (lease) => {
+			expect(lease.activityPolicy).toBe("strict");
+		});
+	});
+
+	test("observe admits new known activity without erasing the sticky observation", async () => {
+		await coordinator.withRollback(request(scope, { activityPolicy: "observe" }), (lease) => {
+			expect(lease.overlappedUncoordinatedActivity).toBe(false);
+			const activity = coordinator.registerActivity(request());
+			expect(lease.overlappedUncoordinatedActivity).toBe(true);
+			lease.assertCurrent();
+			coordinator.endActivity(activity);
+			expect(lease.overlappedUncoordinatedActivity).toBe(true);
+			lease.assertCurrent();
+		});
+	});
+
+	test("a queued observe request survives brief activity and freezes its caller policy", async () => {
+		const first = await hold();
+		const input = request(scope, { activityPolicy: "observe" });
+		const rollback = track(
+			coordinator.withRollback(input, (lease) => {
+				expect(lease.activityPolicy).toBe("observe");
+				const activity = coordinator.registerActivity(request());
+				coordinator.endActivity(activity);
+				lease.assertCurrent();
+			}),
+		);
+		input.activityPolicy = "strict";
+		const activity = coordinator.registerActivity(request());
+		coordinator.endActivity(activity);
+		first.release();
+		await first.done;
+		await rollback;
+	});
+
+	test("write cannot select observe and nested requests cannot upgrade a strict lease", async () => {
+		await expect(
+			coordinator.withWrite(request(scope, { activityPolicy: "observe" }), () => undefined),
+		).rejects.toThrow(errorCode("invalid_input"));
+		expect(row()?.fencingToken).toBe(0);
+		await coordinator.withRollback(request(), async (lease) => {
+			await expect(
+				coordinator.withRollback(
+					request(scope, {
+						leaseToken: lease.token,
+						activityPolicy: "observe",
+					}),
+					() => undefined,
+				),
+			).rejects.toThrow(errorCode("invalid_nesting"));
+			expect(lease.activityPolicy).toBe("strict");
+			expectCode(() => coordinator.registerActivity(request()), "rollback_active");
+		});
+	});
+
+	test("nested restore inherits the real observe lease, never a request policy", async () => {
+		await coordinator.withRollback(request(scope, { activityPolicy: "observe" }), async (lease) => {
+			await coordinator.withRollback(request(scope, { leaseToken: lease.token }), (nested) => {
+				expect(nested).toBe(lease);
+				expect(nested.activityPolicy).toBe("observe");
+			});
+			await coordinator.withRollback(
+				request(scope, {
+					leaseToken: lease.token,
+					activityPolicy: "strict",
+				}),
+				(nested) => {
+					expect(nested.activityPolicy).toBe("observe");
+				},
+			);
+		});
+	});
+
+	test("batch copying keeps each policy and member helpers inherit it", async () => {
+		const other = addScope({ canonicalRoot: "/workspace/other" });
+		const activity = coordinator.registerActivity(request());
+		await coordinator.withRollbackMany(
+			{ scopes: [request(other), request(scope, { activityPolicy: "observe" })] },
+			async (batch) => {
+				const observed = batch.leases.find((lease) => lease.scope.id === scope.id);
+				const strict = batch.leases.find((lease) => lease.scope.id === other.id);
+				if (!observed || !strict) throw new Error("Missing admitted batch member");
+				expect(strict.activityPolicy).toBe("strict");
+				await batch.runInScope(observed.token, async (lease) => {
+					expect(lease.activityPolicy).toBe("observe");
+					await coordinator.withRollback(request(scope, { leaseToken: lease.token }), (nested) => {
+						expect(nested).toBe(lease);
+					});
+					const added = coordinator.registerActivity(request());
+					coordinator.endActivity(added);
+				});
+				expectCode(() => coordinator.registerActivity(request(other)), "rollback_active");
+			},
+		);
+		coordinator.endActivity(activity);
+	});
+
+	test("conflicting duplicate policies or an invalid policy never grant a batch", async () => {
+		await expect(
+			coordinator.withRollbackMany(
+				{ scopes: [request(), request(scope, { activityPolicy: "observe" })] },
+				() => undefined,
+			),
+		).rejects.toThrow(errorCode("invalid_input"));
+		const invalid = "ignore" as WorkspaceWriteRequest["activityPolicy"];
+		await expect(
+			coordinator.withRollback(request(scope, { activityPolicy: invalid }), () => undefined),
+		).rejects.toThrow(errorCode("invalid_input"));
+		await expect(
+			coordinator.withRollbackMany(
+				{ scopes: [request(scope, { activityPolicy: invalid })] },
+				() => undefined,
+			),
+		).rejects.toThrow(errorCode("invalid_input"));
+		expect(row()?.fencingToken).toBe(0);
+	});
+
+	test("observe never bypasses uncertain activity retained after failed persistence", async () => {
+		const activity = coordinator.registerActivity(request());
+		sqlite.exec(`CREATE TRIGGER reject_observed_unknown BEFORE UPDATE OF status ON file_change_scopes
+			WHEN NEW.status = 'needs_verification' BEGIN SELECT RAISE(ABORT, 'observed-unknown'); END;`);
+		expect(() => coordinator.endActivity(activity, "unknown")).toThrow("observed-unknown");
+		await expect(
+			coordinator.withRollback(request(scope, { activityPolicy: "observe" }), () => undefined),
+		).rejects.toThrow(errorCode("needs_verification"));
+		sqlite.exec("DROP TRIGGER reject_observed_unknown;");
+		coordinator.endActivity(activity);
+		expect(row()?.status).toBe("needs_verification");
+		await expect(
+			coordinator.withRollback(request(scope, { activityPolicy: "observe" }), () => undefined),
+		).rejects.toThrow(errorCode("needs_verification"));
+	});
+
+	test("unknown intersecting activity taints observe and retains the durable quarantine", async () => {
+		const first = await hold(scope, "rollback", coordinator, { activityPolicy: "observe" });
+		first.lease.registerMutation("restore");
+		const activity = coordinator.registerActivity(request());
+		coordinator.endActivity(activity, "unknown");
+		first.lease.settle("restore", "applied");
+		expectCode(() => first.lease.assertCurrent(), "needs_verification");
+		expectCode(() => coordinator.registerActivity(request()), "rollback_active");
+		first.release();
+		await first.done;
+		expect(row()?.status).toBe("needs_verification");
+		expect(quarantined()).toHaveLength(1);
+	});
+
+	test("observe does not clear an existing uncertain mutation barrier", async () => {
+		await coordinator.withWrite(request(), (lease) => {
+			lease.registerMutation("unknown-write");
+			lease.settle("unknown-write", "unknown");
+		});
+		await expect(
+			coordinator.withRollback(request(scope, { activityPolicy: "observe" }), () => undefined),
+		).rejects.toThrow(errorCode("needs_verification"));
+		expect(quarantined()).toHaveLength(1);
+	});
+});
+
+describe("activity observation follows actual file ranges", () => {
+	function ranges() {
+		return [{ kind: "file" as const, canonicalPath: `${scope.canonicalRoot}/target/file` }];
+	}
+
+	test("an existing sibling subtree activity neither denies strict rollback nor taints its lease", async () => {
+		const sibling = addScope({ canonicalRoot: `${scope.canonicalRoot}/sibling` });
+		const activity = coordinator.registerActivity(request(sibling));
+		await coordinator.withRollback(request(scope, { ranges: ranges() }), (lease) => {
+			expect(lease.activityPolicy).toBe("strict");
+			expect(lease.overlappedUncoordinatedActivity).toBe(false);
+			lease.assertCurrent();
+		});
+		coordinator.endActivity(activity);
+	});
+
+	test.each([
+		"write",
+		"rollback",
+	] as const)("new sibling activity does not taint %s or its unknown outcome", async (kind) => {
+		const sibling = addScope({ canonicalRoot: `${scope.canonicalRoot}/sibling` });
+		const first = await hold(scope, kind, coordinator, { ranges: ranges() });
+		const activity = coordinator.registerActivity(request(sibling));
+		expect(first.lease.overlappedUncoordinatedActivity).toBe(false);
+		coordinator.endActivity(activity, "unknown");
+		expect(row(sibling)?.status).toBe("needs_verification");
+		first.lease.assertCurrent();
+		first.release();
+		await first.done;
+		expect(quarantined()).toHaveLength(0);
+		await coordinator.withRollback(request(scope, { ranges: ranges() }), () => undefined);
+	});
+
+	test("strict excludes activity on the target subtree and its ancestor", async () => {
+		const target = addScope({ canonicalRoot: `${scope.canonicalRoot}/target` });
+		const first = await hold(scope, "rollback", coordinator, { ranges: ranges() });
+		expectCode(() => coordinator.registerActivity(request(target)), "rollback_active");
+		expectCode(() => coordinator.registerActivity(request()), "rollback_active");
+		first.release();
+		await first.done;
+	});
+});
+
 function observation(target = scope) {
 	const captured = coordinator.capture(target);
 	return {

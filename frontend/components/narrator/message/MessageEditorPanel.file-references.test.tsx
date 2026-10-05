@@ -6,13 +6,23 @@ import type { FileReference } from "@shared/file-reference";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
-import { act, type ComponentProps, type ReactNode } from "react";
+import { act, type ComponentProps, type ReactNode, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
-import { api } from "../../../lib/api";
+import { api, type BufferMessageSummary } from "../../../lib/api";
 import en from "../../../locales/en/narrator.json";
+import zh from "../../../locales/zh-CN/narrator.json";
+import { ImageViewerContext } from "../../common/image-viewer-context";
 import { QueuedAttachmentPreview, QueuedMessageRow } from "../interaction/QueuedMessageRow";
+import {
+	QueuedMessagesPanel,
+	type QueuedMessagesPanelProps,
+} from "../interaction/QueuedMessagesPanel";
 import type { QueuedEditPayload } from "../interaction/queued-attachment-edit";
+import {
+	type UseQueuedMessageActionsOptions,
+	useQueuedMessageActions,
+} from "../interaction/use-queued-message-actions";
 import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
 import { MessageEditorPanel, type MessageEditorPanelProps } from "./MessageEditorPanel";
 
@@ -129,7 +139,9 @@ async function render(child: ReactNode) {
 								},
 							}}
 						>
-							{child}
+							<ImageViewerContext.Provider value={{ open: () => {} }}>
+								{child}
+							</ImageViewerContext.Provider>
 						</EditingMessageCtx.Provider>
 					</MantineProvider>
 				</QueryClientProvider>
@@ -174,9 +186,10 @@ beforeEach(async () => {
 			lng: "en",
 			fallbackLng: "en",
 			defaultNS: "narrator",
-			resources: { en: { narrator: en } },
+			resources: { en: { narrator: en }, "zh-CN": { narrator: zh } },
 			react: { useSuspense: false },
 		});
+	await i18n.changeLanguage("en");
 	qc = new QueryClient({
 		defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: Infinity } },
 	});
@@ -325,8 +338,8 @@ for (const mode of ["message", "queued"] as const) {
 						onRetry={async () => ({ ok: true, resumed: false })}
 						cancelBufferLabel="Cancel"
 						editLabel="Edit"
-						priorityLabel="Priority"
-						priorityNextRequestLabel="Next"
+						onChangeMode={async () => {}}
+						onMove={() => {}}
 					/>
 				);
 			await render(view());
@@ -491,13 +504,302 @@ function queueRow(overrides: Partial<ComponentProps<typeof QueuedMessageRow>> = 
 			onRetry={(id) => api.retryBufferedMessage("target-narrator", id)}
 			cancelBufferLabel="Cancel"
 			editLabel="Edit"
-			priorityLabel="Priority"
-			priorityNextRequestLabel="Next"
+			onChangeMode={async () => {}}
+			onMove={() => {}}
 			{...overrides}
 		/>
 	);
 }
 
+describe("visible queued message collaboration details", () => {
+	const queued = {
+		id: "queued-detail",
+		text: "Queued body",
+		state: "queued" as const,
+		bufferedAt: "now",
+		imageCount: 0,
+		creator: { id: "teammate-id", username: "teammate", avatarColor: "#5c7cfa" },
+	};
+
+	test("a single sender remains visible for one message and several messages by the same sender", async () => {
+		for (const count of [1, 2]) {
+			await render(
+				queuePanel({
+					queuedMessages: Array.from({ length: count }, (_, index) => ({
+						...queued,
+						id: `detail-${index}`,
+					})),
+				}),
+			);
+			const senders = document.querySelectorAll("[data-queue-sender]");
+			expect(senders).toHaveLength(count);
+			for (const sender of senders) expect(sender.textContent).toContain("teammate");
+		}
+	});
+
+	test("missing creator is explicit rather than silently attributed to the current user", async () => {
+		await render(queueRow({ msg: { ...queued, creator: null } }));
+		expect(document.querySelector("[data-queue-sender]")?.textContent).toContain(
+			en.queuedSenderUnknown,
+		);
+	});
+
+	test("all thumbnails, file names and references are visible without expanding attachments", async () => {
+		await render(
+			queueRow({
+				msg: {
+					...queued,
+					imageCount: 4,
+					images: Array.from({ length: 4 }, (_, index) => ({
+						imageId: `image-${index}`,
+						filename: `image-${index}.png`,
+						mediaType: "image/png",
+					})),
+					textFiles: [
+						{ index: 0, filename: "notes.txt", size: 12 },
+						{ index: 1, filename: "report.md", size: 8 },
+					],
+					fileReferences: [reference],
+				},
+			}),
+		);
+		expect(document.querySelector("[data-queue-attachment-preview]")).not.toBeNull();
+		expect(document.querySelectorAll("[data-queue-image]")).toHaveLength(4);
+		expect(document.body.textContent).toContain("notes.txt");
+		expect(document.body.textContent).toContain("report.md");
+		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+	});
+
+	test("remove is directly accessible and double-clicking it does not edit", async () => {
+		const remove = mock((_id: string) => {});
+		const edit = mock((_message: unknown) => {});
+		await render(queueRow({ msg: queued, onRemove: remove, onStartEdit: edit }));
+		const externalRemove = button("Cancel");
+		await click(externalRemove);
+		await act(async () => externalRemove.dispatchEvent(new Event("dblclick", { bubbles: true })));
+		expect(remove).toHaveBeenCalledWith(queued.id);
+		expect(remove).toHaveBeenCalledTimes(1);
+		expect(edit).not.toHaveBeenCalled();
+	});
+
+	test("double-clicking body or blank row space edits exactly once per gesture", async () => {
+		const edit = mock((_message: unknown) => {});
+		await render(queueRow({ msg: queued, onStartEdit: edit }));
+		await act(async () =>
+			button(en.queuedExpandText).dispatchEvent(new Event("dblclick", { bubbles: true })),
+		);
+		expect(edit).toHaveBeenCalledTimes(1);
+		expect(edit).toHaveBeenCalledWith(queued);
+		const row = document.querySelector("[data-queue-message-row]");
+		if (!row) throw new Error("Queued row missing");
+		await act(async () => row.dispatchEvent(new Event("dblclick", { bubbles: true })));
+		expect(edit).toHaveBeenCalledTimes(2);
+	});
+
+	test("double-clicking attachments or urgent controls cannot start editing", async () => {
+		const edit = mock((_message: unknown) => {});
+		await render(queueRow({ msg: { ...queued, fileReferences: [reference] }, onStartEdit: edit }));
+		const preview = document.querySelector("[data-queue-attachment-preview]");
+		if (!preview) throw new Error("Attachment preview missing");
+		await act(async () => {
+			preview.dispatchEvent(new Event("dblclick", { bubbles: true }));
+			button(en.queuedSendUrgently).dispatchEvent(new Event("dblclick", { bubbles: true }));
+		});
+		expect(edit).not.toHaveBeenCalled();
+	});
+});
+
+describe("queued collaboration gesture and image integration", () => {
+	test("double-click opens the real editor with sender, original text and attachments intact", async () => {
+		const message = {
+			id: "edit-by-double-click",
+			text: "Original queued text",
+			bufferedAt: "now",
+			imageCount: 0,
+			creator: { id: "peer", username: "peer" },
+			fileReferences: [reference],
+		};
+		let editingQueuedId: string | null = null;
+		const view = () =>
+			queuePanel({
+				queuedMessages: [message],
+				editingQueuedId,
+				handleStartEditQueued: (msg) => {
+					editingQueuedId = msg.id;
+				},
+			});
+		await render(view());
+		await act(async () =>
+			button(en.queuedExpandText).dispatchEvent(new Event("dblclick", { bubbles: true })),
+		);
+		expect<string | null>(editingQueuedId).toBe(message.id);
+		await render(view());
+		expect(textareaProps().textarea.value).toBe(message.text);
+		expect(document.querySelector("[data-queue-sender]")?.textContent).toContain("peer");
+		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+	});
+
+	test("mode changes in flight block double-click editing and external removal", async () => {
+		const pending = Promise.withResolvers<void>();
+		const edit = mock((_message: unknown) => {});
+		const remove = mock((_id: string) => {});
+		await render(
+			queueRow({
+				msg: { id: "pending-mode", text: "Queued", bufferedAt: "now", imageCount: 0 },
+				onChangeMode: () => pending.promise,
+				onStartEdit: edit,
+				onRemove: remove,
+			}),
+		);
+		await click(button(en.queuedSwitchToGuidance));
+		expect(button("Cancel").disabled).toBe(true);
+		await act(async () =>
+			button(en.queuedExpandText).dispatchEvent(new Event("dblclick", { bubbles: true })),
+		);
+		expect(edit).not.toHaveBeenCalled();
+		await act(async () => {
+			pending.resolve();
+			await flush();
+		});
+		expect(button("Cancel").disabled).toBe(false);
+		await act(async () =>
+			button(en.queuedExpandText).dispatchEvent(new Event("dblclick", { bubbles: true })),
+		);
+		expect(edit).toHaveBeenCalledTimes(1);
+	});
+
+	test("image previews fetch immediately using explicit or legacy narrator ownership", async () => {
+		const storage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: { getItem: () => null },
+		});
+		const fetchImplementation: typeof fetch = Object.assign(
+			async () => new Response(new Blob(["image bytes"], { type: "image/png" })),
+			{ preconnect: globalThis.fetch.preconnect },
+		);
+		const fetchImage = spyOn(globalThis, "fetch").mockImplementation(fetchImplementation);
+		try {
+			await render(
+				queuePanel({
+					narratorId: "queue-owner",
+					queuedMessages: [
+						{
+							id: "images",
+							text: "Images",
+							bufferedAt: "now",
+							imageCount: 2,
+							images: [
+								{ imageId: "legacy", filename: "legacy.png", mediaType: "image/png" },
+								{
+									imageId: "modern",
+									filename: "modern.png",
+									mediaType: "image/png",
+									uploadNarratorId: "upload-owner",
+								},
+							],
+						},
+					],
+				}),
+			);
+			const requests = fetchImage.mock.calls
+				.map(([url]) => String(url))
+				.filter((url) => url.includes("/uploads/"));
+			expect(requests).toEqual([
+				"/api/uploads/queue-owner/legacy",
+				"/api/uploads/upload-owner/modern",
+			]);
+			for (const filename of ["legacy.png", "modern.png"]) {
+				const image = document.querySelector(`img[alt="${filename}"]`);
+				expect(image).not.toBeNull();
+				expect(image?.getAttribute("src")).toStartWith("blob:");
+			}
+		} finally {
+			fetchImage.mockRestore();
+			if (storage) Object.defineProperty(globalThis, "localStorage", storage);
+			else Reflect.deleteProperty(globalThis, "localStorage");
+		}
+	});
+});
+
+describe("inline queued message mode actions", () => {
+	const queued = {
+		id: "queue-message",
+		text: "Keep this input",
+		bufferedAt: "now",
+		imageCount: 0,
+		state: "queued" as const,
+		fileReferences: [reference],
+	};
+
+	test("switches between next step and guidance with one visible button", async () => {
+		const change = mock(async (_id: string, _mode: "turn" | "tool" | "interrupt") => {});
+		await render(queueRow({ msg: queued, onChangeMode: change }));
+		await click(button(en.queuedSwitchToGuidance));
+		expect(change.mock.calls).toEqual([[queued.id, "tool"]]);
+		await render(queueRow({ msg: { ...queued, queueMode: "tool" }, onChangeMode: change }));
+		await click(button(en.queuedSwitchToNextStep));
+		expect(change.mock.calls).toEqual([
+			[queued.id, "tool"],
+			[queued.id, "turn"],
+		]);
+		expect(document.body.textContent).toContain(queued.text);
+	});
+
+	test("urgent is one-way and simultaneous clicks cannot submit twice", async () => {
+		const pending = Promise.withResolvers<boolean>();
+		const change = mock((_id: string, _mode: "turn" | "tool" | "interrupt") => pending.promise);
+		await render(queueRow({ msg: queued, onChangeMode: change }));
+		const urgent = button(en.queuedSendUrgently);
+		const toggle = button(en.queuedSwitchToGuidance);
+		await act(async () => {
+			urgent.dispatchEvent(new Event("click", { bubbles: true }));
+			urgent.dispatchEvent(new Event("click", { bubbles: true }));
+			toggle.dispatchEvent(new Event("click", { bubbles: true }));
+			await flush();
+		});
+		expect(change.mock.calls).toEqual([[queued.id, "interrupt"]]);
+		expect(urgent.disabled).toBe(true);
+		expect(toggle.disabled).toBe(true);
+		await act(async () => {
+			pending.resolve(true);
+			await flush();
+		});
+		expect(button(en.queuedUrgentRequested).disabled).toBe(true);
+		expect(document.querySelector(`button[aria-label="${en.queuedSwitchToGuidance}"]`)).toBeNull();
+		expect(document.querySelector(`button[aria-label="${en.queuedSwitchToNextStep}"]`)).toBeNull();
+		expect(change).toHaveBeenCalledTimes(1);
+	});
+
+	test("already urgent rows have no switch-back action", async () => {
+		const change = mock(async (_id: string, _mode: "turn" | "tool" | "interrupt") => {});
+		await render(queueRow({ msg: { ...queued, queueMode: "interrupt" }, onChangeMode: change }));
+		expect(button(en.queuedUrgentRetry).disabled).toBe(false);
+		expect(document.body.textContent).toContain(en.queuedUrgentUndelivered);
+		expect(document.querySelector(`button[aria-label="${en.queuedSwitchToNextStep}"]`)).toBeNull();
+		await click(button(en.queuedUrgentRetry));
+		expect(change).toHaveBeenCalledWith(queued.id, "interrupt");
+	});
+
+	test("an unsuccessful urgent request releases buttons and retains content", async () => {
+		const change = mock(async (_id: string, _mode: "turn" | "tool" | "interrupt") => false);
+		await render(queueRow({ msg: queued, onChangeMode: change }));
+		await click(button(en.queuedSendUrgently));
+		expect(button(en.queuedSendUrgently).disabled).toBe(false);
+		expect(button(en.queuedSwitchToGuidance).disabled).toBe(false);
+		expect(document.body.textContent).toContain(queued.text);
+		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+	});
+
+	test("failed messages cannot urgently stop work before an explicit retry", async () => {
+		const change = mock(async (_id: string, _mode: "turn" | "tool" | "interrupt") => {});
+		await render(queueRow({ onChangeMode: change }));
+		expect(button(en.queuedSendUrgently).disabled).toBe(true);
+		expect(button(en.queuedSwitchToGuidance).disabled).toBe(false);
+		await click(button(en.queuedSwitchToGuidance));
+		expect(change.mock.calls).toEqual([["queue-message", "tool"]]);
+	});
+});
 describe("failed queued message retry UI", () => {
 	test("failed rows show full reason, input, attachments and explicit retry; queued/legacy rows do not", async () => {
 		await render(queueRow());
@@ -629,8 +931,13 @@ describe("failed queued message retry UI", () => {
 		expect(cancelEdit).toHaveBeenCalledTimes(1);
 		expect(retry).not.toHaveBeenCalled();
 		await render(queueRow({ onRetry: retry, onRemove: remove }));
-		const cancel = document.querySelector('button[title="Cancel"]');
-		if (!cancel) throw new Error("Cancel button missing");
+		const menu = document.querySelector(`button[aria-label="${en.queuedActions}"]`);
+		if (!menu) throw new Error("Queue menu button missing");
+		await click(menu);
+		const cancel = Array.from(document.querySelectorAll('[role="menuitem"]')).find(
+			(item) => item.textContent === "Cancel",
+		);
+		if (!cancel) throw new Error("Cancel menu item missing");
 		await click(cancel);
 		expect(remove).toHaveBeenCalledWith("queue-message");
 		expect(retry).not.toHaveBeenCalled();
@@ -669,8 +976,8 @@ describe("queued reference attachment editor", () => {
 				onRetry={async () => ({ ok: true, resumed: false })}
 				cancelBufferLabel="Cancel"
 				editLabel="Edit"
-				priorityLabel="Priority"
-				priorityNextRequestLabel="Next"
+				onChangeMode={async () => {}}
+				onMove={() => {}}
 			/>,
 		);
 		await click(button(`${en.removeFile}: a.ts`));
@@ -682,5 +989,397 @@ describe("queued reference attachment editor", () => {
 		expect(cancel).not.toHaveBeenCalled();
 		await click(button(`${en.removeFile}: a.ts`));
 		expect(save.disabled).toBe(true);
+	});
+});
+
+function queuePanel(overrides: Partial<QueuedMessagesPanelProps> = {}) {
+	return (
+		<QueuedMessagesPanel
+			queuedMessages={[]}
+			queueExpanded
+			editingQueuedId={null}
+			setQueueExpanded={() => {}}
+			handleDragEndQueued={() => {}}
+			handleMoveQueued={() => {}}
+			handleChangeMode={async () => {}}
+			handleSaveEditQueued={async () => true}
+			handleCancelEditQueued={() => {}}
+			handleStartEditQueued={() => {}}
+			handleRemoveQueued={() => {}}
+			handleRetryQueued={async () => ({ ok: true, resumed: false })}
+			handleCancelAllQueued={() => {}}
+			{...overrides}
+		/>
+	);
+}
+
+describe("urgent dispatch real hook and panel", () => {
+	for (const [language, strings] of [
+		["en", en],
+		["zh-CN", zh],
+	] as const) {
+		test(`${language}: sending leaves ordinary counts, ACK removes, timeout retains all attachments for retry`, async () => {
+			await i18n.changeLanguage(language);
+			const storage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+			Object.defineProperty(globalThis, "localStorage", {
+				configurable: true,
+				value: { getItem: () => null },
+			});
+			spyOn(globalThis, "fetch").mockImplementation(
+				Object.assign(async () => new Response(new Blob(["image bytes"], { type: "image/png" })), {
+					preconnect: globalThis.fetch.preconnect,
+				}),
+			);
+			const receipt = Promise.withResolvers<{ ok: true; delivered?: boolean }>();
+			const mode = spyOn(api, "setBufferedMessageMode").mockReturnValue(receipt.promise);
+			const message = {
+				id: "urgent",
+				text: "Urgent payload",
+				bufferedAt: "now",
+				imageCount: 2,
+				creator: { id: "peer", username: "peer" },
+				fileReferences: [reference],
+				images: [
+					{
+						imageId: "one",
+						filename: "one.png",
+						uploadNarratorId: "owner",
+						mediaType: "image/png",
+					},
+					{
+						imageId: "two",
+						filename: "two.png",
+						uploadNarratorId: "owner",
+						mediaType: "image/png",
+					},
+				],
+				textFiles: [{ index: 0, filename: "notes.txt", size: 10 }],
+			};
+			let setSnapshot: UseQueuedMessageActionsOptions["setQueuedMessages"] = () => {};
+			function View() {
+				const [messages, setMessages] = useState<BufferMessageSummary[]>([
+					message,
+					...["ordinary-a", "ordinary-b"].map((id) => ({
+						id,
+						text: id,
+						imageCount: 0,
+						bufferedAt: "now",
+					})),
+				]);
+				setSnapshot = setMessages;
+				const actions = useQueuedMessageActions({
+					narratorId: "queue-owner",
+					queuedMessages: messages,
+					setQueuedMessages: setMessages,
+					reconcileBufferedMessages: () => {},
+					cancelBuffer: () => {},
+					composerRef: { current: null },
+					handleSendRef: { current: () => {} },
+					handleSendWithModeRef: { current: () => {} },
+					ctrlEnterQueueModeRef: { current: "tool" },
+					t: (key) => i18n.t(key),
+				});
+				return queuePanel({
+					narratorId: "queue-owner",
+					...actions,
+					queuedMessages: actions.visibleQueuedMessages,
+				});
+			}
+			try {
+				await render(<View />);
+				await click(button(strings.queuedSendUrgently));
+				const urgent = host?.querySelector("[data-urgent-dispatches]");
+				expect(urgent?.textContent).toContain(strings.queuedUrgentSending);
+				expect(urgent?.textContent).toContain("peer");
+				expect(urgent?.textContent).toContain("notes.txt");
+				expect(urgent?.textContent).toContain("#file:a.ts:2-2");
+				expect(urgent?.querySelectorAll("[data-queue-image]")).toHaveLength(2);
+				for (const image of ["one.png", "two.png"])
+					expect(urgent?.querySelector(`img[alt="${image}"]`)).not.toBeNull();
+				for (const action of Array.from(urgent?.querySelectorAll("button") ?? []).filter(
+					(node) => node.getAttribute("aria-label") !== strings.queuedExpandText,
+				))
+					expect(action.disabled).toBe(true);
+				expect(host?.querySelector("[data-queue-summary]")?.textContent).toContain(
+					i18n.t("queuedCount", { count: 2 }),
+				);
+				expect(host?.querySelector("[data-queue-summary]")?.textContent).not.toContain(
+					strings.queueMode_interrupt,
+				);
+				await act(async () => {
+					receipt.reject(new Error("Timeout"));
+					await flush();
+				});
+				expect(host?.querySelector("[data-urgent-dispatches]")?.textContent).toContain(
+					strings.queuedUrgentUndelivered,
+				);
+				expect(host?.querySelector("[data-urgent-dispatches]")?.textContent).toContain("Timeout");
+				expect(button(strings.queuedUrgentRetry).disabled).toBe(false);
+				// Legacy ok is not a delivery receipt.
+				mode.mockResolvedValueOnce({ ok: true });
+				await click(button(strings.queuedUrgentRetry));
+				expect(host?.querySelector("[data-urgent-dispatches]")?.textContent).toContain(
+					strings.queuedUrgentUnconfirmed,
+				);
+				expect(host?.querySelectorAll("[data-queue-image]")).toHaveLength(2);
+				mode.mockResolvedValueOnce({ ok: true, delivered: true });
+				await click(button(strings.queuedUrgentRetry));
+				expect(host?.querySelector("[data-urgent-dispatches]")).toBeNull();
+				expect(host?.textContent).not.toContain(message.text);
+				await act(async () => {
+					setSnapshot((previous) => [message, ...previous]);
+				});
+				expect(host?.textContent).not.toContain(message.text);
+			} finally {
+				if (storage) Object.defineProperty(globalThis, "localStorage", storage);
+				else Reflect.deleteProperty(globalThis, "localStorage");
+			}
+		});
+	}
+});
+
+describe("real queued panel composition", () => {
+	for (const change of [
+		"cancel head",
+		"consume head",
+		"split segment",
+		"merge segments",
+		"change edited mode",
+		"move ordinary head",
+		"drag ordinary head",
+		"collapsed single grows while editing",
+	] as const) {
+		test(`unsaved body, new attachments and undo survive ${change}`, async () => {
+			let messages: QueuedMessagesPanelProps["queuedMessages"] = [
+				{ id: "head", text: "Head", queueMode: "turn", imageCount: 0, bufferedAt: "now" },
+				{ id: "edited", text: "Original", queueMode: "turn", imageCount: 0, bufferedAt: "now" },
+				{ id: "tail", text: "Tail", queueMode: "turn", imageCount: 0, bufferedAt: "now" },
+			];
+			if (change === "merge segments") messages[0].queueMode = "tool";
+			const collapsedSingle = change === "collapsed single grows while editing";
+			if (collapsedSingle) messages = [messages[1]];
+			let editingQueuedId: string | null = "edited";
+			const setQueueExpanded = mock((_expanded: boolean) => {});
+			const save = mock(
+				async (
+					_msg: unknown,
+					_text: string,
+					_payload: Parameters<QueuedMessagesPanelProps["handleSaveEditQueued"]>[2],
+				) => false,
+			);
+			const view = () =>
+				queuePanel({
+					queuedMessages: messages,
+					editingQueuedId,
+					queueExpanded: !collapsedSingle,
+					setQueueExpanded,
+					handleSaveEditQueued: save,
+					handleRemoveQueued: (id) => {
+						messages = messages.filter((message) => message.id !== id);
+					},
+					handleMoveQueued: (id, direction) => {
+						const index = messages.findIndex((message) => message.id === id);
+						const nextIndex = index + direction;
+						if (index < 0 || nextIndex < 0 || nextIndex >= messages.length) return;
+						messages = [...messages];
+						[messages[index], messages[nextIndex]] = [messages[nextIndex], messages[index]];
+					},
+				});
+			await render(view());
+			await editRange(0, "Original".length, "Unsaved body");
+			const image = new File(["gif"], "draft.gif", { type: "image/gif" });
+			const textFile = new File(["draft content"], "draft.txt", { type: "text/plain" });
+			await act(async () => {
+				const { textarea, props } = textareaProps();
+				props.onPaste?.({
+					currentTarget: textarea,
+					clipboardData: {
+						items: [image, textFile].map((file) => ({
+							kind: "file",
+							type: file.type,
+							getAsFile: () => file,
+						})),
+					},
+					preventDefault() {},
+				} as unknown as Parameters<NonNullable<typeof props.onPaste>>[0]);
+				await flush();
+			});
+			const textareaBefore = textareaProps().textarea;
+			if (change === "cancel head" || change === "move ordinary head") {
+				const menu = document.querySelectorAll(`button[aria-label="${en.queuedActions}"]`)[1];
+				if (!menu) throw new Error("Head row menu missing");
+				await click(menu);
+				const label = change === "cancel head" ? en.cancelBuffer : en.queuedMoveDown;
+				const action = Array.from(document.querySelectorAll('[role="menuitem"]')).find(
+					(node) => node.textContent === label,
+				);
+				if (!action) throw new Error(`Head action missing: ${label}`);
+				await click(action);
+			} else if (collapsedSingle) {
+				messages = [
+					...messages,
+					{ id: "new", text: "New arrival", queueMode: "turn", imageCount: 0, bufferedAt: "later" },
+				];
+			} else if (change === "consume head") {
+				messages = messages.slice(1);
+			} else if (change === "drag ordinary head") {
+				// The parent applies a drag's resulting authoritative queue order.
+				messages = [messages[1], messages[2], messages[0]];
+			} else if (change === "change edited mode") {
+				messages = messages.map((message) =>
+					message.id === "edited" ? { ...message, queueMode: "interrupt" } : message,
+				);
+			} else {
+				messages = messages.map((message) =>
+					message.id === "head"
+						? { ...message, queueMode: change === "split segment" ? "tool" : "turn" }
+						: message,
+				);
+			}
+			// A buffer_set also replaces summary objects; this must not re-seed drafts.
+			messages = messages.map((message) => ({ ...message }));
+			await render(view());
+			expect(host?.querySelector("textarea")).not.toBeNull();
+			expect(textareaProps().textarea.value).toBe("Unsaved body");
+			expect(textareaProps().textarea).toBe(textareaBefore);
+			expect(host?.querySelector('img[alt="draft.gif"]')).not.toBeNull();
+			expect(host?.textContent).toContain("draft.txt");
+			await editorKey("Enter");
+			expect(save).toHaveBeenCalledTimes(1);
+			expect(save.mock.calls[0][1]).toBe("Unsaved body");
+			expect(save.mock.calls[0][2].newImages).toEqual([image]);
+			expect(save.mock.calls[0][2].newTextFiles).toEqual([textFile]);
+			await editorKey("z", true);
+			expect(textareaProps().textarea.value).toBe("Original");
+			if (collapsedSingle) {
+				const toggle = host?.querySelector<HTMLButtonElement>("[data-queue-summary] button");
+				if (!toggle) throw new Error("Queue visibility toggle missing");
+				// Editing pins the list open and disables manual collapse until editing ends.
+				expect(toggle.getAttribute("aria-expanded")).toBe("true");
+				expect(toggle.disabled).toBe(true);
+				await click(toggle);
+				expect(setQueueExpanded).not.toHaveBeenCalled();
+				expect(textareaProps().textarea).toBe(textareaBefore);
+				editingQueuedId = null;
+				await render(view());
+				// Once editing ends, the unchanged user's collapsed preference takes effect.
+				expect(host?.querySelector("textarea")).toBeNull();
+				expect(toggle.getAttribute("aria-expanded")).toBe("false");
+				expect(toggle.disabled).toBe(false);
+				expect(host?.textContent).not.toContain("New arrival");
+				expect(setQueueExpanded).not.toHaveBeenCalled();
+			}
+		});
+	}
+	test("two-line message preview expands by pointer and keyboard without losing text", async () => {
+		const fullText = "First line\nSecond line\nThird line\nFourth line";
+		await render(
+			queueRow({ msg: { id: "long", text: fullText, imageCount: 0, bufferedAt: "now" } }),
+		);
+		const preview = document.querySelector<HTMLButtonElement>(
+			`button[aria-label="${en.queuedExpandText}"]`,
+		);
+		if (!preview) throw new Error("Expandable message preview missing");
+		expect(preview.getAttribute("aria-expanded")).toBe("false");
+		expect(preview.getAttribute("data-line-clamp")).toBe("true");
+		await click(preview);
+		expect(preview.getAttribute("aria-expanded")).toBe("true");
+		expect(preview.hasAttribute("data-line-clamp")).toBe(false);
+		expect(preview.textContent).toBe(fullText);
+		for (const key of ["Enter", " "]) {
+			await act(async () => {
+				const event = new Event("keydown", { bubbles: true, cancelable: true });
+				Object.defineProperty(event, "key", { value: key });
+				preview.dispatchEvent(event);
+			});
+			expect(preview.getAttribute("aria-expanded")).toBe(key === "Enter" ? "false" : "true");
+		}
+		expect(preview.getAttribute("aria-expanded")).toBe("true");
+		expect(preview.getAttribute("aria-label")).toBe(en.queuedCollapseText);
+	});
+
+	test("guidance modes have distinct borders and labels; only ordinary edit has a drag handle", async () => {
+		for (const [mode, color] of [
+			["turn", "default-border"],
+			["tool", "indigo-4"],
+			["interrupt", "orange-5"],
+		] as const) {
+			const msg = { id: mode, queueMode: mode, text: "Message", imageCount: 0, bufferedAt: "now" };
+			await render(queuePanel({ queuedMessages: [msg] }));
+			const body = host?.querySelector(`[data-queue-mode="${mode}"]`);
+			expect(body?.getAttribute("style")).toContain(`var(--mantine-color-${color})`);
+			expect(host?.textContent).toContain(
+				mode === "interrupt" ? en.queuedUrgentUndelivered : en[`queueMode_${mode}`],
+			);
+			if (mode === "interrupt") expect(host?.textContent).not.toContain(en.queueMode_interrupt);
+			await render(queueRow({ msg, isEditing: true }));
+			expect(host?.querySelector("[data-queue-drag-handle]") !== null).toBe(mode === "turn");
+		}
+	});
+	test("mixed guidance preserves FIFO and only consecutive modes share headings", async () => {
+		const modes = ["tool", "interrupt", "tool", "tool", "turn"] as const;
+		await render(
+			queuePanel({
+				queuedMessages: modes.map((queueMode, index) => ({
+					id: `fifo-${index}`,
+					text: `FIFO message ${index}`,
+					queueMode,
+					bufferedAt: "now",
+					imageCount: 0,
+				})),
+			}),
+		);
+		const content = host?.textContent ?? "";
+		// Urgent messages are outside the ordinary queue. Remaining guidance keeps FIFO.
+		for (const [before, after] of [
+			[0, 2],
+			[2, 3],
+			[3, 4],
+		]) {
+			expect(content.indexOf(`FIFO message ${before}`)).toBeLessThan(
+				content.indexOf(`FIFO message ${after}`),
+			);
+		}
+		expect(host?.querySelector("[data-urgent-dispatches]")?.textContent).toContain(
+			"FIFO message 1",
+		);
+		expect(host?.querySelector("[data-queue-summary]")?.textContent).not.toContain(
+			en.queueMode_interrupt,
+		);
+		// Counts and headings contain only turn/tool modes.
+		const headings = Array.from(host?.querySelectorAll("p") ?? []).filter((node) =>
+			[en.queueMode_tool, en.queueMode_interrupt, en.queueMode_turn].includes(
+				node.textContent ?? "",
+			),
+		);
+		expect(headings.map((node) => node.textContent)).toEqual([
+			en.queueMode_tool,
+			en.queueMode_turn,
+		]);
+	});
+
+	test("single message has no duplicate summary and clear lives in its row menu", async () => {
+		const clear = mock(() => {});
+		await render(
+			queuePanel({
+				queueExpanded: false,
+				handleCancelAllQueued: clear,
+				queuedMessages: [
+					{ id: "only", text: "Only message", queueMode: "tool", imageCount: 0, bufferedAt: "now" },
+				],
+			}),
+		);
+		expect(host?.querySelector("[data-queue-summary]")).toBeNull();
+		expect(host?.textContent).toContain("Only message");
+		expect((host?.textContent ?? "").split(en.queueMode_tool)).toHaveLength(2);
+		const menu = document.querySelector(`button[aria-label="${en.queuedActions}"]`);
+		if (!menu) throw new Error("Row menu missing");
+		await click(menu);
+		const clearItem = Array.from(document.querySelectorAll('[role="menuitem"]')).find(
+			(node) => node.textContent === en.clearAllQueued,
+		);
+		if (!clearItem) throw new Error("Single-row clear action missing");
+		await click(clearItem);
+		expect(clear).toHaveBeenCalledTimes(1);
 	});
 });

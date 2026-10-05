@@ -33,6 +33,8 @@ interface ContainerConfigModalProps {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON config
 	currentConfig: any;
 	opened: boolean;
+	/** Original resource binding supplied by compatibility hosts; never affects the API target. */
+	targetDescription?: string;
 	onClose: () => void;
 }
 
@@ -64,6 +66,7 @@ export function ContainerConfigModal({
 	chapterId,
 	currentConfig,
 	opened,
+	targetDescription,
 	onClose,
 }: ContainerConfigModalProps) {
 	const { t } = useTranslation("containers");
@@ -131,6 +134,16 @@ export function ContainerConfigModal({
 	return (
 		<Modal opened={opened} onClose={onClose} title={t("configModal.title")} size="lg">
 			<Stack gap="md">
+				{targetDescription && (
+					<Text
+						size="sm"
+						fw={600}
+						c="orange"
+						style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
+					>
+						{targetDescription}
+					</Text>
+				)}
 				{/* Compose file detected info (read-only) */}
 				{composeLoading ? (
 					<Loader size="xs" />

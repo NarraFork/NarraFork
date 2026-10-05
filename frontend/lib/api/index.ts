@@ -18,8 +18,10 @@ import { projectsApi } from "./projects";
 import { scheduledTasksApi } from "./scheduled-tasks";
 import { settingsApi } from "./settings";
 import { specApi } from "./spec";
+import { systemLifecycleApi } from "./system-lifecycle";
 import { terminalsApi } from "./terminals";
 import { traitLayersApi } from "./trait-layers";
+import { workspaceContextApi } from "./workspace-context";
 
 export function getAvatarUrl(userId: string, avatarImageId: string): string {
 	return `${apiBase()}/uploads/avatars/${userId}/${avatarImageId}`;
@@ -35,12 +37,14 @@ export const api = {
 	...terminalsApi,
 	...settingsApi,
 	...gitApi,
+	...workspaceContextApi,
 	...grammarsApi,
 	...integrationsApi,
 	...miscApi,
 	...modelCardsApi,
 	...knowledgeApi,
 	...specApi,
+	...systemLifecycleApi,
 	...devicesApi,
 	...traitLayersApi,
 	...oauthAppsApi,

@@ -265,7 +265,7 @@ export class PostgresRevertMutationJournal {
 			!lease ||
 			lease.kind !== "rollback" ||
 			typeof lease.assertCurrent !== "function" ||
-			lease.overlappedUncoordinatedActivity
+			(lease.activityPolicy !== "observe" && lease.overlappedUncoordinatedActivity)
 		) {
 			throw J.fail("INVALID_LEASE", "A live rollback coordinator lease is required");
 		}

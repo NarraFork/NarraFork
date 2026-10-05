@@ -1,11 +1,24 @@
 {
+	"legacyRoute": {
+		"denied": "You do not have access to this session.",
+		"missing": "This session no longer exists.",
+		"error": "Could not load this session. Please try again later."
+	},
+	"resourceFloat": {
+		"pin": "Pin as a tab in {{target}}",
+		"pinDirector": "Pin in {{target}} and switch to grid",
+		"pinRight": "Pin in a new pane on the right",
+		"pinRightDirector": "Pin on the right and switch to grid",
+		"noNeighbour": "No available pane to pin to",
+		"pinFailed": "The target pane is no longer available. The floating panel was kept."
+	},
 	"title": "Narrators",
 	"newNarrator": "New Narrator",
 	"noNarrators": "No narrators found. Create one to start a conversation.",
 	"narratorId": "Narrator {{id}}",
 	"narratorMeta": "{{model}} · {{count}} messages",
-	"newNarratorModal": "New Standalone Narrator",
-	"newNarratorDescription": "Create a standalone AI narrator not bound to any chapter. Useful for general questions and explorations.",
+	"newNarratorModal": "New Session",
+	"newNarratorDescription": "Start a conversation directly. A project is not required; choose a working directory if needed.",
 	"createNarrator": "Create Narrator",
 	"narratorNotFound": "Narrator not found",
 	"workingDirectory": "Working Directory",

@@ -15,6 +15,7 @@
  * Source of truth: `netsh interface ipv4 show excludedportrange protocol=tcp`.
  */
 
+import { execFile } from "node:child_process";
 import { logger } from "./logger";
 import { IS_WINDOWS } from "./platform";
 
@@ -162,8 +163,43 @@ function runNetsh(): string | null {
 	}
 }
 
+/** Async reader for request paths: never block the HTTP/agent event loop on netsh. */
+export async function readWindowsExcludedPortRangesAsync(
+	read: () => Promise<string | null> = runNetshAsync,
+): Promise<PortRange[]> {
+	if (!IS_WINDOWS) return [];
+	try {
+		const output = await read();
+		return output ? parseExcludedPortRanges(output) : [];
+	} catch {
+		// Unknown is not evidence that a port is reserved; let the caller try binding.
+		return [];
+	}
+}
+
+function runNetshAsync(): Promise<string | null> {
+	// execFile bounds both output streams and terminates only this child on timeout.
+	// Do not use safeSpawn here: its Windows cleanup runs synchronous taskkill.
+	return new Promise((resolve) => {
+		execFile(
+			"netsh",
+			["interface", "ipv4", "show", "excludedportrange", "protocol=tcp"],
+			{ timeout: NETSH_TIMEOUT_MS, maxBuffer: NETSH_MAX_OUTPUT_CHARS, windowsHide: true },
+			(error, stdout) => {
+				if (error) {
+					logger.debug("Could not read Windows excluded TCP port ranges asynchronously", {
+						command: NETSH_EXCLUDED_PORT_COMMAND,
+						error: error.message,
+					});
+				}
+				resolve(error ? null : stdout);
+			},
+		);
+	});
+}
+
 /**
- * Read the reserved TCP ranges on Windows.
+ * Read the reserved TCP ranges on Windows during startup.
  *
  * Fail-open by design: a missing/failing/unparsable `netsh` yields an empty list
  * so port selection falls back to plain bind attempts. Non-Windows platforms

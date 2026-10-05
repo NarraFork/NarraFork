@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
+import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { isDanglingReasoningOnlyAssistantMessage } from "@shared/reasoning-content";
@@ -43,6 +44,11 @@ import {
 	resolveAutoContinuationMode,
 } from "../lib/boolean-override";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
+import {
+	measureMessageCharacters,
+	measureSerializedCharacters,
+	queueContextCharacterRefresh,
+} from "../lib/context-characters";
 import { resolveInjectedDevices } from "../lib/device-injection-trait";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
@@ -169,6 +175,7 @@ import { buildBehaviorFenceBody, buildSpecTaskDigestBody } from "./spec-reminder
 import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
 import { drainSpecUpdatesForNarrator } from "./spec-update-queue";
 import { specVfsService } from "./spec-vfs-service";
+import { readSubagentExecutionBoundary } from "./subagent-execution-boundary";
 import { appendSubagentFileChanges } from "./subagent-file-changes";
 import { agentResultTag, resolveAgentLabel } from "./subagent-label";
 import {
@@ -179,6 +186,7 @@ import {
 } from "./subagent-manual-override";
 import { resolveSubagentModelForRun, subagentRunReasoningEffort } from "./subagent-model";
 import { isTakenOver } from "./subagent-takeover";
+import { buildFinalToolStartAuthorization } from "./tool-final-start-authorization";
 import { resolveEffectiveTraits } from "./trait-layer-service";
 import { worktreeWatcher } from "./worktree-watcher";
 
@@ -509,7 +517,12 @@ export async function applySessionDefaultDevice(
 	active: ActiveNarrator,
 	deviceId: string | null,
 ): Promise<boolean> {
-	return commitNarratorDefaultDevice(narratorId, active, deviceId);
+	await setNarratorDefaultDevice(narratorId, deviceId, {
+		origin: "agent",
+		active,
+		userId: active._currentUserId,
+	});
+	return true;
 }
 
 /**
@@ -548,24 +561,34 @@ export async function getNarratorExecutionDeviceState(narratorId: string): Promi
 export async function setNarratorDefaultDevice(
 	narratorId: string,
 	requestedDeviceId: string | null,
-): Promise<{ defaultDeviceId: string | null }> {
+	options: import("./workspace-context-service").WorkspaceSwitchOptions = { origin: "http" },
+): Promise<{
+	defaultDeviceId: string | null;
+	current: import("@shared/workspace-context").WorkspaceContext;
+}> {
 	const runtime = await assertOAuthNarratorRuntimeActive(narratorId);
 	const projectId = await resolveNarratorProjectId(narratorId);
-	const projectDevices = (await resolveSessionDevices(projectId)) ?? [];
+	const projectDevices = (await resolveSessionDevices(projectId, options.userId)) ?? [];
 	const devices = runtime ? filterOAuthSessionDevices(projectDevices, runtime) : projectDevices;
 	const resolvedDeviceId = resolveNarratorDefaultDeviceRequest(requestedDeviceId, devices, {
 		allowLocal: !runtime,
 		...(runtime ? { authorizedDeviceIds: new Set(runtime.deviceIds) } : {}),
 	});
 
-	const active = activeNarrators.get(narratorId);
-	const committed = await commitNarratorDefaultDevice(
-		narratorId,
-		active?.alive ? active : null,
-		resolvedDeviceId,
-	);
-	if (!committed) throw new NotFoundError("Narrator", narratorId);
-	return { defaultDeviceId: resolvedDeviceId };
+	const { workspaceContextService } = await import("./workspace-context-service");
+	const { current } = await workspaceContextService.switchDevice(narratorId, resolvedDeviceId, {
+		...options,
+		validateDevice: async () => {
+			const latestRuntime = await assertOAuthNarratorRuntimeActive(narratorId);
+			const latestProjectId = await resolveNarratorProjectId(narratorId);
+			const latestDevices = (await resolveSessionDevices(latestProjectId, options.userId)) ?? [];
+			resolveNarratorDefaultDeviceRequest(resolvedDeviceId, latestDevices, {
+				allowLocal: !latestRuntime,
+				...(latestRuntime ? { authorizedDeviceIds: new Set(latestRuntime.deviceIds) } : {}),
+			});
+		},
+	});
+	return { defaultDeviceId: resolvedDeviceId, current };
 }
 
 export async function executeQueuedNewCommand(
@@ -1042,7 +1065,7 @@ export async function buildSystemPrompt(
 		allowLocalExecution?: boolean;
 	},
 	planFilePath?: string,
-): Promise<{ prompt: string | null; usedCompactSummary: boolean }> {
+): Promise<import("./narrator-prompt").BuildPromptResult> {
 	return buildEffectiveSystemPrompt({
 		basePrompt: narrator.systemPrompt,
 		cwd,
@@ -3303,6 +3326,7 @@ async function updateToolCallConclusionUnlocked(opts: {
 		{
 			parentNarratorId,
 			childNarratorId: subagentId,
+			executionBoundary: await readSubagentExecutionBoundary(subagentId),
 			scope: {
 				sourceToolUseId: toolUseId,
 				startedAt: attributionTurn?.turnStartedAt ?? null,
@@ -3371,6 +3395,8 @@ export interface UserMessageAdmissionOptions {
 	fileReferences?: FileReferenceSnapshot[];
 	priority?: boolean;
 	interrupt?: boolean;
+	/** Explicit intent, compatible with legacy priority/interrupt callers. */
+	queueMode?: "turn" | "tool" | "interrupt";
 	executionIntent?: BufferedMessage["executionIntent"];
 	/** Compaction policy may require durable acceptance without starting a loop. */
 	queueOnly?: boolean;
@@ -3431,6 +3457,8 @@ export async function acceptUserMessage(
 	options: UserMessageAdmissionOptions = {},
 ): Promise<UserMessageAdmissionResult> {
 	const locale = options.locale ?? "en";
+	const queueMode =
+		options.queueMode ?? (options.interrupt ? "interrupt" : options.priority ? "tool" : "turn");
 	const result = await withNarratorStartAdmission(
 		narratorId,
 		async (): Promise<UserMessageAdmissionResult> => {
@@ -3452,11 +3480,12 @@ export async function acceptUserMessage(
 					options.userId,
 					options.creator,
 					options.textFiles,
-					options.priority || options.interrupt ? "front" : "back",
+					queueMode !== "turn" ? "front" : "back",
 					options.preBashCommand,
 					options.fileReferences,
-					"stack",
+					"fifo",
 					options.executionIntent,
+					queueMode,
 				);
 				if (!accepted.ok) throw new ValidationError("Message queue is full");
 				const queued = {
@@ -3468,14 +3497,14 @@ export async function acceptUserMessage(
 				// must not make HTTP callers retry the same input or discard its attachments.
 				let claimed: RuntimeMailboxRow | undefined;
 				try {
-					if (options.interrupt && busy) {
+					if (queueMode === "interrupt" && busy) {
 						const ownerUnchanged = getExecutionOwner(narratorId) === oldOwner;
 						const controllerUnchanged =
 							activeNarrators.get(narratorId)?.abortController === oldController;
 						const recoveryUnchanged = plannedUpdateRecoveryControls.get(narratorId) === oldRecovery;
 						if (ownerUnchanged && controllerUnchanged && recoveryUnchanged)
 							interruptNarrator(narratorId);
-					} else if (options.priority && busy) {
+					} else if (queueMode === "tool" && busy) {
 						requestBufferedMessageSoftStop(narratorId);
 					}
 					if (busy) await reconcileRunningStatus(narratorId);
@@ -4746,7 +4775,7 @@ export type ReExecuteDeniedReason =
 	| "narrator_busy";
 
 export type ReExecuteDeniedResult =
-	| { ok: true; shouldContinue?: boolean }
+	| { ok: true; shouldContinue?: boolean; errorMessage?: string }
 	| { ok: false; reason: ReExecuteDeniedReason };
 
 function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrator): void {
@@ -4807,6 +4836,7 @@ function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrat
 export const TOOL_CALL_RERUN_RESET_FIELDS = {
 	status: "initializing" as const,
 	outputJson: null,
+	outputChars: 0,
 	errorMessage: null,
 	permissionDenyMessage: null,
 	permissionDecidedBy: null,
@@ -4903,6 +4933,8 @@ async function reExecuteDeniedToolCallUnlocked(
 		autoContinue?: boolean;
 		persistedToolCallId?: string;
 		permissionMode?: "normal" | "preGranted";
+		/** Runs only after admission, before preparing the attempt or performing tool I/O. */
+		onAdmitted?: () => Promise<void>;
 	},
 ): Promise<ToolCallReexecutionLaunch> {
 	const narrator = await narratorService.getById(narratorId);
@@ -4954,6 +4986,16 @@ async function reExecuteDeniedToolCallUnlocked(
 		orderBy: [desc(narratorToolCalls.executionAttempt), desc(narratorToolCalls.createdAt)],
 	});
 
+	// Distinguish an obsolete call from an unknown ID without preparing either.
+	if (!toolCall && !restoringPersistedCall) {
+		toolCall = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			orderBy: [desc(narratorToolCalls.createdAt), desc(narratorToolCalls.executionAttempt)],
+		});
+	}
 	const rejectReason = restoringPersistedCall
 		? toolCall
 			? null
@@ -4973,20 +5015,7 @@ async function reExecuteDeniedToolCallUnlocked(
 			: {};
 
 	const sourceToolCall = toolCall;
-	const preparedAttempt = await narratorPersistence.prepareToolCallAttempt(
-		narratorId,
-		toolCall.id,
-		restoringPersistedCall,
-	);
-	toolCall = preparedAttempt.toolCall;
-	const toolCallBinding = await narratorPersistence.getToolCallBinding(
-		narratorId,
-		toolCall.messageId,
-		toolUseId,
-		toolCall.id,
-	);
-
-	// Atomically hand off the checked/prepared attempt to a long-lived work lease.
+	// Atomically hand off the checked attempt to a long-lived work lease.
 	// Await may depend on an independently running child whose Send(parent) needs
 	// this same start mutex; only the completion handle may leave the transaction.
 	const releaseRuntime = claimNarratorRuntime(narratorId, randomUUID());
@@ -5010,6 +5039,19 @@ async function reExecuteDeniedToolCallUnlocked(
 		narratorId,
 		async (): Promise<ReExecuteDeniedResult> => {
 			try {
+				await options?.onAdmitted?.();
+				const preparedAttempt = await narratorPersistence.prepareToolCallAttempt(
+					narratorId,
+					sourceToolCall.id,
+					restoringPersistedCall,
+				);
+				toolCall = preparedAttempt.toolCall;
+				const toolCallBinding = await narratorPersistence.getToolCallBinding(
+					narratorId,
+					toolCall.messageId,
+					toolUseId,
+					toolCall.id,
+				);
 				const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 				// Restore the triggering user so knowledge-base ACL works after a rebuild.
 				// The active may have been freshly recreated (interrupt destroyed the old one),
@@ -5057,6 +5099,13 @@ async function reExecuteDeniedToolCallUnlocked(
 					reviewReadOnlyBash: isSubagent && narrator.subagentType === "review",
 					allowedTools: oauthRuntime ? new Set(oauthRuntime.allowedTools) : undefined,
 					allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
+					onToolExecutionFinalAuthorization: buildFinalToolStartAuthorization({
+						narratorId,
+						cwd: active.cwd,
+						signal: active.abortController.signal,
+						userId: active._currentUserId,
+						reviewReadOnlyBash: isSubagent && narrator.subagentType === "review",
+					}),
 					runtimeAuthorizationGuard: oauthRuntime
 						? async () => {
 								await assertOAuthNarratorRuntimeActive(narratorId, active._currentUserId);
@@ -5271,7 +5320,7 @@ async function reExecuteDeniedToolCallUnlocked(
 					});
 					await narratorService.updateStatus(narratorId, "idle", { substatus: ["error"] });
 					disposeInactiveNarratorSession(narratorId, active);
-					return { ok: true, shouldContinue: false };
+					return { ok: true, shouldContinue: false, errorMessage: message };
 				}
 
 				if (options?.autoContinue === false) {
@@ -6448,7 +6497,10 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 						(block) => block.type !== "tool_use" || !toolUseIds.has(block.id as string),
 					);
 					tx.update(narratorMessages)
-						.set({ contentJson: filtered })
+						.set({
+							contentJson: filtered,
+							contextCharsJson: measureMessageCharacters("assistant", filtered),
+						})
 						.where(eq(narratorMessages.id, partialId))
 						.run();
 				}
@@ -6462,6 +6514,7 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 				return true;
 			});
 
+			if (hasContent) queueContextCharacterRefresh(narratorId, partialId);
 			if (!hasContent) {
 				// Truly empty — safe to delete
 				await cleanupPartialMessage(partialId, narratorId);
@@ -6517,13 +6570,17 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 						(block) => block.type !== "tool_use" || !unexecutedToolUseIds.has(block.id as string),
 					);
 					tx.update(narratorMessages)
-						.set({ contentJson: filtered })
+						.set({
+							contentJson: filtered,
+							contextCharsJson: measureMessageCharacters("assistant", filtered),
+						})
 						.where(eq(narratorMessages.id, partialId))
 						.run();
 				}
 			}
 		});
 
+		queueContextCharacterRefresh(narratorId, partialId);
 		logger.info("Finalized partial message with executed tool calls", {
 			narratorId,
 			partialId,
@@ -6570,6 +6627,7 @@ async function markInterruptedToolCallsForMessageUnlocked(
 			status: "fail",
 			errorMessage: "Narrator interrupted by user",
 			outputJson: getToolMessage("interruptedByUser", locale),
+			outputChars: measureSerializedCharacters(getToolMessage("interruptedByUser", locale)),
 			completedAt: new Date().toISOString(),
 		})
 		.where(
@@ -6579,6 +6637,7 @@ async function markInterruptedToolCallsForMessageUnlocked(
 				inArray(narratorToolCalls.status, [...INTERRUPTABLE_TOOL_CALL_STATUSES]),
 			),
 		);
+	queueContextCharacterRefresh(narratorId, messageId);
 }
 
 /**
@@ -6594,12 +6653,13 @@ async function cleanupOrphanedToolCalls(narratorId: string, locale: Locale = "en
 }
 
 async function cleanupOrphanedToolCallsUnlocked(narratorId: string, locale: Locale): Promise<void> {
-	await db
+	const changed = await db
 		.update(narratorToolCalls)
 		.set({
 			status: "fail",
 			errorMessage: "Narrator interrupted by user",
 			outputJson: getToolMessage("interruptedByUser", locale),
+			outputChars: measureSerializedCharacters(getToolMessage("interruptedByUser", locale)),
 			completedAt: new Date().toISOString(),
 		})
 		.where(
@@ -6607,7 +6667,9 @@ async function cleanupOrphanedToolCallsUnlocked(narratorId: string, locale: Loca
 				eq(narratorToolCalls.narratorId, narratorId),
 				inArray(narratorToolCalls.status, [...INTERRUPTABLE_TOOL_CALL_STATUSES]),
 			),
-		);
+		)
+		.returning({ messageId: narratorToolCalls.messageId });
+	for (const row of changed) queueContextCharacterRefresh(narratorId, row.messageId);
 }
 
 /**
@@ -6976,6 +7038,20 @@ export function hasPendingBufferedWork(narratorId: string): boolean {
 	return getBufferedMessages(narratorId).length > 0;
 }
 
+/** A queued next-step or failed input must never keep a guidance stop armed. */
+export function hasPendingBufferedGuidance(narratorId: string): boolean {
+	if (resolveRuntimeQueueBackend() === "postgres") {
+		// Updated after durable admission, queue mutations and consumption. The
+		// synchronous loop boundary must not inspect the PostgreSQL mailbox.
+		return activeNarrators.get(narratorId)?._bufferGuidancePending === true;
+	}
+	return getBufferedMessages(narratorId).some(
+		(message) =>
+			message.state !== "failed" &&
+			resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
+	);
+}
+
 /**
  * Decide whether the agent loop should soft-stop at the current tool boundary.
  *
@@ -7022,7 +7098,27 @@ export function requestBufferedMessageSoftStop(narratorId: string): boolean {
 	const active = activeNarrators.get(narratorId);
 	if (!active?.alive) return false;
 	active._bufferSoftStop = true;
+	active._bufferGuidancePending = true;
+	active._guidanceAbortController?.abort(new Error("Immediate guidance requested"));
 	return true;
+}
+
+export function applyBufferedQueueModeControl(
+	narratorId: string,
+	mode: "turn" | "tool" | "interrupt",
+	hasPendingGuidance = true,
+	targetQueued = true,
+): void {
+	const active = activeNarrators.get(narratorId);
+	if (active) active._bufferGuidancePending = hasPendingGuidance;
+	if (!targetQueued) return;
+	if (mode === "turn") {
+		clearBufferedMessageSoftStopIfIdle(narratorId, hasPendingGuidance);
+		return;
+	}
+	if (!isNarratorRuntimeBusy(narratorId) && !isLoopRunning(narratorId)) return;
+	if (mode === "interrupt") interruptNarrator(narratorId);
+	else requestBufferedMessageSoftStop(narratorId);
 }
 
 /**
@@ -7043,22 +7139,20 @@ export function requestBufferedMessageSoftStop(narratorId: string): boolean {
  */
 export function rearmCutInSoftStopBeforeContinuing(active: ActiveNarrator): void {
 	if (!active._bufferSoftStopTaken) return;
-	if (!hasPendingBufferedWork(active.narratorId)) return;
+	if (!hasPendingBufferedGuidance(active.narratorId)) return;
 	active._bufferSoftStopTaken = false;
 	active._bufferSoftStop = true;
 }
 
-/**
- * Drop a pending soft-stop request when its queued input is gone (cancelled or
- * fully consumed). Without this the flag survives until the next tool boundary
- * and ends the turn with nothing to resume, which looks like the narrator
- * stopping on its own right after the current tool call.
- */
-export function clearBufferedMessageSoftStopIfIdle(narratorId: string): void {
+export function clearBufferedMessageSoftStopIfIdle(
+	narratorId: string,
+	pendingGuidance?: boolean,
+): void {
 	const active = activeNarrators.get(narratorId);
-	if (!active?._bufferSoftStop) return;
-	if (hasPendingBufferedWork(narratorId)) return;
-	active._bufferSoftStop = false;
+	if (!active) return;
+	const pending = pendingGuidance ?? hasPendingBufferedGuidance(narratorId);
+	active._bufferGuidancePending = pending;
+	if (!pending && active._bufferSoftStop) active._bufferSoftStop = false;
 }
 
 // === Dynamic narrator controls ===
@@ -7413,6 +7507,21 @@ export interface NarratorStartupProtectionSets {
 }
 
 /** Clean up stale in-progress states left by a previous server run. */
+/** Bounded audit maintenance, also used by isolated restart fixtures. */
+export async function recoverPermissionRuleRequestAuditsOnStartup(): Promise<void> {
+	const { recoverPermissionRuleRequests } = await import("./permission-rule-request-service");
+	let after: string | undefined;
+	do {
+		const page = recoverPermissionRuleRequests({
+			after,
+			limit: 100,
+			reason: "Interrupted by server restart",
+		});
+		after = page.nextCursor;
+		if (after) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+	} while (after);
+}
+
 export async function recoverOnStartup(
 	protection: NarratorStartupProtectionSets = {},
 ): Promise<void> {
@@ -7428,6 +7537,10 @@ export async function recoverOnStartup(
 	// On restart (or hot reload), old fs.watch handles may leak if the previous
 	// process didn't shut down cleanly, causing phantom CPU usage from inotify.
 	worktreeWatcher.shutdown();
+
+	// A restart invalidates attempt-bound approval authority, including approved
+	// rows whose tool had not reached consume. Never apply yesterday's receipt.
+	await recoverPermissionRuleRequestAuditsOnStartup();
 
 	const now = new Date().toISOString();
 	// Legacy status migrations (from older DB versions).
@@ -7569,6 +7682,7 @@ export async function recoverOnStartup(
 				status: "fail",
 				errorMessage: "Interrupted by server restart",
 				outputJson: getToolMessage("interruptedByServerRestart"),
+				outputChars: measureSerializedCharacters(getToolMessage("interruptedByServerRestart")),
 			})
 			.where(
 				inArray(
@@ -7576,6 +7690,8 @@ export async function recoverOnStartup(
 					staleToolCalls.map((toolCall) => toolCall.id),
 				),
 			);
+		for (const call of staleToolCalls)
+			queueContextCharacterRefresh(call.narratorId, call.messageId);
 		logger.info("Stale running tool calls marked as failed on startup", {
 			count: staleToolCalls.length,
 		});
@@ -7594,6 +7710,7 @@ export async function recoverOnStartup(
 				status: "fail",
 				errorMessage: "Interrupted by server restart",
 				outputJson: getToolMessage("interruptedByServerRestart"),
+				outputChars: measureSerializedCharacters(getToolMessage("interruptedByServerRestart")),
 			})
 			.where(
 				inArray(
@@ -7601,6 +7718,8 @@ export async function recoverOnStartup(
 					staleInitializing.map((toolCall) => toolCall.id),
 				),
 			);
+		for (const call of staleInitializing)
+			queueContextCharacterRefresh(call.narratorId, call.messageId);
 		logger.info("Stale initializing tool calls marked as failed on startup", {
 			count: staleInitializing.length,
 		});

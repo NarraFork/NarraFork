@@ -20,7 +20,6 @@ import { NarratorDockContext } from "../dock/NarratorDockContext";
 import {
 	BrowserDockPanel as BrowserToolAdapter,
 	DetailsDockPanel as DetailsToolAdapter,
-	FileModDockPanel as FileModToolAdapter,
 	FileTreeDockPanel as FileTreeToolAdapter,
 	FileDockPanel as FileViewerAdapter,
 	GitDockPanel as GitToolAdapter,
@@ -30,6 +29,7 @@ import {
 	SubagentSessionPanelContent,
 	TasksDockPanel as TasksToolAdapter,
 	TerminalDockPanel as TerminalToolAdapter,
+	ToolPanelShell,
 	UserChatDockPanel as UserChatToolAdapter,
 } from "../dock/panels";
 import { useFilePanelSourceOpener } from "../file-panel/file-panel-navigation";
@@ -53,10 +53,12 @@ import {
 	type WorkspaceKnowledgePanelParams,
 	type WorkspacePanelParams,
 } from "./panel-types";
+import { WorkspaceResourceFrame } from "./WorkspaceResourceFrame";
 import {
 	useWorkspaceDirectorActive,
 	useWorkspaceId,
 	useWorkspaceNarratorDockValue,
+	workspaceResourceOwner,
 } from "./workspace-dock";
 
 export type {
@@ -77,7 +79,7 @@ const WorkspaceTerminalPanel = lazy(() =>
 	})),
 );
 
-/** Narrator cell adapter. Child sessions open as secondary Dockview tabs. */
+/** Narrator cell adapter. Child sessions use the shared temporary resource window. */
 function NarratorDockPanel(props: IDockviewPanelProps<NarratorPanelParams>) {
 	const { narratorId } = props.params;
 	const { ref: compactRef, compact } = usePanelCompact();
@@ -98,7 +100,7 @@ function NarratorDockPanel(props: IDockviewPanelProps<NarratorPanelParams>) {
 	const { data: narratorData } = useNarrator(narratorId);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON entity
 	const narratorTitle = (narratorData as any)?.title as string | undefined;
-	const dockValue = useWorkspaceNarratorDockValue(narratorId);
+	const dockValue = useWorkspaceNarratorDockValue(narratorId, props.api.id);
 
 	useLayoutEffect(() => {
 		const title = narratorTitle?.trim();
@@ -130,8 +132,7 @@ function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
 	const { hostNarratorId, subagentNarratorId, highlightMessageId, highlightRequestId } =
 		props.params;
 	const { ref, compact } = usePanelCompact();
-	const directorActive = useWorkspaceDirectorActive();
-	const dockValue = useWorkspaceNarratorDockValue(hostNarratorId);
+	const dockValue = useWorkspaceNarratorDockValue(hostNarratorId, props.api.id);
 	const openFilePanel = useFilePanelSourceOpener(
 		dockValue?.openFilePanel,
 		props.api.id,
@@ -145,8 +146,6 @@ function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
 		},
 		[props.api],
 	);
-
-	if (directorActive) return null;
 
 	return (
 		<Box ref={ref} style={{ height: "100%", overflow: "hidden" }}>
@@ -166,14 +165,14 @@ function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
 }
 
 /**
- * Narrator-scoped tool panel adapter (terminal / details / filemod / spec /
+ * Narrator-scoped tool panel adapter (terminal / details / spec /
  * git / browser). Reuses the focus dock's tool adapters verbatim — they read
  * `narratorId` / `chapterId` and published props from the dock context, so we
  * just provide a per-narrator context and delegate by `toolType`.
  */
 function NarratorToolDockPanel(props: IDockviewPanelProps<NarratorToolPanelParams>) {
 	const { toolType, narratorId } = props.params;
-	const dockValue = useWorkspaceNarratorDockValue(narratorId);
+	const dockValue = useWorkspaceNarratorDockValue(narratorId, props.api.id);
 
 	if (!dockValue) {
 		return (
@@ -208,9 +207,6 @@ function NarratorToolDockPanel(props: IDockviewPanelProps<NarratorToolPanelParam
 			break;
 		case "details":
 			inner = <DetailsToolAdapter {...toolProps} />;
-			break;
-		case "filemod":
-			inner = <FileModToolAdapter {...toolProps} />;
 			break;
 		case "spec":
 			inner = <SpecToolAdapter {...toolProps} />;
@@ -342,9 +338,7 @@ function WebviewDockPanel(props: IDockviewPanelProps<WebviewPanelParams>) {
  */
 function WorkspaceFileDockPanel(props: IDockviewPanelProps<WorkspaceFilePanelParams>) {
 	// Preserve the host bridge and resource identity, including device and navigation.
-	const directorActive = useWorkspaceDirectorActive();
-	const dockValue = useWorkspaceNarratorDockValue(props.params.hostNarratorId);
-	if (directorActive) return null;
+	const dockValue = useWorkspaceNarratorDockValue(props.params.hostNarratorId, props.api.id);
 
 	const adaptedParams: FilePanelParams = { ...props.params, panelType: "file" };
 	const fileProps = { ...props, params: adaptedParams } as IDockviewPanelProps<FilePanelParams>;
@@ -361,9 +355,6 @@ function WorkspaceFileDockPanel(props: IDockviewPanelProps<WorkspaceFilePanelPar
  * only adaptation is dropping the workspace-only `hostNarratorId`.
  */
 function WorkspaceKnowledgeDockPanel(props: IDockviewPanelProps<WorkspaceKnowledgePanelParams>) {
-	const directorActive = useWorkspaceDirectorActive();
-	if (directorActive) return null;
-
 	const adaptedParams: KnowledgePanelParams = {
 		panelType: "knowledge",
 		entryId: props.params.entryId,
@@ -379,8 +370,37 @@ function WorkspaceKnowledgeDockPanel(props: IDockviewPanelProps<WorkspaceKnowled
 
 function WorkspacePluginDockPanel(props: Parameters<typeof PluginDockPanel>[0]) {
 	const directorActive = useWorkspaceDirectorActive();
-	if (directorActive) return null;
-	return <PluginDockPanel {...props} />;
+	const owner = workspaceResourceOwner(props.params);
+	const [title, setTitle] = useState(props.api.title);
+	useLayoutEffect(() => {
+		const subscription = props.api.onDidTitleChange(({ title }) => setTitle(title));
+		return () => subscription.dispose();
+	}, [props.api]);
+	// Surface-owned plugins still have a Director counterpart; resources do not.
+	if (directorActive && !owner) return null;
+	if (!owner) return <PluginDockPanel {...props} />;
+	return (
+		<ToolPanelShell
+			props={props}
+			subjectId={owner}
+			title={title || props.params.fallback?.title || props.params.pluginId}
+		>
+			<PluginDockPanel {...props} />
+		</ToolPanelShell>
+	);
+}
+
+/** Stable wrappers preserve resource instances across floating and pinned locations. */
+function withResourceFrame<P extends WorkspacePanelParams>(
+	Panel: React.FunctionComponent<IDockviewPanelProps<P>>,
+) {
+	return function ResourcePanel(props: IDockviewPanelProps<P>) {
+		return (
+			<WorkspaceResourceFrame props={props}>
+				<Panel {...props} />
+			</WorkspaceResourceFrame>
+		);
+	};
 }
 
 /** Component registry passed to <DockviewReact components={...} />. */
@@ -388,10 +408,10 @@ export const workspacePanelComponents = {
 	[PANEL_COMPONENT.narrator]: NarratorDockPanel,
 	[PANEL_COMPONENT.terminal]: TerminalDockPanel,
 	[PANEL_COMPONENT.webview]: WebviewDockPanel,
-	[PANEL_COMPONENT.narratorTool]: NarratorToolDockPanel,
-	[PANEL_COMPONENT.subagent]: SubagentDockPanel,
-	[PANEL_COMPONENT.file]: WorkspaceFileDockPanel,
-	[PANEL_COMPONENT.knowledge]: WorkspaceKnowledgeDockPanel,
-	[PANEL_COMPONENT.plugin]: WorkspacePluginDockPanel,
+	[PANEL_COMPONENT.narratorTool]: withResourceFrame(NarratorToolDockPanel),
+	[PANEL_COMPONENT.subagent]: withResourceFrame(SubagentDockPanel),
+	[PANEL_COMPONENT.file]: withResourceFrame(WorkspaceFileDockPanel),
+	[PANEL_COMPONENT.knowledge]: withResourceFrame(WorkspaceKnowledgeDockPanel),
+	[PANEL_COMPONENT.plugin]: withResourceFrame(WorkspacePluginDockPanel),
 	// biome-ignore lint/suspicious/noExplicitAny: dockview panel registry is heterogeneous
 } satisfies Record<string, React.FunctionComponent<IDockviewPanelProps<any>>>;

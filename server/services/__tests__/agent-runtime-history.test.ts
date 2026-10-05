@@ -59,6 +59,9 @@ function message(
 	};
 }
 
+// Numeric composition/cache tests now live in narrator-context-composition.test.ts.
+// Runtime history semantics remain independently covered below.
+
 test.each([
 	false,
 	true,

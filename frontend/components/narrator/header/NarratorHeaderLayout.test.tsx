@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { Root } from "react-dom/client";
+import type { PanelHeaderControls } from "../panels/panel-header-controls";
 import type { HeaderAfterTitleInput } from "./header-title-width";
 import { resolveHeaderLayoutAfterTitle } from "./header-title-width";
 import type { NarratorHeaderLayoutSnapshot } from "./NarratorHeaderLayout";
@@ -85,10 +86,16 @@ afterEach(async () => {
 	restore();
 });
 
-async function mount(initial: Input = DEFAULT_INPUT, strict = false) {
+async function mount(
+	initial: Input = DEFAULT_INPUT,
+	strict = false,
+	initialControls: PanelHeaderControls | null = null,
+) {
 	const { createElement, StrictMode } = await import("react");
 	const { createRoot } = await import("react-dom/client");
 	const { NarratorHeaderLayout } = await import("./NarratorHeaderLayout");
+	const { PanelHeaderControlsProvider } = await import("../panels/panel-header-controls");
+	let controls = initialControls;
 	const counts = { panel: 0, body: 0, header: 0 };
 	let input = initial;
 	let last: NarratorHeaderLayoutSnapshot | null = null;
@@ -117,7 +124,11 @@ async function mount(initial: Input = DEFAULT_INPUT, strict = false) {
 	const render = () =>
 		flush(() =>
 			root.render(
-				strict ? createElement(StrictMode, null, createElement(Panel)) : createElement(Panel),
+				createElement(
+					PanelHeaderControlsProvider,
+					{ value: controls },
+					strict ? createElement(StrictMode, null, createElement(Panel)) : createElement(Panel),
+				),
 			),
 		);
 	render();
@@ -145,10 +156,17 @@ async function mount(initial: Input = DEFAULT_INPUT, strict = false) {
 			input = next;
 			render();
 		},
+		updateControls(next: PanelHeaderControls | null) {
+			controls = next;
+			render();
+		},
 	};
 }
 
-function expected(width: number, input = DEFAULT_INPUT): NarratorHeaderLayoutSnapshot {
+function expected(
+	width: number,
+	input: Omit<HeaderAfterTitleInput, "rowWidth"> = DEFAULT_INPUT,
+): NarratorHeaderLayoutSnapshot {
 	const { titleWidth, visibleToolCount, unmeasured } = resolveHeaderLayoutAfterTitle({
 		...input,
 		rowWidth: width,
@@ -244,6 +262,29 @@ describe("NarratorHeaderLayout resize isolation", () => {
 			harness.update(input);
 			expect(harness.layout()).toEqual(expected(600, input));
 		}
+	});
+
+	it("budgets host pin from context and recomputes when it appears or disappears", async () => {
+		const harness = await mount();
+		harness.resize(600);
+		const plain = harness.layout();
+		harness.updateControls({ pinAction: "pin" });
+		expect(harness.layout()).toEqual(expected(600, { ...DEFAULT_INPUT, showPin: true }));
+		expect(harness.layout()?.titleWidth).toBe(DEFAULT_INPUT.titleFullWidth);
+		expect(harness.layout()?.visibleToolCount).toBeLessThan(plain?.visibleToolCount ?? 0);
+		harness.updateControls(null);
+		expect(harness.layout()).toEqual(plain);
+	});
+
+	it("does not reserve a pin when close is absent and keeps pinned narrow chrome inside the row", async () => {
+		const harness = await mount(DEFAULT_INPUT, false, { pinAction: "pin" });
+		harness.resize(350);
+		expect(harness.layout()).toEqual(expected(350, { ...DEFAULT_INPUT, showPin: true }));
+		expect(harness.layout()?.visibleToolCount).toBe(0);
+		expect(harness.layout()?.titleWidth).toBe(DEFAULT_INPUT.titleFullWidth);
+		const withoutClose = { ...DEFAULT_INPUT, showClose: false };
+		harness.update(withoutClose);
+		expect(harness.layout()).toEqual(expected(350, withoutClose));
 	});
 
 	it("updates unknown-width options without inventing a no-room shortfall", async () => {

@@ -58,7 +58,7 @@ export interface WebviewPanelParams extends WorkspaceMemberRowRef {
 }
 
 /**
- * Params carried by a narrator-bound tool panel (terminal / details / filemod /
+ * Params carried by a narrator-bound tool panel (terminal / details /
  * spec / git / browser) opened next to a narrator cell in the workspace. Mirrors
  * the focus dock's resource panels, but scoped to a specific narrator so several
  * clusters can coexist on one workspace surface.

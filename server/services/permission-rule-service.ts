@@ -8,7 +8,9 @@ import {
 } from "@server/db/schema";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
+import { logger } from "@server/lib/logger";
 import { and, eq } from "drizzle-orm";
+import { executionPolicyEngine } from "./execution-policy/engine";
 import {
 	normalizeCommandBlacklistRule,
 	normalizeCommandWhitelistRule,
@@ -24,6 +26,7 @@ import type {
 	LegacyDirectoryBlacklistEntry,
 	LegacyDirectoryWhitelistEntry,
 } from "./execution-policy/types";
+import { isSignedReviewBoundaryRow } from "./narrator-review-boundary";
 
 export type PermissionRuleType = ExecutionPermissionRule["ruleType"];
 
@@ -58,7 +61,18 @@ class PermissionPolicyChangeEmitter {
 	}
 
 	emit(event: PermissionPolicyChangeEvent): void {
-		this.emitter.emit("changed", event);
+		// Observers may immediately launch their next call; clear first, never after broadcast.
+		executionPolicyEngine.invalidate(event.narratorId);
+		for (const listener of this.emitter.listeners("changed")) {
+			try {
+				listener(event);
+			} catch (error) {
+				logger.warn("Permission policy observer failed after commit", {
+					narratorId: event.narratorId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 	}
 }
 
@@ -119,6 +133,24 @@ function rulesFromSet(set: ExecutionPolicyRuleSet): ExecutionPermissionRule[] {
 }
 
 class PermissionRuleService {
+	private assertEditableNarratorRule(
+		narratorId: string,
+		ruleType: PermissionRuleType,
+		ruleId: string,
+	): void {
+		if (ruleType !== "directoryBlacklist") return;
+		// Check the stored row, never the replacement path/selector supplied by the API.
+		const row = db
+			.select()
+			.from(narratorBlacklistDirs)
+			.where(
+				and(eq(narratorBlacklistDirs.narratorId, narratorId), eq(narratorBlacklistDirs.id, ruleId)),
+			)
+			.get();
+		if (row && isSignedReviewBoundaryRow(row))
+			throw new ValidationError("Inherited review workspace boundaries are immutable");
+	}
+
 	async listNarratorRules(narratorId: string): Promise<ExecutionPolicyRuleSet> {
 		const [whitelistDirs, blacklistDirs, commandWhitelist, commandBlacklist] = await Promise.all([
 			db
@@ -182,6 +214,7 @@ class PermissionRuleService {
 	): Promise<ExecutionPermissionRule> {
 		const normalized = normalizePermissionRuleInput(input);
 		if (!normalized.id) throw new ValidationError("Permission rule id is required");
+		this.assertEditableNarratorRule(narratorId, normalized.ruleType, normalized.id);
 		const current = rulesFromSet(await this.listNarratorRules(narratorId));
 		if (
 			!current.some((rule) => rule.ruleType === normalized.ruleType && rule.id === normalized.id)
@@ -208,6 +241,7 @@ class PermissionRuleService {
 		ruleType: PermissionRuleType,
 		ruleId: string,
 	): Promise<void> {
+		this.assertEditableNarratorRule(narratorId, ruleType, ruleId);
 		const deleted = await this.deleteRuleRow(narratorId, ruleType, ruleId);
 		if (!deleted) throw new NotFoundError("Permission rule", ruleId);
 		const now = new Date().toISOString();
@@ -221,62 +255,79 @@ class PermissionRuleService {
 		});
 	}
 
-	private async insertRule(narratorId: string, rule: ExecutionPermissionRule): Promise<void> {
+	/** Synchronous insert for the bounded request terminal-CAS transaction. */
+	insertRule(
+		narratorId: string,
+		rule: ExecutionPermissionRule,
+		store: Pick<typeof db, "insert"> = db,
+	): void {
 		if (!rule.id || !rule.createdAt || !rule.updatedAt) {
 			throw new ValidationError("Permission rule storage metadata is incomplete");
 		}
 		const target = selectorToStorage(rule.selector);
 		switch (rule.ruleType) {
 			case "directoryWhitelist":
-				await db.insert(narratorWhitelistDirs).values({
-					id: rule.id,
-					narratorId,
-					path: rule.path,
-					pathFlavor: rule.pathFlavor,
-					pathKey: rule.pathKey,
-					accessLevel: rule.accessLevel,
-					enabled: rule.enabled,
-					...target,
-					createdAt: rule.createdAt,
-					updatedAt: rule.updatedAt,
-				});
+				store
+					.insert(narratorWhitelistDirs)
+					.values({
+						id: rule.id,
+						narratorId,
+						path: rule.path,
+						pathFlavor: rule.pathFlavor,
+						pathKey: rule.pathKey,
+						accessLevel: rule.accessLevel,
+						enabled: rule.enabled,
+						...target,
+						createdAt: rule.createdAt,
+						updatedAt: rule.updatedAt,
+					})
+					.run();
 				return;
 			case "directoryBlacklist":
-				await db.insert(narratorBlacklistDirs).values({
-					id: rule.id,
-					narratorId,
-					path: rule.path,
-					pathFlavor: rule.pathFlavor,
-					pathKey: rule.pathKey,
-					denyLevel: rule.denyLevel,
-					enabled: rule.enabled,
-					...target,
-					createdAt: rule.createdAt,
-					updatedAt: rule.updatedAt,
-				});
+				store
+					.insert(narratorBlacklistDirs)
+					.values({
+						id: rule.id,
+						narratorId,
+						path: rule.path,
+						pathFlavor: rule.pathFlavor,
+						pathKey: rule.pathKey,
+						denyLevel: rule.denyLevel,
+						enabled: rule.enabled,
+						...target,
+						createdAt: rule.createdAt,
+						updatedAt: rule.updatedAt,
+					})
+					.run();
 				return;
 			case "commandWhitelist":
-				await db.insert(narratorWhitelistCmds).values({
-					id: rule.id,
-					narratorId,
-					pattern: rule.pattern,
-					enabled: rule.enabled,
-					...target,
-					createdAt: rule.createdAt,
-					updatedAt: rule.updatedAt,
-				});
+				store
+					.insert(narratorWhitelistCmds)
+					.values({
+						id: rule.id,
+						narratorId,
+						pattern: rule.pattern,
+						enabled: rule.enabled,
+						...target,
+						createdAt: rule.createdAt,
+						updatedAt: rule.updatedAt,
+					})
+					.run();
 				return;
 			case "commandBlacklist":
-				await db.insert(narratorBlacklistCmds).values({
-					id: rule.id,
-					narratorId,
-					pattern: rule.pattern,
-					denyPrompt: rule.denyPrompt,
-					enabled: rule.enabled,
-					...target,
-					createdAt: rule.createdAt,
-					updatedAt: rule.updatedAt,
-				});
+				store
+					.insert(narratorBlacklistCmds)
+					.values({
+						id: rule.id,
+						narratorId,
+						pattern: rule.pattern,
+						denyPrompt: rule.denyPrompt,
+						enabled: rule.enabled,
+						...target,
+						createdAt: rule.createdAt,
+						updatedAt: rule.updatedAt,
+					})
+					.run();
 		}
 	}
 

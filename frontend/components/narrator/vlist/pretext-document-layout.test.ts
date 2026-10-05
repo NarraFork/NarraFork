@@ -93,6 +93,7 @@ function reasoningBodyMessage(
 ): NarratorMsg {
 	return {
 		...message(id, 1, "assistant", ""),
+		...(structured ? { model: "gpt-5.6" } : {}),
 		contentJson: [
 			{
 				type: "reasoning",
@@ -211,6 +212,7 @@ describe("buildPretextDocumentLayout", () => {
 		const messages = [
 			{
 				...message("multi-body", 1, "assistant", ""),
+				model: "gpt-5.6",
 				contentJson: [
 					{ type: "reasoning", id: "run-a", text: `**A first**\n\n${long}` },
 					{ type: "reasoning", id: "run-a-next", text: `**A second**\n\n${long}` },

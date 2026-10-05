@@ -57,6 +57,249 @@ test("workspace serialization drops navigation but preserves membership and devi
 	expect(layout.panels.file.params?.selection).toBeDefined();
 });
 
+function arrangementWithFloatingResources(): SerializedDockview {
+	const group = (id: string, views: string[]) => ({ id, views, activeView: views[0] });
+	const leaf = (id: string, views: string[]) => ({ type: "leaf", data: group(id, views) });
+	const grid = (data: unknown[]) => ({
+		root: { type: "branch", data },
+		width: 1200,
+		height: 800,
+		orientation: "HORIZONTAL",
+	});
+	const panelIds = [
+		"chat",
+		"second",
+		"persisted",
+		"nested-persisted",
+		"popout-persisted",
+		"edge-persisted",
+		"tmp-file",
+		"tmp-grid",
+		"tmp-popout",
+		"tmp-edge",
+	];
+	return {
+		grid: grid([
+			leaf("main", ["chat"]),
+			{
+				type: "branch",
+				data: [leaf("secondary", ["second"]), leaf("tmp-grid-group", ["tmp-grid"])],
+			},
+		]),
+		panels: Object.fromEntries(
+			panelIds.map((id) => [
+				id,
+				{
+					id,
+					contentComponent: "file",
+					params: { panelType: "file", hostNarratorId: "n", filePath: `/repo/${id}.ts` },
+				},
+			]),
+		),
+		floatingGroups: [
+			{
+				data: group("temporary", ["tmp-file"]),
+				position: { left: 10, top: 20, width: 400, height: 300 },
+			},
+			{
+				data: group("persisted-float", ["persisted"]),
+				position: { left: 40, top: 60, width: 500, height: 350 },
+			},
+			{
+				grid: grid([
+					leaf("nested", ["tmp-file", "nested-persisted"]),
+					leaf("tmp-nested", ["tmp-grid"]),
+				]),
+				position: { left: 70, top: 80, width: 700, height: 450 },
+			},
+		],
+		popoutGroups: [
+			{ data: group("tmp-popout-group", ["tmp-popout"]), position: null },
+			{
+				grid: grid([leaf("popout", ["tmp-popout", "popout-persisted"])]),
+				position: null,
+				url: "/popout",
+				gridReferenceGroup: "tmp-grid-group",
+			},
+		],
+		edgeGroups: {
+			left: { size: 200, visible: true, group: group("tmp-edge-group", ["tmp-edge"]) },
+			right: { size: 250, visible: true, group: group("edge", ["tmp-edge", "edge-persisted"]) },
+		},
+		activeGroup: "temporary",
+	} as unknown as SerializedDockview;
+}
+
+const transientResourceIds = new Set(["tmp-file", "tmp-grid", "tmp-popout", "tmp-edge"]);
+
+function saveArrangement(layout: SerializedDockview, activeGroup?: string | null) {
+	return JSON.parse(
+		serializeWorkspaceLayout(
+			{ toJSON: () => layout } as unknown as DockviewApi,
+			DEFAULT_DIRECTOR_STATE,
+			transientResourceIds,
+			activeGroup,
+		),
+	).layout;
+}
+
+describe("durable workspace serialization", () => {
+	test("temporary floats disappear without losing legacy and nested durable floating windows", () => {
+		const layout = arrangementWithFloatingResources();
+		const before = structuredClone(layout);
+		const saved = saveArrangement(layout);
+		expect(Object.keys(saved.panels)).toEqual([
+			"chat",
+			"second",
+			"persisted",
+			"nested-persisted",
+			"popout-persisted",
+			"edge-persisted",
+		]);
+		expect(saved.floatingGroups).toHaveLength(2);
+		expect(saved.floatingGroups[0]).toEqual(before.floatingGroups?.[1]);
+		expect(saved.floatingGroups[1].grid.root.data).toEqual([
+			{
+				type: "leaf",
+				data: { id: "nested", views: ["nested-persisted"], activeView: "nested-persisted" },
+			},
+		]);
+		expect(saved.activeGroup).toBe("main");
+		expect(layout).toEqual(before);
+		for (const id of transientResourceIds) expect(JSON.stringify(saved)).not.toContain(id);
+	});
+
+	test("nested grid, popout and edge references are pruned together", () => {
+		const saved = saveArrangement(arrangementWithFloatingResources());
+		expect(saved.grid.root.data[1].data).toEqual([
+			{ type: "leaf", data: { id: "secondary", views: ["second"], activeView: "second" } },
+		]);
+		expect(saved.popoutGroups).toHaveLength(1);
+		expect(saved.popoutGroups[0].url).toBe("/popout");
+		expect(saved.popoutGroups[0].gridReferenceGroup).toBeUndefined();
+		expect(saved.popoutGroups[0].grid.root.data[0].data.activeView).toBe("popout-persisted");
+		expect(saved.edgeGroups.left).toBeUndefined();
+		expect(saved.edgeGroups.right.group).toEqual({
+			id: "edge",
+			views: ["edge-persisted"],
+			activeView: "edge-persisted",
+		});
+	});
+
+	test("previous durable active group wins over temporary focus and missing groups fall back", () => {
+		const layout = arrangementWithFloatingResources();
+		expect(saveArrangement(layout, "secondary").activeGroup).toBe("secondary");
+		expect(saveArrangement(layout, "missing").activeGroup).toBe("main");
+		expect(saveArrangement(layout, null).activeGroup).toBe("main");
+		expect(saveArrangement(layout, "temporary").activeGroup).toBe("main");
+	});
+
+	test("undefined durable focus preserves a surviving floating active group", () => {
+		const layout = arrangementWithFloatingResources();
+		layout.activeGroup = "persisted-float";
+		expect(saveArrangement(layout).activeGroup).toBe("persisted-float");
+		expect(saveArrangement(layout, null).activeGroup).toBe("main");
+	});
+
+	test("optional arguments preserve old arrangements verbatim and keep navigation stripping", () => {
+		const layout = arrangementWithFloatingResources();
+		const api = { toJSON: () => layout } as unknown as DockviewApi;
+		layout.panels.persisted.params = {
+			...layout.panels.persisted.params,
+			highlightRequestId: "jump",
+			selection: { startLine: 4 },
+		};
+		const before = structuredClone(layout);
+		delete before.panels.persisted.params?.highlightRequestId;
+		delete before.panels.persisted.params?.selection;
+		const oldSaved = JSON.parse(serializeWorkspaceLayout(api, DEFAULT_DIRECTOR_STATE));
+		const emptySetSaved = JSON.parse(
+			serializeWorkspaceLayout(api, DEFAULT_DIRECTOR_STATE, new Set()),
+		);
+		expect(oldSaved.layout).toEqual(before);
+		expect(emptySetSaved).toEqual(oldSaved);
+		expect(resolveWorkspaceLayout(JSON.stringify(oldSaved))).toMatchObject({
+			kind: "dockview",
+			layout: before,
+		});
+		expect(saveArrangement(layout).panels.persisted.params.highlightRequestId).toBeUndefined();
+		expect(saveArrangement(layout).panels.persisted.params.selection).toBeUndefined();
+		expect(layout.panels.persisted.params?.highlightRequestId).toBe("jump");
+	});
+
+	test("temporary floating open leaves durable serialization byte-identical", () => {
+		const baseline = arrangementWithFloatingResources();
+		baseline.panels = { chat: baseline.panels.chat };
+		baseline.grid.root = {
+			type: "branch",
+			data: [{ type: "leaf", data: { id: "main", views: ["chat"], activeView: "chat" } }],
+		};
+		baseline.activeGroup = "main";
+		delete baseline.floatingGroups;
+		delete baseline.popoutGroups;
+		delete baseline.edgeGroups;
+		const serialize = (layout: SerializedDockview, temporary?: ReadonlySet<string>) =>
+			serializeWorkspaceLayout(
+				{ toJSON: () => layout } as unknown as DockviewApi,
+				DEFAULT_DIRECTOR_STATE,
+				temporary,
+			);
+		const initial = serialize(baseline);
+		const opened = structuredClone(baseline);
+		opened.panels["tmp-file"] = arrangementWithFloatingResources().panels["tmp-file"];
+		opened.floatingGroups = arrangementWithFloatingResources().floatingGroups?.slice(0, 1);
+		opened.activeGroup = "temporary";
+		const before = structuredClone(opened);
+		expect(serialize(opened, new Set(["tmp-file"]))).toBe(initial);
+		expect(opened).toEqual(before);
+
+		const emptyCollections = {
+			...baseline,
+			floatingGroups: [],
+			popoutGroups: [],
+			edgeGroups: {},
+		};
+		expect(serialize(emptyCollections)).toBe(initial);
+		expect(emptyCollections.floatingGroups).toEqual([]);
+		expect(emptyCollections.popoutGroups).toEqual([]);
+		expect(emptyCollections.edgeGroups).toEqual({});
+	});
+
+	test("an all-temporary layout serializes a legal empty root with no dangling active refs", () => {
+		const layout = arrangementWithFloatingResources();
+		const saved = JSON.parse(
+			serializeWorkspaceLayout(
+				{ toJSON: () => layout } as unknown as DockviewApi,
+				{ ...DEFAULT_DIRECTOR_STATE, primaryPanelId: "tmp-file" },
+				new Set(Object.keys(layout.panels)),
+				"secondary",
+			),
+		);
+		expect(saved.layout.grid.root).toEqual({ type: "branch", data: [] });
+		expect(saved.layout.panels).toEqual({});
+		expect(saved.layout.floatingGroups).toBeUndefined();
+		expect(saved.layout.popoutGroups).toBeUndefined();
+		expect(saved.layout.edgeGroups).toBeUndefined();
+		expect(saved.layout.activeGroup).toBeUndefined();
+		expect(saved.director.primaryPanelId).toBeNull();
+	});
+
+	test("float-only durable layouts keep their window when the main grid becomes empty", () => {
+		const layout = arrangementWithFloatingResources();
+		const saved = JSON.parse(
+			serializeWorkspaceLayout(
+				{ toJSON: () => layout } as unknown as DockviewApi,
+				DEFAULT_DIRECTOR_STATE,
+				new Set(Object.keys(layout.panels).filter((id) => id !== "persisted")),
+			),
+		).layout;
+		expect(saved.grid.root).toEqual({ type: "branch", data: [] });
+		expect(saved.floatingGroups).toHaveLength(1);
+		expect(saved.floatingGroups[0].data.views).toEqual(["persisted"]);
+		expect(saved.activeGroup).toBe("persisted-float");
+	});
+});
+
 describe("resolveWorkspaceLayout", () => {
 	// "No usable arrangement" must never be read as "no panels": membership is a
 	// separate, authoritative input, so the caller still places every member at a

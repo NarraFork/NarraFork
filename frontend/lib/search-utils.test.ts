@@ -3,6 +3,7 @@ import {
 	DEFAULT_SEARCH_SORT,
 	normalizeSearchSort,
 	normalizeSearchType,
+	sortVisibleSearchResults,
 	summarizeSearchRuntimeState,
 } from "./search-utils";
 
@@ -99,5 +100,33 @@ describe("summarizeSearchRuntimeState", () => {
 			mode: "fts5-with-like-fallback",
 			fallbackMessages: [],
 		});
+	});
+});
+
+describe("all results share the selected ordering", () => {
+	const hits = [
+		{ id: "n-old", type: "narrator", title: "D", updatedAt: "2026-01-01", matchScore: 10 },
+		{ id: "n-new", type: "narrator", title: "B", updatedAt: "2026-09-03", matchScore: 30 },
+		{ id: "m-new", type: "message", narratorTitle: "A", createdAt: "2026-09-04", matchScore: 40 },
+		{ id: "m-mid", type: "message", narratorTitle: "C", createdAt: "2026-09-02", matchScore: 20 },
+	];
+	const order = (sort: "time" | "relevance" | "title" | "type") =>
+		sortVisibleSearchResults(hits, "all", sort, (id) => id).map((r) => r.id);
+
+	for (const sort of ["time", "relevance", "title"] as const) {
+		test(`${sort} interleaves messages and narrators rather than grouping types`, () => {
+			expect(order(sort)).toEqual(["m-new", "n-new", "m-mid", "n-old"]);
+			expect(hits.map((r) => r.id)).toEqual(["n-old", "n-new", "m-new", "m-mid"]);
+		});
+	}
+
+	test("only an explicit type sort groups the types", () => {
+		expect(order("type")).toEqual(["m-new", "m-mid", "n-old", "n-new"]);
+	});
+
+	test("a type filter still uses the selected ordering within that type", () => {
+		expect(sortVisibleSearchResults(hits, "narrator", "time", (id) => id).map((r) => r.id)).toEqual(
+			["n-new", "n-old"],
+		);
 	});
 });

@@ -11,6 +11,7 @@ import {
 } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { GIT_COMMIT_PREVIEW_UNSUPPORTED, type GitCommitDetail } from "@shared/git-commit-preview";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	createMemoryHistory,
@@ -39,6 +40,12 @@ const { Route: narratorRoute } = await import(
 	"../../routes/git/narrators/$narratorId/commits/$sha"
 );
 const { Route: chapterRoute } = await import("../../routes/git/chapters/$chapterId/commits/$sha");
+const { Route: narratorWindowRoute } = await import(
+	"../../routes/windows/git/narrators/$narratorId/commits/$sha"
+);
+const { Route: chapterWindowRoute } = await import(
+	"../../routes/windows/git/chapters/$chapterId/commits/$sha"
+);
 const SHA = "a".repeat(40);
 const PARENT = "b".repeat(64);
 const FILE = "src/one.ts";
@@ -207,10 +214,22 @@ function makeRouter(href: string) {
 		path: "/git/chapters/$chapterId/commits/$sha",
 		id: "/git/chapters/$chapterId/commits/$sha",
 	} as never);
+	const narratorWindow = narratorWindowRoute.update({
+		getParentRoute: () => rootRoute,
+		path: "/windows/git/narrators/$narratorId/commits/$sha",
+		id: "/windows/git/narrators/$narratorId/commits/$sha",
+	} as never);
+	const chapterWindow = chapterWindowRoute.update({
+		getParentRoute: () => rootRoute,
+		path: "/windows/git/chapters/$chapterId/commits/$sha",
+		id: "/windows/git/chapters/$chapterId/commits/$sha",
+	} as never);
 	return createRouter({
 		routeTree: rootRoute.addChildren([
 			narrator,
 			chapter,
+			narratorWindow,
+			chapterWindow,
 			createRoute({
 				getParentRoute: () => rootRoute,
 				path: "/narrators/$narratorId",
@@ -293,15 +312,28 @@ beforeEach(async () => {
 	document.body.appendChild(container);
 	root = createRoot(container);
 	spyOn(api, "getNarrator").mockResolvedValue({ id: TARGET.narratorId, cwd: "/repo" });
+	spyOn(api, "getWorkspaceContext").mockResolvedValue({
+		revision: 0,
+		deviceId: "device-a",
+		cwd: "/repo",
+		pathFlavor: "posix",
+		contextKey: "resolved-context",
+		capabilities: { switchDirectory: true },
+	});
 	spyOn(api, "getGitWorkspace").mockResolvedValue(workspace());
 	spyOn(api, "getGitCommitDetail").mockImplementation(async (_target, sha) => detail(sha));
 	spyOn(api, "getGitCommitDiff").mockResolvedValue({
 		diff: "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+PRIVATE_PATCH\n",
 		truncated: false,
 	});
-	spyOn(globalThis, "fetch").mockImplementation(async () => {
-		throw new Error("Unexpected network request");
-	});
+	spyOn(globalThis, "fetch").mockImplementation(
+		Object.assign(
+			async () => {
+				throw new Error("Unexpected network request");
+			},
+			{ preconnect: () => {} },
+		),
+	);
 });
 afterEach(async () => {
 	root.unmount();
@@ -316,6 +348,103 @@ afterEach(async () => {
 afterAll(disposeCanvas);
 
 describe("standalone commit file routes with real memory history", () => {
+	test("a cold window waits for workspace identity instead of showing and reloading provisional content", async () => {
+		const context = deferred<WorkspaceContext>();
+		spyOn(api, "getWorkspaceContext").mockImplementation(() => context.promise);
+		await mount(buildCommitPreviewHref(TARGET, SHA, FILE, "window"));
+		await waitFor(
+			() => queryClient.getQueryState(["narrators", TARGET.narratorId])?.status === "success",
+			"narrator metadata",
+		);
+		for (let i = 0; i < 8; i++) await tick();
+		expect(api.getGitCommitDetail).not.toHaveBeenCalled();
+		expect(text()).not.toContain("PRIVATE_PATCH");
+		context.resolve({
+			revision: 0,
+			deviceId: "device-a",
+			cwd: "/repo",
+			pathFlavor: "posix",
+			contextKey: "resolved-context",
+			capabilities: { switchDirectory: true },
+		});
+		await expectSelected(FILE);
+		await waitFor(() => text().includes("PRIVATE_PATCH"), "authorized patch");
+		const preview = document.querySelector("[data-commit-preview]");
+		const detailReads = (api.getGitCommitDetail as ReturnType<typeof spyOn>).mock.calls.length;
+		for (let i = 0; i < 8; i++) await tick();
+		expect(document.querySelector("[data-commit-preview]")).toBe(preview);
+		expect(api.getGitCommitDetail).toHaveBeenCalledTimes(detailReads);
+	});
+	test("late narrator metadata does not remount a preview with an already resolved context", async () => {
+		const narrator = deferred<Awaited<ReturnType<typeof api.getNarrator>>>();
+		spyOn(api, "getNarrator").mockImplementation(() => narrator.promise);
+		await mount(buildCommitPreviewHref(TARGET, SHA, FILE, "window"));
+		await waitFor(() => text().includes("PRIVATE_PATCH"), "resolved-context patch");
+		const preview = document.querySelector("[data-commit-preview]");
+		const detailReads = (api.getGitCommitDetail as ReturnType<typeof spyOn>).mock.calls.length;
+		narrator.resolve({ id: TARGET.narratorId, cwd: "/repo" });
+		await waitFor(
+			() => queryClient.getQueryState(["narrators", TARGET.narratorId])?.status === "success",
+			"late narrator metadata",
+		);
+		for (let i = 0; i < 8; i++) await tick();
+		expect(document.querySelector("[data-commit-preview]")).toBe(preview);
+		expect(api.getGitCommitDetail).toHaveBeenCalledTimes(detailReads);
+	});
+	test("a legacy context failure waits for narrator metadata before using the fallback identity", async () => {
+		const narrator = deferred<Awaited<ReturnType<typeof api.getNarrator>>>();
+		spyOn(api, "getNarrator").mockImplementation(() => narrator.promise);
+		spyOn(api, "getWorkspaceContext").mockRejectedValue(new ApiError("Unavailable", 404));
+		await mount(buildCommitPreviewHref(TARGET, SHA, FILE, "window"));
+		await waitFor(
+			() => queryClient.getQueryState(["workspaceContext", TARGET.narratorId])?.status === "error",
+			"legacy context fallback",
+		);
+		for (let i = 0; i < 8; i++) await tick();
+		expect(api.getGitCommitDetail).not.toHaveBeenCalled();
+		narrator.resolve({ id: TARGET.narratorId, cwd: "/repo" });
+		await expectSelected(FILE);
+		await waitFor(() => text().includes("PRIVATE_PATCH"), "fallback patch");
+		expect(text()).toContain(`Private commit ${SHA}`);
+	});
+	test.each([
+		"chapter",
+		"narrator",
+	])("%s window keeps file and parent navigation in its prefix", async (owner) => {
+		const target = owner === "chapter" ? "chapter-one" : TARGET;
+		const initial =
+			owner === "chapter"
+				? buildCommitPreviewHref(target, SHA, undefined, "window")
+				: `/windows/git/narrators/${TARGET.narratorId}/commits/${SHA}`;
+		const route = await mount(initial);
+		await expectSelected(FILE);
+		expect(route.history.length).toBe(1);
+		expect(route.state.location.pathname.startsWith("/windows/git/")).toBe(true);
+		expect(
+			document.querySelector('[data-git-preview-page="window"] [data-commit-preview="window"]'),
+		).not.toBeNull();
+		const ownerLink = document.querySelector("[data-git-preview-owner-link]");
+		expect(ownerLink?.getAttribute("href")).toBe(
+			owner === "chapter" ? "/chapters/chapter-one" : "/narrators/narrator-one",
+		);
+		expect(ownerLink?.getAttribute("target")).toBe("_blank");
+		expect(ownerLink?.textContent).toBe("Open in main app");
+		click(`[data-commit-file="${SECOND}"]`);
+		await expectSelected(SECOND);
+		expect(route.state.location.href).toBe(buildCommitPreviewHref(target, SHA, SECOND, "window"));
+		expect(document.querySelector(`[data-commit-parent="${PARENT}"]`)?.getAttribute("href")).toBe(
+			buildCommitPreviewHref(target, PARENT, undefined, "window"),
+		);
+		click(`[data-commit-parent="${PARENT}"]`);
+		await expectSelected("parent.txt");
+		expect(route.state.location.href).toBe(
+			buildCommitPreviewHref(target, PARENT, "parent.txt", "window"),
+		);
+		route.history.back();
+		await expectSelected(SECOND);
+		expect(route.state.location.href).toBe(buildCommitPreviewHref(target, SHA, SECOND, "window"));
+	});
+
 	test("chapter direct entry resolves metadata without a narrator Dock or previous state", async () => {
 		const route = await mount(buildCommitPreviewHref("chapter-one", SHA));
 		await expectSelected(FILE);
@@ -337,7 +466,7 @@ describe("standalone commit file routes with real memory history", () => {
 			`${buildCommitPreviewHref(TARGET, SHA, SECOND)}&rootPath=%2Fsecret&canWrite=true`,
 		);
 		await expectSelected(SECOND);
-		expect(api.getNarrator).toHaveBeenCalledWith(TARGET.narratorId);
+		expect(api.getNarrator).toHaveBeenCalledWith(TARGET.narratorId, expect.any(AbortSignal));
 		expect(api.getGitWorkspace).toHaveBeenCalled();
 		expect(api.getGitCommitDetail).toHaveBeenCalledWith(
 			expect.objectContaining({ ...TARGET, rootPath: "/repo" }),
@@ -537,6 +666,14 @@ describe("standalone commit file routes with real memory history", () => {
 		await mount(buildCommitPreviewHref(TARGET, SHA, FILE));
 		await waitFor(() => !!document.querySelector('[role="alert"]'));
 		expect(api.getGitCommitDetail).not.toHaveBeenCalled();
+		spyOn(api, "getWorkspaceContext").mockResolvedValue({
+			revision: 0,
+			deviceId: "device-a",
+			cwd: "/repo",
+			pathFlavor: "posix",
+			contextKey: "resolved-context",
+			capabilities: { switchDirectory: true },
+		});
 		spyOn(api, "getGitWorkspace").mockResolvedValue(workspace());
 		click("button");
 		await expectSelected(FILE);

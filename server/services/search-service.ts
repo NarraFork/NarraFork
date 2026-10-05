@@ -2,7 +2,7 @@ import { db } from "../db";
 import { knowledgeService } from "./knowledge-service";
 import { searchStore } from "./search/backend";
 import { canUseIndex, sanitizeQuery } from "./search/query";
-import type { InheritedSearchScope, SearchStrategy } from "./search/types";
+import type { InheritedSearchScope, SearchSort, SearchStrategy } from "./search/types";
 
 export { sanitizeQuery } from "./search/query";
 export type { InheritedSearchScope } from "./search/types";
@@ -33,6 +33,8 @@ interface SearchResult {
 }
 
 interface SearchOptions {
+	signal?: AbortSignal;
+	sort?: SearchSort;
 	query: string;
 	entities: string[];
 	limit?: number;
@@ -93,24 +95,22 @@ async function collectionNameMap(collectionIds: string[]): Promise<Map<string, s
 	return new Map(rows.map((r) => [r.id, r.name]));
 }
 
-/**
- * The one ordering used by every search response: score first, then recency.
- *
- * Exported because knowledge hits are resolved on a separate (async) path and
- * merged in by the route — a second local sort there would drift from this one.
- */
-export function sortSearchResults(results: SearchResult[]): SearchResult[] {
+/** Shared ordering for entity results and separately resolved knowledge hits. */
+export function sortSearchResults(
+	results: SearchResult[],
+	sort: SearchSort = "relevance",
+): SearchResult[] {
 	return results.sort((a, b) => {
-		if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
+		if (sort !== "time" && b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
 		const bTime = Date.parse(b.updatedAt ?? b.createdAt ?? b.lastMessageAt ?? "") || 0;
 		const aTime = Date.parse(a.updatedAt ?? a.createdAt ?? a.lastMessageAt ?? "") || 0;
-		return bTime - aTime;
+		return bTime - aTime || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 	});
 }
 
 export const searchService = {
 	async search(options: SearchOptions): Promise<SearchResult[]> {
-		const { query, entities, limit = 50, principal } = options;
+		const { query, entities, limit = 50, principal, sort = "relevance" } = options;
 		const results: SearchResult[] = [];
 
 		// Sanitize: remove FTS5 special chars to prevent injection
@@ -121,7 +121,14 @@ export const searchService = {
 		const safeQueryLower = safeQuery.toLowerCase();
 		// One query object for all three entity searches: the viewer travels with it, so a
 		// branch cannot accidentally run ungated.
-		const base = { text: safeQuery, strategy, limit, viewer: principal };
+		const base = {
+			text: safeQuery,
+			strategy,
+			limit,
+			sort,
+			viewer: principal,
+			signal: options.signal,
+		};
 
 		if (entities.includes("chapters")) {
 			// A chapter hit exposes its title, description snippet and project name, so the
@@ -186,7 +193,7 @@ export const searchService = {
 			}
 		}
 
-		return sortSearchResults(results);
+		return sortSearchResults(results, sort);
 	},
 
 	/**
@@ -204,6 +211,8 @@ export const searchService = {
 	async searchKnowledge(options: {
 		query: string;
 		limit?: number;
+		signal?: AbortSignal;
+		sort?: "time" | "relevance";
 		principal: { userId: string; isAdmin: boolean };
 	}): Promise<SearchResult[]> {
 		const { query, limit = 50, principal } = options;
@@ -216,6 +225,8 @@ export const searchService = {
 		const rows = await knowledgeService.search({
 			q: safeQuery,
 			limit,
+			signal: options.signal,
+			sort: options.sort,
 			draftUserId: principal.userId || undefined,
 		});
 		if (rows.length === 0) return [];

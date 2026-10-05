@@ -69,7 +69,7 @@ export function GitCommitPreview(props: {
 	selectedPath?: string | null;
 	onSelectPath?: (path: string) => void;
 	onNavigateCommit?: (sha: string) => void;
-	mode?: "modal" | "page";
+	mode?: "modal" | "page" | "window";
 }) {
 	// Identity includes the API endpoint, not just the workspace: two narrators may
 	// share a worktree but have different permissions. Reset observers and UI state.
@@ -104,7 +104,10 @@ function CommitPreviewContent({
 	const path =
 		selectedPath === undefined ? (localPath ?? data?.files[0]?.path ?? null) : selectedPath;
 	const selected = data?.files.find((file) => file.path === path);
-	const previewHref = data ? buildCommitPreviewBrowserHref(target, sha, selected?.path) : "";
+	const linkMode = mode === "page" ? "page" : "window";
+	const previewHref = data
+		? buildCommitPreviewBrowserHref(target, sha, selected?.path, linkMode)
+		: "";
 	const query = filter.trim().toLocaleLowerCase();
 	const visibleFiles = data?.files.filter(
 		(file) =>
@@ -247,7 +250,7 @@ function CommitPreviewContent({
 										data.parents.map((parent) => (
 											<Anchor
 												key={parent}
-												href={buildCommitPreviewBrowserHref(target, parent)}
+												href={buildCommitPreviewBrowserHref(target, parent, undefined, linkMode)}
 												size="xs"
 												ff="monospace"
 												title={parent}
@@ -474,7 +477,7 @@ function CommitFileCard({
 	target: GitTarget;
 	sha: string;
 	file: GitCommitFile;
-	mode: "modal" | "page";
+	mode: "modal" | "page" | "window";
 }) {
 	const { t } = useTranslation("git");
 	const [expanded, setExpanded] = useState(true);
@@ -522,7 +525,7 @@ function CommitFileCard({
 						target={target}
 						sha={sha}
 						file={file}
-						maxHeight={mode === "page" ? 720 : 560}
+						maxHeight={mode === "modal" ? 560 : 720}
 					/>
 				</Box>
 			)}

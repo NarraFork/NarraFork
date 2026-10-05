@@ -9,7 +9,7 @@
  */
 
 import type { DockviewApi, SerializedDockview } from "dockview-react";
-import { isRestorableLayout, stripIdentityFromLayout } from "../panels/layout-envelope";
+import { removeRetiredFilemodPanels, stripIdentityFromLayout } from "../panels/layout-envelope";
 import { dockPanelId, NARRATOR_DOCK_COMPONENT } from "./dock-panel-types";
 
 /** Device class — desktop and mobile keep independent layouts. */
@@ -81,9 +81,7 @@ export function loadNarratorDockLayout(
 		const raw = localStorage.getItem(storageKey(narratorId, device));
 		if (!raw) return null;
 		const parsed = JSON.parse(raw);
-		if (isEnvelope(parsed) && isRestorableLayout(parsed.layout)) {
-			return parsed.layout;
-		}
+		if (isEnvelope(parsed)) return removeRetiredFilemodPanels(parsed.layout);
 	} catch {
 		// fall through
 	}

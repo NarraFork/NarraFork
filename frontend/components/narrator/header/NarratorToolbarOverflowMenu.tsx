@@ -283,6 +283,8 @@ export interface NarratorToolbarOverflowMenuProps {
 	/** Archive action, pinned below the sortable list. Omit to hide it. */
 	onArchive?: () => void;
 	archiveLoading?: boolean;
+	compatibilityEntry?: ReactNode;
+	backupEntry?: ReactNode;
 }
 
 export function NarratorToolbarOverflowMenu({
@@ -296,6 +298,8 @@ export function NarratorToolbarOverflowMenu({
 	renderInlineOptions,
 	onArchive,
 	archiveLoading,
+	compatibilityEntry,
+	backupEntry,
 }: NarratorToolbarOverflowMenuProps) {
 	const { t } = useTranslation("narrator");
 	const [menuOpen, setMenuOpen] = useState(false);
@@ -494,6 +498,13 @@ export function NarratorToolbarOverflowMenu({
 						})}
 					</SortableContext>
 				</DndContext>
+				{backupEntry}
+				{compatibilityEntry && (
+					<>
+						<Menu.Divider />
+						{compatibilityEntry}
+					</>
+				)}
 				{onArchive ? (
 					<>
 						<Menu.Divider />

@@ -76,6 +76,9 @@ export interface AgentSectionProps {
 	setDefaultRelaxedPlan: (v: boolean) => void;
 	planModeAllowInlinePlan: boolean;
 	setPlanModeAllowInlinePlan: (v: boolean) => void;
+	permissionRuleAutoApprove: boolean;
+	setPermissionRuleAutoApprove: (v: boolean) => void;
+	isAdmin?: boolean;
 	planReflectionAutoApprove: boolean;
 	setPlanReflectionAutoApprove: (v: boolean) => void;
 	planReflectionAllowAutoCompact: boolean;
@@ -375,6 +378,13 @@ export function AgentSection(props: AgentSectionProps) {
 			<Title order={5} mt="sm">
 				{t("safetyGuardSettings")}
 			</Title>
+			<Switch
+				label={t("permissionRuleAutoApprove")}
+				description={t("permissionRuleAutoApproveDesc")}
+				checked={props.permissionRuleAutoApprove}
+				disabled={!props.isAdmin}
+				onChange={(e) => props.setPermissionRuleAutoApprove(e.currentTarget.checked)}
+			/>
 			<Select
 				label={t("dangerReflectionLevel")}
 				description={t("dangerReflectionLevelDesc")}

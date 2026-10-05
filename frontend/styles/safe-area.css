@@ -50,7 +50,13 @@ html[data-nf-authenticated-app-shell="true"] {
  * `--app-viewport-bottom` still wins when present: the keyboard is the one occlusion the
  * engine folds into neither unit, so the tracker's measured value has to override both.
  */
-@media (display-mode: standalone) {
+/*
+ * `window-controls-overlay` is a display-mode of its own — the plain `standalone`
+ * query stops matching in exactly the installed mode we prefer on desktop. The
+ * lvh basis must hold there too (on desktop dvh == lvh, so this is consistency,
+ * not a visual change).
+ */
+@media (display-mode: standalone), (display-mode: window-controls-overlay) {
 	html[data-nf-authenticated-app-shell="true"] {
 		height: var(--app-viewport-bottom, 100lvh);
 		max-height: var(--app-viewport-bottom, 100lvh);

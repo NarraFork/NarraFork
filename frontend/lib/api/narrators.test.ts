@@ -24,6 +24,62 @@ describe("narrators API", () => {
 		}
 	});
 
+	test("narrator detail forwards optional cancellation signals while legacy callers stay compatible", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const signals: Array<AbortSignal | null | undefined> = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (_url: string, init?: RequestInit) => {
+				signals.push(init?.signal);
+				return Response.json({ id: "n" });
+			},
+		});
+		const controller = new AbortController();
+		await api.getNarrator("n", controller.signal);
+		await api.getNarrator("n");
+		expect(signals).toEqual([controller.signal, undefined]);
+	});
+
+	test("snapshot preview and apply forward explicit consent while default requests omit recovery fields", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: string, init?: RequestInit) => {
+				calls.push({ url, body: JSON.parse(String(init?.body)) });
+				return Response.json({});
+			},
+		});
+		const target = { messageId: "m", blockIndex: 2, action: "rollback_to_block" as const };
+		await api.previewRevertAction("n", { ...target, idempotencyKey: "selective-key" });
+		await api.previewRevertAction("n", {
+			...target,
+			idempotencyKey: "snapshot-key",
+			recoveryMode: "snapshot",
+		});
+		const plan = { planId: "p", planHash: "h", action: target.action };
+		await api.applyRevertPlan("n", plan);
+		await api.applyRevertPlan("n", { ...plan, acceptSnapshotRestore: true });
+		expect(calls[0]?.body).toEqual({ ...target, idempotencyKey: "selective-key" });
+		expect(calls[1]?.body).toEqual({
+			...target,
+			idempotencyKey: "snapshot-key",
+			recoveryMode: "snapshot",
+		});
+		expect(calls[2]?.body).toEqual({ planHash: "h", action: target.action });
+		expect(calls[3]?.body).toEqual({
+			planHash: "h",
+			action: target.action,
+			acceptSnapshotRestore: true,
+		});
+	});
+
 	test("historical ensure sends exact row/message/attempt without asking for full tool detail", async () => {
 		Object.defineProperty(g, "localStorage", {
 			value: { getItem: () => null },

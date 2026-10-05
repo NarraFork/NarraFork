@@ -81,6 +81,7 @@ const {
 	reprocessAllPendingPermissions,
 	resolvePermission,
 	resolvePermissionDecision,
+	shouldTriggerDangerReflection,
 } = await import("../narrator-permission");
 const { activeNarrators, pendingDangerReflections, pendingPermissions } = await import(
 	"../narrator-session-state"
@@ -369,6 +370,92 @@ describe("confirmDangerReflection ordering", () => {
 		expect(row?.status).toBe("running");
 		expect((row?.permissionSuggestions as Array<{ status?: string }>)[0]?.status).toBe("confirmed");
 	});
+});
+
+describe("working-directory switch danger reflection", () => {
+	const input = {
+		expectedRevision: 1,
+		requestId: "switch-workspace-request",
+		target: { deviceId: "local", cwd: "/workspace/next" },
+	};
+
+	test("workspace switches are high risk even inside an allowed directory and with read-only skips", () => {
+		const classified = classifyDanger(
+			"SwitchWorkingDirectory",
+			input,
+			"/workspace",
+			undefined,
+			[{ path: "/workspace", enabled: true, accessLevel: "full" }],
+			[],
+			true,
+		);
+		expect(classified?.severity).toBe("high");
+		if (!classified) throw new Error("Workspace switch must be classified");
+		for (const level of ["light", "standard", "strict"] as const)
+			expect(shouldTriggerDangerReflection(classified, level)).toBe(true);
+		expect(shouldTriggerDangerReflection(classified, "off")).toBe(false);
+		expect(classified.details).toContain("Requested working directory: /workspace/next");
+	});
+
+	for (const permissionMode of ["default", "bypassPermissions"] as const) {
+		test.each([
+			"light",
+			"standard",
+			"strict",
+			"off",
+		] as const)(`${permissionMode} mode honors %s reflection for workspace switches`, async (level) => {
+			const id = `switch-reflection-${permissionMode}-${level}`;
+			const callId = `${id}-call`;
+			const useId = `${id}-use`;
+			await seedPermissionRequest({
+				narratorId: id,
+				messageId: `${id}-message`,
+				toolCallId: callId,
+				toolUseId: useId,
+				toolName: "SwitchWorkingDirectory",
+				input,
+				permissionMode,
+			});
+			await db
+				.update(narrators)
+				.set({ dangerReflectionOverride: level })
+				.where(eq(narrators.id, id));
+			const permissionPromise = handlePermission(
+				id,
+				new AbortController().signal,
+				"SwitchWorkingDirectory",
+				input,
+				useId,
+				"/workspace",
+				"en",
+			);
+			if (permissionMode === "default") {
+				// Reflection must not replace an existing human-approval requirement.
+				await waitFor(() => pendingPermissions.has(callId));
+				expect(pendingDangerReflections.has(callId)).toBe(false);
+				expect(await resolvePermission(callId, "deny")).toBe(true);
+				expect(await permissionPromise).toMatchObject({ behavior: "deny" });
+				return;
+			}
+			const result = await permissionPromise;
+			if (level === "off") {
+				expect(result.behavior).toBe("allow");
+				expect(pendingDangerReflections.has(callId)).toBe(false);
+				return;
+			}
+			expect(result.behavior).toBe("dangerReflection");
+			if (result.behavior !== "dangerReflection") throw new Error("Expected reflection pause");
+			expect(pendingDangerReflections.has(callId)).toBe(true);
+			expect(
+				(await db.query.narratorToolCalls.findFirst({ where: eq(narratorToolCalls.id, callId) }))
+					?.permissionDecidedBy,
+			).not.toBe("auto");
+			expect(
+				await confirmDangerReflection(callId, "Verified the user-requested target workspace"),
+			).toBe(true);
+			expect(await result.decision).toMatchObject({ behavior: "allow" });
+		});
+	}
 });
 
 describe("danger fingerprint execution identity", () => {
@@ -869,6 +956,69 @@ describe("pending permission execution identity", () => {
 		} finally {
 			controller.abort();
 		}
+	});
+});
+
+describe("Worktree permission validation", () => {
+	test("empty input returns parameter error rather than non-interactive denial", async () => {
+		const narratorId = "worktree-empty-input";
+		const toolUseId = "worktree-empty-input-use";
+		await seedPermissionRequest({
+			narratorId,
+			messageId: "worktree-empty-input-message",
+			toolCallId: "worktree-empty-input-call",
+			toolUseId,
+			toolName: "Worktree",
+			input: {},
+			permissionMode: "bypassPermissions",
+		});
+		const result = await handlePermission(
+			narratorId,
+			new AbortController().signal,
+			"Worktree",
+			{},
+			toolUseId,
+			"/workspace",
+			"zh-CN",
+			undefined,
+			{
+				executionBackend: localBackend,
+				executionTarget: frozenTarget(localBackend, { cwd: "/workspace" }),
+			},
+		);
+		expect(result.behavior).toBe("deny");
+		if (result.behavior !== "deny") throw new Error("Expected denial");
+		expect(result.message).toContain("Invalid Worktree parameters");
+		expect(result.message).not.toContain("非交互式");
+	});
+	for (const action of [undefined, "remove"]) {
+		test(`invalid action ${action} reports parameter error in bypass mode`, () => {
+			const meta: { blacklistReason?: string } = {};
+			expect(
+				resolvePermissionDecision({
+					toolName: "Worktree",
+					input: action === undefined ? {} : { action },
+					permMode: "bypassPermissions",
+					cwd: "/local/work",
+					meta,
+				}),
+			).toBe("deny");
+			expect(meta.blacklistReason).toContain("Invalid Worktree parameters");
+		});
+	}
+	test("review mode still rejects create with an explicit reason", () => {
+		const meta: { blacklistReason?: string } = {};
+		expect(
+			resolvePermissionDecision({
+				toolName: "Worktree",
+				input: { action: "create" },
+				permMode: "bypassPermissions",
+				cwd: "/local/work",
+				reviewReadOnlyBash: true,
+				meta,
+			}),
+		).toBe("deny");
+		expect(meta.blacklistReason).toContain("Review mode");
 	});
 });
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { isLoopbackBrowserOrigin } from "./local-origin";
+import { canRevealFromBrowser, isLoopbackBrowserOrigin } from "./local-origin";
 
 function windowWithHostname(hostname: string): Window {
 	return { location: { hostname } } as unknown as Window;
@@ -36,5 +36,21 @@ describe("isLoopbackBrowserOrigin", () => {
 				},
 			} as unknown as Window),
 		).toBe(false);
+	});
+});
+
+describe("canRevealFromBrowser", () => {
+	test("explicit opt-in permits domains and LAN addresses without changing automatic detection", () => {
+		for (const hostname of ["narrafork.example.com", "192.168.1.10", "10.0.0.5"]) {
+			const win = windowWithHostname(hostname);
+			expect(canRevealFromBrowser(true, win)).toBe(true);
+			expect(canRevealFromBrowser(false, win)).toBe(false);
+			expect(canRevealFromBrowser(undefined, win)).toBe(false);
+			expect(isLoopbackBrowserOrigin(win)).toBe(false);
+		}
+	});
+	test("disabled override preserves automatic loopback access", () => {
+		expect(canRevealFromBrowser(false, windowWithHostname("localhost"))).toBe(true);
+		expect(canRevealFromBrowser(undefined, windowWithHostname("[::1]"))).toBe(true);
 	});
 });

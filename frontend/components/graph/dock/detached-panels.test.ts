@@ -118,9 +118,11 @@ describe("device-scoped pending file panels", () => {
 
 describe("detachable kinds", () => {
 	test("the panels that depend on chat-published props are NOT detachable", () => {
-		// details/filemod read dock.detailsProps / dock.fileModProps, which only the
-		// chat panel publishes; detached they would load forever.
+		// Details reads chat-published props and would load forever when detached.
 		expect(isDetachablePanelKind("details")).toBe(false);
+	});
+
+	test("the retired filemod kind cannot be detached", () => {
 		expect(isDetachablePanelKind("filemod")).toBe(false);
 	});
 

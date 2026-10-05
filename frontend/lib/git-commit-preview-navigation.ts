@@ -6,6 +6,8 @@ import { assetUrl } from "./base-path";
 export const COMMIT_PREVIEW_FILE_MAX_LENGTH = 4096;
 const WORKSPACE_KEY_MAX_LENGTH = 4096;
 
+export type CommitPreviewPageMode = "page" | "window";
+
 export interface CommitPreviewSearch {
 	file?: string;
 	workspaceKey?: string;
@@ -31,11 +33,12 @@ export function validateCommitPreviewSearch(search: Record<string, unknown>): Co
 	return { file: file as string | undefined, workspaceKey: workspaceKey as string | undefined };
 }
 
-/** Internal Router address; its basepath is added by Router navigation. */
+/** Internal Router address; defaults to the legacy page. Router navigation adds its basepath. */
 export function buildCommitPreviewHref(
 	target: GitTarget,
 	sha: string,
 	file?: string | null,
+	mode: CommitPreviewPageMode = "page",
 ): string {
 	if (!GIT_COMMIT_SHA_PATTERN.test(sha)) throw new Error("A full commit SHA is required");
 	const owner =
@@ -51,14 +54,15 @@ export function buildCommitPreviewHref(
 		}),
 	);
 	const query = params.toString();
-	return `/git/${owner}/commits/${sha.toLowerCase()}${query ? `?${query}` : ""}`;
+	return `${mode === "window" ? "/windows" : ""}/git/${owner}/commits/${sha.toLowerCase()}${query ? `?${query}` : ""}`;
 }
 
-/** Browser address for native anchors and copied links, including the app mount. */
+/** Native anchors and copied links default to the Git window and include the app mount. */
 export function buildCommitPreviewBrowserHref(
 	target: GitTarget,
 	sha: string,
 	file?: string | null,
+	mode: CommitPreviewPageMode = "window",
 ): string {
-	return assetUrl(buildCommitPreviewHref(target, sha, file));
+	return assetUrl(buildCommitPreviewHref(target, sha, file, mode));
 }

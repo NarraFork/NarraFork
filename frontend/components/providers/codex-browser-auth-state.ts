@@ -12,6 +12,9 @@
 
 export interface CodexBrowserAuthServerState {
 	pending: boolean;
+	status?: string;
+	errorCode?: string;
+	error?: string;
 	redirectUri: string;
 	/**
 	 * False when the server could not start its local callback listener
@@ -38,9 +41,9 @@ export interface CodexBrowserAuthReconcileInput {
 	/** Redirect URI already known to this tab, if any. */
 	knownRedirectUri: string | null;
 	/**
-	 * Whether a manual callback submit is in flight. The server detaches the
-	 * pending flow while exchanging the code, so `pending: false` during a submit
-	 * must not tear down the UI.
+	 * Whether a manual callback submit is in flight. A state fetch may arrive before
+	 * the submit response (or come from an older server), so `pending: false`
+	 * during a submit must not tear down the UI.
 	 */
 	submitting: boolean;
 }

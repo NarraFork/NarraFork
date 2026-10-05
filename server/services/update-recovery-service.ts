@@ -2,6 +2,10 @@ import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
 import {
+	measureSerializedCharacters,
+	queueContextCharacterRefresh,
+} from "../lib/context-characters";
+import {
 	flushRuntimePublications,
 	getRuntimePublicationService,
 } from "./agent-runtime/publication";
@@ -46,6 +50,7 @@ import {
 	consumePlannedUpdateRecoverySnapshot,
 	type PlannedUpdateRecoverySnapshot,
 	removePlannedUpdateRecoverySnapshot,
+	writePlannedUpdateRecoverySnapshot,
 } from "./update-coordinator";
 
 export const CLAIM_LEASE_MS = 5 * 60_000;
@@ -704,6 +709,15 @@ export async function getPlannedUpdateStartupProtection(): Promise<{
 		return { snapshot: null, protection: EMPTY_PROTECTION, severedNarratorIds: new Set() };
 	}
 
+	if (snapshot.resumeOnNextStartup) {
+		// Claim before mounting any owner. Keep evidence for this recovery pass, but a later
+		// ordinary boot must not replay the authorization if recovery crashes or fails.
+		writePlannedUpdateRecoverySnapshot(
+			{ ...snapshot, resumeOnNextStartup: false, evidenceOnly: true },
+			{ expectedEpoch: snapshot.updateEpoch },
+		);
+	}
+
 	return {
 		snapshot,
 		protection: await toolContinuationService.getProtectionSets(snapshot.updateEpoch),
@@ -767,12 +781,13 @@ async function finalizeInterruptedRecoveryParent(
 	}
 	const ordinary = interruptedToolResults.filter((record) => record.kind !== "send_await");
 	if (ordinary.length > 0) {
-		await db
+		const changed = await db
 			.update(narratorToolCalls)
 			.set({
 				status: "fail",
 				errorMessage,
 				outputJson: getToolMessage("interruptedByUser", locale),
+				outputChars: measureSerializedCharacters(getToolMessage("interruptedByUser", locale)),
 				completedAt: new Date().toISOString(),
 			})
 			.where(
@@ -783,7 +798,9 @@ async function finalizeInterruptedRecoveryParent(
 					),
 					inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
 				),
-			);
+			)
+			.returning({ messageId: narratorToolCalls.messageId });
+		for (const row of changed) queueContextCharacterRefresh(narratorId, row.messageId);
 	}
 	await narratorService.updateStatus(narratorId, "idle", {
 		substatus: ["interrupted"],

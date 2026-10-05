@@ -35,6 +35,14 @@ import {
 	parseNameStatusRecords,
 	requireCommitFile,
 } from "./git-commit-preview-parse";
+import {
+	captureLifecycleContextPath,
+	confirmLifecyclePathCreated,
+	confirmLifecyclePathRemoved,
+	lifecycleCreationPath,
+	revalidateLifecycleTarget,
+	withProtectionReservation,
+} from "./worktree-lifecycle-guard";
 import { WORKTREES_DIR_NAME } from "./worktree-tree-snapshot";
 
 const gitRequestContext = new AsyncLocalStorage<{
@@ -356,6 +364,9 @@ async function exec(
 	cwd: string,
 	options: boolean | ExecOptions = {},
 ): Promise<ExecResult> {
+	// Lifecycle writes/read probes dispatch against the frozen backend cwd, never a
+	// mutable raw chapter alias after an await. Outside retirement this is unchanged.
+	cwd = await lifecycleCreationPath(cwd);
 	const { silent, optionalLocks, timeout, maxOutputBytes, identity } =
 		normalizeExecOptions(options);
 	const request = gitRequestContext.getStore();
@@ -803,7 +814,8 @@ export const gitService = {
 	},
 
 	async createWorktree(repoPath: string, worktreePath: string, branchName: string): Promise<void> {
-		const result = await exec(["worktree", "add", worktreePath, branchName], repoPath);
+		const frozenPath = await lifecycleCreationPath(worktreePath);
+		const result = await exec(["worktree", "add", frozenPath, branchName], repoPath);
 		if (result.exitCode !== 0) {
 			// Detect shallow clone as a likely cause of "unable to read tree" errors
 			if (result.stderr.includes("unable to read tree")) {
@@ -818,11 +830,17 @@ export const gitService = {
 			}
 			throw new Error(`Failed to create worktree: ${result.stderr}`);
 		}
+		await confirmLifecyclePathCreated(frozenPath);
 	},
 
 	async removeWorktree(repoPath: string, worktreePath: string): Promise<void> {
-		const result = await exec(["worktree", "remove", worktreePath, "--force"], repoPath);
-		if (result.exitCode !== 0) throw new GitError(`Failed to remove worktree: ${result.stderr}`);
+		return withProtectionReservation([{ path: worktreePath }], "git worktree remove", async () => {
+			const frozenRepository = await captureLifecycleContextPath(repoPath);
+			const frozenPath = await revalidateLifecycleTarget(worktreePath);
+			const result = await exec(["worktree", "remove", frozenPath, "--force"], frozenRepository);
+			if (result.exitCode !== 0) throw new GitError(`Failed to remove worktree: ${result.stderr}`);
+			await confirmLifecyclePathRemoved(frozenPath);
+		});
 	},
 
 	async pruneWorktrees(repoPath: string): Promise<void> {

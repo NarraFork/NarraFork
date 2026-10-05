@@ -22,6 +22,10 @@
 
 import { type WorkspacePanel, workspacePanelDomId } from "@shared/workspace-panels";
 import type { Direction, SerializedDockview } from "dockview-react";
+import {
+	isRetiredFilemodPanel,
+	pruneDockviewLayout as pruneWorkspaceLayout,
+} from "../panels/layout-envelope";
 import type { PanelSpec } from "./dockview-layout";
 
 /**
@@ -162,6 +166,10 @@ export function reconcileLayoutWithPanels(input: {
 	const placedIdentities = new Set<string>();
 	const droppedPanelIds: string[] = [];
 	for (const [panelId, entry] of Object.entries(rawPanels)) {
+		if (isRetiredFilemodPanel(entry)) {
+			droppedPanelIds.push(panelId);
+			continue;
+		}
 		const params = (entry as { params?: unknown } | null)?.params;
 		if (!params || typeof params !== "object") {
 			droppedPanelIds.push(panelId);
@@ -196,96 +204,20 @@ export function reconcileLayoutWithPanels(input: {
 	// Prune rather than discard. Throwing the whole layout away because ONE stale
 	// entry survived would reset an arrangement the user built by hand — a visible
 	// regression every time a narrator is removed elsewhere.
+	const layout =
+		droppedPanelIds.length === 0
+			? (input.layout as SerializedDockview)
+			: pruneWorkspaceLayout(input.layout as SerializedDockview, new Set(droppedPanelIds), {
+					allowEmptyGrid: droppedPanelIds.some((id) => isRetiredFilemodPanel(rawPanels[id])),
+				});
 	return {
-		layout:
-			droppedPanelIds.length === 0
-				? (input.layout as SerializedDockview)
-				: pruneLayout(input.layout as SerializedDockview, new Set(droppedPanelIds)),
-		appended,
+		layout,
+		appended: layout ? appended : members,
 		droppedPanelIds,
 	};
 }
 
-/**
- * Remove named panels from a serialized layout, including their grid leaves.
- *
- * Dockview's `fromJSON` throws when a grid leaf references a panel id that is not in
- * `panels`, and that throw is what used to clear the surface entirely. So the grid
- * tree has to be rewritten in step with the panel map: leaves naming a dropped panel
- * lose that id, branches that end up empty collapse, and a group left with no views
- * is removed.
- *
- * Operates on a `structuredClone`; the caller's layout is never mutated.
- */
-function pruneLayout(
-	layout: SerializedDockview,
-	dropped: ReadonlySet<string>,
-): SerializedDockview | null {
-	let clone: SerializedDockview;
-	try {
-		clone = structuredClone(layout);
-	} catch {
-		// A layout holding something non-cloneable cannot be trusted as a restore
-		// source; the caller's member-only fallback is the safe answer.
-		return null;
-	}
-
-	const panels = (clone as unknown as { panels: Record<string, unknown> }).panels;
-	for (const panelId of dropped) delete panels[panelId];
-	if (Object.keys(panels).length === 0) return null;
-
-	const grid = (clone as unknown as { grid?: { root?: unknown } }).grid;
-	if (!grid?.root) return null;
-	const prunedRoot = pruneGridNode(grid.root, dropped);
-	if (!prunedRoot) return null;
-	grid.root = prunedRoot;
-
-	// An active group that no longer exists would leave dockview activating nothing.
-	const activeGroup = (clone as unknown as { activeGroup?: unknown }).activeGroup;
-	if (typeof activeGroup === "string" && !gridContainsGroup(grid.root, activeGroup)) {
-		delete (clone as unknown as { activeGroup?: unknown }).activeGroup;
-	}
-	return clone;
-}
-
-/** Prune one grid node, returning null when it holds nothing renderable. */
-function pruneGridNode(node: unknown, dropped: ReadonlySet<string>): unknown | null {
-	if (!node || typeof node !== "object") return null;
-	const record = node as Record<string, unknown>;
-
-	if (record.type === "branch") {
-		if (!Array.isArray(record.data)) return null;
-		const children = record.data
-			.map((child) => pruneGridNode(child, dropped))
-			.filter((child): child is unknown => child !== null);
-		if (children.length === 0) return null;
-		return { ...record, data: children };
-	}
-
-	if (record.type !== "leaf") return null;
-	const data = record.data as Record<string, unknown> | undefined;
-	if (!data) return null;
-	const views = Array.isArray(data.views) ? data.views : [];
-	const keptViews = views.filter((view) => typeof view === "string" && !dropped.has(view));
-	if (keptViews.length === 0) return null;
-	const activeView =
-		typeof data.activeView === "string" && keptViews.includes(data.activeView)
-			? data.activeView
-			: keptViews[0];
-	return { ...record, data: { ...data, views: keptViews, activeView } };
-}
-
-function gridContainsGroup(node: unknown, groupId: string): boolean {
-	if (!node || typeof node !== "object") return false;
-	const record = node as Record<string, unknown>;
-	if (record.type === "branch") {
-		return (
-			Array.isArray(record.data) && record.data.some((child) => gridContainsGroup(child, groupId))
-		);
-	}
-	const data = record.data as Record<string, unknown> | undefined;
-	return data?.id === groupId;
-}
+export { pruneDockviewLayout as pruneWorkspaceLayout } from "../panels/layout-envelope";
 
 /**
  * Extract the `panels` map from a persisted layout, or null when unusable.

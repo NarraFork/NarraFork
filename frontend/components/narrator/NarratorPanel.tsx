@@ -1,5 +1,5 @@
 import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
-import { formatLocaleNumber } from "@frontend/lib/intl-format";
+import { formatCompactNumber } from "@frontend/lib/compact-number";
 import { narratorColumnPlaceholderStyle } from "@frontend/lib/narrator-content-column";
 import {
 	ActionIcon,
@@ -84,6 +84,11 @@ import {
 import { useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
+import {
+	useUpdateExecutionDevice,
+	useWorkspaceContext,
+	workspaceFileTarget,
+} from "../../hooks/useWorkspaceContext";
 import { ApiError, api } from "../../lib/api";
 import type { RevertScope } from "../../lib/api/narrators";
 import { statusRegistry } from "../../lib/constants";
@@ -106,6 +111,7 @@ import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
+import { NarratorCompatibilityEntry } from "../project/NarratorCompatibilityEntry";
 import {
 	BackgroundTasksDrawerHost,
 	useBackgroundTasksButton,
@@ -115,6 +121,7 @@ import { useCompactSummaryModal } from "./compact/use-compact-summary-modal";
 import type { FileReferenceScopeValue } from "./composer/FileReferenceScope";
 import type { NarratorComposerHandle, NarratorRemoteDraft } from "./composer/NarratorComposer";
 import { ContentViewerEnvironmentProvider } from "./content/ContentViewer";
+import { ContextCompositionMenu } from "./context-management/ContextCompositionMenu";
 import {
 	type ContextManagementDraft,
 	DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
@@ -145,7 +152,10 @@ import { useComposerFileIngest } from "./interaction/use-composer-file-ingest";
 import { useInternalFileViewer } from "./interaction/use-internal-file-viewer";
 import { useInterruptLongPress } from "./interaction/use-interrupt-long-press";
 import { useMessageRevertConfirm } from "./interaction/use-message-revert-confirm";
-import { useNarratorForkActions } from "./interaction/use-narrator-fork-actions";
+import {
+	ordinaryPromoteDestination,
+	useNarratorForkActions,
+} from "./interaction/use-narrator-fork-actions";
 import { useNarratorSend } from "./interaction/use-narrator-send";
 import { usePermissionFocusNav } from "./interaction/use-permission-focus-nav";
 import { capabilityModelReference, useResolvedModel } from "./interaction/use-resolved-model";
@@ -189,12 +199,12 @@ import { useMessageSelection } from "./selection/use-message-selection";
 import { revealSpecFile } from "./spec/spec-file-reveal";
 import {
 	AllowRetryCtx,
-	FileModDrawerCtx,
 	LatestTodosToolUseIdCtx,
 	PermEnterHintCtx,
 } from "./tool-call/tool-call-contexts";
 import { useNarratorAsyncQuestionSlots } from "./useNarratorAsyncQuestionSlots";
 import { useNarratorPanelWS } from "./useNarratorPanelWS";
+import { useWorkspaceDock } from "./workspace/workspace-dock";
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
 
@@ -206,11 +216,6 @@ const NarratorDetailsPanel = lazy(() =>
 
 const SpecPanel = lazy(() =>
 	import("./spec/SpecPanel").then((module) => ({ default: module.SpecPanel })),
-);
-const FileModificationsDrawer = lazy(() =>
-	import("./file-panel/FileModificationsDrawer").then((module) => ({
-		default: module.FileModificationsDrawer,
-	})),
 );
 // Body of the read-only file viewer. Shared with the `file` dock panel — the
 // drawer below is just the off-dock (mobile) host for the same content, so both
@@ -231,14 +236,6 @@ const PretextExactMessageList = lazy(() =>
 		default: module.PretextExactMessageList,
 	})),
 );
-
-/** Mount the lazy drawer only after it is first opened; keep it mounted on close. */
-export function shouldRenderFileModificationsDrawer(
-	opened: boolean,
-	hasBeenOpened: boolean,
-): boolean {
-	return opened || hasBeenOpened;
-}
 
 type CompactingMarkerKind = "context" | "segment";
 
@@ -274,9 +271,6 @@ function NarratorPanelBody({
 	onOpenTerminalPanel,
 	workspacePreview,
 	suppressAutoFocusOnPromote,
-	fileModPanelOpen,
-	onToggleFileModPanel,
-	onFileModPropsChange,
 	detailsPanelOpen,
 	onToggleDetailsPanel,
 	onDetailsPropsChange,
@@ -294,9 +288,10 @@ function NarratorPanelBody({
 	// bridges chat input to it, so sibling tool panels can consume it. Outside a
 	// provider these all fall back to the legacy prop callbacks.
 	const dock = useNarratorDockContext();
+	const workspaceDock = useWorkspaceDock();
 	const pluginSurface = usePluginUiSurface();
+	const workspaceId = pluginSurface?.hostContext.workspaceId;
 	// Effective sidebar callbacks: prefer explicit props, else route through dock.
-	const effOnFileModPropsChange = onFileModPropsChange ?? dock?.setFileModProps;
 	const effOnDetailsPropsChange = onDetailsPropsChange ?? dock?.setDetailsProps;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterId = (narrator as any)?.chapterId as string | null | undefined;
@@ -368,6 +363,7 @@ function NarratorPanelBody({
 	} = useAllModels();
 	const modelCardIndex = useModelCardIndex();
 	const { data: currentUser } = useCurrentUser();
+	const { data: workspaceContext } = useWorkspaceContext(narratorId);
 	const currentUserId = currentUser?.id ? String(currentUser.id) : null;
 	const { data: userPrefs } = useUserPreferences();
 	const updateUserPrefs = useUpdateUserPreferences();
@@ -455,19 +451,9 @@ function NarratorPanelBody({
 		// 设备列表变化缓慢, 60s 轮询足够
 		refetchInterval: 60_000,
 	});
-	const updateExecutionDeviceMutation = useMutation({
-		mutationFn: (deviceId: string | null) => api.updateNarratorDefaultDevice(narratorId, deviceId),
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["narratorExecutionDevices", narratorId] });
-			qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
-			qc.resetQueries({ queryKey: ["gitWorkspace", narratorId] });
-		},
-		onError: (error) =>
-			notifications.show({
-				color: "red",
-				message: error instanceof Error ? error.message : String(error),
-			}),
-	});
+	const updateExecutionDeviceMutation = useUpdateExecutionDevice(narratorId, (error) =>
+		notifications.show({ color: "red", message: error.message }),
+	);
 	const updateSettingsMutation = useMutation({
 		mutationFn: api.updateSettings,
 		onSuccess: (data) => {
@@ -590,17 +576,12 @@ function NarratorPanelBody({
 	const handlePromote = useCallback(() => {
 		promoteMutation.mutate(narratorId, {
 			onSuccess: (data) => {
-				if (data.type === "forked" && data.chapter) {
+				if (data.type === "forked") {
 					notifications.show({
 						message: t("promote_success_forked"),
 						color: "teal",
 					});
-					navigate({
-						to: "/projects/$projectId",
-						params: {
-							projectId: (data.chapter as Record<string, string>).projectId,
-						},
-					});
+					navigate(ordinaryPromoteDestination(data.narratorId));
 				} else {
 					notifications.show({
 						message: t("promote_success_unlocked"),
@@ -1108,10 +1089,10 @@ function NarratorPanelBody({
 		setQueuedMessages,
 		reconcileBufferedMessages,
 		substatus,
+		contextSnapshot,
 		contextPercent,
 		promptTokens,
 		contextWindow,
-		isEstimated,
 		contextStale,
 		activeCompactStart,
 		compactProgress,
@@ -1289,48 +1270,6 @@ function NarratorPanelBody({
 		effOnDetailsPropsChange(detailsPanelExternalProps);
 	}, [dock, detailsOpened, detailsPanelExternalProps, narrator, effOnDetailsPropsChange]);
 
-	// File modifications drawer/panel state
-	// When onToggleFileModPanel is provided (desktop sidebar mode), use external state;
-	// otherwise use internal state (mobile drawer / workspace fallback).
-	const [internalFileModOpen, setInternalFileModOpen] = useState(false);
-	const fileModDrawerOpened = dock
-		? dock.openToolTypes.has("filemod")
-		: onToggleFileModPanel
-			? (fileModPanelOpen ?? false)
-			: internalFileModOpen;
-	const [fileModDrawerHasOpened, setFileModDrawerHasOpened] = useState(false);
-	useEffect(() => {
-		if (fileModDrawerOpened) setFileModDrawerHasOpened(true);
-	}, [fileModDrawerOpened]);
-	const fileModPanelOpenRef = useRef(fileModPanelOpen ?? false);
-	fileModPanelOpenRef.current = fileModPanelOpen ?? false;
-	const externalSetFileModOpened = useCallback(
-		(v: boolean | ((prev: boolean) => boolean)) => {
-			if (!onToggleFileModPanel) return;
-			if (typeof v === "function") {
-				const next = v(fileModPanelOpenRef.current);
-				if (next !== fileModPanelOpenRef.current) onToggleFileModPanel();
-			} else if (v !== fileModPanelOpenRef.current) {
-				onToggleFileModPanel();
-			}
-		},
-		[onToggleFileModPanel],
-	);
-	const dockFileModToggle = useCallback(
-		(v: boolean | ((prev: boolean) => boolean)) => {
-			if (!dock) return;
-			const cur = dock.openToolTypes.has("filemod");
-			const next = typeof v === "function" ? v(cur) : v;
-			if (next !== cur) dock.toggleToolPanel("filemod");
-		},
-		[dock],
-	);
-	const setFileModDrawerOpened = dock
-		? dockFileModToggle
-		: onToggleFileModPanel
-			? externalSetFileModOpened
-			: setInternalFileModOpen;
-
 	// Spec toggle: three mutually-exclusive routes, in precedence order.
 	//  1. dock spec tab   — the unified surface, but ONLY for the dock's own base
 	//     narrator. When a subagent session is pushed into the dock, `dock.narratorId`
@@ -1419,6 +1358,15 @@ function NarratorPanelBody({
 			version: string;
 			hash: string;
 		}) => {
+			if (workspaceDock && pluginSurface) {
+				workspaceDock.openPluginPanel(narratorId, pick, {
+					...pluginSurface.hostContext,
+					narratorId,
+					chapterId,
+					projectId,
+				});
+				return;
+			}
 			const api = dockApiRef?.current;
 			if (!api) return;
 			// A plugin contribution is a singleton per narrator surface: re-picking it
@@ -1449,10 +1397,8 @@ function NarratorPanelBody({
 			});
 			api.addPanel(request);
 		},
-		[dockApiRef, pluginSurface, narratorId, chapterId, projectId],
+		[dockApiRef, pluginSurface, narratorId, chapterId, projectId, workspaceDock],
 	);
-	const [deletePreviewMessageId, setDeletePreviewMessageId] = useState<string | null>(null);
-	const [pendingDeleteCallback, setPendingDeleteCallback] = useState<(() => void) | null>(null);
 
 	// ── Asynchronous questions (AskUserQuestion with `async: true`) ──────────
 	//
@@ -1470,44 +1416,6 @@ function NarratorPanelBody({
 		() => ({ ...renderPermCb, asyncQuestions: asyncQuestionSlots }),
 		[renderPermCb, asyncQuestionSlots],
 	);
-
-	// Get the first pending Write/Edit permission for the drawer
-	const firstEditPermission = useMemo(() => {
-		for (const perm of renderPermCb.pendingPermissions) {
-			if (perm.toolName === "Write" || perm.toolName === "Edit") {
-				return perm;
-			}
-		}
-		return null;
-	}, [renderPermCb.pendingPermissions]);
-
-	// Expose file-mod panel props to parent for desktop sidebar rendering
-	useEffect(() => {
-		if (effOnFileModPropsChange) {
-			effOnFileModPropsChange({
-				narratorId,
-				pendingPermission: firstEditPermission,
-				onPermissionDecision: renderPermCb.onPermissionDecision,
-				deletePreviewMessageId,
-				onConfirmDelete: () => {
-					pendingDeleteCallback?.();
-					setDeletePreviewMessageId(null);
-					setPendingDeleteCallback(null);
-				},
-				onCancelDelete: () => {
-					setDeletePreviewMessageId(null);
-					setPendingDeleteCallback(null);
-				},
-			});
-		}
-	}, [
-		effOnFileModPropsChange,
-		narratorId,
-		firstEditPermission,
-		renderPermCb.onPermissionDecision,
-		deletePreviewMessageId,
-		pendingDeleteCallback,
-	]);
 
 	const isWorking = narrator?.status === "working";
 	/**
@@ -1677,13 +1585,6 @@ function NarratorPanelBody({
 			latestSpecTasksToolUseId: chunkTailMeta.latestSpecTasksToolUseId ?? null,
 		}),
 		[isWorking, chunkTailMeta.latestSpecTasksToolUseId],
-	);
-
-	const fileModDrawerCtxValue = useMemo(
-		() => ({
-			openForApproval: () => setFileModDrawerOpened(true),
-		}),
-		[setFileModDrawerOpened],
 	);
 
 	// What the composer currently holds, split by ownership: the text flag comes
@@ -1900,20 +1801,11 @@ function NarratorPanelBody({
 	const addFileReference = useCallback((reference: FileReference) => {
 		composerRef.current?.addFileReference(reference);
 	}, []);
-	const fileReferenceDevice = executionDevicesQuery.data
-		? (executionDevicesQuery.data.defaultDeviceId ?? "local")
-		: undefined;
-	const fileReferenceCwd =
-		fileReferenceDevice === "local"
-			? (fetchedNarrator?.cwd ?? narrator?.cwd ?? chapterWorktreePath)
-			: executionDevicesQuery.data?.devices.find((device) => device.id === fileReferenceDevice)
-					?.defaultCwd;
+	// Never pair a freshly selected device with a cached local cwd. The server's
+	// single revisioned snapshot owns # references, the file tree and default cwd.
 	const fileReferenceContext = useMemo<FileReferenceContext | null>(
-		() =>
-			fileReferenceDevice && fileReferenceCwd
-				? { deviceId: fileReferenceDevice, cwd: fileReferenceCwd }
-				: null,
-		[fileReferenceDevice, fileReferenceCwd],
+		() => workspaceFileTarget(workspaceContext),
+		[workspaceContext],
 	);
 	const fileReferenceScope = useMemo<FileReferenceScopeValue>(
 		() => ({
@@ -2599,7 +2491,7 @@ function NarratorPanelBody({
 	const headerHostCapabilities = useMemo<NarratorToolbarHost[]>(() => {
 		if (isWorkspacePreview) return ["inline"];
 		// A drawer host exists whenever this panel is not a lightweight preview: it
-		// either owns its own drawers (details / filemod / spec) or is handed one by
+		// either owns its own drawers (details / spec) or is handed one by
 		// the route (terminal), and MobileToolPanelHost covers the rest.
 		const caps: NarratorToolbarHost[] = ["inline", "drawer"];
 		if (dock) caps.push("dock");
@@ -2633,13 +2525,11 @@ function NarratorPanelBody({
 		executionDevicesQuery,
 		mobileTasksOpen,
 		mobileToolPanel,
-		fileModDrawerOpened,
 		detailsOpened,
 		terminalToolOpened,
 		specToolOpened,
 		setMobileTasksOpen,
 		setMobileToolPanel,
-		setFileModDrawerOpened,
 		toggleDetails,
 		toggleTerminalTool,
 		toggleSpecTool,
@@ -2703,7 +2593,13 @@ function NarratorPanelBody({
 		if (!revertHistorySubmitting) setPendingBlockDelete(null);
 	}, [revertHistorySubmitting, setPendingBlockDelete]);
 
-	if (!narrator) return <NarratorPanelSkeleton />;
+	// List props are not detail readiness: wait until the workspace shape is known
+	// before exposing messages, otherwise a late Git strip shifts the whole panel.
+	if (
+		!narrator ||
+		(!isWorkspacePreview && !isSubagent && (!fetchedNarrator || !gitWorkspaceQuery.layoutReady))
+	)
+		return <NarratorPanelSkeleton />;
 
 	const statusBarDisplay = getNarratorStatusBarDisplay({
 		panelNarratorId: narratorId,
@@ -2766,7 +2662,13 @@ function NarratorPanelBody({
 			: "Context";
 	const contextRingNode = (
 		<Box
+			component="button"
+			type="button"
+			aria-label={t("contextComposition.title")}
 			style={{
+				border: 0,
+				padding: 0,
+				background: "transparent",
 				position: "relative",
 				width: 24,
 				height: 24,
@@ -2819,68 +2721,62 @@ function NarratorPanelBody({
 	const contextIndicator = isWorkspacePreview ? (
 		contextRingNode
 	) : (
-		<Menu position="top-start">
-			<Menu.Target>{contextRingNode}</Menu.Target>
-			<Menu.Dropdown>
-				{contextStale && (
-					<Menu.Label c="orange" fz={10} style={{ maxWidth: 240, whiteSpace: "normal" }}>
-						{t("contextStaleHint")}
-					</Menu.Label>
-				)}
-				<Menu.Label c="dimmed" fz={10}>
-					{t("activeThresholds", {
-						compact: activeCompactStart ?? modelThresholds?.compactStart,
-					})}
+		<ContextCompositionMenu
+			narratorId={narratorId}
+			totalTokens={promptTokens}
+			snapshot={contextSnapshot}
+			target={contextRingNode}
+		>
+			<Menu.Label c="dimmed" fz={10}>
+				{t("activeThresholds", {
+					compact: activeCompactStart ?? modelThresholds?.compactStart,
+				})}
+			</Menu.Label>
+			<Menu.Item
+				leftSection={<IconSettings size={14} />}
+				c="dimmed"
+				fz="xs"
+				onClick={handleOpenContextThresholdSettings}
+			>
+				{t("thresholdSettings")}
+			</Menu.Item>
+			<Menu.Divider />
+			{hasContextData && (
+				<Menu.Label>{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}</Menu.Label>
+			)}
+			{promptTokens != null && (
+				<Menu.Label>
+					{contextWindow != null
+						? t("contextUsageTokensWithWindow", {
+								tokens: formatCompactNumber(promptTokens).compact,
+								window: formatCompactNumber(contextWindow).compact,
+							})
+						: t("contextUsageTokens", {
+								tokens: formatCompactNumber(promptTokens).compact,
+							})}
 				</Menu.Label>
-				<Menu.Item
-					leftSection={<IconSettings size={14} />}
-					c="dimmed"
-					fz="xs"
-					onClick={handleOpenContextThresholdSettings}
-				>
-					{t("thresholdSettings")}
-				</Menu.Item>
-				<Menu.Divider />
-				{hasContextData && (
-					<Menu.Label>
-						{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
-					</Menu.Label>
-				)}
-				{promptTokens != null && (
-					<Menu.Label>
-						{contextWindow != null
-							? t("contextUsageTokensWithWindow", {
-									tokens: formatLocaleNumber(promptTokens),
-									window: formatLocaleNumber(contextWindow),
-								})
-							: t("contextUsageTokens", {
-									tokens: formatLocaleNumber(promptTokens),
-								})}
-						{isEstimated && <span style={{ opacity: 0.6, marginLeft: 4 }}>({t("estimated")})</span>}
-					</Menu.Label>
-				)}
-				<Menu.Divider />
-				<Menu.Item
-					leftSection={<IconArrowsMinimize size={14} />}
-					onClick={() => {
-						// Compacting state will arrive via substatus_change WS event
-						api.triggerCompact(narratorId).catch((err) => {
-							handleCompactError(err);
-						});
-					}}
-				>
-					{t("triggerCompact")}
-				</Menu.Item>
-				<Menu.Item
-					leftSection={<IconEraser size={14} />}
-					onClick={() => {
-						api.clearContext(narratorId).catch(() => {});
-					}}
-				>
-					{t("clearContext")}
-				</Menu.Item>
-			</Menu.Dropdown>
-		</Menu>
+			)}
+			<Menu.Divider />
+			<Menu.Item
+				leftSection={<IconArrowsMinimize size={14} />}
+				onClick={() => {
+					// Compacting state will arrive via substatus_change WS event
+					api.triggerCompact(narratorId).catch((err) => {
+						handleCompactError(err);
+					});
+				}}
+			>
+				{t("triggerCompact")}
+			</Menu.Item>
+			<Menu.Item
+				leftSection={<IconEraser size={14} />}
+				onClick={() => {
+					api.clearContext(narratorId).catch(() => {});
+				}}
+			>
+				{t("clearContext")}
+			</Menu.Item>
+		</ContextCompositionMenu>
 	);
 
 	// Configuration controls stay fixed; movable tools follow the saved bottom order.
@@ -2939,7 +2835,7 @@ function NarratorPanelBody({
 					    fixed title @ pretext W, then only tools that fit after it. */}
 					<NarratorHeaderLayout
 						titleFullWidth={headerTitleFullWidth}
-						showBack={!isWorkspacePreview}
+						showBack={!isWorkspacePreview && !onMinimize && !chapterId}
 						showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
 						surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
 						showClose={!!onClose}
@@ -2961,13 +2857,9 @@ function NarratorPanelBody({
 									}}
 								>
 									{!isWorkspacePreview &&
-										(onMinimize ? (
-											<Tooltip label={t("backToGraph")} position="right">
-												<ActionIcon size="sm" variant="subtle" color="gray" onClick={onMinimize}>
-													<IconArrowsMinimize size={16} />
-												</ActionIcon>
-											</Tooltip>
-										) : onBack ? (
+										!onMinimize &&
+										!chapterId &&
+										(onBack ? (
 											<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
 												<IconArrowLeft size={16} />
 											</ActionIcon>
@@ -2985,7 +2877,7 @@ function NarratorPanelBody({
 										) : (
 											<NarratorPanelCompactContext.Consumer>
 												{(compact) =>
-													compact ? (
+													compact || workspaceId ? (
 														<ActionIcon
 															size="sm"
 															variant="subtle"
@@ -2994,7 +2886,9 @@ function NarratorPanelBody({
 																navigate({
 																	to: "/narrators/$narratorId",
 																	params: { narratorId },
-																	search: { from: "graph" },
+																	search: workspaceId
+																		? { from: "workspace", workspaceId }
+																		: { from: "graph" },
 																})
 															}
 														>
@@ -3057,6 +2951,17 @@ function NarratorPanelBody({
 										archiveMutation={archiveMutation}
 										dock={dock}
 										mockStreamEnabled={mockStreamEnabled}
+										compatibilityEntry={
+											<Suspense fallback={null}>
+												<NarratorCompatibilityEntry
+													projectId={
+														workspaceContext?.contextProjectId ??
+														projectId ??
+														narrator?.contextProjectId
+													}
+												/>
+											</Suspense>
+										}
 										onClose={onClose}
 										visibleToolCount={headerLayout.visibleToolCount}
 										unmeasured={headerLayout.unmeasured}
@@ -3163,55 +3068,53 @@ function NarratorPanelBody({
 							<CompactSummaryModalCtx.Provider value={compactSummaryModalCtxValue}>
 								<MessageSelectionCtx.Provider value={selectionCtxValue}>
 									<AllowRetryCtx.Provider value={allowRetryCtxValue}>
-										<FileModDrawerCtx.Provider value={fileModDrawerCtxValue}>
-											<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
-												<EditingMessageCtx.Provider value={editingMessageCtxValue}>
-													<RenderLodCtx.Provider value={renderLodCtxValue}>
-														{/* Same message-shaped skeleton the list itself shows while its
+										<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
+											<EditingMessageCtx.Provider value={editingMessageCtxValue}>
+												<RenderLodCtx.Provider value={renderLodCtxValue}>
+													{/* Same message-shaped skeleton the list itself shows while its
 													    document loads, so the lazy-chunk wait and the document wait
 													    look like one continuous placeholder (no blank → text flash).
 													    The column geometry comes from the shared helper rather than
 													    Mantine padding, so this fallback, the list's own placeholder
 													    and the real rows are all the same width — otherwise the
 													    mount stepped through two different column widths. */}
-														<Suspense
-															fallback={
-																<Box style={narratorColumnPlaceholderStyle(narratorCenteredColumn)}>
-																	<NarratorMessageListSkeleton />
-																</Box>
-															}
-														>
-															<PretextExactMessageList
-																ref={chunkListRef}
-																narratorId={narratorId}
-																isSubagent={isSubagent}
-																isActive={isActive}
-																scrollRef={chunkViewportRef}
-																contentRef={contentRef}
-																onAtBottomChange={setIsAtBottom}
-																onUnreadCountChange={setUnreadCount}
-																onTailMetaChange={handleMessageListTailMetaChange}
-																onLodStep={handleLodStep}
-																onSelectionResolverChange={setChunkSelectionResolver}
-																rowHandlers={vlistRowHandlers}
-																permCb={permCbWithAsyncQuestions}
-																hasChapter={hasChapter}
-																highlightMessageId={highlightMessageId}
-																highlightRequestId={highlightRequestId}
-																tailFooter={messageListTailFooter}
-															/>
-														</Suspense>
-													</RenderLodCtx.Provider>
-													<LodSwitchToast
-														lod={renderLod}
-														isDefault={renderLodIsDefault}
-														onSetAsDefault={setAsDefault}
-														onSelectLod={handleSelectLod}
-														pinned={lodIndicatorPinned}
-													/>
-												</EditingMessageCtx.Provider>
-											</LatestTodosToolUseIdCtx.Provider>
-										</FileModDrawerCtx.Provider>
+													<Suspense
+														fallback={
+															<Box style={narratorColumnPlaceholderStyle(narratorCenteredColumn)}>
+																<NarratorMessageListSkeleton />
+															</Box>
+														}
+													>
+														<PretextExactMessageList
+															ref={chunkListRef}
+															narratorId={narratorId}
+															isSubagent={isSubagent}
+															isActive={isActive}
+															scrollRef={chunkViewportRef}
+															contentRef={contentRef}
+															onAtBottomChange={setIsAtBottom}
+															onUnreadCountChange={setUnreadCount}
+															onTailMetaChange={handleMessageListTailMetaChange}
+															onLodStep={handleLodStep}
+															onSelectionResolverChange={setChunkSelectionResolver}
+															rowHandlers={vlistRowHandlers}
+															permCb={permCbWithAsyncQuestions}
+															hasChapter={hasChapter}
+															highlightMessageId={highlightMessageId}
+															highlightRequestId={highlightRequestId}
+															tailFooter={messageListTailFooter}
+														/>
+													</Suspense>
+												</RenderLodCtx.Provider>
+												<LodSwitchToast
+													lod={renderLod}
+													isDefault={renderLodIsDefault}
+													onSetAsDefault={setAsDefault}
+													onSelectLod={handleSelectLod}
+													pinned={lodIndicatorPinned}
+												/>
+											</EditingMessageCtx.Provider>
+										</LatestTodosToolUseIdCtx.Provider>
 									</AllowRetryCtx.Provider>
 								</MessageSelectionCtx.Provider>
 							</CompactSummaryModalCtx.Provider>
@@ -3537,35 +3440,6 @@ function NarratorPanelBody({
 						}}
 					/>
 					{/* ═══════════════════ End Bottom Interaction Area ═══════════════════ */}
-
-					{/* Only mount the lazy Drawer after its first open (mobile / workspace). */}
-					{!dock &&
-						!onToggleFileModPanel &&
-						shouldRenderFileModificationsDrawer(fileModDrawerOpened, fileModDrawerHasOpened) && (
-							<Suspense fallback={null}>
-								<FileModificationsDrawer
-									narratorId={narratorId}
-									opened={fileModDrawerOpened}
-									onClose={() => {
-										setFileModDrawerOpened(false);
-										setDeletePreviewMessageId(null);
-										setPendingDeleteCallback(null);
-									}}
-									pendingPermission={firstEditPermission}
-									onPermissionDecision={renderPermCb.onPermissionDecision}
-									deletePreviewMessageId={deletePreviewMessageId}
-									onConfirmDelete={() => {
-										pendingDeleteCallback?.();
-										setDeletePreviewMessageId(null);
-										setPendingDeleteCallback(null);
-									}}
-									onCancelDelete={() => {
-										setDeletePreviewMessageId(null);
-										setPendingDeleteCallback(null);
-									}}
-								/>
-							</Suspense>
-						)}
 
 					{/* Internal spec drawer — the third fallback when there is no dock spec
 					    tab (off-dock page) or the dock is showing a pushed subagent. Bound to

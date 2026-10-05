@@ -43,7 +43,7 @@ const NarratorUserChatPanel = lazy(() =>
 
 /**
  * Tool panels this host can present. A subset of the dock's panel kinds on
- * purpose — `details` and `filemod` already have their own drawers in
+ * purpose — `details` already has its own drawer in
  * `NarratorPanel`, and `terminal` / `spec` are hosted by the route.
  */
 export type MobileToolPanelKind = "git" | "search" | "browser" | "userchat";

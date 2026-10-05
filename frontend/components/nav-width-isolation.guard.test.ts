@@ -17,7 +17,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const LAYOUT = join(import.meta.dir, "AppRootLayout.tsx");
+const LAYOUT = join(import.meta.dir, "AuthenticatedAppLayout.tsx");
 
 /**
  * The layout's CODE, with comments stripped.
@@ -37,7 +37,7 @@ function functionBody(source: string, name: string): string {
 	const start = source.indexOf(`function ${name}(`);
 	expect(start).toBeGreaterThan(-1);
 	const rest = source.slice(start + 1);
-	const nextIndex = rest.search(/\nfunction [A-Za-z]/);
+	const nextIndex = rest.search(/\n(?:export )?function [A-Za-z]/);
 	return nextIndex === -1 ? rest : rest.slice(0, nextIndex);
 }
 

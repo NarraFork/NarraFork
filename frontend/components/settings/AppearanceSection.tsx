@@ -382,6 +382,14 @@ export function AppearanceSection({
 				onChange={(e) => updateUserPref.mutate({ wordWrapDiff: e.currentTarget.checked })}
 			/>
 
+			<Switch
+				label={t("treatAsLocalAccess")}
+				description={t("treatAsLocalAccessDesc")}
+				checked={userPrefs?.treatAsLocalAccess ?? false}
+				disabled={updateUserPref.isPending}
+				onChange={(e) => updateUserPref.mutate({ treatAsLocalAccess: e.currentTarget.checked })}
+			/>
+
 			{/* Recent Tabs */}
 			<Title order={5} mt="sm">
 				{t("recentTabsSubSection")}

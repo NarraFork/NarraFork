@@ -3,6 +3,13 @@ import { PLAN_DIR_REL } from "../../plan-file-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../../prompt-i18n";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 
+const DISABLE_REFLECTION_REVIEW_DESCRIPTION =
+	"Set true to disable plan reflection for the current narrator when the user explicitly requires human approval of the plan.";
+
+export function shouldDisablePlanReflectionReview(value: unknown): boolean {
+	return value === true || value === "true" || value === 1 || value === "1";
+}
+
 export const enterPlanModeTool: ToolDefinition = {
 	name: "EnterPlanMode",
 	description:
@@ -69,6 +76,7 @@ export const enterPlanModeTool: ToolDefinition = {
 		'User: "What files handle routing?"\n' +
 		"- Research task, not implementation planning\n\n" +
 		"## Important Notes\n\n" +
+		"- If the user explicitly requires human approval of the plan, set `disableReflectionReview: true`.\n" +
 		"- This tool REQUIRES user approval - they must consent to entering plan mode\n" +
 		"- If unsure whether to use it, err on the side of planning - it's better to get alignment upfront than to redo work\n" +
 		"- Users appreciate being consulted before significant changes are made to their codebase",
@@ -81,6 +89,14 @@ export const enterPlanModeTool: ToolDefinition = {
 					"a fresh random unique suffix is always appended.",
 				type: "string",
 			},
+			disableReflectionReview: {
+				description: DISABLE_REFLECTION_REVIEW_DESCRIPTION,
+				anyOf: [
+					{ type: "boolean" },
+					{ type: "string", enum: ["true", "false", "1", "0"] },
+					{ type: "integer", enum: [1, 0] },
+				],
+			},
 		},
 		additionalProperties: false,
 	},
@@ -91,6 +107,10 @@ export const enterPlanModeTool: ToolDefinition = {
 			.describe(
 				"Optional readable plan_name prefix (sanitized, limited to 48 UTF-8 bytes); a fresh random unique suffix is always appended.",
 			),
+		disableReflectionReview: z
+			.union([z.boolean(), z.enum(["true", "false", "1", "0"]), z.literal(1), z.literal(0)])
+			.optional()
+			.describe(DISABLE_REFLECTION_REVIEW_DESCRIPTION),
 	}),
 	async execute(_args, ctx): Promise<ToolResult> {
 		// DB update + WS broadcast handled by session layer (assistant_message event).

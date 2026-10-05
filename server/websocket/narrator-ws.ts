@@ -12,6 +12,10 @@ import {
 	RECENT_TABS_WS_BATCH_SIZE,
 } from "@shared/recent-tabs";
 import type { ServerWebSocket } from "bun";
+import {
+	measureSerializedCharacters,
+	queueContextCharacterRefresh,
+} from "../lib/context-characters";
 import { toolInputStreamSource } from "../services/tool-input-stream-source";
 
 export const MAX_NARRATOR_SUBSCRIPTIONS_PER_CONNECTION =
@@ -74,6 +78,7 @@ import {
 	updateBufferedMessage,
 } from "../services/narrator-session";
 import { addStatsSubscriber, removeStatsSubscriber } from "../services/output-stats";
+import { permissionPolicyChanges } from "../services/permission-rule-service";
 import { assertChapterProjectAccess, canReadProject } from "../services/project-acl";
 import type { PublicShareConnectionLease } from "../services/public-narrator-share-connections";
 import {
@@ -688,6 +693,16 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 	eventBus.emit({ type: "narrator:message_broadcast", narratorId, message });
 }
 
+// Replace the callback on hot reload; a hotOnce listener would retain the old emitter.
+const permissionPolicyBridge = hotSafe<{ dispose?: () => void }>(
+	"narrafork.permissionPolicyWsBridge",
+	() => ({}),
+);
+permissionPolicyBridge.dispose?.();
+permissionPolicyBridge.dispose = permissionPolicyChanges.on((event) => {
+	broadcastToNarrator(event.narratorId, event);
+});
+
 function withSubscriptionRequestId<T extends Record<string, unknown>>(
 	message: T,
 	subscriptionRequestId?: string,
@@ -1048,7 +1063,8 @@ function sendStreamingSnapshot(ws: NarratorWS, narratorIds: string[], requestId?
 	for (const id of narratorIds) {
 		const snap = getStreamingSnapshot(id);
 		if (!snap) continue;
-		const hasStreaming = snap.streamingBlocks.length > 0 || snap.toolChunks.size > 0;
+		const hasStreaming =
+			snap.streamingBlocks.length > 0 || snap.toolChunks.size > 0 || snap.model !== undefined;
 		if (!hasStreaming) continue;
 		if (
 			!safeSend(
@@ -1057,6 +1073,8 @@ function sendStreamingSnapshot(ws: NarratorWS, narratorIds: string[], requestId?
 					{
 						type: "streaming_snapshot",
 						narratorId: id,
+						model: snap.model,
+						provider: snap.provider,
 						streamingBlocks: snap.streamingBlocks,
 						toolChunks: [...snap.toolChunks.values()],
 					},
@@ -2375,16 +2393,24 @@ export const handleNarratorWS = {
 					// so it survives page refresh.
 					try {
 						const row = db
-							.select({ id: narratorToolCalls.id, inputJson: narratorToolCalls.inputJson })
+							.select({
+								id: narratorToolCalls.id,
+								messageId: narratorToolCalls.messageId,
+								inputJson: narratorToolCalls.inputJson,
+							})
 							.from(narratorToolCalls)
 							.where(eq(narratorToolCalls.toolUseId, msg.toolUseId))
 							.get();
 						if (row) {
 							const input = row.inputJson && typeof row.inputJson === "object" ? row.inputJson : {};
 							db.update(narratorToolCalls)
-								.set({ inputJson: { ...input, timeout: newMs } })
+								.set({
+									inputJson: { ...input, timeout: newMs },
+									inputChars: measureSerializedCharacters({ ...input, timeout: newMs }),
+								})
 								.where(eq(narratorToolCalls.id, row.id))
 								.run();
+							queueContextCharacterRefresh(msg.narratorId, row.messageId);
 						}
 					} catch (err) {
 						logger.warn("Failed to persist updated timeout", {

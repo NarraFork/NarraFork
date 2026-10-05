@@ -19,6 +19,7 @@ import { asc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
 import { normalizeBooleanOverride } from "../lib/boolean-override";
+import { measureSummaryCharacters, queueContextCharacterRefresh } from "../lib/context-characters";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { legacyFastModeMirror } from "../lib/fast-mode";
@@ -34,7 +35,9 @@ import {
 	initializeRefSeqFloor,
 	withSeqFloorRaiseScope,
 } from "./narrator-refs/seq-store";
+import { narratorCreationWorkspaceTarget } from "./narrator-service";
 import { resolveSubagentModelForRun } from "./subagent-model";
+import { withWorkspaceAdmission } from "./worktree-lifecycle-guard";
 
 /** Soft cap: above this, full materialization falls back to compressed context. */
 export const EXTRACT_FULL_MAX_MESSAGES = 2000;
@@ -162,154 +165,169 @@ export async function extractSubagentToPrimary(
 	const id = generateId();
 	const title = opts?.title?.trim() || defaultExtractTitle(source.title, subagentType, locale);
 
-	const newNarrator = withSeqFloorRaiseScope(() =>
-		db.transaction((tx) => {
-			const created = tx
-				.insert(narrators)
-				.values({
-					id,
-					chapterId: null,
-					type: "primary",
-					variant: "primary",
-					subagentType: null,
-					traits: ["standalone", "extracted-from-subagent"],
-					model: storedModel,
-					// Never inherit the subagent system prompt — primary control plane.
-					systemPrompt: null,
-					// Do not inherit explore/plan readOnly lockdown.
-					permissionMode: "default",
-					reasoningEffort: source.reasoningEffort ?? null,
-					fastModeOverride: normalizeBooleanOverride(source.fastModeOverride),
-					fastMode: legacyFastModeMirror(source.fastModeOverride),
-					relaxedPlan: resolveInitialRelaxedPlan({
+	const workspace = {
+		chapterId: null,
+		cwd: source.cwd ?? null,
+		defaultDeviceId: source.defaultDeviceId ?? null,
+	};
+	const admissionTargets = await narratorCreationWorkspaceTarget(workspace);
+	const newNarrator = await withWorkspaceAdmission(admissionTargets, async () =>
+		withSeqFloorRaiseScope(() =>
+			db.transaction((tx) => {
+				const created = tx
+					.insert(narrators)
+					.values({
+						id,
+						chapterId: null,
+						type: "primary",
+						variant: "primary",
+						subagentType: null,
+						traits: ["standalone", "extracted-from-subagent"],
+						model: storedModel,
+						// Never inherit the subagent system prompt — primary control plane.
+						systemPrompt: null,
+						// Do not inherit explore/plan readOnly lockdown.
 						permissionMode: "default",
-						explicit: source.relaxedPlan ?? undefined,
-						defaultRelaxedPlan: false,
-					}),
-					planReflectionAutoApproveOverride: source.planReflectionAutoApproveOverride ?? "inherit",
-					dangerReflectionOverride: source.dangerReflectionOverride ?? "inherit",
-					autoContinuationOverride: source.autoContinuationOverride ?? "inherit",
-					behaviorFenceIntervalOverride: source.behaviorFenceIntervalOverride ?? null,
-					behaviorFenceAttachOverride: source.behaviorFenceAttachOverride ?? "inherit",
-					// Independence: never join the source/parent deletion cascade.
-					parentNarratorId: null,
-					refsInheritedFrom: null,
-					refsBackfillCursor: null,
-					originToolCallId: null,
-					subagentOriginKind: null,
-					// Primary convention: judged on its own columns, not a delegation root.
-					aclRootNarratorId: null,
-					ownerUserId: source.ownerUserId,
-					visibility: audiences.visibility,
-					writeAudience: audiences.writeAudience,
-					inheritMode,
-					apiConversationId: null,
-					contextSummary,
-					status: "idle",
-					title,
-					cwd: source.cwd ?? null,
-					defaultDeviceId: source.defaultDeviceId ?? null,
-					createdAt: now,
-					updatedAt: now,
-				})
-				.returning()
-				.get();
+						reasoningEffort: source.reasoningEffort ?? null,
+						fastModeOverride: normalizeBooleanOverride(source.fastModeOverride),
+						fastMode: legacyFastModeMirror(source.fastModeOverride),
+						relaxedPlan: resolveInitialRelaxedPlan({
+							permissionMode: "default",
+							explicit: source.relaxedPlan ?? undefined,
+							defaultRelaxedPlan: false,
+						}),
+						planReflectionAutoApproveOverride:
+							source.planReflectionAutoApproveOverride ?? "inherit",
+						dangerReflectionOverride: source.dangerReflectionOverride ?? "inherit",
+						autoContinuationOverride: source.autoContinuationOverride ?? "inherit",
+						behaviorFenceIntervalOverride: source.behaviorFenceIntervalOverride ?? null,
+						behaviorFenceAttachOverride: source.behaviorFenceAttachOverride ?? "inherit",
+						// Independence: never join the source/parent deletion cascade.
+						parentNarratorId: null,
+						refsInheritedFrom: null,
+						refsBackfillCursor: null,
+						originToolCallId: null,
+						subagentOriginKind: null,
+						// Primary convention: judged on its own columns, not a delegation root.
+						aclRootNarratorId: null,
+						ownerUserId: source.ownerUserId,
+						visibility: audiences.visibility,
+						writeAudience: audiences.writeAudience,
+						inheritMode,
+						apiConversationId: null,
+						contextSummary,
+						contextSummaryChars: measureSummaryCharacters(contextSummary),
+						contextSystemChars: 0,
+						contextToolsChars: 0,
+						status: "idle",
+						title,
+						cwd: workspace.cwd,
+						defaultDeviceId: source.defaultDeviceId ?? null,
+						createdAt: now,
+						updatedAt: now,
+					})
+					.returning()
+					.get();
 
-			if (inheritMode === "full") {
-				for (const msg of orderedSourceMessages) {
-					const newMessageId = generateId();
+				if (inheritMode === "full") {
+					for (const msg of orderedSourceMessages) {
+						const newMessageId = generateId();
+						tx.insert(narratorMessages)
+							.values({
+								id: newMessageId,
+								narratorId: id,
+								// Detach from the parent Agent tool-call tree so primary history
+								// builders that filter top-level messages keep this exploration.
+								parentToolUseId: null,
+								// New identity: never reuse the source SDK uuid.
+								messageUuid: null,
+								role: msg.role,
+								contentJson: msg.contentJson,
+								contextCharsJson: msg.contextCharsJson,
+								contentText: msg.contentText,
+								tokensIn: msg.tokensIn,
+								costUsd: msg.costUsd,
+								costStatus: msg.costStatus,
+								costMissingFields: msg.costMissingFields,
+								turnUsageJson: msg.turnUsageJson,
+								provider: msg.provider,
+								credentialId: msg.credentialId,
+								model: msg.model,
+								outputTokens: msg.outputTokens,
+								cachedInputTokens: msg.cachedInputTokens,
+								cacheCreationInputTokens: msg.cacheCreationInputTokens,
+								cacheCreation5mTokens: msg.cacheCreation5mTokens,
+								cacheCreation1hTokens: msg.cacheCreation1hTokens,
+								reasoningTokens: msg.reasoningTokens,
+								ttftMs: msg.ttftMs,
+								durationMs: msg.durationMs,
+								contextPercent: msg.contextPercent,
+								meterUsage: msg.meterUsage,
+								meterUnit: msg.meterUnit,
+								commitSha: msg.commitSha,
+								treeHashAfter: msg.treeHashAfter,
+								snapshotCommitSha: msg.snapshotCommitSha,
+								commandText: msg.commandText,
+								createdBy: msg.createdBy,
+								origin: msg.origin,
+								originLabel: msg.originLabel,
+								editedAt: msg.editedAt,
+								editedBy: msg.editedBy,
+								originalContentJson: msg.originalContentJson,
+								createdAt: msg.createdAt,
+							})
+							.run();
+
+						const seq = claimNextRefSeq(tx, id);
+						tx.insert(narratorMessageRefs)
+							.values({
+								id: generateId(),
+								narratorId: id,
+								messageId: newMessageId,
+								seq,
+								isCompact: 0,
+								segmentCompactId: null,
+							})
+							.run();
+					}
+				} else if (contextSummary) {
+					const compactMsgId = generateId();
 					tx.insert(narratorMessages)
 						.values({
-							id: newMessageId,
+							id: compactMsgId,
 							narratorId: id,
-							// Detach from the parent Agent tool-call tree so primary history
-							// builders that filter top-level messages keep this exploration.
 							parentToolUseId: null,
-							// New identity: never reuse the source SDK uuid.
-							messageUuid: null,
-							role: msg.role,
-							contentJson: msg.contentJson,
-							contentText: msg.contentText,
-							tokensIn: msg.tokensIn,
-							costUsd: msg.costUsd,
-							costStatus: msg.costStatus,
-							costMissingFields: msg.costMissingFields,
-							turnUsageJson: msg.turnUsageJson,
-							provider: msg.provider,
-							credentialId: msg.credentialId,
-							model: msg.model,
-							outputTokens: msg.outputTokens,
-							cachedInputTokens: msg.cachedInputTokens,
-							cacheCreationInputTokens: msg.cacheCreationInputTokens,
-							cacheCreation5mTokens: msg.cacheCreation5mTokens,
-							cacheCreation1hTokens: msg.cacheCreation1hTokens,
-							reasoningTokens: msg.reasoningTokens,
-							ttftMs: msg.ttftMs,
-							durationMs: msg.durationMs,
-							contextPercent: msg.contextPercent,
-							meterUsage: msg.meterUsage,
-							meterUnit: msg.meterUnit,
-							commitSha: msg.commitSha,
-							treeHashAfter: msg.treeHashAfter,
-							snapshotCommitSha: msg.snapshotCommitSha,
-							commandText: msg.commandText,
-							createdBy: msg.createdBy,
-							origin: msg.origin,
-							originLabel: msg.originLabel,
-							editedAt: msg.editedAt,
-							editedBy: msg.editedBy,
-							originalContentJson: msg.originalContentJson,
-							createdAt: msg.createdAt,
+							role: "system",
+							contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
+							contextCharsJson: { segments: [] },
+							contentText:
+								locale === "zh-CN"
+									? `[来自子代理的压缩上下文：${source.title ?? sourceId}]`
+									: `[Compressed context extracted from subagent ${source.title ?? sourceId}]`,
+							origin: "system",
+							originLabel: `extractFromSubagent:${sourceId}`,
+							createdAt: now,
 						})
 						.run();
-
 					const seq = claimNextRefSeq(tx, id);
 					tx.insert(narratorMessageRefs)
 						.values({
 							id: generateId(),
 							narratorId: id,
-							messageId: newMessageId,
+							messageId: compactMsgId,
 							seq,
-							isCompact: 0,
-							segmentCompactId: null,
+							isCompact: 1,
 						})
 						.run();
 				}
-			} else if (contextSummary) {
-				const compactMsgId = generateId();
-				tx.insert(narratorMessages)
-					.values({
-						id: compactMsgId,
-						narratorId: id,
-						parentToolUseId: null,
-						role: "system",
-						contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
-						contentText:
-							locale === "zh-CN"
-								? `[来自子代理的压缩上下文：${source.title ?? sourceId}]`
-								: `[Compressed context extracted from subagent ${source.title ?? sourceId}]`,
-						origin: "system",
-						originLabel: `extractFromSubagent:${sourceId}`,
-						createdAt: now,
-					})
-					.run();
-				const seq = claimNextRefSeq(tx, id);
-				tx.insert(narratorMessageRefs)
-					.values({
-						id: generateId(),
-						narratorId: id,
-						messageId: compactMsgId,
-						seq,
-						isCompact: 1,
-					})
-					.run();
-			}
 
-			initializeRefSeqFloor(tx, id);
-			return created;
-		}),
+				initializeRefSeqFloor(tx, id);
+				return created;
+			}),
+		),
 	);
 
+	queueContextCharacterRefresh(id);
 	// Spec namespace fork is best-effort; extract must not fail on it.
 	const { specVfsService } = await import("./spec-vfs-service");
 	try {

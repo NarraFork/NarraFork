@@ -197,10 +197,12 @@ describe("danger reflection whose loop throws", () => {
 		// The gate must be resolved by the fallback, not left running.
 		expect(cancellations.length).toBeGreaterThan(0);
 		expect(cancellations[0]?.requestId).toBe(REQUEST_ID);
-		// The reason must name the gate AND the concrete cause, not a generic
-		// "the model didn't call its decision tool" (see reflection-failure-summary.test.ts).
-		expect(cancellations[0]?.reason).toContain("Danger reflection could not decide");
-		expect(cancellations[0]?.reason).toContain("provider error");
+		// Human/main-session feedback names the check failure and next action,
+		// rather than blaming the model or exposing internal tooling instructions.
+		expect(cancellations[0]?.reason).toContain("Operation safety check could not complete");
+		expect(cancellations[0]?.reason).toContain("model service request failed");
+		expect(cancellations[0]?.reason).toContain("not authorized to execute");
+		expect(cancellations[0]?.reason).not.toContain("DangerConfirm");
 		// And no runtime entry may survive, or the narrator stays tagged "reflecting".
 		expect(pendingDangerReflections.has(REQUEST_ID)).toBe(false);
 	});

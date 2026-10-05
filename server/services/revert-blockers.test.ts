@@ -10,6 +10,7 @@ import {
 	workspaceWriteLeases,
 } from "../db/schema";
 import { generateId } from "../lib/id";
+import { hasNarratorAdmissionWork, withNarratorWorkAdmission } from "./narrator-session-state";
 import { collectRevertBlockers } from "./revert-blockers";
 
 const now = () => new Date().toISOString();
@@ -66,6 +67,40 @@ afterEach(() => {
 });
 
 describe("collectRevertBlockers", () => {
+	test("preview does not diagnose its own admission as unfinished work", async () => {
+		await withNarratorWorkAdmission(ids.narrator, async () => {
+			expect(hasNarratorAdmissionWork(ids.narrator)).toBe(true);
+			expect(collectRevertBlockers(ids.narrator)).toEqual([]);
+		});
+		expect(hasNarratorAdmissionWork(ids.narrator)).toBe(false);
+	});
+
+	test("excluding the preview claim still reports concurrent admitted work", async () => {
+		let release!: () => void;
+		let entered!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const started = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const other = withNarratorWorkAdmission(ids.narrator, async () => {
+			entered();
+			await gate;
+		});
+		await started;
+		try {
+			await withNarratorWorkAdmission(ids.narrator, async () => {
+				expect(collectRevertBlockers(ids.narrator)).toEqual([
+					{ kind: "narrator_busy", detail: "admission work still settling" },
+				]);
+			});
+		} finally {
+			release();
+			await other;
+		}
+	});
+
 	test("planner busy short-circuits to one high-signal blocker", () => {
 		const blockers = collectRevertBlockers(ids.narrator, "REVERT_PLANNER_BUSY");
 		expect(blockers).toEqual([

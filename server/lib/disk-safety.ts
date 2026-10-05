@@ -1,5 +1,6 @@
+import { SQLiteError } from "bun:sqlite";
 import { realpath, stat, statfs } from "node:fs/promises";
-import { dirname, resolve, win32 } from "node:path";
+import { dirname, isAbsolute, resolve, win32 } from "node:path";
 import { DEFAULT_DISK_SAFETY, type DiskSafetySettings } from "./disk-safety-config";
 import { AppError } from "./errors";
 import { settings } from "./settings";
@@ -245,31 +246,50 @@ export class DiskSpaceError extends AppError {
 	}
 }
 
-/** Match specific storage failures, not generic "ENOSPC" in a successful tool's source text.
- * inotify ENOSPC is an exhausted watch quota, not a full filesystem.
+export type DiskFullEvidence =
+	| { kind: "sqlite"; code: "SQLITE_FULL" }
+	| { kind: "filesystem"; code: "ENOSPC" | "EDQUOT"; path: string };
+
+// Only single-path storage syscalls with an explicit operation path qualify.
+// copyfile/link/symlink/rename can name both source and destination: do not guess
+// which partition failed. inotify/watch ENOSPC is watcher exhaustion, not disk full.
+const STORAGE_SYSCALLS = new Set([
+	"open",
+	"write",
+	"writev",
+	"pwrite",
+	"truncate",
+	"ftruncate",
+	"mkdir",
+	"fsync",
+	"fdatasync",
+]);
+
+/** Positive structured evidence only: messages and tool output are never inspected.
+ * Unknown codes, unknown syscalls and unattributed paths remain ordinary errors.
+ * SQLite's errno is meaningful only on its native error type, never on a plain object.
  */
-export function isDiskFullError(error: unknown): boolean {
+export function confirmedDiskFullEvidence(error: unknown): DiskFullEvidence | null {
 	let current = error;
-	for (let depth = 0; depth < 4 && current != null; depth++) {
-		const record =
-			typeof current === "object"
-				? (current as { code?: unknown; errno?: unknown; message?: unknown; cause?: unknown })
-				: {};
-		const text = typeof current === "string" ? current : String(record.message ?? "");
+	for (let depth = 0; depth < 4 && current instanceof Error; depth++) {
+		if (current instanceof SQLiteError && current.code === "SQLITE_FULL" && current.errno === 13)
+			return { kind: "sqlite", code: "SQLITE_FULL" };
+		const record = current as NodeJS.ErrnoException;
 		if (
-			!/inotify|file watchers reached|watch(?:er)? limit|watch quota|max_user_watches/i.test(
-				text,
-			) &&
-			(["ENOSPC", "EDQUOT", "SQLITE_FULL"].includes(String(record.code)) ||
-				(record.errno === 13 && /database|sqlite/i.test(text)) ||
-				/\bENOSPC\b|\bEDQUOT\b|\bSQLITE_FULL\b|no space left on device|disk quota exceeded|database or disk is full/i.test(
-					text,
-				))
+			(record.code === "ENOSPC" || record.code === "EDQUOT") &&
+			typeof record.syscall === "string" &&
+			STORAGE_SYSCALLS.has(record.syscall) &&
+			typeof record.path === "string" &&
+			isAbsolute(record.path)
 		)
-			return true;
-		current = record.cause;
+			return { kind: "filesystem", code: record.code, path: record.path };
+		current = current.cause;
 	}
-	return false;
+	return null;
+}
+
+export function isDiskFullError(error: unknown): boolean {
+	return confirmedDiskFullEvidence(error) !== null;
 }
 
 export const diskSpaceMonitor = new DiskSpaceMonitor();

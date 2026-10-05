@@ -67,6 +67,42 @@ export function getSearchResultDisplayTitle(
 	);
 }
 
+interface SortableSearchResult {
+	id?: string;
+	type?: string;
+	title?: string | null;
+	narratorTitle?: string | null;
+	chapterTitle?: string | null;
+	updatedAt?: string | null;
+	createdAt?: string | null;
+	lastMessageAt?: string | null;
+	matchScore?: number;
+}
+
+/** All result types share one ordering; only explicit type sorting groups them. */
+export function sortVisibleSearchResults<T extends SortableSearchResult>(
+	results: readonly T[],
+	type: SearchResultType,
+	sort: SearchSortMode,
+	untitled: (id: string) => string,
+): T[] {
+	const items = results.filter((result) => type === "all" || result.type === type);
+	if (sort === "title") {
+		return items
+			.map((result) => ({ result, title: getSearchResultDisplayTitle(result, untitled) }))
+			.sort((a, b) => a.title.localeCompare(b.title))
+			.map(({ result }) => result);
+	}
+	return items.sort((a, b) => {
+		if (sort === "time") {
+			const bTime = Date.parse(b.updatedAt ?? b.createdAt ?? b.lastMessageAt ?? "") || 0;
+			const aTime = Date.parse(a.updatedAt ?? a.createdAt ?? a.lastMessageAt ?? "") || 0;
+			return bTime - aTime;
+		}
+		if (sort === "type") return String(a.type).localeCompare(String(b.type));
+		return (b.matchScore ?? 0) - (a.matchScore ?? 0);
+	});
+}
 export function normalizeSearchText(value: unknown): string {
 	return String(value ?? "")
 		.toLowerCase()

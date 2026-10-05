@@ -23,6 +23,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
 
 let isMobileViewport = false;
+/** Drives the `(hover: none), (pointer: coarse)` touch-pointer query per test. */
+let touchPointerMatches = false;
 
 mock.module("@mantine/hooks", () => ({
 	useMediaQuery: () => isMobileViewport,
@@ -52,6 +54,16 @@ let container: HTMLDivElement | undefined;
 
 /** Viewport width the stubbed DOM reports (feeds the floating bar's `right`). */
 const TEST_VIEWPORT_WIDTH = 1000;
+const resizeSubscriptions = new Map<object, { targets: Set<Element>; callback: () => void }>();
+
+async function notifyResize(target: Element): Promise<void> {
+	await act(async () => {
+		for (const subscription of resizeSubscriptions.values()) {
+			if (subscription.targets.has(target)) subscription.callback();
+		}
+		for (let i = 0; i < 3; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+	});
+}
 
 function installDom() {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
@@ -63,7 +75,8 @@ function installDom() {
 		value: TEST_VIEWPORT_WIDTH,
 	});
 	const matchMedia = (query: string) => ({
-		matches: false,
+		matches:
+			touchPointerMatches && (query.includes("hover: none") || query.includes("pointer: coarse")),
 		media: query,
 		onchange: null,
 		addListener() {},
@@ -72,12 +85,28 @@ function installDom() {
 		removeEventListener() {},
 		dispatchEvent: () => false,
 	});
+	// `useMatchMedia` reads `window.matchMedia` (the window OBJECT, not the global
+	// binding), so the stub has to live there for the touch branch to be testable.
+	Object.defineProperty(window, "matchMedia", {
+		configurable: true,
+		writable: true,
+		value: matchMedia,
+	});
 	const requestAnimationFrame = (callback: FrameRequestCallback) => setTimeout(callback, 0);
 	const cancelAnimationFrame = (id: number) => clearTimeout(id);
 	class TestResizeObserver {
-		observe() {}
-		unobserve() {}
-		disconnect() {}
+		constructor(callback: () => void) {
+			resizeSubscriptions.set(this, { targets: new Set(), callback });
+		}
+		observe(target: Element) {
+			resizeSubscriptions.get(this)?.targets.add(target);
+		}
+		unobserve(target: Element) {
+			resizeSubscriptions.get(this)?.targets.delete(target);
+		}
+		disconnect() {
+			resizeSubscriptions.delete(this);
+		}
 	}
 	const globals = {
 		window,
@@ -378,6 +407,8 @@ function clickAction(label: string): void {
 
 beforeEach(() => {
 	isMobileViewport = false;
+	touchPointerMatches = false;
+	resizeSubscriptions.clear();
 	installDom();
 	container = document.createElement("div");
 	document.body.appendChild(container);
@@ -685,6 +716,268 @@ describe("VListContentViewHost — mobile", () => {
 		expect(recorded.opened).toEqual([]);
 		await act(async () => {
 			(host as HTMLElement).click();
+		});
+		expect(recorded.opened).toEqual([CODE_TARGET.id]);
+	});
+});
+
+/**
+ * A touch pointer cannot hover, so the hover action bar — and with it the
+ * "read from the start" button a FLOATING bar gains — is unreachable on a phone.
+ * The one action with no other one-tap route gets a standalone, finger-sized
+ * button instead, painted exactly while the bar WOULD be floating: the body's
+ * head is gone and enough of it remains to still be reading.
+ *
+ * The suite drives `window.matchMedia` (the touch branch reads the query, and
+ * linkedom has no pointer model) and the float tracker's geometry stubs.
+ */
+describe("VListContentViewHost — touch scroll-to-top", () => {
+	/** The standalone touch button, portaled to <body> like the floating bar. */
+	function touchButton(): HTMLElement | null {
+		return document.querySelector("[data-vlist-touch-scroll-top]");
+	}
+
+	/**
+	 * Let the float tracker re-read the stubbed geometry. The tracker listens on
+	 * the scroller's `scroll` and window `resize`; the latter is always attached,
+	 * regardless of which scroller the host resolved at mount.
+	 *
+	 * A few macrotasks: the tracker measures inside a rAF (a setTimeout in this
+	 * DOM), and its commit then triggers the linger effect's commit that actually
+	 * mounts the button — each hop needs its own flush inside this act() scope.
+	 */
+	async function settleFloat(): Promise<void> {
+		await act(async () => {
+			window.dispatchEvent(new Event("resize"));
+			for (let i = 0; i < 3; i++) {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			}
+		});
+	}
+
+	test("updates the size gate when the body grows without a scroll or window resize", async () => {
+		touchPointerMatches = true;
+		const { controls } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		stubScrollGeometry({ above: 80, bodyHeight: 180 });
+		await notifyResize(hostEl());
+		expect(touchButton()).toBeNull();
+		stubScrollGeometry({ above: 80, bodyHeight: 400 });
+		await notifyResize(hostEl());
+		expect(touchButton()).toBeTruthy();
+	});
+
+	test("tracks dock scroller resizing without a window resize and disconnects on hide", async () => {
+		touchPointerMatches = true;
+		container?.setAttribute("data-pretext-exact-message-list", "");
+		const { controls } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		stubScrollGeometry({ above: 120, bodyRight: 800 });
+		await notifyResize(container as HTMLDivElement);
+		expect(touchButton()?.getAttribute("style")).toContain("right:204px");
+		stubScrollGeometry({ above: 120, bodyRight: 600 });
+		await notifyResize(container as HTMLDivElement);
+		expect(touchButton()?.getAttribute("style")).toContain("right:404px");
+		const tracker = [...resizeSubscriptions.values()].find((s) => s.targets.has(hostEl()));
+		expect(tracker).toBeDefined();
+		await renderHost({ target: CODE_TARGET, controls, panelVisible: false });
+		expect([...resizeSubscriptions.values()]).not.toContain(tracker);
+	});
+
+	test("paints the button with no hover once the head is out of view", async () => {
+		touchPointerMatches = true;
+		isMobileViewport = true;
+		const { controls } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		// Nothing yet: the initial geometry (all-zero rects) reads as parked.
+		expect(touchButton()).toBeNull();
+		stubScrollGeometry({ above: 120 });
+		await settleFloat();
+		const button = touchButton();
+		expect(button).toBeTruthy();
+		// Portaled out of the row, fixed to the same coordinates the bar would use.
+		expect(button?.parentElement).toBe(document.body as unknown as HTMLElement);
+		expect(button?.getAttribute("style")).toContain("position:fixed");
+		expect(button?.getAttribute("style")).toContain("top:104px");
+		// …and the hover bar never mounted: this button is the ONLY affordance.
+		expect(barEl()).toBeNull();
+	});
+
+	test("stays hidden while the head is visible — nothing to scroll back to", async () => {
+		touchPointerMatches = true;
+		isMobileViewport = true;
+		const { controls } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		stubScrollGeometry({ above: -50 }); // head 50px BELOW the fold
+		await settleFloat();
+		expect(touchButton()).toBeNull();
+	});
+
+	test("never triggers for a body shorter than 200px, however far it scrolled", async () => {
+		// Jumping back to the start of a barely-screenful body is not worth a
+		// persistent finger target — and short bodies are the ones a fast fling
+		// walks through their floating window in a few frames (the strobe).
+		touchPointerMatches = true;
+		isMobileViewport = true;
+		const { controls } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		// Head 120px above the fold, 30px still visible below it: floating per the
+		// bar's geometry, but the body is only 150px tall.
+		stubScrollGeometry({ above: 120, bodyHeight: 150 });
+		await settleFloat();
+		expect(touchButton()).toBeNull();
+	});
+
+	test("a body exactly at the 200px threshold still triggers", async () => {
+		touchPointerMatches = true;
+		isMobileViewport = true;
+		const { controls } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		stubScrollGeometry({ above: 120, bodyHeight: 200 });
+		await settleFloat();
+		expect(touchButton()).toBeTruthy();
+	});
+
+	test("clicking it scrolls the head back into view", async () => {
+		touchPointerMatches = true;
+		isMobileViewport = true;
+		const { controls } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		const scroller = stubScrollGeometry({ above: 120, scrollTop: 1000 });
+		await settleFloat();
+		const button = touchButton();
+		if (!button) throw new Error("touch button not found");
+		await act(async () => {
+			button.click();
+		});
+		// Same arithmetic as the bar's button: 120px above the fold + 8px gap.
+		expect(scroller.scrollTops).toEqual([1000 - 120 - 8]);
+	});
+
+	test("its taps never arm the body's double-tap fullscreen shortcut", async () => {
+		touchPointerMatches = true;
+		isMobileViewport = true;
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		stubScrollGeometry({ above: 120 });
+		await settleFloat();
+		const button = touchButton();
+		if (!button) throw new Error("touch button not found");
+		// Portaled, so the click still bubbles through the REACT tree to the host's
+		// onClick; the button stops it, or two scroll-backs would open the modal.
+		await act(async () => {
+			button.click();
+			button.click();
+		});
+		expect(recorded.opened).toEqual([]);
+	});
+
+	test("a tap-synthesized mouseover never summons the bar on a touch pointer", async () => {
+		touchPointerMatches = true;
+		// A desktop-width touchscreen (tablet in landscape): hover handlers used to be
+		// attached there, and the `mouseenter` a browser synthesizes after every tap
+		// would mount the bar — replacing the big touch button with its small one
+		// mid-gesture, the original complaint.
+		isMobileViewport = false;
+		const { controls } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		stubScrollGeometry({ above: 120 });
+		await hover();
+		expect(barEl()).toBeNull();
+		expect(touchButton()).toBeTruthy();
+	});
+
+	test("scrolling back to the top does not pop the bar up as the button unmounts", async () => {
+		// The exact regression: tap the button → smooth-scroll home → the button
+		// unmounts (parked) mid-gesture → the browser's synthesized mouseover lands
+		// on the body beneath → the bar mounted and the big button "became" small
+		// ones. None of that may happen now.
+		touchPointerMatches = true;
+		isMobileViewport = false;
+		const { controls } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		const scroller = stubScrollGeometry({ above: 120, scrollTop: 1000 });
+		await settleFloat();
+		const button = touchButton();
+		if (!button) throw new Error("touch button not found");
+		await act(async () => {
+			button.click();
+		});
+		expect(scroller.scrollTops).toEqual([1000 - 120 - 8]);
+		// The scroll lands: head back in view (parked), then the synthesized hover.
+		stubScrollGeometry({ above: -8 });
+		await settleFloat();
+		await hover();
+		expect(barEl()).toBeNull();
+		// The button does not blink off — it fades out through its linger…
+		expect(touchButton()?.getAttribute("data-vlist-touch-scroll-top-shown")).toBe("false");
+		// …and is gone once the linger runs down.
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 300));
+		});
+		expect(touchButton()).toBeNull();
+		expect(barEl()).toBeNull();
+	});
+
+	test("fades out through a short linger instead of vanishing at a body boundary", async () => {
+		// A fast fling walks a short body through its floating window in a few
+		// frames; unmounting on the exact state change is the strobe the reader
+		// reported. The exit must be a fade.
+		touchPointerMatches = true;
+		isMobileViewport = true;
+		const { controls } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		stubScrollGeometry({ above: 120 });
+		await settleFloat();
+		expect(touchButton()?.getAttribute("data-vlist-touch-scroll-top-shown")).toBe("true");
+		// The body scrolls on: too little of it left below the fold (hidden).
+		stubScrollGeometry({ above: 380, bodyHeight: 400 });
+		await settleFloat();
+		const fading = touchButton();
+		expect(fading).toBeTruthy();
+		expect(fading?.getAttribute("data-vlist-touch-scroll-top-shown")).toBe("false");
+		expect(fading?.getAttribute("style")).toContain("opacity:0");
+		// The linger keeps the LAST floating coordinates — the parked/hidden states
+		// carry zeros, which would teleport the fade to the viewport's top-left.
+		expect(fading?.getAttribute("style")).toContain("top:104px");
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 300));
+		});
+		expect(touchButton()).toBeNull();
+	});
+
+	test("re-entering the floating state within the linger reuses the same element", async () => {
+		// "Scrolled one body too far and right back" must not blink: the linger
+		// window reuses the mounted button, so no unmount/remount flash occurs.
+		touchPointerMatches = true;
+		isMobileViewport = true;
+		const { controls } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		stubScrollGeometry({ above: 120 });
+		await settleFloat();
+		const first = touchButton();
+		if (!first) throw new Error("touch button not found");
+		stubScrollGeometry({ above: -8 }); // head back in view (parked)
+		await settleFloat();
+		expect(touchButton()?.getAttribute("data-vlist-touch-scroll-top-shown")).toBe("false");
+		stubScrollGeometry({ above: 120 }); // and scrolled away again
+		await settleFloat();
+		const second = touchButton();
+		expect(second).toBe(first);
+		expect(second?.getAttribute("data-vlist-touch-scroll-top-shown")).toBe("true");
+	});
+
+	test("a wide touch screen keeps the double-tap fullscreen route", async () => {
+		touchPointerMatches = true;
+		isMobileViewport = false;
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		await act(async () => {
+			hostEl().click();
+		});
+		expect(recorded.opened).toEqual([]);
+		await act(async () => {
+			hostEl().click();
 		});
 		expect(recorded.opened).toEqual([CODE_TARGET.id]);
 	});

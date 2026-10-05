@@ -73,6 +73,7 @@ export type WorkspaceRuntimeBinding = Readonly<
 	Pick<FileChangeExecutionBinding, "runtimeEpoch" | "runtimeGeneration">
 >;
 export type WorkspaceWriteLeaseKind = "write" | "rollback";
+export type WorkspaceActivityPolicy = "strict" | "observe";
 export type WorkspaceWriteLeaseToken = Readonly<{ id: symbol }>;
 export type WorkspaceActivityToken = Readonly<{ id: symbol }>;
 export type WorkspaceMutationOutcome = "applied" | "not_applied" | "unknown";
@@ -124,10 +125,12 @@ export interface WorkspaceWriteRequest {
 	ranges?: readonly WorkspaceWriteRange[];
 	/** Trusted native-IO caller only; unknown execution can outlive its owning process. */
 	executionClass?: "local_file_io" | "unknown";
+	/** Rollback only: observe known activity without overriding file guards or uncertainty. */
+	activityPolicy?: WorkspaceActivityPolicy;
 }
 
 export type WorkspaceWriteTarget = Readonly<
-	Pick<WorkspaceWriteRequest, "scope" | "runtime" | "ranges" | "executionClass">
+	Pick<WorkspaceWriteRequest, "scope" | "runtime" | "ranges" | "executionClass" | "activityPolicy">
 >;
 
 export interface WorkspaceWriteManyRequest {
@@ -157,6 +160,8 @@ export interface WorkspaceWriteLease {
 	readonly ranges: readonly WorkspaceWriteRange[];
 	readonly token: WorkspaceWriteLeaseToken;
 	readonly kind: WorkspaceWriteLeaseKind;
+	/** Frozen admission policy; absent on older leases means strict. Nested requests cannot replace it. */
+	readonly activityPolicy?: WorkspaceActivityPolicy;
 	readonly scope: Readonly<FileChangeScopeIdentity>;
 	/** Stable across normal mutation registration/settlement within this lease. */
 	readonly scopeRevision: number;
@@ -212,6 +217,8 @@ interface LeaseRecord {
 	owner: WorkspaceWriteCoordinator;
 	scope: Readonly<FileChangeScopeIdentity>;
 	kind: WorkspaceWriteLeaseKind;
+	/** Absent on leases that survived an older hot-safe wrapper; those remain strict. */
+	activityPolicy?: WorkspaceActivityPolicy;
 	token: WorkspaceWriteLeaseToken;
 	binding: Readonly<FileChangeExecutionBinding>;
 	revision: number;
@@ -539,7 +546,13 @@ export class WorkspaceWriteCoordinator {
 		return this.state.executionContext.run(token, () =>
 			this.run(
 				record.kind,
-				{ scope: record.scope, runtime: record.binding, ranges: record.ranges, leaseToken: token },
+				{
+					scope: record.scope,
+					runtime: record.binding,
+					ranges: record.ranges,
+					leaseToken: token,
+					activityPolicy: record.activityPolicy ?? "strict",
+				},
 				body,
 			),
 		);
@@ -548,7 +561,7 @@ export class WorkspaceWriteCoordinator {
 	/**
 	 * Register BEFORE starting a long Bash/unknown writer; end only when it has
 	 * really stopped (including delegated work). This is observation, not a write
-	 * permission or a long-held write lock. A running rollback rejects registration.
+	 * permission or a long-held write lock. A strict rollback rejects intersecting registration.
 	 */
 	registerActivity(
 		input: Pick<WorkspaceWriteRequest, "scope" | "runtime">,
@@ -575,14 +588,21 @@ export class WorkspaceWriteCoordinator {
 				);
 		}
 		for (const record of this.state.leases.values()) {
-			if (record.kind === "rollback" && overlaps(scope, record.scope)) {
+			if (
+				record.kind === "rollback" &&
+				(record.activityPolicy !== "observe" ||
+					record.uncertain ||
+					record.persistencePending ||
+					record.executionEnded) &&
+				activityIntersects(record, scope)
+			) {
 				throw fail("rollback_active", "An overlapping rollback is still executing");
 			}
 		}
 		const token = Object.freeze({ id: Symbol("workspace-activity") });
 		this.state.activities.set(token, { owner: this, scope, uncertain: false });
 		for (const record of this.state.leases.values()) {
-			if (overlaps(scope, record.scope)) record.hadActivity = true;
+			if (activityIntersects(record, scope)) record.hadActivity = true;
 		}
 		this.changed();
 		// Reject an already queued rollback too; ending this activity cannot erase it.
@@ -606,7 +626,7 @@ export class WorkspaceWriteCoordinator {
 		// OWN mutation guard. Failed persistence cannot be retried as "finished".
 		if (record.uncertain) {
 			for (const lease of this.state.leases.values()) {
-				if (overlaps(record.scope, lease.scope)) lease.uncertain = true;
+				if (activityIntersects(lease, record.scope)) lease.uncertain = true;
 			}
 			// On a persistence failure retain the activity, continuing to deny rollback.
 			const revision = record.owner.persistUncertainScope(record.scope);
@@ -694,7 +714,7 @@ export class WorkspaceWriteCoordinator {
 				"needs_verification",
 				"Workspace observation overlaps an unfinished durable lease",
 			);
-		this.rejectActivityOverlap("rollback", scope);
+		this.rejectActivityOverlap("rollback", { scope, runtime: input.runtime });
 		const summary = this.capture(scope);
 		if (
 			summary.scopeRevision !== input.scopeRevision ||
@@ -1226,6 +1246,10 @@ export class WorkspaceWriteCoordinator {
 			runtime: Object.freeze({ ...input.runtime }),
 			ranges: copyRanges(input.scope, input.ranges),
 		};
+		assertActivityPolicy(request.activityPolicy);
+		if (kind !== "rollback" && request.activityPolicy === "observe") {
+			throw fail("invalid_input", "Observing activity is only supported for rollback");
+		}
 		assertWaitTimeout(request.waitTimeoutMs ?? this.waitTimeoutMs);
 		if (request.signal?.aborted) throw fail("aborted", "Workspace admission was cancelled");
 		const inherited = this.state.executionContext.getStore();
@@ -1246,7 +1270,8 @@ export class WorkspaceWriteCoordinator {
 					record.ranges ?? freezeWorkspaceRanges(record.scope),
 					request.ranges ?? freezeWorkspaceRanges(request.scope),
 				) ||
-				(kind === "rollback" && record.kind !== "rollback")
+				(kind === "rollback" && record.kind !== "rollback") ||
+				(request.activityPolicy === "observe" && record.activityPolicy !== "observe")
 			) {
 				throw fail(
 					"invalid_nesting",
@@ -1324,7 +1349,7 @@ export class WorkspaceWriteCoordinator {
 		for (const target of requested) {
 			this.requireScope(this.db, target.scope);
 			this.requireRuntime(target.scope.deviceId, target.runtime);
-			this.rejectActivityOverlap(kind, target.scope);
+			this.rejectActivityOverlap(kind, target);
 		}
 		if (
 			targets
@@ -1394,7 +1419,7 @@ export class WorkspaceWriteCoordinator {
 					}
 					const targets = waiterTargets(waiter);
 					for (const target of targets) {
-						waiter.owner.rejectActivityOverlap(waiter.kind, target.scope);
+						waiter.owner.rejectActivityOverlap(waiter.kind, target);
 					}
 					if (!canStartRanges(this.state, targets, this.state.waiters.slice(0, index))) {
 						index++;
@@ -1427,7 +1452,7 @@ export class WorkspaceWriteCoordinator {
 	}
 
 	private grant(kind: WorkspaceWriteLeaseKind, request: WorkspaceWriteRequest): LeaseRecord {
-		this.rejectActivityOverlap(kind, request.scope);
+		this.rejectActivityOverlap(kind, request);
 		const leaseId = generateId();
 		// Synchronous range check + transaction + insertion: no await/interleaving.
 		const row = this.transaction((tx) => {
@@ -1482,7 +1507,7 @@ export class WorkspaceWriteCoordinator {
 		request: WorkspaceWriteRequest,
 		targets: readonly WorkspaceWriteTarget[],
 	): LeaseRecord {
-		for (const target of targets) this.rejectActivityOverlap(kind, target.scope);
+		for (const target of targets) this.rejectActivityOverlap(kind, target);
 		const records = this.transaction((tx) => {
 			const current = targets.map((target) => {
 				const row = this.requireScope(tx, target.scope);
@@ -1595,6 +1620,7 @@ export class WorkspaceWriteCoordinator {
 			owner: this,
 			scope: request.scope,
 			kind,
+			activityPolicy: request.activityPolicy ?? "strict",
 			token,
 			binding: Object.freeze({
 				deviceId: request.scope.deviceId,
@@ -1606,7 +1632,7 @@ export class WorkspaceWriteCoordinator {
 			leaseId,
 			ranges: request.ranges ?? freezeWorkspaceRanges(request.scope),
 			uncertain: false,
-			hadActivity: this.hasActivity(request.scope),
+			hadActivity: this.hasActivity(request.scope, request.ranges),
 			mutations: new Map(),
 			mutationIndexes: new Map(),
 			children: new Set(),
@@ -1619,6 +1645,7 @@ export class WorkspaceWriteCoordinator {
 			ranges: record.ranges,
 			token,
 			kind,
+			activityPolicy: record.activityPolicy ?? "strict",
 			scope: record.scope,
 			executionBinding: record.binding,
 			get scopeRevision() {
@@ -2083,23 +2110,23 @@ export class WorkspaceWriteCoordinator {
 		return row.revision;
 	}
 
-	private hasActivity(scope: Readonly<FileChangeScopeIdentity>): boolean {
+	private hasActivity(
+		scope: Readonly<FileChangeScopeIdentity>,
+		ranges?: readonly WorkspaceWriteRange[],
+	): boolean {
 		for (const activity of this.state.activities.values()) {
-			if (overlaps(scope, activity.scope)) return true;
+			if (activityIntersects({ scope, ranges }, activity.scope)) return true;
 		}
 		return false;
 	}
 
-	private rejectActivityOverlap(
-		kind: WorkspaceWriteLeaseKind,
-		scope: Readonly<FileChangeScopeIdentity>,
-	) {
+	private rejectActivityOverlap(kind: WorkspaceWriteLeaseKind, target: WorkspaceWriteTarget) {
 		for (const activity of this.state.activities.values()) {
-			if (!overlaps(scope, activity.scope)) continue;
+			if (!activityIntersects(target, activity.scope)) continue;
 			if (activity.uncertain) {
 				throw fail("needs_verification", "An uncertain activity still needs durable quarantine");
 			}
-			if (kind === "rollback") {
+			if (kind === "rollback" && target.activityPolicy !== "observe") {
 				throw fail("uncoordinated_activity", "An overlapping uncoordinated writer is registered");
 			}
 		}
@@ -2124,6 +2151,25 @@ export class WorkspaceWriteCoordinator {
 	private transaction<T>(work: (tx: QueryDb) => T): T {
 		return this.db.transaction(work, { behavior: "immediate" });
 	}
+}
+
+function assertActivityPolicy(policy: WorkspaceActivityPolicy | undefined): void {
+	if (policy !== undefined && policy !== "strict" && policy !== "observe") {
+		throw fail("invalid_input", "Invalid workspace activity policy");
+	}
+}
+
+/** Activities cover their scope subtree, not every file in an ancestor lease's root. */
+function activityIntersects(
+	target: Pick<WorkspaceWriteTarget, "scope" | "ranges">,
+	activityScope: Readonly<FileChangeScopeIdentity>,
+): boolean {
+	return workspaceRangesIntersect(
+		target.scope,
+		target.ranges ?? freezeWorkspaceRanges(target.scope),
+		activityScope,
+		[{ kind: "subtree", canonicalPath: activityScope.canonicalRoot }],
+	);
 }
 
 function copyRanges(
@@ -2217,7 +2263,13 @@ function copyBatchTargets(input: readonly WorkspaceWriteTarget[]): readonly Work
 		if (previous && previous.executionClass !== executionClass) {
 			throw fail("invalid_input", "Duplicate scope IDs have conflicting execution classes");
 		}
-		if (!previous) byId.set(scope.id, Object.freeze({ scope, runtime, ranges, executionClass }));
+		const activityPolicy = target.activityPolicy ?? "strict";
+		assertActivityPolicy(activityPolicy);
+		if (previous && previous.activityPolicy !== activityPolicy) {
+			throw fail("invalid_input", "Duplicate scope IDs have conflicting activity policies");
+		}
+		if (!previous)
+			byId.set(scope.id, Object.freeze({ scope, runtime, ranges, executionClass, activityPolicy }));
 	}
 	return Object.freeze(
 		[...byId.values()].sort((left, right) => {

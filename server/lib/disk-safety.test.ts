@@ -1,3 +1,4 @@
+import { Database, SQLiteError } from "bun:sqlite";
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdtemp, readFile, type realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -261,21 +262,72 @@ describe("filesystem identity and last-mile protection", () => {
 });
 
 describe("disk errors and settings", () => {
-	test("recognizes native/quota/SQLite/caused errors, not inotify or arbitrary I/O failures", () => {
-		for (const code of ["ENOSPC", "EDQUOT", "SQLITE_FULL"])
-			expect(isDiskFullError({ code })).toBe(true);
-		expect(isDiskFullError(new Error("outer", { cause: { code: "ENOSPC" } }))).toBe(true);
-		expect(isDiskFullError("error: database or disk is full")).toBe(true);
-		expect(
-			isDiskFullError({
+	test("only recognizes structured local storage evidence, never message text", () => {
+		for (const code of ["ENOSPC", "EDQUOT"]) {
+			const error = Object.assign(new Error("native write failure"), {
+				code,
+				syscall: "write",
+				path: join(tmpdir(), "disk-evidence-file"),
+			});
+			expect(isDiskFullError(error)).toBe(true);
+			expect(isDiskFullError(new Error("outer", { cause: error }))).toBe(true);
+		}
+		for (const error of [
+			"error: database or disk is full",
+			new Error("ENOSPC EDQUOT SQLITE_FULL: no space left on device"),
+			{ code: "SQLITE_FULL", errno: 13 },
+			Object.assign(new Error("database or disk is full"), { errno: 13 }),
+			Object.assign(new Error("SQLITE_FULL"), { code: "SQLITE_FULL" }),
+			Object.assign(new Error("unknown origin"), { code: "ENOSPC" }),
+			Object.assign(new Error("unknown path"), { code: "ENOSPC", syscall: "write" }),
+			Object.assign(new Error("watch quota"), {
 				code: "ENOSPC",
-				message: "System limit for number of file watchers reached",
+				syscall: "watch",
+				path: tmpdir(),
 			}),
-		).toBe(false);
-		expect(isDiskFullError({ code: "EACCES" })).toBe(false);
+			Object.assign(new Error("ambiguous copy destination"), {
+				code: "ENOSPC",
+				syscall: "copyfile",
+				path: join(tmpdir(), "source-file"),
+				dest: join(tmpdir(), "other-volume-destination"),
+			}),
+			Object.assign(new Error("permission denied"), {
+				code: "EACCES",
+				syscall: "write",
+				path: tmpdir(),
+			}),
+			Object.assign(new Error("relative path"), {
+				code: "EDQUOT",
+				syscall: "write",
+				path: "unattributed.txt",
+			}),
+		]) {
+			expect(isDiskFullError(error)).toBe(false);
+			expect(isDiskFullError(new Error("outer", { cause: error }))).toBe(false);
+		}
 		expect(new DiskSpaceError("/disk", null, undefined, true).describe("zh-CN")).toContain(
 			"可能已部分写入",
 		);
+	});
+
+	test("recognizes native SQLite FULL without filling a real disk", () => {
+		const database = new Database(":memory:");
+		try {
+			database.exec("PRAGMA max_page_count=2; CREATE TABLE fixture (value BLOB)");
+			let observed: unknown;
+			try {
+				database.query("INSERT INTO fixture VALUES (zeroblob(100000))").run();
+			} catch (error) {
+				observed = error;
+			}
+			expect(observed).toBeInstanceOf(SQLiteError);
+			expect(isDiskFullError(observed)).toBe(true);
+			expect(isDiskFullError(new Error("wrapped database failure", { cause: observed }))).toBe(
+				true,
+			);
+		} finally {
+			database.close();
+		}
 	});
 
 	test("settings defaults are backward compatible and malformed waits are bounded", () => {

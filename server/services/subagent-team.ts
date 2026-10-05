@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { and, asc, eq, like, or } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
@@ -16,7 +16,12 @@ import {
 import type { MailboxClaim } from "./agent-runtime/mailbox-types";
 import type { RuntimeMailboxRow } from "./agent-runtime/runtime-queue-port";
 import { normalizeWorkspacePath } from "./git-workspace";
-import { subagentFileIdentityKey } from "./subagent-file-changes";
+import {
+	getCurrentSubagentFileChangeOptions,
+	getFileChangesBySubagent,
+	MAX_SUBAGENT_QUERY_IDS,
+	subagentFileIdentityKey,
+} from "./subagent-file-changes";
 
 // === Team file-change tracking ===
 
@@ -96,19 +101,74 @@ export function getTeamFileChangeEntries(parentNarratorId: string): Map<string, 
 	);
 }
 
+function formatTeamObservation(file: TeamFileChange): string {
+	return `${subagentFileIdentityKey(file)} (device, workspace, file; legacy/unscoped${file.deviceId === null || file.workspacePath === null ? "; location unknown" : ""})`;
+}
+
 /** Keep the TeamStatus Map/Set API, but each displayed key retains its full identity. */
 export function getTeamFileChanges(parentNarratorId: string): Map<string, Set<string>> {
 	return new Map(
 		[...getTeamFileChangeEntries(parentNarratorId)].map(([id, files]) => [
 			id,
-			new Set(
-				files.map(
-					(file) =>
-						`${subagentFileIdentityKey(file)} (device, workspace, file; legacy/unscoped${file.deviceId === null || file.workspacePath === null ? "; location unknown" : ""})`,
-				),
-			),
+			new Set(files.map(formatTeamObservation)),
 		]),
 	);
+}
+
+/** Bounded persisted receipts, plus explicitly observational in-memory fallback. */
+export async function getPersistedTeamFileChanges(
+	parentNarratorId: string,
+	targetNarratorId?: string,
+): Promise<Map<string, Set<string>>> {
+	// A requested target is not a page filter: query it directly, even if it is
+	// beyond the bounded whole-team window. The synchronous observation API is
+	// retained as a compatibility source, independently of persisted pagination.
+	const observations = getTeamFileChanges(parentNarratorId);
+	const result = targetNarratorId ? new Map<string, Set<string>>() : observations;
+	if (targetNarratorId && observations.has(targetNarratorId))
+		result.set(targetNarratorId, observations.get(targetNarratorId) as Set<string>);
+	try {
+		const children = await db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(
+				and(
+					eq(narrators.parentNarratorId, parentNarratorId),
+					targetNarratorId ? eq(narrators.id, targetNarratorId) : undefined,
+					or(eq(narrators.type, "subagent"), like(narrators.variant, "subagent:%")),
+				),
+			)
+			.orderBy(asc(narrators.id))
+			.limit(targetNarratorId ? 1 : MAX_SUBAGENT_QUERY_IDS + 1);
+		const ids = children.slice(0, MAX_SUBAGENT_QUERY_IDS).map((child) => child.id);
+		if (!ids.length) return result;
+		const options = await getCurrentSubagentFileChangeOptions(ids, parentNarratorId);
+		const persisted = await getFileChangesBySubagent(ids, options);
+		for (const [id, changes] of persisted) {
+			const files = result.get(id) ?? new Set<string>();
+			const observations = getTeamFileChangesMap().get(parentNarratorId)?.get(id);
+			for (const file of changes.files) {
+				const observation = observations?.get(subagentFileIdentityKey(file));
+				if (observation) files.delete(formatTeamObservation(observation));
+				files.add(
+					`${subagentFileIdentityKey(file)} (${changes.attributionScope}; cumulative churn, not net contribution${observation ? "; also legacy/unscoped observation" : ""})`,
+				);
+			}
+			if (changes.bashTouchedCount)
+				files.add(`${changes.bashTouchedCount} shell file observation(s), lines not measured`);
+			if (changes.countsTruncated) files.add("File evidence truncated; totals are lower bounds");
+			result.set(id, files);
+		}
+		if (children.length > MAX_SUBAGENT_QUERY_IDS) {
+			const files = result.get(ids[0]) ?? new Set<string>();
+			files.add("Team receipt query truncated; observations are incomplete");
+			result.set(ids[0], files);
+		}
+		return result;
+	} catch {
+		// Persisted evidence unavailable: observations keep their legacy/unscoped label.
+		return result;
+	}
 }
 
 /** Clear file change tracking for a team. */

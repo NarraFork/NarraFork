@@ -1044,6 +1044,10 @@ export const PretextExactMessageList = memo(
 						contextAskOutputChars: t("contextAskOutputChars", { count: "{count}" }),
 						contextAskQuestions: t("contextAskQuestions", { count: "{count}" }),
 						contextAskStatusSummary: t("contextAskStatusSummary"),
+						workspaceCreate: t("workspaceCreate"),
+						workspaceList: t("workspaceList"),
+						workspaceSwitch: t("workspaceSwitch"),
+						workspaceDevice: t("workspaceDevice"),
 					});
 				},
 				[t],
@@ -2089,6 +2093,7 @@ export const PretextExactMessageList = memo(
 			);
 			const pretextDocument = usePretextDocument(narratorId, {
 				lod,
+				keepEmptyReasoningLive: isActive,
 				labels: vlistLabels,
 				labelsRevision,
 				widthBucket: String(Math.round(contentWidth)),

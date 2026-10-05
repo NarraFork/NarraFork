@@ -64,6 +64,7 @@ function reasoningMessage(id: string, blockCount: number): NarratorMsg {
 	seq += 1;
 	return {
 		id,
+		model: "gpt-5.6",
 		narratorId: "n1",
 		seq,
 		role: "assistant",

@@ -159,6 +159,7 @@ export function redactGitActors(
 			...file,
 			lastActor: actor(file.lastActor),
 			actors: file.actors.map(actor),
+			recentEvents: file.recentEvents.map((event) => ({ ...event, actor: actor(event.actor) })),
 		})),
 		currentDiff: view.currentDiff
 			? {
@@ -193,6 +194,7 @@ export async function redactGitModificationView(
 	for (const file of view.byFile) {
 		add(file.lastActor);
 		for (const actor of file.actors) add(actor);
+		for (const event of file.recentEvents) add(event.actor);
 	}
 	for (const event of view.timeline ?? []) add(event.actor);
 	for (const file of view.currentDiff?.byFile ?? []) {

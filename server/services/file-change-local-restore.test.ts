@@ -78,6 +78,7 @@ async function request(
 		leaseId: "fixture-lease",
 		ranges: [{ kind: "subtree", canonicalPath: root }],
 		kind: "rollback",
+		activityPolicy: "strict",
 		scope,
 		scopeRevision: 1,
 		executionBinding: binding,
@@ -635,6 +636,65 @@ describe.skipIf(!supported)("guarded local typed object restore", () => {
 			if (change === "permission") f.revoke();
 		});
 		await untouched(f, change === "bytes" ? "last-guard content" : "before\r\n");
+	});
+
+	test("strict activity veto is based on the lease, not an arbitrary input policy", async () => {
+		const f = await fixture();
+		Object.defineProperty(f.lease, "overlappedUncoordinatedActivity", { value: true });
+		Object.assign(f.input, { activityPolicy: "observe" });
+		expect((await untouched(f, "before\r\n")).reason).toBe("guard_failed");
+	});
+
+	test.each([
+		"existing",
+		"new",
+	] as const)("observe lease safely refuses %s known overlapping activity", async (timing) => {
+		const f = await fixture();
+		Object.defineProperty(f.lease, "activityPolicy", { value: "observe" });
+		if (timing === "existing") {
+			Object.defineProperty(f.lease, "overlappedUncoordinatedActivity", { value: true });
+		} else {
+			atGuard(f.input, (guard) => {
+				if (guard.phase === "preflight")
+					Object.defineProperty(f.lease, "overlappedUncoordinatedActivity", { value: true });
+			});
+		}
+		expect((await untouched(f, "before\r\n")).reason).toBe("guard_failed");
+	});
+
+	test("observe cannot bypass activity registered in the last synchronous dispatch barrier", async () => {
+		const f = await fixture();
+		Object.defineProperty(f.lease, "activityPolicy", { value: "observe" });
+		const original = f.input.onDispatch;
+		f.input.onDispatch = (guard) => {
+			original(guard);
+			Object.defineProperty(f.lease, "overlappedUncoordinatedActivity", { value: true });
+		};
+		const result = await restoreLocalFile(f.input);
+		await result.whenSettled;
+		expect(result.status).toBe("not_dispatched");
+		expect(result.reason).toBe("guard_failed");
+		expect(f.events).toContain("dispatch");
+		expect(await fs.readFile(f.path, "utf8")).toBe("before\r\n");
+		expect((await fs.stat(f.path)).mode & 0o777).toBe(0o640);
+	});
+
+	test.each([
+		"bytes",
+		"identity",
+	] as const)("observe still refuses an unregistered same-file %s conflict at the final native guard", async (change) => {
+		const f = await fixture();
+		Object.defineProperty(f.lease, "activityPolicy", { value: "observe" });
+		// External writes remain protected by bytes/object guards, independently of registered activity.
+		const moved = join(root, "observed-moved");
+		atGuard(f.input, async (guard) => {
+			if (guard.phase !== "before_dispatch") return;
+			if (change === "identity") await fs.rename(f.path, moved);
+			await fs.writeFile(f.path, "third-party", { mode: 0o640 });
+		});
+		const result = await untouched(f, "third-party");
+		expect(result.reason).toBe(change === "bytes" ? "expected_mismatch" : "target_changed");
+		if (change === "identity") expect(await fs.readFile(moved, "utf8")).toBe("before\r\n");
 	});
 
 	test("explicit authorization is re-run after blob loading", async () => {

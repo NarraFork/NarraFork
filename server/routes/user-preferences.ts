@@ -40,6 +40,7 @@ export const userPreferencesRoutes = new Hono();
 const DEFAULTS = {
 	autoLoadOlderMessages: true,
 	fastModeDefault: false,
+	treatAsLocalAccess: false,
 	language: "en",
 	wordWrapMarkdown: true,
 	wordWrapCode: true,
@@ -129,6 +130,7 @@ const INSERT_COLUMNS = [
 	"user_id",
 	"auto_load_older_messages",
 	"fast_mode_default",
+	"treat_as_local_access",
 	"language",
 	"word_wrap_markdown",
 	"word_wrap_code",
@@ -392,6 +394,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   auto_load_older_messages = COALESCE(?, auto_load_older_messages),
 		   fast_mode_default = COALESCE(?, fast_mode_default),
+		   treat_as_local_access = COALESCE(?, treat_as_local_access),
 		   language = COALESCE(?, language),
 		   word_wrap_markdown = COALESCE(?, word_wrap_markdown),
 		   word_wrap_code = COALESCE(?, word_wrap_code),
@@ -436,6 +439,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 				userId,
 				(d.autoLoadOlderMessages ?? DEFAULTS.autoLoadOlderMessages) ? 1 : 0,
 				(d.fastModeDefault ?? DEFAULTS.fastModeDefault) ? 1 : 0,
+				(d.treatAsLocalAccess ?? DEFAULTS.treatAsLocalAccess) ? 1 : 0,
 				d.language ?? DEFAULTS.language,
 				(d.wordWrapMarkdown ?? DEFAULTS.wordWrapMarkdown) ? 1 : 0,
 				(d.wordWrapCode ?? DEFAULTS.wordWrapCode) ? 1 : 0,
@@ -478,6 +482,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 				// ON CONFLICT UPDATE values (null = keep existing)
 				d.autoLoadOlderMessages != null ? (d.autoLoadOlderMessages ? 1 : 0) : null,
 				d.fastModeDefault != null ? (d.fastModeDefault ? 1 : 0) : null,
+				d.treatAsLocalAccess != null ? (d.treatAsLocalAccess ? 1 : 0) : null,
 				d.language ?? null,
 				d.wordWrapMarkdown != null ? (d.wordWrapMarkdown ? 1 : 0) : null,
 				d.wordWrapCode != null ? (d.wordWrapCode ? 1 : 0) : null,

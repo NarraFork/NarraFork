@@ -3,6 +3,10 @@ import { db } from "../db";
 import { narratorToolCalls } from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import type { ToolContext } from "../lib/agent/types";
+import {
+	measureSerializedCharacters,
+	queueContextCharacterRefresh,
+} from "../lib/context-characters";
 import { ensureFileSnapshot } from "./file-snapshot-service";
 
 /** Legacy evidence only: remote execution has no local tree/v2 settlement. */
@@ -91,7 +95,7 @@ export async function prepareRemoteStructSedChange(
 	// Persist ALL resolved operations before dispatch, including the device identity.
 	// The RPC may finish after a transport failure; retained input is recovery evidence,
 	// not a claim that the mutation succeeded.
-	await db
+	const changed = await db
 		.update(narratorToolCalls)
 		.set({
 			inputJson: {
@@ -99,12 +103,19 @@ export async function prepareRemoteStructSedChange(
 				device: backend.deviceId,
 				file_path: filePath,
 			},
+			inputChars: measureSerializedCharacters({
+				...input,
+				device: backend.deviceId,
+				file_path: filePath,
+			}),
 		})
 		.where(
 			and(
 				eq(narratorToolCalls.id, binding.toolCallId),
 				eq(narratorToolCalls.executionAttempt, binding.attempt),
 			),
-		);
+		)
+		.returning({ messageId: narratorToolCalls.messageId });
+	for (const row of changed) queueContextCharacterRefresh(ctx.narratorId, row.messageId);
 	assertBinding();
 }

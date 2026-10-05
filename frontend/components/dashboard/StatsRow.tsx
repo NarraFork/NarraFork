@@ -22,13 +22,7 @@ export function StatsRow() {
 	const formattedTokens = formatCompactNumber(todayTokens);
 
 	return (
-		<SimpleGrid cols={{ base: 2, sm: 3, lg: 6 }}>
-			<StatCard
-				label={t("activeProjects")}
-				value={summary?.activeProjectCount ?? 0}
-				color="indigo"
-				to="/projects"
-			/>
+		<SimpleGrid cols={{ base: 2, sm: 3, lg: 5 }}>
 			<StatCard
 				label={t("workingNarrators")}
 				value={summary?.workingNarratorCount ?? 0}

@@ -6,7 +6,6 @@
  *   - chat     → NarratorPanel (primary)
  *   - terminal → NarratorTerminal (with a header bar)
  *   - details  → NarratorDetailsPanel (inline) — props from dock context
- *   - filemod  → FileModificationsPanel — props from dock context
  *   - spec     → SpecPanel
  *   - git      → GitPanel (resolves narrator workspace; chapter adapter retained)
  *   - browser  → BrowserPanel — session info from dock context
@@ -19,7 +18,6 @@ import { ActionIcon, Badge, Box, Center, Group, Loader, Text, Tooltip } from "@m
 import { notifications } from "@mantine/notifications";
 import type { FileReferenceEditorSelection, FileTarget } from "@shared/file-reference";
 import {
-	IconFileCode,
 	IconFileText,
 	IconFlask,
 	IconFolder,
@@ -50,6 +48,7 @@ import {
 	type FilePanelOpener,
 	useFilePanelSourceOpener,
 } from "../file-panel/file-panel-navigation";
+import { usePanelHeaderControls } from "../panels/panel-header-controls";
 import {
 	type FilePanelParams,
 	filePanelBaseName,
@@ -78,11 +77,6 @@ const BackgroundTasksPanel = lazy(() =>
 );
 const BrowserPanel = lazy(() =>
 	import("../browser/BrowserPanel").then((m) => ({ default: m.BrowserPanel })),
-);
-const FileModificationsPanel = lazy(() =>
-	import("../file-panel/FileModificationsDrawer").then((m) => ({
-		default: m.FileModificationsPanel,
-	})),
 );
 const SpecPanel = lazy(() => import("../spec/SpecPanel").then((m) => ({ default: m.SpecPanel })));
 const AppearancePanel = lazy(() =>
@@ -155,7 +149,7 @@ function PluginDockPanel(props: PluginDockPanelProps) {
  * docked panel shares one uniform header. Full toolbars (terminal tabs, spec
  * file tabs) stay as the panel's content top row, not here.
  */
-function ToolPanelHeader({
+export function ToolPanelHeader({
 	title,
 	icon,
 	actions,
@@ -168,6 +162,7 @@ function ToolPanelHeader({
 	onPointerDown: (e: React.PointerEvent) => void;
 	onClose: () => void;
 }) {
+	const controls = usePanelHeaderControls();
 	return (
 		<Group
 			gap="xs"
@@ -201,6 +196,7 @@ function ToolPanelHeader({
 					{actions}
 				</Group>
 			) : null}
+			{controls?.pinAction}
 			<Tooltip label="Close" withinPortal>
 				<ActionIcon className="nodrag" size="sm" variant="subtle" color="gray" onClick={onClose}>
 					<IconX size={16} />
@@ -211,7 +207,7 @@ function ToolPanelHeader({
 }
 
 /** Wrap tool-panel content with the shared header + a flex column layout. */
-function ToolPanelShell({
+export function ToolPanelShell({
 	title,
 	icon,
 	actions,
@@ -314,6 +310,8 @@ export interface SubagentSessionPanelContentProps {
 	subagentNarratorId: string;
 	compact: boolean;
 	onClose: () => void;
+	/** Window hosts navigate without closing their OS window. Recents remain shared. */
+	onOpenStandalonePage?: (narratorId: string) => void;
 	onHeaderPointerDown?: (event: React.PointerEvent) => void;
 	onViewSubagentSession?: (narratorId: string, messageId?: string) => void;
 	onTitleChange?: (title: string) => void;
@@ -335,6 +333,7 @@ export function SubagentSessionPanelContent({
 	subagentNarratorId,
 	compact,
 	onClose,
+	onOpenStandalonePage,
 	onHeaderPointerDown,
 	onViewSubagentSession,
 	onTitleChange,
@@ -370,6 +369,10 @@ export function SubagentSessionPanelContent({
 				isScheduled: traits.includes("scheduled"),
 			});
 		}
+		if (onOpenStandalonePage) {
+			onOpenStandalonePage(subagentNarratorId);
+			return;
+		}
 		onClose();
 		navigate({
 			to: "/narrators/$narratorId",
@@ -379,6 +382,7 @@ export function SubagentSessionPanelContent({
 		navigate,
 		narratorData,
 		onClose,
+		onOpenStandalonePage,
 		subagentNarratorId,
 		title,
 		traits,
@@ -573,46 +577,6 @@ export function DetailsDockPanel(props: IDockviewPanelProps<NarratorBoundPanelPa
 					opened
 					onClose={close}
 					displayMode="inline"
-					chromeless
-				/>
-			</LazyPanelBoundary>
-		</ToolPanelShell>
-	);
-}
-
-// ── File modifications ──
-export function FileModDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
-	const { t } = useTranslation("narrator");
-	const dock = useNarratorDockContext();
-	// Live context is the source of truth (see ChatDockPanel note).
-	const narratorId = dock?.narratorId ?? props.params.narratorId;
-	const fileModProps = dock?.fileModProps;
-	const close = useCallback(() => props.api.close(), [props.api]);
-
-	// Sync Dockview tab title with localization
-	useLayoutEffect(() => {
-		const title = t("fileMod_title");
-		if (title && title !== props.api.title) {
-			props.api.setTitle(title);
-		}
-	}, [t, props.api]);
-
-	return (
-		<ToolPanelShell
-			title={t("fileMod_title")}
-			icon={<IconFileCode size={16} color="var(--mantine-color-dimmed)" />}
-			props={props}
-			subjectId="__filemod__"
-		>
-			<LazyPanelBoundary>
-				<FileModificationsPanel
-					narratorId={narratorId}
-					onClose={close}
-					pendingPermission={fileModProps?.pendingPermission}
-					onPermissionDecision={fileModProps?.onPermissionDecision}
-					deletePreviewMessageId={fileModProps?.deletePreviewMessageId}
-					onConfirmDelete={fileModProps?.onConfirmDelete}
-					onCancelDelete={fileModProps?.onCancelDelete}
 					chromeless
 				/>
 			</LazyPanelBoundary>
@@ -1122,9 +1086,13 @@ export function FileTreeDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 			// Routed through the dock's existing multi-instance file viewer rather than a
 			// viewer of our own: re-opening the same path must focus the panel that is
 			// already showing it, and that dedup lives in `openFilePanel`.
-			openFilePanel?.(absolutePath, fileName, { sourcePanelId: props.api.id });
+			openFilePanel?.(absolutePath, fileName, {
+				sourcePanelId: props.api.id,
+				fileNarratorId: narratorId,
+				deviceId: "local",
+			});
 		},
-		[openFilePanel, props.api.id],
+		[openFilePanel, props.api.id, narratorId],
 	);
 
 	return (
@@ -1197,7 +1165,6 @@ export const narratorDockComponents: Record<
 	chat: ChatDockPanel,
 	terminal: TerminalDockPanel,
 	details: DetailsDockPanel,
-	filemod: FileModDockPanel,
 	spec: SpecDockPanel,
 	git: GitDockPanel,
 	browser: BrowserDockPanel,

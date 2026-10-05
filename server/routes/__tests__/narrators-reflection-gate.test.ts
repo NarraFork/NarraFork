@@ -22,6 +22,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { AppError } from "../../lib/errors";
 
@@ -34,7 +35,7 @@ process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
 // import time and must not touch the developer's real instance.
 const { narratorRoutes } = await import("../narrators");
 const { db } = await import("../../db");
-const { narrators, users } = await import("../../db/schema");
+const { narrators, narratorMessages, narratorToolCalls, users } = await import("../../db/schema");
 const { generateId } = await import("../../lib/id");
 
 // The reflection registries under test — imported AFTER the routes so we see the
@@ -120,6 +121,72 @@ beforeAll(async () => {
 // which is exactly the state a running reflection is in.
 const PLAN_REQUEST_ID = `exit_plan_${Date.now()}_gatepin`;
 const TASK_REQUEST_ID = `task_reflect_${Date.now()}_gatepin`;
+
+describe("plan reflection persists approval for the final-start gate", () => {
+	for (const action of ["confirm", "confirm_compact", "revise"] as const) {
+		test(`${action} persists the correct permission receipt`, async () => {
+			const {
+				markExitPlanReflectionStarted,
+				confirmExitPlanReflection,
+				confirmAndCompactExitPlanReflection,
+				cancelExitPlanReflection,
+				cleanupExitPlanReflection,
+			} = await import("../../lib/agent/tools/exit-plan-reflection");
+			const id = generateId();
+			const requestId = `exit_plan_${id}`;
+			const input = { mode: "inline", plan: "Implement the regression fix" };
+			await db.insert(narratorMessages).values({
+				id,
+				narratorId,
+				role: "assistant",
+				contentJson: [],
+				createdAt: new Date().toISOString(),
+			});
+			await db.insert(narratorToolCalls).values({
+				id,
+				narratorId,
+				messageId: id,
+				toolUseId: id,
+				toolName: "ExitPlanMode",
+				inputJson: input,
+				status: "initializing",
+				createdAt: new Date().toISOString(),
+			});
+			const decision = createExitPlanReflectionDecision(requestId, {
+				narratorId,
+				broadcastTargetId: narratorId,
+				toolUseId: id,
+				toolName: "ExitPlanMode",
+				inputJson: input,
+			});
+			try {
+				await markExitPlanReflectionStarted(requestId);
+				const pending = await db.query.narratorToolCalls.findFirst({
+					where: eq(narratorToolCalls.id, id),
+				});
+				expect(pending?.status).toBe("pending");
+				expect(pending?.permissionDecidedBy).toBeNull();
+				const settled =
+					action === "confirm"
+						? await confirmExitPlanReflection(requestId, "Ready")
+						: action === "confirm_compact"
+							? await confirmAndCompactExitPlanReflection(requestId, "Ready")
+							: await cancelExitPlanReflection(requestId, "Needs revision");
+				expect(settled).toBe(true);
+				expect((await decision).action).toBe(action);
+				const receipt = await db.query.narratorToolCalls.findFirst({
+					where: eq(narratorToolCalls.id, id),
+				});
+				expect(receipt?.inputJson).toEqual(input);
+				expect(receipt?.permissionDecidedAt).toBeTruthy();
+				expect(receipt?.status).toBe(action === "revise" ? "fail" : "running");
+				expect(receipt?.permissionDecidedBy).toBe(action === "revise" ? null : "reflection");
+			} finally {
+				cleanupExitPlanReflection(requestId);
+			}
+		});
+	}
+});
 
 describe("the permissions gate resolves synthetic reflection ids", () => {
 	// The takeover handlers intentionally LEAVE the decision promise unresolved

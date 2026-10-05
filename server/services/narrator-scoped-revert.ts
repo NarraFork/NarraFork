@@ -46,6 +46,8 @@ export type ScopedRevertUnavailableReason =
 	| "execution_unavailable"
 	| "runtime_reload_required"
 	| "incomplete_coverage"
+	| "file_conflict"
+	| "history_changed"
 	| "unsupported_target"
 	/** The server's data volume cannot provide stable object identities/link counts. */
 	| "platform_unsupported"

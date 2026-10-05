@@ -1,0 +1,132 @@
+{
+	"version": 1,
+	"fixtureId": "fixture:ordinary",
+	"narrator": {
+		"id": "fixture:narrator",
+		"chapterId": null,
+		"projectId": null,
+		"state": "idle",
+		"lease": "none",
+		"run": "idle",
+		"authorization": "clear",
+		"mutation": "none"
+	},
+	"chapter": null,
+	"workspaceContext": {
+		"id": "fixture:context",
+		"narratorId": "fixture:narrator",
+		"chapterId": null,
+		"projectId": null,
+		"resourceIds": ["fixture:worktree", "fixture:terminal"],
+		"complete": true
+	},
+	"manifest": {
+		"complete": true,
+		"truncated": false,
+		"resourceCount": 2,
+		"objectCount": 6,
+		"dependencyCount": 5,
+		"aclRootId": "fixture:acl",
+		"provenanceComplete": true,
+		"sharedUsersComplete": true
+	},
+	"resources": [
+		{
+			"id": "fixture:worktree",
+			"kind": "worktree",
+			"rootObjectIds": ["fixture:tree"],
+			"referenceIdentity": "fixture:worktree-ref",
+			"targetIdentity": "fixture:worktree-ref",
+			"bindings": { "chapterId": null, "narratorId": "fixture:narrator", "projectId": null },
+			"ownerNarratorIds": ["fixture:narrator"],
+			"sharedUserIds": ["fixture:user"],
+			"sharedUsersComplete": true,
+			"provenanceComplete": true,
+			"aclRootId": "fixture:acl",
+			"metadataMappingComplete": true,
+			"registry": {
+				"ownerNarratorId": "fixture:narrator",
+				"ownerDeleted": false,
+				"state": "ready",
+				"deviceId": "fixture:local",
+				"repositoryId": "fixture:repository",
+				"createRequestId": "fixture:create"
+			}
+		},
+		{
+			"id": "fixture:terminal",
+			"kind": "terminal",
+			"referenceIdentity": "fixture:terminal-ref",
+			"targetIdentity": "fixture:terminal-ref",
+			"bindings": { "chapterId": null, "narratorId": "fixture:narrator", "projectId": null },
+			"ownerNarratorIds": ["fixture:narrator"],
+			"sharedUserIds": ["fixture:user"],
+			"sharedUsersComplete": true,
+			"provenanceComplete": true,
+			"aclRootId": "fixture:acl",
+			"metadataMappingComplete": true,
+			"terminal": {
+				"state": "exited",
+				"location": "local",
+				"dtach": false,
+				"migrationReceiptId": null
+			}
+		}
+	],
+	"objectDependencies": [
+		{
+			"id": "fixture:tree",
+			"kind": "tree",
+			"dependencies": ["fixture:blob", "fixture:binary", "fixture:ignored", "fixture:fork"],
+			"available": true,
+			"complete": true,
+			"referenceIdentity": "fixture:tree-ref",
+			"targetIdentity": "fixture:tree-ref"
+		},
+		{
+			"id": "fixture:blob",
+			"kind": "blob",
+			"dependencies": [],
+			"available": true,
+			"complete": true,
+			"referenceIdentity": "fixture:blob-ref",
+			"targetIdentity": "fixture:blob-ref"
+		},
+		{
+			"id": "fixture:binary",
+			"kind": "binary",
+			"dependencies": [],
+			"available": true,
+			"complete": true,
+			"referenceIdentity": "fixture:binary-ref",
+			"targetIdentity": "fixture:binary-ref"
+		},
+		{
+			"id": "fixture:ignored",
+			"kind": "ignored",
+			"dependencies": [],
+			"available": true,
+			"complete": true,
+			"referenceIdentity": "fixture:ignored-ref",
+			"targetIdentity": "fixture:ignored-ref"
+		},
+		{
+			"id": "fixture:fork",
+			"kind": "lazy-fork-metadata",
+			"dependencies": ["fixture:upload"],
+			"available": true,
+			"complete": true,
+			"referenceIdentity": "fixture:fork-ref",
+			"targetIdentity": "fixture:fork-ref"
+		},
+		{
+			"id": "fixture:upload",
+			"kind": "upload",
+			"dependencies": [],
+			"available": true,
+			"complete": true,
+			"referenceIdentity": "fixture:upload-ref",
+			"targetIdentity": "fixture:upload-ref"
+		}
+	]
+}

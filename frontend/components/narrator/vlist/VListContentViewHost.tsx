@@ -6,7 +6,13 @@
  * host. The host supplies what `ContentViewer` gives the chunked path:
  *
  *   desktop : hover → the zero-height action bar (source / wrap / copy / fullscreen)
- *   mobile  : double-tap → fullscreen (the bar is hidden there, same as ContentViewer)
+ *   touch   : no hover bar — the only "hover" a tap raises is the browser's
+ *             SYNTHESIZED mouseenter, which would pop the bar up under the
+ *             reader's finger mid-gesture. Instead: double-tap → fullscreen, and
+ *             while a long body's head is scrolled away a persistent finger-sized
+ *             "back to the start" button stands in for the bar's — the one action
+ *             with no other one-tap route on a pointer that cannot hover.
+ *             (`mobile` below is the narrow-viewport subset of this.)
  *
  * FLOATING THE BAR (why not `position: sticky`)
  *
@@ -31,6 +37,7 @@
  */
 
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
+import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "@frontend/lib/use-match-media";
 import { Box } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import {
@@ -45,6 +52,7 @@ import { useRenderInteractive } from "../lod/RenderLodCtx";
 import { useNarratorPanelVisible } from "../narrator-panel-visibility";
 import type { ContentViewportSnapshot } from "../scroll/AutoFollowScroll";
 import { VListContentViewActions } from "./VListContentViewActions";
+import { VListTouchScrollTopButton } from "./VListTouchScrollTopButton";
 import {
 	type FloatState,
 	resolveFloatState,
@@ -76,6 +84,27 @@ export interface VListViewControls {
 const DOUBLE_TAP_MS = 300;
 
 /**
+ * How long (ms) the touch scroll-to-top button stays mounted, fading out, after
+ * its body leaves the floating state.
+ *
+ * A fast fling walks short bodies through their floating window in a few frames
+ * each; unmounting on the exact state change strobes the button at every body
+ * boundary. The linger turns each exit into a fade, and a re-entry within the
+ * window reuses the SAME element — the common "scrolled one body too far and
+ * right back" case then never blinks at all.
+ */
+const TOUCH_SCROLL_TOP_LINGER_MS = 250;
+
+/**
+ * Bodies shorter than this never raise the touch scroll-to-top button, however
+ * far past the fold their head scrolls. Jumping back to the start of a body that
+ * is barely a screenful tall is not worth a persistent finger target — and short
+ * bodies are exactly the ones a fast fling walks through their floating window
+ * in a few frames, which is the strobe this button otherwise lives to avoid.
+ */
+const TOUCH_SCROLL_TOP_MIN_BODY_HEIGHT = 200;
+
+/**
  * How far into a PREFIX body the reader must scroll before its full payload is
  * fetched.
  *
@@ -89,7 +118,7 @@ const AUTO_LOAD_SCROLL_RATIO = 0.5;
 
 const relative: CSSProperties = { position: "relative" };
 
-const PARKED: FloatState = { mode: "parked", top: 0, right: 0 };
+const PARKED: FloatState = { mode: "parked", top: 0, right: 0, bodyHeight: 0 };
 
 /** The vlist scroll viewport (the element the bar must stay pinned to). */
 const LIST_VIEWPORT_SELECTOR = "[data-pretext-exact-message-list]";
@@ -155,8 +184,16 @@ function useFloatState(
 			const next = resolveFloatState(geometry);
 			// Bail on an unchanged result so a scroll through a floating body commits
 			// nothing at all (the position is scroll-invariant by construction).
+			// `bodyHeight` is part of the comparison: a body that GROWS while floating
+			// (a full payload landing) must re-evaluate the touch button's size gate
+			// even though the position itself did not move.
 			setState((prev) =>
-				prev.mode === next.mode && prev.top === next.top && prev.right === next.right ? prev : next,
+				prev.mode === next.mode &&
+				prev.top === next.top &&
+				prev.right === next.right &&
+				prev.bodyHeight === next.bodyHeight
+					? prev
+					: next,
 			);
 		};
 		const schedule = () => {
@@ -166,7 +203,14 @@ function useFloatState(
 		const listenTarget: HTMLElement | Window = scroller ?? window;
 		listenTarget.addEventListener("scroll", schedule, { passive: true });
 		window.addEventListener("resize", schedule);
+		// Streaming/full payloads and dock resizes change geometry without either
+		// a scroll event or a window resize. Observe both boxes while enabled only;
+		// all notifications share the same frame-throttled measurement.
+		const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(schedule);
+		if (hostRef.current) observer?.observe(hostRef.current);
+		if (scroller) observer?.observe(scroller);
 		return () => {
+			observer?.disconnect();
 			if (raf) cancelAnimationFrame(raf);
 			listenTarget.removeEventListener("scroll", schedule);
 			window.removeEventListener("resize", schedule);
@@ -237,6 +281,10 @@ export function VListContentViewHost({
 	const interactive = useRenderInteractive();
 	const panelVisible = useNarratorPanelVisible();
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
+	// Own subscription, not Mantine's `useMediaQuery`: vlist test suites stub that
+	// hook's whole module, which would silently kill the touch branch (see
+	// `use-match-media.ts`).
+	const touchPointer = useMatchMedia(TOUCH_POINTER_MEDIA_QUERY);
 	const [pointerOverBody, setPointerOverBody] = useState(false);
 	const [pointerOverBar, setPointerOverBar] = useState(false);
 	const lastTapRef = useRef(0);
@@ -247,19 +295,72 @@ export function VListContentViewHost({
 	// reached for a button. Either surface keeps it alive.
 	const hovered = pointerOverBody || pointerOverBar;
 	// Only tracked while the bar is actually on screen: an idle body pays nothing.
+	// A touch pointer is the exception — its persistent scroll-to-top button needs
+	// the float state whether or not anything is hovered, so every ENABLED body on
+	// such a device keeps a (rAF-throttled, scroll-invariant) tracker. The list is
+	// virtualized, so "every enabled body" is bounded by what is on screen.
 	const enabled = !!target && !!controls && interactive && panelVisible;
-	const { state: float, scrollToBodyTop } = useFloatState(hostRef, enabled && hovered && !isMobile);
+	const { state: float, scrollToBodyTop } = useFloatState(
+		hostRef,
+		enabled && ((hovered && !isMobile) || touchPointer),
+	);
 	const onReaderProgress = useReaderProgress(target, controls, interactive);
 
 	const openFullscreen = useCallback(() => {
 		if (target && controls) controls.openFullscreen(target);
 	}, [target, controls]);
 
-	// Mobile: the action bar is hidden, so a double-tap on the body is the way in.
+	// The hover bar, whenever it is (or would be) mounted. A touch pointer never
+	// gets one: the only "hover" it could raise is the mouseenter a browser
+	// SYNTHESIZES after a tap, which arrives exactly when the standalone touch
+	// button unmounts mid-gesture — the bar would pop up under the reader's finger
+	// and replace the big button with its own small one, the original complaint.
+	const barMounted =
+		enabled &&
+		!!target &&
+		!!controls &&
+		hovered &&
+		!isMobile &&
+		!touchPointer &&
+		float.mode !== "hidden";
+	// Touch, head gone, enough of the body left to still be reading it: exactly the
+	// state the desktop bar would call "floating". Bodies under the minimum height
+	// are excluded — see TOUCH_SCROLL_TOP_MIN_BODY_HEIGHT.
+	const touchScrollTopFloating =
+		touchPointer &&
+		enabled &&
+		float.mode === "floating" &&
+		float.bodyHeight >= TOUCH_SCROLL_TOP_MIN_BODY_HEIGHT;
+	// Exit linger: keep the button mounted (fading) briefly after the float state
+	// leaves "floating", so fast scrolls fade at body boundaries instead of
+	// strobing — see TOUCH_SCROLL_TOP_LINGER_MS.
+	const [touchScrollTopLinger, setTouchScrollTopLinger] = useState(false);
+	useEffect(() => {
+		if (touchScrollTopFloating) {
+			setTouchScrollTopLinger(true);
+			return;
+		}
+		if (!touchScrollTopLinger) return;
+		const timer = setTimeout(() => setTouchScrollTopLinger(false), TOUCH_SCROLL_TOP_LINGER_MS);
+		return () => clearTimeout(timer);
+	}, [touchScrollTopFloating, touchScrollTopLinger]);
+	// Freeze the last floating coordinates: the parked/hidden float states carry
+	// placeholder zeros, which would teleport a lingering button to the viewport's
+	// top-left corner mid-fade. (The real coordinates are scroll-invariant, so the
+	// frozen pair stays correct for the whole fade.)
+	const lastFloatingPosRef = useRef<{ top: number; right: number } | null>(null);
+	if (float.mode === "floating") {
+		lastFloatingPosRef.current = { top: float.top, right: float.right };
+	}
+	const touchScrollTopPos =
+		float.mode === "floating" ? { top: float.top, right: float.right } : lastFloatingPosRef.current;
+
+	// Touch: the action bar is hidden, so a double-tap on the body is the way in.
 	// Handled HERE rather than in VListRowInteraction because a row can host
 	// several bodies and the row layer cannot tell which one was tapped.
+	const touchSurface = isMobile || touchPointer;
 	const handleClick = useCallback(() => {
-		if (!isMobile) return;
+		if (!touchSurface) return;
 		const now = Date.now();
 		if (now - lastTapRef.current < DOUBLE_TAP_MS) {
 			lastTapRef.current = 0;
@@ -267,7 +368,7 @@ export function VListContentViewHost({
 		} else {
 			lastTapRef.current = now;
 		}
-	}, [isMobile, openFullscreen]);
+	}, [touchSurface, openFullscreen]);
 
 	return (
 		// A Mantine Box (not a raw div) keeps the pointer handlers off a static host
@@ -278,14 +379,14 @@ export function VListContentViewHost({
 			ref={hostRef}
 			style={{ ...relative, ...style }}
 			data-vlist-content-host
-			onMouseEnter={!enabled || isMobile ? undefined : () => setPointerOverBody(true)}
-			onMouseLeave={!enabled || isMobile ? undefined : () => setPointerOverBody(false)}
-			onClick={enabled && isMobile ? handleClick : undefined}
+			onMouseEnter={!enabled || touchSurface ? undefined : () => setPointerOverBody(true)}
+			onMouseLeave={!enabled || touchSurface ? undefined : () => setPointerOverBody(false)}
+			onClick={enabled && touchSurface ? handleClick : undefined}
 		>
 			{/* Mounted only while hovered, so a scrolling list builds no Tooltip /
 			    CopyButton trees for bodies the reader is not pointing at. `hidden` drops
 			    it entirely: too little of the body is left to host a bar. */}
-			{enabled && target && controls && hovered && float.mode !== "hidden" ? (
+			{barMounted && target && controls ? (
 				<VListContentViewActions
 					target={target}
 					wordWrap={controls.isWrapped(target)}
@@ -296,7 +397,19 @@ export function VListContentViewHost({
 					float={float.mode === "floating" ? { top: float.top, right: float.right } : undefined}
 					// The jump-back button only makes sense once the head is gone.
 					onScrollToTop={float.mode === "floating" ? scrollToBodyTop : undefined}
-					onPointerOverChange={isMobile ? undefined : setPointerOverBar}
+					onPointerOverChange={touchSurface ? undefined : setPointerOverBar}
+				/>
+			) : null}
+			{/* The touch surface's standalone route back to this body's head (the bar it
+			    leads on desktop never mounts without hover). Parked or `hidden` means
+			    there is nothing useful to scroll back to — but the button lingers
+			    briefly, fading out, so fast scrolls don't strobe it. */}
+			{touchScrollTopLinger && touchScrollTopPos ? (
+				<VListTouchScrollTopButton
+					top={touchScrollTopPos.top}
+					right={touchScrollTopPos.right}
+					visible={touchScrollTopFloating}
+					onScrollToTop={scrollToBodyTop}
 				/>
 			) : null}
 			{typeof children === "function" ? children(onReaderProgress) : children}

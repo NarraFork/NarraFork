@@ -8,11 +8,10 @@
  *
  * Deliberately excluded:
  *
- *  - `details` and `filemod` take their data from `dock.detailsProps` /
- *    `dock.fileModProps`, which the CHAT panel publishes into the shared provider
- *    (see NarratorPanel's publish effects). Detached, nothing publishes to them
- *    and `DetailsDockPanel` would render its loader forever. Supporting them means
- *    first making both panels fetch their own data, which also drags in the
+ *  - `details` takes its data from `dock.detailsProps`, which the CHAT panel
+ *    publishes into the shared provider (see NarratorPanel's publish effects).
+ *    Detached, nothing publishes to it and `DetailsDockPanel` would render its
+ *    loader forever. Supporting it means first fetching its own data, including the
  *    permission-approval and delete-preview flows they share with chat.
  *  - `chat` is the cluster's protagonist and has a close-less tab; tearing it out
  *    would leave a node with tool panels and no conversation.

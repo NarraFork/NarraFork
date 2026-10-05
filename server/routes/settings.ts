@@ -430,6 +430,7 @@ export const updateSettingsSchema = z
 				planReflectionAutoApprove: z.boolean(),
 				planReflectionAllowAutoCompact: z.boolean(),
 				questionReflectionEnabled: z.boolean(),
+				permissionRuleAutoApprove: z.boolean(),
 				questionReflectionTimeoutMs: z.number().int().min(10000).max(3600000),
 				dangerReflectionLevel: dangerReflectionLevelSchema,
 				dangerReflectionEnabled: z.boolean(),

@@ -338,6 +338,7 @@ class RestoreSession {
 			"canonicalRoot",
 		] as const)
 			if (this.lease.scope[key] !== scope[key]) fail("target_changed");
+		// Observation is a coordinator capability, not authority to race native file recovery.
 		if (this.lease.overlappedUncoordinatedActivity) fail("guard_failed");
 		this.lease.assertCurrent(executionBinding);
 	}

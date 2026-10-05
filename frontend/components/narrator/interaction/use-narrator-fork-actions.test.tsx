@@ -4,6 +4,7 @@ import { act, memo } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import * as narratorHooks from "../../../hooks/useNarrator";
 import {
+	ordinaryPromoteDestination,
 	type UseNarratorForkActionsOptions,
 	type UseNarratorForkActionsResult,
 	useNarratorForkActions,
@@ -82,6 +83,13 @@ async function render(overrides: Partial<UseNarratorForkActionsOptions> = {}) {
 }
 
 describe("narrator fork action identity", () => {
+	test("promotion targets the independent narrator URL and missing IDs fail closed", () => {
+		expect(ordinaryPromoteDestination("ordinary-child")).toEqual({
+			to: "/narrators/$narratorId",
+			params: { narratorId: "ordinary-child" },
+		});
+		expect(() => ordinaryPromoteDestination("")).toThrow("missing");
+	});
 	test("inline navigation on unrelated renders does not invalidate memoized rows", async () => {
 		await render();
 		const first = actions.forkHandler;
@@ -131,27 +139,27 @@ describe("narrator fork action identity", () => {
 		});
 	});
 
-	test("chapter hosts retain ownership and a changed host callback takes effect", async () => {
+	test("chapter sources fork the conversation without invoking legacy resource callbacks", async () => {
 		const host = mock((_id: string) => {});
 		const replacement = mock((_id: string) => {});
-		await render({ chapterId: "chapter", onForkFromMessage: host });
-		await render({ chapterId: "chapter", onForkFromMessage: host });
-		expect(actions.forkHandler).toBe(host);
+		const navigate = mock((_id: string) => {});
+		await render({ chapterId: "chapter", onForkFromMessage: host, navigateToNarrator: navigate });
+		const first = actions.forkHandler;
+		await render({
+			chapterId: "other-chapter",
+			onForkFromMessage: replacement,
+			navigateToNarrator: navigate,
+		});
+		expect(actions.forkHandler).toBe(first);
 		expect(rowRenders).toBe(1);
 		actions.forkHandler?.("host-message");
-		expect(host).toHaveBeenCalledWith("host-message");
-
-		await render({ chapterId: "other-chapter", onForkFromMessage: replacement });
-		expect(actions.forkHandler).toBe(replacement);
-		actions.forkHandler?.("replacement-message");
-		expect(replacement).toHaveBeenCalledWith("replacement-message");
-		expect(host).toHaveBeenCalledTimes(1);
-		expect(mutate).not.toHaveBeenCalled();
-
-		await render({ chapterId: "chapter" });
-		expect(actions.forkHandler).toBeUndefined();
-		await render();
-		actions.forkHandler?.("standalone-message");
-		expect(mutate.mock.calls[0]?.[0].forkMessageId).toBe("standalone-message");
+		expect(host).not.toHaveBeenCalled();
+		expect(replacement).not.toHaveBeenCalled();
+		expect(mutate.mock.calls[0]?.[0]).toEqual({
+			narratorId: "narrator-a",
+			forkMessageId: "host-message",
+		});
+		mutate.mock.calls[0]?.[1].onSuccess({ id: "ordinary-child" });
+		expect(navigate).toHaveBeenCalledWith("ordinary-child");
 	});
 });

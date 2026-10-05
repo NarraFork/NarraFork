@@ -15,10 +15,19 @@ export interface GitWorkspace {
 	cwd: string;
 	rootPath: string | null;
 	state: GitWorkspaceState;
+	/** Lightweight cached HEAD label; never used to authorize Git operations. */
+	branch?: string | null;
 	capabilities: { read: boolean; write: boolean };
 	reason?: string;
 	narratorId?: string;
 	/** Present only when the actual worktree matches this chapter. */
 	chapterId?: string;
 	projectId?: string;
+}
+
+/** Authorized display snapshot delivered together with narrator detail. */
+export interface GitWorkspaceSummary {
+	workspace: GitWorkspace;
+	branch: string | null;
+	revision: number;
 }

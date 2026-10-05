@@ -31,6 +31,7 @@ beforeEach(() => {
 	for (const [key, value] of Object.entries({
 		window,
 		document: window.document,
+		localStorage: { getItem: () => null },
 		IS_REACT_ACT_ENVIRONMENT: true,
 	})) {
 		originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
@@ -131,6 +132,7 @@ describe("narrator interrupt send", () => {
 			expect.any(AbortSignal),
 			[reference],
 			true,
+			"interrupt",
 		]);
 		expect(queue.map((message) => message.id)).toEqual(["replacement", "existing"]);
 		expect(queue[0]).toMatchObject({ priority: true, fileReferences: [reference] });
@@ -160,6 +162,7 @@ describe("narrator interrupt send", () => {
 			expect.any(AbortSignal),
 			[reference],
 			mode === "interrupt" ? true : undefined,
+			mode,
 		]);
 		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
 		expect(queue.map((message) => message.id)).toEqual(
@@ -191,12 +194,13 @@ describe("narrator interrupt send", () => {
 	test.each([
 		false,
 		true,
-	])("idle subagent never carries hard-interrupt intent (takenOver=%s)", async (isTakenOver) => {
+	])("idle subagent preserves urgent guidance intent (takenOver=%s)", async (isTakenOver) => {
 		await render({ isActive: false, isSubagent: true, isTakenOver });
 		await act(async () => actions.handleSend());
 		expect(send).toHaveBeenCalledTimes(1);
 		expect(send.mock.calls[0]?.[4]).toBe(true);
-		expect(send.mock.calls[0]?.[8]).toBeUndefined();
+		expect(send.mock.calls[0]?.[8]).toBe(true);
+		expect(send.mock.calls[0]?.[9]).toBe("interrupt");
 		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
 	});
 
@@ -252,13 +256,47 @@ describe("narrator interrupt send", () => {
 	test.each([
 		false,
 		true,
-	])("subagent preserves existing queue behavior (takenOver=%s)", async (isTakenOver) => {
+	])("subagent uses one durable urgent guidance request (takenOver=%s)", async (isTakenOver) => {
 		await render({ isSubagent: true, isTakenOver });
 		await act(async () => actions.handleSend());
 		expect(send).toHaveBeenCalledTimes(1);
 		expect(send.mock.calls[0]?.[4]).toBe(true);
-		expect(send.mock.calls[0]?.[8]).toBeUndefined();
+		expect(send.mock.calls[0]?.[8]).toBe(true);
+		expect(send.mock.calls[0]?.[9]).toBe("interrupt");
 		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
+	});
+});
+
+describe("narrator retry without file rollback", () => {
+	test.each([200, 503])("retry only calls the retry API (HTTP %s)", async (status) => {
+		const retryFetch = spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(
+				JSON.stringify(status === 200 ? { ok: true } : { error: "fixture retry failed" }),
+				{ status, headers: { "content-type": "application/json" } },
+			),
+		);
+		try {
+			await render({ isActive: false, canRetryLastUserMessage: true });
+			await act(async () => actions.handleRetry());
+			// Observe the real API helper's entire HTTP surface, so any file preview,
+			// plan-file lookup, apply or legacy rollback would be an extra request.
+			expect(retryFetch).toHaveBeenCalledTimes(1);
+			expect(retryFetch.mock.calls[0]).toEqual([
+				"/api/narrators/n/retry",
+				expect.objectContaining({ method: "POST" }),
+			]);
+			expect(send).not.toHaveBeenCalled();
+			expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
+			if (status === 200) expect(notify).not.toHaveBeenCalled();
+			else
+				expect(notify).toHaveBeenCalledWith({
+					title: "Error",
+					message: "fixture retry failed",
+					color: "red",
+				});
+		} finally {
+			retryFetch.mockRestore();
+		}
 	});
 });
 

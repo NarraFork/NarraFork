@@ -225,6 +225,54 @@ describe("worker pool", () => {
 		rmSync(home, { recursive: true, force: true });
 	});
 
+	test("wakes queued work after cancellation during cold startup", async () => {
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+		const specifier = writeWorkerFixture(
+			home,
+			"delayed-ready-worker.ts",
+			`
+	let posted = 0;
+	self.onmessage = (event) => {
+		if (event.data?.type !== "task") return;
+		postMessage({ type: "result", requestId: event.data.requestId, result: { posted: ++posted }, durationMs: 0 });
+	};
+	await new Promise((resolve) => setTimeout(resolve, 150));
+	`,
+		);
+		setDbWorkerSpecifiersForTest([specifier]);
+		const controller = new AbortController();
+		const first = runReadTask(
+			dbPath,
+			{ kind: "storageScanContext" },
+			{
+				timeoutMs: 2000,
+				signal: controller.signal,
+			},
+		).then(
+			() => null,
+			(error: unknown) => error,
+		);
+		const queued = runReadTask(
+			dbPath,
+			{ kind: "storageScanContext" },
+			{
+				timeoutMs: 1500,
+			},
+		).then(
+			(value) => value,
+			(error: unknown) => error,
+		);
+		// The first task owns the only startup reservation; the second must already be waiting.
+		await Bun.sleep(20);
+		expect(getDbWorkerPoolStats().queued).toBe(1);
+		controller.abort();
+		expect(await first).toBeInstanceOf(Error);
+		// No third request is issued to nudge the pool. The cancelled request must not be posted.
+		expect(await queued).toEqual({ posted: 1 });
+		expect(getDbWorkerPoolStats().queued).toBe(0);
+		expect(getDbWorkerPoolStats().busy).toBe(0);
+	}, 5000);
+
 	test("runs a scan-context task in a worker", async () => {
 		const context = await runReadTask<StorageScanContextResult>(dbPath, {
 			kind: "storageScanContext",

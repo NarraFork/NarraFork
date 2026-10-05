@@ -48,6 +48,8 @@ export class ApiError extends Error {
 export interface ReflectionLoopContext {
 	/** Kind of reflection loop, e.g. "dangerReflection". */
 	kind: string;
+	/** Dedicated authorization workflow: no cached confirm or text fallback. */
+	purpose?: "permissionRuleRequest";
 	/** Optional request/domain ID for the loop. */
 	requestId?: string;
 	/** Optional source toolUseId or target toolUseId that triggered the loop. */
@@ -87,6 +89,18 @@ export interface ToolExecutionLifecycleContext {
 	effectiveInput: Record<string, unknown>;
 	executionTarget?: ToolExecutionTarget;
 	binding?: ToolCallBinding;
+}
+
+/** Final authorization uses the immutable admitted input/target, never a live cwd hint. */
+export interface ToolFinalStartAuthorizationContext extends ToolExecutionLifecycleContext {
+	executionBackend?: import("./execution/backend").ExecutionBackend;
+	executionPlan?: ToolExecutionPlan;
+	approvedPermission: AllowPermissionResult;
+}
+
+/** Async policy preparation followed by a synchronous fence at the actual call boundary. */
+export interface ToolFinalStartAuthorizationTicket {
+	assertStillCurrent: () => void;
 }
 
 export interface ToolContext {
@@ -196,6 +210,14 @@ export interface ToolContext {
 	 * session cannot be found. Absent for callers without a live session.
 	 */
 	setDefaultDevice?: (deviceId: string | null) => Promise<boolean>;
+	/** Checks at both permission and final execution admission; stale passes fail closed. */
+	assertWorkspaceCurrent?: () => void;
+	/** Frozen workspace identity for this pass; background closures retain it. */
+	workspaceContext?: import("@shared/workspace-context").WorkspaceContext;
+	/** Commit a strict-serial switch without waiting for the invoking loop. */
+	switchWorkingDirectory?: (
+		request: import("@shared/workspace-context").SwitchWorkingDirectoryRequest,
+	) => Promise<import("@shared/workspace-context").SwitchWorkingDirectoryResult>;
 }
 
 /** Immutable execution identity captured before a routed tool enters permission handling. */
@@ -269,6 +291,8 @@ export type ToolExecutionRouting =
 	  };
 
 export interface PermissionHandlerOptions {
+	/** Per-call preparation cancellation; prefer this over the whole-run signal. */
+	signal?: AbortSignal;
 	/** Exact execution row; never resolve a different row by provider toolUseId. */
 	toolCallBinding?: ToolCallBinding;
 	/** Suppress user-facing attention for an internally resumed permission flow. */
@@ -373,6 +397,8 @@ export type PermissionResult =
 	  }
 	| {
 			behavior: "dangerReflection";
+			/** Dedicated rule-request gate; never cached or approved via text fallback. */
+			purpose?: "permissionRuleRequest";
 			requestId: string;
 			danger: DangerInfo;
 			fingerprint: string;
@@ -685,6 +711,8 @@ export type AgentEvent =
 	  }
 	| {
 			type: "context_usage";
+			source?: import("@shared/context-usage").ContextUsageSource;
+			snapshot?: import("@shared/context-usage").ContextUsageSnapshot;
 			percentage: number;
 			promptTokens?: number;
 			inputTokens?: number;
@@ -747,6 +775,7 @@ export type AgentEvent =
 	  }
 	| {
 			type: "api_request_end";
+			contextSnapshot?: import("@shared/context-usage").ContextUsageSnapshot;
 			requestId: string;
 			credentialId?: string;
 			usage?: {
@@ -888,12 +917,20 @@ export interface AgentHistoryReplacement {
 }
 
 export interface AgentConfig {
+	/** Freeze an already-recorded numeric cache at input preparation; never rebuild on this path. */
+	freezeContextComposition?: (
+		counts: import("@shared/context-usage").ContextInputCharacters | null,
+		requestId: string,
+		startedAt: string,
+	) => import("@shared/context-composition").ContextCharCache | null;
 	narratorId: string;
 	conversationId: string;
 	model: string;
 	provider: string;
 	cwd: string;
 	systemPrompt?: string;
+	/** Host telemetry for the actual provider-formatted tool payload; failures are non-fatal. */
+	onToolsCharacters?: (toolsChars: number) => void | Promise<void>;
 	locale?: string;
 	signal: AbortSignal;
 	/** Chapter ID the narrator belongs to (passed through to ToolContext) */
@@ -969,6 +1006,14 @@ export interface AgentConfig {
 	 * into ToolContext.setDefaultDevice. Absent → SwitchDevice reports failure.
 	 */
 	setDefaultDevice?: (deviceId: string | null) => Promise<boolean>;
+	/** Checks at both permission and final execution admission; stale passes fail closed. */
+	assertWorkspaceCurrent?: () => void;
+	/** Frozen workspace identity for this pass; background closures retain it. */
+	workspaceContext?: import("@shared/workspace-context").WorkspaceContext;
+	/** Commit a strict-serial switch without waiting for the invoking loop. */
+	switchWorkingDirectory?: (
+		request: import("@shared/workspace-context").SwitchWorkingDirectoryRequest,
+	) => Promise<import("@shared/workspace-context").SwitchWorkingDirectoryResult>;
 	/**
 	 * Persist the immutable primary execution identity before a routed tool enters permission handling.
 	 * Rejecting this callback prevents execution so audit state cannot silently diverge.
@@ -1054,6 +1099,11 @@ export interface AgentConfig {
 	allowLocalExecution?: boolean;
 	/** Live authorization check performed immediately before every tool call. */
 	runtimeAuthorizationGuard?: () => Promise<void>;
+	/** Real policy rejudgment after all preparation/slot waits; its synchronous fence
+	 *  is checked immediately before tool.execute, not as an observer. */
+	onToolExecutionFinalAuthorization?: (
+		context: ToolFinalStartAuthorizationContext,
+	) => Promise<ToolFinalStartAuthorizationTicket>;
 	/** Skills blocked by narrator custom traits. `all` hides the Skill tool entirely. */
 	blockedSkills?: { all: boolean; names: string[] } | null;
 	/** Custom description appended to Agent.model schema when narrator traits restrict subagent models. */
@@ -1168,6 +1218,14 @@ export interface AgentConfig {
 	 * the loop exits gracefully and marks later tool calls in the turn as skipped.
 	 */
 	shouldStop?: () => boolean;
+	/** Event-driven immediate guidance: cancel the provider and unstarted preparation,
+	 * but drain actual running tools. Supply a fresh signal for each loop invocation. */
+	guidanceSignal?: AbortSignal;
+	/** Urgent guidance: cancel provider and tool IO, then persist results and soft-stop.
+	 * Unlike signal, this does not mark the whole narrator run as user-interrupted. */
+	urgentGuidanceSignal?: AbortSignal;
+	/** Internal synchronous boundary after the final fences, immediately before tool.execute. */
+	onToolExecutionInvoking?: (toolUse: AgentToolUse) => void;
 	/**
 	 * Disable streaming-time eager tool execution so shouldStop boundaries can
 	 * guarantee that later serial tools have not already started.

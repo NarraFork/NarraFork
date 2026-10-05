@@ -49,6 +49,25 @@ const AUTHENTICATED_PATHS: string[] = [
 ];
 
 describe("app shell i18n namespaces", () => {
+	test.each(["narrators", "chapters"])("%s window preloads only its own translations", (kind) => {
+		expect(getNamespacesForPath(`/windows/git/${kind}/abc/commits/${"a".repeat(40)}`)).toEqual([
+			"common",
+			"errors",
+			"git",
+		]);
+	});
+	test("unknown window targets do not load navigation bundles", () => {
+		expect(getNamespacesForPath("/windows/unknown")).toEqual(["common", "errors"]);
+	});
+	test("panel windows preload the namespaces panel components translate with", () => {
+		const loaded = getNamespacesForPath("/windows/panel");
+		for (const ns of ["common", "errors", "narrator", "terminal", "git", "knowledge"] as const) {
+			expect(loaded).toContain(ns);
+		}
+	});
+	test("workspace windows preload the workspace page's namespaces", () => {
+		expect(getNamespacesForPath("/windows/workspaces/abc")).toContain("narrators");
+	});
 	test.each(["narrators", "chapters"])("%s commit deep links preload git translations", (kind) => {
 		const loaded = getNamespacesForPath(`/git/${kind}/abc/commits/${"a".repeat(40)}`);
 		expect(loaded).toContain("git");

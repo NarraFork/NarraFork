@@ -1,0 +1,18 @@
+# 第三方开源协议页面（`/licenses`）
+
+页面覆盖**所有随发布产物分发的第三方组件**（当前约 1180 条），而非仅 `package.json` 里的直接依赖。分组依据是"是否随产物分发"，不是 `dependencies` / `devDependencies` 的位置：
+
+- **`bundled`** — 不在 `node_modules` 里、但被编译进发布产物的组件。**由人工在 `licenses/extra/entries.json` 声明**，协议全文放同目录 `.txt`。当前包含：Bun 运行时（含其静态链接的 JavaScriptCore，**LGPL-2**，附带 relink 说明）、`vendor/zstd` 静态二进制（**BSD-3-Clause OR GPL-2.0，已选定 BSD-3**）、静态链接的 musl libc、Go 标准库 + `remote-executor/go.mod` 的 4 个模块、`@parcel/watcher` 的 8 个平台原生 `.node`（由 `scripts/download-parcel-watcher.ts` 直接从 npm 下载，**绕过 node_modules，扫描器看不到**）。
+- **`runtime`** — 从 `dependencies` 递归可达的包（含 `optionalDependencies`），全部随二进制分发。
+- **`development`** — 仅 `devDependencies` 可达，不分发，列出以求完整。
+
+**⚠️ 新增非 npm 二进制依赖时必须在 `licenses/extra/entries.json` 登记**，否则页面不会提及它，构成 attribution 缺口。
+
+实现要点：
+
+1. **扫描器** `server/lib/licenses/scan.ts` — 递归依赖树 + `readdir` 正则匹配协议文件（`/^(licen[cs]e|copying)([._-].*)?$/i`，比固定候选名多命中 23 个包）+ NOTICE 单独采集（Apache-2.0 §4(d)）+ 按 sha256 去重全文（1052 份 → 563 份唯一）。
+2. **双许可选定** `server/lib/licenses/dual-license.ts` — `"A OR B"` 必须人工声明采用哪个分支并写明理由；**未声明的 disjunction 会报 error 阻断构建**，不会静默显示原始 `"A OR B"`（那看起来像答案，却隐藏了没人做过选择的事实，MPL 分支还带源码披露义务）。同文件还有 `khroma` 这类"无 license 字段"的人工 override。
+3. **缺协议原文回落** `server/lib/licenses/spdx-templates.ts` — 38 个包声明了 SPDX 但没随包提供协议文件（monorepo 只在仓库根放一份）。回落到标准协议全文，条目标 `textSource: "spdx-template"`，**UI 明确提示"这是标准文本，不是该包自行提供的措辞"并给出上游链接**。所有模板均从 `node_modules` 中已安装的规范副本逐字复制（模板注释里标注了来源包），有测试逐字对比；**禁止凭记忆手写或改写协议文本**。
+4. **构建嵌入** `scripts/build-cross-platform.ts` Step 5c → `server/generated/embedded-licenses.ts`。**`problems` 中有 `error` 级会 `exit(1)` 阻断构建**（取代旧实现的静默 `catch {}`，正是它让 785 个包无声消失）。嵌入内容以 JSON 字符串 + `JSON.parse` 形式生成，与 `embedded-migrations-data.ts` 同理：1179 条对象字面量会让 TS 推断出过复杂 union 而报 TS2590。
+5. **运行时读取** `server/lib/licenses/manifest.ts` 双模式 — 开发扫 `node_modules`（约 130ms，进程内缓存），二进制读嵌入数据。API：`GET /api/licenses`（摘要，**不含全文**）+ `GET /api/licenses/text/:id`（按内容哈希取单份全文）。两者均公开无需认证，因为 attribution 必须对软件接收者可得，且 `/licenses` 从登录页可直达。
+6. **前端** `frontend/routes/licenses.tsx` — 运行时加载，展开行才拉取对应全文。改造前是构建期把 1.7MB 全文内联进 bundle（`__LICENSE_DATA__`），现在 licenses chunk 仅 7.6KB。

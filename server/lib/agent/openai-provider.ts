@@ -31,6 +31,11 @@ import {
 } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { buildImageGenerationSavedPathInstruction } from "./image-generation";
+import {
+	markRuntimeInstructions,
+	markRuntimeSystemMessage,
+	reportInputCharacters,
+} from "./input-characters";
 import { buildOpencodeSessionHeader } from "./opencode-session";
 import type {
 	ChatParams,
@@ -702,7 +707,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const identity = identityMap[locale] ?? identityMap.en;
 		const content = `${identity}\n\n${systemPrompt}`;
 		const role = this.responsesFormat ? "developer" : "system";
-		h.unshift({ role, content } as unknown as OAIMessage);
+		h.unshift(markRuntimeSystemMessage({ role, content }) as unknown as OAIMessage);
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
@@ -810,6 +815,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			} else if (this.apiMode === "codex") {
 				// Codex gateway requires non-empty instructions even for pure tool/result turns.
 				body.instructions = CODEX_DEFAULT_INSTRUCTIONS;
+				markRuntimeInstructions(body);
 			}
 			if (tools.length > 0) body.tools = tools;
 
@@ -901,6 +907,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				settings.agent?.requestDumpMaxSize,
 			);
 
+			await reportInputCharacters(params, body);
 			const bodyText = JSON.stringify(body);
 			params.onRequestStart?.();
 			const response = await this.pfetch(endpoint, {
@@ -1608,6 +1615,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const fingerprint = this.resolveFingerprint(params.conversationId);
 
 		try {
+			await reportInputCharacters(params, request);
 			params.onRequestStart?.({ credentialId: this.config.id });
 			for await (const event of streamCodexResponsesWebSocket({
 				baseUrl,
@@ -1712,6 +1720,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			store: false,
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
+		if (!instructions) markRuntimeInstructions(request);
 		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
 		appendCodexNativeTools(tools, params.model, {
 			webSearch:

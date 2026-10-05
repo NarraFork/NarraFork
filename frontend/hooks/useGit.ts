@@ -11,6 +11,7 @@ import {
 	type GitCommitDetail,
 	type GitCommitPatch,
 } from "../../shared/git-commit-preview";
+import type { GitWorkspaceSummary } from "../../shared/git-workspace";
 import { type ApiError, api } from "../lib/api";
 import {
 	type GitLogEntry,
@@ -23,6 +24,7 @@ import { GitWorkspaceSubscriptions } from "../lib/git-workspace-subscription";
 import { type ListenerHandle, narratorWSManager } from "../lib/narrator-ws-manager";
 import { observePageLifecycle } from "../lib/page-lifecycle";
 import { useNarrator } from "./useNarrator";
+import { useWorkspaceContext } from "./useWorkspaceContext";
 
 export type {
 	CurrentDiffFile,
@@ -181,6 +183,22 @@ export function useGitWorkspaceSubscription(target: GitTarget) {
 }
 
 // One permission subscription per QueryClient, shared by all mounted workspace consumers.
+const deniedGitSummaries = new WeakMap<QueryClient, Set<string>>();
+// Query.reset restores its original initialData snapshot. Mark presentation seeds
+// so a reset cannot mistake that old snapshot for a new authoritative response.
+const gitSummarySeeds = new WeakSet<GitWorkspace>();
+function blockGitSummary(qc: QueryClient, narratorId: string) {
+	let denied = deniedGitSummaries.get(qc);
+	if (!denied) {
+		denied = new Set();
+		deniedGitSummaries.set(qc, denied);
+	}
+	denied.add(narratorId);
+	void qc.cancelQueries({ queryKey: ["narrators", narratorId], exact: true });
+	qc.setQueryData<Record<string, unknown>>(["narrators", narratorId], (detail) =>
+		detail ? { ...detail, gitSummary: null } : detail,
+	);
+}
 const gitAccessSubscriptions = new WeakMap<
 	QueryClient,
 	{ count: number; handle: ListenerHandle }
@@ -191,6 +209,19 @@ function subscribeGitAccess(qc: QueryClient) {
 		const handle = narratorWSManager.addListener(
 			{ narratorIds: "*", types: ["narrator_access_changed"] },
 			() => {
+				// Cancel in-flight detail reads before clearing presentation-only summaries.
+				// A late response must not revive private facts after access changed.
+				const details = {
+					predicate: (q: { queryKey: readonly unknown[] }) =>
+						q.queryKey[0] === "narrators" &&
+						q.queryKey.length === 2 &&
+						typeof q.queryKey[1] === "string",
+				};
+				void qc.cancelQueries(details);
+				qc.setQueriesData<Record<string, unknown>>(details, (detail) =>
+					detail ? { ...detail, gitSummary: null } : detail,
+				);
+				void qc.invalidateQueries(details);
 				qc.resetQueries({ queryKey: ["gitWorkspace"] });
 				qc.removeQueries({ predicate: (q) => GIT_FACT_QUERIES.includes(String(q.queryKey[0])) });
 			},
@@ -226,27 +257,70 @@ async function readWorkspace<T>(
 			!unsupportedPreview &&
 			[401, 403, 409, 503].includes(failure?.status)
 		) {
+			if ([401, 403].includes(failure.status)) blockGitSummary(qc, target.narratorId);
+			void qc.cancelQueries({ queryKey: ["narrators", target.narratorId], exact: true });
+			qc.setQueryData<Record<string, unknown>>(["narrators", target.narratorId], (detail) =>
+				detail ? { ...detail, gitSummary: null } : detail,
+			);
 			qc.resetQueries({ queryKey: ["gitWorkspace", target.narratorId] });
 		}
 		throw error;
 	}
 }
 
-/** The execution-context revision is a cache key, not a client-supplied path. */
+/** Detail summaries are presentation hints only, never authorization for a Git API. */
+export function gitSummaryWorkspace(
+	narrator: Record<string, unknown> | undefined,
+	contextRevision: number,
+): GitWorkspace | undefined {
+	const summary = narrator?.gitSummary as GitWorkspaceSummary | null | undefined;
+	if (!summary || summary.revision !== contextRevision) return undefined;
+	// cwd may be a host path while the executor uses its own defaultCwd, or a
+	// symlink resolved by the probe. Directory switches must advance the revision;
+	// comparing these differently normalized paths would reject valid summaries.
+	if (narrator?.defaultDeviceId && narrator.defaultDeviceId !== summary.workspace.deviceId)
+		return undefined;
+	return { ...summary.workspace, branch: summary.workspace.branch ?? summary.branch };
+}
+
+/** A monotonic revision does not change when execution context first hydrates. */
 export function useGitWorkspace(narratorId: string | null | undefined, revision?: unknown) {
 	const qc = useQueryClient();
-	const { data: narrator } = useNarrator(narratorId ?? "");
+	const {
+		data: narrator,
+		dataUpdatedAt: narratorUpdatedAt,
+		isError: narratorError,
+	} = useNarrator(narratorId ?? "");
+	const { data: executionContext } = useWorkspaceContext(narratorId ?? "");
 	useEffect(() => (narratorId ? subscribeGitAccess(qc) : undefined), [qc, narratorId]);
-	const context = revision ?? [
-		narrator?.cwd,
-		narrator?.chapterId,
-		narrator?.contextProjectId,
-		narrator?.defaultDeviceId,
-	];
+	const workspaceRevision = Math.max(
+		typeof narrator?.workspaceRevision === "number" ? narrator.workspaceRevision : 0,
+		executionContext?.revision ?? 0,
+	);
+	// Directory/device switches advance this revision. Late hydration of optional
+	// narrator metadata must not replace an already authorized workspace query.
+	const context = revision ?? workspaceRevision;
+	const summaryWorkspace = gitSummaryWorkspace(narrator, workspaceRevision);
 	const query = useQuery({
 		queryKey: ["gitWorkspace", narratorId, context],
 		queryFn: ({ signal }) => api.getGitWorkspace(narratorId as string, signal),
-		enabled: !!narratorId,
+		initialData: () => {
+			if (!narratorId || deniedGitSummaries.get(qc)?.has(narratorId)) return undefined;
+			// resetQueries may call this again: re-read the source rather than capture
+			// a summary which an access event has since removed from the detail cache.
+			const detail =
+				qc.getQueryData<Record<string, unknown>>(["narrators", narratorId]) ?? narrator;
+			const seed = gitSummaryWorkspace(detail, workspaceRevision);
+			if (seed) gitSummarySeeds.add(seed);
+			return seed;
+		},
+		initialDataUpdatedAt: narratorUpdatedAt || Date.now(),
+		// Keep presentation seeds distinguishable from authoritative responses even
+		// when a successful probe returns exactly the same small facts object.
+		structuralSharing: false,
+		// Detail discovery already probes Git. Do not race it with a duplicate cold
+		// request; legacy detail responses and failed detail reads can still recover.
+		enabled: !!narratorId && (!!narrator || narratorError),
 		retry: false,
 		staleTime: 5_000,
 		// A non-ready workspace has no panel watch yet. Probe only recoverable
@@ -264,12 +338,56 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 		},
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
+	const isSummarySeed = !!query.data && gitSummarySeeds.has(query.data);
 	// Do not leave private facts visible after an authorization/capability failure.
 	useEffect(() => {
+		if (narratorId) {
+			if (
+				(query.isError && [401, 403].includes((query.error as ApiError)?.status)) ||
+				query.data?.state === "access_denied"
+			)
+				blockGitSummary(qc, narratorId);
+			else if (!isSummarySeed && query.isSuccess && query.data?.capabilities.read)
+				deniedGitSummaries.get(qc)?.delete(narratorId);
+		}
 		if (!query.isError && query.data?.capabilities.read !== false) return;
 		qc.removeQueries({ predicate: (q) => GIT_FACT_QUERIES.includes(String(q.queryKey[0])) });
-	}, [qc, query.isError, query.data?.capabilities.read]);
-	return query;
+	}, [
+		qc,
+		narratorId,
+		isSummarySeed,
+		query.isError,
+		query.error,
+		query.isSuccess,
+		query.data?.state,
+		query.data?.capabilities.read,
+	]);
+	// Synchronous fallback also works when a pending query already existed before
+	// the detail arrived (initialData cannot seed that existing query).
+	let data = query.isError
+		? undefined
+		: query.isPending || isSummarySeed
+			? narratorId && deniedGitSummaries.get(qc)?.has(narratorId)
+				? undefined
+				: summaryWorkspace
+			: query.data;
+	// Old executors and the authority-only probe may omit branch. Preserve only
+	// the label from a same-version summary of this exact device/worktree.
+	if (
+		data?.state === "ready" &&
+		data.capabilities.read &&
+		data.branch === undefined &&
+		data.workspaceKey &&
+		data.workspaceKey === summaryWorkspace?.workspaceKey &&
+		data.deviceId === summaryWorkspace.deviceId &&
+		data.rootPath === summaryWorkspace.rootPath
+	)
+		data = { ...data, branch: summaryWorkspace.branch };
+	return {
+		...query,
+		data,
+		layoutReady: !narratorId || !!data || query.isError,
+	};
 }
 
 export function invalidateWorkspaceQueries(

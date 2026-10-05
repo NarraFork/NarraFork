@@ -25,12 +25,17 @@ import "@frontend/styles/oled.css";
 import "@frontend/styles/blur-anim.css";
 import "@frontend/styles/nav-collapsed.css";
 import "@frontend/styles/safe-area.css";
+// WCO (installed-PWA title-bar fusion): gated entirely on html[data-nf-wco].
+import "@frontend/styles/wco.css";
 import "@frontend/styles/toast.css";
 // Tool-call shimmer classes (card face + compact row text). Global because BOTH
 // narrator render paths paint these and vlist may not import the chunk path — see
 // each stylesheet's header.
 import "@frontend/styles/card-shimmer.css";
 import "@frontend/styles/trace-shimmer.css";
+// The touch scroll-to-top button's mount fade — a keyframe inline styles cannot
+// declare; see the stylesheet's header.
+import "@frontend/styles/vlist-touch-scroll-top.css";
 
 /*
  * Deep import rather than the `components/plugins` barrel, for the same reason as the

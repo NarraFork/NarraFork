@@ -8,21 +8,13 @@ Two conversation modes are available:
 
 - "fork": Fork from the current conversation position, inheriting the message history. Your message is sent as a follow-up in the forked context. Use this when the new narrator should continue from where you are but take a different direction.
 
-For chapter-bound narrators, `worktreeSource` independently controls files:
+Every parent, including an old chapter-bound narrator, creates a standalone conversation (no new chapter, git branch, project or worktree). The child inherits the parent's validated execution device/directory and access restrictions; no filesystem snapshot is restored or copied. Independent conversations may use the same directory, so independence is not filesystem isolation.
 
-- "workspace": include workspace state (including uncommitted changes). With mode="fork", this uses the current conversation position's workspace snapshot.
-- "commit": use committed history only. Optional `commitSha` selects a commit in the parent chapter's branch history.
-
-`mode`/`inheritMode` control conversation history only; `worktreeSource` controls filesystem state. Omission keeps legacy-compatible defaults.
-
-Behavior depends on the parent narrator type:
-
-- Chapter-bound narrator: Creates a new chapter (with its own git branch and worktree) forked from the current chapter, plus a new primary narrator for that chapter.
-- Standalone narrator: Creates a new standalone narrator (no chapter).
+`mode`/`inheritMode` control conversation history only. `worktreeSource` and `commitSha` are deprecated and explicitly rejected; omit them. Use the explicit Worktree resource tool when filesystem isolation or a selected commit is needed.
 
 Important notes:
 - The new narrator runs completely independently — you will NOT receive its output.
 - Use this when you want to delegate a long-running or divergent task to a separate narrator that the user can monitor independently.
 - Do NOT use this as a substitute for the Agent tool (subagents). Use Agent when you need the result back in your current conversation.
 - This tool is best for spawning parallel workstreams that the user will interact with directly.
-- Fork DEPTH is capped: the new narrator can fork again, so a chain of forks-of-forks is refused past a fixed limit (each hop creates a chapter, a git worktree and a running narrator). Breadth is not capped — several forks from the same parent are fine. If you are refused, do the work in the current narrator instead of trying to route around it.
+- Fork DEPTH is capped: the new narrator can fork again, so a chain of forks-of-forks is refused past a fixed limit (each hop creates a new conversation and a running narrator). Breadth is not capped — several forks from the same parent are fine. If you are refused, do the work in the current narrator instead of trying to route around it.

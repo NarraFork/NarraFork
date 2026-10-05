@@ -1184,7 +1184,8 @@ function UnstyledButtonWorkIndicator(
 							flexShrink: 0,
 						}}
 					>
-						<IconShield size={14} />
+						{/* Match the trace row's optical centering without changing the icon slot. */}
+						<IconShield size={14} style={{ display: "block", transform: "translateY(-1px)" }} />
 					</Box>
 				) : (
 					<Loader size={14} color={workIndicator.color} style={{ flexShrink: 0 }} />

@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } f
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { SQL } from "drizzle-orm";
+import { eq, type SQL } from "drizzle-orm";
 import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { cleanDb } from "../../../tests/setup";
 
@@ -12,6 +12,7 @@ const startCalls: Array<Record<string, unknown>> = [];
 const persistedCalls: Array<Record<string, unknown>> = [];
 const conclusionCalls: Array<Record<string, unknown>> = [];
 const retriedToolCalls: Array<Record<string, unknown>> = [];
+let beforeDeniedRetryIo: (() => Promise<void>) | undefined;
 const editedMessageCalls: Array<Record<string, unknown>> = [];
 const deleteMessagesAfterCalls: Array<Record<string, unknown>> = [];
 const foregroundResolvers = new Map<string, (output: string) => void>();
@@ -470,6 +471,8 @@ beforeAll(async () => {
 				userId: string | null | undefined,
 				options: Record<string, unknown>,
 			) => {
+				await (options.onAdmitted as (() => Promise<void>) | undefined)?.();
+				await beforeDeniedRetryIo?.();
 				retriedToolCalls.push({
 					narratorId,
 					toolUseId,
@@ -623,6 +626,7 @@ describe("resume lifecycle shares the root's file-revert admission", () => {
 });
 
 afterEach(async () => {
+	beforeDeniedRetryIo = undefined;
 	for (const subagentId of [...terminalResolvers.keys()]) {
 		await finishRun(subagentId);
 	}
@@ -1256,6 +1260,37 @@ describe("resumeSubagent", () => {
 
 	test("routes denied-tool result continuation through the same resume service", async () => {
 		const subagentId = "resume-denied-tool";
+		const { db } = await import("../../db");
+		const { narrators } = await import("../../db/schema");
+		const now = new Date().toISOString();
+		await db
+			.insert(narrators)
+			.values([
+				{ id: parentNarratorId, createdAt: now, updatedAt: now },
+				{
+					id: subagentId,
+					parentNarratorId,
+					variant: "subagent:general",
+					type: "subagent",
+					logicalRunId: "previous-run",
+					createdAt: now,
+					updatedAt: now,
+				},
+			])
+			.onConflictDoNothing();
+		let runAtIo: string | undefined;
+		beforeDeniedRetryIo = async () => {
+			const { resolveSubagentExecutionSegment } = await import("../subagent-execution-boundary");
+			const run = await db
+				.select({ logicalRunId: narrators.logicalRunId })
+				.from(narrators)
+				.where(eq(narrators.id, subagentId))
+				.get();
+			const segment = await resolveSubagentExecutionSegment(subagentId, run?.logicalRunId);
+			expect(segment?.sourceInputId).toStartWith("subagent-run:");
+			runAtIo = segment?.sourceInputId?.slice("subagent-run:".length);
+			expect(runAtIo).not.toBe("previous-run");
+		};
 		loadedTrailingToolResults = [{ type: "tool_result", toolUseId: "denied-tool-use" }];
 
 		const result = await resumeSubagent({
@@ -1276,7 +1311,7 @@ describe("resumeSubagent", () => {
 				locale: "zh-CN",
 				replyInUserLanguage: true,
 				userId: "user-4",
-				options: { autoContinue: false },
+				options: { autoContinue: false, onAdmitted: expect.any(Function) },
 			},
 		]);
 		expect(startCalls[0]).toMatchObject({
@@ -1284,6 +1319,8 @@ describe("resumeSubagent", () => {
 			persistPrompt: false,
 			initialHistory: [{ role: "user", content: "history" }],
 			initialTrailingToolResults: [{ type: "tool_result", toolUseId: "denied-tool-use" }],
+			resumeLogicalRunId: runAtIo,
+			fileChangeStartedAt: expect.any(String),
 		});
 		await finishRun(subagentId);
 	});

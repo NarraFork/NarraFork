@@ -20,7 +20,7 @@
  */
 
 import { afterAll, describe, expect, mock, test } from "bun:test";
-import { eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../../tests/setup";
 import {
 	narratorMessageRefs,
@@ -73,7 +73,9 @@ async function seedPendingPermissionRow(): Promise<void> {
 		id: messageId,
 		narratorId: NARRATOR_ID,
 		role: "assistant",
-		contentJson: [{ type: "tool_use", id: TOOL_USE_ID, name: PERMISSION_TOOL_NAME, input: {} }],
+		contentJson: [
+			{ type: "tool_use", id: TOOL_USE_ID, name: PERMISSION_TOOL_NAME, input: { answer: "42" } },
+		],
 		createdAt: now,
 	});
 	await db.insert(narratorMessageRefs).values({
@@ -116,7 +118,7 @@ describe("permission wait does not block a planned restart", () => {
 		toolRegistry.register({
 			name: PERMISSION_TOOL_NAME,
 			description: "waits for a human decision",
-			parameters: z.object({}),
+			parameters: z.object({ answer: z.literal("42") }),
 			execute: async () => {
 				executions++;
 				return { output: "executed after approval" };
@@ -124,10 +126,35 @@ describe("permission wait does not block a planned restart", () => {
 		});
 
 		let permissionAsked = false;
-		let approve: (() => void) | undefined;
+		let releaseDecision: (() => void) | undefined;
 		const decided = new Promise<void>((resolve) => {
-			approve = resolve;
+			releaseDecision = resolve;
 		});
+		const approve = async () => {
+			// A human decision authorizes one exact durable attempt before waking it.
+			// Resolving the Promise alone is not the production approval receipt.
+			const approved = await db
+				.update(narratorToolCalls)
+				.set({
+					status: "running",
+					permissionDecidedBy: "user",
+					permissionDecidedAt: new Date().toISOString(),
+					permissionDecisionReason: "Human approved the bound restart-wait fixture",
+				})
+				.where(
+					and(
+						eq(narratorToolCalls.id, TOOL_CALL_ID),
+						eq(narratorToolCalls.narratorId, NARRATOR_ID),
+						eq(narratorToolCalls.toolUseId, TOOL_USE_ID),
+						eq(narratorToolCalls.executionAttempt, 1),
+						eq(narratorToolCalls.status, "pending"),
+						isNull(narratorToolCalls.executionStartedAt),
+					),
+				)
+				.returning({ id: narratorToolCalls.id });
+			expect(approved).toEqual([{ id: TOOL_CALL_ID }]);
+			releaseDecision?.();
+		};
 		const abortController = new AbortController();
 		/**
 		 * The tool row as it stood at the instant the grant was released.
@@ -142,7 +169,7 @@ describe("permission wait does not block a planned restart", () => {
 		const toolUse: AgentToolUse = {
 			toolUseId: TOOL_USE_ID,
 			name: PERMISSION_TOOL_NAME,
-			input: {},
+			input: { answer: "42" },
 		};
 		const config: AgentConfig = {
 			requireToolCallBinding: true,
@@ -209,7 +236,7 @@ describe("permission wait does not block a planned restart", () => {
 
 			// Approving mid-restart must not start the tool against a server about to be replaced:
 			// re-admission holds it behind the gate instead of half-executing it.
-			approve?.();
+			await approve();
 			await new Promise((resolve) => setTimeout(resolve, 20));
 			expect(executions).toBe(0);
 
@@ -220,7 +247,7 @@ describe("permission wait does not block a planned restart", () => {
 			expect(executions).toBe(1);
 		} finally {
 			abortController.abort();
-			approve?.();
+			releaseDecision?.();
 			toolRegistry.unregister?.(PERMISSION_TOOL_NAME);
 			updateCoordinator.resetUpdateCoordinationForTests();
 		}

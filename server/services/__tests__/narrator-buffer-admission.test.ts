@@ -22,16 +22,28 @@
  *   legitimately lets a zombie `working` row fall through to a normal send.
  */
 
-import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { getTestDb } from "../../../tests/setup";
-import { narratorBufferedMessages, narrators } from "../../db/schema";
+import { users as pgUsers } from "../../db/postgres-schema";
+import { narratorBufferedMessages, narrators, users } from "../../db/schema";
+import { MAILBOX_LIMITS } from "../agent-runtime/limits";
+import type { PostgresRuntimeQueue } from "../agent-runtime/postgres-runtime-queue";
+import { bindRuntimeQueue } from "../agent-runtime/runtime-queue-port";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
-const { getBufferedMessages, pushBufferedMessage } = await import("../narrator-buffer");
+const {
+	getBufferedMessages,
+	getBufferedMessagesAsync,
+	pushBufferedMessage,
+	enqueueBufferedMessage,
+	updateBufferedMessageMode,
+	reorderBufferedMessages,
+	toBufferSummary,
+} = await import("../narrator-buffer");
 const { activeNarrators, claimNarratorRuntime, pendingDangerReflections, pendingPermissions } =
 	await import("../narrator-session-state");
 
@@ -70,6 +82,331 @@ afterEach(() => {
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+});
+
+describe("queued user identity", () => {
+	const author = {
+		id: "buffer-author",
+		username: "queue-author",
+		avatarColor: "teal",
+		avatarImageId: "author-avatar",
+	};
+	db.insert(users)
+		.values({ ...author, passwordHash: "private-hash", createdAt: new Date().toISOString() })
+		.run();
+
+	test("explicit primary snapshot survives canonical profile changes", async () => {
+		const snapshot = { ...author, username: "snapshot-name", avatarColor: "pink" };
+		const result = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			"primary",
+			undefined,
+			undefined,
+			author.id,
+			snapshot,
+		);
+		const [message] = await getBufferedMessagesAsync(NARRATOR_ID);
+		expect(message.createdBy).toBe(author.id);
+		expect(message.creator).toEqual(snapshot);
+		expect(toBufferSummary([message])[0].creator).toEqual(snapshot);
+		expect(
+			JSON.parse(
+				db
+					.select()
+					.from(narratorBufferedMessages)
+					.where(eq(narratorBufferedMessages.id, result.id))
+					.get()?.creatorJson ?? "null",
+			),
+		).toEqual(snapshot);
+	});
+
+	test("child-like createdBy-only admission persists the public canonical author", async () => {
+		const result = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			"child",
+			undefined,
+			undefined,
+			author.id,
+			null,
+		);
+		const row = db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.id, result.id))
+			.get();
+		expect(row?.createdBy).toBe(author.id);
+		expect(JSON.parse(row?.creatorJson ?? "null")).toEqual(author);
+		const [message] = await getBufferedMessagesAsync(NARRATOR_ID);
+		expect(toBufferSummary([message])[0].creator).toEqual(author);
+	});
+
+	test("legacy pending authors hydrate with one bounded public-field query and no payload reads", async () => {
+		for (const text of ["legacy-one", "legacy-two"]) {
+			const result = await enqueueBufferedMessage(
+				NARRATOR_ID,
+				text,
+				undefined,
+				undefined,
+				author.id,
+				author,
+			);
+			db.update(narratorBufferedMessages)
+				.set({
+					creatorJson: null,
+					payloadRefJson: JSON.stringify({ path: "/missing-identity-test-payload" }),
+					textFilePathsJson: JSON.stringify([
+						{ path: "/missing-identity-test-attachment", filename: "missing.txt", size: 1 },
+					]),
+				})
+				.where(eq(narratorBufferedMessages.id, result.id))
+				.run();
+		}
+		const select = spyOn(db, "select");
+		try {
+			const messages = await getBufferedMessagesAsync(NARRATOR_ID);
+			expect(messages.map((message) => message.creator)).toEqual([author, author]);
+			expect(messages.map((message) => message.createdBy)).toEqual([author.id, author.id]);
+			expect(select).toHaveBeenCalledTimes(2);
+			expect(Object.keys(select.mock.calls[1][0] ?? {})).toEqual([
+				"id",
+				"username",
+				"avatarColor",
+				"avatarImageId",
+			]);
+			// The projection keeps lazy payload getters instead of spreading the message.
+			expect(() => messages[0].text).toThrow();
+			expect(typeof Object.getOwnPropertyDescriptor(messages[0], "textFiles")?.get).toBe(
+				"function",
+			);
+		} finally {
+			select.mockRestore();
+		}
+	});
+
+	test("PG listing uses the canonical async runtime, never the unavailable SQLite handle", async () => {
+		const result = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			"pg legacy",
+			undefined,
+			undefined,
+			author.id,
+			author,
+		);
+		const row = db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.id, result.id))
+			.get();
+		if (!row) throw new Error("Expected fixture mailbox row");
+		const select = mock((fields: Record<string, unknown>) => {
+			expect(fields).toEqual({
+				id: pgUsers.id,
+				username: pgUsers.username,
+				avatarColor: pgUsers.avatarColor,
+				avatarImageId: pgUsers.avatarImageId,
+			});
+			return {
+				from(table: unknown) {
+					expect(table).toBe(pgUsers);
+					return {
+						where() {
+							return {
+								limit(limit: number) {
+									expect(limit).toBe(1);
+									return Promise.resolve([author]);
+								},
+							};
+						},
+					};
+				},
+			};
+		});
+		const listPending = mock(async (_id: string, options: { kinds: string[]; limit: number }) => {
+			expect(options.kinds).toEqual(["user_input"]);
+			expect(options.limit).toBe(MAILBOX_LIMITS.userPending);
+			return [{ ...row, creatorJson: null }];
+		});
+		bindRuntimeQueue({
+			backend: "postgres",
+			queue: { mailbox: { listPending } } as unknown as PostgresRuntimeQueue,
+		});
+		mock.module("../../db", () => ({
+			...realDbModule,
+			sqlite,
+			db: new Proxy(
+				{},
+				{
+					get() {
+						throw new Error("Forbidden SQLite access during PG identity lookup");
+					},
+				},
+			),
+			postgresRuntime: { client: { db: { select } } },
+		}));
+		try {
+			const messages = await getBufferedMessagesAsync(NARRATOR_ID);
+			expect(messages[0].creator).toEqual(author);
+			expect(toBufferSummary(messages)[0].creator).toEqual(author);
+			expect(select).toHaveBeenCalledTimes(1);
+			expect(listPending).toHaveBeenCalledTimes(1);
+		} finally {
+			bindRuntimeQueue(undefined);
+			mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+		}
+	});
+
+	test("machine mailbox rows are not presented as queued human messages", async () => {
+		const result = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			"machine",
+			undefined,
+			undefined,
+			author.id,
+			author,
+		);
+		db.update(narratorBufferedMessages)
+			.set({ kind: "agent_message", creatorJson: null })
+			.where(eq(narratorBufferedMessages.id, result.id))
+			.run();
+		const select = spyOn(db, "select");
+		try {
+			expect(await getBufferedMessagesAsync(NARRATOR_ID)).toEqual([]);
+			expect(select).toHaveBeenCalledTimes(1);
+		} finally {
+			select.mockRestore();
+		}
+	});
+
+	test("missing, deleted and absent user IDs stay anonymous rather than guess an author", async () => {
+		for (const createdBy of ["nonexistent-user", null]) {
+			await enqueueBufferedMessage(NARRATOR_ID, "unknown", undefined, undefined, createdBy);
+		}
+		const deletedId = "buffer-deleted-author";
+		db.insert(users)
+			.values({
+				id: deletedId,
+				username: deletedId,
+				passwordHash: "private",
+				createdAt: new Date().toISOString(),
+			})
+			.run();
+		const deleted = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			"deleted",
+			undefined,
+			undefined,
+			deletedId,
+		);
+		db.update(narratorBufferedMessages)
+			.set({ creatorJson: null })
+			.where(eq(narratorBufferedMessages.id, deleted.id))
+			.run();
+		db.delete(users).where(eq(users.id, deletedId)).run();
+		const messages = await getBufferedMessagesAsync(NARRATOR_ID);
+		expect(messages.map((message) => message.creator)).toEqual([null, null, null]);
+		expect(toBufferSummary(messages).map((message) => message.creator)).toEqual([null, null, null]);
+	});
+});
+
+describe("durable queue modes", () => {
+	test("PostgreSQL admission receives hard-front interrupt but FIFO tool ordering", async () => {
+		const admissions: Array<{ mode: string; frontOrder: string }> = [];
+		const admitUserBuffered = async (
+			input: { metadata: { queueMode: string } },
+			ordering: { frontOrder: string },
+		) => {
+			admissions.push({ mode: input.metadata.queueMode, frontOrder: ordering.frontOrder });
+			return { status: "accepted", delivery: { id: `pg-${admissions.length}`, bufferedAt: "now" } };
+		};
+		bindRuntimeQueue({
+			backend: "postgres",
+			queue: { mailbox: { admitUserBuffered } } as unknown as PostgresRuntimeQueue,
+		});
+		const transaction = spyOn(db, "transaction").mockImplementation(() => {
+			throw new Error("Forbidden SQLite admission under PostgreSQL");
+		});
+		try {
+			await enqueue("older tool", "tool");
+			await enqueue("new urgent", "interrupt");
+			await enqueue("later tool", "tool");
+			expect(admissions).toEqual([
+				{ mode: "tool", frontOrder: "fifo" },
+				{ mode: "interrupt", frontOrder: "stack" },
+				{ mode: "tool", frontOrder: "fifo" },
+			]);
+			expect(transaction).not.toHaveBeenCalled();
+		} finally {
+			transaction.mockRestore();
+			bindRuntimeQueue(undefined);
+		}
+	});
+	async function enqueue(text: string, mode: "turn" | "tool" | "interrupt") {
+		return enqueueBufferedMessage(
+			NARRATOR_ID,
+			text,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			mode === "turn" ? "back" : "front",
+			undefined,
+			undefined,
+			"stack",
+			undefined,
+			mode,
+		);
+	}
+	test("urgent admission is hard-front while tool guidance remains FIFO", async () => {
+		await enqueue("ordinary", "turn");
+		await enqueue("first guide", "tool");
+		await enqueue("second guide", "interrupt");
+		const messages = getBufferedMessages(NARRATOR_ID);
+		expect(messages.map((m) => m.text)).toEqual(["second guide", "first guide", "ordinary"]);
+		expect(toBufferSummary(messages).map((m) => m.queueMode)).toEqual([
+			"interrupt",
+			"tool",
+			"turn",
+		]);
+	});
+	test("urgent mode promotes ahead of guidance without retrying failed payload", async () => {
+		const first = await enqueue("first", "turn");
+		const second = await enqueue("second", "tool");
+		await enqueue("third", "turn");
+		db.update(narratorBufferedMessages)
+			.set({ state: "failed", lastError: "test failure" })
+			.where(eq(narratorBufferedMessages.id, first.id))
+			.run();
+		expect(await updateBufferedMessageMode(NARRATOR_ID, first.id, "interrupt")).toBe(true);
+		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.text)).toEqual([
+			"first",
+			"second",
+			"third",
+		]);
+		const failed = getBufferedMessages(NARRATOR_ID).find((m) => m.id === first.id);
+		expect(failed?.state).toBe("failed");
+		expect(failed?.error).toBe("test failure");
+		expect(await updateBufferedMessageMode(NARRATOR_ID, second.id, "turn")).toBe(true);
+		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.text)).toEqual([
+			"first",
+			"third",
+			"second",
+		]);
+	});
+	test("only ordinary rows reorder; claimed messages reject mode mutations", async () => {
+		const guide = await enqueue("guide", "tool");
+		const a = await enqueue("a", "turn");
+		const b = await enqueue("b", "turn");
+		expect(await reorderBufferedMessages(NARRATOR_ID, [b.id, guide.id, a.id])).toBe(false);
+		expect(await reorderBufferedMessages(NARRATOR_ID, [guide.id, b.id, a.id])).toBe(true);
+		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.text)).toEqual(["guide", "b", "a"]);
+		expect(await reorderBufferedMessages(NARRATOR_ID, [a.id, b.id])).toBe(true);
+		db.update(narratorBufferedMessages)
+			.set({ state: "claimed" })
+			.where(eq(narratorBufferedMessages.id, guide.id))
+			.run();
+		expect(await updateBufferedMessageMode(NARRATOR_ID, guide.id, "turn")).toBe(false);
+	});
 });
 
 describe("pushBufferedMessage — loop-less runtime owners can hold a queue", () => {

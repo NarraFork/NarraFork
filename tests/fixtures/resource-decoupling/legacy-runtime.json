@@ -1,0 +1,97 @@
+{
+	"chapter": { "id": "fixture:chapter", "projectId": "fixture:project", "state": "active" },
+	"resources": [
+		{
+			"id": "fixture:container",
+			"kind": "container",
+			"referenceIdentity": "fixture:container-ref",
+			"targetIdentity": "fixture:container-ref",
+			"bindings": {
+				"chapterId": "fixture:chapter",
+				"narratorId": "fixture:narrator",
+				"projectId": "fixture:project"
+			},
+			"ownerNarratorIds": ["fixture:narrator"],
+			"sharedUserIds": ["fixture:user"],
+			"sharedUsersComplete": true,
+			"provenanceComplete": true,
+			"aclRootId": "fixture:acl",
+			"metadataMappingComplete": true,
+			"container": {
+				"state": "stopped",
+				"serviceId": "fixture:service",
+				"composeProjectId": "fixture:compose",
+				"volumePrefixMapped": true,
+				"portIds": ["fixture:port"],
+				"volumeIds": ["fixture:volume"],
+				"referencesComplete": true
+			}
+		},
+		{
+			"id": "fixture:port",
+			"kind": "port",
+			"referenceIdentity": "fixture:port-ref",
+			"targetIdentity": "fixture:port-ref",
+			"bindings": {
+				"chapterId": "fixture:chapter",
+				"narratorId": "fixture:narrator",
+				"projectId": "fixture:project"
+			},
+			"ownerNarratorIds": ["fixture:narrator"],
+			"sharedUserIds": ["fixture:user"],
+			"sharedUsersComplete": true,
+			"provenanceComplete": true,
+			"aclRootId": "fixture:acl",
+			"metadataMappingComplete": true,
+			"port": {
+				"serviceId": "fixture:service",
+				"proxyId": "fixture:proxy",
+				"proxyExpected": true,
+				"containerId": "fixture:container",
+				"referencesComplete": true
+			}
+		},
+		{
+			"id": "fixture:volume",
+			"kind": "volume",
+			"referenceIdentity": "fixture:volume-ref",
+			"targetIdentity": "fixture:volume-ref",
+			"bindings": {
+				"chapterId": "fixture:chapter",
+				"narratorId": "fixture:narrator",
+				"projectId": "fixture:project"
+			},
+			"ownerNarratorIds": ["fixture:narrator"],
+			"sharedUserIds": ["fixture:user"],
+			"sharedUsersComplete": true,
+			"provenanceComplete": true,
+			"aclRootId": "fixture:acl",
+			"metadataMappingComplete": true,
+			"volume": {
+				"ownershipMapped": true,
+				"projectMapped": true,
+				"snapshotId": "fixture:tree",
+				"snapshotApplicationMapped": true,
+				"containerIds": ["fixture:container"]
+			}
+		},
+		{
+			"id": "fixture:legacy",
+			"kind": "legacy-binding",
+			"referenceIdentity": "fixture:legacy-ref",
+			"targetIdentity": "fixture:legacy-ref",
+			"bindings": {
+				"chapterId": "fixture:chapter",
+				"narratorId": "fixture:narrator",
+				"projectId": "fixture:project"
+			},
+			"ownerNarratorIds": ["fixture:narrator"],
+			"sharedUserIds": ["fixture:user"],
+			"sharedUsersComplete": true,
+			"provenanceComplete": true,
+			"aclRootId": "fixture:acl",
+			"metadataMappingComplete": false,
+			"legacy": { "mappingsComplete": false, "mappingReceiptId": null }
+		}
+	]
+}

@@ -7,6 +7,12 @@ import { expandAllowedPoolForDisplay, getSubagentVisibleModels, settings } from 
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
 
+const TAKEOVER_BY_USER_DESCRIPTION =
+	"Set to true to create this subagent directly in user takeover mode for further human interaction. " +
+	"The Agent call returns immediately without requiring run_in_background. The initial prompt still runs, " +
+	"but completion does not notify or wake the parent; the subagent stays taken over until the user explicitly ends takeover. " +
+	"Do not automatically Await this agent.";
+
 const REASONING_EFFORT_DESCRIPTION =
 	'Reasoning/thinking effort for this subagent. Use "none" to disable thinking where supported. ' +
 	'Valid values: "none", "low", "medium", "high", "xhigh", "max" ("max" is only honored by some providers like DeepSeek; other providers clamp it down). ' +
@@ -98,6 +104,7 @@ function buildParameters() {
 			.describe(
 				"Set to true to run this agent in the background. You will be notified when it completes.",
 			),
+		takeover_by_user: z.boolean().optional().describe(TAKEOVER_BY_USER_DESCRIPTION),
 		timeout: looseNumber(
 			"Optional execution timeout for this subagent in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run itself, not Await waiting.",
 		),
@@ -169,6 +176,10 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 			run_in_background: {
 				description:
 					"Set to true to run this agent in the background. You will be notified when it completes.",
+				type: "boolean",
+			},
+			takeover_by_user: {
+				description: TAKEOVER_BY_USER_DESCRIPTION,
 				type: "boolean",
 			},
 			timeout: {
@@ -274,6 +285,7 @@ export const agentTool: ToolDefinition = {
 			description?: string;
 			subagent_type?: string;
 			run_in_background?: boolean;
+			takeover_by_user?: boolean;
 			timeout?: number;
 			model?: string;
 			reasoning_effort?: ReasoningEffort;
@@ -484,6 +496,7 @@ export const agentTool: ToolDefinition = {
 				model: model || undefined,
 				reasoningEffort: reasoning_effort,
 				background: run_in_background || false,
+				takeoverByUser: raw.takeover_by_user === true,
 				timeoutMs: timeout,
 				alias: alias || description || undefined,
 				// The subagent acts on behalf of whoever triggered this parent turn:

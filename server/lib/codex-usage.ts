@@ -36,6 +36,18 @@ export interface CodexUsageWindow {
 	limit_window_seconds?: number;
 }
 
+/**
+ * Spendable Codex credit balance from the `credits` field of the same
+ * /wham/usage response (distinct from rate-limit reset credits). Upstream
+ * represents the balance as a nullable decimal string; keep that
+ * representation verbatim to preserve precision instead of parsing to float.
+ */
+export interface CodexCredits {
+	has_credits: boolean;
+	unlimited: boolean;
+	balance: string | null;
+}
+
 export interface CodexUsageResult {
 	plan_type: string;
 	primary_window?: CodexUsageWindow;
@@ -47,6 +59,11 @@ export interface CodexUsageResult {
 	 * response. Absent when the upstream payload omits the field.
 	 */
 	reset_credits_available?: number;
+	/**
+	 * Spendable credit balance from the `credits` field of the same /wham/usage
+	 * response. Absent when the upstream payload omits the field.
+	 */
+	credits?: CodexCredits;
 	queriedAt: string;
 }
 
@@ -188,6 +205,23 @@ function normalizeCodeReviewWindow(
 	};
 }
 
+export function normalizeCodexCredits(value: unknown): CodexCredits | undefined {
+	if (!isRecord(value)) return undefined;
+	// Keep the decimal balance as a string: parsing it to a float would lose
+	// precision on large or high-precision balances.
+	const balance =
+		typeof value.balance === "string"
+			? value.balance
+			: finiteNumber(value.balance) !== undefined
+				? String(value.balance)
+				: null;
+	return {
+		has_credits: value.has_credits === true,
+		unlimited: value.unlimited === true,
+		balance,
+	};
+}
+
 export function parseCodexUsagePayload(
 	value: unknown,
 	queriedAt = new Date().toISOString(),
@@ -221,6 +255,9 @@ export function parseCodexUsagePayload(
 			result.reset_credits_available = Math.floor(availableCount);
 		}
 	}
+
+	const credits = normalizeCodexCredits(value.credits);
+	if (credits) result.credits = credits;
 
 	if (isRecord(value.code_review_rate_limit)) {
 		const codeReview = normalizeCodeReviewWindow(

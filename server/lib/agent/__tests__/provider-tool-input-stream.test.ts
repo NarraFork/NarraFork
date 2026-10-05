@@ -8,6 +8,7 @@ import {
 	type ResponsesToolAccum,
 } from "../openai-provider";
 import type { ParsedStreamEvent } from "../provider";
+import { ToolInputStream } from "../tool-input-stream";
 
 const config = {
 	id: "input-stream",
@@ -234,6 +235,39 @@ describe("provider incremental tool arguments", () => {
 			),
 		);
 		expect(eof.at(-1)?.toolUseChunk).toMatchObject({ toolUseId: "incomplete", stop: true });
+	});
+
+	test.each([
+		['{"file_path":"x","content":"hi"}', { file_path: "x", content: "hi" }],
+		['{"content":}', { _raw: '{"content":}' }],
+		["", {}],
+	])("Anthropic short input survives native stop: %s", async (raw, expected) => {
+		const events = await collect(
+			parseAnthropicSSEStream(
+				sse([
+					{ type: "message_start", message: { id: "msg-short" } },
+					{
+						type: "content_block_start",
+						index: 0,
+						content_block: { type: "tool_use", id: "short-call", name: "Write", input: {} },
+					},
+					{
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "input_json_delta", partial_json: raw },
+					},
+					{ type: "content_block_stop", index: 0 },
+					{ type: "message_delta", delta: { stop_reason: "tool_use" } },
+					{ type: "message_stop" },
+				]).body as ReadableStream<Uint8Array>,
+			),
+		);
+		expect(events.filter((event) => event.toolUseChunk?.stop)).toHaveLength(1);
+		const stream = new ToolInputStream();
+		for (const event of events) {
+			if (event.toolUseChunk?.input) stream.feed(event.toolUseChunk.input);
+		}
+		expect(stream.finish()).toEqual(expected);
 	});
 
 	test("Chat eager completion, malformed native stop and EOF full-input fallback", async () => {

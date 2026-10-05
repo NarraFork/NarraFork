@@ -928,9 +928,14 @@ export interface BufferMessageSummary {
 	fileReferences?: FileReference[];
 	creator?: BufferCreator | null;
 	priority?: boolean;
+	/** Explicit sending intent; older servers only provide priority. */
+	queueMode?: "turn" | "tool" | "interrupt";
 }
 
 export interface TreeMessage {
+	/** Actual model/provider for this message, not the narrator's current selection. */
+	model?: string | null;
+	provider?: string | null;
 	id: string;
 	narratorId: string;
 	parentToolUseId: string | null;
@@ -1121,6 +1126,13 @@ export interface CodexUsageWindow {
 	window_type: CodexUsageWindowType;
 }
 
+export interface CodexCredits {
+	has_credits: boolean;
+	unlimited: boolean;
+	/** Decimal balance kept as a string to preserve precision. */
+	balance: string | null;
+}
+
 export interface CodexUsageData {
 	plan_type: string;
 	primary_window?: CodexUsageWindow;
@@ -1133,6 +1145,8 @@ export interface CodexUsageData {
 	};
 	/** Rate-limit reset credits available for immediate window resets, when reported upstream. */
 	reset_credits_available?: number;
+	/** Spendable Codex credit balance, when reported upstream. */
+	credits?: CodexCredits;
 	queriedAt: string;
 }
 

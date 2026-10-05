@@ -152,6 +152,9 @@ describe("extractSubagentToPrimary", () => {
 	test("creates an independent primary with materialized history and full ask policy", async () => {
 		seedPrimary("parent");
 		seedSubagent("sub", { parentNarratorId: "parent" });
+		sqlite.run(
+			"UPDATE narrators SET context_system_chars=91,context_tools_chars=73 WHERE id='sub'",
+		);
 		seedSourceMessage("m0", "sub", 0, "found route A");
 		seedSourceMessage("m1", "sub", 1, "found route B");
 
@@ -161,6 +164,8 @@ describe("extractSubagentToPrimary", () => {
 		expect(extracted.type).toBe("primary");
 		expect(extracted.parentNarratorId).toBeNull();
 		expect(extracted.systemPrompt).toBeNull();
+		expect(extracted.contextSystemChars).toBe(0);
+		expect(extracted.contextToolsChars).toBe(0);
 		expect(extracted.chapterId).toBeNull();
 		expect(extracted.permissionMode).toBe("default");
 		expect(extracted.refsInheritedFrom).toBeNull();

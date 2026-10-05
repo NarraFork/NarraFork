@@ -23,6 +23,9 @@
 		"repairFailed": "修复未成功完成，请重新检查或人工处理目录。"
 	},
 	"dockTabs": {
+		"revealInExplorer": "在资源管理器中查看",
+		"revealFailed": "无法打开资源管理器",
+		"openInWindow": "在外部窗口打开",
 		"all": "关闭全部（保留主叙述者）",
 		"left": "关闭左侧",
 		"right": "关闭右侧",
@@ -40,6 +43,10 @@
 	"allow": "允许",
 	"deny": "拒绝",
 	"unknownError": "未知错误",
+	"panelWindow": {
+		"invalidTitle": "无法在外部窗口打开该面板",
+		"invalidDescription": "面板链接无效或来自不兼容的版本。请从应用内重新打开该面板。"
+	},
 	"invalidCredentials": "用户名或密码错误",
 	"authRequired": "请先登录",
 	"tokenExpired": "登录已过期，请重新登录",

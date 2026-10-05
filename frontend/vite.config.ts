@@ -364,6 +364,11 @@ function webManifestAsset(appName: string, shortName: string): Plugin {
 		theme_color: "#1a1b1e",
 		background_color: "#1a1b1e",
 		display: "standalone",
+		// Prefer WCO for installed desktop PWAs: the OS window controls become a
+		// floating overlay and the page paints the whole title-bar strip, so our
+		// (narrower) header can sit beside the buttons. Unsupported browsers fall
+		// back to `display: "standalone"` with no behavioural change.
+		display_override: ["window-controls-overlay"],
 		// Relative, for the same reason as `base: "./"` above: a rooted scope claims the
 		// proxy's whole origin, which both overreaches and is wrong about where the app
 		// lives. The browser resolves these against the manifest's own URL, so under a

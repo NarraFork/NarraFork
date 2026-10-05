@@ -391,7 +391,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					 JOIN chapters c ON c.id = f.id
 					 JOIN projects p ON p.id = c.project_id
 					 WHERE ${where} ${gate}
-					 ORDER BY rank_score LIMIT ${params.add(query.limit)}`,
+					 ORDER BY ${query.sort === "time" ? "COALESCE(c.updated_at, c.created_at) DESC, c.id ASC" : "rank_score"} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
 			} else {
@@ -402,7 +402,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					 FROM chapters c
 					 JOIN projects p ON p.id = c.project_id
 					 WHERE (c.title ILIKE ${needle} OR c.description ILIKE ${needle}) ${gate}
-					 LIMIT ${params.add(query.limit)}`,
+					 ${query.sort === "time" ? "ORDER BY COALESCE(c.updated_at, c.created_at) DESC, c.id ASC" : ""} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
 			}
@@ -438,7 +438,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					 LEFT JOIN chapters c ON c.id = n.chapter_id
 					 LEFT JOIN projects p ON p.id = c.project_id
 					 WHERE ${where} ${gate}
-					 ORDER BY rank_score LIMIT ${params.add(query.limit)}`,
+					 ORDER BY ${query.sort === "time" ? "m.created_at DESC, m.id ASC" : "rank_score"} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
 			} else {
@@ -451,7 +451,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					 LEFT JOIN chapters c ON c.id = n.chapter_id
 					 LEFT JOIN projects p ON p.id = c.project_id
 					 WHERE m.content_text ILIKE ${needle} ${gate}
-					 LIMIT ${params.add(query.limit)}`,
+					 ${query.sort === "time" ? "ORDER BY m.created_at DESC, m.id ASC" : ""} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
 			}
@@ -488,7 +488,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					 LEFT JOIN chapters c ON c.id = n.chapter_id
 					 LEFT JOIN projects p ON p.id = c.project_id
 					 WHERE ${where} ${gate}
-					 ORDER BY rank_score LIMIT ${params.add(query.limit)}`,
+					 ORDER BY ${query.sort === "time" ? "COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : "rank_score"} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
 			} else {
@@ -501,7 +501,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					 LEFT JOIN chapters c ON c.id = n.chapter_id
 					 LEFT JOIN projects p ON p.id = c.project_id
 					 WHERE n.title ILIKE ${needle} ${gate}
-					 LIMIT ${params.add(query.limit)}`,
+					 ${query.sort === "time" ? "ORDER BY COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : ""} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
 			}
@@ -635,6 +635,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 
 		async searchKnowledgeEntries(query: KnowledgeSearchQuery): Promise<KnowledgeSearchRow[]> {
 			const field = knowledgeField(query.field);
+			const order = query.sort === "time" ? "e.updated_at DESC, e.id ASC" : "rank_score";
 			const params = new Params();
 			// Clauses are assembled before the match predicate so parameter order in the
 			// final text is irrelevant — every value is bound positionally by construction.
@@ -654,7 +655,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					 FROM search_knowledge_entries f
 					 JOIN knowledge_entries e ON e.id = f.id
 					 WHERE ${where} ${scope}
-					 ORDER BY rank_score LIMIT ${params.add(query.limit)}`,
+					 ORDER BY ${order} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
 				return rows.map((row) =>
@@ -678,7 +679,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					substr(COALESCE(e.current_content, e.title), 1, ${PREVIEW_CHARS}) AS snippet_raw
 				 FROM knowledge_entries e
 				 WHERE (${raw} = '' OR ${matchExpr}) ${scope}
-				 ORDER BY e.updated_at DESC LIMIT ${params.add(query.limit)}`,
+				 ORDER BY e.updated_at DESC${query.sort === "time" ? ", e.id ASC" : ""} LIMIT ${params.add(query.limit)}`,
 				params,
 			);
 			return rows.map((row) => toKnowledgeRow(row, false, str(row, "snippet_raw") ?? ""));
@@ -689,6 +690,11 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 			const scope =
 				collectionClause(query.collectionId, params) + projectClause(query.projectId, params);
 			const drift = `(d.base_revision_id IS NOT NULL AND d.base_revision_id != e.current_revision_id) AS drifted`;
+			const columns =
+				query.sort === "time"
+					? KNOWLEDGE_ENTRY_COLUMNS.replace("e.updated_at", "d.updated_at")
+					: KNOWLEDGE_ENTRY_COLUMNS;
+			const order = query.sort === "time" ? "d.updated_at DESC, e.id ASC" : "rank_score";
 
 			if (query.strategy === "index") {
 				const terms = queryTerms(query.indexText);
@@ -696,7 +702,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 				const snippet = snippetSql("f.content", terms, KNOWLEDGE_SNIPPET, params);
 				const rank = rankSql(["f.title", "f.content"], params.add(query.indexText));
 				const rows = await run(
-					`SELECT ${KNOWLEDGE_ENTRY_COLUMNS}, ${drift},
+					`SELECT ${columns}, ${drift},
 						${snippet} AS snippet_raw, ${rank} AS rank_score
 					 FROM search_knowledge_drafts f
 					 JOIN knowledge_drafts d ON d.id = f.id
@@ -704,7 +710,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					 WHERE ${where}
 					   AND d.author_user_id = ${params.add(query.authorUserId)}
 					   AND d.status = ${params.add(query.draftStatus)} ${scope}
-					 ORDER BY rank_score LIMIT ${params.add(query.limit)}`,
+					 ORDER BY ${order} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
 				return rows.map((row) =>
@@ -715,14 +721,14 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 			const raw = params.add(query.substringText);
 			const pattern = params.add(escapedContains(query.substringText));
 			const rows = await run(
-				`SELECT ${KNOWLEDGE_ENTRY_COLUMNS}, ${drift},
+				`SELECT ${columns}, ${drift},
 					substr(COALESCE(d.content, e.title), 1, ${PREVIEW_CHARS}) AS snippet_raw
 				 FROM knowledge_drafts d
 				 JOIN knowledge_entries e ON e.id = d.entry_id
 				 WHERE (${raw} = '' OR e.title ILIKE ${pattern} ESCAPE '\\' OR d.content ILIKE ${pattern} ESCAPE '\\')
 				   AND d.author_user_id = ${params.add(query.authorUserId)}
 				   AND d.status = ${params.add(query.draftStatus)} ${scope}
-				 ORDER BY d.updated_at DESC LIMIT ${params.add(query.limit)}`,
+				 ORDER BY d.updated_at DESC${query.sort === "time" ? ", e.id ASC" : ""} LIMIT ${params.add(query.limit)}`,
 				params,
 			);
 			return rows.map((row) => toKnowledgeRow(row, true, str(row, "snippet_raw") ?? ""));

@@ -1,6 +1,10 @@
 import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
 import { eq } from "drizzle-orm";
 import { narratorMessages, narrators, narratorToolCalls } from "../../../server/db/schema";
+import {
+	enterPlanModeTool,
+	shouldDisablePlanReflectionReview,
+} from "../../../server/lib/agent/tools/plan-mode";
 import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
@@ -241,6 +245,80 @@ describe("plan file identity lifecycle", () => {
 	});
 });
 
+describe("disableReflectionReview", () => {
+	it("advertises an optional parameter and accepts the four explicit true values", () => {
+		expect(enterPlanModeTool.parameters.safeParse({}).success).toBe(true);
+		const schema = enterPlanModeTool.rawJsonSchema;
+		expect(schema?.properties).toHaveProperty("disableReflectionReview");
+		for (const value of [true, "true", 1, "1"]) {
+			expect(
+				enterPlanModeTool.parameters.safeParse({ disableReflectionReview: value }).success,
+			).toBe(true);
+			expect(shouldDisablePlanReflectionReview(value)).toBe(true);
+		}
+		for (const value of [undefined, false, "false", 0, "0", "yes", "TRUE", 2, null]) {
+			expect(shouldDisablePlanReflectionReview(value)).toBe(false);
+		}
+	});
+
+	for (const value of [true, "true", 1, "1"]) {
+		for (const override of ["inherit", "on", "off"] as const) {
+			it(`disables only the current narrator for ${JSON.stringify(value)} with ${override}`, async () => {
+				seedNarrator("n1");
+				seedNarrator("n2");
+				db.update(narrators).set({ planReflectionAutoApproveOverride: override }).run();
+				seedPlanToolCall("n1", "reflection-call", "reflection-use");
+				db.update(narratorToolCalls)
+					.set({ inputJson: { disableReflectionReview: value } })
+					.where(eq(narratorToolCalls.id, "reflection-call"))
+					.run();
+				const prepared = await prepareNarratorPlanMode("n1", "reflection-call", "reflection-use");
+				// Preparing/permission approval must not change durable settings.
+				expect(
+					(await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") }))
+						?.planReflectionAutoApproveOverride,
+				).toBe(override);
+				const result = await commitPreparedEnterPlanModeResult("n1", prepared, {
+					output: "entered",
+				});
+				expect(result.planReflectionDisabled).toBe(true);
+				expect(
+					(await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") }))
+						?.planReflectionAutoApproveOverride,
+				).toBe("off");
+				expect(
+					(await db.query.narrators.findFirst({ where: eq(narrators.id, "n2") }))
+						?.planReflectionAutoApproveOverride,
+				).toBe(override);
+				await exitNarratorPlanMode("n1");
+				expect(
+					(await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") }))
+						?.planReflectionAutoApproveOverride,
+				).toBe("off");
+			});
+		}
+	}
+
+	for (const value of [undefined, false, "false", 0, "0"]) {
+		it(`leaves reflection unchanged for ${JSON.stringify(value)}`, async () => {
+			seedNarrator();
+			db.update(narrators).set({ planReflectionAutoApproveOverride: "on" }).run();
+			seedPlanToolCall("n1", "unchanged-call", "unchanged-use");
+			db.update(narratorToolCalls)
+				.set({ inputJson: value === undefined ? {} : { disableReflectionReview: value } })
+				.where(eq(narratorToolCalls.id, "unchanged-call"))
+				.run();
+			const prepared = await prepareNarratorPlanMode("n1", "unchanged-call", "unchanged-use");
+			const result = await commitPreparedEnterPlanModeResult("n1", prepared, { output: "entered" });
+			expect(result.planReflectionDisabled).toBe(false);
+			expect(
+				(await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") }))
+					?.planReflectionAutoApproveOverride,
+			).toBe("on");
+		});
+	}
+});
+
 describe("commitPreparedEnterPlanModeResult", () => {
 	it("atomically persists the tool result and converges concurrent preparations", async () => {
 		seedNarrator();
@@ -269,9 +347,14 @@ describe("commitPreparedEnterPlanModeResult", () => {
 		expect(toolCalls.map((row) => row.status)).toEqual(["success", "success"]);
 	});
 
-	it("rolls back the tool result when the narrator state update fails", async () => {
+	it("rolls back the tool result and reflection override when the narrator state update fails", async () => {
 		seedNarrator();
+		db.update(narrators).set({ planReflectionAutoApproveOverride: "on" }).run();
 		seedPlanToolCall("n1", "tool-call-1", "tool-use-1");
+		db.update(narratorToolCalls)
+			.set({ inputJson: { disableReflectionReview: true } })
+			.where(eq(narratorToolCalls.id, "tool-call-1"))
+			.run();
 		const prepared = await prepareNarratorPlanMode(
 			"n1",
 			"tool-call-1",
@@ -298,6 +381,7 @@ describe("commitPreparedEnterPlanModeResult", () => {
 		expect(narrator?.planMode).toBe(false);
 		expect(narrator?.planFileId).toBeNull();
 		expect(narrator?.traits).not.toContain("plan");
+		expect(narrator?.planReflectionAutoApproveOverride).toBe("on");
 		expect(toolCall?.status).toBe("running");
 		expect(toolCall?.outputJson).toBeNull();
 

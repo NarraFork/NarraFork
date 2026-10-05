@@ -40,6 +40,7 @@
 	"copyCwdNoDir": "无法确定该标签对应的工作目录",
 	"copyCwdSuccess": "已复制工作目录：{{path}}",
 	"copyCwdFailed": "复制工作目录失败",
+	"openInWindow": "在外部窗口打开",
 	"rename": "重命名",
 	"archive": "归档",
 	"totalOutputChars": "AI 输出总字符数",

@@ -1,5 +1,5 @@
 import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
-import { Box, Center, Drawer, Group, Loader, Text } from "@mantine/core";
+import { Alert, Box, Center, Drawer, Group, Loader, Text } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import {
 	createFileRoute,
@@ -16,6 +16,7 @@ import { ChapterForkModal } from "../../components/chapter/ChapterForkModal";
 import { clearHighlightCache } from "../../components/narrator/markdown/highlight-cache";
 import { serializeSeedEnvelope } from "../../components/narrator/panels/layout-envelope";
 import { twoNarratorWorkspaceSeed } from "../../components/narrator/workspace/dockview-layout";
+import { legacyRouteErrorKey } from "../../components/project/legacy-chapter-redirect";
 import { clearShikiTokenCache } from "../../lib/shiki-token-cache";
 
 // Lazy-loaded heavy panels — not needed for first paint (mobile drawers)
@@ -60,6 +61,7 @@ import {
 	type PanelDragState,
 } from "../../lib/panel-drag";
 import {
+	APP_SHELL_CONTENT_HEIGHT,
 	APP_SHELL_FULL_BLEED_HEIGHT,
 	SAFE_AREA_DRAWER_BODY_STYLE,
 	safeAreaDrawerBodyHeight,
@@ -108,6 +110,8 @@ function NarratorDetailPage() {
 	// biome-ignore lint/suspicious/noExplicitAny: loose search params
 	const search = useSearch({ strict: false }) as any;
 	const from = search?.from as string | undefined;
+	const workspaceId = search?.workspaceId as string | undefined;
+	const fromWorkspace = from === "workspace" && !!workspaceId;
 	const scrollToMessageId = search?.scrollTo as string | undefined;
 	const location = useLocation();
 	const hashMessageId = location.hash?.startsWith("msg-") ? location.hash.slice(4) : undefined;
@@ -116,7 +120,12 @@ function NarratorDetailPage() {
 	const isMobile = useMobileViewport();
 
 	// Fetch narrator data for recent tab tracking
-	const { data: narrator } = useNarrator(narratorId);
+	const {
+		data: narrator,
+		error: narratorError,
+		isLoading: narratorLoading,
+	} = useNarrator(narratorId);
+	const { t: tns } = useTranslation("narrators");
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const isSubagent = !!(narrator as any)?.variant?.startsWith("subagent:");
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -290,9 +299,14 @@ function NarratorDetailPage() {
 	}, [navigate, projectId, chapterId]);
 	const showMinimize = from === "graph" && !!projectId && !!chapterId;
 
-	// Subagent back navigation: return to parent narrator, or to graph if opened from graph
+	// Return to the originating workspace before applying subagent navigation defaults.
 	const onBack = useCallback(() => {
-		if (isSubagent) {
+		if (fromWorkspace && workspaceId) {
+			navigate({
+				to: "/narrators/workspace/$workspaceId",
+				params: { workspaceId },
+			});
+		} else if (isSubagent) {
 			if (from === "graph" && parentProjectId && parentChapterId) {
 				navigate({
 					to: "/projects/$projectId",
@@ -311,7 +325,16 @@ function NarratorDetailPage() {
 		} else {
 			navigate({ to: ".." });
 		}
-	}, [isSubagent, from, parentProjectId, parentChapterId, parentNarratorId, navigate]);
+	}, [
+		fromWorkspace,
+		workspaceId,
+		isSubagent,
+		from,
+		parentProjectId,
+		parentChapterId,
+		parentNarratorId,
+		navigate,
+	]);
 
 	const [forkMessageId, setForkMessageId] = useState<string | null>(null);
 	const handleForkFromMessage = useCallback(
@@ -433,6 +456,19 @@ function NarratorDetailPage() {
 		pageBoxRef.current = el;
 	}, []);
 
+	if (narratorLoading)
+		return (
+			<Center h={APP_SHELL_CONTENT_HEIGHT}>
+				<Loader />
+			</Center>
+		);
+	if (narratorError || !narrator)
+		return (
+			<Alert color="red">
+				{tns(`legacyRoute.${narratorError ? legacyRouteErrorKey(narratorError) : "missing"}`)}
+			</Alert>
+		);
+
 	// The provider and portal owner never cross the responsive identity boundary.
 	return (
 		<NarratorDockProvider
@@ -441,7 +477,7 @@ function NarratorDetailPage() {
 			chapterId={chapterId}
 			onForkFromMessage={chapterId ? handleForkFromMessage : null}
 			highlightMessageId={highlightMessageId}
-			onBack={isSubagent ? onBack : null}
+			onBack={isSubagent || fromWorkspace ? onBack : null}
 			onMinimize={showMinimize ? onMinimize : null}
 		>
 			<Box
@@ -488,7 +524,7 @@ function NarratorDetailPage() {
 										: undefined
 								}
 								onMinimize={showMinimize ? onMinimize : undefined}
-								onBack={isSubagent ? onBack : undefined}
+								onBack={isSubagent || fromWorkspace ? onBack : undefined}
 								specPanelOpen={isMobile ? specDrawerOpened : undefined}
 								onToggleSpecPanel={
 									isMobile ? (specDrawerOpened ? closeSpecDrawer : openSpecDrawer) : undefined

@@ -86,6 +86,7 @@ import type {
 	ToolStructuredEntry,
 } from "@shared/pretext-layout/tool-detail";
 import { ASK_OPTIONS_MAX, ASK_QUESTIONS_MAX } from "@shared/pretext-layout/tool-detail";
+import { sharePreviewHeight } from "@shared/share-preview";
 
 export type {
 	DetailCapKind,
@@ -207,6 +208,7 @@ export type ToolCategory =
 	| "browser"
 	| "knowledge"
 	| "contextAsk"
+	| "workspace"
 	| "generic";
 
 /** Tool-call status (subset of the live statuses that affect the height model). */
@@ -1790,7 +1792,10 @@ export function measureToolBody(
 				};
 			}
 			const diffGutterChars = diffGutterWidthChars(detail.diffDocument);
-			const media = mediaContentPx(detail.media, detail.contentPx, innerWidth, cap);
+			const media =
+				detail.sharePreview && detail.sharePreview.kind !== "image"
+					? { contentPx: sharePreviewHeight(detail.sharePreview.kind, innerWidth), fit: null }
+					: mediaContentPx(detail.media, detail.contentPx, innerWidth, cap);
 			const capped = detail.diffDocument
 				? measureDiffDocumentHeight(detail.diffDocument, cap, innerWidth)
 				: cappedBodyHeight(

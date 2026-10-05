@@ -194,7 +194,7 @@ fsRoutes.post("/mkdir", async (c) => {
  *
  * - macOS: `open <path>`
  * - Windows: `explorer <path>`
- * - Linux: not supported (returns 400)
+ * - Linux desktop: `xdg-open <path>` (requires xdg-utils)
  */
 fsRoutes.post("/reveal", async (c) => {
 	const body = await c.req.json<{ path?: string }>();
@@ -218,13 +218,25 @@ fsRoutes.post("/reveal", async (c) => {
 	} else if (IS_WINDOWS) {
 		cmd = "explorer";
 		args = [absPath];
+	} else if (IS_LINUX) {
+		cmd = "xdg-open";
+		args = [absPath];
 	} else {
 		throw new ValidationError("Opening file manager is not supported on this platform");
 	}
 
-	// Fire-and-forget — don't wait for the file manager to close
-	const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
-	child.unref();
+	// Wait only for launch, not for the desktop window to close. Handle ENOENT
+	// (e.g. missing xdg-utils) as an API error rather than an unhandled child error.
+	await new Promise<void>((resolve, reject) => {
+		const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
+		child.once("error", (error) => {
+			reject(new AppError(`Could not launch file manager (${cmd}): ${error.message}`, 500));
+		});
+		child.once("spawn", () => {
+			child.unref();
+			resolve();
+		});
+	});
 
 	return c.json({ ok: true });
 });

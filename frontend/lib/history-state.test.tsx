@@ -709,7 +709,7 @@ describe("mobile Back sentinel entries", () => {
 		// interception reached desktop even though the overlays themselves are mobile-only.
 		const sources = await Promise.all(
 			[
-				"../components/AppRootLayout.tsx",
+				"../components/AuthenticatedAppLayout.tsx",
 				"../routes/narrators/$narratorId.tsx",
 				"../components/narrator/content/ContentViewer.tsx",
 				"../hooks/useMobileDrawerHistory.ts",

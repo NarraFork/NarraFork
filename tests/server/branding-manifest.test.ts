@@ -21,6 +21,7 @@ const STATIC_MANIFEST = JSON.stringify({
 	description: "AI-powered collaborative programming with narrative forking",
 	start_url: "/",
 	display: "standalone",
+	display_override: ["window-controls-overlay"],
 	background_color: "#1a1b1e",
 	theme_color: "#1a1b1e",
 	lang: "en",
@@ -41,6 +42,7 @@ interface WebManifest {
 	start_url?: string;
 	scope?: string;
 	display?: string;
+	display_override?: string[];
 	lang?: string;
 	icons: Array<{ src: string; sizes: string; type: string; purpose?: string }>;
 }
@@ -129,6 +131,9 @@ describe("brandManifestJson", () => {
 		expect(manifest.start_url).toBe("/");
 		expect(manifest.scope).toBe("/");
 		expect(manifest.display).toBe("standalone");
+		// WCO opt-in must survive branding verbatim — the frontend layout adapts to
+		// it (styles/wco.css), so a rewrite that dropped it would desync the two.
+		expect(manifest.display_override).toEqual(["window-controls-overlay"]);
 		expect(manifest.lang).toBe("en");
 	});
 

@@ -438,6 +438,7 @@ function UserBubble({
 						);
 					}
 					if (block.tag === "user-markdown") {
+						const body = block.data?.measured as MeasuredElement;
 						return (
 							<div
 								key="user-markdown"
@@ -445,15 +446,16 @@ function UserBubble({
 									position: "absolute",
 									top,
 									left: USER_BUBBLE_PADDING,
-									width: measured.contentWidth,
+									width: body.contentWidth,
 									height: block.height,
-									// Unknown Markdown media stays scrollable inside the exact box;
-									// it must not resize an already committed chat row.
-									overflow: "auto",
+									// This is an exact-height body, not a scroll viewport. Native
+									// scrollbars consume its reserved text line on classic-scrollbar
+									// platforms. Tables/code own their overflow inside Markdown.
+									overflow: "hidden",
 								}}
 							>
 								<FileReferenceScopeProvider value={{ context: null }}>
-									<RenderMarkdown measured={block.data?.measured as MeasuredElement} />
+									<RenderMarkdown measured={body} />
 								</FileReferenceScopeProvider>
 							</div>
 						);

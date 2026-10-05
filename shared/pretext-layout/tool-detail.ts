@@ -14,6 +14,7 @@
  */
 
 import { hasUsablePlanBody } from "../plan-reference";
+import { classifySharePreview, type SharePreviewRef, sharePreviewHeight } from "../share-preview";
 import { readBackgroundTaskId, stripAwaitAgentEnvelope } from "../subagent-result-text";
 import {
 	deriveToolProgress,
@@ -44,6 +45,7 @@ import {
 	type SourceTextRange,
 } from "./source-text";
 import { hasTruncatedLeaf, readLeafText, stringifyForDisplay } from "./tool-io-projection";
+import { workspaceObject, workspaceSummary, workspaceText } from "./workspace-tool-display";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Canonical tool-detail bodies and ordered sections.
@@ -199,6 +201,8 @@ export interface ToolCappedDetail {
 	 * aspect-fitted content height over the fixed fallback).
 	 */
 	media?: ToolMediaRef;
+	/** Typed share body; never route non-images through VListImage. */
+	sharePreview?: SharePreviewRef;
 	/**
 	 * True when `text` is only a PREFIX of the real body (a truncated leaf).
 	 *
@@ -1011,6 +1015,8 @@ function classifyByCategory(
 			return classifyKnowledge(toolName, inputJson, outputJson, metadata);
 		case "contextAsk":
 			return classifyContextAsk(inputJson, outputJson, metadata, status);
+		case "workspace":
+			return classifyWorkspace(toolName, inputJson, outputJson, input.labels, metadata);
 		default:
 			return classifyGeneric(inputJson, outputJson);
 	}
@@ -1472,11 +1478,12 @@ function classifyBash(
 			undefined,
 			backgroundTaskId
 				? metaRows([
-						badgeRow(
-							chips([chip(backgroundTaskId, "blue")]),
-							labels?.backgroundTaskStarted ??
+						{
+							text:
+								labels?.backgroundTaskStarted ??
 								"Started in the background; see Background tasks for progress.",
-						),
+							dimmed: true,
+						},
 					])
 				: null,
 		),
@@ -2626,6 +2633,12 @@ function classifyShare(
 	}
 	const filename = readLeafText(metadata.filename) ?? "file";
 	const downloadUrl = metadata.downloadUrl;
+	const capability =
+		metadata.previewType === "unsupported" ||
+		metadata.compressed === true ||
+		metadata.isDirectory === true
+			? { kind: "unsupported" as const, mime: "application/octet-stream" }
+			: classifySharePreview(filename);
 	const sizeFormatted = readLeafText(metadata.sizeFormatted);
 	const fileCount = typeof metadata.fileCount === "number" ? metadata.fileCount : undefined;
 	const expiryHours = typeof metadata.expiryHours === "number" ? metadata.expiryHours : undefined;
@@ -2646,7 +2659,10 @@ function classifyShare(
 					"violet",
 				),
 				chip(fileCount != null && fileCount > 0 ? `${fileCount} files` : undefined, "cyan"),
-				chip(metadata.preview === true ? "preview" : undefined, "teal"),
+				chip(
+					metadata.preview === true && capability.kind !== "unsupported" ? "preview" : undefined,
+					"teal",
+				),
 				chip(expiryHours != null ? `${expiryHours}h` : undefined, "yellow"),
 			]),
 			actions: [
@@ -2655,8 +2671,20 @@ function classifyShare(
 			],
 		},
 	]);
-	const sharePreviewUrl = readLeafText(metadata.previewUrl);
-	if (metadata.preview === true && sharePreviewUrl !== undefined) {
+	const legacyRequested =
+		!Object.hasOwn(metadata, "previewRequested") &&
+		inputJson !== null &&
+		typeof inputJson === "object" &&
+		(inputJson as Record<string, unknown>).preview === true;
+	const previewRequested = metadata.previewRequested === true || legacyRequested;
+	const sharePreviewUrl =
+		readLeafText(metadata.previewUrl) ??
+		(previewRequested &&
+		capability.kind !== "unsupported" &&
+		/^\/api\/shares\/[\w-]+$/.test(downloadUrl)
+			? `${downloadUrl}/preview`
+			: undefined);
+	if ((metadata.preview === true && sharePreviewUrl !== undefined) || previewRequested) {
 		return sections([
 			section("meta.share", undefined, header),
 			section(
@@ -2664,8 +2692,30 @@ function classifyShare(
 				undefined,
 				capped("output.main", "media", {
 					format: "media",
-					contentPx: MEDIA_IMAGE_CONTENT_PX,
-					media: { previewUrl: sharePreviewUrl, filename, ...mediaDimensions(metadata) },
+					contentPx:
+						capability.kind === "image"
+							? MEDIA_IMAGE_CONTENT_PX
+							: sharePreviewHeight(capability.kind, 480),
+					...(capability.kind === "image"
+						? { media: { previewUrl: sharePreviewUrl, filename, ...mediaDimensions(metadata) } }
+						: {}),
+					sharePreview: {
+						...capability,
+						filename,
+						url: sharePreviewUrl,
+						downloadUrl,
+						expiresAt: readLeafText(metadata.expiresAt),
+						reason:
+							metadata.previewReason === "tooLarge"
+								? "tooLarge"
+								: metadata.previewReason === "compressed" ||
+										metadata.compressed === true ||
+										metadata.isDirectory === true
+									? "compressed"
+									: capability.kind === "unsupported"
+										? "unsupported"
+										: undefined,
+					},
 				}),
 			),
 		]);
@@ -3263,4 +3313,93 @@ function classifyContextAsk(
 			),
 		]) ?? { kind: "sections", sections: [] }
 	);
+}
+
+/** Workspace cards deliberately use plain rows, not protocol dumps or badge strips. */
+function classifyWorkspace(
+	toolName: string,
+	input: unknown,
+	output: unknown,
+	labels?: Record<string, string>,
+	metadata?: Record<string, unknown> | null,
+): ToolDetailData | null {
+	const args = workspaceObject(input);
+	const envelope = workspaceObject(output);
+	const raw = envelope && "_text" in envelope ? envelope._text : output;
+	const result = workspaceObject(raw) ?? workspaceObject(tryParseJson(readLeafText(raw)));
+	const rows: ToolMetaRow[] = [];
+	const text = (key: Parameters<typeof workspaceText>[0]) => workspaceText(key, labels);
+	const pathRow = (path: unknown, branch?: unknown) => {
+		const value = readLeafText(path);
+		if (!value) return;
+		const name = readLeafText(branch)?.replace(/^refs\/heads\//, "");
+		rows.push({ text: name ? `${name} · ${value}` : value, mono: true });
+	};
+	let handled = false;
+	if (toolName === "Worktree") {
+		if (readLeafText(args?.action) === "list") {
+			const list = workspaceObject(metadata?.workspaceWorktrees) ?? result;
+			if (Array.isArray(list?.entries)) {
+				rows.push({ text: text("workspaceList") });
+				for (const entry of list.entries) {
+					const item = workspaceObject(entry);
+					pathRow(
+						item?.path,
+						item?.branch ?? (item?.detached ? text("workspaceDetached") : undefined),
+					);
+				}
+				if (!list.entries.length) rows.push({ text: text("workspaceEmpty") });
+				if (list.truncated === true) rows.push({ text: text("workspaceTruncated") });
+				handled = true;
+			} else rows.push({ text: text("workspaceList") });
+		} else {
+			const worktree = workspaceObject(result?.worktree);
+			const outcome = readLeafText(result?.outcome);
+			rows.push({
+				text:
+					outcome === "created"
+						? text("workspaceCreated")
+						: outcome === "failed"
+							? text("workspaceFailed")
+							: outcome === "unknown"
+								? text("workspaceUnknown")
+								: text("workspaceCreate"),
+			});
+			pathRow(
+				worktree?.path ?? args?.destinationPath,
+				worktree?.branch ?? workspaceObject(args?.branch)?.name,
+			);
+			handled = ["created", "failed", "unknown"].includes(outcome ?? "");
+		}
+	} else if (toolName === "SwitchWorkingDirectory") {
+		const previous = workspaceObject(result?.previous);
+		const current = workspaceObject(result?.current);
+		const target = current ?? workspaceObject(args?.target);
+		rows.push({
+			text:
+				result?.changed === true
+					? text("workspaceChanged")
+					: result?.changed === false
+						? text("workspaceUnchanged")
+						: text("workspaceSwitch"),
+		});
+		const from = readLeafText(previous?.cwd);
+		const to = readLeafText(target?.cwd);
+		if (to) rows.push({ text: from && from !== to ? `${from} → ${to}` : to, mono: true });
+		const device = readLeafText(target?.deviceId);
+		if (device && device !== "local") rows.push({ text: device, mono: true });
+		handled = typeof result?.changed === "boolean";
+	} else {
+		rows.push({ text: workspaceSummary(toolName, input, labels) });
+	}
+	const error = workspaceObject(result?.error);
+	const message = readLeafText(error?.message) ?? readLeafText(result?.error);
+	if (message) {
+		rows.push({ text: message, dimmed: false });
+		handled = true;
+	}
+	return sections([
+		section("meta.workspace", undefined, metaRows(rows)),
+		...(!handled ? [textSection("output.main", output, "output")] : []),
+	]);
 }

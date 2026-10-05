@@ -1,15 +1,15 @@
 import { resolve } from "node:path";
 import {
+	confirmedDiskFullEvidence,
 	type DiskAssessment,
 	DiskSpaceError,
 	type DiskSpaceMonitor,
 	diskSafetySettings,
 	diskSpaceMonitor,
-	isDiskFullError,
 } from "../disk-safety";
 import type { DiskSafetySettings } from "../disk-safety-config";
 import { getNarraforkHome } from "../narrafork-home";
-import type { ToolContext, ToolResult } from "./types";
+import type { ToolContext } from "./types";
 
 const READ_ONLY_TOOLS = new Set([
 	"Read",
@@ -173,37 +173,19 @@ export async function checkToolDiskSafety(
 
 export function diskToolError(
 	error: unknown,
-	path: string,
 	locale: string,
+	localFilesystem: boolean,
 ): { output: string; fatal?: boolean; metadata?: Record<string, unknown> } | null {
 	let diskError = error instanceof DiskSpaceError ? error : null;
-	if (!diskError && isDiskFullError(error)) {
-		let text = "";
-		let current = error;
-		for (let depth = 0; depth < 4 && current != null; depth++) {
-			if (typeof current === "string") {
-				text += current.slice(-8192);
-				break;
-			}
-			if (typeof current !== "object") break;
-			const item = current as { code?: unknown; message?: unknown; cause?: unknown };
-			text += `${String(item.code ?? "")} ${String(item.message ?? "").slice(-8192)} `;
-			current = item.cause;
-		}
-		const storagePath =
-			path.startsWith("spec://") || /SQLITE_FULL|database or disk is full/i.test(text)
-				? getNarraforkHome()
-				: path;
-		diskSpaceMonitor.noteDiskFull(storagePath);
-		diskError = new DiskSpaceError(
-			storagePath,
-			null,
-			undefined,
-			true,
-			storagePath === getNarraforkHome(),
-		);
+	if (!diskError) {
+		const evidence = confirmedDiskFullEvidence(error);
+		// A native SQLite FULL proves a database failure, not which database or
+		// partition failed. Only an explicitly attributed application-DB boundary
+		// below may promote it to a host DiskSpaceError. Never guess from cwd.
+		if (!evidence || evidence.kind !== "filesystem" || !localFilesystem) return null;
+		diskError = new DiskSpaceError(evidence.path, null, undefined, true);
 	}
-	if (!diskError) return null;
+	if (diskError.occurred) diskSpaceMonitor.noteDiskFull(diskError.path);
 	return {
 		output: diskError.describe(locale),
 		fatal: diskError.fatal || undefined,
@@ -219,19 +201,23 @@ export function diskToolError(
 	};
 }
 
-export function normalizeDiskToolResult(
-	result: ToolResult,
-	path: string,
-	locale: string,
-): ToolResult {
-	if (!result.isError || !isDiskFullError(result.output)) return result;
-	const normalized = diskToolError(result.output, path, locale);
-	if (!normalized) return result;
-	return {
-		...result,
-		...normalized,
-		fatal: result.fatal || normalized.fatal,
-		output: `${normalized.output}\n\n${result.output}`,
-		metadata: { ...result.metadata, ...normalized.metadata },
-	};
+export function rethrowConfirmedToolDiskError(
+	error: unknown,
+	ctx: ToolContext,
+	hostDatabase = false,
+): void {
+	if (error instanceof DiskSpaceError) throw error;
+	const evidence = confirmedDiskFullEvidence(error);
+	if (!evidence) return;
+	if (evidence.kind === "sqlite") {
+		// Explicit attribution by Write/Edit/StructSed: their in-process SQLite
+		// operations use the application database, not a user/project database.
+		if (hostDatabase) {
+			const failure = new DiskSpaceError(getNarraforkHome(), null, undefined, true, true);
+			failure.cause = error;
+			throw failure;
+		}
+		return;
+	}
+	if (ctx.executionTarget?.backendKind === "local") throw error;
 }

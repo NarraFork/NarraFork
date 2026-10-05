@@ -33,7 +33,6 @@ import {
 	useCallback,
 	useContext,
 	useEffect,
-	useMemo,
 	useRef,
 	useState,
 } from "react";
@@ -53,7 +52,7 @@ import { api } from "../../../lib/api";
 import { readSession, writeSession } from "../../../lib/session-store";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import { InlinePermission } from "../permission/InlinePermission";
-import { FileModDrawerCtx, PermEnterHintCtx } from "../tool-call/tool-call-contexts";
+import { PermEnterHintCtx } from "../tool-call/tool-call-contexts";
 import { AskUserQuestionBanner, coerceQuestions } from "./AskUserQuestionBanner";
 import { toBannerQuestions } from "./async-question-questions";
 
@@ -807,8 +806,6 @@ function ReviewMarkdown({ label, value }: { label: string; value: string }) {
 
 function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
 	const { t } = useTranslation("narrator");
-	const navigate = useNavigate();
-	const onClose = useContext(CloseAttentionContext);
 	const client = useQueryClient();
 	const query = useHumanAttentionDetail(summary.id);
 	const item = query.data?.item ?? summary;
@@ -862,16 +859,6 @@ function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
 			/* Inline retry notice keeps the request and draft. */
 		}
 	};
-	const fileDrawer = useMemo(
-		() => ({
-			// The inbox has no workspace file drawer; open the ACTUAL owner rather than a noop or parent.
-			openForApproval: () => {
-				void navigate({ to: "/narrators/$narratorId", params: { narratorId: item.narratorId } });
-				onClose();
-			},
-		}),
-		[item.narratorId, navigate, onClose],
-	);
 
 	if (query.isLoading) return <Text size="sm">{t("humanAttentionLoading")}</Text>;
 	if (query.isError)
@@ -974,23 +961,21 @@ function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
 						onReflect={() => void run(() => api.reflectQuestion(item.requestId))}
 					/>
 				) : permission && !readOnly ? (
-					<FileModDrawerCtx.Provider value={fileDrawer}>
-						<InlinePermission
-							permission={{ ...permission, id: item.requestId }}
-							onPlanPreviewChange={preview}
-							onDecision={(_id, decision, feedbackText, compactAfter, updatedPlan) =>
-								void run(() =>
-									decision === "allow"
-										? api.approvePermission(item.requestId, {
-												feedbackText,
-												compactAfter,
-												updatedPlan,
-											})
-										: api.denyPermission(item.requestId, { feedbackText }),
-								)
-							}
-						/>
-					</FileModDrawerCtx.Provider>
+					<InlinePermission
+						permission={{ ...permission, id: item.requestId }}
+						onPlanPreviewChange={preview}
+						onDecision={(_id, decision, feedbackText, compactAfter, updatedPlan) =>
+							void run(() =>
+								decision === "allow"
+									? api.approvePermission(item.requestId, {
+											feedbackText,
+											compactAfter,
+											updatedPlan,
+										})
+									: api.denyPermission(item.requestId, { feedbackText }),
+							)
+						}
+					/>
 				) : null}
 			</Box>
 		</Stack>

@@ -33,6 +33,7 @@ import { collectMergeContext, mergeSummaryService } from "./merge-summary-servic
 import { startSession } from "./narrator-session";
 import { parkUncommittedWork, reapplyParkedWork, restoreParkedWork } from "./snapshot-dirty-git-op";
 import { terminalService } from "./terminal-service";
+import { isResourceProtectionError, withLegacyRetirement } from "./worktree-lifecycle-guard";
 import { SNAPSHOT_HEAD_REF, worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 export interface MergeCheckResult {
@@ -182,6 +183,7 @@ async function readRealHeadShaForGuard(targetWorktree: string): Promise<string |
 		if (sha) return sha;
 		// Resolved to empty: treat as unreadable, not as empty-repo.
 	} catch (err) {
+		if (isResourceProtectionError(err)) throw err;
 		if (await isUnbornHead(targetWorktree)) return null;
 		throw new ValidationError(
 			`Cannot abort snapshot merge: failed to read HEAD in ${targetWorktree}: ` +
@@ -263,6 +265,7 @@ async function autoCommitSourceBeforeMerge(
 				source: "auto",
 			});
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			logger.warn("Failed to record pre-merge auto-commit (non-fatal)", {
 				sourceChapterId: source.id,
 				commitSha: normalizedSha,
@@ -386,6 +389,7 @@ async function persistParkedWork(
 			baseTree: parked.baseTree,
 		});
 	} catch (err) {
+		if (isResourceProtectionError(err)) throw err;
 		logger.error("Could not record where uncommitted work was parked", {
 			chapterId,
 			snapshotCommitSha: parked.commitSha,
@@ -405,6 +409,7 @@ async function clearPersistedParkedWork(chapterId: string): Promise<void> {
 	try {
 		await chapterWriteStore.setChapterParkedWork({ chapterId, commitSha: null, baseTree: null });
 	} catch (err) {
+		if (isResourceProtectionError(err)) throw err;
 		logger.error("Could not clear a chapter's parked-work coordinates", {
 			chapterId,
 			error: String(err),
@@ -530,6 +535,7 @@ async function cleanUpConflictedMerge(
 			await gitService.mergeAbort(targetWorktree);
 			return (await verifyAndRecord()) ?? {};
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			// Logged rather than swallowed, then handled by falling through. A non-squash
 			// merge that cannot be aborted is either already abandoned or in a state only
 			// the harder cleanups can address.
@@ -548,6 +554,7 @@ async function cleanUpConflictedMerge(
 		await gitService.resetMergeUnlocked(targetWorktree, preMergeTargetSha);
 		return (await verifyAndRecord()) ?? {};
 	} catch (err) {
+		if (isResourceProtectionError(err)) throw err;
 		logger.warn("git reset --merge refused; falling back to a hard reset", {
 			targetWorktree,
 			strategy,
@@ -564,6 +571,7 @@ async function cleanUpConflictedMerge(
 		// Unlocked: the caller owns `worktreeLock` for this worktree (see the doc comment).
 		await gitService.resetHardUnlocked(targetWorktree, preMergeTargetSha);
 	} catch (err) {
+		if (isResourceProtectionError(err)) throw err;
 		logger.error("Could not clean up a conflicted merge; the target worktree is left dirty", {
 			targetWorktree,
 			strategy,
@@ -748,6 +756,7 @@ async function markMergedSnapshot(
 				await terminalService.cleanupForChapter(sourceChapterId);
 				await gitService.removeWorktree(gitPath, source.worktreePath);
 			} catch (err) {
+				if (isResourceProtectionError(err)) throw err;
 				logger.warn("Failed to clean up source worktree after snapshot merge", {
 					sourceChapterId,
 					error: String(err),
@@ -764,6 +773,7 @@ async function markMergedSnapshot(
 				mergeSnapshotCommitSha: snapshot.mergeSnapshotCommitSha,
 			});
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			logger.error("Failed to create merge edge after snapshot merge (non-fatal)", {
 				sourceChapterId,
 				targetChapterId,
@@ -1058,6 +1068,7 @@ export const chapterMerge = {
 						identity,
 					);
 				} catch (err) {
+					if (isResourceProtectionError(err)) throw err;
 					if (parked) {
 						await restoreParkedWork(targetWorktree, parked);
 						// The bytes are back on disk, so the debt is discharged and a stale pointer
@@ -1309,6 +1320,7 @@ export const chapterMerge = {
 					status: "pending",
 				});
 			} catch (err) {
+				if (isResourceProtectionError(err)) throw err;
 				logger.warn("Failed to create pending merge edge (non-fatal)", {
 					sourceChapterId: source.id,
 					targetChapterId: target.id,
@@ -1567,6 +1579,7 @@ export const chapterMerge = {
 					},
 				);
 			} catch (err) {
+				if (isResourceProtectionError(err)) throw err;
 				logger.warn("Failed to create pending merge edge (non-fatal)", {
 					sourceChapterId,
 					targetChapterId: input.targetChapterId,
@@ -1798,6 +1811,7 @@ export const chapterMerge = {
 				const resolvedTree = await worktreeTreeSnapshot.capture(targetWorktree);
 				return finish(resolvedTree, plan.sourceSnapshot);
 			} catch (err) {
+				if (isResourceProtectionError(err)) throw err;
 				logger.error("AI conflict resolution failed (snapshot mode)", { error: String(err) });
 				try {
 					// Same fresh-coordinate compensation as above. Residual risk: a concurrent
@@ -2003,6 +2017,7 @@ export const chapterMerge = {
 					preMergeTargetSha,
 				);
 			} catch (err) {
+				if (isResourceProtectionError(err)) throw err;
 				logger.error("AI conflict resolution failed", { error: String(err) });
 				// The cleanup is reported rather than best-effort-and-silent: `autoCommit`
 				// now throws mid-conflict instead of committing markers, so this branch is
@@ -2059,6 +2074,7 @@ export const chapterMerge = {
 				await terminalService.cleanupForChapter(sourceChapterId);
 				await gitService.removeWorktree(gitPath, source.worktreePath);
 			} catch (err) {
+				if (isResourceProtectionError(err)) throw err;
 				logger.warn("Failed to clean up source worktree after merge", {
 					sourceChapterId,
 					error: String(err),
@@ -2080,6 +2096,7 @@ export const chapterMerge = {
 					},
 				);
 			} catch (err) {
+				if (isResourceProtectionError(err)) throw err;
 				// Edge is auxiliary data — log but don't fail the merge operation,
 				// otherwise the retry path in merge() could create duplicate edges.
 				logger.error("Failed to create merge edge (non-fatal)", {
@@ -2108,6 +2125,7 @@ export const chapterMerge = {
 					source: strategy === "cherry-pick" ? "cherry_pick" : "merge",
 				});
 			} catch (err) {
+				if (isResourceProtectionError(err)) throw err;
 				logger.warn("Failed to record merge commit (non-fatal)", {
 					targetChapterId,
 					commitSha,
@@ -2270,6 +2288,7 @@ export const chapterMerge = {
 						revertSha,
 					});
 				} catch (err) {
+					if (isResourceProtectionError(err)) throw err;
 					// A ValidationError from the branch above must not be reshaped into a
 					// conflict message, but that branch throws outside this try. What reaches
 					// here is a git failure, and the revert methods already abort their own
@@ -2293,6 +2312,7 @@ export const chapterMerge = {
 		try {
 			await commitSyncService.syncChapterCommits(target.id);
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			logger.warn("Failed to sync target commits after unmerge (non-fatal)", {
 				targetChapterId: target.id,
 				error: String(err),
@@ -2327,6 +2347,7 @@ export const chapterMerge = {
 		try {
 			await chapterEdgeService.deleteMergeEdgesBySource(sourceChapterId);
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			logger.warn("Failed to remove merge edges during unmerge", {
 				sourceChapterId,
 				error: String(err),
@@ -2351,6 +2372,7 @@ export const chapterMerge = {
 				}
 			}
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			logger.warn("Failed to clean up merge summary messages during unmerge", {
 				sourceChapterId,
 				error: String(err),
@@ -2476,6 +2498,7 @@ export const chapterMerge = {
 		try {
 			await chapterEdgeService.deleteMergeEdgesBySource(source.id);
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			logger.warn("Failed to remove merge edges during snapshot unmerge", {
 				sourceChapterId: source.id,
 				error: String(err),
@@ -2499,6 +2522,7 @@ export const chapterMerge = {
 				}
 			}
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			logger.warn("Failed to clean up merge summary during snapshot unmerge", {
 				sourceChapterId: source.id,
 				error: String(err),
@@ -2569,6 +2593,7 @@ export const chapterMerge = {
 				worktreeSource: "workspace",
 			});
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			logger.error("Failed to fork temporary chapter for ruler AI resolve", {
 				sourceChapterId,
 				targetChapterId,
@@ -2635,6 +2660,7 @@ export const chapterMerge = {
 					// drain the session — the narrator resolves conflicts in the temp worktree
 				}
 			} catch (err) {
+				if (isResourceProtectionError(err)) throw err;
 				logger.error("Ruler AI conflict resolution session failed", {
 					error: String(err),
 				});
@@ -2676,6 +2702,7 @@ export const chapterMerge = {
 				chapterService,
 			);
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			logger.error("Ruler AI resolve unexpected error", {
 				sourceChapterId,
 				targetChapterId,
@@ -2751,6 +2778,7 @@ export const chapterMerge = {
 			await chapterService.remove(tempChapter.id);
 			await gitService.deleteBranch(gitPath, tempChapter.branch).catch(() => {});
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			logger.warn("Failed to clean up temporary chapter after ruler AI resolve", {
 				tempChapterId: tempChapter.id,
 				error: String(err),
@@ -2763,6 +2791,62 @@ export const chapterMerge = {
 		};
 	},
 };
+
+// Source retirement is reserved BEFORE commits, target mutations or terminal cleanup.
+// Nested finalization reuses the service-derived scope rather than reacquiring a mutex.
+function protectSource<Args extends unknown[], Result>(
+	method: (...args: Args) => Promise<Result>,
+	sourceId: (...args: Args) => string,
+): (...args: Args) => Promise<Result> {
+	return (...args) =>
+		withLegacyRetirement([sourceId(...args)], "merge source retirement", () => method(...args));
+}
+chapterMerge.merge = protectSource(chapterMerge.merge.bind(chapterMerge), (id) => id);
+chapterMerge.mergeViaSnapshot = protectSource(
+	chapterMerge.mergeViaSnapshot.bind(chapterMerge),
+	(source) => source.id,
+);
+chapterMerge.startInteractiveSnapshotMerge = protectSource(
+	chapterMerge.startInteractiveSnapshotMerge.bind(chapterMerge),
+	(source) => source.id,
+);
+chapterMerge.completeInteractiveSnapshotMerge = protectSource(
+	chapterMerge.completeInteractiveSnapshotMerge.bind(chapterMerge),
+	(source) => source.id,
+);
+chapterMerge.completeInteractiveSnapshotMergeById = protectSource(
+	chapterMerge.completeInteractiveSnapshotMergeById.bind(chapterMerge),
+	(id) => id,
+);
+chapterMerge.startInteractiveConflictMerge = protectSource(
+	chapterMerge.startInteractiveConflictMerge.bind(chapterMerge),
+	(id) => id,
+);
+chapterMerge.completeInteractiveConflictMerge = protectSource(
+	chapterMerge.completeInteractiveConflictMerge.bind(chapterMerge),
+	(id) => id,
+);
+chapterMerge.aiResolveViaSnapshot = protectSource(
+	chapterMerge.aiResolveViaSnapshot.bind(chapterMerge),
+	(source) => source.id,
+);
+chapterMerge.aiResolveConflicts = protectSource(
+	chapterMerge.aiResolveConflicts.bind(chapterMerge),
+	(id) => id,
+);
+chapterMerge.markMerged = protectSource(chapterMerge.markMerged.bind(chapterMerge), (id) => id);
+chapterMerge.markMergedResult = protectSource(
+	chapterMerge.markMergedResult.bind(chapterMerge),
+	(id) => id,
+);
+chapterMerge.rulerAiResolve = protectSource(
+	chapterMerge.rulerAiResolve.bind(chapterMerge),
+	(id) => id,
+);
+chapterMerge.finalizeTempMerge = protectSource(
+	chapterMerge.finalizeTempMerge.bind(chapterMerge),
+	(id) => id,
+);
 
 function buildConflictResolutionPrompt(
 	conflictFiles: string[],

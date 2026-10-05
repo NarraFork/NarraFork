@@ -125,6 +125,7 @@ describe("shared pretext layout pipeline — adapter context forwarding", () => 
 						kind: "message",
 						msg: {
 							id: "steps",
+							model: "gpt-5.6",
 							role: "assistant",
 							contentJson: [
 								{ type: "reasoning", text: "**First**\n\nbody one\n\n**Second**\n\nbody two" },

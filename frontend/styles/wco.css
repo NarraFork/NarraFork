@@ -1,0 +1,138 @@
+/*
+ * Window Controls Overlay (PWA) layout adaptation.
+ *
+ * `data-nf-wco` on <html> is owned by installWcoTracking (lib/wco.ts) and is only
+ * present while the overlay is actually visible, so every rule here is inert in
+ * ordinary tabs and non-WCO PWAs. All sizes come from env(titlebar-area-*) so
+ * window resizes need no JS; the attribute contributes only on/off and side.
+ */
+
+html[data-nf-wco] {
+	--nf-wco-strip-height: env(titlebar-area-height, 40px);
+	/* Width of the strip the right-side buttons cover; 0 when they sit on the left. */
+	--nf-wco-inset-right: calc(100vw - env(titlebar-area-width, 100vw) - env(titlebar-area-x, 0px));
+	/* Width of the strip the left-side buttons cover; 0 when they sit on the right. */
+	--nf-wco-inset-left: env(titlebar-area-x, 0px);
+}
+
+/* Buttons on the right: the header's right edge (search box etc.) moves left. */
+html[data-nf-wco="right"] .nf-app-shell .mantine-AppShell-header {
+	padding-right: var(--nf-wco-inset-right);
+}
+
+/*
+ * Buttons on the left: the navbar normally absorbs the traffic lights (it is the
+ * full-height column), but collapsed to 60px it is narrower than the ~78px light
+ * cluster — shift the header past whatever the navbar did not cover.
+ */
+html[data-nf-wco="left"] .nf-app-shell .mantine-AppShell-header {
+	padding-left: max(0px, env(titlebar-area-x, 0px) - var(--app-shell-navbar-width, 0px));
+}
+
+/*
+ * Window dragging. The header row drags, except its two content clusters — the
+ * draggable remainder is exactly the empty gap between them. The wizard's
+ * full-width return button is a direct header child and stays clickable.
+ */
+html[data-nf-wco] .nf-header-row {
+	-webkit-app-region: drag;
+}
+
+html[data-nf-wco] .nf-header-side,
+html[data-nf-wco] .nf-app-shell .mantine-AppShell-header > button {
+	-webkit-app-region: no-drag;
+}
+
+/*
+ * Narrow windows: the gap between the two header clusters all but disappears,
+ * so the clusters themselves become drag surface instead and their interactive
+ * children opt out individually. Safe because the mobile BrandTitle is
+ * deliberately non-interactive (the click-to-collapse one is desktop-only) —
+ * everything actually clickable is a button/a/input and stays no-drag.
+ * 48em is Mantine's `sm` breakpoint (MOBILE_VIEWPORT_MEDIA_QUERY in
+ * lib/responsive.ts, the same boundary safe-area.css uses).
+ */
+@media not all and (min-width: 48em) {
+	html[data-nf-wco] .nf-header-side {
+		-webkit-app-region: drag;
+	}
+
+	html[data-nf-wco] .nf-header-side :is(button, a, input, textarea, select, [role="button"]) {
+		-webkit-app-region: no-drag;
+	}
+}
+
+/*
+ * Buttons on the left: push the navbar content below the traffic lights. The
+ * spacer doubles as drag surface, so the strip next to the lights still moves
+ * the window. Hidden in every other mode.
+ */
+.nf-wco-nav-spacer {
+	display: none;
+}
+
+html[data-nf-wco="left"] .nf-wco-nav-spacer {
+	display: block;
+	flex-shrink: 0;
+	height: var(--nf-wco-strip-height);
+	-webkit-app-region: drag;
+}
+
+/*
+ * Standalone windows (/windows/*): the WCO title-bar strip.
+ *
+ * These pages have no app header, so in WCO mode nothing would be draggable and
+ * the OS buttons would overlap content. This strip is that surface: it shows the
+ * window title, drags the window, and stays clear of the buttons on either side.
+ * Outside WCO a browser popup has native chrome, so it collapses entirely.
+ * Its background is declared unconditionally so theme-color sync
+ * (lib/theme-color-sync.ts) can read the resolved shell colour from it.
+ */
+.nf-wco-window-strip {
+	display: none;
+	background: var(--mantine-color-body);
+}
+
+html[data-nf-wco] .nf-wco-window-strip {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	position: sticky;
+	top: 0;
+	z-index: 200;
+	height: var(--nf-wco-strip-height);
+	padding-left: var(--nf-wco-inset-left);
+	padding-right: var(--nf-wco-inset-right);
+	border-bottom: 1px solid var(--mantine-color-default-border);
+	-webkit-app-region: drag;
+}
+
+.nf-wco-window-strip-title {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: var(--mantine-font-size-sm);
+	color: var(--mantine-color-dimmed);
+	user-select: none;
+}
+
+/*
+ * Floating layers above the drag surface must opt out of it explicitly.
+ *
+ * `-webkit-app-region` hit-testing is purely geometric: the browser subtracts
+ * no-drag rects from drag rects, ignoring paint order entirely. Anything painted
+ * over the header row's drag rect — a fixed banner, a toast, a modal overlay, a
+ * menu dropdown — therefore still loses its clicks to window dragging unless its
+ * own rect is subtracted. Z-index does not help.
+ *
+ *   - `.nf-top-banner`: the fixed version-update / WS-reconnect banners
+ *     (VersionUpdateBanner, WSConnectionAlert), centred inside the strip.
+ *   - `.nf-notifications-safe-area`: the toast stack (top-right, i.e. directly
+ *     under the window buttons on Windows).
+ *   - `.nf-overlay-layer`: injected by the theme (lib/mantine-theme.ts) onto
+ *     Modal/Drawer roots and Menu/Popover/HoverCard/Combobox dropdowns, because
+ *     Mantine v9 emits no stable component classes to target from here.
+ */
+html[data-nf-wco] :is(.nf-top-banner, .nf-notifications-safe-area, .nf-overlay-layer) {
+	-webkit-app-region: no-drag;
+}

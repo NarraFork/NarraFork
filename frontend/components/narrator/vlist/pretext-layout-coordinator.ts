@@ -41,7 +41,7 @@ import {
 	refreshPretextDocumentWindow,
 } from "./pretext-document-loader";
 import { measureElementCached } from "./registry";
-import { projectStreamingDocument } from "./streaming-handoff";
+import { projectPendingEmptyReasoning, projectStreamingDocument } from "./streaming-handoff";
 import { askInPassingBlock, syncAskInPassingMessage } from "./vlist-ask-in-passing-sync";
 import { trimClockNow, trimLoadedHead } from "./vlist-head-trim";
 import { appendLoadedMessage, upsertLoadedMessage } from "./vlist-message-append";
@@ -117,6 +117,9 @@ export interface PretextLayoutCoordinatorSnapshot {
 export interface PretextLayoutBuildOptions
 	extends Omit<BuildPretextDocumentLayoutOptions, "layoutRevision" | "documentRevision" | "lod"> {
 	lod: RenderLod;
+	/** Active session: the latest empty reasoning may still hide ongoing thought. */
+	keepEmptyReasoningLive?: boolean;
+	isSubagent?: boolean;
 }
 
 /**
@@ -1233,8 +1236,15 @@ export class PretextLayoutCoordinator {
 	 * The streaming row is appended here rather than stored in `input.messages` so
 	 * pagination and version checks only ever see persisted content.
 	 */
-	private layoutMessages(input: PretextDocumentInput): readonly TreeMessage[] {
-		return projectStreamingDocument(input.messages, this.streamingMessage);
+	private layoutMessages(
+		input: PretextDocumentInput,
+		buildOptions: PretextLayoutBuildOptions,
+	): readonly TreeMessage[] {
+		return projectPendingEmptyReasoning(
+			projectStreamingDocument(input.messages, this.streamingMessage),
+			buildOptions.keepEmptyReasoningLive === true,
+			buildOptions.isSubagent,
+		);
 	}
 
 	/**
@@ -1255,7 +1265,7 @@ export class PretextLayoutCoordinator {
 	}
 
 	private buildLayoutInner(input: PretextDocumentInput, buildOptions: PretextLayoutBuildOptions) {
-		const messages = this.layoutMessages(input);
+		const messages = this.layoutMessages(input, buildOptions);
 		return buildPretextDocumentLayout(messages as unknown as NarratorMsg[], {
 			...buildOptions,
 			// The loaded-message count keeps the revision distinct as the window

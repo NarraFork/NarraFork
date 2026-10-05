@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { resolve } from "node:path";
+import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import {
 	type FileReference,
@@ -42,7 +43,6 @@ import {
 	containerInstances,
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
-	narratorFileSnapshots,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -55,6 +55,7 @@ import {
 } from "../db/schema";
 import { summaryGenerate } from "../lib/agent";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
+import { generateWithFirstTokenTimeout } from "../lib/agent/generate-first-token-timeout";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
@@ -129,7 +130,7 @@ import {
 import { isPermissionMode, PERMISSION_MODES } from "../lib/permission-modes";
 import { buildPlanFileRelPath } from "../lib/plan-file-path";
 import { getHome } from "../lib/platform";
-import { isInsidePath } from "../lib/platform-path";
+import { requireProjectAccess } from "../lib/project-access";
 import {
 	buildSetupAssistantSystemPrompt,
 	formatDependencyBriefing,
@@ -168,6 +169,7 @@ import {
 	asyncQuestionAnswerSchema,
 	asyncQuestionListQuerySchema,
 	browserInteractSchema,
+	bufferQueueModeSchema,
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,
 	createNarratorSchema,
@@ -197,8 +199,8 @@ import {
 	suggestAnswersSchema,
 	updateBlacklistCmdSchema,
 	updateBlacklistDirSchema,
+	updateBufferedMessageModeSchema,
 	updateBufferedMessageSchema,
-	updateNarratorCwdSchema,
 	updateNarratorDraftSchema,
 	updateNarratorHandleSchema,
 	updateNarratorModelSchema,
@@ -226,7 +228,6 @@ import {
 	scanBrokenModelNarrators,
 	undoLastBrokenModelMigration,
 } from "../services/broken-model-migration-service";
-import { chapterFork } from "../services/chapter-fork";
 import type {
 	BashCommandResult,
 	BlockAllSkillsResult,
@@ -255,16 +256,12 @@ import { normalizePathKey, type PathFlavor, pathKeyContains } from "../services/
 import { captureFileReferences } from "../services/file-reference-service";
 import {
 	applyToolCall,
-	buildCanonicalIdentityAliases,
-	canonicalizeDeviceFileIdentityWith,
 	type DeviceFileIdentity,
 	type DeviceFileState,
 	deviceFileKey,
 	FileHistoryError,
 	getAffectedDeviceFilesStrict,
 	getToolCallFileIdentityStrict,
-	groupByDeviceFileStrict,
-	queryOrderedToolCalls,
 	rebuildDeviceFileState,
 	rebuildDeviceFileStatesExcluding,
 } from "../services/file-state-rebuild";
@@ -279,7 +276,9 @@ import {
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
 	retryBufferedMessage,
+	updateBufferedMessageMode,
 } from "../services/narrator-buffer";
+import { getNarratorContextComposition } from "../services/narrator-context-composition";
 import {
 	getNarratorDraft,
 	getNarratorIdsWithDraft,
@@ -287,6 +286,7 @@ import {
 	updateNarratorDraft,
 } from "../services/narrator-draft-service";
 import { buildExportFileName, streamNarratorExport } from "../services/narrator-export";
+import { getNarratorGitSummary } from "../services/narrator-git-summary";
 import {
 	countNarratorMessageRefs,
 	countNarratorMessageRefsBatch,
@@ -373,7 +373,6 @@ import {
 	toBufferSummary,
 	updateActiveBlockedSkills,
 	updateActiveDisabledTools,
-	updateActiveNarratorCwdAndSkillContext,
 	updateBufferedMessage,
 	updateNarratorModel,
 	updateNarratorPermissionMode,
@@ -447,6 +446,7 @@ import {
 } from "../services/tool-input-stream-source";
 import { usageHistoryService } from "../services/usage-history-service";
 import { syncNarratorDraftToRecentTabs } from "../services/user-preferences-service";
+import { assertWorkspaceHistoryRevertSupported } from "../services/workspace-context-service";
 import {
 	broadcastToNarrator,
 	broadcastToUser,
@@ -454,6 +454,7 @@ import {
 	getNarratorPresenceBatch,
 } from "../websocket/narrator-ws";
 import { fileReferenceRoutes } from "./narrator-file-references";
+import { narratorWorkspaceContextRoutes } from "./narrator-workspace-context";
 
 function parseNewCommand(message: string): { rawCommand: string; initialMessage: string } | null {
 	const match = message.trim().match(/^\/new(?:\s+([\s\S]*))?$/);
@@ -477,11 +478,15 @@ export async function parseMessageRequest(
 	textFiles: File[];
 	priority?: boolean;
 	interrupt?: boolean;
+	queueMode?: import("@shared/buffer-queue-mode").BufferQueueMode;
 	fileReferences?: FileReference[];
 }> {
 	const contentType = c.req.header("content-type") ?? "";
 	if (contentType.includes("multipart/form-data")) {
 		const formData = await c.req.formData();
+		const rawMode = formData.get("queueMode");
+		const modeResult = bufferQueueModeSchema.optional().safeParse(rawMode ?? undefined);
+		if (!modeResult.success) throw new ValidationError(modeResult.error.message);
 		const rawMessage = formData.get("message");
 		const message = typeof rawMessage === "string" ? rawMessage : "";
 		const fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
@@ -539,6 +544,7 @@ export async function parseMessageRequest(
 			textFiles: textFileEntries,
 			priority: priority || undefined,
 			interrupt: formData.get("interrupt") === "true" || undefined,
+			queueMode: modeResult.data,
 			fileReferences,
 		};
 	}
@@ -551,6 +557,7 @@ export async function parseMessageRequest(
 		textFiles: [],
 		priority: parsed.data.priority,
 		interrupt: parsed.data.interrupt,
+		queueMode: parsed.data.queueMode,
 		fileReferences: parsed.data.fileReferences,
 	};
 }
@@ -702,6 +709,21 @@ narratorRoutes.use("/:id/*", async (c, next) => {
 			? ("read" as const)
 			: ("write" as const);
 	await requireNarratorAccess(c, id, need);
+	// Legacy rollback cannot reinterpret historical trees under a new cwd. Scoped plans
+	// instead bind recorded file identities and recheck the current write boundary on
+	// preview and apply, so a prior workspace switch alone must not disable them.
+	// Mixed history/file handlers below check only after parsing skipRevert; their
+	// history-only branch (and retry) must never depend on file restoration support.
+	const scopedRevert =
+		subPath === "revert-action-preview" ||
+		subPath === "revert-plans" ||
+		/^revert-plans\/[^/]+\/apply$/.test(subPath);
+	if (
+		need === "write" &&
+		!scopedRevert &&
+		/^(?:revert(?:$|[-/])|unrevert$|resume(?:$|\/))/.test(subPath)
+	)
+		await assertWorkspaceHistoryRevertSupported(id);
 	// Apply owns its exclusive admission through whenSettled; wrapping it in shared
 	// work would deadlock it. Preview remains a shared read/selection operation and
 	// must not interrupt an active narrator before confirmation.
@@ -719,6 +741,13 @@ narratorRoutes.use("/:id", async (c, next) => {
 });
 
 narratorRoutes.route("/:id/file-references", fileReferenceRoutes);
+
+// The /:id/* middleware above enforces requireNarratorAccess(..., "read").
+narratorRoutes.get("/:id/context-composition", async (c) => {
+	return c.json(
+		await getNarratorContextComposition(c.req.param("id"), c.req.raw.signal, c.req.query("cursor")),
+	);
+});
 
 /**
  * Gate for the routes keyed by a permission request id.
@@ -850,8 +879,13 @@ narratorRoutes.get("/", async (c) => {
 	const userId = c.get("user").sub;
 	const chapterId = c.req.query("chapterId");
 	const standalone = c.req.query("standalone");
+	const projectId = c.req.query("projectId")?.trim();
+	if (projectId !== undefined) {
+		if (!projectId || projectId.length > 128) throw new ValidationError("Invalid projectId");
+		await requireProjectAccess(c, projectId, "read");
+	}
 
-	if (standalone === "true" || standalone === "all") {
+	if (standalone === "true" || standalone === "all" || projectId) {
 		// Paginated session list
 		// standalone=true: only standalone (chapterId IS NULL)
 		// standalone=all: all sessions (standalone + chapter-bound)
@@ -896,6 +930,19 @@ narratorRoutes.get("/", async (c) => {
 			conditions.push(isNotNull(narrators.chapterId));
 		}
 		// standalone=all with no filter: show all
+		if (projectId) {
+			conditions.push(
+				or(
+					and(isNull(narrators.chapterId), eq(narrators.contextProjectId, projectId)),
+					exists(
+						db
+							.select({ id: chapters.id })
+							.from(chapters)
+							.where(and(eq(chapters.id, narrators.chapterId), eq(chapters.projectId, projectId))),
+					),
+				),
+			);
+		}
 
 		// Filter: has active terminals
 		if (hasTerminals) {
@@ -1048,9 +1095,15 @@ narratorRoutes.get("/", async (c) => {
 					running: sql<number>`SUM(CASE WHEN ${containerInstances.status} = 'running' THEN 1 ELSE 0 END)`,
 				})
 				.from(containerInstances)
-				.where(sql`${containerInstances.chapterId} IN ${chapterIds}`)
+				.where(
+					and(
+						sql`${containerInstances.chapterId} IN ${chapterIds}`,
+						isNull(containerInstances.worktreeResourceId),
+					),
+				)
 				.groupBy(containerInstances.chapterId);
 			for (const row of containerRows) {
+				if (row.chapterId === null) continue;
 				containerCounts.set(row.chapterId, {
 					total: row.total,
 					running: row.running ?? 0,
@@ -1352,7 +1405,10 @@ narratorRoutes.post("/broken-models/undo", requireAdmin, async (c) => {
 narratorRoutes.get("/:id", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
-	const hasDraft = await narratorHasDraft(c.get("user").sub, id);
+	const [hasDraft, gitSummary] = await Promise.all([
+		narratorHasDraft(c.get("user").sub, id),
+		getNarratorGitSummary(id, narrator.workspaceRevision, narratorPrincipalOf(c), c.req.raw.signal),
+	]);
 	const runtimeModel = getNarratorRuntimeModel(id, narrator.model?.trim() || FOLLOW_DEFAULT_MODEL);
 	// The stored counter is only refreshed when a turn ends, so a narrator that has
 	// not run since the turn-count → message-count change would still report the old
@@ -1369,6 +1425,7 @@ narratorRoutes.get("/:id", async (c) => {
 			: undefined;
 	return c.json({
 		...publicNarratorResponse(narrator, hasDraft),
+		gitSummary,
 		messageCount,
 		...(modelInheritance && { modelInheritance }),
 		...(runtimeModel && {
@@ -1597,25 +1654,30 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 	// Resolve the model (default follows summaryModel via __summary__)
 	const model = resolveEffectiveModel(settings.agent.promptOptimizeModel);
 
-	// Call LLM with 30s timeout
-	const signal = AbortSignal.timeout(30000);
-	let result: string;
-	try {
-		const generated = await summaryGenerate(
-			taggedContent,
-			systemInstruction,
-			{ narratorId, kind: "optimize" },
-			signal,
-			undefined,
-			model, // modelOverride parameter
-		);
-		result = generated.text;
-	} catch (err) {
-		if ((err as Error).name === "AbortError" || (err as Error).name === "TimeoutError") {
-			throw new ValidationError("Optimization timed out after 30 seconds");
+	// Follow the configured first-token budget; output clears the timer. Request
+	// cancellation remains connected to the provider throughout generation.
+	const generated = await generateWithFirstTokenTimeout(
+		(options) =>
+			summaryGenerate(
+				taggedContent,
+				systemInstruction,
+				{ narratorId, kind: "optimize" },
+				options.signal,
+				options.onTextDelta,
+				model,
+				undefined,
+				false,
+				options.onReasoningDelta,
+			),
+		settings.agent.firstTokenTimeoutMs,
+		c.req.raw.signal,
+	).catch((err: unknown) => {
+		if (err instanceof Error && err.name === "TimeoutError") {
+			throw new ValidationError(err.message);
 		}
 		throw err;
-	}
+	});
+	let result = generated.text;
 
 	// Post-process: trim, remove wrapping quotes/code fences
 	result = result.trim();
@@ -1856,13 +1918,17 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		images,
 		textFiles,
 		priority: requestedPriority,
-		interrupt,
+		interrupt: requestedInterrupt,
+		queueMode,
 		fileReferences,
 	} = await parseMessageRequest(c, id);
-	// Hard interruption is a primary-narrator intent; subagents keep their existing queue contract.
-	const priority = isSubagentVariant(narrator.variant)
-		? requestedPriority
-		: requestedPriority || interrupt;
+	// Explicit mode wins over legacy booleans; omission retains existing callers.
+	const interrupt = queueMode ? queueMode === "interrupt" : requestedInterrupt;
+	const priority = queueMode
+		? queueMode !== "turn"
+		: isSubagentVariant(narrator.variant)
+			? requestedPriority
+			: requestedPriority || interrupt;
 	const userId = c.get("user").sub;
 	// Only a successfully persisted message/queue owns these uploads. In particular,
 	// a rejected reference must not strand images saved by multipart parsing.
@@ -1924,6 +1990,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				commandText: message,
 				locale: await getUserLanguage(userId),
 				interrupt: true,
+				queueMode,
 				executionIntent: { controlCommand: true },
 			});
 			// Controls do not consume attachments; retain the direct path's cleanup.
@@ -2197,6 +2264,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					createdBy: userId,
 					prePromptBashCommand,
 					priority,
+					queueMode,
 					requestSoftStop: !takenOver,
 					fileReferences: snapshots,
 				});
@@ -2287,6 +2355,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			fileReferences: snapshots,
 			priority,
 			interrupt,
+			queueMode,
 			queueOnly: queueBehindCompaction,
 			executionIntent: modelOverride?.model ? { modelOverride } : undefined,
 		});
@@ -2567,6 +2636,7 @@ narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
 	const id = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	const { blockIndex, skipRevert, scope } = rollbackToBlockSchema.parse(await c.req.json());
+	if (skipRevert !== true) await assertWorkspaceHistoryRevertSupported(id);
 
 	const narrator = await narratorService.getById(id);
 
@@ -3097,23 +3167,132 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	return c.json({ ok: true });
 });
 
+/** Called under start admission; only signal owners, never await their finalizers. */
+async function applyPendingBufferModeControl(
+	id: string,
+	mid: string,
+	mode: import("@shared/buffer-queue-mode").BufferQueueMode,
+	child: boolean,
+): Promise<boolean> {
+	const applyControl = child
+		? (await import("../services/subagent-executor")).applySubagentBufferedQueueModeControl
+		: (await import("../services/narrator-session")).applyBufferedQueueModeControl;
+	// Always consult async authority: PostgreSQL must not fall into SQLite probes.
+	// Resolve imports first so there is no async gap between authority and signaling.
+	const remaining = await getBufferedMessagesAsync(id);
+	const target = remaining.find((message) => message.id === mid);
+	const targetQueued = target !== undefined && target.state !== "failed";
+	const effectiveMode = target ? resolveBufferQueueMode(target.queueMode, target.priority) : mode;
+	const hasPendingGuidance = remaining.some(
+		(message) =>
+			message.state !== "failed" &&
+			resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
+	);
+	applyControl(id, effectiveMode, hasPendingGuidance, targetQueued);
+	return targetQueued && effectiveMode !== "turn";
+}
+
+// Changing a queued mode never mutates or retries its durable payload.
+narratorRoutes.patch("/:id/buffer/:mid/mode", async (c) => {
+	const id = c.req.param("id");
+	const mid = c.req.param("mid");
+	const parsed = updateBufferedMessageModeSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { withNarratorStartAdmission } = await import("../services/narrator-session-state");
+	const narrator = await narratorService.getById(id);
+	let shouldWake = false;
+	let awaitDelivery = false;
+	await withNarratorStartAdmission(id, async () => {
+		if (!(await updateBufferedMessageMode(id, mid, parsed.data.mode))) {
+			if (parsed.data.mode === "interrupt") {
+				const { readBufferedMessageDeliveryReceipt } = await import("../services/narrator-buffer");
+				const receipt = await readBufferedMessageDeliveryReceipt(id, mid);
+				if (receipt?.state === "claimed" || receipt?.state === "materialized") {
+					// Retry/a concurrent request already owns this delivery. Never abort its new owner.
+					awaitDelivery = true;
+					return;
+				}
+			}
+			throw new AppError("Buffered message was claimed or is no longer pending", 409, "CONFLICT");
+		}
+		shouldWake = await applyPendingBufferModeControl(
+			id,
+			mid,
+			parsed.data.mode,
+			isSubagentVariant(narrator.variant),
+		);
+		awaitDelivery = shouldWake && parsed.data.mode === "interrupt";
+	});
+	try {
+		if (awaitDelivery) {
+			const { waitForBufferedMessageDelivery } = await import("../services/narrator-buffer");
+			const delivered = await waitForBufferedMessageDelivery(id, mid, { signal: c.req.raw.signal });
+			return c.json({ ok: true, ...delivered });
+		}
+		if (shouldWake) {
+			// Admission must be released before waking; existing owners retain delivery responsibility.
+			const { wakeInboxIfEligible } = await import("../services/agent-runtime/inbox");
+			await wakeInboxIfEligible(id);
+		}
+		return c.json({ ok: true });
+	} finally {
+		// Timeout/error is not rollback: publish the retained durable mode and payload too.
+		await broadcastBufferQueue(id);
+	}
+});
+
 // Explicit retry retains the stable mailbox/recipient identity and resets failed attempts.
 narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 	const id = c.req.param("id");
 	const mid = c.req.param("mid");
-	let retried: boolean;
-	try {
-		retried = await retryBufferedMessage(id, mid);
-	} catch (error) {
-		throw new ValidationError(
-			error instanceof Error ? error.message : "Buffered payload unavailable",
+	const { withNarratorStartAdmission } = await import("../services/narrator-session-state");
+	const narrator = await narratorService.getById(id);
+	let urgentRetry = false;
+	await withNarratorStartAdmission(id, async () => {
+		// Retain mode before the transition: the recovered row may be claimed immediately.
+		const previous = (await getBufferedMessagesAsync(id)).find((message) => message.id === mid);
+		let retried: boolean;
+		try {
+			retried = await retryBufferedMessage(id, mid);
+		} catch (error) {
+			throw new ValidationError(
+				error instanceof Error ? error.message : "Buffered payload unavailable",
+			);
+		}
+		if (!retried) throw new ValidationError("Only a failed user message can be retried");
+		urgentRetry = resolveBufferQueueMode(previous?.queueMode, previous?.priority) === "interrupt";
+		if (urgentRetry && !(await updateBufferedMessageMode(id, mid, "interrupt"))) {
+			const { readBufferedMessageDeliveryReceipt } = await import("../services/narrator-buffer");
+			const receipt = await readBufferedMessageDeliveryReceipt(id, mid);
+			if (receipt?.state === "claimed" || receipt?.state === "materialized") {
+				// Another consumer already owns the restored input; confirm it outside
+				// admission without aborting that consumer's fresh execution owner.
+				return;
+			}
+			throw new AppError("Retried urgent input is no longer pending", 409, "CONFLICT");
+		}
+		// Promotion and cancellation share admission: no later urgent row can be
+		// dispatched ahead of the selected retry before its control signal lands.
+		// A control failure must not roll back or repeat this committed durable transition.
+		await applyPendingBufferModeControl(
+			id,
+			mid,
+			resolveBufferQueueMode(previous?.queueMode, previous?.priority),
+			isSubagentVariant(narrator.variant),
 		);
+	});
+	try {
+		if (urgentRetry) {
+			const { waitForBufferedMessageDelivery } = await import("../services/narrator-buffer");
+			const delivered = await waitForBufferedMessageDelivery(id, mid, { signal: c.req.raw.signal });
+			return c.json({ ok: true, resumed: true, ...delivered });
+		}
+		const { wakeInboxIfEligible } = await import("../services/agent-runtime/inbox");
+		const resumed = await wakeInboxIfEligible(id);
+		return c.json({ ok: true, resumed });
+	} finally {
+		await broadcastBufferQueue(id);
 	}
-	if (!retried) throw new ValidationError("Only a failed user message can be retried");
-	const { wakeInboxIfEligible } = await import("../services/agent-runtime/inbox");
-	const resumed = await wakeInboxIfEligible(id);
-	await broadcastBufferQueue(id);
-	return c.json({ ok: true, resumed });
 });
 
 // Remove a single queued buffered message
@@ -3124,8 +3303,16 @@ narratorRoutes.delete("/:id/buffer/:mid", async (c) => {
 	// state; the primary counterpart is cleared below for the same queue identity.
 	const { removeSubagentBufferedMessage } = await import("../services/narrator-subagent");
 	const ok = await removeSubagentBufferedMessage(id, mid);
-	if (ok) clearBufferedMessageSoftStopIfIdle(id);
 	if (!ok) throw new NotFoundError("Buffered message", mid);
+	const remaining = await getBufferedMessagesAsync(id);
+	clearBufferedMessageSoftStopIfIdle(
+		id,
+		remaining.some(
+			(message) =>
+				message.state !== "failed" &&
+				resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
+		),
+	);
 	await broadcastBufferQueue(id);
 	return c.json({ ok: true });
 });
@@ -3148,8 +3335,16 @@ narratorRoutes.delete("/:id/buffer", async (c) => {
 	// One persistent cancellation, plus each actor adapter's ephemeral soft stop.
 	const { clearSubagentBufferedMessages } = await import("../services/narrator-subagent");
 	await clearSubagentBufferedMessages(id);
-	clearBufferedMessageSoftStopIfIdle(id);
-	broadcastToNarrator(id, { type: "buffer_set", narratorId: id, messages: [] });
+	const remaining = await getBufferedMessagesAsync(id);
+	clearBufferedMessageSoftStopIfIdle(
+		id,
+		remaining.some(
+			(message) =>
+				message.state !== "failed" &&
+				resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
+		),
+	);
+	await broadcastBufferQueue(id);
 	return c.json({ ok: true });
 });
 
@@ -3592,6 +3787,7 @@ narratorRoutes.delete("/:id/messages/batch-blocks", async (c) => {
 	const body = await c.req.json();
 	const { batchDeleteBlocksSchema } = await import("../lib/validators");
 	const { blocks, skipRevert, scope } = batchDeleteBlocksSchema.parse(body);
+	if (skipRevert !== true) await assertWorkspaceHistoryRevertSupported(narratorId);
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessageBlocks(narratorId, blocks, {
 		skipRevert,
@@ -3612,6 +3808,7 @@ narratorRoutes.delete("/:id/messages/:messageId/blocks/:blockIndex", async (c) =
 	// The narrator scope is the default and refuses on conflict, so the caller needs
 	// a way to ask for the wider one its error suggests.
 	const scope = revertScopeSchema.parse(c.req.query("scope"));
+	if (!skipRevert) await assertWorkspaceHistoryRevertSupported(narratorId);
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessageBlock(narratorId, messageId, blockIndex, {
 		skipRevert,
@@ -3628,6 +3825,7 @@ narratorRoutes.delete("/:id/messages/:messageId", async (c) => {
 	// The narrator scope is the default and can refuse on conflict; the caller needs a
 	// way to act on that refusal, so the widening choice must be expressible here too.
 	const scope = revertScopeSchema.parse(c.req.query("scope"));
+	if (!skipRevert) await assertWorkspaceHistoryRevertSupported(narratorId);
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessage(narratorId, messageId, {
 		skipRevert,
@@ -4549,7 +4747,12 @@ narratorRoutes.patch("/:id/default-device", async (c) => {
 	if (value !== null && value !== undefined && typeof value !== "string") {
 		throw new ValidationError("deviceId must be a string or null");
 	}
-	return c.json(await setNarratorDefaultDevice(c.req.param("id"), value ?? null));
+	return c.json(
+		await setNarratorDefaultDevice(c.req.param("id"), value ?? null, {
+			origin: "http",
+			userId: c.get("user").sub,
+		}),
+	);
 });
 
 // Update model
@@ -4965,72 +5168,12 @@ narratorRoutes.patch("/:id/handle", async (c) => {
 	return c.json(publicNarratorResponse(updated));
 });
 
-// Update narrator working directory
-narratorRoutes.patch("/:id/cwd", async (c) => {
-	const id = c.req.param("id");
-	const parsed = updateNarratorCwdSchema.safeParse(await c.req.json());
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
-
-	let cwd = parsed.data.cwd.trim();
-	if (!isAbsolute(cwd)) {
-		throw new ValidationError("cwd must be an absolute path");
-	}
-
-	const narrator = await narratorService.getById(id);
-	const chapter = narrator.chapterId
-		? await db.query.chapters.findFirst({
-				where: eq(chapters.id, narrator.chapterId),
-				columns: { worktreePath: true },
-			})
-		: null;
-	if (narrator.chapterId && !chapter?.worktreePath) {
-		throw new ValidationError("The current chapter has no active worktree");
-	}
-
-	// Validate path exists/access and resolve symlinks before enforcing the
-	// chapter worktree boundary.
-	let canonicalCwd: string;
-	try {
-		const { access, constants, realpath } = await import("node:fs/promises");
-		await access(cwd, constants.R_OK | constants.X_OK);
-		canonicalCwd = await realpath(cwd);
-		if (chapter?.worktreePath) {
-			const canonicalWorktree = await realpath(chapter.worktreePath);
-			if (!isInsidePath(canonicalWorktree, canonicalCwd)) {
-				throw new ValidationError("cwd must be inside the current chapter worktree");
-			}
-		}
-	} catch (error) {
-		if (error instanceof ValidationError) throw error;
-		const message =
-			error instanceof Error
-				? error.message
-				: "Working directory does not exist or is not accessible";
-		throw new ValidationError(message);
-	}
-	cwd = canonicalCwd;
-
-	const previousCwd = narrator.cwd?.trim() || null;
-	if (previousCwd === cwd) {
-		return c.json({ ok: true, cwd, changed: false });
-	}
-
-	await narratorService.updateCwd(id, cwd);
-	await updateActiveNarratorCwdAndSkillContext(id, cwd);
-
-	const userId = c.get("user").sub;
-	const locale = await getUserLanguage(userId);
-	const reminder =
-		locale === "zh-CN"
-			? previousCwd
-				? `工作目录已更新：${previousCwd} → ${cwd}`
-				: `工作目录已设置为：${cwd}`
-			: previousCwd
-				? `Working directory updated: ${previousCwd} → ${cwd}`
-				: `Working directory set to: ${cwd}`;
-	await narratorService.persistDisplayMessage(id, reminder);
-
-	return c.json({ ok: true, cwd, changed: true });
+narratorRoutes.route("/", narratorWorkspaceContextRoutes);
+narratorRoutes.get("/:id/permission-rule-requests", async (c) => {
+	const { listPermissionRuleRequests } = await import(
+		"../services/permission-rule-request-service"
+	);
+	return c.json(await listPermissionRuleRequests(c.req.param("id"), c.req.query()));
 });
 
 // Regenerate narrator title via AI
@@ -5116,10 +5259,19 @@ narratorRoutes.post("/:id/fork-messages", async (c) => {
 	return c.json(publicNarratorResponse(newNarrator), 201);
 });
 
-// Fork standalone narrator (chapter-bound narrators must fork via chapter fork)
+// Ordinary fork always creates an independent narrator, including chapter-bound sources.
 narratorRoutes.post("/:id/fork", async (c) => {
 	const id = c.req.param("id");
 	const body = await c.req.json();
+	if (
+		body &&
+		typeof body === "object" &&
+		["worktreeSource", "commitSha"].some((key) => Object.hasOwn(body, key))
+	)
+		throw new ValidationError(
+			"worktreeSource and commitSha are unsupported by ordinary narrator forks",
+			"NARRATOR_WORKTREE_FORK_UNSUPPORTED",
+		);
 	const parsed = forkNarratorSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const newNarrator = await narratorService.forkNarrator(id, parsed.data.forkMessageUuid ?? null, {
@@ -5127,6 +5279,7 @@ narratorRoutes.post("/:id/fork", async (c) => {
 		userId: c.get("user").sub,
 		inheritMode: parsed.data.inheritMode ?? "full",
 		forkMessageId: parsed.data.forkMessageId,
+		standalone: true,
 	});
 	return c.json(publicNarratorResponse(newNarrator), 201);
 });
@@ -5219,6 +5372,7 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 					},
 				],
 				contentText: buildAskInPassingContentText(),
+				contextCharsJson: { segments: [] },
 				createdBy: userId,
 				createdAt: now,
 			})
@@ -5342,7 +5496,11 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	const resolvedContentText = buildAskInPassingContentText(question);
 	const updatedMsg = db.transaction((tx) => {
 		tx.update(narratorMessages)
-			.set({ contentJson: resolvedContentJson, contentText: resolvedContentText })
+			.set({
+				contentJson: resolvedContentJson,
+				contentText: resolvedContentText,
+				contextCharsJson: { segments: [] },
+			})
 			.where(eq(narratorMessages.id, pendingMessageId))
 			.run();
 
@@ -5439,29 +5597,48 @@ narratorRoutes.post("/:id/promote", async (c) => {
 				.set({
 					isAskInPassing: false,
 					traits: unlockedTraits,
-					permissionMode: "default",
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, id));
 		});
 
-		await updateNarratorPermissionMode(id, "default");
+		// Promotion removes the ask label, never broadens the existing execution policy.
+		await updateNarratorPermissionMode(id, narrator.permissionMode ?? "readOnly");
 
 		const updated = await narratorService.getById(id);
 		broadcastToNarrator(id, {
 			type: "permission_mode_changed",
 			narratorId: id,
-			permissionMode: "default",
+			permissionMode: updated.permissionMode ?? "readOnly",
 		});
 
-		return c.json({ type: "unlocked", narrator: publicNarratorResponse(updated) });
+		return c.json({
+			type: "unlocked",
+			narratorId: updated.id,
+			narrator: publicNarratorResponse(updated),
+		});
 	}
 
-	// Chapter-bound narrator: fork a new chapter
-	const chapter = await chapterFork.fork(narrator.chapterId, {
+	// Promotion no longer creates a chapter/worktree; the source remains an audit record.
+	const forkedNarrator = await narratorService.forkStandaloneFromTool(id, "fork", {
 		inheritMode: "full",
-		worktreeSource: "workspace",
+		userId: c.get("user").sub,
 	});
+
+	// The fork inherits traits; clear only the ask label on the new ordinary narrator,
+	// preserving its existing readOnly/OAuth/review permission restrictions.
+	await narratorTraitsLock.acquire(forkedNarrator.id, async () => {
+		const current = await narratorService.getById(forkedNarrator.id);
+		await db
+			.update(narrators)
+			.set({
+				isAskInPassing: false,
+				traits: removeTrait(parseTraits(current.traits), "ask-in-passing"),
+				updatedAt: new Date().toISOString(),
+			})
+			.where(eq(narrators.id, forkedNarrator.id));
+	});
+	const promotedNarrator = await narratorService.getById(forkedNarrator.id);
 
 	// Mark the original ask-in-passing narrator as promoted so the UI
 	// no longer shows it as locked.  We keep permissionMode as readOnly
@@ -5479,7 +5656,11 @@ narratorRoutes.post("/:id/promote", async (c) => {
 			.where(eq(narrators.id, id));
 	});
 
-	return c.json({ type: "forked", chapter });
+	return c.json({
+		type: "forked",
+		narratorId: promotedNarrator.id,
+		narrator: publicNarratorResponse(promotedNarrator),
+	});
 });
 
 // Get pending permissions
@@ -5821,100 +6002,6 @@ async function resolveSeqBoundaryStartedAt(
 	return earliest?.createdAt ?? null;
 }
 
-/** List file snapshots for a narrator */
-narratorRoutes.get("/:id/patches", async (c) => {
-	const narratorId = c.req.param("id");
-
-	// Project out originalContent (full file body) — the list only needs metadata.
-	// Full content is available via /patches/:id/diff.
-	const snapshots = await db.query.narratorFileSnapshots.findMany({
-		where: eq(narratorFileSnapshots.narratorId, narratorId),
-		orderBy: asc(narratorFileSnapshots.createdAt),
-		columns: { id: true, narratorId: true, deviceId: true, filePath: true, createdAt: true },
-		extras: {
-			originalExists:
-				sql<number>`CASE WHEN ${narratorFileSnapshots.originalContent} IS NOT NULL THEN 1 ELSE 0 END`.as(
-					"original_exists",
-				),
-		},
-	});
-
-	return c.json(
-		snapshots.map((s) => ({
-			id: s.id,
-			narratorId: s.narratorId,
-			deviceId: s.deviceId,
-			filePath: s.filePath,
-			createdAt: s.createdAt,
-			originalExists: Number(s.originalExists) === 1,
-		})),
-	);
-});
-
-/** Get the diff for a specific file snapshot (original vs current rebuilt state) */
-narratorRoutes.get("/:id/patches/:patchId/diff", async (c) => {
-	const narratorId = c.req.param("id");
-	const patchId = c.req.param("patchId");
-	const upToMessageId = c.req.query("upToMessageId");
-	const fromMessageId = c.req.query("fromMessageId");
-
-	const snap = await db.query.narratorFileSnapshots.findFirst({
-		where: and(
-			eq(narratorFileSnapshots.id, patchId),
-			eq(narratorFileSnapshots.narratorId, narratorId),
-		),
-	});
-	if (!snap) return c.json({ error: "Snapshot not found" }, 404);
-
-	const identity = { deviceId: snap.deviceId, filePath: snap.filePath };
-	// Resolve "from" boundary: file state at fromMessageId (used as the diff base)
-	let originalContent: string | null;
-	let currentContent: string | null;
-	try {
-		if (fromMessageId) {
-			const fromRef = await db.query.narratorMessageRefs.findFirst({
-				where: and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, fromMessageId),
-				),
-				columns: { seq: true },
-			});
-			if (!fromRef) return c.json({ error: "fromMessageId not found in this narrator" }, 404);
-			originalContent =
-				(await rebuildDeviceFileState(narratorId, identity, fromRef.seq)) ?? snap.originalContent;
-		} else {
-			originalContent = snap.originalContent;
-		}
-
-		// Resolve "to" boundary: file state at upToMessageId (or current)
-		if (upToMessageId) {
-			const ref = await db.query.narratorMessageRefs.findFirst({
-				where: and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, upToMessageId),
-				),
-				columns: { seq: true },
-			});
-			if (!ref) return c.json({ error: "Message not found in this narrator" }, 404);
-			currentContent =
-				(await rebuildDeviceFileState(narratorId, identity, ref.seq)) ?? snap.originalContent;
-		} else {
-			currentContent = await rebuildDeviceFileState(narratorId, identity);
-		}
-	} catch (error) {
-		// Replay divergence means this file cannot be reconstructed; surface it
-		// rather than rendering a diff against a wrong baseline.
-		return c.json(fileHistoryConflictBody(error), 409);
-	}
-
-	return c.json({
-		deviceId: snap.deviceId,
-		filePath: snap.filePath,
-		original: originalContent,
-		current: currentContent,
-	});
-});
-
 /** Durable preview only: these endpoints do not apply files or mutate history. */
 function revertPreviewJson(c: Context, value: unknown) {
 	const body = JSON.stringify(value);
@@ -6106,214 +6193,6 @@ narratorRoutes.get("/:id/file-tree-status", async (c) => {
 		totalFiles: status.totalFiles,
 		truncated: status.totalFiles > status.files.length,
 	});
-});
-
-/**
- * Newest top-level messages exposed as range boundaries by `/file-modifications`.
- *
- * The timeline only populates two dropdowns, so it does not need the narrator's whole
- * history: an unbounded one measured 30278 rows / ~2.8 MB of JSON on a long narrator,
- * and `JSON.stringify` on that is synchronous main-thread work on every refresh.
- */
-const FILE_MODIFICATION_TIMELINE_LIMIT = 500;
-
-/** Get aggregated file modification summary for a narrator */
-narratorRoutes.get("/:id/file-modifications", async (c) => {
-	const narratorId = c.req.param("id");
-	const upToMessageId = c.req.query("upToMessageId");
-	const fromMessageId = c.req.query("fromMessageId");
-
-	// Project out originalContent (full file body); only its presence is needed here.
-	const snapshots = await db.query.narratorFileSnapshots.findMany({
-		where: eq(narratorFileSnapshots.narratorId, narratorId),
-		orderBy: asc(narratorFileSnapshots.createdAt),
-		columns: { id: true, deviceId: true, filePath: true, createdAt: true },
-		extras: {
-			originalExists:
-				sql<number>`CASE WHEN ${narratorFileSnapshots.originalContent} IS NOT NULL THEN 1 ELSE 0 END`.as(
-					"original_exists",
-				),
-		},
-	});
-	if (snapshots.length === 0) return c.json({ files: [], timeline: [] });
-
-	// Always query all tool calls first to build the timeline.
-	// Only file_path is needed here (grouping + timeline), so skip loading the
-	// full inputJson (Write contains entire file bodies).
-	const allToolCalls = await queryOrderedToolCalls(narratorId, undefined, { filePathOnly: true });
-
-	// Timeline feeds the range-boundary dropdowns, so it is capped: a long narrator has
-	// tens of thousands of top-level messages (measured: 30278 rows / ~2.8 MB of JSON),
-	// and serializing that on every refresh is synchronous main-thread work for a picker
-	// nobody scrolls that far back in. The newest window is the useful one, so take the
-	// tail and re-sort ascending for the UI.
-	//
-	// The ref window is taken FIRST, as its own subquery, and only then joined to the
-	// message row for `role`/`createdAt`. Written the other way round — join first, then
-	// `ORDER BY ref.seq DESC LIMIT n` — the planner drove from `narrator_messages` through
-	// `idx_messages_parent_tool_use_lookup`, whose `parent_tool_use_id IS NULL` predicate
-	// matches ~90% of every message in the database, and sorted this narrator's entire ref
-	// set in a temp B-tree to read 500 rows: ~300ms. Driving from `idx_narrator_refs_seq`
-	// makes the ORDER BY free and lets the LIMIT stop the scan early: 3.3ms, identical rows.
-	// The EXISTS is not decoration here — with the join still in place the planner ignores
-	// it and keeps the bad plan, so this query needs the refs-first shape rather than a
-	// predicate swap (unlike the ref-only queries in narrator-session.ts).
-	const newestRefPage = db
-		.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-		.from(narratorMessageRefs)
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				exists(
-					db
-						.select({ one: sql`1` })
-						.from(narratorMessages)
-						.where(
-							and(
-								eq(narratorMessages.id, narratorMessageRefs.messageId),
-								isNull(narratorMessages.parentToolUseId),
-							),
-						),
-				),
-			),
-		)
-		.orderBy(desc(narratorMessageRefs.seq))
-		.limit(FILE_MODIFICATION_TIMELINE_LIMIT + 1)
-		.as("newest_ref_page");
-
-	const newestRefs = await db
-		.select({
-			messageId: newestRefPage.messageId,
-			seq: newestRefPage.seq,
-			role: narratorMessages.role,
-			createdAt: narratorMessages.createdAt,
-		})
-		.from(newestRefPage)
-		.innerJoin(narratorMessages, eq(narratorMessages.id, newestRefPage.messageId))
-		.orderBy(desc(newestRefPage.seq));
-
-	const timelineTruncated = newestRefs.length > FILE_MODIFICATION_TIMELINE_LIMIT;
-	const windowRefs = timelineTruncated
-		? newestRefs.slice(0, FILE_MODIFICATION_TIMELINE_LIMIT)
-		: newestRefs;
-	windowRefs.reverse();
-
-	// Pre-compute which messageIds have file edits
-	const editMessageIds = new Set(allToolCalls.map((tc) => tc.messageId));
-	const timeline = windowRefs.map((ref) => ({
-		messageId: ref.messageId,
-		createdAt: ref.createdAt,
-		seq: ref.seq,
-		role: ref.role,
-		hasEdits: editMessageIds.has(ref.messageId),
-	}));
-
-	// Boundaries are resolved against the database, not the capped timeline: a client
-	// may still hold a messageId from outside the window (a stale tab, a deep link),
-	// and silently dropping the filter there would return the full unfiltered range
-	// instead of the narrower one the caller asked for.
-	const resolveSeq = async (messageId: string): Promise<number | undefined> => {
-		const inWindow = timeline.find((entry) => entry.messageId === messageId);
-		if (inWindow) return inWindow.seq;
-		const [row] = await db
-			.select({ seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, messageId),
-				),
-			)
-			.limit(1);
-		return row?.seq;
-	};
-
-	// Resolve seq boundaries for range filtering
-	const fromSeq = fromMessageId ? await resolveSeq(fromMessageId) : undefined;
-	const toSeq = upToMessageId ? await resolveSeq(upToMessageId) : undefined;
-
-	// Filter tool calls to the [fromSeq, toSeq] range
-	const isRangeFiltered = fromSeq !== undefined || toSeq !== undefined;
-	const filteredToolCalls = allToolCalls.filter((tc) => {
-		if (fromSeq !== undefined && tc.seq <= fromSeq) return false;
-		if (toSeq !== undefined && tc.seq > toSeq) return false;
-		return true;
-	});
-
-	const legacyLocalCwd = await resolveNarratorCwd(narratorId);
-	let grouped: ReturnType<typeof groupByDeviceFileStrict>;
-	try {
-		grouped = groupByDeviceFileStrict(filteredToolCalls, legacyLocalCwd);
-	} catch (error) {
-		return c.json(fileHistoryConflictBody(error), 409);
-	}
-
-	// Built once for the whole snapshot set: canonicalizing per snapshot would rebuild
-	// this map on every iteration, which is O(snapshots × toolCalls) of synchronous work
-	// and froze the event loop for ~4.3s on a 1436 × 7213 narrator.
-	const canonicalAliases = buildCanonicalIdentityAliases(allToolCalls, legacyLocalCwd);
-
-	const files = snapshots
-		.map((snap) => {
-			const identity = canonicalizeDeviceFileIdentityWith(
-				{ deviceId: snap.deviceId, filePath: snap.filePath },
-				canonicalAliases,
-			);
-			const ops = grouped.get(deviceFileKey(identity))?.calls ?? [];
-			if (isRangeFiltered && ops.length === 0) return null; // hide files with no ops in filtered mode
-			return {
-				deviceId: identity.deviceId,
-				filePath: identity.filePath,
-				pathFlavor: identity.pathFlavor,
-				identityKey: identity.identityKey,
-				snapshotId: snap.id,
-				originalExists: Number(snap.originalExists) === 1,
-				editCount: ops.length,
-				lastModifiedAt: ops.length > 0 ? ops[ops.length - 1].createdAt : snap.createdAt,
-				operations: ops.map((op) => ({
-					toolUseId: op.toolUseId,
-					toolName: op.toolName,
-					messageId: op.messageId,
-					createdAt: op.createdAt,
-				})),
-			};
-		})
-		.filter(Boolean);
-
-	return c.json({ files, timeline, timelineTruncated });
-});
-
-/** Revert a single file to its original state (before narrator touched it) */
-narratorRoutes.post("/:id/revert-file", async (c) => {
-	const narratorId = c.req.param("id");
-	const body = await c.req.json<{ deviceId?: string; filePath: string }>();
-	if (!body.filePath) return c.json({ error: "filePath is required" }, 400);
-	const deviceId = body.deviceId ?? "local";
-
-	if (isNarratorActive(narratorId)) {
-		return c.json({ error: "Cannot revert while narrator is running" }, 409);
-	}
-
-	const snap = await db.query.narratorFileSnapshots.findFirst({
-		where: and(
-			eq(narratorFileSnapshots.narratorId, narratorId),
-			eq(narratorFileSnapshots.deviceId, deviceId),
-			eq(narratorFileSnapshots.filePath, body.filePath),
-		),
-		columns: { filePath: true },
-	});
-	if (!snap) return c.json({ error: "No snapshot found for this file" }, 404);
-	// First-touch text is viewing material, not a verified operation or an expected
-	// current version. Do not read the full baseline just to reject unsafe replay.
-	return c.json(
-		revertConflictBody(
-			unavailableSnapshotRevert(
-				"legacy_unverified: a first-touch text snapshot cannot safely authorize file rollback.",
-				snap.filePath,
-			),
-		),
-		409,
-	);
 });
 
 /**
@@ -6530,8 +6409,7 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 /**
  * Preview the files that deleting a single tool_use block would roll back.
  *
- * Separate from `/delete-preview`, which describes "this message and everything
- * after it". A block deletion reverses exactly one recorded call, so its preview
+ * A block deletion reverses exactly one recorded call, so its preview
  * has to come from the tool-use scope or it would overstate what is removed.
  *
  * Contents are attached because this response also backs the diff view; without
@@ -6586,96 +6464,6 @@ narratorRoutes.get("/:id/block-delete-preview", async (c) => {
 		conflicts: preview.conflicts,
 		...(preview.subagentWarning ? { subagentWarning: preview.subagentWarning } : {}),
 	});
-});
-
-/** Preview file changes that would be reverted if a message is deleted */
-narratorRoutes.get("/:id/delete-preview", async (c) => {
-	const narratorId = c.req.param("id");
-	const messageId = c.req.query("messageId");
-	if (!messageId) return c.json({ error: "messageId query param is required" }, 400);
-
-	const targetRef = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-		columns: { seq: true },
-	});
-	if (!targetRef) return c.json({ error: "Message not found" }, 404);
-
-	// The tree-snapshot path below only reports a count, so resolve that with an
-	// aggregate first. Loading the rows to call `.length` would pull every
-	// `input_json` — Write calls carry whole file bodies — for nothing.
-	const revertScopeFilter = and(
-		eq(narratorToolCalls.narratorId, narratorId),
-		eq(narratorToolCalls.status, "success"),
-		gte(narratorMessageRefs.seq, targetRef.seq),
-	);
-	const revertScopeJoin = and(
-		eq(narratorMessageRefs.narratorId, narratorId),
-		eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-	);
-
-	// Deletion reverts files too, so the preview describes both scopes — with file
-	// contents attached, because this response also backs the diff view.
-	const scopes = await buildRevertScopePreviews(narratorId, targetRef.seq, true);
-	if (scopes) {
-		const [counted] = await db
-			.select({ value: countFn() })
-			.from(narratorToolCalls)
-			.innerJoin(narratorMessageRefs, revertScopeJoin)
-			.where(revertScopeFilter);
-		return c.json({ ...scopes, toolCallCount: counted?.value ?? 0 });
-	}
-
-	// Find all tool calls at or after the target message. Only the replay path needs
-	// the recorded inputs, so this query stays behind the tree-snapshot branch.
-	const toolCallsToRevert = await db
-		.select({
-			toolUseId: narratorToolCalls.toolUseId,
-			toolName: narratorToolCalls.toolName,
-			inputJson: narratorToolCalls.inputJson,
-			executionDeviceId: narratorToolCalls.executionDeviceId,
-			executionCwd: narratorToolCalls.executionCwd,
-			executionPathFlavor: narratorToolCalls.executionPathFlavor,
-			resolvedFilePath: narratorToolCalls.resolvedFilePath,
-			canonicalFilePath: narratorToolCalls.canonicalFilePath,
-			runtimeGeneration: narratorToolCalls.runtimeGeneration,
-			executionTargetsJson: narratorToolCalls.executionTargetsJson,
-		})
-		.from(narratorToolCalls)
-		.innerJoin(narratorMessageRefs, revertScopeJoin)
-		.where(revertScopeFilter);
-
-	let affectedFiles: DeviceFileIdentity[];
-	try {
-		affectedFiles = getAffectedDeviceFilesStrict(
-			toolCallsToRevert,
-			await resolveNarratorCwd(narratorId),
-		);
-	} catch (error) {
-		return c.json(fileHistoryConflictBody(error), 409);
-	}
-	if (affectedFiles.length === 0) return c.json({ affectedFiles: [], toolCallCount: 0 });
-
-	const excludeIds = new Set(toolCallsToRevert.map((tc) => tc.toolUseId));
-	let currentStates: Map<string, DeviceFileState>;
-	let revertedStates: Map<string, DeviceFileState>;
-	try {
-		currentStates = await rebuildDeviceFileStatesExcluding(narratorId, affectedFiles, new Set());
-		revertedStates = await rebuildDeviceFileStatesExcluding(narratorId, affectedFiles, excludeIds);
-	} catch (error) {
-		return c.json(fileHistoryConflictBody(error), 409);
-	}
-
-	const affectedFilePreviews = affectedFiles.map((identity) => ({
-		...identity,
-		currentContent: currentStates.get(deviceFileKey(identity))?.content ?? null,
-		revertedContent: revertedStates.get(deviceFileKey(identity))?.content ?? null,
-		willBeDeleted: revertedStates.get(deviceFileKey(identity))?.content === null,
-	}));
-
-	return c.json({ affectedFiles: affectedFilePreviews, toolCallCount: toolCallsToRevert.length });
 });
 
 /** Preview file state for a pending Write/Edit permission request */

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { KIMI_QUOTA_EXHAUSTED } from "@shared/agent-protocol/quota-exhausted";
+import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
 import { formatOriginLabel } from "@shared/message-origin";
@@ -31,6 +32,7 @@ import {
 	resolveAutoContinuationMode,
 	resolveBooleanOverride,
 } from "../../lib/boolean-override";
+import { queueContextCharacterRefresh } from "../../lib/context-characters";
 import { withDbRetry } from "../../lib/db-resilience";
 import { resolveInjectedDevices } from "../../lib/device-injection-trait";
 import { resolveFastModeForUser } from "../../lib/fast-mode";
@@ -101,6 +103,7 @@ import {
 	toBufferSummary,
 } from "../narrator-buffer";
 import { runCustomCompact, runPlanCompact } from "../narrator-compact";
+import { freezeNarratorContextComposition } from "../narrator-context-composition";
 import {
 	clearStreamingSnapshot,
 	type EventHandlerContext,
@@ -150,7 +153,7 @@ import {
 	getLatestSubagentParentToolUseId,
 	getSubagentFinalText,
 	getSubagentResultMessageId,
-	hasPendingBufferedWork,
+	hasPendingBufferedGuidance,
 	inheritedModelRuntime,
 	maybeStartContinuation,
 	parseQueuedGoalCommand,
@@ -211,6 +214,7 @@ import {
 	markPendingStopTakeover,
 } from "../subagent-takeover";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
+import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
 import { resolveEffectiveTraits } from "../trait-layer-service";
 import { buildTreeSnapshotExecutionHooks, FILE_MUTATING_TOOLS } from "../tree-snapshot-loop-hooks";
 import {
@@ -234,6 +238,7 @@ import { buildRuntimeHistory } from "./history";
 import { createRuntimeRunState, type RuntimeProfile, type RuntimeRunOutcome } from "./input";
 import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
 import { resolveRuntimePolicy } from "./policy";
+import { countRuntimeSystemCharacters } from "./prompt-characters";
 import type { RuntimeRecoveryState, RuntimeRecoveryTransition } from "./transition";
 import { selectRuntimeInterruption, selectRuntimeRecovery } from "./transition";
 
@@ -503,6 +508,13 @@ export async function runAgentLoopUnlocked(
 
 	try {
 		while (active.alive && owner.isCurrent()) {
+			// Request-only control has one pass lifetime; a new pass must never inherit
+			// an already-consumed guidance abort from the preceding request.
+			active._guidanceAbortController = new AbortController();
+			active._urgentGuidanceAbortController = new AbortController();
+			if (active._bufferSoftStop && hasPendingBufferedGuidance(narratorId)) {
+				active._guidanceAbortController.abort(new Error("Immediate guidance requested"));
+			}
 			if (runState.pendingPrePromptBashCommand && !active.abortController.signal.aborted) {
 				const command = runState.pendingPrePromptBashCommand;
 				runState.pendingPrePromptBashCommand = undefined;
@@ -548,6 +560,13 @@ export async function runAgentLoopUnlocked(
 			// Rebuild system prompt each iteration so AGENTS.md/CLAUDE.md changes are picked up.
 			const modelVersionBeforeLoad = active._modelRefreshVersion;
 			const freshNarrator = await narratorService.getById(narratorId);
+			if (profile.kind === "primary" || active._workspaceContext) {
+				if (active._workspaceInstallFailed)
+					throw new Error("Workspace context installation requires session recovery");
+				const { workspaceContextService } = await import("../workspace-context-service");
+				active._workspaceContext = await workspaceContextService.get(narratorId);
+				active._workspacePassInvalidated = false;
+			}
 			const oauthRuntime = await assertOAuthNarratorRuntimeActive(
 				narratorId,
 				active._currentUserId,
@@ -665,7 +684,25 @@ export async function runAgentLoopUnlocked(
 			}
 			runState.firstPass = false;
 
-			const { prompt: freshSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
+			const storeRuntimeCharacters = async (values: {
+				systemChars?: number;
+				toolsChars?: number;
+			}) => {
+				try {
+					const { storeContextRuntimeCharacters } = await import("../narrator-context-composition");
+					await storeContextRuntimeCharacters(narratorId, values);
+				} catch (error) {
+					logger.warn("Failed to store context runtime characters", {
+						narratorId,
+						error: String(error),
+					});
+				}
+			};
+			const {
+				prompt: freshSystemPrompt,
+				usedCompactSummary,
+				summaryRange,
+			} = await buildSystemPrompt(
 				{
 					systemPrompt: oauthRuntime
 						? (oauthRuntime.systemPrompt ?? null)
@@ -693,6 +730,14 @@ export async function runAgentLoopUnlocked(
 						? await profile.rebuildSystemPrompt(freshNarrator.contextSummary)
 						: profile.systemPrompt
 					: freshSystemPrompt;
+			const initialSystemChars = countRuntimeSystemCharacters(
+				active.systemPrompt,
+				freshNarrator.contextSummary,
+				profile.kind === "primary" ? summaryRange : undefined,
+			);
+			// Already-held prompt/summary memory, never a cache count or a GET body read.
+			let runtimeSummaryChars = (active.systemPrompt?.length ?? 0) - initialSystemChars;
+			await storeRuntimeCharacters({ systemChars: initialSystemChars });
 			active._usedCompactSummary = usedCompactSummary;
 
 			const eventContext: EventHandlerContext = createRuntimeEventContext({
@@ -764,15 +809,20 @@ export async function runAgentLoopUnlocked(
 				},
 				rebuildSystemPrompt: async () => {
 					const freshNarrator = await narratorService.getById(narratorId);
-					if (profile.kind === "subagent")
-						return profile.rebuildSystemPrompt
-							? profile.rebuildSystemPrompt(freshNarrator.contextSummary)
+					if (profile.kind === "subagent") {
+						const prompt = profile.rebuildSystemPrompt
+							? await profile.rebuildSystemPrompt(freshNarrator.contextSummary)
 							: profile.systemPrompt;
+						const systemChars = countRuntimeSystemCharacters(prompt, freshNarrator.contextSummary);
+						runtimeSummaryChars = (prompt?.length ?? 0) - systemChars;
+						await storeRuntimeCharacters({ systemChars });
+						return prompt;
+					}
 					const freshOAuthRuntime = await assertOAuthNarratorRuntimeActive(
 						narratorId,
 						active._currentUserId,
 					);
-					const { prompt } = await buildSystemPrompt(
+					const { prompt, summaryRange } = await buildSystemPrompt(
 						{
 							systemPrompt: freshOAuthRuntime
 								? (freshOAuthRuntime.systemPrompt ?? null)
@@ -793,6 +843,13 @@ export async function runAgentLoopUnlocked(
 						// model being told to write somewhere the gate then rejects.
 						active._planFilePath,
 					);
+					const systemChars = countRuntimeSystemCharacters(
+						prompt,
+						freshNarrator.contextSummary,
+						summaryRange,
+					);
+					runtimeSummaryChars = (prompt?.length ?? 0) - systemChars;
+					await storeRuntimeCharacters({ systemChars });
 					// NOTE: Do NOT set active.systemPrompt here — the returned value
 					// flows through onBeforeTurn → loop.ts which updates config.systemPrompt.
 					// Setting active.systemPrompt would create a second source of truth.
@@ -875,6 +932,13 @@ export async function runAgentLoopUnlocked(
 							relaxedPlan: true,
 						});
 					}
+					if (planState.planReflectionDisabled) {
+						broadcastToNarrator(narratorId, {
+							type: "reflection_overrides_changed",
+							narratorId,
+							planReflectionAutoApproveOverride: "off",
+						});
+					}
 					active._preparedPlanModes?.delete(toolCallId);
 				},
 				onEnterPlanModeFailed: async (toolCallId, toolUseId) => {
@@ -934,8 +998,13 @@ export async function runAgentLoopUnlocked(
 					if (!active._usedCompactSummary) return;
 					await db
 						.update(narrators)
-						.set({ contextSummary: null, updatedAt: new Date().toISOString() })
+						.set({
+							contextSummary: null,
+							contextSummaryChars: 0,
+							updatedAt: new Date().toISOString(),
+						})
 						.where(eq(narrators.id, narratorId));
+					queueContextCharacterRefresh(narratorId);
 					active._usedCompactSummary = false;
 				},
 				onToolResult: (event) => {
@@ -1124,16 +1193,53 @@ export async function runAgentLoopUnlocked(
 			const availableDevices = turnSessionDevices;
 
 			let toolCallLimitExceeded = false;
+			const passWorkspaceContext = active._workspaceContext;
 			const config: import("../../lib/agent").AgentConfig = {
+				// Freeze this logical run's segment across every retry/compact pass.
+				executionSegmentId: profile.kind === "subagent" ? profile.executionSegmentId : undefined,
 				runtimePolicy,
 				narratorId,
 				conversationId: active.conversationId,
 				model: resolved.model,
 				provider: resolved.provider,
 				cwd: active.cwd,
+				workspaceContext: passWorkspaceContext,
+				assertWorkspaceCurrent: passWorkspaceContext
+					? () => {
+							if (
+								active._workspaceInstallFailed ||
+								active._workspacePassInvalidated ||
+								active._workspaceContext?.revision !== passWorkspaceContext.revision ||
+								active._workspaceContext?.contextKey !== passWorkspaceContext.contextKey
+							)
+								throw new Error("Workspace changed; this old pass cannot start more tools");
+						}
+					: undefined,
+				switchWorkingDirectory:
+					profile.kind === "primary" && !oauthRuntime
+						? async (request) => {
+								const { workspaceContextService } = await import("../workspace-context-service");
+								return workspaceContextService.switch(narratorId, request, {
+									origin: "agent",
+									active,
+									userId: active._currentUserId,
+								});
+							}
+						: undefined,
 				systemPrompt: active.systemPrompt ?? undefined,
+				onToolsCharacters: (toolsChars) => storeRuntimeCharacters({ toolsChars }),
+				freezeContextComposition: (counts, requestId, startedAt) =>
+					freezeNarratorContextComposition(
+						narratorId,
+						counts,
+						requestId,
+						startedAt,
+						runtimeSummaryChars,
+					),
 				locale,
 				signal: active.abortController.signal,
+				guidanceSignal: active._guidanceAbortController.signal,
+				urgentGuidanceSignal: active._urgentGuidanceAbortController.signal,
 				chapterId: active._chapterId,
 				parentNarratorId: saParentNarratorId,
 				parentToolUseId: saParentToolUseId,
@@ -1181,9 +1287,8 @@ export async function runAgentLoopUnlocked(
 				skillScopeKey: active._skillScopeKey ?? undefined,
 				userId: active._currentUserId ?? null,
 				projectId: oauthRuntime?.projectId ?? active._projectId ?? null,
-				get defaultDeviceId() {
-					return active._defaultDeviceId ?? null;
-				},
+				// A pass owns its device identity; selection changes only affect the next pass.
+				defaultDeviceId: active._defaultDeviceId ?? null,
 				availableDevices,
 				setDefaultDevice: oauthRuntime
 					? async (deviceId) => {
@@ -1234,6 +1339,13 @@ export async function runAgentLoopUnlocked(
 				disabledTools: active._disabledTools,
 				allowedTools: oauthRuntime ? new Set(oauthRuntime.allowedTools) : undefined,
 				allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
+				onToolExecutionFinalAuthorization: buildFinalToolStartAuthorization({
+					narratorId,
+					cwd: active.cwd,
+					signal: active.abortController.signal,
+					userId: active._currentUserId,
+					reviewReadOnlyBash: profile.kind === "subagent" && profile.subagentType === "review",
+				}),
 				runtimeAuthorizationGuard: oauthRuntime
 					? async () => {
 							await assertOAuthNarratorRuntimeActive(narratorId, active._currentUserId);
@@ -1278,7 +1390,7 @@ export async function runAgentLoopUnlocked(
 				permissionHandler: (toolName, input, toolUseId, options) =>
 					handlePermission(
 						narratorId,
-						active.abortController.signal,
+						options?.signal ?? active.abortController.signal,
 						toolName,
 						input,
 						toolUseId,
@@ -1425,6 +1537,14 @@ export async function runAgentLoopUnlocked(
 					);
 				},
 				shouldStop: () => {
+					// Cancellation is irreversible even when the queued guidance has since
+					// been removed/downgraded. Record the actual pass interruption using
+					// its captured signals, independently of whether input remains. This
+					// keeps ordinary next steps behind recovery of the unfinished work.
+					if (config.guidanceSignal?.aborted || config.urgentGuidanceSignal?.aborted) {
+						active._bufferSoftStopTaken = true;
+					}
+					if (active._workspacePassInvalidated || active._workspaceInstallFailed) return true;
 					if (profile.kind === "subagent" && shouldStopSubagentForBufferedMessageSync(narratorId)) {
 						active._bufferSoftStopTaken = true;
 						return true;
@@ -1432,7 +1552,7 @@ export async function runAgentLoopUnlocked(
 					const decision = evaluateSoftStopRequest({
 						feedbackSoftStop: active._feedbackSoftStop,
 						bufferSoftStop: active._bufferSoftStop,
-						hasPendingBufferedWork: hasPendingBufferedWork(narratorId),
+						hasPendingBufferedWork: hasPendingBufferedGuidance(narratorId),
 					});
 					active._feedbackSoftStop = decision.feedbackSoftStop;
 					active._bufferSoftStop = decision.bufferSoftStop;
@@ -1739,6 +1859,18 @@ export async function runAgentLoopUnlocked(
 				hooks,
 			});
 			runState.lastPass = result;
+			if (
+				active._workspacePassInvalidated &&
+				!active._workspaceInstallFailed &&
+				!active.abortController.signal.aborted
+			) {
+				// Rebuild config, permissions, skills, prompt and file-reference lanes together.
+				active._workspacePassInvalidated = false;
+				runState.input.text =
+					"Working directory changed. Continue using the newly installed workspace context; unstarted calls from the previous pass were not executed.";
+				runState.input.images = undefined;
+				continue;
+			}
 			if (toolCallLimitExceeded) {
 				// Stop before any retry, review/task continuation or buffered-message replay.
 				// A new explicit user turn can still start normally; no persistent latch.
@@ -2479,6 +2611,7 @@ export async function runAgentLoopUnlocked(
 				!active.abortController.signal.aborted
 			) {
 				const input = await consumeNextBufferedSubagentMessage({
+					onlyGuidance: active._bufferSoftStopTaken === true,
 					narratorId,
 					parentNarratorId: profile.parentNarratorId,
 					toolUseId: profile.parentToolUseId,
@@ -2508,12 +2641,16 @@ export async function runAgentLoopUnlocked(
 				const bufferedRow = await withNarratorMutationAdmission(narratorId, async () => {
 					if (active.abortController.signal.aborted) return undefined;
 					return claimInboxHead(narratorId, (candidate) => {
+						if (
+							active.abortController.signal.aborted ||
+							candidate.kind !== "user_input" ||
+							(active._bufferSoftStopTaken && bufferedRowMode(candidate) === "turn")
+						)
+							return false;
+						// A blocked ordinary next step must not end unfinished recovery
+						// merely because its later execution needs a fresh owner/model.
 						requiresFreshTurn = mailboxInputRequiresFreshTurn(candidate);
-						return (
-							!active.abortController.signal.aborted &&
-							candidate.kind === "user_input" &&
-							!requiresFreshTurn
-						);
+						return !requiresFreshTurn;
 					});
 				});
 				// Let the finalizer restore the previous model and release its epoch first.
@@ -2549,6 +2686,14 @@ export async function runAgentLoopUnlocked(
 					}
 					// Broadcast which message was consumed + remaining queue snapshot
 					const remaining = toBufferSummary(await getBufferedMessagesAsync(narratorId));
+					active._bufferGuidancePending = remaining.some(
+						(message) =>
+							message.state !== "failed" &&
+							resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
+					);
+					// Materialize accumulated guidance before starting another model
+					// request, so one request sees the whole FIFO batch.
+					active._bufferSoftStop = active._bufferGuidancePending;
 					broadcastToNarrator(narratorId, {
 						type: "buffer_consumed",
 						narratorId,

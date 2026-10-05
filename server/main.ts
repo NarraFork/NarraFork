@@ -50,7 +50,7 @@ import {
 	registerServerRestart,
 } from "./lib/server-restart";
 import { settings } from "./lib/settings";
-import { ShutdownActivityTracker } from "./lib/shutdown-activity";
+import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
 import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
 import {
 	buildHealthPayload,
@@ -69,6 +69,7 @@ import {
 	nextAllowedPort,
 	readWindowsExcludedPortRanges,
 } from "./lib/windows-excluded-ports";
+import { shutdownPrivateArchiveWorkers } from "./services/narrator-backup/worker-client";
 import { pluginManager } from "./services/plugin-manager";
 import { pluginProviderRegistry } from "./services/plugin-provider-registry";
 import {
@@ -1766,6 +1767,7 @@ async function performGracefulShutdown(
 		await shutdownStep(tracker, "integrityProbe.cancel", () => cancelBackgroundIntegrityCheck());
 		// Read workers hold their own read-only SQLite connections; terminate them before the clean
 		// marker is written so no thread is still touching the database afterwards.
+		await shutdownStep(tracker, "privateArchiveWorkers.shutdown", shutdownPrivateArchiveWorkers);
 		await shutdownStep(tracker, "dbWorkerPool.shutdown", () => shutdownDbWorkerPool());
 		// PostgreSQL: stop accepting new operations and close the client, in drain order — after
 		// HTTP/WS handlers have drained, before the lock release below. A no-op on the SQLite
@@ -1775,10 +1777,10 @@ async function performGracefulShutdown(
 		await shutdownStep(tracker, "pluginManager.shutdown", () => pluginManager.shutdown());
 		unregisterExternalProviderResolver();
 		await shutdownStep(tracker, "mcpManager.shutdown", () => mcpManager.shutdown());
-		// Seamless-update handoff only: persist active browser sessions and flip the pool into
-		// preserve-on-close mode so the following browserPool.close disconnects (keeps Chrome alive)
-		// instead of killing it. A normal shutdown skips this and closes the browser as usual.
-		if (options.reason === "replacement_started") {
+		// Checkpoint-backed update/system shutdown: persist active browser sessions and flip the
+		// pool into preserve-on-close mode so browserPool.close disconnects (keeps Chrome alive)
+		// for recovery. A normal shutdown skips this and closes the browser as usual.
+		if (preservesRecoveryOnShutdown(options.reason)) {
 			await shutdownStep(tracker, "browserSessions.persistForUpdate", () =>
 				import("./services/browser-session-recovery").then(({ persistBrowserSessionsForUpdate }) =>
 					persistBrowserSessionsForUpdate(),
@@ -1845,13 +1847,18 @@ registerGracefulShutdownHandler(async (request) => {
  * Administrator-initiated shutdown with no successor process.
  *
  * Unlike the handoff path above, nothing is coming to take over the port: the user asked to stop
- * this version so they can launch the prepared binary themselves. So this runs the full teardown
- * — child processes included — rather than the handoff variant that deliberately leaves Bash
- * processes and the browser alive for a replacement to inherit.
+ * this version so they can launch the prepared binary themselves. Ordinary manual-update
+ * shutdown runs full teardown. Explicit system preparation instead preserves checkpoint-backed
+ * processes and browser sessions for the next manually started server.
  */
 registerOperatorShutdownHandler(async ({ reason }) => {
 	logger.info("Administrator requested shutdown", { reason });
-	const result = await performGracefulShutdown({ reason });
+	const preserveForRecovery = preservesRecoveryOnShutdown(reason);
+	const result = await performGracefulShutdown({
+		reason,
+		skipWindowsProcessTreeKill: preserveForRecovery,
+		skipBashProcessKill: preserveForRecovery,
+	});
 	setTimeout(() => process.exit(0), 250);
 	return result;
 });

@@ -1,5 +1,5 @@
 import { realpath } from "node:fs/promises";
-import { and, asc, eq, gt, inArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { db } from "../db";
 import { chapters, projects, remoteDevices } from "../db/schema";
@@ -10,7 +10,6 @@ import { narratorPrincipalOf } from "../lib/narrator-access";
 import { getHome } from "../lib/platform";
 import { narraforkDir } from "../lib/settings";
 import { isDeviceAuthorized } from "./device-service";
-import type { CompiledExecutionPolicy } from "./execution-policy/compiler";
 import { executionPolicyEngine } from "./execution-policy/engine";
 import type { ExecutionDeviceClass, ExecutionTargetContext } from "./execution-policy/types";
 import {
@@ -19,6 +18,7 @@ import {
 	resolveNarratorGitTarget,
 } from "./git-workspace";
 import { ACCESS_PAGE_SIZE, GitAccessScan } from "./git-workspace-access-scan";
+import { gitPathPolicyAllows } from "./git-workspace-path-policy";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { canWriteNarrator, loadNarratorForAccess, type NarratorPrincipal } from "./narrator-acl";
 import { resolveOAuthDeviceRuntimeAuthorization } from "./oauth-device-runtime-policy";
@@ -41,6 +41,7 @@ function redactDeniedTarget(target: GitWorkspaceTarget): void {
 	delete workspace.chapterId;
 	delete workspace.projectId;
 	delete target.repositoryPath;
+	delete workspace.branch;
 }
 
 async function requireSafeLocalGitPath(target: GitWorkspaceTarget, path: string): Promise<void> {
@@ -61,35 +62,7 @@ async function requireSafeLocalGitPath(target: GitWorkspaceTarget, path: string)
 		throw denied();
 }
 
-/** A whole-tree operation cannot skip forbidden descendants or widen a subtree grant. */
-export function gitPathPolicyAllows(
-	policy: CompiledExecutionPolicy,
-	context: ExecutionTargetContext,
-	root: string,
-	need: "read" | "write",
-): boolean {
-	const paths = context.paths;
-	if (
-		policy.directoryBlacklist.some(
-			(rule) =>
-				rule.enabled &&
-				(rule.denyLevel === "denyAll" || need === "write") &&
-				(paths.contains(root, rule.path) || paths.contains(rule.path, root)),
-		)
-	)
-		return false;
-	const decision = policy.evaluatePath({ path: root, operation: need });
-	if (decision.decision === "deny") return false;
-	// An explicit narrower grant is not permission to manage its containing repository.
-	// Only rules strictly INSIDE root count: a whitelist only ever grants, so an ancestor
-	// (or identical) rule with a lower access level — e.g. a readOnly grant on the parent
-	// directory holding sibling projects — must not downgrade the narrator's own workspace.
-	const scoped = policy.directoryWhitelist.filter(
-		(rule) => paths.contains(root, rule.path) && !paths.equals(root, rule.path),
-	);
-	if (scoped.length > 0 && decision.decision !== "allow") return false;
-	return true;
-}
+export { gitPathPolicyAllows } from "./git-workspace-path-policy";
 
 function ancestors(path: string, target: GitWorkspaceTarget): string[] {
 	const paths = target.backend?.paths;
@@ -104,8 +77,26 @@ function ancestors(path: string, target: GitWorkspaceTarget): string[] {
 }
 
 /** Bound both rows and fields. Standalone cwd must not bypass a protected project's ACL. */
-async function relatedProjects(target: GitWorkspaceTarget, scan: GitAccessScan) {
-	if (!target.backend || target.backend.kind !== "local" || !target.workspace.rootPath) return [];
+async function relatedProjects(
+	target: GitWorkspaceTarget,
+	scan: GitAccessScan,
+	principal: NarratorPrincipal,
+) {
+	if (
+		principal.isAdmin ||
+		!target.backend ||
+		target.backend.kind !== "local" ||
+		!target.workspace.rootPath
+	)
+		return [];
+	// Owner/admin always pass both project gates. Their associations cannot narrow
+	// capabilities, so do not enumerate/realpath their entire project inventory on
+	// first paint. Foreign (including null-owner) aliases still fail closed and
+	// receive fresh ACL checks; no permission verdict is cached.
+	const foreignProject = or(
+		isNull(projects.ownerUserId),
+		ne(projects.ownerUserId, principal.userId),
+	);
 	const root = target.workspace.rootPath;
 	const candidates = new Set([
 		...ancestors(root, target),
@@ -129,6 +120,7 @@ async function relatedProjects(target: GitWorkspaceTarget, scan: GitAccessScan) 
 			.from(projects)
 			.where(
 				and(
+					foreignProject,
 					cursor ? gt(projects.id, cursor) : undefined,
 					or(
 						inArray(projects.gitPath, [...candidates]),
@@ -157,7 +149,11 @@ async function relatedProjects(target: GitWorkspaceTarget, scan: GitAccessScan) 
 		const missing = [...new Set(page.map((row) => row.projectId))].filter((id) => !matches.has(id));
 		if (!missing.length) continue;
 		const rows = await scan.run(() =>
-			db.select(fields).from(projects).where(inArray(projects.id, missing)).limit(ACCESS_PAGE_SIZE),
+			db
+				.select(fields)
+				.from(projects)
+				.where(and(foreignProject, inArray(projects.id, missing)))
+				.limit(ACCESS_PAGE_SIZE),
 		);
 		for (const row of rows) matches.set(row.id, row);
 	}
@@ -167,7 +163,7 @@ async function relatedProjects(target: GitWorkspaceTarget, scan: GitAccessScan) 
 		db
 			.select(fields)
 			.from(projects)
-			.where(cursor ? gt(projects.id, cursor) : undefined)
+			.where(and(foreignProject, cursor ? gt(projects.id, cursor) : undefined))
 			.orderBy(asc(projects.id))
 			.limit(ACCESS_PAGE_SIZE),
 	)) {
@@ -200,6 +196,7 @@ export async function authorizeGitTargetForPrincipal(
 	source: { narratorId: string } | { chapterId: string },
 	need: "read" | "write",
 	signal: AbortSignal,
+	cachedDiscovery = false,
 ): Promise<GitWorkspaceTarget> {
 	let canWrite = true;
 	let policy: Awaited<ReturnType<typeof resolveOAuthNarratorRuntimePolicy>> = null;
@@ -297,6 +294,7 @@ export async function authorizeGitTargetForPrincipal(
 				);
 				if (need === "write" && !canWrite) throw denied();
 			},
+			cachedDiscovery && need === "read",
 		);
 	} else {
 		await assertChapterProjectAccess(source.chapterId, principal, need);
@@ -316,7 +314,7 @@ export async function authorizeGitTargetForPrincipal(
 	const root = workspace.rootPath;
 	const scan = new GitAccessScan(signal);
 	try {
-		for (const project of await relatedProjects(target, scan)) {
+		for (const project of await relatedProjects(target, scan, principal)) {
 			if (!(await scan.run(() => hasProjectAccess(project, principal, "read")))) throw denied();
 			canWrite &&= await scan.run(() => hasProjectAccess(project, principal, "write"));
 		}

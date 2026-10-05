@@ -59,6 +59,8 @@ const TRUNCATED_PREFIX = "\u0000truncated:";
 export interface FileTreeContentProps {
 	/** Absolute path of the tree root — the narrator's cwd. */
 	root: string;
+	/** Frozen device/revision/context identity supplied by the narrator-bound host. */
+	contextKey?: string;
 	showHidden: boolean;
 	/** File figures plus pre-aggregated directory figures, keyed by tree-relative path. */
 	lineStats?: ReadonlyMap<string, TreeLineStats>;
@@ -110,6 +112,7 @@ function buildNodes(
 
 export function FileTreeContent({
 	root,
+	contextKey,
 	showHidden,
 	lineStats,
 	lineStatsTruncated = false,
@@ -118,7 +121,11 @@ export function FileTreeContent({
 	registerIngest,
 }: FileTreeContentProps) {
 	const { t } = useTranslation("narrator");
-	const { state, loading, errors, load, reload, reloadAll, ingest } = useFileTree(root, showHidden);
+	const { state, loading, errors, load, reload, reloadAll, ingest } = useFileTree(
+		root,
+		showHidden,
+		contextKey,
+	);
 
 	// Hand the patch entry point to the panel, which owns the WS subscription. In an
 	// effect rather than the render body: publishing a callback is a side effect, and

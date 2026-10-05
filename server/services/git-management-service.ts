@@ -1,6 +1,7 @@
 import { lstat, realpath } from "node:fs/promises";
 import { AppError, ValidationError } from "../lib/errors";
 import { invalidateBoundaries } from "./git-commit-boundary-cache";
+import { gitDiscoveryCache } from "./git-discovery-cache";
 import { gitService } from "./git-service";
 import { invalidateStatus } from "./git-status-cache";
 import { type GitWorkspaceTarget, normalizeWorkspacePath } from "./git-workspace";
@@ -16,6 +17,12 @@ export function gitManagementService(target: GitWorkspaceTarget, signal?: AbortS
 }
 
 export function invalidateGitWorkspace(target: GitWorkspaceTarget): void {
+	gitDiscoveryCache.invalidate(
+		target.workspace.deviceId,
+		target.workspace.rootPath ?? target.workspace.cwd,
+		target.repositoryPath,
+		target.backend?.paths.equals,
+	);
 	// Remote reads deliberately have no host-path cache. Local legacy consumers keep sharing theirs.
 	if (target.backend?.kind === "local" && target.workspace.rootPath) {
 		invalidateStatus(target.workspace.rootPath);

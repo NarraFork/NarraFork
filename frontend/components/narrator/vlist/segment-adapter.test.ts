@@ -2254,8 +2254,8 @@ describe("folded tool rows — drill-down payload", () => {
 		inputJson: { file_path: "/a/b.ts" },
 		outputJson: { _text: "line1\nline2\n" },
 	});
-	const msgWith = (blocks: unknown[], id = "m1") =>
-		({ id, role: "assistant", contentJson: blocks }) as never;
+	const msgWith = (blocks: unknown[], id = "m1", model?: string) =>
+		({ id, role: "assistant", contentJson: blocks, model }) as never;
 	const activityRows = (spec: { data: unknown }): Row[] => (spec.data as { items: Row[] }).items;
 
 	it("a collapsed row carries no card (the fold stays cheap)", async () => {
@@ -2309,7 +2309,7 @@ describe("folded tool rows — drill-down payload", () => {
 	it("reports the expanded row's index over the EMITTED rows, not the input items", async () => {
 		const { adaptActivityUnit } = await import("./segment-adapter");
 		const blocks = [{ type: "reasoning", text: "**A**\n\nfirst\n\n**B**\n\nsecond" }];
-		const msg = msgWith(blocks);
+		const msg = msgWith(blocks, "m1", "gpt-5.6");
 		const items = [
 			{ kind: "reasoning" as const, msg, blockIndex: 0, block: blocks[0] as never },
 			{ kind: "tool" as const, msg, blockIndex: 1, tc: readTc() },
@@ -2336,7 +2336,7 @@ describe("folded tool rows — drill-down payload", () => {
 		const { adaptActivityUnit } = await import("./segment-adapter");
 		const openedFor = (text: string) => {
 			const blocks = [{ type: "reasoning", text }];
-			const msg = msgWith(blocks);
+			const msg = msgWith(blocks, "m1", "gpt-5.6");
 			const spec = adaptActivityUnit(
 				[
 					{ kind: "reasoning" as const, msg, blockIndex: 0, block: blocks[0] as never },
@@ -2508,6 +2508,7 @@ describe("folded tool rows — drill-down payload", () => {
 		const { adaptActivityUnit } = await import("./segment-adapter");
 		const msg = {
 			id: "m-reason",
+			model: "gpt-5.6",
 			role: "assistant" as const,
 			contentJson: [
 				{
@@ -2538,6 +2539,7 @@ describe("folded tool rows — drill-down payload", () => {
 		const { adaptActivityUnit } = await import("./segment-adapter");
 		const msg = {
 			id: "__streaming__",
+			model: "gpt-5.6",
 			role: "assistant" as const,
 			contentJson: [
 				{ type: "reasoning", text: ["**Check the cache**", "The key folds lod in."].join("\n") },
@@ -2576,6 +2578,97 @@ describe("folded tool rows — drill-down payload", () => {
 	});
 });
 
+describe("structured reasoning model gate", () => {
+	const models = [
+		"gpt-5.6",
+		"nug:openai:GPT-5.6",
+		"claude-sonnet-4.6",
+		"gemini-3",
+		undefined,
+	] as const;
+
+	it.each([
+		1, 2, 3, 4, 5,
+	] as const)("L%s gates short titles and the long-single shortcut for live and historical messages", async (lod) => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const { parseReasoningSegments } = await import("@shared/pretext-layout/reasoning-segments");
+		for (const model of models) {
+			for (const id of ["__streaming__", "gate-history"]) {
+				for (const text of [
+					"**Plan**\n\nbody\n\n**Check**\n\nnext",
+					`**Plan**\n\n${"body ".repeat(40_000)}`,
+				]) {
+					const block = { type: "reasoning", text };
+					const msg = { id, role: "assistant", model, contentJson: [block] };
+					let parses = 0;
+					const ctx: AdapterContext = {
+						lod,
+						resolveReasoningSegments: (source) => {
+							parses++;
+							return parseReasoningSegments(source);
+						},
+					};
+					const isGpt = model === "gpt-5.6" || model === "nug:openai:GPT-5.6";
+					if (lod <= 2) {
+						const spec = adaptActivityUnit(
+							[{ kind: "reasoning", msg, blockIndex: 0, block }],
+							`gate-${model}-${id}`,
+							ctx,
+						);
+						const rows = (spec.data as { items: { bodyText?: string; title: string }[] }).items;
+						expect(rows).toHaveLength(isGpt && text.length < 100 ? 2 : 1);
+						if (!isGpt && id !== "__streaming__") expect(rows[0]?.bodyText).toBe(text);
+					} else {
+						const [spec] = adaptSegment({ kind: "message", msg }, ctx);
+						expect(spec!.kind).toBe(isGpt ? "reasoning-steps" : "reasoning");
+						if (!isGpt) expect((spec!.data as { text: string }).text).toBe(text);
+						else
+							expect((spec!.data as { steps: { title: string }[] }).steps[0]?.title).toBe("Plan");
+						if (text.length > 100) expect(parses).toBe(0);
+					}
+					if (!isGpt) expect(parses).toBe(0);
+				}
+			}
+		}
+	});
+
+	it.each([
+		1, 2, 3, 4, 5,
+	] as const)("L%s uses each message's model in mixed live/history sessions", async (lod) => {
+		const { groupRenderUnits } = await import("../trace/render-units");
+		const text = "**Plan**\n\nbody\n\n**Check**\n\nnext";
+		for (const liveModel of ["gpt-5.6", "claude-sonnet-4.6", undefined]) {
+			const messages = ["gpt-5.6", "claude-sonnet-4.6", undefined, liveModel].map(
+				(model, index) => ({
+					id: index === 3 ? "__streaming__" : `mixed-${index}`,
+					role: "assistant",
+					model,
+					contentJson: [{ type: "reasoning", text }],
+					toolCalls: [],
+					children: [],
+				}),
+			);
+			const units = groupRenderUnits(segmentMessages(messages as never), lod <= 2);
+			const specs = adaptRenderUnits(units as never, { lod });
+			if (lod <= 2) {
+				const rows = specs.flatMap(
+					(spec) => (spec.data as { items?: { bodyText?: string }[] }).items ?? [],
+				);
+				expect(rows).toHaveLength(liveModel === "gpt-5.6" ? 6 : 5);
+				expect(rows[2]?.bodyText).toBe(text);
+				expect(rows[3]?.bodyText).toBe(text);
+			} else {
+				expect(specs.map((spec) => spec.kind)).toEqual([
+					"reasoning-steps",
+					"reasoning",
+					"reasoning",
+					liveModel === "gpt-5.6" ? "reasoning-steps" : "reasoning",
+				]);
+			}
+		}
+	});
+});
+
 describe("LOD matrix adapter semantics", () => {
 	it("renders structured reasoning as the SAME expandable step trace at L3/L4/L5", () => {
 		// There is no level whose step titles are visible but unopenable (the former
@@ -2584,6 +2677,7 @@ describe("LOD matrix adapter semantics", () => {
 			kind: "message",
 			msg: {
 				id: "reasoning-1",
+				model: "gpt-5.6",
 				role: "assistant",
 				contentJson: [
 					{ type: "reasoning", text: ["**Plan**", "<!-- -->", "**Check**", "body"].join("\n\n") },
@@ -3899,6 +3993,7 @@ describe("reasoning steps: one identity across the L2/L3 boundary", () => {
 	const twoStepMessage = (id = "real-msg", blocks?: unknown[]) =>
 		({
 			id,
+			model: "gpt-5.6",
 			role: "assistant",
 			contentJson: blocks ?? [
 				{ type: "reasoning", text: "**第一步**\n\n分析正文。\n\n**第二步**\n\n继续分析。" },
@@ -4244,9 +4339,10 @@ describe("adaptSegment — a concluded review", () => {
 			id: string,
 			role: string,
 			contentJson: AdapterContentBlock[],
+			model?: string,
 		): AdapterSegment => ({
 			kind: "message",
-			msg: { id, role, contentJson },
+			msg: { id, role, contentJson, model },
 		});
 
 		it("preserves durable body expansion across streaming hand-off without reusing it for a new block", async () => {
@@ -4261,7 +4357,12 @@ describe("adaptSegment — a concluded review", () => {
 			const text = "full retained body ".repeat(1000);
 			const make = (messageId: string, blockId: string, body = text) =>
 				adaptSegment(
-					message(messageId, "assistant", [{ type: "reasoning", id: blockId, text: body }]),
+					message(
+						messageId,
+						"assistant",
+						[{ type: "reasoning", id: blockId, text: body }],
+						"gpt-5.6",
+					),
 					context,
 				)[0]!;
 			const live = make("__streaming__", "durable-reasoning");
@@ -4347,9 +4448,12 @@ describe("adaptSegment — a concluded review", () => {
 		it("addresses step bodies by emitted row key while retaining full source", () => {
 			const body = "source paragraph ".repeat(1000);
 			const [spec] = adaptSegment(
-				message("steps", "assistant", [
-					{ type: "reasoning", text: `**First**\n\n${body}\n\n**Second**\n\nsecond body` },
-				]),
+				message(
+					"steps",
+					"assistant",
+					[{ type: "reasoning", text: `**First**\n\n${body}\n\n**Second**\n\nsecond body` }],
+					"gpt-5.6",
+				),
 				{
 					lod: 5,
 					expandedRows: () => [0],
@@ -4374,7 +4478,7 @@ describe("adaptSegment — a concluded review", () => {
 			};
 			const make = (text: string) =>
 				adaptSegment(
-					message("large-single-step", "assistant", [{ type: "reasoning", text }]),
+					message("large-single-step", "assistant", [{ type: "reasoning", text }], "gpt-5.6"),
 					context,
 				)[0]!;
 			const first = make(`**First**\n\n${body}`);
@@ -4399,7 +4503,7 @@ describe("adaptSegment — a concluded review", () => {
 			for (const length of [9000, 16000, 22000, text.length]) {
 				const source = text.slice(0, length);
 				const [spec] = adaptSegment(
-					message("__streaming__", "assistant", [{ type: "reasoning", text: source }]),
+					message("__streaming__", "assistant", [{ type: "reasoning", text: source }], "gpt-5.6"),
 					{ lod: 5 },
 				);
 				const steps = (spec!.data as { steps: { key: string; body: string | null }[] }).steps;
@@ -4415,7 +4519,7 @@ describe("adaptSegment — a concluded review", () => {
 			const text = "plain reasoning ".repeat(40_000);
 			let parses = 0;
 			const [spec] = adaptSegment(
-				message("large-plain", "assistant", [{ type: "reasoning", text }]),
+				message("large-plain", "assistant", [{ type: "reasoning", text }], "gpt-5.6"),
 				{
 					lod: 5,
 					resolveReasoningSegments: () => {

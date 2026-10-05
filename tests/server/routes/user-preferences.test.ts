@@ -3,6 +3,7 @@ import type { PersistedRecentTab, RecentTabsMutationResult } from "@shared/recen
 import { Hono } from "hono";
 import { userPreferences, userRecentTabs, users } from "../../../server/db/schema";
 import type { JwtPayload } from "../../../server/lib/auth";
+import { updateUserPreferencesSchema } from "../../../server/lib/validators/settings";
 import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
@@ -105,6 +106,70 @@ afterAll(() => {
 	mock.module("../../../server/lib/settings", () => realSettingsModule);
 	mock.module("../../../server/websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
+});
+
+describe("local access preference", () => {
+	async function patch(body: Record<string, unknown>) {
+		return requestJson("/", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+	}
+
+	it("defaults to false with and without a stored preferences row", async () => {
+		seedUser();
+		expect((await requestJson("/")).body).toMatchObject({ treatAsLocalAccess: false });
+		const saved = await patch({ wordWrapCode: false });
+		expect(saved.status).toBe(200);
+		expect((await requestJson("/")).body).toMatchObject({ treatAsLocalAccess: false });
+	});
+
+	it("persists opt-in on first insert and preserves it across unrelated patches", async () => {
+		seedUser();
+		expect((await patch({ treatAsLocalAccess: true })).status).toBe(200);
+		expect((await requestJson("/")).body).toMatchObject({ treatAsLocalAccess: true });
+		expect((await patch({ wordWrapCode: false })).status).toBe(200);
+		expect((await requestJson("/")).body).toMatchObject({
+			treatAsLocalAccess: true,
+			wordWrapCode: false,
+		});
+		expect((await patch({ treatAsLocalAccess: false })).status).toBe(200);
+		expect((await requestJson("/")).body).toMatchObject({
+			treatAsLocalAccess: false,
+			wordWrapCode: false,
+		});
+	});
+
+	it("updates existing preferences and keeps the override scoped to its user", async () => {
+		seedPreferences([]);
+		expect((await patch({ treatAsLocalAccess: true })).status).toBe(200);
+		expect((await requestJson("/")).body).toMatchObject({ treatAsLocalAccess: true });
+		db.insert(users)
+			.values({
+				id: "other-user",
+				username: "other-user",
+				passwordHash: "test",
+				role: "user",
+				createdAt: NOW,
+			})
+			.run();
+		authUser.sub = "other-user";
+		expect((await requestJson("/")).body).toMatchObject({ treatAsLocalAccess: false });
+	});
+
+	it("accepts only boolean opt-ins, not truthy strings or numbers", () => {
+		for (const value of ["true", "false", 1, 0, null]) {
+			expect(updateUserPreferencesSchema.safeParse({ treatAsLocalAccess: value }).success).toBe(
+				false,
+			);
+		}
+		for (const value of [true, false]) {
+			expect(updateUserPreferencesSchema.safeParse({ treatAsLocalAccess: value }).success).toBe(
+				true,
+			);
+		}
+	});
 });
 
 describe("instance setup wizard completion", () => {

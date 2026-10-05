@@ -12,6 +12,7 @@ const STORAGE_KEY = "narrafork_optimize_with_context";
 export interface UsePromptOptimizeOptions {
 	narratorId: string;
 	messageId?: string; // For editing message context
+	withContext?: boolean; // Shared context preference for an alternate editor
 	textareaRef: RefObject<HTMLTextAreaElement | null>;
 	/**
 	 * Callback after successful optimization.
@@ -27,6 +28,7 @@ export interface UsePromptOptimizeResult {
 	toggleContext: () => void;
 	setContextMessageCount: (count: number) => void;
 	handleOptimize: (style: OptimizeStyle) => Promise<void>;
+	cancelOptimize: () => void;
 }
 
 export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptOptimizeResult {
@@ -50,6 +52,20 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 		}
 	});
 	const abortRef = useRef<AbortController | null>(null);
+	const cancelOptimize = useCallback(() => {
+		abortRef.current?.abort();
+		abortRef.current = null;
+		setLoading(false);
+	}, []);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: Changing the target invalidates its pending optimization.
+	useEffect(() => {
+		setLoading(false);
+		return () => {
+			abortRef.current?.abort();
+			abortRef.current = null;
+		};
+	}, [options.narratorId, options.messageId]);
 
 	const handleOptimize = useCallback(
 		async (style: OptimizeStyle) => {
@@ -58,7 +74,7 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 
 			// Save preference
 			try {
-				localStorage.setItem(STORAGE_KEY, String(withContext));
+				localStorage.setItem(STORAGE_KEY, String(options.withContext ?? withContext));
 			} catch {
 				// Ignore localStorage errors
 			}
@@ -77,11 +93,13 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 					textarea.value,
 					style,
 					{
-						withContext,
+						withContext: options.withContext ?? withContext,
 						messageId: options.messageId,
 						signal: controller.signal,
 					},
 				);
+
+				if (controller.signal.aborted || abortRef.current !== controller) return;
 
 				// Use document.execCommand for browser native undo support
 				textarea.focus();
@@ -99,7 +117,11 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 					autoClose: 8000,
 				});
 			} catch (err) {
-				if ((err as Error).name === "AbortError") {
+				if (
+					controller.signal.aborted ||
+					abortRef.current !== controller ||
+					(err as Error).name === "AbortError"
+				) {
 					return; // User cancelled
 				}
 
@@ -118,8 +140,10 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 					autoClose: 10000,
 				});
 			} finally {
-				setLoading(false);
-				abortRef.current = null;
+				if (abortRef.current === controller) {
+					setLoading(false);
+					abortRef.current = null;
+				}
 			}
 		},
 		[options, withContext, t],
@@ -136,5 +160,6 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 		toggleContext,
 		setContextMessageCount,
 		handleOptimize,
+		cancelOptimize,
 	};
 }

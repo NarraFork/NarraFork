@@ -23,6 +23,7 @@ import { generateId } from "../lib/id";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
+import { ResourceProtectionError, withLegacyRetirement } from "./worktree-lifecycle-guard";
 import {
 	SNAPSHOT_BASE_REF,
 	SNAPSHOT_HEAD_REF,
@@ -570,7 +571,7 @@ describe("merging uncommitted work", () => {
 });
 
 describe("shadow repository ownership", () => {
-	async function createChapterClaiming(worktree: string): Promise<void> {
+	async function createChapterClaiming(worktree: string): Promise<string> {
 		const projectId = generateId();
 		const now = new Date().toISOString();
 		await db.insert(projects).values({
@@ -597,6 +598,7 @@ describe("shadow repository ownership", () => {
 			updatedAt: now,
 		});
 		createdChapters.push(chapterId);
+		return chapterId;
 	}
 
 	test("keeps a shadow repository a chapter still claims", async () => {
@@ -615,17 +617,33 @@ describe("shadow repository ownership", () => {
 		);
 	});
 
-	test("force removes a claimed repository, for deleting the chapter itself", async () => {
+	test("force cannot erase a claim; verified legacy retirement can release only its own lineage", async () => {
 		const { worktree } = await createWorktree("nf-dag-forced-");
+		const binary = Buffer.from([0, 255, 128, 13, 10, 0, 42]);
 		writeFileSync(join(worktree, "app.txt"), "doomed\n");
+		writeFileSync(join(worktree, "marker.bin"), binary);
 		const snap = await worktreeTreeSnapshot.advanceSnapshotRef(worktree);
-		await createChapterClaiming(worktree);
+		const chapterId = await createChapterClaiming(worktree);
 
-		const destroyed = await worktreeTreeSnapshot.destroy(worktree, undefined, { force: true });
+		await expect(
+			worktreeTreeSnapshot.destroy(worktree, undefined, { force: true }),
+		).rejects.toBeInstanceOf(ResourceProtectionError);
+		expect(await worktreeTreeSnapshot.hasTree(worktree, present(snap, "snapshot").treeHash)).toBe(
+			true,
+		);
+		expect(readFileSync(join(worktree, "app.txt"), "utf8")).toBe("doomed\n");
+		expect(readFileSync(join(worktree, "marker.bin"))).toEqual(binary);
+
+		// The service reads/validates the current DB claim. Force alone never supplies
+		// release authority, and no client token or guessed owner is accepted.
+		const destroyed = await withLegacyRetirement([chapterId], "fixture chapter retirement", () =>
+			worktreeTreeSnapshot.destroy(worktree, undefined, { force: true }),
+		);
 		expect(destroyed).toBe(true);
 		expect(await worktreeTreeSnapshot.hasTree(worktree, present(snap, "snapshot").treeHash)).toBe(
 			false,
 		);
+		expect(readFileSync(join(worktree, "marker.bin"))).toEqual(binary);
 	});
 
 	test("removes an unclaimed repository and its recorded hashes", async () => {

@@ -4,7 +4,7 @@ import {
 	groupRecentTabsByDirectory,
 	type RecentTabRow,
 } from "@frontend/hooks/recent-tab-directory-groups";
-import { isLoopbackBrowserOrigin } from "@frontend/lib/local-origin";
+import { canRevealFromBrowser } from "@frontend/lib/local-origin";
 import {
 	getEffectiveNarratorDisplay,
 	type StatusShape,
@@ -52,6 +52,7 @@ import {
 	IconRobot,
 	IconShield,
 	IconTerminal2,
+	IconWindowMaximize,
 	IconX,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
@@ -97,8 +98,8 @@ import {
 	updateAsyncQuestionAttention,
 } from "../../lib/notification";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
-
 import { UserAvatar } from "../UserAvatar";
+import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
 import { RecentTabDirectoryRow, type RecentTabDirectoryRowProps } from "./RecentTabDirectoryRow";
 import { RecentTabDropIndicator } from "./RecentTabDropIndicator";
 import type { RecentTabDropTarget } from "./recent-tab-drop-target";
@@ -835,13 +836,9 @@ export function RecentTabList({
 	);
 
 	const fsRevealCapability = useFsRevealCapability();
-	/**
-	 * Reveal opens a file manager window on the *server* host, so it is only offered when
-	 * the browser is on that same machine. Remote users would get a silent success (or a
-	 * window on someone else's desktop), which is worse than not seeing the option.
-	 * The origin cannot change without a page load, so this is computed once.
-	 */
-	const canRevealFromThisBrowser = useMemo(() => isLoopbackBrowserOrigin(), []);
+	// Reveal runs on the server desktop. Explicit user opt-in also supports a local
+	// browser accessing that server through a domain or LAN IP; react to preference changes.
+	const canRevealFromThisBrowser = canRevealFromBrowser(userPrefsForGrouping?.treatAsLocalAccess);
 	const revealAvailable = fsRevealCapability.supported && canRevealFromThisBrowser;
 
 	const handleReveal = useCallback(async () => {
@@ -885,6 +882,14 @@ export function RecentTabList({
 			notifications.show({ color: "red", message: t("copyCwdFailed") });
 		}
 	}, [ctxMenu, resolveTabDirectory, t]);
+
+	/** 在外部窗口打开该标签（叙述者/章节 → chat 面板窗口；workspace → 表面窗口；project → 主应用窗口） */
+	const handleOpenInWindow = useCallback(() => {
+		if (!ctxMenu) return;
+		const href = recentTabWindowHref(ctxMenu.tab);
+		setCtxMenu(null);
+		if (href) window.open(href, "_blank", PANEL_WINDOW_FEATURES);
+	}, [ctxMenu]);
 
 	/** 打开重命名对话框 */
 	const handleRename = useCallback(() => {
@@ -1315,6 +1320,8 @@ export function RecentTabList({
 							}
 							onCopyCwd={handleCopyCwd}
 							canCopyCwd={["chapter", "narrator", "subagent"].includes(ctxMenu.tab.type)}
+							onOpenInWindow={handleOpenInWindow}
+							canOpenInWindow={recentTabWindowHref(ctxMenu.tab) !== null}
 							onRename={handleRename}
 							canRename={ctxMenu.tab.type === "narrator"}
 							onArchive={handleArchive}
@@ -2297,6 +2304,8 @@ interface TabContextMenuProps {
 	canNewNarratorHere: boolean;
 	onCopyCwd: () => void;
 	canCopyCwd: boolean;
+	onOpenInWindow: () => void;
+	canOpenInWindow: boolean;
 	onRename: () => void;
 	canRename: boolean;
 	onArchive: () => void;
@@ -2320,6 +2329,8 @@ function TabContextMenu({
 	canNewNarratorHere,
 	onCopyCwd,
 	canCopyCwd,
+	onOpenInWindow,
+	canOpenInWindow,
 	onRename,
 	canRename,
 	onArchive,
@@ -2379,6 +2390,14 @@ function TabContextMenu({
 							<Group gap={8} wrap="nowrap">
 								<IconCopy size={14} />
 								<Text size="sm">{t("copyCwd")}</Text>
+							</Group>
+						</UnstyledButton>
+					)}
+					{canOpenInWindow && (
+						<UnstyledButton px="xs" py={4} onClick={onOpenInWindow} style={{ borderRadius: 4 }}>
+							<Group gap={8} wrap="nowrap">
+								<IconWindowMaximize size={14} />
+								<Text size="sm">{t("openInWindow")}</Text>
 							</Group>
 						</UnstyledButton>
 					)}

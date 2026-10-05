@@ -16,6 +16,7 @@ import {
 	memberIdentity,
 	panelDomId,
 	planSeedMaterialisation,
+	pruneWorkspaceLayout,
 	reconcileLayoutWithPanels,
 } from "./workspace-panel-set";
 
@@ -67,6 +68,41 @@ function layoutWith(
 		activeGroup: "group-1",
 	} as unknown as SerializedDockview;
 }
+
+test("retired filemod is dropped even when its host remains a member", () => {
+	const layout = layoutWith([
+		narratorEntry("a"),
+		{ id: "old", params: { panelType: "narrator-tool", toolType: "filemod", narratorId: "a" } },
+		{ id: "tree", params: { panelType: "narrator-tool", toolType: "filetree", narratorId: "a" } },
+	]);
+	const plan = reconcileLayoutWithPanels({ panels: [narratorMember("a", 0)], layout });
+	expect(plan.droppedPanelIds).toEqual(["old"]);
+	expect(plan.appended).toEqual([]);
+	expect(gridViews(plan.layout)).toEqual(["a", "tree"]);
+	expect(layout.panels.old).toBeDefined();
+});
+
+test("retired-only main grid does not reset a surviving floating narrator", () => {
+	const layout = layoutWith([
+		{ id: "old", params: { panelType: "narrator-tool", toolType: "filemod", narratorId: "a" } },
+	]);
+	layout.panels.a = {
+		id: "a",
+		contentComponent: "narrator",
+		params: { panelType: "narrator", narratorId: "a" },
+	};
+	layout.floatingGroups = [
+		{
+			data: { id: "float", views: ["a"], activeView: "a" },
+			position: { left: 1, top: 2, width: 400, height: 300 },
+		},
+	];
+	const plan = reconcileLayoutWithPanels({ panels: [narratorMember("a", 0)], layout });
+	expect(plan.layout).not.toBeNull();
+	expect(plan.layout?.floatingGroups).toEqual(layout.floatingGroups);
+	expect(plan.appended).toEqual([]);
+	expect(plan.layout?.activeGroup).toBe("float");
+});
 
 function narratorEntry(narratorId: string) {
 	return { id: narratorId, params: { panelType: "narrator", narratorId } };
@@ -177,6 +213,114 @@ describe("layout entries that are no longer members are pruned", () => {
 
 		expect(plan.droppedPanelIds).toEqual(["junk"]);
 		expect(gridViews(plan.layout)).toEqual(["n1"]);
+	});
+});
+
+describe("pruning covers every serialized group location", () => {
+	function layoutAcrossLocations() {
+		const layout = layoutWith([narratorEntry("n1"), narratorEntry("gone")]);
+		const group = (id: string, views: string[]) => ({
+			id,
+			views,
+			activeView: "gone",
+			tabGroups: [
+				{ id: "mixed", collapsed: false, panelIds: views },
+				{ id: "stale", collapsed: false, panelIds: ["gone"] },
+			],
+		});
+		const leaf = (id: string, views: string[]) => ({ type: "leaf", data: group(id, views) });
+		return {
+			...layout,
+			grid: {
+				...layout.grid,
+				root: {
+					type: "branch",
+					data: [
+						{ type: "branch", data: [leaf("group-1", ["gone", "n1"])] },
+						{ type: "branch", data: [leaf("stale-grid", ["gone"])] },
+					],
+				},
+			},
+			floatingGroups: [
+				{
+					data: group("float", ["gone", "n1"]),
+					position: { left: 1, top: 2, width: 300, height: 400 },
+				},
+				{
+					data: group("stale-float", ["gone"]),
+					position: { left: 3, top: 4, width: 300, height: 400 },
+				},
+			],
+			popoutGroups: [
+				{ data: group("popout", ["gone", "n1"]), position: null, gridReferenceGroup: "group-1" },
+				{
+					grid: {
+						...layout.grid,
+						root: {
+							type: "branch",
+							data: [leaf("nested-popout", ["gone", "n1"]), leaf("stale-popout", ["gone"])],
+						},
+					},
+					position: null,
+					gridReferenceGroup: "stale-grid",
+				},
+			],
+			edgeGroups: {
+				left: { size: 200, visible: true, group: group("edge", ["gone", "n1"]) },
+				right: { size: 300, visible: false, group: group("stale-edge", ["gone"]) },
+			},
+			activeGroup: "stale-float",
+		} as unknown as SerializedDockview;
+	}
+
+	test("membership pruning removes stale references, empty branches and tab groups without mutation", () => {
+		const layout = layoutAcrossLocations();
+		const before = structuredClone(layout);
+		const plan = reconcileLayoutWithPanels({ panels: [narratorMember("n1", 1000)], layout });
+		expect(plan.droppedPanelIds).toEqual(["gone"]);
+		expect(plan.appended).toEqual([]);
+		expect(plan.layout).not.toBeNull();
+		expect(gridViews(plan.layout)).toEqual(["n1"]);
+		expect(plan.layout?.floatingGroups).toHaveLength(1);
+		expect(plan.layout?.floatingGroups?.[0].data).toEqual({
+			id: "float",
+			views: ["n1"],
+			activeView: "n1",
+			tabGroups: [{ id: "mixed", collapsed: false, panelIds: ["n1"] }],
+		});
+		expect(plan.layout?.popoutGroups).toHaveLength(2);
+		expect(plan.layout?.popoutGroups?.[0].gridReferenceGroup).toBe("group-1");
+		expect(plan.layout?.popoutGroups?.[1].gridReferenceGroup).toBeUndefined();
+		expect(plan.layout?.edgeGroups?.left?.group).toMatchObject({ views: ["n1"], activeView: "n1" });
+		expect(plan.layout?.edgeGroups?.right).toBeUndefined();
+		expect(plan.layout?.activeGroup).toBe("group-1");
+		expect(JSON.stringify(plan.layout)).not.toContain("gone");
+		expect(layout).toEqual(before);
+	});
+
+	test("an active durable floating group survives membership pruning", () => {
+		const layout = layoutAcrossLocations();
+		layout.activeGroup = "float";
+		const pruned = pruneWorkspaceLayout(layout, new Set(["gone"]));
+		expect(pruned?.activeGroup).toBe("float");
+	});
+
+	test("empty main grid falls back to all members even when a member was placed in a float", () => {
+		const layout = layoutAcrossLocations();
+		layout.grid = layoutWith([narratorEntry("gone")]).grid;
+		expect(pruneWorkspaceLayout(layout, new Set(["gone"]))).toBeNull();
+		const members = [narratorMember("n1", 1000), narratorMember("n2", 2000)];
+		const plan = reconcileLayoutWithPanels({ panels: members, layout });
+		expect(plan.layout).toBeNull();
+		expect(plan.appended).toEqual(members);
+	});
+
+	test("unlisted panel references are removed as well as explicitly dropped ids", () => {
+		const layout = layoutAcrossLocations();
+		delete layout.panels.gone;
+		const pruned = pruneWorkspaceLayout(layout, new Set());
+		expect(gridViews(pruned)).toEqual(["n1"]);
+		expect(JSON.stringify(pruned)).not.toContain("gone");
 	});
 });
 

@@ -13,7 +13,10 @@
  * window would be seen. A loopback origin is the one form that guarantees both ends
  * are the same machine.
  *
- * Deliberately not treated as local:
+ * Users may explicitly override this conservative origin check in their preferences.
+ * That override changes menu visibility only, not the execution device.
+ *
+ * Deliberately not automatically treated as local:
  *  - private-network literals (`192.168.x.x`, `10.x.x.x`) — same LAN, different desktop
  *  - hostnames that happen to resolve to loopback — not knowable in the browser
  *
@@ -34,4 +37,9 @@ export function isLoopbackBrowserOrigin(win?: Window): boolean {
 		// Cross-origin or stripped location objects: treat as remote.
 		return false;
 	}
+}
+
+/** An opt-in overrides origin detection only; file-manager execution stays on the server. */
+export function canRevealFromBrowser(treatAsLocalAccess = false, win?: Window): boolean {
+	return treatAsLocalAccess === true || isLoopbackBrowserOrigin(win);
 }

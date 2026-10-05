@@ -252,31 +252,21 @@ You have completed {count} tool call(s) since your last visible text reply. Befo
 			"[系统提示：Pipeline 已经执行过一次提取，目前仍处于活动状态。继续调用工具前，请确认是否仍需要 Pipeline；如果不再需要，请停止使用 Pipeline，让系统按闲置阈值清理捕获内容，避免继续累积。]",
 	},
 	"tool.brokenToolCallReminder": {
-		en: `[SYSTEM: Your previous {toolNames} call(s) were broken — the output was cut off by the token limit before the tool input was complete, so they were not executed. The broken call has been removed from history to save context.
+		en: `[SYSTEM: Your previous {toolNames} call(s) had invalid or missing input and were not executed. The broken calls and their results have been removed from model history to save context. Invalid input alone does not establish that an output/token limit was reached.
 
-STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
-1. Each tool call's TOTAL input must be under 10,000 characters (including file_path, old_string, new_string, content — everything).
-2. SKELETON-FIRST approach for new files: Use Write to create the file with a SKELETON — include the real opening code, then place numbered splice markers where large sections will go, then the real closing code. The skeleton itself must be under 10,000 chars. Use the file type's comment syntax for markers (e.g. // SPLICE_1 for JS/TS, {# SPLICE_1 #} for Jinja, <!-- SPLICE_1 --> for HTML). Number markers sequentially: SPLICE_1, SPLICE_2, SPLICE_3, etc.
-3. FILL via Edit: For each marker, call Edit with old_string="// SPLICE_1" (just the marker, nothing more) and new_string=<the real content for that section>. If a section is still too large, replace the marker with partial content + a new sub-marker (e.g. SPLICE_1a, SPLICE_1b).
-4. NEVER write/edit more than 10,000 characters in a single tool call. NEVER use Write to overwrite a file that already exists with content.
-5. For large replacements in existing files: split into multiple small Edit calls with different unique short anchors as old_string.]`,
-		"zh-CN": `[系统提示：你上一次的 {toolNames} 调用已损坏——输出在工具输入完成前被 token 限制截断，因此未被执行。损坏的调用已从历史中移除以节省上下文。
+Retry with complete, valid JSON containing all required parameters. If a large input may have exceeded the output budget, split it into smaller calls (aim for under 10,000 characters per call). For a new large file, use a skeleton-first approach: Write the opening and closing code with numbered SPLICE markers (SPLICE_1, SPLICE_2, etc.) using the file type's comment syntax, then use Edit to fill each marker with a manageable section. Do not overwrite an existing file with Write.]`,
+		"zh-CN": `[系统提示：你上一次的 {toolNames} 调用参数无效或缺失，因此未执行。损坏的调用及其结果已从模型历史中移除以节省上下文。仅凭参数无效，无法认定触及输出或 token 上限。
 
-严格规则——你必须严格遵守以下规则，避免重复截断：
-1. 每次工具调用的总输入必须小于 10,000 字符（包括 file_path、old_string、new_string、content 等所有字段）。
-2. 骨架优先策略（新文件）：用 Write 创建文件骨架——包含真实的开头代码，然后在需要大段内容的位置放置编号的拼接标记，最后是真实的结尾代码。骨架本身必须小于 10,000 字符。根据文件类型使用对应注释语法（如 JS/TS 用 // SPLICE_1，Jinja 用 {# SPLICE_1 #}，HTML 用 <!-- SPLICE_1 -->）。标记按顺序编号：SPLICE_1、SPLICE_2、SPLICE_3 等。
-3. 用 Edit 填充：对每个标记，调用 Edit，old_string="// SPLICE_1"（只写标记本身，不要多写），new_string=<该段的真实内容>。如果某段仍然过大，将标记替换为部分内容 + 新的子标记（如 SPLICE_1a、SPLICE_1b）。
-4. 绝对不要在单次调用中写入/编辑超过 10,000 字符。绝对不要用 Write 覆盖已有内容的文件。
-5. 大范围替换已有文件：拆分为多个小 Edit，用不同的唯一短锚点作为 old_string。]`,
+请使用完整、有效的 JSON 重试，并提供全部必填参数。如果大输入可能超出输出预算，请拆分为更小的调用（建议每次小于 10,000 字符）。对于大型新文件，采用骨架优先策略：先用 Write 写入开头、结尾及编号的 SPLICE 标记（如 SPLICE_1、SPLICE_2，使用对应文件类型的注释语法），再用 Edit 逐个填充大小适中的片段。不要用 Write 覆盖已有文件。]`,
 	},
 	"tool.brokenToolCallInputPlaceholder": {
-		en: "[Content too large for single output — output was truncated]",
-		"zh-CN": "[过长的单次输出，输出被截断]",
+		en: "[Tool input invalid or missing — not executed]",
+		"zh-CN": "[工具参数无效或缺失，未执行]",
 	},
 	"tool.brokenToolCallResult": {
-		en: "Tool input was truncated by token limit — not executed. Each call must be under 10,000 chars. Use skeleton-first approach: Write a skeleton with SPLICE markers, then Edit to fill each marker.",
+		en: "Tool input is invalid or missing — not executed. Retry with complete, valid JSON and all required parameters. This does not necessarily indicate an output/token limit; split large inputs into smaller calls if needed.",
 		"zh-CN":
-			"工具输入被 token 限制截断，未执行。每次调用总输入须小于 10,000 字符，请使用骨架优先策略：先 Write 骨架（含 SPLICE 标记），再用 Edit 逐个填充。",
+			"工具参数无效或缺失，未执行。请提供完整、有效的 JSON 及全部必填参数后重试。这不一定是输出或 token 上限导致；必要时将大输入拆分为更小的调用。",
 	},
 	"tool.skippedForSoftStop": {
 		en: "Tool not executed because queued user feedback requested a safe stop after the previous tool.",

@@ -71,6 +71,14 @@ describe("resolveFloatState — floating", () => {
 		const state = resolveFloatState(geometry({ above: 120, right: VIEWPORT_WIDTH }));
 		expect(state.right).toBe(VIEW_ACTION_BAR_GAP);
 	});
+
+	test("carries the body's own height, for consumers that gate on body size", () => {
+		// The touch scroll-to-top button ignores short bodies; it reads the height
+		// from here rather than re-measuring.
+		const state = resolveFloatState(geometry({ above: 120, height: 640 }));
+		expect(state.mode).toBe("floating");
+		expect(state.bodyHeight).toBe(640);
+	});
 });
 
 describe("resolveFloatState — hidden", () => {

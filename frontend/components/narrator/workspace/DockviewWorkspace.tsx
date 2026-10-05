@@ -19,6 +19,7 @@
  * way to tell that apart from the user having closed it.
  */
 
+import { Box } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import type { WorkspacePanel } from "@shared/workspace-panels";
 import { useQueryClient } from "@tanstack/react-query";
@@ -28,7 +29,9 @@ import {
 	type IDockviewPanel,
 	positionToDirection,
 } from "dockview-react";
-import { type RefObject, useCallback, useEffect, useRef } from "react";
+import { type ReactNode, type RefObject, useCallback, useEffect, useRef } from "react";
+import { WorkspaceResourceTab } from "./WorkspaceResourceTab";
+import "./workspace-resource.css";
 import { useTranslation } from "react-i18next";
 import { workspaceQueryKey } from "../../../hooks/useWorkspace";
 import { api as apiClient, isWorkspaceLayoutConflict } from "../../../lib/api";
@@ -46,7 +49,11 @@ import {
 	type WorkspaceDirectorState,
 } from "./dockview-layout";
 import { type WorkspacePanelParams, workspacePanelComponents } from "./panels";
-import { createWorkspaceDockStore, WorkspaceDockProvider } from "./workspace-dock";
+import {
+	createWorkspaceDockStore,
+	WorkspaceDockProvider,
+	workspaceResourceOwner,
+} from "./workspace-dock";
 import {
 	decideSurfaceRefresh,
 	livePanelIdentity,
@@ -72,8 +79,8 @@ export interface DirectorControl {
 	/** Persist the primary/rail ratio. */
 	setRatio: (ratio: number) => void;
 	/**
-	 * Open a child session in its host narrator's secondary area and return to grid
-	 * mode. `messageId` optionally scrolls that session to one message.
+	 * Open a child session as a temporary resource without leaving Director.
+	 * `messageId` optionally scrolls that session to one message.
 	 */
 	openSubagentPanel: (
 		hostNarratorId: string,
@@ -132,6 +139,8 @@ interface DockviewWorkspaceProps {
 	 * overlay and never mutates the dockview layout (except `closePanel`).
 	 */
 	directorControlRef?: RefObject<DirectorControl | null>;
+	/** Rendered inside the shared resource provider, below native floating panels. */
+	directorOverlay?: ReactNode;
 }
 
 /** Extract the live narrator ids from the current Dockview layout. */
@@ -197,7 +206,7 @@ function collectPanels(api: DockviewApi): DirectorLeaf[] {
 		const params = panel.params as WorkspacePanelParams | undefined;
 		if (!params) continue;
 		// Cluster secondary panels are resources, not top-level director cells.
-		if (!isDirectorRenderablePanel(params)) continue;
+		if (!isDirectorRenderablePanel(params) || workspaceResourceOwner(params)) continue;
 		leaves.push({ id: panel.api.id, params, title: panel.api.title ?? "" });
 	}
 	return leaves;
@@ -214,6 +223,7 @@ export function DockviewWorkspace({
 	onApiReady,
 	onDirectorStateChange,
 	directorControlRef,
+	directorOverlay,
 }: DockviewWorkspaceProps) {
 	const { t } = useTranslation("narrators");
 	const qc = useQueryClient();
@@ -225,6 +235,19 @@ export function DockviewWorkspace({
 	const apiDisposablesRef = useRef<Array<{ dispose(): void }>>([]);
 	const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const directorRef = useRef<WorkspaceDirectorState>({ ...DEFAULT_DIRECTOR_STATE });
+	const surfaceRootRef = useRef<HTMLDivElement>(null);
+	const durableActiveGroupRef = useRef<string | null>(null);
+	const observedArrangementRef = useRef<string | null>(null);
+	const serializeCurrentLayout = useCallback(
+		(api: DockviewApi) =>
+			serializeWorkspaceLayout(
+				api,
+				directorRef.current,
+				dockStoreRef.current?.getTemporaryPanelIds(),
+				durableActiveGroupRef.current,
+			),
+		[],
+	);
 	/**
 	 * Whether the user has edited the arrangement on THIS mount.
 	 *
@@ -381,9 +404,10 @@ export function DockviewWorkspace({
 		if (!api) return;
 		if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
 		saveTimerRef.current = setTimeout(() => {
-			void saveLayout(serializeWorkspaceLayout(api, directorRef.current));
+			const serialized = serializeCurrentLayout(api);
+			if (serialized !== builtTreeRef.current) void saveLayout(serialized);
 		}, SAVE_DEBOUNCE_MS);
-	}, [saveLayout]);
+	}, [saveLayout, serializeCurrentLayout]);
 
 	// ── Director mode (pure overlay; never mutates the dockview layout) ──
 	// All director mutations flow through the imperative handle so the persisted
@@ -407,7 +431,7 @@ export function DockviewWorkspace({
 			const api = apiRef.current;
 			const primaryPanelId =
 				mode === "director"
-					? (directorRef.current.primaryPanelId ?? api?.activePanel?.id ?? null)
+					? (directorRef.current.primaryPanelId ?? (api ? collectPanels(api)[0]?.id : null) ?? null)
 					: directorRef.current.primaryPanelId;
 			commitDirector({ ...directorRef.current, mode, primaryPanelId });
 		},
@@ -428,12 +452,15 @@ export function DockviewWorkspace({
 		[commitDirector],
 	);
 
+	if (dockStoreRef.current)
+		dockStoreRef.current.onRevealGrid = () => {
+			if (directorRef.current.mode !== "grid") setMode("grid");
+		};
 	const openSubagentPanel = useCallback(
 		(hostNarratorId: string, subagentNarratorId: string, messageId?: string) => {
 			dockStoreRef.current?.openSubagentPanel(hostNarratorId, subagentNarratorId, messageId);
-			setMode("grid");
 		},
-		[setMode],
+		[],
 	);
 
 	const closePanel = useCallback((panelId: string) => {
@@ -553,7 +580,14 @@ export function DockviewWorkspace({
 		}
 		const params = paramsForMember(member);
 		if (!params) return;
-		api.addPanel({ id: panelDomId(member), component: componentForParams(params), params });
+		api.addPanel({
+			id: panelDomId(member),
+			component: componentForParams(params),
+			params,
+			position: dockStoreRef.current?.getMemberPosition(durableActiveGroupRef.current) ?? {
+				direction: "right",
+			},
+		});
 	}, []);
 
 	/**
@@ -770,6 +804,8 @@ export function DockviewWorkspace({
 		(api: DockviewApi) => {
 			apiRef.current = api;
 			buildSurface(api);
+			durableActiveGroupRef.current = api.activeGroup?.id ?? null;
+			observedArrangementRef.current = serializeCurrentLayout(api);
 
 			// Director mode is a pure overlay owned by the route; just report the
 			// restored state so the toolbar + overlay reflect it.
@@ -783,12 +819,33 @@ export function DockviewWorkspace({
 					// A rebuild (stale-refresh) runs `fromJSON`, which fires this event;
 					// the suppression flag keeps that from being misread as a user edit.
 					if (suppressLayoutEventsRef.current) return;
-					localEditRef.current = true;
-					persist();
+					dockStoreRef.current?.reconcileTemporaryResources();
+					if (
+						api.activePanel &&
+						!dockStoreRef.current?.isTemporary(api.activePanel.id) &&
+						api.activePanel.api.location.type === "grid"
+					)
+						durableActiveGroupRef.current = api.activePanel.group.id;
+					const serialized = serializeCurrentLayout(api);
+					if (serialized !== observedArrangementRef.current) {
+						observedArrangementRef.current = serialized;
+						localEditRef.current = true;
+						persist();
+					}
 					syncNarratorIds();
+				}),
+				api.onDidActivePanelChange(({ panel }) => {
+					if (
+						panel &&
+						!dockStoreRef.current?.isTemporary(panel.id) &&
+						panel.api.location.type === "grid"
+					) {
+						durableActiveGroupRef.current = panel.group.id;
+					}
 				}),
 				api.onDidAddPanel(() => syncNarratorIds()),
 				api.onDidRemovePanel((panel) => {
+					dockStoreRef.current?.forgetResource(panel.id);
 					// A closed MEMBER panel has to be removed from membership, or the surface
 					// and the server disagree: the row survives, and the next `panels` refresh
 					// re-adds the panel the user just closed. ("The panel won't close / it
@@ -809,7 +866,14 @@ export function DockviewWorkspace({
 			];
 			apiDisposablesRef.current = disposables;
 		},
-		[persist, syncNarratorIds, onApiReady, onDirectorStateChange, buildSurface],
+		[
+			persist,
+			syncNarratorIds,
+			onApiReady,
+			onDirectorStateChange,
+			buildSurface,
+			serializeCurrentLayout,
+		],
 	);
 
 	/**
@@ -824,17 +888,21 @@ export function DockviewWorkspace({
 	 */
 	const rebuildSurface = useCallback(
 		(api: DockviewApi) => {
+			const temporaryResources = dockStoreRef.current?.captureTemporaryResources() ?? [];
 			suppressLayoutEventsRef.current = true;
 			try {
 				for (const panel of [...api.panels]) closePanelInternally(panel);
 				buildSurface(api);
+				durableActiveGroupRef.current = api.activeGroup?.id ?? null;
+				dockStoreRef.current?.restoreTemporaryResources(temporaryResources);
+				observedArrangementRef.current = serializeCurrentLayout(api);
 			} finally {
 				suppressLayoutEventsRef.current = false;
 			}
 			// The per-event syncs were suppressed above; reconcile once, explicitly.
 			syncNarratorIds();
 		},
-		[buildSurface, closePanelInternally, syncNarratorIds],
+		[buildSurface, closePanelInternally, syncNarratorIds, serializeCurrentLayout],
 	);
 
 	/**
@@ -1000,6 +1068,66 @@ export function DockviewWorkspace({
 		[addDroppedNarrator],
 	);
 
+	useEffect(() => {
+		const root = surfaceRootRef.current;
+		if (!root) return;
+		const onEscape = (event: KeyboardEvent) => {
+			// React's delegated handlers run after this native ancestor listener. Let
+			// editors/menus consume the event before deciding whether to dismiss.
+			queueMicrotask(() => dockStoreRef.current?.closeFocusedTemporaryResource(event));
+		};
+		root.addEventListener("keydown", onEscape);
+		return () => root.removeEventListener("keydown", onEscape);
+	}, []);
+	// Director hides only the ordinary grid, never the floating resource ancestors.
+	useEffect(() => {
+		const root = surfaceRootRef.current;
+		const api = apiRef.current;
+		if (!root || !api) return;
+		const previous = new Map<HTMLElement, { inert: boolean; aria: string | null }>();
+		let frame = 0;
+		const restore = (element: HTMLElement) => {
+			const saved = previous.get(element);
+			if (!saved) return;
+			element.inert = saved.inert;
+			if (saved.aria === null) element.removeAttribute("aria-hidden");
+			else element.setAttribute("aria-hidden", saved.aria);
+			previous.delete(element);
+		};
+		const sync = () => {
+			for (const element of previous.keys()) {
+				if (
+					!directorOverlay ||
+					element.classList.contains("dv-render-overlay-float") ||
+					!element.isConnected
+				)
+					restore(element);
+			}
+			if (!directorOverlay) return;
+			for (const element of root.querySelectorAll<HTMLElement>(
+				".dv-grid-view.dv-dockview, .dv-render-overlay:not(.dv-render-overlay-float)",
+			)) {
+				if (!previous.has(element))
+					previous.set(element, {
+						inert: element.inert,
+						aria: element.getAttribute("aria-hidden"),
+					});
+				element.inert = true;
+				element.setAttribute("aria-hidden", "true");
+			}
+		};
+		const schedule = () => {
+			cancelAnimationFrame(frame);
+			frame = requestAnimationFrame(sync);
+		};
+		sync();
+		const subscription = api.onDidLayoutChange(schedule);
+		return () => {
+			subscription.dispose();
+			cancelAnimationFrame(frame);
+			for (const element of previous.keys()) restore(element);
+		};
+	}, [directorOverlay]);
 	// ── Cleanup: leave narrators, dispose listeners, flush save ──
 	useEffect(() => {
 		return () => {
@@ -1010,7 +1138,7 @@ export function DockviewWorkspace({
 				// unmounting, so a toast would land on whatever page the user navigated to.
 				// The log line still records it, and only the arrangement is at stake.
 				try {
-					const serialized = serializeWorkspaceLayout(api, directorRef.current);
+					const serialized = serializeCurrentLayout(api);
 					apiClient
 						.saveWorkspaceLayout(workspaceId, serialized, layoutRevisionRef.current)
 						.then((result) => {
@@ -1036,6 +1164,7 @@ export function DockviewWorkspace({
 				}
 				for (const d of apiDisposablesRef.current) d.dispose();
 				apiDisposablesRef.current = [];
+				dockStoreRef.current?.disposeTemporaryResourceChrome();
 			}
 			// Leave every narrator this surface joined. Sourced from MEMBERSHIP rather
 			// than by re-parsing the layout blob: the layout may omit a member (that is
@@ -1046,23 +1175,39 @@ export function DockviewWorkspace({
 			}
 			for (const nId of ids) apiClient.leaveNarrator(nId).catch(() => {});
 		};
-	}, [workspaceId, commitSavedLayout]);
+	}, [workspaceId, commitSavedLayout, serializeCurrentLayout]);
 
 	return (
 		<WorkspaceDockProvider store={dockStoreRef.current} workspaceId={workspaceId}>
-			<DockviewSurface
-				apiRef={apiRef}
-				components={workspacePanelComponents}
-				onReady={handleReady}
-				onDidDrop={handleDidDrop}
-				onDropSubject={handleDropSubject}
-				// Identifies this workspace's surface on panel drags, so only it treats
-				// its own panel ids as local (see DockviewSurfaceProps.surfaceId).
-				surfaceId={`workspace:${workspaceId}`}
-				// Preserve panel component instances (live narrator sessions, terminals,
-				// webviews) when panels are dragged/rearranged across groups.
-				defaultRenderer="always"
-			/>
+			<Box
+				ref={surfaceRootRef}
+				className={`workspace-resource-surface${directorOverlay ? " workspace-resource-director" : ""}`}
+				style={{ position: "relative", height: "100%", width: "100%" }}
+			>
+				<DockviewSurface
+					apiRef={apiRef}
+					components={workspacePanelComponents}
+					tabComponents={{ "workspace-resource": WorkspaceResourceTab }}
+					floatingGroupBounds="boundedWithinViewport"
+					onReady={handleReady}
+					onDidDrop={handleDidDrop}
+					onDropSubject={handleDropSubject}
+					// Identifies this workspace's surface on panel drags, so only it treats
+					// its own panel ids as local (see DockviewSurfaceProps.surfaceId).
+					surfaceId={`workspace:${workspaceId}`}
+					// Preserve panel component instances (live narrator sessions, terminals,
+					// webviews) when panels are dragged/rearranged across groups.
+					defaultRenderer="always"
+				/>
+				{directorOverlay && (
+					<Box
+						className="workspace-resource-director-overlay"
+						style={{ position: "absolute", inset: 0 }}
+					>
+						{directorOverlay}
+					</Box>
+				)}
+			</Box>
 		</WorkspaceDockProvider>
 	);
 }

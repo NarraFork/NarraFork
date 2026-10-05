@@ -92,6 +92,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 
 	const hasInput = props.composerHasText;
 	const hasAttachments = props.composerHasAttachments;
+	const sendLabel = props.isActive ? t(`queueMode_${props.enterQueueMode}`) : tc("send");
 
 	// Wrap a primary button as the right segment of the split send-options control
 	const withSendOptions = (
@@ -197,7 +198,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 			);
 		}
 
-		// Idle but compacting: show queue button
+		// Compaction keeps its wait/run policy, but an idle narrator still says Send.
 		if (props.showCompactQueueChoice) {
 			return withSendOptions(
 				<Button
@@ -206,9 +207,11 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 					disabled={!hasInput && !hasAttachments}
 					loading={props.isSending}
 				>
-					{props.queuedMessagesCount > 0
-						? `${t("queue")} (${props.queuedMessagesCount})`
-						: t("queue")}
+					{!props.isActive
+						? sendLabel
+						: props.queuedMessagesCount > 0
+							? `${t("queue")} (${props.queuedMessagesCount})`
+							: t("queue")}
 				</Button>,
 			);
 		}
@@ -218,7 +221,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 			return withSendOptions(
 				<Tooltip
 					label={t("queueButtonPressHint", {
-						shortMode: t(`queueMode_${props.enterQueueMode}`),
+						shortMode: sendLabel,
 						longMode: t(`queueMode_${props.ctrlEnterQueueMode}`),
 					})}
 					position="top"
@@ -256,11 +259,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 								}}
 							/>
 						)}
-						<span style={{ position: "relative" }}>
-							{props.queuedMessagesCount > 0
-								? `${t("queue")} (${props.queuedMessagesCount})`
-								: t("queue")}
-						</span>
+						<span style={{ position: "relative" }}>{sendLabel}</span>
 					</Button>
 				</Tooltip>,
 			);
@@ -274,7 +273,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 				disabled={!hasInput && !hasAttachments}
 				loading={props.isSending}
 			>
-				{tc("send")}
+				{sendLabel}
 			</Button>,
 		);
 	};

@@ -24,11 +24,6 @@ export const LatestTodosToolUseIdCtx = createContext<{
 	latestSpecTasksToolUseId?: string | null;
 }>({ isThinking: false, latestSpecTasksToolUseId: null });
 
-/** Context for opening the file modifications drawer from within tool call cards */
-export const FileModDrawerCtx = createContext<{
-	openForApproval: () => void;
-}>({ openForApproval: () => {} });
-
 /**
  * Context that lets a denied tool call in the latest assistant turn offer an
  * "allow and execute" action. Only enabled when the narrator is idle/interrupted

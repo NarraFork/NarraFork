@@ -102,8 +102,16 @@ export const miscApi = {
 		),
 
 	// Search
-	search: (q: string, entities = "chapters,messages") =>
-		request<SearchResponse>(`/search?q=${encodeURIComponent(q)}&entities=${entities}`),
+	search: (
+		q: string,
+		entities = "chapters,messages",
+		sort?: "time" | "relevance",
+		signal?: AbortSignal,
+	) =>
+		request<SearchResponse>(
+			`/search?q=${encodeURIComponent(q)}&entities=${entities}${sort ? `&sort=${sort}` : ""}`,
+			{ signal },
+		),
 
 	// Favorite Directories
 	listFavoriteDirectories: () => request<ApiEntity[]>("/favorites"),
@@ -473,9 +481,14 @@ export const miscApi = {
 			body: JSON.stringify({ callbackUrl }),
 		}),
 	codexBrowserAuthState: () =>
-		request<{ pending: boolean; redirectUri: string; localCallbackServer?: boolean }>(
-			"/codex/auth/browser/state",
-		),
+		request<{
+			pending: boolean;
+			status?: string;
+			errorCode?: string;
+			error?: string;
+			redirectUri: string;
+			localCallbackServer?: boolean;
+		}>("/codex/auth/browser/state"),
 	codexDeviceAuthStart: () =>
 		request<{
 			deviceAuthId: string;

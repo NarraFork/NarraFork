@@ -2,8 +2,8 @@
  * GitCommitGraph — Stage 3 UI harness.
  *
  * Guards the collapsible graph strip under Git changes: default expansion,
- * collapse persistence, HEAD branch badge, and topology degradation when
- * `parents` is missing (old remotes).
+ * collapse persistence, and topology degradation when `parents` is missing
+ * (old remotes).
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
@@ -41,6 +41,15 @@ mock.module("../../lib/i18n", () => ({
 	changeAppLanguage: async () => i18n,
 	initI18n: async () => i18n,
 	default: i18n,
+}));
+// The graph suite verifies entry wiring; the real preview has its own integration suite.
+mock.module("./GitCommitDetailModal", () => ({
+	GitCommitDetailModal: ({ sha, onClose }: { sha: string | null; onClose: () => void }) =>
+		sha ? (
+			<button type="button" data-preview-sha={sha} onClick={onClose}>
+				Close preview
+			</button>
+		) : null,
 }));
 const { GitCommitGraph } = await import("./GitCommitGraph");
 
@@ -126,9 +135,9 @@ async function initTestI18n() {
 	}
 }
 
-const HEAD_SHA = "sha-head-000000000000000000000000000001";
-const PARENT_SHA = "sha-parent-00000000000000000000000000001";
-const ROOT_SHA = "sha-root-0000000000000000000000000000001";
+const HEAD_SHA = "1".repeat(40);
+const PARENT_SHA = "2".repeat(40);
+const ROOT_SHA = "3".repeat(40);
 
 function makeStatus(): GitStatusSummary {
 	return {
@@ -265,12 +274,12 @@ function makeQueryClient(chapterId: string) {
 /** N synthetic commits, newest first, each pointing at the next as its parent. */
 function makeLongHistory(count: number): GitLogEntry[] {
 	return Array.from({ length: count }, (_, i) => ({
-		sha: `sha-${String(i).padStart(36, "0")}`,
+		sha: (i + 1).toString(16).padStart(40, "0"),
 		shortSha: `sha-${i}`,
 		message: `commit ${i}`,
 		author: "alice",
 		date: new Date(Date.UTC(2026, 0, 1, 0, 0, count - i)).toISOString(),
-		parents: i + 1 < count ? [`sha-${String(i + 1).padStart(36, "0")}`] : [],
+		parents: i + 1 < count ? [(i + 2).toString(16).padStart(40, "0")] : [],
 	}));
 }
 
@@ -318,6 +327,38 @@ describe("GitCommitGraph", () => {
 		root = undefined;
 	});
 
+	test("commit rows open and close preview, preserve native links, and clear on target change", async () => {
+		stubGitApi();
+		const { container, rerender } = renderGraph("chapter-preview");
+		await waitFor(() => !!container.querySelector("[data-commit-row]"));
+		const link = container.querySelector(`[data-commit-row="${HEAD_SHA}"]`) as HTMLAnchorElement;
+		expect(link.getAttribute("href")).toContain(
+			`/git/chapters/chapter-preview/commits/${HEAD_SHA}`,
+		);
+		for (const modifier of ["ctrlKey", "metaKey", "shiftKey", "altKey"]) {
+			const event = new Event("click", { bubbles: true, cancelable: true });
+			Object.assign(event, { button: 0, [modifier]: true });
+			link.dispatchEvent(event);
+			await flushRender();
+			expect(event.defaultPrevented).toBe(false);
+			expect(container.querySelector("[data-preview-sha]")).toBeNull();
+		}
+		const click = () => {
+			const event = new Event("click", { bubbles: true, cancelable: true });
+			Object.assign(event, { button: 0 });
+			link.dispatchEvent(event);
+			expect(event.defaultPrevented).toBe(true);
+		};
+		click();
+		await waitFor(() => !!container.querySelector(`[data-preview-sha="${HEAD_SHA}"]`));
+		buttonByText(container, "Close preview").click();
+		await waitFor(() => !container.querySelector("[data-preview-sha]"));
+		click();
+		await waitFor(() => !!container.querySelector("[data-preview-sha]"));
+		rerender("chapter-other");
+		await waitFor(() => !container.querySelector("[data-preview-sha]"));
+	});
+
 	test("1. default expanded shows commit messages", async () => {
 		const chapterId = "chapter-graph-expand";
 		const logCalls = stubGitApi();
@@ -362,24 +403,6 @@ describe("GitCommitGraph", () => {
 		expect(textOf(container)).toContain("Graph");
 		expect(textOf(container)).not.toContain("feat: stage commit graph");
 		expect(headerByLabel(container, "Expand graph")).toBeTruthy();
-
-		queryClient.clear();
-	});
-
-	test("3. HEAD row shows the branch badge", async () => {
-		const chapterId = "chapter-graph-badge";
-		stubGitApi();
-		const qc = new QueryClient({
-			defaultOptions: {
-				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
-				mutations: { retry: false },
-			},
-		});
-		qc.setQueryData(["gitStatus", chapterId], makeStatus());
-		const { container, queryClient } = renderGraph(chapterId, qc);
-		await waitFor(() => textOf(container).includes("feature/graph"));
-
-		expect(textOf(container)).toContain("feature/graph");
 
 		queryClient.clear();
 	});
@@ -758,7 +781,7 @@ describe("GitCommitGraph workspace switch", () => {
 			const key = typeof target === "string" ? target : target.workspaceKey;
 			return [
 				{
-					sha: `${key}-sha`,
+					sha: key === first ? HEAD_SHA : PARENT_SHA,
 					shortSha: "aaaaaaa",
 					message: key === first ? "only in repo A" : "only in repo B",
 					author: "alice",

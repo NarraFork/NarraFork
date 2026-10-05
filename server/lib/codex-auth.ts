@@ -15,7 +15,9 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
+import { readResponseTextWithLimit } from "./agent/response-body";
 import { logger } from "./logger";
+import { findExcludingRange, readWindowsExcludedPortRangesAsync } from "./windows-excluded-ports";
 
 // === Constants ===
 
@@ -153,6 +155,16 @@ function extractIdTokenInfo(tokens: TokenResponse): {
 
 // === Token exchange ===
 
+export class CodexOAuthError extends Error {
+	constructor(
+		public readonly code: string,
+		message: string,
+		public readonly restartRequired = false,
+	) {
+		super(message);
+	}
+}
+
 async function exchangeCodeForTokens(
 	code: string,
 	redirectUri: string,
@@ -164,6 +176,7 @@ async function exchangeCodeForTokens(
 		{
 			method: "POST",
 			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			signal: AbortSignal.timeout(30_000),
 			body: new URLSearchParams({
 				grant_type: "authorization_code",
 				code,
@@ -175,17 +188,42 @@ async function exchangeCodeForTokens(
 		proxy,
 	);
 	if (!response.ok) {
-		const text = await response.text().catch(() => "");
-		throw new Error(`Token exchange failed: ${response.status} ${text}`);
+		const text = await readResponseTextWithLimit(response, 64 * 1024).catch(() => "");
+		let upstreamCode: string | undefined;
+		try {
+			upstreamCode = JSON.parse(text)?.error?.code;
+		} catch {
+			// Non-JSON upstream errors still terminate this exchange.
+		}
+		if (upstreamCode === "unsupported_country_region_territory") {
+			throw new CodexOAuthError(
+				"region_unsupported",
+				"The server network region is not supported. Configure a usable proxy in NarraFork Codex settings, then start authorization again. Changing only the browser proxy may not affect token exchange. This flow has ended; do not resubmit the old callback URL.",
+				true,
+			);
+		}
+		throw new CodexOAuthError(
+			"token_exchange_failed",
+			`Token exchange failed: ${response.status} ${text.slice(0, 500)}. Start authorization again; do not resubmit the old callback URL.`,
+			true,
+		);
 	}
-	const raw = await response.text();
+	const raw = await readResponseTextWithLimit(response, 64 * 1024);
 	try {
-		return JSON.parse(raw) as TokenResponse;
+		const tokens = JSON.parse(raw) as TokenResponse;
+		if (
+			!tokens ||
+			typeof tokens.access_token !== "string" ||
+			!tokens.access_token ||
+			typeof tokens.refresh_token !== "string" ||
+			!tokens.refresh_token
+		) {
+			throw new Error("Missing access or refresh token");
+		}
+		return tokens;
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(
-			`Token exchange returned non-JSON payload: ${message}. body preview=${raw.slice(0, 500)}`,
-		);
+		throw new Error(`Token exchange returned an invalid token payload: ${message}`);
 	}
 }
 
@@ -247,10 +285,11 @@ const HTML_ERROR = (error: string) => `<!doctype html>
 .container{text-align:center;padding:2rem}h1{color:#ff6b6b;margin-bottom:1rem}p{color:#909296}
 .error{color:#ffa8a8;font-family:monospace;margin-top:1rem;padding:1rem;background:#2c2e33;border-radius:.5rem}</style></head>
 <body><div class="container"><h1>Authorization Failed</h1><p>An error occurred during authorization.</p>
-<div class="error">${error}</div></div></body></html>`;
+<div class="error">${error.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char] ?? char)}</div></div></body></html>`;
 
 interface PendingOAuth {
 	pkce: PkceCodes;
+	exchanging?: boolean;
 	state: string;
 	proxy?: string;
 	/** Exact redirect_uri sent in the authorize request — must be replayed on exchange. */
@@ -261,6 +300,64 @@ interface PendingOAuth {
 
 let oauthServer: ReturnType<typeof Bun.serve> | undefined;
 let pendingOAuth: PendingOAuth | undefined;
+let browserOAuthFailure: CodexOAuthError | undefined;
+
+export function getBrowserOAuthStatus() {
+	return {
+		status: pendingOAuth
+			? pendingOAuth.exchanging
+				? "exchanging"
+				: "waiting"
+			: browserOAuthFailure
+				? "failed"
+				: "idle",
+		errorCode: browserOAuthFailure?.code,
+		error: browserOAuthFailure?.message,
+	};
+}
+
+async function completeBrowserOAuthExchange(current: PendingOAuth, code: string) {
+	if (current.exchanging) {
+		throw new CodexOAuthError(
+			"exchange_in_progress",
+			"Token exchange is already in progress. Please wait.",
+		);
+	}
+	current.exchanging = true;
+	try {
+		const tokens = await exchangeCodeForTokens(
+			code,
+			current.redirectUri,
+			current.pkce,
+			current.proxy,
+		);
+		if (pendingOAuth !== current) {
+			throw new CodexOAuthError(
+				"flow_expired",
+				"This authorization has ended. Start authorization again.",
+				true,
+			);
+		}
+		pendingOAuth = undefined;
+		current.resolve(tokens);
+		return tokens;
+	} catch (err) {
+		const failure =
+			err instanceof CodexOAuthError
+				? err
+				: new CodexOAuthError(
+						isNetworkError(err) ? "network_error" : "token_exchange_failed",
+						`Token exchange failed: ${err instanceof Error ? err.message : String(err)}. Check the server's Codex proxy configuration and start authorization again.`,
+						true,
+					);
+		if (pendingOAuth === current) {
+			pendingOAuth = undefined;
+			browserOAuthFailure = failure;
+			current.reject(failure);
+		}
+		throw failure;
+	}
+}
 /** Last known state of the callback listener, for surfacing in the browser-auth state endpoint. */
 let oauthServerRunning = false;
 
@@ -277,6 +374,32 @@ async function ensureOAuthServer(): Promise<{
 		return { port, redirectUri: `http://localhost:${port}/auth/callback`, running: true };
 	}
 
+	// Re-read before each bind attempt: Windows exclusions can change between flows.
+	// Do not invoke Bun.serve for a known reservation (its failure can be asynchronous).
+	const excludedRange = findExcludingRange(
+		CALLBACK_PORT,
+		await readWindowsExcludedPortRangesAsync(),
+	);
+	// Another flow may have started the persistent server while netsh was running.
+	// TS retains the pre-await narrowing, so explicitly re-read the shared state.
+	const startedServer = oauthServer as ReturnType<typeof Bun.serve> | undefined;
+	if (startedServer) {
+		const port = startedServer.port ?? CALLBACK_PORT;
+		return { port, redirectUri: `http://localhost:${port}/auth/callback`, running: true };
+	}
+	if (excludedRange) {
+		oauthServerRunning = false;
+		logger.warn("Codex OAuth callback port is reserved by Windows; use manual callback", {
+			port: CALLBACK_PORT,
+			reservedRange: `${excludedRange.start}-${excludedRange.end}`,
+		});
+		return {
+			port: CALLBACK_PORT,
+			redirectUri: `http://localhost:${CALLBACK_PORT}/auth/callback`,
+			running: false,
+		};
+	}
+
 	// Use fixed port 1455 to match Go's RedirectURI.
 	// The server is kept alive across multiple OAuth flows to avoid port-release
 	// race conditions when Bun.serve is stopped and immediately restarted.
@@ -284,7 +407,9 @@ async function ensureOAuthServer(): Promise<{
 		oauthServer = Bun.serve({
 			port: CALLBACK_PORT,
 			reusePort: true,
-			fetch(req) {
+			// Keep the browser response open for the bounded 30-second token exchange.
+			idleTimeout: 35,
+			async fetch(req) {
 				const url = new URL(req.url);
 
 				if (url.pathname === "/auth/callback") {
@@ -293,59 +418,58 @@ async function ensureOAuthServer(): Promise<{
 					const error = url.searchParams.get("error");
 					const errorDescription = url.searchParams.get("error_description");
 
-					if (error) {
-						const errorMsg = errorDescription || error;
-						pendingOAuth?.reject(new Error(errorMsg));
-						pendingOAuth = undefined;
-						return new Response(HTML_ERROR(errorMsg), {
-							headers: { "Content-Type": "text/html" },
-						});
-					}
-
-					if (!code) {
-						const errorMsg = "Missing authorization code";
-						pendingOAuth?.reject(new Error(errorMsg));
-						pendingOAuth = undefined;
-						return new Response(HTML_ERROR(errorMsg), {
-							status: 400,
-							headers: { "Content-Type": "text/html" },
-						});
-					}
-
 					if (!pendingOAuth || state !== pendingOAuth.state) {
 						const errorMsg = pendingOAuth
 							? "Invalid state - potential CSRF attack"
 							: "No pending OAuth flow (expired or already completed)";
-						pendingOAuth?.reject(new Error(errorMsg));
+						return new Response(
+							HTML_ERROR(`${errorMsg}. Use the latest callback URL or start authorization again.`),
+							{
+								status: 400,
+								headers: { "Content-Type": "text/html" },
+							},
+						);
+					}
+
+					if (pendingOAuth.exchanging) {
+						return new Response(HTML_ERROR("Token exchange is already in progress. Please wait."), {
+							status: 409,
+							headers: { "Content-Type": "text/html" },
+						});
+					}
+					if (error) {
+						const failure = new CodexOAuthError(
+							"authorization_denied",
+							`${errorDescription || error}. Start authorization again.`,
+							true,
+						);
+						pendingOAuth.reject(failure);
 						pendingOAuth = undefined;
-						return new Response(HTML_ERROR(errorMsg), {
+						browserOAuthFailure = failure;
+						return new Response(HTML_ERROR(failure.message), {
 							status: 400,
 							headers: { "Content-Type": "text/html" },
 						});
 					}
-
-					const current = pendingOAuth;
-					pendingOAuth = undefined;
-
-					exchangeCodeForTokens(code, current.redirectUri, current.pkce, current.proxy)
-						.then((tokens) => current.resolve(tokens))
-						.catch((err) => {
-							// Enhance error message when proxy is not configured
-							if (!current.proxy && isNetworkError(err)) {
-								current.reject(
-									new Error(
-										`Token exchange failed (no proxy configured): ${err.message}. ` +
-											`If you are behind a firewall, configure the Codex proxy first.`,
-									),
-								);
-							} else {
-								current.reject(err);
-							}
+					if (!code) {
+						return new Response(
+							HTML_ERROR(
+								"Missing authorization code. Use the latest callback URL or start authorization again.",
+							),
+							{ status: 400, headers: { "Content-Type": "text/html" } },
+						);
+					}
+					try {
+						await completeBrowserOAuthExchange(pendingOAuth, code);
+						return new Response(HTML_SUCCESS, {
+							headers: { "Content-Type": "text/html" },
 						});
-
-					return new Response(HTML_SUCCESS, {
-						headers: { "Content-Type": "text/html" },
-					});
+					} catch (err) {
+						return new Response(HTML_ERROR(err instanceof Error ? err.message : String(err)), {
+							status: 400,
+							headers: { "Content-Type": "text/html" },
+						});
+					}
 				}
 
 				return new Response("Not found", { status: 404 });
@@ -410,6 +534,7 @@ export async function startBrowserOAuth(proxy?: string): Promise<{
 	const { redirectUri, running } = await ensureOAuthServer();
 	const pkce = generatePKCE();
 	const state = generateState();
+	browserOAuthFailure = undefined;
 
 	// Cancel any lingering previous flow
 	if (pendingOAuth) {
@@ -436,7 +561,12 @@ export async function startBrowserOAuth(proxy?: string): Promise<{
 			() => {
 				if (pendingOAuth?.state === state) {
 					pendingOAuth = undefined;
-					reject(new Error("OAuth callback timeout"));
+					browserOAuthFailure = new CodexOAuthError(
+						"flow_expired",
+						"OAuth callback timeout. Start authorization again; do not resubmit the old callback URL.",
+						true,
+					);
+					reject(browserOAuthFailure);
 				}
 			},
 			15 * 60 * 1000,
@@ -647,44 +777,52 @@ export async function completeBrowserOAuthFromCallbackUrl(input: string): Promis
 
 	const current = pendingOAuth;
 	if (!current) {
-		throw new Error(
-			"No pending browser authorization. Click the browser login button first, then paste the callback URL.",
+		throw new CodexOAuthError(
+			"flow_expired",
+			"No pending browser authorization. Start authorization again; do not resubmit the old callback URL.",
+			true,
 		);
 	}
 
 	const params = parseCallbackParams(raw);
-	const error = params.get("error");
-	if (error) {
-		throw new Error(params.get("error_description") || error);
-	}
-
-	const code = params.get("code");
-	if (!code) {
-		throw new Error("No 'code' parameter found in the callback URL");
-	}
 
 	// State is optional in the pasted value (some browsers truncate on copy), but
 	// when present it must match — a mismatch means the URL belongs to another flow.
 	const state = params.get("state");
 	if (state && state !== current.state) {
-		throw new Error("Callback state does not match the pending authorization");
+		throw new CodexOAuthError(
+			"state_mismatch",
+			"Callback state does not match the pending authorization. Use the latest callback URL or start authorization again; do not keep submitting this URL.",
+		);
 	}
 
-	// Detach while the exchange is in flight so a concurrent real callback can't
-	// spend the same pending flow twice.
-	pendingOAuth = undefined;
-	let tokens: TokenResponse;
-	try {
-		tokens = await exchangeCodeForTokens(code, current.redirectUri, current.pkce, current.proxy);
-	} catch (err) {
-		// Keep the flow pending so the user can fix the paste (or a transient proxy
-		// failure) and try again without restarting authorization from scratch.
-		// A newer flow started meanwhile wins and this one is dropped.
-		if (!pendingOAuth) pendingOAuth = current;
-		throw err instanceof Error ? err : new Error(String(err));
+	if (current.exchanging) {
+		throw new CodexOAuthError(
+			"exchange_in_progress",
+			"Token exchange is already in progress. Please wait.",
+		);
 	}
+	const error = params.get("error");
+	if (error) {
+		const failure = new CodexOAuthError(
+			"authorization_denied",
+			`${params.get("error_description") || error}. Start authorization again.`,
+			true,
+		);
+		pendingOAuth = undefined;
+		browserOAuthFailure = failure;
+		current.reject(failure);
+		throw failure;
+	}
+	const code = params.get("code");
+	if (!code)
+		throw new CodexOAuthError(
+			"invalid_callback",
+			"No 'code' parameter found in the callback URL. Use the latest callback URL or start authorization again.",
+		);
 
-	current.resolve(tokens);
+	// Both callback paths share the same exchange lock and terminal failure handling.
+	const tokens = await completeBrowserOAuthExchange(current, code);
 	const info = extractIdTokenInfo(tokens);
 	return {
 		accessToken: tokens.access_token,
@@ -735,6 +873,7 @@ export function isBrowserOAuthServerRunning(): boolean {
  * The callback server is intentionally kept alive for future flows.
  */
 export function cancelBrowserOAuth(): void {
+	browserOAuthFailure = undefined;
 	if (pendingOAuth) {
 		pendingOAuth.reject(new Error("Login cancelled"));
 		pendingOAuth = undefined;

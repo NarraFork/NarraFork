@@ -257,6 +257,14 @@ export function generatePostgresSchema(
 				sql += `"${column.name}"${span.literal.text}`;
 			}
 		}
+		// The historical ISO-like text default remains text, not a PG timestamp column.
+		sql = sql.replace(/\(datetime\('now'\)\)/g, "CURRENT_TIMESTAMP::text");
+		// Byte budgets, not character counts: SQLite BLOB length maps to PG octet_length(text).
+		sql = sql.replace(/length\(cast\("([\w]+)" as blob\)\)/gi, (_match, name: string) => {
+			if (!table.columns.some((column) => column.name === name && column.kind === "text"))
+				return fail(object, `byte budget source ${name}`);
+			return `octet_length("${name}")`;
+		});
 		// SQLite dynamically checks integer storage; PG enforces the mapped column type itself.
 		sql = sql.replace(/typeof\("([\w]+)"\)\s*=\s*'integer'/g, (match, name: string) => {
 			const column = table.columns.find((c) => c.name === name);
@@ -299,7 +307,7 @@ export function generatePostgresSchema(
 		// SQL is deliberately a small language here. Unknown SQLite functions cannot silently leak into PG.
 		const functions = [...sql.matchAll(/\b([a-z_]\w*)\s*\(/gi)].map((m) => m[1].toLowerCase());
 		for (const fn of functions)
-			if (!["coalesce", "in", "or", "and", "when", "not"].includes(fn))
+			if (!["coalesce", "in", "or", "and", "when", "not", "octet_length"].includes(fn))
 				fail(object, `unsupported SQL function ${fn}`);
 		return sql.trim().replace(/\s+/g, " ");
 	};

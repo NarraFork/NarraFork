@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, setSystemTime, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { getTestDb } from "../../../tests/setup";
 
@@ -48,9 +48,12 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 		waitForManualOverride,
 	} = await import("../subagent-manual-override");
 	const {
+		applySubagentBufferedQueueModeControl,
 		bufferSubagentUserMessage,
 		canDeliverBufferedMessageInPass,
 		clearSubagentBufferedMessages,
+		consumeBufferedSubagentMessageInPass,
+		consumeNextBufferedSubagentMessage,
 		getSubagentBufferedMessages,
 		MAX_SUBAGENT_INTERRUPTION_RETRIES,
 		planSubagentInterruption,
@@ -62,23 +65,35 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 		updateSubagentBufferedMessage,
 	} = await import("../subagent-executor");
 
+	const { activeNarrators } = await import("../narrator-session-state");
+	type ActiveNarrator = import("../narrator-session-state").ActiveNarrator;
 	const SUBAGENT_ID = "subagent-interrupt-test";
 	db.insert(narrators)
-		.values({
-			id: SUBAGENT_ID,
-			type: "subagent",
-			variant: "subagent:general",
-			createdAt: new Date().toISOString(),
-			updatedAt: new Date().toISOString(),
-		})
+		.values([
+			{
+				id: "subagent-interrupt-parent",
+				variant: "primary",
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+			},
+			{
+				id: SUBAGENT_ID,
+				type: "subagent",
+				variant: "subagent:general",
+				parentNarratorId: "subagent-interrupt-parent",
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+			},
+		])
 		.run();
 
-	afterEach(() => {
+	afterEach(async () => {
+		activeNarrators.delete(SUBAGENT_ID);
 		getForegroundAbortControllers().clear();
 		getDetachableMap().clear();
 		clearManualOverrideRuntimes();
 		consumeForegroundSubagentHardInterrupt(SUBAGENT_ID);
-		clearSubagentBufferedMessages(SUBAGENT_ID);
+		await clearSubagentBufferedMessages(SUBAGENT_ID);
 	});
 
 	afterAll(() => {
@@ -237,6 +252,287 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
 		});
 
+		test("explicit turn stays FIFO and waits for natural completion", async () => {
+			await bufferSubagentUserMessage(SUBAGENT_ID, "first", { queueMode: "turn" });
+			await bufferSubagentUserMessage(SUBAGENT_ID, "second", {
+				queueMode: "turn",
+				priority: true,
+			});
+			const messages = getSubagentBufferedMessages(SUBAGENT_ID);
+			expect(messages.map((message) => message.text)).toEqual(["first", "second"]);
+			expect(messages.map((message) => message.queueMode)).toEqual(["turn", "turn"]);
+			expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
+			expect(canDeliverBufferedMessageInPass(messages[0], null)).toBe(false);
+		});
+
+		for (const queueMode of ["tool", "interrupt"] as const) {
+			test(`${queueMode} only cancels its guidance channels and preserves runner ownership`, async () => {
+				const parentAbort = new AbortController();
+				const runnerAbort = new AbortController();
+				const guidance = new AbortController();
+				const urgent = new AbortController();
+				const active = {
+					narratorId: SUBAGENT_ID,
+					alive: true,
+					abortController: runnerAbort,
+					_guidanceAbortController: guidance,
+					_urgentGuidanceAbortController: urgent,
+				} as ActiveNarrator;
+				activeNarrators.set(SUBAGENT_ID, active);
+				const waiting = waitForManualOverride(SUBAGENT_ID, parentAbort.signal, "parent", "tool");
+				await bufferSubagentUserMessage(SUBAGENT_ID, "feedback", {
+					queueMode,
+					requestSoftStop: false,
+				});
+				expect(active._bufferSoftStop).toBe(true);
+				expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
+				expect(guidance.signal.aborted).toBe(true);
+				expect(urgent.signal.aborted).toBe(queueMode === "interrupt");
+				expect(runnerAbort.signal.aborted).toBe(false);
+				expect(parentAbort.signal.aborted).toBe(false);
+				expect(getManualOverrideRuntime(SUBAGENT_ID)).not.toBeNull();
+				resumeManualOverride(SUBAGENT_ID, {
+					prompt: "resume",
+					history: [],
+					trailingToolResults: [],
+				});
+				await waiting;
+			});
+		}
+
+		test("new urgent input precedes older tool guidance and retains tool arrival order", async () => {
+			await bufferSubagentUserMessage(SUBAGENT_ID, "turn-1", { queueMode: "turn" });
+			await bufferSubagentUserMessage(SUBAGENT_ID, "tool-1", { queueMode: "tool" });
+			await bufferSubagentUserMessage(SUBAGENT_ID, "interrupt-1", { queueMode: "interrupt" });
+			await bufferSubagentUserMessage(SUBAGENT_ID, "tool-2", { queueMode: "tool" });
+			expect(getSubagentBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
+				"interrupt-1",
+				"tool-1",
+				"tool-2",
+				"turn-1",
+			]);
+		});
+
+		test("committed guidance cannot be claimed before old-pass cancellation", async () => {
+			const bufferModule = { ...(await import("../narrator-buffer")) };
+			const inboxModule = { ...(await import("../agent-runtime/inbox")) };
+			const historyModule = { ...(await import("../agent-runtime/history")) };
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const { tryClaimExecution } = await import("../agent-runtime/ownership");
+			const owner = tryClaimExecution(SUBAGENT_ID, "subagent");
+			expect(owner).not.toBeNull();
+			const guidance = new AbortController();
+			const replacementGuidance = new AbortController();
+			const active = {
+				narratorId: SUBAGENT_ID,
+				alive: true,
+				_guidanceAbortController: guidance,
+			} as ActiveNarrator;
+			activeNarrators.set(SUBAGENT_ID, active);
+			let claimed = false;
+			let abortedAtClaim = false;
+			mock.module("../narrator-buffer", () => ({
+				...bufferModule,
+				enqueueBufferedMessage: async (
+					...args: Parameters<typeof bufferModule.enqueueBufferedMessage>
+				) => {
+					const result = await bufferModule.enqueueBufferedMessage(...args);
+					entered.resolve();
+					await release.promise;
+					return result;
+				},
+			}));
+			mock.module("../agent-runtime/inbox", () => ({
+				...inboxModule,
+				claimInboxHead: async (...args: Parameters<typeof inboxModule.claimInboxHead>) => {
+					const row = await inboxModule.claimInboxHead(...args);
+					if (row) {
+						claimed = true;
+						abortedAtClaim = guidance.signal.aborted;
+						active._guidanceAbortController = replacementGuidance;
+					}
+					return row;
+				},
+			}));
+			mock.module("../agent-runtime/history", () => ({
+				...historyModule,
+				buildRuntimeHistory: async () => ({ history: [], trailingToolResults: [] }),
+			}));
+			let admission: ReturnType<typeof bufferSubagentUserMessage> | undefined;
+			let consumption: ReturnType<typeof consumeNextBufferedSubagentMessage> | undefined;
+			try {
+				admission = bufferSubagentUserMessage(SUBAGENT_ID, "guide", { queueMode: "tool" });
+				await entered.promise;
+				expect(getSubagentBufferedMessages(SUBAGENT_ID)[0]?.text).toBe("guide");
+				consumption = consumeNextBufferedSubagentMessage({
+					narratorId: SUBAGENT_ID,
+					parentNarratorId: "subagent-interrupt-parent",
+					toolUseId: "tool",
+					model: "test",
+					provider: "test",
+					cwd: process.cwd(),
+					onlyGuidance: true,
+				});
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(claimed).toBe(false);
+				expect(guidance.signal.aborted).toBe(false);
+				release.resolve();
+				expect((await admission).ok).toBe(true);
+				expect((await consumption)?.currentInput).toBe("guide");
+				expect(claimed).toBe(true);
+				expect(abortedAtClaim).toBe(true);
+				expect(replacementGuidance.signal.aborted).toBe(false);
+				expect(getSubagentBufferedMessages(SUBAGENT_ID)).toEqual([]);
+			} finally {
+				release.resolve();
+				await Promise.allSettled([admission, consumption]);
+				owner?.release();
+				mock.module("../narrator-buffer", () => bufferModule);
+				mock.module("../agent-runtime/inbox", () => inboxModule);
+				mock.module("../agent-runtime/history", () => historyModule);
+			}
+		});
+
+		test("in-pass claim reenters mutation admission without losing FIFO", async () => {
+			const { withNarratorMutationAdmission } = await import("../narrator-session-state");
+			const { tryClaimExecution } = await import("../agent-runtime/ownership");
+			const owner = tryClaimExecution(SUBAGENT_ID, "subagent");
+			expect(owner).not.toBeNull();
+			try {
+				const { narratorMessages, narratorToolCalls } = await import("../../db/schema");
+				const { createAgentMessageDelivery } = await import("../agent-message-delivery");
+				for (const text of ["first", "second"]) {
+					const id = `in-pass-${text}`;
+					const parent = "subagent-interrupt-parent";
+					const now = new Date().toISOString();
+					db.insert(narratorMessages)
+						.values({ id, narratorId: parent, role: "assistant", contentJson: [], createdAt: now })
+						.run();
+					db.insert(narratorToolCalls)
+						.values({
+							id: `${id}-tool`,
+							narratorId: parent,
+							messageId: id,
+							toolUseId: id,
+							toolName: "Send",
+							executionAttempt: 1,
+							executionIdentityVersion: 1,
+							status: "running",
+							createdAt: now,
+						})
+						.run();
+					await pushSubagentBufferedMessage(SUBAGENT_ID, text, {
+						delivery: createAgentMessageDelivery(
+							SUBAGENT_ID,
+							{ id: parent, title: "Parent", label: "parent", type: null, isParent: true },
+							id,
+							text,
+							{ toolCallId: `${id}-tool`, attempt: 1 },
+						),
+					});
+				}
+				const consumed = await withNarratorMutationAdmission(SUBAGENT_ID, () =>
+					consumeBufferedSubagentMessageInPass({
+						narratorId: SUBAGENT_ID,
+						parentNarratorId: "subagent-interrupt-parent",
+						toolUseId: "tool",
+						cwd: process.cwd(),
+					}),
+				);
+				expect(consumed?.buffered.text).toBe("first");
+				const { peekInbox } = await import("../agent-runtime/inbox");
+				expect((await peekInbox(SUBAGENT_ID))?.text).toBe("second");
+				const second = await consumeBufferedSubagentMessageInPass({
+					narratorId: SUBAGENT_ID,
+					parentNarratorId: "subagent-interrupt-parent",
+					toolUseId: "tool",
+					cwd: process.cwd(),
+				});
+				expect(second?.buffered.text).toBe("second");
+				expect(await peekInbox(SUBAGENT_ID)).toBeUndefined();
+			} finally {
+				owner?.release();
+				sqlite
+					.query(
+						"DELETE FROM narrator_buffered_messages WHERE narrator_id = ? AND kind = 'agent_message'",
+					)
+					.run(SUBAGENT_ID);
+			}
+		});
+
+		test("soft-stop drain cannot consume a queued next step", async () => {
+			await bufferSubagentUserMessage(SUBAGENT_ID, "after completion", { queueMode: "turn" });
+			requestSubagentBufferedMessageSoftStop(SUBAGENT_ID);
+			expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
+			expect(
+				await consumeNextBufferedSubagentMessage({
+					narratorId: SUBAGENT_ID,
+					parentNarratorId: "parent",
+					toolUseId: "tool",
+					model: "test",
+					provider: "test",
+					cwd: process.cwd(),
+					onlyGuidance: true,
+				}),
+			).toBeNull();
+			expect(getSubagentBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
+				"after completion",
+			]);
+		});
+
+		test("mode downgrade clears only when no queued guidance remains", async () => {
+			await bufferSubagentUserMessage(SUBAGENT_ID, "guide", { queueMode: "tool" });
+			applySubagentBufferedQueueModeControl(SUBAGENT_ID, "turn", true, true);
+			expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
+			applySubagentBufferedQueueModeControl(SUBAGENT_ID, "turn", false, true);
+			expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
+		});
+
+		test("failed mode target cannot cancel a pass even with other queued guidance", () => {
+			const guidance = new AbortController();
+			const urgent = new AbortController();
+			activeNarrators.set(SUBAGENT_ID, {
+				narratorId: SUBAGENT_ID,
+				alive: true,
+				_guidanceAbortController: guidance,
+				_urgentGuidanceAbortController: urgent,
+			} as ActiveNarrator);
+			applySubagentBufferedQueueModeControl(SUBAGENT_ID, "interrupt", true, false);
+			expect(guidance.signal.aborted).toBe(false);
+			expect(urgent.signal.aborted).toBe(false);
+		});
+
+		test("rejected admission never cancels a running child", async () => {
+			const guidance = new AbortController();
+			const urgent = new AbortController();
+			activeNarrators.set(SUBAGENT_ID, {
+				narratorId: SUBAGENT_ID,
+				alive: true,
+				_guidanceAbortController: guidance,
+				_urgentGuidanceAbortController: urgent,
+			} as ActiveNarrator);
+			await expect(
+				bufferSubagentUserMessage(SUBAGENT_ID, "x".repeat(2 * 1024 * 1024 + 1), {
+					queueMode: "interrupt",
+				}),
+			).rejects.toThrow("Buffered input exceeds size limit");
+			expect(guidance.signal.aborted).toBe(false);
+			expect(urgent.signal.aborted).toBe(false);
+			expect(getSubagentBufferedMessages(SUBAGENT_ID)).toEqual([]);
+		});
+
+		test("mode control with an empty queue does not cancel a pass", () => {
+			const guidance = new AbortController();
+			activeNarrators.set(SUBAGENT_ID, {
+				narratorId: SUBAGENT_ID,
+				alive: true,
+				_guidanceAbortController: guidance,
+			} as ActiveNarrator);
+			applySubagentBufferedQueueModeControl(SUBAGENT_ID, "interrupt");
+			expect(guidance.signal.aborted).toBe(false);
+		});
+
 		test("taken-over user messages can queue without requesting soft-stop", async () => {
 			await bufferSubagentUserMessage(SUBAGENT_ID, "manual", { requestSoftStop: false });
 
@@ -259,7 +555,7 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			await pushSubagentBufferedMessage(SUBAGENT_ID, "queued");
 			requestSubagentBufferedMessageSoftStop(SUBAGENT_ID);
 
-			clearSubagentBufferedMessages(SUBAGENT_ID);
+			await clearSubagentBufferedMessages(SUBAGENT_ID);
 
 			expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
 		});
@@ -685,45 +981,59 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			});
 		});
 
-		test("timeout during a claim is deferred and then settled as terminal", async () => {
-			const waiting = waitForManualOverride(
-				SUBAGENT_ID,
-				new AbortController().signal,
-				"parent-narrator",
-				"tool-use-id",
-				{ timeoutMs: 5 },
-			);
-			const claim = claimManualOverride(SUBAGENT_ID, "detach");
-			expect(claim).not.toBeNull();
-			if (!claim) throw new Error("expected detach claim");
-			await Bun.sleep(10);
-			expect(getManualOverrideRuntime(SUBAGENT_ID)?.pendingTerminal).toMatchObject({
-				action: "finish",
-				hasError: true,
-			});
-			settleManualOverrideClaim(claim, {
-				action: "finish",
-				finalText: "detach finished",
-				hasError: false,
-			});
-			await expect(waiting).resolves.toMatchObject({
-				action: "finish",
-				finalText: "Manual override timed out after 2 hours",
-				hasError: true,
-			});
+		test("manual override never schedules a timeout and survives more than two hours", async () => {
+			const timerSpy = spyOn(globalThis, "setTimeout");
+			try {
+				const waiting = waitForManualOverride(
+					SUBAGENT_ID,
+					new AbortController().signal,
+					"parent-narrator",
+					"tool-use-id",
+				);
+				expect(timerSpy).not.toHaveBeenCalled();
+				let settled = false;
+				void waiting.then(() => {
+					settled = true;
+				});
+				setSystemTime(Date.now() + 3 * 60 * 60 * 1000);
+				await Promise.resolve();
+				expect(settled).toBe(false);
+				expect(getManualOverrideRuntime(SUBAGENT_ID)?.phase).toBe("waiting");
+				const claim = claimManualOverride(SUBAGENT_ID, "detach");
+				if (!claim) throw new Error("expected detach claim");
+				setSystemTime(Date.now() + 3 * 60 * 60 * 1000);
+				await Promise.resolve();
+				expect(settled).toBe(false);
+				expect(getManualOverrideRuntime(SUBAGENT_ID)?.pendingTerminal).toBeNull();
+				expect(timerSpy).not.toHaveBeenCalled();
+				settleManualOverrideClaim(claim, {
+					action: "finish",
+					finalText: "detach finished",
+					hasError: false,
+				});
+				await expect(waiting).resolves.toEqual({
+					action: "finish",
+					finalText: "detach finished",
+					hasError: false,
+				});
+			} finally {
+				timerSpy.mockRestore();
+				setSystemTime();
+				clearManualOverrideRuntimes();
+			}
 		});
 
-		test("an old timeout callback cannot delete a replacement runtime", async () => {
+		test("an old parent abort cannot delete a replacement runtime", async () => {
+			const oldParent = new AbortController();
 			const first = waitForManualOverride(
 				SUBAGENT_ID,
-				new AbortController().signal,
+				oldParent.signal,
 				"parent-narrator",
 				"tool-use-id",
-				{ timeoutMs: 5 },
 			);
 			expect(
 				resumeManualOverride(SUBAGENT_ID, {
-					prompt: "finish before old timer",
+					prompt: "finish before parent abort",
 					history: [],
 					trailingToolResults: [],
 				}),
@@ -737,7 +1047,7 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 				"tool-use-id-2",
 			);
 			const replacementId = getManualOverrideRuntime(SUBAGENT_ID)?.entryId;
-			await Bun.sleep(10);
+			oldParent.abort();
 			expect(getManualOverrideRuntime(SUBAGENT_ID)?.entryId).toBe(replacementId);
 			expect(
 				resumeManualOverride(SUBAGENT_ID, {

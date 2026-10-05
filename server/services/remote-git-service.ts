@@ -188,8 +188,11 @@ export function createRemoteGitService(
 		await request(cwd, operation, args);
 	}
 	return {
-		probe: (cwd: string, probeSignal?: AbortSignal) =>
-			request(cwd, "probe", {}, probeSignal ?? signal),
+		probe: (
+			cwd: string,
+			probeSignal?: AbortSignal,
+			limits: Pick<GitWorkspaceRequest, "maxBytes" | "timeoutMs"> = {},
+		) => request(cwd, "probe", limits, probeSignal ?? signal),
 		async getStatusSummary(cwd: string) {
 			return parseRemoteGitStatus(await request(cwd, "status"));
 		},

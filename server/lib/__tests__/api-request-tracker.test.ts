@@ -622,6 +622,52 @@ function readSpill(row: string | null): { filePath?: string } | undefined {
 	return (JSON.parse(row) as { spill?: { filePath?: string } }).spill;
 }
 
+describe("request occupancy snapshot persistence", () => {
+	test("actual request insertion maps bounded occupancy metadata without changing billing", async () => {
+		const handle = startApiRequest({ provider: "anthropic", model: "claude-sonnet-4-20250514" });
+		const snapshot = {
+			requestId: "logical-request",
+			startedAt: "2026-10-05T00:00:00Z",
+			source: "upstream" as const,
+			percentage: 92.6,
+			contextWindow: 1_000_000,
+			occupiedTokens: 926000,
+			inputCharacters: { totalChars: 1_000_000, systemChars: 0, toolsChars: 0 },
+			composition: null,
+		};
+		await finishApiRequest(handle, {
+			usage: { inputTokens: 510800, outputTokens: 10 },
+			contextPercent: 92.6,
+			contextSnapshot: snapshot,
+		});
+		const row = db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get();
+		expect(row?.contextUsageSnapshotJson).toEqual(snapshot);
+		expect(row?.inputTokens).toBe(510800);
+	});
+	test("historical omission remains null; oversized metadata is not inserted", async () => {
+		for (const contextSnapshot of [
+			undefined,
+			{
+				requestId: "x".repeat(17000),
+				startedAt: "2026-10-05T00:00:00Z",
+				source: "estimate" as const,
+				percentage: null,
+				contextWindow: null,
+				occupiedTokens: null,
+				inputCharacters: null,
+				composition: null,
+			},
+		]) {
+			const handle = startApiRequest({ provider: "anthropic", model: "claude-sonnet-4-20250514" });
+			await finishApiRequest(handle, { contextSnapshot });
+			expect(
+				db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get()
+					?.contextUsageSnapshotJson,
+			).toBeNull();
+		}
+	});
+});
+
 describe("request user attribution", () => {
 	test("completion persists frozen user and rolls up once, including unknown-cost failures", async () => {
 		const userId = "tracker-user-rollup-test";

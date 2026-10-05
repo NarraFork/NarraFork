@@ -33,6 +33,7 @@ import {
 	narratorToolCalls,
 	narratorWhitelistCmds,
 	narratorWhitelistDirs,
+	narratorWorktreeResources,
 	oauthAccessTokens,
 	oauthAuthorizationCodes,
 	oauthClients,
@@ -329,18 +330,54 @@ export const remoteDevicesRelations = relations(remoteDevices, ({ one }) => ({
 	}),
 }));
 
+export const narratorWorktreeResourcesRelations = relations(
+	narratorWorktreeResources,
+	({ one, many }) => ({
+		ownerNarrator: one(narrators, {
+			fields: [narratorWorktreeResources.ownerNarratorId],
+			references: [narrators.id],
+		}),
+		scopeProject: one(projects, {
+			fields: [narratorWorktreeResources.scopeProjectId],
+			references: [projects.id],
+		}),
+		scopeOwner: one(users, {
+			fields: [narratorWorktreeResources.scopeOwnerUserId],
+			references: [users.id],
+		}),
+		terminals: many(terminals),
+		terminalViewStates: many(terminalViewState),
+		containers: many(containerInstances),
+		ports: many(portAllocations),
+		volumeSources: many(volumeSnapshots),
+		volumeApplications: many(volumeSnapshotApplications),
+	}),
+);
+
 export const terminalsRelations = relations(terminals, ({ one }) => ({
+	worktreeResource: one(narratorWorktreeResources, {
+		fields: [terminals.worktreeResourceId],
+		references: [narratorWorktreeResources.id],
+	}),
 	chapter: one(chapters, { fields: [terminals.chapterId], references: [chapters.id] }),
 	narrator: one(narrators, { fields: [terminals.narratorId], references: [narrators.id] }),
 }));
 
 export const terminalViewStateRelations = relations(terminalViewState, ({ one }) => ({
+	worktreeResource: one(narratorWorktreeResources, {
+		fields: [terminalViewState.worktreeResourceId],
+		references: [narratorWorktreeResources.id],
+	}),
 	user: one(users, { fields: [terminalViewState.userId], references: [users.id] }),
 	chapter: one(chapters, { fields: [terminalViewState.chapterId], references: [chapters.id] }),
 	narrator: one(narrators, { fields: [terminalViewState.narratorId], references: [narrators.id] }),
 }));
 
 export const containerInstancesRelations = relations(containerInstances, ({ one }) => ({
+	worktreeResource: one(narratorWorktreeResources, {
+		fields: [containerInstances.worktreeResourceId],
+		references: [narratorWorktreeResources.id],
+	}),
 	chapter: one(chapters, {
 		fields: [containerInstances.chapterId],
 		references: [chapters.id],
@@ -348,6 +385,10 @@ export const containerInstancesRelations = relations(containerInstances, ({ one 
 }));
 
 export const portAllocationsRelations = relations(portAllocations, ({ one }) => ({
+	worktreeResource: one(narratorWorktreeResources, {
+		fields: [portAllocations.worktreeResourceId],
+		references: [narratorWorktreeResources.id],
+	}),
 	chapter: one(chapters, {
 		fields: [portAllocations.chapterId],
 		references: [chapters.id],
@@ -540,6 +581,10 @@ export const narratorBlacklistCmdsRelations = relations(narratorBlacklistCmds, (
 }));
 
 export const volumeSnapshotsRelations = relations(volumeSnapshots, ({ one, many }) => ({
+	sourceWorktreeResource: one(narratorWorktreeResources, {
+		fields: [volumeSnapshots.sourceWorktreeResourceId],
+		references: [narratorWorktreeResources.id],
+	}),
 	project: one(projects, {
 		fields: [volumeSnapshots.projectId],
 		references: [projects.id],
@@ -558,6 +603,10 @@ export const volumeSnapshotsRelations = relations(volumeSnapshots, ({ one, many 
 export const volumeSnapshotApplicationsRelations = relations(
 	volumeSnapshotApplications,
 	({ one }) => ({
+		targetWorktreeResource: one(narratorWorktreeResources, {
+			fields: [volumeSnapshotApplications.targetWorktreeResourceId],
+			references: [narratorWorktreeResources.id],
+		}),
 		snapshot: one(volumeSnapshots, {
 			fields: [volumeSnapshotApplications.snapshotId],
 			references: [volumeSnapshots.id],

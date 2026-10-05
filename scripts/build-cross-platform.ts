@@ -306,7 +306,7 @@ console.log(
 		}
 		console.error(
 			"   Fix these, or declare the component in licenses/extra/entries.json. " +
-				"See the license section in CLAUDE.md.",
+				"See docs/LICENSES.md.",
 		);
 		process.exit(1);
 	}
@@ -377,8 +377,14 @@ export const buildPlatform = ${JSON.stringify(platform.platformId)};
 			"./server/services/editor-document-worker.ts",
 			"./server/lib/browser/memory-snapshot-worker.ts",
 			"./server/lib/browser/memory-profile-worker.ts",
+			// Share HTML cleaning runs off-thread, including in compiled distributions.
+			"./server/lib/share-preview-worker.ts",
 			// Revert manifest validation also runs in a Worker; Worker URLs are not bundled imports.
 			"./server/services/revert-transaction-manifest-worker.ts",
+			// Private archive scans/copies/imports must remain off-thread in released binaries.
+			"./server/services/narrator-backup/worker.ts",
+			"./server/services/project-archive/legacy-sync-worker.ts",
+			"./server/services/project-archive/legacy-import-worker.ts",
 			"--compile",
 			"--minify",
 			"--target",

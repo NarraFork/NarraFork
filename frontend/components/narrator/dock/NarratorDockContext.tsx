@@ -34,10 +34,7 @@ import {
 	type PluginUiHostSurface,
 	PluginUiSurfaceProvider,
 } from "../../plugins/PluginUiSurfaceContext";
-import type {
-	FileModPanelExternalProps,
-	NarratorDetailsPanelExternalProps,
-} from "../narrator-panel-types";
+import type { NarratorDetailsPanelExternalProps } from "../narrator-panel-types";
 import { focusMessagePanel } from "../panels/focus-message-panel";
 import {
 	type FileOpenOptions,
@@ -129,10 +126,6 @@ export interface NarratorDockContextValue {
 
 	/** Live dockview api ref (bound by the surface once ready). */
 	apiRef: RefObject<DockviewApi | null>;
-
-	/** Published by chat, read by the file-modifications panel. */
-	fileModProps: FileModPanelExternalProps | null;
-	setFileModProps: (props: FileModPanelExternalProps | null) => void;
 
 	/** Published by chat, read by the details panel. */
 	detailsProps: NarratorDetailsPanelExternalProps | null;
@@ -265,7 +258,6 @@ export function NarratorDockProvider({
 	children: React.ReactNode;
 }) {
 	const apiRef = useRef<DockviewApi | null>(null);
-	const [fileModProps, setFileModProps] = useState<FileModPanelExternalProps | null>(null);
 	const [fileReferenceSelection, setFileReferenceSelection] =
 		useState<FileReferenceEditorSelection | null>(null);
 	const [detailsProps, setDetailsProps] = useState<NarratorDetailsPanelExternalProps | null>(null);
@@ -712,8 +704,6 @@ export function NarratorDockProvider({
 			onBack,
 			onMinimize,
 			apiRef,
-			fileModProps,
-			setFileModProps,
 			fileReferenceSelection,
 			setFileReferenceSelection,
 			registerAddFileReference,
@@ -741,7 +731,6 @@ export function NarratorDockProvider({
 		highlightMessageId,
 		onBack,
 		onMinimize,
-		fileModProps,
 		fileReferenceSelection,
 		registerAddFileReference,
 		addFileReference,

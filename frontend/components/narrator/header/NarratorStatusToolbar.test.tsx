@@ -637,6 +637,10 @@ describe("BackgroundTasksStatusButton", () => {
 		// Preserve the count when the neighboring elapsed label needs to shrink.
 		expect(button?.style.flexShrink).toBe("0");
 		expect(button?.style.whiteSpace).toBe("nowrap");
+		// UnstyledButton's md font-size strut must not outgrow the xs label: the
+		// button is an inline-flex box so its height equals the wrapped Text.
+		expect(button?.style.display).toBe("inline-flex");
+		expect(button?.style.alignItems).toBe("center");
 
 		expect((await renderBackgroundTasksStatus(1))?.textContent).toBe("· 后台任务 1");
 		expect(await renderBackgroundTasksStatus(0)).toBeNull();

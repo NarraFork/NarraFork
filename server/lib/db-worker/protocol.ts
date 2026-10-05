@@ -22,7 +22,26 @@ export const DB_WORKER_READY_TIMEOUT_MS = 10_000;
 export const DB_WORKER_PROBE_READY_TIMEOUT_MS = 1_500;
 
 /** Task names the worker can execute. Read-only by contract. */
-export type DbReadTaskName = "storageScanContext" | "storageScanTables" | "usageHistoryQuery";
+export type DbReadTaskName =
+	| "storageScanContext"
+	| "storageScanTables"
+	| "usageHistoryQuery"
+	| "searchQuery";
+
+/** Shared search budgets; importing these must never bootstrap a database. */
+export const SEARCH_QUERY_MAX_SQL_BYTES = 64 * 1024;
+export const SEARCH_QUERY_MAX_PARAMS_BYTES = 128 * 1024;
+export const SEARCH_QUERY_MAX_PARAMS = 256;
+export const SEARCH_QUERY_MAX_ROWS = 10_000;
+export const SEARCH_QUERY_MAX_BYTES = 4 * 1024 * 1024;
+
+/** Internal server-built SELECT (optionally WITH); never caller-provided SQL. */
+export interface SearchQueryParams {
+	kind: "searchQuery";
+	sql: string;
+	params: Array<string | number | null>;
+	maxRows: number;
+}
 
 /** Internal, server-built SELECT only. Never accepts SQL from an HTTP caller. */
 export interface UsageHistoryQueryParams {
@@ -86,7 +105,8 @@ export interface StorageScanTablesResult {
 export type DbReadTaskParams =
 	| StorageScanContextParams
 	| StorageScanTablesParams
-	| UsageHistoryQueryParams;
+	| UsageHistoryQueryParams
+	| SearchQueryParams;
 
 export interface DbWorkerRequest {
 	type: "task";

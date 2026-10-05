@@ -8,7 +8,7 @@
  * workspace). This module is the single source of truth both sides now share.
  *
  * Cluster model: a "cluster" is one dockview group = a primary narrator panel
- * (`chat`) plus its secondary panels (terminal / details / filemod / spec / git /
+ * (`chat`) plus its secondary panels (terminal / details / spec / git /
  * browser / subagent) as sibling tabs. The workspace additionally hosts standalone
  * `terminal` / `webview` panels that are not bound to a narrator.
  *
@@ -27,7 +27,7 @@ import { isToolEditReference, type ToolEditReference } from "../tool-call/tool-e
  *
  * - `chat`     — the primary narrator panel (a cluster's protagonist).
  * - `terminal` — a terminal; narrator-bound in the dock, config-bound in a workspace.
- * - `details` / `filemod` / `spec` / `git` / `browser` / `tasks` / `search` — singleton narrator resources.
+ * - `details` / `spec` / `git` / `browser` / `tasks` / `search` — singleton narrator resources.
  * - `userchat` — the human discussion room beside this narrator (people talking to
  *   each other; its content never enters the narrator's context unless someone
  *   forwards it explicitly).
@@ -43,7 +43,6 @@ export type PanelKind =
 	| "chat"
 	| "terminal"
 	| "details"
-	| "filemod"
 	| "spec"
 	| "git"
 	| "browser"
@@ -278,7 +277,6 @@ export const PANEL_COMPONENT: Record<PanelKind, string> = {
 	chat: "chat",
 	terminal: "terminal",
 	details: "details",
-	filemod: "filemod",
 	spec: "spec",
 	git: "git",
 	browser: "browser",
@@ -306,7 +304,6 @@ export const PANEL_DEFAULT_TITLE: Record<PanelKind, string> = {
 	chat: "Chat",
 	terminal: "Terminal",
 	details: "Details",
-	filemod: "Files",
 	spec: "Spec",
 	git: "Git",
 	browser: "Browser",

@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { watch } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { logger } from "../lib/logger";
+import type { RevertJournalOperation } from "./revert-mutation-journal";
 import type { RevertSelectionResult } from "./revert-selection-service";
 import type { TransactionManifestRequest } from "./revert-transaction-manifest-worker";
 import {
@@ -76,6 +78,138 @@ describe("revert manifest worker resolution", () => {
 			expect(entry).toBeInstanceOf(URL);
 			expect(String(entry)).toBe(specifier);
 		}
+	});
+});
+
+describe("snapshot consent bound to original selector", () => {
+	function entrypoint(recoveryMode: unknown = "snapshot", uiAction = "revert_files") {
+		const owner = { subjectKey: "human:alice", narratorId: "narrator", projectId: "project" };
+		const originalRequest = {
+			principal: { userId: "alice", isAdmin: false },
+			narratorId: "narrator",
+			expectedMessageVersion: 7,
+			idempotencyKey: "request-key",
+			kind: "revert",
+			revertScope: "narrator",
+			selector: { kind: "all" },
+			uiAction,
+			...(recoveryMode === undefined ? {} : { recoveryMode }),
+		};
+		const hash = (value: Uint8Array | string) => createHash("sha256").update(value).digest("hex");
+		const bytes = Buffer.from(
+			JSON.stringify({
+				version: 1,
+				owner,
+				request: originalRequest,
+				fixedSelector: { kind: "all" },
+				boundary: null,
+			}),
+		);
+		return {
+			action: "entrypoint" as const,
+			raw: {
+				ref: { algorithm: "sha256" as const, digest: hash(bytes), sizeBytes: bytes.byteLength },
+				bytes,
+			},
+			operation: {
+				requestedBySubjectKey: owner.subjectKey,
+				narratorId: owner.narratorId,
+				projectId: owner.projectId,
+				kind: "revert",
+				scope: "narrator",
+				expectedMessageVersion: 7,
+				idempotencyKey: "request-key",
+				selectorBlobDigest: hash(bytes),
+				requestDigest: hash(JSON.stringify({ version: 1, owner, request: originalRequest })),
+			} as RevertJournalOperation,
+			userId: "alice",
+			expectedAction: "revert_files" as const,
+		};
+	}
+
+	test("snapshot entrypoint refuses absent/false confirmation, accepts literal true", async () => {
+		const input = entrypoint();
+		await expect(runRevertManifestWorker(input, signal())).rejects.toMatchObject({
+			code: "REVERT_TRANSACTION_SNAPSHOT_CONFIRMATION_REQUIRED",
+		});
+		await expect(
+			runRevertManifestWorker(
+				{ ...input, acceptSnapshotRestore: false } as unknown as TransactionManifestRequest,
+				signal(),
+			),
+		).rejects.toMatchObject({ code: "REVERT_TRANSACTION_SNAPSHOT_CONFIRMATION_REQUIRED" });
+		await expect(
+			runRevertManifestWorker({ ...input, acceptSnapshotRestore: true }, signal()),
+		).resolves.toBe(true);
+		const { expectedAction: _action, ...internal } = input;
+		await expect(runRevertManifestWorker(internal, signal())).rejects.toMatchObject({
+			code: "REVERT_TRANSACTION_SNAPSHOT_CONFIRMATION_REQUIRED",
+		});
+	});
+
+	test("entrypoint validates bound mode and UI action even when request digest is valid", async () => {
+		await expect(
+			runRevertManifestWorker(
+				{ ...entrypoint("automatic"), acceptSnapshotRestore: true },
+				signal(),
+			),
+		).rejects.toMatchObject({ code: "REVERT_TRANSACTION_RECOVERY_MODE" });
+		await expect(
+			runRevertManifestWorker(
+				{
+					...entrypoint("snapshot", "rollback_to_block"),
+					expectedAction: "rollback_to_block",
+					acceptSnapshotRestore: true,
+				},
+				signal(),
+			),
+		).rejects.toMatchObject({ code: "REVERT_TRANSACTION_ACTION_MISMATCH" });
+	});
+
+	test("unknown UI action cannot inherit delete_tool_block's selector semantics", async () => {
+		const { expectedAction: _action, ...input } = entrypoint("snapshot", "unknown_action");
+		const selector = JSON.parse(Buffer.from(input.raw.bytes).toString());
+		selector.request.kind = "history_delete";
+		selector.request.selector = { kind: "tool_calls", toolCallIds: ["tool"] };
+		const bytes = Buffer.from(JSON.stringify(selector));
+		const hash = (value: Uint8Array | string) => createHash("sha256").update(value).digest("hex");
+		const digest = hash(bytes);
+		await expect(
+			runRevertManifestWorker(
+				{
+					...input,
+					raw: { bytes, ref: { algorithm: "sha256", digest, sizeBytes: bytes.byteLength } },
+					operation: {
+						...input.operation,
+						kind: "history_delete",
+						selectorBlobDigest: digest,
+						requestDigest: hash(
+							JSON.stringify({ version: 1, owner: selector.owner, request: selector.request }),
+						),
+					},
+					acceptSnapshotRestore: true,
+				},
+				signal(),
+			),
+		).rejects.toMatchObject({ code: "REVERT_TRANSACTION_ACTION_MISMATCH" });
+	});
+
+	test("altering only the frozen selector mode cannot bypass the original request digest", async () => {
+		const input = entrypoint();
+		const selector = JSON.parse(Buffer.from(input.raw.bytes).toString());
+		delete selector.request.recoveryMode;
+		const bytes = Buffer.from(JSON.stringify(selector));
+		const digest = createHash("sha256").update(bytes).digest("hex");
+		await expect(
+			runRevertManifestWorker(
+				{
+					...input,
+					raw: { bytes, ref: { algorithm: "sha256", digest, sizeBytes: bytes.byteLength } },
+					operation: { ...input.operation, selectorBlobDigest: digest },
+				},
+				signal(),
+			),
+		).rejects.toMatchObject({ code: "REVERT_TRANSACTION_ORIGINAL_REQUEST_DIGEST" });
 	});
 });
 

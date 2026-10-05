@@ -79,6 +79,11 @@
  * queue's earlier scratch-schema tests remain supplementary, not migration proof.
  */
 
+import {
+	type BufferQueueMode,
+	bufferedModePatch,
+	ordinaryBufferReorder,
+} from "@shared/buffer-queue-mode";
 import { and, asc, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { WriteConflictError } from "../../db/backend/write-port";
@@ -839,6 +844,11 @@ export function createPostgresRuntimeQueue(
 		input: MailboxInput & { kind: "user_input" },
 		ordering: PgBufferedOrdering,
 	): Promise<PgEnqueueResult> {
+		await tx
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(eq(narrators.id, input.narratorId))
+			.for("update");
 		const rows = await tx
 			.select({ id: mailbox.id, seq: mailbox.seq, priority: mailbox.priority })
 			.from(mailbox)
@@ -1834,6 +1844,31 @@ export function createPostgresRuntimeQueue(
 				.limit(1);
 			return rows.length > 0;
 		},
+		/** Named, indexed four-column receipt read; never load payloads while polling. */
+		async readUserBufferedDeliveryReceipt(
+			narratorId: string,
+			id: string,
+		): Promise<import("./runtime-queue-port").RuntimeBufferedDeliveryReceipt | undefined> {
+			pointer(narratorId);
+			pointer(id);
+			const rows = await db
+				.select({
+					id: mailbox.id,
+					state: mailbox.state,
+					recipientMessageId: mailbox.recipientMessageId,
+					lastError: mailbox.lastError,
+				})
+				.from(mailbox)
+				.where(
+					and(
+						eq(mailbox.id, id),
+						eq(mailbox.narratorId, narratorId),
+						eq(mailbox.kind, "user_input"),
+					),
+				)
+				.limit(1);
+			return rows[0];
+		},
 		/** Wake routing/archived probe on the recipient narrator row. */
 		async readRecipientRoute(
 			narratorId: string,
@@ -1850,6 +1885,52 @@ export function createPostgresRuntimeQueue(
 		 * the FULL text size even when the body lives behind `payloadRefJson` (the
 		 * stored text is "" then) — the caller computes it from the pre-split text.
 		 */
+		updateUserBufferedMode(
+			narratorId: string,
+			id: string,
+			mode: BufferQueueMode,
+		): Promise<boolean> {
+			pointer(narratorId);
+			pointer(id);
+			return runSection("mailbox.updateUserBufferedMode", async (tx) => {
+				// Serialize admission, mode changes and reorders for this recipient.
+				await tx
+					.select({ id: narrators.id })
+					.from(narrators)
+					.where(eq(narrators.id, narratorId))
+					.for("update");
+				const rows = await tx
+					.select()
+					.from(mailbox)
+					.where(
+						and(
+							eq(mailbox.narratorId, narratorId),
+							eq(mailbox.kind, "user_input"),
+							inArray(mailbox.state, ["queued", "failed"]),
+						),
+					)
+					.limit(L.userPending)
+					.for("update");
+				const row = rows.find((row) => row.id === id);
+				if (!row) return false;
+				const updated = await tx
+					.update(mailbox)
+					.set({
+						...bufferedModePatch(row, rows, mode),
+						contentRevision: row.contentRevision + 1,
+						updatedAt: now(),
+					})
+					.where(
+						and(
+							eq(mailbox.id, id),
+							inArray(mailbox.state, ["queued", "failed"]),
+							eq(mailbox.contentRevision, row.contentRevision),
+						),
+					)
+					.returning({ id: mailbox.id });
+				return updated.length === 1;
+			});
+		},
 		updateUserBuffered(
 			id: string,
 			narratorId: string,
@@ -1900,16 +1981,21 @@ export function createPostgresRuntimeQueue(
 			});
 		},
 		/**
-		 * Full-set reorder of the pending user queue: `ids` must be exactly the
-		 * current pending set, then seq=index and priority=false are written in
-		 * order. Anything else returns false with no writes (the section rolls back).
+		 * Reorder only ordinary pending inputs. Complete legacy lists are accepted
+		 * if the immutable guidance prefix is unchanged; ordinary-only lists are
+		 * accepted too. Guidance metadata, priority and FIFO order remain untouched.
 		 */
 		reorderUserPending(narratorId: string, ids: readonly string[]): Promise<boolean> {
 			pointer(narratorId);
 			for (const id of ids) pointer(id);
 			return runSection("mailbox.reorderUserPending", async (tx) => {
+				await tx
+					.select({ id: narrators.id })
+					.from(narrators)
+					.where(eq(narrators.id, narratorId))
+					.for("update");
 				const rows = await tx
-					.select({ id: mailbox.id })
+					.select()
 					.from(mailbox)
 					.where(
 						and(
@@ -1918,18 +2004,12 @@ export function createPostgresRuntimeQueue(
 							inArray(mailbox.state, ["queued", "failed"]),
 						),
 					)
-					.limit(L.userPending);
-				if (
-					!rows.length ||
-					ids.length !== rows.length ||
-					new Set(ids).size !== ids.length ||
-					rows.some((row) => !ids.includes(row.id))
-				)
-					return false;
-				// Explicit user ordering supersedes front-insertion priority. Clear the
-				// badge too, so display, peek and claim agree without changing other kinds.
-				for (const [seq, id] of ids.entries())
-					await tx.update(mailbox).set({ seq, priority: false }).where(eq(mailbox.id, id));
+					.limit(L.userPending)
+					.for("update");
+				const ordinary = ordinaryBufferReorder(rows, ids);
+				if (!rows.length || !ordinary) return false;
+				for (const [seq, id] of ordinary.entries())
+					await tx.update(mailbox).set({ seq }).where(eq(mailbox.id, id));
 				return true;
 			});
 		},

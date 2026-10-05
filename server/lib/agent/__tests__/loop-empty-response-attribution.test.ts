@@ -1,10 +1,13 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
+import { z } from "zod/v4";
 import { settings } from "../../settings";
+import { AnthropicProvider } from "../anthropic-provider";
 import {
 	clearCodexResponsesWebSocketSessions,
 	streamCodexResponsesWebSocket,
 } from "../codex-websocket";
 import type { ProviderAdapter } from "../provider";
+import { toolRegistry } from "../tool-registry";
 import { type AgentConfig, type AgentEvent, ApiError } from "../types";
 
 /**
@@ -28,11 +31,27 @@ let providerScenario:
 	| "stop_reason_without_content_forever"
 	| "truncated_tool_input_forever"
 	| "reasoning_then_truncated_tool_input"
+	| "broken_anthropic_single"
+	| "broken_anthropic_mixed"
 	| "ws_error_response" = "error_then_usage_only";
 let providerAttempts = 0;
 let wsBaseUrl = "";
 /** `content` (user-side turn text) seen by each provider.chat() call, in order. */
 let sentContents: string[] = [];
+let sentToolResults: unknown[][] = [];
+let sentHistories: unknown[][] = [];
+const RECOVERY_TOOL = "__BrokenInputRecoveryTest";
+const anthropicFormatter = new AnthropicProvider({
+	id: "recovery-test",
+	prefix: "recovery-test",
+	baseUrl: "https://example.invalid/v1",
+	apiKey: "test",
+} as never);
+function usesAnthropicRecovery(): boolean {
+	return (
+		providerScenario === "broken_anthropic_single" || providerScenario === "broken_anthropic_mixed"
+	);
+}
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
@@ -42,6 +61,34 @@ const testProvider: ProviderAdapter = {
 		providerAttempts++;
 		sentContents.push(params.content ?? "");
 		params.onRequestStart?.();
+
+		if (usesAnthropicRecovery()) {
+			sentToolResults.push(structuredClone(params.toolResults ?? []));
+			sentHistories.push(structuredClone(params.history));
+			if (providerAttempts === 1) {
+				yield {
+					toolUseChunk: {
+						toolUseId: "broken-call",
+						name: RECOVERY_TOOL,
+						input: '{"content":}',
+						stop: true,
+					},
+				};
+				if (providerScenario === "broken_anthropic_mixed") {
+					yield {
+						toolUseChunk: {
+							toolUseId: "valid-call",
+							name: RECOVERY_TOOL,
+							input: '{"content":"ok"}',
+							stop: true,
+						},
+					};
+				}
+			} else {
+				yield { text: "recovered" };
+			}
+			return;
+		}
 
 		if (providerScenario === "ws_error_response") {
 			yield* streamCodexResponsesWebSocket({
@@ -121,9 +168,16 @@ const testProvider: ProviderAdapter = {
 			return;
 		}
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
+	formatToolResult: (toolUseId, output, isError) =>
+		usesAnthropicRecovery()
+			? anthropicFormatter.formatToolResult(toolUseId, output, isError)
+			: { toolUseId, output, isError },
+	pushUserTurn: (...args) => {
+		if (usesAnthropicRecovery()) anthropicFormatter.pushUserTurn(...args);
+	},
+	pushAssistantTurn: (...args) => {
+		if (usesAnthropicRecovery()) anthropicFormatter.pushAssistantTurn(...args);
+	},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -173,6 +227,49 @@ async function runLoop(overrides: Partial<AgentConfig> = {}): Promise<AgentEvent
 	}
 	return events;
 }
+
+describe("Anthropic broken tool recovery", () => {
+	test.each([
+		"broken_anthropic_single",
+		"broken_anthropic_mixed",
+	] as const)("%s removes both broken call and native tool_use_id result", async (scenario) => {
+		providerScenario = scenario;
+		providerAttempts = 0;
+		sentContents = [];
+		sentToolResults = [];
+		sentHistories = [];
+		const execute = mock(async () => ({ output: "valid result" }));
+		toolRegistry.register({
+			name: RECOVERY_TOOL,
+			description: "Recovery fixture",
+			parameters: z.object({ content: z.string() }),
+			execute,
+		});
+		try {
+			const events = await runLoop({ maxTurns: 3 });
+			expect(providerAttempts).toBe(2);
+			expect(
+				events.some((event) => event.type === "assistant_message" && event.text === "recovered"),
+			).toBe(true);
+			expect(sentToolResults[1]).toEqual(
+				scenario === "broken_anthropic_mixed"
+					? [{ tool_use_id: "valid-call", content: "valid result", is_error: undefined }]
+					: [],
+			);
+			expect(JSON.stringify(sentHistories[1])).not.toContain("broken-call");
+			if (scenario === "broken_anthropic_mixed") {
+				expect(JSON.stringify(sentHistories[1])).toContain("valid-call");
+				expect(execute).toHaveBeenCalledTimes(1);
+			} else {
+				expect(execute).not.toHaveBeenCalled();
+			}
+			expect(sentContents[1]).toContain("invalid or missing input");
+			expect(sentContents[1]).not.toContain("output was cut off by the token limit");
+		} finally {
+			toolRegistry.unregister(RECOVERY_TOOL);
+		}
+	});
+});
 
 describe("空响应归因链", () => {
 	test("上游 503 后仅收到 usage 事件时，仍报告 503 而非空响应", async () => {

@@ -2,14 +2,20 @@ import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { FILE_CHANGE_LIMITS, type FileChangeRevertSelector } from "@shared/file-change-protocol";
 import { eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { sqlite as isolatedTemplate } from "../db";
 import * as schema from "../db/schema";
+import { measureMessageCharacters } from "../lib/context-characters";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-identity";
 import type { NarratorAclRow, NarratorPrincipal } from "./narrator-acl";
-import { type PreparedRevertHistory, RevertHistoryCommitService } from "./revert-history-commit";
+import {
+	type PreparedRevertHistory,
+	REWRITE_WORKER,
+	RevertHistoryCommitService,
+} from "./revert-history-commit";
 import { RevertSelectionService } from "./revert-selection-service";
 
 // Actual schema/FKs/generated columns, with a real independent root and actual collector.
@@ -383,6 +389,79 @@ function question(toolCallId: string, id = `question-${serial++}`) {
 	return id;
 }
 
+for (const role of ["assistant", "user", "sys", "system", "disp", "other"]) {
+	test(`rewrite worker context characters match the shared helper for ${role}`, async () => {
+		const retained: Array<Record<string, unknown>> = [
+			{ type: "text", text: "中文😀" },
+			{ type: "text", text: "adjacent" },
+			{ type: "thinking", thinking: "think" },
+			{ type: "tool_use", id: "kept-tool", name: "Read", input: { text: "not counted" } },
+			{ type: "tool_result", content: "not counted either" },
+			{ type: "image", source: { data: "binary not counted" } },
+			{ type: "redacted_thinking", data: "hidden" },
+			{ type: "info", text: "display only" },
+			{ type: "error", text: "display only" },
+			{ type: "compact", status: "compacted", summary: "narrator row already counts this" },
+			{ type: "segment_compact", status: "compacted", summary: "摘要😀" },
+			{ type: "segment_compact", status: "compacting", summary: "not final" },
+			{ type: "segment_compact", status: "failed", summary: "not final" },
+			{ type: "file_reference", snapshotText: "inline snapshot" },
+			{ type: "text_file", chars: 7 },
+			{ type: "text_file", contentChars: 9 },
+			{ type: "text_file", text: "actual text", chars: 999, contentChars: 999 },
+			{ type: "text_file", content: "content priority", chars: 999 },
+			{ type: "text_file", chars: -1 },
+			{ type: "text_file", chars: 0.5 },
+			{ type: "text_file", filename: "legacy.txt", size: 9000 },
+			{ type: "attachment", source: { text: "source text" } },
+			{ type: "document", content: "document text" },
+			{ type: "text", text: "after attachment" },
+			{ type: "tool_use", id: "second-tool", name: "Bash", input: { command: "not counted" } },
+			{ type: "system_injection", modelText: "native projection", text: "display projection" },
+			{ type: "reasoning", text: "reasoning text" },
+		];
+		const content = [...retained, { type: "text", text: "removed" }];
+		const body = JSON.stringify(content);
+		const contentDigest = hash(body);
+		const fixed = content.map((block, i) => {
+			const digest = hash(JSON.stringify(block));
+			return {
+				key: hash(JSON.stringify(["char-message", contentDigest, i, digest])),
+				digest,
+				type: block.type,
+				toolUseId: block.type === "tool_use" ? block.id : null,
+				action: i === retained.length ? "remove" : "retain",
+			};
+		});
+		const worker = new Worker(REWRITE_WORKER, { eval: true });
+		try {
+			const response = new Promise<{ contextCharsJson: string; error?: string }>(
+				(resolve, reject) => {
+					worker.once("message", resolve);
+					worker.once("error", reject);
+				},
+			);
+			worker.postMessage({
+				message: {
+					id: "char-message",
+					contentDigest,
+					blockCount: content.length,
+					removedBlockCount: 1,
+				},
+				blocks: fixed,
+				body,
+				role,
+				limit: FILE_CHANGE_LIMITS.historyCowBytes,
+			});
+			const result = await response;
+			expect(result.error).toBeUndefined();
+			expect(JSON.parse(result.contextCharsJson)).toEqual(measureMessageCharacters(role, retained));
+		} finally {
+			await worker.terminate();
+		}
+	});
+}
+
 describe("fixed selector history application", () => {
 	for (const kind of ["all", "from_seq", "messages"] as const)
 		test(`${kind} removes exactly the fixed refs/messages`, async () => {
@@ -415,6 +494,19 @@ describe("fixed selector history application", () => {
 			await prepare({ kind: "after_block", messageId: target.messageId, keepThroughBlockIndex: 1 }),
 		);
 		expect(JSON.parse(body(target.messageId))).toHaveLength(2);
+		expect(
+			query<{ context_chars_json: string }>(
+				"SELECT context_chars_json FROM narrator_messages WHERE id=?",
+				target.messageId,
+			)[0].context_chars_json,
+		).toBe(
+			JSON.stringify({
+				segments: [
+					{ category: "assistant", chars: 4 },
+					{ category: "toolCall", chars: 0, toolUseId: "a" },
+				],
+			}),
+		);
 		expect(body(later)).toBeUndefined();
 		expect(query<{ id: string }>("SELECT id FROM narrator_tool_calls").map((r) => r.id)).toEqual([
 			target.tools[0],
@@ -786,33 +878,128 @@ describe("manifest associations and real FK behavior", () => {
 		sqlite
 			.query("UPDATE narrator_message_refs SET segment_compact_id=? WHERE message_id=?")
 			.run(compact, other);
-		await expect(prepare({ kind: "messages", messageIds: [compact] })).rejects.toMatchObject({
-			code: "REVERT_HISTORY_UNAUTHORIZED_ASSOCIATION",
-		});
+		const error = await prepare({ kind: "messages", messageIds: [compact] }).catch(
+			(error: unknown) => error,
+		);
+		expect(error).toMatchObject({ code: "REVERT_HISTORY_UNAUTHORIZED_ASSOCIATION" });
 		expect(count("narrator_messages")).toBe(2);
 	});
-	test("new inbound FK/cascade through a leaf is explicitly unsupported, never implicit SQL expansion", async () => {
+	test("new inbound FK cascade through a leaf is executed by SQLite", async () => {
 		const target = withTools();
 		const q = question(target.tools[0]);
 		sqlite.exec(
 			"CREATE TABLE unplanned_leaf(id TEXT PRIMARY KEY, question_id TEXT REFERENCES narrator_questions(id) ON DELETE CASCADE)",
 		);
 		sqlite.query("INSERT INTO unplanned_leaf VALUES('leaf',?)").run(q);
-		await expect(prepare()).rejects.toMatchObject({
-			code: "REVERT_HISTORY_UNSUPPORTED_ASSOCIATION",
-		});
-		expect(count("unplanned_leaf")).toBe(1);
-		expect(count("narrator_tool_calls")).toBe(2);
+		apply(await prepare());
+		for (const table of [
+			"unplanned_leaf",
+			"narrator_questions",
+			"narrator_tool_calls",
+			"narrator_message_refs",
+			"narrator_messages",
+		])
+			expect(count(table)).toBe(0);
+		expect(version()).toBe(8);
 	});
-	test("unreviewed triggers cannot create unmanifested cascade rows during apply", async () => {
-		withTools();
-		sqlite.exec(
-			"CREATE TRIGGER hidden_mutation AFTER DELETE ON narrator_message_refs BEGIN UPDATE narrators SET title='unplanned'; END",
-		);
-		await expect(prepare()).rejects.toMatchObject({
-			code: "REVERT_HISTORY_UNSUPPORTED_ASSOCIATION",
+	for (const action of ["CASCADE", "SET NULL", "RESTRICT", "NO ACTION"])
+		test(`an empty unfamiliar ${action} FK table does not block unrelated history`, async () => {
+			withTools();
+			sqlite.exec(
+				`CREATE TABLE unfamiliar_fk(id TEXT PRIMARY KEY, message_id TEXT REFERENCES narrator_messages(id) ON DELETE ${action})`,
+			);
+			apply(await prepare());
+			expect(count("unfamiliar_fk")).toBe(0);
+			expect(count("narrator_messages")).toBe(0);
+			expect(count("narrator_message_refs")).toBe(0);
+			expect(count("narrator_tool_calls")).toBe(0);
+			expect(version()).toBe(8);
 		});
-		expect(count("narrator_message_refs")).toBe(1);
+	for (const action of ["RESTRICT", "NO ACTION"])
+		test(`a real ${action} association fails SQL and restores every earlier mutation`, async () => {
+			const first = withTools(1);
+			const blocked = withTools(2, ["c", "d"]);
+			const firstQuestion = question(first.tools[0]);
+			const blockedQuestion = question(blocked.tools[0]);
+			sqlite.exec(
+				`CREATE TABLE unfamiliar_fk(id TEXT PRIMARY KEY, message_id TEXT REFERENCES narrator_messages(id) ON DELETE ${action}); CREATE TABLE test_revert_journal(status TEXT NOT NULL); INSERT INTO test_revert_journal VALUES('files_verified')`,
+			);
+			sqlite.query("INSERT INTO unfamiliar_fk VALUES('blocked',?)").run(blocked.messageId);
+			const beforeBodies = [body(first.messageId), body(blocked.messageId)];
+			const token = await prepare();
+			const statements: string[] = [];
+			const realQuery = sqlite.query.bind(sqlite);
+			const trace = spyOn(sqlite, "query").mockImplementation(((text: string) => {
+				statements.push(text);
+				return realQuery(text);
+			}) as typeof sqlite.query);
+			try {
+				expect(() =>
+					db.transaction((tx) => {
+						service.applyToTransaction(tx, token);
+						tx.run(sql`UPDATE test_revert_journal SET status='committed'`);
+					}),
+				).toThrow("FOREIGN KEY constraint failed");
+			} finally {
+				trace.mockRestore();
+			}
+			expect(
+				statements.filter((text) => text.startsWith('DELETE FROM "narrator_messages"')),
+			).toHaveLength(2);
+			expect([body(first.messageId), body(blocked.messageId)]).toEqual(beforeBodies);
+			expect(count("narrator_messages")).toBe(2);
+			expect(count("narrator_message_refs")).toBe(2);
+			expect(count("narrator_tool_calls")).toBe(4);
+			expect(query("SELECT id FROM narrator_questions ORDER BY id")).toEqual([
+				{ id: firstQuestion },
+				{ id: blockedQuestion },
+			]);
+			expect(query("SELECT * FROM unfamiliar_fk")).toEqual([
+				{ id: "blocked", message_id: blocked.messageId },
+			]);
+			expect(query("SELECT status FROM test_revert_journal")).toEqual([
+				{ status: "files_verified" },
+			]);
+			expect(version()).toBe(7);
+			expect(() => apply(token)).toThrow("Unknown");
+		});
+	test("application-owned triggers execute normally without disabling foreign keys", async () => {
+		const target = withTools();
+		sqlite.exec(
+			"CREATE TABLE trigger_audit(message_id TEXT NOT NULL); CREATE TRIGGER history_audit AFTER DELETE ON narrator_message_refs BEGIN INSERT INTO trigger_audit VALUES(OLD.message_id); END",
+		);
+		apply(await prepare());
+		expect(query("SELECT * FROM trigger_audit")).toEqual([{ message_id: target.messageId }]);
+		expect(query("PRAGMA foreign_keys")).toEqual([{ foreign_keys: 1 }]);
+		expect(count("narrator_messages")).toBe(0);
+		expect(count("narrator_message_refs")).toBe(0);
+		expect(count("narrator_tool_calls")).toBe(0);
+		expect(version()).toBe(8);
+	});
+	test("an application trigger SQL failure rolls back prior deletes and trigger writes", async () => {
+		const first = withTools(1);
+		const blocked = withTools(2, ["c", "d"]);
+		const q = question(first.tools[0]);
+		sqlite.exec(
+			"CREATE TABLE trigger_audit(message_id TEXT NOT NULL); CREATE TRIGGER history_audit AFTER DELETE ON narrator_message_refs BEGIN INSERT INTO trigger_audit VALUES(OLD.message_id); END; CREATE TRIGGER history_failure BEFORE DELETE ON narrator_message_refs WHEN OLD.seq=2 BEGIN SELECT RAISE(ABORT, 'history trigger failure'); END; CREATE TABLE test_revert_journal(status TEXT NOT NULL); INSERT INTO test_revert_journal VALUES('files_verified')",
+		);
+		const beforeBodies = [body(first.messageId), body(blocked.messageId)];
+		const token = await prepare();
+		expect(() =>
+			db.transaction((tx) => {
+				service.applyToTransaction(tx, token);
+				tx.run(sql`UPDATE test_revert_journal SET status='committed'`);
+			}),
+		).toThrow("history trigger failure");
+		expect(count("trigger_audit")).toBe(0);
+		expect([body(first.messageId), body(blocked.messageId)]).toEqual(beforeBodies);
+		expect(count("narrator_messages")).toBe(2);
+		expect(count("narrator_message_refs")).toBe(2);
+		expect(count("narrator_tool_calls")).toBe(4);
+		expect(query("SELECT id FROM narrator_questions")).toEqual([{ id: q }]);
+		expect(query("SELECT status FROM test_revert_journal")).toEqual([{ status: "files_verified" }]);
+		expect(version()).toBe(7);
+		expect(() => apply(token)).toThrow("Unknown");
 	});
 	test("reviewed live FTS triggers and generated columns remain enabled during rewrite", async () => {
 		sqlite.exec(
@@ -870,6 +1057,10 @@ describe("manifest associations and real FK behavior", () => {
 	});
 	test("ambiguous provider-ID child history is refused rather than deleted", async () => {
 		const target = withTools(1, ["same"]);
+		// Delegation, not a read-only tool, is the authority that requires child binding.
+		sqlite
+			.query("UPDATE narrator_tool_calls SET tool_name='Agent' WHERE id=?")
+			.run(target.tools[0]);
 		const other = message(1, [], "other");
 		sqlite.query("UPDATE narrator_messages SET parent_tool_use_id='same' WHERE id=?").run(other);
 		await expect(
@@ -1164,7 +1355,9 @@ describe("bounded preparation and synchronous atomic commit", () => {
 			for (let i = 0; i < FILE_CHANGE_LIMITS.historyToolRelatedChanges + 1; i++)
 				insertRequest.run(`request-${i}`, target.messageId, time, "fixture", "fixture");
 		});
-		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_SELECTION_BUDGET_EXCEEDED" });
+		// Await collection outside Bun's rejects matcher so paginated setImmediate yields run.
+		const error = await prepare().catch((error: unknown) => error);
+		expect(error).toMatchObject({ code: "REVERT_SELECTION_BUDGET_EXCEEDED" });
 		expect(count("narrator_messages")).toBe(1);
 	}, 20_000);
 	test("5000 message/ref changes reject before any mutation", async () => {
@@ -1180,7 +1373,9 @@ describe("bounded preparation and synchronous atomic commit", () => {
 				insertRef.run(`r-${i}`, `m-${i}`, i);
 			}
 		});
-		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_SELECTION_BUDGET_EXCEEDED" });
+		// Await collection outside Bun's rejects matcher so paginated setImmediate yields run.
+		const error = await prepare().catch((error: unknown) => error);
+		expect(error).toMatchObject({ code: "REVERT_SELECTION_BUDGET_EXCEEDED" });
 		expect(count("narrator_messages")).toBe(2501);
 		expect(version()).toBe(7);
 	}, 20_000);

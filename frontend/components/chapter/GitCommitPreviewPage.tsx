@@ -4,45 +4,65 @@ import { Link, useRouter } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { gitWorkspaceTarget, useGitCommitDetail, useGitWorkspace } from "../../hooks/useGit";
+import { useNarrator } from "../../hooks/useNarrator";
+import { useWorkspaceContext } from "../../hooks/useWorkspaceContext";
 import type { ApiError } from "../../lib/api";
 import { type GitTarget, gitBasePath, gitTargetKey } from "../../lib/api/git";
 import {
 	buildCommitPreviewHref,
+	type CommitPreviewPageMode,
 	type CommitPreviewSearch,
 } from "../../lib/git-commit-preview-navigation";
 import { GitCommitPreview } from "./GitCommitPreview";
 
 type Owner = { narratorId: string; chapterId?: never } | { chapterId: string; narratorId?: never };
-type Props = Owner & { sha: string; search: CommitPreviewSearch };
+type Props = Owner & {
+	sha: string;
+	search: CommitPreviewSearch;
+	mode?: CommitPreviewPageMode;
+};
 
-/** A root-level AppShell page: deliberately outside the narrator Dock route. */
+/** Shared by the legacy AppShell page and the lightweight Git window, outside the narrator Dock. */
 export function GitCommitPreviewPage(props: Props) {
 	const { t } = useTranslation("git");
 	const valid = GIT_COMMIT_SHA_PATTERN.test(props.sha) && !props.search.invalid;
 	const sha = props.sha.toLowerCase();
+	const mode = props.mode ?? "page";
 	return (
-		<Container size="xl" py="md" w="100%">
+		<Container fluid={mode === "window"} size="xl" py="md" w="100%" data-git-preview-page={mode}>
 			<Stack gap="md">
 				<Group justify="space-between">
 					<Title order={2}>{t("commitPreview.title", { sha: props.sha.slice(0, 7) })}</Title>
 					{props.narratorId !== undefined ? (
-						<Button
-							component={Link}
+						<Link
 							to="/narrators/$narratorId"
 							params={{ narratorId: props.narratorId }}
-							variant="subtle"
+							target={mode === "window" ? "_blank" : undefined}
+							rel={mode === "window" ? "noopener noreferrer" : undefined}
+							data-git-preview-owner-link
+							style={{ textDecoration: "none" }}
 						>
-							{t("commitPreview.page.backNarrator", { defaultValue: "Back to narrator" })}
-						</Button>
+							<Button component="span" variant="subtle">
+								{mode === "window"
+									? t("commitPreview.page.openInApp")
+									: t("commitPreview.page.backNarrator", { defaultValue: "Back to narrator" })}
+							</Button>
+						</Link>
 					) : (
-						<Button
-							component={Link}
+						<Link
 							to="/chapters/$chapterId"
 							params={{ chapterId: props.chapterId }}
-							variant="subtle"
+							target={mode === "window" ? "_blank" : undefined}
+							rel={mode === "window" ? "noopener noreferrer" : undefined}
+							data-git-preview-owner-link
+							style={{ textDecoration: "none" }}
 						>
-							{t("commitPreview.page.backChapter", { defaultValue: "Back to chapter" })}
-						</Button>
+							<Button component="span" variant="subtle">
+								{mode === "window"
+									? t("commitPreview.page.openInApp")
+									: t("commitPreview.page.backChapter", { defaultValue: "Back to chapter" })}
+							</Button>
+						</Link>
 					)}
 				</Group>
 				{!valid ? (
@@ -58,6 +78,7 @@ export function GitCommitPreviewPage(props: Props) {
 						narratorId={props.narratorId}
 						sha={sha}
 						search={props.search}
+						mode={mode}
 					/>
 				) : (
 					<ResolvedPreview
@@ -65,6 +86,7 @@ export function GitCommitPreviewPage(props: Props) {
 						target={props.chapterId}
 						sha={sha}
 						file={props.search.file}
+						mode={mode}
 					/>
 				)}
 			</Stack>
@@ -102,14 +124,43 @@ function PreviewFailure({ error, retry }: { error: unknown; retry: () => void })
 	);
 }
 
-function NarratorPreview({
+function NarratorPreview(props: {
+	narratorId: string;
+	sha: string;
+	search: CommitPreviewSearch;
+	mode: CommitPreviewPageMode;
+}) {
+	const { t } = useTranslation("git");
+	const context = useWorkspaceContext(props.narratorId);
+	const narrator = useNarrator(props.narratorId);
+	const [initialized, setInitialized] = useState(false);
+	// Wait for a revisioned execution context (or legacy narrator fallback) before
+	// authorizing a preview. Later metadata hydration at the same revision keeps
+	// its workspace query stable and must not tear down visible commit content.
+	useEffect(() => {
+		if (
+			!context.transitioning &&
+			!context.isPending &&
+			(context.data?.contextKey || !narrator.isPending)
+		)
+			setInitialized(true);
+	}, [context.transitioning, context.isPending, context.data?.contextKey, narrator.isPending]);
+	// This is a first-visit gate, not a background-fetch gate. In particular, a legacy
+	// context endpoint may retry on mount; that retry must not keep unmounting its child.
+	if (!initialized || context.transitioning) return <Loader aria-label={t("workspace.loading")} />;
+	return <NarratorWorkspacePreview {...props} />;
+}
+
+function NarratorWorkspacePreview({
 	narratorId,
 	sha,
 	search,
+	mode,
 }: {
 	narratorId: string;
 	sha: string;
 	search: CommitPreviewSearch;
+	mode: CommitPreviewPageMode;
 }) {
 	const { t } = useTranslation("git");
 	const router = useRouter();
@@ -135,8 +186,11 @@ function NarratorPreview({
 	const mustPin = checked && target && !mismatch && search.workspaceKey === undefined;
 	useEffect(() => {
 		if (!mustPin || !target) return;
-		void router.navigate({ href: buildCommitPreviewHref(target, sha, search.file), replace: true });
-	}, [router, mustPin, target, sha, search.file]);
+		void router.navigate({
+			href: buildCommitPreviewHref(target, sha, search.file, mode),
+			replace: true,
+		});
+	}, [router, mustPin, target, sha, search.file, mode]);
 	if (!checked || workspace.isLoading) return <Loader aria-label={t("workspace.loading")} />;
 	if (workspace.isError)
 		return <PreviewFailure error={workspace.error} retry={() => void refetch()} />;
@@ -161,11 +215,22 @@ function NarratorPreview({
 			target={target}
 			sha={sha}
 			file={search.file}
+			mode={mode}
 		/>
 	);
 }
 
-function ResolvedPreview({ target, sha, file }: { target: GitTarget; sha: string; file?: string }) {
+function ResolvedPreview({
+	target,
+	sha,
+	file,
+	mode,
+}: {
+	target: GitTarget;
+	sha: string;
+	file?: string;
+	mode: CommitPreviewPageMode;
+}) {
 	const { t } = useTranslation("git");
 	const router = useRouter();
 	const detail = useGitCommitDetail(target, sha);
@@ -185,8 +250,11 @@ function ResolvedPreview({ target, sha, file }: { target: GitTarget; sha: string
 	const firstFile = data?.files[0]?.path;
 	useEffect(() => {
 		if (file !== undefined || firstFile === undefined) return;
-		void router.navigate({ href: buildCommitPreviewHref(target, sha, firstFile), replace: true });
-	}, [router, target, sha, file, firstFile]);
+		void router.navigate({
+			href: buildCommitPreviewHref(target, sha, firstFile, mode),
+			replace: true,
+		});
+	}, [router, target, sha, file, firstFile, mode]);
 	if (!checked || detail.isLoading || detail.isFetching) return <Loader />;
 	if (detail.isError) return <PreviewFailure error={detail.error} retry={() => void refetch()} />;
 	if (file !== undefined && data && !data.files.some((entry) => entry.path === file))
@@ -201,15 +269,15 @@ function ResolvedPreview({ target, sha, file }: { target: GitTarget; sha: string
 		<GitCommitPreview
 			target={target}
 			sha={sha}
-			mode="page"
+			mode={mode}
 			selectedPath={file ?? null}
 			onSelectPath={(path) => {
 				if (path === file || !data?.files.some((entry) => entry.path === path)) return;
-				void router.navigate({ href: buildCommitPreviewHref(target, sha, path) });
+				void router.navigate({ href: buildCommitPreviewHref(target, sha, path, mode) });
 			}}
 			onNavigateCommit={(parent) => {
 				if (!data?.parents.includes(parent)) return;
-				void router.navigate({ href: buildCommitPreviewHref(target, parent) });
+				void router.navigate({ href: buildCommitPreviewHref(target, parent, undefined, mode) });
 			}}
 		/>
 	);

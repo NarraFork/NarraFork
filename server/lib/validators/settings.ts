@@ -157,10 +157,12 @@ const narratorToolbarLayoutSchema = z.object({
 	items: z
 		.array(
 			z.object({
-				id: z.enum(PERSISTED_NARRATOR_TOOLBAR_IDS),
+				// Accept only this retired id from older clients, then remove it.
+				id: z.enum([...PERSISTED_NARRATOR_TOOLBAR_IDS, "filemod"]),
 			}),
 		)
-		.max(30),
+		.max(30)
+		.transform((items) => items.filter((item) => item.id !== "filemod")),
 });
 
 export const updateUserPreferencesSchema = z.object({
@@ -204,6 +206,7 @@ export const updateUserPreferencesSchema = z.object({
 		.min(TYPOGRAPHY_RANGE.paragraphScalePercent.min)
 		.max(TYPOGRAPHY_RANGE.paragraphScalePercent.max)
 		.optional(),
+	treatAsLocalAccess: z.boolean().optional(),
 	addSubagentToRecentTabs: z.boolean().optional(),
 	recentTabsGroupMode: z.enum(["flat", "directory"]).optional(),
 	// Notification preferences

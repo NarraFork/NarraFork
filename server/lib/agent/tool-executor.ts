@@ -12,7 +12,7 @@ import { logger } from "../logger";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
 import { assertSpecPath, assertToolSpecPaths, toolSpecPathError } from "../spec-uri";
-import { checkToolDiskSafety, diskToolError, normalizeDiskToolResult } from "./disk-safety";
+import { checkToolDiskSafety, diskToolError } from "./disk-safety";
 import type { ExecutionBackend } from "./execution/backend";
 import { LOCAL_DEVICE_ID } from "./execution/backend";
 import { targetPathSemantics, toolBaseCwd } from "./execution/path-resolve";
@@ -677,11 +677,34 @@ async function getPipelineCaptureText(
 	}
 }
 
+export function getReflectionToolRejection(
+	tu: AgentToolUse,
+	config: AgentConfig,
+): ToolExecResult | undefined {
+	if (!config.reflectionLoop || config.reflectionLoop.allowedTools.includes(tu.name)) {
+		return undefined;
+	}
+	const allowedTools = config.reflectionLoop.allowedTools.join(", ") || "(none / 无)";
+	return {
+		output:
+			config.locale === "zh-CN"
+				? `工具 ${tu.name} 没有执行。当前反思环节只能调用以下工具：${allowedTools}。不得直接编辑文件或执行原操作；请通过当前决策工具把反馈返回主会话，由主会话处理修订。`
+				: `Tool ${tu.name} was not executed. This reflection context only allows these tools: ${allowedTools}. Do not edit files directly or execute the original operation; use a current decision tool to return feedback to the main session for revision.`,
+		isError: true,
+		durationMs: 0,
+	};
+}
+
 export async function executeTool(
 	tu: AgentToolUse,
 	config: AgentConfig,
 	options: ExecuteToolOptions = {},
 ): Promise<ToolExecResult> {
+	const reflectionRejection = getReflectionToolRejection(tu, config);
+	if (reflectionRejection) {
+		if (options.admissionState) releaseToolAdmissionState(options.admissionState);
+		return reflectionRejection;
+	}
 	const specError = toolSpecPathError(tu.name, tu.input);
 	if (specError) {
 		if (options.admissionState) releaseToolAdmissionState(options.admissionState);
@@ -697,6 +720,8 @@ export async function executeTool(
 			config.toolExecutionBindings?.get(tu),
 	);
 	admissionState.toolCallBinding = toolCallBinding;
+	let permissionRuleTerminationReason =
+		"Permission rule request finished without consuming its approval";
 	// A direct persisted recovery uses the exact same path as a loop receipt.
 	if (toolCallBinding && !config.toolExecutionBindings?.has(tu)) {
 		config.toolExecutionBindings ??= new WeakMap();
@@ -706,11 +731,11 @@ export async function executeTool(
 	// Unified update admission is deliberately the first executable guard. Live loop callers
 	// reach this point only after the tool-use block has a stable narrator_tool_calls row.
 	// A boolean alone is not admission authority: only the registered grant closes the phase race.
-	if (!admissionState.startGrant) {
-		await preAdmitToolExecution(tu, config, { state: admissionState });
-	}
-
 	try {
+		if (!admissionState.startGrant) {
+			await preAdmitToolExecution(tu, config, { state: admissionState });
+		}
+		config.assertWorkspaceCurrent?.();
 		const tool = toolRegistry.get(tu.name);
 
 		// Defense-in-depth: when unified native search is enabled for this provider/model,
@@ -893,6 +918,17 @@ export async function executeTool(
 					onAwaitingUserDecision: releaseAdmissionForUserDecisionWait(admissionState),
 					onInputResolved: frozenExecution
 						? async (resolvedInput) => {
+								if (config.requireToolCallBinding && toolCallBinding) {
+									const { persistPermissionResolvedInput } = await import(
+										"@server/services/tool-final-start-authorization"
+									);
+									await persistPermissionResolvedInput(
+										config.narratorId,
+										tu.toolUseId,
+										toolCallBinding,
+										resolvedInput,
+									);
+								}
 								const refined = await resolveAndPersistFrozenExecutionTarget(
 									tu,
 									config,
@@ -1023,16 +1059,14 @@ export async function executeTool(
 			}
 		}
 
-		// Check if the tool input is malformed JSON (_raw field) — a sign of output truncation
+		// Malformed JSON is not proof of output truncation: syntax errors and
+		// interrupted/missing stream fragments can produce the same _raw marker.
 		if ("_raw" in effectiveInput) {
 			const rawLen = typeof effectiveInput._raw === "string" ? effectiveInput._raw.length : 0;
 			return {
 				output:
-					`The tool call input was truncated — received malformed JSON (${rawLen} chars of raw input). ` +
-					`The ${tu.name} was NOT executed to avoid corrupting files. ` +
-					"Each tool call's total input must be under 10,000 characters. " +
-					"Use skeleton-first approach: Write a skeleton with SPLICE markers, " +
-					"then Edit to fill each marker with real content.",
+					`The ${tu.name} call received malformed JSON (${rawLen} chars of raw input). ` +
+					getToolMessage("brokenToolCallResult", locale),
 				isError: true,
 				durationMs: Date.now() - start,
 				permissionStartedAt,
@@ -1043,17 +1077,13 @@ export async function executeTool(
 			};
 		}
 
-		// Detect empty input for file-writing tools — a sign of complete truncation
-		// where the stream sent tool name/id but no input chunks at all.
+		// Empty file-writing input is unusable, but does not establish why it is missing.
 		const FILE_TOOLS = new Set(["Write", "Edit"]);
 		if (FILE_TOOLS.has(tu.name) && Object.keys(effectiveInput).length === 0) {
 			return {
 				output:
-					`The ${tu.name} call received no input at all (complete truncation). ` +
-					`The ${tu.name} was NOT executed. ` +
-					"Each tool call's total input must be under 10,000 characters. " +
-					"Use skeleton-first approach: Write a skeleton with SPLICE markers, " +
-					"then Edit to fill each marker with real content.",
+					`The ${tu.name} call received no input. ` +
+					getToolMessage("brokenToolCallResult", locale),
 				isError: true,
 				durationMs: Date.now() - start,
 				permissionStartedAt,
@@ -1140,6 +1170,18 @@ export async function executeTool(
 			defaultDeviceId: config.defaultDeviceId,
 			allowLocalExecution: config.allowLocalExecution,
 			setDefaultDevice: config.setDefaultDevice,
+			workspaceContext: config.workspaceContext,
+			switchWorkingDirectory: config.switchWorkingDirectory,
+			assertWorkspaceCurrent: config.assertWorkspaceCurrent,
+			recheckAuthorization: async () => {
+				config.signal.throwIfAborted();
+				config.assertWorkspaceCurrent?.();
+				await config.runtimeAuthorizationGuard?.();
+				if (ctx.toolCallBinding && config.onInternalReadAuthorization)
+					await config.onInternalReadAuthorization(tu.toolUseId, ctx.toolCallBinding);
+				config.signal.throwIfAborted();
+				config.assertWorkspaceCurrent?.();
+			},
 		};
 
 		// Wire up emitLongRunning: notify UI when a process exceeds 60s
@@ -1378,7 +1420,29 @@ export async function executeTool(
 					}
 					claimingExecution = false;
 				}
+				// An update-admission wait can outlive an actor/grant or workspace change.
+				// Recheck at the actual body boundary, not only before permission handling.
+				await config.runtimeAuthorizationGuard?.();
+				let authorizeFinalStart = config.onToolExecutionFinalAuthorization;
+				if (!authorizeFinalStart && config.requireToolCallBinding && !config.reflectionLoop) {
+					// Durable recovery/direct runners must not silently omit the production gate.
+					const { buildFinalToolStartAuthorization } = await import(
+						"@server/services/tool-final-start-authorization"
+					);
+					authorizeFinalStart = buildFinalToolStartAuthorization(config);
+				}
+				const finalTicket = authorizeFinalStart
+					? await authorizeFinalStart({
+							...lifecycle,
+							executionBackend: frozenExecution?.backend,
+							executionPlan: frozenExecution?.plan,
+							approvedPermission: permission,
+						})
+					: undefined;
+				if (authorizeFinalStart && typeof finalTicket?.assertStillCurrent !== "function")
+					throw new Error("Final authorization did not return a synchronous policy fence");
 				config.signal.throwIfAborted();
+				config.assertWorkspaceCurrent?.();
 				// Only actual execution is painted as running; captures are preparation.
 				if (config.onEvent) {
 					const onEvent = config.onEvent;
@@ -1389,11 +1453,15 @@ export async function executeTool(
 						onEvent({ type: "tool_progress", toolUseId: tu.toolUseId, elapsed });
 					}, PROGRESS_INTERVAL_MS);
 				}
-				result = normalizeDiskToolResult(
-					await tool.execute(effectiveInput, ctx),
-					ctx.executionTarget?.canonicalPath ?? ctx.cwd,
-					ctx.locale,
-				);
+				// No await or observer callback may sit between these fences and invocation.
+				config.signal.throwIfAborted();
+				config.assertWorkspaceCurrent?.();
+				finalTicket?.assertStillCurrent();
+				// Tool output is untrusted text (including test names and source excerpts),
+				// not evidence of a host storage failure, even when the command exits nonzero.
+				// Only the preflight above and thrown storage errors below may trip the guard.
+				config.onToolExecutionInvoking?.(tu);
+				result = await tool.execute(effectiveInput, ctx);
 				result.output += diskCheck.notice;
 			} catch (error) {
 				executionError = error;
@@ -1499,12 +1567,13 @@ export async function executeTool(
 				pipelineExitConfirmationStateId,
 			};
 		} catch (err) {
+			permissionRuleTerminationReason = err instanceof Error ? err.message : String(err);
 			// A failed durable claim must still reject (not become a normal tool result).
 			if (claimingExecution) throw err;
 			const diskError = diskToolError(
 				err,
-				ctx.executionTarget?.canonicalPath ?? ctx.cwd,
 				ctx.locale,
+				ctx.executionTarget?.backendKind === "local",
 			);
 			return {
 				output:
@@ -1528,8 +1597,27 @@ export async function executeTool(
 				pendingOutputTimer = undefined;
 			}
 		}
+	} catch (error) {
+		permissionRuleTerminationReason = error instanceof Error ? error.message : String(error);
+		throw error;
 	} finally {
 		releaseToolAdmissionState(admissionState);
+		if (tu.name === "RequestPermissionRule" && toolCallBinding) {
+			// Final deny, abort, routing failures and every early return must close an
+			// unconsumed approval. The service CAS protects applied/existing/denied receipts.
+			const { terminatePermissionRuleRequest } = await import(
+				"@server/services/permission-rule-request-service"
+			);
+			terminatePermissionRuleRequest({
+				narratorId: config.narratorId,
+				toolCallId: toolCallBinding.toolCallId,
+				attempt: toolCallBinding.attempt,
+				status: config.signal.aborted ? "cancelled" : "failed",
+				reason: config.signal.aborted
+					? "Permission rule request interrupted before execution completed"
+					: permissionRuleTerminationReason,
+			});
+		}
 	}
 }
 

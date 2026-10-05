@@ -1,8 +1,6 @@
-import type { OptimizeStyle, UsePromptOptimizeResult } from "@frontend/hooks/usePromptOptimize";
-import { narratorsApi } from "@frontend/lib/api/narrators";
+import { type UsePromptOptimizeResult, usePromptOptimize } from "@frontend/hooks/usePromptOptimize";
 import { Box, Button, Group, Modal, Stack, Text, Textarea } from "@mantine/core";
 import { useHotkeys } from "@mantine/hooks";
-import { notifications } from "@mantine/notifications";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -48,58 +46,41 @@ export function ComposerFullscreenModal({
 	}, [opened, initialText]);
 
 	const handleSubmit = () => {
+		cancelModalOptimize();
 		onSubmit(text);
 		onClose();
 	};
-
-	// Keyboard shortcuts
-	useHotkeys([
-		["mod+Enter", handleSubmit],
-		["Escape", onClose],
-	]);
 
 	// Stats
 	const charCount = text.length;
 	const lineCount = text.split("\n").length;
 	const wordCount = text.trim() ? text.trim().split(/\s+/).length : 0;
 
-	// Handle optimize in modal - manually call the API since we can't reuse the hook's textarea ref
-	const handleOptimizeInModal = async (style: OptimizeStyle) => {
-		if (!optimizeHook || !narratorId || !textareaRef.current || !text.trim()) return;
-
-		const textarea = textareaRef.current;
-		try {
-			const result = await narratorsApi.optimizePrompt(narratorId, textarea.value, style, {
-				withContext: optimizeHook.withContext,
-				messageId,
-				signal: undefined,
-			});
-
-			// Use document.execCommand for browser native undo support
-			textarea.focus();
-			textarea.setSelectionRange(0, textarea.value.length);
-			document.execCommand("insertText", false, result.text);
-			setText(result.text);
-
-			notifications.show({
-				message: t("optimizeSuccess"),
-				color: "green",
-				autoClose: 8000,
-			});
-		} catch (err) {
-			notifications.show({
-				title: t("optimizeFailed"),
-				message: (err as Error).message || t("optimizeFailedGeneric"),
-				color: "red",
-				autoClose: 10000,
-			});
-		}
+	const modalOptimize = usePromptOptimize({
+		narratorId: narratorId ?? "",
+		messageId,
+		withContext: optimizeHook?.withContext,
+		textareaRef,
+		onOptimized: setText,
+	});
+	const cancelModalOptimize = modalOptimize.cancelOptimize;
+	useEffect(() => {
+		if (!opened) cancelModalOptimize();
+	}, [opened, cancelModalOptimize]);
+	const handleClose = () => {
+		cancelModalOptimize();
+		onClose();
 	};
+
+	useHotkeys([
+		["mod+Enter", handleSubmit],
+		["Escape", handleClose],
+	]);
 
 	return (
 		<Modal
 			opened={opened}
-			onClose={onClose}
+			onClose={handleClose}
 			title={t("fullscreenComposerTitle")}
 			size="xl"
 			centered
@@ -138,13 +119,14 @@ export function ComposerFullscreenModal({
 					rightSection={
 						optimizeHook ? (
 							<TextareaOptimizeControls
-								disabled={!text.trim() || optimizeHook.loading}
-								loading={optimizeHook.loading}
+								disabled={!text.trim() || modalOptimize.loading}
+								loading={modalOptimize.loading}
 								withContext={optimizeHook.withContext}
 								onToggleContext={optimizeHook.toggleContext}
-								onOptimize={handleOptimizeInModal}
-								contextMessageCount={optimizeHook.contextMessageCount}
-								onContextMessageCountChange={optimizeHook.setContextMessageCount}
+								onOptimize={modalOptimize.handleOptimize}
+								onCancelOptimize={modalOptimize.cancelOptimize}
+								contextMessageCount={modalOptimize.contextMessageCount}
+								onContextMessageCountChange={modalOptimize.setContextMessageCount}
 							/>
 						) : undefined
 					}
@@ -167,7 +149,7 @@ export function ComposerFullscreenModal({
 							{t("fullscreenHint")}
 						</Text>
 						<Group gap="sm">
-							<Button variant="subtle" onClick={onClose}>
+							<Button variant="subtle" onClick={handleClose}>
 								{tc("cancel")}
 							</Button>
 							<Button onClick={handleSubmit} disabled={!text.trim()}>

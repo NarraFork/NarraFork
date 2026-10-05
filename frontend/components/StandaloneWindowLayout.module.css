@@ -1,0 +1,12 @@
+.window {
+	box-sizing: border-box;
+	width: 100%;
+	/* html owns the viewport, including PWA height and keyboard tracking. */
+	height: 100%;
+	min-height: 0;
+	overflow: auto;
+	overscroll-behavior: contain;
+	padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+		var(--app-safe-area-inset-bottom, env(safe-area-inset-bottom, 0px))
+		env(safe-area-inset-left, 0px);
+}

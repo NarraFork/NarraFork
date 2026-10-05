@@ -17,12 +17,17 @@
 	opacity: 0;
 }
 
+:root {
+	/* Narrator header: Mantine sm control + 8px padding per side + divider. */
+	--nf-panel-header-height: calc(1.375rem * var(--mantine-scale) + 17px);
+}
+
 .dockview-theme-narrafork {
 	/* Core surfaces */
 	--dv-group-view-background-color: var(--mantine-color-body);
 	--dv-tabs-and-actions-container-background-color: var(--mantine-color-default);
-	--dv-tabs-and-actions-container-height: 34px;
-	--dv-tabs-and-actions-container-font-size: var(--mantine-font-size-xs);
+	--dv-tabs-and-actions-container-height: var(--nf-panel-header-height);
+	--dv-tabs-and-actions-container-font-size: var(--mantine-font-size-sm);
 
 	/* Active group / visible tab */
 	--dv-activegroup-visiblepanel-tab-background-color: var(--mantine-color-body);
@@ -99,6 +104,11 @@
  */
 .nf-panel-header {
 	touch-action: none;
+	height: var(--nf-panel-header-height);
+	min-height: var(--nf-panel-header-height);
+	box-sizing: border-box;
+	padding-top: 8px;
+	padding-bottom: 8px;
 }
 
 /* Custom Tab boundary and active/inactive differentiation overrides */
@@ -145,7 +155,7 @@
 		color 150ms ease;
 	display: flex;
 	align-items: center;
-	font-size: var(--mantine-font-size-xs);
+	font-size: var(--dv-tabs-and-actions-container-font-size);
 	cursor: pointer;
 }
 

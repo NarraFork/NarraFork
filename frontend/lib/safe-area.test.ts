@@ -198,7 +198,7 @@ describe("mobile safe-area layout contract", () => {
 		// `--app-shell-header-height` by hand left the header at 92 while Main's padding
 		// stayed 116 — a 24px hole between them. So the height must arrive via the prop.
 		const appShell = await Bun.file(
-			new URL("../components/AppRootLayout.tsx", import.meta.url),
+			new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url),
 		).text();
 		expect(appShell).toContain("header={{ height: APP_SHELL_HEADER_HEIGHT }}");
 		expect(appShell).not.toContain("--app-shell-header-height");
@@ -363,7 +363,7 @@ describe("mobile safe-area layout contract", () => {
 		// The pairing only holds if AppShell.Navbar actually applies both halves as one
 		// responsive pair; a `top` that drifts from the height is the failure this guards.
 		const appShell = await Bun.file(
-			new URL("../components/AppRootLayout.tsx", import.meta.url),
+			new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url),
 		).text();
 		const navbarProps = appShell.slice(
 			appShell.indexOf("<AppShell.Navbar"),
@@ -410,7 +410,7 @@ describe("mobile safe-area layout contract", () => {
 		expect(APP_SHELL_MAIN_PADDING_BOTTOM).not.toContain("+");
 
 		const appShell = await Bun.file(
-			new URL("../components/AppRootLayout.tsx", import.meta.url),
+			new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url),
 		).text();
 		const navbarProps = appShell.slice(
 			appShell.indexOf("<AppShell.Navbar"),
@@ -1020,11 +1020,12 @@ describe("mobile safe-area layout contract", () => {
 		// The prohibition this replaces still holds in substance: no *width* media
 		// query may re-derive the chain, because that is what let two breakpoints
 		// disagree about who owns the height. Assert the allowed queries exactly
-		// instead of banning the at-rule: the display-mode basis switch, plus the
-		// director lift — which does not touch the chain at all, it only hands
-		// the keyboard occlusion to one opt-in surface.
+		// instead of banning the at-rule: the display-mode basis switch (WCO is its
+		// own display-mode — the installed-PWA branch must keep matching there),
+		// plus the director lift — which does not touch the chain at all, it only
+		// hands the keyboard occlusion to one opt-in surface.
 		expect(declarations.match(/@media[^{]*/g)).toEqual([
-			"@media (display-mode: standalone) ",
+			"@media (display-mode: standalone), (display-mode: window-controls-overlay) ",
 			`@media ${MOBILE_VIEWPORT_MEDIA_QUERY} `,
 		]);
 		// The shell chain itself never positions; the one `position: fixed` layer in the
@@ -1136,7 +1137,7 @@ describe("mobile safe-area layout contract", () => {
 			providersRoute,
 			loginRoute,
 		] = await Promise.all([
-			Bun.file(new URL("../components/AppRootLayout.tsx", import.meta.url)).text(),
+			Bun.file(new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../components/narrator/content/ContentViewer.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/chapters/$chapterId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/settings.tsx", import.meta.url)).text(),
@@ -1175,9 +1176,13 @@ describe("mobile safe-area layout contract", () => {
 			narratorPanel,
 			safeArea,
 		] = await Promise.all([
-			Bun.file(new URL("../components/AppRootLayout.tsx", import.meta.url)).text(),
-			Bun.file(new URL("../routes/narrators/$narratorId.tsx", import.meta.url)).text(),
-			Bun.file(new URL("../routes/narrators/workspace/$workspaceId.tsx", import.meta.url)).text(),
+			Bun.file(new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url)).text(),
+		Bun.file(new URL("../routes/narrators/$narratorId.tsx", import.meta.url)).text(),
+		// The route file is a thin shell; the workspace surface (and its full-bleed
+		// branches) lives in WorkspacePage so the standalone window route can reuse it.
+		Bun.file(
+			new URL("../components/narrator/workspace/WorkspacePage.tsx", import.meta.url),
+		).text(),
 			Bun.file(new URL("../routes/projects/$projectId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../components/terminal/TerminalPanel.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../components/narrator/NarratorPanel.tsx", import.meta.url)).text(),
@@ -1218,8 +1223,13 @@ describe("mobile safe-area layout contract", () => {
 		// identical mobile/desktop branches; both layouts inherit its height.
 		expect(narratorRoute.match(/h=\{APP_SHELL_FULL_BLEED_HEIGHT\}/g)?.length).toBe(1);
 		expect(narratorRoute).toContain("<FocusChatHost");
-		expect(workspaceRoute.match(/h=\{APP_SHELL_FULL_BLEED_HEIGHT\}/g)?.length).toBe(2);
-		expect(projectRoute).toContain("height: APP_SHELL_CONTENT_HEIGHT");
+		// The workspace page collapsed its two identical mobile/desktop branches into
+		// one shared `shellBoxProps` when the window chrome variant was added, so the
+		// full-bleed height is named exactly once and both layouts inherit it.
+		expect(workspaceRoute.match(/APP_SHELL_FULL_BLEED_HEIGHT/g)?.length).toBeGreaterThanOrEqual(1);
+		// The compatibility page now uses natural document flow inside Main instead of a fixed canvas.
+		expect(projectRoute).toContain("<ProjectCompatibilityPanel");
+		expect(projectRoute).not.toContain("APP_SHELL_FULL_BLEED_HEIGHT");
 		for (const route of [narratorRoute, workspaceRoute, projectRoute]) {
 			expect(route).not.toContain("APP_SHELL_SAFE_VIEWPORT_HEIGHT");
 			expect(route).not.toContain("APP_SHELL_PADDED_SAFE_VIEWPORT_HEIGHT");

@@ -11,6 +11,7 @@ import {
 	type FileChangeState,
 	fileChangeStatesEqual,
 } from "@shared/file-change-protocol";
+import iconv from "iconv-lite";
 import { FileChangeBlobStore } from "./file-change-blob-store";
 import {
 	FileChangeReversalCalculator,
@@ -261,6 +262,126 @@ describe("raw per-file reverse deltas", () => {
 			}),
 		).toMatchObject({ ok: false, reason: "duplicate_unverified" });
 		expect(publishes).toBe(0);
+	});
+});
+
+describe("explicit historical snapshot recovery", () => {
+	test("text merge conflict is refused by default; snapshot restores earliest selected before", async () => {
+		const before = await regular("baseline\r\n");
+		const firstAfter = await regular("selected one\r\n");
+		const secondBefore = await regular("human between selected changes\r\n");
+		const secondAfter = await regular("selected two\r\n");
+		const current = await regular("human after selected changes\r\n");
+		const first = effect(before, firstAfter, 10);
+		const second = effect(secondBefore, secondAfter, 30);
+		const noChange = effect(current, current, 40);
+		const input = { identity, current, effects: [first, noChange, second] };
+		expect(await calculator().calculate(input)).toMatchObject({
+			ok: false,
+			reason: "merge_conflict",
+		});
+		const result = success(await calculator().calculate({ ...input, recoveryMode: "snapshot" }));
+		expect(result.expected).toEqual(current);
+		expect(result.desired).toEqual(before);
+		expect(result.steps.map(({ scopeRevision, method }) => [scopeRevision, method])).toEqual([
+			[40, "no_change"],
+			[30, "restore_snapshot"],
+			[10, "restore_snapshot"],
+		]);
+		expect(await desiredBytes(result)).toEqual(Buffer.from("baseline\r\n"));
+		expect(publishes).toBe(0);
+	});
+
+	test.each([
+		{
+			name: "binary",
+			bytes: Buffer.from([0x81, 0x40, 0, 13, 10]),
+			mode: 0o751,
+			reason: "state_conflict",
+		},
+		{
+			name: "GBK",
+			bytes: iconv.encode("原始内容\r\n", "gbk"),
+			mode: 0o644,
+			reason: "merge_conflict",
+		},
+	])("snapshot restores original %s raw bytes/mode despite divergent current state", async ({
+		bytes,
+		mode,
+		reason,
+	}) => {
+		const before = await regular(bytes, mode);
+		const after = await regular("selected utf8\n");
+		const current = await regular("external conflicting bytes\n", 0o600);
+		const effects = [effect(before, after, 10)];
+		expect(await calculator().calculate({ identity, current, effects })).toMatchObject({
+			ok: false,
+			reason,
+		});
+		const result = success(
+			await calculator().calculate({ identity, current, effects, recoveryMode: "snapshot" }),
+		);
+		expect(result.desired).toEqual(before);
+		expect(await desiredBytes(result)).toEqual(bytes);
+		expect(result.steps[0].method).toBe("restore_snapshot");
+		expect(publishes).toBe(0);
+	});
+
+	test("snapshot respects absent baseline; no-change-only selection preserves current", async () => {
+		const after = await regular("created\n");
+		const current = await regular("human changed created file\n");
+		const changed = effect(absent, after, 10);
+		expect(
+			success(
+				await calculator().calculate({
+					identity,
+					current,
+					effects: [changed],
+					recoveryMode: "snapshot",
+				}),
+			).desired,
+		).toEqual(absent);
+		const noChange = effect(after, after, 20);
+		expect(
+			success(
+				await calculator().calculate({
+					identity,
+					current,
+					effects: [noChange],
+					recoveryMode: "snapshot",
+				}),
+			).desired,
+		).toEqual(current);
+	});
+
+	test("snapshot still rejects missing/corrupt blobs, unmeasured effects and identity changes", async () => {
+		const before = await regular("original\n");
+		const after = await regular("selected\n");
+		const current = await regular("conflicting\n");
+		const selected = effect(before, after, 10);
+		const input = { identity, current, effects: [selected], recoveryMode: "snapshot" as const };
+		expect(
+			await calculator({
+				readBlob: async () => {
+					throw new Error("missing");
+				},
+			}).calculate(input),
+		).toMatchObject({ ok: false, reason: "blob_unavailable" });
+		expect(
+			await calculator({ readBlob: async (ref) => new Uint8Array(ref.sizeBytes) }).calculate(input),
+		).toMatchObject({ ok: false, reason: "blob_integrity" });
+		expect(
+			await calculator().calculate({
+				...input,
+				effects: [{ ...selected, executionConfirmed: false }],
+			}),
+		).toMatchObject({ ok: false, reason: "effect_unverified" });
+		expect(
+			await calculator().calculate({
+				...input,
+				effects: [{ ...selected, identity: { ...identity, workspaceInstanceId: "other" } }],
+			}),
+		).toMatchObject({ ok: false, reason: "identity_mismatch" });
 	});
 });
 

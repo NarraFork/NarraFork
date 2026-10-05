@@ -17,6 +17,7 @@ import {
 	completeBrowserOAuthFromCallbackUrl,
 	extractCodexTokenInfo,
 	getBrowserOAuthRedirectUri,
+	getBrowserOAuthStatus,
 	hasPendingBrowserOAuth,
 	isBrowserOAuthServerRunning,
 	pollDeviceCodeFlow,
@@ -712,6 +713,7 @@ export class CodexManager {
 	private readonly beforeExitHandler: () => void;
 	/** Exposed via snapshot so the frontend can show browser-auth errors. */
 	private _lastBrowserAuthError?: string;
+	private browserAuthGeneration = 0;
 	private usageSchedulerTimer?: ReturnType<typeof setTimeout>;
 	private usageSchedulerStarted = false;
 	private usageSchedulerNextRunAt?: number;
@@ -1718,6 +1720,7 @@ export class CodexManager {
 		const { resolveOverride } = await import("./net/proxy");
 		const { settings } = await import("./settings");
 		const proxy = resolveOverride(settings.codex?.proxy);
+		const generation = ++this.browserAuthGeneration;
 		const { authorizeUrl, tokenPromise, localCallbackServer } = await startBrowserOAuth(proxy);
 
 		// Clear previous error when a new flow starts
@@ -1731,6 +1734,7 @@ export class CodexManager {
 				logger.info("Codex browser auth completed", { accountId: tokens.accountId });
 			})
 			.catch((err) => {
+				if (generation !== this.browserAuthGeneration) return;
 				this._lastBrowserAuthError = err instanceof Error ? err.message : String(err);
 				logger.warn("Codex browser auth failed", { error: this._lastBrowserAuthError });
 			});
@@ -1744,11 +1748,9 @@ export class CodexManager {
 	 * The credential is added by the background `tokenPromise` handler in
 	 * `startBrowserAuth`, so this only reports which account was authorized.
 	 *
-	 * A failure here is NOT recorded in `_lastBrowserAuthError`: a bad paste or a
-	 * transient proxy error leaves the flow pending on purpose, so the user can fix
-	 * the input and retry. That field means "the flow itself failed" and the UI
-	 * reacts by closing the paste box — which would take the retry away. The caller
-	 * gets the message through the thrown error instead.
+	 * Invalid pasted input keeps the current flow alive. Once token exchange starts,
+	 * a failure ends the flow and is recorded by the background promise handler;
+	 * the code may already have been consumed, so retries need fresh authorization.
 	 */
 	async completeBrowserAuthFromCallbackUrl(
 		callbackUrl: string,
@@ -1758,8 +1760,9 @@ export class CodexManager {
 		return { accountId: tokens.accountId, email: tokens.email };
 	}
 
-	getBrowserAuthState(): { pending: boolean; redirectUri: string; localCallbackServer: boolean } {
+	getBrowserAuthState() {
 		return {
+			...getBrowserOAuthStatus(),
 			pending: hasPendingBrowserOAuth(),
 			redirectUri: getBrowserOAuthRedirectUri(),
 			localCallbackServer: isBrowserOAuthServerRunning(),

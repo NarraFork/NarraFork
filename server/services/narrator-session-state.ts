@@ -31,6 +31,12 @@ export interface ActiveNarrator {
 	narratorId: string;
 	conversationId: string;
 	cwd: string;
+	/** Authoritative execution context installed from the committed narrator row. */
+	_workspaceContext?: import("@shared/workspace-context").WorkspaceContext;
+	/** End this old pass after a switch; unstarted tools must not mix identities. */
+	_workspacePassInvalidated?: boolean;
+	/** Installation failure blocks further tools until activation reloads persisted state. */
+	_workspaceInstallFailed?: boolean;
 	/** Runtime reference (e.g. __default__ or __agg__:id), never the __parent__ sentinel. */
 	_modelRef?: string;
 	/** Persisted selection, kept separate from the pool-authorized runtime reference. */
@@ -154,6 +160,12 @@ export interface ActiveNarrator {
 	_feedbackSoftStop?: boolean;
 	/** Soft-stop flag: set when a priority buffered message should run after current tools finish. */
 	_bufferSoftStop?: boolean;
+	/** Authoritative pending-guidance snapshot for synchronous PostgreSQL stop checks. */
+	_bufferGuidancePending?: boolean;
+	/** Per-pass request-only cancellation; never cancels already-running tools. */
+	_guidanceAbortController?: AbortController;
+	/** Urgent guidance cancels tools without ending the child runner/takeover. */
+	_urgentGuidanceAbortController?: AbortController;
 	/**
 	 * Set when the current agent-loop pass actually ended early because of a buffered
 	 * soft stop. If the queued input is gone by the time the pass returns (the user
@@ -316,6 +328,7 @@ export interface BufferedExecutionIntent {
 }
 
 export interface BufferedMessage {
+	queueMode?: import("@shared/buffer-queue-mode").BufferQueueMode;
 	executionIntent?: BufferedExecutionIntent;
 	id: string;
 	text: string;
@@ -979,6 +992,12 @@ export function withNarratorStartAdmission<T>(
 	});
 }
 
+/** Fail-fast observation for new requests; a caller already holding this admission is exempt. */
+export function isNarratorMutationAdmissionBusy(narratorId: string): boolean {
+	if (admissionContext.getStore()?.starts.get(narratorId)?.live) return false;
+	return admissionStartLock.isLocked(narratorId);
+}
+
 /**
  * The same short mutex for history/resume publication. Already-admitted delivery
  * may drain during `waiting`; new callers are rejected by the work lease. Sharing
@@ -987,12 +1006,13 @@ export function withNarratorStartAdmission<T>(
 export function withNarratorMutationAdmission<T>(
 	narratorId: string,
 	fn: () => Promise<T>,
+	options: { failIfBusy?: boolean } = {},
 ): Promise<T> {
 	if (admissionContext.getStore()?.starts.get(narratorId)?.live) {
 		return withNarratorWorkAdmission(narratorId, fn);
 	}
-	return withNarratorWorkAdmission(narratorId, () =>
-		admissionStartLock.acquire(narratorId, async () => {
+	return withNarratorWorkAdmission(narratorId, async () => {
+		const run = async () => {
 			const parent = admissionContext.getStore();
 			const token = { live: true };
 			const starts = new Map(parent?.starts);
@@ -1002,8 +1022,19 @@ export function withNarratorMutationAdmission<T>(
 			} finally {
 				token.live = false;
 			}
-		}),
-	);
+		};
+		if (options.failIfBusy) {
+			const result = await admissionStartLock.tryAcquire(narratorId, run, 0);
+			if (!result.acquired)
+				throw new AppError(
+					"Another workspace mutation is in progress",
+					409,
+					"WORKSPACE_CONTEXT_BUSY",
+				);
+			return result.value;
+		}
+		return admissionStartLock.acquire(narratorId, run);
+	});
 }
 
 /**
@@ -1037,6 +1068,14 @@ export async function withIdleNarratorCleanupAdmission<T>(
  */
 export function hasNarratorAdmissionWork(narratorId: string): boolean {
 	return admissionWorkFor(narratorId).length > 0;
+}
+
+/** Diagnostics only: a preview must not report its own request as unfinished work. */
+export function hasOtherNarratorAdmissionWork(narratorId: string): boolean {
+	const current = admissionContext.getStore()?.work.get(narratorId);
+	return admissionWorkFor(narratorId).some(
+		(work) => work !== current || current?.narratorId !== narratorId,
+	);
 }
 
 export function listNarratorAdmissionOwners(narratorId: string): string[] {

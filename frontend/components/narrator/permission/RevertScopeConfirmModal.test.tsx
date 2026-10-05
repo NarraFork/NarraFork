@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { useRevertHistoryAction } from "@frontend/hooks/useNarrator";
+import { ApiError } from "@frontend/lib/api";
 import type {
 	RevertActionConfirmOptions,
 	RevertActionPlan,
@@ -1031,13 +1032,7 @@ describe("fixed plan apply and history-only branches", () => {
 			const apply = deferredResponse();
 			respond = (request) =>
 				request.url.pathname.endsWith("/apply") ? apply.promise : normalResponse(request);
-			const resources = [
-				"messages",
-				"file-modifications",
-				"file-diff",
-				"file-tree-status",
-				"tool-calls",
-			];
+			const resources = ["messages", "file-tree-status", "tool-calls"];
 			for (const resource of resources)
 				queryClient.setQueryData(["narrators", "narrator-test", resource], {});
 			await renderAction();
@@ -1066,26 +1061,72 @@ describe("fixed plan apply and history-only branches", () => {
 			assertUnavailable();
 		});
 
-		test(`${selectedAction} keep-files sends only the explicit legacy history operation`, async () => {
-			action = selectedAction;
-			execute = true;
-			respond = normalResponse;
-			await renderAction();
-			await click(button(props.messagesOnlyLabel));
-			expect(confirmations).toEqual([{ skipRevert: true }]);
-			expect(requestsTo("/apply")).toHaveLength(0);
-			const history = requests.at(-1);
-			if (action === "rollback_to_block") {
-				expect(history?.url.pathname).toBe("/api/narrators/narrator-test/rollback/message-1");
-				expect(history?.body).toEqual({ blockIndex: 3, skipRevert: true });
-			} else {
-				expect(history?.method).toBe("DELETE");
-				expect(history?.url.pathname).toBe(
-					"/api/narrators/narrator-test/messages/message-1/blocks/3",
-				);
-				expect(history?.url.searchParams.get("skipRevert")).toBe("1");
-			}
-		});
+		for (const previewState of [
+			"ready",
+			"preview_failed",
+			"files_failed",
+			"preview_loading",
+			"files_loading",
+			"pagination_loading",
+			"incomplete",
+		] as const) {
+			test(`${selectedAction} keep-files sends only the legacy history operation (${previewState})`, async () => {
+				action = selectedAction;
+				execute = true;
+				const deferred = deferredResponse();
+				respond = (request) => {
+					if (request.url.pathname.endsWith("/revert-action-preview")) {
+						if (previewState === "preview_failed")
+							return reply({ error: "fixture preview failed" }, 503);
+						if (previewState === "preview_loading") return deferred.promise;
+					}
+					if (request.url.pathname.endsWith("/files")) {
+						if (previewState === "files_failed")
+							return reply({ error: "fixture files failed" }, 503);
+						if (previewState === "files_loading") return deferred.promise;
+						if (previewState === "pagination_loading")
+							return request.url.searchParams.has("cursor")
+								? deferred.promise
+								: filesReply([planFile(0)], true);
+						if (previewState === "incomplete") return filesReply([planFile(0)]);
+					}
+					return normalResponse(request);
+				};
+				await renderAction();
+				if (previewState === "pagination_loading")
+					await waitFor(() => requestsTo("/files").length === 2);
+				if (previewState !== "ready") assertUnavailable();
+				if (previewState === "preview_failed" || previewState === "files_failed")
+					expect(document.body.textContent).toContain(en.revertPlanPreviewFailed);
+				if (previewState === "incomplete")
+					expect(document.body.textContent).toContain(en.revertScopePreviewTruncated);
+				const previewRequests = [...requests];
+				await click(button(props.messagesOnlyLabel));
+				expect(confirmations).toEqual([{ skipRevert: true }]);
+				expect(applyErrors).toEqual([]);
+				expect(requestsTo("/apply")).toHaveLength(0);
+				// Clicking history-only adds exactly one independent legacy request:
+				// no plan apply, preview reload or file-page refetch is permitted.
+				expect(requests).toHaveLength(previewRequests.length + 1);
+				expect(requests.slice(0, -1)).toEqual(previewRequests);
+				const history = requests.at(-1);
+				if (action === "rollback_to_block") {
+					expect(history?.method).toBe("POST");
+					expect(history?.url.pathname).toBe("/api/narrators/narrator-test/rollback/message-1");
+					expect(history?.body).toEqual({ blockIndex: 3, skipRevert: true });
+				} else {
+					expect(history?.method).toBe("DELETE");
+					expect(history?.url.pathname).toBe(
+						"/api/narrators/narrator-test/messages/message-1/blocks/3",
+					);
+					expect(history?.url.searchParams.get("skipRevert")).toBe("1");
+				}
+				deferred.resolve(reply({ error: "fixture late preview failure" }, 503));
+				await flush();
+				expect(requests).toHaveLength(previewRequests.length + 1);
+				expect(applyErrors).toEqual([]);
+			});
+		}
 	}
 
 	for (const [status, explanation] of [
@@ -1128,6 +1169,370 @@ describe("fixed plan apply and history-only branches", () => {
 	}
 });
 
+function conflictActionPreview(reason = "file_conflict", diagnosticReason = "merge_conflict") {
+	return {
+		action,
+		executable: false,
+		plan: null,
+		historySummary: null,
+		unavailable: reason,
+		blockers: [],
+		diagnostics: [
+			{
+				code: "REVERSAL_REFUSED",
+				reason: diagnosticReason,
+				filePath: "/workspace/conflicted.ts",
+				toolCallId: "tool-conflict-123",
+				operationId: "operation-conflict-456",
+			},
+		],
+	};
+}
+
+function snapshotResponse(request: CapturedRequest): Response {
+	if (request.url.pathname.endsWith("/revert-action-preview")) {
+		const id = `snapshot-${requestsTo("/revert-action-preview").length}`;
+		return request.body?.recoveryMode === "snapshot"
+			? reply({
+					...preparedActionPreview({ id, planHash: `hash-${id}` }),
+					recoveryMode: "snapshot",
+				})
+			: reply(conflictActionPreview());
+	}
+	if (request.url.pathname.endsWith("/apply")) {
+		return reply({
+			planId: request.url.pathname.split("/").at(-2),
+			status: "committed",
+			journalStatus: "committed",
+			settling: false,
+			reason: null,
+		});
+	}
+	return normalResponse(request);
+}
+
+async function acceptSnapshot(accepted = true) {
+	const checkbox = document.body.querySelector('input[type="checkbox"]');
+	if (!(checkbox instanceof HTMLInputElement)) throw new Error("Missing snapshot consent");
+	expect(checkbox.disabled).toBe(false);
+	checkbox.checked = accepted;
+	await click(checkbox);
+}
+
+describe("explicit historical snapshot recovery", () => {
+	for (const [language, locale] of Object.entries({ en, "zh-CN": zh })) {
+		for (const diagnosticReason of ["merge_conflict", "state_conflict"] as const) {
+			test(`${language}: ${diagnosticReason} shows the actual file and conflict, not incomplete evidence`, async () => {
+				await i18n.changeLanguage(language);
+				respond = () => reply(conflictActionPreview("incomplete_coverage", diagnosticReason));
+				await renderAction();
+				props.messagesOnlyLabel = locale.rollbackConfirmMessagesOnly;
+				assertUnavailable(locale);
+				expect(document.body.textContent).toContain(locale.revertScopeFileConflict);
+				expect(document.body.textContent).not.toContain(locale.revertScopeIncompleteCoverage);
+				expect(document.body.textContent).toContain(
+					locale.revertDiagnosticReason[diagnosticReason],
+				);
+				expect(document.body.textContent).toContain("incomplete_coverage");
+				expect(document.body.textContent).toContain("REVERSAL_REFUSED");
+				expect(document.body.textContent).toContain("/workspace/conflicted.ts");
+				expect(document.body.textContent).toContain("tool-conflict-123");
+				expect(document.body.textContent).toContain("operation-conflict-456");
+				expect(button(locale.revertSnapshotRequest).disabled).toBe(false);
+				expect(requestsTo("/revert-action-preview")).toHaveLength(1);
+			});
+		}
+	}
+
+	test("snapshot request has a separate key; consent gates apply and forwards only true", async () => {
+		respond = snapshotResponse;
+		execute = true;
+		await renderAction();
+		const initial = requestsTo("/revert-action-preview")[0];
+		expect(initial?.body?.recoveryMode).toBeUndefined();
+		await click(button(en.revertSnapshotRequest));
+		const recovery = requestsTo("/revert-action-preview")[1];
+		expect(recovery?.body?.recoveryMode).toBe("snapshot");
+		expect(recovery?.body?.idempotencyKey).not.toBe(initial?.body?.idempotencyKey);
+		expect(document.body.textContent).toContain(en.revertSnapshotWarning);
+		expect(button(en.revertSnapshotConfirm).disabled).toBe(true);
+		expect(button(en.rollbackConfirmMessagesOnly).disabled).toBe(false);
+		await click(button(en.revertSnapshotConfirm));
+		expect(confirmations).toEqual([]);
+		expect(requestsTo("/apply")).toHaveLength(0);
+		await acceptSnapshot();
+		expect(button(en.revertSnapshotConfirm).disabled).toBe(false);
+		await click(button(en.revertSnapshotConfirm));
+		await waitFor(() => requestsTo("/apply").length === 1);
+		expect(requestsTo("/apply")[0]?.body).toEqual({
+			planHash: "hash-snapshot-2",
+			action,
+			acceptSnapshotRestore: true,
+		});
+		expect(confirmations[0]?.revertPlan?.acceptSnapshotRestore).toBe(true);
+	});
+
+	test("unchecking consent only gates confirmation and does not retire a valid snapshot plan", async () => {
+		respond = snapshotResponse;
+		execute = true;
+		await renderAction();
+		await click(button(en.revertSnapshotRequest));
+		await acceptSnapshot();
+		expect(button(en.revertSnapshotConfirm).disabled).toBe(false);
+		await acceptSnapshot(false);
+		expect(button(en.revertSnapshotConfirm).disabled).toBe(true);
+		expect(document.body.textContent).not.toContain(en.revertPlanReloadRequired);
+		await click(button(en.revertSnapshotConfirm));
+		expect(confirmations).toEqual([]);
+		expect(requestsTo("/apply")).toHaveLength(0);
+		await acceptSnapshot();
+		expect(button(en.revertSnapshotConfirm).disabled).toBe(false);
+		expect(requestsTo("/revert-action-preview")).toHaveLength(2);
+		await click(button(en.revertSnapshotConfirm));
+		await waitFor(() => requestsTo("/apply").length === 1);
+		expect(requestsTo("/apply")[0]?.body?.acceptSnapshotRestore).toBe(true);
+	});
+
+	for (const change of ["target", "reopen", "reload"] as const) {
+		test(`${change} resets snapshot mode and consent`, async () => {
+			respond = snapshotResponse;
+			await renderAction();
+			await click(button(en.revertSnapshotRequest));
+			await acceptSnapshot();
+			if (change === "reload") {
+				await click(button(en.revertPlanReload));
+			} else if (change === "reopen") {
+				const original = pending;
+				pending = null;
+				await renderAction();
+				pending = original;
+				await renderAction();
+			} else {
+				pending = { messageId: "message-new", blockIndex: 1 };
+				await renderAction();
+			}
+			expect(requestsTo("/revert-action-preview").at(-1)?.body?.recoveryMode).toBeUndefined();
+			assertUnavailable();
+			await click(button(en.revertSnapshotRequest));
+			expect(button(en.revertSnapshotConfirm).disabled).toBe(true);
+			expect(confirmations).toEqual([]);
+		});
+	}
+
+	test("snapshot paging cannot be acknowledged before the complete file list arrives", async () => {
+		const page = deferredResponse();
+		respond = (request) =>
+			request.url.pathname.endsWith("/files") ? page.promise : snapshotResponse(request);
+		await renderAction();
+		await click(button(en.revertSnapshotRequest));
+		assertUnavailable();
+		expect(document.body.querySelector('input[type="checkbox"]')).toBeNull();
+		await click(button(en.rollbackConfirmMessagesOnly));
+		expect(confirmations).toEqual([{ skipRevert: true }]);
+		page.resolve(filesReply([planFile(0), planFile(1)]));
+		await flush();
+		assertUnavailable();
+	});
+
+	test("a consented snapshot plan expires without applying or re-planning", async () => {
+		respond = (request) => {
+			if (request.body?.recoveryMode === "snapshot") {
+				return reply({
+					...preparedActionPreview({ expiresAt: new Date(Date.now() + 180).toISOString() }),
+					recoveryMode: "snapshot",
+				});
+			}
+			return snapshotResponse(request);
+		};
+		await renderAction();
+		await click(button(en.revertSnapshotRequest));
+		await acceptSnapshot();
+		expect(button(en.revertSnapshotConfirm).disabled).toBe(false);
+		await waitFor(() => document.body.textContent?.includes(en.revertPlanExpired) === true);
+		assertUnavailable();
+		await click(button(en.revertScopeUnavailableTitle));
+		expect(confirmations).toEqual([]);
+		expect(requestsTo("/apply")).toHaveLength(0);
+		expect(requestsTo("/revert-action-preview")).toHaveLength(2);
+	});
+
+	test("a snapshot preview timeout cancels its request and ignores a late plan", async () => {
+		const late = deferredResponse();
+		respond = (request) =>
+			request.body?.recoveryMode === "snapshot" ? late.promise : snapshotResponse(request);
+		await renderAction();
+		const originalSetTimeout = globalThis.setTimeout;
+		overrideGlobal("setTimeout", (...args: Parameters<typeof setTimeout>) => {
+			if (args[1] === 60_000) args[1] = 80;
+			return originalSetTimeout(...args);
+		});
+		await click(button(en.revertSnapshotRequest));
+		await waitFor(() => document.body.textContent?.includes(en.revertPlanPreviewFailed) === true);
+		expect(requestsTo("/revert-action-preview")[1]?.signal?.aborted).toBe(true);
+		late.resolve(reply({ ...preparedActionPreview(), recoveryMode: "snapshot" }));
+		await flush();
+		assertUnavailable();
+		expect(requestsTo("/files")).toHaveLength(0);
+		expect(requestsTo("/apply")).toHaveLength(0);
+	});
+
+	test("a late snapshot response cannot leak its mode into a changed target", async () => {
+		const late = deferredResponse();
+		respond = (request) =>
+			request.body?.recoveryMode === "snapshot" ? late.promise : snapshotResponse(request);
+		await renderAction();
+		await click(button(en.revertSnapshotRequest));
+		const snapshotRequest = requestsTo("/revert-action-preview")[1];
+		pending = { messageId: "different-message", blockIndex: 9 };
+		await renderAction();
+		expect(snapshotRequest?.signal?.aborted).toBe(true);
+		late.resolve(reply({ ...preparedActionPreview(), recoveryMode: "snapshot" }));
+		await flush();
+		assertUnavailable();
+		expect(document.body.textContent).not.toContain(en.revertSnapshotWarning);
+		expect(requestsTo("/revert-action-preview").at(-1)?.body?.recoveryMode).toBeUndefined();
+		expect(requestsTo("/files")).toHaveLength(0);
+	});
+
+	test("changing the active preview key revokes consent even with reused data", async () => {
+		const data = fixedPreview();
+		if (data.revertPlan) data.revertPlan.recoveryMode = "snapshot";
+		await render({ data, previewKey: "opening-1" });
+		await acceptSnapshot();
+		expect(button(en.revertSnapshotConfirm).disabled).toBe(false);
+		await render({ previewKey: "opening-new" });
+		assertUnavailable();
+		expect(document.body.querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(
+			false,
+		);
+	});
+
+	test("an unrequested snapshot response cannot authorize a default selective rollback", async () => {
+		respond = (request) =>
+			request.url.pathname.endsWith("/revert-action-preview")
+				? reply({ ...preparedActionPreview(), recoveryMode: "snapshot" })
+				: normalResponse(request);
+		await renderAction();
+		assertUnavailable();
+		expect(requestsTo("/files")).toHaveLength(0);
+		expect(document.body.textContent).toContain(en.revertPlanPreviewFailed);
+	});
+
+	test("a default selective apply retains its unchanged payload without snapshot acknowledgement", async () => {
+		respond = normalResponse;
+		execute = true;
+		await renderAction();
+		expect(document.body.textContent).not.toContain(en.revertSnapshotWarning);
+		await click(button(en.rollbackConfirmWithRevert));
+		await waitFor(() => requestsTo("/apply").length === 1);
+		expect(requestsTo("/apply")[0]?.body).toEqual({ planHash: "hash-plan-1", action });
+	});
+
+	for (const [language, locale] of Object.entries({ en, "zh-CN": zh })) {
+		for (const reason of ["current_file_changed", "target_changed", "history_changed"] as const) {
+			test(`${language}: ${reason} explains the actual changed subject rather than relying on its code`, async () => {
+				await i18n.changeLanguage(language);
+				respond = () => reply(conflictActionPreview("history_changed", reason));
+				await renderAction();
+				props.messagesOnlyLabel = locale.rollbackConfirmMessagesOnly;
+				assertUnavailable(locale);
+				expect(document.body.textContent).toContain(locale.revertDiagnosticReason[reason]);
+				expect(document.body.textContent).toContain("/workspace/conflicted.ts");
+				expect(document.body.textContent).toContain("REVERSAL_REFUSED");
+				if (reason !== "history_changed") {
+					expect(document.body.textContent).not.toContain(locale.revertScopeHistoryChanged);
+					expect(document.body.textContent).not.toContain(
+						locale.revertDiagnosticReason.history_changed,
+					);
+				}
+				expect(document.body.textContent).not.toContain(locale.revertSnapshotRequest);
+			});
+		}
+	}
+
+	test("unknown safe diagnostic reasons remain visible even without blockers", async () => {
+		respond = () => reply(conflictActionPreview("history_changed", "future_safe_reason"));
+		await renderAction();
+		assertUnavailable();
+		expect(document.body.textContent).toContain(en.revertScopeHistoryChanged);
+		expect(document.body.textContent).toContain("history_changed");
+		expect(document.body.textContent).toContain("future_safe_reason");
+	});
+});
+
+describe("action preview failures retain visible diagnostics through the actual host", () => {
+	for (const [language, locale] of Object.entries({ en, "zh-CN": zh })) {
+		for (const status of [400, 409, 500]) {
+			test(`${language}: HTTP ${status} renders the exact safe error code and message without a plan`, async () => {
+				await i18n.changeLanguage(language);
+				respond = () =>
+					reply({ code: "REVERT_PREVIEW_REFUSED", error: `fixture ${status} message` }, status);
+				await renderAction();
+				props.messagesOnlyLabel = locale.rollbackConfirmMessagesOnly;
+				assertUnavailable(locale);
+				expect(document.body.textContent).toContain(locale.revertPlanPreviewFailed);
+				expect(document.body.textContent).toContain("REVERT_PREVIEW_REFUSED");
+				expect(document.body.textContent).toContain(`fixture ${status} message`);
+				expect(requestsTo("/files")).toHaveLength(0);
+				expect(requestsTo("/apply")).toHaveLength(0);
+			});
+		}
+
+		test(`${language}: preview timeout leaves a visible reason without a plan`, async () => {
+			await i18n.changeLanguage(language);
+			const late = deferredResponse();
+			respond = () => late.promise;
+			const originalSetTimeout = globalThis.setTimeout;
+			overrideGlobal("setTimeout", (...args: Parameters<typeof setTimeout>) => {
+				if (args[1] === 60_000) args[1] = 80;
+				return originalSetTimeout(...args);
+			});
+			await renderAction();
+			await waitFor(
+				() => document.body.textContent?.includes(locale.revertPlanPreviewTimeout) === true,
+			);
+			props.messagesOnlyLabel = locale.rollbackConfirmMessagesOnly;
+			assertUnavailable(locale);
+			expect(document.body.textContent).toContain("REVERT_PREVIEW_TIMEOUT");
+			expect(requestsTo("/revert-action-preview")[0]?.signal?.aborted).toBe(true);
+			late.resolve(reply(preparedActionPreview()));
+			await flush();
+			expect(document.body.textContent).toContain(locale.revertPlanPreviewTimeout);
+			expect(requestsTo("/files")).toHaveLength(0);
+		});
+	}
+
+	test("API failures while loading files retain their code and cannot authorize the partial plan", async () => {
+		respond = (request) =>
+			request.url.pathname.endsWith("/files")
+				? reply({ code: "REVERT_PLAN_FILES_UNAVAILABLE", error: "File page failed" }, 409)
+				: normalResponse(request);
+		await renderAction();
+		assertUnavailable();
+		expect(document.body.textContent).toContain("REVERT_PLAN_FILES_UNAVAILABLE");
+		expect(document.body.textContent).toContain("File page failed");
+		expect(requestsTo("/apply")).toHaveLength(0);
+	});
+
+	test("an ApiError direct code is retained when present", async () => {
+		respond = () => {
+			throw Object.assign(new ApiError("Direct failure", 409), { code: "DIRECT_REFUSAL" });
+		};
+		await renderAction();
+		assertUnavailable();
+		expect(document.body.textContent).toContain("DIRECT_REFUSAL");
+		expect(document.body.textContent).toContain("Direct failure");
+	});
+
+	test("an HTTP failure without a code still renders the HTTP status diagnostic", async () => {
+		respond = () => reply({ error: "Failure without code" }, 500);
+		await renderAction();
+		assertUnavailable();
+		expect(document.body.textContent).toContain("HTTP_500");
+		expect(document.body.textContent).toContain("Failure without code");
+	});
+});
+
 const reasonKeys = {
 	no_boundaries: "revertScopeLegacyUnverified",
 	snapshot_missing: "revertScopeSnapshotMissing",
@@ -1138,6 +1543,8 @@ const reasonKeys = {
 	execution_unavailable: "revertScopeExecutionUnavailable",
 	runtime_reload_required: "revertScopeRuntimeReloadRequired",
 	incomplete_coverage: "revertScopeIncompleteCoverage",
+	file_conflict: "revertScopeFileConflict",
+	history_changed: "revertScopeHistoryChanged",
 	unsupported_target: "revertScopeUnsupportedTarget",
 	platform_unsupported: "revertScopePlatformUnsupported",
 	pending_operations: "revertScopePendingOperations",

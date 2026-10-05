@@ -1,11 +1,33 @@
 import { describe, expect, test } from "bun:test";
 import type { NarratorMsg } from "../narrator-panel-types";
 import {
+	buildStreamingMsg,
 	mergeStreamingSnapshotBlocks,
 	resolveAllToolCallsFromMsg,
 	type StreamingBlock,
 	segmentMessages,
 } from "./message-segments";
+
+describe("buildStreamingMsg request identity", () => {
+	test("carries actual identity without inferring it from tool chunks", () => {
+		const toolChunksMsg = {
+			contentJson: [{ type: "tool_use", id: "tool", name: "Read" }],
+			model: "unrelated-model",
+			provider: "unrelated-provider",
+		} as NarratorMsg;
+		expect(
+			buildStreamingMsg({
+				narratorId: "n",
+				model: "gpt-request",
+				provider: "openai",
+				toolChunksMsg,
+			}),
+		).toMatchObject({ model: "gpt-request", provider: "openai" });
+		const unknownIdentity = buildStreamingMsg({ narratorId: "n", toolChunksMsg });
+		expect(unknownIdentity).not.toHaveProperty("model");
+		expect(unknownIdentity).not.toHaveProperty("provider");
+	});
+});
 
 describe("resolveAllToolCallsFromMsg", () => {
 	test("accepts numeric tcCreatedAt values", () => {

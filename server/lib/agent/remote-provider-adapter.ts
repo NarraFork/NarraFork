@@ -197,6 +197,8 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		if (params.signal.aborted) throw createAbortError(params.signal.reason);
+		// Remote plugins, not the host's canonical DTO, know the actual model input.
+		params.onInputCharacters?.(null);
 		const chatParams = await this.buildChatParams(params);
 		const operation = await this.rpc.chat(chatParams, {
 			signal: params.signal,
@@ -219,6 +221,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 					continue;
 				}
 				if (event.type === "request_started") {
+					params.onInputCharacters?.(event.inputCharacters ?? null);
 					requestStarted = true;
 					if (event.reasoningSource) this.activeReasoningSource = event.reasoningSource;
 					params.onRequestStart?.({ credentialId: event.credentialId });

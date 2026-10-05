@@ -2,13 +2,8 @@
  * CAPABILITY BOUNDARY: this module is SQLite-only by design, and that is a
  * deliberate capability decision, not unfinished porting.
  *
- * Everything it does is built on connection-scoped SQLite facts a second backend
- * cannot reproduce as the same capability:
+ * Its query implementation uses SQLite-specific capabilities:
  *
- *   - the conservative connection stamp (`total_changes()` + `PRAGMA data_version`)
- *     that rejects ANY intervening write — PostgreSQL has no per-connection
- *     "anything changed since" counter; the equivalent guarantee there is a
- *     transaction-isolation property, not a stamp;
  *   - `INDEXED BY` + `rowid` keyset scans, which pin both the index choice and a
  *     physical row order PostgreSQL does not expose;
  *   - raw `bun:sqlite` prepared statements against the root handle, including the
@@ -17,9 +12,8 @@
  * THE PG ALTERNATIVE (for whoever ports history selection): do not translate the
  * scans. Re-express the collector as set-oriented, keyset-paged SELECTs on the
  * PG schema (the same indexes exist; ordering is by the columns themselves, not
- * `rowid`), and replace the stamp with `REPEATABLE READ` — one snapshot for the
- * whole collection, which is the stronger form of "no intervening write" the
- * stamp approximates. The plan/journal/evidence write paths that CONSUME this
+ * `rowid`). Preserve the target-scoped version and source commitments; unrelated
+ * database writes do not invalidate a preview. The plan/journal/evidence paths that CONSUME this
  * selection already have their PG counterparts (`postgres-revert-plan-store.ts`,
  * `postgres-revert-journal-store.ts`, `postgres-file-change-evidence-store.ts`).
  */
@@ -230,7 +224,10 @@ interface BodySummary {
 interface ScopeState {
 	principal: NarratorPrincipal;
 	signal: AbortSignal;
-	stamp: string;
+	/** Bounded source queries only; never a database-wide write counter. */
+	commitments: Map<string, { query: string; params: SQLQueryBindings[]; digest: string }>;
+	commitmentBytes: number;
+	bodies: Map<string, { ref: RefRow; digest: string }>;
 	queries: number;
 	inspectedBytes: number;
 	manifestBytes: number;
@@ -265,10 +262,10 @@ interface ScopeState {
  * block projection is needed, NOT an incomplete manifest. Public results are internal bounded
  * manifests, NOT HTTP summaries; never dump the arrays into a model response or public route.
  *
- * A conservative connection stamp (total_changes + data_version) rejects ANY database write
- * between pages, including shared-message changes without a root messageVersion bump. This
- * trades retries during unrelated writes for honest completeness without an await-held read
- * transaction. The returned versions/digests must be checked again by the future executor.
+ * Recheck selected narrator metadata and bounded source-query/body commitments, not unrelated
+ * database writes. This is optimistic validation, NOT an atomic snapshot across await: normal
+ * history writers must bump messageVersion, and execution must recheck returned versions/digests.
+ * A direct unversioned write after its source's last verification can still race the preview.
  *
  * Current FK actions are inventoried explicitly, including spec revisions/chapter commits;
  * COW of a shared partial message counts retained tool payload bytes without loading them.
@@ -306,7 +303,9 @@ export class RevertSelectionService {
 		const state: ScopeState = {
 			principal: input.principal,
 			signal,
-			stamp: "",
+			commitments: new Map(),
+			commitmentBytes: 0,
+			bodies: new Map(),
 			queries: 0,
 			inspectedBytes: 0,
 			manifestBytes: 0,
@@ -355,7 +354,6 @@ export class RevertSelectionService {
 			const root = state.narrators.get(input.narratorId);
 			if (root?.messageVersion !== input.expectedMessageVersion)
 				throw fail("STALE", "Message version changed before collection");
-			state.stamp = this.stamp();
 			await this.select(state, input.narratorId, input.selector);
 			for (const narratorId of state.narrators.keys())
 				await this.authorize(state, narratorId, true);
@@ -370,6 +368,7 @@ export class RevertSelectionService {
 			}
 			this.check(state);
 			state.result.metadataDigest = hash.digest("hex");
+			await this.verifySources(state);
 			completed = true;
 			return state.result;
 		} finally {
@@ -381,7 +380,12 @@ export class RevertSelectionService {
 				if (this.options.onSlow) this.options.onSlow(event);
 				else console.warn("[revert-selection] slow metadata collection", event);
 			}
-			if (completed) this.check(state); // worker shutdown was the final await
+			if (completed) {
+				this.check(state); // worker shutdown was the final await
+				// Catch version/context changes even during ACL callbacks or worker shutdown.
+				for (const narratorId of state.narrators.keys())
+					this.one<NarratorRow>(state, `${NARRATOR_SELECT} WHERE id = ? LIMIT 1`, [narratorId]);
+			}
 		}
 	}
 
@@ -392,23 +396,62 @@ export class RevertSelectionService {
 				"Collection cannot hold an ambient transaction across yields",
 			);
 	}
-	private stamp() {
-		this.root();
-		return `${this.database.$client.query<{ value: number }, []>("SELECT total_changes() AS value").get()?.value}:${this.database.$client.query<{ data_version: number }, []>("PRAGMA data_version").get()?.data_version}`;
-	}
 	private check(state: ScopeState) {
 		state.signal.throwIfAborted();
 		this.root();
-		if (state.stamp && state.stamp !== this.stamp())
-			throw fail("STALE", "Database changed while collecting the fixed selection");
 	}
-	private rows<T>(state: ScopeState, query: string, params: SQLQueryBindings[]): T[] {
+	private rows<T>(
+		state: ScopeState,
+		query: string,
+		params: SQLQueryBindings[],
+		commit = true,
+	): T[] {
 		this.check(state);
 		state.queries++;
-		return this.database.$client.query<T, SQLQueryBindings[]>(query).all(...params);
+		const rows = this.database.$client.query<T, SQLQueryBindings[]>(query).all(...params);
+		if (commit) {
+			const key = JSON.stringify([query, params]);
+			const digest = sourceRowsDigest(rows);
+			const old = state.commitments.get(key);
+			if (old && old.digest !== digest)
+				throw fail("STALE", "Selected source metadata changed during collection");
+			if (!old) {
+				state.commitmentBytes += Buffer.byteLength(key) + digest.length;
+				integer(
+					state.commitmentBytes,
+					0,
+					REVERT_SELECTION_LIMITS.manifestBytes,
+					"source commitments",
+				);
+				state.commitments.set(key, { query, params: [...params], digest });
+			}
+		}
+		return rows;
 	}
-	private one<T>(state: ScopeState, query: string, params: SQLQueryBindings[]): T | undefined {
-		return this.rows<T>(state, query, params)[0];
+	private one<T>(
+		state: ScopeState,
+		query: string,
+		params: SQLQueryBindings[],
+		commit = true,
+	): T | undefined {
+		return this.rows<T>(state, query, params, commit)[0];
+	}
+	private async verifySources(state: ScopeState) {
+		// Reuse the original indexed/keyset SELECTs, including their empty/end pages:
+		// row insertion/removal, sharing, tool bindings and FK associations all matter.
+		// Raw bodies are rehashed off-thread, never included in main-thread row digests.
+		for (const { ref, digest } of state.bodies.values()) {
+			const content = this.readBody(state, ref);
+			const current = await state.worker.inspect(ref.id, content, true);
+			this.check(state);
+			if (current.digest !== digest) throw fail("STALE", "Selected message body changed");
+		}
+		let verified = 0;
+		for (const { query, params } of state.commitments.values()) {
+			this.rows(state, query, params);
+			if (++verified % REVERT_SELECTION_PAGE_ITEMS === 0) await this.pause(state);
+		}
+		for (const narratorId of state.narrators.keys()) await this.authorize(state, narratorId, true);
 	}
 	private async pause(state: ScopeState) {
 		await yieldToEventLoop();
@@ -445,14 +488,9 @@ export class RevertSelectionService {
 	}
 
 	private async authorize(state: ScopeState, narratorId: string, recheck = false) {
-		const row = this.one<NarratorRow>(
-			state,
-			`SELECT id, owner_user_id AS ownerUserId, visibility, write_audience AS writeAudience, type,
-			acl_root_narrator_id AS aclRootNarratorId, chapter_id AS chapterId, context_project_id AS contextProjectId,
-			message_version AS messageVersion, refs_inherited_from AS refsInheritedFrom, status,
-			parent_narrator_id AS parentNarratorId, origin_tool_call_id AS originToolCallId FROM narrators WHERE id = ? LIMIT 1`,
-			[narratorId],
-		);
+		const row = this.one<NarratorRow>(state, `${NARRATOR_SELECT} WHERE id = ? LIMIT 1`, [
+			narratorId,
+		]);
 		if (!row) throw fail("NOT_FOUND", "Narrator not found");
 		const authorized = await withSignal(
 			this.options.authorize({ ...state.principal }, { ...row }, "write", state.signal),
@@ -557,15 +595,22 @@ export class RevertSelectionService {
 			REVERT_SELECTION_LIMITS.inspectedBodyBytes,
 			"total body inspection bytes",
 		);
+		const summary = await state.worker.inspect(ref.id, this.readBody(state, ref));
+		this.check(state);
+		const old = state.bodies.get(ref.id);
+		if (old && old.digest !== summary.digest) throw fail("STALE", "Selected message body changed");
+		state.bodies.set(ref.id, { ref, digest: summary.digest });
+		return summary;
+	}
+	private readBody(state: ScopeState, ref: RefRow): string {
 		const content = this.one<{ body: string }>(
 			state,
 			"SELECT content_json AS body FROM narrator_messages WHERE id = ? AND octet_length(content_json) = ? AND octet_length(content_json) <= ? LIMIT 1",
 			[ref.id, ref.contentBytes, REVERT_SELECTION_LIMITS.messageBytes],
+			false,
 		);
 		if (!content) throw fail("STALE", "Message changed before bounded inspection");
-		const summary = await state.worker.inspect(ref.id, content.body);
-		this.check(state);
-		return summary;
+		return content.body;
 	}
 
 	private async message(
@@ -1133,6 +1178,16 @@ export class RevertSelectionService {
 	}
 }
 
+function sourceRowsDigest(rows: unknown[]): string {
+	const hash = createHash("sha256");
+	for (const row of rows) hash.update(JSON.stringify(row)).update("\n");
+	return hash.digest("hex");
+}
+
+const NARRATOR_SELECT = `SELECT id, owner_user_id AS ownerUserId, visibility, write_audience AS writeAudience, type,
+ acl_root_narrator_id AS aclRootNarratorId, chapter_id AS chapterId, context_project_id AS contextProjectId,
+ message_version AS messageVersion, refs_inherited_from AS refsInheritedFrom, status,
+ parent_narrator_id AS parentNarratorId, origin_tool_call_id AS originToolCallId FROM narrators`;
 const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "StructView", "WebSearch", "WebFetch"]);
 const REF_SELECT = `SELECT r.rowid, r.id AS refId, r.message_id AS id, r.narrator_id AS narratorId, r.seq,
  coalesce(m.role,'assistant') AS role, r.segment_compact_id AS segmentCompactId, octet_length(m.content_json) AS contentBytes,
@@ -1371,7 +1426,7 @@ class BodyWorker {
 		reject: (error: Error) => void;
 	} | null = null;
 	constructor(private readonly signal: AbortSignal) {}
-	async inspect(id: string, body: string): Promise<BodySummary> {
+	async inspect(id: string, body: string, digestOnly = false): Promise<BodySummary> {
 		this.signal.throwIfAborted();
 		if (!this.worker) {
 			this.worker = new Worker(BODY_WORKER, { eval: true });
@@ -1392,6 +1447,7 @@ class BodyWorker {
 			this.worker?.postMessage({
 				id,
 				body,
+				digestOnly,
 				maxBlocks: REVERT_SELECTION_LIMITS.blockItems,
 				maxOutput: FILE_CHANGE_LIMITS.summaryBytes,
 			});
@@ -1413,8 +1469,9 @@ const BODY_WORKER = `
 const { parentPort } = require('node:worker_threads');
 const { createHash } = require('node:crypto');
 const hash = value => createHash('sha256').update(value).digest('hex');
-parentPort.on('message', ({id, body, maxBlocks, maxOutput}) => {
+parentPort.on('message', ({id, body, digestOnly, maxBlocks, maxOutput}) => {
  try {
+  if (digestOnly) { parentPort.postMessage({digest: hash(body), blocks: []}); return; }
   const parsed = JSON.parse(body);
   if (!Array.isArray(parsed) || parsed.length > maxBlocks) throw Error('Message block coverage is unavailable or over budget');
   const digest = hash(body); const seen = new Set(); const blocks = [];

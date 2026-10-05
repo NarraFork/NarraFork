@@ -7,6 +7,7 @@ import {
 	nextAllowedPort,
 	parseExcludedPortRanges,
 	readWindowsExcludedPortRanges,
+	readWindowsExcludedPortRangesAsync,
 } from "../../../server/lib/windows-excluded-ports";
 
 // Verbatim output from the field report (Chinese Windows, PowerShell 7.6.4). The
@@ -185,6 +186,33 @@ describe("formatPortRanges", () => {
 
 	it("formats an empty list as an empty string", () => {
 		expect(formatPortRanges([])).toBe("");
+	});
+});
+
+describe("readWindowsExcludedPortRangesAsync", () => {
+	it("fails open on unavailable, malformed, or throwing readers", async () => {
+		expect(await readWindowsExcludedPortRangesAsync(async () => null)).toEqual([]);
+		expect(await readWindowsExcludedPortRangesAsync(async () => "Access denied")).toEqual([]);
+		expect(
+			await readWindowsExcludedPortRangesAsync(async () => {
+				throw new Error("netsh timed out");
+			}),
+		).toEqual([]);
+	});
+
+	it("reads current ranges on Windows and never invokes the reader elsewhere", async () => {
+		let calls = 0;
+		const ranges = await readWindowsExcludedPortRangesAsync(async () => {
+			calls++;
+			return "1356 1455\n1456 1555\n";
+		});
+		if (process.platform === "win32") {
+			expect(calls).toBe(1);
+			expect(ranges).toEqual([{ start: 1356, end: 1555 }]);
+		} else {
+			expect(calls).toBe(0);
+			expect(ranges).toEqual([]);
+		}
 	});
 });
 

@@ -12,6 +12,7 @@ import {
 } from "@shared/pretext-layout/text-document";
 import type { SubagentModelPools, SubagentModelUse } from "@shared/subagent-model-policy";
 import type { ToolEditPreview } from "@shared/tool-edit-preview";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import {
 	ApiError,
 	absorbRenewedToken,
@@ -229,6 +230,8 @@ export type ScopedRevertUnavailableReason =
 	| "execution_unavailable"
 	| "runtime_reload_required"
 	| "incomplete_coverage"
+	| "file_conflict"
+	| "history_changed"
 	| "unsupported_target"
 	| "platform_unsupported"
 	| "pending_operations"
@@ -272,6 +275,7 @@ export interface RevertPlanConfirmation {
 	planId: string;
 	planHash: string;
 	action: RevertAction;
+	acceptSnapshotRestore?: true;
 }
 
 export interface RevertActionConfirmOptions {
@@ -320,12 +324,23 @@ export interface RevertBlocker {
 	detail?: string;
 }
 
+export interface RevertDiagnostic {
+	code: string;
+	reason?: string;
+	filePath?: string;
+	effectId?: string;
+	toolCallId?: string;
+	operationId?: string;
+}
+
 export interface RevertActionPreview {
 	action: RevertAction;
 	plan: RevertActionPlan | null;
 	executable: false;
 	historySummary: RevertHistorySummary | null;
 	unavailable?: ScopedRevertUnavailableReason;
+	diagnostics?: RevertDiagnostic[];
+	recoveryMode?: "snapshot";
 	/** Present when the server could name the running/unfinished holders. */
 	blockers?: RevertBlocker[];
 }
@@ -374,6 +389,7 @@ export interface RevertPlanReview extends Omit<RevertActionPlan, "id"> {
 	action: RevertAction;
 	previewKey: string;
 	filesComplete: boolean;
+	recoveryMode?: "snapshot";
 }
 
 export interface RevertPreviewFile {
@@ -418,6 +434,9 @@ export interface RevertScopePreviews<F extends RevertPreviewFile = RevertPreview
 	revertPlan?: RevertPlanReview;
 	previewIssue?: RevertPlanPreviewIssue;
 	previewError?: string;
+	previewErrorKey?: "revertPlanPreviewTimeout";
+	diagnostics?: RevertDiagnostic[];
+	recoveryMode?: "snapshot";
 	blockers?: RevertBlocker[];
 	scope?: RevertScope;
 	affectedFiles: F[];
@@ -563,6 +582,7 @@ export const narratorsApi = {
 		return request<ApiEntity[]>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
 	listNarratorsPaginated: (opts?: {
+		projectId?: string;
 		standalone?: boolean | "all";
 		status?: string;
 		filter?: string;
@@ -576,6 +596,7 @@ export const narratorsApi = {
 		hasViewers?: boolean;
 	}) => {
 		const params = new URLSearchParams();
+		if (opts?.projectId) params.set("projectId", opts.projectId);
 		if (opts?.standalone === "all") params.set("standalone", "all");
 		else if (opts?.standalone) params.set("standalone", "true");
 		if (opts?.status) params.set("status", opts.status);
@@ -591,7 +612,8 @@ export const narratorsApi = {
 		const qs = params.toString();
 		return request<PaginatedNarrators>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
-	getNarrator: (id: string) => request<ApiEntity>(`/narrators/${id}`),
+	getNarrator: (id: string, signal?: AbortSignal) =>
+		request<ApiEntity>(`/narrators/${id}`, { signal }),
 
 	/**
 	 * Upload a custom bitmap avatar for a narrator, replacing any previous one.
@@ -1011,6 +1033,15 @@ export const narratorsApi = {
 		}
 		return (await res.json()) as { ok: boolean };
 	},
+	setBufferedMessageMode: (
+		narratorId: string,
+		messageId: string,
+		mode: "turn" | "tool" | "interrupt",
+	) =>
+		request<{ ok: true; delivered?: boolean; messageId?: string }>(
+			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/mode`,
+			{ method: "PATCH", body: JSON.stringify({ mode }) },
+		),
 	retryBufferedMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: true; resumed: boolean }>(
 			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/retry`,
@@ -1227,10 +1258,13 @@ export const narratorsApi = {
 		return request<RemoteDirectoryListing>(`/narrators/${id}/device-browse?${params}`);
 	},
 	updateNarratorDefaultDevice: (id: string, deviceId: string | null) =>
-		request<{ defaultDeviceId: string | null }>(`/narrators/${id}/default-device`, {
-			method: "PATCH",
-			body: JSON.stringify({ deviceId }),
-		}),
+		request<{ defaultDeviceId: string | null; current?: WorkspaceContext }>(
+			`/narrators/${id}/default-device`,
+			{
+				method: "PATCH",
+				body: JSON.stringify({ deviceId }),
+			},
+		),
 	updateNarratorPermissionMode: (id: string, permissionMode: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/permission-mode`, {
 			method: "PATCH",
@@ -1407,7 +1441,12 @@ export const narratorsApi = {
 		signal?: AbortSignal,
 		fileReferences?: FileReference[],
 		interrupt?: boolean,
+		queueMode?: "turn" | "tool" | "interrupt",
 	) => {
+		if (queueMode !== undefined) {
+			priority = queueMode !== "turn";
+			interrupt = queueMode === "interrupt";
+		}
 		// Interrupt-and-insert is one request; its replacement always has queue priority.
 		if (interrupt) priority = true;
 		const headers: Record<string, string> = {};
@@ -1427,6 +1466,7 @@ export const narratorsApi = {
 			}
 			if (priority) formData.append("priority", "true");
 			if (interrupt) formData.append("interrupt", "true");
+			if (queueMode !== undefined) formData.append("queueMode", queueMode);
 			if (fileReferences !== undefined) {
 				formData.append("fileReferences", JSON.stringify(fileReferences));
 			}
@@ -1445,6 +1485,7 @@ export const narratorsApi = {
 					message,
 					...(priority ? { priority: true } : {}),
 					...(interrupt ? { interrupt: true } : {}),
+					...(queueMode !== undefined ? { queueMode } : {}),
 					fileReferences,
 				}),
 				signal,
@@ -1492,7 +1533,11 @@ export const narratorsApi = {
 		),
 	previewRevertAction: (
 		narratorId: string,
-		body: RevertActionTarget & { action: RevertAction; idempotencyKey: string },
+		body: RevertActionTarget & {
+			action: RevertAction;
+			idempotencyKey: string;
+			recoveryMode?: "snapshot";
+		},
 		signal?: AbortSignal,
 	) =>
 		request<RevertActionPreview>(`/narrators/${narratorId}/revert-action-preview`, {
@@ -1518,7 +1563,11 @@ export const narratorsApi = {
 			`/narrators/${narratorId}/revert-plans/${encodeURIComponent(plan.planId)}/apply`,
 			{
 				method: "POST",
-				body: JSON.stringify({ planHash: plan.planHash, action: plan.action }),
+				body: JSON.stringify({
+					planHash: plan.planHash,
+					action: plan.action,
+					...(plan.acceptSnapshotRestore === true ? { acceptSnapshotRestore: true } : {}),
+				}),
 			},
 		),
 	rollbackToBlock: (
@@ -1795,80 +1844,7 @@ export const narratorsApi = {
 			truncated: boolean;
 		}>(`/narrators/${narratorId}/file-tree-status`),
 
-	// File modifications
-	getFileModifications: (narratorId: string, upToMessageId?: string, fromMessageId?: string) => {
-		const params = new URLSearchParams();
-		if (upToMessageId) params.set("upToMessageId", upToMessageId);
-		if (fromMessageId) params.set("fromMessageId", fromMessageId);
-		const qs = params.toString();
-		return request<{
-			files: Array<{
-				deviceId: string;
-				filePath: string;
-				snapshotId: string;
-				originalExists: boolean;
-				editCount: number;
-				lastModifiedAt: string;
-				operations: Array<{
-					toolUseId: string;
-					toolName: string;
-					messageId: string;
-					createdAt: string;
-				}>;
-			}>;
-			/** Newest window only; see `timelineTruncated`. */
-			timeline: Array<{
-				messageId: string;
-				createdAt: string;
-				seq: number;
-				role: string;
-				hasEdits: boolean;
-			}>;
-			/** True when older messages exist outside the returned timeline window. */
-			timelineTruncated?: boolean;
-		}>(`/narrators/${narratorId}/file-modifications${qs ? `?${qs}` : ""}`);
-	},
-	getFileDiff: (
-		narratorId: string,
-		snapshotId: string,
-		upToMessageId?: string,
-		fromMessageId?: string,
-	) => {
-		const params = new URLSearchParams();
-		if (upToMessageId) params.set("upToMessageId", upToMessageId);
-		if (fromMessageId) params.set("fromMessageId", fromMessageId);
-		const qs = params.toString();
-		return request<{
-			deviceId: string;
-			filePath: string;
-			original: string | null;
-			current: string | null;
-		}>(`/narrators/${narratorId}/patches/${snapshotId}/diff${qs ? `?${qs}` : ""}`);
-	},
-	revertFile: (narratorId: string, target: { deviceId: string; filePath: string }) =>
-		request<{ success: boolean; originalExists: boolean }>(`/narrators/${narratorId}/revert-file`, {
-			method: "POST",
-			body: JSON.stringify(target),
-		}),
-	revertAllFiles: (narratorId: string, opts?: { scope?: RevertScope }) =>
-		request<{ fileCount: number; files: string[]; warnings?: RevertWarning[] }>(
-			`/narrators/${narratorId}/revert`,
-			{
-				method: "POST",
-				body: JSON.stringify({
-					messageId: "__all__",
-					...(opts?.scope ? { scope: opts.scope } : {}),
-				}),
-			},
-		),
-	unrevertAll: (narratorId: string) =>
-		request<{ success: boolean }>(`/narrators/${narratorId}/unrevert`, { method: "POST" }),
-	getDeletePreview: (narratorId: string, messageId: string) =>
-		request<
-			RevertScopePreviews<RevertPreviewFileWithContent> & {
-				toolCallCount: number;
-			}
-		>(`/narrators/${narratorId}/delete-preview?messageId=${encodeURIComponent(messageId)}`),
+	// File rollback previews
 	getRollbackPreview: (narratorId: string, messageId: string, blockIndex: number) =>
 		request<
 			RevertScopePreviews<RevertPreviewFile> & {
@@ -1917,7 +1893,7 @@ export const narratorsApi = {
 			`/narrators/${narratorId}/permission-file-preview?toolUseId=${encodeURIComponent(toolUseId)}`,
 		),
 
-	// Narrator Fork (standalone sessions only).
+	// Ordinary conversation fork (standalone output, including legacy chapter sources).
 	// The fork point is identified by the local narrator message id: only
 	// assistant messages carry an SDK uuid, so a uuid-only contract cannot fork
 	// from a user message.
@@ -1958,7 +1934,7 @@ export const narratorsApi = {
 			method: "DELETE",
 		}),
 	promoteNarrator: (narratorId: string) =>
-		request<{ type: "unlocked" | "forked"; narrator?: ApiEntity; chapter?: ApiEntity }>(
+		request<{ type: "unlocked" | "forked"; narratorId: string; narrator?: ApiEntity }>(
 			`/narrators/${narratorId}/promote`,
 			{ method: "POST" },
 		),

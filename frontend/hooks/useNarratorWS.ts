@@ -452,7 +452,7 @@ export interface NarratorWSCallbacks {
 		data: PermissionRoutingFields & {
 			requestId: string;
 			toolUseId: string;
-			decision: "allow" | "deny" | "aborted";
+			decision: "allow" | "deny" | "aborted" | "failed";
 			reason?: string;
 		},
 	) => void;
@@ -479,7 +479,7 @@ export interface NarratorWSCallbacks {
 		data: PermissionRoutingFields & {
 			requestId: string;
 			toolUseId: string;
-			decision: "allow" | "deny" | "aborted";
+			decision: "allow" | "deny" | "aborted" | "failed";
 			reason?: string;
 			nextSteps?: string;
 		},
@@ -660,6 +660,7 @@ export interface NarratorWSCallbacks {
 		contextWindow?: number,
 		isEstimated?: boolean,
 		compactStart?: number,
+		snapshot?: import("@shared/context-usage").ContextUsageSnapshot,
 	) => void;
 	onGitStatus?: (data: {
 		chapterId: string;
@@ -856,7 +857,14 @@ export interface NarratorWSCallbacks {
 			avatarImageId: string | null;
 		}>,
 	) => void;
+	onStreamingIdentity?: (identity: {
+		model: string;
+		provider: string;
+		parentToolUseId?: string;
+	}) => void;
 	onStreamingSnapshot?: (snapshot: {
+		model?: string;
+		provider?: string;
 		streamingBlocks: Array<
 			| { type: "reasoning"; id?: string; outputIndex?: number; text: string }
 			| {
@@ -1018,6 +1026,15 @@ export function useNarratorWS(
 							narratorWSManager.noteMessage(subscribedId, data.message as TreeMessage);
 						}
 						break;
+					case "streaming_identity":
+						if (typeof data.model === "string" && typeof data.provider === "string") {
+							callbackOwner.callbacks.onStreamingIdentity?.({
+								model: data.model,
+								provider: data.provider,
+								parentToolUseId: nonEmptyString(data.parentToolUseId) ?? undefined,
+							});
+						}
+						break;
 					case "stream_event":
 						callbackOwner.callbacks.onStreamEvent?.(data);
 						break;
@@ -1080,7 +1097,7 @@ export function useNarratorWS(
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
-							decision: data.decision as "allow" | "deny" | "aborted",
+							decision: data.decision as "allow" | "deny" | "aborted" | "failed",
 							reason: data.reason as string | undefined,
 						});
 						break;
@@ -1110,7 +1127,7 @@ export function useNarratorWS(
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
-							decision: data.decision as "allow" | "deny" | "aborted",
+							decision: data.decision as "allow" | "deny" | "aborted" | "failed",
 							reason: data.reason as string | undefined,
 							nextSteps: data.nextSteps as string | undefined,
 						});
@@ -1404,6 +1421,7 @@ export function useNarratorWS(
 								data.contextWindow as number | undefined,
 								data.isEstimated as boolean | undefined,
 								data.compactStart as number | undefined,
+								data.snapshot as import("@shared/context-usage").ContextUsageSnapshot | undefined,
 							);
 						}
 						break;
@@ -1761,6 +1779,8 @@ export function useNarratorWS(
 						break;
 					case "streaming_snapshot":
 						callbackOwner.callbacks.onStreamingSnapshot?.({
+							model: nonEmptyString(data.model) ?? undefined,
+							provider: nonEmptyString(data.provider) ?? undefined,
 							streamingBlocks: (data.streamingBlocks ?? []) as Array<
 								| {
 										type: "reasoning";

@@ -60,6 +60,8 @@ export interface RecentTabsSnapshotMessage {
 
 // Server → Client messages
 export type NarratorServerMessage =
+	| import("@shared/workspace-context").WorkspaceContextChangedEvent
+	| import("@shared/permission-policy-events").PermissionPolicyChangedEvent
 	| import("@shared/git-workspace-events").GitWorkspaceServerMessage
 	/** No narrator identifiers or payloads; clients re-fetch their ACL-filtered inbox. */
 	| { type: "human_attention_changed" }
@@ -130,7 +132,7 @@ export type NarratorServerMessage =
 			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
-			decision: "allow" | "deny" | "aborted";
+			decision: "allow" | "deny" | "aborted" | "failed";
 			reason?: string;
 	  }
 	| {
@@ -166,7 +168,7 @@ export type NarratorServerMessage =
 			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
-			decision: "allow" | "deny" | "aborted";
+			decision: "allow" | "deny" | "aborted" | "failed";
 			reason?: string;
 			nextSteps?: string;
 	  }
@@ -549,6 +551,8 @@ export type NarratorServerMessage =
 	| { type: "segment_compact_hide"; narratorId: string; hiddenMessageIds: string[] }
 	| {
 			type: "context_usage";
+			source?: import("@shared/context-usage").ContextUsageSource;
+			snapshot?: import("@shared/context-usage").ContextUsageSnapshot;
 			narratorId: string;
 			percentage: number;
 			isSubagent?: boolean;
@@ -893,8 +897,17 @@ export type NarratorServerMessage =
 			queueMessage?: string;
 	  }
 	| {
+			type: "streaming_identity";
+			narratorId: string;
+			model: string;
+			provider: string;
+			parentToolUseId?: string;
+	  }
+	| {
 			type: "streaming_snapshot";
 			narratorId: string;
+			model?: string;
+			provider?: string;
 			streamingBlocks: Array<
 				| { type: "reasoning"; id?: string; outputIndex?: number; text: string }
 				| {

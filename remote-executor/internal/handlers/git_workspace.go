@@ -410,7 +410,13 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 		return nil, fmt.Errorf("Git repository identity exceeds metadata budget")
 	}
 	if op == "probe" {
-		return map[string]any{"state": "ready", "rootPath": root, "repositoryPath": common}, nil
+		// HEAD only: keep discovery independent of the potentially large status scan.
+		branch, _, branchErr := g.run("symbolic-ref", "--quiet", "--short", "HEAD")
+		var label any
+		if branchErr == nil && !g.truncated {
+			label = strings.TrimSpace(branch)
+		}
+		return map[string]any{"state": "ready", "rootPath": root, "repositoryPath": common, "branch": label}, nil
 	}
 	if expected := stringParam(params, "expectedRoot"); expected == "" || !samePath(expected, root) {
 		return nil, fmt.Errorf("Git workspace changed; refresh before retrying")

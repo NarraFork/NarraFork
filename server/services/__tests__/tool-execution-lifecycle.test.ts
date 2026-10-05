@@ -30,6 +30,9 @@ function config(controller = new AbortController()): AgentConfig {
 		permissionHandler: async () => ({ behavior: "allow" }),
 		requireToolCallBinding: true,
 		onToolExecutionStarting: async (_id, receipt) => receipt,
+		// This observer-order fixture has no DB narrator; actual policy gates are
+		// covered by the real SQLite permission-rule/runtime tests.
+		onToolExecutionFinalAuthorization: async () => ({ assertStillCurrent() {} }),
 	};
 }
 

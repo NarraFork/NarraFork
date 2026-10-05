@@ -182,7 +182,12 @@ export const ARCHIVE_COLUMNS: Readonly<Record<ArchiveTable, readonly string[]>> 
 		"reasoning_effort",
 		"previous_permission_mode",
 		"plan_file_id",
+		"context_summary_chars",
+		"context_system_chars",
+		"context_tools_chars",
+		"context_char_revision",
 		"updated_at",
+		"context_project_id",
 	],
 	narrator_messages: [
 		"id",
@@ -211,6 +216,7 @@ export const ARCHIVE_COLUMNS: Readonly<Record<ArchiveTable, readonly string[]>> 
 		"meter_usage",
 		"meter_unit",
 		"commit_sha",
+		"context_chars_json",
 		"created_at",
 	],
 	narrator_message_refs: ["id", "narrator_id", "message_id", "seq", "is_compact"],
@@ -222,6 +228,8 @@ export const ARCHIVE_COLUMNS: Readonly<Record<ArchiveTable, readonly string[]>> 
 		"tool_name",
 		"input_json",
 		"output_json",
+		"input_chars",
+		"output_chars",
 		"execution_device_id",
 		"execution_cwd",
 		"resolved_file_path",
@@ -285,6 +293,41 @@ export const ARCHIVE_COLUMNS: Readonly<Record<ArchiveTable, readonly string[]>> 
 		"created_at",
 		"updated_at",
 	],
+};
+
+// Source-contained FK closure. Existing target rows may never supply missing archive evidence.
+export const ARCHIVE_INTERNAL_REFERENCES: Partial<
+	Record<ArchiveTable, Record<string, ArchiveTable>>
+> = {
+	exploration_groups: {
+		project_id: "projects",
+		base_chapter_id: "chapters",
+		decided_chapter_id: "chapters",
+	},
+	chapters: {
+		project_id: "projects",
+		parent_chapter_id: "chapters",
+		merged_into_chapter_id: "chapters",
+		review_source_chapter_id: "chapters",
+		exploration_group_id: "exploration_groups",
+	},
+	chapter_edges: { project_id: "projects", source_id: "chapters", target_id: "chapters" },
+	narrators: {
+		chapter_id: "chapters",
+		parent_narrator_id: "narrators",
+		fork_message_id: "narrator_messages",
+		context_project_id: "projects",
+	},
+	narrator_messages: { narrator_id: "narrators" },
+	narrator_message_refs: { narrator_id: "narrators", message_id: "narrator_messages" },
+	narrator_tool_calls: { narrator_id: "narrators", message_id: "narrator_messages" },
+	narrator_patches: { narrator_id: "narrators", message_id: "narrator_messages" },
+	chapter_commits: {
+		chapter_id: "chapters",
+		narrator_id: "narrators",
+		narrator_message_id: "narrator_messages",
+	},
+	merge_sessions: { target_chapter_id: "chapters", current_source_chapter_id: "chapters" },
 };
 
 const ARCHIVE_TABLE_SET: ReadonlySet<string> = new Set(ARCHIVE_TABLE_ORDER);
