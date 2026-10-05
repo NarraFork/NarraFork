@@ -6,14 +6,13 @@ import { StandalonePanelWindow } from "../../components/window/StandalonePanelWi
 
 export const Route = createFileRoute("/windows/panel")({
 	validateSearch: (search: Record<string, unknown>) => ({
-		d: typeof search.d === "string" ? search.d : undefined,
+		d: parsePanelWindowDescriptor(search.d),
 	}),
 	component: PanelWindowRoute,
 });
 
 function PanelWindowRoute() {
-	const { d } = Route.useSearch();
-	const descriptor = parsePanelWindowDescriptor(d);
+	const { d: descriptor } = Route.useSearch();
 	if (!descriptor) return <InvalidPanelWindow />;
 	return <StandalonePanelWindow descriptor={descriptor} />;
 }

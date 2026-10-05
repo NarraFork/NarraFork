@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { defaultParseSearch } from "@tanstack/react-router";
 import type { PluginUiSessionContext } from "../plugins/PluginUiSurfaceContext";
 import { type PluginDockPanelParams, parsePluginDockPanelParams } from "../plugins/protocol";
 import {
@@ -14,7 +15,14 @@ import {
 function roundtrip(descriptor: PanelWindowDescriptor): PanelWindowDescriptor | null {
 	const href = buildPanelWindowHref(descriptor);
 	const d = new URL(href, "https://example.test").searchParams.get("d");
-	return parsePanelWindowDescriptor(d ?? undefined);
+	const expected = parsePanelWindowDescriptor(d ?? undefined);
+	// The window route receives JSON-decoded values, not URLSearchParams strings.
+	const search = defaultParseSearch(new URL(href, "https://example.test").search) as Record<
+		string,
+		unknown
+	>;
+	expect(parsePanelWindowDescriptor(search.d)).toEqual(expected);
+	return expected;
 }
 
 describe("buildPanelWindowHref + parsePanelWindowDescriptor", () => {
@@ -138,6 +146,15 @@ describe("buildPanelWindowHref + parsePanelWindowDescriptor", () => {
 	test("parsePanelWindowDescriptor rejects garbage and oversized input", () => {
 		expect(parsePanelWindowDescriptor(undefined)).toBe(null);
 		expect(parsePanelWindowDescriptor("not json")).toBe(null);
+		for (const value of [null, 42, true, [], {}, { panelType: "chat" }]) {
+			expect(parsePanelWindowDescriptor(value)).toBeNull();
+		}
+		expect(
+			parsePanelWindowDescriptor({
+				panelType: "file",
+				filePath: "文".repeat(PANEL_WINDOW_DESCRIPTOR_MAX_BYTES),
+			}),
+		).toBeNull();
 		expect(parsePanelWindowDescriptor(`"${"x".repeat(PANEL_WINDOW_DESCRIPTOR_MAX_BYTES)}"`)).toBe(
 			null,
 		);

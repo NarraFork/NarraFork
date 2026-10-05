@@ -279,9 +279,12 @@ export function pluginPanelWindowHostContext(
 	}
 }
 
-/** Parse the `d` query param. Size-bound first so a hostile URL stays cheap to reject. */
-export function parsePanelWindowDescriptor(json: string | undefined): PanelWindowDescriptor | null {
+/** Accept raw query JSON or TanStack Router's automatically decoded object. */
+export function parsePanelWindowDescriptor(json: unknown): PanelWindowDescriptor | null {
+	if (isRecord(json)) return normalizePanelWindowDescriptor(json);
+	// Size-bound raw JSON before parsing so a hostile URL stays cheap to reject.
 	if (
+		typeof json !== "string" ||
 		!json ||
 		json.length > PANEL_WINDOW_DESCRIPTOR_MAX_BYTES ||
 		new TextEncoder().encode(json).byteLength > PANEL_WINDOW_DESCRIPTOR_MAX_BYTES
