@@ -1,11 +1,11 @@
 import { getContextComposition } from "@frontend/lib/api/context-composition";
-import { formatLocaleNumber } from "@frontend/lib/intl-format";
+import { formatCompactNumber } from "@frontend/lib/compact-number";
 import {
 	Box,
 	Button,
 	Group,
 	Loader,
-	Modal,
+	Menu,
 	SegmentedControl,
 	Stack,
 	Text,
@@ -18,7 +18,7 @@ import {
 	contextCharacterPercent,
 } from "@shared/context-composition";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 export const CONTEXT_COLORS: Record<ContextCategory, string> = {
@@ -33,14 +33,31 @@ export const CONTEXT_COLORS: Record<ContextCategory, string> = {
 	other: "gray",
 };
 
+export function contextTokenShare(
+	chars: number,
+	totalChars: number,
+	totalTokens?: number | null,
+): number | null {
+	if (totalTokens == null || !Number.isFinite(totalTokens) || totalTokens < 0) return null;
+	return (totalTokens * contextCharacterPercent(chars, totalChars)) / 100;
+}
+
+export function formatContextTokens(tokens?: number | null): string {
+	return tokens != null && Number.isFinite(tokens) && tokens >= 0
+		? formatCompactNumber(tokens).compact
+		: "—";
+}
+
 export function ContextCompositionView({
 	data,
+	totalTokens,
 	onLoadMore,
 	loadingMore,
 	mode: controlledMode,
 	onModeChange,
 }: {
 	data: ContextComposition;
+	totalTokens?: number | null;
 	onLoadMore?: () => void;
 	loadingMore?: boolean;
 	mode?: string;
@@ -49,7 +66,9 @@ export function ContextCompositionView({
 	const { t } = useTranslation("narrator");
 	const [localMode, setLocalMode] = useState("category");
 	const mode = controlledMode ?? localMode;
-	const [selected, setSelected] = useState<string | null>(null);
+	const [selected, setSelected] = useState<{ category: ContextCategory; chars: number } | null>(
+		null,
+	);
 	let offset = 0;
 	const segments = (mode === "category" ? data.totals : data.segments)
 		.filter((segment) => segment.chars > 0)
@@ -59,14 +78,14 @@ export function ContextCompositionView({
 			return { ...segment, key };
 		});
 	const describe = (category: ContextCategory, chars: number) =>
-		`${t(`contextComposition.categories.${category}`)} · ${formatLocaleNumber(chars)} ${t("contextComposition.characters")} · ${contextCharacterPercent(chars, data.totalChars).toFixed(1)}%`;
+		`${t(`contextComposition.categories.${category}`)} · ${formatContextTokens(contextTokenShare(chars, data.totalChars, totalTokens))} · ${contextCharacterPercent(chars, data.totalChars).toFixed(1)}%`;
 	const unloadedChars =
 		mode === "sequence" && data.nextCursor ? Math.max(0, data.totalChars - offset) : 0;
 	return (
 		<Stack gap="sm">
 			<Group justify="space-between">
-				<Text size="sm" fw={600}>
-					{formatLocaleNumber(data.totalChars)} {t("contextComposition.characters")}
+				<Text size="sm" fw={600} data-testid="context-composition-total">
+					~{formatContextTokens(totalTokens)}
 				</Text>
 				<SegmentedControl
 					value={mode}
@@ -95,7 +114,7 @@ export function ContextCompositionView({
 								component="button"
 								type="button"
 								aria-label={label}
-								onClick={() => setSelected(label)}
+								onClick={() => setSelected({ category: segment.category, chars: segment.chars })}
 								style={{
 									width: `${contextCharacterPercent(segment.chars, data.totalChars)}%`,
 									flexShrink: 0,
@@ -134,7 +153,7 @@ export function ContextCompositionView({
 			</Box>
 			{selected && (
 				<Text size="xs" role="status">
-					{selected}
+					{describe(selected.category, selected.chars)}
 				</Text>
 			)}
 			<Group gap="xs">
@@ -148,7 +167,7 @@ export function ContextCompositionView({
 							variant="light"
 							size="compact-xs"
 							color={CONTEXT_COLORS[category]}
-							onClick={() => setSelected(label)}
+							onClick={() => setSelected({ category, chars: item.chars })}
 						>
 							{label}
 						</Button>
@@ -164,14 +183,14 @@ export function ContextCompositionView({
 	);
 }
 
-export function ContextCompositionModal({
+export function ContextCompositionPanel({
 	opened,
-	onClose,
 	narratorId,
+	totalTokens,
 }: {
 	opened: boolean;
-	onClose: () => void;
 	narratorId: string;
+	totalTokens?: number | null;
 }) {
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
@@ -205,45 +224,77 @@ export function ContextCompositionModal({
 				}
 			: undefined;
 	return (
-		<Modal
-			opened={opened}
-			onClose={onClose}
-			title={t("contextComposition.title")}
-			size="xl"
-			centered
-		>
-			<Stack gap="sm">
-				<Group justify="flex-end">
-					{query.isFetching && <Loader size="xs" aria-label={t("contextComposition.loading")} />}
-					<Button
-						size="compact-xs"
-						variant="subtle"
-						disabled={query.isFetching}
-						onClick={() => void qc.resetQueries({ queryKey, exact: true })}
-					>
-						{t("contextComposition.refresh")}
+		<Stack gap="sm" data-testid="context-composition-panel">
+			<Group justify="space-between">
+				<Text size="sm" fw={600}>
+					{t("contextComposition.title")}
+				</Text>
+				{query.isFetching && <Loader size="xs" aria-label={t("contextComposition.loading")} />}
+				<Button
+					size="compact-xs"
+					variant="subtle"
+					data-testid="context-composition-refresh"
+					disabled={query.isFetching}
+					onClick={() => void qc.resetQueries({ queryKey, exact: true })}
+				>
+					{t("contextComposition.refresh")}
+				</Button>
+			</Group>
+			{query.isError && (
+				<Group gap="xs">
+					<Text size="sm" c="red">
+						{t("contextComposition.error")}
+					</Text>
+					<Button size="compact-xs" onClick={() => void query.refetch()}>
+						{t("contextComposition.retry")}
 					</Button>
 				</Group>
-				{query.isError && (
-					<Group gap="xs">
-						<Text size="sm" c="red">
-							{t("contextComposition.error")}
-						</Text>
-						<Button size="compact-xs" onClick={() => void query.refetch()}>
-							{t("contextComposition.retry")}
-						</Button>
-					</Group>
+			)}
+			{data && (
+				<ContextCompositionView
+					data={data}
+					totalTokens={totalTokens}
+					mode={mode}
+					onModeChange={setMode}
+					onLoadMore={() => void query.fetchNextPage()}
+					loadingMore={query.isFetchingNextPage}
+				/>
+			)}
+		</Stack>
+	);
+}
+
+export function ContextCompositionMenu({
+	narratorId,
+	totalTokens,
+	target,
+	children,
+}: {
+	narratorId: string;
+	totalTokens?: number | null;
+	target: ReactNode;
+	children?: ReactNode;
+}) {
+	const [opened, setOpened] = useState(false);
+	return (
+		<Menu position="top-start" width={420} opened={opened} onChange={setOpened}>
+			<Menu.Target>{target}</Menu.Target>
+			<Menu.Dropdown
+				data-testid="context-composition-menu"
+				style={{
+					maxWidth: "calc(100vw - 16px)",
+					maxHeight: "calc(100dvh - 24px)",
+					overflowY: "auto",
+				}}
+			>
+				{opened && (
+					<Box p="xs">
+						<ContextCompositionPanel opened narratorId={narratorId} totalTokens={totalTokens} />
+					</Box>
 				)}
-				{data && (
-					<ContextCompositionView
-						data={data}
-						mode={mode}
-						onModeChange={setMode}
-						onLoadMore={() => void query.fetchNextPage()}
-						loadingMore={query.isFetchingNextPage}
-					/>
-				)}
-			</Stack>
-		</Modal>
+				<Menu.Divider />
+				{children}
+			</Menu.Dropdown>
+		</Menu>
 	);
 }

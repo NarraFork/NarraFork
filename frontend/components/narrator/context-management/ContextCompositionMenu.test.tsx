@@ -42,8 +42,7 @@ mock.module("@mantine/core", () => ({
 	Text: element,
 	Loader: element,
 	Button: (props: Record<string, unknown>) => element({ ...props, component: "button" }),
-	Modal: ({ opened, children }: { opened: boolean; children: ReactNode }) =>
-		opened ? children : null,
+	Menu: Object.assign(element, { Target: element, Dropdown: element, Divider: element }),
 	Tooltip: ({ children }: { children: ReactNode }) => children,
 	SegmentedControl: ({
 		data,
@@ -69,9 +68,8 @@ mock.module("@mantine/core", () => ({
 			),
 		),
 }));
-const { ContextCompositionView, ContextCompositionModal } = await import(
-	"./ContextCompositionModal"
-);
+const { ContextCompositionView, ContextCompositionPanel, contextTokenShare, formatContextTokens } =
+	await import("./ContextCompositionMenu");
 let root: Root;
 let container: HTMLElement;
 const savedGlobals = new Map<string, PropertyDescriptor | undefined>();
@@ -119,7 +117,11 @@ afterEach(async () => {
 	savedGlobals.clear();
 });
 async function render(value = data, onLoadMore?: () => void) {
-	await act(() => root.render(createElement(ContextCompositionView, { data: value, onLoadMore })));
+	await act(() =>
+		root.render(
+			createElement(ContextCompositionView, { data: value, totalTokens: 160_000, onLoadMore }),
+		),
+	);
 }
 function bar() {
 	const node = container.querySelector('[data-testid="context-composition-bar"]');
@@ -131,7 +133,11 @@ test("比例只按字符数，分类合并且顺序保留", async () => {
 	await render();
 	expect(bar().querySelectorAll("button").length).toBe(2);
 	expect(bar().querySelector("button")?.getAttribute("style")).toContain("width:50%");
-	expect(container.textContent).toContain("400 contextComposition.characters");
+	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
+		"~160K",
+	);
+	expect(container.textContent).not.toContain("contextComposition.characters");
+	expect(container.textContent?.match(/~/g)?.length).toBe(1);
 	await act(() => {
 		(container.querySelector('[data-mode="sequence"]') as HTMLElement).click();
 	});
@@ -140,14 +146,15 @@ test("比例只按字符数，分类合并且顺序保留", async () => {
 	await act(() => {
 		(bar().querySelector("button") as HTMLElement).click();
 	});
-	expect(container.querySelector('[role="status"]')?.textContent).toContain(
-		"100 contextComposition.characters · 25.0%",
-	);
+	expect(container.querySelector('[role="status"]')?.textContent).toContain("40K · 25.0%");
 });
 test("旧数据0不会产生虚假区块或说明段落", async () => {
 	await render(emptyContextComposition());
 	expect(bar().querySelectorAll("button").length).toBe(0);
-	expect(container.textContent).toContain("0 contextComposition.characters");
+	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
+		"~160K",
+	);
+	expect(container.textContent).not.toContain("contextComposition.characters");
 	for (const word of [
 		"estimated",
 		"estimateHint",
@@ -176,7 +183,7 @@ test("分页不改变完整分类汇总和百分比分母", async () => {
 	expect(more.getAttribute("style")).toContain("width:75%");
 	await act(() => more.click());
 	expect(loads).toBe(1);
-	expect(container.textContent).toContain("contextComposition.categories.assistant · 200");
+	expect(container.textContent).toContain("contextComposition.categories.assistant · 80K");
 });
 test("工具定义作为独立分类", async () => {
 	const values = [
@@ -189,16 +196,15 @@ test("工具定义作为独立分类", async () => {
 		segments: values,
 		totals: groupContextSegments(values),
 	});
-	expect(container.textContent).toContain("contextComposition.categories.toolDefinition · 80");
+	expect(container.textContent).toContain("contextComposition.categories.toolDefinition · 128K");
 	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("80.0%");
 });
 test("跨世代分页不会混合展示旧新缓存", async () => {
 	query = { ...query, data: { pages: [data, { ...data, generation: "new" }] } };
 	await act(() =>
 		root.render(
-			createElement(ContextCompositionModal, {
+			createElement(ContextCompositionPanel, {
 				opened: true,
-				onClose: () => {},
 				narratorId: "test",
 			}),
 		),
@@ -210,9 +216,8 @@ test("加载失败只显示简短状态与重试", async () => {
 	query = { isFetching: false, isError: true, refetch: () => {} };
 	await act(() =>
 		root.render(
-			createElement(ContextCompositionModal, {
+			createElement(ContextCompositionPanel, {
 				opened: true,
-				onClose: () => {},
 				narratorId: "test",
 			}),
 		),
@@ -223,15 +228,61 @@ test("加载失败只显示简短状态与重试", async () => {
 });
 
 test("缓存换代后保留用户选择的顺序模式", async () => {
-	const props = { opened: true, onClose: () => {}, narratorId: "test" };
-	await act(() => root.render(createElement(ContextCompositionModal, props)));
+	const props = { opened: true, narratorId: "test" };
+	await act(() => root.render(createElement(ContextCompositionPanel, props)));
 	await act(() => {
 		(container.querySelector('[data-mode="sequence"]') as HTMLElement).click();
 	});
 	expect(bar().querySelectorAll("button").length).toBe(3);
 	query = { ...query, data: { pages: [data, { ...data, generation: "new" }] } };
-	await act(() => root.render(createElement(ContextCompositionModal, props)));
+	await act(() => root.render(createElement(ContextCompositionPanel, props)));
 	query = { ...query, data: { pages: [{ ...data, generation: "new" }] } };
-	await act(() => root.render(createElement(ContextCompositionModal, props)));
+	await act(() => root.render(createElement(ContextCompositionPanel, props)));
 	expect(bar().querySelectorAll("button").length).toBe(3);
+});
+
+test("用当前上游总量乘字符占比，并统一显示K/M/B", () => {
+	expect(contextTokenShare(100, 400, 425_814)).toBe(106453.5);
+	expect(formatContextTokens(contextTokenShare(100, 400, 425_814))).toBe("106.5K");
+	expect(formatContextTokens(1_600_000)).toBe("1.6M");
+	expect(formatContextTokens(2_500_000_000)).toBe("2.5B");
+	expect(formatContextTokens(12)).toBe("12");
+	expect(formatContextTokens(0)).toBe("0");
+	expect(contextTokenShare(0, 0, 1_000)).toBe(0);
+});
+test("没有上游token时只显示横杠，不回退显示字符数", async () => {
+	await act(() => root.render(createElement(ContextCompositionView, { data, totalTokens: null })));
+	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
+		"~—",
+	);
+	expect(container.textContent).not.toContain("contextComposition.characters");
+	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain(" · — · 50.0%");
+	for (const invalid of [undefined, null, Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+		expect(formatContextTokens(invalid)).toBe("—");
+		expect(contextTokenShare(100, 400, invalid)).toBeNull();
+	}
+});
+test("上游总token动态更新时，已选分类数字同步更新且只显示一个波浪号", async () => {
+	await render();
+	await act(() => {
+		(bar().querySelector("button") as HTMLElement).click();
+	});
+	expect(container.querySelector('[role="status"]')?.textContent).toContain("80K");
+	await act(() =>
+		root.render(createElement(ContextCompositionView, { data, totalTokens: 2_000_000 })),
+	);
+	expect(container.querySelector('[role="status"]')?.textContent).toContain("1M");
+	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
+		"~2M",
+	);
+	expect(container.textContent?.match(/~/g)?.length).toBe(1);
+	for (const word of [
+		"contextComposition.characters",
+		"估算",
+		"近似",
+		"不准确",
+		"estimated",
+		"approximate",
+	])
+		expect(container.textContent).not.toContain(word);
 });

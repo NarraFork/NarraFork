@@ -33,10 +33,10 @@ const data: ContextComposition = {
 	pending: false,
 };
 (chrome ? test : test.skip)(
-	"真实浏览器：中英桌面和手机布局、排序切换与键盘选择",
+	"真实浏览器：一次点开圆环即可查看，菜单内切换刷新不关闭且无独立弹窗",
 	async () => {
 		const build = await Bun.build({
-			entrypoints: [join(import.meta.dir, "ContextCompositionModal.browser-fixture.tsx")],
+			entrypoints: [join(import.meta.dir, "ContextCompositionMenu.browser-fixture.tsx")],
 			target: "browser",
 			minify: true,
 			define: { "process.env.NODE_ENV": '"production"' },
@@ -81,9 +81,17 @@ const data: ContextComposition = {
 			});
 			const page = await browser.newPage();
 			for (const language of ["zh-CN", "en"]) {
-				for (const width of [360, 1100]) {
-					await page.setViewport({ width, height: 800 });
+				for (const [width, height] of [
+					[360, 800],
+					[360, 480],
+					[1100, 800],
+				]) {
+					await page.setViewport({ width, height });
+					const before = requests;
 					await page.goto(`http://127.0.0.1:${server.port}/?lang=${language}`, { timeout: 15000 });
+					await page.waitForSelector('[data-testid="context-ring"]', { visible: true });
+					expect(requests).toBe(before);
+					await page.click('[data-testid="context-ring"]');
 					await page.waitForSelector('[data-testid="context-composition-bar"]', {
 						visible: true,
 						timeout: 5000,
@@ -92,7 +100,18 @@ const data: ContextComposition = {
 						const bar = document.querySelector('[data-testid="context-composition-bar"]');
 						if (!bar) throw new Error("Missing character bar");
 						const bounds = bar.getBoundingClientRect();
+						const popup = document
+							.querySelector('[data-testid="context-composition-menu"]')
+							?.getBoundingClientRect();
 						return {
+							noDialog: !document.querySelector('[role="dialog"]'),
+							popupContained: Boolean(
+								popup &&
+									popup.left >= 0 &&
+									popup.right <= innerWidth &&
+									popup.top >= 0 &&
+									popup.bottom <= innerHeight,
+							),
 							count: bar.querySelectorAll("button").length,
 							width: bounds.width,
 							contained: bounds.left >= 0 && bounds.right <= innerWidth,
@@ -102,6 +121,11 @@ const data: ContextComposition = {
 									0,
 								) / bounds.width,
 							noThreshold: !document.querySelector('[data-testid="context-composition-threshold"]'),
+							headerTokens: document.querySelector('[data-testid="context-composition-total"]')
+								?.textContent,
+							firstTokens: bar.querySelector("button")?.getAttribute("aria-label"),
+							oneWave: document.body.innerText.match(/~/g)?.length === 1,
+							noCharacters: !/(字符|characters)/i.test(document.body.innerText),
 							noDisclaimer: !/(估算|不完整|免责声明|estimated|incomplete|tokens)/i.test(
 								document.body.innerText,
 							),
@@ -110,9 +134,15 @@ const data: ContextComposition = {
 					expect(layout.count).toBe(3);
 					expect(layout.width).toBeGreaterThan(200);
 					expect(layout.contained).toBe(true);
+					expect(layout.noDialog).toBe(true);
+					expect(layout.popupContained).toBe(true);
 					expect(layout.filled).toBeCloseTo(1, 2);
 					expect(layout.noThreshold).toBe(true);
 					expect(layout.noDisclaimer).toBe(true);
+					expect(layout.noCharacters).toBe(true);
+					expect(layout.oneWave).toBe(true);
+					expect(layout.headerTokens).toBe("~400K");
+					expect(layout.firstTokens).toContain("100K · 25.0%");
 					const sequenceId = await page.$eval('input[value="sequence"]', (input) => input.id);
 					await page.click(`label[for="${sequenceId}"]`);
 					await page.waitForFunction(
@@ -123,9 +153,41 @@ const data: ContextComposition = {
 					await page.focus('[data-testid="context-composition-bar"] button');
 					await page.keyboard.press("Enter");
 					await page.waitForSelector('[role="status"]', { visible: true, timeout: 5000 });
+					await page.waitForSelector('[data-testid="context-composition-menu"]', { visible: true });
+					await page.waitForFunction(
+						() =>
+							!(
+								document.querySelector(
+									'[data-testid="context-composition-refresh"]',
+								) as HTMLButtonElement
+							)?.disabled,
+					);
+					await page.click('[data-testid="context-composition-refresh"]');
+					await page.waitForFunction(
+						() =>
+							document.querySelectorAll('[data-testid="context-composition-bar"] button').length ===
+							4,
+					);
+					expect(requests).toBe(before + 2);
+					await page.waitForSelector('[data-testid="context-composition-menu"]', { visible: true });
+					await page.keyboard.press("Escape");
+					await page.waitForSelector('[data-testid="context-composition-menu"]', { hidden: true });
+					await page.click('[data-testid="context-ring"]');
+					await page.waitForSelector('[data-testid="context-composition-bar"]', { visible: true });
+					await page.waitForFunction(
+						() =>
+							!(
+								document.querySelector(
+									'[data-testid="context-composition-refresh"]',
+								) as HTMLButtonElement
+							)?.disabled,
+					);
+					await page.click('[data-testid="compact-action"]');
+					await page.waitForSelector('[data-testid="context-composition-menu"]', { hidden: true });
+					expect(await page.evaluate(() => document.body.dataset.compactClicked)).toBe("yes");
 				}
 			}
-			expect(requests).toBe(4);
+			expect(requests).toBe(18);
 		} finally {
 			await browser?.close();
 			server.stop(true);
