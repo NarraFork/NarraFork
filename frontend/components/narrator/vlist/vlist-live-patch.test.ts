@@ -29,7 +29,12 @@ import {
 	applyStreamingToolStarted,
 	createStreamingToolStore,
 } from "./streaming-tool-chunks";
-import { toolCompletedPatch, toolExecutingPatch, toolStartedPatch } from "./vlist-live-events";
+import {
+	reflectionResolvedPatch,
+	toolCompletedPatch,
+	toolExecutingPatch,
+	toolStartedPatch,
+} from "./vlist-live-events";
 import {
 	composeLivePatches,
 	patchReflection,
@@ -620,6 +625,41 @@ describe("patchReflection", () => {
 			{ type: "plan_reflection", status: "running", requestId: "req-1" },
 		]);
 	});
+});
+
+describe("plan/task reflection system-failure live patches", () => {
+	for (const kind of ["plan_reflection", "task_reflection"] as const) {
+		it(`${kind} writes failed rather than cancelled on the row and enriched card block`, () => {
+			const messages = [
+				assistantWithTools("m1", [
+					{
+						toolUseId: "tu-1",
+						status: "pending",
+						permissionSuggestions: [{ type: kind, status: "running", requestId: "req-1" }],
+					},
+				]),
+			];
+			const result = reflectionResolvedPatch({
+				kind,
+				toolUseId: "tu-1",
+				requestId: "req-1",
+				decision: "failed",
+				reason: "Provider failed before a decision",
+			})(messages);
+			expect(result.changed).toBe(true);
+			for (const card of [result.messages[0]?.toolCalls[0], findBlock(result.messages, "tu-1")]) {
+				expect(card?.status).toBe("fail");
+				expect(card?.permissionSuggestions).toEqual([
+					{
+						type: kind,
+						status: "failed",
+						requestId: "req-1",
+						reason: "Provider failed before a decision",
+					},
+				]);
+			}
+		});
+	}
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -44,7 +44,7 @@ export type ReflectionKind =
 	| "question_reflection";
 
 /** A reflection decision as delivered by `*_reflection_resolved`. */
-export type ReflectionDecision = "allow" | "deny" | "aborted" | (string & {});
+export type ReflectionDecision = "allow" | "deny" | "aborted" | "failed" | (string & {});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool lifecycle
@@ -408,7 +408,8 @@ export function reflectionStoppedPatch(opts: {
 export function reflectionResolvedStatus(
 	kind: ReflectionKind,
 	decision: ReflectionDecision,
-): "confirmed" | "aborted" | "cancelled" | "awaiting_user" {
+): "confirmed" | "aborted" | "cancelled" | "awaiting_user" | "failed" {
+	if (decision === "failed") return "failed";
 	if (decision === "allow") return "confirmed";
 	if (decision === "aborted") return kind === "question_reflection" ? "awaiting_user" : "aborted";
 	return "cancelled";

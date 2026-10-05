@@ -40,7 +40,12 @@ import {
 	shouldRunExitPlanModeReflection,
 	shouldRunExitPlanModeReflectionLive,
 } from "../loop";
-import { classifyToolUpdateExecution, executeTool, preAdmitToolExecution } from "../tool-executor";
+import {
+	classifyToolUpdateExecution,
+	executeTool,
+	getReflectionToolRejection,
+	preAdmitToolExecution,
+} from "../tool-executor";
 import { toolRegistry } from "../tool-registry";
 import { askUserQuestionTool } from "../tools/ask-user-question";
 import { browserTool } from "../tools/browser";
@@ -125,6 +130,119 @@ function stubAdmissionPersistence(records: Array<Record<string, unknown>>): void
 		return input as never;
 	}) as typeof toolContinuationService.upsert;
 }
+
+describe("reflection tool early rejection", () => {
+	for (const locale of ["en", "zh-CN"] as const) {
+		for (const name of ["Edit", "__UnknownReflectionTool"]) {
+			test(`${locale}: rejects ${name} before binding, authorization, or side effects`, async () => {
+				const permissionHandler = mock(async () => ({ behavior: "allow" as const }));
+				const config = makeConfig(permissionHandler);
+				config.toolExecutionBindings = undefined;
+				config.locale = locale;
+				config.reflectionLoop = {
+					allowedTools: ["ExitPlanRevise", "ExitPlanConfirm"],
+					context: { kind: "exitPlanMode" },
+				};
+				const authorization = mock(async () => {
+					throw new Error("authorization must not run");
+				});
+				const workspaceCheck = mock(() => {
+					throw new Error("workspace must not be touched");
+				});
+				const execute = mock(async () => ({ output: "unexpected side effect" }));
+				config.runtimeAuthorizationGuard = authorization;
+				config.assertWorkspaceCurrent = workspaceCheck;
+				if (name === "Edit") {
+					toolRegistry.register({
+						name: TEST_TOOL_NAME,
+						description: "Side effect sentinel",
+						parameters: z.object({}),
+						execute,
+					});
+					const originalGet = toolRegistry.get.bind(toolRegistry);
+					const registryGet = mock((toolName: string) =>
+						toolName === "Edit" ? originalGet(TEST_TOOL_NAME) : originalGet(toolName),
+					);
+					const originalMethod = toolRegistry.get;
+					toolRegistry.get = registryGet;
+					try {
+						const result = await executeTool({ toolUseId: "wrong-edit", name, input: {} }, config);
+						expect(result.isError).toBe(true);
+						expect(result.durationMs).toBe(0);
+						expect(registryGet).not.toHaveBeenCalled();
+					} finally {
+						toolRegistry.get = originalMethod;
+					}
+				}
+				// A spec-path error must not hide the reflection decision guidance either.
+				const result = await executeTool(
+					{ toolUseId: "wrong-tool", name, input: { file_path: "spec://tasks.json" } },
+					config,
+				);
+				expect(result.isError).toBe(true);
+				expect(result.durationMs).toBe(0);
+				expect(result.output).toContain("ExitPlanRevise, ExitPlanConfirm");
+				expect(result.output).not.toContain("durable receipt");
+				if (locale === "zh-CN") {
+					expect(result.output).toContain("没有执行");
+					expect(result.output).toContain("不得直接编辑文件或执行原操作");
+					expect(result.output).toContain("反馈返回主会话");
+				} else {
+					expect(result.output).toContain("was not executed");
+					expect(result.output).toContain(
+						"Do not edit files directly or execute the original operation",
+					);
+					expect(result.output).toContain("return feedback to the main session");
+				}
+				expect(permissionHandler).not.toHaveBeenCalled();
+				expect(authorization).not.toHaveBeenCalled();
+				expect(workspaceCheck).not.toHaveBeenCalled();
+				expect(execute).not.toHaveBeenCalled();
+			});
+		}
+	}
+
+	test("releases a supplied start grant when rejecting a reflection tool", async () => {
+		const config = makeConfig(async () => ({ behavior: "allow" }));
+		const toolUse = { toolUseId: "reflection-grant", name: "Edit", input: {} };
+		const state = await preAdmitToolExecution(toolUse, config);
+		expect(state.startGrant).toBeDefined();
+		config.reflectionLoop = {
+			allowedTools: ["ExitPlanRevise"],
+			context: { kind: "exitPlanMode" },
+		};
+		const result = await executeTool(toolUse, config, { admissionState: state });
+		expect(result.isError).toBe(true);
+		expect(state.startGrant).toBeUndefined();
+		await waitForOrdinaryToolDrain();
+	});
+
+	test("does not reject ordinary calls or allowed decisions", () => {
+		const config = makeConfig(async () => ({ behavior: "allow" }));
+		const toolUse = { toolUseId: "decision", name: "DangerConfirm", input: {} };
+		expect(getReflectionToolRejection(toolUse, config)).toBeUndefined();
+		config.reflectionLoop = {
+			allowedTools: ["DangerConfirm"],
+			context: { kind: "danger" },
+		};
+		expect(getReflectionToolRejection(toolUse, config)).toBeUndefined();
+	});
+
+	test("reflection-only decisions remain unavailable in the main session", async () => {
+		toolRegistry.register(dangerConfirmTool);
+		try {
+			const config = makeConfig(async () => ({ behavior: "allow" }));
+			const result = await executeTool(
+				{ toolUseId: "main-confirm", name: dangerConfirmTool.name, input: { confirm: true } },
+				config,
+			);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("not allowed in the current reflection context");
+		} finally {
+			toolRegistry.unregister(dangerConfirmTool.name);
+		}
+	});
+});
 
 describe("executeTool trusted runtime policy", () => {
 	test("passes the exact server policy to ToolContext and cannot be overwritten by tool input", async () => {

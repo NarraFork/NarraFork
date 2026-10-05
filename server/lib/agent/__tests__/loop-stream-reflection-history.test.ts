@@ -253,7 +253,9 @@ function expectCancelled(events: AgentEvent[]) {
 	expect(reflectionHistories).toHaveLength(1);
 	expect(cancellations).toHaveLength(1);
 	expect(cancellations[0]?.requestId).toBe(REQUEST_ID);
-	expect(cancellations[0]?.reason).toContain(FAILURE);
+	expect(cancellations[0]?.reason).toContain("model service request failed");
+	expect(cancellations[0]?.reason).toContain("not authorized to execute");
+	expect(cancellations[0]?.reason).not.toContain("DangerConfirm");
 	expect(pendingDangerReflections.size).toBe(0);
 	expect(executed).not.toContain("fake danger");
 	expect(events.filter((event) => event.type === "error")).toEqual([]);

@@ -677,11 +677,34 @@ async function getPipelineCaptureText(
 	}
 }
 
+export function getReflectionToolRejection(
+	tu: AgentToolUse,
+	config: AgentConfig,
+): ToolExecResult | undefined {
+	if (!config.reflectionLoop || config.reflectionLoop.allowedTools.includes(tu.name)) {
+		return undefined;
+	}
+	const allowedTools = config.reflectionLoop.allowedTools.join(", ") || "(none / 无)";
+	return {
+		output:
+			config.locale === "zh-CN"
+				? `工具 ${tu.name} 没有执行。当前反思环节只能调用以下工具：${allowedTools}。不得直接编辑文件或执行原操作；请通过当前决策工具把反馈返回主会话，由主会话处理修订。`
+				: `Tool ${tu.name} was not executed. This reflection context only allows these tools: ${allowedTools}. Do not edit files directly or execute the original operation; use a current decision tool to return feedback to the main session for revision.`,
+		isError: true,
+		durationMs: 0,
+	};
+}
+
 export async function executeTool(
 	tu: AgentToolUse,
 	config: AgentConfig,
 	options: ExecuteToolOptions = {},
 ): Promise<ToolExecResult> {
+	const reflectionRejection = getReflectionToolRejection(tu, config);
+	if (reflectionRejection) {
+		if (options.admissionState) releaseToolAdmissionState(options.admissionState);
+		return reflectionRejection;
+	}
 	const specError = toolSpecPathError(tu.name, tu.input);
 	if (specError) {
 		if (options.admissionState) releaseToolAdmissionState(options.admissionState);
