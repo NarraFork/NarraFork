@@ -3191,8 +3191,18 @@ narratorRoutes.patch("/:id/buffer/:mid/mode", async (c) => {
 	const { withNarratorStartAdmission } = await import("../services/narrator-session-state");
 	const narrator = await narratorService.getById(id);
 	let shouldWake = false;
+	let awaitDelivery = false;
 	await withNarratorStartAdmission(id, async () => {
 		if (!(await updateBufferedMessageMode(id, mid, parsed.data.mode))) {
+			if (parsed.data.mode === "interrupt") {
+				const { readBufferedMessageDeliveryReceipt } = await import("../services/narrator-buffer");
+				const receipt = await readBufferedMessageDeliveryReceipt(id, mid);
+				if (receipt?.state === "claimed" || receipt?.state === "materialized") {
+					// Retry/a concurrent request already owns this delivery. Never abort its new owner.
+					awaitDelivery = true;
+					return;
+				}
+			}
 			throw new AppError("Buffered message was claimed or is no longer pending", 409, "CONFLICT");
 		}
 		shouldWake = await applyPendingBufferModeControl(
@@ -3201,14 +3211,24 @@ narratorRoutes.patch("/:id/buffer/:mid/mode", async (c) => {
 			parsed.data.mode,
 			isSubagentVariant(narrator.variant),
 		);
+		awaitDelivery = shouldWake && parsed.data.mode === "interrupt";
 	});
-	if (shouldWake) {
-		// Admission must be released before waking; existing owners retain delivery responsibility.
-		const { wakeInboxIfEligible } = await import("../services/agent-runtime/inbox");
-		await wakeInboxIfEligible(id);
+	try {
+		if (awaitDelivery) {
+			const { waitForBufferedMessageDelivery } = await import("../services/narrator-buffer");
+			const delivered = await waitForBufferedMessageDelivery(id, mid, { signal: c.req.raw.signal });
+			return c.json({ ok: true, ...delivered });
+		}
+		if (shouldWake) {
+			// Admission must be released before waking; existing owners retain delivery responsibility.
+			const { wakeInboxIfEligible } = await import("../services/agent-runtime/inbox");
+			await wakeInboxIfEligible(id);
+		}
+		return c.json({ ok: true });
+	} finally {
+		// Timeout/error is not rollback: publish the retained durable mode and payload too.
+		await broadcastBufferQueue(id);
 	}
-	await broadcastBufferQueue(id);
-	return c.json({ ok: true });
 });
 
 // Explicit retry retains the stable mailbox/recipient identity and resets failed attempts.
@@ -3217,6 +3237,7 @@ narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 	const mid = c.req.param("mid");
 	const { withNarratorStartAdmission } = await import("../services/narrator-session-state");
 	const narrator = await narratorService.getById(id);
+	let urgentRetry = false;
 	await withNarratorStartAdmission(id, async () => {
 		// Retain mode before the transition: the recovered row may be claimed immediately.
 		const previous = (await getBufferedMessagesAsync(id)).find((message) => message.id === mid);
@@ -3229,6 +3250,19 @@ narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 			);
 		}
 		if (!retried) throw new ValidationError("Only a failed user message can be retried");
+		urgentRetry = resolveBufferQueueMode(previous?.queueMode, previous?.priority) === "interrupt";
+		if (urgentRetry && !(await updateBufferedMessageMode(id, mid, "interrupt"))) {
+			const { readBufferedMessageDeliveryReceipt } = await import("../services/narrator-buffer");
+			const receipt = await readBufferedMessageDeliveryReceipt(id, mid);
+			if (receipt?.state === "claimed" || receipt?.state === "materialized") {
+				// Another consumer already owns the restored input; confirm it outside
+				// admission without aborting that consumer's fresh execution owner.
+				return;
+			}
+			throw new AppError("Retried urgent input is no longer pending", 409, "CONFLICT");
+		}
+		// Promotion and cancellation share admission: no later urgent row can be
+		// dispatched ahead of the selected retry before its control signal lands.
 		// A control failure must not roll back or repeat this committed durable transition.
 		await applyPendingBufferModeControl(
 			id,
@@ -3237,10 +3271,18 @@ narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 			isSubagentVariant(narrator.variant),
 		);
 	});
-	const { wakeInboxIfEligible } = await import("../services/agent-runtime/inbox");
-	const resumed = await wakeInboxIfEligible(id);
-	await broadcastBufferQueue(id);
-	return c.json({ ok: true, resumed });
+	try {
+		if (urgentRetry) {
+			const { waitForBufferedMessageDelivery } = await import("../services/narrator-buffer");
+			const delivered = await waitForBufferedMessageDelivery(id, mid, { signal: c.req.raw.signal });
+			return c.json({ ok: true, resumed: true, ...delivered });
+		}
+		const { wakeInboxIfEligible } = await import("../services/agent-runtime/inbox");
+		const resumed = await wakeInboxIfEligible(id);
+		return c.json({ ok: true, resumed });
+	} finally {
+		await broadcastBufferQueue(id);
+	}
 });
 
 // Remove a single queued buffered message

@@ -60,6 +60,14 @@ import type {
 
 export type RuntimeQueueBackendId = "sqlite" | "postgres";
 
+/** Indexed receipt polling must never load a buffered payload or attachment metadata. */
+export interface RuntimeBufferedDeliveryReceipt {
+	id: string;
+	state: string;
+	recipientMessageId: string | null;
+	lastError: string | null;
+}
+
 /**
  * The dialect-neutral mailbox row. Free-form and enum columns are typed `string`:
  * the SQLite schema narrows them to enum unions while the PG schema leaves them wide,

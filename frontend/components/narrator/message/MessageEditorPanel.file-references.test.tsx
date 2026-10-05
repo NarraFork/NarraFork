@@ -6,11 +6,12 @@ import type { FileReference } from "@shared/file-reference";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
-import { act, type ComponentProps, type ReactNode } from "react";
+import { act, type ComponentProps, type ReactNode, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
-import { api } from "../../../lib/api";
+import { api, type BufferMessageSummary } from "../../../lib/api";
 import en from "../../../locales/en/narrator.json";
+import zh from "../../../locales/zh-CN/narrator.json";
 import { ImageViewerContext } from "../../common/image-viewer-context";
 import { QueuedAttachmentPreview, QueuedMessageRow } from "../interaction/QueuedMessageRow";
 import {
@@ -18,6 +19,10 @@ import {
 	type QueuedMessagesPanelProps,
 } from "../interaction/QueuedMessagesPanel";
 import type { QueuedEditPayload } from "../interaction/queued-attachment-edit";
+import {
+	type UseQueuedMessageActionsOptions,
+	useQueuedMessageActions,
+} from "../interaction/use-queued-message-actions";
 import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
 import { MessageEditorPanel, type MessageEditorPanelProps } from "./MessageEditorPanel";
 
@@ -181,9 +186,10 @@ beforeEach(async () => {
 			lng: "en",
 			fallbackLng: "en",
 			defaultNS: "narrator",
-			resources: { en: { narrator: en } },
+			resources: { en: { narrator: en }, "zh-CN": { narrator: zh } },
 			react: { useSuspense: false },
 		});
+	await i18n.changeLanguage("en");
 	qc = new QueryClient({
 		defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: Infinity } },
 	});
@@ -741,7 +747,7 @@ describe("inline queued message mode actions", () => {
 	});
 
 	test("urgent is one-way and simultaneous clicks cannot submit twice", async () => {
-		const pending = Promise.withResolvers<void>();
+		const pending = Promise.withResolvers<boolean>();
 		const change = mock((_id: string, _mode: "turn" | "tool" | "interrupt") => pending.promise);
 		await render(queueRow({ msg: queued, onChangeMode: change }));
 		const urgent = button(en.queuedSendUrgently);
@@ -756,7 +762,7 @@ describe("inline queued message mode actions", () => {
 		expect(urgent.disabled).toBe(true);
 		expect(toggle.disabled).toBe(true);
 		await act(async () => {
-			pending.resolve();
+			pending.resolve(true);
 			await flush();
 		});
 		expect(button(en.queuedUrgentRequested).disabled).toBe(true);
@@ -768,9 +774,11 @@ describe("inline queued message mode actions", () => {
 	test("already urgent rows have no switch-back action", async () => {
 		const change = mock(async (_id: string, _mode: "turn" | "tool" | "interrupt") => {});
 		await render(queueRow({ msg: { ...queued, queueMode: "interrupt" }, onChangeMode: change }));
-		expect(button(en.queuedUrgentRequested).disabled).toBe(true);
+		expect(button(en.queuedUrgentRetry).disabled).toBe(false);
+		expect(document.body.textContent).toContain(en.queuedUrgentUndelivered);
 		expect(document.querySelector(`button[aria-label="${en.queuedSwitchToNextStep}"]`)).toBeNull();
-		expect(change).not.toHaveBeenCalled();
+		await click(button(en.queuedUrgentRetry));
+		expect(change).toHaveBeenCalledWith(queued.id, "interrupt");
 	});
 
 	test("an unsuccessful urgent request releases buttons and retains content", async () => {
@@ -1005,6 +1013,131 @@ function queuePanel(overrides: Partial<QueuedMessagesPanelProps> = {}) {
 	);
 }
 
+describe("urgent dispatch real hook and panel", () => {
+	for (const [language, strings] of [
+		["en", en],
+		["zh-CN", zh],
+	] as const) {
+		test(`${language}: sending leaves ordinary counts, ACK removes, timeout retains all attachments for retry`, async () => {
+			await i18n.changeLanguage(language);
+			const storage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+			Object.defineProperty(globalThis, "localStorage", {
+				configurable: true,
+				value: { getItem: () => null },
+			});
+			spyOn(globalThis, "fetch").mockImplementation(
+				Object.assign(async () => new Response(new Blob(["image bytes"], { type: "image/png" })), {
+					preconnect: globalThis.fetch.preconnect,
+				}),
+			);
+			const receipt = Promise.withResolvers<{ ok: true; delivered?: boolean }>();
+			const mode = spyOn(api, "setBufferedMessageMode").mockReturnValue(receipt.promise);
+			const message = {
+				id: "urgent",
+				text: "Urgent payload",
+				bufferedAt: "now",
+				imageCount: 2,
+				creator: { id: "peer", username: "peer" },
+				fileReferences: [reference],
+				images: [
+					{
+						imageId: "one",
+						filename: "one.png",
+						uploadNarratorId: "owner",
+						mediaType: "image/png",
+					},
+					{
+						imageId: "two",
+						filename: "two.png",
+						uploadNarratorId: "owner",
+						mediaType: "image/png",
+					},
+				],
+				textFiles: [{ index: 0, filename: "notes.txt", size: 10 }],
+			};
+			let setSnapshot: UseQueuedMessageActionsOptions["setQueuedMessages"] = () => {};
+			function View() {
+				const [messages, setMessages] = useState<BufferMessageSummary[]>([
+					message,
+					...["ordinary-a", "ordinary-b"].map((id) => ({
+						id,
+						text: id,
+						imageCount: 0,
+						bufferedAt: "now",
+					})),
+				]);
+				setSnapshot = setMessages;
+				const actions = useQueuedMessageActions({
+					narratorId: "queue-owner",
+					queuedMessages: messages,
+					setQueuedMessages: setMessages,
+					reconcileBufferedMessages: () => {},
+					cancelBuffer: () => {},
+					composerRef: { current: null },
+					handleSendRef: { current: () => {} },
+					handleSendWithModeRef: { current: () => {} },
+					ctrlEnterQueueModeRef: { current: "tool" },
+					t: (key) => i18n.t(key),
+				});
+				return queuePanel({
+					narratorId: "queue-owner",
+					...actions,
+					queuedMessages: actions.visibleQueuedMessages,
+				});
+			}
+			try {
+				await render(<View />);
+				await click(button(strings.queuedSendUrgently));
+				const urgent = host?.querySelector("[data-urgent-dispatches]");
+				expect(urgent?.textContent).toContain(strings.queuedUrgentSending);
+				expect(urgent?.textContent).toContain("peer");
+				expect(urgent?.textContent).toContain("notes.txt");
+				expect(urgent?.textContent).toContain("#file:a.ts:2-2");
+				expect(urgent?.querySelectorAll("[data-queue-image]")).toHaveLength(2);
+				for (const image of ["one.png", "two.png"])
+					expect(urgent?.querySelector(`img[alt="${image}"]`)).not.toBeNull();
+				for (const action of Array.from(urgent?.querySelectorAll("button") ?? []).filter(
+					(node) => node.getAttribute("aria-label") !== strings.queuedExpandText,
+				))
+					expect(action.disabled).toBe(true);
+				expect(host?.querySelector("[data-queue-summary]")?.textContent).toContain(
+					i18n.t("queuedCount", { count: 2 }),
+				);
+				expect(host?.querySelector("[data-queue-summary]")?.textContent).not.toContain(
+					strings.queueMode_interrupt,
+				);
+				await act(async () => {
+					receipt.reject(new Error("Timeout"));
+					await flush();
+				});
+				expect(host?.querySelector("[data-urgent-dispatches]")?.textContent).toContain(
+					strings.queuedUrgentUndelivered,
+				);
+				expect(host?.querySelector("[data-urgent-dispatches]")?.textContent).toContain("Timeout");
+				expect(button(strings.queuedUrgentRetry).disabled).toBe(false);
+				// Legacy ok is not a delivery receipt.
+				mode.mockResolvedValueOnce({ ok: true });
+				await click(button(strings.queuedUrgentRetry));
+				expect(host?.querySelector("[data-urgent-dispatches]")?.textContent).toContain(
+					strings.queuedUrgentUnconfirmed,
+				);
+				expect(host?.querySelectorAll("[data-queue-image]")).toHaveLength(2);
+				mode.mockResolvedValueOnce({ ok: true, delivered: true });
+				await click(button(strings.queuedUrgentRetry));
+				expect(host?.querySelector("[data-urgent-dispatches]")).toBeNull();
+				expect(host?.textContent).not.toContain(message.text);
+				await act(async () => {
+					setSnapshot((previous) => [message, ...previous]);
+				});
+				expect(host?.textContent).not.toContain(message.text);
+			} finally {
+				if (storage) Object.defineProperty(globalThis, "localStorage", storage);
+				else Reflect.deleteProperty(globalThis, "localStorage");
+			}
+		});
+	}
+});
+
 describe("real queued panel composition", () => {
 	for (const change of [
 		"cancel head",
@@ -1175,7 +1308,10 @@ describe("real queued panel composition", () => {
 			await render(queuePanel({ queuedMessages: [msg] }));
 			const body = host?.querySelector(`[data-queue-mode="${mode}"]`);
 			expect(body?.getAttribute("style")).toContain(`var(--mantine-color-${color})`);
-			expect(host?.textContent).toContain(en[`queueMode_${mode}`]);
+			expect(host?.textContent).toContain(
+				mode === "interrupt" ? en.queuedUrgentUndelivered : en[`queueMode_${mode}`],
+			);
+			if (mode === "interrupt") expect(host?.textContent).not.toContain(en.queueMode_interrupt);
 			await render(queueRow({ msg, isEditing: true }));
 			expect(host?.querySelector("[data-queue-drag-handle]") !== null).toBe(mode === "turn");
 		}
@@ -1194,20 +1330,29 @@ describe("real queued panel composition", () => {
 			}),
 		);
 		const content = host?.textContent ?? "";
-		for (let index = 0; index < modes.length - 1; index++) {
-			expect(content.indexOf(`FIFO message ${index}`)).toBeLessThan(
-				content.indexOf(`FIFO message ${index + 1}`),
+		// Urgent messages are outside the ordinary queue. Remaining guidance keeps FIFO.
+		for (const [before, after] of [
+			[0, 2],
+			[2, 3],
+			[3, 4],
+		]) {
+			expect(content.indexOf(`FIFO message ${before}`)).toBeLessThan(
+				content.indexOf(`FIFO message ${after}`),
 			);
 		}
-		// Summary has aggregate counts, list headings represent four consecutive segments.
+		expect(host?.querySelector("[data-urgent-dispatches]")?.textContent).toContain(
+			"FIFO message 1",
+		);
+		expect(host?.querySelector("[data-queue-summary]")?.textContent).not.toContain(
+			en.queueMode_interrupt,
+		);
+		// Counts and headings contain only turn/tool modes.
 		const headings = Array.from(host?.querySelectorAll("p") ?? []).filter((node) =>
 			[en.queueMode_tool, en.queueMode_interrupt, en.queueMode_turn].includes(
 				node.textContent ?? "",
 			),
 		);
 		expect(headings.map((node) => node.textContent)).toEqual([
-			en.queueMode_tool,
-			en.queueMode_interrupt,
 			en.queueMode_tool,
 			en.queueMode_turn,
 		]);

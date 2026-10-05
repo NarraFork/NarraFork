@@ -25,6 +25,7 @@ import {
 	copyFileReference,
 	freezeFileReferenceSnapshots,
 } from "../lib/agent/file-reference-projection";
+import { AppError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
@@ -34,6 +35,7 @@ import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxRow } from "./agent-runtime/mailbox-types";
 import {
 	getRuntimeQueuePort,
+	type RuntimeBufferedDeliveryReceipt,
 	type RuntimeMailboxRow,
 	type RuntimeMailboxStagingLookup,
 	type RuntimeQueuePort,
@@ -630,7 +632,7 @@ export async function enqueueBufferedMessage(
 		}
 		let fileReferencesJson = refs.length ? JSON.stringify(refs) : null;
 		const metadata: StagingMetadata = { stagingId, executionIntent, queueMode };
-		if (queueMode) frontOrder = "fifo";
+		if (queueMode) frontOrder = queueMode === "interrupt" ? "stack" : "fifo";
 		if (commandText && Buffer.byteLength(commandText) > MAILBOX_LIMITS.metadataBytes / 8) {
 			metadata.commandTextPath = await writeStagingText(stagingId, "command", commandText);
 			commandText = null;
@@ -952,6 +954,114 @@ export async function removeBufferedMessage(
 	cleanupBufferedTextFiles(id);
 	return true;
 }
+export const BUFFER_INTERRUPT_DELIVERY_TIMEOUT_MS = 5_000;
+
+export async function readBufferedMessageDeliveryReceipt(
+	narratorId: string,
+	messageId: string,
+): Promise<RuntimeBufferedDeliveryReceipt | undefined> {
+	const port = pgQueue();
+	if (port) return port.mailbox.readUserBufferedDeliveryReceipt(narratorId, messageId);
+	return db
+		.select({
+			id: mailbox.id,
+			state: mailbox.state,
+			recipientMessageId: mailbox.recipientMessageId,
+			lastError: mailbox.lastError,
+		})
+		.from(mailbox)
+		.where(
+			and(
+				eq(mailbox.id, messageId),
+				eq(mailbox.narratorId, narratorId),
+				eq(mailbox.kind, "user_input"),
+			),
+		)
+		.limit(1)
+		.get();
+}
+
+/** Wait OUTSIDE mutation admission. A busy wake is not a delivery acknowledgement. */
+export async function waitForBufferedMessageDelivery(
+	narratorId: string,
+	messageId: string,
+	options: {
+		signal?: AbortSignal;
+		timeoutMs?: number;
+		wake?: () => Promise<boolean>;
+	} = {},
+): Promise<{ delivered: true; messageId: string }> {
+	const startedAt = Date.now();
+	const timeoutMs = options.timeoutMs ?? BUFFER_INTERRUPT_DELIVERY_TIMEOUT_MS;
+	const timeout = new AbortController();
+	const timer = setTimeout(() => timeout.abort(), timeoutMs);
+	const signal = options.signal
+		? AbortSignal.any([options.signal, timeout.signal])
+		: timeout.signal;
+	const cancellation = () =>
+		options.signal?.aborted
+			? new AppError(
+					"Interrupted input delivery wait cancelled; durable input retained",
+					499,
+					"BUFFER_DELIVERY_CANCELLED",
+				)
+			: new AppError(
+					"Interrupted input has not been delivered within the deadline; durable input retained",
+					504,
+					"BUFFER_DELIVERY_TIMEOUT",
+				);
+	async function bounded<T>(operation: Promise<T>): Promise<T> {
+		if (signal.aborted) throw cancellation();
+		return new Promise<T>((resolve, reject) => {
+			const abort = () => reject(cancellation());
+			signal.addEventListener("abort", abort, { once: true });
+			operation.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+		});
+	}
+	try {
+		const wake =
+			options.wake ??
+			(async () => {
+				const { wakeInboxIfEligible } = await import("./agent-runtime/inbox");
+				return wakeInboxIfEligible(narratorId);
+			});
+		while (true) {
+			if (signal.aborted) throw cancellation();
+			const receipt = await bounded(readBufferedMessageDeliveryReceipt(narratorId, messageId));
+			if (!receipt)
+				throw new AppError("Buffered input no longer exists", 409, "BUFFER_DELIVERY_MISSING");
+			if (receipt.state === "materialized" && receipt.recipientMessageId) {
+				return { delivered: true, messageId: receipt.recipientMessageId };
+			}
+			if (receipt.state === "failed") {
+				throw new AppError(
+					"Interrupted input delivery failed; explicit retry required",
+					409,
+					"BUFFER_DELIVERY_FAILED",
+				);
+			}
+			if (receipt.state === "cancelled") {
+				throw new AppError("Buffered input was cancelled", 409, "BUFFER_DELIVERY_CANCELLED");
+			}
+			// Never cancel again: a newer owner may already be consuming this exact input.
+			await bounded(wake());
+			await bounded(new Promise<void>((resolve) => setTimeout(resolve, 25)));
+		}
+	} catch (error) {
+		if (error instanceof AppError && error.code === "BUFFER_DELIVERY_TIMEOUT") {
+			logger.warn("Urgent buffered input delivery confirmation timed out; retained for retry", {
+				narratorId,
+				messageId,
+				timeoutMs,
+				durationMs: Date.now() - startedAt,
+			});
+		}
+		throw error;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 export async function updateBufferedMessageMode(
 	narratorId: string,
 	messageId: string,

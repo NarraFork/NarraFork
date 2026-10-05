@@ -300,14 +300,14 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			});
 		}
 
-		test("explicit guidance preserves arrival order within its priority group", async () => {
+		test("new urgent input precedes older tool guidance and retains tool arrival order", async () => {
 			await bufferSubagentUserMessage(SUBAGENT_ID, "turn-1", { queueMode: "turn" });
 			await bufferSubagentUserMessage(SUBAGENT_ID, "tool-1", { queueMode: "tool" });
 			await bufferSubagentUserMessage(SUBAGENT_ID, "interrupt-1", { queueMode: "interrupt" });
 			await bufferSubagentUserMessage(SUBAGENT_ID, "tool-2", { queueMode: "tool" });
 			expect(getSubagentBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
-				"tool-1",
 				"interrupt-1",
+				"tool-1",
 				"tool-2",
 				"turn-1",
 			]);
