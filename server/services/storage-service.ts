@@ -31,7 +31,6 @@ import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
 import { readWorktreeReceiptProtection } from "./narrator-worktree-journal";
 import {
 	isRegisteredNarratorWorktree,
-	narratorWorktreeResourceRegistry,
 	readLegacyNarratorWorktreeProtection,
 } from "./narrator-worktree-resources";
 import { parseWorktreePorcelain } from "./narrator-worktree-service";
@@ -41,6 +40,13 @@ import {
 } from "./storage/database-storage-port";
 import { databaseStoragePort } from "./storage/store";
 import { withWorkspaceRepositoryLock } from "./workspace-context-service";
+import {
+	captureLifecycleContextPath,
+	confirmLifecyclePathRemoved,
+	isResourceProtectionError,
+	revalidateLifecycleTarget,
+	withProtectionReservation,
+} from "./worktree-lifecycle-guard";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -1116,30 +1122,12 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 							if (chapter) continue;
 							// Legacy switched sessions may predate receipts/registry. Protect ancestor
 							// directories too, e.g. a narrator running in a worktree subdirectory.
-							const cwdOwner = legacy.owners.find((owner) =>
-								localBackend.paths.contains(fullPath, owner.path),
+							const cwdOwner = legacy.owners.find(
+								(owner) =>
+									owner.deviceId === "local" && localBackend.paths.contains(fullPath, owner.path),
 							);
-							if (cwdOwner) {
-								// Adopt legacy ordinary workspaces before their last session row can
-								// disappear. This is inventory preservation, not creation/reconciliation.
-								if (
-									registered.entries.some((item) =>
-										localBackend.paths.equals(item.path, fullPath),
-									) &&
-									(await realpath(fullPath)) === fullPath
-								) {
-									const resource = {
-										ownerNarratorId: cwdOwner.narratorId,
-										deviceId: "local",
-										repositoryKey: gitWorkspaceIdentity(localBackend, probe.repositoryPath ?? ""),
-										worktreePath: fullPath,
-										createRequestId: `legacy-cwd-${cwdOwner.narratorId}`,
-									};
-									await narratorWorktreeResourceRegistry.register(resource);
-									await narratorWorktreeResourceRegistry.setState(resource, "unknown");
-								}
-								continue;
-							}
+							// A cleanup inspection must never select/adopt an owner or write inventory.
+							if (cwdOwner) continue;
 							const entry = registered.entries.find((item) =>
 								localBackend.paths.equals(item.path, fullPath),
 							);
@@ -1195,25 +1183,42 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 								clean.stdout !== ""
 							)
 								continue;
-							const size = await dirSize(fullPath);
-							// No --force and no rm fallback. Git must prove this clean registered
-							// chapter worktree is removable; a late dirty write makes remove fail.
-							const deletion = await safeSpawn({
-								cmd: ["git", "-C", proj.gitPath ?? "", "worktree", "remove", "--", fullPath],
-								timeout: 10_000,
-								maxOutputBytes: 32 * 1024,
-								env: gitEnv,
-							});
-							if (deletion.exitCode !== 0) continue;
-							await worktreeTreeSnapshot.destroy(fullPath).catch(() => {});
-							dropStatus(fullPath);
-							dropRecentlyAttributed(fullPath);
-							removed++;
-							freedBytes += size;
-							logger.info("Removed verified clean orphaned chapter worktree", {
-								path: fullPath,
-								size,
-							});
+							try {
+								await withProtectionReservation(
+									[{ path: fullPath }],
+									"orphan worktree cleanup",
+									async () => {
+										const size = await dirSize(await revalidateLifecycleTarget(fullPath));
+										const frozenRepository = await captureLifecycleContextPath(proj.gitPath ?? "");
+										const frozenPath = await revalidateLifecycleTarget(fullPath);
+										// No --force and no rm fallback. Git must prove this clean registered
+										// chapter worktree is removable; a late dirty write makes remove fail.
+										const deletion = await safeSpawn({
+											cmd: ["git", "-C", frozenRepository, "worktree", "remove", "--", frozenPath],
+											timeout: 10_000,
+											maxOutputBytes: 32 * 1024,
+											env: gitEnv,
+										});
+										if (deletion.exitCode !== 0) return;
+										await confirmLifecyclePathRemoved(frozenPath);
+										await worktreeTreeSnapshot.destroy(fullPath);
+										dropStatus(fullPath);
+										dropRecentlyAttributed(fullPath);
+										removed++;
+										freedBytes += size;
+										logger.info("Removed verified clean orphaned chapter worktree", {
+											path: fullPath,
+											size,
+										});
+									},
+								);
+							} catch (error) {
+								if (!isResourceProtectionError(error)) throw error;
+								logger.warn("Kept protected or unverifiable orphan worktree", {
+									path: fullPath,
+									error: String(error),
+								});
+							}
 						}
 					},
 				);

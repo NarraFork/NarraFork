@@ -69,6 +69,7 @@ import {
 	nextAllowedPort,
 	readWindowsExcludedPortRanges,
 } from "./lib/windows-excluded-ports";
+import { shutdownPrivateArchiveWorkers } from "./services/narrator-backup/worker-client";
 import { pluginManager } from "./services/plugin-manager";
 import { pluginProviderRegistry } from "./services/plugin-provider-registry";
 import {
@@ -1776,6 +1777,7 @@ async function performGracefulShutdown(
 		await shutdownStep(tracker, "integrityProbe.cancel", () => cancelBackgroundIntegrityCheck());
 		// Read workers hold their own read-only SQLite connections; terminate them before the clean
 		// marker is written so no thread is still touching the database afterwards.
+		await shutdownStep(tracker, "privateArchiveWorkers.shutdown", shutdownPrivateArchiveWorkers);
 		await shutdownStep(tracker, "dbWorkerPool.shutdown", () => shutdownDbWorkerPool());
 		// PostgreSQL: stop accepting new operations and close the client, in drain order — after
 		// HTTP/WS handlers have drained, before the lock release below. A no-op on the SQLite

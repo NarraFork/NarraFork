@@ -103,6 +103,8 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 	// Queue buffer interactions live here rather than in the panel: every output
 	// below is consumed only within this component's subtree.
 	const {
+		visibleQueuedMessages,
+		urgentDispatches,
 		queueHoldProgress,
 		startQueueHold,
 		cancelQueueHold,
@@ -149,7 +151,8 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 			{/* Queued messages indicator */}
 			<QueuedMessagesPanel
 				narratorId={props.common.narratorId}
-				queuedMessages={props.queueDeps.queuedMessages}
+				queuedMessages={visibleQueuedMessages ?? props.queueDeps.queuedMessages}
+				urgentDispatches={urgentDispatches}
 				queueExpanded={queueExpanded}
 				setQueueExpanded={setQueueExpanded}
 				editingQueuedId={editingQueuedId}

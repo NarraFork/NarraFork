@@ -29,6 +29,7 @@ import {
 	SubagentSessionPanelContent,
 	TasksDockPanel as TasksToolAdapter,
 	TerminalDockPanel as TerminalToolAdapter,
+	ToolPanelShell,
 	UserChatDockPanel as UserChatToolAdapter,
 } from "../dock/panels";
 import { useFilePanelSourceOpener } from "../file-panel/file-panel-navigation";
@@ -52,6 +53,7 @@ import {
 	type WorkspaceKnowledgePanelParams,
 	type WorkspacePanelParams,
 } from "./panel-types";
+import { WorkspaceResourceFrame } from "./WorkspaceResourceFrame";
 import {
 	useWorkspaceDirectorActive,
 	useWorkspaceId,
@@ -368,10 +370,37 @@ function WorkspaceKnowledgeDockPanel(props: IDockviewPanelProps<WorkspaceKnowled
 
 function WorkspacePluginDockPanel(props: Parameters<typeof PluginDockPanel>[0]) {
 	const directorActive = useWorkspaceDirectorActive();
-	// Only surface-owned plugins have a Director counterpart. Narrator-owned
-	// resource views remain mounted through floating/pinned transitions.
-	if (directorActive && !workspaceResourceOwner(props.params)) return null;
-	return <PluginDockPanel {...props} />;
+	const owner = workspaceResourceOwner(props.params);
+	const [title, setTitle] = useState(props.api.title);
+	useLayoutEffect(() => {
+		const subscription = props.api.onDidTitleChange(({ title }) => setTitle(title));
+		return () => subscription.dispose();
+	}, [props.api]);
+	// Surface-owned plugins still have a Director counterpart; resources do not.
+	if (directorActive && !owner) return null;
+	if (!owner) return <PluginDockPanel {...props} />;
+	return (
+		<ToolPanelShell
+			props={props}
+			subjectId={owner}
+			title={title || props.params.fallback?.title || props.params.pluginId}
+		>
+			<PluginDockPanel {...props} />
+		</ToolPanelShell>
+	);
+}
+
+/** Stable wrappers preserve resource instances across floating and pinned locations. */
+function withResourceFrame<P extends WorkspacePanelParams>(
+	Panel: React.FunctionComponent<IDockviewPanelProps<P>>,
+) {
+	return function ResourcePanel(props: IDockviewPanelProps<P>) {
+		return (
+			<WorkspaceResourceFrame props={props}>
+				<Panel {...props} />
+			</WorkspaceResourceFrame>
+		);
+	};
 }
 
 /** Component registry passed to <DockviewReact components={...} />. */
@@ -379,10 +408,10 @@ export const workspacePanelComponents = {
 	[PANEL_COMPONENT.narrator]: NarratorDockPanel,
 	[PANEL_COMPONENT.terminal]: TerminalDockPanel,
 	[PANEL_COMPONENT.webview]: WebviewDockPanel,
-	[PANEL_COMPONENT.narratorTool]: NarratorToolDockPanel,
-	[PANEL_COMPONENT.subagent]: SubagentDockPanel,
-	[PANEL_COMPONENT.file]: WorkspaceFileDockPanel,
-	[PANEL_COMPONENT.knowledge]: WorkspaceKnowledgeDockPanel,
-	[PANEL_COMPONENT.plugin]: WorkspacePluginDockPanel,
+	[PANEL_COMPONENT.narratorTool]: withResourceFrame(NarratorToolDockPanel),
+	[PANEL_COMPONENT.subagent]: withResourceFrame(SubagentDockPanel),
+	[PANEL_COMPONENT.file]: withResourceFrame(WorkspaceFileDockPanel),
+	[PANEL_COMPONENT.knowledge]: withResourceFrame(WorkspaceKnowledgeDockPanel),
+	[PANEL_COMPONENT.plugin]: withResourceFrame(WorkspacePluginDockPanel),
 	// biome-ignore lint/suspicious/noExplicitAny: dockview panel registry is heterogeneous
 } satisfies Record<string, React.FunctionComponent<IDockviewPanelProps<any>>>;

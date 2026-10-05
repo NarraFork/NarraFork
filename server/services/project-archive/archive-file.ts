@@ -77,7 +77,11 @@ export class ProjectArchiveFile {
 	 * preserved from the previous implementation.
 	 */
 	static open(gitPath: string): ProjectArchiveFile {
-		const path = getProjectDbPath(gitPath);
+		return ProjectArchiveFile.openFile(getProjectDbPath(gitPath));
+	}
+
+	/** Independent archive file: no project ID or fabricated repository is required. */
+	static openFile(path: string): ProjectArchiveFile {
 		if (!existsSync(path)) throw new NotFoundError("Project database", path);
 		return new ProjectArchiveFile(new Database(path, { readonly: true }), path);
 	}

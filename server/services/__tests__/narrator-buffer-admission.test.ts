@@ -309,6 +309,37 @@ describe("queued user identity", () => {
 });
 
 describe("durable queue modes", () => {
+	test("PostgreSQL admission receives hard-front interrupt but FIFO tool ordering", async () => {
+		const admissions: Array<{ mode: string; frontOrder: string }> = [];
+		const admitUserBuffered = async (
+			input: { metadata: { queueMode: string } },
+			ordering: { frontOrder: string },
+		) => {
+			admissions.push({ mode: input.metadata.queueMode, frontOrder: ordering.frontOrder });
+			return { status: "accepted", delivery: { id: `pg-${admissions.length}`, bufferedAt: "now" } };
+		};
+		bindRuntimeQueue({
+			backend: "postgres",
+			queue: { mailbox: { admitUserBuffered } } as unknown as PostgresRuntimeQueue,
+		});
+		const transaction = spyOn(db, "transaction").mockImplementation(() => {
+			throw new Error("Forbidden SQLite admission under PostgreSQL");
+		});
+		try {
+			await enqueue("older tool", "tool");
+			await enqueue("new urgent", "interrupt");
+			await enqueue("later tool", "tool");
+			expect(admissions).toEqual([
+				{ mode: "tool", frontOrder: "fifo" },
+				{ mode: "interrupt", frontOrder: "stack" },
+				{ mode: "tool", frontOrder: "fifo" },
+			]);
+			expect(transaction).not.toHaveBeenCalled();
+		} finally {
+			transaction.mockRestore();
+			bindRuntimeQueue(undefined);
+		}
+	});
 	async function enqueue(text: string, mode: "turn" | "tool" | "interrupt") {
 		return enqueueBufferedMessage(
 			NARRATOR_ID,
@@ -326,19 +357,19 @@ describe("durable queue modes", () => {
 			mode,
 		);
 	}
-	test("guidance is FIFO, persisted and authoritative in summaries", async () => {
+	test("urgent admission is hard-front while tool guidance remains FIFO", async () => {
 		await enqueue("ordinary", "turn");
 		await enqueue("first guide", "tool");
 		await enqueue("second guide", "interrupt");
 		const messages = getBufferedMessages(NARRATOR_ID);
-		expect(messages.map((m) => m.text)).toEqual(["first guide", "second guide", "ordinary"]);
+		expect(messages.map((m) => m.text)).toEqual(["second guide", "first guide", "ordinary"]);
 		expect(toBufferSummary(messages).map((m) => m.queueMode)).toEqual([
-			"tool",
 			"interrupt",
+			"tool",
 			"turn",
 		]);
 	});
-	test("mode changes append to destination and retain failed payload", async () => {
+	test("urgent mode promotes ahead of guidance without retrying failed payload", async () => {
 		const first = await enqueue("first", "turn");
 		const second = await enqueue("second", "tool");
 		await enqueue("third", "turn");
@@ -348,8 +379,8 @@ describe("durable queue modes", () => {
 			.run();
 		expect(await updateBufferedMessageMode(NARRATOR_ID, first.id, "interrupt")).toBe(true);
 		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.text)).toEqual([
-			"second",
 			"first",
+			"second",
 			"third",
 		]);
 		const failed = getBufferedMessages(NARRATOR_ID).find((m) => m.id === first.id);

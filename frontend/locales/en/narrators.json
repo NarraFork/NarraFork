@@ -7,9 +7,9 @@
 	"resourceFloat": {
 		"pin": "Pin as a tab in {{target}}",
 		"pinDirector": "Pin in {{target}} and switch to grid",
-		"noNeighbour": "No other available pane; choose an explicit split from the menu",
-		"chooseTarget": "Pin to another pane",
-		"newSplit": "Create an adjacent pane",
+		"pinRight": "Pin in a new pane on the right",
+		"pinRightDirector": "Pin on the right and switch to grid",
+		"noNeighbour": "No available pane to pin to",
 		"pinFailed": "The target pane is no longer available. The floating panel was kept."
 	},
 	"title": "Narrators",

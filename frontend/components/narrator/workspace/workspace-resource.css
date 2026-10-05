@@ -47,3 +47,29 @@
 	outline: 2px solid var(--mantine-color-indigo-filled);
 	outline-offset: -2px;
 }
+
+/* The panel's own header is the only visible title/drag bar for a temporary
+ * window. Keep Dockview's hidden native handle alive for its pointer machinery. */
+.workspace-resource-surface .workspace-resource-float-window > .dv-floating-titlebar {
+	display: none;
+}
+
+.workspace-resource-surface .workspace-resource-float-window {
+	/* Native floating geometry owns horizontal dragging; these two constraints
+	 * keep the preview full-height through workspace resize without remounting. */
+	/* biome-ignore lint/complexity/noImportantStyles: override the initial native pixel height as the workspace resizes. */
+	height: 100% !important;
+	max-width: 100%;
+	/* biome-ignore lint/complexity/noImportantStyles: full-height previews cannot drift vertically out of the workspace. */
+	top: 0 !important;
+	border-radius: 0;
+}
+
+/* Keep background previews alive, but only the selected drawer may paint or
+ * receive pointer/keyboard input. Pin/close does not uncover an older preview. */
+.workspace-resource-surface .workspace-resource-inactive-preview {
+	/* biome-ignore lint/complexity/noImportantStyles: native always-rendered overlays otherwise clear their own inline visibility. */
+	visibility: hidden !important;
+	/* biome-ignore lint/complexity/noImportantStyles: an inactive preview cannot intercept the newly pinned pane. */
+	pointer-events: none !important;
+}

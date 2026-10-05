@@ -11,6 +11,7 @@ import type {
 	ReasoningProviderMetadata,
 	WebSearchAction,
 } from "@shared/agent-protocol/types";
+import type { ContextInputCharacters } from "@shared/context-usage";
 import { catalogError } from "../errors";
 import {
 	FOLLOW_DEFAULT_MODEL,
@@ -91,6 +92,8 @@ export interface ChatParams extends ProtocolChatParams {
 	 * paths that completed without ever contacting the API.
 	 */
 	onRequestStart?: (info?: { credentialId?: string }) => void;
+	/** Complete final logical input counts; null when counting is unavailable or exceeds budget. */
+	onInputCharacters?: (counts: ContextInputCharacters | null) => void;
 }
 
 export interface GenerateOptions {

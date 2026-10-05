@@ -551,6 +551,8 @@ export type NarratorServerMessage =
 	| { type: "segment_compact_hide"; narratorId: string; hiddenMessageIds: string[] }
 	| {
 			type: "context_usage";
+			source?: import("@shared/context-usage").ContextUsageSource;
+			snapshot?: import("@shared/context-usage").ContextUsageSnapshot;
 			narratorId: string;
 			percentage: number;
 			isSubagent?: boolean;
@@ -895,8 +897,17 @@ export type NarratorServerMessage =
 			queueMessage?: string;
 	  }
 	| {
+			type: "streaming_identity";
+			narratorId: string;
+			model: string;
+			provider: string;
+			parentToolUseId?: string;
+	  }
+	| {
 			type: "streaming_snapshot";
 			narratorId: string;
+			model?: string;
+			provider?: string;
 			streamingBlocks: Array<
 				| { type: "reasoning"; id?: string; outputIndex?: number; text: string }
 				| {

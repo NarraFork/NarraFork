@@ -54,6 +54,12 @@ import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
 import { ensureRefsCoverMessage } from "./narrator-refs-backfill";
 import { narratorService } from "./narrator-service";
+import {
+	compensateLegacyCreation,
+	recordChapterCreated,
+	recordChapterNarratorCreated,
+	withChapterCreation,
+} from "./worktree-lifecycle-guard";
 import { treeSnapshotKey, worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 export interface SplitChapterInput {
@@ -307,365 +313,370 @@ export const chapterSplit = {
 			});
 			if (!project?.gitPath) throw new ValidationError("Project has no git repository configured");
 			const gitPath = project.gitPath;
-			const repoPath = original.worktreePath ?? gitPath;
+			return withChapterCreation(project.id, gitPath, async () => {
+				const repoPath = original.worktreePath ?? gitPath;
 
-			// Resolve the commit through git so a short sha from the UI becomes the full
-			// one everything downstream stores and compares against.
-			const commitSha = await gitService
-				.getRefCommit(repoPath, `${input.commitSha}^{commit}`)
-				.catch(() => {
-					throw new ValidationError(`Commit not found in this repository: ${input.commitSha}`);
-				});
-
-			// The chapter's own tip, by branch name when it has no worktree (the
-			// repository's HEAD is the main checkout and unrelated to this chapter).
-			const tip = original.worktreePath
-				? await gitService.getHeadCommit(original.worktreePath)
-				: await gitService.getRefCommit(gitPath, original.branch);
-
-			if (!(await gitService.isAncestor(repoPath, commitSha, original.branch))) {
-				throw new ValidationError(
-					`Commit ${commitSha.slice(0, 7)} is not part of this chapter's history, so there is ` +
-						"nothing to split at it.",
-				);
-			}
-			if (commitSha === tip) {
-				throw new ValidationError(
-					"Cannot split at the chapter's latest commit — the continuation would be empty. " +
-						"Fork the chapter instead.",
-				);
-			}
-			if (original.startCommitSha && commitSha === original.startCommitSha) {
-				throw new ValidationError(
-					"Cannot split at the chapter's first commit — the prefix would be empty. " +
-						"Fork from that commit instead.",
-				);
-			}
-
-			const primaryNarrator = await db.query.narrators.findFirst({
-				where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
-				columns: { id: true },
-			});
-			if (!primaryNarrator) {
-				throw new ValidationError(
-					"This chapter has no primary narrator, so its conversation cannot be split.",
-				);
-			}
-			if (await hasPendingCompact(primaryNarrator.id)) {
-				// A compact in flight rewrites the very refs the prefix would copy, and the
-				// parent's finalizer would then copy-on-write a row the prefix shares —
-				// leaving the prefix with a marker it can never finish.
-				throw new ValidationError(
-					"This chapter's conversation is being compacted. Wait for it to finish, then split.",
-				);
-			}
-
-			const truncation = await resolveTruncationSeqForCommit(chapterId, commitSha, { repoPath });
-			if (!truncation) {
-				warnings.push(
-					`No conversation message is associated with commit ${commitSha.slice(0, 7)} or any ` +
-						"earlier commit, so the prefix chapter starts with an empty conversation. The full " +
-						"history stays with the original chapter.",
-				);
-				fallbacks.push({ step: "truncationPoint", mode: "empty", commitSha });
-			} else if (truncation.approximate) {
-				warnings.push(
-					`Commit ${commitSha.slice(0, 7)} was not made by the narrator, so the conversation ` +
-						`was cut at the last message belonging to commit ` +
-						`${truncation.resolvedFromCommitSha.slice(0, 7)} instead. Messages written between ` +
-						"those two commits stay with the original chapter.",
-				);
-				fallbacks.push({
-					step: "truncationPoint",
-					mode: "approximate",
-					commitSha,
-					resolvedFromCommitSha: truncation.resolvedFromCommitSha,
-					seq: truncation.seq,
-				});
-			}
-
-			const now = new Date().toISOString();
-			const prefixId = generateId();
-			const prefixTitle = `${original.title.slice(0, 180)}-upto-${commitSha.slice(0, 7)}`;
-			const prefixSlug = slugify(prefixTitle);
-			const prefixShortId = generateShortId(6);
-			const prefixBranch = `chapter/${prefixSlug}-${prefixShortId}`;
-			const prefixWorktreePath = resolve(gitPath, ".worktrees", `${prefixSlug}-${prefixShortId}`);
-			/**
-			 * A prefix that inherits a trunk role stays `active` (trunk is where merges
-			 * land, and a merge target needs a checkout); anything else becomes the
-			 * dormant anchor described at the top of this file, which by definition has
-			 * no worktree on disk.
-			 *
-			 * Not materializing a worktree for the dormant case is not just an
-			 * optimization: creating one only to delete it again would check the whole
-			 * repository out twice per split, and every intermediate state would be one
-			 * more thing rollback has to undo. `chapterFork.fork` explicitly supports a
-			 * worktree-less parent, so the fork below is unaffected.
-			 */
-			const prefixStatus = original.role === "trunk" ? "active" : "dormant";
-
-			const rollback: Array<() => Promise<void>> = [];
-
-			try {
-				// Step 1: the prefix's branch, pinned at the split commit.
-				await gitService.createBranch(gitPath, prefixBranch, commitSha);
-				rollback.push(() => gitService.deleteBranch(gitPath, prefixBranch));
-
-				if (prefixStatus === "active") {
-					await gitService.createWorktree(gitPath, prefixWorktreePath, prefixBranch);
-					rollback.push(() => gitService.removeWorktree(gitPath, prefixWorktreePath));
-				}
-				// Registered even when no worktree was created, and before anything can
-				// write into the shadow repository: neither automatic cleanup path can
-				// reach a shadow repo left behind by a rollback (`gcAll` skips
-				// directories that have a HEAD, and the orphan sweep only walks
-				// `.worktrees` entries that still exist). `destroy` on a path that never
-				// had one is a no-op, and `force` is required because the prefix row
-				// claims this key.
-				rollback.push(async () => {
-					await worktreeTreeSnapshot.destroy(prefixWorktreePath, undefined, { force: true });
-				});
-
-				// Step 2: the prefix chapter row.
-				const prefixChapter = await chapterWriteStore.insertChapter({
-					id: prefixId,
-					projectId: original.projectId,
-					title: prefixTitle,
-					description: original.description,
-					status: prefixStatus,
-					role: original.role,
-					branch: prefixBranch,
-					// Dormant means "no worktree on disk", and the column is what every
-					// reader consults to decide whether one exists.
-					worktreePath: prefixStatus === "active" ? prefixWorktreePath : null,
-					baseBranch: original.baseBranch,
-					// The prefix takes over the original's place in the graph: whatever O
-					// descended from, the prefix now descends from.
-					parentChapterId: original.parentChapterId,
-					forkPoint: original.forkPoint,
-					// The prefix owns the window [O's original start, C]; the continuation
-					// takes over from C.
-					startCommitSha: original.startCommitSha,
-					headCommitSha: commitSha,
-					anchorCommitSha: commitSha,
-					// Same lane as the original so the split reads as one timeline cut in
-					// two rather than a branch off to the side.
-					axisOffset: 0,
-					crossOffset: original.crossOffset ?? 0,
-					// Recorded at insert rather than left to the first tool call so the
-					// shadow-repo ownership guard protects this lineage immediately —
-					// a chapter with no worktree would otherwise have its snapshots swept
-					// as an orphan (see chapter-fork.ts for the same reasoning).
-					snapshotShadowKey: treeSnapshotKey(LOCAL_DEVICE_ID, prefixWorktreePath),
-					// Deliberately not carried over: exploration membership, review
-					// coordinates, merge coordinates and container config all describe the
-					// chapter that keeps evolving, which is the continuation.
-					lastAccessedAt: now,
-					createdAt: now,
-					updatedAt: now,
-				});
-				rollback.push(async () => {
-					await chapterWriteStore.deleteChapter(prefixId);
-				});
-
-				// Step 3: the prefix's narrator — the original's conversation cut at the
-				// truncation point.
-				//
-				// `forkNarrator` is used rather than a hand-rolled ref copy because the
-				// hard parts are all already solved there: the compact boundary, excluding
-				// in-flight compact markers, registering the lazy-backfill cursor so older
-				// history stays reachable, copying the four permission rule sets, and
-				// forking the Dynamic Spec namespace.
-				if (truncation) {
-					await ensureRefsCoverMessage(primaryNarrator.id, truncation.messageId).catch(() => {
-						// Reported by forkNarrator if the ref genuinely cannot be resolved.
+				// Resolve the commit through git so a short sha from the UI becomes the full
+				// one everything downstream stores and compares against.
+				const commitSha = await gitService
+					.getRefCommit(repoPath, `${input.commitSha}^{commit}`)
+					.catch(() => {
+						throw new ValidationError(`Commit not found in this repository: ${input.commitSha}`);
 					});
-				}
-				const prefixNarrator = await narratorService.forkNarrator(primaryNarrator.id, null, {
-					title: prefixTitle,
-					newChapterId: prefixId,
-					// With a truncation point this copies the history up to it. Without one
-					// there is nothing to inherit, and `fresh` is the only mode that does not
-					// silently fall back to copying the whole conversation.
-					inheritMode: truncation ? "full" : "fresh",
-					locale: input.locale,
-					forkMessageId: truncation?.messageId,
-				});
-				rollback.push(async () => {
-					await narratorService.remove(prefixNarrator.id);
-				});
 
-				// Step 4: commit records up to C.
-				//
-				// `copyCommitsForFork` already means "copy through this commit", so it is
-				// reused verbatim — but it also sets `startCommitSha` to the fork point,
-				// which is right for a fork and wrong here: the prefix starts where the
-				// original started. The window is restored immediately afterwards.
-				try {
-					await commitSyncService.syncChapterCommits(chapterId);
-					await commitSyncService.copyCommitsForFork(chapterId, prefixId, commitSha);
-				} catch (err) {
-					logger.warn("Failed to copy commit history during split (non-fatal)", {
-						chapterId,
-						prefixId,
-						error: String(err),
-					});
+				// The chapter's own tip, by branch name when it has no worktree (the
+				// repository's HEAD is the main checkout and unrelated to this chapter).
+				const tip = original.worktreePath
+					? await gitService.getHeadCommit(original.worktreePath)
+					: await gitService.getRefCommit(gitPath, original.branch);
+
+				if (!(await gitService.isAncestor(repoPath, commitSha, original.branch))) {
+					throw new ValidationError(
+						`Commit ${commitSha.slice(0, 7)} is not part of this chapter's history, so there is ` +
+							"nothing to split at it.",
+					);
+				}
+				if (commitSha === tip) {
+					throw new ValidationError(
+						"Cannot split at the chapter's latest commit — the continuation would be empty. " +
+							"Fork the chapter instead.",
+					);
+				}
+				if (original.startCommitSha && commitSha === original.startCommitSha) {
+					throw new ValidationError(
+						"Cannot split at the chapter's first commit — the prefix would be empty. " +
+							"Fork from that commit instead.",
+					);
+				}
+
+				const primaryNarrator = await db.query.narrators.findFirst({
+					where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
+					columns: { id: true },
+				});
+				if (!primaryNarrator) {
+					throw new ValidationError(
+						"This chapter has no primary narrator, so its conversation cannot be split.",
+					);
+				}
+				if (await hasPendingCompact(primaryNarrator.id)) {
+					// A compact in flight rewrites the very refs the prefix would copy, and the
+					// parent's finalizer would then copy-on-write a row the prefix shares —
+					// leaving the prefix with a marker it can never finish.
+					throw new ValidationError(
+						"This chapter's conversation is being compacted. Wait for it to finish, then split.",
+					);
+				}
+
+				const truncation = await resolveTruncationSeqForCommit(chapterId, commitSha, { repoPath });
+				if (!truncation) {
 					warnings.push(
-						`The prefix chapter's commit list could not be built (${String(err)}). Its git ` +
-							"branch is correct; the list rebuilds on the next sync.",
+						`No conversation message is associated with commit ${commitSha.slice(0, 7)} or any ` +
+							"earlier commit, so the prefix chapter starts with an empty conversation. The full " +
+							"history stays with the original chapter.",
 					);
-					fallbacks.push({ step: "commitHistoryCopy", mode: "skipped", error: String(err) });
-				}
-				await chapterWriteStore.updateSplitPrefixHead({
-					prefixId,
-					startCommitSha: original.startCommitSha,
-					headCommitSha: commitSha,
-					now,
-				});
-
-				if (project.copyFiles && prefixStatus !== "active") {
-					// `chapterFork.fork` copies these from the parent's worktree, and the
-					// dormant prefix has none. Said out loud because the files are typically
-					// local config the new fork needs and git does not track.
-					const configured = (() => {
-						try {
-							return (JSON.parse(project.copyFiles) as string[]).length;
-						} catch {
-							return 0;
-						}
-					})();
-					if (configured > 0) {
-						warnings.push(
-							`${configured} project-configured file(s) were not copied into the new fork: the ` +
-								"prefix chapter it forks from has no worktree. Copy them manually if the new " +
-								"branch needs them.",
-						);
-						fallbacks.push({
-							step: "copyFiles",
-							mode: "skipped",
-							reason: "prefix has no worktree",
-						});
-					}
-				}
-
-				// Step 5: the fork the user actually asked for.
-				//
-				// Delegated to `chapterFork.fork` rather than reimplemented: it owns
-				// branch/worktree creation, snapshot lineage adoption, the graph slot
-				// search, the narrator fork and the container/startup-script handling.
-				// It rolls only *itself* back on failure and takes no external rollback
-				// stack, so undoing a successful fork is this function's job.
-				const newForkChapter = await chapterFork.fork(prefixId, {
-					title: input.newFork.title,
-					description: input.newFork.description,
-					inheritMode: input.newFork.inheritMode,
-					worktreeSource: "commit",
-					startCommitSha: commitSha,
-					anchorCommitSha: commitSha,
-					locale: input.locale,
-				});
-				rollback.push(async () => {
-					// `chapterService.remove` is the only teardown that also stops containers,
-					// releases ports, kills terminals and drops the shadow repository — all of
-					// which `fork` may have created.
-					await chapterService.remove(newForkChapter.id);
-				});
-				const forkWarnings = (newForkChapter as { warnings?: string[] }).warnings;
-				if (forkWarnings?.length) warnings.push(...forkWarnings);
-
-				// Step 6: hand the original's incoming fork edges to the prefix.
-				//
-				// Ordered after everything that can fail on its own, and compensated
-				// first on rollback: `chapter_edges` cascades on both endpoints, so
-				// deleting the prefix row while these point at it would destroy the
-				// project's parent→O edges outright.
-				const inboundForkEdges = await db
-					.select({ id: chapterEdges.id })
-					.from(chapterEdges)
-					.where(and(eq(chapterEdges.targetId, chapterId), eq(chapterEdges.type, "fork")));
-				for (const edge of inboundForkEdges) {
-					const previousTargetId = await chapterEdgeService.redirectForkEdgeTarget(
-						edge.id,
-						prefixId,
+					fallbacks.push({ step: "truncationPoint", mode: "empty", commitSha });
+				} else if (truncation.approximate) {
+					warnings.push(
+						`Commit ${commitSha.slice(0, 7)} was not made by the narrator, so the conversation ` +
+							`was cut at the last message belonging to commit ` +
+							`${truncation.resolvedFromCommitSha.slice(0, 7)} instead. Messages written between ` +
+							"those two commits stay with the original chapter.",
 					);
-					rollback.push(async () => {
-						await chapterEdgeService.redirectForkEdgeTarget(edge.id, previousTargetId);
+					fallbacks.push({
+						step: "truncationPoint",
+						mode: "approximate",
+						commitSha,
+						resolvedFromCommitSha: truncation.resolvedFromCommitSha,
+						seq: truncation.seq,
 					});
 				}
 
-				// The prefix→continuation edge. No compensation is registered: both
-				// endpoints cascade, so deleting the prefix row removes it.
-				await chapterEdgeService.createForkEdge(original.projectId, prefixId, chapterId, {
-					commitSha,
-					worktreeSource: "commit",
-					inheritMode: "full",
-					narratorMessageId: truncation?.messageId,
-				});
+				const now = new Date().toISOString();
+				const prefixId = generateId();
+				const prefixTitle = `${original.title.slice(0, 180)}-upto-${commitSha.slice(0, 7)}`;
+				const prefixSlug = slugify(prefixTitle);
+				const prefixShortId = generateShortId(6);
+				const prefixBranch = `chapter/${prefixSlug}-${prefixShortId}`;
+				const prefixWorktreePath = resolve(gitPath, ".worktrees", `${prefixSlug}-${prefixShortId}`);
+				/**
+				 * A prefix that inherits a trunk role stays `active` (trunk is where merges
+				 * land, and a merge target needs a checkout); anything else becomes the
+				 * dormant anchor described at the top of this file, which by definition has
+				 * no worktree on disk.
+				 *
+				 * Not materializing a worktree for the dormant case is not just an
+				 * optimization: creating one only to delete it again would check the whole
+				 * repository out twice per split, and every intermediate state would be one
+				 * more thing rollback has to undo. `chapterFork.fork` explicitly supports a
+				 * worktree-less parent, so the fork below is unaffected.
+				 */
+				const prefixStatus = original.role === "trunk" ? "active" : "dormant";
 
-				// Step 7: rewrite the original into the continuation.
-				//
-				// Last, and in one atomic section of the chapter write store, so the
-				// window in which the original claims a lineage that may still be
-				// rolled back is as small as it can be. `parentChapterId` is
-				// `ON DELETE SET NULL`, so even a crash between this commit and a later
-				// prefix deletion degrades to "no parent" rather than a dangling
-				// pointer.
-				//
-				// The commit records are recomputed, never deleted: the UI lists them and
-				// they are the chapter's only local record of its own history.
-				const continuationChapter = await chapterWriteStore.rewriteSplitContinuation({
-					chapterId,
-					prefixId,
-					commitSha,
-					...(truncation ? { narratorMessageId: truncation.messageId } : {}),
-					fallbackCommitCount: original.commitCount ?? null,
-					now,
-				});
+				return withChapterCreation(
+					project.id,
+					gitPath,
+					async () => {
+						const rollback: Array<() => Promise<void>> = [];
 
-				logger.info("Chapter split", {
-					chapterId,
-					prefixId,
-					newForkId: newForkChapter.id,
-					commitSha,
-					truncationSeq: truncation?.seq ?? null,
-					truncationApproximate: truncation?.approximate ?? null,
-				});
+						try {
+							// Step 1: the prefix's branch, pinned at the split commit.
+							await gitService.createBranch(gitPath, prefixBranch, commitSha);
+							rollback.push(() => gitService.deleteBranch(gitPath, prefixBranch));
 
-				// Emitted only once every compensable step has succeeded: subscribers
-				// (project-db sync, WebSocket fan-out) treat it as fact.
-				eventBus.emit({
-					type: "chapter:split",
-					prefixChapterId: prefixId,
-					continuationChapterId: chapterId,
-					newForkChapterId: newForkChapter.id,
-					commitSha,
-					projectId: original.projectId,
-				});
+							if (prefixStatus === "active") {
+								await gitService.createWorktree(gitPath, prefixWorktreePath, prefixBranch);
+								rollback.push(() => gitService.removeWorktree(gitPath, prefixWorktreePath));
+							}
+							// Registered even when no worktree was created, and before anything can
+							// write into the shadow repository: neither automatic cleanup path can
+							// reach a shadow repo left behind by a rollback (`gcAll` skips
+							// directories that have a HEAD, and the orphan sweep only walks
+							// `.worktrees` entries that still exist). `destroy` on a path that never
+							// had one is a no-op, and `force` is required because the prefix row
+							// claims this key.
+							rollback.push(async () => {
+								await worktreeTreeSnapshot.destroy(prefixWorktreePath, undefined, { force: true });
+							});
 
-				return {
-					prefixChapter,
-					continuationChapter,
-					newForkChapter,
-					commitSha,
-					...(warnings.length > 0 ? { warnings } : {}),
-					...(fallbacks.length > 0 ? { fallbacks } : {}),
-				};
-			} catch (err) {
-				logger.error("Chapter split failed, rolling back", {
-					chapterId,
-					prefixId,
-					error: String(err),
-				});
-				for (const fn of rollback.reverse()) {
-					try {
-						await fn();
-					} catch (rollbackErr) {
-						logger.error("Split rollback step failed", { error: String(rollbackErr) });
-					}
-				}
-				throw err;
-			}
+							// Step 2: the prefix chapter row.
+							const prefixChapter = await chapterWriteStore.insertChapter({
+								id: prefixId,
+								projectId: original.projectId,
+								title: prefixTitle,
+								description: original.description,
+								status: prefixStatus,
+								role: original.role,
+								branch: prefixBranch,
+								// Dormant means "no worktree on disk", and the column is what every
+								// reader consults to decide whether one exists.
+								worktreePath: prefixStatus === "active" ? prefixWorktreePath : null,
+								baseBranch: original.baseBranch,
+								// The prefix takes over the original's place in the graph: whatever O
+								// descended from, the prefix now descends from.
+								parentChapterId: original.parentChapterId,
+								forkPoint: original.forkPoint,
+								// The prefix owns the window [O's original start, C]; the continuation
+								// takes over from C.
+								startCommitSha: original.startCommitSha,
+								headCommitSha: commitSha,
+								anchorCommitSha: commitSha,
+								// Same lane as the original so the split reads as one timeline cut in
+								// two rather than a branch off to the side.
+								axisOffset: 0,
+								crossOffset: original.crossOffset ?? 0,
+								// Recorded at insert rather than left to the first tool call so the
+								// shadow-repo ownership guard protects this lineage immediately —
+								// a chapter with no worktree would otherwise have its snapshots swept
+								// as an orphan (see chapter-fork.ts for the same reasoning).
+								snapshotShadowKey: treeSnapshotKey(LOCAL_DEVICE_ID, prefixWorktreePath),
+								// Deliberately not carried over: exploration membership, review
+								// coordinates, merge coordinates and container config all describe the
+								// chapter that keeps evolving, which is the continuation.
+								lastAccessedAt: now,
+								createdAt: now,
+								updatedAt: now,
+							});
+							recordChapterCreated(prefixId);
+							rollback.push(async () => {
+								await chapterWriteStore.deleteChapter(prefixId);
+							});
+
+							// Step 3: the prefix's narrator — the original's conversation cut at the
+							// truncation point.
+							//
+							// `forkNarrator` is used rather than a hand-rolled ref copy because the
+							// hard parts are all already solved there: the compact boundary, excluding
+							// in-flight compact markers, registering the lazy-backfill cursor so older
+							// history stays reachable, copying the four permission rule sets, and
+							// forking the Dynamic Spec namespace.
+							if (truncation) {
+								await ensureRefsCoverMessage(primaryNarrator.id, truncation.messageId).catch(() => {
+									// Reported by forkNarrator if the ref genuinely cannot be resolved.
+								});
+							}
+							const prefixNarrator = await narratorService.forkNarrator(primaryNarrator.id, null, {
+								title: prefixTitle,
+								newChapterId: prefixId,
+								// With a truncation point this copies the history up to it. Without one
+								// there is nothing to inherit, and `fresh` is the only mode that does not
+								// silently fall back to copying the whole conversation.
+								inheritMode: truncation ? "full" : "fresh",
+								locale: input.locale,
+								forkMessageId: truncation?.messageId,
+							});
+							recordChapterNarratorCreated(prefixNarrator.id);
+							rollback.push(async () => {
+								await narratorService.remove(prefixNarrator.id);
+							});
+
+							// Step 4: commit records up to C.
+							//
+							// `copyCommitsForFork` already means "copy through this commit", so it is
+							// reused verbatim — but it also sets `startCommitSha` to the fork point,
+							// which is right for a fork and wrong here: the prefix starts where the
+							// original started. The window is restored immediately afterwards.
+							try {
+								await commitSyncService.syncChapterCommits(chapterId);
+								await commitSyncService.copyCommitsForFork(chapterId, prefixId, commitSha);
+							} catch (err) {
+								logger.warn("Failed to copy commit history during split (non-fatal)", {
+									chapterId,
+									prefixId,
+									error: String(err),
+								});
+								warnings.push(
+									`The prefix chapter's commit list could not be built (${String(err)}). Its git ` +
+										"branch is correct; the list rebuilds on the next sync.",
+								);
+								fallbacks.push({ step: "commitHistoryCopy", mode: "skipped", error: String(err) });
+							}
+							await chapterWriteStore.updateSplitPrefixHead({
+								prefixId,
+								startCommitSha: original.startCommitSha,
+								headCommitSha: commitSha,
+								now,
+							});
+
+							if (project.copyFiles && prefixStatus !== "active") {
+								// `chapterFork.fork` copies these from the parent's worktree, and the
+								// dormant prefix has none. Said out loud because the files are typically
+								// local config the new fork needs and git does not track.
+								const configured = (() => {
+									try {
+										return (JSON.parse(project.copyFiles) as string[]).length;
+									} catch {
+										return 0;
+									}
+								})();
+								if (configured > 0) {
+									warnings.push(
+										`${configured} project-configured file(s) were not copied into the new fork: the ` +
+											"prefix chapter it forks from has no worktree. Copy them manually if the new " +
+											"branch needs them.",
+									);
+									fallbacks.push({
+										step: "copyFiles",
+										mode: "skipped",
+										reason: "prefix has no worktree",
+									});
+								}
+							}
+
+							// Step 5: the fork the user actually asked for.
+							//
+							// Delegated to `chapterFork.fork` rather than reimplemented: it owns
+							// branch/worktree creation, snapshot lineage adoption, the graph slot
+							// search, the narrator fork and the container/startup-script handling.
+							// It rolls only *itself* back on failure and takes no external rollback
+							// stack, so undoing a successful fork is this function's job.
+							const newForkChapter = await chapterFork.fork(prefixId, {
+								title: input.newFork.title,
+								description: input.newFork.description,
+								inheritMode: input.newFork.inheritMode,
+								worktreeSource: "commit",
+								startCommitSha: commitSha,
+								anchorCommitSha: commitSha,
+								locale: input.locale,
+							});
+							rollback.push(async () => {
+								// `chapterService.remove` is the only teardown that also stops containers,
+								// releases ports, kills terminals and drops the shadow repository — all of
+								// which `fork` may have created.
+								await chapterService.remove(newForkChapter.id);
+							});
+							const forkWarnings = (newForkChapter as { warnings?: string[] }).warnings;
+							if (forkWarnings?.length) warnings.push(...forkWarnings);
+
+							// Step 6: hand the original's incoming fork edges to the prefix.
+							//
+							// Ordered after everything that can fail on its own, and compensated
+							// first on rollback: `chapter_edges` cascades on both endpoints, so
+							// deleting the prefix row while these point at it would destroy the
+							// project's parent→O edges outright.
+							const inboundForkEdges = await db
+								.select({ id: chapterEdges.id })
+								.from(chapterEdges)
+								.where(and(eq(chapterEdges.targetId, chapterId), eq(chapterEdges.type, "fork")));
+							for (const edge of inboundForkEdges) {
+								const previousTargetId = await chapterEdgeService.redirectForkEdgeTarget(
+									edge.id,
+									prefixId,
+								);
+								rollback.push(async () => {
+									await chapterEdgeService.redirectForkEdgeTarget(edge.id, previousTargetId);
+								});
+							}
+
+							// The prefix→continuation edge. No compensation is registered: both
+							// endpoints cascade, so deleting the prefix row removes it.
+							await chapterEdgeService.createForkEdge(original.projectId, prefixId, chapterId, {
+								commitSha,
+								worktreeSource: "commit",
+								inheritMode: "full",
+								narratorMessageId: truncation?.messageId,
+							});
+
+							// Step 7: rewrite the original into the continuation.
+							//
+							// Last, and in one atomic section of the chapter write store, so the
+							// window in which the original claims a lineage that may still be
+							// rolled back is as small as it can be. `parentChapterId` is
+							// `ON DELETE SET NULL`, so even a crash between this commit and a later
+							// prefix deletion degrades to "no parent" rather than a dangling
+							// pointer.
+							//
+							// The commit records are recomputed, never deleted: the UI lists them and
+							// they are the chapter's only local record of its own history.
+							const continuationChapter = await chapterWriteStore.rewriteSplitContinuation({
+								chapterId,
+								prefixId,
+								commitSha,
+								...(truncation ? { narratorMessageId: truncation.messageId } : {}),
+								fallbackCommitCount: original.commitCount ?? null,
+								now,
+							});
+
+							logger.info("Chapter split", {
+								chapterId,
+								prefixId,
+								newForkId: newForkChapter.id,
+								commitSha,
+								truncationSeq: truncation?.seq ?? null,
+								truncationApproximate: truncation?.approximate ?? null,
+							});
+
+							// Emitted only once every compensable step has succeeded: subscribers
+							// (project-db sync, WebSocket fan-out) treat it as fact.
+							eventBus.emit({
+								type: "chapter:split",
+								prefixChapterId: prefixId,
+								continuationChapterId: chapterId,
+								newForkChapterId: newForkChapter.id,
+								commitSha,
+								projectId: original.projectId,
+							});
+
+							return {
+								prefixChapter,
+								continuationChapter,
+								newForkChapter,
+								commitSha,
+								...(warnings.length > 0 ? { warnings } : {}),
+								...(fallbacks.length > 0 ? { fallbacks } : {}),
+							};
+						} catch (err) {
+							logger.error("Chapter split failed, rolling back", {
+								chapterId,
+								prefixId,
+								error: String(err),
+							});
+							await compensateLegacyCreation(prefixId, prefixWorktreePath, rollback);
+							throw err;
+						}
+					},
+					prefixWorktreePath,
+				);
+			});
 		});
 	},
 };

@@ -60,6 +60,7 @@ import {
 	hasStructuredReasoning,
 	parseReasoningSegments,
 	type ReasoningSegment,
+	usesStructuredReasoning,
 } from "./reasoning-segments";
 import {
 	parseStreamingReasoningSegments,
@@ -179,6 +180,9 @@ export interface AdapterContentBlock {
 }
 
 export interface AdapterMessage {
+	/** Actual per-message identity; absent legacy identity must not enable GPT parsing. */
+	model?: string | null;
+	provider?: string | null;
 	id?: string;
 	role: string;
 	contentJson: AdapterContentBlock[];
@@ -1916,7 +1920,8 @@ function adaptMessage(
 			const lifecycleId = contentBlockLifecycleId(block);
 			const textExpanded = adapterTextExpanded(ctx, key, undefined, lifecycleId);
 			const parsed =
-				!textExpanded && isLongPlainReasoning(key, displayText)
+				!usesStructuredReasoning(msg.model) ||
+				(!textExpanded && isLongPlainReasoning(key, displayText))
 					? []
 					: (longSingleReasoningStep(key, displayText) ??
 						(streaming && !ctx.resolveReasoningSegments
@@ -4995,9 +5000,17 @@ function adaptActivityItems(
 			// `liveTail`, and the row keeps its key across the hand-off — so the instant
 			// the turn persists the SAME row gains its chevron.
 			const isLiveParse = isStreamingReasoningItem(item);
-			const parsed = isLiveParse
-				? parseStreamingReasoningTitles(`${traceKey}|${reasoningRowKeyBase(item)}`, text)
-				: (ctx.resolveReasoningSegments ?? parseReasoningSegments)(text);
+			const parsed: ReasoningSegment[] = !usesStructuredReasoning(item.msg?.model)
+				? [
+						{
+							title: null,
+							body: isLiveParse ? text.slice(0, TITLE_MAX_CHARS) : text,
+							isEmpty: text.length === 0,
+						},
+					]
+				: isLiveParse
+					? parseStreamingReasoningTitles(`${traceKey}|${reasoningRowKeyBase(item)}`, text)
+					: (ctx.resolveReasoningSegments ?? parseReasoningSegments)(text);
 			const rows =
 				parsed.length > 0
 					? parsed

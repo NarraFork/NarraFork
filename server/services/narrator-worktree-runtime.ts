@@ -1,20 +1,46 @@
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
+import { activeDatabaseBackend } from "../db";
 import { isAdminUser } from "../lib/agent/tools/admin-common";
 import type { ToolContext } from "../lib/agent/types";
 import { AppError } from "../lib/errors";
 import { narraforkDir } from "../lib/settings";
 import { authorizeGitTargetForPrincipal } from "./git-workspace-access";
 import type { NarratorPrincipal } from "./narrator-acl";
+import { loadNarratorForAccess, resolveAclRootId } from "./narrator-acl";
 import { FileWorktreeJournal } from "./narrator-worktree-journal";
+import { unknownWorktreeScope } from "./narrator-worktree-resource-store";
 import { narratorWorktreeResourceRegistry } from "./narrator-worktree-resources";
 import { NarratorWorktreeService } from "./narrator-worktree-service";
 import { withWorkspaceRepositoryLock, workspaceContextService } from "./workspace-context-service";
 
 /** Real production adapters; fixture tests deliberately import only the pure service. */
 export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrincipal>({
-	authorize: (principal, narratorId, need, signal) =>
-		authorizeGitTargetForPrincipal(principal, { narratorId }, need, signal),
+	authorize: async (principal, narratorId, need, signal) => {
+		if (activeDatabaseBackend !== "sqlite")
+			throw new AppError(
+				"Worktree resource adapter unavailable",
+				503,
+				"WORKTREE_RESOURCE_BACKEND_UNAVAILABLE",
+			);
+		const target = await authorizeGitTargetForPrincipal(principal, { narratorId }, need, signal);
+		const source = await loadNarratorForAccess(narratorId, principal, "read");
+		const rootId = await resolveAclRootId(source);
+		if (!rootId) return { ...target, resourceScope: unknownWorktreeScope };
+		const root = await loadNarratorForAccess(rootId, principal, "read");
+		signal.throwIfAborted();
+		// Resolver contextProjectId is explicit provenance, not cwd/repository proximity.
+		return {
+			...target,
+			resourceScope: root.ownerUserId
+				? {
+						scopeKind: target.contextProjectId ? ("project" as const) : ("standalone" as const),
+						scopeProjectId: target.contextProjectId ?? null,
+						scopeOwnerUserId: root.ownerUserId,
+					}
+				: unknownWorktreeScope,
+		};
+	},
 	withRevision: (narratorId, revision, action) =>
 		workspaceContextService.withRevision(narratorId, revision, undefined, async (context) => {
 			if (context.deviceId !== "local" || !context.capabilities.switchDirectory)

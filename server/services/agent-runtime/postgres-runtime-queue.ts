@@ -1842,6 +1842,31 @@ export function createPostgresRuntimeQueue(
 				.limit(1);
 			return rows.length > 0;
 		},
+		/** Named, indexed four-column receipt read; never load payloads while polling. */
+		async readUserBufferedDeliveryReceipt(
+			narratorId: string,
+			id: string,
+		): Promise<import("./runtime-queue-port").RuntimeBufferedDeliveryReceipt | undefined> {
+			pointer(narratorId);
+			pointer(id);
+			const rows = await db
+				.select({
+					id: mailbox.id,
+					state: mailbox.state,
+					recipientMessageId: mailbox.recipientMessageId,
+					lastError: mailbox.lastError,
+				})
+				.from(mailbox)
+				.where(
+					and(
+						eq(mailbox.id, id),
+						eq(mailbox.narratorId, narratorId),
+						eq(mailbox.kind, "user_input"),
+					),
+				)
+				.limit(1);
+			return rows[0];
+		},
 		/** Wake routing/archived probe on the recipient narrator row. */
 		async readRecipientRoute(
 			narratorId: string,

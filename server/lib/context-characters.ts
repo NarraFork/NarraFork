@@ -140,33 +140,131 @@ export function measureMessageCharacters(
 	return { segments };
 }
 
-const pendingRefreshes = new Map<string, Set<string>>();
+interface PendingCharacterRefresh {
+	messages: Set<string>;
+	full: boolean;
+}
+const pendingRefreshes = new Map<string, PendingCharacterRefresh>();
+const MAX_PENDING_CHARACTER_ACTORS = 256;
+const MAX_PENDING_CHARACTER_MESSAGES = 8192;
+let pendingMessages = 0;
+let overflowPending = false;
+let overflowFlushing = false;
+let overflowRetries = 0;
+let overflowBlocked = false;
+const flushingNarrators = new Set<string>();
 let refreshScheduled = false;
+let refreshRunning = false;
 
-/** Defer database imports and merge bursts. A failed notification cannot fail a committed write. */
-export function queueContextCharacterRefresh(narratorId: string, messageId?: string): void {
-	const messages = pendingRefreshes.get(narratorId) ?? new Set<string>();
-	if (messageId) messages.add(messageId);
-	pendingRefreshes.set(narratorId, messages);
-	if (refreshScheduled) return;
+/** A pending notification is not a fresh cache, even before its database revision advances. */
+export function hasPendingContextCharacterRefresh(narratorId?: string): boolean {
+	return (
+		overflowPending ||
+		overflowFlushing ||
+		(narratorId
+			? pendingRefreshes.has(narratorId) || flushingNarrators.has(narratorId)
+			: pendingRefreshes.size > 0 || flushingNarrators.size > 0)
+	);
+}
+
+function scheduleContextCharacterRefresh(): void {
+	if (
+		refreshScheduled ||
+		refreshRunning ||
+		overflowBlocked ||
+		(!overflowPending && pendingRefreshes.size === 0)
+	)
+		return;
 	refreshScheduled = true;
-	setTimeout(() => {
-		refreshScheduled = false;
-		const ids = [...pendingRefreshes];
-		pendingRefreshes.clear();
-		void import("../services/narrator-context-composition")
-			.then(async ({ invalidateContextCharacterCache }) => {
-				for (const [id, messages] of ids) {
-					try {
-						if (!messages.size) await invalidateContextCharacterCache(id);
-						else
-							for (const messageId of messages)
-								await invalidateContextCharacterCache(id, messageId);
-					} catch (error) {
-						console.warn("Context character refresh failed", id, error);
+	setTimeout(
+		() => {
+			refreshScheduled = false;
+			refreshRunning = true;
+			const ids = [...pendingRefreshes];
+			pendingRefreshes.clear();
+			pendingMessages = 0;
+			const overflow = overflowPending;
+			overflowPending = false;
+			overflowFlushing = overflow;
+			for (const [id] of ids) flushingNarrators.add(id);
+			void import("../services/narrator-context-composition")
+				.then(async (service) => {
+					if (overflow) {
+						// Unknown shared holders must also lose freshness; never silently discard IDs.
+						await service.invalidateContextCharacterOverflow();
+						overflowRetries = 0;
 					}
-				}
-			})
-			.catch((error: unknown) => console.warn("Context character refresh failed", error));
-	}, 0);
+					for (const [id, entry] of ids) {
+						try {
+							// One epoch per affected holder, not one epoch for every message in the burst.
+							if (typeof service.invalidateContextCharacterBatch === "function") {
+								await service.invalidateContextCharacterBatch(
+									id,
+									entry.messages.size ? [...entry.messages] : undefined,
+									{ full: entry.full },
+								);
+							} else {
+								// Compatibility with older integrations and isolated module fixtures.
+								if (entry.full || !entry.messages.size)
+									await service.invalidateContextCharacterCache(id);
+								for (const messageId of entry.messages)
+									await service.invalidateContextCharacterCache(id, messageId);
+							}
+						} catch (error) {
+							console.warn("Context character refresh failed", id, error);
+						} finally {
+							flushingNarrators.delete(id);
+						}
+					}
+				})
+				.catch((error: unknown) => {
+					if (overflow) {
+						overflowPending = true;
+						overflowRetries++;
+						overflowBlocked = overflowRetries >= 3;
+					}
+					console.warn("Context character refresh failed", error);
+				})
+				.finally(() => {
+					for (const [id] of ids) flushingNarrators.delete(id);
+					overflowFlushing = false;
+					refreshRunning = false;
+					scheduleContextCharacterRefresh();
+				});
+		},
+		overflowRetries ? 200 : 0,
+	);
+}
+
+/** Coalesce numeric changes before the asynchronous service invalidation; never read a body. */
+export function queueContextCharacterRefresh(narratorId: string, messageId?: string): void {
+	if (overflowBlocked) {
+		// A later actual write can retry an unavailable service; no endless hot retry loop.
+		overflowBlocked = false;
+		overflowRetries = 0;
+	}
+	if (overflowPending) {
+		scheduleContextCharacterRefresh();
+		return;
+	}
+	const known = pendingRefreshes.get(narratorId);
+	const newMessage = !!messageId && !known?.messages.has(messageId);
+	if (
+		(!known && pendingRefreshes.size >= MAX_PENDING_CHARACTER_ACTORS) ||
+		(newMessage && pendingMessages >= MAX_PENDING_CHARACTER_MESSAGES)
+	) {
+		// Fold the burst to a bounded mark sweep. Shared fork holders cannot be dropped.
+		pendingRefreshes.clear();
+		pendingMessages = 0;
+		overflowPending = true;
+		scheduleContextCharacterRefresh();
+		return;
+	}
+	const entry = known ?? { messages: new Set<string>(), full: false };
+	if (messageId) {
+		if (newMessage) pendingMessages++;
+		entry.messages.add(messageId);
+	} else entry.full = true;
+	pendingRefreshes.set(narratorId, entry);
+	scheduleContextCharacterRefresh();
 }

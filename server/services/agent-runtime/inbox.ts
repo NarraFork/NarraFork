@@ -11,6 +11,7 @@ import {
 	projectInjectionSenderText,
 	projectMessageSenderText,
 } from "../../lib/agent/sender-projection";
+import type { ToolCallBinding } from "../../lib/agent/types";
 import { AppError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
@@ -50,6 +51,48 @@ export interface InboxAgentMetadata {
 	fromMessageId?: string | null;
 	/** Initiating user for the producing pass; null/undefined means unattributed. */
 	userId?: string | null;
+}
+
+export interface InboxExecutionBinding {
+	toolCallBinding: ToolCallBinding;
+	bindingToolUseId: string;
+	bindingNarratorId: string;
+}
+
+/** Recover only the exact durable sender attempt, never the child's creation call. */
+export async function resolveInboxExecutionBinding(
+	row: RuntimeMailboxRow,
+): Promise<InboxExecutionBinding | null> {
+	if (!row.sourceNarratorId || !row.sourceToolCallId || row.sourceAttempt == null) return null;
+	try {
+		const source = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.id, row.sourceToolCallId),
+				eq(narratorToolCalls.narratorId, row.sourceNarratorId),
+				eq(narratorToolCalls.executionAttempt, row.sourceAttempt),
+			),
+			columns: { messageId: true, toolUseId: true },
+		});
+		if (!source) return null;
+		const { narratorPersistence } = await import("../narrator-persistence");
+		const binding = await narratorPersistence.getToolCallBinding(
+			row.sourceNarratorId,
+			source.messageId,
+			source.toolUseId,
+			row.sourceToolCallId,
+		);
+		return {
+			toolCallBinding: binding,
+			bindingToolUseId: source.toolUseId,
+			bindingNarratorId: row.sourceNarratorId,
+		};
+	} catch (error) {
+		logger.warn("Mailbox execution receipt unavailable; preserving unverified input", {
+			mailboxId: row.id,
+			error: String(error),
+		});
+		return null;
+	}
 }
 
 export function inboxMetadata<T>(row: Pick<RuntimeMailboxRow, "metadataJson">): T {
@@ -1148,8 +1191,11 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 					if (!head || !acceptsBufferedSubagentInput(head)) return false;
 				}
 				const { resumeSubagent } = await import("../subagent-resume");
+				const head = await peekInbox(narratorId);
+				const executionBinding = head ? await resolveInboxExecutionBinding(head) : null;
 				return (
 					await resumeSubagent({
+						...executionBinding,
 						subagentId: narratorId,
 						intent: "follow_up",
 						actor: "parent_agent",

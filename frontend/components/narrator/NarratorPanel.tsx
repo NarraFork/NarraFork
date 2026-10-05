@@ -1,5 +1,5 @@
 import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
-import { formatLocaleNumber } from "@frontend/lib/intl-format";
+import { formatCompactNumber } from "@frontend/lib/compact-number";
 import { narratorColumnPlaceholderStyle } from "@frontend/lib/narrator-content-column";
 import {
 	ActionIcon,
@@ -121,7 +121,7 @@ import { useCompactSummaryModal } from "./compact/use-compact-summary-modal";
 import type { FileReferenceScopeValue } from "./composer/FileReferenceScope";
 import type { NarratorComposerHandle, NarratorRemoteDraft } from "./composer/NarratorComposer";
 import { ContentViewerEnvironmentProvider } from "./content/ContentViewer";
-import { ContextCompositionModal } from "./context-management/ContextCompositionModal";
+import { ContextCompositionMenu } from "./context-management/ContextCompositionMenu";
 import {
 	type ContextManagementDraft,
 	DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
@@ -152,7 +152,10 @@ import { useComposerFileIngest } from "./interaction/use-composer-file-ingest";
 import { useInternalFileViewer } from "./interaction/use-internal-file-viewer";
 import { useInterruptLongPress } from "./interaction/use-interrupt-long-press";
 import { useMessageRevertConfirm } from "./interaction/use-message-revert-confirm";
-import { useNarratorForkActions } from "./interaction/use-narrator-fork-actions";
+import {
+	ordinaryPromoteDestination,
+	useNarratorForkActions,
+} from "./interaction/use-narrator-fork-actions";
 import { useNarratorSend } from "./interaction/use-narrator-send";
 import { usePermissionFocusNav } from "./interaction/use-permission-focus-nav";
 import { capabilityModelReference, useResolvedModel } from "./interaction/use-resolved-model";
@@ -573,17 +576,12 @@ function NarratorPanelBody({
 	const handlePromote = useCallback(() => {
 		promoteMutation.mutate(narratorId, {
 			onSuccess: (data) => {
-				if (data.type === "forked" && data.chapter) {
+				if (data.type === "forked") {
 					notifications.show({
 						message: t("promote_success_forked"),
 						color: "teal",
 					});
-					navigate({
-						to: "/projects/$projectId",
-						params: {
-							projectId: (data.chapter as Record<string, string>).projectId,
-						},
-					});
+					navigate(ordinaryPromoteDestination(data.narratorId));
 				} else {
 					notifications.show({
 						message: t("promote_success_unlocked"),
@@ -1091,10 +1089,10 @@ function NarratorPanelBody({
 		setQueuedMessages,
 		reconcileBufferedMessages,
 		substatus,
+		contextSnapshot,
 		contextPercent,
 		promptTokens,
 		contextWindow,
-		isEstimated,
 		contextStale,
 		activeCompactStart,
 		compactProgress,
@@ -2595,7 +2593,6 @@ function NarratorPanelBody({
 		if (!revertHistorySubmitting) setPendingBlockDelete(null);
 	}, [revertHistorySubmitting, setPendingBlockDelete]);
 
-	const [contextCompositionOpened, setContextCompositionOpened] = useState(false);
 	if (!narrator) return <NarratorPanelSkeleton />;
 
 	const statusBarDisplay = getNarratorStatusBarDisplay({
@@ -2718,83 +2715,62 @@ function NarratorPanelBody({
 	const contextIndicator = isWorkspacePreview ? (
 		contextRingNode
 	) : (
-		<>
-			{contextCompositionOpened && (
-				<ContextCompositionModal
-					opened={contextCompositionOpened}
-					onClose={() => setContextCompositionOpened(false)}
-					narratorId={narratorId}
-				/>
+		<ContextCompositionMenu
+			narratorId={narratorId}
+			totalTokens={promptTokens}
+			snapshot={contextSnapshot}
+			target={contextRingNode}
+		>
+			<Menu.Label c="dimmed" fz={10}>
+				{t("activeThresholds", {
+					compact: activeCompactStart ?? modelThresholds?.compactStart,
+				})}
+			</Menu.Label>
+			<Menu.Item
+				leftSection={<IconSettings size={14} />}
+				c="dimmed"
+				fz="xs"
+				onClick={handleOpenContextThresholdSettings}
+			>
+				{t("thresholdSettings")}
+			</Menu.Item>
+			<Menu.Divider />
+			{hasContextData && (
+				<Menu.Label>{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}</Menu.Label>
 			)}
-			<Menu position="top-start">
-				<Menu.Target>{contextRingNode}</Menu.Target>
-				<Menu.Dropdown>
-					<Menu.Item onClick={() => setContextCompositionOpened(true)}>
-						{t("contextComposition.title")}
-					</Menu.Item>
-					<Menu.Divider />
-					{contextStale && (
-						<Menu.Label c="orange" fz={10} style={{ maxWidth: 240, whiteSpace: "normal" }}>
-							{t("contextStaleHint")}
-						</Menu.Label>
-					)}
-					<Menu.Label c="dimmed" fz={10}>
-						{t("activeThresholds", {
-							compact: activeCompactStart ?? modelThresholds?.compactStart,
-						})}
-					</Menu.Label>
-					<Menu.Item
-						leftSection={<IconSettings size={14} />}
-						c="dimmed"
-						fz="xs"
-						onClick={handleOpenContextThresholdSettings}
-					>
-						{t("thresholdSettings")}
-					</Menu.Item>
-					<Menu.Divider />
-					{hasContextData && (
-						<Menu.Label>
-							{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
-						</Menu.Label>
-					)}
-					{promptTokens != null && (
-						<Menu.Label>
-							{contextWindow != null
-								? t("contextUsageTokensWithWindow", {
-										tokens: formatLocaleNumber(promptTokens),
-										window: formatLocaleNumber(contextWindow),
-									})
-								: t("contextUsageTokens", {
-										tokens: formatLocaleNumber(promptTokens),
-									})}
-							{isEstimated && (
-								<span style={{ opacity: 0.6, marginLeft: 4 }}>({t("estimated")})</span>
-							)}
-						</Menu.Label>
-					)}
-					<Menu.Divider />
-					<Menu.Item
-						leftSection={<IconArrowsMinimize size={14} />}
-						onClick={() => {
-							// Compacting state will arrive via substatus_change WS event
-							api.triggerCompact(narratorId).catch((err) => {
-								handleCompactError(err);
-							});
-						}}
-					>
-						{t("triggerCompact")}
-					</Menu.Item>
-					<Menu.Item
-						leftSection={<IconEraser size={14} />}
-						onClick={() => {
-							api.clearContext(narratorId).catch(() => {});
-						}}
-					>
-						{t("clearContext")}
-					</Menu.Item>
-				</Menu.Dropdown>
-			</Menu>
-		</>
+			{promptTokens != null && (
+				<Menu.Label>
+					{contextWindow != null
+						? t("contextUsageTokensWithWindow", {
+								tokens: formatCompactNumber(promptTokens).compact,
+								window: formatCompactNumber(contextWindow).compact,
+							})
+						: t("contextUsageTokens", {
+								tokens: formatCompactNumber(promptTokens).compact,
+							})}
+				</Menu.Label>
+			)}
+			<Menu.Divider />
+			<Menu.Item
+				leftSection={<IconArrowsMinimize size={14} />}
+				onClick={() => {
+					// Compacting state will arrive via substatus_change WS event
+					api.triggerCompact(narratorId).catch((err) => {
+						handleCompactError(err);
+					});
+				}}
+			>
+				{t("triggerCompact")}
+			</Menu.Item>
+			<Menu.Item
+				leftSection={<IconEraser size={14} />}
+				onClick={() => {
+					api.clearContext(narratorId).catch(() => {});
+				}}
+			>
+				{t("clearContext")}
+			</Menu.Item>
+		</ContextCompositionMenu>
 	);
 
 	// Configuration controls stay fixed; movable tools follow the saved bottom order.

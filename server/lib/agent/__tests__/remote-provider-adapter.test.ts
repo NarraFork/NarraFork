@@ -282,6 +282,35 @@ describe("RemoteProviderAdapter", () => {
 		});
 	});
 
+	test("chat bridges only remote final-input counts and old plugins report unknown", async () => {
+		const counts = { totalChars: 120, systemChars: 20, toolsChars: 40 };
+		for (const reported of [counts, undefined]) {
+			const snapshots: unknown[] = [];
+			const rpc = makeRpc([
+				event("request_started", {
+					...(reported ? { inputCharacters: reported } : {}),
+				}),
+				event("text.delta", { text: "hello" }),
+			]);
+			await collect(
+				makeAdapter(rpc).chat(chatParams({ onInputCharacters: (value) => snapshots.push(value) })),
+			);
+			expect(snapshots).toEqual([null, reported ?? null]);
+		}
+		expect(
+			providerStreamEventSchema.safeParse({
+				type: "request_started",
+				inputCharacters: { ...counts, totalChars: 1 },
+			}).success,
+		).toBe(false);
+		expect(
+			providerStreamEventSchema.safeParse({
+				type: "request_started",
+				inputCharacters: { ...counts, totalChars: Infinity },
+			}).success,
+		).toBe(false);
+	});
+
 	test("chat maps text, request_started, and done metadata", async () => {
 		let requestStarted: { credentialId?: string } | undefined;
 		const rpc = makeRpc([

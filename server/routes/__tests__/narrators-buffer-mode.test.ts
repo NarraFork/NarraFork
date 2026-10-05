@@ -34,6 +34,9 @@ function fixture(
 		retryError?: string;
 		controlError?: boolean;
 		wakeResult?: boolean;
+		deliveryError?: AppError;
+		deliveryGate?: Promise<void>;
+		receiptState?: "claimed" | "materialized";
 	} = {},
 ) {
 	let rows = options.rows ?? [{ id: "message", state: "queued", queueMode: "turn" }];
@@ -44,7 +47,7 @@ function fixture(
 	const update = mock(async (_id: string, mid: string, mode: string) => {
 		expect(locked).toBe(true);
 		order.push("mutation");
-		if (options.mutation === false) return false;
+		if (options.mutation === false || !rows.some((row) => row.id === mid)) return false;
 		rows = rows.map((row) => (row.id === mid ? { ...row, queueMode: mode } : row));
 		return true;
 	});
@@ -86,6 +89,22 @@ function fixture(
 			if (args[2] === undefined || args[3] === undefined)
 				throw new Error("Forbidden sync queue probe");
 			controls.push(args);
+		},
+		readBufferedMessageDeliveryReceipt: async () =>
+			options.receiptState
+				? {
+						id: "message",
+						state: options.receiptState,
+						recipientMessageId: "delivered-user",
+						lastError: null,
+					}
+				: undefined,
+		waitForBufferedMessageDelivery: async () => {
+			expect(locked).toBe(false);
+			order.push("delivery");
+			await options.deliveryGate;
+			if (options.deliveryError) throw options.deliveryError;
+			return { delivered: true, messageId: "delivered-user" };
 		},
 		wakeInboxIfEligible: async () => {
 			expect(locked).toBe(false);
@@ -149,6 +168,37 @@ function fixture(
 }
 
 describe("buffer retry HTTP mutation", () => {
+	test("selected failed urgent retry is promoted under admission before cancellation or delivery", async () => {
+		const f = fixture({
+			rows: [
+				{ id: "newer-urgent", state: "queued", queueMode: "interrupt" },
+				{ id: "message", state: "failed", queueMode: "interrupt" },
+			],
+		});
+		expect((await f.retry()).status).toBe(200);
+		expect(f.update).toHaveBeenCalledWith("session", "message", "interrupt");
+		expect(f.order).toEqual(["read", "retry", "mutation", "read", "delivery", "broadcast"]);
+		expect(f.controls).toEqual([["session", "interrupt", true, true]]);
+	});
+	test("lost urgent retry promotion without a valid claim receipt is conflict, not false delivery", async () => {
+		const f = fixture({
+			claimedAfterRetry: true,
+			rows: [{ id: "message", state: "failed", queueMode: "interrupt" }],
+		});
+		expect((await f.retry()).status).toBe(409);
+		expect(f.controls).toEqual([]);
+		expect(f.order).toEqual(["read", "retry", "mutation"]);
+	});
+	test("already materialized retry confirms receipt without cancelling the fresh owner", async () => {
+		const f = fixture({
+			claimedAfterRetry: true,
+			receiptState: "materialized",
+			rows: [{ id: "message", state: "failed", queueMode: "interrupt" }],
+		});
+		expect(await (await f.retry()).json()).toMatchObject({ ok: true, delivered: true });
+		expect(f.controls).toEqual([]);
+		expect(f.order).toEqual(["read", "retry", "mutation", "delivery", "broadcast"]);
+	});
 	for (const mode of ["tool", "interrupt", "turn"] as const) {
 		test(`busy primary retry restores ${mode} controls with PostgreSQL-safe authority`, async () => {
 			const f = fixture({
@@ -159,9 +209,20 @@ describe("buffer retry HTTP mutation", () => {
 			});
 			const response = await f.retry();
 			expect(response.status).toBe(200);
-			expect(await response.json()).toEqual({ ok: true, resumed: false });
+			expect(await response.json()).toEqual(
+				mode === "interrupt"
+					? { ok: true, resumed: true, delivered: true, messageId: "delivered-user" }
+					: { ok: true, resumed: false },
+			);
 			expect(f.controls).toEqual([["session", mode, mode !== "turn", true]]);
-			expect(f.order).toEqual(["read", "retry", "read", "wake", "broadcast"]);
+			expect(f.order).toEqual([
+				"read",
+				"retry",
+				...(mode === "interrupt" ? ["mutation"] : []),
+				"read",
+				mode === "interrupt" ? "delivery" : "wake",
+				"broadcast",
+			]);
 			expect(f.rows().map((row) => row.id)).toEqual(["earlier", "message"]);
 		});
 	}
@@ -181,10 +242,12 @@ describe("buffer retry HTTP mutation", () => {
 	test("instant claim after retry must not interrupt the new signal owner", async () => {
 		const f = fixture({
 			claimedAfterRetry: true,
+			receiptState: "claimed",
 			rows: [{ id: "message", state: "failed", queueMode: "interrupt" }],
 		});
 		expect((await f.retry()).status).toBe(200);
-		expect(f.controls).toEqual([["session", "interrupt", false, false]]);
+		expect(f.controls).toEqual([]);
+		expect(f.order).toEqual(["read", "retry", "mutation", "delivery", "broadcast"]);
 	});
 	test("ordinary retry preserves another queued guidance signal, excluding failed guidance", async () => {
 		for (const state of ["queued", "failed"] as const) {
@@ -226,15 +289,66 @@ describe("buffer retry HTTP mutation", () => {
 });
 
 describe("buffer mode HTTP mutation", () => {
+	test("interrupt acknowledgement waits for materialization after releasing admission", async () => {
+		const gate = Promise.withResolvers<void>();
+		const f = fixture({ deliveryGate: gate.promise });
+		let responded = false;
+		const pending = Promise.resolve(f.mode({ mode: "interrupt" })).then((response) => {
+			responded = true;
+			return response;
+		});
+		await Bun.sleep(10);
+		expect(responded).toBe(false);
+		expect(f.order).toEqual(["mutation", "read", "delivery"]);
+		gate.resolve();
+		expect(await (await pending).json()).toEqual({
+			ok: true,
+			delivered: true,
+			messageId: "delivered-user",
+		});
+	});
+	for (const status of [409, 499, 504]) {
+		test(`interrupt delivery failure ${status} preserves durable input and publishes it`, async () => {
+			const f = fixture({ deliveryError: new AppError("not delivered", status, "DELIVERY_ERROR") });
+			const response = await f.mode({ mode: "interrupt" });
+			expect(response.status).toBe(status);
+			expect(await response.json()).toEqual({ error: "not delivered" });
+			expect(f.rows()).toEqual([{ id: "message", state: "queued", queueMode: "interrupt" }]);
+			expect(f.retryMutation).not.toHaveBeenCalled();
+			expect(f.controls).toHaveLength(1);
+			expect(f.order).toEqual(["mutation", "read", "delivery", "broadcast"]);
+		});
+	}
+	for (const receiptState of ["claimed", "materialized"] as const) {
+		test(`concurrent urgent ${receiptState} request confirms receipt without cancelling a new owner`, async () => {
+			const f = fixture({ mutation: false, receiptState });
+			const response = await f.mode({ mode: "interrupt" });
+			expect(await response.json()).toEqual({
+				ok: true,
+				delivered: true,
+				messageId: "delivered-user",
+			});
+			expect(f.controls).toEqual([]);
+		});
+	}
 	for (const mode of ["tool", "interrupt"] as const) {
 		for (const wakeResult of [true, false]) {
 			test(`${wakeResult ? "idle" : "busy"} queued ${mode} mode wakes after admission unlock`, async () => {
 				const f = fixture({ wakeResult });
 				const response = await f.mode({ mode });
 				expect(response.status).toBe(200);
-				expect(await response.json()).toEqual({ ok: true });
+				expect(await response.json()).toEqual(
+					mode === "interrupt"
+						? { ok: true, delivered: true, messageId: "delivered-user" }
+						: { ok: true },
+				);
 				expect(f.controls).toEqual([["session", mode, true, true]]);
-				expect(f.order).toEqual(["mutation", "read", "wake", "broadcast"]);
+				expect(f.order).toEqual([
+					"mutation",
+					"read",
+					mode === "interrupt" ? "delivery" : "wake",
+					"broadcast",
+				]);
 			});
 		}
 	}

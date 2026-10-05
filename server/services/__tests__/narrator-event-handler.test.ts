@@ -1,14 +1,17 @@
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import type { ContextUsageSnapshot } from "@shared/context-usage";
 import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
 import { eq } from "drizzle-orm";
 import { getTestDb } from "../../../tests/setup";
 import {
+	apiRequests,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
+import type { TokenUsageSnapshot } from "../narrator-event-handler";
 
 // Functional in-memory test db (not empty stubs): Bun's mock.module is global
 // and leaks across files, so `{}` stubs would break `db.*` in later real-db suites.
@@ -189,6 +192,88 @@ describe("Write complete input source routing", () => {
 });
 
 describe("request attribution", () => {
+	test("persists the actual request identity on the first content checkpoint", async () => {
+		const id = "request-checkpoint-identity";
+		const createdAt = new Date().toISOString();
+		await db
+			.insert(narrators)
+			.values({ id, type: "primary", inheritMode: "fresh", createdAt, updatedAt: createdAt });
+		let partialId: string | undefined;
+		const ctx: EventHandlerContext = {
+			...makeMainContext(),
+			narratorId: id,
+			broadcastTargetId: id,
+			model: "__default__",
+			provider: "configured-provider",
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (value) => {
+				partialId = value;
+			},
+		};
+		try {
+			await processEvent(
+				{
+					type: "api_request_start",
+					requestId: "checkpoint-request",
+					model: "gpt-resolved",
+					provider: "openai",
+				},
+				ctx,
+			);
+			expect(ctx).toMatchObject({ model: "gpt-resolved", provider: "openai" });
+			await processEvent(
+				{
+					type: "block_complete",
+					block: { type: "reasoning", id: "reason-checkpoint", text: "Actual reasoning" },
+				},
+				ctx,
+			);
+			expect(partialId).toBeDefined();
+			const persisted = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, partialId as string),
+			});
+			expect(persisted).toMatchObject({ model: "gpt-resolved", provider: "openai" });
+			expect(persisted?.contentJson).toMatchObject([
+				{ type: "reasoning", text: "Actual reasoning" },
+			]);
+		} finally {
+			clearStreamingSnapshot(id);
+			await cleanupFileContextNarrator(id);
+		}
+	});
+	test("publishes actual request identity to live clients and author reconnect snapshots", async () => {
+		for (const child of [false, true]) {
+			const ctx = child ? makeSubagentContext() : makeMainContext();
+			ctx.model = "configured-default";
+			ctx.provider = "configured-provider";
+			await processEvent(
+				{
+					type: "api_request_start",
+					requestId: `identity-${child}`,
+					model: child ? "gpt-child" : "gpt-actual",
+					provider: "actual-provider",
+				},
+				ctx,
+			);
+			expect(getStreamingSnapshot(ctx.narratorId)).toMatchObject({
+				model: child ? "gpt-child" : "gpt-actual",
+				provider: "actual-provider",
+			});
+			const identities = (broadcastMessages as Array<Record<string, unknown>>).filter(
+				(message) => message.type === "streaming_identity",
+			);
+			expect(identities.at(-1)).toMatchObject({
+				model: child ? "gpt-child" : "gpt-actual",
+				provider: "actual-provider",
+			});
+			if (child) {
+				expect(identities.at(-2)).toMatchObject({ parentToolUseId: PARENT_TOOL_USE_ID });
+				expect(identities.at(-1)).not.toHaveProperty("parentToolUseId");
+				expect(broadcastTargets.at(-1)).toBe(SUBAGENT_NARRATOR_ID);
+				expect(getStreamingSnapshot(PARENT_NARRATOR_ID)?.model).toBe("gpt-actual");
+			}
+		}
+	});
 	test("subagent request keeps its event owner rather than the later pass owner", async () => {
 		const ctx = makeSubagentContext();
 		ctx.userId = "later-user";
@@ -274,6 +359,149 @@ async function cleanupFileContextNarrator(id: string) {
 		sqlite.run("PRAGMA foreign_keys = ON");
 	}
 }
+
+describe("request occupancy is independent from billing and historical usage", () => {
+	test("real usage explicitly clears sticky estimate state in memory, WS and SSE", async () => {
+		let usage: TokenUsageSnapshot = { promptTokens: 42, inputTokens: 42, isEstimated: true };
+		const sse = new EventEmitter();
+		const sseEvents: Array<{ data: Record<string, unknown> }> = [];
+		sse.on("event", (event) => sseEvents.push(event));
+		const ctx = {
+			...makeMainContext(sse),
+			getTokenUsage: () => usage,
+			setTokenUsage: (next: TokenUsageSnapshot | undefined) => {
+				usage = next ?? {};
+			},
+		};
+		await processEvent(
+			{
+				type: "context_usage",
+				source: "upstream",
+				percentage: 92.6,
+				promptTokens: 926000,
+				contextWindow: 1_000_000,
+				isEstimated: true,
+			},
+			ctx,
+		);
+		expect(usage.promptTokens).toBe(42);
+		await processEvent(
+			{
+				type: "context_usage",
+				source: "usage",
+				percentage: 51.08,
+				promptTokens: 510800,
+				inputTokens: 510800,
+				contextWindow: 1_000_000,
+				isEstimated: false,
+			},
+			ctx,
+		);
+		expect(usage).toMatchObject({ promptTokens: 510800, inputTokens: 510800, isEstimated: false });
+		expect((broadcastMessages.at(-1) as { isEstimated?: boolean }).isEstimated).toBe(false);
+		expect(sseEvents.at(-1)?.data.isEstimated).toBe(false);
+	});
+	test("request end stores one snapshot in narrator, API row and assistant turn metadata", async () => {
+		const id = "occupancy-history-narrator";
+		const now = "2026-10-05T00:00:00Z";
+		await db.insert(narrators).values({ id, createdAt: now, updatedAt: now });
+		let usage: TokenUsageSnapshot | undefined;
+		let pct: number | undefined;
+		const ctx: EventHandlerContext = {
+			...makeMainContext(),
+			narratorId: id,
+			broadcastTargetId: id,
+			provider: "anthropic",
+			model: "claude-sonnet-4-20250514",
+			getTokenUsage: () => usage,
+			setTokenUsage: (next) => {
+				usage = next;
+			},
+			getContextUsagePct: () => pct,
+			setContextUsagePct: (next) => {
+				pct = next;
+			},
+		};
+		const snapshot: ContextUsageSnapshot = {
+			requestId: "logical-occupancy-history",
+			startedAt: now,
+			source: "upstream",
+			percentage: 92.6,
+			contextWindow: 1_000_000,
+			occupiedTokens: 926000,
+			inputCharacters: { totalChars: 1_000_000, systemChars: 0, toolsChars: 0 },
+			composition: null,
+		};
+		try {
+			await processEvent(
+				{
+					type: "api_request_start",
+					requestId: snapshot.requestId,
+					provider: "anthropic",
+					model: "claude-sonnet-4-20250514",
+				},
+				ctx,
+			);
+			await processEvent(
+				{
+					type: "context_usage",
+					source: "upstream",
+					percentage: 92.6,
+					promptTokens: 926000,
+					contextWindow: 1_000_000,
+					isEstimated: true,
+					snapshot,
+				},
+				ctx,
+			);
+			await processEvent(
+				{
+					type: "api_request_end",
+					requestId: snapshot.requestId,
+					contextPercent: 92.6,
+					contextSnapshot: snapshot,
+					usage: { promptTokens: 510800, inputTokens: 510800, completionTokens: 12 },
+				},
+				ctx,
+			);
+			expect(usage).toMatchObject({
+				promptTokens: 510800,
+				inputTokens: 510800,
+				isEstimated: false,
+				contextSnapshot: snapshot,
+			});
+			expect(
+				db
+					.select({ snapshot: narrators.contextUsageSnapshotJson })
+					.from(narrators)
+					.where(eq(narrators.id, id))
+					.get()?.snapshot,
+			).toEqual(snapshot);
+			const request = db.select().from(apiRequests).where(eq(apiRequests.narratorId, id)).get();
+			expect(request?.inputTokens).toBe(510800);
+			expect(request?.contextUsageSnapshotJson).toEqual(snapshot);
+			expect(broadcastMessages.at(-1)).toMatchObject({
+				type: "context_usage",
+				promptTokens: 926000,
+				snapshot,
+			});
+			await processEvent({ type: "assistant_message", text: "answer", toolUses: [] }, ctx);
+			const message = db
+				.select({ usage: narratorMessages.turnUsageJson })
+				.from(narratorMessages)
+				.where(eq(narratorMessages.narratorId, id))
+				.get();
+			expect(message?.usage).toMatchObject({
+				input_tokens: 510800,
+				prompt_tokens: 510800,
+				context_snapshot: snapshot,
+			});
+		} finally {
+			await db.delete(apiRequests).where(eq(apiRequests.narratorId, id));
+			await cleanupFileContextNarrator(id);
+		}
+	});
+});
 
 describe("streaming snapshot author isolation", () => {
 	for (const event of [

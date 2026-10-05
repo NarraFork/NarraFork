@@ -34,16 +34,23 @@
  * — which is the asymmetry that actually matters, since the archive is what they would retry
  * from.
  */
+
+import { NARRATOR_BACKUP_LIMITS } from "@shared/narrator-backup";
 import { eq } from "drizzle-orm";
-import { db } from "../db";
+import { activeDatabaseBackend, db } from "../db";
+import { getDbPath } from "../db/connection";
 import { projects } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { getProjectDbPath } from "../lib/project-db";
+import type { BackupActor } from "./narrator-backup/contract";
 import { initializeRefSeqFloor, markNarratorSeqFloorHealedMany } from "./narrator-refs/seq-store";
 import { ProjectArchiveFile } from "./project-archive/archive-file";
+import { importLegacyProjectOnWorker } from "./project-archive/legacy-import-job";
 import type { ArchiveBatch, ArchiveRow } from "./project-archive/main-store";
 import { ARCHIVE_TABLE_ORDER, type ArchiveTable } from "./project-archive/manifest";
 import { projectArchiveMainStore } from "./project-archive/store";
+import { sanitizeLegacyPolicyRow } from "./project-archive/untrusted-policy";
 
 export interface ImportResult {
 	projectId: string;
@@ -185,7 +192,12 @@ function retainBatch(
 	}
 	budget.rows = nextRows;
 	budget.serializedBytes = nextBytes;
-	batches.push({ table, columns, rows });
+	const sanitizedRows = rows.map((row) => {
+		const sanitized = { ...row };
+		sanitizeLegacyPolicyRow(sanitized);
+		return sanitized;
+	});
+	batches.push({ table, columns, rows: sanitizedRows });
 }
 
 function resolveImportLimits(overrides: Partial<ProjectImportLimits>): ProjectImportLimits {
@@ -212,8 +224,30 @@ function resolveImportLimits(overrides: Partial<ProjectImportLimits>): ProjectIm
 export async function importProject(
 	gitPath: string,
 	limitOverrides: Partial<ProjectImportLimits> = {},
+	options: { actor?: BackupActor; signal?: AbortSignal; worker?: boolean } = {},
 ): Promise<ImportResult> {
 	const limits = resolveImportLimits(limitOverrides);
+	// HTTP and production callers never stage or commit a large archive on the main thread.
+	// The old adapter path remains solely for isolated legacy-format/limit override tests.
+	if (options.worker ?? process.env.NODE_ENV !== "test") {
+		if (Object.keys(limitOverrides).length)
+			throw new ValidationError("Worker import uses fixed production budgets");
+		return importLegacyProjectOnWorker(
+			{
+				gitPath,
+				archivePath: getProjectDbPath(gitPath),
+				databasePath: getDbPath(),
+				backend: activeDatabaseBackend === "postgres" ? "postgres" : "sqlite",
+				postgresUrl:
+					activeDatabaseBackend === "postgres"
+						? (process.env.NF_DATABASE_URL ?? process.env.DATABASE_URL)
+						: undefined,
+				actor: options.actor,
+				deadline: Date.now() + NARRATOR_BACKUP_LIMITS.jobMs,
+			},
+			options.signal,
+		);
+	}
 	const archive = ProjectArchiveFile.open(gitPath);
 
 	try {

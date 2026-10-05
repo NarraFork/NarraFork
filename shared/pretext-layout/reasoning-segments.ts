@@ -40,6 +40,12 @@ export interface ReasoningSegment {
 
 const EMPTY_PLACEHOLDER = "<!-- -->";
 
+/** Only GPT summaries use the bold-title step convention. Unknown models stay plain. */
+export function usesStructuredReasoning(model: string | null | undefined): boolean {
+	const name = model?.trim().split(":").at(-1) ?? "";
+	return /^gpt(?:-|$)/i.test(name);
+}
+
 /**
  * If `paragraph` is a pure bold title (`**Title**` optionally followed by more
  * lines), return `{ title, rest }` where `rest` is the paragraph content after

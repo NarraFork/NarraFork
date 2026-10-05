@@ -1508,6 +1508,9 @@ async function sendSubagentMessageDetailedWithRun(
 				const bgAbort = new AbortController();
 				try {
 					await resumeSubagent({
+						toolCallBinding: input.toolCallBinding,
+						bindingToolUseId: input.toolUseId,
+						bindingNarratorId: input.callerNarratorId,
 						subagentId: fresh.id,
 						intent: "follow_up",
 						actor: "parent_agent",

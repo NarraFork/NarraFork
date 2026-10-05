@@ -1,7 +1,8 @@
-import { ActionIcon, Group, Tooltip } from "@mantine/core";
+import { ActionIcon, Box, Group, Tooltip } from "@mantine/core";
 import { IconFlask, IconX } from "@tabler/icons-react";
-import { memo, type ReactNode, useMemo } from "react";
+import { lazy, memo, type ReactNode, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import type { NarratorDockContextValue } from "../dock/NarratorDockContext";
+import { usePanelHeaderControls } from "../panels/panel-header-controls";
 import { NarratorToolbarItem, type NarratorToolbarItemProps } from "./NarratorToolbarItem";
 import { NarratorToolbarOverflowMenu } from "./NarratorToolbarOverflowMenu";
 import {
@@ -9,6 +10,13 @@ import {
 	selectHeaderToolbarEntries,
 } from "./narrator-header-toolbar-capacity";
 import type { NarratorToolbarHost } from "./narrator-toolbar-items";
+
+const NarratorBackupEntry = lazy(() =>
+	import("../NarratorBackupEntry").then((m) => ({ default: m.NarratorBackupEntry })),
+);
+const NarratorBackupModal = lazy(() =>
+	import("../NarratorBackupModal").then((m) => ({ default: m.NarratorBackupModal })),
+);
 
 export interface HeaderToolbarProps extends Omit<NarratorToolbarItemProps, "def" | "mode"> {
 	headerHostCapabilities: readonly NarratorToolbarHost[];
@@ -35,6 +43,7 @@ export interface HeaderToolbarProps extends Omit<NarratorToolbarItemProps, "def"
  * the remainder stays in the overflow menu. No flex fight with the title.
  */
 export const HeaderToolbar = memo(function HeaderToolbar(props: HeaderToolbarProps) {
+	const controls = usePanelHeaderControls();
 	const {
 		headerHostCapabilities,
 		toolbarBadgeCounts,
@@ -51,6 +60,17 @@ export const HeaderToolbar = memo(function HeaderToolbar(props: HeaderToolbarPro
 	const { toolbarEntries, saveToolbarLayout, activateToolbarEntry, renderToolbarInlineOptions } =
 		controller;
 	const surfaced = controller.toolbarSurfacedDefs;
+	// Menu.Dropdown unmounts on an outside click (including a portaled Modal).
+	// Keep the workflow and its job state owned by this persistent header instead.
+	const [backupOpened, setBackupOpened] = useState(false);
+	const [backupLoaded, setBackupLoaded] = useState(false);
+	const backupNarratorId = useRef(props.narratorId);
+	useEffect(() => {
+		if (backupNarratorId.current === props.narratorId) return;
+		backupNarratorId.current = props.narratorId;
+		setBackupOpened(false);
+		setBackupLoaded(false);
+	}, [props.narratorId]);
 
 	// Keep the partition helper on the production path. `unmeasured` maps to
 	// capacity `null`, which shows every surfaced entry and labels none "no room"
@@ -68,53 +88,86 @@ export const HeaderToolbar = memo(function HeaderToolbar(props: HeaderToolbarPro
 	const noRoomIds = useMemo(() => noRoomDefs.map((d) => d.id as string), [noRoomDefs]);
 
 	return (
-		<Group
-			gap="xs"
-			wrap="nowrap"
-			style={{ flex: "0 0 auto", marginLeft: "auto" }}
-			{...{ [HEADER_TOOLBAR_FIXED_ATTR]: "" }}
-		>
-			{visibleDefs.map((def) => (
-				<NarratorToolbarItem key={def.id} {...props} def={def} />
-			))}
-			{dock && mockStreamEnabled && (
-				<Tooltip label="Mock stream (debug)">
-					<ActionIcon
-						size="sm"
-						variant={dock.openToolTypes.has("mock") ? "light" : "subtle"}
-						color={dock.openToolTypes.has("mock") ? "indigo" : "gray"}
-						onClick={() => dock.toggleToolPanel("mock")}
-					>
-						<IconFlask size={16} />
-					</ActionIcon>
-				</Tooltip>
-			)}
-			<NarratorToolbarOverflowMenu
-				entries={toolbarEntries}
-				hiddenDefs={hiddenDefs}
-				noRoomIds={noRoomIds}
-				onSaveLayout={saveToolbarLayout}
-				hostCapabilities={headerHostCapabilities}
-				badgeCounts={toolbarBadgeCounts}
-				onActivate={activateToolbarEntry}
-				renderInlineOptions={renderToolbarInlineOptions}
-				onArchive={openArchiveConfirm}
-				archiveLoading={archiveMutation.isPending}
-				compatibilityEntry={props.compatibilityEntry}
-			/>
-			{onClose && (
-				<Tooltip label={t("closePanel")}>
-					<ActionIcon
+		<>
+			<Group
+				gap="xs"
+				wrap="nowrap"
+				style={{ flex: "0 0 auto", marginLeft: "auto" }}
+				{...{ [HEADER_TOOLBAR_FIXED_ATTR]: "" }}
+			>
+				{visibleDefs.map((def) => (
+					<NarratorToolbarItem key={def.id} {...props} def={def} />
+				))}
+				{dock && mockStreamEnabled && (
+					<Tooltip label="Mock stream (debug)">
+						<ActionIcon
+							size="sm"
+							variant={dock.openToolTypes.has("mock") ? "light" : "subtle"}
+							color={dock.openToolTypes.has("mock") ? "indigo" : "gray"}
+							onClick={() => dock.toggleToolPanel("mock")}
+						>
+							<IconFlask size={16} />
+						</ActionIcon>
+					</Tooltip>
+				)}
+				<NarratorToolbarOverflowMenu
+					entries={toolbarEntries}
+					hiddenDefs={hiddenDefs}
+					noRoomIds={noRoomIds}
+					onSaveLayout={saveToolbarLayout}
+					hostCapabilities={headerHostCapabilities}
+					badgeCounts={toolbarBadgeCounts}
+					onActivate={activateToolbarEntry}
+					renderInlineOptions={renderToolbarInlineOptions}
+					onArchive={openArchiveConfirm}
+					archiveLoading={archiveMutation.isPending}
+					compatibilityEntry={props.compatibilityEntry}
+					backupEntry={
+						<Suspense fallback={null}>
+							<NarratorBackupEntry
+								key={props.narratorId}
+								narratorId={props.narratorId}
+								onOpen={() => {
+									setBackupLoaded(true);
+									setBackupOpened(true);
+								}}
+							/>
+						</Suspense>
+					}
+				/>
+				{onClose && controls?.pinAction && (
+					<Box
 						{...{ [HEADER_TOOLBAR_FIXED_ATTR]: "" }}
-						size="sm"
-						variant="subtle"
-						color="red"
-						onClick={onClose}
+						className="nodrag"
+						style={{ display: "flex", flexShrink: 0 }}
 					>
-						<IconX size={16} />
-					</ActionIcon>
-				</Tooltip>
+						{controls.pinAction}
+					</Box>
+				)}
+				{onClose && (
+					<Tooltip label={t("closePanel")}>
+						<ActionIcon
+							{...{ [HEADER_TOOLBAR_FIXED_ATTR]: "" }}
+							size="sm"
+							variant="subtle"
+							color="red"
+							onClick={onClose}
+						>
+							<IconX size={16} />
+						</ActionIcon>
+					</Tooltip>
+				)}
+			</Group>
+			{backupLoaded && (
+				<Suspense fallback={null}>
+					<NarratorBackupModal
+						key={props.narratorId}
+						opened={backupOpened}
+						onClose={() => setBackupOpened(false)}
+						narratorId={props.narratorId}
+					/>
+				</Suspense>
 			)}
-		</Group>
+		</>
 	);
 });

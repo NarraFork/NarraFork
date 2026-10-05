@@ -100,8 +100,8 @@ import {
 // Pure in-memory state module (no imports of its own), so importing it here
 // cannot widen this file's already-delicate import cycle with narrator-service.
 import {
+	getCurrentSubagentFileChangeOptions,
 	getFileChangesBySubagent,
-	type SubagentExecutionBoundary,
 	type SubagentFileChanges,
 } from "./subagent-file-changes";
 import { getRecentSubagentModelInheritance } from "./subagent-model";
@@ -975,6 +975,7 @@ async function deleteBlockSelection(
 					.set({
 						...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
 						messageVersion: sql`${narrators.messageVersion} + 1`,
+						contextUsageSnapshotJson: null,
 						updatedAt: new Date().toISOString(),
 					})
 					.where(eq(narrators.id, narratorId))
@@ -1184,6 +1185,7 @@ function deleteOutputlessAssistantMessage(
 			.set({
 				apiConversationId: null,
 				messageVersion: sql`${narrators.messageVersion} + 1`,
+				contextUsageSnapshotJson: null,
 				messageStructureVersion: sql`${narrators.messageStructureVersion} + 1`,
 				updatedAt: new Date().toISOString(),
 			})
@@ -1493,6 +1495,7 @@ async function deleteMessageRange(
 			.set({
 				...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
 				messageVersion: sql`${narrators.messageVersion} + 1`,
+				contextUsageSnapshotJson: null,
 				updatedAt: new Date().toISOString(),
 			})
 			.where(eq(narrators.id, narratorId))
@@ -2204,7 +2207,6 @@ interface SubagentActivityOwner {
 	subagentNarratorId: string;
 	model: string | null;
 	reasoningEffort: string | null;
-	executionBoundary: SubagentExecutionBoundary;
 }
 
 /**
@@ -2348,14 +2350,10 @@ async function buildSubagentActivities(
 	}
 	const narratorIds = [...new Set(owners.map((owner) => owner.subagentNarratorId))];
 	const toolCallsByNarrator = await loadLatestSubagentToolCalls(narratorIds);
-	const executionBoundariesBySubagent = new Map(
-		owners.map((owner) => [owner.subagentNarratorId, owner.executionBoundary] as const),
-	);
+	const currentOptions = await getCurrentSubagentFileChangeOptions(narratorIds);
 	// One aggregate for EVERY card on the page. A per-card query here would turn
 	// opening a session with a dozen Agent calls into a query storm on a list path.
-	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds, {
-		executionBoundariesBySubagent,
-	});
+	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds, currentOptions);
 	for (const owner of owners) {
 		const effectiveReasoningEffort =
 			owner.reasoningEffort ??
@@ -2426,6 +2424,9 @@ function resolveAggregateScopeTx(tx: MessageTx, narratorId: string, toolUseIds: 
 						executionIdentityVersion: narratorToolCalls.executionIdentityVersion,
 						executionAttempt: narratorToolCalls.executionAttempt,
 						executionSegmentId: narratorToolCalls.executionSegmentId,
+						executionStartedAt: narratorToolCalls.executionStartedAt,
+						createdAt: narratorToolCalls.createdAt,
+						completedAt: narratorToolCalls.completedAt,
 						callerSeq: sql<
 							number | null
 						>`(SELECT aggregate_ref.seq FROM narrator_message_refs aggregate_ref
@@ -2605,12 +2606,6 @@ function resolveAggregateScopeTx(tx: MessageTx, narratorId: string, toolUseIds: 
 			subagentNarratorId: row.id,
 			model: row.model,
 			reasoningEffort: row.reasoningEffort,
-			executionBoundary: {
-				sourceToolCallId: parent.id,
-				executionAttempt: parent.executionAttempt ?? null,
-				executionIdentityVersion: parent.executionIdentityVersion ?? null,
-				executionSegmentId: parent.executionSegmentId ?? null,
-			},
 		});
 		ownerGroups.set(parentToolUseId, group);
 	}
@@ -4438,6 +4433,7 @@ const narratorMessageQueriesUnlocked = {
 							}
 						: {}),
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: now,
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4507,6 +4503,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4571,6 +4568,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4626,6 +4624,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4672,6 +4671,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4743,6 +4743,7 @@ const narratorMessageQueriesUnlocked = {
 			tx.update(narrators)
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4766,6 +4767,7 @@ const narratorMessageQueriesUnlocked = {
 				.set({
 					errorMessage: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 				})
 				.where(eq(narrators.id, narratorId));
 			const narrator = await db.query.narrators.findFirst({
@@ -4813,6 +4815,7 @@ const narratorMessageQueriesUnlocked = {
 				.set({
 					errorMessage: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 				})
 				.where(eq(narrators.id, narratorId))
 				.run();
@@ -4940,6 +4943,7 @@ const narratorMessageQueriesUnlocked = {
 					contextSummaryChars: measureSummaryCharacters(summary),
 					apiConversationId: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
 					updatedAt: now,
 				})
 				.where(eq(narrators.id, narratorId))

@@ -104,6 +104,7 @@ import {
 	toBufferSummary,
 } from "../narrator-buffer";
 import { runCustomCompact, runPlanCompact } from "../narrator-compact";
+import { freezeNarratorContextComposition } from "../narrator-context-composition";
 import {
 	clearStreamingSnapshot,
 	type EventHandlerContext,
@@ -768,13 +769,14 @@ export async function runAgentLoopUnlocked(
 			const pendingQuestionHint = await buildPendingQuestionHint(narratorId);
 			if (pendingQuestionHint)
 				active.systemPrompt = `${active.systemPrompt ?? ""}\n\n${pendingQuestionHint}`;
-			await storeRuntimeCharacters({
-				systemChars: countRuntimeSystemCharacters(
-					active.systemPrompt,
-					freshNarrator.contextSummary,
-					profile.kind === "primary" ? summaryRange : undefined,
-				),
-			});
+			const initialSystemChars = countRuntimeSystemCharacters(
+				active.systemPrompt,
+				freshNarrator.contextSummary,
+				profile.kind === "primary" ? summaryRange : undefined,
+			);
+			// Already-held prompt/summary memory, never a cache count or a GET body read.
+			let runtimeSummaryChars = (active.systemPrompt?.length ?? 0) - initialSystemChars;
+			await storeRuntimeCharacters({ systemChars: initialSystemChars });
 			active._usedCompactSummary = usedCompactSummary;
 
 			const eventContext: EventHandlerContext = createRuntimeEventContext({
@@ -850,11 +852,15 @@ export async function runAgentLoopUnlocked(
 						const prompt = profile.rebuildSystemPrompt
 							? await profile.rebuildSystemPrompt(freshNarrator.contextSummary)
 							: profile.systemPrompt;
-						await storeRuntimeCharacters({
-							systemChars: countRuntimeSystemCharacters(prompt, freshNarrator.contextSummary),
-						});
 						const hint = await buildPendingQuestionHint(narratorId);
-						return hint ? `${prompt}\n\n${hint}` : prompt;
+						const finalPrompt = hint ? `${prompt}\n\n${hint}` : prompt;
+						const systemChars = countRuntimeSystemCharacters(
+							finalPrompt,
+							freshNarrator.contextSummary,
+						);
+						runtimeSummaryChars = (finalPrompt?.length ?? 0) - systemChars;
+						await storeRuntimeCharacters({ systemChars });
+						return finalPrompt;
 					}
 					const freshOAuthRuntime = await assertOAuthNarratorRuntimeActive(
 						narratorId,
@@ -881,18 +887,19 @@ export async function runAgentLoopUnlocked(
 						// model being told to write somewhere the gate then rejects.
 						active._planFilePath,
 					);
-					await storeRuntimeCharacters({
-						systemChars: countRuntimeSystemCharacters(
-							prompt,
-							freshNarrator.contextSummary,
-							summaryRange,
-						),
-					});
+					const hint = await buildPendingQuestionHint(narratorId);
+					const finalPrompt = hint ? `${prompt}\n\n${hint}` : prompt;
+					const systemChars = countRuntimeSystemCharacters(
+						finalPrompt,
+						freshNarrator.contextSummary,
+						summaryRange,
+					);
+					runtimeSummaryChars = (finalPrompt?.length ?? 0) - systemChars;
+					await storeRuntimeCharacters({ systemChars });
 					// NOTE: Do NOT set active.systemPrompt here — the returned value
 					// flows through onBeforeTurn → loop.ts which updates config.systemPrompt.
 					// Setting active.systemPrompt would create a second source of truth.
-					const hint = await buildPendingQuestionHint(narratorId);
-					return hint ? `${prompt}\n\n${hint}` : prompt;
+					return finalPrompt;
 				},
 			});
 
@@ -1234,6 +1241,8 @@ export async function runAgentLoopUnlocked(
 			let toolCallLimitExceeded = false;
 			const passWorkspaceContext = active._workspaceContext;
 			const config: import("../../lib/agent").AgentConfig = {
+				// Freeze this logical run's segment across every retry/compact pass.
+				executionSegmentId: profile.kind === "subagent" ? profile.executionSegmentId : undefined,
 				runtimePolicy,
 				narratorId,
 				conversationId: active.conversationId,
@@ -1265,6 +1274,14 @@ export async function runAgentLoopUnlocked(
 						: undefined,
 				systemPrompt: active.systemPrompt ?? undefined,
 				onToolsCharacters: (toolsChars) => storeRuntimeCharacters({ toolsChars }),
+				freezeContextComposition: (counts, requestId, startedAt) =>
+					freezeNarratorContextComposition(
+						narratorId,
+						counts,
+						requestId,
+						startedAt,
+						runtimeSummaryChars,
+					),
 				locale,
 				signal: active.abortController.signal,
 				guidanceSignal: active._guidanceAbortController.signal,

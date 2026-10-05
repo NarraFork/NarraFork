@@ -41,6 +41,8 @@ export const HEADER_BACK_WIDTH_PX = 22;
 export const HEADER_TITLE_ACTIONS_PX = 18 * 2 + 4 * 2;
 export const HEADER_OVERFLOW_WIDTH_PX = 22;
 export const HEADER_CLOSE_WIDTH_PX = 22;
+/** Host pin action (`ActionIcon size={28}`), independent of the sm close button. */
+export const HEADER_PIN_WIDTH_PX = 28;
 /** Header `padding: "8px 16px"` → 16×2. */
 export const HEADER_ROW_PADDING_PX = 16 * 2;
 
@@ -128,6 +130,8 @@ export interface HeaderAfterTitleInput {
 	showTitleActions?: boolean;
 	surfacedToolCount: number;
 	showClose?: boolean;
+	/** Host pin is only rendered alongside the close control. */
+	showPin?: boolean;
 }
 
 export interface HeaderAfterTitleLayout {
@@ -147,7 +151,7 @@ export interface HeaderAfterTitleLayout {
  *
  * DOM (NarratorPanel header row + NarratorPanelHeaderTitle + HeaderToolbar):
  *
- *   [pad 16][back?][gap 8][title text + actions][row-gap 8][tool… gap10 …overflow][gap10 close?][pad 16]
+ *   [pad16][back? gap8][title+actions][row-gap8][tools… overflow][gap10 pin?][gap10 close?][pad16]
  *
  * `HEADER_TITLE_ACTIONS_PX` already includes the title-slot gaps after the text
  * (edit + 4 + generate + 4). The leading↔toolbar gap is charged once as
@@ -166,6 +170,7 @@ export function resolveHeaderLayoutAfterTitle(
 		showTitleActions = false,
 		surfacedToolCount,
 		showClose = false,
+		showPin = false,
 	} = input;
 
 	const toolsTotal = Math.max(0, surfacedToolCount);
@@ -189,7 +194,10 @@ export function resolveHeaderLayoutAfterTitle(
 	if (showTitleActions) chrome += HEADER_TITLE_ACTIONS_PX;
 	chrome += HEADER_ROW_GAP_PX;
 	chrome += HEADER_OVERFLOW_WIDTH_PX;
-	if (showClose) chrome += HEADER_TOOLBAR_GAP_PX + HEADER_CLOSE_WIDTH_PX;
+	if (showClose) {
+		chrome += HEADER_TOOLBAR_GAP_PX + HEADER_CLOSE_WIDTH_PX;
+		if (showPin) chrome += HEADER_TOOLBAR_GAP_PX + HEADER_PIN_WIDTH_PX;
+	}
 
 	// Complete title first.
 	let titleWidth = titleFullWidth;

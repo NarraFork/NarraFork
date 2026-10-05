@@ -105,6 +105,8 @@ export interface QueuedMessageRowProps {
 	onChangeMode: (id: string, mode: QueueMode) => Promise<boolean> | Promise<void>;
 	onMove: (id: string, direction: -1 | 1) => void;
 	onClearAll?: () => void;
+	urgentStatus?: "sending" | "failed";
+	urgentError?: string;
 }
 
 function QueuedAttachmentPreview({
@@ -174,9 +176,11 @@ export function QueuedMessageRow({
 	onChangeMode,
 	onMove,
 	onClearAll,
+	urgentStatus,
+	urgentError,
 }: QueuedMessageRowProps) {
 	const { t } = useTranslation("narrator");
-	const mode = queuedMessageMode(msg);
+	const mode = urgentStatus ? "interrupt" : queuedMessageMode(msg);
 	const [textExpanded, setTextExpanded] = useState(false);
 	const borderColor =
 		mode === "interrupt"
@@ -186,7 +190,7 @@ export function QueuedMessageRow({
 				: "var(--mantine-color-default-border)";
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: msg.id,
-		disabled: mode !== "turn" || isEditing,
+		disabled: mode !== "turn" || isEditing || urgentStatus !== undefined,
 	});
 	const style = {
 		transform: CSS.Transform.toString(transform),
@@ -196,31 +200,38 @@ export function QueuedMessageRow({
 	const failed = msg.state === "failed";
 	const [retrying, setRetrying] = useState(false);
 	const retryingRef = useRef(false);
-	const [changingMode, setChangingMode] = useState<QueueMode | null>(null);
+	const [localChangingMode, setChangingMode] = useState<QueueMode | null>(null);
+	const changingMode = urgentStatus === "sending" ? "interrupt" : localChangingMode;
 	const changingModeRef = useRef(false);
 	const [urgentRequested, setUrgentRequested] = useState(false);
 	const urgentRequestedRef = useRef(false);
-	const urgentCommitted = mode === "interrupt" || urgentRequested;
+	const urgentCommitted = urgentRequested;
+	const urgentOnly = mode === "interrupt" || urgentStatus !== undefined;
 	const nextMode = mode === "turn" ? "tool" : "turn";
 	const toggleLabel = t(mode === "turn" ? "queuedSwitchToGuidance" : "queuedSwitchToNextStep");
 	const urgentLabel = t(
-		urgentCommitted && !failed ? "queuedUrgentRequested" : "queuedSendUrgently",
+		urgentCommitted
+			? "queuedUrgentRequested"
+			: urgentOnly
+				? "queuedUrgentRetry"
+				: "queuedSendUrgently",
 	);
 	const changeMode = async (next: QueueMode) => {
 		if (
 			changingModeRef.current ||
 			retryingRef.current ||
 			urgentRequestedRef.current ||
-			mode === "interrupt" ||
+			urgentStatus === "sending" ||
+			(urgentOnly && next !== "interrupt") ||
 			isEditing ||
-			(next === "interrupt" && failed)
+			(next === "interrupt" && failed && !urgentOnly)
 		)
 			return;
 		changingModeRef.current = true;
 		setChangingMode(next);
 		try {
 			const accepted = await onChangeMode(msg.id, next);
-			if (accepted !== false && next === "interrupt") {
+			if (accepted === true && next === "interrupt") {
 				// Lock immediately after acceptance, even before the authoritative WS
 				// snapshot removes the row or changes its mode. Urgent cannot be undone.
 				urgentRequestedRef.current = true;
@@ -237,14 +248,15 @@ export function QueuedMessageRow({
 			setChangingMode(null);
 		}
 	};
-	const canEdit = !isEditing && !retrying && changingMode === null && !urgentCommitted;
+	const canEdit =
+		!isEditing && !retrying && changingMode === null && !urgentCommitted && !urgentOnly;
 	const startEditing = () => {
 		if (
 			isEditing ||
 			retryingRef.current ||
 			changingModeRef.current ||
 			urgentRequestedRef.current ||
-			mode === "interrupt"
+			urgentOnly
 		)
 			return;
 		onStartEdit(msg);
@@ -579,9 +591,20 @@ export function QueuedMessageRow({
 						textFiles={msg.textFiles ?? []}
 						fileReferences={msg.fileReferences}
 					/>
+					{urgentOnly && (
+						<Text
+							size="xs"
+							c={urgentStatus === "sending" ? "orange" : "red"}
+							role="status"
+							data-urgent-status={urgentStatus ?? "failed"}
+						>
+							{t(urgentStatus === "sending" ? "queuedUrgentSending" : "queuedUrgentUndelivered")}
+							{urgentError && `: ${urgentError}`}
+						</Text>
+					)}
 					{failureNotice}
 				</Stack>
-				{failed && (
+				{failed && !urgentOnly && (
 					<Button
 						size="compact-xs"
 						color="red"
@@ -593,7 +616,7 @@ export function QueuedMessageRow({
 						{t("queuedRetry")}
 					</Button>
 				)}
-				{!urgentCommitted && (
+				{!urgentCommitted && !urgentOnly && (
 					<Tooltip label={toggleLabel} withinPortal>
 						<ActionIcon
 							size="sm"
@@ -619,7 +642,9 @@ export function QueuedMessageRow({
 						variant="subtle"
 						color="orange"
 						aria-label={urgentLabel}
-						disabled={failed || retrying || changingMode !== null || urgentCommitted}
+						disabled={
+							(failed && !urgentOnly) || retrying || changingMode !== null || urgentCommitted
+						}
 						loading={changingMode === "interrupt"}
 						onClick={() => void changeMode("interrupt")}
 					>

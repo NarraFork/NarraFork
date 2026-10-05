@@ -1164,6 +1164,7 @@ export function DockviewWorkspace({
 				}
 				for (const d of apiDisposablesRef.current) d.dispose();
 				apiDisposablesRef.current = [];
+				dockStoreRef.current?.disposeTemporaryResourceChrome();
 			}
 			// Leave every narrator this surface joined. Sourced from MEMBERSHIP rather
 			// than by re-parsing the layout blob: the layout may omit a member (that is

@@ -31,6 +31,7 @@ import {
 	enqueueInboxAgent,
 	hasQueuedInboxRowSync,
 	type InboxAgentMetadata,
+	type InboxExecutionBinding,
 	inboxAgentText,
 	inboxClaim,
 	inboxConsumption,
@@ -40,6 +41,7 @@ import {
 	materializeClaimedInboxUserMessage,
 	peekInbox,
 	releaseInboxClaim,
+	resolveInboxExecutionBinding,
 	wakeInboxIfEligible,
 	withInboxOwner,
 } from "./agent-runtime/inbox";
@@ -124,6 +126,8 @@ export interface SubagentBufferedMessage {
 }
 
 export interface SubagentExecOptions {
+	/** Persisted child-run segment, independent of its parent result slot. */
+	executionSegmentId?: string;
 	control?: RuntimeForegroundControl;
 	narratorId: string;
 	parentNarratorId: string;
@@ -861,6 +865,7 @@ async function persistNextBufferedSubagentMessageAdmitted(opts: {
 	cwd: string;
 }): Promise<{
 	buffered: SubagentBufferedMessage;
+	executionBinding: InboxExecutionBinding | null;
 	userMsg:
 		| Awaited<ReturnType<typeof narratorService.persistSubagentUserMessage>>
 		| MaterializedInboxUserMessage;
@@ -947,6 +952,18 @@ async function persistNextBufferedSubagentMessageAdmitted(opts: {
 		if (hadSoftStop) requestSubagentBufferedMessageSoftStop(narratorId);
 		throw error;
 	}
+	if (buffered.queueMode === "interrupt") {
+		// This mutation admission excludes new guidance producers. The urgent input
+		// now owns the next request: old tool guidance must not spend its soft stop
+		// against that fresh pass. Later guidance can arm a new stop after unlock.
+		// Do this before fallible presentation/cleanup: materialization is committed.
+		clearRuntimeBufferSoftStop(narratorId);
+		const active = activeNarrators.get(narratorId);
+		if (active) {
+			active._bufferSoftStop = false;
+			active._bufferSoftStopTaken = false;
+		}
+	}
 	try {
 		broadcastToNarrator(parentNarratorId, {
 			type: "user_message",
@@ -983,7 +1000,7 @@ async function persistNextBufferedSubagentMessageAdmitted(opts: {
 			error: String(error),
 		});
 	}
-	return { buffered, userMsg };
+	return { buffered, userMsg, executionBinding: await resolveInboxExecutionBinding(row) };
 }
 
 /** The running-pass path shares the same durable claim/restore boundary as restarts. */
@@ -1043,6 +1060,8 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 	onlyGuidance?: boolean;
 }): Promise<{
 	prompt: string;
+	/** Exact claimed input's source, not whichever Send happened to trigger the wake. */
+	executionBinding?: InboxExecutionBinding | null;
 	/** Raw current input for an orchestrator that will rebuild history itself. */
 	currentInput?: string;
 	history: unknown[];
@@ -1103,6 +1122,7 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 			trailingToolResults: rebuilt.trailingToolResults,
 			userId: consumed.row.createdBy,
 			preservePrincipal: true,
+			executionBinding: null,
 		};
 	}
 	const { buffered, userMsg } = consumed;
@@ -1142,6 +1162,7 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 	return {
 		prompt,
 		currentInput: modelText,
+		executionBinding: consumed.executionBinding,
 		history: rebuilt.history,
 		trailingToolResults: rebuilt.trailingToolResults,
 		userId: buffered.createdBy,
@@ -1376,6 +1397,7 @@ async function runSubagentRuntime(
 	try {
 		const result = await runAgentLoopUnlocked(active, owner, opts.prompt, undefined, {
 			kind: "subagent",
+			executionSegmentId: opts.executionSegmentId,
 			parentNarratorId: opts.parentNarratorId,
 			parentToolUseId: opts.toolUseId,
 			subagentType: opts.subagentType,

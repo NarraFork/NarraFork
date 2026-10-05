@@ -1,7 +1,7 @@
 {
 	"name": "narrafork",
 	"type": "module",
-	"version": "0.8.0",
+	"version": "0.8.2",
 	"private": true,
 	"packageManager": "bun@1.4.2",
 	"dependencies": {
@@ -123,7 +123,7 @@
 		"build:windows": "bun scripts/build-cross-platform.ts --platform=windows",
 		"plugins:validate-release": "bun scripts/validate-plugin-release.ts",
 		"check": "bunx @biomejs/biome check .",
-		"db:generate": "bunx drizzle-kit generate",
+		"db:generate": "bun scripts/generate-sqlite-migrations.ts",
 		"db:migrate": "bun server/db/migrate.ts",
 		"dev": "bun run db:migrate; PORT=7780 bun run --hot server/index.ts",
 		"dev:all": "bun server/dev-all.ts",

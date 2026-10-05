@@ -1,0 +1,3 @@
+CREATE INDEX "idx_toolcalls_context_id" ON "narrator_tool_calls" USING btree ("message_id","id");--> statement-breakpoint
+CREATE INDEX "idx_toolcalls_context_order" ON "narrator_tool_calls" USING btree ("message_id","created_at","id");--> statement-breakpoint
+CREATE INDEX "idx_toolcalls_context_latest" ON "narrator_tool_calls" USING btree ("message_id","tool_use_id","execution_attempt","created_at","id");

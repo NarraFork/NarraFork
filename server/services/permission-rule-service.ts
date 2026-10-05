@@ -26,6 +26,7 @@ import type {
 	LegacyDirectoryBlacklistEntry,
 	LegacyDirectoryWhitelistEntry,
 } from "./execution-policy/types";
+import { isSignedReviewBoundaryRow } from "./narrator-review-boundary";
 
 export type PermissionRuleType = ExecutionPermissionRule["ruleType"];
 
@@ -132,6 +133,24 @@ function rulesFromSet(set: ExecutionPolicyRuleSet): ExecutionPermissionRule[] {
 }
 
 class PermissionRuleService {
+	private assertEditableNarratorRule(
+		narratorId: string,
+		ruleType: PermissionRuleType,
+		ruleId: string,
+	): void {
+		if (ruleType !== "directoryBlacklist") return;
+		// Check the stored row, never the replacement path/selector supplied by the API.
+		const row = db
+			.select()
+			.from(narratorBlacklistDirs)
+			.where(
+				and(eq(narratorBlacklistDirs.narratorId, narratorId), eq(narratorBlacklistDirs.id, ruleId)),
+			)
+			.get();
+		if (row && isSignedReviewBoundaryRow(row))
+			throw new ValidationError("Inherited review workspace boundaries are immutable");
+	}
+
 	async listNarratorRules(narratorId: string): Promise<ExecutionPolicyRuleSet> {
 		const [whitelistDirs, blacklistDirs, commandWhitelist, commandBlacklist] = await Promise.all([
 			db
@@ -195,6 +214,7 @@ class PermissionRuleService {
 	): Promise<ExecutionPermissionRule> {
 		const normalized = normalizePermissionRuleInput(input);
 		if (!normalized.id) throw new ValidationError("Permission rule id is required");
+		this.assertEditableNarratorRule(narratorId, normalized.ruleType, normalized.id);
 		const current = rulesFromSet(await this.listNarratorRules(narratorId));
 		if (
 			!current.some((rule) => rule.ruleType === normalized.ruleType && rule.id === normalized.id)
@@ -221,6 +241,7 @@ class PermissionRuleService {
 		ruleType: PermissionRuleType,
 		ruleId: string,
 	): Promise<void> {
+		this.assertEditableNarratorRule(narratorId, ruleType, ruleId);
 		const deleted = await this.deleteRuleRow(narratorId, ruleType, ruleId);
 		if (!deleted) throw new NotFoundError("Permission rule", ruleId);
 		const now = new Date().toISOString();

@@ -624,16 +624,34 @@ export function loadSource(): RawCoverage {
 			0,
 		),
 	};
-	if (snapshotShape.tables !== 107 || snapshotShape.columns !== 1537) {
-		throw new Error(
-			`unexpected SQLite source shape: ${snapshotShape.tables}/${snapshotShape.columns}`,
-		);
-	}
-	return generatePostgresSchema(
+	const generated = generatePostgresSchema(
 		readFileSync(resolve(import.meta.dir, "../server/db/schema.ts"), "utf8"),
 		{ DEFAULT_LOCALE },
 		PG_ONLY_IDENTITY_COLUMNS,
-	).coverage as RawCoverage;
+	).coverage;
+	if (
+		snapshotShape.tables !== generated.tableCount ||
+		snapshotShape.columns !== generated.columnCount - PG_ONLY_IDENTITY_COLUMNS.length
+	)
+		throw new Error(
+			`SQLite source/snapshot shape mismatch: ${snapshotShape.tables}/${snapshotShape.columns}`,
+		);
+	// Counts alone cannot catch replacing a column. Verify exact physical names, excluding PG overlays.
+	for (const table of generated.tables) {
+		const columns = table.columns
+			.filter(
+				(column) =>
+					!PG_ONLY_IDENTITY_COLUMNS.some(
+						(overlay) => overlay.table === table.exportName && overlay.name === column.name,
+					),
+			)
+			.map((column) => column.name)
+			.sort();
+		const snap = snapshot.tables[table.name];
+		if (!snap || JSON.stringify(columns) !== JSON.stringify(Object.keys(snap.columns).sort()))
+			throw new Error(`SQLite source/snapshot columns mismatch: ${table.name}`);
+	}
+	return generated as RawCoverage;
 }
 
 /**

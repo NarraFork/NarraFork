@@ -1,6 +1,7 @@
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
 import { RECENT_TABS_WS_BATCH_SIZE } from "@shared/recent-tabs";
 import { z } from "zod";
+import { rejectUnsupportedTerminalResourceSelector } from "./terminals";
 
 const catchUpCursorSchema = z
 	.object({
@@ -129,44 +130,52 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 ]);
 
 // Terminal client → server
-export const terminalWsMessageSchema = z.discriminatedUnion("type", [
-	z.object({ type: z.literal("pong") }),
-	z.object({
-		type: z.literal("subscribe"),
-		terminalIds: z.array(z.string().min(1)),
-	}),
-	z.object({
-		type: z.literal("unsubscribe"),
-		terminalIds: z.array(z.string().min(1)),
-	}),
-	z.object({
-		type: z.literal("input"),
-		terminalId: z.string().min(1),
-		data: z.string(),
-	}),
-	z.object({
-		type: z.literal("resize"),
-		terminalId: z.string().min(1),
-		cols: z.number().int().min(10).max(500),
-		rows: z.number().int().min(2).max(200),
-	}),
-	z.object({
-		type: z.literal("create"),
-		requestId: z.string().min(1),
-		chapterId: z.string().min(1).optional(),
-		narratorId: z.string().min(1).optional(),
-		deviceId: z.string().min(1).optional(),
-		name: z.string().max(100).optional(),
-		cols: z.number().int().min(10).max(500).optional(),
-		rows: z.number().int().min(2).max(200).optional(),
-	}),
-	z.object({
-		type: z.literal("kill"),
-		terminalId: z.string().min(1),
-	}),
-	z.object({
-		type: z.literal("rename"),
-		terminalId: z.string().min(1),
-		name: z.string().min(1).max(100),
-	}),
-]);
+export const terminalWsMessageSchema = z.preprocess(
+	(input, ctx) => {
+		if (input && typeof input === "object" && "type" in input && input.type === "create") {
+			return rejectUnsupportedTerminalResourceSelector(input, ctx);
+		}
+		return input;
+	},
+	z.discriminatedUnion("type", [
+		z.object({ type: z.literal("pong") }),
+		z.object({
+			type: z.literal("subscribe"),
+			terminalIds: z.array(z.string().min(1)),
+		}),
+		z.object({
+			type: z.literal("unsubscribe"),
+			terminalIds: z.array(z.string().min(1)),
+		}),
+		z.object({
+			type: z.literal("input"),
+			terminalId: z.string().min(1),
+			data: z.string(),
+		}),
+		z.object({
+			type: z.literal("resize"),
+			terminalId: z.string().min(1),
+			cols: z.number().int().min(10).max(500),
+			rows: z.number().int().min(2).max(200),
+		}),
+		z.object({
+			type: z.literal("create"),
+			requestId: z.string().min(1),
+			chapterId: z.string().min(1).optional(),
+			narratorId: z.string().min(1).optional(),
+			deviceId: z.string().min(1).optional(),
+			name: z.string().max(100).optional(),
+			cols: z.number().int().min(10).max(500).optional(),
+			rows: z.number().int().min(2).max(200).optional(),
+		}),
+		z.object({
+			type: z.literal("kill"),
+			terminalId: z.string().min(1),
+		}),
+		z.object({
+			type: z.literal("rename"),
+			terminalId: z.string().min(1),
+			name: z.string().min(1).max(100),
+		}),
+	]),
+);

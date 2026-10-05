@@ -20,6 +20,18 @@ import {
 } from "./NarratorDockContext";
 import { bindFilePanelExitGuard } from "./panels";
 
+// Navigation fixtures expose the real group/header/content contract used by
+// workspace preview coordination, while keeping these tests DOM-only.
+function fileGroupFixture(id: string) {
+	const { window } = parseHTML("<html><body></body></html>");
+	return {
+		id: `file-group-${id}`,
+		panels: [{ id }],
+		header: { hidden: false },
+		api: { location: { type: "floating" as const } },
+		element: window.document.createElement("div"),
+	};
+}
 function narratorHostFixture(narratorId: string) {
 	return {
 		id: `workspace-narrator-${narratorId}`,
@@ -287,7 +299,7 @@ describe("device-scoped navigation", () => {
 			{
 				id: string;
 				params: FilePanelParams;
-				group: { id: string };
+				group: ReturnType<typeof fileGroupFixture>;
 				api: {
 					location: { type: "grid" | "floating" };
 					setActive: () => void;
@@ -296,10 +308,12 @@ describe("device-scoped navigation", () => {
 			}
 		>();
 		const add = (id: string, params: FilePanelParams) => {
+			const group = fileGroupFixture(id);
 			const panel = {
 				id,
 				params,
-				group: { id: `file-group-${id}` },
+				group,
+				view: { content: { element: group.element.ownerDocument.createElement("div") } },
 				api: {
 					location: { type: "floating" as const },
 					setActive: () => {},
@@ -318,6 +332,9 @@ describe("device-scoped navigation", () => {
 			getPanel: (id: string) => (id === narrator.id ? narrator : panels.get(id)),
 			get panels() {
 				return [narrator, ...panels.values()];
+			},
+			get groups() {
+				return [narrator.group, ...[...panels.values()].map((panel) => panel.group)];
 			},
 			addPanel: (panel: { id: string; params: FilePanelParams }) => add(panel.id, panel.params),
 		} as unknown as DockviewApi;
@@ -490,7 +507,7 @@ describe("historical file panels", () => {
 				{
 					id: string;
 					params: FilePanelParams;
-					group: { id: string };
+					group: ReturnType<typeof fileGroupFixture>;
 					api: {
 						location: { type: "floating" };
 						setActive: ReturnType<typeof mock>;
@@ -506,11 +523,16 @@ describe("historical file panels", () => {
 				get panels() {
 					return [narrator, ...panels.values()];
 				},
+				get groups() {
+					return [narrator.group, ...[...panels.values()].map((panel) => panel.group)];
+				},
 				addPanel: ({ id, params }: { id: string; params: FilePanelParams }) => {
+					const group = fileGroupFixture(id);
 					const panel = {
 						id,
 						params,
-						group: { id: `file-group-${id}` },
+						group,
+						view: { content: { element: group.element.ownerDocument.createElement("div") } },
 						api: {
 							location: { type: "floating" as const },
 							setActive: mock(() => {}),

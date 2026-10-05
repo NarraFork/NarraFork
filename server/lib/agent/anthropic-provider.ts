@@ -38,6 +38,7 @@ import {
 	ProviderInvalidStateError,
 } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
+import { reportInputCharacters } from "./input-characters";
 import { buildOpencodeSessionHeader } from "./opencode-session";
 import type {
 	ChatParams,
@@ -1860,6 +1861,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			reasoningEffort: params.reasoningEffort,
 		});
 
+		await reportInputCharacters(params, body);
 		const bodyStr = JSON.stringify(body);
 
 		params.onRequestStart?.();
