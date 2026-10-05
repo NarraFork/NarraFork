@@ -59,7 +59,7 @@ func TestGitWorkspaceLifecycle(t *testing.T) {
 		}
 	}
 	probe := gitCall(t, h, root, "probe", nil)
-	if probe["state"] != "ready" || probe["rootPath"] != root {
+	if probe["state"] != "ready" || probe["rootPath"] != root || probe["branch"] != "main" {
 		t.Fatalf("probe: %v", probe)
 	}
 	gitCall(t, h, root, "status", nil)

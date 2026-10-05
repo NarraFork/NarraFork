@@ -1,6 +1,6 @@
 import { Menu, Portal } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { IconFolder } from "@tabler/icons-react";
+import { IconFolder, IconWindowMaximize } from "@tabler/icons-react";
 import { DockviewDefaultTab, type IDockviewPanelHeaderProps } from "dockview-react";
 import { type FunctionComponent, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -8,6 +8,12 @@ import { usePlatform } from "../../hooks/usePlatform";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { canRevealFromBrowser } from "../../lib/local-origin";
+import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
+import {
+	normalizePanelWindowDescriptor,
+	openPanelInWindow,
+	pluginPanelWindowHostContext,
+} from "../window/panel-window";
 import { closeSurfaceTabs, getTabCloseTargets, type TabCloseAction } from "./tab-close";
 
 const actions: TabCloseAction[] = ["all", "left", "right", "auxiliary"];
@@ -55,6 +61,29 @@ export function withSurfaceTabMenu(Tab: FunctionComponent<IDockviewPanelHeaderPr
 			platform,
 			canRevealFromBrowser(userPrefs?.treatAsLocalAccess),
 		);
+		// Every panel whose params carry its identity can live in its own window
+		// (mock and params-less panels normalize to null). Copy semantics: the
+		// source panel stays put.
+		const surface = usePluginUiSurface();
+		let windowDescriptor = normalizePanelWindowDescriptor(props.params);
+		if (windowDescriptor?.panelType === "plugin") {
+			// Copy the resolved panel session, not just the surface's generic host.
+			const hostContext = surface?.resolveSessionContext(windowDescriptor);
+			if (hostContext) {
+				const binding =
+					windowDescriptor.binding.kind === "focus-current-narrator" && hostContext.narratorId
+						? { kind: "focus-current-narrator" as const, narratorId: hostContext.narratorId }
+						: windowDescriptor.binding;
+				windowDescriptor = normalizePanelWindowDescriptor({
+					...windowDescriptor,
+					binding,
+					hostContext,
+				});
+			} else if (!pluginPanelWindowHostContext(windowDescriptor)) {
+				windowDescriptor = null;
+			}
+		}
+		const canOpenInWindow = windowDescriptor !== null;
 		const [position, setPosition] = useState<{ x: number; y: number } | null>(null);
 		return (
 			// The wrapper leaves ordinary click, middle-click and drag handling to the tab.
@@ -96,6 +125,20 @@ export function withSurfaceTabMenu(Tab: FunctionComponent<IDockviewPanelHeaderPr
 							onMouseDown={(event) => event.stopPropagation()}
 							onClick={(event) => event.stopPropagation()}
 						>
+							{canOpenInWindow && (
+								<>
+									<Menu.Item
+										leftSection={<IconWindowMaximize size={14} />}
+										onClick={() => {
+											setPosition(null);
+											openPanelInWindow(windowDescriptor);
+										}}
+									>
+										{t("dockTabs.openInWindow")}
+									</Menu.Item>
+									<Menu.Divider />
+								</>
+							)}
 							{revealDirectory && (
 								<>
 									<Menu.Item

@@ -7,6 +7,8 @@ import {
 	type FileChangeRevertAction,
 	type FileChangeState,
 	fileChangeRevertActionMatches,
+	hasConfirmedNoFileChange,
+	hasSettledMeasuredFileEffect,
 	type KnownFileChangeState,
 	FILE_CHANGE_LIMITS as LIMIT,
 } from "@shared/file-change-protocol";
@@ -43,6 +45,7 @@ export type TransactionManifestRequest =
 			operation: RevertJournalOperation;
 			files: RevertJournalFile[];
 			userId: string;
+			acceptSnapshotRestore?: true;
 	  }
 	| { action: "compare"; fixed: RevertSelectionResult; current: RevertSelectionResult }
 	| {
@@ -50,7 +53,8 @@ export type TransactionManifestRequest =
 			raw: { ref: FileChangeBlobRef; bytes: Uint8Array };
 			operation: RevertJournalOperation;
 			userId: string;
-			expectedAction: FileChangeRevertAction;
+			expectedAction?: FileChangeRevertAction;
+			acceptSnapshotRestore?: true;
 	  };
 
 const port = parentPort;
@@ -97,19 +101,34 @@ function validateEntrypoint(input: Extract<TransactionManifestRequest, { action:
 			input.operation.requestDigest,
 		"ORIGINAL_REQUEST_DIGEST",
 	);
+	keys(
+		selector.request,
+		[
+			"principal",
+			"narratorId",
+			"expectedMessageVersion",
+			"idempotencyKey",
+			"kind",
+			"revertScope",
+			"selector",
+		],
+		["uiAction", "recoveryMode"],
+	);
+	keys(selector.request.principal, ["userId", "isAdmin"]);
 	selectorValid(selector.request.selector);
 	check(
-		selector.request.uiAction === input.expectedAction &&
-			selector.request.kind === input.operation.kind &&
+		selector.request.kind === input.operation.kind &&
 			selector.request.narratorId === input.operation.narratorId &&
+			selector.request.expectedMessageVersion === input.operation.expectedMessageVersion &&
+			selector.request.idempotencyKey === input.operation.idempotencyKey &&
+			selector.request.revertScope === input.operation.scope &&
 			selector.request.principal.userId === input.userId &&
-			fileChangeRevertActionMatches(
-				input.expectedAction,
-				input.operation.kind,
-				selector.request.selector,
-			),
-		"ACTION_MISMATCH",
+			typeof selector.request.principal.isAdmin === "boolean",
+		"REQUEST_CONFLICT",
 	);
+	if (input.expectedAction !== undefined)
+		check(selector.request.uiAction === input.expectedAction, "ACTION_MISMATCH");
+	validateRecoveryPolicy(selector.request, input.acceptSnapshotRestore);
 }
 
 function validate(
@@ -237,17 +256,9 @@ function validate(
 			"revertScope",
 			"selector",
 		],
-		["uiAction"],
+		["uiAction", "recoveryMode"],
 	);
-	if (selector.request.uiAction !== undefined)
-		check(
-			fileChangeRevertActionMatches(
-				selector.request.uiAction,
-				selector.request.kind,
-				selector.request.selector,
-			),
-			"ACTION_MISMATCH",
-		);
+	validateRecoveryPolicy(selector.request, input.acceptSnapshotRestore);
 	keys(selector.request.principal, ["userId", "isAdmin"]);
 	check(
 		selector.request.principal.userId === input.userId &&
@@ -466,6 +477,8 @@ function validate(
 			}
 			array(file.steps, LIMIT.historyToolRelatedChanges);
 			let previous = Number.MAX_SAFE_INTEGER;
+			let snapshotDesired: FileChangeState = file.expected;
+			let previousChanged = Number.MAX_SAFE_INTEGER;
 			for (const step of file.steps) {
 				keys(step, ["effectId", "mutationId", "scopeRevision", "method"]);
 				const effect = effects.get(step.effectId);
@@ -479,13 +492,34 @@ function validate(
 					"EFFECT_BINDING",
 				);
 				check(
-					["restore_before", "merge", "already_before", "no_change"].includes(step.method),
+					["restore_before", "restore_snapshot", "merge", "already_before", "no_change"].includes(
+						step.method,
+					),
 					"STEP_METHOD",
 				);
+				if (selector.request.recoveryMode === "snapshot") {
+					if (effect.outcome === "no_change") {
+						check(
+							(hasConfirmedNoFileChange(effect) || hasSettledMeasuredFileEffect(effect)) &&
+								step.method === "no_change",
+							"STEP_METHOD",
+						);
+					} else {
+						check(
+							hasSettledMeasuredFileEffect(effect) && step.method === "restore_snapshot",
+							"STEP_METHOD",
+						);
+						check(step.scopeRevision < previousChanged, "EFFECT_BINDING");
+						previousChanged = step.scopeRevision;
+						snapshotDesired = effect.before;
+					}
+				} else check(step.method !== "restore_snapshot", "STEP_METHOD");
 				previous = step.scopeRevision;
 				usedEffects.add(step.effectId);
 			}
 			check(file.steps.length > 0, "EMPTY_FILE_SELECTION");
+			if (selector.request.recoveryMode === "snapshot")
+				check(equal(file.desired, snapshotDesired), "SNAPSHOT_TARGET_CONFLICT");
 			return {
 				sequence: file.sequence,
 				identity: file.identity,
@@ -514,6 +548,33 @@ function validate(
 	// reuse those typed states; only later independent third-state evidence grows the budget.
 	integer(evidenceBytes, LIMIT.operationEvidenceBytes);
 	return { header, proof, selection, files, rawRefs: [...refs.values()], evidenceBytes };
+}
+
+function validateRecoveryPolicy(
+	request: {
+		recoveryMode?: unknown;
+		kind: "revert" | "history_delete" | "rollback_to_block";
+		uiAction?: FileChangeRevertAction;
+		selector: RevertSelectionResult["selector"];
+	},
+	acceptSnapshotRestore?: true,
+) {
+	check(
+		["revert", "history_delete", "rollback_to_block"].includes(request.kind) &&
+			(request.recoveryMode === undefined ||
+				(request.recoveryMode === "snapshot" && request.uiAction !== undefined)),
+		"RECOVERY_MODE",
+	);
+	if (request.uiAction !== undefined)
+		check(
+			["revert_files", "rollback_to_block", "delete_tool_block"].includes(request.uiAction) &&
+				fileChangeRevertActionMatches(request.uiAction, request.kind, request.selector),
+			"ACTION_MISMATCH",
+		);
+	check(
+		request.recoveryMode !== "snapshot" || acceptSnapshotRestore === true,
+		"SNAPSHOT_CONFIRMATION_REQUIRED",
+	);
 }
 
 function selectorValid(value: RevertSelectionResult["selector"]) {

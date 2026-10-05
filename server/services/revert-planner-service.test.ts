@@ -419,6 +419,23 @@ async function prepare(extra: Partial<RevertPlannerRequest> = {}) {
 	return service.prepare(request(extra));
 }
 
+// Await paged worker/yield work normally; Bun's async rejects matcher can starve
+// these callbacks and let teardown close a database while a test is still running.
+async function rejected(pending: Promise<unknown>) {
+	const result = await pending.then(
+		() => ({ rejected: false, error: undefined }),
+		(error: unknown) => ({ rejected: true, error }),
+	);
+	expect(result.rejected).toBe(true);
+	return {
+		toMatchObject: (expected: object) => expect(result.error).toMatchObject(expected),
+		toThrow: (expected?: string) =>
+			expect(() => {
+				throw result.error;
+			}).toThrow(expected),
+	};
+}
+
 describe("real tool evidence -> complete prepared preview", () => {
 	test("Write A -> human -> Edit B -> late human preserves human raw bytes without workspace/history mutation", async () => {
 		const { path, original } = await fixture();
@@ -435,7 +452,7 @@ describe("real tool evidence -> complete prepared preview", () => {
 		expect(await readFile(path)).toEqual(disk);
 		expect(historySnapshot()).toBe(history);
 		expect(reads).toBe(2);
-		expect(narratorAuthorizations).toBe(4);
+		expect(narratorAuthorizations).toBe(9);
 		expect(authentications).toBe(2);
 		const selected = await rawManifest<RevertSelectionResult>(result.plan.manifestDigests.history);
 		expect(selected.effects).toHaveLength(2);
@@ -578,7 +595,7 @@ describe("no partial executable prefix", () => {
 				},
 			};
 		};
-		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_PLANNER_STATE_UNKNOWN" });
+		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_STATE_UNKNOWN" });
 		options.access.resolveFile = async (input) => {
 			const target = await resolve(input);
 			return {
@@ -589,7 +606,7 @@ describe("no partial executable prefix", () => {
 				},
 			};
 		};
-		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_PLANNER_STATE_UNKNOWN" });
+		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_STATE_UNKNOWN" });
 		assertUnprepared();
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path)).toEqual(disk);
@@ -606,7 +623,7 @@ describe("no partial executable prefix", () => {
 			.where(eq(schema.fileChangeEffects.id, effect.id))
 			.run();
 		const before = historySnapshot();
-		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_PLANNER_STATE_UNKNOWN" });
+		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_STATE_UNKNOWN" });
 		assertUnprepared();
 		expect(reads).toBe(0);
 		expect(historySnapshot()).toBe(before);
@@ -630,7 +647,7 @@ describe("no partial executable prefix", () => {
 			.run();
 		const before = historySnapshot();
 		const disk = await readFile(path);
-		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_PLANNER_EVIDENCE_INCOMPLETE" });
+		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_EVIDENCE_INCOMPLETE" });
 		assertUnprepared();
 		expect(reads).toBe(0);
 		expect(historySnapshot()).toBe(before);
@@ -638,10 +655,14 @@ describe("no partial executable prefix", () => {
 	});
 	test("missing journal for any selected write candidate refuses the entire preview", async () => {
 		const { path } = await fixture();
-		await context("Write", path, { content: "unmeasured" });
+		const missing = await context("Write", path, { content: "unmeasured" });
+		db.update(schema.narratorToolCalls)
+			.set({ status: "success" })
+			.where(eq(schema.narratorToolCalls.id, missing.toolCallId))
+			.run();
 		const before = historySnapshot();
 		const disk = await readFile(path);
-		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_PLANNER_EVIDENCE_INCOMPLETE" });
+		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_EVIDENCE_INCOMPLETE" });
 		assertUnprepared();
 		expect(reads).toBe(0);
 		expect(historySnapshot()).toBe(before);
@@ -657,7 +678,7 @@ describe("no partial executable prefix", () => {
 			.run();
 		const before = historySnapshot();
 		const disk = await readFile(path);
-		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_PLANNER_EVIDENCE_INCOMPLETE" });
+		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_EVIDENCE_INCOMPLETE" });
 		assertUnprepared();
 		expect(reads).toBe(0);
 		expect(historySnapshot()).toBe(before);
@@ -672,7 +693,7 @@ describe("no partial executable prefix", () => {
 		await write(second, "new");
 		await writeFile(second, "human overwrite");
 		const before = historySnapshot();
-		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_PLANNER_REVERSAL_REFUSED" });
+		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_REVERSAL_REFUSED" });
 		assertUnprepared();
 		expect(db.select().from(schema.revertOperationFiles).all()).toHaveLength(0);
 		expect(historySnapshot()).toBe(before);
@@ -692,7 +713,7 @@ describe("no partial executable prefix", () => {
 		await unlink(join(root, "private", "file-change-blobs", row.storageKey));
 		const before = historySnapshot();
 		const disk = await readFile(path);
-		await expect(prepare()).rejects.toThrow();
+		(await rejected(prepare())).toThrow();
 		assertUnprepared();
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path)).toEqual(disk);
@@ -760,7 +781,7 @@ describe("no partial executable prefix", () => {
 			.where(eq(schema.narratorToolCalls.id, call.toolCallId))
 			.run();
 		const before = historySnapshot();
-		await expect(prepare()).rejects.toThrow("Remote capability unavailable");
+		(await rejected(prepare())).toThrow("Remote capability unavailable");
 		assertUnprepared();
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path, "utf8")).toBe("new");
@@ -776,10 +797,10 @@ describe("mandatory authorization, freshness and idempotency", () => {
 	test("authenticated subject labels alone cannot authorize another user", async () => {
 		await fixture();
 		const before = historySnapshot();
-		await expect(prepare({ principal: { userId: "bob", isAdmin: false } })).rejects.toThrow(
+		(await rejected(prepare({ principal: { userId: "bob", isAdmin: false } }))).toThrow(
 			"Narrator ACL denied",
 		);
-		await expect(prepare({ principal: { userId: "alice", isAdmin: true } })).rejects.toThrow(
+		(await rejected(prepare({ principal: { userId: "alice", isAdmin: true } }))).toThrow(
 			"Authentication denied",
 		);
 		assertUnprepared();
@@ -792,14 +813,14 @@ describe("mandatory authorization, freshness and idempotency", () => {
 			.set({ ownerUserId: "bob" })
 			.where(eq(schema.projects.id, "project"))
 			.run();
-		await expect(prepare()).rejects.toThrow("Project ACL denied");
+		(await rejected(prepare())).toThrow("Project ACL denied");
 		db.update(schema.projects)
 			.set({ ownerUserId: "alice" })
 			.where(eq(schema.projects.id, "project"))
 			.run();
 		allowedFiles.delete(path);
 		const before = historySnapshot();
-		await expect(prepare()).rejects.toThrow("File ACL denied");
+		(await rejected(prepare())).toThrow("File ACL denied");
 		assertUnprepared();
 		expect(reads).toBe(0);
 		expect(historySnapshot()).toBe(before);
@@ -811,7 +832,7 @@ describe("mandatory authorization, freshness and idempotency", () => {
 		beforeNarratorAuthorization = (count) => {
 			if (count >= 3) throw new Error("Narrator grant revoked");
 		};
-		await expect(prepare()).rejects.toThrow("Narrator grant revoked");
+		(await rejected(prepare())).toThrow("Narrator grant revoked");
 		assertUnprepared();
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path)).toEqual(disk);
@@ -822,14 +843,35 @@ describe("mandatory authorization, freshness and idempotency", () => {
 		beforeAuthentication = (count) => {
 			if (count === 2) allowedFiles.delete(path);
 		};
-		await expect(prepare()).rejects.toThrow("File ACL denied");
+		(await rejected(prepare())).toThrow("File ACL denied");
 		assertUnprepared();
 		expect(historySnapshot()).toBe(before);
 	});
+	test("unrelated database writes during selection and final file checks do not veto preview", async () => {
+		const { path } = await fixture();
+		const disk = await readFile(path);
+		beforeNarratorAuthorization = (count) => {
+			db.update(schema.users)
+				.set({ username: `unrelated-${count}` })
+				.where(eq(schema.users.id, "bob"))
+				.run();
+		};
+		beforeRead = (_path, count) => {
+			db.update(schema.users)
+				.set({ username: `unrelated-file-check-${count}` })
+				.where(eq(schema.users.id, "bob"))
+				.run();
+		};
+		const result = await prepare();
+		expect(result.plan.status).toBe("prepared");
+		expect(result.plan.coverageComplete).toBe(true);
+		expect(await readFile(path)).toEqual(disk);
+	});
+
 	test("original expected message version is enforced", async () => {
 		await fixture();
 		const before = historySnapshot();
-		await expect(prepare({ expectedMessageVersion: 6 })).rejects.toMatchObject({
+		(await rejected(prepare({ expectedMessageVersion: 6 }))).toMatchObject({
 			code: "REVERT_SELECTION_STALE",
 		});
 		assertUnprepared();
@@ -860,7 +902,7 @@ describe("mandatory authorization, freshness and idempotency", () => {
 				altered = historySnapshot();
 			}
 		};
-		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_PLANNER_STALE" });
+		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_STALE" });
 		assertUnprepared();
 		expect(altered).toBeDefined();
 		expect(historySnapshot()).toBe(altered ?? "missing alteration");
@@ -872,7 +914,7 @@ describe("mandatory authorization, freshness and idempotency", () => {
 		beforeRead = async (_path, count) => {
 			if (count === 2) await writeFile(path, "later human contents");
 		};
-		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_PLANNER_STALE" });
+		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_STALE" });
 		assertUnprepared();
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path, "utf8")).toBe("later human contents");
@@ -884,7 +926,7 @@ describe("mandatory authorization, freshness and idempotency", () => {
 			if (count === 2)
 				db.update(schema.fileChangeScopes).set({ status: "needs_verification" }).run();
 		};
-		await expect(prepare()).rejects.toThrow("Scope/runtime drift");
+		(await rejected(prepare())).toThrow("Scope/runtime drift");
 		assertUnprepared();
 		expect(historySnapshot()).toBe(before);
 	});
@@ -896,10 +938,12 @@ describe("mandatory authorization, freshness and idempotency", () => {
 		};
 		const result = await prepare({ selector });
 		expect((await prepare({ selector })).plan.id).toBe(result.plan.id);
-		await expect(
-			prepare({ selector: { ...selector, toolCallIds: [second.toolCallId, first.toolCallId] } }),
-		).rejects.toMatchObject({ code: "REVERT_PLANNER_REQUEST_CONFLICT" });
-		await expect(prepare({ selector, kind: "history_delete" })).rejects.toMatchObject({
+		(
+			await rejected(
+				prepare({ selector: { ...selector, toolCallIds: [second.toolCallId, first.toolCallId] } }),
+			)
+		).toMatchObject({ code: "REVERT_PLANNER_REQUEST_CONFLICT" });
+		(await rejected(prepare({ selector, kind: "history_delete" }))).toMatchObject({
 			code: "REVERT_PLANNER_REQUEST_CONFLICT",
 		});
 		expect(db.select().from(schema.revertOperations).all()).toHaveLength(1);
@@ -909,24 +953,26 @@ describe("mandatory authorization, freshness and idempotency", () => {
 		await prepare();
 		const before = historySnapshot();
 		clock += FILE_CHANGE_LIMITS.planLifetimeMs + 1;
-		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_PLANNER_EXPIRED" });
+		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_EXPIRED" });
 		expect(historySnapshot()).toBe(before);
 	});
 	test("workspace/unrevert/unknown proof fields cannot bypass completeness", async () => {
 		await fixture();
 		const before = historySnapshot();
-		await expect(prepare({ kind: "unrevert" as "revert" })).rejects.toMatchObject({
+		(await rejected(prepare({ kind: "unrevert" as "revert" }))).toMatchObject({
 			code: "REVERT_PLANNER_UNSUPPORTED",
 		});
-		await expect(prepare({ revertScope: "workspace" as "narrator" })).rejects.toMatchObject({
+		(await rejected(prepare({ revertScope: "workspace" as "narrator" }))).toMatchObject({
 			code: "REVERT_PLANNER_UNSUPPORTED",
 		});
-		await expect(
-			service.prepare({
-				...request(),
-				manifestProof: { computation: "complete" },
-			} as RevertPlannerRequest),
-		).rejects.toMatchObject({ code: "REVERT_PLANNER_INVALID_INPUT" });
+		(
+			await rejected(
+				service.prepare({
+					...request(),
+					manifestProof: { computation: "complete" },
+				} as RevertPlannerRequest),
+			)
+		).toMatchObject({ code: "REVERT_PLANNER_INVALID_INPUT" });
 		assertUnprepared();
 		expect(reads).toBe(0);
 		expect(historySnapshot()).toBe(before);
@@ -959,14 +1005,14 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 		const one = prepare({ signal: first.signal }).catch((error: unknown) => error);
 		const two = prepare({ signal: second.signal }).catch((error: unknown) => error);
 		try {
-			await expect(prepare({ idempotencyKey: "third" })).rejects.toMatchObject({
+			(await rejected(prepare({ idempotencyKey: "third" }))).toMatchObject({
 				code: "REVERT_PLANNER_BUSY",
 			});
 			first.abort(new Error("cancelled first"));
 			second.abort(new Error("cancelled second"));
 			expect(await one).toMatchObject({ message: "cancelled first" });
 			expect(await two).toMatchObject({ message: "cancelled second" });
-			await expect(prepare({ idempotencyKey: "still busy" })).rejects.toMatchObject({
+			(await rejected(prepare({ idempotencyKey: "still busy" }))).toMatchObject({
 				code: "REVERT_PLANNER_BUSY",
 			});
 		} finally {
@@ -1000,9 +1046,7 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 			return cancelledPublication;
 		});
 		try {
-			await expect(prepare({ signal: controller.signal })).rejects.toThrow(
-				"cancel manifest stream",
-			);
+			(await rejected(prepare({ signal: controller.signal }))).toThrow("cancel manifest stream");
 		} finally {
 			await cancelledPublication?.catch(() => {});
 			publishing.mockRestore();
@@ -1018,7 +1062,7 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 		sqlite.exec(
 			"CREATE TRIGGER fail_blob BEFORE INSERT ON file_change_blobs BEGIN SELECT RAISE(ABORT,'forced blob catalog failure'); END",
 		);
-		await expect(prepare()).rejects.toThrow();
+		(await rejected(prepare())).toThrow();
 		assertUnprepared();
 		expect(db.select().from(schema.revertOperations).all()).toHaveLength(0);
 		expect(historySnapshot()).toBe(before);
@@ -1032,7 +1076,7 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 		}
 		const before = historySnapshot();
 		service = new RevertPlannerService(db, { ...options, maxEvidenceBytes: 32 * 1024 });
-		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_PLANNER_BUDGET_EXCEEDED" });
+		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_BUDGET_EXCEEDED" });
 		assertUnprepared();
 		expect(historySnapshot()).toBe(before);
 	});
@@ -1074,7 +1118,7 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 			maxEvidenceBytes: beforeMerge + disk.byteLength - 1,
 		});
 		const initialReads = reads;
-		await expect(prepare({ idempotencyKey: "limited" })).rejects.toMatchObject({
+		(await rejected(prepare({ idempotencyKey: "limited" }))).toMatchObject({
 			code: "REVERT_PLANNER_REVERSAL_REFUSED",
 			message: "Complete reversal refused: budget_exceeded",
 		});
@@ -1088,7 +1132,7 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 		const before = historySnapshot();
 		const controller = new AbortController();
 		controller.abort(new Error("cancelled preview"));
-		await expect(prepare({ signal: controller.signal })).rejects.toThrow("cancelled preview");
+		(await rejected(prepare({ signal: controller.signal }))).toThrow("cancelled preview");
 		assertUnprepared();
 		expect(authentications).toBe(0);
 		expect(historySnapshot()).toBe(before);
@@ -1099,7 +1143,7 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 		const disk = await readFile(path);
 		const controller = new AbortController();
 		beforeRead = () => controller.abort(new Error("cancel read"));
-		await expect(prepare({ signal: controller.signal })).rejects.toThrow("cancel read");
+		(await rejected(prepare({ signal: controller.signal }))).toThrow("cancel read");
 		await Promise.resolve();
 		assertUnprepared();
 		expect(historySnapshot()).toBe(before);
@@ -1112,7 +1156,7 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 		sqlite.exec(
 			"CREATE TRIGGER fail_plan BEFORE INSERT ON revert_operations BEGIN SELECT RAISE(ABORT,'forced plan failure'); END",
 		);
-		await expect(prepare()).rejects.toThrow("forced plan failure");
+		(await rejected(prepare())).toThrow("forced plan failure");
 		assertUnprepared();
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path)).toEqual(disk);
@@ -1124,7 +1168,7 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 		sqlite.exec(
 			"CREATE TRIGGER fail_file BEFORE INSERT ON revert_operation_files BEGIN SELECT RAISE(ABORT,'forced append failure'); END",
 		);
-		await expect(prepare()).rejects.toThrow("forced append failure");
+		(await rejected(prepare())).toThrow("forced append failure");
 		assertUnprepared();
 		const row = db.select().from(schema.revertOperations).get();
 		expect(row?.status).toBe("planned");
@@ -1139,7 +1183,7 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 		sqlite.exec(
 			"CREATE TRIGGER fail_finalize BEFORE UPDATE OF status ON revert_operations WHEN NEW.status='prepared' BEGIN SELECT RAISE(ABORT,'forced finalize failure'); END",
 		);
-		await expect(prepare()).rejects.toThrow("forced finalize failure");
+		(await rejected(prepare())).toThrow("forced finalize failure");
 		assertUnprepared();
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path)).toEqual(disk);

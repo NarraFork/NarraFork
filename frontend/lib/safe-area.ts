@@ -433,6 +433,11 @@ function supportsVirtualKeyboard(targetWindow: Window): boolean {
 function isStandaloneDisplay(targetWindow: Window): boolean {
 	if (targetWindow.matchMedia?.("(display-mode: standalone)").matches === true) return true;
 	if (targetWindow.matchMedia?.("(display-mode: fullscreen)").matches === true) return true;
+	// WCO is its own display-mode, not "standalone" — without this branch the
+	// tracker's standalone guarantee would silently drop out in the one installed
+	// mode we actually prefer on desktop.
+	if (targetWindow.matchMedia?.("(display-mode: window-controls-overlay)").matches === true)
+		return true;
 	// iOS Safari's non-standard flag, still the only signal in older home-screen apps.
 	return (targetWindow.navigator as { standalone?: boolean }).standalone === true;
 }

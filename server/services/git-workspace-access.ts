@@ -1,5 +1,5 @@
 import { realpath } from "node:fs/promises";
-import { and, asc, eq, gt, inArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { db } from "../db";
 import { chapters, projects, remoteDevices } from "../db/schema";
@@ -41,6 +41,7 @@ function redactDeniedTarget(target: GitWorkspaceTarget): void {
 	delete workspace.chapterId;
 	delete workspace.projectId;
 	delete target.repositoryPath;
+	delete workspace.branch;
 }
 
 async function requireSafeLocalGitPath(target: GitWorkspaceTarget, path: string): Promise<void> {
@@ -76,8 +77,26 @@ function ancestors(path: string, target: GitWorkspaceTarget): string[] {
 }
 
 /** Bound both rows and fields. Standalone cwd must not bypass a protected project's ACL. */
-async function relatedProjects(target: GitWorkspaceTarget, scan: GitAccessScan) {
-	if (!target.backend || target.backend.kind !== "local" || !target.workspace.rootPath) return [];
+async function relatedProjects(
+	target: GitWorkspaceTarget,
+	scan: GitAccessScan,
+	principal: NarratorPrincipal,
+) {
+	if (
+		principal.isAdmin ||
+		!target.backend ||
+		target.backend.kind !== "local" ||
+		!target.workspace.rootPath
+	)
+		return [];
+	// Owner/admin always pass both project gates. Their associations cannot narrow
+	// capabilities, so do not enumerate/realpath their entire project inventory on
+	// first paint. Foreign (including null-owner) aliases still fail closed and
+	// receive fresh ACL checks; no permission verdict is cached.
+	const foreignProject = or(
+		isNull(projects.ownerUserId),
+		ne(projects.ownerUserId, principal.userId),
+	);
 	const root = target.workspace.rootPath;
 	const candidates = new Set([
 		...ancestors(root, target),
@@ -101,6 +120,7 @@ async function relatedProjects(target: GitWorkspaceTarget, scan: GitAccessScan) 
 			.from(projects)
 			.where(
 				and(
+					foreignProject,
 					cursor ? gt(projects.id, cursor) : undefined,
 					or(
 						inArray(projects.gitPath, [...candidates]),
@@ -129,7 +149,11 @@ async function relatedProjects(target: GitWorkspaceTarget, scan: GitAccessScan) 
 		const missing = [...new Set(page.map((row) => row.projectId))].filter((id) => !matches.has(id));
 		if (!missing.length) continue;
 		const rows = await scan.run(() =>
-			db.select(fields).from(projects).where(inArray(projects.id, missing)).limit(ACCESS_PAGE_SIZE),
+			db
+				.select(fields)
+				.from(projects)
+				.where(and(foreignProject, inArray(projects.id, missing)))
+				.limit(ACCESS_PAGE_SIZE),
 		);
 		for (const row of rows) matches.set(row.id, row);
 	}
@@ -139,7 +163,7 @@ async function relatedProjects(target: GitWorkspaceTarget, scan: GitAccessScan) 
 		db
 			.select(fields)
 			.from(projects)
-			.where(cursor ? gt(projects.id, cursor) : undefined)
+			.where(and(foreignProject, cursor ? gt(projects.id, cursor) : undefined))
 			.orderBy(asc(projects.id))
 			.limit(ACCESS_PAGE_SIZE),
 	)) {
@@ -172,6 +196,7 @@ export async function authorizeGitTargetForPrincipal(
 	source: { narratorId: string } | { chapterId: string },
 	need: "read" | "write",
 	signal: AbortSignal,
+	cachedDiscovery = false,
 ): Promise<GitWorkspaceTarget> {
 	let canWrite = true;
 	let policy: Awaited<ReturnType<typeof resolveOAuthNarratorRuntimePolicy>> = null;
@@ -269,6 +294,7 @@ export async function authorizeGitTargetForPrincipal(
 				);
 				if (need === "write" && !canWrite) throw denied();
 			},
+			cachedDiscovery && need === "read",
 		);
 	} else {
 		await assertChapterProjectAccess(source.chapterId, principal, need);
@@ -288,7 +314,7 @@ export async function authorizeGitTargetForPrincipal(
 	const root = workspace.rootPath;
 	const scan = new GitAccessScan(signal);
 	try {
-		for (const project of await relatedProjects(target, scan)) {
+		for (const project of await relatedProjects(target, scan, principal)) {
 			if (!(await scan.run(() => hasProjectAccess(project, principal, "read")))) throw denied();
 			canWrite &&= await scan.run(() => hasProjectAccess(project, principal, "write"));
 		}

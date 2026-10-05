@@ -878,7 +878,7 @@ function assertLease(
 		!lease ||
 		lease.kind !== "rollback" ||
 		typeof lease.assertCurrent !== "function" ||
-		lease.overlappedUncoordinatedActivity
+		(lease.activityPolicy !== "observe" && lease.overlappedUncoordinatedActivity)
 	)
 		throw fail("INVALID_LEASE", "A live rollback coordinator lease is required");
 	lease.assertCurrent(lease.executionBinding);

@@ -26,6 +26,7 @@ import {
 	waitForOrdinaryToolDrain,
 	waitForUpdateCheckpointFence,
 } from "../../../services/update-coordinator";
+import { getToolMessage, getToolMessageWithParams } from "../../i18n";
 import { settings } from "../../settings";
 import type { ExecutionBackend } from "../execution/backend";
 import { posixPathSemantics } from "../execution/path-semantics";
@@ -45,6 +46,7 @@ import {
 	executeTool,
 	getReflectionToolRejection,
 	preAdmitToolExecution,
+	sanitizeBrokenInput,
 } from "../tool-executor";
 import { toolRegistry } from "../tool-registry";
 import { askUserQuestionTool } from "../tools/ask-user-question";
@@ -241,6 +243,57 @@ describe("reflection tool early rejection", () => {
 		} finally {
 			toolRegistry.unregister(dangerConfirmTool.name);
 		}
+	});
+});
+
+describe("broken tool input attribution", () => {
+	test.each([
+		["Write", { _raw: '{"content":}' }],
+		["Write", {}],
+		["Edit", {}],
+	] as const)("%s invalid/missing input is not proof of token truncation", async (name, input) => {
+		const previous = toolRegistry.get(name);
+		const execute = mock(async () => ({ output: "must not execute" }));
+		toolRegistry.register({
+			name,
+			description: "Input guard fixture",
+			parameters: z.object({}),
+			execute,
+		});
+		try {
+			const result = await executeTool(
+				{ toolUseId: "broken-input", name, input },
+				makeConfig(async () => ({ behavior: "allow" })),
+			);
+			expect(result.broken).toBe(true);
+			expect(result.isError).toBe(true);
+			expect(execute).not.toHaveBeenCalled();
+			expect(result.output).toContain("invalid or missing");
+			expect(result.output).not.toContain("was truncated");
+			expect(result.output).not.toContain("complete truncation");
+		} finally {
+			if (previous) toolRegistry.register(previous);
+			else toolRegistry.unregister(name);
+		}
+	});
+
+	test.each([
+		"en",
+		"zh-CN",
+	] as const)("%s placeholder and reminder preserve uncertain cause", (locale) => {
+		const placeholder = getToolMessage("brokenToolCallInputPlaceholder", locale);
+		expect(sanitizeBrokenInput("Write", { _raw: '{"content":}' }, locale).content).toBe(
+			placeholder,
+		);
+		expect(placeholder).not.toContain("too large");
+		expect(placeholder).not.toContain("过长");
+		expect(placeholder).not.toContain("truncated");
+		expect(placeholder).not.toContain("截断");
+		const reminder = getToolMessageWithParams("brokenToolCallReminder", locale, {
+			toolNames: "Write",
+		});
+		expect(reminder).toContain(locale === "en" ? "does not establish" : "无法认定");
+		expect(reminder).toContain(locale === "en" ? "valid JSON" : "有效的 JSON");
 	});
 });
 

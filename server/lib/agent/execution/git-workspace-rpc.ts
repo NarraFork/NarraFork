@@ -65,6 +65,8 @@ export interface GitWorkspaceResult {
 		| "unsupported";
 	rootPath?: string;
 	repositoryPath?: string;
+	/** Additive probe HEAD label; older executors may omit it. */
+	branch?: string | null;
 	reason?: string;
 	stdout?: string;
 	/** Named bounded raw Git outputs (porcelain and numstat use NUL delimiters).

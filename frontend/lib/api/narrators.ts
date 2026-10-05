@@ -230,6 +230,8 @@ export type ScopedRevertUnavailableReason =
 	| "execution_unavailable"
 	| "runtime_reload_required"
 	| "incomplete_coverage"
+	| "file_conflict"
+	| "history_changed"
 	| "unsupported_target"
 	| "platform_unsupported"
 	| "pending_operations"
@@ -273,6 +275,7 @@ export interface RevertPlanConfirmation {
 	planId: string;
 	planHash: string;
 	action: RevertAction;
+	acceptSnapshotRestore?: true;
 }
 
 export interface RevertActionConfirmOptions {
@@ -321,12 +324,23 @@ export interface RevertBlocker {
 	detail?: string;
 }
 
+export interface RevertDiagnostic {
+	code: string;
+	reason?: string;
+	filePath?: string;
+	effectId?: string;
+	toolCallId?: string;
+	operationId?: string;
+}
+
 export interface RevertActionPreview {
 	action: RevertAction;
 	plan: RevertActionPlan | null;
 	executable: false;
 	historySummary: RevertHistorySummary | null;
 	unavailable?: ScopedRevertUnavailableReason;
+	diagnostics?: RevertDiagnostic[];
+	recoveryMode?: "snapshot";
 	/** Present when the server could name the running/unfinished holders. */
 	blockers?: RevertBlocker[];
 }
@@ -375,6 +389,7 @@ export interface RevertPlanReview extends Omit<RevertActionPlan, "id"> {
 	action: RevertAction;
 	previewKey: string;
 	filesComplete: boolean;
+	recoveryMode?: "snapshot";
 }
 
 export interface RevertPreviewFile {
@@ -419,6 +434,9 @@ export interface RevertScopePreviews<F extends RevertPreviewFile = RevertPreview
 	revertPlan?: RevertPlanReview;
 	previewIssue?: RevertPlanPreviewIssue;
 	previewError?: string;
+	previewErrorKey?: "revertPlanPreviewTimeout";
+	diagnostics?: RevertDiagnostic[];
+	recoveryMode?: "snapshot";
 	blockers?: RevertBlocker[];
 	scope?: RevertScope;
 	affectedFiles: F[];
@@ -594,7 +612,8 @@ export const narratorsApi = {
 		const qs = params.toString();
 		return request<PaginatedNarrators>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
-	getNarrator: (id: string) => request<ApiEntity>(`/narrators/${id}`),
+	getNarrator: (id: string, signal?: AbortSignal) =>
+		request<ApiEntity>(`/narrators/${id}`, { signal }),
 
 	/**
 	 * Upload a custom bitmap avatar for a narrator, replacing any previous one.
@@ -1514,7 +1533,11 @@ export const narratorsApi = {
 		),
 	previewRevertAction: (
 		narratorId: string,
-		body: RevertActionTarget & { action: RevertAction; idempotencyKey: string },
+		body: RevertActionTarget & {
+			action: RevertAction;
+			idempotencyKey: string;
+			recoveryMode?: "snapshot";
+		},
 		signal?: AbortSignal,
 	) =>
 		request<RevertActionPreview>(`/narrators/${narratorId}/revert-action-preview`, {
@@ -1540,7 +1563,11 @@ export const narratorsApi = {
 			`/narrators/${narratorId}/revert-plans/${encodeURIComponent(plan.planId)}/apply`,
 			{
 				method: "POST",
-				body: JSON.stringify({ planHash: plan.planHash, action: plan.action }),
+				body: JSON.stringify({
+					planHash: plan.planHash,
+					action: plan.action,
+					...(plan.acceptSnapshotRestore === true ? { acceptSnapshotRestore: true } : {}),
+				}),
 			},
 		),
 	rollbackToBlock: (

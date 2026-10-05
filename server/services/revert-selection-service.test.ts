@@ -1,6 +1,9 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { FILE_CHANGE_LIMITS, type FileChangeRevertSelector } from "@shared/file-change-protocol";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-identity";
 import type { NarratorAclRow, NarratorPrincipal } from "./narrator-acl";
@@ -277,7 +280,9 @@ const collect = (
 const hasIssue = (result: Awaited<ReturnType<typeof collect>>, code: string) =>
 	result.issues.some((issue) => issue.code === code);
 const rejected = async (pending: Promise<unknown>, code: string) => {
-	await expect(pending).rejects.toMatchObject({ code: `REVERT_SELECTION_${code}` });
+	// Bun's async .rejects matcher can starve paginated setImmediate work; await first.
+	const error = await pending.catch((error: unknown) => error);
+	expect(error).toMatchObject({ code: `REVERT_SELECTION_${code}` });
 };
 
 describe("authorized stable source selection", () => {
@@ -288,7 +293,7 @@ describe("authorized stable source selection", () => {
 		expect(result.executable).toBe(false);
 		expect(result.history.messages).toHaveLength(0);
 		expect(result.messageVersions).toEqual([{ narratorId: "root", messageVersion: 7 }]);
-		expect(authorized).toEqual(["root", "root"]);
+		expect(authorized).toEqual(["root", "root", "root"]);
 		for (const name of ["execute", "delete", "commit", "apply", "finalize"])
 			expect(name in service).toBe(false);
 	});
@@ -811,7 +816,7 @@ describe("derived history requires actual origins and fresh authorization", () =
 		expect(result.noDiskTools.filter((row) => row.reason === "delegated")).toHaveLength(3);
 		expect(
 			queries.filter((query) => query.includes("SELECT id, origin_tool_call_id AS origin")),
-		).toHaveLength(3);
+		).toHaveLength(6); // One collection scan plus one bounded commitment verification.
 		expect(authorized).not.toContain("sibling-72");
 	});
 
@@ -933,6 +938,70 @@ describe("bounded metadata collection and drift", () => {
 		sqlite.exec("DROP TABLE api_requests");
 		await expect(collect()).rejects.toBeDefined();
 	});
+	test("unrelated same-connection writes do not invalidate source capture or metadata digest", async () => {
+		for (let i = 0; i < 70; i++) message(i);
+		const unrelated = message(1, [{ type: "text", text: "other" }], "other");
+		const expected = await collect();
+		let pages = 0;
+		beforeQuery = (query) => {
+			if (query.includes("FROM narrator_message_refs r") && query.includes("ORDER BY r.seq")) {
+				pages++;
+				sqlite
+					.query("UPDATE narrators SET message_version=message_version+1 WHERE id='other'")
+					.run();
+				sqlite
+					.query("UPDATE narrator_messages SET content_text=? WHERE id=?")
+					.run(`changed-${pages}`, unrelated);
+			}
+		};
+		const result = await collect();
+		expect(pages).toBeGreaterThan(3);
+		expect(result.selectionComplete).toBe(true);
+		expect(result.metadataDigest).toBe(expected.metadataDigest);
+		expect(queries.some((query) => /total_changes|data_version/i.test(query))).toBe(false);
+	});
+
+	test("unrelated commits on another connection do not invalidate preview via data_version", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "revert-selection-drift-"));
+		const path = join(directory, "fixture.db");
+		const source = new Database(path);
+		const writer = new Database(path);
+		try {
+			source.exec(DDL);
+			source.exec(`
+				INSERT INTO narrators(id,owner_user_id) VALUES('root','alice'),('other','bob');
+				INSERT INTO narrator_messages(id,narrator_id,content_json) VALUES('selected','root','[{"type":"text","text":"old"}]');
+				INSERT INTO narrator_message_refs VALUES('selected-ref','root','selected',1,NULL);
+			`);
+			service = new RevertSelectionService({ $client: source }, { authorize, onSlow: () => {} });
+			const initial = source
+				.query<{ data_version: number }, []>("PRAGMA data_version")
+				.get()?.data_version;
+			const pending = collect();
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			writer.query("UPDATE narrators SET message_version=message_version+1 WHERE id='other'").run();
+			expect(
+				source.query<{ data_version: number }, []>("PRAGMA data_version").get()?.data_version,
+			).not.toBe(initial);
+			expect((await pending).selectionComplete).toBe(true);
+		} finally {
+			writer.close();
+			source.close();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("a worker-await write to an unrelated source no longer refuses selection", async () => {
+		message(1);
+		const unrelated = message(1, [{ type: "text", text: "old" }], "other");
+		const pending = collect();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		sqlite
+			.query("UPDATE narrator_messages SET content_json=? WHERE id=?")
+			.run(JSON.stringify([{ type: "text", text: "new" }]), unrelated);
+		expect((await pending).selectionComplete).toBe(true);
+	});
+
 	test("same-connection mutation during the first worker await rejects despite same length/version", async () => {
 		const id = message(1, [{ type: "text", text: "old" }]);
 		const pending = collect();
@@ -942,6 +1011,77 @@ describe("bounded metadata collection and drift", () => {
 			.run(JSON.stringify([{ type: "text", text: "new" }]), id);
 		await rejected(pending, "STALE");
 	});
+	test.each([
+		["ref removal", "DELETE FROM narrator_message_refs WHERE narrator_id='root'"],
+		["ref movement", "UPDATE narrator_message_refs SET seq=seq+1 WHERE narrator_id='root'"],
+		["tool binding", "UPDATE narrator_tool_calls SET execution_attempt=2 WHERE narrator_id='root'"],
+		["association removal", "DELETE FROM api_requests WHERE id='selected-request'"],
+		[
+			"association addition",
+			"INSERT INTO api_requests VALUES('late-request', (SELECT id FROM narrator_messages WHERE narrator_id='root' LIMIT 1))",
+		],
+		[
+			"shared ref addition",
+			"INSERT INTO narrator_message_refs SELECT 'late-shared','other',id,1,NULL FROM narrator_messages WHERE narrator_id='root' LIMIT 1",
+		],
+	])("direct unversioned %s changes after collection still refuse the preview", async (_name, mutation) => {
+		const t = tool(1, "Read");
+		sqlite.query("INSERT INTO api_requests VALUES('selected-request',?)").run(t.messageId);
+		let authorizations = 0;
+		service = new RevertSelectionService(
+			{ $client: sqlite },
+			{
+				authorize: async (...args) => {
+					await authorize(...args);
+					if (++authorizations === 2) sqlite.exec(mutation);
+				},
+				onSlow: () => {},
+			},
+		);
+		await rejected(collect(), "STALE");
+	});
+
+	test("same-length body changes during the final digest are checked against the raw commitment", async () => {
+		const selected = message(0, [{ type: "text", text: "old" }]);
+		for (let i = 1; i < 80; i++) message(i);
+		let authorizations = 0;
+		service = new RevertSelectionService(
+			{ $client: sqlite },
+			{
+				authorize: async (...args) => {
+					await authorize(...args);
+					if (++authorizations === 2)
+						setImmediate(() => {
+							sqlite
+								.query("UPDATE narrator_messages SET content_json=? WHERE id=?")
+								.run(JSON.stringify([{ type: "text", text: "new" }]), selected);
+						});
+				},
+				onSlow: () => {},
+			},
+		);
+		await rejected(collect(), "STALE");
+	});
+
+	test("final authorization rechecks the target version after its async callback", async () => {
+		message(1);
+		let authorizations = 0;
+		service = new RevertSelectionService(
+			{ $client: sqlite },
+			{
+				authorize: async (...args) => {
+					await authorize(...args);
+					if (++authorizations === 3)
+						sqlite
+							.query("UPDATE narrators SET message_version=message_version+1 WHERE id='root'")
+							.run();
+				},
+				onSlow: () => {},
+			},
+		);
+		await rejected(collect(), "STALE");
+	});
+
 	test("cancellation during the final metadata digest is observed between bounded rows", async () => {
 		for (let i = 0; i < 80; i++) message(i);
 		const controller = new AbortController();
@@ -977,7 +1117,7 @@ describe("bounded metadata collection and drift", () => {
 					.run();
 		};
 		await rejected(collect(), "STALE");
-		expect(pages).toBe(2);
+		expect(pages).toBe(3);
 	});
 
 	test("a hung ACL callback is cancelled without holding a database transaction", async () => {

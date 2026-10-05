@@ -1,6 +1,7 @@
-import { Badge, Progress, Stack, Text } from "@mantine/core";
+import { Badge, Progress, Stack, Text, Tooltip } from "@mantine/core";
 import { useTranslation } from "react-i18next";
 import type { CodexUsageData, CodexUsageWindow } from "../../lib/api/types";
+import { getCodexCreditsDisplay } from "../../lib/codex-credits";
 import {
 	CODEX_TIER_COLORS,
 	getCodexPlanTypeLabel,
@@ -45,6 +46,7 @@ export function CodexUsageDisplay({ usage }: { usage?: CodexUsageData }) {
 
 	const planTier = normalizeCodexPlanTier(usage.plan_type);
 	const windows = sortCodexUsageWindows(getCodexUsageWindows(usage));
+	const creditsDisplay = getCodexCreditsDisplay(usage.credits);
 	const resetCreditsAvailable = usage.reset_credits_available;
 	const hasResetCredits =
 		typeof resetCreditsAvailable === "number" && Number.isFinite(resetCreditsAvailable);
@@ -68,6 +70,17 @@ export function CodexUsageDisplay({ usage }: { usage?: CodexUsageData }) {
 			<Badge size="xs" variant="light" color={CODEX_TIER_COLORS[planTier]} w="fit-content">
 				{getCodexPlanTypeLabel(t, usage.plan_type)}
 			</Badge>
+
+			{creditsDisplay && (
+				<Tooltip label={t("codexUsageCreditsFetchedAt", { time: relativeTime(usage.queriedAt) })}>
+					<Badge size="xs" variant="light" color="grape" w="fit-content">
+						{t("codexUsageCredits")}:{" "}
+						{creditsDisplay.kind === "unlimited"
+							? t("codexUsageCreditsUnlimited")
+							: creditsDisplay.value}
+					</Badge>
+				</Tooltip>
+			)}
 
 			{windows.length === 0 ? (
 				<Text size="xs" c="dimmed">

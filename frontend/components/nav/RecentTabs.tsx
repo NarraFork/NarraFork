@@ -52,6 +52,7 @@ import {
 	IconRobot,
 	IconShield,
 	IconTerminal2,
+	IconWindowMaximize,
 	IconX,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
@@ -97,8 +98,8 @@ import {
 	updateAsyncQuestionAttention,
 } from "../../lib/notification";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
-
 import { UserAvatar } from "../UserAvatar";
+import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
 import { RecentTabDirectoryRow, type RecentTabDirectoryRowProps } from "./RecentTabDirectoryRow";
 import { RecentTabDropIndicator } from "./RecentTabDropIndicator";
 import type { RecentTabDropTarget } from "./recent-tab-drop-target";
@@ -882,6 +883,14 @@ export function RecentTabList({
 		}
 	}, [ctxMenu, resolveTabDirectory, t]);
 
+	/** 在外部窗口打开该标签（叙述者/章节 → chat 面板窗口；workspace → 表面窗口；project → 主应用窗口） */
+	const handleOpenInWindow = useCallback(() => {
+		if (!ctxMenu) return;
+		const href = recentTabWindowHref(ctxMenu.tab);
+		setCtxMenu(null);
+		if (href) window.open(href, "_blank", PANEL_WINDOW_FEATURES);
+	}, [ctxMenu]);
+
 	/** 打开重命名对话框 */
 	const handleRename = useCallback(() => {
 		if (!ctxMenu) return;
@@ -1311,6 +1320,8 @@ export function RecentTabList({
 							}
 							onCopyCwd={handleCopyCwd}
 							canCopyCwd={["chapter", "narrator", "subagent"].includes(ctxMenu.tab.type)}
+							onOpenInWindow={handleOpenInWindow}
+							canOpenInWindow={recentTabWindowHref(ctxMenu.tab) !== null}
 							onRename={handleRename}
 							canRename={ctxMenu.tab.type === "narrator"}
 							onArchive={handleArchive}
@@ -2293,6 +2304,8 @@ interface TabContextMenuProps {
 	canNewNarratorHere: boolean;
 	onCopyCwd: () => void;
 	canCopyCwd: boolean;
+	onOpenInWindow: () => void;
+	canOpenInWindow: boolean;
 	onRename: () => void;
 	canRename: boolean;
 	onArchive: () => void;
@@ -2316,6 +2329,8 @@ function TabContextMenu({
 	canNewNarratorHere,
 	onCopyCwd,
 	canCopyCwd,
+	onOpenInWindow,
+	canOpenInWindow,
 	onRename,
 	canRename,
 	onArchive,
@@ -2375,6 +2390,14 @@ function TabContextMenu({
 							<Group gap={8} wrap="nowrap">
 								<IconCopy size={14} />
 								<Text size="sm">{t("copyCwd")}</Text>
+							</Group>
+						</UnstyledButton>
+					)}
+					{canOpenInWindow && (
+						<UnstyledButton px="xs" py={4} onClick={onOpenInWindow} style={{ borderRadius: 4 }}>
+							<Group gap={8} wrap="nowrap">
+								<IconWindowMaximize size={14} />
+								<Text size="sm">{t("openInWindow")}</Text>
 							</Group>
 						</UnstyledButton>
 					)}

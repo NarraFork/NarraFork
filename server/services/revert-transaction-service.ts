@@ -34,8 +34,10 @@ import { fileChangeBlobs, fileChangeScopes, revertOperationFiles } from "../db/s
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { generateId } from "../lib/id";
+import { logger } from "../lib/logger";
 import {
 	createFileChangeIdentity,
+	type FileChangeScopeIdentity,
 	fileChangeExecutionBindingMatches,
 	fileChangeIdentityKey,
 } from "./file-change-identity";
@@ -82,7 +84,30 @@ import {
 	type WorkspaceWriteLease,
 } from "./workspace-write-coordinator";
 
+import {
+	freezeWorkspaceRanges,
+	WORKSPACE_RANGE_LIMITS,
+	type WorkspaceWriteRange,
+} from "./workspace-write-ranges";
+
 export { RevertTransactionError } from "./revert-transaction-worker";
+
+/** Admission bounds for already-authorized fixed targets, never additional mutation authority. */
+export function buildRevertScopeRanges(
+	scope: Readonly<FileChangeScopeIdentity>,
+	canonicalPaths: readonly string[],
+): readonly WorkspaceWriteRange[] {
+	bound(canonicalPaths.length, FILE_CHANGE_LIMITS.revertFiles, 1);
+	const ranges = canonicalPaths.map((canonicalPath) => ({ kind: "file" as const, canonicalPath }));
+	if (
+		ranges.length <= WORKSPACE_RANGE_LIMITS.count &&
+		Buffer.byteLength(JSON.stringify({ version: 1, ranges })) <= WORKSPACE_RANGE_LIMITS.jsonBytes
+	)
+		return freezeWorkspaceRanges(scope, ranges);
+	// Do not hide an invalid/out-of-scope target behind the conservative fallback.
+	for (const range of ranges) freezeWorkspaceRanges(scope, [range]);
+	return freezeWorkspaceRanges(scope);
+}
 
 type Namespace = Awaited<ReturnType<LocalFileChangeRuntime["verifyNamespace"]>>;
 type Scope = typeof fileChangeScopes.$inferSelect;
@@ -93,6 +118,7 @@ export interface RevertTransactionRequest {
 	planHash: string;
 	/** Required by HTTP; internal callers may still exercise non-UI preview plans. */
 	action?: FileChangeRevertAction;
+	acceptSnapshotRestore?: true;
 	signal?: AbortSignal;
 }
 export interface RevertTransactionOutcome {
@@ -247,8 +273,10 @@ export class RevertTransactionService {
 		operation: RevertJournalOperation,
 		signal: AbortSignal,
 	): Promise<void> {
-		if (!request.action) return;
-		await this.namespace(signal);
+		// Terminal replay checks immutable consent only, not target IO. A reopened
+		// runtime may supply a new namespace object with the same durable binding.
+		const terminal = operation.status !== "prepared";
+		await this.namespace(signal, terminal);
 		const blob = this.db
 			.select({ size: fileChangeBlobs.sizeBytes, status: fileChangeBlobs.status })
 			.from(fileChangeBlobs)
@@ -264,10 +292,13 @@ export class RevertTransactionService {
 		await worker<boolean>(
 			{
 				action: "entrypoint",
-				raw: { ref, bytes: await this.readBlob(ref, signal) },
+				raw: { ref, bytes: await this.readBlob(ref, signal, terminal) },
 				operation,
 				userId: request.principal.userId,
-				expectedAction: request.action,
+				...(request.action === undefined ? {} : { expectedAction: request.action }),
+				...(request.acceptSnapshotRestore === undefined
+					? {}
+					: { acceptSnapshotRestore: request.acceptSnapshotRestore }),
 			},
 			signal,
 		);
@@ -377,7 +408,16 @@ export class RevertTransactionService {
 			raw.push({ ref, bytes: await this.readBlob(ref, run.signal) });
 		}
 		const manifest = await worker<ValidatedTransactionManifest>(
-			{ action: "validate", raw, operation, files: rows, userId: run.request.principal.userId },
+			{
+				action: "validate",
+				raw,
+				operation,
+				files: rows,
+				userId: run.request.principal.userId,
+				...(run.request.acceptSnapshotRestore === undefined
+					? {}
+					: { acceptSnapshotRestore: run.request.acceptSnapshotRestore }),
+			},
 			run.signal,
 		);
 		run.usedBytes = manifest.evidenceBytes;
@@ -395,8 +435,9 @@ export class RevertTransactionService {
 			const preview = await this.options.access.resolveFile(fileAccess);
 			await preview.assertCurrent({ signal: run.signal });
 			if (
-				!fileChangeExecutionBindingMatches(preview.executionBinding, file.executionBinding) ||
-				preview.scopeRevision !== file.scopeRevision ||
+				preview.executionBinding.deviceId !== file.executionBinding.deviceId ||
+				preview.executionBinding.runtimeEpoch !== file.executionBinding.runtimeEpoch ||
+				preview.executionBinding.runtimeGeneration !== file.executionBinding.runtimeGeneration ||
 				fileChangeIdentityKey(preview.identity) !== fileChangeIdentityKey(file.identity) ||
 				preview.identity.scopeId !== file.identity.scopeId
 			)
@@ -406,15 +447,9 @@ export class RevertTransactionService {
 				.from(fileChangeScopes)
 				.where(eq(fileChangeScopes.id, file.identity.scopeId))
 				.get();
-			if (
-				!scope ||
-				scope.status !== "active" ||
-				scope.revision !== file.scopeRevision ||
-				scope.fencingToken !== file.executionBinding.fencingToken ||
-				scope.activeLeaseId ||
-				scope.activeMutationCount
-			)
-				throw fail("SCOPE_STALE");
+			// The lease below owns CURRENT admission. A fence from the read-only
+			// preview is not a dependency on every other file in this workspace.
+			if (!scope || scope.status !== "active") throw fail("SCOPE_STALE");
 			this.scopeIdentity(scope, file);
 			if ((await localDirectoryIdentity(scope.canonicalRoot)) !== scope.rootIdentityJson?.object)
 				throw fail("ROOT_STALE");
@@ -439,8 +474,6 @@ export class RevertTransactionService {
 			for (const file of run.files) {
 				const lease = this.lease(run, file);
 				if (
-					lease.scopeRevision !== file.manifest.scopeRevision + 1 ||
-					lease.executionBinding.fencingToken !== file.manifest.executionBinding.fencingToken + 1 ||
 					lease.executionBinding.runtimeEpoch !== file.manifest.executionBinding.runtimeEpoch ||
 					lease.executionBinding.runtimeGeneration !==
 						file.manifest.executionBinding.runtimeGeneration
@@ -534,6 +567,10 @@ export class RevertTransactionService {
 					this.quarantine(run);
 					return this.outcome(run, live, false, "COMMIT_RESULT_UNKNOWN");
 				}
+				logger.warn("Revert execution failed; compensating target files", {
+					planId: run.request.planId,
+					error: String(error),
+				});
 				return this.compensate(run, batch);
 			}
 		};
@@ -545,6 +582,13 @@ export class RevertTransactionService {
 					scopes: [...scopes.values()].map((scope) => ({
 						scope,
 						runtime: this.runtimeBinding(scope.deviceId),
+						activityPolicy: "strict" as const,
+						ranges: buildRevertScopeRanges(
+							scope,
+							run.files
+								.filter((file) => file.scope.id === scope.id)
+								.map((file) => file.manifest.identity.canonicalPath),
+						),
 						// This service exclusively awaits native restoreLocalFile IO; it
 						// does not launch Bash or delegate mutations to remote processes.
 						executionClass: "local_file_io" as const,
@@ -882,11 +926,13 @@ export class RevertTransactionService {
 		});
 		if (current.projectId !== run.ctx?.owner.projectId) throw fail("OWNER_STALE");
 	}
-	private async namespace(signal: AbortSignal) {
+	private async namespace(signal: AbortSignal, allowRecoveredNamespace = false) {
 		const namespace = await this.options.runtime.verifyNamespace(signal);
 		const budget = namespace.catalog.getBudget();
 		if (
-			namespace !== this.options.namespace ||
+			(allowRecoveredNamespace
+				? namespace.generation !== this.options.namespace.generation
+				: namespace !== this.options.namespace) ||
 			budget?.status !== "ready" ||
 			budget.namespaceKey !== this.options.planOptions.namespaceKey ||
 			budget.generation !== namespace.generation
@@ -894,16 +940,20 @@ export class RevertTransactionService {
 			throw fail("NAMESPACE_STALE");
 		return namespace;
 	}
-	private async readBlob(ref: FileChangeBlobRef, signal: AbortSignal) {
+	private async readBlob(
+		ref: FileChangeBlobRef,
+		signal: AbortSignal,
+		allowRecoveredNamespace = false,
+	) {
 		bound(ref.sizeBytes, FILE_CHANGE_LIMITS.blobBytes);
-		const namespace = await this.namespace(signal);
+		const namespace = await this.namespace(signal, allowRecoveredNamespace);
 		const row = namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref });
 		if (row?.status !== "ready" || row.sizeBytes !== ref.sizeBytes) throw fail("RAW_UNAVAILABLE");
 		const bytes = await namespace.store.readBytes(ref, {
 			signal,
 			maxBytes: FILE_CHANGE_LIMITS.blobBytes,
 		});
-		await this.namespace(signal);
+		await this.namespace(signal, allowRecoveredNamespace);
 		return bytes;
 	}
 	private async observeForReceipt(
@@ -1086,7 +1136,16 @@ function fixedRequest(input: RevertTransactionRequest): Omit<RevertTransactionRe
 	if (
 		!input ||
 		Object.keys(input).some(
-			(key) => !["principal", "narratorId", "planId", "planHash", "action", "signal"].includes(key),
+			(key) =>
+				![
+					"principal",
+					"narratorId",
+					"planId",
+					"planHash",
+					"action",
+					"acceptSnapshotRestore",
+					"signal",
+				].includes(key),
 		)
 	)
 		throw fail("INVALID_REQUEST");
@@ -1109,6 +1168,8 @@ function fixedRequest(input: RevertTransactionRequest): Omit<RevertTransactionRe
 		!["revert_files", "rollback_to_block", "delete_tool_block"].includes(input.action)
 	)
 		throw fail("INVALID_REQUEST");
+	if (input.acceptSnapshotRestore !== undefined && input.acceptSnapshotRestore !== true)
+		throw fail("INVALID_REQUEST");
 	if (typeof input.planHash !== "string" || !/^[a-f0-9]{64}$/.test(input.planHash))
 		throw fail("INVALID_PLAN_HASH");
 	return Object.freeze({
@@ -1117,6 +1178,9 @@ function fixedRequest(input: RevertTransactionRequest): Omit<RevertTransactionRe
 		planId: input.planId,
 		planHash: input.planHash,
 		...(input.action === undefined ? {} : { action: input.action }),
+		...(input.acceptSnapshotRestore === undefined
+			? {}
+			: { acceptSnapshotRestore: input.acceptSnapshotRestore }),
 	});
 }
 function bound(value: number, max: number, min = 0) {

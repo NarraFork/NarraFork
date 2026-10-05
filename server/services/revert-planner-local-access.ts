@@ -56,7 +56,7 @@ import {
 	RevertPlannerService,
 } from "./revert-planner-service";
 import { RevertTransactionService } from "./revert-transaction-service";
-import type { WorkspaceCaptureSummary } from "./workspace-write-coordinator";
+import { WorkspaceWriteCoordinatorError } from "./workspace-write-coordinator";
 
 /** Production ACL and read-only local backend adapter. No test/HTTP allow callbacks,
  * cwd confirmation, default-device guessing, legacy replay or remote fallback. */
@@ -215,12 +215,12 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 		if (!scope) throw stale("Recorded scope is unavailable");
 		const initialRuntime = localFileChangeRuntimeBinding(LOCAL_DEVICE_ID);
 		if (!initialRuntime) throw stale("Local runtime is unavailable");
-		const initialCapture = runtime.coordinator.capture(scope);
-		assertIdle(initialCapture);
+		// A preview observes this file, not workspace quiescence. Unrelated activity
+		// and scope fences may advance; apply obtains a fresh lease and checks bytes.
 		const executionBinding = Object.freeze({
 			deviceId: LOCAL_DEVICE_ID,
 			...initialRuntime,
-			fencingToken: initialCapture.fencingToken,
+			fencingToken: scope.fencingToken,
 		});
 		const assertCurrent = async ({ signal }: { signal: AbortSignal }) => {
 			const context = await this.fileContext({ ...input, identity, signal });
@@ -263,37 +263,13 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 				localBackend.runtimeGeneration !== initialRuntime.runtimeGeneration
 			)
 				throw stale("Local runtime generation changed");
-			let capture: WorkspaceCaptureSummary;
-			try {
-				capture = runtime.coordinator.assertObservationCurrent({
-					scope: live,
-					runtime: currentRuntime,
-					scopeRevision: initialCapture.scopeRevision,
-					fencingToken: executionBinding.fencingToken,
-					signal,
-				});
-			} catch {
-				signal.throwIfAborted();
-				throw new RevertPlannerError(
-					"ACTIVE_WRITER",
-					"An overlapping durable or live write scope requires verification",
-				);
-			}
-			assertIdle(capture);
-			if (
-				capture.scopeRevision !== initialCapture.scopeRevision ||
-				capture.fencingToken !== executionBinding.fencingToken ||
-				capture.coordinationEpoch !== initialCapture.coordinationEpoch ||
-				capture.coordinationRevision !== initialCapture.coordinationRevision
-			)
-				throw stale("Platform write activity or scope revision changed during observation");
 			signal.throwIfAborted();
 		};
 		await assertCurrent({ signal: input.signal });
 		return {
 			identity,
 			executionBinding,
-			scopeRevision: initialCapture.scopeRevision,
+			scopeRevision: scope.revision,
 			assertCurrent,
 			async readCurrent({ signal, maxBytes }) {
 				if (
@@ -360,23 +336,6 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 	}
 }
 
-function assertIdle(capture: WorkspaceCaptureSummary) {
-	if (
-		capture.status !== "active" ||
-		capture.durableLeasePresent ||
-		capture.activeMutationCount ||
-		capture.active.writes ||
-		capture.active.rollbacks ||
-		capture.active.uncoordinatedActivities ||
-		capture.active.retainedRecoveryHolds
-	)
-		throw new RevertPlannerError(
-			"ACTIVE_WRITER",
-			"Known platform activity or an unsettled scope prevents preview preparation",
-		);
-	// externalFilesystemQuiescence intentionally remains unknown. This is only a
-	// preview; external races must be detected again by a future guarded executor.
-}
 function stale(message: string) {
 	return new RevertPlannerError("STALE", message);
 }
@@ -508,6 +467,7 @@ export interface LocalRevertActionPreviewRequest {
 	messageId: string;
 	blockIndex?: number;
 	idempotencyKey: string;
+	recoveryMode?: "snapshot";
 }
 
 /** Resolve UI indices only at preview time; the resulting manifest freezes actual identities. */
@@ -519,8 +479,6 @@ export async function prepareLocalRevertAction(
 ) {
 	await access.owner(principal, narratorId, signal);
 	try {
-		const { assertBashActivityProtectionReady } = await import("../lib/agent/tools/bash");
-		assertBashActivityProtectionReady();
 		const narrator = db
 			.select({ messageVersion: narrators.messageVersion })
 			.from(narrators)
@@ -626,6 +584,7 @@ export async function prepareLocalRevertAction(
 			revertScope: "narrator",
 			selector,
 			uiAction: input.action,
+			...(input.recoveryMode ? { recoveryMode: input.recoveryMode } : {}),
 			signal,
 		});
 		return { ...result, action: input.action };
@@ -633,11 +592,36 @@ export async function prepareLocalRevertAction(
 		if (!(error instanceof AppError) || error.statusCode !== 409) throw error;
 		const code = error.code;
 		if (/IDEMPOTENCY|ACTION_MISMATCH|REQUEST_CONFLICT/.test(code)) throw error;
-		// The coarse reason below is all the client sees. Keep the precise code for
-		// remote diagnosis; never log error.message, which can embed absolute paths.
-		logger.warn("Revert preview refused", { narratorId, action: input.action, code });
+		// Always return the precise code. Calculated failures additionally name the
+		// authorized display path and safe reason enum; never echo arbitrary messages.
+		const diagnostics =
+			error instanceof RevertPlannerError && error.diagnostics.length
+				? error.diagnostics.slice(0, 8)
+				: [{ code, ...(/STALE/.test(code) ? { reason: "history_changed" } : {}) }];
+		logger.warn("Revert preview refused", { narratorId, action: input.action, code, diagnostics });
 		let unavailable: ScopedRevertUnavailableReason = "incomplete_coverage";
-		if (code === "REVERT_RUNTIME_RELOAD_REQUIRED") unavailable = "runtime_reload_required";
+		if (
+			diagnostics.some(
+				(item) => item.reason === "merge_conflict" || item.reason === "state_conflict",
+			)
+		)
+			unavailable = "file_conflict";
+		else if (diagnostics.some((item) => item.reason === "current_file_changed"))
+			unavailable = "file_conflict";
+		else if (diagnostics.some((item) => item.reason === "target_changed"))
+			unavailable = "unsupported_target";
+		else if (/STALE/.test(code)) unavailable = "history_changed";
+		else if (
+			diagnostics.some((item) => item.reason === "budget_exceeded" || item.reason === "timeout")
+		)
+			unavailable = "window_too_large";
+		else if (
+			diagnostics.some(
+				(item) => item.reason === "blob_unavailable" || item.reason === "blob_integrity",
+			)
+		)
+			unavailable = "snapshot_missing";
+		else if (code === "REVERT_RUNTIME_RELOAD_REQUIRED") unavailable = "runtime_reload_required";
 		else if (code === "REVERT_PLANNER_PLATFORM_UNSUPPORTED") unavailable = "platform_unsupported";
 		else if (/UNSUPPORTED|WORKSPACE_UNAVAILABLE|TARGET_UNVERIFIED/.test(code))
 			unavailable = "unsupported_target";
@@ -669,6 +653,8 @@ export async function prepareLocalRevertAction(
 			plan: null,
 			executable: false as const,
 			unavailable,
+			diagnostics,
+			...(input.recoveryMode ? { recoveryMode: input.recoveryMode } : {}),
 			historySummary: null,
 			...(blockers && blockers.length > 0 ? { blockers } : {}),
 		};
@@ -680,12 +666,10 @@ export async function applyLocalRevertPlan(
 	principal: NarratorPrincipal,
 	narratorId: string,
 	planId: string,
-	input: { planHash: string; action: FileChangeRevertAction },
+	input: { planHash: string; action: FileChangeRevertAction; acceptSnapshotRestore?: true },
 	signal: AbortSignal,
 ) {
 	const owner = await access.owner(principal, narratorId, signal);
-	const { assertBashActivityProtectionReady } = await import("../lib/agent/tools/bash");
-	assertBashActivityProtectionReady();
 	await assertLocalRevertPlatform();
 	const { plans, transactions } = await services(signal);
 	const plan = plans.getSummary(owner, planId);
@@ -703,6 +687,8 @@ export async function applyLocalRevertPlan(
 			"ACTION_MISMATCH",
 			"Confirmed action does not match the prepared plan",
 		);
+	// Consent and immutable entrypoint validation precede any interruption.
+	await transactions.validateHttpAction({ principal, narratorId, planId, ...input, signal });
 	const { acquireNarratorRevertAdmission } = await import("./narrator-session");
 	const release =
 		plan.status === "prepared"
@@ -710,7 +696,6 @@ export async function applyLocalRevertPlan(
 			: () => {};
 	let execution: ReturnType<RevertTransactionService["execute"]>;
 	try {
-		await transactions.validateHttpAction({ principal, narratorId, planId, ...input, signal });
 		const admissionPlan = plans.getSummary(owner, planId);
 		if (admissionPlan.status === "prepared" && admissionPlan.expired)
 			throw new RevertPlannerError("EXPIRED", "Confirmed plan expired; load a fresh preview");
@@ -744,7 +729,15 @@ export async function applyLocalRevertPlan(
 	void settled.catch((error) =>
 		logger.error("Revert settlement or post-commit refresh failed", { error: String(error) }),
 	);
-	const outcome = await execution.result;
+	const outcome = await execution.result.catch((error: unknown) => {
+		if (error instanceof WorkspaceWriteCoordinatorError)
+			throw new AppError(
+				"The target files are blocked by an unfinished write or recovery operation",
+				409,
+				`REVERT_COORDINATOR_${error.code.toUpperCase()}`,
+			);
+		throw error;
+	});
 	if (!outcome.settling) await settled;
 	const { historyResult: _historyResult, worktreePaths: _worktreePaths, ...response } = outcome;
 	return refreshFailed && response.status === "committed"

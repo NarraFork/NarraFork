@@ -1059,16 +1059,14 @@ export async function executeTool(
 			}
 		}
 
-		// Check if the tool input is malformed JSON (_raw field) — a sign of output truncation
+		// Malformed JSON is not proof of output truncation: syntax errors and
+		// interrupted/missing stream fragments can produce the same _raw marker.
 		if ("_raw" in effectiveInput) {
 			const rawLen = typeof effectiveInput._raw === "string" ? effectiveInput._raw.length : 0;
 			return {
 				output:
-					`The tool call input was truncated — received malformed JSON (${rawLen} chars of raw input). ` +
-					`The ${tu.name} was NOT executed to avoid corrupting files. ` +
-					"Each tool call's total input must be under 10,000 characters. " +
-					"Use skeleton-first approach: Write a skeleton with SPLICE markers, " +
-					"then Edit to fill each marker with real content.",
+					`The ${tu.name} call received malformed JSON (${rawLen} chars of raw input). ` +
+					getToolMessage("brokenToolCallResult", locale),
 				isError: true,
 				durationMs: Date.now() - start,
 				permissionStartedAt,
@@ -1079,17 +1077,13 @@ export async function executeTool(
 			};
 		}
 
-		// Detect empty input for file-writing tools — a sign of complete truncation
-		// where the stream sent tool name/id but no input chunks at all.
+		// Empty file-writing input is unusable, but does not establish why it is missing.
 		const FILE_TOOLS = new Set(["Write", "Edit"]);
 		if (FILE_TOOLS.has(tu.name) && Object.keys(effectiveInput).length === 0) {
 			return {
 				output:
-					`The ${tu.name} call received no input at all (complete truncation). ` +
-					`The ${tu.name} was NOT executed. ` +
-					"Each tool call's total input must be under 10,000 characters. " +
-					"Use skeleton-first approach: Write a skeleton with SPLICE markers, " +
-					"then Edit to fill each marker with real content.",
+					`The ${tu.name} call received no input. ` +
+					getToolMessage("brokenToolCallResult", locale),
 				isError: true,
 				durationMs: Date.now() - start,
 				permissionStartedAt,

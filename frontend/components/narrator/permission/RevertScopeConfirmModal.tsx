@@ -18,6 +18,7 @@ import {
 	Badge,
 	Button,
 	Center,
+	Checkbox,
 	Group,
 	Loader,
 	Modal,
@@ -41,6 +42,7 @@ export interface RevertScopeConfirmModalProps {
 	isLoading: boolean;
 	loadingDescription?: string;
 	onReload?: () => void;
+	onRequestSnapshotRestore?: () => void;
 	/** Disables the exits while the host's request is in flight. */
 	submitting?: boolean;
 	/** Confirm label when there ARE files to revert. */
@@ -73,6 +75,10 @@ function scopeUnavailableKey(preview: ScopePreview | undefined): string | null {
 				return "revertScopeSnapshotMissing";
 			case "incomplete_coverage":
 				return "revertScopeIncompleteCoverage";
+			case "file_conflict":
+				return "revertScopeFileConflict";
+			case "history_changed":
+				return "revertScopeHistoryChanged";
 			case "window_too_large":
 				return "revertScopeWindowTooLarge";
 			case "pending_operations":
@@ -145,6 +151,7 @@ export function RevertScopeConfirmModal({
 	isLoading,
 	loadingDescription,
 	onReload,
+	onRequestSnapshotRestore,
 	submitting,
 	confirmWithRevertLabel,
 	confirmNoFilesLabel,
@@ -167,6 +174,28 @@ export function RevertScopeConfirmModal({
 	}, [opened, data, isLoading]);
 	const scope = selection && selection.preview === data ? selection.scope : "narrator";
 	const plan = data?.revertPlan;
+	const snapshotPlan = plan?.recoveryMode === "snapshot";
+	const [snapshotConsent, setSnapshotConsent] = useState<{
+		preview: RevertScopePreviews;
+		key: string | undefined;
+	} | null>(null);
+	const snapshotAccepted =
+		opened &&
+		!isLoading &&
+		snapshotConsent !== null &&
+		snapshotConsent.preview === data &&
+		snapshotConsent.key === previewKey;
+	useEffect(() => {
+		setSnapshotConsent((current) =>
+			opened &&
+			!isLoading &&
+			!submitting &&
+			current?.preview === data &&
+			current?.key === previewKey
+				? current
+				: null,
+		);
+	}, [opened, isLoading, submitting, data, previewKey]);
 	const lastReadyPlan = useRef<string | null>(null);
 	const [retiredPlanId, setRetiredPlanId] = useState<string | null>(null);
 	const [, setExpiryTick] = useState(0);
@@ -227,7 +256,33 @@ export function RevertScopeConfirmModal({
 				: "revertScopeUnavailable"
 			: ((scope === "workspace" ? workspaceUnavailable : narratorUnavailable) ??
 				(revertBlocked && conflicts.length === 0 ? "revertScopeUnavailable" : null));
-	const unavailableKey = planUnavailable ?? scopeUnavailable;
+	const diagnostics = data?.diagnostics ?? [];
+	const fileConflict =
+		selectedPreview?.reason === "file_conflict" ||
+		diagnostics.some((diagnostic) =>
+			["merge_conflict", "state_conflict"].includes(diagnostic.reason ?? diagnostic.code),
+		);
+	const changedTargetDiagnostic = diagnostics.find((diagnostic) =>
+		["current_file_changed", "target_changed"].includes(diagnostic.reason ?? diagnostic.code),
+	);
+	const changedTargetReason = changedTargetDiagnostic?.reason ?? changedTargetDiagnostic?.code;
+	const unavailableKey =
+		planUnavailable ??
+		(fileConflict && revertBlocked
+			? "revertScopeFileConflict"
+			: changedTargetReason && revertBlocked
+				? `revertDiagnosticReason.${changedTargetReason}`
+				: scopeUnavailable);
+	const unavailableCode = selectedPreview?.reason ?? data?.previewIssue ?? "unavailable";
+	const canRequestSnapshot =
+		opened &&
+		!isLoading &&
+		!submitting &&
+		!snapshotPlan &&
+		!plan &&
+		fileConflict &&
+		!data?.previewIssue &&
+		!!onRequestSnapshotRestore;
 	const workspaceWarningText = formatRevertWarnings(t, workspaceScope?.warnings);
 	const blockers = data?.blockers ?? [];
 	const subagentWarningText = narratorScope?.subagentWarning
@@ -271,6 +326,24 @@ export function RevertScopeConfirmModal({
 							</Alert>
 						)}
 
+						{snapshotPlan && (
+							<Alert color="yellow" variant="light" title={t("revertSnapshotWarningTitle")}>
+								<Text size="xs">{t("revertSnapshotWarning")}</Text>
+								<Checkbox
+									mt="xs"
+									label={t("revertSnapshotAccept")}
+									checked={snapshotAccepted}
+									disabled={revertBlocked || submitting}
+									onChange={(event) => {
+										if (!data || revertBlocked || submitting) return;
+										setSnapshotConsent(
+											event.currentTarget.checked ? { preview: data, key: previewKey } : null,
+										);
+									}}
+								/>
+							</Alert>
+						)}
+
 						{showScopeChoice && (
 							<SegmentedControl
 								size="xs"
@@ -304,7 +377,39 @@ export function RevertScopeConfirmModal({
 						{unavailableKey && (
 							<Alert color="yellow" variant="light" title={t("revertScopeUnavailableTitle")}>
 								<Text size="xs">{t(unavailableKey)}</Text>
-								{data?.previewError && <Text size="xs">{data.previewError}</Text>}
+								<Text size="xs">{t("revertDiagnosticCode", { code: unavailableCode })}</Text>
+								{diagnostics.map((diagnostic) => (
+									<Stack key={JSON.stringify(diagnostic)} gap={2} mt="xs">
+										<Text size="xs">
+											{t(`revertDiagnosticReason.${diagnostic.reason ?? diagnostic.code}`, {
+												defaultValue: diagnostic.reason ?? diagnostic.code,
+											})}
+										</Text>
+										<Text size="xs">{diagnostic.code}</Text>
+										{diagnostic.filePath && <TruncatedPath path={diagnostic.filePath} />}
+										{diagnostic.toolCallId && <Text size="xs">tool: {diagnostic.toolCallId}</Text>}
+										{diagnostic.operationId && (
+											<Text size="xs">operation: {diagnostic.operationId}</Text>
+										)}
+										{diagnostic.effectId && <Text size="xs">effect: {diagnostic.effectId}</Text>}
+									</Stack>
+								))}
+								{canRequestSnapshot && (
+									<Button
+										size="xs"
+										mt="xs"
+										variant="light"
+										color="yellow"
+										onClick={onRequestSnapshotRestore}
+									>
+										{t("revertSnapshotRequest")}
+									</Button>
+								)}
+								{(data?.previewErrorKey || data?.previewError) && (
+									<Text size="xs">
+										{data.previewErrorKey ? t(data.previewErrorKey) : data.previewError}
+									</Text>
+								)}
 								{blockers.length > 0 && (
 									<Stack gap={4} mt="xs">
 										<Text size="xs" fw={500}>
@@ -421,6 +526,7 @@ export function RevertScopeConfirmModal({
 							onClick={() => {
 								if (!opened || isLoading || submitting) return;
 								if (plan) setRetiredPlanId(plan.planId);
+								setSnapshotConsent(null);
 								onReload();
 							}}
 						>
@@ -445,16 +551,23 @@ export function RevertScopeConfirmModal({
 					<Button
 						size="xs"
 						color="red"
-						disabled={revertBlocked || submitting}
+						disabled={revertBlocked || submitting || (snapshotPlan && !snapshotAccepted)}
 						onClick={() => {
-							if (revertBlocked || submitting) return;
+							if (revertBlocked || submitting || (snapshotPlan && !snapshotAccepted)) return;
 							if (plan) {
 								if (planUnavailableKey(plan, previewKey, activeFiles.length) || !plan.planHash)
 									return;
 								setRetiredPlanId(plan.planId);
 								onConfirm({
 									skipRevert: false,
-									revertPlan: { planId: plan.planId, planHash: plan.planHash, action: plan.action },
+									revertPlan: {
+										planId: plan.planId,
+										planHash: plan.planHash,
+										action: plan.action,
+										...(snapshotPlan && snapshotAccepted
+											? { acceptSnapshotRestore: true as const }
+											: {}),
+									},
 								});
 							} else {
 								onConfirm({ skipRevert: false, scope });
@@ -464,9 +577,11 @@ export function RevertScopeConfirmModal({
 					>
 						{revertBlocked
 							? t("revertScopeUnavailableTitle")
-							: activeFiles.length > 0
-								? confirmWithRevertLabel
-								: confirmNoFilesLabel}
+							: snapshotPlan
+								? t("revertSnapshotConfirm")
+								: activeFiles.length > 0
+									? confirmWithRevertLabel
+									: confirmNoFilesLabel}
 					</Button>
 				</Group>
 			</Stack>
@@ -520,6 +635,7 @@ export function RevertActionConfirmModal({
 			}
 			submitting={submitting}
 			onReload={preview.reload}
+			onRequestSnapshotRestore={preview.requestSnapshotRestore}
 			confirmWithRevertLabel={t(
 				isBlockDelete ? "blockDeleteWithRevert" : "rollbackConfirmWithRevert",
 			)}

@@ -262,6 +262,7 @@ export const createRevertActionPreviewSchema = z
 			.max(FILE_CHANGE_LIMITS.historyToolRelatedChanges)
 			.optional(),
 		idempotencyKey: revertPlanIdentifierSchema,
+		recoveryMode: z.literal("snapshot").optional(),
 	})
 	.strict()
 	.refine(
@@ -272,7 +273,11 @@ export const createRevertActionPreviewSchema = z
 		"The action requires an exact message/block boundary",
 	);
 export const applyRevertPlanSchema = z
-	.object({ planHash: z.string().regex(/^[a-f0-9]{64}$/), action: revertActionSchema })
+	.object({
+		planHash: z.string().regex(/^[a-f0-9]{64}$/),
+		action: revertActionSchema,
+		acceptSnapshotRestore: z.literal(true).optional(),
+	})
 	.strict();
 
 export const revertPlanFilesQuerySchema = z

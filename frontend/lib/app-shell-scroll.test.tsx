@@ -229,15 +229,19 @@ describe("authenticated AppShell scroll contract", () => {
 		expect(mainRuleStart).toBeGreaterThan(-1);
 		expect(mainRule).toContain("overflow-y: auto");
 		// The one media query above Main is the installed-PWA height basis on `html`
-		// (`100lvh` instead of `100dvh`; see the rationale in safe-area.css). It changes
-		// which unit the single height owner resolves, never who scrolls — so what this
-		// assertion has to protect is that no conditional rule reassigns the scroll owner.
+		// (`100lvh` instead of `100dvh`; see the rationale in safe-area.css). WCO is a
+		// display-mode of its own, so the basis switch matches it alongside standalone.
+		// Either way it changes which unit the single height owner resolves, never who
+		// scrolls — so what this assertion has to protect is that no conditional rule
+		// reassigns the scroll owner.
 		// Checked by shape rather than by banning `@media`, which the basis switch needs.
 		// (The stylesheet-wide prohibitions those rules rest on — no `position: fixed`,
 		// `touch-action` or `overflow-x` anywhere in the chain — are asserted in
 		// safe-area.test.ts; this test is only about who owns the scroll.)
 		const queriesAboveMain = css.slice(0, mainRuleStart).match(/@media[^{]*/g) ?? [];
-		expect(queriesAboveMain).toEqual(["@media (display-mode: standalone) "]);
+		expect(queriesAboveMain).toEqual([
+			"@media (display-mode: standalone), (display-mode: window-controls-overlay) ",
+		]);
 		expect(css.slice(0, mainRuleStart)).not.toContain("overflow-y: auto");
 		// Main stays the only scroll container: the overlay rule must not introduce one.
 		expect(css.slice(mainRuleEnd).match(/overflow-y: auto/g)).toBe(null);
@@ -266,8 +270,10 @@ describe("authenticated AppShell scroll contract", () => {
 		expect(scrollerEnd).toBeGreaterThan(scrollerStart);
 		const scroller = source.slice(scrollerStart, scrollerEnd);
 
-		// It is the scroll container…
-		expect(scroller).toContain('overflow: "auto"');
+		// It owns both axes and keeps the vertical track stable while loading.
+		expect(scroller).toContain('overflowX: "auto"');
+		expect(scroller).toContain('overflowY: "scroll"');
+		expect(scroller).toContain('scrollbarGutter: "stable"');
 		// …but it must not claim the touch gestures the shell resolves, and it must not
 		// re-enable the browser's scroll anchoring, which competes with this list's own
 		// anchored writes on every streaming frame.

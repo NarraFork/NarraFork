@@ -5,12 +5,18 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { DockviewDefaultTab, type IDockviewPanelHeaderProps } from "dockview-react";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
-import { act } from "react";
+import { act, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
 import { api } from "../../lib/api";
 import commonLocale from "../../locales/en/common.json";
+import {
+	type PluginUiSessionContext,
+	PluginUiSurfaceProvider,
+	usePluginUiSurface,
+} from "../plugins/PluginUiSurfaceContext";
+import { parsePanelWindowDescriptor } from "../window/panel-window";
 import { DefaultSurfaceTab, fileTabRevealDirectory, withSurfaceTabMenu } from "./SurfaceTab";
 
 function queryClient(platform = "windows") {
@@ -108,6 +114,8 @@ async function mountTab(
 		hostname?: string;
 		params?: Record<string, unknown>;
 		treatAsLocalAccess?: boolean;
+		hostContext?: PluginUiSessionContext;
+		sessionContext?: PluginUiSessionContext;
 	} = {},
 ) {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
@@ -159,7 +167,14 @@ async function mountTab(
 			<QueryClientProvider client={testClient}>
 				<I18nextProvider i18n={i18n}>
 					<MantineProvider env="test">
-						<Tab {...props} />
+						{options.hostContext ? (
+							<PluginUiSurfaceProvider hostContext={options.hostContext}>
+								<SessionSeed context={options.sessionContext} />
+								<Tab {...props} />
+							</PluginUiSurfaceProvider>
+						) : (
+							<Tab {...props} />
+						)}
 					</MantineProvider>
 				</I18nextProvider>
 			</QueryClientProvider>,
@@ -172,17 +187,101 @@ async function mountTab(
 	});
 }
 
+function SessionSeed({ context }: { context?: PluginUiSessionContext }) {
+	const surface = usePluginUiSurface();
+	useEffect(() => {
+		if (context) surface?.setSessionContext("i1", context);
+	}, [context, surface]);
+	return null;
+}
+
+function windowItem() {
+	return Array.from(document.querySelectorAll("[role=menuitem]")).find(
+		(item) => item.textContent?.trim() === commonLocale.dockTabs.openInWindow,
+	);
+}
+
 function revealItem() {
 	return Array.from(document.querySelectorAll("[role=menuitem]")).find(
 		(item) => item.textContent?.trim() === commonLocale.dockTabs.revealInExplorer,
 	);
 }
 
+describe("plugin tab window context", () => {
+	const plugin = {
+		panelType: "plugin",
+		schemaVersion: 1,
+		pluginId: "p1",
+		contributionId: "c1",
+		panelInstanceId: "i1",
+		binding: { kind: "focus-current-narrator" },
+	} as const;
+	it("copies actual resolved session context and fixes the current narrator binding", async () => {
+		const sessionContext: PluginUiSessionContext = {
+			surface: "focus",
+			narratorId: "actual",
+			chapterId: "chapter1",
+			projectId: "project1",
+		};
+		await mountTab({
+			params: plugin,
+			hostContext: { surface: "focus", narratorId: "host" },
+			sessionContext,
+		});
+		expect(windowItem()).toBeDefined();
+		const calls: string[] = [];
+		Object.defineProperty(window, "open", {
+			configurable: true,
+			value: (href: string) => {
+				calls.push(href);
+				return null;
+			},
+		});
+		await act(async () => {
+			windowItem()?.dispatchEvent(new Event("click", { bubbles: true }));
+		});
+		expect(calls).toHaveLength(1);
+		const json = new URL(calls[0] ?? "", "https://example.test").searchParams.get("d");
+		expect(parsePanelWindowDescriptor(json ?? undefined)).toEqual({
+			...plugin,
+			binding: { kind: "focus-current-narrator", narratorId: "actual" },
+			hostContext: sessionContext,
+		});
+	});
+
+	it("opens workspace plugin params after dropping panelRowId", async () => {
+		await mountTab({
+			params: { ...plugin, binding: { kind: "workspace", workspaceId: "w1" }, panelRowId: "row1" },
+			hostContext: { surface: "workspace", workspaceId: "w1" },
+		});
+		expect(windowItem()).toBeDefined();
+	});
+
+	it("offers legal large plugin state", async () => {
+		await mountTab({
+			params: { ...plugin, binding: { kind: "global" }, viewState: { text: "x".repeat(9000) } },
+			hostContext: { surface: "settings" },
+		});
+		expect(Boolean(windowItem())).toBe(true);
+	});
+
+	it("hides descriptors beyond the shared UTF-8 budget", async () => {
+		await mountTab({ params: { panelType: "file", filePath: `/${"界".repeat(11000)}` } });
+		expect(Boolean(windowItem())).toBe(false);
+	});
+
+	it("does not guess a narrator identity without a source surface or binding", async () => {
+		await mountTab({ params: plugin });
+		expect(Boolean(windowItem())).toBe(false);
+	});
+});
+
 describe("file tab context menu", () => {
 	it("opens the containing directory, closes the menu and retains close actions", async () => {
 		revealSpy = spyOn(api, "fsReveal").mockResolvedValue({ ok: true });
 		await mountTab();
-		expect(document.querySelectorAll("[role=menuitem]").length).toBe(5);
+		// openInWindow + reveal + the four close actions.
+		expect(document.querySelectorAll("[role=menuitem]").length).toBe(6);
 		expect(revealItem()).toBeDefined();
 		await act(async () => {
 			revealItem()?.dispatchEvent(new Event("click", { bubbles: true }));
@@ -243,16 +342,53 @@ describe("file tab context menu", () => {
 	});
 
 	it.each([
-		{ hostname: "example.com" },
-		{ platform: "unknown" },
-		{ params: { panelType: "file", filePath: "C:/file.ts", deviceId: "remote" } },
-		{ params: { panelType: "chat" } },
-		{ params: { panelType: "file", filePath: "spec://tasks.json" } },
-	])("hides the action when unavailable: %j", async (options) => {
+		// reveal hidden; the file/chat panel still opens in a window (+1 item)…
+		{ options: { hostname: "example.com" }, items: 5 },
+		{ options: { platform: "unknown" }, items: 5 },
+		{
+			options: { params: { panelType: "file", filePath: "C:/file.ts", deviceId: "remote" } },
+			items: 5,
+		},
+		// …except a panel whose params carry no identity (chat without narratorId).
+		{ options: { params: { panelType: "chat" } }, items: 4 },
+		{ options: { params: { panelType: "file", filePath: "spec://tasks.json" } }, items: 5 },
+	])("hides the action when unavailable: %j", async ({ options, items }) => {
 		revealSpy = spyOn(api, "fsReveal").mockResolvedValue({ ok: true });
 		await mountTab(options);
 		expect(revealItem()).toBeUndefined();
-		expect(document.querySelectorAll("[role=menuitem]").length).toBe(4);
+		expect(document.querySelectorAll("[role=menuitem]").length).toBe(items);
 		expect(revealSpy).not.toHaveBeenCalled();
+	});
+
+	it("offers the panel in an external window, unless it is the mock harness", async () => {
+		await mountTab();
+		const openCalls: string[] = [];
+		Object.defineProperty(window, "open", {
+			configurable: true,
+			writable: true,
+			value: (href: string) => {
+				openCalls.push(href);
+				return null;
+			},
+		});
+		await mountTab();
+		const item = Array.from(document.querySelectorAll("[role=menuitem]")).find(
+			(entry) => entry.textContent?.trim() === commonLocale.dockTabs.openInWindow,
+		);
+		expect(item).toBeDefined();
+		await act(async () => {
+			item?.dispatchEvent(new Event("click", { bubbles: true }));
+		});
+		expect(openCalls).toHaveLength(1);
+		expect(openCalls[0]).toContain("/windows/panel?d=");
+		expect(decodeURIComponent(openCalls[0] ?? "")).toContain("file name.ts");
+
+		// The debug streaming harness is never windowable.
+		await mountTab({ params: { panelType: "mock", narratorId: "n1" } });
+		expect(
+			Array.from(document.querySelectorAll("[role=menuitem]")).find(
+				(entry) => entry.textContent?.trim() === commonLocale.dockTabs.openInWindow,
+			),
+		).toBeUndefined();
 	});
 });

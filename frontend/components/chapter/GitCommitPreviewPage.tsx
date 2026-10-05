@@ -134,9 +134,9 @@ function NarratorPreview(props: {
 	const context = useWorkspaceContext(props.narratorId);
 	const narrator = useNarrator(props.narratorId);
 	const [initialized, setInitialized] = useState(false);
-	// useGitWorkspace keys reads by contextKey, falling back to narrator metadata.
-	// Do not mount its consumer on a provisional key: a late identity response would
-	// otherwise tear down a visible preview and fetch the same commit a second time.
+	// Wait for a revisioned execution context (or legacy narrator fallback) before
+	// authorizing a preview. Later metadata hydration at the same revision keeps
+	// its workspace query stable and must not tear down visible commit content.
 	useEffect(() => {
 		if (
 			!context.transitioning &&

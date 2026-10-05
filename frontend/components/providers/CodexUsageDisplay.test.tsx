@@ -36,6 +36,9 @@ function installDom() {
 		Text: window.Text,
 		matchMedia,
 		getComputedStyle: () => ({ getPropertyValue: () => "" }),
+		// Mantine Tooltip transitions drive animation frames; the fake DOM has none.
+		requestAnimationFrame: (callback: () => void) => setTimeout(callback, 0),
+		cancelAnimationFrame: (id: number) => clearTimeout(id),
 		IS_REACT_ACT_ENVIRONMENT: true,
 	});
 }
@@ -183,5 +186,25 @@ describe("CodexUsageDisplay", () => {
 
 		await renderUsage(usage());
 		expect(container.textContent).not.toContain("Reset credits");
+	});
+
+	test("renders the spendable credits balance verbatim when reported", async () => {
+		await renderUsage(
+			usage({
+				credits: { has_credits: true, unlimited: false, balance: "123.456789012345678" },
+			}),
+		);
+		expect(container.textContent).toContain("Credits: 123.456789012345678");
+
+		await renderUsage(usage());
+		expect(container.textContent).not.toContain("Credits:");
+	});
+
+	test("renders unlimited and zero credits states", async () => {
+		await renderUsage(usage({ credits: { has_credits: true, unlimited: true, balance: null } }));
+		expect(container.textContent).toContain("Credits: Unlimited");
+
+		await renderUsage(usage({ credits: { has_credits: false, unlimited: false, balance: null } }));
+		expect(container.textContent).toContain("Credits: 0");
 	});
 });

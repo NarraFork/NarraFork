@@ -310,6 +310,8 @@ export interface SubagentSessionPanelContentProps {
 	subagentNarratorId: string;
 	compact: boolean;
 	onClose: () => void;
+	/** Window hosts navigate without closing their OS window. Recents remain shared. */
+	onOpenStandalonePage?: (narratorId: string) => void;
 	onHeaderPointerDown?: (event: React.PointerEvent) => void;
 	onViewSubagentSession?: (narratorId: string, messageId?: string) => void;
 	onTitleChange?: (title: string) => void;
@@ -331,6 +333,7 @@ export function SubagentSessionPanelContent({
 	subagentNarratorId,
 	compact,
 	onClose,
+	onOpenStandalonePage,
 	onHeaderPointerDown,
 	onViewSubagentSession,
 	onTitleChange,
@@ -366,6 +369,10 @@ export function SubagentSessionPanelContent({
 				isScheduled: traits.includes("scheduled"),
 			});
 		}
+		if (onOpenStandalonePage) {
+			onOpenStandalonePage(subagentNarratorId);
+			return;
+		}
 		onClose();
 		navigate({
 			to: "/narrators/$narratorId",
@@ -375,6 +382,7 @@ export function SubagentSessionPanelContent({
 		navigate,
 		narratorData,
 		onClose,
+		onOpenStandalonePage,
 		subagentNarratorId,
 		title,
 		traits,

@@ -22,7 +22,7 @@ import {
 import { targetPathSemantics } from "../lib/agent/execution/path-semantics";
 import {
 	compactLocks,
-	hasNarratorAdmissionWork,
+	hasOtherNarratorAdmissionWork,
 	isNarratorRuntimeBusy,
 } from "./narrator-session-state";
 
@@ -322,12 +322,12 @@ export function collectRevertBlockers(narratorId: string, code?: string): Revert
 	if (
 		compactLocks.has(narratorId) ||
 		isNarratorRuntimeBusy(narratorId) ||
-		hasNarratorAdmissionWork(narratorId)
+		hasOtherNarratorAdmissionWork(narratorId)
 	) {
 		const parts: string[] = [];
 		if (compactLocks.has(narratorId)) parts.push("compact lock");
 		if (isNarratorRuntimeBusy(narratorId)) parts.push("loop or tool execution");
-		if (hasNarratorAdmissionWork(narratorId)) parts.push("admission work still settling");
+		if (hasOtherNarratorAdmissionWork(narratorId)) parts.push("admission work still settling");
 		blockers.push({
 			kind: "narrator_busy",
 			detail: boundedDetail(parts.join(", ")),

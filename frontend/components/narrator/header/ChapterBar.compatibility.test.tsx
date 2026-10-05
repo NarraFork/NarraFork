@@ -3,6 +3,7 @@ import { parseHTML } from "linkedom";
 import type { HTMLAttributes, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import type { Root } from "react-dom/client";
+import type { GitWorkspace } from "../../../../shared/git-workspace";
 
 const keys = ["window", "document", "navigator", "IS_REACT_ACT_ENVIRONMENT"] as const;
 const originals = keys.map(
@@ -40,10 +41,15 @@ mock.module("@frontend/hooks/useChapterGitStatus", () => ({
 	useChapterGitStatus: () => ({ data: undefined }),
 }));
 mock.module("@frontend/hooks/useContainers", () => ({ useContainers: () => ({ data: [] }) }));
+let gitWorkspace: { data?: GitWorkspace; isPending?: boolean; isError?: boolean } = {};
+let gitStatus:
+	| { branch: string; totalFiles: number; linesAdded: number; linesRemoved: number }
+	| undefined;
 mock.module("@frontend/hooks/useGit", () => ({
-	useGitWorkspace: () => ({ data: undefined }),
-	useGitStatus: () => ({ data: undefined }),
-	gitWorkspaceTarget: () => null,
+	useGitWorkspace: () => gitWorkspace,
+	useGitStatus: () => ({ data: gitStatus }),
+	gitWorkspaceTarget: (_id: string, workspace?: GitWorkspace) =>
+		workspace?.state === "ready" ? { narratorId: "n" } : null,
 }));
 let currentCwd = "/different/current-workspace";
 let containerSupported = true;
@@ -124,9 +130,9 @@ mock.module("@frontend/components/container/ContainerConfigModal", () => ({
 	},
 }));
 type WrapperProps = { children?: ReactNode };
-const Wrapper = ({ children, onClick, onKeyDown, role }: HTMLAttributes<HTMLDivElement>) => (
+const Wrapper = ({ children, onClick, onKeyDown, role, style }: HTMLAttributes<HTMLDivElement>) => (
 	// biome-ignore lint/a11y/noStaticElementInteractions: mock forwards Mantine Group event handlers and dynamic role
-	<div role={role} onClick={onClick} onKeyDown={onKeyDown}>
+	<div role={role} onClick={onClick} onKeyDown={onKeyDown} style={style}>
 		{children}
 	</div>
 );
@@ -182,6 +188,8 @@ async function click(label: string) {
 	});
 }
 beforeEach(async () => {
+	gitWorkspace = {};
+	gitStatus = undefined;
 	chapter = { ...chapter, status: "active", containerConfig: { services: {} } };
 	currentCwd = "/different/current-workspace";
 	containerSupported = true;
@@ -207,6 +215,64 @@ afterAll(() => {
 		else Reflect.deleteProperty(globalThis, key);
 	}
 });
+test("non-Git and unresolved standalone workspaces never reserve a strip", async () => {
+	gitWorkspace = { isPending: true };
+	await act(async () => {
+		root.render(<NarratorGitBar narratorId="n" onOpenGitPanel={() => {}} />);
+		await flush();
+	});
+	expect(container.textContent).toBe("");
+	gitWorkspace = { data: { state: "not_git" } as GitWorkspace };
+	await act(async () => {
+		root.render(<NarratorGitBar narratorId="n" onOpenGitPanel={() => {}} />);
+		await flush();
+	});
+	expect(container.textContent).toBe("");
+});
+for (const variant of ["chapter", "standalone"] as const) {
+	test(`${variant} shows summary branch before statistics and keeps a fixed strip height`, async () => {
+		gitWorkspace = {
+			isPending: true,
+			data: {
+				state: "ready",
+				branch: "summary-branch",
+				capabilities: { read: true, write: true },
+				deviceId: "local",
+				cwd: "/repo",
+				rootPath: "/repo",
+				workspaceKey: "local:/repo",
+				repositoryKey: "local:/repo",
+			},
+		};
+		const render = () =>
+			root.render(
+				variant === "chapter" ? (
+					<ChapterBar chapterId="chapter" narratorId="n" />
+				) : (
+					<NarratorGitBar narratorId="n" onOpenGitPanel={() => {}} />
+				),
+			);
+		await act(async () => {
+			render();
+			await flush();
+		});
+		expect(container.textContent).toContain("summary-branch");
+		const strip = container.firstElementChild as HTMLElement;
+		expect(strip.style.height).toBe("30px");
+		gitStatus = {
+			branch: "authoritative-branch",
+			totalFiles: 12,
+			linesAdded: 100,
+			linesRemoved: 2,
+		};
+		await act(async () => {
+			render();
+			await flush();
+		});
+		expect(container.textContent).toContain("authoritative-branch");
+		expect((container.firstElementChild as HTMLElement).style.height).toBe("30px");
+	});
+}
 for (const variant of ["chapter", "standalone"] as const) {
 	test(`${variant} Git row ignores worktree portal clicks and activation keys`, async () => {
 		const openGit = mock(() => {});

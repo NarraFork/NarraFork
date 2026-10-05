@@ -76,6 +76,16 @@ beforeAll(async () => {
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	const template = new Database(":memory:");
 	await runMigrations(template);
+	// This migration-only fixture does not run the normal startup schema patcher.
+	// Keep its disposable narrator rows compatible with the current Drizzle insert shape.
+	if (
+		!template
+			.query(
+				"SELECT 1 FROM pragma_table_info('narrators') WHERE name = 'context_usage_snapshot_json'",
+			)
+			.get()
+	)
+		template.exec("ALTER TABLE narrators ADD COLUMN context_usage_snapshot_json TEXT");
 	migrated = template.serialize();
 	template.close();
 });
@@ -421,6 +431,24 @@ describe("real prepared plans and lease-bound durable claims", () => {
 			"not ready",
 		);
 		expect(service.getOperation(p.ctx).status).toBe("prepared");
+	});
+
+	test("explicit recovery journal claims accept an observing lease during registered activity", async () => {
+		const p = await started();
+		const activity = coordinator.registerActivity({ scope, runtime });
+		try {
+			await expect(rollback(() => {})).rejects.toMatchObject({ code: "uncoordinated_activity" });
+			await coordinator.withRollback(
+				{ scope, runtime, activityPolicy: "observe" },
+				async (lease) => {
+					expect(lease.overlappedUncoordinatedActivity).toBe(true);
+					for (const file of p.files) await applyFile(p.ctx, file, lease);
+				},
+			);
+			expect((await service.finishFiles(p.ctx)).status).toBe("files_verified");
+		} finally {
+			coordinator.endActivity(activity);
+		}
 	});
 
 	test("real rollback lease required; stale, write-only and foreign scope leases cannot claim", async () => {

@@ -2593,7 +2593,13 @@ function NarratorPanelBody({
 		if (!revertHistorySubmitting) setPendingBlockDelete(null);
 	}, [revertHistorySubmitting, setPendingBlockDelete]);
 
-	if (!narrator) return <NarratorPanelSkeleton />;
+	// List props are not detail readiness: wait until the workspace shape is known
+	// before exposing messages, otherwise a late Git strip shifts the whole panel.
+	if (
+		!narrator ||
+		(!isWorkspacePreview && !isSubagent && (!fetchedNarrator || !gitWorkspaceQuery.layoutReady))
+	)
+		return <NarratorPanelSkeleton />;
 
 	const statusBarDisplay = getNarratorStatusBarDisplay({
 		panelNarratorId: narratorId,

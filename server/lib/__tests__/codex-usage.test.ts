@@ -279,6 +279,63 @@ describe("Codex usage window parsing", () => {
 	});
 });
 
+describe("Codex spendable credits", () => {
+	test("parses credits and keeps the decimal balance as a string", () => {
+		const parsed = parseCodexUsagePayload(
+			payload({
+				credits: { has_credits: true, unlimited: false, balance: "123.456789012345678" },
+			} as unknown as Partial<CodexUsagePayload>),
+			"2026-05-01T00:00:00.000Z",
+		);
+		expect(parsed.credits).toEqual({
+			has_credits: true,
+			unlimited: false,
+			balance: "123.456789012345678",
+		});
+		// A float round-trip would lose digits; the verbatim string must not.
+		expect(parsed.credits?.balance).not.toBe(String(Number("123.456789012345678")));
+	});
+
+	test("parses unlimited and no-credits states with a null balance", () => {
+		const unlimited = parseCodexUsagePayload(
+			payload({
+				credits: { has_credits: true, unlimited: true, balance: null },
+			} as unknown as Partial<CodexUsagePayload>),
+			"2026-05-01T00:00:00.000Z",
+		);
+		expect(unlimited.credits).toEqual({ has_credits: true, unlimited: true, balance: null });
+
+		const none = parseCodexUsagePayload(
+			payload({
+				credits: { has_credits: false, unlimited: false, balance: null },
+			} as unknown as Partial<CodexUsagePayload>),
+			"2026-05-01T00:00:00.000Z",
+		);
+		expect(none.credits).toEqual({ has_credits: false, unlimited: false, balance: null });
+	});
+
+	test("stringifies a numeric balance and tolerates malformed flag values", () => {
+		const parsed = parseCodexUsagePayload(
+			payload({
+				credits: { has_credits: "yes", unlimited: 1, balance: 42 },
+			} as unknown as Partial<CodexUsagePayload>),
+			"2026-05-01T00:00:00.000Z",
+		);
+		expect(parsed.credits).toEqual({ has_credits: false, unlimited: false, balance: "42" });
+	});
+
+	test("a missing or non-record credits field leaves the field absent", () => {
+		expect(parseCodexUsagePayload(payload(), "2026-05-01T00:00:00.000Z").credits).toBeUndefined();
+		for (const credits of [null, "nope", [1]]) {
+			const parsed = parseCodexUsagePayload(
+				payload({ credits } as unknown as Partial<CodexUsagePayload>),
+				"2026-05-01T00:00:00.000Z",
+			);
+			expect(parsed.credits).toBeUndefined();
+		}
+	});
+});
+
 describe("Codex reset credits", () => {
 	test("parses rate_limit_reset_credits into reset_credits_available", () => {
 		const parsed = parseCodexUsagePayload(

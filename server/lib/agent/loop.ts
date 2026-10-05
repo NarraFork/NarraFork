@@ -7431,9 +7431,10 @@ async function* agentLoopInMetadataSnapshot(
 				// formatted from tu.toolUseId and are only renamed further below.
 				pendingToolResults = pendingToolResults.filter((tr) => {
 					const toolUseId =
-						(tr as { toolUseId?: string; call_id?: string; tool_call_id?: string }).toolUseId ??
-						(tr as { toolUseId?: string; call_id?: string; tool_call_id?: string }).call_id ??
-						(tr as { toolUseId?: string; call_id?: string; tool_call_id?: string }).tool_call_id;
+						(tr as { toolUseId?: string }).toolUseId ??
+						(tr as { tool_use_id?: string }).tool_use_id ??
+						(tr as { call_id?: string }).call_id ??
+						(tr as { tool_call_id?: string }).tool_call_id;
 					return !toolUseId || !brokenToolUseIds.has(toolUseId);
 				});
 				provider.pushAssistantTurn(

@@ -80,7 +80,7 @@ export function NarratorGitBar({
 	const workspaceState = workspace.data?.state;
 	if (
 		!workspace.isError &&
-		((workspace.isPending && !executionContext?.git) || workspaceState === "not_git")
+		((workspace.isPending && !workspace.data) || workspaceState === "not_git")
 	) {
 		return null;
 	}
@@ -93,7 +93,13 @@ export function NarratorGitBar({
 			role="button"
 			tabIndex={0}
 			aria-label={t("panel.title")}
-			style={{ flexShrink: 0, cursor: "pointer", userSelect: "text" }}
+			style={{
+				height: 30,
+				flexShrink: 0,
+				overflow: "hidden",
+				cursor: "pointer",
+				userSelect: "text",
+			}}
 			onClick={(event) => {
 				// Portal events bubble through React, even when outside this DOM row.
 				if (!event.currentTarget.contains(event.target as Node)) return;
@@ -119,9 +125,9 @@ export function NarratorGitBar({
 					}
 				>
 					{target
-						? status.data?.branch || t("workspace.ready")
+						? status.data?.branch || workspace.data?.branch || t("workspace.ready")
 						: t(
-								`workspace.${workspace.isPending ? "loading" : workspace.isError ? "error" : (workspace.data?.state ?? "error")}`,
+								`workspace.${workspace.isPending && !workspace.data ? "loading" : workspace.isError ? "error" : (workspace.data?.state ?? "error")}`,
 							)}
 				</Text>
 			</Group>
@@ -280,6 +286,8 @@ export function ChapterBar({
 				wrap="nowrap"
 				style={{
 					borderBottom: "1px solid var(--mantine-color-default-border)",
+					height: 30,
+					overflow: "hidden",
 					flexShrink: 0,
 					backgroundColor: "light-dark(var(--mantine-color-gray-0), var(--mantine-color-dark-7))",
 				}}
@@ -314,7 +322,9 @@ export function ChapterBar({
 							executionContext ? `${executionContext.deviceId}: ${executionContext.cwd}` : undefined
 						}
 					>
-						{narratorId ? workspaceStatus?.branch || "Git" : chapter.branch}
+						{narratorId
+							? workspaceStatus?.branch || workspaceQuery.data?.branch || "Git"
+							: chapter.branch}
 					</Text>
 					{gitStatus &&
 						(gitStatus.commitsAhead > 0 ||

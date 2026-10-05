@@ -87,6 +87,8 @@ import {
 	installAuthenticatedAppShellRootLock,
 	SAFE_AREA_INSET_TOP,
 } from "../lib/safe-area";
+import { installThemeColorSync } from "../lib/theme-color-sync";
+import { installWcoTracking } from "../lib/wco";
 import { BrandTitle } from "./common/BrandTitle";
 import { LazyOverlayBoundary } from "./common/LazyOverlayBoundary";
 import { GitMissingAlert } from "./GitMissingAlert";
@@ -330,7 +332,15 @@ export function AuthenticatedLayout() {
 	useBrowserLayoutEffect(() => {
 		const removeRootLock = installAuthenticatedAppShellRootLock();
 		const stopViewportTracking = installAppViewportTracking();
+		// PWA Window Controls Overlay: publishes html[data-nf-wco]; all adaptation
+		// is CSS (styles/wco.css), so this is the only JS hookup the shell needs.
+		const stopWcoTracking = installWcoTracking();
+		// The WCO buttons paint theme-color as their background (not transparent),
+		// so it must follow the shell's real background across theme changes.
+		const stopThemeColorSync = installThemeColorSync();
 		return () => {
+			stopThemeColorSync();
+			stopWcoTracking();
 			stopViewportTracking();
 			removeRootLock();
 		};
@@ -488,9 +498,10 @@ export function AuthenticatedLayout() {
 					px="md"
 					justify="space-between"
 					wrap="nowrap"
+					className="nf-header-row"
 					visibleFrom={wizardOpen && !opened ? "sm" : undefined}
 				>
-					<Group wrap="nowrap">
+					<Group wrap="nowrap" className="nf-header-side">
 						<Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
 						<Tooltip
 							label={t(navCollapsed ? "expandSidebar" : "collapseSidebar")}
@@ -532,7 +543,7 @@ export function AuthenticatedLayout() {
 						)}
 						{!searchOpen && <BrandTitle order={3} hiddenFrom="sm" />}
 					</Group>
-					<Group wrap="nowrap">
+					<Group wrap="nowrap" className="nf-header-side">
 						<OutputStatsBadge enabled={prefs?.showOutputStats ?? false} />
 						<NotificationBell />
 						<Tooltip label={t("feedback")} position="bottom" withArrow>
@@ -574,6 +585,10 @@ export function AuthenticatedLayout() {
 				}}
 			>
 				<RecentTabsWSProvider />
+				{/* WCO (buttons left, e.g. macOS): pushes nav content below the traffic
+				    lights and doubles as drag surface. display:none everywhere else —
+				    see styles/wco.css. */}
+				<Box className="nf-wco-nav-spacer" aria-hidden />
 				{wizardOpen ? (
 					// The wizard replaces the navbar contents, so a failed chunk here used to
 					// take down the shell that hosts it and leave no way to navigate.

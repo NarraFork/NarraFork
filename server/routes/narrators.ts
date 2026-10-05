@@ -286,6 +286,7 @@ import {
 	updateNarratorDraft,
 } from "../services/narrator-draft-service";
 import { buildExportFileName, streamNarratorExport } from "../services/narrator-export";
+import { getNarratorGitSummary } from "../services/narrator-git-summary";
 import {
 	countNarratorMessageRefs,
 	countNarratorMessageRefsBatch,
@@ -1404,7 +1405,10 @@ narratorRoutes.post("/broken-models/undo", requireAdmin, async (c) => {
 narratorRoutes.get("/:id", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
-	const hasDraft = await narratorHasDraft(c.get("user").sub, id);
+	const [hasDraft, gitSummary] = await Promise.all([
+		narratorHasDraft(c.get("user").sub, id),
+		getNarratorGitSummary(id, narrator.workspaceRevision, narratorPrincipalOf(c), c.req.raw.signal),
+	]);
 	const runtimeModel = getNarratorRuntimeModel(id, narrator.model?.trim() || FOLLOW_DEFAULT_MODEL);
 	// The stored counter is only refreshed when a turn ends, so a narrator that has
 	// not run since the turn-count → message-count change would still report the old
@@ -1421,6 +1425,7 @@ narratorRoutes.get("/:id", async (c) => {
 			: undefined;
 	return c.json({
 		...publicNarratorResponse(narrator, hasDraft),
+		gitSummary,
 		messageCount,
 		...(modelInheritance && { modelInheritance }),
 		...(runtimeModel && {

@@ -17,6 +17,7 @@
  */
 import { logger } from "../lib/logger";
 import { invalidateBoundaries } from "./git-commit-boundary-cache";
+import { gitDiscoveryCache } from "./git-discovery-cache";
 import { type GitStatusSummary, gitService } from "./git-service";
 import { normalizeWorkspacePath } from "./git-workspace";
 
@@ -168,6 +169,12 @@ export function invalidateStatus(rawPath: string): void {
 	// drifting apart. Synchronous on purpose: a deferred invalidation would leave a
 	// window in which a refetch could still read boundaries from the old HEAD.
 	invalidateBoundaries(rawPath);
+	gitDiscoveryCache.invalidate(
+		"local",
+		rawPath,
+		undefined,
+		(a, b) => normalizeWorkspacePath(a) === normalizeWorkspacePath(b),
+	);
 
 	const key = normalizeWorkspacePath(rawPath);
 	const entry = cache.get(key);
@@ -197,6 +204,12 @@ export function invalidateStatus(rawPath: string): void {
  */
 export function dropStatus(rawPath: string): void {
 	invalidateBoundaries(rawPath);
+	gitDiscoveryCache.invalidate(
+		"local",
+		rawPath,
+		undefined,
+		(a, b) => normalizeWorkspacePath(a) === normalizeWorkspacePath(b),
+	);
 	cache.delete(normalizeWorkspacePath(rawPath));
 }
 

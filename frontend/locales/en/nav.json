@@ -40,6 +40,7 @@
 	"copyCwdNoDir": "Could not resolve a working directory for this tab",
 	"copyCwdSuccess": "Working directory copied: {{path}}",
 	"copyCwdFailed": "Failed to copy working directory",
+	"openInWindow": "Open in window",
 	"rename": "Rename",
 	"archive": "Archive",
 	"totalOutputChars": "Total AI output chars",

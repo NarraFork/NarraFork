@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import type { GitWorkspaceCategory } from "@shared/git-workspace-events";
 import { logger } from "../lib/logger";
 import { safeSpawn } from "../lib/spawn";
+import { gitDiscoveryCache } from "./git-discovery-cache";
 import type { GitWorkspaceTarget } from "./git-workspace";
 
 export const WATCH_INTERVAL_MS = 3000;
@@ -246,6 +247,13 @@ export class GitWorkspaceWatchPool {
 				const sample = await this.probe(target, controller.signal);
 				if (!controller.signal.aborted) {
 					const categories = changedGitCategories(entry.previous, sample);
+					if (categories.includes("head") || categories.includes("refs"))
+						gitDiscoveryCache.invalidate(
+							target.workspace.deviceId,
+							target.workspace.rootPath ?? target.workspace.cwd,
+							target.repositoryPath,
+							target.backend?.paths.equals,
+						);
 					entry.failures = 0;
 					entry.previous = sample;
 					for (const listener of entry.listeners) listener.changed(categories);

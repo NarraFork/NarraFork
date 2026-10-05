@@ -466,7 +466,7 @@ describe("standalone commit file routes with real memory history", () => {
 			`${buildCommitPreviewHref(TARGET, SHA, SECOND)}&rootPath=%2Fsecret&canWrite=true`,
 		);
 		await expectSelected(SECOND);
-		expect(api.getNarrator).toHaveBeenCalledWith(TARGET.narratorId);
+		expect(api.getNarrator).toHaveBeenCalledWith(TARGET.narratorId, expect.any(AbortSignal));
 		expect(api.getGitWorkspace).toHaveBeenCalled();
 		expect(api.getGitCommitDetail).toHaveBeenCalledWith(
 			expect.objectContaining({ ...TARGET, rootPath: "/repo" }),

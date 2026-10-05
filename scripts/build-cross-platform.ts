@@ -306,7 +306,7 @@ console.log(
 		}
 		console.error(
 			"   Fix these, or declare the component in licenses/extra/entries.json. " +
-				"See the license section in CLAUDE.md.",
+				"See docs/LICENSES.md.",
 		);
 		process.exit(1);
 	}

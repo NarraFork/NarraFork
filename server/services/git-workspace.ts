@@ -10,6 +10,7 @@ import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { getHome } from "../lib/platform";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
+import { gitDiscoveryCache } from "./git-discovery-cache";
 import { resolveNarratorSessionCwd } from "./narrator-cwd";
 import { activeNarrators } from "./narrator-session-state";
 import { createRemoteGitService, supportsRemoteGitWorkspace } from "./remote-git-service";
@@ -35,6 +36,7 @@ export interface GitProbe {
 	rootPath?: string;
 	repositoryPath?: string;
 	reason?: string;
+	branch?: string | null;
 }
 
 /** Real Git probing handles unborn repositories, linked worktrees, submodules and bare repos. */
@@ -61,10 +63,13 @@ export async function probeLocalGitWorkspace(cwd: string, signal?: AbortSignal):
 				"--show-toplevel",
 				"--git-common-dir",
 			],
+			// Classify Git failures independently of the host's locale.
+			env: { ...process.env, LC_ALL: "C", LANG: "C" },
 			timeout: GIT_PROBE_TIMEOUT_MS,
 			maxOutputBytes: GIT_PROBE_MAX_BYTES,
 			signal,
 		});
+		signal?.throwIfAborted();
 		if (result.stdoutTruncated || result.stderrTruncated)
 			return { state: "unsupported", reason: "Git workspace probe exceeded its output budget" };
 		const [inside, bare, root, repository] = result.stdout.trim().split("\n");
@@ -73,7 +78,9 @@ export async function probeLocalGitWorkspace(cwd: string, signal?: AbortSignal):
 		if (result.exitCode !== 0 || inside !== "true" || !root || !repository) {
 			if (/dubious ownership|permission denied|access denied/i.test(result.stderr))
 				return { state: "access_denied", reason: "Git refused access to this working tree" };
-			return { state: "not_git", reason: "Directory is not a Git working tree" };
+			return /not a git repository/i.test(result.stderr)
+				? { state: "not_git", reason: "Directory is not a Git working tree" }
+				: { state: "unsupported", reason: "Git workspace probe did not complete" };
 		}
 		return {
 			state: "ready",
@@ -115,6 +122,8 @@ export async function resolveNarratorGitTarget(
 	signal?: AbortSignal,
 	beforeResolve?: (target: GitWorkspaceTarget) => Promise<void>,
 	beforeProbe?: (target: GitWorkspaceTarget) => Promise<void>,
+	/** Display discovery only; authoritative reads/writes keep the uncached probe. */
+	cachedDiscovery = false,
 ): Promise<GitWorkspaceTarget> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
@@ -199,11 +208,50 @@ export async function resolveNarratorGitTarget(
 	}
 	let probe: GitProbe;
 	try {
-		const result =
-			backend.kind === "local"
-				? await probeLocalGitWorkspace(workspace.cwd, signal)
-				: await createRemoteGitService(backend, signal).probe(workspace.cwd);
-		probe = { ...result, state: result.state ?? "unsupported" };
+		const discover = async (probeSignal?: AbortSignal): Promise<GitProbe> => {
+			const result =
+				backend.kind === "local"
+					? await probeLocalGitWorkspace(workspace.cwd, probeSignal)
+					: await createRemoteGitService(backend, probeSignal).probe(
+							workspace.cwd,
+							probeSignal,
+							cachedDiscovery
+								? { maxBytes: GIT_PROBE_MAX_BYTES, timeoutMs: GIT_PROBE_TIMEOUT_MS }
+								: {},
+						);
+			const facts: GitProbe = { ...result, state: result.state ?? "unsupported" };
+			if (facts.state === "ready" && (!facts.rootPath || !facts.repositoryPath))
+				return { state: "unsupported", reason: "Incomplete Git workspace discovery" };
+			if (cachedDiscovery && facts.state === "ready" && backend.kind === "local") {
+				const head = await safeSpawn({
+					cmd: [
+						"git",
+						"--no-optional-locks",
+						"-C",
+						workspace.cwd,
+						"symbolic-ref",
+						"--quiet",
+						"--short",
+						"HEAD",
+					],
+					timeout: GIT_PROBE_TIMEOUT_MS,
+					maxOutputBytes: GIT_PROBE_MAX_BYTES,
+					signal: probeSignal,
+				});
+				facts.branch = !head.stdoutTruncated && head.exitCode === 0 ? head.stdout.trim() : null;
+			}
+			probeSignal?.throwIfAborted();
+			return facts;
+		};
+		probe = cachedDiscovery
+			? await gitDiscoveryCache.get(
+					backend.deviceId,
+					backend.runtimeGeneration,
+					backend.paths.identityKey(workspace.cwd),
+					() => discover(AbortSignal.timeout(GIT_PROBE_TIMEOUT_MS)),
+					signal,
+				)
+			: await discover(signal);
 	} catch (error) {
 		signal?.throwIfAborted();
 		workspace.state = /offline|connection|unavailable|disconnect/i.test(String(error))
@@ -216,6 +264,7 @@ export async function resolveNarratorGitTarget(
 	}
 	workspace.state = probe.state ?? "unsupported";
 	workspace.reason = probe.reason;
+	if (cachedDiscovery) workspace.branch = probe.branch ?? null;
 	if (probe.state !== "ready" || !probe.rootPath || !probe.repositoryPath) return target;
 	workspace.rootPath = probe.rootPath;
 	target.repositoryPath = probe.repositoryPath;

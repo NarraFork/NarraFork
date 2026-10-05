@@ -25,6 +25,7 @@
 	"dockTabs": {
 		"revealInExplorer": "Show in File Manager",
 		"revealFailed": "Could not open the file manager",
+		"openInWindow": "Open in window",
 		"all": "Close all (keep main narrators)",
 		"left": "Close tabs to the left",
 		"right": "Close tabs to the right",
@@ -42,6 +43,10 @@
 	"allow": "Allow",
 	"deny": "Deny",
 	"unknownError": "Unknown error",
+	"panelWindow": {
+		"invalidTitle": "Cannot open this panel in a window",
+		"invalidDescription": "The panel link is invalid or was created by an incompatible version. Open the panel again from the app."
+	},
 	"invalidCredentials": "Incorrect username or password",
 	"authRequired": "Authentication required",
 	"tokenExpired": "Session expired, please log in again",

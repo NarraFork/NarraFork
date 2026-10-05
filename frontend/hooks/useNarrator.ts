@@ -19,6 +19,7 @@ import {
 	type RevertActionConfirmOptions,
 	type RevertActionPreview,
 	type RevertActionTarget,
+	type RevertDiagnostic,
 	type RevertPlanFile,
 	type RevertPlanPreviewIssue,
 	type RevertScopePreviews,
@@ -174,6 +175,7 @@ interface RevertPreviewRequest {
 	action: RevertAction;
 	target: RevertActionTarget;
 	key: string;
+	recoveryMode?: "snapshot";
 }
 
 interface RevertPreviewState {
@@ -184,6 +186,8 @@ interface RevertPreviewState {
 	loading: boolean;
 	issue?: RevertPlanPreviewIssue;
 	error?: string;
+	errorKey?: "revertPlanPreviewTimeout";
+	diagnostics?: RevertDiagnostic[];
 }
 
 function validPlanFile(file: RevertPlanFile): boolean {
@@ -218,12 +222,31 @@ export function useRevertActionPreview(
 	target: RevertActionTarget | null,
 ) {
 	const [revision, setRevision] = useState(0);
+	const [snapshotTarget, setSnapshotTarget] = useState<{
+		narratorId: string;
+		action: RevertAction;
+		target: RevertActionTarget;
+	} | null>(null);
+	const snapshotRequested =
+		!!target &&
+		snapshotTarget?.target === target &&
+		snapshotTarget.narratorId === narratorId &&
+		snapshotTarget.action === action;
+	useEffect(() => {
+		if (!snapshotRequested) setSnapshotTarget(null);
+	}, [snapshotRequested]);
 	const request = useMemo<RevertPreviewRequest | null>(
 		() =>
 			target && narratorId
-				? { narratorId, action, target: { ...target }, key: newRevertPreviewKey(revision) }
+				? {
+						narratorId,
+						action,
+						target: { ...target },
+						key: newRevertPreviewKey(revision),
+						...(snapshotRequested ? { recoveryMode: "snapshot" as const } : {}),
+					}
 				: null,
-		[narratorId, action, target, revision],
+		[narratorId, action, target, revision, snapshotRequested],
 	);
 	const [state, setState] = useState<RevertPreviewState | null>(null);
 	const [invalidated, setInvalidated] = useState<RevertPreviewRequest | null>(null);
@@ -243,7 +266,12 @@ export function useRevertActionPreview(
 		};
 		setState({ request, files: [], filesComplete: false, loading: true });
 		const deadline = setTimeout(() => {
-			update({ loading: false, issue: "preview_failed" });
+			update({
+				loading: false,
+				issue: "preview_failed",
+				errorKey: "revertPlanPreviewTimeout",
+				diagnostics: [{ code: "REVERT_PREVIEW_TIMEOUT" }],
+			});
 			controller.abort();
 		}, REVERT_PREVIEW_TIMEOUT_MS);
 
@@ -251,7 +279,12 @@ export function useRevertActionPreview(
 			try {
 				const response = await api.previewRevertAction(
 					request.narratorId,
-					{ ...request.target, action: request.action, idempotencyKey: request.key },
+					{
+						...request.target,
+						action: request.action,
+						idempotencyKey: request.key,
+						...(request.recoveryMode ? { recoveryMode: request.recoveryMode } : {}),
+					},
 					controller.signal,
 				);
 				if (disposed || controller.signal.aborted) return;
@@ -259,6 +292,7 @@ export function useRevertActionPreview(
 				if (
 					response.action !== request.action ||
 					response.executable !== false ||
+					(plan !== null && response.recoveryMode !== request.recoveryMode) ||
 					(plan !== null &&
 						(!historySummary ||
 							!Number.isSafeInteger(historySummary.deletedMessageCount) ||
@@ -354,10 +388,23 @@ export function useRevertActionPreview(
 				}
 			} catch (error) {
 				if (!controller.signal.aborted) {
+					const code =
+						error instanceof ApiError
+							? "code" in error
+								? error.code
+								: error.data?.code
+							: undefined;
+					const safeCode =
+						typeof code === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(code)
+							? code
+							: error instanceof ApiError
+								? `HTTP_${error.status}`
+								: "REVERT_PREVIEW_FAILED";
 					update({
 						loading: false,
 						issue: "preview_failed",
-						error: error instanceof Error ? error.message : undefined,
+						error: error instanceof Error ? error.message.slice(0, 1000) : undefined,
+						diagnostics: [{ code: safeCode }],
 					});
 				}
 			} finally {
@@ -390,7 +437,10 @@ export function useRevertActionPreview(
 			affectedFiles: files,
 			previewIssue: issue,
 			previewError: current?.error,
+			previewErrorKey: current?.errorKey,
 			blockers: response?.blockers,
+			diagnostics: [...(response?.diagnostics ?? []), ...(current?.diagnostics ?? [])],
+			recoveryMode: response?.recoveryMode,
 			narratorScope: {
 				available: !!plan && !issue && current?.filesComplete === true,
 				reason: response?.unavailable,
@@ -407,12 +457,21 @@ export function useRevertActionPreview(
 							action: request.action,
 							previewKey: request.key,
 							filesComplete: current?.filesComplete === true && !revoked,
+							recoveryMode: response?.recoveryMode,
 						},
 					}
 				: {}),
 		};
 	}, [current, request, revoked]);
-	const reload = useCallback(() => setRevision((value) => value + 1), []);
+	const reload = useCallback(() => {
+		setSnapshotTarget(null);
+		setRevision((value) => value + 1);
+	}, []);
+	const requestSnapshotRestore = useCallback(() => {
+		if (!target || !narratorId) return;
+		setSnapshotTarget({ narratorId, action, target });
+		setRevision((value) => value + 1);
+	}, [narratorId, action, target]);
 	const invalidate = useCallback(() => {
 		setInvalidated(request);
 		if (active.current?.request === request) active.current?.controller.abort();
@@ -423,6 +482,7 @@ export function useRevertActionPreview(
 		historySummary: current?.response?.historySummary ?? null,
 		isLoading: !!request && !revoked && (!current || current.loading),
 		reload,
+		requestSnapshotRestore,
 		invalidate,
 	};
 }
@@ -695,7 +755,7 @@ export function useExtractSubagentToPrimary() {
 export function useNarrator(id: string) {
 	return useQuery({
 		queryKey: ["narrators", id],
-		queryFn: () => api.getNarrator(id),
+		queryFn: ({ signal }) => api.getNarrator(id, signal),
 		enabled: !!id,
 		// Narrator data is kept fresh via WS invalidation (useNarratorPanelWS).
 		// A 30s staleTime avoids redundant refetches when multiple components

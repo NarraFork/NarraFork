@@ -1070,6 +1070,14 @@ export function hasNarratorAdmissionWork(narratorId: string): boolean {
 	return admissionWorkFor(narratorId).length > 0;
 }
 
+/** Diagnostics only: a preview must not report its own request as unfinished work. */
+export function hasOtherNarratorAdmissionWork(narratorId: string): boolean {
+	const current = admissionContext.getStore()?.work.get(narratorId);
+	return admissionWorkFor(narratorId).some(
+		(work) => work !== current || current?.narratorId !== narratorId,
+	);
+}
+
 export function listNarratorAdmissionOwners(narratorId: string): string[] {
 	return [...new Set(admissionWorkFor(narratorId).map((work) => work.narratorId))];
 }
