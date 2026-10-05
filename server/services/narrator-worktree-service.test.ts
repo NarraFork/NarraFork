@@ -792,6 +792,42 @@ describe("local worktree list/create fixtures", () => {
 		expect(writes).toBe(4);
 	});
 
+	test("registry scope uses the fresh authorized target evidence, never the authenticated actor", async () => {
+		target.resourceScope = {
+			scopeKind: "standalone",
+			scopeProjectId: null,
+			scopeOwnerUserId: "stale-owner",
+		};
+		let checks = 0;
+		ports.authorize = async () => {
+			checks++;
+			return checks < 2
+				? target
+				: {
+						...target,
+						resourceScope: {
+							scopeKind: "project",
+							scopeProjectId: "verified-project",
+							scopeOwnerUserId: "verified-root-owner",
+						},
+					};
+		};
+		ports.resources = {
+			register: async (resource) => {
+				expect(resource.scope).toEqual({
+					scopeKind: "project",
+					scopeProjectId: "verified-project",
+					scopeOwnerUserId: "verified-root-owner",
+				});
+				expect(resource.scope?.scopeOwnerUserId).not.toBe("actor");
+			},
+			setState: async () => {},
+		};
+		expect((await service.create("actor", "narrator", proposal(), signal())).outcome).toBe(
+			"created",
+		);
+	});
+
 	test("registry registration is awaited before Git and a registration error dispatches no add", async () => {
 		let registered = false;
 		let state: string | undefined;

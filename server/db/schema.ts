@@ -83,6 +83,22 @@ export const narratorWorktreeResources = sqliteTable(
 		ownerNarratorId: text("owner_narrator_id").references(() => narrators.id, {
 			onDelete: "set null",
 		}),
+		/** Historical rows remain unknown; deletion of evidence never broadens this scope. */
+		scopeKind: text("scope_kind", { enum: ["unknown", "standalone", "project"] })
+			.notNull()
+			.default("unknown"),
+		scopeProjectId: text("scope_project_id").references(() => projects.id, {
+			onDelete: "set null",
+		}),
+		scopeOwnerUserId: text("scope_owner_user_id").references(() => users.id, {
+			onDelete: "set null",
+		}),
+		ownershipRevision: integer("ownership_revision").notNull().default(0),
+		containerConfig: text("container_config", { mode: "json" }).$type<{
+			composeFile: string;
+			projectName?: string;
+			proxyDomain?: string;
+		}>(),
 		deviceId: text("device_id").notNull(),
 		repositoryKey: text("repository_key").notNull(),
 		/** Canonical backend path; never derive cleanup ownership from chapters alone. */
@@ -95,6 +111,22 @@ export const narratorWorktreeResources = sqliteTable(
 	(table) => [
 		uniqueIndex("uq_narrator_worktree_resource_path").on(table.deviceId, table.worktreePath),
 		index("idx_narrator_worktree_resource_owner").on(table.ownerNarratorId),
+		index("idx_worktree_resource_scope_project").on(table.scopeProjectId),
+		index("idx_worktree_resource_scope_owner").on(table.scopeOwnerUserId),
+		check(
+			"ck_worktree_resource_scope_kind",
+			sql`${table.scopeKind} in ('unknown', 'standalone', 'project')`,
+		),
+		// Project SET NULL is intentional: project scope with missing evidence must deny, not downgrade.
+		check(
+			"ck_worktree_resource_scope_project",
+			sql`${table.scopeProjectId} is null or ${table.scopeKind} = 'project'`,
+		),
+		check("ck_worktree_resource_revision", sql`${table.ownershipRevision} >= 0`),
+		check(
+			"ck_worktree_resource_config_bytes",
+			sql`${table.containerConfig} is null or length(cast(${table.containerConfig} as blob)) <= 16384`,
+		),
 	],
 );
 
@@ -1867,6 +1899,10 @@ export const terminals = sqliteTable(
 		 */
 		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
 		narratorId: text("narrator_id").references(() => narrators.id),
+		worktreeResourceId: text("worktree_resource_id").references(
+			() => narratorWorktreeResources.id,
+			{ onDelete: "restrict" },
+		),
 		name: text("name").notNull(),
 		cwd: text("cwd"),
 		dtachSocket: text("dtach_socket"),
@@ -1895,6 +1931,11 @@ export const terminals = sqliteTable(
 		index("idx_terminals_chapter").on(table.chapterId, table.status, table.graphOpened),
 		index("idx_terminals_narrator").on(table.narratorId),
 		index("idx_terminals_status").on(table.status),
+		index("idx_terminals_resource_status").on(table.worktreeResourceId, table.status, table.id),
+		check(
+			"ck_terminals_resource_owner",
+			sql`${table.worktreeResourceId} is null or (${table.chapterId} is null and ${table.narratorId} is null)`,
+		),
 	],
 );
 
@@ -1925,6 +1966,10 @@ export const terminalViewState = sqliteTable(
 			.references(() => users.id, { onDelete: "cascade" }),
 		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
 		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
+		worktreeResourceId: text("worktree_resource_id").references(
+			() => narratorWorktreeResources.id,
+			{ onDelete: "restrict" },
+		),
 		layout: text("layout", {
 			enum: ["single", "split-h", "split-v", "triple", "quad"],
 		})
@@ -1943,6 +1988,12 @@ export const terminalViewState = sqliteTable(
 		// chapter-service / narrator-service / projects routes, which would otherwise scan.
 		index("idx_view_state_chapter").on(table.chapterId),
 		index("idx_view_state_narrator").on(table.narratorId),
+		uniqueIndex("idx_view_state_user_resource").on(table.userId, table.worktreeResourceId),
+		index("idx_view_state_resource").on(table.worktreeResourceId),
+		check(
+			"ck_view_state_resource_owner",
+			sql`${table.worktreeResourceId} is null or (${table.chapterId} is null and ${table.narratorId} is null)`,
+		),
 	],
 );
 
@@ -1951,10 +2002,12 @@ export const containerInstances = sqliteTable(
 	"container_instances",
 	{
 		id: text("id").primaryKey(),
-		/** Cascaded for the same reason as `terminals.chapterId`; see there. */
-		chapterId: text("chapter_id")
-			.notNull()
-			.references(() => chapters.id, { onDelete: "cascade" }),
+		/** Legacy chapters still cascade; new resource-domain containers are independent. */
+		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
+		worktreeResourceId: text("worktree_resource_id").references(
+			() => narratorWorktreeResources.id,
+			{ onDelete: "restrict" },
+		),
 		containerId: text("container_id"),
 		serviceName: text("service_name").notNull(),
 		status: text("status", {
@@ -1975,6 +2028,15 @@ export const containerInstances = sqliteTable(
 		index("idx_container_instances_chapter_service").on(table.chapterId, table.serviceName),
 		index("idx_container_instances_container").on(table.containerId),
 		index("idx_container_instances_status").on(table.chapterId, table.status),
+		index("idx_container_instances_resource_service_status").on(
+			table.worktreeResourceId,
+			table.serviceName,
+			table.status,
+		),
+		check(
+			"ck_container_instances_owner",
+			sql`(${table.chapterId} is null) <> (${table.worktreeResourceId} is null)`,
+		),
 	],
 );
 
@@ -1990,11 +2052,22 @@ export const portAllocations = sqliteTable(
 		 * successfully while leaving a row that then refused the chapter's deletion.
 		 */
 		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
+		worktreeResourceId: text("worktree_resource_id").references(
+			() => narratorWorktreeResources.id,
+			{ onDelete: "restrict" },
+		),
 		serviceName: text("service_name"),
 		allocatedAt: text("allocated_at").notNull(),
 	},
 	// FK covering index for chapter deletion.
-	(table) => [index("idx_port_allocations_chapter").on(table.chapterId)],
+	(table) => [
+		index("idx_port_allocations_chapter").on(table.chapterId),
+		index("idx_port_allocations_resource").on(table.worktreeResourceId),
+		check(
+			"ck_port_allocations_owner",
+			sql`${table.chapterId} is null or ${table.worktreeResourceId} is null`,
+		),
+	],
 );
 
 // === user_preferences ===
@@ -3051,6 +3124,11 @@ export const volumeSnapshots = sqliteTable(
 		sourceChapterId: text("source_chapter_id").references(() => chapters.id, {
 			onDelete: "set null",
 		}),
+		// Provenance only: the existing non-null project FK and its cascade remain unchanged.
+		sourceWorktreeResourceId: text("source_worktree_resource_id").references(
+			() => narratorWorktreeResources.id,
+			{ onDelete: "restrict" },
+		),
 		serviceName: text("service_name").notNull(),
 		containerPath: text("container_path").notNull(),
 		sizeBytes: integer("size_bytes"),
@@ -3061,6 +3139,7 @@ export const volumeSnapshots = sqliteTable(
 	(table) => [
 		index("idx_volume_snapshots_project").on(table.projectId),
 		index("idx_volume_snapshots_source_chapter").on(table.sourceChapterId),
+		index("idx_volume_snapshots_source_resource").on(table.sourceWorktreeResourceId),
 	],
 );
 
@@ -3072,15 +3151,22 @@ export const volumeSnapshotApplications = sqliteTable(
 		snapshotId: text("snapshot_id")
 			.notNull()
 			.references(() => volumeSnapshots.id, { onDelete: "cascade" }),
-		chapterId: text("chapter_id")
-			.notNull()
-			.references(() => chapters.id, { onDelete: "cascade" }),
+		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
+		targetWorktreeResourceId: text("target_worktree_resource_id").references(
+			() => narratorWorktreeResources.id,
+			{ onDelete: "restrict" },
+		),
 		appliedAt: text("applied_at").notNull(),
 		appliedBy: text("applied_by").references(() => users.id, { onDelete: "set null" }),
 	},
 	(table) => [
 		index("idx_snapshot_applications_snapshot").on(table.snapshotId),
 		index("idx_snapshot_applications_chapter").on(table.chapterId),
+		index("idx_snapshot_applications_target_resource").on(table.targetWorktreeResourceId),
+		check(
+			"ck_snapshot_applications_owner",
+			sql`(${table.chapterId} is null) <> (${table.targetWorktreeResourceId} is null)`,
+		),
 	],
 );
 

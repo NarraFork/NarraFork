@@ -10,8 +10,21 @@ import {
 } from "@server/db/schema";
 import { getSettingsRevision, settings } from "@server/lib/settings";
 import { eq, inArray } from "drizzle-orm";
-import { mergeExecutionPolicyRuleSets, normalizeExecutionPolicyRuleSet } from "./normalize";
-import type { ExecutionPolicyRuleSet, LegacyExecutionPolicyRuleSet } from "./types";
+import {
+	isSignedReviewBoundaryRow,
+	markTrustedReviewBoundary,
+	reviewBoundaryRule,
+} from "../narrator-review-boundary";
+import {
+	mergeExecutionPolicyRuleSets,
+	normalizeDirectoryBlacklistRule,
+	normalizeExecutionPolicyRuleSet,
+} from "./normalize";
+import type {
+	ExecutionPolicyRuleSet,
+	LegacyDirectoryBlacklistEntry,
+	LegacyExecutionPolicyRuleSet,
+} from "./types";
 
 export interface LoadedExecutionPolicy extends ExecutionPolicyRuleSet {
 	narratorId: string;
@@ -34,6 +47,7 @@ export class ExecutionPolicyRepository {
 		let next: string | null = narratorId;
 		let projectId: string | null = null;
 		const contextProjects = new Set<string>();
+		const reviewBoundaries: LegacyDirectoryBlacklistEntry[] = [];
 		while (next) {
 			if (inheritedNarratorIds.includes(next) || inheritedNarratorIds.length >= 16) {
 				throw new Error("Invalid or excessive permission inheritance chain");
@@ -56,12 +70,21 @@ export class ExecutionPolicyRepository {
 			let effectiveProjectId = narrator.contextProjectId;
 			if (narrator.chapterId) {
 				const chapter = store
-					.select({ projectId: chapters.projectId })
+					.select({
+						id: chapters.id,
+						projectId: chapters.projectId,
+						role: chapters.role,
+						worktreePath: chapters.worktreePath,
+					})
 					.from(chapters)
 					.where(eq(chapters.id, narrator.chapterId))
 					.get();
 				if (!chapter) throw new Error("Permission chapter context no longer exists");
 				effectiveProjectId = chapter.projectId;
+				if (chapter.role === "review") {
+					if (!chapter.worktreePath) throw new Error("Review workspace boundary is unavailable");
+					reviewBoundaries.push(reviewBoundaryRule(chapter.id, chapter.worktreePath));
+				}
 			}
 			projectId ??= effectiveProjectId;
 			if (effectiveProjectId) contextProjects.add(effectiveProjectId);
@@ -130,9 +153,32 @@ export class ExecutionPolicyRepository {
 				normalizeExecutionPolicyRuleSet(settings.agent, "global"),
 				...projectRuleSets,
 				normalizeExecutionPolicyRuleSet(
-					{ whitelistDirs, blacklistDirs, commandWhitelist, commandBlacklist },
+					{
+						whitelistDirs,
+						blacklistDirs: [],
+						commandWhitelist,
+						commandBlacklist,
+					},
 					"narrator",
 				),
+				{
+					directoryWhitelist: [],
+					directoryBlacklist: [
+						...blacklistDirs.map((row) => {
+							const normalized = normalizeDirectoryBlacklistRule(row, "narrator");
+							// Only persisted instance-signed rows confer the additional hard fence.
+							// Unsigned legacy/global/project IDs remain ordinary deny rules.
+							return isSignedReviewBoundaryRow(row)
+								? markTrustedReviewBoundary({ ...normalized, enabled: true })
+								: normalized;
+						}),
+						...reviewBoundaries.map((row) =>
+							markTrustedReviewBoundary(normalizeDirectoryBlacklistRule(row, "narrator")),
+						),
+					],
+					commandWhitelist: [],
+					commandBlacklist: [],
+				},
 			),
 		};
 	}

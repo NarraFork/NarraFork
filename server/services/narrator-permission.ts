@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { isParentSelector } from "@shared/communication-tool";
@@ -133,6 +133,7 @@ import type {
 import { notifyHumanAttentionChanged } from "./human-attention-events";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { narratorPersistence, reconstructToolExecutionTargets } from "./narrator-persistence";
+import { isTrustedReviewBoundary } from "./narrator-review-boundary";
 import { narratorService } from "./narrator-service";
 import {
 	activeNarrators,
@@ -515,6 +516,234 @@ function planFileWriteCandidates(
 	return candidates;
 }
 
+// These are path-only shell mutations with no opaque interpreter/config hooks.
+// Unknown commands cannot prove they leave the protected tree alone, even after cd.
+const REVIEW_PATH_WRITE_COMMANDS = new Set([
+	"touch",
+	"mkdir",
+	"rmdir",
+	"cp",
+	"mv",
+	"rm",
+	"install",
+	"truncate",
+]);
+
+/** Literal path-only shell footprint. This is a guard, not an OS sandbox for arbitrary scripts. */
+function reviewShellWriteFootprint(
+	analysis: BashAnalysis,
+	cwd: string,
+	boundaryRoots: readonly string[],
+	context?: ExecutionTargetContext | null,
+): Array<{ path: string; subtree: boolean }> | null {
+	const paths = decisionPaths(context);
+	const result: Array<{ path: string; subtree: boolean }> = [];
+	// Do not turn this permission check into an unbounded synchronous host filesystem scan.
+	if (analysis.commands.length > 64) return null;
+	let remainingProbes = 128;
+	const startedAt = performance.now();
+	const literal = (token: string): string | null => {
+		const value = /^(?:'[^']*'|"[^"]*")$/.test(token) ? token.slice(1, -1) : token;
+		// Expansions/globs, escapes and mixed quotation cannot prove their actual footprint.
+		return value && !/[\s"'\\$`*?{}]/.test(value.replaceAll(" ", "")) ? value : null;
+	};
+	for (const command of analysis.commands) {
+		const [name, ...args] = command.tokens;
+		if (!REVIEW_PATH_WRITE_COMMANDS.has(name) || command.fullText !== command.text) return null;
+		if (args.length > 256) return null;
+		const operands: string[] = [];
+		let targetDirectory: string | undefined;
+		let noTargetDirectory = false;
+		let recursive = false;
+		let endOptions = false;
+		for (let index = 0; index < args.length; index++) {
+			const arg = args[index];
+			if (!endOptions && arg === "--") {
+				endOptions = true;
+				continue;
+			}
+			if (!endOptions && arg.startsWith("-")) {
+				if (arg === "--parents" && name !== "mkdir") return null;
+				if ((name === "mv" || name === "cp") && (arg === "-t" || arg === "--target-directory")) {
+					const value = literal(args[++index] ?? "");
+					if (!value) return null;
+					targetDirectory = value;
+					continue;
+				}
+				if ((name === "mv" || name === "cp") && arg.startsWith("--target-directory=")) {
+					const value = literal(arg.slice("--target-directory=".length));
+					if (!value) return null;
+					targetDirectory = value;
+					continue;
+				}
+				if (arg === "-T" || arg === "--no-target-directory") noTargetDirectory = true;
+				if (arg === "--recursive" || arg === "--archive" || /^-[^-]*[rRa]/.test(arg))
+					recursive = true;
+				// Only known valueless flags; flags with hidden path operands fail closed.
+				if (
+					!/^-[frRaipnvPTdHLsuv]+$/.test(arg) &&
+					![
+						"--recursive",
+						"--archive",
+						"--force",
+						"--no-clobber",
+						"--verbose",
+						"--parents",
+						"--no-target-directory",
+						"--remove-destination",
+						"--preserve=all",
+					].includes(arg)
+				)
+					return null;
+				continue;
+			}
+			const value = literal(arg);
+			if (!value) return null;
+			operands.push(value);
+		}
+		if (operands.length === 0) return null;
+		const canonical = (value: string) => {
+			if (--remainingProbes < 0 || performance.now() - startedAt > 100)
+				throw new Error("Review write footprint identity budget exceeded");
+			return canonicalHostPath(paths.resolve(decisionCwd(cwd, context), value));
+		};
+		if (name === "mv" || name === "cp") {
+			if (noTargetDirectory && (targetDirectory || operands.length !== 2)) return null;
+			const destination = targetDirectory ?? operands.pop();
+			if (!destination || operands.length === 0) return null;
+			const dest = canonical(destination);
+			let intoDirectory =
+				!!targetDirectory ||
+				(!noTargetDirectory &&
+					boundaryRoots.some((root) => paths.contains(dest, root) && !paths.equals(dest, root)));
+			if (!noTargetDirectory && !intoDirectory) {
+				try {
+					intoDirectory = statSync(dest).isDirectory();
+				} catch {
+					/* absent destination */
+				}
+			}
+			for (const source of operands) {
+				const from = canonical(source);
+				if (name === "mv") result.push({ path: from, subtree: true });
+				// Copy reads its source. Its target (and mv's) may overwrite a protected subtree.
+				// cp source/. copies CONTENTS, not a child named basename(source).
+				// Resolving first would erase that syntax and miss an ancestor destination.
+				const copiesContents = name === "cp" && /(?:^|\/)\.{1,2}(?:\/)*$/.test(source);
+				const actualTarget =
+					intoDirectory && !copiesContents
+						? paths.resolve(dest, basename(paths.resolve(decisionCwd(cwd, context), source)))
+						: dest;
+				// Explicit operands are not the whole write footprint. A derived directory/file
+				// target may itself be a symlink into the review tree. Resolve it AFTER joining;
+				// cp -P controls source dereferencing, not existing destination-file symlinks.
+				result.push({ path: canonical(actualTarget), subtree: name === "mv" || recursive });
+			}
+		} else {
+			for (const operand of operands)
+				result.push({
+					path: canonical(operand),
+					subtree: name === "rm" || name === "rmdir",
+				});
+		}
+	}
+	return result;
+}
+
+function resolveReviewBoundaryDeny(
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	policy: CompiledExecutionPolicy,
+	analysis?: BashAnalysis,
+	context?: ExecutionTargetContext | null,
+): string | null {
+	// Scope follows the actual frozen executor, never just a matching path string.
+	const execution = context ?? policy.targetContext;
+	if (
+		execution &&
+		(execution.backend.kind !== "local" ||
+			execution.target.deviceId !== LOCAL_DEVICE_ID ||
+			execution.paths.flavor === "spec")
+	)
+		return null;
+	const boundaries = policy.directoryBlacklist.filter(isTrustedReviewBoundary);
+	if (
+		boundaries.length === 0 ||
+		isReadOnlyCall(toolName, input) ||
+		isTaskStateMaintenanceTool(toolName, input)
+	)
+		return null;
+	const paths = decisionPaths(context);
+	if (isBashToolName(toolName)) {
+		if (
+			typeof input.command !== "string" ||
+			input.run_in_background === true ||
+			typeof input.stop === "string" ||
+			input.await != null
+		) {
+			return "Inherited review boundary requires synchronous, verifiable shell operations";
+		}
+		if (analysis?.allReadOnly) return null;
+		if (
+			!analysis?.hasWriteOperation ||
+			analysis.filePaths.length === 0 ||
+			analysis.hasEnvInjection ||
+			analysis.commandEnvVars.length > 0 ||
+			analysis.dangerousPatterns.length > 0 ||
+			analysis.commands.some((command) => !REVIEW_PATH_WRITE_COMMANDS.has(command.tokens[0]))
+		) {
+			return "Inherited review boundary denies shell operations with unproven write scope";
+		}
+		try {
+			const footprint = reviewShellWriteFootprint(
+				analysis,
+				cwd,
+				boundaries.map((rule) => rule.path),
+				execution,
+			);
+			if (!footprint)
+				return "Inherited review boundary denies shell operations with unproven write scope";
+			return footprint.some(({ path, subtree }) =>
+				boundaries.some(
+					(rule) => paths.contains(rule.path, path) || (subtree && paths.contains(path, rule.path)),
+				),
+			)
+				? "Inherited review workspace is read-only"
+				: null;
+		} catch {
+			return "Inherited review boundary cannot verify shell path identity";
+		}
+	}
+	if (toolName === "Agent" && (input.subagent_type === "explore" || input.subagent_type === "plan"))
+		return null;
+	if (
+		toolName === "Browser" &&
+		(input.action !== "screenshot" || typeof input.file_path !== "string")
+	)
+		return null;
+	if (!WRITE_TOOLS.has(toolName) && toolName !== "Browser" && toolName !== "Agent") return null;
+	const targets =
+		toolName === "Agent" && typeof input.workdir === "string" && input.workdir
+			? [resolveDecisionPath(cwd, input.workdir, context)]
+			: getToolPolicyPaths(toolName, input, cwd, analysis, context);
+	try {
+		return targets.some((path) =>
+			boundaries.some((rule) => {
+				const canonical = canonicalHostPath(path);
+				return (
+					paths.contains(rule.path, canonical) ||
+					(toolName === "Agent" && paths.contains(canonical, rule.path))
+				);
+			}),
+		)
+			? "Inherited review workspace is read-only"
+			: null;
+	} catch {
+		return "Inherited review boundary cannot verify write path identity";
+	}
+}
+
 export function resolvePermissionDecision(
 	opts: PermissionDecisionOpts,
 ): "allow" | "deny" | "ask" | "fatal" {
@@ -569,6 +798,18 @@ export function resolvePermissionDecision(
 	);
 	if (protectedPathReason) {
 		if (meta) meta.blacklistReason = protectedPathReason;
+		return "deny";
+	}
+	const reviewBoundaryReason = resolveReviewBoundaryDeny(
+		toolName,
+		input,
+		cwd,
+		compiledPolicy,
+		bashAnalysis,
+		context,
+	);
+	if (reviewBoundaryReason) {
+		if (meta) meta.blacklistReason = reviewBoundaryReason;
 		return "deny";
 	}
 
@@ -914,7 +1155,25 @@ function resolveBlacklistDecision(
 	bashAnalysis?: BashAnalysis,
 	context?: ExecutionTargetContext | null,
 ): BlacklistDecisionResult | null {
-	if (compiledPolicy.directoryBlacklist.length === 0) return null;
+	// The hard review fence is additive: never exempt a denyAll rule or a user/imported
+	// prefix. Only trusted denyWrite rows are irrelevant to non-filesystem metadata.
+	const metadataOnly =
+		!isBashToolName(toolName) &&
+		!WRITE_TOOLS.has(toolName) &&
+		toolName !== "Agent" &&
+		toolName !== "Browser" &&
+		!isReadOnlyCall(toolName, input);
+	const editableBlacklist = compiledPolicy.directoryBlacklist.filter(
+		(rule) => !(metadataOnly && rule.denyLevel === "denyWrite" && isTrustedReviewBoundary(rule)),
+	);
+	if (editableBlacklist.length === 0) return null;
+	const genericPolicy =
+		editableBlacklist.length === compiledPolicy.directoryBlacklist.length
+			? compiledPolicy
+			: compileExecutionPolicy(
+					{ ...compiledPolicy, directoryBlacklist: editableBlacklist },
+					context ?? compiledPolicy.targetContext,
+				);
 
 	const operation =
 		toolName === "Agent"
@@ -933,7 +1192,7 @@ function resolveBlacklistDecision(
 			? [resolveDecisionPath(cwd, input.workdir, context)]
 			: getToolPolicyPaths(toolName, input, cwd, bashAnalysis, context);
 	for (const path of paths) {
-		const result = compiledPolicy.evaluatePath({ path, operation });
+		const result = genericPolicy.evaluatePath({ path, operation });
 		if (result.decision === "deny") {
 			return { decision: "deny", reason: formatBlacklistReason(result.rule, path) };
 		}
@@ -4195,6 +4454,15 @@ export async function recheckFinalToolExecutionPermission(
 		context?.target,
 	);
 	if (protectedReason) finalPermissionDeny(protectedReason);
+	const reviewBoundaryReason = resolveReviewBoundaryDeny(
+		decisionTool,
+		decisionInput,
+		cwd,
+		policy,
+		analysis,
+		context,
+	);
+	if (reviewBoundaryReason) finalPermissionDeny(reviewBoundaryReason);
 	// Run deny layers before ALL shortcuts (including designated plan-file allowance).
 	if (
 		analysis &&

@@ -1,93 +1,71 @@
-import { createHash } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { createWorktreeResourceRegistry } from "./narrator-worktree-resource-store";
+
+export type {
+	VerifiedWorktreeScope,
+	WorktreeResourceRegistration,
+	WorktreeResourceRegistry,
+} from "./narrator-worktree-resource-store";
+
 import { and, eq, gt, sql } from "drizzle-orm";
-import { db } from "../db";
+import { activeDatabaseBackend, db } from "../db";
 import { narrators, narratorWorktreeResources } from "../db/schema";
+import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
+import { withWorkspaceAdmission } from "./worktree-lifecycle-guard";
 
-export interface WorktreeResourceRegistration {
-	ownerNarratorId: string;
-	deviceId: string;
-	repositoryKey: string;
-	worktreePath: string;
-	createRequestId: string;
-}
-export interface WorktreeResourceRegistry {
-	/** Must complete durably while holding the repository write lock, BEFORE Git add. */
-	register(resource: WorktreeResourceRegistration): Promise<void>;
-	setState(resource: WorktreeResourceRegistration, state: "ready" | "unknown"): Promise<void>;
-}
-
-/** Resources outlive sessions, owners and request receipts. No implicit deletion API. */
-export const narratorWorktreeResourceRegistry: WorktreeResourceRegistry = {
-	async register(resource) {
-		const id = createHash("sha256")
-			.update(JSON.stringify([resource.deviceId, resource.worktreePath]))
-			.digest("hex");
-		const now = new Date().toISOString();
-		await db
-			.insert(narratorWorktreeResources)
-			.values({
-				id,
-				...resource,
-				state: "preparing",
-				createdAt: now,
-				updatedAt: now,
-			})
-			.onConflictDoNothing();
-		const existing = db
-			.select({
-				repositoryKey: narratorWorktreeResources.repositoryKey,
-				createRequestId: narratorWorktreeResources.createRequestId,
-				ownerNarratorId: narratorWorktreeResources.ownerNarratorId,
-			})
-			.from(narratorWorktreeResources)
-			.where(eq(narratorWorktreeResources.id, id))
-			.get();
-		if (
-			!existing ||
-			existing.repositoryKey !== resource.repositoryKey ||
-			existing.createRequestId !== resource.createRequestId ||
-			existing.ownerNarratorId !== resource.ownerNarratorId
-		)
+/** Resources outlive sessions, owners and receipts. PostgreSQL has no adapter yet: closed. */
+export const narratorWorktreeResourceRegistry = createWorktreeResourceRegistry(
+	db,
+	(resource, commit) => {
+		if (activeDatabaseBackend !== "sqlite")
 			throw new AppError(
-				"Destination already has a durable resource owner",
-				409,
-				"WORKTREE_RESOURCE_CONFLICT",
+				"Worktree resource registry is unavailable for PostgreSQL",
+				503,
+				"WORKTREE_RESOURCE_BACKEND_UNAVAILABLE",
 			);
+		const target = {
+			deviceId: resource.deviceId,
+			path: resource.worktreePath,
+			repositoryKey: resource.repositoryKey,
+			scopeProjectId: resource.scopeProjectId ?? undefined,
+		};
+		return withWorkspaceAdmission(target, commit);
 	},
-	async setState(resource, state) {
-		await db
-			.update(narratorWorktreeResources)
-			.set({ state, updatedAt: new Date().toISOString() })
-			.where(
-				and(
-					eq(narratorWorktreeResources.deviceId, resource.deviceId),
-					eq(narratorWorktreeResources.worktreePath, resource.worktreePath),
-					eq(narratorWorktreeResources.createRequestId, resource.createRequestId),
-				),
-			);
-	},
-};
+);
 
 /** Bounded cursor inventory, with small projections only. A cap/read failure is NOT a
  * complete ownership set. Backend path comparison (in the caller) handles Windows case,
  * separator variants and nested cwds; SQL's case-sensitive string equality cannot do that.
  */
-export async function readLegacyNarratorWorktreeProtection(deadline: number): Promise<{
+export async function readLegacyNarratorWorktreeProtection(
+	deadline: number,
+	signal?: AbortSignal,
+): Promise<{
 	complete: boolean;
-	owners: Array<{ narratorId: string; path: string }>;
+	owners: Array<{ narratorId: string; path: string; deviceId: string }>;
 }> {
-	const owners: Array<{ narratorId: string; path: string }> = [];
+	const owners: Array<{ narratorId: string; path: string; deviceId: string }> = [];
+	if (!Number.isFinite(deadline)) return { complete: false, owners };
+	const readDeadline = Math.min(deadline, performance.now() + 5000);
+	const trustedCwd = process.cwd();
+	let bytes = 0;
 	let cursor: string | undefined;
 	try {
 		for (let page = 0; page < 16; page++) {
-			if (performance.now() > deadline) return { complete: false, owners };
+			if (performance.now() > readDeadline || signal?.aborted) return { complete: false, owners };
 			const rows = db
 				.select({
 					id: narrators.id,
 					cwd: narrators.cwd,
+					defaultDeviceId: narrators.defaultDeviceId,
 					contextCwd: sql<string | null>`json_extract(${narrators.workspaceContext}, '$.cwd')`,
+					contextDevice: sql<
+						string | null
+					>`json_extract(${narrators.workspaceContext}, '$.deviceId')`,
+					contextCwdType: sql<string | null>`json_type(${narrators.workspaceContext}, '$.cwd')`,
+					contextDeviceType: sql<
+						string | null
+					>`json_type(${narrators.workspaceContext}, '$.deviceId')`,
 				})
 				.from(narrators)
 				.where(cursor ? gt(narrators.id, cursor) : undefined)
@@ -95,11 +73,58 @@ export async function readLegacyNarratorWorktreeProtection(deadline: number): Pr
 				.limit(129)
 				.all();
 			for (const row of rows.slice(0, 128)) {
-				for (const path of [row.cwd, row.contextCwd]) {
-					if (path === null) continue;
-					if (typeof path !== "string" || path.length > 4096 || !isAbsolute(path))
+				const validDevice = (device: unknown) =>
+					device === null ||
+					(typeof device === "string" &&
+						device.length > 0 &&
+						device.length <= 256 &&
+						!device.includes("\0"));
+				if (
+					!validDevice(row.defaultDeviceId) ||
+					!validDevice(row.contextDevice) ||
+					(row.contextDeviceType !== null &&
+						row.contextDeviceType !== "null" &&
+						row.contextDeviceType !== "text") ||
+					(row.contextCwd !== null && row.contextCwdType !== "text")
+				)
+					return { complete: false, owners };
+				// Match the actual creator: an absolute legacy cwd remains the host claim even
+				// when SwitchDevice later changes the default; context is a separate device claim.
+				const rawDevice =
+					row.cwd !== null && localPathSemantics.isAbsolute(row.cwd)
+						? "local"
+						: (row.defaultDeviceId ?? row.contextDevice ?? "local");
+				// A malformed old remote context without device evidence may still hide a local
+				// claim. Do not guess its namespace or declare it ownerless.
+				if (
+					row.contextCwd !== null &&
+					row.contextDevice === null &&
+					row.defaultDeviceId !== null &&
+					row.defaultDeviceId !== "local"
+				)
+					return { complete: false, owners };
+				for (const entry of [
+					{ path: row.cwd, deviceId: rawDevice },
+					{ path: row.contextCwd, deviceId: row.contextDevice ?? "local" },
+				]) {
+					if (entry.path === null) continue;
+					if (
+						typeof entry.path !== "string" ||
+						entry.path.length === 0 ||
+						entry.path.length > 4096 ||
+						entry.path.includes("\0")
+					)
 						return { complete: false, owners };
-					owners.push({ narratorId: row.id, path });
+					const path =
+						entry.deviceId === "local"
+							? localPathSemantics.resolve(trustedCwd, entry.path)
+							: entry.path;
+					if (path.length > 4096) return { complete: false, owners };
+					const owner = { narratorId: row.id, path, deviceId: entry.deviceId };
+					bytes += Buffer.byteLength(JSON.stringify(owner));
+					if (bytes > 256 * 1024 || performance.now() > readDeadline || signal?.aborted)
+						return { complete: false, owners };
+					owners.push(owner);
 				}
 			}
 			if (rows.length <= 128) return { complete: true, owners };

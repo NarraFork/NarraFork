@@ -30,6 +30,7 @@ import {
 } from "./narrator-session-state";
 import { resolveOAuthNarratorRuntimePolicy } from "./oauth-narrator-runtime-policy";
 import { transitionWorkspaceContext, workspaceConflict } from "./workspace-context-transition";
+import { withWorkspaceAdmission } from "./worktree-lifecycle-guard";
 
 const writingRepositories = hotSafe("narrafork.workspaceRepositoryWrites", () => new Set<string>());
 
@@ -407,18 +408,27 @@ export const workspaceContextService = {
 						if (backend.defaultCwd !== current.cwd)
 							throw workspaceConflict("Remote default working directory changed");
 					}
-					const rows = await db
-						.update(narrators)
-						.set({
-							defaultDeviceId: deviceId,
-							workspaceRevision: current.revision,
-							workspaceContext: current,
-							apiConversationId: null,
-							updatedAt: new Date().toISOString(),
-						})
-						.where(and(eq(narrators.id, id), eq(narrators.workspaceRevision, old.revision)))
-						.returning({ id: narrators.id });
-					return rows.length === 1;
+					return withWorkspaceAdmission(
+						{
+							deviceId: current.deviceId,
+							path: current.cwd,
+							repositoryKey: current.git?.repositoryKey,
+						},
+						async () => {
+							const rows = await db
+								.update(narrators)
+								.set({
+									defaultDeviceId: deviceId,
+									workspaceRevision: current.revision,
+									workspaceContext: current,
+									apiConversationId: null,
+									updatedAt: new Date().toISOString(),
+								})
+								.where(and(eq(narrators.id, id), eq(narrators.workspaceRevision, old.revision)))
+								.returning({ id: narrators.id });
+							return rows.length === 1;
+						},
+					);
 				},
 				install: async (current) => {
 					executionPolicyEngine.invalidate(id);
@@ -516,17 +526,26 @@ export const workspaceContextService = {
 				if (target.contextKey !== current.contextKey)
 					throw workspaceConflict("Target directory identity changed");
 				await assertTargetAllowed(id, current.cwd);
-				const rows = await db
-					.update(narrators)
-					.set({
-						cwd: current.cwd,
-						workspaceRevision: current.revision,
-						workspaceContext: current,
-						apiConversationId: null,
-					})
-					.where(and(eq(narrators.id, id), eq(narrators.workspaceRevision, previous.revision)))
-					.returning({ id: narrators.id });
-				return rows.length === 1;
+				return withWorkspaceAdmission(
+					{
+						deviceId: current.deviceId,
+						path: current.cwd,
+						repositoryKey: current.git?.repositoryKey,
+					},
+					async () => {
+						const rows = await db
+							.update(narrators)
+							.set({
+								cwd: current.cwd,
+								workspaceRevision: current.revision,
+								workspaceContext: current,
+								apiConversationId: null,
+							})
+							.where(and(eq(narrators.id, id), eq(narrators.workspaceRevision, previous.revision)))
+							.returning({ id: narrators.id });
+						return rows.length === 1;
+					},
+				);
 			},
 			install: async (current) => {
 				const active = activeNarrators.get(id);

@@ -1907,6 +1907,13 @@ async function requireEmptyDirectory(path: string): Promise<void> {
 	}
 }
 
+/** Application-private backup provenance only; never an authorization credential. */
+export async function readOrInitializeFileChangeSourceInstanceId(): Promise<string> {
+	const root = getNarraforkHome();
+	await requireApplicationDataDirectory(root);
+	return persistentSourceId(root);
+}
+
 /** Atomic exclusive publication; never replace an existing instance identity. */
 async function persistentSourceId(root: string, createIfMissing = true): Promise<string> {
 	const path = join(root, "file-change-source.json");

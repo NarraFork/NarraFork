@@ -17,6 +17,13 @@ import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { gitService } from "./git-service";
 import { terminalService } from "./terminal-service";
+import {
+	assertLifecycleProtectionCurrent,
+	confirmLifecyclePathRemoved,
+	isResourceProtectionError,
+	revalidateLifecycleTarget,
+	withLegacyRetirement,
+} from "./worktree-lifecycle-guard";
 import { worktreeWatcher } from "./worktree-watcher";
 
 export interface CleanupReport {
@@ -183,6 +190,7 @@ async function archiveIgnoredFiles(
 	try {
 		entries = await listIgnoredEntries(worktreePath);
 	} catch (err) {
+		if (isResourceProtectionError(err)) throw err;
 		logger.warn("Could not enumerate ignored files before making a chapter dormant", {
 			chapterId,
 			worktreePath,
@@ -218,6 +226,7 @@ async function archiveIgnoredFiles(
 			report.archived.push(relative);
 			budget -= size;
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			report.skipped.push(relative);
 			logger.warn("Failed to archive an ignored file before making a chapter dormant", {
 				chapterId,
@@ -271,6 +280,7 @@ export function discardIgnoredArchive(chapterId: string): void {
 		rmSync(dir, { recursive: true, force: true });
 		logger.info("Discarded a chapter's archived ignored files", { chapterId, path: dir });
 	} catch (err) {
+		if (isResourceProtectionError(err)) throw err;
 		logger.warn("Failed to discard a chapter's archived ignored files", {
 			chapterId,
 			path: dir,
@@ -397,6 +407,7 @@ function restoreIgnoredFiles(chapterId: string, worktreePath: string): IgnoredRe
 			// archive whose remaining entries look like collisions on the next wake.
 			rmSync(source, { force: true });
 		} catch (err) {
+			if (isResourceProtectionError(err)) throw err;
 			report.skipped.push(rel);
 			logger.warn("Failed to restore one archived ignored file during wake (copy kept)", {
 				chapterId,
@@ -453,178 +464,184 @@ export const chapterCleanup = {
 			const gitPath = await getProjectGitPath(chapter.projectId);
 			if (!gitPath) throw new ValidationError("Project has no git repository configured");
 
-			// Step 1: Clean up terminals
-			await terminalService.cleanupForChapter(chapterId);
+			return withLegacyRetirement([chapterId], "chapter dormant", async () => {
+				// Step 1: Clean up terminals
+				await terminalService.cleanupForChapter(chapterId);
 
-			// Step 2: Stop containers.
-			//
-			// Ordered before `worktreePath` is nulled because every compose command is
-			// resolved from the worktree: `removeChapterContainers` skips `compose down`
-			// entirely when the path is null, deletes the DB rows and releases the ports
-			// anyway, and leaves the actual Podman containers running on the host holding
-			// those ports — which the allocator then hands to another chapter, whose
-			// `compose up` fails on a port conflict nothing in NarraFork can explain.
-			//
-			// `pause` rather than `down` so wake can resume the same containers, matching
-			// what wake already expects (`unpauseChapterContainers`).
-			if (chapter.containerConfig) {
-				try {
-					await containerService.pauseChapterContainers(chapterId);
-				} catch (err) {
-					logger.warn("Failed to pause containers during dormant", {
+				// Step 2: Stop containers.
+				//
+				// Ordered before `worktreePath` is nulled because every compose command is
+				// resolved from the worktree: `removeChapterContainers` skips `compose down`
+				// entirely when the path is null, deletes the DB rows and releases the ports
+				// anyway, and leaves the actual Podman containers running on the host holding
+				// those ports — which the allocator then hands to another chapter, whose
+				// `compose up` fails on a port conflict nothing in NarraFork can explain.
+				//
+				// `pause` rather than `down` so wake can resume the same containers, matching
+				// what wake already expects (`unpauseChapterContainers`).
+				if (chapter.containerConfig) {
+					try {
+						await containerService.pauseChapterContainers(chapterId);
+					} catch (err) {
+						if (isResourceProtectionError(err)) throw err;
+						logger.warn("Failed to pause containers during dormant", {
+							chapterId,
+							error: String(err),
+						});
+						// Still proceed — containers may have been removed externally
+					}
+				}
+
+				// Step 2.5: Record the workspace in the snapshot DAG before anything removes
+				// it. The auto-commit below may fail, so without a snapshot taken here a
+				// chapter that goes dormant with a failing commit would have no record of its
+				// uncommitted bytes anywhere.
+				//
+				// Taken BEFORE the commit rather than after so it captures the workspace as the
+				// user left it, including files the commit would not pick up.
+				const dormantSnapshot = await ensureChapterSnapshot(
+					worktreePath,
+					"state before going dormant",
+				);
+				if (!dormantSnapshot) {
+					logger.warn("Could not snapshot a chapter's workspace before making it dormant", {
 						chapterId,
+						worktreePath,
+					});
+				}
+
+				// Step 2.6: Copy out the files no other mechanism protects.
+				//
+				// Snapshots and the auto-commit both honour the repository's ignore rules, and
+				// `worktree remove --force` deletes ignored content — so ignored files have
+				// exactly zero copies unless they are archived here.
+				const ignored = await archiveIgnoredFiles(chapterId, worktreePath);
+
+				// Step 3: Auto-commit with conflict recovery
+				//
+				// `commitFailed` decides whether the snapshot above is still needed on wake. When
+				// the commit succeeds the branch tip carries the work, and restoring a snapshot
+				// on top would be a pointless (and slightly risky) rewrite of a clean worktree.
+				// When it fails, that snapshot is the ONLY copy.
+				let commitFailed = false;
+				let commitError: unknown = null;
+				// `worktreeLock` in addition to the `chapterLock` this method already holds. The two
+				// guard different things and neither implies the other: `chapterLock` keeps another
+				// *chapter* transition out, while a narrator's Bash tool or a merge targeting this
+				// worktree is keyed on the path, not the chapter. The commit and the merge-abort
+				// retry have to be one unit — an abort followed by someone else's write, then this
+				// auto-commit, would commit that write under this chapter's "auto-save" message.
+				//
+				// Ordering is chapter → worktree, matching the hierarchy in `lib/async-mutex`; the
+				// reverse nesting anywhere would make a cycle out of two locks that are each safe.
+				const identity = await resolveUserGitIdentityEnv(userId);
+				try {
+					await worktreeLock.acquire(worktreePath, () =>
+						gitService.autoCommitUnlocked(worktreePath, "auto-save before dormant", identity),
+					);
+				} catch (commitErr) {
+					if (isResourceProtectionError(commitErr)) throw commitErr;
+					// If worktree has merge conflicts, abort merge and retry
+					logger.warn("Auto-commit failed, attempting conflict recovery", {
+						chapterId,
+						error: String(commitErr),
+					});
+					try {
+						await worktreeLock.acquire(worktreePath, async () => {
+							await gitService.mergeAbort(worktreePath);
+							await gitService.autoCommitUnlocked(
+								worktreePath,
+								"auto-save before dormant (after merge abort)",
+								identity,
+							);
+						});
+					} catch (recoveryErr) {
+						if (isResourceProtectionError(recoveryErr)) throw recoveryErr;
+						logger.error("Conflict recovery failed during dormant", {
+							chapterId,
+							error: String(recoveryErr),
+						});
+						commitFailed = true;
+						commitError = recoveryErr;
+					}
+				}
+
+				// Step 3.5: Refuse to continue when NOTHING holds this chapter's work.
+				//
+				// The worktree is deleted a few lines below, so the two mechanisms that can
+				// carry uncommitted state past that point are the commit and the snapshot. If
+				// both failed there is no third copy, and proceeding would destroy the
+				// workspace — which is exactly what the previous code did: the snapshot failure
+				// was a `warn`, the commit failure only set a flag, and the removal ran
+				// unconditionally. Failing here leaves the chapter active and the worktree
+				// intact, so the user (or a retry after the underlying git problem is fixed)
+				// still has the bytes.
+				if (commitFailed && !dormantSnapshot) {
+					throw new ValidationError(
+						"Refusing to make this chapter dormant: its uncommitted work could neither be " +
+							`committed (${String(commitError)}) nor snapshotted, so removing the worktree ` +
+							"would destroy it. Resolve the git problem in the worktree (or commit manually) " +
+							"and try again.",
+					);
+				}
+
+				// Step 4: Stop file watcher before removing worktree
+				worktreeWatcher.unwatchAll(worktreePath);
+
+				// Step 5: Remove worktree BEFORE updating DB
+				// This ensures we don't lose the worktreePath reference if removal fails
+				try {
+					await gitService.removeWorktree(gitPath, worktreePath);
+				} catch (err) {
+					if (isResourceProtectionError(err)) throw err;
+					// Removal failed, so the directory on disk is still this chapter's workspace
+					// — and when the commit failed it is also still the live copy of work the
+					// branch does not have.
+					//
+					// The chapter therefore stays active with its `worktreePath` intact. Nulling
+					// it (the previous behaviour) was unrecoverable in both directions: wake
+					// would try `worktree add` at a path that already exists and fail forever,
+					// while the orphan sweep — which deletes `.worktrees` directories no active
+					// chapter claims — would eventually delete that same directory.
+					logger.error("Worktree removal failed during dormant; chapter stays active", {
+						chapterId,
+						worktreePath,
 						error: String(err),
 					});
-					// Still proceed — containers may have been removed externally
+					throw new ValidationError(
+						`Could not make this chapter dormant: removing its worktree failed (${String(err)}). ` +
+							"The chapter is still active and its worktree is untouched — close anything " +
+							"holding files open in it and try again.",
+					);
 				}
-			}
 
-			// Step 2.5: Record the workspace in the snapshot DAG before anything removes
-			// it. The auto-commit below may fail, so without a snapshot taken here a
-			// chapter that goes dormant with a failing commit would have no record of its
-			// uncommitted bytes anywhere.
-			//
-			// Taken BEFORE the commit rather than after so it captures the workspace as the
-			// user left it, including files the commit would not pick up.
-			const dormantSnapshot = await ensureChapterSnapshot(
-				worktreePath,
-				"state before going dormant",
-			);
-			if (!dormantSnapshot) {
-				logger.warn("Could not snapshot a chapter's workspace before making it dormant", {
+				// Step 6: Update DB — external resources already cleaned
+				const now = new Date().toISOString();
+				await db
+					.update(chapters)
+					.set({
+						status: "dormant",
+						worktreePath: null,
+						// Recorded only when the commit failed, so it means exactly one thing:
+						// "the branch does not carry this chapter's work, the snapshot does".
+						// Waking reads it to decide whether a restore is needed at all, and a
+						// value written after a SUCCESSFUL commit would make every wake rewrite
+						// a worktree that git had already restored correctly.
+						...(commitFailed && dormantSnapshot
+							? { dormantSnapshotCommitSha: dormantSnapshot.commitSha }
+							: {}),
+						updatedAt: now,
+					})
+					.where(eq(chapters.id, chapterId));
+
+				logger.info("Chapter made dormant", {
 					chapterId,
-					worktreePath,
+					archivedIgnored: ignored.archived.length,
+					skippedIgnored: ignored.skipped.length,
 				});
-			}
-
-			// Step 2.6: Copy out the files no other mechanism protects.
-			//
-			// Snapshots and the auto-commit both honour the repository's ignore rules, and
-			// `worktree remove --force` deletes ignored content — so ignored files have
-			// exactly zero copies unless they are archived here.
-			const ignored = await archiveIgnoredFiles(chapterId, worktreePath);
-
-			// Step 3: Auto-commit with conflict recovery
-			//
-			// `commitFailed` decides whether the snapshot above is still needed on wake. When
-			// the commit succeeds the branch tip carries the work, and restoring a snapshot
-			// on top would be a pointless (and slightly risky) rewrite of a clean worktree.
-			// When it fails, that snapshot is the ONLY copy.
-			let commitFailed = false;
-			let commitError: unknown = null;
-			// `worktreeLock` in addition to the `chapterLock` this method already holds. The two
-			// guard different things and neither implies the other: `chapterLock` keeps another
-			// *chapter* transition out, while a narrator's Bash tool or a merge targeting this
-			// worktree is keyed on the path, not the chapter. The commit and the merge-abort
-			// retry have to be one unit — an abort followed by someone else's write, then this
-			// auto-commit, would commit that write under this chapter's "auto-save" message.
-			//
-			// Ordering is chapter → worktree, matching the hierarchy in `lib/async-mutex`; the
-			// reverse nesting anywhere would make a cycle out of two locks that are each safe.
-			const identity = await resolveUserGitIdentityEnv(userId);
-			try {
-				await worktreeLock.acquire(worktreePath, () =>
-					gitService.autoCommitUnlocked(worktreePath, "auto-save before dormant", identity),
-				);
-			} catch (commitErr) {
-				// If worktree has merge conflicts, abort merge and retry
-				logger.warn("Auto-commit failed, attempting conflict recovery", {
-					chapterId,
-					error: String(commitErr),
-				});
-				try {
-					await worktreeLock.acquire(worktreePath, async () => {
-						await gitService.mergeAbort(worktreePath);
-						await gitService.autoCommitUnlocked(
-							worktreePath,
-							"auto-save before dormant (after merge abort)",
-							identity,
-						);
-					});
-				} catch (recoveryErr) {
-					logger.error("Conflict recovery failed during dormant", {
-						chapterId,
-						error: String(recoveryErr),
-					});
-					commitFailed = true;
-					commitError = recoveryErr;
-				}
-			}
-
-			// Step 3.5: Refuse to continue when NOTHING holds this chapter's work.
-			//
-			// The worktree is deleted a few lines below, so the two mechanisms that can
-			// carry uncommitted state past that point are the commit and the snapshot. If
-			// both failed there is no third copy, and proceeding would destroy the
-			// workspace — which is exactly what the previous code did: the snapshot failure
-			// was a `warn`, the commit failure only set a flag, and the removal ran
-			// unconditionally. Failing here leaves the chapter active and the worktree
-			// intact, so the user (or a retry after the underlying git problem is fixed)
-			// still has the bytes.
-			if (commitFailed && !dormantSnapshot) {
-				throw new ValidationError(
-					"Refusing to make this chapter dormant: its uncommitted work could neither be " +
-						`committed (${String(commitError)}) nor snapshotted, so removing the worktree ` +
-						"would destroy it. Resolve the git problem in the worktree (or commit manually) " +
-						"and try again.",
-				);
-			}
-
-			// Step 4: Stop file watcher before removing worktree
-			worktreeWatcher.unwatchAll(worktreePath);
-
-			// Step 5: Remove worktree BEFORE updating DB
-			// This ensures we don't lose the worktreePath reference if removal fails
-			try {
-				await gitService.removeWorktree(gitPath, worktreePath);
-			} catch (err) {
-				// Removal failed, so the directory on disk is still this chapter's workspace
-				// — and when the commit failed it is also still the live copy of work the
-				// branch does not have.
-				//
-				// The chapter therefore stays active with its `worktreePath` intact. Nulling
-				// it (the previous behaviour) was unrecoverable in both directions: wake
-				// would try `worktree add` at a path that already exists and fail forever,
-				// while the orphan sweep — which deletes `.worktrees` directories no active
-				// chapter claims — would eventually delete that same directory.
-				logger.error("Worktree removal failed during dormant; chapter stays active", {
-					chapterId,
-					worktreePath,
-					error: String(err),
-				});
-				throw new ValidationError(
-					`Could not make this chapter dormant: removing its worktree failed (${String(err)}). ` +
-						"The chapter is still active and its worktree is untouched — close anything " +
-						"holding files open in it and try again.",
-				);
-			}
-
-			// Step 6: Update DB — external resources already cleaned
-			const now = new Date().toISOString();
-			await db
-				.update(chapters)
-				.set({
-					status: "dormant",
-					worktreePath: null,
-					// Recorded only when the commit failed, so it means exactly one thing:
-					// "the branch does not carry this chapter's work, the snapshot does".
-					// Waking reads it to decide whether a restore is needed at all, and a
-					// value written after a SUCCESSFUL commit would make every wake rewrite
-					// a worktree that git had already restored correctly.
-					...(commitFailed && dormantSnapshot
-						? { dormantSnapshotCommitSha: dormantSnapshot.commitSha }
-						: {}),
-					updatedAt: now,
-				})
-				.where(eq(chapters.id, chapterId));
-
-			logger.info("Chapter made dormant", {
-				chapterId,
-				archivedIgnored: ignored.archived.length,
-				skippedIgnored: ignored.skipped.length,
+				eventBus.emit({ type: "chapter:dormant", chapterId });
+				return { ignored, snapshotOnly: commitFailed };
 			});
-			eventBus.emit({ type: "chapter:dormant", chapterId });
-			return { ignored, snapshotOnly: commitFailed };
 		});
 	},
 
@@ -664,124 +681,136 @@ export const chapterCleanup = {
 			const branchSuffix = chapter.branch.split("/").slice(1).join("/");
 			const worktreePath = resolve(gitPath, ".worktrees", branchSuffix);
 
-			// Step 1: Create worktree, tolerating leftovers from a failed teardown.
-			//
-			// `git worktree add` fails outright in two states this code can genuinely be
-			// in, and both used to make the chapter permanently unwakeable:
-			//   - the path exists on disk ("already exists"), because a previous removal
-			//     failed or was interrupted;
-			//   - the path is gone but git still has the registration ("missing but already
-			//     registered"), which `prune` clears.
-			// Neither is `--force`-able for the first case, so the directory has to be
-			// reclaimed explicitly.
-			await this._createWorktreeReclaiming(gitPath, worktreePath, chapter.branch, chapterId);
+			return withLegacyRetirement(
+				[chapterId],
+				"chapter wake/reclaim",
+				async () => {
+					// Step 1: Create worktree, tolerating leftovers from a failed teardown.
+					//
+					// `git worktree add` fails outright in two states this code can genuinely be
+					// in, and both used to make the chapter permanently unwakeable:
+					//   - the path exists on disk ("already exists"), because a previous removal
+					//     failed or was interrupted;
+					//   - the path is gone but git still has the registration ("missing but already
+					//     registered"), which `prune` clears.
+					// Neither is `--force`-able for the first case, so the directory has to be
+					// reclaimed explicitly.
+					await this._createWorktreeReclaiming(gitPath, worktreePath, chapter.branch, chapterId);
 
-			// Step 1.5: Put back the uncommitted work the branch does not carry.
-			//
-			// A dormant chapter holds state its branch tip does not when the pre-dormant
-			// auto-commit failed: `dormantSnapshotCommitSha` is then the only copy, and
-			// dormant records it for exactly this restore.
-			//
-			// `mergedSourceSnapshotSha` is still consulted for chapters that were merged and
-			// later made dormant again, where it names uncommitted state the branch never
-			// received. `restoreSourceSnapshot` verifies the commit against the shadow
-			// repository and reports rather than throws, so a pruned or missing snapshot
-			// degrades to "you got the last commit" instead of failing the wake.
-			const restoreTarget = chapter.dormantSnapshotCommitSha ?? chapter.mergedSourceSnapshotSha;
-			if (restoreTarget) {
-				const restored = await restoreSourceSnapshot(worktreePath, restoreTarget);
-				if (!restored.restored) {
-					logger.warn("Wake could not restore the chapter's uncommitted work", {
-						chapterId,
-						snapshot: restoreTarget,
-						reason: restored.reason,
-					});
-				}
-			}
+					// Step 1.5: Put back the uncommitted work the branch does not carry.
+					//
+					// A dormant chapter holds state its branch tip does not when the pre-dormant
+					// auto-commit failed: `dormantSnapshotCommitSha` is then the only copy, and
+					// dormant records it for exactly this restore.
+					//
+					// `mergedSourceSnapshotSha` is still consulted for chapters that were merged and
+					// later made dormant again, where it names uncommitted state the branch never
+					// received. `restoreSourceSnapshot` verifies the commit against the shadow
+					// repository and reports rather than throws, so a pruned or missing snapshot
+					// degrades to "you got the last commit" instead of failing the wake.
+					const restoreTarget = chapter.dormantSnapshotCommitSha ?? chapter.mergedSourceSnapshotSha;
+					if (restoreTarget) {
+						const restored = await restoreSourceSnapshot(worktreePath, restoreTarget);
+						if (!restored.restored) {
+							logger.warn("Wake could not restore the chapter's uncommitted work", {
+								chapterId,
+								snapshot: restoreTarget,
+								reason: restored.reason,
+							});
+						}
+					}
 
-			// Step 1.6: Put back the ignored files dormant copied out. Ordered after the
-			// snapshot restore because that rewrites tracked content, while these are by
-			// definition outside it.
-			//
-			// Anything it declined is reported rather than dropped: those archived bytes are
-			// still the user's only copy, and a silent skip followed by deleting the archive
-			// is how they used to disappear for good.
-			const restoredIgnored = restoreIgnoredFiles(chapterId, worktreePath);
-			if (restoredIgnored.skipped.length > 0) {
-				warnings.push(
-					`${restoredIgnored.skipped.length} archived git-ignored file(s) were not restored ` +
-						`because the worktree already has those paths (${restoredIgnored.skipped
-							.slice(0, 5)
-							.join(", ")}). Their archived copies were kept at ${restoredIgnored.archivePath}.`,
-				);
-			}
+					// Step 1.6: Put back the ignored files dormant copied out. Ordered after the
+					// snapshot restore because that rewrites tracked content, while these are by
+					// definition outside it.
+					//
+					// Anything it declined is reported rather than dropped: those archived bytes are
+					// still the user's only copy, and a silent skip followed by deleting the archive
+					// is how they used to disappear for good.
+					const restoredIgnored = restoreIgnoredFiles(chapterId, worktreePath);
+					if (restoredIgnored.skipped.length > 0) {
+						warnings.push(
+							`${restoredIgnored.skipped.length} archived git-ignored file(s) were not restored ` +
+								`because the worktree already has those paths (${restoredIgnored.skipped
+									.slice(0, 5)
+									.join(
+										", ",
+									)}). Their archived copies were kept at ${restoredIgnored.archivePath}.`,
+						);
+					}
 
-			// Step 2: Update DB — if this fails, clean up the orphan worktree
-			const now = new Date().toISOString();
-			try {
-				await db
-					.update(chapters)
-					.set({
-						status: "active",
-						worktreePath,
-						lastAccessedAt: now,
-						updatedAt: now,
-						// The dormant snapshot has been consumed (or was found unrestorable), and
-						// the chapter now has a live worktree whose state is tracked by
-						// `snapshotCommitSha`. Cleared so it keeps meaning "the branch is missing
-						// this chapter's work": left behind, a LATER dormant cycle whose commit
-						// succeeded would still find this stale value and restore an old workspace
-						// over the one git had just restored correctly.
-						dormantSnapshotCommitSha: null,
-						// No merge coordinates are cleared here: only dormant chapters reach this
-						// point, and a dormant chapter's merge fields (if any) describe a merge
-						// that is still applied in the target. Clearing them is `unmerge`'s job,
-						// which also rolls the target back.
-					})
-					.where(eq(chapters.id, chapterId));
-			} catch (dbErr) {
-				logger.error("DB update failed during wake, removing orphan worktree", {
-					chapterId,
-					error: String(dbErr),
-				});
-				try {
-					await gitService.removeWorktree(gitPath, worktreePath);
-				} catch (cleanupErr) {
-					logger.error("Failed to clean up orphan worktree", {
-						chapterId,
-						worktreePath,
-						error: String(cleanupErr),
-					});
-				}
-				throw dbErr;
-			}
+					// Step 2: Update DB — if this fails, clean up the orphan worktree
+					const now = new Date().toISOString();
+					try {
+						await db
+							.update(chapters)
+							.set({
+								status: "active",
+								worktreePath,
+								lastAccessedAt: now,
+								updatedAt: now,
+								// The dormant snapshot has been consumed (or was found unrestorable), and
+								// the chapter now has a live worktree whose state is tracked by
+								// `snapshotCommitSha`. Cleared so it keeps meaning "the branch is missing
+								// this chapter's work": left behind, a LATER dormant cycle whose commit
+								// succeeded would still find this stale value and restore an old workspace
+								// over the one git had just restored correctly.
+								dormantSnapshotCommitSha: null,
+								// No merge coordinates are cleared here: only dormant chapters reach this
+								// point, and a dormant chapter's merge fields (if any) describe a merge
+								// that is still applied in the target. Clearing them is `unmerge`'s job,
+								// which also rolls the target back.
+							})
+							.where(eq(chapters.id, chapterId));
+					} catch (dbErr) {
+						logger.error("DB update failed during wake, removing orphan worktree", {
+							chapterId,
+							error: String(dbErr),
+						});
+						try {
+							await gitService.removeWorktree(gitPath, worktreePath);
+						} catch (cleanupErr) {
+							if (isResourceProtectionError(cleanupErr)) throw cleanupErr;
+							logger.error("Failed to clean up orphan worktree", {
+								chapterId,
+								worktreePath,
+								error: String(cleanupErr),
+							});
+						}
+						throw dbErr;
+					}
 
-			// Step 3: Restore containers (non-fatal — chapter is already usable)
-			if (chapter.containerConfig) {
-				try {
-					await containerService.unpauseChapterContainers(chapterId);
-				} catch (err) {
-					logger.warn("Failed to unpause containers during wake", {
-						chapterId,
-						error: String(err),
-					});
-				}
-			}
+					// Step 3: Restore containers (non-fatal — chapter is already usable)
+					if (chapter.containerConfig) {
+						try {
+							await containerService.unpauseChapterContainers(chapterId);
+						} catch (err) {
+							if (isResourceProtectionError(err)) throw err;
+							logger.warn("Failed to unpause containers during wake", {
+								chapterId,
+								error: String(err),
+							});
+						}
+					}
 
-			logger.info("Chapter woken", { chapterId, worktreePath });
-			eventBus.emit({ type: "chapter:woken", chapterId });
+					logger.info("Chapter woken", { chapterId, worktreePath });
+					eventBus.emit({ type: "chapter:woken", chapterId });
 
-			// Sync commits that may have been added externally while dormant
-			try {
-				await commitSyncService.syncChapterCommits(chapterId);
-			} catch (err) {
-				logger.warn("Failed to sync commits after wake (non-fatal)", {
-					chapterId,
-					error: String(err),
-				});
-			}
+					// Sync commits that may have been added externally while dormant
+					try {
+						await commitSyncService.syncChapterCommits(chapterId);
+					} catch (err) {
+						if (isResourceProtectionError(err)) throw err;
+						logger.warn("Failed to sync commits after wake (non-fatal)", {
+							chapterId,
+							error: String(err),
+						});
+					}
 
-			return { warnings };
+					return { warnings };
+				},
+				[{ path: worktreePath }],
+			);
 		});
 	},
 
@@ -809,77 +838,91 @@ export const chapterCleanup = {
 		branch: string,
 		chapterId: string,
 	): Promise<void> {
-		try {
-			await gitService.createWorktree(gitPath, worktreePath, branch);
-			return;
-		} catch (firstErr) {
-			logger.warn("Worktree creation failed; attempting to reclaim the path", {
-				chapterId,
-				worktreePath,
-				error: String(firstErr),
-			});
-		}
+		return withLegacyRetirement(
+			[chapterId],
+			"chapter reclaim",
+			async () => {
+				try {
+					await gitService.createWorktree(gitPath, worktreePath, branch);
+					return;
+				} catch (firstErr) {
+					if (isResourceProtectionError(firstErr)) throw firstErr;
+					logger.warn("Worktree creation failed; attempting to reclaim the path", {
+						chapterId,
+						worktreePath,
+						error: String(firstErr),
+					});
+				}
 
-		// Cheapest recovery first: drops registrations whose directories are gone.
-		await gitService.pruneWorktrees(gitPath).catch((err) => {
-			logger.debug("worktree prune failed during reclaim", {
-				chapterId,
-				error: String(err),
-			});
-		});
-		try {
-			await gitService.createWorktree(gitPath, worktreePath, branch);
-			return;
-		} catch (afterPruneErr) {
-			logger.debug("Worktree creation still failing after prune", {
-				chapterId,
-				error: String(afterPruneErr),
-			});
-		}
-
-		// A directory is in the way. `worktree remove --force` first, so git also drops
-		// its administrative files; a bare `rm` would leave the registration behind and
-		// the next `add` would report "missing but already registered".
-		if (existsSync(worktreePath)) {
-			// But first: is that directory actually ours?
-			//
-			// `worktreePath` is derived, not stored — `resolve(gitPath, ".worktrees",
-			// branch.split("/").slice(1).join("/"))` — so two chapters whose branches differ
-			// only in their prefix (`chapter/foo` and `review/foo`) resolve to the SAME path.
-			// Waking one of them would then hit the other's live worktree, and the recovery
-			// below (`remove --force` plus `rmSync`) would delete an active chapter's
-			// workspace including everything uncommitted in it. Refusing is the only safe
-			// answer: the destructive branch exists to reclaim *this* chapter's leftovers,
-			// and it cannot tell those from another chapter's working state.
-			const claimant = await db.query.chapters.findFirst({
-				columns: { id: true, title: true, branch: true, status: true },
-				where: and(
-					ne(chapters.id, chapterId),
-					eq(chapters.worktreePath, worktreePath),
-					inArray(chapters.status, ["active", "dormant"]),
-				),
-			});
-			if (claimant) {
-				throw new ValidationError(
-					`Cannot wake this chapter: the worktree path it derives from its branch ` +
-						`(${worktreePath}) is already in use by chapter "${claimant.title}" ` +
-						`(${claimant.id}, branch ${claimant.branch}). Their branch names collide after ` +
-						"the prefix, so reclaiming the directory would delete that chapter's workspace. " +
-						"Rename one of the branches, or delete the other chapter first.",
-				);
-			}
-			await gitService.removeWorktree(gitPath, worktreePath).catch((err) => {
-				logger.debug("worktree remove failed during reclaim; deleting the directory", {
-					chapterId,
-					error: String(err),
+				// Cheapest recovery first: drops registrations whose directories are gone.
+				await gitService.pruneWorktrees(gitPath).catch((err) => {
+					logger.debug("worktree prune failed during reclaim", {
+						chapterId,
+						error: String(err),
+					});
 				});
-			});
-			if (existsSync(worktreePath)) {
-				rmSync(worktreePath, { recursive: true, force: true });
-			}
-			await gitService.pruneWorktrees(gitPath).catch(() => {});
-		}
-		await gitService.createWorktree(gitPath, worktreePath, branch);
+				try {
+					await gitService.createWorktree(gitPath, worktreePath, branch);
+					return;
+				} catch (afterPruneErr) {
+					if (isResourceProtectionError(afterPruneErr)) throw afterPruneErr;
+					logger.debug("Worktree creation still failing after prune", {
+						chapterId,
+						error: String(afterPruneErr),
+					});
+				}
+
+				// A directory is in the way. `worktree remove --force` first, so git also drops
+				// its administrative files; a bare `rm` would leave the registration behind and
+				// the next `add` would report "missing but already registered".
+				const frozenPath = await revalidateLifecycleTarget(worktreePath);
+				if (existsSync(frozenPath)) {
+					// But first: is that directory actually ours?
+					//
+					// `worktreePath` is derived, not stored — `resolve(gitPath, ".worktrees",
+					// branch.split("/").slice(1).join("/"))` — so two chapters whose branches differ
+					// only in their prefix (`chapter/foo` and `review/foo`) resolve to the SAME path.
+					// Waking one of them would then hit the other's live worktree, and the recovery
+					// below (`remove --force` plus `rmSync`) would delete an active chapter's
+					// workspace including everything uncommitted in it. Refusing is the only safe
+					// answer: the destructive branch exists to reclaim *this* chapter's leftovers,
+					// and it cannot tell those from another chapter's working state.
+					const claimant = await db.query.chapters.findFirst({
+						columns: { id: true, title: true, branch: true, status: true },
+						where: and(
+							ne(chapters.id, chapterId),
+							eq(chapters.worktreePath, worktreePath),
+							inArray(chapters.status, ["active", "dormant"]),
+						),
+					});
+					if (claimant) {
+						throw new ValidationError(
+							`Cannot wake this chapter: the worktree path it derives from its branch ` +
+								`(${worktreePath}) is already in use by chapter "${claimant.title}" ` +
+								`(${claimant.id}, branch ${claimant.branch}). Their branch names collide after ` +
+								"the prefix, so reclaiming the directory would delete that chapter's workspace. " +
+								"Rename one of the branches, or delete the other chapter first.",
+						);
+					}
+					await gitService.removeWorktree(gitPath, worktreePath).catch((err) => {
+						if (isResourceProtectionError(err)) throw err;
+						logger.debug("worktree remove failed during reclaim; deleting the directory", {
+							chapterId,
+							error: String(err),
+						});
+					});
+					await assertLifecycleProtectionCurrent([{ path: worktreePath }], "reclaim rm fallback");
+					const removalPath = await revalidateLifecycleTarget(worktreePath);
+					if (existsSync(removalPath)) {
+						rmSync(removalPath, { recursive: true, force: true });
+						await confirmLifecyclePathRemoved(removalPath);
+					}
+					await gitService.pruneWorktrees(gitPath).catch(() => {});
+				}
+				await gitService.createWorktree(gitPath, worktreePath, branch);
+			},
+			[{ path: worktreePath }],
+		);
 	},
 
 	async batchCleanup(
@@ -921,70 +964,76 @@ export const chapterCleanup = {
 						return;
 					}
 
-					if (chapter.worktreePath && !options.force) {
-						const status = await gitService.getStatus(chapter.worktreePath);
-						if (status) {
-							report.skipped.push(chapterId);
-							return;
+					return withLegacyRetirement([chapterId], "chapter batch cleanup", async () => {
+						if (chapter.worktreePath && !options.force) {
+							const status = await gitService.getStatus(chapter.worktreePath);
+							if (status) {
+								report.skipped.push(chapterId);
+								return;
+							}
 						}
-					}
 
-					await terminalService.cleanupForChapter(chapterId);
+						await terminalService.cleanupForChapter(chapterId);
 
-					if (chapter.containerConfig) {
-						try {
-							await containerService.removeChapterContainers(chapterId, {
-								deleteVolumes: options.deleteBranch,
-							});
-						} catch (err) {
-							logger.warn("Failed to remove containers during cleanup", {
-								chapterId,
-								error: String(err),
-							});
+						if (chapter.containerConfig) {
+							try {
+								await containerService.removeChapterContainers(chapterId, {
+									deleteVolumes: options.deleteBranch,
+								});
+							} catch (err) {
+								if (isResourceProtectionError(err)) throw err;
+								logger.warn("Failed to remove containers during cleanup", {
+									chapterId,
+									error: String(err),
+								});
+							}
 						}
-					}
 
-					const gitPath = await getProjectGitPath(chapter.projectId);
+						const gitPath = await getProjectGitPath(chapter.projectId);
 
-					if (chapter.worktreePath && gitPath) {
-						try {
-							await gitService.removeWorktree(gitPath, chapter.worktreePath);
-						} catch (err) {
-							logger.warn("Failed to remove worktree during cleanup", {
-								chapterId,
-								error: String(err),
-							});
+						if (chapter.worktreePath && gitPath) {
+							try {
+								await gitService.removeWorktree(gitPath, chapter.worktreePath);
+							} catch (err) {
+								if (isResourceProtectionError(err)) throw err;
+								logger.warn("Failed to remove worktree during cleanup", {
+									chapterId,
+									error: String(err),
+								});
+							}
 						}
-					}
 
-					if (options.deleteBranch && gitPath) {
-						try {
-							await gitService.deleteBranch(gitPath, chapter.branch);
-						} catch (err) {
-							logger.warn("Failed to delete branch during cleanup", {
-								chapterId,
-								error: String(err),
-							});
+						if (options.deleteBranch && gitPath) {
+							try {
+								await gitService.deleteBranch(gitPath, chapter.branch);
+							} catch (err) {
+								if (isResourceProtectionError(err)) throw err;
+								logger.warn("Failed to delete branch during cleanup", {
+									chapterId,
+									error: String(err),
+								});
+							}
 						}
-					}
 
-					// Abandoned is terminal: `wake` only accepts `dormant`, so nothing will ever
-					// consume this chapter's ignored-file archive again. Leaving it behind kept a
-					// plaintext copy of exactly the files git refuses to track (`secret.env` and
-					// friends) on disk forever, with no reader and no sweeper — for a chapter the
-					// user just cleaned up.
-					discardIgnoredArchive(chapterId);
+						// Abandoned is terminal: `wake` only accepts `dormant`, so nothing will ever
+						// consume this chapter's ignored-file archive again. Leaving it behind kept a
+						// plaintext copy of exactly the files git refuses to track (`secret.env` and
+						// friends) on disk forever, with no reader and no sweeper — for a chapter the
+						// user just cleaned up.
+						discardIgnoredArchive(chapterId);
 
-					const now = new Date().toISOString();
-					await db
-						.update(chapters)
-						.set({ status: "abandoned", worktreePath: null, updatedAt: now })
-						.where(eq(chapters.id, chapterId));
+						const now = new Date().toISOString();
+						await db
+							.update(chapters)
+							.set({ status: "abandoned", worktreePath: null, updatedAt: now })
+							.where(eq(chapters.id, chapterId));
 
-					eventBus.emit({ type: "chapter:abandoned", chapterId, projectId: chapter.projectId });
-					report.cleaned.push(chapterId);
+						eventBus.emit({ type: "chapter:abandoned", chapterId, projectId: chapter.projectId });
+						report.cleaned.push(chapterId);
+					});
 				});
 			} catch (err) {
+				if (isResourceProtectionError(err)) throw err;
 				report.errors.push({ chapterId, error: String(err) });
 			}
 		}
@@ -1016,6 +1065,7 @@ export const chapterCleanup = {
 				await this.dormant(chapter.id);
 				dormanted.push(chapter.id);
 			} catch (err) {
+				if (isResourceProtectionError(err)) throw err;
 				logger.warn("Failed to auto-dormant chapter", {
 					chapterId: chapter.id,
 					error: String(err),
@@ -1046,6 +1096,7 @@ export const chapterCleanup = {
 			try {
 				await this.dormantInactiveChapters(projectId);
 			} catch (err) {
+				if (isResourceProtectionError(err)) throw err;
 				logger.warn("Scheduled auto-dormant failed", {
 					projectId,
 					error: String(err),

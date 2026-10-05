@@ -284,6 +284,7 @@ export interface NarratorToolbarOverflowMenuProps {
 	onArchive?: () => void;
 	archiveLoading?: boolean;
 	compatibilityEntry?: ReactNode;
+	backupEntry?: ReactNode;
 }
 
 export function NarratorToolbarOverflowMenu({
@@ -298,6 +299,7 @@ export function NarratorToolbarOverflowMenu({
 	onArchive,
 	archiveLoading,
 	compatibilityEntry,
+	backupEntry,
 }: NarratorToolbarOverflowMenuProps) {
 	const { t } = useTranslation("narrator");
 	const [menuOpen, setMenuOpen] = useState(false);
@@ -496,6 +498,7 @@ export function NarratorToolbarOverflowMenu({
 						})}
 					</SortableContext>
 				</DndContext>
+				{backupEntry}
 				{compatibilityEntry && (
 					<>
 						<Menu.Divider />

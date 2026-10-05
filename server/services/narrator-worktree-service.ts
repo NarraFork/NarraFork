@@ -21,7 +21,10 @@ import {
 	worktreeProposalHash,
 } from "./narrator-worktree-journal";
 
-import type { WorktreeResourceRegistry } from "./narrator-worktree-resources";
+import type {
+	VerifiedWorktreeScope,
+	WorktreeResourceRegistry,
+} from "./narrator-worktree-resources";
 
 export type { WorktreeCreateResult, WorktreeEntry } from "./narrator-worktree-journal";
 
@@ -70,6 +73,8 @@ export interface WorktreeTarget {
 	workspace: GitWorkspace;
 	backend?: ExecutionBackend;
 	repositoryPath?: string;
+	/** Verified server-side evidence; omitted fixture/legacy registrations stay unknown. */
+	resourceScope?: VerifiedWorktreeScope;
 }
 export interface WorktreeServicePorts<Principal> {
 	/** Must be the existing Git ACL/policy authorization, not a client-path resolver. */
@@ -835,6 +840,7 @@ export class NarratorWorktreeService<Principal> {
 						repositoryKey: record.repositoryKey,
 						worktreePath: record.destination,
 						createRequestId: request.requestId,
+						scope: fresh.resourceScope,
 					});
 					signal.throwIfAborted();
 					const args =

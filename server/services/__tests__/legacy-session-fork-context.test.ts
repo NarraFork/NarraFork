@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { beforeAll, describe, expect, mock, test } from "bun:test";
+import { beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { getTableConfig, SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
@@ -171,11 +171,16 @@ async function rules(id: string) {
 	});
 }
 
-async function assertInherited(parentId: string, childId: string, cwd: string) {
+async function assertInherited(
+	parentId: string,
+	childId: string,
+	cwd: string,
+	deviceId = "device-original",
+) {
 	const child = await db.query.narrators.findFirst({ where: eq(narrators.id, childId) });
 	expect(child).toMatchObject({
 		cwd,
-		defaultDeviceId: "device-original",
+		defaultDeviceId: deviceId,
 		contextProjectId: projectId,
 		ownerUserId: owner,
 		visibility: "private",
@@ -303,6 +308,95 @@ describe("ordinary session fork context and constraints", () => {
 		await rules(id);
 		const child = await narratorService.forkNarrator(id, null, { inheritMode: "fresh" });
 		await assertInherited(id, child.id, "/committed");
+		expect(child.workspaceRevision).toBe(0);
+		expect(child.workspaceContext).toMatchObject({
+			revision: 0,
+			cwd: "/committed",
+			deviceId: "device-original",
+		});
+	});
+	test("ordinary tool wrapper refuses review/general subagents before allocating a child", async () => {
+		for (const kind of ["review", "general"] as const) {
+			const rootId = await parent({ chapterId });
+			const id = await parent({
+				type: "subagent",
+				parentNarratorId: rootId,
+				aclRootNarratorId: rootId,
+				variant: `subagent:${kind}`,
+				subagentType: kind,
+				chapterId,
+			});
+			const before = sqlite.query("SELECT COUNT(*) AS n FROM narrators").get();
+			await expect(narratorService.forkStandaloneFromTool(id, "fresh")).rejects.toThrow(
+				"Cannot fork from a subagent",
+			);
+			expect(sqlite.query("SELECT COUNT(*) AS n FROM narrators").get()).toEqual(before);
+		}
+	});
+	test("committed device/context project wins over stale mirror and child revision is self-consistent", async () => {
+		const id = await parent({
+			chapterId,
+			contextProjectId: otherProjectId,
+			defaultDeviceId: "device-original",
+			cwd: "/stale-mirror",
+			workspaceRevision: 9,
+			workspaceContext: {
+				revision: 9,
+				deviceId: "device-original",
+				cwd: "/verified-remote",
+				pathFlavor: "posix",
+				contextKey: "verified",
+				contextProjectId: otherProjectId,
+				capabilities: { switchDirectory: false },
+			},
+		});
+		const child = await narratorService.forkStandaloneFromTool(id, "fresh");
+		expect(child).toMatchObject({
+			chapterId: null,
+			contextProjectId: projectId,
+			cwd: "/verified-remote",
+			defaultDeviceId: "device-original",
+			workspaceRevision: 0,
+			workspaceContext: {
+				revision: 0,
+				deviceId: "device-original",
+				cwd: "/verified-remote",
+				contextProjectId: projectId,
+			},
+		});
+	});
+	test("unresolved remote workspace refuses rather than borrowing host project paths", async () => {
+		const id = await parent({ chapterId, defaultDeviceId: "device-original", cwd: null });
+		await expect(narratorService.forkStandaloneFromTool(id, "fresh")).rejects.toThrow(
+			"Remote workspace is unresolved",
+		);
+	});
+	test.each([
+		"fresh",
+		"full",
+	] as const)("chapter %s tool fork retains constraints and model without creating resources", async (inheritMode) => {
+		const id = await parent({
+			chapterId,
+			defaultDeviceId: "local",
+			traits: ["review", "disabledTools:dangerous-tool"],
+			model: "old-model",
+			aclRootNarratorId: "root",
+		});
+		await rules(id);
+		const beforeChapters = sqlite.query("SELECT COUNT(*) AS n FROM chapters").get();
+		const beforeProjects = sqlite.query("SELECT COUNT(*) AS n FROM projects").get();
+		const child = await narratorService.forkStandaloneFromTool(
+			id,
+			inheritMode === "fresh" ? "fresh" : "fork",
+			{ inheritMode: inheritMode === "full" ? "full" : undefined, model: "new-model" },
+		);
+		await assertInherited(id, child.id, worktreePath, "local");
+		expect(child.chapterId).toBeNull();
+		expect(child.aclRootNarratorId).toBe("root");
+		expect(child.traits).toContain("review");
+		expect(child.model).toBe("new-model");
+		expect(sqlite.query("SELECT COUNT(*) AS n FROM chapters").get()).toEqual(beforeChapters);
+		expect(sqlite.query("SELECT COUNT(*) AS n FROM projects").get()).toEqual(beforeProjects);
 	});
 	test.each([
 		"fresh",
@@ -311,17 +405,17 @@ describe("ordinary session fork context and constraints", () => {
 		const id = await parent({
 			contextProjectId: projectId,
 			defaultDeviceId: "device-original",
-			cwd: null,
+			cwd: "/remote-context",
 		});
 		await rules(id);
 		const child = await narratorService.forkNarrator(id, null, { inheritMode });
-		await assertInherited(id, child.id, projectPath);
+		await assertInherited(id, child.id, "/remote-context");
 	});
 	test("forking an old chapter session keeps its project gate and actual worktree, without unbinding the parent", async () => {
 		const id = await parent({
 			chapterId,
 			contextProjectId: otherProjectId,
-			defaultDeviceId: "device-original",
+			defaultDeviceId: "local",
 			cwd: null,
 		});
 		await rules(id);
@@ -329,7 +423,7 @@ describe("ordinary session fork context and constraints", () => {
 			standalone: true,
 			inheritMode: "fresh",
 		});
-		await assertInherited(id, child.id, worktreePath);
+		await assertInherited(id, child.id, worktreePath, "local");
 		expect((await narratorService.getById(id)).chapterId).toBe(chapterId);
 	});
 	test("selected-message forks inherit the same access and execution profile", async () => {
@@ -354,19 +448,53 @@ describe("ordinary session fork context and constraints", () => {
 		await assertInherited(id, child.id, "/chosen");
 	});
 	test("fresh tool forks preserve context and honor model override", async () => {
-		const id = await parent({ contextProjectId: projectId, defaultDeviceId: "device-original" });
+		const id = await parent({
+			contextProjectId: projectId,
+			defaultDeviceId: "device-original",
+			cwd: "/remote-context",
+		});
 		await rules(id);
 		const child = await narratorService.forkStandaloneFromTool(id, "fresh", {
 			model: "custom-model",
 		});
-		await assertInherited(id, child.id, projectPath);
+		await assertInherited(id, child.id, "/remote-context");
 		expect(child.model).toBe("custom-model");
+	});
+	test("compressed chapter tool forks preserve model and read-only context without network or resource creation", async () => {
+		const { narratorContext } = await import("../narrator-context");
+		const summary = spyOn(narratorContext, "generateContextSummary").mockResolvedValue(
+			"fixture summary",
+		);
+		try {
+			const id = await parent({ chapterId, defaultDeviceId: "local", model: "old-model" });
+			await rules(id);
+			const beforeChapters = sqlite.query("SELECT COUNT(*) AS n FROM chapters").get();
+			const beforeProjects = sqlite.query("SELECT COUNT(*) AS n FROM projects").get();
+			const child = await narratorService.forkStandaloneFromTool(id, "fork", {
+				inheritMode: "compressed",
+				model: "new-model",
+				userId: owner,
+			});
+			await assertInherited(id, child.id, worktreePath, "local");
+			expect(child).toMatchObject({
+				chapterId: null,
+				model: "new-model",
+				contextSummary: "fixture summary",
+				inheritMode: "compressed",
+			});
+			expect(summary).toHaveBeenCalledWith(id, "en", { userId: owner });
+			expect(sqlite.query("SELECT COUNT(*) AS n FROM chapters").get()).toEqual(beforeChapters);
+			expect(sqlite.query("SELECT COUNT(*) AS n FROM projects").get()).toEqual(beforeProjects);
+		} finally {
+			summary.mockRestore();
+		}
 	});
 	test("frozen OAuth policy keeps its revoked authority provenance, not an unrestricted ordinary child", async () => {
 		const snapshot = { test: "frozen constraint" };
 		const id = await parent({
 			contextProjectId: projectId,
 			defaultDeviceId: "device-original",
+			cwd: "/remote-context",
 			oauthPolicySnapshotJson: snapshot,
 		});
 		await db.insert(integrationResourceBindings).values({

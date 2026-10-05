@@ -667,8 +667,6 @@ export function usePromoteNarrator() {
 		onSuccess: (_data, narratorId) => {
 			qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
 			qc.invalidateQueries({ queryKey: ["narrators"] });
-			qc.invalidateQueries({ queryKey: ["chapters"] });
-			qc.invalidateQueries({ queryKey: ["graph"] });
 		},
 	});
 }

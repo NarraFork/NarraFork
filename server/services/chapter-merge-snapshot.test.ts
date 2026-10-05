@@ -13,6 +13,7 @@
  * question in every case is whether the git-level pieces compose correctly.
  */
 import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -20,6 +21,7 @@ import { eq } from "drizzle-orm";
 import { getTestDb } from "../../tests/setup";
 import { chapters, mergeSessions, projects } from "../db/schema";
 import { generateId } from "../lib/id";
+import { getNarraforkPath } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 
 // Exercise real Git worktrees and shadow repositories, but keep session metadata
@@ -48,7 +50,7 @@ const {
 } = await import("./chapter-merge-snapshot");
 const { ensureChapterSnapshot } = await import("./chapter-snapshot-ref");
 const { gitService } = await import("./git-service");
-const { worktreeTreeSnapshot } = await import("./worktree-tree-snapshot");
+const { treeSnapshotKey, worktreeTreeSnapshot } = await import("./worktree-tree-snapshot");
 afterAll(() => mock.restore());
 
 const tempDirs: string[] = [];
@@ -407,8 +409,21 @@ describe("undoing a commit-free merge", () => {
 		writeFileSync(join(env.source.worktree, BASE_FILE), BASE_CONTENT.replace("l9", "l9-feature"));
 		await chapterMerge.merge(env.source.id, { targetChapterId: env.target.id });
 
-		// Simulate the shadow repository having been swept away.
-		await worktreeTreeSnapshot.destroy(env.source.worktree, undefined, { force: true });
+		// Simulate EXTERNAL loss in this test's isolated home, not a production force
+		// bypass. The lifecycle service correctly refuses to erase this live claim.
+		const digest = createHash("sha256")
+			.update(treeSnapshotKey("local", env.source.worktree))
+			.digest("hex");
+		const shadow = getNarraforkPath("tree-snapshots", digest.slice(0, 32));
+		const home = process.env.NARRAFORK_HOME;
+		if (
+			process.env.NARRAFORK_TEST !== "1" ||
+			!home ||
+			!shadow.startsWith(join(home, "tree-snapshots"))
+		)
+			throw new Error("External-loss fixture must remain in its isolated test namespace");
+		expect(existsSync(shadow)).toBe(true);
+		rmSync(shadow, { recursive: true, force: true });
 
 		const result = await chapterMerge.unmerge(env.source.id);
 		expect(result.ok).toBe(true);

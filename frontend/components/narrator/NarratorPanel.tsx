@@ -152,7 +152,10 @@ import { useComposerFileIngest } from "./interaction/use-composer-file-ingest";
 import { useInternalFileViewer } from "./interaction/use-internal-file-viewer";
 import { useInterruptLongPress } from "./interaction/use-interrupt-long-press";
 import { useMessageRevertConfirm } from "./interaction/use-message-revert-confirm";
-import { useNarratorForkActions } from "./interaction/use-narrator-fork-actions";
+import {
+	ordinaryPromoteDestination,
+	useNarratorForkActions,
+} from "./interaction/use-narrator-fork-actions";
 import { useNarratorSend } from "./interaction/use-narrator-send";
 import { usePermissionFocusNav } from "./interaction/use-permission-focus-nav";
 import { capabilityModelReference, useResolvedModel } from "./interaction/use-resolved-model";
@@ -573,17 +576,12 @@ function NarratorPanelBody({
 	const handlePromote = useCallback(() => {
 		promoteMutation.mutate(narratorId, {
 			onSuccess: (data) => {
-				if (data.type === "forked" && data.chapter) {
+				if (data.type === "forked") {
 					notifications.show({
 						message: t("promote_success_forked"),
 						color: "teal",
 					});
-					navigate({
-						to: "/projects/$projectId",
-						params: {
-							projectId: (data.chapter as Record<string, string>).projectId,
-						},
-					});
+					navigate(ordinaryPromoteDestination(data.narratorId));
 				} else {
 					notifications.show({
 						message: t("promote_success_unlocked"),

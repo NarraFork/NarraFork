@@ -116,11 +116,19 @@ test("frozen old migration chain upgrades workspace receipts and resource regist
 				.some((index) => index.name === "uq_permission_rule_request_attempt"),
 		).toBe(true);
 		const resources = sqlite
-			.query<{ name: string }, []>("PRAGMA table_info(narrator_worktree_resources)")
+			.query<{ name: string; notnull: number; dflt_value: string | null }, []>(
+				"PRAGMA table_info(narrator_worktree_resources)",
+			)
 			.all();
+		// Preserve the legacy nine columns' relative order while requiring all five new fields.
 		expect(resources.map((column) => column.name)).toEqual([
 			"id",
 			"owner_narrator_id",
+			"scope_kind",
+			"scope_project_id",
+			"scope_owner_user_id",
+			"ownership_revision",
+			"container_config",
 			"device_id",
 			"repository_key",
 			"worktree_path",
@@ -128,6 +136,15 @@ test("frozen old migration chain upgrades workspace receipts and resource regist
 			"create_request_id",
 			"created_at",
 			"updated_at",
+		]);
+		expect(
+			resources.slice(2, 7).map(({ name, notnull, dflt_value }) => ({ name, notnull, dflt_value })),
+		).toEqual([
+			{ name: "scope_kind", notnull: 1, dflt_value: "'unknown'" },
+			{ name: "scope_project_id", notnull: 0, dflt_value: null },
+			{ name: "scope_owner_user_id", notnull: 0, dflt_value: null },
+			{ name: "ownership_revision", notnull: 1, dflt_value: "0" },
+			{ name: "container_config", notnull: 0, dflt_value: null },
 		]);
 		const indexes = sqlite
 			.query<{ name: string; unique: number }, []>("PRAGMA index_list(narrator_worktree_resources)")
@@ -139,12 +156,42 @@ test("frozen old migration chain upgrades workspace receipts and resource regist
 			expect.objectContaining({ name: "idx_narrator_worktree_resource_owner" }),
 		);
 		const foreignKeys = sqlite
-			.query<{ from: string; table: string; on_delete: string }, []>(
+			.query<{ from: string; table: string; to: string; on_delete: string; on_update: string }, []>(
 				"PRAGMA foreign_key_list(narrator_worktree_resources)",
 			)
 			.all();
-		expect(foreignKeys).toMatchObject([
-			{ from: "owner_narrator_id", table: "narrators", on_delete: "SET NULL" },
+		expect(
+			foreignKeys
+				.map(({ from, table, to, on_delete, on_update }) => ({
+					from,
+					table,
+					to,
+					on_delete,
+					on_update,
+				}))
+				.sort((left, right) => left.from.localeCompare(right.from)),
+		).toEqual([
+			{
+				from: "owner_narrator_id",
+				table: "narrators",
+				to: "id",
+				on_delete: "SET NULL",
+				on_update: "NO ACTION",
+			},
+			{
+				from: "scope_owner_user_id",
+				table: "users",
+				to: "id",
+				on_delete: "SET NULL",
+				on_update: "NO ACTION",
+			},
+			{
+				from: "scope_project_id",
+				table: "projects",
+				to: "id",
+				on_delete: "SET NULL",
+				on_update: "NO ACTION",
+			},
 		]);
 		sqlite.run("PRAGMA foreign_keys = ON");
 		sqlite
@@ -160,6 +207,44 @@ test("frozen old migration chain upgrades workspace receipts and resource regist
 				"ready",
 				"create-request",
 			);
+		expect(
+			sqlite
+				.query(
+					"SELECT scope_kind, scope_project_id, scope_owner_user_id, ownership_revision, container_config FROM narrator_worktree_resources WHERE id = ?",
+				)
+				.get("retained-resource"),
+		).toEqual({
+			scope_kind: "unknown",
+			scope_project_id: null,
+			scope_owner_user_id: null,
+			ownership_revision: 0,
+			container_config: null,
+		});
+		// These parents and metadata mutations exist only in this isolated memory fixture.
+		sqlite.run("INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)", [
+			"scope-user",
+			"scope-user",
+			"fixture-hash",
+			"fixture-now",
+		]);
+		sqlite.run("INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)", [
+			"scope-project",
+			"scope fixture",
+			"fixture-now",
+			"fixture-now",
+		]);
+		sqlite.run(
+			"UPDATE narrator_worktree_resources SET scope_kind = 'project', scope_project_id = ?, scope_owner_user_id = ? WHERE id = ?",
+			["scope-project", "scope-user", "retained-resource"],
+		);
+		const readResource = () =>
+			sqlite
+				.query<Record<string, unknown>, [string]>(
+					"SELECT * FROM narrator_worktree_resources WHERE id = ?",
+				)
+				.get("retained-resource");
+		const beforeParentDeletes = readResource();
+		if (!beforeParentDeletes) throw new Error("Isolated resource fixture is missing");
 		sqlite.query("DELETE FROM narrators WHERE id = ?").run("old-narrator");
 		expect(
 			sqlite
@@ -176,6 +261,22 @@ test("frozen old migration chain upgrades workspace receipts and resource regist
 			state: "ready",
 			create_request_id: "create-request",
 		});
+		expect(readResource()).toEqual({ ...beforeParentDeletes, owner_narrator_id: null });
+		sqlite.run("DELETE FROM projects WHERE id = ?", ["scope-project"]);
+		// Missing project evidence must retain project kind, never silently become standalone.
+		expect(readResource()).toEqual({
+			...beforeParentDeletes,
+			owner_narrator_id: null,
+			scope_project_id: null,
+		});
+		sqlite.run("DELETE FROM users WHERE id = ?", ["scope-user"]);
+		expect(readResource()).toEqual({
+			...beforeParentDeletes,
+			owner_narrator_id: null,
+			scope_project_id: null,
+			scope_owner_user_id: null,
+		});
+		expect(sqlite.query("PRAGMA foreign_key_check").all()).toEqual([]);
 	} finally {
 		sqlite.close();
 	}
