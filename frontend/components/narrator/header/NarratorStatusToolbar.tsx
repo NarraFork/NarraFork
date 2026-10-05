@@ -301,11 +301,24 @@ export function BackgroundTasksStatusButton({
 	const label = t("backgroundTasks.activeCount", { count: runningCount });
 	return (
 		<Tooltip label={t("backgroundTasks.openPanel")} withinPortal>
+			{/*
+				UnstyledButton ships `font-size: var(--mantine-font-size-md)`. As an
+				inline-block button that strut sets the line box taller than the
+				wrapped `size="xs"` label, so this segment grew ~5px above its
+				TruncatedText neighbours and the row read as "heights not aligned".
+				`display: inline-flex` blockifies the label into a flex item, so the
+				button's height is exactly the text's — same contract as TurnElapsedTime.
+			*/}
 			<UnstyledButton
 				type="button"
 				onClick={onOpen}
 				aria-label={label}
-				style={{ flexShrink: 0, whiteSpace: "nowrap" }}
+				style={{
+					flexShrink: 0,
+					whiteSpace: "nowrap",
+					display: "inline-flex",
+					alignItems: "center",
+				}}
 			>
 				<Text component="span" size="xs" c="blue">
 					<span aria-hidden="true">· </span>
