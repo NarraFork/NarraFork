@@ -65,6 +65,7 @@ function tool(seq: number, id: string) {
 function live(text: string) {
 	return {
 		id: "__streaming__",
+		model: "gpt-5.6",
 		seq: 999,
 		role: "assistant",
 		contentJson: [{ type: "reasoning", text }],

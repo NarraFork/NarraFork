@@ -1063,7 +1063,8 @@ function sendStreamingSnapshot(ws: NarratorWS, narratorIds: string[], requestId?
 	for (const id of narratorIds) {
 		const snap = getStreamingSnapshot(id);
 		if (!snap) continue;
-		const hasStreaming = snap.streamingBlocks.length > 0 || snap.toolChunks.size > 0;
+		const hasStreaming =
+			snap.streamingBlocks.length > 0 || snap.toolChunks.size > 0 || snap.model !== undefined;
 		if (!hasStreaming) continue;
 		if (
 			!safeSend(
@@ -1072,6 +1073,8 @@ function sendStreamingSnapshot(ws: NarratorWS, narratorIds: string[], requestId?
 					{
 						type: "streaming_snapshot",
 						narratorId: id,
+						model: snap.model,
+						provider: snap.provider,
 						streamingBlocks: snap.streamingBlocks,
 						toolChunks: [...snap.toolChunks.values()],
 					},

@@ -59,6 +59,7 @@ function finishedTool(index: number) {
 function streamingMessage(text: string) {
 	return {
 		id: "__streaming__",
+		model: "gpt-5.6",
 		seq: 999,
 		role: "assistant",
 		contentJson: [{ type: "reasoning", text }],
@@ -75,6 +76,7 @@ function streamingMessage(text: string) {
 function checkpointProjectionMessage(text: string) {
 	return {
 		id: "msg-checkpoint-1",
+		model: "gpt-5.6",
 		seq: 100,
 		role: "assistant",
 		contentJson: [{ type: "reasoning", id: "r-1", revision: 2, text }],

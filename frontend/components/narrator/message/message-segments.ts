@@ -713,6 +713,8 @@ export function mergeStreamingSnapshotBlocks(
 }
 
 export function buildStreamingMsg(opts: {
+	model?: string;
+	provider?: string;
 	streamingBlocks?: StreamingBlock[] | null;
 	toolChunksMsg?: NarratorMsg | null;
 	narratorId: string;
@@ -799,6 +801,8 @@ export function buildStreamingMsg(opts: {
 	return {
 		id: "__streaming__",
 		narratorId,
+		...(opts.model !== undefined ? { model: opts.model } : {}),
+		...(opts.provider !== undefined ? { provider: opts.provider } : {}),
 		parentToolUseId: null,
 		role: "assistant",
 		contentJson: blocks,

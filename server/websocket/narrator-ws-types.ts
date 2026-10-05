@@ -895,8 +895,17 @@ export type NarratorServerMessage =
 			queueMessage?: string;
 	  }
 	| {
+			type: "streaming_identity";
+			narratorId: string;
+			model: string;
+			provider: string;
+			parentToolUseId?: string;
+	  }
+	| {
 			type: "streaming_snapshot";
 			narratorId: string;
+			model?: string;
+			provider?: string;
 			streamingBlocks: Array<
 				| { type: "reasoning"; id?: string; outputIndex?: number; text: string }
 				| {

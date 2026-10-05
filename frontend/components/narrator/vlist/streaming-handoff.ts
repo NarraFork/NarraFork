@@ -150,7 +150,16 @@ export function projectStreamingDocument(
 			return { ...base, ...live };
 		});
 		return changed
-			? ({ ...message, contentJson, liveBlockIndex, liveContentProjection: true } as TreeMessage)
+			? ({
+					...message,
+					// The matched newer block belongs to this actual upstream request.
+					// Older checkpoints can still carry no identity (or a configured alias).
+					model: projected.model ?? message.model,
+					provider: projected.provider ?? message.provider,
+					contentJson,
+					liveBlockIndex,
+					liveContentProjection: true,
+				} as TreeMessage)
 			: message;
 	});
 	const remaining = liveBlocks.filter((block) => !block.id || !mergedIds.has(block.id));

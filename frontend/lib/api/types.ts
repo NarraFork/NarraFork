@@ -933,6 +933,9 @@ export interface BufferMessageSummary {
 }
 
 export interface TreeMessage {
+	/** Actual model/provider for this message, not the narrator's current selection. */
+	model?: string | null;
+	provider?: string | null;
 	id: string;
 	narratorId: string;
 	parentToolUseId: string | null;

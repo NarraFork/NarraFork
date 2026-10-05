@@ -48,6 +48,7 @@ describe("traceRowFoldChannel", () => {
 /** A reasoning message whose text parses into two step rows. */
 const reasoningMessage = {
 	id: "m1",
+	model: "gpt-5.6",
 	seq: 1,
 	role: "assistant",
 	contentJson: [{ type: "reasoning", text: "**A**\n\nfirst body\n\n**B**\n\nsecond body" }],

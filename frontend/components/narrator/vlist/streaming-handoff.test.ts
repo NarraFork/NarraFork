@@ -79,6 +79,21 @@ describe("block identity/revision handoff projection", () => {
 			{ ...text("b", 1), translatedText: "old translation", citations: [] },
 		]);
 	});
+	it("a newer checkpoint projection uses actual request identity without mutating history", () => {
+		const committed = [message([text("b", 1)], "a1", { model: "pool:default" })];
+		const streaming = {
+			...live([text("b", 2)], 0),
+			model: "gpt-5.6",
+			provider: "codex",
+		};
+		const document = projectStreamingDocument(committed, streaming);
+		expect(document[0].model).toBe("gpt-5.6");
+		expect(document[0].provider).toBe("codex");
+		expect(committed[0].model).toBe("pool:default");
+		expect(committed[0].provider).toBeUndefined();
+		const legacy = projectStreamingDocument(committed, live([text("b", 2)], 0));
+		expect(legacy[0].model).toBe("pool:default");
+	});
 	it("a stale published row cannot duplicate an already committed revision", () => {
 		const committed = [message([text("b", 5)])];
 		expect(projectStreamingDocument(committed, live([text("b", 4)]))).toBe(committed);

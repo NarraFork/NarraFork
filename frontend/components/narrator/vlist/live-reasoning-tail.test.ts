@@ -48,6 +48,7 @@ const HISTORY = [
 
 const streamingMessage = (text: string) => ({
 	id: "__streaming__",
+	model: "gpt-5.6",
 	seq: 999,
 	role: "assistant",
 	contentJson: [{ type: "reasoning", text }],
@@ -57,6 +58,7 @@ const streamingMessage = (text: string) => ({
 
 const settledMessage = (text: string) => ({
 	id: "real-1",
+	model: "gpt-5.6",
 	seq: 1,
 	role: "assistant",
 	contentJson: [{ type: "reasoning", text }],

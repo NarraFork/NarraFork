@@ -96,6 +96,7 @@ export function useVListStreamingMessage(
 	// Raw text never takes a committed (citation-cleaned) value as its seed. A
 	// checkpoint only removes the display copy; later deltas still append here.
 	const blocksRef = useRef<StreamingBlock[]>([]);
+	const identityRef = useRef<{ model?: string; provider?: string }>({});
 	const ownerRef = useRef(narratorId);
 	const finalizedRef = useRef(new Map<string, number>());
 	const toolStoreRef = useRef(createStreamingToolStore());
@@ -137,6 +138,7 @@ export function useVListStreamingMessage(
 		}
 		clearOutputTimers();
 		finalizedRef.current.clear();
+		identityRef.current = {};
 		liveBlockRef.current = null;
 		snapshotEpochRef.current = undefined;
 		snapshotBlocksRef.current = new WeakSet();
@@ -318,7 +320,29 @@ export function useVListStreamingMessage(
 					flush();
 				}
 			},
+			onStreamingIdentity: (identity) => {
+				if (!isSubagent && identity.parentToolUseId) return;
+				if (
+					identityRef.current.model !== identity.model ||
+					identityRef.current.provider !== identity.provider
+				) {
+					identityRef.current = { model: identity.model, provider: identity.provider };
+					flush();
+				}
+			},
 			onStreamingSnapshot: (snapshot) => {
+				// Old-server snapshots omit identity; never erase a newer live identity.
+				const identity = {
+					model: snapshot.model ?? identityRef.current.model,
+					provider: snapshot.provider ?? identityRef.current.provider,
+				};
+				if (
+					identityRef.current.model !== identity.model ||
+					identityRef.current.provider !== identity.provider
+				) {
+					identityRef.current = identity;
+					flush();
+				}
 				let toolsChanged = false;
 				for (const chunk of snapshot.toolChunks) {
 					if (!isSubagent && chunk.parentToolUseId) continue;
@@ -665,6 +689,7 @@ export function useVListStreamingMessage(
 		const toolChunksMsg =
 			chunks.length > 0 ? buildTopLevelStreamingChunksMsg(chunks, narratorId, null) : null;
 		const streaming = buildStreamingMsg({
+			...identityRef.current,
 			streamingBlocks: blocksRef.current,
 			toolChunksMsg,
 			narratorId,
