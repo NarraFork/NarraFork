@@ -452,7 +452,7 @@ export interface NarratorWSCallbacks {
 		data: PermissionRoutingFields & {
 			requestId: string;
 			toolUseId: string;
-			decision: "allow" | "deny" | "aborted";
+			decision: "allow" | "deny" | "aborted" | "failed";
 			reason?: string;
 		},
 	) => void;
@@ -479,7 +479,7 @@ export interface NarratorWSCallbacks {
 		data: PermissionRoutingFields & {
 			requestId: string;
 			toolUseId: string;
-			decision: "allow" | "deny" | "aborted";
+			decision: "allow" | "deny" | "aborted" | "failed";
 			reason?: string;
 			nextSteps?: string;
 		},
@@ -1097,7 +1097,7 @@ export function useNarratorWS(
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
-							decision: data.decision as "allow" | "deny" | "aborted",
+							decision: data.decision as "allow" | "deny" | "aborted" | "failed",
 							reason: data.reason as string | undefined,
 						});
 						break;
@@ -1127,7 +1127,7 @@ export function useNarratorWS(
 							...coercePermissionRoutingFields(data),
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
-							decision: data.decision as "allow" | "deny" | "aborted",
+							decision: data.decision as "allow" | "deny" | "aborted" | "failed",
 							reason: data.reason as string | undefined,
 							nextSteps: data.nextSteps as string | undefined,
 						});

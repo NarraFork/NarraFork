@@ -13,6 +13,7 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+	buildExitPlanReflectionDeniedToolResult,
 	buildReflectionFallbackMessage,
 	type ReflectionLoopObservation,
 	summarizeReflectionFailure,
@@ -130,19 +131,70 @@ describe("summarizeReflectionFailure", () => {
 });
 
 describe("buildReflectionFallbackMessage", () => {
-	test("leads with the gate name and carries the concrete cause", () => {
+	test("names a provider failure and gives actionable main-session guidance", () => {
 		const message = buildReflectionFallbackMessage(
 			"Danger reflection",
 			"provider error: 520 upstream unavailable",
 		);
-		expect(message).toBe(
-			"Danger reflection could not decide: provider error: 520 upstream unavailable",
-		);
+		expect(message).toContain("Operation safety check could not complete");
+		expect(message).toContain("model service request failed");
+		expect(message).toContain("not authorized to execute");
+		expect(message).toContain("request human handling");
 	});
 
-	test("falls back to the historical wording when no cause is known", () => {
+	test("unknown cause explains the decision ceiling and preserves task state", () => {
 		const message = buildReflectionFallbackMessage("taskReflection", undefined);
-		expect(message).toContain("taskReflection");
-		expect(message).toContain("did not reach a decision");
+		expect(message).toContain("at most two responses");
+		expect(message).toContain("original task status is preserved");
 	});
+
+	for (const locale of ["en", "zh-CN"] as const) {
+		test(`internal correction instructions never leak to the main session (${locale})`, () => {
+			const message = buildReflectionFallbackMessage(
+				"ExitPlanMode reflection",
+				"the Edit tool call was rejected: Tool Edit has no durable execution receipt; call ExitPlanRevise",
+				locale,
+			);
+			expect(message).not.toContain("ExitPlanRevise");
+			expect(message).not.toContain("durable execution receipt");
+			expect(message).toContain("ExitPlanMode");
+			expect(message).toContain(locale === "zh-CN" ? "计划尚未提交" : "plan was not submitted");
+			expect(message).toContain(
+				locale === "zh-CN" ? "不代表计划内容被否决" : "not a rejection of the plan's content",
+			);
+		});
+	}
+});
+
+describe("plan check failure is not a plan revision decision", () => {
+	for (const locale of ["en", "zh-CN"] as const) {
+		test(`a failed check preserves main-session retry guidance (${locale})`, () => {
+			const feedback = buildReflectionFallbackMessage(
+				"ExitPlanMode reflection",
+				"the Edit tool call was rejected",
+				locale,
+			);
+			const result = buildExitPlanReflectionDeniedToolResult(
+				{ action: "revise", feedback },
+				locale,
+				true,
+			);
+			expect(result.isError).toBe(true);
+			expect(result.output).toBe(feedback);
+			expect(result.output).not.toContain("ExitPlanRevise");
+			expect(result.output).not.toContain(
+				locale === "zh-CN" ? "请先修改计划" : "Revise the plan first",
+			);
+		});
+		test(`a substantive revision still carries concrete content feedback (${locale})`, () => {
+			const result = buildExitPlanReflectionDeniedToolResult(
+				{ action: "revise", feedback: "Add a cancellation test" },
+				locale,
+			);
+			expect(result.output).toContain("Add a cancellation test");
+			expect(result.output).toContain(
+				locale === "zh-CN" ? "请先修改计划" : "Revise the plan first",
+			);
+		});
+	}
 });

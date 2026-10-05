@@ -132,7 +132,7 @@ export type NarratorServerMessage =
 			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
-			decision: "allow" | "deny" | "aborted";
+			decision: "allow" | "deny" | "aborted" | "failed";
 			reason?: string;
 	  }
 	| {
@@ -168,7 +168,7 @@ export type NarratorServerMessage =
 			parentToolUseId?: string;
 			requestId: string;
 			toolUseId: string;
-			decision: "allow" | "deny" | "aborted";
+			decision: "allow" | "deny" | "aborted" | "failed";
 			reason?: string;
 			nextSteps?: string;
 	  }

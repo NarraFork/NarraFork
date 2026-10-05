@@ -23,6 +23,7 @@ export type TaskReflectionStatus =
 	| "awaiting_user"
 	| "confirmed"
 	| "cancelled"
+	| "failed"
 	| "aborted";
 
 export type TaskReflectionDecidedBy = "reflection" | "user";
@@ -173,7 +174,10 @@ function taskReflectionSuggestions(
 			requestId: pending.requestId,
 			startedAt: new Date(pending.startedAt).toISOString(),
 			mutations: pending.mutations,
-			...(status === "confirmed" || status === "cancelled" || status === "aborted"
+			...(status === "confirmed" ||
+			status === "cancelled" ||
+			status === "failed" ||
+			status === "aborted"
 				? { resolvedAt: new Date().toISOString() }
 				: {}),
 			...(reason ? { reason } : {}),
@@ -195,6 +199,8 @@ function statusReason(status: TaskReflectionStatus, reason?: string, nextSteps?:
 			return "Task reflection confirmed the protected task change";
 		case "cancelled":
 			return "Task reflection requested more work";
+		case "failed":
+			return "Task reflection failed before reaching a decision";
 		case "aborted":
 			return "Task reflection aborted";
 	}
@@ -253,7 +259,9 @@ async function markTaskReflectionStatus(
 					...(status !== "running" && status !== "awaiting_user"
 						? { permissionDecidedAt: new Date().toISOString() }
 						: {}),
-					...(status === "cancelled" || status === "aborted" ? { errorMessage: message } : {}),
+					...(status === "cancelled" || status === "failed" || status === "aborted"
+						? { errorMessage: message }
+						: {}),
 				})
 				.where(eq(narratorToolCalls.id, toolCallId));
 		}
@@ -306,7 +314,14 @@ async function markTaskReflectionStatus(
 				type: "task_reflection_resolved",
 				requestId: pending.requestId,
 				toolUseId: pending.toolUseId,
-				decision: status === "confirmed" ? "allow" : status === "aborted" ? "aborted" : "deny",
+				decision:
+					status === "confirmed"
+						? "allow"
+						: status === "failed"
+							? "failed"
+							: status === "aborted"
+								? "aborted"
+								: "deny",
 				reason: reason ?? message,
 				nextSteps,
 			});
@@ -402,11 +417,12 @@ export async function reviseTaskReflection(
 	feedback: string,
 	nextSteps?: string,
 	decidedBy: TaskReflectionDecidedBy = "reflection",
+	options?: { failed?: boolean },
 ): Promise<boolean> {
 	return resolveTaskReflection(
 		requestId,
 		{ action: "revise", feedback, nextSteps },
-		"cancelled",
+		options?.failed ? "failed" : "cancelled",
 		feedback,
 		nextSteps,
 		decidedBy,
