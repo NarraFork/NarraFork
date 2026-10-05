@@ -47,7 +47,8 @@ export function resolveAsyncQuestionHosts(
 	for (const [questionId, { toolId }] of newestByQuestion) {
 		const question = byId.get(questionId);
 		if (!question) continue;
-		result.delete(question.host);
+		if (question.slot.question?.status && question.slot.question.status !== "open") continue;
+		result.set(question.host, { ...question.slot, summaryOnly: true });
 		result.set(toolId, question.slot);
 	}
 	return result;

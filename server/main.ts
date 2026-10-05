@@ -90,6 +90,7 @@ import {
 import { ensureRootlessEnv } from "./services/container-service";
 import {
 	recoverOnStartup as recoverNarrators,
+	recoverPendingQuestionAnswerDeliveries,
 	restorePendingModelOverrides,
 } from "./services/narrator-session";
 import "./services/notification-service"; // Register notification event listeners
@@ -1409,6 +1410,12 @@ pluginManager
 		logger.error("Plugin manager initialization failed", { error: String(err) });
 	});
 
+function startQuestionAnswerRecovery(): void {
+	void recoverPendingQuestionAnswerDeliveries().catch((error) => {
+		logger.error("Pending question answer recovery failed", { error: String(error) });
+	});
+}
+
 // Read planned-update protection before generic cleanup can mutate process-owned rows. The
 // admission barrier covers generic recovery, browser-session handoff restoration, and mounting the
 // ordered continuation queue; terminal Agent/Await work and interactive permissions continue in
@@ -1439,6 +1446,7 @@ getPlannedUpdateStartupProtection()
 			plannedRecovery.completion
 				.then(() => {
 					startupReadiness.markReady();
+					startQuestionAnswerRecovery();
 					logger.info("Planned-update background continuation recovery completed");
 				})
 				.catch((err) => {
@@ -1446,6 +1454,8 @@ getPlannedUpdateStartupProtection()
 					startupReadiness.markFailed(error);
 					logger.error("Planned-update background continuation recovery failed", { error });
 				});
+		} else {
+			startQuestionAnswerRecovery();
 		}
 	})
 	.catch((err) => {

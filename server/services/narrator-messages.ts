@@ -73,6 +73,7 @@ import {
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
 import { deleteRecipientMessageRefs, updateRecipientMessageRef } from "./narrator-persistence";
+import { reconcileQuestionHistoryInTransaction } from "./narrator-question-history";
 import {
 	ensureRefsCoverMessage,
 	ensureRefsCoverSeq,
@@ -108,6 +109,23 @@ import { isTakenOverForDisplay, listDisplayTakenOverSubagents } from "./subagent
 import { toolEditPreviewColumns } from "./tool-edit-preview";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
+
+async function notifyQuestionHistoryAfterCommit(
+	narratorId: string,
+	questionIds: string[],
+): Promise<void> {
+	if (!questionIds.length) return;
+	try {
+		const { notifyQuestionHistoryChanged } = await import("./narrator-question-service");
+		await notifyQuestionHistoryChanged(narratorId, questionIds);
+	} catch (error) {
+		logger.warn("Committed question history notification deferred", {
+			narratorId,
+			error: String(error),
+		});
+		broadcastToNarrator(narratorId, { type: "full_reload", narratorId });
+	}
+}
 
 /** A scope is a choice, never permission to fall back to a broader writer. */
 async function revertForDeletedMessages(
@@ -922,6 +940,7 @@ async function deleteBlockSelection(
 	const removedRefMessageIds = planned.plans
 		.filter((plan) => plan.remaining.length === 0)
 		.map((plan) => plan.message.id);
+	let affectedQuestionIds: string[] = [];
 	const mutate = () =>
 		db.transaction((tx) => {
 			// Recheck refs, content, tool evidence and narrator version after async rollback.
@@ -933,6 +952,13 @@ async function deleteBlockSelection(
 					"HISTORY_DELETE_STALE",
 				);
 			}
+			affectedQuestionIds = reconcileQuestionHistoryInTransaction(tx, narratorId, {
+				deletedMessageIds: [...removedRefMessageIds, ...planned.derived.messageIds],
+				deletedToolBlocks: toolUses.filter(
+					(block): block is { messageId: string; toolUseId: string } =>
+						typeof block.toolUseId === "string",
+				),
+			}).affectedQuestionIds;
 			insertFileHistoryCheckpoints(tx, narratorId, planned.derived.checkpoints);
 			deleteOrphanedMessages(tx, planned.derived.messageIds);
 			for (const plan of planned.plans) {
@@ -957,6 +983,7 @@ async function deleteBlockSelection(
 		});
 	if (snapshotRevert) await commitSnapshotRevert(snapshotRevert, mutate);
 	else mutate();
+	await notifyQuestionHistoryAfterCommit(narratorId, affectedQuestionIds);
 
 	// Persisted block edits must reach already-open narrators. Broadcast the exact
 	// post-COW message row; a refresh remains the source of truth, while this keeps
@@ -1443,8 +1470,12 @@ async function deleteMessageRange(
 	inclusive: boolean,
 	opts?: BlockDeleteOptions,
 ) {
+	let affectedQuestionIds: string[] = [];
 	const apply = (tx: MessageTx, planned: ReturnType<typeof planMessageRangeDeletion>) => {
 		if (planned.refs.length === 0) return;
+		affectedQuestionIds = reconcileQuestionHistoryInTransaction(tx, narratorId, {
+			deletedMessageIds: planned.refs.map((ref) => ref.messageId),
+		}).affectedQuestionIds;
 		insertFileHistoryCheckpoints(tx, narratorId, planned.checkpoints);
 		deleteRecipientMessageRefs(tx)
 			.where(
@@ -1495,6 +1526,7 @@ async function deleteMessageRange(
 		);
 		revertWarnings = result.warnings ?? [];
 	}
+	await notifyQuestionHistoryAfterCommit(narratorId, affectedQuestionIds);
 	// Same retire rule as block delete: a removed Agent/Task card archives its subagent.
 	if (planned.derived.subagentNarratorIds.length > 0) {
 		const { archiveRetiredSubagents } = await import("./subagent-lifecycle");

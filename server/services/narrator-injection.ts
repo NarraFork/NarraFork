@@ -345,28 +345,38 @@ async function deliverInjectionUnlocked(
 	// `parentToolUseId` so it attaches to the tool card, and the self copy is stripped
 	// so the subagent's page reads it as a top-level row. Degrades to a single
 	// broadcast for a primary narrator, which is what this used to do unconditionally.
-	dualBroadcastToNarrator(
-		{
-			narratorId,
-			broadcastTargetId: options.subagent?.parentNarratorId ?? narratorId,
-			parentToolUseId: options.subagent?.parentToolUseId,
-		},
-		{
-			type: "message",
-			narratorId,
-			message: {
-				id: message.id,
+	try {
+		dualBroadcastToNarrator(
+			{
 				narratorId,
-				role: message.role,
-				contentJson: message.contentJson,
-				contentText: message.contentText,
-				createdAt: message.createdAt,
-				seq: message.seq,
-				parentToolUseId: options.subagent?.parentToolUseId ?? null,
-				children: [],
+				broadcastTargetId: options.subagent?.parentNarratorId ?? narratorId,
+				parentToolUseId: options.subagent?.parentToolUseId,
 			},
-		},
-	);
+			{
+				type: "message",
+				narratorId,
+				message: {
+					id: message.id,
+					narratorId,
+					role: message.role,
+					contentJson: message.contentJson,
+					contentText: message.contentText,
+					createdAt: message.createdAt,
+					seq: message.seq,
+					parentToolUseId: options.subagent?.parentToolUseId ?? null,
+					children: [],
+				},
+			},
+		);
+	} catch (error) {
+		// Persistence is already committed. A missing WS frame must not prevent the
+		// answer scheduler (or another producer) from supplying this durable event.
+		logger.warn("Injection notification deferred after persistence", {
+			narratorId,
+			messageId: message.id,
+			error: String(error),
+		});
+	}
 
 	const result: DeliverInjectionResult = {
 		messageId: message.id,

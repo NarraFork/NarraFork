@@ -23,6 +23,7 @@ import type { AsyncQuestion } from "../types/narrator";
 import {
 	applyAsyncQuestionChangeToList,
 	asyncQuestionsQueryKey,
+	readAsyncQuestionPush,
 	useAnswerAsyncQuestion,
 	useApplyAsyncQuestionChange,
 	useDismissAsyncQuestion,
@@ -103,6 +104,32 @@ async function withHook<T>(
 }
 
 describe("async-question real hook caches", () => {
+	it("ID-only frames invalidate all bounded pages and detail without replacing snapshots", async () => {
+		await withHook(
+			() => useApplyAsyncQuestionChange("n1"),
+			async (hook, qc) => {
+				qc.setQueryData(asyncQuestionsQueryKey("n1"), page([q("a")]));
+				const olderKey = [...asyncQuestionsQueryKey("n1"), "older", "cursor"];
+				qc.setQueryData(olderKey, { pages: [page([q("old")])], pageParams: ["cursor"] });
+				const detailKey = ["async-question-detail", "n1", "a"];
+				qc.setQueryData(detailKey, { question: q("a") });
+				const push = readAsyncQuestionPush({
+					questionId: "a",
+					narratorId: "n1",
+					status: "answered",
+				});
+				expect(push).not.toBeNull();
+				if (!push) throw new Error("Missing question push");
+				await act(async () => hook()("resolved", push));
+				expect(qc.getQueryData<ReturnType<typeof page>>(asyncQuestionsQueryKey("n1"))).toEqual(
+					page([q("a")]),
+				);
+				expect(qc.getQueryState(asyncQuestionsQueryKey("n1"))?.isInvalidated).toBe(true);
+				expect(qc.getQueryState(olderKey)?.isInvalidated).toBe(true);
+				expect(qc.getQueryState(detailKey)?.isInvalidated).toBe(true);
+			},
+		);
+	});
 	for (const change of [
 		"opened",
 		"answered",
@@ -110,6 +137,8 @@ describe("async-question real hook caches", () => {
 		"withdrawn",
 		"awaited",
 		"await_ended",
+		"resolved",
+		"supplemented",
 	] as const) {
 		it(`${change} reconciles the narrator page and invalidates even a hidden global inbox`, async () => {
 			await withHook(
@@ -118,7 +147,20 @@ describe("async-question real hook caches", () => {
 					qc.setQueryData(asyncQuestionsQueryKey("n1"), page(change === "opened" ? [] : [q("a")]));
 					qc.setQueryData(globalKey, page(change === "opened" ? [] : [q("a")]));
 					qc.setQueryData(["human-attention"], { pages: [{ items: [], nextCursor: null }] });
-					await act(async () => hook()(change, q("a", { awaited: change === "awaited" })));
+					await act(async () =>
+						hook()(
+							change,
+							q("a", {
+								awaited: change === "awaited",
+								status:
+									change === "answered" || change === "dismissed" || change === "withdrawn"
+										? change
+										: change === "resolved" || change === "supplemented"
+											? "answered"
+											: "open",
+							}),
+						),
+					);
 					const keep = ["opened", "awaited", "await_ended"].includes(change);
 					expect(qc.getQueryData(asyncQuestionsQueryKey("n1"))).toMatchObject({
 						openCount: keep ? 1 : 0,
@@ -276,6 +318,8 @@ for (const [name, useList] of [
 								expect(updates).toEqual([
 									{ type: "awaitedQuestion", awaited: change === "awaited", questionId: "a" },
 								]);
+							// An unopened narrator cache is not manufactured from a single WS frame.
+							expect(qc.getQueryData(asyncQuestionsQueryKey("n1"))).toBeUndefined();
 							expect(qc.getQueryState(globalKey)?.isInvalidated).toBe(true);
 						},
 					);

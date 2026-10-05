@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
+	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
 	narratorQuestions,
@@ -39,6 +40,9 @@ const adapter = {
 		throw new Error("Question principal test must not contact a model");
 	},
 	formatToolResult: () => ({}),
+	pushUserTurn: () => {},
+	pushAssistantTurn: () => {},
+	generate: async () => "",
 } as unknown as ProviderAdapter;
 const unregister = provider.registerExternalProviderResolver((name) =>
 	name === "questionprincipal" ? adapter : null,
@@ -82,6 +86,7 @@ beforeEach(() => {
 				cwd: process.env.HOME,
 				ownerUserId: A,
 				status: "idle",
+				lastStopReason: "normal",
 				autoContinuationOverride: "off",
 				type: id === CHILD ? "subagent" : "primary",
 				variant: id === CHILD ? "subagent:general" : "primary",
@@ -180,6 +185,129 @@ async function seedChildQuestion(principal: string | null): Promise<{ record: { 
 }
 
 describe("late async answers retain their durable execution principal", () => {
+	test("receipt arriving after the prebuilt child packet reaches actual provider.chat before adoption", async () => {
+		activeNarrators.set(PARENT, parentActive(A));
+		const question = await seedChildQuestion(A);
+		// A fork/compressed packet may intentionally omit a parent's old receipt.
+		// Its COW row remains background, not a newly delivered child question.
+		const foreignText =
+			'{"answerMessageId":"foreign-receipt","answer":"COMPRESSED_PARENT_BACKGROUND"}';
+		db.insert(narratorMessages)
+			.values({
+				id: "foreign-receipt",
+				narratorId: PARENT,
+				role: "user",
+				origin: "user",
+				createdBy: C,
+				contentText: foreignText,
+				contentJson: [
+					{
+						type: "system_injection",
+						source: "async_question_answers",
+						modelText: foreignText,
+						body: {
+							kind: "asyncQuestionAnswers",
+							questionId: "foreign-question",
+							answerMessageId: "foreign-receipt",
+							outcome: "answered",
+							items: [{ header: "Parent choice", answer: "COMPRESSED_PARENT_BACKGROUND" }],
+						},
+					},
+				],
+				createdAt: new Date().toISOString(),
+			})
+			.run();
+		db.insert(narratorMessageRefs)
+			.values({ id: "foreign-child-ref", narratorId: CHILD, messageId: "foreign-receipt", seq: 2 })
+			.run();
+		db.update(narrators).set({ nextSeq: 2 }).where(eq(narrators.id, CHILD)).run();
+		spyOn(devices, "getSessionDevices").mockResolvedValue([]);
+		spyOn(knowledgeInjection, "resolveInjections").mockResolvedValue([]);
+		spyOn(sessionService, "startBackgroundCompletionContinuationIfPossible").mockResolvedValue({
+			started: false,
+		});
+		const prepared = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const requests: Array<{
+			history: unknown;
+			content: string;
+			userId: string | null | undefined;
+			adopted: string[];
+		}> = [];
+		const originalBuild = adapter.buildHistory.bind(adapter);
+		let builds = 0;
+		spyOn(adapter, "buildHistory").mockImplementation(async (...args) => {
+			const snapshot = await originalBuild(...args);
+			if (++builds === 1) {
+				snapshot.history = snapshot.history.filter(
+					(entry) => !JSON.stringify(entry).includes("COMPRESSED_PARENT_BACKGROUND"),
+				);
+				expect(JSON.stringify(snapshot)).not.toContain("LATE_AFTER_PREBUILT");
+				prepared.resolve();
+				await release.promise;
+			}
+			return snapshot;
+		});
+		spyOn(adapter, "pushUserTurn").mockImplementation((history, content, _model, results) => {
+			history.push({ role: "user", content, toolResults: results });
+		});
+		spyOn(adapter, "pushAssistantTurn").mockImplementation(() => {});
+		spyOn(adapter, "chat").mockImplementation(async function* (params) {
+			params.onRequestStart?.();
+			const active = activeNarrators.get(CHILD);
+			requests.push({
+				history: JSON.parse(JSON.stringify(params.history)),
+				content: params.content,
+				userId: active?._currentUserId,
+				adopted: Array.from(active?._questionAnswerAdoptedMessageIds ?? []),
+			});
+			yield { text: "receipt applied" };
+		});
+		const { resumeSubagent } = await import("../subagent-resume");
+		const resumed = resumeSubagent({
+			subagentId: CHILD,
+			intent: "follow_up",
+			actor: "user",
+			prompt: "OLD_PREBUILT_PACKET",
+			createdBy: A,
+			locale: "en",
+		});
+		await prepared.promise;
+		const answer = await questions.answerAsyncQuestion(question.record.id, {
+			answers: { q: "LATE_AFTER_PREBUILT" },
+			userId: C,
+			locale: "en",
+		});
+		if (!answer.ok || !answer.record.answerMessageId) throw new Error("answer failed");
+		expect(
+			activeNarrators
+				.get(CHILD)
+				?._questionAnswerAdoptedMessageIds?.has(answer.record.answerMessageId),
+		).not.toBe(true);
+		release.resolve();
+		const outcome = await resumed;
+		await outcome.terminalCompletion;
+		expect(requests).toHaveLength(1);
+		const packet = JSON.stringify({ history: requests[0].history, content: requests[0].content });
+		expect(packet.split("LATE_AFTER_PREBUILT")).toHaveLength(2);
+		expect(packet).toContain("OLD_PREBUILT_PACKET");
+		expect(packet).not.toContain("COMPRESSED_PARENT_BACKGROUND");
+		expect(packet).toContain('kind=\\"human\\"');
+		expect(packet).toContain(`id=\\"${C}\\"`);
+		expect(requests[0].userId).toBe(A);
+		expect(requests[0].adopted).toEqual([answer.record.answerMessageId]);
+		const readReceipt = () =>
+			db
+				.select({ adoptedAt: narratorBufferedMessages.currentAdoptedAt })
+				.from(narratorBufferedMessages)
+				.where(
+					eq(narratorBufferedMessages.recipientMessageId, answer.record.answerMessageId as string),
+				)
+				.get();
+		for (let attempt = 0; attempt < 20 && !readReceipt()?.adoptedAt; attempt++)
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		expect(readReceipt()?.adoptedAt).toBeTruthy();
+	});
 	for (const scenario of cases)
 		test(scenario.name, async () => {
 			activeNarrators.set(PARENT, parentActive(A));

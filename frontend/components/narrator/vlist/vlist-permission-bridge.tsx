@@ -32,6 +32,7 @@ import type {
 } from "../narrator-panel-types";
 import { InlinePermission } from "../permission/InlinePermission";
 import { AskUserQuestionBanner, coerceQuestions } from "../question/AskUserQuestionBanner";
+import { AsyncQuestionDetail, AsyncQuestionSummary } from "../question/AsyncQuestionDetail";
 import {
 	decidePermissionSlot,
 	findPendingForKey,
@@ -240,6 +241,11 @@ export function usePermissionSlots({
  * that is not running.
  */
 export function buildAsyncQuestionNode(slot: AsyncQuestionSlot): ReactNode {
+	if (slot.question) {
+		if (slot.summaryOnly || slot.question.status !== "open" || slot.readOnly)
+			return <AsyncQuestionSummary question={slot.question} readOnly={slot.readOnly} />;
+		return <AsyncQuestionDetail narratorId={slot.question.narratorId} questionId={slot.id} />;
+	}
 	if (slot.questions.length === 0) return null;
 	const banner = (
 		<AskUserQuestionBanner

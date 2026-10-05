@@ -242,30 +242,33 @@ describe("Await question result wording", () => {
 		expect(text).toContain("no answer recorded");
 	});
 
-	test("a timeout tells the agent the question is still open and it may proceed", () => {
+	test("a timeout ends only the wait and does not select a default", () => {
 		const text = formatQuestionResult(QUESTION_ID, "timeout", record);
 		expect(text.toLowerCase()).toContain("still open");
-		// Both escape routes have to be spelled out, or the agent tends to re-await in a
-		// tight loop rather than continuing with its default.
-		expect(text.toLowerCase()).toContain("default");
+		expect(text.toLowerCase()).not.toContain("default");
+		expect(text).toContain("Question action=get");
 		expect(text).toContain("Await again");
 	});
 
-	test("a dismissal tells the agent to decide, and not to ask again", () => {
+	test("a dismissal reports no selected answer without inventing permission to proceed", () => {
 		const text = formatQuestionResult(QUESTION_ID, "dismissed", record);
-		expect(text.toLowerCase()).toContain("own");
-		expect(text.toLowerCase()).toContain("do not ask again");
+		expect(text).toContain("No answer was selected");
+		expect(text).toContain("Question action=get");
+		expect(text.toLowerCase()).not.toContain("best judgement");
+		expect(text.toLowerCase()).not.toContain("do not ask again");
 	});
 
 	test("a withdrawal makes clear no answer is coming", () => {
 		const text = formatQuestionResult(QUESTION_ID, "withdrawn", record);
-		expect(text.toLowerCase()).toContain("no answer is coming");
+		expect(text.toLowerCase()).toContain("no further answer is pending");
 	});
 
-	test("an interrupted wait leaves the question open without inviting an immediate retry loop", () => {
+	test("an interrupted wait preserves the question and asks for its current status", () => {
 		const text = formatQuestionResult(QUESTION_ID, "aborted", record);
-		expect(text.toLowerCase()).toContain("still open");
+		expect(text.toLowerCase()).toContain("remains stored");
 		expect(text.toLowerCase()).toContain("interrupted");
+		expect(text).toContain("Question action=get");
+		expect(text.toLowerCase()).not.toContain("default");
 	});
 });
 

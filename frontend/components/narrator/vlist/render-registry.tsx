@@ -15,8 +15,10 @@
 
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
+import type { SideCarBody } from "@shared/sidecar-body";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import type { MeasuredElement } from "./prepared-block";
+import { QuestionEventAction } from "./QuestionEventAction";
 import type { VListElementKind } from "./registry";
 import {
 	type AskInPassingPendingInteraction,
@@ -379,7 +381,14 @@ export function renderElement(
 					compactProgressIsSegment={extra.compactProgressIsSegment as boolean | undefined}
 				/>
 			);
-		case "system-text":
+		case "system-text": {
+			const eventData = extra.data as
+				| {
+						questionReference?: { narratorId?: string | null; questionId?: string };
+						questionSnapshot?: Extract<SideCarBody, { kind: "asyncQuestionAnswers" }>;
+				  }
+				| undefined;
+			const reference = eventData?.questionReference;
 			return (
 				<RenderSystemText
 					measured={m}
@@ -388,8 +397,18 @@ export function renderElement(
 					actions={extra.specCarryoverActions as never}
 					errorActions={extra.errorNoticeActions as never}
 					injectionGuardActions={extra.injectionGuardActions as never}
+					headerAction={
+						reference?.narratorId && reference.questionId ? (
+							<QuestionEventAction
+								viewingNarratorId={extra.narratorId as string | undefined}
+								reference={{ narratorId: reference.narratorId, questionId: reference.questionId }}
+								snapshot={eventData?.questionSnapshot}
+							/>
+						) : undefined
+					}
 				/>
 			);
+		}
 		case "knowledge-hint":
 			return <RenderSystemList measured={m} onOpenEntry={extra.onOpenEntry as never} />;
 		case "plan-card":

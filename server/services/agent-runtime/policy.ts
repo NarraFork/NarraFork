@@ -44,6 +44,7 @@ const READ_TOOLS = Object.freeze([
 	BASH_TOOL_NAME,
 	"TeamStatus",
 	"Await",
+	"Question",
 	"ContextAsk",
 	"Send",
 ]);
@@ -53,6 +54,7 @@ const SEARCH_TOOLS = Object.freeze([
 	"WebFetch",
 	"TeamStatus",
 	"Await",
+	"Question",
 	"ContextAsk",
 	"Send",
 ]);
@@ -147,6 +149,7 @@ export function isRuntimeToolAllowed(
 	mcpBehavior?: string | null,
 ): boolean {
 	const caps = policy.capabilities;
+	if (toolName === "Question") return caps.awaitOwnQuestion;
 	if (toolName === "AskUserQuestion" && caps.askUserQuestion === "disabled") return false;
 	if (["Agent", "Task", "ContinueTask", "ForkNarrator"].includes(toolName) && !caps.spawnAgent)
 		return false;

@@ -16,6 +16,7 @@ import {
 	acknowledgePipelineExitConfirmation,
 	clearPipelineStateIfActive,
 } from "../../lib/agent/pipeline-state";
+import { modelInputContainsText } from "../../lib/agent/question-model-input";
 import { projectMessageSenderText } from "../../lib/agent/sender-projection";
 import { detectShell } from "../../lib/agent/shell";
 import { getMissingWorkingDirectoryRecovery, SHELL_TOOL_NAME } from "../../lib/agent/tools/bash";
@@ -140,6 +141,7 @@ import {
 	buildSystemPrompt,
 	cleanupPartialMessage,
 	completeOrphanedToolCalls,
+	consumeQuestionAnswerModelReceipts,
 	drainAndPersistPendingInjections,
 	drainInjectionsIntoHistory,
 	ensureSkillCacheFreshForActiveNarrator,
@@ -233,7 +235,7 @@ import {
 	isForegroundTurnInterrupted,
 	resetForegroundTurn,
 } from "./control";
-import { buildRuntimeHistory } from "./history";
+import { buildRuntimeHistory, questionModelReceipts } from "./history";
 import { createRuntimeRunState, type RuntimeProfile, type RuntimeRunOutcome } from "./input";
 import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
 import { resolveRuntimePolicy } from "./policy";
@@ -397,6 +399,12 @@ export async function runAgentLoopUnlocked(
 			userId: active._currentUserId,
 			replyInUserLanguage: active._replyInUserLanguage,
 		});
+		// A legitimately admitted run is an explicit recovery from a previous stop.
+		if (!active.abortController.signal.aborted)
+			db.update(narrators)
+				.set({ lastStopReason: "normal" })
+				.where(eq(narrators.id, narratorId))
+				.run();
 		const initNarrator = await narratorService.getById(narratorId);
 		if (
 			profile.kind === "primary" &&
@@ -551,6 +559,10 @@ export async function runAgentLoopUnlocked(
 			// Always use getModelHistorySinceLastCompact: if no compact marker exists it
 			// returns all messages; after a compact it only returns post-compact messages
 			// (old context is already in the summary injected via system prompt).
+			// Materialize queued receipts before building history. They then enter this
+			// request exactly once through normal history adoption (including subagents).
+			if (!active.abortController.signal.aborted)
+				await drainAndPersistPendingInjections(active, subagentPlacement);
 			const rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId);
 			// History below is rebuilt from the latest post-compact messages, so any
 			// pending-compact guard set by a background compact can be released here.
@@ -668,6 +680,9 @@ export async function runAgentLoopUnlocked(
 				currentInput: runState.input.text,
 			});
 			let { history, trailingToolResults } = preparedHistory;
+			let initialQuestionReceiptText = "";
+			const receipts = questionModelReceipts(preparedHistory.modelMessages);
+			active._questionAnswerModelReceipts = new Map(receipts.map(({ id, text }) => [id, text]));
 			// The caller's history was formatted using its initial model. A parent or
 			// manual change can select another protocol before this first pass starts.
 			// Never overwrite the freshly rebuilt history with that obsolete snapshot.
@@ -680,6 +695,26 @@ export async function runAgentLoopUnlocked(
 			if (usesInitialHistory && profile.kind === "subagent") {
 				history = profile.initialHistory;
 				trailingToolResults = profile.initialTrailingToolResults ?? [];
+				// The runner prepared this packet before this pass's mailbox drain.
+				// Retain compressed/fork context and caller principal, but merge any
+				// newly persisted user receipts that packet could not have included.
+				const ownedReceiptIds = new Set(
+					preparedHistory.modelMessages
+						.filter((message) => message.narratorId === narratorId)
+						.map((message) => message.id),
+				);
+				const missing = receipts.filter(
+					({ id, text }) =>
+						ownedReceiptIds.has(id) &&
+						!modelInputContainsText(
+							[history, profile.initialCurrentText ?? preparedHistory.currentInputText],
+							text,
+						),
+				);
+				// Fold these into the current user packet, not history: inserting a
+				// user turn before initialTrailingToolResults would break providers
+				// requiring tool_result immediately after its assistant tool_use.
+				initialQuestionReceiptText = missing.map(({ text }) => text).join("\n\n");
 			}
 			runState.firstPass = false;
 
@@ -729,6 +764,10 @@ export async function runAgentLoopUnlocked(
 						? await profile.rebuildSystemPrompt(freshNarrator.contextSummary)
 						: profile.systemPrompt
 					: freshSystemPrompt;
+			const { buildPendingQuestionHint } = await import("../narrator-question-service");
+			const pendingQuestionHint = await buildPendingQuestionHint(narratorId);
+			if (pendingQuestionHint)
+				active.systemPrompt = `${active.systemPrompt ?? ""}\n\n${pendingQuestionHint}`;
 			await storeRuntimeCharacters({
 				systemChars: countRuntimeSystemCharacters(
 					active.systemPrompt,
@@ -814,7 +853,8 @@ export async function runAgentLoopUnlocked(
 						await storeRuntimeCharacters({
 							systemChars: countRuntimeSystemCharacters(prompt, freshNarrator.contextSummary),
 						});
-						return prompt;
+						const hint = await buildPendingQuestionHint(narratorId);
+						return hint ? `${prompt}\n\n${hint}` : prompt;
 					}
 					const freshOAuthRuntime = await assertOAuthNarratorRuntimeActive(
 						narratorId,
@@ -851,7 +891,8 @@ export async function runAgentLoopUnlocked(
 					// NOTE: Do NOT set active.systemPrompt here — the returned value
 					// flows through onBeforeTurn → loop.ts which updates config.systemPrompt.
 					// Setting active.systemPrompt would create a second source of truth.
-					return prompt;
+					const hint = await buildPendingQuestionHint(narratorId);
+					return hint ? `${prompt}\n\n${hint}` : prompt;
 				},
 			});
 
@@ -1411,7 +1452,17 @@ export async function runAgentLoopUnlocked(
 					// close the window so later tool calls in the same turn cannot write the fence.
 					clearBehaviorFenceEditGrant(narratorId);
 				},
-				onModelInputConsumed: consumeAgentMessageHistory,
+				getQuestionModelReceipts: () =>
+					Array.from(active._questionAnswerModelReceipts ?? [], ([id, text]) => ({ id, text })),
+				onModelInputConsumed: (history, content, answerEventIds) => {
+					consumeAgentMessageHistory(history, content);
+					// DB presence and Await completion are only candidates. The loop
+					// confirms the IDs actually supplied after projection/compaction.
+					active._questionAnswerAdoptedMessageIds = new Set(answerEventIds);
+					consumeQuestionAnswerModelReceipts(narratorId, active._questionAnswerAdoptedMessageIds);
+					for (const id of answerEventIds ?? [])
+						active._questionAnswerFallbackMessageIds?.delete(id);
+				},
 				getAfterToolsInjections: () =>
 					drainInjectionsIntoHistory(active, locale, subagentPlacement),
 				deliverInjectionRow: async (injection) => {
@@ -1601,6 +1652,8 @@ export async function runAgentLoopUnlocked(
 				usesInitialHistory && profile.kind === "subagent"
 					? (profile.initialCurrentText ?? preparedHistory.currentInputText)
 					: preparedHistory.currentText;
+			if (initialQuestionReceiptText)
+				effectiveText = [effectiveText, initialQuestionReceiptText].filter(Boolean).join("\n\n");
 			const _isPureToolResultReplay = !effectiveText.trim() && trailingToolResults.length > 0;
 
 			// Passive knowledge injection (point A): when this turn carries real user text,
@@ -3377,9 +3430,11 @@ export async function runAgentLoopUnlocked(
 			? `${finalText.trim()}\n\n${continuationStopNote}`
 			: continuationStopNote;
 	}
+	if (runState.hadError && !active.abortController.signal.aborted)
+		db.update(narrators).set({ lastStopReason: "error" }).where(eq(narrators.id, narratorId)).run();
 	return {
 		started: true,
-		allowInboxWake: !runState.hadError,
+		allowInboxWake: !runState.hadError && !active.abortController.signal.aborted,
 		finalText,
 		hasError: runState.hadError,
 		aborted: runState.wasInterrupted,

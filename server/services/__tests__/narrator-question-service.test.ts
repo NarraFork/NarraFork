@@ -16,7 +16,13 @@
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { narratorMessages, narrators, narratorToolCalls, users } from "../../db/schema";
+import {
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	users,
+} from "../../db/schema";
 
 // The shared migrated test database, not a hand-rolled subset.
 //
@@ -58,7 +64,15 @@ const {
 	answerAsyncQuestion,
 	awaitAsyncQuestion,
 	countOpenAsyncQuestions,
-	createAsyncQuestion,
+	createAsyncQuestion: createQuestionRecord,
+	resolveAsyncQuestion,
+	supplementAsyncQuestion,
+	getBoundedQuestionDetail,
+	listQuestionSummaries,
+	buildPendingQuestionHint,
+	getBoundedQuestionReceipt,
+	retryQuestionAnswerDelivery,
+	notifyQuestionHistoryChanged,
 	dismissAsyncQuestion,
 	getAsyncQuestion,
 	isAsyncQuestionAwaited,
@@ -66,6 +80,12 @@ const {
 	setQuestionServiceSeam,
 	withdrawAsyncQuestions,
 } = await import("../narrator-question-service");
+
+const createAsyncQuestion = (args: Parameters<typeof createQuestionRecord>[0]) =>
+	createQuestionRecord({
+		context: "API cache decision; continue implementation with local cache while waiting.",
+		...args,
+	});
 
 const NARRATOR_ID = "async-q-narrator";
 const OTHER_NARRATOR_ID = "async-q-other-narrator";
@@ -110,6 +130,7 @@ const previousScheduler = setInjectionScheduler({
 });
 setQuestionServiceSeam({
 	isLoopRunning: () => loopRunning,
+	scheduleQuestionAnswerDelivery: async () => ({ ready: true, started: false }),
 	deliverInjection: async (narratorId, options) => {
 		injections.push({
 			narratorId,
@@ -148,6 +169,378 @@ async function seedToolCall(
 	});
 	return { toolCallId, toolUseId };
 }
+
+describe("question lifecycle closure", () => {
+	test("canonical IDs preserve answers and notes when another title names that ID", async () => {
+		for (const partial of [false, true]) {
+			const call = await seedToolCall();
+			const { record } = await createAsyncQuestion({
+				narratorId: NARRATOR_ID,
+				...call,
+				questions: [
+					{ id: "q1", header: "q2", options: [{ header: "A" }] },
+					{ id: "q2", header: "Second", options: [{ header: "B" }] },
+				],
+			});
+			const result = await answerAsyncQuestion(record.id, {
+				answers: partial ? { q2: "B" } : { q1: "A", q2: "B" },
+				annotations: { q2: { notes: "Second question only" } },
+			});
+			expect(result.ok).toBe(true);
+			const body = injections.at(-1)?.body as {
+				items: { questionId: string; answer: string; answerProvided: boolean; notes?: string }[];
+			};
+			expect(body.items[0]).toMatchObject({
+				questionId: "q1",
+				answer: partial ? "" : "A",
+				answerProvided: !partial,
+			});
+			expect(body.items[0].notes).toBeUndefined();
+			expect(body.items[1]).toMatchObject({
+				questionId: "q2",
+				answer: "B",
+				notes: "Second question only",
+			});
+		}
+	});
+	test("new async requires context, user-deferred remains compatible, and UTF-8 budgets apply", async () => {
+		const call = await seedToolCall();
+		await expect(
+			createQuestionRecord({ narratorId: NARRATOR_ID, ...call, questions: QUESTIONS }),
+		).rejects.toThrow("context");
+		await expect(
+			createQuestionRecord({
+				narratorId: NARRATOR_ID,
+				...call,
+				questions: QUESTIONS,
+				context: "中".repeat(700),
+			}),
+		).rejects.toThrow("2048");
+		const result = await createQuestionRecord({
+			narratorId: NARRATOR_ID,
+			...call,
+			questions: QUESTIONS,
+			origin: "user_deferred",
+		});
+		expect(result.record.context).toBeNull();
+	});
+	test("a partial batch answer keeps every original topic and identifies omitted answers", async () => {
+		const call = await seedToolCall();
+		const { record } = await createAsyncQuestion({
+			narratorId: NARRATOR_ID,
+			...call,
+			questions: [
+				{ id: "one", header: "First", options: [{ header: "A", description: "First meaning" }] },
+				{
+					id: "two",
+					header: "Second",
+					options: [{ header: "B", description: "Second meaning after compression" }],
+				},
+			],
+		});
+		expect((await answerAsyncQuestion(record.id, { answers: { one: "A" } })).ok).toBe(true);
+		const body = injections[0].body as { items: { questionId: string; answerProvided: boolean }[] };
+		expect(body.items.map((item) => [item.questionId, item.answerProvided])).toEqual([
+			["one", true],
+			["two", false],
+		]);
+		expect(injections[0].content).toContain("Second meaning after compression");
+	});
+	test("a fork sharing the asked prefix never receives a late answer via original SDK/tool input", async () => {
+		const call = await seedToolCall();
+		const input = { async: true, context: "Cache choice before the fork", questions: QUESTIONS };
+		const sdk = JSON.stringify([
+			{ type: "tool_use", id: call.toolUseId, name: "AskUserQuestion", input },
+		]);
+		const originalInput = JSON.stringify(input);
+		sqlite.query("UPDATE narrator_messages SET content_json = ? WHERE id = ?").run(sdk, MESSAGE_ID);
+		sqlite
+			.query("UPDATE narrator_tool_calls SET input_json = ? WHERE id = ?")
+			.run(originalInput, call.toolCallId);
+		await testDb.insert(narratorMessageRefs).values([
+			{ id: "original-prefix-ref", narratorId: NARRATOR_ID, messageId: MESSAGE_ID, seq: 1 },
+			{ id: "fork-prefix-ref", narratorId: OTHER_NARRATOR_ID, messageId: MESSAGE_ID, seq: 1 },
+		]);
+		sqlite
+			.query("UPDATE narrators SET next_seq = 2 WHERE id IN (?, ?)")
+			.run(NARRATOR_ID, OTHER_NARRATOR_ID);
+		const { record } = await createAsyncQuestion({
+			narratorId: NARRATOR_ID,
+			...call,
+			questions: QUESTIONS,
+			context: input.context,
+		});
+		const answer = await answerAsyncQuestion(record.id, {
+			answers: { "cache-layer": "LATE_PRIVATE_ANSWER" },
+			userId: "user-1",
+		});
+		expect(answer.ok).toBe(true);
+		const sharedInput = sqlite
+			.query<{ input_json: string }, [string]>(
+				"SELECT input_json FROM narrator_tool_calls WHERE id = ?",
+			)
+			.get(call.toolCallId);
+		expect(sharedInput?.input_json).toBe(originalInput);
+		const forkHistory = sqlite
+			.query<{ content_json: string; role: string }, [string]>(
+				"SELECT m.content_json, m.role FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = ? ORDER BY r.seq",
+			)
+			.all(OTHER_NARRATOR_ID);
+		expect(forkHistory).toHaveLength(1);
+		expect(forkHistory[0].content_json).toBe(sdk);
+		expect(JSON.stringify(forkHistory)).not.toContain("LATE_PRIVATE_ANSWER");
+		expect(
+			sqlite
+				.query<{ n: number }, [string]>(
+					"SELECT count(*) AS n FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = ? AND m.role='user'",
+				)
+				.get(NARRATOR_ID)?.n,
+		).toBe(1);
+	});
+	test("prototype-looking frozen IDs preserve answers and notes across storage", async () => {
+		const call = await seedToolCall();
+		const { record } = await createAsyncQuestion({
+			narratorId: NARRATOR_ID,
+			...call,
+			questions: [{ id: "__proto__", header: "Prototype-looking ID", options: [] }],
+		});
+		const answered = await answerAsyncQuestion(record.id, {
+			answers: { "Prototype-looking ID": "Safe answer" },
+			annotations: { "Prototype-looking ID": { notes: "Safe notes" } },
+		});
+		expect(answered.ok).toBe(true);
+		const stored = await getAsyncQuestion(record.id);
+		expect(Object.hasOwn(stored?.answers ?? {}, "__proto__")).toBe(true);
+		expect(stored?.answers?.["__proto__"]).toBe("Safe answer");
+		expect(stored?.annotations?.["__proto__"]?.notes).toBe("Safe notes");
+	});
+	test("history notification processes beyond 200 IDs and releases a physically deleted waiter", async () => {
+		const call = await seedToolCall();
+		const { record } = await createAsyncQuestion({
+			narratorId: NARRATOR_ID,
+			...call,
+			questions: QUESTIONS,
+		});
+		const waiting = awaitAsyncQuestion({
+			questionId: record.id,
+			narratorId: NARRATOR_ID,
+			timeoutMs: 1000,
+		});
+		await Bun.sleep(5);
+		sqlite.query("DELETE FROM narrator_questions WHERE id = ?").run(record.id);
+		broadcasts = [];
+		await notifyQuestionHistoryChanged(NARRATOR_ID, [
+			...Array.from({ length: 205 }, (_, index) => `removed-${index}`),
+			record.id,
+		]);
+		const result = await waiting;
+		expect(result.status).toBe("withdrawn");
+		expect(broadcasts.filter((event) => event.change === "withdrawn")).toHaveLength(206);
+		expect(isAsyncQuestionAwaited(record.id)).toBe(false);
+	});
+	test("supplement backfills a legacy original event and its processing note", async () => {
+		const call = await seedToolCall();
+		const { record } = await createAsyncQuestion({
+			narratorId: NARRATOR_ID,
+			...call,
+			questions: QUESTIONS,
+		});
+		const answer = await answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } });
+		if (!answer.ok || !answer.record.answerMessageId) throw new Error("answer failed");
+		sqlite.query("DELETE FROM narrator_question_events WHERE question_id = ?").run(record.id);
+		await resolveAsyncQuestion({
+			id: record.id,
+			narratorId: NARRATOR_ID,
+			answerMessageId: answer.record.answerMessageId,
+			note: "Original legacy handling",
+		});
+		expect((await supplementAsyncQuestion(record.id, { text: "Actually memory" })).ok).toBe(true);
+		const detail = await getBoundedQuestionDetail(record.id);
+		expect(detail.events.map((event) => event.kind)).toEqual(["answer", "supplement"]);
+		expect(detail.events[0].messageId).toBe(answer.record.answerMessageId);
+		expect(detail.events[0].resolution?.note).toBe("Original legacy handling");
+		expect(detail.record?.answers).toEqual({ "cache-layer": "Redis" });
+	});
+	test("full inbox releases Await with a bounded receipt fallback and retry never duplicates messages", async () => {
+		const call = await seedToolCall();
+		const { record } = await createAsyncQuestion({
+			narratorId: NARRATOR_ID,
+			...call,
+			questions: QUESTIONS,
+		});
+		let ready = false;
+		let attempts = 0;
+		const previous = setQuestionServiceSeam({
+			isLoopRunning: () => true,
+			broadcastToNarrator: () => {},
+			deliverInjection,
+			scheduleQuestionAnswerDelivery: async () => {
+				attempts++;
+				return { ready, started: false };
+			},
+		});
+		try {
+			const waiting = awaitAsyncQuestion({
+				questionId: record.id,
+				narratorId: NARRATOR_ID,
+				timeoutMs: 500,
+			});
+			await Bun.sleep(5);
+			const answer = await answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } });
+			const result = await waiting;
+			if (result.status === "not_found") throw new Error("Question waiter lost its own record.");
+			expect(result.status).toBe("answered");
+			expect(result.record?.receiptReady).toBe(false);
+			if (!answer.ok || !answer.record.answerMessageId) throw new Error("answer failed");
+			expect(await getBoundedQuestionReceipt(answer.record.answerMessageId, NARRATOR_ID)).toContain(
+				"Redis",
+			);
+			ready = true;
+			expect((await retryQuestionAnswerDelivery(NARRATOR_ID, record.id)).ready).toBe(true);
+			expect(attempts).toBe(2);
+			expect(
+				sqlite.query("SELECT count(*) AS n FROM narrator_messages WHERE role='user'").get(),
+			).toEqual({ n: 1 });
+		} finally {
+			setQuestionServiceSeam(previous);
+		}
+	});
+	test("oversized snapshots and answers reject before changing state; legacy detail stays bounded", async () => {
+		const call = await seedToolCall();
+		await expect(
+			createAsyncQuestion({
+				narratorId: NARRATOR_ID,
+				...call,
+				questions: [
+					{
+						id: "q",
+						header: "Question",
+						options: [{ header: "Artifact", preview: "x".repeat(64 * 1024) }],
+					},
+				],
+			}),
+		).rejects.toThrow("snapshot");
+		const { record } = await createAsyncQuestion({
+			narratorId: NARRATOR_ID,
+			...call,
+			questions: QUESTIONS,
+		});
+		await expect(
+			answerAsyncQuestion(record.id, { answers: { "cache-layer": "x".repeat(16 * 1024) } }),
+		).rejects.toThrow("answers");
+		expect((await getAsyncQuestion(record.id))?.status).toBe("open");
+		sqlite
+			.query("UPDATE narrator_questions SET questions_json = ? WHERE id = ?")
+			.run(
+				JSON.stringify([{ id: "historical question id with spaces", header: "Legacy" }]),
+				record.id,
+			);
+		expect((await getBoundedQuestionDetail(record.id)).record?.questions[0].id).toBe(
+			"historical question id with spaces",
+		);
+		sqlite.query("UPDATE narrator_questions SET questions_json = ? WHERE id = ?").run(
+			JSON.stringify([
+				{ id: "a", header: "Same" },
+				{ id: "b", header: "Same" },
+			]),
+			record.id,
+		);
+		await expect(
+			answerAsyncQuestion(record.id, { answers: { Same: "ambiguous" } }),
+		).rejects.toThrow("ambiguous");
+		sqlite.query("UPDATE narrator_questions SET questions_json = ? WHERE id = ?").run(
+			JSON.stringify([
+				{
+					id: "cache-layer",
+					header: "Legacy",
+					options: [{ header: "Artifact", preview: "x".repeat(100 * 1024) }],
+				},
+			]),
+			record.id,
+		);
+		const detail = await getBoundedQuestionDetail(record.id);
+		expect(detail.tooLarge).toBe(true);
+		expect(detail.record).toBeNull();
+		const summaries = await listQuestionSummaries({ narratorId: NARRATOR_ID, filter: "open" });
+		expect(JSON.stringify(summaries)).not.toContain("x".repeat(1000));
+		expect(Object.hasOwn(summaries.items[0], "answers")).toBe(false);
+		const legacyList = await listAsyncQuestions({ narratorId: NARRATOR_ID, status: "open" });
+		expect(legacyList.items[0].detailTooLarge).toBe(true);
+		expect(legacyList.items[0].questions).toEqual([]);
+	});
+	test("stable IDs, self-contained receipt, CAS, supplement history and summary bounds", async () => {
+		const call = await seedToolCall();
+		const { record } = await createAsyncQuestion({
+			narratorId: NARRATOR_ID,
+			...call,
+			questions: [
+				{
+					id: "cache-layer",
+					header: "Cache",
+					description: "Choose the cache",
+					options: [
+						{ header: "Redis", description: "Shared service", preview: "x".repeat(1000) },
+						{ header: "Memory", description: "Process-local cache" },
+					],
+				},
+			],
+		});
+		const answered = await answerAsyncQuestion(record.id, {
+			answers: { Cache: "All except Redis" },
+			userId: "user-1",
+		});
+		if (!answered.ok || !answered.record.answerMessageId) throw new Error("answer failed");
+		expect(answered.record.answers).toEqual({ "cache-layer": "All except Redis" });
+		expect(injections[0].content).toContain("Shared service");
+		expect(injections[0].content).toContain("Process-local cache");
+		expect(injections[0].content).toContain("Preview");
+		expect(injections[0].content).not.toContain("x".repeat(1000));
+		expect(
+			(await listQuestionSummaries({ narratorId: NARRATOR_ID, filter: "pending" })).items,
+		).toHaveLength(1);
+		expect(await buildPendingQuestionHint(NARRATOR_ID)).toContain(record.id);
+		const resolution = {
+			id: record.id,
+			narratorId: NARRATOR_ID,
+			answerMessageId: answered.record.answerMessageId,
+			note: "Keep local caching while waiting.",
+		};
+		expect((await resolveAsyncQuestion(resolution)).ok).toBe(true);
+		expect((await resolveAsyncQuestion(resolution)).ok).toBe(true);
+		expect((await resolveAsyncQuestion({ ...resolution, narratorId: OTHER_NARRATOR_ID })).ok).toBe(
+			false,
+		);
+		const supplemented = await supplementAsyncQuestion(record.id, {
+			text: "  Use Redis after all.  ",
+			userId: "user-1",
+			expectedAnswerMessageId: resolution.answerMessageId,
+		});
+		if (!supplemented.ok) throw new Error("supplement failed");
+		expect(supplemented.record.answers).toEqual(answered.record.answers);
+		expect(supplemented.record.resolution).toBeNull();
+		expect(supplemented.record.answerMessageId).not.toBe(resolution.answerMessageId);
+		expect(injections[1].content).toContain("originalQuestionsAndFirstAnswers");
+		expect(injections[1].content).toContain("historical background, not a re-submission");
+		expect(injections[1].content).toContain("Read earlier supplement events");
+		expect((await resolveAsyncQuestion(resolution)).ok).toBe(false);
+		// Equal millisecond timestamps must still preserve durable insertion order.
+		sqlite
+			.query("UPDATE narrator_question_events SET created_at = ? WHERE question_id = ?")
+			.run("2020-01-01T00:00:00.000Z", record.id);
+		const detail = await getBoundedQuestionDetail(record.id, { limit: 1 });
+		expect(detail.events).toHaveLength(1);
+		expect(detail.events[0].resolution?.note).toBe(resolution.note);
+		expect(detail.nextCursor).not.toBeNull();
+		const next = await getBoundedQuestionDetail(record.id, {
+			cursor: detail.nextCursor ?? undefined,
+		});
+		expect(next.events[0].text).toBe("  Use Redis after all.  ");
+		expect(
+			(await getBoundedQuestionDetail(record.id, { narratorId: OTHER_NARRATOR_ID })).record,
+		).toBeNull();
+		expect((await getBoundedQuestionDetail(record.id, { narratorId: "" })).record).toBeNull();
+	});
+});
 
 const QUESTIONS = [
 	{
@@ -272,7 +665,7 @@ describe("createAsyncQuestion", () => {
 });
 
 describe("answerAsyncQuestion", () => {
-	test("persists the answer, mirrors it onto the tool call and delivers it as a user turn", async () => {
+	test("persists the answer without mutating the original tool input and delivers it as a user turn", async () => {
 		const { toolCallId, toolUseId } = await seedToolCall();
 		const { record } = await createAsyncQuestion({
 			narratorId: NARRATOR_ID,
@@ -300,14 +693,14 @@ describe("answerAsyncQuestion", () => {
 		expect(message.role).toBe("user");
 		expect(message.content_text).toContain("Redis");
 
-		// Mirrored onto the historical tool call so the answered card renders through the
-		// same read-only replay path a synchronous question uses.
+		// The original tool input is a frozen historical/shared-prefix snapshot.
+		// Late answers belong only to the question row and appended user events.
 		const row = sqlite
 			.query<{ input_json: string }, [string]>(
 				"SELECT input_json FROM narrator_tool_calls WHERE id = ?",
 			)
 			.get(toolCallId);
-		expect(JSON.parse(row?.input_json ?? "{}").answers).toEqual({ "cache-layer": "Redis" });
+		expect(JSON.parse(row?.input_json ?? "{}").answers).toBeUndefined();
 
 		expect(injections).toHaveLength(1);
 		const injection = injections[0];
@@ -317,13 +710,23 @@ describe("answerAsyncQuestion", () => {
 		expect(injection?.source).toBe("async_question");
 		// Idle narrator → wake it, so the answer is acted on now rather than whenever the
 		// user happens to send something next.
-		expect(injection?.schedule).toBe("wakeIfIdle");
+		expect(injection?.schedule).toBe("none");
 		expect(injection?.content).toContain("Redis");
 		expect(injection?.content).toContain(QUESTIONS[0]?.header as string);
-		expect(injection?.body).toEqual({
+		expect(injection?.body).toMatchObject({
 			kind: "asyncQuestionAnswers",
+			questionId: record.id,
+			answerMessageId: result.record.answerMessageId,
+			context: record.context,
 			outcome: "answered",
-			items: [{ header: QUESTIONS[0]?.header, answer: "Redis" }],
+			items: [
+				{
+					questionId: "cache-layer",
+					header: QUESTIONS[0]?.header,
+					answer: "Redis",
+					options: [{ header: "Redis", description: "Shared, needs a service", hasPreview: false }],
+				},
+			],
 		});
 
 		expect(broadcasts).toEqual([
@@ -332,7 +735,7 @@ describe("answerAsyncQuestion", () => {
 		expect(await countOpenAsyncQuestions(NARRATOR_ID)).toBe(0);
 	});
 
-	test("interjects instead of waking when a loop is already running", async () => {
+	test("persists without interrupting a running loop, then hands off to the safe-turn scheduler", async () => {
 		const { toolCallId, toolUseId } = await seedToolCall();
 		const { record } = await createAsyncQuestion({
 			narratorId: NARRATOR_ID,
@@ -346,7 +749,7 @@ describe("answerAsyncQuestion", () => {
 
 		// A running loop rebuilds its history only at pass start, so the answer has to ask
 		// for a stop at the next tool boundary to be taken up promptly.
-		expect(injections[0]?.schedule).toBe("interject");
+		expect(injections[0]?.schedule).toBe("none");
 	});
 
 	test("answering twice reports the second attempt as stale", async () => {
@@ -479,9 +882,9 @@ describe("answerAsyncQuestion", () => {
 			expect(
 				(await answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } })).ok,
 			).toBe(true);
-			expect(await answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } })).toEqual(
-				{ ok: false, reason: "stale" },
-			);
+			expect(
+				(await answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } })).ok,
+			).toBe(true);
 			expect(
 				sqlite.query("SELECT count(*) AS n FROM narrator_messages WHERE role = 'user'").get(),
 			).toEqual({ n: 1 });
@@ -548,8 +951,9 @@ describe("dismissAsyncQuestion", () => {
 		expect(result.record.status).toBe("dismissed");
 		// A silent dismissal would leave the agent waiting for an answer that never comes.
 		expect(injections).toHaveLength(1);
-		expect(injections[0]?.body).toEqual({
+		expect(injections[0]?.body).toMatchObject({
 			kind: "asyncQuestionAnswers",
+			questionId: record.id,
 			outcome: "dismissed",
 			items: [{ header: QUESTIONS[0]?.header, answer: "" }],
 		});

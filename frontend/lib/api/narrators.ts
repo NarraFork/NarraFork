@@ -1064,10 +1064,16 @@ export const narratorsApi = {
 		}>("/narrators/questions/all"),
 	getAsyncQuestions: (
 		id: string,
-		params?: { status?: string; cursor?: string; limit?: number },
+		params?: {
+			status?: string;
+			filter?: "all" | "open" | "pending" | "history";
+			cursor?: string;
+			limit?: number;
+		},
 	) => {
 		const query = new URLSearchParams();
 		if (params?.status) query.set("status", params.status);
+		if (params?.filter) query.set("filter", params.filter);
 		if (params?.cursor) query.set("cursor", params.cursor);
 		if (params?.limit !== undefined) query.set("limit", String(params.limit));
 		const suffix = query.size > 0 ? `?${query.toString()}` : "";
@@ -1075,6 +1081,46 @@ export const narratorsApi = {
 			`/narrators/${id}/questions${suffix}`,
 		);
 	},
+	getAsyncQuestionDetail: (narratorId: string, questionId: string, cursor?: string) =>
+		request<{
+			question: AsyncQuestion;
+			supplements: {
+				messageId: string;
+				kind?: "answer" | "dismissal" | "supplement";
+				text: string | null;
+				createdAt: string;
+				actor?: string | null;
+			}[];
+			nextCursor?: string | null;
+			tooLarge?: boolean;
+			canAct?: boolean;
+		}>(
+			`/narrators/${narratorId}/questions/${questionId}${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+		),
+	getGlobalQuestionPage: (filter: "open" | "pending" | "history", cursor?: string) => {
+		const query = new URLSearchParams({ filter, limit: "30" });
+		if (cursor) query.set("cursor", cursor);
+		return request<{
+			items: (AsyncQuestion & {
+				narratorTitle: string | null;
+				chapterId: string | null;
+				canAct?: boolean;
+			})[];
+			nextCursor: string | null;
+		}>(`/narrators/questions?${query}`);
+	},
+	supplementAsyncQuestion: (
+		narratorId: string,
+		questionId: string,
+		payload: { text: string; answerMessageId?: string },
+	) =>
+		request<{ ok: boolean; question: AsyncQuestion }>(
+			`/narrators/${narratorId}/questions/${questionId}/supplement`,
+			{
+				method: "POST",
+				body: JSON.stringify(payload),
+			},
+		),
 	answerAsyncQuestion: (
 		narratorId: string,
 		questionId: string,

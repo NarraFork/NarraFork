@@ -98,6 +98,51 @@ function projectCurrentInput(messages: readonly RuntimeHistoryMessage[], text: s
 	// Unpersisted control/continuation text has no authenticated human author.
 	return projectSenderText(text, { kind: "system" });
 }
+/** Exact authenticated receipt candidates; supply is verified later against provider input. */
+export function questionModelReceipts(messages: readonly RuntimeHistoryMessage[]) {
+	return messages.flatMap((message) => {
+		if (message.role !== "user" || !Array.isArray(message.contentJson)) return [];
+		const receipt = message.contentJson.some(
+			(block) =>
+				block?.type === "system_injection" &&
+				block.body?.kind === "asyncQuestionAnswers" &&
+				block.body.answerMessageId === message.id,
+		);
+		if (!receipt) return [];
+		const projected = projectMessageSenderForModel(message);
+		const text =
+			modelTextFromContentBlocks(projected.contentJson as unknown[]) || projected.contentText || "";
+		return text ? [{ id: message.id, text }] : [];
+	});
+}
+
+/** Keep the live Await fallback, but replay only one full receipt once its event is in history. */
+export function projectQuestionFallbackToolResults(messages: RuntimeHistoryMessage[]): void {
+	const receiptIds = new Set(
+		messages
+			.filter(
+				(message) =>
+					message.role === "user" &&
+					Array.isArray(message.contentJson) &&
+					message.contentJson.some(
+						(block) =>
+							block?.type === "system_injection" && block.body?.kind === "asyncQuestionAnswers",
+					),
+			)
+			.map((message) => message.id),
+	);
+	for (const message of messages) {
+		for (const call of message.toolCalls ?? []) {
+			if (call.toolName !== "Await" || typeof call.outputJson !== "string") continue;
+			const match = /^<question_answer_fallback event="([A-Za-z0-9_-]{1,100})">\n/.exec(
+				call.outputJson,
+			);
+			if (match && receiptIds.has(match[1]))
+				call.outputJson = `The user answered. Answer event: ${match[1]}. The complete receipt is present as its own user event; use Question action=get and Question action=resolve for handling.`;
+		}
+	}
+}
+
 /** No principal changes, attachment reads, mailbox draining, persistence or adoption happen here. */
 export async function buildRuntimeHistory(
 	options: RuntimeHistoryOptions,
@@ -121,6 +166,9 @@ export async function buildRuntimeHistory(
 				: message.contentJson,
 			toolCalls: message.toolCalls?.map((call) => ({ ...call })),
 		}));
+	// Full Await outputs remain intact until the actual provider-input boundary.
+	// A builder may omit/move a user receipt (or a prebuilt child may replace
+	// this history), so row presence alone is not a safe deduplication decision.
 	const built = await buildHistory(
 		modelMessages,
 		options.model,

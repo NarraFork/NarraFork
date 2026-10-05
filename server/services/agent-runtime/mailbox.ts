@@ -236,9 +236,7 @@ export function createMailboxStore(db: RuntimeDb) {
 				dedupeKey,
 				deliveryId: generateId(),
 				recipientMessageId:
-					input.kind === "agent_message"
-						? (input.recipientMessageId ?? generateId())
-						: generateId(),
+					input.kind !== "user_input" ? (input.recipientMessageId ?? generateId()) : generateId(),
 				sourceNarratorId: input.kind === "agent_message" ? input.sourceNarratorId : null,
 				sourceToolCallId: input.kind === "agent_message" ? input.sourceToolCallId : null,
 				sourceAttempt: input.kind === "agent_message" ? input.sourceAttempt : null,

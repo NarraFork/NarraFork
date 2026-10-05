@@ -1075,11 +1075,48 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 			const row = port
 				? await port.mailbox.readRecipientRoute(narratorId)
 				: db
-						.select({ variant: narrators.variant, status: narrators.status })
+						.select({
+							variant: narrators.variant,
+							status: narrators.status,
+							lastStopReason: narrators.lastStopReason,
+						})
 						.from(narrators)
 						.where(eq(narrators.id, narratorId))
 						.get();
 			if (!row || row.status === "archived") return false;
+			const pendingHead = await peekInbox(narratorId);
+			const hasExplicitUserInput = await hasInboxKind(narratorId, ["user_input"]);
+			if (
+				!hasExplicitUserInput &&
+				"lastStopReason" in row &&
+				(row.lastStopReason === "user_interrupt" || row.lastStopReason === "error")
+			)
+				return false;
+			if (
+				!hasExplicitUserInput &&
+				pendingHead &&
+				inboxMetadata<{
+					questionAnswer?: {
+						executionPrincipal?: import("../narrator-question-service").QuestionExecutionPrincipal;
+					};
+				}>(pendingHead).questionAnswer
+			) {
+				const answer = inboxMetadata<{
+					questionAnswer: {
+						executionPrincipal?: import("../narrator-question-service").QuestionExecutionPrincipal;
+					};
+				}>(pendingHead).questionAnswer;
+				if (!answer.executionPrincipal) return false;
+				const { startInjectionContinuationIfPossible } = await import("../narrator-session");
+				return (
+					await startInjectionContinuationIfPossible(
+						narratorId,
+						locale,
+						false,
+						answer.executionPrincipal,
+					)
+				).started;
+			}
 			if (!(await hasWakeEligibleInboxInput(narratorId))) {
 				const notice = port
 					? await port.mailbox.hasActionableTaskNotice(narratorId)

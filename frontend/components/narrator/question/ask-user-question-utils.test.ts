@@ -96,6 +96,31 @@ describe("ask-user-question-utils", () => {
 		expect(getCustomSavedAnswer(question, { 测试策略: "使用其它方案" })).toBe("使用其它方案");
 	});
 
+	test("async IDs outrank colliding headers while synchronous headers keep precedence", () => {
+		const question = { id: "q1", header: "q2", options: [{ header: "First" }] };
+		const answers = { q1: "First", q2: "Second" };
+		const options = { answerKey: "id" as const, canonicalQuestionIds: new Set(["q1", "q2"]) };
+		expect(resolveSavedAnswer(question, answers, options)).toBe("First");
+		expect(getSelectedOptionValue(question, answers, options)).toBe("First");
+		expect(isSavedOptionSelected(question, "First", answers, options)).toBe(true);
+		expect(getCustomSavedAnswer(question, answers, options)).toBeUndefined();
+		expect(resolveSavedAnswer(question, answers)).toBe("Second");
+	});
+
+	test("async legacy fallback cannot take another canonical ID's answer", () => {
+		const question = { id: "q1", header: "q2", options: [] };
+		const options = {
+			answerKey: "id" as const,
+			canonicalQuestionIds: new Set(["q1", "q2"]),
+			allowSingleAnswerFallback: true,
+		};
+		expect(resolveSavedAnswer(question, { q2: "Second" }, options)).toBeUndefined();
+		expect(getCustomSavedAnswer(question, { q2: "Second" }, options)).toBeUndefined();
+		expect(
+			resolveSavedAnswer({ ...question, header: "Legacy" }, { Legacy: "Old answer" }, options),
+		).toBe("Old answer");
+	});
+
 	test("matches read-only option headers that contain commas", () => {
 		const [question] = coerceQuestions([
 			{

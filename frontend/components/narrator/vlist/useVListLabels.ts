@@ -321,6 +321,9 @@ export function useVListLabels(): VListLabels {
 			// ── message-origin attribution ──────────────────────────────────────────
 			// The origin_notice heading is composed during adaptation (it is a
 			// measured row), so these belong to the adapter labels.
+			asyncQuestionUser: t("you"),
+			asyncQuestionAnswerEvent: t("asyncQuestionAnswerEvent", { id: "{id}" }),
+			asyncQuestionSupplementEvent: t("asyncQuestionSupplementEvent", { id: "{id}" }),
 			originKindSystem: t("origin.kind.system"),
 			originKindAssistant: t("origin.kind.assistant"),
 			originSourceAutoContinuation: t("origin.source.autoContinuation"),

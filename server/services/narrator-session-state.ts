@@ -77,6 +77,12 @@ export interface ActiveNarrator {
 	_lastMeterUnit?: string;
 	/** Last reported token usage snapshot from context_usage events */
 	_lastTokenUsage?: TokenUsageSnapshot;
+	/** Exact question events already adopted by a model request in the current pass. */
+	_questionAnswerAdoptedMessageIds?: Set<string>;
+	/** Complete receipt bodies already staged in Await tool results for the next request. */
+	_questionAnswerFallbackMessageIds?: Set<string>;
+	/** Exact authenticated user projections available to this pass; not adoption evidence. */
+	_questionAnswerModelReceipts?: Map<string, string>;
 	/** Whether to append language instruction to system prompt */
 	_replyInUserLanguage?: boolean;
 	/** Set when ExitPlanMode completes — the loop should restart with a user message.

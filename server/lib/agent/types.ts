@@ -890,6 +890,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Send",
 	"TeamStatus",
 	"AskUserQuestion",
+	"Question",
 	"Skill",
 	"LearningGuide",
 ]);
@@ -1144,7 +1145,13 @@ export interface AgentConfig {
 		| string
 		| { text: string; onConsumed?: () => void };
 	/** Exact source history adopted at the provider-input boundary, never during preparation. */
-	onModelInputConsumed?: (sourceHistory: unknown[], content: string) => void;
+	onModelInputConsumed?: (
+		sourceHistory: unknown[],
+		content: string,
+		questionAnswerEventIds?: ReadonlySet<string>,
+	) => void;
+	/** Authenticated receipt candidates, checked against the actual supplied model input. */
+	getQuestionModelReceipts?: () => readonly { id: string; text: string }[];
 	/**
 	 * Persist a reminder the LOOP itself produced as its own message row.
 	 *

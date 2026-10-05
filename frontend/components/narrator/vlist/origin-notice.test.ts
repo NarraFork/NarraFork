@@ -10,7 +10,10 @@
  */
 
 import { beforeAll, describe, expect, test } from "bun:test";
+import { MantineProvider } from "@mantine/core";
 import { type AdapterContext, adaptSegment } from "@shared/pretext-layout/segment-adapter";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { measureMessageBubble } from "./measure/measure-message-bubble";
 import {
 	MEASURE_SYSTEM_TEXT_CONSTANTS as c,
@@ -19,6 +22,8 @@ import {
 	systemTextChromeHeight,
 } from "./measure/measure-system-text";
 import { installCanvasStub } from "./measure/test-canvas-stub";
+import { VLIST_REGISTRY } from "./registry";
+import { renderElement, resolveRenderExtra } from "./render-registry";
 
 beforeAll(() => {
 	installCanvasStub();
@@ -44,6 +49,97 @@ function userMessage(extra: Record<string, unknown>) {
 function adapt(extra: Record<string, unknown>) {
 	return adaptSegment(userMessage(extra), CTX);
 }
+
+describe("structured async question answer projection", () => {
+	const body = {
+		kind: "asyncQuestionAnswers",
+		questionId: "q1",
+		context: "Old context",
+		outcome: "answered",
+		items: [{ id: "choice", header: "Which option?", answer: "A" }],
+	};
+	test("human receipts are compact, preserve question identity, and never measure full model text", () => {
+		const specs = adapt({
+			narratorId: "owner",
+			origin: "user",
+			contentJson: [
+				{ type: "text", text: "Model receipt ".repeat(10000) },
+				{ type: "system_injection", source: "async_question_answer", body },
+			],
+		});
+		expect(specs).toHaveLength(1);
+		expect((specs[0]?.data as { questionSnapshot?: unknown }).questionSnapshot).toBe(body);
+		expect(specs[0]?.data).toMatchObject({
+			kind: "origin_notice",
+			origin: "user",
+			text: "Which option?",
+			questionReference: { questionId: "q1", narratorId: "owner" },
+		});
+		const measured = measureSystemTextCard("origin_notice", specs[0]?.data as never, WIDTH);
+		expect(measured.height).toBe(systemTextChromeHeight("origin_notice") + c.BODY_LINE_HEIGHT);
+		const largerSnapshot = adapt({
+			narratorId: "owner",
+			origin: "user",
+			contentJson: [
+				{
+					type: "system_injection",
+					source: "async_question_answer",
+					body: {
+						...body,
+						context: "historical context ".repeat(50),
+						items: [{ ...body.items[0], answer: "historical answer ".repeat(800) }],
+					},
+				},
+			],
+		});
+		expect(
+			measureSystemTextCard("origin_notice", largerSnapshot[0]?.data as never, WIDTH).height,
+		).toBe(measured.height);
+		const spec = specs[0];
+		if (!spec) throw new Error("Missing question event projection");
+		const actual = VLIST_REGISTRY[spec.kind].measure(spec.data, WIDTH, 5, spec.opts);
+		const rendered = renderToStaticMarkup(
+			createElement(
+				MantineProvider,
+				{ env: "test" },
+				renderElement(spec.kind, actual, resolveRenderExtra(spec)),
+			),
+		);
+		expect(rendered).toContain(`height:${actual.height}px`);
+		expect(rendered).toContain("Which option?");
+		expect(rendered).toContain("asyncQuestionDetails");
+		expect(rendered).not.toContain("Model receipt");
+		expect(rendered).not.toContain("Old context");
+	});
+	test("supplements use the same compact geometry and legacy bodies retain their verbatim fallback", () => {
+		const supplemental = adapt({
+			narratorId: "owner",
+			origin: "user",
+			contentJson: [
+				{
+					type: "system_injection",
+					source: "async_question_answer",
+					body: { ...body, supplement: "Correction ".repeat(10000) },
+				},
+			],
+		});
+		expect(supplemental[0]?.data).toMatchObject({ origin: "user", text: "Which option?" });
+		expect((supplemental[0]?.data as { title: string }).title).toContain("Supplemented");
+		const legacy = adapt({
+			origin: "user",
+			contentJson: [
+				{ type: "text", text: "Legacy complete receipt" },
+				{
+					type: "system_injection",
+					source: "async_question_answer",
+					body: { kind: "asyncQuestionAnswers", outcome: "answered", items: body.items },
+				},
+			],
+		});
+		expect(legacy[0]?.kind).toBe("message-bubble");
+		expect(legacy[0]?.data).toMatchObject({ text: "Legacy complete receipt" });
+	});
+});
 
 describe("adapter routing by origin", () => {
 	test("a human message still renders as a bubble", () => {

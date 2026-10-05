@@ -29,7 +29,7 @@
  * `tests/server/services/pg-revert-trigger-policy.test.ts`.
  */
 import type { Database, SQLQueryBindings } from "bun:sqlite";
-import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+import { setTimeout as yieldToEventLoop } from "node:timers/promises";
 import { Worker } from "node:worker_threads";
 import { FILE_CHANGE_LIMITS, type FileChangeRevertSelector } from "@shared/file-change-protocol";
 import { getTableColumns } from "drizzle-orm";
@@ -38,6 +38,16 @@ import { narratorMessages, narratorToolCalls } from "../db/schema";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import type { NarratorPrincipal } from "./narrator-acl";
+import {
+	buildQuestionHistoryInboxProgram,
+	buildQuestionHistoryProgram,
+	QUESTION_HISTORY_BYTES,
+	QUESTION_HISTORY_COLUMNS,
+	QUESTION_HISTORY_LIMIT,
+	type QuestionHistoryEvent,
+	type QuestionHistoryInboxRow,
+	type QuestionHistoryRow,
+} from "./narrator-question-history";
 import {
 	REVERT_SELECTION_PAGE_ITEMS,
 	type RevertSelectionBlock,
@@ -76,6 +86,7 @@ export interface RevertHistoryCommitOptions {
 export interface RevertHistoryApplyResult {
 	/** Only emit context invalidations/broadcasts AFTER the caller commits. */
 	affectedNarratorIds: string[];
+	affectedQuestionIds: string[];
 	replacements: { refId: string; previousMessageId: string; messageId: string }[];
 }
 
@@ -116,10 +127,28 @@ type AssociationRule = {
 	target: "narrator_messages" | "narrator_tool_calls";
 	action: "delete" | "null";
 	fk: "NO ACTION" | "CASCADE" | "SET NULL" | null;
+	idColumn?: string;
 };
 /** Explicit interpretation of the collector's MESSAGE/TOOL_ASSOCIATIONS, not SQL supplied
  * by a manifest. In particular segment_compact_id is a logical edge, NOT a schema FK. */
 const ASSOCIATIONS: readonly AssociationRule[] = [
+	{
+		table: "permission_rule_requests",
+		column: "tool_call_id",
+		index: "uq_permission_rule_request_attempt",
+		target: "narrator_tool_calls",
+		action: "delete",
+		fk: "CASCADE",
+	},
+	{
+		table: "narrator_question_events",
+		column: "message_id",
+		index: "sqlite_autoindex_narrator_question_events_1",
+		target: "narrator_messages",
+		action: "delete",
+		fk: "CASCADE",
+		idColumn: "message_id",
+	},
 	{
 		table: "narrators",
 		column: "fork_message_id",
@@ -305,7 +334,7 @@ export class RevertHistoryCommitService {
 			signal,
 			expiresAt: Date.now() + this.timeoutMs,
 			statements: [],
-			result: { affectedNarratorIds: [], replacements: [] },
+			result: { affectedNarratorIds: [], affectedQuestionIds: [], replacements: [] },
 		};
 		const worker = new RewriteWorker(signal);
 		this.active++;
@@ -377,6 +406,7 @@ export class RevertHistoryCommitService {
 			}
 			return {
 				affectedNarratorIds: [...snapshot.result.affectedNarratorIds],
+				affectedQuestionIds: [...snapshot.result.affectedQuestionIds],
 				replacements: snapshot.result.replacements.map((row) => ({ ...row })),
 			};
 		} finally {
@@ -418,7 +448,7 @@ export class RevertHistoryCommitService {
 		if (this.stamp() !== work.stamp) throw fail("STALE", "Database changed during preparation");
 	}
 	private async pause(work: Snapshot) {
-		await yieldToEventLoop();
+		await yieldToEventLoop(0);
 		this.check(work);
 	}
 	private one<T>(work: Snapshot, text: string, values: SQLQueryBindings[]): T {
@@ -457,6 +487,7 @@ export class RevertHistoryCommitService {
 			"narrator_tool_calls",
 			"narrator_message_refs",
 			"narrators",
+			"narrator_buffered_messages",
 			...ASSOCIATIONS.map((rule) => rule.table),
 		]);
 		const triggers = this.root
@@ -506,6 +537,8 @@ export class RevertHistoryCommitService {
 			"narrator_tool_calls",
 			"narrator_patches",
 			"narrator_questions",
+			"narrator_question_events",
+			"permission_rule_requests",
 			"narrator_tool_continuations",
 		]);
 		const allowed = new Map<string, string>();
@@ -513,6 +546,7 @@ export class RevertHistoryCommitService {
 			if (rule.fk) allowed.set(`${rule.table}:${rule.column}:${rule.target}:id`, rule.fk);
 		allowed.set("narrator_message_refs:message_id:narrator_messages:id", "NO ACTION");
 		allowed.set("narrator_tool_calls:message_id:narrator_messages:id", "NO ACTION");
+		allowed.set("narrator_question_events:question_id:narrator_questions:id", "CASCADE");
 		const found = new Set<string>();
 		let cursor = "";
 		let tableCount = 0;
@@ -539,7 +573,7 @@ export class RevertHistoryCommitService {
 					if (allowed.get(key) !== fk.on_delete)
 						throw fail(
 							"UNSUPPORTED_ASSOCIATION",
-							"A database FK is not covered by the collector action whitelist",
+							`A database FK is not covered by the collector action whitelist: ${key} (${fk.on_delete})`,
 						);
 					found.add(key);
 				}
@@ -730,7 +764,7 @@ export class RevertHistoryCommitService {
 			for (const targetId of targets) {
 				const rows = await this.page<{ id: string }>(
 					work,
-					`SELECT id,rowid AS cursor FROM ${rule.table}`,
+					`SELECT ${rule.idColumn ?? "id"} AS id,rowid AS cursor FROM ${rule.table}`,
 					rule.index,
 					rule.column,
 					targetId,
@@ -756,10 +790,10 @@ export class RevertHistoryCommitService {
 				const ref = refFor(edge.id);
 				addAffected(ref.narrator_id);
 				patchRef(ref).patch.segment_compact_id = null;
-			} else {
+			} else if (edge.table !== "narrator_question_events") {
 				const rule = ASSOCIATIONS.find((r) => r.table === edge.table && r.column === edge.column);
 				const where = {
-					id: edge.id,
+					[rule?.idColumn ?? "id"]: edge.id,
 					...Object.fromEntries(edges.map((e) => [e.column, e.targetId])),
 				};
 				associationProgram.push(
@@ -769,6 +803,7 @@ export class RevertHistoryCommitService {
 				);
 			}
 		}
+		const questionProgram = await this.prepareQuestions(work, selection);
 		for (const id of affected) {
 			const narrator = this.one<Narrator>(
 				work,
@@ -912,6 +947,7 @@ export class RevertHistoryCommitService {
 		const messageChanges = refProgram.length + messages.filter((m) => m.action !== "unlink").length;
 		const relatedChanges =
 			associationProgram.length +
+			questionProgram.length +
 			narratorProgram.length +
 			[...changes.values()].filter((action) => action !== "retain").length;
 		bound(
@@ -925,6 +961,7 @@ export class RevertHistoryCommitService {
 			"actual tool/related mutations",
 		);
 		work.statements.push(
+			...questionProgram,
 			...associationProgram,
 			...messageProgram,
 			...refProgram,
@@ -942,6 +979,158 @@ export class RevertHistoryCommitService {
 		work.result.affectedNarratorIds = [...affected];
 		this.check(work);
 	}
+	/** Materialize every question/event write before issuing the capability. Apply does
+	 * not call the ordinary reconciliation helper or discover any new history rows. */
+	private async prepareQuestions(work: Snapshot, selection: RevertSelectionResult) {
+		const questions = new Map<string, QuestionHistoryRow>();
+		const requests = new Set<string>();
+		const physicallyDeleted = new Set<string>();
+		const deletedByOwner = new Map<string, Set<string>>();
+		const authorized = new Set(selection.messageVersions.map((row) => row.narratorId));
+		const add = (row: QuestionHistoryRow, requestRemoved = false) => {
+			if (!authorized.has(row.narrator_id))
+				throw fail(
+					"UNAUTHORIZED_ASSOCIATION",
+					"Question owner is outside the fixed history manifest",
+				);
+			questions.set(row.id, row);
+			if (requestRemoved) requests.add(row.id);
+			bound(questions.size, QUESTION_HISTORY_LIMIT, "question history rows");
+		};
+		const read = (text: string, values: SQLQueryBindings[]) => {
+			this.check(work);
+			const rows = this.root.query<QuestionHistoryRow, SQLQueryBindings[]>(text).all(...values);
+			bound(rows.length, QUESTION_HISTORY_LIMIT, "question candidates");
+			return rows;
+		};
+		for (const message of selection.history.messages) {
+			if (message.action === "delete" || message.action === "unlink") {
+				const ids = deletedByOwner.get(message.narratorId) ?? new Set<string>();
+				ids.add(message.id);
+				deletedByOwner.set(message.narratorId, ids);
+				for (const row of read(
+					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_tool_calls t INDEXED BY idx_toolcalls_message CROSS JOIN narrator_questions q INDEXED BY idx_narrator_questions_tool_call ON q.tool_call_id=t.id WHERE q.narrator_id=? AND t.message_id=? LIMIT ?`,
+					[message.narratorId, message.id, QUESTION_HISTORY_LIMIT + 1],
+				))
+					add(row, true);
+				for (const row of read(
+					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_question_events e CROSS JOIN narrator_questions q ON q.id=e.question_id WHERE q.narrator_id=? AND e.message_id=? LIMIT 1`,
+					[message.narratorId, message.id],
+				))
+					add(row);
+				for (const row of read(
+					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_questions q INDEXED BY idx_narrator_questions_answer_message WHERE q.narrator_id=? AND q.answer_message_id=? LIMIT ?`,
+					[message.narratorId, message.id, QUESTION_HISTORY_LIMIT + 1],
+				))
+					add(row);
+			} else {
+				for (const block of selection.history.blocks) {
+					if (
+						block.messageId !== message.id ||
+						block.action !== "remove" ||
+						block.type !== "tool_use"
+					)
+						continue;
+					for (const row of read(
+						`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_tool_calls t INDEXED BY idx_toolcalls_message CROSS JOIN narrator_questions q INDEXED BY idx_narrator_questions_tool_call ON q.tool_call_id=t.id WHERE q.narrator_id=? AND t.message_id=? AND t.tool_use_id=? LIMIT ?`,
+						[message.narratorId, message.id, block.toolUseId, QUESTION_HISTORY_LIMIT + 1],
+					))
+						add(row, true);
+				}
+			}
+			await this.pause(work);
+		}
+		// Explicitly include all cascade leaves, including a question's older events.
+		// A FK whitelist is not permission to let SQLite discover an unbounded write set.
+		for (const edge of selection.history.associations) {
+			if (edge.table === "narrator_questions") {
+				const row = this.one<QuestionHistoryRow>(
+					work,
+					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_questions q WHERE q.id=? LIMIT 1`,
+					[edge.id],
+				);
+				add(row, true);
+				physicallyDeleted.add(row.id);
+			} else if (edge.table === "narrator_question_events") {
+				const row = this.one<QuestionHistoryRow>(
+					work,
+					`SELECT ${QUESTION_HISTORY_COLUMNS} FROM narrator_question_events e CROSS JOIN narrator_questions q ON q.id=e.question_id WHERE e.message_id=? LIMIT 1`,
+					[edge.id],
+				);
+				add(row);
+				const ids = deletedByOwner.get(row.narrator_id) ?? new Set<string>();
+				ids.add(edge.id);
+				deletedByOwner.set(row.narrator_id, ids);
+			}
+		}
+		const program: Statement[] = [];
+		const inboxRows = new Map<string, QuestionHistoryInboxRow>();
+		let count = 0;
+		let bytes = 0;
+		for (const question of questions.values()) {
+			const sizes = await this.page<{ bytes: number }>(
+				work,
+				"SELECT coalesce(octet_length(resolution_json),0) AS bytes,rowid AS cursor FROM narrator_question_events",
+				"idx_question_events_question_rowid",
+				"question_id",
+				question.id,
+			);
+			count += sizes.length;
+			bytes += sizes.reduce((sum, row) => sum + row.bytes, 0);
+			bound(count, QUESTION_HISTORY_LIMIT, "question history events");
+			bound(bytes, QUESTION_HISTORY_BYTES, "question resolution bytes");
+			const events = await this.page<QuestionHistoryEvent>(
+				work,
+				"SELECT question_id,message_id,kind,created_at,resolution_json,rowid AS cursor FROM narrator_question_events",
+				"idx_question_events_question_rowid",
+				"question_id",
+				question.id,
+			);
+			const deleted = deletedByOwner.get(question.narrator_id) ?? new Set<string>();
+			for (const eventId of new Set([
+				...events
+					.filter(
+						(event) =>
+							requests.has(question.id) ||
+							physicallyDeleted.has(question.id) ||
+							deleted.has(event.message_id),
+					)
+					.map((event) => event.message_id),
+				...(question.answer_message_id &&
+				(requests.has(question.id) || deleted.has(question.answer_message_id))
+					? [question.answer_message_id]
+					: []),
+			])) {
+				this.check(work);
+				const rows = this.root
+					.query<QuestionHistoryInboxRow, SQLQueryBindings[]>(
+						"SELECT id,narrator_id,recipient_message_id FROM narrator_buffered_messages INDEXED BY idx_nbm_reserved WHERE narrator_id=? AND recipient_message_id=? AND kind='task_notice' AND source_key=? LIMIT ?",
+					)
+					.all(
+						question.narrator_id,
+						eventId,
+						`question-answer:${eventId}`,
+						QUESTION_HISTORY_LIMIT + 1,
+					);
+				for (const row of rows) inboxRows.set(row.id, row);
+				bound(inboxRows.size, QUESTION_HISTORY_LIMIT, "question inbox rows");
+			}
+			const plan = buildQuestionHistoryProgram(
+				question,
+				events,
+				deleted,
+				requests.has(question.id),
+				physicallyDeleted.has(question.id),
+			);
+			if (plan.statements.length || physicallyDeleted.has(question.id))
+				work.result.affectedQuestionIds.push(question.id);
+			program.push(...plan.statements);
+			await this.pause(work);
+		}
+		program.push(...buildQuestionHistoryInboxProgram([...inboxRows.values()]));
+		return program;
+	}
+
 	private report(phase: "prepare" | "apply", started: number, statements: number) {
 		const durationMs = performance.now() - started;
 		if (durationMs < (phase === "apply" ? 100 : 1000)) return;

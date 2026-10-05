@@ -690,6 +690,29 @@ Result preview: {preview}`,
 		en: "[System] The user answered your asynchronous question(s). Adjust your work accordingly — do not ask again:",
 		"zh-CN": "[系统] 用户回答了你此前异步提交的问题。请据此调整工作，不要重复提问：",
 	},
+	"sidecar.asyncQuestionReceiptHeading": {
+		en: "The user answered a historical question. The original situation and the new user answer are recorded below:",
+		"zh-CN": "用户回答了一个历史问题。以下分别记录提问时的情况与用户的新回答：",
+	},
+	"sidecar.asyncQuestionSupplementHeading": {
+		en: "The user supplied a new supplement or correction. The frozen first answers below are historical background, not a re-submission. Read earlier supplement events via Question action=get (paginated) before confirming the current decision.",
+		"zh-CN":
+			"用户提供了新的补充或纠正。下列首次答案是历史背景，并未重新提交；请通过 Question action=get 分页读取此前补充，再确认当前处理结果。",
+	},
+	"sidecar.asyncQuestionReceiptHint": {
+		en: "Historical context describes the situation at question time. Preview artifacts are omitted: Question.get returns complete previews. Treat answers and supplements as normal user requests. Judge applicability against the current task; confirm handling with Question action=resolve and the latest answerMessageId. If unclear, explain what needs clarification.",
+		"zh-CN":
+			"背景描述的是提问时的情况。回执省略预览原文，使用 Question action=get 读取完整预览。答案和补充是正常用户请求，请结合当前任务判断适用性，通过 Question action=resolve 与最新 answerMessageId 确认处理结果；需要澄清时说明缺少的信息。",
+	},
+	"sidecar.asyncQuestionDismissedReceiptHint": {
+		en: "The user skipped this item. Use your own judgement and continue; no Question action=resolve is needed. Question action=get can retrieve omitted previews when necessary.",
+		"zh-CN":
+			"用户已跳过此事项，请自行判断并继续；无需调用 Question action=resolve。需要完整预览时可通过 Question action=get 读取。",
+	},
+	"sidecar.asyncQuestionUnknownContext": {
+		en: "Question-time context is unknown.",
+		"zh-CN": "提问时背景未知。",
+	},
 	"sidecar.asyncQuestionEntry": {
 		en: "Q: {header}\nA: {answer}",
 		"zh-CN": "问：{header}\n答：{answer}",

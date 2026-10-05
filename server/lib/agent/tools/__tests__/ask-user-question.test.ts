@@ -1,10 +1,39 @@
 import { describe, expect, test } from "bun:test";
+import { isRuntimeToolAllowed, resolveRuntimePolicy } from "@server/services/agent-runtime/policy";
 import {
 	askUserQuestionTool,
 	isAsyncAskRequest,
 	isWithdrawOnlyAskRequest,
 	readWithdrawIds,
 } from "../ask-user-question";
+import { questionTool } from "../question";
+
+describe("Question lifecycle capability", () => {
+	test("ids, cursors, page size and notes have hard character bounds before SQLite", () => {
+		for (const value of [
+			{ id: "" },
+			{ id: "x".repeat(201) },
+			{ ids: [""] },
+			{ answerMessageId: "x".repeat(201) },
+			{ cursor: "x".repeat(2049) },
+			{ limit: 33 },
+			{ note: "x".repeat(2049) },
+			{ reason: "x".repeat(2049) },
+		]) {
+			expect(questionTool.parameters.safeParse({ action: "list", ...value }).success).toBe(false);
+		}
+	});
+	test("get/list/resolve/withdraw form one tool without granting creation to subagents", () => {
+		for (const action of ["get", "list", "resolve", "withdraw"])
+			expect(questionTool.parameters.safeParse({ action }).success).toBe(true);
+		for (const subagentType of ["general", "explore", "plan", "review", "search"]) {
+			const policy = resolveRuntimePolicy({ variant: "subagent", subagentType });
+			expect(isRuntimeToolAllowed(policy, "Question")).toBe(true);
+			expect(isRuntimeToolAllowed(policy, "AskUserQuestion")).toBe(false);
+		}
+		expect(questionTool.parameters.safeParse({ action: "create" }).success).toBe(false);
+	});
+});
 
 describe("AskUserQuestion", () => {
 	test("advertises only header/description on questions and options", () => {

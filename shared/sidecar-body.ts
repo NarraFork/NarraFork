@@ -135,6 +135,11 @@ export interface SideCarInboundMessage {
  * answered. Both sides of the projection want the readable form.
  */
 export interface SideCarAsyncQuestionAnswer {
+	questionId?: string;
+	/** Distinguishes an omitted topic from an explicitly empty submitted answer. */
+	answerProvided?: boolean;
+	multiSelect?: boolean;
+	options?: { header: string; description?: string; hasPreview?: boolean }[];
 	header: string;
 	/** The user's answer, already flattened (multi-select joined) by the producer. */
 	answer: string;
@@ -206,6 +211,11 @@ export type SideCarBody =
 	 */
 	| {
 			kind: "asyncQuestionAnswers";
+			questionId?: string;
+			createdAt?: string;
+			context?: string | null;
+			answerMessageId?: string | null;
+			supplement?: string;
 			outcome: "answered" | "dismissed";
 			items: SideCarAsyncQuestionAnswer[];
 	  };
@@ -791,6 +801,30 @@ export function renderSideCarBodyToText(
 		}
 
 		case "asyncQuestionAnswers": {
+			if (body.questionId) {
+				// JSON encodes historical and user text as data rather than instruction markup.
+				const receipt = {
+					questionId: body.questionId,
+					questionCreatedAt: body.createdAt,
+					answerMessageId: body.answerMessageId,
+					contextAtQuestionTime: body.context || tpl(templates, "asyncQuestionUnknownContext"),
+					outcome: body.outcome,
+					...(body.supplement !== undefined
+						? { originalQuestionsAndFirstAnswers: body.items, supplement: body.supplement }
+						: { questions: body.items }),
+				};
+				const heading =
+					body.supplement !== undefined
+						? "asyncQuestionSupplementHeading"
+						: body.outcome === "dismissed"
+							? "asyncQuestionDismissedHeading"
+							: "asyncQuestionReceiptHeading";
+				const hint =
+					body.outcome === "dismissed"
+						? "asyncQuestionDismissedReceiptHint"
+						: "asyncQuestionReceiptHint";
+				return `${tpl(templates, heading)}\n${JSON.stringify(receipt)}\n${tpl(templates, hint)}`;
+			}
 			if (body.outcome === "dismissed") {
 				// The dismissed heading is the whole instruction ("use your own judgement"),
 				// but the questions still have to be NAMED: by the time a dismissal lands the

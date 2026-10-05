@@ -25,7 +25,7 @@
  */
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+import { setTimeout as yieldToEventLoop } from "node:timers/promises";
 import { Worker } from "node:worker_threads";
 import {
 	FILE_CHANGE_LIMITS,
@@ -411,7 +411,9 @@ export class RevertSelectionService {
 		return this.rows<T>(state, query, params)[0];
 	}
 	private async pause(state: ScopeState) {
-		await yieldToEventLoop();
+		// A zero-delay timer avoids Bun's long immediate-poll waits while a body worker
+		// is idle between pages. Still yield a real macrotask before rechecking drift.
+		await yieldToEventLoop(0);
 		this.check(state);
 	}
 	private add<T>(state: ScopeState, target: T[], row: T) {
@@ -1098,12 +1100,12 @@ export class RevertSelectionService {
 		specs: readonly AssociationSpec[],
 		targetId: string,
 	) {
-		for (const [table, column, index] of specs) {
+		for (const [table, column, index, idColumn = "id"] of specs) {
 			let cursor = 0;
 			for (;;) {
 				const rows = this.rows<{ id: string; cursor: number }>(
 					state,
-					`SELECT id, rowid AS cursor FROM ${table} INDEXED BY ${index} WHERE ${column} = ? AND rowid > ? ORDER BY rowid LIMIT ?`,
+					`SELECT ${idColumn} AS id, rowid AS cursor FROM ${table} INDEXED BY ${index} WHERE ${column} = ? AND rowid > ? ORDER BY rowid LIMIT ?`,
 					[targetId, cursor, REVERT_SELECTION_PAGE_ITEMS + 1],
 				);
 				for (const row of rows.slice(0, REVERT_SELECTION_PAGE_ITEMS)) {
@@ -1233,7 +1235,7 @@ function stateRef(state: FileChangeState) {
 			? state.target.digest
 			: null;
 }
-type AssociationSpec = readonly [table: string, column: string, index: string];
+type AssociationSpec = readonly [table: string, column: string, index: string, idColumn?: string];
 const MESSAGE_ASSOCIATIONS: readonly AssociationSpec[] = [
 	["narrators", "fork_message_id", "idx_narrators_fork_message"],
 	["chapter_commits", "narrator_message_id", "idx_chapter_commits_narrator_message"],
@@ -1242,8 +1244,15 @@ const MESSAGE_ASSOCIATIONS: readonly AssociationSpec[] = [
 	["api_requests", "message_id", "idx_api_requests_message"],
 	["knowledge_injection_events", "trigger_message_id", "idx_kie_trigger_message"],
 	["narrator_message_refs", "segment_compact_id", "idx_narrator_refs_segment_compact"],
+	[
+		"narrator_question_events",
+		"message_id",
+		"sqlite_autoindex_narrator_question_events_1",
+		"message_id",
+	],
 ];
 const TOOL_ASSOCIATIONS: readonly AssociationSpec[] = [
+	["permission_rule_requests", "tool_call_id", "uq_permission_rule_request_attempt"],
 	["narrator_questions", "tool_call_id", "idx_narrator_questions_tool_call"],
 	["narrator_tool_continuations", "tool_call_id", "idx_tool_continuations_tool_call"],
 	["knowledge_injection_events", "trigger_tool_call_id", "idx_kie_trigger_tool_call"],

@@ -729,8 +729,17 @@ export async function applyLocalRevertPlan(
 		}
 	};
 	const settled = execution.whenSettled
-		.then((outcome) => {
+		.then(async (outcome) => {
 			if (outcome.status !== "committed") return;
+			if (outcome.historyResult?.affectedQuestionIds?.length) {
+				try {
+					const { notifyQuestionHistoryChanged } = await import("./narrator-question-service");
+					await notifyQuestionHistoryChanged(narratorId, outcome.historyResult.affectedQuestionIds);
+				} catch (error) {
+					refreshFailed = true;
+					logger.error("Committed question history refresh failed", { error: String(error) });
+				}
+			}
 			for (const path of outcome.worktreePaths ?? [])
 				refresh(() => invalidateWorkspaceTreeCache(path));
 			const affected = new Set(outcome.historyResult?.affectedNarratorIds ?? []);

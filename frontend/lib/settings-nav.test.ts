@@ -87,8 +87,8 @@ describe("settings nav inventory", () => {
 	});
 
 	test("every nav entry has a label key and icon", async () => {
-		const en = (await import("../locales/en/settings.json")).default as Record<string, string>;
-		const zh = (await import("../locales/zh-CN/settings.json")).default as Record<string, string>;
+		const en = (await import("../locales/en/settings.json")).default as Record<string, unknown>;
+		const zh = (await import("../locales/zh-CN/settings.json")).default as Record<string, unknown>;
 		for (const item of flatten(getSettingsNavGroups())) {
 			expect(item.to.startsWith("/settings")).toBe(true);
 			expect(item.labelKey.length).toBeGreaterThan(0);

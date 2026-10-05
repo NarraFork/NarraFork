@@ -82,7 +82,10 @@ CREATE TABLE knowledge_injection_events (id TEXT PRIMARY KEY, trigger_message_id
 CREATE INDEX idx_kie_trigger_message ON knowledge_injection_events(trigger_message_id);
 CREATE INDEX idx_kie_trigger_tool_call ON knowledge_injection_events(trigger_tool_call_id);
 CREATE TABLE narrator_questions (id TEXT PRIMARY KEY, tool_call_id TEXT);
+CREATE TABLE narrator_question_events (message_id TEXT PRIMARY KEY, question_id TEXT, kind TEXT, created_at TEXT, resolution_json TEXT);
 CREATE INDEX idx_narrator_questions_tool_call ON narrator_questions(tool_call_id);
+CREATE TABLE permission_rule_requests (id TEXT PRIMARY KEY, tool_call_id TEXT, attempt INTEGER);
+CREATE UNIQUE INDEX uq_permission_rule_request_attempt ON permission_rule_requests(tool_call_id,attempt);
 CREATE TABLE narrator_tool_continuations (id TEXT PRIMARY KEY, tool_call_id TEXT);
 CREATE INDEX idx_tool_continuations_tool_call ON narrator_tool_continuations(tool_call_id);
 `;

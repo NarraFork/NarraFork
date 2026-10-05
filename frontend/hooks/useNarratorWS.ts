@@ -1,4 +1,4 @@
-import type { AsyncQuestion, PendingPermission } from "@frontend/types/narrator";
+import type { PendingPermission } from "@frontend/types/narrator";
 import type { BackgroundTaskListDelta } from "@shared/background-task-list";
 import {
 	isSubagentModelInheritance,
@@ -30,7 +30,11 @@ import {
 	narratorWSManager,
 	type SubscriptionHandle,
 } from "../lib/narrator-ws-manager";
-import { useAsyncQuestionListChange } from "./useAsyncQuestions";
+import {
+	type AsyncQuestionPush,
+	readAsyncQuestionPush,
+	useAsyncQuestionListChange,
+} from "./useAsyncQuestions";
 
 function nonEmptyString(value: unknown): string | null {
 	if (typeof value !== "string") return null;
@@ -519,8 +523,16 @@ export interface NarratorWSCallbacks {
 	 * delta, so a consumer that missed an event still converges on the correct state.
 	 */
 	onAsyncQuestionChanged?: (data: {
-		change: "opened" | "answered" | "dismissed" | "withdrawn" | "awaited" | "await_ended";
-		question: AsyncQuestion;
+		change:
+			| "opened"
+			| "answered"
+			| "dismissed"
+			| "withdrawn"
+			| "awaited"
+			| "await_ended"
+			| "resolved"
+			| "supplemented";
+		question: AsyncQuestionPush;
 	}) => void;
 	/**
 	 * Live progress of a running reflection gate. Fires on a throttled cadence, so
@@ -1153,7 +1165,7 @@ export function useNarratorWS(
 						});
 						break;
 					case "async_question_changed": {
-						const question = data.question as AsyncQuestion | undefined;
+						const question = readAsyncQuestionPush(data);
 						if (question?.id) {
 							callbackOwner.callbacks.onAsyncQuestionChanged?.({
 								change: data.change as
@@ -1162,7 +1174,9 @@ export function useNarratorWS(
 									| "dismissed"
 									| "withdrawn"
 									| "awaited"
-									| "await_ended",
+									| "await_ended"
+									| "resolved"
+									| "supplemented",
 								question,
 							});
 						}

@@ -1413,7 +1413,7 @@ function NarratorPanelBody({
 	// above the composer reads the cross-session query instead (it has to be able to say
 	// "2 waiting elsewhere"), and both are kept in step by invalidating the narrator
 	// and global inbox queries on every decision.
-	const asyncQuestionSlots = useNarratorAsyncQuestionSlots(narratorId, !isWorkspacePreview);
+	const asyncQuestionSlots = useNarratorAsyncQuestionSlots(narratorId, true, isWorkspacePreview);
 	const permCbWithAsyncQuestions = useMemo(
 		() => ({ ...renderPermCb, asyncQuestions: asyncQuestionSlots }),
 		[renderPermCb, asyncQuestionSlots],

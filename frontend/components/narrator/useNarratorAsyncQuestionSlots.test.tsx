@@ -163,6 +163,53 @@ function slot(id = "question-1") {
 }
 
 describe("useNarratorAsyncQuestionSlots", () => {
+	test("recovers older original cards through bounded cursor pages", async () => {
+		get.mockImplementation(async (_id, params) => {
+			if (!params?.cursor) return { items: [question("new")], nextCursor: "older", openCount: 1 };
+			if (params.cursor === "older")
+				return {
+					items: [{ ...question("old"), status: "answered" as const }],
+					nextCursor: "oldest",
+					openCount: 1,
+				};
+			return {
+				items: [{ ...question("oldest"), status: "withdrawn" as const }],
+				nextCursor: null,
+				openCount: 1,
+			};
+		});
+		await render();
+		for (let n = 0; n < 8; n++) await settle();
+		expect(slots.get("use-old")?.question?.status).toBe("answered");
+		expect(slots.get("use-oldest")?.question?.status).toBe("withdrawn");
+		expect(get).toHaveBeenCalledWith(narratorId, { filter: "all", cursor: "older", limit: 32 });
+		expect(get).toHaveBeenCalledWith(narratorId, { filter: "all", cursor: "oldest", limit: 32 });
+	});
+	test("answered, dismissed and withdrawn remain attached to their original tool with context and resolution", async () => {
+		const answered = {
+			...question("answered"),
+			status: "answered" as const,
+			context: "Original context",
+			resolution: {
+				answerMessageId: "m",
+				note: "Accepted",
+				resolvedAt: "2026-01-01",
+				actor: "agent",
+			},
+		};
+		const dismissed = { ...question("dismissed"), status: "dismissed" as const };
+		const withdrawn = {
+			...question("withdrawn"),
+			status: "withdrawn" as const,
+			withdrawReason: "Superseded",
+		};
+		await setQuestions([answered, dismissed, withdrawn]);
+		await render(0, false);
+		expect(slots.size).toBe(3);
+		expect(slots.get("use-answered")?.question).toEqual(answered);
+		expect(slots.get("use-dismissed")?.question?.status).toBe("dismissed");
+		expect(slots.get("use-withdrawn")?.question?.withdrawReason).toBe("Superseded");
+	});
 	test("keeps the fallback empty Map and memo consumer stable on unrelated parent renders", async () => {
 		await render(0, false);
 		const original = slots;
@@ -176,7 +223,7 @@ describe("useNarratorAsyncQuestionSlots", () => {
 
 	test("fetches by default and keeps a loaded empty Map stable", async () => {
 		await render();
-		expect(get).toHaveBeenCalledWith(narratorId, { status: "open" });
+		expect(get).toHaveBeenCalledWith(narratorId, { filter: "all", limit: 32 });
 		const original = slots;
 		const renders = consumerRenders;
 		await render(1);
@@ -254,7 +301,8 @@ describe("useNarratorAsyncQuestionSlots", () => {
 				const original = slots;
 				// Use the supplied callback id, not the slot's closed-over question id.
 				await act(async () => {
-					if (action === "submit") slot().onSubmit("question-2", answers);
+					if (action === "submit")
+						void Promise.resolve(slot().onSubmit("question-2", answers)).catch(() => {});
 					else slot().onDismiss("question-2");
 				});
 				await settle();

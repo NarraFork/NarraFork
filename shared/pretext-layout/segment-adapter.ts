@@ -1563,6 +1563,40 @@ function adaptMessage(
 	// than only the text ones. Dropping them here is what made an image the user
 	// sent silently disappear in the virtual list.
 	if (msg.role === "user") {
+		// New structured answer receipts are human events, not full model prompts.
+		// A legacy body without an ID keeps the historical verbatim fallback.
+		const answerBody = blocks
+			.map((block) => readSideCarBody(block))
+			.find((body) => body?.kind === "asyncQuestionAnswers" && body.questionId);
+		if (answerBody?.kind === "asyncQuestionAnswers" && answerBody.questionId) {
+			const label = answerBody.supplement
+				? "asyncQuestionSupplementEvent"
+				: "asyncQuestionAnswerEvent";
+			return [
+				{
+					kind: "system-text",
+					key: `${idBase}-question-event`,
+					data: {
+						kind: "origin_notice",
+						origin: "user",
+						originLabel: "async_question_answer",
+						title: `${msg.creator?.username ?? ctx.labels?.asyncQuestionUser ?? "User"} · ${(
+							ctx.labels?.[label] ??
+								(answerBody.supplement ? "Supplemented question {id}" : "Answered question {id}")
+						).replace("{id}", answerBody.questionId)}`,
+						text: answerBody.items.map((item) => item.header).join(" · ") || answerBody.questionId,
+						timeLabel: formatOriginNoticeTime(msg.createdAt),
+						questionReference: {
+							questionId: answerBody.questionId,
+							narratorId: msg.narratorId ?? null,
+						},
+						// Frozen message data, never the current mutable question record. A
+						// fork's subject cannot read the original owner's future answers.
+						questionSnapshot: answerBody,
+					},
+				},
+			];
+		}
 		// Self-contained native context blocks are protocol cards, not human chat bubbles.
 		// Keep their physical indexes and render each block independently.
 		if (blocks.some((block) => isNativeModelContextBlock(block))) {
