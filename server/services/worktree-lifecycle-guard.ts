@@ -237,24 +237,22 @@ export function recordChapterNarratorCreated(narratorId: string): void {
 	held.createdNarrators.add(narratorId);
 }
 
-/** Backend canonicalization for a newly committed cwd/context claim, never inventory adoption. */
+/**
+ * Backend canonicalization for a newly committed cwd/context claim, never inventory adoption.
+ * `path` is the comparison key used by reservations; `canonicalCwd` is safe to persist/execute.
+ */
 export async function canonicalWorkspaceAdmissionTarget(
 	target: LifecycleTarget,
-): Promise<LifecycleTarget> {
+): Promise<LifecycleTarget & { canonicalCwd?: string }> {
 	if (target.path && (target.path.length > 4096 || target.path.includes("\0")))
 		reject("workspace claim admission", unavailable());
-	if ((target.deviceId ?? "local") !== "local") return { ...target };
-	return {
-		...target,
-		...(target.path
-			? {
-					path: await boundedRead(
-						productionPorts.canonicalPath(target.path),
-						performance.now() + MAX_MS,
-					),
-				}
-			: {}),
-	};
+	if ((target.deviceId ?? "local") !== "local") return { ...target, canonicalCwd: target.path };
+	if (!target.path) return { ...target };
+	const canonicalCwd = await boundedRead(
+		productionPorts.canonicalAdmissionPath(target.path),
+		performance.now() + MAX_MS,
+	);
+	return { ...target, path: normalizePathForComparison(canonicalCwd), canonicalCwd };
 }
 /** Async registration/CAS must keep their claim visible until the durable write completes. */
 export async function withWorkspaceAdmission<T>(
@@ -275,14 +273,15 @@ export async function withWorkspaceAdmission<T>(
 	}
 }
 
-async function canonicalPath(path: string): Promise<string> {
+/** Resolve filesystem aliases without turning a display/execution path into a comparison key. */
+async function canonicalAdmissionPath(path: string): Promise<string> {
 	if (!isAbsolute(path) || path.length > 4096 || path.includes("\0"))
 		throw new Error("Invalid resource path");
 	let current = path;
 	const suffix: string[] = [];
 	for (let depth = 0; depth < 64; depth++) {
 		try {
-			return normalizePathForComparison(resolve(await realpath(current), ...suffix));
+			return resolve(await realpath(current), ...suffix);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			const node = await lstat(current).catch((cause) => {
@@ -304,12 +303,20 @@ async function canonicalPath(path: string): Promise<string> {
 	throw new Error("Resource path ancestry exceeded budget");
 }
 
+/** Internal ownership keys remain case-insensitive on Windows. Never persist these as cwd. */
+async function canonicalPath(path: string): Promise<string> {
+	return normalizePathForComparison(await canonicalAdmissionPath(path));
+}
+
 export interface LifecycleGuardPorts {
 	readClaims(
 		deadline: number,
 		signal?: AbortSignal,
 	): Promise<{ complete: boolean; claims: ResourceClaim[] }>;
+	/** Canonical comparison key, case-folded on Windows. */
 	canonicalPath(path: string): Promise<string>;
+	/** Case-preserving canonical path for a committed cwd/context (fixture seam). */
+	canonicalAdmissionPath?(path: string): Promise<string>;
 	/** Bounded lstat projection: device/inode only, never contents or a directory walk. */
 	pathIdentity?(path: string): Promise<string | null>;
 	probeGitRoot?(path: string, deadline: number): Promise<{ root: string; common: string } | null>;
@@ -581,10 +588,18 @@ async function probeGitRoot(
 	if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
 	return { root: await canonicalPath(parts[0]), common: await canonicalPath(parts[1]) };
 }
-const productionPorts: LifecycleGuardPorts = {
+const productionPorts: LifecycleGuardPorts & {
+	canonicalAdmissionPath(path: string): Promise<string>;
+} = {
 	readClaims: (deadline, signal) =>
 		(fixturePorts.getStore()?.readClaims ?? readClaims)(deadline, signal),
 	canonicalPath: (path) => (fixturePorts.getStore()?.canonicalPath ?? canonicalPath)(path),
+	canonicalAdmissionPath: (path) => {
+		const fixture = fixturePorts.getStore();
+		return (fixture?.canonicalAdmissionPath ?? fixture?.canonicalPath ?? canonicalAdmissionPath)(
+			path,
+		);
+	},
 	pathIdentity: (path) => (fixturePorts.getStore()?.pathIdentity ?? readPathIdentity)(path),
 	probeGitRoot: (path, deadline) =>
 		(fixturePorts.getStore()?.probeGitRoot ?? probeGitRoot)(path, deadline),
