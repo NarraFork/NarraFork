@@ -158,32 +158,38 @@ function ContentScrollSession({
 	const subscribers = useRef(new Set<(snapshot: ContentViewportSnapshot) => void>());
 	const viewportFrame = useRef<number | null>(null);
 
-	const getTarget = useCallback((): number | null => {
-		if (!viewportRef.current) return null;
-		const { scrollHeight, viewportHeight, scrollTop } = getSnapshot();
-		const max = Math.max(0, scrollHeight - viewportHeight);
-		if (config.current.followTarget === "end") return max;
-		const row = rowTarget.current;
-		if (!row || !Number.isFinite(row.top) || !Number.isFinite(row.bottom)) return null;
-		const margin = Math.min(ROW_MARGIN, viewportHeight / 4);
-		let top = scrollTop;
-		if (row.bottom > top + viewportHeight) top = row.bottom + margin - viewportHeight;
-		else if (row.top < top && row.bottom - row.top <= viewportHeight) top = row.top - margin;
-		else if (row.bottom <= top) top = row.bottom + margin - viewportHeight;
-		return Math.max(0, Math.min(max, top));
-	}, [getSnapshot]);
+	const getTarget = useCallback(
+		(snapshot?: ContentViewportSnapshot): number | null => {
+			if (!viewportRef.current) return null;
+			// Reuse only the caller's synchronous read phase, never a previous commit's geometry.
+			const { scrollHeight, viewportHeight, scrollTop } = snapshot ?? getSnapshot();
+			const max = Math.max(0, scrollHeight - viewportHeight);
+			if (config.current.followTarget === "end") return max;
+			const row = rowTarget.current;
+			if (!row || !Number.isFinite(row.top) || !Number.isFinite(row.bottom)) return null;
+			const margin = Math.min(ROW_MARGIN, viewportHeight / 4);
+			let top = scrollTop;
+			if (row.bottom > top + viewportHeight) top = row.bottom + margin - viewportHeight;
+			else if (row.top < top && row.bottom - row.top <= viewportHeight) top = row.top - margin;
+			else if (row.bottom <= top) top = row.bottom + margin - viewportHeight;
+			return Math.max(0, Math.min(max, top));
+		},
+		[getSnapshot],
+	);
 
 	const write = useCallback(
 		(top: number) => {
 			const node = viewportRef.current;
 			if (!node || !mounted.current || !Number.isFinite(top)) return;
-			const { scrollHeight, viewportHeight } = getSnapshot();
+			const { scrollHeight, viewportHeight, scrollTop } = getSnapshot();
 			const next = Math.max(0, Math.min(top, scrollHeight - viewportHeight));
-			if (Math.abs(node.scrollTop - next) < 0.01) return;
+			if (Math.abs(scrollTop - next) < 0.01) return;
 			reader.current.scrolling = false;
 			node.scrollTop = next;
-			expectedTop.current = node.scrollTop;
-			lastTop.current = node.scrollTop;
+			// Native clamping may differ from the requested top; retain the actual scroll echo.
+			const actualTop = node.scrollTop;
+			expectedTop.current = actualTop;
+			lastTop.current = actualTop;
 		},
 		[getSnapshot],
 	);
@@ -205,15 +211,14 @@ function ContentScrollSession({
 	}, []);
 
 	const syncResume = useCallback(() => {
-		const node = viewportRef.current;
-		const target = getTarget();
-		setShowResume(
-			!followingRef.current &&
-				everLive.current &&
-				!!node &&
-				(target === null || Math.abs(target - node.scrollTop) > EPSILON),
-		);
-	}, [getTarget]);
+		if (followingRef.current || !everLive.current || !viewportRef.current) {
+			setShowResume(false);
+			return;
+		}
+		const snapshot = getSnapshot();
+		const target = getTarget(snapshot);
+		setShowResume(target === null || Math.abs(target - snapshot.scrollTop) > EPSILON);
+	}, [getSnapshot, getTarget]);
 
 	const notifyViewport = useCallback(() => {
 		if (!mounted.current || viewportFrame.current !== null || subscribers.current.size === 0)
@@ -229,13 +234,19 @@ function ContentScrollSession({
 
 	const attemptFollow = useCallback(() => {
 		const node = viewportRef.current;
-		if (!node || !mounted.current || getSnapshot().viewportHeight <= 0) return;
-		const target = getTarget();
+		if (!node || !mounted.current) return;
+		// Historical and paused readers have no follow work; do not measure a target for them.
 		if (
-			followingRef.current &&
-			(config.current.live || pendingFinal.current || pendingResume.current) &&
-			target !== null
+			!followingRef.current ||
+			!(config.current.live || pendingFinal.current || pendingResume.current)
 		) {
+			syncResume();
+			return;
+		}
+		const snapshot = getSnapshot();
+		if (snapshot.viewportHeight <= 0) return;
+		const target = getTarget(snapshot);
+		if (target !== null) {
 			if (!primed.current) {
 				write(target);
 				primed.current = true;
@@ -333,8 +344,8 @@ function ContentScrollSession({
 		const body = contentRef.current;
 		if (!node || !body) return;
 		const readGeometry = () => {
-			const target = getTarget();
 			const snapshot = getSnapshot();
+			const target = getTarget(snapshot);
 			return {
 				height: snapshot.viewportHeight,
 				width: snapshot.viewportWidth,

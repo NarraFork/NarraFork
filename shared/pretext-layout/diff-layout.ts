@@ -1,8 +1,8 @@
 import {
 	type LayoutCursor,
-	layoutWithLines,
 	measureNaturalWidth,
 	prepareWithSegments,
+	walkLineRanges,
 } from "@chenglou/pretext";
 import type { DiffLine } from "./diff-core";
 import type { ParsedDiffHunk } from "./parse-unified-diff";
@@ -160,13 +160,16 @@ function layoutRow(
 	};
 	let offset = 0;
 	let maxWidth = 0;
-	const visualLines = layoutWithLines(prepared, width, type.lineHeight).lines.map((line) => {
+	const visualLines: DiffVisualLine[] = [];
+	// Use the same raw line walker as layoutWithLines without materializing its
+	// display strings: the painter needs source slices, not line.text.
+	walkLineRanges(prepared, width, (line) => {
 		// A normalized start can skip leading invisible segments. Assign those to
 		// this slice too, so every source code unit has exactly one visual owner.
 		const start = offset;
 		offset = consumedEndOffset(line.end);
 		maxWidth = Math.max(maxWidth, line.width);
-		return { start, end: offset, width: line.width };
+		visualLines.push({ start, end: offset, width: line.width });
 	});
 	// An all-discretionary row has no painted lines, but still owns source text.
 	if (!visualLines.length) {

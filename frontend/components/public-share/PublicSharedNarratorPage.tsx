@@ -284,6 +284,7 @@ function SessionPane({
 				<RenderLodCtx.Provider value={lodValue}>
 					<PretextExactMessageListLazy
 						narratorId={session.narratorId}
+						deferInteractions={false}
 						isActive={session.status === "working"}
 						dataSource={dataSource}
 					/>

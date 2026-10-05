@@ -21,7 +21,7 @@
 
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import { notifications } from "@mantine/notifications";
-import { memo, type ReactNode, useLayoutEffect, useRef } from "react";
+import { memo, type ReactNode, useLayoutEffect, useMemo, useRef } from "react";
 import { MessageContextMenuCtx } from "../message/MessageContextMenuCtx";
 import { openCommunicationRecipient } from "./communication-navigation";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
@@ -58,6 +58,7 @@ import {
 	TRACE_KINDS,
 } from "./vlist-exact-row-state";
 import { type InjectionNavigation, injectInjectionBubbleChrome } from "./vlist-injection-header";
+import { VListInteractionRowBoundsContext } from "./vlist-interaction-admission-context";
 import { traceRowFoldChannel } from "./vlist-interaction-state";
 import type { VListItem } from "./vlist-pipeline";
 import type { VListRowToolActions } from "./vlist-row-actions";
@@ -871,6 +872,20 @@ export const ExactRow = memo(
 		// selection surface. The chunked path behaves the same way (its edit branch
 		// returns before ContentViewer), so the row temporarily has no
 		// data-block-id — expected, and it comes back when editing ends.
+		const immediateInteraction =
+			item.spec.opts?.streamingContent === true ||
+			animateStreaming === true ||
+			extra.isActive === true ||
+			specTaskLive === true ||
+			permissionSlot != null ||
+			editorSlot != null ||
+			(traceRowPermissionSlots?.size ?? 0) > 0 ||
+			askInPassingPending != null ||
+			(kind === "tool-call" && isRunningStatus((item.measured as MeasuredToolCall).status));
+		const admissionBounds = useMemo(
+			() => ({ top, height, immediate: immediateInteraction }),
+			[top, height, immediateInteraction],
+		);
 		const body = editorBody ?? renderElement(kind, item.measured, extra);
 		// A plain content row has no capped box of its own, so its viewer action bar
 		// wraps the whole row body. Never while editing: the editor replaces the row.
@@ -976,13 +991,15 @@ export const ExactRow = memo(
 							style={{ position: "absolute", width: 0, height: 0, pointerEvents: "none" }}
 						/>
 					))}
-					{isDynamic ? (
-						<DynamicHeightReporter onHeight={onUnknownHeight}>
-							{interactiveBody}
-						</DynamicHeightReporter>
-					) : (
-						interactiveBody
-					)}
+					<VListInteractionRowBoundsContext.Provider value={admissionBounds}>
+						{isDynamic ? (
+							<DynamicHeightReporter onHeight={onUnknownHeight}>
+								{interactiveBody}
+							</DynamicHeightReporter>
+						) : (
+							interactiveBody
+						)}
+					</VListInteractionRowBoundsContext.Provider>
 				</div>
 				{/* The extended part of the hit box (the gap below this row) carries no
 				    text of its own, so a drag-selection crossing it would still fail to
@@ -1012,6 +1029,7 @@ export const ExactRow = memo(
 		prev.item.measured === next.item.measured &&
 		prev.item.spec.key === next.item.spec.key &&
 		prev.item.spec.kind === next.item.spec.kind &&
+		prev.item.spec.opts === next.item.spec.opts &&
 		prev.item.spec.lifecycleId === next.item.spec.lifecycleId &&
 		// Painted as `data-nf-unit` (the LOD-independent row identity), so a change
 		// must reach the DOM even though it affects nothing else.

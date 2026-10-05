@@ -81,6 +81,7 @@ import type { MessageListHandle, MessageListTailMeta } from "../message/message-
 import { NarratorMessageListSkeleton } from "../NarratorMessageListSkeleton";
 import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
+import { useNarratorPanelVisible } from "../narrator-panel-visibility";
 import { getGlobalSwipeAnchor, subscribeGlobalSwipeAnchor } from "../scroll/swipeState";
 import {
 	getCategory,
@@ -127,7 +128,6 @@ import { installVListCopyHandler } from "./vlist-copy-text";
 import type { VListDataSource } from "./vlist-data-source";
 import {
 	buildDrillSnapshots,
-	DRILL_MORPH_X_OFFSET,
 	type DrillRowSnapshot,
 	diffDrillSnapshots,
 } from "./vlist-drill-morph";
@@ -213,6 +213,8 @@ import {
 	useInterruptGuardActions,
 } from "./vlist-injection-guard-actions";
 import type { InjectionNavigation } from "./vlist-injection-header";
+import { createVListInteractionAdmission } from "./vlist-interaction-admission";
+import { VListInteractionAdmissionContext } from "./vlist-interaction-admission-context";
 import {
 	createVListInteractionState,
 	isFileChangesOpenRow,
@@ -247,6 +249,7 @@ import {
 	type LifecycleSnapshot,
 	planLifecycleMotion,
 } from "./vlist-lifecycle-motion";
+import { createVListResizeController, type VListResizeController } from "./vlist-live-resize";
 import {
 	createLodFocusPoint,
 	createLodStepThrottle,
@@ -257,27 +260,16 @@ import {
 	resolvePinchLodStep,
 	resolveWheelLodStep,
 } from "./vlist-lod-gesture";
-import {
-	buildLodSnapshots,
-	diffLodSnapshots,
-	type LodElementSnapshot,
-	type LodElementSource,
-} from "./vlist-lod-morph";
-import { lodMorphKeyframesFrom } from "./vlist-lod-morph-motion";
+import { commitLodMorph, resetLodMorphPlayback } from "./vlist-lod-morph-commit";
+import type { createLodMorphFrameBaseline } from "./vlist-lod-morph-frame";
+import type { createLodMorphGeometryCache } from "./vlist-lod-morph-geometry";
 import { createMorphDriver, type MorphDriver } from "./vlist-morph-driver";
-import {
-	admitPair,
-	initialStateFor,
-	type MorphElement,
-	planMorphTargets,
-} from "./vlist-morph-plan";
+import { createVListMorphScrollOrigin } from "./vlist-morph-scroll-origin";
 import {
 	createMotionScheduler,
 	drillScope,
 	frameScope,
-	LOD_MOTION_DURATION_MS,
 	lifecycleScope,
-	lodScope,
 	type MotionOp,
 	prefersReducedMotion,
 	rowScope,
@@ -296,6 +288,7 @@ import {
 	resolveReloadDelayMs,
 	shouldSurfaceDeferredReload,
 } from "./vlist-reload-policy";
+import { indexWithHeightOverrides } from "./vlist-resize-preview";
 import {
 	resolveReviewFeedbackActions,
 	useReviewFeedbackActions,
@@ -342,31 +335,8 @@ import {
 import { mergePinnedRowIndices, resolvePinnedRowIndices } from "./vlist-virtualization";
 import { createVListVisibleViewport } from "./vlist-visible-viewport";
 import { createVisualStateStore } from "./vlist-visual-state";
-import type { WindowRowProjection } from "./vlist-window-row-reuse";
-
-/**
- * Reuse the keyframe path's element list for the unified planner.
- *
- * Only the unit-box field name differs (`groupBox` → `unitBox`); `MorphElement` needs no
- * `unitAnchored` flag because it always prefers a unit box when one is present. Module-level
- * so the per-frame roll-forward does not re-allocate a closure on every commit.
- */
-function toMorphElements(src: readonly LodElementSource[]): MorphElement[] {
-	return src.map((el) => ({
-		unitId: el.unitId,
-		key: el.key,
-		kind: el.kind,
-		top: el.top,
-		height: el.height,
-		clip: el.clip ?? null,
-		nested: el.nested,
-		unitBox: el.groupBox ?? null,
-	}));
-}
-
-import { createVListResizeController, type VListResizeController } from "./vlist-live-resize";
-import { indexWithHeightOverrides } from "./vlist-resize-preview";
 import { bucketViewportHeight } from "./vlist-width-settle";
+import type { WindowRowProjection } from "./vlist-window-row-reuse";
 
 // Editing chrome is lazy: a list that is only being read never pays for the
 // editor's module graph (attachment thumbs, upload flow) or the modal.
@@ -421,6 +391,8 @@ type ScrollRef = RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) 
 
 type PretextExactMessageListProps = {
 	narratorId: string;
+	/** Defer optional cold controllers by default; public read-only transcripts opt out. */
+	deferInteractions?: boolean;
 	isSubagent?: boolean;
 	/** Narrator is working/waiting → render the live streaming tail overlay. */
 	isActive?: boolean;
@@ -540,6 +512,7 @@ export const PretextExactMessageList = memo(
 		function PretextExactMessageList(props, ref) {
 			const {
 				narratorId,
+				deferInteractions = true,
 				isSubagent,
 				isActive = false,
 				scrollRef,
@@ -617,6 +590,19 @@ export const PretextExactMessageList = memo(
 			 * every COW alias when the event does name replacement identities.
 			 */
 			const compactProgressKeysRef = useRef<Map<string, boolean>>(new Map());
+			const panelVisible = useNarratorPanelVisible();
+			const interactionOwner = useMemo(
+				() => ({
+					narratorId,
+					admission: deferInteractions ? createVListInteractionAdmission() : null,
+				}),
+				[narratorId, deferInteractions],
+			);
+			const interactionAdmission = interactionOwner.admission;
+			const interactionAdmissionRef = useRef(interactionAdmission);
+			useLayoutEffect(() => {
+				interactionAdmissionRef.current = interactionAdmission;
+			}, [interactionAdmission]);
 			const pinnedToBottomRef = useRef(true);
 			// Explicit full-text reading is not a request to chase newly streamed text.
 			const textReadingDetachedRef = useRef(false);
@@ -637,6 +623,8 @@ export const PretextExactMessageList = memo(
 			// before its browser-generated scroll event has been classified.
 			const scrollViewportHeightRef = useRef<number | null>(null);
 			const scrollRafRef = useRef(0);
+			// Lifetime holder only: recording a scroll sample never schedules React work.
+			const [morphScrollOrigin] = useState(createVListMorphScrollOrigin);
 			// Where the in-flight LOD gesture is pointing (mouse / pinch center), captured
 			// by the gesture handlers and read back by readCurrentView when the rebuild
 			// captures its anchor. Expires (LOD_FOCUS_TTL_MS) so an unrelated later rebuild
@@ -691,9 +679,34 @@ export const PretextExactMessageList = memo(
 			const footerHeightRef = useRef(0);
 			footerHeightRef.current = footerHeight;
 			pinnedToBottomRef.current = pinnedToBottom;
+			useEffect(() => {
+				if (!interactionAdmission) return;
+				const syncAdmissionVisibility = () => {
+					if (!panelVisible || document.hidden) interactionAdmission.suspend();
+					else
+						interactionAdmission.resume(
+							pinnedToBottomRef.current && !textReadingDetachedRef.current,
+						);
+				};
+				syncAdmissionVisibility();
+				document.addEventListener("visibilitychange", syncAdmissionVisibility);
+				return () => {
+					document.removeEventListener("visibilitychange", syncAdmissionVisibility);
+					interactionAdmission.suspend();
+				};
+			}, [interactionAdmission, panelVisible]);
+			useEffect(() => {
+				if (!interactionAdmission || !viewportNode) return;
+				const onScrollEnd = (event: Event) => {
+					if (event.target === viewportNode) interactionAdmission.finishScroll();
+				};
+				viewportNode.addEventListener("scrollend", onScrollEnd);
+				return () => viewportNode.removeEventListener("scrollend", onScrollEnd);
+			}, [interactionAdmission, viewportNode]);
 
 			const assignViewport = useCallback(
 				(node: HTMLDivElement | null) => {
+					morphScrollOrigin.invalidate();
 					viewportRef.current = node;
 					scrollViewportHeightRef.current = node?.clientHeight ?? null;
 					// Mirror into state so the ResizeObserver effect re-runs when the node is
@@ -704,7 +717,7 @@ export const PretextExactMessageList = memo(
 					if (typeof scrollRef === "function") scrollRef(node);
 					else setExternalRef(scrollRef, node);
 				},
-				[scrollRef],
+				[scrollRef, morphScrollOrigin],
 			);
 			const assignContent = useCallback(
 				(node: HTMLDivElement | null) => {
@@ -733,28 +746,40 @@ export const PretextExactMessageList = memo(
 			 * of once per animation frame; the chase's exact landing still uses the full
 			 * write so state converges to the true position.
 			 */
-			const writeScrollTopCore = useCallback((nextTop: number, advanceState: boolean) => {
-				const node = viewportRef.current;
-				if (!node || !visibleViewportRef.current.isVisible(node)) {
-					smoothFollowerRef.current?.cancel();
-					return;
-				}
-				const target = Math.max(0, nextTop);
-				node.scrollTop = target;
-				// Read back: the container clamps, so the settled value is what future scroll
-				// events will report for this write.
-				const settled = node.scrollTop;
-				suppressScrollStateRef.current = true;
-				suppressedScrollTopRef.current = settled;
-				scrollTopRef.current = settled;
-				scrollViewportHeightRef.current = node.clientHeight;
-				visibleViewportRef.current.recordScrollTop(settled);
-				if (advanceState) setScrollTop(settled);
-				requestAnimationFrame(() => {
-					suppressScrollStateRef.current = false;
-					suppressedScrollTopRef.current = null;
-				});
-			}, []);
+			const writeScrollTopCore = useCallback(
+				(nextTop: number, advanceState: boolean) => {
+					morphScrollOrigin.invalidate();
+					const node = viewportRef.current;
+					if (!node || !visibleViewportRef.current.isVisible(node)) {
+						smoothFollowerRef.current?.cancel();
+						return;
+					}
+					const target = Math.max(0, nextTop);
+					node.scrollTop = target;
+					// Read back: the container clamps, so the settled value is what future scroll
+					// events will report for this write.
+					const settled = node.scrollTop;
+					suppressScrollStateRef.current = true;
+					suppressedScrollTopRef.current = settled;
+					scrollTopRef.current = settled;
+					scrollViewportHeightRef.current = node.clientHeight;
+					visibleViewportRef.current.recordScrollTop(settled);
+					// Cache committed corrections for admission priority without mistaking
+					// anchoring/follow echoes for another reader gesture.
+					interactionAdmissionRef.current?.observeScroll({
+						scrollTop: settled,
+						viewportHeight: scrollViewportHeightRef.current,
+						atBottom: pinnedToBottomRef.current && !textReadingDetachedRef.current,
+						activity: false,
+					});
+					if (advanceState) setScrollTop(settled);
+					requestAnimationFrame(() => {
+						suppressScrollStateRef.current = false;
+						suppressedScrollTopRef.current = null;
+					});
+				},
+				[morphScrollOrigin],
+			);
 			const writeScrollTop = useCallback(
 				(nextTop: number) => writeScrollTopCore(nextTop, true),
 				[writeScrollTopCore],
@@ -1104,26 +1129,10 @@ export const PretextExactMessageList = memo(
 			const visualStateRef = useRef(createVisualStateStore());
 			/** Identities the driver should write this frame; refreshed by the morph effect. */
 			const morphIdentitiesRef = useRef<Set<string>>(new Set());
-			/**
-			 * Previous admitted frame for the UNIFIED path.
-			 *
-			 * Deliberately separate from `lodMorphPrevRef`: while the flag can be toggled at
-			 * runtime, sharing one ref would let a frame recorded by one path be diffed by the
-			 * other, whose admission rules differ — a silent mispairing rather than an error.
-			 */
-			const unifiedPrevRef = useRef<MorphElement[] | null>(null);
-			/**
-			 * `scrollTop` of the frame `unifiedPrevRef` was captured in.
-			 *
-			 * Element geometry is DOCUMENT px, so turning it into screen space needs the scroll
-			 * origin of ITS OWN frame. A gesture-driven LOD switch rewrites `scrollTop` (the LOD
-			 * anchor keeps the pointed-at content at a fixed screen position), so using the new
-			 * frame's origin for the old frame's geometry charges the entire scroll correction to
-			 * every element as travel it never made — the anchored content is displaced by the
-			 * correction and animates back from it, which reads as the zoom being centred on the
-			 * wrong place.
-			 */
-			const unifiedPrevScrollTopRef = useRef(0);
+			/** Reuse only the latest committed document-space geometry, never admitted maps. */
+			const lodMorphGeometryRef = useRef<ReturnType<typeof createLodMorphGeometryCache> | null>(
+				null,
+			);
 			/**
 			 * THE ONE TIMING OWNER for unified morphs.
 			 *
@@ -1189,8 +1198,7 @@ export const PretextExactMessageList = memo(
 				// what stops the linter from "simplifying" the dep list to `[]` — which would make
 				// this run on mount only and miss every mid-session flip, i.e. the entire case.
 				void unifiedMorph;
-				morphIdentitiesRef.current = new Set();
-				morphDriverRef.current?.stop();
+				resetLodMorphPlayback(morphIdentitiesRef, morphDriverRef.current);
 			}, [unifiedMorph]);
 
 			const foldCaptureRef = useRef<{
@@ -1327,14 +1335,11 @@ export const PretextExactMessageList = memo(
 			 */
 			const drillMorphRevisionRef = useRef<number>(-1);
 			/**
-			 * LOD-switch morph (see vlist-lod-morph.ts). Diff-driven off the committed layout,
-			 * keyed by `unitId` — the one identity that survives a level switch. The snapshot
-			 * rolls forward every commit so the next diff has a clean baseline; a morph only
-			 * plays when the document revision is unchanged AND the lod moved (pure re-theme).
+			 * Latest committed world frame for BOTH LOD paths. Each selected planner derives
+			 * its own admitted maps only on a real switch; no viewport-space Map is shared.
+			 * Origins/heights still advance on scroll/rebuild/reduced-motion commits.
 			 */
-			const lodMorphPrevRef = useRef<Map<string, LodElementSnapshot> | null>(null);
-			const lodMorphLodRef = useRef<number>(-1);
-			const lodMorphDocRevRef = useRef<number>(-1);
+			const lodMorphFramesRef = useRef<ReturnType<typeof createLodMorphFrameBaseline> | null>(null);
 			/**
 			 * LIFECYCLE transition (see vlist-lifecycle-motion.ts): the previous committed
 			 * frame of the mounted window, and the frame context it was taken under. Pure
@@ -1493,6 +1498,7 @@ export const PretextExactMessageList = memo(
 							// clicked control before the item anchor is captured.
 							smoothFollowerRef.current?.cancel();
 							textReadingDetachedRef.current = true;
+							interactionAdmissionRef.current?.markHistoryIntent();
 							pinnedToBottomRef.current = false;
 							visibleViewportRef.current.setPinned(false);
 							setPinnedToBottom(false);
@@ -1815,12 +1821,8 @@ export const PretextExactMessageList = memo(
 						return;
 					const entry = { requestId, height: rounded, width };
 					resizeFormHeightsRef.current.set(toolUseId, entry);
-					if (resizeControllerRef.current?.isPending()) {
-						// A form wrapping is geometry, NOT a semantic document mutation.
-						resizeDirtyKeysRef.current.add(rowKey);
-						resizeControllerRef.current.refresh();
-						return;
-					}
+					// Resize freezes wrapping, not permission content. Publish fixed-width
+					// height changes through the normal anchored document rebuild even pending.
 					setPermissionFormHeights((prev) => {
 						const next = new Map(prev);
 						next.set(toolUseId, entry);
@@ -3033,6 +3035,23 @@ export const PretextExactMessageList = memo(
 			}, [ensureWriteSource, narratorId, visible.start, visible.end, renderItems]);
 			const exactLayoutRef = useRef(exactLayout);
 			exactLayoutRef.current = exactLayout;
+			const readMorphScrollTop = useCallback(() => {
+				const node = viewportRef.current;
+				const layout = exactLayoutRef.current;
+				if (!node || !layout) return scrollTopRef.current;
+				return morphScrollOrigin.read(
+					{
+						narratorId,
+						viewport: node,
+						items: renderItemsRef.current,
+						layout,
+						viewportHeight: viewportHeightRef.current,
+						footerHeight: footerHeightRef.current,
+						footer: tailFooter,
+					},
+					() => node.scrollTop,
+				);
+			}, [morphScrollOrigin, narratorId, tailFooter]);
 
 			// Read watermark seam: the STRICTLY visible window (no overscan) mapped to
 			// its last source message id. Chat rooms translate that id back into a seq
@@ -3423,7 +3442,7 @@ export const PretextExactMessageList = memo(
 						})),
 					});
 				}
-				const next = buildDrillSnapshots(traces, node.scrollTop);
+				const next = buildDrillSnapshots(traces, readMorphScrollTop());
 				const prev = drillMorphPrevRef.current;
 				// Only morph across a USER-driven fold: if the document revision moved, a live
 				// patch / page / reload rebuilt the window and the diff would mix the reader's
@@ -3544,9 +3563,9 @@ export const PretextExactMessageList = memo(
 			 *
 			 * An LOD switch re-themes elements into different components (a card folds into a
 			 * trace row, a row expands into a card), so neither the fold nor the drill morph is
-			 * planned across it. This effect snapshots the viewport×3 window, diffs against the
-			 * previous commit, and morphs each pair from its old screen position to its new one
-			 * — all in one frame.
+			 * planned across it. Every commit records a lightweight world-frame descriptor;
+			 * only a playable switch admits the viewport×3 window and diffs the TWO committed
+			 * frames. Each pair morphs from its old screen position — all in one frame.
 			 *
 			 * Pairing covers the WHOLE document, not just the re-themed cards: a tool call pairs
 			 * on the LOD-independent `unitId` the adapter attaches, while everything else
@@ -3559,312 +3578,35 @@ export const PretextExactMessageList = memo(
 			 * Gate: the morph only plays when the document revision is UNCHANGED and the lod
 			 * MOVED (a pure re-theme). A revision move means a live patch / page / reload
 			 * rebuilt the window; diffing across it would animate a change the reader did not
-			 * make. The snapshot rolls forward either way so the next diff has a clean
-			 * baseline. Pure layout arithmetic throughout — no DOM measurement, no React state.
+			 * make. The frame rolls forward either way, including reduced motion, so the next
+			 * diff has a clean baseline without unused snapshots. Pure layout arithmetic
+			 * throughout — no DOM measurement, no React state.
 			 */
 			useLayoutEffect(() => {
 				const node = viewportRef.current;
 				const layout = exactLayoutRef.current;
 				if (!node || !layout) return;
-				const items = renderItemsRef.current;
-				const scrollTop = node.scrollTop;
-				const vh = viewportHeightRef.current;
-				// Assemble the unitId-bearing elements straight from the layout + specs. The
-				// whole committed document is read here (geometry is O(n) plain numbers, cheap);
-				// the viewport×3 crop happens inside buildLodSnapshots.
-				const elements: LodElementSource[] = [];
-				/**
-				 * Box of the render-UNIT each item belongs to, spanning all of its specs.
-				 *
-				 * The admission window has to judge one unit's content the same way at both levels,
-				 * and the two forms differ enormously: at L1/L2 an activity unit is a single short
-				 * fold, at L3+ it is a stack of full cards spanning thousands of pixels. Judged on
-				 * their own boxes, the unit's later CARDS fall outside the window in the expanded
-				 * frame while its ROWS all sit inside it in the folded one — so those members have
-				 * no counterpart and are planned nothing, silently.
-				 *
-				 * Grouping comes from `spec.morphGroupId`, which the layout assigns from the
-				 * activity grouping that applies at a low LOD — computed at every level, so both
-				 * sides agree on the membership. See the note on the loop below.
-				 */
-				const unitBoxes: Array<{ top: number; height: number } | null> = new Array(
-					items.length,
-				).fill(null);
-				{
-					// One SHARED, mutable box per unit: every index in a unit points at the same
-					// object, so growing it as later specs are seen retroactively widens the box the
-					// earlier ones already reference.
-					//
-					// ⚠️ Grouped by `spec.morphGroupId`, NOT by `spec.unitStart`.
-					//
-					// `unitStart` marks the first spec of each RENDER unit, and at L3+ grouping is
-					// off (`groupRenderUnits(segments, lod <= 2)`), so every spec starts its own
-					// unit and the flag is true for all of them. The box then degenerated to each
-					// element's OWN box — exactly what it exists to avoid. Measured on a 12-tool
-					// group at scrollTop 9500: 3 of 12 members paired with the degenerate box
-					// versus all 12 with the real group box.
-					//
-					// `morphGroupId` is computed from the activity grouping that would apply at a
-					// low LOD regardless of the current level (see buildPretextDocumentLayout), so
-					// the members of one group share it at BOTH levels and the box spans the whole
-					// group on each side. Specs outside any activity group have none and fall back
-					// to their own box, which is correct for them: their two forms are the same
-					// element.
-					const boxes = new Map<string, { top: number; height: number }>();
-					for (let i = 0; i < items.length; i++) {
-						const it = items[i];
-						const g = layout.items[i];
-						if (!it || !g) continue;
-						const groupId = it.spec.morphGroupId;
-						if (!groupId) {
-							unitBoxes[i] = { top: g.top, height: g.height };
-							continue;
-						}
-						const existing = boxes.get(groupId);
-						if (!existing) {
-							const box = { top: g.top, height: g.height };
-							boxes.set(groupId, box);
-							unitBoxes[i] = box;
-							continue;
-						}
-						// Mutated in place so the members already pointing at this box widen with it.
-						existing.height = Math.max(existing.height, g.top + g.height - existing.top);
-						unitBoxes[i] = existing;
-					}
-				}
-				for (let index = 0; index < items.length; index++) {
-					const item = items[index];
-					const geo = layout.items[index];
-					if (!item || !geo) continue;
-					// `key` and `kind` travel with `unitId`: the planner pairs on `unitId ?? key`
-					// (so the document body — markdown, bubbles, system cards — is no longer
-					// skipped for want of a unitId) and reads `kind` to decide whether the morph
-					// is a component swap worth cross-fading. See vlist-lod-morph.ts.
-					elements.push({
-						unitId: item.spec.unitId,
-						key: item.spec.key,
-						kind: item.spec.kind,
-						top: geo.top,
-						height: geo.height,
-						// Anchored to the whole unit, so a tool CARD at L3+ is admitted on the same
-						// basis as the folded ROW it pairs with at L1/L2. Without this the fix on the
-						// folded side alone changes nothing: the card is a top-level element with its
-						// own tall box, so the unit's later cards still prune themselves out of the
-						// expanded frame and still have no counterpart.
-						groupBox: unitBoxes[index],
-						unitAnchored: true,
-					});
-					// The L2/L3 boundary: a tool call is a summary ROW inside this trace at L1/L2
-					// and a top-level CARD at L3+, both carrying the same `unitId`. Without the
-					// nested rows the pairing has an empty intersection exactly at the switch that
-					// changes the most, so nothing animates where it matters.
-					//
-					// `clip` is the item's own painted box: the shell clips a non-dynamic row to
-					// its arithmetic height, so a nested row animated from far outside that box
-					// would be invisible mid-flight. The planner drops the travel (keeping the
-					// fade) for that case — see clipFor.
-					const measured = measuredByKeyRef.current.get(item.spec.key) as
-						| { rows?: { top: number; rowHeight: number; unitId?: string }[] }
-						| undefined;
-					if (!measured?.rows) continue;
-					const clip = { top: geo.top, bottom: geo.top + geo.height };
-					for (const row of measured.rows) {
-						if (!row.unitId) continue;
-						elements.push({
-							unitId: row.unitId,
-							// A row key is scoped to its trace, so it is not a usable cross-level
-							// identity; `nested` tells the builder not to fall back to it.
-							key: row.unitId,
-							// The kind the ROW is, not the trace's: pairing it against the card's
-							// `tool-call` is what marks this morph as a re-theme worth fading.
-							kind: "trace-row",
-							top: geo.top + row.top,
-							// The title LINE, not the row block: a drilled-in row's block is a whole
-							// card tall, and the perceived thing that moves is the summary line.
-							height: row.rowHeight,
-							clip,
-							nested: true,
-							// Admission is decided by the GROUP's box, not this row's. At L3+ the same
-							// content spans an order of magnitude more height (10 rows of 19px become
-							// 10 cards of ~400px), so judged on their own boxes the later members fall
-							// outside the ×3 window in the expanded frame only — no counterpart, no
-							// plan, and the reader sees the first few rows animate while the rest
-							// teleport. The group's box is short and stable at both levels.
-							groupBox: { top: geo.top, height: geo.height },
-						});
-					}
-				}
-				const next = buildLodSnapshots(elements, scrollTop, vh);
-				const prev = lodMorphPrevRef.current;
-				const docRev = foldRevisionOf(foldDocumentRevision);
-				const lod = pretextDocument.manifest?.lod ?? -1;
-				const isLodSwitch =
-					prev != null &&
-					lodMorphDocRevRef.current === docRev &&
-					lodMorphLodRef.current !== -1 &&
-					lodMorphLodRef.current !== lod;
-				// Roll forward BEFORE the early returns, so the next diff compares against this
-				// frame even when the morph is skipped (non-LOD rebuild, reduced motion, first
-				// paint).
-				lodMorphPrevRef.current = next;
-				lodMorphDocRevRef.current = docRev;
-				lodMorphLodRef.current = lod;
-				/**
-				 * The unified baseline must roll forward on EVERY frame, exactly like the keyframe
-				 * path's `prev` above — and for the same reason.
-				 *
-				 * ⚠️ This was originally written inside the `unifiedMorph` branch below, i.e. AFTER the
-				 * `isLodSwitch` guard. That made the baseline unreachable on ordinary frames, so it
-				 * only ever recorded the layout of a frame that was ALREADY mid-switch: every switch
-				 * then diffed against a stale, one-step-late snapshot and most elements failed to pair
-				 * at all. The symptom was a large number of rows losing their animation — the very bug
-				 * the rewrite set out to remove, reintroduced by putting the roll-forward on the wrong
-				 * side of a `return`.
-				 *
-				 * Computed unconditionally rather than lazily: an admitted snapshot is plain numbers
-				 * over the already-built element list, and skipping it on non-switch frames is exactly
-				 * what broke it.
-				 */
-				// Raw element list, not an admitted snapshot: admission needs BOTH frames (see
-				// `admitPair`), so the decision cannot be taken until the next frame arrives.
-				const unifiedElements = toMorphElements(elements);
-				const unifiedPrev = unifiedPrevRef.current;
-				const unifiedPrevScrollTop = unifiedPrevScrollTopRef.current;
-				unifiedPrevRef.current = unifiedElements;
-				// Rolled forward with the elements it describes, on EVERY frame, or the pair would
-				// be converted with mismatched scroll origins (see the ref's note).
-				unifiedPrevScrollTopRef.current = scrollTop;
-				if (!isLodSwitch || prefersReducedMotion()) return;
-				if (unifiedMorph) {
-					// UNIFIED PATH. Targets, not keyframes: the element is already laid out at its new
-					// position, so it is handed the displacement it must travel back from and a resting
-					// target of zero. Nothing here names a START, which is precisely why an interrupted
-					// switch needs no special handling — the store already holds the visual position.
-					if (!unifiedPrev) return;
-					// Admitted as a PAIR: an element visible at either level is kept at both. Judging
-					// each frame on its own geometry drops whole units, because one level's unit box can
-					// miss the window entirely while the other's spans it.
-					const { before: unifiedBefore, after: unifiedAfter } = admitPair(
-						unifiedPrev,
-						unifiedElements,
-						scrollTop,
-						vh,
-						// The baseline frame's own scroll origin. A gesture-driven switch corrects
-						// `scrollTop` to hold the pointed-at content still, so passing only the current
-						// value would turn that correction into travel for every element.
-						unifiedPrevScrollTop,
-					);
-					const targets = planMorphTargets(
-						unifiedBefore,
-						unifiedAfter,
-						// A card is fully "cardness"; every folded form is not. This is the only place
-						// the kind vocabulary is interpreted, keeping the planner generic.
-						(kind) => (kind === "tool-call" || kind === "subagent-card" ? 1 : 0),
-						// The two forms start their content at different offsets; the drill morph already
-						// derives this from the shared row metrics and card padding.
-						() => DRILL_MORPH_X_OFFSET,
-					);
-					const store = visualStateRef.current;
-					const ids = new Set<string>();
-					for (const plan of targets) {
-						ids.add(plan.unitId);
-						// Seed the new displacement UNLESS the element is still moving.
-						//
-						// ⚠️ The predicate is `isMoving`, NOT "does the store know this element". A
-						// settled element is still retained, so keying on existence meant every switch
-						// after the first one applied no displacement at all and the element teleported —
-						// which is exactly the "most rows don't animate" report. It also explains why
-						// interrupting repeatedly appeared to help: an interrupted element IS still
-						// moving, so it happened to take the right branch.
-						//
-						//   moving  → retarget only, continuing from the current visual position;
-						//   settled → seed the fresh displacement, or there is nothing to animate.
-						if (store.isMoving(plan.unitId)) {
-							// Mid-flight: keep the visual position and only change where it is heading. This
-							// is the interruption property — the element continues from where it is.
-							store.setTarget(plan.unitId, plan.target);
-						} else {
-							// Settled (or new): displace it back to where it was and let it travel home.
-							// `startFrom` rather than `setTarget`, because the latter deliberately never
-							// moves an existing element — using it here left every switch after the first
-							// with no displacement at all, i.e. no animation.
-							store.startFrom(plan.unitId, initialStateFor(plan), plan.target);
-						}
-					}
-					morphIdentitiesRef.current = ids;
-					store.retain(ids);
-					morphDriverRef.current?.kick();
-					return;
-				}
-				const plans = diffLodSnapshots(prev, next);
-				if (plans.length === 0) return;
-				motionRef.current.begin();
-				motionRef.current.push(
-					plans.map((plan) => ({
-						scope: lodScope(plan.unitId),
-						resolve: () => {
-							const escaped = cssAttrEscape(plan.unitId);
-							// `data-nf-unit` first, then `data-nf-row-key` — the only attribute an
-							// element paired on its `key` paints. Without the fallback every
-							// key-paired plan would resolve to null and the document body would go
-							// back to teleporting, silently: the plans are still produced, so nothing
-							// looks broken from the planner's side.
-							//
-							// One selector serves both forms of a tool call, because `data-nf-unit` is
-							// painted on the top-level card wrapper AND on the folded trace row, and
-							// the two never coexist: at L3+ only the card is mounted, at L1/L2 only
-							// the row. (A drilled-in card inside a row paints no `data-nf-unit` of its
-							// own, so it cannot shadow its row here.)
-							return (
-								node.querySelector<HTMLElement>(`[data-nf-unit="${escaped}"]`) ??
-								node.querySelector<HTMLElement>(`[data-nf-row-key="${escaped}"]`)
-							);
-						},
-						// A builder, so a switch re-triggered mid-flight (holding a zoom shortcut, or a
-						// pinch crossing two thresholds) resumes from where the previous motion
-						// visually got to. With `fill: "none"` the plain array restarts from the
-						// committed geometry the cancelled animation snapped back to — a visible jump.
-						keyframes: (previous) => lodMorphKeyframesFrom(plan, previous),
-					})),
-					// A level switch re-themes the whole document at once, so it gets the longer
-					// base. The override is event-level, applied to every op in this batch.
-					LOD_MOTION_DURATION_MS,
-				);
-				// A RE-THEMED element (`plan.fade`) is the same trace-row ↔ tool-call pair a drill
-				// morph handles, so it gets the same two extra fades — the tail cluster, whose
-				// travel distance is unknowable without measuring rendered text, and the border,
-				// which exists in only one of the two forms.
-				//
-				// Only re-themes: an element that merely MOVED keeps its component, so its tail and
-				// border are already correct and animating them would make unchanged chrome blink
-				// once per zoom step.
-				motionRef.current.push(
-					plans.flatMap((plan) => {
-						if (!plan.fade) return [];
-						const escaped = cssAttrEscape(plan.unitId);
-						const host =
-							node.querySelector<HTMLElement>(`[data-nf-unit="${escaped}"]`) ??
-							node.querySelector<HTMLElement>(`[data-nf-row-key="${escaped}"]`);
-						if (!host) return [];
-						// The card form's kind: fade the border IN when arriving at it, OUT when
-						// leaving. `plan.fade` guarantees the two kinds differ.
-						const kind = plan.toKind === "tool-call" ? "expand" : "collapse";
-						return [
-							{
-								scope: `${lodScope(plan.unitId)}:tail`,
-								resolve: () => host.querySelector<HTMLElement>("[data-nf-card-tail]"),
-								keyframes: (previous: { progress: number } | null) =>
-									drillTailKeyframesFrom(kind, previous),
-							},
-							{
-								scope: `${lodScope(plan.unitId)}:border`,
-								resolve: () => host.querySelector<HTMLElement>("[data-nf-card-surface]"),
-								keyframes: (previous: { progress: number } | null) =>
-									drillBorderKeyframesFrom(kind, previous),
-							},
-						];
-					}),
-					LOD_MOTION_DURATION_MS,
+				commitLodMorph(
+					{
+						narratorId,
+						items: renderItemsRef.current,
+						layout,
+						index: pretextDocument.index,
+						scrollTop: readMorphScrollTop(),
+						viewportHeight: viewportHeightRef.current,
+						documentRevision: foldRevisionOf(foldDocumentRevision),
+						lod: pretextDocument.manifest?.lod ?? -1,
+					},
+					{ geometry: lodMorphGeometryRef, frames: lodMorphFramesRef },
+					{
+						viewport: node,
+						unified: unifiedMorph,
+						prefersReducedMotion,
+						visualState: visualStateRef.current,
+						identities: morphIdentitiesRef,
+						driver: morphDriverRef.current,
+						motion: motionRef.current,
+					},
 				);
 			});
 
@@ -3918,7 +3660,7 @@ export const PretextExactMessageList = memo(
 					widthBucket: String(pretextDocument.manifest?.widthBucket ?? ""),
 					resizing:
 						pretextDocument.resizePreview || resizeControllerRef.current?.isPending() === true,
-					scrollTop: node.scrollTop,
+					scrollTop: readMorphScrollTop(),
 				};
 				const prev = lifecyclePrevRef.current;
 				const prevContext = lifecyclePrevContextRef.current;
@@ -3957,7 +3699,7 @@ export const PretextExactMessageList = memo(
 				// Land a running chase first: the plan's pinned afterScrollTop is the PREDICTED
 				// bottom, and a glide still heading there would move rows under the animation.
 				smoothFollowerRef.current?.snapToTarget();
-				const afterScrollTop = pinnedToBottom ? getScrollBottomTarget(node) : node.scrollTop;
+				const afterScrollTop = pinnedToBottom ? getScrollBottomTarget(node) : readMorphScrollTop();
 				const plan = planLifecycleMotion({
 					before: prev,
 					after: next,
@@ -4206,14 +3948,15 @@ export const PretextExactMessageList = memo(
 				onAtBottomChange?.(pinnedToBottom);
 			}, [onAtBottomChange, pinnedToBottom]);
 
-			// Width events have two paths: an rAF-coalesced visible-window preview,
-			// and one explicit full-width commit after the gesture/quiet period ends.
+			// Freeze row wrapping during resize; only the outer viewport follows the host.
+			// Commit final geometry once after the gesture/quiet period ends.
 			// The observer follows the actual node, not a ref captured once on mount.
 			useLayoutEffect(() => {
 				const node = viewportNode;
 				if (!node) return;
 				const pointerTracker = createPointerDragTracker(() => controller.release());
 				const controller = createVListResizeController({
+					previewPolicy: "freeze",
 					readSize: () => ({
 						width: resolveNarratorColumnWidth(node.clientWidth, PAGE_PADDING, centeredColumn),
 						boxWidth: node.offsetWidth,
@@ -4232,10 +3975,7 @@ export const PretextExactMessageList = memo(
 						setViewportHeight(height);
 						setLayoutHeight(height);
 					},
-					onPreview: ({ width, height }) => {
-						setViewportHeight(height);
-						return pretextDocumentRef.current.previewWidth(width, mobileViewportRef.current);
-					},
+					onPreview: () => false,
 					onCommit: ({ width, height }) => {
 						committedContentWidthRef.current = width;
 						setContentWidth(width);
@@ -4249,6 +3989,7 @@ export const PretextExactMessageList = memo(
 				});
 				resizeControllerRef.current = controller;
 				const measure = () => {
+					morphScrollOrigin.invalidate();
 					// The stable chat temporarily parks off-layout while a dock slot mounts.
 					// Do not commit a one-pixel reading width or zero plan-detail cap.
 					if (!visibleViewportRef.current.isVisible(node)) return;
@@ -4257,9 +3998,9 @@ export const PretextExactMessageList = memo(
 					visibleViewportRef.current.resume(node, pinnedToBottomRef.current, writeScrollTop);
 					readViewportView();
 					controller.observe();
-					// Live height feeds the window, not full-build params during a width preview.
+					// Exact height keeps the mounted window live while wrapping stays committed.
+					setViewportHeight(node.clientHeight);
 					if (!controller.isPending()) {
-						setViewportHeight(node.clientHeight);
 						setLayoutHeight(node.clientHeight);
 					}
 				};
@@ -4272,15 +4013,15 @@ export const PretextExactMessageList = memo(
 					controller.dispose();
 					if (resizeControllerRef.current === controller) resizeControllerRef.current = null;
 				};
-			}, [viewportNode, centeredColumn, readViewportView, writeScrollTop]);
+			}, [viewportNode, centeredColumn, readViewportView, writeScrollTop, morphScrollOrigin]);
 			// A capped column may keep the same width across a viewport breakpoint.
 			// Notify the controller explicitly rather than relying on ResizeObserver.
 			useLayoutEffect(() => {
 				void isMobileViewport;
 				resizeControllerRef.current?.observe();
 			}, [isMobileViewport]);
-			// Re-preview a newly committed semantic snapshot or new window, including an
-			// asynchronous page/font/stream update that replaced the previous preview.
+			// Refresh is separate from observing geometry: freeze intentionally ignores it.
+			// Semantic page/font/stream updates still publish normally at committed width.
 			useLayoutEffect(() => {
 				void pretextDocument.resizeRevision;
 				void scrollTop;
@@ -4299,12 +4040,14 @@ export const PretextExactMessageList = memo(
 
 			const hasTailFooter = tailFooter != null;
 			useLayoutEffect(() => {
+				morphScrollOrigin.invalidate();
 				const node = footerNodeRef.current;
 				if (!hasTailFooter || !node) {
 					setFooterHeight(0);
 					return;
 				}
 				const measure = () => {
+					morphScrollOrigin.invalidate();
 					if (!visibleViewportRef.current.isVisible(viewportRef.current)) return;
 					setFooterHeight(Math.max(0, node.offsetHeight));
 				};
@@ -4313,7 +4056,7 @@ export const PretextExactMessageList = memo(
 				const observer = new ResizeObserver(measure);
 				observer.observe(node);
 				return () => observer.disconnect();
-			}, [hasTailFooter]);
+			}, [hasTailFooter, morphScrollOrigin]);
 
 			// The streaming row now grows `exactLayout.totalHeight` like any other row, so
 			// the geometry revision no longer needs a separate tail-height term.
@@ -4454,6 +4197,14 @@ export const PretextExactMessageList = memo(
 					suppressedScrollTopRef.current,
 					nextTop,
 				);
+				// Classify before React mounts a new band. Only optional cold controllers
+				// subscribe to admission; this never invalidates the body/row element cache.
+				interactionAdmissionRef.current?.observeScroll({
+					scrollTop: nextTop,
+					viewportHeight: liveViewportHeight,
+					atBottom: effectiveAtBottom,
+					activity: !isEcho && !viewportResizedWhilePinned,
+				});
 				// Scrollbar drags and keyboard scrolling have no wheel/touch event to arm
 				// the history gate. Record their actual upward travel before testing it.
 				// Keyboard resize/focus adjustment is not a request to read older history.
@@ -4510,12 +4261,39 @@ export const PretextExactMessageList = memo(
 				resizeControllerRef.current?.refresh();
 				const layout = exactLayoutRef.current;
 				if (!layout) return;
+				// This frame sampled the native position before React mounts the new band.
+				// Reuse only for a whole-viewport jump with unchanged document geometry.
+				// Fine scrolling keeps its original pre-paint layout-read order; deferring
+				// that small flush increased its frame-interval tail in browser controls.
+				if (
+					resizeControllerRef.current?.isPending() !== true &&
+					liveViewportHeight === viewportHeightRef.current &&
+					Math.abs(settledTop - previousTop) > liveViewportHeight
+				) {
+					morphScrollOrigin.record(
+						{
+							narratorId,
+							viewport: node,
+							items: renderItemsRef.current,
+							layout,
+							viewportHeight: liveViewportHeight,
+							footerHeight: footerHeightRef.current,
+							footer: tailFooter,
+						},
+						settledTop,
+					);
+				} else {
+					morphScrollOrigin.invalidate();
+				}
 				const nextWindow = resolveVisibleWindow(layout, settledTop, viewportHeight, ITEM_OVERSCAN);
 				const cur = visibleRef.current;
 				if (nextWindow.start !== cur.start || nextWindow.end !== cur.end) {
 					setScrollTop(settledTop);
 				}
 			}, [
+				morphScrollOrigin,
+				narratorId,
+				tailFooter,
 				maybeAutoLoadOlder,
 				readViewportView,
 				onAtBottomChange,
@@ -4526,9 +4304,11 @@ export const PretextExactMessageList = memo(
 			]);
 
 			const onScroll = useCallback(() => {
+				// Until the queued native event is classified, an older sample is not live.
+				morphScrollOrigin.invalidate();
 				if (scrollRafRef.current) return;
 				scrollRafRef.current = requestAnimationFrame(processScrollFrame);
-			}, [processScrollFrame]);
+			}, [processScrollFrame, morphScrollOrigin]);
 			useEffect(
 				() => () => {
 					if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current);
@@ -4542,6 +4322,7 @@ export const PretextExactMessageList = memo(
 					// chase drifting in afterwards would fight the write.
 					getSmoothFollower().cancel();
 					textReadingDetachedRef.current = false;
+					interactionAdmissionRef.current?.setAtBottom(true);
 					pinnedToBottomRef.current = true;
 					visibleViewportRef.current.setPinned(true);
 					setPinnedToBottom(true);
@@ -4563,6 +4344,7 @@ export const PretextExactMessageList = memo(
 				// Reader intent (wheel-up): the chase must die with the pin, or its next
 				// frame re-writes scrollTop and pulls the reader back down.
 				getSmoothFollower().cancel();
+				interactionAdmissionRef.current?.markHistoryIntent();
 				pinnedToBottomRef.current = false;
 				visibleViewportRef.current.setPinned(false);
 				setPinnedToBottom(false);
@@ -4605,6 +4387,7 @@ export const PretextExactMessageList = memo(
 					// A jump is an explicit reading action: unpin so streaming output cannot
 					// immediately pull the reader back to the tail.
 					getSmoothFollower().cancel();
+					interactionAdmissionRef.current?.markHistoryIntent();
 					pinnedToBottomRef.current = false;
 					visibleViewportRef.current.setPinned(false);
 					setPinnedToBottom(false);
@@ -4615,6 +4398,7 @@ export const PretextExactMessageList = memo(
 			const handleCompactMarkerJump = useCallback(
 				(marker: VListCompactMarker) => {
 					getSmoothFollower().cancel();
+					interactionAdmissionRef.current?.markHistoryIntent();
 					pinnedToBottomRef.current = false;
 					visibleViewportRef.current.setPinned(false);
 					setPinnedToBottom(false);
@@ -4757,6 +4541,7 @@ export const PretextExactMessageList = memo(
 						if (!node) return false;
 						const element = mountedJumpTarget(node, domIds, targetIds);
 						if (!element) return false;
+						interactionAdmissionRef.current?.markHistoryIntent();
 						pinnedToBottomRef.current = false;
 						visibleViewportRef.current.setPinned(false);
 						setPinnedToBottom(false);
@@ -4778,6 +4563,7 @@ export const PretextExactMessageList = memo(
 							const itemIndex = jumpTargetItemIndex(index, messageId);
 							if (itemIndex == null) continue;
 							const targetTop = index.itemStart(itemIndex) - Math.max(0, node.clientHeight / 2);
+							interactionAdmissionRef.current?.markHistoryIntent();
 							pinnedToBottomRef.current = false;
 							visibleViewportRef.current.setPinned(false);
 							setPinnedToBottom(false);
@@ -4854,6 +4640,7 @@ export const PretextExactMessageList = memo(
 						// Paging upward while pinned to the bottom would re-snap the canvas to the
 						// tail on every commit (commitPrependLayout's pinned branch), fighting the
 						// jump. A jump is an explicit reading action, so unpin first.
+						interactionAdmissionRef.current?.markHistoryIntent();
 						pinnedToBottomRef.current = false;
 						visibleViewportRef.current.setPinned(false);
 						setPinnedToBottom(false);
@@ -5646,7 +5433,9 @@ export const PretextExactMessageList = memo(
 										/>
 									);
 								})}
-								{windowRowElements}
+								<VListInteractionAdmissionContext.Provider value={interactionAdmission}>
+									{windowRowElements}
+								</VListInteractionAdmissionContext.Provider>
 							</div>
 						) : (
 							// Loading / error placeholder. While the document is being fetched and

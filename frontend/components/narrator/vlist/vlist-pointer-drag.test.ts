@@ -13,6 +13,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { parseHTML } from "linkedom";
+import { createVListResizeController } from "./vlist-live-resize";
 import { createPointerDragTracker } from "./vlist-pointer-drag";
 import { resolveWidthSettle, WIDTH_SETTLE_DELAY_MS } from "./vlist-width-settle";
 
@@ -440,6 +441,115 @@ describe("listener coverage (source)", () => {
 		for (const registration of registrations) {
 			expect(registration).toContain("capture: true");
 			expect(registration).toContain("passive: true");
+		}
+	});
+});
+
+describe("pointer tracker with frozen production resize controller", () => {
+	function frozenHarness() {
+		let width = 650;
+		let committed = 700;
+		let id = 0;
+		const frames = new Map<number, () => void>();
+		const commits: number[] = [];
+		const tracker = createPointerDragTracker(() => controller.release());
+		const controller = createVListResizeController({
+			previewPolicy: "freeze",
+			readSize: () => ({ width, boxWidth: width + 32, height: 700 }),
+			getCommittedWidth: () => committed,
+			pointerDown: tracker.isDown,
+			onInitial: () => {},
+			onPreview: () => {
+				throw new Error("Frozen rows must never preview");
+			},
+			onCommit: (size) => {
+				committed = size.width;
+				commits.push(size.width);
+			},
+			requestFrame: (callback) => {
+				frames.set(++id, callback);
+				return id;
+			},
+			cancelFrame: (frameId) => {
+				frames.delete(frameId);
+			},
+			setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+			clearTimer: () => {},
+		});
+		return {
+			controller,
+			commits,
+			set width(value: number) {
+				width = value;
+			},
+			frame: () => {
+				for (const [frameId, callback] of [...frames]) {
+					frames.delete(frameId);
+					callback();
+				}
+			},
+			dispose: () => {
+				tracker.dispose();
+				controller.dispose();
+			},
+		};
+	}
+
+	it("checks host resize after an unobserved release but never rebuilds a plain click", () => {
+		const h = frozenHarness();
+		try {
+			h.width = 700;
+			fire("pointerdown", 1);
+			fire("pointerup", 1);
+			h.frame();
+			expect(h.commits).toEqual([]);
+			fire("pointerdown", 2);
+			fire("pointerup", 2);
+			expect(h.controller.isPending()).toBe(false);
+			h.width = 620;
+			h.frame();
+			expect(h.commits).toEqual([620]);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	it("waits for every touch, then reads host geometry after the release event", () => {
+		const h = frozenHarness();
+		try {
+			fire("pointerdown", 1);
+			fire("pointerdown", 2);
+			h.controller.observe();
+			fire("pointerup", 1);
+			h.frame();
+			expect(h.commits).toEqual([]);
+			fire("pointerup", 2);
+			expect(h.commits).toEqual([]);
+			// Simulate host release layout after the tracker callback (not DOM capture).
+			h.width = 620;
+			h.frame();
+			expect(h.commits).toEqual([620]);
+		} finally {
+			h.dispose();
+		}
+	});
+
+	it("does not commit a new pointer held before the prior release frame", () => {
+		const h = frozenHarness();
+		try {
+			fire("pointerdown", 1);
+			h.controller.observe();
+			fire("pointerup", 1);
+			fire("pointerdown", 2);
+			h.width = 620;
+			h.frame();
+			expect(h.commits).toEqual([]);
+			expect(h.controller.isPending()).toBe(true);
+			fire("pointercancel", 2);
+			h.frame();
+			expect(h.commits).toEqual([620]);
+		} finally {
+			h.dispose();
 		}
 	});
 });

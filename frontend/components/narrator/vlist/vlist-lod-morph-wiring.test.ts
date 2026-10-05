@@ -2,9 +2,9 @@
  * vlist-lod-morph-wiring.test.ts — Source-level guard for the LOD-switch morph's
  * shell wiring.
  *
- * The pure planner (`vlist-lod-morph`) and the WAAPI edge (`vlist-lod-morph-motion`)
- * are unit-tested on their own. What neither can see is WHERE they are wired into
- * the shell — and that is where this feature's failure modes live:
+ * `vlist-lod-morph-frame.test.ts` and `vlist-lod-morph-geometry.test.ts` call the
+ * production commit entry directly; they do not mount the React shell. These guards
+ * pin that shell's input/ref forwarding and the entry's production planner/player edges:
  *
  *  - morphing on a NON-LOD rebuild (a live patch / page would animate a change the
  *    reader did not make);
@@ -20,11 +20,13 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import { shellSource } from "./guard-source";
+import { shellModule, shellSource } from "./guard-source";
+import { sliceBracketedRegion } from "./source-slice";
 
-const DIR = import.meta.dir;
+const ENTRY = shellModule("PretextExactMessageList.tsx");
+const COMMIT = shellModule("vlist-lod-morph-commit.ts");
+const GEOMETRY = shellModule("vlist-lod-morph-geometry.ts");
+const FRAME = shellModule("vlist-lod-morph-frame.ts");
 /**
  * The shell's whole module set: the negative rules below forbid a per-feature morph
  * controller ANYWHERE in the shell, and a rule scoped to one file stops guarding as
@@ -32,45 +34,59 @@ const DIR = import.meta.dir;
  */
 const SHELL = shellSource();
 
-/**
- * The body of the shell's LOD-morph layout effect.
- *
- * Anchored at the effect's own opening rather than at `buildLodSnapshots(`: the
- * snapshot SOURCE is assembled in a loop above that call, so a slice starting there
- * cannot see what the snapshot is actually fed — which is half of what this file
- * guards.
- */
+/** Only the React scheduling/input boundary remains in the shell. */
 function morphEffect(): string {
-	const buildIdx = SHELL.indexOf("buildLodSnapshots(");
-	expect(buildIdx).toBeGreaterThan(0);
-	const start = SHELL.lastIndexOf("useLayoutEffect(() => {", buildIdx);
+	const callAt = ENTRY.indexOf("commitLodMorph(");
+	expect(callAt).toBeGreaterThan(0);
+	const start = ENTRY.lastIndexOf("useLayoutEffect(() => {", callAt);
 	expect(start).toBeGreaterThan(0);
-	// Ends at the push of this effect's ops into the shared motion scheduler, which
-	// replaced the per-feature controller (see vlist-motion-scheduler.ts).
-	const end = SHELL.indexOf("lodScope(", buildIdx);
-	expect(end).toBeGreaterThan(buildIdx);
-	return SHELL.slice(start, SHELL.indexOf("\t});", end));
+	const effect = sliceBracketedRegion(ENTRY.slice(start), "useLayoutEffect(() => {");
+	if (!effect) throw new Error("Missing committed LOD morph layout effect");
+	expect(effect).toContain("commitLodMorph(");
+	return effect;
 }
 
 describe("LOD morph: diff-driven, keyed by unitId ?? key", () => {
-	it("builds snapshots and diffs them (no toggle-time capture)", () => {
-		expect(SHELL).toContain("buildLodSnapshots(");
-		expect(SHELL).toContain("diffLodSnapshots(");
-		// Played through the shared scheduler, under this feature's own cancel scope.
-		expect(SHELL).toContain("lodScope(");
+	it("defaults the production entry to the real planners (no toggle-time capture)", () => {
+		// Direct commit tests inject observing ports; production must select the same planners.
+		for (const field of [
+			"buildSnapshots: buildLodSnapshots",
+			"diffSnapshots: diffLodSnapshots",
+			"admit: admitPair",
+			"planTargets: planMorphTargets",
+			"planner: LodMorphCommitAlgorithms = algorithms",
+		])
+			expect(COMMIT).toContain(field);
 	});
 
-	/**
-	 * The planner pairs on `unitId ?? key` and reads `kind` to decide whether to fade.
-	 * Feeding it only `unitId` (the original shape) silently narrows the morph back to
-	 * tool cards: the document body — markdown, bubbles, system cards — carries no
-	 * `unitId`, so it would be dropped from every snapshot and teleport again.
-	 */
-	it("feeds the snapshot spec.key and spec.kind alongside spec.unitId", () => {
+	/** Key/kind/unitId and nested geometry have direct helper/commit behavior tests. */
+	it("forwards committed geometry and the persistent state/playback ports from a layout effect", () => {
 		const effect = morphEffect();
-		expect(effect).toContain("unitId: item.spec.unitId");
-		expect(effect).toContain("key: item.spec.key");
-		expect(effect).toContain("kind: item.spec.kind");
+		expect(effect).toContain("const node = viewportRef.current");
+		expect(effect).toContain("const layout = exactLayoutRef.current");
+		expect(effect).toContain("if (!node || !layout) return;");
+		const call = sliceBracketedRegion(effect, "commitLodMorph(");
+		expect(call).not.toBeNull();
+		for (const field of [
+			"narratorId,",
+			"items: renderItemsRef.current",
+			"layout,",
+			"index: pretextDocument.index",
+			"scrollTop: readMorphScrollTop()",
+			"viewportHeight: viewportHeightRef.current",
+			"documentRevision: foldRevisionOf(foldDocumentRevision)",
+			"lod: pretextDocument.manifest?.lod ?? -1",
+			"geometry: lodMorphGeometryRef",
+			"frames: lodMorphFramesRef",
+			"viewport: node",
+			"unified: unifiedMorph",
+			"prefersReducedMotion,",
+			"visualState: visualStateRef.current",
+			"identities: morphIdentitiesRef",
+			"driver: morphDriverRef.current",
+			"motion: motionRef.current",
+		])
+			expect(call).toContain(field);
 	});
 
 	/**
@@ -80,89 +96,56 @@ describe("LOD morph: diff-driven, keyed by unitId ?? key", () => {
 	 * resolves to null — and nothing looks broken, because the plans are still produced.
 	 */
 	it("resolves a morph by data-nf-unit, falling back to data-nf-row-key", () => {
-		const effect = morphEffect();
-		expect(effect).toContain("data-nf-unit");
-		expect(effect).toContain("data-nf-row-key");
+		expect(COMMIT).toContain("data-nf-unit");
+		expect(COMMIT).toContain("data-nf-row-key");
 	});
 });
 
 /**
- * The L2/L3 boundary is the switch that changes the most — a tool call is a folded ROW
- * at L1/L2 and a full CARD at L3+ — and it is the one that fails SILENTLY: drop the
- * nested rows from the snapshot and the two frames simply have an empty intersection,
- * so no plan is produced, no error is raised, and the boundary stops animating while
- * every other level pair still works.
+ * Geometry assertions moved to vlist-lod-morph-geometry.test.ts as actual helper/planner
+ * behavior: key-bound measured rows, document offsets, title (not block) heights, clips
+ * and group admission. Only commit ownership/order remains a source-level contract here.
  */
-describe("LOD morph: the L2/L3 boundary is snapshotted", () => {
-	it("walks each trace's measured rows into the snapshot source", () => {
-		const effect = morphEffect();
-		// Reached through the measured payload, keyed by the item's spec key.
-		expect(effect).toContain("measuredByKeyRef.current.get(item.spec.key)");
-		expect(effect).toContain("measured?.rows");
-		expect(effect).toContain("nested: true");
-	});
-
-	it("lifts a row's geometry into document space", () => {
-		// A row's `top` is relative to its trace element; pairing it against a top-level
-		// card requires the same coordinate space as the layout's own offsets.
-		expect(morphEffect()).toContain("geo.top + row.top");
-	});
-
-	/**
-	 * Without the clip the planner cannot tell the two directions apart, and the L3 → L2
-	 * one animates a row from far outside its trace's box — invisible for the duration,
-	 * i.e. a blink rather than a morph.
-	 */
-	it("passes the clipping box so the planner can drop unslidable travel", () => {
-		const effect = morphEffect();
-		expect(effect).toContain("bottom: geo.top + geo.height");
-		expect(effect).toContain("clip,");
-	});
-
-	/**
-	 * A drilled-in row's block is a whole card tall; the thing the reader perceives as
-	 * moving is the summary LINE. Snapshotting `blockHeight` would make the clip test
-	 * (and the pairing geometry) describe a box the eye never tracks.
-	 */
-	it("snapshots the row's title line height, not its whole block", () => {
-		const effect = morphEffect();
-		expect(effect).toContain("height: row.rowHeight");
-		expect(effect).not.toContain("height: row.blockHeight");
-	});
-});
 
 describe("LOD morph: the LOD-switch gate", () => {
-	it("requires an unchanged document revision AND a moved lod", () => {
-		const effect = morphEffect();
-		expect(effect).toContain("isLodSwitch");
-		// Same document revision as the previous frame…
-		expect(effect).toContain("lodMorphDocRevRef.current === docRev");
-		// …and a DIFFERENT lod.
-		expect(effect).toContain("lodMorphLodRef.current !== lod");
+	// Gate behavior (owner/revision/moved level/initial -1) is executed in frame.test.
+	// This guard protects the shell-to-helper input contract, not a copied predicate.
+	it("publishes the supplied owner, revision, level, geometry and viewport descriptor", () => {
+		const commit = sliceBracketedRegion(COMMIT, "state.frames.current.commit({");
+		expect(commit).not.toBeNull();
+		for (const field of [
+			"narratorId: source.narratorId",
+			"geometry,",
+			"scrollTop: source.scrollTop",
+			"viewportHeight: source.viewportHeight",
+			"documentRevision: source.documentRevision",
+			"lod: source.lod",
+		])
+			expect(commit).toContain(field);
 	});
 
-	it("rolls the snapshot + lod + revision forward even when it skips playing", () => {
-		const effect = morphEffect();
-		// The roll-forward assignments must precede the reduced-motion / non-LOD early
-		// return, or the next diff compares against a stale baseline.
-		const rollIdx = effect.indexOf("lodMorphPrevRef.current = next");
-		const gateIdx = effect.indexOf("if (!isLodSwitch");
-		expect(rollIdx).toBeGreaterThan(0);
-		expect(gateIdx).toBeGreaterThan(rollIdx);
-	});
-
-	it("honours prefers-reduced-motion (skips playing, still rolls the snapshot)", () => {
-		expect(morphEffect()).toContain("prefersReducedMotion()");
+	it("reads geometry and rolls the descriptor before gating either planner", () => {
+		// frame.test drives ordinary/reduced-motion commits and verifies zero planner calls.
+		const getAt = COMMIT.indexOf("state.geometry.current.get(source)");
+		const rollAt = COMMIT.indexOf("state.frames.current.commit(");
+		const gateAt = COMMIT.indexOf("if (!frames || playback.prefersReducedMotion())");
+		expect(getAt).toBeGreaterThan(0);
+		expect(rollAt).toBeGreaterThan(getAt);
+		expect(gateAt).toBeGreaterThan(rollAt);
+		for (const planner of ["planner.admit(", "planner.buildSnapshots("])
+			expect(COMMIT.indexOf(planner)).toBeGreaterThan(gateAt);
 	});
 });
 
 describe("LOD morph: no DOM measurement, no detached ghost", () => {
 	it("never reads getBoundingClientRect in the morph path", () => {
-		expect(morphEffect()).not.toContain("getBoundingClientRect");
+		expect(`${morphEffect()}\n${COMMIT}\n${GEOMETRY}\n${FRAME}`).not.toContain(
+			"getBoundingClientRect",
+		);
 	});
 
 	it("never re-homes or removes a node (the morph animates only the committed new node)", () => {
-		const effect = morphEffect();
+		const effect = `${morphEffect()}\n${COMMIT}\n${GEOMETRY}\n${FRAME}`;
 		expect(effect).not.toContain("appendChild");
 		expect(effect).not.toContain(".remove(");
 		expect(effect).not.toContain("position:fixed");
@@ -170,14 +153,16 @@ describe("LOD morph: no DOM measurement, no detached ghost", () => {
 });
 
 describe("LOD morph: own planner, shared scheduler", () => {
-	it("plans in its own layout effect, invoking neither the fold nor the drill planner", () => {
-		expect(morphEffect()).not.toContain("planFoldMotion");
-		expect(morphEffect()).not.toContain("diffDrillSnapshots");
+	it("delegates from its own layout effect without invoking fold or drill planners", () => {
+		for (const source of [morphEffect(), COMMIT]) {
+			expect(source).not.toContain("planFoldMotion");
+			expect(source).not.toContain("diffDrillSnapshots");
+		}
 	});
 
 	it("plays through the shared scheduler under its own scope", () => {
-		expect(SHELL).toContain("motionRef.current.push(");
-		expect(SHELL).toContain("lodScope(");
+		expect(COMMIT).toContain("playback.motion.push(");
+		expect(COMMIT).toContain("lodScope(");
 		expect(SHELL).not.toContain("createLodMorphController");
 		expect(SHELL).not.toContain("lodMorphRef");
 	});
@@ -189,7 +174,7 @@ describe("LOD morph: own planner, shared scheduler", () => {
 	 * shares it — a per-op duration would let paired elements finish at different times.
 	 */
 	it("carries the longer LOD duration as an event-level override", () => {
-		expect(morphEffect()).toContain("LOD_MOTION_DURATION_MS");
+		expect(COMMIT).toContain("LOD_MOTION_DURATION_MS");
 	});
 });
 
@@ -204,25 +189,24 @@ describe("LOD re-theme: tail + border fades", () => {
 	it("resumes an interrupted switch instead of restarting it", () => {
 		// Holding a zoom shortcut re-triggers the switch mid-flight; with `fill: "none"` a
 		// plain keyframe array would restart from the committed geometry.
-		expect(morphEffect()).toContain("lodMorphKeyframesFrom");
+		expect(COMMIT).toContain("lodMorphKeyframesFrom");
 	});
 
 	it("fades the tail and the border, on their own scopes", () => {
-		const effect = morphEffect();
-		expect(effect).toContain("drillTailKeyframesFrom");
-		expect(effect).toContain("drillBorderKeyframesFrom");
-		expect(effect).toContain(":tail`");
-		expect(effect).toContain(":border`");
+		expect(COMMIT).toContain("drillTailKeyframesFrom");
+		expect(COMMIT).toContain("drillBorderKeyframesFrom");
+		expect(COMMIT).toContain(":tail`");
+		expect(COMMIT).toContain(":border`");
 	});
 
 	it("only fades those for a RE-THEME, never for an element that merely moved", () => {
 		// Fading unchanged chrome would make it blink once per zoom step.
-		expect(morphEffect()).toContain("if (!plan.fade) return []");
+		expect(COMMIT).toContain("if (!plan.fade) return []");
 	});
 
 	it("derives the fade direction from toKind, not from `fade` alone", () => {
 		// `fade` is true in BOTH directions, so using it to pick the direction would fade the
 		// border in while collapsing to a row.
-		expect(morphEffect()).toContain('plan.toKind === "tool-call"');
+		expect(COMMIT).toContain('plan.toKind === "tool-call"');
 	});
 });

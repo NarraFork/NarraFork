@@ -69,12 +69,11 @@ describe("viewportHeight / contentWidth are document-build inputs", () => {
 		const src = read("PretextExactMessageList.tsx");
 		const start = src.indexOf("const node = viewportNode;");
 		expect(start).toBeGreaterThan(-1);
-		const end = src.indexOf(
-			"}, [viewportNode, centeredColumn, readViewportView, writeScrollTop]);",
-			start,
-		);
-		expect(end).toBeGreaterThan(start);
-		const measure = src.slice(start, end);
+		const effectStart = src.lastIndexOf("useLayoutEffect(", start);
+		expect(effectStart).toBeGreaterThan(-1);
+		const measure = sliceBracketedRegion(src.slice(effectStart), "useLayoutEffect(");
+		if (!measure) throw new Error("viewport ResizeObserver layout effect not found");
+		expect(measure).toContain("const node = viewportNode;");
 		expect(measure).toContain("setViewportHeight(node.clientHeight)");
 		expect(measure).toContain("node.clientWidth");
 		expect(measure).toContain("new ResizeObserver(measure)");

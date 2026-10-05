@@ -22,7 +22,8 @@ export interface VListResizeController {
 }
 
 /**
- * Owns scheduling, not measurement: previews patch only the caller's bounded window.
+ * Owns scheduling, not measurement: freeze withholds all previews; live-window
+ * previews patch only the caller's bounded window (the compatibility default).
  * Only initial/commit callbacks may publish the global layout width. Every deferred
  * burst ends with an explicit commit, even if its final width equals an earlier one.
  */
@@ -31,6 +32,8 @@ export function createVListResizeController(options: {
 	getCommittedWidth: () => number;
 	getCommittedPresentationKey?: () => string | undefined;
 	pointerDown: () => boolean;
+	/** Freeze keeps committed wrapping until settle; omitted preserves live-window previews. */
+	previewPolicy?: "freeze" | "live-window";
 	onInitial: (size: VListResizeSize) => void;
 	onPreview: (size: VListResizeSize) => boolean;
 	onCommit: (size: VListResizeSize) => void;
@@ -67,11 +70,19 @@ export function createVListResizeController(options: {
 	}
 
 	function preview(): void {
-		if (disposed || !pending || previewFailed || frame !== null) return;
+		if (
+			disposed ||
+			!pending ||
+			options.previewPolicy === "freeze" ||
+			previewFailed ||
+			frame !== null
+		)
+			return;
 		const scheduledGeneration = generation;
 		frame = requestFrame(() => {
 			if (disposed || !pending || scheduledGeneration !== generation) return;
 			frame = null;
+			if (options.previewPolicy === "freeze") return;
 			let needsMore: boolean;
 			try {
 				const size = options.readSize();
@@ -163,9 +174,33 @@ export function createVListResizeController(options: {
 	return {
 		observe: () => evaluate("observer"),
 		release: () => {
-			if (!disposed && pending) evaluate("gesture-end");
+			if (disposed) return;
 			// A real gesture also releases a previously pinned feedback cycle.
-			if (!disposed) recentCommittedWidths = [];
+			recentCommittedWidths = [];
+			if (options.previewPolicy !== "freeze") {
+				if (!pending) return;
+				evaluate("gesture-end");
+				recentCommittedWidths = [];
+				return;
+			}
+			// Capture-phase release precedes the host's final layout, even when no
+			// observer has arrived yet. Coalesce releases and read geometry next frame.
+			// Preserve the REAL pending state: ordinary clicks must not force a commit.
+			const wasPending = pending;
+			stop();
+			pending = wasPending;
+			const scheduledGeneration = generation;
+			frame = requestFrame(() => {
+				if (disposed || scheduledGeneration !== generation) return;
+				frame = null;
+				// A new gesture started before this frame: never force its width through.
+				// Observer evaluation rearms the existing quiet/backstop policy instead.
+				// An unmeasured visible slot still needs its synchronous initial callback.
+				const trigger =
+					options.pointerDown() || options.getCommittedWidth() === 0 ? "observer" : "gesture-end";
+				evaluate(trigger);
+				if (!pending) recentCommittedWidths = [];
+			});
 		},
 		refresh: preview,
 		dispose: () => {

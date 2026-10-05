@@ -1,6 +1,6 @@
 /**
- * Full-build inputs stay committed/bucketed while the production controller previews
- * the bounded live window. Behaviour lives in vlist-live-resize.test.ts; these guards
+ * Full-build inputs and row wrapping stay committed while the outer viewport resizes.
+ * Behaviour lives in vlist-live-resize.test.ts; these guards
  * assert the shell -> controller -> document ownership that pure tests cannot see.
  */
 import { describe, expect, it } from "bun:test";
@@ -88,17 +88,16 @@ describe("resize inputs cannot reach the full layout at pixel resolution", () =>
 		expect(resizeSources().match(/committedContentWidthRef\.current\s*=/g)).toHaveLength(2);
 	});
 
-	it("keeps preview out of global width and full-build height state", () => {
-		const preview = region(resizeOptions(), "onPreview: ({ width, height }) => {");
-		expect(preview.match(/setViewportHeight\s*\(/g)).toHaveLength(1);
-		expect(preview).toMatch(/setViewportHeight\(height\)/);
-		expect(preview).toMatch(
-			/return\s+pretextDocumentRef\.current\.previewWidth\(width,\s*mobileViewportRef\.current\)/,
+	it("selects freeze and never wires a document preview into production resize", () => {
+		const options = resizeOptions();
+		expect(options).toContain('previewPolicy: "freeze"');
+		expect(options).toMatch(/onPreview:\s*\(\)\s*=>\s*false/);
+		expect(options).not.toContain(".previewWidth(");
+		const preview = region(controller(), "function preview(): void {");
+		expect(preview).toContain('options.previewPolicy === "freeze"');
+		expect(preview.indexOf('options.previewPolicy === "freeze"')).toBeLessThan(
+			preview.indexOf("requestFrame("),
 		);
-		expect(preview).not.toMatch(
-			/setContentWidth|setLayoutHeight|setWidthCommitEpoch|setLayoutCompactUsageLines/,
-		);
-		expect(preview).not.toMatch(/committedContentWidthRef\.current\s*=/);
 	});
 
 	it("starts from an unmeasured sentinel, not a plausible width", () => {
@@ -121,7 +120,7 @@ describe("resize inputs cannot reach the full layout at pixel resolution", () =>
 	it("reads the LIVE pointer in the shell and controller settle path", () => {
 		expect(resizeOptions()).toMatch(/pointerDown:\s*\(\)\s*=>\s*pointerTracker\.isDown\(\)/);
 		const call = region(controller(), "resolveWidthSettle({");
-		// Capture-phase release is explicitly final even before the tracker clears.
+		// Gesture-end is final; freeze reaches it only after a next-frame live pointer check.
 		expect(call).toMatch(
 			/pointerDown:\s*trigger\s*===\s*"gesture-end"\s*\?\s*false\s*:\s*options\.pointerDown\(\)/,
 		);
@@ -153,7 +152,16 @@ describe("resize inputs cannot reach the full layout at pixel resolution", () =>
 		expect(commit).toContain("options.onCommit(size)");
 		const release = region(source, "release: () => {");
 		expect(release).toMatch(/evaluate\("gesture-end"\)/);
-		expect(release).toMatch(/if\s*\(!disposed\)\s*recentCommittedWidths\s*=\s*\[\]/);
+		expect(release).toMatch(/if\s*\(disposed\)\s*return/);
+		expect(release).toMatch(/recentCommittedWidths\s*=\s*\[\]/);
+		expect(release).toContain("frame = requestFrame(");
+		expect(release).toContain("pending = wasPending");
+		expect(release).not.toContain("pending = true");
+		expect(release).toContain(
+			'options.pointerDown() || options.getCommittedWidth() === 0 ? "observer" : "gesture-end"',
+		);
+		expect(release).toContain("evaluate(trigger)");
+		expect(release).toContain("scheduledGeneration !== generation");
 	});
 
 	it("passes NO cost estimate to the production settle decision", () => {

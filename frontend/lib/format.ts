@@ -1,21 +1,44 @@
-import { type DateInput, formatLocaleDateTime } from "./intl-format";
+import { type DateInput, formatLocaleDateTime, resolveIntlLocale } from "./intl-format";
+
+const FULL_DATE_TIME_OPTIONS: Readonly<Intl.DateTimeFormatOptions> = Object.freeze({
+	year: "numeric",
+	month: "short",
+	day: "numeric",
+	hour: "2-digit",
+	minute: "2-digit",
+	second: "2-digit",
+});
+const FULL_DATE_TIME_CACHE_LIMIT = 256;
+const fullDateTimeLabels = new Map<string, string>();
 
 /**
- * Format a date using the active locale with year, month, day, hour, minute, and second.
+ * Fixed year/month/day/hour/minute/second label, with no zone name or fractional
+ * seconds. Numeric tool timestamps often repeat across row renders/remounts.
+ * Cache their labels, not a formatter bound to a potentially stale default zone.
+ * The local calendar/clock fields are read afresh: timezone and DST changes either
+ * change this key, or leave exactly the same displayed fields. Locale is resolved
+ * on every call. String/Date inputs retain the original parsing/custom-Date path.
  */
 export function formatFullLocaleDateTime(value: DateInput, locale?: string | null): string {
-	return formatLocaleDateTime(
-		value,
-		{
-			year: "numeric",
-			month: "short",
-			day: "numeric",
-			hour: "2-digit",
-			minute: "2-digit",
-			second: "2-digit",
-		},
-		locale,
-	);
+	if (typeof value !== "number")
+		return formatLocaleDateTime(value, { ...FULL_DATE_TIME_OPTIONS }, locale);
+	const date = new Date(value);
+	if (Number.isNaN(date.getTime())) return "";
+	const activeLocale = resolveIntlLocale(locale);
+	const key = `${activeLocale}:${date.getFullYear()}:${date.getMonth()}:${date.getDate()}:${date.getHours()}:${date.getMinutes()}:${date.getSeconds()}`;
+	const cached = fullDateTimeLabels.get(key);
+	if (cached !== undefined) {
+		fullDateTimeLabels.delete(key);
+		fullDateTimeLabels.set(key, cached);
+		return cached;
+	}
+	const label = date.toLocaleString(activeLocale, FULL_DATE_TIME_OPTIONS);
+	fullDateTimeLabels.set(key, label);
+	if (fullDateTimeLabels.size > FULL_DATE_TIME_CACHE_LIMIT) {
+		const oldest = fullDateTimeLabels.keys().next().value;
+		if (oldest !== undefined) fullDateTimeLabels.delete(oldest);
+	}
+	return label;
 }
 
 /**

@@ -23,7 +23,9 @@ import { join } from "node:path";
 import { shellSource } from "./guard-source";
 
 const SHELL = shellSource();
-const ROW_INTERACTION = readFileSync(join(import.meta.dir, "VListRowInteraction.tsx"), "utf8");
+const ROW_INTERACTION = ["VListRowInteraction.tsx", "VListRowInteractionControls.tsx"]
+	.map((file) => readFileSync(join(import.meta.dir, file), "utf8"))
+	.join("\n");
 
 describe("vlist inline editing wiring", () => {
 	it("treats the editing row as dynamic so its real height overrides the arithmetic one", () => {
