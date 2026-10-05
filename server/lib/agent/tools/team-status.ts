@@ -288,23 +288,21 @@ export const teamStatusTool: ToolDefinition = {
 
 		// The remaining actions operate on the current narrator's direct subagent team.
 		const parentNarratorId = scopeId;
-		const { getTeamFileChanges, deliverTeamMessage } = await import(
-			"@server/services/narrator-subagent"
-		);
+		const { deliverTeamMessage } = await import("@server/services/narrator-subagent");
 		type TeamMessage = import("@server/services/narrator-subagent").TeamMessage;
 
 		switch (action) {
 			case "file_changes": {
-				const changes = getTeamFileChanges(parentNarratorId);
-				if (changes.size === 0) {
-					return { output: "No file changes recorded by any team member." };
-				}
+				const { getPersistedTeamFileChanges } = await import("@server/services/subagent-team");
+				// Resolve a target BEFORE querying; it must not be constrained by the
+				// whole-team page budget or an empty first-page aggregate.
+				const resolvedId = target_id
+					? await resolveTeamMemberId(ctx.narratorId, target_id)
+					: undefined;
+				const changes = await getPersistedTeamFileChanges(parentNarratorId, resolvedId);
 				// Only ids are tracked here, so labels need the async resolver.
 				const { resolveAgentLabel } = await import("@server/services/subagent-label");
-				if (target_id) {
-					// The listing above prints aliases, so `target_id` is very likely one.
-					// The change map is keyed by real narrator id, so resolve first.
-					const resolvedId = await resolveTeamMemberId(ctx.narratorId, target_id);
+				if (resolvedId) {
 					const files = changes.get(resolvedId);
 					const label = await resolveAgentLabel(scopeId, resolvedId);
 					if (!files?.size) {
@@ -313,6 +311,9 @@ export const teamStatusTool: ToolDefinition = {
 					return {
 						output: `Files modified by ${label} (${files.size}):\n${[...files].join("\n")}`,
 					};
+				}
+				if (changes.size === 0) {
+					return { output: "No file changes recorded by any team member." };
 				}
 				const sections: string[] = [];
 				for (const [subId, files] of changes) {

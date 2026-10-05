@@ -69,13 +69,17 @@ import {
 	ProxyAbortController,
 } from "./subagent-detach";
 import {
+	establishSubagentExecutionSegment,
+	readSubagentExecutionBoundary,
+} from "./subagent-execution-boundary";
+import {
 	consumeNextBufferedSubagentMessage,
 	executeSubagent,
 	finalizeSubagent,
 	loadSubagentHistory,
 	type SubagentExecOptions,
 } from "./subagent-executor";
-import { appendSubagentFileChanges } from "./subagent-file-changes";
+import { appendSubagentFileChanges, type SubagentExecutionBoundary } from "./subagent-file-changes";
 import { agentLabelFromNarrator, agentResultTag, resolveAgentLabel } from "./subagent-label";
 import {
 	formatSubagentModelFallbackNote,
@@ -880,7 +884,9 @@ export function broadcastSubagentStarted(
  * Execute a background task (fire-and-forget).
  * Updates narrator status and broadcasts events on completion/failure.
  */
-export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<void> {
+export async function executeBackgroundTask(
+	opts: SubagentExecOptions & { toolCallBinding?: ToolCallBinding },
+): Promise<void> {
 	const launch = await withNarratorStartAdmission(opts.narratorId, async () => {
 		const owner = claimSubagentExecution(opts.narratorId);
 		const wakePolicy = { allowInboxWake: false };
@@ -919,7 +925,7 @@ function claimSubagentExecution(narratorId: string): ExecutionOwner {
 }
 
 async function executeBackgroundTaskUnlocked(
-	opts: SubagentExecOptions,
+	opts: SubagentExecOptions & { toolCallBinding?: ToolCallBinding },
 	owner: ExecutionOwner,
 	wakePolicy: { allowInboxWake: boolean },
 ): Promise<void> {
@@ -968,9 +974,17 @@ async function executeBackgroundTaskUnlocked(
 	let finalUserId: string | null = opts.userId ?? null;
 
 	try {
+		const execution = await establishSubagentExecutionSegment({
+			childNarratorId: narratorId,
+			parentNarratorId,
+			toolUseId,
+			logicalRunId: publicationRun.logicalRunId,
+			binding: opts.toolCallBinding,
+		});
 		const result = await executeSubagent(
 			{
 				...opts,
+				executionSegmentId: execution.executionSegmentId,
 				fileChangeStartedAt: new Date(executionStartedAt).toISOString(),
 			},
 			owner,
@@ -1265,6 +1279,10 @@ export function waitForBackgroundTask(
 // === Foreground subagent execution loop ===
 
 interface ForegroundLoopInput {
+	toolCallBinding?: ToolCallBinding;
+	bindingToolUseId?: string;
+	bindingNarratorId?: string;
+	fileChangeStartedAt?: string;
 	deferCompletionPublication?: boolean;
 	prePromptBashCommand?: string;
 	publicationRun?: PublicationRun;
@@ -1398,6 +1416,8 @@ function startForegroundRunUnlocked(
 	const currentProvider = provider;
 	const currentSystemPrompt = systemPrompt;
 	const executionStartedAt = Date.now();
+	const fileChangeStartedAt =
+		input.fileChangeStartedAt ?? new Date(executionStartedAt).toISOString();
 	const { remainingTimeoutMs, timeoutLabelMs, executionDeadlineAt, expiredAtMount } =
 		resolveSubagentExecutionTiming({
 			now: executionStartedAt,
@@ -1491,6 +1511,7 @@ function startForegroundRunUnlocked(
 	let detachReadyPromise: Promise<DetachSetupResult> | undefined;
 	let currentForegroundAbortController: AbortController | undefined;
 
+	let executionBoundary: SubagentExecutionBoundary | null = null;
 	const runLoop = async () => {
 		const proxy = new ProxyAbortController();
 		const runtimeControl: RuntimeForegroundControl = {
@@ -1502,6 +1523,15 @@ function startForegroundRunUnlocked(
 		};
 
 		try {
+			const execution = await establishSubagentExecutionSegment({
+				childNarratorId: subagentId,
+				parentNarratorId,
+				toolUseId: input.bindingToolUseId ?? toolUseId,
+				logicalRunId: publicationRun.logicalRunId,
+				binding: input.toolCallBinding,
+				bindingNarratorId: input.bindingNarratorId,
+			});
+			executionBoundary = execution.executionBoundary;
 			// Register detach entry so the API can detach this subagent
 			getDetachableMap().set(subagentId, {
 				runId,
@@ -1528,6 +1558,7 @@ function startForegroundRunUnlocked(
 			if (executionTimeout) proxy.listenTo(executionTimeout.signal);
 			const result = await executeSubagent(
 				{
+					executionSegmentId: execution.executionSegmentId,
 					initialPrePromptBashCommand: currentPrePromptBashCommand,
 					narratorId: subagentId,
 					parentNarratorId,
@@ -1540,7 +1571,7 @@ function startForegroundRunUnlocked(
 					locale,
 					signal: proxy.signal,
 					control: runtimeControl,
-					fileChangeStartedAt: new Date(executionStartedAt).toISOString(),
+					fileChangeStartedAt,
 					timeoutMs: remainingTimeoutMs,
 					userId: currentUserId,
 					systemPrompt: currentSystemPrompt,
@@ -1766,9 +1797,10 @@ function startForegroundRunUnlocked(
 						{
 							parentNarratorId,
 							childNarratorId: subagentId,
+							executionBoundary,
 							scope: {
 								sourceToolUseId: toolUseId,
-								startedAt: new Date(executionStartedAt).toISOString(),
+								startedAt: fileChangeStartedAt,
 								completedAt: new Date().toISOString(),
 							},
 						},
@@ -1806,9 +1838,10 @@ function startForegroundRunUnlocked(
 				{
 					parentNarratorId,
 					childNarratorId: subagentId,
+					executionBoundary,
 					scope: {
 						sourceToolUseId: toolUseId,
-						startedAt: new Date(executionStartedAt).toISOString(),
+						startedAt: fileChangeStartedAt,
 						completedAt: new Date().toISOString(),
 					},
 				},
@@ -2182,6 +2215,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			// Resolve the child's trusted root before handing off the startup lease.
 			await withNarratorWorkAdmission(subagentId, async () => {
 				void executeBackgroundTask({
+					toolCallBinding: input.toolCallBinding,
 					narratorId: subagentId,
 					parentNarratorId,
 					toolUseId,
@@ -2233,6 +2267,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	// --- Foreground mode ---
 
 	let output = await runForegroundLoop({
+		toolCallBinding: input.toolCallBinding,
 		subagentId,
 		parentNarratorId,
 		toolUseId,
@@ -2265,10 +2300,15 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 // === Continue subagent ===
 
 export interface ContinueSubagentInput {
+	/** Actual initiating call for a NEW run, not the historical publication target. */
+	toolCallBinding?: ToolCallBinding;
+	bindingToolUseId?: string;
+	bindingNarratorId?: string;
+	fileChangeStartedAt?: string;
 	mailboxInput?: boolean;
 	/** The resume adapter owns the final exact-origin publication chain. */
 	deferPublicationRelease?: boolean;
-	/** Planned-update recovery alone reuses the persisted logical run. */
+	/** Recovery or pre-continuation denied-tool execution reuses the persisted logical run. */
 	resumeLogicalRunId?: string;
 	delivery?: import("./agent-message-delivery").AgentMessageDelivery;
 	fileReferences?: FileReferenceSnapshot[];
@@ -2413,6 +2453,7 @@ async function startContinuedSubagentUnlocked(
 			{
 				parentNarratorId,
 				childNarratorId: subagentId,
+				executionBoundary: await readSubagentExecutionBoundary(subagentId, original.logicalRunId),
 				scope: {
 					sourceToolUseId: toolUseId,
 					startedAt: original.turnStartedAt ?? null,
@@ -2531,6 +2572,12 @@ async function startContinuedSubagentUnlocked(
 				.where(eq(narrators.id, subagentId));
 		}
 		await narratorService.updateStatus(subagentId, "working");
+		if (input.fileChangeStartedAt) {
+			await db
+				.update(narrators)
+				.set({ turnStartedAt: input.fileChangeStartedAt })
+				.where(eq(narrators.id, subagentId));
+		}
 
 		// 3. Persist the follow-up before broadcasting/starting so the narrator and
 		// parent card always observe a consistent linked transcript.
@@ -2624,6 +2671,18 @@ async function startContinuedSubagentUnlocked(
 		run = startForegroundRun(
 			{
 				publicationRun,
+				toolCallBinding: input.resumeLogicalRunId
+					? undefined
+					: mailboxInput
+						? mailboxInput.executionBinding?.toolCallBinding
+						: input.toolCallBinding,
+				bindingToolUseId: mailboxInput
+					? mailboxInput.executionBinding?.bindingToolUseId
+					: input.bindingToolUseId,
+				bindingNarratorId: mailboxInput
+					? mailboxInput.executionBinding?.bindingNarratorId
+					: input.bindingNarratorId,
+				fileChangeStartedAt: input.fileChangeStartedAt,
 				deferCompletionPublication: input.skipConclusionDelivery !== true,
 				prePromptBashCommand: mailboxInput?.prePromptBashCommand,
 				subagentId,

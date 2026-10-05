@@ -16,6 +16,8 @@ export interface RuntimeForegroundControl {
 
 export interface SubagentRuntimeProfile {
 	kind: "subagent";
+	/** Durable child-run provenance retained across retries and continuation passes. */
+	executionSegmentId?: string;
 	parentNarratorId: string;
 	parentToolUseId: string;
 	subagentType: string;

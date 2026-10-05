@@ -9,6 +9,7 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
 import { registerAndPersistSubagentAlias, registerTaskAlias } from "./subagent-alias";
+import { readSubagentExecutionBoundary } from "./subagent-execution-boundary";
 import { appendSubagentFileChanges } from "./subagent-file-changes";
 import { agentResultTag, resolveAgentLabel } from "./subagent-label";
 import {
@@ -630,6 +631,7 @@ export async function attachSubagent(
 		{
 			parentNarratorId,
 			childNarratorId: subagentId,
+			executionBoundary: await readSubagentExecutionBoundary(subagentId, subNarrator.logicalRunId),
 			scope: {
 				sourceToolUseId: toolUseId,
 				startedAt: subNarrator.turnStartedAt ?? null,

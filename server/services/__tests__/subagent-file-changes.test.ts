@@ -25,6 +25,7 @@ import {
 	fileChangeExecutionSegments,
 	fileChangeOperations,
 	fileChangeScopes,
+	narratorMessageRefs,
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
@@ -42,6 +43,7 @@ const {
 	appendSubagentFileChanges,
 	formatSubagentFileChanges,
 	getFileChangesBySubagent,
+	getCurrentSubagentFileChangeOptions,
 	getChildSubagentFileChanges,
 	getTeamSubagentFileChanges,
 	getSubagentFileChanges,
@@ -87,6 +89,8 @@ async function attribute(over: {
 	workspacePath?: string;
 	deviceId?: string;
 	changedAt?: string;
+	operationId?: string;
+	effectId?: string;
 }) {
 	attributionSeq += 1;
 	await db.insert(fileAttributions).values({
@@ -100,33 +104,53 @@ async function attribute(over: {
 		linesRemoved:
 			over.linesRemoved === undefined ? (over.linesAdded == null ? null : 0) : over.linesRemoved,
 		changedAt: over.changedAt ?? new Date().toISOString(),
+		operationId: over.operationId,
+		effectId: over.effectId,
 	});
 }
 
-async function parentExecutionCall(executionSegmentId: string) {
+async function parentExecutionCall(executionSegmentId: string, actorNarratorId = PARENT) {
 	const now = new Date().toISOString();
 	await db.insert(narratorMessages).values({
 		id: `parent-message-${executionSegmentId}`,
-		narratorId: PARENT,
+		narratorId: actorNarratorId,
 		role: "assistant",
 		contentJson: [],
 		createdAt: now,
 	});
 	await db.insert(narratorToolCalls).values({
 		id: "parent-call",
-		narratorId: PARENT,
+		narratorId: actorNarratorId,
 		messageId: `parent-message-${executionSegmentId}`,
 		toolUseId: "parent-tool-use",
-		toolName: "Agent",
+		toolName: actorNarratorId === PARENT ? "Agent" : "Send",
 		status: "success",
 		executionIdentityVersion: 1,
 		executionAttempt: 1,
 		executionSegmentId,
 		createdAt: now,
 	});
+	// A valid receipt belongs to the call actor and has a separate child run
+	// linked to it; a call's segment id alone cannot establish child ownership.
+	sqlite.run(
+		"UPDATE file_change_execution_segments SET narrator_id = ?, source_tool_call_id = ?, source_execution_attempt = 1 WHERE id = ?",
+		[actorNarratorId, "parent-call", executionSegmentId],
+	);
+	await db.insert(fileChangeExecutionSegments).values({
+		id: `${executionSegmentId}-child-run`,
+		narratorId: "sub-a",
+		sourceInputId: `subagent-run:${executionSegmentId}-run`,
+		parentSegmentId: executionSegmentId,
+		createdAt: now,
+	});
+	sqlite.run("UPDATE narrators SET logical_run_id = ? WHERE id = ?", [
+		`${executionSegmentId}-run`,
+		"sub-a",
+	]);
 }
 
 async function exactEffect(over: {
+	narratorId?: string;
 	segmentId: string;
 	operationId: string;
 	filePath?: string;
@@ -135,9 +159,10 @@ async function exactEffect(over: {
 }) {
 	const now = new Date().toISOString();
 	const filePath = over.filePath ?? "src/current.ts";
+	const childId = over.narratorId ?? "sub-a";
 	await db.insert(fileChangeExecutionSegments).values({
 		id: over.segmentId,
-		narratorId: "sub-a",
+		narratorId: childId,
 		sourceInputId: `input-${over.segmentId}`,
 		createdAt: now,
 	});
@@ -168,17 +193,17 @@ async function exactEffect(over: {
 		preparedEffectCount: 1,
 		settledEffectCount: 1,
 		unresolvedEffectCount: 0,
-		actorSubjectKey: "narrator:sub-a",
+		actorSubjectKey: `narrator:${childId}`,
 		actorJson: {
 			kind: "subagent",
-			subjectKey: "narrator:sub-a",
-			narratorId: "sub-a",
+			subjectKey: `narrator:${childId}`,
+			narratorId: childId,
 			userId: null,
-			label: "sub-a",
+			label: childId,
 			deleted: false,
 			parentSubjectKey: "narrator:parent-1",
 		},
-		narratorId: "sub-a",
+		narratorId: childId,
 		executionOutcome: "succeeded",
 		effectOutcome: "changed",
 		settlement: "settled",
@@ -220,6 +245,67 @@ async function exactEffect(over: {
 		createdAt: now,
 		updatedAt: now,
 	});
+}
+
+async function sendRootFixture(rootId: string, segmentCount: number, childIds: string[]) {
+	const now = new Date().toISOString();
+	const sourceToolCallId = `call-${rootId}`;
+	await db.insert(narratorMessages).values({
+		id: `message-${rootId}`,
+		narratorId: PARENT,
+		role: "assistant",
+		contentJson: [],
+		createdAt: now,
+	});
+	await db.insert(narratorToolCalls).values({
+		id: sourceToolCallId,
+		narratorId: PARENT,
+		messageId: `message-${rootId}`,
+		toolUseId: `send-${rootId}`,
+		toolName: "Send",
+		status: "success",
+		executionIdentityVersion: 1,
+		executionAttempt: 1,
+		executionSegmentId: rootId,
+		createdAt: now,
+	});
+	await db.insert(fileChangeExecutionSegments).values({
+		id: rootId,
+		narratorId: PARENT,
+		sourceToolCallId,
+		sourceExecutionAttempt: 1,
+		createdAt: now,
+	});
+	for (const childId of childIds) {
+		const runId = `${rootId}-${childId}-run`;
+		await db.insert(fileChangeExecutionSegments).values({
+			id: runId,
+			narratorId: childId,
+			sourceInputId: `subagent-run:${runId}`,
+			parentSegmentId: rootId,
+			createdAt: now,
+		});
+		sqlite.run("UPDATE narrators SET logical_run_id = ? WHERE id = ?", [runId, childId]);
+		const operationSegment = `${rootId}-${childId}-operation`;
+		await exactEffect({
+			narratorId: childId,
+			segmentId: operationSegment,
+			operationId: `op-${operationSegment}`,
+			filePath: `${rootId}-${childId}.ts`,
+			linesAdded: childId === "sub-a" ? 4 : 6,
+		});
+		sqlite.run("UPDATE file_change_execution_segments SET parent_segment_id = ? WHERE id = ?", [
+			runId,
+			operationSegment,
+		]);
+	}
+	const insert = sqlite.prepare(
+		"INSERT INTO file_change_execution_segments (id, narrator_id, parent_segment_id, created_at) VALUES (?, ?, ?, ?)",
+	);
+	sqlite.transaction(() => {
+		for (let i = 1 + childIds.length * 2; i < segmentCount; i++)
+			insert.run(`${rootId}-padding-${i}`, PARENT, rootId, now);
+	})();
 }
 
 beforeEach(async () => {
@@ -465,6 +551,406 @@ describe("getFileChangesBySubagent — the card projection", () => {
 			linesRemoved: 1,
 			editCount: 1,
 		});
+	});
+
+	for (const segmentCount of [600, 1000]) {
+		test(`multi-target Send reuses ${segmentCount} shared segments without truncating the second child`, async () => {
+			await sendRootFixture(`shared-${segmentCount}`, segmentCount, ["sub-a", "sub-b"]);
+			const options = await getCurrentSubagentFileChangeOptions(["sub-a", "sub-b"], PARENT);
+			const changes = await getFileChangesBySubagent(["sub-a", "sub-b"], options);
+			for (const [childId, added] of [
+				["sub-a", 4],
+				["sub-b", 6],
+			] as const) {
+				expect(changes.get(childId)?.attributionScope).toBe("exact_attempt");
+				expect(changes.get(childId)?.countsTruncated).toBe(false);
+				expect(changes.get(childId)?.files[0]?.linesAdded).toBe(added);
+			}
+		});
+	}
+
+	test("overlapping distinct roots only consume budget for unique segments", async () => {
+		await sendRootFixture("outer-root", 700, ["sub-a"]);
+		await sendRootFixture("nested-root", 300, ["sub-b"]);
+		sqlite.run("UPDATE file_change_execution_segments SET parent_segment_id = ? WHERE id = ?", [
+			"outer-root",
+			"nested-root",
+		]);
+		const options = await getCurrentSubagentFileChangeOptions(["sub-a", "sub-b"], PARENT);
+		const changes = await getFileChangesBySubagent(["sub-a", "sub-b"], options);
+		for (const childId of ["sub-a", "sub-b"]) {
+			expect(changes.get(childId)?.attributionScope).toBe("exact_attempt");
+			expect(changes.get(childId)?.countsTruncated).toBe(false);
+		}
+		expect(changes.get("sub-b")?.files[0]?.linesAdded).toBe(6);
+	});
+
+	test("distinct roots retain the overall unique-segment hard limit", async () => {
+		await sendRootFixture("first-root", 600, ["sub-a"]);
+		await sendRootFixture("second-root", 600, ["sub-b"]);
+		const options = await getCurrentSubagentFileChangeOptions(["sub-a", "sub-b"], PARENT);
+		const changes = await getFileChangesBySubagent(["sub-a", "sub-b"], options);
+		const entries = [changes.get("sub-a"), changes.get("sub-b")];
+		expect(entries.filter((entry) => entry?.attributionScope === "exact_attempt")).toHaveLength(1);
+		expect(entries.filter((entry) => entry?.countsTruncated)).toHaveLength(1);
+		expect(entries.filter((entry) => entry && !entry.countsTruncated)).toHaveLength(1);
+		expect(entries.reduce((sum, entry) => sum + (entry?.totalFiles ?? 0), 0)).toBe(1);
+	});
+
+	test("peer Send boundaries prove actor ownership and current child-run linkage", async () => {
+		const now = new Date().toISOString();
+		await db
+			.insert(fileChangeExecutionSegments)
+			.values({ id: "peer-source", narratorId: "sub-b", createdAt: now });
+		await parentExecutionCall("peer-source", "sub-b");
+		await exactEffect({
+			segmentId: "peer-operation-segment",
+			operationId: "peer-op",
+			linesAdded: 4,
+		});
+		sqlite.run("UPDATE file_change_execution_segments SET parent_segment_id = ? WHERE id = ?", [
+			"peer-source-child-run",
+			"peer-operation-segment",
+		]);
+		const boundary = {
+			sourceToolCallId: "parent-call",
+			executionAttempt: 1,
+			executionIdentityVersion: 1,
+			executionSegmentId: "peer-source",
+		};
+		const options = {
+			parentNarratorId: PARENT,
+			childNarratorId: "sub-a",
+			scope: { sourceToolUseId: "parent-tool-use", startedAt: null, completedAt: null },
+			executionBoundary: boundary,
+		};
+		const current = await getCurrentSubagentFileChangeOptions(["sub-a"], PARENT);
+		expect(current.executionBoundariesBySubagent?.get("sub-a")).toMatchObject(boundary);
+		const direct = await getChildSubagentFileChanges(options);
+		expect(direct.attributionScope).toBe("exact_attempt");
+		expect(direct.files[0]?.linesAdded).toBe(4);
+		const { getPersistedTeamFileChanges, clearTeamFileChanges } = await import("../subagent-team");
+		clearTeamFileChanges(PARENT);
+		expect(
+			[...((await getPersistedTeamFileChanges(PARENT, "sub-a")).get("sub-a") ?? [])].join("\n"),
+		).toContain("exact_attempt");
+		// A valid peer actor/call tuple still does not authorize another child's run.
+		sqlite.run("UPDATE file_change_operations SET narrator_id = ? WHERE id = ?", [
+			"sub-b",
+			"peer-op",
+		]);
+		const wrongChild = await getChildSubagentFileChanges({ ...options, childNarratorId: "sub-b" });
+		expect(wrongChild.attributionScope).toBe("legacy_unscoped");
+		expect(wrongChild.totalFiles).toBe(0);
+		sqlite.run("UPDATE file_change_operations SET narrator_id = ? WHERE id = ?", [
+			"sub-a",
+			"peer-op",
+		]);
+		// A segment naming the right call cannot impersonate its actual actor.
+		sqlite.run("UPDATE file_change_execution_segments SET narrator_id = ? WHERE id = ?", [
+			PARENT,
+			"peer-source",
+		]);
+		expect(
+			(
+				await getCurrentSubagentFileChangeOptions(["sub-a"], PARENT)
+			).executionBoundariesBySubagent?.get("sub-a"),
+		).toBeNull();
+		const wrongActor = await getChildSubagentFileChanges(options);
+		expect(wrongActor.attributionScope).toBe("legacy_unscoped");
+		expect(wrongActor.totalFiles).toBe(0);
+	});
+
+	test("child results deduplicate receipts, not entire files, and reject previous-round projections", async () => {
+		await exactEffect({ segmentId: "old", operationId: "old-op", linesAdded: 99 });
+		await exactEffect({ segmentId: "current", operationId: "current-op", linesAdded: 4 });
+		await parentExecutionCall("current");
+		await attribute({
+			narratorId: "sub-a",
+			filePath: "src/current.ts",
+			linesAdded: 99,
+			operationId: "old-op",
+			effectId: "effect-old-op",
+		});
+		await attribute({
+			narratorId: "sub-a",
+			filePath: "src/current.ts",
+			linesAdded: 4,
+			operationId: "current-op",
+			effectId: "effect-current-op",
+		});
+		const options = {
+			parentNarratorId: PARENT,
+			childNarratorId: "sub-a",
+			scope: { sourceToolUseId: "parent-tool-use", startedAt: null, completedAt: null },
+			executionBoundary: {
+				sourceToolCallId: "parent-call",
+				executionAttempt: 1,
+				executionIdentityVersion: 1,
+				executionSegmentId: "current",
+			},
+		};
+		const exact = await getChildSubagentFileChanges(options);
+		expect(exact.attributionScope).toBe("exact_attempt");
+		expect(exact.files[0]?.linesAdded).toBe(4);
+		expect(formatSubagentFileChanges(exact)).not.toContain("Execution boundary unavailable");
+		await attribute({ narratorId: "sub-a", filePath: "src/current.ts", linesAdded: 2 });
+		const mixed = await getChildSubagentFileChanges(options);
+		expect(mixed.attributionScope).toBe("mixed");
+		expect(mixed.files[0]?.linesAdded).toBe(6);
+		expect(mixed.files[0]?.editCount).toBe(2);
+		expect(formatSubagentFileChanges(mixed)).not.toContain("Execution boundary unavailable");
+		// The explicitly cumulative whole-team API still includes all legacy rows.
+		expect((await getTeamSubagentFileChanges(PARENT)).files[0]?.linesAdded).toBe(105);
+	});
+
+	test("TeamStatus reads persisted exact receipts without in-memory observations", async () => {
+		await exactEffect({ segmentId: "team-current", operationId: "team-op" });
+		await parentExecutionCall("team-current");
+		sqlite.run("UPDATE narrators SET logical_run_id = ? WHERE id = ?", ["team-run", "sub-a"]);
+		sqlite.run(
+			"UPDATE file_change_execution_segments SET narrator_id = ?, source_tool_call_id = ?, source_execution_attempt = 1 WHERE id = ?",
+			[PARENT, "parent-call", "team-current"],
+		);
+		await db.insert(fileChangeExecutionSegments).values({
+			id: "team-child",
+			narratorId: "sub-a",
+			sourceInputId: "subagent-run:team-run",
+			parentSegmentId: "team-current",
+			createdAt: new Date().toISOString(),
+		});
+		const { getPersistedTeamFileChanges, clearTeamFileChanges, recordTeamFileChange } =
+			await import("../subagent-team");
+		clearTeamFileChanges(PARENT);
+		const persisted = await getPersistedTeamFileChanges(PARENT);
+		expect([...(persisted.get("sub-a") ?? [])].join("\n")).toContain("exact_attempt");
+		const currentOptions = await getCurrentSubagentFileChangeOptions(["sub-a", "sub-b"], PARENT);
+		expect(currentOptions.executionBoundariesBySubagent?.get("sub-a")?.sourceToolCallId).toBe(
+			"parent-call",
+		);
+		expect(currentOptions.executionBoundariesBySubagent?.get("sub-b")).toBeNull();
+		expect(
+			(
+				await getCurrentSubagentFileChangeOptions(["sub-a"], "wrong-parent")
+			).executionBoundariesBySubagent?.get("sub-a"),
+		).toBeNull();
+		recordTeamFileChange(PARENT, "sub-a", "uncertain.ts");
+		recordTeamFileChange(PARENT, "sub-a", "src/current.ts", {
+			deviceId: "local",
+			workspacePath: WORKSPACE,
+		});
+		const mixed = await getPersistedTeamFileChanges(PARENT);
+		expect([...(mixed.get("sub-a") ?? [])].join("\n")).toContain("legacy/unscoped");
+		expect(mixed.get("sub-a")?.size).toBe(2); // One display entry per full identity, not per evidence source.
+		sqlite.run(
+			"UPDATE file_change_execution_segments SET source_execution_attempt = 2 WHERE id = ?",
+			["team-current"],
+		);
+		expect(
+			(
+				await getCurrentSubagentFileChangeOptions(["sub-a"], PARENT)
+			).executionBoundariesBySubagent?.get("sub-a"),
+		).toBeNull();
+		sqlite.run(
+			"UPDATE file_change_execution_segments SET source_execution_attempt = 1 WHERE id = ?",
+			["team-current"],
+		);
+		await db.insert(fileChangeExecutionSegments).values({
+			id: "team-duplicate",
+			narratorId: "sub-a",
+			sourceInputId: "subagent-run:team-run",
+			parentSegmentId: "team-current",
+			createdAt: new Date().toISOString(),
+		});
+		expect(
+			(
+				await getCurrentSubagentFileChangeOptions(["sub-a"], PARENT)
+			).executionBoundariesBySubagent?.get("sub-a"),
+		).toBeNull();
+		clearTeamFileChanges(PARENT);
+	});
+
+	test("real history cards use the current logical run instead of the creation origin", async () => {
+		await exactEffect({ segmentId: "card-old", operationId: "card-old-op", linesAdded: 99 });
+		await exactEffect({ segmentId: "card-current", operationId: "card-current-op", linesAdded: 4 });
+		await parentExecutionCall("card-current");
+		sqlite.run(
+			"UPDATE file_change_execution_segments SET narrator_id = ?, source_tool_call_id = ?, source_execution_attempt = 1 WHERE id = ?",
+			[PARENT, "parent-call", "card-current"],
+		);
+		await db.insert(fileChangeExecutionSegments).values({
+			id: "card-child",
+			narratorId: "sub-a",
+			sourceInputId: "subagent-run:card-run",
+			parentSegmentId: "card-current",
+			createdAt: new Date().toISOString(),
+		});
+		const oldTime = "2026-01-01T00:00:00.000Z";
+		await db.insert(narratorMessages).values({
+			id: "origin-message",
+			narratorId: PARENT,
+			role: "assistant",
+			contentJson: [{ type: "tool_use", id: "origin-tool", name: "Agent", input: {} }],
+			createdAt: oldTime,
+		});
+		await db
+			.insert(narratorMessageRefs)
+			.values({ id: "origin-ref", narratorId: PARENT, messageId: "origin-message", seq: 1 });
+		await db.insert(narratorToolCalls).values({
+			id: "origin-call",
+			narratorId: PARENT,
+			messageId: "origin-message",
+			toolUseId: "origin-tool",
+			toolName: "Agent",
+			status: "success",
+			executionIdentityVersion: 1,
+			createdAt: oldTime,
+		});
+		sqlite.run("UPDATE narrators SET logical_run_id = ?, origin_tool_call_id = ? WHERE id = ?", [
+			"card-run",
+			"origin-call",
+			"sub-a",
+		]);
+		await db.insert(narratorMessages).values({
+			id: "child-card-message",
+			narratorId: "sub-a",
+			role: "assistant",
+			parentToolUseId: "origin-tool",
+			contentJson: [{ type: "text", text: "done" }],
+			createdAt: oldTime,
+		});
+		await db.insert(narratorMessageRefs).values({
+			id: "child-card-ref",
+			narratorId: "sub-a",
+			messageId: "child-card-message",
+			seq: 1,
+		});
+		const { narratorMessageQueries } = await import("../narrator-messages");
+		const page = await narratorMessageQueries.getPretextDocumentPage(PARENT);
+		const card = page.messages[0]?.contentJson.find(
+			(block: { type: string }) => block.type === "tool_use",
+		)?._subagentActivity;
+		expect(card?.subagentNarratorId).toBe("sub-a");
+		expect(card?.fileChanges?.attributionScope).toBe("exact_attempt");
+		expect(card?.fileChanges?.files[0]?.linesAdded).toBe(4);
+		expect(card?.fileChanges?.scope?.sourceToolUseId).toBe("parent-tool-use");
+		// The next run has no trusted parent receipt. It still has its own window;
+		// neither creation-origin timing nor old exact evidence may be resurrected.
+		const runStart = "2026-02-01T00:00:00.000Z";
+		const runEnd = "2026-02-01T00:01:00.000Z";
+		sqlite.run(
+			"UPDATE narrators SET logical_run_id = ?, turn_started_at = ?, background_completed_at = ? WHERE id = ?",
+			["card-orphan", runStart, runEnd, "sub-a"],
+		);
+		await db.insert(fileChangeExecutionSegments).values({
+			id: "card-orphan-segment",
+			narratorId: "sub-a",
+			sourceInputId: "subagent-run:card-orphan",
+			parentSegmentId: null,
+			createdAt: runStart,
+		});
+		await attribute({
+			narratorId: "sub-a",
+			filePath: "previous-round.ts",
+			linesAdded: 88,
+			changedAt: "2026-01-02T00:00:00.000Z",
+		});
+		await attribute({
+			narratorId: "sub-a",
+			filePath: "orphan-current.ts",
+			linesAdded: 3,
+			changedAt: "2026-02-01T00:00:30.000Z",
+		});
+		await attribute({
+			narratorId: "sub-a",
+			filePath: "after-round.ts",
+			linesAdded: 77,
+			changedAt: "2026-02-02T00:00:00.000Z",
+		});
+		const orphanPage = await narratorMessageQueries.getPretextDocumentPage(PARENT);
+		const orphanCard = orphanPage.messages[0]?.contentJson.find(
+			(block: { type: string }) => block.type === "tool_use",
+		)?._subagentActivity;
+		expect(orphanCard?.fileChanges?.attributionScope).toBe("legacy_unscoped");
+		expect(
+			orphanCard?.fileChanges?.files.map((file: { filePath: string }) => file.filePath),
+		).toEqual(["orphan-current.ts"]);
+		expect(orphanCard?.fileChanges?.scope).toEqual({
+			sourceToolUseId: null,
+			startedAt: runStart,
+			completedAt: runEnd,
+		});
+		sqlite.run("DELETE FROM file_change_execution_segments WHERE id = ?", ["card-orphan-segment"]);
+		const noSegmentOptions = await getCurrentSubagentFileChangeOptions(["sub-a"], PARENT);
+		expect(noSegmentOptions.executionBoundariesBySubagent?.get("sub-a")).toBeNull();
+		expect(noSegmentOptions.scopesBySubagent?.get("sub-a")).toEqual({
+			sourceToolUseId: null,
+			startedAt: runStart,
+			completedAt: runEnd,
+		});
+	});
+
+	test("TeamStatus queries a selected member beyond the whole-team limit directly", async () => {
+		for (let i = 0; i < 201; i++)
+			await makeNarrator(`page-child-${String(i).padStart(3, "0")}`, PARENT);
+		await makeNarrator("zz-target", PARENT, WORKSPACE);
+		await attribute({ narratorId: "zz-target", filePath: "beyond-page.ts", linesAdded: 5 });
+		const { getPersistedTeamFileChanges, clearTeamFileChanges } = await import("../subagent-team");
+		clearTeamFileChanges(PARENT);
+		const wholeTeam = await getPersistedTeamFileChanges(PARENT);
+		expect(wholeTeam.has("zz-target")).toBe(false);
+		expect([...wholeTeam.values()].flatMap((files) => [...files]).join("\n")).toContain(
+			"truncated",
+		);
+		const targeted = await getPersistedTeamFileChanges(PARENT, "zz-target");
+		expect([...(targeted.get("zz-target") ?? [])].join("\n")).toContain("beyond-page.ts");
+		const { teamStatusTool } = await import("../../lib/agent/tools/team-status");
+		const reply = await teamStatusTool.execute(
+			{ action: "file_changes", target_id: "zz-target" },
+			{
+				narratorId: PARENT,
+				cwd: WORKSPACE,
+				signal: new AbortController().signal,
+				locale: "en",
+				requestPermission: async () => ({ behavior: "allow" as const }),
+			},
+		);
+		expect(reply.isError).toBeFalsy();
+		expect(reply.output).toContain("beyond-page.ts");
+		expect(reply.output).not.toContain("No file changes");
+	});
+
+	test("targeted truncated evidence is never reported as zero changes", async () => {
+		const oldTime = "2026-01-01T00:00:00.000Z";
+		sqlite.run("UPDATE narrators SET logical_run_id = ?, turn_started_at = ? WHERE id = ?", [
+			"target-run",
+			"2026-02-01T00:00:00.000Z",
+			"sub-a",
+		]);
+		const insert = sqlite.prepare(
+			"INSERT INTO file_attributions (id, narrator_id, device_id, workspace_path, file_path, action, lines_added, lines_removed, changed_at) VALUES (?, ?, 'local', ?, ?, 'edit', 1, 0, ?)",
+		);
+		sqlite.transaction(() => {
+			for (let i = 0; i <= MAX_LEGACY_ATTRIBUTION_ROWS; i++)
+				insert.run(`old-target-${i}`, "sub-a", WORKSPACE, "old.ts", oldTime);
+		})();
+		const { getPersistedTeamFileChanges, clearTeamFileChanges } = await import("../subagent-team");
+		clearTeamFileChanges(PARENT);
+		const targeted = await getPersistedTeamFileChanges(PARENT, "sub-a");
+		expect([...(targeted.get("sub-a") ?? [])].join("\n")).toContain("truncated");
+		const { teamStatusTool } = await import("../../lib/agent/tools/team-status");
+		const reply = await teamStatusTool.execute(
+			{ action: "file_changes", target_id: "sub-a" },
+			{
+				narratorId: PARENT,
+				cwd: WORKSPACE,
+				signal: new AbortController().signal,
+				locale: "en",
+				requestPermission: async () => ({ behavior: "allow" as const }),
+			},
+		);
+		expect(reply.output).toContain("truncated");
+		expect(reply.output).not.toContain("No file changes");
 	});
 
 	test("downgrades exact attribution when the execution boundary is missing", async () => {

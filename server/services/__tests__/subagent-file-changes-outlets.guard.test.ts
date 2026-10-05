@@ -67,12 +67,15 @@ describe("subagent result outlets carry the file-change summary", () => {
 			expect(summarized).toBe(tagged);
 			const childScoped =
 				source.match(
-					/appendSubagentFileChanges\(\s*\{\s*parentNarratorId,\s*childNarratorId:\s*subagentId,\s*scope:\s*\{/g,
+					/appendSubagentFileChanges\(\s*\{\s*parentNarratorId,\s*childNarratorId:\s*subagentId,\s*(?:executionBoundary(?:\s*:[^\n]+)?,\s*)?scope:\s*\{/g,
 				) ?? [];
 			expect(childScoped.length).toBe(summarized);
 			const executionBoundary =
 				source.match(/scope:\s*\{\s*sourceToolUseId:\s*toolUseId,\s*startedAt:/g) ?? [];
 			expect(executionBoundary.length).toBe(summarized);
+			const verifiedBoundary =
+				source.match(/childNarratorId:\s*subagentId,\s*executionBoundary(?:\s*:[^\n]+)?,/g) ?? [];
+			expect(verifiedBoundary.length).toBe(summarized);
 		});
 	}
 
@@ -90,6 +93,10 @@ describe("subagent result outlets carry the file-change summary", () => {
 		const source = executableSource("subagent-file-changes.ts");
 		const append = source.slice(source.indexOf("export async function appendSubagentFileChanges("));
 		expect(append).toContain("getChildSubagentFileChanges(options)");
+		expect(source).toContain("options.executionBoundary ?? null");
+		expect(source).toContain("getCurrentSubagentFileChangeOptions");
+		expect(source).toContain("fileChangeEffects.id");
+		expect(source).not.toContain("entry.exactKeys.has(key)");
 		expect(append).not.toContain("getSubagentFileChanges(");
 		expect(append).not.toContain("getTeamSubagentFileChanges(");
 		for (const field of [

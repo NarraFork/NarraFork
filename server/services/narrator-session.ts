@@ -175,6 +175,7 @@ import { buildBehaviorFenceBody, buildSpecTaskDigestBody } from "./spec-reminder
 import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
 import { drainSpecUpdatesForNarrator } from "./spec-update-queue";
 import { specVfsService } from "./spec-vfs-service";
+import { readSubagentExecutionBoundary } from "./subagent-execution-boundary";
 import { appendSubagentFileChanges } from "./subagent-file-changes";
 import { agentResultTag, resolveAgentLabel } from "./subagent-label";
 import {
@@ -3325,6 +3326,7 @@ async function updateToolCallConclusionUnlocked(opts: {
 		{
 			parentNarratorId,
 			childNarratorId: subagentId,
+			executionBoundary: await readSubagentExecutionBoundary(subagentId),
 			scope: {
 				sourceToolUseId: toolUseId,
 				startedAt: attributionTurn?.turnStartedAt ?? null,
@@ -4773,7 +4775,7 @@ export type ReExecuteDeniedReason =
 	| "narrator_busy";
 
 export type ReExecuteDeniedResult =
-	| { ok: true; shouldContinue?: boolean }
+	| { ok: true; shouldContinue?: boolean; errorMessage?: string }
 	| { ok: false; reason: ReExecuteDeniedReason };
 
 function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrator): void {
@@ -4931,6 +4933,8 @@ async function reExecuteDeniedToolCallUnlocked(
 		autoContinue?: boolean;
 		persistedToolCallId?: string;
 		permissionMode?: "normal" | "preGranted";
+		/** Runs only after admission, before preparing the attempt or performing tool I/O. */
+		onAdmitted?: () => Promise<void>;
 	},
 ): Promise<ToolCallReexecutionLaunch> {
 	const narrator = await narratorService.getById(narratorId);
@@ -4982,6 +4986,16 @@ async function reExecuteDeniedToolCallUnlocked(
 		orderBy: [desc(narratorToolCalls.executionAttempt), desc(narratorToolCalls.createdAt)],
 	});
 
+	// Distinguish an obsolete call from an unknown ID without preparing either.
+	if (!toolCall && !restoringPersistedCall) {
+		toolCall = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			orderBy: [desc(narratorToolCalls.createdAt), desc(narratorToolCalls.executionAttempt)],
+		});
+	}
 	const rejectReason = restoringPersistedCall
 		? toolCall
 			? null
@@ -5001,20 +5015,7 @@ async function reExecuteDeniedToolCallUnlocked(
 			: {};
 
 	const sourceToolCall = toolCall;
-	const preparedAttempt = await narratorPersistence.prepareToolCallAttempt(
-		narratorId,
-		toolCall.id,
-		restoringPersistedCall,
-	);
-	toolCall = preparedAttempt.toolCall;
-	const toolCallBinding = await narratorPersistence.getToolCallBinding(
-		narratorId,
-		toolCall.messageId,
-		toolUseId,
-		toolCall.id,
-	);
-
-	// Atomically hand off the checked/prepared attempt to a long-lived work lease.
+	// Atomically hand off the checked attempt to a long-lived work lease.
 	// Await may depend on an independently running child whose Send(parent) needs
 	// this same start mutex; only the completion handle may leave the transaction.
 	const releaseRuntime = claimNarratorRuntime(narratorId, randomUUID());
@@ -5038,6 +5039,19 @@ async function reExecuteDeniedToolCallUnlocked(
 		narratorId,
 		async (): Promise<ReExecuteDeniedResult> => {
 			try {
+				await options?.onAdmitted?.();
+				const preparedAttempt = await narratorPersistence.prepareToolCallAttempt(
+					narratorId,
+					sourceToolCall.id,
+					restoringPersistedCall,
+				);
+				toolCall = preparedAttempt.toolCall;
+				const toolCallBinding = await narratorPersistence.getToolCallBinding(
+					narratorId,
+					toolCall.messageId,
+					toolUseId,
+					toolCall.id,
+				);
 				const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 				// Restore the triggering user so knowledge-base ACL works after a rebuild.
 				// The active may have been freshly recreated (interrupt destroyed the old one),
@@ -5306,7 +5320,7 @@ async function reExecuteDeniedToolCallUnlocked(
 					});
 					await narratorService.updateStatus(narratorId, "idle", { substatus: ["error"] });
 					disposeInactiveNarratorSession(narratorId, active);
-					return { ok: true, shouldContinue: false };
+					return { ok: true, shouldContinue: false, errorMessage: message };
 				}
 
 				if (options?.autoContinue === false) {

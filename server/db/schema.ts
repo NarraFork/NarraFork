@@ -4095,6 +4095,7 @@ export const fileChangeExecutionSegments = sqliteTable(
 		index("idx_fc_segment_source").on(table.sourceToolCallId, table.sourceExecutionAttempt),
 		index("idx_fc_segment_parent").on(table.parentSegmentId),
 		index("idx_fc_segment_narrator").on(table.narratorId),
+		index("idx_fc_segment_input").on(table.narratorId, table.sourceInputId),
 	],
 );
 

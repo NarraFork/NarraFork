@@ -575,6 +575,7 @@ test("failed reexecution releases its work and runtime claims after cleanup", as
 	).toEqual({
 		ok: true,
 		shouldContinue: false,
+		errorMessage: "controlled execution failure",
 	});
 	expect(state.isNarratorRuntimeBusy(ROOT)).toBe(false);
 	expect(state.activeNarrators.has(ROOT)).toBe(false);

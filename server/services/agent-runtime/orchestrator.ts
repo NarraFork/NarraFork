@@ -1193,6 +1193,8 @@ export async function runAgentLoopUnlocked(
 			let toolCallLimitExceeded = false;
 			const passWorkspaceContext = active._workspaceContext;
 			const config: import("../../lib/agent").AgentConfig = {
+				// Freeze this logical run's segment across every retry/compact pass.
+				executionSegmentId: profile.kind === "subagent" ? profile.executionSegmentId : undefined,
 				runtimePolicy,
 				narratorId,
 				conversationId: active.conversationId,

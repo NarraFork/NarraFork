@@ -80,40 +80,13 @@ const executionSegments = createFileChangeExecutionSegmentsService(db);
 
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
-type ExecutionSegmentParent = {
-	id: string;
-	executionAttempt: number;
-	executionSegmentId: string | null;
-};
-
-/** Resolve a parent tool across the child narrator boundary without guessing by provider ID. */
+/** Use the durable current-run receipt; provider IDs and creation origins are not execution authority. */
 async function findExecutionSegmentParent(
 	narratorId: string,
-	parentToolUseId: string | null | undefined,
-): Promise<ExecutionSegmentParent | null> {
-	if (!parentToolUseId) return null;
-	const local = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.toolUseId, parentToolUseId),
-		),
-		columns: { id: true, executionAttempt: true, executionSegmentId: true },
-	});
-	if (local) return local;
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { parentNarratorId: true },
-	});
-	if (!narrator?.parentNarratorId) return null;
-	return (
-		(await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.narratorId, narrator.parentNarratorId),
-				eq(narratorToolCalls.toolUseId, parentToolUseId),
-			),
-			columns: { id: true, executionAttempt: true, executionSegmentId: true },
-		})) ?? null
-	);
+): Promise<{ executionSegmentId: string } | null> {
+	const { resolveSubagentExecutionSegment } = await import("./subagent-execution-boundary");
+	const segment = await resolveSubagentExecutionSegment(narratorId);
+	return segment ? { executionSegmentId: segment.id } : null;
 }
 
 /** Recipient mutation also invalidates source pages, including child cards rendered in a parent. */
@@ -1958,15 +1931,13 @@ const sqliteNarratorPersistence = {
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const toolUseBlocks = content.filter((b: any) => b.type === "tool_use");
 		for (const block of toolUseBlocks) {
-			const parentToolCall = await findExecutionSegmentParent(
-				narratorId,
-				sdkMessage.parent_tool_use_id,
-			);
+			const parentToolCall = await findExecutionSegmentParent(narratorId);
 			const toolCallId = generateId();
 			const segment = await executionSegments.create({
 				narratorId,
 				parentSegmentId: parentToolCall?.executionSegmentId ?? null,
-				sourceInputId: block.id,
+				sourceToolCallId: toolCallId,
+				sourceExecutionAttempt: 1,
 			});
 			await db.insert(narratorToolCalls).values({
 				executionSegmentId: segment.id,
@@ -2286,12 +2257,13 @@ const sqliteNarratorPersistence = {
 
 		if (block.type === "tool_use") {
 			const now = new Date().toISOString();
-			const parentToolCall = await findExecutionSegmentParent(narratorId, existing.parentToolUseId);
+			const parentToolCall = await findExecutionSegmentParent(narratorId);
 			const toolCallId = generateId();
 			const segment = await executionSegments.create({
 				narratorId,
 				parentSegmentId: parentToolCall?.executionSegmentId ?? null,
-				sourceInputId: block.id,
+				sourceToolCallId: toolCallId,
+				sourceExecutionAttempt: 1,
 			});
 			await db.insert(narratorToolCalls).values({
 				executionSegmentId: segment.id,
@@ -3020,7 +2992,7 @@ const sqliteNarratorPersistence = {
 		return Object.freeze({
 			toolCallId,
 			attempt: row.executionAttempt,
-			executionSegmentId: row.executionSegmentId ?? toolCallId,
+			executionSegmentId: row.executionSegmentId ?? undefined,
 		});
 	},
 
@@ -3036,7 +3008,18 @@ const sqliteNarratorPersistence = {
 		});
 		if (!row)
 			throw new ValidationError("Tool execution binding is stale or belongs to another narrator");
-		await this.getToolCallBinding(narratorId, row.messageId, toolUseId, binding.toolCallId);
+		const receipt = await this.getToolCallBinding(
+			narratorId,
+			row.messageId,
+			toolUseId,
+			binding.toolCallId,
+		);
+		if (
+			binding.executionSegmentId !== undefined &&
+			binding.executionSegmentId !== receipt.executionSegmentId
+		) {
+			throw new ValidationError("Tool execution segment does not match its persisted receipt");
+		}
 		return row.messageId;
 	},
 
@@ -3066,7 +3049,20 @@ const sqliteNarratorPersistence = {
 		}
 		const toolCallId = generateId();
 		const toolUseId = `internal_read_${generateId()}`;
+		const parentReceipt = await this.getToolCallBinding(
+			narratorId,
+			messageId,
+			parentToolUseId,
+			parentBinding.toolCallId,
+		);
+		const segment = await executionSegments.create({
+			narratorId,
+			parentSegmentId: parentReceipt.executionSegmentId ?? null,
+			sourceToolCallId: toolCallId,
+			sourceExecutionAttempt: 1,
+		});
 		await db.insert(narratorToolCalls).values({
+			executionSegmentId: segment.id,
 			id: toolCallId,
 			narratorId,
 			messageId,
@@ -3087,7 +3083,10 @@ const sqliteNarratorPersistence = {
 			createdAt: new Date().toISOString(),
 		});
 		queueContextCharacterRefresh(narratorId, messageId);
-		return { toolUseId, binding: Object.freeze({ toolCallId, attempt: 1 }) };
+		return {
+			toolUseId,
+			binding: Object.freeze({ toolCallId, attempt: 1, executionSegmentId: segment.id }),
+		};
 	},
 
 	async completeInternalRead(
@@ -3322,7 +3321,21 @@ const sqliteNarratorPersistence = {
 					.all();
 				return created;
 			});
-			return { toolCall, requiresFreshPermission: shared || source.narratorId !== narratorId };
+			const parent = await findExecutionSegmentParent(narratorId);
+			const segment = await executionSegments.create({
+				narratorId,
+				parentSegmentId: parent?.executionSegmentId ?? null,
+				sourceToolCallId: toolCall.id,
+				sourceExecutionAttempt: toolCall.executionAttempt,
+			});
+			await db
+				.update(narratorToolCalls)
+				.set({ executionSegmentId: segment.id })
+				.where(eq(narratorToolCalls.id, toolCall.id));
+			return {
+				toolCall: { ...toolCall, executionSegmentId: segment.id },
+				requiresFreshPermission: shared || source.narratorId !== narratorId,
+			};
 		});
 	},
 
