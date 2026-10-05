@@ -57,6 +57,20 @@
       "when": 1791132648665,
       "tag": "0007_main_context_characters",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1791184048500,
+      "tag": "0008_context_usage_snapshots",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1791196409136,
+      "tag": "0009_context_character_cache_indexes",
+      "breakpoints": true
     }
   ]
 }

@@ -14,6 +14,7 @@ for (const [table, column, definition] of [
 	["narrators", "context_tools_chars", "integer NOT NULL DEFAULT 0"],
 	["narrators", "context_char_revision", "integer NOT NULL DEFAULT 0"],
 	["narrators", "context_char_cache_json", "text"],
+	["narrators", "context_usage_snapshot_json", "text"],
 ]) {
 	const columns = sqlite.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
 	if (!columns.some(({ name }) => name === column))
@@ -24,6 +25,8 @@ mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const refreshes: string[] = [];
 const messageRefreshes: Array<{ narratorId: string; messageId?: string }> = [];
 mock.module("../narrator-context-composition", () => ({
+	storeNarratorContextUsage: async () => {},
+	freezeNarratorContextComposition: async () => null,
 	invalidateContextCharacterCache: async (id: string, messageId?: string) => {
 		refreshes.push(id);
 		messageRefreshes.push({ narratorId: id, messageId });
@@ -252,8 +255,41 @@ describe("character statistics at actual persistence boundaries", () => {
 					.get() as { chars: number }
 			).chars;
 		expect(count()).toBe("plan 中😀".length);
+		sqlite.run("UPDATE narrators SET context_usage_snapshot_json = '{}' WHERE id = 'n1'");
 		await narratorPersistence.clearContext("n1");
 		expect(count()).toBe(0);
+		expect(
+			(
+				sqlite
+					.prepare("SELECT context_usage_snapshot_json AS snapshot FROM narrators WHERE id = 'n1'")
+					.get() as { snapshot: string | null }
+			).snapshot,
+		).toBeNull();
+	});
+
+	test("clear before a message discards calibration from the previous input", async () => {
+		const msg = await narratorPersistence.persistUserMessage("n1", "keep this");
+		sqlite.run("UPDATE narrators SET context_usage_snapshot_json = '{}' WHERE id = 'n1'");
+		await narratorPersistence.clearContextBefore("n1", msg.id);
+		expect(
+			(
+				sqlite
+					.prepare("SELECT context_usage_snapshot_json AS snapshot FROM narrators WHERE id = 'n1'")
+					.get() as { snapshot: string | null }
+			).snapshot,
+		).toBeNull();
+	});
+
+	test("model changes discard the previous request calibration", async () => {
+		sqlite.run("UPDATE narrators SET context_usage_snapshot_json = '{}' WHERE id = 'n1'");
+		await narratorPersistence.updateModel("n1", "other-model");
+		expect(
+			(
+				sqlite
+					.prepare("SELECT context_usage_snapshot_json AS snapshot FROM narrators WHERE id = 'n1'")
+					.get() as { snapshot: string | null }
+			).snapshot,
+		).toBeNull();
 	});
 
 	test("COW inheritance preserves legacy null, semantic edit only measures its new private version", async () => {

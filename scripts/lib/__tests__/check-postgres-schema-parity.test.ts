@@ -404,10 +404,17 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 115 tables and 1659 columns including resource inventory", () => {
+	test("covers 115 tables and 1661 columns including resource inventory and context snapshots", () => {
 		expect(target.tables.length).toBe(115);
-		// 1656 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1659);
+		// 1658 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1661);
+		for (const name of ["narrators", "api_requests"]) {
+			expect(
+				target.tables
+					.find((table) => table.name === name)
+					?.columns.map((column) => column.property),
+			).toContain("contextUsageSnapshotJson");
+		}
 		expect(
 			target.tables
 				.find((table) => table.name === "narrator_worktree_resources")

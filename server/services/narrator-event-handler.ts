@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
+import type { ContextUsageSnapshot } from "@shared/context-usage";
 import type { FileReferenceContext } from "@shared/file-reference";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
 import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
@@ -29,6 +30,7 @@ import {
 	startApiRequest,
 } from "../lib/api-request-tracker";
 import { measureMessageCharacters, queueContextCharacterRefresh } from "../lib/context-characters";
+import { boundedContextSnapshot } from "../lib/context-usage-snapshot";
 import { updateCustomApiQuotaByPrefix } from "../lib/custom-api-quota-cache";
 import { withDbRetry } from "../lib/db-resilience";
 import { eventBus } from "../lib/event-bus";
@@ -45,6 +47,7 @@ import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tra
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
 import { FileReferenceContextTracker } from "./file-reference-context";
+import { storeNarratorContextUsage } from "./narrator-context-composition";
 import { bumpNarratorMessageVersion, narratorPersistence } from "./narrator-persistence";
 import type { EnterPlanModeToolResultCommit } from "./narrator-plan-mode";
 import {
@@ -246,6 +249,7 @@ export async function persistDetachedToolResult(
  * - Subagent: broadcastTargetId === parentNarratorId, has parentToolUseId/subagentModel
  */
 export interface TokenUsageSnapshot {
+	contextSnapshot?: ContextUsageSnapshot;
 	promptTokens?: number;
 	inputTokens?: number;
 	completionTokens?: number;
@@ -1734,6 +1738,7 @@ export async function processEvent(
 								...(tokenUsage.contextWindow != null && {
 									context_window: tokenUsage.contextWindow,
 								}),
+								...(tokenUsage.contextSnapshot && { context_snapshot: tokenUsage.contextSnapshot }),
 								...(tokenUsage.isEstimated && { is_estimated: true }),
 							}
 						: undefined,
@@ -1940,6 +1945,7 @@ export async function processEvent(
 						...(tokenUsage.contextWindow != null && {
 							context_window: tokenUsage.contextWindow,
 						}),
+						...(tokenUsage.contextSnapshot && { context_snapshot: tokenUsage.contextSnapshot }),
 						...(tokenUsage.isEstimated && { is_estimated: true }),
 					}
 				: undefined;
@@ -2020,6 +2026,11 @@ export async function processEvent(
 						: undefined,
 				});
 				savedId = saved.id;
+				if (turnUsage)
+					await db
+						.update(narratorMessages)
+						.set({ turnUsageJson: turnUsage })
+						.where(eq(narratorMessages.id, savedId));
 				if (usageData && ctx.provider && ctx.model) {
 					await updateMessageUsage(savedId, usageData, ctx.provider, ctx.model);
 				}
@@ -2765,9 +2776,14 @@ export async function processEvent(
 		case "context_usage": {
 			ctx.setContextUsagePct(event.percentage);
 			const previousUsage = ctx.getTokenUsage() ?? {};
+			const snapshot = boundedContextSnapshot(event.snapshot);
+			if (snapshot) await storeNarratorContextUsage(narratorId, snapshot);
 			ctx.setTokenUsage({
 				...previousUsage,
-				...(event.promptTokens != null && { promptTokens: event.promptTokens }),
+				...(snapshot ? { contextSnapshot: snapshot } : {}),
+				isEstimated: event.isEstimated === true,
+				...(event.promptTokens != null &&
+					(!event.source || event.source === "usage") && { promptTokens: event.promptTokens }),
 				...(event.inputTokens != null && { inputTokens: event.inputTokens }),
 				...(event.completionTokens != null && { completionTokens: event.completionTokens }),
 				...(event.reasoningTokens != null && { reasoningTokens: event.reasoningTokens }),
@@ -2782,7 +2798,6 @@ export async function processEvent(
 					cacheCreation1hTokens: event.cacheCreation1hTokens,
 				}),
 				...(event.contextWindow != null && { contextWindow: event.contextWindow }),
-				...(event.isEstimated && { isEstimated: true }),
 			});
 
 			// Resolve active thresholds based on context window size
@@ -2795,10 +2810,12 @@ export async function processEvent(
 			dualBroadcast(ctx, {
 				type: "context_usage",
 				narratorId: broadcastTargetId,
+				source: event.source,
+				snapshot: snapshot ?? undefined,
 				percentage: event.percentage,
 				...(event.promptTokens != null && { promptTokens: event.promptTokens }),
 				...(event.contextWindow != null && { contextWindow: event.contextWindow }),
-				...(event.isEstimated && { isEstimated: true }),
+				isEstimated: event.isEstimated === true,
 				...(isSubagent && { isSubagent: true }),
 				compactStart:
 					activeThresholds.compactStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].compactStart,
@@ -2806,10 +2823,12 @@ export async function processEvent(
 			ctx.sseEmitter?.emit("event", {
 				type: "context_usage",
 				data: {
+					source: event.source,
+					snapshot: snapshot ?? undefined,
 					percentage: event.percentage,
 					...(event.promptTokens != null && { promptTokens: event.promptTokens }),
 					...(event.contextWindow != null && { contextWindow: event.contextWindow }),
-					...(event.isEstimated && { isEstimated: true }),
+					isEstimated: event.isEstimated === true,
 					compactStart:
 						activeThresholds.compactStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].compactStart,
 				},
@@ -3099,6 +3118,8 @@ export async function processEvent(
 		}
 
 		case "api_request_start": {
+			// Counters and frozen classifications never carry across attempts.
+			ctx.setTokenUsage(undefined);
 			// This context is runtime state; durable checkpoints must use the same
 			// resolved request identity as the live row, not a configured model alias.
 			ctx.model = event.model;
@@ -3173,6 +3194,40 @@ export async function processEvent(
 		}
 
 		case "api_request_end": {
+			const snapshot = boundedContextSnapshot(event.contextSnapshot);
+			if (snapshot) {
+				await storeNarratorContextUsage(narratorId, snapshot);
+				ctx.setTokenUsage({
+					...ctx.getTokenUsage(),
+					contextSnapshot: snapshot,
+					...(event.usage ?? {}),
+					...(event.usage ? { isEstimated: false } : {}),
+				});
+				if (snapshot.percentage != null) {
+					dualBroadcast(ctx, {
+						type: "context_usage",
+						narratorId: broadcastTargetId,
+						percentage: snapshot.percentage,
+						source: snapshot.source,
+						snapshot,
+						promptTokens: snapshot.occupiedTokens ?? undefined,
+						contextWindow: snapshot.contextWindow ?? undefined,
+						isEstimated: snapshot.source !== "usage",
+						...(ctx.parentToolUseId ? { isSubagent: true } : {}),
+					});
+					ctx.sseEmitter?.emit("event", {
+						type: "context_usage",
+						data: {
+							percentage: snapshot.percentage,
+							source: snapshot.source,
+							snapshot,
+							promptTokens: snapshot.occupiedTokens ?? undefined,
+							contextWindow: snapshot.contextWindow ?? undefined,
+							isEstimated: snapshot.source !== "usage",
+						},
+					});
+				}
+			}
 			// Create API request record in database
 			const requestInfo = ctx.apiRequestsMap?.get(event.requestId);
 			if (!requestInfo) {
@@ -3199,6 +3254,7 @@ export async function processEvent(
 					ttftMs: event.ttftMs ?? null,
 					durationMs: event.durationMs ?? null,
 					contextPercent: event.contextPercent ?? null,
+					contextSnapshot: snapshot,
 					meterUsage: event.meterUsage ?? null,
 					meterUnit: event.meterUnit ?? null,
 					errorMessage: event.errorMessage ?? null,

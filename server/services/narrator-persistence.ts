@@ -1586,6 +1586,7 @@ const sqliteNarratorPersistence = {
 					contextSummary: content,
 					contextSummaryChars: measureSummaryCharacters(content),
 					apiConversationId: null,
+					contextUsageSnapshotJson: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
@@ -1631,6 +1632,7 @@ const sqliteNarratorPersistence = {
 					contextSummary: null,
 					contextSummaryChars: 0,
 					apiConversationId: null,
+					contextUsageSnapshotJson: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
@@ -1690,6 +1692,7 @@ const sqliteNarratorPersistence = {
 			tx.update(narrators)
 				.set({
 					apiConversationId: null,
+					contextUsageSnapshotJson: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
@@ -1847,6 +1850,7 @@ const sqliteNarratorPersistence = {
 								contextSummary: summary,
 								contextSummaryChars: measureSummaryCharacters(summary),
 								apiConversationId: null,
+								contextUsageSnapshotJson: null,
 							}
 						: {}),
 					messageVersion: sql`${narrators.messageVersion} + 1`,
@@ -2442,7 +2446,10 @@ const sqliteNarratorPersistence = {
 
 	async updateModel(narratorId: string, model: string) {
 		const now = new Date().toISOString();
-		await db.update(narrators).set({ model, updatedAt: now }).where(eq(narrators.id, narratorId));
+		await db
+			.update(narrators)
+			.set({ model, contextUsageSnapshotJson: null, updatedAt: now })
+			.where(eq(narrators.id, narratorId));
 	},
 
 	async updatePermissionMode(narratorId: string, permissionMode: PermissionMode) {
@@ -4128,6 +4135,7 @@ const sqliteNarratorPersistence = {
 				.set({
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					apiConversationId: null,
+					contextUsageSnapshotJson: null,
 					updatedAt: now,
 				})
 				.where(eq(narrators.id, narratorId))
@@ -4215,6 +4223,7 @@ const sqliteNarratorPersistence = {
 			tx.update(narrators)
 				.set({
 					apiConversationId: null,
+					contextUsageSnapshotJson: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
@@ -4271,7 +4280,7 @@ const sqliteNarratorPersistence = {
 				.run();
 
 			tx.update(narrators)
-				.set({ apiConversationId: null, updatedAt: now })
+				.set({ apiConversationId: null, contextUsageSnapshotJson: null, updatedAt: now })
 				.where(eq(narrators.id, narratorId))
 				.run();
 		});

@@ -551,6 +551,8 @@ export type NarratorServerMessage =
 	| { type: "segment_compact_hide"; narratorId: string; hiddenMessageIds: string[] }
 	| {
 			type: "context_usage";
+			source?: import("@shared/context-usage").ContextUsageSource;
+			snapshot?: import("@shared/context-usage").ContextUsageSnapshot;
 			narratorId: string;
 			percentage: number;
 			isSubagent?: boolean;

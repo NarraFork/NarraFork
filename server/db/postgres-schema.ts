@@ -327,6 +327,7 @@ export const narrators = pgTable(
 		contextSystemChars: integer("context_system_chars").notNull().default(0),
 		contextToolsChars: integer("context_tools_chars").notNull().default(0),
 		contextCharRevision: integer("context_char_revision").notNull().default(0),
+		contextUsageSnapshotJson: jsonText("context_usage_snapshot_json"),
 		contextCharCacheJson: jsonText("context_char_cache_json"),
 		model: text("model").default("claude-sonnet-4.5"),
 		pendingModelRestore: text("pending_model_restore"),
@@ -891,6 +892,15 @@ export const narratorToolCalls = pgTable(
 	},
 	(table) => [
 		index("idx_toolcalls_message").on(table.messageId),
+		index("idx_toolcalls_context_id").on(table.messageId, table.id),
+		index("idx_toolcalls_context_order").on(table.messageId, table.createdAt, table.id),
+		index("idx_toolcalls_context_latest").on(
+			table.messageId,
+			table.toolUseId,
+			table.executionAttempt,
+			table.createdAt,
+			table.id,
+		),
 		index("idx_toolcalls_tool_use_id").on(table.toolUseId),
 		index("idx_toolcalls_execution_device").on(table.executionDeviceId, table.createdAt),
 		index("idx_toolcalls_status").on(table.narratorId, table.status),
@@ -1897,6 +1907,7 @@ export const apiRequests = pgTable(
 		costUsd: doublePrecision("cost_usd"),
 		costStatus: text("cost_status"),
 		costMissingFields: jsonText("cost_missing_fields"),
+		contextUsageSnapshotJson: jsonText("context_usage_snapshot_json"),
 		contextPercent: doublePrecision("context_percent"),
 		meterUsage: doublePrecision("meter_usage"),
 		meterUnit: text("meter_unit"),
@@ -3677,7 +3688,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 115,
-  "columnCount": 1659,
+  "columnCount": 1661,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -5654,6 +5665,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "0",
           "defaultExpression": "0"
+        },
+        {
+          "property": "contextUsageSnapshotJson",
+          "name": "context_usage_snapshot_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         },
         {
           "property": "contextCharCacheJson",
@@ -9214,6 +9235,34 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_toolcalls_message",
           "columns": [
             "messageId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_toolcalls_context_id",
+          "columns": [
+            "messageId",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_toolcalls_context_order",
+          "columns": [
+            "messageId",
+            "createdAt",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_toolcalls_context_latest",
+          "columns": [
+            "messageId",
+            "toolUseId",
+            "executionAttempt",
+            "createdAt",
+            "id"
           ],
           "unique": false
         },
@@ -14947,6 +14996,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "contextUsageSnapshotJson",
+          "name": "context_usage_snapshot_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "contextPercent",
           "name": "context_percent",
           "kind": "real",
@@ -18802,6 +18861,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_fc_segment_narrator",
           "columns": [
             "narratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_fc_segment_input",
+          "columns": [
+            "narratorId",
+            "sourceInputId"
           ],
           "unique": false
         }

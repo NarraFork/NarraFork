@@ -9,6 +9,7 @@ import { readWithTimeout, StreamByteBudget } from "../stream-timeout";
 import type { UsageData } from "../usage-tracking";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { isCompletionLimitReason } from "./error-handling";
+import { reportInputCharacters } from "./input-characters";
 import type {
 	ChatParams,
 	DbMessage,
@@ -284,6 +285,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			reasoningEffort: params.reasoningEffort,
 			stream: true,
 		});
+		await reportInputCharacters(params, body);
 		const bodyText = JSON.stringify(body);
 		assertByteLimit(bodyText, GEMINI_MAX_STREAM_BYTES, "request body");
 

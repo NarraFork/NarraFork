@@ -551,6 +551,17 @@ export const providerStreamEventSchema = z.discriminatedUnion("type", [
 			credentialId: optionalTextSchema,
 			upstreamRequestId: optionalTextSchema,
 			reasoningSource: optionalTextSchema,
+			/** Complete final model input; absent for plugins that cannot report it. */
+			inputCharacters: z
+				.object({
+					totalChars: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+					systemChars: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+					toolsChars: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+				})
+				.strict()
+				.refine((counts) => counts.systemChars + counts.toolsChars <= counts.totalChars)
+				.nullable()
+				.optional(),
 		})
 		.strict(),
 	z

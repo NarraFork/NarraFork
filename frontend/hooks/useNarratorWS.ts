@@ -660,6 +660,7 @@ export interface NarratorWSCallbacks {
 		contextWindow?: number,
 		isEstimated?: boolean,
 		compactStart?: number,
+		snapshot?: import("@shared/context-usage").ContextUsageSnapshot,
 	) => void;
 	onGitStatus?: (data: {
 		chapterId: string;
@@ -1420,6 +1421,7 @@ export function useNarratorWS(
 								data.contextWindow as number | undefined,
 								data.isEstimated as boolean | undefined,
 								data.compactStart as number | undefined,
+								data.snapshot as import("@shared/context-usage").ContextUsageSnapshot | undefined,
 							);
 						}
 						break;

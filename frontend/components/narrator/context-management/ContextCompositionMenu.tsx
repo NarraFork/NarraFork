@@ -17,6 +17,7 @@ import {
 	type ContextComposition,
 	contextCharacterPercent,
 } from "@shared/context-composition";
+import type { ContextUsageSnapshot } from "@shared/context-usage";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -51,6 +52,7 @@ export function formatContextTokens(tokens?: number | null): string {
 export function ContextCompositionView({
 	data,
 	totalTokens,
+	snapshot,
 	onLoadMore,
 	loadingMore,
 	mode: controlledMode,
@@ -58,6 +60,7 @@ export function ContextCompositionView({
 }: {
 	data: ContextComposition;
 	totalTokens?: number | null;
+	snapshot?: ContextUsageSnapshot | null;
 	onLoadMore?: () => void;
 	loadingMore?: boolean;
 	mode?: string;
@@ -69,6 +72,8 @@ export function ContextCompositionView({
 	const [selected, setSelected] = useState<{ category: ContextCategory; chars: number } | null>(
 		null,
 	);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: selection belongs to this composition generation
+	useEffect(() => setSelected(null), [data.generation]);
 	let offset = 0;
 	const segments = (mode === "category" ? data.totals : data.segments)
 		.filter((segment) => segment.chars > 0)
@@ -77,15 +82,26 @@ export function ContextCompositionView({
 			offset += segment.chars;
 			return { ...segment, key };
 		});
+	const usage = snapshot ?? data.usage;
+	const occupiedTokens = usage ? usage.occupiedTokens : totalTokens;
+	const calibrated =
+		usage?.composition?.generation === data.generation &&
+		data.generation != null &&
+		(!snapshot || snapshot.requestId === data.usage?.requestId) &&
+		usage?.inputCharacters != null &&
+		usage.inputCharacters.totalChars > 0;
 	const describe = (category: ContextCategory, chars: number) =>
-		`${t(`contextComposition.categories.${category}`)} · ${formatContextTokens(contextTokenShare(chars, data.totalChars, totalTokens))} · ${contextCharacterPercent(chars, data.totalChars).toFixed(1)}%`;
+		`${t(`contextComposition.categories.${category}`)} · ${formatContextTokens(calibrated ? contextTokenShare(chars, usage.inputCharacters?.totalChars ?? 0, usage.occupiedTokens) : null)} · ${contextCharacterPercent(chars, data.totalChars).toFixed(1)}%`;
 	const unloadedChars =
 		mode === "sequence" && data.nextCursor ? Math.max(0, data.totalChars - offset) : 0;
 	return (
 		<Stack gap="sm">
 			<Group justify="space-between">
 				<Text size="sm" fw={600} data-testid="context-composition-total">
-					~{formatContextTokens(totalTokens)}
+					{occupiedTokens != null && Number.isFinite(occupiedTokens) && occupiedTokens >= 0
+						? "~"
+						: ""}
+					{formatContextTokens(occupiedTokens)}
 				</Text>
 				<SegmentedControl
 					value={mode}
@@ -187,10 +203,12 @@ export function ContextCompositionPanel({
 	opened,
 	narratorId,
 	totalTokens,
+	snapshot,
 }: {
 	opened: boolean;
 	narratorId: string;
 	totalTokens?: number | null;
+	snapshot?: ContextUsageSnapshot | null;
 }) {
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
@@ -254,6 +272,7 @@ export function ContextCompositionPanel({
 				<ContextCompositionView
 					data={data}
 					totalTokens={totalTokens}
+					snapshot={snapshot}
 					mode={mode}
 					onModeChange={setMode}
 					onLoadMore={() => void query.fetchNextPage()}
@@ -267,11 +286,13 @@ export function ContextCompositionPanel({
 export function ContextCompositionMenu({
 	narratorId,
 	totalTokens,
+	snapshot,
 	target,
 	children,
 }: {
 	narratorId: string;
 	totalTokens?: number | null;
+	snapshot?: ContextUsageSnapshot | null;
 	target: ReactNode;
 	children?: ReactNode;
 }) {
@@ -289,7 +310,12 @@ export function ContextCompositionMenu({
 			>
 				{opened && (
 					<Box p="xs">
-						<ContextCompositionPanel opened narratorId={narratorId} totalTokens={totalTokens} />
+						<ContextCompositionPanel
+							opened
+							narratorId={narratorId}
+							totalTokens={totalTokens}
+							snapshot={snapshot}
+						/>
 					</Box>
 				)}
 				<Menu.Divider />

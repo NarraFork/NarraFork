@@ -31,6 +31,22 @@ const data: ContextComposition = {
 	totalChars: 400,
 	nextCursor: null,
 	pending: false,
+	usage: {
+		requestId: "fixture-request",
+		startedAt: "2026-01-01",
+		source: "upstream",
+		percentage: 40,
+		contextWindow: 1_000_000,
+		occupiedTokens: 400_000,
+		inputCharacters: { totalChars: 400, systemChars: 100, toolsChars: 0 },
+		composition: {
+			generation: "fixture",
+			revision: "1",
+			pageCount: 1,
+			totalChars: 400,
+			totals: groupContextSegments(segments),
+		},
+	},
 };
 (chrome ? test : test.skip)(
 	"真实浏览器：一次点开圆环即可查看，菜单内切换刷新不关闭且无独立弹窗",
@@ -169,6 +185,42 @@ const data: ContextComposition = {
 							4,
 					);
 					expect(requests).toBe(before + 2);
+					for (const [tokens, percentage, source, label] of [
+						[926_000, 92.6, "upstream", "~926K"],
+						[510_800, 51.08, "usage", "~510.8K"],
+						[400_000, 40, "estimate", "~400K"],
+					] as const) {
+						await page.evaluate(
+							(usage) =>
+								window.dispatchEvent(new CustomEvent("fixture-context", { detail: usage })),
+							{
+								...data.usage,
+								source,
+								occupiedTokens: tokens,
+								percentage,
+								inputCharacters: { totalChars: 4000, systemChars: 100, toolsChars: 0 },
+							},
+						);
+						await page.waitForFunction(
+							(value) =>
+								document.querySelector('[data-testid="context-composition-total"]')?.textContent ===
+								value,
+							{},
+							label,
+						);
+						expect(
+							await page.$eval('[data-testid="context-composition-bar"] button', (button) =>
+								button.getAttribute("aria-label"),
+							),
+						).toContain(
+							source === "upstream"
+								? "23.2K · 25.0%"
+								: source === "usage"
+									? "12.8K · 25.0%"
+									: "10K · 25.0%",
+						);
+						expect(await page.evaluate(() => document.body.innerText.match(/~/g)?.length)).toBe(1);
+					}
 					await page.waitForSelector('[data-testid="context-composition-menu"]', { visible: true });
 					await page.keyboard.press("Escape");
 					await page.waitForSelector('[data-testid="context-composition-menu"]', { hidden: true });
