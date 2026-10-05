@@ -17,6 +17,7 @@ export interface SystemLifecycleStatus {
 
 export type SystemLifecycleNotice = Pick<SystemLifecycleStatus, "phase" | "shutdownRequested">;
 export const systemLifecycleNoticeQueryKey = ["system-lifecycle-notice"] as const;
+export const systemLifecycleStatusQueryKey = ["system-lifecycle"] as const;
 
 interface SystemLifecycleActionResult {
 	success: true;
