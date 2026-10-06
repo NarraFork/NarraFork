@@ -1204,6 +1204,7 @@ const ALWAYS_ALLOW_TOOLS = [
 	"EnterPlanMode",
 	"WebSearch",
 	"Await",
+	"Question",
 	"Skill",
 	"LearningGuide",
 	// SwitchDevice only changes which device subsequent file/command tool calls default

@@ -11,8 +11,9 @@
  *   headers are uniquified (` (2)`, ` (3)`, …) so answers cannot overwrite.
  * - `description` — optional FULL prompt / extra context under the header.
  *
- * `id` is an INTERNAL draft/React key only. Legacy `question` / `content` /
- * option `label` are accepted on read and mapped onto this shape.
+ * `id` is retained as the stable persisted answer association key. Header aliases
+ * are accepted only through normalizeQuestionKeys when unambiguous. Legacy
+ * `question` / `content` / option `label` are accepted on read and mapped onto this shape.
  */
 
 import {

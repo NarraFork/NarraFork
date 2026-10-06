@@ -30,6 +30,7 @@ import { packActivateTool, packDeactivateTool, packListTool } from "./pack";
 import { extractPipelineTool, startPipelineTool } from "./pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
 import { pluginInstallTool } from "./plugin-install";
+import { questionTool } from "./question";
 import { readTool } from "./read";
 import { recallTool } from "./recall";
 import { requestPermissionRuleTool } from "./request-permission-rule";
@@ -138,6 +139,7 @@ const coreProvider: ToolProvider = {
 			sendTool,
 			teamStatusTool,
 			askUserQuestionTool,
+			questionTool,
 			skillTool,
 			knowledgeSearchTool,
 			knowledgeReadTool,

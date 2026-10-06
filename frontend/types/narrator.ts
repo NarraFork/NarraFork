@@ -68,7 +68,16 @@ export interface AsyncQuestion {
 	toolCallId: string;
 	toolUseId: string;
 	questions: AsyncQuestionDefinition[];
-	answers: Record<string, string> | null;
+	/** Present only in the detail response. */
+	answers?: Record<string, string> | null;
+	context?: string | null;
+	withdrawReason?: string | null;
+	resolution?: {
+		answerMessageId: string;
+		note: string;
+		resolvedAt: string;
+		actor: string;
+	} | null;
 	annotations?: Record<string, { preview?: string; notes?: string }> | null;
 	status: AsyncQuestionStatus;
 	origin: "agent_async" | "user_deferred";

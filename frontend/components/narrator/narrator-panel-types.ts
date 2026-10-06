@@ -74,6 +74,9 @@ export type { PendingPermission } from "@frontend/types/narrator";
  */
 export interface AsyncQuestionSlot {
 	id: string;
+	question?: import("@frontend/types/narrator").AsyncQuestion;
+	readOnly?: boolean;
+	summaryOnly?: boolean;
 	/** Local draft identity; distinct from the async API record id. */
 	draftId?: string;
 	questions: Question[];
@@ -83,7 +86,7 @@ export interface AsyncQuestionSlot {
 	awaited?: boolean;
 	/** Copy for the awaited notice, resolved by the owner (the bridge has no i18n). */
 	awaitedLabel?: string;
-	onSubmit: (questionId: string, answers: Record<string, string>) => void;
+	onSubmit: (questionId: string, answers: Record<string, string>) => unknown;
 	onDismiss: (questionId: string) => void;
 }
 

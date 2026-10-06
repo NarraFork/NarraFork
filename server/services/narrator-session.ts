@@ -16,12 +16,14 @@ import {
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
 } from "@shared/text-file-types";
-import { and, desc, eq, exists, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	chapters,
+	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
+	narratorQuestions,
 	narrators,
 	narratorToolCalls,
 	projects,
@@ -29,6 +31,7 @@ import {
 import type { ReasoningEffort } from "../lib/agent";
 import { diagnosticsFromError } from "../lib/agent/error-diagnostics";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
+import { projectMessageSenderText } from "../lib/agent/sender-projection";
 import {
 	clearBehaviorFenceEditGrant,
 	grantBehaviorFenceEdit,
@@ -1994,11 +1997,52 @@ async function deliverPendingInjectionsInOrder(
 						inboxMetadata<InboxAgentMetadata>(candidate).channel !== "buffer") &&
 					(projectedBytes === 0 ||
 						projectedBytes +
-							(candidate.kind === "task_notice" ? 52 * 1024 : candidate.projectedByteSize) <=
+							(candidate.kind === "task_notice"
+								? Math.max(52 * 1024, candidate.projectedByteSize)
+								: candidate.projectedByteSize) <=
 							256 * 1024),
 			);
 			if (!row) break;
 			try {
+				const questionAnswer = inboxMetadata<{ questionAnswer?: { messageId: string } }>(
+					row,
+				).questionAnswer;
+				if (questionAnswer) {
+					// Adopt the already persisted user receipt, never create a second message.
+					const ref = db
+						.select({ id: narratorMessageRefs.id })
+						.from(narratorMessageRefs)
+						.where(
+							and(
+								eq(narratorMessageRefs.narratorId, narratorId),
+								eq(narratorMessageRefs.messageId, questionAnswer.messageId),
+							),
+						)
+						.get();
+					if (!ref) throw new Error("Question answer history reference no longer exists");
+					const adopted = runtimeInbox.materialize(inboxClaim(row), () => ({
+						messageId: questionAnswer.messageId,
+						refId: ref.id,
+					}));
+					if (active?._questionAnswerAdoptedMessageIds?.has(questionAnswer.messageId)) {
+						// It arrived between the pre-pass drain and history read. The model
+						// already saw it; acknowledge the receipt, do not add a second copy.
+						consumeMailboxDelivery(inboxConsumption(adopted));
+						continue;
+					}
+					adoptedMailbox?.push(inboxConsumption(adopted));
+					if (active?._questionAnswerFallbackMessageIds?.has(questionAnswer.messageId)) {
+						// Await already staged the full receipt in this request's tool result.
+						continue;
+					}
+					if (active) {
+						active._questionAnswerModelReceipts ??= new Map();
+						active._questionAnswerModelReceipts.set(questionAnswer.messageId, row.text);
+					}
+					parts.push(row.text);
+					projectedBytes += row.projectedByteSize;
+					continue;
+				}
 				const entry = {
 					...projectPendingInjection(row),
 					mailboxClaim: inboxClaim(row),
@@ -2039,8 +2083,17 @@ async function deliverPendingInjectionsInOrder(
 			}
 		}
 
+		const retried = !active?.abortController?.signal.aborted
+			? await retryDeferredQuestionAnswerDeliveries(narratorId, locale)
+			: 0;
 		const joined = parts.filter((part) => part.trim().length > 0).join("\n\n");
-		return joined.length > 0 ? joined : null;
+		// A just-accepted receipt may sit behind this bounded batch. Keep a pass
+		// alive so normal history rebuilding supplies its full persisted event.
+		return joined.length > 0
+			? joined
+			: retried
+				? "Pending question receipts were accepted for delivery."
+				: null;
 	});
 }
 
@@ -2260,6 +2313,9 @@ export async function drainInjectionsIntoHistory(
 ): Promise<{ text: string; onConsumed: () => void }> {
 	const narratorId = active.narratorId;
 	const parts: string[] = [];
+	const { buildPendingQuestionHint } = await import("./narrator-question-service");
+	const pendingQuestionHint = await buildPendingQuestionHint(narratorId);
+	if (pendingQuestionHint) parts.push(pendingQuestionHint);
 	const adoptedDeliveries: AgentMessageDelivery[] = [];
 	const adoptedMailbox: MailboxDeliveryConsumption[] = [];
 
@@ -2780,6 +2836,7 @@ export async function runAgentLoop(
 				.finally(() => {
 					if (owner.release() && allowInboxWake)
 						void (async () => {
+							await retryDeferredQuestionAnswerDeliveries(narratorId, active.locale);
 							if (await hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"]))
 								await wakeInboxIfEligible(narratorId, active.locale);
 						})().catch((error) => {
@@ -4140,6 +4197,370 @@ export async function startBackgroundCompletionContinuationIfPossible(
  * decision there would leave `routes/narrators.ts` — the other caller — still able to
  * run a subagent through the primary path.
  */
+export function isQuestionAnswerWakeEligible(recipient: {
+	status: string;
+	lastStopReason: string | null;
+	substatus?: string | null;
+}): boolean {
+	return (
+		recipient.status === "idle" &&
+		recipient.lastStopReason === "normal" &&
+		!parseSubstatus(recipient.substatus).some(
+			(tag) => tag === "error" || tag === "waiting_permission",
+		)
+	);
+}
+
+async function canWakeQuestionAnswer(
+	recipient: Pick<
+		Awaited<ReturnType<typeof narratorService.getById>>,
+		"status" | "lastStopReason" | "substatus" | "chapterId"
+	>,
+): Promise<boolean> {
+	if (!isQuestionAnswerWakeEligible(recipient)) return false;
+	if (recipient.chapterId) {
+		const chapter = db
+			.select({ status: chapters.status })
+			.from(chapters)
+			.where(eq(chapters.id, recipient.chapterId))
+			.get();
+		if (!chapter || chapter.status !== "active") return false;
+	}
+	return true;
+}
+
+export async function recoverPendingQuestionAnswerDeliveries(
+	locale: Locale = "en",
+	options: { signal?: AbortSignal } = {},
+): Promise<number> {
+	if (getNarratorMessageRefsPort()) return 0;
+	const { getAsyncQuestionExecutionPrincipal, getBoundedQuestionReceipt } = await import(
+		"./narrator-question-service"
+	);
+	const narratorRowid = sql<number>`${narrators}.rowid`;
+	const questionRowid = sql<number>`${narratorQuestions}.rowid`;
+	const narratorEnd = db
+		.select({ cursor: narratorRowid })
+		.from(narrators)
+		.orderBy(desc(narratorRowid))
+		.limit(1)
+		.get()?.cursor;
+	const questionEnd = db
+		.select({ cursor: questionRowid })
+		.from(narratorQuestions)
+		.orderBy(desc(questionRowid))
+		.limit(1)
+		.get()?.cursor;
+	if (!narratorEnd || !questionEnd) return 0;
+	let cursor = 0;
+	let scheduled = 0;
+	// Fixed high-water marks make this background traversal finite; each indexed
+	// page is small and yields before continuing, including a single busy narrator.
+	while (cursor < narratorEnd) {
+		options.signal?.throwIfAborted();
+		const recipients = db
+			.select({
+				cursor: narratorRowid,
+				id: narrators.id,
+				chapterId: narrators.chapterId,
+				status: narrators.status,
+				lastStopReason: narrators.lastStopReason,
+				substatus: narrators.substatus,
+			})
+			.from(narrators)
+			.where(and(gt(narratorRowid, cursor), sql`${narratorRowid} <= ${narratorEnd}`))
+			.orderBy(asc(narratorRowid))
+			.limit(32)
+			.all();
+		if (!recipients.length) break;
+		for (const recipient of recipients) {
+			options.signal?.throwIfAborted();
+			if (!(await canWakeQuestionAnswer(recipient))) continue;
+			let answerCursor = 0;
+			while (answerCursor < questionEnd) {
+				options.signal?.throwIfAborted();
+				// idx_narrator_questions_narrator_status also carries SQLite rowid,
+				// so equality on its two columns supports ordered cursor pagination.
+				const pending = db
+					.select({
+						cursor: questionRowid,
+						id: narratorQuestions.id,
+						messageId: narratorQuestions.answerMessageId,
+					})
+					.from(narratorQuestions)
+					.where(
+						and(
+							eq(narratorQuestions.narratorId, recipient.id),
+							eq(narratorQuestions.status, "answered"),
+							isNull(narratorQuestions.resolutionJson),
+							gt(questionRowid, answerCursor),
+							sql`${questionRowid} <= ${questionEnd}`,
+						),
+					)
+					.orderBy(asc(questionRowid))
+					.limit(32)
+					.all();
+				if (!pending.length) break;
+				for (const question of pending) {
+					options.signal?.throwIfAborted();
+					if (!question.messageId) continue;
+					try {
+						const principal = await getAsyncQuestionExecutionPrincipal(question.id, recipient.id);
+						if (!principal) continue;
+						const receipt = await getBoundedQuestionReceipt(question.messageId, recipient.id);
+						if (!receipt) continue;
+						const delivery = await scheduleQuestionAnswerDelivery(
+							recipient.id,
+							question.messageId,
+							receipt,
+							principal,
+							locale,
+						);
+						if (delivery.ready) scheduled++;
+					} catch (error) {
+						logger.warn("Pending question recovery deferred", {
+							narratorId: recipient.id,
+							questionId: question.id,
+							error: String(error),
+						});
+					}
+				}
+				answerCursor = pending[pending.length - 1].cursor;
+				await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			}
+		}
+		cursor = recipients[recipients.length - 1].cursor;
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+	}
+	return scheduled;
+}
+
+/** Bounded receipt with its persisted human source, never the execution principal. */
+export async function getQuestionAnswerFallbackText(
+	narratorId: string,
+	messageId: string,
+): Promise<string | null> {
+	const { getBoundedQuestionReceipt } = await import("./narrator-question-service");
+	const text = await getBoundedQuestionReceipt(messageId, narratorId);
+	if (!text) return null;
+	const source = db
+		.select({
+			id: narratorMessages.id,
+			narratorId: narratorMessages.narratorId,
+			createdBy: narratorMessages.createdBy,
+			origin: narratorMessages.origin,
+		})
+		.from(narratorMessages)
+		.where(eq(narratorMessages.id, messageId))
+		.get();
+	if (!source) return null;
+	return projectMessageSenderText(
+		{
+			...source,
+			role: "user",
+			contentJson: [],
+			contentText: text,
+			parentToolUseId: null,
+			messageUuid: null,
+		},
+		text,
+	);
+}
+
+/** A prebuilt history has no WeakMap registration for receipts that arrived later. */
+export function consumeQuestionAnswerModelReceipts(
+	narratorId: string,
+	eventIds: ReadonlySet<string>,
+): void {
+	if (getNarratorMessageRefsPort()) return;
+	for (const messageId of eventIds) {
+		const row = db
+			.select({
+				deliveryId: narratorBufferedMessages.deliveryId,
+				recipientRefId: narratorBufferedMessages.recipientRefId,
+				revision: narratorBufferedMessages.contentRevision,
+			})
+			.from(narratorBufferedMessages)
+			.where(
+				and(
+					eq(narratorBufferedMessages.narratorId, narratorId),
+					eq(narratorBufferedMessages.sourceKey, `question-answer:${messageId}`),
+					eq(narratorBufferedMessages.recipientMessageId, messageId),
+					eq(narratorBufferedMessages.state, "materialized"),
+					eq(narratorBufferedMessages.receiptDisposition, "active"),
+					isNull(narratorBufferedMessages.currentAdoptedAt),
+				),
+			)
+			.limit(1)
+			.get();
+		if (row?.deliveryId && row.recipientRefId)
+			consumeMailboxDelivery({
+				deliveryId: row.deliveryId,
+				recipientNarratorId: narratorId,
+				recipientMessageId: messageId,
+				recipientRefId: row.recipientRefId,
+				revision: row.revision,
+			});
+	}
+}
+
+export function registerQuestionAnswerFallback(narratorId: string, messageId: string): void {
+	const active = activeNarrators.get(narratorId);
+	if (!active) return;
+	active._questionAnswerFallbackMessageIds ??= new Set();
+	active._questionAnswerFallbackMessageIds.add(messageId);
+}
+
+/** Retry only receipts whose earlier inbox acceptance failed; existing delivery identities never repeat. */
+export async function retryDeferredQuestionAnswerDeliveries(
+	narratorId: string,
+	locale: Locale = "en",
+): Promise<number> {
+	if (getNarratorMessageRefsPort()) return 0;
+	const { getAsyncQuestionExecutionPrincipal, getBoundedQuestionReceipt } = await import(
+		"./narrator-question-service"
+	);
+	const pending = db
+		.select({ id: narratorQuestions.id, messageId: narratorQuestions.answerMessageId })
+		.from(narratorQuestions)
+		.where(
+			and(
+				eq(narratorQuestions.narratorId, narratorId),
+				eq(narratorQuestions.status, "answered"),
+				isNull(narratorQuestions.resolutionJson),
+				isNotNull(narratorQuestions.answerMessageId),
+				sql`NOT EXISTS (SELECT 1 FROM ${narratorBufferedMessages} WHERE ${narratorBufferedMessages.narratorId} = ${narratorQuestions.narratorId} AND ${narratorBufferedMessages.recipientMessageId} = ${narratorQuestions.answerMessageId})`,
+			),
+		)
+		.limit(16)
+		.all();
+	let accepted = 0;
+	for (const question of pending) {
+		if (!question.messageId) continue;
+		try {
+			const text = await getBoundedQuestionReceipt(question.messageId, narratorId);
+			if (!text) continue;
+			const principal = await getAsyncQuestionExecutionPrincipal(question.id, narratorId);
+			if (
+				(
+					await scheduleQuestionAnswerDelivery(
+						narratorId,
+						question.messageId,
+						text,
+						principal ?? undefined,
+						locale,
+					)
+				).ready
+			)
+				accepted++;
+		} catch (error) {
+			logger.warn("Question receipt inbox retry deferred", {
+				narratorId,
+				questionId: question.id,
+				error: String(error),
+			});
+		}
+	}
+	return accepted;
+}
+
+export function isQuestionAnswerDeliveryReady(narratorId: string, messageId: string): boolean {
+	if (getNarratorMessageRefsPort()) return false;
+	return !!db
+		.select({ id: narratorBufferedMessages.id })
+		.from(narratorBufferedMessages)
+		.where(
+			and(
+				eq(narratorBufferedMessages.narratorId, narratorId),
+				eq(narratorBufferedMessages.sourceKey, `question-answer:${messageId}`),
+				eq(narratorBufferedMessages.recipientMessageId, messageId),
+				inArray(narratorBufferedMessages.state, ["queued", "claimed", "materialized"]),
+				eq(narratorBufferedMessages.receiptDisposition, "active"),
+				isNull(narratorBufferedMessages.adoptedAt),
+				isNull(narratorBufferedMessages.currentAdoptedAt),
+			),
+		)
+		.limit(1)
+		.get();
+}
+
+export async function scheduleQuestionAnswerDelivery(
+	narratorId: string,
+	messageId: string,
+	text: string,
+	executionPrincipal: QuestionExecutionPrincipal | undefined,
+	locale: Locale = "en",
+): Promise<{ ready: boolean; started: boolean }> {
+	// Questions still use the SQLite business service. Fail closed rather than enqueue
+	// on another backend while reading the receipt from the local database.
+	if (getNarratorMessageRefsPort()) return { ready: false, started: false };
+	const accepted = db.transaction((tx) => {
+		const ref = tx
+			.select({ id: narratorMessageRefs.id })
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+			)
+			.get();
+		if (!ref) throw new Error("Question answer must be persisted before scheduling");
+		const message = tx
+			.select({
+				id: narratorMessages.id,
+				narratorId: narratorMessages.narratorId,
+				role: narratorMessages.role,
+				createdBy: narratorMessages.createdBy,
+				origin: narratorMessages.origin,
+				originLabel: narratorMessages.originLabel,
+			})
+			.from(narratorMessages)
+			.where(eq(narratorMessages.id, messageId))
+			.get();
+		if (!message || message.role !== "user")
+			throw new Error("Question answer must be a user event");
+		const modelText = projectMessageSenderText(
+			{ ...message, contentJson: [], contentText: text, parentToolUseId: null, messageUuid: null },
+			text,
+		);
+		return runtimeInbox.enqueue(
+			{
+				kind: "task_notice",
+				noticeKind: "agent",
+				narratorId,
+				sourceKey: `question-answer:${messageId}`,
+				recipientMessageId: messageId,
+				text: modelText,
+				projectedByteSize: Buffer.byteLength(modelText),
+				metadata: {
+					eventKind: "question_answer",
+					questionAnswer: { messageId, executionPrincipal },
+				},
+			},
+			tx,
+		);
+	});
+	if (accepted.status === "full" || accepted.status === "publication_pending")
+		return { ready: false, started: false };
+	if (!executionPrincipal || isLoopRunning(narratorId) || getExecutionOwner(narratorId))
+		return { ready: true, started: false };
+	try {
+		const result = await startInjectionContinuationIfPossible(
+			narratorId,
+			locale,
+			false,
+			executionPrincipal,
+		);
+		return { ready: true, started: result.started };
+	} catch (error) {
+		// The user event and its inbox receipt are committed. A revoked grant or
+		// unavailable execution environment must not turn a saved answer into failure.
+		logger.warn("Question answer wake deferred", { narratorId, messageId, error: String(error) });
+		return { ready: true, started: false };
+	}
+}
+
 export async function startInjectionContinuationIfPossible(
 	narratorId: string,
 	locale: Locale = "en",
@@ -4150,6 +4571,7 @@ export async function startInjectionContinuationIfPossible(
 	// resume lock, and nesting the two in an order nobody else uses invites a deadlock
 	// with a concurrent primary-narrator continuation.
 	const recipient = await narratorService.getById(narratorId);
+	if (executionPrincipal && !(await canWakeQuestionAnswer(recipient))) return { started: false };
 	if (isSubagentVariant(recipient.variant)) {
 		return startSubagentInjectionContinuation(
 			recipient,
@@ -4164,9 +4586,19 @@ export async function startInjectionContinuationIfPossible(
 		const narrator = await narratorService.getById(narratorId);
 		if (narrator.status !== "idle") return { started: false };
 		if (isPlanModeTrait(narrator.traits)) return { started: false };
+		if (executionPrincipal && !(await canWakeQuestionAnswer(narrator))) return { started: false };
 
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 		if (active._loopRunning) return { started: false };
+		if (
+			executionPrincipal &&
+			db
+				.select({ reason: narrators.lastStopReason })
+				.from(narrators)
+				.where(eq(narrators.id, narratorId))
+				.get()?.reason !== "normal"
+		)
+			return { started: false };
 
 		if (executionPrincipal) active._currentUserId = executionPrincipal.userId;
 		active._continuationSuppressed = false;
@@ -6705,6 +7137,11 @@ export function abortActiveNarratorLoopForPlannedUpdateRecovery(
 }
 
 export function interruptNarrator(narratorId: string): boolean {
+	// Persist before aborting: the finalizer and answer wake may race this call.
+	db.update(narrators)
+		.set({ lastStopReason: "user_interrupt" })
+		.where(eq(narrators.id, narratorId))
+		.run();
 	const active = activeNarrators.get(narratorId);
 	const recovery = interruptPlannedUpdateRecovery(narratorId);
 	if (!active && !recovery.interrupted) return false;

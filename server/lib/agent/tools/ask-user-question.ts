@@ -63,6 +63,7 @@ export const askUserQuestionTool: ToolDefinition = {
 		"- Configuration examples\n\n" +
 		"Preview content is rendered as markdown in a monospace box. Multi-line text with newlines is supported. When any option has a preview, the UI switches to a side-by-side layout with a vertical option list on the left and preview on the right. Do not use previews for simple preference questions where headers and descriptions suffice. Note: previews are only supported for single-select questions (not multiSelect).\n\n" +
 		"Asynchronous mode (`async: true`):\n" +
+		"Provide non-empty context (maximum 2KiB UTF-8) describing the task background, applicability and your action while waiting. Question action=get/list recovers historical items after compact; Question action=resolve confirms handling of a specific latest answerMessageId; Question action=withdraw withdraws open items.\n" +
 		"By default this tool BLOCKS until the user answers. Set `async: true` to submit the question without stopping: you get an immediate acknowledgement, keep working with a sensible default, and the user's answer arrives later as a message in the conversation — at which point you adjust.\n" +
 		"Use async when ALL of these hold:\n" +
 		"- The answer refines the work but does not decide your next action\n" +
@@ -163,6 +164,11 @@ export const askUserQuestionTool: ToolDefinition = {
 					additionalProperties: false,
 				},
 			},
+			context: {
+				type: "string",
+				description:
+					"Required for new async questions: task background, answer applicability and what you will do while waiting. Maximum 2KiB UTF-8.",
+			},
 			async: {
 				description:
 					"Set to true to submit the question(s) WITHOUT blocking. You receive an immediate acknowledgement with a question id, keep working with a sensible default, and the user's answer arrives later as a message. Use only when the answer does not decide your next action. Defaults to false (blocking).",
@@ -230,6 +236,10 @@ export const askUserQuestionTool: ToolDefinition = {
 				// below rather than silently doing nothing.
 				.optional()
 				.describe("The list of questions to present to the user"),
+			context: z
+				.string()
+				.optional()
+				.describe("Required non-empty background for async=true; maximum 2KiB UTF-8"),
 			async: z
 				.boolean()
 				.optional()
@@ -392,12 +402,22 @@ async function submitAsyncQuestions(
 						]
 					: []),
 			),
-			columns: { id: true },
+			columns: { id: true, inputJson: true, permissionDecidedBy: true },
 		});
 		if (!call) {
 			return "Could not submit asynchronously (tool call not found). Ask again without `async` if you need an answer.";
 		}
 
+		const persistedInput =
+			call.inputJson && typeof call.inputJson === "object"
+				? (call.inputJson as Record<string, unknown>)
+				: {};
+		// This exemption is a permission-component decision, never a model-owned flag.
+		const deferredByUser =
+			input.deferredByUser === true &&
+			call.permissionDecidedBy === "user" &&
+			persistedInput.deferredByUser === true &&
+			persistedInput.async === true;
 		const { record } = await service.createAsyncQuestion({
 			narratorId: ctx.narratorId,
 			toolCallId: call.id,
@@ -405,16 +425,17 @@ async function submitAsyncQuestions(
 			// Normalize before persisting so the inbox and answer path share one shape
 			// even when a provider still sends legacy field names.
 			questions: coerceAskQuestions(input.questions) as AsyncQuestionDefinition[],
+			context: typeof input.context === "string" ? input.context : null,
 			// ToolContext.userId is server-owned; the answerer's identity must never replace it.
 			executionPrincipal: { version: 1, userId: ctx.userId ?? null },
 			// `deferredByUser` is set by the permission gate when the user pressed "answer
 			// later" on a BLOCKING prompt. Recording that distinction matters for reading
 			// the history back: the agent did not choose to defer, the user did.
-			origin: input.deferredByUser === true ? "user_deferred" : "agent_async",
+			origin: deferredByUser ? "user_deferred" : "agent_async",
 		});
 
 		const openCount = await service.countOpenAsyncQuestions(ctx.narratorId);
-		const deferred = input.deferredByUser === true;
+		const deferred = record.origin === "user_deferred";
 		const lines = deferred
 			? [
 					// The agent asked a BLOCKING question and the user chose to answer later. It
@@ -437,6 +458,8 @@ async function submitAsyncQuestions(
 		}
 		return lines.join("\n");
 	} catch (err) {
-		return `Failed to submit the question asynchronously: ${err instanceof Error ? err.message : String(err)}. Ask again without \`async\` if you need an answer.`;
+		throw new Error(
+			`${err instanceof Error ? err.message : String(err)}. Ask again without \`async\` if you need an answer.`,
+		);
 	}
 }

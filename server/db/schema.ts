@@ -666,6 +666,7 @@ export const narrators = sqliteTable(
 		messageCount: integer("message_count").default(0),
 		totalCostUsd: real("total_cost_usd").default(0),
 		lastMessageAt: text("last_message_at"),
+		lastStopReason: text("last_stop_reason", { enum: ["user_interrupt", "error", "normal"] }),
 		status: text("status", {
 			enum: ["idle", "working", "waiting", "archived"],
 		})
@@ -1823,6 +1824,23 @@ export const narratorQuestions = sqliteTable(
 		toolUseId: text("tool_use_id").notNull(),
 		/** Question definitions, same shape as AskUserQuestion's `questions` input. */
 		questionsJson: text("questions_json", { mode: "json" }).notNull(),
+		context: text("context"),
+		resolutionJson: text("resolution_json", { mode: "json" }).$type<{
+			answerMessageId: string;
+			note: string;
+			resolvedAt: string;
+			actor: string;
+		}>(),
+		withdrawReason: text("withdraw_reason"),
+		/** Small frozen display projection; list APIs never load the snapshot. */
+		summaryJson: text("summary_json", { mode: "json" }).$type<
+			{
+				id: string;
+				header: string;
+				description?: string;
+				options?: { header: string; description?: string }[];
+			}[]
+		>(),
 		/** Trusted execution principal at creation; NULL means unknown legacy provenance. */
 		executionPrincipalJson: text("execution_principal_json", { mode: "json" }).$type<{
 			version: 1;
@@ -1852,6 +1870,37 @@ export const narratorQuestions = sqliteTable(
 	(table) => [
 		uniqueIndex("idx_narrator_questions_tool_call").on(table.toolCallId),
 		index("idx_narrator_questions_narrator_status").on(table.narratorId, table.status),
+		index("idx_narrator_questions_answer_message").on(table.answerMessageId),
+		index("idx_narrator_questions_created").on(table.createdAt, table.id),
+	],
+);
+
+// Structured question/message association survives compact boundaries without scanning content JSON.
+export const narratorQuestionEvents = sqliteTable(
+	"narrator_question_events",
+	{
+		questionId: text("question_id")
+			.notNull()
+			.references(() => narratorQuestions.id, { onDelete: "cascade" }),
+		messageId: text("message_id")
+			.primaryKey()
+			.references(() => narratorMessages.id, { onDelete: "cascade" }),
+		kind: text("kind", { enum: ["answer", "dismissal", "supplement"] }).notNull(),
+		resolutionJson: text("resolution_json", { mode: "json" }).$type<{
+			answerMessageId: string;
+			note: string;
+			resolvedAt: string;
+			actor: string;
+		}>(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_question_events_question_rowid").on(table.questionId),
+		index("idx_question_events_question_created").on(
+			table.questionId,
+			table.createdAt,
+			table.messageId,
+		),
 	],
 );
 

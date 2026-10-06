@@ -177,6 +177,7 @@ beforeEach(() => {
 	listPage = { items: [], nextCursor: null };
 	details = new Map();
 	restorers = [];
+	track(spyOn(api, "getGlobalQuestionPage").mockResolvedValue({ items: [], nextCursor: null }));
 	router = testRouter();
 	track(spyOn(router, "navigate").mockResolvedValue(undefined));
 	track(spyOn(api, "getHumanAttention").mockImplementation(async () => listPage));
@@ -256,6 +257,83 @@ function addPermission(
 
 const draft = JSON.stringify({ selections: {}, customInputs: { notes: "Keep this answer" } });
 
+for (const state of ["empty", "pending", "history"] as const) {
+	test(`the inbox remains neutrally accessible with only ${state} questions`, async () => {
+		const stored = {
+			...question(item("archive-question")),
+			status: "answered" as const,
+			context: "Stored context",
+			narratorTitle: "Owner",
+			chapterId: null,
+			resolution:
+				state === "history"
+					? { answerMessageId: "m", note: "Handled", actor: "agent", resolvedAt: "2026-01-01" }
+					: null,
+		};
+		track(
+			spyOn(api, "getGlobalQuestionPage").mockImplementation(async (filter) => ({
+				items: filter === state ? [stored] : [],
+				nextCursor: null,
+			})),
+		);
+		await render(<HumanAttentionInboxButton currentNarratorId="parent" />);
+		const entry = button(narratorEn.humanAttentionTitle);
+		expect(entry.getAttribute("aria-label")).toBe(narratorEn.humanAttentionTitle);
+		expect(entry.getAttribute("data-variant")).toBe("subtle");
+		expect(entry.textContent).not.toContain("pending");
+		expect(entry.textContent).not.toContain("waiting");
+		await click(narratorEn.humanAttentionTitle);
+		expect(document.querySelector('[data-question-group="open"]')).not.toBeNull();
+		expect(document.querySelector('[data-question-group="pending"]')).not.toBeNull();
+		expect(document.querySelector('[data-question-group="history"]')).not.toBeNull();
+		if (state === "history") await click(narratorEn.asyncQuestionHistoryGroup);
+		if (state !== "empty")
+			expect(document.querySelector(`[data-question-group="${state}"]`)?.textContent).toContain(
+				"Stored context",
+			);
+	});
+}
+
+test("the shared drawer retains other attention items and paginates pending and historical questions independently", async () => {
+	addPermission(item("permission-remains"));
+	const pending = {
+		...question(item("pending-q")),
+		status: "answered" as const,
+		context: "Frozen context",
+		narratorTitle: "Owner",
+		chapterId: null,
+	};
+	const page = track(
+		spyOn(api, "getGlobalQuestionPage").mockImplementation(async (filter, cursor) => ({
+			items: [
+				{
+					...pending,
+					id: `${filter}-${cursor ?? "first"}`,
+					resolution:
+						filter === "history"
+							? { answerMessageId: "m", note: "Handled", resolvedAt: "2026-01-01", actor: "agent" }
+							: null,
+				},
+			],
+			nextCursor: cursor ? null : "next",
+		})),
+	);
+	await openDrawer();
+	expect(row("permission:permission-remains")).toBeDefined();
+	expect(document.querySelector('[data-question-group="open"]')?.textContent).toBe(
+		narratorEn.asyncQuestionOpenGroup,
+	);
+	const pendingGroup = document.querySelector('[data-question-group="pending"]') as Element;
+	expect(pendingGroup.textContent).toContain("Frozen context");
+	await click(narratorEn.humanAttentionLoadMore, pendingGroup);
+	expect(page).toHaveBeenCalledWith("pending", "next");
+	await click(narratorEn.asyncQuestionHistoryGroup);
+	const historyGroup = document.querySelector('[data-question-group="history"]') as Element;
+	expect(historyGroup.textContent).toContain("Handled");
+	await click(narratorEn.humanAttentionLoadMore, historyGroup);
+	expect(page).toHaveBeenCalledWith("history", "next");
+});
+
 describe("human attention global listener and pagination", () => {
 	test("appears with no tabs/subscriptions, shares one listener, ignores automatic progress, reconnects and cleans up", async () => {
 		const listener = track(spyOn(narratorWSManager, "addListener"));
@@ -275,7 +353,7 @@ describe("human attention global listener and pagination", () => {
 		);
 		expect(listener).toHaveBeenCalledTimes(1);
 		expect(subscriptions).not.toHaveBeenCalled();
-		expect(document.querySelector("button")).toBeNull();
+		expect(document.querySelector("button")?.textContent).toBe(narratorEn.humanAttentionTitle);
 		const before = list.mock.calls.length;
 		listPage = { items: [item("outside-tabs")], nextCursor: null };
 		await act(async () =>
@@ -307,7 +385,7 @@ describe("human attention global listener and pagination", () => {
 		listPage = { items: [], nextCursor: null };
 		await act(async () => connection.mock.calls[0][0](true, true));
 		await settle();
-		expect(document.querySelector("button")).toBeNull();
+		expect(document.querySelector("button")?.textContent).toBe(narratorEn.humanAttentionTitle);
 		await render(null);
 		expect(remove).toHaveBeenCalledTimes(1);
 	});
@@ -424,7 +502,7 @@ describe("child async questions from the parent attention entry", () => {
 				),
 		);
 		await render(<HumanAttentionInboxButton currentNarratorId="parent" />);
-		expect(document.querySelector("button")).toBeNull();
+		expect(document.querySelector("button")?.textContent).toBe(narratorEn.humanAttentionTitle);
 		listPage = { items: [child], nextCursor: null };
 		details.set(child.id, { item: child, question: childQuestion });
 		writeSession("ask-draft", child.requestId, draft);
@@ -454,7 +532,7 @@ describe("child async questions from the parent attention entry", () => {
 		for (const [url, init] of fetchSpy.mock.calls) {
 			expect(url).toBe("/api/narrators/actual-child/questions/child-question/answer");
 			expect(init?.method).toBe("POST");
-			expect(JSON.parse(String(init?.body))).toEqual({ answers: { "Notes?": "Keep this answer" } });
+			expect(JSON.parse(String(init?.body))).toEqual({ answers: { notes: "Keep this answer" } });
 		}
 		expect(document.querySelector("[data-attention-id]")).toBeNull();
 		expect(qc.getQueryData<typeof parentQuestions>(["async-questions", "parent"])).toEqual(
@@ -541,7 +619,7 @@ test("notification pending panel reuses decision form, draft recovery and keyboa
 	await assertIsolated(document.querySelector('[role="dialog"] button') as Element);
 	await click(narratorEn.submitAnswer, row(child.id));
 	expect(answer).toHaveBeenCalledWith("actual-child", child.requestId, {
-		answers: { "Notes?": "Keep this answer" },
+		answers: { notes: "Keep this answer" },
 	});
 	await click(navEn.notificationTabActivity);
 	await assertIsolated(
@@ -862,7 +940,7 @@ describe("human attention decisions", () => {
 		expect(approve).toHaveBeenCalledWith("block", { answers: { "Notes?": "Keep this answer" } });
 		await click(narratorEn.submitAnswer, row(asyncRow.id));
 		expect(answer).toHaveBeenCalledWith(asyncRow.narratorId, "async", {
-			answers: { "Notes?": "Keep this answer" },
+			answers: { notes: "Keep this answer" },
 			annotations: asyncQuestion.annotations,
 		});
 		expect(readSession("ask-draft", asyncRow.toolCallId)).not.toBeNull();

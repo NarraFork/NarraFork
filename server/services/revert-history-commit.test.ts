@@ -11,6 +11,7 @@ import * as schema from "../db/schema";
 import { measureMessageCharacters } from "../lib/context-characters";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-identity";
 import type { NarratorAclRow, NarratorPrincipal } from "./narrator-acl";
+import { reconcileQuestionHistoryInTransaction } from "./narrator-question-history";
 import {
 	type PreparedRevertHistory,
 	REWRITE_WORKER,
@@ -50,6 +51,29 @@ function seedSchema(client: Database) {
 		.all();
 	expect(definitions.length).toBeLessThan(2048);
 	for (const row of definitions) client.exec(row.sql);
+	// Pending schema changes are exercised without generating/running a migration.
+	const columns = new Set(
+		client
+			.query<{ name: string }, []>("PRAGMA table_info(narrator_questions)")
+			.all()
+			.map((row) => row.name),
+	);
+	for (const column of ["context", "resolution_json", "summary_json", "withdraw_reason"]) {
+		if (!columns.has(column))
+			client.exec(`ALTER TABLE narrator_questions ADD COLUMN ${column} TEXT`);
+	}
+	client.exec(
+		"CREATE INDEX IF NOT EXISTS idx_narrator_questions_answer_message ON narrator_questions(answer_message_id)",
+	);
+	client.exec(
+		"CREATE TABLE IF NOT EXISTS narrator_question_events (question_id TEXT NOT NULL REFERENCES narrator_questions(id) ON DELETE CASCADE,message_id TEXT PRIMARY KEY REFERENCES narrator_messages(id) ON DELETE CASCADE,kind TEXT NOT NULL,created_at TEXT NOT NULL,resolution_json TEXT)",
+	);
+	client.exec(
+		"CREATE INDEX IF NOT EXISTS idx_question_events_question_created ON narrator_question_events(question_id,created_at,message_id)",
+	);
+	client.exec(
+		"CREATE INDEX IF NOT EXISTS idx_question_events_question_rowid ON narrator_question_events(question_id)",
+	);
 }
 beforeEach(() => {
 	expect(process.env.NARRAFORK_TEST).toBe("1");
@@ -1056,11 +1080,13 @@ describe("manifest associations and real FK behavior", () => {
 		expect(version("different-child")).toBe(7);
 	});
 	test("ambiguous provider-ID child history is refused rather than deleted", async () => {
-		const target = withTools(1, ["same"]);
 		// Delegation, not a read-only tool, is the authority that requires child binding.
-		sqlite
-			.query("UPDATE narrator_tool_calls SET tool_name='Agent' WHERE id=?")
-			.run(target.tools[0]);
+		// The message body must contain the delegation call too, matching real execution.
+		const messageId = message(1, [
+			{ type: "text", text: "keep" },
+			{ type: "tool_use", id: "same", name: "Task", input: { prompt: "fixture" } },
+		]);
+		const target = { messageId, tools: [tool(messageId, "same", "Task")] };
 		const other = message(1, [], "other");
 		sqlite.query("UPDATE narrator_messages SET parent_tool_use_id='same' WHERE id=?").run(other);
 		await expect(
@@ -1276,6 +1302,305 @@ describe("drift, ACL and capability/transaction boundaries", () => {
 		controller.abort();
 		expect(() => apply(token)).toThrow();
 		expect(count("narrator_messages")).toBe(1);
+	});
+});
+
+describe("prepared question lifecycle", () => {
+	function answer(
+		questionId: string,
+		seq: number,
+		kind: "answer" | "supplement" | "dismissal" = "answer",
+		resolution: unknown = null,
+	) {
+		const id = message(seq);
+		db.insert(schema.narratorQuestionEvents)
+			.values({
+				questionId,
+				messageId: id,
+				kind,
+				createdAt: `${time}-${seq}`,
+				resolutionJson:
+					resolution as typeof schema.narratorQuestionEvents.$inferInsert.resolutionJson,
+			})
+			.run();
+		sqlite
+			.query(
+				"UPDATE narrator_questions SET status=?,answer_message_id=?,answers_json=?,annotations_json=?,resolution_json=? WHERE id=?",
+			)
+			.run(
+				kind === "dismissal" ? "dismissed" : "answered",
+				id,
+				'{"answer":"yes"}',
+				'{"answer":"note"}',
+				resolution ? JSON.stringify(resolution) : null,
+				questionId,
+			);
+		return id;
+	}
+	function receipt(messageId: string) {
+		const id = `receipt-${serial++}`;
+		db.insert(schema.narratorBufferedMessages)
+			.values({
+				id,
+				narratorId: "root",
+				text: "receipt",
+				seq: 1,
+				bufferedAt: time,
+				kind: "task_notice",
+				noticeKind: "agent",
+				sourceKey: `question-answer:${messageId}`,
+				recipientMessageId: messageId,
+				state: "claimed",
+				claimToken: "claim",
+				claimEpoch: "epoch",
+				claimedAt: time,
+			})
+			.run();
+		return id;
+	}
+	test("deleting the latest supplement restores the prior event and its resolution", async () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		const note = { answerMessageId: "first", note: "used", actor: "root", resolvedAt: time };
+		const first = answer(q, 2, "answer", note);
+		const latest = answer(q, 3, "supplement");
+		const inbox = receipt(latest);
+		const token = await prepare({ kind: "messages", messageIds: [latest] });
+		const result = apply(token);
+		expect(result.affectedQuestionIds).toEqual([q]);
+		const restored = db
+			.select()
+			.from(schema.narratorQuestions)
+			.where(eq(schema.narratorQuestions.id, q))
+			.get();
+		expect(restored?.answerMessageId).toBe(first);
+		expect(restored?.resolutionJson).toEqual(note);
+		expect(restored?.status).toBe("answered");
+		expect(count("narrator_question_events")).toBe(1);
+		expect(
+			query<{ state: string; receipt_disposition: string; claim_token: string | null }>(
+				"SELECT state,receipt_disposition,claim_token FROM narrator_buffered_messages WHERE id=?",
+				inbox,
+			)[0],
+		).toEqual({ state: "cancelled", receipt_disposition: "recipient_deleted", claim_token: null });
+	});
+	test("same-millisecond events restore their actual insertion order rather than random message IDs", async () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		serial = 9;
+		answer(q, 2);
+		const previous = answer(q, 3, "supplement");
+		const latest = answer(q, 4, "supplement");
+		sqlite
+			.query("UPDATE narrator_question_events SET created_at=? WHERE question_id=?")
+			.run(time, q);
+		apply(await prepare({ kind: "messages", messageIds: [latest] }));
+		expect(
+			query<{ answer_message_id: string }>(
+				"SELECT answer_message_id FROM narrator_questions WHERE id=?",
+				q,
+			)[0].answer_message_id,
+		).toBe(previous);
+	});
+	test("deleting the only answer reopens the question and clears response fields", async () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		const event = answer(q, 2);
+		apply(await prepare({ kind: "messages", messageIds: [event] }));
+		const row = db
+			.select()
+			.from(schema.narratorQuestions)
+			.where(eq(schema.narratorQuestions.id, q))
+			.get();
+		expect(row?.status).toBe("open");
+		expect(row?.answerMessageId).toBeNull();
+		expect(row?.answersJson).toBeNull();
+		expect(row?.annotationsJson).toBeNull();
+		expect(row?.resolutionJson).toBeNull();
+	});
+	test("original-owner answer unlink restores state even if the fork retains the physical message", async () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		const event = answer(q, 2);
+		ref(event, "fork", 2);
+		apply(await prepare({ kind: "messages", messageIds: [event] }));
+		expect(
+			query<{ status: string }>("SELECT status FROM narrator_questions WHERE id=?", q)[0].status,
+		).toBe("open");
+		expect(query("SELECT id FROM narrator_messages WHERE id=?", event)).toHaveLength(1);
+		expect(count("narrator_question_events")).toBe(0);
+	});
+	test("fork-only answer unlink cannot mutate the original owner's active question", async () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		const event = answer(q, 2);
+		ref(event, "fork", 2);
+		const result = apply(await prepare({ kind: "messages", messageIds: [event] }, "fork"));
+		expect(result.affectedQuestionIds).toEqual([]);
+		expect(
+			query<{ status: string }>("SELECT status FROM narrator_questions WHERE id=?", q)[0].status,
+		).toBe("answered");
+		expect(count("narrator_question_events")).toBe(1);
+	});
+	test("original-owner creation unlink withdraws the retained question and cancels pending receipts", async () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		ref(creation.messageId, "fork", 1);
+		const event = answer(q, 2);
+		const inbox = receipt(event);
+		apply(await prepare({ kind: "messages", messageIds: [creation.messageId] }));
+		expect(
+			query<{ status: string; withdraw_reason: string }>(
+				"SELECT status,withdraw_reason FROM narrator_questions WHERE id=?",
+				q,
+			)[0],
+		).toEqual({
+			status: "withdrawn",
+			withdraw_reason: "Question creation was removed from history.",
+		});
+		expect(
+			query<{ state: string }>("SELECT state FROM narrator_buffered_messages WHERE id=?", inbox)[0]
+				.state,
+		).toBe("cancelled");
+		expect(query("SELECT id FROM narrator_tool_calls WHERE id=?", creation.tools[0])).toHaveLength(
+			1,
+		);
+	});
+	test("physical question deletion explicitly deletes all historical event leaves", async () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		answer(q, 2);
+		answer(q, 3, "supplement");
+		const result = apply(await prepare({ kind: "messages", messageIds: [creation.messageId] }));
+		expect(result.affectedQuestionIds).toEqual([q]);
+		expect(count("narrator_questions")).toBe(0);
+		expect(count("narrator_question_events")).toBe(0);
+		expect(count("narrator_messages")).toBe(2);
+	});
+	test("shared partial creation removal withdraws the owner question despite retaining fork tools", async () => {
+		const creation = withTools(1, ["ask", "keep"]);
+		const q = question(creation.tools[0]);
+		ref(creation.messageId, "fork", 1);
+		apply(await prepare({ kind: "tool_calls", toolCallIds: [creation.tools[0]] }));
+		expect(
+			query<{ status: string }>("SELECT status FROM narrator_questions WHERE id=?", q)[0].status,
+		).toBe("withdrawn");
+		expect(query("SELECT id FROM narrator_tool_calls WHERE id=?", creation.tools[0])).toHaveLength(
+			1,
+		);
+		expect(count("narrator_messages")).toBe(2);
+	});
+	test("deleting a supplement after a dismissal restores the dismissed status", async () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		const first = answer(q, 2, "dismissal");
+		const latest = answer(q, 3, "supplement");
+		apply(await prepare({ kind: "messages", messageIds: [latest] }));
+		expect(
+			query<{ status: string; answer_message_id: string }>(
+				"SELECT status,answer_message_id FROM narrator_questions WHERE id=?",
+				q,
+			)[0],
+		).toEqual({ status: "dismissed", answer_message_id: first });
+	});
+	test("question resolution history is size gated before preparing restoration bodies", async () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		const event = answer(q, 2);
+		sqlite
+			.query("UPDATE narrator_question_events SET resolution_json=? WHERE message_id=?")
+			.run("x".repeat(4 * 1024 * 1024 + 1), event);
+		await expect(prepare({ kind: "messages", messageIds: [event] })).rejects.toMatchObject({
+			code: "REVERT_HISTORY_BUDGET_EXCEEDED",
+		});
+		expect(count("narrator_question_events")).toBe(1);
+	}, 20_000);
+	test("ordinary transaction helper restores answers and cancels only their question receipts", () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		const first = answer(q, 2, "answer", {
+			answerMessageId: "first",
+			note: "used",
+			resolvedAt: time,
+			actor: "root",
+		});
+		const latest = answer(q, 3, "supplement");
+		const oldInbox = receipt(first);
+		const latestInbox = receipt(latest);
+		const result = db.transaction((tx) =>
+			reconcileQuestionHistoryInTransaction(tx, "root", { deletedMessageIds: [latest] }),
+		);
+		expect(result).toEqual({ affectedQuestionIds: [q], withdrawnQuestionIds: [] });
+		expect(
+			query<{ answer_message_id: string }>(
+				"SELECT answer_message_id FROM narrator_questions WHERE id=?",
+				q,
+			)[0].answer_message_id,
+		).toBe(first);
+		expect(
+			query<{ state: string }>(
+				"SELECT state FROM narrator_buffered_messages WHERE id=?",
+				latestInbox,
+			)[0].state,
+		).toBe("cancelled");
+		expect(
+			query<{ state: string }>(
+				"SELECT state FROM narrator_buffered_messages WHERE id=?",
+				oldInbox,
+			)[0].state,
+		).toBe("claimed");
+	});
+	test("ordinary partial tool removal withdraws only the exact owner and tool identity", () => {
+		const creation = withTools(1, ["ask", "keep"]);
+		const q = question(creation.tools[0]);
+		const otherQ = question(creation.tools[1]);
+		ref(creation.messageId, "fork", 1);
+		const rootResult = db.transaction((tx) =>
+			reconcileQuestionHistoryInTransaction(tx, "root", {
+				deletedMessageIds: [],
+				deletedToolBlocks: [{ messageId: creation.messageId, toolUseId: "ask" }],
+			}),
+		);
+		expect(rootResult).toEqual({ affectedQuestionIds: [q], withdrawnQuestionIds: [q] });
+		expect(
+			query<{ status: string }>("SELECT status FROM narrator_questions WHERE id=?", otherQ)[0]
+				.status,
+		).toBe("open");
+		const forkResult = db.transaction((tx) =>
+			reconcileQuestionHistoryInTransaction(tx, "fork", {
+				deletedMessageIds: [creation.messageId],
+			}),
+		);
+		expect(forkResult).toEqual({ affectedQuestionIds: [], withdrawnQuestionIds: [] });
+	});
+	test("ordinary question reconciliation rolls back with the caller transaction", () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		const event = answer(q, 2);
+		const inbox = receipt(event);
+		expect(() =>
+			db.transaction((tx) => {
+				reconcileQuestionHistoryInTransaction(tx, "root", { deletedMessageIds: [event] });
+				throw new Error("rollback");
+			}),
+		).toThrow("rollback");
+		expect(
+			query<{ status: string }>("SELECT status FROM narrator_questions WHERE id=?", q)[0].status,
+		).toBe("answered");
+		expect(count("narrator_question_events")).toBe(1);
+		expect(
+			query<{ state: string }>("SELECT state FROM narrator_buffered_messages WHERE id=?", inbox)[0]
+				.state,
+		).toBe("claimed");
+	});
+	test("question inbox writes after prepare invalidate the fixed SQL capability", async () => {
+		const creation = withTools(1, ["ask"]);
+		const q = question(creation.tools[0]);
+		const event = answer(q, 2);
+		const token = await prepare({ kind: "messages", messageIds: [event] });
+		receipt(event);
+		expect(() => apply(token)).toThrow("Database changed after preparation");
+		expect(count("narrator_question_events")).toBe(1);
 	});
 });
 

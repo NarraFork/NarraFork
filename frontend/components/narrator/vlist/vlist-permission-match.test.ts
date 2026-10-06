@@ -26,7 +26,10 @@ describe("async question hosts", () => {
 			new Map([["wait", { awaitQuestionId: "q1" }]]),
 			new Set(["ask", "wait"]),
 		);
-		expect([...(result ?? [])]).toEqual([["wait", slot]]);
+		expect([...(result ?? [])]).toEqual([
+			["ask", { ...slot, summaryOnly: true }],
+			["wait", slot],
+		]);
 		expect(questions.get("ask")).toBe(slot);
 	});
 	it("keeps the original form when Await cannot host it or has completed", () => {
@@ -55,7 +58,10 @@ describe("async question hosts", () => {
 			]),
 			new Set(["wait1", "wait2", "other"]),
 		);
-		expect([...(result ?? [])]).toEqual([["wait1", slot]]);
+		expect([...(result ?? [])]).toEqual([
+			["ask", { ...slot, summaryOnly: true }],
+			["wait1", slot],
+		]);
 	});
 });
 

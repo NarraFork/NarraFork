@@ -22,7 +22,7 @@
  * trying to notify somebody.
  */
 
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 
 const { db, sqlite } = getTestDb();
@@ -69,13 +69,12 @@ mock.module("../subagent-resume", () => ({
 	},
 }));
 
-const { startInjectionContinuationIfPossible, drainAndPersistPendingInjections } = await import(
-	"../narrator-session"
-);
-const { pushParentInboundMessage } = await import("../parent-inbound-queue");
-const { pushBgCompletionNotification } = await import("../bg-completion-queue");
-const { sendSubagentMessageDetailed } = await import("../agent-communication");
-const { announceResumedBackgroundTask } = await import("../subagent-runner");
+const { startInjectionContinuationIfPossible } = await import("../narrator-session");
+// Preserve collaborator initialization order without unused/shadowed local bindings.
+await import("../parent-inbound-queue");
+await import("../bg-completion-queue");
+await import("../agent-communication");
+await import("../subagent-runner");
 
 const now = "2026-07-28T10:00:00.000Z";
 const PARENT_ID = "wake-parent";
@@ -99,8 +98,8 @@ function seedNarrator(
 ) {
 	sqlite
 		.prepare(
-			`INSERT INTO narrators (id, variant, parent_narrator_id, status, traits, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO narrators (id, variant, parent_narrator_id, status, traits, created_at, updated_at, last_stop_reason)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, 'normal')`,
 		)
 		.run(
 			id,

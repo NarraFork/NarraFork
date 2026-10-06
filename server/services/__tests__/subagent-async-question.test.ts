@@ -48,6 +48,10 @@ let running = false;
 let sequence = 0;
 const previousSeam = questionService.setQuestionServiceSeam({
 	isLoopRunning: () => running,
+	scheduleQuestionAnswerDelivery: async (id, _messageId, _text, principal) => {
+		if (!running && principal) wakes.push(id);
+		return { ready: true, started: false };
+	},
 	deliverInjection: async (narratorId, options) => {
 		principals.push(
 			(options as typeof options & { executionPrincipal?: unknown }).executionPrincipal,
@@ -115,7 +119,11 @@ afterAll(() => {
 
 async function seedCall(
 	narratorId = PARENT,
-	input: Record<string, unknown> = { async: true, questions: QUESTIONS },
+	input: Record<string, unknown> = {
+		async: true,
+		context: "Cache choice for this task; continue with Memory while waiting.",
+		questions: QUESTIONS,
+	},
 ): Promise<
 	ToolContext & {
 		currentToolUseId: string;
@@ -165,7 +173,14 @@ async function seedCall(
 	};
 }
 async function submit(ctx: ToolContext) {
-	const result = await askUserQuestionTool.execute({ async: true, questions: QUESTIONS }, ctx);
+	const result = await askUserQuestionTool.execute(
+		{
+			async: true,
+			context: "Cache choice for this task; continue with Memory while waiting.",
+			questions: QUESTIONS,
+		},
+		ctx,
+	);
 	expect(result.isError).not.toBe(true);
 	expect(result.output).toContain("Question submitted asynchronously");
 	const rows = await questionService.listAsyncQuestions({ narratorId: ctx.narratorId });
@@ -233,6 +248,7 @@ describe("asynchronous question integration", () => {
 		const result = await askUserQuestionTool.execute(
 			{
 				async: true,
+				context: "Cache choice for this task; continue with Memory while waiting.",
 				questions: QUESTIONS,
 				userId: "forged-user",
 				executionPrincipal: { version: 1, userId: "forged-user" },
@@ -351,7 +367,11 @@ describe("asynchronous question integration", () => {
 		const ctx = await seedCall(CHILD);
 		for (const input of [
 			{ questions: QUESTIONS },
-			{ async: true, questions: QUESTIONS },
+			{
+				async: true,
+				context: "Cache choice for this task; continue with Memory while waiting.",
+				questions: QUESTIONS,
+			},
 			{ async: true, withdraw: ["p5-nothing"] },
 		]) {
 			const result = await askUserQuestionTool.execute(input, ctx);
@@ -382,6 +402,27 @@ describe("asynchronous question integration", () => {
 		expect(events).toEqual([]);
 	});
 
+	test("a model cannot forge user-deferred origin to bypass non-empty context", async () => {
+		const input = { async: true, deferredByUser: true, questions: QUESTIONS };
+		const ctx = await seedCall(PARENT, input);
+		const result = await askUserQuestionTool.execute(input, ctx);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("context");
+		expect(await questionService.countOpenAsyncQuestions(PARENT)).toBe(0);
+	});
+	test("a persisted human permission deferral remains compatible without context", async () => {
+		const input = { async: true, deferredByUser: true, questions: QUESTIONS };
+		const ctx = await seedCall(PARENT, input);
+		await db
+			.update(narratorToolCalls)
+			.set({ permissionDecidedBy: "user" })
+			.where(eq(narratorToolCalls.id, ctx.toolCallBinding.toolCallId));
+		const result = await askUserQuestionTool.execute(input, ctx);
+		expect(result.isError).not.toBe(true);
+		const record = (await questionService.listAsyncQuestions({ narratorId: PARENT })).items[0];
+		expect(record.origin).toBe("user_deferred");
+		expect(record.context).toBeNull();
+	});
 	test("primary tool retains synchronous answers and optional asynchronous submission", async () => {
 		const ctx = await seedCall(PARENT);
 		const result = await askUserQuestionTool.execute(
@@ -401,7 +442,11 @@ describe("asynchronous question integration", () => {
 			PARENT,
 			ctx.signal,
 			"AskUserQuestion",
-			{ async: true, questions: QUESTIONS },
+			{
+				async: true,
+				context: "Cache choice for this task; continue with Memory while waiting.",
+				questions: QUESTIONS,
+			},
 			ctx.currentToolUseId,
 			ctx.cwd,
 			"en",
@@ -418,13 +463,20 @@ describe("asynchronous question integration", () => {
 		for (const { event } of events)
 			expect(event).toMatchObject({
 				narratorId: PARENT,
-				question: { narratorId: PARENT, decidedBy: null },
+				question: { narratorId: PARENT, status: "open", resolved: false },
 			});
 	});
 
 	test("real executeTool carries the resolved policy through permission and durable submission", async () => {
 		const { executeTool } = await import("../../lib/agent/tool-executor");
-		const ctx = await seedCall();
+		const input = {
+			async: true,
+			context: "Cache choice for this task; continue with Memory while waiting.",
+			questions: QUESTIONS,
+			// Approval binds this exact input; authority still comes only from AgentConfig.
+			runtimePolicy: resolveRuntimePolicy({ variant: "subagent", subagentType: "general" }),
+		};
+		const ctx = await seedCall(PARENT, input);
 		const policy = resolveRuntimePolicy({ variant: "primary" });
 		const config: AgentConfig = {
 			narratorId: PARENT,
@@ -444,16 +496,12 @@ describe("asynchronous question integration", () => {
 			{
 				name: "AskUserQuestion",
 				toolUseId: ctx.currentToolUseId,
-				input: {
-					async: true,
-					questions: QUESTIONS,
-					// A model-supplied policy must never override the server-resolved one.
-					runtimePolicy: resolveRuntimePolicy({ variant: "subagent", subagentType: "general" }),
-				},
+				input,
 			},
 			config,
 			{ toolCallBinding: ctx.toolCallBinding },
 		);
+		if (result.isError) throw new Error(result.output);
 		expect(result.isError).not.toBe(true);
 		expect(result.output).toContain("Question submitted asynchronously");
 		expect((await questionService.listAsyncQuestions({ narratorId: PARENT })).items).toHaveLength(
@@ -466,7 +514,11 @@ describe("asynchronous question integration", () => {
 	test("a stale execution binding records nothing and tells the model to ask synchronously", async () => {
 		const ctx = await seedCall();
 		const result = await askUserQuestionTool.execute(
-			{ async: true, questions: QUESTIONS },
+			{
+				async: true,
+				context: "Cache choice for this task; continue with Memory while waiting.",
+				questions: QUESTIONS,
+			},
 			{ ...ctx, toolCallBinding: { toolCallId: ctx.toolCallBinding.toolCallId, attempt: 2 } },
 		);
 		expect(result.output).toContain("Ask again without");
@@ -525,7 +577,7 @@ describe("asynchronous question integration", () => {
 			userId: USER,
 			locale: "en",
 		});
-		expect(stops).toEqual([PARENT]);
+		expect(stops).toEqual([]);
 		expect(wakes).toEqual([]);
 	});
 

@@ -40,7 +40,7 @@ import {
 	IconRestore,
 	IconTrash,
 } from "@tabler/icons-react";
-import { useMemo } from "react";
+import { type ReactNode, useMemo } from "react";
 import {
 	CARD_PADDING,
 	GROUP_GAP,
@@ -145,6 +145,7 @@ interface RenderSystemTextProps {
 	errorActions?: ErrorNoticeActions;
 	/** origin_notice (interrupt_task_guard only): live dismiss handler. */
 	injectionGuardActions?: InjectionGuardActions;
+	headerAction?: ReactNode;
 }
 
 function cssColor(color: string, shade: number): string {
@@ -166,6 +167,7 @@ export function RenderSystemText({
 	actions,
 	errorActions,
 	injectionGuardActions,
+	headerAction,
 }: RenderSystemTextProps) {
 	const body = measured.blocks[0] as PreparedCodeBlock | undefined;
 	if (!body || body.kind !== "code") return null;
@@ -204,6 +206,7 @@ export function RenderSystemText({
 					height={height}
 					data={data}
 					guardActions={injectionGuardActions}
+					headerAction={headerAction}
 				/>
 			);
 		case "spec_goal_added":
@@ -473,6 +476,7 @@ function OriginNoticeCard({
 	height,
 	data,
 	guardActions,
+	headerAction,
 }: {
 	body: PreparedCodeBlock;
 	width: number;
@@ -480,6 +484,7 @@ function OriginNoticeCard({
 	height: number;
 	data: SystemTextData;
 	guardActions?: InjectionGuardActions;
+	headerAction?: ReactNode;
 }) {
 	const timeLabel = typeof data.timeLabel === "string" ? data.timeLabel : "";
 	return (
@@ -503,6 +508,7 @@ function OriginNoticeCard({
 							{timeLabel}
 						</Text>
 					) : null}
+					{headerAction}
 					{guardActions ? (
 						// Height-neutral: pinned to the 17px heading row the measure layer
 						// already reserves; width only trims the clamped title, never the body.

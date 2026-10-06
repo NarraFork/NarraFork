@@ -45,21 +45,42 @@ function getAnswerForKey(
 	return typeof value === "string" && value.trim() ? value : undefined;
 }
 
+type SavedAnswerOptions = {
+	allowSingleAnswerFallback?: boolean;
+	answerKey?: "id" | "header";
+	canonicalQuestionIds?: ReadonlySet<string>;
+};
+
 export function resolveSavedAnswer(
 	question: Question,
 	savedAnswers: Record<string, string> | undefined,
-	options: { allowSingleAnswerFallback?: boolean } = {},
+	options: SavedAnswerOptions = {},
 ): string | undefined {
-	// Model-facing key first (header), then the internal id used by drafts/legacy rows.
-	const byHeader = getAnswerForKey(savedAnswers, question.header);
-	if (byHeader) return byHeader;
 	const byId = getAnswerForKey(savedAnswers, question.id);
-	if (byId) return byId;
+	if (options.answerKey === "id") {
+		if (byId) return byId;
+		// A legacy header cannot claim another question's canonical ID.
+		if (!options.canonicalQuestionIds?.has(question.header)) {
+			const byHeader = getAnswerForKey(savedAnswers, question.header);
+			if (byHeader) return byHeader;
+		}
+	} else {
+		// Synchronous model-facing answers retain the existing header protocol.
+		const byHeader = getAnswerForKey(savedAnswers, question.header);
+		if (byHeader) return byHeader;
+		if (byId) return byId;
+	}
 
 	if (options.allowSingleAnswerFallback && savedAnswers) {
-		const values = Object.values(savedAnswers).filter(
-			(value): value is string => typeof value === "string" && value.trim().length > 0,
-		);
+		const values = Object.entries(savedAnswers)
+			.filter(
+				([key]) =>
+					options.answerKey !== "id" ||
+					key === question.id ||
+					!options.canonicalQuestionIds?.has(key),
+			)
+			.map(([, value]) => value)
+			.filter((value): value is string => typeof value === "string" && value.trim().length > 0);
 		if (values.length === 1) return values[0];
 	}
 	return undefined;
@@ -84,7 +105,7 @@ export function isSavedOptionSelected(
 	question: Question,
 	optionHeader: string,
 	savedAnswers: Record<string, string> | undefined,
-	options: { allowSingleAnswerFallback?: boolean } = {},
+	options: SavedAnswerOptions = {},
 ): boolean {
 	return isAnswerOptionSelected(resolveSavedAnswer(question, savedAnswers, options), optionHeader);
 }
@@ -92,7 +113,7 @@ export function isSavedOptionSelected(
 export function getSelectedOptionValue(
 	question: Question,
 	savedAnswers: Record<string, string> | undefined,
-	options: { allowSingleAnswerFallback?: boolean } = {},
+	options: SavedAnswerOptions = {},
 ): string {
 	const answer = resolveSavedAnswer(question, savedAnswers, options);
 	return (
@@ -103,7 +124,7 @@ export function getSelectedOptionValue(
 export function getCustomSavedAnswer(
 	question: Question,
 	savedAnswers: Record<string, string> | undefined,
-	options: { allowSingleAnswerFallback?: boolean } = {},
+	options: SavedAnswerOptions = {},
 ): string | undefined {
 	const answer = resolveSavedAnswer(question, savedAnswers, options);
 	if (!answer) return undefined;

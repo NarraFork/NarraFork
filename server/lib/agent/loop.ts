@@ -65,6 +65,7 @@ import {
 } from "./malformed-request-dump";
 import { type ContentLane, OutputContentAccumulator } from "./output-content";
 import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
+import { projectQuestionModelInput } from "./question-model-input";
 import { ApiRequestDumpCollector } from "./request-dump";
 import { detectShell } from "./shell";
 import {
@@ -527,6 +528,7 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"StartPipeline",
 	"ExtractPipeline",
 	"AskUserQuestion",
+	"Question",
 	"EnterPlanMode",
 	"ExitPlanMode",
 ]);
@@ -4381,12 +4383,24 @@ async function* agentLoopInMetadataSnapshot(
 					const resetUpstreamSession = resetUpstreamSessionOnNextRequest;
 					resetUpstreamSessionOnNextRequest = false;
 					if (config.runtimeAuthorizationGuard) await config.runtimeAuthorizationGuard();
+					const questionInput = projectQuestionModelInput(
+						history,
+						content,
+						pendingToolResults,
+						config.getQuestionModelReceipts?.() ?? [],
+					);
 					// This is adoption by the recipient loop, not persistence, wake admission,
 					// or upstream response success. An interrupted/preparation-failed pass never
 					// reaches it. Receipt failures cannot retract input or cause redelivery.
 					if (!attemptAbort.signal.aborted) {
 						const callbacks = pendingInputConsumptions.splice(0);
-						callbacks.unshift(() => config.onModelInputConsumed?.(sourceInputHistory, content));
+						callbacks.unshift(() =>
+							config.onModelInputConsumed?.(
+								sourceInputHistory,
+								content,
+								questionInput.answerEventIds,
+							),
+						);
 						for (const callback of callbacks) {
 							try {
 								callback();
@@ -4425,9 +4439,9 @@ async function* agentLoopInMetadataSnapshot(
 						content,
 						model: effectiveModel,
 						cwd: config.cwd,
-						history,
+						history: questionInput.history,
 						tools,
-						toolResults: pendingToolResults,
+						toolResults: questionInput.toolResults,
 						signal: attemptAbort.signal,
 						stickySessionKey: config.narratorId,
 						reasoningEffort: config.reasoningEffort,

@@ -34,14 +34,28 @@
  * Withdraw uses the same `status = 'open'` condition, so first writer wins.
  */
 
-import type { SideCarAsyncQuestionAnswer, SideCarBody } from "@shared/sidecar-body";
-import { and, desc, eq, inArray, lt, or, type SQLWrapper, sql } from "drizzle-orm";
-import { db } from "../db";
-import { narratorQuestions, narrators, narratorToolCalls } from "../db/schema";
 import {
-	measureSerializedCharacters,
-	queueContextCharacterRefresh,
-} from "../lib/context-characters";
+	assertQuestionBudget,
+	normalizeQuestionKeys,
+	QUESTION_ANSWER_MAX_BYTES,
+	QUESTION_CONTEXT_MAX_BYTES,
+	QUESTION_HINT_MAX_BYTES,
+	QUESTION_NOTE_MAX_BYTES,
+	QUESTION_RECEIPT_MAX_BYTES,
+	QUESTION_SNAPSHOT_MAX_BYTES,
+	type QuestionFilter,
+	type QuestionResolution,
+} from "@shared/question-protocol";
+import type { SideCarAsyncQuestionAnswer, SideCarBody } from "@shared/sidecar-body";
+import { and, desc, eq, getTableColumns, inArray, lt, or, type SQLWrapper, sql } from "drizzle-orm";
+import { db } from "../db";
+import {
+	narratorMessages,
+	narratorQuestionEvents,
+	narratorQuestions,
+	narrators,
+	narratorToolCalls,
+} from "../db/schema";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
@@ -62,12 +76,9 @@ import { type DeliverInjectionOptions, deliverInjection } from "./narrator-injec
 
 /** One question as the tool defined it. Header + description only. */
 export interface AsyncQuestionDefinition {
-	/**
-	 * Internal draft/React key. Not advertised to models; model-facing answers
-	 * are keyed by the (uniquified) `header`.
-	 */
+	/** Stable frozen identity for canonical answer association. */
 	id: string;
-	/** SHORT title shown as the heading; also the model-facing answers key. */
+	/** SHORT display title; legacy header answer keys are accepted only when unambiguous. */
 	header: string;
 	/** Optional FULL prompt / extra context under the header. */
 	description?: string;
@@ -124,6 +135,9 @@ export interface AsyncQuestionRecord {
 	toolCallId: string;
 	toolUseId: string;
 	questions: AsyncQuestionDefinition[];
+	context: string | null;
+	resolution: QuestionResolution | null;
+	withdrawReason: string | null;
 	answers: Record<string, string> | null;
 	annotations: Record<string, AsyncQuestionAnnotation> | null;
 	status: AsyncQuestionStatus;
@@ -140,6 +154,10 @@ export interface AsyncQuestionRecord {
 	 * alike, rather than only from whichever one it happened to see.
 	 */
 	awaited: boolean;
+	/** Transient scheduling evidence; absent/false requires a bounded receipt fallback. */
+	receiptReady?: boolean;
+	/** Compatibility full-list queries omit oversized legacy snapshots rather than load them. */
+	detailTooLarge?: boolean;
 }
 
 /**
@@ -163,6 +181,51 @@ export type AsyncQuestionTransition =
 // ─────────────────────────────────────────────────────────────────────────────
 
 type QuestionRow = typeof narratorQuestions.$inferSelect;
+const questionStateColumns = {
+	id: narratorQuestions.id,
+	narratorId: narratorQuestions.narratorId,
+	toolCallId: narratorQuestions.toolCallId,
+	toolUseId: narratorQuestions.toolUseId,
+	status: narratorQuestions.status,
+	origin: narratorQuestions.origin,
+	answerMessageId: narratorQuestions.answerMessageId,
+	decidedBy: narratorQuestions.decidedBy,
+	decidedAt: narratorQuestions.decidedAt,
+	createdAt: narratorQuestions.createdAt,
+	withdrawReason: sql<
+		string | null
+	>`case when length(cast(${narratorQuestions.withdrawReason} as blob)) <= ${QUESTION_NOTE_MAX_BYTES} then ${narratorQuestions.withdrawReason} else null end`,
+	resolutionJson: sql<
+		string | null
+	>`case when length(cast(${narratorQuestions.resolutionJson} as blob)) <= ${QUESTION_NOTE_MAX_BYTES + 1024} then ${narratorQuestions.resolutionJson} else null end`,
+};
+type QuestionStateRow = Pick<
+	QuestionRow,
+	| "id"
+	| "narratorId"
+	| "toolCallId"
+	| "toolUseId"
+	| "status"
+	| "origin"
+	| "answerMessageId"
+	| "decidedBy"
+	| "decidedAt"
+	| "createdAt"
+	| "withdrawReason"
+> & { resolutionJson: string | null };
+function toStateRecord(row: QuestionStateRow): AsyncQuestionRecord {
+	return toRecord({
+		...row,
+		questionsJson: [],
+		answersJson: null,
+		annotationsJson: null,
+		context: null,
+		summaryJson: null,
+		resolutionJson: row.resolutionJson
+			? (JSON.parse(row.resolutionJson) as QuestionResolution)
+			: null,
+	});
+}
 
 /**
  * Questions currently being awaited, by id → number of live waits.
@@ -204,17 +267,45 @@ export function listAwaitedAsyncQuestionIds(): string[] {
  * shape change (legacy `question` / `content` / option `label`). Uses the shared coerce
  * path so stored rows and live tool input normalize the same way.
  */
-function coerceDefinitions(value: unknown): AsyncQuestionDefinition[] {
-	return coerceAskQuestions(value);
+function coerceDefinitions(
+	value: unknown,
+	preserveStoredTitles = false,
+): AsyncQuestionDefinition[] {
+	const definitions = coerceAskQuestions(value);
+	// Reading a frozen legacy snapshot must not silently uniquify duplicate headers:
+	// legacy title-key submission is genuinely ambiguous and must be rejected.
+	if (preserveStoredTitles && Array.isArray(value) && value.length === definitions.length) {
+		return definitions.map((question, index) => {
+			const header = value[index]?.header;
+			const id = value[index]?.id;
+			return {
+				...question,
+				...(typeof id === "string" && id.trim() ? { id } : {}),
+				...(typeof header === "string" && header.trim() ? { header: header.trim() } : {}),
+			};
+		});
+	}
+	return definitions;
 }
 
 function coerceAnswers(value: unknown): Record<string, string> | null {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 	const out: Record<string, string> = {};
 	for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
-		if (typeof raw === "string") out[key] = raw;
-		// Multi-select answers may have been stored as arrays by an older client.
-		else if (Array.isArray(raw)) out[key] = raw.filter((v) => typeof v === "string").join(", ");
+		const answer =
+			typeof raw === "string"
+				? raw
+				: Array.isArray(raw)
+					? raw.filter((v) => typeof v === "string").join(", ")
+					: undefined;
+		// Define own fields rather than assigning prototype-looking historical IDs.
+		if (answer !== undefined)
+			Object.defineProperty(out, key, {
+				value: answer,
+				enumerable: true,
+				configurable: true,
+				writable: true,
+			});
 	}
 	return Object.keys(out).length > 0 ? out : null;
 }
@@ -228,7 +319,13 @@ function coerceAnnotations(value: unknown): Record<string, AsyncQuestionAnnotati
 		const entry: AsyncQuestionAnnotation = {};
 		if (typeof item.preview === "string") entry.preview = item.preview;
 		if (typeof item.notes === "string") entry.notes = item.notes;
-		if (Object.keys(entry).length > 0) out[key] = entry;
+		if (Object.keys(entry).length > 0)
+			Object.defineProperty(out, key, {
+				value: entry,
+				enumerable: true,
+				configurable: true,
+				writable: true,
+			});
 	}
 	return Object.keys(out).length > 0 ? out : null;
 }
@@ -239,7 +336,10 @@ function toRecord(row: Omit<QuestionRow, "executionPrincipalJson">): AsyncQuesti
 		narratorId: row.narratorId,
 		toolCallId: row.toolCallId,
 		toolUseId: row.toolUseId,
-		questions: coerceDefinitions(row.questionsJson),
+		questions: coerceDefinitions(row.questionsJson, true),
+		context: row.context ?? null,
+		resolution: row.resolutionJson ?? null,
+		withdrawReason: row.withdrawReason ?? null,
 		answers: coerceAnswers(row.answersJson),
 		annotations: coerceAnnotations(row.annotationsJson),
 		status: row.status,
@@ -274,7 +374,18 @@ async function broadcastChange(
 		type: "async_question_changed" as const,
 		narratorId: record.narratorId,
 		change,
-		question: { ...record, awaited },
+		question: {
+			id: record.id,
+			narratorId: record.narratorId,
+			toolCallId: record.toolCallId,
+			toolUseId: record.toolUseId,
+			status: record.status,
+			origin: record.origin,
+			answerMessageId: record.answerMessageId,
+			resolved: !!record.resolution,
+			createdAt: record.createdAt,
+			awaited,
+		},
 		awaited,
 	};
 	seam.broadcastToNarrator(record.narratorId, event);
@@ -336,6 +447,7 @@ export interface CreateAsyncQuestionArgs {
 	toolCallId: string;
 	toolUseId: string;
 	questions: AsyncQuestionDefinition[];
+	context?: string | null;
 	origin?: AsyncQuestionOrigin;
 	/** Trusted server execution snapshot; never inferred from answers or tool arguments. */
 	executionPrincipal?: QuestionExecutionPrincipal;
@@ -368,12 +480,54 @@ export async function createAsyncQuestion(
 	});
 	if (existing) return { record: toRecord(existing), created: false };
 
+	assertQuestionBudget(args.context ?? "", QUESTION_CONTEXT_MAX_BYTES, "Question context");
+	const context = args.context?.trim() || null;
+	if ((args.origin ?? "agent_async") === "agent_async" && !context) {
+		throw new Error("New async questions require a non-empty context.");
+	}
+	assertQuestionBudget(context ?? "", QUESTION_CONTEXT_MAX_BYTES, "Question context");
+	if (!Array.isArray(args.questions) || args.questions.length < 1 || args.questions.length > 4)
+		throw new Error("Provide 1-4 questions.");
+	let snapshotUnits = context?.length ?? 0;
+	for (const question of args.questions) {
+		if ((question.options?.length ?? 0) > 4)
+			throw new Error("Provide at most 4 options per question.");
+		for (const value of [
+			question.id,
+			question.header,
+			question.description,
+			...(question.options ?? []).flatMap((option) => [
+				option.header,
+				option.description,
+				option.preview,
+			]),
+		]) {
+			if (typeof value === "string") snapshotUnits += value.length;
+		}
+		if (snapshotUnits > QUESTION_SNAPSHOT_MAX_BYTES)
+			throw new Error("Question snapshot exceeds 65536 UTF-8 bytes.");
+	}
+	const questions = coerceDefinitions(args.questions);
+	if (questions.length < 1 || questions.length > 4) throw new Error("Provide 1-4 questions.");
+	assertQuestionBudget({ questions, context }, QUESTION_SNAPSHOT_MAX_BYTES, "Question snapshot");
 	const row = {
 		id: generateId(),
 		narratorId: args.narratorId,
 		toolCallId: args.toolCallId,
 		toolUseId: args.toolUseId,
-		questionsJson: args.questions,
+		questionsJson: questions,
+		context,
+		resolutionJson: null,
+		withdrawReason: null,
+		summaryJson: questions.map((q) => ({
+			id: q.id,
+			header: q.header.slice(0, 120),
+			description: q.description?.slice(0, 240),
+			options: q.options?.slice(0, 4).map((option) => ({
+				header: option.header.slice(0, 120),
+				description: option.description?.slice(0, 240),
+			})),
+		})),
 		executionPrincipalJson: parseQuestionExecutionPrincipal(args.executionPrincipal),
 		answersJson: null,
 		annotationsJson: null,
@@ -449,11 +603,38 @@ export async function listAsyncQuestions(args: ListAsyncQuestionsArgs): Promise<
 		}
 	}
 
-	const rows = await db.query.narratorQuestions.findMany({
-		where: and(...conditions),
-		orderBy: [desc(narratorQuestions.createdAt), desc(narratorQuestions.id)],
-		limit: limit + 1,
-	});
+	const bytes = sql`coalesce(length(cast(${narratorQuestions.questionsJson} as blob)), 0)
+		+ coalesce(length(cast(${narratorQuestions.answersJson} as blob)), 0)
+		+ coalesce(length(cast(${narratorQuestions.annotationsJson} as blob)), 0)
+		+ coalesce(length(cast(${narratorQuestions.context} as blob)), 0)
+		+ coalesce(length(cast(${narratorQuestions.resolutionJson} as blob)), 0)
+		+ coalesce(length(cast(${narratorQuestions.withdrawReason} as blob)), 0)`;
+	const budget = QUESTION_RECEIPT_MAX_BYTES + 4096;
+	const bounded = (column: SQLWrapper) =>
+		sql<string | null>`case when ${bytes} <= ${budget} then ${column} else null end`;
+	const rows = await db
+		.select({
+			...getTableColumns(narratorQuestions),
+			questionsJson: bounded(narratorQuestions.questionsJson).mapWith(
+				narratorQuestions.questionsJson,
+			),
+			answersJson: bounded(narratorQuestions.answersJson).mapWith(narratorQuestions.answersJson),
+			annotationsJson: bounded(narratorQuestions.annotationsJson).mapWith(
+				narratorQuestions.annotationsJson,
+			),
+			context: bounded(narratorQuestions.context),
+			resolutionJson: bounded(narratorQuestions.resolutionJson).mapWith(
+				narratorQuestions.resolutionJson,
+			),
+			withdrawReason: bounded(narratorQuestions.withdrawReason),
+			summaryJson: sql<null>`null`,
+			executionPrincipalJson: sql<null>`null`,
+			withinBudget: sql<number>`${bytes} <= ${budget}`,
+		})
+		.from(narratorQuestions)
+		.where(and(...conditions))
+		.orderBy(desc(narratorQuestions.createdAt), desc(narratorQuestions.id))
+		.limit(limit + 1);
 
 	const hasMore = rows.length > limit;
 	const page = hasMore ? rows.slice(0, limit) : rows;
@@ -466,7 +647,10 @@ export async function listAsyncQuestions(args: ListAsyncQuestionsArgs): Promise<
 	// keyed on `(createdAt, id)` — the stable, sortable pair — because ordering pages by
 	// a value that changes while the user reads would let a question shift between pages
 	// and be seen twice or not at all.
-	const items = page.map(toRecord);
+	const items = page.map((row) => ({
+		...toRecord(row),
+		...(row.withinBudget ? {} : { detailTooLarge: true }),
+	}));
 	items.sort((a, b) => {
 		if (a.awaited !== b.awaited) return a.awaited ? -1 : 1;
 		return b.createdAt.localeCompare(a.createdAt);
@@ -500,10 +684,15 @@ export async function getAsyncQuestion(id: string): Promise<AsyncQuestionRecord 
 export async function getBoundedOpenAsyncQuestion(
 	id: string,
 	maxBytes: number,
+	status: AsyncQuestionStatus | null = "open",
+	narratorId?: string,
 ): Promise<{ record: AsyncQuestionRecord | null; tooLarge: boolean }> {
 	const bytes = sql`coalesce(length(cast(${narratorQuestions.questionsJson} as blob)), 0)
 		+ coalesce(length(cast(${narratorQuestions.answersJson} as blob)), 0)
-		+ coalesce(length(cast(${narratorQuestions.annotationsJson} as blob)), 0)`;
+		+ coalesce(length(cast(${narratorQuestions.annotationsJson} as blob)), 0)
+		+ coalesce(length(cast(${narratorQuestions.context} as blob)), 0)
+		+ coalesce(length(cast(${narratorQuestions.resolutionJson} as blob)), 0)
+		+ coalesce(length(cast(${narratorQuestions.withdrawReason} as blob)), 0)`;
 	const bounded = (column: SQLWrapper) =>
 		sql<string | null>`case when ${bytes} <= ${maxBytes} then ${column} else null end`;
 	const row = await db
@@ -512,6 +701,9 @@ export async function getBoundedOpenAsyncQuestion(
 			narratorId: narratorQuestions.narratorId,
 			toolCallId: narratorQuestions.toolCallId,
 			toolUseId: narratorQuestions.toolUseId,
+			context: bounded(narratorQuestions.context),
+			resolutionJson: bounded(narratorQuestions.resolutionJson),
+			withdrawReason: bounded(narratorQuestions.withdrawReason),
 			questionsJson: bounded(narratorQuestions.questionsJson),
 			answersJson: bounded(narratorQuestions.answersJson),
 			annotationsJson: bounded(narratorQuestions.annotationsJson),
@@ -524,7 +716,13 @@ export async function getBoundedOpenAsyncQuestion(
 			createdAt: narratorQuestions.createdAt,
 		})
 		.from(narratorQuestions)
-		.where(and(eq(narratorQuestions.id, id), eq(narratorQuestions.status, "open")))
+		.where(
+			and(
+				eq(narratorQuestions.id, id),
+				...(status ? [eq(narratorQuestions.status, status)] : []),
+				...(narratorId !== undefined ? [eq(narratorQuestions.narratorId, narratorId)] : []),
+			),
+		)
 		.limit(1)
 		.get();
 	if (!row) return { record: null, tooLarge: false };
@@ -542,9 +740,381 @@ export async function getBoundedOpenAsyncQuestion(
 			questionsJson: parse(row.questionsJson),
 			answersJson: parse(row.answersJson),
 			annotationsJson: parse(row.annotationsJson),
+			resolutionJson: parse(row.resolutionJson) as QuestionResolution | null,
+			summaryJson: null,
 		}),
 		tooLarge: false,
 	};
+}
+
+export async function getBoundedQuestionReceipt(
+	messageId: string,
+	narratorId: string,
+): Promise<string | null> {
+	const row = await db
+		.select({
+			text: sql<
+				string | null
+			>`case when length(cast(${narratorMessages.contentText} as blob)) <= ${QUESTION_RECEIPT_MAX_BYTES} then ${narratorMessages.contentText} else null end`,
+		})
+		.from(narratorMessages)
+		.where(
+			and(
+				eq(narratorMessages.id, messageId),
+				eq(narratorMessages.narratorId, narratorId),
+				eq(narratorMessages.role, "user"),
+			),
+		)
+		.limit(1)
+		.get();
+	return row?.text ?? null;
+}
+
+export async function getBoundedQuestionDetail(
+	id: string,
+	options: { narratorId?: string; cursor?: string; limit?: number } = {},
+) {
+	const detail = await getBoundedOpenAsyncQuestion(
+		id,
+		QUESTION_RECEIPT_MAX_BYTES + 4 * 1024,
+		null,
+		options.narratorId,
+	);
+	if (!detail.record) return { ...detail, events: [], nextCursor: null };
+	const events = await listQuestionEvents(id, options);
+	return { ...detail, ...events };
+}
+
+/** Event payloads are bounded in SQL, before fetching or parsing legacy JSON. */
+export async function listQuestionEvents(
+	id: string,
+	options: { cursor?: string; limit?: number } = {},
+) {
+	const limit = Math.min(Math.max(options.limit ?? 5, 1), 10);
+	const conditions = [eq(narratorQuestionEvents.questionId, id)];
+	if (options.cursor) {
+		const cursor = Number(options.cursor);
+		if (!Number.isSafeInteger(cursor) || cursor < 0)
+			throw new Error("Invalid question event cursor.");
+		conditions.push(sql`${narratorQuestionEvents}.rowid > ${cursor}`);
+	}
+	const rows = await db
+		.select({
+			messageId: narratorQuestionEvents.messageId,
+			cursor: sql<number>`${narratorQuestionEvents}.rowid`,
+			resolution: sql<
+				string | null
+			>`case when length(cast(${narratorQuestionEvents.resolutionJson} as blob)) <= ${QUESTION_NOTE_MAX_BYTES + 1024} then ${narratorQuestionEvents.resolutionJson} else null end`,
+			kind: narratorQuestionEvents.kind,
+			createdAt: narratorQuestionEvents.createdAt,
+			text: sql<
+				string | null
+			>`case when length(cast(${narratorMessages.contentJson} as blob)) <= ${QUESTION_RECEIPT_MAX_BYTES * 3} then coalesce(json_extract(${narratorMessages.contentJson}, '$[0].body.supplement'), json_extract(${narratorMessages.contentJson}, '$[1].body.supplement'), '') else null end`,
+			actor: narratorMessages.createdBy,
+		})
+		.from(narratorQuestionEvents)
+		.innerJoin(narratorMessages, eq(narratorQuestionEvents.messageId, narratorMessages.id))
+		.where(and(...conditions))
+		.orderBy(sql`${narratorQuestionEvents}.rowid`)
+		.limit(limit + 1);
+	const page = rows.slice(0, limit);
+	const last = page.at(-1);
+	return {
+		events: page.map((event) => ({
+			...event,
+			resolution: event.resolution ? (JSON.parse(event.resolution) as QuestionResolution) : null,
+		})),
+		nextCursor: rows.length > limit && last ? String(last.cursor) : null,
+	};
+}
+
+/** Summaries avoid loading previews, answers, context and raw event payloads. */
+export async function listQuestionSummaries(args: {
+	narratorId?: string;
+	principal?: { userId: string; isAdmin: boolean };
+	filter?: QuestionFilter;
+	cursor?: string;
+	limit?: number;
+}) {
+	if (!args.narratorId && !args.principal)
+		throw new Error("Question query requires an owner or principal.");
+	const limit = Math.min(Math.max(args.limit ?? 20, 1), 32);
+	const conditions = [];
+	if (args.narratorId) conditions.push(eq(narratorQuestions.narratorId, args.narratorId));
+	const pending = sql`${narratorQuestions.status} = 'answered' and ${narratorQuestions.resolutionJson} is null`;
+	if (args.filter === "open") conditions.push(eq(narratorQuestions.status, "open"));
+	if (args.filter === "pending") conditions.push(pending);
+	if (args.filter === "history")
+		conditions.push(sql`${narratorQuestions.status} != 'open' and not (${pending})`);
+	if (args.cursor) {
+		const [createdAt, id] = args.cursor.split("|");
+		conditions.push(
+			sql`(${narratorQuestions.createdAt}, ${narratorQuestions.id}) < (${createdAt}, ${id})`,
+		);
+	}
+	const rows = await db
+		.select({
+			id: narratorQuestions.id,
+			narratorId: narratorQuestions.narratorId,
+			toolCallId: narratorQuestions.toolCallId,
+			toolUseId: narratorQuestions.toolUseId,
+			status: narratorQuestions.status,
+			origin: narratorQuestions.origin,
+			createdAt: narratorQuestions.createdAt,
+			answerMessageId: narratorQuestions.answerMessageId,
+			context: sql<
+				string | null
+			>`case when length(cast(${narratorQuestions.context} as blob)) <= ${QUESTION_CONTEXT_MAX_BYTES} then ${narratorQuestions.context} else null end`,
+			resolution: sql<
+				string | null
+			>`case when length(cast(${narratorQuestions.resolutionJson} as blob)) <= ${QUESTION_NOTE_MAX_BYTES + 1024} then ${narratorQuestions.resolutionJson} else null end`,
+			withdrawReason: sql<
+				string | null
+			>`case when length(cast(${narratorQuestions.withdrawReason} as blob)) <= ${QUESTION_NOTE_MAX_BYTES} then ${narratorQuestions.withdrawReason} else null end`,
+			resolved: sql<boolean>`${narratorQuestions.resolutionJson} is not null`,
+			questions: sql<string>`case when length(cast(${narratorQuestions.summaryJson} as blob)) <= 16384 and json_valid(${narratorQuestions.summaryJson}) then ${narratorQuestions.summaryJson} when length(cast(${narratorQuestions.questionsJson} as blob)) <= ${QUESTION_SNAPSHOT_MAX_BYTES} and json_valid(${narratorQuestions.questionsJson}) then (select json_group_array(json_object('id', json_extract(value, '$.id'), 'header', substr(json_extract(value, '$.header'), 1, 120))) from json_each(${narratorQuestions.questionsJson}) where key < 4) else '[]' end`,
+			narratorTitle: narrators.title,
+			chapterId: narrators.chapterId,
+		})
+		.from(narratorQuestions)
+		.innerJoin(narrators, eq(narratorQuestions.narratorId, narrators.id))
+		.where(and(...conditions))
+		.orderBy(desc(narratorQuestions.createdAt), desc(narratorQuestions.id))
+		.limit(limit + 1);
+	const page = rows.slice(0, limit);
+	const items = [];
+	const { canReadNarrator, canWriteNarrator } = await import("./narrator-acl");
+	for (const row of page) {
+		let canAct = true;
+		if (args.principal) {
+			const narrator = await db.query.narrators.findFirst({
+				where: eq(narrators.id, row.narratorId),
+				columns: {
+					id: true,
+					ownerUserId: true,
+					visibility: true,
+					writeAudience: true,
+					type: true,
+					aclRootNarratorId: true,
+					chapterId: true,
+					contextProjectId: true,
+				},
+			});
+			if (!narrator || !(await canReadNarrator(narrator, args.principal))) continue;
+			canAct = await canWriteNarrator(narrator, args.principal);
+		}
+		items.push({
+			...row,
+			canAct,
+			resolution:
+				typeof row.resolution === "string"
+					? (JSON.parse(row.resolution) as QuestionResolution)
+					: row.resolution,
+			resolved: !!row.resolved,
+			awaited: isAsyncQuestionAwaited(row.id),
+			questions:
+				typeof row.questions === "string"
+					? (JSON.parse(row.questions) as { id: string; header: string }[])
+					: row.questions,
+		});
+	}
+	const last = page.at(-1);
+	items.sort((left, right) => Number(right.awaited) - Number(left.awaited));
+	return { items, nextCursor: rows.length > limit && last ? `${last.createdAt}|${last.id}` : null };
+}
+
+export async function buildPendingQuestionHint(
+	narratorId: string,
+	locale: Locale = "en",
+): Promise<string> {
+	const [open, pending] = await Promise.all([
+		listQuestionSummaries({ narratorId, filter: "open", limit: 8 }),
+		listQuestionSummaries({ narratorId, filter: "pending", limit: 8 }),
+	]);
+	const lines = [
+		locale === "zh-CN"
+			? "未决问题（Question action=get 读取详情，action=list 分页）："
+			: "Unresolved questions (Question action=get for details; action=list for pagination):",
+	];
+	for (const row of [...open.items, ...pending.items]) {
+		const line = JSON.stringify({
+			id: row.id,
+			status: row.status,
+			titles: Array.isArray(row.questions) ? row.questions.map((question) => question.header) : [],
+			awaited: row.awaited,
+			answerMessageId: row.answerMessageId,
+		});
+		if (
+			new TextEncoder().encode([...lines, line].join("\n")).length >
+			QUESTION_HINT_MAX_BYTES - 100
+		) {
+			lines.push("Additional questions omitted; use Question action=list.");
+			break;
+		}
+		lines.push(line);
+	}
+	if (open.nextCursor || pending.nextCursor)
+		lines.push("Additional questions available via Question action=list.");
+	return lines.length === 1 ? "" : lines.join("\n");
+}
+
+export async function resolveAsyncQuestion(args: {
+	id: string;
+	narratorId: string;
+	answerMessageId: string;
+	note: string;
+}) {
+	assertQuestionBudget(args.note, QUESTION_NOTE_MAX_BYTES, "Resolution note");
+	if (!args.note.trim()) throw new Error("Resolution note must be non-empty.");
+	const detail = await getBoundedQuestionDetail(args.id, { narratorId: args.narratorId });
+	if (detail.tooLarge) throw new Error("Question detail exceeds the byte budget.");
+	if (!detail.record) return { ok: false as const, reason: "not_found", answerMessageId: null };
+	const resolution: QuestionResolution = {
+		answerMessageId: args.answerMessageId,
+		note: args.note.trim(),
+		actor: args.narratorId,
+		resolvedAt: new Date().toISOString(),
+	};
+	const row = db.transaction((tx) => {
+		const claimed = tx
+			.update(narratorQuestions)
+			.set({ resolutionJson: resolution })
+			.where(
+				and(
+					eq(narratorQuestions.id, args.id),
+					eq(narratorQuestions.narratorId, args.narratorId),
+					eq(narratorQuestions.status, "answered"),
+					eq(narratorQuestions.answerMessageId, args.answerMessageId),
+					sql`${narratorQuestions.resolutionJson} is null`,
+				),
+			)
+			.returning({ id: narratorQuestions.id })
+			.get();
+		if (claimed)
+			tx.update(narratorQuestionEvents)
+				.set({ resolutionJson: resolution })
+				.where(
+					and(
+						eq(narratorQuestionEvents.messageId, args.answerMessageId),
+						eq(narratorQuestionEvents.questionId, args.id),
+					),
+				)
+				.run();
+		return claimed;
+	});
+	if (row) {
+		const record = { ...detail.record, resolution };
+		await broadcastChange(record, "answered");
+		return { ok: true as const, record };
+	}
+	const { record } = await getBoundedQuestionDetail(args.id, { narratorId: args.narratorId });
+	if (
+		record?.resolution?.answerMessageId === args.answerMessageId &&
+		record.resolution.note === args.note.trim() &&
+		record.resolution.actor === args.narratorId
+	)
+		return { ok: true as const, record };
+	return {
+		ok: false as const,
+		reason: record ? "stale" : "not_found",
+		answerMessageId: record?.answerMessageId ?? null,
+	};
+}
+
+export async function supplementAsyncQuestion(
+	id: string,
+	args: {
+		text: string;
+		userId?: string | null;
+		locale?: Locale;
+		answerMessageId?: string;
+		expectedAnswerMessageId?: string;
+	},
+) {
+	assertQuestionBudget(args.text, QUESTION_ANSWER_MAX_BYTES, "Question supplement");
+	if (!args.text.trim()) throw new Error("Supplement must be non-empty.");
+	const { record } = await getBoundedQuestionDetail(id);
+	if (!record) return { ok: false as const, reason: "not_found" };
+	if (
+		record.status !== "answered" ||
+		!record.answerMessageId ||
+		((args.expectedAnswerMessageId ?? args.answerMessageId) &&
+			record.answerMessageId !== (args.expectedAnswerMessageId ?? args.answerMessageId))
+	)
+		return { ok: false as const, reason: "stale", answerMessageId: record.answerMessageId };
+	const previousAnswerMessageId = record.answerMessageId;
+	const seam = await resolveSeam();
+	let committed: string | null = null;
+	try {
+		await deliverDecision(
+			record,
+			"answered",
+			args.locale ?? "en",
+			args.userId ?? null,
+			seam,
+			(tx, messageId) => {
+				const claimed = tx
+					.update(narratorQuestions)
+					.set({ answerMessageId: messageId, resolutionJson: null })
+					.where(
+						and(
+							eq(narratorQuestions.id, id),
+							eq(narratorQuestions.status, "answered"),
+							eq(narratorQuestions.answerMessageId, previousAnswerMessageId),
+						),
+					)
+					.returning({ id: narratorQuestions.id })
+					.get();
+				if (!claimed) throw new QuestionAlreadyDecidedError();
+				// Legacy answered rows predate the association table. Preserve their original
+				// event and processing note before replacing the current pointer.
+				const previousMessage = tx
+					.select({ id: narratorMessages.id })
+					.from(narratorMessages)
+					.where(
+						and(
+							eq(narratorMessages.id, previousAnswerMessageId),
+							eq(narratorMessages.narratorId, record.narratorId),
+							eq(narratorMessages.role, "user"),
+						),
+					)
+					.get();
+				if (previousMessage)
+					tx.insert(narratorQuestionEvents)
+						.values({
+							questionId: id,
+							messageId: previousAnswerMessageId,
+							kind: "answer",
+							createdAt: record.decidedAt ?? record.createdAt,
+							resolutionJson: record.resolution,
+						})
+						.onConflictDoNothing()
+						.run();
+				tx.insert(narratorQuestionEvents)
+					.values({
+						questionId: id,
+						messageId,
+						kind: "supplement",
+						createdAt: new Date().toISOString(),
+					})
+					.run();
+				committed = messageId;
+			},
+			args.text,
+		);
+	} catch (error) {
+		if (error instanceof QuestionAlreadyDecidedError)
+			return { ok: false as const, reason: "stale" };
+		if (!committed) throw error;
+		logger.warn("Question supplement persisted but notification failed", {
+			questionId: id,
+			error: String(error),
+		});
+	}
+	if (!committed) throw new Error("Supplement delivery did not commit its question association.");
+	const updated = { ...record, answerMessageId: committed, resolution: null };
+	await broadcastChange(updated, "answered");
+	return { ok: true as const, record: updated };
 }
 
 /** An open question plus the narrator context the global inbox needs to label it. */
@@ -635,76 +1205,47 @@ class QuestionAlreadyDecidedError extends Error {
 	}
 }
 
-/**
- * Mirror the answers onto the historical tool call's stored input.
- *
- * This is what makes the answered card render with zero frontend work: the read-only
- * replay path already paints `inputJson.answers` for a synchronous AskUserQuestion, so
- * writing the same field means an async question's history looks identical.
- *
- * Failure is logged, never fatal: the answers are already committed on the question
- * row (which the inbox reads), so the worst case is a history card that shows the
- * question without its answer.
- */
-async function mirrorAnswersToToolCall(
-	toolCallId: string,
-	answers: Record<string, string>,
-	annotations: Record<string, AsyncQuestionAnnotation> | null,
-): Promise<void> {
-	try {
-		const call = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.id, toolCallId),
-			columns: { id: true, narratorId: true, messageId: true, inputJson: true },
-		});
-		if (!call) return;
-		const input =
-			call.inputJson && typeof call.inputJson === "object" && !Array.isArray(call.inputJson)
-				? (call.inputJson as Record<string, unknown>)
-				: {};
-		await db
-			.update(narratorToolCalls)
-			.set({
-				inputJson: { ...input, answers, ...(annotations ? { annotations } : {}) },
-				inputChars: measureSerializedCharacters({
-					...input,
-					answers,
-					...(annotations ? { annotations } : {}),
-				}),
-			})
-			.where(eq(narratorToolCalls.id, toolCallId));
-		queueContextCharacterRefresh(call.narratorId, call.messageId);
-	} catch (err) {
-		logger.warn("Failed to mirror async question answers onto the tool call", {
-			toolCallId,
-			error: String(err),
-		});
-	}
-}
-
 /** Flatten one question's answer for the injected message. */
 function buildAnswerItems(record: AsyncQuestionRecord): SideCarAsyncQuestionAnswer[] {
 	const answers = record.answers ?? {};
 	const items: SideCarAsyncQuestionAnswer[] = [];
 	const matchedKeys = new Set<string>();
+	const canonicalIds = new Set(record.questions.map((question) => question.id));
+	const annotations = record.annotations ?? {};
 	for (const question of record.questions) {
-		// Model-facing key is `header`; internal `id` and legacy `question` still
-		// appear in older rows / draft mirrors.
-		const answer =
-			answers[question.header] ??
-			answers[question.id] ??
-			answers[(question as { question?: string }).question ?? ""];
-		if (answer === undefined) continue;
-		const notes =
-			record.annotations?.[question.header]?.notes ??
-			record.annotations?.[question.id]?.notes ??
-			null;
+		// IDs are canonical. A legacy title may resolve only when it cannot
+		// take an answer or annotation belonging to another canonical question ID.
+		const answer = Object.hasOwn(answers, question.id)
+			? answers[question.id]
+			: !canonicalIds.has(question.header) && Object.hasOwn(answers, question.header)
+				? answers[question.header]
+				: undefined;
+		// Include every frozen question and option, even a partially answered item.
+		const annotation = Object.hasOwn(annotations, question.id)
+			? annotations[question.id]
+			: !canonicalIds.has(question.header) && Object.hasOwn(annotations, question.header)
+				? annotations[question.header]
+				: undefined;
+		const notes = annotation?.notes ?? null;
 		matchedKeys.add(question.header);
 		matchedKeys.add(question.id);
 		const legacyKey = (question as { question?: string }).question;
 		if (legacyKey) matchedKeys.add(legacyKey);
 		const description = question.description?.trim();
 		const header = description ? `${question.header}\n${description}` : question.header;
-		items.push({ header, answer, ...(notes ? { notes } : {}) });
+		items.push({
+			questionId: question.id,
+			answerProvided: answer !== undefined,
+			multiSelect: question.multiSelect ?? false,
+			header,
+			answer: answer ?? "",
+			options: question.options?.map((option) => ({
+				header: option.header,
+				description: option.description,
+				hasPreview: !!option.preview,
+			})),
+			...(notes ? { notes } : {}),
+		});
 	}
 	// Answers whose key matches no known question (a repaired/renamed key) still have
 	// to reach the model: dropping them would silently discard something the user typed.
@@ -735,19 +1276,21 @@ async function deliverDecision(
 	userId: string | null,
 	seam: QuestionServiceSeam,
 	onPersist: NonNullable<DeliverInjectionOptions["onPersist"]>,
+	supplement?: string,
 ): Promise<string> {
+	const messageId = generateId();
 	const body: SideCarBody = {
 		kind: "asyncQuestionAnswers",
+		questionId: record.id,
+		createdAt: record.createdAt,
+		context: record.context,
+		answerMessageId: messageId,
+		...(supplement !== undefined ? { supplement } : {}),
 		outcome,
-		items:
-			outcome === "answered"
-				? buildAnswerItems(record)
-				: record.questions.map((q) => ({
-						header: q.description?.trim() ? `${q.header}\n${q.description}` : q.header,
-						answer: "",
-					})),
+		items: buildAnswerItems(record),
 	};
 	const { content } = sideCarBodyWithText("async_question", body, locale);
+	assertQuestionBudget(content, QUESTION_RECEIPT_MAX_BYTES, "Question receipt");
 	const executionPrincipal = await getAsyncQuestionExecutionPrincipal(record.id, record.narratorId);
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, record.narratorId),
@@ -762,21 +1305,24 @@ async function deliverDecision(
 		);
 
 	const result = await seam.deliverInjection(record.narratorId, {
+		messageId,
 		content,
 		source: "async_question",
 		body,
 		role: "user",
-		schedule: unknownChildPrincipal
-			? "none"
-			: seam.isLoopRunning(record.narratorId)
-				? "interject"
-				: "wakeIfIdle",
+		schedule: "none",
 		...(executionPrincipal ? { executionPrincipal } : {}),
 		locale,
 		createdBy: userId,
 		onPersist,
 	});
 	if (!result.messageId) throw new Error("Async question delivery did not persist a message");
+	await scheduleSavedQuestionDecision(
+		{ ...record, answerMessageId: result.messageId },
+		seam,
+		locale,
+		content,
+	);
 	return result.messageId;
 }
 
@@ -791,8 +1337,64 @@ async function deliverDecision(
  * whose suites legitimately use the real modules. A seam the test sets and restores
  * keeps the blast radius inside the test.
  */
+async function scheduleSavedQuestionDecision(
+	record: AsyncQuestionRecord,
+	seam: QuestionServiceSeam,
+	locale: Locale,
+	content?: string,
+) {
+	if (!record.answerMessageId) return { ready: false, started: false };
+	const text =
+		content ?? (await getBoundedQuestionReceipt(record.answerMessageId, record.narratorId));
+	if (text === null) {
+		notifyQuestionDecided({ ...record, receiptReady: false });
+		return { ready: false, started: false };
+	}
+	try {
+		const principal = await getAsyncQuestionExecutionPrincipal(record.id, record.narratorId);
+		const delivery = await seam.scheduleQuestionAnswerDelivery(
+			record.narratorId,
+			record.answerMessageId,
+			text,
+			principal ?? undefined,
+			locale,
+		);
+		notifyQuestionDecided({ ...record, receiptReady: delivery.ready });
+		return delivery;
+	} catch (error) {
+		// Durable answers must release a blocked Await even when the inbox is full or
+		// scheduling fails. Its result carries a bounded full-receipt fallback.
+		notifyQuestionDecided({ ...record, receiptReady: false });
+		throw error;
+	}
+}
+
+/** Retry scheduling a committed event without inserting another user-message row. */
+export async function retryQuestionAnswerDelivery(
+	narratorId: string,
+	questionId: string,
+	locale: Locale = "en",
+) {
+	const row = await db
+		.select(questionStateColumns)
+		.from(narratorQuestions)
+		.where(and(eq(narratorQuestions.id, questionId), eq(narratorQuestions.narratorId, narratorId)))
+		.limit(1)
+		.get();
+	if (!row || (row.status !== "answered" && row.status !== "dismissed"))
+		return { ready: false, started: false };
+	return scheduleSavedQuestionDecision(toStateRecord(row), await resolveSeam(), locale);
+}
+
 export interface QuestionServiceSeam {
 	isLoopRunning: (narratorId: string) => boolean;
+	scheduleQuestionAnswerDelivery: (
+		narratorId: string,
+		messageId: string,
+		text: string,
+		executionPrincipal: QuestionExecutionPrincipal | undefined,
+		locale: Locale,
+	) => Promise<{ ready: boolean; started: boolean }>;
 	deliverInjection: typeof deliverInjection;
 	broadcastToNarrator: typeof broadcastToNarrator;
 	/**
@@ -822,6 +1424,12 @@ async function resolveSeam(): Promise<QuestionServiceSeam> {
 		: await import("./narrator-session");
 	return {
 		isLoopRunning: session.isLoopRunning,
+		scheduleQuestionAnswerDelivery:
+			serviceSeam?.scheduleQuestionAnswerDelivery ??
+			(async (...args) => {
+				const runtime = await import("./narrator-session");
+				return runtime.scheduleQuestionAnswerDelivery(...args);
+			}),
 		deliverInjection: serviceSeam?.deliverInjection ?? deliverInjection,
 		broadcastToNarrator: serviceSeam?.broadcastToNarrator ?? broadcastToNarrator,
 		emitAttention:
@@ -868,14 +1476,53 @@ async function decideAsyncQuestion(
 	outcome: "answered" | "dismissed",
 	args: Partial<AnswerAsyncQuestionArgs>,
 ): Promise<AsyncQuestionTransition> {
-	const existing = await getAsyncQuestion(id);
+	const detail = await getBoundedQuestionDetail(id);
+	if (detail.tooLarge) throw new Error("Question detail exceeds the byte budget.");
+	const existing = detail.record;
 	if (!existing) return { ok: false, reason: "not_found" };
-	if (existing.status !== "open") return { ok: false, reason: "stale" };
+	if (existing.status !== "open") {
+		if (existing.status === outcome && existing.decidedBy === (args.userId ?? null)) {
+			const retryAnswers =
+				outcome === "answered"
+					? normalizeQuestionKeys(existing.questions, args.answers ?? {})
+					: null;
+			const retryAnnotations = args.annotations
+				? normalizeQuestionKeys(existing.questions, args.annotations)
+				: null;
+			if (
+				JSON.stringify(existing.answers) === JSON.stringify(retryAnswers) &&
+				JSON.stringify(existing.annotations) === JSON.stringify(retryAnnotations)
+			) {
+				try {
+					const delivery = await scheduleSavedQuestionDecision(
+						existing,
+						await resolveSeam(),
+						args.locale ?? "en",
+					);
+					return { ok: true, record: { ...existing, receiptReady: delivery.ready } };
+				} catch (error) {
+					logger.warn("Committed question delivery retry failed", {
+						questionId: id,
+						error: String(error),
+					});
+					return { ok: true, record: { ...existing, receiptReady: false } };
+				}
+			}
+		}
+		return { ok: false, reason: "stale" };
+	}
+	const answers =
+		outcome === "answered" ? normalizeQuestionKeys(existing.questions, args.answers ?? {}) : null;
+	const annotations = args.annotations
+		? normalizeQuestionKeys(existing.questions, args.annotations)
+		: null;
+	assertQuestionBudget({ answers, annotations }, QUESTION_ANSWER_MAX_BYTES, "Question answers");
 	const decided: AsyncQuestionRecord = {
 		...existing,
 		status: outcome,
-		answers: outcome === "answered" ? (args.answers ?? null) : null,
-		annotations: args.annotations ?? null,
+		answers,
+		annotations,
+		resolution: null,
 		decidedBy: args.userId ?? null,
 		decidedAt: new Date().toISOString(),
 	};
@@ -898,11 +1545,20 @@ async function decideAsyncQuestion(
 						decidedBy: decided.decidedBy,
 						decidedAt: decided.decidedAt,
 						answerMessageId: messageId,
+						resolutionJson: null,
 					})
 					.where(and(eq(narratorQuestions.id, id), eq(narratorQuestions.status, "open")))
 					.returning({ id: narratorQuestions.id })
 					.get();
 				if (!claimed) throw new QuestionAlreadyDecidedError();
+				tx.insert(narratorQuestionEvents)
+					.values({
+						questionId: id,
+						messageId,
+						kind: outcome === "answered" ? "answer" : "dismissal",
+						createdAt: decided.decidedAt ?? new Date().toISOString(),
+					})
+					.run();
 				persistedMessageId = messageId;
 			},
 		);
@@ -920,9 +1576,6 @@ async function decideAsyncQuestion(
 			error: String(error),
 		});
 	}
-	if (decided.answers) {
-		await mirrorAnswersToToolCall(decided.toolCallId, decided.answers, decided.annotations);
-	}
 	try {
 		await broadcastChange(decided, outcome);
 	} catch (error) {
@@ -931,7 +1584,6 @@ async function decideAsyncQuestion(
 			error: String(error),
 		});
 	}
-	notifyQuestionDecided(decided);
 	return { ok: true, record: decided };
 }
 
@@ -946,13 +1598,21 @@ async function decideAsyncQuestion(
 export async function withdrawAsyncQuestions(
 	narratorId: string,
 	ids: string[],
+	reason?: string,
 ): Promise<{ withdrawn: string[]; skipped: string[] }> {
+	assertQuestionBudget(reason ?? "", QUESTION_NOTE_MAX_BYTES, "Withdrawal reason");
+	if (ids.length > 100) throw new Error("Withdraw at most 100 questions per call.");
 	const unique = [...new Set(ids.filter((id) => typeof id === "string" && id.length > 0))];
 	if (unique.length === 0) return { withdrawn: [], skipped: [] };
 
 	const rows = await db
 		.update(narratorQuestions)
-		.set({ status: "withdrawn", decidedBy: "agent", decidedAt: new Date().toISOString() })
+		.set({
+			status: "withdrawn",
+			withdrawReason: reason?.trim() || null,
+			decidedBy: "agent",
+			decidedAt: new Date().toISOString(),
+		})
 		.where(
 			and(
 				eq(narratorQuestions.narratorId, narratorId),
@@ -960,11 +1620,11 @@ export async function withdrawAsyncQuestions(
 				inArray(narratorQuestions.id, unique),
 			),
 		)
-		.returning();
+		.returning(questionStateColumns);
 
 	const withdrawn = new Set<string>();
 	for (const row of rows) {
-		const record = toRecord(row);
+		const record = toStateRecord(row);
 		withdrawn.add(record.id);
 		await broadcastChange(record, "withdrawn");
 		// A withdraw also ends a wait: the agent that withdrew may not be the one
@@ -1029,8 +1689,18 @@ export async function awaitAsyncQuestion(opts: {
 	timeoutSignal?: AbortSignal;
 }): Promise<AwaitAsyncQuestionResult | { status: "not_found" }> {
 	const { questionId, narratorId, timeoutMs, signal, timeoutSignal } = opts;
-	const existing = await getAsyncQuestion(questionId);
-	if (!existing || existing.narratorId !== narratorId) return { status: "not_found" };
+	const bounded = await getBoundedOpenAsyncQuestion(
+		questionId,
+		QUESTION_RECEIPT_MAX_BYTES + 4096,
+		null,
+		narratorId,
+	);
+	if (bounded.tooLarge)
+		throw new Error(
+			"Question exceeds the bounded Await detail budget; use Question action=get for controlled retrieval.",
+		);
+	const existing = bounded.record;
+	if (!existing) return { status: "not_found" };
 	// Already decided → answer immediately. A wait here could only time out, because the
 	// event that would end it has already fired.
 	if (existing.status !== "open") {
@@ -1095,8 +1765,13 @@ export async function awaitAsyncQuestion(opts: {
 			// Guard against a decision that landed between the status read above and the
 			// listener registration: without this the wait would hang until its timeout on
 			// a question that is already answered.
-			void getAsyncQuestion(questionId)
-				.then((fresh) => {
+			void getBoundedOpenAsyncQuestion(
+				questionId,
+				QUESTION_RECEIPT_MAX_BYTES + 4096,
+				null,
+				narratorId,
+			)
+				.then(({ record: fresh }) => {
 					if (fresh && fresh.status !== "open") {
 						finish({ status: fresh.status as AwaitQuestionStatus, record: fresh });
 					}
@@ -1119,7 +1794,15 @@ export async function awaitAsyncQuestion(opts: {
 		seam.emitAttentionResolved(narratorId, "waiting_permission");
 		// Re-broadcast so the inbox drops the "agent is waiting" flag even when the wait
 		// ended without a decision (timeout / interrupt).
-		const latest = (await getAsyncQuestion(questionId)) ?? existing;
+		const latest =
+			(
+				await getBoundedOpenAsyncQuestion(
+					questionId,
+					QUESTION_RECEIPT_MAX_BYTES + 4096,
+					null,
+					narratorId,
+				)
+			).record ?? existing;
 		if (latest.status === "open") await broadcastChange(latest, "await_ended");
 	}
 }
@@ -1147,6 +1830,55 @@ export function subscribeAsyncQuestionDecisions(listener: QuestionDecidedListene
 }
 
 /** Wake any waiter blocked on this question. Never throws into the decision path. */
+export async function notifyQuestionHistoryChanged(
+	narratorId: string,
+	questionIds: string[],
+): Promise<void> {
+	for (const [index, id] of [...new Set(questionIds)].entries()) {
+		// Prepared reverts can affect thousands of questions. Process every ID while
+		// yielding between small batches instead of silently dropping later waiters.
+		if (index > 0 && index % 32 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+		const row = await db
+			.select(questionStateColumns)
+			.from(narratorQuestions)
+			.where(and(eq(narratorQuestions.id, id), eq(narratorQuestions.narratorId, narratorId)))
+			.limit(1)
+			.get();
+		const record: AsyncQuestionRecord = row
+			? toStateRecord(row)
+			: {
+					id,
+					narratorId,
+					toolCallId: "",
+					toolUseId: "",
+					questions: [],
+					answers: null,
+					annotations: null,
+					context: null,
+					resolution: null,
+					withdrawReason: "history removed",
+					status: "withdrawn",
+					origin: "agent_async",
+					answerMessageId: null,
+					decidedBy: null,
+					decidedAt: null,
+					createdAt: "",
+					awaited: isAsyncQuestionAwaited(id),
+				};
+		await broadcastChange(
+			record,
+			record.status === "withdrawn"
+				? "withdrawn"
+				: record.status === "dismissed"
+					? "dismissed"
+					: record.status === "open"
+						? "opened"
+						: "answered",
+		);
+		if (record.status !== "open") notifyQuestionDecided(record);
+	}
+}
+
 function notifyQuestionDecided(record: AsyncQuestionRecord): void {
 	for (const listener of [...questionDecidedListeners]) {
 		try {

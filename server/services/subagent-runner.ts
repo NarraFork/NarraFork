@@ -905,7 +905,11 @@ function releaseSubagentPublicationOwner(owner: ExecutionOwner, allowInboxWake: 
 	owner.release();
 	// Failed/runtime-paused turns retain queued input until an explicit retry.
 	if (!allowInboxWake) return;
-	void import("./agent-runtime/inbox")
+	void import("./narrator-session")
+		.then(({ retryDeferredQuestionAnswerDeliveries }) =>
+			retryDeferredQuestionAnswerDeliveries(narratorId),
+		)
+		.then(() => import("./agent-runtime/inbox"))
 		.then(({ wakeInboxIfEligible }) => wakeInboxIfEligible(narratorId))
 		.catch((error) =>
 			logger.warn("Deferred subagent inbox wake after publication", {

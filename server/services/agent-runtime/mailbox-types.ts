@@ -50,6 +50,8 @@ export type MailboxInput = InputBase &
 				kind: "task_notice";
 				noticeKind: NoticeKind;
 				sourceKey: string;
+				/** An already persisted event, adopted at the next safe model boundary. */
+				recipientMessageId?: string;
 		  }
 	);
 export interface MailboxClaim {

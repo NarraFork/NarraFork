@@ -1,5 +1,11 @@
 import type { AsyncQuestion } from "@frontend/types/narrator";
-import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+	type QueryClient,
+	useInfiniteQuery,
+	useMutation,
+	useQuery,
+	useQueryClient,
+} from "@tanstack/react-query";
 import { useCallback } from "react";
 import { api } from "../lib/api";
 
@@ -9,9 +15,10 @@ export const globalQuestionsQueryKey = ["async-questions", "all"];
 /** Decisions from either surface must refresh both the inline form and global inbox. */
 export function invalidateAsyncQuestionQueries(queryClient: QueryClient, narratorId: string) {
 	return Promise.all([
-		queryClient.invalidateQueries({ queryKey: asyncQuestionsQueryKey(narratorId), exact: true }),
-		queryClient.invalidateQueries({ queryKey: globalQuestionsQueryKey, exact: true }),
+		queryClient.invalidateQueries({ queryKey: asyncQuestionsQueryKey(narratorId), exact: false }),
+		queryClient.invalidateQueries({ queryKey: globalQuestionsQueryKey, exact: false }),
 		queryClient.invalidateQueries({ queryKey: ["human-attention"] }),
+		queryClient.invalidateQueries({ queryKey: ["async-question-detail", narratorId] }),
 	]);
 }
 
@@ -21,22 +28,28 @@ interface AsyncQuestionsPage {
 	openCount: number;
 }
 
-/**
- * The open asynchronous-question inbox for one narrator.
- *
- * No polling: every transition is pushed as `async_question_changed`, and
- * `applyAsyncQuestionChange` writes it straight into this cache. The query itself is
- * the reconnect / first-load path.
- *
- * Scoped to `status: "open"` because that is the actionable set. Decided questions are
- * already visible in the conversation (their tool card renders the answers), so a
- * second place to read them would only go stale.
- */
+/** Bounded all-state summaries for durable tool cards; full answers load via detail. */
 export function useAsyncQuestions(narratorId: string, enabled = true) {
 	return useQuery({
 		queryKey: asyncQuestionsQueryKey(narratorId),
-		queryFn: () => api.getAsyncQuestions(narratorId, { status: "open" }),
+		queryFn: () => api.getAsyncQuestions(narratorId, { filter: "all", limit: 32 }),
 		enabled: !!narratorId && enabled,
+	});
+}
+
+/** Older summary pages are fetched separately, keeping the first-page cache compatible. */
+export function useOlderAsyncQuestions(
+	narratorId: string,
+	cursor: string | null | undefined,
+	enabled = true,
+) {
+	return useInfiniteQuery({
+		queryKey: [...asyncQuestionsQueryKey(narratorId), "older", cursor ?? "none"],
+		initialPageParam: cursor ?? undefined,
+		queryFn: ({ pageParam }) =>
+			api.getAsyncQuestions(narratorId, { filter: "all", cursor: pageParam, limit: 32 }),
+		getNextPageParam: (page) => page.nextCursor ?? undefined,
+		enabled: !!narratorId && !!cursor && enabled,
 	});
 }
 
@@ -67,13 +80,34 @@ export function applyAsyncQuestionChangeToList(
 	});
 }
 
+export type AsyncQuestionPush = Pick<AsyncQuestion, "id" | "narratorId"> & Partial<AsyncQuestion>;
+
+export function readAsyncQuestionPush(data: Record<string, unknown>): AsyncQuestionPush | null {
+	const nested = data.question as AsyncQuestionPush | undefined;
+	if (nested?.id && nested.narratorId) return nested;
+	const id =
+		typeof data.questionId === "string"
+			? data.questionId
+			: typeof data.id === "string"
+				? data.id
+				: null;
+	if (!id || typeof data.narratorId !== "string") return null;
+	return {
+		id,
+		narratorId: data.narratorId,
+		status: data.status as AsyncQuestion["status"] | undefined,
+	};
+}
+
 export type AsyncQuestionChange =
 	| "opened"
 	| "answered"
 	| "dismissed"
 	| "withdrawn"
 	| "awaited"
-	| "await_ended";
+	| "await_ended"
+	| "resolved"
+	| "supplemented";
 
 /**
  * Apply one pushed change to the cached inbox.
@@ -92,22 +126,37 @@ export type AsyncQuestionChange =
 export function useApplyAsyncQuestionChange(narratorId?: string) {
 	const queryClient = useQueryClient();
 	return useCallback(
-		(change: AsyncQuestionChange, question: AsyncQuestion) => {
+		(change: AsyncQuestionChange, question: AsyncQuestionPush) => {
 			queryClient.setQueryData<AsyncQuestionsPage>(
 				asyncQuestionsQueryKey(narratorId ?? question.narratorId),
 				(previous) => {
-					const next = applyAsyncQuestionChangeToList(previous?.items ?? [], change, question);
+					// Preserve terminal summaries at their original card. Never insert into an
+					// unloaded page: refetch supplies ordering and the authoritative cursor.
+					if (!previous || !question.questions) return previous;
+					const record = question as AsyncQuestion;
+					const exists = previous.items.some((item) => item.id === question.id);
+					const next = exists
+						? previous.items.map((item) => (item.id === question.id ? record : item))
+						: change === "opened" && !previous.nextCursor
+							? [record, ...previous.items].slice(0, 32)
+							: previous.items;
 					return {
+						...previous,
 						items: next,
-						nextCursor: previous?.nextCursor ?? null,
-						openCount: next.length,
+						openCount: next.filter((item) => item.status === "open").length,
 					};
 				},
 			);
+			void queryClient.invalidateQueries({
+				queryKey: asyncQuestionsQueryKey(narratorId ?? question.narratorId),
+			});
+			void queryClient.invalidateQueries({
+				queryKey: ["async-question-detail", question.narratorId, question.id],
+			});
 			// The global page contains ACL-filtered session metadata absent from this frame.
 			// Refetch it on EVERY change, even an unawaited open while its button is hidden.
 			// Cache correctness must not depend on whether a notification is urgent.
-			void queryClient.invalidateQueries({ queryKey: globalQuestionsQueryKey, exact: true });
+			void queryClient.invalidateQueries({ queryKey: globalQuestionsQueryKey, exact: false });
 			void queryClient.invalidateQueries({ queryKey: ["human-attention"] });
 		},
 		[queryClient, narratorId],
@@ -120,13 +169,15 @@ export function useAsyncQuestionListChange() {
 	return useCallback(
 		(data: Record<string, unknown>) => {
 			const change = data.change as AsyncQuestionChange;
-			const question = data.question as AsyncQuestion | undefined;
+			const question = readAsyncQuestionPush(data);
 			if (!question?.id || !question.narratorId) return null;
 			if (
 				!UPSERT_CHANGES.has(change) &&
 				change !== "answered" &&
 				change !== "dismissed" &&
-				change !== "withdrawn"
+				change !== "withdrawn" &&
+				change !== "resolved" &&
+				change !== "supplemented"
 			)
 				return null;
 			applyChange(change, question);
@@ -135,7 +186,7 @@ export function useAsyncQuestionListChange() {
 			// await_ended for decided questions. Always clear this question's own alert.
 			return {
 				type: "awaitedQuestion" as const,
-				awaited: change === "awaited",
+				awaited: change === "awaited" && question.status === "open",
 				questionId: question.id,
 			};
 		},

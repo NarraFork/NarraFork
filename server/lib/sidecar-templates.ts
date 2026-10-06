@@ -66,6 +66,11 @@ const MESSAGE_TABLE_KEYS = [
 	"specUpdatePreview",
 	// asyncQuestionAnswers
 	"asyncQuestionAnsweredHeading",
+	"asyncQuestionReceiptHeading",
+	"asyncQuestionSupplementHeading",
+	"asyncQuestionReceiptHint",
+	"asyncQuestionDismissedReceiptHint",
+	"asyncQuestionUnknownContext",
 	"asyncQuestionEntry",
 	"asyncQuestionNotes",
 	"asyncQuestionDismissedHeading",

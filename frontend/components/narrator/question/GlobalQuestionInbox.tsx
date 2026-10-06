@@ -23,7 +23,7 @@ import {
 	reflectionTitleKeySuffix,
 } from "@shared/pretext-layout/reflection";
 import { IconClockPause, IconInbox } from "@tabler/icons-react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
 	createContext,
@@ -54,6 +54,7 @@ import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import { InlinePermission } from "../permission/InlinePermission";
 import { PermEnterHintCtx } from "../tool-call/tool-call-contexts";
 import { AskUserQuestionBanner, coerceQuestions } from "./AskUserQuestionBanner";
+import { AsyncQuestionSummary } from "./AsyncQuestionDetail";
 import { toBannerQuestions } from "./async-question-questions";
 
 /**
@@ -128,45 +129,46 @@ export function HumanAttentionInboxButton({
 		others.length > 0 ? t("inboxBadgeOtherSessions", { count: others.length }) : null,
 	].filter((label): label is string => label !== null);
 
-	// A failed first load is unknown, not an authoritative empty inbox. Keep a retry entry.
-	if (!opened && items.length === 0 && !query.hasNextPage && !query.isError) return null;
+	// The archive is navigation, not a notification: pending/history remain reachable
+	// after the last open item is answered. Only live attention adds urgent styling.
+	const hasAttention = items.length > 0 || query.hasNextPage;
 	return (
 		<>
-			{(items.length > 0 || query.hasNextPage || query.isError) && (
-				<Button
-					size={variant === "compact" ? "compact-xs" : "compact-sm"}
-					fullWidth={variant === "row"}
-					justify={variant === "row" ? "flex-start" : undefined}
-					variant={blocking > 0 ? "light" : "subtle"}
-					color={blocking > 0 ? "yellow" : "gray"}
-					leftSection={blocking > 0 ? <IconClockPause size={14} /> : <IconInbox size={14} />}
-					onClick={() => setOpened(true)}
-					aria-label={t("humanAttentionOpen", { count })}
-				>
-					<Group gap={6} wrap="wrap">
+			<Button
+				size={variant === "compact" ? "compact-xs" : "compact-sm"}
+				fullWidth={variant === "row"}
+				justify={variant === "row" ? "flex-start" : undefined}
+				variant={blocking > 0 ? "light" : "subtle"}
+				color={blocking > 0 ? "yellow" : "gray"}
+				leftSection={blocking > 0 ? <IconClockPause size={14} /> : <IconInbox size={14} />}
+				onClick={() => setOpened(true)}
+				aria-label={hasAttention ? t("humanAttentionOpen", { count }) : t("humanAttentionTitle")}
+			>
+				<Group gap={6} wrap="wrap">
+					<Text size="xs">
+						{query.isError && !items.length
+							? t("humanAttentionLoadError")
+							: hasAttention
+								? t("humanAttentionBadge", { count })
+								: t("humanAttentionTitle")}
+					</Text>
+					{currentNarratorId && scopeLabels.length > 0 && (
 						<Text size="xs">
-							{query.isError && !items.length
-								? t("humanAttentionLoadError")
-								: t("humanAttentionBadge", { count })}
+							{scopeLabels.map((label, index) => (
+								<span key={label}>
+									{index > 0 ? " · " : null}
+									{label}
+								</span>
+							))}
 						</Text>
-						{currentNarratorId && scopeLabels.length > 0 && (
-							<Text size="xs">
-								{scopeLabels.map((label, index) => (
-									<span key={label}>
-										{index > 0 ? " · " : null}
-										{label}
-									</span>
-								))}
-							</Text>
-						)}
-						{blocking > 0 && (
-							<Text size="xs" fw={600}>
-								{t("inboxBadgeAwaitedSuffix", { count: blocking })}
-							</Text>
-						)}
-					</Group>
-				</Button>
-			)}
+					)}
+					{blocking > 0 && (
+						<Text size="xs" fw={600}>
+							{t("inboxBadgeAwaitedSuffix", { count: blocking })}
+						</Text>
+					)}
+				</Group>
+			</Button>
 			<HumanAttentionInboxDrawer
 				opened={opened}
 				onClose={() => setOpened(false)}
@@ -229,6 +231,52 @@ export function HumanAttentionInboxDrawer({
 	);
 }
 
+function QuestionLifecycleGroup({ filter }: { filter: "pending" | "history" }) {
+	const { t } = useTranslation("narrator");
+	const [expanded, setExpanded] = useState(filter === "pending");
+	const query = useInfiniteQuery({
+		queryKey: [...globalQuestionsQueryKey, filter],
+		initialPageParam: undefined as string | undefined,
+		queryFn: ({ pageParam }) => api.getGlobalQuestionPage(filter, pageParam),
+		getNextPageParam: (page) => page.nextCursor ?? undefined,
+		enabled: expanded,
+	});
+	return (
+		<Stack gap="sm" data-question-group={filter}>
+			<Button
+				variant="subtle"
+				aria-expanded={expanded}
+				onClick={() => setExpanded((value) => !value)}
+			>
+				{t(filter === "pending" ? "asyncQuestionPendingGroup" : "asyncQuestionHistoryGroup")}
+			</Button>
+			{expanded && (
+				<>
+					{query.isLoading && <Text size="xs">{t("humanAttentionLoading")}</Text>}
+					{query.isError && (
+						<RetryNotice message={query.error.message} retry={() => void query.refetch()} />
+					)}
+					{query.data?.pages
+						.flatMap((page) => page.items ?? [])
+						.map((question) => (
+							<Paper key={question.id} withBorder p="sm">
+								<Text size="xs" c="dimmed">
+									{question.narratorTitle || question.narratorId}
+								</Text>
+								<AsyncQuestionSummary question={question} readOnly={question.canAct === false} />
+							</Paper>
+						))}
+					{query.hasNextPage && (
+						<Button loading={query.isFetchingNextPage} onClick={() => void query.fetchNextPage()}>
+							{t("humanAttentionLoadMore")}
+						</Button>
+					)}
+				</>
+			)}
+		</Stack>
+	);
+}
+
 /** Shared decision surface. Both drawers use the same authority and private forms. */
 export function HumanAttentionInboxContent({
 	onClose,
@@ -257,6 +305,9 @@ export function HumanAttentionInboxContent({
 				>
 					<Text size="xs" c="dimmed">
 						{t("humanAttentionDesc")}
+					</Text>
+					<Text size="sm" fw={600} data-question-group="open">
+						{t("asyncQuestionOpenGroup")}
 					</Text>
 					{query.isLoading && <Text size="sm">{t("humanAttentionLoading")}</Text>}
 					{query.isError && (
@@ -303,6 +354,9 @@ export function HumanAttentionInboxContent({
 							{t("humanAttentionLoadMore")}
 						</Button>
 					)}
+					<Divider />
+					<QuestionLifecycleGroup filter="pending" />
+					<QuestionLifecycleGroup filter="history" />
 				</Stack>
 			</PermEnterHintCtx.Provider>
 		</CloseAttentionContext.Provider>
@@ -843,7 +897,7 @@ function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
 			}
 		},
 	});
-	const run = async (action: () => Promise<unknown>) => {
+	const run = async (action: () => Promise<unknown>, propagate = false) => {
 		if (
 			actionLock.current ||
 			!summary.canAct ||
@@ -855,7 +909,8 @@ function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
 		actionLock.current = true;
 		try {
 			await mutation.mutateAsync(action);
-		} catch {
+		} catch (error) {
+			if (propagate) throw error;
 			/* Inline retry notice keeps the request and draft. */
 		}
 	};
@@ -893,6 +948,11 @@ function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
 			<Text size="xs" c="dimmed">
 				{t("humanAttentionOwner", { narrator: item.narratorId, request: item.requestId })}
 			</Text>
+			{question && (
+				<Text size="sm" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+					{question.context || t("asyncQuestionContextUnknown")}
+				</Text>
+			)}
 			{permission?.subagentNarratorId && (
 				<Text size="xs" c="dimmed">
 					{t("humanAttentionChild", { narrator: permission.subagentNarratorId })}
@@ -929,16 +989,19 @@ function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
 					<AskUserQuestionBanner
 						requestId={item.requestId}
 						draftId={question.toolCallId}
+						answerKey="id"
 						questions={toBannerQuestions(question.questions)}
 						readOnly={readOnly}
 						busy={mutation.isPending}
 						denyLabel={t("asyncQuestionDismiss")}
 						onSubmit={(_id, answers) =>
-							void run(() =>
-								api.answerAsyncQuestion(item.narratorId, item.requestId, {
-									answers,
-									...(question.annotations ? { annotations: question.annotations } : {}),
-								}),
+							run(
+								() =>
+									api.answerAsyncQuestion(item.narratorId, item.requestId, {
+										answers,
+										...(question.annotations ? { annotations: question.annotations } : {}),
+									}),
+								true,
 							)
 						}
 						onDeny={() => void run(() => api.dismissAsyncQuestion(item.narratorId, item.requestId))}

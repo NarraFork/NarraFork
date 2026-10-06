@@ -49,6 +49,12 @@ type AskDraft = {
 	customInputs?: Record<string, string>;
 };
 
+// Same-page surfaces share one draft identity, including while both are mounted.
+const draftListeners = new Map<string, Set<() => void>>();
+function notifyDraft(draftId: string) {
+	for (const listener of draftListeners.get(draftId) ?? []) listener();
+}
+
 function sanitizeDraftRecord(value: unknown): Record<string, string> {
 	if (!value || typeof value !== "object") return {};
 	const result: Record<string, string> = {};
@@ -93,7 +99,9 @@ function persistAskDraft(
 			customInputs: safeCustomInputs,
 		});
 		if (serialized.length <= ASK_DRAFT_STORAGE_MAX_CHARS) {
+			if (readSession("ask-draft", draftId) === serialized) return;
 			writeSession("ask-draft", draftId, serialized);
+			notifyDraft(draftId);
 		} else {
 			removeSession("ask-draft", draftId);
 		}
@@ -121,7 +129,9 @@ interface AskUserQuestionBannerProps {
 	 * disarms the timer.
 	 */
 	reflectionDeadline?: number | null;
-	onSubmit?: (requestId: string, answers: Record<string, string>) => void;
+	onSubmit?: (requestId: string, answers: Record<string, string>) => unknown;
+	/** Async questions use frozen IDs; blocking legacy prompts still use headers. */
+	answerKey?: "id" | "header";
 	onDeny?: (requestId: string) => void;
 	/**
 	 * Run the model's own answer instead. Omit for questions where that makes no sense
@@ -152,6 +162,7 @@ export function AskUserQuestionBanner({
 	readOnly,
 	reflectionDeadline,
 	onSubmit,
+	answerKey = "header",
 	onDeny,
 	onReflect,
 	denyLabel,
@@ -205,6 +216,29 @@ export function AskUserQuestionBanner({
 	const [customInputs, setCustomInputs] = useState<Record<string, string>>(
 		() => getStoredDraft()?.customInputs ?? {},
 	);
+	useEffect(() => {
+		if (readOnly) return;
+		const listeners = draftListeners.get(draftKey) ?? new Set<() => void>();
+		const sync = () => {
+			const draft = readAskDraft(draftKey);
+			setSelections((previous) =>
+				JSON.stringify(previous) === JSON.stringify(draft?.selections ?? {})
+					? previous
+					: (draft?.selections ?? {}),
+			);
+			setCustomInputs((previous) =>
+				JSON.stringify(previous) === JSON.stringify(draft?.customInputs ?? {})
+					? previous
+					: (draft?.customInputs ?? {}),
+			);
+		};
+		listeners.add(sync);
+		draftListeners.set(draftKey, listeners);
+		return () => {
+			listeners.delete(sync);
+			if (!listeners.size) draftListeners.delete(draftKey);
+		};
+	}, [draftKey, readOnly]);
 	const [reflecting, setReflecting] = useState(false);
 	const [deferring, setDeferring] = useState(false);
 
@@ -286,16 +320,23 @@ export function AskUserQuestionBanner({
 
 	const allAnswered = questions.every((q) => getAnswer(q.id));
 
-	const handleSubmit = () => {
-		if (!allAnswered) return;
+	const [submitError, setSubmitError] = useState<string | null>(null);
+	const [submitting, setSubmitting] = useState(false);
+	const handleSubmit = async () => {
+		if (!allAnswered || submitting || busy || !onSubmit) return;
 		const answers: Record<string, string> = {};
-		for (const q of questions) {
-			// Models only see header + description; key answers by the uniquified header.
-			// Coerce guarantees headers do not collide, so this cannot overwrite.
-			answers[q.header] = getAnswer(q.id);
+		for (const q of questions) answers[answerKey === "id" ? q.id : q.header] = getAnswer(q.id);
+		setSubmitting(true);
+		setSubmitError(null);
+		try {
+			await onSubmit(requestId, answers);
+			removeSession("ask-draft", draftKey);
+		} catch (error) {
+			persistAskDraft(draftKey, selections, customInputs);
+			setSubmitError(error instanceof Error ? error.message : String(error));
+		} finally {
+			setSubmitting(false);
 		}
-		removeSession("ask-draft", draftKey);
-		onSubmit?.(requestId, answers);
 	};
 
 	const handleReflect = async () => {
@@ -310,19 +351,24 @@ export function AskUserQuestionBanner({
 	};
 
 	const alertColor = readOnly ? "gray" : "blue";
+	const savedAnswerOptions = {
+		allowSingleAnswerFallback: questions.length === 1,
+		answerKey,
+		canonicalQuestionIds: new Set(questions.map((question) => question.id)),
+	};
 
 	return (
 		<>
 			<Alert color={alertColor} radius="md">
 				<Stack gap="md">
+					{submitError && <Alert color="red">{submitError}</Alert>}
 					{questions.map((q, questionIndex) => {
-						const allowSingleAnswerFallback = questions.length === 1;
 						const hasCustom = readOnly ? false : !!customInputs[q.id]?.trim();
 						const savedAnswer = readOnly
-							? resolveSavedAnswer(q, savedAnswers, { allowSingleAnswerFallback })
+							? resolveSavedAnswer(q, savedAnswers, savedAnswerOptions)
 							: undefined;
 						const customAnswer = readOnly
-							? getCustomSavedAnswer(q, savedAnswers, { allowSingleAnswerFallback })
+							? getCustomSavedAnswer(q, savedAnswers, savedAnswerOptions)
 							: undefined;
 						const questionKey = `${q.id}-${questionIndex}`;
 						return (
@@ -346,9 +392,12 @@ export function AskUserQuestionBanner({
 													disabled={readOnly || hasCustom}
 													checked={
 														readOnly
-															? isSavedOptionSelected(q, opt.header, savedAnswers, {
-																	allowSingleAnswerFallback,
-																})
+															? isSavedOptionSelected(
+																	q,
+																	opt.header,
+																	savedAnswers,
+																	savedAnswerOptions,
+																)
 															: (selections[q.id]?.split(", ").includes(opt.header) ?? false)
 													}
 													onChange={
@@ -365,7 +414,7 @@ export function AskUserQuestionBanner({
 											name={`${requestId}-question-${questionIndex}`}
 											value={
 												readOnly
-													? getSelectedOptionValue(q, savedAnswers, { allowSingleAnswerFallback })
+													? getSelectedOptionValue(q, savedAnswers, savedAnswerOptions)
 													: hasCustom
 														? ""
 														: (selections[q.id] ?? "")
@@ -427,8 +476,8 @@ export function AskUserQuestionBanner({
 							<Button
 								size="xs"
 								onClick={handleSubmit}
-								disabled={!allAnswered || busy}
-								loading={busy}
+								disabled={!allAnswered || busy || submitting}
+								loading={busy || submitting}
 							>
 								{t("submitAnswer")}
 							</Button>

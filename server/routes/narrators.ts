@@ -45,6 +45,7 @@ import {
 	narratorBlacklistDirs,
 	narratorMessageRefs,
 	narratorMessages,
+	narratorQuestions,
 	narrators,
 	narratorToolCalls,
 	narratorWhitelistCmds,
@@ -167,7 +168,9 @@ import {
 	askInPassingSchema,
 	askInPassingStartSchema,
 	asyncQuestionAnswerSchema,
+	asyncQuestionDetailQuerySchema,
 	asyncQuestionListQuerySchema,
+	asyncQuestionSupplementSchema,
 	browserInteractSchema,
 	bufferQueueModeSchema,
 	createBlacklistCmdSchema,
@@ -271,7 +274,12 @@ import {
 	getHumanAttentionForPrincipal,
 	listHumanAttentionForPrincipal,
 } from "../services/human-attention-service";
-import { filterReadableNarrators, narratorReadableWhere } from "../services/narrator-acl";
+import {
+	canWriteNarrator,
+	filterReadableNarrators,
+	NARRATOR_ACL_COLUMNS,
+	narratorReadableWhere,
+} from "../services/narrator-acl";
 import {
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
@@ -306,9 +314,11 @@ import {
 	answerAsyncQuestion,
 	countOpenAsyncQuestions,
 	dismissAsyncQuestion,
-	getAsyncQuestion,
+	getBoundedQuestionDetail,
 	listAllOpenAsyncQuestionsForPrincipal,
 	listAsyncQuestions,
+	listQuestionSummaries,
+	supplementAsyncQuestion,
 } from "../services/narrator-question-service";
 import { dbTransactionWithSeqFloor } from "../services/narrator-refs/seq-floor-tx";
 import { claimShiftInsertSlot } from "../services/narrator-refs/seq-store";
@@ -600,6 +610,17 @@ const boundedRevertRequest = bodyLimit({
 narratorRoutes.use("/:id/revert-plans", boundedRevertRequest);
 narratorRoutes.use("/:id/revert-action-preview", boundedRevertRequest);
 narratorRoutes.use("/:id/revert-plans/:planId/apply", boundedRevertRequest);
+
+const boundedQuestionRequest = bodyLimit({
+	maxSize: 128 * 1024,
+	onError: (c) =>
+		c.json(
+			{ error: "Question request exceeds the byte limit", code: "QUESTION_REQUEST_TOO_LARGE" },
+			413,
+		),
+});
+narratorRoutes.use("/:id/questions/:questionId/answer", boundedQuestionRequest);
+narratorRoutes.use("/:id/questions/:questionId/supplement", boundedQuestionRequest);
 
 narratorRoutes.use(
 	"*",
@@ -1361,6 +1382,20 @@ narratorRoutes.get("/questions/all", async (c) => {
 		openCount: items.length,
 		awaitedCount: items.filter((q) => q.awaited).length,
 	});
+});
+
+narratorRoutes.get("/questions", async (c) => {
+	const parsed = asyncQuestionListQuerySchema.safeParse(c.req.query());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await listQuestionSummaries({
+			principal: narratorPrincipalOf(c),
+			filter: parsed.data.filter ?? "pending",
+			cursor: parsed.data.cursor,
+			limit: parsed.data.limit,
+		}),
+	);
 });
 
 /** The unified inbox is a projection; all decisions keep their existing guarded endpoints. */
@@ -5690,12 +5725,19 @@ narratorRoutes.get("/:id/permissions", async (c) => {
  */
 narratorRoutes.get("/:id/questions", async (c) => {
 	const id = c.req.param("id");
-	const parsed = asyncQuestionListQuerySchema.safeParse({
-		status: c.req.query("status"),
-		cursor: c.req.query("cursor"),
-		limit: c.req.query("limit"),
-	});
+	const parsed = asyncQuestionListQuerySchema.safeParse(c.req.query());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	c.header("Cache-Control", "no-store");
+	if (parsed.data.filter || !parsed.data.status) {
+		return c.json(
+			await listQuestionSummaries({
+				narratorId: id,
+				filter: parsed.data.filter ?? "all",
+				cursor: parsed.data.cursor,
+				limit: parsed.data.limit,
+			}),
+		);
+	}
 	const { items, nextCursor } = await listAsyncQuestions({
 		narratorId: id,
 		status: parsed.data.status,
@@ -5704,6 +5746,62 @@ narratorRoutes.get("/:id/questions", async (c) => {
 	});
 	const openCount = await countOpenAsyncQuestions(id);
 	return c.json({ items, nextCursor, openCount });
+});
+
+narratorRoutes.get("/:id/questions/:questionId", async (c) => {
+	const narratorId = c.req.param("id");
+	const parsed = asyncQuestionDetailQuerySchema.safeParse(c.req.query());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	c.header("Cache-Control", "no-store");
+	const detail = await getBoundedQuestionDetail(c.req.param("questionId"), {
+		narratorId,
+		cursor: parsed.data.cursor,
+		limit: parsed.data.limit,
+	});
+	if (detail.tooLarge) {
+		return c.json({ error: "Question detail exceeds the byte limit", tooLarge: true }, 413);
+	}
+	if (!detail.record) return c.json({ error: "Question not found" }, 404);
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: NARRATOR_ACL_COLUMNS,
+	});
+	const canAct = !!narrator && (await canWriteNarrator(narrator, narratorPrincipalOf(c)));
+	return c.json({
+		question: detail.record,
+		supplements: detail.events,
+		nextCursor: detail.nextCursor,
+		canAct,
+	});
+});
+
+narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
+	const narratorId = c.req.param("id");
+	const questionId = c.req.param("questionId");
+	const parsed = asyncQuestionSupplementSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const [existing] = await db
+		.select({ narratorId: narratorQuestions.narratorId })
+		.from(narratorQuestions)
+		.where(eq(narratorQuestions.id, questionId))
+		.limit(1);
+	if (!existing || existing.narratorId !== narratorId) {
+		return c.json({ error: "Question not found" }, 404);
+	}
+	const userId = c.get("user").sub;
+	const result = await supplementAsyncQuestion(questionId, {
+		text: parsed.data.text,
+		expectedAnswerMessageId: parsed.data.answerMessageId,
+		userId,
+		locale: (await getUserLanguage(userId)) as Locale,
+	});
+	if (!result.ok) {
+		return c.json(
+			{ error: result.reason === "not_found" ? "Question not found" : "Question answer changed" },
+			result.reason === "not_found" ? 404 : 409,
+		);
+	}
+	return c.json({ ok: true, question: result.record });
 });
 
 narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
@@ -5717,7 +5815,12 @@ narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
 	// Ownership is checked against the question's own narrator rather than trusting the
 	// path: the `/:id/*` gate authorized `narratorId`, so a question belonging to a
 	// DIFFERENT narrator must not be reachable by naming an id the caller can access.
-	const existing = await getAsyncQuestion(questionId);
+	const existing = db
+		.select({ narratorId: narratorQuestions.narratorId })
+		.from(narratorQuestions)
+		.where(eq(narratorQuestions.id, questionId))
+		.limit(1)
+		.get();
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -5743,7 +5846,12 @@ narratorRoutes.post("/:id/questions/:questionId/dismiss", async (c) => {
 	const questionId = c.req.param("questionId");
 	const userId = c.get("user").sub;
 
-	const existing = await getAsyncQuestion(questionId);
+	const existing = db
+		.select({ narratorId: narratorQuestions.narratorId })
+		.from(narratorQuestions)
+		.where(eq(narratorQuestions.id, questionId))
+		.limit(1)
+		.get();
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
