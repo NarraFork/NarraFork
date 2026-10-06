@@ -1306,6 +1306,7 @@ export async function runReflectionLoop(
 	//
 	// Letting the nested loop inject again produced two copies — a stray
 	// `__SYSTEM__:` user block on Anthropic, doubled `instructions` on
+	// codex/openai, a duplicated leading user message on some gateways — and, because
 	// the duplicate lands at the very front, it shifted every following byte and
 	// destroyed the cacheable prefix this loop shares with the parent
 	// conversation. Prompt caching is a byte-exact prefix match, so a reflection
@@ -4734,6 +4735,7 @@ async function* agentLoopInMetadataSnapshot(
 								// If this tool was also being streamed via toolUseChunk, remove it
 								// from the accumulator so it isn't flagged as orphaned.
 								// This happens with some providers (e.g. NUG) that send both a
+								// streaming tool-use event and a non-streaming toolUse/toolUses for
 								// the same call — especially for tools with empty parameters.
 								const wasStreaming = toolUseAccum.has(tu.toolUseId);
 								if (wasStreaming) {

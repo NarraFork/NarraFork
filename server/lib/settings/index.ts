@@ -125,6 +125,7 @@ export const narraforkDir = getNarraforkHome();
 const settingsPath = resolve(narraforkDir, "settings.json");
 
 const DANGER_REFLECTION_LEVELS = new Set(["off", "light", "standard", "strict"]);
+const OBSOLETE_TOP_LEVEL_SETTINGS_KEYS: readonly string[] = [];
 
 /** The superseded 1MB `agent.requestDumpMaxSize` default, rewritten on load. */
 const LEGACY_REQUEST_DUMP_MAX_SIZE = 1024 * 1024;

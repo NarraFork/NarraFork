@@ -23,6 +23,7 @@ const testProvider: ProviderAdapter = {
 
 		if (providerScenario === "phantom_then_text") {
 			if (providerAttempts === 1) {
+				// A streamed tool-use chunk that carries a toolUseId but no `name`. This is the
 				// real-world NUG edge case: isMeaningfulStreamEvent() flips
 				// sawMeaningfulResponse=true, yet the loop never builds an accumulator
 				// (name is required) and never pushes to toolUses — leaving zero

@@ -2912,6 +2912,7 @@ export async function processEvent(
 				reason: event.reason,
 				message: event.message,
 			});
+			const invalidStateErrorEvent = {
 				type: "error",
 				error: {
 					type: "invalid_state",
@@ -2923,9 +2924,11 @@ export async function processEvent(
 			dualBroadcast(ctx, {
 				type: "stream_event",
 				narratorId: broadcastTargetId,
+				event: invalidStateErrorEvent,
 			});
 			ctx.sseEmitter?.emit("event", {
 				type: "stream_event",
+				data: invalidStateErrorEvent,
 			});
 			return null;
 		}

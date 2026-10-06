@@ -137,6 +137,7 @@ function hasGatewayReportedEffortLevels(modelOption?: ModelOption): boolean {
 /**
  * Map a gateway-reported effort list onto the UI's unified enum.
  *
+ * Applies to every NUG channel type: the gateway reports the real
  * per-model tiers for all of them, and that beats guessing from the model id.
  * Relay ids in particular (k3, GLM-5.1, MiniMax-M2) match no vendor naming rule,
  * so id-based inference produced no menu at all for models that do accept the
@@ -176,8 +177,9 @@ function getGatewayReportedEffortOptions(
  *
  * Kept as an explicit list mirroring the delegate switch in
  * server/lib/agent/nug-provider.ts (createDelegate). Channels absent from it
- * so "none" is dropped in transit and a menu entry for it would promise a
- * control that does nothing.
+ * fall through to a native delegate that only forwards effort hints it
+ * recognizes (low..max) — so "none" is dropped in transit and a menu entry
+ * for it would promise a control that does nothing.
  *
  * The delegates listed here do implement it: the Anthropic delegate maps "none"
  * to `thinking: { type: "disabled" }`, and the Codex/Responses path returns

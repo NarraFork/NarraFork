@@ -306,15 +306,18 @@ describe("collectToolUseIdsFromHistory", () => {
 		expect(collectToolUseIdsFromHistory(history)).toEqual(new Set(["call_a", "call_b"]));
 	});
 
-	test("识别嵌套形态", () => {
+	test("识别任意嵌套形态", () => {
 		const history = [
 			{
+				envelope: {
 					content: "",
 					toolUses: [{ toolUseId: "call_nug", name: "Bash", input: {} }],
 				},
 			},
 			{
+				wrapper: {
 					content: "",
+					context: { toolResults: [{ toolUseId: "call_nug", status: "success" }] },
 				},
 			},
 		];

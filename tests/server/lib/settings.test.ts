@@ -185,15 +185,7 @@ describe("stripObsoleteSettingsKeys", () => {
 		});
 	});
 
-		const value: Record<string, unknown> = {
-			customApiProviders: [],
-			nugProviders: [],
-		};
-
-		expect(stripObsoleteSettingsKeys(value)).toBe(true);
-		expect(value).toEqual({ customApiProviders: [], nugProviders: [] });
-	});
-
+	it("reports unchanged when no obsolete keys are present", () => {
 		const value: Record<string, unknown> = { customApiProviders: [] };
 
 		expect(stripObsoleteSettingsKeys(value)).toBe(false);

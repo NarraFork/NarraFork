@@ -148,34 +148,31 @@ function limitList<T>(values: Iterable<T>): T[] {
 	return out;
 }
 
-function countImages(message: Record<string, unknown>, summary: MalformedRequestBodySummary): void {
-	const images = message.images;
-	if (!Array.isArray(images)) return;
-	summary.imageCount = (summary.imageCount ?? 0) + images.length;
-	for (const image of images) {
-		if (!isRecord(image)) continue;
-		const source = isRecord(image.source) ? image.source : undefined;
-		const bytes = typeof source?.bytes === "string" ? source.bytes : "";
-		summary.imageBase64Chars = (summary.imageBase64Chars ?? 0) + bytes.length;
-		if (!bytes) summary.emptyImageCount = (summary.emptyImageCount ?? 0) + 1;
-	}
-}
-
 /**
  * Build a bounded structural summary of a chat request body. Purely descriptive —
  * it never mutates the body and never copies conversation content, only shapes/counts.
+ *
+ * Recognizes the common chat shape (`messages[]` with `role` plus string or
+ * content-block payloads, Anthropic-style `tool_use`/`tool_result` blocks and
+ * OpenAI-style `tool_calls`/`tool_call_id`), and degrades to a top-level key
+ * listing for anything else.
  */
 export function summarizeRequestBody(body: unknown): MalformedRequestBodySummary | undefined {
 	if (!isRecord(body)) return undefined;
 	const summary: MalformedRequestBodySummary = {};
 	const notes: string[] = [];
 	summary.topLevelKeys = limitList(Object.keys(body));
+	if (typeof body.model === "string") summary.modelId = body.model;
+	const bodyTools = Array.isArray(body.tools) ? body.tools : [];
+	if (bodyTools.length > 0) summary.toolSpecCount = bodyTools.length;
 
+	const messages = Array.isArray(body.messages) ? body.messages : undefined;
+	if (!messages) {
+		notes.push("body has no messages array — not a standard chat request");
 		summary.notes = notes;
 		return summary;
 	}
-
-	summary.historyLength = history.length;
+	summary.historyLength = messages.length;
 
 	const toolUseIds: string[] = [];
 	const toolResultIds = new Set<string>();
@@ -184,78 +181,71 @@ export function summarizeRequestBody(body: unknown): MalformedRequestBodySummary
 	const emptyContentIndexes: number[] = [];
 	let roles = "";
 
-	history.forEach((entry, index) => {
+	const countImageBlock = (block: Record<string, unknown>): void => {
+		summary.imageCount = (summary.imageCount ?? 0) + 1;
+		const source = isRecord(block.source) ? block.source : undefined;
+		const data = typeof source?.data === "string" ? source.data : "";
+		summary.imageBase64Chars = (summary.imageBase64Chars ?? 0) + data.length;
+		if (!data) summary.emptyImageCount = (summary.emptyImageCount ?? 0) + 1;
+	};
+
+	messages.forEach((entry, index) => {
 		if (!isRecord(entry)) {
 			roles += "?";
 			return;
 		}
-			: undefined;
+		const role = typeof entry.role === "string" ? entry.role : "?";
+		roles +=
+			role === "user"
+				? "U"
+				: role === "assistant"
+					? "A"
+					: role === "tool"
+						? "T"
+						: role === "system"
+							? "S"
+							: "?";
+		if (entry.content === "") emptyContentIndexes.push(index);
 
-		if (userMessage) {
-			roles += "U";
-			if (userMessage.content === "") emptyContentIndexes.push(index);
-			if (!summary.modelId && typeof userMessage.modelId === "string") {
-				summary.modelId = userMessage.modelId;
+		const blocks = Array.isArray(entry.content) ? entry.content : [];
+		for (const block of blocks) {
+			if (!isRecord(block)) continue;
+			if (block.type === "tool_use" && typeof block.id === "string") {
+				toolUseIds.push(block.id);
+				if (seenToolUseIds.has(block.id)) duplicateToolUseIds.add(block.id);
+				seenToolUseIds.add(block.id);
 			}
-			countImages(userMessage, summary);
-				: undefined;
-			const results = Array.isArray(context?.toolResults) ? context.toolResults : [];
-			for (const result of results) {
-				if (isRecord(result) && typeof result.toolUseId === "string") {
-					toolResultIds.add(result.toolUseId);
-				}
+			if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
+				toolResultIds.add(block.tool_use_id);
 			}
-			const tools = Array.isArray(context?.tools) ? context.tools : [];
-			if (tools.length > 0) summary.toolSpecCount = (summary.toolSpecCount ?? 0) + tools.length;
-			return;
-		}
-
-		if (assistantMessage) {
-			roles += "A";
-			if (assistantMessage.content === "") emptyContentIndexes.push(index);
-			const uses = Array.isArray(assistantMessage.toolUses) ? assistantMessage.toolUses : [];
-			for (const use of uses) {
-				if (!isRecord(use) || typeof use.toolUseId !== "string") continue;
-				toolUseIds.push(use.toolUseId);
-				if (seenToolUseIds.has(use.toolUseId)) duplicateToolUseIds.add(use.toolUseId);
-				seenToolUseIds.add(use.toolUseId);
-			}
-			const reasoning = assistantMessage.reasoning_content;
-			if (isRecord(reasoning)) {
+			if (block.type === "image") countImageBlock(block);
+			if (block.type === "thinking" || block.type === "redacted_thinking") {
 				summary.reasoningBlocks = (summary.reasoningBlocks ?? 0) + 1;
-				const reasoningText = isRecord(reasoning.reasoningText)
-					? reasoning.reasoningText
-					: undefined;
-				const signature = reasoningText?.signature;
-				if (typeof signature !== "string" || signature.length === 0) {
+				if (typeof block.signature !== "string" || block.signature.length === 0) {
 					summary.reasoningWithoutSignature = (summary.reasoningWithoutSignature ?? 0) + 1;
 				}
 			}
-			return;
 		}
-		roles += "?";
-	});
 
-		: undefined;
-		: undefined;
-	if (currentUser) {
-		roles += "C";
-		if (typeof currentUser.modelId === "string") summary.modelId = currentUser.modelId;
-		summary.currentMessageContentChars =
-			typeof currentUser.content === "string" ? currentUser.content.length : 0;
-		countImages(currentUser, summary);
-			: undefined;
-		const results = Array.isArray(context?.toolResults) ? context.toolResults : [];
-		summary.currentMessageToolResults = results.length;
-		for (const result of results) {
-			if (isRecord(result) && typeof result.toolUseId === "string") {
-				toolResultIds.add(result.toolUseId);
-			}
+		// OpenAI-style tool calls / results.
+		const toolCalls = Array.isArray(entry.tool_calls) ? entry.tool_calls : [];
+		for (const call of toolCalls) {
+			if (!isRecord(call) || typeof call.id !== "string") continue;
+			toolUseIds.push(call.id);
+			if (seenToolUseIds.has(call.id)) duplicateToolUseIds.add(call.id);
+			seenToolUseIds.add(call.id);
 		}
-		const tools = Array.isArray(context?.tools) ? context.tools : [];
-		if (tools.length > 0) summary.toolSpecCount = (summary.toolSpecCount ?? 0) + tools.length;
-	} else {
-	}
+		if (typeof entry.tool_call_id === "string") toolResultIds.add(entry.tool_call_id);
+
+		// The last message doubles as the "current" one for the summary.
+		if (index === messages.length - 1) {
+			summary.currentMessageContentChars =
+				typeof entry.content === "string" ? entry.content.length : 0;
+			summary.currentMessageToolResults = blocks.filter(
+				(block) => isRecord(block) && block.type === "tool_result",
+			).length;
+		}
+	});
 
 	summary.roleSequence =
 		roles.length > MAX_ROLE_SEQUENCE_CHARS
@@ -282,7 +272,7 @@ export function summarizeRequestBody(body: unknown): MalformedRequestBodySummary
 		summary.unmatchedToolResultIds = limitList(unmatchedResults);
 		notes.push("toolResult without a matching toolUse (orphaned result)");
 	}
-	if (summary.emptyImageCount) notes.push("image with empty source.bytes present");
+	if (summary.emptyImageCount) notes.push("image with empty source data present");
 
 	if (notes.length > 0) summary.notes = limitList(notes);
 	return summary;

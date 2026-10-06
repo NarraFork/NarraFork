@@ -51,6 +51,7 @@ const FAMILY_DATE_SUFFIXES: readonly RegExp[] = [
  * 3. Normalize version separators: dots between digits → dashes (`claude-opus-4.6` → `claude-opus-4-6`)
  * 4. Strip volatile date suffixes (`claude-opus-4-6-20260514` → `claude-opus-4-6`)
  *
+ * This means `nug:claude-opus-4.6`, `legacy:claude-opus-4-6-20260514`, and
  * `myprov:claude-opus-4-6` all normalize to `claude-opus-4-6`.
  */
 export function normalizeModelFamily(raw: string | null | undefined): string {
