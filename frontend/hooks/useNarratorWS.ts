@@ -1959,6 +1959,7 @@ export interface NarratorListWSEvent {
 		| "permissionMode"
 		| "presence"
 		| "terminalCount"
+		| "backgroundTaskCount"
 		| "containerStatus"
 		| "draft"
 		/**
@@ -1985,6 +1986,7 @@ export interface NarratorListWSEvent {
 		avatarImageId: string | null;
 	}>;
 	activeTerminalCount?: number;
+	activeBackgroundTaskCount?: number;
 	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
 	hasDraft?: boolean;
 	/** `awaitedQuestion` only: true when an agent just started blocking on a question. */

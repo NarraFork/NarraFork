@@ -16,6 +16,7 @@ export const RECENT_TABS_LIST_EVENT_TYPES = [
 	"permission_mode_changed",
 	"presence_update",
 	"terminal_count_changed",
+	"background_task_count_changed",
 	"container_status_changed",
 	"draft_changed",
 	"goals_set",
@@ -58,6 +59,12 @@ function dispatchListStateItem(
 		onUpdate(narratorId, {
 			type: "terminalCount",
 			activeTerminalCount: state.activeTerminalCount,
+		});
+	}
+	if (typeof state.activeBackgroundTaskCount === "number") {
+		onUpdate(narratorId, {
+			type: "backgroundTaskCount",
+			activeBackgroundTaskCount: state.activeBackgroundTaskCount,
 		});
 	}
 	if ("containerStatus" in state) {
@@ -155,6 +162,11 @@ export function useRecentTabsWS(
 					onUpdateRef.current(narratorId, {
 						type: "terminalCount",
 						activeTerminalCount: data.activeTerminalCount as number,
+					});
+				} else if (data.type === "background_task_count_changed") {
+					onUpdateRef.current(narratorId, {
+						type: "backgroundTaskCount",
+						activeBackgroundTaskCount: data.activeBackgroundTaskCount as number,
 					});
 				} else if (data.type === "container_status_changed") {
 					onUpdateRef.current(narratorId, {

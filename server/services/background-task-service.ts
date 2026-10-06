@@ -24,6 +24,7 @@ import {
 	inArray,
 	like,
 	lt,
+	lte,
 	ne,
 	notExists,
 	notInArray,
@@ -491,6 +492,14 @@ class BackgroundTaskService {
 			version: this.bumpListVersion(parentNarratorId),
 			activeCount,
 			...delta,
+		});
+		// Separate tiny frame for count-only consumers (sidebar badges, narrator
+		// list): they filter by message type client-side and should not have to
+		// parse full delta payloads. Same delivery scope as the delta itself.
+		fn(parentNarratorId, {
+			type: "background_task_count_changed",
+			narratorId: parentNarratorId,
+			activeBackgroundTaskCount: activeCount,
 		});
 	}
 
@@ -2338,6 +2347,221 @@ class BackgroundTaskService {
 	async countActiveByParent(parentNarratorId: string): Promise<number> {
 		const active = await this.listActiveItems(parentNarratorId, { omitOutput: true });
 		return active.items.length;
+	}
+
+	/**
+	 * Batch variant of `countActiveByParent` for list surfaces (RecentTabs
+	 * snapshot, GET /api/narrators) that render one badge per narrator.
+	 *
+	 * The per-parent candidate cap is applied in SQL via a window function: the
+	 * `type='agent'` predicate matches every historical agent row forever, so
+	 * capping in JS after an uncapped read would materialize a narrator's whole
+	 * agent history on the main thread. Reconcile + liveness semantics are shared
+	 * with the single-parent path so a sidebar badge and the panel badge can
+	 * never disagree, and the result is capped at BACKGROUND_TASK_ACTIVE_LIMIT
+	 * per parent for the same reason `listActiveItems` truncates.
+	 */
+	async countActiveByParentBatch(parentNarratorIds: string[]): Promise<Map<string, number>> {
+		const counts = new Map<string, number>();
+		const ids = [...new Set(parentNarratorIds.filter((id) => typeof id === "string" && id))];
+		if (ids.length === 0) return counts;
+
+		const cap = BACKGROUND_TASK_ACTIVE_LIMIT + 1;
+		const candidateSq = db
+			.select({
+				id: backgroundTasks.id,
+				parentNarratorId: backgroundTasks.parentNarratorId,
+				type: backgroundTasks.type,
+				status: backgroundTasks.status,
+				subagentNarratorId: backgroundTasks.subagentNarratorId,
+				rn: sql<number>`ROW_NUMBER() OVER (PARTITION BY ${backgroundTasks.parentNarratorId} ORDER BY ${backgroundTasks.createdAt} DESC, ${backgroundTasks.id} DESC)`.as(
+					"rn",
+				),
+			})
+			.from(backgroundTasks)
+			.where(
+				and(
+					inArray(backgroundTasks.parentNarratorId, ids),
+					or(
+						eq(backgroundTasks.status, "running"),
+						eq(backgroundTasks.status, "paused"),
+						eq(backgroundTasks.type, "agent"),
+					),
+				),
+			)
+			.as("candidates");
+		const candidateRows = await db
+			.select({
+				id: candidateSq.id,
+				parentNarratorId: candidateSq.parentNarratorId,
+				type: candidateSq.type,
+				status: candidateSq.status,
+				subagentNarratorId: candidateSq.subagentNarratorId,
+			})
+			.from(candidateSq)
+			.where(lte(candidateSq.rn, cap))
+			.all();
+
+		// Reconcile agent rows against their subagent narrators' current state —
+		// same inputs as reconcileSummaries, but count-only (no list items built).
+		const agentIds = [
+			...new Set(
+				candidateRows
+					.filter((row) => row.type === "agent")
+					.map((row) => row.subagentNarratorId ?? row.id),
+			),
+		];
+		const narratorState = new Map<
+			string,
+			{
+				status: string;
+				isBackground: boolean | null;
+				backgroundStatus: string | null;
+				substatus: string | null;
+				errorMessage: string | null;
+			}
+		>();
+		const childCounts = new Map<string, number>();
+		if (agentIds.length > 0) {
+			const [narratorRows, childRows] = await Promise.all([
+				db
+					.select({
+						id: narrators.id,
+						status: narrators.status,
+						isBackground: narrators.isBackground,
+						backgroundStatus: narrators.backgroundStatus,
+						substatus: narrators.substatus,
+						errorMessage: narrators.errorMessage,
+					})
+					.from(narrators)
+					.where(inArray(narrators.id, agentIds))
+					.all(),
+				db
+					.select({
+						parentNarratorId: backgroundTasks.parentNarratorId,
+						value: count(),
+					})
+					.from(backgroundTasks)
+					.where(
+						and(
+							inArray(backgroundTasks.parentNarratorId, agentIds),
+							eq(backgroundTasks.status, "running"),
+						),
+					)
+					.groupBy(backgroundTasks.parentNarratorId)
+					.all(),
+			]);
+			for (const row of narratorRows) narratorState.set(row.id, row);
+			for (const row of childRows) {
+				if (row.parentNarratorId) childCounts.set(row.parentNarratorId, Number(row.value) || 0);
+			}
+		}
+
+		const isLive = await this.getLivenessFn();
+		// Same overlay as applyLiveness, minus transfer progress (which never
+		// changes whether a row counts as active).
+		const liveEffectiveStatus = (row: {
+			type: string;
+			status: string;
+			subagentNarratorId: string | null;
+			id: string;
+			effectiveStatus: string;
+		}): string => {
+			if (!isLive || row.type !== "agent") return row.effectiveStatus;
+			if (!isLive(row.subagentNarratorId ?? row.id)) return row.effectiveStatus;
+			if (row.effectiveStatus === "taken_over") return "taken_over";
+			return row.status === "running" ? "running" : "continued";
+		};
+
+		for (const row of candidateRows) {
+			const subagentNarratorId = row.type === "agent" ? (row.subagentNarratorId ?? row.id) : null;
+			const currentNarrator = subagentNarratorId
+				? (narratorState.get(subagentNarratorId) ?? null)
+				: null;
+			const effectiveStatus = liveEffectiveStatus({
+				...row,
+				effectiveStatus: resolveBackgroundTaskEffectiveStatus({
+					taskStatus: row.status,
+					currentNarratorStatus: currentNarrator?.status ?? null,
+					currentNarratorIsBackground: currentNarrator?.isBackground,
+					currentNarratorBackgroundStatus: currentNarrator?.backgroundStatus,
+					currentNarratorSubstatus: currentNarrator?.substatus,
+					currentNarratorErrorMessage: currentNarrator?.errorMessage,
+					activeChildTaskCount: subagentNarratorId ? (childCounts.get(subagentNarratorId) ?? 0) : 0,
+				}),
+			});
+			if (isBackgroundTaskActiveStatus(effectiveStatus as BackgroundTaskEffectiveStatus)) {
+				counts.set(row.parentNarratorId, (counts.get(row.parentNarratorId) ?? 0) + 1);
+			}
+		}
+
+		// Legacy active rows (subagent narrators without a background_tasks row),
+		// same predicate and reconcile as listLegacyRows with activeOnly: true.
+		// Their set is bounded by reality (activeOnly filters to running-ish
+		// rows), so no window cap is needed. Note the single-parent path applies
+		// `LIMIT cap` to this stream BEFORE the active filter, so a pathological
+		// parent with 200+ running-ish legacy rows could undercount there while
+		// this batch path counts them all (then caps the total) — the batch badge
+		// is the more accurate one in that case, and legacy rows are pre-unified
+		// history that new subagents never produce, so the divergence cannot grow.
+		const legacyRows = await db
+			.select({
+				id: narrators.id,
+				parentNarratorId: narrators.parentNarratorId,
+				status: narrators.status,
+				isBackground: narrators.isBackground,
+				backgroundStatus: narrators.backgroundStatus,
+				substatus: narrators.substatus,
+				errorMessage: narrators.errorMessage,
+			})
+			.from(narrators)
+			.where(
+				and(
+					inArray(narrators.parentNarratorId, ids),
+					or(eq(narrators.isBackground, true), like(narrators.variant, "subagent:%")),
+					notExists(
+						db
+							.select({ one: sql`1` })
+							.from(backgroundTasks)
+							.where(eq(backgroundTasks.id, narrators.id)),
+					),
+					or(
+						eq(narrators.backgroundStatus, "running"),
+						inArray(narrators.status, ["working", "waiting"]),
+						like(narrators.substatus, '%"taken_over"%'),
+					),
+				),
+			)
+			.all();
+		for (const row of legacyRows) {
+			if (!row.parentNarratorId) continue;
+			const status =
+				row.backgroundStatus ??
+				(row.status === "working" || row.status === "waiting" ? "running" : "completed");
+			const effectiveStatus = liveEffectiveStatus({
+				id: row.id,
+				type: "agent",
+				status,
+				subagentNarratorId: row.id,
+				effectiveStatus: resolveBackgroundTaskEffectiveStatus({
+					taskStatus: status as BackgroundTaskRecord["status"],
+					currentNarratorStatus: row.status,
+					currentNarratorIsBackground: row.isBackground,
+					currentNarratorBackgroundStatus: row.backgroundStatus,
+					currentNarratorSubstatus: row.substatus,
+					currentNarratorErrorMessage: row.errorMessage,
+				}),
+			});
+			if (isBackgroundTaskActiveStatus(effectiveStatus as BackgroundTaskEffectiveStatus)) {
+				counts.set(row.parentNarratorId, (counts.get(row.parentNarratorId) ?? 0) + 1);
+			}
+		}
+
+		// Match listActiveItems truncation: the badge never exceeds the active limit.
+		for (const [parentId, value] of counts) {
+			if (value > BACKGROUND_TASK_ACTIVE_LIMIT) counts.set(parentId, BACKGROUND_TASK_ACTIVE_LIMIT);
+		}
+		return counts;
 	}
 
 	/**

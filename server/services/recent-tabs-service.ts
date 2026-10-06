@@ -1631,6 +1631,7 @@ export async function getRuntimePatches(
 			substatus: tab.substatus ?? null,
 			hasDraft: tab.hasDraft ?? false,
 			activeTerminalCount: tab.activeTerminalCount ?? 0,
+			activeBackgroundTaskCount: tab.activeBackgroundTaskCount ?? 0,
 			viewers: tab.viewers ?? [],
 			viewerCount: tab.viewerCount ?? 0,
 			containerStatus: tab.containerStatus ?? null,

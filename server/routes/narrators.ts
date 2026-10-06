@@ -1145,11 +1145,17 @@ narratorRoutes.get("/", async (c) => {
 		const presenceMap = getNarratorPresenceBatch(narratorIds);
 		const draftNarratorIds = await getNarratorIdsWithDraft(userId, narratorIds);
 
+		// Batch fetch active background task counts (subagents + bash + transfers).
+		// Lazy import matches the other background-task routes in this file.
+		const { backgroundTaskService } = await import("../services/background-task-service");
+		const backgroundTaskCounts = await backgroundTaskService.countActiveByParentBatch(narratorIds);
+
 		const items = rawItems.map((n) => ({
 			...publicNarratorResponse(n, draftNarratorIds.has(n.id)),
 			messageCount: messageCounts.get(n.id) ?? 0,
 			chapter: n.chapterId ? (chapterMap.get(n.chapterId) ?? null) : null,
 			activeTerminalCount: terminalCounts.get(n.id) ?? 0,
+			activeBackgroundTaskCount: backgroundTaskCounts.get(n.id) ?? 0,
 			containerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.total ?? 0) : 0,
 			runningContainerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.running ?? 0) : 0,
 			viewers: presenceMap.get(n.id) ?? [],
