@@ -716,6 +716,10 @@ Result preview: {preview}`,
 		"zh-CN":
 			"[系统] 用户选择不回答你此前异步提交的问题 —— 请按你自己的最佳判断继续，不要重复提问：",
 	},
+	"sidecar.asyncQuestionIgnoreReason": {
+		en: "Ignored by the user; the narrator was not notified.",
+		"zh-CN": "用户已忽略此问题，未通知叙述者。",
+	},
 };
 
 // ---------------------------------------------------------------------------

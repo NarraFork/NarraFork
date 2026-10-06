@@ -256,6 +256,7 @@ export function buildAsyncQuestionNode(slot: AsyncQuestionSlot): ReactNode {
 			denyLabel={slot.denyLabel}
 			onSubmit={(id, answers) => slot.onSubmit(id, answers)}
 			onDeny={(id) => slot.onDismiss(id)}
+			onIgnore={slot.onIgnore ? (id) => slot.onIgnore?.(id) : undefined}
 		/>
 	);
 	if (!slot.awaited || !slot.awaitedLabel) return banner;

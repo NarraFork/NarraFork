@@ -187,7 +187,7 @@ function context(narratorId = "n") {
 	};
 }
 function config(narratorId = "n"): AgentConfig {
-	return {
+	const cfg: AgentConfig = {
 		narratorId,
 		conversationId: `conv-${narratorId}`,
 		provider: "test",
@@ -196,10 +196,23 @@ function config(narratorId = "n"): AgentConfig {
 		signal: new AbortController().signal,
 		requireToolCallBinding: true,
 		silentToolCallThreshold: -1,
-		permissionHandler: async () => ({ behavior: "allow" }),
+		// The production final-start gate requires approval of this exact persisted attempt.
+		permissionHandler: (name, input, toolUseId, options) =>
+			handlePermission(
+				narratorId,
+				cfg.signal,
+				name,
+				input,
+				toolUseId,
+				cfg.cwd,
+				"en",
+				undefined,
+				options,
+			),
 		onToolExecutionStarting: (toolUseId, binding, startedAt) =>
 			narratorPersistence.claimToolCallExecution(narratorId, toolUseId, binding, startedAt),
 	};
+	return cfg;
 }
 async function untilPending(id: string) {
 	for (let i = 0; i < 100; i++) {
@@ -235,6 +248,58 @@ afterAll(() => {
 });
 
 describe("真实工具行执行绑定", () => {
+	test("sealed no-dispatch evidence cannot reclaim an old attempt after a status reset", async () => {
+		await seedNarrator();
+		const binding = await seedRow();
+		await db.insert(fileChangeOperations).values({
+			id: "sealed-no-dispatch",
+			sourceInstanceId: "binding-fixture",
+			sourceKind: "tool",
+			sourceId: binding.toolCallId,
+			toolCallId: binding.toolCallId,
+			toolUseId: "call_0",
+			attempt: binding.attempt,
+			narratorId: "n",
+			requestDigest: "a".repeat(64),
+			expectedEffectCount: 0,
+			actorSubjectKey: "narrator:n",
+			actorJson: {
+				kind: "primary",
+				subjectKey: "narrator:n",
+				narratorId: "n",
+				userId: null,
+				label: null,
+				deleted: false,
+				parentSubjectKey: null,
+			},
+			executionBindingJson: {
+				deviceId: "local",
+				runtimeEpoch: "host-fixture",
+				runtimeGeneration: 0,
+				fencingToken: 0,
+			},
+			executionOutcome: "failed",
+			effectOutcome: "no_change",
+			settlement: "settled",
+			coverage: "complete",
+			reason: "no_dispatch:invocation_rejected",
+			startedAt: now,
+			finishedAt: now,
+			updatedAt: now,
+		});
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "pending", fileChangeOperationId: "sealed-no-dispatch" })
+			.where(eq(narratorToolCalls.id, binding.toolCallId));
+		await expect(
+			narratorPersistence.claimToolCallExecution("n", "call_0", binding, Date.now()),
+		).rejects.toThrow("no longer executable");
+		const row = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, binding.toolCallId),
+		});
+		expect(row?.executionStartedAt).toBeNull();
+		expect(row?.executionAttempt).toBe(1);
+	});
 	for (const stream of ["eager", "streaming"] as const)
 		test(`${stream}: 持久屏障先于执行，同ID跨消息不复用旧map`, async () => {
 			await seedNarrator();
@@ -747,9 +812,14 @@ describe("真实工具行执行绑定", () => {
 		await seedNarrator();
 		const binding = await seedRow("agent-source");
 		await seedRow("older", "n", "other-agent-message");
+		const input = {
+			prompt: "verify origin",
+			subagent_type: "general",
+			description: "origin child",
+		};
 		await db
 			.update(narratorToolCalls)
-			.set({ toolName: "Agent" })
+			.set({ toolName: "Agent", inputJson: input })
 			.where(eq(narratorToolCalls.id, "agent-source"));
 		const { agentTool } = await import("../../lib/agent/tools/task");
 		const previous = toolRegistry.get("Agent");
@@ -761,7 +831,7 @@ describe("真实工具行执行绑定", () => {
 				{
 					toolUseId: "call_0",
 					name: "Agent",
-					input: { prompt: "verify origin", subagent_type: "general", description: "origin child" },
+					input,
 				},
 				config(),
 				{ toolCallBinding: binding },
@@ -769,6 +839,7 @@ describe("真实工具行执行绑定", () => {
 			const children = await db.query.narrators.findMany({
 				where: eq(narrators.parentNarratorId, "n"),
 			});
+			if (result.isError) throw new Error(result.output);
 			expect(result.isError).not.toBe(true);
 			expect(children).toHaveLength(1);
 			expect(children[0].originToolCallId).toBe("agent-source");

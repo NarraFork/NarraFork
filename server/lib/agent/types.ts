@@ -104,6 +104,8 @@ export interface ToolFinalStartAuthorizationTicket {
 }
 
 export interface ToolContext {
+	/** Trusted host callback; called only at a proven pre-write control-flow boundary. */
+	recordFileNoDispatch?: (reason: "validation_rejected" | "preview") => Promise<void>;
 	/** Eval-only audited Read bridge; never exposes the runner configuration. */
 	executeRead?: (input: Record<string, unknown>, signal: AbortSignal) => Promise<ToolResult>;
 	recheckAuthorization?: () => Promise<void>;
@@ -1066,6 +1068,21 @@ export interface AgentConfig {
 	 * or runs model/context hooks. The host must fence writes by toolCallBinding.
 	 */
 	onDetachedToolResult?: (event: Extract<AgentEvent, { type: "tool_result" }>) => Promise<void>;
+	/** Capture a live host observation before permission can terminate the unclaimed row. */
+	prepareToolNoDispatch?: (
+		ctx: ToolContext,
+		toolName: "Write" | "Edit" | "StructSed",
+	) => (
+		reason: "validation_rejected" | "cancelled_before_dispatch" | "preview" | "invocation_rejected",
+		claimed: boolean,
+	) => Promise<void>;
+	/** Host evidence persistence (not an observer): failures must reject execution. */
+	recordToolNoDispatch?: (
+		ctx: ToolContext,
+		toolName: "Write" | "Edit" | "StructSed",
+		reason: "validation_rejected" | "cancelled_before_dispatch" | "preview" | "invocation_rejected",
+		claimed: boolean,
+	) => Promise<void>;
 	/** Durable single-start claim immediately before tool.execute, after authorization. */
 	onToolExecutionStarting?: (
 		toolUseId: string,

@@ -1,6 +1,6 @@
 import type { Worker } from "node:worker_threads";
-import { startPrivateArchiveWorker } from "../narrator-backup/worker-client";
 import type { LegacyImportWorkerRequest, LegacyWorkerImportResult } from "./legacy-import-worker";
+import { startPrivateArchiveWorker } from "./worker-client";
 
 let workers = 0;
 export async function importLegacyProjectOnWorker(

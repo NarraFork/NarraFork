@@ -24,14 +24,22 @@ import { FILE_CHANGE_LIMITS, type FileChangeState } from "../../shared/file-chan
 import { sqlite as isolatedTemplate } from "../db";
 import * as relations from "../db/relations";
 import * as schema from "../db/schema";
+import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
+import { executeTool } from "../lib/agent/tool-executor";
+import { toolRegistry } from "../lib/agent/tool-registry";
 import { editTool } from "../lib/agent/tools/edit";
 import { decodeFileBytes } from "../lib/agent/tools/encoding";
-import { structSedTool } from "../lib/agent/tools/struct-sed";
+import { previewStructSedChange, structSedTool } from "../lib/agent/tools/struct-sed";
 import { MAX_BATCH_OPERATIONS } from "../lib/agent/tools/struct-sed/commands";
 import { writeTool } from "../lib/agent/tools/write";
 import { withBashWriteLock, withWorkspaceWriteLock } from "../lib/agent/tools/write-serialization";
-import type { ToolContext, ToolExecutionTarget } from "../lib/agent/types";
+import type {
+	AgentConfig,
+	AgentToolUse,
+	ToolContext,
+	ToolExecutionTarget,
+} from "../lib/agent/types";
 import { worktreeWriteLock } from "../lib/async-mutex";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
@@ -285,6 +293,469 @@ function referenceRequestDigest(parts: string[], input: Record<string, unknown>)
 		digest.update(`${Buffer.byteLength(text)}:`).update(text);
 	return digest.digest("hex");
 }
+
+async function executorFileCall(
+	toolName: "Write" | "Edit" | "StructSed",
+	input: Record<string, unknown>,
+	patch: Partial<AgentConfig> = {},
+) {
+	const ctx = await callContext(toolName, input.file_path as string);
+	const binding = ctx.toolCallBinding;
+	if (!binding || !ctx.currentToolUseId) throw new Error("Missing fixture tool binding");
+	db.update(schema.narratorToolCalls)
+		.set({ status: "pending", executionStartedAt: null })
+		.where(eq(schema.narratorToolCalls.id, binding.toolCallId))
+		.run();
+	const tu: AgentToolUse = { name: toolName, toolUseId: ctx.currentToolUseId, input };
+	toolRegistry.register(
+		toolName === "Write" ? writeTool : toolName === "Edit" ? editTool : structSedTool,
+	);
+	const config: AgentConfig = {
+		narratorId,
+		conversationId: "host-proof-test",
+		model: "test",
+		provider: "test",
+		cwd: workspace,
+		signal: ctx.signal,
+		permissionHandler: async () => ({ behavior: "allow" }),
+		requireToolCallBinding: true,
+		toolExecutionBindings: new WeakMap([[tu, binding]]),
+		onExecutionTargetResolved: async (_toolUseId, target) => {
+			db.update(schema.narratorToolCalls)
+				.set({
+					executionDeviceId: target.deviceId,
+					executionCwd: target.cwd,
+					executionPathFlavor: target.pathFlavor,
+					resolvedFilePath: target.lexicalPath ?? null,
+					canonicalFilePath: target.canonicalPath ?? null,
+					runtimeGeneration: target.runtimeGeneration ?? null,
+				})
+				.where(eq(schema.narratorToolCalls.id, binding.toolCallId))
+				.run();
+		},
+		prepareToolNoDispatch: (proofCtx, name) => runtime.prepareHostNoDispatch(proofCtx, name),
+		onToolExecutionStarting: async (_toolUseId, attempt, startedAt) => {
+			const rows = sqlite
+				.query(
+					"UPDATE narrator_tool_calls SET status='running',execution_started_at=? WHERE id=? AND execution_attempt=? AND execution_started_at IS NULL AND status IN ('initializing','pending','running') RETURNING id",
+				)
+				.all(new Date(startedAt).toISOString(), attempt.toolCallId, attempt.attempt);
+			if (rows.length !== 1) throw new Error("Attempt was not claimed");
+			return attempt;
+		},
+		onToolExecutionFinalAuthorization: async () => ({ assertStillCurrent() {} }),
+		...patch,
+	};
+	return { ctx, run: () => withLocalFileChangeRuntime(runtime, () => executeTool(tu, config)) };
+}
+
+function expectZeroDispatch(reason: string, executionOutcome: string) {
+	expect(operations()).toHaveLength(1);
+	expect(operations()[0]).toMatchObject({
+		reason: `no_dispatch:${reason}`,
+		executionOutcome,
+		effectOutcome: "no_change",
+		expectedEffectCount: 0,
+		preparedEffectCount: 0,
+		settledEffectCount: 0,
+		unresolvedEffectCount: 0,
+		evidenceBytes: 0,
+		coverage: "complete",
+	});
+	expect(effects()).toHaveLength(0);
+	expect(attributions()).toHaveLength(0);
+}
+
+describe("trusted host no-dispatch boundaries", () => {
+	test.each([
+		{ command: "unknown", address: "1" },
+		{ command: "replace", address: "1" },
+		{ command: "delete", from_stash: "missing" },
+		{ command: "delete", address: "/not-found/" },
+	])("actual StructSed validation/stash/address rejection records no writes: %j", async (input) => {
+		const path = join(workspace, "struct.txt");
+		await writeFile(path, "original\n");
+		const ctx = await callContext("StructSed", path);
+		const result = await withLocalFileChangeRuntime(runtime, () =>
+			structSedTool.execute({ file_path: path, dry_run: false, ...input }, ctx),
+		);
+		expect(result.isError).toBe(true);
+		expectZeroDispatch("validation_rejected", "failed");
+		expect(await readFile(path, "utf8")).toBe("original\n");
+	});
+
+	test.each([
+		undefined,
+		false,
+	])("actual StructSed preview/identical content is succeeded (dryRun=%s)", async (dryRun) => {
+		const path = join(workspace, "preview.txt");
+		await writeFile(path, "original\n");
+		const ctx = await callContext("StructSed", path);
+		const result = await withLocalFileChangeRuntime(runtime, () =>
+			structSedTool.execute(
+				{
+					file_path: path,
+					command: "replace",
+					address: "1",
+					content: dryRun === false ? "original" : "next",
+					...(dryRun === false ? { dry_run: false } : {}),
+				},
+				ctx,
+			),
+		);
+		expect(result.isError).not.toBe(true);
+		expectZeroDispatch("preview", "succeeded");
+		expect(await readFile(path, "utf8")).toBe("original\n");
+	});
+
+	test("permission rejection records actual never-invoked body without claiming execution", async () => {
+		const path = join(workspace, "deny.txt");
+		const { ctx, run } = await executorFileCall(
+			"Write",
+			{ file_path: path, content: "next" },
+			{
+				permissionHandler: async () => ({ behavior: "deny" }),
+			},
+		);
+		const result = await run();
+		expect(result.isError).toBe(true);
+		expect(result.executionStartedAt).toBeUndefined();
+		expectZeroDispatch("invocation_rejected", "failed");
+		expect(
+			db
+				.select()
+				.from(schema.narratorToolCalls)
+				.where(eq(schema.narratorToolCalls.id, ctx.toolCallBinding?.toolCallId ?? ""))
+				.get(),
+		).toMatchObject({ status: "fail", executionStartedAt: null, executionAttempt: 1 });
+		expect(await Bun.file(path).exists()).toBe(false);
+	});
+
+	test.each([
+		"deny",
+		"abort",
+	] as const)("live pre-permission ticket survives handler's early terminal row (%s)", async (mode) => {
+		const path = join(workspace, "terminated.txt");
+		const controller = new AbortController();
+		const { run } = await executorFileCall(
+			"Write",
+			{ file_path: path, content: "next" },
+			{
+				signal: controller.signal,
+				permissionHandler: async (_name, _input, _toolUseId, options) => {
+					db.update(schema.narratorToolCalls)
+						.set({ status: "fail" })
+						.where(eq(schema.narratorToolCalls.id, options?.toolCallBinding?.toolCallId ?? ""))
+						.run();
+					if (mode === "abort") {
+						controller.abort();
+						throw new Error("Cancelled while pending");
+					}
+					return { behavior: "deny" };
+				},
+			},
+		);
+		expect((await run()).isError).toBe(true);
+		expectZeroDispatch(
+			mode === "abort" ? "cancelled_before_dispatch" : "invocation_rejected",
+			mode === "abort" ? "interrupted" : "failed",
+		);
+		expect(await Bun.file(path).exists()).toBe(false);
+	});
+
+	test.each([
+		"Write",
+		"Edit",
+		"StructSed",
+	] as const)("safeParse refusal for %s never claims the row", async (name) => {
+		const path = join(workspace, "invalid.txt");
+		const { ctx, run } = await executorFileCall(name, {
+			file_path: path,
+			...(name === "StructSed" ? { command: "invalid" } : {}),
+		});
+		const result = await run();
+		expect(result.isError).toBe(true);
+		expect(result.executionStartedAt).toBeUndefined();
+		expectZeroDispatch("invocation_rejected", "failed");
+		expect(
+			db
+				.select()
+				.from(schema.narratorToolCalls)
+				.where(eq(schema.narratorToolCalls.id, ctx.toolCallBinding?.toolCallId ?? ""))
+				.get()?.executionStartedAt,
+		).toBeNull();
+	});
+
+	test("an executor dry-run really invokes StructSed and records succeeded preview", async () => {
+		const path = join(workspace, "executor-preview.txt");
+		await writeFile(path, "original\n");
+		const { run } = await executorFileCall("StructSed", {
+			file_path: path,
+			command: "delete",
+			address: "1",
+		});
+		const result = await run();
+		expect(result.isError).not.toBe(true);
+		expect(result.executionStartedAt).toBeNumber();
+		expectZeroDispatch("preview", "succeeded");
+		expect(await readFile(path, "utf8")).toBe("original\n");
+	});
+
+	test("proof persistence failure rejects instead of returning a successful preview", async () => {
+		const path = join(workspace, "journal-failure.txt");
+		await writeFile(path, "original\n");
+		const ctx = await callContext("StructSed", path);
+		sqlite.exec(
+			"CREATE TRIGGER reject_no_dispatch BEFORE INSERT ON file_change_operations BEGIN SELECT RAISE(ABORT, 'proof persistence rejected'); END;",
+		);
+		await expect(
+			withLocalFileChangeRuntime(runtime, () =>
+				structSedTool.execute({ file_path: path, command: "delete", address: "1" }, ctx),
+			),
+		).rejects.toThrow("persist trusted no-dispatch evidence");
+		expect(operations()).toHaveLength(0);
+		expect(effects()).toHaveLength(0);
+		expect(await readFile(path, "utf8")).toBe("original\n");
+	});
+
+	test("approval UI preview does not seal the actual pending write attempt", async () => {
+		const path = join(workspace, "approval-preview.txt");
+		await writeFile(path, "original\n");
+		const ctx = await callContext("StructSed", path);
+		const input = { file_path: path, command: "delete", address: "1", dry_run: false };
+		const preview = await withLocalFileChangeRuntime(runtime, () =>
+			previewStructSedChange(input, ctx),
+		);
+		expect("preview" in preview).toBe(true);
+		expect(operations()).toHaveLength(0);
+		const applied = await withLocalFileChangeRuntime(runtime, () =>
+			structSedTool.execute(input, ctx),
+		);
+		expect(applied.isError).not.toBe(true);
+		expect(effects()[0]?.outcome).toBe("changed");
+	});
+
+	test.each([
+		false,
+		true,
+	])("executor oversize rejection persists proof or rejects failed proof (failJournal=%s)", async (failJournal) => {
+		const path = join(workspace, "oversize.txt");
+		const { run } = await executorFileCall("Write", {
+			file_path: path,
+			content: "x".repeat(FILE_CHANGE_LIMITS.fileToolRequestBytes + 1),
+		});
+		if (failJournal)
+			sqlite.exec(
+				"CREATE TRIGGER reject_no_dispatch BEFORE INSERT ON file_change_operations BEGIN SELECT RAISE(ABORT, 'normalization proof rejected'); END;",
+			);
+		if (failJournal) {
+			await expect(run()).rejects.toThrow("normalization proof rejected");
+			expect(operations()).toHaveLength(0);
+		} else {
+			expect((await run()).isError).toBe(true);
+			expectZeroDispatch("validation_rejected", "failed");
+		}
+		expect(await Bun.file(path).exists()).toBe(false);
+	});
+
+	test.each([
+		false,
+		true,
+	])("JSON escape budget rejection is proven at hash_request (failJournal=%s)", async (failJournal) => {
+		const path = join(workspace, "escaped-budget.txt");
+		const apply = spyOn(io, "apply");
+		const read = spyOn(io, "read");
+		// Each NUL is six JSON bytes, despite occupying only one JS character.
+		// The field itself passes snapshotFileToolInput's length ceiling.
+		const { run } = await executorFileCall("Write", {
+			file_path: path,
+			content: "\0".repeat(FILE_CHANGE_LIMITS.fileToolRequestBytes / 6),
+		});
+		if (failJournal)
+			sqlite.exec(
+				"CREATE TRIGGER reject_no_dispatch BEFORE INSERT ON file_change_operations BEGIN SELECT RAISE(ABORT, 'escaped request proof rejected'); END;",
+			);
+		if (failJournal) {
+			await expect(run()).rejects.toThrow("escaped request proof rejected");
+			expect(operations()).toHaveLength(0);
+		} else {
+			const result = await run();
+			expect(result.isError).toBe(true);
+			expectZeroDispatch("validation_rejected", "failed");
+		}
+		expect(apply).not.toHaveBeenCalled();
+		expect(read).not.toHaveBeenCalled();
+		expect(effects()).toHaveLength(0);
+		expect(await Bun.file(path).exists()).toBe(false);
+		apply.mockRestore();
+		read.mockRestore();
+	});
+
+	test("aggregate scalar budget rejection records proof before construction or IO", async () => {
+		const path = join(workspace, "aggregate-budget.txt");
+		const ctx = await callContext("Write", path);
+		const value = "a".repeat(FILE_CHANGE_LIMITS.fileToolRequestBytes / 2);
+		const apply = spyOn(io, "apply");
+		await expect(
+			runtime.execute({
+				ctx,
+				backend: localBackend,
+				toolName: "Write",
+				filePath: path,
+				input: { first: value, second: value },
+				construct() {
+					throw new Error("must not construct");
+				},
+			}),
+		).rejects.toThrow("bounded input budget");
+		expectZeroDispatch("validation_rejected", "failed");
+		expect(apply).not.toHaveBeenCalled();
+		expect(await Bun.file(path).exists()).toBe(false);
+		apply.mockRestore();
+	});
+
+	test("executor construct rejection cannot swallow a failed evidence commit", async () => {
+		const path = join(workspace, "construct-proof.txt");
+		await writeFile(path, "original\n");
+		const { run } = await executorFileCall("Edit", {
+			file_path: path,
+			old_string: "not-found",
+			new_string: "next",
+		});
+		sqlite.exec(
+			"CREATE TRIGGER reject_no_dispatch BEFORE INSERT ON file_change_operations BEGIN SELECT RAISE(ABORT, 'construct proof rejected'); END;",
+		);
+		await expect(run()).rejects.toThrow("construct proof rejected");
+		expect(operations()).toHaveLength(0);
+		expect(effects()).toHaveLength(0);
+		expect(await readFile(path, "utf8")).toBe("original\n");
+	});
+
+	test("executor successful preview cannot swallow failed proof persistence", async () => {
+		const path = join(workspace, "executor-proof.txt");
+		await writeFile(path, "original\n");
+		const { run } = await executorFileCall("StructSed", {
+			file_path: path,
+			command: "delete",
+			address: "1",
+		});
+		sqlite.exec(
+			"CREATE TRIGGER reject_no_dispatch BEFORE INSERT ON file_change_operations BEGIN SELECT RAISE(ABORT, 'preview proof rejected'); END;",
+		);
+		await expect(run()).rejects.toThrow("preview proof rejected");
+		expect(operations()).toHaveLength(0);
+		expect(effects()).toHaveLength(0);
+	});
+
+	test("frozen target drift after the ticket cannot be rebound by a denial", async () => {
+		const path = join(workspace, "frozen-proof.txt");
+		const { run } = await executorFileCall(
+			"Write",
+			{ file_path: path, content: "next" },
+			{
+				permissionHandler: async (_name, _input, _id, options) => {
+					db.update(schema.narratorToolCalls)
+						.set({ canonicalFilePath: `${path}.drift` })
+						.where(eq(schema.narratorToolCalls.id, options?.toolCallBinding?.toolCallId ?? ""))
+						.run();
+					return { behavior: "deny" };
+				},
+			},
+		);
+		await expect(run()).rejects.toThrow("live host attempt");
+		expect(operations()).toHaveLength(0);
+		expect(await Bun.file(path).exists()).toBe(false);
+	});
+
+	test("remote preview records only host flow, without remote file states or receipt", async () => {
+		const localPath = join(workspace, "host-must-not-touch.txt");
+		const ctx = await callContext("StructSed", localPath);
+		const remotePath = "/remote/proof.txt";
+		ctx.cwd = "/remote";
+		ctx.executionTarget = Object.freeze({
+			deviceId: "proof-device",
+			backendKind: "remote",
+			cwd: "/remote",
+			pathFlavor: "posix",
+			lexicalPath: remotePath,
+			canonicalPath: remotePath,
+			runtimeGeneration: 7,
+			selectionSource: "explicit",
+		});
+		const writes: string[] = [];
+		ctx.resolveBackend = () =>
+			Object.assign(Object.create(localBackend) as ExecutionBackend, {
+				kind: "remote" as const,
+				deviceId: "proof-device",
+				runtimeGeneration: 7,
+				statFile: async () => ({ isFile: true, isDirectory: false, size: 9 }),
+				readFileBytes: async () => ({
+					bytes: Buffer.from("original\n"),
+					truncated: false,
+					totalSize: 9,
+				}),
+				writeFileBytes: async () => {
+					writes.push("write");
+				},
+				mkdirp: async () => {
+					writes.push("mkdir");
+				},
+			});
+		db.update(schema.narratorToolCalls)
+			.set({
+				executionDeviceId: "proof-device",
+				executionCwd: "/remote",
+				executionPathFlavor: "posix",
+				resolvedFilePath: remotePath,
+				canonicalFilePath: remotePath,
+				runtimeGeneration: 7,
+			})
+			.where(eq(schema.narratorToolCalls.id, ctx.toolCallBinding?.toolCallId ?? ""))
+			.run();
+		const result = await withLocalFileChangeRuntime(runtime, () =>
+			structSedTool.execute({ file_path: remotePath, command: "delete", address: "1" }, ctx),
+		);
+		expect(result.isError).not.toBe(true);
+		expectZeroDispatch("preview", "succeeded");
+		expect(operations()[0]?.executionBindingJson).toMatchObject({
+			deviceId: "proof-device",
+			runtimeGeneration: 7,
+			runtimeEpoch: localFileChangeRuntimeBinding()?.runtimeEpoch,
+			fencingToken: 0,
+		});
+		expect(writes).toEqual([]);
+		expect(await Bun.file(localPath).exists()).toBe(false);
+	});
+
+	test("after an actual write, an opaque failure does not generate host no-dispatch evidence", async () => {
+		const path = join(workspace, "write-then-fail.txt");
+		await writeFile(path, "original\n");
+		io.apply = async () => {
+			await writeFile(path, "unknown\n");
+			throw new Error("Opaque failure after write");
+		};
+		const { run } = await executorFileCall("Write", { file_path: path, content: "next" });
+		expect((await run()).isError).toBe(true);
+		expect(operations()).toHaveLength(1);
+		expect(operations()[0]?.reason?.startsWith("no_dispatch:")).not.toBe(true);
+		expect(effects()[0]?.outcome).toBe("unknown");
+		expect(await readFile(path, "utf8")).toBe("unknown\n");
+	});
+
+	test("a terminal old attempt cannot obtain a live observation ticket", async () => {
+		const path = join(workspace, "stale.txt");
+		const ctx = await callContext("Write", path);
+		db.update(schema.narratorToolCalls)
+			.set({ status: "fail", executionStartedAt: null })
+			.where(eq(schema.narratorToolCalls.id, ctx.toolCallBinding?.toolCallId ?? ""))
+			.run();
+		expect(() => runtime.prepareHostNoDispatch(ctx, "Write")).toThrow("precede");
+		await expect(
+			runtime.recordHostNoDispatch(ctx, "Write", "invocation_rejected", false),
+		).rejects.toThrow("live host");
+		expect(operations()).toHaveLength(0);
+	});
+});
 
 describe("bounded immutable request digest", () => {
 	test("matches existing JSON digest including escaping and surrogate chunk boundaries", async () => {
@@ -656,9 +1127,10 @@ describe("fail closed before writes and after uncertain IO", () => {
 		sqlite.exec(
 			"CREATE TRIGGER fail_zero BEFORE INSERT ON file_change_operations BEGIN SELECT RAISE(ABORT, 'zero-journal-fault'); END",
 		);
-		const result = await edit(path, "missing", "replacement");
-		expect(result.isError).toBe(true);
-		expect(result.output).toContain("zero-journal-fault");
+		await expect(edit(path, "missing", "replacement")).rejects.toMatchObject({
+			name: "FileNoDispatchEvidenceError",
+			cause: { message: "zero-journal-fault" },
+		});
 		expect(operations()).toHaveLength(0);
 		expect(await readFile(path, "utf8")).toBe("same");
 	});

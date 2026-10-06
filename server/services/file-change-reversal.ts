@@ -53,6 +53,10 @@ export interface FileChangeReversalDependencies {
 	timeoutMs?: number;
 	/** Trusted infrastructure/test options, never derived from selected paths. */
 	mergeOptions?: Omit<FileChangeMergeOptions, "signal">;
+	/** Independent cumulative read/merge work cap; repeated reads are never deduplicated. */
+	maxProcessedBytes?: number;
+	/** Planner-wide processing charge for merge work (blob IO is charged by readBlob). */
+	processMergeBytes?: (bytes: number) => void;
 }
 
 export type FileChangeReversalFailure =
@@ -82,8 +86,12 @@ export type FileChangeReversalResult =
 			desired: KnownFileChangeState;
 			changed: boolean;
 			steps: FileChangeReversalStep[];
-			/** Referenced current/before/after bytes plus all calculated merge outputs. */
+			/** Unique blob bytes across input evidence and private calculated merge outputs. */
 			evidenceBytes: number;
+			/** Explicit output accounting, independent of input reference multiplicity. */
+			intermediateBytes: number;
+			/** Metadata only; intermediate bodies are never retained in a history cache. */
+			outputRefs: FileChangeBlobRef[];
 	  }
 	| { ok: false; reason: FileChangeReversalFailure; effectId?: string };
 
@@ -105,8 +113,18 @@ class Refusal extends Error {
 export class FileChangeReversalCalculator {
 	private readonly admission = new Admission();
 	private readonly timeoutMs: number;
+	private readonly maxProcessedBytes: number;
 
 	constructor(private readonly dependencies: FileChangeReversalDependencies) {
+		// Four passes allow verification, rereads and merge processing, but remain finite.
+		this.maxProcessedBytes =
+			dependencies.maxProcessedBytes ?? 4 * FILE_CHANGE_LIMITS.operationEvidenceBytes;
+		if (
+			!Number.isSafeInteger(this.maxProcessedBytes) ||
+			this.maxProcessedBytes < 1 ||
+			this.maxProcessedBytes > 4 * FILE_CHANGE_LIMITS.operationEvidenceBytes
+		)
+			throw new Refusal("invalid_input");
 		this.timeoutMs = dependencies.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		if (
 			!Number.isSafeInteger(this.timeoutMs) ||
@@ -118,7 +136,7 @@ export class FileChangeReversalCalculator {
 	}
 
 	async calculate(input: FileChangeReversalInput): Promise<FileChangeReversalResult> {
-		const budget = new Budget(input.signal, this.timeoutMs);
+		const budget = new Budget(input.signal, this.timeoutMs, this.maxProcessedBytes);
 		let release: (() => void) | undefined;
 		try {
 			budget.check();
@@ -163,6 +181,7 @@ export class FileChangeReversalCalculator {
 		let desired = prepared.current;
 		let calculatedBytes: Uint8Array | undefined;
 		let evidenceBytes = prepared.evidenceBytes;
+		const outputRefs = new Map<string, FileChangeBlobRef>();
 		for (const effect of prepared.effects) {
 			budget.check();
 			let method: FileChangeReversalStep["method"];
@@ -197,6 +216,9 @@ export class FileChangeReversalCalculator {
 				for (const bytes of [currentBytes, afterBytes, beforeBytes]) {
 					if (await isBinary(bytes, budget)) throw new Refusal("state_conflict", effect.id);
 				}
+				const inputBytes = currentBytes.byteLength + afterBytes.byteLength + beforeBytes.byteLength;
+				budget.process(inputBytes);
+				this.dependencies.processMergeBytes?.(inputBytes);
 				let merged: Uint8Array;
 				try {
 					merged = await mergeFileChangeBytes(currentBytes, afterBytes, beforeBytes, {
@@ -212,8 +234,16 @@ export class FileChangeReversalCalculator {
 					throw new Refusal("merge_failed", effect.id);
 				}
 				budget.check();
-				evidenceBytes += merged.byteLength;
+				budget.process(merged.byteLength);
+				this.dependencies.processMergeBytes?.(merged.byteLength);
 				const ref = await hashBytes(merged, budget);
+				const prior = prepared.refs.get(ref.digest);
+				if (prior && !refsEqual(prior, ref)) throw new Refusal("blob_integrity");
+				if (!prior) {
+					evidenceBytes += ref.sizeBytes;
+					prepared.refs.set(ref.digest, ref);
+				}
+				outputRefs.set(ref.digest, ref);
 				// Intermediate blobs remain private memory; publish only the final successful state.
 				desired = { kind: "regular", blob: ref, mode: desired.mode };
 				calculatedBytes = merged;
@@ -257,11 +287,14 @@ export class FileChangeReversalCalculator {
 			changed,
 			steps,
 			evidenceBytes,
+			intermediateBytes: evidenceBytes - prepared.evidenceBytes,
+			outputRefs: [...outputRefs.values()],
 		};
 	}
 
 	private async read(ref: FileChangeBlobRef, budget: Budget): Promise<Uint8Array> {
 		budget.check();
+		budget.process(ref.sizeBytes);
 		let bytes: Uint8Array;
 		try {
 			bytes = await budget.wait(
@@ -365,11 +398,12 @@ async function prepare(input: FileChangeReversalInput, budget: Budget) {
 		const ref =
 			state.kind === "regular" ? state.blob : state.kind === "symlink" ? state.target : null;
 		if (!ref) return;
+		const prior = refs.get(ref.digest);
+		if (prior && !refsEqual(prior, ref)) throw new Refusal("blob_integrity");
+		if (prior) return;
 		evidenceBytes += ref.sizeBytes;
 		if (evidenceBytes > FILE_CHANGE_LIMITS.operationEvidenceBytes)
 			throw new Refusal("budget_exceeded");
-		const prior = refs.get(ref.digest);
-		if (prior && !refsEqual(prior, ref)) throw new Refusal("blob_integrity");
 		refs.set(ref.digest, ref);
 	};
 	addState(current);
@@ -417,7 +451,9 @@ async function prepare(input: FileChangeReversalInput, budget: Budget) {
 		}
 		if (!noDispatch) {
 			addState(effect.before);
+			addState(effect.intendedAfter);
 			addState(effect.observedAfter);
+			if (effect.executionReceipt) addState(effect.executionReceipt.observedAfter);
 		}
 	}
 	const effects = Array.from(ids.values(), ({ effect }) => effect).sort(
@@ -606,10 +642,23 @@ class Budget {
 	private readonly onAbort = () => this.abort("cancelled");
 	private readonly pending = new Set<Promise<unknown>>();
 	private release: (() => void) | undefined;
+	private processedBytes = 0;
+
+	process(bytes: number): void {
+		this.check();
+		if (
+			!Number.isSafeInteger(bytes) ||
+			bytes < 0 ||
+			bytes > this.maxProcessedBytes - this.processedBytes
+		)
+			throw new Refusal("budget_exceeded");
+		this.processedBytes += bytes;
+	}
 
 	constructor(
 		private readonly external: AbortSignal | undefined,
 		timeoutMs: number,
+		private readonly maxProcessedBytes: number,
 	) {
 		external?.addEventListener("abort", this.onAbort, { once: true });
 		if (external?.aborted) this.onAbort();

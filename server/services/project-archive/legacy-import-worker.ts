@@ -1,13 +1,10 @@
 import { Database } from "bun:sqlite";
 import { parentPort } from "node:worker_threads";
 import { openDatabase } from "@server/db/connection";
-import { NARRATOR_BACKUP_LIMITS as LIMITS } from "@shared/narrator-backup";
 import { SQL } from "bun";
-import type { BackupActor, BackupTable } from "../narrator-backup/contract";
-import { postgresBackupConnection } from "../narrator-backup/postgres-main-store";
-import { sqliteBackupConnection } from "../narrator-backup/sqlite-main-store";
-import { assertFullExport } from "../narrator-backup/state";
+import { type ArchiveActor, assertFullExport } from "./access";
 import { forwardReferencesOf } from "./deferred-references";
+import { PROJECT_ARCHIVE_LIMITS as LIMITS } from "./limits";
 import type { ArchiveRow, ArchiveValue } from "./main-store";
 import {
 	ARCHIVE_COLUMNS,
@@ -16,6 +13,8 @@ import {
 	type ArchiveTable,
 } from "./manifest";
 import { sanitizeLegacyPolicyRow } from "./untrusted-policy";
+import { postgresArchiveConnection } from "./worker-postgres-store";
+import { sqliteArchiveConnection } from "./worker-sqlite-store";
 
 export interface LegacyImportWorkerRequest {
 	archivePath: string;
@@ -23,7 +22,7 @@ export interface LegacyImportWorkerRequest {
 	databasePath: string;
 	backend: "sqlite" | "postgres";
 	postgresUrl?: string;
-	actor?: BackupActor;
+	actor?: ArchiveActor;
 	deadline: number;
 	cancellation: SharedArrayBuffer;
 }
@@ -76,9 +75,9 @@ export async function runLegacyImportWorker(
 				? new SQL(request.postgresUrl ?? "", { max: 1, connectionTimeout: 10 })
 				: undefined;
 		const connection = main
-			? sqliteBackupConnection(main)
+			? sqliteArchiveConnection(main)
 			: pg
-				? postgresBackupConnection(pg)
+				? postgresArchiveConnection(pg)
 				: undefined;
 		if (!connection) throw new Error("Project import target unavailable");
 		const batches: { table: ArchiveTable; columns: string[]; rows: ArchiveRow[] }[] = [];
@@ -94,7 +93,7 @@ export async function runLegacyImportWorker(
 				if (!definition) continue; // Legacy archives may omit a whole table.
 				if (definition.type !== "table" || /CREATE\s+VIRTUAL/i.test(definition.sql))
 					throw new Error("Project archive requires plain tables");
-				const live = await connection.columns(table as BackupTable);
+				const live = await connection.columns(table);
 				const present = archive.prepare(`PRAGMA table_xinfo(${q(table)})`).all() as {
 					name: string;
 					hidden: number;
@@ -104,7 +103,7 @@ export async function runLegacyImportWorker(
 				const columns = ARCHIVE_COLUMNS[table].filter(
 					(name) => live.includes(name) && present.some((field) => field.name === name),
 				);
-				if (!columns.length) continue; // Deliberate legacy intersection, never used by v1 narrator profiles.
+				if (!columns.length) continue; // Deliberate intersection for portable archives written by older versions.
 				const rows: ArchiveRow[] = [];
 				let after = "";
 				for (;;) {
@@ -191,7 +190,7 @@ export async function runLegacyImportWorker(
 				if (!user) throw new Error("Project import actor no longer exists");
 				actor = { userId: actor.userId, isAdmin: actor.isAdmin && user.role === "admin" };
 			}
-			const projectColumns = await tx.columns("projects" as BackupTable);
+			const projectColumns = await tx.columns("projects");
 			const narratorColumns = await tx.columns("narrators");
 			async function authorizeTargetProject(id: unknown) {
 				if (!actor || typeof id !== "string" || !projectColumns.includes("owner_user_id")) return;

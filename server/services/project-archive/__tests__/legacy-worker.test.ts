@@ -3,10 +3,9 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BACKUP_TABLES } from "../../narrator-backup/contract";
 import { importLegacyProjectOnWorker } from "../legacy-import-job";
 import { exportLegacyProjectOnWorker } from "../legacy-sync-job";
-import { ARCHIVE_COLUMNS, ARCHIVE_TABLE_ORDER, type ArchiveTable } from "../manifest";
+import { ARCHIVE_COLUMNS, ARCHIVE_TABLE_ORDER } from "../manifest";
 
 const dirs: string[] = [];
 const handles: Database[] = [];
@@ -20,10 +19,19 @@ function database(path: string) {
 	db.run(
 		"CREATE TABLE users(id TEXT PRIMARY KEY,role TEXT); INSERT INTO users VALUES('alice','user'),('bob','user')",
 	);
-	for (const table of new Set([...Object.keys(BACKUP_TABLES), ...ARCHIVE_TABLE_ORDER])) {
+	for (const table of ARCHIVE_TABLE_ORDER) {
 		const columns = new Set([
-			...(BACKUP_TABLES[table as keyof typeof BACKUP_TABLES]?.split(" ") ?? []),
-			...(ARCHIVE_COLUMNS[table as ArchiveTable] ?? []),
+			...ARCHIVE_COLUMNS[table],
+			...(table === "narrators"
+				? [
+						"owner_user_id",
+						"acl_root_narrator_id",
+						"variant",
+						"refs_inherited_from",
+						"refs_backfill_cursor",
+						"next_seq",
+					]
+				: []),
 		]);
 		db.run(
 			`CREATE TABLE ${table} (${[...columns].map((name) => `${name} ${name === "id" ? "TEXT PRIMARY KEY" : ["seq", "refs_backfill_cursor"].includes(name) ? "INTEGER" : "TEXT"}`).join(",")})`,
@@ -112,7 +120,7 @@ test("legacy Worker import archives restored state, raises seq floor and rolls b
 		{ id: "context", status: "archived", permission_mode: "readOnly", next_seq: "8" },
 	]);
 	expect(JSON.stringify(archive.prepare("SELECT * FROM narrator_message_refs").all())).toBe(before);
-	// Legacy project-level skip is retained; narrator-backup v1 instead rejects every ID collision.
+	// Existing projects are deliberately skipped without merging their history.
 	expect((await restore()).skipped).toBe(true);
 });
 
@@ -129,6 +137,45 @@ test("legacy untrusted SQLite views/virtual tables reject before target writes",
 	);
 	await expect(restore()).rejects.toThrow("validation or operation failed");
 	expect(target.prepare("SELECT id FROM projects").all()).toEqual([]);
+});
+
+test.each([
+	"parent_narrator_id",
+	"refs_inherited_from",
+	"acl_root_narrator_id",
+])("metadata-only %s closure independently requires every ancestor owner before publication", async (field) => {
+	const { source, archive, sync } = await fixture();
+	source.run(
+		"INSERT INTO narrators(id,type,owner_user_id) VALUES('ancestor','primary','alice'),('foreign','primary','bob')",
+	);
+	source.run(`UPDATE narrators SET ${field}='ancestor' WHERE id='bound'`);
+	source.run(`UPDATE narrators SET ${field}='foreign' WHERE id='ancestor'`);
+	const before = archive.serialize();
+	await expect(sync()).rejects.toMatchObject({
+		statusCode: 403,
+		code: "PROJECT_ARCHIVE_FORBIDDEN",
+	});
+	expect(archive.serialize()).toEqual(before);
+});
+
+test("authenticated admin can export another owner's full archive; claimed admin cannot", async () => {
+	const { source, archive, sync, sourcePath, archivePath } = await fixture();
+	source.run("UPDATE narrators SET owner_user_id='bob' WHERE id='bound'");
+	await expect(sync()).rejects.toMatchObject({ statusCode: 403 });
+	const request = {
+		databasePath: sourcePath,
+		archivePath,
+		backend: "sqlite" as const,
+		projectId: "p",
+		actor: { userId: "alice", isAdmin: true },
+		deadline: Date.now() + 10000,
+	};
+	await expect(exportLegacyProjectOnWorker(request)).rejects.toMatchObject({ statusCode: 403 });
+	source.run("UPDATE users SET role='admin' WHERE id='alice'");
+	await exportLegacyProjectOnWorker(request);
+	expect(archive.prepare("SELECT id FROM narrators WHERE id='bound'").get()).toEqual({
+		id: "bound",
+	});
 });
 
 test("real legacy clients propagate cancelled signals and expired deadlines without writes", async () => {

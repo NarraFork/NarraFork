@@ -1,7 +1,8 @@
 import type { Worker } from "node:worker_threads";
-import { NARRATOR_BACKUP_LIMITS as LIMITS } from "@shared/narrator-backup";
-import { startPrivateArchiveWorker } from "../narrator-backup/worker-client";
+import { AppError } from "../../lib/errors";
 import type { LegacySyncWorkerRequest } from "./legacy-sync-worker";
+import { PROJECT_ARCHIVE_LIMITS as LIMITS } from "./limits";
+import { startPrivateArchiveWorker } from "./worker-client";
 
 let workers = 0;
 /** Fixed queue cap; only narrow metadata crosses the thread boundary. */
@@ -35,7 +36,21 @@ export async function exportLegacyProjectOnWorker(
 			);
 			worker.once(
 				"message",
-				(message: { value?: { tables: Record<string, number> }; error?: string }) => {
+				(message: {
+					value?: { tables: Record<string, number> };
+					error?: string;
+					code?: string;
+				}) => {
+					if (message.code === "PROJECT_ARCHIVE_FORBIDDEN") {
+						reject(
+							new AppError(
+								"Project archive closure requires narrator owner/admin authority",
+								403,
+								"PROJECT_ARCHIVE_FORBIDDEN",
+							),
+						);
+						return;
+					}
 					if (message.error || !message.value)
 						reject(new Error("Project backup validation or operation failed"));
 					else resolve(message.value);

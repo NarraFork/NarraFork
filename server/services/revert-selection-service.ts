@@ -232,7 +232,7 @@ interface ScopeState {
 	inspectedBytes: number;
 	manifestBytes: number;
 	evidenceBytes: number;
-	declaredEvidenceBytes: number;
+	evidenceRefs: Map<string, { algorithm: string; sizeBytes: number }>;
 	result: RevertSelectionResult;
 	narrators: Map<string, NarratorRow>;
 	messages: Set<string>;
@@ -310,7 +310,7 @@ export class RevertSelectionService {
 			inspectedBytes: 0,
 			manifestBytes: 0,
 			evidenceBytes: 0,
-			declaredEvidenceBytes: 0,
+			evidenceRefs: new Map(),
 			narrators: new Map(),
 			messages: new Set(),
 			tools: new Set(),
@@ -1016,13 +1016,8 @@ export class RevertSelectionService {
 			FILE_CHANGE_LIMITS.operationEvidenceBytes,
 			"operation evidence bytes",
 		);
-		state.declaredEvidenceBytes += operation.evidenceBytes;
-		integer(
-			state.declaredEvidenceBytes,
-			0,
-			FILE_CHANGE_LIMITS.operationEvidenceBytes,
-			"selected operation evidence bytes",
-		);
+		// Declarations remain bounded per operation; shared historical aliases are
+		// accounted once by their immutable blob reference below.
 		let cursor: { fileKey: string; phase: string } | null = null;
 		let effectCount = 0;
 		for (;;) {
@@ -1067,7 +1062,12 @@ export class RevertSelectionService {
 					) !== JSON.stringify(Object.entries(effect.identity).sort())
 				)
 					this.issue(state, { code: "EFFECT_SCOPE_UNVERIFIED", operationId: operation.id });
-				for (const fileState of [effect.before, effect.intendedAfter, effect.observedAfter]) {
+				for (const fileState of [
+					effect.before,
+					effect.intendedAfter,
+					effect.observedAfter,
+					...(effect.executionReceipt ? [effect.executionReceipt.observedAfter] : []),
+				]) {
 					const ref =
 						fileState.kind === "regular"
 							? fileState.blob
@@ -1076,7 +1076,17 @@ export class RevertSelectionService {
 								: null;
 					if (ref) {
 						integer(ref.sizeBytes, 0, FILE_CHANGE_LIMITS.blobBytes, "raw ref bytes");
-						state.evidenceBytes += ref.sizeBytes;
+						const namespaceDigest = JSON.stringify([operation.sourceInstanceId, ref.digest]);
+						const prior = state.evidenceRefs.get(namespaceDigest);
+						if (prior && (prior.algorithm !== ref.algorithm || prior.sizeBytes !== ref.sizeBytes))
+							throw new RevertSelectionError("INVALID_INPUT", "Conflicting blob metadata");
+						if (!prior) {
+							state.evidenceRefs.set(namespaceDigest, {
+								algorithm: ref.algorithm,
+								sizeBytes: ref.sizeBytes,
+							});
+							state.evidenceBytes += ref.sizeBytes;
+						}
 					}
 				}
 				integer(
@@ -1116,7 +1126,7 @@ export class RevertSelectionService {
 			cursor = { fileKey: last.fileKey, phase: last.phase };
 			await this.pause(state);
 		}
-		if (effectCount === 0 && isNoDispatch(operation) && ["Write", "Edit"].includes(tool.toolName)) {
+		if (effectCount === 0 && isNoDispatch(operation)) {
 			this.add(state, state.result.noDiskTools, { toolCallId: tool.id, reason: "no_dispatch" });
 			return;
 		}
@@ -1278,7 +1288,10 @@ function isNoDispatch(op: RevertSelectionOperation) {
 		op.coverage === "complete" &&
 		op.effectOutcome === "no_change" &&
 		op.finishedAt !== null &&
-		((op.reason === "no_dispatch:validation_rejected" && op.executionOutcome === "failed") ||
+		(((op.reason === "no_dispatch:validation_rejected" ||
+			op.reason === "no_dispatch:invocation_rejected") &&
+			op.executionOutcome === "failed") ||
+			(op.reason === "no_dispatch:preview" && op.executionOutcome === "succeeded") ||
 			(op.reason === "no_dispatch:cancelled_before_dispatch" &&
 				op.executionOutcome === "interrupted"))
 	);

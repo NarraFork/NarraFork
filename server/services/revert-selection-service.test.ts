@@ -510,18 +510,50 @@ describe("complete mutation candidates, not just successful writes", () => {
 		});
 		expect(hasIssue(result, "EFFECT_UNRESOLVED")).toBe(true);
 	});
-	test("explicit fixed no-dispatch zero-effect terminal is distinct from a missing effect journal", async () => {
-		const t = tool(1);
+	for (const toolName of ["Write", "Edit", "StructSed"]) {
+		for (const [reason, outcome] of [
+			["validation_rejected", "failed"],
+			["invocation_rejected", "failed"],
+			["cancelled_before_dispatch", "interrupted"],
+			["preview", "succeeded"],
+		]) {
+			test(`${toolName} ${reason} accepts only a complete zero-effect terminal proof`, async () => {
+				const changed = tool(1, "Edit");
+				journal(changed);
+				const t = tool(2, toolName);
+				const op = journal(t, 0);
+				sqlite
+					.query(
+						"UPDATE file_change_operations SET evidence_bytes=0,execution_outcome=?,effect_outcome='no_change',attribution_grade='unknown',reason=? WHERE id=?",
+					)
+					.run(outcome, `no_dispatch:${reason}`, op);
+				sqlite
+					.query("UPDATE narrator_tool_calls SET status=? WHERE id=?")
+					.run(outcome === "succeeded" ? "success" : "fail", t.id);
+				const result = await collect();
+				expect(result.evidenceComplete).toBe(true);
+				expect(result.operations).toHaveLength(2);
+				expect(result.effects).toHaveLength(1);
+				expect(result.noDiskTools).toContainEqual({ toolCallId: t.id, reason: "no_dispatch" });
+				sqlite.query("UPDATE file_change_operations SET reason=NULL WHERE id=?").run(op);
+				expect(hasIssue(await collect(), "OPERATION_UNRESOLVED")).toBe(true);
+			});
+		}
+	}
+	test("preview labels cannot prove zero effects with a failed outcome or unsettled evidence", async () => {
+		const t = tool(1, "StructSed");
 		const op = journal(t, 0);
 		sqlite
 			.query(
-				"UPDATE file_change_operations SET evidence_bytes=0,execution_outcome='failed',effect_outcome='no_change',attribution_grade='unknown',reason='no_dispatch:validation_rejected' WHERE id=?",
+				"UPDATE file_change_operations SET evidence_bytes=0,execution_outcome='failed',effect_outcome='no_change',reason='no_dispatch:preview' WHERE id=?",
 			)
 			.run(op);
-		const result = await collect();
-		expect(result.evidenceComplete).toBe(true);
-		expect(result.noDiskTools).toContainEqual({ toolCallId: t.id, reason: "no_dispatch" });
-		sqlite.query("UPDATE file_change_operations SET reason=NULL WHERE id=?").run(op);
+		expect(hasIssue(await collect(), "OPERATION_UNRESOLVED")).toBe(true);
+		sqlite
+			.query(
+				"UPDATE file_change_operations SET execution_outcome='succeeded',coverage='partial' WHERE id=?",
+			)
+			.run(op);
 		expect(hasIssue(await collect(), "OPERATION_UNRESOLVED")).toBe(true);
 	});
 	test("sys/user leftover cards in a mixed from_seq window do not veto file coverage", async () => {
@@ -706,12 +738,45 @@ test("a receipt from another runtime generation is not the selected attempt's ev
 	expect(result.evidenceComplete).toBe(false);
 });
 
-test("the full selected operation budget is enforced, not 256MiB independently per operation", async () => {
+test("declarations are bounded per operation but repeated historical blobs consume unique bytes", async () => {
 	const first = journal(tool(1));
 	const second = journal(tool(2));
 	sqlite
 		.query("UPDATE file_change_operations SET evidence_bytes=? WHERE id IN (?,?)")
 		.run(160 * 1024 * 1024, first, second);
+	const result = await collect();
+	expect(result.evidenceComplete).toBe(true);
+	expect(result.effects).toHaveLength(2);
+	sqlite
+		.query("UPDATE file_change_operations SET evidence_bytes=? WHERE id=?")
+		.run(256 * 1024 * 1024 + 1, first);
+	await rejected(collect(), "BUDGET_EXCEEDED");
+});
+
+test("same namespace digest with conflicting size refuses rather than replacing metadata", async () => {
+	journal(tool(1));
+	const second = journal(tool(2));
+	sqlite
+		.query(
+			"UPDATE file_change_effects SET before_state_json=json_set(before_state_json,'$.blob.sizeBytes',4) WHERE operation_id=?",
+		)
+		.run(second);
+	await rejected(collect(), "INVALID_INPUT");
+});
+
+test("unique raw evidence across the whole selection retains the 256MiB ceiling", async () => {
+	journal(tool(1), 9);
+	const rows = sqlite
+		.query<{ id: string }, []>("SELECT id FROM file_change_effects ORDER BY id")
+		.all();
+	for (const [index, row] of rows.entries()) {
+		const digest = hash(`unique-${index}`);
+		sqlite
+			.query(
+				"UPDATE file_change_effects SET before_state_json=json_set(before_state_json,'$.blob.digest',?,'$.blob.sizeBytes',?),before_blob_digest=? WHERE id=?",
+			)
+			.run(digest, 32 * 1024 * 1024, digest, row.id);
+	}
 	await rejected(collect(), "BUDGET_EXCEEDED");
 });
 

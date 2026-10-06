@@ -144,6 +144,14 @@ interface AskUserQuestionBannerProps {
 	 * to decide for itself and moves on permanently.
 	 */
 	denyLabel?: string;
+	/**
+	 * Close an ASYNCHRONOUS question without telling the narrator anything — offered
+	 * only where the question is async (the prop is the gate), because a blocking prompt
+	 * has no such state to close silently.
+	 */
+	onIgnore?: (requestId: string) => void;
+	/** Label for the ignore action; only used when `onIgnore` is set. */
+	ignoreLabel?: string;
 	/** Show the submit/decline buttons as busy while a request is in flight. */
 	busy?: boolean;
 	/**
@@ -166,6 +174,8 @@ export function AskUserQuestionBanner({
 	onDeny,
 	onReflect,
 	denyLabel,
+	onIgnore,
+	ignoreLabel,
 	busy,
 	onDefer,
 }: AskUserQuestionBannerProps) {
@@ -538,6 +548,23 @@ export function AskUserQuestionBanner({
 							>
 								{denyLabel ?? t("skipQuestion")}
 							</Button>
+							{/* Ignore also discards the draft: the user has decided the question
+							    will never be answered, so keeping it would be stale data loss in
+							    reverse. Unlike deny, NOTHING is sent to the narrator. */}
+							{onIgnore && (
+								<Button
+									size="xs"
+									variant="subtle"
+									color="gray"
+									disabled={busy}
+									onClick={() => {
+										removeSession("ask-draft", draftKey);
+										onIgnore(requestId);
+									}}
+								>
+									{ignoreLabel ?? t("asyncQuestionIgnore")}
+								</Button>
+							)}
 						</Group>
 					)}
 				</Stack>

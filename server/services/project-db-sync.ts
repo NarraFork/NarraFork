@@ -48,7 +48,6 @@
 import type { Database } from "bun:sqlite";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { NARRATOR_BACKUP_LIMITS } from "@shared/narrator-backup";
 import { and, eq, gt } from "drizzle-orm";
 import { activeDatabaseBackend, db } from "../db";
 import { getDbPath } from "../db/connection";
@@ -63,7 +62,7 @@ import type { NarraForkEvent } from "../lib/event-bus";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { projectDbManager } from "../lib/project-db";
-import type { BackupActor } from "./narrator-backup/contract";
+import type { ArchiveActor } from "./project-archive/access";
 import {
 	copyTable,
 	distinctIds,
@@ -74,6 +73,7 @@ import {
 	replaceTables,
 } from "./project-archive/export-rows";
 import { exportLegacyProjectOnWorker } from "./project-archive/legacy-sync-job";
+import { PROJECT_ARCHIVE_LIMITS } from "./project-archive/limits";
 import type { ArchiveTable } from "./project-archive/manifest";
 import { projectArchiveMainStore as mainStore } from "./project-archive/store";
 import { createNarratorSyncScheduler } from "./project-db-sync-scheduler";
@@ -530,7 +530,7 @@ async function deleteChapterFromProjectDb(chapterId: string, projectId: string):
 export interface FullSyncOptions {
 	readonly signal?: AbortSignal;
 	/** Public/full exports revalidate the authenticated closure in the worker snapshot. */
-	readonly actor?: BackupActor;
+	readonly actor?: ArchiveActor;
 	/** Isolated contract tests may use the injected inline main-store port. */
 	readonly worker?: boolean;
 	/** Relative budget in ms, converted to an absolute deadline once, at entry. */
@@ -558,7 +558,7 @@ export async function fullSync(
 				actor: options.actor,
 				deadline:
 					Date.now() +
-					Math.min(options.timeoutMs ?? NARRATOR_BACKUP_LIMITS.jobMs, NARRATOR_BACKUP_LIMITS.jobMs),
+					Math.min(options.timeoutMs ?? PROJECT_ARCHIVE_LIMITS.jobMs, PROJECT_ARCHIVE_LIMITS.jobMs),
 			},
 			options.signal,
 		);

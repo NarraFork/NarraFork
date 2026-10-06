@@ -3,11 +3,11 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { NARRATOR_BACKUP_LIMITS } from "@shared/narrator-backup";
 import { getTestDb } from "../../../../tests/setup";
 import { openDatabase } from "../../../db/connection";
 import { importLegacyProjectOnWorker } from "../legacy-import-job";
 import { exportLegacyProjectOnWorker } from "../legacy-sync-job";
+import { PROJECT_ARCHIVE_LIMITS } from "../limits";
 import { ARCHIVE_COLUMNS, ARCHIVE_TABLE_ORDER } from "../manifest";
 
 // SQLite production migrations/defaults/FKs, not a PostgreSQL mock or live PG claim.
@@ -176,7 +176,10 @@ test("current variant subagent identity requires its actual ACL root, not a clai
 	});
 	message(source, "private-child-message", "variant-child");
 	const before = archive.serialize();
-	await expect(sync()).rejects.toThrow("validation or operation failed");
+	await expect(sync()).rejects.toMatchObject({
+		statusCode: 403,
+		code: "PROJECT_ARCHIVE_FORBIDDEN",
+	});
 	expect(archive.serialize()).toEqual(before);
 });
 
@@ -194,7 +197,7 @@ test("lazy cycles and oversized production rows are bounded and leave the archiv
 	message(source, "huge", "root");
 	source
 		.prepare("UPDATE narrator_messages SET content_json=? WHERE id='huge'")
-		.run(JSON.stringify([{ type: "text", text: "x".repeat(NARRATOR_BACKUP_LIMITS.rowBytes) }]));
+		.run(JSON.stringify([{ type: "text", text: "x".repeat(PROJECT_ARCHIVE_LIMITS.rowBytes) }]));
 	await expect(sync()).rejects.toThrow("validation or operation failed");
 	expect(archive.serialize()).toEqual(before);
 });

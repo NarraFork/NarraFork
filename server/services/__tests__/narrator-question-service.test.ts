@@ -55,6 +55,9 @@ interface RecordedInjection {
 let injections: RecordedInjection[] = [];
 let deliveryError: Error | null = null;
 let broadcasts: { type: string; change?: string }[] = [];
+// Counts `scheduleQuestionAnswerDelivery` calls: the wake-an-idle-loop path an ignore
+// must provably never take.
+let scheduledDeliveries = 0;
 // Attention intents raised / cleared while a question is awaited. Recorded rather than
 // asserted through the real event bus so the test does not depend on notification
 // consumers being registered.
@@ -74,6 +77,7 @@ const {
 	retryQuestionAnswerDelivery,
 	notifyQuestionHistoryChanged,
 	dismissAsyncQuestion,
+	ignoreAsyncQuestion,
 	getAsyncQuestion,
 	isAsyncQuestionAwaited,
 	listAsyncQuestions,
@@ -130,7 +134,10 @@ const previousScheduler = setInjectionScheduler({
 });
 setQuestionServiceSeam({
 	isLoopRunning: () => loopRunning,
-	scheduleQuestionAnswerDelivery: async () => ({ ready: true, started: false }),
+	scheduleQuestionAnswerDelivery: async () => {
+		scheduledDeliveries += 1;
+		return { ready: true, started: false };
+	},
 	deliverInjection: async (narratorId, options) => {
 		injections.push({
 			narratorId,
@@ -554,6 +561,7 @@ beforeEach(async () => {
 	injections = [];
 	broadcasts = [];
 	attentions = [];
+	scheduledDeliveries = 0;
 	deliveryError = null;
 	loopRunning = false;
 	cleanDb(sqlite);
@@ -1028,6 +1036,75 @@ describe("withdrawAsyncQuestions", () => {
 			withdrawn: [],
 			skipped: [],
 		});
+	});
+});
+
+describe("ignoreAsyncQuestion", () => {
+	test("closes the question without delivering a message or scheduling a wake", async () => {
+		const { toolCallId, toolUseId } = await seedToolCall();
+		const { record } = await createAsyncQuestion({
+			narratorId: NARRATOR_ID,
+			toolCallId,
+			toolUseId,
+			questions: QUESTIONS,
+		});
+		broadcasts = [];
+
+		const result = await ignoreAsyncQuestion(record.id, { userId: "user-1", locale: "en" });
+
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.record.status).toBe("withdrawn");
+		expect(result.record.decidedBy).toBe("user-1");
+		expect(result.record.withdrawReason).toContain("Ignored by the user");
+		// The whole point of the action: the narrator learns nothing and is not woken.
+		expect(injections).toHaveLength(0);
+		expect(scheduledDeliveries).toBe(0);
+		expect(result.record.answerMessageId).toBeNull();
+		// ...but the inbox still hears about it, so the question disappears from the UI.
+		expect(broadcasts).toEqual([
+			expect.objectContaining({ type: "async_question_changed", change: "withdrawn" }),
+		]);
+		expect(await countOpenAsyncQuestions(NARRATOR_ID)).toBe(0);
+	});
+
+	test("a blocked Await is released as withdrawn, not left parked", async () => {
+		const { toolCallId, toolUseId } = await seedToolCall();
+		const { record } = await createAsyncQuestion({
+			narratorId: NARRATOR_ID,
+			toolCallId,
+			toolUseId,
+			questions: QUESTIONS,
+		});
+
+		const wait = awaitAsyncQuestion({
+			questionId: record.id,
+			narratorId: NARRATOR_ID,
+			timeoutMs: 60_000,
+		});
+		// Let the wait register its listener before the decision lands.
+		await new Promise((resolve) => setImmediate(resolve));
+		await ignoreAsyncQuestion(record.id, { userId: "user-1" });
+
+		const awaited = await wait;
+		expect(awaited.status).toBe("withdrawn");
+		// Releasing an already-running waiter is not a wake.
+		expect(injections).toHaveLength(0);
+		expect(scheduledDeliveries).toBe(0);
+	});
+
+	test("ignoring twice reports the second attempt as stale; an unknown id is not found", async () => {
+		const { toolCallId, toolUseId } = await seedToolCall();
+		const { record } = await createAsyncQuestion({
+			narratorId: NARRATOR_ID,
+			toolCallId,
+			toolUseId,
+			questions: QUESTIONS,
+		});
+
+		expect((await ignoreAsyncQuestion(record.id)).ok).toBe(true);
+		expect(await ignoreAsyncQuestion(record.id)).toEqual({ ok: false, reason: "stale" });
+		expect(await ignoreAsyncQuestion("ghost-id")).toEqual({ ok: false, reason: "not_found" });
 	});
 });
 

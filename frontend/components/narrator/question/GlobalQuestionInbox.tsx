@@ -1005,6 +1005,10 @@ function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
 							)
 						}
 						onDeny={() => void run(() => api.dismissAsyncQuestion(item.narratorId, item.requestId))}
+						onIgnore={() =>
+							void run(() => api.ignoreAsyncQuestion(item.narratorId, item.requestId))
+						}
+						ignoreLabel={t("asyncQuestionIgnore")}
 					/>
 				) : permission?.toolName === "AskUserQuestion" ? (
 					<AskUserQuestionBanner

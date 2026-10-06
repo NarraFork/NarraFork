@@ -4,7 +4,11 @@ import {
 	fileChangeDiagnosticSuffix,
 } from "../../../services/file-change-diagnostics";
 import { LocalFileValidationError } from "../../../services/file-change-local-io";
-import { executeLocalFileChange } from "../../../services/file-change-runtime";
+import {
+	executeLocalFileChange,
+	FileNoDispatchEvidenceError,
+	withFileToolNoDispatch,
+} from "../../../services/file-change-runtime";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
 import { broadcastSpecChanged } from "../../../services/spec-broadcast";
 import { specVfsService } from "../../../services/spec-vfs-service";
@@ -506,7 +510,7 @@ export const editTool: ToolDefinition = {
 			.optional()
 			.describe("Replace all occurrences of old_string (default false)"),
 	}),
-	async execute(args, ctx): Promise<ToolResult> {
+	execute: withFileToolNoDispatch("Edit", async (args, ctx, flow): Promise<ToolResult> => {
 		const specError = toolSpecPathError("Edit", args);
 		if (specError) return { output: specError, isError: true };
 		const { file_path, old_string, new_string, replace_all } = args as {
@@ -541,6 +545,7 @@ export const editTool: ToolDefinition = {
 				const allowFenceMutation = isBehaviorFencePath(file_path)
 					? consumeBehaviorFenceEditGrant(ctx.narratorId)
 					: false;
+				flow.writing();
 				const written = await specVfsService.writeSpecFile(
 					ctx.narratorId,
 					file_path,
@@ -587,6 +592,7 @@ export const editTool: ToolDefinition = {
 					},
 				};
 			} catch (err) {
+				if (err instanceof FileNoDispatchEvidenceError) throw err;
 				rethrowConfirmedToolDiskError(err, ctx, true);
 				return {
 					output: `Error editing ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
@@ -603,6 +609,7 @@ export const editTool: ToolDefinition = {
 		const ioPath = canonicalPath ?? resolvedPath;
 
 		try {
+			flow.writing();
 			const recorded = await executeLocalFileChange({
 				ctx,
 				backend,
@@ -668,6 +675,8 @@ export const editTool: ToolDefinition = {
 				await trackFileChange(ctx, ioPath, "edit", backend, null, { evidenceRecorded: true });
 				return recorded;
 			}
+			// An explicit runtime decline guarantees that no local IO was performed.
+			flow.declined();
 			// Legacy/remote compatibility only; it never creates v2 evidence.
 			// Guard: identical strings
 			if (old_string === new_string) {
@@ -719,6 +728,7 @@ export const editTool: ToolDefinition = {
 				// model wrote, which is what detecting on `new_string` amounts to.
 				if (old_string === "") {
 					const overwriteEnding = detectLineEnding(existingBytes ? decoded.text : new_string);
+					flow.writing();
 					await backend.writeFileBytes(
 						resolvedPath,
 						encodeFileBytes(
@@ -757,6 +767,7 @@ export const editTool: ToolDefinition = {
 				const normalizedNew = normalizeLineEndings(new_string);
 
 				const result = replace(content, normalizedOld, normalizedNew, replace_all);
+				flow.writing();
 				await backend.writeFileBytes(
 					resolvedPath,
 					encodeFileBytes(applyLineEnding(result.content, lineEnding), encoding),
@@ -787,6 +798,7 @@ export const editTool: ToolDefinition = {
 				};
 			});
 		} catch (err) {
+			if (err instanceof FileNoDispatchEvidenceError) throw err;
 			rethrowConfirmedToolDiskError(err, ctx, true);
 			return {
 				output:
@@ -797,5 +809,5 @@ export const editTool: ToolDefinition = {
 				metadata: fileChangeDiagnosticMetadata(err),
 			};
 		}
-	},
+	}),
 };

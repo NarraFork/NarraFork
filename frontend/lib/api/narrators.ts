@@ -1157,6 +1157,11 @@ export const narratorsApi = {
 			`/narrators/${narratorId}/questions/${questionId}/dismiss`,
 			{ method: "POST" },
 		),
+	ignoreAsyncQuestion: (narratorId: string, questionId: string) =>
+		request<{ ok: boolean; question: AsyncQuestion }>(
+			`/narrators/${narratorId}/questions/${questionId}/ignore`,
+			{ method: "POST" },
+		),
 	approvePermission: (requestId: string, payload?: PermissionDecisionPayload) =>
 		request<ApiEntity>(`/narrators/permissions/${requestId}/approve`, {
 			method: "POST",

@@ -1,15 +1,14 @@
 import type { SQL } from "bun";
-import type { ArchiveRow, ArchiveValue } from "../project-archive/main-store";
-import { quoteBackupIdentifier } from "./contract";
-import { type BackupSqlConnection, SqlNarratorBackupMainStore } from "./main-store";
+import type { ArchiveRow, ArchiveValue } from "./main-store";
+import { type ArchiveSqlConnection, quoteArchiveIdentifier } from "./worker-store";
 
 /** Genuine asynchronous PG statements, including a repeatable-read source snapshot. */
-export function postgresBackupConnection(
+export function postgresArchiveConnection(
 	client: Pick<SQL, "unsafe" | "begin">,
-): BackupSqlConnection {
-	const connection: BackupSqlConnection = {
+): ArchiveSqlConnection {
+	const connection: ArchiveSqlConnection = {
 		byteLength(column) {
-			return `coalesce(octet_length(${quoteBackupIdentifier(column)}::text),0)`;
+			return `coalesce(octet_length(${quoteArchiveIdentifier(column)}::text),0)`;
 		},
 		async query(text: string, values: ArchiveValue[] = []) {
 			const rows = await client.unsafe(text, values);
@@ -44,12 +43,9 @@ export function postgresBackupConnection(
 				);
 				await tx.unsafe("SET LOCAL lock_timeout='250ms'");
 				await tx.unsafe("SET LOCAL statement_timeout='60s'");
-				return action(postgresBackupConnection(tx));
+				return action(postgresArchiveConnection(tx));
 			});
 		},
 	};
 	return connection;
-}
-export function createPostgresNarratorBackupMainStore(client: Pick<SQL, "unsafe" | "begin">) {
-	return new SqlNarratorBackupMainStore(postgresBackupConnection(client));
 }

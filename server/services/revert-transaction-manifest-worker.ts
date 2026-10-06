@@ -365,17 +365,27 @@ function validate(
 	const bySequence = new Map(input.files.map((file) => [file.sequence, file]));
 	check(bySequence.size === input.files.length, "DUPLICATE_SEQUENCE");
 	const refs = new Map<string, FileChangeBlobRef>();
-	let evidenceBytes = input.raw.reduce((sum, raw) => sum + raw.ref.sizeBytes, 0);
+	const evidenceRefs = new Map<string, FileChangeBlobRef>();
+	let evidenceBytes = 0;
+	// All objects are read from the plan's fixed, verified physical namespace.
+	const chargeRef = (ref: FileChangeBlobRef) => {
+		const old = evidenceRefs.get(ref.digest);
+		check(
+			!old || (old.algorithm === ref.algorithm && old.sizeBytes === ref.sizeBytes),
+			"REF_CONFLICT",
+		);
+		if (old) return;
+		evidenceRefs.set(ref.digest, ref);
+		evidenceBytes += ref.sizeBytes;
+		integer(evidenceBytes, LIMIT.operationEvidenceBytes);
+	};
+	for (const raw of input.raw) chargeRef(raw.ref);
 	const chargeState = (state: FileChangeState) => {
 		stateValid(state);
 		if (state.kind !== "regular") return;
-		const old = refs.get(state.blob.digest);
-		check(!old || old.sizeBytes === state.blob.sizeBytes, "REF_CONFLICT");
+		chargeRef(state.blob);
 		refs.set(state.blob.digest, state.blob);
-		evidenceBytes += state.blob.sizeBytes;
-		integer(evidenceBytes, LIMIT.operationEvidenceBytes);
 	};
-	const manifestBytes = evidenceBytes;
 	const effects = new Map<string, RevertSelectionResult["effects"][number]>();
 	for (const effect of selection.effects as RevertSelectionResult["effects"]) {
 		check(!effects.has(effect.id), "DUPLICATE_EFFECT");
@@ -388,14 +398,8 @@ function validate(
 		])
 			chargeState(state);
 	}
-	let declaredBytes = 0;
-	for (const operation of selection.operations as RevertSelectionResult["operations"]) {
+	for (const operation of selection.operations as RevertSelectionResult["operations"])
 		integer(operation.evidenceBytes, LIMIT.operationEvidenceBytes);
-		declaredBytes += operation.evidenceBytes;
-		integer(declaredBytes, LIMIT.operationEvidenceBytes);
-	}
-	evidenceBytes += Math.max(0, declaredBytes - (evidenceBytes - manifestBytes));
-	integer(evidenceBytes, LIMIT.operationEvidenceBytes);
 	const usedEffects = new Set<string>();
 	const files: TransactionManifestFile[] = manifest.files.map(
 		(

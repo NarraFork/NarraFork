@@ -3138,6 +3138,9 @@ const sqliteNarratorPersistence = {
 					eq(narratorToolCalls.id, binding.toolCallId),
 					eq(narratorToolCalls.executionAttempt, binding.attempt),
 					isNull(narratorToolCalls.executionStartedAt),
+					// A sealed no-dispatch attempt is never executable, even if a legacy
+					// caller resets its visible status without allocating a fresh attempt.
+					isNull(narratorToolCalls.fileChangeOperationId),
 					inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
 				),
 			)

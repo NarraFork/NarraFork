@@ -315,6 +315,7 @@ import {
 	countOpenAsyncQuestions,
 	dismissAsyncQuestion,
 	getBoundedQuestionDetail,
+	ignoreAsyncQuestion,
 	listAllOpenAsyncQuestionsForPrincipal,
 	listAsyncQuestions,
 	listQuestionSummaries,
@@ -5858,6 +5859,34 @@ narratorRoutes.post("/:id/questions/:questionId/dismiss", async (c) => {
 
 	const locale = (await getUserLanguage(userId)) as Locale;
 	const result = await dismissAsyncQuestion(questionId, { userId, locale });
+	if (!result.ok) {
+		return c.json(
+			{ error: result.reason === "stale" ? "Question already decided" : "Question not found" },
+			result.reason === "stale" ? 409 : 404,
+		);
+	}
+	return c.json({ ok: true, question: result.record });
+});
+
+// Close the question WITHOUT notifying the narrator — see ignoreAsyncQuestion for why
+// this is a separate action from dismiss rather than a flag on it.
+narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
+	const narratorId = c.req.param("id");
+	const questionId = c.req.param("questionId");
+	const userId = c.get("user").sub;
+
+	const existing = db
+		.select({ narratorId: narratorQuestions.narratorId })
+		.from(narratorQuestions)
+		.where(eq(narratorQuestions.id, questionId))
+		.limit(1)
+		.get();
+	if (!existing || existing.narratorId !== narratorId) {
+		return c.json({ error: "Question not found" }, 404);
+	}
+
+	const locale = (await getUserLanguage(userId)) as Locale;
+	const result = await ignoreAsyncQuestion(questionId, { userId, locale });
 	if (!result.ok) {
 		return c.json(
 			{ error: result.reason === "stale" ? "Question already decided" : "Question not found" },

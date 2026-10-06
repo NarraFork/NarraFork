@@ -2,6 +2,7 @@ import {
 	useAnswerAsyncQuestion,
 	useAsyncQuestions,
 	useDismissAsyncQuestion,
+	useIgnoreAsyncQuestion,
 	useOlderAsyncQuestions,
 } from "@frontend/hooks/useAsyncQuestions";
 import { useEffect, useMemo, useState } from "react";
@@ -21,6 +22,7 @@ export function useNarratorAsyncQuestionSlots(
 	// Mutation result objects change on every render; only mutate is stable.
 	const { mutateAsync: answerAsyncQuestion } = useAnswerAsyncQuestion(narratorId);
 	const { mutate: dismissAsyncQuestion } = useDismissAsyncQuestion(narratorId);
+	const { mutate: ignoreAsyncQuestion } = useIgnoreAsyncQuestion(narratorId);
 	const [busyAsyncQuestionId, setBusyAsyncQuestionId] = useState<string | null>(null);
 	const older = useOlderAsyncQuestions(narratorId, data?.nextCursor, enabled);
 	const { fetchNextPage, hasNextPage, isFetching, isError } = older;
@@ -59,6 +61,10 @@ export function useNarratorAsyncQuestionSlots(
 					setBusyAsyncQuestionId(questionId);
 					dismissAsyncQuestion({ questionId }, { onSettled: () => setBusyAsyncQuestionId(null) });
 				},
+				onIgnore: (questionId) => {
+					setBusyAsyncQuestionId(questionId);
+					ignoreAsyncQuestion({ questionId }, { onSettled: () => setBusyAsyncQuestionId(null) });
+				},
 			});
 		}
 		return map;
@@ -67,6 +73,7 @@ export function useNarratorAsyncQuestionSlots(
 		busyAsyncQuestionId,
 		answerAsyncQuestion,
 		dismissAsyncQuestion,
+		ignoreAsyncQuestion,
 		t,
 		readOnly,
 	]);

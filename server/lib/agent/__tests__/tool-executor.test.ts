@@ -115,6 +115,10 @@ function makeConfig(permissionHandler: AgentConfig["permissionHandler"]): AgentC
 			}
 		})(),
 		onToolExecutionStarting: async (_toolUseId, binding) => binding,
+		// This unit fixture owns no real narrator/tool rows. Production authorization and
+		// no-dispatch CAS are tested against real rows in file-change-runtime.test.ts.
+		onToolExecutionFinalAuthorization: async () => ({ assertStillCurrent() {} }),
+		recordToolNoDispatch: async () => {},
 	};
 }
 
@@ -1306,6 +1310,8 @@ describe("executeTool execution target freeze", () => {
 				order.push("permission:decide");
 				return { behavior: "deny" };
 			}),
+			// Routing-order fixture has no durable row to persist permission-resolved input.
+			requireToolCallBinding: false,
 			defaultDeviceId: remoteBackend.deviceId,
 			availableDevices: [availableRemote],
 			onExecutionTargetResolved: async (_toolUseId, target) => {

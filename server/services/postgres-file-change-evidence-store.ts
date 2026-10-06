@@ -662,7 +662,12 @@ export class PostgresFileChangeEvidenceStore {
 	): Promise<FileChangeOperationRecord> {
 		if (
 			proof.targetDispatched !== false ||
-			!["validation_rejected", "cancelled_before_dispatch"].includes(proof.reason) ||
+			![
+				"validation_rejected",
+				"cancelled_before_dispatch",
+				"preview",
+				"invocation_rejected",
+			].includes(proof.reason) ||
 			input.sourceKind !== "tool" ||
 			!input.toolCallId ||
 			input.sourceId !== input.toolCallId ||
@@ -681,7 +686,9 @@ export class PostgresFileChangeEvidenceStore {
 			executionOutcome:
 				proof.reason === "cancelled_before_dispatch"
 					? ("interrupted" as const)
-					: ("failed" as const),
+					: proof.reason === "preview"
+						? ("succeeded" as const)
+						: ("failed" as const),
 			effectOutcome: "no_change" as const,
 			settlement: "settled" as const,
 			coverage: "complete" as const,
@@ -694,7 +701,9 @@ export class PostgresFileChangeEvidenceStore {
 		};
 		return withPgRetry(
 			() =>
-				this.database.transaction((tx) => this.beginNoDispatchSection(tx, input, values, terminal)),
+				this.database.transaction((tx) =>
+					this.beginNoDispatchSection(tx, input, proof, values, terminal),
+				),
 			{ label: "evidence.beginNoDispatchOperation" },
 		);
 	}
@@ -702,9 +711,10 @@ export class PostgresFileChangeEvidenceStore {
 	private async beginNoDispatchSection(
 		tx: Tx,
 		input: BeginFileChangeOperation,
+		proof: FileChangeNoDispatchProof,
 		values: ReturnType<typeof E.normalizeOperation>,
 		terminal: {
-			executionOutcome: "interrupted" | "failed";
+			executionOutcome: "interrupted" | "failed" | "succeeded";
 			effectOutcome: "no_change";
 			settlement: "settled";
 			coverage: "complete";
@@ -730,10 +740,15 @@ export class PostgresFileChangeEvidenceStore {
 				startedAt: narratorToolCalls.executionStartedAt,
 				deviceId: narratorToolCalls.executionDeviceId,
 				generation: narratorToolCalls.runtimeGeneration,
+				cwd: narratorToolCalls.executionCwd,
+				pathFlavor: narratorToolCalls.executionPathFlavor,
+				lexicalPath: narratorToolCalls.resolvedFilePath,
+				canonicalPath: narratorToolCalls.canonicalFilePath,
 				operationId: narratorToolCalls.fileChangeOperationId,
 			})
 			.from(narratorToolCalls)
-			.where(eq(narratorToolCalls.id, values.sourceId));
+			.where(eq(narratorToolCalls.id, values.sourceId))
+			.for("update");
 		const tool = toolRows[0];
 		if (
 			!tool ||
@@ -743,9 +758,14 @@ export class PostgresFileChangeEvidenceStore {
 			tool.attempt !== values.attempt ||
 			tool.narratorId !== values.narratorId ||
 			tool.toolUseId !== values.toolUseId ||
-			!["Write", "Edit"].includes(tool.toolName) ||
+			!["Write", "Edit", "StructSed"].includes(tool.toolName) ||
 			tool.deviceId !== input.executionBinding.deviceId ||
-			tool.generation !== input.executionBinding.runtimeGeneration
+			tool.generation !== input.executionBinding.runtimeGeneration ||
+			(proof.frozenTarget !== undefined &&
+				(tool.cwd !== proof.frozenTarget.cwd ||
+					tool.pathFlavor !== proof.frozenTarget.pathFlavor ||
+					tool.lexicalPath !== (proof.frozenTarget.lexicalPath ?? null) ||
+					tool.canonicalPath !== (proof.frozenTarget.canonicalPath ?? null)))
 		) {
 			throw E.fail(
 				"IDENTITY_CONFLICT",
@@ -781,10 +801,26 @@ export class PostgresFileChangeEvidenceStore {
 			}
 			return existing;
 		}
-		if (tool.operationId !== null || tool.status !== "running" || tool.startedAt === null) {
+		const beforeInvocation = proof.beforeInvocation;
+		const unclaimed = beforeInvocation !== undefined;
+		if (
+			tool.operationId !== null ||
+			(unclaimed
+				? !proof.frozenTarget ||
+					!["invocation_rejected", "cancelled_before_dispatch"].includes(proof.reason) ||
+					(!["initializing", "pending", "running"].includes(beforeInvocation.status) &&
+						!(
+							beforeInvocation.status === "fail" &&
+							["initializing", "pending", "running"].includes(beforeInvocation.observedStatus ?? "")
+						)) ||
+					beforeInvocation.executionStartedAt !== null ||
+					tool.status !== beforeInvocation.status ||
+					tool.startedAt !== null
+				: tool.status !== "running" || tool.startedAt === null)
+		) {
 			throw E.fail(
 				"INVALID_TRANSITION",
-				"No-dispatch evidence must be recorded by the live claimed tool attempt",
+				"No-dispatch evidence requires the exact live allocated or claimed attempt",
 			);
 		}
 		const timestamp = this.now();
@@ -802,11 +838,20 @@ export class PostgresFileChangeEvidenceStore {
 		if (!recorded) throw E.fail("JOURNAL_UNAVAILABLE", "Operation insert returned no row");
 		const linked = await tx
 			.update(narratorToolCalls)
-			.set({ fileChangeOperationId: recorded.id })
+			.set({
+				fileChangeOperationId: recorded.id,
+				...(unclaimed ? { status: "fail" as const } : {}),
+			})
 			.where(
 				and(
 					eq(narratorToolCalls.id, tool.id),
 					eq(narratorToolCalls.executionAttempt, values.attempt),
+					eq(narratorToolCalls.status, tool.status),
+					tool.startedAt === null
+						? isNull(narratorToolCalls.executionStartedAt)
+						: eq(narratorToolCalls.executionStartedAt, tool.startedAt),
+					eq(narratorToolCalls.executionDeviceId, input.executionBinding.deviceId),
+					eq(narratorToolCalls.runtimeGeneration, input.executionBinding.runtimeGeneration),
 					isNull(narratorToolCalls.fileChangeOperationId),
 				),
 			)

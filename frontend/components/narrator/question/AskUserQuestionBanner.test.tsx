@@ -736,6 +736,41 @@ describe("AskUserQuestion draft identity", () => {
 		expect(readSession("ask-draft", deferredQuestion.toolCallId)).toBeNull();
 	});
 
+	test("the ignore action renders only when offered and clears the draft without denying", async () => {
+		writeSession("ask-draft", deferredQuestion.toolCallId, draft);
+		const ignored: string[] = [];
+		const denied: string[] = [];
+		await render(
+			<AskUserQuestionBanner
+				requestId={deferredQuestion.id}
+				draftId={deferredQuestion.toolCallId}
+				questions={questions}
+				onDeny={(id) => denied.push(id)}
+				onIgnore={(id) => ignored.push(id)}
+				ignoreLabel="Ignore it"
+			/>,
+		);
+		expect(document.querySelector("textarea")?.value).toBe("Keep this unfinished answer");
+		await act(async () => button("Ignore it").click());
+		expect(ignored).toEqual([deferredQuestion.id]);
+		expect(denied).toEqual([]);
+		expect(readSession("ask-draft", deferredQuestion.toolCallId)).toBeNull();
+
+		// Without onIgnore there is no ignore affordance — blocking prompts keep deny only.
+		await render(
+			<AskUserQuestionBanner
+				requestId={deferredQuestion.id}
+				questions={questions}
+				onDeny={() => {}}
+			/>,
+		);
+		expect(
+			[...document.querySelectorAll("button")].some((item) =>
+				item.textContent?.includes("Ignore it"),
+			),
+		).toBe(false);
+	});
+
 	test("restores multi-select checkboxes as well as free-form text", async () => {
 		writeSession(
 			"ask-draft",

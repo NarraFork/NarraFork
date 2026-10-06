@@ -909,6 +909,62 @@ describe("stable inputs and actual private IO lifetime", () => {
 });
 
 describe("bounded admission and cancellation", () => {
+	test("many historical aliases consume one immutable blob, not expanded bytes", async () => {
+		const state = await regular("x".repeat(128 * 1024));
+		let reads = 0;
+		const result = success(
+			await calculator({
+				maxProcessedBytes: state.blob.sizeBytes,
+				readBlob: (ref, options) => {
+					reads++;
+					return store.readBytes(ref, options);
+				},
+			}).calculate({
+				identity,
+				current: state,
+				effects: Array.from({ length: 1100 }, () => effect(state, state)),
+			}),
+		);
+		expect(result.evidenceBytes).toBe(state.blob.sizeBytes);
+		expect(result.intermediateBytes).toBe(0);
+		expect(reads).toBe(1);
+		expect(publishes).toBe(0);
+	});
+
+	test("merge rereads charge processing before IO and publish no prefix", async () => {
+		const before = await regular(text());
+		const after = await regular(text("agent-a"));
+		const current = await regular(text("agent-a", "human"));
+		let reads = 0;
+		const inputBytes = before.blob.sizeBytes + after.blob.sizeBytes + current.blob.sizeBytes;
+		const result = await calculator({
+			maxProcessedBytes: inputBytes,
+			readBlob: (ref, options) => {
+				reads++;
+				return store.readBytes(ref, options);
+			},
+		}).calculate({ identity, current, effects: [effect(before, after)] });
+		expect(result).toMatchObject({ ok: false, reason: "budget_exceeded" });
+		expect(reads).toBe(3);
+		expect(publishes).toBe(0);
+	});
+
+	test("same digest with conflicting algorithm refuses before IO", async () => {
+		const state = await regular("bytes");
+		let reads = 0;
+		const invalid = {
+			...state,
+			blob: { ...state.blob, algorithm: "sha512" },
+		} as unknown as FileChangeState;
+		const result = await calculator({
+			readBlob: async () => {
+				reads++;
+				throw new Error("no IO");
+			},
+		}).calculate({ identity, current: invalid, effects: [effect(state, state)] });
+		expect(result.ok).toBe(false);
+		expect(reads).toBe(0);
+	});
 	test("effect count, single-blob size and total evidence budgets reject before reads", async () => {
 		const f = await chain();
 		let reads = 0;

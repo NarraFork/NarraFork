@@ -532,6 +532,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/project-archive/archive-writer.ts": ["driver", "pragma", "insertOr"],
 	"server/services/project-archive/export-rows.ts": ["driver"],
 	"server/services/project-archive/sqlite-main-store.ts": ["insertOr"],
+	"server/services/project-archive/worker-sqlite-store.ts": ["driver", "pragma"],
 	// `insertOr` left for `project-archive/archive-writer.ts`; the export's own SQLite reads and
 	// PRAGMA work on the portable file stay.
 	"server/services/project-db-sync.ts": ["driver", "pragma", "json1"],

@@ -2,9 +2,8 @@ import type { EventEmitter } from "node:events";
 import { Worker } from "node:worker_threads";
 import { hotSafe } from "@server/lib/hot-safe";
 import { isCompiledRuntime } from "@server/lib/runtime-target";
-export type PrivateArchiveWorkerKind = "backup" | "legacy-sync" | "legacy-import";
+export type PrivateArchiveWorkerKind = "legacy-sync" | "legacy-import";
 const paths = {
-	backup: "narrator-backup/worker",
 	"legacy-sync": "project-archive/legacy-sync-worker",
 	"legacy-import": "project-archive/legacy-import-worker",
 } as const;
@@ -17,7 +16,7 @@ export function privateArchiveWorkerSpecifiers(
 	return (
 		compiled
 			? [`./services/${path}.js`, `./server/services/${path}.js`, `./${path.split("/").at(-1)}.js`]
-			: [kind === "backup" ? "./worker.ts" : `../${path}.ts`]
+			: [`./${path.split("/").at(-1)}.ts`]
 	).map((specifier) => new URL(specifier, moduleUrl).href);
 }
 function entryPoint(specifier: string): URL | string {
@@ -67,7 +66,7 @@ export function createPrivateArchiveWorkerLifecycle<W extends PrivateArchiveWork
 		for (const specifier of privateArchiveWorkerSpecifiers(kind)) {
 			assertOpen();
 			signal.throwIfAborted();
-			if (Date.now() >= deadline) throw new Error("Backup worker startup timed out");
+			if (Date.now() >= deadline) throw new Error("Project archive worker startup timed out");
 			const worker = createWorker(entryPoint(specifier));
 			const entry: Entry = { onExit: () => forget(worker, entry) };
 			// Register BEFORE ready: startup and detached HTTP-202 jobs also hold DB handles.
@@ -81,12 +80,12 @@ export function createPrivateArchiveWorkerLifecycle<W extends PrivateArchiveWork
 			try {
 				try {
 					await new Promise<void>((resolve, reject) => {
-						abort = () => reject(new Error("Backup worker startup cancelled"));
+						abort = () => reject(new Error("Project archive worker startup cancelled"));
 						entry.cancelStartup = () =>
 							reject(new Error("Private archive workers are shutting down"));
 						signal.addEventListener("abort", abort, { once: true });
 						timer = setTimeout(
-							() => reject(new Error("Backup worker startup timed out")),
+							() => reject(new Error("Project archive worker startup timed out")),
 							Math.min(5000, deadline - Date.now()),
 						);
 						onMessage = (message: unknown) => {
@@ -97,10 +96,10 @@ export function createPrivateArchiveWorkerLifecycle<W extends PrivateArchiveWork
 								message.ready === "private-archive-worker-v1"
 							)
 								resolve();
-							else reject(new Error("Backup worker startup protocol failed"));
+							else reject(new Error("Project archive worker startup protocol failed"));
 						};
-						onError = () => reject(new Error("Backup worker unavailable"));
-						onExit = () => reject(new Error("Backup worker unavailable"));
+						onError = () => reject(new Error("Project archive worker unavailable"));
+						onExit = () => reject(new Error("Project archive worker unavailable"));
 						worker.once("message", onMessage);
 						worker.once("error", onError);
 						worker.once("exit", onExit);
@@ -116,14 +115,14 @@ export function createPrivateArchiveWorkerLifecycle<W extends PrivateArchiveWork
 				}
 				// Ready can race shutdown/exit before this continuation gets a turn.
 				assertOpen();
-				if (!workers.has(worker)) throw new Error("Backup worker unavailable");
+				if (!workers.has(worker)) throw new Error("Project archive worker unavailable");
 				return worker;
 			} catch {
 				if (workers.has(worker)) await terminate(worker, entry);
 				assertOpen();
 			}
 		}
-		throw new Error("Backup worker unavailable");
+		throw new Error("Project archive worker unavailable");
 	}
 
 	function shutdown(): Promise<void> {

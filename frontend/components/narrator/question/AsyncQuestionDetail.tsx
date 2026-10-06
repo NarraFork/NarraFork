@@ -183,6 +183,10 @@ function AsyncQuestionLiveDetail({
 		mutationFn: () => api.dismissAsyncQuestion(narratorId, questionId),
 		onSuccess: () => invalidateAsyncQuestionQueries(client, narratorId),
 	});
+	const ignore = useMutation({
+		mutationFn: () => api.ignoreAsyncQuestion(narratorId, questionId),
+		onSuccess: () => invalidateAsyncQuestionQueries(client, narratorId),
+	});
 	const supplement = useMutation({
 		onError: () =>
 			client.invalidateQueries({ queryKey: ["async-question-detail", narratorId, questionId] }),
@@ -233,10 +237,12 @@ function AsyncQuestionLiveDetail({
 				questions={toBannerQuestions(question.questions)}
 				answers={question.answers ?? undefined}
 				readOnly={!canAct || question.status !== "open"}
-				busy={answer.isPending || dismiss.isPending}
+				busy={answer.isPending || dismiss.isPending || ignore.isPending}
 				onSubmit={(_id, answers) => answer.mutateAsync(answers)}
 				onDeny={() => dismiss.mutate()}
 				denyLabel={t("asyncQuestionDismiss")}
+				onIgnore={() => ignore.mutate()}
+				ignoreLabel={t("asyncQuestionIgnore")}
 			/>
 			{question.resolution && (
 				<Alert color="gray">
@@ -281,8 +287,8 @@ function AsyncQuestionLiveDetail({
 					</Button>
 				</Stack>
 			)}
-			{(supplement.error || dismiss.error) && (
-				<Alert color="red">{(supplement.error || dismiss.error)?.message}</Alert>
+			{(supplement.error || dismiss.error || ignore.error) && (
+				<Alert color="red">{(supplement.error || dismiss.error || ignore.error)?.message}</Alert>
 			)}
 		</Stack>
 	);

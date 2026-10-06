@@ -287,4 +287,39 @@ describe("async question lifecycle HTTP API", () => {
 		});
 		expect(response.status).toBe(400);
 	});
+
+	test("ignore closes an open question without an answer message", async () => {
+		await seedQuestion("ignorable", ROOT);
+		const response = await appAs().request(`/narrators/${ROOT}/questions/ignorable/ignore`, {
+			method: "POST",
+		});
+		expect(response.status).toBe(200);
+		const body = await response.json();
+		expect(body.ok).toBe(true);
+		expect(body.question.status).toBe("withdrawn");
+		// Ignore is inbox hygiene, not a decision the model hears about.
+		expect(body.question.answerMessageId).toBeNull();
+		expect(body.question.decidedBy).toBe(OWNER);
+		// A second ignore loses the race against the first one's terminal state.
+		expect(
+			(await appAs().request(`/narrators/${ROOT}/questions/ignorable/ignore`, { method: "POST" }))
+				.status,
+		).toBe(409);
+	});
+
+	test("ignore is scoped to the question's own narrator and existing rows", async () => {
+		await seedQuestion("foreign-owned", PRIVATE);
+		// The caller may not name a narrator they can reach to close somebody else's question.
+		expect(
+			(
+				await appAs().request(`/narrators/${PUBLIC}/questions/foreign-owned/ignore`, {
+					method: "POST",
+				})
+			).status,
+		).toBe(404);
+		expect(
+			(await appAs().request(`/narrators/${ROOT}/questions/ghost/ignore`, { method: "POST" }))
+				.status,
+		).toBe(404);
+	});
 });

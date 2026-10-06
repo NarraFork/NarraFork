@@ -1,11 +1,8 @@
 import { Database } from "bun:sqlite";
 import { parentPort } from "node:worker_threads";
-import { NARRATOR_BACKUP_LIMITS as LIMITS } from "@shared/narrator-backup";
 import { SQL } from "bun";
-import type { BackupActor, BackupTable } from "../narrator-backup/contract";
-import { postgresBackupConnection } from "../narrator-backup/postgres-main-store";
-import { sqliteBackupConnection } from "../narrator-backup/sqlite-main-store";
-import { assertFullExport } from "../narrator-backup/state";
+import { type ArchiveActor, assertFullExport, ProjectArchiveAuthorizationError } from "./access";
+import { PROJECT_ARCHIVE_LIMITS as LIMITS } from "./limits";
 import type { ArchiveRow, ArchiveValue } from "./main-store";
 import {
 	ARCHIVE_COLUMNS,
@@ -13,6 +10,8 @@ import {
 	ARCHIVE_TABLE_ORDER,
 	type ArchiveTable,
 } from "./manifest";
+import { postgresArchiveConnection } from "./worker-postgres-store";
+import { sqliteArchiveConnection } from "./worker-sqlite-store";
 
 export interface LegacySyncWorkerRequest {
 	databasePath: string;
@@ -20,7 +19,7 @@ export interface LegacySyncWorkerRequest {
 	backend: "sqlite" | "postgres";
 	postgresUrl?: string;
 	projectId: string;
-	actor?: BackupActor;
+	actor?: ArchiveActor;
 	deadline: number;
 	cancellation: SharedArrayBuffer;
 }
@@ -42,9 +41,9 @@ export async function runLegacySyncWorker(
 			? new SQL(request.postgresUrl ?? "", { max: 1, connectionTimeout: 10 })
 			: undefined;
 	const sourceConnection = source
-		? sqliteBackupConnection(source)
+		? sqliteArchiveConnection(source)
 		: pg
-			? postgresBackupConnection(pg)
+			? postgresArchiveConnection(pg)
 			: undefined;
 	if (!sourceConnection) throw new Error("Project backup source unavailable");
 	const archive = new Database(request.archivePath);
@@ -58,7 +57,7 @@ export async function runLegacySyncWorker(
 			const dependencyQueue: [ArchiveTable, ArchiveRow][] = [];
 			const refMembership = new Set<string>();
 			for (const table of ARCHIVE_TABLE_ORDER) {
-				const available = await tx.columns(table as BackupTable);
+				const available = await tx.columns(table);
 				const target = archive.prepare(`PRAGMA table_info(${q(table)})`).all() as {
 					name: string;
 				}[];
@@ -149,35 +148,54 @@ export async function runLegacySyncWorker(
 				const user = (
 					await tx.query("SELECT id,role FROM users WHERE id=$1 LIMIT 1", [actor.userId])
 				)[0];
-				if (!user) throw new Error("Backup actor no longer exists");
+				if (!user) throw new ProjectArchiveAuthorizationError();
 				actor = { userId: actor.userId, isAdmin: actor.isAdmin && user.role === "admin" };
 			}
 			const authorized = new Set<string>();
 			async function authorize(narratorId: string) {
-				if (!actor || authorized.has(narratorId)) return;
-				const row = (
-					await tx.query(
-						`SELECT id,type,owner_user_id,acl_root_narrator_id${narratorSourceColumns.includes("variant") ? ",variant" : ""} FROM narrators WHERE id=$1 LIMIT 1`,
-						[narratorId],
-					)
-				)[0];
-				if (!row) throw new Error("Project export dependency owner missing");
-				const root =
-					typeof row.acl_root_narrator_id === "string"
-						? (
-								await tx.query("SELECT id,type,owner_user_id FROM narrators WHERE id=$1 LIMIT 1", [
-									row.acl_root_narrator_id,
-								])
-							)[0]
-						: undefined;
-				assertFullExport(
-					typeof row.variant === "string" && row.variant.startsWith("subagent:")
-						? { ...row, type: "subagent" }
-						: row,
-					actor,
-					root,
-				);
-				authorized.add(narratorId);
+				if (!actor) return;
+				const pending = new Set([narratorId]);
+				// Metadata-only parent/lazy/ACL dependencies still require independent full
+				// authority, even when their rows or transcripts are not portable archive data.
+				const metadataFields = [
+					"parent_narrator_id",
+					"refs_inherited_from",
+					"acl_root_narrator_id",
+					"variant",
+				].filter((field) => narratorSourceColumns.includes(field));
+				for (const id of pending) {
+					check();
+					if (authorized.has(id)) continue;
+					if (authorized.size + pending.size > LIMITS.stateRows)
+						throw new Error("Project archive authorization closure budget exceeded");
+					const row = (
+						await tx.query(
+							`SELECT id,type,owner_user_id${metadataFields.map((field) => `,${q(field)}`).join("")} FROM narrators WHERE id=$1 LIMIT 1`,
+							[id],
+						)
+					)[0];
+					if (!row) throw new ProjectArchiveAuthorizationError();
+					const root =
+						typeof row.acl_root_narrator_id === "string"
+							? (
+									await tx.query(
+										"SELECT id,type,owner_user_id FROM narrators WHERE id=$1 LIMIT 1",
+										[row.acl_root_narrator_id],
+									)
+								)[0]
+							: undefined;
+					assertFullExport(
+						typeof row.variant === "string" && row.variant.startsWith("subagent:")
+							? { ...row, type: "subagent" }
+							: row,
+						actor,
+						root,
+					);
+					authorized.add(id);
+					for (const field of ["parent_narrator_id", "refs_inherited_from", "acl_root_narrator_id"])
+						if (typeof row[field] === "string" && !authorized.has(row[field]))
+							pending.add(row[field]);
+				}
 			}
 			for (const id of narratorIds) await authorize(id);
 			await read("narrator_message_refs", "narrator_id", narratorIds);
@@ -445,8 +463,14 @@ if (parentPort) {
 	port.once("message", async (request: LegacySyncWorkerRequest) => {
 		try {
 			port.postMessage({ value: await runLegacySyncWorker(request) });
-		} catch {
-			port.postMessage({ error: "Project backup validation or operation failed" });
+		} catch (error) {
+			port.postMessage({
+				error: "Project archive validation or operation failed",
+				code:
+					error instanceof ProjectArchiveAuthorizationError
+						? "PROJECT_ARCHIVE_FORBIDDEN"
+						: undefined,
+			});
 		}
 	});
 }

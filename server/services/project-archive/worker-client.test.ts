@@ -4,7 +4,32 @@ import { ShutdownActivityTracker } from "../../lib/shutdown-activity";
 import {
 	createPrivateArchiveWorkerLifecycle,
 	type PrivateArchiveWorkerKind,
+	privateArchiveWorkerSpecifiers,
 } from "./worker-client";
+
+test("source URLs stay relative to the project archive module, not the working directory", () => {
+	for (const kind of ["legacy-sync", "legacy-import"] as const) {
+		expect(
+			privateArchiveWorkerSpecifiers(
+				kind,
+				false,
+				"file:///source/server/services/project-archive/worker-client.ts",
+			),
+		).toEqual([`file:///source/server/services/project-archive/${kind}-worker.ts`]);
+	}
+});
+
+test("compiled URLs probe embedded server-root and flattened bundles on Unix and Windows", () => {
+	for (const moduleUrl of ["file:///$bunfs/root/main.js", "file:///C:/%7EBUN/root/main.js"]) {
+		for (const kind of ["legacy-sync", "legacy-import"] as const) {
+			expect(privateArchiveWorkerSpecifiers(kind, true, moduleUrl)).toEqual([
+				new URL(`./services/project-archive/${kind}-worker.js`, moduleUrl).href,
+				new URL(`./server/services/project-archive/${kind}-worker.js`, moduleUrl).href,
+				new URL(`./${kind}-worker.js`, moduleUrl).href,
+			]);
+		}
+	}
+});
 
 function deferred<T>() {
 	let resolve!: (value: T) => void;
@@ -28,7 +53,7 @@ class FakeWorker extends EventEmitter {
 	}
 }
 
-const kinds: PrivateArchiveWorkerKind[] = ["backup", "legacy-sync", "legacy-import"];
+const kinds: PrivateArchiveWorkerKind[] = ["legacy-sync", "legacy-import"];
 function fixture(prepare: (worker: FakeWorker) => void = () => {}) {
 	const workers: FakeWorker[] = [];
 	const lifecycle = createPrivateArchiveWorkerLifecycle(() => {
@@ -37,7 +62,7 @@ function fixture(prepare: (worker: FakeWorker) => void = () => {}) {
 		workers.push(worker);
 		return worker;
 	});
-	const start = (kind: PrivateArchiveWorkerKind = "backup") =>
+	const start = (kind: PrivateArchiveWorkerKind = "legacy-sync") =>
 		lifecycle.start(kind, new AbortController().signal, Date.now() + 10_000);
 	return { workers, lifecycle, start };
 }
@@ -46,7 +71,7 @@ async function flush() {
 	for (let i = 0; i < 10; i++) await Promise.resolve();
 }
 
-test("all three private kinds are tracked and shutdown waits for every deferred termination", async () => {
+test("both project archive kinds are tracked and shutdown waits for every deferred termination", async () => {
 	const { workers, lifecycle, start } = fixture();
 	const starts = kinds.map((kind) => start(kind));
 	for (const worker of workers) worker.ready();
@@ -58,13 +83,12 @@ test("all three private kinds are tracked and shutdown waits for every deferred 
 		finished = true;
 	});
 	await flush();
-	expect(workers.map((worker) => worker.terminateCalls)).toEqual([1, 1, 1]);
+	expect(workers.map((worker) => worker.terminateCalls)).toEqual([1, 1]);
 	expect(finished).toBe(false);
 	workers[0].termination.resolve(0);
-	workers[1].termination.resolve(0);
 	await flush();
 	expect(finished).toBe(false);
-	workers[2].termination.resolve(0);
+	workers[1].termination.resolve(0);
 	await shutdown;
 	expect(finished).toBe(true);
 	expect(workers.every((worker) => worker.listenerCount("exit") === 0)).toBe(true);
@@ -149,7 +173,7 @@ test("ready and termination cleanup preserve caller message/error/exit listeners
 
 test("failed termination waits for other workers, preserves unknown records and marks shutdown degraded", async () => {
 	const { workers, lifecycle, start } = fixture();
-	const starts = [start("backup"), start("legacy-import")];
+	const starts = [start("legacy-sync"), start("legacy-import")];
 	for (const worker of workers) worker.ready();
 	await Promise.all(starts);
 	const tracker = new ShutdownActivityTracker();

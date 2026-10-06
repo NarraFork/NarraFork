@@ -58,6 +58,7 @@ import {
 } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
+import { t } from "../lib/i18n";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getSubagentType, isSubagentVariant } from "../lib/narrator-utils";
@@ -1463,6 +1464,53 @@ export async function dismissAsyncQuestion(
 	args: { userId?: string | null; locale?: Locale } = {},
 ): Promise<AsyncQuestionTransition> {
 	return decideAsyncQuestion(id, "dismissed", args);
+}
+
+/**
+ * Close a question WITHOUT telling the narrator anything.
+ *
+ * Unlike a dismiss ("let it decide" — a user instruction the model must see, which is
+ * why it is delivered as a message and wakes an idle loop), an ignore is pure inbox
+ * hygiene: the narrator typically finished long ago, and waking it to report that its
+ * question went unanswered would burn a full request on nothing. So no message is
+ * injected and no delivery is scheduled; the row simply leaves `open` and the inbox
+ * stops showing it.
+ *
+ * The state is `withdrawn` (shared with the agent's own cleanup) with `decidedBy` set
+ * to the user and a localized reason, so the history view can say WHO closed it.
+ *
+ * A blocked `Await` IS released (with `status: "withdrawn"`): that loop is already
+ * running and parked on this question, so leaving it until its timeout would strand it
+ * on a decision that has, in fact, happened.
+ */
+export async function ignoreAsyncQuestion(
+	id: string,
+	args: { userId?: string | null; locale?: Locale } = {},
+): Promise<AsyncQuestionTransition> {
+	const row = await db
+		.select(questionStateColumns)
+		.from(narratorQuestions)
+		.where(eq(narratorQuestions.id, id))
+		.limit(1)
+		.get();
+	if (!row) return { ok: false, reason: "not_found" };
+	if (row.status !== "open") return { ok: false, reason: "stale" };
+	const claimed = await db
+		.update(narratorQuestions)
+		.set({
+			status: "withdrawn",
+			withdrawReason: t("sidecar.asyncQuestionIgnoreReason", args.locale ?? "en"),
+			decidedBy: args.userId ?? null,
+			decidedAt: new Date().toISOString(),
+		})
+		.where(and(eq(narratorQuestions.id, id), eq(narratorQuestions.status, "open")))
+		.returning(questionStateColumns);
+	const updated = claimed[0];
+	if (!updated) return { ok: false, reason: "stale" };
+	const record = toStateRecord(updated);
+	await broadcastChange(record, "withdrawn");
+	notifyQuestionDecided(record);
+	return { ok: true, record };
 }
 
 /**

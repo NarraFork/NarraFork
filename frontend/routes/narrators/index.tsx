@@ -25,7 +25,6 @@ import {
 	useNarratorInfiniteScroll,
 	validateNarratorListSearch,
 } from "../../components/narrator/list/narrator-list-utils";
-import { NarratorBackupRestoreButton } from "../../components/narrator/NarratorBackupEntry";
 import { useAllModels } from "../../hooks/useModels";
 import { useArchiveNarrator, useNarratorsPaginated } from "../../hooks/useNarrator";
 import { useNarratorsListWS } from "../../hooks/useNarratorWS";
@@ -218,9 +217,6 @@ function NarratorsPage() {
 				/>
 			</Stack>
 
-			<Group justify="flex-end">
-				<NarratorBackupRestoreButton />
-			</Group>
 			<NarratorListLocalSearchSummary
 				localQuery={localQuery}
 				shown={filteredNarrators.length}

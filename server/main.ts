@@ -69,13 +69,13 @@ import {
 	nextAllowedPort,
 	readWindowsExcludedPortRanges,
 } from "./lib/windows-excluded-ports";
-import { shutdownPrivateArchiveWorkers } from "./services/narrator-backup/worker-client";
 import { pluginManager } from "./services/plugin-manager";
 import { pluginProviderRegistry } from "./services/plugin-provider-registry";
 import {
 	activatePostgresRuntimeQueue,
 	composePostgresStores,
 } from "./services/postgres-composition";
+import { shutdownPrivateArchiveWorkers } from "./services/project-archive/worker-client";
 import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)

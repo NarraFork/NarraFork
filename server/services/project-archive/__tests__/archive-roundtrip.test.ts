@@ -41,7 +41,7 @@ import {
 	projects,
 	users,
 } from "@server/db/schema";
-import { ValidationError } from "@server/lib/errors";
+import { AppError, ValidationError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
 import { getProjectDbPath, projectDbManager } from "@server/lib/project-db";
 import { ProjectArchiveFile } from "@server/services/project-archive/archive-file";
@@ -435,6 +435,55 @@ describe("export writes a real, self-describing SQLite file", () => {
 			archive.close();
 		}
 	});
+});
+
+test("HTTP project management never substitutes for conversation owner and denied sync returns 403", async () => {
+	const fixture = await createFixture("nf-archive-http-sync-authorization-");
+	await fullSync(fixture.projectId);
+	const archive = await projectDbManager.getDb(fixture.projectId);
+	if (!archive) throw new Error("Project archive missing");
+	const before = archive.serialize();
+	const userId = generateId();
+	await db.insert(users).values({
+		id: userId,
+		username: userId,
+		passwordHash: "fixture",
+		role: "user",
+		createdAt: new Date().toISOString(),
+	});
+	await db.update(projects).set({ ownerUserId: userId }).where(eq(projects.id, fixture.projectId));
+	try {
+		const app = new Hono();
+		app.use("*", async (c, next) => {
+			c.set("user", { sub: userId, role: "user", iat: 0, exp: 2_147_483_647 });
+			await next();
+		});
+		app.onError((error, c) =>
+			error instanceof AppError && error.statusCode === 403
+				? c.json({ code: error.code }, 403)
+				: c.json({ error: error.message }, 500),
+		);
+		app.route("/api/projects", projectDbRoutes);
+		const path = `/api/projects/${fixture.projectId}/backup/sync`;
+		const denied = await app.request(path, { method: "POST" });
+		expect(denied.status).toBe(403);
+		expect(await denied.json()).toEqual({ code: "PROJECT_ARCHIVE_FORBIDDEN" });
+		expect(archive.serialize()).toEqual(before);
+		await db
+			.update(narrators)
+			.set({ ownerUserId: userId })
+			.where(eq(narrators.id, fixture.narratorId));
+		const allowed = await app.request(path, { method: "POST" });
+		expect(allowed.status).toBe(200);
+		expect(await allowed.json()).toMatchObject({ tables: { narrators: 1 } });
+	} finally {
+		await db.update(projects).set({ ownerUserId: null }).where(eq(projects.id, fixture.projectId));
+		await db
+			.update(narrators)
+			.set({ ownerUserId: null })
+			.where(eq(narrators.id, fixture.narratorId));
+		await db.delete(users).where(eq(users.id, userId));
+	}
 });
 
 describe("import reads the archive back into the main database", () => {

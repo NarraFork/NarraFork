@@ -21,7 +21,7 @@
  *  - a loop that refuses to stop is still reported instead of being written over.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
@@ -37,7 +37,9 @@ process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
 // import time and must not touch the developer's real instance.
 const { narratorRoutes } = await import("../narrators");
 const { db } = await import("../../db");
-const { narrators, users } = await import("../../db/schema");
+const { narrators, users, narratorMessages, narratorMessageRefs, narratorToolCalls } = await import(
+	"../../db/schema"
+);
 const { generateId } = await import("../../lib/id");
 const { activeNarrators, pendingPermissions } = await import(
 	"../../services/narrator-session-state"
@@ -147,6 +149,57 @@ afterEach(async () => {
 	activeNarrators.clear();
 	pendingPermissions.clear();
 	await db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, narratorId));
+});
+
+test("history-only deletion ignores missing file evidence and preserves workspace bytes", async () => {
+	mkdirSync(WORKTREE, { recursive: true });
+	const path = join(WORKTREE, "unverified-structsed.txt");
+	writeFileSync(path, "keep these bytes\n");
+	const messageId = generateId();
+	const providerId = generateId();
+	const callId = generateId();
+	const timestamp = new Date().toISOString();
+	const input = { file_path: path, command: "delete", address: "1", dry_run: false };
+	await db.insert(narratorMessages).values({
+		id: messageId,
+		narratorId,
+		role: "assistant",
+		contentJson: [{ type: "tool_use", id: providerId, name: "StructSed", input }],
+		createdAt: timestamp,
+	});
+	await db.insert(narratorMessageRefs).values({
+		id: generateId(),
+		narratorId,
+		messageId,
+		seq: 1,
+	});
+	await db.insert(narratorToolCalls).values({
+		id: callId,
+		narratorId,
+		messageId,
+		toolUseId: providerId,
+		toolName: "StructSed",
+		status: "fail",
+		inputJson: input,
+		fileChangeOperationId: null,
+		createdAt: timestamp,
+	});
+	try {
+		const response = await del(`/${narratorId}/messages/${messageId}?skipRevert=1`);
+		const body = await response.json();
+		expect(response.status, JSON.stringify(body)).toBe(200);
+		expect(body).toMatchObject({ ok: true, deletedCount: 1 });
+		expect(readFileSync(path, "utf8")).toBe("keep these bytes\n");
+		expect(
+			db
+				.select()
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.messageId, messageId))
+				.get(),
+		).toBeUndefined();
+	} finally {
+		await db.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
+	}
 });
 
 describe("another narrator running in the same worktree", () => {

@@ -88,6 +88,8 @@ export interface AsyncQuestionSlot {
 	awaitedLabel?: string;
 	onSubmit: (questionId: string, answers: Record<string, string>) => unknown;
 	onDismiss: (questionId: string) => void;
+	/** Close without notifying the narrator; absent where the question is not ignorable. */
+	onIgnore?: (questionId: string) => void;
 }
 
 export interface PermissionCallbacks {

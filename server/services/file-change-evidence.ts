@@ -79,7 +79,21 @@ export interface BeginFileChangeOperation {
 export interface FileChangeNoDispatchProof {
 	/** Trusted IO caller assertion, never derived from an error status or matching bytes. */
 	targetDispatched: false;
-	reason: "validation_rejected" | "cancelled_before_dispatch";
+	reason: "validation_rejected" | "cancelled_before_dispatch" | "preview" | "invocation_rejected";
+	/** Host control-flow proof may close an allocated, never claimed attempt. */
+	beforeInvocation?: {
+		status: "initializing" | "pending" | "running" | "fail";
+		/** A trusted invocation recorder observed this live status before permission handling. */
+		observedStatus?: "initializing" | "pending" | "running";
+		executionStartedAt: null;
+	};
+	/** Frozen host routing identity, not a remote file receipt. */
+	frozenTarget?: {
+		cwd: string;
+		pathFlavor: string;
+		lexicalPath?: string;
+		canonicalPath?: string;
+	};
 }
 
 export interface PrepareFileChangeEffect {
@@ -509,7 +523,12 @@ export class FileChangeEvidenceService {
 	): FileChangeOperationRecord {
 		if (
 			proof.targetDispatched !== false ||
-			!["validation_rejected", "cancelled_before_dispatch"].includes(proof.reason) ||
+			![
+				"validation_rejected",
+				"cancelled_before_dispatch",
+				"preview",
+				"invocation_rejected",
+			].includes(proof.reason) ||
 			input.sourceKind !== "tool" ||
 			!input.toolCallId ||
 			input.sourceId !== input.toolCallId ||
@@ -528,7 +547,9 @@ export class FileChangeEvidenceService {
 			executionOutcome:
 				proof.reason === "cancelled_before_dispatch"
 					? ("interrupted" as const)
-					: ("failed" as const),
+					: proof.reason === "preview"
+						? ("succeeded" as const)
+						: ("failed" as const),
 			effectOutcome: "no_change" as const,
 			settlement: "settled" as const,
 			coverage: "complete" as const,
@@ -554,6 +575,10 @@ export class FileChangeEvidenceService {
 					startedAt: narratorToolCalls.executionStartedAt,
 					deviceId: narratorToolCalls.executionDeviceId,
 					generation: narratorToolCalls.runtimeGeneration,
+					cwd: narratorToolCalls.executionCwd,
+					pathFlavor: narratorToolCalls.executionPathFlavor,
+					lexicalPath: narratorToolCalls.resolvedFilePath,
+					canonicalPath: narratorToolCalls.canonicalFilePath,
 					operationId: narratorToolCalls.fileChangeOperationId,
 				})
 				.from(narratorToolCalls)
@@ -567,9 +592,14 @@ export class FileChangeEvidenceService {
 				tool.attempt !== values.attempt ||
 				tool.narratorId !== values.narratorId ||
 				tool.toolUseId !== values.toolUseId ||
-				!["Write", "Edit"].includes(tool.toolName) ||
+				!["Write", "Edit", "StructSed"].includes(tool.toolName) ||
 				tool.deviceId !== input.executionBinding.deviceId ||
-				tool.generation !== input.executionBinding.runtimeGeneration
+				tool.generation !== input.executionBinding.runtimeGeneration ||
+				(proof.frozenTarget !== undefined &&
+					(tool.cwd !== proof.frozenTarget.cwd ||
+						tool.pathFlavor !== proof.frozenTarget.pathFlavor ||
+						tool.lexicalPath !== (proof.frozenTarget.lexicalPath ?? null) ||
+						tool.canonicalPath !== (proof.frozenTarget.canonicalPath ?? null)))
 			) {
 				throw fail(
 					"IDENTITY_CONFLICT",
@@ -609,10 +639,28 @@ export class FileChangeEvidenceService {
 				}
 				return existing;
 			}
-			if (tool.operationId !== null || tool.status !== "running" || tool.startedAt === null) {
+			const beforeInvocation = proof.beforeInvocation;
+			const unclaimed = beforeInvocation !== undefined;
+			if (
+				tool.operationId !== null ||
+				(unclaimed
+					? !proof.frozenTarget ||
+						!["invocation_rejected", "cancelled_before_dispatch"].includes(proof.reason) ||
+						(!["initializing", "pending", "running"].includes(beforeInvocation.status) &&
+							!(
+								beforeInvocation.status === "fail" &&
+								["initializing", "pending", "running"].includes(
+									beforeInvocation.observedStatus ?? "",
+								)
+							)) ||
+						beforeInvocation.executionStartedAt !== null ||
+						tool.status !== beforeInvocation.status ||
+						tool.startedAt !== null
+					: tool.status !== "running" || tool.startedAt === null)
+			) {
 				throw fail(
 					"INVALID_TRANSITION",
-					"No-dispatch evidence must be recorded by the live claimed tool attempt",
+					"No-dispatch evidence requires the exact live allocated or claimed attempt",
 				);
 			}
 			const timestamp = this.now();
@@ -628,11 +676,20 @@ export class FileChangeEvidenceService {
 			const recorded = boundedRecord(tx.insert(fileChangeOperations).values(row).returning().get());
 			const linked = tx
 				.update(narratorToolCalls)
-				.set({ fileChangeOperationId: recorded.id })
+				.set({
+					fileChangeOperationId: recorded.id,
+					...(unclaimed ? { status: "fail" as const } : {}),
+				})
 				.where(
 					and(
 						eq(narratorToolCalls.id, tool.id),
 						eq(narratorToolCalls.executionAttempt, values.attempt),
+						eq(narratorToolCalls.status, tool.status),
+						tool.startedAt === null
+							? isNull(narratorToolCalls.executionStartedAt)
+							: eq(narratorToolCalls.executionStartedAt, tool.startedAt),
+						eq(narratorToolCalls.executionDeviceId, input.executionBinding.deviceId),
+						eq(narratorToolCalls.runtimeGeneration, input.executionBinding.runtimeGeneration),
 						isNull(narratorToolCalls.fileChangeOperationId),
 					),
 				)

@@ -26,7 +26,7 @@ import {
 import { type ExecutionBackend, LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { withWorkspaceWriteLock } from "../lib/agent/tools/write-serialization";
-import type { ToolContext, ToolResult } from "../lib/agent/types";
+import type { ToolContext, ToolDefinition, ToolResult } from "../lib/agent/types";
 import { requireApplicationDataDirectory } from "../lib/data-directory-security";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
@@ -44,6 +44,7 @@ import {
 	type BeginFileChangeOperation,
 	type FileChangeEffectRecord,
 	FileChangeEvidenceService,
+	type FileChangeNoDispatchProof,
 	type FileChangeOperationRecord,
 } from "./file-change-evidence";
 import { createFileChangeIdentity, type FileChangeScopeIdentity } from "./file-change-identity";
@@ -74,6 +75,15 @@ import {
 } from "./workspace-write-coordinator";
 
 type RuntimeDb = typeof applicationDb;
+type HostNoDispatchObservation = Readonly<{
+	toolCallId: string;
+	attempt: number;
+	narratorId: string;
+	toolUseId: string | undefined;
+	toolName: FileChangeToolName;
+	targetJson: string;
+	status: "initializing" | "pending" | "running";
+}>;
 // Coordination survives identity-file damage and runtime recreation. This cache is
 // not evidence of history trust; every history admission still checks the file.
 const workspaceSources = hotSafe(
@@ -201,7 +211,9 @@ type BoundFileChange<Result> = {
 	): PreparedFileChange<Result> | Promise<PreparedFileChange<Result>>;
 	assertBinding(): void | Promise<void>;
 	linkOperation?(operationId: string): void;
-	recordNoDispatch?(operation: BeginFileChangeOperation, error: unknown): void;
+	recordNoDispatch?(operation: BeginFileChangeOperation, error: unknown): void | Promise<void>;
+	/** Called only at an explicit validation fence before lease/intent/IO admission. */
+	beforeIntentValidation?(): Promise<void>;
 	onDispatch?(): void;
 };
 
@@ -272,6 +284,7 @@ export class LocalFileChangeRuntime {
 	private readonly readRuntime: (deviceId: string) => WorkspaceRuntimeBinding | null;
 	private readonly io: FileChangeLocalIo;
 	private initialization?: Promise<Namespace>;
+	private readonly noDispatchObservations = new WeakSet<HostNoDispatchObservation>();
 
 	constructor(private readonly options: LocalFileChangeRuntimeOptions) {
 		if (!isAbsolute(options.privateRoot)) throw new Error("Private evidence root must be absolute");
@@ -549,12 +562,193 @@ export class LocalFileChangeRuntime {
 			throw new Error("Tool-call operation reference is already bound; refusing redispatch");
 	}
 
+	/** Capture authority while the attempt is live, BEFORE permission can close it. */
+	prepareHostNoDispatch(
+		ctx: ToolContext,
+		toolName: FileChangeToolName,
+	): (reason: FileChangeNoDispatchProof["reason"], claimed: boolean) => Promise<void> {
+		const frozen: ToolContext = {
+			...ctx,
+			toolCallBinding: ctx.toolCallBinding && Object.freeze({ ...ctx.toolCallBinding }),
+			executionTarget: ctx.executionTarget && Object.freeze({ ...ctx.executionTarget }),
+		};
+		const binding = frozen.toolCallBinding;
+		const target = frozen.executionTarget;
+		if (!binding || !target) throw new Error("No-dispatch observation requires a frozen attempt");
+		const row = this.database
+			.select(TOOL_COLUMNS)
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.id, binding.toolCallId))
+			.get();
+		if (
+			!row ||
+			row.version !== 1 ||
+			row.origin !== null ||
+			row.checkpoint ||
+			row.attempt !== binding.attempt ||
+			row.narratorId !== ctx.narratorId ||
+			row.toolUseId !== ctx.currentToolUseId ||
+			row.toolName !== toolName ||
+			row.device !== target.deviceId ||
+			row.generation !== target.runtimeGeneration ||
+			row.cwd !== target.cwd ||
+			row.flavor !== target.pathFlavor ||
+			row.lexical !== (target.lexicalPath ?? null) ||
+			row.canonical !== (target.canonicalPath ?? null) ||
+			!["initializing", "pending", "running"].includes(row.status) ||
+			row.startedAt !== null ||
+			row.operationId !== null
+		)
+			throw new Error(
+				"No-dispatch observation must precede the live attempt's claim or termination",
+			);
+		const observation: HostNoDispatchObservation = Object.freeze({
+			toolCallId: binding.toolCallId,
+			attempt: binding.attempt,
+			narratorId: ctx.narratorId,
+			toolUseId: ctx.currentToolUseId,
+			toolName,
+			targetJson: JSON.stringify(target),
+			status: row.status as HostNoDispatchObservation["status"],
+		});
+		this.noDispatchObservations.add(observation);
+		return (reason, claimed) =>
+			this.recordHostNoDispatch(frozen, toolName, reason, claimed, observation);
+	}
+
+	/** Host control-flow fact only: no IO lease, blob, file state or remote receipt. */
+	async recordHostNoDispatch(
+		ctx: ToolContext,
+		toolName: FileChangeToolName,
+		reason: FileChangeNoDispatchProof["reason"],
+		claimed: boolean,
+		observation?: HostNoDispatchObservation,
+	): Promise<void> {
+		const binding = ctx.toolCallBinding && Object.freeze({ ...ctx.toolCallBinding });
+		const target = ctx.executionTarget && Object.freeze({ ...ctx.executionTarget });
+		if (
+			!binding ||
+			!target ||
+			target.pathFlavor === undefined ||
+			target.runtimeGeneration === undefined
+		)
+			throw new Error("No-dispatch proof requires a frozen tool identity");
+		const observedLive =
+			observation !== undefined &&
+			this.noDispatchObservations.has(observation) &&
+			observation.toolCallId === binding.toolCallId &&
+			observation.attempt === binding.attempt &&
+			observation.narratorId === ctx.narratorId &&
+			observation.toolUseId === ctx.currentToolUseId &&
+			observation.toolName === toolName &&
+			observation.targetJson === JSON.stringify(target);
+		const row = this.database
+			.select(TOOL_COLUMNS)
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.id, binding.toolCallId))
+			.get();
+		if (
+			!row ||
+			row.version !== 1 ||
+			row.origin !== null ||
+			row.checkpoint ||
+			row.attempt !== binding.attempt ||
+			binding.attempt < 1 ||
+			row.narratorId !== ctx.narratorId ||
+			row.toolUseId !== ctx.currentToolUseId ||
+			row.toolName !== toolName ||
+			row.device !== target.deviceId ||
+			row.generation !== target.runtimeGeneration ||
+			row.cwd !== target.cwd ||
+			row.flavor !== target.pathFlavor ||
+			row.lexical !== (target.lexicalPath ?? null) ||
+			row.canonical !== (target.canonicalPath ?? null) ||
+			(claimed
+				? row.status !== "running" || row.startedAt === null
+				: (!["initializing", "pending", "running"].includes(row.status) &&
+						!(observedLive && row.status === "fail")) ||
+					row.startedAt !== null)
+		)
+			throw new Error("No-dispatch proof does not match the live host attempt");
+		const actorRow = this.database
+			.select({
+				type: narrators.type,
+				variant: narrators.variant,
+				title: narrators.title,
+				parent: narrators.parentNarratorId,
+			})
+			.from(narrators)
+			.where(eq(narrators.id, ctx.narratorId))
+			.get();
+		if (!actorRow) throw new Error("Executing narrator no longer exists");
+		const source = await this.workspaceSource();
+		const host = this.readRuntime(LOCAL_DEVICE_ID);
+		if (!host) throw new Error("Host control-flow runtime identity is unavailable");
+		const subagent = actorRow.type === "subagent" || actorRow.variant.startsWith("subagent");
+		this.evidence.beginNoDispatchOperation(
+			{
+				sourceInstanceId: source.sourceInstanceId,
+				sourceKind: "tool",
+				sourceId: binding.toolCallId,
+				toolCallId: binding.toolCallId,
+				toolUseId: ctx.currentToolUseId,
+				attempt: binding.attempt,
+				requestDigest: hash([
+					"host-no-dispatch-v1",
+					binding.toolCallId,
+					String(binding.attempt),
+					JSON.stringify(target),
+					reason,
+				]),
+				expectedEffectCount: 1,
+				actor: {
+					kind: subagent ? "subagent" : "primary",
+					subjectKey: `narrator:${ctx.narratorId}`,
+					narratorId: ctx.narratorId,
+					userId: null,
+					label: actorRow.title?.slice(0, 160) ?? null,
+					deleted: false,
+					parentSubjectKey: subagent && actorRow.parent ? `narrator:${actorRow.parent}` : null,
+				},
+				narratorId: ctx.narratorId,
+				projectId: ctx.projectId,
+				ownerUserId: ctx.userId,
+				executionSegmentId: ctx.executionSegmentId,
+				// runtimeEpoch identifies the HOST assertion, not a claim about remote IO.
+				executionBinding: {
+					deviceId: target.deviceId,
+					runtimeGeneration: target.runtimeGeneration,
+					runtimeEpoch: host.runtimeEpoch,
+					fencingToken: 0,
+				},
+			},
+			{
+				targetDispatched: false,
+				reason,
+				frozenTarget: {
+					cwd: target.cwd,
+					pathFlavor: target.pathFlavor,
+					lexicalPath: target.lexicalPath,
+					canonicalPath: target.canonicalPath,
+				},
+				...(!claimed
+					? {
+							beforeInvocation: {
+								status: row.status as "initializing" | "pending" | "running" | "fail",
+								...(observedLive ? { observedStatus: observation.status } : {}),
+								executionStartedAt: null as null,
+							},
+						}
+					: {}),
+			},
+		);
+	}
+
 	async execute(request: LocalFileChangeRequest): Promise<ToolResult> {
 		// Keep the authoritative attempt/target stable across every await. Later
 		// caller context updates cannot redirect the journal association or IO.
 		request = {
 			...request,
-			input: snapshotFileToolInput(request.input),
 			ctx: {
 				...request.ctx,
 				toolCallBinding:
@@ -565,6 +759,18 @@ export class LocalFileChangeRuntime {
 		};
 		const { ctx, backend } = request;
 		const frozen = this.validateCall(request);
+		try {
+			request.input = snapshotFileToolInput(request.input);
+		} catch (error) {
+			// Request normalization is still before blobs/intent/IO, and is known host control flow.
+			try {
+				if (ctx.recordFileNoDispatch) await ctx.recordFileNoDispatch("validation_rejected");
+				else await this.recordHostNoDispatch(ctx, request.toolName, "validation_rejected", true);
+			} catch (cause) {
+				throw new FileNoDispatchEvidenceError(cause);
+			}
+			throw error;
+		}
 		const actorRow = this.database
 			.select({
 				title: narrators.title,
@@ -611,6 +817,14 @@ export class LocalFileChangeRuntime {
 			},
 			linkOperation: (id) => this.linkOperation(request, id),
 			recordNoDispatch: (operation, error) => this.recordNoDispatch(request, operation, error),
+			beforeIntentValidation: async () => {
+				try {
+					if (ctx.recordFileNoDispatch) await ctx.recordFileNoDispatch("validation_rejected");
+					else await this.recordHostNoDispatch(ctx, request.toolName, "validation_rejected", true);
+				} catch (cause) {
+					throw new FileNoDispatchEvidenceError(cause);
+				}
+			},
 		};
 		let completed: FileChangeCompletion<ToolResult>;
 		try {
@@ -896,11 +1110,11 @@ export class LocalFileChangeRuntime {
 										toolCallId: request.sourceId,
 										toolUseId: request.toolUseId,
 										attempt: request.attempt,
-										requestDigest: await hashLocalFileChangeRequest(
-											[request.toolName ?? "tool", lexicalPath, canonicalPath],
-											request.input,
-											signal,
-										),
+										requestDigest: await this.hashBeforeIntent(request, [
+											request.toolName ?? "tool",
+											lexicalPath,
+											canonicalPath,
+										]),
 										expectedEffectCount: 1,
 										actor: request.actor,
 										narratorId: request.narratorId,
@@ -1078,11 +1292,11 @@ export class LocalFileChangeRuntime {
 				objectRole: "referent",
 			});
 			diagnostics.enter("hash_request");
-			const requestDigest = await hashLocalFileChangeRequest(
-				[request.toolName ?? "editor", lexicalPath, canonicalPath],
-				request.input,
-				signal,
-			);
+			const requestDigest = await this.hashBeforeIntent(request, [
+				request.toolName ?? "editor",
+				lexicalPath,
+				canonicalPath,
+			]);
 			const historyTarget = {
 				deviceId: LOCAL_DEVICE_ID,
 				pathFlavor: backend.pathFlavor,
@@ -1203,7 +1417,7 @@ export class LocalFileChangeRuntime {
 										// failures are not evidence of a no-change operation.
 										diagnostics.fail(error);
 										diagnostics.enter("settle_evidence");
-										request.recordNoDispatch?.(operationInput, error);
+										await request.recordNoDispatch?.(operationInput, error);
 										throw error;
 									}
 									let beforeState: FileChangeState;
@@ -1510,19 +1724,41 @@ export class LocalFileChangeRuntime {
 		return { kind: "regular", blob, mode: observed.mode };
 	}
 
-	private recordNoDispatch(
+	/** Both call sites are before creating an ordinary intent or dispatching target IO. */
+	private async hashBeforeIntent<Result>(
+		request: BoundFileChange<Result>,
+		identityParts: readonly string[],
+	): Promise<string> {
+		try {
+			return await hashLocalFileChangeRequest(identityParts, request.input, request.signal);
+		} catch (error) {
+			// Aggregate UTF-8/JSON-escape rejection is proven by this exact pre-intent fence,
+			// never by the generic execution catch or an isError result after writes.
+			if (error instanceof LocalFileValidationError) await request.beforeIntentValidation?.();
+			throw error;
+		}
+	}
+
+	private async recordNoDispatch(
 		request: LocalFileChangeRequest,
 		operation: BeginFileChangeOperation,
 		error: unknown,
-	): void {
+	): Promise<void> {
 		if (!(error instanceof LocalFileValidationError)) return;
-		// This branch is reachable only before io.apply (and before any blob or
-		// intent persistence). EACCES/quota/DB failures are NOT no-change evidence.
-		this.validateCall(request);
-		this.evidence.beginNoDispatchOperation(operation, {
-			targetDispatched: false,
-			reason: "validation_rejected",
-		});
+		// Reachable only before IO/blob/intent persistence, not from an error-output heuristic.
+		try {
+			this.validateCall(request);
+			if (request.ctx.recordFileNoDispatch) {
+				await request.ctx.recordFileNoDispatch("validation_rejected");
+			} else {
+				this.evidence.beginNoDispatchOperation(operation, {
+					targetDispatched: false,
+					reason: "validation_rejected",
+				});
+			}
+		} catch (cause) {
+			throw new FileNoDispatchEvidenceError(cause);
+		}
 	}
 
 	private project(
@@ -1589,6 +1825,88 @@ export function withLocalFileChangeRuntime<T>(runtime: LocalFileChangeRuntime, b
 let defaultRuntime: LocalFileChangeRuntime | undefined;
 
 /** Undefined is the explicit legacy/remote branch, never a failed v2 fallback. */
+export class FileNoDispatchEvidenceError extends Error {
+	constructor(cause: unknown) {
+		super("Failed to persist trusted no-dispatch evidence", { cause });
+		this.name = "FileNoDispatchEvidenceError";
+	}
+}
+
+interface FileToolDispatchControl {
+	/** Called BEFORE any IO or ordinary intent can be dispatched. */
+	writing(): void;
+	/** The runtime explicitly returned without invoking IO (legacy/remote eligibility decline). */
+	declined(): void;
+	/** A successful read-only branch returned without attempting a write. */
+	preview(): void;
+	/** Internal approval UI rendering is not an executed tool attempt. */
+	suppressEvidence(): void;
+}
+
+/** Share the control-flow fence without nesting/reindenting each tool's entire implementation. */
+export function withFileToolNoDispatch(
+	toolName: FileChangeToolName,
+	body: (
+		args: Record<string, unknown>,
+		ctx: ToolContext,
+		control: FileToolDispatchControl,
+	) => Promise<ToolResult>,
+): ToolDefinition["execute"] {
+	return async (args, ctx) => {
+		const record = createFileToolNoDispatchRecorder(ctx, toolName);
+		let writing = false;
+		let suppressed = false;
+		let reason: "validation_rejected" | "preview" = "validation_rejected";
+		try {
+			return await body(args, ctx, {
+				writing: () => {
+					writing = true;
+				},
+				declined: () => {
+					writing = false;
+				},
+				preview: () => {
+					reason = "preview";
+				},
+				suppressEvidence: () => {
+					suppressed = true;
+				},
+			});
+		} finally {
+			if (!writing && !suppressed) await record(reason);
+		}
+	};
+}
+
+/** Freeze the host assertion identity before the tool's first await. */
+export function createFileToolNoDispatchRecorder(
+	ctx: ToolContext,
+	toolName: "Write" | "Edit" | "StructSed",
+): (reason: "validation_rejected" | "preview") => Promise<void> {
+	const frozen: ToolContext = {
+		...ctx,
+		toolCallBinding: ctx.toolCallBinding && Object.freeze({ ...ctx.toolCallBinding }),
+		executionTarget: ctx.executionTarget && Object.freeze({ ...ctx.executionTarget }),
+	};
+	return (reason) => recordFileToolNoDispatch(frozen, toolName, reason);
+}
+
+/** Called by trusted tools BEFORE crossing any file-writing/intent boundary. */
+export async function recordFileToolNoDispatch(
+	ctx: ToolContext,
+	toolName: "Write" | "Edit" | "StructSed",
+	reason: "validation_rejected" | "preview",
+): Promise<void> {
+	if (!ctx.toolCallBinding || !ctx.executionTarget || ctx.executionTarget.pathFlavor === "spec")
+		return;
+	try {
+		if (ctx.recordFileNoDispatch) await ctx.recordFileNoDispatch(reason);
+		else await (await currentRuntime()).recordHostNoDispatch(ctx, toolName, reason, true);
+	} catch (cause) {
+		throw new FileNoDispatchEvidenceError(cause);
+	}
+}
+
 export async function executeLocalFileChange(
 	request: LocalFileChangeRequest,
 ): Promise<ToolResult | undefined> {

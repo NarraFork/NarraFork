@@ -223,3 +223,13 @@ export function useDismissAsyncQuestion(narratorId: string) {
 		onSettled: () => invalidateAsyncQuestionQueries(queryClient, narratorId),
 	});
 }
+
+/** Ignore one open question: close it WITHOUT notifying or waking the narrator. */
+export function useIgnoreAsyncQuestion(narratorId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: ({ questionId }: { questionId: string }) =>
+			api.ignoreAsyncQuestion(narratorId, questionId),
+		onSettled: () => invalidateAsyncQuestionQueries(queryClient, narratorId),
+	});
+}

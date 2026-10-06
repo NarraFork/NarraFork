@@ -382,7 +382,6 @@ export const buildPlatform = ${JSON.stringify(platform.platformId)};
 			// Revert manifest validation also runs in a Worker; Worker URLs are not bundled imports.
 			"./server/services/revert-transaction-manifest-worker.ts",
 			// Private archive scans/copies/imports must remain off-thread in released binaries.
-			"./server/services/narrator-backup/worker.ts",
 			"./server/services/project-archive/legacy-sync-worker.ts",
 			"./server/services/project-archive/legacy-import-worker.ts",
 			"--compile",

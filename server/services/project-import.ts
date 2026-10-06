@@ -35,7 +35,6 @@
  * from.
  */
 
-import { NARRATOR_BACKUP_LIMITS } from "@shared/narrator-backup";
 import { eq } from "drizzle-orm";
 import { activeDatabaseBackend, db } from "../db";
 import { getDbPath } from "../db/connection";
@@ -43,10 +42,11 @@ import { projects } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { getProjectDbPath } from "../lib/project-db";
-import type { BackupActor } from "./narrator-backup/contract";
 import { initializeRefSeqFloor, markNarratorSeqFloorHealedMany } from "./narrator-refs/seq-store";
+import type { ArchiveActor } from "./project-archive/access";
 import { ProjectArchiveFile } from "./project-archive/archive-file";
 import { importLegacyProjectOnWorker } from "./project-archive/legacy-import-job";
+import { PROJECT_ARCHIVE_LIMITS } from "./project-archive/limits";
 import type { ArchiveBatch, ArchiveRow } from "./project-archive/main-store";
 import { ARCHIVE_TABLE_ORDER, type ArchiveTable } from "./project-archive/manifest";
 import { projectArchiveMainStore } from "./project-archive/store";
@@ -224,7 +224,7 @@ function resolveImportLimits(overrides: Partial<ProjectImportLimits>): ProjectIm
 export async function importProject(
 	gitPath: string,
 	limitOverrides: Partial<ProjectImportLimits> = {},
-	options: { actor?: BackupActor; signal?: AbortSignal; worker?: boolean } = {},
+	options: { actor?: ArchiveActor; signal?: AbortSignal; worker?: boolean } = {},
 ): Promise<ImportResult> {
 	const limits = resolveImportLimits(limitOverrides);
 	// HTTP and production callers never stage or commit a large archive on the main thread.
@@ -243,7 +243,7 @@ export async function importProject(
 						? (process.env.NF_DATABASE_URL ?? process.env.DATABASE_URL)
 						: undefined,
 				actor: options.actor,
-				deadline: Date.now() + NARRATOR_BACKUP_LIMITS.jobMs,
+				deadline: Date.now() + PROJECT_ARCHIVE_LIMITS.jobMs,
 			},
 			options.signal,
 		);

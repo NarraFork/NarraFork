@@ -33,6 +33,8 @@ import {
 	RevertPlannerService,
 } from "./revert-planner-service";
 import type { RevertSelectionResult } from "./revert-selection-service";
+import type { ValidatedTransactionManifest } from "./revert-transaction-manifest-worker";
+import { runRevertManifestWorker } from "./revert-transaction-worker";
 import { createWorkspaceWriteCoordinatorState } from "./workspace-write-coordinator";
 
 const principal: NarratorPrincipal = { userId: "alice", isAdmin: false };
@@ -1075,11 +1077,116 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 			await write(path, "b".repeat(4096));
 		}
 		const before = historySnapshot();
-		service = new RevertPlannerService(db, { ...options, maxEvidenceBytes: 32 * 1024 });
+		service = new RevertPlannerService(db, { ...options, maxEvidenceBytes: 16 * 1024 });
 		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_BUDGET_EXCEEDED" });
 		assertUnprepared();
 		expect(historySnapshot()).toBe(before);
 	});
+	test("cross-file and receipt aliases fit unique evidence capacity without duplicate raw charges", async () => {
+		for (let i = 0; i < 2; i++) {
+			const path = join(workspace, `${i}.txt`);
+			await writeFile(path, "a".repeat(4096));
+			await write(path, "b".repeat(4096));
+		}
+		// Historical declarations can overlap; neither planner nor final worker sums them.
+		sqlite.query("UPDATE file_change_operations SET evidence_bytes=?").run(160 * 1024 * 1024);
+		const fixedHistory = historySnapshot();
+		service = new RevertPlannerService(db, { ...options, maxEvidenceBytes: 32 * 1024 });
+		const plan = (await prepare()).plan;
+		expect(plan.status).toBe("prepared");
+		const operation = db
+			.select()
+			.from(schema.revertOperations)
+			.where(eq(schema.revertOperations.id, plan.id))
+			.get();
+		if (!operation) throw new Error("Missing prepared plan");
+		const raw = [];
+		for (const digest of [
+			operation.planBlobDigest,
+			operation.selectorBlobDigest,
+			operation.historyManifestBlobDigest,
+		]) {
+			const row = db
+				.select()
+				.from(schema.fileChangeBlobs)
+				.where(eq(schema.fileChangeBlobs.digest, digest ?? ""))
+				.get();
+			if (!row) throw new Error("Missing manifest");
+			const ref = { algorithm: "sha256" as const, digest: row.digest, sizeBytes: row.sizeBytes };
+			raw.push({ ref, bytes: await namespace.store.readBytes(ref) });
+		}
+		const validated = await runRevertManifestWorker<ValidatedTransactionManifest>(
+			{
+				action: "validate",
+				raw,
+				operation,
+				userId: principal.userId,
+				files: db
+					.select()
+					.from(schema.revertOperationFiles)
+					.where(eq(schema.revertOperationFiles.revertOperationId, plan.id))
+					.limit(3)
+					.all(),
+			},
+			AbortSignal.timeout(10_000),
+		);
+		const refs = new Map(raw.map(({ ref }) => [ref.digest, ref.sizeBytes]));
+		for (const effect of validated.selection.effects) {
+			for (const state of [
+				effect.before,
+				effect.intendedAfter,
+				effect.observedAfter,
+				...(effect.executionReceipt ? [effect.executionReceipt.observedAfter] : []),
+			]) {
+				if (state.kind === "regular") refs.set(state.blob.digest, state.blob.sizeBytes);
+			}
+		}
+		for (const file of validated.files)
+			for (const state of [file.expected, file.desired]) {
+				if (state.kind === "regular") refs.set(state.blob.digest, state.blob.sizeBytes);
+			}
+		expect(validated.evidenceBytes).toBe([...refs.values()].reduce((sum, bytes) => sum + bytes, 0));
+		expect(historySnapshot()).toBe(fixedHistory);
+		for (let i = 0; i < 2; i++)
+			expect(await readFile(join(workspace, `${i}.txt`), "utf8")).toBe("b".repeat(4096));
+	});
+
+	test("calculator rereads exhaust the planner-wide processing cap before the next IO", async () => {
+		const { path } = await fixture();
+		const before = historySnapshot();
+		const disk = await readFile(path);
+		// Four historical unique blobs are read by planner, five including live current
+		// by calculator; all fixture states have exactly the same raw length.
+		service = new RevertPlannerService(db, { ...options, maxProcessedBytes: 10 * disk.byteLength });
+		const reading = spyOn(namespace.store, "readBytes");
+		try {
+			(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_BUDGET_EXCEEDED" });
+			expect(reading).toHaveBeenCalledTimes(9);
+		} finally {
+			reading.mockRestore();
+		}
+		assertUnprepared();
+		expect(historySnapshot()).toBe(before);
+		expect(await readFile(path)).toEqual(disk);
+	});
+
+	test("repeated real blob reads exceed independent processing cap without preparing a prefix", async () => {
+		const { path } = await fixture();
+		const before = historySnapshot();
+		const disk = await readFile(path);
+		const reading = spyOn(namespace.store, "readBytes");
+		service = new RevertPlannerService(db, { ...options, maxProcessedBytes: disk.byteLength });
+		try {
+			(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_BUDGET_EXCEEDED" });
+			expect(reading).not.toHaveBeenCalled();
+		} finally {
+			reading.mockRestore();
+		}
+		assertUnprepared();
+		expect(historySnapshot()).toBe(before);
+		expect(await readFile(path)).toEqual(disk);
+	});
+
 	test("private intermediate merge output is capped before publication, not only counted afterwards", async () => {
 		const { path } = await fixture();
 		const before = historySnapshot();
@@ -1095,24 +1202,25 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 				.from(schema.fileChangeBlobs)
 				.where(eq(schema.fileChangeBlobs.digest, digest ?? ""))
 				.get()?.sizeBytes ?? 0;
-		const rawSize = (state: FileChangeState) =>
-			state.kind === "regular" ? state.blob.sizeBytes : 0;
-		const inputBytes = selected.effects.reduce(
-			(sum, effect) =>
-				sum +
-				rawSize(effect.before) +
-				rawSize(effect.intendedAfter) +
-				rawSize(effect.observedAfter) +
-				(effect.executionReceipt ? rawSize(effect.executionReceipt.observedAfter) : 0),
-			0,
-		);
+		const refs = new Map<string, number>();
+		for (const effect of selected.effects) {
+			for (const state of [
+				effect.before,
+				effect.intendedAfter,
+				effect.observedAfter,
+				...(effect.executionReceipt ? [effect.executionReceipt.observedAfter] : []),
+			]) {
+				if (state.kind === "regular") refs.set(state.blob.digest, state.blob.sizeBytes);
+			}
+		}
+		refs.set(hash(disk), disk.byteLength);
+		const inputBytes = [...refs.values()].reduce((sum, bytes) => sum + bytes, 0);
 		// Same-length idempotency key keeps both serialized request lengths fixed.
 		const beforeMerge =
 			Buffer.byteLength(JSON.stringify({ version: 1, owner, request: fixed.request })) +
 			inputBytes +
 			size(first.plan.manifestDigests.history) +
-			size(first.plan.manifestDigests.selector) +
-			disk.byteLength;
+			size(first.plan.manifestDigests.selector);
 		service = new RevertPlannerService(db, {
 			...options,
 			maxEvidenceBytes: beforeMerge + disk.byteLength - 1,

@@ -19,7 +19,6 @@ import {
 	type FileChangeState,
 	fileChangeRevertActionMatches,
 	fileChangeStatesEqual,
-	hasConfirmedNoFileChange,
 	type KnownFileChangeState,
 } from "@shared/file-change-protocol";
 import { AppError } from "../lib/errors";
@@ -109,6 +108,8 @@ export interface RevertPlannerOptions {
 	planOptions: ConstructorParameters<typeof RevertPlanService>[1];
 	/** Trusted configuration can only lower shared limits, never HTTP overrides. */
 	maxEvidenceBytes?: number;
+	/** Separate cumulative physical read/processing cap, default 1 GiB (four 256 MiB passes). */
+	maxProcessedBytes?: number;
 	timeoutMs?: number;
 	onSlow?: (event: {
 		service: "revert-planner";
@@ -171,6 +172,7 @@ export class RevertPlannerService {
 	private readonly reversal: FileChangeReversalCalculator;
 	private readonly calculation = new AsyncLocalStorage<CalculationContext>();
 	private readonly maxEvidenceBytes: number;
+	private readonly maxProcessedBytes: number;
 	private readonly timeoutMs: number;
 	private active = 0;
 
@@ -192,6 +194,9 @@ export class RevertPlannerService {
 				);
 		this.maxEvidenceBytes = options.maxEvidenceBytes ?? FILE_CHANGE_LIMITS.operationEvidenceBytes;
 		integer(this.maxEvidenceBytes, 1, FILE_CHANGE_LIMITS.operationEvidenceBytes);
+		this.maxProcessedBytes =
+			options.maxProcessedBytes ?? 4 * FILE_CHANGE_LIMITS.operationEvidenceBytes;
+		integer(this.maxProcessedBytes, 1, 4 * FILE_CHANGE_LIMITS.operationEvidenceBytes);
 		this.timeoutMs = options.timeoutMs ?? 60_000;
 		integer(this.timeoutMs, 1, FILE_CHANGE_LIMITS.planLifetimeMs);
 		this.selection = new RevertSelectionService(database, {
@@ -208,6 +213,8 @@ export class RevertPlannerService {
 		// remaining budget before calculate, bounding every private intermediate output too.
 		// The calculator reads this option on each merge; ALS isolates simultaneous requests.
 		this.reversal = new FileChangeReversalCalculator({
+			maxProcessedBytes: this.maxProcessedBytes,
+			processMergeBytes: (bytes) => context().work.process(bytes),
 			readBlob: async (ref, { signal }) => {
 				const active = context();
 				await this.guard(active, active.work, signal);
@@ -236,6 +243,7 @@ export class RevertPlannerService {
 				AbortSignal.timeout(this.timeoutMs),
 			]),
 			this.maxEvidenceBytes,
+			this.maxProcessedBytes,
 		);
 		work.check();
 		if (this.active >= FILE_CHANGE_LIMITS.captureConcurrency)
@@ -251,7 +259,6 @@ export class RevertPlannerService {
 			const selected = await work.wait(this.selection.collect({ ...fixed, signal: work.signal }));
 			complete(selected);
 			const groups = new Map<string, FileChangeReversalEffect[]>();
-			let selectedRawBytes = 0;
 			let processedEffects = 0;
 			for (const effect of selected.effects) {
 				if (processedEffects++ % FILE_CHANGE_LIMITS.historyPageItems === 0) {
@@ -269,22 +276,17 @@ export class RevertPlannerService {
 					// A measured content delta is not proof of unmeasured object metadata.
 					// In particular, null mode must not produce an executable restore state.
 					knownState(state);
-					const bytes = stateBytes(state);
-					work.charge(bytes);
-					selectedRawBytes += bytes;
+					work.addRef(stateRef(state));
 				}
 				if (groups.size > FILE_CHANGE_LIMITS.revertFiles)
 					throw fail("BUDGET_EXCEEDED", "The complete file set exceeds the shared limit");
 			}
-			const declaredRawBytes = selected.operations.reduce(
-				(sum, operation) => sum + operation.evidenceBytes,
-				0,
-			);
-			work.charge(Math.max(0, declaredRawBytes - selectedRawBytes));
+			// The selector validates each declaration independently. Across the fixed
+			// namespace only unique immutable evidence objects consume raw capacity.
 			// The history manifest is the COMPLETE collector result, including effect sources,
 			// COW block identities, non-disk candidates and explicit (empty only on success) issues.
 			const history = await encodeJson(selected, work);
-			work.charge(history.ref.sizeBytes);
+			work.addRef(history.ref);
 			const selector = await encodeJson(
 				{
 					version: 1,
@@ -295,17 +297,13 @@ export class RevertPlannerService {
 				},
 				work,
 			);
-			work.charge(selector.ref.sizeBytes);
+			work.addRef(selector.ref);
 			const files: PreparedFile[] = [];
 			for (const [, effects] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
 				const identity = effects[0].identity;
 				const context = await this.target(fixed, owner, identity, work);
-				const observed = await this.current(
-					context,
-					work,
-					Math.min(FILE_CHANGE_LIMITS.blobBytes, work.remaining),
-				);
-				work.charge(stateBytes(observed.state));
+				const observed = await this.current(context, work, FILE_CHANGE_LIMITS.blobBytes);
+				work.addRef(stateRef(observed.state));
 				if (observed.raw) {
 					const ref = stateRef(observed.state);
 					if (!ref) throw fail("STATE_UNKNOWN", "Raw bytes require a known object state");
@@ -401,21 +399,11 @@ export class RevertPlannerService {
 						],
 					);
 				}
-				const baseline =
-					stateBytes(observed.state) +
-					effects.reduce(
-						(sum, effect) =>
-							sum +
-							(hasConfirmedNoFileChange(effect)
-								? 0
-								: stateBytes(effect.before) + stateBytes(effect.observedAfter)),
-						0,
-					);
-				const intermediateBytes = result.evidenceBytes - baseline;
+				const intermediateBytes = result.intermediateBytes;
 				integer(intermediateBytes, 0, reserved);
 				work.release(reserved);
-				work.charge(intermediateBytes);
-				work.charge(stateBytes(result.desired));
+				for (const ref of result.outputRefs) work.addRef(ref);
+				work.addRef(stateRef(result.desired));
 				files.push({
 					sequence: files.length,
 					identity,
@@ -476,7 +464,7 @@ export class RevertPlannerService {
 				},
 				work,
 			);
-			work.charge(manifest.ref.sizeBytes);
+			work.addRef(manifest.ref);
 			for (const raw of [selector, history, manifest]) await this.publish(raw, work);
 			// Publication writes total_changes. Finish it BEFORE opening the second scan.
 			const reselected = await work.wait(this.selection.collect({ ...fixed, signal: work.signal }));
@@ -639,11 +627,15 @@ export class RevertPlannerService {
 	}
 	private async current(context: FileContext, work: Work, maxBytes = FILE_CHANGE_LIMITS.blobBytes) {
 		await this.guard(context, work);
+		maxBytes = Math.min(maxBytes, work.processingRemaining);
+		work.process(maxBytes); // Reserve the unknown live size BEFORE actual IO.
 		const observation = await work.wait(
 			context.target.readCurrent({ signal: work.signal, maxBytes }),
 		);
 		const state = knownState(observation.state);
 		const ref = stateRef(state);
+		integer(ref?.sizeBytes ?? 0, 0, maxBytes);
+		work.releaseProcessed(maxBytes - (ref?.sizeBytes ?? 0));
 		let raw: Uint8Array | null = null;
 		if (ref) {
 			integer(ref.sizeBytes, 0, maxBytes);
@@ -681,6 +673,7 @@ export class RevertPlannerService {
 			throw fail("BLOB_UNAVAILABLE", "The complete raw object must be published and catalog-ready");
 	}
 	private async readBlob(ref: FileChangeBlobRef, work: Work, signal = work.signal) {
+		work.process(ref.sizeBytes);
 		this.ready(ref);
 		const bytes = await work.wait(
 			this.options.blobStore.readBytes(ref, { signal, maxBytes: FILE_CHANGE_LIMITS.blobBytes }),
@@ -733,9 +726,6 @@ function effectStates(effect: FileChangeReversalEffect) {
 }
 function stateRef(state: FileChangeState): FileChangeBlobRef | null {
 	return state.kind === "regular" ? state.blob : state.kind === "symlink" ? state.target : null;
-}
-function stateBytes(state: FileChangeState) {
-	return stateRef(state)?.sizeBytes ?? 0;
 }
 function knownState(state: FileChangeState): KnownFileChangeState {
 	if (!state || state.kind === "unknown")
@@ -873,16 +863,48 @@ function fail(code: string, message: string, diagnostics: readonly RevertPreview
 
 class Work {
 	used = 0;
+	private processedBytes = 0;
+	private processingFailure: RevertPlannerError | undefined;
+	private readonly refs = new Map<string, FileChangeBlobRef>();
 	private readonly pending = new Set<Promise<unknown>>();
 	constructor(
 		readonly signal: AbortSignal,
 		private readonly maximum: number,
+		private readonly maxProcessedBytes: number,
 	) {}
+	get processingRemaining() {
+		return this.maxProcessedBytes - this.processedBytes;
+	}
+	process(bytes: number) {
+		this.check();
+		if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > this.processingRemaining) {
+			this.processingFailure = fail(
+				"BUDGET_EXCEEDED",
+				"Cumulative physical processing budget exceeded",
+			);
+			throw this.processingFailure;
+		}
+		this.processedBytes += bytes;
+	}
+	releaseProcessed(bytes: number) {
+		integer(bytes, 0, this.processedBytes);
+		this.processedBytes -= bytes;
+	}
+	addRef(ref: FileChangeBlobRef | null) {
+		if (!ref) return;
+		const prior = this.refs.get(ref.digest);
+		if (prior && (prior.algorithm !== ref.algorithm || prior.sizeBytes !== ref.sizeBytes))
+			throw fail("BLOB_INTEGRITY", "Conflicting immutable blob metadata in the fixed namespace");
+		if (prior) return;
+		this.charge(ref.sizeBytes);
+		this.refs.set(ref.digest, { ...ref });
+	}
 	get remaining() {
 		return this.maximum - this.used;
 	}
 	check() {
 		this.signal.throwIfAborted();
+		if (this.processingFailure) throw this.processingFailure;
 	}
 	charge(bytes: number) {
 		integer(bytes, 0, this.remaining);

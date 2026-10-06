@@ -14,6 +14,7 @@ import * as relations from "../db/relations";
 import * as schema from "../db/schema";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { editTool } from "../lib/agent/tools/edit";
+import { structSedTool } from "../lib/agent/tools/struct-sed/tool";
 import { writeTool } from "../lib/agent/tools/write";
 import type { ToolContext, ToolExecutionTarget } from "../lib/agent/types";
 import { generateId } from "../lib/id";
@@ -241,33 +242,50 @@ function checkNarrator(user: NarratorPrincipal, row: NarratorAclRow) {
 	if (!user.isAdmin && row.ownerUserId !== user.userId) throw new Error("Narrator denied");
 }
 async function tool(
-	name: "Write" | "Edit",
+	name: "Write" | "Edit" | "StructSed",
 	path: string,
 	input: Record<string, unknown>,
 	cwd = workspace,
 	failure = false,
 	actorNarratorId = "narrator",
+	existingMessageId?: string,
 ) {
 	allowedFiles.add(path);
 	const resolved = await localBackend.resolvePathIdentity(path);
 	const providerId = generateId();
-	const messageId = generateId();
+	const messageId = existingMessageId ?? generateId();
 	const toolCallId = generateId();
-	db.insert(schema.narratorMessages)
-		.values({
-			id: messageId,
-			narratorId: actorNarratorId,
-			role: "assistant",
-			contentJson: [
-				{ type: "text", text: "retain" },
-				{ type: "tool_use", id: providerId, name, input },
-			],
-			createdAt: now(),
-		})
-		.run();
-	db.insert(schema.narratorMessageRefs)
-		.values({ id: generateId(), narratorId: actorNarratorId, messageId, seq: ++serial })
-		.run();
+	const block = { type: "tool_use" as const, id: providerId, name, input };
+	if (existingMessageId) {
+		const previous = db
+			.select()
+			.from(schema.narratorMessages)
+			.where(eq(schema.narratorMessages.id, messageId))
+			.get();
+		if (
+			!previous ||
+			previous.narratorId !== actorNarratorId ||
+			!Array.isArray(previous.contentJson)
+		)
+			throw new Error("Missing tool message owned by the same actor");
+		db.update(schema.narratorMessages)
+			.set({ contentJson: [...(previous.contentJson ?? []), block] })
+			.where(eq(schema.narratorMessages.id, messageId))
+			.run();
+	} else {
+		db.insert(schema.narratorMessages)
+			.values({
+				id: messageId,
+				narratorId: actorNarratorId,
+				role: "assistant",
+				contentJson: [{ type: "text", text: "retain" }, block],
+				createdAt: now(),
+			})
+			.run();
+		db.insert(schema.narratorMessageRefs)
+			.values({ id: generateId(), narratorId: actorNarratorId, messageId, seq: ++serial })
+			.run();
+	}
 	db.insert(schema.narratorToolCalls)
 		.values({
 			id: toolCallId,
@@ -311,7 +329,10 @@ async function tool(
 		requestPermission: async () => ({ behavior: "allow" }),
 	};
 	const result = await withLocalFileChangeRuntime(runtime, () =>
-		(name === "Write" ? writeTool : editTool).execute(input, ctx),
+		(name === "Write" ? writeTool : name === "StructSed" ? structSedTool : editTool).execute(
+			input,
+			ctx,
+		),
 	);
 	db.update(schema.narratorToolCalls)
 		.set({ status: result.isError ? "fail" : "success" })
@@ -428,7 +449,7 @@ async function manifestRequest(
 }
 
 async function fixedEvidenceBytes(plan: RevertPlanSummary) {
-	let manifests = 0;
+	const refs = new Map<string, number>();
 	let selection: RevertSelectionResult | undefined;
 	for (const digest of Object.values(plan.manifestDigests)) {
 		const row = db
@@ -437,7 +458,7 @@ async function fixedEvidenceBytes(plan: RevertPlanSummary) {
 			.where(eq(schema.fileChangeBlobs.digest, digest ?? ""))
 			.get();
 		if (!row) throw new Error("Missing raw manifest");
-		manifests += row.sizeBytes;
+		refs.set(row.digest, row.sizeBytes);
 		if (digest === plan.manifestDigests.history)
 			selection = JSON.parse(
 				Buffer.from(
@@ -450,29 +471,30 @@ async function fixedEvidenceBytes(plan: RevertPlanSummary) {
 			) as RevertSelectionResult;
 	}
 	if (!selection) throw new Error("Missing fixed history");
-	const size = (state: FileChangeState) => (state.kind === "regular" ? state.blob.sizeBytes : 0);
-	const sourceBytes = selection.effects.reduce(
-		(sum, effect) =>
-			sum +
-			[
-				effect.before,
-				effect.intendedAfter,
-				effect.observedAfter,
-				...(effect.executionReceipt ? [effect.executionReceipt.observedAfter] : []),
-			].reduce((total, state) => total + size(state), 0),
-		0,
-	);
-	return (
-		manifests +
-		Math.max(
-			sourceBytes,
-			selection.operations.reduce((sum, operation) => sum + operation.evidenceBytes, 0),
-		) +
-		journalFiles(plan).reduce(
-			(sum, file) => sum + size(file.expectedStateJson) + size(file.desiredStateJson),
-			0,
-		)
-	);
+	const add = (state: FileChangeState) => {
+		const ref =
+			state.kind === "regular" ? state.blob : state.kind === "symlink" ? state.target : null;
+		if (ref) {
+			const previous = refs.get(ref.digest);
+			if (previous !== undefined && previous !== ref.sizeBytes)
+				throw new Error("Conflicting blob size");
+			refs.set(ref.digest, ref.sizeBytes);
+		}
+	};
+	for (const effect of selection.effects) {
+		for (const state of [
+			effect.before,
+			effect.intendedAfter,
+			effect.observedAfter,
+			...(effect.executionReceipt ? [effect.executionReceipt.observedAfter] : []),
+		])
+			add(state);
+	}
+	for (const file of journalFiles(plan)) {
+		add(file.expectedStateJson);
+		add(file.desiredStateJson);
+	}
+	return [...refs.values()].reduce((sum, bytes) => sum + bytes, 0);
 }
 function hold() {
 	let release: () => void = () => {};
@@ -2164,6 +2186,120 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		).rejects.toThrow("Narrator denied");
 		expect(await fs.readFile(a, "utf8")).toBe("changed");
 		expect(operation(plan)?.status).toBe("prepared");
+	});
+	test("a mixed StructSed write, default preview and pre-write refusals can retract as one range", async () => {
+		const path = join(workspace, "structsed-mixed.txt");
+		await fs.writeFile(path, "original\nkeep\n");
+		await tool("StructSed", path, {
+			file_path: path,
+			command: "replace",
+			address: "1",
+			content: "changed",
+			dry_run: false,
+		});
+		await tool("StructSed", path, {
+			file_path: path,
+			command: "replace",
+			address: "1",
+			content: "preview only",
+		});
+		await tool(
+			"StructSed",
+			path,
+			{ file_path: path, operations: [], dry_run: false },
+			workspace,
+			true,
+		);
+		await tool(
+			"StructSed",
+			path,
+			{ file_path: path, command: "delete", address: "/no-such-marker/", dry_run: false },
+			workspace,
+			true,
+		);
+		expect(await fs.readFile(path, "utf8")).toBe("changed\nkeep\n");
+		const plan = await prepare();
+		expect(plan.expectedFileCount).toBe(1);
+		expect((await execution(plan).result).status).toBe("committed");
+		expect(await fs.readFile(path, "utf8")).toBe("original\nkeep\n");
+		expect(db.select().from(schema.narratorMessageRefs).limit(100).all()).toHaveLength(0);
+	});
+	test("partial rollback within one assistant message includes its failed StructSed safely", async () => {
+		const path = join(workspace, "structsed-same-message.txt");
+		await fs.writeFile(path, "original\n");
+		const written = await write(path, "changed\n");
+		await tool(
+			"StructSed",
+			path,
+			{ file_path: path, operations: [], dry_run: false },
+			workspace,
+			true,
+			"narrator",
+			written.messageId,
+		);
+		const plan = await prepare({
+			kind: "rollback_to_block",
+			selector: { kind: "after_block", messageId: written.messageId, keepThroughBlockIndex: 0 },
+		});
+		expect(plan.expectedFileCount).toBe(1);
+		expect((await execution(plan).result).status).toBe("committed");
+		expect(await fs.readFile(path, "utf8")).toBe("original\n");
+		const retained = db
+			.select()
+			.from(schema.narratorMessages)
+			.where(eq(schema.narratorMessages.id, written.messageId))
+			.get();
+		expect(retained?.contentJson).toEqual([{ type: "text", text: "retain" }]);
+		expect(db.select().from(schema.narratorToolCalls).limit(100).all()).toHaveLength(0);
+	});
+	test("StructSed previews and invalid stash do not require a fabricated file restore", async () => {
+		const path = join(workspace, "structsed-preview.txt");
+		await fs.writeFile(path, "unchanged\n");
+		await tool("StructSed", path, {
+			file_path: path,
+			command: "delete",
+			address: "1",
+			dry_run: true,
+		});
+		await tool(
+			"StructSed",
+			path,
+			{
+				file_path: path,
+				command: "append",
+				address: "1",
+				from_stash: "stash_missing_handle",
+				dry_run: false,
+			},
+			workspace,
+			true,
+		);
+		const plan = await prepare();
+		expect(plan.expectedFileCount).toBe(0);
+		expect((await execution(plan).result).status).toBe("committed");
+		expect(await fs.readFile(path, "utf8")).toBe("unchanged\n");
+		expect(db.select().from(schema.fileChangeEffects).limit(100).all()).toHaveLength(0);
+		expect(db.select().from(schema.narratorMessageRefs).limit(100).all()).toHaveLength(0);
+	});
+	test("a legacy failed StructSed without evidence cannot be inferred harmless from its status", async () => {
+		const path = join(workspace, "structsed-unverified.txt");
+		await fs.writeFile(path, "unchanged\n");
+		const call = await tool(
+			"StructSed",
+			path,
+			{ file_path: path, operations: [], dry_run: false },
+			workspace,
+			true,
+		);
+		// Simulate an old record with no authoritative proof, not a safe migration guess.
+		db.update(schema.narratorToolCalls)
+			.set({ fileChangeOperationId: null })
+			.where(eq(schema.narratorToolCalls.id, call.toolCallId))
+			.run();
+		const before = history();
+		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_PLANNER_EVIDENCE_INCOMPLETE" });
+		expect(history()).toBe(before);
+		expect(await fs.readFile(path, "utf8")).toBe("unchanged\n");
 	});
 	test("positive no_dispatch zero-file history deletion uses no fabricated workspace lease", async () => {
 		const path = join(workspace, "no-dispatch.txt");

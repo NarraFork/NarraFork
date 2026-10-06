@@ -181,6 +181,9 @@ describe("data-free authoritative human attention invalidation", () => {
 			toolCallId: "call",
 			toolUseId: "tool",
 			questions,
+			// Required since the async-question closure: an agent-initiated question must
+			// carry the context the user needs to answer it later.
+			context: "choose the cache backend; continuing with the local cache meanwhile",
 		});
 		questionId = record.id;
 		expect(events.at(-1)?.questionCount).toBe(1);
@@ -210,7 +213,13 @@ describe("data-free authoritative human attention invalidation", () => {
 			},
 		});
 		await expect(
-			createAsyncQuestion({ narratorId: "n", toolCallId: "call", toolUseId: "tool", questions }),
+			createAsyncQuestion({
+				narratorId: "n",
+				toolCallId: "call",
+				toolUseId: "tool",
+				questions,
+				context: "choose the cache backend; continuing with the local cache meanwhile",
+			}),
 		).rejects.toThrow("local subscriber failed");
 		expect(events.at(-1)?.questionCount).toBe(1);
 		expect((await list(principal)).items).toHaveLength(1);

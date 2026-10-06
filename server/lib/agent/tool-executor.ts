@@ -728,6 +728,86 @@ export async function executeTool(
 		config.toolExecutionBindings.set(tu, toolCallBinding);
 	}
 
+	let frozenExecution: FrozenExecutionTarget | undefined;
+	let bodyInvoked = false;
+	let attemptClaimed = false;
+	let evidenceFailure: unknown;
+	const fileToolName = ["Write", "Edit", "StructSed"].includes(tu.name)
+		? (tu.name as "Write" | "Edit" | "StructSed")
+		: undefined;
+	let preparedNoDispatch: ReturnType<NonNullable<AgentConfig["prepareToolNoDispatch"]>> | undefined;
+	const proofContext = (): ToolContext => ({
+		narratorId: config.narratorId,
+		cwd: config.cwd,
+		signal: config.signal,
+		locale,
+		requestPermission: config.permissionHandler,
+		currentToolUseId: tu.toolUseId,
+		toolCallBinding,
+		executionTarget: frozenExecution?.target,
+		executionSegmentId: config.executionSegmentId ?? toolCallBinding?.executionSegmentId,
+		projectId: config.projectId,
+		userId: config.userId,
+	});
+	const prepareNoDispatch = async () => {
+		if (
+			(!config.requireToolCallBinding &&
+				!config.prepareToolNoDispatch &&
+				!config.recordToolNoDispatch) ||
+			!fileToolName ||
+			!toolCallBinding ||
+			!frozenExecution ||
+			frozenExecution.target.pathFlavor === "spec"
+		)
+			return;
+		if (config.prepareToolNoDispatch) {
+			preparedNoDispatch = config.prepareToolNoDispatch(proofContext(), fileToolName);
+		} else if (!config.recordToolNoDispatch) {
+			const { getDefaultLocalFileChangeRuntime } = await import(
+				"@server/services/file-change-runtime"
+			);
+			preparedNoDispatch = (await getDefaultLocalFileChangeRuntime()).prepareHostNoDispatch(
+				proofContext(),
+				fileToolName,
+			);
+		}
+	};
+	const persistNoDispatch = async (
+		reason: "validation_rejected" | "cancelled_before_dispatch" | "preview" | "invocation_rejected",
+		claimed: boolean,
+	) => {
+		if (
+			(!config.requireToolCallBinding &&
+				!config.prepareToolNoDispatch &&
+				!config.recordToolNoDispatch) ||
+			!fileToolName ||
+			!toolCallBinding ||
+			!frozenExecution ||
+			frozenExecution.target.pathFlavor === "spec"
+		)
+			return;
+		try {
+			if (preparedNoDispatch) {
+				await preparedNoDispatch(reason, claimed);
+			} else if (config.recordToolNoDispatch) {
+				await config.recordToolNoDispatch(proofContext(), fileToolName, reason, claimed);
+			} else {
+				const { getDefaultLocalFileChangeRuntime } = await import(
+					"@server/services/file-change-runtime"
+				);
+				await (await getDefaultLocalFileChangeRuntime()).recordHostNoDispatch(
+					proofContext(),
+					fileToolName,
+					reason,
+					claimed,
+				);
+			}
+		} catch (error) {
+			evidenceFailure = error;
+			throw error;
+		}
+	};
+
 	// Unified update admission is deliberately the first executable guard. Live loop callers
 	// reach this point only after the tool-use block has a stable narrator_tool_calls row.
 	// A boolean alone is not admission authority: only the registered grant closes the phase race.
@@ -850,7 +930,6 @@ export async function executeTool(
 		// tools resolve their own paths from the backend (see edit.ts/write.ts), so pinning the
 		// audit columns to a stale identity would only make the record disagree with the bytes
 		// actually written, and would hide a permission-time path redirect.
-		let frozenExecution: FrozenExecutionTarget | undefined;
 		try {
 			const approvedTarget =
 				options.preFrozenTarget && isRoutedTool(tu) ? options.preFrozenTarget : undefined;
@@ -898,6 +977,8 @@ export async function executeTool(
 			};
 		}
 
+		await prepareNoDispatch();
+
 		// Permission check. The live handler may canonicalize a path (for example a plan-file
 		// redirect) before deciding or displaying approval. Refine + persist that identity while
 		// the tool-call row is still initializing, never after approval has begun.
@@ -939,6 +1020,7 @@ export async function executeTool(
 									throw new Error("Routed tool lost its frozen execution target.");
 								}
 								frozenExecution = refined;
+								await prepareNoDispatch();
 							}
 						: undefined,
 				}));
@@ -1014,7 +1096,7 @@ export async function executeTool(
 		// Start timing after permission is granted. If an update closes the final gate,
 		// reset these timestamps after the transparent wait so paused time is not execution time.
 		let start = Date.now();
-		let executionStartedAt = start;
+		let executionStartedAt: number | undefined;
 
 		const effectiveInput = permission.updatedInput ?? tu.input;
 		const updatedSpecError = toolSpecPathError(tu.name, effectiveInput);
@@ -1125,6 +1207,7 @@ export async function executeTool(
 		const pipelinePreviewChars = pipelineState?.maxPreviewChars ?? 100;
 
 		const ctx: ToolContext = {
+			recordFileNoDispatch: (reason) => persistNoDispatch(reason, true),
 			narratorId: config.narratorId,
 			cwd: config.cwd,
 			signal: config.signal,
@@ -1396,13 +1479,12 @@ export async function executeTool(
 				// Capture may await its hot-path budget; an interrupt during it must not write.
 				config.signal.throwIfAborted();
 				start = Date.now();
-				executionStartedAt = start;
 				if (toolCallBinding) {
 					claimingExecution = true;
 					const startedBinding = await config.onToolExecutionStarting?.(
 						tu.toolUseId,
 						toolCallBinding,
-						executionStartedAt,
+						start,
 					);
 					if (config.requireToolCallBinding && (!startedBinding || startedBinding.attempt < 1)) {
 						throw new Error("Tool execution attempt was not durably allocated");
@@ -1419,6 +1501,8 @@ export async function executeTool(
 						config.toolExecutionBindings?.set(tu, startedBinding);
 					}
 					claimingExecution = false;
+					attemptClaimed = startedBinding !== undefined;
+					if (attemptClaimed) executionStartedAt = start;
 				}
 				// An update-admission wait can outlive an actor/grant or workspace change.
 				// Recheck at the actual body boundary, not only before permission handling.
@@ -1444,6 +1528,7 @@ export async function executeTool(
 				config.signal.throwIfAborted();
 				config.assertWorkspaceCurrent?.();
 				// Only actual execution is painted as running; captures are preparation.
+				executionStartedAt ??= start;
 				if (config.onEvent) {
 					const onEvent = config.onEvent;
 					onEvent({ type: "tool_executing", toolUseId: tu.toolUseId, executionStartedAt });
@@ -1461,6 +1546,7 @@ export async function executeTool(
 				// not evidence of a host storage failure, even when the command exits nonzero.
 				// Only the preflight above and thrown storage errors below may trip the guard.
 				config.onToolExecutionInvoking?.(tu);
+				bodyInvoked = true;
 				result = await tool.execute(effectiveInput, ctx);
 				result.output += diskCheck.notice;
 			} catch (error) {
@@ -1617,6 +1703,14 @@ export async function executeTool(
 					? "Permission rule request interrupted before execution completed"
 					: permissionRuleTerminationReason,
 			});
+		}
+		// biome-ignore lint/correctness/noUnsafeFinally: evidence persistence failure must override any tool result.
+		if (evidenceFailure) throw evidenceFailure;
+		if (!bodyInvoked) {
+			await persistNoDispatch(
+				config.signal.aborted ? "cancelled_before_dispatch" : "invocation_rejected",
+				attemptClaimed,
+			);
 		}
 	}
 }

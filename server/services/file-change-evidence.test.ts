@@ -461,6 +461,125 @@ describe("explicit no-dispatch file-tool evidence", () => {
 		expect(() => service.prepareEffects(result.id, [effectInput()])).toThrow();
 	});
 
+	test.each([
+		"Write",
+		"Edit",
+		"StructSed",
+	])("%s preview is succeeded with strictly zero effects", (toolName) => {
+		const input = noDispatchInput();
+		db.update(narratorToolCalls)
+			.set({ toolName })
+			.where(eq(narratorToolCalls.id, input.toolCallId))
+			.run();
+		const operation = service.beginNoDispatchOperation(input, {
+			targetDispatched: false,
+			reason: "preview",
+		});
+		expect(operation).toMatchObject({
+			reason: "no_dispatch:preview",
+			executionOutcome: "succeeded",
+			effectOutcome: "no_change",
+			expectedEffectCount: 0,
+			evidenceBytes: 0,
+		});
+		expect(service.listEffects(operation.id).items).toHaveLength(0);
+	});
+
+	test.each([
+		"initializing",
+		"pending",
+	] as const)("closes %s without inventing an execution claim", (status) => {
+		const input = noDispatchInput();
+		const target = {
+			cwd: "/workspace",
+			pathFlavor: "posix",
+			lexicalPath: "/workspace/file",
+			canonicalPath: "/workspace/file",
+		};
+		db.update(narratorToolCalls)
+			.set({
+				status,
+				executionStartedAt: null,
+				executionCwd: target.cwd,
+				executionPathFlavor: "posix",
+				resolvedFilePath: target.lexicalPath,
+				canonicalFilePath: target.canonicalPath,
+			})
+			.where(eq(narratorToolCalls.id, input.toolCallId))
+			.run();
+		const operation = service.beginNoDispatchOperation(input, {
+			targetDispatched: false,
+			reason: "invocation_rejected",
+			frozenTarget: target,
+			beforeInvocation: { status, executionStartedAt: null },
+		});
+		expect(operation).toMatchObject({
+			executionOutcome: "failed",
+			reason: "no_dispatch:invocation_rejected",
+			expectedEffectCount: 0,
+		});
+		const tool = db
+			.select()
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.id, input.toolCallId))
+			.get();
+		expect(tool).toMatchObject({
+			status: "fail",
+			executionAttempt: 1,
+			executionStartedAt: null,
+			fileChangeOperationId: operation.id,
+		});
+		// The production start claim accepts only initializing/pending/running rows.
+		expect(
+			sqlite
+				.query(
+					"UPDATE narrator_tool_calls SET status='running' WHERE id=? AND execution_started_at IS NULL AND status IN ('initializing','pending','running') RETURNING id",
+				)
+				.all(input.toolCallId),
+		).toHaveLength(0);
+	});
+
+	test("preclaim proof cannot upgrade a preview or rebind an old attempt", () => {
+		const input = noDispatchInput();
+		const target = { cwd: "/workspace", pathFlavor: "posix" };
+		db.update(narratorToolCalls)
+			.set({
+				status: "pending",
+				executionStartedAt: null,
+				executionCwd: target.cwd,
+				executionPathFlavor: "posix",
+			})
+			.where(eq(narratorToolCalls.id, input.toolCallId))
+			.run();
+		const proof = {
+			targetDispatched: false as const,
+			reason: "invocation_rejected" as const,
+			frozenTarget: target,
+			beforeInvocation: { status: "pending" as const, executionStartedAt: null },
+		};
+		expect(() => service.beginNoDispatchOperation(input, { ...proof, reason: "preview" })).toThrow(
+			"exact live",
+		);
+		expect(() =>
+			service.beginNoDispatchOperation(input, {
+				...proof,
+				frozenTarget: { ...target, cwd: "/other" },
+			}),
+		).toThrow("frozen");
+		db.update(narratorToolCalls)
+			.set({ executionAttempt: 2 })
+			.where(eq(narratorToolCalls.id, input.toolCallId))
+			.run();
+		expect(() => service.beginNoDispatchOperation(input, proof)).toThrow("frozen");
+		expect(
+			db
+				.select()
+				.from(fileChangeOperations)
+				.where(eq(fileChangeOperations.sourceInstanceId, source))
+				.all(),
+		).toHaveLength(0);
+	});
+
 	test("identical proof remains idempotent after the tool result, conflicting proof stays rejected", () => {
 		const input = noDispatchInput();
 		const result = service.beginNoDispatchOperation(input, NO_DISPATCH);
