@@ -86,6 +86,17 @@ export async function enrichTabs(
 			}
 		}
 
+		// Active background task counts (subagents + bash + transfers). Lazy import
+		// matches the narrators route: the service pulls in half the agent runtime.
+		const { backgroundTaskService } = await import("./background-task-service");
+		const bgTaskCountMap = await backgroundTaskService.countActiveByParentBatch(narratorIds);
+		for (const tab of tabs) {
+			const nId = getTabNarratorId(tab);
+			if (nId && bgTaskCountMap.has(nId)) {
+				tab.activeBackgroundTaskCount = bgTaskCountMap.get(nId);
+			}
+		}
+
 		// Presence (from in-memory map)
 		const presenceMap = getNarratorPresenceBatch(narratorIds);
 		for (const tab of tabs) {

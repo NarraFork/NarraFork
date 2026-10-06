@@ -13,6 +13,7 @@ export interface RecentTab extends PersistedRecentTab {
 	substatus?: string[];
 	// Runtime-enriched fields (not persisted to DB)
 	activeTerminalCount?: number;
+	activeBackgroundTaskCount?: number;
 	viewers?: RecentTabViewer[];
 	viewerCount?: number;
 	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
@@ -24,6 +25,16 @@ export interface RecentTab extends PersistedRecentTab {
 
 export const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
 const RECENT_TAB_VIEWERS_MAX = 20;
+
+/**
+ * Whether a narrator tab whose foreground renders hollow (idle, nothing unread)
+ * still has background tasks running — the signal for the diagonally half-filled
+ * bubble. Kept here (not inside the component) so the decision is unit-testable
+ * and every surface agrees on it.
+ */
+export function isRecentTabBackgroundActive(tab: RecentTab, filledStatus: boolean): boolean {
+	return !filledStatus && (tab.activeBackgroundTaskCount ?? 0) > 0;
+}
 
 export function clampRecentTabText(value: string | null | undefined): string | undefined {
 	if (value == null) return undefined;
@@ -82,6 +93,7 @@ const RECENT_TAB_RUNTIME_KEYS = [
 	"status",
 	"substatus",
 	"activeTerminalCount",
+	"activeBackgroundTaskCount",
 	"viewers",
 	"viewerCount",
 	"containerStatus",

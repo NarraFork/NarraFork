@@ -868,6 +868,17 @@ export type NarratorServerMessage =
 			activeTerminalCount: number;
 	  }
 	| {
+			/**
+			 * Lightweight counterpart to `background_task_list_delta` for list-level
+			 * consumers (RecentTabs sidebar, narrator list) that only need the active
+			 * count and must not parse full delta payloads. Emitted alongside every
+			 * list delta, so it changes exactly when the delta's `activeCount` does.
+			 */
+			type: "background_task_count_changed";
+			narratorId: string;
+			activeBackgroundTaskCount: number;
+	  }
+	| {
 			type: "browser_session_count";
 			narratorId: string;
 			activeBrowserSessions: number;

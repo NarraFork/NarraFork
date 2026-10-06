@@ -13,6 +13,7 @@ import {
 	IconArchive,
 	IconArchiveOff,
 	IconBox,
+	IconSubtask,
 	IconTerminal2,
 	IconTrash,
 } from "@tabler/icons-react";
@@ -95,6 +96,7 @@ export interface NarratorListItem {
 	createdAt: string;
 	lastMessageAt?: string | null;
 	activeTerminalCount?: number | null;
+	activeBackgroundTaskCount?: number | null;
 	containerCount?: number | null;
 	runningContainerCount?: number | null;
 	chapter?: NarratorListChapter | null;
@@ -198,6 +200,7 @@ function NarratorBadges({
 	mobile?: boolean;
 }) {
 	const activeTerminals = narrator.activeTerminalCount ?? 0;
+	const activeBackgroundTasks = narrator.activeBackgroundTaskCount ?? 0;
 	const containers = narrator.containerCount ?? 0;
 	const runningContainers = narrator.runningContainerCount ?? 0;
 	return (
@@ -211,6 +214,17 @@ function NarratorBadges({
 					style={mobile ? { flexShrink: 0 } : undefined}
 				>
 					{activeTerminals}
+				</Badge>
+			)}
+			{activeBackgroundTasks > 0 && (
+				<Badge
+					size="xs"
+					variant="light"
+					color="blue"
+					leftSection={<IconSubtask size={10} />}
+					style={mobile ? { flexShrink: 0 } : undefined}
+				>
+					{activeBackgroundTasks}
 				</Badge>
 			)}
 			{containers > 0 && (

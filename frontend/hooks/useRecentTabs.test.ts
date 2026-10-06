@@ -5,6 +5,7 @@ import {
 	buildRecentTabUpsert,
 	buildSubagentRecentTab,
 	bumpRecentTabRuntimeVersions,
+	isRecentTabBackgroundActive,
 	mergeRecentTabPatch,
 	mergeRecentTabRuntime,
 	pruneRecentTabsRuntimeVersions,
@@ -62,6 +63,25 @@ const {
 } = await import("./useRecentTabs");
 const { api } = await import("../lib/api");
 const { queryClient: globalQC } = await import("../lib/query-client");
+
+describe("isRecentTabBackgroundActive", () => {
+	const tab = (activeBackgroundTaskCount?: number): RecentTab =>
+		({ type: "narrator", id: "n1", activeBackgroundTaskCount }) as RecentTab;
+
+	test("hollow tab with running background tasks renders half-filled", () => {
+		expect(isRecentTabBackgroundActive(tab(2), false)).toBeTrue();
+		expect(isRecentTabBackgroundActive(tab(1), false)).toBeTrue();
+	});
+
+	test("filled tab keeps its solid state regardless of background work", () => {
+		expect(isRecentTabBackgroundActive(tab(2), true)).toBeFalse();
+	});
+
+	test("no background work means the ordinary hollow icon", () => {
+		expect(isRecentTabBackgroundActive(tab(0), false)).toBeFalse();
+		expect(isRecentTabBackgroundActive(tab(undefined), false)).toBeFalse();
+	});
+});
 
 describe("shouldAddSubagentRecentTab", () => {
 	test("waits until preferences finish loading", () => {

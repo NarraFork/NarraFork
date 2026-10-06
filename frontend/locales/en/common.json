@@ -249,6 +249,7 @@
 	"containerSetupRecheck": "Recheck",
 	"containerRecheckFailed": "Failed to recheck container environment",
 	"activeTerminals": "{{count}} active terminal(s)",
+	"activeBackgroundTasks": "{{count}} background task(s) running",
 	"viewersWatching": "{{count}} people viewing",
 	"swipePin": "Pin",
 	"swipeUnpin": "Unpin",

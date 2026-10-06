@@ -48,6 +48,7 @@ export {
 	buildSubagentRecentTab,
 	bumpRecentTabRuntimeVersions,
 	clampRecentTabText,
+	isRecentTabBackgroundActive,
 	isSameRecentTab,
 	mergeRecentTabPatch,
 	mergeRecentTabRuntime,

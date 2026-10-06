@@ -543,6 +543,158 @@ describe("background task active count", () => {
 	});
 });
 
+describe("background task batch active count", () => {
+	// List surfaces (RecentTabs snapshot, GET /api/narrators) render one badge per
+	// narrator from `countActiveByParentBatch`. It must agree with the single-parent
+	// count on every state that count recognizes, or the sidebar and the panel
+	// badge would tell different stories.
+	test("matches the single-parent count for mixed running/finished/continued states", async () => {
+		await seedParent();
+		await seedBashTaskAt("batch-running", "2026-07-01T00:00:00.000Z");
+		await seedBashTaskAt("batch-done", "2026-07-01T00:00:01.000Z", "finished");
+
+		const subagentId = "batch-continued";
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({
+			id: subagentId,
+			type: "subagent",
+			variant: "subagent:general",
+			parentNarratorId: PARENT,
+			status: "working",
+			createdAt: now,
+			updatedAt: now,
+		});
+		await backgroundTaskService.createAgentTask({
+			id: subagentId,
+			parentNarratorId: PARENT,
+			subagentNarratorId: subagentId,
+			subagentType: "general",
+		});
+		await backgroundTaskService.markCompleted(subagentId, "first pass done");
+
+		const counts = await backgroundTaskService.countActiveByParentBatch([PARENT]);
+		// running bash + continued agent; the completed bash does not count.
+		expect(counts.get(PARENT)).toBe(2);
+		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(2);
+	});
+
+	test("counts independently per parent and omits parents with nothing active", async () => {
+		await seedParent();
+		const other = "batch-parent-2";
+		const now = new Date().toISOString();
+		await db
+			.insert(narrators)
+			.values({ id: other, type: "primary", variant: "primary", createdAt: now, updatedAt: now });
+		await seedBashTaskAt("batch-p1", "2026-07-02T00:00:00.000Z");
+		await backgroundTaskService.createBashTask({
+			id: "batch-p2",
+			parentNarratorId: other,
+			command: "cmd batch-p2",
+		});
+		await backgroundTaskService.createBashTask({
+			id: "batch-p2b",
+			parentNarratorId: other,
+			command: "cmd batch-p2b",
+		});
+
+		const counts = await backgroundTaskService.countActiveByParentBatch([
+			PARENT,
+			other,
+			"parent-with-no-rows",
+		]);
+		expect(counts.get(PARENT)).toBe(1);
+		expect(counts.get(other)).toBe(2);
+		expect(counts.has("parent-with-no-rows")).toBe(false);
+	});
+
+	test("counts a legacy row still marked running", async () => {
+		await seedParent();
+		await seedLegacyTask({
+			id: "batch-legacy-running",
+			createdAt: "2026-07-03T00:00:00.000Z",
+			backgroundStatus: "running",
+		});
+		const counts = await backgroundTaskService.countActiveByParentBatch([PARENT]);
+		expect(counts.get(PARENT)).toBe(1);
+	});
+
+	// A paused transfer still occupies a slot (resume checkpoint retained), so
+	// both count paths must treat it as active — a badge that dropped it would
+	// read as "nothing running" while work is resumable.
+	test("counts a paused transfer as active", async () => {
+		await seedParent();
+		const { backgroundTasks } = await import("../../db/schema");
+		const now = new Date().toISOString();
+		await db.insert(backgroundTasks).values({
+			id: "batch-paused-transfer",
+			parentNarratorId: PARENT,
+			type: "transfer",
+			status: "paused",
+			startedAt: now,
+			createdAt: now,
+			updatedAt: now,
+		});
+
+		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(1);
+		const counts = await backgroundTaskService.countActiveByParentBatch([PARENT]);
+		expect(counts.get(PARENT)).toBe(1);
+	});
+
+	test("a live agent loop counts as continued in batch too", async () => {
+		await seedParent();
+		const subagentId = "batch-live-loop";
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({
+			id: subagentId,
+			type: "subagent",
+			variant: "subagent:general",
+			parentNarratorId: PARENT,
+			status: "idle",
+			createdAt: now,
+			updatedAt: now,
+		});
+		await backgroundTaskService.createAgentTask({
+			id: subagentId,
+			parentNarratorId: PARENT,
+			subagentNarratorId: subagentId,
+			subagentType: "general",
+		});
+		await backgroundTaskService.markCompleted(subagentId, "done");
+
+		expect((await backgroundTaskService.countActiveByParentBatch([PARENT])).has(PARENT)).toBe(
+			false,
+		);
+		liveLoops.add(subagentId);
+		expect((await backgroundTaskService.countActiveByParentBatch([PARENT])).get(PARENT)).toBe(1);
+	});
+});
+
+describe("background task count frames", () => {
+	// Count-only consumers (sidebar badges) must not parse full delta payloads, so
+	// every delta is paired with a tiny `background_task_count_changed` frame
+	// carrying the same activeCount.
+	test("every list delta is paired with a count frame carrying the same activeCount", async () => {
+		await seedParent();
+		await seedBashTaskAt("cf-1", "2026-08-01T00:00:00.000Z");
+		await flushDeltas();
+		await backgroundTaskService.markCompleted("cf-1", "ok");
+		await flushDeltas();
+
+		const deltas = listDeltas();
+		const countFrames = broadcasts
+			.filter((b) => b.message.type === "background_task_count_changed")
+			.map((b) => b.message);
+		expect(countFrames).toHaveLength(deltas.length);
+		expect(countFrames.map((f) => f.activeBackgroundTaskCount)).toEqual(
+			deltas.map((d) => d.activeCount),
+		);
+		for (const frame of countFrames) {
+			expect(frame.narratorId).toBe(PARENT);
+		}
+		expect(countFrames.map((f) => f.activeBackgroundTaskCount)).toEqual([1, 0]);
+	});
+});
+
 describe("background task list deltas", () => {
 	test("creation and completion each push exactly one delta with consecutive versions", async () => {
 		await seedParent();
