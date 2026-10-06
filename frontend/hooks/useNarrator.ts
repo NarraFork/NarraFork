@@ -1,0 +1,1346 @@
+import { publishAskInPassingEvent } from "@frontend/lib/ask-in-passing-events";
+import { notifications } from "@mantine/notifications";
+import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
+import type { SubagentModelPools } from "@shared/subagent-model-policy";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import {
+	ApiError,
+	api,
+	type BlacklistCmd,
+	type BlacklistDir,
+	type PaginatedNarrators,
+	type WhitelistCmd,
+	type WhitelistDir,
+} from "../lib/api";
+import {
+	type RevertAction,
+	type RevertActionConfirmOptions,
+	type RevertActionPreview,
+	type RevertActionTarget,
+	type RevertDiagnostic,
+	type RevertPlanFile,
+	type RevertPlanPreviewIssue,
+	type RevertScopePreviews,
+	type ToolCallDetailRef,
+	toolCallDetailQueryKey,
+} from "../lib/api/narrators";
+import type {
+	CommandBlacklistRuleInput,
+	CommandWhitelistRuleInput,
+	DirectoryBlacklistRuleInput,
+	DirectoryWhitelistRuleInput,
+	RuleTargetSelector,
+} from "../lib/api/types";
+import { RECENT_TABS_QUERY_KEY } from "./useRecentTabs";
+
+const FILE_PREVIEW_QUERY_GC_TIME_MS = 30_000;
+const NARRATORS_LIST_GC_TIME_MS = 60_000;
+const NARRATOR_DETAIL_QUERY_GC_TIME_MS = 60_000;
+const TOOL_CALL_DETAIL_QUERY_GC_TIME_MS = 5 * 60_000;
+
+export function useNarrators(opts?: {
+	chapterId?: string;
+	standalone?: boolean;
+	status?: string;
+	sortBy?: string;
+	sortOrder?: string;
+}) {
+	return useQuery({
+		queryKey: ["narrators", { ...opts }],
+		queryFn: () => api.listNarrators(opts),
+		enabled: !!(opts?.chapterId || opts?.standalone),
+		gcTime: NARRATORS_LIST_GC_TIME_MS,
+	});
+}
+
+export function useNarratorsPaginated(opts?: {
+	projectId?: string;
+	standalone?: boolean | "all";
+	status?: string;
+	filter?: string;
+	sortBy?: string;
+	sortOrder?: string;
+	limit?: number;
+	hasTerminals?: boolean;
+	hasContainers?: boolean;
+	hasRunningContainers?: boolean;
+	hasViewers?: boolean;
+}) {
+	return useInfiniteQuery<PaginatedNarrators>({
+		queryKey: ["narrators", "paginated", { ...opts }],
+		queryFn: ({ pageParam }) =>
+			api.listNarratorsPaginated({ ...opts, cursor: pageParam as string | undefined }),
+		initialPageParam: undefined as string | undefined,
+		getNextPageParam: (lastPage) =>
+			lastPage.hasMore ? (lastPage.nextCursor ?? undefined) : undefined,
+		gcTime: NARRATORS_LIST_GC_TIME_MS,
+	});
+}
+
+// --- File tree status ---
+
+export interface FileTreeStatusFile {
+	path: string;
+	linesAdded: number;
+	linesRemoved: number;
+}
+
+export interface FileTreeStatus {
+	isGitRepo: boolean;
+	files: FileTreeStatusFile[];
+	totalFiles: number;
+	truncated: boolean;
+}
+
+export function useFileTreeStatus(narratorId: string, enabled = true, root?: string) {
+	return useQuery<FileTreeStatus>({
+		// `root` is part of the key: the status is reported relative to the narrator's
+		// cwd, so after a cwd change the previous query's paths would annotate a tree
+		// they no longer describe — and the old entry could linger without a refetch
+		// trigger. A fresh key starts an empty (unannotated) query that refetches
+		// immediately instead.
+		queryKey: ["narrators", narratorId, "file-tree-status", root ?? ""],
+		queryFn: () => api.getFileTreeStatus(narratorId),
+		enabled: enabled && !!narratorId,
+		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
+	});
+}
+
+// --- File rollback previews ---
+
+export function useRollbackPreview(
+	narratorId: string,
+	messageId: string | null,
+	blockIndex: number | null,
+	enabled = false,
+) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "rollback-preview", messageId, blockIndex],
+		queryFn: () => api.getRollbackPreview(narratorId, messageId as string, blockIndex as number),
+		enabled: enabled && !!messageId && blockIndex != null,
+		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
+	});
+}
+
+/**
+ * What editing a user message and regenerating would roll back.
+ *
+ * Prefetched as soon as the editor opens, so the submit handler already knows
+ * whether there is anything to confirm rather than deciding after the fact.
+ */
+export function useEditRegeneratePreview(
+	narratorId: string,
+	messageId: string | null,
+	enabled = false,
+) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "edit-regenerate-preview", messageId],
+		queryFn: () => api.getEditRegeneratePreview(narratorId, messageId as string),
+		enabled: enabled && !!messageId,
+		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
+	});
+}
+
+/** What deleting one tool_use block would roll back, for its confirm dialog. */
+export function useBlockDeletePreview(
+	narratorId: string,
+	messageId: string | null,
+	blockIndex: number | null,
+	enabled = false,
+) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "block-delete-preview", messageId, blockIndex],
+		queryFn: () => api.blockDeletePreview(narratorId, messageId as string, blockIndex as number),
+		enabled: enabled && !!messageId && blockIndex != null,
+		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
+	});
+}
+
+const REVERT_PLAN_PAGE_SIZE = 32;
+const REVERT_PREVIEW_TIMEOUT_MS = 60_000;
+
+function newRevertPreviewKey(revision: number): string {
+	// randomUUID is absent on plain HTTP; an unavailable helper must not crash
+	// the whole history-only confirmation. This is a dedup key, not a credential.
+	const nonce =
+		globalThis.crypto?.randomUUID?.() ??
+		`${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+	return `${revision}-${nonce}`;
+}
+
+interface RevertPreviewRequest {
+	narratorId: string;
+	action: RevertAction;
+	target: RevertActionTarget;
+	key: string;
+	recoveryMode?: "snapshot";
+}
+
+interface RevertPreviewState {
+	request: RevertPreviewRequest;
+	response?: RevertActionPreview;
+	files: RevertPlanFile[];
+	filesComplete: boolean;
+	loading: boolean;
+	issue?: RevertPlanPreviewIssue;
+	error?: string;
+	errorKey?: "revertPlanPreviewTimeout";
+	diagnostics?: RevertDiagnostic[];
+}
+
+function validPlanFile(file: RevertPlanFile): boolean {
+	const identity = file?.identityJson;
+	const boundedText = (value: unknown) =>
+		typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= FILE_CHANGE_LIMITS.metadataBytes;
+	const knownState = (kind: unknown) =>
+		kind === "absent" || kind === "regular" || kind === "symlink";
+	return (
+		boundedText(file?.id) &&
+		boundedText(file?.fileKey) &&
+		boundedText(identity?.deviceId) &&
+		boundedText(identity?.displayPath) &&
+		boundedText(identity?.lexicalPath) &&
+		boundedText(identity?.canonicalPath) &&
+		knownState(file?.expectedStateJson?.kind) &&
+		knownState(file?.desiredStateJson?.kind)
+	);
+}
+
+/**
+ * An action preview is a POST creating one durable plan, not a live query. Never
+ * refetch on focus/invalidation or reuse a previous opening's plan. Pages are
+ * loaded serially under one deadline, with abort and count/cursor admission checks.
+ * Expiration/failed apply revokes the plan; only an explicit reload may re-plan.
+ */
+export function useRevertActionPreview(
+	narratorId: string,
+	action: RevertAction,
+	target: RevertActionTarget | null,
+) {
+	const [revision, setRevision] = useState(0);
+	const [snapshotTarget, setSnapshotTarget] = useState<{
+		narratorId: string;
+		action: RevertAction;
+		target: RevertActionTarget;
+	} | null>(null);
+	const snapshotRequested =
+		!!target &&
+		snapshotTarget?.target === target &&
+		snapshotTarget.narratorId === narratorId &&
+		snapshotTarget.action === action;
+	useEffect(() => {
+		if (!snapshotRequested) setSnapshotTarget(null);
+	}, [snapshotRequested]);
+	const request = useMemo<RevertPreviewRequest | null>(
+		() =>
+			target && narratorId
+				? {
+						narratorId,
+						action,
+						target: { ...target },
+						key: newRevertPreviewKey(revision),
+						...(snapshotRequested ? { recoveryMode: "snapshot" as const } : {}),
+					}
+				: null,
+		[narratorId, action, target, revision, snapshotRequested],
+	);
+	const [state, setState] = useState<RevertPreviewState | null>(null);
+	const [invalidated, setInvalidated] = useState<RevertPreviewRequest | null>(null);
+	const active = useRef<{ request: RevertPreviewRequest; controller: AbortController } | null>(
+		null,
+	);
+
+	useEffect(() => {
+		if (!request) return;
+		const controller = new AbortController();
+		active.current = { request, controller };
+		let disposed = false;
+		let expiryTimer: ReturnType<typeof setTimeout> | undefined;
+		const update = (patch: Partial<RevertPreviewState>) => {
+			if (disposed) return;
+			setState((current) => (current?.request === request ? { ...current, ...patch } : current));
+		};
+		setState({ request, files: [], filesComplete: false, loading: true });
+		const deadline = setTimeout(() => {
+			update({
+				loading: false,
+				issue: "preview_failed",
+				errorKey: "revertPlanPreviewTimeout",
+				diagnostics: [{ code: "REVERT_PREVIEW_TIMEOUT" }],
+			});
+			controller.abort();
+		}, REVERT_PREVIEW_TIMEOUT_MS);
+
+		void (async () => {
+			try {
+				const response = await api.previewRevertAction(
+					request.narratorId,
+					{
+						...request.target,
+						action: request.action,
+						idempotencyKey: request.key,
+						...(request.recoveryMode ? { recoveryMode: request.recoveryMode } : {}),
+					},
+					controller.signal,
+				);
+				if (disposed || controller.signal.aborted) return;
+				const { plan, historySummary } = response;
+				if (
+					response.action !== request.action ||
+					response.executable !== false ||
+					(plan !== null && response.recoveryMode !== request.recoveryMode) ||
+					(plan !== null &&
+						(!historySummary ||
+							!Number.isSafeInteger(historySummary.deletedMessageCount) ||
+							historySummary.deletedMessageCount < 0 ||
+							!Number.isSafeInteger(historySummary.deletedBlockCount) ||
+							historySummary.deletedBlockCount < 0))
+				) {
+					throw new Error("Invalid rollback preview response");
+				}
+				update({ response });
+				if (!plan) {
+					update({ loading: false });
+					return;
+				}
+				const remaining = Date.parse(plan.expiresAt) - Date.now();
+				if (plan.expired !== false || !Number.isFinite(remaining) || remaining <= 0) {
+					update({ loading: false, issue: "expired" });
+					return;
+				}
+				expiryTimer = setTimeout(
+					() => {
+						update({ loading: false, issue: "expired" });
+						controller.abort();
+					},
+					Math.min(remaining, FILE_CHANGE_LIMITS.planLifetimeMs),
+				);
+				const expectedKind = {
+					rollback_to_block: "rollback_to_block",
+					delete_tool_block: "history_delete",
+					revert_files: "revert",
+				}[request.action];
+				if (
+					plan.status !== "prepared" ||
+					typeof plan.id !== "string" ||
+					!plan.id ||
+					typeof plan.planHash !== "string" ||
+					!plan.planHash ||
+					plan.kind !== expectedKind ||
+					plan.coverageComplete !== true
+				) {
+					update({ loading: false, issue: "not_prepared" });
+					return;
+				}
+				if (!Number.isSafeInteger(plan.expectedFileCount) || plan.expectedFileCount < 0) {
+					update({ loading: false, issue: "incomplete_files" });
+					return;
+				}
+				if (plan.expectedFileCount > FILE_CHANGE_LIMITS.revertFiles) {
+					update({ loading: false, issue: "window_too_large" });
+					return;
+				}
+				const files: RevertPlanFile[] = [];
+				const keys = new Set<string>();
+				let cursor: string | undefined;
+				while (!disposed && !controller.signal.aborted) {
+					const page = await api.getRevertPlanFiles(
+						request.narratorId,
+						plan.id,
+						{ limit: REVERT_PLAN_PAGE_SIZE, cursor },
+						controller.signal,
+					);
+					if (disposed || controller.signal.aborted) return;
+					if (
+						!Array.isArray(page.items) ||
+						page.items.length > REVERT_PLAN_PAGE_SIZE ||
+						typeof page.hasMore !== "boolean" ||
+						files.length + page.items.length > plan.expectedFileCount ||
+						page.items.some((file) => {
+							if (!validPlanFile(file) || keys.has(file.fileKey)) return true;
+							keys.add(file.fileKey);
+							return false;
+						})
+					) {
+						update({ loading: false, issue: "incomplete_files" });
+						return;
+					}
+					files.push(...page.items);
+					const nextCursor = page.nextCursor?.fileKey;
+					if (
+						(page.hasMore &&
+							(!nextCursor ||
+								nextCursor === cursor ||
+								nextCursor !== page.items.at(-1)?.fileKey ||
+								files.length >= plan.expectedFileCount)) ||
+						(!page.hasMore && (page.nextCursor !== null || files.length !== plan.expectedFileCount))
+					) {
+						update({ files: [...files], loading: false, issue: "incomplete_files" });
+						return;
+					}
+					update({ files: [...files], filesComplete: !page.hasMore, loading: page.hasMore });
+					if (!page.hasMore) return;
+					cursor = nextCursor;
+				}
+			} catch (error) {
+				if (!controller.signal.aborted) {
+					const code =
+						error instanceof ApiError
+							? "code" in error
+								? error.code
+								: error.data?.code
+							: undefined;
+					const safeCode =
+						typeof code === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(code)
+							? code
+							: error instanceof ApiError
+								? `HTTP_${error.status}`
+								: "REVERT_PREVIEW_FAILED";
+					update({
+						loading: false,
+						issue: "preview_failed",
+						error: error instanceof Error ? error.message.slice(0, 1000) : undefined,
+						diagnostics: [{ code: safeCode }],
+					});
+				}
+			} finally {
+				clearTimeout(deadline);
+			}
+		})();
+		return () => {
+			disposed = true;
+			controller.abort();
+			clearTimeout(deadline);
+			clearTimeout(expiryTimer);
+		};
+	}, [request]);
+
+	const current = request && state?.request === request ? state : null;
+	const revoked = request !== null && invalidated === request;
+	const data = useMemo<RevertScopePreviews | undefined>(() => {
+		if (!current && !revoked) return undefined;
+		const response = current?.response;
+		const plan = response?.plan;
+		const files = (current?.files ?? []).map((file) => ({
+			fileKey: file.fileKey,
+			deviceId: file.identityJson.deviceId,
+			filePath: file.identityJson.displayPath,
+			willBeDeleted: file.desiredStateJson.kind === "absent",
+		}));
+		const issue = revoked ? "reload_required" : current?.issue;
+		return {
+			scope: "narrator",
+			affectedFiles: files,
+			previewIssue: issue,
+			previewError: current?.error,
+			previewErrorKey: current?.errorKey,
+			blockers: response?.blockers,
+			diagnostics: [...(response?.diagnostics ?? []), ...(current?.diagnostics ?? [])],
+			recoveryMode: response?.recoveryMode,
+			narratorScope: {
+				available: !!plan && !issue && current?.filesComplete === true,
+				reason: response?.unavailable,
+				files,
+				conflicts: [],
+				totalFileCount: plan?.expectedFileCount,
+				hasMore: !!plan && !current?.filesComplete,
+			},
+			...(plan && request
+				? {
+						revertPlan: {
+							...plan,
+							planId: plan.id,
+							action: request.action,
+							previewKey: request.key,
+							filesComplete: current?.filesComplete === true && !revoked,
+							recoveryMode: response?.recoveryMode,
+						},
+					}
+				: {}),
+		};
+	}, [current, request, revoked]);
+	const reload = useCallback(() => {
+		setSnapshotTarget(null);
+		setRevision((value) => value + 1);
+	}, []);
+	const requestSnapshotRestore = useCallback(() => {
+		if (!target || !narratorId) return;
+		setSnapshotTarget({ narratorId, action, target });
+		setRevision((value) => value + 1);
+	}, [narratorId, action, target]);
+	const invalidate = useCallback(() => {
+		setInvalidated(request);
+		if (active.current?.request === request) active.current?.controller.abort();
+	}, [request]);
+	return {
+		data,
+		previewKey: request?.key,
+		historySummary: current?.response?.historySummary ?? null,
+		isLoading: !!request && !revoked && (!current || current.loading),
+		reload,
+		requestSnapshotRestore,
+		invalidate,
+	};
+}
+
+/** File+history apply is already one transaction. Never follow it with a legacy delete. */
+export function useRevertHistoryAction(narratorId: string) {
+	const qc = useQueryClient();
+	const { t } = useTranslation("narrator");
+	return useMutation({
+		retry: false,
+		mutationFn: async ({
+			action,
+			target,
+			opts,
+		}: {
+			action: "rollback_to_block" | "delete_tool_block";
+			target: { messageId: string; blockIndex: number };
+			opts: RevertActionConfirmOptions;
+		}) => {
+			if (opts.skipRevert) {
+				const result =
+					action === "rollback_to_block"
+						? await api.rollbackToBlock(narratorId, target.messageId, target.blockIndex, {
+								skipRevert: true,
+							})
+						: await api.deleteMessageBlock(narratorId, target.messageId, target.blockIndex, {
+								skipRevert: true,
+							});
+				if (result.ok !== true) throw new Error(t("deleteMessageFailedDesc"));
+				return { reason: null };
+			}
+			const plan = opts.revertPlan;
+			if (!plan?.planId || !plan.planHash || plan.action !== action) {
+				throw new Error(t("revertPlanReloadRequired"));
+			}
+			const result = await api.applyRevertPlan(narratorId, plan);
+			if (
+				result.planId !== plan.planId ||
+				result.status !== "committed" ||
+				result.journalStatus !== "committed" ||
+				result.settling !== false
+			) {
+				throw new ApiError(result.reason ?? t("revertPlanApplyFailed"), 409, { ...result });
+			}
+			return result;
+		},
+		onSuccess: (result) => {
+			if (result.reason) {
+				notifications.show({
+					title: t("rollbackPartialTitle"),
+					message: result.reason,
+					color: "yellow",
+					autoClose: false,
+				});
+			}
+		},
+		onError: (error, { opts }) => {
+			const status = error instanceof ApiError ? error.data?.status : undefined;
+			const settling = error instanceof ApiError && error.data?.settling === true;
+			const reloadRequired =
+				error instanceof ApiError && error.data?.code === "REVERT_RUNTIME_RELOAD_REQUIRED";
+			const explanation = opts.skipRevert
+				? t("deleteMessageFailedDesc")
+				: reloadRequired
+					? t("revertScopeRuntimeReloadRequired")
+					: settling
+						? t("revertPlanSettling")
+						: status === "recovery_required"
+							? t("revertPlanRecoveryRequired")
+							: status === "compensated"
+								? t("revertPlanCompensated")
+								: t("revertPlanApplyFailed");
+			notifications.show({
+				title: t(opts.skipRevert ? "deleteMessageFailed" : "rollbackFailed"),
+				message: `${explanation}\n${error.message}`,
+				color: "red",
+				autoClose: false,
+			});
+		},
+		onSettled: () => {
+			// A lost response or a compensated result can still change what is visible.
+			for (const resource of ["messages", "file-tree-status", "tool-calls"]) {
+				void qc.invalidateQueries({ queryKey: ["narrators", narratorId, resource] });
+			}
+		},
+	});
+}
+
+export function usePermissionFilePreview(
+	narratorId: string,
+	toolUseId: string | null,
+	enabled = false,
+) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "permission-file-preview", toolUseId],
+		queryFn: () => api.getPermissionFilePreview(narratorId, toolUseId as string),
+		enabled: enabled && !!toolUseId,
+		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
+	});
+}
+
+// === Narrator Fork (standalone narrators only) ===
+
+export function useForkNarrator() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			narratorId,
+			forkMessageId,
+			title,
+			inheritMode,
+		}: {
+			narratorId: string;
+			forkMessageId: string;
+			title?: string;
+			inheritMode?: "full" | "compressed" | "fresh";
+		}) => api.forkNarrator(narratorId, forkMessageId, title, inheritMode),
+		onSuccess: () => {
+			// 只让 narrator 列表失效, 避免误伤 narrator 详情/预览/工具调用等子资源查询
+			qc.invalidateQueries({
+				predicate: (query) => {
+					const key = query.queryKey;
+					if (!Array.isArray(key) || key[0] !== "narrators") return false;
+					// 列表查询: ["narrators", {...}] 或 ["narrators", "paginated", {...}]
+					if (key.length === 2 && typeof key[1] === "object") return true;
+					if (key.length === 3 && key[1] === "paginated") return true;
+					return false;
+				},
+			});
+		},
+	});
+}
+
+export function useStartAskInPassing() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			narratorId,
+			sourceMessageId,
+			sourceMessageUuid,
+		}: {
+			narratorId: string;
+			sourceMessageId: string;
+			sourceMessageUuid?: string;
+		}) => api.startAskInPassing(narratorId, { sourceMessageId, sourceMessageUuid }),
+		onSuccess: (data, { narratorId }) => {
+			if (data.message) {
+				publishAskInPassingEvent({ kind: "start", narratorId, message: data.message, focus: true });
+			}
+			qc.invalidateQueries({ queryKey: ["narrators", narratorId, "messages"] });
+		},
+	});
+}
+
+export function useAskInPassing() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			narratorId,
+			question,
+			pendingMessageId,
+		}: {
+			narratorId: string;
+			question: string;
+			pendingMessageId: string;
+		}) => api.askInPassing(narratorId, { question, pendingMessageId }),
+		// Only the narrator LISTS need refreshing (a new standalone narrator now
+		// exists). Invalidating the whole `["narrators"]` prefix also dropped every
+		// open session's messages/tool-calls/preview caches — including the panel the
+		// answer opens in, which then refetches its history from scratch. Mirrors the
+		// predicate `useForkNarrator` already uses for the same reason.
+		onSuccess: (data, { narratorId }) => {
+			if (data.message) {
+				publishAskInPassingEvent({ kind: "resolved", narratorId, message: data.message });
+			}
+			qc.invalidateQueries({
+				predicate: (query) => {
+					const key = query.queryKey;
+					if (!Array.isArray(key) || key[0] !== "narrators") return false;
+					if (key.length === 2 && typeof key[1] === "object") return true;
+					if (key.length === 3 && key[1] === "paginated") return true;
+					return false;
+				},
+			});
+		},
+	});
+}
+
+export function useCancelAskInPassing() {
+	return useMutation({
+		mutationFn: ({ narratorId, messageId }: { narratorId: string; messageId: string }) =>
+			api.cancelAskInPassing(narratorId, messageId),
+		onSuccess: (_data, { narratorId, messageId }) => {
+			publishAskInPassingEvent({ kind: "deleted", narratorId, messageId });
+		},
+	});
+}
+
+export function useResumeRecoverySubagents() {
+	const qc = useQueryClient();
+	const { t } = useTranslation("narrator");
+	return useMutation({
+		mutationFn: ({
+			narratorId,
+			messageId,
+			subagentIds,
+			mode,
+		}: {
+			narratorId: string;
+			messageId: string;
+			subagentIds: string[];
+			mode: "notify" | "await";
+		}) => api.resumeRecoverySubagents(narratorId, { messageId, subagentIds, mode }),
+		onSuccess: (data, { narratorId }) => {
+			qc.invalidateQueries({ queryKey: ["narrators", narratorId, "messages"] });
+			qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
+			if (data.skipped.length > 0) {
+				notifications.show({
+					color: "orange",
+					title: t("subagentRecoveryPartial", {
+						resumed: data.resumed,
+						skipped: data.skipped.length,
+					}),
+					message: data.skipped.map((entry) => `${entry.id}: ${entry.reason}`).join("\n"),
+				});
+			}
+		},
+		onError: (error) => {
+			notifications.show({
+				color: "red",
+				title: t("subagentRecoveryFailed"),
+				message: error.message,
+			});
+		},
+	});
+}
+
+export function usePromoteNarrator() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (narratorId: string) => api.promoteNarrator(narratorId),
+		onSuccess: (_data, narratorId) => {
+			qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+export function useExtractSubagentToPrimary() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (vars: {
+			narratorId: string;
+			title?: string;
+			inheritMode?: "full" | "compressed";
+			locale?: "en" | "zh-CN";
+		}) =>
+			api.extractSubagentToPrimary(vars.narratorId, {
+				title: vars.title,
+				inheritMode: vars.inheritMode,
+				locale: vars.locale,
+			}),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators", vars.narratorId] });
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+export function useNarrator(id: string) {
+	return useQuery({
+		queryKey: ["narrators", id],
+		queryFn: ({ signal }) => api.getNarrator(id, signal),
+		enabled: !!id,
+		// Narrator data is kept fresh via WS invalidation (useNarratorPanelWS).
+		// A 30s staleTime avoids redundant refetches when multiple components
+		// subscribe to the same narrator (e.g. route + NarratorPanel).
+		staleTime: 30_000,
+		gcTime: NARRATOR_DETAIL_QUERY_GC_TIME_MS,
+	});
+}
+
+export function useNarratorUsageStats(narratorId: string, includeSubagents = true, enabled = true) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "usage-stats", { includeSubagents }],
+		queryFn: () => api.getNarratorUsageStats(narratorId, { includeSubagents }),
+		enabled: !!narratorId && enabled,
+		staleTime: 15_000,
+		gcTime: 60_000,
+	});
+}
+
+export function useToolCallDetail(
+	narratorId: string,
+	toolUseId: string,
+	enabled: boolean,
+	ref?: ToolCallDetailRef,
+) {
+	return useQuery({
+		queryKey: toolCallDetailQueryKey(narratorId, toolUseId, ref),
+		queryFn: ({ signal }) => api.getToolCallDetail(narratorId, toolUseId, ref, signal),
+		enabled: !!narratorId && !!toolUseId && enabled,
+		staleTime: TOOL_CALL_DETAIL_QUERY_GC_TIME_MS,
+		gcTime: TOOL_CALL_DETAIL_QUERY_GC_TIME_MS,
+	});
+}
+
+export function useCreateNarrator() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (data: {
+			chapterId?: string | null;
+			type?: string;
+			model?: string;
+			systemPrompt?: string;
+			permissionMode?: string;
+			startInPlanMode?: boolean;
+			reasoningEffort?: string | null;
+			fastModeOverride?: "inherit" | "on" | "off";
+			relaxedPlan?: boolean;
+			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
+			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+			cwd?: string;
+			makeNamed?: boolean;
+			handle?: string;
+			kind?: "knowledge";
+		}) =>
+			// No fast-mode default is injected here: new narrators keep the "inherit"
+			// override and the server resolves it against the user's fastModeDefault
+			// on every turn. AppRootLayout migrates the legacy localStorage flag into
+			// that preference.
+			api.createNarrator(data),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+export function useArchiveNarrator() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.archiveNarrator(id),
+		onSuccess: (_data, narratorId) => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+			// Remove all tabs associated with the archived narrator from the sidebar
+			const tabs =
+				qc.getQueryData<
+					{ type: "chapter" | "narrator" | "project"; id: string; narratorId?: string }[]
+				>(RECENT_TABS_QUERY_KEY) ?? [];
+			const isMatch = (t: (typeof tabs)[number]) =>
+				(t.type === "narrator" && t.id === narratorId) ||
+				(t.type === "chapter" && t.narratorId === narratorId);
+			const matched = tabs.filter(isMatch);
+			if (matched.length > 0) {
+				for (const tab of matched) {
+					api.removeRecentTab(tab.type, tab.id).catch(() => {});
+				}
+				qc.setQueryData(
+					RECENT_TABS_QUERY_KEY,
+					tabs.filter((t) => !isMatch(t)),
+				);
+			}
+		},
+	});
+}
+export function useUnarchiveNarrator() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.unarchiveNarrator(id),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+export function useDeleteNarrator() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.deleteNarrator(id),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+export function useInterruptNarrator() {
+	return useMutation({
+		mutationFn: ({ id, waitForIdle = false }: { id: string; waitForIdle?: boolean }) =>
+			api.interruptNarrator(id, waitForIdle),
+	});
+}
+
+export function useUpdateSubagentConclusion() {
+	return useMutation({
+		mutationFn: (id: string) => api.updateSubagentConclusion(id),
+	});
+}
+
+export function useTakeoverSubagent() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.takeoverSubagent(id),
+		onSuccess: (_data, id) => {
+			qc.invalidateQueries({ queryKey: ["narrators", id] });
+		},
+	});
+}
+
+export function useStopTakeoverSubagent() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: async (id: string): Promise<{ stopped: boolean; deferred?: boolean }> => {
+			// The subagent may momentarily be in the "settling" window (its takeover
+			// interrupt has fired but the loop has not yet reached the suspension
+			// branch). Current servers record a pending stop and return success, but
+			// guard against transient 409s (older servers / extremely short windows)
+			// with a few silent retries so the user never sees a raw error toast.
+			const MAX_ATTEMPTS = 4;
+			const RETRY_DELAY_MS = 400;
+			for (let attempt = 0; ; attempt++) {
+				try {
+					return await api.stopTakeoverSubagent(id);
+				} catch (err) {
+					const isSettling = err instanceof ApiError && err.status === 409;
+					if (!isSettling) throw err;
+					if (attempt >= MAX_ATTEMPTS - 1) {
+						// Window did not clear in time. The server has already recorded
+						// the pending stop, so the takeover will resolve on its own when
+						// the loop suspends; swallow the transient error rather than
+						// surfacing a confusing failure toast.
+						return { stopped: true, deferred: true };
+					}
+					await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+				}
+			}
+		},
+		onSuccess: (_data, id) => {
+			qc.invalidateQueries({ queryKey: ["narrators", id] });
+		},
+	});
+}
+
+export function useUpdatePermissionMode() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, permissionMode }: { id: string; permissionMode: string }) =>
+			api.updateNarratorPermissionMode(id, permissionMode),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+export function useEnterPlanMode() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.enterPlanMode(id),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+export function useExitPlanMode() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.exitPlanMode(id),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+// ── Whitelist directories ──
+
+export function useWhitelistDirs(narratorId: string) {
+	return useQuery<WhitelistDir[]>({
+		queryKey: ["whitelist-dirs", narratorId],
+		queryFn: () => api.getWhitelistDirs(narratorId),
+		enabled: !!narratorId,
+	});
+}
+
+export function useCreateWhitelistDir() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ narratorId, ...rule }: { narratorId: string } & DirectoryWhitelistRuleInput) =>
+			api.createWhitelistDir(narratorId, rule),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["whitelist-dirs", vars.narratorId] });
+		},
+	});
+}
+
+export function useUpdateWhitelistDir(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			dirId,
+			...data
+		}: { dirId: string } & Partial<DirectoryWhitelistRuleInput> & {
+				selector?: RuleTargetSelector;
+			}) => api.updateWhitelistDir(dirId, data),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["whitelist-dirs", narratorId] });
+		},
+	});
+}
+
+export function useDeleteWhitelistDir(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (dirId: string) => api.deleteWhitelistDir(dirId),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["whitelist-dirs", narratorId] });
+		},
+	});
+}
+
+export function useBlacklistDirs(narratorId: string) {
+	return useQuery<BlacklistDir[]>({
+		queryKey: ["blacklist-dirs", narratorId],
+		queryFn: () => api.getBlacklistDirs(narratorId),
+		enabled: !!narratorId,
+	});
+}
+
+export function useCreateBlacklistDir() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ narratorId, ...rule }: { narratorId: string } & DirectoryBlacklistRuleInput) =>
+			api.createBlacklistDir(narratorId, rule),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["blacklist-dirs", vars.narratorId] });
+		},
+	});
+}
+
+export function useUpdateBlacklistDir(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			dirId,
+			...data
+		}: { dirId: string } & Partial<DirectoryBlacklistRuleInput> & {
+				selector?: RuleTargetSelector;
+			}) => api.updateBlacklistDir(dirId, data),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["blacklist-dirs", narratorId] });
+		},
+	});
+}
+
+export function useDeleteBlacklistDir(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (dirId: string) => api.deleteBlacklistDir(dirId),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["blacklist-dirs", narratorId] });
+		},
+	});
+}
+
+// ── Command whitelist ──
+
+export function useCmdWhitelist(narratorId: string) {
+	return useQuery<WhitelistCmd[]>({
+		queryKey: ["cmd-whitelist", narratorId],
+		queryFn: () => api.getCmdWhitelist(narratorId),
+		enabled: !!narratorId,
+	});
+}
+
+export function useCreateCmdWhitelist() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ narratorId, ...rule }: { narratorId: string } & CommandWhitelistRuleInput) =>
+			api.createCmdWhitelist(narratorId, rule),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["cmd-whitelist", vars.narratorId] });
+		},
+	});
+}
+
+export function useUpdateCmdWhitelist(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			entryId,
+			...data
+		}: { entryId: string } & Partial<CommandWhitelistRuleInput> & {
+				selector?: RuleTargetSelector;
+			}) => api.updateCmdWhitelist(entryId, data),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["cmd-whitelist", narratorId] });
+		},
+	});
+}
+
+export function useDeleteCmdWhitelist(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (entryId: string) => api.deleteCmdWhitelist(entryId),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["cmd-whitelist", narratorId] });
+		},
+	});
+}
+
+// ── Command blacklist ──
+
+export function useCmdBlacklist(narratorId: string) {
+	return useQuery<BlacklistCmd[]>({
+		queryKey: ["cmd-blacklist", narratorId],
+		queryFn: () => api.getCmdBlacklist(narratorId),
+		enabled: !!narratorId,
+	});
+}
+
+export function useCreateCmdBlacklist() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ narratorId, ...rule }: { narratorId: string } & CommandBlacklistRuleInput) =>
+			api.createCmdBlacklist(narratorId, rule),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["cmd-blacklist", vars.narratorId] });
+		},
+	});
+}
+
+export function useUpdateCmdBlacklist(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			entryId,
+			...data
+		}: { entryId: string } & Partial<CommandBlacklistRuleInput> & {
+				selector?: RuleTargetSelector;
+			}) => api.updateCmdBlacklist(entryId, data),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["cmd-blacklist", narratorId] });
+		},
+	});
+}
+
+export function useDeleteCmdBlacklist(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (entryId: string) => api.deleteCmdBlacklist(entryId),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["cmd-blacklist", narratorId] });
+		},
+	});
+}
+
+export function useUpdateReasoningEffort() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, reasoningEffort }: { id: string; reasoningEffort: string | null }) =>
+			api.updateNarratorReasoningEffort(id, reasoningEffort),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+export function useUpdateFastMode() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			id,
+			fastModeOverride,
+		}: {
+			id: string;
+			fastModeOverride: "inherit" | "on" | "off";
+		}) => api.updateNarratorFastMode(id, fastModeOverride),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+export function useUpdateRelaxedPlan() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, relaxedPlan }: { id: string; relaxedPlan: boolean }) =>
+			api.updateNarratorRelaxedPlan(id, relaxedPlan),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+export function useUpdateReflectionOverrides() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			id,
+			...data
+		}: {
+			id: string;
+			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
+			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+			autoContinuationOverride?: "inherit" | "always" | "blockStop" | "protectedOnly" | "off";
+			tasksReminderIntervalOverride?: number | null;
+		}) => api.updateNarratorReflectionOverrides(id, data),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id] });
+		},
+	});
+}
+
+export function useUpdateBehaviorFence() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			id,
+			...data
+		}: {
+			id: string;
+			behaviorFenceIntervalOverride?: number | null;
+			behaviorFenceAttachOverride?: "inherit" | "on" | "off";
+		}) => api.updateNarratorBehaviorFence(id, data),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id] });
+		},
+	});
+}
+
+export function useUpdateModel() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, model }: { id: string; model: string }) =>
+			api.updateNarratorModel(id, model),
+		onSuccess: (_data, vars) => {
+			// Changing the model abandons the unavailable model's wait condition, so
+			// dismiss its persistent notification even if the server does not emit a
+			// recovery event for the old model.
+			notifications.hide(`model-unavailable-${vars.id}`);
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+export function useUpdateCwd() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, cwd }: { id: string; cwd: string }) => api.updateNarratorCwd(id, cwd),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id] });
+			qc.invalidateQueries({ queryKey: ["narrator-commands", vars.id] });
+			qc.invalidateQueries({ queryKey: ["narrator-skills", vars.id] });
+		},
+	});
+}
+
+export function useNarratorSkills(id: string, enabled = true) {
+	return useQuery({
+		queryKey: ["narrator-skills", id],
+		queryFn: () => api.getNarratorSkills(id),
+		enabled: !!id && enabled,
+		staleTime: 15_000,
+		gcTime: NARRATOR_DETAIL_QUERY_GC_TIME_MS,
+	});
+}
+
+export function useRefreshNarratorSkills() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.getNarratorSkills(id, { refresh: true }),
+		onSuccess: (_data, id) => {
+			qc.setQueryData(["narrator-skills", id], _data);
+			qc.invalidateQueries({ queryKey: ["narrator-commands", id] });
+		},
+	});
+}
+
+export function useNarratorCustomTraits(id: string, enabled = true) {
+	return useQuery({
+		queryKey: ["narrators", id, "custom-traits"],
+		queryFn: () => api.getCustomTraits(id),
+		enabled: !!id && enabled,
+		gcTime: NARRATOR_DETAIL_QUERY_GC_TIME_MS,
+	});
+}
+
+export function useUpdateSubagentModelRestriction() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, pools }: { id: string; pools: SubagentModelPools }) =>
+			api.updateSubagentModelRestriction(id, pools),
+		onSuccess: (data, vars) => {
+			qc.setQueryData(["narrators", vars.id, "custom-traits"], data.customTraits);
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id, "custom-traits"] });
+		},
+	});
+}
+
+export function useClearSubagentModelRestriction() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.clearSubagentModelRestriction(id),
+		onSuccess: (data, id) => {
+			qc.setQueryData(["narrators", id, "custom-traits"], data.customTraits);
+			qc.invalidateQueries({ queryKey: ["narrators", id] });
+			qc.invalidateQueries({ queryKey: ["narrators", id, "custom-traits"] });
+		},
+	});
+}
+
+export function useUpdateDisabledTools() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, tools }: { id: string; tools: string[] }) =>
+			api.updateDisabledTools(id, tools),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id, "custom-traits"] });
+		},
+	});
+}
+
+export function useClearDisabledTools() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.clearDisabledTools(id),
+		onSuccess: (_data, id) => {
+			qc.invalidateQueries({ queryKey: ["narrators", id] });
+			qc.invalidateQueries({ queryKey: ["narrators", id, "custom-traits"] });
+		},
+	});
+}
+
+export function useUpdateBlockedSkills() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, all, names }: { id: string; all: boolean; names: string[] }) =>
+			api.updateBlockedSkills(id, { all, names }),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id, "custom-traits"] });
+			qc.invalidateQueries({ queryKey: ["narrator-commands", vars.id] });
+		},
+	});
+}
+
+export function useClearBlockedSkills() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.clearBlockedSkills(id),
+		onSuccess: (_data, id) => {
+			qc.invalidateQueries({ queryKey: ["narrators", id] });
+			qc.invalidateQueries({ queryKey: ["narrators", id, "custom-traits"] });
+			qc.invalidateQueries({ queryKey: ["narrator-commands", id] });
+		},
+	});
+}

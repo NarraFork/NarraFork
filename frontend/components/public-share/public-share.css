@@ -1,0 +1,65 @@
+.public-share-page {
+	height: 100dvh;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right))
+		max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+	gap: 10px;
+}
+.public-share-columns {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) minmax(300px, 38%);
+	gap: 12px;
+	flex: 1;
+	min-height: 0;
+}
+.public-share-pane {
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
+	min-width: 0;
+	border: 1px solid var(--mantine-color-default-border);
+	border-radius: 8px;
+	overflow: hidden;
+}
+.public-share-pane-header {
+	padding: 8px 12px;
+	border-bottom: 1px solid var(--mantine-color-default-border);
+}
+/* The vlist surface inside a pane: the list owns its own scrolling. */
+.public-share-list {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+}
+.public-share-list > * {
+	flex: 1;
+	min-height: 0;
+}
+.public-share-composer {
+	padding: 10px;
+	border-top: 1px solid var(--mantine-color-default-border);
+}
+.public-share-placeholder {
+	color: var(--mantine-color-dimmed);
+	font-style: italic;
+}
+.public-share-mobile-tabs {
+	display: none;
+}
+@media (max-width: 767px) {
+	.public-share-columns {
+		display: flex;
+	}
+	.public-share-pane {
+		flex: 1;
+	}
+	.public-share-pane[data-mobile-hidden="true"] {
+		display: none;
+	}
+	.public-share-mobile-tabs {
+		display: block;
+	}
+}

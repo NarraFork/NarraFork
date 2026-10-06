@@ -1,0 +1,6 @@
+{
+	"version": "0.4.11",
+	"date": "2026-05-10",
+	"en": "## New Features\n\n- Added configurable context pruning and compaction thresholds, including a max-prune trigger and in-panel threshold settings for narrators.\n- Improved narrator status indicators so background compaction and reasoning states remain visible without masking higher-priority statuses.\n\n## Bug Fixes\n\n- Fixed custom slash commands with a Bash pre-step so their expanded prompt continues to the narrator after the command runs.\n- Improved Codex WebSocket fallback detection for wrapped Expected 101 status code failures.",
+	"zh-CN": "## 新功能\n\n- 新增可配置的上下文裁剪与压缩阈值，包括最大裁剪触发点和叙述者面板内的阈值设置。\n- 改进叙述者状态提示，让后台压缩和推理状态保持可见，同时不遮盖更高优先级状态。\n\n## 修复\n\n- 修复带 Bash 前置步骤的自定义斜杠命令，确保命令执行后展开后的提示词会继续发送给叙述者。\n- 改进 Codex WebSocket 对包装后的 Expected 101 status code 失败的降级识别。"
+}

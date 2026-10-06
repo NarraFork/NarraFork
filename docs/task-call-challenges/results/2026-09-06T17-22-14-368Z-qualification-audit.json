@@ -1,0 +1,17 @@
+{
+  "runId": "2026-09-06T17-22-14-368Z",
+  "candidate": "task-call-v6-coherent",
+  "gatePassed": true,
+  "episodes": 24,
+  "qualified": 24,
+  "explicitDelivery": 22,
+  "naturalCompletion": 2,
+  "evals": 60,
+  "requests": 62,
+  "allSourcesAndInputsMatch": true,
+  "roundOrderVerified": true,
+  "scorerHash": "9dca713be6015bb951fbf903663d10dcf08025fdc15b94e5906a5144d91b9398",
+  "forbiddenAttempts": 0,
+  "productionAuthorized": false,
+  "nextAction": "AskUserQuestion and wait for the user to finish other uncommitted changes and explicitly authorize continuation."
+}

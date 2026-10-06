@@ -1,0 +1,6 @@
+{
+	"version": "0.2.10",
+	"date": "2026-04-30",
+	"en": "## New Features\n\n- Image generation results are now saved to the filesystem instead of storing large base64 data in the database\n- Streaming blocks (text, web search, image generation) are ordered by outputIndex for correct interleaving\n- Anthropic model list fetching automatically retries with gateway suffix stripping and /v1 fallback for third-party proxies\n\n## Bug Fixes\n\n- Fixed image generation interruption check: only skip when block_complete carries actual result data, preventing silent loss of unpersisted images when the stream breaks mid-generation",
+	"zh-CN": "## 新功能\n\n- 图片生成结果保存到文件系统，避免大体积 base64 数据存入数据库\n- 流式输出块（文本、网页搜索、图片生成）按 outputIndex 排序，确保交错顺序正确\n- Anthropic 模型列表获取支持自动剥离网关后缀和追加 /v1 重试，兼容更多第三方中转\n\n## 修复\n\n- 修复图片生成中断检查：仅在 block_complete 携带实际 result 数据时才跳过，防止流中断时图片未持久化却不触发恢复"
+}

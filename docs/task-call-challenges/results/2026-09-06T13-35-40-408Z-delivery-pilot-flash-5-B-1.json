@@ -1,0 +1,290 @@
+{
+  "runId": "2026-09-06T13-35-40-408Z",
+  "image": "0d36aaa2c1ad7cccd2dc0cf7fba4efb11ea7193023cecb1c27a84463c9ba01aa",
+  "limits": {
+    "responses": 5,
+    "evals": 6,
+    "requestMs": 120000,
+    "responseChars": 64000
+  },
+  "model": "nug2:antigravity:gemini-3.7-flash",
+  "requestedEffort": "low",
+  "channelType": "anthropic",
+  "challenge": "05-changed-contract.md",
+  "challengeId": "5",
+  "interfaceVersion": "task-call-v5-delivery",
+  "apiHash": "42867f3211583c70d7461d5c72f9f7e0f1a8bf9d6b654167a95284aeef0df2dc",
+  "descriptionHash": "33be249d00059c586826ec0518dc65bdc5d047ad7d8ae475de054ee2a7837918",
+  "contractHash": "ee3a01083056859eec6cbb881a72c455f2bda217b6b42233ee3fa2f73e0483bf",
+  "challengeHash": "0c4e63605d8031226949d5f1c784b8c3b1e9911781c788fe8e1b384e00cda388",
+  "fixtureHash": "2ef9e1666dca7674aac8f3bb4a318ce863938047796017ad0589a91f245871b8",
+  "firstEvalPass": false,
+  "finalPass": true,
+  "reasons": [],
+  "naturalStop": false,
+  "deliveryAccepted": true,
+  "deliveryProtocolErrors": 0,
+  "correctDelivery": true,
+  "evalCount": 2,
+  "durationMs": 7543,
+  "helps": 0,
+  "uncaughtScriptErrors": 0,
+  "interfaceViolations": 0,
+  "finalText": "验收条件发生变化: 任务目标已改变，本次未提交，生命周期保持原状。这不是 TEST_FAILURE，不要自动 block。用当前对象 read() 返回最新 acceptance 供判断，不用旧结果重试；此前成功操作不回滚。",
+  "lastValue": "新增要求：必须覆盖 refresh-token 过期与撤销两种边界。",
+  "finalState": {
+    "caseId": "5",
+    "actor": {
+      "id": "lead",
+      "role": "primary"
+    },
+    "team": "team-a",
+    "currentKey": "T05",
+    "tasks": [
+      {
+        "key": "T05",
+        "text": "任务 T05",
+        "status": "doing",
+        "team": "team-a",
+        "assignee": "lead",
+        "manager": "lead",
+        "creator": "lead",
+        "participants": [
+          "worker"
+        ],
+        "parent": null,
+        "archived": false,
+        "paused": false,
+        "version": 2,
+        "contractVersion": 2,
+        "acceptance": "新增要求：必须覆盖 refresh-token 过期与撤销两种边界。",
+        "description": "完成本任务并如实报告。",
+        "result": null,
+        "submission": null
+      }
+    ],
+    "nextKey": 100,
+    "pageSize": 2,
+    "evalNumber": 2,
+    "trace": [
+      {
+        "eval": 1,
+        "op": "read",
+        "key": "T05",
+        "args": null,
+        "ok": true
+      },
+      {
+        "eval": 2,
+        "op": "Bash",
+        "args": {
+          "command": "bun test session-core"
+        },
+        "ok": true
+      },
+      {
+        "eval": 2,
+        "op": "finish",
+        "key": "T05",
+        "args": {
+          "summary": "bun test session-core: PASS"
+        },
+        "ok": false,
+        "error": {
+          "code": "CONTRACT_CHANGED",
+          "message": "任务目标已改变，本次未提交，生命周期保持原状。这不是 TEST_FAILURE，不要自动 block。用当前对象 read() 返回最新 acceptance 供判断，不用旧结果重试；此前成功操作不回滚。"
+        }
+      },
+      {
+        "eval": 2,
+        "op": "read",
+        "key": "T05",
+        "args": null,
+        "ok": true
+      },
+      {
+        "eval": 2,
+        "op": "deliver",
+        "args": {
+          "hasSummary": true
+        },
+        "ok": true
+      }
+    ],
+    "testCommand": "bun test session-core",
+    "testPass": true,
+    "testedVersion": 1,
+    "contractChanged": true
+  },
+  "turns": [
+    {
+      "turn": 1,
+      "text": "",
+      "calls": [
+        {
+          "toolUseId": "call_2258004",
+          "name": "Eval",
+          "input": {
+            "code": "const data = task.read();\nreturn data;"
+          }
+        }
+      ],
+      "usage": {
+        "promptTokens": 1312,
+        "completionTokens": 355
+      },
+      "stopReason": "tool_use",
+      "reasoningChars": 0,
+      "wire": [
+        {
+          "model": "antigravity:gemini-3.7-flash",
+          "effort": "low",
+          "tools": [
+            "Eval"
+          ],
+          "thinkingType": "enabled",
+          "descriptionHash": "33be249d00059c586826ec0518dc65bdc5d047ad7d8ae475de054ee2a7837918",
+          "apiHash": "42867f3211583c70d7461d5c72f9f7e0f1a8bf9d6b654167a95284aeef0df2dc"
+        }
+      ],
+      "evals": [
+        {
+          "number": 1,
+          "toolUseId": "call_2258004",
+          "feedback": {
+            "ok": true,
+            "value": {
+              "key": "T05",
+              "text": "任务 T05",
+              "status": "doing",
+              "paused": false,
+              "archived": false,
+              "description": "完成本任务并如实报告。",
+              "acceptance": "先执行 bun test session-core，再提交当前测试结果。",
+              "result": null,
+              "workflow": {
+                "kind": "execute",
+                "actions": [
+                  "task.finish",
+                  "task.block"
+                ],
+                "note": "执行自己的工作：按要求操作并验证后 finish(summary)；自管任务 done，分派任务 submitted、等待负责人验收。实际测试失败（TEST_FAILURE）才 block，不把提交/验收异常当测试失败。只查询或列计划时不要执行这些动作。"
+              }
+            },
+            "logs": []
+          },
+          "trace": [
+            {
+              "eval": 1,
+              "op": "read",
+              "key": "T05",
+              "args": null,
+              "ok": true
+            }
+          ],
+          "gradeAfterEval": {
+            "pass": false,
+            "reasons": [
+              "未经历预设目标变更拒绝",
+              "未返回新的 acceptance",
+              "拒绝后再次提交或重新执行了旧测试"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "turn": 2,
+      "text": "",
+      "calls": [
+        {
+          "toolUseId": "call_950559",
+          "name": "Eval",
+          "input": {
+            "code": "let testRes;\ntry {\n  testRes = tools.Bash({ command: \"bun test session-core\" });\n} catch (e: any) {\n  testRes = e;\n}\n\nlet finishRes;\ntry {\n  finishRes = task.finish(testRes.output || String(testRes));\n  return { status: \"finished\", finishRes };\n} catch (e: any) {\n  const updated = task.read();\n  deliver(updated.acceptance, `验收条件发生变化: ${e.message || e.code}`);\n}"
+          }
+        }
+      ],
+      "usage": {
+        "promptTokens": 1827,
+        "completionTokens": 350
+      },
+      "stopReason": "tool_use",
+      "reasoningChars": 374,
+      "wire": [
+        {
+          "model": "antigravity:gemini-3.7-flash",
+          "effort": "low",
+          "tools": [
+            "Eval"
+          ],
+          "thinkingType": "enabled",
+          "descriptionHash": "33be249d00059c586826ec0518dc65bdc5d047ad7d8ae475de054ee2a7837918",
+          "apiHash": "42867f3211583c70d7461d5c72f9f7e0f1a8bf9d6b654167a95284aeef0df2dc"
+        }
+      ],
+      "evals": [
+        {
+          "number": 2,
+          "toolUseId": "call_950559",
+          "delivery": {
+            "summary": "验收条件发生变化: 任务目标已改变，本次未提交，生命周期保持原状。这不是 TEST_FAILURE，不要自动 block。用当前对象 read() 返回最新 acceptance 供判断，不用旧结果重试；此前成功操作不回滚。"
+          },
+          "feedback": {
+            "ok": true,
+            "value": "新增要求：必须覆盖 refresh-token 过期与撤销两种边界。",
+            "logs": []
+          },
+          "trace": [
+            {
+              "eval": 2,
+              "op": "Bash",
+              "args": {
+                "command": "bun test session-core"
+              },
+              "ok": true
+            },
+            {
+              "eval": 2,
+              "op": "finish",
+              "key": "T05",
+              "args": {
+                "summary": "bun test session-core: PASS"
+              },
+              "ok": false,
+              "error": {
+                "code": "CONTRACT_CHANGED",
+                "message": "任务目标已改变，本次未提交，生命周期保持原状。这不是 TEST_FAILURE，不要自动 block。用当前对象 read() 返回最新 acceptance 供判断，不用旧结果重试；此前成功操作不回滚。"
+              }
+            },
+            {
+              "eval": 2,
+              "op": "read",
+              "key": "T05",
+              "args": null,
+              "ok": true
+            },
+            {
+              "eval": 2,
+              "op": "deliver",
+              "args": {
+                "hasSummary": true
+              },
+              "ok": true
+            }
+          ],
+          "gradeAfterEval": {
+            "pass": true,
+            "reasons": []
+          }
+        }
+      ],
+      "notExecutedAfterDelivery": []
+    }
+  ],
+  "stage": "pilot",
+  "condition": "B",
+  "repeat": 1,
+  "ordinal": 2,
+  "file": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-flash-5-B-1.json"
+}

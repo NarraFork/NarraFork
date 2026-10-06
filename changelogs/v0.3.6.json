@@ -1,0 +1,6 @@
+{
+	"version": "0.3.6",
+	"date": "2026-05-04",
+	"en": "## Bug Fixes\n\n- Prevent narrator context-overflow recovery from retrying too early when automatic compacting does not actually produce a history compact.\n- Distinguish history, segment, and probe compact locks so concurrent compact operations wait and resume more reliably.",
+	"zh-CN": "## 修复\n\n- 避免叙述者在上下文溢出恢复中，于自动压缩未真正生成历史压缩时过早重试。\n- 区分历史压缩、片段压缩和探测锁，让并发压缩操作的等待与恢复更加可靠。"
+}

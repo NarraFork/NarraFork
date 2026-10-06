@@ -1,0 +1,449 @@
+import { and, eq, inArray } from "drizzle-orm";
+import { Hono } from "hono";
+import { db } from "../db";
+import { chapters } from "../db/schema";
+import { ValidationError } from "../lib/errors";
+import { logger } from "../lib/logger";
+import { parseSubstatus } from "../lib/narrator-utils";
+import { projectPrincipalOf, requireProjectAccess } from "../lib/project-access";
+import { updateGraphPositionsSchema } from "../lib/validators";
+import { commitSyncService } from "../services/commit-sync-service";
+import { gitService } from "../services/git-service";
+import { projectReadAdapter, projectReadBackend } from "../services/read";
+
+export interface GraphNode {
+	id: string;
+	type: string;
+	data: {
+		title: string;
+		status: string;
+		branch: string;
+		role: string;
+		color: string | null;
+		groupLabel: string | null;
+		explorationGroupId: string | null;
+		narratorCount: number;
+		narratorId: string | null;
+		narratorStatus: string | null;
+		narratorSubstatus: string[] | null;
+		hasContainers: boolean;
+		isRoot: boolean;
+		commitCount: number;
+		headCommitSha: string | null;
+		panelExpanded: boolean;
+		panelWidth: number | null;
+		panelHeight: number | null;
+		worktreePath: string | null;
+	};
+	/**
+	 * Classic canvas coordinates. `null` means this chapter has never been placed by
+	 * hand there, so the client should auto-layout it.
+	 *
+	 * Deliberately NOT the ruler columns (`axisOffset`/`crossOffset`): those are
+	 * offsets relative to a commit tick and are meaningless as world coordinates —
+	 * reading them here is what threw classic's nodes tens of thousands of pixels
+	 * away in ruler-arranged projects. See `chapters.graphX` in the schema.
+	 */
+	position: {
+		x: number | null;
+		y: number | null;
+	};
+}
+
+export interface GraphEdge {
+	id: string;
+	source: string;
+	target: string;
+	type: string;
+	metadata?: unknown;
+}
+
+/**
+ * One degraded aspect of a graph response, so the client can say *what* is stale
+ * rather than silently rendering cached numbers as if they were fresh.
+ *
+ * `feature`/`reason` are stable machine-readable identifiers the frontend formats
+ * into its alert; `message` is prose *we* wrote. Aggregated per feature — see the
+ * dedup note at the call site.
+ *
+ * Deliberately has no field for a raw error string. Not because of the worktree path
+ * such a string usually contains — `GraphNode.data.worktreePath` publishes that to
+ * the same clients anyway — but because git's stderr is unbounded output from a
+ * subprocess, shaped by the user's git version, locale and config. Putting it in a
+ * response means an untranslatable, arbitrarily long, arbitrarily detailed string
+ * rendered verbatim in the UI, and a response size nobody budgeted. `reason` is what
+ * the client actually needs: a fixed identifier it can translate and act on.
+ *
+ * The detail is not lost. It goes to `logger.warn` at the call site, which is where
+ * an operator diagnosing a broken repository is already looking.
+ *
+ * Adding a field that carries subprocess output or an exception message puts this
+ * back. Name a new `reason` instead.
+ */
+export interface GraphFallback {
+	feature: string;
+	reason?: string;
+	message?: string;
+	/** How many chapters were affected, so a repo-wide outage is distinguishable. */
+	failedChapters?: number;
+}
+
+export function buildGraph(
+	projectChapters: {
+		id: string;
+		title: string;
+		status: string;
+		branch: string;
+		role: string;
+		color: string | null;
+		groupLabel: string | null;
+		explorationGroupId: string | null;
+		isRoot: number | null;
+		/**
+		 * Classic canvas coordinates; null when never placed by hand there.
+		 *
+		 * The ruler columns are deliberately absent from this input type, so a caller
+		 * cannot accidentally feed tick-relative offsets in as world coordinates.
+		 */
+		graphX: number | null;
+		graphY: number | null;
+		commitCount: number | null;
+		headCommitSha: string | null;
+		panelExpanded: number | null;
+		panelWidth: number | null;
+		panelHeight: number | null;
+		worktreePath?: string | null;
+		reviewSourceChapterId?: string | null;
+		reviewStatus?: string | null;
+	}[],
+	narratorCounts: Map<string, number>,
+	narratorIds: Map<string, string>,
+	narratorStatuses: Map<string, string>,
+	narratorSubstatuses: Map<string, string[]>,
+	containerPresence: Set<string>,
+	edgeRows: {
+		id: string;
+		sourceId: string;
+		targetId: string;
+		type: string;
+		metadata: unknown;
+	}[],
+): { nodes: GraphNode[]; edges: GraphEdge[] } {
+	const nodes: GraphNode[] = projectChapters.map((ch) => ({
+		id: ch.id,
+		type: ch.role === "review" ? "reviewNode" : "chapterNode",
+		data: {
+			title: ch.title,
+			status: ch.status,
+			branch: ch.branch,
+			role: ch.role,
+			color: ch.color,
+			groupLabel: ch.groupLabel,
+			explorationGroupId: ch.explorationGroupId,
+			narratorCount: narratorCounts.get(ch.id) ?? 0,
+			narratorId: narratorIds.get(ch.id) ?? null,
+			narratorStatus: narratorStatuses.get(ch.id) ?? null,
+			narratorSubstatus: narratorSubstatuses.get(ch.id) ?? null,
+			hasContainers: containerPresence.has(ch.id),
+			isRoot: !!ch.isRoot,
+			commitCount: ch.commitCount ?? 0,
+			headCommitSha: ch.headCommitSha ?? null,
+			panelExpanded: !!ch.panelExpanded,
+			panelWidth: ch.panelWidth ?? null,
+			panelHeight: ch.panelHeight ?? null,
+			worktreePath: ch.worktreePath ?? null,
+			reviewSourceChapterId: ch.reviewSourceChapterId ?? null,
+			reviewStatus: ch.reviewStatus ?? null,
+		},
+		// `?? null` rather than `?? 0`: null and 0 mean different things here. 0 is a
+		// position the user can actually drag a node to, so collapsing "unplaced" into
+		// it would make any node near the origin get auto-laid-out away on next load.
+		position: {
+			x: ch.graphX ?? null,
+			y: ch.graphY ?? null,
+		},
+	}));
+
+	const edges: GraphEdge[] = edgeRows.map((e) => ({
+		id: e.id,
+		source: e.sourceId,
+		target: e.targetId,
+		type: e.type,
+		metadata: e.metadata,
+	}));
+
+	return { nodes, edges };
+}
+
+export const graphRoutes = new Hono();
+
+graphRoutes.get("/:id/graph", async (c) => {
+	// The story graph is the project's whole structure in one payload, so it needs the
+	// same read access as the project itself.
+	await requireProjectAccess(c, c.req.param("id"), "read");
+	const projectId = c.req.param("id");
+	// The backend actually serving reads, not the configured intent: in production
+	// PostgreSQL mode the legacy NF_READ_BACKEND selector must be absent, so asking it
+	// would always answer "sqlite" and the SQLite commit refresh below would run against
+	// a database that serves nothing. `projectReadBackend` reads the composed adapter.
+	const readBackend = projectReadBackend();
+	const readGraph = (await projectReadAdapter().getGraph(projectId, projectPrincipalOf(c))) as {
+		chapters: Array<{
+			id: string;
+			title: string;
+			status: string;
+			branch: string;
+			role: string;
+			color: string | null;
+			groupLabel: string | null;
+			explorationGroupId: string | null;
+			isRoot: number | null;
+			graphX: number | null;
+			graphY: number | null;
+			commitCount: number | null;
+			headCommitSha: string | null;
+			worktreePath: string | null;
+			panelExpanded: number | null;
+			panelWidth: number | null;
+			panelHeight: number | null;
+			reviewSourceChapterId: string | null;
+			reviewStatus: string | null;
+		}>;
+		edges: Array<{
+			id: string;
+			sourceId: string;
+			targetId: string;
+			type: string;
+			metadata: unknown;
+		}>;
+		/** Absent unless the read was bounded; see `GraphReadResult`. */
+		truncated?: true;
+		truncatedChapters?: true;
+		truncatedEdges?: true;
+	};
+	if (readGraph.chapters.length === 0)
+		return c.json({ nodes: [], edges: [], detachedPanels: [], degraded: false, fallbacks: [] });
+
+	const projectChapters = readGraph.chapters;
+
+	// Degradation is reported per feature, not per chapter: a repo-wide problem (git
+	// missing, worktrees gone after a disk move) fails every active chapter at once,
+	// and a few hundred identical entries would blow up a response the frontend
+	// renders as a single alert. `failedChapters` carries the scale instead.
+	const fallbacks: GraphFallback[] = [];
+
+	// A bounded read must not be served as a complete graph. The adapters cap chapters and
+	// edges (an unbounded graph query is the "every request hangs" failure mode), and a
+	// canvas that quietly drops chapters also drops every edge attached to them — which
+	// reads as "those branches were deleted" rather than "we did not send them".
+	if (readGraph.truncatedChapters || readGraph.truncatedEdges) {
+		logger.warn("Graph response truncated", {
+			projectId,
+			chapters: readGraph.chapters.length,
+			edges: readGraph.edges.length,
+			truncatedChapters: readGraph.truncatedChapters,
+			truncatedEdges: readGraph.truncatedEdges,
+		});
+		fallbacks.push({
+			feature: "graph.size",
+			reason: readGraph.truncatedChapters ? "graph_chapters_truncated" : "graph_edges_truncated",
+			failedChapters: readGraph.chapters.length,
+		});
+	}
+	let commitSyncFailures = 0;
+	let firstCommitSyncError: string | undefined;
+
+	// Refresh git info for active chapters with worktrees (lightweight, with concurrency limit)
+	const activeChapters = projectChapters.filter((ch) => ch.status === "active" && ch.worktreePath);
+	if (readBackend.backend === "sqlite" && activeChapters.length > 0) {
+		const MAX_CONCURRENT = 3;
+		const refreshResults: PromiseSettledResult<void>[] = [];
+		for (let i = 0; i < activeChapters.length; i += MAX_CONCURRENT) {
+			const batch = activeChapters.slice(i, i + MAX_CONCURRENT);
+			const batchResults = await Promise.allSettled(
+				batch.map(async (ch) => {
+					const cwd = ch.worktreePath;
+					if (!cwd) return;
+					try {
+						const liveHead = await gitService.getHeadCommit(cwd);
+						if (liveHead && liveHead !== ch.headCommitSha) {
+							// HEAD changed — sync commits and update cache
+							const newCount = await commitSyncService.syncChapterCommits(ch.id);
+							if (newCount > 0 || liveHead !== ch.headCommitSha) {
+								// Re-read updated values from DB
+								const updated = await db.query.chapters.findFirst({
+									where: eq(chapters.id, ch.id),
+									columns: { commitCount: true, headCommitSha: true },
+								});
+								if (updated) {
+									ch.commitCount = updated.commitCount;
+									ch.headCommitSha = updated.headCommitSha;
+								}
+							}
+						}
+					} catch (err) {
+						// Still non-fatal — the cached commit count and HEAD are served as-is.
+						// But it is counted, because swallowing it silently is what made the
+						// `allSettled` check below dead code: this catch is inside the mapped
+						// function, so nothing ever rejected and `failures` was always empty.
+						commitSyncFailures += 1;
+						firstCommitSyncError ??= String(err);
+					}
+				}),
+			);
+			refreshResults.push(...batchResults);
+		}
+		if (commitSyncFailures > 0) {
+			// The error text stays here and does not go into the response; see the note on
+			// `GraphFallback`.
+			logger.warn("Graph served stale git metadata for some chapters", {
+				projectId,
+				failedChapters: commitSyncFailures,
+				error: firstCommitSyncError,
+			});
+			fallbacks.push({
+				feature: "graph.commitSync",
+				reason: "commit_sync_refresh_failed",
+				failedChapters: commitSyncFailures,
+			});
+		}
+		// Reserved for a rejection the per-chapter catch could not see (e.g. the DB
+		// write-back below it throwing). Raised to warn: the user is looking at a
+		// stale commit count and HEAD, which debug-level logging never revealed.
+		const failures = refreshResults.filter(
+			(r): r is PromiseRejectedResult => r.status === "rejected",
+		);
+		if (failures.length > 0) {
+			logger.warn("Some graph git refreshes failed", {
+				projectId,
+				failCount: failures.length,
+				error: String(failures[0]?.reason),
+			});
+			fallbacks.push({
+				feature: "graph.gitMetadata",
+				reason: "git_metadata_refresh_failed",
+				failedChapters: failures.length,
+			});
+		}
+	}
+
+	// Get graph metadata once chapter IDs are known.
+	const chapterIds = projectChapters.map((ch) => ch.id);
+	const auxiliary = await projectReadAdapter().getGraphAuxiliaryData(
+		projectId,
+		chapterIds,
+		projectPrincipalOf(c),
+	);
+	const allNarrators = auxiliary.narrators;
+	const allContainers = auxiliary.containers;
+	const detachedPanelRows = auxiliary.detachedPanels;
+	const edgeRows = readGraph.edges;
+	// Every auxiliary read (narrator badges, container presence, detached panels) belongs to
+	// the adapter, including their ACL predicates — the narrator list in particular must stay
+	// filtered by narrator readability, so a badge on the canvas cannot open into a 404 and a
+	// teammate's private session cannot appear just because the project is readable. Issuing
+	// any of these here would query SQLite even when PostgreSQL served the graph, mixing two
+	// data sources inside one response.
+	if (auxiliary.truncated) {
+		logger.warn("Graph auxiliary data truncated", { projectId, chapters: chapterIds.length });
+		fallbacks.push({
+			feature: "graph.auxiliary",
+			reason: "graph_auxiliary_truncated",
+			failedChapters: chapterIds.length,
+		});
+	}
+
+	const narratorCounts = new Map<string, number>();
+	const narratorIds = new Map<string, string>();
+	const narratorStatuses = new Map<string, string>();
+	const narratorSubstatuses = new Map<string, string[]>();
+	for (const n of allNarrators) {
+		if (n.chapterId) {
+			narratorCounts.set(n.chapterId, (narratorCounts.get(n.chapterId) ?? 0) + 1);
+			// Keep the first narrator ID and status per chapter
+			if (!narratorIds.has(n.chapterId)) {
+				narratorIds.set(n.chapterId, n.id);
+				if (n.status) narratorStatuses.set(n.chapterId, n.status);
+				narratorSubstatuses.set(n.chapterId, parseSubstatus(n.substatus));
+			}
+		}
+	}
+
+	const containerPresence = new Set<string>();
+	for (const ci of allContainers) {
+		containerPresence.add(ci.chapterId);
+	}
+
+	// Build graph
+	const { nodes, edges } = buildGraph(
+		projectChapters,
+		narratorCounts,
+		narratorIds,
+		narratorStatuses,
+		narratorSubstatuses,
+		containerPresence,
+		edgeRows,
+	);
+
+	// No `explorationGroups` here: the rows were queried on every graph request and
+	// returned, but nothing rendered them, and the frontend type even declared a
+	// `chapterIds` field this endpoint never sent. The table and its validators stay for
+	// the schema; reviving the feature means adding the query back next to a real reader.
+	return c.json({
+		nodes,
+		edges,
+		/**
+		 * Per-chapter serialized detached-panel envelopes, for the chapters that have
+		 * any. The client parses each with `parseDetachedPanels`; keeping the raw
+		 * string here means the wire format has exactly one parser.
+		 */
+		detachedPanels: detachedPanelRows.map((row) => ({
+			chapterId: row.id,
+			panels: row.detachedPanelsJson,
+		})),
+		degraded: fallbacks.length > 0,
+		fallbacks,
+	});
+});
+
+graphRoutes.patch("/:id/graph/positions", async (c) => {
+	// Node positions are shared project state: everyone sees the same layout.
+	await requireProjectAccess(c, c.req.param("id"), "write");
+	const projectId = c.req.param("id");
+	const body = await c.req.json();
+	const parsed = updateGraphPositionsSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	// Validate all chapterIds belong to this project
+	const chapterIds = parsed.data.positions.map((p) => p.chapterId);
+	if (chapterIds.length > 0) {
+		const owned = await db
+			.select({ id: chapters.id })
+			.from(chapters)
+			.where(and(inArray(chapters.id, chapterIds), eq(chapters.projectId, projectId)));
+		const ownedIds = new Set(owned.map((r) => r.id));
+		const invalid = chapterIds.filter((id) => !ownedIds.has(id));
+		if (invalid.length > 0) {
+			throw new ValidationError(`Chapters not in project: ${invalid.join(", ")}`);
+		}
+	}
+
+	db.transaction((tx) => {
+		for (const pos of parsed.data.positions) {
+			// Writes ONLY the classic columns. It must not touch anchorCommitSha /
+			// axisOffset / crossOffset: those belong to ruler, and having this route
+			// overwrite them meant simply opening a project in classic destroyed the
+			// ruler layout (and vice versa, since both canvases wrote the same pair).
+			const updates: Record<string, unknown> = {
+				graphX: pos.x,
+				graphY: pos.y,
+			};
+			if (pos.panelExpanded !== undefined) updates.panelExpanded = pos.panelExpanded ? 1 : 0;
+			if (pos.panelWidth !== undefined) updates.panelWidth = pos.panelWidth;
+			if (pos.panelHeight !== undefined) updates.panelHeight = pos.panelHeight;
+			tx.update(chapters).set(updates).where(eq(chapters.id, pos.chapterId)).run();
+		}
+	});
+
+	return c.json({ ok: true });
+});

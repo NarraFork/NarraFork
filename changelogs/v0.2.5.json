@@ -1,0 +1,6 @@
+{
+	"version": "0.2.5",
+	"date": "2026-04-25",
+	"en": "## Bug Fixes\n\n- Relaxed overly strict Zod schema constraints on agent tools (Read, Terminal, Agent, Overseer) so that slightly imprecise model outputs (floats, zero, negative numbers) are gracefully coerced instead of rejected\n- Added missing `args` field to Skill tool Zod schema so skill arguments are no longer silently dropped\n- Added missing `alias` field to Agent tool Zod schema to match the advertised rawJsonSchema\n- Added missing `allowedPrompts` field to ExitPlanMode Zod schema to match the advertised rawJsonSchema\n\n## Refactoring\n\n- Extracted background subagent completion queue into a standalone module to eliminate circular dependency",
+	"zh-CN": "## 修复\n\n- 放宽 Agent 工具（Read、Terminal、Agent、Overseer）过严的 Zod schema 约束，模型输出的浮点数、零值、负数等边界值现在会被自动修正而非直接拒绝\n- Skill 工具补充缺失的 `args` 字段到 Zod schema，技能参数不再被静默丢弃\n- Agent 工具补充缺失的 `alias` 字段到 Zod schema，与 rawJsonSchema 保持一致\n- ExitPlanMode 补充缺失的 `allowedPrompts` 字段到 Zod schema，与 rawJsonSchema 保持一致\n\n## 重构\n\n- 将后台子代理完成队列提取为独立模块，消除循环依赖"
+}

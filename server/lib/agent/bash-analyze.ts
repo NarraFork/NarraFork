@@ -1,0 +1,3412 @@
+/**
+ * 基于 tree-sitter AST 的 Bash 命令分析模块
+ *
+ * 解析 bash 命令字符串，提取所有子命令、文件路径，
+ * 并根据白名单 + 危险模式检测判断是否可以自动放行。
+ */
+
+// Embed the bash grammar for compiled single-executable mode. `import ... with
+// { type: "file" }` gives Bun an explicit asset edge so the WASM is available both
+// in dev and in packaged binaries. The core engine wasm is embedded the same way,
+// inside tree-sitter-runtime.ts.
+import embeddedBashWasm from "tree-sitter-bash/tree-sitter-bash.wasm" with { type: "file" };
+import { toForwardSlash } from "../platform-path";
+import { localPathSemantics, type TargetPathSemantics } from "./execution/path-semantics";
+import {
+	createTreeSitterParser,
+	loadTreeSitterLanguage,
+} from "./structural/tree-sitter-runtime";
+
+// ── 类型定义 ──────────────────────────────────────────────
+
+export interface BashAnalysis {
+	/** 解析出的每条子命令 */
+	commands: Array<{
+		/** 命令 token 列表，如 ["git", "checkout"] */
+		tokens: string[];
+		/** 命令节点文本 */
+		text: string;
+		/** 包含重定向的完整文本 */
+		fullText: string;
+	}>;
+	/** 文件操作命令中提取的路径参数 */
+	filePaths: string[];
+	/** 是否所有命令都在白名单中 */
+	allWhitelisted: boolean;
+	/** 不在白名单中的命令名列表 */
+	nonWhitelisted: string[];
+	/** 检测到的危险模式描述 */
+	dangerousPatterns: string[];
+	/** 是否检测到环境变量注入 */
+	hasEnvInjection: boolean;
+	/**
+	 * 命令前缀环境变量的名字列表（`VAR=val cmd`）。
+	 *
+	 * token 提取刻意不含 variable_assignment 节点，因此这些赋值对逐命令的
+	 * 只读/白名单判定**不可见**——但 `GIT_DIR`、`GIT_EXTERNAL_DIFF`、
+	 * `GIT_CONFIG_COUNT` 等足以改变 git 的仓库指向或借外部命令执行任意代码。
+	 * 逐项列出让无人兜底的判定（如 review 只读放行）可以整体否决。
+	 */
+	commandEnvVars: string[];
+	/** 是否为灾难性命令 — 即使 bypassPermissions 也必须 deny + 终止 loop */
+	isCatastrophic: boolean;
+	/** 灾难性命令的原因描述 */
+	catastrophicReason?: string;
+	/** Chapter 模式下检测到的 git 分支/工作树高风险操作（交由权限系统决策） */
+	gitBranchViolations: string[];
+	/** Chapter 模式下检测到的 git 分支/工作树警告操作（交由权限系统决策） */
+	gitBranchWarnings: string[];
+	/** 是否包含写操作（如 biome --write）— 只在 acceptEdits 模式下允许 */
+	hasWriteOperation: boolean;
+	/**
+	 * 是否**所有**子命令都被确认为纯只读（无任何文件系统/进程/远程副作用）。
+	 *
+	 * 与 `hasWriteOperation` 不是互补关系：`hasWriteOperation` 只标记"已识别的写"，
+	 * 未被识别的命令（如 `git commit`、`curl -o`、未知命令）不会置位它。
+	 * `allReadOnly` 采用相反的保守立场：只有出现在只读白名单里的命令才算只读，
+	 * 任何未确认命令、危险模式、环境注入、重定向都会让它变为 false。
+	 * 供权限层用于"逐项询问模式下自动放行只读命令"。
+	 */
+	allReadOnly: boolean;
+}
+
+// ── 白名单 ────────────────────────────────────────────────
+
+/**
+ * 纯只读 / 无副作用命令 — 可自动放行。
+ * 注意：任何能执行子命令、写文件、或加载动态库的命令都不应在此列表中。
+ */
+const SAFE_COMMANDS = new Set([
+	// 版本控制
+	"git",
+	// 文件浏览（只读）
+	"ls",
+	"dir",
+	"tree",
+	"pwd",
+	"cat",
+	"head",
+	"tail",
+	"wc",
+	"less",
+	"more",
+	// 搜索（只读）
+	"grep",
+	"rg",
+	"ag",
+	"fd",
+	// 输出
+	"echo",
+	"printf",
+	// 路径工具（只读）
+	"basename",
+	"dirname",
+	"realpath",
+	"readlink",
+	// 文件信息（只读）
+	"stat",
+	"file",
+	"which",
+	"type",
+	"command",
+	// 系统信息（只读）
+	"date",
+	"whoami",
+	"uname",
+	"hostname",
+	"id",
+	"uptime",
+	// 文本处理（只读，无 -i）
+	"sort",
+	"uniq",
+	"diff",
+	"tr",
+	"cut",
+	"paste",
+	"column",
+	"rev",
+	"tac",
+	"nl",
+	"seq",
+	"yes",
+	// 类型检查工具
+	"tsc",
+	"tsgo",
+	"eslint",
+	"prettier",
+	"biome",
+	// shell 内建（无副作用）
+	"test",
+	"true",
+	"false",
+	"[",
+	"[[",
+	// 延时（无副作用）
+	"sleep",
+	// 目录操作
+	"cd",
+	"pushd",
+	"popd",
+	// 环境查看（只读）
+	"printenv",
+	// JSON
+	"jq",
+	// 包执行器（仅允许严格白名单场景，具体由 CONDITIONAL_COMMANDS 进一步约束）
+	"npx",
+	"bunx",
+	// 包管理工具（只读子命令由 CONDITIONAL_COMMANDS 放行，危险子命令拦截）
+	"npm",
+	"bun",
+	"yarn",
+	"pnpm",
+	// 文件操作（路径由 PATH_COMMANDS 提取，外部路径由 isInsideWorktree 拦截）
+	"cp",
+	"mv",
+	"mkdir",
+	"touch",
+	// 网络（pipe-to-shell 由 detectPipeToShell 检测）
+	"curl",
+	"wget",
+	// 文本处理（危险参数由 CONDITIONAL_COMMANDS 检测）
+	"sed",
+	"awk",
+	"gawk",
+	"find",
+	// 间接执行（危险参数由 CONDITIONAL_COMMANDS 检测）
+	"xargs",
+	// 压缩
+	"tar",
+	"zip",
+	"unzip",
+	"gzip",
+	"gunzip",
+]);
+
+/**
+ * 纯只读命令 — 无任何文件系统写入、进程控制或远程副作用。
+ *
+ * 这是 SAFE_COMMANDS 的严格子集：SAFE_COMMANDS 还包含 cp/mv/mkdir/touch/curl/tar
+ * 等有写副作用或网络副作用的命令，它们不属于这里。带子命令语义的命令
+ * （git/npm/bun/yarn/pnpm/npx/bunx）不在此列表中，由 READ_ONLY_SUBCOMMAND_CHECKS
+ * 逐子命令判定。
+ *
+ * 刻意排除的两类：
+ *  - **执行器包装**（`command` / `env` / `nohup` / `xargs` …）：它们只是把真正的
+ *    命令挪到后面的 token，只看 `tokens[0]` 会把 `command rm -rf x` 判成只读。
+ *    `env`/`nohup` 等已在 ALWAYS_ASK_COMMANDS；`command` 由
+ *    READ_ONLY_SUBCOMMAND_CHECKS 递归判定其目标命令。
+ *  - **能改系统状态的信息命令**（`date -s` 设置系统时间）：命令本身"只读"，
+ *    但带上写参数就不是了，见 READ_ONLY_WRITE_FLAGS。
+ */
+const READ_ONLY_COMMANDS = new Set([
+	// 文件浏览（只读）
+	"ls",
+	"dir",
+	"tree",
+	"pwd",
+	"cat",
+	"head",
+	"tail",
+	"wc",
+	"less",
+	"more",
+	// 搜索（只读）
+	"grep",
+	"rg",
+	"ag",
+	"fd",
+	// 输出（无重定向时无副作用；重定向单独检测）
+	"echo",
+	"printf",
+	// 路径工具（只读）
+	"basename",
+	"dirname",
+	"realpath",
+	"readlink",
+	// 文件信息（只读）
+	"stat",
+	"file",
+	"which",
+	// 系统信息（只读）
+	"date",
+	"whoami",
+	"uname",
+	"hostname",
+	"id",
+	"uptime",
+	// 文本处理（只读，-i 由 CONDITIONAL_COMMANDS 拦截）
+	"sort",
+	"uniq",
+	"diff",
+	"tr",
+	"cut",
+	"paste",
+	"column",
+	"rev",
+	"tac",
+	"nl",
+	"seq",
+	// shell 内建（无副作用）
+	"test",
+	"true",
+	"false",
+	"[",
+	"[[",
+	// 目录切换（不修改文件系统）
+	"cd",
+	"pushd",
+	"popd",
+	// 环境查看（只读）
+	"printenv",
+	// JSON 处理（只读）
+	"jq",
+]);
+
+/**
+ * 让一个"只读"命令不再是纯只读的参数：写文件、改系统状态，或永不返回。
+ *
+ * `hasWriteOperation` 只覆盖 biome/tsc 这类检查工具的写参数，通用的 coreutils
+ * 输出参数不在其列 —— 而 `sort -o out.txt`、`date -s` 都是真实的写操作，且它们的
+ * 目标路径不会进入 `filePaths`，所以连 worktree 边界都拦不住。`tail -f` 不写任何
+ * 东西，但会一直阻塞到 bash 超时，自动放行等于静默占满一个执行窗口。两类都必须由
+ * 只读判定自己识别。
+ *
+ * 按命令分表而不是用一张全局表：`-o` 在 `sort` 是输出文件，在 `find` 却是 `-o`(or)
+ * 逻辑运算符 —— 一张全局表会把 `find a -o b` 误判为写。
+ */
+const READ_ONLY_DISQUALIFYING_FLAGS: Record<string, ReadonlySet<string>> = {
+	// 输出到文件
+	sort: new Set(["-o", "--output"]),
+	nl: new Set(["-o"]),
+	// `tree -o FILE` 把目录树写进文件而不是 stdout
+	tree: new Set(["-o", "--output"]),
+	// 修改系统时间（`date -f <file>` 只读文件，不在此列）
+	date: new Set(["-s", "--set"]),
+	// 永不返回：跟随模式会阻塞到超时
+	tail: new Set(["-f", "-F", "--follow", "--retry"]),
+	// 搜索工具的**命令执行**参数：`rg --pre=CMD` 对每个文件运行 CMD（`-z`/`--search-zip`
+	// 也会调用外部解压器），`fd -x/-X` 直接执行命令。这些让"搜索"变成任意命令执行，
+	// 且执行的命令不会进入 commands/filePaths，只读判定必须自己拦住。
+	rg: new Set(["--pre", "--pre-glob", "-z", "--search-zip", "--hostname-bin"]),
+	ag: new Set(["--pager"]),
+	fd: new Set(["-x", "--exec", "-X", "--exec-batch"]),
+	// `file -f LIST` 从文件读取待检查列表；本身只读，但 `-s` 会读块设备。保守起见只拦
+	// 明确的特殊设备读取，避免 agent 在 /dev 上做意外 IO。
+	file: new Set(["-s", "--special-files"]),
+};
+
+/**
+ * `uniq [INPUT [OUTPUT]]` 的第二个位置参数就是输出文件 —— 没有任何 flag 提示。
+ * 这类"位置参数即写目标"的命令必须单独判定。
+ */
+const POSITIONAL_OUTPUT_COMMANDS = new Set(["uniq"]);
+
+/**
+ * 命令是否带有让它不再是纯只读的参数
+ * （`sort -o`、`date -s`、`uniq in out`、`tail -f`）。
+ */
+function hasReadOnlyDisqualifyingFlag(cmdName: string, tokens: string[]): boolean {
+	const flags = READ_ONLY_DISQUALIFYING_FLAGS[cmdName];
+	if (flags) {
+		for (const arg of tokens.slice(1)) {
+			if (!arg.startsWith("-")) continue;
+			// 支持 `--output=path` 形式
+			if (flags.has(arg.split("=")[0] ?? arg)) return true;
+			// 支持合并短参数（`tail -fn20`）；`--` 长参数不做字符拆分
+			if (!arg.startsWith("--")) {
+				for (const ch of arg.slice(1)) {
+					if (flags.has(`-${ch}`)) return true;
+				}
+			}
+		}
+	}
+	if (POSITIONAL_OUTPUT_COMMANDS.has(cmdName)) {
+		// 第二个非 flag 位置参数是输出文件
+		const positional = tokens.slice(1).filter((arg) => !arg.startsWith("-"));
+		if (positional.length >= 2) return true;
+	}
+	return false;
+}
+
+/**
+ * 带子命令/参数语义的命令的只读判定。
+ *
+ * 返回 true 表示这次调用是纯只读。这些命令整体不能进 READ_ONLY_COMMANDS，
+ * 因为同一个命令既有只读子命令（`git status`）也有写子命令（`git commit`）。
+ */
+const READ_ONLY_SUBCOMMAND_CHECKS: Record<string, (tokens: string[]) => boolean> = {
+	// git：只有明确的只读 plumbing/porcelain 子命令算只读
+	git: (tokens) => {
+		// 能注入配置或改变可执行文件查找路径的全局 flag 一律否决只读，
+		// 因为它们让即使是 `git status` 这样的只读子命令也能执行任意命令
+		// （实测：`git -c core.fsmonitor='touch X' status` 会运行该命令，
+		// `git -c alias.foo='!cmd' foo`、`core.pager`、`core.sshCommand`、
+		// `protocol.ext.allow` 同理）。
+		const { sub, index, injectionFlag } = gitSubcommandInfo(tokens);
+		if (injectionFlag) return false;
+		// 裸 `git` / `git --version` 只打印信息
+		if (!sub) return true;
+		if (!GIT_READONLY_SUBCOMMANDS.has(sub)) return false;
+		// 对仓库只读 ≠ 无副作用：这些子命令会连接任意远端。自动放行等于开了一条不需要
+		// 批准的出站网络通道（可用于外传信息或探测内网），与 curl/wget 一律 ask 的策略
+		// 冲突，因此从只读自动放行中排除（它们仍留在 GIT_READONLY_SUBCOMMANDS，
+		// 只影响"是否免询问"，不影响原有白名单语义）。
+		if (GIT_NETWORK_SUBCOMMANDS.has(sub)) return false;
+		// 只读子命令自己的写参数（`git diff --output=patch`、`git hash-object -w`）
+		if (hasGitSubcommandWriteFlag(sub, tokens.slice(index + 1))) return false;
+		// `git diff > patch` 之类的重定向由 redirect 检测单独否决，这里只看子命令
+		return true;
+	},
+	// `command foo …` 只是把 foo 挪到后一个 token；必须递归判定真正的命令，
+	// 否则 `command rm -rf x` 会因 tokens[0] 在只读表里而被放行。
+	command: (tokens) => {
+		// 跳过 command 自己的 flag（-p/-v/-V）。`-v`/`-V` 只打印路径，是只读的。
+		let idx = 1;
+		while (idx < tokens.length && tokens[idx].startsWith("-")) {
+			if (tokens[idx] === "-v" || tokens[idx] === "-V") return true;
+			idx++;
+		}
+		const rest = tokens.slice(idx);
+		if (rest.length === 0) return true;
+		return isReadOnlyCommand(rest);
+	},
+	// `type foo` 只打印 foo 的类型，不执行它 —— 与 command -v 同类，纯只读。
+	type: () => true,
+	// 类型检查 / lint 工具：写参数（--write/--fix/--outDir 等）不算只读
+	tsc: (tokens) => !hasCheckToolWriteFlag(tokens),
+	tsgo: (tokens) => !hasCheckToolWriteFlag(tokens),
+	eslint: (tokens) => !hasCheckToolWriteFlag(tokens),
+	prettier: (tokens) => !hasCheckToolWriteFlag(tokens),
+	biome: (tokens) => !hasCheckToolWriteFlag(tokens),
+	// 包管理器：只读子命令由 CONDITIONAL_COMMANDS 放行，这里复用同一份判定
+	npm: (tokens) => isReadOnlyPackageManagerInvocation("npm", tokens),
+	bun: (tokens) => isReadOnlyPackageManagerInvocation("bun", tokens),
+	yarn: (tokens) => isReadOnlyPackageManagerInvocation("yarn", tokens),
+	pnpm: (tokens) => isReadOnlyPackageManagerInvocation("pnpm", tokens),
+	// 包执行器：仅当白名单包 + 无写参数时算只读
+	npx: (tokens) => isReadOnlyPackageRunner(tokens, "npx"),
+	bunx: (tokens) => isReadOnlyPackageRunner(tokens, "bunx"),
+	// find：纯搜索是只读的，但 -delete/-exec/-fprintf 等会写文件或执行命令。
+	//
+	// 这里刻意比 `classifyFind` 更严：即使 `-exec` 执行的是只读命令，`find … -exec cat
+	// /etc/shadow \;` 的目标路径也只存在于 exec 参数里，不会进入 `filePaths`，
+	// 而只读自动放行会跳过用户确认 —— 边界检查读的是 `filePaths`，拦不住它。
+	// 因此任何 -exec 家族参数都放弃只读结论，交回用户确认。
+	// `classifyFind` 服务于危险反思（"这个操作有多危险"），语义不同，不要合并。
+	find: (tokens) => !tokens.slice(1).some((arg) => FIND_WRITE_FLAGS.has(arg.split("=")[0])),
+	// sleep 不写任何东西，但会独占一个执行窗口直到 bash 超时 —— 与 `tail -f` 被
+	// READ_ONLY_DISQUALIFYING_FLAGS 排除的理由完全相同。短暂 sleep 仍算只读，
+	// 超过阈值的（含无法解析的时长）交回用户确认，避免 `sleep 999999` 被免询问放行。
+	sleep: (tokens) => isShortSleep(tokens),
+};
+
+/** 只读自动放行允许的最长 sleep 秒数。超过这个量级就等于占用整个执行窗口。 */
+const MAX_READ_ONLY_SLEEP_SECONDS = 60;
+
+/** sleep 时长后缀 → 秒数倍率（GNU coreutils 语义）。 */
+const SLEEP_SUFFIX_SECONDS: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400 };
+
+/**
+ * `sleep` 的总时长是否短到可以免询问。
+ *
+ * GNU sleep 接受多个时长参数并求和（`sleep 1 2` = 3 秒），支持 `s`/`m`/`h`/`d` 后缀和
+ * 小数。任何解析不出来的参数（变量展开 `$N`、算术、非法后缀）都按"未知即拒绝"处理：
+ * 我们不能证明它短，就不该替用户放行。
+ */
+function isShortSleep(tokens: string[]): boolean {
+	const args = tokens.slice(1).filter((token) => !token.startsWith("-"));
+	// 裸 `sleep` 缺少操作数，会立即报错退出，不占用执行窗口。
+	if (args.length === 0) return true;
+
+	let totalSeconds = 0;
+	for (const arg of args) {
+		const match = /^(\d+(?:\.\d+)?|\.\d+)([smhd]?)$/.exec(arg);
+		if (!match) return false;
+		const value = Number.parseFloat(match[1]);
+		if (!Number.isFinite(value)) return false;
+		totalSeconds += value * (SLEEP_SUFFIX_SECONDS[match[2]] ?? 1);
+		if (totalSeconds > MAX_READ_ONLY_SLEEP_SECONDS) return false;
+	}
+	return true;
+}
+
+/** find 的写/执行参数 — 出现任意一个即不再是纯只读搜索。 */
+const FIND_WRITE_FLAGS = new Set([
+	"-delete",
+	"-exec",
+	"-execdir",
+	"-ok",
+	"-okdir",
+	"-fprint",
+	"-fprint0",
+	"-fprintf",
+	"-fls",
+]);
+
+/** find 直接把结果写进任意文件的参数（不执行命令，但目标路径不进 filePaths）。 */
+const FIND_FILE_OUTPUT_FLAGS = new Set(["-fprint", "-fprint0", "-fprintf", "-fls"]);
+
+/** find -exec/-execdir 家族 —— 每个匹配项都会被当作参数执行一次命令。 */
+const FIND_EXEC_FLAGS = ["-exec", "-execdir", "-ok", "-okdir"] as const;
+
+/**
+ * find 调用的分类结果。
+ *
+ * 四态而不是"危险/不危险"两态，因为自动放行和危险反思需要的粒度不同：
+ * - `safe`：纯搜索，或 `-exec` 执行的是可证明只读的命令（`-exec cat`）。
+ * - `sideEffects`：`-exec` 执行的是白名单内但有写/网络副作用的命令（`cp`/`mkdir`/`curl`），
+ *   或 `-fprintf` 这类直接写文件的参数。白名单放行语义保持原样（不进
+ *   `dangerousPatterns`），但危险反思要把它当作确定的高风险 —— find 会把这个副作用
+ *   施加到每个匹配项上，且 `-exec` 子命令的目标路径不会进入 `filePaths`，
+ *   worktree 边界检查拦不住它。
+ * - `dangerous`：确认危险（`-delete`、`-exec rm`、`-exec` 的子命令自带危险参数）。
+ * - `unknown`：被执行命令无法分类 —— 只能证明"不确定"，不能证明"危险"。
+ */
+export type FindClassification =
+	| { kind: "safe" }
+	| { kind: "sideEffects"; pattern: string }
+	| { kind: "dangerous"; pattern: string }
+	| { kind: "unknown"; pattern: string };
+
+/**
+ * find 调用的分类 —— 白名单判定与危险反思共用的唯一来源。
+ *
+ * 权限层必须复用这里的结论，不要退化成"只要带 `-exec` 就算高危"：那会让
+ * `find … -exec cat {} \;` 这类纯读取在宽松反思档被误拦。
+ */
+export function classifyFind(tokens: string[]): FindClassification {
+	if (tokens.some((t) => t === "-delete")) {
+		return { kind: "dangerous", pattern: "find with -delete (removes files)" };
+	}
+
+	const outputFlag = tokens.find((t) => FIND_FILE_OUTPUT_FLAGS.has(t.split("=")[0]));
+	if (outputFlag) {
+		return { kind: "sideEffects", pattern: `find with ${outputFlag} (writes to files)` };
+	}
+
+	for (const flag of FIND_EXEC_FLAGS) {
+		const idx = tokens.indexOf(flag);
+		if (idx < 0) continue;
+
+		// -exec 后面到 \; 或 + 之间的 tokens 就是被执行的命令
+		const execCmd = tokens[idx + 1];
+		if (!execCmd) return { kind: "unknown", pattern: `find with ${flag} (empty command)` };
+
+		// 递归分类：被执行的命令是否危险
+		if (ALWAYS_ASK_COMMANDS.has(execCmd)) {
+			return { kind: "dangerous", pattern: `find ${flag} ${execCmd} (dangerous command)` };
+		}
+
+		// 提取 -exec 后面到终止符之间的完整 tokens
+		const endIdx = tokens.findIndex((t, i) => i > idx && (t === ";" || t === "+"));
+		const subTokens = tokens.slice(idx + 1, endIdx > 0 ? endIdx : undefined);
+
+		// 检查条件安全命令的危险参数
+		if (execCmd in CONDITIONAL_COMMANDS) {
+			const danger = CONDITIONAL_COMMANDS[execCmd](subTokens, subTokens.join(" "));
+			if (danger) return { kind: "dangerous", pattern: `find ${flag} → ${danger}` };
+		}
+
+		// 可证明只读的子命令 — 整条 find 无副作用
+		if (isReadOnlyCommand(subTokens)) return { kind: "safe" };
+
+		// 白名单内但有副作用（cp/mv/mkdir/touch/curl/tar/git write 子命令…）
+		if (SAFE_COMMANDS.has(execCmd)) {
+			return {
+				kind: "sideEffects",
+				pattern: `find ${flag} ${execCmd} (side effects on every match)`,
+			};
+		}
+
+		// 未知命令 — 保守拦截，但只能算"未分类"
+		return { kind: "unknown", pattern: `find ${flag} ${execCmd} (unknown command)` };
+	}
+	return { kind: "safe" };
+}
+
+/**
+ * git 全局 flag：能注入配置或改写可执行文件查找路径，从而让任意只读子命令
+ * 执行外部命令。出现任意一个即放弃只读结论（交给用户确认）。
+ *
+ * `-c key=value` 可设置 `core.pager` / `core.sshCommand` / `core.fsmonitor` /
+ * `alias.*` / `protocol.ext.allow`，全部可导致命令执行；`--config-env` 是它的
+ * 环境变量变体；`--exec-path` 改写 git 自身子命令的查找目录；`--git-dir` 可指向
+ * 任意仓库并连带其 `.git/config`（含 hooks 与上述 core.* 键）。
+ */
+const GIT_CONFIG_INJECTION_FLAGS = new Set([
+	"-c",
+	"--config-env",
+	"--exec-path",
+	"--git-dir",
+	"--upload-pack",
+	"--receive-pack",
+]);
+
+/**
+ * 跳过 git 全局 flag 定位子命令，供只读判定与危险模式检测共用。
+ *
+ * `-C`/`--work-tree`/`--namespace` 带值，连值一起跳过；附着形式（`-Cdir`、
+ * `--work-tree=dir`）按普通 flag 跳过。遇到 GIT_CONFIG_INJECTION_FLAGS 中的
+ * flag 时不返回子命令，而是以 `injectionFlag` 上报——这些 flag 让任何"只读"
+ * 子命令都能注入配置或改变可执行文件查找路径，调用方必须按自身语义否决/标记；
+ * 各自裸取 `tokens[1]` 会让 `git -C . reflog expire` 这类形式绕过全部子命令检查。
+ */
+function gitSubcommandInfo(tokens: string[]): {
+	sub: string | undefined;
+	index: number;
+	injectionFlag: string | undefined;
+} {
+	let idx = 1;
+	while (idx < tokens.length) {
+		const t = tokens[idx];
+		if (!t.startsWith("-")) break;
+		const name = t.split("=")[0] ?? t;
+		if (GIT_CONFIG_INJECTION_FLAGS.has(name)) {
+			return { sub: undefined, index: idx, injectionFlag: name };
+		}
+		if ((t === "-C" || t === "--work-tree" || t === "--namespace") && idx + 1 < tokens.length) {
+			idx += 2;
+			continue;
+		}
+		idx++;
+	}
+	return { sub: tokens[idx], index: idx, injectionFlag: undefined };
+}
+
+/**
+ * 对本地仓库只读、但会发起出站网络连接的 git 子命令。
+ *
+ * `git ls-remote <url>` 可以连接任意主机（含内网地址），凭据由 credential helper
+ * 自动附带。它不修改任何本地文件，所以路径作用域和写检测都拦不住，只能由只读判定
+ * 把它排除在自动放行之外。
+ */
+const GIT_NETWORK_SUBCOMMANDS = new Set(["ls-remote"]);
+
+/**
+ * 只读 git 子命令自身的写参数。
+ *
+ * `git diff` 默认写 stdout，但 `--output=<file>` 会写文件；`git hash-object -w`
+ * 把对象写进 object database。这些目标不会进入 `filePaths`，所以路径作用域也
+ * 拦不住，必须在只读判定里识别。
+ */
+const GIT_SUBCOMMAND_WRITE_FLAGS: Record<string, ReadonlySet<string>> = {
+	diff: new Set(["-o", "--output"]),
+	"diff-tree": new Set(["-o", "--output"]),
+	"diff-files": new Set(["-o", "--output"]),
+	"diff-index": new Set(["-o", "--output"]),
+	show: new Set(["-o", "--output"]),
+	log: new Set(["-o", "--output"]),
+	"hash-object": new Set(["-w"]),
+	fsck: new Set(["--lost-found"]),
+};
+
+/** 只读 git 子命令是否带写参数（`git diff --output=x`、`git hash-object -w`）。 */
+function hasGitSubcommandWriteFlag(sub: string, args: string[]): boolean {
+	const flags = GIT_SUBCOMMAND_WRITE_FLAGS[sub];
+	if (!flags) return false;
+	for (const arg of args) {
+		if (!arg.startsWith("-")) continue;
+		// `--output=path` / 独立 `-o` 的精确匹配
+		if (flags.has(arg.split("=")[0] ?? arg)) return true;
+		// 附着/合并短选项（`-o/tmp/x`、`-tw`）：git 的 parse-options 接受短 flag
+		// 直接附着值，精确匹配会漏掉；长 flag 不做字符拆分
+		if (!arg.startsWith("--")) {
+			for (const ch of arg.slice(1)) {
+				if (flags.has(`-${ch}`)) return true;
+			}
+		}
+	}
+	return false;
+}
+
+/** 检查/格式化工具的写参数前缀（`--write`、`--fix`、`--outDir=...` 等）。 */
+function hasCheckToolWriteFlag(tokens: string[]): boolean {
+	return tokens.slice(1).some((arg) => {
+		if (!arg.startsWith("-")) return false;
+		const name = arg.split("=")[0];
+		return (
+			BIOME_WRITE_ARG_PREFIXES.includes(name) ||
+			TSC_WRITE_ARG_PREFIXES.includes(name) ||
+			name === "--fix" ||
+			name === "--fix-dry-run" ||
+			name === "--fix-type" ||
+			name === "-w" ||
+			name === "--write" ||
+			name === "--output-file" ||
+			name === "-o"
+		);
+	});
+}
+
+/**
+ * 包管理器调用是否为纯只读。
+ * 复用 CONDITIONAL_COMMANDS 的判定：返回 null（无危险）即为只读子命令，
+ * 因为这些检查函数会把所有安装/脚本执行/构建子命令都判为危险。
+ */
+function isReadOnlyPackageManagerInvocation(name: string, tokens: string[]): boolean {
+	const check = CONDITIONAL_COMMANDS[name];
+	if (!check) return false;
+	return check(tokens, tokens.join(" ")) === null;
+}
+
+/** npx/bunx 调用是否为纯只读（白名单包 + 无写参数）。 */
+function isReadOnlyPackageRunner(tokens: string[], runner: string): boolean {
+	const classification = classifyPackageRunner(tokens, runner);
+	return classification.error === null && !classification.hasWriteOperation;
+}
+
+/**
+ * 判断单条命令是否为纯只读调用。
+ * 未知命令、未确认命令一律返回 false（保守立场）。
+ */
+function isReadOnlyCommand(tokens: string[]): boolean {
+	const cmdName = tokens[0];
+	if (!cmdName) return false;
+	if (isPathExecution(cmdName)) return false;
+	if (ALWAYS_ASK_COMMANDS.has(cmdName)) return false;
+	const subCheck = READ_ONLY_SUBCOMMAND_CHECKS[cmdName];
+	if (subCheck) return subCheck(tokens);
+	if (!READ_ONLY_COMMANDS.has(cmdName)) return false;
+	// 只读命令带上写/阻塞参数就不再只读（`sort -o out`、`date -s`、`tail -f`）。
+	return !hasReadOnlyDisqualifyingFlag(cmdName, tokens);
+}
+
+const REVIEW_READ_ONLY_POST_PROCESSORS = new Set([
+	"head",
+	"tail",
+	"cat",
+	"grep",
+	"rg",
+	"wc",
+	"cut",
+	"sort",
+	"uniq",
+	"tr",
+	"column",
+	"nl",
+]);
+
+const REVIEW_GIT_PATH_OVERRIDE_FLAGS = new Set(["--work-tree", "--namespace"]);
+
+function gitSubcommand(tokens: string[]): string | undefined {
+	let index = 1;
+	while (index < tokens.length) {
+		const token = tokens[index];
+		if (!token?.startsWith("-")) return token;
+		if (token === "-C") index++;
+		index++;
+	}
+	return undefined;
+}
+
+function hasReviewGitPathOverride(tokens: string[]): boolean {
+	return tokens.slice(1).some((token) => {
+		if (token.startsWith("-C") && token !== "-C" && !token.startsWith("--")) return true;
+		const flag = token.split("=", 1)[0];
+		return REVIEW_GIT_PATH_OVERRIDE_FLAGS.has(flag ?? token);
+	});
+}
+
+/**
+ * Whether an analyzed Bash command is safe for a review follow-up subagent.
+ *
+ * Review Bash is narrower than the general read-only verdict: it must start with a
+ * local, read-only Git query, and may only use a fixed set of read-only output
+ * processors afterward. The caller must still enforce the target path policy.
+ */
+export function isReviewReadOnlyBashAnalysis(analysis: BashAnalysis): boolean {
+	if (!analysis.allReadOnly || analysis.commands.length === 0) return false;
+	// 命令前缀环境变量对 token 分析不可见（`VAR=val cmd` 的 tokens 不含赋值），
+	// 而 GIT_DIR/GIT_EXTERNAL_DIFF/GIT_CONFIG_COUNT 等足以改变仓库指向或借外部
+	// 命令执行任意代码；review 路径无人兜底，任何前缀赋值都整体拒绝。
+	if (analysis.commandEnvVars.length > 0) return false;
+	const [first, ...rest] = analysis.commands;
+	if (first?.tokens[0] !== "git") return false;
+	const subcommand = gitSubcommand(first.tokens);
+	if (
+		!subcommand ||
+		GIT_NETWORK_SUBCOMMANDS.has(subcommand) ||
+		hasReviewGitPathOverride(first.tokens)
+	) {
+		return false;
+	}
+	if (!rest.every((command) => REVIEW_READ_ONLY_POST_PROCESSORS.has(command.tokens[0] ?? ""))) {
+		return false;
+	}
+	return true;
+}
+
+/** 始终需要用户确认的命令 */
+const ALWAYS_ASK_COMMANDS = new Set([
+	// 删除
+	"rm",
+	"rmdir",
+	"shred",
+	// 权限提升
+	"sudo",
+	"su",
+	"doas",
+	"pkexec",
+	// 权限修改
+	"chmod",
+	"chown",
+	"chgrp",
+	// 进程管理
+	"kill",
+	"killall",
+	"pkill",
+	// 磁盘/分区
+	"dd",
+	"mkfs",
+	"fdisk",
+	"parted",
+	"mount",
+	"umount",
+	// 系统控制
+	"reboot",
+	"shutdown",
+	"halt",
+	"poweroff",
+	"systemctl",
+	"service",
+	// 防火墙
+	"iptables",
+	"ip6tables",
+	"nft",
+	"ufw",
+	// 代码执行
+	"eval",
+	"exec",
+	// Shell 嵌套执行 — 可以 -c 执行任意命令或通过 pipe/heredoc 接收恶意输入
+	"bash",
+	"sh",
+	"zsh",
+	"fish",
+	"dash",
+	"ksh",
+	"csh",
+	"tcsh",
+	// 间接命令执行
+	"env",
+	"nohup",
+	"timeout",
+	"strace",
+	"ltrace",
+	"nice",
+	"ionice",
+	"chroot",
+	// 远程执行
+	"ssh",
+	"scp",
+	"rsync",
+	// 容器（可挂载宿主文件系统）
+	"podman",
+	"podman-compose",
+	"kubectl",
+	// 间接命令执行
+	// xargs 移至 CONDITIONAL_COMMANDS 进行递归分析
+	// 脚本解释器（可 -e/-c 执行任意代码）
+	"perl",
+	"ruby",
+	"lua",
+	"php",
+	// 运行时 / 构建/包管理工具（可直接或间接执行项目/远程代码）
+	// npm/bun/yarn/pnpm 移至 CONDITIONAL_COMMANDS 以允许只读子命令（ls/list/view 等）
+	"node",
+	"python",
+	"python3",
+	"go",
+	"cargo",
+	"pip",
+	"pip3",
+	"make",
+	// source / dot（执行外部脚本）
+	"source",
+	".",
+	// 别名（可重定义命令语义）
+	"alias",
+	"unalias",
+	// crontab
+	"crontab",
+	"at",
+	"batch",
+]);
+
+/**
+ * npx/bunx 可执行的受控白名单包。
+ * 注意：这里只是第一层筛选，仍需通过参数/来源校验。
+ */
+const SAFE_PACKAGE_RUNNERS = new Set([
+	// 类型检查 / 编译
+	"tsc",
+	"tsgo",
+	"typescript",
+	"@typescript/native-preview",
+	// Lint / 格式化
+	"biome",
+	"@biomejs/biome",
+	"prettier",
+	"eslint",
+]);
+
+/** 允许通过 npx/bunx 的命令参数（仅只读/检查类）。 */
+const SAFE_PACKAGE_ARGS = new Set([
+	"check",
+	"--check",
+	"--noEmit",
+	"--write=false",
+	"--version",
+	"-v",
+]);
+
+/** Biome 特定的只读参数前缀 */
+const BIOME_SAFE_ARG_PREFIXES = [
+	"--max-diagnostics",
+	"--diagnostic-level",
+	"--colors",
+	"--no-colors",
+	"--use-server",
+	"--verbose",
+	"--log-level",
+	"--log-kind",
+	"--config-path",
+	"--reporter",
+	"--formatter-enabled",
+	"--linter-enabled",
+	"--organize-imports-enabled",
+	"--assists-enabled",
+	"--stdin-file-path",
+	"--vcs-enabled",
+	"--vcs-client-kind",
+	"--vcs-use-ignore-file",
+	"--vcs-root",
+	"--vcs-default-branch",
+	"--files-max-size",
+	"--files-ignore-unknown",
+	"--indent-style",
+	"--indent-width",
+	"--line-ending",
+	"--line-width",
+	"--json-formatter-enabled",
+	"--json-formatter-indent-style",
+	"--json-formatter-indent-width",
+	"--json-formatter-line-ending",
+	"--json-formatter-line-width",
+	"--javascript-formatter-enabled",
+	"--javascript-formatter-indent-style",
+	"--javascript-formatter-indent-width",
+	"--javascript-formatter-line-ending",
+	"--javascript-formatter-line-width",
+];
+
+/** Biome 写操作参数 — 只在 acceptEdits 模式下允许 */
+const BIOME_WRITE_ARG_PREFIXES = [
+	"--write", // 格式化并写入文件
+	"--fix", // 修复 lint 错误
+	"--unsafe", // 应用不安全的修复
+];
+
+/** TypeScript 特定的只读参数前缀 */
+const TSC_SAFE_ARG_PREFIXES = [
+	"--pretty",
+	"--listFiles",
+	"--listFilesOnly",
+	"--explainFiles",
+	"--showConfig",
+	"--traceResolution",
+	"--diagnostics",
+	"--extendedDiagnostics",
+	"--generateTrace",
+	"--sourceMap",
+	"--inlineSourceMap",
+	"--rootDir",
+	"--removeComments",
+	"--importHelpers",
+	"--downlevelIteration",
+	"--isolatedModules",
+	"--strict",
+	"--noImplicitAny",
+	"--strictNullChecks",
+	"--strictFunctionTypes",
+	"--strictBindCallApply",
+	"--strictPropertyInitialization",
+	"--noImplicitThis",
+	"--alwaysStrict",
+	"--noUnusedLocals",
+	"--noUnusedParameters",
+	"--noImplicitReturns",
+	"--noFallthroughCasesInSwitch",
+	"--noUncheckedIndexedAccess",
+	"--noImplicitOverride",
+	"--allowUnusedLabels",
+	"--allowUnreachableCode",
+	"--skipLibCheck",
+	"--skipDefaultLibCheck",
+	"--moduleResolution",
+	"--module",
+	"--target",
+	"--lib",
+	"--jsx",
+	"--jsxFactory",
+	"--jsxFragmentFactory",
+	"--jsxImportSource",
+	"--experimentalDecorators",
+	"--emitDecoratorMetadata",
+	"--resolveJsonModule",
+	"--esModuleInterop",
+	"--allowSyntheticDefaultImports",
+	"--forceConsistentCasingInFileNames",
+	"--allowJs",
+	"--checkJs",
+	"--maxNodeModuleJsDepth",
+	"--types",
+	"--typeRoots",
+	"--paths",
+	"--baseUrl",
+	"--rootDirs",
+	"--preserveSymlinks",
+	"--charset",
+	"--newLine",
+	"--useDefineForClassFields",
+	"--preserveConstEnums",
+	"--preserveValueImports",
+	"--assumeChangesOnlyAffectDirectDependencies",
+];
+
+/** TypeScript 写操作参数 — 只在 acceptEdits 模式下允许 */
+const TSC_WRITE_ARG_PREFIXES = [
+	"--incremental",
+	"--tsBuildInfoFile",
+	"--composite",
+	"--declaration",
+	"--declarationMap",
+	"--emitDeclarationOnly",
+	"--declarationDir",
+	"--outDir",
+	"--outFile",
+];
+
+/** 会触发远程拉包或动态来源的高风险参数。 */
+const PACKAGE_RUNNER_DANGEROUS_FLAGS = new Set([
+	"-p",
+	"--package",
+	"--registry",
+	"--userconfig",
+	"--ignore-existing",
+]);
+
+/** 包执行器分类结果 */
+interface PackageRunnerClassification {
+	/** 错误描述，null 表示安全 */
+	error: string | null;
+	/** 是否包含写操作 */
+	hasWriteOperation: boolean;
+}
+
+/**
+ * 对 npx/bunx 执行的命令进行递归分类。
+ * 严格模式：仅允许受控白名单包 + 只读参数 + 非远程来源。
+ */
+function classifyPackageRunner(tokens: string[], runner: string): PackageRunnerClassification {
+	let i = 1;
+	while (i < tokens.length && tokens[i].startsWith("-")) {
+		const flag = tokens[i];
+		if (PACKAGE_RUNNER_DANGEROUS_FLAGS.has(flag)) {
+			return {
+				error: `${runner} ${flag} (dynamic package source not allowed)`,
+				hasWriteOperation: false,
+			};
+		}
+		// --package/-p 带参数（虽然上面已拦截，保留健壮性）
+		if (flag === "--package" || flag === "-p") {
+			i += 2;
+			continue;
+		}
+		i++;
+	}
+	const execCmd = tokens[i];
+	if (!execCmd) {
+		return { error: `${runner} (no explicit command)`, hasWriteOperation: false };
+	}
+
+	// 禁止 URL / git / file 协议来源
+	if (
+		execCmd.includes("://") ||
+		execCmd.startsWith("git+") ||
+		execCmd.startsWith("file:") ||
+		execCmd.startsWith("http:") ||
+		execCmd.startsWith("https:")
+	) {
+		return { error: `${runner} ${execCmd} (remote source not allowed)`, hasWriteOperation: false };
+	}
+
+	// 禁止非固定版本（如 @latest, @next）
+	const unstableTagPattern = /@(latest|next|canary|beta|alpha|rc)$/i;
+	if (unstableTagPattern.test(execCmd)) {
+		return {
+			error: `${runner} ${execCmd} (unstable package tag not allowed)`,
+			hasWriteOperation: false,
+		};
+	}
+
+	// 提取包名（去除 @scope/pkg@version 里的版本部分）
+	const packageName = execCmd.startsWith("@")
+		? execCmd.split("@").slice(0, 2).join("@")
+		: execCmd.split("@")[0];
+
+	if (!SAFE_PACKAGE_RUNNERS.has(packageName)) {
+		return { error: `${runner} ${execCmd} (package not in allowlist)`, hasWriteOperation: false };
+	}
+
+	const isBiome = packageName === "biome" || packageName === "@biomejs/biome";
+	const isTsc =
+		packageName === "tsc" ||
+		packageName === "tsgo" ||
+		packageName === "typescript" ||
+		packageName === "@typescript/native-preview";
+
+	let hasWriteOperation = false;
+
+	const cmdArgs = tokens.slice(i + 1);
+	for (const arg of cmdArgs) {
+		if (arg.startsWith("--config") || arg.startsWith("--plugin") || arg.startsWith("--require")) {
+			return {
+				error: `${runner} ${execCmd} ${arg} (dynamic code loading flag)`,
+				hasWriteOperation: false,
+			};
+		}
+		if (arg.startsWith("-")) {
+			// 检查是否在通用白名单中
+			if (SAFE_PACKAGE_ARGS.has(arg)) {
+				continue;
+			}
+			// Biome 特定参数：检查前缀匹配（支持 --max-diagnostics=200 格式）
+			if (isBiome) {
+				const argName = arg.split("=")[0];
+				// 检查只读参数
+				if (BIOME_SAFE_ARG_PREFIXES.some((prefix) => argName === prefix)) {
+					continue;
+				}
+				// 检查写操作参数
+				if (BIOME_WRITE_ARG_PREFIXES.some((prefix) => argName === prefix)) {
+					hasWriteOperation = true;
+					continue;
+				}
+			}
+			// TypeScript 特定参数：检查前缀匹配
+			if (isTsc) {
+				const argName = arg.split("=")[0];
+				if (TSC_SAFE_ARG_PREFIXES.some((prefix) => argName === prefix)) {
+					continue;
+				}
+				if (TSC_WRITE_ARG_PREFIXES.some((prefix) => argName === prefix)) {
+					hasWriteOperation = true;
+					continue;
+				}
+			}
+			return {
+				error: `${runner} ${execCmd} ${arg} (flag not in safe allowlist)`,
+				hasWriteOperation: false,
+			};
+		}
+		// 非 flag 参数（子命令/目标路径）
+		// - 允许只读子命令：check, version
+		// - 允许当前目录：.
+		// - Biome/tsc 允许文件路径参数（只读检查操作）
+		if (arg === "check" || arg === "version" || arg === ".") continue;
+		if (isBiome || isTsc) {
+			// Biome/tsc 接受文件路径作为检查目标，这是只读操作
+			// 路径安全性由外层的 isInsideWorktree 检查保证
+			continue;
+		}
+		return {
+			error: `${runner} ${execCmd} ${arg} (argument not in safe allowlist)`,
+			hasWriteOperation: false,
+		};
+	}
+
+	return { error: null, hasWriteOperation };
+}
+
+/**
+ * 条件安全命令 — 在白名单中但某些参数组合是危险的。
+ * key: 命令名, value: 危险参数检测函数
+ */
+const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) => string | null> =
+	{
+		// git — 大部分子命令安全，但部分写操作有破坏性
+		git: (tokens) => {
+			// 与只读判定共用同一套全局 flag 跳过逻辑：裸取 tokens[1] 会让
+			// `git -C . reflog expire` / `git -C repo clean -fdx` 这类形式绕过检查。
+			const { sub, injectionFlag } = gitSubcommandInfo(tokens);
+			// 配置/可执行路径注入 flag 本身就是危险操作，与跟的是什么子命令无关
+			if (injectionFlag)
+				return `git ${injectionFlag} (global flag injects config or executable path — can run arbitrary commands)`;
+			if (!sub) return null;
+
+			// push --force / -f / --force-with-lease / --mirror / --delete
+			if (sub === "push") {
+				if (
+					tokens.some(
+						(t) => t === "--force" || t === "-f" || t === "--force-with-lease" || t === "--mirror",
+					)
+				)
+					return "git push --force (rewrites remote history)";
+				if (tokens.some((t) => t === "--delete" || t === "-d"))
+					return "git push --delete (deletes remote ref)";
+				return null;
+			}
+			// reset --hard
+			if (sub === "reset" && tokens.some((t) => t === "--hard"))
+				return "git reset --hard (discards uncommitted changes)";
+			// clean -f / -fd / -fdx
+			if (sub === "clean") return "git clean (removes untracked files)";
+			// checkout -- (discard changes) — only when restoring files, not switching branches
+			if (sub === "checkout" && tokens.includes("--"))
+				return "git checkout -- (discards working tree changes)";
+			// rebase (interactive or not — rewrites history)
+			if (sub === "rebase") return "git rebase (rewrites commit history)";
+			// merge (can cause conflicts / alter branch state)
+			if (sub === "merge") return "git merge (alters branch state)";
+			// filter-branch / filter-repo (mass history rewrite)
+			if (sub === "filter-branch" || sub === "filter-repo")
+				return `git ${sub} (mass history rewrite)`;
+			// reflog expire / delete / drop — 销毁恢复点（delete/drop 不带 flag 也同样破坏）
+			if (sub === "reflog" && tokens.some((t) => t === "expire" || t === "delete" || t === "drop"))
+				return "git reflog expire/delete (destroys recovery points)";
+			// gc with aggressive prune
+			if (sub === "gc" && tokens.some((t) => t.startsWith("--prune")))
+				return "git gc --prune (permanently removes objects)";
+			// branch -D (force delete)
+			if (sub === "branch" && tokens.some((t) => t === "-D" || t === "--delete" || t === "-d"))
+				return "git branch delete";
+			// submodule deinit
+			if (sub === "submodule" && tokens.includes("deinit")) return "git submodule deinit";
+			// worktree remove
+			if (sub === "worktree" && tokens.includes("remove")) return "git worktree remove";
+
+			return null;
+		},
+		// node -e / --eval / --input-type / -p 可以执行任意 JS
+		node: (tokens) => {
+			const dangerous = ["-e", "--eval", "-p", "--print", "-"];
+			if (tokens.some((t) => dangerous.includes(t) || t.startsWith("--input-type")))
+				return "node with code execution flag";
+			return null;
+		},
+		// python/python3 -c 可以执行任意代码
+		python: (tokens) => {
+			if (tokens.includes("-c") || tokens.includes("-")) return "python with -c flag";
+			return null;
+		},
+		python3: (tokens) => {
+			if (tokens.includes("-c") || tokens.includes("-")) return "python3 with -c flag";
+			return null;
+		},
+		// npm — 只读子命令放行，写操作/脚本执行拦截
+		npm: (tokens) => {
+			if (tokens.includes("exec")) return "npm exec (executes arbitrary package)";
+			const sub = tokens[1];
+			if (!sub) return null; // bare `npm` — safe (shows help)
+			// 只读子命令 — 安全
+			const npmReadOnly = new Set([
+				"ls",
+				"list",
+				"ll",
+				"la",
+				"view",
+				"info",
+				"show",
+				"outdated",
+				"search",
+				"find",
+				"help",
+				"config",
+				"get",
+				"prefix",
+				"root",
+				"bin",
+				"version",
+				"--version",
+				"-v",
+				"explain",
+				"why",
+				"fund",
+				"audit",
+				"doctor",
+				"ping",
+				"whoami",
+				"token",
+				"pack",
+				"diff",
+				"pkg",
+				"query",
+				"completion",
+				"explore",
+			]);
+			if (npmReadOnly.has(sub)) return null;
+			// 危险子命令
+			if (sub === "run" || sub === "run-script") return `npm ${sub} (runs project script)`;
+			if (sub === "test" || sub === "start" || sub === "stop" || sub === "restart")
+				return `npm ${sub} (runs project script)`;
+			if (sub === "install" || sub === "i" || sub === "ci" || sub === "add")
+				return `npm ${sub} (installs packages)`;
+			if (sub === "uninstall" || sub === "remove" || sub === "rm" || sub === "un" || sub === "r")
+				return `npm ${sub} (removes packages)`;
+			if (sub === "update" || sub === "up" || sub === "upgrade")
+				return `npm ${sub} (updates packages)`;
+			if (sub === "publish") return "npm publish (publishes package)";
+			if (sub === "link" || sub === "ln") return `npm ${sub} (creates symlink)`;
+			if (sub === "prune") return "npm prune (removes extraneous packages)";
+			if (sub === "rebuild" || sub === "rb") return `npm ${sub} (rebuilds packages)`;
+			if (sub === "cache" && tokens.includes("clean")) return "npm cache clean";
+			// 未知子命令 — 保守拦截
+			return `npm ${sub} (unknown npm subcommand)`;
+		},
+		// pip install 可以执行 setup.py
+		pip: (tokens) => {
+			if (
+				tokens.includes("install") &&
+				tokens.some((t) => t.startsWith("--target") || t.startsWith("-t"))
+			)
+				return "pip install with custom target";
+			return null;
+		},
+		pip3: (tokens) => {
+			if (
+				tokens.includes("install") &&
+				tokens.some((t) => t.startsWith("--target") || t.startsWith("-t"))
+			)
+				return "pip3 install with custom target";
+			return null;
+		},
+		// go run 可以执行任意代码
+		go: (tokens) => {
+			if (tokens.includes("run")) return "go run";
+			return null;
+		},
+		// cargo run 可以执行任意代码
+		cargo: (tokens) => {
+			if (tokens.includes("run")) return "cargo run";
+			return null;
+		},
+		// bun — 只读子命令放行，脚本执行/-e 拦截
+		bun: (tokens) => {
+			if (tokens.includes("-e") || tokens.includes("--eval")) return "bun with -e flag";
+			const sub = tokens[1];
+			if (!sub) return null; // bare `bun` — safe (shows help)
+			// 版本/帮助 flags
+			if (sub === "--version" || sub === "-v" || sub === "--help" || sub === "-h") return null;
+			// 只读子命令
+			const bunReadOnly = new Set(["pm", "--version", "-v", "--help", "-h", "--revision"]);
+			if (bunReadOnly.has(sub)) return null;
+			// 危险子命令
+			if (sub === "run") return "bun run (runs project script)";
+			if (sub === "test") return "bun test (runs project tests)";
+			if (sub === "install" || sub === "i" || sub === "add")
+				return `bun ${sub} (installs packages)`;
+			if (sub === "remove" || sub === "rm") return `bun ${sub} (removes packages)`;
+			if (sub === "update") return "bun update (updates packages)";
+			if (sub === "link") return "bun link (creates symlink)";
+			if (sub === "build") return "bun build (bundles code)";
+			if (sub === "init") return "bun init (initializes project)";
+			if (sub === "create") return "bun create (scaffolds project)";
+			if (sub === "upgrade") return "bun upgrade (upgrades bun itself)";
+			if (sub === "patch") return "bun patch (patches packages)";
+			// 未知子命令 — 可能是脚本名（bun <script>），保守拦截
+			return `bun ${sub} (unknown bun subcommand)`;
+		},
+		// find -exec / -execdir — 提取被执行的命令进行递归分类（见 classifyFind）。
+		// `sideEffects` 不进 dangerousPatterns：`-exec cp`/`-fprintf` 的子命令本身在白名单里，
+		// 自动放行语义保持原样，额外的风险由危险反思层（classifyShellDanger）处理。
+		find: (tokens) => {
+			const classification = classifyFind(tokens);
+			return classification.kind === "dangerous" || classification.kind === "unknown"
+				? classification.pattern
+				: null;
+		},
+		// sed -i 可以修改文件
+		sed: (tokens) => {
+			if (tokens.includes("-i") || tokens.some((t) => t.startsWith("-i")))
+				return "sed with -i (in-place edit)";
+			return null;
+		},
+		// awk 可以通过 system() 执行命令
+		awk: (_tokens, fullText) => {
+			if (fullText.includes("system(") || fullText.includes("| getline"))
+				return "awk with system()/getline";
+			return null;
+		},
+		gawk: (_tokens, fullText) => {
+			if (fullText.includes("system(") || fullText.includes("| getline"))
+				return "gawk with system()/getline";
+			return null;
+		},
+		// xargs — 递归分析被执行的命令
+		xargs: (tokens) => {
+			// 跳过 xargs 自身的 flags
+			const xargsFlags = new Set([
+				"-0",
+				"--null",
+				"-d",
+				"--delimiter",
+				"-n",
+				"--max-args",
+				"-P",
+				"--max-procs",
+				"-I",
+				"-i",
+				"--replace",
+				"-L",
+				"--max-lines",
+				"-s",
+				"--max-chars",
+				"-t",
+				"--verbose",
+				"-p",
+				"--interactive",
+				"-r",
+				"--no-run-if-empty",
+				"--show-limits",
+			]);
+			const flagsWithValue = new Set([
+				"-d",
+				"--delimiter",
+				"-n",
+				"--max-args",
+				"-P",
+				"--max-procs",
+				"-I",
+				"-i",
+				"--replace",
+				"-L",
+				"--max-lines",
+				"-s",
+				"--max-chars",
+			]);
+			let i = 1;
+			while (i < tokens.length) {
+				const t = tokens[i];
+				if (t.startsWith("-") && xargsFlags.has(t)) {
+					i++;
+					if (flagsWithValue.has(t) && i < tokens.length) i++; // skip value
+				} else if (t.startsWith("-")) {
+					i++; // unknown flag, skip
+				} else {
+					break;
+				}
+			}
+			const execCmd = tokens[i];
+			// xargs 默认执行 echo — 安全
+			if (!execCmd) return null;
+
+			if (ALWAYS_ASK_COMMANDS.has(execCmd)) return `xargs ${execCmd} (dangerous command)`;
+			if (execCmd in CONDITIONAL_COMMANDS) {
+				const subTokens = tokens.slice(i);
+				const danger = CONDITIONAL_COMMANDS[execCmd](subTokens, subTokens.join(" "));
+				if (danger) return `xargs → ${danger}`;
+				return null;
+			}
+			if (SAFE_COMMANDS.has(execCmd)) return null;
+			return `xargs ${execCmd} (unknown command)`;
+		},
+		// tee 可以写入任意文件
+		tee: (_tokens) => {
+			// tee 总是写文件，标记为危险
+			return "tee (writes to files)";
+		},
+		// curl/wget — 下载本身不危险，但 pipe 到 shell 是（在 pipeline 检测中处理）
+		curl: (_tokens) => null,
+		wget: (_tokens) => null,
+		// tar 可以覆盖文件
+		tar: (tokens) => {
+			if (
+				tokens.some(
+					(t) =>
+						t === "-x" ||
+						t === "--extract" ||
+						// 短选项组合如 xzf, xf, -xzf
+						(t.startsWith("-") && t.includes("x")) ||
+						(!t.startsWith("-") && t !== "tar" && /^[a-zA-Z]*x[a-zA-Z]*$/.test(t)),
+				)
+			)
+				return "tar extract (may overwrite files)";
+			return null;
+		},
+		// cp/mv/mkdir/touch — 文件操作，保留在条件安全中
+		cp: (_tokens) => null,
+		mv: (_tokens) => null,
+		mkdir: (_tokens) => null,
+		touch: (_tokens) => null,
+		// make — 可以执行任意命令，但是正常开发流程
+		make: (_tokens) => null,
+		// diff — 只读
+		diff: (_tokens) => null,
+		// zip/unzip/gzip/gunzip — 压缩解压
+		zip: (_tokens) => null,
+		unzip: (_tokens) => null,
+		gzip: (_tokens) => null,
+		gunzip: (_tokens) => null,
+		// yarn — 只读子命令放行，脚本执行拦截
+		yarn: (tokens) => {
+			const sub = tokens[1];
+			if (!sub) return null;
+			// 只读子命令
+			const yarnReadOnly = new Set([
+				"list",
+				"info",
+				"why",
+				"outdated",
+				"config",
+				"--version",
+				"-v",
+				"--help",
+				"-h",
+				"audit",
+				"licenses",
+				"bin",
+				"versions",
+				"policies",
+				"workspaces",
+			]);
+			if (yarnReadOnly.has(sub)) return null;
+			// 危险子命令
+			if (sub === "run") return "yarn run (runs project script)";
+			if (sub === "test" || sub === "start" || sub === "stop")
+				return `yarn ${sub} (runs project script)`;
+			if (sub === "add") return "yarn add (installs packages)";
+			if (sub === "remove") return "yarn remove (removes packages)";
+			if (sub === "install") return "yarn install (installs all packages)";
+			if (sub === "upgrade" || sub === "up") return `yarn ${sub} (updates packages)`;
+			if (sub === "link") return "yarn link (creates symlink)";
+			if (sub === "publish") return "yarn publish (publishes package)";
+			if (sub === "cache" && tokens.includes("clean")) return "yarn cache clean";
+			// yarn <script-name> 也是 run 的隐式别名，但无法区分子命令和脚本名
+			// 保守处理：未知子命令拦截
+			return `yarn ${sub} (unknown yarn subcommand)`;
+		},
+		// pnpm — 只读子命令放行，脚本执行拦截
+		pnpm: (tokens) => {
+			const sub = tokens[1];
+			if (!sub) return null;
+			// 只读子命令
+			const pnpmReadOnly = new Set([
+				"list",
+				"ls",
+				"ll",
+				"la",
+				"why",
+				"outdated",
+				"audit",
+				"config",
+				"--version",
+				"-v",
+				"--help",
+				"-h",
+				"root",
+				"bin",
+				"store",
+			]);
+			if (pnpmReadOnly.has(sub)) return null;
+			// 危险子命令
+			if (sub === "run") return "pnpm run (runs project script)";
+			if (sub === "test" || sub === "start" || sub === "stop")
+				return `pnpm ${sub} (runs project script)`;
+			if (sub === "add" || sub === "install" || sub === "i")
+				return `pnpm ${sub} (installs packages)`;
+			if (sub === "remove" || sub === "rm" || sub === "un" || sub === "uninstall")
+				return `pnpm ${sub} (removes packages)`;
+			if (sub === "update" || sub === "up") return `pnpm ${sub} (updates packages)`;
+			if (sub === "link" || sub === "ln") return `pnpm ${sub} (creates symlink)`;
+			if (sub === "publish") return "pnpm publish (publishes package)";
+			if (sub === "rebuild" || sub === "rb") return `pnpm ${sub} (rebuilds packages)`;
+			if (sub === "prune") return "pnpm prune (removes extraneous packages)";
+			return `pnpm ${sub} (unknown pnpm subcommand)`;
+		},
+		// npx/bunx — 包执行器，递归检查被执行的命令
+		npx: (tokens) => classifyPackageRunner(tokens, "npx").error,
+		bunx: (tokens) => classifyPackageRunner(tokens, "bunx").error,
+	};
+
+/** 需要提取路径参数的命令（写操作） */
+const PATH_COMMANDS_WRITE = new Set(["rm", "cp", "mv", "mkdir", "touch", "chmod", "chown"]);
+
+/** 需要提取路径参数的命令（读操作 + 目录浏览） */
+const PATH_COMMANDS_READ = new Set([
+	"cd",
+	"cat",
+	"ls",
+	"head",
+	"tail",
+	"less",
+	"more",
+	"stat",
+	"file",
+	"find",
+	"grep",
+	"rg",
+	"ag",
+	"fd",
+	"wc",
+]);
+
+/** 所有需要路径提取的命令 */
+const PATH_COMMANDS = new Set([...PATH_COMMANDS_WRITE, ...PATH_COMMANDS_READ]);
+
+/** 危险的环境变量前缀 */
+const DANGEROUS_ENV_VARS = new Set([
+	"LD_PRELOAD",
+	"LD_LIBRARY_PATH",
+	"DYLD_INSERT_LIBRARIES",
+	"DYLD_LIBRARY_PATH",
+	"PYTHONPATH",
+	"NODE_OPTIONS",
+	"NODE_PATH",
+	"PERL5LIB",
+	"RUBYLIB",
+	"CLASSPATH",
+	"BASH_ENV",
+	"ENV",
+	"PROMPT_COMMAND",
+	// git：仓库/对象库指向（越界读写任意仓库）
+	"GIT_DIR",
+	"GIT_WORK_TREE",
+	"GIT_NAMESPACE",
+	"GIT_INDEX_FILE",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+	// git：配置注入（等价于 `git -c key=val`，可设 alias/core.pager/core.fsmonitor 等）
+	"GIT_CONFIG_COUNT",
+	"GIT_CONFIG_PARAMETERS",
+	"GIT_CONFIG_GLOBAL",
+	"GIT_CONFIG_SYSTEM",
+	// git：外部命令执行（diff/pager/ssh/编辑器全部经 shell 启动）
+	"GIT_EXEC_PATH",
+	"GIT_EXTERNAL_DIFF",
+	"GIT_PAGER",
+	"GIT_EDITOR",
+	"GIT_SSH",
+	"GIT_SSH_COMMAND",
+	"GIT_ASKPASS",
+	"SSH_ASKPASS",
+	// git：trace 输出可写到任意文件
+	"GIT_TRACE",
+	"GIT_TRACE2",
+]);
+
+/** Shell 命令名集合，用于检测 pipe-to-shell 模式 */
+const SHELL_COMMANDS = new Set(["bash", "sh", "zsh", "fish", "dash", "ksh", "csh", "tcsh"]);
+
+// ── Parser 单例 ───────────────────────────────────────────
+
+type TreeSitterParser = {
+	parse(input: string): { rootNode: TreeSitterNode };
+};
+
+type TreeSitterNode = {
+	type: string;
+	text: string;
+	childCount: number;
+	child(index: number): TreeSitterNode | null;
+	parent: TreeSitterNode | null;
+	descendantsOfType(type: string): TreeSitterNode[];
+};
+
+let parserPromise: Promise<TreeSitterParser> | null = null;
+
+async function getParser(): Promise<TreeSitterParser> {
+	if (parserPromise) return parserPromise;
+	parserPromise = initParser();
+	return parserPromise;
+}
+
+async function initParser(): Promise<TreeSitterParser> {
+	// Engine bootstrap (including materializing the embedded core wasm out of
+	// $bunfs) lives in tree-sitter-runtime.ts because `Parser.init` is a
+	// process-wide singleton with an unguarded init check: two callers racing it
+	// would each build an Emscripten module, and languages loaded against the
+	// losing one would hold pointers into an abandoned heap.
+	const bashBuf = await Bun.file(embeddedBashWasm).arrayBuffer();
+	const bashLanguage = await loadTreeSitterLanguage(new Uint8Array(bashBuf));
+	const parser = await createTreeSitterParser(bashLanguage);
+	return parser as unknown as TreeSitterParser;
+}
+
+// ── 辅助函数 ─────────────────────────────────────────────
+
+/** 检测命令是否使用绝对路径或相对路径执行 */
+function isPathExecution(cmdName: string): boolean {
+	const fwd = toForwardSlash(cmdName);
+	// Unix absolute, relative, or Windows drive-letter absolute (e.g. C:/...)
+	return (
+		fwd.startsWith("/") ||
+		fwd.startsWith("./") ||
+		fwd.startsWith("../") ||
+		/^[a-zA-Z]:[\\/]/.test(cmdName)
+	);
+}
+
+/** 检测 pipeline 中是否存在 pipe-to-shell 模式 */
+function detectPipeToShell(rootNode: TreeSitterNode): string[] {
+	const patterns: string[] = [];
+	const pipelines = rootNode.descendantsOfType("pipeline");
+	for (const pipeline of pipelines) {
+		// 获取 pipeline 中的所有 command 节点（直接子节点）
+		const commands: TreeSitterNode[] = [];
+		for (let i = 0; i < pipeline.childCount; i++) {
+			const child = pipeline.child(i);
+			if (!child) continue;
+			if (child.type === "command" || child.type === "redirected_statement") {
+				commands.push(child);
+			}
+		}
+		if (commands.length < 2) continue;
+
+		// 检查最后一个命令是否是 shell
+		const lastCmd = commands[commands.length - 1];
+		const lastCmdNode =
+			lastCmd.type === "redirected_statement" ? lastCmd.descendantsOfType("command")[0] : lastCmd;
+		if (!lastCmdNode) continue;
+
+		const firstChild = lastCmdNode.child(0);
+		if (firstChild?.type === "command_name") {
+			const name = firstChild.text;
+			if (
+				SHELL_COMMANDS.has(name) ||
+				name === "python" ||
+				name === "python3" ||
+				name === "node" ||
+				name === "perl" ||
+				name === "ruby"
+			) {
+				patterns.push(`pipe to ${name}`);
+			}
+		}
+	}
+	return patterns;
+}
+
+/** 检测环境变量注入 */
+function detectEnvInjection(rootNode: TreeSitterNode): string[] {
+	const patterns: string[] = [];
+	const assignments = rootNode.descendantsOfType("variable_assignment");
+	for (const assignment of assignments) {
+		// variable_assignment 的 parent 是 command → 这是命令前缀环境变量
+		if (assignment.parent?.type === "command") {
+			const varName = assignment.text.split("=")[0];
+			if (DANGEROUS_ENV_VARS.has(varName)) {
+				patterns.push(`dangerous env var: ${varName}`);
+			}
+		}
+	}
+	return patterns;
+}
+
+/**
+ * 从命令 tokens 中提取文件/目录路径参数。
+ * 跳过 flag（-xxx）、chmod 模式（+x）、以及已知的非路径参数。
+ */
+const GREP_LIKE_FLAGS_WITH_VALUE = new Set([
+	"-e",
+	"-f",
+	"--regexp",
+	"--file",
+	"-m",
+	"--max-count",
+	"-A",
+	"-B",
+	"-C",
+	"--after-context",
+	"--before-context",
+	"--context",
+	"--include",
+	"--exclude",
+	"--exclude-dir",
+	"-t",
+	"--type",
+	"-T",
+	"--type-not", // rg/ag
+]);
+
+/** 从 fullText 中提取重定向目标路径（>, >>, 2>, &> 等） */
+const REDIRECT_REGEX = /(?:>>|[012]>|&>|>\|?)[ \t]*([^\s;|&)]+)/g;
+
+function extractRedirectTargets(
+	fullText: string,
+	cwd: string,
+	semantics: TargetPathSemantics,
+): string[] {
+	const paths: string[] = [];
+	for (const match of fullText.matchAll(REDIRECT_REGEX)) {
+		const target = match[1];
+		// 忽略 /dev/null 等特殊设备
+		if (target.startsWith("/dev/")) continue;
+		paths.push(semantics.resolve(cwd, target));
+	}
+	return paths;
+}
+
+function extractPathArgs(
+	cmdName: string,
+	tokens: string[],
+	cwd: string,
+	semantics: TargetPathSemantics,
+): string[] {
+	const paths: string[] = [];
+	const args = tokens.slice(1);
+
+	if (cmdName === "grep" || cmdName === "rg" || cmdName === "ag" || cmdName === "fd") {
+		// grep pattern [file/dir...] — 第一个非 flag 参数是 pattern，之后的是路径
+		let patternSeen = false;
+		let skipNext = false;
+		for (const arg of args) {
+			if (skipNext) {
+				skipNext = false;
+				continue;
+			}
+			if (arg.startsWith("-")) {
+				if (GREP_LIKE_FLAGS_WITH_VALUE.has(arg)) skipNext = true;
+				continue;
+			}
+			if (!patternSeen) {
+				patternSeen = true;
+				continue;
+			} // skip pattern
+			paths.push(semantics.resolve(cwd, arg));
+		}
+		return paths;
+	}
+
+	if (cmdName === "find") {
+		// find [path...] [expression] — 路径在表达式之前
+		for (const arg of args) {
+			if (arg.startsWith("-") || arg.startsWith("(") || arg.startsWith("!")) break;
+			paths.push(semantics.resolve(cwd, arg));
+		}
+		return paths;
+	}
+
+	// 通用：跳过 flag 和 chmod 模式
+	for (const arg of args) {
+		if (arg.startsWith("-")) continue;
+		if (cmdName === "chmod" && arg.startsWith("+")) continue;
+		paths.push(semantics.resolve(cwd, arg));
+	}
+	return paths;
+}
+
+// ── git 路径提取 ─────────────────────────────────────────
+
+/**
+ * git clone/init 等子命令中带值的 flag — 遇到时跳过下一个 token。
+ * 只列出 `--flag value` 形式（非 `--flag=value`）的常用选项。
+ */
+const GIT_CLONE_FLAGS_WITH_VALUE = new Set([
+	"-b",
+	"--branch",
+	"-o",
+	"--origin",
+	"--reference",
+	"--reference-if-able",
+	"--separate-git-dir",
+	"--depth",
+	"--shallow-since",
+	"--shallow-exclude",
+	"-j",
+	"--jobs",
+	"--filter",
+	"--bundle-uri",
+	"--template",
+	"--config",
+	"-c",
+]);
+
+/** git 写操作子命令 — 会在文件系统创建/修改内容 */
+const GIT_WRITE_SUBCOMMANDS = new Set(["clone", "init", "worktree"]);
+
+/**
+ * 从 git 命令中提取文件系统路径。
+ *
+ * git 的路径语义完全取决于子命令，不能用通用的 extractPathArgs 处理。
+ * 目前覆盖：
+ * - `git -C <dir>` — 工作目录切换
+ * - `git clone <url> [<directory>]` — 克隆目标目录
+ * - `git init [<directory>]` — 初始化目标目录
+ * - `git worktree add <path>` — worktree 路径
+ *
+ * @returns `{ paths, isWrite }` — 提取的路径列表和是否为写操作
+ */
+function extractGitPaths(
+	tokens: string[],
+	cwd: string,
+	semantics: TargetPathSemantics,
+): { paths: string[]; isWrite: boolean } {
+	const paths: string[] = [];
+	let isWrite = false;
+
+	// 先处理 git -C <dir>：跳过 git 本身的全局选项找到子命令
+	let subIdx = 1;
+	while (subIdx < tokens.length) {
+		const t = tokens[subIdx];
+		if (t === "-C" && subIdx + 1 < tokens.length) {
+			paths.push(semantics.resolve(cwd, tokens[subIdx + 1]));
+			subIdx += 2;
+			continue;
+		}
+		// 附着形式 `-C<dir>`：git 的短选项接受值直接附着，分离形式以外的
+		// 这一形态同样改变仓库指向，不提取就会绕过路径作用域检查。
+		if (t.startsWith("-C") && t.length > 2 && !t.startsWith("--")) {
+			paths.push(semantics.resolve(cwd, t.slice(2)));
+			subIdx++;
+			continue;
+		}
+		// 跳过其他全局 flag（--git-dir=, --work-tree= 等 = 形式自动跳过）
+		if (t.startsWith("-")) {
+			// --git-dir / --work-tree 等带值的全局 flag
+			if (
+				(t === "--git-dir" || t === "--work-tree" || t === "--namespace") &&
+				subIdx + 1 < tokens.length
+			) {
+				subIdx += 2;
+				continue;
+			}
+			subIdx++;
+			continue;
+		}
+		break; // 找到子命令
+	}
+
+	const sub = tokens[subIdx];
+	if (!sub) return { paths, isWrite };
+
+	if (GIT_WRITE_SUBCOMMANDS.has(sub)) {
+		isWrite = true;
+	}
+
+	if (sub === "clone") {
+		// git clone [options] <repository> [<directory>]
+		// 提取最后一个非 flag 参数作为目标目录（如果有两个非 flag 参数）
+		const nonFlagArgs: string[] = [];
+		let skipNext = false;
+		for (let i = subIdx + 1; i < tokens.length; i++) {
+			if (skipNext) {
+				// tree-sitter 可能丢失数字 token（如 --depth 1 中的 1），
+				// 如果下一个 token 仍是 flag，说明值被吃掉了，不应跳过
+				if (!tokens[i].startsWith("-")) {
+					skipNext = false;
+					continue;
+				}
+				skipNext = false;
+			}
+			const arg = tokens[i];
+			if (arg.startsWith("-")) {
+				if (GIT_CLONE_FLAGS_WITH_VALUE.has(arg)) skipNext = true;
+				continue;
+			}
+			nonFlagArgs.push(arg);
+		}
+		// nonFlagArgs[0] = repository URL/path, nonFlagArgs[1] = target directory
+		if (nonFlagArgs.length >= 2) {
+			paths.push(semantics.resolve(cwd, nonFlagArgs[1]));
+		}
+		// 如果 repository 是本地路径（不含 :// 且不以 git@ 开头），也提取
+		if (nonFlagArgs.length >= 1) {
+			const repo = nonFlagArgs[0];
+			if (!repo.includes("://") && !repo.startsWith("git@")) {
+				paths.push(semantics.resolve(cwd, repo));
+			}
+		}
+	} else if (sub === "init") {
+		// git init [<directory>]
+		const nonFlagArgs: string[] = [];
+		for (let i = subIdx + 1; i < tokens.length; i++) {
+			const arg = tokens[i];
+			if (arg.startsWith("-")) {
+				// --template / --separate-git-dir 带值
+				if (arg === "--template" || arg === "--separate-git-dir") {
+					i++;
+				}
+				continue;
+			}
+			nonFlagArgs.push(arg);
+		}
+		if (nonFlagArgs.length >= 1) {
+			paths.push(semantics.resolve(cwd, nonFlagArgs[0]));
+		}
+	} else if (sub === "worktree") {
+		const worktreeSub = tokens[subIdx + 1];
+		if (worktreeSub === "add" || worktreeSub === "move") {
+			// git worktree add <path> [<branch>] / git worktree move <worktree> <new-path>
+			const nonFlagArgs: string[] = [];
+			for (let i = subIdx + 2; i < tokens.length; i++) {
+				const arg = tokens[i];
+				if (arg.startsWith("-")) continue;
+				nonFlagArgs.push(arg);
+			}
+			if (nonFlagArgs.length >= 1) {
+				paths.push(semantics.resolve(cwd, nonFlagArgs[0]));
+			}
+			// worktree move 的第二个参数也是路径
+			if (worktreeSub === "move" && nonFlagArgs.length >= 2) {
+				paths.push(semantics.resolve(cwd, nonFlagArgs[1]));
+			}
+		}
+	}
+
+	return { paths, isWrite };
+}
+
+// ── 灾难性命令检测 ────────────────────────────────────────
+
+/** 系统关键路径 — 对这些路径的递归删除/覆盖是灾难性的 */
+const CATASTROPHIC_PATHS = new Set([
+	"/",
+	"/bin",
+	"/boot",
+	"/dev",
+	"/etc",
+	"/home",
+	"/lib",
+	"/lib64",
+	"/opt",
+	"/proc",
+	"/root",
+	"/run",
+	"/sbin",
+	"/srv",
+	"/sys",
+	"/tmp",
+	"/usr",
+	"/var",
+]);
+
+/** Windows 系统关键路径（小写，正斜杠格式） */
+const WINDOWS_CATASTROPHIC_SUFFIXES = [
+	"/windows",
+	"/windows/system32",
+	"/program files",
+	"/program files (x86)",
+];
+
+/** 块设备前缀 */
+const BLOCK_DEVICE_PREFIXES = [
+	"/dev/sd",
+	"/dev/hd",
+	"/dev/nvme",
+	"/dev/vd",
+	"/dev/xvd",
+	"/dev/mmcblk",
+	"/dev/loop",
+];
+
+function isBlockDevice(path: string): boolean {
+	if (
+		path === "/dev/null" ||
+		path === "/dev/zero" ||
+		path === "/dev/urandom" ||
+		path === "/dev/random"
+	)
+		return false;
+	return BLOCK_DEVICE_PREFIXES.some((prefix) => path.startsWith(prefix));
+}
+
+function isCatastrophicPath(p: string): boolean {
+	const normalized = toForwardSlash(p).replace(/\/+$/, "") || "/";
+	if (CATASTROPHIC_PATHS.has(normalized)) return true;
+	// Windows: check drive roots (e.g. "C:/") and system directories
+	const lower = normalized.toLowerCase();
+	if (/^[a-z]:$/.test(lower) || /^[a-z]:\/$/.test(lower)) return true;
+	return WINDOWS_CATASTROPHIC_SUFFIXES.some(
+		(suffix) => lower.endsWith(suffix) && /^[a-z]:/.test(lower),
+	);
+}
+
+// ── Chapter 模式 Git 分支违规检测 ─────────────────────────
+
+/**
+ * Git 纯只读子命令 — 在 chapter 模式下始终允许。
+ * 这些命令不会产生任何写入副作用。
+ */
+const GIT_READONLY_SUBCOMMANDS = new Set([
+	"status",
+	"log",
+	"diff",
+	"show",
+	"blame",
+	"shortlog",
+	"describe",
+	"rev-parse",
+	"rev-list",
+	"ls-files",
+	"ls-tree",
+	"ls-remote",
+	"cat-file",
+	"name-rev",
+	"reflog", // 查看 reflog（expire 已在 CONDITIONAL 中拦截）
+	"for-each-ref",
+	"count-objects",
+	"fsck",
+	"verify-pack",
+	"hash-object",
+	// symbolic-ref 已移至条件检测（写入可切换分支）
+	// plumbing 只读命令
+	"diff-tree",
+	"diff-files",
+	"diff-index",
+	"merge-base",
+	"show-ref",
+	"verify-commit",
+	"verify-tag",
+	"var",
+	"get-tar-commit-id",
+	"whatchanged",
+	"check-ignore",
+]);
+
+/**
+ * 当前分支安全操作 — 只影响当前分支的工作区/暂存区/提交/本地配置。
+ * 在 chapter 模式下允许，因为不会影响其他分支。
+ * 注意：部分命令有写入副作用（如 stash/config/remote），但不涉及分支变更。
+ */
+const GIT_CURRENT_BRANCH_SAFE = new Set([
+	"add",
+	"commit",
+	"restore",
+	"rm",
+	"mv",
+	"apply",
+	"cherry-pick",
+	"am",
+	"notes",
+	"bisect",
+	"grep",
+	"archive",
+	"bundle",
+	"format-patch",
+	"send-email",
+	"request-pull",
+	"svn",
+	"init",
+	"clone",
+	"fetch",
+	"pull",
+	"submodule",
+	// stash 已移至条件检测（stash branch 会创建新分支）
+	"config", // 可写入 .git/config，但不影响分支
+	"remote", // add/remove 修改远程配置，但不影响分支
+]);
+
+/**
+ * 检测 chapter 模式下的 git 分支/工作树高风险和警告操作。
+ * 返回 violations（高风险权限项）和 warnings（普通警告权限项）。
+ *
+ * 在 chapter 模式下，agent 只能在当前分支上工作：
+ * - violations（高风险权限项）：切换分支、创建/删除分支、强制推送、合并、变基到其他分支、硬重置等
+ * - warnings（普通警告权限项）：soft/mixed reset、force-with-lease push、stash branch 等
+ * - 放行：恢复操作（merge --abort）、标签操作、只读 plumbing 命令等
+ */
+function detectGitBranchViolations(commands: BashAnalysis["commands"]): {
+	violations: string[];
+	warnings: string[];
+} {
+	const violations: string[] = [];
+	const warnings: string[] = [];
+
+	for (const cmd of commands) {
+		const tokens = cmd.tokens;
+		if (tokens[0] !== "git") continue;
+
+		const sub = tokens[1];
+		if (!sub) continue;
+
+		// 只读命令 — 始终安全
+		if (GIT_READONLY_SUBCOMMANDS.has(sub)) continue;
+
+		// 当前分支安全写操作 — 允许
+		if (GIT_CURRENT_BRANCH_SAFE.has(sub)) continue;
+
+		// ── 逐个检测可能影响分支的命令 ──
+
+		// checkout: 文件恢复操作放行，分支切换拦截
+		if (sub === "checkout") {
+			// checkout -- <file> 是恢复文件
+			if (tokens.includes("--")) continue;
+			// --ours/--theirs/--conflict 是冲突解决（文件级操作）
+			if (tokens.some((t) => t === "--ours" || t === "--theirs" || t.startsWith("--conflict")))
+				continue;
+			// -p/--patch 是交互式 hunk 恢复
+			if (tokens.some((t) => t === "-p" || t === "--patch")) continue;
+			// --pathspec-from-file 是从文件读取路径列表恢复
+			if (tokens.some((t) => t.startsWith("--pathspec-from-file"))) continue;
+			// checkout -b <branch> 创建新分支
+			if (tokens.some((t) => t === "-b" || t === "-B"))
+				violations.push("git checkout -b (creates new branch)");
+			else violations.push("git checkout (switches branch)");
+			continue;
+		}
+
+		// switch: 专门用于切换分支
+		if (sub === "switch") {
+			violations.push("git switch (switches branch)");
+			continue;
+		}
+
+		// branch: 查看分支列表是安全的，但创建/删除分支不行
+		if (sub === "branch") {
+			// 纯 `git branch` 或 `git branch -a/-r/--list/-v/--verbose` 是只读
+			const readonlyFlags = new Set([
+				"-a",
+				"--all",
+				"-r",
+				"--remotes",
+				"--list",
+				"-v",
+				"--verbose",
+				"-vv",
+				"--no-color",
+				"--color",
+			]);
+			// 这些 flag 后面跟一个值参数（不是分支名）
+			const flagsWithValue = new Set([
+				"--sort",
+				"--format",
+				"--contains",
+				"--no-contains",
+				"--merged",
+				"--no-merged",
+				"--points-at",
+			]);
+			const args = tokens.slice(2);
+			let hasWriteFlag = false;
+			const nonFlagArgs: string[] = [];
+			let skipNext = false;
+			for (let i = 0; i < args.length; i++) {
+				if (skipNext) {
+					skipNext = false;
+					continue;
+				}
+				const arg = args[i];
+				if (arg.startsWith("-")) {
+					// Check if it's a flag with value (--contains=X or --contains X)
+					const eqIdx = arg.indexOf("=");
+					const flagName = eqIdx >= 0 ? arg.slice(0, eqIdx) : arg;
+					if (flagsWithValue.has(flagName)) {
+						if (eqIdx < 0) skipNext = true; // next arg is the value
+					} else if (!readonlyFlags.has(arg)) {
+						hasWriteFlag = true;
+					}
+				} else {
+					nonFlagArgs.push(arg);
+				}
+			}
+			// 如果有非 flag 参数（分支名）或写 flag（-d/-D/-m/-M/-c/-C），则是写操作
+			if (nonFlagArgs.length > 0 || hasWriteFlag) {
+				const flags = args.filter((t) => t.startsWith("-"));
+				if (flags.some((f) => f === "-d" || f === "-D" || f === "--delete"))
+					violations.push("git branch -d/-D (deletes branch)");
+				else if (flags.some((f) => f === "-m" || f === "-M" || f === "--move"))
+					violations.push("git branch -m/-M (renames branch)");
+				else if (flags.some((f) => f === "-c" || f === "-C" || f === "--copy"))
+					violations.push("git branch -c/-C (copies branch)");
+				else if (nonFlagArgs.length > 0) violations.push("git branch <name> (creates new branch)");
+			}
+			continue;
+		}
+
+		// push: 区分 --force（硬拒绝）和 --force-with-lease（警告）
+		if (sub === "push") {
+			const pushFlags = tokens.slice(2);
+			const hasForce = pushFlags.some((t) => t === "--force" || t === "-f");
+			const hasForceWithLease = pushFlags.some((t) => t === "--force-with-lease");
+			if (hasForce) violations.push("git push --force (may overwrite other branches)");
+			else if (hasForceWithLease)
+				warnings.push("git push --force-with-lease (safe force push, but rewrites remote history)");
+			if (pushFlags.some((t) => t === "--delete" || t === "-d"))
+				violations.push("git push --delete (deletes remote branch)");
+			// push --all / --mirror 推送所有分支/引用
+			if (pushFlags.some((t) => t === "--all" || t === "--mirror"))
+				violations.push("git push --all/--mirror (pushes all branches)");
+			// 检查 refspec src:dst 格式 — 可能推送到其他分支
+			const pushArgs = pushFlags.filter((t) => !t.startsWith("-"));
+			// pushArgs: [remote, refspec...]
+			for (const arg of pushArgs.slice(1)) {
+				if (arg.includes(":")) {
+					violations.push(`git push with refspec '${arg}' (may target other branch)`);
+				}
+			}
+			continue;
+		}
+
+		// merge: --abort/--continue/--quit 是恢复操作，放行；其他拦截
+		if (sub === "merge") {
+			if (tokens.some((t) => t === "--abort" || t === "--continue" || t === "--quit")) continue;
+			violations.push("git merge (merges another branch into current)");
+			continue;
+		}
+
+		// rebase: --abort/--continue/--skip/--quit/--edit-todo/--show-current-patch 是恢复操作，放行
+		if (sub === "rebase") {
+			if (
+				tokens.some(
+					(t) =>
+						t === "--abort" ||
+						t === "--continue" ||
+						t === "--skip" ||
+						t === "--quit" ||
+						t === "--edit-todo" ||
+						t === "--show-current-patch",
+				)
+			)
+				continue;
+			violations.push("git rebase (rewrites branch history)");
+			continue;
+		}
+
+		// reset: 区分硬拒绝（--hard/--merge/--keep）、警告（--soft/--mixed/隐式 mixed）和放行（unstage）
+		if (sub === "reset") {
+			const resetArgs = tokens.slice(2);
+			const hasHard = resetArgs.includes("--hard");
+			const hasMerge = resetArgs.includes("--merge");
+			const hasKeep = resetArgs.includes("--keep");
+			const hasSoft = resetArgs.includes("--soft");
+			const hasMixed = resetArgs.includes("--mixed");
+
+			if (hasHard || hasMerge || hasKeep) {
+				violations.push("git reset --hard/--merge/--keep (destructive branch state change)");
+				continue;
+			}
+			if (hasSoft) {
+				warnings.push("git reset --soft (moves HEAD, keeps working tree and index)");
+				continue;
+			}
+			if (hasMixed) {
+				warnings.push("git reset --mixed (moves HEAD, resets index but keeps working tree)");
+				continue;
+			}
+			// 无显式 mode flag — 检查是否有 commit-ish 参数（隐式 --mixed）
+			// `git reset` (unstage all) 和 `git reset -- file` (unstage file) 是安全的
+			// `git reset HEAD file` (unstage file) 也是安全的
+			// 但 `git reset HEAD~N` (无文件路径) 等价于 `git reset --mixed HEAD~N`
+			if (resetArgs.includes("--")) continue; // -- 后面是文件路径，是 unstage
+			if (resetArgs.includes("-p") || resetArgs.includes("--patch")) continue; // 交互式 unstage
+			const nonFlagArgs = resetArgs.filter((t) => !t.startsWith("-"));
+			if (nonFlagArgs.length === 0) continue; // 纯 `git reset`，unstage all
+			// 有非 flag 参数 — 判断是 commit-ish 还是文件路径
+			// 启发式：如果参数看起来像 commit-ish（HEAD~N、hash、分支名等），视为隐式 --mixed
+			// 如果有多个非 flag 参数，第一个可能是 tree-ish，后面是文件路径（unstage）
+			if (nonFlagArgs.length >= 2) continue; // `git reset HEAD file.txt` — unstage
+			// 单个非 flag 参数 — 可能是 commit-ish 或文件路径
+			// 保守处理：如果看起来像 commit ref（HEAD、HEAD~N、hash 等），产生 warning
+			const arg = nonFlagArgs[0];
+			if (looksLikeCommitRef(arg)) {
+				warnings.push("git reset <commit> (implicit --mixed, moves HEAD and resets index)");
+			}
+			// 否则可能是文件路径（unstage），放行
+			continue;
+		}
+
+		// stash: stash branch 创建新分支（warning），其他子命令放行
+		if (sub === "stash") {
+			const stashSub = tokens[2];
+			if (stashSub === "branch") warnings.push("git stash branch (creates new branch from stash)");
+			// push/pop/drop/apply/list/show/clear/create/store/save 和无子命令 — 放行
+			continue;
+		}
+
+		// symbolic-ref: 读取放行，写入/删除拦截
+		if (sub === "symbolic-ref") {
+			if (tokens.some((t) => t === "-d" || t === "--delete")) {
+				violations.push("git symbolic-ref --delete (deletes symbolic ref)");
+				continue;
+			}
+			// 过滤掉 flag 参数，提取非 flag 参数（排除 -m 的值参数）
+			const symFlags = new Set(["-q", "--quiet", "--short", "--recurse", "--no-recurse"]);
+			const cleanArgs: string[] = [];
+			for (let i = 0; i < tokens.slice(2).length; i++) {
+				const t = tokens[i + 2];
+				if (t === "-m") {
+					i++; // skip next (reason message)
+					continue;
+				}
+				if (symFlags.has(t)) continue;
+				if (t.startsWith("-")) continue; // unknown flag, skip
+				cleanArgs.push(t);
+			}
+			// 一个参数 = 读取（如 `symbolic-ref HEAD`），两个参数 = 写入
+			if (cleanArgs.length >= 2) {
+				violations.push("git symbolic-ref <name> <ref> (changes branch pointer)");
+			}
+			// 读取模式 — 放行
+			continue;
+		}
+
+		// clean: 允许（只影响工作区，不影响分支）
+		if (sub === "clean") continue;
+
+		// worktree: 禁止 add（创建新 worktree 关联其他分支）
+		if (sub === "worktree") {
+			if (tokens.includes("add"))
+				violations.push("git worktree add (creates worktree for another branch)");
+			if (tokens.includes("remove")) violations.push("git worktree remove (removes worktree)");
+			// list/prune 是安全的
+			continue;
+		}
+
+		// filter-branch / filter-repo: 禁止
+		if (sub === "filter-branch" || sub === "filter-repo") {
+			violations.push(`git ${sub} (mass history rewrite)`);
+			continue;
+		}
+
+		// tag: 标签操作不影响分支结构，全部放行
+		if (sub === "tag") continue;
+
+		// gc: 允许（维护操作，不影响分支）
+		if (sub === "gc") continue;
+
+		// 其他未知 git 子命令 — 保守拒绝
+		violations.push(`git ${sub} (unknown git subcommand in chapter mode)`);
+	}
+
+	return { violations, warnings };
+}
+
+/**
+ * 启发式判断一个字符串是否看起来像 git commit 引用。
+ * 用于区分 `git reset <commit>` 和 `git reset <file>`。
+ */
+function looksLikeCommitRef(arg: string): boolean {
+	// HEAD, HEAD~N, HEAD^N, HEAD~N^M, @{N}, ORIG_HEAD, MERGE_HEAD, CHERRY_PICK_HEAD
+	if (/^(HEAD|ORIG_HEAD|MERGE_HEAD|CHERRY_PICK_HEAD|FETCH_HEAD|@)([~^@{}\d]|$)/i.test(arg))
+		return true;
+	// 完整或缩写的 hex SHA（7-40 字符）
+	if (/^[0-9a-f]{7,40}$/i.test(arg)) return true;
+	// tag-like: v1.0, v1.0.0
+	if (/^v\d+\.\d+/i.test(arg)) return true;
+	return false;
+}
+
+/**
+ * 检测灾难性命令 — 不可逆的系统级破坏操作。
+ * 返回 null 表示安全，否则返回原因描述。
+ */
+function detectCatastrophic(commands: BashAnalysis["commands"], rawCommand: string): string | null {
+	for (const cmd of commands) {
+		const [name, ...args] = cmd.tokens;
+		const fullText = cmd.fullText;
+
+		// ── rm -rf / 系列 ──
+		if (name === "rm") {
+			const hasRecursive = args.some(
+				(a) => a === "-r" || a === "-rf" || a === "-fr" || (a.startsWith("-") && a.includes("r")),
+			);
+			if (hasRecursive) {
+				for (const arg of args) {
+					if (arg.startsWith("-")) continue;
+					// rm -rf /, /*, ~, $HOME
+					if (arg === "/" || arg === "/*" || arg === "~" || arg === "$HOME" || arg === `\${HOME}`) {
+						return `rm recursive on critical path: ${arg}`;
+					}
+					if (isCatastrophicPath(arg)) {
+						return `rm recursive on system directory: ${arg}`;
+					}
+				}
+			}
+			// rm without -r but targeting / or system dirs
+			for (const arg of args) {
+				if (arg.startsWith("-")) continue;
+				if (arg === "/" || arg === "/*") {
+					return `rm on root: ${arg}`;
+				}
+			}
+		}
+
+		// ── dd 写入块设备 ──
+		if (name === "dd") {
+			const ofArg = args.find((a) => a.startsWith("of="));
+			if (ofArg) {
+				const target = ofArg.slice(3);
+				if (isBlockDevice(target)) {
+					return `dd write to block device: ${target}`;
+				}
+				if (target === "/" || isCatastrophicPath(target)) {
+					return `dd write to system path: ${target}`;
+				}
+			}
+		}
+
+		// ── mkfs 格式化 ──
+		if (name === "mkfs" || name?.startsWith("mkfs.")) {
+			return `filesystem format: ${cmd.text}`;
+		}
+
+		// ── chmod/chown -R on / ──
+		if (name === "chmod" || name === "chown" || name === "chgrp") {
+			const hasRecursive = args.some((a) => a === "-R" || a === "--recursive");
+			if (hasRecursive) {
+				for (const arg of args) {
+					if (arg.startsWith("-") || arg.startsWith("+")) continue;
+					// 跳过 mode 参数 (如 777, u+x)
+					if (/^[0-7]{3,4}$/.test(arg) || /^[ugoa]/.test(arg)) continue;
+					if (arg === "/" || isCatastrophicPath(arg)) {
+						return `${name} -R on system directory: ${arg}`;
+					}
+				}
+			}
+		}
+
+		// ── 重定向到块设备 ──
+		if (fullText) {
+			const redirectMatch = fullText.match(/>\s*(\/dev\/\S+)/);
+			if (redirectMatch && isBlockDevice(redirectMatch[1])) {
+				return `redirect to block device: ${redirectMatch[1]}`;
+			}
+		}
+
+		// ── shutdown/reboot/halt/poweroff ──
+		if (name === "shutdown" || name === "reboot" || name === "halt" || name === "poweroff") {
+			return `system power control: ${name}`;
+		}
+	}
+
+	// ── fork bomb 检测（原始文本匹配）──
+	const forkBombPatterns = [
+		/:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;?\s*:/, // :(){:|:&};:
+		/bomb\(\)\s*\{\s*bomb\s*\|\s*bomb\s*&\s*\}/, // bomb(){bomb|bomb&}
+		/\.\/\S+\s*&\s*\.\/\S+/, // ./a & ./a (self-replicating)
+	];
+	for (const pattern of forkBombPatterns) {
+		if (pattern.test(rawCommand)) {
+			return "fork bomb detected";
+		}
+	}
+
+	return null;
+}
+
+// ── 核心分析函数 ──────────────────────────────────────────
+
+/**
+ * 分析 bash 命令字符串，返回命令列表、路径和白名单状态。
+ * @param isChapter 是否在 chapter 模式下运行（启用 git 分支限制）
+ */
+export async function analyzeBashCommand(
+	command: string,
+	cwd: string,
+	isChapterOrSemantics: boolean | TargetPathSemantics = false,
+	pathSemantics: TargetPathSemantics = localPathSemantics,
+): Promise<BashAnalysis> {
+	const isChapter = typeof isChapterOrSemantics === "boolean" ? isChapterOrSemantics : false;
+	const semantics =
+		typeof isChapterOrSemantics === "boolean" ? pathSemantics : isChapterOrSemantics;
+	const parser = await getParser();
+	const tree = parser.parse(command);
+
+	const commands: BashAnalysis["commands"] = [];
+	const filePaths: string[] = [];
+	const nonWhitelisted: string[] = [];
+	const dangerousPatterns: string[] = [];
+	const commandEnvVars: string[] = [];
+	let hasWriteOperation = false;
+	// 保守初值：空命令（解析不出任何 command 节点）不算只读
+	let allReadOnly = false;
+	let sawCommand = false;
+
+	for (const node of tree.rootNode.descendantsOfType("command")) {
+		if (!node) continue;
+
+		// 命令前缀环境变量（FOO=bar cmd）：token 提取刻意不含 variable_assignment
+		// 节点，但它们对执行语义有实质影响（GIT_DIR、GIT_EXTERNAL_DIFF 等），
+		// 单独记录下来供只读/评审判定否决。
+		for (let i = 0; i < node.childCount; i++) {
+			const child = node.child(i);
+			if (child?.type === "variable_assignment") {
+				const varName = child.text.split("=")[0];
+				if (varName && !commandEnvVars.includes(varName)) commandEnvVars.push(varName);
+			}
+		}
+
+		// 包含重定向的完整文本
+		const fullText = node.parent?.type === "redirected_statement" ? node.parent.text : node.text;
+
+		const tokens: string[] = [];
+		for (let i = 0; i < node.childCount; i++) {
+			const child = node.child(i);
+			if (!child) continue;
+			if (
+				child.type !== "command_name" &&
+				child.type !== "word" &&
+				// tree-sitter-bash gives a bare integer its own `number` type instead of
+				// `word`. Dropping it silently shifted every later argument one slot to the
+				// left: `grep 42 ../../etc/passwd` became tokens ["grep", "../../etc/passwd"],
+				// so the PATH was consumed as grep's pattern and never reached `filePaths` —
+				// the worktree boundary check reads `filePaths`, so an out-of-tree read looked
+				// path-free. `sleep 999999` likewise collapsed to ["sleep"], indistinguishable
+				// from a bare `sleep`. Numeric arguments must survive tokenization.
+				child.type !== "number" &&
+				child.type !== "string" &&
+				child.type !== "raw_string" &&
+				child.type !== "concatenation" &&
+				child.type !== "simple_expansion" &&
+				child.type !== "expansion"
+			) {
+				continue;
+			}
+			tokens.push(child.text);
+		}
+
+		if (tokens.length === 0) continue;
+
+		commands.push({ tokens, text: node.text, fullText });
+
+		// 只读判定：所有子命令都必须被确认为只读
+		if (!sawCommand) {
+			sawCommand = true;
+			allReadOnly = true;
+		}
+		if (!isReadOnlyCommand(tokens)) allReadOnly = false;
+
+		const cmdName = tokens[0];
+
+		// 1. 绝对路径 / 相对路径执行 — 始终需要确认
+		if (isPathExecution(cmdName)) {
+			if (!nonWhitelisted.includes(cmdName)) {
+				nonWhitelisted.push(cmdName);
+			}
+			dangerousPatterns.push(`path execution: ${cmdName}`);
+			continue;
+		}
+
+		// 2. ALWAYS_ASK 命令
+		if (ALWAYS_ASK_COMMANDS.has(cmdName)) {
+			if (!nonWhitelisted.includes(cmdName)) {
+				nonWhitelisted.push(cmdName);
+			}
+			// 写操作标记
+			if (PATH_COMMANDS_WRITE.has(cmdName)) {
+				hasWriteOperation = true;
+			}
+			// 路径提取（即使命令被拦截，也需要记录路径用于 UI 展示）
+			if (PATH_COMMANDS.has(cmdName)) {
+				filePaths.push(...extractPathArgs(cmdName, tokens, cwd, semantics));
+			}
+			continue;
+		}
+
+		// 3. 条件安全命令 — 检查危险参数
+		if (cmdName in CONDITIONAL_COMMANDS) {
+			const danger = CONDITIONAL_COMMANDS[cmdName](tokens, fullText);
+			if (danger) {
+				if (!nonWhitelisted.includes(cmdName)) {
+					nonWhitelisted.push(cmdName);
+				}
+				dangerousPatterns.push(danger);
+			}
+			// 条件安全命令通过检查后视为安全，不再标记为 nonWhitelisted
+			// 写操作标记
+			if (PATH_COMMANDS_WRITE.has(cmdName)) {
+				hasWriteOperation = true;
+			}
+			// 检查包执行器的写操作标志
+			if (cmdName === "npx" || cmdName === "bunx") {
+				const classification = classifyPackageRunner(tokens, cmdName);
+				if (classification.hasWriteOperation) {
+					hasWriteOperation = true;
+				}
+			}
+			// 路径提取（条件安全命令中的文件操作）
+			if (PATH_COMMANDS.has(cmdName)) {
+				filePaths.push(...extractPathArgs(cmdName, tokens, cwd, semantics));
+			}
+			// git 路径提取（clone/init/worktree 等子命令的目标路径）
+			if (cmdName === "git") {
+				const gitResult = extractGitPaths(tokens, cwd, semantics);
+				filePaths.push(...gitResult.paths);
+				if (gitResult.isWrite) hasWriteOperation = true;
+			}
+			continue;
+		}
+
+		// 4. SAFE_COMMANDS — 放行
+		if (SAFE_COMMANDS.has(cmdName)) {
+			// 写操作标记（mkdir, cp, mv, touch 等）
+			if (PATH_COMMANDS_WRITE.has(cmdName)) {
+				hasWriteOperation = true;
+			}
+			// 路径提取
+			if (PATH_COMMANDS.has(cmdName)) {
+				filePaths.push(...extractPathArgs(cmdName, tokens, cwd, semantics));
+			}
+			// git 路径提取（安全子命令中也可能有 -C 等路径参数）
+			if (cmdName === "git") {
+				const gitResult = extractGitPaths(tokens, cwd, semantics);
+				filePaths.push(...gitResult.paths);
+				if (gitResult.isWrite) hasWriteOperation = true;
+			}
+			continue;
+		}
+
+		// 5. 未知命令 — 需要确认
+		if (!nonWhitelisted.includes(cmdName)) {
+			nonWhitelisted.push(cmdName);
+		}
+	}
+
+	// 重定向检测：遍历所有 redirected_statement 节点，提取目标路径并标记写操作
+	for (const redir of tree.rootNode.descendantsOfType("redirected_statement")) {
+		const redirectTargets = extractRedirectTargets(redir.text, cwd, semantics);
+		if (redirectTargets.length > 0) {
+			hasWriteOperation = true;
+			allReadOnly = false;
+			filePaths.push(...redirectTargets);
+		}
+	}
+
+	// 全局模式检测
+	const pipePatterns = detectPipeToShell(tree.rootNode);
+	dangerousPatterns.push(...pipePatterns);
+	if (pipePatterns.length > 0) {
+		// pipe-to-shell 模式中的 shell 命令已经在 ALWAYS_ASK 中了，
+		// 但如果上游命令（如 curl）本身是安全的，整体仍然需要标记
+		for (const p of pipePatterns) {
+			const shellName = p.replace("pipe to ", "");
+			if (!nonWhitelisted.includes(shellName)) {
+				nonWhitelisted.push(shellName);
+			}
+		}
+	}
+
+	const envPatterns = detectEnvInjection(tree.rootNode);
+	dangerousPatterns.push(...envPatterns);
+	const hasEnvInjection = envPatterns.length > 0;
+	// 环境变量注入使整个命令不安全
+	if (hasEnvInjection && nonWhitelisted.length === 0) {
+		nonWhitelisted.push("(env injection)");
+	}
+
+	// 灾难性命令检测
+	const catastrophicReason = detectCatastrophic(commands, command);
+
+	// Chapter 模式下的 git 分支违规检测
+	const gitBranchResult = isChapter
+		? detectGitBranchViolations(commands)
+		: { violations: [], warnings: [] };
+
+	return {
+		commands,
+		filePaths,
+		allWhitelisted:
+			nonWhitelisted.length === 0 && dangerousPatterns.length === 0 && !hasEnvInjection,
+		nonWhitelisted,
+		dangerousPatterns,
+		hasEnvInjection,
+		commandEnvVars,
+		isCatastrophic: catastrophicReason !== null,
+		catastrophicReason: catastrophicReason ?? undefined,
+		gitBranchViolations: gitBranchResult.violations,
+		gitBranchWarnings: gitBranchResult.warnings,
+		hasWriteOperation,
+		// 危险模式/环境注入/写操作/灾难性命令都会否决只读结论
+		allReadOnly:
+			allReadOnly &&
+			!hasWriteOperation &&
+			!hasEnvInjection &&
+			dangerousPatterns.length === 0 &&
+			nonWhitelisted.length === 0 &&
+			catastrophicReason === null,
+	};
+}
+
+export {
+	ALWAYS_ASK_COMMANDS,
+	CONDITIONAL_COMMANDS,
+	DANGEROUS_ENV_VARS,
+	GIT_CURRENT_BRANCH_SAFE,
+	GIT_READONLY_SUBCOMMANDS,
+	PATH_COMMANDS,
+	PS_ALWAYS_ASK_CMDLETS,
+	PS_SAFE_CMDLETS,
+	SAFE_COMMANDS,
+};
+
+// ── PowerShell 命令分析 ──────────────────────────────────
+
+/**
+ * PowerShell 安全 cmdlet — 只读/无副作用操作，可自动放行。
+ * 包含完整 cmdlet 名和常用别名。
+ */
+const PS_SAFE_CMDLETS = new Set([
+	// 文件浏览（只读）
+	"get-childitem",
+	"gci",
+	"dir",
+	"ls",
+	"get-content",
+	"gc",
+	"cat",
+	"type",
+	"get-item",
+	"gi",
+	"get-itemproperty",
+	"gp",
+	"test-path",
+	"resolve-path",
+	"split-path",
+	"join-path",
+	"convert-path",
+	// 搜索
+	"select-string",
+	"sls",
+	// 输出
+	"write-output",
+	"echo",
+	"write-host",
+	"write-verbose",
+	"write-debug",
+	"write-warning",
+	"out-string",
+	"out-null",
+	"format-list",
+	"fl",
+	"format-table",
+	"ft",
+	"format-wide",
+	"fw",
+	// 系统信息（只读）
+	"get-date",
+	"get-location",
+	"gl",
+	"pwd",
+	"get-command",
+	"gcm",
+	"get-alias",
+	"gal",
+	"get-help",
+	"help",
+	"get-host",
+	"get-process",
+	"gps",
+	"ps",
+	"get-variable",
+	"gv",
+	"get-module",
+	"gmo",
+	"get-executionpolicy",
+	"get-culture",
+	"get-uiculture",
+	// 文本处理（只读）
+	"select-object",
+	"select",
+	"where-object",
+	"where",
+	"?",
+	"foreach-object",
+	"foreach",
+	"%",
+	"sort-object",
+	"sort",
+	"group-object",
+	"group",
+	"measure-object",
+	"measure",
+	"compare-object",
+	"diff",
+	"compare",
+	// 类型转换
+	"convertto-json",
+	"convertfrom-json",
+	"convertto-csv",
+	"convertfrom-csv",
+	"convertto-xml",
+	"convertto-html",
+	// 版本控制（git 通过 PowerShell 调用）
+	"git",
+	// 数学
+	"get-random",
+	// 路径工具
+	"get-psdrive",
+]);
+
+/**
+ * PowerShell 危险 cmdlet — 始终需要用户确认。
+ */
+const PS_ALWAYS_ASK_CMDLETS = new Set([
+	// 删除
+	"remove-item",
+	"ri",
+	"rm",
+	"rmdir",
+	"del",
+	"erase",
+	"rd",
+	"clear-content",
+	"clc",
+	"clear-item",
+	"cli",
+	"clear-itemproperty",
+	"clp",
+	// 文件写入
+	"set-content",
+	"sc",
+	"add-content",
+	"ac",
+	"out-file",
+	// 文件操作
+	"copy-item",
+	"cp",
+	"copy",
+	"cpi",
+	"move-item",
+	"mv",
+	"move",
+	"mi",
+	"rename-item",
+	"ren",
+	"rni",
+	"new-item",
+	"ni",
+	"mkdir",
+	"md",
+	// 进程管理
+	"stop-process",
+	"kill",
+	"spps",
+	"start-process",
+	"saps",
+	"start",
+	// 代码执行
+	"invoke-expression",
+	"iex",
+	"invoke-command",
+	"icm",
+	"start-job",
+	"sajb",
+	// 网络（可能下载执行）
+	"invoke-webrequest",
+	"iwr",
+	"curl",
+	"wget",
+	"invoke-restmethod",
+	"irm",
+	// 服务管理
+	"start-service",
+	"sasv",
+	"stop-service",
+	"spsv",
+	"restart-service",
+	"set-service",
+	// 注册表
+	"set-itemproperty",
+	"sp",
+	"new-itemproperty",
+	"remove-itemproperty",
+	"rp",
+	// 权限
+	"set-acl",
+	"set-executionpolicy",
+	// 脚本执行
+	"powershell",
+	"pwsh",
+	"cmd",
+	"cmd.exe",
+	// 包管理
+	"install-module",
+	"install-package",
+	"install-script",
+	// 运行时（npm/bun/yarn/pnpm 由 SAFE_COMMANDS + CONDITIONAL_COMMANDS 处理）
+	"node",
+	"python",
+	"python3",
+	// 系统控制
+	"restart-computer",
+	"stop-computer",
+]);
+
+const PS_WRITE_CMDLETS = new Set([
+	"remove-item",
+	"ri",
+	"rm",
+	"rmdir",
+	"del",
+	"erase",
+	"rd",
+	"clear-content",
+	"clc",
+	"clear-item",
+	"cli",
+	"clear-itemproperty",
+	"clp",
+	"set-content",
+	"sc",
+	"add-content",
+	"ac",
+	"out-file",
+	"copy-item",
+	"cp",
+	"copy",
+	"cpi",
+	"move-item",
+	"mv",
+	"move",
+	"mi",
+	"rename-item",
+	"ren",
+	"rni",
+	"new-item",
+	"ni",
+	"mkdir",
+	"md",
+	"set-itemproperty",
+	"sp",
+	"new-itemproperty",
+	"remove-itemproperty",
+	"rp",
+	"set-acl",
+]);
+
+const PS_EXECUTION_CMDLETS = new Set([
+	"start-process",
+	"saps",
+	"start",
+	"invoke-expression",
+	"iex",
+	"invoke-command",
+	"icm",
+	"start-job",
+	"sajb",
+	"powershell",
+	"pwsh",
+	"cmd",
+	"cmd.exe",
+	"node",
+	"python",
+	"python3",
+]);
+
+const PS_NETWORK_CMDLETS = new Set([
+	"invoke-webrequest",
+	"iwr",
+	"curl",
+	"wget",
+	"invoke-restmethod",
+	"irm",
+]);
+
+const PS_SYSTEM_CMDLETS = new Set([
+	"start-service",
+	"sasv",
+	"stop-service",
+	"spsv",
+	"restart-service",
+	"set-service",
+	"set-executionpolicy",
+	"install-module",
+	"install-package",
+	"install-script",
+	"restart-computer",
+	"stop-computer",
+	"stop-process",
+	"kill",
+	"spps",
+]);
+
+function describePowerShellDanger(cmdLower: string, commandText: string): string {
+	if (PS_WRITE_CMDLETS.has(cmdLower))
+		return `PowerShell ${commandText} (writes, moves, or deletes files/state)`;
+	if (PS_EXECUTION_CMDLETS.has(cmdLower))
+		return `PowerShell ${commandText} (executes code or starts a process)`;
+	if (PS_NETWORK_CMDLETS.has(cmdLower))
+		return `PowerShell ${commandText} (network access may fetch remote content)`;
+	if (PS_SYSTEM_CMDLETS.has(cmdLower))
+		return `PowerShell ${commandText} (changes process, service, package, policy, or system state)`;
+	return `PowerShell ${commandText} (requires approval)`;
+}
+
+function stripPowerShellQuotes(arg: string): string {
+	if ((arg.startsWith('"') && arg.endsWith('"')) || (arg.startsWith("'") && arg.endsWith("'"))) {
+		return arg.slice(1, -1);
+	}
+	return arg;
+}
+
+function extractPowerShellPathArgs(
+	cmdLower: string,
+	tokens: string[],
+	cwd: string,
+	semantics: TargetPathSemantics,
+): string[] {
+	if (!PS_WRITE_CMDLETS.has(cmdLower)) return [];
+	const paths: string[] = [];
+	const pathValueFlags = new Set([
+		"-path",
+		"-literalpath",
+		"-destination",
+		"-target",
+		"-filepath",
+		"-outputpath",
+	]);
+	const nonPathValueFlags = new Set([
+		"-value",
+		"-inputobject",
+		"-encoding",
+		"-filter",
+		"-include",
+		"-exclude",
+		"-argumentlist",
+	]);
+	for (let i = 1; i < tokens.length; i++) {
+		const raw = tokens[i];
+		const lower = raw.toLowerCase();
+		if (pathValueFlags.has(lower)) {
+			const next = tokens[i + 1];
+			if (next && !next.startsWith("-"))
+				paths.push(semantics.resolve(cwd, stripPowerShellQuotes(next)));
+			i++;
+			continue;
+		}
+		if (nonPathValueFlags.has(lower)) {
+			i++;
+			continue;
+		}
+		if (lower.includes(":")) {
+			const [flagName] = lower.split(":");
+			if (pathValueFlags.has(flagName)) {
+				const inlineValue = raw.slice(raw.indexOf(":") + 1);
+				if (inlineValue) paths.push(semantics.resolve(cwd, stripPowerShellQuotes(inlineValue)));
+				continue;
+			}
+			if (nonPathValueFlags.has(flagName)) continue;
+		}
+		if (raw.startsWith("-")) continue;
+		if (raw.startsWith("$") || raw.includes("|")) continue;
+		paths.push(semantics.resolve(cwd, stripPowerShellQuotes(raw)));
+	}
+	return paths;
+}
+
+/**
+ * PowerShell 灾难性命令模式 — 即使 bypassPermissions 也必须拒绝。
+ */
+const PS_CATASTROPHIC_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
+	{
+		pattern: /remove-item\s+.*-recurse.*[/\\]\s*$/i,
+		reason: "Remove-Item -Recurse on root path",
+	},
+	{
+		pattern: /remove-item\s+.*-recurse.*\$env:systemroot/i,
+		reason: "Remove-Item -Recurse on system root",
+	},
+	{
+		pattern: /format-volume/i,
+		reason: "Format-Volume (disk format)",
+	},
+	{
+		pattern: /clear-disk/i,
+		reason: "Clear-Disk (disk wipe)",
+	},
+	{
+		pattern: /restart-computer\s*.*-force/i,
+		reason: "Restart-Computer -Force",
+	},
+	{
+		pattern: /stop-computer\s*.*-force/i,
+		reason: "Stop-Computer -Force",
+	},
+];
+
+/**
+ * 基于正则的 PowerShell 命令分析。
+ * 不使用 AST 解析器，而是通过 token 化和模式匹配来分类命令。
+ */
+export function analyzePowerShellCommand(
+	command: string,
+	cwd: string,
+	isChapterOrSemantics: boolean | TargetPathSemantics = false,
+	pathSemantics: TargetPathSemantics = localPathSemantics,
+): BashAnalysis {
+	const isChapter = typeof isChapterOrSemantics === "boolean" ? isChapterOrSemantics : false;
+	const semantics =
+		typeof isChapterOrSemantics === "boolean" ? pathSemantics : isChapterOrSemantics;
+	const commands: BashAnalysis["commands"] = [];
+	const filePaths: string[] = [];
+	const nonWhitelisted: string[] = [];
+	const dangerousPatterns: string[] = [];
+	let hasWriteOperation = false;
+	// 保守初值：没有解析出任何命令时不算只读
+	let allReadOnly = false;
+	let sawCommand = false;
+
+	// 灾难性命令检测
+	let catastrophicReason: string | undefined;
+	for (const { pattern, reason } of PS_CATASTROPHIC_PATTERNS) {
+		if (pattern.test(command)) {
+			catastrophicReason = reason;
+			break;
+		}
+	}
+
+	// 将命令按 ; 和 && 和 || 分割为子命令（不按 | 分割，因为 PowerShell 管道很常见）
+	const subCommands = command
+		.split(/\s*(?:;|&&|\|\|)\s*/)
+		.map((s) => s.trim())
+		.filter(Boolean);
+
+	for (const sub of subCommands) {
+		// 提取管道中的每个命令
+		const pipeSegments = splitPowerShellPipeline(sub);
+
+		for (const segment of pipeSegments) {
+			const tokens = tokenizePowerShell(segment);
+			if (tokens.length === 0) continue;
+
+			commands.push({ tokens, text: segment, fullText: sub });
+
+			const cmdName = tokens[0];
+			const cmdLower = cmdName.toLowerCase();
+
+			// 只读判定：所有管道段都必须被确认为只读
+			if (!sawCommand) {
+				sawCommand = true;
+				allReadOnly = true;
+			}
+			if (!isReadOnlyPowerShellSegment(cmdLower, tokens)) allReadOnly = false;
+
+			// 检查是否是 git 命令（PowerShell 中也可以直接调用 git）
+			if (cmdLower === "git") {
+				if (cmdLower in CONDITIONAL_COMMANDS) {
+					const danger = CONDITIONAL_COMMANDS[cmdLower](tokens, sub);
+					if (danger) {
+						if (!nonWhitelisted.includes(cmdName)) nonWhitelisted.push(cmdName);
+						dangerousPatterns.push(danger);
+					}
+				}
+				// 与 bash 路径一致：-C/--git-dir 等全局 flag 指向的仓库路径必须进入
+				// filePaths，否则越界访问不会被路径作用域检查发现。
+				const gitResult = extractGitPaths(tokens, cwd, semantics);
+				filePaths.push(...gitResult.paths);
+				if (gitResult.isWrite) hasWriteOperation = true;
+				continue;
+			}
+
+			// PowerShell 安全 cmdlet
+			if (PS_SAFE_CMDLETS.has(cmdLower)) {
+				continue;
+			}
+
+			// PowerShell 危险 cmdlet
+			if (PS_ALWAYS_ASK_CMDLETS.has(cmdLower)) {
+				if (!nonWhitelisted.includes(cmdName)) nonWhitelisted.push(cmdName);
+				dangerousPatterns.push(describePowerShellDanger(cmdLower, segment));
+				if (PS_WRITE_CMDLETS.has(cmdLower)) {
+					hasWriteOperation = true;
+					filePaths.push(...extractPowerShellPathArgs(cmdLower, tokens, cwd, semantics));
+				}
+				continue;
+			}
+
+			// 检查 bunx/npx（PowerShell 中也可以调用）
+			if (cmdLower === "bunx" || cmdLower === "npx") {
+				if (cmdLower in CONDITIONAL_COMMANDS) {
+					const danger = CONDITIONAL_COMMANDS[cmdLower](tokens, sub);
+					if (danger) {
+						if (!nonWhitelisted.includes(cmdName)) nonWhitelisted.push(cmdName);
+						dangerousPatterns.push(danger);
+					}
+				} else if (!SAFE_COMMANDS.has(cmdLower)) {
+					if (!nonWhitelisted.includes(cmdName)) nonWhitelisted.push(cmdName);
+				}
+				continue;
+			}
+
+			// 检查是否是 bash 白名单中的命令（PowerShell 也能调用外部程序）
+			if (SAFE_COMMANDS.has(cmdLower)) {
+				if (cmdLower in CONDITIONAL_COMMANDS) {
+					const danger = CONDITIONAL_COMMANDS[cmdLower](tokens, sub);
+					if (danger) {
+						if (!nonWhitelisted.includes(cmdName)) nonWhitelisted.push(cmdName);
+						dangerousPatterns.push(danger);
+					}
+				}
+				continue;
+			}
+
+			if (ALWAYS_ASK_COMMANDS.has(cmdLower)) {
+				if (!nonWhitelisted.includes(cmdName)) nonWhitelisted.push(cmdName);
+				dangerousPatterns.push(`${cmdName} (requires approval)`);
+				if (PATH_COMMANDS_WRITE.has(cmdLower)) {
+					hasWriteOperation = true;
+					filePaths.push(...extractPathArgs(cmdLower, tokens, cwd, semantics));
+				}
+				continue;
+			}
+
+			// 未知命令 — 需要确认
+			if (!nonWhitelisted.includes(cmdName)) {
+				nonWhitelisted.push(cmdName);
+			}
+		}
+	}
+
+	// Pipe-to-shell 检测（PowerShell 版本）
+	if (/\|\s*(powershell|pwsh|cmd|bash|sh|iex|invoke-expression)\b/i.test(command)) {
+		const match = command.match(/\|\s*(powershell|pwsh|cmd|bash|sh|iex|invoke-expression)\b/i);
+		if (match) {
+			dangerousPatterns.push(`pipe to ${match[1]}`);
+			if (!nonWhitelisted.includes(match[1])) nonWhitelisted.push(match[1]);
+		}
+	}
+
+	// 命令替换检测（PowerShell 版本）：tokenizePowerShell 不解析 $(...) 内部，
+	// 其中的命令对上面的全部分析不可见（`git log $(Remove-Item …)` 只看到 git）。
+	// 与 bash AST 不同无法补救，只能保守标记为危险模式（同时否决只读结论）。
+	if (command.includes("$(")) {
+		dangerousPatterns.push("command substitution $(...) (contents not analyzed)");
+		if (!nonWhitelisted.includes("(command substitution)")) {
+			nonWhitelisted.push("(command substitution)");
+		}
+	}
+
+	// 环境变量注入检测（PowerShell 版本）
+	const hasEnvInjection = /\$env:(LD_PRELOAD|NODE_OPTIONS|BASH_ENV|PROMPT_COMMAND)\b/i.test(
+		command,
+	);
+	if (hasEnvInjection && nonWhitelisted.length === 0) {
+		nonWhitelisted.push("(env injection)");
+	}
+
+	// $env:VAR = ... 赋值段对逐命令分析不可见（赋值段本身不是受管命令），
+	// 与 bash 侧的 variable_assignment 前缀同理记录下来。
+	const commandEnvVars: string[] = [];
+	for (const match of command.matchAll(/\$env:([A-Za-z_]\w*)\s*=/gi)) {
+		const varName = match[1];
+		if (varName && !commandEnvVars.includes(varName)) commandEnvVars.push(varName);
+	}
+
+	// Chapter 模式下的 git 分支违规检测
+	const gitBranchResult = isChapter
+		? detectGitBranchViolations(commands)
+		: { violations: [], warnings: [] };
+
+	return {
+		commands,
+		filePaths,
+		allWhitelisted:
+			nonWhitelisted.length === 0 && dangerousPatterns.length === 0 && !hasEnvInjection,
+		nonWhitelisted,
+		dangerousPatterns,
+		hasEnvInjection,
+		commandEnvVars,
+		isCatastrophic: catastrophicReason !== undefined,
+		catastrophicReason,
+		gitBranchViolations: gitBranchResult.violations,
+		gitBranchWarnings: gitBranchResult.warnings,
+		hasWriteOperation,
+		// 危险模式/环境注入/写操作/灾难性命令都会否决只读结论
+		allReadOnly:
+			allReadOnly &&
+			!hasWriteOperation &&
+			!hasEnvInjection &&
+			dangerousPatterns.length === 0 &&
+			nonWhitelisted.length === 0 &&
+			catastrophicReason === undefined &&
+			// PowerShell 重定向没有 AST 检测，这里保守地按文本否决
+			!/(?:>>|[012]>|&>|>)/.test(command),
+	};
+}
+
+/** PowerShell 管道段是否为纯只读（cmdlet 只读白名单 + git/检查工具子命令判定）。 */
+function isReadOnlyPowerShellSegment(cmdLower: string, tokens: string[]): boolean {
+	if (PS_ALWAYS_ASK_CMDLETS.has(cmdLower)) return false;
+	const subCheck = READ_ONLY_SUBCOMMAND_CHECKS[cmdLower];
+	if (subCheck) return subCheck(tokens);
+	if (PS_SAFE_CMDLETS.has(cmdLower)) return !PS_WRITE_CMDLETS.has(cmdLower);
+	if (!READ_ONLY_COMMANDS.has(cmdLower)) return false;
+	// coreutils 也可以在 PowerShell 里被直接调用，写/阻塞参数同样要否决只读。
+	return !hasReadOnlyDisqualifyingFlag(cmdLower, tokens);
+}
+
+/**
+ * 简单的 PowerShell 命令 token 化。
+ * 按空格分割，但尊重引号内的空格。
+ */
+function tokenizePowerShell(command: string): string[] {
+	const tokens: string[] = [];
+	let current = "";
+	let inSingle = false;
+	let inDouble = false;
+
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		if (ch === "'" && !inDouble) {
+			inSingle = !inSingle;
+			current += ch;
+		} else if (ch === '"' && !inSingle) {
+			inDouble = !inDouble;
+			current += ch;
+		} else if ((ch === " " || ch === "\t") && !inSingle && !inDouble) {
+			if (current) {
+				tokens.push(current);
+				current = "";
+			}
+		} else {
+			current += ch;
+		}
+	}
+	if (current) tokens.push(current);
+	return tokens;
+}
+
+/**
+ * Split a PowerShell command by pipe operator, respecting quotes and parentheses.
+ */
+function splitPowerShellPipeline(command: string): string[] {
+	const segments: string[] = [];
+	let current = "";
+	let inSingle = false;
+	let inDouble = false;
+	let parenDepth = 0;
+
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		if (ch === "'" && !inDouble) {
+			inSingle = !inSingle;
+			current += ch;
+		} else if (ch === '"' && !inSingle) {
+			inDouble = !inDouble;
+			current += ch;
+		} else if (ch === "(" && !inSingle && !inDouble) {
+			parenDepth++;
+			current += ch;
+		} else if (ch === ")" && !inSingle && !inDouble) {
+			parenDepth = Math.max(0, parenDepth - 1);
+			current += ch;
+		} else if (ch === "|" && !inSingle && !inDouble && parenDepth === 0) {
+			const trimmed = current.trim();
+			if (trimmed) segments.push(trimmed);
+			current = "";
+		} else {
+			current += ch;
+		}
+	}
+	const trimmed = current.trim();
+	if (trimmed) segments.push(trimmed);
+	return segments;
+}
+
+/**
+ * 统一的命令分析入口 — 根据 shell 类型选择合适的分析器。
+ * @param shellType 当前使用的 shell 类型
+ */
+export async function analyzeShellCommand(
+	command: string,
+	cwd: string,
+	shellType: "bash" | "posix" | "powershell" | "cmd",
+	isChapter = false,
+	pathSemantics: TargetPathSemantics = localPathSemantics,
+): Promise<BashAnalysis> {
+	if (shellType === "powershell") {
+		return analyzePowerShellCommand(command, cwd, isChapter, pathSemantics);
+	}
+	// bash、POSIX sh 和 cmd 都使用 bash 分析器；tree-sitter-bash 可安全解析 POSIX shell 语法。
+	return analyzeBashCommand(command, cwd, isChapter, pathSemantics);
+}

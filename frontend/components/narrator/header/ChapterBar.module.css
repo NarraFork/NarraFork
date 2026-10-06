@@ -1,0 +1,27 @@
+/* The whole chapter-info strip opens the Git view. It is a div with
+   role="button" rather than a real <button> because readers copy the branch
+   name out of this row and the UA button style sets `user-select: none`.
+   Selection is therefore re-enabled explicitly here, and the affordance is
+   carried by cursor + hover tint — both scoped to [role="button"] so the
+   non-interactive variant (no dock, no drawer host) shows neither. */
+
+.gitTrigger {
+	flex: 1;
+	min-width: 0;
+	border-radius: var(--mantine-radius-sm);
+	/* Bleed the hover surface slightly past the text without shifting layout. */
+	margin-inline: -4px;
+	padding-inline: 4px;
+	transition: background-color 120ms ease;
+	user-select: text;
+	-webkit-user-select: text;
+}
+
+.gitTrigger[role="button"] {
+	cursor: pointer;
+}
+
+.gitTrigger[role="button"]:hover,
+.gitTrigger[role="button"]:focus-visible {
+	background-color: light-dark(var(--mantine-color-gray-2), var(--mantine-color-dark-5));
+}

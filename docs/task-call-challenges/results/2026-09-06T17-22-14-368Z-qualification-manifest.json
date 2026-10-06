@@ -1,0 +1,109 @@
+{
+  "runId": "2026-09-06T17-22-14-368Z",
+  "experiment": "full-suite-qualification",
+  "image": "0d36aaa2c1ad7cccd2dc0cf7fba4efb11ea7193023cecb1c27a84463c9ba01aa",
+  "models": [
+    "nugjp:codex:gpt-5.6-luna",
+    "nug2:antigravity:gemini-3.7-flash"
+  ],
+  "effort": "low",
+  "limits": {
+    "responses": 5,
+    "evals": 6,
+    "requestMs": 120000,
+    "responseChars": 64000
+  },
+  "qualification": {
+    "rounds": 2,
+    "cases": [
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6"
+    ],
+    "roundOrder": [
+      [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6"
+      ],
+      [
+        "6",
+        "5",
+        "4",
+        "3",
+        "2",
+        "1"
+      ]
+    ],
+    "planned": 24
+  },
+  "qualificationGate": "All 24 trials pass the unchanged business grader and end with trusted delivery or a normal natural end_turn after a successful Eval. Truncation, budget exhaustion, unresolved errors, infrastructure failure, or source drift do not qualify. No production implementation before explicit user go-ahead.",
+  "maximumTrials": 24,
+  "frozenBaseline": "2026-09-06T15-41-09-954Z-coherent-delivery",
+  "conditions": {
+    "B": {
+      "id": "task-call-v6-coherent",
+      "deliveryEnabled": true
+    }
+  },
+  "sourceHashes": {
+    "fixtures.ts": "9dca713be6015bb951fbf903663d10dcf08025fdc15b94e5906a5144d91b9398",
+    "contract.ts": "447bc49a6f83a6f967b589fb251dbccfab24fd218dd5ed9bcac8eb79b40c93ce",
+    "profiles.ts": "743d1bdb3af0f4fe062cff0447b273c40e5218690deb5040d8fbbf3a92e337a3",
+    "runner.ts": "875165dc8e7ea70afdeb25b9f3ac6c843c019c46eff440b647775821659e2b1b",
+    "isolate.ts": "f881bdeaace4ca93238873399a3c2ad38354f41a07dfef89c66a0bdbad26d6c3",
+    "client.ts": "e3eb31c58c7dbddc607a2b21bcf4da6ea8ed53378074c8dabad2270deaa3a152",
+    "run.ts": "9db1c53be0549aa91812a6e1683950f977ad2cbe2f13267b4a36cca14a178b7f",
+    "analyze.ts": "7c9a849fa7256ed7fb091916ad207ead36c9c95867e9c347880dcb34dfac1cdc",
+    "delivery.test.ts": "2d586613fd5408bbc9e03a18ab5972aeaabf8c9f2d97d1d620331889bafa4c49",
+    "delivery-experiment.ts": "0a3273e87deccbcc781cefa46d19d1f617c69dd949b60c9afcb6409e20061e2a"
+  },
+  "sourceSnapshot": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-sources.json",
+  "inputSnapshot": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-inputs.json",
+  "files": [
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-luna-1-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-flash-1-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-luna-2-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-flash-2-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-luna-3-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-flash-3-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-flash-4-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-luna-4-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-luna-5-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-flash-5-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-luna-6-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-flash-6-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-luna-6-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-flash-6-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-luna-5-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-flash-5-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-luna-4-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-flash-4-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-luna-3-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-luna-2-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-luna-1-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-flash-3-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-flash-2-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T17-22-14-368Z-qualification-qualification-flash-1-B-2.json"
+  ],
+  "graderHash": "9dca713be6015bb951fbf903663d10dcf08025fdc15b94e5906a5144d91b9398",
+  "profileHashes": {
+    "B": {
+      "api": "2bcd050e5ed2ae07fcf66b96602cd2772cc8bf8f7f87872822f87396ec5f9f23",
+      "description": "fb4db207dfb723b5b5b3a22473c50cc5684d995d778453a882469dacfbf8ea01",
+      "parameters": "910000d08449b0a6ee0a2c2ac8b8c8245141dd3da6ecdf1a475bf699bd50b4a7",
+      "contract": "448d92d8b001de24c457a99c0fada5dd22b47f0159ec6ad0c81a5decafb1dabc"
+    }
+  },
+  "status": "complete",
+  "attempted": 24,
+  "gatePassed": true,
+  "failures": [],
+  "sourceDrift": []
+}

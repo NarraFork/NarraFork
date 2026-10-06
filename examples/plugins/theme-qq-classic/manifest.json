@@ -1,0 +1,314 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.qq-classic",
+	"version": "1.0.0",
+	"displayName": "Classic Messenger (2007)",
+	"description": "A nostalgic mid-2000s instant-messenger look: glossy blue gradient chrome, hairline rules, bevelled nine-slice controls, sunken code panels, grouped sidebar tabs and a serif type stack. Built entirely from whitelisted design tokens plus procedurally generated art shipped in the package.",
+	"publisher": {
+		"id": "com.example",
+		"name": "Example Team"
+	},
+	"license": "Apache-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"features": [],
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "local-process"
+	},
+	"activationEvents": [],
+	"contributes": {
+		"providers": [],
+		"tools": [],
+		"commands": [],
+		"events": [],
+		"views": [],
+		"themes": [
+			{
+				"id": "classic-blue",
+				"title": "Classic Messenger (2007)",
+				"colorScheme": "light",
+				"tokens": {
+					"primaryColor": "#2f7fd0",
+					"body": "#eef6fd",
+					"text": "#123c5a",
+					"colors": {
+						"chrome": "#2f6ba8",
+						"sky": "#c9e0f4"
+					},
+					"radius": "3px",
+					"fontSize": "13px",
+					"fontFamily": "serif",
+					"fontFamilyHeadings": "serif",
+					"shadow": 6,
+					"gradients": {
+						"header": {
+							"from": "#7fc0f0",
+							"via": "#3d8fd4",
+							"viaAt": 52,
+							"to": "#1f5f9e"
+						},
+						"navbar": {
+							"from": "#e4f1fc",
+							"to": "#bcd9f0"
+						},
+						"footer": {
+							"from": "#dceafa",
+							"to": "#b8d4ee"
+						},
+						"main": {
+							"from": "#f4fafe",
+							"to": "#e2eff9"
+						},
+						"card": {
+							"from": "#ffffff",
+							"to": "#eaf4fc"
+						},
+						"paper": {
+							"from": "#ffffff",
+							"to": "#f2f8fd"
+						},
+						"modal": {
+							"from": "#ffffff",
+							"to": "#e8f2fb"
+						},
+						"input": {
+							"from": "#f2f8fd",
+							"to": "#ffffff"
+						},
+						"inputFocus": {
+							"from": "#ffffff",
+							"to": "#ffffff"
+						},
+						"button": {
+							"from": "#ffffff",
+							"via": "#e2f0fb",
+							"viaAt": 48,
+							"to": "#b6d6ef"
+						},
+						"buttonHover": {
+							"from": "#ffffff",
+							"via": "#f2f9ff",
+							"viaAt": 48,
+							"to": "#cbe4f7"
+						},
+						"buttonActive": {
+							"from": "#b6d6ef",
+							"via": "#d8eaf8",
+							"viaAt": 48,
+							"to": "#ffffff"
+						},
+						"actionIcon": {
+							"from": "#ffffff",
+							"to": "#cfe3f5"
+						},
+						"actionIconHover": {
+							"from": "#ffffff",
+							"to": "#e4f1fc"
+						},
+						"navLink": {
+							"from": "#f4fafe",
+							"to": "#e2eff9"
+						},
+						"navLinkHover": {
+							"from": "#ffffff",
+							"to": "#e8f4fd"
+						},
+						"navLinkActive": {
+							"from": "#ffffff",
+							"via": "#eaf4fc",
+							"viaAt": 40,
+							"to": "#cfe3f5"
+						},
+						"tableHeader": {
+							"from": "#e4f1fc",
+							"to": "#c4dcf2"
+						},
+						"menu": {
+							"from": "#ffffff",
+							"to": "#f2f8fd"
+						},
+						"menuItemHover": {
+							"from": "#dbeafa",
+							"to": "#c2dcf4"
+						},
+						"badge": {
+							"from": "#5fa3e0",
+							"to": "#2f6ba8"
+						},
+						"tooltip": {
+							"from": "#fdfbe8",
+							"to": "#f5eec4"
+						},
+						"scrollbar": {
+							"from": "#e8f1fa",
+							"to": "#dbe9f6"
+						},
+						"scrollbarThumb": {
+							"from": "#ffffff",
+							"via": "#cfe3f5",
+							"viaAt": 50,
+							"to": "#9dc4e4"
+						},
+						"table": {
+							"from": "#ffffff",
+							"to": "#f4fafe"
+						},
+						"divider": {
+							"from": "#a8c8e4",
+							"to": "#a8c8e4"
+						},
+						"menuItem": {
+							"from": "#ffffff",
+							"to": "#fbfdff"
+						}
+					},
+					"textColors": {
+						"header": "#ffffff",
+						"button": "#12324f",
+						"buttonHover": "#0d2740",
+						"actionIcon": "#1a4670",
+						"navLink": "#12324f",
+						"navLinkActive": "#0b2d4d",
+						"tableHeader": "#12324f",
+						"badge": "#ffffff",
+						"tooltip": "#4a3c12",
+						"code": "#1d3a52",
+						"footer": "#2a5580",
+						"table": "#12324f",
+						"menuItem": "#12324f"
+					},
+					"borders": {
+						"header": {
+							"width": 1,
+							"color": "#1a4e85",
+							"edges": ["bottom"]
+						},
+						"navbar": {
+							"width": 1,
+							"color": "#a8c8e4",
+							"edges": ["right"]
+						},
+						"footer": {
+							"width": 1,
+							"color": "#a8c8e4",
+							"edges": ["top"]
+						},
+						"navLink": {
+							"radius": 3
+						},
+						"navLinkActive": {
+							"width": 1,
+							"color": "#7ba7d7",
+							"inset": true,
+							"radius": 3
+						},
+						"code": {
+							"width": 1,
+							"color": "#a8c8e4",
+							"inset": true,
+							"radius": 2
+						},
+						"table": {
+							"width": 1,
+							"color": "#c4dcf2",
+							"inset": true,
+							"radius": 2
+						},
+						"tableHeader": {
+							"width": 1,
+							"color": "#a8c8e4",
+							"edges": ["bottom"]
+						},
+						"tooltip": {
+							"width": 1,
+							"color": "#d4c98a",
+							"inset": true,
+							"radius": 2
+						},
+						"menu": {
+							"width": 1,
+							"color": "#a8c8e4",
+							"inset": true,
+							"radius": 2
+						},
+						"badge": {
+							"radius": 9
+						},
+						"scrollbarThumb": {
+							"width": 1,
+							"color": "#7ba7d7",
+							"inset": true,
+							"radius": 6
+						},
+						"menuItem": {
+							"radius": 2
+						}
+					},
+					"backgrounds": {
+						"main": {
+							"image": "assets/panel-tile.png",
+							"size": "auto",
+							"repeat": "repeat"
+						}
+					},
+					"frames": {
+						"button": {
+							"image": "assets/frame-button.png",
+							"slice": 8,
+							"width": 5,
+							"repeat": "stretch"
+						},
+						"actionIcon": {
+							"image": "assets/frame-button.png",
+							"slice": 8,
+							"width": 4,
+							"repeat": "stretch"
+						},
+						"input": {
+							"image": "assets/frame-sunken.png",
+							"slice": 8,
+							"width": 4,
+							"repeat": "stretch"
+						},
+						"card": {
+							"image": "assets/frame-blue.png",
+							"slice": 16,
+							"width": 9,
+							"repeat": "stretch"
+						},
+						"modal": {
+							"image": "assets/frame-blue.png",
+							"slice": 16,
+							"width": 12,
+							"repeat": "stretch"
+						}
+					}
+				}
+			}
+		]
+	},
+	"permissions": {
+		"host": ["ui.theme"],
+		"network": {
+			"mode": "none",
+			"allow": []
+		},
+		"filesystem": {
+			"package": "readOnly",
+			"pluginData": "none",
+			"workspace": "none"
+		},
+		"process": {
+			"spawn": "none"
+		}
+	},
+	"secrets": [],
+	"dependencies": {
+		"plugins": {},
+		"runtime": {}
+	}
+}

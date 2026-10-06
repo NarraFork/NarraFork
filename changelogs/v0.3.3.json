@@ -1,0 +1,6 @@
+{
+	"version": "0.3.3",
+	"date": "2026-05-03",
+	"en": "## New Features\n\n- Improve model selection and make plan mode restoration more reliable.\n\n## Bug Fixes\n\n- Prevent message views from unexpectedly detaching from the bottom scroll position.\n- Harden narrator safety pauses and message rendering so confirmations remain consistent.",
+	"zh-CN": "## 新功能\n\n- 优化模型选择体验，并提升计划模式恢复的可靠性。\n\n## 修复\n\n- 防止消息视图意外脱离底部滚动位置。\n- 加强叙述者安全暂停和消息渲染逻辑，让确认流程更稳定一致。"
+}

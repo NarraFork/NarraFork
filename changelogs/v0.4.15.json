@@ -1,0 +1,6 @@
+{
+	"version": "0.4.15",
+	"date": "2026-05-14",
+	"en": "## New Features\n\n- Routed NUG models by channel with channel-aware caching and delegation so provider selection stays accurate across model sources.\n- Surfaced NUG provider metadata in model selectors to make channel and provider choices clearer.\n\n## Bug Fixes\n\n- Prevented stale or mismatched Service Workers from taking over API requests, fixing cases where WebSocket stayed connected while HTTP calls stopped working.\n- Reduced false version-update banners by comparing the backend version against the current frontend build before prompting for refresh.\n- Marked PWA entry files as no-cache so Service Worker and manifest updates are picked up more reliably.",
+	"zh-CN": "## 新功能\n\n- 按 channel 路由 NUG 模型，并加入感知 channel 的缓存与委托逻辑，使不同模型来源下的 provider 选择更准确。\n- 在模型选择器中展示 NUG provider 元数据，让 channel 和 provider 选择更清晰。\n\n## 修复\n\n- 阻止过期或版本不匹配的 Service Worker 接管 API 请求，修复 WebSocket 仍连接但 HTTP 调用全部失效的问题。\n- 只有后端版本与当前前端构建版本确实不一致时才显示刷新提示，减少误报的版本更新横幅。\n- 将 PWA 入口文件设为 no-cache，使 Service Worker 和 manifest 更新更可靠。"
+}

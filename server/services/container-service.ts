@@ -1,0 +1,1488 @@
+import { existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
+import { and, eq, isNull } from "drizzle-orm";
+import { db } from "../db";
+import { chapters, containerInstances, projects } from "../db/schema";
+import { containerLock } from "../lib/async-mutex";
+import { NotFoundError, PodmanNotFoundError, ValidationError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
+import { generateId } from "../lib/id";
+import { logger } from "../lib/logger";
+import { envWithAmbientProxy } from "../lib/net/proxy-env";
+import { getContainerUnsupportedReason, supportsContainers } from "../lib/platform";
+import { isInsidePath } from "../lib/platform-path";
+import { settings } from "../lib/settings";
+import { safeSpawn } from "../lib/spawn";
+import { buildProxyUrl, generateProxyLabel, isPastaBackend } from "./container-proxy";
+import { type PortMapping, portAllocator } from "./port-allocator";
+
+export interface ContainerConfig {
+	composeFile?: string;
+	services?: string[];
+	ports?: Array<{ containerPort: number; serviceName: string }>;
+	env?: Record<string, string>;
+}
+
+interface ProxyInfo {
+	domain: string;
+	port: number;
+	chapterShortId: string;
+}
+
+interface ProxyPortHint {
+	serviceName: string;
+	containerPort: number;
+}
+
+interface ExecResult {
+	stdout: string;
+	stderr: string;
+	exitCode: number;
+}
+
+/** Check if podman is available (rootless). Throws PodmanNotFoundError if not. Cached after first success. */
+let _verified = false;
+
+async function ensurePodman(): Promise<void> {
+	if (!supportsContainers()) {
+		throw new ValidationError(
+			getContainerUnsupportedReason() ?? "Container management is unsupported",
+		);
+	}
+	if (_verified) return;
+	try {
+		ensureRootlessEnv();
+		const result = await safeSpawn({ cmd: ["podman", "--version"], timeout: 5000 });
+		if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout);
+		await ensureCgroupConfig();
+		_verified = true;
+		logger.info("Container runtime detected", { runtime: "podman", mode: "rootless" });
+	} catch (err) {
+		if (err instanceof PodmanNotFoundError) throw err;
+		throw new PodmanNotFoundError();
+	}
+}
+
+/**
+ * Ensure XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS are set in process.env.
+ * Rootless podman (netavark + aardvark-dns) needs these to communicate
+ * with the systemd user bus. If the server process was started without
+ * a full login session (e.g. via ssh without PAM, or a process manager),
+ * these may be missing.
+ *
+ * Called at server startup so all child processes (containers, bash tool,
+ * terminals) inherit the correct environment.
+ */
+export function ensureRootlessEnv(): void {
+	if (process.platform !== "linux" || !supportsContainers()) return;
+	const uid = process.getuid?.();
+	if (uid == null || uid === 0) return;
+
+	if (!process.env.XDG_RUNTIME_DIR) {
+		const dir = `/run/user/${uid}`;
+		if (existsSync(dir)) {
+			process.env.XDG_RUNTIME_DIR = dir;
+			logger.info("Set XDG_RUNTIME_DIR", { dir });
+		}
+	}
+
+	if (!process.env.DBUS_SESSION_BUS_ADDRESS) {
+		const bus = `${process.env.XDG_RUNTIME_DIR}/bus`;
+		if (bus && existsSync(bus)) {
+			process.env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${bus}`;
+			logger.info("Set DBUS_SESSION_BUS_ADDRESS", { bus });
+		}
+	}
+}
+
+/**
+ * Ensure podman uses cgroupfs when systemd cgroup delegation is unavailable.
+ *
+ * Two cases require cgroupfs:
+ * 1. No systemd user session at all (e.g. bare SSH without PAM)
+ * 2. Process runs under system.slice (e.g. code-server.service) — systemd
+ *    cgroup manager requires the process to be in user.slice for delegation.
+ *
+ * If containers.conf already exists we don't overwrite it.
+ */
+async function ensureCgroupConfig(): Promise<void> {
+	if (process.platform !== "linux") return;
+
+	let needsCgroupfs = false;
+
+	// Check 1: systemd user session available?
+	try {
+		const systemd = await safeSpawn({
+			cmd: ["systemctl", "--user", "is-system-running"],
+			timeout: 3000,
+		});
+		if (systemd.exitCode !== 0) needsCgroupfs = true;
+	} catch {
+		needsCgroupfs = true;
+	}
+
+	// Check 2: even with user session, if we're in system.slice, delegation won't work
+	if (!needsCgroupfs) {
+		try {
+			const cgroup = (await Bun.file("/proc/self/cgroup").text()).trim();
+			if (cgroup.includes("system.slice")) {
+				needsCgroupfs = true;
+				logger.info("Process runs under system.slice, forcing cgroupfs");
+			}
+		} catch {
+			// Can't determine — be safe
+			needsCgroupfs = true;
+		}
+	}
+
+	if (!needsCgroupfs) return;
+
+	// Check current cgroup manager
+	try {
+		const mgr = await safeSpawn({
+			cmd: ["podman", "info", "--format", "{{.Host.CgroupManager}}"],
+			timeout: 5000,
+		});
+		if (mgr.exitCode === 0 && mgr.stdout.trim() === "cgroupfs") return; // Already using cgroupfs
+	} catch {
+		// Can't determine — try to fix anyway
+	}
+
+	// Write user-level containers.conf to force cgroupfs
+	const confDir = resolve(homedir(), ".config", "containers");
+	const confPath = resolve(confDir, "containers.conf");
+	if (existsSync(confPath)) return; // Don't overwrite existing config
+
+	try {
+		mkdirSync(confDir, { recursive: true });
+		await Bun.write(
+			confPath,
+			[
+				"# Auto-generated by NarraFork — systemd cgroup delegation unavailable",
+				"[engine]",
+				'cgroup_manager = "cgroupfs"',
+				'events_logger = "file"',
+				"",
+			].join("\n"),
+		);
+		logger.info("Created containers.conf with cgroupfs manager", { path: confPath });
+	} catch (err) {
+		logger.warn("Failed to create containers.conf", { error: String(err) });
+	}
+}
+
+/** Reset the cached podman check (used after installation). */
+export function resetPodmanCache(): void {
+	_verified = false;
+}
+
+/** Return podman status: installed + version, or not installed. */
+export async function getPodmanStatus(): Promise<{ installed: boolean; version?: string }> {
+	if (!supportsContainers()) return { installed: false };
+	try {
+		const result = await safeSpawn({ cmd: ["podman", "--version"], timeout: 5000 });
+		if (result.exitCode !== 0) return { installed: false };
+		_verified = true;
+		return { installed: true, version: result.stdout.trim() };
+	} catch {
+		return { installed: false };
+	}
+}
+
+export interface ContainerSetupStatus {
+	podman: { ok: boolean; version?: string };
+	podmanCompose: { ok: boolean; version?: string };
+	composeProvider: { ok: boolean; provider?: string };
+	passt: { ok: boolean; version?: string };
+	rootlessNetwork: { ok: boolean; backend?: string };
+	allReady: boolean;
+	supported?: boolean;
+	reason?: string;
+	code?: string;
+}
+
+/** Cached container setup status. */
+let _setupCache: ContainerSetupStatus | null = null;
+
+/** Check all container prerequisites for rootless podman-compose. Uses cache unless refresh=true. */
+export async function getContainerSetupStatus(refresh = false): Promise<ContainerSetupStatus> {
+	if (_setupCache && !refresh) return _setupCache;
+
+	if (!supportsContainers()) {
+		_setupCache = {
+			podman: { ok: false },
+			podmanCompose: { ok: false },
+			composeProvider: { ok: false },
+			passt: { ok: false },
+			rootlessNetwork: { ok: false },
+			allReady: false,
+			supported: false,
+			reason: getContainerUnsupportedReason(),
+			code: "CONTAINERS_UNSUPPORTED",
+		};
+		return _setupCache;
+	}
+
+	ensureRootlessEnv();
+	const podman = await getPodmanStatus();
+
+	let podmanCompose: ContainerSetupStatus["podmanCompose"] = { ok: false };
+	try {
+		const result = await safeSpawn({ cmd: ["podman-compose", "version"], timeout: 5000 });
+		if (result.exitCode === 0) {
+			const out = result.stdout.trim();
+			// Output like "podman-compose version 1.5.0" or just version lines
+			const match = out.match(/podman-compose\s+version\s+([\d.]+)/i);
+			podmanCompose = { ok: true, version: match?.[1] ?? out.split("\n").pop()?.trim() };
+		}
+	} catch {
+		podmanCompose = { ok: false };
+	}
+
+	let composeProvider: ContainerSetupStatus["composeProvider"] = { ok: false };
+	try {
+		const result = await safeSpawn({
+			cmd: ["podman", "compose", "version"],
+			timeout: 5000,
+			env: envWithAmbientProxy(),
+		});
+		if (result.exitCode === 0) {
+			const out = result.stdout.trim();
+			// podman-compose output contains "podman-compose version"
+			// docker-compose output contains "Docker Compose version"
+			if (out.includes("podman-compose")) {
+				composeProvider = { ok: true, provider: "podman-compose" };
+			} else {
+				const match = out.match(/Docker Compose version\s+(v[\d.]+)/i);
+				composeProvider = {
+					ok: false,
+					provider: match ? `docker-compose ${match[1]}` : "docker-compose",
+				};
+			}
+		}
+	} catch {
+		composeProvider = { ok: false };
+	}
+
+	let passt: ContainerSetupStatus["passt"] = { ok: false };
+	try {
+		const result = await safeSpawn({ cmd: ["passt", "--version"], timeout: 5000 });
+		if (result.exitCode === 0) {
+			passt = { ok: true, version: result.stdout.trim().split("\n")[0] };
+		}
+	} catch {
+		// passt --version may not exist, try which
+		try {
+			const result = await safeSpawn({ cmd: ["which", "passt"], timeout: 3000 });
+			passt = { ok: result.exitCode === 0 };
+		} catch {
+			passt = { ok: false };
+		}
+	}
+
+	let rootlessNetwork: ContainerSetupStatus["rootlessNetwork"] = { ok: false };
+	try {
+		const result = await safeSpawn({
+			cmd: ["podman", "info", "--format", "{{.Host.RootlessNetworkCmd}}"],
+			timeout: 5000,
+		});
+		if (result.exitCode === 0) {
+			const backend = result.stdout.trim().replace(/^'|'$/g, "").toLowerCase();
+			rootlessNetwork = {
+				ok: backend === "pasta" || backend === "passt",
+				backend: backend || undefined,
+			};
+		}
+	} catch {
+		rootlessNetwork = { ok: false };
+	}
+
+	_setupCache = {
+		podman: { ok: podman.installed, version: podman.version },
+		podmanCompose,
+		composeProvider,
+		passt,
+		rootlessNetwork,
+		allReady:
+			podman.installed && podmanCompose.ok && composeProvider.ok && passt.ok && rootlessNetwork.ok,
+	};
+	return _setupCache;
+}
+
+/** Lines matching these patterns are podman noise — filter from stderr. */
+const NOISE_PATTERNS = [
+	"cgroupv2 manager is set to systemd",
+	"you may need to log in using a user session",
+	"enable lingering with",
+	"Falling back to --cgroup-manager",
+	"Executing external compose provider",
+	"podman-compose(1) for how to disable",
+];
+
+function isNoiseLine(line: string): boolean {
+	return NOISE_PATTERNS.some((p) => line.includes(p));
+}
+
+/**
+ * Detect whether a compose log line belongs to the "build" or "start" phase.
+ * Lines matching container lifecycle patterns (Container/Network/Volume creating
+ * or started) indicate the start phase; everything before that is build.
+ */
+type ComposePhase = "build" | "start";
+
+// Patterns that indicate container lifecycle (start phase)
+const START_PATTERNS = [
+	/^Container\s+/,
+	/^Network\s+/,
+	/^Volume\s+/,
+	/^Attaching to/,
+	/^Gracefully stopping/,
+	/^Killing /,
+];
+
+// Patterns that indicate build output (build phase)
+const BUILD_PATTERNS = [
+	/^STEP\s+\d+\/\d+:/,
+	/^--> /,
+	/^CACHED/,
+	/^COMMIT/,
+	/^Successfully tagged /,
+	/^error building at step/i,
+	/^error: failed to solve/i,
+	/^\[internal\]/,
+	/^\[build\]/,
+	/^\s*RUN\s/,
+	/^\s*COPY\s/,
+	/^\s*FROM\s/,
+	/^\s*ADD\s/,
+	/^Building\s/,
+];
+
+function isStartLine(line: string): boolean {
+	return START_PATTERNS.some((p) => p.test(line));
+}
+
+function isBuildLine(line: string): boolean {
+	return BUILD_PATTERNS.some((p) => p.test(line));
+}
+
+/** Strip ANSI escape codes from a string. */
+function stripAnsi(s: string): string {
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping ANSI escape sequences
+	return s.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function cleanStderr(raw: string): string {
+	return stripAnsi(raw)
+		.split("\n")
+		.filter((line) => line.trim() !== "" && !isNoiseLine(line))
+		.join("\n")
+		.trim();
+}
+
+/** Hard timeout for quick (non-streaming) podman commands. */
+const PODMAN_EXEC_TIMEOUT_MS = 120_000;
+/** Default `--tail` applied to container logs when the caller does not specify one. */
+const DEFAULT_LOG_TAIL_LINES = 2000;
+
+async function exec(
+	args: string[],
+	cwd: string,
+	env?: Record<string, string>,
+): Promise<ExecResult> {
+	await ensurePodman();
+	const result = await safeSpawn({
+		cmd: ["podman", ...args],
+		cwd,
+		// podman pulls from user-configured registries, so it keeps the user's
+		// ambient proxy configuration.
+		env: envWithAmbientProxy(env),
+		// Quick podman ops only (ps/inspect/down/pause/stop/logs). Long-running
+		// builds go through execStreaming (10min timeout), never here. Guard against
+		// a hung podman pinning the caller.
+		timeout: PODMAN_EXEC_TIMEOUT_MS,
+	});
+	const stderr = cleanStderr(result.stderr);
+	if (result.exitCode !== 0) {
+		logger.error("Container command failed", {
+			cmd: ["podman", ...args].join(" "),
+			cwd,
+			stderr,
+			exitCode: result.exitCode,
+		});
+	}
+	return { stdout: result.stdout.trim(), stderr, exitCode: result.exitCode };
+}
+
+/**
+ * Execute a podman command and stream stderr lines to a callback in real time.
+ * Used for long-running operations like `compose up` that may build images.
+ * @param timeout Hard timeout in ms (default 10 minutes). Process is killed on expiry.
+ */
+async function execStreaming(
+	args: string[],
+	cwd: string,
+	onLine: (line: string) => void,
+	env?: Record<string, string>,
+	timeout = 600_000,
+): Promise<ExecResult> {
+	await ensurePodman();
+	const proc = Bun.spawn(["podman", ...args], {
+		cwd,
+		stdout: "pipe",
+		stderr: "pipe",
+		// Image builds/pulls reach user-configured registries — keep their proxy.
+		env: envWithAmbientProxy(env),
+	});
+
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		logger.error("Container command timed out, killing process", {
+			cmd: ["podman", ...args].join(" "),
+			cwd,
+			timeoutMs: timeout,
+		});
+		proc.kill();
+	}, timeout);
+
+	// Stream stderr line by line
+	const stderrChunks: string[] = [];
+	const readStream = async (stream: ReadableStream<Uint8Array>) => {
+		const reader = stream.getReader();
+		const decoder = new TextDecoder();
+		let buffer = "";
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				buffer += decoder.decode(value, { stream: true });
+				const lines = buffer.split("\n");
+				buffer = lines.pop() ?? "";
+				for (const raw of lines) {
+					const cleaned = stripAnsi(raw);
+					stderrChunks.push(cleaned);
+					if (cleaned.trim() && !isNoiseLine(cleaned)) {
+						onLine(cleaned);
+					}
+				}
+			}
+			// Flush remaining buffer
+			if (buffer.trim()) {
+				const cleaned = stripAnsi(buffer);
+				stderrChunks.push(cleaned);
+				if (!isNoiseLine(cleaned)) {
+					onLine(cleaned);
+				}
+			}
+		} finally {
+			reader.releaseLock();
+		}
+	};
+
+	const stdoutPromise = new Response(proc.stdout).text();
+	const [stdout, , exitCode] = await Promise.all([
+		stdoutPromise,
+		readStream(proc.stderr),
+		proc.exited,
+	]);
+
+	clearTimeout(timer);
+
+	const stderr = stderrChunks
+		.filter((l) => l.trim() !== "" && !isNoiseLine(l))
+		.join("\n")
+		.trim();
+
+	if (timedOut) {
+		return {
+			stdout: stdout.trim(),
+			stderr: `Command timed out after ${timeout / 1000}s. ${stderr}`.trim(),
+			exitCode: exitCode ?? 1,
+		};
+	}
+
+	if (exitCode !== 0) {
+		logger.error("Container command failed", {
+			cmd: ["podman", ...args].join(" "),
+			cwd,
+			stderr,
+			exitCode,
+		});
+	}
+	return { stdout: stdout.trim(), stderr, exitCode };
+}
+
+/** Resolve the compose file path in a worktree directory. */
+export function resolveComposeFile(
+	worktreePath: string,
+	config: ContainerConfig | null,
+): string | null {
+	if (config?.composeFile) {
+		const p = resolve(worktreePath, config.composeFile);
+		// Prevent path traversal — resolved path must stay within worktree
+		if (!isInsidePath(worktreePath, p)) return null;
+		return existsSync(p) ? p : null;
+	}
+	for (const name of ["compose.yml", "compose.yaml"]) {
+		const p = resolve(worktreePath, name);
+		if (existsSync(p)) return p;
+	}
+	return null;
+}
+
+export interface ComposeServiceInfo {
+	name: string;
+	ports: Array<{ host: number; container: number }>;
+	environment: Record<string, string>;
+	image?: string;
+}
+
+/**
+ * Parse a compose file and extract service info (ports, environment, image).
+ * Uses `podman-compose config` for variable substitution, falls back to
+ * naive YAML parsing of the raw file.
+ */
+export async function parseComposeFile(
+	worktreePath: string,
+	composeFilePath: string,
+): Promise<ComposeServiceInfo[]> {
+	let yamlText: string;
+	try {
+		const result = await safeSpawn({
+			cmd: ["podman-compose", "-f", composeFilePath, "config"],
+			cwd: worktreePath,
+			timeout: 10_000,
+		});
+		yamlText = result.exitCode === 0 ? result.stdout : await Bun.file(composeFilePath).text();
+	} catch {
+		// Fallback: read raw file
+		yamlText = await Bun.file(composeFilePath).text();
+	}
+
+	return parseComposeYaml(yamlText);
+}
+
+/**
+ * Naive YAML parser for compose config output.
+ * Handles the subset we care about: services → name, ports, environment, image.
+ * No dependency on a YAML library.
+ */
+function parseComposeYaml(text: string): ComposeServiceInfo[] {
+	const results: ComposeServiceInfo[] = [];
+	const lines = text.split("\n");
+	let inServices = false;
+	let currentService: string | null = null;
+	let currentSection: string | null = null; // "ports" | "environment" | null
+	let ports: ComposeServiceInfo["ports"] = [];
+	let env: Record<string, string> = {};
+	let image: string | undefined;
+
+	const flushService = () => {
+		if (currentService) {
+			results.push({ name: currentService, ports, environment: env, image });
+		}
+		ports = [];
+		env = {};
+		image = undefined;
+	};
+
+	for (const line of lines) {
+		const stripped = line.trimEnd();
+		if (stripped === "" || stripped.startsWith("#")) continue;
+
+		// Top-level key (no indentation)
+		if (!stripped.startsWith(" ") && !stripped.startsWith("\t")) {
+			if (stripped.startsWith("services:")) {
+				inServices = true;
+				currentSection = null;
+				continue;
+			}
+			if (inServices && currentService) {
+				flushService();
+				currentService = null;
+			}
+			inServices = false;
+			currentSection = null;
+			continue;
+		}
+
+		if (!inServices) continue;
+
+		const indent = stripped.length - stripped.trimStart().length;
+		const trimmed = stripped.trimStart();
+
+		// Service name (indent level 2)
+		if (indent === 2 && trimmed.endsWith(":") && !trimmed.startsWith("-")) {
+			flushService();
+			currentService = trimmed.slice(0, -1).trim();
+			currentSection = null;
+			continue;
+		}
+
+		if (!currentService) continue;
+
+		// Service-level keys (indent level 4)
+		if (indent === 4 && !trimmed.startsWith("-")) {
+			if (trimmed.startsWith("ports:")) {
+				currentSection = "ports";
+				continue;
+			}
+			if (trimmed.startsWith("environment:")) {
+				currentSection = "environment";
+				continue;
+			}
+			if (trimmed.startsWith("image:")) {
+				image = trimmed
+					.slice(6)
+					.trim()
+					.replace(/^['"]|['"]$/g, "");
+				currentSection = null;
+				continue;
+			}
+			currentSection = null;
+			continue;
+		}
+
+		// List items under ports/environment (indent >= 4, starts with -)
+		if (currentSection === "ports" && trimmed.startsWith("-")) {
+			const portStr = trimmed
+				.slice(1)
+				.trim()
+				.replace(/^['"]|['"]$/g, "");
+			// "3000:3000" or "8080:80" or "3000:3000/tcp"
+			const match = portStr.match(/^(\d+):(\d+)/);
+			if (match) {
+				ports.push({ host: Number(match[1]), container: Number(match[2]) });
+			}
+			continue;
+		}
+
+		if (currentSection === "environment") {
+			if (trimmed.startsWith("-")) {
+				// List format: - KEY=VALUE
+				const val = trimmed.slice(1).trim();
+				const eqIdx = val.indexOf("=");
+				if (eqIdx > 0) {
+					env[val.slice(0, eqIdx)] = val.slice(eqIdx + 1).replace(/^['"]|['"]$/g, "");
+				}
+			} else {
+				// Map format: KEY: VALUE
+				const colonIdx = trimmed.indexOf(":");
+				if (colonIdx > 0) {
+					const key = trimmed.slice(0, colonIdx).trim();
+					const val = trimmed
+						.slice(colonIdx + 1)
+						.trim()
+						.replace(/^['"]|['"]$/g, "");
+					env[key] = val;
+				}
+			}
+		}
+	}
+
+	flushService();
+	return results;
+}
+
+function extractContainerPortsFromComposePs(
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic compose ps JSON
+	portsRaw: any,
+): number[] {
+	const ports = Array.isArray(portsRaw) ? portsRaw : [];
+	const values = new Set<number>();
+	for (const p of ports) {
+		const cp =
+			Number((p as Record<string, unknown>).container_port) ||
+			Number((p as Record<string, unknown>).TargetPort);
+		if (Number.isFinite(cp) && cp > 0) values.add(cp);
+	}
+	return [...values];
+}
+
+export function resolveProxyPortHints(
+	composePortsByService: Map<string, number[]>,
+	configuredPortsByService: Map<string, number[]>,
+	inspectPortsByService: Map<string, number[]>,
+): ProxyPortHint[] {
+	const serviceNames = new Set<string>([
+		...composePortsByService.keys(),
+		...configuredPortsByService.keys(),
+		...inspectPortsByService.keys(),
+	]);
+	const hints: ProxyPortHint[] = [];
+
+	for (const serviceName of serviceNames) {
+		const compose = composePortsByService.get(serviceName) ?? [];
+		const configured = configuredPortsByService.get(serviceName) ?? [];
+		const inspect = inspectPortsByService.get(serviceName) ?? [];
+		const ports = [...new Set([...compose, ...configured, ...inspect])];
+		for (const containerPort of ports) {
+			hints.push({ serviceName, containerPort });
+		}
+	}
+
+	return hints;
+}
+
+const PROXY_OVERRIDE_FILENAME = ".narrafork-proxy-override.yml";
+
+/**
+ * Generate a compose override file that strips all port mappings via `!reset`.
+ * Used in proxy mode so containers don't bind host ports.
+ * Returns the override file path, or null if no services found.
+ */
+async function generateProxyOverride(
+	worktreePath: string,
+	composeFile: string,
+): Promise<string | null> {
+	const services = await parseComposeFile(worktreePath, composeFile);
+	if (services.length === 0) return null;
+
+	const lines = ["services:"];
+	for (const svc of services) {
+		lines.push(`  ${svc.name}:`);
+		lines.push("    ports: !reset []");
+	}
+	lines.push("");
+
+	const overridePath = resolve(worktreePath, PROXY_OVERRIDE_FILENAME);
+	await Bun.write(overridePath, lines.join("\n"));
+	return overridePath;
+}
+
+/** Remove the proxy override file if it exists. */
+function cleanupProxyOverride(worktreePath: string): void {
+	try {
+		unlinkSync(resolve(worktreePath, PROXY_OVERRIDE_FILENAME));
+	} catch {
+		// Ignore — file may not exist
+	}
+}
+
+/** Build podman compose args with optional override file. */
+function buildComposeFileArgs(composeFile: string, overrideFile: string | null): string[] {
+	const args = ["compose", "-f", composeFile];
+	if (overrideFile) args.push("-f", overrideFile);
+	return args;
+}
+
+/** Build environment variables for compose, including port mappings or proxy info. */
+export function buildComposeEnv(
+	chapterId: string,
+	portMappings: PortMapping[],
+	config: ContainerConfig | null,
+	proxyInfo?: ProxyInfo,
+): Record<string, string> {
+	const env: Record<string, string> = {
+		NARRAFORK_CHAPTER_ID: chapterId,
+		NARRAFORK_VOLUME_PREFIX: `nf_${chapterId.slice(0, 12)}`,
+	};
+	if (proxyInfo) {
+		// Proxy mode: inject proxy URLs instead of host ports
+		env.NARRAFORK_PROXY = "1";
+		env.NARRAFORK_PROXY_DOMAIN = proxyInfo.domain;
+		if (config?.ports) {
+			for (const { containerPort, serviceName } of config.ports) {
+				const label = generateProxyLabel(proxyInfo.chapterShortId, serviceName, containerPort);
+				env[`NARRAFORK_PROXY_URL_${containerPort}`] = buildProxyUrl(
+					label,
+					proxyInfo.domain,
+					proxyInfo.port,
+				);
+			}
+		}
+	} else {
+		// Legacy mode: inject host port mappings
+		for (const { hostPort, containerPort } of portMappings) {
+			env[`PORT_${containerPort}`] = String(hostPort);
+		}
+	}
+	if (config?.env) {
+		Object.assign(env, config.env);
+	}
+	return env;
+}
+
+export const containerService = {
+	/**
+	 * Start containers for a chapter based on its containerConfig.
+	 * Validates inputs synchronously, then kicks off compose up in the background.
+	 * Progress is streamed via container:log events; completion via container:started/error.
+	 */
+	async startChapterContainers(chapterId: string): Promise<void> {
+		const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
+		if (!chapter) throw new NotFoundError("Chapter", chapterId);
+		if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
+
+		const config = chapter.containerConfig as ContainerConfig | null;
+		const composeFile = resolveComposeFile(chapter.worktreePath, config);
+		if (!composeFile) {
+			const hint = config?.composeFile
+				? `Configured file "${config.composeFile}" not found in ${chapter.worktreePath}`
+				: `No compose.yml or compose.yaml found in ${chapter.worktreePath}`;
+			throw new ValidationError(`Cannot start containers: ${hint}`);
+		}
+
+		// Determine proxy mode: global proxy enabled + project has proxyDomain
+		const project = await db.query.projects.findFirst({
+			where: eq(projects.id, chapter.projectId),
+			columns: { proxyDomain: true },
+		});
+		const proxyEnabled = settings.containers.proxy?.enabled && !!project?.proxyDomain;
+		const proxyDomain = project?.proxyDomain ?? null;
+
+		// Block proxy mode if pasta/passt backend is not available
+		if (proxyEnabled && !(await isPastaBackend())) {
+			throw new ValidationError(
+				"Proxy mode requires Podman 5.0+ with pasta/passt network backend. " +
+					"Current rootless network backend does not support direct host→container IP access. " +
+					"Either upgrade Podman and install passt, or disable proxy mode in settings.",
+			);
+		}
+
+		// Run the entire start flow under a per-chapter lock to prevent concurrent starts
+		containerLock
+			.acquire(chapterId, async () => {
+				// Allocate ports (skip in proxy mode)
+				let portMappings: PortMapping[] = [];
+				if (!proxyEnabled && config?.ports && config.ports.length > 0) {
+					portMappings = await portAllocator.allocate(chapterId, config.ports);
+				} else if (proxyEnabled) {
+					// Switching from legacy port mapping mode to proxy mode — ensure stale allocations are gone.
+					await portAllocator.release(chapterId);
+				}
+
+				const chapterShortId = chapterId.slice(0, 8);
+				const env = buildComposeEnv(
+					chapterId,
+					portMappings,
+					config,
+					proxyEnabled && proxyDomain
+						? {
+								domain: proxyDomain,
+								port: settings.containers.proxy.port,
+								chapterShortId,
+							}
+						: undefined,
+				);
+
+				// Signal that we're starting (UI can show a spinner)
+				eventBus.emit({ type: "container:starting", chapterId });
+				logger.info("Starting chapter containers", {
+					chapterId,
+					composeFile,
+					proxyMode: proxyEnabled,
+				});
+
+				await this._runComposeUp(
+					chapterId,
+					chapter.worktreePath ?? "",
+					composeFile,
+					portMappings,
+					env,
+					config,
+					proxyEnabled && proxyDomain
+						? { domain: proxyDomain, port: settings.containers.proxy.port, chapterShortId }
+						: undefined,
+				);
+			})
+			.catch((err) => {
+				// _runComposeUp reports its own errors via eventBus; catch pre-compose
+				// failures (e.g. port allocation) that would otherwise be silently swallowed.
+				if (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					logger.error("Container start failed before compose up", { chapterId, error: msg });
+					eventBus.emit({ type: "container:error", chapterId, error: msg });
+				}
+			});
+	},
+
+	/** @internal Background compose up with streaming logs. */
+	async _runComposeUp(
+		chapterId: string,
+		worktreePath: string,
+		composeFile: string,
+		portMappings: PortMapping[],
+		env: Record<string, string>,
+		config: ContainerConfig | null,
+		proxyInfo?: ProxyInfo,
+	): Promise<void> {
+		const isProxy = !!proxyInfo;
+		const configuredPortsByService = new Map<string, number[]>();
+		if (config?.ports) {
+			for (const { serviceName, containerPort } of config.ports) {
+				const list = configuredPortsByService.get(serviceName) ?? [];
+				if (!list.includes(containerPort)) list.push(containerPort);
+				configuredPortsByService.set(serviceName, list);
+			}
+		}
+
+		// In proxy mode, generate an override file that strips all port mappings
+		// so containers don't bind host ports (traffic goes through the reverse proxy).
+		let overrideFile: string | null = null;
+		if (isProxy) {
+			overrideFile = await generateProxyOverride(worktreePath, composeFile);
+		}
+		const fileArgs = buildComposeFileArgs(composeFile, overrideFile);
+
+		try {
+			const composeArgs = [...fileArgs, "up", "-d"];
+			if (config?.services && config.services.length > 0) {
+				composeArgs.push(...config.services);
+			}
+
+			let currentPhase: ComposePhase = "build";
+			const result = await execStreaming(
+				composeArgs,
+				worktreePath,
+				(line) => {
+					// Phase transition: once we see lifecycle lines, switch to "start"
+					if (currentPhase === "build" && isStartLine(line)) {
+						currentPhase = "start";
+						// Emit a phase transition marker
+						eventBus.emit({ type: "container:log", chapterId, line: "", phase: "start" });
+					}
+					const phase = currentPhase;
+					// Re-detect build lines even after switching to start (mixed output)
+					const effectivePhase = isBuildLine(line) ? "build" : phase;
+					eventBus.emit({ type: "container:log", chapterId, line, phase: effectivePhase });
+				},
+				env,
+			);
+
+			if (result.exitCode !== 0) {
+				if (!isProxy) await portAllocator.release(chapterId);
+				const msg = result.stderr || `compose up failed with exit code ${result.exitCode}`;
+				eventBus.emit({ type: "container:error", chapterId, error: msg });
+				return;
+			}
+
+			// In proxy mode, enrich env with fallback proxy URLs from configured ports
+			// before recording instances (actual labels may be refined from compose/inspect later).
+			if (proxyInfo) {
+				const fallbackHints = resolveProxyPortHints(new Map(), configuredPortsByService, new Map());
+				for (const { serviceName, containerPort } of fallbackHints) {
+					const label = generateProxyLabel(proxyInfo.chapterShortId, serviceName, containerPort);
+					env[`NARRAFORK_PROXY_URL_${containerPort}`] = buildProxyUrl(
+						label,
+						proxyInfo.domain,
+						proxyInfo.port,
+					);
+				}
+			}
+
+			// Record container instances (clear stale records first)
+			try {
+				await db
+					.delete(containerInstances)
+					.where(
+						and(
+							eq(containerInstances.chapterId, chapterId),
+							isNull(containerInstances.worktreeResourceId),
+						),
+					);
+				await this._recordContainerInstances(
+					chapterId,
+					worktreePath,
+					composeFile,
+					portMappings,
+					env,
+					proxyInfo,
+					configuredPortsByService,
+					overrideFile,
+				);
+			} catch (recordErr) {
+				logger.error("Failed to record container instances, running compose down to clean up", {
+					chapterId,
+					error: String(recordErr),
+				});
+				await exec([...fileArgs, "down"], worktreePath, env);
+				if (!isProxy) await portAllocator.release(chapterId);
+				eventBus.emit({
+					type: "container:error",
+					chapterId,
+					error: `Containers started but recording failed, cleaned up: ${recordErr}`,
+				});
+				return;
+			}
+
+			logger.info("Chapter containers started", { chapterId, proxyMode: isProxy });
+			eventBus.emit({ type: "container:started", chapterId });
+		} catch (err) {
+			logger.error("Unexpected error during container start", {
+				chapterId,
+				error: String(err),
+			});
+			if (!isProxy) await portAllocator.release(chapterId).catch(() => {});
+			eventBus.emit({
+				type: "container:error",
+				chapterId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		} finally {
+			if (overrideFile) cleanupProxyOverride(worktreePath);
+		}
+	},
+
+	/** Pause all containers for a chapter (used during dormant). */
+	async pauseChapterContainers(chapterId: string): Promise<void> {
+		await containerLock.acquire(chapterId, async () => {
+			const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
+			if (!chapter) throw new NotFoundError("Chapter", chapterId);
+
+			const config = chapter.containerConfig as ContainerConfig | null;
+			const worktreePath = chapter.worktreePath;
+			if (!worktreePath) return;
+
+			const composeFile = resolveComposeFile(worktreePath, config);
+			if (!composeFile) return;
+
+			const result = await exec(["compose", "-f", composeFile, "pause"], worktreePath);
+			if (result.exitCode !== 0) {
+				logger.warn("Failed to pause containers", { chapterId, stderr: result.stderr });
+				return;
+			}
+
+			const now = new Date().toISOString();
+			await db
+				.update(containerInstances)
+				.set({ status: "paused", updatedAt: now })
+				.where(
+					and(
+						eq(containerInstances.chapterId, chapterId),
+						isNull(containerInstances.worktreeResourceId),
+					),
+				);
+
+			eventBus.emit({ type: "container:paused", chapterId });
+			logger.info("Chapter containers paused", { chapterId });
+		});
+	},
+
+	/** Unpause all containers for a chapter (used during wake). */
+	async unpauseChapterContainers(chapterId: string): Promise<void> {
+		const needsFreshStart = await containerLock.acquire(chapterId, async () => {
+			const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
+			if (!chapter) throw new NotFoundError("Chapter", chapterId);
+			if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
+
+			const config = chapter.containerConfig as ContainerConfig | null;
+			const composeFile = resolveComposeFile(chapter.worktreePath, config);
+			if (!composeFile) return false;
+
+			const result = await exec(["compose", "-f", composeFile, "unpause"], chapter.worktreePath);
+			if (result.exitCode !== 0) {
+				// Containers may have been removed — signal caller to do a fresh start
+				logger.warn("Unpause failed, will attempt fresh start", { chapterId });
+				return true;
+			}
+
+			const now = new Date().toISOString();
+			await db
+				.update(containerInstances)
+				.set({ status: "running", updatedAt: now })
+				.where(
+					and(
+						eq(containerInstances.chapterId, chapterId),
+						isNull(containerInstances.worktreeResourceId),
+					),
+				);
+
+			eventBus.emit({ type: "container:resumed", chapterId });
+			logger.info("Chapter containers unpaused", { chapterId });
+			return false;
+		});
+
+		// Fresh start outside the lock to avoid deadlock (remove + start each acquire their own lock)
+		if (needsFreshStart) {
+			await this.removeChapterContainers(chapterId);
+			await this.startChapterContainers(chapterId);
+		}
+	},
+
+	/** Stop all containers for a chapter. */
+	async stopChapterContainers(chapterId: string): Promise<void> {
+		await containerLock.acquire(chapterId, async () => {
+			const chapter = await db.query.chapters.findFirst({
+				where: eq(chapters.id, chapterId),
+			});
+			if (!chapter) throw new NotFoundError("Chapter", chapterId);
+
+			const config = chapter.containerConfig as ContainerConfig | null;
+			const worktreePath = chapter.worktreePath;
+			if (!worktreePath) return;
+
+			const composeFile = resolveComposeFile(worktreePath, config);
+			if (!composeFile) return;
+
+			const result = await exec(["compose", "-f", composeFile, "stop"], worktreePath);
+			if (result.exitCode !== 0) {
+				logger.warn("Failed to stop containers", { chapterId, stderr: result.stderr });
+			}
+
+			const now = new Date().toISOString();
+			await db
+				.update(containerInstances)
+				.set({ status: "stopped", updatedAt: now })
+				.where(
+					and(
+						eq(containerInstances.chapterId, chapterId),
+						isNull(containerInstances.worktreeResourceId),
+					),
+				);
+
+			eventBus.emit({ type: "container:stopped", chapterId });
+			logger.info("Chapter containers stopped", { chapterId });
+		});
+	},
+
+	/**
+	 * Remove all containers for a chapter (used during cleanup).
+	 * Optionally deletes volumes.
+	 */
+	async removeChapterContainers(
+		chapterId: string,
+		opts: { deleteVolumes?: boolean } = {},
+	): Promise<void> {
+		await containerLock.acquire(chapterId, async () => {
+			const chapter = await db.query.chapters.findFirst({
+				where: eq(chapters.id, chapterId),
+			});
+			if (!chapter) throw new NotFoundError("Chapter", chapterId);
+
+			const config = chapter.containerConfig as ContainerConfig | null;
+			const worktreePath = chapter.worktreePath;
+
+			// Check if this chapter was using proxy mode (has proxyLabel records)
+			const existingInstances = await db.query.containerInstances.findMany({
+				where: and(
+					eq(containerInstances.chapterId, chapterId),
+					isNull(containerInstances.worktreeResourceId),
+				),
+				columns: { proxyLabel: true },
+			});
+			const wasProxyMode = existingInstances.some((i) => !!i.proxyLabel);
+
+			// Try to run compose down if worktree exists
+			if (worktreePath) {
+				const composeFile = resolveComposeFile(worktreePath, config);
+				if (composeFile) {
+					const args = ["compose", "-f", composeFile, "down"];
+					if (opts.deleteVolumes) args.push("-v");
+
+					const result = await exec(args, worktreePath);
+					if (result.exitCode !== 0) {
+						logger.warn("Failed to remove containers via compose", {
+							chapterId,
+							stderr: result.stderr,
+						});
+					}
+				}
+			}
+
+			// Clean up DB records regardless
+			await db
+				.delete(containerInstances)
+				.where(
+					and(
+						eq(containerInstances.chapterId, chapterId),
+						isNull(containerInstances.worktreeResourceId),
+					),
+				);
+			// Only release ports if not in proxy mode
+			if (!wasProxyMode) {
+				await portAllocator.release(chapterId);
+			}
+
+			eventBus.emit({ type: "container:stopped", chapterId });
+			logger.info("Chapter containers removed", {
+				chapterId,
+				deleteVolumes: opts.deleteVolumes,
+			});
+		});
+	},
+
+	/** Get container logs for a chapter. */
+	async getContainerLogs(
+		chapterId: string,
+		opts: { tail?: number; service?: string } = {},
+	): Promise<string> {
+		const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
+		if (!chapter) throw new NotFoundError("Chapter", chapterId);
+		if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
+
+		const config = chapter.containerConfig as ContainerConfig | null;
+		const composeFile = resolveComposeFile(chapter.worktreePath, config);
+		if (!composeFile) return "";
+
+		const args = ["compose", "-f", composeFile, "logs"];
+		// Always bound log volume: an unbounded `logs` on a long-running container
+		// can return a huge payload. Callers may pass a larger explicit tail.
+		const tail = opts.tail ?? DEFAULT_LOG_TAIL_LINES;
+		args.push("--tail", String(tail));
+		if (opts.service) args.push(opts.service);
+
+		const result = await exec(args, chapter.worktreePath);
+		return result.stdout || result.stderr;
+	},
+
+	/** List container instances for a chapter from DB. */
+	async listByChapter(chapterId: string) {
+		return db.query.containerInstances.findMany({
+			where: and(
+				eq(containerInstances.chapterId, chapterId),
+				isNull(containerInstances.worktreeResourceId),
+			),
+		});
+	},
+
+	/**
+	 * @internal Record container instances by querying compose ps.
+	 */
+	async _recordContainerInstances(
+		chapterId: string,
+		worktreePath: string,
+		composeFile: string,
+		portMappings: PortMapping[],
+		env: Record<string, string>,
+		proxyInfo?: ProxyInfo,
+		configuredPortsByService?: Map<string, number[]>,
+		overrideFile?: string | null,
+	): Promise<void> {
+		const fileArgs = buildComposeFileArgs(composeFile, overrideFile ?? null);
+		const result = await exec([...fileArgs, "ps", "--format", "json"], worktreePath, env);
+
+		const now = new Date().toISOString();
+
+		if (result.exitCode === 0 && result.stdout) {
+			// Parse container list — podman-compose outputs a pretty-printed JSON array,
+			// docker compose outputs one JSON object per line.
+			let containerList: Record<string, unknown>[] = [];
+			try {
+				// Try parsing the entire output as a single JSON value first
+				const parsed = JSON.parse(result.stdout);
+				containerList = Array.isArray(parsed) ? parsed : [parsed];
+			} catch {
+				// Fallback: one JSON object per line (docker compose format)
+				for (const line of result.stdout.split("\n").filter(Boolean)) {
+					try {
+						const parsed = JSON.parse(line);
+						const items = Array.isArray(parsed) ? parsed : [parsed];
+						containerList.push(...items);
+					} catch {
+						logger.warn("Failed to parse compose ps output line", { line });
+					}
+				}
+			}
+
+			const composePortsByService = new Map<string, number[]>();
+			let proxyRowsRecorded = 0;
+			for (const container of containerList) {
+				// docker compose: Service, Name, ID
+				// podman-compose: Labels["com.docker.compose.service"], Names[], Id
+				const labels = container.Labels as Record<string, string> | undefined;
+				const names = container.Names;
+				const serviceName =
+					(container.Service as string) ||
+					labels?.["com.docker.compose.service"] ||
+					labels?.["io.podman.compose.service"] ||
+					(Array.isArray(names) ? names[0] : (container.Name as string)) ||
+					"unknown";
+				const containerId = (container.ID as string) || (container.Id as string) || null;
+
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic compose ps JSON
+				const portsRaw = (container.Ports ?? container.Publishers ?? []) as any;
+				const composePorts = extractContainerPortsFromComposePs(portsRaw);
+				composePortsByService.set(serviceName, composePorts);
+
+				if (proxyInfo) {
+					let containerIp: string | null = null;
+					if (containerId) {
+						containerIp = await this._getContainerIp(containerId);
+					}
+					const configured = configuredPortsByService?.get(serviceName) ?? [];
+					const inspectPorts = containerId ? await this._getContainerExposedPorts(containerId) : [];
+					const hints = resolveProxyPortHints(
+						new Map([[serviceName, composePorts]]),
+						new Map([[serviceName, configured]]),
+						new Map([[serviceName, inspectPorts]]),
+					);
+
+					if (hints.length === 0) {
+						logger.warn("No proxy ports resolved for container", {
+							chapterId,
+							serviceName,
+							containerId,
+							composePorts,
+							configuredPorts: configured,
+							inspectPorts,
+						});
+						continue;
+					}
+
+					for (const { containerPort } of hints) {
+						const proxyLabel = generateProxyLabel(
+							proxyInfo.chapterShortId,
+							serviceName,
+							containerPort,
+						);
+						await db.insert(containerInstances).values({
+							id: generateId(),
+							chapterId,
+							containerId,
+							serviceName,
+							status: "running",
+							hostPort: null,
+							containerPort,
+							proxyLabel,
+							containerIp,
+							createdAt: now,
+							updatedAt: now,
+						});
+						proxyRowsRecorded++;
+					}
+				} else {
+					// Legacy mode: extract port mappings
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic compose ps JSON
+					const ports = (container.Ports ?? container.Publishers ?? []) as any[];
+					const firstPort = ports[0] as Record<string, unknown> | undefined;
+					const userMapping = portMappings.find((p) => p.serviceName === serviceName);
+					const hostPort =
+						(firstPort?.host_port as number) ??
+						(firstPort?.PublishedPort as number) ??
+						userMapping?.hostPort ??
+						null;
+					const containerPort =
+						(firstPort?.container_port as number) ??
+						(firstPort?.TargetPort as number) ??
+						userMapping?.containerPort ??
+						null;
+
+					await db.insert(containerInstances).values({
+						id: generateId(),
+						chapterId,
+						containerId,
+						serviceName,
+						status: "running",
+						hostPort,
+						containerPort,
+						proxyLabel: null,
+						containerIp: null,
+						createdAt: now,
+						updatedAt: now,
+					});
+				}
+			}
+
+			if (proxyInfo && proxyRowsRecorded === 0) {
+				logger.warn("compose ps succeeded in proxy mode but no proxy routes were recorded", {
+					chapterId,
+				});
+				throw new ValidationError(
+					"No proxy routes resolved from running containers. Check compose service ports or image EXPOSE settings.",
+				);
+			}
+		} else if (!proxyInfo) {
+			// Fallback: create instances from port mappings if ps failed (legacy mode only).
+			// In proxy mode we can't create useful records without container IDs for IP lookup.
+			for (const { hostPort, containerPort, serviceName } of portMappings) {
+				await db.insert(containerInstances).values({
+					id: generateId(),
+					chapterId,
+					serviceName,
+					status: "running",
+					hostPort,
+					containerPort,
+					createdAt: now,
+					updatedAt: now,
+				});
+			}
+		} else {
+			logger.warn("compose ps failed in proxy mode — no container instances recorded", {
+				chapterId,
+			});
+		}
+	},
+
+	/** @internal Get a container's bridge network IP via podman inspect (with retry). */
+	async _getContainerIp(containerId: string): Promise<string | null> {
+		const MAX_RETRIES = 3;
+		const BASE_DELAY_MS = 1000;
+
+		for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+			try {
+				const result = await exec(
+					[
+						"inspect",
+						"--format",
+						"{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+						containerId,
+					],
+					"/",
+				);
+				const ip = result.stdout.trim();
+				if (ip) return ip;
+
+				// Empty IP — network may not be ready yet
+				if (attempt < MAX_RETRIES) {
+					const delay = BASE_DELAY_MS * 2 ** attempt;
+					logger.debug("Container IP empty, retrying", {
+						containerId,
+						attempt: attempt + 1,
+						delayMs: delay,
+					});
+					await Bun.sleep(delay);
+				}
+			} catch (err) {
+				if (attempt < MAX_RETRIES) {
+					const delay = BASE_DELAY_MS * 2 ** attempt;
+					logger.debug("Container IP fetch failed, retrying", {
+						containerId,
+						attempt: attempt + 1,
+						delayMs: delay,
+						error: String(err),
+					});
+					await Bun.sleep(delay);
+				} else {
+					logger.warn("Failed to get container IP after retries", {
+						containerId,
+						attempts: MAX_RETRIES + 1,
+						error: String(err),
+					});
+				}
+			}
+		}
+		logger.warn("Container IP still empty after all retries", {
+			containerId,
+			attempts: MAX_RETRIES + 1,
+		});
+		return null;
+	},
+
+	/** @internal Get exposed container ports via podman inspect. */
+	async _getContainerExposedPorts(containerId: string): Promise<number[]> {
+		try {
+			const result = await exec(
+				["inspect", "--format", "{{json .Config.ExposedPorts}}", containerId],
+				"/",
+			);
+			const raw = result.stdout.trim();
+			if (!raw || raw === "<nil>" || raw === "null") return [];
+			const parsed = JSON.parse(raw) as Record<string, unknown>;
+			const ports: number[] = [];
+			for (const key of Object.keys(parsed)) {
+				const p = Number.parseInt(key.split("/")[0] ?? "", 10);
+				if (Number.isFinite(p) && p > 0) ports.push(p);
+			}
+			return [...new Set(ports)];
+		} catch (err) {
+			logger.warn("Failed to get container exposed ports", {
+				containerId,
+				error: String(err),
+			});
+			return [];
+		}
+	},
+};

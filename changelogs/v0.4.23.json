@@ -1,0 +1,6 @@
+{
+	"version": "0.4.23",
+	"date": "2026-06-12",
+	"en": "## New Features\n\n- Built-in gateway providers now pass back reasoning content (visible thinking text, signatures, and encrypted thinking blocks) across multi-turn conversations, enabling Anthropic extended thinking reuse on these channels.",
+	"zh-CN": "## 新功能\n\n- 内置网关提供商现在支持在多轮对话中回传推理内容（可见思考文本、签名、加密思考块），使 Anthropic 扩展思考可在这些通道上跨轮复用。"
+}

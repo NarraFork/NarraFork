@@ -1,0 +1,30 @@
+; User-level systemd unit for the NarraFork remote executor.
+;
+; Install to ~/.config/systemd/user/narrafork-executor.service, then:
+;   systemctl --user daemon-reload
+;   systemctl --user enable --now narrafork-executor
+;
+; Use this when you cannot (or do not want to) install a machine-wide service.
+; The executor then runs with your own account's permissions — note that
+; --allow-root bounds structured filesystem paths, but is not a shell sandbox.
+;
+; To keep the service running while you are logged out:
+;   sudo loginctl enable-linger "$USER"
+
+[Unit]
+Description=NarraFork Remote Executor (user)
+Documentation=https://github.com/narrafork/narrafork
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/narrafork-executor --config %h/.config/narrafork/executor.json --token-file %h/.config/narrafork/device-token
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0077
+
+[Install]
+WantedBy=default.target

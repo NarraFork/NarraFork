@@ -1,0 +1,252 @@
+/*
+ * card-shimmer.css — the shimmer a TOOL CARD paints across its own face.
+ *
+ * A card has a surface, so its shimmer is a light sweeping OVER that surface: an
+ * `::after` overlay under `overflow: hidden`. That is the opposite carrier from a
+ * folded row, which has no face and tints its own text instead (see
+ * trace-shimmer.css). Both end up with the same five states and the same reading,
+ * by different means — the split is deliberate, not an inconsistency to unify.
+ *
+ * HEIGHT-NEUTRAL: the overlay is absolutely positioned at `inset: 0`, so it cannot
+ * contribute to the card's box. The exact vlist measures these cards arithmetically
+ * and would be broken by anything that could.
+ *
+ * ── WHY THIS IS A GLOBAL STYLESHEET ──────────────────────────────────────────
+ * Two render paths draw tool cards — the chunk `ToolCallCard` and the vlist
+ * `RenderToolCall` — and vlist may not import the chunk path (vlist-isolation
+ * guard). Each used to carry its own copy of these rules (a runtime <style> in
+ * ToolCallCard, and `vlist-tool-*-shimmer` in vlist-markdown.css), which is how
+ * they came to disagree: both grew neutral/blue/green and neither grew purple or
+ * red. One stylesheet, referenced by class name from both, cannot drift.
+ *
+ * The six states mirror @shared/tool-shimmer's kinds 1:1; the class names come
+ * from CARD_SHIMMER_CLASS in that module. `queued` is deliberately NOT a sweep —
+ * a travelling highlight claims motion, and a call parked behind an earlier tool
+ * has not started. It paints a left-anchored slate stripe instead.
+ *
+ * ── ON `light-dark()` AND THE Safari 14 TARGET ────────────────────────────────
+ * `light-dark()` is CSS Color 5 (Chrome 123+, Safari 17.5+), well beyond this app's
+ * `["es2020", "safari14"]` build target — but it never reaches the browser. PostCSS
+ * runs `postcss-preset-mantine` (see postcss.config.cjs), whose `postcss-light-dark`
+ * plugin expands each declaration at BUILD TIME into the light value plus a
+ * `[data-mantine-color-scheme='dark']`-scoped override. So the shipped CSS contains
+ * plain `rgba()`/`var()` and an attribute selector, both ancient.
+ *
+ * That means these are authoring sugar with no runtime fallback to reason about, and
+ * also that they only work because MantineProvider always sets that attribute on
+ * `:root`. Writing `light-dark()` in a stylesheet OUTSIDE this PostCSS pipeline (an
+ * inline `<style>`, a runtime-injected rule) would ship it verbatim and silently drop
+ * the declaration on the target — that path has no safety net.
+ */
+
+/* Looping sweep: left to right, repeating. */
+@keyframes nf-card-shimmer-loop {
+	from {
+		transform: translateX(-100%);
+	}
+	to {
+		transform: translateX(100%);
+	}
+}
+
+/* Closing sweep: right to left, once. The reversed direction is what separates
+   "this settled" from "this is still going" without relying on colour alone. */
+@keyframes nf-card-shimmer-flash {
+	from {
+		transform: translateX(100%);
+	}
+	to {
+		transform: translateX(-100%);
+	}
+}
+
+/* Queued: opacity pulse on a parked left stripe — no translate. Slow enough to
+   read as idle-with-presence rather than activity. */
+@keyframes nf-card-queued-pulse {
+	0%,
+	100% {
+		opacity: 0.45;
+	}
+	50% {
+		opacity: 1;
+	}
+}
+
+/* Exported for trace-shimmer.css: both sheets load globally via main.tsx. */
+
+.nf-card-shimmer--stream,
+.nf-card-shimmer--reflect,
+.nf-card-shimmer--run,
+.nf-card-shimmer--queued,
+.nf-card-shimmer--queued-out,
+.nf-card-shimmer--done,
+.nf-card-shimmer--fail {
+	position: relative;
+	overflow: hidden;
+}
+
+.nf-card-shimmer--stream::after,
+.nf-card-shimmer--reflect::after,
+.nf-card-shimmer--run::after,
+.nf-card-shimmer--queued::after,
+.nf-card-shimmer--queued-out::after,
+.nf-card-shimmer--done::after,
+.nf-card-shimmer--fail::after {
+	content: "";
+	position: absolute;
+	inset: 0;
+	pointer-events: none;
+}
+
+.nf-card-shimmer--stream::after,
+.nf-card-shimmer--reflect::after,
+.nf-card-shimmer--run::after {
+	transform: translateX(-100%);
+	animation: nf-card-shimmer-loop 2s ease-in-out infinite;
+}
+
+.nf-card-shimmer--done::after,
+.nf-card-shimmer--fail::after {
+	transform: translateX(100%);
+	animation: nf-card-shimmer-flash 600ms ease-out forwards;
+}
+
+/* Streaming — neutral, and deliberately the faintest of the five: an arriving
+   payload is the least eventful thing a card can be doing. The highlight must
+   CONTRAST with the card face, so it is white on dark and black on light. */
+.nf-card-shimmer--stream::after {
+	background-image: linear-gradient(
+		90deg,
+		transparent 0%,
+		light-dark(rgba(0, 0, 0, 0.04), rgba(255, 255, 255, 0.04)) 40%,
+		light-dark(rgba(0, 0, 0, 0.07), rgba(255, 255, 255, 0.07)) 50%,
+		light-dark(rgba(0, 0, 0, 0.04), rgba(255, 255, 255, 0.04)) 60%,
+		transparent 100%
+	);
+}
+
+/* Reflecting — indigo self-review, distinct from user-attention yellow/orange. */
+.nf-card-shimmer--reflect::after {
+	background-image: linear-gradient(
+		90deg,
+		transparent 0%,
+		rgba(76, 110, 245, 0.07) 30%,
+		rgba(76, 110, 245, 0.15) 50%,
+		rgba(76, 110, 245, 0.07) 70%,
+		transparent 100%
+	);
+}
+
+/* Running — blue, the family the status spinner and the running border already use. */
+.nf-card-shimmer--run::after {
+	background-image: linear-gradient(
+		90deg,
+		transparent 0%,
+		rgba(77, 171, 247, 0.06) 30%,
+		rgba(77, 171, 247, 0.13) 50%,
+		rgba(77, 171, 247, 0.06) 70%,
+		transparent 100%
+	);
+}
+
+/*
+ * Queued — SLATE, NOT a sweep.
+ *
+ * Arguments are complete but an earlier call in the same turn still owns the
+ * execution slot. Colour groups with `model_unavailable` / `quota_exhausted`
+ * (machine waiting, user has nothing to act on). Yellow is reserved for
+ * "waiting on you", and `pending` (a person) is silent entirely — queued is
+ * neither.
+ *
+ * ⚠️ NO HARD EDGE. An earlier version clipped a 12% band and ended the gradient
+ * at a non-zero alpha, so the overlay stopped mid-card as a visible vertical
+ * seam — ugly on a tool card face, which is a large surface the eye scans.
+ * The wash now covers the full card and fades to TRANSPARENT well before the
+ * middle; the slow opacity pulse still says "parked", not "moving".
+ */
+.nf-card-shimmer--queued::after {
+	background-image: linear-gradient(
+		90deg,
+		light-dark(rgba(125, 149, 184, 0.16), rgba(125, 149, 184, 0.22)) 0%,
+		light-dark(rgba(125, 149, 184, 0.05), rgba(125, 149, 184, 0.08)) 18%,
+		transparent 42%
+	);
+	animation: nf-card-queued-pulse 2.4s ease-in-out infinite;
+}
+
+/*
+ * Leaving queued — one-shot dissolve of the SAME wash.
+ *
+ * ⚠️ Do not just drop `--queued` when the call starts (or the row settles): the
+ * infinite pulse freezes wherever it happens to be and the next rule's overlay
+ * replaces it in one frame, which reads as the transparency snapping. This class
+ * keeps the wash and fades it to zero over `TOOL_SHIMMER_QUEUED_EXIT_MS`, so the
+ * parked mark finishes its gesture before the next phase appears.
+ */
+@keyframes nf-card-queued-out {
+	from {
+		opacity: 0.8;
+	}
+	to {
+		opacity: 0;
+	}
+}
+
+.nf-card-shimmer--queued-out::after {
+	background-image: linear-gradient(
+		90deg,
+		light-dark(rgba(125, 149, 184, 0.16), rgba(125, 149, 184, 0.22)) 0%,
+		light-dark(rgba(125, 149, 184, 0.05), rgba(125, 149, 184, 0.08)) 18%,
+		transparent 42%
+	);
+	animation: nf-card-queued-out 450ms ease-out forwards;
+}
+
+/* Succeeded — green, one reverse pass. */
+.nf-card-shimmer--done::after {
+	background-image: linear-gradient(
+		90deg,
+		transparent 0%,
+		rgba(64, 192, 87, 0.06) 30%,
+		rgba(64, 192, 87, 0.13) 50%,
+		rgba(64, 192, 87, 0.06) 70%,
+		transparent 100%
+	);
+}
+
+/* Failed — red, one reverse pass. Slightly stronger than the green: a failure is
+   the one outcome the reader must not miss while scanning. */
+.nf-card-shimmer--fail::after {
+	background-image: linear-gradient(
+		90deg,
+		transparent 0%,
+		rgba(250, 82, 82, 0.08) 30%,
+		rgba(250, 82, 82, 0.17) 50%,
+		rgba(250, 82, 82, 0.08) 70%,
+		transparent 100%
+	);
+}
+
+/* Reduced motion: no sweep. The overlay stays but never moves, and since every
+   gradient is transparent at its edges a parked overlay is invisible — so nothing
+   needs resetting the way the text shimmer's fill colour does. */
+@media (prefers-reduced-motion: reduce) {
+	.nf-card-shimmer--stream::after,
+	.nf-card-shimmer--reflect::after,
+	.nf-card-shimmer--run::after,
+	.nf-card-shimmer--queued::after,
+	.nf-card-shimmer--queued-out::after,
+	.nf-card-shimmer--done::after,
+	.nf-card-shimmer--fail::after {
+		animation: none;
+	}
+	/* Keep the parked stripe visible (static mid-opacity) rather than dropping it:
+	   queued must not collapse into "nothing here" under reduced motion. */
+	.nf-card-shimmer--queued::after {
+		opacity: 0.75;
+	}
+	/* Reduced motion: end the wash immediately (no dissolve). */
+	.nf-card-shimmer--queued-out::after {
+		opacity: 0;
+	}
+}

@@ -1,0 +1,254 @@
+/**
+ * NarraFork Dockview theme — aligns dockview's CSS variables with the Mantine
+ * indigo dark theme used across the app. Apply via the `dockview-theme-narrafork`
+ * class on the DockviewReact container.
+ *
+ * Variable reference: node_modules/dockview-core/dist/styles/dockview.css
+ * We intentionally drive everything from Mantine CSS variables so light/dark
+ * color scheme switching stays consistent with the rest of the app.
+ */
+
+/* Keep native drop targets alive; only replace their visual indicator.
+ * Dockview defaults to an in-place dropzone; absolute mounting uses a container.
+ * Both must be hidden while our own preview is active, not only the latter.
+ */
+.narrafork-native-drop-preview .dv-drop-target-dropzone,
+.narrafork-native-drop-preview .dv-drop-target-container {
+	opacity: 0;
+}
+
+:root {
+	/* Narrator header: Mantine sm control + 8px padding per side + divider. */
+	--nf-panel-header-height: calc(1.375rem * var(--mantine-scale) + 17px);
+}
+
+.dockview-theme-narrafork {
+	/* Core surfaces */
+	--dv-group-view-background-color: var(--mantine-color-body);
+	--dv-tabs-and-actions-container-background-color: var(--mantine-color-default);
+	--dv-tabs-and-actions-container-height: var(--nf-panel-header-height);
+	--dv-tabs-and-actions-container-font-size: var(--mantine-font-size-sm);
+
+	/* Active group / visible tab */
+	--dv-activegroup-visiblepanel-tab-background-color: var(--mantine-color-body);
+	--dv-activegroup-visiblepanel-tab-color: var(--mantine-color-text);
+	--dv-activegroup-hiddenpanel-tab-background-color: var(--mantine-color-default);
+	--dv-activegroup-hiddenpanel-tab-color: var(--mantine-color-dimmed);
+
+	/* Inactive group */
+	--dv-inactivegroup-visiblepanel-tab-background-color: var(--mantine-color-body);
+	--dv-inactivegroup-visiblepanel-tab-color: var(--mantine-color-text);
+	--dv-inactivegroup-hiddenpanel-tab-background-color: var(--mantine-color-default);
+	--dv-inactivegroup-hiddenpanel-tab-color: var(--mantine-color-dimmed);
+
+	/* Dividers / separators / sashes */
+	--dv-tab-divider-color: var(--mantine-color-default-border);
+	--dv-separator-border: var(--mantine-color-default-border);
+	--dv-sash-color: transparent;
+	--dv-active-sash-color: var(--mantine-color-indigo-6);
+	--dv-paneview-header-border-color: var(--mantine-color-default-border);
+	--dv-paneview-active-outline-color: var(--mantine-color-indigo-6);
+
+	/* Drag & drop overlay — indigo accent */
+	--dv-drag-over-background-color: color-mix(
+		in srgb,
+		var(--mantine-color-indigo-9) 25%,
+		transparent
+	);
+	--dv-drag-over-border-color: var(--mantine-color-indigo-5);
+
+	/* Tab group accent line */
+	--dv-tab-group-line-opacity: 1;
+
+	/* Context menu (Dockview built-in) */
+	--dv-context-menu-background-color: var(--mantine-color-default);
+	--dv-context-menu-color: var(--mantine-color-text);
+
+	/* Icons */
+	--dv-icon-hover-background-color: var(--mantine-color-default-hover);
+
+	/* Radius aligned to Mantine sm */
+	--dv-border-radius: var(--mantine-radius-sm);
+	--dv-tab-border-radius: var(--mantine-radius-sm);
+
+	/* Floating groups */
+	--dv-floating-box-shadow: var(--mantine-shadow-md);
+	--dv-floating-group-border: 1px solid var(--mantine-color-default-border);
+
+	height: 100%;
+	width: 100%;
+}
+
+/*
+ * dockview 的 .dv-render-overlay(defaultRenderer="always" 时每个面板内容的包裹层)
+ * 带了 transform: translate3d()、will-change: transform、contain: layout paint 三个
+ * GPU 优化提示,其中任意一个都会让它成为内部所有 position: fixed 后代的包含块。
+ * 聊天区的右键菜单/swipe 菜单/多选浮动工具条等用 position: fixed + 视口坐标定位,被
+ * overlay 重定基后会相对 overlay(左边缘 = 内容区左边)而非视口定位,整体右移一个导航栏
+ * 宽度而跑到屏幕外,表现为消息右半区右键无反应(失效区宽度恒等于导航宽度)。overlay 自身
+ * 用 left/top 绝对定位,这些提示对其布局无作用,安全清除。
+ */
+.dockview-theme-narrafork .dv-render-overlay {
+	transform: none;
+	will-change: auto;
+	contain: none;
+}
+
+/*
+ * Custom panel headers act as drag handles (via usePanelHeaderDrag →
+ * panel-drag singleton). On touch screens the browser would otherwise claim
+ * vertical/horizontal swipes for native scrolling before our document-level
+ * pointermove listener sees enough movement, killing the drag. Opting out of
+ * native touch actions on the header gives the drag singleton exclusive
+ * ownership of the gesture, matching dockview's own `.dv-tab` behaviour.
+ */
+.nf-panel-header {
+	touch-action: none;
+	height: var(--nf-panel-header-height);
+	min-height: var(--nf-panel-header-height);
+	box-sizing: border-box;
+	padding-top: 8px;
+	padding-bottom: 8px;
+}
+
+/* Custom Tab boundary and active/inactive differentiation overrides */
+
+/*
+ * The tab strip background. The bottom divider is NOT drawn here as a continuous
+ * line — instead each inactive tab draws its own bottom line and the trailing void
+ * area draws one too (see below), so the active tab can leave a clean gap that
+ * merges into the content below. All lines use box-shadow (not border) so they
+ * never consume flex height and the labels stay vertically centered.
+ */
+.dockview-theme-narrafork .dv-tabs-and-actions-container {
+	background-color: var(--mantine-color-default);
+}
+
+/* Trailing empty area to the right of the tabs: draw the bottom divider so it
+ * continues past the last tab and lines up with the inactive tabs' bottom lines. */
+.dockview-theme-narrafork .dv-void-container {
+	box-shadow: inset 0 -1px 0 var(--mantine-color-default-border);
+}
+
+/*
+ * Reset tab styling to a modern flat tab. All separators are drawn with an inset
+ * box-shadow composed from two segments so a single declaration can carry both a
+ * left vertical divider and a bottom divider without one overriding the other
+ * (box-shadow does not stack across rules — later rules replace the whole value —
+ * so we compose it from per-segment custom properties instead):
+ *   --tab-shadow-left   : the vertical separator on the tab's left edge
+ *   --tab-shadow-bottom : the tab's own bottom divider
+ * Both default to transparent; specific tab states switch them on below.
+ */
+.dockview-theme-narrafork .dv-tab {
+	--tab-shadow-left: 0 0 0 0 transparent;
+	--tab-shadow-bottom: 0 0 0 0 transparent;
+	height: 100%;
+	padding: 0 16px;
+	border: none;
+	background-color: var(--mantine-color-default);
+	box-shadow:
+		inset var(--tab-shadow-left),
+		inset var(--tab-shadow-bottom);
+	transition:
+		background-color 150ms ease,
+		color 150ms ease;
+	display: flex;
+	align-items: center;
+	font-size: var(--dv-tabs-and-actions-container-font-size);
+	cursor: pointer;
+}
+
+/* Vertical separator: every tab except the first draws a line on its LEFT edge,
+ * yielding exactly one boundary between adjacent tabs (N tabs → N-1 separators). */
+.dockview-theme-narrafork .dv-tab:not(:first-child) {
+	--tab-shadow-left: 1px 0 0 0 var(--mantine-color-default-border);
+}
+
+/*
+ * Vertical centering of the label is handled purely by the flex layout above
+ * (display:flex + align-items:center on .dv-tab). We deliberately do NOT override
+ * line-height or add any translateY compensation: with our theme applied to the
+ * shell the strip is an even height and flex centering places the glyphs cleanly,
+ * so a tall inherited line-height (Mantine's ~1.55) is fine and the label stays
+ * centered without magic numbers.
+ */
+
+/*
+ * Active tab: blends into the content area below with NO bottom divider. Its
+ * --tab-shadow-bottom stays transparent (never switched on), so the strip's
+ * bottom line has a clean gap exactly under the active tab. A left separator is
+ * still drawn by the :not(:first-child) rule above when it is not the first tab.
+ */
+.dockview-theme-narrafork .dv-tab.dv-active-tab {
+	background-color: var(--mantine-color-body) !important;
+	color: var(--mantine-color-text) !important;
+	font-weight: 600;
+	position: relative;
+	height: 100% !important;
+}
+
+/* Indigo top active indicator (absolute so it never affects the flex-centered label) */
+.dockview-theme-narrafork .dv-tab.dv-active-tab::before {
+	content: "";
+	position: absolute;
+	top: 0;
+	left: 0;
+	right: 0;
+	height: 2px;
+	background-color: var(--mantine-color-indigo-6);
+	z-index: 10;
+}
+
+/* Inactive tabs: grey background, dimmed text, and their OWN bottom divider so
+ * every non-active tab shows a bottom line (the active tab is the only gap). */
+.dockview-theme-narrafork .dv-tab.dv-inactive-tab {
+	background-color: var(--mantine-color-default);
+	color: var(--mantine-color-dimmed);
+	--tab-shadow-bottom: 0 -1px 0 0 var(--mantine-color-default-border);
+}
+
+/* Add hover feedback to inactive tabs */
+.dockview-theme-narrafork .dv-tab.dv-inactive-tab:hover {
+	background-color: var(--mantine-color-default-hover);
+	color: var(--mantine-color-text);
+}
+
+/* Eliminate dockview's default grey focus outline box (drawn via ::after) that
+ * appears when a tab is clicked/focused, plus the outline fallback. We no longer
+ * repurpose ::after, so this can apply uniformly to all tabs. */
+.dockview-theme-narrafork .dv-tab:focus-within::after,
+.dockview-theme-narrafork .dv-tab:focus::after {
+	display: none !important;
+}
+
+.dockview-theme-narrafork .dv-tab:focus-within,
+.dockview-theme-narrafork .dv-tab:focus {
+	outline: none !important;
+}
+
+/* Tab close button styling: force display instead of visibility: hidden in dockview core */
+.dockview-theme-narrafork .dv-tab .dv-default-tab-action {
+	visibility: visible !important;
+	opacity: 0.3;
+	margin-left: 8px;
+	border-radius: 4px;
+	transition:
+		opacity 150ms ease,
+		background-color 150ms ease;
+}
+
+/* Make active tab action slightly brighter */
+.dockview-theme-narrafork .dv-tab.dv-active-tab .dv-default-tab-action {
+	opacity: 0.6;
+}
+
+/* Action button fully visible on hover */
+.dockview-theme-narrafork .dv-tab .dv-default-tab:hover .dv-default-tab-action,
+.dockview-theme-narrafork .dv-tab .dv-default-tab-action:hover {
+	opacity: 1 !important;
+}
+
+.dockview-theme-narrafork .dv-tab .dv-default-tab-action:hover {
+	background-color: var(--mantine-color-default-hover);
+}

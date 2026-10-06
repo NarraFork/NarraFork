@@ -1,0 +1,155 @@
+.nf-notifications-safe-area[data-position^="top-"] {
+	top: calc(var(--mantine-spacing-md) + env(safe-area-inset-top, 0px));
+}
+
+/*
+ * One vertical height owner, then pure derivation.
+ *
+ * `html` is the only element that names a viewport height. `100dvh` is resolved
+ * by the engine in the same coordinate system as `env(safe-area-inset-*)`, so no
+ * layer has to assume whether `visualViewport.height` includes the insets — the
+ * assumption that made every layer's subtraction land in a different coordinate
+ * system. `--app-viewport-bottom` is published only while the virtual keyboard
+ * occludes the bottom edge, the one occlusion the engine does not fold into
+ * `dvh` (see installAppViewportTracking).
+ *
+ * Everything below fills its parent. Header offset and the bottom inset are
+ * expressed exactly once, as `.nf-app-shell-main`'s padding, so route content
+ * sized `height: 100%` inherits both without repeating either subtraction.
+ */
+html[data-nf-authenticated-app-shell="true"] {
+	height: var(--app-viewport-bottom, 100dvh);
+	max-height: var(--app-viewport-bottom, 100dvh);
+	overflow-y: hidden;
+	overscroll-behavior-y: none;
+}
+
+/*
+ * Installed PWA: `100lvh`, not `100dvh`.
+ *
+ * iOS reports these differently depending on which shell the page runs in. Measured on
+ * an iPhone 11 (896px panel):
+ *
+ *                     standalone (PWA)      Safari browser
+ *   env(inset-top)     48                    0
+ *   env(inset-bottom)  34                    0
+ *   innerHeight        848                   714
+ *   100dvh             848                   714   (== innerHeight in both)
+ *   100lvh             896  (== panel)       796   (panel minus Safari's own chrome)
+ *
+ * In the browser, `100dvh` is right and `100lvh` would overflow behind the toolbar by
+ * 82px. In the PWA there is no retractable chrome, yet `100dvh` still comes back 48px
+ * short — exactly `env(safe-area-inset-top)`, which iOS excludes from the dynamic
+ * viewport. `100lvh` is the panel height there, so the shell reaches the physical bottom
+ * and the home-indicator strip is painted rather than left as a dead band.
+ *
+ * The strip stays clear of content the way it always has: `.nf-app-shell-main`'s
+ * `padding-bottom` and the Navbar's bottom gutter reserve `env(safe-area-inset-bottom)`,
+ * so content and controls sit above the indicator while the background runs under it.
+ *
+ * `--app-viewport-bottom` still wins when present: the keyboard is the one occlusion the
+ * engine folds into neither unit, so the tracker's measured value has to override both.
+ */
+/*
+ * `window-controls-overlay` is a display-mode of its own — the plain `standalone`
+ * query stops matching in exactly the installed mode we prefer on desktop. The
+ * lvh basis must hold there too (on desktop dvh == lvh, so this is consistency,
+ * not a visual change).
+ */
+@media (display-mode: standalone), (display-mode: window-controls-overlay) {
+	html[data-nf-authenticated-app-shell="true"] {
+		height: var(--app-viewport-bottom, 100lvh);
+		max-height: var(--app-viewport-bottom, 100lvh);
+	}
+}
+
+html[data-nf-authenticated-app-shell="true"] body,
+html[data-nf-authenticated-app-shell="true"] body > #root,
+html[data-nf-authenticated-app-shell="true"] .nf-app-shell {
+	height: 100%;
+	max-height: 100%;
+	min-height: 0;
+	overflow-y: hidden;
+	overscroll-behavior-y: none;
+}
+
+html[data-nf-authenticated-app-shell="true"] .nf-app-shell-main {
+	box-sizing: border-box;
+	height: 100%;
+	min-height: 0;
+	overflow-y: auto;
+	overscroll-behavior-y: contain;
+	-webkit-overflow-scrolling: touch;
+}
+
+/*
+ * Overlay surfaces are the second layer that has to name the viewport, for the same
+ * reason the Navbar does (see APP_SHELL_MOBILE_NAVBAR_HEIGHT in lib/safe-area.ts).
+ *
+ * Mantine's ModalBase inner is `position: fixed; top: 0; bottom: 0`, so its
+ * containing block is the initial containing block — not `html`. `bottom: 0` there
+ * is the bottom of the *layout* viewport, which stops tracking `html` the moment
+ * the keyboard shrinks it: `--app-viewport-bottom` becomes 557px while the inner
+ * stays 848px, and every `height: 100%` below it derives from the wrong base. So a
+ * Drawer's own bottom-anchored content is pushed under the keyboard even though the
+ * shell published the right height. Measured on the mobile terminal Drawer at
+ * 414x848 with the keyboard-open height from a real iPhone 11 PWA report: the
+ * TerminalAuxKeys toolbar ended at y=848 against a 557px visible bottom, clipped by
+ * exactly the 291px keyboard.
+ *
+ * `top: 0` plus this height collapses to the visible bottom, and `--app-viewport-
+ * bottom` is published in layout coordinates (visual height plus the visual
+ * viewport's offsetTop) — the same coordinate system `top: 0` resolves in, and the
+ * same one html/body/#root/.nf-app-shell are already sized from.
+ *
+ * `bottom: auto` is defensive, not load-bearing: measured on Chromium, `height` wins
+ * over the inherited `bottom: 0` either way (identical 557px with and without it).
+ * It is kept so the box is never over-constrained between `top`, `bottom` and
+ * `height`, rather than depending on which of the three a given engine drops.
+ *
+ * Panels inside keep deriving with `height: 100%` and must not subtract the
+ * keyboard themselves; this rule is what makes that derivation correct again.
+ *
+ * Scoped to Drawer only, deliberately. Modal shares the same ModalBase `inner`, but
+ * a Modal's content is centred or top-offset *within* that box rather than filling
+ * it, so shrinking the box moves content instead of resizing it: measured on a
+ * `centered` Modal taller than the keyboard-open viewport, the same declarations
+ * moved its top edge from y=86 to y=-59.5, spilling off the top where it cannot be
+ * scrolled back — strictly worse than the bottom-only overhang it replaced. The one
+ * Modal that must track the visible bottom is the fullscreen viewer, and it already
+ * names APP_VIEWPORT_BOTTOM in its own content style (verified unchanged at 557px
+ * with the keyboard up, with and without this rule).
+ */
+html[data-nf-authenticated-app-shell="true"] .mantine-Drawer-inner {
+	bottom: auto;
+	height: var(--app-viewport-bottom, 100dvh);
+	max-height: var(--app-viewport-bottom, 100dvh);
+}
+
+/*
+ * Narrow screens: the director surface rides up over the virtual keyboard
+ * instead of being squeezed by it.
+ *
+ * The shell-level response to `--app-viewport-bottom` shrinks every layer, which
+ * is right for scrollable pages but wrong for the director surface: its primary
+ * panel and preview rail are sized from their own box, so a shrunken box
+ * compresses both. On mobile widths the surface instead keeps its pre-keyboard
+ * height — the component grows its own box by `--nf-director-keyboard-lift` and
+ * shifts its top edge up by the same amount, so the bottom edge (the composer)
+ * stays exactly on the keyboard while the excess slides off the top, clipped by
+ * the parent. `data-virtual-keyboard-open` and `--app-keyboard-occlusion` are
+ * published together by installAppViewportTracking, so the lift is 0 at rest and
+ * this rule alone decides when a nonzero lift can apply.
+ *
+ * 48em is Mantine's `sm` breakpoint (see MOBILE_VIEWPORT_MEDIA_QUERY in
+ * lib/responsive.ts — the JS definition of "mobile viewport" this mirrors).
+ */
+.nf-director-layout {
+	--nf-director-keyboard-lift: 0px;
+}
+
+@media not all and (min-width: 48em) {
+	html[data-virtual-keyboard-open] .nf-director-layout {
+		--nf-director-keyboard-lift: var(--app-keyboard-occlusion, 0px);
+	}
+}

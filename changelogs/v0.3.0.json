@@ -1,0 +1,6 @@
+{
+	"version": "0.3.0",
+	"date": "2026-05-02",
+	"en": "## New Features\n\n- Add persistent narrator goal queues with slash commands, agent tools, automatic continuation, and a queued-message-style UI.\n- Add an inline tool call inspector that shows inputs, outputs, status, and timing details directly in narrator messages.\n- Add rollback-to-block context menus across all interactive narrator message block types.\n\n## Bug Fixes\n\n- Improve streaming event handling for degenerate reasoning responses and preserve parent tool context for streamed web search and image generation events.\n- Harden narrator goal continuation against duplicate concurrent starts and preserve paused goal state when reordering.\n- Strengthen YOLO permission safety checks for destructive git path restores and other high-risk commands.\n\n## Other Changes\n\n- Remove the legacy Overseer flow in favor of inline tool inspection and permission handling.",
+	"zh-CN": "## 新功能\n\n- 新增持久化叙述者目标队列，支持 slash 命令、agent 工具、自动延续和类似排队消息的界面。\n- 新增内联工具调用检查器，可直接在叙述者消息中查看输入、输出、状态和耗时细节。\n- 为所有可交互的叙述者消息 block 补齐“回退到此处”上下文菜单。\n\n## 修复\n\n- 改进流式事件处理，兼容异常 reasoning 响应，并保留 web search 与图像生成流式事件的父工具上下文。\n- 修复目标自动延续可能并发重复启动的问题，并在拖拽排序目标时保留暂停状态。\n- 强化 YOLO 权限安全检查，覆盖破坏性的 git 路径恢复和其他高风险命令。\n\n## 其他变更\n\n- 移除旧版 Overseer 流程，改由内联工具检查与权限处理承接。"
+}

@@ -1,0 +1,6 @@
+{
+	"version": "0.4.20",
+	"date": "2026-06-10",
+	"en": "## New Features\n\n- Added Codex provider controls for reasoning effort, WebSocket mode, web search, image generation, tier ordering, and unhealthy credential cleanup.\n- Expanded Go backend parity coverage with explicit runtime capability contracts, route/service fixtures, Git panel replacement boundaries, and lifecycle smoke tests.\n- Improved narrator question flows with reflection settings, stricter schema validation, legacy answer recovery, and clearer read-only displays.\n- Hardened frontend runtime resilience for Git and Review panels, graph refresh, recent tabs, WebSocket catch-up, DOM mutation safety, avatar/audio caches, and Markdown/Pixi rendering.\n\n## Bug Fixes\n\n- Fixed Pixi icon texture reload races and read-only question option matching when option labels contain commas.\n- Improved subagent interrupt handling and max-turn/error propagation with focused regression coverage.",
+	"zh-CN": "## 新功能\n\n- 增加 Codex Provider 控制项，支持 reasoning effort、WebSocket 模式、联网搜索、图像生成、套餐排序和异常凭证清理。\n- 扩展 Go 后端 parity 覆盖，补充明确的运行时能力契约、路由/服务夹具、Git 面板替换边界和生命周期冒烟测试。\n- 改进叙述者提问流程，加入反思设置、更严格的 schema 校验、旧答案恢复和更清晰的只读展示。\n- 强化前端运行时稳定性，覆盖 Git/Review 面板、图刷新、最近标签、WebSocket 补拉、DOM 变更防护、头像/音效缓存以及 Markdown/Pixi 渲染。\n\n## 修复\n\n- 修复 Pixi 图标纹理重载竞态，以及只读问题展示中带逗号选项无法正确匹配的问题。\n- 改进子代理中断处理和 max-turn/error 传播，并补充针对性回归测试。"
+}

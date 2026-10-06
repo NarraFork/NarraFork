@@ -1,0 +1,6 @@
+{
+	"version": "0.4.1",
+	"date": "2026-05-06",
+	"en": "## New Features\n\n- Improved narrator runtime controls and Codex usage balancing for more predictable agent sessions.",
+	"zh-CN": "## 新功能\n\n- 改进叙述者运行时控制和 Codex 用量均衡，让 Agent 会话更稳定可控。"
+}

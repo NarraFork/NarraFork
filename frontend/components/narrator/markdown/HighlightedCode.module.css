@@ -1,0 +1,45 @@
+.root {
+	border-radius: var(--mantine-radius-sm);
+	background-color: var(--mantine-color-body);
+	border: 1px solid var(--mantine-color-default-border);
+	overflow: hidden;
+	padding: var(--mantine-spacing-xs);
+	font-family: var(--mantine-font-family-monospace);
+	font-size: 11px;
+	line-height: 1.55;
+	white-space: pre-wrap;
+	word-break: break-word;
+	overflow-wrap: break-word;
+
+	pre {
+		margin: 0;
+		padding: 0;
+		font-family: inherit;
+		font-size: inherit;
+		line-height: inherit;
+		white-space: inherit;
+		word-break: inherit;
+		overflow-wrap: inherit;
+		tab-size: 4;
+		/* Shiki emits an inline background-color on <pre>; overriding it requires
+		   !important so the block's own .root background shows through. */
+		/* biome-ignore lint/complexity/noImportantStyles: shiki emits inline styles */
+		background: transparent !important;
+
+		code {
+			font-family: inherit;
+			font-size: inherit;
+			background: none;
+
+			span {
+				white-space: inherit;
+			}
+		}
+	}
+}
+
+/* Light mode: --mantine-color-body is white and blends into the message
+   background, so the code block loses its visible boundary. Use a subtle gray. */
+:root[data-mantine-color-scheme="light"] .root {
+	background-color: var(--mantine-color-gray-1);
+}

@@ -1,0 +1,250 @@
+{
+  "note": "Baseline uses original cases 1/2/3/5/6 plus both models corrected-help case 4; not best-of selection. v3 and v4 are separate complete runs. Strict/output rules unchanged.",
+  "baselineApiChars": 1467,
+  "baseline": [
+    {
+      "model": "nug2:antigravity:gemini-3.7-flash",
+      "strict": 6,
+      "business": 6,
+      "evals": 17,
+      "helps": 3,
+      "responses": 22,
+      "inputTokens": 29812,
+      "outputTokens": 4594,
+      "feedbackChars": 3215
+    },
+    {
+      "model": "nugjp:codex:gpt-5.6-luna",
+      "strict": 5,
+      "business": 6,
+      "evals": 17,
+      "helps": 1,
+      "responses": 22,
+      "inputTokens": 22193,
+      "outputTokens": 1212,
+      "feedbackChars": 1692
+    }
+  ],
+  "baselineRows": [
+    {
+      "model": "nug2:antigravity:gemini-3.7-flash",
+      "case": "1",
+      "evals": 2,
+      "helps": 0,
+      "strict": true,
+      "file": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T09-34-44-554Z-flash-1.json"
+    },
+    {
+      "model": "nug2:antigravity:gemini-3.7-flash",
+      "case": "2",
+      "evals": 1,
+      "helps": 0,
+      "strict": true,
+      "file": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T09-34-44-554Z-flash-2.json"
+    },
+    {
+      "model": "nug2:antigravity:gemini-3.7-flash",
+      "case": "3",
+      "evals": 3,
+      "helps": 0,
+      "strict": true,
+      "file": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T09-34-44-554Z-flash-3.json"
+    },
+    {
+      "model": "nug2:antigravity:gemini-3.7-flash",
+      "case": "5",
+      "evals": 3,
+      "helps": 0,
+      "strict": true,
+      "file": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T09-34-44-554Z-flash-5.json"
+    },
+    {
+      "model": "nug2:antigravity:gemini-3.7-flash",
+      "case": "6",
+      "evals": 3,
+      "helps": 2,
+      "strict": true,
+      "file": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T09-34-44-554Z-flash-6.json"
+    },
+    {
+      "model": "nugjp:codex:gpt-5.6-luna",
+      "case": "1",
+      "evals": 3,
+      "helps": 0,
+      "strict": true,
+      "file": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T09-34-44-554Z-luna-1.json"
+    },
+    {
+      "model": "nugjp:codex:gpt-5.6-luna",
+      "case": "2",
+      "evals": 1,
+      "helps": 0,
+      "strict": true,
+      "file": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T09-34-44-554Z-luna-2.json"
+    },
+    {
+      "model": "nugjp:codex:gpt-5.6-luna",
+      "case": "3",
+      "evals": 1,
+      "helps": 0,
+      "strict": true,
+      "file": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T09-34-44-554Z-luna-3.json"
+    },
+    {
+      "model": "nugjp:codex:gpt-5.6-luna",
+      "case": "5",
+      "evals": 4,
+      "helps": 0,
+      "strict": true,
+      "file": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T09-34-44-554Z-luna-5.json"
+    },
+    {
+      "model": "nugjp:codex:gpt-5.6-luna",
+      "case": "6",
+      "evals": 5,
+      "helps": 1,
+      "strict": false,
+      "file": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T09-34-44-554Z-luna-6.json"
+    },
+    {
+      "model": "nug2:antigravity:gemini-3.7-flash",
+      "case": "4",
+      "evals": 5,
+      "helps": 1,
+      "strict": true,
+      "file": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T09-53-49-584Z-flash-4.json"
+    },
+    {
+      "model": "nugjp:codex:gpt-5.6-luna",
+      "case": "4",
+      "evals": 3,
+      "helps": 0,
+      "strict": true,
+      "file": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T09-53-49-584Z-luna-4.json"
+    }
+  ],
+  "v3": [
+    {
+      "model": "nug2:antigravity:gemini-3.7-flash",
+      "cases": 6,
+      "correctedStrictPass": 6,
+      "recoveredBusinessPass": 6,
+      "firstEvalGoalPass": 2,
+      "firstEvalExecuted": 6,
+      "evals": 12,
+      "helps": 1,
+      "responses": 18,
+      "interfaceViolations": 0,
+      "allWireLowAndEvalOnly": true,
+      "allWireMatchesFrozenDescriptions": true,
+      "readCalls": 5,
+      "bashCalls": 3,
+      "repeatCandidates": {
+        "read": 1,
+        "Bash": 0,
+        "finish": 0
+      },
+      "codeChars": 2335,
+      "feedbackChars": 1592,
+      "inputTokens": 30444,
+      "outputTokens": 6104
+    },
+    {
+      "model": "nugjp:codex:gpt-5.6-luna",
+      "cases": 6,
+      "correctedStrictPass": 5,
+      "recoveredBusinessPass": 5,
+      "firstEvalGoalPass": 3,
+      "firstEvalExecuted": 6,
+      "evals": 10,
+      "helps": 0,
+      "responses": 16,
+      "interfaceViolations": 0,
+      "allWireLowAndEvalOnly": true,
+      "allWireMatchesFrozenDescriptions": true,
+      "readCalls": 6,
+      "bashCalls": 3,
+      "repeatCandidates": {
+        "read": 2,
+        "Bash": 0,
+        "finish": 0
+      },
+      "codeChars": 1473,
+      "feedbackChars": 1707,
+      "inputTokens": 19648,
+      "outputTokens": 1004
+    }
+  ],
+  "v4": [
+    {
+      "model": "nug2:antigravity:gemini-3.7-flash",
+      "cases": 6,
+      "correctedStrictPass": 5,
+      "recoveredBusinessPass": 5,
+      "firstEvalGoalPass": 1,
+      "firstEvalExecuted": 6,
+      "evals": 14,
+      "helps": 2,
+      "responses": 19,
+      "interfaceViolations": 0,
+      "allWireLowAndEvalOnly": true,
+      "allWireMatchesFrozenDescriptions": true,
+      "readCalls": 6,
+      "bashCalls": 3,
+      "repeatCandidates": {
+        "read": 2,
+        "Bash": 0,
+        "finish": 0
+      },
+      "codeChars": 2591,
+      "feedbackChars": 2796,
+      "inputTokens": 36541,
+      "outputTokens": 7207
+    },
+    {
+      "model": "nugjp:codex:gpt-5.6-luna",
+      "cases": 6,
+      "correctedStrictPass": 5,
+      "recoveredBusinessPass": 5,
+      "firstEvalGoalPass": 3,
+      "firstEvalExecuted": 6,
+      "evals": 9,
+      "helps": 0,
+      "responses": 15,
+      "interfaceViolations": 0,
+      "allWireLowAndEvalOnly": true,
+      "allWireMatchesFrozenDescriptions": true,
+      "readCalls": 5,
+      "bashCalls": 3,
+      "repeatCandidates": {
+        "read": 1,
+        "Bash": 0,
+        "finish": 0
+      },
+      "codeChars": 1927,
+      "feedbackChars": 1024,
+      "inputTokens": 19569,
+      "outputTokens": 1071
+    }
+  ],
+  "audit": [
+    {
+      "runId": "2026-09-06T11-40-20-915Z",
+      "episodes": 12,
+      "requests": 34,
+      "apiChars": 1789,
+      "descriptionChars": 204,
+      "sourceAndInputHashesPass": true,
+      "graderHash": "9dca713be6015bb951fbf903663d10dcf08025fdc15b94e5906a5144d91b9398"
+    },
+    {
+      "runId": "2026-09-06T11-54-55-805Z",
+      "episodes": 12,
+      "requests": 34,
+      "apiChars": 2012,
+      "descriptionChars": 231,
+      "sourceAndInputHashesPass": true,
+      "graderHash": "9dca713be6015bb951fbf903663d10dcf08025fdc15b94e5906a5144d91b9398"
+    }
+  ]
+}

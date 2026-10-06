@@ -1,0 +1,6 @@
+{
+	"version": "0.5.5",
+	"date": "2026-07-12",
+	"en": "## New Features\n\n- Reasoning effort now follows one global default and is automatically clamped to each model's supported levels; narrator controls can follow the default or promote an override to become the new default.\n- Completed subagent conversations now load their message trees on demand with cursor pagination, while active subagents continue updating live.\n- Codex/GPT-5.6 reasoning summaries are now presented as a compact, expandable step trace.\n\n## Bug Fixes\n\n- Added support for Codex monthly quota windows so monthly limits and coverage are displayed correctly.\n- Adjacent interleaved reasoning blocks now render and behave as one trace, including correct selection, copy, deletion, rollback, streaming shimmer, and encrypted-content notices.\n- Returning to a long-backgrounded or restored tab now recovers narrator connections without leaving the page stuck in a paused state, while preserving reconnect backoff.",
+	"zh-CN": "## 新功能\n\n- 思考强度统一跟随一个全局默认值，并按模型支持范围自动调整；叙述者可选择跟随默认，或将当前覆盖值设为新的全局默认。\n- 已结束的子代理会话改为按需分页加载消息树，仍在运行的子代理继续保持实时更新。\n- Codex/GPT-5.6 的推理摘要现在以紧凑、可展开的步骤轨迹展示。\n\n## 修复\n\n- 支持 Codex 月度配额窗口，月度限额和覆盖情况现在可以正确展示。\n- 连续交错的推理块现在作为一条完整轨迹展示和操作，选择、复制、删除、回滚、流式闪烁及加密内容提示均保持一致。\n- 标签页长时间处于后台或从浏览器冻结状态恢复后，叙述者连接可自动恢复，不再停留在暂停页面，同时保留重连退避机制。"
+}

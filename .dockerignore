@@ -1,0 +1,13 @@
+node_modules
+dist
+.git
+*.db
+*.db-shm
+*.db-wal
+drizzle/meta
+.env
+.env.*
+*.log
+.vscode
+.idea
+.narrafork

@@ -1,0 +1,66 @@
+Launch a new agent to handle tasks that genuinely benefit from an isolated context.
+
+IMPORTANT — This tool is expensive and slow. Do NOT use it casually. You already have Read, Glob, Grep, Bash, and WebSearch available directly. Use those first. Only spawn a subagent when the task meets one of the criteria below.
+
+Available agent types:
+- explore: Isolated read-only agent for codebase exploration. Tools: Read, Glob, Grep, WebSearch, Bash
+- plan: Software architect agent for designing implementation plans. Tools: Read, Glob, Grep, WebSearch, Bash
+- search: Focused read-only web research agent. Tools: provider-native WebSearch and WebFetch; it does not inspect or modify local files.
+- general: General-purpose agent with write access. It can use the standard coding and coordination tools exposed to subagents (including Bash, Read, Write, Edit, Glob, Grep, Send, and TeamStatus), but cannot launch another Agent.
+- review: Read-only review follow-up agent. Tools: Read, Glob, Grep, WebSearch, WebFetch, and necessary coordination tools; it must not modify files or require ConcludeReview.
+- Custom types: Users can define custom subagent types with specialized prompts and tool access. Use the custom type name as the subagent_type value. Custom types have their own system prompts and tool permissions configured by the user.
+
+When to use each type:
+
+explore — ONLY for these situations:
+  1. Cross-module investigation: you need to trace logic across many files/modules and the search space is large enough that it would flood your own context with irrelevant content
+  2. Needle-in-haystack: you need to find a few critical pieces of information buried in a large codebase, and you want to avoid polluting your main context with all the intermediate search results
+  3. Exploratory trial-and-error: you're unsure which files or patterns are relevant and need to try multiple search strategies — offloading this keeps your context clean
+  If you already know which file to read, or can find what you need with a single Grep/Glob call, do it yourself. Do NOT use explore as a shortcut for simple lookups.
+
+plan — ONLY when you are in plan mode (EnterPlanMode). Do not spawn a plan subagent outside of plan mode. Use it to delegate architectural analysis of a specific subsystem while you focus on the broader design.
+
+general — For delegating self-contained subtasks that require file modifications, multi-step operations, or complex research that would clutter your main context. The subtask should be well-defined and independent enough to complete without back-and-forth.
+
+search — For a focused web research question with a clear purpose. Keep the assignment limited to web sources; do not ask this type to inspect or modify local files.
+
+review — For a read-only follow-up review of an assigned diff or finding. It may inspect context with Read/Glob/Grep and web tools when necessary, but must not edit files, run implementation work, or require ConcludeReview.
+
+When NOT to use the Agent tool:
+- Reading a specific file → use Read directly
+- Reading full contents of known files → use Read directly, NEVER delegate this to a subagent
+- Searching for a class/function definition → use Glob or Grep directly
+- Searching for code within a known file → use Read directly
+- Any task you can accomplish in 1-3 tool calls → do it yourself
+- Gathering context for a simple bug fix or small change → do it yourself
+
+CRITICAL — Subagents exist to FILTER and DISTILL information, not to relay it verbatim. Never instruct a subagent to return full file contents back to you. If you need the complete content of files, read them yourself. A subagent that returns full file contents defeats its entire purpose — it wastes time and tokens while providing zero context reduction. When using explore, your prompt should ask for specific answers, summaries, or relevant snippets — not raw file dumps.
+
+User takeover at creation:
+- Use takeover_by_user: true when creating a subagent specifically for the user to continue discussing or interacting with it.
+- The subagent enters user takeover mode immediately and still executes its initial prompt. The Agent call returns immediately, even without run_in_background: true.
+- Completing a turn does NOT notify or wake the parent. The subagent remains taken over, waiting for further user interaction, until the user explicitly ends takeover.
+- Do NOT automatically Await a user-taken-over agent or treat its turn completion as a delegated task result.
+
+Working directory:
+- By default, subagents inherit the parent narrator's working directory
+- Use the `workdir` parameter to run a subagent in a different directory
+- When workdir differs from the parent's cwd, user approval is required before the subagent is created
+- Once created, the subagent's permission checks (path boundaries, etc.) are scoped to its own workdir
+
+Usage notes:
+- Launch multiple agents concurrently whenever possible by using a single message with multiple tool uses
+- When the agent is run in foreground, it will return a single message back to you with its findings/results
+- When the agent is run in background, use `Await({ type: "agent", id })` to get results and `Send({ id, message })` to send follow-up instructions
+- Each agent invocation starts with a fresh context. Provide a highly detailed task description so the agent can work autonomously
+- Use `reasoning_effort` to request subagent thinking intensity (`none`, `low`, `medium`, `high`, `xhigh`); models/providers without a configurable thinking option will ignore it
+- The agent's outputs should generally be trusted
+- Clearly tell the agent whether you expect it to write code or just to do research
+
+Coordination discipline:
+- Give subagents uninterrupted time to work. Non-trivial investigation, implementation, and testing often take longer than 30 seconds; an Await timeout only means that wait ended, not that the subagent is stuck. If Await reports recent tool activity, treat that as evidence of progress and keep waiting with Await.
+- Use Await when you need task completion. Only a primary narrator may use `Send({ ..., await: true })` for a direct message reply; subagents must always use asynchronous Send and must never wait for a parent or sibling reply.
+- When you only need a targeted answer from a subagent's existing persisted context, use ContextAsk instead of Send. ContextAsk reads through the summary model without messaging, waking, interrupting, or modifying the target; use Send only to deliver new information, requirements, or corrections.
+- Do not Send status-check or hurry-up messages after a short wait. Send only when you have new information, changed requirements, or a concrete correction that the subagent needs.
+- Never ask a working subagent to "stop immediately and summarize" merely because an Await timed out or you are impatient. That discards completed context and wastes resources.
+- `doInterrupt` is exceptional: use it only when the current work must stop immediately because it is clearly wrong/unsafe, conflicts with new user instructions, or the user explicitly requested interruption. Never use it as routine progress polling.

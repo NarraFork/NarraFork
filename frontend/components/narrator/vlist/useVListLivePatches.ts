@@ -1,0 +1,543 @@
+/**
+ * useVListLivePatches.ts — Subscribes the exact vlist to the LIVE LIFECYCLE
+ * events the shell previously ignored, and applies them as coalesced in-place
+ * document patches.
+ *
+ * The gap this closes
+ * -------------------
+ * The exact shell only listened for STRUCTURAL events (message added / edited /
+ * deleted) and answered each with a full document refetch. But a tool call
+ * finishing and a reflection gate resolving mutate an already-loaded message
+ * without re-broadcasting it — and reflections do not even bump `messageVersion`.
+ * With no subscription and no structural signal, a completed tool rendered as
+ * "running" and a resolved reflection as "reflecting" indefinitely.
+ *
+ * Design
+ * ------
+ * - Every event is translated to a pure patch (vlist-live-events.ts) and pushed
+ *   onto a queue drained once per animation frame. A turn that completes several
+ *   tools at once therefore costs ONE document rebuild, not one per event.
+ * - Nothing here refetches. The patch keeps `messageVersion` and the message
+ *   count fixed, so the rebuild reuses every untouched card's cached measurement.
+ * - Deliberately NOT handled: `tool_use_chunk` / `tool_output`. Those fire at
+ *   streaming frequency; routing them through the document would rebuild the
+ *   whole layout per chunk. They belong to the streaming tail instead.
+ *
+ * Subagent routing follows the same rule as the chunked path: on a parent page a
+ * child tool event only updates the parent card's activity summary, while on the
+ * subagent's OWN page those same events are its top-level tools.
+ */
+
+import { useNarratorWS } from "@frontend/hooks/useNarratorWS";
+import type { SubagentActivityCatchUp, TreeMessage } from "@frontend/lib/api";
+import { useCallback, useEffect, useMemo, useRef } from "react";
+import {
+	awaitAgentResolvedPatch,
+	backgroundTaskPatch,
+	permissionRequestedPatch,
+	permissionResolvedPatch,
+	type ReflectionKind,
+	reflectionResolvedPatch,
+	reflectionStartedPatch,
+	reflectionStoppedPatch,
+	sendDeliveryResolvedPatch,
+	subagentActivityPatch,
+	subagentConclusionPatch,
+	subagentTakeoverPatch,
+	timeoutUpdatedPatch,
+	toolCompletedPatch,
+	toolExecutingPatch,
+	toolStartedPatch,
+} from "./vlist-live-events";
+import {
+	type LivePatch,
+	LivePatchQueue,
+	patchSubagentActivitySnapshots,
+	patchSubagentIdentity,
+	patchSubagentTakeoverByNarrator,
+} from "./vlist-live-patch";
+
+export interface UseVListLivePatchesOptions {
+	/** Only subscribe once a complete document exists to patch. */
+	enabled: boolean;
+	/** A subagent page treats its own (parent-pointing) tool events as top-level. */
+	isSubagent: boolean;
+	/** Apply a patch to the loaded document; returns true when it changed something. */
+	applyLivePatch: (
+		patch: (messages: readonly TreeMessage[]) => {
+			readonly messages: readonly TreeMessage[];
+			changed: boolean;
+		},
+	) => boolean;
+	/** Revalidate when a terminal event arrived before its message was loaded. */
+	onUnappliedToolCompletion?: () => void;
+}
+
+/**
+ * Fallback wording when a gate reports no reason. Kept byte-identical to the
+ * chunked path so both lists show the same text for the same event.
+ */
+const REFLECTION_FALLBACK: Record<ReflectionKind, { started: string; stopped: string }> = {
+	danger_reflection: {
+		started: "Danger reflection in progress",
+		stopped: "Danger reflection stopped; awaiting user decision",
+	},
+	plan_reflection: {
+		started: "Plan reflection in progress",
+		stopped: "Plan reflection stopped; awaiting user decision",
+	},
+	task_reflection: {
+		started: "Task reflection in progress",
+		stopped: "Task reflection stopped; awaiting user decision",
+	},
+	question_reflection: {
+		started: "Question reflection in progress",
+		stopped: "Question reflection stopped; awaiting user decision",
+	},
+};
+
+/** Danger reflections describe themselves through a `danger.summary` payload. */
+function dangerStartedReason(danger: unknown): string {
+	if (danger && typeof danger === "object" && "summary" in danger) {
+		return `Danger reflection: ${String((danger as { summary?: unknown }).summary ?? "")}`;
+	}
+	return REFLECTION_FALLBACK.danger_reflection.started;
+}
+
+export function useVListLivePatches(
+	narratorId: string | undefined,
+	options: UseVListLivePatchesOptions,
+): void {
+	const { enabled, isSubagent, applyLivePatch, onUnappliedToolCompletion } = options;
+	const applyRef = useRef(applyLivePatch);
+	applyRef.current = applyLivePatch;
+	/**
+	 * Completions that arrived before their tool_use was loaded.
+	 *
+	 * A `tool_completed` patch is a pure merge by toolUseId; when the assistant
+	 * message has not landed yet the patch reports no-change and would otherwise
+	 * be dropped. The spinner then stays on that call until the NEXT tool's
+	 * structural reload — the "status lags by one tool call" symptom. Replay them
+	 * when a message event indicates the document may now own the tool.
+	 */
+	const pendingCompletionsRef = useRef(new Map<string, LivePatch>());
+	// Read fresh on every enqueue AND every flush: the queue rejects a batch whose
+	// narrator changed between the two (see LivePatchQueue for why the effect
+	// cleanup alone cannot cover that window).
+	const narratorRef = useRef<string | undefined>(narratorId);
+	narratorRef.current = narratorId;
+
+	const queueRef = useRef<LivePatchQueue | null>(null);
+	if (!queueRef.current) {
+		queueRef.current = new LivePatchQueue({
+			currentNarratorId: () => narratorRef.current,
+			apply: (patch) => applyRef.current(patch),
+			schedule: (drain) =>
+				typeof requestAnimationFrame === "function"
+					? requestAnimationFrame(drain)
+					: (setTimeout(drain, 0) as unknown as number),
+			cancel: (handle) => {
+				if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(handle);
+				else clearTimeout(handle);
+			},
+		});
+	}
+
+	const enqueue = useCallback((patch: LivePatch | null, onMiss?: () => void) => {
+		queueRef.current?.enqueue(patch, onMiss);
+	}, []);
+
+	/** Enqueue a completion, remembering it when the tool is not loaded yet. */
+	const enqueueCompletion = useCallback(
+		(toolUseId: string, patch: LivePatch) => {
+			enqueue((messages) => {
+				const result = patch(messages);
+				if (!result.changed) {
+					pendingCompletionsRef.current.set(toolUseId, patch);
+					return result;
+				}
+				pendingCompletionsRef.current.delete(toolUseId);
+				return result;
+			}, onUnappliedToolCompletion);
+		},
+		[enqueue, onUnappliedToolCompletion],
+	);
+
+	/** Replay completions that missed while their tool_use was still unloaded. */
+	const replayPendingCompletions = useCallback(() => {
+		if (pendingCompletionsRef.current.size === 0) return;
+		for (const [toolUseId, patch] of pendingCompletionsRef.current) {
+			enqueue((messages) => {
+				const result = patch(messages);
+				if (result.changed) pendingCompletionsRef.current.delete(toolUseId);
+				return result;
+			});
+		}
+	}, [enqueue]);
+
+	// Drop anything still queued on unmount / narrator switch: those patches target
+	// a document this hook no longer owns. narratorId/enabled are cleanup TRIGGERS
+	// (not values the effect reads), so they must stay in the dependency list.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset triggers
+	useEffect(() => {
+		return () => {
+			pendingCompletionsRef.current.clear();
+			queueRef.current?.dispose();
+		};
+	}, [narratorId, enabled]);
+
+	/**
+	 * Resolve where a tool event belongs. On a parent page an event carrying a
+	 * parentToolUseId describes a CHILD tool, so it may only touch the parent
+	 * card's activity summary; on the subagent's own page the parent pointer is
+	 * noise and the event is top-level.
+	 */
+	const routeParent = useCallback(
+		(rawParentToolUseId?: string) => (isSubagent ? undefined : rawParentToolUseId),
+		[isSubagent],
+	);
+
+	const reflectionHandlers = useMemo(
+		() => ({
+			started:
+				(kind: ReflectionKind) =>
+				(event: {
+					requestId: string;
+					toolUseId: string;
+					reason?: string;
+					danger?: unknown;
+					mutations?: unknown;
+					inputJson?: Record<string, unknown>;
+				}) => {
+					enqueue(
+						reflectionStartedPatch({
+							kind,
+							toolUseId: event.toolUseId,
+							requestId: event.requestId,
+							...(event.reason !== undefined ? { reason: event.reason } : {}),
+							...(event.danger !== undefined ? { danger: event.danger } : {}),
+							...(event.mutations !== undefined ? { mutations: event.mutations } : {}),
+							...(event.inputJson ? { inputJson: event.inputJson } : {}),
+							fallbackReason:
+								kind === "danger_reflection"
+									? dangerStartedReason(event.danger)
+									: REFLECTION_FALLBACK[kind].started,
+						}),
+					);
+				},
+			stopped:
+				(kind: ReflectionKind) =>
+				(event: {
+					requestId: string;
+					toolUseId: string;
+					reason?: string;
+					danger?: unknown;
+					mutations?: unknown;
+					inputJson?: Record<string, unknown>;
+				}) => {
+					enqueue(
+						reflectionStoppedPatch({
+							kind,
+							toolUseId: event.toolUseId,
+							requestId: event.requestId,
+							...(event.reason !== undefined ? { reason: event.reason } : {}),
+							...(event.danger !== undefined ? { danger: event.danger } : {}),
+							...(event.mutations !== undefined ? { mutations: event.mutations } : {}),
+							...(event.inputJson ? { inputJson: event.inputJson } : {}),
+							fallbackReason: REFLECTION_FALLBACK[kind].stopped,
+						}),
+					);
+				},
+			resolved:
+				(kind: ReflectionKind) =>
+				(event: {
+					requestId: string;
+					toolUseId: string;
+					decision: string;
+					reason?: string;
+					nextSteps?: string;
+				}) => {
+					enqueue(
+						reflectionResolvedPatch({
+							kind,
+							toolUseId: event.toolUseId,
+							requestId: event.requestId,
+							decision: event.decision,
+							...(event.reason !== undefined ? { reason: event.reason } : {}),
+							...(event.nextSteps !== undefined ? { nextSteps: event.nextSteps } : {}),
+						}),
+					);
+				},
+		}),
+		[enqueue],
+	);
+
+	useNarratorWS(
+		enabled ? narratorId : undefined,
+		{
+			// ── Tool lifecycle ──────────────────────────────────────────────────
+			onToolStarted: (
+				toolUseId,
+				toolName,
+				streamStartedAt,
+				streamCompletedAt,
+				input,
+				rawParent,
+				meta,
+				streamingEditOrigin,
+			) => {
+				const parentToolUseId = routeParent(rawParent);
+				if (parentToolUseId) {
+					enqueue(
+						subagentActivityPatch({
+							parentToolUseId,
+							toolUseId,
+							toolName,
+							status: "running",
+							toolCallId: meta?.toolCallId ?? null,
+							createdAt: meta?.createdAt ?? null,
+							timing: meta?.timing ?? null,
+							subagentNarratorId: meta?.subagentNarratorId ?? null,
+							model: meta?.model ?? null,
+							inputSummary: meta?.inputSummary ?? null,
+						}),
+					);
+					return;
+				}
+				enqueue(
+					toolStartedPatch({
+						toolUseId,
+						...(streamStartedAt != null ? { streamStartedAt } : {}),
+						...(streamCompletedAt != null ? { streamCompletedAt } : {}),
+						...(input ? { input } : {}),
+						...(streamingEditOrigin ? { streamingEditOrigin } : {}),
+					}),
+				);
+			},
+			onStreamingSnapshot: (snapshot) => {
+				for (const chunk of snapshot.toolChunks) {
+					if ((!isSubagent && chunk.parentToolUseId) || !chunk.started) continue;
+					enqueue(
+						toolStartedPatch({
+							toolUseId: chunk.toolUseId,
+							input: chunk.input as Record<string, unknown> | undefined,
+							streamStartedAt: chunk.streamStartedAt,
+							streamingEditOrigin: chunk.streamingEditOrigin,
+						}),
+					);
+					if (chunk.executing) enqueue(toolExecutingPatch(chunk.toolUseId));
+				}
+			},
+			onToolCompleted: (
+				toolUseId,
+				status,
+				output,
+				durationMs,
+				updatedInput,
+				metadata,
+				rawParent,
+				meta,
+			) => {
+				const parentToolUseId = routeParent(rawParent);
+				if (parentToolUseId) {
+					enqueue(
+						subagentActivityPatch({
+							parentToolUseId,
+							toolUseId,
+							toolName: meta?.toolName ?? "Tool",
+							status,
+							toolCallId: meta?.toolCallId ?? null,
+							createdAt: meta?.createdAt ?? null,
+							timing: meta?.timing ?? null,
+							subagentNarratorId: meta?.subagentNarratorId ?? null,
+							model: meta?.model ?? null,
+							inputSummary: meta?.inputSummary ?? null,
+						}),
+					);
+					return;
+				}
+				enqueueCompletion(
+					toolUseId,
+					toolCompletedPatch({
+						toolUseId,
+						status,
+						output,
+						...(durationMs != null ? { durationMs } : {}),
+						...(updatedInput ? { updatedInput } : {}),
+						...(metadata ? { metadata } : {}),
+					}),
+				);
+			},
+
+			// The header's timeout editor commits over WS and the server answers with
+			// `timeout_updated`. Without this the popover closed and the suffix kept
+			// showing the OLD deadline until an unrelated reload — the change had taken
+			// effect on the server, only the card was lying about it.
+			//
+			// No subagent routing: the event carries no parentToolUseId, and the
+			// activity summary rows have no timeout to show.
+			onTimeoutUpdated: (toolUseId, timeoutMs) => {
+				if (!toolUseId) return;
+				enqueue(timeoutUpdatedPatch({ toolUseId, timeoutMs }));
+			},
+
+			// A running Await-agent call resolved its target. Without this the row's
+			// "open session" item stays hidden for the whole wait — exactly when the
+			// child's progress is only visible inside its own session — because the
+			// id does not reach the persisted row until the tool returns.
+			onSendDeliveryResolved: (
+				toolUseId,
+				targets,
+				_parentToolUseId,
+				toolCallBinding,
+				targetCount,
+			) => {
+				if (!toolUseId) return;
+				// The patch walks loaded children too; parent pages must receive child receipts.
+				enqueue(sendDeliveryResolvedPatch({ toolUseId, targets, toolCallBinding, targetCount }));
+			},
+			onAwaitAgentResolved: (toolUseId, subagentNarratorId) => {
+				if (!toolUseId || !subagentNarratorId) return;
+				enqueue(awaitAgentResolvedPatch({ toolUseId, subagentNarratorId }));
+			},
+
+			// The user took over a subagent, so this card's call is now blocked on a
+			// PERSON. Without the badge a suspended Agent card and an in-flight Await
+			// look exactly like ordinary running work, and a forgotten takeover stalls
+			// the session with nothing on screen explaining why.
+			//
+			// BOTH addressing routes run, they are not fallbacks for each other. The
+			// frame's `toolUseId` is the call that SPAWNED the child (resolved from its
+			// first user message), while a separate in-flight `Await({type:"agent"})`
+			// waiting on the same child is a DIFFERENT card that only carries the child's
+			// narrator id (`_awaitAgentNarratorId`, server-resolved). Treating the id as
+			// exclusive left the Await card lit forever after the user stopped the
+			// takeover, because the message-load path (`collectTakenOverToolUseIds`) does
+			// flag it while no live frame ever cleared it.
+			//
+			// Running both is safe: each patch reports `changed: false` when it matches
+			// nothing, and they write the same fields with the same value, so the card
+			// cannot end up in a mixed state.
+			onSubagentTakeoverChanged: ({ subagentNarratorId, toolUseId, takenOver }) => {
+				if (toolUseId) enqueue(subagentTakeoverPatch({ toolUseId, takenOver }));
+				if (!subagentNarratorId) return;
+				enqueue((messages) =>
+					patchSubagentTakeoverByNarrator(messages, subagentNarratorId, takenOver),
+				);
+			},
+
+			// Execution began (permission granted). The persisted half of the same signal
+			// `useVListStreamingMessage` folds into the live store.
+			onToolExecuting: (toolUseId) => {
+				if (!toolUseId) return;
+				enqueue(toolExecutingPatch(toolUseId));
+			},
+
+			// ── Permissions (persisted status half; the live form is separate) ──
+			onPermissionRequest: (request) => {
+				if (request.toolUseId) enqueue(permissionRequestedPatch(request.toolUseId));
+			},
+			onPermissionResolved: (_requestId, toolUseId, updatedInput, decision, feedbackText) => {
+				if (!toolUseId) return;
+				enqueue(
+					permissionResolvedPatch({
+						toolUseId,
+						...(decision ? { decision } : {}),
+						...(updatedInput ? { updatedInput } : {}),
+						...(feedbackText !== undefined ? { feedbackText } : {}),
+					}),
+				);
+			},
+
+			// ── Reflection gates (4 families × started / stopped / resolved) ────
+			onDangerReflectionStarted: reflectionHandlers.started("danger_reflection"),
+			onDangerReflectionStopped: reflectionHandlers.stopped("danger_reflection"),
+			onDangerReflectionResolved: reflectionHandlers.resolved("danger_reflection"),
+			onPlanReflectionStarted: reflectionHandlers.started("plan_reflection"),
+			onPlanReflectionStopped: reflectionHandlers.stopped("plan_reflection"),
+			onPlanReflectionResolved: reflectionHandlers.resolved("plan_reflection"),
+			onTaskReflectionStarted: reflectionHandlers.started("task_reflection"),
+			onTaskReflectionStopped: reflectionHandlers.stopped("task_reflection"),
+			onTaskReflectionResolved: reflectionHandlers.resolved("task_reflection"),
+			onQuestionReflectionStarted: reflectionHandlers.started("question_reflection"),
+			// A disarmed question gate is the same transition as a "stopped" one:
+			// the decision returns to the user.
+			onQuestionReflectionDisarmed: reflectionHandlers.stopped("question_reflection"),
+			onQuestionReflectionResolved: reflectionHandlers.resolved("question_reflection"),
+
+			// ── Subagents ───────────────────────────────────────────────────────
+			// NOTE the argument order: (toolUseId, model, subagentNarratorId, …).
+			// `toolUseId` here IS the parent Agent/Task card's id — the event announces
+			// which child narrator that card now owns.
+			onSubagentStarted: (
+				toolUseId,
+				model,
+				subagentNarratorId,
+				reasoningEffort,
+				modelInheritance,
+			) => {
+				if (!toolUseId) return;
+				enqueue((messages) =>
+					patchSubagentIdentity(messages, toolUseId, {
+						...(subagentNarratorId ? { subagentNarratorId } : {}),
+						...(model ? { model } : {}),
+						...(reasoningEffort ? { reasoningEffort } : {}),
+						...(modelInheritance ? { modelInheritance } : {}),
+					}),
+				);
+			},
+			onSubagentConclusionUpdated: (
+				_subagentNarratorId,
+				toolUseId,
+				output,
+				hasError,
+				completedAt,
+				durationMs,
+			) => {
+				if (!toolUseId) return;
+				enqueue(
+					subagentConclusionPatch({
+						toolUseId,
+						output,
+						hasError,
+						...(completedAt != null ? { completedAt } : {}),
+						...(durationMs != null ? { durationMs } : {}),
+					}),
+				);
+			},
+
+			// ── Background tasks ────────────────────────────────────────────────
+			onBackgroundTaskCompleted: (_taskNarratorId, toolUseId, resultPreview) => {
+				if (!toolUseId) return;
+				enqueue(backgroundTaskPatch({ toolUseId, status: "success", text: resultPreview ?? "" }));
+			},
+			onBackgroundTaskFailed: (_taskNarratorId, toolUseId, error) => {
+				if (!toolUseId) return;
+				enqueue(backgroundTaskPatch({ toolUseId, status: "fail", text: error ?? "" }));
+			},
+			onBackgroundTaskCancelled: (_taskNarratorId, toolUseId) => {
+				if (!toolUseId) return;
+				enqueue(backgroundTaskPatch({ toolUseId, status: "cancelled", text: "Cancelled" }));
+			},
+
+			// ── Reconnect catch-up: authoritative activity snapshots ────────────
+			// The shell's own onCatchUp only decides whether to reload structurally;
+			// the activity summaries it carries would otherwise be dropped.
+			onCatchUp: (_orphanChildren, _topLevel, subagentActivities) => {
+				// A catch-up reload may finally load the tool_use a completion missed.
+				replayPendingCompletions();
+				if (subagentActivities.length === 0) return;
+				const snapshots = subagentActivities as SubagentActivityCatchUp[];
+				enqueue((messages) => patchSubagentActivitySnapshots(messages, snapshots));
+			},
+			// A landed / updated message can introduce the tool_use a completion
+			// previously could not find. Replay before other patches so the spinner
+			// clears in the same frame the card appears.
+			onMessage: () => {
+				replayPendingCompletions();
+			},
+		},
+		undefined,
+		{ kind: "messages" },
+	);
+}

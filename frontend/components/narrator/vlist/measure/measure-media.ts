@@ -1,0 +1,559 @@
+/**
+ * measure-media.ts — Zero-DOM height model for the three MessageBubble media
+ * blocks (CONTRACT.md §4, WBS-batch2 P2):
+ *
+ *   - image            → aspect-ratio fitted box when the block carries the
+ *     intrinsic width/height persisted at upload time (ZERO measurement, pure
+ *     arithmetic on data); fixed 200px placeholder when they are absent (old
+ *     messages). 🟢
+ *   - text_file        → single icon+name+size row, py=2. 🟢
+ *   - image_generation → header row (icon + status + optional loader) + image
+ *     area. With intrinsic width/height the image area is reserved via aspect
+ *     ratio (ZERO measurement). The revisedPrompt can wrap, so the header text
+ *     line count is derived with pretext (measure-markdown style). Without
+ *     metrics but with an image source, the image area falls back to a
+ *     conservative PreparedUnknownBlock placeholder.
+ *
+ * Chrome constants come from the batch-1 exploration + pretext-fonts.ts +
+ * Mantine v7 defaults. Reference template: measure-markdown.ts /
+ * measure-message-bubble.ts.
+ *
+ * ZERO DOM: no getBoundingClientRect / offsetHeight / ResizeObserver. The only
+ * variable part (header wrap) uses pretext pure arithmetic; everything else is
+ * fixed or aspect-ratio derived.
+ */
+
+import { measureNaturalWidth } from "@chenglou/pretext";
+import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
+import { fitImageBox, readImageIntrinsicSize } from "@shared/pretext-layout/image-fit";
+import { getPreparedTextWithSegments } from "@shared/pretext-layout/prepared-markdown-cache";
+import { formatFileSize } from "@shared/text-file-types";
+import {
+	accumulateFrame,
+	type BlockFrame,
+	DEFAULT_RENDER_LOD,
+	type ElementFrame,
+	type MeasuredElement,
+	type PreparedBlock,
+	type PreparedBlockBase,
+	type PreparedFixedBlock,
+	type PreparedInlineBlock,
+	type PreparedUnknownBlock,
+	type RenderLod,
+} from "../prepared-block";
+import {
+	FONT_SIZE,
+	LINE_HEIGHT,
+	lineBoxHeight,
+	SPACING,
+	typographyMetrics,
+} from "../pretext-fonts";
+import { inlineMetrics, pretextLineMetrics } from "./pretext-metrics";
+
+// ── Shared flat block base (media blocks have no list/quote nesting) ─────────
+const FLAT_BASE: PreparedBlockBase = {
+	marginTop: 0,
+	contentLeft: 0,
+	quoteRailLefts: [],
+	markerText: null,
+	markerLeft: null,
+	markerClassName: null,
+};
+
+// ── image ────────────────────────────────────────────────────────────────────
+/**
+ * Fallback image height (px) when the block carries NO intrinsic dimensions
+ * (messages persisted before width/height were recorded). Matches the classic
+ * `<Image h={200}>` and the `<Skeleton h={200}>` loading placeholder.
+ */
+export const IMAGE_FIXED_HEIGHT = 200;
+/**
+ * Height cap (px) for a dimensioned image. Without it a tall screenshot would
+ * reserve its full aspect height (a 700×7000 capture → 7000px of list). When
+ * the cap clamps, the box narrows to keep the aspect ratio, so the paint still
+ * matches the reservation exactly.
+ *
+ * ⚠️ THIS IS THE SOURCE OF THE 400. Two other copies exist and must move with
+ * it, neither of which can import this module:
+ *   - `MessageBubble.tsx`'s `CHAT_IMAGE_MAX_HEIGHT` — the CHUNKED path, which
+ *     lives outside vlist/ and therefore cannot import anything in it (§0 铁律 1
+ *     is enforced by `vlist-isolation.guard.test.ts`: a static import from
+ *     outside vlist/ fails the build). Same value, painted by a different
+ *     renderer for the same images.
+ *   - `DETAIL_CAPS.media` in `measure-tool-call.ts` — the tool card's media cap.
+ *     Coincidentally equal and deliberately NOT aliased: it is one entry in a cap
+ *     table whose other rows (code/term/diff/…) have nothing to do with images,
+ *     so tying it to this constant would couple two unrelated tables.
+ * Tests import this constant rather than re-declaring 400 (a fourth copy that
+ * silently drifts is a test that stops protecting the value it names).
+ *
+ * Same "Keep in sync with …" arrangement as tool-detail.ts's
+ * MEDIA_IMAGE_CONTENT_PX ↔ IMAGE_FIXED_HEIGHT, and for the same reason.
+ */
+export const IMAGE_MAX_DISPLAY_HEIGHT = 400;
+
+export interface MeasureImageInput {
+	imageId?: string;
+	previewUrl?: string;
+	mediaType?: string;
+	filename?: string;
+	uploadNarratorId?: string;
+	/** Intrinsic pixel size, persisted at upload time. Drives aspect fitting. */
+	width?: number | null;
+	height?: number | null;
+}
+
+/**
+ * Measure an inline image block. With intrinsic dimensions the box is the
+ * aspect-ratio fit into (`contentWidth` × IMAGE_MAX_DISPLAY_HEIGHT) — the same
+ * formula the render layer paints, so reservation and paint cannot drift.
+ * Without them the box is the fixed 200px placeholder (the rendered image is
+ * `h={200} w="auto"`, and the loading Skeleton is also 200). Zero measurement.
+ *
+ * ⚠️ Like `measureImageGeneration`, the fitted branch is a DELIBERATE exception
+ * to "height is monotone non-increasing in width": a wider column produces a
+ * TALLER box. Termination of the width loop rests on the structural cycle
+ * guard in `vlist-width-settle.ts`, not on measure-layer monotonicity.
+ */
+export function measureImage(
+	data: MeasureImageInput,
+	contentWidth: number,
+	_lod: RenderLod = DEFAULT_RENDER_LOD,
+): MeasuredElement {
+	const natural = readImageIntrinsicSize(data.width, data.height);
+	if (natural) {
+		const fit = fitImageBox(natural, contentWidth, IMAGE_MAX_DISPLAY_HEIGHT);
+		const block: PreparedFixedBlock = {
+			...FLAT_BASE,
+			kind: "fixed",
+			height: fit.displayHeight,
+			tag: "image",
+			displayWidth: fit.displayWidth,
+			data: {
+				imageId: data.imageId ?? null,
+				previewUrl: data.previewUrl ?? null,
+				mediaType: data.mediaType ?? null,
+				filename: data.filename ?? null,
+				uploadNarratorId: data.uploadNarratorId ?? null,
+				width: natural.width,
+				height: natural.height,
+				displayWidth: fit.displayWidth,
+				displayHeight: fit.displayHeight,
+			},
+		};
+		const blocks: PreparedBlock[] = [block];
+		const frame = accumulateFrame(blocks, contentWidth, pretextLineMetrics);
+		return {
+			height: frame.contentHeight,
+			blocks,
+			frame,
+			contentWidth,
+			usedWidth: Math.min(contentWidth, fit.displayWidth),
+		};
+	}
+	const block: PreparedFixedBlock = {
+		...FLAT_BASE,
+		kind: "fixed",
+		height: IMAGE_FIXED_HEIGHT,
+		tag: "image",
+		data: {
+			imageId: data.imageId ?? null,
+			previewUrl: data.previewUrl ?? null,
+			mediaType: data.mediaType ?? null,
+			filename: data.filename ?? null,
+			uploadNarratorId: data.uploadNarratorId ?? null,
+		},
+	};
+	const blocks: PreparedBlock[] = [block];
+	const frame = accumulateFrame(blocks, contentWidth, pretextLineMetrics);
+	return {
+		height: frame.contentHeight,
+		blocks,
+		frame,
+		contentWidth,
+		usedWidth: Math.min(contentWidth, IMAGE_FIXED_HEIGHT),
+	};
+}
+
+// ── text_file ──────────────────────────────────────────────────────────────
+/** ThemeIcon size="sm" is 22px (dominant height of the single row). */
+export const TEXT_FILE_ICON_SIZE = 22;
+/** Group py={2}. */
+export const TEXT_FILE_PADDING_Y = 2;
+/** Single-row height: the ThemeIcon (22) dominates the xs/sm text; + py. */
+export const TEXT_FILE_HEIGHT = TEXT_FILE_ICON_SIZE + TEXT_FILE_PADDING_Y * 2; // 26
+
+export interface MeasureTextFileInput {
+	filename?: string;
+	size?: number;
+	mediaType?: string;
+}
+
+/**
+ * Natural (unwrapped) width of the icon + filename + size row.
+ *
+ * The row is reserved at a FIXED single-line height, so the render layer must
+ * never wrap the filename — it truncates instead (see `TextFileRow`). That makes
+ * the row's painted width a pure function of its data, which this computes so a
+ * shrink-wrap container (the user bubble) can grow around it. Without it a long
+ * filename was squeezed into whatever width the caption text happened to need,
+ * and the row overflowed the box the measure layer had already committed to.
+ *
+ * Zero DOM: pretext's canvas text metrics only, same as every other measure here.
+ */
+export function textFileRowNaturalWidth(data: MeasureTextFileInput): number {
+	const metrics = typographyMetrics();
+	const filename = data.filename ?? "";
+	const nameWidth =
+		filename.length > 0
+			? measureNaturalWidth(getPreparedTextWithSegments(filename, metrics.font.bodyMedium))
+			: 0;
+	const sizeText = typeof data.size === "number" ? `(${formatFileSize(data.size)})` : "";
+	const sizeWidth =
+		sizeText.length > 0
+			? measureNaturalWidth(getPreparedTextWithSegments(sizeText, metrics.font.xs)) +
+				IMGGEN_GROUP_GAP
+			: 0;
+	// icon + gap + name (+ gap + size). Ceil so a fractional advance never leaves
+	// the last glyph a sub-pixel outside the reserved box.
+	return Math.ceil(TEXT_FILE_ICON_SIZE + IMGGEN_GROUP_GAP + nameWidth + sizeWidth);
+}
+
+/**
+ * Measure a text-file attachment chip: a single row (icon + filename + size).
+ * Fixed height regardless of width — the filename TRUNCATES rather than wraps,
+ * so a long name cannot push the row past the reserved single line. Zero DOM.
+ */
+export function measureTextFile(
+	data: MeasureTextFileInput,
+	contentWidth: number,
+	_lod: RenderLod = DEFAULT_RENDER_LOD,
+): MeasuredElement {
+	const natural = textFileRowNaturalWidth(data);
+	const block: PreparedFixedBlock = {
+		...FLAT_BASE,
+		kind: "fixed",
+		height: TEXT_FILE_HEIGHT,
+		tag: "text_file",
+		// Capped at the column: a name longer than the frame truncates, so the row
+		// never claims more space than exists.
+		displayWidth: Math.min(contentWidth, natural),
+		data: {
+			filename: data.filename ?? null,
+			size: typeof data.size === "number" ? data.size : null,
+			mediaType: data.mediaType ?? null,
+		},
+	};
+	const blocks: PreparedBlock[] = [block];
+	const frame = accumulateFrame(blocks, contentWidth, pretextLineMetrics);
+	return {
+		height: frame.contentHeight,
+		blocks,
+		frame,
+		contentWidth,
+		usedWidth: contentWidth,
+	};
+}
+
+// ── image_generation ─────────────────────────────────────────────────────────
+/** Paper p="xs" padding (px). */
+export const IMGGEN_PAPER_PADDING = SPACING.xs; // 10
+/** Paper withBorder → 1px top + 1px bottom. */
+export const IMGGEN_BORDER = 1;
+/** Header ThemeIcon size={18}. */
+export const IMGGEN_ICON_SIZE = 18;
+/** Loader size={12} shown while generating. */
+export const IMGGEN_LOADER_SIZE = 12;
+/** Group gap={6} between header items. */
+export const IMGGEN_GROUP_GAP = 6;
+/** Group mb="xs" between header and the reserved image area. */
+export const IMGGEN_IMAGE_GAP = SPACING.xs; // 10
+/** Header text (xs) line box height. */
+export const IMGGEN_HEADER_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+/** GENERATED_IMAGE_MAX_DISPLAY_WIDTH from the original component. */
+export const IMGGEN_MAX_DISPLAY_WIDTH = 512;
+/** Conservative fallback image area height when intrinsic size is unknown. */
+export const IMGGEN_UNKNOWN_IMAGE_HEIGHT = 240;
+
+// ml={4} applied to the revisedPrompt span.
+const IMGGEN_PROMPT_GAP = 4;
+
+const IMGGEN_STATUS_CLASS = "vlist-imggen-status";
+const IMGGEN_PROMPT_CLASS = "vlist-imggen-prompt";
+
+export interface MeasureImageGenerationInput {
+	/** Raw status ("generating" / "in_progress" / "completed" / ...). */
+	status?: string;
+	/** Localized status text actually rendered (drives header wrap width). */
+	statusText?: string;
+	/** Revised prompt shown after the status (fw 500, may wrap). */
+	revisedPrompt?: string;
+	/** Inline base64 / data-url result (image source hint). */
+	result?: string;
+	savedPath?: string;
+	partialSavedPath?: string;
+	/** Intrinsic pixel width/height — enables aspect-ratio reservation. */
+	width?: number | null;
+	height?: number | null;
+}
+
+export interface MeasureMediaOpts {
+	inRun?: boolean;
+	isLast?: boolean;
+}
+
+export interface MeasuredImageGeneration extends MeasuredElement {
+	inRun: boolean;
+	isLast: boolean;
+}
+
+interface ImageMetrics {
+	width: number;
+	height: number;
+}
+
+function getImageMetrics(data: MeasureImageGenerationInput): ImageMetrics | null {
+	const { width, height } = data;
+	if (
+		typeof width !== "number" ||
+		typeof height !== "number" ||
+		!Number.isFinite(width) ||
+		!Number.isFinite(height) ||
+		width <= 0 ||
+		height <= 0
+	) {
+		return null;
+	}
+	return { width, height };
+}
+
+function isGeneratingStatus(status: string | undefined): boolean {
+	return !!status && status !== "completed";
+}
+
+/** Build the header rich-inline flow (status text + optional revisedPrompt). */
+function buildHeaderInline(
+	data: MeasureImageGenerationInput,
+	contentLeft: number,
+): PreparedInlineBlock {
+	const items: RichInlineItem[] = [];
+	const fonts: string[] = [];
+	const classNames: string[] = [];
+	const hrefs: Array<string | null> = [];
+
+	const statusText = data.statusText ?? "";
+	if (statusText.length > 0) {
+		items.push({
+			text: statusText,
+			font: typographyMetrics().font.xs,
+			break: "normal",
+			extraWidth: 0,
+		});
+		fonts.push(typographyMetrics().font.xs);
+		classNames.push(IMGGEN_STATUS_CLASS);
+		hrefs.push(null);
+	}
+	const prompt = data.revisedPrompt ?? "";
+	if (prompt.length > 0) {
+		items.push({
+			text: prompt,
+			font: typographyMetrics().font.xsMedium,
+			break: "normal",
+			extraWidth: items.length > 0 ? IMGGEN_PROMPT_GAP : 0,
+		});
+		fonts.push(typographyMetrics().font.xsMedium);
+		classNames.push(IMGGEN_PROMPT_CLASS);
+		hrefs.push(null);
+	}
+	// Guarantee at least one fragment so pretext produces a valid single line.
+	if (items.length === 0) {
+		items.push({ text: " ", font: typographyMetrics().font.xs, break: "normal", extraWidth: 0 });
+		fonts.push(typographyMetrics().font.xs);
+		classNames.push(IMGGEN_STATUS_CLASS);
+		hrefs.push(null);
+	}
+
+	return {
+		...FLAT_BASE,
+		kind: "inline",
+		flow: prepareRichInline(items),
+		lineHeight: typographyMetrics().line.xs,
+		classNames,
+		hrefs,
+		fonts,
+		contentLeft,
+	};
+}
+
+/**
+ * Measure an image_generation block. Header (icon + status + optional loader +
+ * wrapping revisedPrompt) stacked above an image area whose height is either
+ * aspect-ratio reserved (intrinsic width/height known → zero measurement) or a
+ * conservative placeholder (unknown size but an image source exists) or absent.
+ */
+export function measureImageGeneration(
+	data: MeasureImageGenerationInput,
+	contentWidth: number,
+	_lod: RenderLod = DEFAULT_RENDER_LOD,
+	opts: MeasureMediaOpts = {},
+): MeasuredImageGeneration {
+	const inRun = opts.inRun === true;
+	const isLast = opts.isLast === true;
+	const border = inRun ? 0 : IMGGEN_BORDER * 2;
+	const divider = inRun && !isLast ? 1 : 0;
+	// Preserve the legacy standalone width model. In-run cards have no border,
+	// so this padding-only budget also exactly matches their rendered content.
+	const innerWidth = Math.max(1, contentWidth - IMGGEN_PAPER_PADDING * 2);
+	const generating = isGeneratingStatus(data.status);
+	const loaderWidth = generating ? IMGGEN_LOADER_SIZE + IMGGEN_GROUP_GAP : 0;
+	// Icon + gap (+ loader + gap) reserved to the left of the header text.
+	const iconArea = IMGGEN_ICON_SIZE + IMGGEN_GROUP_GAP + loaderWidth;
+
+	const headerBlock = buildHeaderInline(data, iconArea);
+	const headerTextWidth = Math.max(1, innerWidth - iconArea);
+	const { lineCount, maxLineWidth } = inlineMetrics(headerBlock, headerTextWidth);
+	const textHeight = lineCount * typographyMetrics().line.xs;
+	// The header row is at least as tall as the icon.
+	const headerHeight = Math.max(IMGGEN_ICON_SIZE, textHeight);
+
+	// Image area.
+	const metrics = getImageMetrics(data);
+	const hasSource = !!(data.result || data.savedPath || data.partialSavedPath);
+
+	const blocks: PreparedBlock[] = [headerBlock];
+	const frames: BlockFrame[] = [
+		{ index: 0, top: 0, height: headerHeight, usedWidth: iconArea + maxLineWidth },
+	];
+	let contentHeight = headerHeight;
+
+	if (metrics) {
+		// ⚠️ DELIBERATE EXCEPTION to "layout height is monotone non-increasing in width".
+		//
+		// Almost every measure in this directory gets TALLER as the column narrows (text
+		// wraps into more lines). This one does the opposite: while
+		// `innerWidth < min(intrinsicWidth, IMGGEN_MAX_DISPLAY_WIDTH)` the image is
+		// scaled to fit the column, so a narrower column produces a SHORTER block. At
+		// 1024x512 the reserved height climbs 200px → 306px across a 320 → 532px column
+		// and then saturates.
+		//
+		// This is not fixable here, and must not be "fixed": the renderer sizes the frame
+		// `width: min(100%, displayWidth)` with the intrinsic aspect ratio and
+		// `objectFit: contain` (render/RenderMedia.tsx, mirroring MessageBubble), which is
+		// how a responsive image is supposed to behave. Reserving a width-independent
+		// height instead (the `measureImage` approach, a flat 200px) would letterbox every
+		// generated image on a narrow column — a 1024x512 at a 300px column paints 150px
+		// tall while 256px was reserved, leaving ~106px of dead space under it. And the
+		// vlist CONTRACT requires the measured height to EQUAL the rendered height, so
+		// diverging here would corrupt the scroll geometry rather than just look wrong.
+		//
+		// Consequence for the width loop: because this height rises with width, "a
+		// scrollbar that appears can never become unnecessary" is FALSE, so the width
+		// feedback cycle is reachable (measured: 59 commits in 60 hops on a 380x1656
+		// viewport). Termination therefore cannot rest on measure-layer monotonicity — it
+		// rests on the structural cycle guard in `vlist-width-settle.ts`
+		// (`isWidthFeedbackCycle`), which assumes nothing about content shape.
+		const displayWidth = Math.min(innerWidth, Math.min(metrics.width, IMGGEN_MAX_DISPLAY_WIDTH));
+		const imageHeight = Math.round((displayWidth * metrics.height) / metrics.width);
+		const imageBlock: PreparedFixedBlock = {
+			...FLAT_BASE,
+			kind: "fixed",
+			marginTop: IMGGEN_IMAGE_GAP,
+			height: imageHeight,
+			tag: "imggen-image",
+			data: {
+				displayWidth,
+				intrinsicWidth: metrics.width,
+				intrinsicHeight: metrics.height,
+				result: data.result ?? null,
+				savedPath: data.savedPath ?? null,
+				partialSavedPath: data.partialSavedPath ?? null,
+			},
+		};
+		const top = headerHeight + IMGGEN_IMAGE_GAP;
+		blocks.push(imageBlock);
+		frames.push({ index: 1, top, height: imageHeight, usedWidth: displayWidth });
+		contentHeight = top + imageHeight;
+	} else if (hasSource) {
+		const imageBlock: PreparedUnknownBlock = {
+			...FLAT_BASE,
+			kind: "unknown",
+			marginTop: IMGGEN_IMAGE_GAP,
+			tag: "image-unknown",
+			placeholderHeight: IMGGEN_UNKNOWN_IMAGE_HEIGHT,
+			data: {
+				result: data.result ?? null,
+				savedPath: data.savedPath ?? null,
+				partialSavedPath: data.partialSavedPath ?? null,
+			},
+		};
+		const top = headerHeight + IMGGEN_IMAGE_GAP;
+		blocks.push(imageBlock);
+		frames.push({ index: 1, top, height: IMGGEN_UNKNOWN_IMAGE_HEIGHT, usedWidth: innerWidth });
+		contentHeight = top + IMGGEN_UNKNOWN_IMAGE_HEIGHT;
+	}
+
+	const usedWidth = frames.reduce((w, f) => Math.max(w, f.usedWidth), 0);
+	const frame: ElementFrame = { blocks: frames, contentHeight, usedWidth };
+	const height = IMGGEN_PAPER_PADDING * 2 + border + contentHeight + divider;
+
+	return {
+		inRun,
+		isLast,
+		height,
+		blocks,
+		frame,
+		contentWidth: innerWidth,
+		usedWidth: Math.min(contentWidth, usedWidth + IMGGEN_PAPER_PADDING * 2),
+	};
+}
+
+// ── Unified dispatcher ───────────────────────────────────────────────────────
+export type MediaBlockType = "image" | "image_generation" | "text_file";
+
+export interface MediaBlockInput
+	extends MeasureImageInput,
+		MeasureTextFileInput,
+		MeasureImageGenerationInput {
+	type: MediaBlockType | string;
+}
+
+/**
+ * Dispatch to the correct media measurer by `block.type`. Unknown types fall
+ * back to a zero-height empty element (the caller should not route them here).
+ */
+export function measureMedia(
+	block: MediaBlockInput,
+	contentWidth: number,
+	lod: RenderLod = DEFAULT_RENDER_LOD,
+	opts: MeasureMediaOpts = {},
+): MeasuredElement {
+	switch (block.type) {
+		case "image":
+			return measureImage(block, contentWidth, lod);
+		case "text_file":
+			return measureTextFile(block, contentWidth, lod);
+		case "image_generation":
+			return measureImageGeneration(block, contentWidth, lod, opts);
+		default: {
+			const frame: ElementFrame = { blocks: [], contentHeight: 0, usedWidth: 0 };
+			return { height: 0, blocks: [], frame, contentWidth, usedWidth: 0 };
+		}
+	}
+}
+
+export const MEASURE_MEDIA_CONSTANTS = {
+	IMAGE_FIXED_HEIGHT,
+	IMAGE_MAX_DISPLAY_HEIGHT,
+	TEXT_FILE_ICON_SIZE,
+	TEXT_FILE_PADDING_Y,
+	TEXT_FILE_HEIGHT,
+	IMGGEN_PAPER_PADDING,
+	IMGGEN_BORDER,
+	IMGGEN_ICON_SIZE,
+	IMGGEN_LOADER_SIZE,
+	IMGGEN_GROUP_GAP,
+	IMGGEN_IMAGE_GAP,
+	IMGGEN_HEADER_LINE_HEIGHT,
+	IMGGEN_MAX_DISPLAY_WIDTH,
+	IMGGEN_UNKNOWN_IMAGE_HEIGHT,
+} as const;

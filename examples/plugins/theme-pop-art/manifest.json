@@ -1,0 +1,68 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.pop-art",
+	"version": "1.0.0",
+	"displayName": "Pop Art Themes",
+	"description": "High-saturation pop-art color themes (Warhol/Lichtenstein style) contributed as whitelisted design tokens. No raw CSS: the host compiles these tokens into scoped Mantine variable overrides.",
+	"publisher": { "id": "com.example", "name": "Example Team" },
+	"license": "Apache-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"features": [],
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "local-process"
+	},
+	"activationEvents": [],
+	"contributes": {
+		"providers": [],
+		"tools": [],
+		"commands": [],
+		"events": [],
+		"views": [],
+		"themes": [
+			{
+				"id": "pop-art",
+				"title": "Pop Art",
+				"colorScheme": "light",
+				"tokens": {
+					"primaryColor": "#ff2e4d",
+					"body": "#fff4d6",
+					"text": "#141414",
+					"colors": {
+						"accent": "#ffd21e",
+						"pop": "#1fb6ff"
+					},
+					"radius": "2px",
+					"fontSize": "15px"
+				}
+			},
+			{
+				"id": "pop-art-night",
+				"title": "Pop Art Night",
+				"colorScheme": "dark",
+				"tokens": {
+					"primaryColor": "#ff1f8f",
+					"body": "#12060f",
+					"text": "#fff7fb",
+					"colors": {
+						"accent": "#ffe100",
+						"pop": "#00e5ff"
+					},
+					"radius": "2px"
+				}
+			}
+		]
+	},
+	"permissions": {
+		"host": ["ui.theme"],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": { "package": "readOnly", "pluginData": "none", "workspace": "none" },
+		"process": { "spawn": "none" }
+	},
+	"secrets": [],
+	"dependencies": { "plugins": {}, "runtime": {} }
+}

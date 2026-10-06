@@ -1,0 +1,6 @@
+{
+	"version": "0.4.12",
+	"date": "2026-05-11",
+	"en": "## New Features\n\n- Added richer agent diagnostics and request visibility to make troubleshooting model runs easier.\n- Improved recent-tab navigation by prefetching narrator data and messages for faster panel opening.\n\n## Bug Fixes\n\n- Stabilized subagent detach/attach lifecycle handling to prevent stuck background tasks and stale cancellation state.\n- Fixed interrupted attach flows so detached subagents continue to be managed as background tasks.\n- Localized Pipeline tool cards in the message UI and Pixi renderer.\n- Reduced unnecessary message reloads by keeping message caches alive longer while still trimming large histories.",
+	"zh-CN": "## 新功能\n\n- 增强 agent 诊断与请求可见性，便于排查模型运行问题。\n- 为最近标签页预取叙述者与消息数据，打开会话面板更快。\n\n## 修复\n\n- 稳定子代理 detach/attach 生命周期，避免后台任务卡住或保留过期取消状态。\n- 修复 attach 等待被中断后子代理状态不一致的问题，确保仍按后台任务管理。\n- 补齐 Pipeline 工具卡在消息 UI 与 Pixi 渲染器中的本地化文案。\n- 延长消息缓存保留时间并保留历史裁剪，减少不必要的消息重载。"
+}

@@ -1,0 +1,258 @@
+name: plugin-platform-acceptance
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "server/lib/plugins/**"
+      - "server/lib/platform-path.ts"
+      - "server/services/plugin-*.ts"
+      - "server/services/__tests__/plugin-*.test.ts"
+      - "server/routes/plugin-ui.ts"
+      - "server/routes/plugins.ts"
+      - "frontend/components/plugins/**"
+      - "frontend/hooks/usePluginContributions.ts"
+      - "tests/server/integration/plugins/**"
+      - "tests/server/services/plugin-*.test.ts"
+      - "tests/frontend/plugins/**"
+      - "tests/fixtures/plugins/e2e/**"
+      - "examples/plugins/**"
+      - "scripts/drill-plugin-rollback.ts"
+      - "scripts/smoke-plugin-ui.ts"
+      - "scripts/smoke-narrator-dock.ts"
+      - "scripts/validate-plugin-release.ts"
+      - "tests/scripts/*release*.test.ts"
+      - "tests/update-server-release*.test.ts"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/plugin-platform-acceptance.yml"
+  pull_request:
+    paths:
+      - "server/lib/plugins/**"
+      - "server/lib/platform-path.ts"
+      - "server/services/plugin-*.ts"
+      - "server/services/__tests__/plugin-*.test.ts"
+      - "server/routes/plugin-ui.ts"
+      - "server/routes/plugins.ts"
+      - "frontend/components/plugins/**"
+      - "frontend/hooks/usePluginContributions.ts"
+      - "tests/server/integration/plugins/**"
+      - "tests/server/services/plugin-*.test.ts"
+      - "tests/frontend/plugins/**"
+      - "tests/fixtures/plugins/e2e/**"
+      - "examples/plugins/**"
+      - "scripts/drill-plugin-rollback.ts"
+      - "scripts/smoke-plugin-ui.ts"
+      - "scripts/smoke-narrator-dock.ts"
+      - "scripts/validate-plugin-release.ts"
+      - "tests/scripts/*release*.test.ts"
+      - "tests/update-server-release*.test.ts"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/plugin-platform-acceptance.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-platform-acceptance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract-tests:
+    name: Plugin contract and vertical-slice tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Check plugin acceptance files
+        run: >-
+          bunx @biomejs/biome check --vcs-enabled=false
+          server/lib/plugins
+          server/services/plugin-*.ts
+          server/services/__tests__/plugin-*.test.ts
+          server/routes/plugin-ui.ts
+          server/routes/plugins.ts
+          frontend/components/plugins
+          tests/server/integration/plugins
+          tests/server/services/plugin-*.test.ts
+          tests/frontend/plugins
+          tests/fixtures/plugins/e2e/reference-ui-hostile
+          scripts/drill-plugin-rollback.ts
+          scripts/smoke-plugin-ui.ts
+          scripts/smoke-narrator-dock.ts
+          scripts/validate-plugin-release.ts
+
+      - name: Check TypeScript
+        run: bunx tsgo --noEmit
+
+      - name: Run plugin acceptance tests
+        run: >-
+          bun test --isolate
+          tests/server/integration/plugins
+          tests/server/services/plugin-*.test.ts
+          server/services/__tests__/plugin-*.test.ts
+          tests/frontend/plugins/plugin-c1-c2-acceptance.test.ts
+
+  hardening-tests:
+    name: Upgrade, rollback, and platform hardening
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run upgrade and rollback tests
+        run: >-
+          bun test --isolate
+          tests/server/services/plugin-manager.test.ts
+          tests/server/services/plugin-package-store.test.ts
+          server/services/__tests__/plugin-upgrade-coordinator.test.ts
+          server/services/__tests__/plugin-process-runner.test.ts
+          server/services/__tests__/plugin-podman-runner.test.ts
+          server/services/__tests__/plugin-signature.test.ts
+          server/services/__tests__/plugin-sbom.test.ts
+          server/services/__tests__/plugin-health.test.ts
+          server/services/__tests__/plugin-ui-host.test.ts
+
+      - name: Run rollback drill
+        run: bun scripts/drill-plugin-rollback.ts
+
+  cross-platform-security:
+    name: Cross-platform plugin security (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Check TypeScript
+        run: bunx tsgo --noEmit
+
+      - name: Run path and runner security tests
+        run: >-
+          bun test --isolate
+          server/lib/agent/execution/__tests__/local-backend-read.test.ts
+          tests/server/services/plugin-manager.test.ts
+          server/services/__tests__/plugin-podman-runner.test.ts
+          server/services/__tests__/plugin-process-runner.test.ts
+          server/services/__tests__/plugin-signature.test.ts
+          server/services/__tests__/plugin-sbom.test.ts
+
+  release-gate:
+    name: GA plugin release and update integrity gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run release integrity tests
+        run: >-
+          bun test --isolate
+          tests/scripts/release.test.ts
+          tests/scripts/validate-plugin-release.test.ts
+          tests/scripts/release-baseline.test.ts
+          tests/update-server-release-integrity.test.ts
+          tests/update-server-release-route-integrity.test.ts
+
+      - name: Run GA plugin release validation
+        run: bun scripts/validate-plugin-release.ts --ga
+
+  browser-smoke:
+    name: Isolated hostile iframe smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [contract-tests, hardening-tests, cross-platform-security, release-gate]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Locate Chrome
+        shell: bash
+        run: |
+          CHROME_PATH="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || true)"
+          test -n "$CHROME_PATH"
+          echo "PUPPETEER_EXECUTABLE_PATH=$CHROME_PATH" >> "$GITHUB_ENV"
+
+      - name: Build frontend
+        run: bun run build
+
+      - name: Run isolated plugin UI smoke (strict)
+        run: bun scripts/smoke-plugin-ui.ts --strict
+
+      - name: Run narrator dock smoke
+        run: bun scripts/smoke-narrator-dock.ts
+
+  plugin-platform-gate:
+    name: Required plugin platform gate
+    if: always()
+    needs:
+      - contract-tests
+      - hardening-tests
+      - cross-platform-security
+      - release-gate
+      - browser-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every acceptance lane to pass
+        env:
+          CONTRACT: ${{ needs.contract-tests.result }}
+          HARDENING: ${{ needs.hardening-tests.result }}
+          CROSS_PLATFORM: ${{ needs.cross-platform-security.result }}
+          RELEASE: ${{ needs.release-gate.result }}
+          BROWSER: ${{ needs.browser-smoke.result }}
+        run: |
+          for result in "$CONTRACT" "$HARDENING" "$CROSS_PLATFORM" "$RELEASE" "$BROWSER"; do
+            test "$result" = success || {
+              echo "plugin platform acceptance lane failed or was skipped: $result"
+              exit 1
+            }
+          done
+          echo "all plugin platform acceptance lanes passed"

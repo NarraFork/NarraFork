@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#4c6ef5"/>
+  <g fill="none" stroke="#fff" stroke-width="32" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Main trunk -->
+    <path d="M256 400 V200"/>
+    <!-- Left fork -->
+    <path d="M256 200 Q256 160 216 130 L176 108"/>
+    <!-- Right fork -->
+    <path d="M256 200 Q256 160 296 130 L336 108"/>
+    <!-- Dots at endpoints -->
+  </g>
+  <circle cx="176" cy="108" r="24" fill="#fff"/>
+  <circle cx="336" cy="108" r="24" fill="#fff"/>
+  <circle cx="256" cy="400" r="24" fill="#fff"/>
+</svg>

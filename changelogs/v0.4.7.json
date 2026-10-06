@@ -1,0 +1,6 @@
+{
+	"version": "0.4.7",
+	"date": "2026-05-09",
+	"en": "## New Features\n\n- Improved update application, quota visibility, and diagnostics workflows for long-running local deployments.\n\n## Bug Fixes\n\n- Hardened update handoff, dependency install permissions, and full-fork inheritance so upgrades and forks behave more safely.\n- Fixed narrator WebSocket catch-up for parent and subagent message streams, keeping missed messages and message versions in sync.\n- Kept tracked database, SQLite, and log files visible to worktree status updates instead of hiding them through watcher ignores.",
+	"zh-CN": "## 新功能\n\n- 改进更新应用、配额可视化和诊断流程，让长期运行的本地部署更容易维护。\n\n## 修复\n\n- 加固更新交接、依赖安装权限和完整 fork 继承逻辑，让升级和分叉过程更安全可靠。\n- 修复叙述者 WebSocket 对父消息流和子代理消息流的增量补拉，确保遗漏消息与消息版本保持同步。\n- 确保已被版本控制的数据库、SQLite 和日志文件仍能触发 worktree 状态更新，不再被 watcher 忽略规则隐藏。"
+}

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<!--
+			INTENTIONAL: maximum-scale=1.0, user-scalable=no
+			NarraFork is a developer-facing PWA / desktop tool, NOT a public-facing website.
+			Pinch-to-zoom conflicts with the ruler canvas (which has its own zoom/pan),
+			causes layout glitches in the terminal emulator, and breaks drag interactions.
+			CSS touch-action:manipulation only prevents double-tap zoom — it does NOT
+			prevent pinch-to-zoom, which is the actual problem here.
+			This is a deliberate, permanent decision. Do NOT remove or "fix" this.
+		-->
+		<meta
+			name="viewport"
+			content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+		/>
+		<meta name="theme-color" content="#1a1b1e" media="(prefers-color-scheme: dark)" />
+		<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+		<meta name="apple-mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+		<meta name="mobile-web-app-capable" content="yes" />
+		<meta name="description" content="AI-powered collaborative programming with narrative forking" />
+		<!--
+			Relative hrefs, resolved against the <base> the server injects when it answers
+			a SPA navigation (server/lib/spa-base-href.ts). Rooted paths would address the
+			origin root, which is not where NarraFork lives behind a reverse-proxy subpath
+			or code-server's /proxy/<port>/ — the icons would 404 with nothing to indicate
+			why. Keep in sync with DEFAULT_*_URL in frontend/lib/branding.ts.
+		-->
+		<link rel="icon" href="favicon.svg" type="image/svg+xml" />
+		<link rel="apple-touch-icon" href="apple-touch-icon-180x180.png" />
+		<title>NarraFork</title>
+		<script>
+			var d = localStorage.getItem("mantine-color-scheme-value");
+			var m;
+			var o = localStorage.getItem("narrafork_oled") === "true";
+			var tc;
+			try {
+				if (d === "light" || d === "dark") {
+					m = d;
+				} else {
+					m = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+				}
+				document.documentElement.setAttribute("data-mantine-color-scheme", m);
+				tc = m === "dark" ? (o ? "#000000" : "#1a1b1e") : "#ffffff";
+				document.querySelectorAll('meta[name="theme-color"]').forEach((el) => {
+					el.setAttribute("content", tc);
+				});
+			} catch (_e) {}
+
+			/*
+				Per-instance branding, applied from a localStorage mirror written by
+				frontend/lib/branding.ts.
+
+				This HTML is a build artifact shared by every deployment, so the instance
+				name cannot be baked in. Reading the mirror here — before any bundle loads
+				— is what stops the tab from showing "NarraFork" for the duration of the
+				/api/branding round trip, which is exactly the ambiguity this feature
+				exists to remove. The fetched value corrects this a moment later.
+
+				Storage keys are duplicated from BRAND_*_STORAGE_KEY in that module;
+				they are asserted to match in tests/frontend/branding-boot.test.ts.
+			*/
+			try {
+				var bn = localStorage.getItem("narrafork_brand_name");
+				if (bn) document.title = bn;
+				var bc = localStorage.getItem("narrafork_brand_icon_color");
+				// The mirror only holds a colour when it differs from the default, so its
+				// mere presence means the recolouring endpoints are worth requesting.
+				if (bc) {
+					var fi = document.querySelector('link[rel="icon"]');
+					if (fi) fi.setAttribute("href", "api/branding/favicon.svg");
+					var ati = document.querySelector('link[rel="apple-touch-icon"]');
+					if (ati) ati.setAttribute("href", "api/branding/apple-touch-icon.png");
+				}
+			} catch (_e) {}
+		</script>
+	</head>
+	<body>
+		<div id="root"></div>
+		<script type="module" src="/main.tsx"></script>
+	</body>
+</html>

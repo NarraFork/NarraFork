@@ -1,0 +1,81 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.hello",
+	"version": "1.0.0",
+	"displayName": "Hello Tool",
+	"description": "A minimal reference plugin manifest.",
+	"publisher": {
+		"id": "com.example",
+		"name": "Example Team",
+		"url": "https://example.com/plugins/hello"
+	},
+	"license": "Apache-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "local-process"
+	},
+	"server": {
+		"entry": "server/index.js",
+		"transport": "stdio",
+		"protocol": "narrafork.rpc/1",
+		"args": [],
+		"workingDirectory": "package",
+		"startupTimeoutMs": 15000,
+		"activationTimeoutMs": 30000
+	},
+	"activationEvents": ["onCommand:hello", "onEvent:chapter.changed"],
+	"contributes": {
+		"commands": [
+			{
+				"id": "hello",
+				"title": "Hello",
+				"handler": "server"
+			}
+		],
+		"events": [
+			{
+				"id": "chapterChanged",
+				"topic": "chapter.changed",
+				"filter": {
+					"type": "object",
+					"properties": {
+						"chapterId": { "type": "string" }
+					}
+				}
+			}
+		],
+		"configuration": {
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"default": true
+				}
+			}
+		}
+	},
+	"permissions": {
+		"host": ["query.chapters.read", "ui.panel"],
+		"network": {
+			"mode": "none",
+			"allow": []
+		},
+		"filesystem": {
+			"package": "readOnly",
+			"pluginData": "readWrite",
+			"workspace": "none"
+		},
+		"process": {
+			"spawn": "none"
+		}
+	},
+	"secrets": [],
+	"dependencies": {
+		"plugins": {},
+		"runtime": {}
+	}
+}

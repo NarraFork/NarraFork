@@ -1,0 +1,371 @@
+/*
+ * trace-shimmer.css — the shimmer a COMPACT ROW paints on its own text.
+ *
+ * A folded trace row has no card face to tint: it is one dimmed line inside a
+ * fixed 18.8px lane. So its shimmer lights up the TEXT itself (a gradient clipped
+ * to the glyphs) rather than sweeping a background overlay the way a tool card
+ * does. That difference is deliberate and load-bearing:
+ *
+ *   - It is HEIGHT-NEUTRAL by construction. Only `background` and
+ *     `-webkit-text-fill-color` change, so a shimmering row measures exactly like a
+ *     quiet one — which the exact vlist requires (a row's height must never move
+ *     unless the user acted).
+ *   - The neutral sweep reads correctly on either scheme. The base is dimmed grey,
+ *     so the highlight travels toward the EXTREME: white in dark mode, black in
+ *     light mode. (A card's neutral sweep resolves the same way for a different
+ *     reason — contrast against the card face. Same direction, different cause; do
+ *     not "unify" them into one rule.)
+ *
+ * ── WHY THIS IS A GLOBAL STYLESHEET ──────────────────────────────────────────
+ * Both render paths paint these rows: the chunk `CollapsibleTrace` and the vlist
+ * `RenderToolRun`. vlist must not import from the chunk path (vlist-isolation
+ * guard), so a shared component or module is impossible. These classes previously
+ * lived in a runtime <style> injected by CollapsibleTrace.tsx, and the vlist rows
+ * referenced them — working only because NarratorPanel still statically imports
+ * MessageRenderer and dragged the chunk path into the graph. That was an accident.
+ * A global stylesheet loaded by main.tsx makes the dependency real.
+ *
+ * The six states mirror @shared/tool-shimmer's kinds 1:1. `queued` is the only
+ * non-sweep phase: it must not use the looping highlight, because a call parked
+ * behind an earlier tool has not started.
+ *
+ * ── ON `light-dark()` AND THE Safari 14 TARGET ────────────────────────────────
+ * `light-dark()` is CSS Color 5 (Chrome 123+, Safari 17.5+) and this app builds for
+ * `["es2020", "safari14"]`, but it is never shipped: `postcss-preset-mantine` (see
+ * postcss.config.cjs) expands every such declaration at BUILD TIME into the light
+ * value plus a `[data-mantine-color-scheme='dark']`-scoped override, so the browser
+ * only ever sees plain `rgba()`/`var()` and an attribute selector.
+ *
+ * Worth knowing precisely HERE, because this carrier could not survive a dropped
+ * declaration: the shared rule sets `-webkit-text-fill-color: transparent`, so a row
+ * whose gradient failed to parse would render INVISIBLE TEXT rather than a slightly
+ * wrong colour. The PostCSS expansion is what makes that impossible — which also means
+ * `light-dark()` must not be used for these classes anywhere outside this pipeline
+ * (a runtime-injected `<style>`, for instance), where it would ship verbatim.
+ */
+
+/*
+ * ── ON `background-position` RATHER THAN `transform` ──────────────────────────
+ * `card-shimmer.css` animates its sweep with `transform: translateX()`, which the
+ * compositor handles without repainting. This file cannot: the gradient IS the text
+ * (`background-clip: text`), so there is no separate overlay element to move — the
+ * only way to slide the highlight is to move the background itself, which repaints
+ * the row's glyphs each frame. That cost is the price of the text-clip carrier, and
+ * the carrier is the reason a folded row can shimmer at all without a card face.
+ *
+ * Why the repaint is bounded in practice, i.e. why there is no per-row limiter here:
+ *
+ *   - Only an IN-FLIGHT row carries a looping class (`resolveToolShimmerPhase`
+ *     returns null for every terminal and unrecognised status), so a fold of settled
+ *     history animates nothing at all — the common case is zero.
+ *   - Concurrency is capped upstream: the agent loop executes one parallel-safe
+ *     GROUP at a time, so the live set is that group plus at most one streaming row,
+ *     not "every row in the fold". A 60-row fold with a live tail animates ~5 rows.
+ *   - Each repaint is one 18.8px line of truncated text, and `prefers-reduced-motion`
+ *     removes it entirely.
+ *
+ * If a future provider ever runs unbounded parallel tools, the fix is to animate only
+ * the last N in-flight rows — not to change the carrier, which would cost the
+ * height-neutrality this whole file is built on.
+ */
+
+/*
+ * ── HOW A PERCENTAGE `background-position` ACTUALLY MOVES ─────────────────────
+ * This is the one piece of arithmetic every keyframe below depends on, and getting
+ * it wrong is what shipped the broken closing sweep.
+ *
+ * A percentage position resolves against the FREE SPACE, not the box:
+ *
+ *     offset = P × (boxWidth − imageWidth)
+ *
+ * The image here is `background-size: 200%`, so imageWidth = 2W and
+ *
+ *     offset = P × (W − 2W) = −P × W
+ *
+ * Two consequences. The tile moves OPPOSITE to P (a rising P sweeps LEFT), and the
+ * tile is TWICE the box, so a full period of the repeating pattern is 200% of P.
+ * The bright band occupies 35%–65% of the tile, i.e. 0.7W–1.3W from the tile's own
+ * left edge — which is what decides when it is on screen.
+ */
+
+/* Looping sweep: the highlight travels left-to-right across the text.
+   Its 400% travel is TWO periods per cycle, i.e. a pass every 1.1s. That is fine
+   for a loop — there is no start or end frame for the reader to catch — but it is
+   exactly what made the one-shot sweep below stutter, so do not copy these bounds
+   into a finite animation. */
+@keyframes nf-trace-shimmer-loop {
+	0% {
+		background-position: 200% 0;
+	}
+	100% {
+		background-position: -200% 0;
+	}
+}
+
+/*
+ * Closing sweep: ONE highlight, entering at the right edge and leaving past the
+ * left. The reversed direction is what distinguishes "this settled" from "this is
+ * still going" at a glance, without relying on the reader noticing a colour.
+ *
+ * ── WHY THESE BOUNDS ARE −30% → 170% AND NOT ±200% ────────────────────────────
+ * This used to run −200% → 200%: 4W of travel across a 2W period, i.e. TWO passes,
+ * which reads as a stutter rather than one closing gesture. And because 4W is an
+ * even multiple of the period, the end frame EQUALLED the start frame — a frame
+ * whose band sits at 0.7W–1.0W, the right-hand end of the row. `both` held it there
+ * until the caller dropped the class, so the green appeared to die mid-row instead
+ * of leaving it.
+ *
+ * The bounds below are derived from the arithmetic above, not tuned:
+ *   - the travel is exactly ONE period (200% of P), so exactly one band passes;
+ *   - the phase parks the band OUTSIDE the box at both ends. P = −30% → offset
+ *     +0.3W puts the band at 1.0W–1.6W, just past the right edge; P = 170% →
+ *     offset −1.7W puts it at −1.0W–−0.4W, fully past the left edge.
+ *
+ * So change one bound and the other must be re-derived: widen the span and the
+ * sweep gains dead time at the ends, narrow it and it starts or stops mid-row.
+ * Moving the gradient's own 35%/65% stops moves these numbers too.
+ */
+@keyframes nf-trace-shimmer-flash {
+	0% {
+		background-position: -30% 0;
+	}
+	100% {
+		background-position: 170% 0;
+	}
+}
+
+/*
+ * ⚠️ Every per-state rule below MUST use `background-image`, never the `background`
+ * shorthand.
+ *
+ * The shorthand resets every background longhand it omits — including the
+ * `background-clip: text` and `background-size` set here. A state rule written as
+ * `background: linear-gradient(…)` therefore silently un-clips the gradient, and
+ * since the text fill is transparent the result is a SOLID GRADIENT BAR where the
+ * row's words used to be: the whole line painted grey with a coloured blob sliding
+ * through it, no text at all. (That is exactly how this shipped broken once — the
+ * predecessor class got away with the shorthand only because it declared all of
+ * these properties in the same rule.)
+ */
+.nf-trace-shimmer--stream,
+.nf-trace-shimmer--reflect,
+.nf-trace-shimmer--run,
+.nf-trace-shimmer--queued,
+.nf-trace-shimmer--queued-out,
+.nf-trace-shimmer--done,
+.nf-trace-shimmer--fail {
+	background-size: 200% 100%;
+	-webkit-background-clip: text;
+	background-clip: text;
+	-webkit-text-fill-color: transparent;
+}
+
+.nf-trace-shimmer--stream,
+.nf-trace-shimmer--reflect,
+.nf-trace-shimmer--run {
+	animation: nf-trace-shimmer-loop 2.2s linear infinite;
+}
+
+/*
+ * Queued — parked slate text, NOT a travelling highlight.
+ *
+ * Same reading as the card's wash: parameters are ready, an earlier call
+ * in the turn still owns the slot. The gradient is static (left-weighted slate
+ * over dimmed grey); only opacity breathes, slowly. Height-neutral: only
+ * background / text-fill / opacity move.
+ */
+.nf-trace-shimmer--queued {
+	background-image: linear-gradient(
+		90deg,
+		light-dark(var(--mantine-color-slate-7), var(--mantine-color-slate-4)) 0%,
+		light-dark(var(--mantine-color-slate-6), var(--mantine-color-slate-5)) 28%,
+		var(--mantine-color-dimmed) 62%,
+		var(--mantine-color-dimmed) 100%
+	);
+	animation: nf-card-queued-pulse 2.4s ease-in-out infinite;
+}
+
+/*
+ * Leaving queued on a text-clip row.
+ *
+ * ⚠️ Cannot fade `opacity` to 0: the gradient IS the glyphs (`text-fill` is
+ * transparent), so opacity 0 would erase the words. The dissolve therefore walks
+ * the slate tint back to plain dimmed grey across several keyframe steps —
+ * same stop layout every frame so a browser that interpolates gradients blends
+ * them, and one that does not still gets a short stepped fade instead of a snap.
+ */
+@keyframes nf-trace-queued-out {
+	0% {
+		background-image: linear-gradient(
+			90deg,
+			light-dark(var(--mantine-color-slate-7), var(--mantine-color-slate-4)) 0%,
+			light-dark(var(--mantine-color-slate-6), var(--mantine-color-slate-5)) 28%,
+			var(--mantine-color-dimmed) 62%,
+			var(--mantine-color-dimmed) 100%
+		);
+	}
+	45% {
+		background-image: linear-gradient(
+			90deg,
+			light-dark(var(--mantine-color-slate-6), var(--mantine-color-slate-5)) 0%,
+			var(--mantine-color-dimmed) 28%,
+			var(--mantine-color-dimmed) 62%,
+			var(--mantine-color-dimmed) 100%
+		);
+	}
+	75% {
+		background-image: linear-gradient(
+			90deg,
+			var(--mantine-color-dimmed) 0%,
+			var(--mantine-color-dimmed) 28%,
+			var(--mantine-color-dimmed) 62%,
+			var(--mantine-color-dimmed) 100%
+		);
+		opacity: 0.85;
+	}
+	100% {
+		background-image: linear-gradient(
+			90deg,
+			var(--mantine-color-dimmed) 0%,
+			var(--mantine-color-dimmed) 28%,
+			var(--mantine-color-dimmed) 62%,
+			var(--mantine-color-dimmed) 100%
+		);
+		opacity: 0.85;
+	}
+}
+
+.nf-trace-shimmer--queued-out {
+	background-image: linear-gradient(
+		90deg,
+		light-dark(var(--mantine-color-slate-7), var(--mantine-color-slate-4)) 0%,
+		light-dark(var(--mantine-color-slate-6), var(--mantine-color-slate-5)) 28%,
+		var(--mantine-color-dimmed) 62%,
+		var(--mantine-color-dimmed) 100%
+	);
+	animation: nf-trace-queued-out 450ms ease-out forwards;
+}
+
+/* Shared keyframe name with card-shimmer.css — one definition, both carriers load
+   the sheet via main.tsx. If a path ever loads only this file, the pulse is
+   missing but the static gradient still reads as queued. */
+
+/*
+ * The closing sweep: one slow, even pass.
+ *
+ * ⚠️ `linear`, not an easing. The band ENTERS and LEAVES the row (see the keyframes),
+ * so any easing spends its slow end outside the box: `ease-out` made the highlight
+ * cross the text quickly and then crawl off-screen where nobody can see it, which
+ * read as the green vanishing partway across. Constant speed is the only curve whose
+ * whole duration is visible.
+ *
+ * 900ms is the sweep the reader is meant to actually follow — it is the row's one
+ * report of an outcome, and at the old 600ms (halved again by the double pass) it
+ * was a flicker. `ROW_FLASH_MS` in both render paths must stay above it, or the
+ * class is pulled while the band is still mid-row.
+ *
+ * `both` and not `forwards` for a reason that is now merely defensive: the end frame
+ * parks the band past the left edge, so holding it would be harmless, but the caller
+ * drops the class anyway and `both` only covers the frame before the first tick.
+ */
+.nf-trace-shimmer--done,
+.nf-trace-shimmer--fail {
+	animation: nf-trace-shimmer-flash 900ms linear both;
+}
+
+/* Streaming — neutral. The highlight goes to the scheme's extreme (white on dark,
+   black on light) because the base is dimmed grey; anything tinted here would be
+   mistaken for one of the four semantic colours. */
+.nf-trace-shimmer--stream {
+	background-image: linear-gradient(
+		90deg,
+		var(--mantine-color-dimmed) 0%,
+		var(--mantine-color-dimmed) 35%,
+		light-dark(rgba(0, 0, 0, 0.85), rgba(255, 255, 255, 0.92)) 50%,
+		var(--mantine-color-dimmed) 65%,
+		var(--mantine-color-dimmed) 100%
+	);
+}
+
+/* Reflecting — indigo automated self-review, paired with the shield status glyph. */
+.nf-trace-shimmer--reflect {
+	background-image: linear-gradient(
+		90deg,
+		var(--mantine-color-dimmed) 0%,
+		var(--mantine-color-dimmed) 35%,
+		light-dark(var(--mantine-color-indigo-7), var(--mantine-color-indigo-3)) 50%,
+		var(--mantine-color-dimmed) 65%,
+		var(--mantine-color-dimmed) 100%
+	);
+}
+
+/* Running — blue, the same family the status spinner and the card border use. */
+.nf-trace-shimmer--run {
+	background-image: linear-gradient(
+		90deg,
+		var(--mantine-color-dimmed) 0%,
+		var(--mantine-color-dimmed) 35%,
+		light-dark(var(--mantine-color-blue-7), var(--mantine-color-blue-3)) 50%,
+		var(--mantine-color-dimmed) 65%,
+		var(--mantine-color-dimmed) 100%
+	);
+}
+
+/* Succeeded — green, one reverse pass. */
+.nf-trace-shimmer--done {
+	background-image: linear-gradient(
+		90deg,
+		var(--mantine-color-dimmed) 0%,
+		var(--mantine-color-dimmed) 35%,
+		light-dark(var(--mantine-color-green-7), var(--mantine-color-green-3)) 50%,
+		var(--mantine-color-dimmed) 65%,
+		var(--mantine-color-dimmed) 100%
+	);
+}
+
+/* Failed — red, one reverse pass. */
+.nf-trace-shimmer--fail {
+	background-image: linear-gradient(
+		90deg,
+		var(--mantine-color-dimmed) 0%,
+		var(--mantine-color-dimmed) 35%,
+		light-dark(var(--mantine-color-red-7), var(--mantine-color-red-4)) 50%,
+		var(--mantine-color-dimmed) 65%,
+		var(--mantine-color-dimmed) 100%
+	);
+}
+
+/*
+ * NOTE: the predecessor class `reasoning-step-shimmer` is gone, not renamed.
+ *
+ * It was the neutral sweep on the live reasoning step, back when that was the only
+ * shimmer a compact row had. Reasoning rows still get exactly that look — they carry
+ * no tool lifecycle, so `nf-trace-shimmer--stream` is the only state they can resolve
+ * to — but they now reach it through the same TRACE_SHIMMER_CLASS table as every
+ * other row, so a second name for one appearance would only be a thing to keep in
+ * sync. Nothing selects the old class any more.
+ */
+
+/* Reduced motion: stop the sweep and restore plain text. Dropping the animation
+   alone would freeze the gradient mid-sweep, leaving the row permanently
+   half-transparent — so the fill colour has to come back too. */
+@media (prefers-reduced-motion: reduce) {
+	.nf-trace-shimmer--stream,
+	.nf-trace-shimmer--reflect,
+	.nf-trace-shimmer--run,
+	.nf-trace-shimmer--queued-out,
+	.nf-trace-shimmer--done,
+	.nf-trace-shimmer--fail {
+		animation: none;
+		-webkit-text-fill-color: currentColor;
+	}
+	/*
+	 * Queued must NOT collapse into the neutral streaming look under reduced
+	 * motion. Keep the slate gradient (static, no pulse) so the parked state
+	 * stays distinguishable from "receiving input".
+	 */
+	.nf-trace-shimmer--queued {
+		animation: none;
+		opacity: 0.85;
+	}
+}

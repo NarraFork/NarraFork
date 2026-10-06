@@ -1,0 +1,95 @@
+{
+  "runId": "2026-09-06T15-41-09-954Z",
+  "experiment": "coherent-delivery-abba",
+  "image": "0d36aaa2c1ad7cccd2dc0cf7fba4efb11ea7193023cecb1c27a84463c9ba01aa",
+  "models": [
+    "nugjp:codex:gpt-5.6-luna",
+    "nug2:antigravity:gemini-3.7-flash"
+  ],
+  "effort": "low",
+  "limits": {
+    "responses": 5,
+    "evals": 6,
+    "requestMs": 120000,
+    "responseChars": 64000
+  },
+  "pilot": {
+    "cases": [
+      "3",
+      "5"
+    ],
+    "order": [
+      "A",
+      "B",
+      "B",
+      "A"
+    ],
+    "repeatsPerCondition": 2,
+    "planned": 16
+  },
+  "regressionGate": "Only when all 8 B pilot trials strictly pass, deliver cleanly, and have zero interface violations; no infrastructure errors or source drift.",
+  "maximumTrials": 28,
+  "frozenBaseline": "2026-09-06T13-35-40-408Z-delivery",
+  "conditions": {
+    "A": {
+      "id": "task-call-v5-delivery",
+      "deliveryEnabled": true
+    },
+    "B": {
+      "id": "task-call-v6-coherent",
+      "deliveryEnabled": true
+    }
+  },
+  "sourceHashes": {
+    "fixtures.ts": "9dca713be6015bb951fbf903663d10dcf08025fdc15b94e5906a5144d91b9398",
+    "contract.ts": "447bc49a6f83a6f967b589fb251dbccfab24fd218dd5ed9bcac8eb79b40c93ce",
+    "profiles.ts": "2644d23d957ad97cb8a82126ad51cbb090ffeaf7f2cbcf8b4fd88a6498531c17",
+    "runner.ts": "875165dc8e7ea70afdeb25b9f3ac6c843c019c46eff440b647775821659e2b1b",
+    "isolate.ts": "f881bdeaace4ca93238873399a3c2ad38354f41a07dfef89c66a0bdbad26d6c3",
+    "client.ts": "f66f203b472a60deb0331f262e4edebcf11c8894b4534a9b563d6ba724fe953c",
+    "run.ts": "b6420921abf5c4fa876d5e797b71783f171f25633317815757749961e3d7fbc8",
+    "analyze.ts": "7c9a849fa7256ed7fb091916ad207ead36c9c95867e9c347880dcb34dfac1cdc",
+    "delivery.test.ts": "40c305712588ff12804f8192ed417350e6b7212b1e7fa70529cc21641e5ee643",
+    "delivery-experiment.ts": "bc02af44b500f09fd243146900d9abe59f6da4c66469ef612c8e3fc41d5bca22"
+  },
+  "sourceSnapshot": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-sources.json",
+  "inputSnapshot": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-inputs.json",
+  "files": [
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-flash-3-A-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-luna-3-A-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-flash-3-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-luna-3-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-flash-3-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-luna-3-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-luna-3-A-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-flash-3-A-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-flash-5-A-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-luna-5-A-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-flash-5-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-luna-5-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-flash-5-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-luna-5-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-flash-5-A-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-luna-5-A-2.json"
+  ],
+  "graderHash": "9dca713be6015bb951fbf903663d10dcf08025fdc15b94e5906a5144d91b9398",
+  "profileHashes": {
+    "A": {
+      "api": "42867f3211583c70d7461d5c72f9f7e0f1a8bf9d6b654167a95284aeef0df2dc",
+      "description": "33be249d00059c586826ec0518dc65bdc5d047ad7d8ae475de054ee2a7837918",
+      "parameters": "8444f2dbd5c73f4317a92785e255a41a39bbf197691a9c4fe64a9ed1e32743e6",
+      "contract": "ee3a01083056859eec6cbb881a72c455f2bda217b6b42233ee3fa2f73e0483bf"
+    },
+    "B": {
+      "api": "2bcd050e5ed2ae07fcf66b96602cd2772cc8bf8f7f87872822f87396ec5f9f23",
+      "description": "fb4db207dfb723b5b5b3a22473c50cc5684d995d778453a882469dacfbf8ea01",
+      "parameters": "910000d08449b0a6ee0a2c2ac8b8c8245141dd3da6ecdf1a475bf699bd50b4a7",
+      "contract": "448d92d8b001de24c457a99c0fada5dd22b47f0159ec6ad0c81a5decafb1dabc"
+    }
+  },
+  "status": "complete",
+  "attempted": 16,
+  "gatePassed": false,
+  "failures": [],
+  "sourceDrift": []
+}

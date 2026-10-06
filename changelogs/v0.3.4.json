@@ -1,0 +1,6 @@
+{
+	"version": "0.3.4",
+	"date": "2026-05-03",
+	"en": "## New Features\n\n- Add a high-performance narrator message renderer with selectable rendering modes for smoother long conversations.\n- Improve API request and usage tracking with richer model/provider metadata and history details.",
+	"zh-CN": "## 新功能\n\n- 新增高性能叙述者消息渲染器，并支持选择渲染模式，让长对话浏览更流畅。\n- 改进 API 请求与用量追踪，记录更完整的模型、提供商和历史明细。"
+}

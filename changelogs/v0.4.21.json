@@ -1,0 +1,6 @@
+{
+	"version": "0.4.21",
+	"date": "2026-06-12",
+	"en": "## New Features\n\n- Reworked skill loading into a multi-level context system (global / project / workspace) with intelligent directory caching (15s in-memory TTL plus a 7-day DB cache) for faster startup.\n- Added partial image generation streaming so previews appear progressively while an image is still being generated.\n- Persisted draft image attachments so they survive switching between narrators.\n\n## Bug Fixes\n\n- Fixed narrator rollback to keep multimodal user messages atomic instead of splitting them.\n- Improved shell command danger assessment to distinguish high vs medium severity and uncertain patterns.\n- Fixed aggregation routing to skip disabled providers, including per-provider disabled flags.\n- Restored the static rawJsonSchema getter for the agent tool and fixed provider fallback to the built-in gateway when no providers are configured.",
+	"zh-CN": "## 新功能\n\n- 重构技能加载为多层级上下文系统（全局 / 项目 / 工作区），并引入智能目录缓存（15 秒内存 TTL + 7 天数据库缓存），加快启动速度。\n- 支持图像生成的分段流式预览，生成过程中即可逐步看到图像预览。\n- 草稿图片附件在切换叙述者后依然保留。\n\n## 修复\n\n- 修复叙述者回滚，保持多模态用户消息的原子性，不再被拆分。\n- 改进 Shell 命令危险等级评估，区分高/中危险级别及不确定的命令模式。\n- 修复聚合路由，跳过已禁用的 Provider（含按 Provider 单独禁用的情况）。\n- 恢复 agent 工具的静态 rawJsonSchema getter，并修复无 Provider 配置时回退到内置网关的逻辑。"
+}

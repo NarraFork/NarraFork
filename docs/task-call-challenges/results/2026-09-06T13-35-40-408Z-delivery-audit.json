@@ -1,0 +1,37 @@
+{
+  "runId": "2026-09-06T13-35-40-408Z",
+  "episodes": 16,
+  "evals": 36,
+  "requests": 45,
+  "gatePassed": false,
+  "abbaVerified": true,
+  "allSourcesAndInputsMatch": true,
+  "allWireLowAndEvalOnly": true,
+  "originalScorerHash": "9dca713be6015bb951fbf903663d10dcf08025fdc15b94e5906a5144d91b9398",
+  "iifeDiagnostic": {
+    "modelCodeUnmodified": true,
+    "modelResultFile": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-flash-3-B-1.json",
+    "evalNumber": 3,
+    "bothProfilesReturnSameLastApiPage": true,
+    "observation": {
+      "items": [
+        {
+          "key": "Q38",
+          "text": "历史回归 3",
+          "status": "done",
+          "paused": false,
+          "archived": true
+        },
+        {
+          "key": "R57",
+          "text": "历史回归 4",
+          "status": "done",
+          "paused": false,
+          "archived": true
+        }
+      ],
+      "hasMore": false
+    },
+    "note": "Offline replay only, not additional model trials or a repaired model success. An IIFE return is not an outer return in this wrapper."
+  }
+}

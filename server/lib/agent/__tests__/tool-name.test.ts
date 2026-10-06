@@ -1,0 +1,119 @@
+import { describe, expect, test } from "bun:test";
+import { PARALLEL_GROUP_SHELL_TOOL_NAME } from "@shared/tool-parallel-groups";
+import {
+	BASH_TOOL_NAME,
+	canonicalizeToolName,
+	isBashToolName,
+	isValidToolName,
+	MAX_TOOL_NAME_LENGTH,
+	normalizeToolName,
+	sanitizeToolNameSegment,
+	TOOL_NAME_PATTERN,
+} from "../tool-name";
+
+/**
+ * `@shared/tool-parallel-groups` spells the shell tool's name itself rather than
+ * importing it: the grouping predicates are shared with the frontend, and this
+ * module is server-side (provider wire alphabets, length caps). Nothing in the
+ * type system ties the two spellings together, and a divergence would be silent —
+ * Bash would quietly stop being treated as a serial barrier on one side.
+ */
+test("the shared parallel-group predicates spell the shell tool the same way", () => {
+	expect(PARALLEL_GROUP_SHELL_TOOL_NAME).toBe(BASH_TOOL_NAME);
+});
+
+describe("isValidToolName", () => {
+	test("accepts the built-in tool names unchanged", () => {
+		for (const name of [
+			"Bash",
+			"Read",
+			"WebSearch",
+			"ExitPlanConfirmAndCompact",
+			"mcp__gh__echo",
+		]) {
+			expect(isValidToolName(name)).toBe(true);
+		}
+	});
+
+	test("rejects names providers would 400 on", () => {
+		for (const name of ["", "github.search", "fs/read", "tool name", "ns:tool", "emoji😀"]) {
+			expect(isValidToolName(name)).toBe(false);
+		}
+	});
+
+	test("rejects names over the length budget", () => {
+		expect(isValidToolName("a".repeat(MAX_TOOL_NAME_LENGTH))).toBe(true);
+		expect(isValidToolName("a".repeat(MAX_TOOL_NAME_LENGTH + 1))).toBe(false);
+	});
+});
+
+describe("sanitizeToolNameSegment", () => {
+	test("maps illegal characters to underscores instead of dropping them", () => {
+		// Dropping would let `a.b` and `ab` collapse onto the same wire name.
+		expect(sanitizeToolNameSegment("com.example.duo")).toBe("com_example_duo");
+		expect(sanitizeToolNameSegment("github/search issues")).toBe("github_search_issues");
+	});
+
+	test("falls back to a placeholder when nothing usable remains", () => {
+		expect(sanitizeToolNameSegment("")).toBe("unknown");
+		expect(sanitizeToolNameSegment("...")).toBe("unknown");
+		expect(sanitizeToolNameSegment("😀")).toBe("unknown");
+	});
+
+	test("keeps already-safe segments byte-identical", () => {
+		expect(sanitizeToolNameSegment("search_issues-v2")).toBe("search_issues-v2");
+	});
+});
+
+describe("normalizeToolName", () => {
+	test("returns valid names untouched so history keeps matching", () => {
+		expect(normalizeToolName("Bash")).toBe("Bash");
+		expect(normalizeToolName("mcp__gh__search_issues")).toBe("mcp__gh__search_issues");
+	});
+
+	test("produces a provider-valid name for every dynamic input shape", () => {
+		for (const raw of [
+			"mcp__gh__github.search_issues",
+			"plugin__com.example.duo__echo",
+			"mcp__srv__ns:tool/name",
+			`plugin__${"x".repeat(80)}__handler`,
+		]) {
+			const normalized = normalizeToolName(raw);
+			expect(TOOL_NAME_PATTERN.test(normalized)).toBe(true);
+			expect(normalized.length).toBeLessThanOrEqual(MAX_TOOL_NAME_LENGTH);
+			expect(isValidToolName(normalized)).toBe(true);
+		}
+	});
+
+	test("keeps over-long names distinct via a deterministic digest suffix", () => {
+		const a = normalizeToolName(`plugin__${"a".repeat(90)}__one`);
+		const b = normalizeToolName(`plugin__${"a".repeat(90)}__two`);
+		expect(a).not.toBe(b);
+		// Same input must always yield the same wire name, or history would break.
+		expect(normalizeToolName(`plugin__${"a".repeat(90)}__one`)).toBe(a);
+	});
+});
+
+describe("shell tool name", () => {
+	test("is Bash regardless of platform or detected shell", () => {
+		// The old `detectShell().type === "bash" ? "Bash" : "Shell"` rule made the
+		// tool name depend on the host, while several prompt sections keyed off
+		// IS_WINDOWS instead — so the two disagreed on Windows + Git Bash and the
+		// model kept calling a tool that did not exist.
+		expect(BASH_TOOL_NAME).toBe("Bash");
+	});
+
+	test("recognizes the canonical name and the legacy Shell alias", () => {
+		expect(isBashToolName("Bash")).toBe(true);
+		expect(isBashToolName("Shell")).toBe(true);
+		expect(isBashToolName("Execute")).toBe(false);
+		expect(isBashToolName("Read")).toBe(false);
+	});
+
+	test("canonicalizes the legacy alias and leaves everything else alone", () => {
+		expect(canonicalizeToolName("Shell")).toBe("Bash");
+		expect(canonicalizeToolName("Bash")).toBe("Bash");
+		expect(canonicalizeToolName("Read")).toBe("Read");
+		expect(canonicalizeToolName("mcp__gh__search_issues")).toBe("mcp__gh__search_issues");
+	});
+});

@@ -1,0 +1,6 @@
+{
+	"version": "0.3.5",
+	"date": "2026-05-04",
+	"en": "## New Features\n\n- Expand the Pixi narrator renderer with richer Markdown support, including inline formatting, task lists, nested lists, tables, and syntax-highlighted code blocks.\n- Keep scroll position stable when switching between React and Pixi message renderers, with smoother resize handling for long conversations.\n- Improve Pixi rendering performance with message layout caching, renderer resize deduplication, and faster visible-item drawing.\n\n## Bug Fixes\n\n- Restore Pixi image texture rendering after browser or renderer resume events.\n- Prevent YOLO safety pause warnings from being saved as tool output before the original tool has executed.\n- Record automatic YOLO reflection confirmations and cancellations accurately in permission audit metadata.",
+	"zh-CN": "## 新功能\n\n- 扩展 Pixi 叙述者渲染器的 Markdown 能力，支持行内格式、任务列表、嵌套列表、表格和带语法高亮的代码块。\n- 在 React 与 Pixi 消息渲染器之间切换时保持滚动位置稳定，并优化长对话中的尺寸变化处理。\n- 通过消息布局缓存、渲染器 resize 去重和更快的可见项绘制，提升 Pixi 渲染性能。\n\n## 修复\n\n- 修复浏览器或渲染器恢复后 Pixi 图片纹理无法正确显示的问题。\n- 避免 YOLO 安全暂停在原工具尚未执行前，把警告内容保存为工具输出。\n- 正确记录 YOLO 反思自动确认或取消时的权限审计来源。"
+}

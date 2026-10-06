@@ -1,0 +1,26 @@
+.nf-monaco-host {
+	min-width: 0;
+	min-height: 0;
+	height: 100%;
+	overflow: hidden;
+	overscroll-behavior: contain;
+	visibility: inherit;
+}
+.nf-monaco-host .monaco-editor,
+.nf-monaco-host .overflow-guard {
+	visibility: inherit;
+}
+.nf-monaco-host .nf-monaco-navigation-gutter {
+	background: var(--mantine-color-indigo-light);
+}
+.nf-monaco-host .nf-monaco-navigation-start {
+	box-shadow: inset 0 1px 0 var(--mantine-color-indigo-light-hover);
+}
+.nf-monaco-host .nf-monaco-navigation-end {
+	box-shadow: inset 0 -1px 0 var(--mantine-color-indigo-light-hover);
+}
+.nf-monaco-host .nf-monaco-navigation-start.nf-monaco-navigation-end {
+	box-shadow:
+		inset 0 1px 0 var(--mantine-color-indigo-light-hover),
+		inset 0 -1px 0 var(--mantine-color-indigo-light-hover);
+}

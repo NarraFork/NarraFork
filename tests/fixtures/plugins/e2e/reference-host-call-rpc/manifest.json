@@ -1,0 +1,33 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.host-call-rpc",
+	"version": "1.0.0",
+	"displayName": "Reference Plugin to Host RPC",
+	"description": "A bounded stdio fixture that initiates Host API requests after activation.",
+	"engine": {
+		"runtime": "bun",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"features": [],
+		"runner": "local-process"
+	},
+	"server": {
+		"entry": "server/index.js",
+		"transport": "stdio",
+		"protocol": "narrafork.rpc/1",
+		"args": [],
+		"workingDirectory": "package",
+		"startupTimeoutMs": 2000,
+		"activationTimeoutMs": 2000
+	},
+	"activationEvents": ["onStartup"],
+	"contributes": {},
+	"permissions": {
+		"host": ["query.read.projects", "command.chapter.write"],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": { "package": "readOnly", "pluginData": "none", "workspace": "none" },
+		"process": { "spawn": "none" }
+	},
+	"secrets": [],
+	"dependencies": { "plugins": {}, "runtime": {} }
+}

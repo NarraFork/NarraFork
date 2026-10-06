@@ -1,0 +1,6 @@
+{
+	"version": "0.4.2",
+	"date": "2026-05-06",
+	"en": "## New Features\n\n- Added clearer narrator runtime feedback for reflection, manual takeover, and long-running operations.\n- Improved Codex quota visibility so usage limits are easier to understand during agent work.\n- Enhanced the Browser tool with captured evaluation output, safer timeouts, stable value serialization, and more reliable console logs.\n- Improved stream retry handling for queued and truncated provider responses.\n\n## Bug Fixes\n\n- Preserved completed eager tool results when sessions are interrupted or streams close unexpectedly.\n- Kept meaningful Browser console diagnostics for errors instead of replacing them with empty serialized objects.",
+	"zh-CN": "## 新功能\n\n- 增加更清晰的叙述者运行时反馈，便于理解反思状态、手动接管和长时间运行任务。\n- 改进 Codex 配额可见性，让 Agent 工作过程中的用量限制更容易判断。\n- 增强 Browser 工具，支持捕获脚本返回值与控制台输出、更安全的超时、稳定值序列化和更可靠的日志读取。\n- 改进队列中和截断流场景的重试判断，提升提供商响应异常时的恢复能力。\n\n## 修复\n\n- 修复会话中断或流异常关闭时已完成 eager 工具结果可能丢失的问题。\n- 修复 Browser 控制台错误诊断文本可能被空对象序列化结果覆盖的问题。"
+}

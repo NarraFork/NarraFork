@@ -1,0 +1,11 @@
+{
+	"title": "探索组",
+	"create": "创建探索组",
+	"decide": "选定方案",
+	"abandon": "放弃探索",
+	"status": {
+		"active": "进行中",
+		"decided": "已决策",
+		"abandoned": "已放弃"
+	}
+}

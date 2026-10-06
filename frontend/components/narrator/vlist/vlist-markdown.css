@@ -1,0 +1,319 @@
+/**
+ * vlist-markdown.css — Visual chrome for the pretext vlist markdown renderer.
+ *
+ * Fragment fonts (size/weight/family) are already applied inline via the same
+ * `font` strings used by measure (prepared-block.fonts[]). This file only adds
+ * visual decorations that pretext width math either ignores or models via
+ * extraWidth (inline-code padding), so heights stay aligned while display
+ * approaches MarkdownContent.module.css.
+ *
+ * Class names are produced by parse-markdown.ts resolveClassName / marker helpers:
+ *   .vlist-frag, .vlist-frag--body, .vlist-frag--h1..h6, .vlist-frag--code
+ *   .is-strong, .is-em, .is-del, .is-link
+ *   .vlist-marker, .vlist-marker--bullet, .vlist-marker--ordered, .vlist-marker--task
+ */
+
+/* Blockquote panel tint (mirrors MarkdownContent.module.css .mdQuote). Dark by
+   default; light-scheme override matches the chunk renderer. */
+:root {
+	--vlist-quote-bg: rgba(59, 91, 219, 0.06);
+	/* Fenced code panel background (mirrors HighlightedCode.module.css .root:
+	   --mantine-color-body dark; gray-1 in light scheme). */
+	--vlist-code-bg: var(--mantine-color-body);
+	/* Fenced code / math-fallback text. Shiki supplies per-token colours once a
+	   highlight lands (see useShikiTokens); this is the base foreground behind
+	   them — used before the highlight arrives, for tokens Shiki leaves
+	   uncoloured, and for plain-text / oversized bodies. MUST follow the colour
+	   scheme: a fixed light grey is invisible on the light panel. */
+	--vlist-code-fg: var(--mantine-color-gray-3);
+	/* Thematic break — mirrors Mantine <Divider>'s --divider-color
+	   (light-dark(gray-3, dark-4)), which the chunk renderer uses. */
+	--vlist-rule-color: var(--mantine-color-dark-4);
+	/* Reservation fill for blocks whose real content has not painted yet. */
+	--vlist-placeholder-bg: var(--mantine-color-dark-6);
+	/* Inline-code chip (mirrors MarkdownContent.module.css code.mdCode). */
+	--vlist-inline-code-bg: var(--mantine-color-dark-5);
+	--vlist-inline-code-fg: var(--mantine-color-white);
+	/* Monospace detail panel inside tool cards (bash output / code / diff bodies). */
+	--vlist-detail-panel-bg: var(--mantine-color-dark-8);
+	--vlist-detail-panel-fg: var(--mantine-color-gray-3);
+	/* Media / image reservation fill behind a not-yet-loaded picture. */
+	--vlist-media-bg: var(--mantine-color-dark-6);
+	/* Diff tints (row background + the stronger word-level background inside a
+	   modified pair). Consumed by render/RenderToolCall.tsx DiffBody, which reads
+	   these variables instead of branching on the colour scheme in JS — the
+	   cascade follows the theme on its own. Colours never affect geometry, so the
+	   height model is untouched. Values mirror the chunked DiffView table. */
+	--vlist-diff-added-bg: var(--mantine-color-green-light);
+	--vlist-diff-removed-bg: var(--mantine-color-red-light);
+	--vlist-diff-added-word-bg: var(--mantine-color-green-light-hover);
+	--vlist-diff-removed-word-bg: var(--mantine-color-red-light-hover);
+	/* Table chrome. Mirrors Mantine Table's own dark-scheme custom properties
+	   (--table-border-color / --table-striped-color / --table-hover-color) so a
+	   pretext-drawn table is indistinguishable from the chunked <Table> path.
+	   Colours never affect geometry. */
+	--vlist-table-border: var(--mantine-color-dark-4);
+	--vlist-table-striped-bg: var(--mantine-color-dark-6);
+	--vlist-table-hover-bg: var(--mantine-color-dark-5);
+	--vlist-table-header-bg: transparent;
+}
+:root[data-mantine-color-scheme="light"] {
+	--vlist-quote-bg: rgba(76, 110, 245, 0.07);
+	--vlist-code-bg: var(--mantine-color-gray-1);
+	--vlist-code-fg: var(--mantine-color-gray-9);
+	--vlist-rule-color: var(--mantine-color-gray-3);
+	--vlist-placeholder-bg: var(--mantine-color-gray-2);
+	--vlist-inline-code-bg: var(--mantine-color-gray-1);
+	--vlist-inline-code-fg: var(--mantine-color-black);
+	/* gray-0 keeps the panel a shade lighter than the fenced-code panel
+	   (--vlist-code-bg = gray-1) so nested blocks stay distinguishable. */
+	--vlist-detail-panel-bg: var(--mantine-color-gray-0);
+	--vlist-detail-panel-fg: var(--mantine-color-gray-9);
+	--vlist-media-bg: var(--mantine-color-gray-2);
+	/* Mantine's `*-light` variants are too pale on a light surface, so the light
+	   scheme uses explicit higher-opacity rgba (chunked DiffView parity) — that is
+	   why these are two separate declarations rather than one light-dark(). */
+	--vlist-diff-added-bg: rgba(46, 160, 67, 0.13);
+	--vlist-diff-removed-bg: rgba(255, 99, 71, 0.13);
+	--vlist-diff-added-word-bg: rgba(46, 160, 67, 0.25);
+	--vlist-diff-removed-word-bg: rgba(255, 99, 71, 0.25);
+	/* Mantine Table's light-scheme custom properties. */
+	--vlist-table-border: var(--mantine-color-gray-3);
+	--vlist-table-striped-bg: var(--mantine-color-gray-0);
+	--vlist-table-hover-bg: var(--mantine-color-gray-1);
+	--vlist-table-header-bg: transparent;
+}
+
+/* Table row backgrounds (chunked path's `striped` + `highlightOnHover`).
+   Colours only — the row box is already reserved by the height model, so these
+   rules are geometry-neutral. Header rows are excluded from both, matching
+   Mantine's striping of tbody alone. */
+.vlist-table-row[data-vlist-table-row="header"] {
+	background: var(--vlist-table-header-bg);
+}
+.vlist-table-row[data-vlist-table-row="body"][data-striped] {
+	background: var(--vlist-table-striped-bg);
+}
+
+/* Hover is gated on a hover-capable pointer for the same reason Mantine gates
+   it: on touch the rule would latch after a tap and never clear. It follows the
+   striping rules in source order and matches at equal-or-higher specificity, so
+   it wins the cascade without !important. */
+@media (hover: hover) {
+	.vlist-table-row[data-vlist-table-row="body"]:hover {
+		background: var(--vlist-table-hover-bg);
+	}
+}
+
+/* Base fragment: measure paints size via `font:`; keep line-box neutral. */
+.vlist-frag {
+	color: inherit;
+}
+
+/* Streaming per-grapheme fade-in (mirrors MarkdownContent.module.css
+   .animatedWord / @keyframes markdownWordIn). Applied only to freshly-appended
+   graphemes in the active line of the live streaming tail. `display:inline`
+   keeps each grapheme from becoming an atomic inline-block (which would alter
+   wrapping / the fragment box); the animation itself uses only compositor
+   properties (opacity/transform/filter) so measured heights are unaffected.
+
+   ⚠️ The duration is DUPLICATED in JS: stream-token-anim.ts uses it to decide
+   when a grapheme's span may be folded back into plain text. A duration longer
+   here than there seals the span mid-animation, snapping the character to its end
+   state — the exact defect the time-driven seal exists to fix, and one nothing
+   else detects.
+
+   It is user-configurable (Settings → Appearance), so BOTH sides read one
+   preference: AppRootLayout writes --nf-stream-token-duration onto <html> and
+   calls setStreamAnimDurationMs with the same value. The 0.32s fallback here must
+   equal DEFAULT_STREAM_ANIM_DURATION_MS (a test pins the pair), so a browser with
+   nothing stored — or a frame rendered before that effect runs — behaves as before.
+
+   `both` fill-mode is load-bearing for the negative `animation-delay` a remounted
+   span carries: it makes an already-elapsed portion resolve to the correct
+   mid-animation state instead of the pre-start one. */
+.vlist-anim-token {
+	display: inline;
+	animation: vlist-token-in var(--nf-stream-token-duration, 0.32s) ease-out both;
+}
+
+@keyframes vlist-token-in {
+	from {
+		opacity: 0;
+		transform: translateY(0.15em);
+		filter: blur(2px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+		filter: blur(0);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.vlist-anim-token {
+		animation: none;
+	}
+}
+
+/* A folded trace row's label switching FORM (placeholder → tail → settled title).
+   Opacity only: the label sits in a fixed 18.8px line, and anything that moves or
+   blurs glyphs would read as the row itself jumping. Applied once, on the render that
+   mounts the new form (see RenderToolRun's useLabelFormFade). */
+.vlist-trace-label-in {
+	animation: vlist-trace-label-in 150ms ease-out both;
+}
+
+@keyframes vlist-trace-label-in {
+	from {
+		opacity: 0;
+	}
+	to {
+		opacity: 1;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.vlist-trace-label-in {
+		animation: none;
+	}
+}
+
+/* Emphasize marks (weight/style usually already in the measured font string;
+   keep CSS as a safety net when the cascade drops synthetic bold/italic). */
+.vlist-frag.is-strong {
+	font-weight: 700;
+}
+
+.vlist-frag.is-em {
+	font-style: italic;
+}
+
+.vlist-frag.is-del {
+	text-decoration: line-through;
+	opacity: 0.85;
+}
+
+/* Links — color only; size already in measured font. */
+.vlist-frag.is-link {
+	color: var(--mantine-color-anchor, var(--mantine-color-blue-4));
+	text-decoration: none;
+}
+
+.vlist-frag.is-link:hover {
+	text-decoration: underline;
+}
+
+/* Inline code — padding is accounted for in measure via INLINE_CODE_EXTRA_WIDTH
+   (10px total ≈ 2+5 left/right). Keep the box light and mono. */
+.vlist-frag.vlist-frag--code {
+	font-family: var(
+		--mantine-font-family-monospace,
+		ui-monospace,
+		SFMono-Regular,
+		Menlo,
+		Monaco,
+		Consolas,
+		"Liberation Mono",
+		"Courier New",
+		monospace
+	);
+	font-size: var(--mantine-font-size-xs, 12px);
+	line-height: var(--mantine-line-height, 1.55);
+	padding: 2px 5px;
+	border-radius: var(--mantine-radius-sm, 4px);
+	background-color: var(--vlist-inline-code-bg);
+	color: var(--vlist-inline-code-fg);
+	/* Must not reflow line-break differently from measure: keep nowrap in-line. */
+	white-space: pre;
+	box-decoration-break: clone;
+	-webkit-box-decoration-break: clone;
+}
+
+/* Headings inherit measured font size; ensure weight parity with MarkdownContent. */
+.vlist-frag--h1,
+.vlist-frag--h2,
+.vlist-frag--h3,
+.vlist-frag--h4,
+.vlist-frag--h5,
+.vlist-frag--h6 {
+	font-weight: 700;
+	color: inherit;
+}
+
+/* List markers — absolutely positioned by RenderMarkdown next to the line. */
+.vlist-marker {
+	font-size: var(--mantine-font-size-sm, 14px);
+	line-height: var(--mantine-line-height-sm, 1.45);
+	color: var(--mantine-color-dimmed);
+	user-select: none;
+	white-space: pre;
+}
+
+.vlist-marker--bullet {
+	/* slightly larger optical bullet */
+	font-size: 1.1em;
+	line-height: 1;
+}
+
+.vlist-marker--ordered {
+	font-variant-numeric: tabular-nums;
+}
+
+/* ── Math (KaTeX) ──────────────────────────────────────────────────────────────
+ * Geometry is owned by the height model (katex-geometry measured it before
+ * paint), so these rules only handle colour and neutralize the margins KaTeX's
+ * own stylesheet would otherwise add. Anything that could change width or
+ * height here would desync the rendered result from the prediction.
+ */
+.vlist-frag--math,
+.vlist-math-display {
+	color: inherit;
+}
+
+/* KaTeX applies `margin: 1em 0` to .katex-display; the block's own frame already
+ * carries the spacing, so the margin must be removed. */
+.vlist-math-display .katex-display {
+	margin: 0;
+}
+
+/* Fallback when KaTeX is unavailable: show the LaTeX source as dimmed monospace. */
+.vlist-frag--math-source {
+	font-family: var(--mantine-font-family-monospace);
+	font-size: var(--mantine-font-size-xs, 12px);
+	color: var(--mantine-color-dimmed);
+}
+
+.vlist-marker--task {
+	font-size: 1em;
+}
+
+/* Spinner for in-flight tool/subagent status glyphs (StatusIcon parity). Scoped
+   name because this file is vlist-local: anything outside vlist/ that needs a
+   spinner uses Mantine's Loader, which carries its own animation. (A global `spin`
+   keyframe used to be injected at runtime by ToolCallCard; that component is gone,
+   and its one remaining consumer was left with a dead animation name.) */
+@keyframes vlist-spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+.vlist-spin {
+	animation: vlist-spin 1s linear infinite;
+}
+
+/* ── Tool-card / trace-row shimmer: NOT here ──────────────────────────────────
+   The card sweep (`nf-card-shimmer--*`) and the compact-row text shimmer
+   (`nf-trace-shimmer--*`) live in `frontend/styles/card-shimmer.css` and
+   `trace-shimmer.css`, loaded globally by main.tsx, and are selected through
+   CARD_SHIMMER_CLASS / TRACE_SHIMMER_CLASS in `@shared/tool-shimmer`.
+
+   They stay global rather than vlist-local because the classes are selected through
+   shared code that vlist may not import. The arrangement they replaced — a private
+   `vlist-tool-*-shimmer` copy here plus a runtime <style> injected by the (now
+   deleted) chunked ToolCallCard — is exactly how two renderers came to agree on
+   neutral/blue/green while BOTH lacked the purple (reflecting) and red (failed)
+   states. Height-neutrality is
+   unchanged: the card sweep is an `inset: 0` overlay, the row shimmer only recolours
+   text. */

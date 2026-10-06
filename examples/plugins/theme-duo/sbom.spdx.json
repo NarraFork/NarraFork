@@ -1,0 +1,16 @@
+{
+	"spdxVersion": "SPDX-2.3",
+	"dataLicense": "CC0-1.0",
+	"SPDXID": "SPDXRef-DOCUMENT",
+	"name": "com.example.duo",
+	"documentNamespace": "https://narrafork.local/sbom/com.example.duo",
+	"packages": [
+		{
+			"SPDXID": "SPDXRef-duo",
+			"name": "com.example.duo",
+			"versionInfo": "1.0.0",
+			"licenseDeclared": "Apache-2.0",
+			"licenseConcluded": "Apache-2.0"
+		}
+	]
+}

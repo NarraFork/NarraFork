@@ -1,0 +1,6 @@
+{
+	"version": "0.1.12",
+	"date": "2026-04-09",
+	"en": "## Improvements\n\n- Increased PWA maximumFileSizeToCacheInBytes limit to 4MB to accommodate growing bundle size\n- Upgraded test infrastructure: replaced hand-written DDL with Drizzle migration SQL replay, ensuring test schema always matches production\n- Aligned test assertions with current production defaults (slugify CJK support, default model name, tool renames, schema validators)",
+	"zh-CN": "## 改进\n\n- 提升 PWA maximumFileSizeToCacheInBytes 限制至 4MB 以适应不断增长的打包体积\n- 升级测试基础设施：用 Drizzle 迁移 SQL 回放替代手写 DDL，确保测试 schema 始终与生产一致\n- 对齐测试断言与当前生产默认值（slugify CJK 支持、默认模型名称、工具重命名、schema 校验器）"
+}

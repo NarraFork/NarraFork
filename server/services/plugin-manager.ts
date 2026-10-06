@@ -1,0 +1,3438 @@
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { lstat, mkdir, readFile, rm } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { db } from "@server/db";
+import { AsyncMutex } from "@server/lib/async-mutex";
+import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
+import { eventBus, type NarraForkEvent } from "@server/lib/event-bus";
+import { generateShortId } from "@server/lib/id";
+import { adaptPluginCapability } from "@server/lib/integrations/capability-adapters";
+import { logger } from "@server/lib/logger";
+import { getNarraforkPath } from "@server/lib/narrafork-home";
+import { type Manifest, pluginIdSchema, safeParseManifest } from "@server/lib/plugins/manifest";
+import {
+	type PermissionGrant,
+	type PermissionScope,
+	permissionScopeSchema,
+} from "@server/lib/plugins/permissions";
+import { PROVIDER_REQUEST_MAX_BYTES } from "@server/lib/plugins/protocol";
+import { markExtraSearchChannelsReady } from "@server/lib/search/plugin-source";
+import { normalizeSearchSettings } from "@server/lib/search/settings";
+import { saveSettings, settings } from "@server/lib/settings";
+import { PLUGIN_RUNTIME_WORKER_FLAG } from "../plugin-runtime-worker";
+import { PluginAgentToolBridge } from "./plugin-agent-tool-bridge";
+import type { PluginPermissionRequestInput, PluginPrincipal } from "./plugin-capability-broker";
+import {
+	PluginCatalog,
+	type PluginCatalogPlugin,
+	type PluginCatalogSnapshot,
+	type PluginPackageSummary,
+} from "./plugin-catalog";
+import { PluginContributionCoordinator } from "./plugin-contribution-coordinator";
+import { PluginContributionRegistry } from "./plugin-contribution-registry";
+import type { PluginHostRuntimeBindingInput, PluginHostServices } from "./plugin-host-services";
+import {
+	isStableInstallationId,
+	PluginIntegrationAuthorityService,
+} from "./plugin-integration-authority-service";
+import {
+	PluginLifecycleRevokeError,
+	type PluginLifecycleRevokeEvent,
+	type PluginLifecycleRevokeEventKind,
+	type PluginLifecycleRevokeReport,
+} from "./plugin-lifecycle-revoke-coordinator";
+import {
+	type CurrentPackagePointer,
+	type InstalledPackageResult,
+	type PackageSource,
+	PluginPackageStore,
+	type SetCurrentOptions,
+} from "./plugin-package-store";
+import {
+	type PermissionGrantInput,
+	type PermissionMutationResult,
+	type PluginPermanentDenial,
+	type PluginPermissionRequest,
+	type PluginPermissionSet,
+	PluginPermissionStore,
+	permissionSummary,
+} from "./plugin-permission-store";
+import { pluginPlatformServices } from "./plugin-platform-services";
+import {
+	type PodmanPluginSpec,
+	PodmanRunner,
+	type PodmanRunnerOptions,
+} from "./plugin-podman-runner";
+import { createCorePluginPublicApiAdapters } from "./plugin-public-api";
+import {
+	LocalProcessRunner,
+	PluginRuntimeError,
+	type PluginRuntimeOptions,
+	type RuntimeDiagnostics,
+	RuntimeSupervisor,
+} from "./plugin-runtime";
+import { checkSbomInstallPolicy, parseSbom, type SbomInstallPolicy } from "./plugin-sbom";
+import {
+	type PluginTrustKeyring,
+	parsePluginSignature,
+	verifyPluginPackageSignature,
+} from "./plugin-signature";
+import {
+	createPluginStateRecord,
+	type PluginGrantSummary,
+	type PluginJournalContext,
+	type PluginJournalEntry,
+	type PluginJournalOperation,
+	type PluginPackageReference,
+	type PluginPersistenceDiagnostic,
+	type PluginStateRecord,
+	PluginStateStore,
+	pluginStateError,
+} from "./plugin-state-store";
+import { PluginToolRegistry, type PluginToolRuntime } from "./plugin-tool-registry";
+
+const MAX_MANIFEST_BYTES = 1024 * 1024;
+const MAX_TRUST_ARTIFACT_BYTES = 1024 * 1024;
+const HOST_API_VERSION = "1.0";
+
+interface RuntimeLike {
+	state: string;
+	generation: number;
+	getDiagnostics(): RuntimeDiagnostics;
+}
+
+interface RuntimeStateEvent {
+	runtime: RuntimeLike;
+	diagnostics: RuntimeDiagnostics;
+	state: string;
+	sourceError?: unknown;
+	revoked?: boolean;
+	failurePersisted?: boolean;
+}
+
+function asPluginToolRuntime(runtime: RuntimeLike | undefined): PluginToolRuntime | undefined {
+	if (!runtime) return undefined;
+	const request = (runtime as RuntimeLike & { request?: PluginToolRuntime["request"] }).request;
+	if (typeof request !== "function") return undefined;
+	return { request: request.bind(runtime) };
+}
+
+/** Narrow view of the provider catalog refresher, so tests can stub it. */
+export interface PluginProviderCatalogRefresherLike {
+	refreshStale(options?: { signal?: AbortSignal }): Promise<unknown>;
+}
+
+export interface PluginLifecycleRevokeCoordinatorLike {
+	revoke(event: PluginLifecycleRevokeEvent): Promise<PluginLifecycleRevokeReport>;
+}
+
+export interface PluginRuntimeSupervisorLike {
+	register(options: PluginRuntimeOptions): RuntimeLike;
+	start(options: PluginRuntimeOptions): Promise<RuntimeLike>;
+	start(pluginId: string, signal?: AbortSignal): Promise<RuntimeLike>;
+	activate?(options: PluginRuntimeOptions | string, signal?: AbortSignal): Promise<RuntimeLike>;
+	disable(pluginId: string): Promise<void>;
+	drain(pluginId: string): Promise<void>;
+	shutdown(): Promise<void>;
+	get(pluginId: string): RuntimeLike | undefined;
+	getDiagnostics(pluginId?: string): RuntimeDiagnostics[];
+	quarantine(pluginId: string, reason: string): void;
+}
+
+export interface PluginPackageStoreLike {
+	readonly root: string;
+	readonly paths?: {
+		root: string;
+		staging: string;
+		packages: string;
+		current: string;
+	};
+	install(source: PackageSource): Promise<InstalledPackageResult>;
+	readCurrent(): Promise<{
+		version: number;
+		plugins: Record<string, PluginPackageReference>;
+	}>;
+	setCurrent(
+		pluginId: string,
+		pointer: CurrentPackagePointer | undefined,
+		options?: SetCurrentOptions,
+	): Promise<{
+		version: number;
+		plugins: Record<string, PluginPackageReference>;
+	}>;
+	cleanupStaging?(): Promise<number>;
+}
+
+export interface PluginCatalogLike {
+	scan(): Promise<PluginCatalogSnapshot>;
+}
+
+export interface PluginRuntimeBuildContext {
+	pluginId: string;
+	state: PluginStateRecord;
+	package: PluginPackageSummary;
+	manifest: Manifest;
+	root: string;
+	packagePath: string;
+	dataPath: string;
+	tempPath: string;
+	logPath: string;
+	reason: string;
+}
+
+export interface PluginTrustPolicy {
+	/** Disabled by default so existing unsigned development fixtures remain installable. */
+	enabled?: boolean;
+	requireSignature?: boolean;
+	keyring?: PluginTrustKeyring;
+	sbomPolicy?: SbomInstallPolicy;
+}
+
+export interface PluginPodmanConfig {
+	image: string;
+	imageDigest: string;
+	options?: PodmanRunnerOptions;
+}
+
+export interface PluginManagerOptions {
+	root?: string;
+	disabled?: boolean;
+	packageStore?: PluginPackageStoreLike;
+	catalog?: PluginCatalogLike;
+	stateStore?: PluginStateStore;
+	permissionStore?: PluginPermissionStore;
+	integrationAuthorityService?: PluginIntegrationAuthorityService;
+	hostServices?: PluginHostServices;
+	contributionRegistry?: PluginContributionRegistry;
+	toolRegistry?: PluginToolRegistry;
+	agentToolBridge?: PluginAgentToolBridge;
+	contributionCoordinator?: PluginContributionCoordinator;
+	/**
+	 * Pulls plugin provider model catalogs after activation. Optional: without it,
+	 * providers keep whatever catalog the manifest declared.
+	 */
+	providerCatalogRefresher?: PluginProviderCatalogRefresherLike;
+	runtimeSupervisor?: PluginRuntimeSupervisorLike;
+	runtimeOptionsFactory?: (
+		context: PluginRuntimeBuildContext,
+	) => PluginRuntimeOptions | Promise<PluginRuntimeOptions>;
+	trustPolicy?: PluginTrustPolicy;
+	podman?: PluginPodmanConfig;
+	/** Injectable lifecycle fence; production uses the shared plugin platform composition root. */
+	lifecycleRevokeCoordinator?: PluginLifecycleRevokeCoordinatorLike;
+	restorePluginLifecycle?: (pluginId: string) => void | Promise<void>;
+	/**
+	 * Purges the plugin's stored secret values on uninstall.
+	 *
+	 * Without this, credentials would outlive the plugin that owned them and be handed
+	 * straight back if the same pluginId were ever reinstalled.
+	 */
+	purgePluginSecrets?: (pluginId: string) => Promise<unknown> | unknown;
+	/** @deprecated Use lifecycleRevokeCoordinator with a UI-session adapter in tests. */
+	revokeUiSessions?: (pluginId: string) => void | Promise<void>;
+	removeInstalledPackage?: (pluginId: string) => Promise<void>;
+	now?: () => Date;
+}
+
+export interface PluginInstallOptions {
+	pluginId?: string;
+}
+
+export interface PluginActivationOptions {
+	reason?: string;
+	signal?: AbortSignal;
+	/** Automatic activation always obeys the global feature flag. */
+	automatic?: boolean;
+	/** Reserved for an explicit administrator health test while the flag is disabled. */
+	allowWhenDisabled?: boolean;
+}
+
+export interface PluginPermissionReplaceInput {
+	grants: readonly PermissionGrantInput[];
+	expectedRevision: number;
+	grantedBy: string;
+}
+
+export interface PluginPermissionRevokeInput {
+	grantIds: readonly string[];
+	expectedRevision: number;
+	grantedBy: string;
+}
+
+/** Input the capability broker passes when escalating a capability denial into a permission prompt. */
+export interface PluginPermissionMutationResult {
+	status: PluginManagerStatus;
+	permissions: PluginPermissionSet;
+}
+
+export interface PluginManagerStatus extends PluginStateRecord {
+	installed: boolean;
+	featureDisabled: boolean;
+	packageStatus?: PluginPackageSummary["status"];
+	manifest?: PluginPackageSummary["manifest"];
+	contributions: PluginCatalogPlugin["contributions"];
+	diagnostics: Array<
+		| PluginCatalogPlugin["diagnostics"][number]
+		| PluginCatalogSnapshot["diagnostics"][number]
+		| PluginPersistenceDiagnostic
+	>;
+	runtime?: RuntimeDiagnostics;
+	operations: PluginJournalEntry[];
+}
+
+export interface PluginManagerDiagnostics {
+	featureEnabled: boolean;
+	persistence: PluginPersistenceDiagnostic[];
+	catalog: PluginCatalogSnapshot["diagnostics"];
+	plugins: PluginManagerStatus[];
+}
+
+export class PluginManagerError extends AppError {
+	constructor(message: string, code: string, statusCode = 409) {
+		super(message, statusCode, code);
+		this.name = "PluginManagerError";
+	}
+}
+
+function isVolatileRuntimeState(state: PluginStateRecord["runtimeState"]): boolean {
+	return [
+		"starting",
+		"handshaking",
+		"activating",
+		"active",
+		"degraded",
+		"draining",
+		"deactivating",
+		"backoff",
+	].includes(state);
+}
+
+/**
+ * Grant the capabilities a Manifest declares, at first bind of an installation.
+ *
+ * Installing a plugin *is* the trust decision — it puts arbitrary code on the server — so
+ * the capabilities it declared are granted rather than withheld pending a second approval.
+ * This is the "default allow" half of the open-capability model.
+ *
+ * It is applied here, at install/first-bind, and deliberately **not** as a fallback inside
+ * `CapabilityBroker.authorize()`. The broker reads the grant list as live state: `revoke()`
+ * and the lifecycle coordinator express revocation by removing capabilities from it, so a
+ * fallback there would make `disable`/`revoke` silently ineffective.
+ *
+ * **Only capabilities with a canonical adapter are seeded.** Declarations are open — the
+ * manifest schema accepts `admin`, `*`, `network.any` or a vendor-specific token — but a
+ * grant has to be expressible in the authority kernel, which is keyed by
+ * `PLUGIN_CAPABILITY_ADAPTER`. Seeding an unmappable token made `toAuthorityGrants()` throw
+ * `IntegrationAuthorityConflictError`, so *installation itself* failed with a 409 worded in
+ * internal terms. Dropping it here keeps the two halves consistent: the declaration parses,
+ * it simply produces no grant, and the broker (which also requires an adapter) stays
+ * fail-closed at call time. Ignored tokens are logged rather than silently swallowed so an
+ * author can see why a declared capability never took effect.
+ *
+ * An existing summary is returned untouched: once an installation has a grant list, later
+ * edits (including revocation) own it.
+ */
+export function seedGrantsFromManifest(
+	summary: PluginGrantSummary,
+	manifestRequested: readonly string[],
+	context?: { pluginId?: string },
+): PluginGrantSummary {
+	const declared = [...new Set(manifestRequested)];
+	if (declared.length === 0) return summary;
+	const capabilities = declared.filter((capability) => adaptPluginCapability(capability));
+	const ignored = declared.filter((capability) => !adaptPluginCapability(capability));
+	if (ignored.length > 0) {
+		logger.warn("Ignoring plugin capabilities with no canonical adapter while seeding grants", {
+			pluginId: context?.pluginId,
+			ignored,
+			seeded: capabilities.length,
+		});
+	}
+	if (capabilities.length === 0) return summary;
+	// An existing grant list owns itself: later edits (including revocation) are
+	// authoritative, so seeding never touches it. This is also what keeps an UPGRADE
+	// from widening access — the new manifest may declare more, but those extras are
+	// withheld here and raised as pending approval requests
+	// (`requestUndeclaredManifestCapabilities`) instead of being granted silently.
+	if (summary.count > 0 || summary.capabilities.length > 0) return summary;
+	return {
+		...summary,
+		count: capabilities.length,
+		capabilities,
+		revision: Math.max(1, summary.revision),
+	};
+}
+
+function currentPackage(plugin: PluginCatalogPlugin | undefined): PluginPackageSummary | undefined {
+	if (!plugin?.current) return undefined;
+	return plugin.packages.find(
+		(item) => item.version === plugin.current?.version && item.hash === plugin.current.hash,
+	);
+}
+
+function packageCompatibility(
+	plugin: PluginCatalogPlugin | undefined,
+): PluginStateRecord["compatibility"] {
+	const current = currentPackage(plugin);
+	if (current?.status === "compatible") return "compatible";
+	if (current?.status === "incompatible") return "incompatible";
+	return "unknown";
+}
+
+function packageError(
+	plugin: PluginCatalogPlugin | undefined,
+): { code: string; message: string } | null {
+	const current = currentPackage(plugin);
+	const diagnostic = current?.diagnostics[0] ?? plugin?.diagnostics[0];
+	if (!diagnostic) return null;
+	return { code: diagnostic.code, message: diagnostic.message };
+}
+
+function mapRuntimeState(state: string): PluginStateRecord["runtimeState"] {
+	switch (state) {
+		case "starting":
+		case "handshaking":
+		case "active":
+		case "draining":
+		case "crashed":
+		case "failed":
+		case "quarantine":
+			return state;
+		case "stopped":
+			return "inactive";
+		default:
+			return "failed";
+	}
+}
+
+function shouldQuarantine(error: unknown): boolean {
+	if (!(error instanceof PluginRuntimeError)) return false;
+	return (
+		error.kind === "protocol" ||
+		error.kind === "handshake" ||
+		error.code.startsWith("HELLO_") ||
+		error.code.startsWith("HEALTH_") ||
+		["STDOUT_LIMIT", "INVALID_JSON_RPC", "invalid_json_rpc"].includes(error.code)
+	);
+}
+
+function assertPluginId(pluginId: string): void {
+	if (!pluginIdSchema.safeParse(pluginId).success) throw new ValidationError("Invalid pluginId");
+}
+
+function packageReference(
+	packageSummary: PluginPackageSummary | undefined,
+): PluginPackageReference | null {
+	return packageSummary ? { version: packageSummary.version, hash: packageSummary.hash } : null;
+}
+
+function packagePointersEqual(
+	left: PluginPackageReference | null | undefined,
+	right: PluginPackageReference | null | undefined,
+): boolean {
+	if (!left || !right) return !left && !right;
+	return left.version === right.version && left.hash === right.hash;
+}
+
+function authorityInstallationId(state: PluginStateRecord | undefined): string | undefined {
+	return state?.authorityInstallationId ?? state?.current?.hash;
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+async function resolveManagerToolPrincipal(
+	pluginId: string,
+	contributionId: string,
+	runtimeSupervisor: PluginRuntimeSupervisorLike,
+	stateStore: PluginStateStore,
+): Promise<PluginPrincipal | undefined> {
+	const runtime = runtimeSupervisor.get(pluginId);
+	if (!runtime || !["active", "degraded"].includes(runtime.state)) return undefined;
+	const diagnostics = runtime.getDiagnostics();
+	const state = await stateStore.getState(pluginId);
+	const packageVersion = diagnostics.pluginVersion ?? state?.current?.version;
+	// Bindings use the stable UUID installation identity when available; older
+	// state files fall back through the authority generation and legacy package hash.
+	const installationId =
+		state?.installationId ?? authorityInstallationId(state) ?? state?.current?.hash;
+	if (!packageVersion || !installationId) return undefined;
+	return {
+		pluginId,
+		packageVersion,
+		installationId,
+		runtimeId: diagnostics.runtimeId,
+		runtimeGeneration: diagnostics.generation,
+		contributionId,
+	};
+}
+
+/**
+ * The host control plane for plugin lifecycle. It owns desired state and journal
+ * changes; PluginCatalog remains static-only and RuntimeSupervisor owns process
+ * mechanics and restart policy.
+ */
+export class PluginManager {
+	readonly root: string;
+	readonly disabled: boolean;
+	readonly packageStore: PluginPackageStoreLike;
+	readonly catalog: PluginCatalogLike;
+	readonly stateStore: PluginStateStore;
+	readonly permissionStore: PluginPermissionStore;
+	readonly integrationAuthorityService: PluginIntegrationAuthorityService;
+	readonly hostServices: PluginHostServices;
+	readonly contributionRegistry: PluginContributionRegistry;
+	readonly toolRegistry: PluginToolRegistry;
+	readonly agentToolBridge: PluginAgentToolBridge;
+	readonly contributionCoordinator: PluginContributionCoordinator;
+	private readonly providerCatalogRefresher?: PluginProviderCatalogRefresherLike;
+	readonly runtimeSupervisor: PluginRuntimeSupervisorLike;
+	private readonly runtimeOptionsFactory?: PluginManagerOptions["runtimeOptionsFactory"];
+	private readonly trustPolicy: Required<Pick<PluginTrustPolicy, "enabled" | "requireSignature">> &
+		Pick<PluginTrustPolicy, "keyring" | "sbomPolicy">;
+	private readonly podman?: PluginPodmanConfig;
+	private readonly lifecycleRevokeCoordinator: PluginLifecycleRevokeCoordinatorLike;
+	private readonly restorePluginLifecycle: (pluginId: string) => void | Promise<void>;
+	private readonly purgePluginSecrets?: (pluginId: string) => Promise<unknown> | unknown;
+	private readonly legacyRevokeUiSessions?: (pluginId: string) => void | Promise<void>;
+	private readonly removeInstalledPackage: (pluginId: string) => Promise<void>;
+	private readonly now: () => Date;
+	private readonly lifecycleMutex = new AsyncMutex();
+	private readonly lifecycleRevokeFailures = new Map<string, unknown>();
+	private readonly packageMutex = new AsyncMutex();
+	private catalogSnapshot?: PluginCatalogSnapshot;
+	private initializePromise?: Promise<PluginManagerStatus[]>;
+	private initialized = false;
+	private shuttingDown = false;
+
+	constructor(options: PluginManagerOptions = {}) {
+		const root = resolve(options.root ?? options.packageStore?.root ?? getNarraforkPath("plugins"));
+		this.root = root;
+		this.disabled = options.disabled ?? true;
+		this.packageStore = options.packageStore ?? new PluginPackageStore(root);
+		this.catalog = options.catalog ?? new PluginCatalog(root);
+		this.stateStore = options.stateStore ?? new PluginStateStore(root);
+		this.permissionStore =
+			options.permissionStore ??
+			options.hostServices?.permissionStore ??
+			new PluginPermissionStore({ root: this.stateStore.root, stateStore: this.stateStore });
+		this.integrationAuthorityService =
+			options.integrationAuthorityService ??
+			new PluginIntegrationAuthorityService({ permissionStore: this.permissionStore });
+		this.hostServices = options.hostServices ?? pluginPlatformServices.hostServices;
+		this.runtimeSupervisor = options.runtimeSupervisor ?? new RuntimeSupervisor();
+		const useSharedPlatform =
+			!options.root &&
+			!options.packageStore &&
+			!options.catalog &&
+			!options.stateStore &&
+			!options.permissionStore &&
+			!options.integrationAuthorityService &&
+			!options.hostServices &&
+			!options.runtimeSupervisor &&
+			!options.contributionRegistry &&
+			!options.toolRegistry &&
+			!options.agentToolBridge &&
+			!options.contributionCoordinator;
+		if (useSharedPlatform) {
+			this.contributionRegistry = pluginPlatformServices.contributionRegistry;
+			this.toolRegistry = pluginPlatformServices.toolRegistry;
+			this.agentToolBridge = pluginPlatformServices.toolBridge;
+			this.contributionCoordinator = pluginPlatformServices.contributionCoordinator;
+			this.providerCatalogRefresher =
+				options.providerCatalogRefresher ?? pluginPlatformServices.providerCatalogRefresher;
+		} else {
+			this.contributionRegistry = options.contributionRegistry ?? new PluginContributionRegistry();
+			this.toolRegistry =
+				options.toolRegistry ??
+				new PluginToolRegistry({
+					capabilityBroker: this.hostServices.capabilityBroker,
+					resolvePrincipal: (pluginId, contributionId) =>
+						resolveManagerToolPrincipal(
+							pluginId,
+							contributionId,
+							this.runtimeSupervisor,
+							this.stateStore,
+						),
+					resolveRuntime: (pluginId) => {
+						const runtime = this.runtimeSupervisor.get(pluginId);
+						return runtime && ["active", "degraded"].includes(runtime.state)
+							? asPluginToolRuntime(runtime)
+							: undefined;
+					},
+				});
+			this.agentToolBridge =
+				options.agentToolBridge ??
+				new PluginAgentToolBridge({ pluginToolRegistry: this.toolRegistry });
+			this.contributionCoordinator =
+				options.contributionCoordinator ??
+				new PluginContributionCoordinator({
+					contributionRegistry: this.contributionRegistry,
+					toolRegistry: this.toolRegistry,
+					agentToolBridge: this.agentToolBridge,
+					lifecycleStates: () => this.stateStore.listStates(),
+				});
+			// Injected-dependency mode has no platform default; catalog refresh is opt-in.
+			this.providerCatalogRefresher = options.providerCatalogRefresher;
+		}
+		this.agentToolBridge.setActivationHandler((pluginId, activationOptions) =>
+			this.activate(pluginId, activationOptions),
+		);
+		this.agentToolBridge.setRuntimeActiveResolver((pluginId) => {
+			const runtime = this.runtimeSupervisor.get(pluginId);
+			return Boolean(runtime && ["active", "degraded"].includes(runtime.state));
+		});
+		this.runtimeOptionsFactory = options.runtimeOptionsFactory;
+		this.trustPolicy = {
+			enabled: options.trustPolicy?.enabled ?? false,
+			requireSignature: options.trustPolicy?.requireSignature ?? false,
+			keyring: options.trustPolicy?.keyring,
+			sbomPolicy: options.trustPolicy?.sbomPolicy,
+		};
+		this.podman = options.podman;
+		this.lifecycleRevokeCoordinator =
+			options.lifecycleRevokeCoordinator ?? pluginPlatformServices.lifecycleRevokeCoordinator;
+		this.restorePluginLifecycle =
+			options.restorePluginLifecycle ?? pluginPlatformServices.restorePlugin;
+		this.purgePluginSecrets =
+			options.purgePluginSecrets ??
+			((pluginId) => pluginPlatformServices.secretVault.deletePlugin(pluginId));
+		this.legacyRevokeUiSessions = options.revokeUiSessions;
+		this.removeInstalledPackage =
+			options.removeInstalledPackage ?? ((pluginId) => this.removePackageFromDisk(pluginId));
+		this.now = options.now ?? (() => new Date());
+
+		// Inject permission request handler into the capability broker so that
+		// unhandled capability denials can be escalated to an interactive prompt.
+		// The broker accepts onPermissionRequest in its constructor options but the
+		// default shared instance is created without one; we inject it here so the
+		// plugin-manager becomes the single owner of the permission-prompt flow.
+		this.hostServices.capabilityBroker.onPermissionRequest = (
+			input: PluginPermissionRequestInput,
+		) => this.handlePermissionRequest(input);
+	}
+
+	async initialize(): Promise<PluginManagerStatus[]> {
+		if (this.initialized) return this.list();
+		if (this.initializePromise) return this.initializePromise;
+		this.initializePromise = this.initializeInternal();
+		try {
+			return await this.initializePromise;
+		} finally {
+			this.initializePromise = undefined;
+		}
+	}
+
+	isEnabled(): boolean {
+		return !this.disabled;
+	}
+
+	async install(
+		source: PackageSource,
+		options: PluginInstallOptions = {},
+	): Promise<PluginManagerStatus> {
+		await this.ensureInitialized();
+		this.assertFeatureEnabled("install");
+		const hintedPluginId = options.pluginId ?? (await this.discoverSourcePluginId(source));
+		if (hintedPluginId) {
+			assertPluginId(hintedPluginId);
+			return this.lifecycleMutex.acquire(hintedPluginId, () =>
+				this.installLocked(source, hintedPluginId),
+			);
+		}
+
+		// Archive/byte sources do not reveal their identity before PackageStore validation.
+		const installed = await this.packageMutex.acquire("package-store", () =>
+			this.packageStore.install(source),
+		);
+		return this.lifecycleMutex.acquire(installed.pluginId, () =>
+			this.finishInstalledPackage(installed),
+		);
+	}
+
+	async enable(pluginId: string): Promise<PluginManagerStatus> {
+		await this.ensureInitialized();
+		this.assertFeatureEnabled("enable");
+		assertPluginId(pluginId);
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			await this.refreshCatalog();
+			const state = await this.requireState(pluginId);
+			const plugin = this.catalogPlugin(pluginId);
+			if (packageCompatibility(plugin) !== "compatible") {
+				const operation = await this.stateStore.beginOperation({ pluginId, operation: "enable" });
+				const error = new PluginManagerError(
+					`Plugin is not compatible and cannot be enabled: ${pluginId}`,
+					"PLUGIN_INCOMPATIBLE",
+					422,
+				);
+				await this.failOperation(operation, error, "compatibility");
+				throw error;
+			}
+			if (state.desiredState === "enabled" && !this.lifecycleRevokeFailures.has(pluginId)) {
+				await this.refreshCatalog("enable");
+				return this.requireStatus(pluginId);
+			}
+			return this.runJournaled(pluginId, "enable", {}, async () => {
+				await this.stateStore.updateState(pluginId, {
+					desiredState: "enabled",
+					compatibility: "compatible",
+					lastError: null,
+				});
+				try {
+					if (this.lifecycleRevokeFailures.has(pluginId)) {
+						// An explicit recovery attempt needs a fresh event ID: the coordinator
+						// caches failed generation/grant events even after an adapter recovers.
+						await this.revokePluginLifecycle(pluginId, "disable", "manager-enable-recovery");
+					}
+					const runtime = this.runtimeSupervisor.get(pluginId);
+					if (runtime && ["active", "degraded"].includes(runtime.state)) {
+						await this.reconcileActiveRuntimeAccess(pluginId);
+					} else {
+						await this.restorePluginAccess(pluginId);
+					}
+				} catch (error) {
+					await this.stateStore.updateState(pluginId, {
+						desiredState: "disabled",
+						lastError: pluginStateError(error, {
+							phase: "enable-restore",
+							at: this.timestamp(),
+						}),
+					});
+					throw error;
+				}
+				await this.refreshCatalog("enable");
+				return this.requireStatus(pluginId);
+			});
+		});
+	}
+
+	async disable(pluginId: string): Promise<PluginManagerStatus> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			const state = await this.requireState(pluginId);
+			const runtime = this.runtimeSupervisor.get(pluginId);
+			if (
+				state.desiredState === "disabled" &&
+				(!runtime || runtime.state === "stopped") &&
+				!this.lifecycleRevokeFailures.has(pluginId)
+			) {
+				await this.refreshCatalog("disable");
+				return this.requireStatus(pluginId);
+			}
+			return this.runJournaled(pluginId, "disable", {}, async () => {
+				await this.revokePluginLifecycle(pluginId, "disable", "manager-disable");
+				await this.stateStore.updateState(pluginId, {
+					desiredState: "disabled",
+					runtimeState: runtime && runtime.state !== "stopped" ? "draining" : "inactive",
+				});
+				await this.refreshCatalog("disable");
+				try {
+					await this.runtimeSupervisor.disable(pluginId);
+				} catch (error) {
+					this.runtimeSupervisor.quarantine(pluginId, "runtime shutdown failed");
+					await this.persistFailure(pluginId, error, "disable", true);
+					throw error;
+				}
+				await this.stateStore.updateState(pluginId, {
+					desiredState: "disabled",
+					runtimeState: "inactive",
+					consecutiveFailures: 0,
+					lastError: null,
+				});
+				await this.refreshCatalog("disable");
+				return this.requireStatus(pluginId);
+			});
+		});
+	}
+
+	async activate(
+		pluginId: string,
+		options: PluginActivationOptions = {},
+	): Promise<PluginManagerStatus> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		if (this.shuttingDown) {
+			throw new PluginManagerError(
+				"Plugin manager is shutting down",
+				"PLUGIN_MANAGER_SHUTTING_DOWN",
+				503,
+			);
+		}
+		if (this.disabled && !options.allowWhenDisabled) {
+			throw new PluginManagerError(
+				options.automatic
+					? "Automatic plugin activation is disabled by the host feature flag"
+					: "Plugin activation is disabled by the host feature flag",
+				"PLUGINS_DISABLED",
+				503,
+			);
+		}
+		return this.lifecycleMutex.acquire(pluginId, () => this.activateLocked(pluginId, options));
+	}
+
+	async deactivate(pluginId: string): Promise<PluginManagerStatus> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			await this.requireState(pluginId);
+			const runtime = this.runtimeSupervisor.get(pluginId);
+			if (!runtime || runtime.state === "stopped") {
+				await this.stateStore.updateState(pluginId, { runtimeState: "inactive" });
+				await this.refreshCatalog();
+				return this.requireStatus(pluginId);
+			}
+			return this.runJournaled(pluginId, "deactivate", {}, async () => {
+				await this.revokePluginLifecycle(pluginId, "deactivate", "manager-deactivate");
+				await this.stateStore.updateState(pluginId, { runtimeState: "draining" });
+				await this.refreshCatalog();
+				try {
+					await this.runtimeSupervisor.disable(pluginId);
+				} catch (error) {
+					this.runtimeSupervisor.quarantine(pluginId, "runtime deactivation failed");
+					await this.persistFailure(pluginId, error, "deactivate", true);
+					throw error;
+				}
+				await this.stateStore.updateState(pluginId, {
+					runtimeState: "inactive",
+					consecutiveFailures: 0,
+					lastError: null,
+				});
+				await this.refreshCatalog();
+				return this.requireStatus(pluginId);
+			});
+		});
+	}
+
+	async getPermissions(pluginId: string): Promise<PluginPermissionSet> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		const installationId = await this.currentInstallationId(pluginId);
+		const state = await this.requireState(pluginId);
+		const permissions = await this.integrationAuthorityService.ensureInstallation(
+			pluginId,
+			installationId,
+			state.grants,
+		);
+		await this.syncPermissionSummary(pluginId, permissions);
+		return permissions;
+	}
+
+	async replacePermissions(
+		pluginId: string,
+		input: PluginPermissionReplaceInput,
+	): Promise<PluginPermissionMutationResult> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		this.assertPermissionMutationInput(input);
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			const state = await this.requireState(pluginId);
+			const installationId = await this.currentInstallationId(pluginId);
+			await this.integrationAuthorityService.ensureInstallation(
+				pluginId,
+				installationId,
+				state.grants,
+			);
+			const mutation = await this.integrationAuthorityService.replace(
+				pluginId,
+				installationId,
+				input.grants,
+				{
+					expectedRevision: input.expectedRevision,
+					grantedBy: input.grantedBy,
+				},
+			);
+			return this.applyPermissionMutationLocked(pluginId, installationId, mutation);
+		});
+	}
+
+	async revokePermissions(
+		pluginId: string,
+		input: PluginPermissionRevokeInput,
+	): Promise<PluginPermissionMutationResult> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		this.assertPermissionMutationInput(input);
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			const state = await this.requireState(pluginId);
+			const installationId = await this.currentInstallationId(pluginId);
+			await this.integrationAuthorityService.ensureInstallation(
+				pluginId,
+				installationId,
+				state.grants,
+			);
+			const mutation = await this.integrationAuthorityService.revoke(
+				pluginId,
+				installationId,
+				input.grantIds,
+				{
+					expectedRevision: input.expectedRevision,
+					grantedBy: input.grantedBy,
+				},
+			);
+			return this.applyPermissionMutationLocked(pluginId, installationId, mutation);
+		});
+	}
+
+	async listPendingPermissionRequests(pluginId: string): Promise<PluginPermissionRequest[]> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		const installationId = await this.currentInstallationId(pluginId);
+		await this.requireState(pluginId);
+		return this.permissionStore.listPendingRequests(pluginId, installationId);
+	}
+
+	async approvePermissionRequest(
+		pluginId: string,
+		requestId: string,
+		grantedBy: string,
+	): Promise<PluginPermissionMutationResult> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		if (typeof requestId !== "string" || !requestId.trim() || requestId.length > 256) {
+			throw new ValidationError("Invalid permission request id");
+		}
+		if (
+			typeof grantedBy !== "string" ||
+			!grantedBy.trim() ||
+			grantedBy.length > 256 ||
+			/[\0\r\n]/u.test(grantedBy)
+		) {
+			throw new ValidationError("Invalid permission actor");
+		}
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			await this.requireState(pluginId);
+			const installationId = await this.currentInstallationId(pluginId);
+			const pending = await this.permissionStore.listPendingRequests(pluginId, installationId);
+			const request = pending.find((req) => req.requestId === requestId);
+			if (!request) throw new NotFoundError("PluginPermissionRequest", requestId);
+			if (request.status !== "pending") {
+				throw new ValidationError(
+					`Permission request ${requestId} has already been ${request.status}`,
+				);
+			}
+
+			// The canonical grant lives in the DB authority. Write it there FIRST so a
+			// crash between the authority write and the compatibility-mirror write can
+			// never lose an approval; the mirror (and the pending request) is resolved
+			// afterwards. The grant id is derived from the request id so a retry after
+			// a crash re-approves the same request idempotently instead of widening the
+			// grant set again.
+			const current = await this.integrationAuthorityService.get(pluginId, installationId);
+			const grantId = `grant_perm_${createHash("sha256").update(requestId).digest("hex").slice(0, 20)}`;
+			const sameScope = (a: PermissionScope, b: PermissionScope): boolean =>
+				a.type === b.type && (a.id ?? null) === (b.id ?? null);
+			const alreadyGranted = current.grants.some(
+				(grant) =>
+					grant.grantId === grantId ||
+					(grant.capability === request.capability && sameScope(grant.scope, request.scope)),
+			);
+			if (!alreadyGranted) {
+				const mutation = await this.integrationAuthorityService.replace(
+					pluginId,
+					installationId,
+					[
+						...current.grants.map(
+							(grant): PermissionGrantInput => ({
+								capability: grant.capability,
+								scope: grant.scope,
+								...(grant.constraints === undefined ? {} : { constraints: grant.constraints }),
+								...(grant.expiresAt === undefined ? {} : { expiresAt: grant.expiresAt }),
+								grantId: grant.grantId,
+								grantedBy: grant.grantedBy,
+							}),
+						),
+						{
+							capability: request.capability,
+							scope: request.scope,
+							grantId,
+							grantedBy,
+						},
+					],
+					{ expectedRevision: current.revision, grantedBy },
+				);
+				await this.applyPermissionMutationLocked(pluginId, installationId, mutation);
+			} else {
+				// Retry of an already-approved request: reconcile the summary so the
+				// state mirror matches the canonical authority even if the earlier
+				// approval crashed between the authority write and the summary write.
+				const fresh = await this.integrationAuthorityService.get(pluginId, installationId);
+				await this.syncPermissionSummary(pluginId, fresh);
+			}
+
+			const resolved = await this.permissionStore.resolvePendingRequest(
+				pluginId,
+				installationId,
+				requestId,
+				"granted",
+			);
+			if (!resolved) throw new NotFoundError("PluginPermissionRequest", requestId);
+
+			eventBus.emit({
+				type: "plugin:permission_resolved",
+				pluginId,
+				requestId,
+				status: "granted",
+			} as NarraForkEvent);
+			await this.broadcastPluginEvent("plugin:permission_resolved", {
+				pluginId,
+				requestId,
+				status: "granted",
+			});
+
+			const permissions = await this.permissionStore.getSet(pluginId, installationId);
+			return {
+				status: await this.requireStatus(pluginId),
+				permissions,
+			};
+		});
+	}
+
+	async denyPermissionRequest(
+		pluginId: string,
+		requestId: string,
+		options: { permanent?: boolean; deniedBy?: string } = {},
+	): Promise<boolean> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		if (typeof requestId !== "string" || !requestId.trim() || requestId.length > 256) {
+			throw new ValidationError("Invalid permission request id");
+		}
+		if (
+			options.deniedBy !== undefined &&
+			(typeof options.deniedBy !== "string" ||
+				!options.deniedBy.trim() ||
+				options.deniedBy.length > 256 ||
+				/[\0\r\n]/u.test(options.deniedBy))
+		) {
+			throw new ValidationError("Invalid permission actor");
+		}
+		// Same lock as approvePermissionRequest: an approve and a deny racing on one
+		// request must serialize, and the loser must see the row as already decided.
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			const installationId = await this.currentInstallationId(pluginId);
+			await this.requireState(pluginId);
+			// The store refuses rows that are no longer pending, so a stale tab or a
+			// replayed id cannot flip an approved request to denied. "Never ask again"
+			// is recorded in the same write, leaving no window for a plugin retry to
+			// queue a fresh prompt between the denial and the permanent record.
+			const resolved = await this.permissionStore.resolvePendingRequest(
+				pluginId,
+				installationId,
+				requestId,
+				"denied",
+				options.permanent ? { permanentDenial: { deniedBy: options.deniedBy } } : {},
+			);
+			if (!resolved) throw new NotFoundError("PluginPermissionRequest", requestId);
+
+			eventBus.emit({
+				type: "plugin:permission_resolved",
+				pluginId,
+				requestId,
+				status: "denied",
+			} as Record<string, unknown> as NarraForkEvent);
+			await this.broadcastPluginEvent("plugin:permission_resolved", {
+				pluginId,
+				requestId,
+				status: "denied",
+			});
+
+			return true;
+		});
+	}
+
+	async listPermanentDenials(pluginId: string): Promise<PluginPermanentDenial[]> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		const installationId = await this.currentInstallationId(pluginId);
+		await this.requireState(pluginId);
+		return this.permissionStore.listPermanentDenials(pluginId, installationId);
+	}
+
+	/** Lift a permanent denial so the plugin may request the pair again. */
+	async removePermanentDenial(
+		pluginId: string,
+		capability: string,
+		scope: unknown,
+	): Promise<boolean> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		if (typeof capability !== "string" || !capability.trim() || capability.length > 256) {
+			throw new ValidationError("Invalid capability");
+		}
+		const parsedScope = permissionScopeSchema.safeParse(scope);
+		if (!parsedScope.success) throw new ValidationError("Invalid permission scope");
+		const installationId = await this.currentInstallationId(pluginId);
+		await this.requireState(pluginId);
+		const removed = await this.permissionStore.removePermanentDenial(
+			pluginId,
+			installationId,
+			capability,
+			parsedScope.data,
+		);
+		if (!removed) {
+			throw new NotFoundError("PluginPermanentDenial", `${capability}:${JSON.stringify(scope)}`);
+		}
+		return true;
+	}
+
+	/**
+	 * Backwards-compatible summary API. New callers should use replacePermissions/
+	 * revokePermissions. Existing grants are preserved verbatim (constraints,
+	 * expiry, grantor and scope); only capabilities the summary declares that are
+	 * NOT already granted are appended as legacy global grants. It never flattens
+	 * fine-grained scoped grants into global ones.
+	 */
+	async updateGrants(
+		pluginId: string,
+		grants: Omit<PluginGrantSummary, "revision"> & { revision?: number },
+	): Promise<PluginManagerStatus> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			const state = await this.requireState(pluginId);
+			const installationId = await this.currentInstallationId(pluginId);
+			const current = await this.integrationAuthorityService.ensureInstallation(
+				pluginId,
+				installationId,
+				state.grants,
+			);
+			const missingCapabilities = grants.capabilities.filter(
+				(capability) => !current.grants.some((grant) => grant.capability === capability),
+			);
+			const nextGrants: PermissionGrantInput[] = [
+				...current.grants.map(
+					(grant): PermissionGrantInput => ({
+						capability: grant.capability,
+						scope: grant.scope,
+						...(grant.constraints === undefined ? {} : { constraints: grant.constraints }),
+						...(grant.expiresAt === undefined ? {} : { expiresAt: grant.expiresAt }),
+						grantId: grant.grantId,
+						grantedBy: grant.grantedBy,
+					}),
+				),
+				...missingCapabilities.map(
+					(capability): PermissionGrantInput => ({
+						capability: capability as PermissionGrant["capability"],
+						scope: { type: "global" },
+						grantId: `legacy-${pluginId}-${capability}`.slice(0, 128),
+						grantedBy: "legacy-api",
+					}),
+				),
+			];
+			const mutation = await this.integrationAuthorityService.replace(
+				pluginId,
+				installationId,
+				nextGrants,
+				{
+					expectedRevision: current.revision,
+					grantedBy: "legacy-api",
+				},
+			);
+			const result = await this.applyPermissionMutationLocked(pluginId, installationId, mutation);
+			return result.status;
+		});
+	}
+
+	async updateGrantRevision(pluginId: string, grantRevision: number): Promise<PluginManagerStatus> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		if (!Number.isSafeInteger(grantRevision) || grantRevision < 0) {
+			throw new ValidationError("Invalid grantRevision");
+		}
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			const state = await this.requireState(pluginId);
+			// Legacy API: only the summary revision is touched. The canonical DB
+			// authority and its grants are NOT rewritten (a rewrite here would
+			// flatten every scoped/constrained grant into legacy global grants).
+			await this.stateStore.updateGrantSummary(pluginId, {
+				count: state.grants.count,
+				capabilities: state.grants.capabilities,
+				revision: grantRevision,
+				updatedAt: this.timestamp(),
+			});
+			return this.requireStatus(pluginId);
+		});
+	}
+
+	async uninstall(pluginId: string): Promise<void> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		await this.lifecycleMutex.acquire(pluginId, async () => {
+			const state = await this.stateStore.getState(pluginId);
+			const plugin = this.catalogPlugin(pluginId);
+			if (!state && !plugin) return;
+			await this.runJournaled(
+				pluginId,
+				"uninstall",
+				{ from: state?.current ?? plugin?.current ?? null },
+				async () => {
+					await this.revokePluginLifecycle(pluginId, "uninstall", "manager-uninstall", {
+						grantRevision: state ? state.grants.revision + 1 : undefined,
+					});
+					await this.integrationAuthorityService.revokePlugin(
+						pluginId,
+						"Plugin installation uninstalled",
+					);
+					if (state) {
+						await this.stateStore.updateState(pluginId, {
+							desiredState: "uninstalling",
+							runtimeState: "draining",
+							grants: {
+								count: 0,
+								capabilities: [],
+								revision: state.grants.revision + 1,
+								updatedAt: this.timestamp(),
+							},
+						});
+						await this.refreshCatalog("uninstall");
+					}
+					try {
+						await this.runtimeSupervisor.disable(pluginId);
+					} catch (error) {
+						this.runtimeSupervisor.quarantine(pluginId, "runtime uninstall shutdown failed");
+						logger.warn("Plugin runtime did not stop cleanly during uninstall", {
+							pluginId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+					await this.packageMutex.acquire("package-store", () =>
+						this.removeInstalledPackage(pluginId),
+					);
+					await this.permissionStore.clearPlugin(pluginId);
+					// Best-effort: the package and grants are already gone, so a vault
+					// failure must not leave the uninstall half-done. It is logged instead.
+					try {
+						await this.purgePluginSecrets?.(pluginId);
+					} catch (error) {
+						logger.warn("Failed to purge plugin secrets during uninstall", {
+							pluginId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+					await this.stateStore.removeState(pluginId);
+					await this.refreshCatalog("uninstall");
+				},
+			);
+		});
+	}
+
+	async getStatus(pluginId: string): Promise<PluginManagerStatus | undefined> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		return this.buildStatus(pluginId);
+	}
+
+	async get(pluginId: string): Promise<PluginManagerStatus | undefined> {
+		return this.getStatus(pluginId);
+	}
+
+	async getDiagnostics(pluginId?: string): Promise<PluginManagerDiagnostics> {
+		await this.ensureInitialized();
+		const plugins = pluginId
+			? [await this.getStatus(pluginId)].filter(
+					(status): status is PluginManagerStatus => status !== undefined,
+				)
+			: await this.list();
+		return {
+			featureEnabled: this.isEnabled(),
+			persistence: await this.stateStore.getDiagnostics(),
+			catalog: this.catalogSnapshot?.diagnostics ?? [],
+			plugins,
+		};
+	}
+
+	/**
+	 * Admin diagnostic: authorization health for one plugin (authority rows,
+	 * canonical identity, and mirror drift). Read-only.
+	 */
+	async inspectAuthorization(
+		pluginId: string,
+	): Promise<Awaited<ReturnType<PluginIntegrationAuthorityService["inspectAuthorization"]>>> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		const state = await this.requireState(pluginId);
+		return this.integrationAuthorityService.inspectAuthorization(pluginId, {
+			installationId: state.installationId ?? undefined,
+			packageHash: state.current?.hash,
+		});
+	}
+
+	/**
+	 * Admin repair: converge the plugin onto a single canonical installation
+	 * identity and rebuild the compatibility mirror from the DB authority.
+	 *
+	 * dryRun reports the actions without mutating anything. apply is idempotent:
+	 * resolveInstallationContext restores/migrates the UUID and retires legacy
+	 * hash authorities, then the permission mirror is re-mirrored.
+	 */
+	async repairAuthorization(
+		pluginId: string,
+		options: { dryRun?: boolean } = {},
+	): Promise<{
+		inspection: Awaited<ReturnType<PluginIntegrationAuthorityService["inspectAuthorization"]>>;
+		actions: string[];
+	}> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		const state = await this.requireState(pluginId);
+		const inspection = await this.integrationAuthorityService.inspectAuthorization(pluginId, {
+			installationId: state.installationId ?? undefined,
+			packageHash: state.current?.hash,
+		});
+		const actions: string[] = [];
+		if (inspection.ambiguous) {
+			actions.push(
+				"REFUSE: multiple active installation identities cannot be merged automatically; " +
+					"run reset instead",
+			);
+			return { inspection, actions };
+		}
+		if (!inspection.canonicalInstallationId) {
+			actions.push("migrate: allocate a stable UUID and inherit the legacy grants");
+		} else if (state.installationId !== inspection.canonicalInstallationId) {
+			actions.push(`restore state installationId=${inspection.canonicalInstallationId}`);
+		}
+		const legacyActive = inspection.authorities.filter(
+			(authority) =>
+				authority.state === "active" &&
+				authority.installationId !== undefined &&
+				!isStableInstallationId(authority.installationId),
+		);
+		for (const authority of legacyActive) {
+			actions.push(`retire legacy authority ${authority.authorityId}`);
+		}
+		if (inspection.drift.authorityOnlyGrants.length > 0) {
+			actions.push("mirror: rebuild permissions.json from the DB authority");
+		}
+		if (options.dryRun) return { inspection, actions };
+		const { installationId, permissions } = await this.resolveInstallationContext(state);
+		await this.syncPermissionSummary(pluginId, permissions);
+		if (actions.some((action) => action.startsWith("restore state installationId"))) {
+			actions.push(`state installationId is now ${installationId}`);
+		}
+		const repairedState = await this.requireState(pluginId);
+		return {
+			inspection: await this.integrationAuthorityService.inspectAuthorization(pluginId, {
+				installationId: repairedState.installationId ?? installationId,
+				packageHash: repairedState.current?.hash,
+			}),
+			actions,
+		};
+	}
+
+	/**
+	 * Admin reset: revoke every authority for the plugin, clear the permission
+	 * mirror/pending requests and the grant summary, then allocate a fresh
+	 * installation UUID. The plugin package, provider configuration and secrets
+	 * are preserved — this is NOT an uninstall. Requires an explicit confirm.
+	 */
+	async resetAuthorization(
+		pluginId: string,
+		options: { confirm: boolean },
+	): Promise<PluginManagerStatus> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		if (!options.confirm) {
+			throw new ValidationError("Plugin authorization reset requires explicit confirmation");
+		}
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			const state = await this.requireState(pluginId);
+			// Tear down UI sessions, bindings, subscriptions and tool grants for
+			// the current identity before the authorities are revoked.
+			await this.revokePluginLifecycle(pluginId, "disable", "manager-authorization-reset", {
+				grantRevision: state.grants.revision + 1,
+			});
+			await this.integrationAuthorityService.revokePlugin(
+				pluginId,
+				"Plugin authorization reset by administrator",
+			);
+			await this.permissionStore.clearPlugin(pluginId);
+			const installationId = randomUUID();
+			await this.stateStore.setInstallationId(pluginId, installationId);
+			await this.stateStore.updateGrantSummary(pluginId, {
+				count: 0,
+				capabilities: [],
+				revision: 1,
+				updatedAt: this.timestamp(),
+			});
+			// The runtime process still carries the old UUID; tear it down so the
+			// next activation starts with the fresh identity and fails closed
+			// until the administrator re-authorizes.
+			try {
+				await this.runtimeSupervisor.disable(pluginId);
+			} catch (error) {
+				this.runtimeSupervisor.quarantine(pluginId, "runtime reset shutdown failed");
+				logger.warn("Plugin runtime did not stop cleanly during authorization reset", {
+					pluginId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			await this.stateStore.updateState(pluginId, {
+				runtimeState: "inactive",
+				desiredState: "enabled",
+			});
+			logger.info("Plugin authorization reset", { pluginId, installationId });
+			return this.requireStatus(pluginId);
+		});
+	}
+
+	async retry(
+		pluginId: string,
+		options: PluginActivationOptions = {},
+	): Promise<PluginManagerStatus> {
+		await this.ensureInitialized();
+		this.assertFeatureEnabled("retry");
+		assertPluginId(pluginId);
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			const state = await this.requireState(pluginId);
+			if (state.runtimeState === "quarantine") {
+				throw new PluginManagerError(
+					"The current RuntimeSupervisor cannot clear quarantine in-process; restart or reinstall the plugin",
+					"PLUGIN_RETRY_REQUIRES_RESTART",
+					409,
+				);
+			}
+			return this.activateLocked(pluginId, { ...options, reason: options.reason ?? "retry" });
+		});
+	}
+
+	async list(): Promise<PluginManagerStatus[]> {
+		if (!this.initialized) return this.initializePromise ?? this.initialize();
+		const states = await this.stateStore.listStates();
+		const pluginIds = new Set([
+			...states.map((state) => state.pluginId),
+			...(this.catalogSnapshot?.plugins.map((plugin) => plugin.pluginId) ?? []),
+		]);
+		const statuses = await Promise.all(
+			[...pluginIds].sort().map((pluginId) => this.buildStatus(pluginId)),
+		);
+		return statuses.filter((status): status is PluginManagerStatus => status !== undefined);
+	}
+
+	async listStatuses(): Promise<PluginManagerStatus[]> {
+		return this.list();
+	}
+
+	async shutdown(): Promise<void> {
+		if (!this.initialized) return;
+		this.shuttingDown = true;
+		const states = await this.stateStore.listStates();
+		const enabled = states.filter(
+			(state) =>
+				state.runtimeState !== "inactive" &&
+				state.runtimeState !== "stopped" &&
+				this.runtimeSupervisor.get(state.pluginId),
+		);
+		await Promise.allSettled(
+			enabled.map((state) =>
+				this.lifecycleMutex.acquire(state.pluginId, async () => {
+					const operation = await this.stateStore.beginOperation({
+						pluginId: state.pluginId,
+						operation: "deactivate",
+						context: { reason: "host-shutdown" },
+					});
+					await this.stateStore.updateOperation(operation.id, { status: "running" });
+					try {
+						await this.runtimeSupervisor.disable(state.pluginId);
+						await this.stateStore.updateState(state.pluginId, {
+							runtimeState: "inactive",
+						});
+						await this.stateStore.updateOperation(operation.id, { status: "succeeded" });
+					} catch (error) {
+						await this.persistFailure(state.pluginId, error, "shutdown", false);
+						await this.failOperation(operation, error, "shutdown");
+					}
+				}),
+			),
+		);
+		await this.runtimeSupervisor.shutdown().catch((error) => {
+			logger.warn("Plugin runtime supervisor shutdown failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+	}
+
+	private async initializeInternal(): Promise<PluginManagerStatus[]> {
+		const snapshot = await this.stateStore.initialize();
+		await this.permissionStore.initialize();
+		if (this.packageStore.cleanupStaging) {
+			await this.packageStore.cleanupStaging().catch((error) => {
+				logger.warn("Unable to clean stale plugin staging entries", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+		}
+		const persistenceCorrupt = snapshot.diagnostics.some((item) =>
+			["PLUGIN_STATE_CORRUPT", "PLUGIN_JOURNAL_CORRUPT"].includes(item.code),
+		);
+		const incompleteByPlugin = new Map<string, PluginJournalEntry[]>();
+		for (const operation of snapshot.operations) {
+			if (operation.status !== "pending" && operation.status !== "running") continue;
+			incompleteByPlugin.set(operation.pluginId, [
+				...(incompleteByPlugin.get(operation.pluginId) ?? []),
+				operation,
+			]);
+		}
+		const pointerRecovery = new Map<string, { restored: boolean; error?: unknown }>();
+		for (const [pluginId, operations] of incompleteByPlugin) {
+			const pointerOperation = operations.find(
+				(operation) =>
+					(operation.operation === "install" || operation.operation === "upgrade") &&
+					operation.context.from !== undefined,
+			);
+			if (!pointerOperation) continue;
+			try {
+				const current = await this.packageStore.readCurrent();
+				const expected = current.plugins[pluginId];
+				const target = pointerOperation.context.from ?? undefined;
+				if (!packagePointersEqual(expected, target)) {
+					await this.packageStore.setCurrent(pluginId, target, {
+						expectedCurrent: expected ?? null,
+						operationId: `recover-${pointerOperation.id}`,
+					});
+				}
+				pointerRecovery.set(pluginId, { restored: true });
+			} catch (error) {
+				pointerRecovery.set(pluginId, { restored: false, error });
+				logger.error("Unable to compensate an interrupted plugin pointer update", {
+					pluginId,
+					operationId: pointerOperation.id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		this.catalogSnapshot = await this.catalog.scan();
+
+		const stateById = new Map(snapshot.states.map((state) => [state.pluginId, state]));
+		const pluginIds = new Set([
+			...stateById.keys(),
+			...this.catalogSnapshot.plugins.map((plugin) => plugin.pluginId),
+		]);
+		const reconciled: PluginStateRecord[] = [];
+		for (const pluginId of [...pluginIds].sort()) {
+			const plugin = this.catalogPlugin(pluginId);
+			const packageSummary = currentPackage(plugin);
+			const currentState =
+				stateById.get(pluginId) ?? createPluginStateRecord(pluginId, this.timestamp());
+			const nextCurrent = plugin?.current ?? currentState.current;
+			const next: PluginStateRecord = {
+				...currentState,
+				current: nextCurrent,
+				authorityInstallationId: currentState.authorityInstallationId ?? nextCurrent?.hash ?? null,
+				compatibility: packageCompatibility(plugin),
+				updatedAt: this.timestamp(),
+			};
+			const incomplete = incompleteByPlugin.get(pluginId) ?? [];
+			const corruptOrIncomplete = persistenceCorrupt || incomplete.length > 0;
+			if (corruptOrIncomplete) {
+				next.desiredState = "disabled";
+				next.runtimeState = packageSummary ? "inactive" : "failed";
+				next.lastError = pluginStateError(
+					new Error(
+						persistenceCorrupt
+							? "Plugin persistence was corrupt; automatic activation was disabled"
+							: `Recovered incomplete operation: ${incomplete.map((item) => item.operation).join(", ")}`,
+					),
+					{
+						code: persistenceCorrupt
+							? "PLUGIN_PERSISTENCE_RECOVERED"
+							: "PLUGIN_OPERATION_RECOVERED",
+						phase: "initialize",
+						at: this.timestamp(),
+					},
+				);
+			} else if (isVolatileRuntimeState(next.runtimeState)) {
+				next.runtimeState = "inactive";
+				next.lastError = pluginStateError(
+					new Error("Previous runtime was lost during host restart"),
+					{
+						code: "PLUGIN_RUNTIME_LOST",
+						phase: "initialize",
+						at: this.timestamp(),
+					},
+				);
+			}
+			if (!packageSummary || !plugin?.current) {
+				next.desiredState = "disabled";
+				next.runtimeState = "failed";
+				const diagnostic = packageError(plugin);
+				next.lastError = pluginStateError(
+					new Error(diagnostic?.message ?? "Current plugin package is unavailable"),
+					{
+						code: diagnostic?.code ?? "PLUGIN_PACKAGE_UNAVAILABLE",
+						phase: "catalog",
+						at: this.timestamp(),
+					},
+				);
+			} else if (next.compatibility === "incompatible") {
+				next.runtimeState = "inactive";
+			}
+			reconciled.push(next);
+		}
+		await this.stateStore.replaceStates(reconciled);
+		await this.refreshCatalog("initialize");
+		for (const state of reconciled) {
+			if (!state.current) continue;
+			try {
+				const { permissions } = await this.resolveInstallationContext(state);
+				await this.syncPermissionSummary(state.pluginId, permissions);
+			} catch (error) {
+				await this.stateStore.updateState(state.pluginId, {
+					desiredState: "disabled",
+					runtimeState: "failed",
+					lastError: pluginStateError(error, {
+						phase: "authority-initialize",
+						at: this.timestamp(),
+					}),
+				});
+				logger.warn("Plugin authority reconciliation failed; plugin isolated", {
+					pluginId: state.pluginId,
+					installationId:
+						state.installationId ?? authorityInstallationId(state) ?? state.current.hash,
+					error: errorMessage(error),
+				});
+			}
+		}
+
+		for (const [pluginId, operations] of incompleteByPlugin) {
+			for (const operation of operations) {
+				const recovery = pointerRecovery.get(pluginId);
+				const pointerOperation =
+					operation.operation === "install" || operation.operation === "upgrade";
+				const restored = pointerOperation && recovery?.restored === true;
+				const recoveryError = recovery?.error;
+				await this.stateStore.updateOperation(operation.id, {
+					status: restored ? "rolled_back" : "failed",
+					context: {
+						phase: restored ? "recovered-pointer-restored" : "recovered",
+						recoveredAt: this.timestamp(),
+					},
+					error: pluginStateError(
+						new Error(
+							restored
+								? "Host restarted; interrupted pointer update was restored"
+								: recoveryError
+									? `Host restarted; pointer compensation failed: ${errorMessage(recoveryError)}`
+									: "Host restarted before the operation completed",
+						),
+						{
+							code: restored ? "PLUGIN_OPERATION_ROLLED_BACK" : "PLUGIN_OPERATION_INTERRUPTED",
+							phase: "initialize",
+							at: this.timestamp(),
+						},
+					),
+				});
+			}
+		}
+
+		this.initialized = true;
+		if (!this.disabled) {
+			const startupStates = await this.stateStore.listStates();
+			const startupPlugins = startupStates.filter((state) => {
+				const plugin = this.catalogPlugin(state.pluginId);
+				const manifest = currentPackage(plugin)?.manifest;
+				return (
+					state.desiredState === "enabled" &&
+					state.compatibility === "compatible" &&
+					manifest?.activationEvents.includes("onStartup")
+				);
+			});
+			await Promise.allSettled(
+				startupPlugins.map((state) =>
+					this.activate(state.pluginId, { automatic: true, reason: "onStartup" }),
+				),
+			);
+		}
+		return this.list();
+	}
+
+	private async installLocked(
+		source: PackageSource,
+		expectedPluginId: string,
+	): Promise<PluginManagerStatus> {
+		const before = await this.packageStore.readCurrent();
+		const operation = await this.stateStore.beginOperation({
+			pluginId: expectedPluginId,
+			operation: "install",
+			context: { from: before.plugins[expectedPluginId] ?? null },
+		});
+		await this.stateStore.updateOperation(operation.id, { status: "running" });
+		try {
+			const installed = await this.packageMutex.acquire("package-store", () =>
+				this.packageStore.install(source),
+			);
+			if (installed.pluginId !== expectedPluginId) {
+				throw new PluginManagerError(
+					`Installed package identity ${installed.pluginId} did not match ${expectedPluginId}`,
+					"PLUGIN_IDENTITY_MISMATCH",
+					422,
+				);
+			}
+			const status = await this.finishInstalledPackage(installed, operation);
+			return status;
+		} catch (error) {
+			await this.failOperation(operation, error, "install");
+			throw error;
+		}
+	}
+
+	private async finishInstalledPackage(
+		installed: InstalledPackageResult,
+		operation?: PluginJournalEntry,
+	): Promise<PluginManagerStatus> {
+		const journal =
+			operation ??
+			(await this.stateStore.beginOperation({
+				pluginId: installed.pluginId,
+				operation: "install",
+				status: "running",
+			}));
+		try {
+			const previousState = await this.stateStore.getState(installed.pluginId);
+			const nextPackage = { version: installed.version, hash: installed.hash };
+			const samePackage = packagePointersEqual(previousState?.current, nextPackage);
+			const previousAuthorityInstallationId = authorityInstallationId(previousState);
+			const requestedInstallationId = samePackage
+				? (previousAuthorityInstallationId ?? installed.hash)
+				: installed.hash;
+			const isUpgrade =
+				previousState?.current !== null && previousState?.current !== undefined && !samePackage;
+			if (isUpgrade) {
+				const runtime = this.runtimeSupervisor.get(installed.pluginId);
+				await this.revokePluginLifecycle(installed.pluginId, "upgrade", "manager-upgrade", {
+					runtimeId: runtime?.getDiagnostics().runtimeId,
+					runtimeGeneration: runtime?.getDiagnostics().generation,
+				});
+				try {
+					await this.runtimeSupervisor.disable(installed.pluginId);
+				} catch (error) {
+					this.runtimeSupervisor.quarantine(installed.pluginId, "runtime upgrade shutdown failed");
+					await this.persistFailure(installed.pluginId, error, "upgrade", true);
+					throw error;
+				}
+			}
+			await this.assertPackageTrust(installed.path, installed.manifest);
+			this.catalogSnapshot = await this.catalog.scan();
+			const plugin = this.catalogPlugin(installed.pluginId);
+			const packageSummary = currentPackage(plugin);
+			const compatibility = packageCompatibility(plugin);
+			await this.stateStore.updateState(installed.pluginId, (current) => ({
+				...current,
+				current: { version: installed.version, hash: installed.hash },
+				authorityInstallationId: requestedInstallationId,
+				desiredState: "disabled",
+				compatibility,
+				runtimeState: "inactive",
+				lastError:
+					compatibility === "compatible"
+						? null
+						: pluginStateError(
+								new Error(packageError(plugin)?.message ?? "Plugin is incompatible"),
+								{
+									code: packageError(plugin)?.code ?? "PLUGIN_INCOMPATIBLE",
+									phase: "install",
+									at: this.timestamp(),
+								},
+							),
+				updatedAt: this.timestamp(),
+			}));
+			// Authorization is keyed by the stable installation identity (UUID),
+			// the same id the permission/authority system and runtime UI sessions
+			// use — NOT the package hash, which would create a hash-keyed record
+			// that the runtime never consults. An upgrade keeps the persisted UUID;
+			// a first install (or a legacy state without one) allocates a fresh
+			// UUID right here, with the old hash's grants inherited through
+			// `sourceInstallationId` so upgrades never lose authorization.
+			//
+			// A first install seeds the manifest's capabilities: installing IS the trust
+			// decision. An UPGRADE does not. Because the installation identity is now a
+			// stable UUID, the new package inherits the old grants automatically — so a
+			// new manifest declaring MORE capabilities would silently widen the allow set
+			// under an identity the admin approved for a narrower manifest. Newly declared
+			// capabilities are therefore withheld and raised as pending approval requests
+			// below (fail-closed): the upgrade itself succeeds and every previously granted
+			// capability keeps working, only the added ones wait for a decision.
+			const previousInstallationId = previousState?.installationId;
+			const installationId = previousInstallationId ?? randomUUID();
+			const permissions = await this.integrationAuthorityService.ensureInstallation(
+				installed.pluginId,
+				installationId,
+				seedGrantsFromManifest(
+					previousState?.grants ??
+						createPluginStateRecord(installed.pluginId, this.timestamp()).grants,
+					installed.manifest.permissions.host,
+					{ pluginId: installed.pluginId },
+				),
+				// Legacy states predate the stable UUID: inherit the old hash's
+				// grants. First installs have no legacy record at all.
+				previousState?.current?.hash,
+				{ replaceRevoked: true },
+			);
+			if (!previousInstallationId) {
+				await this.stateStore.setInstallationId(installed.pluginId, installationId);
+			}
+			await this.syncPermissionSummary(installed.pluginId, permissions);
+			// Queue approval requests for capabilities this package declares but that the
+			// installation does not hold. Best-effort by design: a failure here must not
+			// fail an otherwise complete install, and withholding the grant already keeps
+			// the capability unusable, so the worst case is a missing prompt rather than
+			// unapproved access.
+			await this.requestUndeclaredManifestCapabilities(
+				installed.pluginId,
+				installationId,
+				installed.manifest.permissions.host,
+				installed.version,
+				permissions,
+			).catch((error) => {
+				logger.warn("Failed to raise upgrade capability approval requests", {
+					pluginId: installed.pluginId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+			await this.refreshCatalog("install");
+			await this.stateStore.updateOperation(journal.id, {
+				status: "succeeded",
+				context: { to: packageReference(packageSummary) },
+			});
+			logger.info("Plugin installed into the host control plane", {
+				pluginId: installed.pluginId,
+				version: installed.version,
+				hash: installed.hash,
+				compatibility,
+			});
+			return this.requireStatus(installed.pluginId);
+		} catch (error) {
+			if (!operation) await this.failOperation(journal, error, "install");
+			throw error;
+		}
+	}
+
+	/**
+	 * Pull model catalogs for providers whose catalog is still stale.
+	 *
+	 * Called right after a successful activation, when the runtime is already up, so
+	 * no extra process is started. Failures are logged and swallowed: a provider with
+	 * an unreachable catalog is still a usable registration (the user can retry), and
+	 * failing activation over model discovery would be a worse outcome.
+	 */
+	private async refreshProviderCatalogs(pluginId: string): Promise<void> {
+		if (!this.providerCatalogRefresher) return;
+		try {
+			await this.providerCatalogRefresher.refreshStale();
+		} catch (error) {
+			logger.warn("Plugin provider catalog refresh failed after activation", {
+				pluginId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	private async activateLocked(
+		pluginId: string,
+		options: PluginActivationOptions,
+	): Promise<PluginManagerStatus> {
+		await this.refreshCatalog();
+		const state = await this.requireState(pluginId);
+		if (state.desiredState !== "enabled") {
+			throw new PluginManagerError(
+				`Plugin must be enabled before activation: ${pluginId}`,
+				"PLUGIN_NOT_ENABLED",
+				422,
+			);
+		}
+		if (state.compatibility !== "compatible") {
+			throw new PluginManagerError(
+				`Plugin is not compatible and cannot be activated: ${pluginId}`,
+				"PLUGIN_INCOMPATIBLE",
+				422,
+			);
+		}
+		if (state.runtimeState === "quarantine") {
+			throw new PluginManagerError(`Plugin is quarantined: ${pluginId}`, "PLUGIN_QUARANTINED", 423);
+		}
+		const existing = this.runtimeSupervisor.get(pluginId);
+		if (existing?.state === "active") {
+			// The runtime may report active while its host/broker binding was
+			// torn down (crash revocation, grant-revision/upgrade
+			// invalidation, out-of-order lifecycle events). Reconcile access
+			// instead of trusting the active marker, so tool/UI calls recover
+			// without a host restart.
+			await this.reconcileActiveRuntimeAccess(pluginId);
+			await this.refreshCatalog("activate");
+			return this.requireStatus(pluginId);
+		}
+
+		const plugin = this.catalogPlugin(pluginId);
+		const packageSummary = currentPackage(plugin);
+		if (!packageSummary || packageSummary.status !== "compatible") {
+			throw new PluginManagerError(
+				"Current plugin package is unavailable",
+				"PLUGIN_PACKAGE_UNAVAILABLE",
+				422,
+			);
+		}
+		return this.runJournaled(
+			pluginId,
+			"activate",
+			{ to: packageReference(packageSummary), reason: options.reason ?? "explicit" },
+			async () => {
+				await this.stateStore.updateState(pluginId, {
+					runtimeState: "starting",
+					lastError: null,
+				});
+				try {
+					const manifest = await this.readPackageManifest(packageSummary);
+					await this.assertPackageTrust(packageSummary.path, manifest);
+					if (!manifest.server) {
+						await this.stateStore.updateState(pluginId, {
+							runtimeState: "active",
+							consecutiveFailures: 0,
+						});
+						await this.restorePluginAccess(pluginId);
+						await this.refreshCatalog("activate");
+						return this.requireStatus(pluginId);
+					}
+					const runtimeOptions = await this.createRuntimeOptions(
+						state,
+						packageSummary,
+						manifest,
+						options.reason ?? "explicit",
+					);
+					if (
+						runtimeOptions.runner instanceof PodmanRunner &&
+						!(await runtimeOptions.runner.isAvailable())
+					) {
+						throw new PluginManagerError(
+							"Podman is unavailable; the manifest-required sandbox cannot start",
+							"PLUGIN_RUNNER_UNAVAILABLE",
+							503,
+						);
+					}
+					// Always start with the freshly built options. RuntimeSupervisor
+					// reuses an existing record only when the command matches; after
+					// an upgrade the command changed, so it replaces the record and
+					// the new package actually starts (the old behavior restarted
+					// the stale package binary while state reported the new one).
+					const runtime = await this.runtimeSupervisor.start(runtimeOptions);
+					const diagnostics = runtime.getDiagnostics();
+					if (runtimeOptions.runtimeId && packageSummary.hash) {
+						await this.completePendingRuntimeRevocation(pluginId, diagnostics);
+						await this.bindRuntimeForRuntime(
+							pluginId,
+							await this.currentInstallationId(pluginId),
+							diagnostics,
+						);
+					}
+					await this.stateStore.updateState(pluginId, (current) => ({
+						...current,
+						runtimeState: "active",
+						runtimeGeneration: Math.max(current.runtimeGeneration, diagnostics.generation),
+						restartCount: Math.max(current.restartCount, Math.max(0, diagnostics.generation - 1)),
+						consecutiveFailures: 0,
+						lastError: null,
+						updatedAt: this.timestamp(),
+					}));
+					await this.restorePluginAccess(pluginId);
+					await this.refreshCatalog("activate");
+					// The runtime is already up, so pulling the model catalog costs no extra
+					// activation. Discovery failure must not fail activation: the provider stays
+					// registered with a stale catalog and can be refreshed again later.
+					await this.refreshProviderCatalogs(pluginId);
+					return this.requireStatus(pluginId);
+				} catch (error) {
+					this.hostServices.revokeRuntime(pluginId);
+					const quarantine = shouldQuarantine(error);
+					if (quarantine) {
+						this.runtimeSupervisor.quarantine(
+							pluginId,
+							error instanceof Error ? error.message : String(error),
+						);
+					}
+					const runtime = this.runtimeSupervisor.get(pluginId);
+					const diagnostics = runtime?.getDiagnostics();
+					const lifecycleKind = diagnostics?.state === "quarantine" ? "quarantine" : "crash";
+					try {
+						await this.revokePluginLifecycle(pluginId, lifecycleKind, `runtime-${lifecycleKind}`, {
+							runtimeId: diagnostics?.runtimeId,
+							runtimeGeneration: diagnostics?.generation,
+						});
+					} catch (lifecycleError) {
+						logger.error("Plugin lifecycle revocation failed after activation failure", {
+							pluginId,
+							error:
+								lifecycleError instanceof Error ? lifecycleError.message : String(lifecycleError),
+						});
+						await this.persistFailure(pluginId, lifecycleError, "lifecycle-revoke", true);
+					}
+					await this.persistFailure(pluginId, error, "activate", quarantine);
+					throw error;
+				}
+			},
+		);
+	}
+
+	private async createRuntimeOptions(
+		state: PluginStateRecord,
+		packageSummary: PluginPackageSummary,
+		manifest: Manifest,
+		reason: string,
+	): Promise<PluginRuntimeOptions> {
+		const dataPath = join(this.root, "data", state.pluginId);
+		const tempPath = join(this.root, "temp", state.pluginId);
+		const logPath = join(this.root, "logs", state.pluginId);
+		await Promise.all([
+			mkdir(dataPath, { recursive: true, mode: 0o700 }),
+			mkdir(tempPath, { recursive: true, mode: 0o700 }),
+			mkdir(logPath, { recursive: true, mode: 0o700 }),
+		]);
+		const context: PluginRuntimeBuildContext = {
+			pluginId: state.pluginId,
+			state,
+			package: packageSummary,
+			manifest,
+			root: this.root,
+			packagePath: packageSummary.path,
+			dataPath,
+			tempPath,
+			logPath,
+			reason,
+		};
+		const created = this.runtimeOptionsFactory
+			? await this.runtimeOptionsFactory(context)
+			: await this.defaultRuntimeOptions(context);
+		let runtimeOptions = created;
+		if (manifest.server) {
+			const existingDiagnostics = this.runtimeSupervisor.get(state.pluginId)?.getDiagnostics();
+			const runtimeId =
+				created.runtimeId ?? existingDiagnostics?.runtimeId ?? `rt_${generateShortId(20)}`;
+			const nextGeneration =
+				Math.max(
+					existingDiagnostics?.generation ?? 0,
+					state.runtimeGeneration,
+					created.generation ?? 0,
+				) + 1;
+			await this.stateStore.updateState(state.pluginId, { runtimeGeneration: nextGeneration });
+			const binding = await this.bindRuntimeDescriptor(context, runtimeId, nextGeneration);
+			// The spawned plugin process must carry the same stable installation
+			// UUID as the broker binding, otherwise every host call fails identity
+			// validation (the dispatcher would otherwise fall back to a
+			// `runtime:<id>` pseudo-installation that no authority record covers).
+			const installationId = await this.currentInstallationId(state.pluginId);
+			runtimeOptions = {
+				...created,
+				runtimeId,
+				generation: nextGeneration - 1,
+				installationId,
+				dispatcher: binding.dispatcher,
+			};
+		}
+		const onStateChange = runtimeOptions.onStateChange;
+		const onCrash = runtimeOptions.onCrash;
+		// A supervisor can replace its record while the retired process still emits
+		// callbacks. Remember the emitting object, not just the plugin lookup key.
+		let owner: RuntimeLike | undefined;
+		let crashEvent: RuntimeStateEvent | undefined;
+		const capture = (runtimeState: string): RuntimeStateEvent | undefined => {
+			owner ??= this.runtimeSupervisor.get(state.pluginId);
+			if (!owner || owner !== this.runtimeSupervisor.get(state.pluginId)) return undefined;
+			return { runtime: owner, diagnostics: owner.getDiagnostics(), state: runtimeState };
+		};
+		return {
+			...runtimeOptions,
+			onStateChange: (runtimeState, previous) => {
+				const event = capture(runtimeState);
+				if (event) {
+					if (["crashed", "failed"].includes(runtimeState)) crashEvent = event;
+					// Never await this queue from a supervisor callback: start/disable
+					// may themselves be awaited by an operation holding lifecycleMutex.
+					void this.handleRuntimeStateChange(state.pluginId, event);
+				}
+				onStateChange?.(runtimeState, previous);
+			},
+			onCrash: (error) => {
+				const event = crashEvent ?? capture(owner?.state ?? "crashed");
+				if (event && event.runtime === this.runtimeSupervisor.get(state.pluginId)) {
+					crashEvent = event;
+					event.sourceError = error;
+					void this.handleRuntimeStateChange(state.pluginId, event);
+				}
+				onCrash?.(error);
+			},
+		};
+	}
+
+	private async bindRuntimeDescriptor(
+		context: PluginRuntimeBuildContext,
+		runtimeId: string,
+		runtimeGeneration: number,
+	): Promise<ReturnType<PluginHostServices["bindRuntime"]>> {
+		const installationId = await this.currentInstallationId(context.pluginId);
+		const permissions = await this.integrationAuthorityService.ensureInstallation(
+			context.pluginId,
+			installationId,
+			seedGrantsFromManifest(context.state.grants, context.manifest.permissions.host, {
+				pluginId: context.pluginId,
+			}),
+		);
+		await this.syncPermissionSummary(context.pluginId, permissions);
+		const input: PluginHostRuntimeBindingInput = {
+			pluginId: context.pluginId,
+			packageVersion: context.manifest.version,
+			installationId,
+			runtimeId,
+			runtimeGeneration,
+			grantRevision: permissions.revision,
+			desiredState: context.state.desiredState,
+			compatibilityState: context.state.compatibility,
+			runtimeState: "starting",
+			manifestRequested: context.manifest.permissions.host,
+			grants: permissions.grants,
+			dataPath: context.dataPath,
+			packagePath: context.packagePath,
+			getDiagnostics: () => this.runtimeSupervisor.get(context.pluginId)?.getDiagnostics(),
+		};
+		return this.hostServices.bindRuntime(input);
+	}
+
+	private async bindRuntimeForRuntime(
+		pluginId: string,
+		installationId: string,
+		diagnostics: RuntimeDiagnostics,
+	): Promise<ReturnType<PluginHostServices["bindRuntime"]>> {
+		const state = await this.requireState(pluginId);
+		await this.refreshCatalog();
+		const plugin = this.catalogPlugin(pluginId);
+		const packageSummary = currentPackage(plugin);
+		if (!packageSummary)
+			throw new PluginManagerError(
+				"Current plugin package is unavailable",
+				"PLUGIN_PACKAGE_UNAVAILABLE",
+				422,
+			);
+		const manifest = await this.readPackageManifest(packageSummary);
+		const dataPath = join(this.root, "data", pluginId);
+		const permissions = await this.integrationAuthorityService.ensureInstallation(
+			pluginId,
+			installationId,
+			seedGrantsFromManifest(state.grants, manifest.permissions.host, { pluginId }),
+		);
+		await this.syncPermissionSummary(pluginId, permissions);
+		return this.hostServices.bindRuntime({
+			pluginId,
+			packageVersion: manifest.version,
+			installationId,
+			runtimeId: diagnostics.runtimeId,
+			runtimeGeneration: diagnostics.generation,
+			grantRevision: permissions.revision,
+			desiredState: state.desiredState,
+			compatibilityState: state.compatibility,
+			runtimeState: diagnostics.state,
+			manifestRequested: manifest.permissions.host,
+			grants: permissions.grants,
+			dataPath,
+			packagePath: packageSummary.path,
+			getDiagnostics: () => this.runtimeSupervisor.get(pluginId)?.getDiagnostics(),
+		});
+	}
+
+	private async completePendingRuntimeRevocation(
+		pluginId: string,
+		diagnostics: RuntimeDiagnostics,
+	): Promise<void> {
+		if (this.lifecycleRevokeFailures.has(pluginId)) {
+			await this.revokePluginLifecycle(
+				pluginId,
+				"runtime_generation",
+				"runtime-generation-changed",
+				{
+					runtimeId: diagnostics.runtimeId,
+					runtimeGeneration: diagnostics.generation,
+				},
+			);
+		}
+	}
+
+	private async restorePluginAccess(pluginId: string): Promise<void> {
+		if (this.lifecycleRevokeFailures.has(pluginId)) {
+			throw this.lifecycleRevokeFailures.get(pluginId);
+		}
+		await this.restorePluginLifecycle(pluginId);
+	}
+
+	/**
+	 * Reconcile host/capability access for a runtime that reports active.
+	 *
+	 * A runtime can be marked active while its host binding is missing or the
+	 * plugin-level platform access is still revoked (crash revocation followed
+	 * by a failed restart, grant-revision/upgrade invalidation, out-of-order
+	 * lifecycle events). Rebuilding the binding from the current runtime
+	 * identity and restoring platform access makes tool/UI calls work again
+	 * without a host restart or manual re-activation.
+	 *
+	 * Security: access is restored only when the plugin is still enabled and
+	 * compatible and the runtime is active/degraded. Disabled, failed and
+	 * quarantined plugins keep their revocations.
+	 */
+	private async reconcileActiveRuntimeAccess(pluginId: string): Promise<void> {
+		const state = await this.requireState(pluginId);
+		if (state.desiredState !== "enabled" || state.compatibility !== "compatible") return;
+		if (!state.current?.hash) return;
+		const runtime = this.runtimeSupervisor.get(pluginId);
+		if (!runtime || !["active", "degraded"].includes(runtime.state)) return;
+		const diagnostics = runtime.getDiagnostics();
+		if (!diagnostics?.runtimeId) return;
+		const event = { runtime, diagnostics, state: runtime.state };
+		await this.completePendingRuntimeRevocation(pluginId, diagnostics);
+		const installationId = await this.currentInstallationId(pluginId);
+		if (!this.isCurrentRuntimeEvent(pluginId, event)) return;
+		const binding = this.hostServices.getRuntimeBinding(pluginId, diagnostics.runtimeId);
+		if (!binding || binding.plugin.installationId !== installationId) {
+			await this.bindRuntimeForRuntime(pluginId, installationId, diagnostics);
+		} else if (binding.plugin.runtimeGeneration !== diagnostics.generation) {
+			// A stale generation binding must not stay cached; replace it with
+			// the current generation before restoring platform access.
+			await this.bindRuntimeForRuntime(pluginId, installationId, diagnostics);
+		}
+		if (!this.isCurrentRuntimeEvent(pluginId, event)) return;
+		// Always restore platform-level access: an earlier revocation may have
+		// left the plugin in the broker/secret/tool revoked sets even when the
+		// binding itself survived. The restore is idempotent and only runs
+		// after the enabled/compatible/active gates above.
+		await this.restorePluginAccess(pluginId);
+	}
+
+	/**
+	 * Locate the Bun executable used to spawn `local-process` plugins whose
+	 * runtime is `bun`.
+	 *
+	 * In development the host itself runs under Bun, so `process.execPath` is
+	 * correct (it points at the real bun binary). A compiled single-file Windows
+	 * executable, however, embeds the host entrypoint — `process.execPath`
+	 * points at the host binary, which does NOT accept a script argument (it
+	 * ignores it and boots the app again, colliding with the instance lock and
+	 * exiting 1). In that case resolve a real bun from PATH; npm's `bun.cmd`
+	 * shim is not directly spawnable, so follow it to the underlying
+	 * `bun.exe` (typically node_modules/bun/bin/bun.exe).
+	 */
+	private resolveBunExecutable(): string {
+		// Explicit override wins: lets a user pin the plugin runtime to a specific
+		// bun install without relying on PATH resolution (which is unreliable
+		// inside compiled single-file binaries).
+		const explicit = process.env.NF_PLUGIN_BUN_PATH?.trim();
+		if (explicit) {
+			const resolved = resolve(explicit);
+			if (!existsSync(resolved)) {
+				throw new PluginManagerError(
+					`NF_PLUGIN_BUN_PATH points at a missing executable: ${explicit}`,
+					"PLUGIN_BUN_RUNTIME_NOT_FOUND",
+					500,
+				);
+			}
+			return resolved;
+		}
+		const execPath = process.execPath;
+		// dev（宿主本身由 bun 运行）：execPath 就是真实的 bun 二进制
+		if (execPath && /(^|[\\/])bun(\.exe)?$/i.test(execPath)) return execPath;
+		const candidates = [
+			typeof Bun !== "undefined" ? Bun.which("bun.exe") : undefined,
+			typeof Bun !== "undefined" ? Bun.which("bun") : undefined,
+		];
+		for (const candidate of candidates) {
+			if (!candidate) continue;
+			if (/\.exe$/i.test(candidate)) return candidate;
+			if (/\.cmd$/i.test(candidate)) {
+				// npm shim → real binary lives next to it as node_modules/bun/bin/bun.exe
+				const viaShim = resolve(dirname(candidate), "node_modules", "bun", "bin", "bun.exe");
+				if (existsSync(viaShim)) return viaShim;
+			}
+		}
+		// Compiled single-file binaries may not resolve Bun.which against the
+		// runtime PATH. Probe well-known install locations before giving up.
+		const known = [
+			process.env.BUN_INSTALL && join(process.env.BUN_INSTALL, "bin", "bun.exe"),
+			join(homedir(), ".bun", "bin", "bun.exe"),
+			process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "bun", "bin", "bun.exe"),
+		].filter((p): p is string => Boolean(p));
+		for (const candidate of known) {
+			if (existsSync(candidate)) return candidate;
+		}
+		// Fail closed: falling back to process.execPath would spawn the host
+		// binary itself, which collides with the instance lock and exits 1 —
+		// surfacing as a silent plugin crash and quarantine. A loud, actionable
+		// error is strictly better than another invisible restart loop.
+		throw new PluginManagerError(
+			"bun runtime required for local-process plugin but no bun executable was found. " +
+				"Install bun and add it to PATH, or set NF_PLUGIN_BUN_PATH to a bun binary " +
+				"(e.g. C:\\Users\\you\\.bun\\bin\\bun.exe).",
+			"PLUGIN_BUN_RUNTIME_NOT_FOUND",
+			500,
+		);
+	}
+
+	private async defaultRuntimeOptions(
+		context: PluginRuntimeBuildContext,
+	): Promise<PluginRuntimeOptions> {
+		const server = context.manifest.server;
+		if (!server) throw new ValidationError("Plugin has no server runtime entry");
+		const entryPath = join(context.packagePath, ...server.entry.split("/"));
+		const containerEntryPath = `/plugin/${server.entry}`;
+		let command: string[];
+		let runner: LocalProcessRunner | PodmanRunner;
+		if (context.manifest.engine.runner === "podman") {
+			if (!this.podman) {
+				throw new PluginManagerError(
+					"Podman runner is configured by the manifest but no pinned image is configured",
+					"PLUGIN_PODMAN_CONFIGURATION_MISSING",
+					503,
+				);
+			}
+			const spec: PodmanPluginSpec = {
+				runtimeId: context.pluginId,
+				image: this.podman.image,
+				imageDigest: this.podman.imageDigest,
+				packagePath: context.packagePath,
+				dataPath: context.dataPath,
+				// PodmanRunner owns a bounded tmpfs at /tmp; do not add a second
+				// host mount from the manager's local temp directory.
+			};
+			runner = new PodmanRunner(spec, this.podman.options);
+			switch (context.manifest.engine.runtime) {
+				case "bun":
+					command = ["bun", containerEntryPath, ...server.args];
+					break;
+				case "node":
+					command = ["node", containerEntryPath, ...server.args];
+					break;
+				case "python":
+					command = ["python", containerEntryPath, ...server.args];
+					break;
+				case "binary":
+					command = [containerEntryPath, ...server.args];
+					break;
+			}
+		} else {
+			runner = new LocalProcessRunner({
+				allowedCwds: [context.packagePath, context.dataPath, context.tempPath],
+				// Windows has no rlimit equivalent in Bun.spawn and the default
+				// runner rejects unbounded local processes on win32; the official
+				// host behavior on Windows is to run without host resource limits
+				// (surfaced as a startup warning), so keep that contract here —
+				// otherwise every local plugin fails to spawn on Windows and lands
+				// in quarantine.
+				allowUnboundedResourceUsage: process.platform === "win32",
+			});
+			switch (context.manifest.engine.runtime) {
+				case "bun": {
+					// Self-hosted plugin runtime: a compiled binary embeds the Bun
+					// runtime, so spawn *ourselves* in plugin-runtime-worker mode
+					// instead of requiring a system Bun (which is a recurring
+					// Windows pain point and previously fell back to spawning the
+					// host binary → instance lock conflict → QUARANTINED). Dev
+					// mode (host runs under Bun) keeps spawning bun directly.
+					const compiledBinary =
+						import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
+					if (compiledBinary) {
+						command = [process.execPath, PLUGIN_RUNTIME_WORKER_FLAG, entryPath, ...server.args];
+					} else {
+						command = [this.resolveBunExecutable(), entryPath, ...server.args];
+					}
+					break;
+				}
+				case "node":
+					command = ["node", entryPath, ...server.args];
+					break;
+				case "python":
+					command = ["python", entryPath, ...server.args];
+					break;
+				case "binary":
+					command = [entryPath, ...server.args];
+					break;
+			}
+		}
+		const cwd =
+			server.workingDirectory === "pluginData"
+				? context.dataPath
+				: server.workingDirectory === "pluginTemp"
+					? context.tempPath
+					: context.packagePath;
+		return {
+			pluginId: context.pluginId,
+			pluginVersion: context.manifest.version,
+			packageDigest: context.package.hash,
+			command,
+			cwd,
+			runner,
+			rpcProtocol: server.protocol,
+			// Provider calls include full histories; keep all plugin-to-host frame limits small.
+			...(context.manifest.contributes.providers.length > 0
+				? { maxOutboundFrameBytes: PROVIDER_REQUEST_MAX_BYTES }
+				: {}),
+			hostApiVersion: HOST_API_VERSION,
+			grantedCapabilities: context.state.grants.capabilities,
+			activationReason: context.reason,
+			env: {
+				NF_PLUGIN_PACKAGE_DIR: context.packagePath,
+				NF_PLUGIN_DATA_DIR: context.dataPath,
+				NF_PLUGIN_TEMP_DIR: context.tempPath,
+				NF_PLUGIN_LOG_DIR: context.logPath,
+				NF_PLUGIN_PACKAGE_DIGEST: context.package.hash,
+			},
+			timeouts: {
+				handshakeMs: server.startupTimeoutMs,
+				activationMs: server.activationTimeoutMs,
+			},
+		};
+	}
+
+	/**
+	 * Enforce the optional signature and SBOM policy over a package's own bytes.
+	 *
+	 * This used to also take the plugin's trust tier and refuse to activate a `T3` package.
+	 * That check is gone with the tier axis itself: every install produced `T3` and nothing
+	 * could raise it, so the branch only ever meant "no plugin may activate while a trust
+	 * policy is on". Signature and SBOM verification are unaffected — they read the package,
+	 * not a host-assigned rank — so the phase argument is no longer needed either.
+	 */
+	private async assertPackageTrust(packagePath: string, manifest: Manifest): Promise<void> {
+		if (!this.trustPolicy.enabled) return;
+
+		const rawSignature = await this.readOptionalTrustJson(packagePath, "signature.json");
+		if (rawSignature === undefined && this.trustPolicy.requireSignature) {
+			throw new PluginManagerError(
+				"Plugin signature is required by the host trust policy",
+				"PLUGIN_SIGNATURE_REQUIRED",
+				422,
+			);
+		}
+		if (rawSignature !== undefined) {
+			let signature: ReturnType<typeof parsePluginSignature>;
+			try {
+				signature = parsePluginSignature(rawSignature);
+			} catch (error) {
+				throw new PluginManagerError(
+					error instanceof Error ? error.message : "Plugin signature is invalid",
+					"PLUGIN_SIGNATURE_INVALID",
+					422,
+				);
+			}
+			if (signature.pluginId !== manifest.pluginId || signature.version !== manifest.version) {
+				throw new PluginManagerError(
+					"Plugin signature identity does not match the manifest",
+					"PLUGIN_SIGNATURE_IDENTITY_MISMATCH",
+					422,
+				);
+			}
+			if (!this.trustPolicy.keyring) {
+				throw new PluginManagerError(
+					"Plugin signature verification requires a configured trust keyring",
+					"PLUGIN_TRUST_CONFIGURATION_MISSING",
+					503,
+				);
+			}
+			const verification = await verifyPluginPackageSignature(
+				packagePath,
+				signature,
+				this.trustPolicy.keyring,
+			);
+			if (!verification.valid || !verification.trusted) {
+				throw new PluginManagerError(
+					`Plugin signature verification failed: ${verification.reason ?? "UNTRUSTED_SIGNATURE"}`,
+					"PLUGIN_SIGNATURE_UNTRUSTED",
+					422,
+				);
+			}
+		}
+
+		const rawSpdx = await this.readOptionalTrustJson(packagePath, "sbom.spdx.json");
+		const rawSbom =
+			rawSpdx !== undefined
+				? rawSpdx
+				: await this.readOptionalTrustJson(packagePath, "sbom.cdx.json");
+		if (rawSbom === undefined && this.trustPolicy.sbomPolicy?.requireSbom) {
+			throw new PluginManagerError(
+				"Plugin SBOM is required by the host trust policy",
+				"PLUGIN_SBOM_REQUIRED",
+				422,
+			);
+		}
+		if (rawSbom !== undefined) {
+			let sbom: ReturnType<typeof parseSbom>;
+			try {
+				sbom = parseSbom(rawSbom);
+			} catch (error) {
+				throw new PluginManagerError(
+					error instanceof Error ? error.message : "Plugin SBOM is invalid",
+					"PLUGIN_SBOM_INVALID",
+					422,
+				);
+			}
+			if (this.trustPolicy.sbomPolicy) {
+				const result = checkSbomInstallPolicy(sbom, this.trustPolicy.sbomPolicy);
+				if (!result.allowed) {
+					throw new PluginManagerError(
+						`Plugin SBOM policy failed: ${result.violations.join(",")}`,
+						"PLUGIN_SBOM_POLICY",
+						422,
+					);
+				}
+			}
+		}
+	}
+
+	private async readOptionalTrustJson(root: string, name: string): Promise<unknown | undefined> {
+		const path = join(root, name);
+		let info: Awaited<ReturnType<typeof lstat>>;
+		try {
+			info = await lstat(path);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}
+		if (info.isSymbolicLink() || !info.isFile()) {
+			throw new PluginManagerError(
+				`Plugin trust artifact is not a regular file: ${name}`,
+				"PLUGIN_TRUST_ARTIFACT_INVALID",
+				422,
+			);
+		}
+		if (info.size > MAX_TRUST_ARTIFACT_BYTES) {
+			throw new PluginManagerError(
+				`Plugin trust artifact is too large: ${name}`,
+				"PLUGIN_TRUST_ARTIFACT_TOO_LARGE",
+				422,
+			);
+		}
+		try {
+			return JSON.parse(await readFile(path, "utf8")) as unknown;
+		} catch {
+			throw new PluginManagerError(
+				`Plugin trust artifact is invalid JSON: ${name}`,
+				"PLUGIN_TRUST_ARTIFACT_INVALID",
+				422,
+			);
+		}
+	}
+
+	private async readPackageManifest(packageSummary: PluginPackageSummary): Promise<Manifest> {
+		const manifestPath = join(packageSummary.path, "manifest.json");
+		const info = await lstat(manifestPath);
+		if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_MANIFEST_BYTES) {
+			throw new PluginManagerError(
+				"Plugin manifest is unavailable",
+				"PLUGIN_MANIFEST_UNAVAILABLE",
+				422,
+			);
+		}
+		const bytes = await readFile(manifestPath);
+		if (bytes.byteLength > MAX_MANIFEST_BYTES) {
+			throw new PluginManagerError(
+				"Plugin manifest is too large",
+				"PLUGIN_MANIFEST_TOO_LARGE",
+				422,
+			);
+		}
+		let value: unknown;
+		try {
+			value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
+		} catch {
+			throw new PluginManagerError("Plugin manifest is corrupt", "PLUGIN_MANIFEST_CORRUPT", 422);
+		}
+		const parsed = safeParseManifest(value);
+		if (!parsed.success) {
+			throw new PluginManagerError("Plugin manifest is invalid", "PLUGIN_MANIFEST_INVALID", 422);
+		}
+		if (
+			parsed.data.pluginId !== packageSummary.pluginId ||
+			parsed.data.version !== packageSummary.version
+		) {
+			throw new PluginManagerError(
+				"Plugin manifest identity does not match the catalog",
+				"PLUGIN_IDENTITY_MISMATCH",
+				422,
+			);
+		}
+		return parsed.data;
+	}
+
+	private isCurrentRuntimeEvent(pluginId: string, event: RuntimeStateEvent): boolean {
+		const runtime = this.runtimeSupervisor.get(pluginId);
+		return (
+			runtime === event.runtime &&
+			runtime.generation === event.diagnostics.generation &&
+			runtime.state === event.state
+		);
+	}
+
+	private async persistRuntimeState(pluginId: string, event: RuntimeStateEvent): Promise<void> {
+		const existing = await this.stateStore.getState(pluginId);
+		if (!existing) return;
+		const { diagnostics, state: runtimeState } = event;
+		await this.stateStore
+			.updateState(pluginId, (state) =>
+				this.isCurrentRuntimeEvent(pluginId, event)
+					? {
+							...state,
+							runtimeState: mapRuntimeState(runtimeState),
+							runtimeGeneration: diagnostics.generation,
+							restartCount: Math.max(state.restartCount, Math.max(0, diagnostics.generation - 1)),
+							...(runtimeState === "active" ? { lastError: null, consecutiveFailures: 0 } : {}),
+							updatedAt: this.timestamp(),
+						}
+					: state,
+			)
+			.catch((error) => {
+				logger.warn("Unable to persist plugin runtime state", {
+					pluginId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+	}
+
+	private async persistFailure(
+		pluginId: string,
+		error: unknown,
+		phase: string,
+		quarantine: boolean,
+		event?: RuntimeStateEvent,
+	): Promise<void> {
+		const existing = await this.stateStore.getState(pluginId);
+		if (!existing || (event && !this.isCurrentRuntimeEvent(pluginId, event))) return;
+		const diagnostics =
+			event?.diagnostics ?? this.runtimeSupervisor.get(pluginId)?.getDiagnostics();
+		await this.stateStore.updateState(pluginId, (state) =>
+			event && !this.isCurrentRuntimeEvent(pluginId, event)
+				? state
+				: {
+						...state,
+						runtimeState: quarantine ? "quarantine" : "failed",
+						crashCount: state.crashCount + 1,
+						restartCount: Math.max(
+							state.restartCount,
+							Math.max(0, (diagnostics?.generation ?? 1) - 1),
+						),
+						consecutiveFailures: state.consecutiveFailures + 1,
+						runtimeGeneration: Math.max(state.runtimeGeneration, diagnostics?.generation ?? 0),
+						lastError: pluginStateError(error, { phase, at: this.timestamp() }),
+						updatedAt: this.timestamp(),
+					},
+		);
+		try {
+			await this.refreshCatalog();
+		} catch (refreshError) {
+			logger.warn("Unable to synchronize plugin contributions after failure", {
+				pluginId,
+				phase,
+				error: refreshError instanceof Error ? refreshError.message : String(refreshError),
+			});
+		}
+	}
+
+	private async runJournaled<T>(
+		pluginId: string,
+		operation: PluginJournalOperation,
+		context: PluginJournalContext,
+		action: () => Promise<T>,
+	): Promise<T> {
+		const journal = await this.stateStore.beginOperation({ pluginId, operation, context });
+		await this.stateStore.updateOperation(journal.id, { status: "running" });
+		try {
+			const result = await action();
+			await this.stateStore.updateOperation(journal.id, { status: "succeeded" });
+			return result;
+		} catch (error) {
+			await this.failOperation(journal, error, operation);
+			throw error;
+		}
+	}
+
+	private async failOperation(
+		operation: PluginJournalEntry,
+		error: unknown,
+		phase: string,
+	): Promise<void> {
+		await this.stateStore
+			.updateOperation(operation.id, {
+				status: "failed",
+				error: pluginStateError(error, { phase, at: this.timestamp() }),
+			})
+			.catch((journalError) => {
+				logger.error("Unable to persist failed plugin operation", {
+					pluginId: operation.pluginId,
+					operationId: operation.id,
+					error: journalError instanceof Error ? journalError.message : String(journalError),
+				});
+			});
+	}
+
+	private assertPermissionMutationInput(
+		input: PluginPermissionReplaceInput | PluginPermissionRevokeInput,
+	): void {
+		if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0) {
+			throw new ValidationError("Invalid expected permission revision");
+		}
+		if (
+			typeof input.grantedBy !== "string" ||
+			!input.grantedBy.trim() ||
+			input.grantedBy.length > 256 ||
+			/[\0\r\n]/u.test(input.grantedBy)
+		) {
+			throw new ValidationError("Invalid permission actor");
+		}
+	}
+
+	/**
+	 * Public alias of the stable installation identity (UUID) for the current
+	 * package. The plugin UI routes use it to key capability authorization, so
+	 * UI sessions authorize against the same authority record the permission
+	 * system maintains (keyed by installation id) instead of the package hash.
+	 */
+	async getCurrentInstallationId(pluginId: string): Promise<string> {
+		return this.currentInstallationId(pluginId);
+	}
+
+	/**
+	 * Resolve the single canonical installation identity for a plugin and make
+	 * sure its authority record exists and is active.
+	 *
+	 * This is the only place that decides which installationId to use for a
+	 * plugin (install, initialize, activation, UI sessions and runtime bindings
+	 * all converge here). Rules, in order:
+	 *
+	 * 1. state already carries a UUID → use it (upgrade keeps it).
+	 * 2. state has no UUID but exactly one active UUID-keyed authority exists in
+	 *    the DB → restore that UUID into state (host restart after a crashed
+	 *    write, or migration left state behind).
+	 * 3. several active UUID authorities → ambiguous: fail closed instead of
+	 *    guessing. An explicit repair/reset is required.
+	 * 4. only legacy package-hash authorities exist → allocate a fresh UUID,
+	 *    inherit the legacy grants (sourceInstallationId), then revoke the
+	 *    legacy authorities so the plugin never has two live identity roots.
+	 * 5. nothing exists at all → allocate a fresh UUID; the state summary is
+	 *    used as the legacy grant source.
+	 */
+	private async resolveInstallationContext(state: PluginStateRecord): Promise<{
+		installationId: string;
+		permissions: PluginPermissionSet;
+	}> {
+		const pluginId = state.pluginId;
+		if (state.installationId) {
+			const permissions = await this.integrationAuthorityService.ensureInstallation(
+				pluginId,
+				state.installationId,
+				state.grants,
+			);
+			// Best-effort hygiene: retires package-hash-keyed authorities that
+			// older host versions created for this plugin (every upgrade used to
+			// mint a new hash authority and none were revoked). The UUID is the
+			// canonical identity now; the hash rows must not remain active.
+			await this.retireLegacyAuthorities(
+				pluginId,
+				await this.integrationAuthorityService.listAuthorities(pluginId),
+			);
+			return { installationId: state.installationId, permissions };
+		}
+		const authorities = await this.integrationAuthorityService.listAuthorities(pluginId);
+		const active = authorities.filter((authority) => authority.state === "active");
+		const uuidActive = active.filter(
+			(authority) =>
+				authority.installationId !== undefined && isStableInstallationId(authority.installationId),
+		);
+		const legacyActive = active.filter(
+			(authority) =>
+				authority.installationId !== undefined && !isStableInstallationId(authority.installationId),
+		);
+		if (uuidActive.length > 1) {
+			throw new PluginManagerError(
+				`Plugin authorization is ambiguous: multiple active installation identities exist for ${pluginId}`,
+				"PLUGIN_AUTHORITY_AMBIGUOUS",
+				409,
+			);
+		}
+		if (uuidActive.length === 1) {
+			const installationId = uuidActive[0].installationId as string;
+			logger.info("Restored plugin stable installation identity from authority record", {
+				pluginId,
+				installationId,
+			});
+			await this.stateStore.setInstallationId(pluginId, installationId);
+			// Retire any stray legacy hash-keyed authorities so the identity root
+			// stays unique across restarts.
+			await this.retireLegacyAuthorities(pluginId, legacyActive);
+			const permissions = await this.integrationAuthorityService.ensureInstallation(
+				pluginId,
+				installationId,
+				state.grants,
+			);
+			return { installationId, permissions };
+		}
+		if (state.current && authorities.some((authority) => authority.state === "revoked")) {
+			throw new PluginManagerError(
+				`Plugin authorization is revoked for ${pluginId}; explicit reinstall or reset is required`,
+				"INTEGRATION_AUTHORITY_CONFLICT",
+				409,
+			);
+		}
+		const installationId = randomUUID();
+		const legacyInstallationId =
+			legacyActive.length === 1
+				? (legacyActive[0].installationId as string)
+				: (state.current?.hash ?? undefined);
+		logger.info("Allocated stable plugin installation identity", {
+			pluginId,
+			installationId,
+			legacyInstallationId: legacyInstallationId ?? null,
+		});
+		const permissions = await this.integrationAuthorityService.ensureInstallation(
+			pluginId,
+			installationId,
+			state.grants,
+			legacyInstallationId,
+		);
+		await this.stateStore.setInstallationId(pluginId, installationId);
+		await this.retireLegacyAuthorities(pluginId, legacyActive);
+		return { installationId, permissions };
+	}
+
+	/**
+	 * Revoke legacy package-hash-keyed authorities once their grants have been
+	 * migrated to the stable UUID identity. Prevents dual live identity roots.
+	 *
+	 * Defensively filters internally: only ACTIVE authorities whose metadata
+	 * installation id is NOT a stable UUID are retired — passing the full
+	 * authority list (or a stale one) is safe and never touches the canonical
+	 * UUID authority.
+	 */
+	private async retireLegacyAuthorities(
+		pluginId: string,
+		authorities: Awaited<ReturnType<PluginIntegrationAuthorityService["listAuthorities"]>>,
+	): Promise<void> {
+		const legacyActive = authorities.filter(
+			(authority) =>
+				authority.state === "active" &&
+				authority.installationId !== undefined &&
+				!isStableInstallationId(authority.installationId),
+		);
+		for (const authority of legacyActive) {
+			try {
+				await this.integrationAuthorityService.revokeAuthority(
+					authority.authorityId,
+					"migrated-to-stable-installation-id",
+				);
+				logger.info("Retired legacy plugin authority after identity migration", {
+					pluginId,
+					authorityId: authority.authorityId,
+				});
+			} catch (error) {
+				logger.warn("Unable to retire legacy plugin authority", {
+					pluginId,
+					authorityId: authority.authorityId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+	}
+
+	private async currentInstallationId(pluginId: string): Promise<string> {
+		const state = await this.requireState(pluginId);
+		const installationId = authorityInstallationId(state);
+		if (!state.current?.hash || !installationId) {
+			throw new PluginManagerError(
+				"Plugin has no current installation package",
+				"PLUGIN_PACKAGE_UNAVAILABLE",
+				422,
+			);
+		}
+		return (await this.resolveInstallationContext(state)).installationId;
+	}
+
+	private async syncPermissionSummary(
+		pluginId: string,
+		permissions: PluginPermissionSet,
+	): Promise<void> {
+		await this.stateStore.updateState(pluginId, {
+			authorityInstallationId: permissions.installationId,
+			grants: permissionSummary(permissions),
+		});
+	}
+
+	private async applyPermissionMutationLocked(
+		pluginId: string,
+		installationId: string,
+		mutation: PermissionMutationResult,
+	): Promise<PluginPermissionMutationResult> {
+		await this.syncPermissionSummary(pluginId, mutation.set);
+		if (mutation.changed) {
+			await this.revokePluginLifecycle(pluginId, "grant_revision", "manager-grant-revision", {
+				grantRevision: mutation.set.revision,
+			});
+		}
+		const state = await this.requireState(pluginId);
+		const runtime = this.runtimeSupervisor.get(pluginId);
+		const runtimeCanAccessHost = runtime?.state === "active" || runtime?.state === "degraded";
+		let rebound = false;
+		if (runtime && runtimeCanAccessHost) {
+			const diagnostics = runtime.getDiagnostics();
+			const binding = this.hostServices.getRuntimeBinding(pluginId, diagnostics.runtimeId);
+			const bindingIsCurrent =
+				binding?.plugin.installationId === installationId &&
+				binding.plugin.runtimeGeneration === diagnostics.generation &&
+				binding.grantRevision === mutation.set.revision;
+			if (mutation.changed || !bindingIsCurrent) {
+				await this.bindRuntimeForRuntime(pluginId, installationId, diagnostics);
+				rebound = true;
+			}
+		}
+		const canRestore =
+			state.desiredState === "enabled" &&
+			(runtime ? runtimeCanAccessHost : state.runtimeState === "active");
+		if ((mutation.changed || rebound) && canRestore) {
+			await this.restorePluginAccess(pluginId);
+		}
+		return {
+			status: await this.requireStatus(pluginId),
+			permissions: mutation.set,
+		};
+	}
+
+	private async revokePluginLifecycle(
+		pluginId: string,
+		kind: PluginLifecycleRevokeEventKind,
+		reason: string,
+		details: Partial<
+			Pick<PluginLifecycleRevokeEvent, "runtimeId" | "runtimeGeneration" | "grantRevision">
+		> = {},
+	): Promise<PluginLifecycleRevokeReport> {
+		const deterministicRuntimeEvent =
+			kind === "crash" ||
+			kind === "quarantine" ||
+			kind === "runtime_generation" ||
+			(kind === "grant_revision" && details.grantRevision !== undefined);
+		const eventId = deterministicRuntimeEvent
+			? [
+					"plugin-lifecycle",
+					kind,
+					pluginId,
+					details.runtimeId ?? "runtime",
+					details.runtimeGeneration ?? 0,
+					details.grantRevision ?? 0,
+				].join(":")
+			: `plugin-lifecycle:${kind}:${pluginId}:${generateShortId(12)}`;
+		let report: PluginLifecycleRevokeReport;
+		try {
+			report = await this.lifecycleRevokeCoordinator.revoke({
+				eventId,
+				pluginId,
+				kind,
+				reason,
+				...details,
+			});
+			await this.legacyRevokeUiSessions?.(pluginId);
+		} catch (error) {
+			// A stale callback must not quarantine its replacement, but a failed
+			// cross-layer revoke still fences every restore until a fresh revoke succeeds.
+			this.lifecycleRevokeFailures.set(pluginId, error);
+			this.hostServices.revokeRuntime(
+				pluginId,
+				details.runtimeId,
+				kind === "runtime_generation" ? undefined : details.runtimeGeneration,
+			);
+			throw error;
+		}
+		if (!report.deduplicated) this.lifecycleRevokeFailures.delete(pluginId);
+		return report;
+	}
+
+	private async handleRuntimeStateChange(
+		pluginId: string,
+		event: RuntimeStateEvent,
+	): Promise<void> {
+		// Share ordering with disable/uninstall/permission mutations. Supervisor
+		// callbacks only enqueue; locked manager operations never await this queue.
+		await this.lifecycleMutex.acquire(pluginId, async () => {
+			const { diagnostics, state: runtimeState } = event;
+			try {
+				if (runtimeState === "active" && this.isCurrentRuntimeEvent(pluginId, event)) {
+					if (await this.isRuntimeGenerationChange(pluginId, diagnostics.generation)) {
+						await this.revokePluginLifecycle(
+							pluginId,
+							"runtime_generation",
+							"runtime-generation-changed",
+							{
+								runtimeId: diagnostics.runtimeId,
+								runtimeGeneration: diagnostics.generation,
+							},
+						);
+					}
+					if (this.isCurrentRuntimeEvent(pluginId, event)) {
+						await this.reconcileActiveRuntimeAccess(pluginId);
+					}
+				}
+				if (["crashed", "failed", "quarantine"].includes(runtimeState) && !event.revoked) {
+					// Even if a restart has begun, finish revocation before the queued
+					// active event restores access. onCrash shares this event, so it
+					// cannot launch a second revocation after a newer restore.
+					event.revoked = true;
+					const kind = runtimeState === "quarantine" ? "quarantine" : "crash";
+					await this.revokePluginLifecycle(pluginId, kind, `runtime-${kind}`, {
+						runtimeId: diagnostics.runtimeId,
+						runtimeGeneration: diagnostics.generation,
+					});
+				}
+				if (!this.isCurrentRuntimeEvent(pluginId, event)) return;
+				if (event.sourceError !== undefined && !event.failurePersisted) {
+					event.failurePersisted = true;
+					await this.persistFailure(pluginId, event.sourceError, "runtime", false, event);
+				} else if (!event.failurePersisted) {
+					await this.persistRuntimeState(pluginId, event);
+				}
+				await this.refreshCatalog();
+			} catch (error) {
+				await this.handleObservedLifecycleRevokeFailure(
+					pluginId,
+					runtimeState,
+					error,
+					event.sourceError,
+					event,
+				);
+			}
+		});
+	}
+
+	private async handleObservedLifecycleRevokeFailure(
+		pluginId: string,
+		runtimeState: string,
+		error: unknown,
+		sourceError?: unknown,
+		event?: RuntimeStateEvent,
+	): Promise<void> {
+		logger.error("Plugin lifecycle revocation failed for a runtime event", {
+			pluginId,
+			runtimeState,
+			error: error instanceof Error ? error.message : String(error),
+			revokeErrors:
+				error instanceof PluginLifecycleRevokeError
+					? error.report.errors.map((failure) => ({
+							layer: failure.layer,
+							action: failure.action,
+							code: failure.code,
+							message: failure.message,
+						}))
+					: undefined,
+		});
+		if (event && !this.isCurrentRuntimeEvent(pluginId, event)) return;
+		if (runtimeState !== "quarantine") {
+			this.runtimeSupervisor.quarantine(pluginId, "lifecycle revocation failed");
+		}
+		await this.persistFailure(
+			pluginId,
+			error,
+			"lifecycle-revoke",
+			true,
+			event ? { ...event, state: "quarantine" } : undefined,
+		).catch((persistError) => {
+			logger.error("Unable to persist plugin lifecycle revocation failure", {
+				pluginId,
+				error: persistError instanceof Error ? persistError.message : String(persistError),
+				sourceError: sourceError instanceof Error ? sourceError.message : undefined,
+			});
+		});
+	}
+
+	private async isRuntimeGenerationChange(pluginId: string, generation: number): Promise<boolean> {
+		const state = await this.stateStore.getState(pluginId);
+		return !!state && state.runtimeGeneration > 0 && generation > state.runtimeGeneration;
+	}
+
+	private async refreshCatalog(
+		operation:
+			| "refresh"
+			| "initialize"
+			| "install"
+			| "enable"
+			| "activate"
+			| "disable"
+			| "uninstall" = "refresh",
+	): Promise<PluginCatalogSnapshot> {
+		this.catalogSnapshot = await this.catalog.scan();
+		let report: { changed: boolean; revision: number };
+		switch (operation) {
+			case "initialize":
+				report = await this.contributionCoordinator.initialize(this.catalogSnapshot);
+				break;
+			case "install":
+				report = await this.contributionCoordinator.install(this.catalogSnapshot);
+				break;
+			case "enable":
+				report = await this.contributionCoordinator.enable(this.catalogSnapshot);
+				break;
+			case "activate":
+				report = await this.contributionCoordinator.activate(this.catalogSnapshot);
+				break;
+			case "disable":
+				report = await this.contributionCoordinator.disable(this.catalogSnapshot);
+				break;
+			case "uninstall":
+				report = await this.contributionCoordinator.uninstall(this.catalogSnapshot);
+				break;
+			default:
+				report = await this.contributionCoordinator.refresh(this.catalogSnapshot);
+				break;
+		}
+		// The search-channel registry is now populated, so a saved `plugin:` channel with no
+		// contribution behind it really is uninstalled. Until this point absence only meant
+		// "not loaded yet", and `mergeChannels` deliberately preserved such entries rather than
+		// discarding the user's enabled flag and fallback position. See
+		// `areExtraSearchChannelsReady` for why registration alone is not enough.
+		//
+		// Newly contributed channels do not need a settings write to become usable — the catalog
+		// is rebuilt from the registry on every read — so this only persists when the merge
+		// actually changed something, i.e. when a stale entry gets pruned.
+		markExtraSearchChannelsReady();
+		if (normalizeSearchSettings(settings)) saveSettings(settings);
+		if (report.changed) {
+			eventBus.emit({
+				type: "plugin:contributions_changed",
+				revision: report.revision,
+				reason: operation,
+			});
+			await this.broadcastPluginEvent("plugin:contributions_changed", {
+				revision: report.revision,
+				reason: operation,
+			});
+		}
+		return this.catalogSnapshot;
+	}
+
+	private catalogPlugin(pluginId: string): PluginCatalogPlugin | undefined {
+		return this.catalogSnapshot?.plugins.find((plugin) => plugin.pluginId === pluginId);
+	}
+
+	/**
+	 * Raise approval requests for capabilities the installed manifest declares but that the
+	 * installation holds no grant for.
+	 *
+	 * This is the fail-closed half of the upgrade path. A stable installation identity means
+	 * a new package version inherits the previous grants; if its manifest declares more, the
+	 * extra capabilities must not ride in on that inheritance. They are surfaced here as
+	 * pending requests instead, so an admin makes the same explicit decision they made at
+	 * first install.
+	 *
+	 * Only capabilities with a canonical adapter can produce a request — the manifest schema
+	 * accepts free-form tokens, but an unmappable one can never be granted (and the broker
+	 * denies it anyway), so prompting for it would be an undecidable question.
+	 *
+	 * Scope is `global`, matching what the manifest expresses: a declaration carries no
+	 * scope, and the install-time seeding grants global too. Narrowing belongs to the
+	 * grants panel, where the admin can replace a grant with a scoped one.
+	 *
+	 * Returns the capabilities that are now awaiting approval (including ones already
+	 * queued), so callers can report the outcome.
+	 */
+	private async requestUndeclaredManifestCapabilities(
+		pluginId: string,
+		installationId: string,
+		manifestRequested: readonly string[],
+		version: string,
+		permissions: PluginPermissionSet,
+	): Promise<string[]> {
+		const declared = [...new Set(manifestRequested)];
+		if (declared.length === 0) return [];
+		// A grant may be stored under the plugin-facing token or its canonical id, so both
+		// spellings count as "already granted" — otherwise every upgrade would re-prompt
+		// for capabilities the admin already approved.
+		const granted = new Set<string>();
+		for (const grant of permissions.grants) {
+			granted.add(grant.capability);
+			const adapted = adaptPluginCapability(grant.capability);
+			if (adapted) granted.add(adapted.id);
+		}
+		const missing = declared.filter((capability) => {
+			const adapted = adaptPluginCapability(capability);
+			if (!adapted) return false;
+			return !granted.has(capability) && !granted.has(adapted.id);
+		});
+		if (missing.length === 0) return [];
+
+		const queued: string[] = [];
+		for (const capability of missing) {
+			try {
+				const request = await this.permissionStore.addPendingRequest(pluginId, installationId, {
+					capability,
+					scope: { type: "global" },
+					source: "upgrade",
+					requestedForVersion: version,
+				});
+				// Permanently denied pairs stay silent across upgrades too: re-declaring
+				// the capability in a new version must not re-raise the question.
+				if (!request) continue;
+				queued.push(capability);
+				eventBus.emit({
+					type: "plugin:permission_request",
+					pluginId,
+					requestId: request.requestId,
+					capability,
+				} as NarraForkEvent);
+				await this.broadcastPluginEvent("plugin:permission_request", {
+					pluginId,
+					requestId: request.requestId,
+					capability,
+					source: "upgrade",
+				});
+			} catch (error) {
+				// A full pending queue (or any single rejected row) must not abort the rest:
+				// the capability stays ungranted either way, and the remaining ones still
+				// deserve a prompt.
+				logger.warn("Could not queue an upgrade capability approval request", {
+					pluginId,
+					capability,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		if (queued.length > 0) {
+			logger.info("Upgraded plugin declares new capabilities; awaiting approval", {
+				pluginId,
+				version,
+				awaitingApproval: queued,
+			});
+		}
+		return queued;
+	}
+
+	/**
+	 * Callback injected into the capability broker. When the broker denies a capability
+	 * because no grant exists, it invokes this handler to create a permission prompt rather
+	 * than failing immediately. Returns the pending request id or undefined when the plugin
+	 * state does not permit prompting or the store rejects a duplicate.
+	 */
+	private async handlePermissionRequest(
+		input: PluginPermissionRequestInput,
+	): Promise<{ requestId: string } | undefined> {
+		try {
+			const state = await this.requireState(input.pluginId);
+			if (state.desiredState !== "enabled") return undefined;
+			if (state.runtimeState === "quarantine" || state.runtimeState === "failed") return undefined;
+
+			const parsedScope = permissionScopeSchema.safeParse(input.scope);
+			if (!parsedScope.success) return undefined;
+
+			const req = await this.permissionStore.addPendingRequest(
+				input.pluginId,
+				input.installationId,
+				{
+					capability: input.capability,
+					scope: parsedScope.data,
+					requestedByRuntimeId: input.runtimeId,
+				},
+			);
+
+			// Permanently denied: no row was queued, so the broker surfaces a plain
+			// denial with no pendingRequestId and no UI prompt.
+			if (!req) return undefined;
+
+			eventBus.emit({
+				type: "plugin:permission_request",
+				pluginId: input.pluginId,
+				requestId: req.requestId,
+				capability: input.capability,
+			} as NarraForkEvent);
+			await this.broadcastPluginEvent("plugin:permission_request", {
+				pluginId: input.pluginId,
+				requestId: req.requestId,
+				capability: input.capability,
+				// Explicit so UI consumers can gate on source without mirroring the
+				// store's "missing means runtime" default.
+				source: "runtime",
+			});
+
+			return { requestId: req.requestId };
+		} catch (error) {
+			if (error instanceof ValidationError) return undefined;
+			throw error;
+		}
+	}
+
+	/**
+	 * Push a plugin lifecycle event to connected UI sessions so panels refresh
+	 * live (event-driven refresh on top of the foreground polling fallback).
+	 * Best-effort: a failure here never affects the operation itself.
+	 */
+	private async broadcastPluginEvent(
+		type:
+			| "plugin:permission_request"
+			| "plugin:permission_resolved"
+			| "plugin:contributions_changed",
+		payload: Record<string, unknown>,
+	): Promise<void> {
+		try {
+			const { broadcastToAdmins, broadcastToAll } = await import("../websocket/narrator-ws");
+			// Permission prompts can only be decided by an admin; contribution changes
+			// affect every client's UI (menus, providers) and stay deployment-wide.
+			if (type === "plugin:contributions_changed") broadcastToAll({ type, ...payload });
+			else broadcastToAdmins({ type, ...payload });
+		} catch {
+			// Event push is best-effort; polling remains the fallback.
+		}
+	}
+
+	private async requireState(pluginId: string): Promise<PluginStateRecord> {
+		const state = await this.stateStore.getState(pluginId);
+		if (!state) throw new NotFoundError("Plugin", pluginId);
+		return state;
+	}
+
+	private async requireStatus(pluginId: string): Promise<PluginManagerStatus> {
+		const status = await this.buildStatus(pluginId);
+		if (!status) throw new NotFoundError("Plugin", pluginId);
+		return status;
+	}
+
+	private async buildStatus(pluginId: string): Promise<PluginManagerStatus | undefined> {
+		const state = await this.stateStore.getState(pluginId);
+		const plugin = this.catalogPlugin(pluginId);
+		if (!state && !plugin) return undefined;
+		const effectiveState = state ?? createPluginStateRecord(pluginId, this.timestamp());
+		const packageSummary = currentPackage(plugin);
+		const runtime = this.runtimeSupervisor.getDiagnostics(pluginId)[0];
+		return {
+			...effectiveState,
+			installed: Boolean(packageSummary),
+			featureDisabled: this.disabled,
+			packageStatus: packageSummary?.status,
+			manifest: packageSummary?.manifest,
+			contributions: plugin?.contributions ?? [],
+			diagnostics: [
+				...(this.catalogSnapshot?.diagnostics ?? []),
+				...(plugin?.diagnostics ?? []),
+				...(await this.stateStore.getDiagnostics()),
+			],
+			runtime,
+			operations: await this.stateStore.listOperations(pluginId),
+		};
+	}
+
+	private async discoverSourcePluginId(source: PackageSource): Promise<string | undefined> {
+		if (typeof source !== "string" && !(source instanceof URL)) return undefined;
+		const path = resolve(source instanceof URL ? source.pathname : source);
+		try {
+			const info = await lstat(path);
+			if (!info.isDirectory()) return undefined;
+			const manifestPath = join(path, "manifest.json");
+			const manifestInfo = await lstat(manifestPath);
+			if (
+				!manifestInfo.isFile() ||
+				manifestInfo.isSymbolicLink() ||
+				manifestInfo.size > MAX_MANIFEST_BYTES
+			) {
+				return undefined;
+			}
+			const raw = JSON.parse(await readFile(manifestPath, "utf8")) as unknown;
+			if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+			const pluginId = (raw as { pluginId?: unknown }).pluginId;
+			return typeof pluginId === "string" && pluginIdSchema.safeParse(pluginId).success
+				? pluginId
+				: undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	private async removePackageFromDisk(pluginId: string): Promise<void> {
+		assertPluginId(pluginId);
+		const current = await this.packageStore.readCurrent();
+		if (current.plugins[pluginId]) {
+			await this.packageStore.setCurrent(pluginId, undefined, {
+				expectedCurrent: current.plugins[pluginId],
+				operationId: `uninstall-${pluginId}`,
+			});
+		}
+		const packagesPath = this.packageStore.paths?.packages ?? join(this.root, "packages");
+		await rm(join(packagesPath, pluginId), { recursive: true, force: true });
+		await Promise.all([
+			rm(join(this.root, "temp", pluginId), { recursive: true, force: true }),
+			rm(join(this.root, "logs", pluginId), { recursive: true, force: true }),
+		]);
+	}
+
+	private assertFeatureEnabled(operation: string): void {
+		if (this.disabled) {
+			throw new PluginManagerError(
+				`Plugin ${operation} is disabled by the host feature flag`,
+				"PLUGINS_DISABLED",
+				503,
+			);
+		}
+	}
+
+	private timestamp(): string {
+		return this.now().toISOString();
+	}
+
+	private async ensureInitialized(): Promise<void> {
+		if (this.initialized) return;
+		await this.initialize();
+	}
+}
+
+/**
+ * Resolve whether the plugin subsystem is enabled. The environment variables
+ * `NF_PLUGINS_ENABLED` / `NARRAFORK_PLUGINS_ENABLED`, when set, take precedence
+ * (operational kill switch: "0"/"false" force-disables). When neither is set,
+ * fall back to `settings.plugins.enabled` (defaults to true).
+ */
+function pluginsEnabledFromEnvironment(): boolean {
+	const value = process.env.NF_PLUGINS_ENABLED ?? process.env.NARRAFORK_PLUGINS_ENABLED;
+	if (value !== undefined) {
+		return value === "1" || value.toLowerCase() === "true";
+	}
+	return settings.plugins?.enabled ?? true;
+}
+
+function pluginTrustPolicyFromEnvironment(): PluginTrustPolicy | undefined {
+	const enabled =
+		process.env.NF_PLUGIN_TRUST_ENFORCED === "1" ||
+		process.env.NF_PLUGIN_TRUST_ENFORCED?.toLowerCase() === "true";
+	const requireSignature =
+		process.env.NF_PLUGIN_REQUIRE_SIGNATURE === "1" ||
+		process.env.NF_PLUGIN_REQUIRE_SIGNATURE?.toLowerCase() === "true";
+	const requireSbom =
+		process.env.NF_PLUGIN_REQUIRE_SBOM === "1" ||
+		process.env.NF_PLUGIN_REQUIRE_SBOM?.toLowerCase() === "true";
+	if (!enabled && !requireSignature && !requireSbom) return undefined;
+	return {
+		enabled: true,
+		requireSignature,
+		sbomPolicy: requireSbom ? { requireSbom: true } : undefined,
+	};
+}
+
+function podmanConfigFromEnvironment(): PluginPodmanConfig | undefined {
+	const image = process.env.NF_PLUGIN_PODMAN_IMAGE;
+	const imageDigest = process.env.NF_PLUGIN_PODMAN_IMAGE_DIGEST;
+	return image && imageDigest ? { image, imageDigest } : undefined;
+}
+
+export const pluginManager = new PluginManager({
+	disabled: !pluginsEnabledFromEnvironment(),
+	trustPolicy: pluginTrustPolicyFromEnvironment(),
+	podman: podmanConfigFromEnvironment(),
+	runtimeSupervisor: pluginPlatformServices.runtimeSupervisor,
+	stateStore: pluginPlatformServices.stateStore,
+	permissionStore: pluginPlatformServices.permissionStore,
+	hostServices: pluginPlatformServices.hostServices,
+	contributionRegistry: pluginPlatformServices.contributionRegistry,
+	toolRegistry: pluginPlatformServices.toolRegistry,
+	agentToolBridge: pluginPlatformServices.toolBridge,
+	contributionCoordinator: pluginPlatformServices.contributionCoordinator,
+	providerCatalogRefresher: pluginPlatformServices.providerCatalogRefresher,
+	lifecycleRevokeCoordinator: pluginPlatformServices.lifecycleRevokeCoordinator,
+	restorePluginLifecycle: pluginPlatformServices.restorePlugin,
+});
+
+pluginPlatformServices.publicApi.configureAdapters(
+	createCorePluginPublicApiAdapters({ db, pluginManager }),
+);

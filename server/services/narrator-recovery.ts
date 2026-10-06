@@ -1,0 +1,432 @@
+/**
+ * Shared recovery logic for both main narrators and subagents.
+ *
+ * Extracted to eliminate ~120 lines of near-identical context-overflow handling
+ * and to give subagents the same transient-error retry resilience that main
+ * narrators already enjoy.
+ */
+
+import { eq } from "drizzle-orm";
+import { db } from "../db";
+import { narrators } from "../db/schema";
+import { TRANSIENT_RETRY_BASE_MS } from "../lib/agent/types";
+import { eventBus } from "../lib/event-bus";
+import { getToolMessage } from "../lib/i18n";
+import { logger } from "../lib/logger";
+import { isSubagentVariant } from "../lib/narrator-utils";
+import type { Locale } from "../lib/prompt-i18n";
+import { getAutoCompactKeepPairs, settings } from "../lib/settings";
+import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { narratorService } from "./narrator-service";
+import {
+	awaitCompactCompletion,
+	markCompactAsBlocking,
+	runCustomCompact,
+} from "./narrator-session";
+import { compactLocks, hasPendingHistoryCompact } from "./narrator-session-state";
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+export const MAX_CONTEXT_OVERFLOW_RETRIES = 2;
+export { TRANSIENT_RETRY_BASE_MS };
+
+/**
+ * A completed assistant turn proves the recovered context was accepted and the
+ * agent made progress. Start a fresh overflow-recovery episode after that point;
+ * otherwise preserve the count so an immediately overflowing retry remains bounded.
+ */
+export function resetContextOverflowRetriesAfterProgress(
+	overflowRetries: number,
+	completedAssistantTurn: boolean | undefined,
+): number {
+	return completedAssistantTurn ? 0 : overflowRetries;
+}
+
+/** Read the user-configured max transient retries from settings. */
+export function getMaxTransientRetries(): number {
+	return settings.agent.maxTransientRetries;
+}
+
+/** Read the user-configured silent-tool-call threshold from settings. */
+export function getSilentToolCallThreshold(): number {
+	return settings.agent.silentToolCallThreshold;
+}
+
+/** Read the user-configured Pipeline capture inactivity threshold from settings. */
+export function getPipelineUnusedToolCallThreshold(): number {
+	return settings.agent.pipelineUnusedToolCallThreshold;
+}
+
+/** Read the user-configured retry backoff ceiling (ms) from settings. */
+export function getRetryBackoffCeilMs(): number {
+	return settings.agent.retryBackoffCeilMs;
+}
+
+/** Read the user-configured first-token timeout (ms) from settings. */
+export function getFirstTokenTimeoutMs(): number {
+	return settings.agent.firstTokenTimeoutMs;
+}
+
+// ── Context overflow recovery ────────────────────────────────────────────────
+
+interface OverflowResultBase {
+	overflowRetries: number;
+}
+
+interface OverflowCompacted extends OverflowResultBase {
+	/**
+	 * History was compacted (or a compact already completed) and the caller
+	 * should retry. Does NOT carry a new conversationId: recovery keeps the
+	 * existing id so prompt-cache / sticky-session affinity survives.
+	 */
+	action: "retry_compacted";
+}
+
+export type ContextOverflowFailureReason =
+	| "max_retries_exceeded"
+	| "no_compact_boundary"
+	| "compact_noop"
+	| "compact_failed";
+
+interface OverflowFailed extends OverflowResultBase {
+	action: "failed";
+	reason: ContextOverflowFailureReason;
+}
+
+export type OverflowResult = OverflowCompacted | OverflowFailed;
+
+export function getContextOverflowFailureError(reason: ContextOverflowFailureReason): {
+	message: string;
+	errorCode: string;
+} {
+	switch (reason) {
+		case "max_retries_exceeded":
+			return {
+				message: "Context is still too long after automatic recovery attempts",
+				errorCode: "context_too_long_recovery_exhausted",
+			};
+		case "no_compact_boundary":
+			return {
+				message: "Context is too long, but there is not enough older conversation to compact",
+				errorCode: "context_too_long_no_compact_boundary",
+			};
+		case "compact_noop":
+			return {
+				message: "Context is too long, but compact did not reduce the conversation",
+				errorCode: "context_too_long_compact_noop",
+			};
+		case "compact_failed":
+			return {
+				message: "Context too long, compact failed",
+				errorCode: "context_too_long_compact_failed",
+			};
+	}
+}
+
+/**
+ * Handle a context-length-exceeded situation with emergency compact.
+ * Returns a discriminated union so the caller can read the
+ * recovery payload (retry_compacted, no conversationId rotation) directly from
+ * the result — no callbacks needed.
+ *
+ * @param onBroadcast  Optional hook to push events to the frontend (main
+ *                     narrator broadcasts to WS; subagents skip this).
+ */
+export async function handleContextOverflow(opts: {
+	narratorId: string;
+	userId?: string | null;
+	locale: Locale;
+	provider: string;
+	model: string;
+	/** Context usage percentage observed on the failed request, when available. */
+	contextPercentBefore?: number | null;
+	overflowRetries: number;
+	maxRetries: number;
+	/** Latest compact seq observed when the failed request's history was built. */
+	baselineCompactSeq?: number | null;
+	/** Abort the in-flight-compact wait when the user/parent interrupts. */
+	signal?: AbortSignal;
+	onBroadcast?: (event: Record<string, unknown>) => void;
+}): Promise<OverflowResult> {
+	const { narratorId, locale, provider, signal, onBroadcast } = opts;
+	let { overflowRetries } = opts;
+
+	logger.warn("Context length exceeded, attempting emergency recovery", {
+		narratorId,
+		attempt: overflowRetries,
+		provider,
+	});
+
+	onBroadcast?.({ type: "context_length_exceeded", narratorId });
+
+	// ── Phase A: consume a compact that is ALREADY happening ─────────────
+	// Waiting for (or applying the result of) an in-flight / just-finished compact
+	// is NOT a failed recovery attempt — it is waiting for an operation that is
+	// guaranteed to shrink the context. It must therefore run BEFORE the retry
+	// quota check and must NOT consume `overflowRetries`. Only when there is no
+	// compact to ride on do we fall through to Phase B and spend a retry.
+	const baselineCompactSeq = opts.baselineCompactSeq ?? -1;
+	const latestCompactSeq = await narratorService.getLatestCompactSeq(narratorId);
+	if (latestCompactSeq != null && latestCompactSeq > baselineCompactSeq) {
+		onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
+		logger.info("A completed compact already supersedes the failed request, retrying", {
+			narratorId,
+			baselineCompactSeq: opts.baselineCompactSeq ?? null,
+			latestCompactSeq,
+		});
+		return { action: "retry_compacted", overflowRetries };
+	}
+
+	// If auto-compact was already triggered while the failed request was in flight,
+	// wait for it. Only a completed history compact is enough to retry directly;
+	// segment compacts and no-op probes do not reduce the overflow recovery history.
+	const existingCompact = compactLocks.get(narratorId);
+	if (existingCompact) {
+		logger.warn("Context overflow detected while compact is in progress, waiting", {
+			narratorId,
+			attempt: overflowRetries,
+			kind: existingCompact.kind,
+			mode: existingCompact.mode,
+		});
+		if (existingCompact.mode === "background" && existingCompact.kind !== "segment") {
+			await markCompactAsBlocking(narratorId).catch((err) => {
+				logger.warn("Failed to mark existing compact as blocking during overflow recovery", {
+					narratorId,
+					error: String(err),
+				});
+			});
+			existingCompact.mode = "blocking";
+		}
+		try {
+			// awaitCompactCompletion drains probe→history lock hand-offs and honors
+			// the interrupt signal. That signal matters more than it looks: the
+			// compact is bounded by an inactivity watchdog, not a total-duration
+			// budget, so a compact that keeps making progress can legitimately run to
+			// its 30-minute ceiling. Passing the signal is what keeps a user/parent
+			// abort from waiting that long.
+			await awaitCompactCompletion(narratorId, signal);
+			const seqAfterInflight = await narratorService.getLatestCompactSeq(narratorId);
+			if (
+				hasPendingHistoryCompact(narratorId) ||
+				(seqAfterInflight != null && seqAfterInflight > baselineCompactSeq)
+			) {
+				onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
+				logger.info("Existing history compact finished after context overflow, retrying", {
+					narratorId,
+					kind: existingCompact.kind,
+				});
+				return { action: "retry_compacted", overflowRetries };
+			}
+			logger.info("Existing compact did not satisfy overflow recovery, continuing", {
+				narratorId,
+				kind: existingCompact.kind,
+			});
+		} catch (compactErr) {
+			// A cancelled wait means the caller was interrupted — do not treat it as
+			// a compact failure; let the caller observe its own abort.
+			if (signal?.aborted) {
+				logger.info("Context overflow compact wait aborted by caller", { narratorId });
+				return { action: "failed", overflowRetries, reason: "compact_failed" };
+			}
+			logger.error("Existing compact failed during context overflow recovery", {
+				narratorId,
+				kind: existingCompact.kind,
+				error: String(compactErr),
+			});
+		}
+	}
+
+	// Race window: a background/mid-turn compact may have COMPLETED after we
+	// captured `baselineCompactSeq` but is not currently holding a lock — either
+	// because triggerMidTurnCompact's probe lock briefly steps aside before
+	// runCustomCompact installs the real history lock, or because the compact
+	// finished between the failed request and this recovery running. In both
+	// cases the history is already compacted, so retry directly instead of
+	// starting a redundant compact (which would report compact_noop) or giving
+	// up with max_retries_exceeded while a perfectly good summary sits in the DB.
+	if (hasPendingHistoryCompact(narratorId)) {
+		onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
+		logger.info("History compact completed but not yet applied to active history, retrying", {
+			narratorId,
+			attempt: overflowRetries,
+		});
+		return { action: "retry_compacted", overflowRetries };
+	}
+	const latestCompactSeqAfterWait = await narratorService.getLatestCompactSeq(narratorId);
+	if (latestCompactSeqAfterWait != null && latestCompactSeqAfterWait > baselineCompactSeq) {
+		onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
+		logger.info("A compact completed while overflow recovery was running, retrying", {
+			narratorId,
+			baselineCompactSeq,
+			latestCompactSeq: latestCompactSeqAfterWait,
+		});
+		return { action: "retry_compacted", overflowRetries };
+	}
+
+	// ── Phase B: no compact to ride on — this is a real recovery attempt ──
+	// Now (and only now) spend a retry. Actively starting a fresh compact
+	// is bounded by maxRetries so a genuinely unrecoverable context still fails
+	// instead of looping forever.
+	overflowRetries++;
+	if (overflowRetries > opts.maxRetries) {
+		return { action: "failed", overflowRetries, reason: "max_retries_exceeded" };
+	}
+
+	// All providers, including Codex, go directly to emergency compact.
+	// Summary generation handles bounded input fitting internally.
+	let boundaryMessageId = await narratorService.getCompactBoundaryMessage(
+		narratorId,
+		getAutoCompactKeepPairs(),
+	);
+
+	// If the normal boundary is unavailable because there are too few messages to
+	// satisfy the configured keepPairs (e.g. a single oversized message blew the
+	// window), fall back to an emergency boundary that ignores keepPairs and keeps
+	// only the most recent message. Anything summarizable is better than failing.
+	let usedEmergencyBoundary = false;
+	if (!boundaryMessageId) {
+		boundaryMessageId = await narratorService.getEmergencyCompactBoundaryMessage(narratorId);
+		usedEmergencyBoundary = boundaryMessageId != null;
+		if (usedEmergencyBoundary) {
+			logger.warn("Falling back to emergency compact boundary (ignoring keepPairs)", {
+				narratorId,
+				boundaryMessageId,
+			});
+		}
+	}
+
+	if (!boundaryMessageId) {
+		logger.warn("No compact boundary found", { narratorId });
+		return { action: "failed", overflowRetries, reason: "no_compact_boundary" };
+	}
+
+	// When recovering from a context overflow, append an emergency hint to the
+	// summary so the next turn is warned against re-filling the window (e.g. by
+	// using the Read tool's read-all mode on very large files).
+	const appendHint = getToolMessage("compactContextOverflowHint", locale);
+
+	try {
+		const compacted = await runCustomCompact(narratorId, locale, boundaryMessageId, {
+			appendHint,
+			trigger: "context_overflow",
+			userId: opts.userId,
+			...(opts.contextPercentBefore != null
+				? { contextPercentBefore: opts.contextPercentBefore }
+				: {}),
+		});
+		if (compacted) {
+			onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
+			logger.info("Emergency compact succeeded, retrying", {
+				narratorId,
+				usedEmergencyBoundary,
+			});
+			return { action: "retry_compacted", overflowRetries };
+		}
+		logger.warn("Emergency compact completed without compacting", {
+			narratorId,
+			boundaryMessageId,
+		});
+		return { action: "failed", overflowRetries, reason: "compact_noop" };
+	} catch (compactErr) {
+		logger.error("Emergency compact failed", {
+			narratorId,
+			error: String(compactErr),
+		});
+		return { action: "failed", overflowRetries, reason: "compact_failed" };
+	}
+}
+
+// ── Transient error retry ────────────────────────────────────────────────────
+
+/**
+ * Abort-aware sleep that resolves early when the signal fires.
+ */
+export function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+	return new Promise<void>((resolve) => {
+		if (signal.aborted) {
+			resolve();
+			return;
+		}
+		const timer = setTimeout(resolve, ms);
+		const onAbort = () => {
+			clearTimeout(timer);
+			resolve();
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+/**
+ * Decide whether to retry a transient API error.
+ *
+ * Returns `true` if the caller should `continue` the loop, `false` if it
+ * should give up.  Handles backoff delay, logging, and frontend notification.
+ */
+export async function handleTransientError(opts: {
+	narratorId: string;
+	error: string;
+	retryCount: number;
+	maxRetries: number;
+	signal: AbortSignal;
+}): Promise<{ shouldRetry: boolean; delayMs: number }> {
+	const { narratorId, error, retryCount, maxRetries, signal } = opts;
+
+	if (maxRetries !== -1 && retryCount > maxRetries) {
+		logger.error("Transient error exceeded max retries", {
+			narratorId,
+			error,
+			retries: retryCount,
+		});
+		return { shouldRetry: false, delayMs: 0 };
+	}
+
+	const delayMs = Math.min(
+		TRANSIENT_RETRY_BASE_MS * 2 ** (retryCount - 1),
+		getRetryBackoffCeilMs(),
+	);
+	logger.warn("Transient API error, retrying", {
+		narratorId,
+		error,
+		attempt: retryCount,
+		delayMs,
+	});
+
+	// Notify frontend (include retry metadata for statusbar display)
+	const warningPayload = {
+		type: "warning" as const,
+		narratorId,
+		message: error,
+		retryCount,
+		maxRetries,
+		delayMs,
+	};
+	eventBus.emit({ type: "narrator:warning", narratorId, message: error });
+	broadcastToNarrator(narratorId, warningPayload);
+
+	// If this is a subagent, also notify the parent narrator so SubagentCard
+	// can display the retry status inline.
+	try {
+		const narrator = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { variant: true, parentNarratorId: true },
+		});
+		if (narrator && isSubagentVariant(narrator.variant) && narrator.parentNarratorId) {
+			broadcastToNarrator(narrator.parentNarratorId, {
+				type: "subagent_warning",
+				narratorId: narrator.parentNarratorId,
+				subagentNarratorId: narratorId,
+				message: error,
+				retryCount,
+				maxRetries,
+				delayMs,
+			});
+		}
+	} catch {
+		// Non-critical — don't let lookup failure break retry flow
+	}
+
+	// Abort-aware backoff
+	await abortableSleep(delayMs, signal);
+
+	return { shouldRetry: !signal.aborted, delayMs };
+}

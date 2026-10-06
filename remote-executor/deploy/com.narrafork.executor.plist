@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd job for the NarraFork remote executor on macOS.
+
+  Machine-wide (runs before login, requires sudo):
+    sudo cp com.narrafork.executor.plist /Library/LaunchDaemons/
+    sudo launchctl load -w /Library/LaunchDaemons/com.narrafork.executor.plist
+
+  Per-user (runs at login):
+    cp com.narrafork.executor.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.narrafork.executor.plist
+
+  Adjust the paths below to match where the binary, config and token file live.
+  For a LaunchAgent, replace /usr/local and /etc/narrafork with paths inside your
+  home directory (for example ~/.local/bin and ~/.config/narrafork).
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.narrafork.executor</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/narrafork-executor</string>
+		<string>--config</string>
+		<string>/etc/narrafork/executor.json</string>
+		<string>--token-file</string>
+		<string>/etc/narrafork/device-token</string>
+	</array>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>KeepAlive</key>
+	<true/>
+
+	<!-- Keep created files private to the executor's account. -->
+	<key>Umask</key>
+	<integer>63</integer>
+
+	<key>StandardOutPath</key>
+	<string>/var/log/narrafork-executor.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/narrafork-executor.log</string>
+</dict>
+</plist>

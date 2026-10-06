@@ -1,0 +1,283 @@
+import { Alert, Button, Modal, Select, Stack, Text, TextInput } from "@mantine/core";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
+import { api } from "../../lib/api";
+import { notifyResultWarnings } from "../../lib/operation-warnings";
+import { ErrorDetail } from "../common/ErrorDetail";
+
+interface MergeCheckResult {
+	hasConflicts: boolean;
+	conflictFiles: string[];
+	isFastForward: boolean;
+}
+
+type MergeMode = "snapshot" | "commit";
+
+const MERGE_MODAL_QUERY_GC_TIME_MS = 60_000;
+
+interface ChapterMergeModalProps {
+	chapterId: string;
+	projectId: string;
+	opened: boolean;
+	onClose: () => void;
+}
+
+export function ChapterMergeModal({
+	chapterId,
+	projectId,
+	opened,
+	onClose,
+}: ChapterMergeModalProps) {
+	const [targetId, setTargetId] = useState<string | null>(null);
+	const [strategy, setStrategy] = useState<string>("merge");
+	// Defaults to snapshot, matching the server's own default: merging the workspaces
+	// as they stand, without touching the user's git history. `commit` is opt-in
+	// because it is the mode that requires clean worktrees and writes history.
+	const [mode, setMode] = useState<MergeMode>("snapshot");
+	const [message, setMessage] = useState("");
+	const [conflicts, setConflicts] = useState<MergeCheckResult | null>(null);
+	const qc = useQueryClient();
+	const { t } = useTranslation("chapters");
+	const { t: tc } = useTranslation("common");
+
+	// Query project settings to check if review is required before merge
+	const { data: project } = useQuery({
+		queryKey: ["project", projectId],
+		queryFn: () => api.getProject(projectId),
+		enabled: opened,
+		gcTime: MERGE_MODAL_QUERY_GC_TIME_MS,
+	});
+
+	const cs = project?.chapterSettings as Record<string, unknown> | null;
+	const requireReview = !!cs?.requireReviewBeforeMerge;
+
+	// Query latest review conclusion for the source chapter
+	const {
+		data: reviewData,
+		isPending: reviewPending,
+		isError: reviewQueryFailed,
+		refetch: refetchReview,
+		isFetching: reviewFetching,
+	} = useQuery({
+		queryKey: ["reviewConclusion", "source", chapterId],
+		queryFn: () => api.getReviewConclusionForSource(chapterId),
+		enabled: opened && requireReview,
+		gcTime: MERGE_MODAL_QUERY_GC_TIME_MS,
+	});
+
+	const reviewVerdict = reviewData?.conclusion?.verdict ?? null;
+	// Three states, not two. `reviewData` is undefined both while the query is in
+	// flight and when it failed, and treating either as "not approved" left the
+	// merge button permanently disabled on a transient network error — including
+	// for chapters that DO have an approval recorded. Only a loaded conclusion that
+	// is not an approval actually blocks; a failure is surfaced as a retryable
+	// notice and leaves the decision with the user, who can see the review itself.
+	const reviewLoading = requireReview && reviewPending;
+	const reviewUnknown = requireReview && reviewQueryFailed;
+	const reviewBlocked =
+		requireReview && !reviewLoading && !reviewUnknown && reviewVerdict !== "approve";
+
+	const resetState = () => {
+		setTargetId(null);
+		setStrategy("merge");
+		setMode("snapshot");
+		setMessage("");
+		setConflicts(null);
+	};
+
+	const handleClose = () => {
+		resetState();
+		onClose();
+	};
+
+	// Get available target chapters (active chapters in the same project, excluding self)
+	const { data: chapters } = useQuery({
+		queryKey: ["chapters", { projectId }],
+		queryFn: () => api.listChapters(projectId),
+		enabled: opened,
+		gcTime: MERGE_MODAL_QUERY_GC_TIME_MS,
+	});
+
+	const targetOptions = (chapters ?? [])
+		.filter((ch) => ch.id !== chapterId && ch.status === "active")
+		.map((ch) => ({ value: ch.id, label: ch.title }));
+
+	// Both mutations render their own failure as an Alert further down, so the global
+	// toast would repeat the same sentence on top of the modal that already shows it.
+	const checkConflicts = useMutation({
+		meta: { suppressErrorToast: true },
+		mutationFn: () =>
+			api.checkMergeConflicts(chapterId, targetId ?? "") as Promise<MergeCheckResult>,
+		onSuccess: (data) => setConflicts(data),
+		onError: () => setConflicts(null),
+	});
+
+	const merge = useMutation({
+		meta: { suppressErrorToast: true },
+		mutationFn: () =>
+			api.mergeChapter(chapterId, {
+				targetChapterId: targetId ?? "",
+				strategy,
+				mode,
+				message: message.trim() || undefined,
+			}),
+		onSuccess: (result) => {
+			// The server answers `{ success: true, warning }` when the merge went
+			// through but left something behind — most often a source worktree kept
+			// because its snapshot could not be verified. Closing on success without
+			// reading it meant the only record was a server log.
+			notifyResultWarnings(t("mergeWarning"), result);
+			qc.invalidateQueries({ queryKey: ["chapters"] });
+			qc.invalidateQueries({ queryKey: ["graph"] });
+			// A merge changes the story network and the timeline too, and these were being
+			// left stale — so the graph and ruler views kept showing the source chapter as
+			// active until something else happened to refetch them.
+			qc.invalidateQueries({ queryKey: ["narraFlow"] });
+			qc.invalidateQueries({ queryKey: ["ruler"] });
+			qc.invalidateQueries({ queryKey: ["rulerSegment"] });
+			qc.invalidateQueries({ queryKey: ["chapterEdges"] });
+			handleClose();
+		},
+	});
+
+	const handleCheck = () => {
+		if (targetId) checkConflicts.mutate();
+	};
+
+	return (
+		<Modal opened={opened} onClose={handleClose} title={t("mergeChapter")}>
+			<Stack>
+				<Select
+					label={t("mergeInto")}
+					placeholder={t("selectTarget")}
+					data={targetOptions}
+					value={targetId}
+					onChange={setTargetId}
+					searchable
+				/>
+				<Select
+					label={tc("strategy")}
+					data={[
+						{ value: "merge", label: t("strategyMerge") },
+						{ value: "squash", label: t("strategySquash") },
+						{ value: "cherry-pick", label: t("strategyCherryPick") },
+					]}
+					value={strategy}
+					onChange={(v) => setStrategy(v ?? "merge")}
+				/>
+				<Select
+					label={t("mergeMode")}
+					data={[
+						{ value: "snapshot", label: t("mergeModeSnapshot") },
+						{ value: "commit", label: t("mergeModeCommit") },
+					]}
+					value={mode}
+					onChange={(v) => setMode(v === "commit" ? "commit" : "snapshot")}
+					description={mode === "commit" ? t("mergeModeCommitDesc") : t("mergeModeSnapshotDesc")}
+				/>
+				<TextInput
+					label={t("mergeMessage")}
+					placeholder={t("mergeMessagePlaceholder")}
+					value={message}
+					onChange={(e) => setMessage(e.currentTarget.value)}
+				/>
+
+				{conflicts?.hasConflicts && (
+					<Alert color="yellow" title={t("conflictsDetected")}>
+						<Text size="sm">
+							{t("conflictsDescription", { count: conflicts.conflictFiles?.length ?? 0 })}
+						</Text>
+					</Alert>
+				)}
+
+				{conflicts && !conflicts.hasConflicts && (
+					<Alert
+						color="green"
+						title={conflicts.isFastForward ? t("fastForward") : t("noConflicts")}
+					>
+						<Text size="sm">
+							{conflicts.isFastForward ? t("fastForwardDescription") : t("mergeClean")}
+						</Text>
+					</Alert>
+				)}
+
+				{checkConflicts.isError && (
+					<Alert color="red" title={t("conflictCheckFailed")}>
+						<ErrorDetail error={checkConflicts.error} fallback={tc("unknownError")} />
+					</Alert>
+				)}
+
+				{merge.isError && (
+					// The dirty-worktree cases used to be detected by comparing the response's
+					// `error` field against the literals "MERGE_DIRTY_SOURCE"/"MERGE_DIRTY_TARGET".
+					// They now travel as `messageCode`, so ErrorDetail localizes them from the
+					// errors namespace like any other catalog error — and anything else keeps its
+					// server prose instead of collapsing to "unknown error".
+					<Alert color="red" title={t("mergeFailed")}>
+						<ErrorDetail error={merge.error} fallback={tc("unknownError")} />
+					</Alert>
+				)}
+
+				{reviewUnknown && (
+					<Alert color="yellow" title={t("reviewConclusionFailed")}>
+						<Stack gap="xs">
+							<Text size="sm">{t("reviewConclusionFailedDesc")}</Text>
+							<Button
+								size="xs"
+								variant="light"
+								loading={reviewFetching}
+								onClick={() => void refetchReview()}
+								style={{ alignSelf: "flex-start" }}
+							>
+								{t("reviewConclusionRetry")}
+							</Button>
+						</Stack>
+					</Alert>
+				)}
+
+				{reviewLoading && (
+					<Text size="sm" c="dimmed">
+						{t("reviewConclusionLoading")}
+					</Text>
+				)}
+
+				{reviewBlocked && (
+					<Alert
+						color={reviewVerdict === "request_changes" ? "red" : "orange"}
+						title={
+							reviewVerdict === "request_changes"
+								? t("mergeReviewRequestChanges")
+								: t("mergeReviewRequired")
+						}
+					>
+						<Text size="sm">
+							{reviewVerdict === "request_changes"
+								? t("mergeReviewRequestChangesDesc")
+								: t("mergeReviewRequiredDesc")}
+						</Text>
+					</Alert>
+				)}
+
+				<Button
+					variant="light"
+					onClick={handleCheck}
+					loading={checkConflicts.isPending}
+					disabled={!targetId}
+				>
+					{t("checkConflicts")}
+				</Button>
+				<Button
+					onClick={() => merge.mutate()}
+					loading={merge.isPending}
+					// Only a loaded "not approved" conclusion, or a check still in flight,
+					// blocks. A failed check does not: it says nothing about the verdict, and
+					// disabling on it made an already-approved chapter unmergeable.
+					disabled={!targetId || reviewBlocked || reviewLoading}
+				>
+					{t("merge")}
+				</Button>
+			</Stack>
+		</Modal>
+	);
+}

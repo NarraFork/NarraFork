@@ -1,0 +1,6 @@
+{
+	"version": "0.4.0",
+	"date": "2026-05-06",
+	"en": "## New Features\n\n- Add configurable safety reflection controls while preserving strict safeguards for high-risk commands\n- Improve narrator list management with consolidated views, richer archived filtering, and better search metadata\n- Add Codex quota forecasting and scheduled usage refreshes to keep account availability accurate\n- Improve narrator plan mode, safety handling, rendering, and gateway settings\n\n## Bug Fixes\n\n- Harden danger reflection pause resolution to avoid races and keep normal permission UI focused on actionable requests",
+	"zh-CN": "## 新功能\n\n- 新增可配置的安全反思控制项，并继续保留高风险命令的严格保护\n- 改进叙述者列表管理，整合视图、增强归档筛选并补充搜索元数据\n- 新增 Codex 配额预测和定时用量刷新，帮助准确判断账号可用性\n- 改进叙述者计划模式、安全处理、渲染表现和网关设置\n\n## 修复\n\n- 强化危险反思暂停的决议流程，避免竞态并让普通权限界面只显示可操作请求"
+}

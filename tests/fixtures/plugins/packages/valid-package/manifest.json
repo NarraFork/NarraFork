@@ -1,0 +1,32 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.hello",
+	"version": "1.0.0",
+	"displayName": "Hello Tool",
+	"description": "A test plugin package.",
+	"engine": {
+		"runtime": "bun",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"runner": "local-process"
+	},
+	"server": {
+		"entry": "server/index.js",
+		"transport": "stdio",
+		"protocol": "narrafork.rpc/1",
+		"args": [],
+		"workingDirectory": "package"
+	},
+	"activationEvents": ["onCommand:hello"],
+	"contributes": {
+		"commands": [{ "id": "hello", "title": "Hello", "handler": "server" }]
+	},
+	"permissions": {
+		"host": [],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": { "package": "readOnly", "pluginData": "readWrite", "workspace": "none" },
+		"process": { "spawn": "none" }
+	},
+	"secrets": [],
+	"dependencies": { "plugins": {}, "runtime": {} }
+}

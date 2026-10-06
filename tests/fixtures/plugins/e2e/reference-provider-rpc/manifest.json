@@ -1,0 +1,112 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.provider",
+	"version": "1.0.1",
+	"displayName": "Example Provider",
+	"description": "Minimal GA remote provider contribution.",
+	"publisher": {
+		"id": "com.example",
+		"name": "Example Team"
+	},
+	"license": "Apache-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"features": ["host_api.notifications", "rpc.cancel"],
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "local-process"
+	},
+	"server": {
+		"entry": "server/index.js",
+		"transport": "stdio",
+		"protocol": "narrafork.rpc/1",
+		"args": [],
+		"workingDirectory": "package",
+		"startupTimeoutMs": 15000,
+		"activationTimeoutMs": 30000
+	},
+	"activationEvents": ["onProvider:example-provider"],
+	"contributes": {
+		"providers": [
+			{
+				"id": "example-provider",
+				"title": "Example Provider",
+				"description": "Returns a deterministic model catalog for release validation.",
+				"providerPrefix": "example",
+				"defaultModelId": "example/offline",
+				"modelDiscovery": true,
+				"sessionMode": "stateless",
+				"maxConcurrency": 2,
+				"capabilities": {
+					"validateConfig": true,
+					"listModels": true,
+					"chat": true,
+					"generate": false
+				},
+				"limits": {
+					"maxConcurrentChat": 2,
+					"maxConcurrentGenerate": 1,
+					"maxConfigBytes": 4096,
+					"maxModelPageSize": 10
+				},
+				"configSchema": {
+					"apiMode": {
+						"type": "string",
+						"title": "Reply style",
+						"description": "Chooses which deterministic reply the provider streams.",
+						"enum": ["offline", "verbose"],
+						"default": "offline"
+					},
+					"apiKey": {
+						"type": "string",
+						"title": "API key",
+						"description": "Optional credential; demonstrates host-side secret injection.",
+						"writeOnly": true,
+						"x-narrafork-secret": true
+					}
+				}
+			}
+		],
+		"tools": [],
+		"commands": [],
+		"events": [],
+		"views": [
+			{
+				"id": "example-provider-settings",
+				"title": "Example provider settings",
+				"entry": "ui/provider-settings.iife.js",
+				"style": "ui/provider-settings.css",
+				"surfaces": ["provider-settings"],
+				"scope": "global",
+				"instance": "singleton",
+				"providerId": "example-provider"
+			}
+		]
+	},
+	"ui": {
+		"entry": "ui/provider-settings.iife.js"
+	},
+	"permissions": {
+		"host": ["provider.register", "provider.use", "ui.panel", "config.read_self"],
+		"network": {
+			"mode": "none",
+			"allow": []
+		},
+		"filesystem": {
+			"package": "readOnly",
+			"pluginData": "readWrite",
+			"workspace": "none"
+		},
+		"process": {
+			"spawn": "none"
+		}
+	},
+	"secrets": [],
+	"dependencies": {
+		"plugins": {},
+		"runtime": {}
+	}
+}

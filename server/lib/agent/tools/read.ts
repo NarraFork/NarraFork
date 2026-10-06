@@ -1,0 +1,591 @@
+import { createReadStream } from "node:fs";
+import { extname } from "node:path";
+import { z } from "zod/v4";
+import { specVfsService } from "../../../services/spec-vfs-service";
+import { toolSpecPathError } from "../../spec-uri";
+import { imageBytesToBase64, imageToBase64, sanitizeParsedDimensions } from "../../uploads";
+import type { ExecutionBackend } from "../execution/backend";
+import { withDeviceParam } from "../execution/device-schema";
+import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
+import { getToolBackend } from "../execution/tool-backend";
+import type { ToolDefinition, ToolResult } from "../types";
+import { decodeFileBytes } from "./encoding";
+import { looseNumber, normalizeNumber } from "./number-param";
+
+/**
+ * When limit = -1 (read-all mode), cap output at ≈100 KB of text
+ * to avoid blowing up the context window.
+ */
+const READ_ALL_MAX_CHARS = 100_000;
+
+/** For large text files, never fall back to whole-file `.text()` + `.split()`. */
+const FULL_READ_STREAM_THRESHOLD_BYTES = 5 * 1024 * 1024;
+
+/** Default number of lines shown when a large file is read without offset/limit. */
+const DEFAULT_LARGE_FILE_LINES = 2000;
+
+/** Long physical lines can otherwise dominate memory and UI rendering. */
+const MAX_LINE_CHARS = 2000;
+
+/** Image extensions → format string for the API (Anthropic media_type = `image/${format}`). */
+const IMAGE_EXTENSIONS: Record<string, string> = {
+	".png": "png",
+	".jpg": "jpeg",
+	".jpeg": "jpeg",
+	".gif": "gif",
+	".webp": "webp",
+};
+
+/** Max raw image size we'll base64-encode (~5 MB, safe for all providers). */
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+export const readTool: ToolDefinition = {
+	name: "Read",
+	executionRouting: {
+		kind: "single",
+		resolve(input) {
+			const path = typeof input.file_path === "string" ? input.file_path : undefined;
+			return {
+				key: "primary",
+				operation: "read",
+				...(typeof input.device === "string" ? { deviceId: input.device } : {}),
+				...(path ? { path } : {}),
+				...(path?.startsWith("spec://") ? { hostOnly: true, pathFlavor: "spec" as const } : {}),
+			};
+		},
+	},
+	description:
+		"Reads a file from the local filesystem or the narrator's Dynamic Spec virtual files. You can access any file directly by using this tool.\n" +
+		"Assume this tool is able to read all local files on the machine. If the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.\n\n" +
+		"FOR A LARGE SOURCE FILE, PREFER StructView: `mode=report` or `mode=outline` gives the " +
+		"structure in a fraction of the tokens, then `mode=extract symbol=X` returns just the " +
+		"declaration you need, and `mode=find` locates a symbol when you do not yet know which " +
+		"file holds it. Paging through thousands of lines here to find one function is the " +
+		"expensive way to answer a question StructView answers directly. Read remains the right " +
+		"tool for small files, config, data, logs, images and PDFs, and whenever you genuinely " +
+		"need the complete contents.\n\n" +
+		"Use targeted, bounded reads by default so only the relevant lines enter the context window.\n\n" +
+		"Usage:\n" +
+		"- The file_path parameter may be an absolute path, a path relative to the current working directory, or a spec:// URI for Dynamic Spec virtual files.\n" +
+		"- When you do not already know the relevant lines, use Glob to locate files and Grep to locate symbols or text before reading.\n" +
+		"- For routine inspection, provide both offset and a positive limit. offset is a 1-based starting line and limit is the smallest number of lines that gives enough context (for example, offset: 120, limit: 80).\n" +
+		"- Continue paging with offset = previous offset + previous limit when more context is needed; do not reread the whole file as a safety measure.\n" +
+		"- Do NOT use limit: -1 (read_all) for routine inspection, exploration, or because the complete file might be useful. Use it only when the user explicitly requests the complete file, or a complete parse/rewrite truly requires it and the file is small enough; page through large files instead.\n" +
+		"- Omitting offset and limit reads from the beginning; large files may be automatically limited, so do not rely on omitted parameters for complete content.\n" +
+		"- Dynamic Spec examples: spec://tasks.json, spec://index.md, spec://behavior_fence. spec:// paths are virtual and do not need to be absolute.\n" +
+		"- Any lines longer than 2000 characters will be truncated. Results use cat -n format, with line numbers starting at 1.\n" +
+		"- This tool allows Claude Code to read images (eg PNG, JPG, etc). When reading an image file the contents are presented visually as Claude Code is a multimodal LLM.\n" +
+		'- This tool can read PDF files (.pdf). For large PDFs (more than 10 pages), you MUST provide the pages parameter to read specific page ranges (e.g., pages: "1-5"). Reading a large PDF without the pages parameter will fail. Maximum 20 pages per request.\n' +
+		"- This tool can read Jupyter notebooks (.ipynb files) and returns all cells with their outputs, combining code, text, and visualizations.\n" +
+		"- This tool can only read files, not directories. To read a directory, use an ls command via the Bash tool.\n" +
+		"- If the user provides a path to a screenshot, ALWAYS use this tool to view the file at the path.\n" +
+		"- If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents.",
+	rawJsonSchema: {
+		type: "object",
+		properties: {
+			file_path: {
+				description:
+					"Absolute or current-working-directory-relative path, or a spec:// Dynamic Spec URI, to read",
+				type: "string",
+			},
+			offset: {
+				description:
+					"1-based line number to start reading from. For targeted reads, pair with a positive limit and start near the relevant lines; do not omit the range just to read extra context.",
+				type: "number",
+			},
+			limit: {
+				description:
+					"Number of lines to read. Prefer a small positive value that covers only the needed context. -1 means read_all (from offset to EOF) and is restricted to explicit complete-file needs; do not use it for routine inspection or exploration.",
+				type: "number",
+			},
+			pages: {
+				description:
+					'Page range for PDF files (e.g., "1-5", "3", "10-20"). Only applicable to PDF files. Maximum 20 pages per request.',
+				type: "string",
+			},
+		},
+		required: ["file_path"],
+		additionalProperties: false,
+	},
+	getRawJsonSchema(config) {
+		return withDeviceParam(readTool.rawJsonSchema as Record<string, unknown>, config);
+	},
+	parameters: z.object({
+		file_path: z
+			.string()
+			.describe(
+				"Absolute or current-working-directory-relative path, or a spec:// Dynamic Spec URI, to read",
+			),
+		offset: looseNumber(
+			"1-based line number to start reading from. For targeted reads, pair with a positive limit and start near the relevant lines; do not omit the range just to read extra context.",
+		),
+		limit: looseNumber(
+			"Number of lines to read. Prefer a small positive value that covers only the needed context. -1 means read_all (from offset to EOF) and is restricted to explicit complete-file needs; do not use it for routine inspection or exploration.",
+		),
+		pages: z
+			.string()
+			.optional()
+			.describe(
+				'Page range for PDF files (e.g., "1-5", "3", "10-20"). Only applicable to PDF files. Maximum 20 pages per request.',
+			),
+	}),
+	async execute(args, ctx): Promise<ToolResult> {
+		const specError = toolSpecPathError("Read", args);
+		if (specError) return { output: specError, isError: true };
+		const { file_path } = args as {
+			file_path: string;
+			offset?: number;
+			limit?: number;
+		};
+
+		// Coerce offset/limit to integers and clamp to sane values so that
+		// slightly-off model outputs (floats, string-encoded numbers, 0, negative)
+		// don't cause hard errors.
+		const offset = normalizeNumber((args as { offset?: unknown }).offset, { min: 1 });
+		// -1 is the "read all" sentinel; any other value <= 0 means "no limit".
+		const normalizedLimit = normalizeNumber((args as { limit?: unknown }).limit, {
+			sentinel: -1,
+		});
+		const limit =
+			normalizedLimit != null && normalizedLimit <= 0 && normalizedLimit !== -1
+				? undefined
+				: normalizedLimit;
+
+		const readAll = limit === -1;
+
+		if (specVfsService.isSpecUri(file_path)) {
+			try {
+				const file = await specVfsService.readSpecFile(ctx.narratorId, file_path);
+				const lines = file.content.split("\n");
+				const start = Math.max(0, (offset ?? 1) - 1);
+				const end = limit && limit !== -1 ? start + limit : lines.length;
+				const slice = lines.slice(start, end);
+				const numbered = formatNumberedLines(slice, start + 1);
+				let tasks: unknown;
+				if (file_path === "spec://tasks.json") {
+					try {
+						const parsed = JSON.parse(file.content);
+						if (parsed && Array.isArray(parsed.tasks)) {
+							tasks = parsed.tasks;
+						}
+					} catch {
+						// ignore parse error
+					}
+				}
+				return {
+					output: numbered || "(empty file)",
+					title: file.uri,
+					metadata: {
+						totalLines: lines.length,
+						readLines: slice.length,
+						readAll,
+						specPath: file.path,
+						readonly: file.readonly,
+						builtin: file.builtin,
+						tasks,
+					},
+				};
+			} catch (err) {
+				return {
+					output: `Error reading ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
+					isError: true,
+				};
+			}
+		}
+
+		const backend = getToolBackend(ctx, (args as { device?: string }).device);
+		const resolvedPath =
+			ctx.executionTarget?.lexicalPath ??
+			resolveBackendPath(backend, toolBaseCwd(backend, ctx.cwd), file_path);
+		const canonicalPath = ctx.executionTarget?.canonicalPath;
+		const ioPath = canonicalPath ?? resolvedPath;
+
+		// ── Directory handling: list contents instead of erroring ──
+		try {
+			const stat = await backend.statFile(ioPath);
+			if (stat?.isDirectory) {
+				return await listDirectory(file_path, ioPath, backend);
+			}
+		} catch {
+			// Path doesn't exist or can't be stat'd — fall through to normal read,
+			// which will produce the appropriate error message.
+		}
+
+		// ── Image file handling ──
+		const ext = extname(resolvedPath).toLowerCase();
+		const imageFormat = IMAGE_EXTENSIONS[ext];
+		if (imageFormat) {
+			try {
+				let size: number;
+				let base64: string;
+				let detectedMediaType: string | undefined;
+				let dimensions: { width: number; height: number } | undefined;
+				const MIME_TO_FORMAT: Record<string, string> = {
+					"image/png": "png",
+					"image/jpeg": "jpeg",
+					"image/gif": "gif",
+					"image/webp": "webp",
+				};
+
+				if (backend.kind === "local") {
+					const file = Bun.file(ioPath);
+					size = file.size;
+					if (size > MAX_IMAGE_BYTES) {
+						return {
+							output: `Image file too large (${(size / 1024 / 1024).toFixed(1)} MB). Maximum supported size is ${MAX_IMAGE_BYTES / 1024 / 1024} MB.`,
+							isError: true,
+						};
+					}
+					({ base64, detectedMediaType, dimensions } = await imageToBase64(ioPath));
+				} else {
+					// Remote image: fetch the bytes over the device RPC (capped at the
+					// same limit) and base64-encode them here, so remote images work
+					// transparently without the model transferring the file first.
+					const { bytes, truncated, totalSize } = await backend.readFileBytes(ioPath, {
+						maxBytes: MAX_IMAGE_BYTES,
+						expectedResolvedPath: canonicalPath,
+						signal: ctx.signal,
+					});
+					if (truncated) {
+						return {
+							output: `Image file too large (${(totalSize / 1024 / 1024).toFixed(1)} MB). Maximum supported size is ${MAX_IMAGE_BYTES / 1024 / 1024} MB.`,
+							isError: true,
+						};
+					}
+					size = totalSize || bytes.byteLength;
+					({ base64, detectedMediaType, dimensions } = imageBytesToBase64(bytes));
+				}
+
+				// Prefer the real format detected from file content magic bytes
+				const actualFormat =
+					(detectedMediaType && MIME_TO_FORMAT[detectedMediaType]) || imageFormat;
+				const safeDimensions = sanitizeParsedDimensions(dimensions);
+				return {
+					output: `[Image: ${file_path} (${(size / 1024).toFixed(1)} KB, ${actualFormat})]`,
+					title: file_path,
+					images: [{ format: actualFormat, base64 }],
+					metadata: {
+						isImage: true,
+						imageFormat: actualFormat,
+						filePath: resolvedPath,
+						sizeKB: Number.parseFloat((size / 1024).toFixed(1)),
+						// Intrinsic pixel size: the frontend reserves an aspect-ratio box
+						// from these instead of a fixed placeholder height. Sanitized first —
+						// this tool reads arbitrary files, so the header's declared size is
+						// attacker-controlled, and an absurd ratio (a PNG claiming
+						// 4294967295x4294967295) would collapse the reserved box to ~1px
+						// while looking like real data. Out-of-bounds sizes are dropped so
+						// the frontend falls back to the placeholder height instead.
+						...(safeDimensions
+							? { width: safeDimensions.width, height: safeDimensions.height }
+							: {}),
+					},
+				};
+			} catch (err) {
+				return {
+					output: `Error reading image ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
+					isError: true,
+				};
+			}
+		}
+
+		// ── Text file handling ──
+		try {
+			const stat = await backend.statFile(ioPath);
+			const fileSize = stat?.size ?? Bun.file(ioPath).size;
+			// Large-file streaming reads from a local fs stream; only reachable for
+			// the local backend. Remote backends use the bounded byte-read path.
+			const canStream = backend.kind === "local";
+			const shouldStream = canStream && (readAll || fileSize > FULL_READ_STREAM_THRESHOLD_BYTES);
+
+			if (shouldStream) {
+				const startLine = offset ?? 1;
+				const largeFileAutoLimited =
+					fileSize > FULL_READ_STREAM_THRESHOLD_BYTES && limit == null && !readAll;
+				const effectiveLimit = readAll
+					? undefined
+					: (limit ?? (largeFileAutoLimited ? DEFAULT_LARGE_FILE_LINES : undefined));
+				const streamResult = await readTextLinesStream(
+					ioPath,
+					startLine,
+					effectiveLimit,
+					READ_ALL_MAX_CHARS,
+					ctx.signal,
+				);
+				const numbered = formatNumberedLines(streamResult.lines, startLine, {
+					truncateLines: false,
+				});
+				const suffix = buildStreamSuffix({
+					readAll,
+					largeFileAutoLimited,
+					startLine,
+					effectiveLimit,
+					streamResult,
+				});
+
+				return {
+					output: (numbered || "(no lines in requested range)") + suffix,
+					title: file_path,
+					truncated:
+						readAll ||
+						streamResult.cappedByChars ||
+						streamResult.cappedByLines ||
+						(fileSize > FULL_READ_STREAM_THRESHOLD_BYTES && limit == null),
+					metadata: {
+						readLines: streamResult.lines.length,
+						readAll,
+						startLine,
+						fileSize,
+						totalLines: streamResult.totalLinesKnown ? streamResult.scannedLines : undefined,
+						totalLinesKnown: streamResult.totalLinesKnown,
+					},
+				};
+			}
+
+			// The non-streaming path is only taken for files within the streaming
+			// threshold (local backend) or for remote reads; cap at the same
+			// threshold so local behaviour matches the previous whole-file read.
+			const { bytes } = await backend.readFileBytes(ioPath, {
+				maxBytes: FULL_READ_STREAM_THRESHOLD_BYTES,
+				expectedResolvedPath: canonicalPath,
+				signal: ctx.signal,
+			});
+			const { text } = decodeFileBytes(bytes);
+			const lines = text.split("\n");
+			const start = Math.max(0, (offset ?? 1) - 1);
+			const end = limit ? start + limit : lines.length;
+			const slice = lines.slice(start, end);
+			const numbered = formatNumberedLines(slice, start + 1);
+
+			return {
+				output: numbered || "(empty file)",
+				title: file_path,
+				metadata: {
+					totalLines: lines.length,
+					readLines: slice.length,
+					readAll,
+				},
+			};
+		} catch (err) {
+			return {
+				output: `Error reading ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
+				isError: true,
+			};
+		}
+	},
+};
+
+type StreamReadResult = {
+	lines: string[];
+	scannedLines: number;
+	totalLinesKnown: boolean;
+	cappedByChars: boolean;
+	cappedByLines: boolean;
+};
+
+function truncateDisplayLine(line: string): string {
+	if (line.length <= MAX_LINE_CHARS) return line;
+	return `${line.slice(0, MAX_LINE_CHARS)}… [line truncated, ${line.length} chars total]`;
+}
+
+function formatNumberedLines(
+	lines: string[],
+	startLine: number,
+	options: { truncateLines?: boolean } = {},
+): string {
+	const truncateLines = options.truncateLines ?? true;
+	return lines
+		.map(
+			(line, i) =>
+				`${String(startLine + i).padStart(6)}│${truncateLines ? truncateDisplayLine(line) : line}`,
+		)
+		.join("\n");
+}
+
+async function readTextLinesStream(
+	filePath: string,
+	startLine: number,
+	limit: number | undefined,
+	maxChars: number,
+	signal: AbortSignal,
+): Promise<StreamReadResult> {
+	const stream = createReadStream(filePath, { encoding: "utf-8" });
+	const lines: string[] = [];
+	let scannedLines = 0;
+	let chars = 0;
+	let cappedByChars = false;
+	let cappedByLines = false;
+	let totalLinesKnown = true;
+	let stopped = false;
+
+	let currentLine = "";
+	let currentLineChars = 0;
+	let currentLineTruncated = false;
+
+	const resetCurrentLine = () => {
+		currentLine = "";
+		currentLineChars = 0;
+		currentLineTruncated = false;
+	};
+
+	const shouldCaptureCurrentLine = () => scannedLines + 1 >= startLine;
+	const lineLimitReached = () =>
+		limit != null && shouldCaptureCurrentLine() && lines.length >= limit;
+
+	const appendLineSegment = (segment: string) => {
+		if (lineLimitReached()) {
+			cappedByLines = true;
+			totalLinesKnown = false;
+			stopped = true;
+			return;
+		}
+
+		currentLineChars += segment.length;
+		if (!shouldCaptureCurrentLine()) return;
+		if (currentLine.length >= MAX_LINE_CHARS) {
+			if (segment.length > 0) currentLineTruncated = true;
+			return;
+		}
+
+		const remaining = MAX_LINE_CHARS - currentLine.length;
+		const captured = segment.slice(0, remaining);
+		currentLine += captured;
+		if (captured.length < segment.length) currentLineTruncated = true;
+	};
+
+	const finalizeCurrentLine = () => {
+		if (stopped) return;
+		if (lineLimitReached()) {
+			cappedByLines = true;
+			totalLinesKnown = false;
+			stopped = true;
+			resetCurrentLine();
+			return;
+		}
+
+		scannedLines++;
+		if (scannedLines < startLine) {
+			resetCurrentLine();
+			return;
+		}
+
+		let displayLine = currentLine;
+		let physicalChars = currentLineChars;
+		if (displayLine.endsWith("\r")) {
+			displayLine = displayLine.slice(0, -1);
+			physicalChars = Math.max(0, physicalChars - 1);
+		}
+		if (currentLineTruncated || physicalChars > displayLine.length) {
+			displayLine = `${displayLine}… [line truncated, ${physicalChars} chars total]`;
+		}
+
+		const projectedChars = chars + displayLine.length + 16;
+		if (projectedChars > maxChars) {
+			cappedByChars = true;
+			totalLinesKnown = false;
+			stopped = true;
+			resetCurrentLine();
+			return;
+		}
+
+		lines.push(displayLine);
+		chars = projectedChars;
+		resetCurrentLine();
+	};
+
+	const onAbort = () => {
+		stream.destroy(new Error("Read aborted"));
+	};
+	signal.addEventListener("abort", onAbort, { once: true });
+
+	try {
+		for await (const chunk of stream) {
+			if (signal.aborted) throw new Error("Read aborted");
+			const text = typeof chunk === "string" ? chunk : chunk.toString("utf-8");
+			let start = 0;
+			while (start < text.length) {
+				const newlineIndex = text.indexOf("\n", start);
+				const end = newlineIndex === -1 ? text.length : newlineIndex;
+				appendLineSegment(text.slice(start, end));
+				if (stopped) break;
+				if (newlineIndex === -1) break;
+				finalizeCurrentLine();
+				if (stopped) break;
+				start = newlineIndex + 1;
+			}
+			if (stopped) break;
+		}
+
+		if (!stopped && currentLineChars > 0) {
+			finalizeCurrentLine();
+		}
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+		stream.destroy();
+	}
+
+	return { lines, scannedLines, totalLinesKnown, cappedByChars, cappedByLines };
+}
+
+function buildStreamSuffix(options: {
+	readAll: boolean;
+	largeFileAutoLimited: boolean;
+	startLine: number;
+	effectiveLimit: number | undefined;
+	streamResult: StreamReadResult;
+}): string {
+	const suffix: string[] = [];
+	const { readAll, largeFileAutoLimited, startLine, effectiveLimit, streamResult } = options;
+
+	if (streamResult.cappedByChars) {
+		suffix.push(
+			`output capped at ${READ_ALL_MAX_CHARS} chars. Use offset/limit to read a smaller range.`,
+		);
+	}
+	if (streamResult.cappedByLines && effectiveLimit != null) {
+		const nextOffset = startLine + streamResult.lines.length;
+		suffix.push(`output limited to ${effectiveLimit} lines. Continue with offset=${nextOffset}.`);
+	}
+	if (largeFileAutoLimited && !readAll && effectiveLimit != null) {
+		suffix.push(
+			`large file detected; streamed only the first ${effectiveLimit} lines. Use offset/limit for more.`,
+		);
+	}
+	if (readAll && !streamResult.totalLinesKnown) {
+		suffix.push("read-all mode stops after the safe output cap instead of loading the whole file.");
+	}
+
+	return suffix.length > 0 ? `\n\n...${suffix.join(" ")}` : "";
+}
+
+// ── Directory listing helper ──
+
+const MAX_DIR_ENTRIES = 500;
+
+async function listDirectory(
+	displayPath: string,
+	resolvedPath: string,
+	backend: ExecutionBackend,
+): Promise<ToolResult> {
+	const entries = await backend.listDir(resolvedPath);
+
+	// Sort: directories first, then files, alphabetical within each group
+	const sorted = entries.toSorted((a, b) => {
+		const aDir = a.isDirectory ? 0 : 1;
+		const bDir = b.isDirectory ? 0 : 1;
+		if (aDir !== bDir) return aDir - bDir;
+		return a.name.localeCompare(b.name);
+	});
+
+	const truncated = sorted.length > MAX_DIR_ENTRIES;
+	const visible = truncated ? sorted.slice(0, MAX_DIR_ENTRIES) : sorted;
+
+	const lines = visible.map((e) => `  ${e.name}${e.isDirectory ? "/" : ""}`);
+	const header = `Directory listing for ${displayPath}\n`;
+	const footer = `\n(${entries.length} entries${truncated ? `, showing first ${MAX_DIR_ENTRIES}` : ""})`;
+
+	return {
+		output: header + lines.join("\n") + footer,
+		title: displayPath,
+	};
+}

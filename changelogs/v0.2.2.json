@@ -1,0 +1,6 @@
+{
+	"version": "0.2.2",
+	"date": "2026-03-18",
+	"en": "## Refactoring\n\n- Improved Anthropic interleaved thinking support: thinking/text/tool_use blocks now preserve their original order from the API response instead of using a fixed ordering\n- Unified content block sorting in pushAssistantTurn, eliminating duplicated code paths for interleaved vs legacy modes\n- Text blocks now capture their native outputIndex from Anthropic SSE events, replacing the previous heuristic-based positioning\n- Stripped internal-only markers from reasoning blocks before passing to downstream consumers\n- History reconstruction (buildAnthropicHistory) now uses a single-pass iteration over contentJson to preserve interleaved block positions, with backward compatibility for older messages",
+	"zh-CN": "## 重构\n\n- 改进 Anthropic 交错思考支持：thinking/text/tool_use 块现在保持 API 响应的原始顺序，而非固定排列\n- 统一 pushAssistantTurn 的内容块排序逻辑，消除 interleaved/legacy 两个重复代码路径\n- text 块现在从 Anthropic SSE 事件中捕获原生 outputIndex，替代之前的启发式位置推断\n- 剥离 reasoning 块的内部标记，防止泄漏到下游消费者\n- 历史重建（buildAnthropicHistory）改为单趟遍历 contentJson 以保持交错块位置，同时向后兼容旧消息格式"
+}

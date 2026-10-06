@@ -1,0 +1,136 @@
+{
+  "runId": "2026-09-06T09-53-49-584Z",
+  "frozenInputsValid": true,
+  "efficiencyNote": "repeatCandidates 仅统计相同操作/key/参数的重复调用，不自动视为多余；例如验收前同次 Eval 的 read 是必需的。feedbackChars 是工具反馈 JSON 字符数，不含完整请求重放。token 为对应网关回报值，不能据此跨模型推断成本。",
+  "gradingNote": "原题未要求裸字符串：状态字符串与顶层 {status:...} 均接受。原始 JSON 不覆盖。strict 仍拒绝违规动作尝试；recoveredBusiness 单独报告被拦截后最终正确的结果，不等于全程正确。UNKNOWN_HELP(task.block) 是 v1 夹具缺口，原题4的效率不可用于公平比较。",
+  "originalGraderHash": "db7c3fc30f506a3750d3d722c36f50e1908c528b61e14937c3c61db23d34f21e",
+  "currentGraderHash": "9dca713be6015bb951fbf903663d10dcf08025fdc15b94e5906a5144d91b9398",
+  "summary": [
+    {
+      "model": "nug2:antigravity:gemini-3.7-flash",
+      "cases": 1,
+      "correctedStrictPass": 1,
+      "recoveredBusinessPass": 1,
+      "firstEvalGoalPass": 0,
+      "firstEvalExecuted": 1,
+      "evals": 5,
+      "helps": 1,
+      "responses": 5,
+      "interfaceViolations": 0,
+      "allWireLowAndEvalOnly": true,
+      "allWireMatchesFrozenDescriptions": null,
+      "readCalls": 2,
+      "bashCalls": 2,
+      "repeatCandidates": {
+        "read": 1,
+        "Bash": 1,
+        "finish": 0
+      },
+      "codeChars": 757,
+      "feedbackChars": 1705,
+      "inputTokens": 7564,
+      "outputTokens": 780
+    },
+    {
+      "model": "nugjp:codex:gpt-5.6-luna",
+      "cases": 1,
+      "correctedStrictPass": 1,
+      "recoveredBusinessPass": 1,
+      "firstEvalGoalPass": 0,
+      "firstEvalExecuted": 1,
+      "evals": 3,
+      "helps": 0,
+      "responses": 4,
+      "interfaceViolations": 0,
+      "allWireLowAndEvalOnly": true,
+      "allWireMatchesFrozenDescriptions": null,
+      "readCalls": 1,
+      "bashCalls": 1,
+      "repeatCandidates": {
+        "read": 0,
+        "Bash": 0,
+        "finish": 0
+      },
+      "codeChars": 297,
+      "feedbackChars": 299,
+      "inputTokens": 3926,
+      "outputTokens": 198
+    }
+  ],
+  "rows": [
+    {
+      "model": "nug2:antigravity:gemini-3.7-flash",
+      "case": "4",
+      "rawStrictPass": true,
+      "correctedStrictPass": true,
+      "recoveredBusinessPass": true,
+      "strictReasons": [],
+      "businessReasons": [],
+      "firstEvalGoalPass": false,
+      "firstEvalExecuted": true,
+      "evals": 5,
+      "helps": 1,
+      "modelResponses": 5,
+      "naturalStop": false,
+      "errorCodes": [],
+      "helpHarnessGap": false,
+      "interfaceViolations": 0,
+      "wireLowAndEvalOnly": true,
+      "wireMatchesFrozenDescriptions": null,
+      "readCalls": 2,
+      "bashCalls": 2,
+      "repeatCandidates": {
+        "read": 1,
+        "Bash": 1,
+        "finish": 0
+      },
+      "codeChars": 757,
+      "feedbackChars": 1705,
+      "codeUsesAwait": false,
+      "codeUsesRefPlumbing": false,
+      "usage": {
+        "input": 7564,
+        "output": 780
+      },
+      "finalText": "",
+      "file": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T09-53-49-584Z-flash-4.json"
+    },
+    {
+      "model": "nugjp:codex:gpt-5.6-luna",
+      "case": "4",
+      "rawStrictPass": true,
+      "correctedStrictPass": true,
+      "recoveredBusinessPass": true,
+      "strictReasons": [],
+      "businessReasons": [],
+      "firstEvalGoalPass": false,
+      "firstEvalExecuted": true,
+      "evals": 3,
+      "helps": 0,
+      "modelResponses": 4,
+      "naturalStop": true,
+      "errorCodes": [],
+      "helpHarnessGap": false,
+      "interfaceViolations": 0,
+      "wireLowAndEvalOnly": true,
+      "wireMatchesFrozenDescriptions": null,
+      "readCalls": 1,
+      "bashCalls": 1,
+      "repeatCandidates": {
+        "read": 0,
+        "Bash": 0,
+        "finish": 0
+      },
+      "codeChars": 297,
+      "feedbackChars": 299,
+      "codeUsesAwait": false,
+      "codeUsesRefPlumbing": false,
+      "usage": {
+        "input": 3926,
+        "output": 198
+      },
+      "finalText": "blocked",
+      "file": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T09-53-49-584Z-luna-4.json"
+    }
+  ]
+}

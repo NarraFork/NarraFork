@@ -1,0 +1,6 @@
+{
+	"version": "0.2.3",
+	"date": "2026-04-24",
+	"en": "## New Features\n\n- Added reasoning_content support for DeepSeek, QwQ and other models that require reasoning to be passed back in multi-turn conversations via the Chat Completions API path",
+	"zh-CN": "## 新功能\n\n- 为 DeepSeek、QwQ 等模型添加 reasoning_content 回传支持，确保通过 Chat Completions API 进行多轮对话时推理内容能正确传递"
+}

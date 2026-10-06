@@ -1,0 +1,387 @@
+import { beforeAll, describe, expect, it } from "bun:test";
+import { installCanvasStub } from "./test-canvas-stub";
+
+// Install the deterministic canvas stub BEFORE importing any pretext-backed
+// module (measure-media builds rich-inline flows for the image_generation
+// header at prepare time).
+beforeAll(() => {
+	installCanvasStub();
+});
+
+describe("media run framing", () => {
+	it("forwards run opts only to generated images and keeps source payload intact", async () => {
+		const { VLIST_REGISTRY } = await import("../registry");
+		const measure = VLIST_REGISTRY.media.measure;
+		for (const source of [
+			{},
+			{ savedPath: "/generated.png", width: 1024, height: 512 },
+			{ partialSavedPath: "/partial.png", status: "generating" },
+			{ result: "data:image/png;base64,abc" },
+		]) {
+			const data = { type: "image_generation", statusText: "Generated", ...source };
+			const original = { ...data };
+			const standalone = measure(data, 600, 5);
+			const middle = measure(data, 600, 5, { inRun: true, isLast: false });
+			const last = measure(data, 600, 5, { inRun: true, isLast: true });
+			expect(middle).toMatchObject({ inRun: true, isLast: false });
+			expect(last).toMatchObject({ inRun: true, isLast: true });
+			expect(standalone).toMatchObject({ inRun: false, isLast: false });
+			expect(middle.height).toBe(standalone.height - 1);
+			expect(last.height).toBe(standalone.height - 2);
+			expect(last.contentWidth).toBe(580);
+			expect(last.blocks).toEqual(standalone.blocks);
+			expect(last.frame).toEqual(standalone.frame);
+			expect(data).toEqual(original);
+		}
+	});
+
+	it("ignores run opts for ordinary image and text_file attachments", async () => {
+		const { VLIST_REGISTRY } = await import("../registry");
+		for (const type of ["image", "text_file"]) {
+			const data = { type, filename: "attachment", width: 100, height: 50 };
+			const measure = VLIST_REGISTRY.media.measure;
+			expect(measure(data, 600, 5, { inRun: true, isLast: false })).toEqual(measure(data, 600, 5));
+		}
+	});
+});
+
+describe("measureImage", () => {
+	it("is a fixed 200px block regardless of width", async () => {
+		const { measureImage, MEASURE_MEDIA_CONSTANTS } = await import("./measure-media");
+		const wide = measureImage({ imageId: "img1", filename: "a.png" }, 1000);
+		const narrow = measureImage({ imageId: "img1", filename: "a.png" }, 120);
+		expect(wide.height).toBe(MEASURE_MEDIA_CONSTANTS.IMAGE_FIXED_HEIGHT);
+		expect(narrow.height).toBe(MEASURE_MEDIA_CONSTANTS.IMAGE_FIXED_HEIGHT);
+		expect(wide.blocks).toHaveLength(1);
+		expect(wide.blocks[0]!.kind).toBe("fixed");
+	});
+
+	it("carries the image tag + data for the renderer", async () => {
+		const { measureImage } = await import("./measure-media");
+		const r = measureImage({ imageId: "x", previewUrl: "/p", uploadNarratorId: "n1" }, 800);
+		const block = r.blocks[0]!;
+		expect(block.kind).toBe("fixed");
+		if (block.kind === "fixed") {
+			expect(block.tag).toBe("image");
+			expect(block.data?.imageId).toBe("x");
+			expect(block.data?.uploadNarratorId).toBe("n1");
+		}
+	});
+
+	it("reserves the aspect-fitted height when intrinsic dimensions are known", async () => {
+		const { measureImage, MEASURE_MEDIA_CONSTANTS } = await import("./measure-media");
+		// 16:9 screenshot in an 800px column → 800 × 450, under the 400 cap? No —
+		// 450 > 400, so the height cap clamps and the width narrows to match.
+		const tall = measureImage({ imageId: "a", width: 1600, height: 900 }, 800);
+		expect(tall.height).toBe(MEASURE_MEDIA_CONSTANTS.IMAGE_MAX_DISPLAY_HEIGHT);
+		expect(tall.usedWidth).toBe(Math.floor((400 * 1600) / 900));
+		const block = tall.blocks[0]!;
+		if (block.kind === "fixed") {
+			expect(block.height).toBe(MEASURE_MEDIA_CONSTANTS.IMAGE_MAX_DISPLAY_HEIGHT);
+			expect(block.displayWidth).toBe(tall.usedWidth);
+			expect(block.data?.displayWidth).toBe(tall.usedWidth);
+			expect(block.data?.displayHeight).toBe(tall.height);
+			expect(block.data?.width).toBe(1600);
+			expect(block.data?.height).toBe(900);
+		}
+	});
+
+	it("fits a wide strip by width, producing a short exact box", async () => {
+		const { measureImage } = await import("./measure-media");
+		// 12:1 banner in a 700px column → 700 × 58 (floored), no dead band.
+		const r = measureImage({ imageId: "s", width: 1200, height: 100 }, 700);
+		expect(r.height).toBe(Math.floor((700 * 100) / 1200));
+		expect(r.usedWidth).toBe(700);
+	});
+
+	it("never upscales a small image", async () => {
+		const { measureImage } = await import("./measure-media");
+		const r = measureImage({ imageId: "i", width: 64, height: 64 }, 700);
+		expect(r.height).toBe(64);
+		expect(r.usedWidth).toBe(64);
+	});
+
+	it("falls back to the fixed 200px when dimensions are missing or invalid", async () => {
+		const { measureImage, MEASURE_MEDIA_CONSTANTS } = await import("./measure-media");
+		for (const data of [
+			{ imageId: "a" },
+			{ imageId: "b", width: 100 },
+			{ imageId: "c", width: 0, height: 100 },
+			{ imageId: "d", width: Number.NaN, height: 100 },
+		]) {
+			const r = measureImage(data, 700);
+			expect(r.height).toBe(MEASURE_MEDIA_CONSTANTS.IMAGE_FIXED_HEIGHT);
+		}
+	});
+});
+
+describe("measureTextFile", () => {
+	it("is a fixed single-row height (icon dominates), width-independent", async () => {
+		const { measureTextFile, MEASURE_MEDIA_CONSTANTS } = await import("./measure-media");
+		const c = MEASURE_MEDIA_CONSTANTS;
+		const expected = c.TEXT_FILE_ICON_SIZE + c.TEXT_FILE_PADDING_Y * 2;
+		const wide = measureTextFile({ filename: "notes.txt", size: 2048 }, 1000);
+		const narrow = measureTextFile({ filename: "notes.txt", size: 2048 }, 100);
+		expect(wide.height).toBe(expected);
+		expect(narrow.height).toBe(expected);
+		expect(wide.height).toBe(c.TEXT_FILE_HEIGHT);
+	});
+
+	it("carries filename + size for the renderer", async () => {
+		const { measureTextFile } = await import("./measure-media");
+		const r = measureTextFile({ filename: "a.md", size: 512 }, 600);
+		const block = r.blocks[0]!;
+		if (block.kind === "fixed") {
+			expect(block.tag).toBe("text_file");
+			expect(block.data?.filename).toBe("a.md");
+			expect(block.data?.size).toBe(512);
+		}
+	});
+
+	// The row is reserved at ONE line, so the render layer truncates the filename
+	// instead of wrapping it — which needs a bounded box. `displayWidth` IS that
+	// box: without it the row was unbounded inside its absolutely positioned host,
+	// a long filename wrapped, and it overflowed the height measure committed to.
+	it("reserves the row's natural width so the filename can be truncated", async () => {
+		const { measureTextFile, textFileRowNaturalWidth } = await import("./measure-media");
+		const data = {
+			filename: "api-request-2026-09-01T17-58-20-793Z-WsKWNTpwoGGUne6.json",
+			size: 855_450,
+		};
+		const r = measureTextFile(data, 600);
+		const block = r.blocks[0]!;
+		expect(block.kind).toBe("fixed");
+		if (block.kind === "fixed") {
+			expect(block.displayWidth).toBe(textFileRowNaturalWidth(data));
+			// A long name must claim more room than a short one, or the shrink-wrap
+			// container has nothing to grow around.
+			const short = measureTextFile({ filename: "a.md", size: 512 }, 600);
+			if (short.blocks[0]!.kind === "fixed") {
+				expect(block.displayWidth!).toBeGreaterThan(short.blocks[0]!.displayWidth!);
+			}
+		}
+	});
+
+	it("never reserves more width than the column offers", async () => {
+		const { measureTextFile } = await import("./measure-media");
+		const r = measureTextFile({ filename: "x".repeat(400), size: 1024 }, 200);
+		const block = r.blocks[0]!;
+		if (block.kind === "fixed") expect(block.displayWidth).toBe(200);
+	});
+
+	// The reserved width is measured from the SAME "(835.4 KB)" string the row
+	// paints. Two implementations of that formatting would reserve one width and
+	// paint another, silently reintroducing the overflow this width prevents.
+	it("measures the size text the render layer actually paints", async () => {
+		const { textFileRowNaturalWidth } = await import("./measure-media");
+		const { formatFileSize } = await import("../render/vlist-text-file-row");
+		const shared = await import("@shared/text-file-types");
+		expect(formatFileSize).toBe(shared.formatFileSize);
+		// A wider size string must widen the reservation: proof the size participates.
+		const withBigSize = textFileRowNaturalWidth({ filename: "a.md", size: 855_450 });
+		const withSmallSize = textFileRowNaturalWidth({ filename: "a.md", size: 1 });
+		expect(withBigSize).toBeGreaterThan(withSmallSize);
+		// No size at all → no size text, no gap for it.
+		expect(textFileRowNaturalWidth({ filename: "a.md" })).toBeLessThan(withSmallSize);
+	});
+});
+
+describe("measureImageGeneration", () => {
+	it("reserves image height via aspect ratio when width/height are known (zero measure)", async () => {
+		const { measureImageGeneration, MEASURE_MEDIA_CONSTANTS } = await import("./measure-media");
+		const c = MEASURE_MEDIA_CONSTANTS;
+		// 1024x512 → aspect 2:1. contentWidth 800 → inner = 800 - 2*paperPad.
+		const r = measureImageGeneration(
+			{ status: "completed", statusText: "Generated", width: 1024, height: 512, result: "data:x" },
+			800,
+		);
+		const innerWidth = 800 - c.IMGGEN_PAPER_PADDING * 2;
+		const displayWidth = Math.min(innerWidth, Math.min(1024, c.IMGGEN_MAX_DISPLAY_WIDTH));
+		const imageHeight = Math.round((displayWidth * 512) / 1024);
+		const headerHeight = c.IMGGEN_ICON_SIZE; // one short status line, icon dominates
+		const expected =
+			c.IMGGEN_PAPER_PADDING * 2 +
+			c.IMGGEN_BORDER * 2 +
+			headerHeight +
+			c.IMGGEN_IMAGE_GAP +
+			imageHeight;
+		expect(r.height).toBe(expected);
+		// header inline block + fixed image block
+		expect(r.blocks).toHaveLength(2);
+		expect(r.blocks[1]!.kind).toBe("fixed");
+	});
+
+	it("caps display width at GENERATED_IMAGE_MAX_DISPLAY_WIDTH", async () => {
+		const { measureImageGeneration, MEASURE_MEDIA_CONSTANTS } = await import("./measure-media");
+		const c = MEASURE_MEDIA_CONSTANTS;
+		// Huge intrinsic size, very wide lane → display width clamps to 512.
+		const r = measureImageGeneration(
+			{ status: "completed", statusText: "Generated", width: 4000, height: 4000, result: "d" },
+			5000,
+		);
+		const imageBlock = r.blocks[1]!;
+		if (imageBlock.kind === "fixed") {
+			expect(imageBlock.data?.displayWidth).toBe(c.IMGGEN_MAX_DISPLAY_WIDTH);
+			// square image → height == displayWidth
+			expect(imageBlock.height).toBe(c.IMGGEN_MAX_DISPLAY_WIDTH);
+		}
+	});
+
+	it("uses a conservative unknown placeholder when metrics are missing but a source exists", async () => {
+		const { measureImageGeneration, MEASURE_MEDIA_CONSTANTS } = await import("./measure-media");
+		const c = MEASURE_MEDIA_CONSTANTS;
+		const r = measureImageGeneration(
+			{ status: "completed", statusText: "Generated", result: "data:image/png;base64,zzz" },
+			800,
+		);
+		expect(r.blocks).toHaveLength(2);
+		expect(r.blocks[1]!.kind).toBe("unknown");
+		const expected =
+			c.IMGGEN_PAPER_PADDING * 2 +
+			c.IMGGEN_BORDER * 2 +
+			c.IMGGEN_ICON_SIZE +
+			c.IMGGEN_IMAGE_GAP +
+			c.IMGGEN_UNKNOWN_IMAGE_HEIGHT;
+		expect(r.height).toBe(expected);
+	});
+
+	it("is header-only (no image area) while generating with no source yet", async () => {
+		const { measureImageGeneration, MEASURE_MEDIA_CONSTANTS } = await import("./measure-media");
+		const c = MEASURE_MEDIA_CONSTANTS;
+		const r = measureImageGeneration({ status: "generating", statusText: "Generating…" }, 800);
+		expect(r.blocks).toHaveLength(1);
+		expect(r.blocks[0]!.kind).toBe("inline");
+		// Paper chrome + single header line (icon dominates the short text).
+		const expected =
+			c.IMGGEN_PAPER_PADDING * 2 +
+			c.IMGGEN_BORDER * 2 +
+			Math.max(c.IMGGEN_ICON_SIZE, c.IMGGEN_HEADER_LINE_HEIGHT);
+		expect(r.height).toBe(expected);
+	});
+
+	it("grows taller as a long revisedPrompt wraps at narrow width", async () => {
+		const { measureImageGeneration } = await import("./measure-media");
+		const longPrompt =
+			"a serene mountain lake at dawn with mist rising over calm water reflecting pink clouds and distant snow peaks";
+		const wide = measureImageGeneration(
+			{ status: "completed", statusText: "Generated", revisedPrompt: longPrompt },
+			2000,
+		);
+		const narrow = measureImageGeneration(
+			{ status: "completed", statusText: "Generated", revisedPrompt: longPrompt },
+			200,
+		);
+		expect(narrow.height).toBeGreaterThan(wide.height);
+	});
+});
+
+describe("measureMedia dispatcher", () => {
+	it("routes by block.type", async () => {
+		const { measureMedia, MEASURE_MEDIA_CONSTANTS } = await import("./measure-media");
+		const c = MEASURE_MEDIA_CONSTANTS;
+		expect(measureMedia({ type: "image", imageId: "x" }, 800).height).toBe(c.IMAGE_FIXED_HEIGHT);
+		expect(measureMedia({ type: "text_file", filename: "f", size: 10 }, 800).height).toBe(
+			c.TEXT_FILE_HEIGHT,
+		);
+		const gen = measureMedia(
+			{ type: "image_generation", status: "completed", statusText: "Generated" },
+			800,
+		);
+		expect(gen.blocks[0]!.kind).toBe("inline");
+	});
+
+	it("returns an empty zero-height element for unknown types", async () => {
+		const { measureMedia } = await import("./measure-media");
+		const r = measureMedia({ type: "video" }, 800);
+		expect(r.height).toBe(0);
+		expect(r.blocks).toHaveLength(0);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A tool card's media image (Browser/WebFetch screenshot, image Read, shared
+// image preview) must reserve the SAME height as a chat message's image block.
+// The classifier's constant lives in shared/ (it cannot import frontend code),
+// so nothing but a test keeps the two copies from drifting — and a drift is what
+// made screenshot rows reserve a 400px box around a much shorter picture.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("media image reserved height", () => {
+	it("the shared classifier constant equals the chat image block height", async () => {
+		const { IMAGE_FIXED_HEIGHT } = await import("./measure-media");
+		const { MEDIA_IMAGE_CONTENT_PX } = await import("@shared/pretext-layout/tool-detail");
+		expect(MEDIA_IMAGE_CONTENT_PX).toBe(IMAGE_FIXED_HEIGHT);
+	});
+
+	it("the measure layer re-exports the same value", async () => {
+		const { IMAGE_FIXED_HEIGHT } = await import("./measure-media");
+		const { MEDIA_IMAGE_CONTENT_PX } = await import("./measure-tool-call");
+		expect(MEDIA_IMAGE_CONTENT_PX).toBe(IMAGE_FIXED_HEIGHT);
+	});
+
+	it("stays under the media cap so it is never clamped", async () => {
+		const { MEDIA_IMAGE_CONTENT_PX, DETAIL_CAPS } = await import("./measure-tool-call");
+		expect(MEDIA_IMAGE_CONTENT_PX).toBeLessThanOrEqual(DETAIL_CAPS.media);
+	});
+});
+
+/**
+ * The DELIBERATE monotonicity exception, pinned so it stays deliberate.
+ *
+ * Nearly every measure in this directory gets taller as its column narrows (text wraps
+ * into more lines). `image_generation` with intrinsic dimensions does the opposite: the
+ * image is scaled to fit the column, so a narrower column yields a SHORTER block. That
+ * matches the renderer (`width: min(100%, displayWidth)` + `objectFit: contain`), so it
+ * is correct — but it also means the vlist's width feedback loop cannot rely on
+ * measure-layer monotonicity for termination, which is why
+ * `vlist-width-settle.ts` carries a structural cycle guard.
+ *
+ * These assertions exist so that (a) nobody "fixes" the growth into a width-independent
+ * reservation without noticing it would letterbox narrow columns, and (b) nobody
+ * reinstates a global monotonicity invariant elsewhere while this exception stands.
+ */
+describe("image_generation height vs column width (monotonicity exception)", () => {
+	const block = {
+		type: "image_generation",
+		status: "completed",
+		width: 1024,
+		height: 512,
+		result: "x",
+	} as const;
+
+	it("GROWS with the column while the image is being scaled to fit", async () => {
+		const { measureMedia } = await import("./measure-media");
+		const heightAt = (w: number) => measureMedia({ ...block }, w).height;
+		// 1px steps: the growth is ~0.5px per px of column, so a coarse stride can land
+		// on equal values and read as flat.
+		let increases = 0;
+		let previous = heightAt(320);
+		for (let width = 321; width <= 532; width++) {
+			const height = heightAt(width);
+			if (height > previous) increases++;
+			expect(height).toBeGreaterThanOrEqual(previous);
+			previous = height;
+		}
+		expect(increases).toBeGreaterThan(50);
+		expect(heightAt(532)).toBeGreaterThan(heightAt(320));
+	});
+
+	it("saturates once the column exceeds the display cap, so growth is bounded", async () => {
+		const { measureMedia, MEASURE_MEDIA_CONSTANTS } = await import("./measure-media");
+		const cap = MEASURE_MEDIA_CONSTANTS.IMGGEN_MAX_DISPLAY_WIDTH;
+		const heightAt = (w: number) => measureMedia({ ...block }, w).height;
+		const atCap = heightAt(cap + MEASURE_MEDIA_CONSTANTS.IMGGEN_PAPER_PADDING * 2);
+		for (const width of [700, 900, 1200, 1600]) {
+			expect(heightAt(width)).toBe(atCap);
+		}
+	});
+
+	// Without intrinsic dimensions there is nothing to scale, so the placeholder is
+	// width-independent and the exception does not apply.
+	it("does not apply to the unknown-size placeholder", async () => {
+		const { measureMedia } = await import("./measure-media");
+		const unknown = { type: "image_generation", status: "completed", result: "x" } as const;
+		const narrow = measureMedia({ ...unknown }, 320).height;
+		const wide = measureMedia({ ...unknown }, 900).height;
+		expect(narrow).toBe(wide);
+	});
+});

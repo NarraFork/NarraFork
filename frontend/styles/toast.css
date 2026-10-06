@@ -1,0 +1,25 @@
+/**
+ * Toast (Mantine notifications) text selection.
+ *
+ * Mantine v9's NotificationContainer implements swipe-to-dismiss with useDrag
+ * and hardcodes `cursor: default` as an INLINE style on the notification root.
+ * With a mouse that combination makes toast text impossible to select: the
+ * pointer drag is captured by useDrag (which also sets
+ * `document.body.style.userSelect = "none"`) and the caret never appears.
+ *
+ * Drag-dismiss itself is disabled for fine pointers in AppNotifications; these
+ * rules restore the selection affordance. `cursor` needs `!important` because
+ * it competes with an inline style, not a class.
+ */
+.nf-toast-selectable {
+	/* biome-ignore lint/complexity/noImportantStyles: Mantine sets cursor inline on the notification root, so only !important restores the caret. */
+	cursor: auto !important;
+	user-select: text;
+	-webkit-user-select: text;
+}
+
+/* The close button keeps its own affordance (UnstyledButton sets pointer, but
+   inheritance from the root would otherwise leak `auto` into nested spans). */
+.nf-toast-selectable button {
+	cursor: pointer;
+}

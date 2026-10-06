@@ -1,0 +1,344 @@
+import { and, eq, sql } from "drizzle-orm";
+import { db } from "../db";
+import { backgroundTasks, narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
+import { queueContextCharacterRefresh } from "../lib/context-characters";
+import { hotSafe } from "../lib/hot-safe";
+import { generateId } from "../lib/id";
+import {
+	enqueueInboxAgent,
+	hasInboxKind,
+	type InboxAgentMetadata,
+	inboxDelivery,
+	inboxMetadata,
+	listInboxRows,
+} from "./agent-runtime/inbox";
+import type { MailboxClaim } from "./agent-runtime/mailbox-types";
+import {
+	migrateLegacyTaskNotice,
+	setLegacyCompletionAdmissionReader,
+} from "./agent-runtime/publication";
+import type { LegacyCompletionAdmission } from "./agent-runtime/publication-outbox";
+import type { CompletedNotification } from "./background-task-service";
+import type { CompletedBgSubagentNotification } from "./bg-completion-queue";
+import { dbTransactionWithSeqFloor } from "./narrator-refs/seq-floor-tx";
+import { claimNextRefSeq } from "./narrator-refs/seq-store";
+import type { ParentInboundMessage } from "./parent-inbound-queue";
+
+export type PendingInjection = (
+	| { kind: "bg_agent"; task: CompletedBgSubagentNotification }
+	| { kind: "bg_bash"; task: CompletedNotification }
+	| { kind: "subagent_message"; message: ParentInboundMessage }
+) & { mailboxClaim?: MailboxClaim; recipientMessageId?: string };
+export type PendingInjectionKind = PendingInjection["kind"];
+
+const legacyQueue = hotSafe(
+	"narrafork:parent-injection-queue",
+	() => new Map<string, PendingInjection[]>(),
+);
+// Snapshot original object identities exactly once at protocol activation. No new producer writes here.
+const legacyCompletions = hotSafe("narrafork:parent-injection-legacy-completions", () => {
+	const entries = new Map<
+		string,
+		Array<{ entry: PendingInjection; admission: LegacyCompletionAdmission }>
+	>();
+	for (const [recipientId, pending] of legacyQueue) {
+		const snapshots: Array<{ entry: PendingInjection; admission: LegacyCompletionAdmission }> = [];
+		for (const entry of pending) {
+			if (entry.kind === "subagent_message") continue;
+			const eventKind = entry.task.status === "timeout" ? "timed_out" : entry.task.status;
+			if (
+				eventKind !== "completed" &&
+				eventKind !== "failed" &&
+				eventKind !== "timed_out" &&
+				eventKind !== "cancelled"
+			)
+				continue;
+			snapshots.push({
+				entry,
+				admission: Object.freeze({
+					producerKind: entry.kind === "bg_agent" ? "agent" : "bash",
+					taskId: entry.task.id,
+					recipientId,
+					token: entry,
+					eventKind,
+				}),
+			});
+		}
+		if (snapshots.length) entries.set(recipientId, snapshots);
+	}
+	return entries;
+});
+setLegacyCompletionAdmissionReader((source) => {
+	const captured = legacyCompletions
+		.get(source.recipientId)
+		?.find(
+			({ entry, admission }) =>
+				admission.producerKind === source.producerKind &&
+				admission.taskId === source.taskId &&
+				legacyQueue.get(source.recipientId)?.includes(entry),
+		);
+	if (!captured || captured.entry.kind === "subagent_message") return undefined;
+	const currentEvent =
+		captured.entry.task.status === "timeout" ? "timed_out" : captured.entry.task.status;
+	if (
+		captured.entry.task.id !== captured.admission.taskId ||
+		currentEvent !== captured.admission.eventKind
+	)
+		return undefined;
+	return captured.admission;
+});
+
+function persistUnboundLegacyAgentMessage(
+	narratorId: string,
+	entry: Extract<PendingInjection, { kind: "subagent_message" }>,
+): void {
+	dbTransactionWithSeqFloor(narratorId, (tx) => {
+		const messageId = generateId();
+		const text = `旧代理消息无法绑定工具执行 / Legacy agent message has no exact execution receipt. It was not resent.\nSender: ${entry.message.fromId}\n${entry.message.text.slice(0, 8000)}`;
+		tx.insert(narratorMessages)
+			.values({
+				id: messageId,
+				narratorId,
+				role: "disp",
+				origin: "system",
+				contentText: text,
+				contentJson: [{ type: "text", text }],
+				contextCharsJson: { segments: [] },
+				createdAt: new Date().toISOString(),
+			})
+			.run();
+		// Single seq authority (narrator-refs/seq-store.ts); base 0 for an empty
+		// narrator — previously this site alone started at 1.
+		tx.insert(narratorMessageRefs)
+			.values({ id: generateId(), narratorId, messageId, seq: claimNextRefSeq(tx, narratorId) })
+			.run();
+	});
+	queueContextCharacterRefresh(narratorId);
+}
+
+/** Compatibility transfer is one-shot: remove only after its durable acceptance succeeds. */
+export async function migrateLegacyParentInjections(narratorId: string): Promise<void> {
+	const entries = legacyQueue.get(narratorId);
+	if (!entries?.length) return;
+	for (const entry of entries.slice(0, 100)) {
+		if (entry.kind === "subagent_message") {
+			if (!entry.message.delivery?.senderToolCallBinding)
+				persistUnboundLegacyAgentMessage(narratorId, entry);
+			else await pushPendingInjection(narratorId, entry);
+		} else await migrateLegacyTaskNotice(narratorId, entry);
+		entries.shift();
+		const snapshots = legacyCompletions.get(narratorId);
+		if (snapshots) {
+			const index = snapshots.findIndex((snapshot) => snapshot.entry === entry);
+			if (index >= 0) snapshots.splice(index, 1);
+			if (!snapshots.length) legacyCompletions.delete(narratorId);
+		}
+	}
+	if (entries.length) return;
+	legacyQueue.delete(narratorId);
+}
+
+/** Completion producers use publication-outbox; this facade accepts ordinary agent messages only. */
+export async function pushPendingInjection(narratorId: string, entry: PendingInjection) {
+	if (entry.kind !== "subagent_message")
+		throw new Error("Completion notices require durable publication outbox");
+	if (!entry.message.delivery) throw new Error("Agent message requires exact delivery receipt");
+	if (entry.message.delivery.recipientNarratorId !== narratorId)
+		throw new Error("Mailbox recipient mismatch");
+	await enqueueInboxAgent(entry.message.delivery, entry.message.text, {
+		channel: "parent",
+		fromMessageId: entry.message.fromMessageId,
+		userId: entry.message.userId ?? null,
+		createdBy: entry.message.userId ?? null,
+	});
+}
+
+/** Read-only compatibility projection. Real consumers claim/commit through agent-runtime/inbox. */
+export async function drainPendingInjections(narratorId: string): Promise<PendingInjection[]> {
+	await migrateLegacyParentInjections(narratorId);
+	return (await listInboxRows(narratorId, ["agent_message", "task_notice"])).map(
+		projectPendingInjection,
+	);
+}
+export function projectPendingInjection(
+	row: import("./agent-runtime/runtime-queue-port").RuntimeMailboxRow,
+): PendingInjection {
+	if (row.kind === "task_notice") {
+		const metadata = inboxMetadata<{
+			producerKind: "agent" | "bash";
+			taskId: string;
+			logicalRunId: string;
+			eventKind: string;
+			resultRef?: string;
+			userId?: string | null;
+		}>(row);
+		if (!metadata.taskId || !metadata.eventKind) throw new Error("Invalid task notice metadata");
+		const task = db
+			.select({ title: backgroundTasks.title, alias: backgroundTasks.alias })
+			.from(backgroundTasks)
+			.where(eq(backgroundTasks.id, metadata.taskId))
+			.get();
+		const status = metadata.eventKind === "timed_out" ? "timeout" : metadata.eventKind;
+		if (metadata.producerKind === "bash") {
+			// Read only the bounded terminal presentation for this exact attempt.
+			// Legacy rows can still contain 512KiB; never load them in full here.
+			const result =
+				metadata.resultRef === `background_task:${metadata.taskId}:${metadata.logicalRunId}`
+					? db
+							.select({
+								output: sql<string | null>`substr(${backgroundTasks.output}, 1, 5121)`,
+								exitCode: backgroundTasks.exitCode,
+							})
+							.from(backgroundTasks)
+							.where(
+								and(
+									eq(backgroundTasks.id, metadata.taskId),
+									eq(backgroundTasks.logicalRunId, metadata.logicalRunId),
+									eq(backgroundTasks.parentNarratorId, row.narratorId),
+								),
+							)
+							.get()
+					: undefined;
+			const ref = task?.alias ?? metadata.taskId;
+			let output = result?.output;
+			if (output != null && Buffer.byteLength(output, "utf8") >= 5120) {
+				// Old tasks (or a failed spill) retain their bounded original for Await.
+				output = `${output.slice(0, 256)}\n[Output preview truncated; captured output file unavailable. Use Await({ type: "bash", id: ${JSON.stringify(ref)} }) to inspect the stored result.]`;
+			}
+			const outputPreview =
+				output == null
+					? `${row.text}\n[Result snapshot unavailable. Use Await({ type: "bash", id: ${JSON.stringify(ref)} }) to inspect the stored result.]`
+					: `${output || "(empty output)"}${result?.exitCode != null ? `\n[exit code: ${result.exitCode}]` : ""}`;
+			return {
+				kind: "bg_bash",
+				task: {
+					id: metadata.taskId,
+					type: "bash",
+					title: task?.title ?? null,
+					alias: task?.alias ?? null,
+					status,
+					outputPreview,
+					userId: metadata.userId ?? peekTaskNoticeUser(metadata.taskId),
+				},
+			};
+		}
+		const narrator = db
+			.select({ title: narrators.title })
+			.from(narrators)
+			.where(eq(narrators.id, metadata.taskId))
+			.get();
+		// Older resumed runs used a conclusion prefix to suppress their result.
+		// Keep those immutable snapshots readable just like ordinary completions.
+		const legacyConclusion = metadata.resultRef?.startsWith("conclusion:") ?? false;
+		const resultRef = legacyConclusion
+			? metadata.resultRef?.slice("conclusion:".length)
+			: metadata.resultRef;
+		const originalSnapshot = resultRef?.startsWith("message-original:") ?? false;
+		const resultMessageId = originalSnapshot
+			? resultRef?.slice("message-original:".length)
+			: resultRef?.startsWith("message:")
+				? resultRef.slice(8)
+				: undefined;
+		// Preserve the idle consumer's bounded long result without reading an unbounded source field.
+		const result =
+			resultMessageId && status !== "started"
+				? db
+						.select({
+							text: originalSnapshot
+								? sql<
+										string | null
+									>`CASE WHEN ${narratorMessages.originalContentJson} IS NULL THEN substr(${narratorMessages.contentText}, 1, 12001) WHEN length(CAST(${narratorMessages.originalContentJson} AS BLOB)) <= 98304 THEN substr(json_extract(${narratorMessages.originalContentJson}, '$[0].text'), 1, 12001) ELSE NULL END`
+								: sql<string>`substr(${narratorMessages.contentText}, 1, 12001)`,
+						})
+						.from(narratorMessages)
+						.where(eq(narratorMessages.id, resultMessageId))
+						.get()?.text
+				: undefined;
+		return {
+			kind: "bg_agent",
+			task: {
+				id: metadata.taskId,
+				alias: task?.alias ?? null,
+				title: task?.title ?? narrator?.title ?? metadata.taskId,
+				status,
+				resultPreview: row.text,
+				result: result?.slice(0, 12000),
+				resultTruncated: !!result && result.length > 12000,
+				resultMessageId,
+				userId: metadata.userId ?? peekTaskNoticeUser(metadata.taskId),
+			},
+		};
+	}
+	const delivery = inboxDelivery(row);
+	const metadata = inboxMetadata<InboxAgentMetadata>(row);
+	return {
+		kind: "subagent_message",
+		message: {
+			delivery,
+			userId: metadata.userId ?? row.createdBy ?? null,
+			fromId: delivery.sender.id,
+			fromTitle: delivery.sender.title ?? null,
+			fromLabel: delivery.sender.label,
+			fromType: delivery.sender.type ?? "general",
+			fromToolUseId: delivery.fromToolUseId,
+			fromMessageId: metadata.fromMessageId,
+			text: row.text,
+			timestamp: row.bufferedAt,
+		},
+	};
+}
+
+/** Attribution ledger for durable task notices that outlived in-memory completion payloads. */
+const taskNoticeUsers = hotSafe(
+	"narrafork:parent-injection-task-notice-user",
+	() => new Map<string, string | null>(),
+);
+
+export function recordTaskNoticeUser(taskId: string, userId: string | null | undefined): void {
+	taskNoticeUsers.set(taskId, userId ?? null);
+}
+
+function peekTaskNoticeUser(taskId: string): string | null {
+	return taskNoticeUsers.get(taskId) ?? null;
+}
+
+/** Keep unattributed legacy/system entries null rather than charging the parent user. */
+export function pendingInjectionUserId(entry: PendingInjection): string | null {
+	if (entry.kind === "subagent_message") return entry.message.userId ?? null;
+	const task = entry.task as { userId?: string | null; id: string };
+	return task.userId ?? peekTaskNoticeUser(task.id);
+}
+
+/**
+ * Contiguous same-user prefix over the durable projection.
+ * Explicit user restricts delivery to that principal; omitted means oldest entry's owner.
+ * Never skip an entry: FIFO holds across users and producer kinds alike.
+ */
+export async function takePendingInjectionBatch(
+	parentNarratorId: string,
+	userId?: string | null,
+): Promise<{ userId: string | null; entries: PendingInjection[] } | null> {
+	const list = await drainPendingInjections(parentNarratorId);
+	if (!list.length) return null;
+	const owner = userId === undefined ? pendingInjectionUserId(list[0]) : userId;
+	const entries: PendingInjection[] = [];
+	for (const entry of list) {
+		if (pendingInjectionUserId(entry) !== owner) break;
+		entries.push(entry);
+	}
+	if (!entries.length) return null;
+	return { userId: owner, entries };
+}
+
+export async function hasPendingInjections(narratorId: string): Promise<boolean> {
+	await migrateLegacyParentInjections(narratorId);
+	return hasInboxKind(narratorId, ["agent_message", "task_notice"]);
+}
+export function runItems<K extends PendingInjectionKind>(
+	entries: readonly PendingInjection[],
+	kind: K,
+): Extract<PendingInjection, { kind: K }>[] {
+	return entries.filter(
+		(entry): entry is Extract<PendingInjection, { kind: K }> => entry.kind === kind,
+	);
+}

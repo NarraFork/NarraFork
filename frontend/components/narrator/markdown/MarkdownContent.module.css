@@ -1,0 +1,359 @@
+.root {
+	min-width: 0;
+	max-width: 100%;
+	overflow-wrap: anywhere;
+	word-break: break-word;
+}
+
+.root > *:first-child {
+	margin-top: 0;
+}
+
+.animatedWord {
+	/* Keep each animated unit breakable. Inline-block would turn a long URL,
+	   hash, or CJK run into an unbreakable atomic box. */
+	display: inline;
+	overflow-wrap: anywhere;
+	word-break: break-word;
+	/* Duration is user-configurable (Settings → Appearance); AppRootLayout writes
+	   --nf-stream-token-duration onto <html>. This is the classic (non-virtual)
+	   renderer, where retirement is driven by the append boundary rather than by
+	   time, so it has no JS-side duration to keep in sync — it just follows the
+	   same preference so both renderers animate at the speed the user chose. The
+	   0.35s fallback is its historical value. */
+	animation: markdownWordIn var(--nf-stream-token-duration, 0.35s) ease-out both;
+}
+
+@keyframes markdownWordIn {
+	from {
+		opacity: 0;
+		transform: translateY(0.2em);
+		filter: blur(2px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+		filter: blur(0);
+	}
+}
+
+/* ── Native markdown elements (visual parity with Mantine Text/Title) ─────────
+   These replace per-element Mantine components (Text/Title/...) in the
+   react-markdown mapping. Mantine's Text/Title each run useProps + useStyles +
+   polymorphicFactory at runtime; for chat history with thousands of inline
+   nodes that mount cost dominates scrolling. Native tags + these scoped rules
+   render identically with zero per-node React/runtime overhead.
+   Values mirror Mantine v7 defaults (size="sm" → 14px / line-height 1.45).
+   Scoped to BOTH wrap roots so streaming (.rootNoWrap) matches static (.root). */
+:is(.root, .rootNoWrap) :is(p, .mdParagraph) {
+	font-size: var(--mantine-font-size-sm);
+	line-height: var(--mantine-line-height-sm);
+	font-weight: normal;
+	margin: 0.35em 0 0;
+	padding: 0;
+	color: inherit;
+}
+
+:is(.root, .rootNoWrap) :is(strong, .mdStrong) {
+	font-size: var(--mantine-font-size-sm);
+	line-height: var(--mantine-line-height-sm);
+	font-weight: 700;
+	color: inherit;
+}
+
+:is(.root, .rootNoWrap) :is(em, .mdEm) {
+	font-size: var(--mantine-font-size-sm);
+	line-height: var(--mantine-line-height-sm);
+	font-style: italic;
+	font-weight: normal;
+	color: inherit;
+}
+
+/* ASCII-art / diagram paragraphs must not word-wrap. */
+:is(.root, .rootNoWrap) p.mdDiagram {
+	white-space: pre;
+	overflow-x: auto;
+	word-break: normal;
+}
+
+/* Inline code — visual parity with Mantine <Code fz="xs"> (dark theme).
+   Uses Mantine vars so it follows theme / OLED overrides. */
+:is(.root, .rootNoWrap) code.mdCode {
+	font-family: var(--mantine-font-family-monospace);
+	font-size: var(--mantine-font-size-xs);
+	line-height: var(--mantine-line-height);
+	padding: 2px calc(var(--mantine-spacing-xs) / 2);
+	border-radius: var(--mantine-radius-sm);
+	background-color: var(--mantine-color-dark-5);
+	color: var(--mantine-color-white);
+	word-break: break-word;
+	overflow-wrap: break-word;
+}
+
+:root[data-mantine-color-scheme="light"] :is(.root, .rootNoWrap) code.mdCode {
+	background-color: var(--mantine-color-gray-1);
+	color: var(--mantine-color-black);
+}
+
+/* ── Native list / heading / anchor / blockquote (r2b) ───────────────────────
+   Replace Mantine <List>/<List.Item>/<Title>/<Anchor>/<Blockquote> in the
+   markdown mapping with native tags. List.Item renders li>div>span (3 nodes +
+   a Box component); native <li> is 1 node. Values mirror Mantine v7 defaults
+   (size="sm" 14px/1.45; Title per-order vars; anchor color var). Marker/padding
+   for ul/ol already set above; here add only typography/margins. */
+:is(.root, .rootNoWrap) :is(ul, ol) {
+	font-size: var(--mantine-font-size-sm);
+	line-height: var(--mantine-line-height-sm);
+	margin-top: 0.35em;
+	margin-bottom: 0;
+}
+
+:is(.root, .rootNoWrap) li {
+	margin: 0;
+	line-height: var(--mantine-line-height-sm);
+}
+
+:is(.root, .rootNoWrap) :is(h1, h2, h3, h4, h5, h6) {
+	font-family: var(--mantine-font-family-headings, inherit);
+	font-weight: 700;
+	margin-top: 0.4em;
+	margin-bottom: 0;
+	color: inherit;
+}
+:is(.root, .rootNoWrap) h1 {
+	font-size: var(--mantine-h1-font-size);
+	line-height: var(--mantine-h1-line-height);
+}
+:is(.root, .rootNoWrap) h2 {
+	font-size: var(--mantine-h2-font-size);
+	line-height: var(--mantine-h2-line-height);
+}
+:is(.root, .rootNoWrap) h3 {
+	font-size: var(--mantine-h3-font-size);
+	line-height: var(--mantine-h3-line-height);
+}
+:is(.root, .rootNoWrap) h4 {
+	font-size: var(--mantine-h4-font-size);
+	line-height: var(--mantine-h4-line-height);
+}
+:is(.root, .rootNoWrap) h5 {
+	font-size: var(--mantine-h5-font-size);
+	line-height: var(--mantine-h5-line-height);
+}
+:is(.root, .rootNoWrap) h6 {
+	font-size: var(--mantine-h6-font-size);
+	line-height: var(--mantine-h6-line-height);
+}
+
+:is(.root, .rootNoWrap) a.mdLink {
+	font-size: var(--mantine-font-size-sm);
+	line-height: var(--mantine-line-height-sm);
+	color: var(--mantine-color-anchor);
+	text-decoration: none;
+	overflow-wrap: anywhere;
+}
+@media (hover: hover) {
+	:is(.root, .rootNoWrap) a.mdLink:hover {
+		text-decoration: underline;
+	}
+}
+
+:is(.root, .rootNoWrap) blockquote.mdQuote {
+	position: relative;
+	margin: 0;
+	padding: var(--mantine-spacing-xs);
+	border-inline-start: 3px solid var(--mantine-primary-color-filled);
+	border-start-end-radius: var(--mantine-radius-default);
+	border-end-end-radius: var(--mantine-radius-default);
+	background-color: rgba(59, 91, 219, 0.06);
+}
+:root[data-mantine-color-scheme="light"] :is(.root, .rootNoWrap) blockquote.mdQuote {
+	background-color: rgba(76, 110, 245, 0.07);
+}
+
+/* Fix flowtoken animated token spans.
+   1. inline-block prevents mid-token wrapping → override to inline.
+   2. pre-wrap inside list items preserves stray \n between items as visible
+      blank lines during streaming → override to normal inside <li>. */
+.root span[style*="inline-block"]:not(:global(.vlist-task-checkbox)) {
+	/* biome-ignore lint/complexity/noImportantStyles: flowtoken emits inline styles, so overriding requires !important. */
+	display: inline !important;
+}
+
+.root li span[style*="pre-wrap"] {
+	/* biome-ignore lint/complexity/noImportantStyles: flowtoken emits inline styles, so overriding requires !important. */
+	white-space: normal !important;
+}
+
+/* Mantine List uses list-style-position:inside + white-space:nowrap on <li>
+   so the marker and inline-flex wrapper stay on one line. But the wrapper has
+   no width cap, so long text overflows the container.
+   Fix: switch to outside positioning with normal wrap. The marker sits in the
+   padding area and content wraps naturally. */
+.root ul,
+.root ol,
+.rootNoWrap ul,
+.rootNoWrap ol {
+	list-style-position: outside;
+	padding-inline-start: 1.5em;
+}
+
+.root li,
+.rootNoWrap li {
+	white-space: normal;
+}
+
+:is(.root, .rootNoWrap) li:global(.md-task-item),
+:is(.root, .rootNoWrap) li:global(.task-list-item) {
+	list-style: none;
+	display: flex;
+	align-items: flex-start;
+	gap: 6px;
+}
+
+:is(.root, .rootNoWrap) li:global(.md-task-item) :global(.md-task-item-body),
+:is(.root, .rootNoWrap) li:global(.task-list-item) :global(.md-task-item-body) {
+	min-width: 0;
+	flex: 1;
+}
+
+:is(.root, .rootNoWrap) li:global(.md-task-item) > :global(.vlist-task-checkbox),
+:is(.root, .rootNoWrap) li:global(.task-list-item) > :global(.vlist-task-checkbox) {
+	margin-top: 4px;
+}
+
+/* Remove extra top-margin on nested lists inside list items */
+.root li ul,
+.root li ol,
+.rootNoWrap li ul,
+.rootNoWrap li ol {
+	margin-top: 0;
+	margin-bottom: 0;
+}
+
+.rootNoWrap {
+	min-width: 0;
+	max-width: 100%;
+	overflow-x: auto;
+	white-space: pre;
+}
+
+.rootNoWrap > *:first-child {
+	margin-top: 0;
+}
+
+.rootNoWrap p {
+	margin-block: 0.25em;
+}
+
+.codeBlock {
+	position: relative;
+	isolation: isolate;
+	margin-top: 0.35em;
+	margin-bottom: 0;
+	min-width: 0;
+	max-width: 100%;
+}
+
+.codeLang {
+	position: absolute;
+	top: 4px;
+	left: 8px;
+	font-size: 10px;
+	line-height: 1;
+	color: var(--mantine-color-dimmed);
+	z-index: 1;
+	pointer-events: none;
+	user-select: none;
+}
+
+.codeCopy {
+	position: absolute;
+	top: 4px;
+	right: 4px;
+	z-index: 1;
+	opacity: 0;
+	transition: opacity 150ms ease;
+}
+
+.codeBlock:hover .codeCopy {
+	opacity: 1;
+}
+
+/* A fenced block that LEADS a ContentViewer body shares its top-right corner with
+   the viewer's own sticky action bar (source / wrap / copy / fullscreen). That bar
+   paints above block-level chrome by design (z-index 2 vs 1), so leaving the copy
+   button there hides it completely and the panel looks like it has none.
+
+   Move it to the panel's BOTTOM-right corner. Not sideways: parking it beside the
+   bar produced five grey icons in one strip, two of them copy glyphs with
+   different scopes (this block vs the whole message) — noisy and ambiguous.
+
+   Mirrors the virtual list's `resolveCodeCopyPlacement`
+   (vlist/vlist-content-view-float.ts), which resolves the same collision from
+   measured geometry. Scoped to `[data-content-block]` because MarkdownContent also
+   renders without a ContentViewer (compact summaries, reasoning bodies), where
+   there is no bar to dodge. */
+[data-content-block] :is(.root, .rootNoWrap) > .codeBlock:first-child .codeCopy {
+	top: auto;
+	bottom: 4px;
+}
+
+/* Known gap vs the virtual list: `resolveCodeCopyPlacement` also has a `hidden`
+   outcome for a panel too short to separate the two corners (a single unlabelled
+   line, ~39px, against the 44px both buttons need). CSS cannot branch on a box's
+   height, so here such a panel keeps its bottom-right button and the two overlap
+   by a few pixels. Left as-is deliberately: this is the opt-out renderer (the
+   virtual list is the default), and a mostly-clickable button beats the original
+   bug of a fully hidden one. */
+
+.codeBlock.codeBlockWithLang pre {
+	padding-top: calc(var(--mantine-spacing-xs) + 12px);
+}
+
+/* KaTeX block-level formulas: horizontal scroll on overflow */
+.root .katex-display,
+.rootNoWrap .katex-display {
+	overflow-x: auto;
+	overflow-y: hidden;
+}
+
+/* ── Mermaid diagram container ───────────────────────────────────────────────
+   Toolbar (size toggle / fullscreen / export) sits top-right and fades in on
+   hover, matching the code-block copy button. */
+.mermaidToolbar {
+	opacity: 0;
+	transition: opacity 150ms ease;
+}
+
+.mermaidContainer:hover .mermaidToolbar,
+.mermaidToolbar:focus-within {
+	opacity: 1;
+}
+
+/* Diagram host. Sizing of the injected <svg> is done imperatively in JS
+   (MermaidDiagram) by rewriting the svg's inline width/height, because mermaid
+   emits its own inline `style="max-width:<natural>px"` that CSS can't reliably
+   beat without !important + specificity fights. These rules cover layout only. */
+.mermaidSvgHost {
+	display: flex;
+	justify-content: center;
+	/* Fill the container so the child svg's width:100% resolves against the full
+	   width instead of shrinking to the diagram's intrinsic size. */
+	width: 100%;
+	/* The whole diagram is a click target (opens fullscreen); prevent the click
+	   from selecting SVG text nodes. */
+	user-select: none;
+	-webkit-user-select: none;
+}
+
+/* Both size modes fill the container width; the toggle only changes the height
+   cap (applied inline in JS via applySvgSize). No per-mode layout rules needed —
+   the classes are kept as hooks in case mode-specific styling is added later. */
+
+.mermaidExportError {
+	position: absolute;
+	top: 6px;
+	left: 8px;
+	z-index: 1;
+}

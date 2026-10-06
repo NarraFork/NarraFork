@@ -1,0 +1,51 @@
+import type { SQL } from "bun";
+import type { ArchiveRow, ArchiveValue } from "./main-store";
+import { type ArchiveSqlConnection, quoteArchiveIdentifier } from "./worker-store";
+
+/** Genuine asynchronous PG statements, including a repeatable-read source snapshot. */
+export function postgresArchiveConnection(
+	client: Pick<SQL, "unsafe" | "begin">,
+): ArchiveSqlConnection {
+	const connection: ArchiveSqlConnection = {
+		byteLength(column) {
+			return `coalesce(octet_length(${quoteArchiveIdentifier(column)}::text),0)`;
+		},
+		async query(text: string, values: ArchiveValue[] = []) {
+			const rows = await client.unsafe(text, values);
+			return Array.from(rows, (value: Record<string, unknown>) =>
+				Object.fromEntries(
+					Object.entries(value).map(([key, item]) => [
+						key,
+						item instanceof Date
+							? item.toISOString()
+							: typeof item === "bigint"
+								? Number(item)
+								: item != null && typeof item === "object"
+									? JSON.stringify(item)
+									: item,
+					]),
+				),
+			) as ArchiveRow[];
+		},
+		async columns(table) {
+			const rows = await client.unsafe(
+				"SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=$1 AND is_generated='NEVER' ORDER BY ordinal_position",
+				[table],
+			);
+			return Array.from(rows, (row: { column_name: string }) => row.column_name);
+		},
+		async transaction(write, action) {
+			return client.begin(async (tx) => {
+				await tx.unsafe(
+					write
+						? "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+						: "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+				);
+				await tx.unsafe("SET LOCAL lock_timeout='250ms'");
+				await tx.unsafe("SET LOCAL statement_timeout='60s'");
+				return action(postgresArchiveConnection(tx));
+			});
+		},
+	};
+	return connection;
+}

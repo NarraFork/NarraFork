@@ -1,0 +1,11 @@
+{
+	"title": "Learning Center",
+	"subtitle": "Documentation, workflows, and best practices for NarraFork features outside the NarraFlow itself.",
+	"searchPlaceholder": "Search features, workflows, or best practices...",
+	"noResults": "No matching learning documents found.",
+	"selectDoc": "Select a learning document.",
+	"jumpToFeature": "Feature shortcuts",
+	"workflow": "Recommended workflow",
+	"bestPractices": "Best practices",
+	"pitfalls": "Common pitfalls"
+}

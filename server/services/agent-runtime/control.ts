@@ -1,0 +1,203 @@
+import { logger } from "../../lib/logger";
+import { broadcastToNarrator } from "../../websocket/narrator-ws";
+import type { ExecuteLoopResult } from "../narrator-executor";
+import { narratorService } from "../narrator-service";
+import type { ActiveNarrator } from "../narrator-session-state";
+import {
+	consumeForegroundSubagentHardInterrupt,
+	getDetachableMap,
+	getForegroundAbortControllers,
+} from "../subagent-detach";
+import {
+	acceptsBufferedSubagentInput,
+	consumeNextBufferedSubagentMessage,
+} from "../subagent-executor";
+import { resumeManualOverride, waitForManualOverride } from "../subagent-manual-override";
+import {
+	beginSubagentInterruptSuspension,
+	clearTakenOver,
+	consumePendingBackgroundFinalize,
+	consumePendingStopTakeover,
+	isTakenOver,
+} from "../subagent-takeover";
+import { peekInbox } from "./inbox";
+import type { SubagentRuntimeProfile } from "./input";
+import { type ExecutionOwner, setExecutionSuspended } from "./ownership";
+
+export type RuntimeControlOutcome =
+	| { kind: "none" }
+	| { kind: "finish"; finalText: string; hasError: boolean; interrupted: boolean }
+	| { kind: "resume"; prompt: string; userId: string | null; prePromptBashCommand?: string };
+
+/**
+ * Whether the pass just ended because THIS subagent's current turn was stopped.
+ *
+ * The canonical signal is `turnAbort`. But the session-level `active.abortController`
+ * is only linked one way (turnAbort → proxy → session), so anything that aborts the
+ * session controller directly — `interruptNarrator(subagentId)` from the Stop route,
+ * the plugin API, the gateway — leaves `turnAbort` untouched. For an ordinary
+ * subagent that is a real end of the run. For a TAKEN-OVER one it must not be: the
+ * user drives it like an independent narrator, so stopping it means "stop this turn",
+ * and treating it as a terminal abort would clear the takeover and hand a result to
+ * the parent that is still supposed to be blocked. Parent/timeout/detach aborts are
+ * excluded here and again inside {@link applyForegroundControl}.
+ */
+export function isForegroundTurnInterrupted(
+	active: ActiveNarrator,
+	profile: SubagentRuntimeProfile,
+): boolean {
+	const control = profile.control;
+	if (!control) return false;
+	if (control.turnAbort.signal.aborted) return true;
+	if (control.detached || control.parentSignal.aborted || control.timeoutSignal?.aborted)
+		return false;
+	return active.alive && active.abortController.signal.aborted && isTakenOver(active.narratorId);
+}
+
+/** A bounded control transition, not a second executor or next-pass loop. */
+export async function applyForegroundControl(
+	active: ActiveNarrator,
+	owner: ExecutionOwner,
+	profile: SubagentRuntimeProfile,
+	result: ExecuteLoopResult,
+): Promise<RuntimeControlOutcome> {
+	const control = profile.control;
+	if (!control || !owner.isCurrent()) return { kind: "none" };
+	const id = active.narratorId;
+	if (control.detached || control.parentSignal.aborted || control.timeoutSignal?.aborted)
+		return { kind: "none" };
+	const locallyInterrupted = isForegroundTurnInterrupted(active, profile);
+	if (consumeForegroundSubagentHardInterrupt(id) && locallyInterrupted) {
+		return {
+			kind: "finish",
+			finalText: "Subagent interrupted by user",
+			hasError: false,
+			interrupted: true,
+		};
+	}
+	if (result.hasError && !result.aborted) {
+		if (isTakenOver(id)) clearTakenOver(id);
+		return { kind: "none" };
+	}
+	if (!locallyInterrupted && !isTakenOver(id)) return { kind: "none" };
+	const consumeQueued = () =>
+		consumeNextBufferedSubagentMessage({
+			narratorId: id,
+			parentNarratorId: profile.parentNarratorId,
+			toolUseId: profile.parentToolUseId,
+			model: active.model,
+			provider: active.provider,
+			cwd: active.cwd,
+		});
+	if (locallyInterrupted) {
+		const queued = await consumeQueued();
+		if (queued)
+			return {
+				kind: "resume",
+				prompt: queued.currentInput ?? queued.prompt,
+				userId: queued.preservePrincipal
+					? (active._currentUserId ?? null)
+					: (queued.userId ?? null),
+				prePromptBashCommand: queued.prePromptBashCommand,
+			};
+	}
+	const heldByTakeover = locallyInterrupted
+		? beginSubagentInterruptSuspension(id).heldByTakeover
+		: true;
+	if (heldByTakeover && (consumePendingStopTakeover(id) || consumePendingBackgroundFinalize(id))) {
+		clearTakenOver(id);
+		return {
+			kind: "finish",
+			finalText: result.finalText,
+			hasError: result.hasError,
+			interrupted: false,
+		};
+	}
+	const substatus = heldByTakeover ? ["taken_over"] : ["manual_override"];
+	await narratorService.updateStatus(id, "idle", { substatus });
+	broadcastToNarrator(profile.parentNarratorId, {
+		type: "subagent_suspended",
+		narratorId: profile.parentNarratorId,
+		subagentNarratorId: id,
+		toolUseId: profile.parentToolUseId,
+	});
+	broadcastToNarrator(id, { type: "status_change", narratorId: id, status: "idle", substatus });
+	const signal = control.timeoutSignal
+		? AbortSignal.any([control.parentSignal, control.timeoutSignal])
+		: control.parentSignal;
+	const waiting = waitForManualOverride(
+		id,
+		signal,
+		profile.parentNarratorId,
+		profile.parentToolUseId,
+	);
+	setExecutionSuspended(owner, true);
+	try {
+		// Registration precedes inbox inspection: queued input may only settle this control,
+		// never observe a gap and start a second owner.
+		// User input AND a Send addressed to this subagent both resume it: a message that
+		// arrived while the turn was ending (buffered, because the status still read
+		// `working`) would otherwise sit unread until the user happened to act. Team
+		// reports and task notices do not authorize releasing user control.
+		const head = await peekInbox(id);
+		const queued =
+			head && acceptsBufferedSubagentInput(head)
+				? await consumeQueued().catch((error) => {
+						logger.warn("Failed to materialize user input for suspended runtime", {
+							narratorId: id,
+							error: String(error),
+						});
+						return undefined;
+					})
+				: undefined;
+		const resumedFromQueue =
+			queued &&
+			resumeManualOverride(id, {
+				prompt: queued.currentInput ?? queued.prompt,
+				history: queued.history,
+				trailingToolResults: queued.trailingToolResults,
+				userId: queued.preservePrincipal
+					? (active._currentUserId ?? null)
+					: (queued.userId ?? null),
+			});
+		const answer = await waiting;
+		if (answer.action === "resume")
+			return {
+				kind: "resume",
+				prompt: answer.prompt,
+				userId: answer.userId ?? null,
+				prePromptBashCommand: resumedFromQueue ? queued?.prePromptBashCommand : undefined,
+			};
+		if (heldByTakeover) clearTakenOver(id);
+		return {
+			kind: "finish",
+			finalText: answer.finalText,
+			hasError: answer.hasError,
+			interrupted: answer.interrupted === true,
+		};
+	} finally {
+		setExecutionSuspended(owner, false);
+	}
+}
+
+/** Install the next turn cancellation sources without releasing its execution epoch. */
+export function resetForegroundTurn(active: ActiveNarrator, profile: SubagentRuntimeProfile): void {
+	const control = profile.control;
+	if (!control) return;
+	control.cleanupTurnAbort?.();
+	control.proxy.dispose();
+	control.turnAbort = new AbortController();
+	control.proxy.listenTo(control.parentSignal, control.turnAbort.signal);
+	if (control.timeoutSignal) control.proxy.listenTo(control.timeoutSignal);
+	getForegroundAbortControllers().set(active.narratorId, control.turnAbort);
+	const detachable = getDetachableMap().get(active.narratorId);
+	if (detachable) detachable.fgAbort = control.turnAbort;
+	active.abortController = new AbortController();
+	const signal = control.proxy.signal;
+	const controller = active.abortController;
+	const abort = () => controller.abort(signal.reason);
+	control.cleanupTurnAbort = () => signal.removeEventListener("abort", abort);
+	if (signal.aborted) abort();
+	else signal.addEventListener("abort", abort, { once: true });
+	active.alive = true;
+}

@@ -1,0 +1,6 @@
+{
+	"version": "0.2.9",
+	"date": "2026-04-30",
+	"en": "## New Features\n\n- MCP fine-grained permissions: refactored from allow/ask/deny to readOnly/readWrite/ask/deny, subagents now filter available MCP tools by permission level\n- Edit message button: bottom send button in NarratorPanel reuses as \"Save & Regenerate\" during message editing\n- Terminal auxiliary keys: arrow keys now support long-press repeat\n- Subagent MCP tools: all subagent types (including custom) can access MCP tools when permissions allow\n\n## Bug Fixes\n\n- Fixed MCP ask permission bypassing dontAsk mode, now correctly denies instead of prompting\n- Legacy MCP allow config auto-migrates to readWrite on settings load and API input\n- Narrator list mobile layout: archive button moved to title row, fixed overflow\n\n## Improvements\n\n- Relaxed model identifier validation to support more provider formats",
+	"zh-CN": "## 新功能\n\n- MCP 细粒度权限：从 allow/ask/deny 三级重构为 readOnly/readWrite/ask/deny 四级，子代理按权限级别过滤可用 MCP 工具\n- 编辑消息按钮：叙述者面板底部发送按钮在编辑消息时复用为\"保存并重新生成\"\n- 终端辅助键：方向键支持长按重复发送\n- 子代理 MCP 工具：所有子代理类型（含自定义）在权限允许时可访问 MCP 工具\n\n## 修复\n\n- 修复 MCP ask 权限在 dontAsk 模式下仍然弹出审批的问题，现在正确拒绝\n- 旧 MCP allow 配置在 settings 加载和 API 输入时自动迁移为 readWrite\n- 叙述者列表移动端布局：归档按钮移至标题行，修复溢出问题\n\n## 改进\n\n- 放宽模型标识符校验以支持更多 provider 格式"
+}

@@ -1,0 +1,49 @@
+{
+  "runId": "2026-09-06T15-41-09-954Z",
+  "allHashesAndInputsVerified": true,
+  "frozenV5Exact": true,
+  "sameDeliveryLimits": true,
+  "abbaVerified": true,
+  "episodes": 16,
+  "evals": 39,
+  "requests": 43,
+  "scorerHash": "9dca713be6015bb951fbf903663d10dcf08025fdc15b94e5906a5144d91b9398",
+  "conditions": {
+    "A": {
+      "version": "task-call-v5-delivery",
+      "trials": 8,
+      "strictPass": 6,
+      "correctDelivery": 5,
+      "evals": 22,
+      "requests": 25,
+      "naturalStops": 3,
+      "guideChars": 2214
+    },
+    "B": {
+      "version": "task-call-v6-coherent",
+      "trials": 8,
+      "strictPass": 8,
+      "correctDelivery": 7,
+      "evals": 17,
+      "requests": 18,
+      "naturalStops": 1,
+      "guideChars": 1965
+    }
+  },
+  "gatePassed": false,
+  "unmarkedCorrectResults": [
+    {
+      "file": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T15-41-09-954Z-coherent-delivery-pilot-luna-3-B-2.json",
+      "case": "3",
+      "model": "nugjp:codex:gpt-5.6-luna",
+      "naturalStop": true,
+      "lastValue": [
+        "A14",
+        "B29",
+        "Q38",
+        "R57"
+      ]
+    }
+  ],
+  "note": "Business pass is unchanged; missing explicit delivery is not reclassified as business failure. The pre-registered clean-delivery expansion gate was not met."
+}

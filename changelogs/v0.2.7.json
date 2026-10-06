@@ -1,0 +1,6 @@
+{
+	"version": "0.2.7",
+	"date": "2026-04-28",
+	"en": "## Bug Fixes\n\n- API request failures are now recorded in usage history with visible error badges and messages\n- Fixed API request tracking so retry, empty-response, abort, and overflow paths always close request records correctly\n- Improved DeepSeek reasoning compatibility across Anthropic-compatible and OpenAI-compatible providers, including effort mapping and history replay cleanup\n- Custom retry rule keyword and domain matching is now case-insensitive",
+	"zh-CN": "## 修复\n\n- API 请求失败现在会记录到使用历史，并显示错误标记和错误信息\n- 修复重试、空响应、中止和上下文溢出等路径下 API 请求记录未正确闭合的问题\n- 改进 DeepSeek 在 Anthropic 兼容和 OpenAI 兼容提供商中的推理兼容性，包括 effort 映射和历史回放清理\n- 自定义重试规则的关键词和域名匹配现在不区分大小写"
+}

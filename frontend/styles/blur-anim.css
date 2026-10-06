@@ -1,0 +1,49 @@
+/*
+ * Narrator enter animations.
+ * Enabled only when [data-advanced-anim="true"] is set on <html>.
+ */
+
+@keyframes nf-blur-in {
+	0% {
+		opacity: 0;
+		filter: blur(10px);
+		transform: translateY(6px) scale(0.985);
+	}
+	100% {
+		opacity: 1;
+		filter: blur(0);
+		transform: translateY(0) scale(1);
+	}
+}
+
+/* Duration is user-configurable (Settings → Appearance). AppRootLayout writes
+   --nf-blur-in-duration onto <html> from `narrafork_blur_in_ms`; the fallback
+   here is the same 400ms default, so a browser with nothing stored — or one
+   rendering before that effect runs — looks unchanged.
+
+   A duration of 0 makes the animation a no-op in one frame, which is how the
+   slider expresses "instant" without needing a separate switch. */
+:root[data-advanced-anim="true"] .nf-blur-in-enter {
+	animation: nf-blur-in var(--nf-blur-in-duration, 400ms) ease-out both;
+	transform-origin: center top;
+	will-change: opacity, filter, transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	:root[data-advanced-anim="true"] .nf-blur-in-enter {
+		animation: none;
+		filter: none;
+		transform: none;
+	}
+}
+
+/* Pulsing dot for active recording indicators */
+@keyframes pulse-dot {
+	0%,
+	100% {
+		opacity: 1;
+	}
+	50% {
+		opacity: 0.3;
+	}
+}

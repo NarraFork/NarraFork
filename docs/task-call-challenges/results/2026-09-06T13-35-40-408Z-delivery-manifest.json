@@ -1,0 +1,85 @@
+{
+  "runId": "2026-09-06T13-35-40-408Z",
+  "experiment": "explicit-delivery-abba",
+  "image": "0d36aaa2c1ad7cccd2dc0cf7fba4efb11ea7193023cecb1c27a84463c9ba01aa",
+  "models": [
+    "nugjp:codex:gpt-5.6-luna",
+    "nug2:antigravity:gemini-3.7-flash"
+  ],
+  "effort": "low",
+  "limits": {
+    "responses": 5,
+    "evals": 6,
+    "requestMs": 120000,
+    "responseChars": 64000
+  },
+  "pilot": {
+    "cases": [
+      "3",
+      "5"
+    ],
+    "order": [
+      "A",
+      "B",
+      "B",
+      "A"
+    ],
+    "repeatsPerCondition": 2,
+    "planned": 16
+  },
+  "regressionGate": "Only when all 8 B pilot trials strictly pass, deliver cleanly, and have zero interface violations; no infrastructure errors or source drift.",
+  "maximumTrials": 28,
+  "frozenBaseline": "2026-09-06T11-54-55-805Z",
+  "sourceHashes": {
+    "fixtures.ts": "9dca713be6015bb951fbf903663d10dcf08025fdc15b94e5906a5144d91b9398",
+    "contract.ts": "837857dc89bf22ba1b4351d2d63f68af2592cf80b81cb52f27ccf38b0105b0da",
+    "profiles.ts": "6ddda9c09c8ccc445cae8f83c38861bb446d26627c7144a8091d88303085dcc6",
+    "runner.ts": "f72d83796006a338f9f07498f0eb0bb3bc55b13c8ec166739a4095a66ffc5e1d",
+    "isolate.ts": "f881bdeaace4ca93238873399a3c2ad38354f41a07dfef89c66a0bdbad26d6c3",
+    "client.ts": "f66f203b472a60deb0331f262e4edebcf11c8894b4534a9b563d6ba724fe953c",
+    "run.ts": "dc1f95c5c605d613bfce7af14186b5368a8e01455ad8c16935cdbea76e6e300c",
+    "analyze.ts": "7c9a849fa7256ed7fb091916ad207ead36c9c95867e9c347880dcb34dfac1cdc",
+    "delivery.test.ts": "a4ce10d212e15ee45443c6771a6b007c210e3a48b4cbf379fe3f73e5cd689bf9",
+    "delivery-experiment.ts": "6119767da73a71b1e05dcf7ac10336857c82ecf0450077a6c0b96f1f9338cb20"
+  },
+  "sourceSnapshot": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-sources.json",
+  "inputSnapshot": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-inputs.json",
+  "files": [
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-luna-3-A-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-flash-3-A-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-luna-3-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-luna-3-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-flash-3-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-luna-3-A-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-flash-3-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-luna-5-A-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-flash-3-A-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-luna-5-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-flash-5-A-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-flash-5-B-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-luna-5-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-flash-5-B-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-luna-5-A-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T13-35-40-408Z-delivery-pilot-flash-5-A-2.json"
+  ],
+  "graderHash": "9dca713be6015bb951fbf903663d10dcf08025fdc15b94e5906a5144d91b9398",
+  "profileHashes": {
+    "A": {
+      "api": "dbaf98f24cf24932760364a18e92efdb839b18cbceae3bb636d3058362d76eba",
+      "description": "8a615cace9dd8f869ae42d8206a326805e2d34dc280b5fd856d5eb0a755c47e0",
+      "parameters": "820314377c9c52ae36beb014a9c959d7f151ad1c53764a06a5a1e18c1f9202b4",
+      "contract": "ae41e55a2089d2da65d671bbffc3782839c39255e902a85bd364b086a9a7e97d"
+    },
+    "B": {
+      "api": "42867f3211583c70d7461d5c72f9f7e0f1a8bf9d6b654167a95284aeef0df2dc",
+      "description": "33be249d00059c586826ec0518dc65bdc5d047ad7d8ae475de054ee2a7837918",
+      "parameters": "8444f2dbd5c73f4317a92785e255a41a39bbf197691a9c4fe64a9ed1e32743e6",
+      "contract": "ee3a01083056859eec6cbb881a72c455f2bda217b6b42233ee3fa2f73e0483bf"
+    }
+  },
+  "status": "complete",
+  "attempted": 16,
+  "gatePassed": false,
+  "failures": [],
+  "sourceDrift": []
+}

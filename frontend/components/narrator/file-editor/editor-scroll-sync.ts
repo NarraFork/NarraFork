@@ -1,0 +1,203 @@
+/**
+ * Line-anchor scroll sync between the Monaco source editor and the rendered
+ * markdown preview, modelled on VS Code's markdown scroll sync
+ * (`extensions/markdown-language-features/preview-src/scroll-sync.ts`).
+ *
+ * Proportional (fraction-of-total-height) sync is wrong for markdown: a ten-
+ * line code fence renders three pixels tall next to a one-line heading that
+ * renders eighty, so the linear height map drifts by whole screens. Instead
+ * the rendered document carries `data-line="<0-based source line>"` anchors
+ * on block elements (injected by MarkdownContent when `sourceLines` is on),
+ * and BOTH directions interpolate line numbers linearly BETWEEN neighbouring
+ * anchors — exact at every block boundary, approximately right inside a block.
+ *
+ * Deviation from VS Code: the forward map interpolates the source-line
+ * interval over the block's OWN pixel span, not over the gap after it. Multi-
+ * source-line blocks (tables, code fences, math) carry only their start-line
+ * anchor, so VS Code's "block end + gap" mapping pins the preview to the
+ * block's bottom edge for every line inside it — scrolling the source through
+ * a 30-line table jumps the preview past the whole table in one frame. The
+ * mapping here is the exact inverse of `lineForScrollTop`, so the two scroll
+ * directions agree at every pixel/line instead of drifting on round-trips.
+ *
+ * The math below is DOM-free and unit-tested; the two collectors that build
+ * anchors from pixels are the only DOM-touching part.
+ */
+
+export interface LineAnchor {
+	/** 0-based source line the block starts on. */
+	readonly line: number;
+	/** Document-space pixel offset of the block's top edge inside the scroller. */
+	readonly top: number;
+	/** Pixel height reserved for this anchor: up to the next anchor, never overlapping. */
+	readonly height: number;
+}
+
+export interface AnchorEntry {
+	readonly line: number;
+	readonly top: number;
+	/** Raw element height; truncated to the next anchor when one follows. */
+	readonly height: number;
+}
+
+/**
+ * Order entries into anchors and give each a non-overlapping height (VS Code's
+ * `getElementBounds` truncation: a block that CONTAINS a more deeply nested
+ * anchored block only owns the pixels up to that child). Duplicate lines keep
+ * the first element — later same-line blocks start at the same source line and
+ * add no interpolation information.
+ */
+export function buildAnchors(entries: readonly AnchorEntry[]): LineAnchor[] {
+	const sorted = [...entries].sort((a, b) => a.top - b.top);
+	const unique: AnchorEntry[] = [];
+	for (const entry of sorted) {
+		// A semantic tree need not follow source order (numeric JSON keys, reopened
+		// INI sections). Sorting by line would invent a different visual order;
+		// dropping only the offending row would silently map it to another key.
+		// Reject the whole map so BOTH directions use proportional sync instead.
+		if (
+			!Number.isFinite(entry.line) ||
+			!Number.isFinite(entry.top) ||
+			!Number.isFinite(entry.height) ||
+			entry.line < 0
+		)
+			return [];
+		const previous = unique[unique.length - 1];
+		if (previous && entry.line < previous.line) return [];
+		if (previous?.line === entry.line) continue;
+		unique.push(entry);
+	}
+	return unique.map((entry, i) => {
+		const next = unique[i + 1];
+		// VS Code's getElementBounds only clips an element when the next anchored
+		// element is nested inside it. A real gap between sibling blocks is kept.
+		const height = next
+			? Math.min(Math.max(1, entry.height), Math.max(1, next.top - entry.top))
+			: Math.max(1, entry.height);
+		return { line: entry.line, top: entry.top, height };
+	});
+}
+
+/**
+ * The scroller offset (top edge) that reveals `line`. The source-line interval
+ * between two anchors maps linearly onto the pixel interval between their tops,
+ * so walking the source THROUGH a multi-line block (table, code fence) walks
+ * the preview through the block's own pixels. This is the exact inverse of
+ * `lineForScrollTop`. Returns null when there is nothing anchored to go by.
+ */
+export function scrollTopForLine(anchors: readonly LineAnchor[], line: number): number | null {
+	if (anchors.length === 0 || !Number.isFinite(line)) return null;
+	if (line <= 0) return 0;
+	// Leading whitespace/comments may leave the first anchor after line zero.
+	// Interpolate from the document origin rather than dividing the first
+	// anchor's line interval by itself (which used to produce 0/0).
+	const first = anchors[0];
+	if (line < first.line) return (line / first.line) * first.top;
+	let previous = first;
+	for (const anchor of anchors) {
+		if (anchor.line === line) return anchor.top;
+		if (anchor.line > line) {
+			const progress = (line - previous.line) / (anchor.line - previous.line);
+			return previous.top + progress * (anchor.top - previous.top);
+		}
+		previous = anchor;
+	}
+	// The collector adds a document-end sentinel, matching VS Code's final
+	// `data-line` marker. This fallback is only for callers that provide no sentinel.
+	const progressInElement = line - Math.floor(line);
+	return previous.top + previous.height * progressInElement;
+}
+
+/**
+ * The fractional source line shown at scroller offset `offset` —
+ * `getEditorLineNumberForPageOffset` in VS Code. `fallbackLineHeight` extends
+ * the document tail past the last anchor; `lineCount` clamps the result.
+ */
+export function lineForScrollTop(
+	anchors: readonly LineAnchor[],
+	offset: number,
+	lineCount: number,
+	_fallbackLineHeight = 1,
+): number {
+	if (anchors.length === 0 || !Number.isFinite(offset)) return 0;
+	if (offset <= 0) return 0;
+	for (let i = 0; i < anchors.length; i++) {
+		const previous = anchors[i];
+		const next = anchors[i + 1];
+		const end = previous.top + previous.height;
+		if (offset < previous.top) {
+			if (!i) return Math.min(lineCount, (offset / Math.max(1, previous.top)) * previous.line);
+			const before = anchors[i - 1];
+			const progress = (offset - before.top) / Math.max(1, previous.top - before.top);
+			return Math.min(lineCount, before.line + progress * (previous.line - before.line));
+		}
+		if (offset <= end || !next) {
+			if (!next) {
+				const progress = (offset - previous.top) / Math.max(1, previous.height);
+				return Math.min(lineCount, previous.line + progress);
+			}
+			// VS Code maps the whole interval from this block's top to the next
+			// block's top onto the source-line interval between their anchors.
+			const progress = (offset - previous.top) / Math.max(1, next.top - previous.top);
+			return Math.min(lineCount, previous.line + progress * (next.line - previous.line));
+		}
+	}
+	return lineCount;
+}
+
+/** Collect anchors from the rendered preview: every element carrying a source line. */
+export function collectPreviewAnchors(scroller: HTMLElement, lineCount?: number): LineAnchor[] {
+	const scrollerRect = scroller.getBoundingClientRect();
+	const entries: AnchorEntry[] = [];
+	for (const element of scroller.querySelectorAll("[data-line]")) {
+		if (!(element instanceof HTMLElement)) continue;
+		const line = Number(element.getAttribute("data-line"));
+		if (Number.isNaN(line)) continue;
+		const rect = element.getBoundingClientRect();
+		entries.push({
+			line,
+			top: rect.top - scrollerRect.top + scroller.scrollTop,
+			height: rect.height,
+		});
+	}
+	// A sentinel alone cannot locate any content (parse-error/oversized preview).
+	if (entries.length && lineCount != null && !entries.some((entry) => entry.line === lineCount)) {
+		entries.push({ line: lineCount, top: scroller.scrollHeight, height: 1 });
+	}
+	return buildAnchors(entries);
+}
+
+/** Coalesce preview commits/layout changes without observing scroll/style writes. */
+export function observePreviewAnchorChanges(scroller: HTMLElement, refresh: () => void) {
+	let timer: ReturnType<typeof setTimeout> | null = null;
+	let disposed = false;
+	const schedule = () => {
+		if (disposed || timer !== null) return;
+		timer = setTimeout(() => {
+			timer = null;
+			refresh();
+		}, 100);
+	};
+	const mutationObserver =
+		typeof MutationObserver === "undefined" ? null : new MutationObserver(schedule);
+	mutationObserver?.observe(scroller, {
+		childList: true,
+		characterData: true,
+		subtree: true,
+		attributes: true,
+		attributeFilter: ["data-line"],
+	});
+	const resizeObserver =
+		typeof ResizeObserver === "undefined" ? null : new ResizeObserver(schedule);
+	resizeObserver?.observe(scroller);
+	return {
+		schedule,
+		dispose() {
+			disposed = true;
+			mutationObserver?.disconnect();
+			resizeObserver?.disconnect();
+			if (timer !== null) clearTimeout(timer);
+			timer = null;
+		},
+	};
+}

@@ -1,0 +1,6 @@
+{
+	"version": "0.8.2",
+	"date": "2026-10-05",
+	"en": "## New Features\n\n- Add private session backups, same-instance archive restoration, and resource previews; ordinary session entry points no longer create chapters implicitly.\n- Give ordinary workspaces independent resource ownership and protect their resources from cleanup of retired chapters.\n- Show context composition directly in the context menu with compact K/M/B token usage.\n\n## Bug Fixes\n\n- Prioritize urgent guidance after interruption and confirm delivery only when it actually reaches the agent.\n- Keep subagent output and team queries tied to the correct run, preventing stale retry and continuation results from leaking into current work.\n- Enable reasoning title sections only for GPT models, preserving the original display for other or unknown models.\n- Preserve character statistics in session backups and improve archived-thread shutdown and archive authorization boundaries.",
+	"zh-CN": "## 新功能\n\n- 新增私有会话备份、同实例归档恢复和资源预演，普通会话入口不再隐式创建章节。\n- 普通工作区拥有独立的资源归属，避免退役章节清理误删仍在使用的资源。\n- 在上下文菜单中直接展示上下文组成，并用 K/M/B 精简显示 token 用量。\n\n## 修复\n\n- 紧急引导在中断后优先送达，派发状态仅在实际投递成功后确认。\n- 子代理输出与团队查询准确关联当前运行，避免重试、续跑及旧轮结果串入。\n- 仅对 GPT 模型启用 reasoning 标题分段，其他及未知模型保持原始展示。\n- 保全会话备份中的字符统计，完善归档线程退出和归档访问授权边界。"
+}
