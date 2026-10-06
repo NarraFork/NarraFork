@@ -1,5 +1,15 @@
 # 第三方开源协议页面（`/licenses`）
 
+## 项目自身的许可证与 CLA
+
+NarraFork 的项目原创源代码和配套材料（除另有明确许可声明外）采用 **Mozilla Public License 2.0（`MPL-2.0`）**，标准正文见 [LICENSE](../LICENSE)。根目录包和 VS Code 扩展的包元数据均声明 `MPL-2.0`。
+
+贡献者许可协议见 [CLA.md](../CLA.md)。接收贡献前需核验贡献者的明确签署及实际权利人授权；CLA 允许将其覆盖的贡献在未来改用 MIT、Apache-2.0、BSD-3-Clause 等宽松开源许可证，但不转让版权，也不授予任意专有再许可权。签署步骤、法人授权及历史贡献补签规则均在 CLA 中说明，不能用普通 PR 提交或 `Signed-off-by` 替代。
+
+第三方依赖、运行时、二进制、复制或 vendored 的代码仍按各自许可证分发，本项目的许可证和 CLA 不覆盖或变更其权利。本页以下内容及 `/licenses` 页面仍用于第三方许可披露。未来如整体变更许可证，必须逐项核验贡献和第三方材料的授权，不能仅修改包元数据或 `LICENSE` 文件。
+
+## 第三方披露范围与实现
+
 页面覆盖**所有随发布产物分发的第三方组件**（当前约 1180 条），而非仅 `package.json` 里的直接依赖。分组依据是"是否随产物分发"，不是 `dependencies` / `devDependencies` 的位置：
 
 - **`bundled`** — 不在 `node_modules` 里、但被编译进发布产物的组件。**由人工在 `licenses/extra/entries.json` 声明**，协议全文放同目录 `.txt`。当前包含：Bun 运行时（含其静态链接的 JavaScriptCore，**LGPL-2**，附带 relink 说明）、`vendor/zstd` 静态二进制（**BSD-3-Clause OR GPL-2.0，已选定 BSD-3**）、静态链接的 musl libc、Go 标准库 + `remote-executor/go.mod` 的 4 个模块、`@parcel/watcher` 的 8 个平台原生 `.node`（由 `scripts/download-parcel-watcher.ts` 直接从 npm 下载，**绕过 node_modules，扫描器看不到**）。

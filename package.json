@@ -3,6 +3,7 @@
 	"type": "module",
 	"version": "0.8.3",
 	"private": true,
+	"license": "MPL-2.0",
 	"packageManager": "bun@1.4.2",
 	"dependencies": {
 		"@babel/parser": "7.29.0",

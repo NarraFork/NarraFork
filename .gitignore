@@ -29,6 +29,8 @@ dist-share-*.zip
 analyze/
 analyze2/
 .perf-analysis/
+# Local audit artifacts for the public export must never be committed.
+.filter-work/
 .narrafork/
 .idea/
 
