@@ -190,3 +190,94 @@ describe("complete field range recovery", () => {
 		await expect(reader(old, 0, 10)).rejects.toThrow("pinned source");
 	});
 });
+test("an evicted rebound can recover a re-registered old descriptor through its exact pin", async () => {
+	const text = `FIRST${"rebound source\r\n".repeat(1000)}LAST`;
+	const old = ref("evicted-rebound-old", text.length);
+	const fresh = ref("evicted-rebound-fresh", text.length);
+	let ensures = 0;
+	const reader = recoveringDocumentRangeReader(
+		async (document, offset, limit) => {
+			if (document.id === old.id) throw expired();
+			return { ref: fresh, offset, text: text.slice(offset, offset + limit) };
+		},
+		async () => {
+			ensures++;
+			return fresh;
+		},
+	);
+	textDocumentStore.register(old, reader);
+	expect(await readCurrentDocumentRange(old.id, 0)).toBe(text);
+	const rebound = textDocumentStore.getSnapshot(old.id);
+	if (!rebound) throw new Error("rebound missing");
+	textDocumentStore.discard(rebound.id, rebound.epoch);
+	expect(textDocumentStore.getSnapshot(old.id)).toBeUndefined();
+	textDocumentStore.register(old, reader);
+	expect(await readCurrentDocumentRange(old.id, 0)).toBe(text);
+	expect(ensures).toBe(2);
+	expect(textDocumentStore.getSnapshot(old.id)?.epoch).not.toBe(old.epoch);
+});
+describe("outer range read ownership", () => {
+	test("a discarded replacement epoch is retried without publishing old source bytes", async () => {
+		const oldText = "old source bytes";
+		const newText = "new replacement source bytes";
+		const old = ref("outer-pin-replacement", oldText.length);
+		let enter = () => {};
+		let resume = () => {};
+		const entered = new Promise<void>((resolve) => {
+			enter = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			resume = resolve;
+		});
+		textDocumentStore.register(old, async (snapshot, offset, limit) => {
+			enter();
+			await gate;
+			return { ref: snapshot, offset, text: oldText.slice(offset, offset + limit) };
+		});
+		const reading = readCurrentDocumentRange(old.id, 0);
+		await entered;
+		const replacement = { ...old, epoch: "outer-pin-new-epoch", length: newText.length };
+		textDocumentStore.register(replacement, async (snapshot, offset, limit) => ({
+			ref: snapshot,
+			offset,
+			text: newText.slice(offset, offset + limit),
+		}));
+		textDocumentStore.discard(replacement.id, replacement.epoch);
+		resume();
+		expect(await reading).toBe(newText);
+		expect(textDocumentStore.getSnapshot(old.id)).toBeUndefined();
+	});
+
+	test("cancelling an in-flight outer read releases the final pin on a retired source", async () => {
+		const document = ref("outer-pin-cancel", 4);
+		let enter = () => {};
+		let resume = () => {};
+		const entered = new Promise<void>((resolve) => {
+			enter = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			resume = resolve;
+		});
+		textDocumentStore.register(document, async (snapshot, offset) => {
+			enter();
+			await gate;
+			return { ref: snapshot, offset, text: "FULL" };
+		});
+		const releaseOwner = textDocumentStore.retainSource(document.id);
+		const controller = new AbortController();
+		const reading = readCurrentDocumentRange(document.id, 0, undefined, controller.signal);
+		const outcome = reading.then(
+			() => ({ success: true }),
+			(error: Error) => ({ success: false, message: error.message }),
+		);
+		await entered;
+		releaseOwner(true);
+		controller.abort(new Error("copy aborted"));
+		try {
+			expect(await outcome).toEqual({ success: false, message: "copy aborted" });
+			expect(textDocumentStore.getSnapshot(document.id)).toBeUndefined();
+		} finally {
+			resume();
+		}
+	});
+});

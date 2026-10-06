@@ -21,6 +21,7 @@
  * error.
  */
 
+import { textDocumentStore } from "@frontend/lib/text-document-store";
 import type { TextDocumentRangeReader } from "@shared/pretext-layout/text-document";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNarratorWS } from "../../../hooks/useNarratorWS";
@@ -100,6 +101,16 @@ export function useVListStreamingMessage(
 	const ownerRef = useRef(narratorId);
 	const finalizedRef = useRef(new Map<string, number>());
 	const toolStoreRef = useRef(createStreamingToolStore());
+	const documentOwnersRef = useRef(
+		new Map<
+			string,
+			{
+				id: string;
+				epoch: string;
+				release: (discard?: boolean) => void;
+			}
+		>(),
+	);
 	/** Pending output throttle state per tool (latest preview + its timer). */
 	const outputThrottleRef = useRef<
 		Map<
@@ -124,6 +135,36 @@ export function useVListStreamingMessage(
 		});
 	}, []);
 
+	// Pins belong to this streaming surface, not to a mounted body row: a Write
+	// can be collapsed/offscreen while its only source is still arriving.
+	const syncDocumentOwner = useCallback((toolUseId: string, discard = false) => {
+		const previous = documentOwnersRef.current.get(toolUseId);
+		const document = toolStoreRef.current.get(toolUseId)?.textDocument;
+		if (!document) {
+			documentOwnersRef.current.delete(toolUseId);
+			previous?.release(discard);
+			return;
+		}
+		if (previous?.id === document.id && previous.epoch === document.epoch) return;
+		const known = textDocumentStore.getSnapshot(document.id);
+		if (known?.epoch !== document.epoch) return;
+		const release = textDocumentStore.retainSource(document.id);
+		documentOwnersRef.current.set(toolUseId, { id: document.id, epoch: document.epoch, release });
+		previous?.release();
+	}, []);
+	const retireMissingDocuments = useCallback(
+		(discard = false) => {
+			for (const toolUseId of documentOwnersRef.current.keys()) {
+				if (!toolStoreRef.current.has(toolUseId)) syncDocumentOwner(toolUseId, discard);
+			}
+		},
+		[syncDocumentOwner],
+	);
+	const releaseDocuments = useCallback((discard = false) => {
+		for (const owner of documentOwnersRef.current.values()) owner.release(discard);
+		documentOwnersRef.current.clear();
+	}, []);
+
 	const clearOutputTimers = useCallback(() => {
 		for (const state of outputThrottleRef.current.values()) {
 			if (state.timer) clearTimeout(state.timer);
@@ -131,24 +172,28 @@ export function useVListStreamingMessage(
 		outputThrottleRef.current.clear();
 	}, []);
 
-	const clearBlocks = useCallback(() => {
-		if (rafRef.current) {
-			cancelAnimationFrame(rafRef.current);
-			rafRef.current = 0;
-		}
-		clearOutputTimers();
-		finalizedRef.current.clear();
-		identityRef.current = {};
-		liveBlockRef.current = null;
-		snapshotEpochRef.current = undefined;
-		snapshotBlocksRef.current = new WeakSet();
-		const hadContent = blocksRef.current.length > 0 || toolStoreRef.current.size > 0;
-		if (hadContent) {
-			blocksRef.current = [];
-			toolStoreRef.current = createStreamingToolStore();
-			setVersion((value) => value + 1);
-		}
-	}, [clearOutputTimers]);
+	const clearBlocks = useCallback(
+		(discardDocuments = false) => {
+			if (rafRef.current) {
+				cancelAnimationFrame(rafRef.current);
+				rafRef.current = 0;
+			}
+			clearOutputTimers();
+			releaseDocuments(discardDocuments);
+			finalizedRef.current.clear();
+			identityRef.current = {};
+			liveBlockRef.current = null;
+			snapshotEpochRef.current = undefined;
+			snapshotBlocksRef.current = new WeakSet();
+			const hadContent = blocksRef.current.length > 0 || toolStoreRef.current.size > 0;
+			if (hadContent) {
+				blocksRef.current = [];
+				toolStoreRef.current = createStreamingToolStore();
+				setVersion((value) => value + 1);
+			}
+		},
+		[clearOutputTimers, releaseDocuments],
+	);
 
 	// Reset accumulation whenever the target narrator changes or streaming is
 	// disabled (the narrator left the active state, or unmount).
@@ -190,9 +235,10 @@ export function useVListStreamingMessage(
 					isTextDocumentPersisted(chunk.textDocument, persistedDocumentPins),
 			)
 		) {
+			retireMissingDocuments();
 			setVersion((value) => value + 1);
 		}
-	}, [persistedToolUseIds, persistedDocumentPins]);
+	}, [persistedToolUseIds, persistedDocumentPins, retireMissingDocuments]);
 
 	// Final message events seal ids, but only the actual document may release their
 	// raw bodies. A late final/checkpoint cannot clear a newer revision or NEW id.
@@ -409,6 +455,7 @@ export function useVListStreamingMessage(
 								chunk.structuredProgress,
 							) || toolsChanged;
 					}
+					syncDocumentOwner(chunk.toolUseId);
 				}
 				const applied = applyExactStreamingSnapshotUpdate(
 					blocksRef.current,
@@ -443,14 +490,17 @@ export function useVListStreamingMessage(
 				// The owning page receives the reset without a parentToolUseId; the
 				// parent-page duplicate keeps it set and must be ignored here.
 				if (parentToolUseId) return;
-				clearBlocks();
+				clearBlocks(true);
 			},
 			// A replayed attempt abandoned these tool ids mid-arguments. They never
 			// persisted, so the structural hand-off has no replacement to wait for and
 			// would keep the cards spinning forever.
 			onToolUseDiscarded: (toolUseIds, rawParentToolUseId) => {
 				if (!isSubagent && rawParentToolUseId) return;
-				if (dropDiscardedStreamingTools(toolStoreRef.current, toolUseIds)) flush();
+				if (dropDiscardedStreamingTools(toolStoreRef.current, toolUseIds)) {
+					retireMissingDocuments(true);
+					flush();
+				}
 			},
 
 			// ── Native provider blocks ──────────────────────────────────────────
@@ -570,6 +620,7 @@ export function useVListStreamingMessage(
 					})
 				)
 					flush();
+				syncDocumentOwner(toolUseId);
 			},
 			onToolStarted: (
 				toolUseId,
@@ -614,6 +665,7 @@ export function useVListStreamingMessage(
 					})
 				)
 					flush();
+				syncDocumentOwner(toolUseId);
 			},
 			// Execution actually began (permission granted). Separate from onToolStarted,
 			// which only means the input finished parsing — see streaming-tool-chunks.ts.
@@ -650,6 +702,7 @@ export function useVListStreamingMessage(
 					})
 				)
 					flush();
+				syncDocumentOwner(toolUseId);
 			},
 			// Live stdout of a running command. Throttled per tool: a build emitting
 			// megabytes would otherwise re-render the row on every socket frame.

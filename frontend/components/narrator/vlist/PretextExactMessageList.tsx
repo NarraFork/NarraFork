@@ -507,6 +507,14 @@ function isStreamingRowKey(key: string): boolean {
 	return key.startsWith(STREAMING_PLACEHOLDER_ID);
 }
 
+// Cached document readers outlive the pane. Keeping this transport at module
+// scope prevents its closure from retaining React's shared render Context (and
+// therefore setViewportNode, the old Fiber tree and the whole Dockview surface).
+const ensureNarratorWriteSource: WriteDocumentSourceEnsurer = (owner, toolUseId, pin, signal) => {
+	if (!isExactWriteDocumentPin(pin))
+		return Promise.reject(new Error("Exact Write document source identity is missing"));
+	return narratorsApi.ensureWriteDocumentSource(owner, toolUseId, pin, signal);
+};
 export const PretextExactMessageList = memo(
 	forwardRef<MessageListHandle, PretextExactMessageListProps>(
 		function PretextExactMessageList(props, ref) {
@@ -1891,14 +1899,7 @@ export const PretextExactMessageList = memo(
 			}>({ narratorId, requests: [] });
 			const rawTextDocumentRangeReader =
 				dataSource?.fetchTextDocumentRange ?? narratorsApi.readTextDocumentRange;
-			const ensureNarratorWriteSource = useCallback<WriteDocumentSourceEnsurer>(
-				(owner, toolUseId, pin, signal) => {
-					if (!isExactWriteDocumentPin(pin))
-						return Promise.reject(new Error("Exact Write document source identity is missing"));
-					return narratorsApi.ensureWriteDocumentSource(owner, toolUseId, pin, signal);
-				},
-				[],
-			);
+
 			const ensureWriteSource =
 				dataSource?.ensureWriteDocumentSource ??
 				(dataSource?.fetchToolDetail ? undefined : ensureNarratorWriteSource);

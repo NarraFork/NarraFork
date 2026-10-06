@@ -29,11 +29,21 @@ export function recoveringDocumentRangeReader(
 	const active = new Map<string, { localEpoch: string; transport: TextDocumentRef }>();
 	const jobs = new Map<string, Promise<TextDocumentRef>>();
 	const recover: TextDocumentRangeReader = async (local, offset, limit, signal) => {
-		if (retiredEpochs.has(epochKey(local))) throw new DocumentSourceReboundError();
+		const retired = retiredEpochs.has(epochKey(local));
+		if (retired && textDocumentStore.getSnapshot(local.id)?.epoch !== local.epoch)
+			throw new DocumentSourceReboundError();
 		const mapping = active.get(local.id);
 		const transport = mapping?.localEpoch === local.epoch ? mapping.transport : local;
 		let response: Awaited<ReturnType<TextDocumentRangeReader>>;
 		try {
+			if (retired) {
+				// A cached descriptor can outlive its evicted rebound. Do not read
+				// retired bytes, but let the existing exact-pin recovery regenerate it.
+				throw Object.assign(new Error("Document rebound was evicted"), {
+					status: 404,
+					code: "TEXT_DOCUMENT_SOURCE_EXPIRED",
+				});
+			}
 			response = await reader(transport, offset, limit, signal);
 		} catch (error) {
 			const detail = error as {
@@ -118,16 +128,26 @@ export async function readCurrentDocumentRange(
 	end?: number,
 	signal?: AbortSignal,
 ): Promise<string> {
-	for (let attempt = 0; attempt < 3; attempt++) {
-		const before = textDocumentStore.getSnapshot(id);
-		if (!before) throw new Error("Document source is missing");
-		const limit = Math.min(before.length, end ?? before.length);
-		try {
-			const text = await textDocumentStore.readRange(id, Math.min(start, limit), limit, signal);
-			if (textDocumentStore.getSnapshot(id)?.epoch === before.epoch) return text;
-		} catch (error) {
-			if (signal?.aborted || textDocumentStore.getSnapshot(id)?.epoch === before.epoch) throw error;
+	if (!textDocumentStore.getSnapshot(id)) throw new Error("Document source is missing");
+	// The inner read pin ends before its Promise reaches this wrapper. Keep a
+	// logical operation pin through epoch validation/retries, so a concurrent
+	// streaming reset cannot delete a successfully read source in that gap.
+	const release = textDocumentStore.retain(id);
+	try {
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const before = textDocumentStore.getSnapshot(id);
+			if (!before) throw new Error("Document source is missing");
+			const limit = Math.min(before.length, end ?? before.length);
+			try {
+				const text = await textDocumentStore.readRange(id, Math.min(start, limit), limit, signal);
+				if (textDocumentStore.getSnapshot(id)?.epoch === before.epoch) return text;
+			} catch (error) {
+				if (signal?.aborted || textDocumentStore.getSnapshot(id)?.epoch === before.epoch)
+					throw error;
+			}
 		}
+		throw new Error("Document source changed repeatedly while reading");
+	} finally {
+		release();
 	}
-	throw new Error("Document source changed repeatedly while reading");
 }

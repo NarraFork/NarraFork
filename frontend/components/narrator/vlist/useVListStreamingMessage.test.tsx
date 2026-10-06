@@ -1,6 +1,8 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { textDocumentStore } from "@frontend/lib/text-document-store";
 import { MantineProvider } from "@mantine/core";
+import { isTextDocumentRef } from "@shared/pretext-layout/tool-detail";
 import { parseHTML } from "linkedom";
 import { act, useEffect, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
@@ -1010,5 +1012,60 @@ describe("hidden reasoning waiting shimmer through WS / coordinator / DOM", () =
 			},
 			{ keepEmptyReasoningLive: true },
 		);
+	});
+});
+describe("streaming Write source ownership", () => {
+	it("retires a complete local Write on reset without switching narrators", async () => {
+		await withStream(async (h) => {
+			const body = `FIRST${"source-row\n".repeat(5000)}LAST`;
+			await h.frame({
+				type: "tool_started",
+				toolCallId: null,
+				toolUseId: "memory-reset-write",
+				toolName: "Write",
+				input: { file_path: "memory-reset.ts", content: body },
+			});
+			await h.raf();
+			const input = h.live()?.toolCalls?.find((call) => call.toolUseId === "memory-reset-write")
+				?.inputJson as { textDocument?: unknown } | undefined;
+			if (!isTextDocumentRef(input?.textDocument)) throw new Error("Write source missing");
+			const document = input.textDocument;
+			expect(await textDocumentStore.readAll(document.id)).toBe(body);
+			expect(textDocumentStore.stats().sourceOwners).toBeGreaterThan(0);
+			await h.frame({ type: "streaming_reset" });
+			await h.raf();
+			expect(h.live()).toBeNull();
+			expect(textDocumentStore.getSnapshot(document.id)).toBeUndefined();
+		});
+	});
+
+	it("keeps an offscreen incomplete source pinned until an explicit tool discard", async () => {
+		await withStream(async (h) => {
+			const body = "still-streaming-source\n".repeat(500);
+			const document = {
+				id: "memory-offscreen-write",
+				epoch: "memory-offscreen-epoch",
+				revision: 1,
+				length: body.length,
+				complete: false,
+				originKnown: true,
+				source: { narratorId: "handoff-n", toolUseId: "memory-offscreen-tool", field: "content" },
+			};
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: "memory-offscreen-tool",
+				toolName: "Write",
+				inputCharsTotal: body.length,
+				streamingField: { name: "content", delta: body, startsField: true },
+				inputDocument: { ref: document, offset: 0 },
+			});
+			await h.raf();
+			await h.showOnlyKeys([]);
+			textDocumentStore.discard(document.id, document.epoch);
+			expect(await textDocumentStore.readAll(document.id)).toBe(body);
+			await h.frame({ type: "tool_use_discarded", toolUseIds: ["memory-offscreen-tool"] });
+			await h.raf();
+			expect(textDocumentStore.getSnapshot(document.id)).toBeUndefined();
+		});
 	});
 });

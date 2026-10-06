@@ -110,3 +110,14 @@ describe("complete document UI architecture", () => {
 		}
 	});
 });
+describe("document transport closure ownership", () => {
+	test("cached recovery readers use a module-scope ensurer, never a pane hook closure", () => {
+		const source = read("../vlist/PretextExactMessageList.tsx");
+		const component = source.indexOf("export const PretextExactMessageList");
+		const ensurer = source.indexOf("const ensureNarratorWriteSource");
+		expect(component).toBeGreaterThan(0);
+		expect(ensurer).toBeGreaterThan(0);
+		expect(ensurer).toBeLessThan(component);
+		expect(source).not.toMatch(/useCallback\s*<WriteDocumentSourceEnsurer>/);
+	});
+});

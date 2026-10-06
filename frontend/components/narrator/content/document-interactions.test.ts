@@ -174,3 +174,67 @@ describe("document raw-offset interaction", () => {
 		);
 	});
 });
+describe("copy ownership across source retirement", () => {
+	for (const mode of ["writeText", "promised ClipboardItem"] as const) {
+		test(`${mode} finishes a full-source copy when the last streaming owner retires`, async () => {
+			const source = `${"FIRST\r\n\t中文😀".repeat(1000)}LAST`;
+			const ref = {
+				id: `retiring-copy-${mode}`,
+				epoch: "retiring-copy-epoch",
+				revision: 1,
+				length: source.length,
+				complete: true,
+				originKnown: true,
+			};
+			let enter = () => {};
+			let resume = () => {};
+			const entered = new Promise<void>((resolve) => {
+				enter = resolve;
+			});
+			const gate = new Promise<void>((resolve) => {
+				resume = resolve;
+			});
+			textDocumentStore.register(ref, async (snapshot, offset, limit) => {
+				enter();
+				await gate;
+				return { ref: snapshot, offset, text: source.slice(offset, offset + limit) };
+			});
+			const releaseOwner = textDocumentStore.retainSource(ref.id);
+			const copied: string[] = [];
+			class Item {
+				constructor(readonly data: Record<string, Promise<Blob>>) {}
+			}
+			Object.defineProperty(globalThis, "ClipboardItem", {
+				configurable: true,
+				value: mode === "writeText" ? undefined : Item,
+			});
+			Object.defineProperty(globalThis, "navigator", {
+				configurable: true,
+				value: {
+					clipboard:
+						mode === "writeText"
+							? {
+									writeText: async (text: string) => {
+										copied.push(text);
+									},
+								}
+							: {
+									write: async (items: Item[]) => {
+										copied.push(await (await items[0].data["text/plain"]).text());
+									},
+								},
+				},
+			});
+			const copy = copyDocument(ref).then(
+				() => ({ success: true }),
+				(error: unknown) => ({ success: false, error }),
+			);
+			await entered;
+			releaseOwner(true);
+			resume();
+			expect(await copy).toEqual({ success: true });
+			expect(copied).toEqual([source]);
+			expect(textDocumentStore.getSnapshot(ref.id)).toBeUndefined();
+		});
+	}
+});

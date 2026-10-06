@@ -292,3 +292,61 @@ describe("complete Write document lane", () => {
 		expect(await textDocumentStore.readAll(input.textDocument.id)).toBe("real");
 	});
 });
+describe("Write document source retirement", () => {
+	test("reimports the complete original object after its cached source was evicted", async () => {
+		const raw = { content: `FIRST${"中😀\r\n".repeat(5000)}LAST`, file_path: "reopen.ts" };
+		const pin = {
+			toolCallId: "retire-reopen-call",
+			messageId: "retire-reopen-msg",
+			executionAttempt: 1,
+		};
+		const first = documentWriteInput("retire-reopen-n", "write-reopen", raw, pin) as {
+			textDocument: TextDocumentRef;
+		};
+		textDocumentStore.discard(first.textDocument.id, first.textDocument.epoch);
+		expect(textDocumentStore.getSnapshot(first.textDocument.id)).toBeUndefined();
+		const reopened = documentWriteInput(
+			"retire-reopen-n",
+			"write-reopen",
+			raw,
+			pin,
+		) as typeof first;
+		expect(reopened).not.toBe(first);
+		expect(reopened.textDocument.epoch).not.toBe(first.textDocument.epoch);
+		expect(await textDocumentStore.readAll(reopened.textDocument.id)).toBe(raw.content);
+		expect(await textDocumentStore.search(reopened.textDocument.id, "LAST")).toEqual({
+			start: raw.content.length - 4,
+			end: raw.content.length,
+		});
+	});
+
+	test("an evicted renderer preview is not imported as a complete replacement", () => {
+		const raw = {
+			content: `HEAD${"real-full-source\n".repeat(1500)}TAIL`,
+			file_path: "preview.ts",
+		};
+		const pin = {
+			toolCallId: "retire-preview-call",
+			messageId: "retire-preview-msg",
+			executionAttempt: 2,
+		};
+		const normalized = documentWriteInput("retire-preview-n", "write-preview", raw, pin) as {
+			content: string;
+			textDocument: TextDocumentRef;
+		};
+		expect(normalized.content.length).toBeLessThan(raw.content.length);
+		textDocumentStore.discard(normalized.textDocument.id, normalized.textDocument.epoch);
+		const missing = documentWriteInput("retire-preview-n", "write-preview", normalized, pin) as {
+			textDocument?: TextDocumentRef;
+			textDocumentSource?: unknown;
+		};
+		expect(missing.textDocument).toBeUndefined();
+		expect(missing.textDocumentSource).toMatchObject({
+			narratorId: "retire-preview-n",
+			toolUseId: "write-preview",
+			field: "content",
+			...pin,
+		});
+		expect(textDocumentStore.getSnapshot(normalized.textDocument.id)).toBeUndefined();
+	});
+});
