@@ -15,6 +15,7 @@ import { FileWorktreeJournal } from "./narrator-worktree-journal";
 import {
 	boundWorktreeGitResult,
 	NarratorWorktreeService,
+	parseLegacyWorktreePorcelain,
 	parseWorktreePorcelain,
 	WORKTREE_MAX_ENTRIES,
 	WORKTREE_MAX_OUTPUT_BYTES,
@@ -126,6 +127,421 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	await rm(temporary, { recursive: true, force: true });
+});
+
+const unsupportedZ = {
+	stdout: "",
+	stderr: "error: unknown switch `z'\nusage: git worktree list [<options>]\n",
+	exitCode: 129,
+};
+
+/** Match Git 2.34's raw line-separated paths, including paths newer Git would quote. */
+function emulateLegacyGit() {
+	const run = ports.runGit;
+	const listCalls: string[][] = [];
+	ports.runGit = async (workspace, args, abort, writing) => {
+		if (!run) throw new Error("Missing fixture runner");
+		if (args[0] !== "worktree" || args[1] !== "list") return run(workspace, args, abort, writing);
+		listCalls.push(args);
+		if (args.includes("-z")) return unsupportedZ;
+		const result = await run(workspace, [...args, "-z"], abort, writing);
+		return { ...result, stdout: result.stdout.replaceAll("\0", "\n") };
+	};
+	return listCalls;
+}
+
+describe("legacy Git worktree compatibility", () => {
+	test("new Git keeps the NUL-delimited command without a fallback", async () => {
+		const run = ports.runGit;
+		const listCalls: string[][] = [];
+		ports.runGit = async (workspace, args, abort, writing) => {
+			if (!run) throw new Error("Missing fixture runner");
+			if (args[0] === "worktree" && args[1] === "list") listCalls.push(args);
+			return run(workspace, args, abort, writing);
+		};
+		const listed = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		expect(listed.truncated).toBe(false);
+		expect(listCalls).toEqual([["worktree", "list", "--porcelain", "-z"]]);
+	});
+
+	test("Git 2.34 lists raw Unicode, spaces, quotes and backslashes with no write permission", async () => {
+		const path = join(source, ".worktrees", '中文 space "quote" \\literal');
+		await git(["worktree", "add", "-b", "feature/中文", path]);
+		target.workspace.capabilities.write = false;
+		const calls = emulateLegacyGit();
+		const result = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		expect(result.truncated).toBe(false);
+		expect(result.entries.find((entry) => entry.path === path)?.branch).toBe(
+			"refs/heads/feature/中文",
+		);
+		expect(result.capabilities.create).toBe(false);
+		expect(calls).toEqual([
+			["worktree", "list", "--porcelain", "-z"],
+			["worktree", "list", "--porcelain"],
+		]);
+		expect(writes).toBe(0);
+	});
+
+	test("Git 2.34 creates once and reconciles the same request without another add", async () => {
+		emulateLegacyGit();
+		const request = proposal();
+		expect((await service.create("actor", "narrator", request, signal())).outcome).toBe("created");
+		expect((await service.create("actor", "narrator", request, signal())).outcome).toBe("created");
+		expect(writes).toBe(1);
+		expect(await git(["branch", "--list", "feature"])).toContain("feature");
+	});
+
+	test("Git 2.34 still rejects a branch already checked out without dispatching add", async () => {
+		emulateLegacyGit();
+		const request = proposal("checked-out", "main", "existing");
+		expect((await service.create("actor", "narrator", request, signal())).outcome).toBe("failed");
+		expect(writes).toBe(0);
+	});
+
+	test("new Git handles newline paths, while raw legacy newline paths fail closed", async () => {
+		const path = join(source, ".worktrees", "line\nsecond");
+		await git(["worktree", "add", "-b", "newline-path", path]);
+		const modern = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		expect(modern.truncated).toBe(false);
+		expect(modern.entries.some((entry) => entry.path === path)).toBe(true);
+		emulateLegacyGit();
+		const legacy = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		expect(legacy.truncated).toBe(true);
+		expect((await service.create("actor", "narrator", proposal(), signal())).outcome).toBe(
+			"failed",
+		);
+		expect(writes).toBe(0);
+	});
+
+	test("a real path embedding complete fake records is never trusted by the legacy fallback", async () => {
+		const head = await git(["rev-parse", "HEAD"]);
+		const fake = join(source, ".worktrees", "fake");
+		const path = join(
+			source,
+			".worktrees",
+			`real\nHEAD ${head}\nbranch refs/heads/injected\n\nworktree ${fake}`,
+		);
+		await git(["worktree", "add", "-b", "actual", path]);
+		const modern = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		expect(modern.truncated).toBe(false);
+		expect(modern.entries.some((entry) => entry.path === path)).toBe(true);
+		emulateLegacyGit();
+		const legacy = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		expect(legacy).toMatchObject({ entries: [], truncated: true });
+		expect((await service.create("actor", "narrator", proposal(), signal())).outcome).toBe(
+			"failed",
+		);
+		expect(writes).toBe(0);
+	});
+
+	test("legacy fallback preserves registrations whose prunable target no longer exists", async () => {
+		const path = join(source, ".worktrees", "missing");
+		await git(["worktree", "add", "-b", "missing", path]);
+		await rm(path, { recursive: true, force: true });
+		emulateLegacyGit();
+		const result = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		expect(result.truncated).toBe(false);
+		expect(result.entries.find((entry) => entry.path === path)).toMatchObject({ prunable: true });
+		expect((await service.create("actor", "narrator", proposal(), signal())).outcome).toBe(
+			"created",
+		);
+		expect(writes).toBe(1);
+	});
+
+	test("legacy verification reads the common registration inventory when invoked from a linked worktree", async () => {
+		const path = join(source, ".worktrees", "linked-source");
+		await git(["worktree", "add", "-b", "linked-source", path]);
+		target.workspace.rootPath = path;
+		target.workspace.cwd = path;
+		emulateLegacyGit();
+		const result = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		expect(result.truncated).toBe(false);
+		expect(result.entries.map((entry) => entry.path).sort()).toEqual([source, path].sort());
+	});
+
+	test("legacy verification supports linked worktrees backed by a bare common repository", async () => {
+		const bare = join(temporary, "bare.git");
+		const path = join(temporary, "bare-linked");
+		await git(["clone", "--bare", source, bare]);
+		await git(["worktree", "add", "-b", "bare-linked", path], bare);
+		target.workspace.rootPath = path;
+		target.workspace.cwd = path;
+		target.repositoryPath = bare;
+		emulateLegacyGit();
+		const result = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		expect(result.truncated).toBe(false);
+		expect(result.entries.map((entry) => entry.path).sort()).toEqual([bare, path].sort());
+	});
+
+	test("missing, symlinked or oversized registration evidence returns no paths and permits no add", async () => {
+		const path = join(source, ".worktrees", "registered");
+		await git(["worktree", "add", "-b", "registered", path]);
+		const pointer = join(source, ".git", "worktrees", "registered", "gitdir");
+		const original = await readFile(pointer, "utf8");
+		const external = join(temporary, "external-pointer");
+		await writeFile(external, original);
+		emulateLegacyGit();
+		for (const mode of ["missing", "symlink", "oversized"] as const) {
+			await rm(pointer, { force: true });
+			if (mode === "symlink") await symlink(external, pointer);
+			if (mode === "oversized") await writeFile(pointer, "x".repeat(16 * 1024 + 1));
+			const result = await service.list(
+				"actor",
+				"narrator",
+				{ workspaceKey: "workspace" },
+				signal(),
+			);
+			expect(result).toMatchObject({ entries: [], truncated: true });
+			expect(
+				(await service.create("actor", "narrator", proposal(`evidence-${mode}`), signal())).outcome,
+			).toBe("failed");
+			await rm(pointer, { force: true });
+			await writeFile(pointer, original);
+		}
+		expect(writes).toBe(0);
+		expect(await readFile(external, "utf8")).toBe(original);
+	});
+
+	test("legacy metadata enumeration is capped and cannot certify an incomplete set", async () => {
+		const directory = join(source, ".git", "worktrees");
+		await mkdir(directory);
+		for (let i = 0; i < WORKTREE_MAX_ENTRIES; i++) {
+			const entry = join(directory, `registration-${i}`);
+			await mkdir(entry);
+			await writeFile(
+				join(entry, "gitdir"),
+				`${join(source, ".worktrees", `registered-${i}`, ".git")}\n`,
+			);
+		}
+		const run = ports.runGit;
+		ports.runGit = async (workspace, args, abort, writing) => {
+			if (!run) throw new Error("Missing fixture runner");
+			if (args[0] !== "worktree" || args[1] !== "list") return run(workspace, args, abort, writing);
+			return args.includes("-z")
+				? unsupportedZ
+				: {
+						stdout: `worktree ${source}\nHEAD ${await git(["rev-parse", "HEAD"])}\nbranch refs/heads/main\n\n`,
+						stderr: "",
+						exitCode: 0,
+					};
+		};
+		expect(
+			await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal()),
+		).toMatchObject({ entries: [], truncated: true });
+		expect((await service.create("actor", "narrator", proposal(), signal())).outcome).toBe(
+			"failed",
+		);
+		expect(writes).toBe(0);
+	});
+
+	test("legacy verification bounds aggregate registration bytes, not only each individual file", async () => {
+		const directory = join(source, ".git", "worktrees");
+		await mkdir(directory);
+		for (let i = 0; i < 9; i++) {
+			const entry = join(directory, `large-${i}`);
+			await mkdir(entry);
+			await writeFile(join(entry, "gitdir"), `/${i}${"x".repeat(16 * 1024 - 16)}/.git\n`);
+		}
+		const run = ports.runGit;
+		const head = await git(["rev-parse", "HEAD"]);
+		ports.runGit = async (workspace, args, abort, writing) => {
+			if (!run) throw new Error("Missing fixture runner");
+			if (args[0] !== "worktree" || args[1] !== "list") return run(workspace, args, abort, writing);
+			return args.includes("-z")
+				? unsupportedZ
+				: {
+						stdout: `worktree ${source}\nHEAD ${head}\nbranch refs/heads/main\n\n`,
+						stderr: "",
+						exitCode: 0,
+					};
+		};
+		expect(
+			await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal()),
+		).toMatchObject({ entries: [], truncated: true });
+		expect((await service.create("actor", "narrator", proposal(), signal())).outcome).toBe(
+			"failed",
+		);
+		expect(writes).toBe(0);
+	});
+
+	test("a metadata/text inventory mismatch cannot authorize creation or show an unregistered path", async () => {
+		emulateLegacyGit();
+		const run = ports.runGit;
+		ports.runGit = async (workspace, args, abort, writing) => {
+			if (!run) throw new Error("Missing fixture runner");
+			const result = await run(workspace, args, abort, writing);
+			if (args[0] !== "worktree" || args[1] !== "list" || args.includes("-z")) return result;
+			return { ...result, stdout: result.stdout.replace(source, join(source, "unregistered")) };
+		};
+		expect(
+			await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal()),
+		).toMatchObject({ entries: [], truncated: true });
+		expect((await service.create("actor", "narrator", proposal(), signal())).outcome).toBe(
+			"failed",
+		);
+		expect(writes).toBe(0);
+	});
+
+	test("legacy verification propagates cancellation instead of converting it to an incomplete list", async () => {
+		const run = ports.runGit;
+		const controller = new AbortController();
+		ports.runGit = async (workspace, args, abort, writing) => {
+			if (!run) throw new Error("Missing fixture runner");
+			if (args[0] !== "worktree" || args[1] !== "list") return run(workspace, args, abort, writing);
+			if (args.includes("-z")) return unsupportedZ;
+			const result = await run(workspace, [...args, "-z"], abort, writing);
+			setTimeout(() => controller.abort(new Error("Registration verification cancelled")), 0);
+			return { ...result, stdout: result.stdout.replaceAll("\0", "\n") };
+		};
+		await expect(
+			service.list("actor", "narrator", { workspaceKey: "workspace" }, controller.signal),
+		).rejects.toThrow("Registration verification cancelled");
+		expect(writes).toBe(0);
+	});
+
+	test("legacy parser cannot certify unverified, forged, duplicate or newline-containing registration sets", () => {
+		const head = "a".repeat(40);
+		const path = `/repo/real\nHEAD ${head}\nbranch refs/heads/injected\n\nworktree /repo/fake`;
+		const forged = `worktree ${path}\nHEAD ${head}\nbranch refs/heads/actual\n\n`;
+		expect(parseLegacyWorktreePorcelain(forged)).toEqual({ entries: [], truncated: true });
+		expect(parseLegacyWorktreePorcelain(forged, false, [path])).toEqual({
+			entries: [],
+			truncated: true,
+		});
+		const valid = `worktree /repo\nHEAD ${head}\nbranch refs/heads/main\n\n`;
+		for (const paths of [["/other"], ["/repo", "/repo"], ["/repo\nHEAD injected"]])
+			expect(parseLegacyWorktreePorcelain(valid, false, paths)).toEqual({
+				entries: [],
+				truncated: true,
+			});
+		expect(parseLegacyWorktreePorcelain(valid, false, ["/repo"]).truncated).toBe(false);
+	});
+
+	test("ordinary Git failures and truncated unsupported diagnostics never trigger a fallback", async () => {
+		for (const failure of [
+			{ stdout: "", stderr: "fatal: Permission denied", exitCode: 128 },
+			{ ...unsupportedZ, stderr: "error: unknown switch `x'" },
+			{ ...unsupportedZ, stderrTruncated: true },
+		]) {
+			let calls = 0;
+			ports.runGit = async () => {
+				calls++;
+				return failure;
+			};
+			await expect(
+				service.list("actor", "narrator", { workspaceKey: "workspace" }, signal()),
+			).rejects.toMatchObject({ code: "WORKTREE_LIST_FAILED" });
+			expect(calls).toBe(1);
+		}
+		expect(writes).toBe(0);
+	});
+
+	test("failed fallback reports the actual bounded error, not the unsupported option", async () => {
+		let calls = 0;
+		ports.runGit = async () => {
+			calls++;
+			return calls === 1
+				? unsupportedZ
+				: {
+						stdout: "",
+						stderr: `fatal: repository unavailable\n${"x".repeat(2000)}`,
+						exitCode: 128,
+					};
+		};
+		try {
+			await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+			throw new Error("Expected Git failure");
+		} catch (error) {
+			expect(error).toBeInstanceOf(AppError);
+			const failure = error as AppError;
+			expect(failure.code).toBe("WORKTREE_LIST_FAILED");
+			expect(failure.message).toContain("fatal: repository unavailable");
+			expect(failure.message).not.toContain("unknown switch");
+			expect(failure.message.length).toBeLessThan(560);
+			expect(failure.message).not.toContain("\n");
+		}
+		expect(calls).toBe(2);
+	});
+
+	test("cancellation between the unsupported option and fallback launches no second command", async () => {
+		const controller = new AbortController();
+		let calls = 0;
+		ports.runGit = async () => {
+			calls++;
+			controller.abort(new Error("Cancelled"));
+			return unsupportedZ;
+		};
+		await expect(
+			service.list("actor", "narrator", { workspaceKey: "workspace" }, controller.signal),
+		).rejects.toThrow("Cancelled");
+		expect(calls).toBe(1);
+	});
+
+	test("a truncated or ambiguous legacy inventory never permits worktree creation", async () => {
+		const legacy = emulateLegacyGit();
+		const run = ports.runGit;
+		for (const mode of ["stdout", "stderr", "partial", "newline-path"] as const) {
+			ports.runGit = async (workspace, args, abort, writing) => {
+				if (!run) throw new Error("Missing fixture runner");
+				const result = await run(workspace, args, abort, writing);
+				if (args[0] !== "worktree" || args[1] !== "list" || args.includes("-z")) return result;
+				if (mode === "stdout") return { ...result, stdoutTruncated: true };
+				if (mode === "stderr") return { ...result, stderrTruncated: true };
+				if (mode === "partial") return { ...result, stdout: result.stdout.slice(0, -1) };
+				return { ...result, stdout: result.stdout.replace(source, `${source}\nambiguous`) };
+			};
+			expect(
+				(await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal()))
+					.truncated,
+			).toBe(true);
+			expect(
+				(await service.create("actor", "narrator", proposal(`bad-${mode}`), signal())).outcome,
+			).toBe("failed");
+		}
+		expect(legacy.length).toBeGreaterThan(0);
+		expect(writes).toBe(0);
+	});
+
+	test("legacy parsing preserves raw paths and recognizes bare, detached, locked and prunable", () => {
+		const head = "a".repeat(40);
+		const path = '/repo/中文 space "quote" \\123\ttab ';
+		const result = parseLegacyWorktreePorcelain(
+			`worktree ${path}\nHEAD ${head}\ndetached\nlocked "reason\\nquoted"\nprunable gitdir file points to non-existent location\n\nworktree /bare\nbare\n\n`,
+			false,
+			[path, "/bare"],
+		);
+		expect(result.truncated).toBe(false);
+		expect(result.entries[0]).toMatchObject({
+			path,
+			head,
+			detached: true,
+			locked: true,
+			prunable: true,
+		});
+		expect(result.entries[1]).toMatchObject({ path: "/bare", head: null });
+	});
+
+	test("legacy parsing rejects incomplete records, duplicate fields, NULs and ambiguous newlines", () => {
+		const head = "a".repeat(40);
+		for (const output of [
+			`worktree /partial\nHEAD ${head}\n`,
+			"worktree /partial\n\n",
+			`worktree /bad\nHEAD ${head}\nHEAD ${head}\n\n`,
+			`worktree /bad\nHEAD ${head}\nbranch refs/heads/a\ndetached\n\n`,
+			`worktree /bad\nHEAD invalid\n\n`,
+			`worktree /bad\0path\nHEAD ${head}\n\n`,
+			`worktree /bad\npath\nHEAD ${head}\n\n`,
+			`worktree /bad\nlocked injected\nHEAD ${head}\n\n`,
+			`worktree /bad\nprunable injected\nHEAD ${head}\n\n`,
+		]) {
+			expect(parseLegacyWorktreePorcelain(output)).toEqual({ entries: [], truncated: true });
+		}
+		const output = Array.from(
+			{ length: WORKTREE_MAX_ENTRIES + 1 },
+			(_, i) => `worktree /repo/${i}\nHEAD ${head}\nbranch refs/heads/a${i}\n\n`,
+		).join("");
+		expect(parseLegacyWorktreePorcelain(output)).toEqual({ entries: [], truncated: true });
+	});
 });
 
 describe("local worktree list/create fixtures", () => {

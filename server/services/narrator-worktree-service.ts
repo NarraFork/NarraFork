@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
-import { access, lstat } from "node:fs/promises";
+import { access, lstat, open, opendir, realpath } from "node:fs/promises";
 import type { GitWorkspace } from "@shared/git-workspace";
 import type { WorktreeListResult, WorktreePrepareResult } from "@shared/narrator-worktrees";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
@@ -149,6 +149,192 @@ export function parseWorktreePorcelain(
 	return { entries, truncated: truncated || entry !== null };
 }
 
+/** Old Git prints paths verbatim. Grammar alone cannot distinguish embedded fake records.
+ * Only an exact match to independently read registration paths can certify completeness. */
+export function parseLegacyWorktreePorcelain(
+	output: string,
+	truncated = false,
+	registeredPaths?: readonly string[],
+	pathKey: (path: string) => string = (path) => path,
+): ReturnType<typeof parseWorktreePorcelain> {
+	const entries: WorktreeEntry[] = [];
+	const incomplete = { entries: [] as WorktreeEntry[], truncated: true };
+	let entry: WorktreeEntry | null = null;
+	let hasHead = false;
+	let bare = false;
+	let hasBranch = false;
+	const fields = output.split("\n");
+	// The final split token is an end-of-line terminator, not a record separator.
+	if (fields.at(-1) === "") fields.pop();
+	for (const field of fields) {
+		if (field === "") {
+			if (entry) {
+				if ((!hasHead && !bare) || entries.length === WORKTREE_MAX_ENTRIES) return incomplete;
+				entries.push(entry);
+				entry = null;
+			}
+			continue;
+		}
+		if (field.startsWith("worktree ")) {
+			const path = field.slice(9);
+			if (entry || !path || path.length > 4096 || path.includes("\0") || path.includes("\r"))
+				return incomplete;
+			entry = { path, head: null, branch: null, detached: false, locked: false, prunable: false };
+			hasHead = false;
+			bare = false;
+			hasBranch = false;
+		} else if (!entry || field.includes("\0")) {
+			return incomplete;
+		} else if (/^HEAD (?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/.test(field) && !hasHead && !bare) {
+			entry.head = field.slice(5);
+			hasHead = true;
+		} else if (
+			field.startsWith("branch refs/") &&
+			field.length <= 512 &&
+			!/\s/.test(field.slice(7)) &&
+			!hasControlCharacters(field.slice(7)) &&
+			hasHead &&
+			!hasBranch &&
+			!entry.detached
+		) {
+			entry.branch = field.slice(7);
+			hasBranch = true;
+		} else if (field === "detached" && hasHead && !hasBranch && !entry.detached) {
+			entry.detached = true;
+		} else if (field === "bare" && !hasHead && !bare) {
+			bare = true;
+		} else if (
+			(field === "locked" || field.startsWith("locked ")) &&
+			(hasHead || bare) &&
+			!entry.locked
+		) {
+			entry.locked = true;
+		} else if (
+			(field === "prunable" || field.startsWith("prunable ")) &&
+			(hasHead || bare) &&
+			!entry.prunable
+		) {
+			entry.prunable = true;
+		} else {
+			return incomplete;
+		}
+	}
+	if (truncated || entry !== null || !output.endsWith("\n\n") || !registeredPaths)
+		return incomplete;
+	// Reject newlines in raw registrations before comparing platform-specific path identities.
+	const registered = new Set(registeredPaths.map(pathKey));
+	if (
+		registered.size !== registeredPaths.length ||
+		entries.length !== registered.size ||
+		registeredPaths.some((path) => /[\r\n]/.test(path) || path.includes("\0"))
+	)
+		return incomplete;
+	for (const entry of entries) {
+		if (!registered.delete(pathKey(entry.path))) return incomplete;
+	}
+	return { entries, truncated: false };
+}
+
+function worktreeListError(result: SafeSpawnResult): never {
+	const detail = result.stderr
+		.slice(0, 512)
+		.replace(/\p{Cc}/gu, " ")
+		.trim();
+	error("WORKTREE_LIST_FAILED", `Unable to list Git worktrees${detail ? `: ${detail}` : ""}`, 409);
+}
+
+/** Read only the already-authorized common Git directory, never the worktrees themselves.
+ * Git 2.34's main path is the common directory with a trailing /.git removed; linked
+ * paths are recorded verbatim in worktrees/<id>/gitdir (including prunable targets). */
+async function readLegacyRegisteredPaths(
+	target: WorktreeTarget,
+	signal: AbortSignal,
+): Promise<string[]> {
+	const paths = target.backend?.paths;
+	const common = target.repositoryPath;
+	if (!paths || !common || /[\r\n]/.test(common) || common.includes("\0"))
+		throw new Error("Invalid legacy Git common directory");
+	const registered = [paths.basename(common) === ".git" ? paths.dirname(common) : common];
+	const directoryPath = paths.resolve(common, "worktrees");
+	signal.throwIfAborted();
+	const info = await lstat(directoryPath).catch((cause) => {
+		if ((cause as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw cause;
+	});
+	signal.throwIfAborted();
+	if (!info) return registered;
+	if (
+		!info.isDirectory() ||
+		info.isSymbolicLink() ||
+		!paths.equals(await realpath(directoryPath), directoryPath)
+	)
+		throw new Error("Unsafe legacy Git registration directory");
+	signal.throwIfAborted();
+	const directory = await opendir(directoryPath);
+	try {
+		let count = 0;
+		let totalBytes = 0;
+		while (true) {
+			signal.throwIfAborted();
+			const item = await directory.read();
+			signal.throwIfAborted();
+			if (!item) break;
+			if (++count >= WORKTREE_MAX_ENTRIES || !item.isDirectory() || item.isSymbolicLink())
+				throw new Error("Incomplete legacy Git registration inventory");
+			const adminPath = paths.resolve(directoryPath, item.name);
+			if (!paths.equals(await realpath(adminPath), adminPath))
+				throw new Error("Unsafe legacy Git registration entry");
+			signal.throwIfAborted();
+			const pointerPath = paths.resolve(adminPath, "gitdir");
+			const pointerInfo = await lstat(pointerPath);
+			signal.throwIfAborted();
+			if (!pointerInfo.isFile() || pointerInfo.isSymbolicLink())
+				throw new Error("Unsafe legacy Git registration file");
+			// Bound reads; the lstat check also rejects symlinks on platforms without NOFOLLOW.
+			const file = await open(
+				pointerPath,
+				constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+			);
+			try {
+				signal.throwIfAborted();
+				const stat = await file.stat();
+				signal.throwIfAborted();
+				if (
+					!stat.isFile() ||
+					stat.dev !== pointerInfo.dev ||
+					stat.ino !== pointerInfo.ino ||
+					stat.size <= 0 ||
+					stat.size > 16 * 1024 ||
+					totalBytes + stat.size > WORKTREE_MAX_OUTPUT_BYTES
+				)
+					throw new Error("Oversized or invalid legacy Git registration file");
+				const bytes = new Uint8Array(stat.size + 1);
+				const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+				signal.throwIfAborted();
+				if (bytesRead !== stat.size) throw new Error("Legacy Git registration changed during read");
+				totalBytes += bytesRead;
+				// Remove only the file terminator, NOT embedded newlines in the pathname.
+				const pointer = new TextDecoder("utf-8", { fatal: true })
+					.decode(bytes.subarray(0, bytesRead))
+					.replace(/\r?\n$/, "");
+				if (
+					!paths.isAbsolute(pointer) ||
+					paths.basename(pointer) !== ".git" ||
+					/[\r\n]/.test(pointer) ||
+					pointer.includes("\0")
+				)
+					throw new Error("Ambiguous legacy Git worktree registration path");
+				registered.push(paths.dirname(pointer));
+			} finally {
+				await file.close();
+			}
+		}
+		return registered;
+	} finally {
+		await directory.close();
+	}
+}
+
 function error(code: string, message: string, status = 400): never {
 	throw new AppError(message, status, code);
 }
@@ -201,6 +387,8 @@ export class NarratorWorktreeService<Principal> {
 					killProcessTree: true,
 					env: {
 						...process.env,
+						// Keep the unsupported-option diagnostic stable across server locales.
+						LC_ALL: "C",
 						GIT_DIR: undefined,
 						GIT_COMMON_DIR: undefined,
 						GIT_WORK_TREE: undefined,
@@ -211,9 +399,64 @@ export class NarratorWorktreeService<Principal> {
 		return boundWorktreeGitResult(result);
 	}
 
+	private async legacyEntries(
+		target: WorktreeTarget,
+		result: SafeSpawnResult,
+		signal: AbortSignal,
+	): Promise<ReturnType<typeof parseWorktreePorcelain>> {
+		const incomplete = { entries: [] as WorktreeEntry[], truncated: true };
+		if (result.stdoutTruncated || result.stderrTruncated) return incomplete;
+		const limited = AbortSignal.any([signal, AbortSignal.timeout(WORKTREE_READ_TIMEOUT_MS)]);
+		const started = performance.now();
+		let abort: (() => void) | undefined;
+		try {
+			limited.throwIfAborted();
+			const cancelled = new Promise<never>((_resolve, reject) => {
+				abort = () => reject(limited.reason);
+				limited.addEventListener("abort", abort, { once: true });
+				if (limited.aborted) abort();
+			});
+			// Cancellation bounds the caller's wait. Pending async FS calls drain and close their
+			// handles in finally; the scan checks limited before launching each subsequent read.
+			const registered = await Promise.race([
+				readLegacyRegisteredPaths(target, limited),
+				cancelled,
+			]);
+			limited.throwIfAborted();
+			return parseLegacyWorktreePorcelain(
+				result.stdout,
+				false,
+				registered,
+				target.backend?.paths.identityKey,
+			);
+		} catch (cause) {
+			signal.throwIfAborted();
+			logger.warn("Unable to verify legacy Git worktree registrations", {
+				reason: String(cause).slice(0, 256),
+			});
+			return incomplete;
+		} finally {
+			if (abort) limited.removeEventListener("abort", abort);
+			const elapsedMs = Math.round(performance.now() - started);
+			if (elapsedMs >= 1000)
+				logger.warn("Slow legacy Git registration verification", { elapsedMs });
+		}
+	}
 	private async entries(target: WorktreeTarget, signal: AbortSignal) {
-		const result = await this.run(target, ["worktree", "list", "--porcelain", "-z"], signal);
-		if (result.exitCode !== 0) error("WORKTREE_LIST_FAILED", "Unable to list Git worktrees", 409);
+		let result = await this.run(target, ["worktree", "list", "--porcelain", "-z"], signal);
+		let legacy = false;
+		// Retry only an explicit unsupported -z diagnostic, never an ordinary Git failure.
+		// No capability cache: a server can change/upgrade its Git executable while running.
+		if (
+			result.exitCode !== 0 &&
+			!result.stderrTruncated &&
+			/^error: unknown (?:switch|option) [`'"]z['"`]\r?$/m.test(result.stderr)
+		) {
+			legacy = true;
+			result = await this.run(target, ["worktree", "list", "--porcelain"], signal);
+		}
+		if (result.exitCode !== 0) worktreeListError(result);
+		if (legacy) return this.legacyEntries(target, result, signal);
 		return parseWorktreePorcelain(
 			result.stdout,
 			!!(result.stdoutTruncated || result.stderrTruncated),
