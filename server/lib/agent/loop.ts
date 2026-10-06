@@ -4296,15 +4296,16 @@ async function* agentLoopInMetadataSnapshot(
 						requestDump,
 						resetUpstreamSession,
 						onRequestStart: markRequestStarted,
-						onInputCharacters: (counts) => {
+						onInputCharacters: async (counts) => {
 							inputCharacters = validInputCharacters(counts);
 							try {
 								inputComposition =
-									config.freezeContextComposition?.(
+									(await config.freezeContextComposition?.(
 										inputCharacters,
 										requestId,
 										new Date(requestStartTime || Date.now()).toISOString(),
-									) ?? null;
+										attemptAbort.signal,
+									)) ?? null;
 							} catch {
 								inputComposition = null;
 							}

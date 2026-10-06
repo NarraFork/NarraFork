@@ -7,13 +7,15 @@ import { type AgentConfig, type AgentEvent, ApiError } from "../types";
 let attempts: Array<Array<ParsedStreamEvent | Error>> = [];
 let attempt = 0;
 let inputPlans: Array<ContextInputCharacters | null> = [];
+let requestReadyObserver: (() => void) | undefined;
 const model = "claude-sonnet-4-20250514";
 const adapter: ProviderAdapter = {
 	formatTools: (tools) => tools,
 	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
-		params.onInputCharacters?.(inputPlans[attempt] ?? null);
+		await params.onInputCharacters?.(inputPlans[attempt] ?? null);
+		requestReadyObserver?.();
 		params.onRequestStart?.();
 		for (const event of attempts[attempt++] ?? []) {
 			if (event instanceof Error) throw event;
@@ -334,4 +336,53 @@ describe("independent upstream context occupancy", () => {
 		expect(ends[1]?.usage).toMatchObject(measured.usage);
 		expect(contexts.at(-1)?.isEstimated).toBe(false);
 	});
+});
+
+test("loop awaits request numeric preparation and binds its pin before consuming response events", async () => {
+	inputPlans = [{ totalChars: 1000, systemChars: 100, toolsChars: 10 }];
+	let release!: () => void;
+	let entered!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const ready = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	let sent = false;
+	requestReadyObserver = () => {
+		sent = true;
+	};
+	try {
+		const running = runWithConfig(
+			{
+				freezeContextComposition: async (counts, requestId, _startedAt, signal) => {
+					expect(counts?.totalChars).toBe(1000);
+					expect(signal.aborted).toBe(false);
+					entered();
+					await gate;
+					return {
+						generation: requestId,
+						revision: "prepared",
+						pageCount: 0,
+						totalChars: 200,
+						totals: [{ category: "user", chars: 200 }],
+					};
+				},
+			},
+			[text],
+		);
+		await ready;
+		expect(sent).toBe(false);
+		release();
+		const { ends, contexts } = await running;
+		expect(sent).toBe(true);
+		expect(ends.at(-1)?.contextSnapshot?.composition?.totalChars).toBe(200);
+		expect(ends.at(-1)?.contextSnapshot?.composition?.generation).toBe(ends.at(-1)?.requestId);
+		expect(contexts.at(-1)?.snapshot?.composition).toEqual(
+			ends.at(-1)?.contextSnapshot?.composition,
+		);
+	} finally {
+		release();
+		requestReadyObserver = undefined;
+	}
 });

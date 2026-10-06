@@ -92,8 +92,8 @@ export interface ChatParams extends ProtocolChatParams {
 	 * paths that completed without ever contacting the API.
 	 */
 	onRequestStart?: (info?: { credentialId?: string }) => void;
-	/** Complete final logical input counts; null when counting is unavailable or exceeds budget. */
-	onInputCharacters?: (counts: ContextInputCharacters | null) => void;
+	/** Complete final input counts; await bounded numeric preparation before sending/consuming output. */
+	onInputCharacters?: (counts: ContextInputCharacters | null) => void | Promise<void>;
 }
 
 export interface GenerateOptions {

@@ -15,7 +15,11 @@ import {
 import { eq } from "drizzle-orm";
 import { activeDatabaseBackend, db, sqlite } from "../db";
 import { narrators } from "../db/schema";
-import { hasPendingContextCharacterRefresh } from "../lib/context-characters";
+import {
+	hasPendingContextCharacterRefresh,
+	observeContextCharacterWrites,
+	pendingContextCharacterWrites,
+} from "../lib/context-characters";
 import {
 	boundedContextSnapshot,
 	parseContextSnapshot,
@@ -48,6 +52,8 @@ export type ContextRebuildMetrics = {
 };
 
 const CONTEXT_REBUILD_BUDGET_MS = 10 * 60 * 1000;
+const REQUEST_PREPARATION_BUDGET_MS = 2_000;
+const MAX_REQUEST_PREPARATIONS = 32;
 class ContextRevisionChanged extends Error {}
 class ContextActorRemoved extends Error {}
 function profileOf(meta: Metadata): "primary" | "subagent" {
@@ -104,12 +110,15 @@ export function createContextCharacterService(
 	options: {
 		budgetMs?: number;
 		debounceMs?: number;
+		preparationBudgetMs?: number;
 		onMetrics?: (metrics: ContextRebuildMetrics) => void;
 	} = {},
 ) {
 	const budgetMs = options.budgetMs ?? CONTEXT_REBUILD_BUDGET_MS;
 	const debounceMs = options.debounceMs ?? 100;
 	const numeric = new ContextNumericCache();
+	const preparations = new Map<string, AbortController>();
+	let preparationLoggedAt = -Infinity;
 	type Pending = {
 		ids: Set<string> | null;
 		first: number;
@@ -118,10 +127,16 @@ export function createContextCharacterService(
 		cleanup?: boolean;
 	};
 	const pending = new Map<string, Pending>();
-	const jobs = new Map<string, { promise: Promise<void>; controller: AbortController }>();
+	const jobs = new Map<
+		string,
+		{ promise: Promise<void>; controller: AbortController; cleanup: boolean }
+	>();
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let disposed = false;
 	let invalidations = 0;
+	type InvalidationScope = { narratorId: string; messageIds?: Iterable<string> };
+	const invalidationScopes = new Set<InvalidationScope>();
+	const invalidationObservers = new Set<(scope: InvalidationScope) => void>();
 	const slowLogged = new Map<string, number>();
 	const cleaned = new Set<string>();
 	let overflowCursor: string | undefined;
@@ -531,7 +546,7 @@ export function createContextCharacterService(
 					}
 					schedule();
 				});
-			jobs.set(id, { promise: job, controller });
+			jobs.set(id, { promise: job, controller, cleanup: !!dirty.cleanup });
 		}
 		schedule();
 	}
@@ -618,12 +633,205 @@ export function createContextCharacterService(
 	}
 	return {
 		invalidateOverflow,
+		/** Await numeric publication before transport can produce new assistant output. */
+		async freezeForRequest(
+			id: string,
+			counts: ContextInputCharacters | null,
+			requestId: string,
+			startedAt: string,
+			runtimeSummaryChars = 0,
+			signal?: AbortSignal,
+		): Promise<ContextCharCache | null> {
+			if (disposed || signal?.aborted || preparations.has(id)) return null;
+			const initial = metadata(id);
+			if (!initial) return null;
+			const unknown = () => {
+				if (disposed || signal?.aborted || preparations.get(id)?.signal.aborted) return null;
+				const snapshot = boundedContextSnapshot({
+					requestId,
+					startedAt,
+					source: "estimate",
+					percentage: null,
+					contextWindow: null,
+					occupiedTokens: null,
+					inputCharacters: counts,
+					composition: null,
+				});
+				database
+					.query("UPDATE narrators SET context_usage_snapshot_json = ? WHERE id = ?")
+					.run(snapshot ? JSON.stringify(snapshot) : null, id);
+				const meta = metadata(id);
+				if (meta && cacheOf(meta.cache)?.revision !== revisionOf(meta)) {
+					if (!pending.has(id) && !jobs.has(id)) queue(id);
+				} else queueCleanup(id);
+				return null;
+			};
+			if (!counts || !validInputCharacters(counts) || preparations.size >= MAX_REQUEST_PREPARATIONS)
+				return unknown();
+			const controller = new AbortController();
+			preparations.set(id, controller);
+			const deadline =
+				performance.now() + (options.preparationBudgetMs ?? REQUEST_PREPARATION_BUDGET_MS);
+			type Scope = { narratorId: string; messageIds?: Iterable<string> };
+			const writes: Scope[] = [];
+			const writeIds = new Map<string, Set<string | undefined>>();
+			let writeOverflow = false;
+			let writeEpoch = 0;
+			const trackWrite = (scope: Scope) => {
+				writeEpoch++;
+				const remember = (messageId?: string) => {
+					let known = writeIds.get(scope.narratorId);
+					if (known?.has(messageId)) return;
+					if (writes.length >= 256) {
+						writeOverflow = true;
+						return;
+					}
+					if (!known) {
+						known = new Set();
+						writeIds.set(scope.narratorId, known);
+					}
+					known.add(messageId);
+					writes.push({
+						narratorId: scope.narratorId,
+						messageIds: messageId === undefined ? undefined : [messageId],
+					});
+				};
+				let seen = false;
+				for (const messageId of scope.messageIds ?? []) {
+					seen = true;
+					remember(messageId);
+					if (writeOverflow) break;
+				}
+				if (!seen) remember();
+			};
+			const initialNotificationOwners = new Set(
+				[...pendingContextCharacterWrites()].map((scope) => scope.narratorId),
+			);
+			const onInvalidation = (scope: Scope) => {
+				// Existing queued writes may legitimately advance the initial numeric epoch.
+				// Later actual writes are independently observed by message ID above the queue.
+				if (!initialNotificationOwners.has(scope.narratorId)) trackWrite(scope);
+			};
+			invalidationObservers.add(onInvalidation);
+			const stopObserving = observeContextCharacterWrites((narratorId, messageId) => {
+				trackWrite({ narratorId, messageIds: messageId ? [messageId] : undefined });
+			});
+			const related = async (scopes: Iterable<Scope>) => {
+				let sliceStarted = performance.now();
+				for (const scope of scopes) {
+					if (scope.narratorId === id) return true;
+					let batch: string[] = [];
+					const matches = () =>
+						database
+							.query<{ id: string }, string[]>(
+								`SELECT r.message_id AS id FROM narrator_message_refs r
+						 JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = ?
+						 AND r.message_id IN (${batch.map(() => "?").join(",")})
+						 AND r.segment_compact_id IS NULL AND m.role != 'disp'
+						 ${profileOf(initial) === "primary" ? "AND m.parent_tool_use_id IS NULL" : ""} LIMIT 1`,
+							)
+							.get(id, ...batch);
+					for (const messageId of scope.messageIds ?? []) {
+						if (
+							performance.now() >= deadline ||
+							signal?.aborted ||
+							controller.signal.aborted ||
+							disposed
+						)
+							return true;
+						batch.push(messageId);
+						if (batch.length === 64) {
+							if (matches()) return true;
+							batch = [];
+							if (performance.now() - sliceStarted >= 4) {
+								await yieldContextReader();
+								sliceStarted = performance.now();
+							}
+						}
+					}
+					if (batch.length && matches()) return true;
+					if (performance.now() - sliceStarted >= 4) {
+						await yieldContextReader();
+						sliceStarted = performance.now();
+					}
+				}
+				return false;
+			};
+			const sameInput = (meta: Metadata) =>
+				meta.messageVersion === initial.messageVersion &&
+				meta.type === initial.type &&
+				meta.variant === initial.variant &&
+				meta.systemChars === initial.systemChars &&
+				meta.summaryChars === initial.summaryChars &&
+				meta.toolsChars === initial.toolsChars;
+			let expectedRevision: string | undefined;
+			try {
+				while (!disposed && !signal?.aborted && !controller.signal.aborted) {
+					if (performance.now() >= deadline) {
+						if (performance.now() - preparationLoggedAt >= 60_000) {
+							preparationLoggedAt = performance.now();
+							logger.warn("Context request classification preparation timed out", {
+								narratorId: id,
+							});
+						}
+						return unknown();
+					}
+					// A fork must wait for owner notifications touching its shared messages,
+					// but unrelated fanout and optional page cleanup cannot stall a warm pin.
+					const blocked =
+						hasPendingContextCharacterRefresh(id) ||
+						!!activeSweep ||
+						(await related(pendingContextCharacterWrites())) ||
+						(await related(invalidationScopes));
+					if (writeOverflow) return unknown();
+					const observed = writeEpoch;
+					const changed = await related(writes);
+					if (disposed || signal?.aborted || controller.signal.aborted) return null;
+					if (writeOverflow || changed) return unknown();
+					if (writeEpoch !== observed) {
+						await yieldContextReader();
+						continue;
+					}
+					const meta = metadata(id);
+					if (!meta || !sameInput(meta)) return unknown();
+					if (blocked) {
+						await yieldContextReader();
+						continue;
+					}
+					const revision = revisionOf(meta);
+					if (expectedRevision !== undefined && expectedRevision !== revision) return unknown();
+					expectedRevision = revision;
+					const dirty = pending.get(id);
+					const job = jobs.get(id);
+					if (
+						cacheOf(meta.cache)?.revision === revision &&
+						(!dirty || dirty.cleanup) &&
+						(!job || job.cleanup)
+					)
+						return this.freeze(id, counts, requestId, startedAt, runtimeSummaryChars, true);
+					if (!pending.has(id) && !jobs.has(id)) queue(id);
+					const queued = pending.get(id);
+					if (queued && queued.due > performance.now()) {
+						// Expedite only this actor; keep normal write bursts debounced.
+						queued.due = performance.now();
+						schedule();
+					}
+					await yieldContextReader();
+				}
+				return null;
+			} finally {
+				stopObserving();
+				invalidationObservers.delete(onInvalidation);
+				preparations.delete(id);
+			}
+		},
 		freeze(
 			id: string,
 			counts: ContextInputCharacters | null,
 			requestId: string,
 			startedAt: string,
 			runtimeSummaryChars = 0,
+			requestScoped = false,
 		): ContextCharCache | null {
 			const meta = metadata(id);
 			if (!meta) return null;
@@ -651,11 +859,11 @@ export function createContextCharacterService(
 				if (
 					candidate?.revision === revisionOf(meta) &&
 					!candidate.fixedPrefix &&
-					!hasPendingContextCharacterRefresh() &&
+					!hasPendingContextCharacterRefresh(requestScoped ? id : undefined) &&
 					!activeSweep &&
-					invalidations === 0 &&
-					!pending.has(id) &&
-					!jobs.has(id)
+					(requestScoped || invalidations === 0) &&
+					(!pending.has(id) || (requestScoped && pending.get(id)?.cleanup)) &&
+					(!jobs.has(id) || (requestScoped && jobs.get(id)?.cleanup))
 				) {
 					const first = database
 						.query<{ json: string }, [string, string]>(
@@ -691,8 +899,9 @@ export function createContextCharacterService(
 							};
 					}
 				}
-				if (!composition) {
-					// No matched variable cache: record only the final fixed input, never stale history.
+				if (!composition && !requestScoped) {
+					// Legacy synchronous callers may retain a partial fixed-input pin.
+					// The production request path never presents this as complete classification.
 					const generation = crypto.randomUUID();
 					database
 						.query(
@@ -756,6 +965,9 @@ export function createContextCharacterService(
 			batchOptions?: { full?: boolean },
 		) {
 			invalidations++;
+			const scope = { narratorId: id, messageIds };
+			invalidationScopes.add(scope);
+			for (const changed of invalidationObservers) changed(scope);
 			try {
 				const invalidateOne = (narratorId: string, ids?: readonly string[]) => {
 					database
@@ -812,6 +1024,7 @@ export function createContextCharacterService(
 					await yieldContextReader();
 				}
 			} finally {
+				invalidationScopes.delete(scope);
 				invalidations--;
 			}
 		},
@@ -919,6 +1132,7 @@ export function createContextCharacterService(
 			return response;
 		},
 		async cancel(id: string) {
+			preparations.get(id)?.abort();
 			if ((overflowCursor !== undefined || activeSweep) && !cancelled.has(id)) {
 				if (cancelled.size >= 1024) {
 					// Never discard cancellation tombstones while their sweep can resurrect old work.
@@ -984,15 +1198,23 @@ function currentService() {
 	service ??= createContextCharacterService(sqlite);
 	return service;
 }
-export function freezeNarratorContextComposition(
+export async function freezeNarratorContextComposition(
 	narratorId: string,
 	counts: ContextInputCharacters | null,
 	requestId: string,
 	startedAt: string,
 	runtimeSummaryChars = 0,
-): ContextCharCache | null {
+	signal?: AbortSignal,
+): Promise<ContextCharCache | null> {
 	if (activeDatabaseBackend === "postgres") return null;
-	return currentService().freeze(narratorId, counts, requestId, startedAt, runtimeSummaryChars);
+	return currentService().freezeForRequest(
+		narratorId,
+		counts,
+		requestId,
+		startedAt,
+		runtimeSummaryChars,
+		signal,
+	);
 }
 export async function storeNarratorContextUsage(
 	narratorId: string,

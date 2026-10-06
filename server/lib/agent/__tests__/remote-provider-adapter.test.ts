@@ -293,7 +293,13 @@ describe("RemoteProviderAdapter", () => {
 				event("text.delta", { text: "hello" }),
 			]);
 			await collect(
-				makeAdapter(rpc).chat(chatParams({ onInputCharacters: (value) => snapshots.push(value) })),
+				makeAdapter(rpc).chat(
+					chatParams({
+						onInputCharacters: (value) => {
+							snapshots.push(value);
+						},
+					}),
+				),
 			);
 			expect(snapshots).toEqual([null, reported ?? null]);
 		}

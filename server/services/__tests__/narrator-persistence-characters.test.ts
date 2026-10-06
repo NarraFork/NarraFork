@@ -1,7 +1,11 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { ContextCharStats } from "@shared/context-composition";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { measureSerializedCharacters } from "../../lib/context-characters";
+import {
+	hasPendingContextCharacterRefresh,
+	measureSerializedCharacters,
+	queueContextCharacterRefresh,
+} from "../../lib/context-characters";
 
 const { db, sqlite } = getTestDb();
 // Schema changes intentionally precede generated migrations in this worktree.
@@ -24,13 +28,27 @@ const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const refreshes: string[] = [];
 const messageRefreshes: Array<{ narratorId: string; messageId?: string }> = [];
+const { createContextCharacterService } = await import("../narrator-context-composition");
+let integrationService: ReturnType<typeof createContextCharacterService> | undefined;
 mock.module("../narrator-context-composition", () => ({
 	storeNarratorContextUsage: async () => {},
 	freezeNarratorContextComposition: async () => null,
 	invalidateContextCharacterCache: async (id: string, messageId?: string) => {
 		refreshes.push(id);
 		messageRefreshes.push({ narratorId: id, messageId });
+		await integrationService?.invalidate(id, messageId);
 	},
+	invalidateContextCharacterBatch: async (
+		id: string,
+		messageIds?: readonly string[],
+		options?: { full?: boolean },
+	) => {
+		refreshes.push(id);
+		for (const messageId of messageIds ?? [undefined])
+			messageRefreshes.push({ narratorId: id, messageId });
+		await integrationService?.invalidateBatch(id, messageIds, options);
+	},
+	invalidateContextCharacterOverflow: async () => integrationService?.invalidateOverflow(),
 }));
 await import("../narrator-service");
 const { narratorPersistence } = await import("../narrator-persistence");
@@ -60,6 +78,8 @@ async function flushRefreshes() {
 
 beforeEach(async () => {
 	await flushRefreshes();
+	await integrationService?.dispose();
+	integrationService = undefined;
 	cleanDb(sqlite);
 	refreshes.length = 0;
 	messageRefreshes.length = 0;
@@ -67,6 +87,7 @@ beforeEach(async () => {
 });
 afterAll(async () => {
 	await flushRefreshes();
+	await integrationService?.dispose();
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
@@ -406,4 +427,188 @@ describe("character statistics at actual persistence boundaries", () => {
 		expect(charsOf(msg.id)).toBeNull();
 		expect(refreshes).toEqual([]);
 	});
+});
+
+test("actual new-session persistence and queued invalidation prepare full request classification before output", async () => {
+	integrationService = createContextCharacterService(sqlite);
+	sqlite.run("UPDATE narrators SET context_system_chars=10,context_tools_chars=20 WHERE id='n1'");
+	await narratorPersistence.persistUserMessage("n1", "question");
+	const assistant = await narratorPersistence.createPartialAssistantMessage("n1", {
+		uuid: "real-input",
+		session_id: "session",
+	});
+	await narratorPersistence.appendBlockToMessage(assistant.id, "n1", {
+		type: "text",
+		id: "answer",
+		text: "answer",
+		revision: 1,
+	});
+	const input = { command: "pwd" };
+	const toolId = await narratorPersistence.appendBlockToMessage(assistant.id, "n1", {
+		type: "tool_use",
+		id: "real-call",
+		name: "Bash",
+		input,
+	});
+	if (!toolId) throw new Error("real tool persistence missing");
+	await narratorPersistence.updateToolCallResult(
+		"real-call",
+		{ output: "result", status: "success" },
+		assistant.id,
+		toolId,
+	);
+	await narratorPersistence.persistUserMessage("n1", "next");
+	// No ready()/settled()/refresh sleep between the last actual write and request preparation.
+	const counts = { totalChars: 10000, systemChars: 10, toolsChars: 20 };
+	const pin = await integrationService.freezeForRequest("n1", counts, "real-request", NOW);
+	expect(pin).not.toBeNull();
+	const composition = await integrationService.get("n1");
+	const category = (name: string) =>
+		composition.totals.find((entry) => entry.category === name)?.chars;
+	expect(category("user")).toBe("question".length + "next".length);
+	expect(category("assistant")).toBe("answer".length);
+	expect(category("toolCall")).toBe(measureSerializedCharacters(input));
+	expect(category("toolResult")).toBe(measureSerializedCharacters("result"));
+	expect(composition.pending).toBe(false);
+	const output = await narratorPersistence.createPartialAssistantMessage("n1", {
+		uuid: "after-input",
+		session_id: "session",
+	});
+	await narratorPersistence.appendBlockToMessage(output.id, "n1", {
+		type: "text",
+		id: "after",
+		text: "later output",
+		revision: 1,
+	});
+	const secondPin = await integrationService.freezeForRequest(
+		"n1",
+		counts,
+		"next-real-request",
+		NOW,
+	);
+	expect(secondPin?.totals.find((entry) => entry.category === "assistant")?.chars).toBe(
+		"answer".length + "later output".length,
+	);
+	// A subsequent tool result is counted at its latest value, not its previous execution output.
+	await narratorPersistence.updateToolCallResult(
+		"real-call",
+		{ output: "updated result", status: "success" },
+		assistant.id,
+		toolId,
+	);
+	const thirdPin = await integrationService.freezeForRequest(
+		"n1",
+		counts,
+		"tool-result-request",
+		NOW,
+	);
+	expect(thirdPin?.totals.find((entry) => entry.category === "toolResult")?.chars).toBe(
+		measureSerializedCharacters("updated result"),
+	);
+	await flushRefreshes();
+	await integrationService.settled();
+	expect((await integrationService.get("n1")).generation).toBe(thirdPin?.generation ?? null);
+});
+
+test("an unrelated narrator's queued write cannot force a fresh request to fixed-only classification", async () => {
+	integrationService = createContextCharacterService(sqlite);
+	await narratorPersistence.persistUserMessage("n1", "own question");
+	const counts = { totalChars: 10000, systemChars: 10, toolsChars: 20 };
+	await integrationService.freezeForRequest("n1", counts, "own-first", NOW);
+	await integrationService.settled();
+	seedNarrator("other");
+	await narratorPersistence.persistUserMessage("other", "unrelated write");
+	expect(hasPendingContextCharacterRefresh()).toBe(true);
+	expect(hasPendingContextCharacterRefresh("n1")).toBe(false);
+	const pin = await integrationService.freezeForRequest("n1", counts, "own-next", NOW);
+	expect(pin?.totals.find((entry) => entry.category === "user")?.chars).toBe("own question".length);
+	expect(pin?.totalChars).toBe(30 + "own question".length);
+	await flushRefreshes();
+	await integrationService.settled();
+});
+
+test("fork waits for owner-only shared-message notifications and rejects a later shared write", async () => {
+	integrationService = createContextCharacterService(sqlite);
+	const assistant = await narratorPersistence.createPartialAssistantMessage("n1", {
+		uuid: "shared-boundary",
+		session_id: "session",
+	});
+	await narratorPersistence.appendBlockToMessage(assistant.id, "n1", {
+		type: "text",
+		id: "shared-text",
+		text: "shared",
+		revision: 1,
+	});
+	const toolId = await narratorPersistence.appendBlockToMessage(assistant.id, "n1", {
+		type: "tool_use",
+		id: "shared-boundary-call",
+		name: "Bash",
+		input: { command: "pwd" },
+	});
+	if (!toolId) throw new Error("shared tool persistence missing");
+	await narratorPersistence.updateToolCallResult(
+		"shared-boundary-call",
+		{ output: "before", status: "success" },
+		assistant.id,
+		toolId,
+	);
+	seedNarrator("fork");
+	sqlite.run(
+		"INSERT INTO narrator_message_refs(id,narrator_id,message_id,seq,is_compact,segment_compact_id) SELECT 'fork-'||id,'fork',message_id,seq,is_compact,segment_compact_id FROM narrator_message_refs WHERE narrator_id='n1'",
+	);
+	const counts = { totalChars: 10000, systemChars: 10, toolsChars: 20 };
+	await integrationService.freezeForRequest("fork", counts, "fork-first", NOW);
+	await integrationService.settled();
+	await narratorPersistence.updateToolCallResult(
+		"shared-boundary-call",
+		{ output: "owner updated result", status: "success" },
+		assistant.id,
+		toolId,
+	);
+	expect(hasPendingContextCharacterRefresh("n1")).toBe(true);
+	expect(hasPendingContextCharacterRefresh("fork")).toBe(false);
+	const pin = await integrationService.freezeForRequest("fork", counts, "fork-current", NOW);
+	expect(pin?.totals.find((entry) => entry.category === "toolResult")?.chars).toBe(
+		measureSerializedCharacters("owner updated result"),
+	);
+	await integrationService.settled();
+	await narratorPersistence.updateToolCallResult(
+		"shared-boundary-call",
+		{ output: "input boundary", status: "success" },
+		assistant.id,
+		toolId,
+	);
+	const preparing = integrationService.freezeForRequest("fork", counts, "fork-late-write", NOW);
+	await narratorPersistence.updateToolCallResult(
+		"shared-boundary-call",
+		{ output: "later shared output", status: "success" },
+		assistant.id,
+		toolId,
+	);
+	expect(await preparing).toBeNull();
+	expect((await integrationService.get("fork")).usage?.composition).toBeNull();
+	await flushRefreshes();
+	await integrationService.settled();
+});
+
+test("duplicate unrelated write notifications cannot overflow a request's distinct-message guard", async () => {
+	integrationService = createContextCharacterService(sqlite);
+	await narratorPersistence.persistUserMessage("n1", "guarded input");
+	seedNarrator("duplicate-owner");
+	const other = await narratorPersistence.persistUserMessage("duplicate-owner", "unrelated");
+	const counts = { totalChars: 10000, systemChars: 10, toolsChars: 20 };
+	const preparing = integrationService.freezeForRequest(
+		"n1",
+		counts,
+		"duplicate-guard-request",
+		NOW,
+	);
+	for (let i = 0; i < 300; i++) queueContextCharacterRefresh("duplicate-owner", other.id);
+	const pin = await preparing;
+	expect(pin?.totals.find((entry) => entry.category === "user")?.chars).toBe(
+		"guarded input".length,
+	);
+	expect(pin?.totalChars).toBe(30 + "guarded input".length);
+	await flushRefreshes();
+	await integrationService.settled();
 });

@@ -90,8 +90,11 @@ export function ContextCompositionView({
 		(!snapshot || snapshot.requestId === data.usage?.requestId) &&
 		usage?.inputCharacters != null &&
 		usage.inputCharacters.totalChars > 0;
+	const totalChars = calibrated
+		? (usage.inputCharacters?.totalChars ?? data.totalChars)
+		: data.totalChars;
 	const describe = (category: ContextCategory, chars: number) =>
-		`${t(`contextComposition.categories.${category}`)} · ${formatContextTokens(calibrated ? contextTokenShare(chars, usage.inputCharacters?.totalChars ?? 0, usage.occupiedTokens) : null)} · ${contextCharacterPercent(chars, data.totalChars).toFixed(1)}%`;
+		`${t(`contextComposition.categories.${category}`)} · ${formatContextTokens(calibrated ? contextTokenShare(chars, totalChars, usage.occupiedTokens) : null)} · ${contextCharacterPercent(chars, totalChars).toFixed(1)}%`;
 	const unloadedChars =
 		mode === "sequence" && data.nextCursor ? Math.max(0, data.totalChars - offset) : 0;
 	return (
@@ -120,7 +123,13 @@ export function ContextCompositionView({
 			<Box
 				data-testid="context-composition-bar"
 				aria-label={t("contextComposition.title")}
-				style={{ display: "flex", height: 32, borderRadius: 6, overflow: "hidden" }}
+				style={{
+					display: "flex",
+					height: 32,
+					borderRadius: 6,
+					overflow: "hidden",
+					background: "var(--mantine-color-default-hover)",
+				}}
 			>
 				{segments.map((segment) => {
 					const label = describe(segment.category, segment.chars);
@@ -132,7 +141,7 @@ export function ContextCompositionView({
 								aria-label={label}
 								onClick={() => setSelected({ category: segment.category, chars: segment.chars })}
 								style={{
-									width: `${contextCharacterPercent(segment.chars, data.totalChars)}%`,
+									width: `${contextCharacterPercent(segment.chars, totalChars)}%`,
 									flexShrink: 0,
 									height: "100%",
 									border: 0,
@@ -154,7 +163,7 @@ export function ContextCompositionView({
 							disabled={loadingMore}
 							onClick={onLoadMore}
 							style={{
-								width: `${contextCharacterPercent(unloadedChars, data.totalChars)}%`,
+								width: `${contextCharacterPercent(unloadedChars, totalChars)}%`,
 								border: 0,
 								padding: 0,
 								cursor: "pointer",

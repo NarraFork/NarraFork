@@ -399,7 +399,7 @@ export async function reportInputCharacters(
 	params: {
 		signal: AbortSignal;
 		history?: readonly unknown[];
-		onInputCharacters?: (counts: ContextInputCharacters | null) => void;
+		onInputCharacters?: (counts: ContextInputCharacters | null) => void | Promise<void>;
 	},
 	body: unknown,
 	budget: InputCharacterOptions = {},
@@ -457,5 +457,5 @@ export async function reportInputCharacters(
 				);
 		}
 	}
-	params.onInputCharacters(counts);
+	await params.onInputCharacters(counts);
 }
