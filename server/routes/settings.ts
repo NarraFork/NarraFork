@@ -33,7 +33,7 @@ import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
 import { listSearchChannels, testSearchChannel } from "../lib/search/router";
 import { normalizeSearchSettings } from "../lib/search/settings";
-import { scheduleServerRestart } from "../lib/server-restart";
+import { restartServerForResponse } from "../lib/server-restart";
 import {
 	customApiProvidersToAnthropic,
 	customApiProvidersToGemini,
@@ -857,6 +857,7 @@ export function buildServerRestartUrl(
 	port: number,
 	tlsEnabled: boolean,
 ): string {
+	// host/port/protocol must come from the actual listener, never from configured auto-lan intent.
 	const redirectHost = isWildcardListenHost(host) ? new URL(requestUrl).hostname : host;
 	return `${tlsEnabled ? "https" : "http"}://${formatUrlHost(redirectHost)}:${port}`;
 }
@@ -1687,12 +1688,9 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 		const tlsChanged = JSON.stringify(oldTlsEffective) !== JSON.stringify(newTlsEffective);
 		const needsRestart = serverAddressChanged || tlsChanged;
 
-		if (needsRestart) {
-			scheduleServerRestart(newHost, newPort);
-		}
-
-		const newUrl = needsRestart
-			? buildServerRestartUrl(c.req.url, newHost, newPort, newTls?.enabled === true)
+		const address = needsRestart ? await restartServerForResponse(newHost, newPort) : undefined;
+		const newUrl = address
+			? buildServerRestartUrl(c.req.url, address.host, address.port, address.protocol === "https")
 			: undefined;
 
 		// Observability: record who changed the instance-wide summary model and to
@@ -1743,12 +1741,10 @@ settingsRoutes.post("/generate-tls", requireAdmin, async (c) => {
 	};
 	saveSettings(merged);
 
-	// Schedule server restart to apply TLS
-	const host = merged.server.host;
-	const port = merged.server.port;
-	scheduleServerRestart(host, port);
-
-	const newUrl = buildServerRestartUrl(c.req.url, host, port, true);
+	const address = await restartServerForResponse(merged.server.host, merged.server.port);
+	const newUrl = address
+		? buildServerRestartUrl(c.req.url, address.host, address.port, address.protocol === "https")
+		: undefined;
 	return c.json({
 		certPath: result.certPath,
 		keyPath: result.keyPath,

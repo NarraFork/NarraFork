@@ -15,6 +15,7 @@ import { useDisclosure } from "@mantine/hooks";
 import { IconAlertTriangle, IconRefresh, IconSearch } from "@tabler/icons-react";
 import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { AUTO_LAN_HOST } from "../../../shared/server-host";
 import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import { PathInput } from "../common/PathInput";
@@ -24,7 +25,7 @@ import { DependencyStatus } from "./DependencyStatus";
 import { SystemShutdownCard } from "./SystemShutdownCard";
 import { TlsSection } from "./TlsSection";
 
-const HOST_PRESETS = ["localhost", "127.0.0.1", "::1", "192.168.0.0", "0.0.0.0"];
+const HOST_PRESETS = ["localhost", AUTO_LAN_HOST, "127.0.0.1", "::1", "192.168.0.0", "0.0.0.0"];
 
 const UpdateModal = lazy(() =>
 	import("../UpdateModal").then((m) => ({

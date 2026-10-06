@@ -9,9 +9,13 @@ import { getNarraforkPath } from "./narrafork-home";
  * Decouples settings/routes/update from server/main.ts to avoid circular imports.
  */
 
-type RestartFn = (newHost: string, newPort: number) => void | Promise<void>;
+type RestartFn = (
+	newHost: string,
+	newPort: number,
+	options?: { preserveResponse: boolean },
+) => void | RuntimeAddress | Promise<void> | Promise<RuntimeAddress | undefined>;
 
-type RuntimeAddress = {
+export type RuntimeAddress = {
 	protocol: "http" | "https";
 	host: string;
 	port: number;
@@ -64,7 +68,7 @@ let _operatorShutdownPending = false;
 let _gracefulRestartSession: GracefulRestartSession | null = null;
 
 /** Called by server/main.ts to register the in-process restart implementation. */
-export function registerServerRestart(fn: RestartFn): void {
+export function registerServerRestart(fn: RestartFn | null): void {
 	_restartFn = fn;
 }
 
@@ -169,6 +173,18 @@ export function scheduleServerRestart(newHost: string, newPort: number): void {
 			}
 		})();
 	}, 200);
+}
+
+/** Restart inline while keeping the HTTP response alive; never predict or probe another server. */
+export async function restartServerForResponse(
+	newHost: string,
+	newPort: number,
+): Promise<RuntimeAddress | undefined> {
+	if (process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART === "1") return undefined;
+	if (!_restartFn) throw new Error("Server restart handler is not registered");
+	const address = await _restartFn(newHost, newPort, { preserveResponse: true });
+	if (!address) throw new Error("Server restart did not return a bound address");
+	return address;
 }
 
 function randomToken(): string {

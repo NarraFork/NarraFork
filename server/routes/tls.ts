@@ -3,7 +3,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
-import { scheduleServerRestart } from "../lib/server-restart";
+import { restartServerForResponse, scheduleServerRestart } from "../lib/server-restart";
 import { saveSettings, settings } from "../lib/settings";
 import {
 	getTlsPaths,
@@ -89,9 +89,7 @@ export const tlsRoutes = new Hono()
 		};
 		saveSettings(merged);
 
-		const host = merged.server.host;
-		const port = merged.server.port;
-		scheduleServerRestart(host, port);
+		const address = await restartServerForResponse(merged.server.host, merged.server.port);
 
 		logger.info("TLS server certificate issued via API", {
 			caCreated: issued.ca.created,
@@ -108,7 +106,9 @@ export const tlsRoutes = new Hono()
 			autoSans: issued.autoSans,
 			caCreated: issued.ca.created,
 			caExpiresAt: issued.ca.expiresAt,
-			newUrl: buildServerRestartUrl(c.req.url, host, port, true),
+			newUrl: address
+				? buildServerRestartUrl(c.req.url, address.host, address.port, address.protocol === "https")
+				: undefined,
 			serverRestarting: true,
 		});
 	})

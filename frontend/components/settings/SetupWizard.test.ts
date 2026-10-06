@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { AUTO_LAN_HOST } from "../../../shared/server-host";
 import {
 	countConfiguredProviders,
 	persistSetupWizardBeforeNetworkChange,
+	resolveWizardNetworkMode,
 	WIZARD_STEPS,
+	wizardNetworkModeToHost,
 	wizardNextBlockedReasonKey,
 	wizardStepIndex,
 } from "./SetupWizard";
@@ -23,6 +26,49 @@ describe("setup wizard completion", () => {
 
 		expect(calls).toEqual(["completion", "network:0.0.0.0"]);
 		expect(response).toEqual({ serverRestarting: true });
+	});
+});
+
+describe("setup wizard network modes", () => {
+	test("recognizes automatic LAN even without a detected address", () => {
+		expect(resolveWizardNetworkMode(AUTO_LAN_HOST, [])).toBe("lan");
+		expect(resolveWizardNetworkMode(AUTO_LAN_HOST, ["192.168.1.10"])).toBe("lan");
+	});
+
+	test("recognizes existing manual addresses on any current LAN interface", () => {
+		const addresses = ["192.168.1.10", "10.0.0.5"];
+		for (const host of addresses) {
+			expect(resolveWizardNetworkMode(host, addresses)).toBe("lan");
+		}
+		expect(resolveWizardNetworkMode("192.168.1.20", addresses)).toBe("local");
+	});
+
+	test("preserves local and open modes", () => {
+		for (const host of ["localhost", "127.0.0.1", "::1"]) {
+			expect(resolveWizardNetworkMode(host, [])).toBe("local");
+		}
+		expect(resolveWizardNetworkMode("0.0.0.0", [])).toBe("open");
+		expect(wizardNetworkModeToHost("local")).toBe("localhost");
+		expect(wizardNetworkModeToHost("open")).toBe("0.0.0.0");
+	});
+
+	test("LAN selection saves the automatic intent, not a detected IP", async () => {
+		const host = wizardNetworkModeToHost("lan");
+		expect(host).toBe(AUTO_LAN_HOST);
+		const calls: string[] = [];
+		await persistSetupWizardBeforeNetworkChange(
+			host,
+			async () => {
+				calls.push("completion");
+			},
+			async (savedHost) => {
+				calls.push(`network:${savedHost}`);
+			},
+		);
+		expect(calls).toEqual(["completion", "network:auto-lan"]);
+		// The staged selection survives a remount or a change of network interfaces.
+		expect(resolveWizardNetworkMode(host, [])).toBe("lan");
+		expect(resolveWizardNetworkMode(host, ["10.0.0.5"])).toBe("lan");
 	});
 });
 

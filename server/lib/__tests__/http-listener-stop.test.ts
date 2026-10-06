@@ -109,6 +109,32 @@ afterEach(() => {
 });
 
 describe("Bun.Server.stop() behaviour that graceful shutdown depends on", () => {
+	test("stop(false) releases the port synchronously and preserves the requesting response", async () => {
+		let replacement: TestServer | undefined;
+		const old = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(_request, server) {
+				const port = boundPort(server);
+				void Promise.resolve(server.stop(false)).catch(() => {});
+				replacement = Bun.serve({
+					hostname: "127.0.0.1",
+					port,
+					fetch: () => new Response("replacement"),
+				});
+				servers.push(replacement);
+				await Bun.sleep(25);
+				return Response.json({ port: boundPort(replacement) });
+			},
+		});
+		servers.push(old);
+		const port = boundPort(old);
+		const response = await fetch(`http://127.0.0.1:${port}/`, {
+			signal: AbortSignal.timeout(1000),
+		});
+		expect(await response.json()).toEqual({ port });
+		expect(await (await fetch(`http://127.0.0.1:${port}/`)).text()).toBe("replacement");
+	});
 	test("stop(true) stops accepting requests synchronously, before any await", async () => {
 		const { server } = startServer();
 		const port = boundPort(server);

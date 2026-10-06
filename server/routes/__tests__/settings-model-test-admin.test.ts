@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
+import { AUTO_LAN_HOST } from "../../../shared/server-host";
 import { AppError } from "../../lib/errors";
 
 const previousHome = process.env.NARRAFORK_HOME;
@@ -14,6 +15,8 @@ const { narrators } = await import("../../db/schema");
 const { saveSettings, settings } = await import("../../lib/settings");
 const { buildServerRestartUrl, settingsRoutes, updateSettingsSchema } = await import("../settings");
 const { getDefaults, deepMerge } = await import("../../lib/settings");
+const { registerServerRestart } = await import("../../lib/server-restart");
+const { tlsRoutes } = await import("../tls");
 
 afterAll(() => {
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
@@ -37,6 +40,7 @@ function appForRole(role: "admin" | "user") {
 		throw error;
 	});
 	app.route("/settings", settingsRoutes);
+	app.route("/tls", tlsRoutes);
 	return app;
 }
 
@@ -91,11 +95,78 @@ describe("search channel settings validation", () => {
 });
 
 describe("settings restart redirects", () => {
+	test.each([
+		"/settings/generate-tls",
+		"/tls/generate",
+	])("%s returns actual rollback protocol and port, not desired HTTPS settings", async (endpoint) => {
+		const original = structuredClone(settings);
+		const suppress = process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
+		const listener = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () => new Response("owned"),
+		});
+		try {
+			delete process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
+			registerServerRestart((_host, _port, options) => {
+				expect(options?.preserveResponse).toBe(true);
+				return { host: "127.0.0.1", port: listener.port as number, protocol: "http" };
+			});
+			const response = await appForRole("admin").request(`http://localhost${endpoint}`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: "{}",
+			});
+			expect(response.status).toBe(200);
+			const body = (await response.json()) as { newUrl: string };
+			expect(body.newUrl).toBe(`http://127.0.0.1:${listener.port}`);
+		} finally {
+			void listener.stop(true);
+			registerServerRestart(null);
+			saveSettings(original);
+			if (suppress === undefined) delete process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
+			else process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART = suppress;
+		}
+	});
+	test("persists automatic LAN mode but redirects to the actual local fallback", async () => {
+		const original = structuredClone(settings);
+		const previousSuppressRestart = process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
+		try {
+			delete process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
+			registerServerRestart((_host, port, options) => {
+				expect(options?.preserveResponse).toBe(true);
+				return { host: _host === AUTO_LAN_HOST ? "localhost" : _host, port, protocol: "http" };
+			});
+			saveSettings({ ...settings, server: { ...settings.server, host: "localhost" } });
+			const response = await appForRole("admin").request("http://localhost/settings", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ server: { host: AUTO_LAN_HOST } }),
+			});
+			const body = (await response.json()) as { server: { host: string }; newUrl: string };
+			expect(response.status).toBe(200);
+			expect(settings.server.host).toBe(AUTO_LAN_HOST);
+			expect(body.server.host).toBe(AUTO_LAN_HOST);
+			expect(new URL(body.newUrl).hostname).toBe("localhost");
+		} finally {
+			saveSettings(original);
+			registerServerRestart(null);
+			if (previousSuppressRestart === undefined) {
+				delete process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
+			} else {
+				process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART = previousSuppressRestart;
+			}
+		}
+	});
 	test("preserves the request hostname when switching to a wildcard listener", async () => {
 		const original = structuredClone(settings);
 		const previousSuppressRestart = process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
 		try {
-			process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART = "1";
+			delete process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
+			registerServerRestart((_host, port, options) => {
+				expect(options?.preserveResponse).toBe(true);
+				return { host: _host === AUTO_LAN_HOST ? "localhost" : _host, port, protocol: "http" };
+			});
 			saveSettings({
 				...settings,
 				server: { ...settings.server, host: "localhost" },
@@ -123,6 +194,7 @@ describe("settings restart redirects", () => {
 			expect(new URL(body.newUrl as string).hostname).toBe("127.0.0.1");
 		} finally {
 			saveSettings(original);
+			registerServerRestart(null);
 			if (previousSuppressRestart === undefined) {
 				delete process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;
 			} else {

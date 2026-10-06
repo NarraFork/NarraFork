@@ -34,10 +34,12 @@ import { getCodexManager } from "./lib/codex-manager";
 import { inspectApplicationDataDirectory } from "./lib/data-directory-security";
 import { shutdownDbWorkerPool } from "./lib/db-worker/pool";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
+import { rebindHttpListener } from "./lib/http-listener-rebind";
 import { logger } from "./lib/logger";
 import { mcpManager } from "./lib/mcp/manager";
 import { syncMcpTools } from "./lib/mcp/tool-bridge";
 import { getNarraforkHome, getNarraforkPath } from "./lib/narrafork-home";
+import { listenWithLanFallback, resolveListenHost } from "./lib/net/listen-host";
 import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
 import { validateAccessTokenById } from "./lib/oauth-provider";
 import { IS_MACOS, IS_WINDOWS, initWslFlag } from "./lib/platform";
@@ -291,7 +293,8 @@ const cliHost = process.argv.find((a) => a.startsWith("--host="))?.split("=")[1]
 
 const portExplicit = !!(cliPort || process.env.PORT);
 const port = Number(cliPort) || Number(process.env.PORT) || settings.server.port;
-let currentHost = cliHost || process.env.HOST || settings.server.host;
+let configuredHost = cliHost || process.env.HOST || settings.server.host;
+let currentHost = resolveListenHost(configuredHost);
 // Compiled single-executable binaries are always treated as production.
 // Bun embeds files under $bunfs (Linux/macOS) or ~BUN/%7EBUN (Windows).
 const isCompiledBinary = import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
@@ -838,8 +841,9 @@ function stopHttpListener(): void {
 	});
 }
 
-function startServer(listenPort: number) {
-	const tlsCfg = settings.server.tls;
+let boundTlsConfig = settings.server.tls;
+
+function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 	const tls =
 		tlsCfg?.enabled && tlsCfg.certFile && tlsCfg.keyFile
 			? {
@@ -1093,8 +1097,16 @@ function startServer(listenPort: number) {
 		websocket: wsHandlers,
 	});
 
+	boundTlsConfig = tlsCfg;
 	clearInheritableHandlesAfterServerBind();
 	return server;
+}
+
+function startServerWithHostFallback(listenPort: number) {
+	return listenWithLanFallback(configuredHost, currentHost, (host) => {
+		currentHost = host;
+		return startServer(listenPort, settings.server.tls);
+	});
 }
 
 let actualPort = port;
@@ -1134,7 +1146,7 @@ if (portExplicit) {
 		process.exit(1);
 	}
 	try {
-		_server = startServer(port);
+		_server = startServerWithHostFallback(port);
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		if (msg.includes("EADDRINUSE") || msg.includes("address already in use")) {
@@ -1155,7 +1167,7 @@ if (portExplicit) {
 		const tryPort: number = candidate;
 		attemptedPorts.push(tryPort);
 		try {
-			_server = startServer(tryPort);
+			_server = startServerWithHostFallback(tryPort);
 			actualPort = tryPort;
 			started = true;
 			if (tryPort !== port) {
@@ -1207,47 +1219,43 @@ logger.info(`NarraFork server running on ${getProtocol()}://${currentHost}:${act
 	metaUrl: import.meta.url,
 });
 
-registerRuntimeAddressGetter(() => ({
-	protocol: getProtocol(),
-	host: currentHost,
-	port: actualPort,
-}));
+function runtimeAddress() {
+	return {
+		protocol: _server.url.protocol === "https:" ? ("https" as const) : ("http" as const),
+		host: currentHost,
+		port: _server.port ?? actualPort,
+	};
+}
+registerRuntimeAddressGetter(runtimeAddress);
 
 // Register server restart handler for hot-reloading host/port from settings
-registerServerRestart(async (newHost: string, newPort: number) => {
+registerServerRestart((newHost: string, newPort: number, options) => {
 	const oldHost = currentHost;
+	const oldConfiguredHost = configuredHost;
 	const oldPort = actualPort;
-	try {
-		// Fire-and-forget: awaiting stop()'s promise would hang forever once any WebSocket was
-		// closed server-side (see stopHttpListener), leaving the server unbound and the user
-		// stranded with no listener at all. The call itself releases the port synchronously, which
-		// is what the rebind below needs.
-		stopHttpListener();
-		currentHost = newHost;
-		_server = startServer(newPort);
-		actualPort = newPort;
-		logger.info(
-			`Server restarted: ${getProtocol()}://${oldHost}:${oldPort} → ${getProtocol()}://${currentHost}:${actualPort}`,
-		);
-	} catch (err) {
-		// Rollback: try to restart on the old address
-		logger.error("Failed to restart server on new address, rolling back", {
-			newHost,
-			newPort,
-			error: String(err),
-		});
-		try {
+	const oldTls = boundTlsConfig;
+	_server = rebindHttpListener(
+		_server,
+		() => {
+			configuredHost = newHost;
+			currentHost = resolveListenHost(configuredHost);
+			const replacement = startServerWithHostFallback(newPort);
+			actualPort = replacement.port ?? newPort;
+			return replacement;
+		},
+		() => {
+			configuredHost = oldConfiguredHost;
 			currentHost = oldHost;
-			_server = startServer(oldPort);
-			actualPort = oldPort;
-			logger.info(`Server rolled back to ${getProtocol()}://${oldHost}:${oldPort}`);
-		} catch (rollbackErr) {
-			logger.error("Rollback also failed — server is down", {
-				error: String(rollbackErr),
-			});
-		}
-		throw err;
-	}
+			// Restore the TLS options actually used by the previous listener, not newly saved settings.
+			const replacement = startServer(oldPort, oldTls);
+			actualPort = replacement.port ?? oldPort;
+			return replacement;
+		},
+		options?.preserveResponse === true,
+	);
+	const address = runtimeAddress();
+	logger.info("Server listener rebound", address);
+	return address;
 });
 
 /** Open a URL in the user's default browser. */

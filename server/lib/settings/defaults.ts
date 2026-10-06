@@ -270,7 +270,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "number",
 	},
 	"server.host": {
-		desc: '服务器监听地址。"localhost" 仅本机访问，"0.0.0.0" 允许局域网访问。重启后生效。',
+		desc: '服务器监听地址。"localhost" 仅本机访问，"auto-lan" 每次启动自动取第一个局域网 IP，失败回退本机；"0.0.0.0" 监听所有 IPv4 网卡。重启后生效。',
 		type: "string",
 	},
 	"server.openBrowser": {

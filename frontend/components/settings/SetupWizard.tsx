@@ -23,8 +23,9 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { AUTO_LAN_HOST } from "../../../shared/server-host";
 import { useAllModels } from "../../hooks/useModels";
 import { useUpdateUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
@@ -128,6 +129,21 @@ export function wizardNextBlockedReasonKey(state: {
 		return "wizardModelsRequired";
 	}
 	return null;
+}
+
+export function resolveWizardNetworkMode(
+	host: string,
+	lanAddresses: readonly string[],
+): "local" | "lan" | "open" {
+	if (host === "0.0.0.0") return "open";
+	if (host === AUTO_LAN_HOST || lanAddresses.includes(host)) return "lan";
+	return "local";
+}
+
+export function wizardNetworkModeToHost(mode: string): string {
+	if (mode === "open") return "0.0.0.0";
+	if (mode === "lan") return AUTO_LAN_HOST;
+	return "localhost";
 }
 
 export async function persistSetupWizardBeforeNetworkChange<T>(
@@ -553,36 +569,15 @@ function NetworkStep({
 	const lanAddresses: string[] = (settings as { lanAddresses?: string[] })?.lanAddresses ?? [];
 	const firstLan = lanAddresses[0];
 
-	const resolveMode = useCallback(
-		(host: string) => {
-			if (host === "0.0.0.0") return "open";
-			if (firstLan && host === firstLan) return "lan";
-			return "local";
-		},
-		[firstLan],
-	);
-
-	const [mode, setMode] = useState<string>(resolveMode(selectedHost));
-
-	// Sync mode from settings or a previously staged selection when the step remounts.
-	useEffect(() => {
-		setMode(resolveMode(selectedHost));
-	}, [resolveMode, selectedHost]);
-
-	const modeToHost = (value: string) => {
-		if (value === "open") return "0.0.0.0";
-		if (value === "lan" && firstLan) return firstLan;
-		return "localhost";
-	};
+	const mode = resolveWizardNetworkMode(selectedHost, lanAddresses);
 
 	const handleChange = (value: string) => {
-		setMode(value);
-		onHostChange(modeToHost(value));
+		onHostChange(wizardNetworkModeToHost(value));
 	};
 
 	const segmentData = [
 		{ label: t("wizardNetworkLocal"), value: "local" },
-		...(firstLan ? [{ label: t("wizardNetworkLan", { ip: firstLan }), value: "lan" }] : []),
+		{ label: t("wizardNetworkLan"), value: "lan" },
 		{ label: t("wizardNetworkOpen"), value: "open" },
 	];
 
@@ -605,6 +600,11 @@ function NetworkStep({
 			<Text size="xs" c="dimmed">
 				{t(descKey)}
 			</Text>
+			{mode === "lan" && firstLan && (
+				<Text size="xs" c="dimmed">
+					{t("wizardNetworkLanAddress", { ip: firstLan })}
+				</Text>
+			)}
 			<Text size="xs" c="orange">
 				{t("wizardNetworkRestartHint")}
 			</Text>

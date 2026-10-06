@@ -511,6 +511,7 @@ export interface NarraForkSettings {
 	};
 	server: {
 		port: number;
+		/** "auto-lan" resolves the first LAN IP on each start, with localhost fallback. */
 		host: string;
 		/** Browser launch behaviour on server start: "off" | "browser" | "app" */
 		openBrowser: "off" | "browser" | "app";

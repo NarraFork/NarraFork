@@ -13,7 +13,7 @@ describe("interrupted merge startup gate", () => {
 		expect(source.match(/chapterBatchMerge\.cleanupStaleSessions\(/g)).toHaveLength(1);
 		for (const entry of [
 			"const server = Bun.serve(",
-			"_server = startServer(",
+			"_server = startServerWithHostFallback(",
 			"await recoverNarrators(",
 		]) {
 			expect(source.indexOf(entry)).toBeGreaterThan(cleanup);
