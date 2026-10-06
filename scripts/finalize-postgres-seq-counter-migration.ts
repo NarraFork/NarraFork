@@ -17,7 +17,7 @@ import { PG_ONLY_IDENTITY_COLUMNS } from "./generate-postgres-schema";
  * disk stays byte-predictable: pure drizzle-kit output plus this block.
  *
  * Flow: bun scripts/generate-postgres-schema.ts
- *       bunx drizzle-kit generate --config drizzle.pg.config.ts --name seq_counters
+ *       bun run db:generate:pg --name seq_counters
  *       bun scripts/finalize-postgres-seq-counter-migration.ts
  */
 

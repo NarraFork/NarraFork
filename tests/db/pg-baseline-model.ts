@@ -15,9 +15,10 @@
  *    server (`buildDeparseScript`) and the two deparsed strings are compared verbatim. A
  *    hand-written normalizer would have to be as clever as the deparser to avoid either
  *    false alarms or silently accepting a changed predicate.
- *  - **Only column defaults are normalized textually** (`normDefault`): they are small,
- *    closed-form, and differ only by a cast to the column's own type and by quoting of
- *    numeric literals. It refuses to strip a cast to any other type.
+ *  - **Only literal column defaults are normalized textually** (`normDefault`): they
+ *    differ only by a cast to the column's own type and by quoting of numeric literals.
+ *    Expression defaults use the server deparser at the actual target type, never a
+ *    hand-written parenthesis/cast rewrite. Literal casts to other types remain distinct.
  *  - **A shape this model cannot represent is a problem, not a silent pass.** Expression
  *    index keys, DESC/NULLS FIRST ordering, non-btree methods, INCLUDE columns, composite
  *    primary keys, enums/views/standalone sequences/policies: none exist in this baseline, and
@@ -497,6 +498,25 @@ export function normDefault(type: string, value: string | null | undefined): str
 	return text;
 }
 
+// Classify only simple literals (and literal casts), never normalize expressions here.
+// E/dollar strings, operators, parentheses and SQL keywords such as CURRENT_TIMESTAMP
+// go through PostgreSQL even when their text happens to resemble a literal.
+const DEFAULT_CAST_IDENTIFIER = '(?:"(?:[^"]|"")*"|[A-Za-z_][A-Za-z0-9_$]*)';
+const DEFAULT_CAST_TYPE = [
+	DEFAULT_CAST_IDENTIFIER,
+	String.raw`(?:\s*\.\s*${DEFAULT_CAST_IDENTIFIER})?`,
+	String.raw`(?:\s+(?:precision|varying|(?:with|without)\s+time\s+zone))?`,
+	String.raw`(?:\s*\(\s*\d+(?:\s*,\s*\d+)*\s*\))?`,
+	String.raw`(?:\s*\[\s*\])*`,
+].join("");
+const LITERAL_DEFAULT = new RegExp(
+	String.raw`^(?:'(?:[^']|'')*'|[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?|true|false|null)(?:\s*::\s*${DEFAULT_CAST_TYPE})*$`,
+	"i",
+);
+function isExpressionDefault(value: string | null): boolean {
+	return value !== null && !LITERAL_DEFAULT.test(value.trim());
+}
+
 // ---------------------------------------------------------------------------------------
 // Catalog facets
 // ---------------------------------------------------------------------------------------
@@ -923,10 +943,21 @@ export function parseCatalog(facets: Record<FacetName, unknown[][]>): {
 export type DeparseRequest =
 	| { id: string; kind: "predicate"; table: string; keyColumn: string; text: string }
 	| { id: string; kind: "check"; table: string; text: string }
-	| { id: string; kind: "generated"; table: string; type: string; text: string };
+	| { id: string; kind: "generated"; table: string; type: string; text: string }
+	| { id: string; kind: "default"; table: string; type: string; text: string };
 
-export const deparseKey = (kind: string, table: string, text: string) =>
-	`${kind}\u0000${table}\u0000${text}`;
+/** DEFAULT coercion depends on the target type; existing expression keys stay compatible. */
+export const deparseKey = (kind: string, table: string, text: string, type?: string) =>
+	`${kind}\u0000${table}\u0000${text}${type === undefined ? "" : `\u0000${type}`}`;
+
+function requestKey(request: DeparseRequest): string {
+	return deparseKey(
+		request.kind,
+		request.table,
+		request.text,
+		request.kind === "default" ? request.type : undefined,
+	);
+}
 
 /** Every distinct expression the snapshot expects, with the table it must be parsed in. */
 export function deparseRequests(expected: Expected): DeparseRequest[] {
@@ -940,8 +971,8 @@ export function deparseRequests(expected: Expected): DeparseRequest[] {
 	const seen = new Set<string>();
 	let counter = 0;
 	const push = (request: DeparseRequest) => {
-		if (seen.has(deparseKey(request.kind, request.table, request.text))) return;
-		seen.add(deparseKey(request.kind, request.table, request.text));
+		if (seen.has(requestKey(request))) return;
+		seen.add(requestKey(request));
 		requests.push(request);
 	};
 	for (const index of expected.indexes) {
@@ -968,6 +999,17 @@ export function deparseRequests(expected: Expected): DeparseRequest[] {
 			table: column.table,
 			type: column.type,
 			text: column.generated.as,
+		});
+	}
+	for (const column of expected.columns) {
+		if (column.default === null || !isExpressionDefault(column.default)) continue;
+		counter += 1;
+		push({
+			id: `def_${counter}`,
+			kind: "default",
+			table: column.table,
+			type: column.type,
+			text: column.default,
 		});
 	}
 	return requests;
@@ -997,9 +1039,14 @@ export function buildDeparseScript(requests: DeparseRequest[]): string {
 			);
 		} else if (request.kind === "check") {
 			lines.push(`ALTER TABLE ${scratch} ADD CONSTRAINT nf_${request.id} CHECK (${request.text});`);
-		} else {
+		} else if (request.kind === "generated") {
 			lines.push(
 				`ALTER TABLE ${scratch} ADD COLUMN nf_${request.id} ${request.type} GENERATED ALWAYS AS (${request.text}) STORED;`,
+			);
+		} else {
+			// PostgreSQL applies the actual target-type coercion and deparses it itself.
+			lines.push(
+				`ALTER TABLE ${scratch} ADD COLUMN nf_${request.id} ${request.type} DEFAULT (${request.text});`,
 			);
 		}
 	}
@@ -1011,7 +1058,7 @@ export function buildDeparseScript(requests: DeparseRequest[]): string {
 	UNION ALL
 	SELECT json_build_array(a.attname, pg_get_expr(d.adbin, d.adrelid))::text
 		FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
-		WHERE a.attname LIKE 'nf\\_gen\\_%';`);
+		WHERE a.attname LIKE 'nf\\_gen\\_%' OR a.attname LIKE 'nf\\_def\\_%';`);
 	return lines.join("\n");
 }
 
@@ -1032,11 +1079,22 @@ export function parseDeparseOutput(
 			problems.push(`deparse: unreadable row ${clip(trimmed)}`);
 			continue;
 		}
-		if (!Array.isArray(parsed) || parsed.length !== 2) {
+		if (
+			!Array.isArray(parsed) ||
+			parsed.length !== 2 ||
+			typeof parsed[0] !== "string" ||
+			typeof parsed[1] !== "string" ||
+			parsed[0].length === 0 ||
+			parsed[1].length === 0
+		) {
 			problems.push(`deparse: unexpected row shape ${clip(trimmed)}`);
 			continue;
 		}
-		byName.set(String(parsed[0]), String(parsed[1]));
+		if (byName.has(parsed[0])) {
+			problems.push(`deparse: duplicate result name ${clip(parsed[0])}`);
+			continue;
+		}
+		byName.set(parsed[0], parsed[1]);
 	}
 	const canonical = new Map<string, string>();
 	for (const request of requests) {
@@ -1045,7 +1103,7 @@ export function parseDeparseOutput(
 			problems.push(`deparse: server returned nothing for ${request.kind} on ${request.table}`);
 			continue;
 		}
-		canonical.set(deparseKey(request.kind, request.table, request.text), value);
+		canonical.set(requestKey(request), value);
 	}
 	return { canonical, problems };
 }
@@ -1209,11 +1267,19 @@ export function compareBaseline(
 		}
 	}
 
+	const expressionDefaults = new Map(
+		expected.columns
+			.filter((column) => isExpressionDefault(column.default))
+			.map((column) => [`${column.table}.${column.name}`, column]),
+	);
 	const columnShape = (column: ExpectedColumn) => ({
 		type: column.type,
 		notNull: column.notNull,
 		primaryKey: column.primaryKey,
-		default: normDefault(column.type, column.default),
+		// Expression defaults are compared verbatim against server canonical text below.
+		default: expressionDefaults.has(`${column.table}.${column.name}`)
+			? null
+			: normDefault(column.type, column.default),
 		generated: column.generated === null ? null : { stored: column.generated.stored },
 		// The sequences facet pins the backing sequence and ownership; this pins the kind.
 		identity: column.identity === null ? null : column.identity.type,
@@ -1224,6 +1290,22 @@ export function compareBaseline(
 		new Map(actual.columns.map((c) => [`${c.table}.${c.name}`, columnShape(c)])),
 		problems,
 	);
+
+	for (const column of expressionDefaults.values()) {
+		// The filter above excludes null; keeping the guard makes this narrowing explicit.
+		if (column.default === null) continue;
+		const want = canonical.get(deparseKey("default", column.table, column.default, column.type));
+		const got = actual.columns.find(
+			(entry) => entry.table === column.table && entry.name === column.name,
+		)?.default;
+		if (want === undefined) {
+			problems.push(`default ${column.table}.${column.name}: no canonical form available`);
+		} else if (got !== want) {
+			problems.push(
+				`default ${column.table}.${column.name}: expected ${clip(want)}, got ${clip(got ?? null)}`,
+			);
+		}
+	}
 
 	// Generated expressions are compared against the server's deparse of the committed text.
 	for (const column of expected.columns) {
