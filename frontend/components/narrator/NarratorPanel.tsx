@@ -129,6 +129,7 @@ import {
 } from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import { HeaderToolbar } from "./header/HeaderToolbar";
+import { showHeaderLeadingChrome } from "./header/header-leading-chrome";
 import { HEADER_LEADING_GAP_PX, headerTitleLayoutWidth } from "./header/header-title-width";
 import { NarratorHeaderLayout } from "./header/NarratorHeaderLayout";
 import { NarratorPanelHeaderTitle } from "./header/NarratorPanelHeaderTitle";
@@ -616,6 +617,18 @@ function NarratorPanelBody({
 		if (hostOwnsTitle || isWorkspacePreview) return 0;
 		return headerTitleLayoutWidth(headerDisplayTitle);
 	}, [hostOwnsTitle, isWorkspacePreview, headerDisplayTitle]);
+
+	// Single predicate for the leading chrome slot: the layout budget
+	// (`showBack`) and the render branch below must never disagree. A
+	// host-provided `onBack` (subagent → parent, workspace origin) wins over
+	// the chapterId surrender — subagents inherit the parent's chapterId, and
+	// without this their header has no way back at all.
+	const showLeadingChrome = showHeaderLeadingChrome({
+		isWorkspacePreview,
+		onMinimize,
+		chapterId,
+		onBack,
+	});
 
 	// Resolve the effective model: when following default, use the actual default
 	// model value; when using a model aggregation, resolve to a representative
@@ -2835,7 +2848,7 @@ function NarratorPanelBody({
 					    fixed title @ pretext W, then only tools that fit after it. */}
 					<NarratorHeaderLayout
 						titleFullWidth={headerTitleFullWidth}
-						showBack={!isWorkspacePreview && !onMinimize && !chapterId}
+						showBack={showLeadingChrome}
 						showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
 						surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
 						showClose={!!onClose}
@@ -2856,9 +2869,7 @@ function NarratorPanelBody({
 										overflow: "hidden",
 									}}
 								>
-									{!isWorkspacePreview &&
-										!onMinimize &&
-										!chapterId &&
+									{showLeadingChrome &&
 										(onBack ? (
 											<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
 												<IconArrowLeft size={16} />
