@@ -24,6 +24,10 @@ NarraFork 把 AI 会话、开发工具和团队协作放在一个自托管平台
 | `bun run start` | 生产环境：运行数据库迁移 + 启动后端 + 静态前端 |
 | `bun run db:generate` | 生成 Drizzle 迁移 SQL 文件 |
 | `bun run db:migrate` | 执行 `./drizzle/` 中的迁移 |
+| `bun run db:generate:pg --name <name>` | 在隔离目录生成PG增量迁移并更新唯一当前快照 |
+| `bun run db:check:pg` | 检查PG迁移谱系及原生Drizzle当前基线 |
+| `bun run db:baseline:pg` | 将旧PG多快照结构收敛为单基线（不是SQL squash） |
+| `bun run db:resume:pg` | 按摘要校验恢复未完成的PG元数据发布 |
 | `bunx @biomejs/biome check .` | Biome 代码检查 + 格式检查（白名单命令，无需用户批准） |
 | `bunx tsgo --noEmit` | TypeScript 类型检查（白名单命令，无需用户批准） |
 | `bunx @biomejs/biome check --write <file>` | Biome 格式化（白名单命令，建议单文件执行） |
@@ -54,6 +58,12 @@ NarraFork 把 AI 会话、开发工具和团队协作放在一个自托管平台
 - **代码评审特殊规则：** 如果评审中的改动修改了 `server/db/schema.ts` 但尚未生成对应迁移，**不要**把“未生成迁移”列为阻塞项或必须修复项；最多作为非阻塞提醒说明“合并/发布前需要生成迁移”。评审应优先确认 schema 设计和业务逻辑正确，迁移可在评审通过后再生成。
 - **⚠️ 禁止自行删除数据库文件（`~/.narrafork/narrafork.db*`）或 `drizzle/` 目录** — 数据库包含用户数据，删除不可逆。迁移失败时应先尝试修复（如关闭外键检查、调整迁移顺序等），必须由用户明确授权后才能执行删除操作
 - 如用户明确要求全新迁移：删除 `drizzle/` 目录和数据库文件（`~/.narrafork/narrafork.db*`），再运行 `bun run db:generate` + `bun run db:migrate`
+
+**PostgreSQL 迁移元数据规则：**
+- `drizzle-postgres/` 保留全部增量SQL和journal，但全量schema只保留固定的 `meta/current_snapshot.json`；`meta/_snapshot_history.json` 保存小型谱系记录，不增加历史全量快照或压缩归档。
+- PG schema继续由 `bun scripts/generate-postgres-schema.ts` 从SQLite schema转译，再用 `bun run db:generate:pg --name <name>` 生成增量迁移；不要对正式PG目录直接运行裸 `drizzle-kit generate/check/up/drop`。
+- 不改写已发布SQL、编号或journal时间戳；回退已发布结构应追加补偿迁移，不删除历史。尚未发布的custom SQL可以按正常流程填写。
+- 出现pending receipt时使用 `db:resume:pg`；中断遗留锁必须先确认生产者已停止后由操作员修复，不自动抢占锁、不删除故障证据。
 
 **后端主线程性能规则（严格遵守）：**
 - Bun HTTP/WS、`bun:sqlite`、JSON 序列化、同步 FS/crypto/zlib 都可能占用同一个 JS 主线程；任何长时间同步工作都会表现为“所有请求无响应”。

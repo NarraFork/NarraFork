@@ -8,10 +8,10 @@
  *    `pg-proxy` migrator reading the journal on disk. That is what creates
  *    `drizzle.__drizzle_migrations` and writes one row per migration, so the bookkeeping can
  *    be checked against the journal instead of against a guessed row count.
- *  - **Every item is compared, not just totals.** 107 tables, 1540 columns with type /
- *    NOT NULL / primary key / default, 207 foreign keys with both column lists and both
- *    actions, 391 indexes with ordered key columns and predicates, 5 UNIQUE constraints,
- *    1 CHECK, 2 generated columns, 3 identity columns and backing sequences, plus replayed
+ *  - **Every item is compared, not just totals.** Snapshot-defined tables, columns with type /
+ *    NOT NULL / primary key / default, foreign keys with both column lists and both
+ *    actions, indexes with ordered key columns and predicates, UNIQUE and CHECK constraints,
+ *    generated columns, identity columns and backing sequences, plus SQL-replayed
  *    physical column order. Server-side counts are read
  *    separately as a landmark, so a facet query that silently returned nothing cannot pass.
  *  - **Expected expressions are canonicalized by the same server**, never by hand
@@ -34,6 +34,7 @@ import { join } from "node:path";
 import type { PgRemoteDatabase } from "drizzle-orm/pg-proxy";
 import { drizzle as drizzleProxy } from "drizzle-orm/pg-proxy";
 import { migrate } from "drizzle-orm/pg-proxy/migrator";
+import { readBounded, readPgMetadata } from "../../scripts/lib/postgres-migration-metadata";
 import {
 	buildDeparseScript,
 	buildExpected,
@@ -54,6 +55,7 @@ import {
 	psqlProxyCallback,
 	type Snapshot,
 } from "./pg-baseline-model";
+import { physicalColumnOrderFromSql } from "./pg-baseline-sql-order";
 import { withPostgres } from "./pg-test-harness";
 
 const MIGRATIONS_FOLDER = "drizzle-postgres";
@@ -83,14 +85,23 @@ async function loadJournal(): Promise<{
 	return { entries, hashes, statements };
 }
 
-/** The snapshot belonging to the newest journal entry: the state migrations must produce. */
 async function loadSnapshot(entries: JournalEntry[]): Promise<Snapshot> {
-	const tag = entries.at(-1)?.tag ?? "";
-	const prefix = tag.match(/^\d+/)?.[0];
-	if (!prefix) throw new Error(`PostgreSQL migration tag has no numeric prefix: ${tag}`);
-	return JSON.parse(
-		await readFile(`${MIGRATIONS_FOLDER}/meta/${prefix}_snapshot.json`, "utf8"),
-	) as Snapshot;
+	const metadata = readPgMetadata(MIGRATIONS_FOLDER);
+	if (JSON.stringify(metadata.journal.entries) !== JSON.stringify(entries)) {
+		throw new Error("PostgreSQL migration journal changed while reading its current baseline");
+	}
+	return metadata.snapshot as unknown as Snapshot;
+}
+
+function buildMigrationExpected(snapshot: Snapshot, entries: JournalEntry[]) {
+	const built = buildExpected(snapshot);
+	const replay = physicalColumnOrderFromSql(
+		entries.map((entry) => readBounded(`${MIGRATIONS_FOLDER}/${entry.tag}.sql`, 1024 * 1024)),
+		snapshot,
+	);
+	built.expected.columnOrder = replay.order;
+	built.problems.push(...replay.problems);
+	return built;
 }
 
 /** Read every facet, then fold the pages into the comparable catalog. */
@@ -145,8 +156,7 @@ describe("PostgreSQL baseline", () => {
 		async () => {
 			const { entries, hashes, statements } = await loadJournal();
 			const snapshot = await loadSnapshot(entries);
-			const prior = await Promise.all(entries.slice(0, -1).map((entry) => loadSnapshot([entry])));
-			const built = buildExpected(snapshot, prior);
+			const built = buildMigrationExpected(snapshot, entries);
 			const expected = built.expected;
 			const requests = deparseRequests(expected);
 
@@ -429,8 +439,7 @@ SELECT json_build_array((SELECT next_seq FROM narrators WHERE id='fresh-n'), (SE
 					join(baselineFolder, `${entries[0].tag}.sql`),
 				);
 				const snapshot = await loadSnapshot(entries);
-				const prior = await Promise.all(entries.slice(0, -1).map((entry) => loadSnapshot([entry])));
-				const built = buildExpected(snapshot, prior);
+				const built = buildMigrationExpected(snapshot, entries);
 				const result = await withPostgres(async ({ exec }) => {
 					try {
 						const run = async (sql: string) => {
@@ -456,11 +465,57 @@ INSERT INTO narrator_tool_calls (id,narrator_id,message_id,tool_use_id,tool_name
 INSERT INTO narrator_tool_continuations (id,tool_call_id,narrator_id,update_epoch,kind,created_at,updated_at) VALUES ('c1','tc1','old-a','epoch','deferred_tool','t','t'),('c2','tc2','old-a','epoch','deferred_tool','t','t');
 INSERT INTO background_tasks (id,parent_narrator_id,type,status,started_at,created_at,updated_at) VALUES ('b1','old-a','bash','running','t','t','t'),('b2','old-a','bash','running','t','t','t');`);
 						const constraintsSql = `SELECT json_build_object('count',count(*),'signature',md5(string_agg(json_build_array(c.relname,k.conname,pg_get_constraintdef(k.oid))::text,E'\\n' ORDER BY c.relname,k.conname)))::text FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid WHERE k.connamespace='public'::regnamespace`;
-						const oldConstraints = await readJson(exec, constraintsSql, "old constraints");
+						const oldConstraints = (await readJson(exec, constraintsSql, "old constraints")) as {
+							count: number;
+						};
+						expect(oldConstraints.count).toBeGreaterThan(0);
+						// Preserve every old definition, while later migrations may add legitimate constraints.
+						// Keep the evidence in this throwaway DB, not an oversized JSON response or the real DB.
+						await run(`CREATE SCHEMA nf_upgrade_constraint_probe;
+CREATE TABLE nf_upgrade_constraint_probe.before AS
+SELECT c.relname AS table_name, k.conname AS constraint_name, pg_get_constraintdef(k.oid) AS definition
+FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid
+WHERE k.connamespace='public'::regnamespace;`);
 						await apply(MIGRATIONS_FOLDER);
-						expect(await readJson(exec, constraintsSql, "upgraded constraints")).toEqual(
-							oldConstraints,
-						);
+						const preservationSql = `SELECT json_build_object(
+'prior', count(*),
+'missing', count(*) FILTER (WHERE k.oid IS NULL),
+'changed', count(*) FILTER (WHERE k.oid IS NOT NULL AND pg_get_constraintdef(k.oid) IS DISTINCT FROM old.definition)
+)::text FROM nf_upgrade_constraint_probe.before old
+LEFT JOIN pg_class c ON c.relname=old.table_name AND c.relnamespace='public'::regnamespace
+LEFT JOIN pg_constraint k ON k.conrelid=c.oid AND k.conname=old.constraint_name;`;
+						const preservation = () =>
+							readJson(exec, preservationSql, "old constraint preservation");
+						expect(await preservation()).toEqual({
+							prior: oldConstraints.count,
+							missing: 0,
+							changed: 0,
+						});
+						// Negative controls mutate only the probe evidence: no real constraint is dropped.
+						await run(`UPDATE nf_upgrade_constraint_probe.before SET definition='__nf_changed__'||definition
+WHERE (table_name,constraint_name)=(SELECT table_name,constraint_name FROM nf_upgrade_constraint_probe.before ORDER BY table_name,constraint_name LIMIT 1);`);
+						expect(await preservation()).toEqual({
+							prior: oldConstraints.count,
+							missing: 0,
+							changed: 1,
+						});
+						await run(`UPDATE nf_upgrade_constraint_probe.before SET definition=substr(definition,length('__nf_changed__')+1)
+WHERE left(definition,length('__nf_changed__'))='__nf_changed__';
+UPDATE nf_upgrade_constraint_probe.before SET table_name='__nf_missing__'||table_name
+WHERE (table_name,constraint_name)=(SELECT table_name,constraint_name FROM nf_upgrade_constraint_probe.before ORDER BY table_name,constraint_name LIMIT 1);`);
+						expect(await preservation()).toEqual({
+							prior: oldConstraints.count,
+							missing: 1,
+							changed: 0,
+						});
+						await run(`UPDATE nf_upgrade_constraint_probe.before SET table_name=substr(table_name,length('__nf_missing__')+1)
+WHERE left(table_name,length('__nf_missing__'))='__nf_missing__';`);
+						expect(await preservation()).toEqual({
+							prior: oldConstraints.count,
+							missing: 0,
+							changed: 0,
+						});
+						await run("DROP SCHEMA nf_upgrade_constraint_probe CASCADE;");
 						const queryRows = async (sql: string) =>
 							(await readJson(
 								exec,
@@ -548,7 +603,7 @@ INSERT INTO narrator_tool_continuations (id,tool_call_id,narrator_id,update_epoc
 							...canonical.problems,
 							...compareBaseline(built.expected, read.catalog, canonical.canonical, counts),
 						]).toEqual([]);
-						expect(counts.foreignKeys).toBe(207);
+						expect(counts.foreignKeys).toBe(built.expected.counts.foreignKeys);
 						expect(counts.identityColumns).toBe(3);
 						expect(counts.sequences).toBe(3);
 						const ledger = await queryRows(

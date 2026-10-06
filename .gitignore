@@ -70,6 +70,17 @@ scripts/lib/__tests__/*
 !scripts/generate-postgres-schema.ts
 !scripts/check-postgres-schema-parity.ts
 !scripts/finalize-postgres-seq-counter-migration.ts
+# PG generation retains one schema baseline; helpers and gates must survive fresh clones.
+!scripts/postgres-migrations.ts
+!scripts/lib/postgres-kit.ts
+!scripts/lib/postgres-migration-metadata.ts
+!scripts/lib/postgres-migration-transaction.ts
+!scripts/lib/__tests__/postgres-kit.test.ts
+!scripts/lib/__tests__/postgres-migration-metadata.test.ts
+!scripts/lib/__tests__/postgres-migration-transaction.test.ts
+# Interrupted PG publication evidence is local, never a committed migration asset.
+drizzle-postgres/meta/_generation.lock/
+drizzle-postgres/meta/_generation_pending.json
 # Canonical SQLite schema generation must be reproducible in fresh clones.
 !scripts/generate-sqlite-migrations.ts
 !scripts/finalize-sqlite-resource-migration.ts

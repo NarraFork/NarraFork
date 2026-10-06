@@ -1326,3 +1326,231 @@ describe("expression canonicalization", () => {
 		expect(parsed.problems).toEqual(["deparse: unreadable row not json"]);
 	});
 });
+
+describe("server-canonical expression defaults", () => {
+	function expressionFixture(expression = "CURRENT_TIMESTAMP", parsed = "(CURRENT_TIMESTAMP)") {
+		const state = fixture();
+		const column = find(
+			state.expected.columns,
+			(c) => c.table === "child" && c.name === "kind",
+			"expected default column",
+		);
+		const actual = find(
+			state.catalog.columns,
+			(c) => c.table === "child" && c.name === "kind",
+			"actual default column",
+		);
+		column.default = expression;
+		actual.default = parsed;
+		state.canonical.set(deparseKey("default", "child", expression, column.type), parsed);
+		return { ...state, column, actual };
+	}
+	const compareState = (state: ReturnType<typeof expressionFixture>) =>
+		compareBaseline(state.expected, state.catalog, state.canonical, state.counts);
+
+	it("accepts PostgreSQL's target-type canonical form instead of rewriting parentheses", () => {
+		const state = expressionFixture();
+		expect(compareState(state)).toEqual([]);
+		const requests = deparseRequests(state.expected).filter(
+			(request) => request.kind === "default",
+		);
+		expect(requests).toHaveLength(1);
+		expect(requests[0]).toMatchObject({ table: "child", type: "text", text: "CURRENT_TIMESTAMP" });
+		const script = buildDeparseScript(requests);
+		expect(script).toContain("ADD COLUMN nf_def_4 text DEFAULT (CURRENT_TIMESTAMP);");
+		expect(script).toContain("pg_get_expr(d.adbin, d.adrelid)");
+		expect(script).toContain("nf\\_def\\_%");
+		expect(script).not.toContain("ALTER TABLE public.");
+	});
+
+	it("requires a server answer even if raw snapshot and catalog strings happen to agree", () => {
+		const state = expressionFixture("CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP");
+		state.canonical.delete(deparseKey("default", "child", "CURRENT_TIMESTAMP", "text"));
+		expect(compareState(state)).toEqual(["default child.kind: no canonical form available"]);
+	});
+
+	it("does not use a canonical result for a different target type", () => {
+		const state = expressionFixture();
+		state.canonical.delete(deparseKey("default", "child", "CURRENT_TIMESTAMP", "text"));
+		state.canonical.set(
+			deparseKey("default", "child", "CURRENT_TIMESTAMP", "timestamp"),
+			"CURRENT_TIMESTAMP",
+		);
+		expect(compareState(state)).toEqual(["default child.kind: no canonical form available"]);
+	});
+
+	it("rejects a literal CURRENT_TIMESTAMP in place of the SQL expression", () => {
+		const state = expressionFixture();
+		state.actual.default = "'CURRENT_TIMESTAMP'::text";
+		expect(compareState(state)).toEqual([expect.stringContaining("default child.kind: expected")]);
+	});
+
+	it("keeps a quoted keyword literal on the original literal-normalization path", () => {
+		const state = expressionFixture();
+		state.column.default = "'CURRENT_TIMESTAMP'";
+		state.actual.default = "'CURRENT_TIMESTAMP'::text";
+		expect(deparseRequests(state.expected).filter((request) => request.kind === "default")).toEqual(
+			[],
+		);
+		expect(compareState(state)).toEqual([]);
+		state.actual.default = "(CURRENT_TIMESTAMP)";
+		expect(compareState(state)).toEqual([expect.stringContaining("column child.kind: expected")]);
+	});
+
+	it("compares precision, expression and server-provided casts verbatim", () => {
+		const precision = expressionFixture("CURRENT_TIMESTAMP(3)", "(CURRENT_TIMESTAMP(3))");
+		precision.actual.default = "(CURRENT_TIMESTAMP(6))";
+		expect(compareState(precision)).toEqual([
+			expect.stringContaining("default child.kind: expected"),
+		]);
+		const functionChange = expressionFixture("now()", "(now())");
+		functionChange.actual.default = "(clock_timestamp())";
+		expect(compareState(functionChange)).toEqual([
+			expect.stringContaining("default child.kind: expected"),
+		]);
+		const castChange = expressionFixture("now()::text", "(now())::text");
+		castChange.actual.default = "(now())";
+		expect(compareState(castChange)).toEqual([
+			expect.stringContaining("default child.kind: expected"),
+		]);
+	});
+
+	it("reports a dropped expression default and a changed target column type", () => {
+		const dropped = expressionFixture();
+		dropped.actual.default = null;
+		expect(compareState(dropped)).toEqual([
+			expect.stringContaining("default child.kind: expected"),
+		]);
+		const changedType = expressionFixture();
+		changedType.actual.type = "timestamp";
+		expect(compareState(changedType)).toEqual([
+			expect.stringContaining("column child.kind: expected"),
+		]);
+	});
+
+	it("keeps casts of literals to a different type distinct", () => {
+		const state = expressionFixture();
+		state.column.default = "'{}'::jsonb";
+		state.actual.default = "'{}'::text";
+		expect(deparseRequests(state.expected).filter((request) => request.kind === "default")).toEqual(
+			[],
+		);
+		expect(compareState(state)).toEqual([expect.stringContaining("column child.kind: expected")]);
+	});
+
+	it("deduplicates the same table/expression/type but preserves distinct target types", () => {
+		const state = expressionFixture();
+		state.expected.columns.push({ ...state.column, name: "same_type" });
+		state.expected.columns.push({
+			...state.column,
+			name: "other_type",
+			type: "timestamp(3) with time zone",
+		});
+		const requests = deparseRequests(state.expected).filter(
+			(request) => request.kind === "default",
+		);
+		expect(requests).toHaveLength(2);
+		expect(requests.map((request) => request.type)).toEqual([
+			"text",
+			"timestamp(3) with time zone",
+		]);
+		expect(deparseKey("default", "child", "CURRENT_TIMESTAMP", "text")).not.toBe(
+			deparseKey("default", "child", "CURRENT_TIMESTAMP", "timestamp(3) with time zone"),
+		);
+		const script = buildDeparseScript(requests);
+		expect(script).toContain("timestamp(3) with time zone DEFAULT (CURRENT_TIMESTAMP)");
+	});
+
+	it("maps each returned default canonical form using its target-type key", () => {
+		const state = expressionFixture();
+		state.expected.columns.push({ ...state.column, name: "other_type", type: "timestamp" });
+		const requests = deparseRequests(state.expected).filter(
+			(request) => request.kind === "default",
+		);
+		const output = requests
+			.map((request) =>
+				JSON.stringify([
+					`nf_${request.id}`,
+					request.type === "text" ? "(CURRENT_TIMESTAMP)" : "CURRENT_TIMESTAMP",
+				]),
+			)
+			.join("\n");
+		const parsed = parseDeparseOutput(requests, output);
+		expect(parsed.problems).toEqual([]);
+		expect(parsed.canonical.size).toBe(2);
+		expect(parsed.canonical.get(deparseKey("default", "child", "CURRENT_TIMESTAMP", "text"))).toBe(
+			"(CURRENT_TIMESTAMP)",
+		);
+		expect(
+			parsed.canonical.get(deparseKey("default", "child", "CURRENT_TIMESTAMP", "timestamp")),
+		).toBe("CURRENT_TIMESTAMP");
+		const partial = parseDeparseOutput(requests, output.split("\n")[0]);
+		expect(partial.canonical.size).toBe(1);
+		expect(partial.problems).toEqual(["deparse: server returned nothing for default on child"]);
+	});
+
+	it("does not create hundreds of scratch columns for numeric/boolean/quoted literals", () => {
+		const built = buildExpected(snapshot());
+		const template = find(
+			built.expected.columns,
+			(column) => column.table === "child" && column.name === "kind",
+			"literal template",
+		);
+		for (let i = 0; i < 600; i++) {
+			built.expected.columns.push({
+				...template,
+				name: `literal_${i}`,
+				type: i % 3 === 0 ? "integer" : i % 3 === 1 ? "boolean" : "text",
+				default: i % 3 === 0 ? String(i) : i % 3 === 1 ? "false" : "'literal''s text'::text",
+			});
+		}
+		for (let i = 0; i < 4; i++) {
+			built.expected.columns.push({
+				...template,
+				table: `default_table_${i}`,
+				name: "created_at",
+				default: "CURRENT_TIMESTAMP",
+			});
+		}
+		const requests = deparseRequests(built.expected);
+		expect(requests.filter((request) => request.kind === "default")).toHaveLength(4);
+		expect(requests).toHaveLength(7);
+		expect(buildDeparseScript(requests).match(/ ADD COLUMN nf_def_/g)).toHaveLength(4);
+	});
+
+	it("delegates quoted-literal expressions, array defaults and escape strings to PostgreSQL", () => {
+		const state = expressionFixture();
+		for (const expression of [
+			"('CURRENT_TIMESTAMP')",
+			"'a' || 'b'",
+			"ARRAY[1,2]",
+			"E'escaped\\\\text'",
+			"$$quoted$$",
+			"1 + 2",
+		]) {
+			state.column.default = expression;
+			const requests = deparseRequests(state.expected).filter(
+				(request) => request.kind === "default",
+			);
+			expect(requests).toHaveLength(1);
+			expect(requests[0].text).toBe(expression);
+		}
+	});
+
+	it("rejects null, invalid and duplicate canonical rows rather than stringifying them", () => {
+		const requests = deparseRequests(expressionFixture().expected).filter(
+			(request) => request.kind === "default",
+		);
+		const name = `nf_${requests[0].id}`;
+		for (const value of [null, 0, ""]) {
+			const parsed = parseDeparseOutput(requests, JSON.stringify([name, value]));
+			expect(parsed.canonical.size).toBe(0);
+			expect(parsed.problems).toHaveLength(2);
+			expect(parsed.problems[0]).toContain("unexpected row shape");
+		}
+		const row = JSON.stringify([name, "(CURRENT_TIMESTAMP)"]);
+		expect(parseDeparseOutput(requests, `${row}\n${row}`).problems).toEqual([
+			`deparse: duplicate result name ${name}`,
+		]);
+	});
+});
