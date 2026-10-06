@@ -917,12 +917,16 @@ export interface AgentHistoryReplacement {
 }
 
 export interface AgentConfig {
-	/** Freeze an already-recorded numeric cache at input preparation; never rebuild on this path. */
+	/** Prepare and pin numeric classification within a bounded, cancellable pre-transport budget. */
 	freezeContextComposition?: (
 		counts: import("@shared/context-usage").ContextInputCharacters | null,
 		requestId: string,
 		startedAt: string,
-	) => import("@shared/context-composition").ContextCharCache | null;
+		signal: AbortSignal,
+	) =>
+		| import("@shared/context-composition").ContextCharCache
+		| null
+		| Promise<import("@shared/context-composition").ContextCharCache | null>;
 	narratorId: string;
 	conversationId: string;
 	model: string;

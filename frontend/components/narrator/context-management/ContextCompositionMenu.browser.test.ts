@@ -208,17 +208,35 @@ const data: ContextComposition = {
 							{},
 							label,
 						);
-						expect(
-							await page.$eval('[data-testid="context-composition-bar"] button', (button) =>
-								button.getAttribute("aria-label"),
-							),
-						).toContain(
-							source === "upstream"
-								? "23.2K · 25.0%"
-								: source === "usage"
-									? "12.8K · 25.0%"
-									: "10K · 25.0%",
+						const calibratedBar = await page.$eval(
+							'[data-testid="context-composition-bar"]',
+							(bar) => {
+								const buttons = Array.from(bar.querySelectorAll("button"));
+								const width = bar.getBoundingClientRect().width;
+								return {
+									firstTokens: buttons[0]?.getAttribute("aria-label"),
+									firstWidth: (buttons[0]?.getBoundingClientRect().width ?? 0) / width,
+									filled:
+										buttons.reduce(
+											(total, button) => total + button.getBoundingClientRect().width,
+											0,
+										) / width,
+									background: getComputedStyle(bar).backgroundColor,
+									noMore: !bar.querySelector('[data-testid="context-composition-more"]'),
+								};
+							},
 						);
+						expect(calibratedBar.firstTokens).toContain(
+							source === "upstream"
+								? "23.2K · 2.5%"
+								: source === "usage"
+									? "12.8K · 2.5%"
+									: "10K · 2.5%",
+						);
+						expect(calibratedBar.firstWidth).toBeCloseTo(0.025, 3);
+						expect(calibratedBar.filled).toBeCloseTo(0.1, 3);
+						expect(calibratedBar.background).not.toBe("rgba(0, 0, 0, 0)");
+						expect(calibratedBar.noMore).toBe(true);
 						expect(await page.evaluate(() => document.body.innerText.match(/~/g)?.length)).toBe(1);
 					}
 					await page.waitForSelector('[data-testid="context-composition-menu"]', { visible: true });

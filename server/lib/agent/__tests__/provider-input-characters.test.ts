@@ -141,7 +141,10 @@ describe("providers report their final logical inputs", () => {
 						history: item.history,
 						model: item.model,
 						tools: item.tools,
-						onInputCharacters: (counts) => snapshots.push(counts),
+						onInputCharacters: async (counts) => {
+							await new Promise<void>((resolve) => setTimeout(resolve, 0));
+							snapshots.push(counts);
+						},
 					}),
 				);
 			} catch {
@@ -204,7 +207,9 @@ describe("providers report their final logical inputs", () => {
 							{ role, content: "historical prefix" },
 							{ role: "user", content: "old user" },
 						],
-						onInputCharacters: (value) => snapshots.push(value),
+						onInputCharacters: (value) => {
+							snapshots.push(value);
+						},
 					}),
 				);
 			} catch {
@@ -255,7 +260,12 @@ describe("providers report their final logical inputs", () => {
 			try {
 				await drive(
 					delegate,
-					params({ history: currentHistory, onInputCharacters: (value) => snapshots.push(value) }),
+					params({
+						history: currentHistory,
+						onInputCharacters: (value) => {
+							snapshots.push(value);
+						},
+					}),
 				);
 			} catch {
 				/* Mocked failure. */
@@ -290,7 +300,9 @@ describe("providers report their final logical inputs", () => {
 					params({
 						model: "codex:gpt-5.5",
 						history: historical ? [{ role: "developer", content: CODEX_DEFAULT_INSTRUCTIONS }] : [],
-						onInputCharacters: (value) => snapshots.push(value),
+						onInputCharacters: (value) => {
+							snapshots.push(value);
+						},
 					}),
 				);
 			} catch {
@@ -334,7 +346,9 @@ describe("providers report their final logical inputs", () => {
 				params({
 					model: "input:gemini-2.5-pro",
 					history: [{ role: "user", parts: [{ functionResponse: native }] }],
-					onInputCharacters: (value) => snapshots.push(value),
+					onInputCharacters: (value) => {
+						snapshots.push(value);
+					},
 				}),
 			);
 		} catch {
@@ -402,7 +416,9 @@ describe("providers report their final logical inputs", () => {
 			history,
 			tools,
 			toolResults: [toolResult],
-			onInputCharacters: (value) => snapshots.push(value),
+			onInputCharacters: (value) => {
+				snapshots.push(value);
+			},
 		});
 		try {
 			await drive(provider, chat);
@@ -458,7 +474,12 @@ describe("providers report their final logical inputs", () => {
 		}) as unknown as typeof fetch;
 		await drive(
 			openai(),
-			params({ maxOutputTokens: 128, onInputCharacters: (counts) => snapshots.push(counts) }),
+			params({
+				maxOutputTokens: 128,
+				onInputCharacters: (counts) => {
+					snapshots.push(counts);
+				},
+			}),
 		);
 		expect(requests).toBe(2);
 		expect(snapshots).toHaveLength(2);
@@ -546,7 +567,9 @@ describe("providers report their final logical inputs", () => {
 					history,
 					content: "first",
 					conversationId: `input-ws-${managed}`,
-					onInputCharacters: (counts) => snapshots.push(counts),
+					onInputCharacters: (counts) => {
+						snapshots.push(counts);
+					},
 				});
 				await drive(provider, chat);
 				provider.pushUserTurn(history, "first", chat.model, []);

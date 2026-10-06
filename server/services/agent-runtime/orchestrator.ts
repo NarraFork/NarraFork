@@ -1228,13 +1228,14 @@ export async function runAgentLoopUnlocked(
 						: undefined,
 				systemPrompt: active.systemPrompt ?? undefined,
 				onToolsCharacters: (toolsChars) => storeRuntimeCharacters({ toolsChars }),
-				freezeContextComposition: (counts, requestId, startedAt) =>
+				freezeContextComposition: (counts, requestId, startedAt, signal) =>
 					freezeNarratorContextComposition(
 						narratorId,
 						counts,
 						requestId,
 						startedAt,
 						runtimeSummaryChars,
+						signal,
 					),
 				locale,
 				signal: active.abortController.signal,

@@ -152,7 +152,27 @@ let overflowPending = false;
 let overflowFlushing = false;
 let overflowRetries = 0;
 let overflowBlocked = false;
-const flushingNarrators = new Set<string>();
+const flushingNarrators = new Map<string, PendingCharacterRefresh>();
+const writeObservers = new Set<(narratorId: string, messageId?: string) => void>();
+/** Bounded request observers receive IDs only, including writes owned by a shared-message holder. */
+export function observeContextCharacterWrites(
+	changed: (narratorId: string, messageId?: string) => void,
+): () => void {
+	writeObservers.add(changed);
+	return () => {
+		writeObservers.delete(changed);
+	};
+}
+/** References to the bounded notification queue; no history/body reads or copies. */
+export function* pendingContextCharacterWrites(): Iterable<{
+	narratorId: string;
+	messageIds: Iterable<string>;
+}> {
+	for (const [narratorId, entry] of pendingRefreshes)
+		yield { narratorId, messageIds: entry.messages };
+	for (const [narratorId, entry] of flushingNarrators)
+		yield { narratorId, messageIds: entry.messages };
+}
 let refreshScheduled = false;
 let refreshRunning = false;
 
@@ -186,7 +206,7 @@ function scheduleContextCharacterRefresh(): void {
 			const overflow = overflowPending;
 			overflowPending = false;
 			overflowFlushing = overflow;
-			for (const [id] of ids) flushingNarrators.add(id);
+			for (const [id, entry] of ids) flushingNarrators.set(id, entry);
 			void import("../services/narrator-context-composition")
 				.then(async (service) => {
 					if (overflow) {
@@ -238,6 +258,7 @@ function scheduleContextCharacterRefresh(): void {
 
 /** Coalesce numeric changes before the asynchronous service invalidation; never read a body. */
 export function queueContextCharacterRefresh(narratorId: string, messageId?: string): void {
+	for (const changed of writeObservers) changed(narratorId, messageId);
 	if (overflowBlocked) {
 		// A later actual write can retry an unavailable service; no endless hot retry loop.
 		overflowBlocked = false;

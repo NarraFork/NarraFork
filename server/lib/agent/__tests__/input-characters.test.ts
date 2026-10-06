@@ -225,7 +225,9 @@ describe("complete logical input characters", () => {
 		const snapshots: unknown[] = [];
 		const params = {
 			signal: new AbortController().signal,
-			onInputCharacters: (value: unknown) => snapshots.push(value),
+			onInputCharacters: (value: unknown) => {
+				snapshots.push(value);
+			},
 		};
 		try {
 			for (let retry = 0; retry < 3; retry++) {
@@ -267,7 +269,9 @@ describe("complete logical input characters", () => {
 		const snapshots: unknown[] = [];
 		const params = {
 			signal: new AbortController().signal,
-			onInputCharacters: (value: unknown) => snapshots.push(value),
+			onInputCharacters: (value: unknown) => {
+				snapshots.push(value);
+			},
 		};
 		try {
 			await reportInputCharacters(params, { input: "text" }, { maxMilliseconds: 1000 });
@@ -438,4 +442,33 @@ describe("complete logical input characters", () => {
 			{ totalChars: 6, systemChars: 0, toolsChars: 0 },
 		]);
 	});
+});
+
+test("report awaits asynchronous numeric preparation before returning to provider transport", async () => {
+	let release!: () => void;
+	let entered!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const ready = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	let complete = false;
+	const reporting = reportInputCharacters(
+		{
+			signal: new AbortController().signal,
+			onInputCharacters: async (counts) => {
+				expect(counts?.totalChars).toBe(5);
+				entered();
+				await gate;
+				complete = true;
+			},
+		},
+		{ input: "input" },
+	);
+	await ready;
+	expect(complete).toBe(false);
+	release();
+	await reporting;
+	expect(complete).toBe(true);
 });

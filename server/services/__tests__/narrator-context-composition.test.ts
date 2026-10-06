@@ -429,9 +429,11 @@ test("real Anthropic formatter and final body callback project legacy fixed coun
 					"UPDATE narrators SET context_system_chars=?,context_summary_chars=0,context_tools_chars=?,context_usage_snapshot_json=NULL,context_char_revision=context_char_revision+1 WHERE id='n'",
 				)
 				.run(systemOnly, oldToolsChars);
-			if (numberOfTools === 0) message("known-variable", 1, [{ category: "user", chars: 5 }]);
-			await ready();
-			await service.settled();
+			if (numberOfTools === 0) {
+				message("known-variable", 1, [{ category: "user", chars: 5 }]);
+				message("current-variable", 2, [{ category: "user", chars: 7 }]);
+			}
+			// Match production: do not prewarm or drain the numeric cache before sending.
 			let received: ContextInputCharacters | null = null;
 			let sent: unknown;
 			globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
@@ -450,9 +452,9 @@ test("real Anthropic formatter and final body callback project legacy fixed coun
 					tools,
 					toolResults: [],
 					signal: new AbortController().signal,
-					onInputCharacters: (counts) => {
+					onInputCharacters: async (counts) => {
 						received = counts;
-						service.freeze(
+						await service.freezeForRequest(
 							"n",
 							counts,
 							`request-real-${numberOfTools}`,
@@ -474,7 +476,7 @@ test("real Anthropic formatter and final body callback project legacy fixed coun
 			expect(counts.toolsChars).not.toBe(oldToolsChars);
 			const projected = await service.get("n");
 			expect(projected.usage?.composition).not.toBeNull();
-			expect(projected.totalChars).toBe(counts.systemChars + counts.toolsChars + 5);
+			expect(projected.totalChars).toBe(counts.systemChars + counts.toolsChars + 12);
 			expect(projected.totals.find((item) => item.category === "summary")?.chars).toBe(
 				summary.length,
 			);
@@ -498,6 +500,7 @@ test("real Anthropic formatter and final body callback project legacy fixed coun
 			expect(all.reduce((sum, item) => sum + item.chars, 0)).toBe(projected.totalChars);
 			expect(all.filter((item) => item.category === "user")).toEqual([
 				{ category: "user", chars: 5 },
+				{ category: "user", chars: 7 },
 			]);
 		}
 	} finally {
@@ -681,7 +684,7 @@ test("warm 1000 refs rereads only one dirty contribution, fresh GET never rebuil
 	expect(metrics).toHaveLength(1);
 });
 
-test("production debounce coalesces burst and freezes fixed-only while dirty", async () => {
+test("production debounce coalesces writes but request preparation expedites the complete numeric pin", async () => {
 	await service.dispose();
 	const metrics: import("../narrator-context-composition").ContextRebuildMetrics[] = [];
 	service = createContextCharacterService(database, { onMetrics: (item) => metrics.push(item) });
@@ -691,18 +694,18 @@ test("production debounce coalesces burst and freezes fixed-only while dirty", a
 	for (let i = 0; i < 10; i++) await service.invalidateBatch("n", ["m"]);
 	expect((await service.get("n")).pending).toBe(true);
 	expect(metrics).toHaveLength(0);
-	expect(
-		service.freeze(
-			"n",
-			{ totalChars: 50, systemChars: 3, toolsChars: 2 },
-			"dirty",
-			"2026-10-05T00:00:00Z",
-		)?.totalChars,
-	).toBe(5);
+	const pin = await service.freezeForRequest(
+		"n",
+		{ totalChars: 50, systemChars: 3, toolsChars: 2 },
+		"dirty",
+		"2026-10-05T00:00:00Z",
+	);
+	expect(pin?.totalChars).toBe(6);
 	await service.settled();
-	expect(metrics).toHaveLength(1);
+	expect((await service.get("n")).totalChars).toBe(6);
+	expect((await service.get("n")).totals.find((item) => item.category === "user")?.chars).toBe(1);
+	expect(metrics.filter((item) => item.rows > 0)).toHaveLength(1);
 	expect(metrics[0]).toMatchObject({ mode: "incremental", rows: 1 });
-	expect(metrics[0].waitMs).toBeGreaterThanOrEqual(80);
 });
 
 test("dirty removal and unnotified append tail converge without scanning old refs", async () => {
@@ -1099,4 +1102,193 @@ test("dispose stops and awaits a running global mark sweep before closing its SQ
 		database.query("SELECT COUNT(*) AS count FROM narrators WHERE context_char_revision > 0").get(),
 	).toEqual({ count: marked });
 	await service.settled();
+});
+
+test("request preparation on a cold new session includes text and tool contributions without prewarming", async () => {
+	await service.dispose();
+	service = createContextCharacterService(database);
+	database.run("UPDATE narrators SET context_system_chars=7,context_tools_chars=13 WHERE id='n'");
+	message("new-user", 1, [{ category: "user", chars: 100 }]);
+	message(
+		"new-assistant",
+		2,
+		[
+			{ category: "assistant", chars: 200 },
+			{ category: "toolCall", chars: 0, toolUseId: "new-call" },
+		],
+		"assistant",
+	);
+	database.run(
+		"INSERT INTO narrator_tool_calls(id,narrator_id,message_id,tool_use_id,input_chars,output_chars) VALUES ('new-tool','n','new-assistant','new-call',30,40)",
+	);
+	await service.invalidateBatch("n", ["new-user", "new-assistant"]);
+	const pin = await service.freezeForRequest(
+		"n",
+		{ totalChars: 400, systemChars: 7, toolsChars: 13 },
+		"cold-request",
+		"2026-10-05T00:00:00Z",
+	);
+	expect(pin?.totalChars).toBe(390);
+	const result = await service.get("n");
+	expect(result.pending).toBe(false);
+	expect(result.totals.filter((item) => item.chars > 0)).toEqual([
+		{ category: "system", chars: 7 },
+		{ category: "toolDefinition", chars: 13 },
+		{ category: "user", chars: 100 },
+		{ category: "assistant", chars: 200 },
+		{ category: "toolCall", chars: 30 },
+		{ category: "toolResult", chars: 40 },
+	]);
+});
+
+test("new input immediately after a warm request is classified and later output cannot change its pin", async () => {
+	await service.dispose();
+	service = createContextCharacterService(database);
+	message("before", 1, [{ category: "user", chars: 10 }]);
+	const counts = { totalChars: 1000, systemChars: 7, toolsChars: 13 };
+	await service.freezeForRequest("n", counts, "first-request", "2026-10-05T00:00:00Z");
+	message("answer", 2, [{ category: "assistant", chars: 20 }], "assistant");
+	message("next-user", 3, [{ category: "user", chars: 5 }]);
+	await service.invalidateBatch("n", ["answer", "next-user"]);
+	const pin = await service.freezeForRequest("n", counts, "second-request", "2026-10-05T00:01:00Z");
+	expect(pin?.totalChars).toBe(55);
+	message("future-output", 4, [{ category: "assistant", chars: 500 }], "assistant");
+	await service.invalidateBatch("n", ["future-output"]);
+	await service.settled();
+	expect((await service.get("n")).totalChars).toBe(55);
+	expect((await service.get("n")).generation).toBe(pin?.generation ?? null);
+	await service.dispose();
+	service = createContextCharacterService(database);
+	expect((await service.get("n")).totalChars).toBe(55);
+});
+
+test("request preparation uses bounded pages and retains an immutable request after restart", async () => {
+	for (let i = 0; i < 300; i++) message(`request-page-${i}`, i, [{ category: "user", chars: 1 }]);
+	const pin = await service.freezeForRequest(
+		"n",
+		{ totalChars: 1000, systemChars: 12, toolsChars: 3 },
+		"prepared-pages",
+		"2026-10-05T00:00:00Z",
+		2,
+	);
+	expect(pin?.totalChars).toBe(315);
+	let result = await service.get("n");
+	const segments = [...result.segments];
+	while (result.nextCursor) {
+		result = await service.get("n", undefined, result.nextCursor);
+		expect(result.segments.length).toBeLessThanOrEqual(128);
+		segments.push(...result.segments);
+	}
+	expect(segments.reduce((sum, item) => sum + item.chars, 0)).toBe(315);
+	expect(segments.filter((item) => item.category === "user")).toHaveLength(300);
+	await service.dispose();
+	service = createContextCharacterService(database);
+	expect((await service.get("n")).generation).toBe(pin?.generation ?? null);
+});
+
+test("request preparation budget failure retains input counts without a fixed-only pin", async () => {
+	await service.dispose();
+	service = createContextCharacterService(database, { preparationBudgetMs: 0 });
+	message("budget-user", 1, [{ category: "user", chars: 10 }]);
+	const counts = { totalChars: 100, systemChars: 7, toolsChars: 13 };
+	expect(
+		await service.freezeForRequest("n", counts, "budget-request", "2026-10-05T00:00:00Z"),
+	).toBeNull();
+	const first = await service.get("n");
+	expect(first.usage?.inputCharacters).toEqual(counts);
+	expect(first.usage?.composition).toBeNull();
+	await service.settled();
+	expect((await service.get("n")).totals.find((item) => item.category === "user")?.chars).toBe(10);
+});
+
+test("cancelled preparation does not replace an existing request pin", async () => {
+	message("abort-user", 1, [{ category: "user", chars: 10 }]);
+	const counts = { totalChars: 100, systemChars: 7, toolsChars: 13 };
+	const pin = await service.freezeForRequest("n", counts, "before-abort", "2026-10-05T00:00:00Z");
+	await service.settled();
+	for (let i = 0; i < 300; i++) message(`abort-tail-${i}`, i + 2, [{ category: "user", chars: 1 }]);
+	await service.invalidate("n");
+	const controller = new AbortController();
+	const preparing = service.freezeForRequest(
+		"n",
+		counts,
+		"aborted-request",
+		"2026-10-05T00:01:00Z",
+		0,
+		controller.signal,
+	);
+	controller.abort();
+	expect(await preparing).toBeNull();
+	expect((await service.get("n")).generation).toBe(pin?.generation ?? null);
+	expect((await service.get("n")).usage?.requestId).toBe("before-abort");
+});
+
+test("a transcript revision arriving during preparation cannot be classified as the earlier input", async () => {
+	message("revision-user", 1, [{ category: "user", chars: 10 }]);
+	const counts = { totalChars: 1000, systemChars: 7, toolsChars: 13 };
+	const preparing = service.freezeForRequest(
+		"n",
+		counts,
+		"revision-request",
+		"2026-10-05T00:00:00Z",
+	);
+	message("revision-later", 2, [{ category: "assistant", chars: 500 }], "assistant");
+	await service.invalidate("n");
+	expect(await preparing).toBeNull();
+	expect((await service.get("n")).usage?.composition).toBeNull();
+});
+
+test("warm request ignores optional cleanup queued behind other actors' cold rebuilds", async () => {
+	await service.dispose();
+	service = createContextCharacterService(database, { debounceMs: 0, preparationBudgetMs: 20 });
+	for (let i = 0; i < 2000; i++) message(`cleanup-warm-${i}`, i, [{ category: "user", chars: 1 }]);
+	await ready();
+	for (const id of ["cleanup-a", "cleanup-b"]) {
+		database.query("INSERT INTO narrators(id) VALUES (?)").run(id);
+		database
+			.query(
+				"INSERT INTO narrator_message_refs SELECT ?,message_id,seq,is_compact,segment_compact_id FROM narrator_message_refs WHERE narrator_id='n'",
+			)
+			.run(id);
+		await service.get(id);
+	}
+	await new Promise<void>((resolve) => setTimeout(resolve, 0));
+	// Remote plugins may first report unknown before delivering their final counts.
+	await service.freezeForRequest("n", null, "cleanup-unknown", "2026-10-05T00:00:00Z");
+	const pin = await service.freezeForRequest(
+		"n",
+		{ totalChars: 10000, systemChars: 7, toolsChars: 13 },
+		"cleanup-ready",
+		"2026-10-05T00:00:00Z",
+	);
+	expect(pin?.totalChars).toBe(2020);
+	expect(pin?.totals.find((item) => item.category === "user")?.chars).toBe(2000);
+});
+
+test("unrelated in-flight shared-holder fanout cannot block an already warm request", async () => {
+	await service.dispose();
+	service = createContextCharacterService(database, { debounceMs: 0, preparationBudgetMs: 20 });
+	message("own-unrelated", 1, [{ category: "user", chars: 9 }]);
+	await ready();
+	database.run(
+		"INSERT INTO narrators(id) VALUES ('unrelated-owner'); INSERT INTO narrator_messages(id,role,context_chars_json) VALUES ('unrelated-shared','user','{\"segments\":[{\"category\":\"user\",\"chars\":5}]}')",
+	);
+	for (let i = 0; i < 300; i++) {
+		const id = `unrelated-holder-${i}`;
+		database.query("INSERT INTO narrators(id) VALUES (?)").run(id);
+		database
+			.query(
+				"INSERT INTO narrator_message_refs(narrator_id,message_id,seq) VALUES (?,'unrelated-shared',1)",
+			)
+			.run(id);
+	}
+	const fanout = service.invalidateBatch("unrelated-owner", ["unrelated-shared"]);
+	const pin = await service.freezeForRequest(
+		"n",
+		{ totalChars: 100, systemChars: 7, toolsChars: 13 },
+		"unrelated-in-flight",
+		"2026-10-05T00:00:00Z",
+	);
+	expect(pin?.totalChars).toBe(29);
+	await fanout;
 });
