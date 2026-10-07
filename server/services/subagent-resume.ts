@@ -18,6 +18,7 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { getRuntimePublicationService } from "./agent-runtime/publication";
 import { resolveRuntimeQueueBackend } from "./agent-runtime/runtime-queue-port";
 import { classifyRuntimeWriteError, runAtomicWrite } from "./agent-runtime/runtime-write";
+import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
 import {
 	withNarratorMutationAdmission,
@@ -487,6 +488,10 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 					eq(backgroundTasks.logicalRunId, logicalRunId),
 				),
 			);
+		backgroundTaskService.notifyDerivedStatusChanged(
+			preContinuationRun.recipientId,
+			input.subagentId,
+		);
 	};
 	input = {
 		...input,
@@ -612,6 +617,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 										eq(backgroundTasks.logicalRunId, retryRun.logicalRunId),
 									),
 								);
+							backgroundTaskService.notifyDerivedStatusChanged(parentNarratorId, input.subagentId);
 						}
 						await establishSubagentExecutionSegment({
 							childNarratorId: input.subagentId,

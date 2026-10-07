@@ -38,6 +38,7 @@ export interface NarratorListStateSnapshotItem {
 	status: string;
 	substatus?: string[];
 	turnStartedAt?: string;
+	activeBackgroundTaskCount?: number;
 }
 
 /** Reflection gate families that report live progress. */

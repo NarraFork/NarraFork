@@ -11,7 +11,8 @@ const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../db")) };
 mock.module("../db", () => ({ db, sqlite }));
 
-const { broadcastToUser, getNarratorConnections, handleNarratorWS } = await import("./narrator-ws");
+const { broadcastToNarrator, broadcastToUser, getNarratorConnections, handleNarratorWS } =
+	await import("./narrator-ws");
 const { eventBus } = await import("../lib/event-bus");
 
 type SentMessage = Record<string, unknown>;
@@ -345,16 +346,146 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 					narratorId: "narrator-idle",
 					status: "idle",
 					substatus: [],
+					activeBackgroundTaskCount: 0,
 				},
 				{
 					narratorId: "narrator-working",
 					status: "working",
 					substatus: ["reasoning"],
 					turnStartedAt: "2026-07-19T00:00:00.000Z",
+					activeBackgroundTaskCount: 0,
 				},
 			],
 		});
 		expect(sent.some((message) => message.type === "status_change")).toBe(false);
+	});
+
+	it("initial and reconnect list snapshots include work that outlives the foreground", async () => {
+		seedNarrators();
+		const { backgroundTasks } = await import("../db/schema");
+		const now = new Date().toISOString();
+		db.insert(backgroundTasks)
+			.values({
+				id: "snapshot-background-bash",
+				parentNarratorId: "narrator-idle",
+				type: "bash",
+				status: "running",
+				startedAt: now,
+				createdAt: now,
+				updatedAt: now,
+			})
+			.run();
+		for (let attempt = 0; attempt < 2; attempt++) {
+			const { ws, sent } = openFakeWs();
+			await handleNarratorWS.message(ws, {
+				type: "subscribe",
+				kind: "list",
+				narratorIds: ["narrator-idle"],
+			});
+			expect(sent[0]).toMatchObject({
+				type: "list_state_snapshot",
+				items: [{ narratorId: "narrator-idle", status: "idle", activeBackgroundTaskCount: 1 }],
+			});
+			handleNarratorWS.close(ws);
+		}
+	});
+
+	it("an in-flight old count snapshot cannot overwrite a delivered live count", async () => {
+		seedNarrators();
+		const { backgroundTaskService } = await import("../services/background-task-service");
+		const original = backgroundTaskService.countActiveByParentBatch;
+		let releaseRead = () => {};
+		let readStarted = () => {};
+		let liveDelivered = () => {};
+		const blockedRead = new Promise<void>((resolve) => {
+			releaseRead = resolve;
+		});
+		const started = new Promise<void>((resolve) => {
+			readStarted = resolve;
+		});
+		const delivered = new Promise<void>((resolve) => {
+			liveDelivered = resolve;
+		});
+		backgroundTaskService.countActiveByParentBatch = async (ids) => {
+			const oldCounts = await original.call(backgroundTaskService, ids);
+			readStarted();
+			await blockedRead;
+			return oldCounts;
+		};
+		backgroundTaskService.setBroadcastFnForTests((id, message) => {
+			broadcastToNarrator(id, message);
+			if (
+				id === "narrator-idle" &&
+				message.type === "background_task_count_changed" &&
+				message.activeBackgroundTaskCount === 1
+			)
+				liveDelivered();
+		});
+		const { ws, sent } = openFakeWs();
+		const subscription = handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "list",
+			narratorIds: ["narrator-idle", "narrator-working"],
+		});
+		try {
+			await started;
+			await backgroundTaskService.createBashTask({
+				id: "snapshot-racing-bash",
+				parentNarratorId: "narrator-idle",
+				command: "long work",
+			});
+			await delivered;
+			expect(sent.some((message) => message.type === "list_state_snapshot")).toBe(false);
+			releaseRead();
+			await subscription;
+			const snapshot = sent.find((message) => message.type === "list_state_snapshot");
+			const items = snapshot?.items as Record<string, unknown>[];
+			expect(items.find((item) => item.narratorId === "narrator-idle")).not.toHaveProperty(
+				"activeBackgroundTaskCount",
+			);
+			expect(items.find((item) => item.narratorId === "narrator-working")).toHaveProperty(
+				"activeBackgroundTaskCount",
+				0,
+			);
+			expect(
+				sent.find((message) => message.type === "background_task_count_changed"),
+			).toMatchObject({ narratorId: "narrator-idle", activeBackgroundTaskCount: 1 });
+		} finally {
+			releaseRead();
+			await subscription;
+			backgroundTaskService.countActiveByParentBatch = original;
+			backgroundTaskService.setBroadcastFnForTests(null);
+		}
+	});
+
+	it("keeps basic list status and omits unknown counts when occupancy loading fails", async () => {
+		seedNarrators();
+		const { backgroundTaskService } = await import("../services/background-task-service");
+		const original = backgroundTaskService.countActiveByParentBatch;
+		backgroundTaskService.countActiveByParentBatch = async () => {
+			throw new Error("occupancy unavailable");
+		};
+		try {
+			const { ws, sent } = openFakeWs();
+			await handleNarratorWS.message(ws, {
+				type: "subscribe",
+				kind: "list",
+				narratorIds: ["narrator-idle", "narrator-working"],
+			});
+			expect(sent).toHaveLength(1);
+			expect(sent[0]).toMatchObject({
+				type: "list_state_snapshot",
+				items: [
+					{ narratorId: "narrator-idle", status: "idle", substatus: [] },
+					{ narratorId: "narrator-working", status: "working", substatus: ["reasoning"] },
+				],
+			});
+			for (const item of sent[0]?.items as Record<string, unknown>[]) {
+				expect(item).not.toHaveProperty("activeBackgroundTaskCount");
+			}
+		} finally {
+			backgroundTaskService.countActiveByParentBatch = original;
+		}
 	});
 
 	it("rejects subscriptions above the per-connection total without changing existing ones", async () => {

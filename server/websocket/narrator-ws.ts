@@ -1007,10 +1007,44 @@ async function sendListStateSnapshot(ws: NarratorWS, narratorIds: string[]): Pro
 		if (!connections.has(ws)) return;
 		const batchIds = narratorIds.slice(offset, offset + RECENT_TABS_WS_BATCH_SIZE);
 		const rows = await loadStatusRows(batchIds);
+		// Load counts after status so an idle snapshot also carries the background
+		// occupancy signal. Use the same bounded count semantics as the runtime API.
+		let counts: Map<string, number> | undefined;
+		const freshCountIds = new Set<string>();
+		try {
+			const { backgroundTaskService } = await import("../services/background-task-service");
+			const versionsAtRead = new Map(
+				rows.map((row) => [row.id, backgroundTaskService.getListVersion(row.id)]),
+			);
+			counts = await backgroundTaskService.countActiveByParentBatch(rows.map((row) => row.id));
+			// List subscriptions are already live. A count frame delivered during
+			// this read must win over the older snapshot, independently per narrator.
+			for (const row of rows) {
+				if (versionsAtRead.get(row.id) === backgroundTaskService.getListVersion(row.id)) {
+					freshCountIds.add(row.id);
+				}
+			}
+		} catch (err) {
+			// Occupancy can be incomplete; do not lose basic status or invent zeros.
+			logger.warn("Failed to load background counts for narrator list snapshot", {
+				count: rows.length,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+		if (!connections.has(ws)) return;
 		const rowsById = new Map(rows.map((row) => [row.id, row]));
 		const items = batchIds.flatMap((id) => {
 			const row = rowsById.get(id);
-			return row ? [toListStateSnapshotItem(row)] : [];
+			return row
+				? [
+						{
+							...toListStateSnapshotItem(row),
+							...(counts && freshCountIds.has(id)
+								? { activeBackgroundTaskCount: counts.get(id) ?? 0 }
+								: {}),
+						},
+					]
+				: [];
 		});
 		if (!safeSend(ws, { type: "list_state_snapshot", items })) return;
 	}
