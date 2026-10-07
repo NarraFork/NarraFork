@@ -55,9 +55,7 @@ import {
 	settings,
 	stripObsoleteSettingsKeys,
 } from "../lib/settings";
-// Imported from lib (not the update service) so a route never depends on a service
-// for pure validation; update-service re-exports the same predicate.
-import { isTrustedUpdateServerUrl } from "../lib/update-server-url";
+import { updateSourceSettingsSchema } from "../lib/settings/update-source";
 import {
 	blacklistDirEntrySchema,
 	codexTierOrderSchema,
@@ -660,31 +658,7 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
-		update: z
-			.object({
-				// "" clears the override so the built-in default server is used again.
-				//
-				// The https refine is a real gate, not cosmetics: update payloads are trusted
-				// on TLS alone (the expected SHA-512 ships in the same response as the
-				// binary), so a plaintext origin hands a man in the middle code execution.
-				// `getServerBaseUrl` already refuses to fetch from one, but without this an
-				// administrator typing `http://` would get a 200 and a silently disabled
-				// updater instead of being told why.
-				serverUrl: z
-					.union([
-						z.string().url().refine(isTrustedUpdateServerUrl, {
-							message: "Update server must use https (plaintext http is only allowed for loopback)",
-						}),
-						z.literal(""),
-					])
-					.optional(),
-				product: z.string().min(1).optional(),
-				channel: z.enum(["stable", "beta"]).optional(),
-				checkIntervalMinutes: z.number().int().min(0).optional(),
-				autoDownload: z.boolean().optional(),
-			})
-			.partial()
-			.optional(),
+		update: updateSourceSettingsSchema,
 		vnet: z
 			.object({
 				enabled: z.boolean(),

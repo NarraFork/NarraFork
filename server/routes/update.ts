@@ -14,11 +14,63 @@ import {
 	getUpdateDirectory,
 	getUpdateInstructions,
 	getUpdateStatus,
+	isUpdateSourceCurrent,
 	shutdownForManualUpdate,
 	type UpdateProgress,
 } from "../services/update-service";
 
 export const updateRoutes = new Hono();
+
+class DownloadRequestError extends Error {
+	constructor(
+		message: string,
+		public readonly status: 400 | 408 | 413,
+	) {
+		super(message);
+	}
+}
+
+/** Identity-only requests must not accept unbounded client-supplied release metadata. */
+async function readDownloadRequest(request: Request): Promise<Record<string, unknown> | null> {
+	if (!request.body) return null;
+	const maxBytes = 64 * 1024;
+	if (Number(request.headers.get("content-length") ?? 0) > maxBytes) {
+		throw new DownloadRequestError("Update request exceeds 64 KiB", 413);
+	}
+	const signal = AbortSignal.any([request.signal, AbortSignal.timeout(10_000)]);
+	const reader = request.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let bytes = 0;
+	const onAbort = () => {
+		void reader.cancel().catch(() => {});
+	};
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		while (true) {
+			if (signal.aborted) throw new DownloadRequestError("Update request body timed out", 408);
+			const { value, done } = await reader.read();
+			if (done) break;
+			bytes += value.byteLength;
+			if (bytes > maxBytes) throw new DownloadRequestError("Update request exceeds 64 KiB", 413);
+			chunks.push(value);
+		}
+		if (signal.aborted) throw new DownloadRequestError("Update request body timed out", 408);
+		if (!bytes) return null;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(Buffer.concat(chunks, bytes).toString("utf8"));
+		} catch {
+			throw new DownloadRequestError("Invalid update request JSON", 400);
+		}
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new DownloadRequestError("Update request must be a JSON object", 400);
+		}
+		return parsed as Record<string, unknown>;
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+		void reader.cancel().catch(() => {});
+	}
+}
 
 /**
  * GET /api/update/check
@@ -59,27 +111,68 @@ updateRoutes.get("/version", requireAuth, (c) => {
  */
 updateRoutes.post("/download", requireAuth, requireAdmin, async (c) => {
 	let requestedVersion: string | undefined;
+	let requestedSource: string | undefined;
+	let requestedRepository: string | undefined;
 	let retry = false;
 	try {
-		const body = await c.req.json();
-		const version = body?.releaseInfo?.version;
+		const body = await readDownloadRequest(c.req.raw);
+		const info = body?.releaseInfo;
+		const version =
+			info && typeof info === "object" && "version" in info ? info.version : undefined;
 		if (typeof version === "string" && version.trim()) requestedVersion = version.trim();
+		if (typeof body?.source === "string") requestedSource = body.source;
+		if (typeof body?.repository === "string") requestedRepository = body.repository;
 		retry = body?.retry === true;
-	} catch {
-		// Empty body is OK — we'll re-check and use server-side release metadata.
+	} catch (error) {
+		if (error instanceof DownloadRequestError)
+			return c.json({ error: error.message }, error.status);
+		return c.json({ error: "Could not read update request" }, 400);
 	}
 
-	// Re-check to get full releaseInfo with trusted _v2 URLs. Never trust client-supplied URLs.
-	const checkResult = await checkForUpdate();
+	// Force a fresh conditional check: only server-resolved URLs may deliver executable code.
+	const checkResult = await checkForUpdate({ force: true });
+	if (
+		(requestedSource && requestedSource !== checkResult.source) ||
+		(requestedRepository &&
+			requestedRepository.toLowerCase() !== checkResult.repository?.toLowerCase())
+	) {
+		return c.json(
+			{
+				error: "Update source changed; check for updates again",
+				errorCode: "UPDATE_SOURCE_CHANGED",
+			},
+			409,
+		);
+	}
 	const releaseInfo = checkResult.releaseInfo;
 
 	if (!releaseInfo) {
+		if (checkResult.errorCode) {
+			return c.json(
+				{
+					error: checkResult.error,
+					errorCode: checkResult.errorCode,
+					retryAfter: checkResult.retryAfter,
+				},
+				checkResult.errorCode === "NO_RELEASE" ? 404 : 503,
+			);
+		}
 		return c.json({ error: "No update available" }, 404);
+	}
+	if (!isUpdateSourceCurrent(releaseInfo)) {
+		return c.json(
+			{
+				error: "Update source changed during detection; check for updates again",
+				errorCode: "UPDATE_SOURCE_CHANGED",
+			},
+			409,
+		);
 	}
 	if (requestedVersion && requestedVersion !== releaseInfo.version) {
 		return c.json(
 			{
 				error: "Requested update version no longer matches the latest server metadata",
+				errorCode: "UPDATE_VERSION_CHANGED",
 				requestedVersion,
 				latestVersion: releaseInfo.version,
 			},
@@ -88,11 +181,33 @@ updateRoutes.post("/download", requireAuth, requireAdmin, async (c) => {
 	}
 
 	return streamSSE(c, async (stream) => {
+		// At most one write and one latest snapshot: a slow SSE client must not build an
+		// unbounded queue of increasingly stale download progress events.
+		let pendingProgress: UpdateProgress | undefined;
+		let progressWrite: Promise<void> | undefined;
+		let progressError: unknown;
+		const flushProgress = (): Promise<void> => {
+			if (progressWrite) return progressWrite;
+			progressWrite = (async () => {
+				while (pendingProgress) {
+					const progress = pendingProgress;
+					pendingProgress = undefined;
+					await stream.writeSSE({ event: "progress", data: JSON.stringify(progress) });
+				}
+			})()
+				.catch((error) => {
+					progressError = error;
+					pendingProgress = undefined;
+				})
+				.finally(() => {
+					progressWrite = undefined;
+				});
+			return progressWrite;
+		};
 		const onProgress = (progress: UpdateProgress) => {
-			stream.writeSSE({
-				event: "progress",
-				data: JSON.stringify(progress),
-			});
+			if (progressError) return;
+			pendingProgress = progress;
+			void flushProgress();
 		};
 
 		// A client that cancels its own fetch must also stop the server-side work; without this
@@ -105,6 +220,8 @@ updateRoutes.post("/download", requireAuth, requireAdmin, async (c) => {
 			signal: abort.signal,
 		});
 
+		while (progressWrite || pendingProgress) await flushProgress();
+		if (progressError) return;
 		if (result.success && result.updatePath) {
 			const instructions = getUpdateInstructions(result.updatePath, result.newBinaryPath);
 			await stream.writeSSE({

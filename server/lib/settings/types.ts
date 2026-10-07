@@ -979,9 +979,13 @@ export interface NarraForkSettings {
 	geminiProviders?: GeminiProviderConfig[];
 	/** External MCP server configurations. */
 	mcpServers?: McpServerConfig[];
-	/** Delta update configuration. */
+	/** Update source and download configuration. */
 	update?: {
-		/** Update server URL. */
+		/** Update source. Optional for legacy settings and mocks; defaults to GitHub. */
+		source?: "github" | "update-server";
+		/** GitHub repository slug (owner/repo), not a URL. */
+		githubRepository?: string;
+		/** Update server URL, retained when switching to GitHub. */
 		serverUrl: string;
 		/** Product ID for multi-product update servers. */
 		product: string;

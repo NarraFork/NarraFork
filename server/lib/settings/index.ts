@@ -29,6 +29,7 @@ import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
 import { _bindSettings } from "./provider";
 import type { NarraForkSettings } from "./types";
+import { normalizeUpdateSourceSettings } from "./update-source";
 
 export {
 	customApiProtocolFromAnthropic,
@@ -251,7 +252,9 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON migration
 	const mergedAny = merged as any;
 
-	let needsSave = false;
+	const normalizedUpdate = normalizeUpdateSourceSettings(merged, raw);
+	merged.update = normalizedUpdate.update;
+	let needsSave = normalizedUpdate.needsSave;
 	if (stripObsoleteSettingsKeys(mergedAny)) {
 		needsSave = true;
 	}

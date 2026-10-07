@@ -8,6 +8,7 @@ import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
 import { DEFAULT_CODEX_TIER_ORDER } from "../codex-manager";
 import { DEFAULT_DISK_SAFETY } from "../disk-safety-config";
 import type { FieldDoc, NarraForkSettings } from "./types";
+import { DEFAULT_UPDATE_SETTINGS } from "./update-source";
 
 export const DEFAULTS: NarraForkSettings = {
 	diskSafety: { ...DEFAULT_DISK_SAFETY },
@@ -189,13 +190,7 @@ export const DEFAULTS: NarraForkSettings = {
 		defaultTimeoutMs: 60_000,
 		maxOutputChars: 24_000,
 	},
-	update: {
-		serverUrl: "https://narrafork-update.b.domexie.cn",
-		product: "narrafork",
-		channel: "stable",
-		checkIntervalMinutes: 60,
-		autoDownload: false,
-	},
+	update: { ...DEFAULT_UPDATE_SETTINGS },
 	vnet: {
 		enabled: true,
 		allowAnonymousRelay: false,
@@ -961,8 +956,18 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 
 	// ── update ──────────────────────────────────────────────────────────
+	"update.source": {
+		desc: '更新来源。默认 "github" 使用 GitHub Release；"update-server" 使用自定义更新服务器。',
+		type: "string",
+		valid: '"github" | "update-server"',
+	},
+	"update.githubRepository": {
+		desc: "GitHub 更新仓库，格式为 owner/repo，默认 NarraFork/NarraFork。切换来源时保留。",
+		type: "string",
+		valid: "owner 最长 39 字符，repo 最长 100 字符；不接受 URL 或 .. 路径",
+	},
 	"update.serverUrl": {
-		desc: "更新服务器 URL。",
+		desc: "自定义更新服务器 URL，仅 update-server 来源使用；切换来源时保留。",
 		type: "string",
 	},
 	"update.product": {

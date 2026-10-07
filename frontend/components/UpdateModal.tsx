@@ -22,6 +22,7 @@ import {
 	IconPower,
 	IconX,
 } from "@tabler/icons-react";
+import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { usePlatform, useUpdateCapability } from "../hooks/usePlatform";
@@ -35,6 +36,7 @@ import { api } from "../lib/api";
 import { normalizeLanguage } from "../lib/i18n";
 import { formatLocaleDate } from "../lib/intl-format";
 import { clearPwaCache, waitForUpdatedServerAndReload } from "../lib/pwa";
+import { sameUpdateSource, updateCheckErrorKey, updateSettingsKey } from "../lib/update-source";
 import {
 	resolveUpdateCoordinationCounts,
 	shouldAssumeLocalSchedule,
@@ -68,6 +70,8 @@ export interface UpdateModalData {
 	latestVersion?: string;
 	currentVersion?: string;
 	releaseInfo?: {
+		source?: "github" | "update-server";
+		repository?: string;
 		version: string;
 		releaseDate: string;
 		releaseNotes?: string | Record<string, string>;
@@ -89,6 +93,8 @@ export interface UpdateModalData {
 	releaseDate?: string;
 	downloadSize?: number;
 	totalSize?: number;
+	strategy?: "full" | "zstd";
+	settingsKey?: string;
 }
 
 export interface UpdateModalProps {
@@ -143,6 +149,28 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		downloadSize,
 		totalSize,
 	} = data;
+	// Subscribe to saved settings without starting an extra admin-only request.
+	const { data: savedSettings } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+		enabled: false,
+	});
+	const recommendationState = useRef({ data, invalidated: false });
+	if (recommendationState.current.data !== data) {
+		recommendationState.current = { data, invalidated: false };
+	}
+	const savedConfigurationChanged =
+		!!savedSettings &&
+		((data.settingsKey !== undefined &&
+			data.settingsKey !== updateSettingsKey(savedSettings.update)) ||
+			(!!releaseInfo &&
+				!sameUpdateSource(releaseInfo, {
+					source: savedSettings.update?.source ?? "github",
+					repository: savedSettings.update?.githubRepository ?? "NarraFork/NarraFork",
+				})));
+	// Switching back does not revive an old recommendation; only a fresh check replaces data.
+	if (savedConfigurationChanged) recommendationState.current.invalidated = true;
+	const recommendationInvalidated = recommendationState.current.invalidated;
 	const requestedTargetVersion = releaseInfo?.version ?? latestVersion;
 	// A 409 download response can transparently re-check and switch to a newer release.
 	// From that point onward, status polling, apply scheduling, and reload readiness must
@@ -181,7 +209,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	});
 
 	const handleDownload = (options?: { retry?: boolean }) => {
-		if (!downloadAvailable || !releaseInfo) return;
+		if (!downloadAvailable || !releaseInfo || recommendationInvalidated) return;
 		download(releaseInfo, options);
 	};
 
@@ -412,7 +440,12 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	const serverStopped = applyResult?.success && !applyResult.restarting;
 	const rawDownloadError = result && !result.success ? result.error : null;
 	const isZstdMissing = rawDownloadError === "ZSTD_CLI_MISSING";
-	const downloadError = isZstdMissing ? null : rawDownloadError;
+	const downloadErrorKey = updateCheckErrorKey(result?.code);
+	const downloadError = isZstdMissing
+		? null
+		: rawDownloadError && downloadErrorKey !== "updateCheckFailed"
+			? t(downloadErrorKey)
+			: rawDownloadError;
 	const applyError =
 		cancelError ??
 		restartWaitError ??
@@ -447,7 +480,28 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 			centered
 		>
 			<Stack gap="md">
-				{releaseDate && (
+				{recommendationInvalidated && (
+					<Alert color="orange" variant="light">
+						{t("updateSourceChanged")}
+					</Alert>
+				)}
+				{releaseInfo && (!recommendationInvalidated || effectiveResult?.success) && (
+					<Group gap="xs">
+						<Badge variant="light">
+							{releaseInfo.source === "github"
+								? t("updateSourceGithub", { repository: releaseInfo.repository })
+								: t("updateSourceServer")}
+						</Badge>
+						<Badge variant="outline">
+							{t(
+								(progress?.strategy ?? data.strategy) === "zstd"
+									? "updateStrategyZstd"
+									: "updateStrategyFull",
+							)}
+						</Badge>
+					</Group>
+				)}
+				{releaseDate && !recommendationInvalidated && (
 					<Text size="xs" c="dimmed">
 						{formatLocaleDate(releaseDate, {
 							year: "numeric",
@@ -458,74 +512,84 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 				)}
 
 				{/* Release notes */}
-				<div>
-					<Text size="sm" fw={500} mb={4}>
-						{t("updateReleaseNotes")}
-					</Text>
-					<ScrollArea.Autosize mah={300}>
-						{releaseNotesPerVersion && releaseNotesPerVersion.length > 1 ? (
-							<Stack gap="md">
-								{releaseNotesPerVersion.map(
-									(v: {
-										version: string;
-										releaseDate: string;
-										releaseNotes?: string | Record<string, string>;
-									}) => {
-										const notes = resolveNotes(v.releaseNotes, i18n.language);
-										return (
-											<div key={v.version}>
-												<Group gap="xs" mb={4}>
-													<Badge size="xs" variant="light">
-														v{v.version}
-													</Badge>
-													<Text size="xs" c="dimmed">
-														{formatLocaleDate(v.releaseDate, {
-															year: "numeric",
-															month: "short",
-															day: "numeric",
-														})}
-													</Text>
-												</Group>
-												{notes ? (
-													<MarkdownContent text={notes} />
-												) : (
-													<Text size="sm" c="dimmed" fs="italic">
-														{t("updateNoNotes")}
-													</Text>
-												)}
-											</div>
-										);
-									},
-								)}
-							</Stack>
-						) : (
-							(() => {
-								const notes = resolveNotes(releaseNotes, i18n.language);
-								return notes ? (
-									<MarkdownContent text={notes} />
-								) : (
-									<Text size="sm" c="dimmed" fs="italic">
-										{t("updateNoNotes")}
-									</Text>
-								);
-							})()
-						)}
-					</ScrollArea.Autosize>
-				</div>
-
-				{savingsPercent > 0 && !effectiveResult?.success && (
-					<Text size="xs" c="dimmed">
-						{t("updatePatchInfo", {
-							downloadSize: formatBytes(downloadSize ?? 0),
-							totalSize: formatBytes(totalSize ?? 0),
-						})}
-					</Text>
+				{!recommendationInvalidated && (
+					<div>
+						<Text size="sm" fw={500} mb={4}>
+							{t("updateReleaseNotes")}
+						</Text>
+						<ScrollArea.Autosize mah={300}>
+							{releaseNotesPerVersion && releaseNotesPerVersion.length > 1 ? (
+								<Stack gap="md">
+									{releaseNotesPerVersion.map(
+										(v: {
+											version: string;
+											releaseDate: string;
+											releaseNotes?: string | Record<string, string>;
+										}) => {
+											const notes = resolveNotes(v.releaseNotes, i18n.language);
+											return (
+												<div key={v.version}>
+													<Group gap="xs" mb={4}>
+														<Badge size="xs" variant="light">
+															v{v.version}
+														</Badge>
+														<Text size="xs" c="dimmed">
+															{formatLocaleDate(v.releaseDate, {
+																year: "numeric",
+																month: "short",
+																day: "numeric",
+															})}
+														</Text>
+													</Group>
+													{notes ? (
+														<MarkdownContent text={notes} />
+													) : (
+														<Text size="sm" c="dimmed" fs="italic">
+															{t("updateNoNotes")}
+														</Text>
+													)}
+												</div>
+											);
+										},
+									)}
+								</Stack>
+							) : (
+								(() => {
+									const notes = resolveNotes(releaseNotes, i18n.language);
+									return notes ? (
+										<MarkdownContent text={notes} />
+									) : (
+										<Text size="sm" c="dimmed" fs="italic">
+											{t("updateNoNotes")}
+										</Text>
+									);
+								})()
+							)}
+						</ScrollArea.Autosize>
+					</div>
 				)}
+
+				{progress?.fallback && releaseInfo?.source === "github" && (
+					<Alert color="yellow" variant="light">
+						{t("updateDeltaFallback")}
+					</Alert>
+				)}
+				{savingsPercent > 0 &&
+					!progress?.fallback &&
+					!recommendationInvalidated &&
+					!effectiveResult?.success && (
+						<Text size="xs" c="dimmed">
+							{t("updatePatchInfo", {
+								downloadSize: formatBytes(downloadSize ?? 0),
+								totalSize: formatBytes(totalSize ?? 0),
+							})}
+						</Text>
+					)}
 
 				<Divider />
 
 				{/* Download button */}
-				{!progress && !effectiveResult && (
+				{!progress && !effectiveResult && !recommendationInvalidated && (
 					<Button
 						fullWidth
 						leftSection={<IconDownload size={16} />}
@@ -588,8 +652,10 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 							color="orange"
 							size="xs"
 							mt={8}
-							disabled={!downloadAvailable}
-							title={downloadUnavailableReason}
+							disabled={!downloadAvailable || recommendationInvalidated}
+							title={
+								recommendationInvalidated ? t("updateSourceChanged") : downloadUnavailableReason
+							}
 							onClick={() => {
 								reset();
 								handleDownload({ retry: true });

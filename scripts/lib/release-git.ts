@@ -26,6 +26,8 @@ export function getUnexpectedReleaseChanges(root: string, allowedPaths: string[]
 		{
 			cwd: root,
 			encoding: "utf8",
+			timeout: 10_000,
+			maxBuffer: 1024 * 1024,
 		},
 	);
 	return parseStatusLines(output);
@@ -37,6 +39,8 @@ export function resolveGitCommit(root: string, ref: string): string | null {
 		return execFileSync("git", ["rev-parse", "--verify", `${ref}^{commit}`], {
 			cwd: root,
 			encoding: "utf8",
+			timeout: 10_000,
+			maxBuffer: 1024 * 1024,
 			stdio: ["ignore", "pipe", "ignore"],
 		}).trim();
 	} catch {

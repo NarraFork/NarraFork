@@ -2,7 +2,7 @@
  * Update service for delta updates.
  * Handles version checking, zstd patch application, and update downloading.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	chmodSync,
 	copyFileSync,
@@ -19,9 +19,10 @@ import {
 import { open } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { inArray } from "drizzle-orm";
+import type { GithubPatchStep } from "../../shared/release-patch";
 import { db } from "../db";
 import { narratorToolCalls } from "../db/schema";
-import { downloadHelperBinary, getHelperBinaryServerBaseUrl } from "../lib/helper-binaries";
+import { downloadHelperBinary, getCachedHelperBinaryPath } from "../lib/helper-binaries";
 import { getCliHelperSpec, isNativeCliHelper } from "../lib/helper-binary-platform";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
@@ -36,6 +37,15 @@ import { settings } from "../lib/settings";
 import { isTrustedUpdateServerUrl } from "../lib/update-server-url";
 import { APP_VERSION, BUILD_PLATFORM } from "../lib/version";
 import { applyZstdPatchToFile, type ZstdPatchMeta } from "../lib/zstd-patch";
+import {
+	createGithubUpdateDeadline,
+	downloadGithubUpdateToFile,
+} from "./github-release-patch-apply";
+import {
+	downloadGithubBinaryToFile,
+	downloadGithubPatchToFile,
+	githubReleaseUpdater,
+} from "./github-release-update";
 import { toolContinuationService } from "./tool-continuation-service";
 import {
 	assertUpdateNotCancelled,
@@ -67,7 +77,8 @@ import {
 const ZSTD_PROBE_TIMEOUT_MS = 5_000;
 
 /** Asynchronously check whether a zstd binary answers `--version`. */
-async function zstdCliResponds(binary: string): Promise<boolean> {
+async function zstdCliResponds(binary: string, signal?: AbortSignal): Promise<boolean> {
+	signal?.throwIfAborted();
 	let proc: ReturnType<typeof Bun.spawn>;
 	try {
 		proc = Bun.spawn([binary, "--version"], {
@@ -78,6 +89,9 @@ async function zstdCliResponds(binary: string): Promise<boolean> {
 	} catch {
 		return false;
 	}
+	const onAbort = () => proc.kill();
+	signal?.addEventListener("abort", onAbort, { once: true });
+	if (signal?.aborted) onAbort();
 	const timer = setTimeout(() => proc.kill(), ZSTD_PROBE_TIMEOUT_MS);
 	try {
 		return (await proc.exited) === 0;
@@ -85,6 +99,7 @@ async function zstdCliResponds(binary: string): Promise<boolean> {
 		return false;
 	} finally {
 		clearTimeout(timer);
+		signal?.removeEventListener("abort", onAbort);
 	}
 }
 
@@ -100,11 +115,17 @@ async function zstdCliResponds(binary: string): Promise<boolean> {
  *
  * When `forceDownload` is true (explicit user retry), the recent-failure cache
  * is bypassed so a previous network timeout does not short-circuit the attempt.
+ * GitHub passes `allowDownload=false`: only PATH / the existing local cache may be used,
+ * and a missing CLI triggers a GitHub full download, never an old-server helper request.
  */
-async function getZstdCliPath(forceDownload = false): Promise<string | null> {
+async function getZstdCliPath(
+	forceDownload = false,
+	allowDownload = true,
+	signal?: AbortSignal,
+): Promise<string | null> {
 	// Resolving first lets ARM64 reject an emulated x64 PATH executable.
 	const system = Bun.which("zstd");
-	if (system && isNativeCliHelper(system) && (await zstdCliResponds(system))) return system;
+	if (system && isNativeCliHelper(system) && (await zstdCliResponds(system, signal))) return system;
 
 	if (process.platform === "darwin") {
 		// No prebuilt helper binary is published for macOS, and installing one from a request
@@ -114,10 +135,20 @@ async function getZstdCliPath(forceDownload = false): Promise<string | null> {
 
 	const spec = getCliHelperSpec("zstd");
 	if (!spec) return null;
+	if (!allowDownload) {
+		const cached = getCachedHelperBinaryPath(spec.cachedName, spec.windowsArch);
+		return cached && isNativeCliHelper(cached) && (await zstdCliResponds(cached, signal))
+			? cached
+			: null;
+	}
 	return downloadHelperBinary(spec, { bypassFailureCache: forceDownload });
 }
 
 export interface ReleaseInfo {
+	/** Selected delivery origin, re-resolved server-side before downloading. */
+	source?: "github" | "update-server";
+	repository?: string;
+	_github?: { repository: string; downloadUrl: string; patchChain?: GithubPatchStep[] };
 	version: string;
 	releaseDate: string;
 	releaseNotes?: string | Record<string, string>;
@@ -130,6 +161,8 @@ export interface ReleaseInfo {
 	}>;
 	/** V2 API URLs — populated by checkForUpdate when using v2 server */
 	_v2?: {
+		/** Snapshot the configured origin so concurrent settings changes cannot retarget a download. */
+		serverUrl?: string;
 		zstdPatchUrl?: string;
 		zstdPatchMetaUrl?: string;
 		patchChain?: Array<{
@@ -149,6 +182,11 @@ export interface ReleaseInfo {
 }
 
 export interface UpdateCheckResult {
+	source?: "github" | "update-server";
+	repository?: string;
+	error?: string;
+	errorCode?: string;
+	retryAfter?: number;
 	updateAvailable: boolean;
 	currentVersion: string;
 	latestVersion?: string;
@@ -159,7 +197,7 @@ export interface UpdateCheckResult {
 	/** Size of zstd dictionary patch if available */
 	zstdPatchSize?: number;
 	/** Which strategy will be used */
-	strategy?: "zstd";
+	strategy?: "full" | "zstd";
 	/** Patch chain for multi-step updates when direct patch is unavailable */
 	patchChain?: Array<{
 		fromVersion: string;
@@ -176,6 +214,8 @@ export interface UpdateProgress {
 	totalBytes: number;
 	percent: number;
 	error?: string;
+	strategy?: "full" | "zstd";
+	fallback?: boolean;
 }
 
 const UPDATE_DIR = getNarraforkPath("updates");
@@ -470,7 +510,11 @@ export { isTrustedUpdateServerUrl };
  * "update server not configured".
  */
 function getServerBaseUrl(): string {
-	const url = getHelperBinaryServerBaseUrl();
+	// Application updates and helper distribution are separate paths; GitHub never uses this URL.
+	const url = (settings.update?.serverUrl || "https://narrafork-update.b.domexie.cn").replace(
+		/\/+$/,
+		"",
+	);
 	if (!url) return "";
 	if (!isTrustedUpdateServerUrl(url)) {
 		logger.warn("Ignoring update server URL that cannot be trusted to deliver code", { url });
@@ -606,7 +650,12 @@ async function checkChannel(
 	const response = await fetchWithTimeout(checkUrl, { timeoutMs: METADATA_FETCH_TIMEOUT_MS });
 	if (!response.ok) {
 		logger.warn("Update check failed", { status: response.status, channel });
-		return { updateAvailable: false, currentVersion: APP_VERSION };
+		return {
+			updateAvailable: false,
+			currentVersion: APP_VERSION,
+			errorCode: "NETWORK_ERROR",
+			error: `Update server returned HTTP ${response.status}`,
+		};
 	}
 
 	const data = (await response.json()) as V2CheckResponse;
@@ -627,6 +676,7 @@ async function checkChannel(
 		: undefined;
 
 	const releaseInfo: ReleaseInfo = {
+		source: "update-server",
 		version: data.version,
 		releaseDate: data.releaseDate ?? new Date().toISOString(),
 		releaseNotes: data.releaseNotes,
@@ -640,6 +690,7 @@ async function checkChannel(
 			},
 		],
 		_v2: {
+			serverUrl,
 			zstdPatchUrl: directPatchUrls?.url,
 			zstdPatchMetaUrl: directPatchUrls?.metaUrl,
 			patchChain: chainUrls,
@@ -683,10 +734,53 @@ async function checkChannel(
  * When on the beta channel, also checks stable — if a newer stable version exists,
  * it takes priority so beta users can upgrade to the next stable release.
  */
-export async function checkForUpdate(): Promise<UpdateCheckResult> {
+export async function checkForUpdate(
+	options: { force?: boolean } = {},
+): Promise<UpdateCheckResult> {
+	if ((settings.update?.source ?? "github") === "github") {
+		const startedAt = Date.now();
+		const result = await githubReleaseUpdater.check(
+			{
+				repository: settings.update?.githubRepository ?? "NarraFork/NarraFork",
+				channel: settings.update?.channel ?? "stable",
+				platform: getPlatform(),
+				currentVersion: APP_VERSION,
+			},
+			options,
+		);
+		if (result.errorCode || Date.now() - startedAt > 5000) {
+			logger.warn("GitHub update check completed", {
+				source: "github",
+				errorCode: result.errorCode,
+				durationMs: Date.now() - startedAt,
+			});
+		}
+		return result;
+	}
+	return { ...(await checkForServerUpdate()), source: "update-server" };
+}
+
+export function isUpdateSourceCurrent(releaseInfo: ReleaseInfo): boolean {
+	const source = settings.update?.source ?? "github";
+	if (source !== (releaseInfo.source ?? "update-server")) return false;
+	if (source === "github") {
+		return (
+			releaseInfo.repository?.toLowerCase() ===
+			(settings.update?.githubRepository ?? "NarraFork/NarraFork").toLowerCase()
+		);
+	}
+	return !releaseInfo._v2?.serverUrl || releaseInfo._v2.serverUrl === getServerBaseUrl();
+}
+
+async function checkForServerUpdate(): Promise<UpdateCheckResult> {
 	const serverUrl = getServerBaseUrl();
 	if (!serverUrl) {
-		return { updateAvailable: false, currentVersion: APP_VERSION };
+		return {
+			updateAvailable: false,
+			currentVersion: APP_VERSION,
+			errorCode: "INVALID_CONFIGURATION",
+			error: "Update server not configured or trusted",
+		};
 	}
 
 	const channel = settings.update?.channel ?? "stable";
@@ -709,13 +803,18 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
 			}
 			if (stableResult.updateAvailable) return stableResult;
 			if (betaResult.updateAvailable) return betaResult;
-			return betaResult; // neither has update — return beta result for latestVersion info
+			return betaResult.errorCode ? betaResult : stableResult.errorCode ? stableResult : betaResult;
 		}
 
 		return await checkChannel(serverUrl, product, channel, platform);
 	} catch (err) {
 		logger.error("Update check error", { error: String(err) });
-		return { updateAvailable: false, currentVersion: APP_VERSION };
+		return {
+			updateAvailable: false,
+			currentVersion: APP_VERSION,
+			errorCode: "NETWORK_ERROR",
+			error: "Update server check failed",
+		};
 	}
 }
 
@@ -863,9 +962,11 @@ export async function downloadUpdate(
 	placed?: boolean;
 }> {
 	const forceDownload = options.forceDownload ?? false;
-	const signal = options.signal;
-	const serverUrl = getServerBaseUrl();
-	if (!serverUrl) {
+	const isGithub = releaseInfo.source === "github";
+	if (!isUpdateSourceCurrent(releaseInfo)) {
+		return { success: false, error: "Update source changed; check for updates again" };
+	}
+	if (!isGithub && !getServerBaseUrl()) {
 		return { success: false, error: "Update server not configured" };
 	}
 
@@ -876,7 +977,8 @@ export async function downloadUpdate(
 
 	const releaseFileName = sanitizeUpdateFileName(releaseInfo.path, releaseInfo.version);
 	const updatePath = join(UPDATE_DIR, releaseFileName);
-	const tempPath = `${updatePath}.${process.pid}.${Date.now()}.tmp`;
+	const tempPath = `${updatePath}.${process.pid}.${randomUUID()}.tmp`;
+	let ownsGithubTemp = false;
 	// Patch chains reconstruct one intermediate binary per step; both slots are reused.
 	const intermediatePaths = [`${tempPath}.step-a`, `${tempPath}.step-b`];
 
@@ -886,8 +988,24 @@ export async function downloadUpdate(
 		hasV2: !!releaseInfo._v2,
 	});
 
+	const githubDeadline = isGithub ? createGithubUpdateDeadline(options.signal) : undefined;
+	const signal = githubDeadline?.signal ?? options.signal;
+	let githubStrategy: "full" | "zstd" = releaseInfo._github?.patchChain?.length ? "zstd" : "full";
+	let githubFallback = false;
+	let githubDownloadedBytes = 0;
+	let githubDownloadTotal = releaseInfo.files[0]?.size ?? 0;
+	const emitProgress = (progress: UpdateProgress) => {
+		if (!isGithub) {
+			onProgress?.(progress);
+			return;
+		}
+		githubStrategy = progress.strategy ?? githubStrategy;
+		githubFallback = progress.fallback ?? githubFallback;
+		onProgress?.({ ...progress, strategy: githubStrategy, fallback: githubFallback });
+	};
 	try {
-		onProgress?.({
+		signal?.throwIfAborted();
+		emitProgress({
 			phase: "downloading",
 			bytesDownloaded: 0,
 			totalBytes: releaseInfo.files[0]?.size ?? 0,
@@ -897,8 +1015,45 @@ export async function downloadUpdate(
 		let applied = false;
 		let zstdCliMissing = false;
 
-		// Strategy: direct zstd patch
-		if (execPath && existsSync(execPath)) {
+		if (isGithub && githubDeadline) {
+			const startedAt = Date.now();
+			const strategy = await downloadGithubUpdateToFile(
+				{
+					release: releaseInfo,
+					currentVersion: APP_VERSION,
+					basePath: execPath,
+					outputPath: tempPath,
+					signal: githubDeadline.signal,
+					onProgress: (progress) => {
+						githubDownloadedBytes = progress.bytesDownloaded;
+						githubDownloadTotal = progress.totalBytes;
+						emitProgress(progress);
+					},
+				},
+				{
+					downloadPatch: downloadGithubPatchToFile,
+					downloadFull: downloadGithubBinaryToFile,
+					resolveZstd: (patchSignal) => getZstdCliPath(false, false, patchSignal),
+					onFallback: (error) =>
+						logger.warn("GitHub delta unavailable; downloading GitHub full binary", {
+							source: "github",
+							error: String(error),
+						}),
+				},
+			);
+			ownsGithubTemp = true;
+			applied = true;
+			logger.info("GitHub update downloaded", {
+				source: "github",
+				strategy,
+				version: releaseInfo.version,
+				bytes: releaseInfo.files[0]?.size,
+				durationMs: Date.now() - startedAt,
+			});
+		}
+
+		// Strategy: direct zstd patch (only the explicitly selected update server).
+		if (!isGithub && execPath && existsSync(execPath)) {
 			const zstdMetaUrl = releaseInfo._v2?.zstdPatchMetaUrl;
 			const zstdPatchUrl = releaseInfo._v2?.zstdPatchUrl;
 
@@ -937,7 +1092,7 @@ export async function downloadUpdate(
 		}
 
 		// Strategy: patch chain (multi-step)
-		if (!applied && execPath && existsSync(execPath)) {
+		if (!isGithub && !applied && execPath && existsSync(execPath)) {
 			const chain = releaseInfo._v2?.patchChain;
 			if (chain && chain.length > 0) {
 				try {
@@ -993,14 +1148,16 @@ export async function downloadUpdate(
 		}
 
 		// Verify SHA512
-		onProgress?.({
+		emitProgress({
 			phase: "applying",
-			bytesDownloaded: releaseInfo.files[0]?.size ?? 0,
-			totalBytes: releaseInfo.files[0]?.size ?? 0,
+			bytesDownloaded: isGithub ? githubDownloadedBytes : (releaseInfo.files[0]?.size ?? 0),
+			totalBytes: isGithub ? githubDownloadTotal : (releaseInfo.files[0]?.size ?? 0),
 			percent: 100,
 		});
 
-		const actualSha512 = await computeFileSha512(tempPath);
+		signal?.throwIfAborted();
+		const actualSha512 = await computeFileSha512(tempPath, signal);
+		signal?.throwIfAborted();
 		if (actualSha512 !== releaseInfo.sha512) {
 			unlinkSync(tempPath);
 			return {
@@ -1016,6 +1173,7 @@ export async function downloadUpdate(
 
 		if (execPath) {
 			const destination = await resolvePreparedBinaryDestination(execPath, releaseInfo);
+			signal?.throwIfAborted();
 			newBinaryPath = destination.path;
 			finalFileName = destination.fileName;
 			if (destination.alreadyPresent) {
@@ -1036,6 +1194,7 @@ export async function downloadUpdate(
 		} else {
 			// Development mode fallback: keep the rebuilt binary in the update cache.
 			const destination = await resolveUpdateCacheDestination(releaseInfo);
+			signal?.throwIfAborted();
 			finalUpdatePath = destination.path;
 			finalFileName = destination.fileName;
 			if (destination.alreadyPresent) {
@@ -1058,10 +1217,10 @@ export async function downloadUpdate(
 			sizeBytes: finalSize,
 		});
 
-		onProgress?.({
+		emitProgress({
 			phase: "complete",
-			bytesDownloaded: releaseInfo.files[0]?.size ?? 0,
-			totalBytes: releaseInfo.files[0]?.size ?? 0,
+			bytesDownloaded: isGithub ? githubDownloadedBytes : (releaseInfo.files[0]?.size ?? 0),
+			totalBytes: isGithub ? githubDownloadTotal : (releaseInfo.files[0]?.size ?? 0),
 			percent: 100,
 		});
 
@@ -1073,15 +1232,15 @@ export async function downloadUpdate(
 			placed,
 		};
 	} catch (err) {
-		// Cleanup temp file
-		if (existsSync(tempPath)) {
+		// The full-download helper owns cleanup on failure, including exclusive-create conflicts.
+		if ((!isGithub || ownsGithubTemp) && existsSync(tempPath)) {
 			try {
 				unlinkSync(tempPath);
 			} catch {}
 		}
 
 		const error = String(err);
-		onProgress?.({
+		emitProgress({
 			phase: "error",
 			bytesDownloaded: 0,
 			totalBytes: 0,
@@ -1090,16 +1249,18 @@ export async function downloadUpdate(
 		});
 
 		return { success: false, error };
+	} finally {
+		githubDeadline?.dispose();
 	}
 }
 
 /**
  * Compute SHA512 hash of a file.
  */
-async function computeFileSha512(filePath: string): Promise<string> {
+async function computeFileSha512(filePath: string, signal?: AbortSignal): Promise<string> {
 	return new Promise((resolve, reject) => {
 		const hash = createHash("sha512");
-		const stream = createReadStream(filePath);
+		const stream = createReadStream(filePath, { signal });
 
 		stream.on("data", (chunk) => hash.update(chunk));
 		stream.on("end", () => resolve(hash.digest("base64")));

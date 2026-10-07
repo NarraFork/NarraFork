@@ -1,0 +1,321 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import type { GithubPatchStep } from "../../../shared/release-patch";
+import { settings } from "../../lib/settings";
+import { APP_VERSION } from "../../lib/version";
+import {
+	checkForUpdate,
+	downloadUpdate,
+	getUpdateDirectory,
+	getUpdateStatus,
+	isUpdateSourceCurrent,
+	type ReleaseInfo,
+	type UpdateProgress,
+} from "../update-service";
+
+const originalFetch = globalThis.fetch;
+let requested: string[] = [];
+const version = `${Number(APP_VERSION.split(".")[0]) + 1}.0.0`;
+const payload = Buffer.from("integration test binary (never executed)");
+const sha512 = createHash("sha512").update(payload).digest("base64");
+const platform =
+	process.platform === "darwin"
+		? `darwin-${process.arch}`
+		: process.platform === "win32"
+			? `win-${process.arch}`
+			: `linux-${process.arch}`;
+const suffix =
+	platform.replace("darwin-", "macos-").replace("win-", "windows-") +
+	(process.platform === "win32" ? ".exe" : "");
+const filename = `narrafork-${version}-${suffix}`;
+const repository = "Integration/Updates";
+const binaryUrl = `https://github.com/${repository}/releases/download/v${version}/${filename}`;
+const sidecarUrl = `${binaryUrl}.metadata.json`;
+const metadata = JSON.stringify({
+	version,
+	platform,
+	name: filename,
+	size: payload.length,
+	sha512,
+	sha256: createHash("sha256").update(payload).digest("hex"),
+});
+const release = {
+	tag_name: `v${version}`,
+	draft: false,
+	prerelease: false,
+	published_at: "2026-10-06T00:00:00Z",
+	body: "integration notes",
+	assets: [
+		{ name: filename, size: payload.length, state: "uploaded", browser_download_url: binaryUrl },
+		{
+			name: `${filename}.metadata.json`,
+			size: Buffer.byteLength(metadata),
+			state: "uploaded",
+			browser_download_url: sidecarUrl,
+		},
+	],
+};
+
+function fixtureReleaseInfo(patchChain?: GithubPatchStep[]): ReleaseInfo {
+	return {
+		source: "github",
+		repository,
+		version,
+		path: filename,
+		releaseDate: "2026-10-06",
+		sha512,
+		files: [{ url: filename, size: payload.length, sha512 }],
+		_github: { repository, downloadUrl: binaryUrl, patchChain },
+	};
+}
+function selectGithub() {
+	settings.update = {
+		...settings.update,
+		source: "github",
+		githubRepository: repository,
+		serverUrl: "https://legacy.integration.example",
+		product: "narrafork",
+		channel: "stable",
+		checkIntervalMinutes: 60,
+		autoDownload: false,
+	};
+}
+function expectNoTemporaryArtifacts() {
+	expect(
+		readdirSync(getUpdateDirectory()).filter(
+			(name) => name.endsWith(".tmp") || name.startsWith(".github-patch-"),
+		),
+	).toEqual([]);
+}
+
+function installFetch(handler: (url: string) => Response | Promise<Response>) {
+	globalThis.fetch = Object.assign(
+		async (...args: Parameters<typeof fetch>) => {
+			const url = String(args[0]);
+			requested.push(url);
+			return handler(url);
+		},
+		{ preconnect: originalFetch.preconnect },
+	);
+}
+beforeEach(() => {
+	requested = [];
+});
+afterEach(() => {
+	globalThis.fetch = originalFetch;
+});
+
+describe("selected update source integration", () => {
+	test("GitHub prepares a verified full binary without contacting update-server or helpers", async () => {
+		settings.update = {
+			...settings.update,
+			source: "github",
+			githubRepository: repository,
+			serverUrl: "http://untrusted.example",
+			product: "narrafork",
+			channel: "stable",
+			checkIntervalMinutes: 60,
+			autoDownload: false,
+		};
+		installFetch((url) => {
+			if (url.startsWith(`https://api.github.com/repos/${repository}/`))
+				return Response.json([release]);
+			if (url === sidecarUrl) return new Response(metadata);
+			if (url === binaryUrl) return new Response(payload);
+			throw new Error(`Unexpected origin ${url}`);
+		});
+		const result = await checkForUpdate({ force: true });
+		expect(result.updateAvailable).toBe(true);
+		expect(result.source).toBe("github");
+		if (!result.releaseInfo) throw new Error("Missing trusted releaseInfo");
+		const progress: UpdateProgress[] = [];
+		const downloaded = await downloadUpdate(result.releaseInfo, (value) => {
+			progress.push(value);
+		});
+		expect(downloaded.success).toBe(true);
+		expect(progress.every((value) => value.strategy === "full" && value.fallback === false)).toBe(
+			true,
+		);
+		expect(progress.at(-1)?.phase).toBe("complete");
+		if (!downloaded.updatePath) throw new Error("No prepared binary");
+		expect(readFileSync(downloaded.updatePath)).toEqual(payload);
+		expect((await getUpdateStatus(version)).ready).toBe(true);
+		expect(requested).toHaveLength(3);
+		expect(requested.some((url) => url.includes("/api/v2/"))).toBe(false);
+	});
+	test("GitHub delta without a compiled base falls back to GitHub full, ignoring legacy descriptors", async () => {
+		selectGithub();
+		const patchUrl = `${binaryUrl}.zstd-patch`;
+		const info = fixtureReleaseInfo([
+			{
+				fromVersion: APP_VERSION,
+				toVersion: version,
+				patchSize: 4,
+				url: patchUrl,
+				metaUrl: `${patchUrl}.meta.json`,
+				meta: {
+					fromVersion: APP_VERSION,
+					toVersion: version,
+					oldFileSize: payload.length,
+					oldFileSha512: sha512,
+					stableEnd: 0,
+					newTailSize: payload.length,
+					patchSize: 4,
+					newFileSize: payload.length,
+					newFileSha512: sha512,
+					mode: "patch-from",
+				},
+			},
+		]);
+		info._v2 = {
+			serverUrl: "https://legacy.integration.example",
+			patchChain: [
+				{
+					fromVersion: APP_VERSION,
+					toVersion: version,
+					patchSize: 4,
+					url: "https://legacy.integration.example/patch",
+					metaUrl: "https://legacy.integration.example/meta",
+				},
+			],
+		};
+		installFetch((url) => {
+			expect(url).toBe(binaryUrl);
+			return new Response(payload);
+		});
+		const progress: UpdateProgress[] = [];
+		const downloaded = await downloadUpdate(info, (value) => {
+			progress.push(value);
+		});
+		expect(downloaded.success).toBe(true);
+		expect(progress[0]?.strategy).toBe("zstd");
+		expect(progress[0]?.fallback).toBe(false);
+		const fallbackIndex = progress.findIndex(
+			(value) => value.strategy === "full" && value.fallback === true,
+		);
+		expect(fallbackIndex).toBeGreaterThan(0);
+		expect(
+			progress
+				.slice(fallbackIndex)
+				.every((value) => value.strategy === "full" && value.fallback === true),
+		).toBe(true);
+		expect(progress.at(-1)).toMatchObject({
+			phase: "complete",
+			strategy: "full",
+			fallback: true,
+			bytesDownloaded: payload.length,
+			totalBytes: payload.length,
+		});
+		expect(requested).toEqual([binaryUrl]);
+		expectNoTemporaryArtifacts();
+	});
+	test("GitHub cancellation during full body progress preserves placed state and removes owned temp", async () => {
+		selectGithub();
+		const manifest = join(getUpdateDirectory(), "placed-update.json");
+		const before = existsSync(manifest) ? readFileSync(manifest, "utf8") : undefined;
+		const controller = new AbortController();
+		const progress: UpdateProgress[] = [];
+		installFetch((url) => {
+			expect(url).toBe(binaryUrl);
+			return new Response(payload);
+		});
+		const downloaded = await downloadUpdate(
+			fixtureReleaseInfo(),
+			(value) => {
+				progress.push(value);
+				if (value.phase === "downloading" && value.bytesDownloaded > 0) {
+					controller.abort(new Error("integration user cancellation"));
+				}
+			},
+			{ signal: controller.signal },
+		);
+		expect(downloaded.success).toBe(false);
+		expect(downloaded.error).toContain("integration user cancellation");
+		expect(progress.at(-1)?.phase).toBe("error");
+		expect(requested).toEqual([binaryUrl]);
+		expect(existsSync(manifest) ? readFileSync(manifest, "utf8") : undefined).toBe(before);
+		expectNoTemporaryArtifacts();
+	});
+	test("GitHub bad full checksum cleans temp and does not ask a legacy origin", async () => {
+		selectGithub();
+		installFetch((url) => {
+			expect(url).toBe(binaryUrl);
+			return new Response(Buffer.alloc(payload.length, 42));
+		});
+		const downloaded = await downloadUpdate(fixtureReleaseInfo());
+		expect(downloaded.success).toBe(false);
+		expect(requested).toEqual([binaryUrl]);
+		expectNoTemporaryArtifacts();
+	});
+	test("pre-aborted GitHub update never opens any origin", async () => {
+		selectGithub();
+		installFetch(() => {
+			throw new Error("must not fetch after cancellation");
+		});
+		const controller = new AbortController();
+		controller.abort(new Error("cancel before update"));
+		const downloaded = await downloadUpdate(fixtureReleaseInfo(), undefined, {
+			signal: controller.signal,
+		});
+		expect(downloaded.success).toBe(false);
+		expect(downloaded.error).toContain("cancel before update");
+		expect(requested).toEqual([]);
+		expectNoTemporaryArtifacts();
+	});
+	test("self-deployed v2 source retains patch descriptors and never calls GitHub", async () => {
+		const serverUrl = "https://updates.integration.example";
+		settings.update = {
+			...settings.update,
+			source: "update-server",
+			serverUrl,
+			product: "custom-product",
+			channel: "stable",
+			checkIntervalMinutes: 60,
+			autoDownload: false,
+		};
+		installFetch((url) => {
+			expect(url).toContain(`${serverUrl}/api/v2/products/custom-product/releases/latest`);
+			return Response.json({
+				updateAvailable: true,
+				version,
+				releaseDate: "2026-10-06",
+				file: { filename, size: payload.length, sha512 },
+				zstdPatch: {
+					fromVersion: APP_VERSION,
+					patchSize: 4,
+					url: "/patch",
+					metaUrl: "/patch.meta.json",
+				},
+			});
+		});
+		const result = await checkForUpdate();
+		expect(result.source).toBe("update-server");
+		expect(result.strategy).toBe("zstd");
+		expect(result.releaseInfo?._v2?.zstdPatchUrl).toBe(`${serverUrl}/patch`);
+		expect(result.releaseInfo?._v2?.serverUrl).toBe(serverUrl);
+		expect(requested.some((url) => url.includes("github"))).toBe(false);
+		if (!result.releaseInfo) throw new Error("Missing v2 releaseInfo");
+		expect(isUpdateSourceCurrent(result.releaseInfo)).toBe(true);
+		settings.update.serverUrl = "https://other.integration.example";
+		expect(isUpdateSourceCurrent(result.releaseInfo)).toBe(false);
+	});
+	test("failed GitHub checks never fall back to the configured legacy server", async () => {
+		settings.update = {
+			...settings.update,
+			source: "github",
+			githubRepository: repository,
+			serverUrl: "https://legacy.integration.example",
+			product: "narrafork",
+			channel: "stable",
+			checkIntervalMinutes: 60,
+			autoDownload: false,
+		};
+		installFetch(() => new Response(null, { status: 404 }));
+		const result = await checkForUpdate({ force: true });
+		expect(result.errorCode).toBe("REPOSITORY_UNAVAILABLE");
+		expect(requested).toHaveLength(1);
+		expect(requested[0]).toContain("api.github.com");
+	});
+});
