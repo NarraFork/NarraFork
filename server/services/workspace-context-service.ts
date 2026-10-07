@@ -9,6 +9,7 @@ import { localBackend, resolveBackend } from "../lib/agent/execution/registry";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { isSecretPlatformPath, isSecretUserPath } from "../lib/fs-secret-paths";
 import { hotSafe } from "../lib/hot-safe";
+import { logger } from "../lib/logger";
 import { isKnowledgeStewardNarrator } from "../lib/narrator-utils";
 import { getHome } from "../lib/platform";
 import { isInsidePath } from "../lib/platform-path";
@@ -170,6 +171,35 @@ function prepareRemoteWorkspaceContext(
 				: "Remote device is unavailable; no local fallback",
 		},
 	};
+}
+
+/**
+ * The manual cwd change card. Restored after the workspace-context rewrite dropped it:
+ * the details panel still promises "writes a reminder message into history", and the
+ * vlist still renders `role=disp` info cards of this shape.
+ *
+ * Agent-origin switches skip this on purpose — that path injects
+ * "Working directory changed..." as the next pass's user text instead.
+ */
+async function writeCwdChangeReminder(
+	narratorId: string,
+	previousCwd: string | null | undefined,
+	cwd: string,
+	userId?: string | null,
+): Promise<void> {
+	const { getUserLanguage } = await import("../lib/i18n");
+	const locale = userId ? await getUserLanguage(userId) : "en";
+	const from = previousCwd?.trim() || null;
+	const reminder =
+		locale === "zh-CN"
+			? from
+				? `工作目录已更新：${from} → ${cwd}`
+				: `工作目录已设置为：${cwd}`
+			: from
+				? `Working directory updated: ${from} → ${cwd}`
+				: `Working directory set to: ${cwd}`;
+	const { narratorService } = await import("./narrator-service");
+	await narratorService.persistDisplayMessage(narratorId, reminder);
 }
 
 async function assertTargetAllowed(narratorId: string, cwd: string) {
@@ -467,7 +497,7 @@ export const workspaceContextService = {
 		request: SwitchWorkingDirectoryRequest,
 		options: WorkspaceSwitchOptions,
 	) {
-		return transitionWorkspaceContext(request, {
+		const result = await transitionWorkspaceContext(request, {
 			read: () => this.get(id),
 			checkAdmission: () => assertSwitchAdmission(id, options),
 			prepare: async (previous, input) => {
@@ -580,5 +610,18 @@ export const workspaceContextService = {
 					current,
 				}),
 		});
+		// Manual HTTP switch: the UI still promises a history reminder card. Agent-origin
+		// switches skip this — the orchestrator injects the pass-continuation text instead.
+		if (result.changed && options.origin === "http") {
+			try {
+				await writeCwdChangeReminder(id, result.previous.cwd, result.current.cwd, options.userId);
+			} catch (error) {
+				logger.warn("Failed to persist working-directory change reminder", {
+					narratorId: id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		return result;
 	},
 };
