@@ -36,7 +36,7 @@ describe("retired tutorial provider", () => {
 				apiKey: "test-only",
 				baseUrl: "https://provider.invalid/v1",
 				defaultModel: "guide",
-				protocol: "responses-compatible",
+				protocol: "openai-responses",
 			},
 		];
 		expect(() => resolveProviderAndModel("tutorial:guide/first-turn/en")).toThrow(

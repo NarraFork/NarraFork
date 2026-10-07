@@ -25,7 +25,7 @@ describe("configured fallback models", () => {
 					apiKey: "key",
 					defaultModel: "disabled-default",
 					disabled: true,
-					protocol: "responses-compatible",
+					protocol: "openai-responses",
 				},
 				{
 					id: "no-key",
@@ -33,7 +33,7 @@ describe("configured fallback models", () => {
 					prefix: "no-key",
 					apiKey: "",
 					defaultModel: "no-key-default",
-					protocol: "responses-compatible",
+					protocol: "openai-responses",
 				},
 			],
 			codexAvailable: true,

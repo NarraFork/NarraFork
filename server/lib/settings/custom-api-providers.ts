@@ -8,6 +8,7 @@ import type {
 	CustomApiProtocol,
 	CustomApiProviderConfig,
 	GeminiProviderConfig,
+	LegacyCustomApiProtocol,
 	NarraForkSettings,
 	OpenAIProviderConfig,
 } from "./types";
@@ -21,32 +22,46 @@ export function customApiProtocolFromOpenAI(
 	const responsesApi =
 		typeof providerOrApiMode === "object" ? providerOrApiMode.responsesApi : legacyResponsesApi;
 
-	switch (apiMode) {
-		case "codex":
-			return "codex-native";
-		case "completions":
-			return "completions-compatible";
-		case "responses":
-			return "responses-compatible";
+	if (apiMode === "completions") return "completions-compatible";
+	// codex / responses fold into the unified Responses protocol; an explicit
+	// apiMode always wins over the legacy responsesApi boolean.
+	if (apiMode) return "openai-responses";
+	return responsesApi === false ? "completions-compatible" : "openai-responses";
+}
+
+export function customApiProtocolFromAnthropic(_officialApi?: boolean): CustomApiProtocol {
+	return "anthropic-messages";
+}
+
+/**
+ * Migrate a persisted/legacy protocol value to the current enum.
+ *
+ * The removed split-protocol values fold into their unified successor:
+ *   codex-native / responses-compatible     → openai-responses
+ *   anthropic-official / anthropic-compatible → anthropic-messages
+ * Values that are already current pass through with `migratedFrom` undefined.
+ */
+export function migrateLegacyCustomApiProtocol(
+	protocol: CustomApiProtocol | LegacyCustomApiProtocol,
+): { protocol: CustomApiProtocol; migratedFrom?: LegacyCustomApiProtocol } {
+	switch (protocol) {
+		case "codex-native":
+		case "responses-compatible":
+			return { protocol: "openai-responses", migratedFrom: protocol };
+		case "anthropic-official":
+		case "anthropic-compatible":
+			return { protocol: "anthropic-messages", migratedFrom: protocol };
 		default:
-			return responsesApi === false ? "completions-compatible" : "responses-compatible";
+			return { protocol };
 	}
 }
 
-export function customApiProtocolFromAnthropic(officialApi?: boolean): CustomApiProtocol {
-	return officialApi ? "anthropic-official" : "anthropic-compatible";
-}
-
 export function isOpenAICustomApiProtocol(protocol: CustomApiProtocol): boolean {
-	return (
-		protocol === "codex-native" ||
-		protocol === "responses-compatible" ||
-		protocol === "completions-compatible"
-	);
+	return protocol === "openai-responses" || protocol === "completions-compatible";
 }
 
 export function isAnthropicCustomApiProtocol(protocol: CustomApiProtocol): boolean {
-	return protocol === "anthropic-official" || protocol === "anthropic-compatible";
+	return protocol === "anthropic-messages";
 }
 
 export function isGeminiCustomApiProtocol(protocol: CustomApiProtocol): boolean {
@@ -56,18 +71,18 @@ export function isGeminiCustomApiProtocol(protocol: CustomApiProtocol): boolean 
 /**
  * Default User-Agent mode when an operator has not chosen one for this protocol.
  *
- * Relay defaults follow the protocol the traffic speaks: Codex 中转 presents as
- * Codex; Claude Code 中转 (official and compatible Anthropic) presents as Claude
- * Code. Other protocols present as NarraFork.
+ * Relay defaults follow the protocol the traffic speaks: OpenAI Responses speaks
+ * the Codex client contract and presents as Codex; Anthropic Messages speaks the
+ * Claude Code dialect and presents as Claude Code. Other protocols present as
+ * NarraFork.
  */
 export function defaultUserAgentModeForProtocol(
 	protocol: CustomApiProtocol,
 ): NonNullable<CustomApiProviderConfig["userAgentMode"]> {
 	switch (protocol) {
-		case "codex-native":
+		case "openai-responses":
 			return "codex";
-		case "anthropic-official":
-		case "anthropic-compatible":
+		case "anthropic-messages":
 			return "claude-code";
 		default:
 			return "narrafork";
@@ -78,10 +93,8 @@ export function customApiProtocolToOpenAIApiMode(
 	protocol: CustomApiProtocol,
 ): OpenAIProviderConfig["apiMode"] | undefined {
 	switch (protocol) {
-		case "codex-native":
+		case "openai-responses":
 			return "codex";
-		case "responses-compatible":
-			return "responses";
 		case "completions-compatible":
 			return "completions";
 		default:
@@ -103,12 +116,25 @@ export function openAIProviderToCustomApi(provider: OpenAIProviderConfig): Custo
 		proxy: provider.proxy,
 		codexAccountId: provider.codexAccountId,
 		codexWebSocket: provider.codexWebSocket,
-		codexWebSearch: provider.codexWebSearch,
-		codexImageGeneration: provider.codexImageGeneration,
-		userAgentMode: provider.userAgentMode,
+		// Legacy plain-Responses entries never sent Codex native tools: the
+		// adapter only reads these flags in codex apiMode, and older clients
+		// materialized `true` onto every entry regardless of mode — an explicit
+		// `true` here is a ghost value, not a user choice. Force them off; the
+		// NarraFork UA pin stays conditional because the UA selector was visible
+		// for every protocol.
+		codexWebSearch: legacyPlainResponses(provider) ? false : provider.codexWebSearch,
+		codexImageGeneration: legacyPlainResponses(provider) ? false : provider.codexImageGeneration,
+		userAgentMode:
+			provider.userAgentMode ?? (legacyPlainResponses(provider) ? "narrafork" : undefined),
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
 	};
+}
+
+/** Legacy OpenAI entries that spoke the plain Responses dialect (no Codex contract). */
+function legacyPlainResponses(provider: OpenAIProviderConfig): boolean {
+	if (provider.apiMode) return provider.apiMode === "responses";
+	return provider.responsesApi !== false;
 }
 
 export function anthropicProviderToCustomApi(
@@ -127,7 +153,10 @@ export function anthropicProviderToCustomApi(
 		defaultReasoningEffort: provider.defaultReasoningEffort,
 		proxy: provider.proxy,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized,
-		nativeSearch: provider.nativeSearch,
+		// Legacy non-official entries never joined native-search routing (the old
+		// conversion dropped nativeSearch for them), so any stored value is
+		// inert; force search off when folding into anthropic-messages.
+		nativeSearch: provider.officialApi ? provider.nativeSearch : false,
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
@@ -224,8 +253,10 @@ export function customApiProviderToAnthropic(
 		defaultReasoningEffort: provider.defaultReasoningEffort ?? undefined,
 		proxy: provider.proxy,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized,
-		officialApi: provider.protocol === "anthropic-official",
-		nativeSearch: provider.protocol === "anthropic-official" ? provider.nativeSearch : undefined,
+		// The unified Anthropic Messages protocol always speaks the Claude Code
+		// dialect; server-side search stays opt-out via nativeSearch.
+		officialApi: true,
+		nativeSearch: provider.nativeSearch,
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
@@ -279,9 +310,38 @@ export function customApiProvidersToGemini(
 }
 
 export function normalizeCustomApiProvider(
-	provider: CustomApiProviderConfig,
+	provider: Omit<CustomApiProviderConfig, "protocol"> & {
+		protocol?: CustomApiProtocol | LegacyCustomApiProtocol;
+	},
 ): CustomApiProviderConfig {
-	const protocol = provider.protocol ?? "responses-compatible";
+	const rawProtocol = provider.protocol ?? "openai-responses";
+	const { protocol, migratedFrom } = migrateLegacyCustomApiProtocol(rawProtocol);
+
+	// Removed compatible protocols fold into the unified full-dialect protocol.
+	// Feature toggles the old dialect never sent stay OFF after migration so the
+	// traffic shape changes only where no toggle exists (wire dialect itself).
+	//
+	// The tool pins are unconditional: previous versions materialized
+	// codexWebSearch/codexImageGeneration=true onto every entry at load time and
+	// the toggles were never rendered for these protocols, so an explicit `true`
+	// is a ghost value, not a user choice — and on the old wire it had no effect.
+	// Users re-enable the tools explicitly on the unified protocol.
+	const migratedDefaults: Partial<CustomApiProviderConfig> = {};
+	if (migratedFrom === "responses-compatible") {
+		migratedDefaults.codexWebSearch = false;
+		migratedDefaults.codexImageGeneration = false;
+		// The old wire identity for this protocol was the plain NarraFork UA;
+		// pin it so upgrading does not silently re-fingerprint existing traffic.
+		// An explicitly chosen UA (the selector was visible for all protocols)
+		// still wins below.
+		if (provider.userAgentMode === undefined) migratedDefaults.userAgentMode = "narrafork";
+	}
+	if (migratedFrom === "anthropic-compatible") {
+		// nativeSearch was dropped by the old conversion for compatible entries,
+		// so any stored value never took effect; keep search off after migration.
+		migratedDefaults.nativeSearch = false;
+	}
+
 	return {
 		...provider,
 		protocol,
@@ -292,12 +352,19 @@ export function normalizeCustomApiProvider(
 		defaultReasoningEffort: provider.defaultReasoningEffort ?? undefined,
 		codexAccountId: provider.codexAccountId ?? "",
 		codexWebSocket: provider.codexWebSocket ?? false,
-		codexWebSearch: provider.codexWebSearch ?? true,
-		codexImageGeneration: provider.codexImageGeneration ?? true,
+		// Migration pins win over stored values (ghost materializations — see
+		// above); for unmigrated protocols the stored explicit choice wins.
+		codexWebSearch: migratedDefaults.codexWebSearch ?? provider.codexWebSearch ?? true,
+		codexImageGeneration:
+			migratedDefaults.codexImageGeneration ?? provider.codexImageGeneration ?? true,
+		nativeSearch: migratedDefaults.nativeSearch ?? provider.nativeSearch,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
 		// Materialize the protocol default so UI display, storage, and the wire
 		// all agree when the operator never touched the fingerprint control.
-		userAgentMode: provider.userAgentMode ?? defaultUserAgentModeForProtocol(protocol),
+		userAgentMode:
+			provider.userAgentMode ??
+			migratedDefaults.userAgentMode ??
+			defaultUserAgentModeForProtocol(protocol),
 	};
 }
 

@@ -48,7 +48,7 @@ function codexProvider(
 		apiKey: "test-key",
 		baseUrl: "https://example.invalid/backend-api/codex",
 		defaultModel: "gpt-5.6-sol",
-		protocol: "codex-native",
+		protocol: "openai-responses",
 		codexImageGeneration: true,
 		...overrides,
 	};
@@ -144,10 +144,12 @@ describe("planDisableCodexImageGeneration — custom API provider", () => {
 	});
 
 	test("also applies to the other OpenAI-family protocols", () => {
-		// `responses-compatible` relays fronting a Codex upstream can refuse the tool
-		// too; the flag is read by the same OpenAI provider adapter.
+		// The fix writes the flag at the settings level for every OpenAI-family
+		// protocol. (Completions-mode requests never send the tool, so the flag
+		// is inert there — writing it is still harmless and keeps the fix
+		// protocol-agnostic within the family.)
 		const current = snapshot([
-			codexProvider("p1", "myrelay", { protocol: "responses-compatible" }),
+			codexProvider("p1", "myrelay", { protocol: "completions-compatible" }),
 		]);
 		const { result } = planDisableCodexImageGeneration(current, "myrelay");
 		expect(result.changed).toBe(true);
@@ -206,11 +208,7 @@ describe("planDisableCodexImageGeneration — refuses to guess", () => {
 	test("rejects a provider whose protocol never sends Codex native tools", () => {
 		// Writing codexImageGeneration on an Anthropic or Gemini provider would be a
 		// silent no-op, so the user must be told the fix does not apply.
-		for (const protocol of [
-			"anthropic-compatible",
-			"anthropic-official",
-			"gemini-compatible",
-		] as const) {
+		for (const protocol of ["anthropic-messages", "gemini-compatible"] as const) {
 			const current = snapshot([codexProvider("p1", "other", { protocol })]);
 			try {
 				planDisableCodexImageGeneration(current, "other");

@@ -313,10 +313,8 @@ function SettingsProvidersPage() {
 					break;
 				default: {
 					const defaultNameByProtocol: Record<Exclude<AddProviderType, "nug">, string> = {
-						"anthropic-compatible": t("addProviderAnthropicCompatible"),
-						"anthropic-official": t("addProviderClaudeCode"),
-						"codex-native": t("addProviderCodex"),
-						"responses-compatible": t("addProviderResponses"),
+						"anthropic-messages": t("addProviderAnthropicMessages"),
+						"openai-responses": t("addProviderOpenAIResponses"),
 						"completions-compatible": t("addProviderCompletions"),
 						"gemini-compatible": t("addProviderGemini"),
 					};

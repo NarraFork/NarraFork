@@ -69,29 +69,25 @@ function resolveUpdater<T>(prev: T, updater: Updater<T>): T {
 
 function protocolFromOpenAI(provider: OpenAIProviderState): CustomApiProtocol {
 	switch (provider.apiMode) {
-		case "codex":
-			return "codex-native";
 		case "completions":
 			return "completions-compatible";
-		case "responses":
-			return "responses-compatible";
 		default:
-			return provider.responsesApi === false ? "completions-compatible" : "responses-compatible";
+			// codex / responses / unset all fold into the unified Responses protocol.
+			return provider.responsesApi === false ? "completions-compatible" : "openai-responses";
 	}
 }
 
-function protocolFromAnthropic(officialApi?: boolean): CustomApiProtocol {
-	return officialApi ? "anthropic-official" : "anthropic-compatible";
+function protocolFromAnthropic(_officialApi?: boolean): CustomApiProtocol {
+	return "anthropic-messages";
 }
 
 function isAnthropicProtocol(protocol: CustomApiProtocol): boolean {
-	return protocol === "anthropic-official" || protocol === "anthropic-compatible";
+	return protocol === "anthropic-messages";
 }
 
 function customApiToOpenAI(provider: CustomApiProviderState): OpenAIProviderState | null {
 	let apiMode: NonNullable<OpenAIProviderState["apiMode"]> | null = null;
-	if (provider.protocol === "codex-native") apiMode = "codex";
-	else if (provider.protocol === "responses-compatible") apiMode = "responses";
+	if (provider.protocol === "openai-responses") apiMode = "codex";
 	else if (provider.protocol === "completions-compatible") apiMode = "completions";
 	if (!apiMode) return null;
 	return {
@@ -125,9 +121,8 @@ function customApiToAnthropic(provider: CustomApiProviderState): AnthropicProvid
 		defaultModel: provider.defaultModel,
 		proxy: provider.proxy,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
-		officialApi: provider.protocol === "anthropic-official",
-		nativeSearch:
-			provider.protocol === "anthropic-official" ? (provider.nativeSearch ?? true) : false,
+		officialApi: true,
+		nativeSearch: provider.nativeSearch ?? true,
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
@@ -161,7 +156,7 @@ function normalizeCustomApiProvider(
 		apiKey: provider.apiKey ?? "",
 		baseUrl: provider.baseUrl ?? "",
 		defaultModel: provider.defaultModel ?? "",
-		protocol: provider.protocol ?? "responses-compatible",
+		protocol: provider.protocol ?? "openai-responses",
 		geminiTransport:
 			provider.protocol === "gemini-compatible"
 				? (provider.geminiTransport ?? "generate-content")
@@ -170,7 +165,7 @@ function normalizeCustomApiProvider(
 		defaultReasoningEffort: provider.defaultReasoningEffort,
 		proxy: provider.proxy,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
-		nativeSearch: provider.nativeSearch ?? provider.protocol === "anthropic-official",
+		nativeSearch: provider.nativeSearch ?? provider.protocol === "anthropic-messages",
 		codexAccountId: provider.codexAccountId ?? "",
 		codexWebSocket: provider.codexWebSocket ?? false,
 		codexWebSearch: provider.codexWebSearch ?? true,
@@ -187,6 +182,10 @@ function deriveCustomApiProvidersFromLegacy(
 	anthropicProviders: AnthropicProviderState[],
 	geminiProviders: Array<Partial<CustomApiProviderState>> = [],
 ): CustomApiProviderState[] {
+	// Only reached when the server returned no customApiProviders at all. The
+	// server's normalize (custom-api-providers.ts) is authoritative for legacy
+	// migration pins (native tools/search off, UA); this path just reconstructs
+	// a displayable state for very old responses.
 	const byId = new Map<string, CustomApiProviderState>();
 	for (const provider of openaiProviders) {
 		byId.set(

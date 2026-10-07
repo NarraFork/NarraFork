@@ -1,10 +1,8 @@
 import type { ProxyOverride } from "../../lib/proxy";
 
 export type CustomApiProtocol =
-	| "anthropic-official"
-	| "anthropic-compatible"
-	| "codex-native"
-	| "responses-compatible"
+	| "anthropic-messages"
+	| "openai-responses"
 	| "completions-compatible"
 	| "gemini-compatible";
 
@@ -16,16 +14,15 @@ export type UserAgentMode = "narrafork" | "claude-code" | "codex" | "custom";
  * chosen a User-Agent mode.
  *
  * Relay defaults follow the protocol the traffic actually speaks:
- * - Codex 中转 → Codex
- * - Claude Code 中转（official / compatible）→ Claude Code
+ * - OpenAI Responses（Codex 客户端契约）→ Codex
+ * - Anthropic Messages（Claude Code 方言）→ Claude Code
  * - Everything else presents as NarraFork
  */
 export function defaultUserAgentModeForProtocol(protocol: CustomApiProtocol): UserAgentMode {
 	switch (protocol) {
-		case "codex-native":
+		case "openai-responses":
 			return "codex";
-		case "anthropic-official":
-		case "anthropic-compatible":
+		case "anthropic-messages":
 			return "claude-code";
 		default:
 			return "narrafork";

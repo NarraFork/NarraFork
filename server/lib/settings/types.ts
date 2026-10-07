@@ -24,12 +24,22 @@ export type DangerReflectionLevel = "off" | "light" | "standard" | "strict";
 export type AutoContinuationMode = "always" | "blockStop" | "protectedOnly" | "off";
 
 export type CustomApiProtocol =
-	| "anthropic-official"
-	| "anthropic-compatible"
-	| "codex-native"
-	| "responses-compatible"
+	| "anthropic-messages"
+	| "openai-responses"
 	| "completions-compatible"
 	| "gemini-compatible";
+
+/**
+ * Legacy protocol values accepted from persisted settings and older clients.
+ * normalizeCustomApiProvider migrates them to the current values:
+ *   codex-native / responses-compatible   → openai-responses
+ *   anthropic-official / anthropic-compatible → anthropic-messages
+ */
+export type LegacyCustomApiProtocol =
+	| "codex-native"
+	| "responses-compatible"
+	| "anthropic-official"
+	| "anthropic-compatible";
 
 export interface CustomApiProviderConfig {
 	/** Unique short ID shared across protocol switches. */

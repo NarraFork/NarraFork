@@ -25,9 +25,10 @@ interface ClientFingerprintFieldsProps {
 	 * Mode shown when `value.userAgentMode` is unset.
 	 *
 	 * Must match the server's wire default for this surface. Built-in Codex and
-	 * codex-native custom providers default to "codex"; other custom protocols
-	 * default to "narrafork". Displaying NarraFork while the wire still sends
-	 * codex-tui made "I selected NarraFork" look like a no-op.
+	 * openai-responses custom providers default to "codex"; anthropic-messages
+	 * defaults to "claude-code"; other custom protocols default to "narrafork".
+	 * Displaying NarraFork while the wire still sends codex-tui made "I selected
+	 * NarraFork" look like a no-op.
 	 */
 	defaultMode?: UserAgentMode;
 }

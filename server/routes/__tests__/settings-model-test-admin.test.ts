@@ -495,7 +495,7 @@ describe("settings conditional admin guards", () => {
 				apiKey: "secret",
 				baseUrl: "https://example.invalid/v1",
 				defaultModel: "model-a",
-				protocol: "responses-compatible" as const,
+				protocol: "openai-responses" as const,
 			};
 			saveSettings({
 				...settings,

@@ -20,7 +20,7 @@ import {
 /**
  * Regression tests for the "custom context window has no effect" report.
  *
- * A ClaudeCode-relay provider (protocol `anthropic-official` → officialApi=true)
+ * A ClaudeCode-relay provider (protocol `anthropic-messages` → officialApi=true)
  * applied a hard 1M floor for every 4.6+ model, so a per-model window typed in
  * settings (e.g. 500k on a relay that really caps there) was silently raised
  * back to 1,000,000 — the narrator footer kept showing "/ 1,000,000 tokens" and

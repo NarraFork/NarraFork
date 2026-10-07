@@ -45,24 +45,14 @@ type ProtocolOptionConfig = {
 
 export const CUSTOM_API_PROTOCOL_OPTIONS: ProtocolOptionConfig[] = [
 	{
-		value: "anthropic-compatible",
-		labelKey: "customApiProtocolAnthropicCompatible",
-		descKey: "customApiProtocolAnthropicCompatibleDesc",
+		value: "anthropic-messages",
+		labelKey: "customApiProtocolAnthropicMessages",
+		descKey: "customApiProtocolAnthropicMessagesDesc",
 	},
 	{
-		value: "codex-native",
-		labelKey: "customApiProtocolCodexNative",
-		descKey: "customApiProtocolCodexNativeDesc",
-	},
-	{
-		value: "responses-compatible",
-		labelKey: "customApiProtocolResponsesCompatible",
-		descKey: "customApiProtocolResponsesCompatibleDesc",
-	},
-	{
-		value: "anthropic-official",
-		labelKey: "customApiProtocolAnthropicOfficial",
-		descKey: "customApiProtocolAnthropicOfficialDesc",
+		value: "openai-responses",
+		labelKey: "customApiProtocolOpenAIResponses",
+		descKey: "customApiProtocolOpenAIResponsesDesc",
 	},
 	{
 		value: "completions-compatible",
@@ -77,31 +67,28 @@ export const CUSTOM_API_PROTOCOL_OPTIONS: ProtocolOptionConfig[] = [
 ];
 
 export const CUSTOM_API_PROTOCOL_LABEL_KEYS: Record<CustomApiProtocol, string> = {
-	"anthropic-official": "customApiProtocolAnthropicOfficial",
-	"anthropic-compatible": "customApiProtocolAnthropicCompatible",
-	"codex-native": "customApiProtocolCodexNative",
-	"responses-compatible": "customApiProtocolResponsesCompatible",
+	"anthropic-messages": "customApiProtocolAnthropicMessages",
+	"openai-responses": "customApiProtocolOpenAIResponses",
 	"completions-compatible": "customApiProtocolCompletionsCompatible",
 	"gemini-compatible": "customApiProtocolGeminiCompatible",
 };
 
 export function protocolFromOpenAI(apiMode?: OpenAIProviderState["apiMode"]): CustomApiProtocol {
 	switch (apiMode) {
-		case "codex":
-			return "codex-native";
 		case "completions":
 			return "completions-compatible";
 		default:
-			return "responses-compatible";
+			// codex / responses / unset all fold into the unified Responses protocol.
+			return "openai-responses";
 	}
 }
 
-export function protocolFromAnthropic(officialApi?: boolean): CustomApiProtocol {
-	return officialApi ? "anthropic-official" : "anthropic-compatible";
+export function protocolFromAnthropic(_officialApi?: boolean): CustomApiProtocol {
+	return "anthropic-messages";
 }
 
 export function isAnthropicProtocol(protocol: CustomApiProtocol): boolean {
-	return protocol === "anthropic-official" || protocol === "anthropic-compatible";
+	return protocol === "anthropic-messages";
 }
 
 export function isGeminiProtocol(protocol: CustomApiProtocol): boolean {
@@ -550,7 +537,7 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					</Stack>
 				)}
 
-				{provider.protocol === "codex-native" && (
+				{provider.protocol === "openai-responses" && (
 					<>
 						<TextInput
 							label={t("openaiCodexAccountId")}
@@ -594,7 +581,7 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					/>
 				)}
 
-				{provider.protocol === "anthropic-official" && (
+				{provider.protocol === "anthropic-messages" && (
 					<Switch
 						label={t("anthropicNativeSearch")}
 						description={t("anthropicNativeSearchDesc")}
