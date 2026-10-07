@@ -413,7 +413,7 @@ export const knowledgeEntryLinks = sqliteTable(
 >
 > 已实现的是**条目级链接**（3.7）：`POST/GET /api/knowledge/entries/:id/links`、`DELETE /api/knowledge/links/:id`、`GET /api/knowledge/entries/:id/graph`。正文里写 `[[...]]` 目前只是普通文本，不会建链、不会渲染成内链。
 >
-> 请勿按本节做任何假设（例如"引用会自动同步"或"存在 anchor 定位"）。若要落地，需要新增 schema 列 + 迁移 + 解析器 + 前端渲染，属独立立项。
+> 请勿按本节做任何假设（例如"引用会自动同步"或"存在 anchor 定位"）。若要落地，需要新增 schema 列 + 迁移 + 解析器 + 前端渲染，属独立立项。下列 3.5/3.7 中涉及 `scope=inline` / 部分索引 `WHERE scope='entry'` / `view.*` / `renderContent` 的叙述均为**设计稿**，当前 `knowledge_entry_links` 无 scope 列、无该部分索引。
 
 内容级（inline）链接的来源是**正文里的内联引用标记**。约定一套与 markdown 兼容的语法，在保存版本时解析、回填 `knowledge_entry_links`（scope=inline）。
 
@@ -987,7 +987,7 @@ principal P：clearance=secret，grantedTags={product:M20}
 
 沿用 CLAUDE.md 的数据库迁移规则（改 `schema.ts` → `bun run db:generate` → `bun run db:migrate`，**禁止手改 drizzle/**）：
 
-1. `schema.ts` 新增核心表：collections / entries / revisions / levels / tags / entry_tags / grants / entry_links（后续另增 drafts、submissions、tag_types、acl_events、injection_events、packs 等）。`entry_links` 的部分唯一索引（`WHERE scope='entry'`）需从 `drizzle-orm` import `sql`；复合主键表（entry_tags）需 import `primaryKey`（见 3.5 注）。
+1. `schema.ts` 新增核心表：collections / entries / revisions / levels / tags / entry_tags / grants / entry_links（后续另增 drafts、submissions、tag_types、acl_events、injection_events、packs 等）。`entry_links` 当前仅条目级（无 scope 列）；复合主键表（entry_tags）需 import `primaryKey`（见 3.5 注）。
 2. `bun run db:generate` 生成迁移；可附种子脚本写入默认密级（public/internal/confidential/secret）。
 3. `server/db/fts.ts` 追加 `knowledge_entries_fts` 虚拟表 + 触发器 + rebuild（加入检测列表）。
 4. `validators/knowledge.ts` 增 Zod schema 并在 `validators/index.ts` 汇出。
@@ -1049,4 +1049,4 @@ principal P：clearance=secret，grantedTags={product:M20}
 - **知识图谱无可视化**：`useEntryGraph` hook 与 `GET /entries/:id/graph` 都已就绪，缺 React Flow 之类的图视图组件。
 - **条目筛选**：`GET /entries` 支持 `tag`，但前端无标签筛选控件；按密级筛选前后端都没有。
 - **ACL 审计无界面**：`GET /api/knowledge/acl-events`（6.7.7）目前只有 API，没有管理页。
-- **无应用内通知中心**：知识库通知走 WS 推送 + React Query 失效（6.7.6），没有落库的未读列表，也没有 toast。全库没有 `notifications` 表，`notification-service` 是钉钉/飞书 webhook——要做通知中心应作为**平台级能力**立项（不止知识库需要），并需先解决"通知带不带标题"的矛盾：带则可能泄露密级，不带则通知可读性差。
+- **知识库事件尚未进站内通知中心**：平台已有应用内通知中心（`notifications` 表 + NotificationBell/Drawer），但知识库通知仍走 WS 推送 + React Query 失效（6.7.6），未写入通知中心的未读列表。`notification-service` 另有钉钉/飞书 webhook。要把知识库审核/发布等事件接入通知中心，需先解决"通知带不带标题"的矛盾：带则可能泄露密级，不带则通知可读性差。

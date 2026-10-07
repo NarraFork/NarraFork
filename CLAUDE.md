@@ -183,7 +183,7 @@ frontend/
 - VS Code 插件 → `docs/VSCODE_EXTENSION.md`
 - Codex Responses WebSocket → `docs/codex-websocket.md`
 
-其余文档按性质：`docs/plugin-system/` 为插件系统设计与验收记录；`docs/*-DESIGN.md`、`docs/CODEX_CLIENT_RELAY.md`、`docs/DYNAMIC_SPEC_TEAM_TASKS.md` 为领域设计；`docs/HANDOUT-agent-control.md` / `docs/TALK-agent-control.md` 为培训讲义；`docs/task-call-challenges/` 为评测存档，不是产品文档。
+其余文档按性质：`docs/plugin-system/` 为插件系统设计与验收记录；`docs/*-DESIGN.md`、`docs/CODEX_CLIENT_RELAY.md`、`docs/DYNAMIC_SPEC_TEAM_TASKS.md`、`docs/PACK.md` 为领域设计；`docs/codex-websocket-ui.md` 为 Codex 开关使用说明；`docs/HANDOUT-agent-control.md` / `docs/TALK-agent-control.md` 为培训讲义；`docs/windows-shell-test-dialogue.md` 为 Windows 适配测试脚本；`docs/task-call-challenges/` 为评测存档，不是产品文档。
 
 > 新增表/路由/校验遵循既有范式：`schema.ts` → `bun run db:generate` → `bun run db:migrate`，FTS5 改 `server/db/fts.ts`，Zod schema 进 `server/lib/validators/`（按资源拆分目录），路由 `new Hono()` + `app.route`。
 

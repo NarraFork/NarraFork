@@ -33,17 +33,17 @@ bun run build:linux-x64-baseline
 bun run build:linux-arm64
 ```
 
-`--platform=` 过滤按 target 后缀精确匹配（如 `darwin-arm64`、`linux-x64`、`windows`）；裸 `arm64` 不会命中。
+`--platform=` 支持完整后缀（`darwin-arm64`、`linux-x64`、`windows-x64`）或短别名前缀（`windows`/`linux`/`darwin` 匹配对应 `*-*`）；裸 `arm64` 不会命中。
 
 ## 构建流程
 
 构建脚本 `scripts/build-cross-platform.ts` 执行以下步骤：
 
 1. **构建前端** — Vite 构建到 `dist/frontend/`
-2. **生成嵌入清单/数据** — embedded-frontend、embedded-migrations、embedded-postgres-migrations、build-info、embedded-changelog、embedded-licenses
-3. **下载 `@parcel/watcher` 原生二进制** — 8 个平台的 `.node`，绕过 node_modules
+2. **下载 `@parcel/watcher` 原生二进制** — 8 个平台的 `.node`，绕过 node_modules
+3. **生成嵌入清单/数据** — embedded-frontend、embedded-migrations、embedded-postgres-migrations、build-info、embedded-changelog、embedded-licenses
 4. **编译可执行文件** — `bun build --compile` 为每个目标平台生成独立二进制
-5. **生成校验和** — SHA256SUMS / checksums，以及更新服务器用的 `latest.yml`
+5. **生成校验和与更新元数据** — SHA256SUMS / checksums，以及更新服务器用的 `latest.yml`
 
 ## 高级用法
 
@@ -61,7 +61,7 @@ bun run build:cross --skip-frontend
 # 仅构建 Linux 版本
 bun scripts/build-cross-platform.ts --platform=linux
 
-# 仅构建某一平台（用完整后缀，如 linux-arm64 / darwin-arm64 / windows）
+# 仅构建某一平台（完整后缀如 linux-arm64 / darwin-arm64，或短别名 windows/linux/darwin）
 bun scripts/build-cross-platform.ts --platform=linux-arm64
 ```
 
