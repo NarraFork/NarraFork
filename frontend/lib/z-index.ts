@@ -15,8 +15,10 @@
  *   app: 100 / modal: 200 / popover: 300 / overlay: 400 / max: 9999
  * Mantine 自管组件(未显式传 zIndex 的 <Modal>/<Drawer>=200、<Menu>/<Select>/
  * <Combobox>/<Popover>=300、<Notifications>=400)整体处于 100~400 低区间。
- * 本 token 体系刻意整体抬高到 1000 起步,确保手写视口级浮层稳定盖过这些 Mantine
- * 默认组件;各档之间留有间隔,便于未来在不重排全局的前提下插入新层级。
+ * 本 token 体系的视口级浮层刻意抬高到 1000 起步,确保手写视口级浮层稳定盖过这些
+ * Mantine 默认组件;各档之间留有间隔,便于未来在不重排全局的前提下插入新层级。
+ * 例外:`raised`/`stickyHeader` 两档刻意贴近或低于 Mantine 自管层级,供 isolate
+ * 内抬升元素与"不得盖住菜单"的内容边缘导航辅助使用。
  *
  * 对齐策略:凡是需要参与本体系排序的 Mantine portal 组件(如全局 <Notifications>、
  * 需压过手写浮层的 Modal),都应显式传入对应的 Z token(见 main.tsx 的
@@ -27,7 +29,10 @@
 export const Z = {
 	/** isolate 容器内的"抬升"元素(粘性头、滚动到底按钮等)。仅在已 isolate 的容器内使用。 */
 	raised: 10,
-	/** 贴靠在内容边缘的粘性头部 / 改宽手柄等。 */
+	/**
+	 * 贴靠在内容边缘的粘性头部 / 改宽手柄 / 悬浮操作条 / 回到顶部等导航辅助。
+	 * 刻意低于 Mantine 自管 Menu/Modal(200~300):这些内容边缘 chrome 不得盖住读者正在操作的菜单。
+	 */
 	stickyHeader: 100,
 	/** 下拉、combobox、命令浮层、输入框上方的浮层。 */
 	dropdown: 1000,
