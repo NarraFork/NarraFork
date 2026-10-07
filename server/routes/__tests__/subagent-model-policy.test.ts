@@ -133,7 +133,7 @@ describe("settings fixed reasoning efforts", () => {
 			id: "subagent-prefix-test",
 			name: "Test",
 			prefix: "old",
-			protocol: "responses-compatible" as const,
+			protocol: "openai-responses" as const,
 			apiKey: "test-key",
 			baseUrl: "https://example.invalid/v1",
 			defaultModel: "model",

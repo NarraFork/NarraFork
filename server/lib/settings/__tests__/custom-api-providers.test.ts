@@ -8,6 +8,7 @@ import {
 	getProviderPrefixChanges,
 	migrateProviderPrefixReferences,
 	normalizeCustomApiProvider,
+	normalizeCustomApiProviderSettings,
 } from "../custom-api-providers";
 import { DEFAULTS } from "../defaults";
 import type { GeminiProviderConfig, NarraForkSettings, OpenAIProviderConfig } from "../types";
@@ -42,7 +43,107 @@ describe("custom API provider migration", () => {
 			apiMode: "responses",
 		};
 
-		expect(customApiProtocolFromOpenAI(provider)).toBe("responses-compatible");
+		expect(customApiProtocolFromOpenAI(provider)).toBe("openai-responses");
+	});
+
+	test("legacy plain-Responses entries keep native tools off and the NarraFork UA", () => {
+		const provider: OpenAIProviderConfig = {
+			id: "legacy-responses",
+			name: "Legacy Responses",
+			prefix: "legacy-resp",
+			apiKey: "sk-test",
+			baseUrl: "https://example.com/v1",
+			defaultModel: "test-model",
+			apiMode: "responses",
+		};
+
+		expect(deriveCustomApiProvidersFromLegacy([provider], [])[0]).toMatchObject({
+			protocol: "openai-responses",
+			codexWebSearch: false,
+			codexImageGeneration: false,
+			userAgentMode: "narrafork",
+		});
+	});
+
+	test("ghost materialized tool flags on plain-Responses entries are forced off", () => {
+		// Older versions materialized codexWebSearch/codexImageGeneration=true onto
+		// every persisted entry regardless of protocol. Those flags never took
+		// effect for plain Responses, so they must not survive the fold.
+		const provider: OpenAIProviderConfig = {
+			id: "ghost",
+			name: "Ghost Flags",
+			prefix: "ghost",
+			apiKey: "sk-test",
+			baseUrl: "https://example.com/v1",
+			defaultModel: "test-model",
+			apiMode: "responses",
+			codexWebSearch: true,
+			codexImageGeneration: true,
+		};
+
+		expect(deriveCustomApiProvidersFromLegacy([provider], [])[0]).toMatchObject({
+			protocol: "openai-responses",
+			codexWebSearch: false,
+			codexImageGeneration: false,
+		});
+	});
+
+	test("legacy Codex entries keep native tools on the unified protocol defaults", () => {
+		const provider: OpenAIProviderConfig = {
+			id: "legacy-codex",
+			name: "Legacy Codex",
+			prefix: "legacy-codex",
+			apiKey: "sk-test",
+			baseUrl: "https://chatgpt.com/backend-api/codex",
+			defaultModel: "gpt-5.6",
+			apiMode: "codex",
+		};
+
+		const [derived] = deriveCustomApiProvidersFromLegacy([provider], []);
+		expect(derived?.protocol).toBe("openai-responses");
+		// No pins: normalize falls back to the unified defaults (tools on, codex UA).
+		if (!derived) throw new Error("expected a derived provider");
+		const normalized = normalizeCustomApiProvider(derived);
+		expect(normalized.codexWebSearch).toBe(true);
+		expect(normalized.codexImageGeneration).toBe(true);
+		expect(normalized.userAgentMode).toBe("codex");
+	});
+
+	test("legacy non-official Anthropic entries keep native search off", () => {
+		const compatible = deriveCustomApiProvidersFromLegacy(
+			[],
+			[
+				{
+					id: "legacy-anthropic",
+					name: "Legacy Anthropic",
+					prefix: "legacy-ant",
+					apiKey: "sk-test",
+					baseUrl: "https://example.com",
+					defaultModel: "claude-opus-5",
+					officialApi: false,
+					// Inert on non-official entries; must not survive the fold.
+					nativeSearch: true,
+				},
+			],
+		)[0];
+		expect(compatible).toMatchObject({ protocol: "anthropic-messages", nativeSearch: false });
+
+		const official = deriveCustomApiProvidersFromLegacy(
+			[],
+			[
+				{
+					id: "legacy-anthropic-official",
+					name: "Legacy Anthropic Official",
+					prefix: "legacy-ant-off",
+					apiKey: "sk-test",
+					baseUrl: "https://api.anthropic.com",
+					defaultModel: "claude-opus-5",
+					officialApi: true,
+					nativeSearch: true,
+				},
+			],
+		)[0];
+		expect(official).toMatchObject({ protocol: "anthropic-messages", nativeSearch: true });
 	});
 
 	test("preserves legacy Gemini providers and their keys when split arrays are merged", () => {
@@ -65,11 +166,9 @@ describe("custom API provider migration", () => {
 		]);
 	});
 
-	test("protocol default User-Agent modes: Codex relay → codex, Claude Code relay → claude-code", () => {
-		expect(defaultUserAgentModeForProtocol("codex-native")).toBe("codex");
-		expect(defaultUserAgentModeForProtocol("anthropic-official")).toBe("claude-code");
-		expect(defaultUserAgentModeForProtocol("anthropic-compatible")).toBe("claude-code");
-		expect(defaultUserAgentModeForProtocol("responses-compatible")).toBe("narrafork");
+	test("protocol default User-Agent modes: OpenAI Responses → codex, Anthropic Messages → claude-code", () => {
+		expect(defaultUserAgentModeForProtocol("openai-responses")).toBe("codex");
+		expect(defaultUserAgentModeForProtocol("anthropic-messages")).toBe("claude-code");
 		expect(defaultUserAgentModeForProtocol("completions-compatible")).toBe("narrafork");
 		expect(defaultUserAgentModeForProtocol("gemini-compatible")).toBe("narrafork");
 	});
@@ -85,23 +184,196 @@ describe("custom API provider migration", () => {
 			codexAccountId: "",
 		};
 
-		expect(normalizeCustomApiProvider({ ...base, protocol: "codex-native" }).userAgentMode).toBe(
-			"codex",
-		);
 		expect(
-			normalizeCustomApiProvider({ ...base, protocol: "anthropic-official" }).userAgentMode,
-		).toBe("claude-code");
+			normalizeCustomApiProvider({ ...base, protocol: "openai-responses" }).userAgentMode,
+		).toBe("codex");
 		expect(
-			normalizeCustomApiProvider({ ...base, protocol: "anthropic-compatible" }).userAgentMode,
+			normalizeCustomApiProvider({ ...base, protocol: "anthropic-messages" }).userAgentMode,
 		).toBe("claude-code");
 		// An explicit operator choice is preserved.
 		expect(
 			normalizeCustomApiProvider({
 				...base,
-				protocol: "codex-native",
+				protocol: "openai-responses",
 				userAgentMode: "narrafork",
 			}).userAgentMode,
 		).toBe("narrafork");
+	});
+
+	test("removed protocol values migrate to the unified protocols", () => {
+		const base = {
+			id: "p1",
+			name: "P",
+			prefix: "p",
+			apiKey: "k",
+			baseUrl: "https://example.com",
+			defaultModel: "m",
+		};
+
+		expect(normalizeCustomApiProvider({ ...base, protocol: "codex-native" }).protocol).toBe(
+			"openai-responses",
+		);
+		expect(normalizeCustomApiProvider({ ...base, protocol: "responses-compatible" }).protocol).toBe(
+			"openai-responses",
+		);
+		expect(normalizeCustomApiProvider({ ...base, protocol: "anthropic-official" }).protocol).toBe(
+			"anthropic-messages",
+		);
+		expect(normalizeCustomApiProvider({ ...base, protocol: "anthropic-compatible" }).protocol).toBe(
+			"anthropic-messages",
+		);
+	});
+
+	test("codex-native migration keeps Codex feature defaults on", () => {
+		const migrated = normalizeCustomApiProvider({
+			id: "p1",
+			name: "P",
+			prefix: "p",
+			apiKey: "k",
+			baseUrl: "https://example.com",
+			defaultModel: "m",
+			protocol: "codex-native",
+		});
+		expect(migrated.protocol).toBe("openai-responses");
+		expect(migrated.codexWebSearch).toBe(true);
+		expect(migrated.codexImageGeneration).toBe(true);
+		expect(migrated.userAgentMode).toBe("codex");
+	});
+
+	test("responses-compatible migration keeps native tools off and pins the NarraFork UA", () => {
+		const migrated = normalizeCustomApiProvider({
+			id: "p1",
+			name: "P",
+			prefix: "p",
+			apiKey: "k",
+			baseUrl: "https://example.com/v1",
+			defaultModel: "m",
+			protocol: "responses-compatible",
+		});
+		expect(migrated.protocol).toBe("openai-responses");
+		expect(migrated.codexWebSearch).toBe(false);
+		expect(migrated.codexImageGeneration).toBe(false);
+		expect(migrated.userAgentMode).toBe("narrafork");
+
+		// The real persisted shape: older versions materialized ghost `true`
+		// tool flags onto every entry. They had no wire effect for this protocol
+		// (the adapter only reads them in codex apiMode), so the migration pins
+		// win over them. An explicitly chosen UA survives — that selector was
+		// visible for every protocol.
+		const withGhostFlags = normalizeCustomApiProvider({
+			id: "p1",
+			name: "P",
+			prefix: "p",
+			apiKey: "k",
+			baseUrl: "https://example.com/v1",
+			defaultModel: "m",
+			protocol: "responses-compatible",
+			codexWebSearch: true,
+			codexImageGeneration: true,
+			userAgentMode: "custom",
+			customUserAgent: "my-agent",
+		});
+		expect(withGhostFlags.codexWebSearch).toBe(false);
+		expect(withGhostFlags.codexImageGeneration).toBe(false);
+		expect(withGhostFlags.userAgentMode).toBe("custom");
+	});
+
+	test("anthropic-compatible migration keeps native search off", () => {
+		const migrated = normalizeCustomApiProvider({
+			id: "p1",
+			name: "P",
+			prefix: "p",
+			apiKey: "k",
+			baseUrl: "https://example.com",
+			defaultModel: "m",
+			protocol: "anthropic-compatible",
+		});
+		expect(migrated.protocol).toBe("anthropic-messages");
+		expect(migrated.nativeSearch).toBe(false);
+		expect(migrated.userAgentMode).toBe("claude-code");
+
+		// nativeSearch was inert on compatible entries (the old conversion dropped
+		// it), so even a stored `true` is forced off rather than newly enabling
+		// server-side search after the fold.
+		const withInertSearchFlag = normalizeCustomApiProvider({
+			id: "p1b",
+			name: "P1b",
+			prefix: "p1b",
+			apiKey: "k",
+			baseUrl: "https://example.com",
+			defaultModel: "m",
+			protocol: "anthropic-compatible",
+			nativeSearch: true,
+		});
+		expect(withInertSearchFlag.nativeSearch).toBe(false);
+
+		const official = normalizeCustomApiProvider({
+			id: "p2",
+			name: "P2",
+			prefix: "p2",
+			apiKey: "k",
+			baseUrl: "https://api.anthropic.com",
+			defaultModel: "m",
+			protocol: "anthropic-official",
+		});
+		expect(official.protocol).toBe("anthropic-messages");
+		expect(official.nativeSearch).toBeUndefined();
+	});
+
+	test("settings-level normalization migrates stored protocols and rederives split arrays", () => {
+		const settings = structuredClone(DEFAULTS) as NarraForkSettings;
+		settings.customApiProviders = [
+			{
+				id: "legacy-codex",
+				name: "Codex Relay",
+				prefix: "cx",
+				apiKey: "k",
+				baseUrl: "https://example.com/backend-api/codex",
+				defaultModel: "gpt-5.6",
+				protocol: "codex-native",
+			},
+			{
+				id: "legacy-resp",
+				name: "Responses Relay",
+				prefix: "resp",
+				apiKey: "k",
+				baseUrl: "https://example.com/v1",
+				defaultModel: "gpt-4o",
+				protocol: "responses-compatible",
+			},
+			{
+				id: "legacy-ant",
+				name: "Anthropic Relay",
+				prefix: "ant",
+				apiKey: "k",
+				baseUrl: "https://example.com",
+				defaultModel: "claude-opus-5",
+				protocol: "anthropic-compatible",
+			},
+		] as unknown as NarraForkSettings["customApiProviders"];
+
+		expect(normalizeCustomApiProviderSettings(settings)).toBe(true);
+		expect(settings.customApiProviders?.map((p) => p.protocol)).toEqual([
+			"openai-responses",
+			"openai-responses",
+			"anthropic-messages",
+		]);
+		// Derived OpenAI entries all use the codex apiMode; the migrated
+		// responses-compatible provider keeps native tools off.
+		expect(settings.openaiProviders?.map((p) => [p.prefix, p.apiMode])).toEqual([
+			["cx", "codex"],
+			["resp", "codex"],
+		]);
+		expect(settings.openaiProviders?.[1]?.codexWebSearch).toBe(false);
+		// Derived Anthropic entry always speaks the official dialect; the migrated
+		// compatible provider keeps native search off.
+		expect(settings.anthropicProviders?.map((p) => [p.prefix, p.officialApi])).toEqual([
+			["ant", true],
+		]);
+		expect(settings.anthropicProviders?.[0]?.nativeSearch).toBe(false);
+
+		// Already normalized settings are a no-op.
+		expect(normalizeCustomApiProviderSettings(settings)).toBe(false);
 	});
 
 	test("Gemini legacy, unified, and normalized conversions preserve transport with safe defaults", () => {

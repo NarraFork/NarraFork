@@ -841,8 +841,9 @@ export class OpenAIProvider implements ProviderAdapter {
 					reasoningEffort: normalizedCodexReasoningEffort as string,
 				});
 			} else {
-				// Plain responses-compatible relays: send the effort hint too. These
-				// used to get nothing at all, so their tier menu was dead weight.
+				// Plain Responses relays (apiMode "responses", e.g. NUG delegates):
+				// send the effort hint too. These used to get nothing at all, so
+				// their tier menu was dead weight.
 				applyGenericReasoningEffort(body, this.apiMode, params.model, params.reasoningEffort);
 			}
 

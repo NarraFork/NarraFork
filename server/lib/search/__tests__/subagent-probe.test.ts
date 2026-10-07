@@ -120,7 +120,7 @@ beforeEach(() => {
 	settings.customApiProviders = [
 		{
 			...settings.anthropicProviders[0],
-			protocol: "anthropic-official",
+			protocol: "anthropic-messages",
 		},
 	];
 	settings.search = {
@@ -179,8 +179,8 @@ describe("search subagent settings probe", () => {
 		};
 		settings.anthropicProviders = [first, second];
 		settings.customApiProviders = [
-			{ ...first, protocol: "anthropic-official" },
-			{ ...second, protocol: "anthropic-official" },
+			{ ...first, protocol: "anthropic-messages" },
+			{ ...second, protocol: "anthropic-messages" },
 		];
 		settings.agent.modelAggregations = [
 			{

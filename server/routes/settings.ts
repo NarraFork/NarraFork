@@ -48,6 +48,7 @@ import {
 	isOpenAICustomApiProtocol,
 	migrateProviderPrefixReferences,
 	type NarraForkSettings,
+	normalizeCustomApiProvider,
 	normalizeCustomApiProviderSettings,
 	normalizeProxyUrl,
 	purgeStaleAgentModelRefs,
@@ -138,13 +139,18 @@ const proxyOverrideSchema = z
 	})
 	.optional();
 
+// Accepts the current 4 protocols plus the 4 removed legacy values; inbound
+// payloads are normalized (legacy → current) before persistence/derivation.
 const customApiProtocolSchema = z.enum([
+	"anthropic-messages",
+	"openai-responses",
+	"completions-compatible",
+	"gemini-compatible",
+	// Legacy values, migrated by normalizeCustomApiProvider.
 	"anthropic-official",
 	"anthropic-compatible",
 	"codex-native",
 	"responses-compatible",
-	"completions-compatible",
-	"gemini-compatible",
 ]);
 
 const userAgentModeSchema = z.enum(["narrafork", "claude-code", "codex", "custom"]).optional();
@@ -1449,16 +1455,21 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 			current.geminiProviders?.find((p) => p.id === id)?.apiKey ??
 			"";
 
-		// Preserve real API keys for unified custom API providers.
+		// Preserve real API keys for unified custom API providers. Inbound protocols
+		// are normalized first so legacy values migrate before storage/derivation.
 		if (validated.customApiProviders) {
-			for (const p of validated.customApiProviders) {
+			const normalizedCustomApiProviders = validated.customApiProviders.map((p) =>
+				normalizeCustomApiProvider(p),
+			);
+			for (const p of normalizedCustomApiProviders) {
 				if (p.apiKey?.startsWith("*")) {
 					p.apiKey = findExistingCustomApiKey(p.id);
 				}
 			}
-			validated.openaiProviders = customApiProvidersToOpenAI(validated.customApiProviders);
-			validated.anthropicProviders = customApiProvidersToAnthropic(validated.customApiProviders);
-			validated.geminiProviders = customApiProvidersToGemini(validated.customApiProviders);
+			validated.customApiProviders = normalizedCustomApiProviders;
+			validated.openaiProviders = customApiProvidersToOpenAI(normalizedCustomApiProviders);
+			validated.anthropicProviders = customApiProvidersToAnthropic(normalizedCustomApiProviders);
+			validated.geminiProviders = customApiProvidersToGemini(normalizedCustomApiProviders);
 		}
 
 		// Preserve real API keys for OpenAI-compatible providers.

@@ -123,7 +123,7 @@ describe("OpenAIProvider completions-compatible reasoning effort", () => {
 	});
 });
 
-describe("OpenAIProvider responses-compatible reasoning effort", () => {
+describe("OpenAIProvider plain responses (apiMode) reasoning effort", () => {
 	test("sends reasoning.effort for a third-party model", async () => {
 		mockFetchCapturingBody();
 		const provider = new OpenAIProvider(config({ apiMode: "responses" }));

@@ -533,7 +533,7 @@ describe("AnthropicProvider final wire-body cache construction", () => {
 		expect(second.body.context_management).toEqual(first.body.context_management);
 	});
 
-	test("anthropic-compatible mode downgrades system messages and sends no cache controls", async () => {
+	test("non-official (officialApi=false) mode downgrades system messages and sends no cache controls", async () => {
 		installFetchCapture();
 		const provider = new AnthropicProvider(config(false));
 		const request = await sendAndCapture(provider, "compatible current user tail");
