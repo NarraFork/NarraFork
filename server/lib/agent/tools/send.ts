@@ -72,6 +72,8 @@ export const sendTool: ToolDefinition = {
 		'Subagents may also report progress to the narrator that launched them via "parent" (or "main"). Ordinary asynchronous messages may mix parent and sibling targets in one call; aliases for the same recipient are deduplicated. ' +
 		"Foreground reports are durably queued until the parent's safe input boundary; they do not start a second parent loop or guarantee immediate reading. Each target is accepted independently after whole-call authorization and reply validation; partial failures preserve successful deliveries. Explicit replyTo requires a single recipient, and replies cannot mix with ordinary messages. " +
 		"Messages have a 256 KiB UTF-8 body limit; larger content must use a file reference or summary. " +
+		"Send may wake the recipient's session and trigger an unnecessary extra agent turn, so send messages only when genuinely necessary. " +
+		"Do not send courtesy acknowledgements, redundant progress updates, or messages merely to check status. " +
 		"Use Send for new information, changed requirements, or concrete corrections—not for routine " +
 		"status checks after an Await timeout. Repeated messages can distract a working subagent. " +
 		"Set doInterrupt=true only when the current work must stop immediately; never use it merely " +
