@@ -47,6 +47,17 @@ mock.module("./narrator-session", () => ({
 		if (active) active.cwd = cwd;
 	},
 }));
+const displayMessages: Array<{ narratorId: string; text: string }> = [];
+mock.module("./narrator-service", () => ({
+	narratorService: {
+		persistDisplayMessage: async (narratorId: string, text: string) => {
+			displayMessages.push({ narratorId, text });
+		},
+	},
+}));
+mock.module("../lib/i18n", () => ({
+	getUserLanguage: async () => "en",
+}));
 const { executionPolicyEngine } = await import("./execution-policy/engine");
 const { activeNarrators, pendingPermissions, reserveNarratorRevertAdmission } = await import(
 	"./narrator-session-state"
@@ -78,6 +89,7 @@ beforeEach(async () => {
 	};
 	chapter = undefined;
 	events = [];
+	displayMessages.length = 0;
 	failInstall = false;
 	policySpy = spyOn(executionPolicyEngine, "compile").mockResolvedValue({
 		evaluatePath: () => ({ decision: "allow" }),
@@ -164,6 +176,20 @@ describe("local authoritative workspace context", () => {
 		expect(row.contextProjectId).toBe("same-project");
 		expect(events).toHaveLength(1);
 		expect(await workspaceContextService.get("narrator")).toEqual(result.current);
+	});
+	test("manual HTTP cwd change writes the history reminder; agent switches skip it", async () => {
+		const result = await change();
+		expect(result.changed).toBe(true);
+		expect(displayMessages).toEqual([
+			{
+				narratorId: "narrator",
+				text: `Working directory updated: ${join(root, "old")} → ${join(root, "new")}`,
+			},
+		]);
+		// Unchanged switch must not spam a second card.
+		displayMessages.length = 0;
+		await change(join(root, "new"), 1);
+		expect(displayMessages).toEqual([]);
 	});
 	test("real concurrent service calls at one revision have a single winner", async () => {
 		await mkdir(join(root, "other"));
@@ -258,6 +284,8 @@ describe("local authoritative workspace context", () => {
 			expect(active.cwd).toBe(join(root, "new"));
 			expect(child.cwd).toBe(join(root, "old"));
 			expect(active._workspacePassInvalidated).toBe(true);
+			// Agent origin injects the pass-continuation text instead of a display card.
+			expect(displayMessages).toEqual([]);
 		} finally {
 			activeNarrators.delete("child");
 		}
