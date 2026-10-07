@@ -1,19 +1,17 @@
 import { Box, Button, Grid, Group, Paper, Stack, Text, Title } from "@mantine/core";
 import { IconPlus } from "@tabler/icons-react";
-import React, { useMemo, useState } from "react";
+import { Link } from "@tanstack/react-router";
+import React, { useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { AddProviderPage } from "./AddProviderPage";
 import type { ProviderGroup } from "./ModelOverviewTab";
 import { ProviderCard } from "./ProviderCard";
 import type { ProviderStatus } from "./ProviderStatusBadge";
-import type { AddProviderDraft } from "./provider-add-draft";
 
 export interface ProviderOverviewViewProps {
 	groups: ProviderGroup[];
 	hiddenModels: Set<string>;
 	onToggleProviderDisabled: (prefix: string) => void;
 	onOpenProviderConfig: (prefix: string) => void;
-	onAddProvider: (draft: AddProviderDraft) => void;
 	selectedProvider: string | null;
 }
 
@@ -22,11 +20,9 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 	hiddenModels,
 	onToggleProviderDisabled,
 	onOpenProviderConfig,
-	onAddProvider,
 	selectedProvider,
 }: ProviderOverviewViewProps) {
 	const { t } = useTranslation("settings");
-	const [addProviderOpened, setAddProviderOpened] = useState(false);
 
 	const stats = useMemo(() => {
 		const total = groups.length;
@@ -114,9 +110,10 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 						</Box>
 					</Group>
 					<Button
+						component={Link}
+						to="/settings/providers/add"
 						variant="light"
 						leftSection={<IconPlus size={16} />}
-						onClick={() => setAddProviderOpened(true)}
 					>
 						{t("addProvider")}
 					</Button>
@@ -149,16 +146,6 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 						{t("overviewNoProviders")}
 					</Text>
 				</Paper>
-			)}
-
-			{addProviderOpened && (
-				<AddProviderPage
-					onClose={() => setAddProviderOpened(false)}
-					onAdd={(draft) => {
-						onAddProvider(draft);
-						setAddProviderOpened(false);
-					}}
-				/>
 			)}
 		</Stack>
 	);

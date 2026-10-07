@@ -3,7 +3,7 @@ import { Affix, Alert, Box, Button, Group, Loader, Stack, Title, Transition } fr
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute, useSearch } from "@tanstack/react-router";
+import { createFileRoute, Outlet, useRouterState, useSearch } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
@@ -20,6 +20,7 @@ import { NUGProvidersSection } from "../../components/providers/NUGProvidersSect
 import { PluginProviderSection } from "../../components/providers/PluginProviderSection";
 import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
 import { ProviderOverviewView } from "../../components/providers/ProviderOverviewView";
+import { ProviderAddContext } from "../../components/providers/provider-add-context";
 import {
 	type AddProviderDraft,
 	customProviderFromDraft,
@@ -133,6 +134,9 @@ function SettingsProvidersPage() {
 	const settingsFeatureCapability = useSettingsFeatureCapability();
 	const nugRefreshCapability = useProviderModelRefreshCapability("nug");
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
+	const isAddingProvider = useRouterState({
+		select: (router) => router.matches.some((match) => match.routeId === "/settings/providers/add"),
+	});
 	const search = useSearch({ strict: false }) as {
 		oauth_success?: string;
 		oauth_error?: string;
@@ -824,6 +828,14 @@ function SettingsProvidersPage() {
 
 	if (isLoading) return <Loader />;
 
+	if (isAddingProvider) {
+		return (
+			<ProviderAddContext value={handleAddProvider}>
+				<Outlet />
+			</ProviderAddContext>
+		);
+	}
+
 	// ── Render overview or config view ──
 	const renderContent = () => {
 		if (selectedProvider) {
@@ -862,7 +874,6 @@ function SettingsProvidersPage() {
 				hiddenModels={state.hiddenModels}
 				onToggleProviderDisabled={dispatchers.toggleProviderDisabled}
 				onOpenProviderConfig={setSelectedProvider}
-				onAddProvider={handleAddProvider}
 				selectedProvider={selectedProvider}
 			/>
 		);

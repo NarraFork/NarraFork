@@ -41,7 +41,10 @@ Data mapping (frontend/components/providers/provider-presets.ts):
 - Add NarraFork-authored Chinese search aliases (for example SiliconFlow,
   ZhiPu, DeepSeek, Bailian, Doubao, Moonshot and StepFun Chinese names) and
   common English aliases. These aliases are local usability metadata, not
-  copied upstream fields; original provider ids and display names are retained.
+  copied upstream fields; original provider ids and raw names are retained.
+- Add local providerNames.<id> translation keys and English/Chinese display-name
+  mappings in NarraFork settings locales. These localized names are local UI
+  metadata, not modifications to the upstream registry data or API URLs.
 - Exclude Azure, Bedrock, Vertex AI, Copilot, OpenAI Codex, Claude Code, Grok CLI,
   native Ollama, ComfyUI, missing URLs, and unapproved specialized adapter
   families (cherryin, aihubmix, dmxapi, newapi, mistral, perplexity, voyage,
