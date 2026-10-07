@@ -19,6 +19,10 @@ export interface DocumentVersion {
 	length: number;
 }
 export interface EditorSessionState {
+	/** Remote editing needs a real server descriptor; preview-only sources never grant Write. */
+	editable?: boolean;
+	readOnlyReason?: string;
+	previewOnly?: boolean;
 	loaded: boolean;
 	loading: boolean;
 	baseHash: string | null;
@@ -44,6 +48,7 @@ export function sessionExitBlocked(state: EditorSessionState): boolean {
 export function sessionCanSave(state: EditorSessionState): boolean {
 	return (
 		state.loaded &&
+		state.editable !== false &&
 		!state.loading &&
 		state.phase === "idle" &&
 		!state.confirmation &&
@@ -76,8 +81,13 @@ interface Options {
 	readOnlySource?: (
 		signal: AbortSignal,
 	) => Promise<{ content: string; hash: string; encoding: string }>;
+	/** Only used for explicit unsupported editor capabilities, never authorization failures. */
+	unsupportedSource?: (
+		signal: AbortSignal,
+	) => Promise<{ content: string; hash: string; encoding: string }>;
 }
 const initial = (): EditorSessionState => ({
+	editable: false,
 	loaded: false,
 	loading: false,
 	baseHash: null,
@@ -98,6 +108,8 @@ export class EditorDocumentSession {
 	state = initial();
 	private api: typeof editorDocumentApi;
 	private document: EditorDocumentDescriptor | null = null;
+	/** Survives expiry/cancellation: reauthorization may not reinterpret an original remote draft. */
+	private remoteDocumentIdentity: string | null = null;
 	private attempt: Attempt | null = null;
 	private loadController: AbortController | null = null;
 	private disposed = false;
@@ -196,7 +208,7 @@ export class EditorDocumentSession {
 		void this.api.release(this.options.narratorId, docId).catch(() => {});
 	}
 	private async authorize(signal: AbortSignal) {
-		return this.api.create(
+		const descriptor = await this.api.create(
 			this.options.narratorId,
 			{
 				path: this.options.path,
@@ -205,6 +217,38 @@ export class EditorDocumentSession {
 			},
 			signal,
 		);
+		if (this.options.deviceId !== "local") {
+			const workspace = descriptor.workspace;
+			if (!workspace) {
+				this.release(descriptor.docId);
+				throw new ApiError(
+					"Remote editor lacks a frozen workspace binding; server upgrade required",
+					422,
+					{ code: "EDITOR_REMOTE_UPGRADE_REQUIRED" },
+				);
+			}
+			const identity = JSON.stringify([
+				descriptor.target.deviceId,
+				descriptor.target.path,
+				workspace.revision,
+				workspace.contextKey,
+				workspace.cwd,
+				workspace.rootIdentity,
+			]);
+			if (
+				descriptor.target.deviceId !== this.options.deviceId ||
+				(this.remoteDocumentIdentity && this.remoteDocumentIdentity !== identity)
+			) {
+				this.release(descriptor.docId);
+				throw new ApiError(
+					"Remote workspace identity changed; keep the draft and reopen the original target",
+					403,
+					{ code: "EDITOR_IDENTITY_CHANGED" },
+				);
+			}
+			this.remoteDocumentIdentity ??= identity;
+		}
+		return descriptor;
 	}
 	/** Reauthorization deliberately does NOT install the newly observed disk baseline or text. */
 	private async recover(signal: AbortSignal) {
@@ -213,6 +257,13 @@ export class EditorDocumentSession {
 			this.release(next.docId);
 			signal.throwIfAborted();
 			throw new Error("Editor closed");
+		}
+		if (next.editable === false || (this.options.deviceId !== "local" && next.editable !== true)) {
+			this.release(next.docId);
+			const reason =
+				next.readOnlyReason ?? "Editor write capability is no longer available; keep the draft";
+			this.update({ editable: false, readOnlyReason: reason });
+			throw new ApiError(reason, 403, { code: "EDITOR_WRITE_REFUSED" });
 		}
 		const old = this.document;
 		this.document = next;
@@ -239,30 +290,36 @@ export class EditorDocumentSession {
 		const revision = this.state.version?.revision;
 		this.update({ loading: true, error: null });
 		let next: EditorDocumentDescriptor | null = null;
+		const loadReadOnly = async (read: NonNullable<Options["readOnlySource"]>, reason?: string) => {
+			const source = await read(controller.signal);
+			controller.signal.throwIfAborted();
+			if (this.disposed || this.loadController !== controller) return;
+			if (revision !== this.state.version?.revision)
+				throw new Error(
+					this.text(
+						"changedDuringReload",
+						"The draft changed while reloading. Your edits were preserved.",
+					),
+				);
+			const version = this.options.applyContent(source.content.replace(/\r\n?/g, "\n"));
+			this.resetBaseline(version);
+			this.update({
+				editable: false,
+				previewOnly: true,
+				readOnlyReason: reason,
+				loaded: true,
+				baseHash: source.hash,
+				encoding: source.encoding,
+				version,
+				baseline: version?.alternativeVersionId ?? null,
+				equivalentVersion: null,
+				conflict: null,
+				confirmation: null,
+			});
+		};
 		try {
 			if (this.options.readOnlySource) {
-				const source = await this.options.readOnlySource(controller.signal);
-				controller.signal.throwIfAborted();
-				if (this.disposed || this.loadController !== controller) return;
-				if (revision !== this.state.version?.revision)
-					throw new Error(
-						this.text(
-							"changedDuringReload",
-							"The draft changed while reloading. Your edits were preserved.",
-						),
-					);
-				const version = this.options.applyContent(source.content.replace(/\r\n?/g, "\n"));
-				this.resetBaseline(version);
-				this.update({
-					loaded: true,
-					baseHash: source.hash,
-					encoding: source.encoding,
-					version,
-					baseline: version?.alternativeVersionId ?? null,
-					equivalentVersion: null,
-					conflict: null,
-					confirmation: null,
-				});
+				await loadReadOnly(this.options.readOnlySource);
 				return;
 			}
 			next = await this.authorize(controller.signal);
@@ -289,6 +346,12 @@ export class EditorDocumentSession {
 			const version = this.options.applyContent(text, this.document);
 			this.resetBaseline(version);
 			this.update({
+				editable:
+					this.options.deviceId === "local"
+						? this.document.editable !== false
+						: this.document.editable === true,
+				readOnlyReason: this.document.readOnlyReason,
+				previewOnly: false,
 				loaded: true,
 				baseHash: this.document.baseHash,
 				encoding: this.document.encoding,
@@ -300,8 +363,24 @@ export class EditorDocumentSession {
 			});
 			if (old) this.release(old.docId);
 		} catch (error) {
-			if (this.loadController === controller && !this.disposed)
-				this.update({ error: message(error) });
+			if (this.loadController === controller && !this.disposed) {
+				if (
+					this.options.deviceId !== "local" &&
+					this.options.unsupportedSource &&
+					error instanceof ApiError &&
+					[
+						"EDITOR_REMOTE_UNSUPPORTED",
+						"EDITOR_REMOTE_UPGRADE_REQUIRED",
+						"EDITOR_REMOTE_WRITE_TOO_LARGE",
+					].includes(String(error.data?.code ?? ""))
+				) {
+					try {
+						await loadReadOnly(this.options.unsupportedSource, message(error));
+					} catch (previewError) {
+						this.update({ error: message(previewError) });
+					}
+				} else this.update({ error: message(error) });
+			}
 		} finally {
 			if (next) this.release(next.docId);
 			if (this.loadController === controller) {

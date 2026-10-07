@@ -635,14 +635,18 @@ describe("complete preparation, bounds and failures", () => {
 			{ historyCoverage: "unknown" },
 			{ omittedFiles: 1 },
 			{ unknownFiles: 1 },
-		])
+		]) {
 			await rejected(
 				service.finalize(owner, result.id, {
 					...input.manifestProof,
 					...patch,
 				} as RevertPlanManifestProof),
-				"COVERAGE_UNPROVEN",
+				"selectorCoverage" in patch || "historyCoverage" in patch
+					? "COVERAGE_UNPROVEN"
+					: "REQUEST_CONFLICT",
 			);
+			incomplete(result.id);
+		}
 		await rejected(
 			service.finalize(owner, result.id, {
 				...input.manifestProof,

@@ -9,8 +9,33 @@ import { workspaceContextService } from "../services/workspace-context-service";
 export const narratorWorkspaceContextRoutes = new Hono();
 narratorWorkspaceContextRoutes.use("/:id/workspace-context/*", bodyLimit({ maxSize: 16 * 1024 }));
 narratorWorkspaceContextRoutes.get("/:id/workspace-context", async (c) => {
-	return c.json(await workspaceContextService.get(c.req.param("id")));
+	return c.json(
+		await workspaceContextService.get(c.req.param("id"), { userId: c.get("user").sub }),
+	);
 });
+narratorWorkspaceContextRoutes.get("/:id/workspace-context/requests/:requestId", async (c) => {
+	const receipt = await workspaceContextService.getRequest(
+		c.req.param("id"),
+		c.req.param("requestId"),
+	);
+	if (!receipt) return c.json({ error: "Workspace request not found" }, 404);
+	return c.json({
+		requestId: receipt.requestId,
+		result: receipt.result,
+		installState: receipt.installState,
+	});
+});
+narratorWorkspaceContextRoutes.post(
+	"/:id/workspace-context/requests/:requestId/recover",
+	async (c) => {
+		return c.json(
+			await workspaceContextService.recoverRequest(c.req.param("id"), c.req.param("requestId"), {
+				origin: "http",
+				userId: c.get("user").sub,
+			}),
+		);
+	},
+);
 narratorWorkspaceContextRoutes.post("/:id/workspace-context/switch", async (c) => {
 	const request = switchWorkingDirectorySchema.parse(await c.req.json());
 	return c.json(
@@ -25,7 +50,7 @@ narratorWorkspaceContextRoutes.post("/:id/workspace-context/switch", async (c) =
 narratorWorkspaceContextRoutes.patch("/:id/cwd", async (c) => {
 	const id = c.req.param("id");
 	const parsed = updateNarratorCwdSchema.parse(await c.req.json());
-	const previous = await workspaceContextService.get(id);
+	const previous = await workspaceContextService.get(id, { userId: c.get("user").sub });
 	const result = await workspaceContextService.switch(
 		id,
 		{

@@ -71,6 +71,41 @@
       "when": 1791196409136,
       "tag": "0009_context_character_cache_indexes",
       "breakpoints": true
-    }
+    },
+		{
+			"idx": 10,
+			"version": "7",
+			"when": 1791346961556,
+			"tag": "0010_remote_workspace",
+			"breakpoints": true
+		},
+		{
+			"idx": 11,
+			"version": "7",
+			"when": 1791348410457,
+			"tag": "0011_remote_tree_capture_receipts",
+			"breakpoints": true
+		},
+		{
+			"idx": 12,
+			"version": "7",
+			"when": 1791357465434,
+			"tag": "0012_pack_target_binding",
+			"breakpoints": true
+		},
+		{
+			"idx": 13,
+			"version": "7",
+			"when": 1791361170113,
+			"tag": "0013_whitelist_target_identity",
+			"breakpoints": true
+		},
+		{
+			"idx": 14,
+			"version": "7",
+			"when": 1791366636786,
+			"tag": "0014_tree_capture_origin",
+			"breakpoints": true
+		}
   ]
 }

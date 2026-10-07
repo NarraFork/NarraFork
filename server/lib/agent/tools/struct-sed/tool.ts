@@ -39,7 +39,7 @@ import { prepareRemoteStructSedChange } from "../../../../services/struct-sed-re
 import { toolSpecPathError } from "../../../spec-uri";
 import { rethrowConfirmedToolDiskError } from "../../disk-safety";
 import { withDeviceParam } from "../../execution/device-schema";
-import { resolveBackendPath, toolBaseCwd } from "../../execution/path-resolve";
+import { resolveBackendPath, toolExecutionCwd } from "../../execution/path-resolve";
 import { getToolBackend } from "../../execution/tool-backend";
 import {
 	applyBatch,
@@ -409,7 +409,7 @@ export const structSedTool: ToolDefinition = {
 
 		const backend = getToolBackend(ctx, (args as { device?: string }).device);
 
-		const baseCwd = toolBaseCwd(backend, ctx.cwd);
+		const baseCwd = toolExecutionCwd(backend, ctx);
 		const resolvedPath =
 			ctx.executionTarget?.lexicalPath ?? resolveBackendPath(backend, baseCwd, filePath);
 		const canonicalPath = ctx.executionTarget?.canonicalPath;
@@ -722,7 +722,7 @@ export const structSedTool: ToolDefinition = {
 		}
 
 		try {
-			if (backend.kind !== "local") {
+			if (backend.kind !== "local" && !backend.supportsRemoteHistory) {
 				if (!backend.conditionalWriteFileBytes) {
 					return {
 						output:

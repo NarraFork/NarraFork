@@ -1076,7 +1076,7 @@ describe("local worktree list/create fixtures", () => {
 		expect(schema.anyOf).toBeUndefined();
 		expect(schema.required).toEqual(["workspaceKey", "action"]);
 		const properties = schema.properties as Record<string, Record<string, unknown>>;
-		expect(properties.action.enum).toEqual(["list", "create"]);
+		expect(properties.action.enum).toEqual(["list", "create", "reconcile"]);
 		for (const field of ["expectedRevision", "requestId", "destinationPath", "branch"]) {
 			expect(properties[field].description).toContain("Required for create");
 		}

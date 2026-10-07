@@ -149,6 +149,37 @@ describe("extractSubagentToPrimary", () => {
 			cost_missing_fields: '["output"]',
 		});
 	});
+	test("extract freezes the child's original remote workspace, not the parent's later target", async () => {
+		seedSubagent("remote-child");
+		const workspaceContext = {
+			revision: 9,
+			deviceId: "remote-original",
+			cwd: "D:\\selected\\child",
+			pathFlavor: "windows" as const,
+			contextKey: "child-source",
+			capabilities: { switchDirectory: true },
+		};
+		await db
+			.update(narrators)
+			.set({
+				workspaceContext,
+				workspaceRevision: 9,
+				cwd: "/host-decoy",
+				defaultDeviceId: "wrong-projection",
+			})
+			.where(eq(narrators.id, "remote-child"));
+		await db
+			.update(narrators)
+			.set({ cwd: "/parent-now", defaultDeviceId: "remote-new" })
+			.where(eq(narrators.id, "parent"));
+		const extracted = await extractSubagentToPrimary("remote-child");
+		expect(extracted.cwd).toBe("D:\\selected\\child");
+		expect(extracted.defaultDeviceId).toBe("remote-original");
+		expect(extracted.workspaceRevision).toBe(0);
+		expect(extracted.workspaceContext).toEqual({ ...workspaceContext, revision: 0 });
+		const source = await db.query.narrators.findFirst({ where: eq(narrators.id, "remote-child") });
+		expect(source?.workspaceContext).toEqual(workspaceContext);
+	});
 	test("creates an independent primary with materialized history and full ask policy", async () => {
 		seedPrimary("parent");
 		seedSubagent("sub", { parentNarratorId: "parent" });

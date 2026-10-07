@@ -6,7 +6,7 @@ import { toolSpecPathError } from "../../spec-uri";
 import { imageBytesToBase64, imageToBase64, sanitizeParsedDimensions } from "../../uploads";
 import type { ExecutionBackend } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
-import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
+import { resolveBackendPath, toolExecutionCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
 import { decodeFileBytes } from "./encoding";
@@ -196,7 +196,7 @@ export const readTool: ToolDefinition = {
 		const backend = getToolBackend(ctx, (args as { device?: string }).device);
 		const resolvedPath =
 			ctx.executionTarget?.lexicalPath ??
-			resolveBackendPath(backend, toolBaseCwd(backend, ctx.cwd), file_path);
+			resolveBackendPath(backend, toolExecutionCwd(backend, ctx), file_path);
 		const canonicalPath = ctx.executionTarget?.canonicalPath;
 		const ioPath = canonicalPath ?? resolvedPath;
 

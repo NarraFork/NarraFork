@@ -1573,10 +1573,11 @@ describe("executeTool execution target freeze", () => {
 			selectionSource: "session_default",
 		});
 
-		// Re-run with no availableDevices/defaultDeviceId still reproduces the frozen
-		// remote target because preFrozenTarget resolves the backend directly.
+		// Re-run without a default device still reproduces the frozen target, but a
+		// persisted approval cannot substitute for the device's current authorization.
 		const rerunConfig: AgentConfig = {
 			...makeConfig(async () => ({ behavior: "allow" })),
+			availableDevices: [availableRemote],
 			onExecutionTargetResolved: async (_toolUseId, target) => {
 				persisted.push(target);
 			},
@@ -1589,6 +1590,16 @@ describe("executeTool execution target freeze", () => {
 
 		expect(persisted).toHaveLength(2);
 		expect(persisted[1]).toEqual(original);
+		// Revocation must be checked on that exact old device, not the new local default.
+		rerunConfig.availableDevices = [];
+		const denied = await executeTool(
+			{ toolUseId: "tool-remote-revoked-rerun", name: "Read", input: { file_path: "src/a.ts" } },
+			rerunConfig,
+			{ preGrantedPermission: { behavior: "allow" }, preFrozenTarget: original },
+		);
+		expect(denied.isError).toBe(true);
+		expect(denied.output).toContain("device-remote");
+		expect(persisted).toHaveLength(2);
 	});
 });
 

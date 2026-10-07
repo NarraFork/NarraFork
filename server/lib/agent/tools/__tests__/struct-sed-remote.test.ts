@@ -324,3 +324,19 @@ test("legacy stash is local and cannot delete matching text on remote", async ()
 	expect(result.isError).toBe(true);
 	expect(result.output).toContain("device local");
 });
+
+test("modern remote history cannot fall back to legacy conditional write without a frozen receipt binding", async () => {
+	const { ctx, backend, path } = context();
+	Object.assign(backend, { supportsRemoteHistory: true });
+	let plainWrites = 0;
+	backend.conditionalWriteFileBytes = async () => {
+		plainWrites++;
+	};
+	const result = await structSedTool.execute(
+		{ file_path: path, command: "replace", address: "1", content: "ALPHA", dry_run: false },
+		ctx,
+	);
+	expect(result.isError).toBe(true);
+	expect(result.output).toContain("Persisted frozen remote tool attempt required");
+	expect(plainWrites).toBe(0);
+});

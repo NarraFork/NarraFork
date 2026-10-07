@@ -216,6 +216,16 @@ export interface ToolContext {
 	assertWorkspaceCurrent?: () => void;
 	/** Frozen workspace identity for this pass; background closures retain it. */
 	workspaceContext?: import("@shared/workspace-context").WorkspaceContext;
+	/** Actor/device/path-authorized access for automatic workspace instructions, skills and plans. */
+	workspaceFileAccess?: import("@server/lib/plan-file-path").WorkspaceFileAccess;
+	/** Manual read scope derives only from the permission-approved endpoint plan. */
+	authorizeWorkspaceRead?: import("@server/services/workspace-artifact-access").ApprovedWorkspaceReadGuard;
+	/** AI materialization requires its own approved Write endpoint, not human upload authority. */
+	workspaceArtifactAccess?: (
+		sourceAccess?: import("@server/lib/plan-file-path").WorkspaceFileAccess,
+	) => Promise<import("@server/lib/uploads").WorkspaceAttachmentAccess>;
+	/** Designated plan cycle remains bound to its original workspace after a switch. */
+	planFileBinding?: import("@server/lib/plan-file-path").PlanFileBinding;
 	/** Commit a strict-serial switch without waiting for the invoking loop. */
 	switchWorkingDirectory?: (
 		request: import("@shared/workspace-context").SwitchWorkingDirectoryRequest,
@@ -227,8 +237,10 @@ export interface ToolExecutionTarget {
 	/** "local" for the NarraFork server, otherwise remote_devices.id. */
 	deviceId: string;
 	backendKind: "local" | "remote";
-	/** Effective working directory on the target device. */
+	/** Effective working directory on the target device; relative workdir is already applied. */
 	cwd: string;
+	/** Frozen original base directory used for workspace scope checks, before workdir. */
+	baseCwd?: string;
 	/** Path grammar used to interpret cwd and path fields. Optional for persisted legacy targets. */
 	pathFlavor?: PathFlavor;
 	/** Lexically normalized absolute path for the primary path argument. */
@@ -299,6 +311,8 @@ export interface PermissionHandlerOptions {
 	toolCallBinding?: ToolCallBinding;
 	/** Suppress user-facing attention for an internally resumed permission flow. */
 	suppressAttention?: boolean;
+	/** Original designated plan workspace; never reinterpret it from a later cwd. */
+	planFileBinding?: import("@server/lib/plan-file-path").PlanFileBinding;
 	/** Frozen execution backend selected before permission handling. */
 	executionBackend?: import("./execution/backend").ExecutionBackend;
 	/** Frozen execution identity selected before permission handling. */
@@ -1017,6 +1031,16 @@ export interface AgentConfig {
 	assertWorkspaceCurrent?: () => void;
 	/** Frozen workspace identity for this pass; background closures retain it. */
 	workspaceContext?: import("@shared/workspace-context").WorkspaceContext;
+	/** Actor/device/path-authorized access for automatic workspace instructions, skills and plans. */
+	workspaceFileAccess?: import("@server/lib/plan-file-path").WorkspaceFileAccess;
+	/** Manual read scope derives only from the permission-approved endpoint plan. */
+	authorizeWorkspaceRead?: import("@server/services/workspace-artifact-access").ApprovedWorkspaceReadGuard;
+	/** AI materialization requires its own approved Write endpoint, not human upload authority. */
+	workspaceArtifactAccess?: (
+		sourceAccess?: import("@server/lib/plan-file-path").WorkspaceFileAccess,
+	) => Promise<import("@server/lib/uploads").WorkspaceAttachmentAccess>;
+	/** Designated plan cycle remains bound to its original workspace after a switch. */
+	planFileBinding?: import("@server/lib/plan-file-path").PlanFileBinding;
 	/** Commit a strict-serial switch without waiting for the invoking loop. */
 	switchWorkingDirectory?: (
 		request: import("@shared/workspace-context").SwitchWorkingDirectoryRequest,

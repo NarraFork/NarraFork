@@ -75,6 +75,34 @@ export interface FileChangeExecutionBinding {
 
 export type FileChangeActorKind = "human" | "primary" | "subagent" | "external_unknown";
 
+/** Portable non-secret original authentication snapshot. Only trusted server
+ * entrypoints produce it; absence is legacy/unknown, never a current-owner grant. */
+export type FileChangeRecoveryAuthProvenance = {
+	version: 1;
+	userId: string;
+	issuedAtSeconds: number;
+	expiresAtSeconds: number;
+} & (
+	| { authentication: "session"; tokenVersion: number }
+	| {
+			authentication: "oauth";
+			oauth: {
+				tokenId: string;
+				clientId: string;
+				oauthClientId: string;
+				grantId: string | null;
+				refreshFamilyId: string | null;
+				expiresAt: string;
+				scopes: string[];
+			};
+	  }
+);
+export interface FileChangeRecoveryOrigin {
+	narratorId: string;
+	projectId: string | null;
+	toolName?: "Write" | "Edit" | "StructSed";
+}
+
 export interface FileChangeActor {
 	kind: FileChangeActorKind;
 	/** Stable even when the linked narrator/user is deleted or anonymized. */
@@ -84,6 +112,8 @@ export interface FileChangeActor {
 	label: string | null;
 	deleted: boolean;
 	parentSubjectKey: string | null;
+	recoveryAuth?: FileChangeRecoveryAuthProvenance;
+	recoveryOrigin?: FileChangeRecoveryOrigin;
 }
 
 export interface FileChangeBlobRef {

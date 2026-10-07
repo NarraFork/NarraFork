@@ -10,7 +10,7 @@ import { logger } from "../../logger";
 import { getHome } from "../../platform";
 import type { ExecHandle, ExecutionBackend } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
-import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
+import { resolveBackendPath, toolExecutionCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
 import {
 	createOptionalExecutionTimeout,
@@ -208,6 +208,37 @@ async function prepareBashExecution(
 		target: ctx.executionTarget,
 		signal: ctx.signal,
 	});
+	// Capture the trusted attempt/endpoint before any background closure outlives this pass.
+	const remoteIdentity =
+		backend.kind === "remote" && backend.supportsRemoteHistory
+			? {
+					target: ctx.executionTarget && Object.freeze({ ...ctx.executionTarget }),
+					binding: ctx.toolCallBinding && Object.freeze({ ...ctx.toolCallBinding }),
+				}
+			: undefined;
+	let remoteFinish:
+		| typeof import("@server/services/remote-tree-snapshot-hooks")["finishRemoteActivity"]
+		| undefined;
+	if (remoteIdentity) {
+		if (!remoteIdentity.target || !remoteIdentity.binding || !ctx.userId)
+			throw new Error(
+				"Modern remote Bash requires a trusted actor, frozen target and real attempt binding.",
+			);
+		const { registerRemoteActivity, finishRemoteActivity } = await import(
+			"@server/services/remote-tree-snapshot-hooks"
+		);
+		await registerRemoteActivity({
+			narratorId: ctx.narratorId,
+			userId: ctx.userId,
+			projectId: ctx.projectId,
+			actorKind: ctx.parentNarratorId ? "subagent" : "primary",
+			target: remoteIdentity.target,
+			binding: remoteIdentity.binding,
+			kind: "bash",
+			signal: ctx.signal,
+		});
+		remoteFinish = finishRemoteActivity;
+	}
 	let started = false;
 	let ended = false;
 	let bashWindow: { end(): void } | undefined;
@@ -216,6 +247,19 @@ async function prepareBashExecution(
 		ended = true;
 		bashWindow?.end();
 		bashWindow = undefined;
+		if (remoteFinish && remoteIdentity?.target && remoteIdentity.binding) {
+			void remoteFinish({
+				target: remoteIdentity.target,
+				binding: remoteIdentity.binding,
+				outcome,
+			}).catch((error) => {
+				logger.warn("Remote Bash activity settlement requires recovery", {
+					deviceId: remoteIdentity.target?.deviceId,
+					outcome,
+					error: String(error),
+				});
+			});
+		}
 		if (!activity) return;
 		try {
 			activity.end(outcome);
@@ -235,10 +279,12 @@ async function prepareBashExecution(
 			if (started) throw new Error("Bash execution was already dispatched");
 			started = true;
 			let handle: ExecHandle;
+			let dispatchRequested = false;
 			try {
 				signal.throwIfAborted();
 				if (backend.kind === "local")
 					bashWindow = beginBashCaptureWindow(cwd, ctx.currentToolUseId ?? "__anonymous__");
+				dispatchRequested = true;
 				handle = await backend.execCommand({
 					command,
 					cwd: activity?.cwd ?? cwd,
@@ -248,11 +294,16 @@ async function prepareBashExecution(
 			} catch (error) {
 				// LocalBackend rejects dispatch only before spawning. Asynchronous
 				// spawn/process errors always come with a handle and its real barrier.
-				end("finished");
+				end(backend.kind === "remote" && dispatchRequested ? "unknown" : "finished");
 				throw error;
 			}
 			void (handle.whenSettled ?? handle.exited).then(
-				() => end("finished"),
+				(code) =>
+					end(
+						backend.kind === "remote" && !handle.whenSettled && code === null
+							? "unknown"
+							: "finished",
+					),
 				() => end("unknown"),
 			);
 			return handle;
@@ -486,11 +537,17 @@ export const bashTool: ToolDefinition = {
 			};
 		}
 		const backend = getToolBackend(ctx, device);
-		// Resolve the working directory against the backend's base cwd (device
-		// default cwd for remote, narrator cwd for local) using the backend's
-		// path grammar.
-		const base = toolBaseCwd(backend, ctx.cwd);
-		const cwd = workdir ? resolveBackendPath(backend, base, workdir) : base;
+		// Admitted cwd already contains workdir; never resolve a relative workdir twice.
+		const base =
+			ctx.workspaceContext?.deviceId === backend.deviceId
+				? ctx.workspaceContext.cwd
+				: (ctx.executionTarget?.baseCwd ??
+					ctx.executionTarget?.cwd ??
+					(workdir && backend.paths.isAbsolute(workdir)
+						? backend.paths.normalize(workdir)
+						: toolExecutionCwd(backend, ctx)));
+		const cwd =
+			ctx.executionTarget?.cwd ?? (workdir ? resolveBackendPath(backend, base, workdir) : base);
 		const title = description || command.slice(0, 80);
 
 		// Only the local backend's cwd lives on this server's filesystem; a remote

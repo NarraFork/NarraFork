@@ -6,9 +6,12 @@ import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { settings } from "../lib/settings";
 import {
+	type EditorActor,
+	type EditorBinding,
 	type EditorDocumentDependencies,
 	EditorDocumentError,
 	EditorDocumentService,
+	type RemoteEditorAdapter,
 } from "./editor-document-service";
 import {
 	EditorFileChangeUncertainError,
@@ -17,6 +20,50 @@ import {
 } from "./file-change-runtime";
 import { closeClaim, openClaim, sealClaim } from "./worktree-write-claims";
 
+export type RemoteEditorRootResolver = (
+	actor: EditorActor,
+	binding: Readonly<EditorBinding>,
+	signal: AbortSignal,
+) => Promise<{ rootIdentity: string; maxWriteBytes: number }>;
+const remoteEditorComposition = hotSafe("narrafork.editor-documents.remote.v1", () => ({
+	adapter: undefined as RemoteEditorAdapter | undefined,
+	resolveRoot: undefined as RemoteEditorRootResolver | undefined,
+}));
+
+/** Workspace/history composition must install a real evidence adapter before edit capability is returned. */
+export function configureRemoteEditorAdapter(
+	adapter: RemoteEditorAdapter,
+	resolveRoot: RemoteEditorRootResolver,
+): void {
+	remoteEditorComposition.adapter = adapter;
+	remoteEditorComposition.resolveRoot = resolveRoot;
+}
+export function remoteEditorAvailable(): boolean {
+	return !!remoteEditorComposition.adapter && !!remoteEditorComposition.resolveRoot;
+}
+export async function resolveRemoteEditorRoot(
+	actor: EditorActor,
+	binding: EditorBinding,
+	signal: AbortSignal,
+) {
+	if (!remoteEditorAvailable()) {
+		const { createProductionRemoteEditorAdapter, resolveProductionRemoteEditorRoot } = await import(
+			"./remote-workspace-history-runtime"
+		);
+		configureRemoteEditorAdapter(
+			createProductionRemoteEditorAdapter(),
+			resolveProductionRemoteEditorRoot,
+		);
+	}
+	if (!remoteEditorComposition.resolveRoot)
+		throw new EditorDocumentError(
+			"EDITOR_REMOTE_UNSUPPORTED",
+			"Remote editor evidence composition is unavailable",
+			422,
+		);
+	return remoteEditorComposition.resolveRoot(actor, Object.freeze({ ...binding }), signal);
+}
+
 export function getEditorDocumentService(): EditorDocumentService {
 	// A hot module reload must not clean up the live previous generation's pinned objects.
 	return hotSafe(
@@ -24,6 +71,9 @@ export function getEditorDocumentService(): EditorDocumentService {
 		() =>
 			new EditorDocumentService({
 				root: join(getNarraforkHome(), "editor-transfers"),
+				get remote() {
+					return remoteEditorComposition.adapter;
+				},
 				execute: executeEditorFileChange,
 				queryOperation: queryEditorOperation,
 				async afterWrite(binding, narratorId, requestId, run, actor) {

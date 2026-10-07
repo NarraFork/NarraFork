@@ -165,10 +165,16 @@ export async function extractSubagentToPrimary(
 	const id = generateId();
 	const title = opts?.title?.trim() || defaultExtractTitle(source.title, subagentType, locale);
 
+	// An extract starts an independent revision lineage, but retains physical source identity.
+	const sourceWorkspace = source.workspaceContext
+		? structuredClone(source.workspaceContext)
+		: undefined;
+	const extractedWorkspace = sourceWorkspace ? { ...sourceWorkspace, revision: 0 } : undefined;
 	const workspace = {
 		chapterId: null,
-		cwd: source.cwd ?? null,
-		defaultDeviceId: source.defaultDeviceId ?? null,
+		cwd: extractedWorkspace?.cwd ?? source.cwd ?? null,
+		defaultDeviceId: extractedWorkspace?.deviceId ?? source.defaultDeviceId ?? null,
+		workspaceContext: extractedWorkspace,
 	};
 	const admissionTargets = await narratorCreationWorkspaceTarget(workspace);
 	const newNarrator = await withWorkspaceAdmission(admissionTargets, async () =>
@@ -222,7 +228,11 @@ export async function extractSubagentToPrimary(
 						status: "idle",
 						title,
 						cwd: workspace.cwd,
-						defaultDeviceId: source.defaultDeviceId ?? null,
+						defaultDeviceId:
+							workspace.defaultDeviceId === "local" ? null : workspace.defaultDeviceId,
+						workspaceContext: extractedWorkspace ?? null,
+						workspaceRevision: 0,
+						contextProjectId: extractedWorkspace?.contextProjectId ?? source.contextProjectId,
 						createdAt: now,
 						updatedAt: now,
 					})

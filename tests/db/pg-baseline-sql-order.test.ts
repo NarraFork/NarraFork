@@ -342,12 +342,17 @@ describe("bounds, real committed assets, and source AST guard", () => {
 			Object.keys((metadata.snapshot as unknown as Snapshot).tables).length,
 		);
 		const narrators = result.order.get("narrators");
-		expect(narrators?.slice(-2)).toEqual([
+		// Historical additions keep their adjacent physical positions when later SQL appends more.
+		const contextCacheIndex = narrators?.indexOf("context_char_cache_json") ?? -1;
+		expect(contextCacheIndex).toBeGreaterThanOrEqual(0);
+		expect(narrators?.slice(contextCacheIndex, contextCacheIndex + 2)).toEqual([
 			"context_char_cache_json",
 			"context_usage_snapshot_json",
 		]);
+		expect(narrators?.slice(-2)).toEqual(["plan_file_binding", "last_stop_reason"]);
 		expect(narrators?.indexOf("next_seq")).toBeLessThan(narrators?.indexOf("insert_seq") ?? -1);
 		expect(result.order.get("background_tasks")?.at(-1)).toBe("insert_seq");
+		expect(result.order.get("knowledge_pack_activations")?.at(-1)).toBe("target_binding_json");
 	});
 
 	test("AST pins a pure SQL helper with no catalog access or snapshot-order writes", () => {

@@ -64,6 +64,12 @@ export async function createExecutionTargetContext(input: {
 		);
 	}
 
+	if (
+		isSpecExecutionTarget(sourceTarget) &&
+		(backend.kind !== "local" || backend.deviceId !== "local")
+	) {
+		throw new Error("Dynamic Spec execution targets must use the host virtual endpoint.");
+	}
 	const paths = isSpecExecutionTarget(sourceTarget)
 		? specPathSemantics
 		: (backend.paths ?? targetPathSemantics(backendPathFlavor(backend)));
@@ -142,6 +148,9 @@ export async function createExecutionTargetContext(input: {
 		deviceId: sourceTarget.deviceId,
 		backendKind: sourceTarget.backendKind,
 		cwd: paths.normalize(sourceTarget.cwd),
+		...(sourceTarget.baseCwd !== undefined
+			? { baseCwd: paths.normalize(sourceTarget.baseCwd) }
+			: {}),
 		pathFlavor: paths.flavor,
 		...(lexicalPath !== undefined ? { lexicalPath: paths.normalize(lexicalPath) } : {}),
 		...(canonicalPath !== undefined ? { canonicalPath: paths.normalize(canonicalPath) } : {}),
@@ -183,6 +192,7 @@ export function executionTargetContextKey(context: ExecutionTargetContext): stri
 		context.target.runtimeGeneration ?? context.backend.runtimeGeneration ?? 0,
 		context.deviceClass ?? "ordinary",
 		context.paths.identityKey(context.target.cwd),
+		context.paths.identityKey(context.target.baseCwd ?? context.target.cwd),
 		executionTargetPolicyPath(context)
 			? context.paths.identityKey(executionTargetPolicyPath(context) as string)
 			: "no-primary-path",

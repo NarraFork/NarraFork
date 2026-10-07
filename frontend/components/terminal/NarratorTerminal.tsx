@@ -11,6 +11,7 @@ import {
 } from "../../hooks/useTerminals";
 import { useTerminalViewState } from "../../hooks/useTerminalViewState";
 import { getTerminalWSManager } from "../../hooks/useTerminalWS";
+import { useWorkspaceContext } from "../../hooks/useWorkspaceContext";
 import { LayoutSelector, type TerminalLayout } from "./LayoutSelector";
 import { TerminalGrid } from "./TerminalGrid";
 import { TerminalTabBar } from "./TerminalTabBar";
@@ -71,8 +72,16 @@ export function NarratorTerminal({
 	const viewState = useTerminalViewState(ctx);
 	const { t } = useTranslation("terminal");
 	const terminalCapability = useTerminalCapability();
-	const terminalSupported = terminalCapability.supported;
-	const terminalUnsupportedReason = terminalCapability.reason ?? t("terminalUnsupported");
+	const workspace = useWorkspaceContext(narratorId);
+	const targetTerminal = workspace.data?.capabilities.terminal;
+	const terminalSupported =
+		!workspace.transitioning &&
+		!!workspace.data &&
+		(workspace.data.deviceId === "local"
+			? terminalCapability.supported && targetTerminal?.available !== false
+			: targetTerminal?.available === true);
+	const terminalUnsupportedReason =
+		targetTerminal?.reason ?? terminalCapability.reason ?? t("terminalUnsupported");
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const runningTerminals = (terminals ?? []).filter((t: any) => t.status === "running");
@@ -202,6 +211,11 @@ export function NarratorTerminal({
 	if (runningTerminals.length === 0) {
 		return (
 			<Group justify="center" align="center" h="100%" gap="xs">
+				{createTerminal.error && (
+					<Text size="xs" c="red">
+						{createTerminal.error.message}
+					</Text>
+				)}
 				<Text size="sm" c="dimmed">
 					{terminalSupported ? t("noTerminals") : terminalUnsupportedReason}
 				</Text>
@@ -222,6 +236,19 @@ export function NarratorTerminal({
 	return (
 		<Box style={{ height: "100%", display: "flex", flexDirection: "column" }}>
 			<Group gap={4} px={4} py={2} wrap="nowrap" style={{ flexShrink: 0 }}>
+				{activeId &&
+					(() => {
+						const terminal = runningTerminals.find((item) => item.id === activeId);
+						if (!terminal) return null;
+						const origin = `${terminal.deviceId ?? "local"} · ${terminal.cwd ?? ""}`;
+						return (
+							<Tooltip label={origin}>
+								<Text size="xs" c="dimmed" maw={220} truncate>
+									{origin}
+								</Text>
+							</Tooltip>
+						);
+					})()}
 				<TerminalTabBar
 					tabs={tabs}
 					activeTabId={activeId}
@@ -238,6 +265,11 @@ export function NarratorTerminal({
 					<LayoutSelector value={layout} onChange={handleLayoutChange} />
 				</Box>
 			</Group>
+			{createTerminal.error && (
+				<Text size="xs" c="red" px={4}>
+					{createTerminal.error.message}
+				</Text>
+			)}
 			<Box style={{ flex: 1, minHeight: 0 }}>
 				<TerminalGrid
 					layout={layout}

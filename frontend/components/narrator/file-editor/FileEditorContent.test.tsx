@@ -70,6 +70,12 @@ const source = Object.freeze({
 const descriptor: EditorDocumentDescriptor = {
 	docId: "doc",
 	target: source.target,
+	workspace: {
+		revision: 4,
+		contextKey: "editor-workspace-four",
+		cwd: "/work",
+		rootIdentity: "remote-root-object",
+	},
 	versionHandle: "v1",
 	baseHash: source.hash,
 	encoding: source.encoding,
@@ -418,14 +424,23 @@ for (const surface of ["focus", "workspace"] as const)
 			const apiRef = {
 				current: {
 					getPanel: (id: string) => panels.get(id),
+					groups: [],
 					get panels() {
-						return [...panels.values()];
+						return [
+							{
+								id: "parent-narrator",
+								params: { panelType: "narrator", narratorId: "parent" },
+								api: { location: { type: "grid" } },
+							},
+							...panels.values(),
+						];
 					},
 					addPanel: ({ id, params }: { id: string; params: FilePanelParams }) => {
 						const panel = {
 							id,
 							params,
 							api: {
+								location: { type: "grid" },
 								setActive() {},
 								updateParameters(next: FilePanelParams) {
 									panel.params = next;
@@ -1039,7 +1054,10 @@ test("preview disables history buttons without dropping undo stack", async () =>
 	expect(model.text).toBe("a\nb\n");
 });
 
-test("remote JSON remains scoped/read-only with source/node/search and explicit 1 MiB budget", async () => {
+test("old remote executor explicitly falls back to scoped/read-only preview with 1 MiB budget", async () => {
+	create.mockRejectedValue(
+		new ApiError("Executor history upgrade required", 422, { code: "EDITOR_REMOTE_UNSUPPORTED" }),
+	);
 	preview.mockResolvedValue({ ...source, content: '{"remote":"read-only value"}' });
 	const model = await mount({
 		filePath: "/work/a.json",
@@ -1048,7 +1066,8 @@ test("remote JSON remains scoped/read-only with source/node/search and explicit 
 	});
 	expect(preview.mock.calls[0]?.[0]).toBe("narrator");
 	expect(preview.mock.calls[0]?.[1].deviceId).toBe("remote-device");
-	expect(create).not.toHaveBeenCalled();
+	expect(create).toHaveBeenCalled();
+	expect(host.textContent).toContain("Executor history upgrade required");
 	expect(host.textContent).toContain("1 MiB");
 	await switchFileMode("node");
 	expect(host.querySelector("[data-file-editor-preview]")?.textContent).toContain(
@@ -1064,6 +1083,39 @@ test("remote JSON remains scoped/read-only with source/node/search and explicit 
 		"true",
 	);
 	expect(upload).not.toHaveBeenCalled();
+});
+
+test("remote server descriptor opens the real bounded editor save chain without local fallback", async () => {
+	create.mockImplementation(async (_narrator, input) => ({
+		...descriptor,
+		editable: true,
+		target: { deviceId: input.deviceId ?? "local", path: input.path },
+	}));
+	const model = await mount({ deviceId: "remote-device" });
+	expect(model.props.readOnly).toBe(false);
+	expect(preview).not.toHaveBeenCalled();
+	expect(host.textContent).not.toContain("1 MiB");
+	await edit(model, "remote draft");
+	await click(iconButton("device-floppy"));
+	expect(create.mock.calls[0]?.[1].deviceId).toBe("remote-device");
+	expect(commit).toHaveBeenCalledTimes(1);
+	expect(legacyWrite).not.toHaveBeenCalled();
+	expect(dirty.mock.calls.at(-1)?.[0]).toBe(false);
+});
+
+test("remote readonly descriptor displays exact capability reason and has no save button", async () => {
+	create.mockImplementation(async (_narrator, input) => ({
+		...descriptor,
+		editable: false,
+		readOnlyReason: "Viewer has no Write grant",
+		target: { deviceId: input.deviceId ?? "local", path: input.path },
+	}));
+	const model = await mount({ deviceId: "remote-device" });
+	expect(model.props.readOnly).toBe(true);
+	expect(host.textContent).toContain("Viewer has no Write grant");
+	expect(host.querySelector(".tabler-icon-device-floppy")).toBeNull();
+	expect(commit).not.toHaveBeenCalled();
+	expect(preview).not.toHaveBeenCalled();
 });
 
 test("search-panel save delegates to the same immutable snapshot handler", async () => {

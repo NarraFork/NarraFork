@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import type { GitWorkspace, GitWorkspaceState } from "@shared/git-workspace";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, projects } from "../db/schema";
@@ -115,6 +116,8 @@ export interface GitWorkspaceTarget {
 	configuredCwd?: string;
 	/** Request-bound authorization refresh, never serialized to clients. */
 	beforeWrite?: () => Promise<void>;
+	/** Frozen authoritative session binding; never the device's default directory. */
+	workspaceContext?: WorkspaceContext;
 }
 
 export async function resolveNarratorGitTarget(
@@ -154,23 +157,22 @@ export async function resolveNarratorGitTarget(
 		: undefined;
 	if (projectId && !project) throw new NotFoundError("Project", projectId);
 	const active = activeNarrators.get(narratorId);
-	const committedContext =
-		narrator.workspaceContext?.revision === narrator.workspaceRevision &&
-		narrator.workspaceContext.deviceId === "local"
+	let committedContext =
+		narrator.workspaceContext?.revision === narrator.workspaceRevision
 			? narrator.workspaceContext
 			: null;
 	const localCwd =
 		committedContext?.cwd ??
 		active?.cwd ??
 		resolveNarratorSessionCwd(narrator.cwd, chapter?.worktreePath, project?.gitPath, getHome());
-	const deviceId = active
-		? (active._defaultDeviceId ?? "local")
-		: (narrator.defaultDeviceId ?? "local");
+	const deviceId =
+		committedContext?.deviceId ??
+		(active ? (active._defaultDeviceId ?? "local") : (narrator.defaultDeviceId ?? "local"));
 	const workspace: GitWorkspace = {
 		narratorId,
 		projectId,
 		deviceId,
-		cwd: deviceId === "local" ? localCwd : "",
+		cwd: committedContext?.cwd ?? (deviceId === "local" ? localCwd : ""),
 		rootPath: null,
 		workspaceKey: null,
 		repositoryKey: null,
@@ -185,15 +187,27 @@ export async function resolveNarratorGitTarget(
 	} catch {
 		return { workspace, contextProjectId: projectId, configuredCwd: localCwd };
 	}
-	// Match toolBaseCwd: remote tools use the executor's cwd, never the host-side
-	// narrator.cwd. Local tools use the live session cwd, then the persisted override.
-	workspace.cwd = backend.kind === "remote" ? (backend.defaultCwd ?? "") : localCwd;
+	// Legacy initialization belongs to the context service and runs only AFTER the access gate.
+	// Dynamic import avoids its Git discovery import cycle. It captures defaultCwd once, not
+	// on each Git request; an offline or uninitialized binding never falls back to host Git.
+	if (!committedContext && backend.kind === "remote") {
+		const { workspaceContextService } = await import("./workspace-context-service");
+		committedContext = await workspaceContextService.get(narratorId);
+		if (committedContext.deviceId !== deviceId)
+			throw new AppError("Workspace changed during Git admission", 409, "GIT_WORKSPACE_CHANGED");
+	}
+	workspace.cwd = committedContext?.cwd ?? (backend.kind === "local" ? localCwd : "");
 	const target: GitWorkspaceTarget = {
 		workspace,
 		backend,
 		contextProjectId: projectId,
-		configuredCwd: localCwd,
+		configuredCwd: workspace.cwd,
+		workspaceContext: committedContext ?? undefined,
 	};
+	Object.assign(workspace, {
+		contextKey: committedContext?.contextKey,
+		workspaceRevision: committedContext?.revision,
+	});
 	if (!workspace.cwd || !backend.paths.isAbsolute(workspace.cwd)) {
 		workspace.state = "missing_directory";
 		workspace.reason = "Execution device has no absolute working directory";

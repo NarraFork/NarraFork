@@ -31,6 +31,7 @@ import {
 	type FileChangeReversalStep,
 } from "./file-change-reversal";
 import type { NarratorPrincipal } from "./narrator-acl";
+import { currentRemoteRecoveryAuthProvenance } from "./remote-history-recovery-auth";
 import {
 	type AppendRevertPlanFile,
 	fingerprintRevertPlanFiles,
@@ -292,6 +293,8 @@ export class RevertPlannerService {
 					version: 1,
 					owner,
 					request: fixed,
+					// Original authenticated entry provenance, never a client field or owner guess.
+					recoveryAuth: currentRemoteRecoveryAuthProvenance(fixed.principal.userId),
 					fixedSelector: selected.selector,
 					boundary: selected.boundary,
 				},

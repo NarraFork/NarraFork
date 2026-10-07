@@ -823,7 +823,25 @@ describe("GitPanel", () => {
 	async function renderNarratorWorkspace(initial: GitWorkspace) {
 		let workspace = initial;
 		const calls: Array<{ name: string; target?: GitTarget }> = [];
+		let workspaceRevision = 7;
+		const workspaceContext = () => ({
+			revision: workspaceRevision,
+			contextKey: `fixture:${workspace.deviceId}:${workspace.cwd}:${workspaceRevision}`,
+			deviceId: workspace.deviceId,
+			cwd: workspace.cwd ?? "/repo/sub",
+			pathFlavor: "posix" as const,
+			capabilities: { switchDirectory: true },
+			git:
+				workspace.workspaceKey && workspace.repositoryKey && workspace.rootPath
+					? {
+							workspaceKey: workspace.workspaceKey,
+							repositoryKey: workspace.repositoryKey,
+							rootPath: workspace.rootPath,
+						}
+					: undefined,
+		});
 		const original = {
+			getWorkspaceContext: api.getWorkspaceContext,
 			getGitWorkspace: api.getGitWorkspace,
 			getGitStatus: api.getGitStatus,
 			getGitModifications: api.getGitModifications,
@@ -834,6 +852,7 @@ describe("GitPanel", () => {
 			getGitLog: api.getGitLog,
 			getGitStashList: api.getGitStashList,
 		};
+		api.getWorkspaceContext = async () => workspaceContext();
 		api.getGitWorkspace = async () => workspace;
 		api.getGitStatus = async () => makeStatus();
 		api.getGitModifications = async () => ({ byFile: [], actors: [], hasMore: false });
@@ -866,11 +885,8 @@ describe("GitPanel", () => {
 			chapterId: null,
 			contextProjectId: "project-context",
 		});
-		const workspaceQueryKey = [
-			"gitWorkspace",
-			narratorId,
-			["/repo/sub", null, "project-context", undefined],
-		];
+		queryClient.setQueryData(["workspaceContext", narratorId], workspaceContext());
+		let workspaceQueryKey = ["gitWorkspace", narratorId, workspaceRevision];
 		queryClient.setQueryData(workspaceQueryKey, workspace);
 		if (workspace.workspaceKey)
 			queryClient.setQueryData(["gitStatus", workspace.workspaceKey], makeStatus());
@@ -896,6 +912,9 @@ describe("GitPanel", () => {
 			calls,
 			update(next: GitWorkspace) {
 				workspace = next;
+				workspaceRevision++;
+				workspaceQueryKey = ["gitWorkspace", narratorId, workspaceRevision];
+				queryClient.setQueryData(["workspaceContext", narratorId], workspaceContext());
 				if (next.workspaceKey)
 					queryClient.setQueryData(["gitStatus", next.workspaceKey], makeStatus());
 				queryClient.setQueryData(workspaceQueryKey, next);

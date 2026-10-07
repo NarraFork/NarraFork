@@ -279,19 +279,27 @@ describe("resumeRecoverySubagents DB recovery", () => {
 			await seedRecoverableSubagent("sub-fails", "retry-fails");
 			await seedRecoverableSubagent("sub-works", "retry-works");
 			if (existingStatus) {
-				await db.insert(backgroundTasks).values({
+				// Create a real publication-bound task before changing its historical
+				// status. A manually INSERTed post-startup legacy row has no admitted
+				// logical run and must not bypass closed legacy publication admission.
+				await backgroundTaskService.createAgentTask({
 					id: "sub-fails",
 					parentNarratorId: PARENT_ID,
-					type: "agent",
-					status: existingStatus,
 					subagentNarratorId: "sub-fails",
+					subagentType: "general",
 					alias: "retry-fails",
-					output: existingStatus === "failed" ? "Previous failure" : null,
-					startedAt: FAILED_AT,
-					completedAt: existingStatus === "failed" ? FAILED_AT : null,
-					createdAt: FAILED_AT,
-					updatedAt: FAILED_AT,
 				});
+				await db
+					.update(backgroundTasks)
+					.set({
+						status: existingStatus,
+						output: existingStatus === "failed" ? "Previous failure" : null,
+						startedAt: FAILED_AT,
+						completedAt: existingStatus === "failed" ? FAILED_AT : null,
+						createdAt: FAILED_AT,
+						updatedAt: FAILED_AT,
+					})
+					.where(eq(backgroundTasks.id, "sub-fails"));
 			}
 			const resume = mockSuccessfulResume();
 			resume.mockImplementationOnce(async () => {

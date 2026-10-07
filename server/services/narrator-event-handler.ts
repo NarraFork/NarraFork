@@ -24,6 +24,7 @@ import {
 	cleanupPartialImageGenerationResults,
 	saveImageGenerationResult,
 } from "../lib/agent/image-generation";
+import type { ToolExecutionTarget } from "../lib/agent/types";
 import {
 	type ApiRequestHandle,
 	finishApiRequest,
@@ -43,6 +44,7 @@ import {
 	resolveTranslationModelOverride,
 	settings,
 } from "../lib/settings";
+import { isApiExecutionTarget } from "../lib/tool-execution-target-projection";
 import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
@@ -262,6 +264,23 @@ export interface TokenUsageSnapshot {
 	isEstimated?: boolean;
 }
 
+function completedExecutionWorkspace(
+	value: unknown,
+): import("@shared/workspace-context").WorkspaceContext | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const scope = value as Partial<import("@shared/workspace-context").WorkspaceContext>;
+	if (
+		typeof scope.deviceId !== "string" ||
+		typeof scope.cwd !== "string" ||
+		typeof scope.contextKey !== "string" ||
+		!Number.isSafeInteger(scope.revision) ||
+		(scope.revision ?? -1) < 0 ||
+		(scope.pathFlavor !== "posix" && scope.pathFlavor !== "windows") ||
+		typeof scope.capabilities?.switchDirectory !== "boolean"
+	)
+		return undefined;
+	return scope as import("@shared/workspace-context").WorkspaceContext;
+}
 export interface EventHandlerContext {
 	/** Initiating user captured for this pass, including background translations. */
 	userId?: string | null;
@@ -410,7 +429,13 @@ export interface EventHooks {
 	/** Clear compact summary after first response */
 	onClearCompactSummary?: () => Promise<void>;
 	/** Git status tracking after file-mutating tools and completed Bash commands */
-	onGitTrack?: (toolName: string, toolUseId: string, input?: Record<string, unknown>) => void;
+	onGitTrack?: (
+		toolName: string,
+		toolUseId: string,
+		input?: Record<string, unknown>,
+		target?: ToolExecutionTarget,
+		workspace?: import("@shared/workspace-context").WorkspaceContext,
+	) => void;
 	/** Legacy direct-call adapter only; processEvent never triggers workspace captures. */
 	onSnapshotBefore?: (toolUseId: string, toolName: string, input: unknown) => Promise<void> | void;
 	/** Snapshot: record the workspace tree hash after a file-mutating tool completes */
@@ -2473,7 +2498,15 @@ export async function processEvent(
 
 			// Main narrator: git tracking
 			if (hooks?.onGitTrack) {
-				hooks.onGitTrack(event.toolName, event.toolUseId, event.input);
+				hooks.onGitTrack(
+					event.toolName,
+					event.toolUseId,
+					event.input,
+					isApiExecutionTarget(event.metadata?.executionTarget)
+						? event.metadata.executionTarget
+						: undefined,
+					completedExecutionWorkspace(event.metadata?.executionWorkspace),
+				);
 			}
 
 			// Main narrator: ExitPlanMode

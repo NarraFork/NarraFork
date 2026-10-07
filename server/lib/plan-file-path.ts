@@ -15,7 +15,155 @@
 
 import { stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
+import type { WorkspaceContext } from "@shared/workspace-context";
+import type { ExecutionBackend, FileStat } from "./agent/execution/backend";
 import type { TargetPathSemantics } from "./agent/execution/path-semantics";
+
+/** Automatic engineering reads use the same actor/project/device/path policy as tools. */
+export interface WorkspaceFileAccess {
+	backend: ExecutionBackend;
+	workspaceContext?: WorkspaceContext;
+	signal?: AbortSignal;
+	runtimeGeneration?: number;
+	authorizeRead: (
+		canonicalPath: string,
+		backend: ExecutionBackend,
+		signal?: AbortSignal,
+	) => Promise<boolean | undefined>;
+}
+
+export interface PlanFileBinding {
+	workspaceContext: WorkspaceContext;
+	planFileId: string;
+	planFilePath: string;
+}
+
+/** Runtime layer supplies the authorization intersection; this helper freezes IO identity. */
+export function createWorkspaceFileAccess(input: WorkspaceFileAccess): WorkspaceFileAccess {
+	if (input.workspaceContext && input.workspaceContext.deviceId !== input.backend.deviceId) {
+		throw new Error("Workspace file backend does not match frozen workspace");
+	}
+	return Object.freeze({
+		...input,
+		runtimeGeneration: input.backend.runtimeGeneration,
+		workspaceContext: input.workspaceContext
+			? Object.freeze(structuredClone(input.workspaceContext))
+			: undefined,
+	});
+}
+
+export const WORKSPACE_READ_TIMEOUT_MS = 5_000;
+
+function waitWorkspaceRead<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+	return new Promise((resolve, reject) => {
+		const abort = () => reject(signal.reason);
+		signal.addEventListener("abort", abort, { once: true });
+		operation.then(
+			(value) => {
+				signal.removeEventListener("abort", abort);
+				if (signal.aborted) reject(signal.reason);
+				else resolve(value);
+			},
+			(error) => {
+				signal.removeEventListener("abort", abort);
+				reject(error);
+			},
+		);
+		if (signal.aborted) abort();
+	});
+}
+
+/** Canonicalize and authorize before even metadata is exposed; never use host filesystem. */
+export async function statWorkspaceFile(
+	access: WorkspaceFileAccess,
+	filePath: string,
+): Promise<FileStat | null> {
+	const { backend } = access;
+	const signal = access.signal
+		? AbortSignal.any([access.signal, AbortSignal.timeout(WORKSPACE_READ_TIMEOUT_MS)])
+		: AbortSignal.timeout(WORKSPACE_READ_TIMEOUT_MS);
+	signal.throwIfAborted();
+	if (access.workspaceContext && access.workspaceContext.deviceId !== backend.deviceId) {
+		throw new Error("Workspace file backend does not match frozen workspace");
+	}
+	const generation = access.runtimeGeneration ?? backend.runtimeGeneration;
+	if (backend.runtimeGeneration !== generation)
+		throw new Error("Workspace read backend generation changed");
+	const identity = await waitWorkspaceRead(
+		backend.resolvePathIdentity(filePath, {
+			signal,
+			timeoutMs: WORKSPACE_READ_TIMEOUT_MS,
+		}),
+		signal,
+	);
+	if (identity.runtimeGeneration !== generation || backend.runtimeGeneration !== generation) {
+		throw new Error("Workspace read backend generation changed");
+	}
+	if (
+		(await waitWorkspaceRead(
+			access.authorizeRead(identity.canonicalPath, backend, signal),
+			signal,
+		)) === false
+	) {
+		throw new Error(`Workspace read denied: ${identity.canonicalPath}`);
+	}
+	signal.throwIfAborted();
+	if (backend.runtimeGeneration !== generation)
+		throw new Error("Workspace read backend generation changed");
+	const info = await waitWorkspaceRead(
+		backend.statFile(identity.lexicalPath, {
+			signal,
+			timeoutMs: WORKSPACE_READ_TIMEOUT_MS,
+		}),
+		signal,
+	);
+	if (backend.runtimeGeneration !== generation)
+		throw new Error("Workspace read backend generation changed");
+	if (info?.resolvedPath && !backend.paths.equals(info.resolvedPath, identity.canonicalPath)) {
+		throw new Error("Workspace read path identity changed");
+	}
+	return info ? { ...info, resolvedPath: identity.canonicalPath } : null;
+}
+
+export async function readWorkspaceText(
+	access: WorkspaceFileAccess,
+	filePath: string,
+	maxBytes: number,
+): Promise<{ content: string; truncated: boolean } | null> {
+	if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > 1_048_576) {
+		throw new Error("Automatic workspace reads require a limit between 1 byte and 1 MiB");
+	}
+	const generation = access.backend.runtimeGeneration;
+	const info = await statWorkspaceFile(access, filePath);
+	if (!info?.isFile) return null;
+	if (access.backend.runtimeGeneration !== generation)
+		throw new Error("Workspace read backend generation changed");
+	const signal = access.signal
+		? AbortSignal.any([access.signal, AbortSignal.timeout(WORKSPACE_READ_TIMEOUT_MS)])
+		: AbortSignal.timeout(WORKSPACE_READ_TIMEOUT_MS);
+	const result = await waitWorkspaceRead(
+		access.backend.readFileBytes(filePath, {
+			maxBytes,
+			signal,
+			timeoutMs: WORKSPACE_READ_TIMEOUT_MS,
+			expectedResolvedPath: info.resolvedPath,
+		}),
+		signal,
+	);
+	if (result.bytes.byteLength > maxBytes) throw new Error("Workspace read exceeded byte limit");
+	if (
+		access.backend.runtimeGeneration !== generation ||
+		(result.resolvedPath &&
+			info.resolvedPath &&
+			!access.backend.paths.equals(result.resolvedPath, info.resolvedPath))
+	) {
+		throw new Error("Workspace read source changed");
+	}
+	return {
+		content: new TextDecoder().decode(result.bytes, { stream: result.truncated }),
+		truncated: result.truncated,
+	};
+}
 
 /** Directory (relative to the narrator cwd) holding every designated plan file. */
 export const PLAN_DIR_REL = ".narrafork/plans";
@@ -131,13 +279,25 @@ const localPlanFileContentProbe: PlanFileContentProbe = async (cwd, relPath) => 
 export async function resolveExistingPlanFileRelPath(
 	cwd: string,
 	planFileId: string | null | undefined,
-	probe: PlanFileContentProbe = localPlanFileContentProbe,
+	probeOrAccess: PlanFileContentProbe | WorkspaceFileAccess = localPlanFileContentProbe,
 ): Promise<string | undefined> {
 	if (!isSafePlanFileIdForPath(planFileId)) return undefined;
 	const canonical = buildPlanFileRelPath(planFileId);
-	if (!isAbsolute(cwd)) return canonical;
-	if (await probe(cwd, canonical)) return canonical;
+	const access = typeof probeOrAccess === "function" ? undefined : probeOrAccess;
+	const probe: PlanFileContentProbe =
+		typeof probeOrAccess === "function"
+			? probeOrAccess
+			: async (base, rel) => {
+					const info = await statWorkspaceFile(
+						probeOrAccess,
+						probeOrAccess.backend.paths.resolve(base, rel),
+					);
+					return !!info?.isFile && info.size > 0;
+				};
+	const baseCwd = access?.workspaceContext?.cwd ?? cwd;
+	if (!(access ? access.backend.paths.isAbsolute(baseCwd) : isAbsolute(baseCwd))) return canonical;
+	if (await probe(baseCwd, canonical)) return canonical;
 	const legacy = buildLegacyPlanFileRelPath(planFileId);
-	if (await probe(cwd, legacy)) return legacy;
+	if (await probe(baseCwd, legacy)) return legacy;
 	return canonical;
 }

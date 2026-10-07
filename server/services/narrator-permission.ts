@@ -89,6 +89,7 @@ import {
 	isInsidePlansDir,
 	isSafePlanFileIdForPath,
 	PLAN_DIR_REL,
+	type PlanFileBinding,
 } from "../lib/plan-file-path";
 import { isInsidePath, normalizePathForOS, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
@@ -313,7 +314,12 @@ function isInsideDecisionWorktree(
 	path: string,
 	context?: ExecutionTargetContext | null,
 ): boolean {
-	return isInsideDecisionPath(cwd, decisionCwd(cwd, context), path, context);
+	return isInsideDecisionPath(
+		cwd,
+		context?.target.baseCwd ?? decisionCwd(cwd, context),
+		path,
+		context,
+	);
 }
 
 function isInsideDecisionTruncateDir(
@@ -334,7 +340,7 @@ function getShellScopePaths(
 ): string[] {
 	const paths = new Set<string>();
 	if (typeof input.workdir === "string" && input.workdir) {
-		paths.add(context?.target.cwd ?? resolveDecisionPath(cwd, input.workdir, context));
+		paths.add(context?.target.cwd ?? resolveDecisionPath(cwd, input.workdir));
 	}
 	// analyzeShellCommand already resolves these with the target's path semantics. Never
 	// feed them through the NarraFork host cwd a second time.
@@ -388,8 +394,14 @@ function resolveWhitelistDecision(
 	if (toolName === "Agent") {
 		const workdir = input.workdir;
 		if (typeof workdir !== "string" || !workdir) return null;
-		const resolvedWorkdir = resolveDecisionPath(cwd, workdir, context);
-		if (decisionPaths(context).equals(resolvedWorkdir, decisionCwd(cwd, context))) return null;
+		const resolvedWorkdir = context?.target.cwd ?? resolveDecisionPath(cwd, workdir);
+		if (
+			decisionPaths(context).equals(
+				resolvedWorkdir,
+				context?.target.baseCwd ?? decisionCwd(cwd, context),
+			)
+		)
+			return null;
 		const operation =
 			input.subagent_type === "explore" || input.subagent_type === "plan" ? "read" : "full";
 		return compiledPolicy.evaluatePath({ path: resolvedWorkdir, operation }).decision === "allow"
@@ -725,7 +737,7 @@ function resolveReviewBoundaryDeny(
 	if (!WRITE_TOOLS.has(toolName) && toolName !== "Browser" && toolName !== "Agent") return null;
 	const targets =
 		toolName === "Agent" && typeof input.workdir === "string" && input.workdir
-			? [resolveDecisionPath(cwd, input.workdir, context)]
+			? [context?.target.cwd ?? resolveDecisionPath(cwd, input.workdir)]
 			: getToolPolicyPaths(toolName, input, cwd, analysis, context);
 	try {
 		return targets.some((path) =>
@@ -1005,8 +1017,10 @@ export function resolvePermissionDecision(
 	if (toolName === "Agent") {
 		const workdir = input.workdir;
 		const resolvedWorkdir =
-			typeof workdir === "string" && workdir ? resolveDecisionPath(cwd, workdir, context) : null;
-		const normalizedCwd = decisionCwd(cwd, context);
+			typeof workdir === "string" && workdir
+				? (context?.target.cwd ?? resolveDecisionPath(cwd, workdir))
+				: null;
+		const normalizedCwd = context?.target.baseCwd ?? decisionCwd(cwd, context);
 		const isOutsideCwd =
 			resolvedWorkdir !== null && !decisionPaths(context).contains(normalizedCwd, resolvedWorkdir);
 		const isDifferentDir =
@@ -1189,7 +1203,7 @@ function resolveBlacklistDecision(
 					: "write";
 	const paths =
 		toolName === "Agent" && typeof input.workdir === "string" && input.workdir
-			? [resolveDecisionPath(cwd, input.workdir, context)]
+			? [context?.target.cwd ?? resolveDecisionPath(cwd, input.workdir)]
 			: getToolPolicyPaths(toolName, input, cwd, bashAnalysis, context);
 	for (const path of paths) {
 		const result = genericPolicy.evaluatePath({ path, operation });
@@ -3126,6 +3140,7 @@ export async function resolveExitPlanModeInput(
 	executionTarget?: ToolExecutionTarget,
 	designatedPlanPath?: string,
 	planReadPolicy?: PlanFileReadPolicy,
+	planFileBinding?: PlanFileBinding,
 ): Promise<ExitPlanModeInputResolution> {
 	return resolveExitPlanModeInputWithBackend(
 		narratorId,
@@ -3137,6 +3152,7 @@ export async function resolveExitPlanModeInput(
 		executionTarget,
 		designatedPlanPath,
 		planReadPolicy,
+		planFileBinding,
 	);
 }
 
@@ -3267,9 +3283,18 @@ export async function resolveExitPlanModeInputWithBackend(
 	executionTarget?: ToolExecutionTarget,
 	designatedPlanPath?: string,
 	planReadPolicy?: PlanFileReadPolicy,
+	planFileBinding?: PlanFileBinding,
 ): Promise<ExitPlanModeInputResolution> {
+	if (planFileBinding && planFileBinding.workspaceContext.deviceId !== backend.deviceId) {
+		return {
+			ok: false,
+			input,
+			resolvedFromFile: false,
+			message: "Plan file is bound to another execution device; use its original frozen endpoint.",
+		};
+	}
 	const active = activeNarrators.get(narratorId);
-	const planFileId = active?._planFileId;
+	const planFileId = planFileBinding?.planFileId ?? active?._planFileId;
 	const allowInlinePlan = settings.agent.planModeAllowInlinePlan;
 	let effectiveInput = input;
 	let resolvedFromFile = false;
@@ -3290,6 +3315,7 @@ export async function resolveExitPlanModeInputWithBackend(
 			: undefined;
 	const customPlanFilePath = isRelaxedPlan ? suppliedPlanFilePath : undefined;
 	const defaultPlanFilePath =
+		planFileBinding?.planFilePath ??
 		designatedPlanPath ??
 		active?._planFilePath ??
 		(isSafePlanFileIdForPath(planFileId) ? buildPlanFileRelPath(planFileId) : null);
@@ -3356,7 +3382,8 @@ export async function resolveExitPlanModeInputWithBackend(
 	let planFileError: PlanFileResolutionError | undefined;
 	/** Bytes of plan content proven to be on disk, for the inline-conflict refusal. */
 	let planFileContentBytes: number | undefined;
-	const baseCwd = executionTarget?.cwd ?? toolBaseCwd(backend, cwd);
+	const baseCwd =
+		planFileBinding?.workspaceContext.cwd ?? executionTarget?.cwd ?? toolBaseCwd(backend, cwd);
 
 	// A malformed persisted identity is a boundary violation in its own right. It is
 	// checked independently of whether a path could be derived from it: an identity
@@ -4984,6 +5011,7 @@ export async function handlePermission(
 			executionContext.target as ToolExecutionTarget,
 			activeNarrators.get(narratorId)?._planFilePath,
 			{ narratorId, compiledPolicy },
+			options?.planFileBinding,
 		);
 		effectiveInput = resolved.input;
 		exitPlanResolvedFromFile = resolved.resolvedFromFile;

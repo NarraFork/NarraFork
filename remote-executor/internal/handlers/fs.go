@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -582,6 +583,134 @@ func (h *Handlers) FsMkdirp(params map[string]any) (any, error) {
 // nothing; the cap protects against a directory holding tens of thousands of links
 // (each stat is a syscall, and a round trip on a network filesystem).
 const maxSymlinkProbes = 1000
+
+// FsListBounded lists a bounded prefix without first materializing the directory.
+// Limits are hard ceilings even if an untrusted caller asks for more.
+func (h *Handlers) FsListBounded(parent context.Context, params map[string]any) (any, error) {
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
+	limit := func(key string, ceiling int64) int64 {
+		value := intParam(params, key, ceiling)
+		if value <= 0 || value > ceiling {
+			return ceiling
+		}
+		return value
+	}
+	maxScanned := limit("maxScanned", 10000)
+	maxEntries := limit("maxEntries", 500)
+	maxBytes := limit("maxBytes", 256*1024)
+	if maxBytes < 256 {
+		return nil, fmt.Errorf("listing byte budget too small")
+	}
+	timeoutMs := limit("timeoutMs", 2000)
+	ctx, cancel := context.WithTimeout(parent, time.Duration(timeoutMs)*time.Millisecond)
+	defer cancel()
+	f, resolvedPath, err := h.openReadFile(params)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	openedInfo, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !openedInfo.IsDir() {
+		return nil, fmt.Errorf("not a directory")
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			f.Close()
+		case <-done:
+		}
+	}()
+	entries := make([]map[string]any, 0)
+	var scanned int64
+	bytesUsed := int64(256) // reserve response envelope, reason and counters
+	truncated, reason := false, ""
+	for {
+		if err := parent.Err(); err != nil {
+			return nil, err
+		}
+		if ctx.Err() != nil {
+			truncated, reason = true, "timeout"
+			break
+		}
+		if scanned >= maxScanned {
+			truncated, reason = true, "scan_limit"
+			break
+		}
+		batch, readErr := f.ReadDir(1)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			if ctx.Err() != nil {
+				truncated, reason = true, "timeout"
+				break
+			}
+			return nil, readErr
+		}
+		if len(batch) == 0 {
+			break
+		}
+		e := batch[0]
+		scanned++
+		if !boolParam(params, "showHidden") && len(e.Name()) > 0 && e.Name()[0] == '.' {
+			continue
+		}
+		isDirectory := e.IsDir()
+		isSymlink := e.Type()&os.ModeSymlink != 0
+		if isSymlink {
+			resolved, guardErr := h.guard.CheckExisting(filepath.Join(resolvedPath, e.Name()))
+			if guardErr != nil {
+				continue
+			}
+			info, statErr := os.Stat(resolved)
+			if statErr != nil {
+				continue
+			}
+			isDirectory = info.IsDir()
+		}
+		if boolParam(params, "directoriesOnly") && !isDirectory {
+			continue
+		}
+		entry := map[string]any{"name": e.Name(), "isDirectory": isDirectory, "isSymlink": isSymlink}
+		encoded, marshalErr := json.Marshal(entry)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		if int64(len(entries)) >= maxEntries {
+			truncated, reason = true, "entry_limit"
+			break
+		}
+		if bytesUsed+int64(len(encoded))+1 > maxBytes {
+			truncated, reason = true, "byte_limit"
+			break
+		}
+		entries = append(entries, entry)
+		bytesUsed += int64(len(encoded)) + 1
+	}
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
+	// Never return names read from a replaced root or a retargeted parent symlink.
+	currentPath, err := h.guard.CheckExisting(stringParam(params, "path"))
+	if err != nil {
+		return nil, err
+	}
+	currentInfo, err := os.Stat(currentPath)
+	if err != nil {
+		return nil, err
+	}
+	if !samePath(currentPath, resolvedPath) || !os.SameFile(openedInfo, currentInfo) {
+		return nil, fmt.Errorf("directory identity changed while listing")
+	}
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"entries": entries, "scanned": scanned, "truncated": truncated, "reason": reason}, nil
+}
 
 // FsList lists one directory level.
 //

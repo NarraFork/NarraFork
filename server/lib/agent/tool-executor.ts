@@ -132,7 +132,8 @@ function deviceSelectionSource(
 }
 
 function assertAuthorizedExecutionDevice(requested: string | undefined, config: AgentConfig): void {
-	const deviceId = requested ?? config.defaultDeviceId ?? LOCAL_DEVICE_ID;
+	const deviceId =
+		requested ?? config.workspaceContext?.deviceId ?? config.defaultDeviceId ?? LOCAL_DEVICE_ID;
 	const source = requested !== undefined ? "requested" : "session_default";
 	if (deviceId === LOCAL_DEVICE_ID) {
 		if (config.allowLocalExecution === false) {
@@ -179,8 +180,9 @@ async function resolveEndpoint(
 		);
 	}
 	assertAuthorizedExecutionDevice(requested, config);
-	const backend =
-		previous?.backend ?? resolveBackend({ requested, sessionDefault: config.defaultDeviceId });
+	if (previous) assertAuthorizedExecutionDevice(previous.target.deviceId, config);
+	const sessionDefault = config.workspaceContext?.deviceId ?? config.defaultDeviceId;
+	const backend = previous?.backend ?? resolveBackend({ requested, sessionDefault });
 	if (previous && backend.deviceId !== previous.target.deviceId) {
 		throw new Error(`Endpoint ${request.key} changed its frozen execution device.`);
 	}
@@ -195,31 +197,66 @@ async function resolveEndpoint(
 	}
 
 	const semantics = request.pathFlavor ? targetPathSemantics(request.pathFlavor) : backend.paths;
-	const baseCwd = request.pathFlavor === "spec" ? "spec://" : toolBaseCwd(backend, config.cwd);
+	if (previous && requested !== undefined && requested !== previous.target.deviceId) {
+		throw new Error(
+			`Endpoint ${request.key} attempted to change its frozen execution device from "${previous.target.deviceId}" to "${requested}".`,
+		);
+	}
+	if (previous?.target.pathFlavor && previous.target.pathFlavor !== semantics.flavor) {
+		throw new Error(`Endpoint ${request.key} cannot change its frozen path grammar.`);
+	}
+	const missingRemoteBase =
+		backend.kind === "remote" &&
+		config.workspaceContext?.deviceId !== backend.deviceId &&
+		(!backend.defaultCwd || !semantics.isAbsolute(backend.defaultCwd));
+	let baseCwd = previous?.target.baseCwd;
+	if (baseCwd === undefined) {
+		if (request.pathFlavor === "spec") baseCwd = "spec://";
+		else if (missingRemoteBase && request.workdir && semantics.isAbsolute(request.workdir)) {
+			baseCwd = semantics.normalize(request.workdir);
+		} else if (
+			missingRemoteBase &&
+			!request.workdir &&
+			request.path &&
+			semantics.isAbsolute(request.path)
+		) {
+			baseCwd = semantics.dirname(request.path);
+		} else baseCwd = toolBaseCwd(backend, config.cwd, config.workspaceContext);
+	}
 	const cwd = request.workdir ? semantics.resolve(baseCwd, request.workdir) : baseCwd;
+	const runtimeGeneration = backend.runtimeGeneration;
 	let lexicalPath: string | undefined;
 	let canonicalPath: string | undefined;
 	if (request.path) {
-		lexicalPath = semantics.resolve(baseCwd, request.path);
+		lexicalPath = semantics.resolve(cwd, request.path);
 		if (request.pathFlavor === "spec") {
 			canonicalPath = lexicalPath;
 		} else {
 			const identity = await backend.resolvePathIdentity(lexicalPath);
+			if (
+				identity.runtimeGeneration !== runtimeGeneration ||
+				backend.runtimeGeneration !== runtimeGeneration
+			) {
+				throw new Error(
+					`Endpoint ${request.key} runtime generation changed while freezing its path.`,
+				);
+			}
 			lexicalPath = identity.lexicalPath;
 			canonicalPath = identity.canonicalPath;
 		}
 	}
-	const target: ToolExecutionTarget = {
+	const target: ToolExecutionTarget = Object.freeze({
 		deviceId: backend.deviceId,
 		backendKind: backend.kind,
 		cwd,
+		baseCwd,
 		pathFlavor: semantics.flavor,
 		...(lexicalPath ? { lexicalPath, resolvedFilePath: lexicalPath } : {}),
 		...(canonicalPath ? { canonicalPath } : {}),
-		runtimeGeneration: backend.runtimeGeneration,
+		runtimeGeneration,
 		selectionSource:
-			previous?.target.selectionSource ?? deviceSelectionSource(requested, config.defaultDeviceId),
-	};
+			previous?.target.selectionSource ?? deviceSelectionSource(requested, sessionDefault),
+	});
 	return { backend, request, target };
 }
 
@@ -334,12 +371,22 @@ export async function freezeToolExecutionTarget(
 	return (await freezeToolExecution(tu, config))?.target;
 }
 
-function executionTargetMetadata(
+function projectExecutionTargetMetadata(
 	target: ToolExecutionTarget | undefined,
-	metadata?: Record<string, unknown>,
+	metadata: Record<string, unknown> | undefined,
+	workspace: AgentConfig["workspaceContext"],
 ): Record<string, unknown> | undefined {
-	if (!target) return metadata;
-	return { ...metadata, executionTarget: target };
+	const {
+		executionTarget: _untrustedTarget,
+		executionWorkspace: _untrustedWorkspace,
+		...safe
+	} = metadata ?? {};
+	if (!target) return metadata ? safe : undefined;
+	return {
+		...safe,
+		executionTarget: target,
+		...(workspace ? { executionWorkspace: workspace } : {}),
+	};
 }
 
 function executionTargetsEqual(a: ToolExecutionTarget, b: ToolExecutionTarget): boolean {
@@ -347,6 +394,7 @@ function executionTargetsEqual(a: ToolExecutionTarget, b: ToolExecutionTarget): 
 		a.deviceId === b.deviceId &&
 		a.backendKind === b.backendKind &&
 		a.cwd === b.cwd &&
+		a.baseCwd === b.baseCwd &&
 		a.pathFlavor === b.pathFlavor &&
 		a.lexicalPath === b.lexicalPath &&
 		a.canonicalPath === b.canonicalPath &&
@@ -374,6 +422,20 @@ function describeExecutionTargetDrift(
 	}
 	if (approved.cwd !== resolved.cwd) {
 		drifted.push(`cwd "${approved.cwd}" → "${resolved.cwd}"`);
+	}
+	if (approved.baseCwd !== undefined && approved.baseCwd !== resolved.baseCwd) {
+		drifted.push(`base cwd "${approved.baseCwd}" → "${resolved.baseCwd}"`);
+	}
+	if (
+		approved.runtimeGeneration !== undefined &&
+		approved.runtimeGeneration !== resolved.runtimeGeneration
+	) {
+		drifted.push(
+			`runtime generation ${approved.runtimeGeneration} → ${resolved.runtimeGeneration}`,
+		);
+	}
+	if (approved.canonicalPath !== undefined && approved.canonicalPath !== resolved.canonicalPath) {
+		drifted.push(`canonical path "${approved.canonicalPath}" → "${resolved.canonicalPath}"`);
 	}
 	if (approved.resolvedFilePath !== resolved.resolvedFilePath) {
 		drifted.push(
@@ -700,6 +762,14 @@ export async function executeTool(
 	config: AgentConfig,
 	options: ExecuteToolOptions = {},
 ): Promise<ToolExecResult> {
+	// Late results must not borrow the active session's later revision, even on the same path.
+	const executionWorkspace = config.workspaceContext
+		? Object.freeze(structuredClone(config.workspaceContext))
+		: undefined;
+	const executionTargetMetadata = (
+		target: ToolExecutionTarget | undefined,
+		metadata?: Record<string, unknown>,
+	) => projectExecutionTargetMetadata(target, metadata, executionWorkspace);
 	const reflectionRejection = getReflectionToolRejection(tu, config);
 	if (reflectionRejection) {
 		if (options.admissionState) releaseToolAdmissionState(options.admissionState);
@@ -993,6 +1063,7 @@ export async function executeTool(
 					executionBackend: frozenExecution?.backend,
 					executionTarget: frozenExecution?.target,
 					executionPlan: frozenExecution?.plan,
+					planFileBinding: config.planFileBinding,
 					// Drop the update start grant once the request is durably pending, so an
 					// unanswered permission cannot block a planned restart. Admission is re-acquired
 					// by acquireFinalToolExecution before the tool actually runs.
@@ -1209,7 +1280,7 @@ export async function executeTool(
 		const ctx: ToolContext = {
 			recordFileNoDispatch: (reason) => persistNoDispatch(reason, true),
 			narratorId: config.narratorId,
-			cwd: config.cwd,
+			cwd: frozenExecution?.target.cwd ?? config.workspaceContext?.cwd ?? config.cwd,
 			signal: config.signal,
 			provider: config.provider,
 			model: config.model,
@@ -1230,6 +1301,10 @@ export async function executeTool(
 			requestPermission: (toolName, input, toolUseId) =>
 				config.permissionHandler(toolName, input, toolUseId, {
 					toolCallBinding: ctx.toolCallBinding,
+					executionBackend: frozenExecution?.backend,
+					executionTarget: frozenExecution?.target,
+					executionPlan: frozenExecution?.plan,
+					planFileBinding: config.planFileBinding,
 				}),
 			currentToolUseId: tu.toolUseId,
 			toolCallBinding,
@@ -1245,7 +1320,10 @@ export async function executeTool(
 					}
 					return frozenExecution.backend;
 				}
-				return resolveBackend({ requested: device, sessionDefault: config.defaultDeviceId });
+				return resolveBackend({
+					requested: device,
+					sessionDefault: config.workspaceContext?.deviceId ?? config.defaultDeviceId,
+				});
 			},
 			executionTarget: frozenExecution?.target,
 			executionPlan: frozenExecution?.plan,
@@ -1254,6 +1332,8 @@ export async function executeTool(
 			allowLocalExecution: config.allowLocalExecution,
 			setDefaultDevice: config.setDefaultDevice,
 			workspaceContext: config.workspaceContext,
+			workspaceFileAccess: config.workspaceFileAccess,
+			planFileBinding: config.planFileBinding,
 			switchWorkingDirectory: config.switchWorkingDirectory,
 			assertWorkspaceCurrent: config.assertWorkspaceCurrent,
 			recheckAuthorization: async () => {
@@ -1266,6 +1346,19 @@ export async function executeTool(
 				config.assertWorkspaceCurrent?.();
 			},
 		};
+		let approvedReadGuard:
+			| import("@server/services/workspace-artifact-access").ApprovedWorkspaceReadGuard
+			| undefined;
+		ctx.authorizeWorkspaceRead = async (path, backend, signal) => {
+			approvedReadGuard ??= (
+				await import("@server/services/workspace-artifact-access")
+			).createApprovedWorkspaceReadGuard(ctx);
+			return approvedReadGuard(path, backend, signal);
+		};
+		ctx.workspaceArtifactAccess = async (sourceAccess) =>
+			(
+				await import("@server/services/workspace-artifact-access")
+			).createApprovedWorkspaceArtifactAccess(ctx, sourceAccess);
 
 		// Wire up emitLongRunning: notify UI when a process exceeds 60s
 		if (config.onEvent) {
@@ -1507,6 +1600,19 @@ export async function executeTool(
 				// An update-admission wait can outlive an actor/grant or workspace change.
 				// Recheck at the actual body boundary, not only before permission handling.
 				await config.runtimeAuthorizationGuard?.();
+				// Authorization can wait across a reconnect or symlink change. Validate the admitted
+				// identities themselves, never reselect a cwd/device from today's defaults.
+				if (frozenExecution) {
+					const { createExecutionTargetContext } = await import(
+						"@server/services/execution-policy/target-context"
+					);
+					for (const endpoint of frozenExecution.endpoints) {
+						await createExecutionTargetContext({
+							backend: endpoint.backend,
+							target: endpoint.target,
+						});
+					}
+				}
 				let authorizeFinalStart = config.onToolExecutionFinalAuthorization;
 				if (!authorizeFinalStart && config.requireToolCallBinding && !config.reflectionLoop) {
 					// Durable recovery/direct runners must not silently omit the production gate.
@@ -1546,6 +1652,13 @@ export async function executeTool(
 				// not evidence of a host storage failure, even when the command exits nonzero.
 				// Only the preflight above and thrown storage errors below may trip the guard.
 				config.onToolExecutionInvoking?.(tu);
+				for (const endpoint of frozenExecution?.endpoints ?? []) {
+					if (endpoint.target.runtimeGeneration !== endpoint.backend.runtimeGeneration) {
+						throw new Error(
+							`Endpoint ${endpoint.request.key} runtime generation changed before IO.`,
+						);
+					}
+				}
 				bodyInvoked = true;
 				result = await tool.execute(effectiveInput, ctx);
 				result.output += diskCheck.notice;

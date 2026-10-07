@@ -140,7 +140,47 @@ export interface RevertTransactionExecution {
 	/** Actual lifetime, including late kernel IO and fd close. Must not be discarded by an owner. */
 	whenSettled: Promise<RevertTransactionOutcome>;
 }
+export interface RevertTransactionProviderInput {
+	planId: string;
+	planHash: string;
+	principal: NarratorPrincipal;
+	owner: RevertJournalContext["owner"];
+	manifest: TransactionManifestFile;
+	scope: Scope;
+	lease: WorkspaceWriteLease;
+	signal: AbortSignal;
+	readBlob(ref: FileChangeBlobRef, signal: AbortSignal): Promise<Uint8Array>;
+}
+
+/** Target IO only. Selection/consent/COW/commit remain in the shared transaction. */
+export interface RevertTransactionProvider {
+	handles(identity: TransactionManifestFile["identity"]): boolean;
+	verifyScope(scope: Scope, manifest: TransactionManifestFile, signal: AbortSignal): Promise<void>;
+	guard(input: RevertTransactionProviderInput): Promise<void>;
+	preflight(input: RevertTransactionProviderInput): Promise<void>;
+	preflightMany?(inputs: readonly RevertTransactionProviderInput[]): Promise<void>;
+	mutateMany?(
+		inputs: readonly RevertTransactionProviderInput[],
+		claims: readonly RevertJournalClaim[],
+		phase: "apply" | "compensate",
+	): Promise<FileChangeExecutionReceipt[]>;
+	mutate(
+		input: RevertTransactionProviderInput,
+		claim: RevertJournalClaim,
+		phase: "apply" | "compensate",
+		originalMutationId: string,
+	): Promise<FileChangeExecutionReceipt>;
+	verifyDesired(input: RevertTransactionProviderInput): Promise<void>;
+	finalize(
+		input: RevertTransactionProviderInput,
+		claim: { mutationId: string; requestDigest: string },
+		serverCommitId: string,
+	): Promise<void>;
+}
+
 export interface RevertTransactionOptions {
+	provider?: RevertTransactionProvider;
+	coordinator?: LocalFileChangeRuntime["coordinator"];
 	access: RevertPlannerAccess;
 	/** SAME real root, coordinator and verified physical store used to produce the plan. */
 	runtime: LocalFileChangeRuntime;
@@ -167,6 +207,7 @@ type BoundFile = {
 	objectIdentity: string | null;
 	/** Only the original apply observation may guard compensation; never a fresh same-byte inode. */
 	appliedObservation?: LocalRestoreObservation;
+	remoteApplyReceipt?: FileChangeExecutionReceipt;
 };
 type Run = {
 	request: Omit<RevertTransactionRequest, "signal">;
@@ -450,9 +491,13 @@ export class RevertTransactionService {
 			// The lease below owns CURRENT admission. A fence from the read-only
 			// preview is not a dependency on every other file in this workspace.
 			if (!scope || scope.status !== "active") throw fail("SCOPE_STALE");
-			this.scopeIdentity(scope, file);
-			if ((await localDirectoryIdentity(scope.canonicalRoot)) !== scope.rootIdentityJson?.object)
-				throw fail("ROOT_STALE");
+			if (this.options.provider?.handles(file.identity)) {
+				await this.options.provider.verifyScope(scope, file, run.signal);
+			} else {
+				this.scopeIdentity(scope, file);
+				if ((await localDirectoryIdentity(scope.canonicalRoot)) !== scope.rootIdentityJson?.object)
+					throw fail("ROOT_STALE");
+			}
 			scopes.set(scope.id, scope);
 			const fixed = rows.find((row) => row.sequence === file.sequence);
 			if (!fixed) throw fail("INCOMPLETE_FILES");
@@ -480,6 +525,10 @@ export class RevertTransactionService {
 				)
 					throw fail("WAITING_PLAN_STALE");
 				await this.guard(run, file, lease, run.signal);
+				if (this.options.provider?.handles(file.manifest.identity)) {
+					await this.options.provider.preflight(this.providerInput(run, file, lease, run.signal));
+					continue;
+				}
 				// This first read only captures the inode. The full restore preflight below
 				// repeats typed/raw/permissions/path checks for every ORIGINAL expected/desired.
 				file.objectIdentity = await currentObjectIdentity(
@@ -492,6 +541,18 @@ export class RevertTransactionService {
 				await result.whenSettled;
 				if (result.status !== "not_dispatched" || result.reason !== "preflight_verified")
 					throw fail(`FILE_PREFLIGHT_${result.reason.toUpperCase()}`);
+			}
+			if (this.options.provider?.preflightMany) {
+				for (const scope of scopes.values()) {
+					const group = run.files.filter(
+						(file) =>
+							file.scope.id === scope.id && this.options.provider?.handles(file.manifest.identity),
+					);
+					if (group.length)
+						await this.options.provider.preflightMany(
+							group.map((file) => this.providerInput(run, file, this.lease(run, file), run.signal)),
+						);
+				}
 			}
 			// Validate history SQL/COW/cascade support before any target IO, not only at commit.
 			if (operation.kind !== "revert")
@@ -514,9 +575,33 @@ export class RevertTransactionService {
 				// startExecution validates paginated plan metadata. Catch history writes
 				// during those awaits before the first target can be dispatched.
 				await this.freshSelection(run, manifest);
+				const dispatchedScopes = new Set<string>();
 				for (const file of run.files) {
 					run.signal.throwIfAborted();
 					const lease = this.lease(run, file);
+					if (
+						this.options.provider?.mutateMany &&
+						this.options.provider.handles(file.manifest.identity)
+					) {
+						if (dispatchedScopes.has(file.scope.id)) continue;
+						dispatchedScopes.add(file.scope.id);
+						const group = run.files.filter((item) => item.scope.id === file.scope.id);
+						const apply = () => this.mutateRemoteMany(run, group, lease, "apply", run.signal);
+						const results = batch ? await batch.runInScope(lease.token, apply) : await apply();
+						if (
+							results.some(
+								(result, index) =>
+									!result.confirmed ||
+									(result.outcome !== "applied" &&
+										!fileChangeStatesEqual(
+											group[index].manifest.expected,
+											group[index].manifest.desired,
+										)),
+							)
+						)
+							throw fail("FILE_NOT_APPLIED");
+						continue;
+					}
 					const apply = () => this.mutate(run, file, lease, "apply", run.signal);
 					const result = batch ? await batch.runInScope(lease.token, apply) : await apply();
 					if (
@@ -554,6 +639,24 @@ export class RevertTransactionService {
 						if (prepared) run.historyResult = this.history.applyToTransaction(tx, prepared);
 					},
 				});
+				for (const file of run.files) {
+					if (!this.options.provider?.handles(file.manifest.identity) || !file.remoteApplyReceipt)
+						continue;
+					const lease = this.lease(run, file);
+					try {
+						await this.options.provider.finalize(
+							this.providerInput(run, file, lease, AbortSignal.timeout(this.cleanupMs)),
+							{
+								mutationId: file.fixed.applyMutationId,
+								requestDigest: file.fixed.applyRequestDigest,
+							},
+							committed.id,
+						);
+					} catch {
+						lease.markUncertain();
+						return this.outcome(run, committed, false, "REMOTE_FINALIZE_REQUIRED");
+					}
+				}
 				return this.outcome(run, committed);
 			} catch (error) {
 				const live = this.safeOperation(run);
@@ -577,21 +680,33 @@ export class RevertTransactionService {
 		// No fabricated scope for positive no_dispatch / history-only selections.
 		if (!scopes.size) return perform();
 		try {
-			return await this.options.runtime.coordinator.withRollbackMany(
+			return await (this.options.coordinator ?? this.options.runtime.coordinator).withRollbackMany(
 				{
 					scopes: [...scopes.values()].map((scope) => ({
 						scope,
 						runtime: this.runtimeBinding(scope.deviceId),
 						activityPolicy: "strict" as const,
-						ranges: buildRevertScopeRanges(
-							scope,
-							run.files
-								.filter((file) => file.scope.id === scope.id)
-								.map((file) => file.manifest.identity.canonicalPath),
-						),
-						// This service exclusively awaits native restoreLocalFile IO; it
-						// does not launch Bash or delegate mutations to remote processes.
-						executionClass: "local_file_io" as const,
+						ranges: run.files.some(
+							(file) =>
+								file.scope.id === scope.id &&
+								this.options.provider?.handles(file.manifest.identity),
+						)
+							? freezeWorkspaceRanges(scope)
+							: buildRevertScopeRanges(
+									scope,
+									run.files
+										.filter((file) => file.scope.id === scope.id)
+										.map((file) => file.manifest.identity.canonicalPath),
+								),
+						// Remote v1 has one scope fence: conservative admission only,
+						// never a wider restore effect or local-process termination proof.
+						executionClass: run.files.some(
+							(file) =>
+								file.scope.id === scope.id &&
+								this.options.provider?.handles(file.manifest.identity),
+						)
+							? ("unknown" as const)
+							: ("local_file_io" as const),
 					})),
 					signal: run.signal,
 				},
@@ -602,6 +717,58 @@ export class RevertTransactionService {
 			// into a reported preflight rejection or trigger compensation after release.
 			if (!run.started) throw error;
 			return this.outcome(run, this.safeOperation(run), false, "COORDINATOR_RECOVERY_REQUIRED");
+		}
+	}
+
+	private async mutateRemoteMany(
+		run: Run,
+		files: BoundFile[],
+		lease: WorkspaceWriteLease,
+		phase: "apply" | "compensate",
+		signal: AbortSignal,
+	): Promise<FileChangeExecutionReceipt[]> {
+		const ctx = run.ctx as RevertJournalContext;
+		const provider = this.options.provider;
+		if (!provider?.mutateMany || files.some((file) => !provider.handles(file.manifest.identity)))
+			throw fail("PROVIDER_BATCH_REQUIRED");
+		try {
+			const claims = files.map((file) =>
+				phase === "apply"
+					? this.journal.claimApply(ctx, file.fixed, lease)
+					: this.journal.claimCompensate(ctx, file.fixed, lease),
+			);
+			for (let i = 0; i < files.length; i++) {
+				if (!claims[i].mayExecute) throw fail("RECOVERY_REQUIRED");
+				lease.registerMutation(claims[i].mutationId);
+				await this.guard(run, files[i], lease, signal);
+				this.assertClaim(run, files[i], claims[i], phase);
+			}
+			const receipts = await provider.mutateMany(
+				files.map((file) => this.providerInput(run, file, lease, signal)),
+				claims,
+				phase,
+			);
+			if (receipts.length !== files.length) throw fail("REMOTE_RECEIPT_MISMATCH");
+			for (let i = 0; i < files.length; i++) {
+				const receipt = receipts[i];
+				const claim = claims[i];
+				const file = files[i];
+				if (
+					receipt.mutationId !== claim.mutationId ||
+					receipt.requestDigest !== claim.requestDigest ||
+					!fileChangeExecutionBindingMatches(receipt.executionBinding, claim.executionBinding)
+				)
+					throw fail("REMOTE_RECEIPT_MISMATCH");
+				if (phase === "apply") await this.journal.recordApplyReceipt(ctx, file.fixed.id, receipt);
+				else await this.journal.recordCompensateReceipt(ctx, file.fixed.id, receipt);
+				if (phase === "apply" && receipt.confirmed && receipt.outcome === "applied")
+					file.remoteApplyReceipt = receipt;
+				lease.settle(claim.mutationId, receipt.confirmed ? receipt.outcome : "unknown");
+			}
+			return receipts;
+		} catch (error) {
+			lease.markUncertain();
+			throw error;
 		}
 	}
 
@@ -619,6 +786,33 @@ export class RevertTransactionService {
 				: this.journal.claimCompensate(ctx, file.fixed, lease);
 		if (!claim.mayExecute) throw fail("RECOVERY_REQUIRED");
 		lease.registerMutation(claim.mutationId);
+		if (this.options.provider?.handles(file.manifest.identity)) {
+			try {
+				await this.guard(run, file, lease, signal);
+				this.assertClaim(run, file, claim, phase);
+				const receipt = await this.options.provider.mutate(
+					this.providerInput(run, file, lease, signal),
+					claim,
+					phase,
+					file.fixed.applyMutationId,
+				);
+				if (
+					receipt.mutationId !== claim.mutationId ||
+					receipt.requestDigest !== claim.requestDigest ||
+					!fileChangeExecutionBindingMatches(receipt.executionBinding, claim.executionBinding)
+				)
+					throw fail("REMOTE_RECEIPT_MISMATCH");
+				if (phase === "apply") await this.journal.recordApplyReceipt(ctx, file.fixed.id, receipt);
+				else await this.journal.recordCompensateReceipt(ctx, file.fixed.id, receipt);
+				if (phase === "apply" && receipt.confirmed && receipt.outcome === "applied")
+					file.remoteApplyReceipt = receipt;
+				lease.settle(claim.mutationId, receipt.confirmed ? receipt.outcome : "unknown");
+				return receipt;
+			} catch (error) {
+				lease.markUncertain();
+				throw error;
+			}
+		}
 		let result: LocalFileRestoreResult;
 		try {
 			result = await restoreLocalFile(this.restoreInput(run, file, lease, signal, claim, phase));
@@ -681,11 +875,26 @@ export class RevertTransactionService {
 			const operation = this.journal.getOperation(ctx);
 			if (operation.status === "committed") return this.outcome(run, operation);
 			this.journal.beginCompensation(ctx);
+			const compensatedScopes = new Set<string>();
 			for (const file of [...run.files].reverse()) {
-				if (!file.appliedObservation) continue;
+				if (!file.appliedObservation && !file.remoteApplyReceipt) continue;
 				const lease = this.lease(run, file);
 				try {
 					signal.throwIfAborted();
+					if (
+						this.options.provider?.mutateMany &&
+						this.options.provider.handles(file.manifest.identity)
+					) {
+						if (compensatedScopes.has(file.scope.id)) continue;
+						compensatedScopes.add(file.scope.id);
+						const group = run.files.filter(
+							(item) => item.scope.id === file.scope.id && item.remoteApplyReceipt,
+						);
+						const act = () => this.mutateRemoteMany(run, group, lease, "compensate", signal);
+						if (batch) await batch.runInScope(lease.token, act);
+						else await act();
+						continue;
+					}
 					const act = () => this.mutate(run, file, lease, "compensate", signal);
 					if (batch) await batch.runInScope(lease.token, act);
 					else await act();
@@ -821,9 +1030,33 @@ export class RevertTransactionService {
 				throw fail("CLAIM_PIN_STALE");
 		}
 	}
+	private providerInput(
+		run: Run,
+		file: BoundFile,
+		lease: WorkspaceWriteLease,
+		signal: AbortSignal,
+	): RevertTransactionProviderInput {
+		return {
+			planId: run.request.planId,
+			planHash: run.request.planHash,
+			principal: run.request.principal,
+			owner: (run.ctx as RevertJournalContext).owner,
+			manifest: file.manifest,
+			scope: file.scope,
+			lease,
+			signal,
+			readBlob: (ref, currentSignal) => this.readBlob(ref, currentSignal),
+		};
+	}
 	private async guard(run: Run, file: BoundFile, lease: WorkspaceWriteLease, signal: AbortSignal) {
 		signal.throwIfAborted();
 		lease.assertCurrent();
+		if (this.options.provider?.handles(file.manifest.identity)) {
+			await this.namespace(signal);
+			await this.options.provider.guard(this.providerInput(run, file, lease, signal));
+			lease.assertCurrent();
+			return;
+		}
 		await this.options.access.authorizeFile({
 			principal: run.request.principal,
 			owner: (run.ctx as RevertJournalContext).owner,
@@ -887,6 +1120,11 @@ export class RevertTransactionService {
 	private async verifyDesired(run: Run, file: BoundFile, signal: AbortSignal) {
 		const lease = this.lease(run, file);
 		await this.guard(run, file, lease, signal);
+		if (this.options.provider?.handles(file.manifest.identity)) {
+			await this.options.provider.verifyDesired(this.providerInput(run, file, lease, signal));
+			await this.guard(run, file, lease, signal);
+			return;
+		}
 		const current = await observe(file.manifest.identity.canonicalPath, signal);
 		if (
 			!fileChangeStatesEqual(current.state, file.manifest.desired) ||

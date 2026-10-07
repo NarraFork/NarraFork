@@ -4,7 +4,6 @@ import {
 	lstat,
 	mkdir,
 	readdir,
-	readFile,
 	realpath,
 	rename,
 	rm,
@@ -12,19 +11,36 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import { and, asc, count, eq, inArray, lt } from "drizzle-orm";
 import matter from "gray-matter";
 import { db } from "../db";
-import { chapters, narrators, projects, skillDirectoryCaches } from "../db/schema";
+import { narrators, projects, skillDirectoryCaches } from "../db/schema";
+import { readCompleteFileBytes } from "../lib/agent/execution/backend";
+import { localPathSemantics, targetPathSemantics } from "../lib/agent/execution/path-semantics";
+import { localBackend } from "../lib/agent/execution/registry";
+import type { ToolContext } from "../lib/agent/types";
 import { getBuiltinSkillRoutines } from "../lib/builtin-routines";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { hotTimer } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
+import {
+	readWorkspaceText,
+	statWorkspaceFile,
+	WORKSPACE_READ_TIMEOUT_MS,
+	type WorkspaceFileAccess,
+} from "../lib/plan-file-path";
 import { isInsidePath } from "../lib/platform-path";
+import { readFileCapped } from "../lib/read-file-capped";
+import type { WorkspaceAttachmentAccess } from "../lib/uploads";
+import { executionPolicyEngine } from "./execution-policy/engine";
 import { resolveNarratorProjectId } from "./narrator-project";
+import { resolveOAuthNarratorRuntimePolicy } from "./oauth-narrator-runtime-policy";
+import { workspaceContextService } from "./workspace-context-service";
+import { createNarratorWorkspaceFileAccess } from "./workspace-file-access";
 
 export type SkillSource = "global" | "project" | "workspace";
 
@@ -40,6 +56,12 @@ export interface SkillInfo {
 	/** Context source when loaded through narrator/workspace APIs. */
 	source?: SkillSource;
 	rootKind?: SkillSource;
+	/** Physical resource source; global skills are always on the server. */
+	deviceId?: string;
+	pathFlavor?: "posix" | "windows";
+	workspaceContextKey?: string;
+	/** Explicit workspace copy of a published server-global skill; never a host execution. */
+	materializedFrom?: { deviceId: "local"; location: string };
 	/** Codex-compatible: frontmatter `metadata.short-description` or sidecar `interface.short_description`. */
 	shortDescription?: string;
 	/** Codex-compatible: sidecar `interface.display_name`. */
@@ -56,6 +78,9 @@ export interface SkillInfo {
 }
 
 export interface SkillSummaryInfo {
+	deviceId?: string;
+	pathFlavor?: "posix" | "windows";
+	workspaceContextKey?: string;
 	name: string;
 	description: string;
 	location: string;
@@ -72,11 +97,16 @@ export interface SkillSummaryInfo {
 }
 
 export interface SkillContext {
+	/** Legacy target hint prevents host probing when a remote context has not initialized. */
+	deviceId?: string | null;
 	projectGitPath?: string | null;
 	cwd?: string | null;
+	workspaceContext?: WorkspaceContext;
+	fileAccess?: WorkspaceFileAccess;
 }
 
 export interface SkillRootInfo {
+	deviceId?: string;
 	rootKind: SkillSource;
 	rootPath: string;
 	normalizedRootPath: string;
@@ -195,8 +225,9 @@ async function loadSkillCached(
 	}
 
 	// Cache miss or stale — read and parse
-	const raw = await readFile(skillFile, "utf-8");
-	const parsed = parseSkillFile(raw, skillFile);
+	const raw = await readFileCapped(skillFile, 256_000);
+	if (!raw || raw.truncated) return null;
+	const parsed = parseSkillFile(raw.content, skillFile);
 	if (!parsed) {
 		skillCache.delete(skillFile);
 		return null;
@@ -387,7 +418,10 @@ function parseSkillFile(raw: string, location: string): Omit<SkillInfo, "files">
  * Fail-open: a missing or malformed sidecar must never block loading SKILL.md
  * (mirrors Codex's `load_skill_metadata`).
  */
-async function loadSkillSidecar(skillDir: string): Promise<{
+async function loadSkillSidecar(
+	skillDir: string,
+	providedRaw?: string,
+): Promise<{
 	displayName?: string;
 	shortDescription?: string;
 	defaultPrompt?: string;
@@ -396,7 +430,12 @@ async function loadSkillSidecar(skillDir: string): Promise<{
 	const sidecarPath = join(skillDir, "agents", "openai.yaml");
 	let raw: string;
 	try {
-		raw = await readFile(sidecarPath, "utf-8");
+		if (providedRaw !== undefined) raw = providedRaw;
+		else {
+			const result = await readFileCapped(sidecarPath, 64_000);
+			if (!result || result.truncated) return null;
+			raw = result.content;
+		}
 	} catch {
 		return null; // no sidecar
 	}
@@ -519,6 +558,41 @@ export async function resolveSkillRootsForContext(context: SkillContext): Promis
 	const roots: SkillRootInfo[] = [];
 
 	addRootIfDistinct(roots, "global", await normalizeRootPath(homedir()));
+	if (
+		context.fileAccess ||
+		(context.workspaceContext?.deviceId && context.workspaceContext.deviceId !== "local") ||
+		(context.deviceId && context.deviceId !== "local")
+	) {
+		const access = context.fileAccess;
+		if (!access) throw new Error("Workspace skill discovery requires target read policy");
+		const workspace = context.workspaceContext ?? access.workspaceContext;
+		const cwd = workspace?.cwd ?? context.cwd;
+		if (!cwd) return roots;
+		const rootPaths = [workspace?.git?.rootPath, cwd].filter((path): path is string => !!path);
+		for (const rootPath of rootPaths) {
+			if (
+				roots.some(
+					(root) =>
+						root.deviceId === access.backend.deviceId &&
+						access.backend.paths.equals(root.rootPath, rootPath),
+				)
+			)
+				continue;
+			try {
+				const identity = await statWorkspaceFile(access, rootPath);
+				if (!identity?.isDirectory) continue;
+				roots.push({
+					rootKind: "workspace",
+					rootPath,
+					normalizedRootPath: identity.resolvedPath ?? rootPath,
+					deviceId: access.backend.deviceId,
+				});
+			} catch {
+				access.signal?.throwIfAborted();
+			}
+		}
+		return roots;
+	}
 
 	if (context.projectGitPath?.trim()) {
 		addRootIfDistinct(roots, "project", await normalizeRootPath(context.projectGitPath.trim()));
@@ -533,6 +607,18 @@ export async function resolveSkillRootsForContext(context: SkillContext): Promis
 }
 
 export function getSkillContextCacheKey(context: SkillContext): string {
+	const workspace = context.workspaceContext ?? context.fileAccess?.workspaceContext;
+	if (context.fileAccess || workspace || (context.deviceId && context.deviceId !== "local")) {
+		const backend = context.fileAccess?.backend;
+		return JSON.stringify([
+			backend?.deviceId ?? workspace?.deviceId ?? context.deviceId ?? "local",
+			workspace?.contextKey ?? context.cwd ?? "",
+			backend?.runtimeGeneration ?? 0,
+			["server-global", homedir(), getNarraforkHome(), process.env.CODEX_HOME ?? ""],
+			context.projectGitPath ?? "",
+			workspace?.contextProjectId ?? "",
+		]);
+	}
 	const project = context.projectGitPath?.trim() ? resolve(context.projectGitPath.trim()) : "";
 	const cwd = context.cwd?.trim() ? resolve(context.cwd.trim()) : "";
 	return `project:${project}|cwd:${cwd}`;
@@ -888,10 +974,9 @@ async function loadRootSkillSummaries(
 }
 
 /** Apply project intent after merging cached filesystem roots, also on explicit loads. */
-async function applyProjectRoutineSkillOverrides<T extends { name: string; location: string }>(
-	skills: T[],
-	projectGitPath: string | null | undefined,
-): Promise<T[]> {
+async function applyProjectRoutineSkillOverrides<
+	T extends { name: string; location: string; pathFlavor?: "posix" | "windows" },
+>(skills: T[], projectGitPath: string | null | undefined): Promise<T[]> {
 	if (!projectGitPath) return skills;
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.gitPath, projectGitPath),
@@ -913,7 +998,182 @@ async function applyProjectRoutineSkillOverrides<T extends { name: string; locat
 			.filter((routine) => disabled.includes(routine.id))
 			.map((routine) => [`_routine-${routine.id}`, routine.skill?.name]),
 	);
-	return skills.filter((skill) => managed.get(basename(dirname(skill.location))) !== skill.name);
+	return skills.filter((skill) => {
+		const paths = skill.pathFlavor ? targetPathSemantics(skill.pathFlavor) : localPathSemantics;
+		return managed.get(paths.basename(paths.dirname(skill.location))) !== skill.name;
+	});
+}
+
+async function loadWorkspaceSkill(
+	context: SkillContext,
+	location: string,
+	disabled = false,
+	includeFiles = true,
+): Promise<SkillInfo | null> {
+	const access = context.fileAccess;
+	if (!access) throw new Error("Workspace skill loading requires target read policy");
+	const { backend } = access;
+	const raw = await readWorkspaceText(access, location, 256_000);
+	if (!raw || raw.truncated) return null;
+	const parsed = parseSkillFile(raw.content, location);
+	if (!parsed) return null;
+	const skillDir = backend.paths.dirname(location);
+	const files: string[] = [];
+	if (includeFiles) {
+		const directory = await statWorkspaceFile(access, skillDir);
+		if (!directory?.isDirectory) return null;
+		const signal = access.signal
+			? AbortSignal.any([access.signal, AbortSignal.timeout(WORKSPACE_READ_TIMEOUT_MS)])
+			: AbortSignal.timeout(WORKSPACE_READ_TIMEOUT_MS);
+		const candidates = await backend.glob("**/*", {
+			cwd: skillDir,
+			dot: true,
+			maxResults: 24,
+			maxBytes: 16_000,
+			timeoutMs: WORKSPACE_READ_TIMEOUT_MS,
+			signal,
+		});
+		for (const candidate of candidates) {
+			const absolute = backend.paths.resolve(skillDir, candidate);
+			if (!backend.paths.contains(skillDir, absolute) || backend.paths.equals(absolute, location))
+				continue;
+			try {
+				const info = await statWorkspaceFile(access, absolute);
+				if (info?.isFile) files.push(backend.paths.relative(skillDir, absolute));
+			} catch {
+				access.signal?.throwIfAborted();
+			}
+			if (files.length >= 20) break;
+		}
+	}
+	let sidecar: Awaited<ReturnType<typeof loadSkillSidecar>> = null;
+	try {
+		const result = await readWorkspaceText(
+			access,
+			backend.paths.resolve(skillDir, "agents/openai.yaml"),
+			64_000,
+		);
+		if (result && !result.truncated) sidecar = await loadSkillSidecar(skillDir, result.content);
+	} catch {
+		access.signal?.throwIfAborted();
+	}
+	return {
+		...parsed,
+		...sidecar,
+		...(parsed.shortDescription ? { shortDescription: parsed.shortDescription } : {}),
+		files,
+		disabled,
+		deviceId: backend.deviceId,
+		pathFlavor: backend.paths.flavor as "posix" | "windows",
+		workspaceContextKey: (context.workspaceContext ?? access.workspaceContext)?.contextKey,
+		source: "workspace",
+		rootKind: "workspace",
+	};
+}
+
+async function loadWorkspaceSkillSummaries(
+	context: SkillContext,
+	root: SkillRootInfo,
+): Promise<{ skills: SkillSummaryInfo[]; meta: SkillRootCacheMeta }> {
+	const access = context.fileAccess;
+	if (!access) throw new Error("Workspace skill discovery requires target read policy");
+	const { backend } = access;
+	const skills = new Map<string, SkillSummaryInfo>();
+	const signal = access.signal
+		? AbortSignal.any([access.signal, AbortSignal.timeout(15_000)])
+		: AbortSignal.timeout(15_000);
+	let truncated = false;
+	for (const rel of [
+		".narrafork/skills",
+		".narrafork/skill",
+		".claude/skills",
+		".agents/skills",
+		".codex/skills",
+	]) {
+		signal.throwIfAborted();
+		const dir = backend.paths.resolve(root.rootPath, rel);
+		try {
+			const info = await statWorkspaceFile(access, dir);
+			if (!info?.isDirectory) continue;
+			const candidates = await backend.glob("**/SKILL.md*", {
+				cwd: dir,
+				dot: true,
+				maxResults: MAX_SKILLS_PER_ROOT,
+				maxBytes: MAX_SIGNATURE_JSON_BYTES,
+				timeoutMs: WORKSPACE_READ_TIMEOUT_MS,
+				signal,
+			});
+			truncated ||= candidates.truncated === true;
+			candidates.sort((a, b) => a.localeCompare(b));
+			const enabledDirectories = new Set(
+				candidates
+					.filter((path) => backend.paths.basename(path) === "SKILL.md")
+					.map((path) =>
+						backend.paths.identityKey(backend.paths.dirname(backend.paths.resolve(dir, path))),
+					),
+			);
+			const locations = candidates
+				.map((candidate) => backend.paths.resolve(dir, candidate))
+				.filter((location) => {
+					if (!backend.paths.contains(dir, location)) return false;
+					const leaf = backend.paths.basename(location);
+					if (leaf !== "SKILL.md" && leaf !== "SKILL.md.disabled") return false;
+					const skillDir = backend.paths.dirname(location);
+					const relativeParts = backend.paths.relative(dir, skillDir).split(/[\\/]/);
+					return (
+						relativeParts.length <= MAX_WALK_DEPTH + 1 &&
+						!relativeParts.some((part) => part.startsWith(".") || SKIP_DIRS.has(part)) &&
+						!(
+							leaf === "SKILL.md.disabled" &&
+							enabledDirectories.has(backend.paths.identityKey(skillDir))
+						)
+					);
+				});
+			// Bounded concurrency, preserving sorted precedence. Summary scans never enumerate assets.
+			for (let offset = 0; offset < locations.length; offset += 6) {
+				signal.throwIfAborted();
+				const loaded = await Promise.all(
+					locations.slice(offset, offset + 6).map(async (location) => {
+						try {
+							return await loadWorkspaceSkill(
+								{ ...context, fileAccess: { ...access, signal } },
+								location,
+								location.endsWith(".disabled"),
+								false,
+							);
+						} catch {
+							signal.throwIfAborted();
+							return null;
+						}
+					}),
+				);
+				for (const skill of loaded) {
+					if (!skill) continue;
+					skills.set(skill.name, {
+						...toSkillSummary(skill, root),
+						deviceId: skill.deviceId,
+						pathFlavor: skill.pathFlavor,
+						workspaceContextKey: skill.workspaceContextKey,
+					});
+					if (
+						skills.size >= MAX_SKILLS_PER_ROOT ||
+						jsonByteLength(Array.from(skills.values())) >= MAX_SKILLS_JSON_BYTES
+					) {
+						truncated = true;
+						break;
+					}
+				}
+				if (truncated) break;
+			}
+		} catch {
+			signal.throwIfAborted();
+		}
+		if (truncated) break;
+	}
+	return {
+		skills: Array.from(skills.values()),
+		meta: { ...root, cacheHit: false, refreshed: true, cacheable: false, skillCount: skills.size },
+	};
 }
 
 export async function loadSkillSummariesForContext(
@@ -921,9 +1181,16 @@ export async function loadSkillSummariesForContext(
 	options: { forceRefresh?: boolean } = {},
 ): Promise<SkillContextLoadResult> {
 	const roots = await resolveSkillRootsForContext(context);
-	const scopeKey = getSkillRootCacheKey(roots) || getSkillContextCacheKey(context);
+	const scopeKey =
+		context.fileAccess || context.workspaceContext
+			? getSkillContextCacheKey(context)
+			: getSkillRootCacheKey(roots) || getSkillContextCacheKey(context);
 	const rootResults = await Promise.all(
-		roots.map((root) => loadRootSkillSummaries(root, { forceRefresh: options.forceRefresh })),
+		roots.map((root) =>
+			root.deviceId
+				? loadWorkspaceSkillSummaries(context, root)
+				: loadRootSkillSummaries(root, { forceRefresh: options.forceRefresh }),
+		),
 	);
 
 	const skillMap = new Map<string, SkillSummaryInfo>();
@@ -958,13 +1225,22 @@ export async function loadSkillByNameForContext(
 	}
 	if (!found) return null;
 
+	if (found.deviceId) return loadWorkspaceSkill(context, found.location, found.disabled ?? false);
 	const skillDir = dirname(found.location);
 	const loaded = await loadSkillCached(found.location, skillDir, found.disabled ?? false);
 	if (!loaded) return null;
 	return { ...loaded, source: found.source, rootKind: found.rootKind };
 }
 
-export async function resolveSkillContextForNarrator(narratorId: string): Promise<SkillContext> {
+export async function resolveSkillContextForNarrator(
+	narratorId: string,
+	options: {
+		userId?: string | null;
+		signal?: AbortSignal;
+		workspaceContext?: WorkspaceContext;
+		fileAccess?: WorkspaceFileAccess;
+	} = {},
+): Promise<SkillContext> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
 		columns: { chapterId: true, contextProjectId: true, cwd: true },
@@ -973,12 +1249,6 @@ export async function resolveSkillContextForNarrator(narratorId: string): Promis
 
 	// Use the same explicit project resolution as ACL/traits; cwd never implies membership.
 	const projectId = await resolveNarratorProjectId(narrator);
-	const chapter = narrator.chapterId
-		? await db.query.chapters.findFirst({
-				where: eq(chapters.id, narrator.chapterId),
-				columns: { worktreePath: true },
-			})
-		: null;
 	const project = projectId
 		? await db.query.projects.findFirst({
 				where: eq(projects.id, projectId),
@@ -986,9 +1256,20 @@ export async function resolveSkillContextForNarrator(narratorId: string): Promis
 			})
 		: null;
 	const projectGitPath = project?.gitPath ?? null;
+	const workspaceContext =
+		options.workspaceContext ??
+		(await workspaceContextService.get(narratorId, { userId: options.userId }));
+	const fileAccess =
+		options.fileAccess ??
+		createNarratorWorkspaceFileAccess(narratorId, workspaceContext, {
+			userId: options.userId,
+			signal: options.signal,
+		});
 	return {
 		projectGitPath,
-		cwd: narrator.cwd || chapter?.worktreePath || projectGitPath || homedir(),
+		cwd: workspaceContext.cwd,
+		workspaceContext,
+		fileAccess,
 	};
 }
 
@@ -1060,7 +1341,12 @@ export async function loadAllSkills(projectGitPath: string | null): Promise<Skil
 export async function resolveSkillRoot(
 	projectGitPath: string | null | undefined,
 	cwd: string,
+	context?: Pick<SkillContext, "workspaceContext" | "fileAccess">,
 ): Promise<string | null> {
+	if (context?.fileAccess || context?.workspaceContext) {
+		const roots = await resolveSkillRootsForContext({ ...context, cwd, projectGitPath });
+		return roots.find((root) => root.rootKind === "workspace")?.rootPath ?? null;
+	}
 	if (projectGitPath) return projectGitPath;
 	const normalizedCwd = await normalizeRootPath(cwd);
 	return (await findGitRoot(normalizedCwd)) ?? normalizedCwd;
@@ -1080,7 +1366,313 @@ export async function loadSkillByName(
 /**
  * Read a companion file from a skill directory.
  */
-export async function readSkillFile(skillLocation: string, filePath: string): Promise<string> {
+export const SKILL_MATERIALIZE_DIR_REL = ".narrafork/skill-resources";
+const MATERIALIZE_MAX_FILES = 21;
+const MATERIALIZE_MAX_BYTES = 1_048_576;
+const MATERIALIZE_FILE_BYTES = 256_000;
+
+/** Published server configuration, not an invented workspace or an arbitrary host Read. */
+export async function createConfiguredGlobalSkillAccess(
+	skill: SkillInfo,
+	ctx: ToolContext,
+): Promise<WorkspaceFileAccess> {
+	if (skill.source !== "global")
+		throw new ValidationError("Only server-global skills require materialization");
+	const { narratorId, userId, recheckAuthorization, assertWorkspaceCurrent } = ctx;
+	const checkSourceAuthority = async () => {
+		if (!recheckAuthorization)
+			throw new ValidationError(
+				"Global skill materialization requires a live source authorization fence",
+			);
+		await recheckAuthorization();
+		assertWorkspaceCurrent?.();
+		const runtime = await resolveOAuthNarratorRuntimePolicy(narratorId, userId);
+		if (
+			runtime &&
+			(!runtime.allowedTools.has("Read") ||
+				!runtime.allowLocalExecution ||
+				!["readOnly", "readWrite"].includes(runtime.policy.deviceAccess.host))
+		)
+			throw new ValidationError(
+				"Server-global skill resources are outside the OAuth host read authority",
+			);
+	};
+	const setupSignal = AbortSignal.any([ctx.signal, AbortSignal.timeout(WORKSPACE_READ_TIMEOUT_MS)]);
+	setupSignal.throwIfAborted();
+	await waitMaterialize(checkSourceAuthority(), setupSignal);
+	const searchDirs = getSkillSearchDirs(
+		await waitMaterialize(normalizeRootPath(homedir()), setupSignal),
+	);
+	if (!searchDirs.some((root) => localBackend.paths.contains(root, skill.location)))
+		throw new ValidationError("Skill is no longer in a configured server-global source");
+	const sourceDir = localBackend.paths.dirname(skill.location);
+	const identity = await waitMaterialize(
+		localBackend.resolvePathIdentity(sourceDir, {
+			signal: setupSignal,
+			timeoutMs: WORKSPACE_READ_TIMEOUT_MS,
+		}),
+		setupSignal,
+	);
+	const canonicalRoot = identity.canonicalPath;
+	return {
+		backend: localBackend,
+		signal: ctx.signal,
+		runtimeGeneration: localBackend.runtimeGeneration,
+		async authorizeRead(canonicalPath, backend, signal) {
+			if (backend !== localBackend || !backend.paths.contains(canonicalRoot, canonicalPath))
+				return false;
+			await checkSourceAuthority();
+			signal?.throwIfAborted();
+			const policy = await executionPolicyEngine.compile(
+				narratorId,
+				{
+					backend,
+					paths: backend.paths,
+					deviceClass: "host",
+					target: {
+						deviceId: "local",
+						backendKind: "local",
+						cwd: canonicalRoot,
+						canonicalPath,
+						lexicalPath: canonicalPath,
+						pathFlavor: backend.pathFlavor,
+						runtimeGeneration: backend.runtimeGeneration,
+						selectionSource: "explicit",
+					},
+				},
+				[],
+				signal,
+			);
+			return policy.evaluatePath({ path: canonicalPath, operation: "read" }).decision !== "deny";
+		},
+	};
+}
+
+function waitMaterialize<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+	return new Promise((resolve, reject) => {
+		const abort = () => reject(signal.reason);
+		signal.addEventListener("abort", abort, { once: true });
+		operation.then(
+			(value) => {
+				signal.removeEventListener("abort", abort);
+				if (signal.aborted) reject(signal.reason);
+				else resolve(value);
+			},
+			(error) => {
+				signal.removeEventListener("abort", abort);
+				reject(error);
+			},
+		);
+		if (signal.aborted) abort();
+	});
+}
+
+/** Explicit bounded data installation. No commands, host writes or implicit project mirror. */
+export async function materializeGlobalSkillResources(
+	skill: SkillInfo,
+	sourceAccess: WorkspaceFileAccess,
+	targetAccess: WorkspaceAttachmentAccess,
+): Promise<SkillInfo> {
+	if (skill.source !== "global" || sourceAccess.backend.kind !== "local")
+		throw new ValidationError("Materialization requires a published server-global skill source");
+	const { backend, workspaceContext: workspace } = targetAccess;
+	if (
+		workspace.deviceId !== backend.deviceId ||
+		workspace.pathFlavor !== backend.paths.flavor ||
+		!backend.paths.isAbsolute(workspace.cwd)
+	)
+		throw new ValidationError("Materialization target does not match the frozen workspace");
+	if (!backend.conditionalWriteFileBytes)
+		throw new ValidationError(
+			"Executor requires conditional file creation support for skill materialization",
+		);
+	const signals = [sourceAccess.signal, targetAccess.signal, AbortSignal.timeout(30_000)].filter(
+		(signal): signal is AbortSignal => !!signal,
+	);
+	const signal = AbortSignal.any(signals);
+	const source = { ...sourceAccess, signal };
+	const sourceDir = source.backend.paths.dirname(skill.location);
+	const sourceInfo = await statWorkspaceFile(source, sourceDir);
+	if (!sourceInfo?.isDirectory || !sourceInfo.resolvedPath)
+		throw new ValidationError("Global skill directory is unavailable");
+	const name = skill.name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 48) || "skill";
+	const installDir = backend.paths.resolve(
+		workspace.cwd,
+		`${SKILL_MATERIALIZE_DIR_REL}/${name}-${generateId()}`,
+	);
+	const generation = backend.runtimeGeneration;
+	const canonicalInstall = await waitMaterialize(
+		backend.resolvePathIdentity(installDir, {
+			signal,
+			timeoutMs: WORKSPACE_READ_TIMEOUT_MS,
+		}),
+		signal,
+	);
+	if (canonicalInstall.runtimeGeneration !== generation)
+		throw new ValidationError("Skill materialization executor generation changed");
+	if (!backend.paths.contains(workspace.cwd, canonicalInstall.canonicalPath))
+		throw new ValidationError("Materialized skill directory escapes the workspace");
+	if (
+		(await waitMaterialize(
+			targetAccess.authorizeWrite(canonicalInstall.canonicalPath, backend, signal),
+			signal,
+		)) === false
+	)
+		throw new ValidationError("Skill materialization write denied");
+	const candidates = await waitMaterialize(
+		source.backend.glob("**/*", {
+			cwd: sourceDir,
+			dot: true,
+			maxResults: MATERIALIZE_MAX_FILES + 1,
+			maxBytes: 24_000,
+			timeoutMs: WORKSPACE_READ_TIMEOUT_MS,
+			signal,
+		}),
+		signal,
+	);
+	if (candidates.truncated || candidates.length > MATERIALIZE_MAX_FILES)
+		throw new ValidationError("Skill materialization exceeds the 21-file limit");
+	const copies: Array<{
+		relative: string;
+		bytes: Uint8Array;
+		destination: string;
+		canonical: string;
+	}> = [];
+	const seen = new Set<string>();
+	let totalBytes = 0;
+	for (const candidate of candidates.sort()) {
+		signal.throwIfAborted();
+		const path = source.backend.paths.resolve(sourceDir, candidate);
+		const info = await statWorkspaceFile(source, path);
+		if (!info?.isFile) continue;
+		if (
+			!info.resolvedPath ||
+			!source.backend.paths.contains(sourceInfo.resolvedPath, info.resolvedPath)
+		)
+			throw new ValidationError("Global skill resource escapes its source directory");
+		if (info.size > MATERIALIZE_FILE_BYTES || totalBytes + info.size > MATERIALIZE_MAX_BYTES)
+			throw new ValidationError("Skill materialization exceeds its byte limit");
+		const bytes = await waitMaterialize(
+			readCompleteFileBytes(source.backend, path, {
+				maxBytes: MATERIALIZE_FILE_BYTES,
+				expectedResolvedPath: info.resolvedPath,
+				signal,
+				timeoutMs: WORKSPACE_READ_TIMEOUT_MS,
+			}),
+			signal,
+		);
+		totalBytes += bytes.bytes.byteLength;
+		if (totalBytes > MATERIALIZE_MAX_BYTES)
+			throw new ValidationError("Skill materialization exceeds the 1 MiB limit");
+		const relative = source.backend.paths.relative(sourceDir, path);
+		const portable =
+			source.backend.paths.flavor === "windows" ? relative.replaceAll("\\", "/") : relative;
+		const destination = backend.paths.resolve(installDir, portable);
+		if (
+			!backend.paths.contains(installDir, destination) ||
+			seen.has(backend.paths.identityKey(destination))
+		)
+			throw new ValidationError("Skill resource paths collide or escape on the target platform");
+		seen.add(backend.paths.identityKey(destination));
+		const identity = await backend.resolvePathIdentity(destination, {
+			signal,
+			timeoutMs: WORKSPACE_READ_TIMEOUT_MS,
+		});
+		if (
+			identity.runtimeGeneration !== generation ||
+			!backend.paths.contains(canonicalInstall.canonicalPath, identity.canonicalPath)
+		)
+			throw new ValidationError("Skill artifact identity changed");
+		if (
+			(await waitMaterialize(
+				targetAccess.authorizeWrite(identity.canonicalPath, backend, signal),
+				signal,
+			)) === false
+		)
+			throw new ValidationError("Skill resource write denied");
+		copies.push({
+			relative: portable,
+			bytes: bytes.bytes,
+			destination,
+			canonical: identity.canonicalPath,
+		});
+	}
+	const main = copies.find((copy) =>
+		source.backend.paths.equals(
+			source.backend.paths.resolve(sourceDir, copy.relative),
+			skill.location,
+		),
+	);
+	const parsed = main ? parseSkillFile(new TextDecoder().decode(main.bytes), skill.location) : null;
+	if (!main || !parsed || parsed.name !== skill.name)
+		throw new ValidationError("Global skill identity changed while materializing; reload it");
+	// All reads and policy checks finish before the first filesystem mutation.
+	try {
+		for (const copy of copies) {
+			signal.throwIfAborted();
+			if (backend.runtimeGeneration !== generation)
+				throw new ValidationError("Skill materialization executor generation changed");
+			if (
+				(await waitMaterialize(
+					targetAccess.authorizeWrite(copy.canonical, backend, signal),
+					signal,
+				)) === false
+			)
+				throw new ValidationError("Skill resource write authority changed");
+			await waitMaterialize(backend.mkdirp(backend.paths.dirname(copy.destination)), signal);
+			await waitMaterialize(
+				backend.conditionalWriteFileBytes(copy.destination, copy.bytes, {
+					expectedBytes: null,
+					expectedResolvedPath: copy.canonical,
+					signal,
+					timeoutMs: WORKSPACE_READ_TIMEOUT_MS,
+				}),
+				signal,
+			);
+		}
+	} catch (error) {
+		// Do not delete a directory/file that an external writer may already have changed.
+		throw new ValidationError(
+			`Skill materialization may be partial on ${backend.deviceId}:${installDir}; no host fallback or automatic deletion. ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	return {
+		...skill,
+		...parsed,
+		location: main.destination,
+		files: copies
+			.filter((copy) => copy !== main)
+			.map((copy) => backend.paths.relative(installDir, copy.destination)),
+		deviceId: backend.deviceId,
+		pathFlavor: backend.paths.flavor as "posix" | "windows",
+		workspaceContextKey: workspace.contextKey,
+		materializedFrom: { deviceId: "local", location: skill.location },
+	};
+}
+
+export async function readSkillFile(
+	skillLocation: string,
+	filePath: string,
+	access?: WorkspaceFileAccess,
+): Promise<string> {
+	if (access) {
+		const paths = access.backend.paths;
+		const dir = paths.dirname(skillLocation);
+		const resolved = paths.resolve(dir, filePath);
+		if (!paths.contains(dir, resolved)) throw new ValidationError("Path traversal not allowed");
+		const info = await statWorkspaceFile(access, resolved);
+		const directory = await statWorkspaceFile(access, dir);
+		if (
+			!info?.resolvedPath ||
+			!directory?.resolvedPath ||
+			!paths.contains(directory.resolvedPath, info.resolvedPath)
+		)
+			throw new ValidationError("Skill resource escapes its directory");
+		const result = await readWorkspaceText(access, resolved, 256_000);
+		if (!result || result.truncated)
+			throw new ValidationError("Skill resource is missing or exceeds size limit");
+		return result.content;
+	}
 	// skillLocation is the SKILL.md path; get the directory
 	const skillDir = resolve(dirname(skillLocation));
 	const resolved = resolve(skillDir, filePath);
@@ -1089,7 +1681,14 @@ export async function readSkillFile(skillLocation: string, filePath: string): Pr
 	if (!isInsidePath(skillDir, resolved)) {
 		throw new ValidationError("Path traversal not allowed");
 	}
-	return readFile(resolved, "utf-8");
+	const canonicalFile = await realpath(resolved);
+	const canonicalDir = await realpath(skillDir);
+	if (!isInsidePath(canonicalDir, canonicalFile))
+		throw new ValidationError("Path traversal not allowed");
+	const result = await readFileCapped(canonicalFile, 256_000);
+	if (!result || result.truncated)
+		throw new ValidationError("Skill resource is missing or exceeds size limit");
+	return result.content;
 }
 
 export async function cleanupSkillDirectoryCaches(): Promise<{ expired: number; lru: number }> {

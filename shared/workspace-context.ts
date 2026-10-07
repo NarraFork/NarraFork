@@ -1,3 +1,8 @@
+export interface WorkspaceFeatureCapability {
+	available: boolean;
+	reason?: string;
+}
+
 /** Execution workspace, deliberately distinct from UI layout workspaces. */
 export interface WorkspaceContext {
 	revision: number;
@@ -7,7 +12,21 @@ export interface WorkspaceContext {
 	contextKey: string;
 	contextProjectId?: string;
 	git?: { workspaceKey: string; repositoryKey: string; rootPath: string };
-	capabilities: { switchDirectory: boolean; reason?: string };
+	/** Runtime state is presentation only; it is never an authorization grant. */
+	availability?: "ready" | "offline" | "needs_initialization" | "missing_directory";
+	/** Legacy SwitchDevice return location; never used as the current execution cwd. */
+	compatibility?: { version: 1; localCwd?: string };
+	capabilities: {
+		switchDirectory: boolean;
+		reason?: string;
+		browse?: WorkspaceFeatureCapability;
+		edit?: WorkspaceFeatureCapability;
+		git?: WorkspaceFeatureCapability;
+		worktree?: WorkspaceFeatureCapability;
+		terminal?: WorkspaceFeatureCapability;
+		history?: WorkspaceFeatureCapability;
+		share?: WorkspaceFeatureCapability;
+	};
 }
 
 export interface SwitchWorkingDirectoryRequest {

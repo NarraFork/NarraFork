@@ -217,11 +217,13 @@ import {
 	createRevertActionPreviewSchema,
 	createRevertPlanSchema,
 	optimizePromptSchema,
+	reconcileRevertPlanSchema,
 	revertPlanFilesQuerySchema,
 	revertPlanIdSchema,
 } from "../lib/validators/narrators";
 import { validateSubagentModelRestrictionInput } from "../lib/validators/subagent-models";
 import { requireAdmin } from "../middleware/auth";
+import { remoteRecoveryProvenance } from "../middleware/remote-recovery-provenance";
 import { isExecutionSuspended } from "../services/agent-runtime/ownership";
 import { coerceAskQuestions } from "../services/ask-user-question-coerce";
 import { generateAskUserQuestionAnswers } from "../services/ask-user-question-reflection";
@@ -465,7 +467,9 @@ import {
 	getNarratorPresenceBatch,
 } from "../websocket/narrator-ws";
 import { fileReferenceRoutes } from "./narrator-file-references";
+import { narratorWorkspaceBrowserRoutes } from "./narrator-workspace-browser";
 import { narratorWorkspaceContextRoutes } from "./narrator-workspace-context";
+import { narratorWorkspaceSnapshotRoutes } from "./narrator-workspace-snapshots";
 
 function parseNewCommand(message: string): { rawCommand: string; initialMessage: string } | null {
 	const match = message.trim().match(/^\/new(?:\s+([\s\S]*))?$/);
@@ -574,6 +578,7 @@ export async function parseMessageRequest(
 }
 
 export const narratorRoutes = new Hono();
+narratorRoutes.route("/", narratorWorkspaceSnapshotRoutes);
 
 /**
  * The narrator HTTP surface still depends on the SQLite-shaped narrator domain, session, ACL, and
@@ -608,9 +613,13 @@ const boundedRevertRequest = bodyLimit({
 			413,
 		),
 });
+narratorRoutes.use("/:id/revert-plans", remoteRecoveryProvenance);
+narratorRoutes.use("/:id/revert-action-preview", remoteRecoveryProvenance);
+narratorRoutes.use("/:id/revert-plans/:planId/apply", remoteRecoveryProvenance);
 narratorRoutes.use("/:id/revert-plans", boundedRevertRequest);
 narratorRoutes.use("/:id/revert-action-preview", boundedRevertRequest);
 narratorRoutes.use("/:id/revert-plans/:planId/apply", boundedRevertRequest);
+narratorRoutes.use("/:id/revert-plans/:planId/reconcile", boundedRevertRequest);
 
 const boundedQuestionRequest = bodyLimit({
 	maxSize: 128 * 1024,
@@ -1230,7 +1239,7 @@ narratorRoutes.post("/", async (c) => {
 	// Ownership always comes from the authenticated session, never from the body:
 	// a client must not be able to create a narrator on someone else's behalf.
 	const ownerUserId = c.get("user").sub;
-	const resolvedCwd = standaloneNarratorCwd(input);
+	const resolvedCwd = input.workspaceTarget ? undefined : standaloneNarratorCwd(input);
 
 	if (input.kind) {
 		const user = c.get("user");
@@ -1768,7 +1777,10 @@ narratorRoutes.get("/:id/skills", async (c) => {
 	const id = c.req.param("id");
 	await narratorService.getById(id);
 	const refresh = c.req.query("refresh") === "true";
-	const context = await skillService.resolveSkillContextForNarrator(id);
+	const context = await skillService.resolveSkillContextForNarrator(id, {
+		userId: c.get("user").sub,
+		signal: c.req.raw.signal,
+	});
 	const result = await skillService.loadSkillSummariesForContext(context, {
 		forceRefresh: refresh,
 	});
@@ -2059,7 +2071,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		}
 		if (cmdResult.resolved && "blockSkill" in cmdResult) {
 			const locale = await getUserLanguage(userId);
-			const result = await handleBlockSkillCommand(id, cmdResult as BlockSkillResult, locale);
+			const result = await handleBlockSkillCommand(id, cmdResult as BlockSkillResult, locale, {
+				userId,
+				signal: c.req.raw.signal,
+			});
 			return c.json(result, 200);
 		}
 		if (cmdResult.resolved && "blockAllSkills" in cmdResult) {
@@ -2086,7 +2101,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			return c.json(result, 200);
 		}
 		if (cmdResult.resolved && "loadSkill" in cmdResult) {
-			const skillResult = await handleLoadSkillCommand(id, cmdResult as LoadSkillResult);
+			const skillResult = await handleLoadSkillCommand(id, cmdResult as LoadSkillResult, {
+				userId,
+				signal: c.req.raw.signal,
+			});
 			if (!skillResult.found) {
 				if (fileReferences?.length) {
 					throw new ValidationError("Skill was not found; file references were not sent");
@@ -4858,11 +4876,15 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 	const id = c.req.param("id");
 	await narratorService.getById(id);
-	const planState = await enterNarratorPlanMode(id);
+	const planState = await enterNarratorPlanMode(id, undefined, undefined, {
+		userId: c.get("user").sub,
+		signal: c.req.raw.signal,
+	});
 	const active = activeNarrators.get(id);
 	if (active) {
 		active._planFileId = planState.planFileId;
 		active._planFilePath = planState.planFilePath;
+		active._planFileBinding = planState.planFileBinding;
 		active._previousPermissionMode = planState.previousPermissionMode;
 	}
 	if (planState.relaxedPlanChanged) {
@@ -5211,6 +5233,7 @@ narratorRoutes.patch("/:id/handle", async (c) => {
 });
 
 narratorRoutes.route("/", narratorWorkspaceContextRoutes);
+narratorRoutes.route("/", narratorWorkspaceBrowserRoutes);
 narratorRoutes.get("/:id/permission-rule-requests", async (c) => {
 	const { listPermissionRuleRequests } = await import(
 		"../services/permission-rule-request-service"
@@ -6202,6 +6225,24 @@ narratorRoutes.post("/:id/revert-plans/:planId/apply", async (c) => {
 			409,
 		);
 	return c.json(result);
+});
+
+narratorRoutes.post("/:id/revert-plans/:planId/reconcile", async (c) => {
+	const raw = await c.req.json().catch((error: unknown) => {
+		if (!(error instanceof SyntaxError)) throw error;
+		throw new ValidationError("Invalid recovery JSON body");
+	});
+	const body = validRevertPreview(reconcileRevertPlanSchema.safeParse(raw));
+	const { reconcileRemoteRevertPlan } = await import("../services/remote-history-control-recovery");
+	const result = await reconcileRemoteRevertPlan({
+		principal: narratorPrincipalOf(c),
+		narratorId: c.req.param("id"),
+		planId: validRevertPreview(revertPlanIdSchema.safeParse(c.req.param("planId"))),
+		planHash: body.planHash,
+		signal: AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(60_000)]),
+	});
+	c.header("Cache-Control", "no-store");
+	return c.json(result, result.status === "committed" ? 200 : 409);
 });
 
 narratorRoutes.post("/:id/revert-plans", async (c) => {

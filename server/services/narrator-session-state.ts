@@ -23,6 +23,7 @@ export interface PreparedPlanMode {
 	toolUseId: string;
 	planFileId: string;
 	planFilePath: string;
+	planFileBinding?: import("../lib/plan-file-path").PlanFileBinding;
 	previousPermissionMode?: string;
 }
 
@@ -33,6 +34,8 @@ export interface ActiveNarrator {
 	cwd: string;
 	/** Authoritative execution context installed from the committed narrator row. */
 	_workspaceContext?: import("@shared/workspace-context").WorkspaceContext;
+	_workspaceFileAccess?: import("../lib/plan-file-path").WorkspaceFileAccess;
+	_planFileBinding?: import("../lib/plan-file-path").PlanFileBinding;
 	/** End this old pass after a switch; unstarted tools must not mix identities. */
 	_workspacePassInvalidated?: boolean;
 	/** Installation failure blocks further tools until activation reloads persisted state. */

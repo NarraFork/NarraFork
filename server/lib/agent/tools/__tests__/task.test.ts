@@ -1,5 +1,8 @@
 import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import { settings } from "../../../settings";
+import type { ExecutionBackend } from "../../execution/backend";
+import { targetPathSemantics } from "../../execution/path-semantics";
 import type { AgentConfig, ToolContext, ToolUpdateExecutionLease } from "../../types";
 
 const runCalls: Array<Record<string, unknown>> = [];
@@ -139,6 +142,75 @@ describe("Agent task tool", () => {
 		await agentTool.execute({ prompt: "check preference plumbing", subagent_type: "general" }, ctx);
 
 		expect(runCalls[0]).toMatchObject({ userId: "user-42" });
+	});
+
+	test("remote Windows consumes admitted cwd once and freezes the parent context", async () => {
+		runCalls.length = 0;
+		const workspaceContext: WorkspaceContext = {
+			deviceId: "remote-win",
+			cwd: "D:\\selected\\parent",
+			pathFlavor: "windows",
+			contextKey: "original",
+			revision: 4,
+			capabilities: { switchDirectory: true },
+		};
+		const backend = {
+			deviceId: "remote-win",
+			kind: "remote",
+			paths: targetPathSemantics("windows"),
+			runtimeGeneration: 3,
+		} as unknown as ExecutionBackend;
+		const ctx: ToolContext = {
+			narratorId: "parent-windows",
+			cwd: "/host-decoy",
+			workspaceContext,
+			resolveBackend: () => backend,
+			executionTarget: {
+				deviceId: "remote-win",
+				backendKind: "remote",
+				cwd: "D:\\selected\\child",
+				baseCwd: "D:\\selected\\parent",
+				pathFlavor: "windows",
+				canonicalPath: "D:\\selected\\child",
+				runtimeGeneration: 3,
+				selectionSource: "session_default",
+			},
+			signal: new AbortController().signal,
+			locale: "en",
+			currentToolUseId: "launch-win",
+			toolCallBinding: { toolCallId: "launch-row", attempt: 1 },
+			updateExecutionLease: {
+				kind: "resumable",
+				setNarratorId: mock(() => {}),
+				transfer: mock(() => true),
+				release: mock(() => {}),
+			},
+			requestPermission: async () => ({ behavior: "allow" }),
+		};
+		const routing = agentTool.executionRouting;
+		expect(routing?.kind).toBe("single");
+		if (routing?.kind !== "single") throw new Error("single routing required");
+		expect(
+			await routing.resolve({ workdir: "../child" }, {
+				cwd: "/host-decoy",
+				workspaceContext,
+			} as AgentConfig),
+		).toMatchObject({
+			operation: "control",
+			deviceId: "remote-win",
+			workdir: "../child",
+			path: ".",
+		});
+		const result = await agentTool.execute({ prompt: "inspect", workdir: "../child" }, ctx);
+		expect(result.isError).toBeFalsy();
+		expect(runCalls[0]?.cwd).toBe("D:\\selected\\child");
+		workspaceContext.cwd = "D:\\later";
+		workspaceContext.deviceId = "other-device";
+		expect(runCalls[0]?.workspaceContext).toMatchObject({
+			cwd: "D:\\selected\\parent",
+			deviceId: "remote-win",
+			revision: 4,
+		});
 	});
 
 	// The tool used to re-write the runner's `<subagent_id>` tag to swap in an

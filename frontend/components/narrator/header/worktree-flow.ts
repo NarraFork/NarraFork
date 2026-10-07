@@ -23,6 +23,8 @@ export interface WorktreeFlowState {
 	confirmedFailure?: boolean;
 	residuals?: WorktreeCreateResult["residuals"];
 	createdPath?: string;
+	/** Device frozen by the creation/recovery receipt, not the later current context. */
+	createdDeviceId?: string;
 	/** Frozen original proposal: recovery must not change its revision, identity or request id. */
 	createRequest?: WorktreeCreateRequest;
 }
@@ -30,7 +32,7 @@ export interface WorktreeFlowPorts {
 	prepare: (input: WorktreePrepareRequest) => Promise<WorktreePrepareResult>;
 	create: (input: WorktreeCreateRequest) => Promise<WorktreeCreateResult>;
 	reconcile: (input: WorktreeReconcileRequest) => Promise<WorktreeCreateResult>;
-	switch: (path: string) => Promise<void>;
+	switch: (path: string, deviceId?: string) => Promise<void>;
 	requestId: () => string;
 	persist?: (request: WorktreeCreateRequest, draft: WorktreeDraft) => Promise<void>;
 	complete?: (requestId: string) => void;
@@ -63,6 +65,7 @@ export class WorktreeFlow {
 				unknown: false,
 				confirmedFailure: false,
 				createdPath: result.worktree.path,
+				createdDeviceId: result.deviceId,
 				residuals: result.residuals,
 				error: undefined,
 			});
@@ -93,6 +96,7 @@ export class WorktreeFlow {
 			confirmedFailure: false,
 			residuals: undefined,
 			createRequest: undefined,
+			createdDeviceId: undefined,
 			step: "prepare",
 		});
 		// Copy before prepare awaits: later UI/cache edits cannot alter the proposal.
@@ -161,7 +165,9 @@ export class WorktreeFlow {
 		this.switching = true;
 		this.update({ step: "switch", busy: true, error: undefined });
 		try {
-			await this.ports.switch(this.state.createdPath);
+			if (this.state.createdDeviceId)
+				await this.ports.switch(this.state.createdPath, this.state.createdDeviceId);
+			else await this.ports.switch(this.state.createdPath);
 			if (this.state.createRequest) this.ports.complete?.(this.state.createRequest.requestId);
 			this.update({ step: "done" });
 		} catch (error) {

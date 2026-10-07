@@ -43,9 +43,9 @@ export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrinc
 	},
 	withRevision: (narratorId, revision, action) =>
 		workspaceContextService.withRevision(narratorId, revision, undefined, async (context) => {
-			if (context.deviceId !== "local" || !context.capabilities.switchDirectory)
+			if (!context.capabilities.switchDirectory)
 				throw new AppError(
-					"Only ordinary local primary narrators support worktree creation",
+					"Only ordinary primary narrators support worktree creation",
 					409,
 					"WORKTREE_UNSUPPORTED",
 				);

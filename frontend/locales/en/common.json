@@ -1,4 +1,8 @@
 {
+	"directoryTargetExists": "The destination already exists. Choose a new name.",
+	"directoryPath": "Directory path",
+	"newDirectoryName": "New directory name",
+	"directoryListingTruncated": "This listing is a bounded prefix; more entries may exist.",
 	"dataDirectorySecurity": {
 		"check": "Check data directory permissions",
 		"handle": "Resolve",

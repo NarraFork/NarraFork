@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import { createWriteStream, existsSync, statSync } from "node:fs";
+import { lstat, open, opendir, rm } from "node:fs/promises";
 import { basename, dirname, relative, resolve } from "node:path";
 import { z } from "zod/v4";
 import {
@@ -6,28 +8,346 @@ import {
 	isShareText,
 	SHARE_HTML_MAX_BYTES,
 } from "../../../../shared/share-preview";
-import { generateShortId } from "../../id";
+import { generateId, generateShortId } from "../../id";
 import { settings } from "../../settings";
 import { createShare, getMaxShareSizeBytes, getShareDir } from "../../shares";
 import { safeSpawn } from "../../spawn";
+import { assertSpecPath } from "../../spec-uri";
 import {
 	MAX_IMAGE_HEADER_SIZE,
 	parseImageDimensions,
 	sanitizeParsedDimensions,
 } from "../../uploads";
-import type { ToolDefinition, ToolResult } from "../types";
+import type { ExecutionBackend } from "../execution/backend";
+import { withDeviceParam } from "../execution/device-schema";
+import { toolExecutionCwd } from "../execution/path-resolve";
+import type { ShareArchiveEntry } from "../execution/share-archive-rpc";
+import { getToolBackend } from "../execution/tool-backend";
+import { zodToJsonSchema } from "../tool-registry";
+import type { ToolContext, ToolDefinition, ToolResult } from "../types";
+
+export type WorkspaceShareReadAuthorizer = (
+	canonicalPath: string,
+	backend: ExecutionBackend,
+	signal?: AbortSignal,
+) => Promise<boolean | undefined>;
+const SHARE_MAX_ENTRIES = 4096;
+const SHARE_CHUNK_BYTES = 1024 * 1024;
+const SHARE_REMOTE_MAX_BYTES = 1024 * 1024 * 1024;
+
+async function authorizeRemoteShareEntries(
+	ctx: ToolContext,
+	backend: ExecutionBackend,
+	entries: ReadonlyArray<Pick<ShareArchiveEntry, "path">>,
+	signal: AbortSignal,
+): Promise<void> {
+	const authorize = (ctx as ToolContext & { authorizeWorkspaceRead?: WorkspaceShareReadAuthorizer })
+		.authorizeWorkspaceRead;
+	if (!authorize)
+		throw new Error("Remote sharing requires live actor/device/project/read-policy authorization.");
+	await ctx.recheckAuthorization?.();
+	for (const entry of entries) {
+		signal.throwIfAborted();
+		if ((await authorize(entry.path, backend, signal)) !== true)
+			throw new Error("Remote share source read denied.");
+	}
+}
+
+/** The executor enumerates and archives; only one opaque, bounded artifact reaches the host. */
+async function handleRemoteShare(
+	inputPaths: string[],
+	compress: boolean | undefined,
+	preview: boolean | undefined,
+	ctx: ToolContext,
+	backend: ExecutionBackend,
+): Promise<ToolResult> {
+	if (!backend.supportsShareArchive || !backend.shareArchive)
+		return {
+			isError: true,
+			output:
+				"Remote sharing requires an executor upgrade with share.archive.v1; directories are supported by that capability.",
+		};
+	const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(ARCHIVE_TIMEOUT_MS)]);
+	const operationId = generateId();
+	const limit = Math.min(getMaxShareSizeBytes(), SHARE_REMOTE_MAX_BYTES);
+	let shareDir: string | undefined;
+	let published = false;
+	try {
+		if (
+			inputPaths.length < 1 ||
+			inputPaths.length > 64 ||
+			!Number.isSafeInteger(limit) ||
+			limit < 1
+		)
+			throw new Error("Share requires 1-64 paths and a positive bounded size allowance.");
+		const base = toolExecutionCwd(backend, ctx);
+		const sources = ctx.executionPlan?.endpoints.filter(
+			(endpoint) => endpoint.operation === "read",
+		);
+		const roots = inputPaths.map((input, index) => {
+			const target =
+				sources?.[index]?.target ?? (inputPaths.length === 1 ? ctx.executionTarget : undefined);
+			if (target && target.deviceId !== backend.deviceId)
+				throw new Error("Share endpoint changed device.");
+			return target?.canonicalPath ?? target?.lexicalPath ?? backend.paths.resolve(base, input);
+		});
+		await authorizeRemoteShareEntries(
+			ctx,
+			backend,
+			roots.map((path) => ({ path })),
+			signal,
+		);
+		const inspected = await backend.shareArchive(
+			{
+				operation: "inspect",
+				operationId,
+				paths: roots,
+				maxEntries: SHARE_MAX_ENTRIES,
+				maxExpandedBytes: limit,
+				maxBytes: SHARE_CHUNK_BYTES,
+				timeoutMs: 30_000,
+			},
+			signal,
+		);
+		const entries = inspected.entries;
+		if (
+			inspected.operationId !== operationId ||
+			inspected.truncated ||
+			!entries ||
+			entries.length < 1 ||
+			entries.length > SHARE_MAX_ENTRIES ||
+			inspected.entryCount !== entries.length ||
+			!/^[a-f0-9]{64}$/.test(inspected.manifestHash ?? "")
+		)
+			throw new Error("Remote share inspection returned an incomplete or invalid manifest.");
+		let expanded = 0;
+		for (const entry of entries) {
+			if (
+				!backend.paths.isAbsolute(entry.path) ||
+				!roots.some((root) => backend.paths.contains(root, entry.path)) ||
+				!Number.isSafeInteger(entry.sizeBytes) ||
+				entry.sizeBytes < 0
+			)
+				throw new Error("Remote share manifest escaped its admitted source or size limits.");
+			expanded += entry.sizeBytes;
+			if (!Number.isSafeInteger(expanded) || expanded > limit)
+				throw new Error("Remote share expanded-byte limit exceeded.");
+		}
+		if (expanded !== inspected.expandedBytes)
+			throw new Error("Remote share manifest size mismatch.");
+		await authorizeRemoteShareEntries(ctx, backend, entries, signal);
+		const format =
+			roots.length > 1 ? "zip" : inspected.isDirectory ? "tar.gz" : compress ? "gz" : "raw";
+		const artifact = await backend.shareArchive(
+			{
+				operation: "prepare",
+				operationId,
+				manifestHash: inspected.manifestHash,
+				format,
+				maxArchiveBytes: limit,
+				timeoutMs: ARCHIVE_TIMEOUT_MS,
+			},
+			signal,
+		);
+		const size = artifact.archiveSizeBytes;
+		const filename = artifact.filename;
+		if (
+			artifact.operationId !== operationId ||
+			!artifact.artifactId ||
+			!Number.isSafeInteger(size) ||
+			(size as number) < 0 ||
+			(size as number) > limit ||
+			!/^[a-f0-9]{64}$/.test(artifact.archiveDigest ?? "") ||
+			!filename ||
+			filename === "." ||
+			filename === ".." ||
+			filename.length > 255 ||
+			/[\\/\p{Cc}]/u.test(filename) ||
+			artifact.format !== format
+		)
+			throw new Error("Remote share artifact is invalid or exceeds its byte limit.");
+		const shareId = generateId();
+		shareDir = getShareDir(shareId);
+		const storagePath = resolve(shareDir, filename);
+		const file = await open(storagePath, "wx", 0o600);
+		const hash = createHash("sha256");
+		let offset = 0;
+		try {
+			while (offset < (size as number)) {
+				await ctx.recheckAuthorization?.();
+				signal.throwIfAborted();
+				const result = await backend.shareArchive(
+					{
+						operation: "readChunk",
+						operationId,
+						artifactId: artifact.artifactId,
+						offset,
+						maxChunkBytes: Math.min(SHARE_CHUNK_BYTES, (size as number) - offset),
+						timeoutMs: 10_000,
+					},
+					signal,
+				);
+				if (
+					result.operationId !== operationId ||
+					result.artifactId !== artifact.artifactId ||
+					result.offset !== offset ||
+					typeof result.contentBase64 !== "string" ||
+					result.contentBase64.length > Math.ceil(SHARE_CHUNK_BYTES / 3) * 4 + 4
+				)
+					throw new Error("Remote share chunk identity or byte cap mismatch.");
+				const bytes = Buffer.from(result.contentBase64, "base64");
+				if (
+					bytes.length < 1 ||
+					bytes.length > SHARE_CHUNK_BYTES ||
+					offset + bytes.length > (size as number)
+				)
+					throw new Error("Remote share chunk length mismatch.");
+				let written = 0;
+				while (written < bytes.length) {
+					const next = await file.write(bytes, written, bytes.length - written, offset + written);
+					if (next.bytesWritten < 1) throw new Error("Share storage stopped accepting bytes.");
+					written += next.bytesWritten;
+				}
+				hash.update(bytes);
+				offset += bytes.length;
+				if (!!result.eof !== (offset === size)) throw new Error("Remote share EOF mismatch.");
+			}
+		} finally {
+			await file.close();
+		}
+		if (hash.digest("hex") !== artifact.archiveDigest)
+			throw new Error("Remote share artifact digest mismatch.");
+		await authorizeRemoteShareEntries(ctx, backend, entries, signal);
+		const previewMetadata = await remoteSharePreview(
+			storagePath,
+			filename,
+			size as number,
+			!!preview && format === "raw",
+		);
+		const expiryHours = settings.shares?.defaultExpiryHours ?? 24;
+		const record = createShare({
+			id: shareId,
+			originalName: filename,
+			storagePath,
+			size: size as number,
+			createdBy: ctx.narratorId,
+			expiryHours,
+		});
+		published = true;
+		const downloadUrl = `/api/shares/${record.id}`;
+		return {
+			output: `File shared successfully.\n\nDownload link: ${downloadUrl}\nFilename: ${filename}\nSize: ${formatSize(size as number)}\nExpires: ${record.expiresAt.toISOString()}`,
+			title: `Shared: ${filename}`,
+			metadata: {
+				shareId,
+				downloadUrl,
+				filename,
+				originalName: artifact.originalName ?? filename,
+				size,
+				sizeFormatted: formatSize(size as number),
+				expiresAt: record.expiresAt.toISOString(),
+				expiryHours,
+				isDirectory: !!inspected.isDirectory,
+				compressed: format !== "raw",
+				format,
+				fileCount: roots.length,
+				sourceManifestHash: inspected.manifestHash,
+				sourceEntryCount: entries.length,
+				expandedSourceBytes: expanded,
+				coverage: "inspected_entries",
+				previewRequested: !!preview,
+				deviceId: backend.deviceId,
+				workspaceContextKey: ctx.workspaceContext?.contextKey,
+				...previewMetadata,
+				...(previewMetadata.previewType && previewMetadata.previewType !== "unsupported"
+					? { previewUrl: `/api/shares/${record.id}/preview` }
+					: {}),
+			},
+		};
+	} catch (error) {
+		return {
+			isError: true,
+			output: `Failed to share remote source: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	} finally {
+		if (!published && shareDir) await rm(shareDir, { recursive: true, force: true });
+		try {
+			await backend.shareArchive(
+				{ operation: "release", operationId, timeoutMs: 5_000 },
+				AbortSignal.timeout(5_000),
+			);
+		} catch {
+			/* Offline artifacts remain private and expire under executor ownership. */
+		}
+	}
+}
+
+async function remoteSharePreview(
+	storagePath: string,
+	filename: string,
+	size: number,
+	enabled: boolean,
+): Promise<Record<string, unknown>> {
+	if (!enabled) return { previewType: "unsupported", previewReason: "compressed" };
+	let capability = classifySharePreview(filename);
+	if (
+		capability.kind === "text" &&
+		!isShareText(
+			new Uint8Array(await Bun.file(storagePath).slice(0, 4096).arrayBuffer()),
+			size <= 4096,
+		)
+	)
+		capability = { kind: "unsupported", mime: "application/octet-stream" };
+	if (
+		capability.kind === "unsupported" ||
+		(capability.kind === "html" && size > SHARE_HTML_MAX_BYTES)
+	)
+		return {
+			previewType: "unsupported",
+			previewReason: capability.kind === "html" ? "tooLarge" : "unsupported",
+		};
+	let dimensions: { width: number; height: number } | undefined;
+	if (capability.kind === "image")
+		dimensions = sanitizeParsedDimensions(
+			parseImageDimensions(
+				new Uint8Array(await Bun.file(storagePath).slice(0, MAX_IMAGE_HEADER_SIZE).arrayBuffer()),
+			),
+		);
+	return {
+		preview: true,
+		previewType: capability.kind,
+		previewMime: capability.mime,
+		textFormat: capability.textFormat,
+		...(dimensions ? { width: dimensions.width, height: dimensions.height } : {}),
+	};
+}
 
 /**
  * Recursively compute the total size of a directory in bytes.
  */
-function dirSize(dirPath: string): number {
+async function dirSize(dirPath: string, signal?: AbortSignal): Promise<number> {
 	let total = 0;
-	const entries = new Bun.Glob("**/*").scanSync({ cwd: dirPath, dot: true, onlyFiles: true });
-	for (const entry of entries) {
-		try {
-			total += statSync(resolve(dirPath, entry)).size;
-		} catch {
-			// skip unreadable files
+	let count = 0;
+	const deadline = Date.now() + 30_000;
+	const pending = [{ path: dirPath, depth: 0 }];
+	while (pending.length > 0) {
+		signal?.throwIfAborted();
+		if (Date.now() > deadline) throw new Error("Share directory enumeration timed out");
+		const next = pending.pop();
+		if (!next) break;
+		if (next.depth > 64) throw new Error("Share directory depth limit exceeded");
+		const directory = await opendir(next.path);
+		for await (const entry of directory) {
+			signal?.throwIfAborted();
+			if (++count > SHARE_MAX_ENTRIES || Date.now() > deadline)
+				throw new Error("Share directory entry/time limit exceeded");
+			const path = resolve(next.path, entry.name);
+			const info = await lstat(path);
+			if (info.isSymbolicLink()) throw new Error("Share refuses symbolic links in directories");
+			if (info.isDirectory()) pending.push({ path, depth: next.depth + 1 });
+			else if (info.isFile()) total += info.size;
+			else throw new Error("Share refuses unsupported filesystem objects");
+			if (total > getMaxShareSizeBytes()) throw new Error("Share source byte limit exceeded");
 		}
 	}
 	return total;
@@ -41,9 +361,10 @@ function formatSize(bytes: number): string {
 }
 
 /** Compute the size of a path (file or directory). */
-function pathSize(fullPath: string): number {
-	const stat = statSync(fullPath);
-	return stat.isDirectory() ? dirSize(fullPath) : stat.size;
+async function pathSize(fullPath: string, signal?: AbortSignal): Promise<number> {
+	const stat = await lstat(fullPath);
+	if (stat.isSymbolicLink()) throw new Error("Share refuses symbolic links");
+	return stat.isDirectory() ? dirSize(fullPath, signal) : stat.size;
 }
 
 /**
@@ -149,7 +470,9 @@ async function zipViaCli(
 	basedir: string,
 	relativePaths: string[],
 ): Promise<string | null> {
-	return runArchiver("zip", ["zip", "-r", outputPath, ...relativePaths], { cwd: basedir });
+	return runArchiver("zip", ["zip", "-r", "-y", outputPath, "--", ...relativePaths], {
+		cwd: basedir,
+	});
 }
 
 /**
@@ -186,6 +509,28 @@ async function zipViaArchiver(
 
 export const shareFileTool: ToolDefinition = {
 	name: "ShareFile",
+	executionRouting: {
+		kind: "multi",
+		resolve(input) {
+			const paths =
+				typeof input.path === "string" ? [input.path] : Array.isArray(input.path) ? input.path : [];
+			if (paths.length === 0) return null;
+			if (paths.length > 64 || paths.some((path) => typeof path !== "string" || !path))
+				throw new Error("ShareFile requires 1-64 nonempty source paths.");
+			return {
+				primaryKey: "source:0",
+				endpoints: paths.map((path, index) => ({
+					key: `source:${index}`,
+					operation: "read" as const,
+					path: path as string,
+					deviceId: typeof input.device === "string" ? input.device : undefined,
+				})),
+			};
+		},
+	},
+	getRawJsonSchema(config) {
+		return withDeviceParam(zodToJsonSchema(shareFileTool.parameters), config);
+	},
 	description:
 		"Share a file or directory by generating a temporary download link. " +
 		"Directories are automatically compressed into a .tar.gz archive. " +
@@ -231,14 +576,32 @@ export const shareFileTool: ToolDefinition = {
 		};
 
 		const isMulti = Array.isArray(inputPath);
+		const paths = isMulti ? inputPath : [inputPath];
+		if (paths.length === 0) return { output: "No paths provided.", isError: true };
+		if (paths.length > 64 || paths.some((path) => typeof path !== "string" || !path))
+			return { output: "ShareFile requires 1-64 nonempty source paths.", isError: true };
+		try {
+			for (const path of paths) assertSpecPath(path);
+		} catch (error) {
+			return { output: error instanceof Error ? error.message : String(error), isError: true };
+		}
+		const backend = getToolBackend(ctx, typeof args.device === "string" ? args.device : undefined);
+		if (backend.kind === "remote") return handleRemoteShare(paths, compress, preview, ctx, backend);
+		const endpoints = ctx.executionPlan?.endpoints;
+		const resolved = paths.map(
+			(path, index) =>
+				endpoints?.[index]?.target.canonicalPath ??
+				endpoints?.[index]?.target.lexicalPath ??
+				backend.paths.resolve(toolExecutionCwd(backend, ctx), path),
+		);
 
 		// ── Multi-file mode: zip packaging ──────────────────────────────────
 		if (isMulti) {
-			return handleMultiFile(inputPath, ctx, preview);
+			return handleMultiFile(resolved, ctx, preview);
 		}
 
 		// ── Single path mode (original behaviour) ──────────────────────────
-		return handleSinglePath(inputPath, compress, preview, ctx);
+		return handleSinglePath(resolved[0], compress, preview, ctx);
 	},
 };
 
@@ -246,7 +609,7 @@ export const shareFileTool: ToolDefinition = {
 
 async function handleMultiFile(
 	inputPaths: string[],
-	ctx: { cwd: string; narratorId: string },
+	ctx: ToolContext,
 	preview?: boolean,
 ): Promise<ToolResult> {
 	if (inputPaths.length === 0) {
@@ -267,7 +630,7 @@ async function handleMultiFile(
 	const maxSize = getMaxShareSizeBytes();
 	let totalSize = 0;
 	for (const full of resolved) {
-		totalSize += pathSize(full);
+		totalSize += await pathSize(full, ctx.signal);
 	}
 	if (totalSize > maxSize) {
 		return {
@@ -357,7 +720,7 @@ async function handleSinglePath(
 	inputPath: string,
 	compress: boolean | undefined,
 	preview: boolean | undefined,
-	ctx: { cwd: string; narratorId: string },
+	ctx: ToolContext,
 ): Promise<ToolResult> {
 	const fullPath = resolve(ctx.cwd, inputPath);
 
@@ -369,7 +732,7 @@ async function handleSinglePath(
 	const isDir = stat.isDirectory();
 	const maxSize = getMaxShareSizeBytes();
 
-	const sourceSize = isDir ? dirSize(fullPath) : stat.size;
+	const sourceSize = isDir ? await dirSize(fullPath, ctx.signal) : stat.size;
 	if (sourceSize > maxSize) {
 		return {
 			output: `Source size (${formatSize(sourceSize)}) exceeds the maximum allowed share size (${formatSize(maxSize)}).`,
@@ -397,6 +760,7 @@ async function handleSinglePath(
 				storagePath,
 				"-C",
 				resolve(fullPath, ".."),
+				"--",
 				originalName,
 			]);
 			if (failure) return { output: `Failed to create archive: ${failure}`, isError: true };

@@ -30,7 +30,7 @@ import {
 	terminalViewState,
 	users,
 } from "../db/schema";
-import { localPathSemantics } from "../lib/agent/execution/path-semantics";
+import { localPathSemantics, targetPathSemantics } from "../lib/agent/execution/path-semantics";
 import {
 	KNOWLEDGE_KIND_PRELOAD_TOOLS,
 	KNOWLEDGE_KIND_PRELOAD_TOOLS_ADMIN,
@@ -135,7 +135,6 @@ import {
 import { materializeChildrenOf } from "./narrator-refs-backfill";
 import { isSignedReviewBoundaryRow, signReviewBoundaryRuleId } from "./narrator-review-boundary";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
-import { resolveSkillContextForNarrator } from "./skill-service";
 import { specVfsService } from "./spec-vfs-service";
 import { removeTabFromAllUsers } from "./user-preferences-service";
 import {
@@ -320,6 +319,7 @@ export interface CreateNarratorInput {
 	systemPrompt?: string;
 	permissionMode?: string;
 	cwd?: string;
+	workspaceTarget?: { deviceId: string; cwd: string };
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 	/** @deprecated Legacy boolean; coerced into `fastModeOverride` ("on"/"off"). */
 	fastMode?: boolean;
@@ -389,6 +389,7 @@ interface CreateSubagentInput {
 	systemPrompt?: string;
 	inheritedTraits?: string[];
 	defaultDeviceId?: string | null;
+	workspaceContext?: import("@shared/workspace-context").WorkspaceContext;
 }
 
 function formatAvailableOptionalToolIds(): string {
@@ -419,7 +420,7 @@ const ADMIN_ONLY_LOAD_TOOLS = new Set([
  */
 async function resolveLayeredTraitsFor(
 	narrator: { traits: unknown; chapterId?: string | null; contextProjectId?: string | null },
-	userId: string | undefined,
+	userId: string | null | undefined,
 ): Promise<string[]> {
 	try {
 		const { resolveEffectiveTraits, resolveNarratorProjectId } = await import(
@@ -634,20 +635,29 @@ export async function handleUnloadToolCommand(
 /**
  * Handle `/skill <name>` slash command.
  */
+export interface SkillCommandOptions {
+	userId?: string | null;
+	signal?: AbortSignal;
+}
+
 export async function handleLoadSkillCommand(
 	narratorId: string,
 	cmdResult: LoadSkillResult,
+	options: SkillCommandOptions = {},
 ): Promise<
 	{ found: true; skillName: string; content: string } | { found: false; skillName: string }
 > {
-	const { dirname, join } = await import("node:path");
+	options.signal?.throwIfAborted();
 	const {
 		loadSkillByNameForContext,
 		loadSkillSummariesForContext,
 		resolveSkillContextForNarrator,
 	} = await import("./skill-service");
 
-	const skillContext = await resolveSkillContextForNarrator(narratorId);
+	const skillContext = await resolveSkillContextForNarrator(narratorId, {
+		userId: options.userId ?? null,
+		signal: options.signal,
+	});
 	const summaries = await loadSkillSummariesForContext(skillContext);
 	const found = await loadSkillByNameForContext(skillContext, cmdResult.loadSkill);
 
@@ -662,10 +672,11 @@ export async function handleLoadSkillCommand(
 	}
 
 	// Respect the blocked-skills trait: a blocked skill cannot be manually injected.
-	// Resolved across layers so a project-level block also applies. No acting user
-	// is threaded into this command, so only the project layer contributes.
+	// Resolve user/project/narrator layers for the real command actor, never its owner.
 	const narratorForBlock = await narratorService.getById(narratorId);
-	const blocked = getBlockedSkills(await resolveLayeredTraitsFor(narratorForBlock, undefined));
+	const blocked = getBlockedSkills(
+		await resolveLayeredTraitsFor(narratorForBlock, options.userId ?? null),
+	);
 	if (isSkillBlocked(blocked, found.name)) {
 		const infoText = blocked.all
 			? `⛔ Skills are disabled for this narrator. Use "/load all_skills" to re-enable them.`
@@ -674,7 +685,10 @@ export async function handleLoadSkillCommand(
 		return { found: false, skillName: found.name };
 	}
 
-	const skillDir = dirname(found.location);
+	options.signal?.throwIfAborted();
+	const paths = found.pathFlavor ? targetPathSemantics(found.pathFlavor) : localPathSemantics;
+	const skillDir = paths.dirname(found.location);
+	const deviceId = found.deviceId ?? "local";
 	const lines = [`<skill_content name="${escapeXmlAttr(found.name)}">`];
 	lines.push(`# Skill: ${found.name}`);
 	lines.push("");
@@ -683,11 +697,16 @@ export async function handleLoadSkillCommand(
 		lines.push("");
 	}
 	lines.push(`Base directory for this skill: ${skillDir}`);
+	lines.push(
+		`Resource device: ${deviceId} (${found.source === "global" ? "NarraFork server global configuration" : "workspace"}). Auxiliary paths belong to this explicit device, not the narrator's current default. No files were copied or executed.`,
+	);
 	if (found.files.length > 0) {
 		lines.push("");
 		lines.push("<skill_files>");
 		for (const f of found.files) {
-			lines.push(`<file>${join(skillDir, f)}</file>`);
+			lines.push(
+				`<file device="${escapeXmlAttr(deviceId)}">${escapeXmlAttr(paths.resolve(skillDir, f))}</file>`,
+			);
 		}
 		lines.push("</skill_files>");
 	}
@@ -706,6 +725,7 @@ export async function handleLoadSkillCommand(
 async function mutateBlockedSkillsTrait(
 	narratorId: string,
 	mutate: (current: BlockedSkillsTrait) => BlockedSkillsTrait,
+	actingUserId?: string | null,
 ): Promise<BlockedSkillsTrait> {
 	const { updateActiveBlockedSkills } = await import("./narrator-session");
 	const { traits, next } = await narratorTraitsLock.acquire(narratorId, async () => {
@@ -725,7 +745,7 @@ async function mutateBlockedSkillsTrait(
 	// appear to lift a block that the project/user layer enforces.
 	const narratorRow = await narratorService.getById(narratorId);
 	const effectiveBlocked = getBlockedSkills(
-		await resolveLayeredTraitsFor({ ...narratorRow, traits }, undefined),
+		await resolveLayeredTraitsFor({ ...narratorRow, traits }, actingUserId),
 	);
 	updateActiveBlockedSkills(narratorId, {
 		all: effectiveBlocked.all,
@@ -753,6 +773,7 @@ export async function handleBlockSkillCommand(
 	narratorId: string,
 	cmdResult: BlockSkillResult,
 	locale: Locale = "en",
+	options: SkillCommandOptions = {},
 ): Promise<{ skillName: string; blocked: boolean }> {
 	const { resolveSkillContextForNarrator, loadSkillSummariesForContext } = await import(
 		"./skill-service"
@@ -760,20 +781,28 @@ export async function handleBlockSkillCommand(
 	// Normalize the requested name to the canonical skill name when it exists.
 	let skillName = cmdResult.blockSkill;
 	try {
-		const context = await resolveSkillContextForNarrator(narratorId);
+		const context = await resolveSkillContextForNarrator(narratorId, {
+			userId: options.userId ?? null,
+			signal: options.signal,
+		});
 		const summaries = await loadSkillSummariesForContext(context);
 		const match = summaries.skills.find(
 			(s) => s.name === skillName || s.name.toLowerCase() === skillName.toLowerCase(),
 		);
 		if (match) skillName = match.name;
 	} catch {
-		// Non-fatal — fall back to the raw name.
+		options.signal?.throwIfAborted();
+		// Non-fatal — fall back to the raw name without probing another filesystem.
 	}
 
-	const next = await mutateBlockedSkillsTrait(narratorId, (current) => ({
-		...current,
-		names: current.names.includes(skillName) ? current.names : [...current.names, skillName],
-	}));
+	const next = await mutateBlockedSkillsTrait(
+		narratorId,
+		(current) => ({
+			...current,
+			names: current.names.includes(skillName) ? current.names : [...current.names, skillName],
+		}),
+		options.userId ?? null,
+	);
 
 	const infoText = next.all
 		? locale === "zh-CN"
@@ -1384,25 +1413,37 @@ function copyForkAccessAndRules(
 }
 
 async function resolveForkExecutionContext(parent: typeof narrators.$inferSelect) {
-	const context = await resolveSkillContextForNarrator(parent.id);
+	// Fork preparation is metadata-only: lazy workspace/skill hydration must not write
+	// a parent row before the new child's lifetime admission has accepted the claim.
 	const committedContext =
-		parent.workspaceContext?.revision === parent.workspaceRevision &&
-		parent.workspaceContext.deviceId === (parent.defaultDeviceId ?? "local")
-			? parent.workspaceContext
+		parent.workspaceContext?.revision === parent.workspaceRevision ? parent.workspaceContext : null;
+	const deviceId = committedContext?.deviceId ?? parent.defaultDeviceId ?? "local";
+	const remote = deviceId !== "local";
+	const contextProjectId = await resolveNarratorProjectId(parent);
+	let fallbackCwd: string | null = null;
+	if (!remote && !committedContext?.cwd && !parent.cwd) {
+		const chapter = parent.chapterId
+			? await db.query.chapters.findFirst({
+					where: eq(chapters.id, parent.chapterId),
+					columns: { worktreePath: true },
+				})
 			: null;
-	// A committed workspace is authoritative. Never reinterpret a remote session's
-	// absent cwd as the host project's path; an unresolved remote workspace stays blocked.
-	const remote = parent.defaultDeviceId && parent.defaultDeviceId !== "local";
-	const cwd = committedContext?.cwd || parent.cwd || (remote ? null : context.cwd);
-	if (remote && !cwd) {
+		const project = contextProjectId
+			? await db.query.projects.findFirst({
+					where: eq(projects.id, contextProjectId),
+					columns: { gitPath: true },
+				})
+			: null;
+		fallbackCwd = chapter?.worktreePath ?? project?.gitPath ?? null;
+	}
+	const cwd = committedContext?.cwd || parent.cwd || fallbackCwd;
+	if (remote && !cwd)
 		throw new ValidationError(
 			"Remote workspace is unresolved; select a device directory before forking",
 		);
-	}
-	const contextProjectId = await resolveNarratorProjectId(parent);
 	return {
 		cwd,
-		defaultDeviceId: parent.defaultDeviceId,
+		defaultDeviceId: deviceId === "local" ? null : deviceId,
 		workspaceRevision: 0,
 		workspaceContext: committedContext
 			? { ...committedContext, revision: 0, contextProjectId: contextProjectId ?? undefined }
@@ -1527,6 +1568,20 @@ export async function prepareNarratorCreation(
 		}
 	}
 
+	if (input.workspaceTarget && input.cwd)
+		throw new ValidationError("Use workspaceTarget or legacy cwd, not both");
+	if (input.workspaceTarget && chapterId && input.workspaceTarget.deviceId !== "local") {
+		throw new ValidationError("Remote workspaces require a standalone narrator");
+	}
+	const initialWorkspace = input.workspaceTarget
+		? await (await import("./workspace-context-service")).prepareWorkspaceContext(
+				input.workspaceTarget,
+				0,
+				input.contextProjectId ?? undefined,
+				{ userId: input.ownerUserId },
+			)
+		: undefined;
+
 	const prepared: PreparedNarratorCreation = {
 		handle: displayHandle,
 		handleFold: foldedHandle,
@@ -1545,6 +1600,14 @@ export async function prepareNarratorCreation(
 			permissionMode: resolvedPermMode,
 			previousPermissionMode,
 			planFileId,
+			planFileBinding:
+				initialWorkspace && planFileId
+					? {
+							workspaceContext: initialWorkspace,
+							planFileId,
+							planFilePath: `.narrafork/plans/plan-${planFileId}.md`,
+						}
+					: null,
 			planMode: startInPlanMode,
 			reasoningEffort: resolvedReasoningEffort,
 			fastModeOverride: resolvedFastModeOverride,
@@ -1559,10 +1622,22 @@ export async function prepareNarratorCreation(
 			autoContinuationOverride: input.autoContinuationOverride ?? "inherit",
 			behaviorFenceIntervalOverride: input.behaviorFenceIntervalOverride ?? null,
 			behaviorFenceAttachOverride: input.behaviorFenceAttachOverride ?? "inherit",
-			cwd: input.cwd ?? null,
+			cwd:
+				initialWorkspace?.deviceId === "local" &&
+				!input.workspaceTarget &&
+				input.cwd &&
+				!localPathSemantics.isAbsolute(input.cwd)
+					? input.cwd
+					: (initialWorkspace?.cwd ?? input.cwd ?? null),
+			workspaceContext: initialWorkspace ?? null,
+			workspaceRevision: initialWorkspace?.revision ?? 0,
 			contextProjectId: input.contextProjectId ?? null,
 			oauthPolicySnapshotJson: input.oauthPolicySnapshotJson ?? null,
-			defaultDeviceId: input.defaultDeviceId ?? null,
+			defaultDeviceId: initialWorkspace
+				? initialWorkspace.deviceId === "local"
+					? null
+					: initialWorkspace.deviceId
+				: (input.defaultDeviceId ?? null),
 			ownerUserId: input.ownerUserId ?? null,
 			...resolveNarratorAudiences(
 				input.visibility,
@@ -1616,41 +1691,38 @@ export async function narratorCreationWorkspaceTarget(
 		: undefined;
 	const scopeProjectId =
 		chapter?.projectId ?? row.contextProjectId ?? row.workspaceContext?.contextProjectId ?? null;
-	const project = scopeProjectId
-		? db
-				.select({ path: projects.gitPath })
-				.from(projects)
-				.where(eq(projects.id, scopeProjectId))
-				.limit(1)
-				.get()
-		: undefined;
-	const cwd = resolveNarratorSessionCwd(row.cwd, chapter?.path, project?.path, getHome());
-	const deviceId = !localPathSemantics.isAbsolute(cwd)
-		? (row.defaultDeviceId ?? row.workspaceContext?.deviceId ?? "local")
-		: "local";
+	const context = row.workspaceContext;
+	const deviceId = context?.deviceId ?? row.defaultDeviceId ?? "local";
+	let cwd: string | undefined;
+	if (context) cwd = context.cwd;
+	else if (deviceId !== "local") {
+		// An unresolved legacy remote narrator has no host filesystem claim.
+		cwd = row.cwd ?? undefined;
+	} else {
+		const project = scopeProjectId
+			? db
+					.select({ path: projects.gitPath })
+					.from(projects)
+					.where(eq(projects.id, scopeProjectId))
+					.limit(1)
+					.get()
+			: undefined;
+		cwd = resolveNarratorSessionCwd(row.cwd, chapter?.path, project?.path, getHome());
+	}
 	const target = await canonicalWorkspaceAdmissionTarget({
 		deviceId,
-		// Match the trusted local backend's lexical base for old relative cwd rows.
-		path: deviceId === "local" ? localPathSemantics.resolve(process.cwd(), cwd) : cwd,
+		path: deviceId === "local" && cwd ? localPathSemantics.resolve(process.cwd(), cwd) : cwd,
 		scopeProjectId,
-		repositoryKey: row.workspaceContext?.git?.repositoryKey,
+		repositoryKey: context?.git?.repositoryKey,
 	});
-	// Store canonical explicit claims; cwd and committed context may be distinct devices.
-	if (row.cwd && target.canonicalCwd && localPathSemantics.isAbsolute(row.cwd))
+	if (
+		target.canonicalCwd &&
+		row.cwd &&
+		(context || deviceId !== "local" || localPathSemantics.isAbsolute(row.cwd))
+	)
 		row.cwd = target.canonicalCwd;
-	const targets = [target];
-	if (row.workspaceContext) {
-		const context = row.workspaceContext;
-		const contextTarget = await canonicalWorkspaceAdmissionTarget({
-			deviceId: context.deviceId,
-			path: context.cwd,
-			scopeProjectId: context.contextProjectId ?? scopeProjectId,
-			repositoryKey: context.git?.repositoryKey,
-		});
-		row.workspaceContext = { ...context, cwd: contextTarget.canonicalCwd ?? context.cwd };
-		targets.push(contextTarget);
-	}
-	return targets;
+	if (context) row.workspaceContext = { ...context, cwd: target.canonicalCwd ?? context.cwd };
+	return [target];
 }
 /** Insert a prepared narrator using the caller's synchronous SQLite transaction. */
 export function createPreparedNarratorInTransaction(
@@ -1796,8 +1868,13 @@ export const narratorService = {
 			const creationWorkspace: CreationWorkspace = {
 				chapterId: subChapterId,
 				contextProjectId: parent.contextProjectId,
-				cwd: input.cwd,
-				defaultDeviceId: input.defaultDeviceId ?? parent.defaultDeviceId ?? null,
+				cwd: input.workspaceContext?.cwd ?? input.cwd,
+				workspaceContext: input.workspaceContext ?? null,
+				defaultDeviceId: input.workspaceContext
+					? input.workspaceContext.deviceId === "local"
+						? null
+						: input.workspaceContext.deviceId
+					: (input.defaultDeviceId ?? parent.defaultDeviceId ?? null),
 			};
 			const creationTarget = await narratorCreationWorkspaceTarget(creationWorkspace);
 			return withWorkspaceAdmission(creationTarget, async () => {
@@ -1831,7 +1908,9 @@ export const narratorService = {
 						subagentOriginKind:
 							input.originToolCallId != null ? "tool" : (input.subagentOriginKind ?? null),
 						cwd: creationWorkspace.cwd,
-						defaultDeviceId: input.defaultDeviceId ?? parent.defaultDeviceId ?? null,
+						workspaceContext: creationWorkspace.workspaceContext ?? null,
+						workspaceRevision: creationWorkspace.workspaceContext?.revision ?? 0,
+						defaultDeviceId: creationWorkspace.defaultDeviceId,
 						// A subagent is part of its parent's work, so its access is DELEGATED to the
 						// root rather than copied: `acl_root_narrator_id` is the only thing consulted
 						// when deciding who may read or drive it. That is what makes a later sharing

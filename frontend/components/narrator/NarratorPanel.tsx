@@ -2536,6 +2536,7 @@ function NarratorPanelBody({
 
 	const toolbarController = useHeaderToolbar({
 		narratorId,
+		workspaceContext,
 		headerHostCapabilities,
 		dock,
 		gitWorkspaceAvailable:
@@ -3583,7 +3584,14 @@ function NarratorPanelBody({
 								onForwardToNarrator={forwardTextToNarrator}
 								// Off-dock the tree's files open in this panel's internal
 								// viewer Drawer (defined whenever !dock && !isWorkspacePreview).
-								onOpenFile={handleOpenFilePanel}
+								onOpenFile={
+									handleOpenFilePanel
+										? (path, _name, target) => {
+												if (target) void handleOpenReferencedFile(target);
+												else handleOpenFilePanel(path);
+											}
+										: undefined
+								}
 							/>
 							<BackgroundTasksDrawerHost
 								narratorId={narratorId}

@@ -12,6 +12,7 @@ import {
 	type GitCommitPatch,
 } from "../../shared/git-commit-preview";
 import type { GitWorkspaceSummary } from "../../shared/git-workspace";
+import type { WorkspaceContext } from "../../shared/workspace-context";
 import { type ApiError, api } from "../lib/api";
 import {
 	type GitLogEntry,
@@ -446,14 +447,50 @@ export function invalidateGitStatusPushQueries(
 	qc: ReturnType<typeof useQueryClient>,
 	narratorId: string,
 	chapterId: string | null,
+	scope?: {
+		deviceId?: string;
+		workspaceKey?: string | null;
+		repositoryKey?: string | null;
+		contextKey?: string;
+		workspaceRevision?: number;
+	},
 ): void {
 	const keys = new Set<string>();
-	if (chapterId) keys.add(chapterId);
+	const scoped = !!(
+		scope?.deviceId ||
+		scope?.workspaceKey ||
+		scope?.repositoryKey ||
+		scope?.contextKey ||
+		scope?.workspaceRevision !== undefined
+	);
+	const current = qc.getQueryData<WorkspaceContext>(["workspaceContext", narratorId]);
+	// Old revision queries can remain cached after a switch, including the SAME Git root.
+	// Their existence is never evidence that an old pass still owns the current badge.
+	if (
+		scoped &&
+		current &&
+		((scope?.deviceId !== undefined && scope.deviceId !== current.deviceId) ||
+			(scope?.contextKey !== undefined && scope.contextKey !== current.contextKey) ||
+			(scope?.workspaceRevision !== undefined && scope.workspaceRevision !== current.revision))
+	)
+		return;
+	if (chapterId && !scoped) keys.add(chapterId);
 	for (const [, workspace] of qc.getQueriesData<GitWorkspace>({
 		queryKey: ["gitWorkspace", narratorId],
 	})) {
-		if (workspace?.workspaceKey) keys.add(workspace.workspaceKey);
-		if (workspace?.chapterId) keys.add(workspace.chapterId);
+		if (!workspace) continue;
+		if (
+			scoped &&
+			((scope?.deviceId !== undefined && scope.deviceId !== workspace.deviceId) ||
+				(scope?.workspaceKey !== undefined && scope.workspaceKey !== workspace.workspaceKey) ||
+				(scope?.repositoryKey !== undefined && scope.repositoryKey !== workspace.repositoryKey) ||
+				(scope?.contextKey !== undefined && scope.contextKey !== workspace.contextKey) ||
+				(scope?.workspaceRevision !== undefined &&
+					scope.workspaceRevision !== workspace.workspaceRevision))
+		)
+			continue;
+		if (workspace.workspaceKey) keys.add(workspace.workspaceKey);
+		if (workspace.chapterId) keys.add(workspace.chapterId);
 	}
 	for (const key of keys) {
 		for (const prefix of GIT_LIVE_FACT_QUERIES)

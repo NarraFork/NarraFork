@@ -43,6 +43,7 @@ const {
 	workspaceContextKey,
 	useUpdateExecutionDevice,
 	workspaceFileTarget,
+	useSwitchWorkspaceContext,
 } = await import("./useWorkspaceContext");
 const { FileTreePanel } = await import("../components/narrator/file-tree/FileTreePanel");
 const old: WorkspaceContext = {
@@ -69,7 +70,7 @@ const remote: WorkspaceContext = {
 	pathFlavor: "windows",
 	contextKey: "remote",
 	git: undefined,
-	capabilities: { switchDirectory: false, reason: "remote directory unsupported" },
+	capabilities: { switchDirectory: true, browse: { available: true } },
 };
 function DeviceProbe() {
 	const { data } = useWorkspaceContext("n");
@@ -209,8 +210,9 @@ test("HTTP UI Local→remote refreshes references and tree from the same authori
 	expect(container.querySelector("[data-references]")?.textContent).toBe(
 		"remote:D:\\remote\\project",
 	);
-	expect(container.querySelector("[data-tree-root]")).toBeNull();
-	expect(container.textContent).toContain("fileTree.remoteUnsupported");
+	expect(container.querySelector("[data-tree-root]")?.getAttribute("data-tree-root")).toBe(
+		remote.cwd,
+	);
 });
 test("model WS SwitchDevice updates references/tree and late local response cannot resurrect old target", async () => {
 	const { spyOn } = await import("bun:test");
@@ -228,7 +230,9 @@ test("model WS SwitchDevice updates references/tree and late local response cann
 	expect(container.querySelector("[data-references]")?.textContent).toBe(
 		"remote:D:\\remote\\project",
 	);
-	expect(container.querySelector("[data-tree-root]")).toBeNull();
+	expect(container.querySelector("[data-tree-root]")?.getAttribute("data-tree-root")).toBe(
+		remote.cwd,
+	);
 	await act(async () => {
 		resolve?.(old);
 		await flush();
@@ -269,7 +273,9 @@ test("legacy HTTP response must get authoritative context, never infer remote cw
 	expect(container.querySelector("[data-references]")?.textContent).toBe(
 		"remote:D:\\remote\\project",
 	);
-	expect(container.querySelector("[data-tree-root]")).toBeNull();
+	expect(container.querySelector("[data-tree-root]")?.getAttribute("data-tree-root")).toBe(
+		remote.cwd,
+	);
 });
 test("acknowledged device patch with failed context read keeps references/tree disabled", async () => {
 	const { spyOn } = await import("bun:test");
@@ -287,6 +293,55 @@ test("acknowledged device patch with failed context read keeps references/tree d
 	expect(container.querySelector("[data-tree-root]")).toBeNull();
 	expect(container.textContent).toContain("context unavailable");
 });
+test("lost workspace switch response recovers only the original durable request receipt", async () => {
+	const { spyOn } = await import("bun:test");
+	spyOn(api, "getWorkspaceContext").mockResolvedValue(old);
+	const submit = spyOn(api, "switchWorkspaceContext").mockRejectedValue(
+		new Error("response dropped"),
+	);
+	const receipt = spyOn(api, "getWorkspaceSwitchRequest").mockResolvedValue({
+		requestId: "original-request",
+		installState: "installed",
+		result: { changed: true, previous: old, current: next },
+	});
+	function SwitchProbe() {
+		const context = useWorkspaceContext("n");
+		const mutation = useSwitchWorkspaceContext("n");
+		return (
+			<>
+				<output>{context.data?.cwd ?? "pending"}</output>
+				<button
+					type="button"
+					onClick={() =>
+						mutation.mutate({
+							requestId: "original-request",
+							expectedRevision: 2,
+							target: { deviceId: "local", cwd: "/new" },
+						})
+					}
+				>
+					switch
+				</button>
+			</>
+		);
+	}
+	client.setQueryData(workspaceContextKey("n"), old);
+	await act(async () =>
+		root.render(
+			<QueryClientProvider client={client}>
+				<SwitchProbe />
+			</QueryClientProvider>,
+		),
+	);
+	await act(async () => {
+		container.querySelector("button")?.click();
+		await flush();
+	});
+	expect(submit).toHaveBeenCalledTimes(1);
+	expect(receipt).toHaveBeenCalledWith("n", "original-request");
+	expect(container.querySelector("output")?.textContent).toBe("/new");
+});
+
 test("multiple context consumers share a single WS listener", async () => {
 	(await import("bun:test")).spyOn(api, "getWorkspaceContext").mockResolvedValue(old);
 	await act(async () => {

@@ -637,27 +637,87 @@ export const reviewService = {
 		if (!sourceNarrator) throw new ValidationError("Source chapter has no narrator");
 
 		const now = new Date().toISOString();
-
 		const sourceChapterId = chapter.reviewSourceChapterId;
+		const sourceChapter = await db.query.chapters.findFirst({
+			where: and(eq(chapters.id, sourceChapterId), eq(chapters.projectId, chapter.projectId)),
+			columns: { worktreePath: true },
+		});
+		if (!sourceChapter) throw new ValidationError("Review source chapter changed");
+		// Chapter conversion is a local resource operation. Never reinterpret a
+		// source narrator's selected remote cwd as a host checkout fallback.
+		const sourceCwd =
+			sourceChapter.worktreePath ??
+			(sourceNarrator.workspaceContext?.deviceId === "local"
+				? sourceNarrator.workspaceContext.cwd
+				: !sourceNarrator.workspaceContext &&
+						(!sourceNarrator.defaultDeviceId || sourceNarrator.defaultDeviceId === "local")
+					? sourceNarrator.cwd
+					: null);
+		if (!sourceCwd)
+			throw new ValidationError("Review conversion requires a local source workspace");
+		const { prepareLocalWorkspaceContext, installWorkspaceContext } = await import(
+			"./workspace-context-service"
+		);
+		const { workspaceConflict } = await import("./workspace-context-transition");
+		const { activeNarrators, isNarratorRuntimeBusy, withNarratorMutationAdmission } = await import(
+			"./narrator-session-state"
+		);
+		const { withWorkspaceAdmission } = await import("./worktree-lifecycle-guard");
 		return withLegacyRetirement([reviewChapterId], "review convert", async () => {
-			// Re-parent the review narrator as a subagent of the source narrator
-			// Also update cwd to source chapter's worktree since the review worktree will be removed
-			const sourceChapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, sourceChapterId),
-				columns: { worktreePath: true },
-			});
-			await db
-				.update(narrators)
-				.set({
-					type: "subagent",
-					variant: "subagent:review",
-					subagentType: "review",
-					parentNarratorId: sourceNarrator.id,
-					chapterId: chapter.reviewSourceChapterId,
-					cwd: sourceChapter?.worktreePath ?? sourceNarrator.cwd,
-					updatedAt: now,
-				})
-				.where(eq(narrators.id, reviewNarrator.id));
+			// Refuse retirement first, including when the source directory is gone.
+			const current = await prepareLocalWorkspaceContext(
+				sourceCwd,
+				reviewNarrator.workspaceRevision + 1,
+				chapter.projectId,
+			);
+			await withWorkspaceAdmission({ deviceId: "local", path: current.cwd }, () =>
+				withNarratorMutationAdmission(reviewNarrator.id, async () => {
+					if (isNarratorRuntimeBusy(reviewNarrator.id))
+						throw workspaceConflict("Review narrator is busy", "WORKSPACE_CONTEXT_BUSY");
+					const installed = await db
+						.update(narrators)
+						.set({
+							type: "subagent",
+							variant: "subagent:review",
+							subagentType: "review",
+							parentNarratorId: sourceNarrator.id,
+							chapterId: sourceChapterId,
+							cwd: current.cwd,
+							defaultDeviceId: null,
+							contextProjectId: chapter.projectId,
+							workspaceRevision: current.revision,
+							workspaceContext: current,
+							updatedAt: now,
+						})
+						.where(
+							and(
+								eq(narrators.id, reviewNarrator.id),
+								eq(narrators.chapterId, reviewChapterId),
+								eq(narrators.variant, "primary"),
+								eq(narrators.workspaceRevision, reviewNarrator.workspaceRevision),
+							),
+						)
+						.returning({ id: narrators.id });
+					if (installed.length !== 1)
+						throw workspaceConflict("Review workspace changed during conversion");
+					try {
+						await installWorkspaceContext(reviewNarrator.id, current);
+					} catch {
+						// The DB CAS won, so keep its source-qualified context and pause the
+						// runtime. Retain old resources; never clean up after half-installation.
+						const active = activeNarrators.get(reviewNarrator.id);
+						if (active) {
+							active._workspaceInstallFailed = true;
+							active._workspacePassInvalidated = true;
+							active.abortController.abort("Review workspace installation failed");
+						}
+						throw workspaceConflict(
+							"Review workspace committed; runtime installation failed",
+							"WORKSPACE_CONTEXT_INSTALL_FAILED",
+						);
+					}
+				}),
+			);
 
 			// Use updateStatus to ensure event bus + WS broadcast
 			await narratorService.updateStatus(reviewNarrator.id, "idle", {
@@ -721,7 +781,7 @@ export const reviewService = {
 				sourceNarratorId: sourceNarrator.id,
 			});
 
-			return reviewNarrator;
+			return db.query.narrators.findFirst({ where: eq(narrators.id, reviewNarrator.id) });
 		});
 	},
 

@@ -6,6 +6,7 @@ import {
 	buildMobileToolbarActions,
 } from "../interaction/mobile-toolbar-actions";
 import { PathRulesPopover } from "../interaction/PathRulesPopover";
+import { ExecutionDeviceMenu } from "../model/ExecutionDeviceMenu";
 import { resolveNarratorStatusToolbarOverflow } from "./NarratorStatusToolbar";
 import {
 	buildBottomToolbarActions,
@@ -105,6 +106,20 @@ describe("shared bottom toolbar actions", () => {
 			})),
 		});
 		expect(hidden).toEqual(["terminal", "path-rules"]);
+	});
+
+	test("production inline and bottom device callers bind narrator identity without legacy direct switching", () => {
+		const props = makeProps();
+		const header = NarratorToolbarItem({ ...props, def: def("device") });
+		expect(header.type).toBe(ExecutionDeviceMenu);
+		expect(header.props.narratorId).toBe("narrator-a");
+		expect(header.props.onSelect).toBeUndefined();
+		const action = buildBottomToolbarActions({ ...props, defs: [def("device")] })[0];
+		const bottom = action.render("inline") as ReactElement<NarratorToolbarItemProps>;
+		const menu = NarratorToolbarItem(bottom.props);
+		expect(menu.type).toBe(ExecutionDeviceMenu);
+		expect(menu.props.narratorId).toBe("narrator-a");
+		expect(props.inlineControls.updateExecutionDeviceMutation.mutate).not.toHaveBeenCalled();
 	});
 
 	test("self-contained menu entries reuse the controller options", () => {

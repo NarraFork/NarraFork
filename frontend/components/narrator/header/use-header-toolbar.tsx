@@ -1,8 +1,10 @@
+import type { WorkspaceContext } from "@shared/workspace-context";
 import {
 	type Dispatch,
 	type ReactNode,
 	type SetStateAction,
 	useCallback,
+	useEffect,
 	useMemo,
 	useState,
 } from "react";
@@ -18,6 +20,8 @@ import { NarratorLodOptions } from "../lod/NarratorLodMenu";
 import type { RenderLod } from "../lod/RenderLodCtx";
 import type { MobileToolPanelKind } from "../MobileToolPanelHost";
 import { ExecutionDeviceOptions } from "../model/ExecutionDeviceMenu";
+import { WorkspaceTargetPickerModal } from "../model/WorkspaceTargetPickerModal";
+import { WorkspaceSnapshotRestoreModal } from "../workspace/WorkspaceSnapshotRestoreModal";
 import type {
 	NarratorToolbarHost,
 	NarratorToolbarId,
@@ -31,6 +35,8 @@ type MutationLike = any;
 
 export interface UseHeaderToolbarOptions {
 	narratorId: string;
+	/** Authority for the current directory; legacy device query is presentation only. */
+	workspaceContext?: WorkspaceContext;
 	headerHostCapabilities: readonly NarratorToolbarHost[];
 	// Per-entry availability inputs.
 	dock: NarratorDockContextValue | null;
@@ -96,6 +102,7 @@ export interface UseHeaderToolbarResult {
 export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToolbarResult {
 	const {
 		narratorId,
+		workspaceContext,
 		headerHostCapabilities,
 		dock,
 		gitWorkspaceAvailable,
@@ -116,7 +123,6 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 		toggleDetails,
 		toggleTerminalTool,
 		toggleSpecTool,
-		updateExecutionDeviceMutation,
 		renderLod,
 		renderLodIsDefault,
 		handleSelectLod,
@@ -125,6 +131,14 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 		t,
 	} = options;
 
+	const [snapshotsOpened, setSnapshotsOpened] = useState(false);
+	const closeSnapshots = useCallback(() => setSnapshotsOpened(false), []);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: narrator ownership changes discard the old manager surface
+	useEffect(() => setSnapshotsOpened(false), [narratorId]);
+	const [workspaceTargetId, setWorkspaceTargetId] = useState<string | null>(null);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: narrator ownership changes must discard the old target selection
+	useEffect(() => setWorkspaceTargetId(null), [narratorId]);
+	const closeWorkspaceTarget = useCallback(() => setWorkspaceTargetId(null), []);
 	const [pathRulesOpened, setPathRulesOpened] = useState(false);
 	const closePathRules = useCallback(() => setPathRulesOpened(false), []);
 
@@ -146,9 +160,9 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "browser":
 					return browserSessionsSupported !== false;
 				case "device":
-					// Only meaningful with at least one remote device — otherwise "local"
-					// is the only choice and the control is decoration.
-					return (executionDevicesQuery.data?.devices.length ?? 0) > 0;
+					// The same control switches ordinary directories, even without Git
+					// or a registered remote device. The modal exposes any policy denial.
+					return !!narratorId;
 				case "plugins":
 					return !!dock;
 				default:
@@ -163,7 +177,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 			onOpenTerminalPanel,
 			gitWorkspaceAvailable,
 			browserSessionsSupported,
-			executionDevicesQuery.data?.devices.length,
+			narratorId,
 			dock,
 		],
 	);
@@ -296,10 +310,26 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 							localLabel={t("executionTargetLocal")}
 							offlineLabel={t("executionDeviceOffline")}
 							devices={executionDevicesQuery.data?.devices ?? []}
-							currentDeviceId={executionDevicesQuery.data?.defaultDeviceId ?? "local"}
+							currentDeviceId={
+								workspaceContext?.deviceId ?? executionDevicesQuery.data?.defaultDeviceId ?? "local"
+							}
 							onSelect={(deviceId) => {
 								close();
-								updateExecutionDeviceMutation.mutate(deviceId);
+								setWorkspaceTargetId(deviceId ?? "local");
+							}}
+							snapshotsLabel={t("snapshotRestore.title")}
+							onManageSnapshots={() => {
+								close();
+								setSnapshotsOpened(true);
+							}}
+							directoryLabel={t("workspaceSwitch")}
+							onChangeDirectory={() => {
+								close();
+								setWorkspaceTargetId(
+									workspaceContext?.deviceId ??
+										executionDevicesQuery.data?.defaultDeviceId ??
+										"local",
+								);
 							}}
 							withLabel={false}
 						/>
@@ -336,7 +366,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 		[
 			t,
 			executionDevicesQuery.data,
-			updateExecutionDeviceMutation,
+			workspaceContext?.deviceId,
 			renderLod,
 			renderLodIsDefault,
 			handleSelectLod,
@@ -352,11 +382,37 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 			toolbarTuckedDefs,
 			toolbarBottomDefs,
 			toolbarOverlays: (
-				<PathRulesPopover
-					narratorId={narratorId}
-					t={t}
-					controlled={{ opened: pathRulesOpened, onClose: closePathRules }}
-				/>
+				<>
+					<PathRulesPopover
+						narratorId={narratorId}
+						t={t}
+						controlled={{ opened: pathRulesOpened, onClose: closePathRules }}
+					/>
+					{snapshotsOpened && (
+						<WorkspaceSnapshotRestoreModal
+							key={narratorId}
+							narratorId={narratorId}
+							opened
+							onClose={closeSnapshots}
+						/>
+					)}
+					{workspaceTargetId && (
+						<WorkspaceTargetPickerModal
+							key={`${narratorId}:${workspaceTargetId}`}
+							narratorId={narratorId}
+							deviceId={workspaceTargetId}
+							deviceLabel={
+								workspaceTargetId === "local"
+									? t("executionTargetLocal")
+									: (executionDevicesQuery.data?.devices.find(
+											(device: { id: string }) => device.id === workspaceTargetId,
+										)?.name ?? workspaceTargetId)
+							}
+							opened
+							onClose={closeWorkspaceTarget}
+						/>
+					)}
+				</>
 			),
 			saveToolbarLayout,
 			toolbarEntryActive,
@@ -372,6 +428,11 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 			t,
 			pathRulesOpened,
 			closePathRules,
+			workspaceTargetId,
+			closeWorkspaceTarget,
+			snapshotsOpened,
+			closeSnapshots,
+			executionDevicesQuery.data,
 			saveToolbarLayout,
 			toolbarEntryActive,
 			activateToolbarEntry,

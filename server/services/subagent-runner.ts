@@ -1,8 +1,10 @@
 import type { FileReferenceSnapshot } from "@shared/file-reference";
 import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, narratorToolCalls } from "../db/schema";
+import { resolveBackend } from "../lib/agent/execution/registry";
 import {
 	createOptionalExecutionTimeout,
 	normalizeOptionalExecutionTimeout,
@@ -12,7 +14,11 @@ import {
 	freezeFileReferenceSnapshots,
 	projectFileReferenceText,
 } from "../lib/agent/file-reference-projection";
-import type { ToolCallBinding, ToolUpdateExecutionLease } from "../lib/agent/types";
+import type {
+	ToolCallBinding,
+	ToolExecutionTarget,
+	ToolUpdateExecutionLease,
+} from "../lib/agent/types";
 import { withDbRetry } from "../lib/db-resilience";
 import { AppError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -25,6 +31,7 @@ import {
 	resolveSubagentModelSelectionFromPolicy,
 } from "../lib/narrator-custom-traits";
 import { getSubagentType, hasTrait, isSubagentVariant, parseTraits } from "../lib/narrator-utils";
+import type { WorkspaceFileAccess } from "../lib/plan-file-path";
 import type { Locale } from "../lib/prompt-i18n";
 import {
 	expandAllowedPoolForDisplay,
@@ -74,6 +81,7 @@ import {
 } from "./subagent-execution-boundary";
 import {
 	consumeNextBufferedSubagentMessage,
+	createSubagentWorkspaceAttachmentAccess,
 	executeSubagent,
 	finalizeSubagent,
 	loadSubagentHistory,
@@ -100,6 +108,8 @@ import { clearTeamInbox } from "./subagent-team";
 import { buildSubagentSystemPrompt } from "./subagent-tools";
 import { resolveEffectiveTraits, resolveNarratorProjectId } from "./trait-layer-service";
 import { tryAcquireFinalUpdateExecution, type UpdateExecutionLease } from "./update-coordinator";
+import { prepareWorkspaceContext, workspaceContextService } from "./workspace-context-service";
+import { createNarratorWorkspaceFileAccess } from "./workspace-file-access";
 
 /** Default wall-clock execution time for background Agent tasks (5 hours). */
 export const BACKGROUND_TASK_TIMEOUT_MS = 5 * 60 * 60 * 1000;
@@ -1881,6 +1891,11 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 // === Subagent runner ===
 
 export interface RunSubagentInput {
+	/** Frozen parent pass, not parent's later live cwd/device. */
+	workspaceContext?: WorkspaceContext;
+	executionTarget?: ToolExecutionTarget;
+	fileAccess?: WorkspaceFileAccess;
+	assertWorkspaceCurrent?: () => void;
 	/** Exact spawning Agent attempt, supplied by executeTool, never resolved by provider id. */
 	toolCallBinding?: ToolCallBinding;
 	parentNarratorId: string;
@@ -1926,7 +1941,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		toolUseId,
 		subagentType,
 		prompt,
-		cwd,
+		cwd: requestedCwd,
 		title,
 		signal,
 		locale,
@@ -1941,6 +1956,51 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	const timeoutMs =
 		requestedTimeoutMs === 0 ? 0 : normalizeOptionalExecutionTimeout(requestedTimeoutMs);
 
+	input.assertWorkspaceCurrent?.();
+	const parent = await narratorService.getById(parentNarratorId);
+	const inheritedWorkspace =
+		input.workspaceContext ??
+		parent.workspaceContext ??
+		(parent.defaultDeviceId && parent.defaultDeviceId !== "local"
+			? await workspaceContextService.get(parentNarratorId, { userId })
+			: undefined);
+	const parentWorkspace = inheritedWorkspace ? structuredClone(inheritedWorkspace) : undefined;
+	const targetCwd = parentWorkspace
+		? resolveBackend({ requested: parentWorkspace.deviceId }).paths.resolve(
+				parentWorkspace.cwd,
+				requestedCwd,
+			)
+		: requestedCwd;
+	const childWorkspace = parentWorkspace
+		? await prepareWorkspaceContext(
+				{ deviceId: parentWorkspace.deviceId, cwd: targetCwd },
+				0,
+				parentWorkspace.contextProjectId,
+				{ narratorId: parentNarratorId, userId },
+			)
+		: undefined;
+	input.assertWorkspaceCurrent?.();
+	if (childWorkspace && input.executionTarget) {
+		const admitted = input.executionTarget;
+		const backend = resolveBackend({ requested: childWorkspace.deviceId });
+		if (
+			admitted.deviceId !== childWorkspace.deviceId ||
+			(admitted.runtimeGeneration !== undefined &&
+				admitted.runtimeGeneration !== backend.runtimeGeneration) ||
+			(admitted.canonicalPath && !backend.paths.equals(admitted.canonicalPath, childWorkspace.cwd))
+		) {
+			throw new ValidationError("Subagent workspace changed after permission admission");
+		}
+	}
+	const cwd = childWorkspace?.cwd ?? requestedCwd;
+	const fileAccess = childWorkspace
+		? createNarratorWorkspaceFileAccess(parentNarratorId, childWorkspace, {
+				userId,
+				signal,
+				backend: input.fileAccess?.backend,
+			})
+		: input.fileAccess;
+
 	// Load custom subagent definition once for non-builtin types
 	const isBuiltin =
 		subagentType === "explore" ||
@@ -1950,18 +2010,35 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		subagentType === "general";
 	const customDef = isBuiltin ? null : await customSubagentService.loadByName(subagentType);
 
-	const rebuildSystemPrompt = (contextSummary?: string | null) =>
-		buildSubagentSystemPrompt(
+	let promptNarratorId: string | undefined;
+	let promptSignal = signal;
+	const rebuildSystemPrompt = async (contextSummary?: string | null) => {
+		const promptWorkspace = promptNarratorId
+			? await workspaceContextService.get(promptNarratorId, { userId })
+			: childWorkspace;
+		const promptAccess =
+			promptNarratorId && promptWorkspace
+				? createNarratorWorkspaceFileAccess(promptNarratorId, promptWorkspace, {
+						userId,
+						signal: promptSignal,
+					})
+				: fileAccess;
+		return buildSubagentSystemPrompt(
 			subagentType,
-			cwd,
+			promptWorkspace?.cwd ?? cwd,
 			locale as Locale,
 			contextSummary,
 			customDef?.prompt,
-			// Only background subagents can report progress to the parent; a
-			// foreground subagent blocks the parent until it finishes.
+			// Only background subagents can report interim progress to the parent.
 			background ?? false,
 			resolveRuntimePolicy({ variant: "subagent", subagentType, customDefinition: customDef }),
+			{
+				workspaceContext: promptWorkspace,
+				fileAccess: promptAccess,
+				backend: promptAccess?.backend,
+			},
 		);
+	};
 	const systemPrompt = await rebuildSystemPrompt();
 
 	// Resolve model: explicit param > per-type setting / custom default > parent model > global default
@@ -1979,7 +2056,6 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 
 	// Apply effective per-narrator subagent model policy. Custom narrator traits override
 	// global settings.agent.subagentAllowedModels.
-	const parent = await narratorService.getById(parentNarratorId);
 	// Model pools are a grant, so layering can only narrow them: a narrator cannot
 	// widen its subagent pool past what the project/user layers allow.
 	const parentTraits = await resolveEffectiveTraits({
@@ -2054,12 +2130,14 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				input.toolCallBinding,
 			);
 		}
+		input.assertWorkspaceCurrent?.();
 		subagent = await narratorService.createSubagent({
 			parentNarratorId,
 			originToolCallId: input.toolCallBinding?.toolCallId,
 			subagentType,
 			title,
 			cwd,
+			workspaceContext: childWorkspace,
 			systemPrompt,
 			model: storedModelInput,
 			reasoningEffort: configuredReasoningEffort,
@@ -2071,6 +2149,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	}
 
 	const subagentId = subagent.id;
+	promptNarratorId = subagentId;
 	updateLease.setNarratorId(subagentId);
 	const {
 		model,
@@ -2181,6 +2260,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			// Create an independent AbortController for the background task
 			// (parent's signal should not cancel background tasks)
 			bgAbort = new AbortController();
+			promptSignal = bgAbort.signal;
 
 			// Store the abort controller for later cancellation
 			getBackgroundAbortControllers().set(subagentId, bgAbort);
@@ -2505,7 +2585,14 @@ async function startContinuedSubagentUnlocked(
 		inheritance,
 	} = await resolveSubagentModelForRun(original, input.userId);
 	const provider = resolveProvider(model);
-	const cwd = original.cwd ?? ".";
+	const workspaceContext = await workspaceContextService.get(subagentId, { userId: input.userId });
+	const cwd = workspaceContext.cwd;
+	const backend = resolveBackend({ requested: workspaceContext.deviceId });
+	const fileAccess = createNarratorWorkspaceFileAccess(subagentId, workspaceContext, {
+		userId: input.userId,
+		backend,
+		signal: runSignal,
+	});
 
 	// Load custom subagent definition once for non-builtin types
 	const isBuiltinContinue =
@@ -2523,6 +2610,7 @@ async function startContinuedSubagentUnlocked(
 			// original foreground semantics.
 			input.canReportToParent ?? false,
 			resolveRuntimePolicy({ variant: "subagent", subagentType, customDefinition: customDef }),
+			{ workspaceContext, backend, fileAccess },
 		);
 	const systemPrompt = await rebuildSystemPrompt(original.contextSummary);
 
@@ -2587,8 +2675,14 @@ async function startContinuedSubagentUnlocked(
 		// parent card always observe a consistent linked transcript.
 		if (input.persistPrompt !== false) {
 			const savedTextFiles: TextFileRef[] = [];
+			const attachmentAccess = input.textFiles?.length
+				? createSubagentWorkspaceAttachmentAccess(subagentId, workspaceContext, {
+						userId: input.userId,
+						signal: runSignal,
+					})
+				: undefined;
 			for (const file of input.textFiles ?? []) {
-				savedTextFiles.push(await saveTextFileToWorktree(cwd, file));
+				savedTextFiles.push(await saveTextFileToWorktree(cwd, file, attachmentAccess));
 			}
 			userMessage = await narratorService.persistSubagentUserMessage(
 				subagentId,

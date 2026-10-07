@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import { and, asc, eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narratorBufferedMessages as mailbox, narrators } from "../db/schema";
@@ -17,6 +18,7 @@ import {
 	imageRefToContentBlock,
 	saveTextFileToWorktree,
 	type TextFileRef,
+	type WorkspaceAttachmentAccess,
 } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
@@ -100,6 +102,8 @@ import {
 } from "./subagent-knowledge-injection";
 import { planTurnInterruption, type TurnInterruptionPlan } from "./turn-continuation-decisions";
 import type { UpdateExecutionLease } from "./update-coordinator";
+import { createNarratorWorkspaceAttachmentAccess } from "./workspace-artifact-access";
+import { workspaceContextService } from "./workspace-context-service";
 
 // ---------------------------------------------------------------------------
 // Interfaces
@@ -839,10 +843,31 @@ export async function loadSubagentHistory(
 // consumeNextBufferedSubagentMessage
 // ---------------------------------------------------------------------------
 
-async function saveBufferedTextFiles(cwd: string, files?: File[]): Promise<TextFileRef[]> {
+export function createSubagentWorkspaceAttachmentAccess(
+	narratorId: string,
+	workspaceContext: WorkspaceContext,
+	options: { userId?: string | null; signal?: AbortSignal } = {},
+): WorkspaceAttachmentAccess {
+	return createNarratorWorkspaceAttachmentAccess(narratorId, workspaceContext, options);
+}
+
+async function saveBufferedTextFiles(
+	narratorId: string,
+	cwd: string,
+	files?: File[],
+	userId?: string | null,
+): Promise<TextFileRef[]> {
 	const saved: TextFileRef[] = [];
-	for (const file of files ?? []) {
-		saved.push(await saveTextFileToWorktree(cwd, file));
+	if (!files?.length) return saved;
+	const active = activeNarrators.get(narratorId);
+	const workspace =
+		active?._workspaceContext ?? (await workspaceContextService.get(narratorId, { userId }));
+	const access = createSubagentWorkspaceAttachmentAccess(narratorId, workspace, {
+		userId,
+		signal: active?.abortController.signal,
+	});
+	for (const file of files) {
+		saved.push(await saveTextFileToWorktree(workspace.cwd || cwd, file, access));
 	}
 	return saved;
 }
@@ -891,7 +916,14 @@ async function persistNextBufferedSubagentMessageAdmitted(opts: {
 		| Awaited<ReturnType<typeof narratorService.persistSubagentUserMessage>>
 		| MaterializedInboxUserMessage;
 	try {
-		const textFiles = await saveBufferedTextFiles(opts.cwd, buffered.textFiles);
+		const textFiles = await saveBufferedTextFiles(
+			narratorId,
+			opts.cwd,
+			buffered.textFiles,
+			row.kind === "user_input"
+				? (buffered.createdBy ?? null)
+				: (activeNarrators.get(narratorId)?._currentUserId ?? null),
+		);
 		if (getNarratorMessageRefsPort()) {
 			// PostgreSQL: the queue's materialize section commits message + ref + mailbox flip
 			// atomically. The block assembly mirrors narratorService.persistSubagentUserMessage
@@ -900,14 +932,10 @@ async function persistNextBufferedSubagentMessageAdmitted(opts: {
 			if (delivery && delivery.recipientNarratorId !== narratorId)
 				throw new ValidationError("Agent delivery recipient does not match message recipient");
 			const origin = delivery ? buildAgentMessageOrigin(delivery.sender) : undefined;
+			const { textAttachmentBlock } = await import("./narrator-text-attachments");
 			const contentJson: unknown[] = [
 				...(buffered.images ?? []).map((image) => imageRefToContentBlock(image)),
-				...textFiles.map((file) => ({
-					type: "text_file" as const,
-					filename: file.filename,
-					size: file.size,
-					filePath: file.filePath,
-				})),
+				...textFiles.map(textAttachmentBlock),
 				...(buffered.fileReferences ?? []),
 				{ type: "text", text: buffered.text },
 				...(delivery
@@ -1348,11 +1376,13 @@ async function runSubagentRuntime(
 				columns: { projectId: true },
 			})
 		: null;
+	const workspace = await workspaceContextService.get(opts.narratorId, { userId: opts.userId });
 	const model = resolveEffectiveModel(opts.model);
 	const active: ActiveNarrator = {
 		narratorId: opts.narratorId,
 		conversationId: randomUUID(),
-		cwd: opts.cwd,
+		cwd: workspace.cwd,
+		_workspaceContext: workspace,
 		model,
 		provider: resolveProvider(model),
 		systemPrompt: opts.systemPrompt,
@@ -1369,7 +1399,7 @@ async function runSubagentRuntime(
 			opts.userId !== undefined
 				? opts.userId
 				: (activeNarrators.get(opts.parentNarratorId)?._currentUserId ?? null),
-		_defaultDeviceId: row.defaultDeviceId,
+		_defaultDeviceId: workspace.deviceId === "local" ? null : workspace.deviceId,
 		_chapterId: row.chapterId ?? undefined,
 		_projectId: chapter?.projectId ?? undefined,
 		reasoningEffort: row.reasoningEffort,
@@ -1377,11 +1407,7 @@ async function runSubagentRuntime(
 		_modelRef: row.model ?? opts.model,
 		_turnStartedAt: opts.fileChangeStartedAt ?? new Date().toISOString(),
 	};
-	active._isInGitRepo =
-		!!row.chapterId ||
-		(await import("./git-service")
-			.then(({ gitService }) => gitService.isGitRepo(opts.cwd))
-			.catch(() => false));
+	active._isInGitRepo = !!workspace.git;
 	if (!owner.isCurrent())
 		throw new AppError("Subagent execution owner expired", 409, "NARRATOR_EXECUTION_BUSY");
 	const queuedHead = await peekInbox(opts.narratorId);

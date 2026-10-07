@@ -27,6 +27,7 @@ export const FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE = FEATURE_FS_WRITE_ATOMIC_RES
 export const FEATURE_GLOB_BOUNDED_V1 = "glob.bounded.v1";
 /** Reads check cancellation between chunks and revalidate identity/size after reading. */
 export const FEATURE_FS_READ_BOUNDED_V1 = "fs.read.bounded.v1";
+export const FEATURE_FS_LIST_BOUNDED_V1 = "fs.list.bounded.v1";
 /** Serialized content check + replacement; does not exclude external filesystem writers. */
 export const FEATURE_FS_CONDITIONAL_WRITE_V1 = "fs.write.conditional.v1";
 
@@ -118,7 +119,13 @@ export interface DeviceHelloAckFrame {
 // ── RPC methods ──────────────────────────────────────────────────────────────
 
 export type RpcMethod =
+	| import("@shared/workspace-attachment-protocol").WorkspaceAttachmentRpcMethod
+	| import("@shared/remote-history-protocol").RemoteHistoryRpcMethod
 	| "system.ping"
+	| "share.inspect"
+	| "share.prepare"
+	| "share.readChunk"
+	| "share.release"
 	| "fs.stat"
 	| "fs.read"
 	| "fs.write"
@@ -126,6 +133,7 @@ export type RpcMethod =
 	| "fs.remove"
 	| "fs.mkdirp"
 	| "fs.list"
+	| "fs.listBounded"
 	| "fs.exists"
 	| "glob"
 	| "grep"
@@ -134,6 +142,7 @@ export type RpcMethod =
 	| "git.status"
 	| "git.diff"
 	| "git.workspace"
+	| "git.worktree"
 	| "pty.open"
 	| "pty.write"
 	| "pty.resize"
@@ -317,6 +326,7 @@ export interface GrepRpcParams {
 	timeoutMs: number;
 }
 export interface GrepRpcResult {
+	policyExcluded?: boolean;
 	/** Base64-encoded raw stdout bytes. */
 	stdoutB64: string;
 	stderr: string;

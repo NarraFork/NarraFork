@@ -45,6 +45,19 @@ func (d *Dispatcher) Dispatch(
 	stream handlers.StreamFunc,
 ) (any, error) {
 	switch method {
+	case "history.open", "history.capture", "history.captureTree", "history.objectStage", "history.objectRead", "history.mutate",
+		"history.status", "history.restore", "history.finalize", "history.compensate", "history.inspect":
+		return d.h.History(ctx, method, params)
+	case "share.inspect":
+		return d.h.ShareInspect(ctx, params)
+	case "share.prepare":
+		return d.h.SharePrepare(ctx, params)
+	case "share.readChunk":
+		return d.h.ShareReadChunk(ctx, params)
+	case "share.release":
+		return d.h.ShareRelease(ctx, params)
+	case "attachment.begin", "attachment.append", "attachment.commit", "attachment.status", "attachment.cleanup":
+		return d.h.WorkspaceAttachment(ctx, method, params)
 	case "system.ping":
 		return map[string]any{"ok": true}, nil
 	case "fs.stat":
@@ -61,6 +74,8 @@ func (d *Dispatcher) Dispatch(
 		return d.h.FsRemoveContext(ctx, params)
 	case "fs.mkdirp":
 		return d.h.FsMkdirp(params)
+	case "fs.listBounded":
+		return d.h.FsListBounded(ctx, params)
 	case "fs.list":
 		return d.h.FsList(params)
 	case "glob":
@@ -73,6 +88,8 @@ func (d *Dispatcher) Dispatch(
 		return d.h.GitStatus(params)
 	case "git.diff":
 		return d.h.GitDiff(params)
+	case "git.worktree":
+		return d.h.GitWorktree(ctx, params)
 	case "git.workspace":
 		return d.h.GitWorkspace(ctx, params)
 	case "pty.open":

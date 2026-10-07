@@ -2138,7 +2138,9 @@ export const handleNarratorWS = {
 						}
 						if (cmdResult.resolved && "blockSkill" in cmdResult) {
 							const locale = await getUserLanguage(userId);
-							await handleBlockSkillCommand(msg.narratorId, cmdResult as BlockSkillResult, locale);
+							await handleBlockSkillCommand(msg.narratorId, cmdResult as BlockSkillResult, locale, {
+								userId,
+							});
 							return;
 						}
 						if (cmdResult.resolved && "blockAllSkills" in cmdResult) {

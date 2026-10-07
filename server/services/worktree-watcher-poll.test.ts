@@ -60,18 +60,18 @@ function registerEntry(worktreePath: string): void {
 	});
 }
 
-/** Count `tryCapture` calls for the duration of `run`, keeping the real behaviour. */
+/** Count the actual hot capture admission attempts; unavailable receipts are not scan evidence. */
 async function countCaptures(run: () => Promise<void>): Promise<number> {
-	const original = worktreeTreeSnapshot.tryCapture;
+	const original = worktreeTreeSnapshot.tryCaptureHot;
 	let calls = 0;
-	worktreeTreeSnapshot.tryCapture = async function (...args) {
+	worktreeTreeSnapshot.tryCaptureHot = async function (...args) {
 		calls += 1;
 		return original.apply(this, args);
 	};
 	try {
 		await run();
 	} finally {
-		worktreeTreeSnapshot.tryCapture = original;
+		worktreeTreeSnapshot.tryCaptureHot = original;
 	}
 	return calls;
 }

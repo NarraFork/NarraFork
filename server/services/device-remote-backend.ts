@@ -5,6 +5,24 @@
  * Byte payloads cross the wire base64-encoded. Streaming exec output is bridged
  * from rpc_stream frames into the ExecHandle's onData callback.
  */
+import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
+import {
+	FEATURE_REMOTE_HISTORY_CAPTURE_TREE_V1,
+	FEATURE_REMOTE_HISTORY_OBJECT_STAGE_V1,
+	FEATURE_REMOTE_HISTORY_V1,
+	REMOTE_HISTORY_METADATA_TIMEOUT_MS,
+	REMOTE_HISTORY_OPERATION_TIMEOUT_MS,
+	type RemoteHistoryOperation,
+	type RemoteHistoryOperations,
+} from "@shared/remote-history-protocol";
+import {
+	FEATURE_WORKSPACE_ATTACHMENT_V1,
+	WORKSPACE_ATTACHMENT_CHUNK_BYTES,
+	WORKSPACE_ATTACHMENT_METADATA_TIMEOUT_MS,
+	WORKSPACE_ATTACHMENT_OPERATION_TIMEOUT_MS,
+	type WorkspaceAttachmentOperation,
+	type WorkspaceAttachmentOperations,
+} from "@shared/workspace-attachment-protocol";
 import type {
 	ConditionalWriteBytesOptions,
 	DevicePlatform,
@@ -19,6 +37,8 @@ import type {
 	GlobOptions,
 	GrepParams,
 	GrepResult,
+	ListBoundedOptions,
+	ListBoundedResult,
 	PathIdentity,
 	ReadBytesOptions,
 	ReadBytesResult,
@@ -33,6 +53,11 @@ import {
 	type GitWorkspaceRequest,
 	type GitWorkspaceResult,
 } from "../lib/agent/execution/git-workspace-rpc";
+import {
+	FEATURE_GIT_WORKTREE_V1,
+	type GitWorktreeRequest,
+	type GitWorktreeResult,
+} from "../lib/agent/execution/git-worktree-rpc";
 import { platformPathFlavor, targetPathSemantics } from "../lib/agent/execution/path-semantics";
 import type {
 	ExecStartResult,
@@ -48,12 +73,20 @@ import type {
 } from "../lib/agent/execution/rpc-types";
 import {
 	FEATURE_FS_CONDITIONAL_WRITE_V1,
+	FEATURE_FS_LIST_BOUNDED_V1,
 	FEATURE_FS_READ_BOUNDED_V1,
 	FEATURE_GLOB_BOUNDED_V1,
 	FS_READ_ATOMIC_RESOLVED_PATH_FEATURE,
 	FS_STAT_RESOLVED_PATH_FEATURE,
 	FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE,
 } from "../lib/agent/execution/rpc-types";
+import {
+	FEATURE_SHARE_ARCHIVE_V1,
+	SHARE_ARCHIVE_METADATA_TIMEOUT_MS,
+	SHARE_ARCHIVE_OPERATION_TIMEOUT_MS,
+	type ShareArchiveRequest,
+	type ShareArchiveResult,
+} from "../lib/agent/execution/share-archive-rpc";
 import { pathsEqualForOS } from "../lib/platform-path";
 import { settings } from "../lib/settings";
 import {
@@ -370,6 +403,34 @@ export class RemoteBackend implements ExecutionBackend {
 		await this.rpc("fs.mkdirp", { path });
 	}
 
+	get supportsFsListBounded(): boolean {
+		return hasDeviceProtocolFeature(this.deviceId, FEATURE_FS_LIST_BOUNDED_V1);
+	}
+
+	async listBounded(path: string, opts: ListBoundedOptions = {}): Promise<ListBoundedResult> {
+		if (!this.supportsFsListBounded)
+			throw new Error("Executor upgrade required: fs.list.bounded.v1");
+		const timeoutMs = Math.min(opts.timeoutMs ?? 2000, 2000);
+		return (await this.rpc(
+			"fs.listBounded",
+			{
+				path,
+				expectedResolvedPath: opts.expectedResolvedPath,
+				showHidden: opts.showHidden,
+				directoriesOnly: opts.directoriesOnly,
+				maxScanned: Math.min(opts.maxScanned ?? 10_000, 10_000),
+				maxEntries: Math.min(opts.maxEntries ?? 500, 500),
+				maxBytes: Math.min(opts.maxBytes ?? 256 * 1024, this.maxBytes, 256 * 1024),
+				timeoutMs,
+			},
+			{
+				signal: opts.signal,
+				timeoutMs: timeoutMs + 1000,
+				requiredFeatures: [FEATURE_FS_LIST_BOUNDED_V1],
+			},
+		)) as ListBoundedResult;
+	}
+
 	async listDir(path: string): Promise<DirEntry[]> {
 		const res = (await this.rpc("fs.list", { path })) as FsListResult;
 		return res.entries;
@@ -427,6 +488,7 @@ export class RemoteBackend implements ExecutionBackend {
 		)) as GrepRpcResult;
 		return {
 			stdoutBytes: fromBase64(res.stdoutB64),
+			policyExcluded: res.policyExcluded,
 			stderr: res.stderr,
 			exitCode: res.exitCode,
 			truncatedByBytes: res.truncatedByBytes,
@@ -445,6 +507,167 @@ export class RemoteBackend implements ExecutionBackend {
 			timeoutMs,
 			this.maxBytes,
 		);
+	}
+
+	get supportsWorkspaceAttachment(): boolean {
+		return hasDeviceProtocolFeature(this.deviceId, FEATURE_WORKSPACE_ATTACHMENT_V1);
+	}
+	async workspaceAttachment<K extends WorkspaceAttachmentOperation>(
+		operation: K,
+		request: WorkspaceAttachmentOperations[K]["request"],
+		signal?: AbortSignal,
+	): Promise<WorkspaceAttachmentOperations[K]["result"]> {
+		if (!this.supportsWorkspaceAttachment)
+			throw new Error("Executor upgrade required: workspace.attachment.v1");
+		signal?.throwIfAborted();
+		if (
+			"contentBase64" in request &&
+			request.contentBase64.length > Math.ceil(WORKSPACE_ATTACHMENT_CHUNK_BYTES / 3) * 4
+		)
+			throw new Error("Attachment chunk budget exceeded");
+		const timeoutMs =
+			operation === "commit" || operation === "cleanup"
+				? Math.min(WORKSPACE_ATTACHMENT_OPERATION_TIMEOUT_MS, 120_000)
+				: WORKSPACE_ATTACHMENT_METADATA_TIMEOUT_MS;
+		return (await this.rpc(
+			`attachment.${operation}`,
+			{ ...request },
+			{ signal, timeoutMs, requiredFeatures: [FEATURE_WORKSPACE_ATTACHMENT_V1] },
+		)) as WorkspaceAttachmentOperations[K]["result"];
+	}
+
+	get supportsShareArchive(): boolean {
+		return hasDeviceProtocolFeature(this.deviceId, FEATURE_SHARE_ARCHIVE_V1);
+	}
+
+	async shareArchive(
+		request: ShareArchiveRequest,
+		signal?: AbortSignal,
+	): Promise<ShareArchiveResult> {
+		if (!this.supportsShareArchive) throw new Error("Executor upgrade required: share.archive.v1");
+		const cap =
+			request.operation === "prepare"
+				? SHARE_ARCHIVE_OPERATION_TIMEOUT_MS
+				: SHARE_ARCHIVE_METADATA_TIMEOUT_MS;
+		const timeoutMs = Math.min(request.timeoutMs ?? cap, cap);
+		return (await this.rpc(
+			`share.${request.operation}`,
+			{
+				...request,
+				timeoutMs,
+				maxEntries: Math.min(request.maxEntries ?? 10_000, 10_000),
+				maxExpandedBytes: Math.min(
+					request.maxExpandedBytes ?? 128 * 1024 * 1024,
+					512 * 1024 * 1024,
+				),
+				maxArchiveBytes: Math.min(request.maxArchiveBytes ?? 128 * 1024 * 1024, 256 * 1024 * 1024),
+				maxBytes: Math.min(request.maxBytes ?? 256 * 1024, this.maxBytes, 256 * 1024),
+				maxChunkBytes: Math.min(
+					request.maxChunkBytes ?? 1024 * 1024,
+					1024 * 1024,
+					Math.floor(((this.maxBytes - 8192) * 3) / 4),
+				),
+			},
+			{ signal, timeoutMs, requiredFeatures: [FEATURE_SHARE_ARCHIVE_V1] },
+		)) as ShareArchiveResult;
+	}
+
+	get remoteHistoryChunkBytes(): number {
+		return Math.min(
+			FILE_CHANGE_LIMITS.streamChunkBytes,
+			Math.floor(((this.maxBytes - 8192) * 3) / 4),
+		);
+	}
+	get supportsRemoteObjectStage(): boolean {
+		return (
+			this.supportsRemoteHistory &&
+			hasDeviceProtocolFeature(this.deviceId, FEATURE_REMOTE_HISTORY_OBJECT_STAGE_V1)
+		);
+	}
+
+	get supportsRemoteTreeCapture(): boolean {
+		return (
+			this.supportsRemoteHistory &&
+			hasDeviceProtocolFeature(this.deviceId, FEATURE_REMOTE_HISTORY_CAPTURE_TREE_V1)
+		);
+	}
+
+	get supportsRemoteHistory(): boolean {
+		return hasDeviceProtocolFeature(this.deviceId, FEATURE_REMOTE_HISTORY_V1);
+	}
+
+	async remoteHistory<K extends RemoteHistoryOperation>(
+		operation: K,
+		request: RemoteHistoryOperations[K]["request"],
+		signal?: AbortSignal,
+	): Promise<RemoteHistoryOperations[K]["result"]> {
+		if (!this.supportsRemoteHistory) throw new Error("Executor upgrade required: history.v1");
+		if (operation === "captureTree" && !this.supportsRemoteTreeCapture)
+			throw new Error("Executor upgrade required: history.capture-tree.v1");
+		if (operation === "objectStage" && !this.supportsRemoteObjectStage)
+			throw new Error("Executor upgrade required: history.object-stage.v1");
+		signal?.throwIfAborted();
+		const maxBytes = Math.min(this.maxBytes, FILE_CHANGE_LIMITS.fileToolRequestBytes);
+		const changes = "changes" in request ? request.changes : undefined;
+		if (changes && changes.length > FILE_CHANGE_LIMITS.revertFiles)
+			throw new Error("Remote effect budget exceeded");
+		let inlineBytes = 0;
+		let metadata = changes
+			? {
+					...request,
+					changes: changes.map(({ contentBase64, ...change }) => {
+						inlineBytes += contentBase64 === undefined ? 0 : contentBase64.length + 32;
+						return change;
+					}),
+				}
+			: request;
+		if ("contentBase64" in metadata) {
+			const { contentBase64, ...headers } = metadata;
+			inlineBytes += typeof contentBase64 === "string" ? contentBase64.length + 32 : 0;
+			metadata = headers as typeof metadata;
+		}
+		const metadataBytes = Buffer.byteLength(JSON.stringify(metadata));
+		if (
+			metadataBytes > FILE_CHANGE_LIMITS.summaryBytes ||
+			metadataBytes + inlineBytes > maxBytes - 8192
+		)
+			throw new Error("Remote history request exceeds RPC byte budget");
+		const longOperation = ["capture", "captureTree", "mutate", "restore", "compensate"].includes(
+			operation,
+		);
+		return (await this.rpc(
+			`history.${operation}`,
+			{ ...request },
+			{
+				signal,
+				requiredFeatures:
+					operation === "captureTree"
+						? [FEATURE_REMOTE_HISTORY_V1, FEATURE_REMOTE_HISTORY_CAPTURE_TREE_V1]
+						: operation === "objectStage"
+							? [FEATURE_REMOTE_HISTORY_V1, FEATURE_REMOTE_HISTORY_OBJECT_STAGE_V1]
+							: [FEATURE_REMOTE_HISTORY_V1],
+				timeoutMs: longOperation
+					? REMOTE_HISTORY_OPERATION_TIMEOUT_MS
+					: REMOTE_HISTORY_METADATA_TIMEOUT_MS,
+			},
+		)) as RemoteHistoryOperations[K]["result"];
+	}
+
+	get supportsGitWorktree(): boolean {
+		return hasDeviceProtocolFeature(this.deviceId, FEATURE_GIT_WORKTREE_V1);
+	}
+
+	async gitWorktree(request: GitWorktreeRequest, signal?: AbortSignal): Promise<GitWorktreeResult> {
+		const timeoutMs = Math.min(request.timeoutMs ?? 60_000, 120_000);
+		return (await this.rpc(
+			"git.worktree",
+			{
+				...request,
+				timeoutMs,
+				maxBytes: Math.min(request.maxBytes ?? 256 * 1024, this.maxBytes, 256 * 1024),
+			},
+			{ signal, timeoutMs: timeoutMs + 5_000, requiredFeatures: [FEATURE_GIT_WORKTREE_V1] },
+		)) as GitWorktreeResult;
 	}
 
 	get supportsGitWorkspace(): boolean {

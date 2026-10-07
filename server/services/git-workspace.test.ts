@@ -477,7 +477,7 @@ describe("authenticated Git management", () => {
 		).toBe(200);
 		expect(await git(repo, "diff", "--cached", "--name-only")).toBe(":(glob)*");
 	});
-	test("remote default uses device cwd, remains device-separated, never falls back locally", async () => {
+	test("remote committed cwd differs from default and remains device-separated, never falls back locally", async () => {
 		const deviceId = generateId();
 		await db.insert(remoteDevices).values({
 			id: deviceId,
@@ -493,7 +493,17 @@ describe("authenticated Git management", () => {
 		});
 		await db
 			.update(narrators)
-			.set({ defaultDeviceId: deviceId })
+			.set({
+				defaultDeviceId: deviceId,
+				workspaceContext: {
+					revision: 0,
+					deviceId,
+					cwd: "/remote/work",
+					pathFlavor: "posix",
+					contextKey: "selected-work",
+					capabilities: { switchDirectory: true },
+				},
+			})
 			.where(eq(narrators.id, narratorId));
 		expect((await workspace()).state).toBe("device_offline");
 		let probes = 0;
@@ -504,7 +514,7 @@ describe("authenticated Git management", () => {
 			paths: localBackend.paths,
 			pathFlavor: localBackend.pathFlavor,
 			runtimeGeneration: 1,
-			defaultCwd: "/remote/work",
+			defaultCwd: "/default/decoy",
 			supportsGitWorkspace: true,
 			async gitWorkspace(input: {
 				cwd: string;
@@ -675,7 +685,20 @@ test("execution path policy rejects a remote cwd before any Git probe", async ()
 		createdAt: now(),
 		updatedAt: now(),
 	});
-	await db.update(narrators).set({ defaultDeviceId: deviceId }).where(eq(narrators.id, narratorId));
+	await db
+		.update(narrators)
+		.set({
+			defaultDeviceId: deviceId,
+			workspaceContext: {
+				revision: 0,
+				deviceId,
+				cwd: "/remote/forbidden",
+				pathFlavor: "posix",
+				contextKey: "denied-selected",
+				capabilities: { switchDirectory: true },
+			},
+		})
+		.where(eq(narrators.id, narratorId));
 	let probes = 0;
 	const backend = {
 		...localBackend,
@@ -848,7 +871,22 @@ test("target is re-authorized inside the local write lock", async () => {
 	await writeFile(join(repo, "late.txt"), "pending\n");
 	const original = gitService.stageAll;
 	const hook = spyOn(gitService, "stageAll").mockImplementation(async (path) => {
-		await db.update(narrators).set({ cwd: other }).where(eq(narrators.id, narratorId));
+		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+		if (!row?.workspaceContext) throw new Error("Write admission must persist its binding");
+		const revision = row.workspaceRevision + 1;
+		await db
+			.update(narrators)
+			.set({
+				cwd: other,
+				workspaceRevision: revision,
+				workspaceContext: {
+					...row.workspaceContext,
+					cwd: other,
+					revision,
+					contextKey: "external-target-change",
+				},
+			})
+			.where(eq(narrators.id, narratorId));
 		return original.call(gitService, path);
 	});
 	try {
@@ -923,7 +961,20 @@ test("remote Windows sibling paths use case-folded workspace attribution", async
 		createdAt: now(),
 		updatedAt: now(),
 	});
-	await db.update(narrators).set({ defaultDeviceId: deviceId }).where(eq(narrators.id, narratorId));
+	await db
+		.update(narrators)
+		.set({
+			defaultDeviceId: deviceId,
+			workspaceContext: {
+				revision: 0,
+				deviceId,
+				cwd: "C:\\Repo\\Packages\\A",
+				pathFlavor: "windows",
+				contextKey: "windows-selected",
+				capabilities: { switchDirectory: true },
+			},
+		})
+		.where(eq(narrators.id, narratorId));
 	const backend = {
 		...localBackend,
 		deviceId,

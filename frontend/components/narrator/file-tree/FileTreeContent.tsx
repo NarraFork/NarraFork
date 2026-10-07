@@ -25,6 +25,7 @@ import {
 	type TreeNodeData,
 	useTree,
 } from "@mantine/core";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import {
 	IconAlertTriangle,
 	IconChevronDown,
@@ -61,6 +62,8 @@ export interface FileTreeContentProps {
 	root: string;
 	/** Frozen device/revision/context identity supplied by the narrator-bound host. */
 	contextKey?: string;
+	narratorId?: string;
+	workspaceContext?: WorkspaceContext;
 	showHidden: boolean;
 	/** File figures plus pre-aggregated directory figures, keyed by tree-relative path. */
 	lineStats?: ReadonlyMap<string, TreeLineStats>;
@@ -113,6 +116,8 @@ function buildNodes(
 export function FileTreeContent({
 	root,
 	contextKey,
+	narratorId,
+	workspaceContext,
 	showHidden,
 	lineStats,
 	lineStatsTruncated = false,
@@ -121,10 +126,15 @@ export function FileTreeContent({
 	registerIngest,
 }: FileTreeContentProps) {
 	const { t } = useTranslation("narrator");
-	const { state, loading, errors, load, reload, reloadAll, ingest } = useFileTree(
+	const workspace = useMemo(
+		() => (narratorId && workspaceContext ? { narratorId, context: workspaceContext } : undefined),
+		[narratorId, workspaceContext],
+	);
+	const { state, loading, errors, truncated, load, reload, reloadAll, ingest } = useFileTree(
 		root,
 		showHidden,
 		contextKey,
+		workspace,
 	);
 
 	// Hand the patch entry point to the panel, which owns the WS subscription. In an
@@ -220,6 +230,13 @@ export function FileTreeContent({
 
 	return (
 		<Box style={{ height: "100%", overflow: "auto" }} p="xs">
+			{truncated.size > 0 && (
+				<Text size="xs" c="orange">
+					{t("fileTree.boundedTruncated", {
+						directories: [...truncated].map((dir) => dir || root).join(", "),
+					})}
+				</Text>
+			)}
 			<Group justify="flex-end" gap={4} mb={4}>
 				<Tooltip label={t("fileTree.refresh")} openDelay={200}>
 					<ActionIcon variant="subtle" color="gray" size="sm" onClick={refreshAll}>

@@ -1,5 +1,6 @@
 import { afterAll, afterEach, expect, mock, test } from "bun:test";
 import type { GitWorkspaceCategory } from "@shared/git-workspace-events";
+import { posixPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
 import type { GitWorkspaceTarget } from "../services/git-workspace";
 
@@ -181,6 +182,9 @@ test("two sockets rebind a real shared watch pool after a generation change with
 			},
 			backend: {
 				kind: "remote",
+				deviceId: "remote",
+				paths: posixPathSemantics,
+				pathFlavor: "posix",
 				runtimeGeneration: boundGeneration,
 				supportsGitWorkspaceWatch: true,
 				gitWorkspace: async () => {

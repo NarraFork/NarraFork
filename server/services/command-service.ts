@@ -430,6 +430,9 @@ export interface SkillSummary {
 	name: string;
 	description: string;
 	source: "global" | "project" | "workspace";
+	deviceId?: string;
+	pathFlavor?: "posix" | "windows";
+	workspaceContextKey?: string;
 	/** Whether this skill is currently blocked for the narrator (via custom trait). */
 	blocked?: boolean;
 }
@@ -456,7 +459,7 @@ export async function getSlashMenuItems(
 }> {
 	const [customCommands, skillContext, narrator] = await Promise.all([
 		getAvailableCommands(narratorId, userId),
-		resolveSkillContextForNarrator(narratorId),
+		resolveSkillContextForNarrator(narratorId, { userId }).catch(() => null),
 		db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
 			columns: { traits: true, chapterId: true, contextProjectId: true },
@@ -485,13 +488,16 @@ export async function getSlashMenuItems(
 	// Load global + project + workspace skills for this narrator context.
 	let skills: SkillSummary[] = [];
 	try {
-		const result = await loadSkillSummariesForContext(skillContext);
+		const result = skillContext ? await loadSkillSummariesForContext(skillContext) : { skills: [] };
 		skills = result.skills
 			.filter((s) => !s.disabled)
 			.map((s) => ({
 				name: s.name,
 				description: s.description,
 				source: s.source,
+				deviceId: s.deviceId ?? "local",
+				...(s.pathFlavor ? { pathFlavor: s.pathFlavor } : {}),
+				...(s.workspaceContextKey ? { workspaceContextKey: s.workspaceContextKey } : {}),
 				blocked: isSkillBlocked(blockedSkills, s.name),
 			}));
 	} catch {

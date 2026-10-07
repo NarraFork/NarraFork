@@ -82,7 +82,8 @@
 
 import { describe, expect, it } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
+import ts from "typescript";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
 
@@ -93,6 +94,16 @@ const SCAN_EXTENSIONS = [".ts", ".tsx"] as const;
 
 /** Skipped anywhere by name: third-party, build output, VCS. */
 const SKIP_DIR_NAMES: ReadonlySet<string> = new Set(["node_modules", "dist", "build", ".git"]);
+
+// Exact paths only: these disposable SQLite fixtures have no served-app callers. The import
+// boundary test below prevents this classification from silently hiding a production dependency.
+const TEST_ONLY_MODULES: ReadonlySet<string> = new Set([
+	"server/services/worktree-resource-fixture.ts",
+	"server/services/local-session-detach/contract.ts",
+	"server/services/local-session-detach/planner.ts",
+	"server/services/local-session-detach/store.ts",
+	"server/services/local-session-detach/executor.ts",
+]);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Capabilities
@@ -396,6 +407,14 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 		"drives the archive-side (SQLite) writer while reading the main database through the port",
 	],
 	[
+		"server/services/project-archive/legacy-sync-worker.ts",
+		"writes portable SQLite archives with either a SQLite or PostgreSQL main-database source",
+	],
+	[
+		"server/services/project-archive/legacy-import-worker.ts",
+		"reads portable SQLite archives with either a SQLite or PostgreSQL main-database target",
+	],
+	[
 		"server/db/connection.ts",
 		"the SQLite connection chokepoint itself (PRAGMA set + real-database test guard)",
 	],
@@ -479,6 +498,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/db-worker/search-query.ts": ["driver"],
 	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
 	"server/lib/project-db.ts": ["driver", "pragma"],
+	// The snapshot catalogue currently rejects PG before querying; register its bounded
+	// JSON1 metadata projection as pending portability work, not a permanent SQLite floor.
+	"server/routes/narrator-workspace-snapshots.ts": ["json1"],
 	"server/routes/storage.ts": ["vacuum"],
 	"server/routes/user-preferences.ts": ["handle"],
 	"server/services/agent-runtime/inbox.ts": ["json1"],
@@ -512,7 +534,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"glob",
 		"collate",
 	],
-	"server/services/file-state-rebuild.ts": ["json1"],
+	"server/services/file-change-namespace-reset.ts": ["rowid"],
+	"server/services/file-change-diagnostics.ts": ["errorCode"],
 	"server/services/git-current-diff-view.ts": ["rowid"],
 	"server/services/integration-authority-service.ts": ["errorCode"],
 	"server/services/narrator-messages.ts": ["json1", "glob"],
@@ -520,7 +543,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-refs-backfill.ts": ["blobFn"],
 	"server/services/narrator-scoped-revert.ts": ["json1"],
 	"server/services/narrator-service.ts": ["blobFn"],
-	"server/services/narrator-session.ts": ["handle"],
+	"server/services/narrator-session.ts": ["handle", "rowid"],
 	"server/services/narrator-subagent-recovery.ts": ["handle"],
 	"server/services/oauth-grant-service.ts": ["errorCode"],
 	"server/services/parent-injection-queue.ts": ["json1"],
@@ -535,18 +558,23 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/project-archive/worker-sqlite-store.ts": ["driver", "pragma"],
 	// `insertOr` left for `project-archive/archive-writer.ts`; the export's own SQLite reads and
 	// PRAGMA work on the portable file stay.
-	"server/services/project-db-sync.ts": ["driver", "pragma", "json1"],
+	"server/services/project-db-sync.ts": ["driver", "connectionModule", "pragma", "json1"],
+	// These workers still read/write portable SQLite archives even with a PG main database.
+	"server/services/project-archive/legacy-sync-worker.ts": ["driver", "pragma", "insertOr"],
+	"server/services/project-archive/legacy-import-worker.ts": [
+		"driver",
+		"connectionModule",
+		"pragma",
+		"sqliteCatalog",
+	],
 	"server/services/revert-history-commit.ts": [
 		"driver",
 		"nativeClient",
 		"drizzleDialect",
 		"pragma",
 		"pragmaFn",
-		"sqliteCatalog",
 		"rowid",
 		"indexHint",
-		"fts5",
-		"insertOr",
 		"sessionFn",
 	],
 	"server/services/revert-mutation-journal.ts": [
@@ -564,15 +592,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"json1",
 	],
 	"server/services/revert-planner-local-access.ts": ["json1"],
-	"server/services/revert-planner-service.ts": ["nativeClient", "pragma", "sessionFn"],
-	"server/services/revert-selection-service.ts": [
-		"driver",
-		"nativeClient",
-		"pragma",
-		"rowid",
-		"indexHint",
-		"sessionFn",
-	],
+	"server/services/revert-planner-service.ts": ["nativeClient"],
+	"server/services/revert-selection-service.ts": ["driver", "nativeClient", "rowid", "indexHint"],
 	"server/services/revert-transaction-service.ts": ["nativeClient", "pragma", "sessionFn"],
 	"server/services/routine-service.ts": ["handle"],
 	// The whole search surface, in one file behind `services/search/port.ts`. NOT SQLite-only: a
@@ -595,7 +616,35 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/tool-continuation-service.ts": ["json1"],
 	"server/services/tool-edit-preview.ts": ["json1"],
 	"server/services/workspace-modification-view.ts": ["rowid"],
-	"server/services/workspace-write-coordinator.ts": ["drizzleDialect", "pragma"],
+	"server/services/workspace-write-coordinator.ts": ["nativeClient", "drizzleDialect", "pragma"],
+	// Main-database services remain tracked work, not permanent SQLite-only exemptions.
+	"server/lib/disk-safety.ts": ["driver", "errorCode"],
+	"server/lib/db-worker/usage-history-query.ts": ["driver"],
+	"server/services/context-composition-history.ts": ["driver"],
+	"server/services/worktree-resource-metadata-store.ts": ["drizzleDialect"],
+	"server/services/narrator-question-history.ts": [
+		"driver",
+		"drizzleDialect",
+		"rowid",
+		"indexHint",
+	],
+	"server/services/workspace-metadata-retry.ts": ["errorCode"],
+	"server/services/remote-workspace-lease-recovery-authority.ts": [
+		"nativeClient",
+		"pragma",
+		"sessionFn",
+	],
+	"server/services/narrator-permission.ts": ["json1"],
+	"server/services/remote-history-journal.ts": ["drizzleDialect", "json1"],
+	"server/services/narrator-context-composition.ts": ["driver", "handle", "json1"],
+	"server/services/usage-history-service.ts": ["connectionModule"],
+	"server/services/narrator-worktree-resources.ts": ["json1"],
+	"server/services/project-import.ts": ["connectionModule"],
+	"server/services/tool-input-stream-source.ts": ["driver", "pragma"],
+	"server/services/narrator-question-service.ts": ["rowid", "json1"],
+	"server/services/worktree-lifecycle-guard.ts": ["json1"],
+	"server/services/workspace-execution-owner.ts": ["nativeClient", "drizzleDialect"],
+	"server/services/workspace-write-lease-store.ts": ["json1"],
 	"shared/subagent-tool-summary.ts": ["json1"],
 };
 
@@ -619,6 +668,7 @@ function isExempt(posixPath: string): boolean {
 	if (fileName.includes(".test.") || fileName.includes(".spec.")) return true;
 	if (posixPath.includes("/__tests__/")) return true;
 	if (posixPath.startsWith("tests/")) return true;
+	if (TEST_ONLY_MODULES.has(posixPath)) return true;
 
 	// Operator CLI tools, run by a human against a local file — not part of the served app.
 	if (posixPath.startsWith("server/scripts/")) return true;
@@ -646,6 +696,26 @@ function collectSourceFiles(dir: string, out: string[] = []): string[] {
 		if (SCAN_EXTENSIONS.some((ext) => entry.endsWith(ext))) out.push(full);
 	}
 	return out;
+}
+
+/** Resolve static imports/re-exports, dynamic imports and require calls, including type imports. */
+function importedTestOnlyModules(file: string, source: string): string[] {
+	const found = new Set<string>();
+	for (const imported of ts.preProcessFile(source, true, true).importedFiles) {
+		const specifier = imported.fileName;
+		const base = specifier.startsWith(".")
+			? resolve(REPO_ROOT, dirname(file), specifier)
+			: specifier.startsWith("@server/")
+				? resolve(REPO_ROOT, "server", specifier.slice("@server/".length))
+				: specifier.startsWith("@frontend/")
+					? resolve(REPO_ROOT, "frontend", specifier.slice("@frontend/".length))
+					: undefined;
+		if (!base) continue;
+		const stem = toPosixRelative(base).replace(/\.(?:[cm]?js|tsx?)$/, "");
+		for (const candidate of [`${stem}.ts`, `${stem}.tsx`, `${stem}/index.ts`])
+			if (TEST_ONLY_MODULES.has(candidate)) found.add(candidate);
+	}
+	return [...found];
 }
 
 /**
@@ -1145,6 +1215,61 @@ describe("SQLite dialect inventory guard", () => {
 		expect(isExempt("frontend/components/settings/StorageSection.tsx")).toBe(false);
 	});
 
+	it("test-only fixtures cannot be imported by production modules", () => {
+		const files = SCAN_ROOTS.flatMap((root) => collectSourceFiles(join(REPO_ROOT, root)));
+		const relativeFiles = new Set(files.map(toPosixRelative));
+		for (const fixture of TEST_ONLY_MODULES) {
+			expect(relativeFiles.has(fixture), `${fixture} must remain a real fixture`).toBe(true);
+			expect(isExempt(fixture)).toBe(true);
+			expect(DIALECT_INVENTORY[fixture]).toBeUndefined();
+		}
+		const violations: string[] = [];
+		for (const absolute of files) {
+			const file = toPosixRelative(absolute);
+			if (isExempt(file)) continue;
+			for (const fixture of importedTestOnlyModules(file, readFileSync(absolute, "utf8")))
+				violations.push(`${file} imports test-only ${fixture}`);
+		}
+		expect(violations).toEqual([]);
+	});
+
+	it("self-check: fixture classification catches imports, re-exports, require and aliases", () => {
+		expect(
+			importedTestOnlyModules(
+				"server/services/new-service.ts",
+				`
+			import type { Fixture } from "./local-session-detach/contract";
+			export * from "./local-session-detach/planner";
+			const dynamic = import("./local-session-detach/executor.js");
+			const fixture = require("@server/services/worktree-resource-fixture");
+		`,
+			),
+		).toEqual([
+			"server/services/local-session-detach/contract.ts",
+			"server/services/local-session-detach/planner.ts",
+			"server/services/local-session-detach/executor.ts",
+			"server/services/worktree-resource-fixture.ts",
+		]);
+		expect(
+			importedTestOnlyModules(
+				"server/services/local-session-detach/new-adapter.ts",
+				'import { store } from "./store";',
+			),
+		).toEqual(["server/services/local-session-detach/store.ts"]);
+		expect(isExempt("server/services/worktree-resource-fixture-production.ts")).toBe(false);
+		expect(isExempt("server/services/local-session-detach/new-adapter.ts")).toBe(false);
+		expect(
+			importedTestOnlyModules(
+				"server/services/new-service.ts",
+				`
+			// import { fixture } from "./worktree-resource-fixture";
+			const prose = "worktree-resource-fixture";
+			import { db } from "../db";
+		`,
+			),
+		).toEqual([]);
+	});
+
 	it("SQLite-only modules are the intentional floor, not the whole ledger", () => {
 		// The point of the distinction: most registered files are candidates for the port, a
 		// minority is staying. If these two ever coincide, the ledger has stopped tracking
@@ -1164,6 +1289,8 @@ describe("SQLite dialect inventory guard", () => {
 			"server/services/project-archive/archive-file.ts",
 			"server/services/project-archive/archive-writer.ts",
 			"server/services/project-archive/export-rows.ts",
+			"server/services/project-archive/legacy-sync-worker.ts",
+			"server/services/project-archive/legacy-import-worker.ts",
 		]) {
 			expect(SQLITE_ONLY_MODULES.has(file), `${file} writes/reads the portable archive`).toBe(true);
 		}
@@ -1189,6 +1316,11 @@ describe("SQLite dialect inventory guard", () => {
 		for (const file of [
 			"server/services/search/sqlite-store.ts",
 			"server/services/project-archive/sqlite-main-store.ts",
+			"server/services/remote-history-journal.ts",
+			"server/services/remote-workspace-lease-recovery-authority.ts",
+			"server/services/workspace-execution-owner.ts",
+			"server/services/workspace-write-lease-store.ts",
+			"server/services/workspace-write-coordinator.ts",
 		]) {
 			expect(DIALECT_INVENTORY[file], `${file} must be registered`).toBeDefined();
 			expect(

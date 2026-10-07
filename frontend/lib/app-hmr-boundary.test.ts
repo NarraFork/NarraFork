@@ -151,6 +151,43 @@ function resolveLocalSpecifier(specifier: string, importer: string): string | nu
 	return null;
 }
 
+const importScanner = new Bun.Transpiler({ loader: "tsx" });
+
+/** Runtime edges only: type-only imports/exports disappear before Vite sees them. */
+function staticRuntimeSpecifiers(source: string): string[] {
+	return importScanner
+		.scanImports(source)
+		.filter((entry) => entry.kind === "import-statement")
+		.map((entry) => entry.path);
+}
+
+describe("runtime import graph extraction", () => {
+	it("ignores type-only and dynamic edges without excluding real runtime API imports", () => {
+		expect(
+			staticRuntimeSpecifiers(`
+			import type { ToolCallDetailRef } from "./api/narrators";
+			export type { Descriptor } from "./types";
+			import { type Result, run } from "./api/runtime";
+			export { value } from "./runtime-barrel";
+			import "./effect";
+			const lazy = import("./lazy");
+			run();
+		`),
+		).toEqual(["./api/runtime", "./runtime-barrel", "./effect"]);
+	});
+	it("includes multiline runtime imports and does not invent edges from comments", () => {
+		expect(
+			staticRuntimeSpecifiers(`
+			// import { lure } from "./comment";
+			import {
+				start,
+			} from "./multiline";
+			start();
+		`),
+		).toEqual(["./multiline"]);
+	});
+});
+
 /**
  * Every local module statically reachable from `main.tsx`, EXCLUDING the `App.tsx`
  * subtree (which is a valid boundary and stops propagation) and CSS (handled by Vite's
@@ -175,17 +212,9 @@ function modulesReachableFromEntry(): string[] {
 			return;
 		}
 
-		// `import x from "y"` / `export … from "y"` (barrels re-export, which counts), and
-		// bare side-effect `import "y"`.
-		const patterns = [
-			/(?:^|\n)\s*(?:import|export)\b[^;\n]*?from\s+["']([^"']+)["']/g,
-			/(?:^|\n)\s*import\s+["']([^"']+)["']/g,
-		];
-		for (const pattern of patterns) {
-			for (const match of source.matchAll(pattern)) {
-				const resolved = resolveLocalSpecifier(match[1], file);
-				if (resolved && resolved !== appTsx) walk(resolved);
-			}
+		for (const specifier of staticRuntimeSpecifiers(source)) {
+			const resolved = resolveLocalSpecifier(specifier, file);
+			if (resolved && resolved !== appTsx) walk(resolved);
 		}
 	};
 

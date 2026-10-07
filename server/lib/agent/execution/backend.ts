@@ -118,6 +118,25 @@ export interface DirEntry {
 }
 
 /** Options for reading raw file bytes. */
+export interface ListBoundedOptions {
+	showHidden?: boolean;
+	directoriesOnly?: boolean;
+	maxScanned?: number;
+	maxEntries?: number;
+	maxBytes?: number;
+	timeoutMs?: number;
+	expectedResolvedPath?: string;
+	signal?: AbortSignal;
+}
+
+export interface ListBoundedResult {
+	reason?: string;
+	entries: DirEntry[];
+	truncated: boolean;
+	scanned: number;
+	resolvedPath?: string;
+}
+
 export interface ReadBytesOptions {
 	/** Maximum number of bytes to return. Backend truncates beyond this. */
 	maxBytes?: number;
@@ -233,6 +252,8 @@ export interface GrepResult {
 	stdoutBytes: Uint8Array;
 	stderr: string;
 	exitCode: number;
+	/** Search was narrowed by immutable executor-private namespace exclusions. */
+	policyExcluded?: boolean;
 	/** stdout was cut off at maxBytes. */
 	truncatedByBytes: boolean;
 	/** Process was killed by the timeout. */
@@ -298,8 +319,28 @@ export interface GitDiffParams {
  * `RemoteBackend` forwards each call to a remote executor via RPC.
  */
 export interface ExecutionBackend {
+	/** Additive private-history data plane; never falls back to plain fs.write. */
+	readonly supportsRemoteHistory?: boolean;
+	readonly supportsRemoteTreeCapture?: boolean;
+	readonly supportsRemoteObjectStage?: boolean;
+	readonly remoteHistoryChunkBytes?: number;
+	readonly supportsFsListBounded?: boolean;
+	readonly supportsShareArchive?: boolean;
+	readonly supportsWorkspaceAttachment?: boolean;
+	workspaceAttachment?: import("@shared/workspace-attachment-protocol").WorkspaceAttachmentBackend["workspaceAttachment"];
+	shareArchive?(
+		request: import("./share-archive-rpc").ShareArchiveRequest,
+		signal?: AbortSignal,
+	): Promise<import("./share-archive-rpc").ShareArchiveResult>;
+	listBounded?(path: string, opts?: ListBoundedOptions): Promise<ListBoundedResult>;
+	remoteHistory?: import("@shared/remote-history-protocol").RemoteHistoryBackend["remoteHistory"];
 	/** Feature-negotiated structured remote Git; absent on local/legacy backends. */
 	readonly supportsGitWorkspace?: boolean;
+	readonly supportsGitWorktree?: boolean;
+	gitWorktree?(
+		request: import("./git-worktree-rpc").GitWorktreeRequest,
+		signal?: AbortSignal,
+	): Promise<import("./git-worktree-rpc").GitWorktreeResult>;
 	readonly supportsGitWorkspaceWatch?: boolean;
 	/** Executor advertises the read-only commit preview operations. */
 	readonly supportsGitCommitPreview?: boolean;

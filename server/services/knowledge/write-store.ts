@@ -411,8 +411,29 @@ export interface RecordPackActivationWrite {
 	narratorId: string;
 	extractDir: string;
 	archiveHash: string;
+	/** Legacy callers default to an explicitly host-local permission row. */
+	targetKind?: "host" | "device";
+	targetValue?: string;
+	pathFlavor?: "posix" | "windows";
+	targetBindingJson?: {
+		version: 1;
+		materializationState?: "complete" | "partial";
+		workspace: import("@shared/workspace-context").WorkspaceContext;
+		extractDir: string;
+		runtimeGeneration: number;
+		actorUserId: string | null;
+		files: Array<{
+			relativePath: string;
+			receipt: import("@shared/workspace-attachment-protocol").WorkspaceAttachmentCreationProof;
+		}>;
+	};
 	now: string;
 }
+
+export type RecordPartialPackMaterializationWrite = Omit<
+	RecordPackActivationWrite,
+	"whitelistDirId" | "targetKind" | "targetValue" | "pathFlavor"
+> & { targetBindingJson: NonNullable<RecordPackActivationWrite["targetBindingJson"]> };
 
 export interface EnsureSpecNamespaceWrite {
 	namespaceId: string;
@@ -674,6 +695,7 @@ export interface KnowledgeWriteStore {
 	 * agent never holds a whitelist entry whose activation record is missing.
 	 */
 	recordPackActivation(input: RecordPackActivationWrite): Promise<void>;
+	recordPartialPackMaterialization(input: RecordPartialPackMaterializationWrite): Promise<void>;
 	/** Release an activation: drop the whitelist row and mark the row released. */
 	releasePackActivation(input: {
 		activationId: string;

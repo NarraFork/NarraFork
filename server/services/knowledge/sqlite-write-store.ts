@@ -875,6 +875,32 @@ export const sqliteKnowledgeWriteStore: KnowledgeWriteStore = {
 	},
 
 	async recordPackActivation(input: RecordPackActivationWrite): Promise<void> {
+		const binding = input.targetBindingJson;
+		if (binding) {
+			const { isWorkspaceAttachmentProof } = await import("../../lib/workspace-attachment-io");
+			if (
+				binding.version !== 1 ||
+				typeof binding.actorUserId !== "string" ||
+				!binding.actorUserId ||
+				binding.extractDir !== input.extractDir ||
+				binding.files.length > 1000 ||
+				Buffer.byteLength(JSON.stringify(binding)) > 512 * 1024 ||
+				binding.files.some((file) => !isWorkspaceAttachmentProof(file.receipt))
+			)
+				throw new ValidationError(
+					"Pack activation source/proof metadata is invalid or exceeds its budget",
+				);
+			if (
+				(input.targetKind ?? "host") !==
+					(binding.workspace.deviceId === "local" ? "host" : "device") ||
+				(input.targetValue ?? "local") !== binding.workspace.deviceId ||
+				input.pathFlavor !== binding.workspace.pathFlavor
+			)
+				throw new ValidationError(
+					"Pack activation permission does not match its original workspace source",
+				);
+		} else if (input.targetKind === "device")
+			throw new ValidationError("Device pack activation requires original source/proof metadata");
 		db.transaction((tx) => {
 			// Upsert-style: a unique (narratorId, path) index exists, so delete any prior
 			// row for this exact path first (e.g. left over from an unclean release).
@@ -883,6 +909,13 @@ export const sqliteKnowledgeWriteStore: KnowledgeWriteStore = {
 					and(
 						eq(narratorWhitelistDirs.narratorId, input.narratorId),
 						eq(narratorWhitelistDirs.path, input.extractDir),
+						eq(narratorWhitelistDirs.targetKind, input.targetKind ?? "host"),
+						input.targetKind === "device"
+							? eq(narratorWhitelistDirs.targetValue, input.targetValue ?? "")
+							: or(
+									isNull(narratorWhitelistDirs.targetValue),
+									eq(narratorWhitelistDirs.targetValue, "local"),
+								),
 					),
 				)
 				.run();
@@ -891,6 +924,9 @@ export const sqliteKnowledgeWriteStore: KnowledgeWriteStore = {
 					id: input.whitelistDirId,
 					narratorId: input.narratorId,
 					path: input.extractDir,
+					pathFlavor: input.pathFlavor ?? "posix",
+					targetKind: input.targetKind ?? "host",
+					targetValue: input.targetKind === "device" ? input.targetValue : null,
 					accessLevel: "readWrite",
 					enabled: true,
 					createdAt: input.now,
@@ -902,6 +938,7 @@ export const sqliteKnowledgeWriteStore: KnowledgeWriteStore = {
 					packId: input.packId,
 					narratorId: input.narratorId,
 					extractDir: input.extractDir,
+					targetBindingJson: input.targetBindingJson ?? null,
 					whitelistDirId: input.whitelistDirId,
 					archiveHash: input.archiveHash,
 					status: "active",
@@ -909,6 +946,36 @@ export const sqliteKnowledgeWriteStore: KnowledgeWriteStore = {
 				})
 				.run();
 		});
+	},
+
+	async recordPartialPackMaterialization(
+		input: import("./write-store").RecordPartialPackMaterializationWrite,
+	): Promise<void> {
+		const binding = input.targetBindingJson;
+		const { isWorkspaceAttachmentProof } = await import("../../lib/workspace-attachment-io");
+		if (
+			binding.version !== 1 ||
+			binding.materializationState !== "partial" ||
+			!binding.actorUserId ||
+			binding.extractDir !== input.extractDir ||
+			binding.files.length > 1000 ||
+			Buffer.byteLength(JSON.stringify(binding)) > 512 * 1024 ||
+			binding.files.some((file) => !isWorkspaceAttachmentProof(file.receipt))
+		)
+			throw new ValidationError("Partial pack source evidence is invalid or exceeds its budget");
+		db.insert(knowledgePackActivations)
+			.values({
+				id: input.activationId,
+				packId: input.packId,
+				narratorId: input.narratorId,
+				extractDir: input.extractDir,
+				archiveHash: input.archiveHash,
+				targetBindingJson: binding,
+				whitelistDirId: null,
+				status: "partial",
+				createdAt: input.now,
+			})
+			.run();
 	},
 
 	async releasePackActivation(input: {

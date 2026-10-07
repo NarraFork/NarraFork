@@ -675,6 +675,12 @@ export interface NarratorWSCallbacks {
 		snapshot?: import("@shared/context-usage").ContextUsageSnapshot,
 	) => void;
 	onGitStatus?: (data: {
+		/** Frozen production scope; absent only on legacy server events. */
+		deviceId?: string;
+		workspaceKey?: string | null;
+		repositoryKey?: string | null;
+		contextKey?: string;
+		workspaceRevision?: number;
 		/** Null for chapter-less narrators; workspace-keyed queries still apply. */
 		chapterId: string | null;
 		commitsAhead: number;
@@ -1442,6 +1448,19 @@ export function useNarratorWS(
 						break;
 					case "git_status":
 						callbackOwner.callbacks.onGitStatus?.({
+							...(typeof data.deviceId === "string" ? { deviceId: data.deviceId } : {}),
+							...(typeof data.workspaceKey === "string" || data.workspaceKey === null
+								? { workspaceKey: data.workspaceKey }
+								: {}),
+							...(typeof data.repositoryKey === "string" || data.repositoryKey === null
+								? { repositoryKey: data.repositoryKey }
+								: {}),
+							...(typeof data.contextKey === "string" ? { contextKey: data.contextKey } : {}),
+							...(typeof data.workspaceRevision === "number" &&
+							Number.isSafeInteger(data.workspaceRevision) &&
+							data.workspaceRevision >= 0
+								? { workspaceRevision: data.workspaceRevision }
+								: {}),
 							chapterId: (data.chapterId as string | null) ?? null,
 							commitsAhead: (data.commitsAhead as number) ?? 0,
 							baseBranch: (data.baseBranch as string) ?? "",

@@ -1,4 +1,5 @@
 /** Lazy file-tree reads and mutations are scoped to one execution-context identity. */
+import type { WorkspaceContext } from "@shared/workspace-context";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../../lib/api";
 import { TREE_ROOT_KEY, type TreeChange } from "./tree-patch";
@@ -21,6 +22,7 @@ export interface UseFileTreeResult {
 	state: TreeState;
 	loading: ReadonlySet<string>;
 	errors: ReadonlyMap<string, string>;
+	truncated: ReadonlySet<string>;
 	load: (dir: string) => Promise<void>;
 	reload: (dir: string) => Promise<void>;
 	reloadAll: () => void;
@@ -31,9 +33,16 @@ interface TreeSnapshot {
 	state: TreeState;
 	loading: ReadonlySet<string>;
 	errors: ReadonlyMap<string, string>;
+	truncated: ReadonlySet<string>;
 }
 function emptySnapshot(token: object): TreeSnapshot {
-	return { token, state: emptyTreeState(), loading: new Set(), errors: new Map() };
+	return {
+		token,
+		state: emptyTreeState(),
+		loading: new Set(),
+		errors: new Map(),
+		truncated: new Set(),
+	};
 }
 
 /** A token, not a path equality check: returning A→B→A must not revive A's old requests. */
@@ -41,16 +50,32 @@ export function useFileTree(
 	root: string,
 	showHidden: boolean,
 	contextKey = root,
+	workspace?: { narratorId: string; context: WorkspaceContext },
 ): UseFileTreeResult {
-	const key = JSON.stringify([contextKey, root, showHidden]);
+	const key = JSON.stringify([
+		contextKey,
+		workspace?.narratorId,
+		workspace?.context.deviceId,
+		workspace?.context.revision,
+		root,
+		showHidden,
+	]);
 	const identity = useRef({
 		key,
 		token: {},
 		active: true,
+		controller: new AbortController(),
 		inFlight: new Map<string, Promise<void>>(),
 	});
 	if (identity.current.key !== key) {
-		identity.current = { key, token: {}, active: true, inFlight: new Map() };
+		identity.current.controller.abort();
+		identity.current = {
+			key,
+			token: {},
+			active: true,
+			controller: new AbortController(),
+			inFlight: new Map(),
+		};
 	}
 	const owner = identity.current;
 	const [stored, setStored] = useState<TreeSnapshot>(() => emptySnapshot(owner.token));
@@ -70,6 +95,7 @@ export function useFileTree(
 		owner.active = true;
 		return () => {
 			owner.active = false;
+			owner.controller.abort();
 		};
 	}, [owner]);
 	const update = useCallback(
@@ -94,9 +120,20 @@ export function useFileTree(
 				}
 				update((previous) => ({ ...previous, loading: new Set(previous.loading).add(dir) }));
 				try {
-					const path = dir === TREE_ROOT_KEY ? root : `${root}/${dir}`;
-					const response = await api.fsBrowse(path, { showHidden, includeFiles: true });
+					if (!workspace) throw new Error("Narrator workspace identity is required");
+					const response = await api.browseNarratorWorkspace(
+						workspace.narratorId,
+						workspace.context,
+						dir === TREE_ROOT_KEY ? undefined : dir,
+						{ showHidden, signal: owner.controller.signal },
+					);
 					if (!current()) return;
+					if (
+						response.deviceId !== workspace.context.deviceId ||
+						response.contextKey !== workspace.context.contextKey ||
+						response.revision !== workspace.context.revision
+					)
+						throw new Error("Workspace identity changed");
 					const entries: TreeEntry[] = response.entries.map((entry) => ({
 						name: entry.name,
 						path: dir === TREE_ROOT_KEY ? entry.name : `${dir}/${entry.name}`,
@@ -107,7 +144,15 @@ export function useFileTree(
 					update((previous) => {
 						const errors = new Map(previous.errors);
 						errors.delete(dir);
-						return { ...previous, state: setDirEntries(previous.state, dir, entries), errors };
+						const truncated = new Set(previous.truncated);
+						if (response.truncated) truncated.add(dir);
+						else truncated.delete(dir);
+						return {
+							...previous,
+							state: setDirEntries(previous.state, dir, entries),
+							errors,
+							truncated,
+						};
 					});
 				} catch (error) {
 					update((previous) => ({
@@ -131,7 +176,7 @@ export function useFileTree(
 			owner.inFlight.set(dir, task);
 			return task;
 		},
-		[current, owner, root, showHidden, update],
+		[current, owner, root, showHidden, update, workspace],
 	);
 
 	const load = useCallback(
@@ -185,6 +230,7 @@ export function useFileTree(
 		state: snapshot.state,
 		loading: snapshot.loading,
 		errors: snapshot.errors,
+		truncated: snapshot.truncated,
 		load,
 		reload,
 		reloadAll,

@@ -36,6 +36,7 @@ import {
 import { queryEditorOperation } from "./editor-document-runtime";
 import {
 	type EditorActor,
+	type EditorBinding,
 	EditorDocumentError,
 	EditorDocumentService,
 } from "./editor-document-service";
@@ -942,6 +943,123 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		await writeFile(join(root, "transfers", "ed-1234-abcd"), "orphan");
 		await create();
 		expect(await bodies()).toHaveLength(1);
+	});
+});
+
+describe("remote editor adapter routing and identity", () => {
+	let binding: EditorBinding;
+	let remoteBytes: Uint8Array;
+	let saves: number;
+	beforeEach(async () => {
+		await service.dispose();
+		binding = {
+			deviceId: "executor",
+			cwd: root,
+			projectId: null,
+			lexicalPath: target,
+			canonicalPath: target,
+			outsideRoots: false,
+			workspaceRevision: 9,
+			contextKey: "workspace-nine",
+			runtimeGeneration: 4,
+			canonicalIdentity: target,
+			rootIdentity: "remote-root-inode",
+			editable: true,
+		};
+		remoteBytes = new TextEncoder().encode("remote before\r\n");
+		saves = 0;
+		actor.authorize = async () => ({ ...binding });
+		service = new EditorDocumentService({
+			root: join(root, "remote-transfers"),
+			execute() {
+				throw new Error("Host editor dispatch is forbidden");
+			},
+			afterWrite() {
+				throw new Error("Host claim and snapshot IO is forbidden");
+			},
+			remote: {
+				async source(_actor, _binding, path, signal) {
+					signal.throwIfAborted();
+					await writeFile(path, remoteBytes, { flag: "wx", mode: 0o600 });
+				},
+				async execute(_actor, _binding, request) {
+					await request.authorize();
+					const prepared = await request.construct({
+						bytes: remoteBytes,
+						mode: 0o644,
+						identity: null,
+					});
+					await request.authorize();
+					remoteBytes = prepared.nextBytes;
+					saves++;
+					return {
+						result: prepared.result,
+						linesAdded: null,
+						linesRemoved: null,
+						fileChangeEvidence: {
+							version: 2,
+							operationId: request.requestId,
+							effectId: "remote-effect",
+							grade: "measured",
+							settlement: "settled",
+							outcome: "changed",
+						},
+					};
+				},
+				async queryOperation() {
+					return null;
+				},
+			},
+		});
+	});
+	const openRemote = () =>
+		service.create(actor, { path: target, deviceId: "executor", origin: "reference" });
+	test("remote source and save never touch a same-named host file or local afterWrite", async () => {
+		const doc = await openRemote();
+		expect(doc.target.deviceId).toBe("executor");
+		expect(doc.editable).toBe(true);
+		expect(doc.baseHash).toBe(hash("remote before\r\n"));
+		const id = await upload(doc, "remote saved\n");
+		expect((await service.commit(actor, doc.docId, id, {})).status).toBe("saved");
+		expect(new TextDecoder().decode(remoteBytes)).toBe("remote saved\r\n");
+		expect(await readFile(target, "utf8")).toBe("before\r\n中文🙂\r\n");
+		expect(saves).toBe(1);
+	});
+	for (const key of [
+		"deviceId",
+		"contextKey",
+		"workspaceRevision",
+		"runtimeGeneration",
+		"canonicalIdentity",
+		"rootIdentity",
+	] as const) {
+		test(`changed remote ${key} invalidates an open document`, async () => {
+			const doc = await openRemote();
+			binding = { ...binding, [key]: typeof binding[key] === "number" ? 99 : "changed" };
+			await expect(service.content(actor, doc.docId, doc.versionHandle)).rejects.toThrow(
+				"identity changed",
+			);
+			expect(saves).toBe(0);
+		});
+	}
+	test("remote content conflict preserves source and never dispatches overwrite", async () => {
+		const doc = await openRemote(),
+			id = await upload(doc, "draft");
+		remoteBytes = new TextEncoder().encode("external update");
+		const error = await failure(() => service.commit(actor, doc.docId, id, {}));
+		expect(error.code).toBe("STALE_WRITE");
+		expect(error.data.conflictVersionHandle).toBeTruthy();
+		expect(new TextDecoder().decode(remoteBytes)).toBe("external update");
+		expect(saves).toBe(0);
+	});
+	test("read-only remote viewer cannot upload a write", async () => {
+		binding.editable = false;
+		binding.readOnlyReason = "Human viewer has no Write grant";
+		const doc = await openRemote();
+		expect(doc.editable).toBe(false);
+		const id = await upload(doc, "draft");
+		await expect(service.commit(actor, doc.docId, id, {})).rejects.toThrow("no Write grant");
+		expect(saves).toBe(0);
 	});
 });
 

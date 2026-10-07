@@ -1,18 +1,28 @@
+import type { WorkspaceContext } from "@shared/workspace-context";
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, narratorToolCalls } from "../db/schema";
+import { targetPathSemantics } from "../lib/agent/execution/path-semantics";
 import { shouldDisablePlanReflectionReview } from "../lib/agent/tools/plan-mode";
 import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
 import {
 	measureSerializedCharacters,
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
+import { AppError, NotFoundError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { addTrait, parseTraits, removeTrait } from "../lib/narrator-utils";
 import { forcesRelaxedPlan, resolveEffectiveRelaxedPlan } from "../lib/permission-modes";
-import { buildPlanFileRelPath } from "../lib/plan-file-path";
+import {
+	buildPlanFileRelPath,
+	type PlanFileBinding,
+	resolveExistingPlanFileRelPath,
+	type WorkspaceFileAccess,
+} from "../lib/plan-file-path";
 import { generateWordSlug } from "../lib/words";
 import type { PreparedPlanMode } from "./narrator-session-state";
+import { workspaceContextService } from "./workspace-context-service";
+import { createNarratorWorkspaceFileAccess } from "./workspace-file-access";
 
 /** Maximum UTF-8 byte length reserved for the human-readable plan_name prefix. */
 export const PLAN_NAME_MAX_BYTES = 48;
@@ -28,7 +38,7 @@ const pendingPlanFileIds = new Set<string>();
 const pendingPlanFileIdsByNarrator = new Map<string, Set<string>>();
 const pendingPlanFileRecords = new Map<
 	string,
-	{ narratorId: string; toolCallId: string; toolUseId: string }
+	{ narratorId: string; toolCallId: string; toolUseId: string; planFileBinding?: PlanFileBinding }
 >();
 const planFileIdentityLock = new AsyncMutex();
 
@@ -37,9 +47,10 @@ function markPendingPlanFileId(
 	planFileId: string,
 	toolCallId: string,
 	toolUseId: string,
+	planFileBinding?: PlanFileBinding,
 ): void {
 	pendingPlanFileIds.add(planFileId);
-	pendingPlanFileRecords.set(planFileId, { narratorId, toolCallId, toolUseId });
+	pendingPlanFileRecords.set(planFileId, { narratorId, toolCallId, toolUseId, planFileBinding });
 	const ids = pendingPlanFileIdsByNarrator.get(narratorId) ?? new Set<string>();
 	ids.add(planFileId);
 	pendingPlanFileIdsByNarrator.set(narratorId, ids);
@@ -91,12 +102,20 @@ export interface PlanModeStateResult {
 	traits: string[];
 	planFileId?: string;
 	planFilePath?: string;
+	planFileBinding?: import("../lib/plan-file-path").PlanFileBinding;
 	previousPermissionMode?: string;
 	wasPlanMode: boolean;
 	changed: boolean;
 	relaxedPlan: boolean;
 	relaxedPlanChanged: boolean;
 	planReflectionDisabled?: boolean;
+}
+
+export interface PlanModeWorkspaceOptions {
+	userId?: string | null;
+	signal?: AbortSignal;
+	workspaceContext?: WorkspaceContext;
+	fileAccess?: WorkspaceFileAccess;
 }
 
 export interface EnterPlanModeToolResultCommit {
@@ -214,6 +233,7 @@ export async function prepareNarratorPlanMode(
 	toolCallId: string,
 	toolUseId: string,
 	customPlanName?: string,
+	options: PlanModeWorkspaceOptions = {},
 ): Promise<PreparedPlanMode> {
 	return narratorTraitsLock.acquire(narratorId, async () => {
 		const current = await db.query.narrators.findFirst({
@@ -222,6 +242,9 @@ export async function prepareNarratorPlanMode(
 				permissionMode: true,
 				previousPermissionMode: true,
 				planFileId: true,
+				planFileBinding: true,
+				workspaceContext: true,
+				workspaceRevision: true,
 				planMode: true,
 				traits: true,
 			},
@@ -231,13 +254,38 @@ export async function prepareNarratorPlanMode(
 		const durablePlanFileId =
 			currentIsPlanMode && isSafePlanFileId(current?.planFileId) ? current.planFileId : undefined;
 		if (durablePlanFileId) reservedPlanFileIds.add(durablePlanFileId);
+		options.signal?.throwIfAborted();
 		const planFileId = durablePlanFileId ?? (await generateUniquePlanFileId(customPlanName));
-		if (!durablePlanFileId) markPendingPlanFileId(narratorId, planFileId, toolCallId, toolUseId);
+		const savedBinding =
+			current?.planFileBinding?.planFileId === planFileId ? current.planFileBinding : undefined;
+		if (durablePlanFileId && !savedBinding && (current?.workspaceRevision ?? 0) > 0)
+			throw new AppError(
+				"Original plan source is unknown after a workspace switch; exit plan mode and explicitly start a new cycle",
+				409,
+				"PLAN_SOURCE_UNAVAILABLE",
+			);
+		const workspace =
+			options.workspaceContext ??
+			(current?.workspaceContext?.revision === current?.workspaceRevision
+				? current?.workspaceContext
+				: undefined);
+		const planFileBinding = savedBinding
+			? structuredClone(savedBinding)
+			: workspace
+				? {
+						workspaceContext: structuredClone(workspace),
+						planFileId,
+						planFilePath: buildPlanFileRelPath(planFileId),
+					}
+				: undefined;
+		if (!durablePlanFileId)
+			markPendingPlanFileId(narratorId, planFileId, toolCallId, toolUseId, planFileBinding);
 		return {
 			toolCallId,
 			toolUseId,
 			planFileId,
-			planFilePath: buildPlanFileRelPath(planFileId),
+			planFilePath: planFileBinding?.planFilePath ?? buildPlanFileRelPath(planFileId),
+			planFileBinding,
 			previousPermissionMode:
 				current?.previousPermissionMode ?? current?.permissionMode ?? "default",
 		};
@@ -262,6 +310,7 @@ export async function commitPreparedEnterPlanModeResult(
 						permissionMode: true,
 						previousPermissionMode: true,
 						planFileId: true,
+						planFileBinding: true,
 						planMode: true,
 						relaxedPlan: true,
 						traits: true,
@@ -305,6 +354,12 @@ export async function commitPreparedEnterPlanModeResult(
 			// A valid durable identity always wins. This makes concurrent prepared calls
 			// converge on the first committed plan file without persisting a path-bearing ID.
 			const planFileId = currentPlanFileId ?? prepared.planFileId;
+			const planFileBinding =
+				current.planFileBinding?.planFileId === planFileId
+					? current.planFileBinding
+					: prepared.planFileBinding?.planFileId === planFileId
+						? prepared.planFileBinding
+						: undefined;
 			const relaxedPlan = resolveEffectiveRelaxedPlan(current.permissionMode, current.relaxedPlan);
 			const relaxedPlanChanged = relaxedPlan !== current.relaxedPlan;
 			const changed =
@@ -353,6 +408,7 @@ export async function commitPreparedEnterPlanModeResult(
 					planMode: true,
 					previousPermissionMode,
 					planFileId,
+					planFileBinding: planFileBinding ?? null,
 					relaxedPlan,
 					...(planReflectionDisabled ? { planReflectionAutoApproveOverride: "off" as const } : {}),
 					messageVersion: sql`${narrators.messageVersion} + 1`,
@@ -365,7 +421,8 @@ export async function commitPreparedEnterPlanModeResult(
 				contextMessageId: toolCall.messageId,
 				traits: nextTraits,
 				planFileId,
-				planFilePath: buildPlanFileRelPath(planFileId),
+				planFilePath: planFileBinding?.planFilePath ?? buildPlanFileRelPath(planFileId),
+				planFileBinding,
 				previousPermissionMode,
 				wasPlanMode,
 				changed,
@@ -387,6 +444,7 @@ export async function enterNarratorPlanMode(
 	narratorId: string,
 	customPlanName?: string,
 	preparedPlanFileId?: string,
+	options: PlanModeWorkspaceOptions = {},
 ): Promise<PlanModeStateResult> {
 	return narratorTraitsLock.acquire(narratorId, async () => {
 		const current = await db.query.narrators.findFirst({
@@ -395,13 +453,17 @@ export async function enterNarratorPlanMode(
 				permissionMode: true,
 				previousPermissionMode: true,
 				planFileId: true,
+				planFileBinding: true,
+				workspaceRevision: true,
 				planMode: true,
 				relaxedPlan: true,
 				traits: true,
 			},
 		});
-		const currentTraits = parseTraits(current?.traits);
-		const wasPlanMode = current?.planMode === true || currentTraits.includes("plan");
+		if (!current) throw new NotFoundError("Narrator", narratorId);
+		options.signal?.throwIfAborted();
+		const currentTraits = parseTraits(current.traits);
+		const wasPlanMode = current.planMode === true || currentTraits.includes("plan");
 		const previousPermissionMode =
 			current?.previousPermissionMode ?? current?.permissionMode ?? "default";
 		// Once an identity is durable it wins over any concurrently prepared slug.
@@ -418,36 +480,90 @@ export async function enterNarratorPlanMode(
 			durablePlanFileId ??
 			usablePreparedPlanFileId ??
 			(await generateUniquePlanFileId(customPlanName));
-		if (usablePreparedPlanFileId) {
-			consumePendingPlanFileId(narratorId, usablePreparedPlanFileId);
+		const savedBinding =
+			current.planFileBinding?.planFileId === planFileId ? current.planFileBinding : undefined;
+		const preparedBinding = usablePreparedPlanFileId
+			? pendingPlanFileRecords.get(usablePreparedPlanFileId)?.planFileBinding
+			: undefined;
+		let planFileBinding = savedBinding
+			? structuredClone(savedBinding)
+			: preparedBinding?.planFileId === planFileId
+				? structuredClone(preparedBinding)
+				: undefined;
+		if (!planFileBinding) {
+			const workspace = options.workspaceContext
+				? structuredClone(options.workspaceContext)
+				: await workspaceContextService.get(narratorId, { userId: options.userId ?? null });
+			if (!workspace.cwd || !targetPathSemantics(workspace.pathFlavor).isAbsolute(workspace.cwd))
+				throw new AppError(
+					"Configure a workspace before entering plan mode",
+					409,
+					"PLAN_SOURCE_UNAVAILABLE",
+				);
+			if (durablePlanFileId && workspace.revision > 0)
+				throw new AppError(
+					"Original plan source is unknown after a workspace switch; exit plan mode and explicitly start a new cycle",
+					409,
+					"PLAN_SOURCE_UNAVAILABLE",
+				);
+			let planFilePath = buildPlanFileRelPath(planFileId);
+			if (durablePlanFileId) {
+				const access =
+					options.fileAccess ??
+					createNarratorWorkspaceFileAccess(narratorId, workspace, {
+						userId: options.userId ?? null,
+						signal: options.signal,
+					});
+				planFilePath =
+					(await resolveExistingPlanFileRelPath(workspace.cwd, planFileId, access)) ?? planFilePath;
+			}
+			planFileBinding = { workspaceContext: workspace, planFileId, planFilePath };
 		}
+		options.signal?.throwIfAborted();
 		const nextTraits = wasPlanMode ? currentTraits : addTrait(currentTraits, "plan");
 		// 全部允许权限下进入计划模式时，忽略默认宽松设置，始终启用宽松规划，防止阻塞。
 		const relaxedPlanChanged = forcesRelaxedPlan(current?.permissionMode) && !current?.relaxedPlan;
 		const relaxedPlan = resolveEffectiveRelaxedPlan(current?.permissionMode, current?.relaxedPlan);
 		const changed =
-			!wasPlanMode || current?.planMode !== true || !durablePlanFileId || relaxedPlanChanged;
+			!wasPlanMode ||
+			current.planMode !== true ||
+			!durablePlanFileId ||
+			relaxedPlanChanged ||
+			!savedBinding;
 
 		if (changed) {
-			await db
+			const updated = await db
 				.update(narrators)
 				.set({
 					traits: nextTraits,
 					planMode: true,
 					previousPermissionMode,
 					planFileId,
+					planFileBinding,
 					...(relaxedPlanChanged ? { relaxedPlan: true } : {}),
 					updatedAt: new Date().toISOString(),
 				})
-				.where(eq(narrators.id, narratorId));
+				.where(
+					savedBinding
+						? eq(narrators.id, narratorId)
+						: and(
+								eq(narrators.id, narratorId),
+								eq(narrators.workspaceRevision, planFileBinding.workspaceContext.revision),
+							),
+				)
+				.returning({ id: narrators.id });
+			if (updated.length !== 1)
+				throw new AppError("Workspace changed while entering plan mode", 409, "WORKSPACE_STALE");
 		}
+		if (usablePreparedPlanFileId) consumePendingPlanFileId(narratorId, usablePreparedPlanFileId);
 
-		const planFilePath = buildPlanFileRelPath(planFileId);
+		const planFilePath = planFileBinding.planFilePath;
 
 		return {
 			traits: nextTraits,
 			planFileId,
 			planFilePath,
+			planFileBinding,
 			previousPermissionMode,
 			wasPlanMode,
 			changed,
@@ -466,19 +582,23 @@ export async function exitNarratorPlanMode(narratorId: string): Promise<PlanMode
 			columns: {
 				previousPermissionMode: true,
 				planFileId: true,
+				planFileBinding: true,
 				planMode: true,
 				relaxedPlan: true,
 				traits: true,
 			},
 		});
 		const currentTraits = parseTraits(current?.traits);
-		const wasPlanMode = currentTraits.includes("plan");
-		const nextTraits = wasPlanMode ? removeTrait(currentTraits, "plan") : currentTraits;
+		const wasPlanMode = current?.planMode === true || currentTraits.includes("plan");
+		const nextTraits = currentTraits.includes("plan")
+			? removeTrait(currentTraits, "plan")
+			: currentTraits;
 		const changed =
 			wasPlanMode ||
 			current?.planMode !== false ||
 			!!current?.previousPermissionMode ||
-			!!current?.planFileId;
+			!!current?.planFileId ||
+			!!current?.planFileBinding;
 
 		if (changed) {
 			await db
@@ -488,6 +608,7 @@ export async function exitNarratorPlanMode(narratorId: string): Promise<PlanMode
 					planMode: false,
 					previousPermissionMode: null,
 					planFileId: null,
+					planFileBinding: null,
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId));

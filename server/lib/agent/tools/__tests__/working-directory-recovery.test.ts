@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as fileChangeRuntime from "../../../../services/file-change-runtime";
 import type { ExecutionBackend } from "../../execution/backend";
 import { windowsPathSemantics } from "../../execution/path-semantics";
 import { resolveBackend } from "../../execution/registry";
@@ -38,17 +39,25 @@ describe("missing working directory recovery", () => {
 			},
 		} as unknown as ExecutionBackend;
 
-		const result = await bashTool.execute({ command: "pwd" }, {
-			narratorId: "test-narrator",
-			cwd: windowsCwd,
-			signal: new AbortController().signal,
-			locale: "en",
-			requestPermission: async () => ({ behavior: "allow" as const }),
-			resolveBackend: () => backend,
-		} satisfies ToolContext);
-
-		expect(result.isError).toBeFalsy();
-		expect(executedCwd).toBe(windowsCwd);
+		// This fixture exercises cwd stat/dispatch, not host history IO for a synthetic
+		// Windows directory on a POSIX runner. Real activity admission is covered separately.
+		const activity = spyOn(fileChangeRuntime, "registerLocalBashActivity").mockResolvedValue(
+			undefined,
+		);
+		try {
+			const result = await bashTool.execute({ command: "pwd" }, {
+				narratorId: "test-narrator",
+				cwd: windowsCwd,
+				signal: new AbortController().signal,
+				locale: "en",
+				requestPermission: async () => ({ behavior: "allow" as const }),
+				resolveBackend: () => backend,
+			} satisfies ToolContext);
+			expect(result.isError, result.output).toBeFalsy();
+			expect(executedCwd).toBe(windowsCwd);
+		} finally {
+			activity.mockRestore();
+		}
 	});
 
 	test("suggests the active worktree when the narrator cwd is missing", async () => {

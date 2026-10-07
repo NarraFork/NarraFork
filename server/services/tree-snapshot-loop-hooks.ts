@@ -53,6 +53,12 @@ import {
 	recordTreeSnapshotBefore,
 	type TreeSnapshotSession,
 } from "./narrator-tree-snapshot-hooks";
+import {
+	afterRemoteTreeSnapshot,
+	beforeRemoteTreeSnapshot,
+	type RemoteTreeAttempt,
+	type RemoteTreeHookDependencies,
+} from "./remote-tree-snapshot-hooks";
 import { specVfsService } from "./spec-vfs-service";
 
 /**
@@ -79,6 +85,8 @@ interface TreeSnapshotHookOptions {
 	isInGitRepo: boolean;
 	binding?: ToolCallBinding;
 	executionTarget?: ToolExecutionTarget;
+	/** Test seam; production uses the durable remote workspace history runtime. */
+	remoteDependencies?: RemoteTreeHookDependencies;
 }
 
 /** Legacy direct-call adapter. Runtime events no longer invoke these callbacks. */
@@ -234,17 +242,42 @@ export function buildTreeSnapshotEventHooks(
 export function buildTreeSnapshotExecutionHooks(
 	opts: TreeSnapshotHookOptions,
 ): Pick<AgentConfig, "onToolExecutionBefore" | "onToolExecutionAfter"> {
-	if (!opts.isInGitRepo) return {};
+	// Remote directory captures also cover non-Git roots and one-call remote overrides.
+	// The legacy local event adapter below retains its non-Git behavior.
 	// Background completions may arrive after the primary switched cwd. The capture
 	// pair must remain attached to the pass that admitted the original attempt.
 	const sourceSession = opts.session;
 	const passCwd = sourceSession.cwd;
 	sourceSession._treeHashBefore ??= new Map();
 	const beforeHashes = sourceSession._treeHashBefore;
-	const calls = new WeakMap<AgentToolUse, ReturnType<typeof buildTreeSnapshotEventHooks>>();
+	const passWorkspace = sourceSession._workspaceContext
+		? structuredClone(sourceSession._workspaceContext)
+		: undefined;
+	const passActor = sourceSession._currentUserId;
+	const passProjectId = passWorkspace?.contextProjectId ?? sourceSession._projectId;
+	const calls = new WeakMap<
+		AgentToolUse,
+		| { kind: "local"; hooks: ReturnType<typeof buildTreeSnapshotEventHooks> }
+		| { kind: "remote"; attempt: RemoteTreeAttempt }
+	>();
 	return {
 		onToolExecutionBefore: async (context) => {
 			if (!FILE_MUTATING_TOOLS.has(context.toolUse.name)) return;
+			if (context.executionTarget?.backendKind === "remote") {
+				const attempt = await beforeRemoteTreeSnapshot(
+					{
+						narratorId: opts.narratorId,
+						userId: passActor,
+						projectId: passProjectId,
+						workspaceContext: passWorkspace,
+						dependencies: opts.remoteDependencies,
+					},
+					context,
+				);
+				if (attempt) calls.set(context.toolUse, { kind: "remote", attempt });
+				return;
+			}
+			if (!opts.isInGitRepo) return;
 			const hooks = buildTreeSnapshotEventHooks({
 				...opts,
 				session: {
@@ -257,7 +290,7 @@ export function buildTreeSnapshotExecutionHooks(
 				binding: context.binding,
 				executionTarget: context.executionTarget,
 			});
-			calls.set(context.toolUse, hooks);
+			calls.set(context.toolUse, { kind: "local", hooks });
 			await hooks.onSnapshotBefore?.(
 				context.toolUse.toolUseId,
 				context.toolUse.name,
@@ -265,11 +298,15 @@ export function buildTreeSnapshotExecutionHooks(
 			);
 		},
 		onToolExecutionAfter: async (context) => {
-			const hooks = calls.get(context.toolUse);
+			const call = calls.get(context.toolUse);
 			calls.delete(context.toolUse);
-			if (!hooks) return;
+			if (!call) return;
+			if (call.kind === "remote") {
+				await afterRemoteTreeSnapshot(call.attempt, context);
+				return;
+			}
 			try {
-				await hooks.onSnapshotAfter?.(context.toolUse.toolUseId, context.toolUse.name);
+				await call.hooks.onSnapshotAfter?.(context.toolUse.toolUseId, context.toolUse.name);
 			} catch (error) {
 				abandonTreeSnapshot(opts.session, opts.narratorId, context.toolUse.toolUseId);
 				throw error;

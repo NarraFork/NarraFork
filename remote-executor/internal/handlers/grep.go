@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -27,6 +30,7 @@ type grepParams struct {
 	afterContext    *int
 	maxBytes        int64
 	timeoutMs       int64
+	privateGlobs    []string
 }
 
 // Grep runs a content search, preferring ripgrep. When rg is not on PATH it
@@ -42,9 +46,20 @@ func (h *Handlers) Grep(params map[string]any) (any, error) {
 	// Prefer ripgrep.
 	if rgPath, lookErr := exec.LookPath("rg"); lookErr == nil {
 		argv := buildRipgrepArgv(rgPath, gp)
-		return runSearch(argv, gp, false), nil
+		result := runSearch(argv, gp, false)
+		if len(gp.privateGlobs) > 0 {
+			result["policyExcluded"] = true
+			previous, _ := result["stderr"].(string)
+			result["stderr"] = "Executor private namespaces (and same-named directories) were excluded from this search. " + previous
+		}
+		return result, nil
 	}
 
+	// A fallback cannot reliably express the protected subtree policy on every
+	// supported OS. Refuse instead of scanning private CAS bytes or faking a result.
+	if len(gp.privateGlobs) > 0 {
+		return nil, fmt.Errorf("private_state_exclusion_requires_ripgrep: narrow the recursive search path")
+	}
 	// Fall back to system grep.
 	grepPath, lookErr := exec.LookPath("grep")
 	if lookErr != nil {
@@ -119,6 +134,26 @@ func (h *Handlers) decodeGrepParams(params map[string]any) (grepParams, error) {
 		return gp, err
 	}
 	gp.cwd = cwd
+	searchRoot := gp.searchPath
+	if searchRoot == "" {
+		searchRoot = cwd
+	}
+	seen := map[string]bool{}
+	for _, private := range h.guard.PrivateDirectories() {
+		if !pathWithin(searchRoot, private) {
+			continue
+		}
+		base := filepath.Base(private)
+		if base == "." || strings.ContainsAny(base, "*?[]{}\\\r\n") {
+			return gp, fmt.Errorf("private namespace cannot be safely excluded; narrow the recursive search path")
+		}
+		// Basename exclusions avoid platform/absolute-glob ambiguities. They can
+		// narrow other same-named directories, which is explicitly reported.
+		if !seen[base] {
+			gp.privateGlobs = append(gp.privateGlobs, "!**/"+base, "!**/"+base+"/**")
+			seen[base] = true
+		}
+	}
 	return gp, nil
 }
 
@@ -159,6 +194,12 @@ func buildRipgrepArgv(rgPath string, gp grepParams) []string {
 	}
 	if gp.glob != "" {
 		args = append(args, "--glob", gp.glob)
+	}
+	for _, denied := range gp.privateGlobs {
+		args = append(args, "--glob", denied)
+	}
+	if len(gp.privateGlobs) > 0 {
+		args = append(args, "--no-follow")
 	}
 	args = append(args, "--regexp", gp.pattern, gp.searchPath)
 	return args

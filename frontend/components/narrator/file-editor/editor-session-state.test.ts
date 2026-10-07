@@ -29,12 +29,26 @@ const descriptor: EditorDocumentDescriptor = {
 	sourceBytes: 8,
 	utf8Bytes: 4,
 };
-async function setup() {
+async function setup(deviceId = "local") {
 	let text = "";
 	let revision = 0;
 	let alternativeVersionId = 0;
 	const api = {
-		create: mock<typeof editorDocumentApi.create>(async () => descriptor),
+		create: mock<typeof editorDocumentApi.create>(async () =>
+			deviceId === "local"
+				? descriptor
+				: {
+						...descriptor,
+						target: { ...descriptor.target, deviceId },
+						editable: true,
+						workspace: {
+							revision: 4,
+							contextKey: "remote-four",
+							cwd: "/work",
+							rootIdentity: "original-root",
+						},
+					},
+		),
 		source: mock<typeof editorDocumentApi.source>(async () => "a\nb\n"),
 		sourcePreview: mock<typeof editorDocumentApi.sourcePreview>(async () => ({
 			content: "theirs",
@@ -108,7 +122,7 @@ async function setup() {
 	const session = new EditorDocumentSession({
 		narratorId: "child",
 		path: "/work/a.txt",
-		deviceId: "local",
+		deviceId,
 		origin: () => "reference",
 		api: api as unknown as typeof editorDocumentApi,
 		snapshot,
@@ -128,6 +142,58 @@ async function setup() {
 	};
 	return { session, api, encode, hash, applyContent, snapshot, change, text: () => text };
 }
+
+for (const key of ["revision", "contextKey", "cwd", "rootIdentity"] as const)
+	test(`expired remote session cannot reauthorize a changed ${key} into its original draft`, async () => {
+		const { session, api, change, text } = await setup("remote");
+		const workspace = {
+			revision: 4,
+			contextKey: "remote-four",
+			cwd: "/work",
+			rootIdentity: "original-root",
+		};
+		api.create.mockResolvedValue({
+			...descriptor,
+			docId: "replacement",
+			target: { ...descriptor.target, deviceId: "remote" },
+			editable: true,
+			workspace: { ...workspace, [key]: typeof workspace[key] === "number" ? 99 : "replaced" },
+		});
+		api.createUpload.mockRejectedValueOnce(new ApiError("Expired", 410));
+		change("original remote draft");
+		await session.save();
+		expect(api.commit).not.toHaveBeenCalled();
+		expect(api.createUpload).toHaveBeenCalledTimes(1);
+		expect(api.release).toHaveBeenCalledWith("child", "replacement");
+		expect(text()).toBe("original remote draft");
+		expect(sessionDirty(session.state)).toBe(true);
+		expect(session.state.error).toContain("identity changed");
+	});
+
+test("remote capability revocation during expiry preserves draft without upload retry", async () => {
+	const { session, api, change, text } = await setup("remote");
+	api.create.mockResolvedValue({
+		...descriptor,
+		docId: "readonly",
+		target: { ...descriptor.target, deviceId: "remote" },
+		editable: false,
+		readOnlyReason: "Human Write grant revoked",
+		workspace: {
+			revision: 4,
+			contextKey: "remote-four",
+			cwd: "/work",
+			rootIdentity: "original-root",
+		},
+	});
+	api.createUpload.mockRejectedValueOnce(new ApiError("Expired", 410));
+	change("unsaved human draft");
+	await session.save();
+	expect(session.state.editable).toBe(false);
+	expect(session.state.error).toContain("Write grant revoked");
+	expect(text()).toBe("unsaved human draft");
+	expect(api.createUpload).toHaveBeenCalledTimes(1);
+	expect(api.commit).not.toHaveBeenCalled();
+});
 
 test("source is immutable, authorized as child/reference, and bound to declared bytes", async () => {
 	const { session, api } = await setup();

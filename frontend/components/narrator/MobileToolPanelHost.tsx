@@ -20,6 +20,7 @@
  */
 
 import { Box, Center, Drawer, Loader, Text } from "@mantine/core";
+import type { FileTarget } from "@shared/file-reference";
 import { lazy, Suspense } from "react";
 import { useTranslation } from "react-i18next";
 import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
@@ -111,7 +112,7 @@ export interface MobileToolPanelHostProps {
 	 * file-viewer Drawer, which sits UNDER this one — so the tree drawer closes
 	 * first, same contract as `onJumpToMessage`.
 	 */
-	onOpenFile?: (absolutePath: string, fileName: string) => void;
+	onOpenFile?: (absolutePath: string, fileName: string, target?: FileTarget) => void;
 }
 
 export function MobileToolPanelHost({
@@ -205,12 +206,12 @@ export function MobileToolPanelHost({
 				<PanelBoundary>
 					<FileTreePanel
 						narratorId={narratorId}
-						onOpenFile={(absolutePath, fileName) => {
-							// No viewer to land on: keep the tree open rather than close into nothing.
-							if (!onOpenFile) return;
+						onOpenFile={(absolutePath, fileName, target) => {
+							// No viewer or frozen identity: keep the tree open, never infer a host path.
+							if (!onOpenFile || !target) return;
 							// The viewer drawer is underneath this one; see onOpenFile's contract.
 							onClose();
-							onOpenFile(absolutePath, fileName);
+							onOpenFile(absolutePath, fileName, target);
 						}}
 					/>
 				</PanelBoundary>

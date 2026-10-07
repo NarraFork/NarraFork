@@ -1304,6 +1304,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setBrowserVisualChange((prev) => ({ sessionId, seq: (prev?.seq ?? 0) + 1 }));
 			},
 			onGitStatus: (data) => {
+				const current = qc.getQueryData<import("@shared/workspace-context").WorkspaceContext>([
+					"workspaceContext",
+					narratorId,
+				]);
+				if (
+					current &&
+					((data.deviceId !== undefined && data.deviceId !== current.deviceId) ||
+						(data.contextKey !== undefined && data.contextKey !== current.contextKey) ||
+						(data.workspaceRevision !== undefined && data.workspaceRevision !== current.revision))
+				)
+					return;
 				if (data.chapterId) {
 					qc.setQueryData(["chapterGitStatus", data.chapterId], {
 						commitsAhead: data.commitsAhead,
@@ -1317,7 +1328,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				// never touches — without this the bar kept pre-session numbers until a
 				// foreground/reconnect refetch. Open Git panels additionally have their
 				// own workspace subscription; double invalidation is idempotent.
-				invalidateGitStatusPushQueries(qc, narratorId, data.chapterId);
+				invalidateGitStatusPushQueries(qc, narratorId, data.chapterId, data);
 			},
 			onCommitSyncError: (event) => {
 				qc.invalidateQueries({ queryKey: ["chapterGitStatus", event.chapterId] });

@@ -304,6 +304,39 @@ export class LocalFileChangeRuntime {
 		return withFileChangeNamespace(this.options.privateRoot, body);
 	}
 
+	/** Scope/coordinator metadata for a native local activity. Caller owns ACL admission.
+	 * Does not initialize the blob namespace, publish history or repair unknown leases. */
+	async prepareWorkspaceActivityScope(input: {
+		backend: ExecutionBackend;
+		cwd: string;
+		signal: AbortSignal;
+		canonicalPath?: string;
+	}) {
+		if (input.backend.kind !== "local" || input.backend.deviceId !== LOCAL_DEVICE_ID)
+			throw new Error("Native local workspace activity requires the local backend");
+		const runtime = this.readRuntime(LOCAL_DEVICE_ID);
+		if (!runtime || input.backend.runtimeGeneration !== runtime.runtimeGeneration)
+			throw new Error("Local activity execution identity changed");
+		input.signal.throwIfAborted();
+		const source = await this.workspaceSource();
+		const prepared = await this.prepareWorkspaceScope(
+			source,
+			input.backend,
+			input.cwd,
+			input.signal,
+			input.canonicalPath,
+		);
+		input.signal.throwIfAborted();
+		const current = this.readRuntime(LOCAL_DEVICE_ID);
+		if (
+			!current ||
+			current.runtimeEpoch !== runtime.runtimeEpoch ||
+			current.runtimeGeneration !== runtime.runtimeGeneration
+		)
+			throw new Error("Local activity execution identity changed during admission");
+		return { ...prepared, runtime: Object.freeze({ ...runtime }), coordinator: this.coordinator };
+	}
+
 	initialize(): Promise<Namespace> {
 		return this.withNamespaceAccess(() => this.initializeLocked());
 	}
@@ -1910,7 +1943,12 @@ export async function recordFileToolNoDispatch(
 export async function executeLocalFileChange(
 	request: LocalFileChangeRequest,
 ): Promise<ToolResult | undefined> {
-	if (request.backend.kind !== "local" || !request.ctx.toolCallBinding) return undefined;
+	if (request.backend.kind === "remote") {
+		return (await import("./remote-workspace-history-runtime")).executeRemoteToolFileChange(
+			request,
+		);
+	}
+	if (!request.ctx.toolCallBinding) return undefined;
 	return (await currentRuntime()).execute(request);
 }
 

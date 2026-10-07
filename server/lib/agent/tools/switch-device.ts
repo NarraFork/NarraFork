@@ -88,11 +88,22 @@ export const switchDeviceTool: ToolDefinition = {
 
 		const resolvedId =
 			target === LOCAL_DEVICE_ID ? LOCAL_DEVICE_ID : normalizeToId(target, devices);
-		// Persist + apply the new default via the session hook when available.
-		const applied = await ctx.setDefaultDevice?.(
-			resolvedId === LOCAL_DEVICE_ID ? null : resolvedId,
-		);
-		if (ctx.setDefaultDevice && applied === false) {
+		// Same-device compatibility calls must not reset an explicitly selected directory.
+		const hasKnownDevice = ctx.workspaceContext !== undefined || ctx.defaultDeviceId !== undefined;
+		if (
+			hasKnownDevice &&
+			resolvedId === (ctx.workspaceContext?.deviceId ?? ctx.defaultDeviceId ?? LOCAL_DEVICE_ID)
+		) {
+			return {
+				output: `Already using device "${resolvedId}"; working directory unchanged: ${ctx.workspaceContext?.cwd ?? ctx.cwd}`,
+			};
+		}
+		if (!ctx.setDefaultDevice) {
+			return { output: "Device switching is unsupported in this runtime.", isError: true };
+		}
+		// The session hook enters the authoritative workspace transition and installs all projections.
+		const applied = await ctx.setDefaultDevice(resolvedId === LOCAL_DEVICE_ID ? null : resolvedId);
+		if (applied === false) {
 			return { output: "Failed to switch device (session not found).", isError: true };
 		}
 

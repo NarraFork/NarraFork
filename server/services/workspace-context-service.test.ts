@@ -11,29 +11,38 @@ let root = "";
 let events: unknown[] = [];
 let failInstall = false;
 const findRow = async () => row;
-mock.module("@server/db", () => ({
-	activeDatabaseBackend: "sqlite",
-	sqlite: {},
-	db: {
-		$client: {},
-		get: () => undefined,
-		query: {
-			narrators: { findFirst: findRow },
-			chapters: { findFirst: async () => chapter },
-			projects: { findFirst: async () => undefined },
-		},
-		update: () => ({
-			set: (values: Record<string, unknown>) => ({
-				where: () => ({
-					returning: async () => {
-						row = { ...row, ...values };
-						return [{ id: row.id }];
-					},
-				}),
-			}),
-		}),
+const mockDb = {
+	$client: {},
+	get: () => undefined,
+	query: {
+		narrators: { findFirst: findRow },
+		chapters: { findFirst: async () => chapter },
+		projects: { findFirst: async () => undefined },
+		remoteDevices: { findMany: async () => [] },
+		workspaceSwitchRequests: { findFirst: async () => undefined },
 	},
-}));
+	update: (table: Record<symbol, unknown>) => ({
+		set: (values: Record<string, unknown>) => ({
+			where: () => {
+				if (table[Symbol.for("drizzle:Name")] === "narrators") row = { ...row, ...values };
+				return {
+					returning: () =>
+						Object.assign(Promise.resolve([{ id: row.id }]), {
+							all: () => [{ id: row.id }],
+						}),
+				};
+			},
+		}),
+	}),
+	insert: () => ({
+		values: () => {
+			const query = { run: () => {}, onConflictDoNothing: () => query };
+			return query;
+		},
+	}),
+	transaction: <T>(action: (tx: object) => T): T => action(mockDb),
+};
+mock.module("@server/db", () => ({ activeDatabaseBackend: "sqlite", sqlite: {}, db: mockDb }));
 mock.module("./oauth-narrator-runtime-policy", () => ({
 	resolveOAuthNarratorRuntimePolicy: async () => null,
 }));
@@ -194,7 +203,7 @@ describe("local authoritative workspace context", () => {
 		}
 		expect(row.workspaceRevision).toBe(0);
 	});
-	test("remote arbitrary cwd and subagent/background directory changes fail closed", async () => {
+	test("unauthorized remote targets and subagent/background directory changes fail closed", async () => {
 		await expect(
 			workspaceContextService.switch(
 				"narrator",
@@ -205,7 +214,7 @@ describe("local authoritative workspace context", () => {
 				},
 				{ origin: "http" },
 			),
-		).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_UNSUPPORTED" });
+		).rejects.toMatchObject({ code: "WORKSPACE_ACCESS_DENIED" });
 		for (const variant of ["subagent:general", "knowledge"]) {
 			row.variant = variant;
 			await expect(change()).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_UNSUPPORTED" });

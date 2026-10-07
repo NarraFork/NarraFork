@@ -37,6 +37,7 @@ const STORAGE_DOM_GLOBALS = [
 	"window",
 	"document",
 	"navigator",
+	"localStorage",
 	"Event",
 	"Document",
 	"ShadowRoot",
@@ -91,7 +92,26 @@ function installStorageTestDom() {
 		dispatchEvent: () => false,
 	});
 
+	// StorageSection now contains an auth-aware workspace maintenance card.
+	// This fixture is deliberately anonymous; an empty, per-test Storage makes
+	// its token read valid without changing any health/capability assertions.
+	const values = new Map<string, string>();
+	const localStorage: Storage = {
+		getItem: (key) => values.get(key) ?? null,
+		setItem: (key, value) => {
+			values.set(key, String(value));
+		},
+		removeItem: (key) => {
+			values.delete(key);
+		},
+		clear: () => values.clear(),
+		key: (index) => [...values.keys()][index] ?? null,
+		get length() {
+			return values.size;
+		},
+	};
 	Object.assign(window, {
+		localStorage,
 		ResizeObserver: StorageTestResizeObserver,
 		matchMedia,
 		requestAnimationFrame: (callback: FrameRequestCallback) => setTimeout(callback, 0),
@@ -101,6 +121,7 @@ function installStorageTestDom() {
 		window,
 		document: window.document,
 		navigator: window.navigator,
+		localStorage,
 		Event: window.Event,
 		Document: window.Document,
 		ShadowRoot: window.ShadowRoot,

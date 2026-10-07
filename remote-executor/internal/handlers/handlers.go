@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+
+	"github.com/narrafork/remote-executor/internal/history"
 )
 
 // StreamFunc is invoked by streaming methods (exec) to push output chunks back
@@ -24,9 +26,14 @@ type ptySession struct {
 // to one transport connection so a reconnect cannot access or replace an old
 // connection's terminals.
 type Handlers struct {
-	guard        *PathGuard
-	maxRpcBytes  int64
-	disableShell bool
+	guard            *PathGuard
+	maxRpcBytes      int64
+	disableShell     bool
+	history          *history.Manager
+	worktreeStateDir string
+	shareStateDir    string
+	shareRegistry    *shareArchiveRegistry
+	attachments      *attachmentRegistry
 
 	ptyMu       sync.Mutex
 	ptySessions map[string]*ptySession
@@ -53,7 +60,13 @@ func NewWithOptions(guard *PathGuard, maxRpcBytes int64, disableShell bool) *Han
 // ConnectionScoped returns a handler set with the same immutable configuration
 // and a fresh PTY registry for one transport connection.
 func (h *Handlers) ConnectionScoped() *Handlers {
-	return NewWithOptions(h.guard, h.maxRpcBytes, h.disableShell)
+	connection := NewWithOptions(h.guard, h.maxRpcBytes, h.disableShell)
+	connection.history = h.history
+	connection.worktreeStateDir = h.worktreeStateDir
+	connection.shareStateDir = h.shareStateDir
+	connection.shareRegistry = h.shareRegistry
+	connection.attachments = h.attachments
+	return connection
 }
 
 func requiredPathParam(params map[string]any, key string) (string, error) {

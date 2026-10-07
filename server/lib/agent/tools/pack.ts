@@ -67,13 +67,58 @@ export const packListTool: ToolDefinition = {
 // ─── PackActivate ───
 export const packActivateTool: ToolDefinition = {
 	name: "PackActivate",
+	executionRouting: {
+		kind: "single",
+		resolve(input, config) {
+			if (input.materialize !== true)
+				return { key: "primary", operation: "control", deviceId: "local" };
+			const packId = input.packId;
+			if (typeof packId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(packId))
+				throw new Error("Pack materialization requires a bounded pack id, not a path");
+			return {
+				key: "primary",
+				operation: "write",
+				deviceId: config.workspaceContext?.deviceId ?? config.defaultDeviceId ?? "local",
+				path: `.narrafork/packs/${packId}`,
+			};
+		},
+	},
 	description:
 		"Extract a pack into an isolated working directory and grant yourself read/write access to that directory. Returns the absolute directory path, a file listing, and any usage notes. NOTE: the directory becomes readable/writable, but RUNNING a script or executable from it (e.g. ./run.sh) still requires separate user approval — explain the purpose when you need to execute something. Use PackDeactivate when finished to release the directory.",
 	parameters: z.object({
 		packId: z.string().describe("The pack id to activate (from PackList)"),
+		materialize: z
+			.boolean()
+			.optional()
+			.describe(
+				"Explicitly install pack files into this workspace; requires a frozen Write endpoint and native creation receipts.",
+			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { packId } = args as { packId: string };
+		const { packId, materialize = false } = args as { packId: string; materialize?: boolean };
+		if (!materialize && (ctx.workspaceContext?.deviceId ?? "local") !== "local") {
+			try {
+				const principal = await principalOf(ctx);
+				const pack = await knowledgePackService.getPack(packId, principal);
+				await ctx.recheckAuthorization?.();
+				return {
+					output: `Pack ${pack.id} is a server-published resource (device: local), not a readable path in the selected remote workspace. Use materialize: true to request a separate workspace Write installation; no host whitelist was added.`,
+					title: `PackActivate: ${pack.id}`,
+					metadata: {
+						tool: "PackActivate",
+						packId: pack.id,
+						deviceId: "local",
+						resourceKind: "published_pack",
+						materialized: false,
+					},
+				};
+			} catch (error) {
+				return {
+					output: `PackActivate failed: ${error instanceof Error ? error.message : String(error)}`,
+					isError: true,
+				};
+			}
+		}
 		// Activation changes the narrator's directory access boundary, so it is a
 		// controlled action — request user permission when configured (default true).
 		if (loadSettings().knowledge.packActivateRequiresPermission) {
@@ -89,7 +134,9 @@ export const packActivateTool: ToolDefinition = {
 		try {
 			const principal = await principalOf(ctx);
 			const pack = await knowledgePackService.getPack(packId, principal);
-			const result = await packActivationService.activate(ctx.narratorId, packId, principal);
+			const result = materialize
+				? await packActivationService.materialize(ctx, packId, principal)
+				: await packActivationService.activate(ctx.narratorId, packId, principal, ctx);
 			const fileBlock =
 				result.files.length > 0
 					? `\n\nFiles:\n${result.files.map((f) => `- ${f}`).join("\n")}`
@@ -135,7 +182,7 @@ export const packDeactivateTool: ToolDefinition = {
 	async execute(args, ctx): Promise<ToolResult> {
 		const { packId } = args as { packId: string };
 		try {
-			const res = await packActivationService.deactivate(ctx.narratorId, packId);
+			const res = await packActivationService.deactivate(ctx.narratorId, packId, ctx);
 			return {
 				output: res.released
 					? `Pack ${packId} deactivated; its directory and access were removed.`

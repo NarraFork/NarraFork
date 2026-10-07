@@ -41,6 +41,11 @@ import {
 	resolveNarratorAdmissionRoot,
 } from "./narrator-session-state";
 import { assertProjectAccess } from "./project-acl";
+import {
+	createRecordQualifiedRevertAccess,
+	RemoteRevertTransactionProvider,
+} from "./remote-revert-transaction";
+import { getRemoteWorkspaceHistoryRuntime } from "./remote-workspace-history-runtime";
 import { boundedDetail, collectRevertBlockers } from "./revert-blockers";
 import {
 	type RevertPlanFileCursor,
@@ -380,11 +385,13 @@ async function services(signal: AbortSignal) {
 	if (!cached || cached.runtime !== runtime || cached.namespace !== namespace) {
 		const namespaceKey = namespace.catalog.getBudget()?.namespaceKey;
 		if (!namespaceKey) throw stale("Evidence namespace metadata is missing");
+		const registry = await getRemoteWorkspaceHistoryRuntime();
+		const providerAccess = createRecordQualifiedRevertAccess(access, registry);
 		cached = {
 			runtime,
 			namespace,
 			planner: new RevertPlannerService(db, {
-				access,
+				access: providerAccess,
 				blobStore: namespace.store,
 				blobCatalog: namespace.catalog,
 				generation: namespace.generation,
@@ -392,7 +399,10 @@ async function services(signal: AbortSignal) {
 			}),
 			plans: new RevertPlanService(db, { namespaceKey }),
 			transactions: new RevertTransactionService(db, {
-				access,
+				access: providerAccess,
+				provider: new RemoteRevertTransactionProvider(registry),
+				coordinator: registry.coordinator,
+				readRuntime: (deviceId) => registry.runtimeBinding(deviceId),
 				runtime,
 				namespace,
 				planOptions: { namespaceKey },
@@ -449,7 +459,7 @@ export async function listLocalRevertPlanFiles(
 	// Stored paths are sensitive too. A preview created before file permission revocation
 	// must not leak target identities under the weaker GET/read-only narrator gate.
 	for (const item of page.items) {
-		await access.authorizeFile({
+		await createRecordQualifiedRevertAccess(access).authorizeFile({
 			principal,
 			owner,
 			identity: item.identityJson,

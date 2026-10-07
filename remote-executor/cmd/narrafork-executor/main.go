@@ -14,12 +14,14 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"syscall"
 
 	"github.com/narrafork/remote-executor/internal/buildinfo"
 	"github.com/narrafork/remote-executor/internal/config"
 	"github.com/narrafork/remote-executor/internal/handlers"
+	"github.com/narrafork/remote-executor/internal/history"
 	"github.com/narrafork/remote-executor/internal/rpc"
 	"github.com/narrafork/remote-executor/internal/transport"
 )
@@ -67,8 +69,11 @@ func run(ctx context.Context, ready func()) error {
 	}
 
 	guard := handlers.NewPathGuardWithRules(toGuardRules(cfg.EffectivePathRules()))
+	if err := guard.ExcludePrivateDirectories(cfg.StateDir); err != nil {
+		return fmt.Errorf("exclude private executor state: %w", err)
+	}
 	if guard.Unrestricted() {
-		log.Printf("WARNING: no path rules set; structured path RPCs may access any path the OS user can access")
+		log.Printf("WARNING: no path rules set; structured path RPCs may access any non-private path the OS user can access")
 	}
 	// An unresolved deny still blocks its literal subtree, but a symlink or a
 	// later-created directory can sidestep it, so it must not stay silent.
@@ -80,6 +85,26 @@ func run(ctx context.Context, ready func()) error {
 	}
 
 	h := handlers.NewWithOptions(guard, 10*1024*1024, cfg.DisableShell)
+	historyManager, err := history.New(filepath.Join(cfg.StateDir, "history"), func(path string, create bool) (string, error) {
+		if create {
+			return guard.CheckCreate(path)
+		}
+		return guard.CheckExisting(path)
+	})
+	if err != nil {
+		return fmt.Errorf("initialize private history: %w", err)
+	}
+	defer historyManager.Close()
+	h.SetHistory(historyManager)
+	if err := h.ConfigureWorktreeStateDirectory(filepath.Join(cfg.StateDir, "worktrees")); err != nil {
+		return fmt.Errorf("initialize private worktree journal: %w", err)
+	}
+	if err := h.ConfigureShareStateDirectory(filepath.Join(cfg.StateDir, "shares")); err != nil {
+		return fmt.Errorf("initialize private share artifacts: %w", err)
+	}
+	if err := h.ConfigureAttachmentStateDirectory(filepath.Join(cfg.StateDir, "attachments")); err != nil {
+		return fmt.Errorf("initialize private attachment receipts: %w", err)
+	}
 	dispatcher := rpc.NewDispatcher(h)
 
 	platform := rpc.Platform{
@@ -102,6 +127,13 @@ func run(ctx context.Context, ready func()) error {
 		Pty:     handlers.PtySupported() && !cfg.DisableShell,
 		Shell:   !cfg.DisableShell,
 		Features: []string{
+			rpc.FeatureHistoryV1,
+			rpc.FeatureHistoryCaptureTreeV1,
+			rpc.FeatureHistoryObjectStageV1,
+			rpc.FeatureHistoryNativeMetadataV1,
+			rpc.FeatureWorkspaceAttachmentV1,
+			rpc.FeatureGitWorktreeV1,
+			rpc.FeatureShareArchiveV1,
 			"transfer.upload-content-identity.v1",
 			"pty.ready-stream.v1",
 		},

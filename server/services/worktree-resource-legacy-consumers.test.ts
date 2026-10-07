@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import * as schema from "../db/schema";
+import { getHome } from "../lib/platform";
 import { settings } from "../lib/settings";
 import { fixtureDatabase } from "./worktree-resource-fixture";
 
@@ -24,11 +26,65 @@ const database = new Proxy(
 		},
 	},
 );
-mock.module("../db", () => ({ db: database }));
+const fixtureSqlite = new Proxy(
+	{},
+	{
+		get: (_target, key) => {
+			const value = Reflect.get(fixture.sqlite, key);
+			return typeof value === "function" ? value.bind(fixture.sqlite) : value;
+		},
+	},
+);
+mock.module("../db", () => ({
+	db: database,
+	sqlite: fixtureSqlite,
+	activeDatabaseBackend: "sqlite",
+}));
 const command = mock(async (_options: unknown) => ({ exitCode: 0, stdout: "", stderr: "" }));
 mock.module("../lib/spawn", () => ({ safeSpawn: command }));
-mock.module("../lib/agent/shell", () => ({ detectShell: () => ({ path: "/fixture/shell" }) }));
+mock.module("../lib/agent/shell", () => ({
+	detectShell: () => ({ path: "/fixture/shell" }),
+	buildMinimalEnv: (env: Record<string, string> = {}) => env,
+	detectShellPath: () => "/fixture/shell",
+	isPowerShell: () => false,
+	killTree: async () => {},
+	_resetShellCache: () => {},
+}));
 mock.module("../lib/agent/tools/terminal", () => ({ resetCursorForTerminal: () => {} }));
+// This compatibility suite owns only terminal/resource behavior. Workspace persistence and
+// transition admission are covered by their dedicated real-store suites; avoid importing
+// the full running-agent graph into this in-memory legacy runtime fixture.
+const fixtureWorkspace = async (id: string) => {
+	const row = await fixture.database.query.narrators.findFirst({
+		where: eq(schema.narrators.id, id),
+	});
+	if (!row || row.id !== id) throw new Error("fixture narrator unavailable");
+	return (
+		row.workspaceContext ?? {
+			revision: row.workspaceRevision,
+			deviceId: "local",
+			cwd: row.cwd ?? getHome(),
+			pathFlavor: "posix" as const,
+			contextKey: `fixture-${id}`,
+			capabilities: { switchDirectory: true },
+		}
+	);
+};
+mock.module("./workspace-context-service", () => ({
+	workspaceContextService: {
+		get: fixtureWorkspace,
+		withRevision: async <T>(
+			id: string,
+			revision: number,
+			_key: unknown,
+			action: (context: Awaited<ReturnType<typeof fixtureWorkspace>>) => Promise<T>,
+		) => {
+			const context = await fixtureWorkspace(id);
+			if (context.revision !== revision) throw new Error("stale workspace revision");
+			return action(context);
+		},
+	},
+}));
 // Exercise the real WS dispatch and real terminal service; only process/buffer/remote
 // boundaries are stubbed. HTTP narrator access uses the real fixture-backed ACL.
 mock.module("../middleware/auth", () => ({
@@ -41,9 +97,23 @@ mock.module("./device-connection-service", () => ({
 mock.module("./device-service", () => ({
 	DeviceScopeError: class extends Error {},
 	deviceHasFeature: () => false,
+	isDeviceAuthorized: () => {
+		throw new Error("unexpected remote device authorization");
+	},
 	requireAuthorizedDeviceForProject: async () => {
 		throw new Error("unexpected remote device");
 	},
+}));
+// This minimal fixture has no permission/OAuth tables: all its narrators are ordinary
+// local narrators with the default ask policy. Dedicated workspace/terminal policy
+// suites exercise deny/revocation; narrator ACL here remains real and fixture-backed.
+mock.module("./execution-policy/engine", () => ({
+	executionPolicyEngine: {
+		compile: async () => ({ evaluatePath: () => ({ decision: "ask" }) }),
+	},
+}));
+mock.module("./oauth-narrator-runtime-policy", () => ({
+	resolveOAuthNarratorRuntimePolicy: async () => null,
 }));
 const loadBuffer = mock(async () => true);
 const readBuffer = mock(async () => "legacy-buffer-secret");
@@ -469,7 +539,7 @@ function terminalHttpApp(userId = "owner") {
 function fixtureWs() {
 	const messages: Array<{ type: string; terminal?: { id: string } }> = [];
 	const ws = {
-		data: { subscribedTerminals: new Set<string>(), lastPongAt: 0 },
+		data: { subscribedTerminals: new Set<string>(), lastPongAt: 0, sessionUserId: "owner" },
 		send: (payload: string) => messages.push(JSON.parse(payload)),
 	} as unknown as Parameters<typeof handleTerminalWS.message>[0];
 	return { ws, messages };
@@ -548,6 +618,7 @@ describe("HTTP/WS DTO to real terminal service fail closed before all runtime ef
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify(payload),
 			});
+			if (response.status !== 201) throw new Error(await response.text());
 			expect(response.status).toBe(201);
 			const terminal = (await response.json()) as { id: string; worktreeResourceId: null };
 			expect(terminal.worktreeResourceId).toBeNull();
@@ -567,6 +638,7 @@ describe("HTTP/WS DTO to real terminal service fail closed before all runtime ef
 			const { ws, messages } = fixtureWs();
 			await handleTerminalWS.message(ws, { type: "create", requestId: "request", ...payload });
 			await new Promise<void>((resolve) => setImmediate(resolve));
+			if (messages[0]?.type !== "created") throw new Error(JSON.stringify(messages[0]));
 			expect(messages[0]?.type).toBe("created");
 			const id = messages[0]?.terminal?.id;
 			expect(id).toBeDefined();
@@ -578,6 +650,10 @@ describe("HTTP/WS DTO to real terminal service fail closed before all runtime ef
 		});
 	}
 	test("HTTP narrator shell still requires write ACL; non-owner cannot spawn", async () => {
+		fixture.database
+			.insert(schema.users)
+			.values({ id: "not-owner", username: "not-owner", passwordHash: "fixture", createdAt: now })
+			.run();
 		const response = await terminalHttpApp("not-owner").request("/terminals", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },

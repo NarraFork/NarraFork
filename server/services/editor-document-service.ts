@@ -24,12 +24,24 @@ import {
 } from "../../shared/editor-document";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
-import type { EditorOperationMetadata } from "../lib/validators/editor-documents";
+import {
+	type EditorOperationMetadata,
+	editorOperationMetadataSchema,
+} from "../lib/validators/editor-documents";
 import { EditorDocumentJobs } from "./editor-document-jobs";
 import type { EditorVersionMetadata } from "./editor-document-worker";
 import type { EditorFileChangeRequest, FileChangeCompletion } from "./file-change-runtime";
 
 export interface EditorBinding {
+	/** Missing device is only the legacy local adapter, never inferred from path syntax. */
+	deviceId?: string;
+	workspaceRevision?: number;
+	contextKey?: string;
+	runtimeGeneration?: number;
+	canonicalIdentity?: string;
+	rootIdentity?: string;
+	editable?: boolean;
+	readOnlyReason?: string;
 	cwd: string;
 	projectId: string | null;
 	lexicalPath: string;
@@ -95,14 +107,57 @@ interface Session {
 	cleanup?: Promise<void>;
 }
 interface Operation {
+	deviceId?: string;
 	userId: string;
 	narratorId: string;
 	value: EditorOperationResult;
 	expires: number;
 	recovery?: EditorOperationMetadata;
 }
+export interface RemoteEditorAdapter {
+	/** Copies only bounded source bytes to a private transfer object, never host target IO. */
+	source(
+		actor: EditorActor,
+		binding: EditorBinding,
+		temporaryPath: string,
+		signal: AbortSignal,
+	): Promise<void>;
+	execute(
+		actor: EditorActor,
+		binding: EditorBinding,
+		request: EditorFileChangeRequest<{ hash: string; bytes: number }>,
+	): Promise<FileChangeCompletion<{ hash: string; bytes: number }>>;
+	queryOperation(
+		actor: EditorActor,
+		operationId: string,
+		recovery?: EditorOperationMetadata,
+	): Promise<EditorOperationResult | null>;
+	afterWrite?(binding: EditorBinding, actor: EditorActor, operationId: string): Promise<void>;
+}
+
+/** Equality covers logical workspace and physical endpoint, not just same-named paths. */
+export function sameEditorBinding(a: EditorBinding, b: EditorBinding): boolean {
+	return (
+		(a.deviceId ?? "local") === (b.deviceId ?? "local") &&
+		(
+			[
+				"cwd",
+				"projectId",
+				"lexicalPath",
+				"canonicalPath",
+				"workspaceRevision",
+				"contextKey",
+				"runtimeGeneration",
+				"canonicalIdentity",
+				"rootIdentity",
+			] as const
+		).every((key) => a[key] === b[key])
+	);
+}
+
 export interface EditorDocumentDependencies {
 	root: string;
+	remote?: RemoteEditorAdapter;
 	jobs?: EditorDocumentJobs;
 	/** Version-object unlink boundary, injectable for race/failure tests; never target-file IO. */
 	unlinkVersion?: (path: string) => Promise<void>;
@@ -129,6 +184,32 @@ const expired = () =>
 		410,
 	);
 const invalid = (message: string) => new EditorDocumentError("EDITOR_INVALID_STATE", message);
+
+async function readEditorRecovery(path: string): Promise<EditorOperationMetadata> {
+	const file = await open(
+		path,
+		constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+	);
+	try {
+		const stat = await file.stat();
+		if (!stat.isFile() || stat.size > EDITOR_METADATA_MAX_BYTES)
+			throw invalid("Recovery metadata exceeds its budget");
+		const bytes = Buffer.alloc(EDITOR_METADATA_MAX_BYTES + 1);
+		let length = 0;
+		while (length < bytes.length) {
+			const read = await file.read(bytes, length, bytes.length - length);
+			if (!read.bytesRead) break;
+			length += read.bytesRead;
+		}
+		if (length > EDITOR_METADATA_MAX_BYTES)
+			throw invalid("Recovery metadata grew beyond its budget");
+		return editorOperationMetadataSchema.parse(
+			JSON.parse(bytes.subarray(0, length).toString("utf8")),
+		);
+	} finally {
+		await file.close();
+	}
+}
 
 function storageUnavailable(message: string): AppError {
 	return new AppError(message, 503, "EDITOR_STORAGE_UNAVAILABLE");
@@ -322,12 +403,7 @@ export class EditorDocumentService {
 		}
 		await this.assertStore();
 		const binding = await actor.authorize(session.input, need);
-		if (
-			binding.cwd !== session.binding.cwd ||
-			binding.projectId !== session.binding.projectId ||
-			binding.lexicalPath !== session.binding.lexicalPath ||
-			binding.canonicalPath !== session.binding.canonicalPath
-		)
+		if (!sameEditorBinding(binding, session.binding))
 			throw new EditorDocumentError(
 				"EDITOR_IDENTITY_CHANGED",
 				"Editor resource identity changed",
@@ -344,7 +420,39 @@ export class EditorDocumentService {
 	): Promise<EditorDocumentDescriptor> {
 		await this.initialize();
 		await this.assertStore();
-		const binding = await actor.authorize(input, "read");
+		const binding = Object.freeze({ ...(await actor.authorize(input, "read")) });
+		const deviceId = binding.deviceId ?? "local";
+		if (input.deviceId && input.deviceId !== deviceId)
+			throw new EditorDocumentError("EDITOR_IDENTITY_CHANGED", "Editor device changed", 403);
+		if (deviceId !== "local" && !this.deps.remote)
+			throw new EditorDocumentError(
+				"EDITOR_REMOTE_UNSUPPORTED",
+				"Remote editor evidence adapter unavailable",
+				422,
+			);
+		let workspace: EditorDocumentDescriptor["workspace"];
+		if (deviceId !== "local") {
+			const { workspaceRevision, contextKey, runtimeGeneration, canonicalIdentity, rootIdentity } =
+				binding;
+			if (
+				workspaceRevision === undefined ||
+				!contextKey ||
+				runtimeGeneration === undefined ||
+				!canonicalIdentity ||
+				!rootIdentity
+			)
+				throw new EditorDocumentError(
+					"EDITOR_IDENTITY_CHANGED",
+					"Remote editor requires a frozen workspace and canonical endpoint",
+					403,
+				);
+			workspace = Object.freeze({
+				revision: workspaceRevision,
+				contextKey,
+				cwd: binding.cwd,
+				rootIdentity,
+			});
+		}
 		if (
 			this.sessions.size >= EDITOR_MAX_SESSIONS ||
 			[...this.sessions.values()].filter((s) => s.userId === actor.userId).length >=
@@ -370,9 +478,33 @@ export class EditorDocumentService {
 		session.looseFiles.add(path);
 		try {
 			this.reserve(session, EDITOR_TRANSFER_MAX_BYTES);
-			const result = await this.jobs.run(
+			const result = await this.jobs.withIo(
 				actor.userId,
-				{ action: "source", sourcePath: binding.canonicalPath, outputPath: path },
+				async (admitted) => {
+					if (deviceId === "local")
+						return this.jobs.run(
+							actor.userId,
+							{ action: "source", sourcePath: binding.canonicalPath, outputPath: path },
+							admitted,
+						);
+					const rawPath = this.path();
+					this.reserve(session, EDITOR_TRANSFER_MAX_BYTES);
+					session.looseFiles.add(rawPath);
+					try {
+						await this.deps.remote?.source(actor, binding, rawPath, admitted);
+						return await this.jobs.run(
+							actor.userId,
+							{ action: "source", sourcePath: rawPath, outputPath: path },
+							admitted,
+						);
+					} finally {
+						await unlink(rawPath).catch((error: NodeJS.ErrnoException) => {
+							if (error.code !== "ENOENT") throw error;
+						});
+						session.looseFiles.delete(rawPath);
+						this.reserve(session, -EDITOR_TRANSFER_MAX_BYTES);
+					}
+				},
 				signal,
 			);
 			if (result.kind !== "source") throw invalid("Unexpected source worker response");
@@ -382,7 +514,10 @@ export class EditorDocumentService {
 			session.looseFiles.delete(path);
 			return {
 				docId: session.id,
-				target: { deviceId: "local", path: binding.canonicalPath },
+				target: { deviceId, path: binding.canonicalPath },
+				workspace,
+				editable: deviceId === "local" ? binding.editable !== false : binding.editable === true,
+				readOnlyReason: binding.readOnlyReason,
 				versionHandle: session.source.handle,
 				...result.metadata,
 			};
@@ -659,6 +794,13 @@ export class EditorDocumentService {
 		input: EditorCommitInput,
 	): Promise<EditorCommitResult> {
 		const { session, binding } = await this.bound(actor, docId, "write");
+		const remote = (binding.deviceId ?? "local") !== "local";
+		if (binding.editable === false || (remote && binding.editable !== true))
+			throw new EditorDocumentError(
+				"EDITOR_WRITE_REFUSED",
+				binding.readOnlyReason ?? "Editor target is read-only",
+				403,
+			);
 		const upload = this.upload(session, uploadId);
 		if (upload.state === "settled") {
 			if (upload.error) throw upload.error;
@@ -716,6 +858,7 @@ export class EditorDocumentService {
 		const recoveryTemporary = join(this.deps.root, `ed-${operationId}`);
 		session.looseFiles.add(recoveryTemporary);
 		const operation: Operation = {
+			deviceId: binding.deviceId ?? "local",
 			userId: actor.userId,
 			narratorId: actor.narratorId,
 			value: { status: "committing", operationId },
@@ -726,7 +869,12 @@ export class EditorDocumentService {
 		try {
 			const run = async () =>
 				this.jobs.withIo(actor.userId, async (signal) => {
-					const completed = await this.deps.execute({
+					const execute = (request: EditorFileChangeRequest<{ hash: string; bytes: number }>) => {
+						if (!remote) return this.deps.execute(request);
+						if (!this.deps.remote) throw invalid("Remote editor adapter unavailable");
+						return this.deps.remote.execute(actor, binding, request);
+					};
+					const completed = await execute({
 						requestId: operationId,
 						userId: actor.userId,
 						narratorId: actor.narratorId,
@@ -747,10 +895,9 @@ export class EditorDocumentService {
 							// Cancellation/DELETE may mark closing after commit began; pin keeps the bound bytes alive.
 							const fresh = await actor.authorize(session.input, "write");
 							if (
-								fresh.cwd !== binding.cwd ||
-								fresh.projectId !== binding.projectId ||
-								fresh.lexicalPath !== binding.lexicalPath ||
-								fresh.canonicalPath !== binding.canonicalPath ||
+								!sameEditorBinding(fresh, binding) ||
+								fresh.editable === false ||
+								(remote && fresh.editable !== true) ||
 								(fresh.outsideRoots && !confirmed)
 							)
 								throw new EditorDocumentError(
@@ -816,6 +963,10 @@ export class EditorDocumentService {
 								);
 							}
 							if (result.kind !== "prepared") throw invalid("Unexpected preparation response");
+							// Retain the worker's bounded durable snapshot metadata for live unknown/recovery queries too.
+							operation.recovery = await readEditorRecovery(
+								join(this.deps.root, `ed-${operationId}.json`),
+							);
 							return {
 								nextBytes: result.nextBytes,
 								result: { hash: result.hash, bytes: result.bytes },
@@ -830,7 +981,14 @@ export class EditorDocumentService {
 						snapshotRevision: upload.snapshotRevision,
 					};
 				});
-			if (this.deps.afterWrite)
+			if (remote) {
+				await run();
+				try {
+					await this.deps.remote?.afterWrite?.(binding, actor, operationId);
+				} catch (error) {
+					logger.debug("Remote editor notification failed", { error: String(error) });
+				}
+			} else if (this.deps.afterWrite)
 				await this.deps.afterWrite(binding, actor.narratorId, operationId, run, actor);
 			else await run();
 			if (!upload.result) throw invalid("Save result unavailable");
@@ -890,10 +1048,28 @@ export class EditorDocumentService {
 			operation.userId === actor.userId &&
 			operation.narratorId === actor.narratorId
 		) {
+			if (
+				operation.deviceId !== "local" &&
+				(operation.recovery || operation.value.status === "uncertain")
+			) {
+				const remote = await this.deps.remote?.queryOperation(
+					actor,
+					operationId,
+					operation.recovery,
+				);
+				if (remote) {
+					operation.value = remote;
+					return remote;
+				}
+				// A recorded remote operation must never query the host namespace as a fallback.
+				if (operation.deviceId) return operation.value;
+			}
 			if (operation.recovery && this.deps.queryOperation)
 				return this.deps.queryOperation(actor, operationId, operation.recovery);
 			return operation.value;
 		}
+		const remote = await this.deps.remote?.queryOperation(actor, operationId);
+		if (remote) return remote;
 		if (this.deps.queryOperation) return this.deps.queryOperation(actor, operationId);
 		throw new EditorDocumentError(
 			"EDITOR_OPERATION_UNKNOWN",

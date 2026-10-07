@@ -39,6 +39,8 @@ const chapterNodeDock = () => read(GRAPH_DIR, "dock", "ChapterNodeDock.tsx");
 const dockContext = () =>
 	read(FRONTEND_ROOT, "components", "narrator", "dock", "NarratorDockContext.tsx");
 const narratorPanel = () => read(FRONTEND_ROOT, "components", "narrator", "NarratorPanel.tsx");
+const narratorHeaderTitle = () =>
+	read(FRONTEND_ROOT, "components", "narrator", "header", "NarratorPanelHeaderTitle.tsx");
 
 describe("node title ownership", () => {
 	it("both chapter-like nodes render their title through NodeTitleEditor", () => {
@@ -73,11 +75,18 @@ describe("node title ownership", () => {
 	it("the chat panel gates its whole title block on hostOwnsTitle", () => {
 		const source = narratorPanel();
 		expect(source).toContain("const hostOwnsTitle = dock?.hostOwnsTitle === true;");
+		// The panel passes ownership into the actual title implementation. A guard
+		// on only the child would miss accidentally dropping this caller binding.
+		const titleProps = source.match(/^\s*<NarratorPanelHeaderTitle\b[\s\S]*?\/>/m)?.[0];
+		expect(titleProps).toBeDefined();
+		expect(titleProps ?? "").toContain("hostOwnsTitle={hostOwnsTitle}");
+		expect(source).toContain("showTitleActions={!hostOwnsTitle && !isWorkspacePreview}");
+		const title = narratorHeaderTitle();
 		// The title element itself...
-		expect(source).toContain("{hostOwnsTitle ? null : editingTitle && !isWorkspacePreview ? (");
+		expect(title).toContain("{hostOwnsTitle ? null : editingTitle && !isWorkspacePreview ? (");
 		// ...and the pencil / sparkles pair beside it. Leaving these would keep two
 		// title buttons in a node header that already has its own.
-		expect(source).toContain("{!isWorkspacePreview && !hostOwnsTitle && (");
+		expect(title).toContain("{!isWorkspacePreview && !hostOwnsTitle && (");
 	});
 });
 

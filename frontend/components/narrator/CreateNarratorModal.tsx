@@ -55,6 +55,7 @@ export interface CreateNarratorResult {
 	id: string;
 	title: string;
 	cwd?: string;
+	deviceId?: string;
 	status: string;
 }
 
@@ -64,6 +65,8 @@ interface CreateNarratorModalProps {
 	onCreated?: (narrator: CreateNarratorResult) => void;
 	/** Pre-fill the working directory (e.g. "new narrator in this directory" entry points). */
 	initialCwd?: string;
+	/** Device qualifier for directory entry points; old callers remain local. */
+	initialDeviceId?: string;
 }
 
 function FavoriteItemContent({
@@ -150,9 +153,17 @@ export function CreateNarratorModal({
 	onClose,
 	onCreated,
 	initialCwd,
+	initialDeviceId = "local",
 }: CreateNarratorModalProps) {
 	const { t } = useTranslation("narrators");
 	const { t: tc } = useTranslation("common");
+	const { t: tn } = useTranslation("narrator");
+	const [deviceId, setDeviceId] = useState(initialDeviceId);
+	const { data: devices } = useQuery({
+		queryKey: ["devices"],
+		queryFn: api.listDevices,
+		enabled: opened,
+	});
 	const createNarrator = useCreateNarrator();
 	const { groupedModels } = useAllModels();
 	const { data: settings } = useQuery({
@@ -221,8 +232,11 @@ export function CreateNarratorModal({
 	// Callers may keep this modal mounted across opens (or swap the target directory
 	// while it is closed), so adopt `initialCwd` on every open rather than only at mount.
 	useEffect(() => {
-		if (opened && initialCwd) setCwd(initialCwd);
-	}, [opened, initialCwd]);
+		if (opened) {
+			setDeviceId(initialDeviceId);
+			if (initialCwd) setCwd(initialCwd);
+		}
+	}, [opened, initialCwd, initialDeviceId]);
 
 	// When the caller gives no entry-point directory, pre-fill the instance's default
 	// project directory: the field previously only SHOWED it as a placeholder while an
@@ -234,6 +248,7 @@ export function CreateNarratorModal({
 	// render or two late and a fires-once-on-open effect would miss it permanently.
 	const prefilledForOpenRef = useRef(false);
 	useEffect(() => {
+		if (deviceId !== "local") return;
 		const decision = resolveCwdPrefill({
 			opened,
 			alreadyPrefilled: prefilledForOpenRef.current,
@@ -253,7 +268,7 @@ export function CreateNarratorModal({
 			setCwd(decision.value);
 			prefilledForOpenRef.current = true;
 		}
-	}, [opened, cwd, initialCwd, defaultProjectDir]);
+	}, [opened, cwd, initialCwd, defaultProjectDir, deviceId]);
 
 	// Same timing question as the cwd field: the settings query is often unresolved
 	// on the first open, so `defaultStartInPlanMode` arrives a render or two late.
@@ -324,6 +339,11 @@ export function CreateNarratorModal({
 	}, []);
 
 	const handleCreate = () => {
+		if (
+			deviceId !== "local" &&
+			(!cwd.trim() || devices?.find((device) => device.id === deviceId)?.status !== "online")
+		)
+			return;
 		// Explicit boolean whenever the switch means something (user flipped it, or
 		// the instance default is showing on it). Omitting `false` would let the
 		// server's `input.startInPlanMode ?? defaultStartInPlanMode` re-impose the
@@ -334,7 +354,7 @@ export function CreateNarratorModal({
 		});
 		createNarrator.mutate(
 			{
-				...(cwd ? { cwd } : {}),
+				...(cwd.trim() ? { workspaceTarget: { deviceId, cwd: cwd.trim() } } : {}),
 				model: selectedModel || FOLLOW_DEFAULT_MODEL,
 				...(sendPlanMode ? { startInPlanMode } : {}),
 				...(makeNamed && handle.trim() ? { makeNamed: true, handle: handle.trim() } : {}),
@@ -348,6 +368,7 @@ export function CreateNarratorModal({
 						id: data.id,
 						title: data.title || t("newNarrator"),
 						cwd: data.cwd || cwd,
+						deviceId: data.workspaceContext?.deviceId ?? deviceId,
 						status: data.status || "idle",
 					});
 				},
@@ -358,6 +379,7 @@ export function CreateNarratorModal({
 	const handleClose = () => {
 		onClose();
 		setCwd("");
+		setDeviceId("local");
 		setSelectedModel("");
 		// Reset to "follow settings" — not a hard false preference. The next open
 		// re-adopts agent.defaultStartInPlanMode via the prefill effect.
@@ -373,63 +395,92 @@ export function CreateNarratorModal({
 	// directory + favorites, the right column holds model/session options.
 	const isWide = useMediaQuery("(min-width: 62em)") ?? false;
 
-	const favoritesDnd = favorites?.length ? (
-		<DndContext
-			sensors={sensors}
-			collisionDetection={closestCenter}
-			onDragStart={handleDragStart}
-			onDragEnd={handleDragEnd}
-			onDragCancel={handleDragCancel}
-		>
-			<SortableContext
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic favorite directory shape
-				items={favorites.map((f: any) => f.id)}
-				strategy={verticalListSortingStrategy}
+	const favoritesDnd =
+		deviceId === "local" && favorites?.length ? (
+			<DndContext
+				sensors={sensors}
+				collisionDetection={closestCenter}
+				onDragStart={handleDragStart}
+				onDragEnd={handleDragEnd}
+				onDragCancel={handleDragCancel}
 			>
-				{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
-				{favorites.map((fav: any) => (
-					<SortableFavoriteItem
-						key={fav.id}
-						fav={fav}
-						isActive={cwd === fav.path}
-						onSelect={() => setCwd(fav.path)}
-						onRemove={() => removeFavorite.mutate(fav.id)}
-					/>
-				))}
-			</SortableContext>
-			{createPortal(
-				<DragOverlay dropAnimation={null}>
-					{activeFav && (
-						<div
-							style={{
-								backgroundColor: "var(--mantine-color-body)",
-								boxShadow: "var(--mantine-shadow-md)",
-								borderRadius: 4,
-							}}
-						>
-							<FavoriteItemContent fav={activeFav} isActive={cwd === activeFav.path} />
-						</div>
-					)}
-				</DragOverlay>,
-				document.body,
-			)}
-		</DndContext>
-	) : null;
+				<SortableContext
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic favorite directory shape
+					items={favorites.map((f: any) => f.id)}
+					strategy={verticalListSortingStrategy}
+				>
+					{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
+					{favorites.map((fav: any) => (
+						<SortableFavoriteItem
+							key={fav.id}
+							fav={fav}
+							isActive={cwd === fav.path}
+							onSelect={() => setCwd(fav.path)}
+							onRemove={() => removeFavorite.mutate(fav.id)}
+						/>
+					))}
+				</SortableContext>
+				{createPortal(
+					<DragOverlay dropAnimation={null}>
+						{activeFav && (
+							<div
+								style={{
+									backgroundColor: "var(--mantine-color-body)",
+									boxShadow: "var(--mantine-shadow-md)",
+									borderRadius: 4,
+								}}
+							>
+								<FavoriteItemContent fav={activeFav} isActive={cwd === activeFav.path} />
+							</div>
+						)}
+					</DragOverlay>,
+					document.body,
+				)}
+			</DndContext>
+		) : null;
 
 	const directorySection = (
 		<>
+			<Select
+				label={tn("executionDeviceSelector")}
+				value={deviceId}
+				data={[
+					{ value: "local", label: tn("executionTargetLocal") },
+					...(devices ?? []).map((device) => ({
+						value: device.id,
+						label: device.name,
+						disabled: device.status !== "online",
+					})),
+				]}
+				onChange={(value) => {
+					const next = value ?? "local";
+					setDeviceId(next);
+					prefilledForOpenRef.current = true;
+					setCwd(
+						next === "local"
+							? defaultProjectDir
+							: (devices?.find((device) => device.id === next)?.defaultCwd ?? ""),
+					);
+				}}
+			/>
 			{/* DirectoryPicker's inner TextInput carries style={{flex:1}} (for horizontal layouts).
 			    Wrap it so that flex:1 cannot stretch it vertically inside the flex-column left pane. */}
 			<div style={{ flexShrink: 0 }}>
 				<DirectoryPicker
+					deviceId={deviceId}
+					deviceLabel={devices?.find((device) => device.id === deviceId)?.name}
 					label={t("workingDirectory")}
 					description={t("workingDirectoryHint")}
-					placeholder={defaultProjectDir || undefined}
+					placeholder={
+						(deviceId === "local"
+							? defaultProjectDir
+							: devices?.find((device) => device.id === deviceId)?.defaultCwd) || undefined
+					}
 					leftSection={<IconFolder size={16} />}
 					value={cwd}
 					onChange={setCwd}
 					rightSectionExtra={
-						cwd ? (
+						deviceId === "local" && cwd ? (
 							isFavorited ? (
 								<IconStarFilled size={16} style={{ color: "var(--mantine-color-yellow-5)" }} />
 							) : (
@@ -448,7 +499,7 @@ export function CreateNarratorModal({
 				/>
 			</div>
 
-			{favorites?.length ? (
+			{deviceId === "local" && favorites?.length ? (
 				// Wide: favorites fills the rest of the column. Narrow: fixed height + drag-to-resize.
 				<Stack gap="xs" style={isWide ? { flex: 1, minHeight: 0 } : undefined}>
 					<Text size="xs" fw={500} c="dimmed">
@@ -610,7 +661,12 @@ export function CreateNarratorModal({
 				<Button
 					onClick={handleCreate}
 					loading={createNarrator.isPending}
-					disabled={makeNamed && handleLength(handle.trim()) < MIN_HANDLE_LENGTH}
+					disabled={
+						(makeNamed && handleLength(handle.trim()) < MIN_HANDLE_LENGTH) ||
+						(deviceId !== "local" &&
+							(!cwd.trim() ||
+								devices?.find((device) => device.id === deviceId)?.status !== "online"))
+					}
 				>
 					{t("createNarrator")}
 				</Button>

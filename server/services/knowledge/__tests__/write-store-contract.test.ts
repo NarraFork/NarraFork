@@ -33,6 +33,7 @@ import {
 	knowledgeEntries,
 	knowledgeInjectionEvents,
 	knowledgeLevels,
+	knowledgePackActivations,
 	knowledgePacks,
 	knowledgeRevisions,
 	knowledgeSubmissions,
@@ -697,6 +698,82 @@ describe("knowledge write store (SQLite)", () => {
 			where: eq(narratorWhitelistDirs.id, whitelistDirId),
 		});
 		expect(whitelist?.path).toBe(`/tmp/extract-${TAG}`);
+		expect(whitelist).toMatchObject({ targetKind: "host", targetValue: null });
+		const remoteActivationId = generateId();
+		const remoteWhitelistId = generateId();
+		const binding = {
+			version: 1 as const,
+			workspace: {
+				revision: 3,
+				deviceId: "pack-device",
+				cwd: "/tmp",
+				pathFlavor: "posix" as const,
+				contextKey: "pack-store-fixture",
+				capabilities: { switchDirectory: true },
+			},
+			extractDir: `/tmp/extract-${TAG}`,
+			runtimeGeneration: 9,
+			actorUserId: "pack-actor",
+			// This DAL case checks empty-pack metadata; native creation proofs are
+			// exercised separately by the official executor integration suite.
+			files: [],
+		};
+		const remoteInput = {
+			activationId: remoteActivationId,
+			whitelistDirId: remoteWhitelistId,
+			narratorId,
+			packId,
+			extractDir: binding.extractDir,
+			archiveHash: "hash",
+			now: NOW(),
+			targetKind: "device" as const,
+			targetValue: "pack-device",
+			pathFlavor: "posix" as const,
+			targetBindingJson: binding,
+		};
+		await store.recordPackActivation(remoteInput);
+		expect(
+			await db.query.narratorWhitelistDirs.findFirst({
+				where: eq(narratorWhitelistDirs.id, whitelistDirId),
+			}),
+		).toMatchObject({ targetKind: "host", targetValue: null });
+		expect(
+			await db.query.narratorWhitelistDirs.findFirst({
+				where: eq(narratorWhitelistDirs.id, remoteWhitelistId),
+			}),
+		).toMatchObject({ targetKind: "device", targetValue: "pack-device", pathFlavor: "posix" });
+		expect(
+			(
+				await db.query.knowledgePackActivations.findFirst({
+					where: eq(knowledgePackActivations.id, remoteActivationId),
+				})
+			)?.targetBindingJson,
+		).toEqual(binding);
+		await expect(
+			store.recordPackActivation({
+				...remoteInput,
+				activationId: generateId(),
+				whitelistDirId: generateId(),
+				targetValue: "other-device",
+			}),
+		).rejects.toBeInstanceOf(ValidationError);
+		await expect(
+			store.recordPackActivation({
+				...remoteInput,
+				activationId: generateId(),
+				whitelistDirId: generateId(),
+				targetBindingJson: { ...binding, actorUserId: null },
+			}),
+		).rejects.toBeInstanceOf(ValidationError);
+		await expect(
+			store.recordPackActivation({
+				...remoteInput,
+				activationId: generateId(),
+				whitelistDirId: generateId(),
+				targetBindingJson: { ...binding, extractDir: "x".repeat(600 * 1024) },
+				extractDir: "x".repeat(600 * 1024),
+			}),
+		).rejects.toBeInstanceOf(ValidationError);
 
 		await store.releasePackActivation({ activationId, whitelistDirId, now: NOW() });
 		const released = await db.query.narratorWhitelistDirs.findFirst({

@@ -1,0 +1,1 @@
+ALTER TABLE "knowledge_pack_activations" ADD COLUMN "target_binding_json" text;

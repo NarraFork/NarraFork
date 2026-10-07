@@ -404,10 +404,24 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 115 tables and 1661 columns including resource inventory and context snapshots", () => {
-		expect(target.tables.length).toBe(115);
-		// 1658 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1661);
+	test("covers 120 tables and 1740 columns including immutable capture origins", () => {
+		expect(target.tables.length).toBe(120);
+		// 1737 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1740);
+		expect(source.tableCount).toBe(120);
+		expect(source.columnCount).toBe(1740);
+		for (const coverage of [source, target]) {
+			expect(coverage.tables.reduce((count, table) => count + table.indexes.length, 0)).toBe(433);
+			expect(
+				coverage.tables.reduce(
+					(count, table) =>
+						count +
+						(table.foreignKeys?.length ?? 0) +
+						table.columns.filter((column) => column.references).length,
+					0,
+				),
+			).toBe(229);
+		}
 		for (const name of ["narrators", "api_requests"]) {
 			expect(
 				target.tables
@@ -420,6 +434,94 @@ describe("real schema parity", () => {
 				.find((table) => table.name === "narrator_worktree_resources")
 				?.columns.map((column) => column.property),
 		).toContain("scopeOwnerUserId");
+	});
+
+	test("remote workspace, history and capture fields retain source and generated parity", () => {
+		const expectedColumns: Record<string, string[]> = {
+			narrators: ["workspaceRevision", "workspaceContext", "planFileBinding", "lastStopReason"],
+			terminals: ["workspaceRevision", "workspaceContext"],
+			knowledge_pack_activations: ["targetBindingJson"],
+			workspace_switch_requests: [
+				"requestId",
+				"requestDigest",
+				"expectedRevision",
+				"result",
+				"installState",
+			],
+			remote_history_objects: [
+				"sourceInstanceId",
+				"scopeId",
+				"deviceId",
+				"workspaceInstanceId",
+				"rootIdentity",
+				"objectId",
+				"algorithm",
+				"digest",
+				"sizeBytes",
+				"placement",
+				"state",
+			],
+			remote_history_receipts: [
+				"sourceInstanceId",
+				"scopeId",
+				"deviceId",
+				"workspaceInstanceId",
+				"rootIdentity",
+				"operationId",
+				"requestDigest",
+				"intentDigest",
+				"intentJson",
+				"fencingToken",
+				"state",
+				"receiptJson",
+				"serverCommitId",
+			],
+			remote_tree_captures: [
+				"originProjectId",
+				"originContextVersion",
+				"narratorId",
+				"toolCallId",
+				"attempt",
+				"edge",
+				"deviceId",
+				"contextKey",
+				"workspaceRevision",
+				"sourceInstanceId",
+				"workspaceInstanceId",
+				"scopeId",
+				"rootIdentity",
+				"remoteOperationId",
+				"requestDigest",
+				"actorSubjectKey",
+				"state",
+				"descriptorJson",
+				"receiptMetadataJson",
+			],
+		};
+		for (const coverage of [source, target]) {
+			for (const [name, properties] of Object.entries(expectedColumns)) {
+				const table = coverage.tables.find((entry) => entry.name === name);
+				expect(table, `${name} must exist in both schemas`).toBeDefined();
+				for (const property of properties)
+					expect(
+						table?.columns.map((column) => column.property),
+						`${name}.${property}`,
+					).toContain(property);
+			}
+			expect(
+				coverage.tables
+					.find((table) => table.name === "knowledge_pack_activations")
+					?.columns.find((column) => column.property === "targetBindingJson"),
+			).toMatchObject({
+				name: "target_binding_json",
+				kind: "text",
+				mode: "json",
+				pgType: "text",
+				notNull: false,
+				primary: false,
+				unique: false,
+			});
+		}
 	});
 
 	test("the PG-only insert_seq identity columns are present on exactly the three ordinal tables", () => {

@@ -70,13 +70,13 @@ export function NarratorToolbarItem({
 	if (def.id === "device") {
 		return (
 			<ExecutionDeviceMenu
+				narratorId={narratorId}
 				label={t("executionDeviceSelector")}
 				localLabel={t("executionTargetLocal")}
 				offlineLabel={t("executionDeviceOffline")}
 				devices={inlineControls.executionDevicesQuery.data?.devices ?? []}
 				currentDeviceId={inlineControls.executionDevicesQuery.data?.defaultDeviceId ?? "local"}
 				pending={inlineControls.updateExecutionDeviceMutation.isPending}
-				onSelect={(deviceId) => inlineControls.updateExecutionDeviceMutation.mutate(deviceId)}
 			/>
 		);
 	}

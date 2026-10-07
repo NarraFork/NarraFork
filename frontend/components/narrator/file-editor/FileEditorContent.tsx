@@ -161,7 +161,8 @@ function FileEditorDocument({
 	const editorSelectionRef = useRef<FileSelection | null>(null);
 	const [lineWrapping, setLineWrapping] = useState(false);
 	const [searchOpen, setSearchOpen] = useState(false);
-	const readOnly = deviceId !== "local" || !narratorId;
+	const readOnly =
+		!narratorId || state?.editable === false || (deviceId !== "local" && state?.editable !== true);
 	const modes = useMemo(() => availableModes(filePath), [filePath]);
 	// The remembered default mode applies only where it makes sense for this file
 	// (resolveInitialMode); "设为默认" writes the current mode back to the same key.
@@ -250,7 +251,17 @@ function FileEditorDocument({
 					};
 				},
 				onChange: setState,
-				...(readOnly
+				...(deviceId !== "local" && narratorId
+					? {
+							unsupportedSource: async (signal: AbortSignal) =>
+								fileReferenceApi.preview(
+									narratorId,
+									{ deviceId, path: filePath },
+									AbortSignal.any([signal, AbortSignal.timeout(FILE_REFERENCE_READ_TIMEOUT_MS)]),
+								),
+						}
+					: {}),
+				...(!narratorId
 					? {
 							readOnlySource: async (signal: AbortSignal) => {
 								const boundedSignal = AbortSignal.any([
@@ -273,7 +284,7 @@ function FileEditorDocument({
 						}
 					: {}),
 			}),
-		[deviceId, filePath, narratorId, readOnly],
+		[deviceId, filePath, narratorId],
 	);
 
 	useEffect(() => {
@@ -811,7 +822,12 @@ function FileEditorDocument({
 					)}
 				</Group>
 			</Group>
-			{deviceId !== "local" && (
+			{readOnly && state.readOnlyReason && (
+				<Text size="xs" c="dimmed" px="xs">
+					{state.readOnlyReason}
+				</Text>
+			)}
+			{deviceId !== "local" && state.previewOnly && (
 				<Text size="xs" c="dimmed" px="xs">
 					{t("fileEditor.remoteBudget", {
 						defaultValue: "Remote files are read-only and use the existing 1 MiB preview limit.",

@@ -653,8 +653,11 @@ export function RecentTabList({
 
 	// Workspace "add narrator" modal state
 	const [wsCreateTarget, setWsCreateTarget] = useState<string | null>(null);
-	// "New narrator in this directory" modal state (cwd pre-filled from a tab)
-	const [newNarratorCwd, setNewNarratorCwd] = useState<string | null>(null);
+	// "New narrator in this directory" keeps its device-qualified source workspace.
+	const [newNarratorTarget, setNewNarratorTarget] = useState<{
+		deviceId: string;
+		cwd: string;
+	} | null>(null);
 
 	const listBoxRef = useRef<HTMLDivElement | null>(null);
 	// Collapse is a user/view preference, never a temporary drag state.
@@ -820,17 +823,30 @@ export function RecentTabList({
 		const { tab } = ctxMenu;
 		setCtxMenu(null);
 		if (!requireSetup()) return;
-		const dir = await resolveTabDirectory(tab);
-		if (!dir) {
-			notifications.show({ color: "red", message: t("newNarratorHereNoDir") });
-			return;
+		try {
+			if (tab.type === "narrator" || tab.type === "subagent") {
+				// A tab's cwd alone cannot identify its filesystem. Read the committed
+				// workspace, not legacy narrator.cwd, host syntax or device.defaultCwd.
+				const context = await api.getWorkspaceContext(tab.id);
+				if (!context.deviceId || !context.cwd) throw new Error("Missing workspace target");
+				setNewNarratorTarget({ deviceId: context.deviceId, cwd: context.cwd });
+				return;
+			}
+			// Chapters retain their explicitly local worktree lifecycle.
+			const cwd = await resolveTabDirectory(tab);
+			if (cwd && tab.type === "chapter") {
+				setNewNarratorTarget({ deviceId: "local", cwd });
+				return;
+			}
+		} catch {
+			/* Failed/offline initialization never falls back to a host path. */
 		}
-		setNewNarratorCwd(dir);
+		notifications.show({ color: "red", message: t("newNarratorHereNoDir") });
 	}, [ctxMenu, requireSetup, resolveTabDirectory, t]);
 
 	const handleNewNarratorHereCreated = useCallback(
 		(data: CreateNarratorResult) => {
-			setNewNarratorCwd(null);
+			setNewNarratorTarget(null);
 			addRecentTab({
 				type: "narrator",
 				id: data.id,
@@ -1400,12 +1416,13 @@ export function RecentTabList({
 							/>
 						</React.Suspense>
 					)}
-					{newNarratorCwd !== null && (
+					{newNarratorTarget !== null && (
 						<React.Suspense fallback={null}>
 							<CreateNarratorModal
-								opened={newNarratorCwd !== null}
-								initialCwd={newNarratorCwd}
-								onClose={() => setNewNarratorCwd(null)}
+								opened={newNarratorTarget !== null}
+								initialCwd={newNarratorTarget.cwd}
+								initialDeviceId={newNarratorTarget.deviceId}
+								onClose={() => setNewNarratorTarget(null)}
 								onCreated={handleNewNarratorHereCreated}
 							/>
 						</React.Suspense>

@@ -55,55 +55,81 @@ export const narratorHandleSchema = z
 		message: "handle must start with a letter or digit and contain only letters, digits, _ or -",
 	});
 
-export const createNarratorSchema = z.object({
-	chapterId: z.string().min(1).nullish(),
-	type: z.enum(["primary"]).optional(),
-	model: z.string().optional(),
-	systemPrompt: z.string().max(10000).optional(),
-	permissionMode: permissionModeSchema.optional(),
-	startInPlanMode: z.boolean().optional(),
-	cwd: z.string().min(1).max(4096).optional(),
-	reasoningEffort: reasoningEffortSchema.nullable().optional(),
-	/** @deprecated Use fastModeOverride. Kept so older clients keep working. */
-	fastMode: z.boolean().optional(),
-	fastModeOverride: booleanOverrideSchema.optional(),
-	relaxedPlan: z.boolean().optional(),
-	planReflectionAutoApproveOverride: booleanOverrideSchema.optional(),
-	dangerReflectionOverride: dangerReflectionOverrideSchema.optional(),
-	autoContinuationOverride: autoContinuationOverrideSchema.optional(),
-	behaviorFenceIntervalOverride: z
-		.number()
-		.int()
-		.min(-1)
-		.max(1000)
-		.refine((v) => v === -1 || v >= 5, {
-			message: "Interval must be -1 or at least 5",
-		})
-		.nullable()
-		.optional(),
-	tasksReminderIntervalOverride: z
-		.number()
-		.int()
-		.min(-1)
-		.max(1000)
-		.refine((v) => v === -1 || v >= 5, {
-			message: "Interval must be -1 or at least 5",
-		})
-		.nullable()
-		.optional(),
-	behaviorFenceAttachOverride: booleanOverrideSchema.optional(),
-	// Named narrator: when makeNamed is true, handle is required and the narrator
-	// gets the "named" trait. Named narrators are standalone, long-lived, and
-	// mentionable via @handle in any session.
-	makeNamed: z.boolean().optional(),
-	handle: narratorHandleSchema.optional(),
-	// Specialized standalone narrator kind. Both must be standalone.
-	//   "knowledge" → Knowledge Steward (knowledge-base mgmt): preinstalls the knowledge
-	//                 toolset and a steward system prompt.
-	//   "setup"     → Setup Assistant (installs missing system dependencies): preinstalls
-	//                 Terminal and a setup-assistant system prompt.
-	kind: z.enum(["knowledge", "setup"]).optional(),
-});
+export const createNarratorSchema = z
+	.object({
+		chapterId: z.string().min(1).nullish(),
+		type: z.enum(["primary"]).optional(),
+		model: z.string().optional(),
+		systemPrompt: z.string().max(10000).optional(),
+		permissionMode: permissionModeSchema.optional(),
+		startInPlanMode: z.boolean().optional(),
+		cwd: z.string().min(1).max(4096).optional(),
+		workspaceTarget: z
+			.strictObject({
+				deviceId: z.string().trim().min(1).max(128),
+				cwd: z.string().trim().min(1).max(4096),
+			})
+			.optional(),
+		reasoningEffort: reasoningEffortSchema.nullable().optional(),
+		/** @deprecated Use fastModeOverride. Kept so older clients keep working. */
+		fastMode: z.boolean().optional(),
+		fastModeOverride: booleanOverrideSchema.optional(),
+		relaxedPlan: z.boolean().optional(),
+		planReflectionAutoApproveOverride: booleanOverrideSchema.optional(),
+		dangerReflectionOverride: dangerReflectionOverrideSchema.optional(),
+		autoContinuationOverride: autoContinuationOverrideSchema.optional(),
+		behaviorFenceIntervalOverride: z
+			.number()
+			.int()
+			.min(-1)
+			.max(1000)
+			.refine((v) => v === -1 || v >= 5, {
+				message: "Interval must be -1 or at least 5",
+			})
+			.nullable()
+			.optional(),
+		tasksReminderIntervalOverride: z
+			.number()
+			.int()
+			.min(-1)
+			.max(1000)
+			.refine((v) => v === -1 || v >= 5, {
+				message: "Interval must be -1 or at least 5",
+			})
+			.nullable()
+			.optional(),
+		behaviorFenceAttachOverride: booleanOverrideSchema.optional(),
+		// Named narrator: when makeNamed is true, handle is required and the narrator
+		// gets the "named" trait. Named narrators are standalone, long-lived, and
+		// mentionable via @handle in any session.
+		makeNamed: z.boolean().optional(),
+		handle: narratorHandleSchema.optional(),
+		// Specialized standalone narrator kind. Both must be standalone.
+		//   "knowledge" → Knowledge Steward (knowledge-base mgmt): preinstalls the knowledge
+		//                 toolset and a steward system prompt.
+		//   "setup"     → Setup Assistant (installs missing system dependencies): preinstalls
+		//                 Terminal and a setup-assistant system prompt.
+		kind: z.enum(["knowledge", "setup"]).optional(),
+	})
+	.superRefine((input, ctx) => {
+		if (input.cwd && input.workspaceTarget)
+			ctx.addIssue({
+				code: "custom",
+				path: ["workspaceTarget"],
+				message: "Use workspaceTarget or legacy cwd, not both",
+			});
+		if (
+			input.chapterId &&
+			input.workspaceTarget?.deviceId !== undefined &&
+			input.workspaceTarget.deviceId !== "local"
+		) {
+			ctx.addIssue({
+				code: "custom",
+				path: ["workspaceTarget"],
+				message: "Remote workspaces require a standalone narrator",
+			});
+		}
+	});
 
 /**
  * Spawn a Setup Assistant narrator.
@@ -280,6 +306,10 @@ export const applyRevertPlanSchema = z
 		acceptSnapshotRestore: z.literal(true).optional(),
 	})
 	.strict();
+
+export const reconcileRevertPlanSchema = z.strictObject({
+	planHash: z.string().regex(/^[a-f0-9]{64}$/),
+});
 
 export const revertPlanFilesQuerySchema = z
 	.object({

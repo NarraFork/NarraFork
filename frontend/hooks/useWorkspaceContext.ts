@@ -138,15 +138,38 @@ export function useUpdateExecutionDevice(narratorId: string, onError?: (error: E
 export function useSwitchWorkspaceContext(narratorId: string) {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: (input: SwitchWorkingDirectoryRequest) =>
-			api.switchWorkspaceContext(narratorId, input),
+		mutationFn: async (input: SwitchWorkingDirectoryRequest) => {
+			try {
+				return await api.switchWorkspaceContext(narratorId, input);
+			} catch (error) {
+				// A lost response must query the ORIGINAL request, never create a new ID.
+				try {
+					const receipt = await api.getWorkspaceSwitchRequest(narratorId, input.requestId);
+					if (receipt.installState === "installed") return receipt.result;
+				} catch {
+					/* No confirmed installed receipt; retain the original error. */
+				}
+				throw error;
+			}
+		},
 		retry: false,
-		onError: () => {
-			void qc.invalidateQueries({ queryKey: workspaceContextKey(narratorId) });
+		onMutate: async () => {
+			qc.setQueryData(transitionKey(narratorId), true);
+			await qc.cancelQueries({ queryKey: workspaceContextKey(narratorId) });
+		},
+		onError: async () => {
+			try {
+				const context = await api.getWorkspaceContext(narratorId);
+				applyWorkspaceContext(qc, narratorId, context);
+				qc.setQueryData(transitionKey(narratorId), false);
+			} catch {
+				/* Keep file operations suspended until an authoritative read. */
+			}
 		},
 		onSuccess: async ({ current }) => {
 			await qc.cancelQueries({ queryKey: workspaceContextKey(narratorId) });
 			applyWorkspaceContext(qc, narratorId, current);
+			qc.setQueryData(transitionKey(narratorId), false);
 			void qc.invalidateQueries({ queryKey: workspaceContextKey(narratorId) });
 		},
 	});

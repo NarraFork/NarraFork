@@ -21,6 +21,7 @@ import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	users,
 } from "../db/schema";
 import { generateId } from "../lib/id";
 import { FILE_CHANGE_BLOB_BUDGET_ID } from "./file-change-blob-catalog";
@@ -425,6 +426,151 @@ function noDispatchInput(): BeginFileChangeOperation & { toolCallId: string; nar
 		actor: { ...actor, narratorId: fixture.narratorId },
 	};
 }
+
+function recoveryInput(authentication: "session" | "oauth" = "session") {
+	const input = noDispatchInput();
+	const userId = generateId();
+	db.insert(users)
+		.values({
+			id: userId,
+			username: userId,
+			passwordHash: "fixture-not-secret",
+			createdAt: new Date(clock).toISOString(),
+		})
+		.run();
+	const common = {
+		version: 1 as const,
+		userId,
+		issuedAtSeconds: 1_790_000_000,
+		expiresAtSeconds: 1_790_003_600,
+	};
+	const proof: NonNullable<FileChangeActor["recoveryAuth"]> =
+		authentication === "session"
+			? { ...common, authentication, tokenVersion: 2 }
+			: {
+					...common,
+					authentication,
+					oauth: {
+						tokenId: "original-token-id",
+						clientId: "external-client",
+						oauthClientId: "client-row",
+						grantId: "original-grant",
+						refreshFamilyId: null,
+						expiresAt: "2026-10-07T14:00:00.000Z",
+						scopes: ["filesystem.workspace.write"],
+					},
+				};
+	return {
+		userId,
+		input: {
+			...input,
+			ownerUserId: userId,
+			projectId: null,
+			actor: {
+				...input.actor,
+				subjectKey: `narrator:${input.narratorId}`,
+				recoveryAuth: proof,
+				recoveryOrigin: {
+					narratorId: input.narratorId,
+					projectId: null,
+					toolName: "Edit" as const,
+				},
+			},
+		},
+	};
+}
+
+describe("strict optional original recovery authentication metadata", () => {
+	for (const authentication of ["session", "oauth"] as const)
+		test(`persists and copies exact ${authentication} provenance`, () => {
+			const fixture = recoveryInput(authentication);
+			try {
+				const operation = service.beginOperation(fixture.input);
+				expect(operation.actorJson.recoveryAuth).toEqual(fixture.input.actor.recoveryAuth);
+				expect(operation.actorJson.recoveryOrigin).toEqual(fixture.input.actor.recoveryOrigin);
+				fixture.input.actor.recoveryAuth.userId = "changed-in-caller";
+				expect(service.getOperation(operation.id)?.actorJson.recoveryAuth?.userId).toBe(
+					fixture.userId,
+				);
+			} finally {
+				db.delete(users).where(eq(users.id, fixture.userId)).run();
+			}
+		});
+	test("legacy actor remains unchanged and gains no current-owner authentication", () => {
+		const input = operationInput();
+		const operation = service.beginOperation(input);
+		expect(operation.actorJson).toEqual(input.actor);
+		expect(operation.actorJson).not.toHaveProperty("recoveryAuth");
+		expect(operation.actorJson).not.toHaveProperty("recoveryOrigin");
+	});
+	test("rejects malformed, foreign and extra recovery authentication/origin fields", () => {
+		const fixture = recoveryInput();
+		try {
+			const origin = fixture.input.actor.recoveryOrigin;
+			const proof = fixture.input.actor.recoveryAuth;
+			const changed = [
+				{ recoveryAuth: { ...proof, version: 2 } },
+				{ recoveryAuth: { ...proof, userId: "another-user" } },
+				{ recoveryAuth: { ...proof, tokenVersion: -1 } },
+				{ recoveryAuth: { ...proof, expiresAtSeconds: proof.issuedAtSeconds } },
+				{ recoveryAuth: { ...proof, admin: true } },
+				{ recoveryAuth: { ...proof, bearer: "not-accepted" } },
+				{ recoveryAuth: { ...proof, authentication: "unknown" } },
+				{ recoveryOrigin: { ...origin, narratorId: "another-narrator" } },
+				{ recoveryOrigin: { ...origin, projectId: "another-project" } },
+				{ recoveryOrigin: { ...origin, toolName: "Bash" } },
+				{ recoveryOrigin: { ...origin, currentCwd: "/untrusted" } },
+				{ recoveryAuth: undefined },
+				{ recoveryOrigin: undefined },
+				{ subjectKey: "borrowed-author" },
+			];
+			for (const extra of changed)
+				expect(() =>
+					service.beginOperation({
+						...fixture.input,
+						actor: { ...fixture.input.actor, ...extra } as FileChangeActor,
+					}),
+				).toThrow();
+			expect(() =>
+				service.beginOperation({ ...fixture.input, ownerUserId: "another-owner" }),
+			).toThrow();
+			expect(() => service.beginOperation({ ...fixture.input, projectId: undefined })).toThrow();
+		} finally {
+			db.delete(users).where(eq(users.id, fixture.userId)).run();
+		}
+	});
+	test("rejects incomplete, oversized and extra OAuth provenance without widening actor keys", () => {
+		const fixture = recoveryInput("oauth");
+		try {
+			const proof = fixture.input.actor.recoveryAuth;
+			if (proof.authentication !== "oauth") throw new Error("OAuth fixture required");
+			for (const oauth of [
+				{ ...proof.oauth, scopes: Array.from({ length: 129 }, () => "Read") },
+				{ ...proof.oauth, tokenId: "" },
+				{ ...proof.oauth, grantId: undefined },
+				{ ...proof.oauth, expiresAt: "invalid-date" },
+				{ ...proof.oauth, rawToken: "not-accepted" },
+			])
+				expect(() =>
+					service.beginOperation({
+						...fixture.input,
+						actor: {
+							...fixture.input.actor,
+							recoveryAuth: { ...proof, oauth } as FileChangeActor["recoveryAuth"],
+						},
+					}),
+				).toThrow();
+			expect(() =>
+				service.beginOperation({
+					...fixture.input,
+					actor: { ...fixture.input.actor, unexpected: true } as FileChangeActor,
+				}),
+			).toThrow("Unexpected fields");
+		} finally {
+			db.delete(users).where(eq(users.id, fixture.userId)).run();
+		}
+	});
+});
 
 const NO_DISPATCH = { targetDispatched: false, reason: "validation_rejected" } as const;
 

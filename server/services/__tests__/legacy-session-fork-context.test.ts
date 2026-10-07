@@ -180,7 +180,7 @@ async function assertInherited(
 	const child = await db.query.narrators.findFirst({ where: eq(narrators.id, childId) });
 	expect(child).toMatchObject({
 		cwd,
-		defaultDeviceId: deviceId,
+		defaultDeviceId: deviceId === "local" ? null : deviceId,
 		contextProjectId: projectId,
 		ownerUserId: owner,
 		visibility: "private",
@@ -234,27 +234,38 @@ async function assertInherited(
 	expect((await narratorService.getById(parentId)).id).toBe(parentId);
 }
 
+async function expectSkillContext(
+	id: string,
+	expected: { projectGitPath: string | null; cwd: string },
+	contextProjectId?: string,
+) {
+	const context = await resolveSkillContextForNarrator(id);
+	// Preserve the exact legacy project/cwd assertions while verifying the new
+	// source-qualified automatic Read access instead of ignoring its authority.
+	expect({ projectGitPath: context.projectGitPath, cwd: context.cwd }).toEqual(expected);
+	expect(context.workspaceContext).toMatchObject({
+		deviceId: "local",
+		cwd: expected.cwd,
+		revision: 0,
+		contextProjectId,
+	});
+	expect(context.fileAccess?.workspaceContext).toEqual(context.workspaceContext);
+	expect(context.fileAccess?.backend.deviceId).toBe("local");
+	expect(context.fileAccess?.authorizeRead).toBeFunction();
+}
+
 describe("skill project context", () => {
 	test("standalone explicit project retains project skills and fallback directory", async () => {
 		const id = await parent({ contextProjectId: projectId, cwd: null });
-		expect(await resolveSkillContextForNarrator(id)).toEqual({
-			projectGitPath: projectPath,
-			cwd: projectPath,
-		});
+		await expectSkillContext(id, { projectGitPath: projectPath, cwd: projectPath }, projectId);
 	});
 	test("chapter project wins over conflicting explicit context", async () => {
 		const id = await parent({ chapterId, contextProjectId: otherProjectId, cwd: null });
-		expect(await resolveSkillContextForNarrator(id)).toEqual({
-			projectGitPath: projectPath,
-			cwd: worktreePath,
-		});
+		await expectSkillContext(id, { projectGitPath: projectPath, cwd: worktreePath }, projectId);
 	});
 	test("an arbitrary directory never infers project membership", async () => {
 		const id = await parent({ cwd: projectPath });
-		expect(await resolveSkillContextForNarrator(id)).toEqual({
-			projectGitPath: null,
-			cwd: projectPath,
-		});
+		await expectSkillContext(id, { projectGitPath: null, cwd: projectPath });
 	});
 });
 

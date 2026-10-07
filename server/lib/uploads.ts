@@ -2,17 +2,31 @@ import {
 	accessSync,
 	chmodSync,
 	constants,
+	createWriteStream,
 	existsSync,
 	mkdirSync,
 	readdirSync,
 	rmSync,
 	statSync,
 } from "node:fs";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import type { WorkspaceAttachmentCreationProof } from "@shared/workspace-attachment-protocol";
+import type { WorkspaceContext } from "@shared/workspace-context";
+import type { ExecutionBackend } from "./agent/execution/backend";
 import { AppError, ValidationError } from "./errors";
-import { generateShortId } from "./id";
+import { generateId, generateShortId } from "./id";
 import { logger } from "./logger";
 import { getNarraforkPath } from "./narrafork-home";
+import type { WorkspaceFileAccess } from "./plan-file-path";
+import {
+	cleanupWorkspaceAttachmentByProof,
+	createWorkspaceAttachmentFromStagedFile,
+	isWorkspaceAttachmentProof,
+	type WorkspaceAttachmentTarget,
+} from "./workspace-attachment-io";
 
 let uploadsDirTestOverride: string | null = null;
 
@@ -601,7 +615,8 @@ export function deleteUploadedImage(narratorId: string, imageId: string): void {
 
 /** Delete worktree attachment files created during a failed pre-commit edit. */
 export function deleteCreatedAttachmentFiles(filePaths: Iterable<string>): void {
-	for (const filePath of filePaths) rmSync(filePath, { force: true });
+	for (const filePath of filePaths)
+		logger.warn("Legacy attachment cleanup refused without creation proof", { filePath });
 }
 
 /**
@@ -714,9 +729,306 @@ export { MAX_TEXT_FILE_SIZE };
 
 export interface TextFileRef {
 	filename: string;
-	/** Absolute path where the file was saved (inside the worktree). */
+	/** Absolute path on deviceId; legacy records without a deviceId refer to the host. */
 	filePath: string;
 	size: number;
+	deviceId?: string;
+	contextKey?: string;
+	/** Random operation-owned directory; cleanup must never infer ownership from a pathname alone. */
+	attachmentId?: string;
+	/** Persisted original binding; read authority is always revalidated, never taken from capabilities. */
+	attachmentWorkspace?: WorkspaceContext;
+	sourceNarratorId?: string;
+	attachmentUnavailableReason?: string;
+	/** Missing a creation receipt is not proof of ownership, even for a random path. */
+	attachmentCleanupUnavailableReason?: string;
+	/** Actual exclusive publisher receipt; never reconstructed from a later observation. */
+	attachmentCreationProof?: WorkspaceAttachmentCreationProof;
+}
+
+/** Runtime callers supply the full actor/project/device/OAuth/write-policy intersection. */
+export interface WorkspaceAttachmentAccess {
+	backend: ExecutionBackend;
+	workspaceContext: WorkspaceContext;
+	signal?: AbortSignal;
+	authorizeWrite: (
+		canonicalPath: string,
+		backend: ExecutionBackend,
+		signal?: AbortSignal,
+	) => Promise<boolean | undefined>;
+	/** Required when copying a device-qualified attachment from another workspace/device. */
+	sourceAccess?: WorkspaceFileAccess;
+	/** Production lease stays held until all native I/O in body actually settles. */
+	withAttachmentTarget?<Result>(
+		signal: AbortSignal,
+		body: (target: WorkspaceAttachmentTarget) => Promise<Result>,
+		admitted: WorkspaceAttachmentAdmittedIdentity,
+	): Promise<Result>;
+	/** Legacy/mock resolver only. Production uses the held-lease callback above. */
+	attachmentTarget?: (signal?: AbortSignal) => Promise<WorkspaceAttachmentTarget>;
+}
+
+export interface WorkspaceAttachmentAdmittedIdentity {
+	lexicalPath: string;
+	canonicalPath: string;
+	operationId: string;
+}
+
+async function withTrustedAttachmentTarget<Result>(
+	access: WorkspaceAttachmentAccess,
+	signal: AbortSignal,
+	body: (target: WorkspaceAttachmentTarget) => Promise<Result>,
+	admitted: WorkspaceAttachmentAdmittedIdentity,
+): Promise<Result> {
+	if (access.withAttachmentTarget) return access.withAttachmentTarget(signal, body, admitted);
+	if (access.attachmentTarget) return body(await access.attachmentTarget(signal));
+	throw new ValidationError("Native attachment operation requires its trusted held-lease resolver");
+}
+
+export const WORKSPACE_ATTACHMENT_TIMEOUT_MS = 5 * 60_000;
+
+function assertAttachmentWorkspace(cwd: string, access: WorkspaceAttachmentAccess): void {
+	const { backend, workspaceContext } = access;
+	if (
+		backend.deviceId !== workspaceContext.deviceId ||
+		!backend.paths.equals(cwd, workspaceContext.cwd) ||
+		backend.paths.flavor !== workspaceContext.pathFlavor ||
+		!backend.paths.isAbsolute(cwd)
+	) {
+		throw new ValidationError("Attachment target does not match its frozen workspace");
+	}
+	if (typeof access.authorizeWrite !== "function")
+		throw new ValidationError("Workspace attachment writes require explicit authorization");
+}
+
+function safeAttachmentFilename(filename: string): string {
+	const name = (filename.split(/[\\/]/).pop() ?? "attachment.txt").replace(
+		/[\\/:*?"<>|\p{Cc}]/gu,
+		"_",
+	);
+	if (!name || name === "." || name === "..")
+		throw new ValidationError("Invalid attachment filename");
+	return name.slice(0, 160);
+}
+
+async function writeAttachmentStream(path: string, file: Blob, signal: AbortSignal): Promise<void> {
+	await pipeline(
+		Readable.fromWeb(file.stream() as unknown as Parameters<typeof Readable.fromWeb>[0]),
+		createWriteStream(path, { flags: "wx", mode: 0o600 }),
+		{ signal },
+	);
+}
+
+/** Materialize one bounded file on the admitted device, never on a same-named host path. */
+export async function saveTextFileToWorkspace(
+	file: File,
+	access: WorkspaceAttachmentAccess,
+): Promise<TextFileRef> {
+	validateTextFile(file);
+	const { backend, workspaceContext } = access;
+	assertAttachmentWorkspace(workspaceContext.cwd, access);
+	const signal = access.signal
+		? AbortSignal.any([access.signal, AbortSignal.timeout(WORKSPACE_ATTACHMENT_TIMEOUT_MS)])
+		: AbortSignal.timeout(WORKSPACE_ATTACHMENT_TIMEOUT_MS);
+	signal.throwIfAborted();
+	const generation = backend.runtimeGeneration;
+	const attachmentId = generateId();
+	const operationDir = backend.paths.resolve(
+		workspaceContext.cwd,
+		`.narrafork/attached/${attachmentId}`,
+	);
+	const filePath = backend.paths.resolve(operationDir, safeAttachmentFilename(file.name));
+	const root = await backend.resolvePathIdentity(workspaceContext.cwd, { signal });
+	const identity = await backend.resolvePathIdentity(filePath, { signal });
+	if (
+		root.runtimeGeneration !== generation ||
+		identity.runtimeGeneration !== generation ||
+		backend.runtimeGeneration !== generation ||
+		!backend.paths.equals(root.canonicalPath, workspaceContext.cwd) ||
+		!backend.paths.contains(root.canonicalPath, identity.canonicalPath) ||
+		identity.exists
+	) {
+		throw new ValidationError("Attachment destination identity changed or escaped the workspace");
+	}
+	// Transfer's partial/manifest paths are also writes; all must pass policy before dispatch.
+	for (const path of [
+		identity.canonicalPath,
+		`${identity.canonicalPath}.nfpart`,
+		`${identity.canonicalPath}.nfmeta`,
+		`${identity.canonicalPath}.nfmeta.tmp`,
+	]) {
+		if ((await access.authorizeWrite(path, backend, signal)) !== true)
+			throw new ValidationError("Workspace attachment write denied");
+	}
+	signal.throwIfAborted();
+	let stagingDir: string | undefined;
+	let dispatched = false;
+	let writeOutcomeKnown = backend.kind === "local";
+	let creationProof: WorkspaceAttachmentCreationProof | undefined;
+	const nativeAvailable = !!(access.withAttachmentTarget || access.attachmentTarget);
+	if (backend.supportsWorkspaceAttachment === true && !nativeAvailable)
+		throw new ValidationError(
+			"Modern attachment creation requires its trusted actor/native resolver",
+		);
+	const started = Date.now();
+	const confirmWrite = async () => {
+		signal.throwIfAborted();
+		if ((await access.authorizeWrite(identity.canonicalPath, backend, signal)) !== true)
+			throw new ValidationError("Workspace attachment write authority changed");
+	};
+	const completeMaterialization = async (): Promise<TextFileRef> => {
+		const after = await backend.resolvePathIdentity(filePath, { signal });
+		const stat = await backend.statFile(filePath, { signal });
+		if (
+			backend.runtimeGeneration !== generation ||
+			after.runtimeGeneration !== generation ||
+			!backend.paths.equals(after.canonicalPath, identity.canonicalPath) ||
+			!stat?.isFile ||
+			stat.size !== file.size
+		)
+			throw new ValidationError("Attachment completion identity or size changed");
+		writeOutcomeKnown = true;
+		await confirmWrite();
+		logger.info("Workspace attachment materialized", {
+			deviceId: backend.deviceId,
+			contextKey: workspaceContext.contextKey,
+			filePath,
+			size: file.size,
+			attachmentId,
+		});
+		return {
+			filename: file.name,
+			filePath: creationProof ? identity.canonicalPath : filePath,
+			size: file.size,
+			deviceId: backend.deviceId,
+			contextKey: workspaceContext.contextKey,
+			attachmentId,
+			...(creationProof
+				? { attachmentCreationProof: creationProof }
+				: {
+						attachmentCleanupUnavailableReason:
+							"This attachment has no conditional creation receipt; automatic deletion is unsafe and the file is retained.",
+					}),
+		};
+	};
+	try {
+		if (nativeAvailable) {
+			const stagingRoot = resolve(getUploadsDir(), ".workspace-staging");
+			await mkdir(stagingRoot, { recursive: true, mode: 0o700 });
+			stagingDir = await mkdtemp(resolve(stagingRoot, "attachment-native-"));
+			const source = resolve(stagingDir, "payload");
+			await writeAttachmentStream(source, file, signal);
+			return await withTrustedAttachmentTarget(
+				access,
+				signal,
+				async (target) => {
+					if (
+						target.deviceId !== backend.deviceId ||
+						!backend.paths.equals(target.binding.root, workspaceContext.cwd)
+					)
+						throw new ValidationError(
+							"Attachment native target does not match the frozen workspace",
+						);
+					dispatched = true;
+					creationProof = await createWorkspaceAttachmentFromStagedFile({
+						target,
+						operationId: attachmentId,
+						path: backend.paths.relative(target.binding.root, identity.canonicalPath),
+						stagedFilePath: source,
+						sizeBytes: file.size,
+						signal,
+						authorize: confirmWrite,
+					});
+					return await completeMaterialization();
+				},
+				{ lexicalPath: filePath, canonicalPath: identity.canonicalPath, operationId: attachmentId },
+			);
+		}
+		await confirmWrite();
+		await backend.mkdirp(operationDir);
+		const actual = await backend.resolvePathIdentity(filePath, { signal });
+		if (
+			actual.runtimeGeneration !== generation ||
+			backend.runtimeGeneration !== generation ||
+			!backend.paths.equals(actual.canonicalPath, identity.canonicalPath) ||
+			actual.exists
+		)
+			throw new ValidationError("Attachment target changed before materialization");
+		if (backend.kind === "local") {
+			await confirmWrite();
+			dispatched = true;
+			await writeAttachmentStream(filePath, file, signal);
+		} else {
+			const stagingRoot = resolve(getUploadsDir(), ".workspace-staging");
+			await mkdir(stagingRoot, { recursive: true, mode: 0o700 });
+			stagingDir = await mkdtemp(resolve(stagingRoot, "attachment-"));
+			const source = resolve(stagingDir, "payload");
+			await writeAttachmentStream(source, file, signal);
+			const { uploadFile } = await import("../services/device-transfer-service");
+			await confirmWrite();
+			dispatched = true;
+			await uploadFile({
+				deviceId: backend.deviceId,
+				localPath: source,
+				remoteDest: filePath,
+				remotePlatformOs: backend.platform?.os,
+				signal,
+			});
+		}
+		return await completeMaterialization();
+	} catch (error) {
+		// Neither a random path, a write acknowledgement, nor a later hash proves that
+		// a pathname still names this attempt's unchanged object. Never plain-remove it.
+		if (creationProof && nativeAvailable) {
+			const originalProof = creationProof;
+			const cleanupSignal = AbortSignal.timeout(10_000);
+			try {
+				await withTrustedAttachmentTarget(
+					access,
+					cleanupSignal,
+					async (target) => {
+						if (target.deviceId !== backend.deviceId)
+							throw new ValidationError("Conditional cleanup device changed");
+						return await cleanupWorkspaceAttachmentByProof({
+							target,
+							proof: originalProof,
+							operationId: `cleanup-${originalProof.operationId}`,
+							signal: cleanupSignal,
+							authorize: async () => {
+								if (
+									(await access.authorizeWrite(identity.canonicalPath, backend, cleanupSignal)) !==
+									true
+								)
+									throw new ValidationError("Attachment conditional cleanup denied");
+							},
+						});
+					},
+					{
+						lexicalPath: filePath,
+						canonicalPath: identity.canonicalPath,
+						operationId: `cleanup-${originalProof.operationId}`,
+					},
+				);
+			} catch {
+				/* Original proof mismatch, revocation or unknown leaves evidence intact. */
+			}
+		} else if (dispatched)
+			logger.warn("Attachment retained without conditional creation proof", {
+				deviceId: backend.deviceId,
+				attachmentId,
+				outcomeKnown: writeOutcomeKnown,
+			});
+		throw error;
+	} finally {
+		if (stagingDir) await rm(stagingDir, { recursive: true, force: true });
+		if (Date.now() - started > 2_000)
+			logger.warn("Slow workspace attachment materialization", {
+				deviceId: backend.deviceId,
+				durationMs: Date.now() - started,
+				size: file.size,
+				attachmentId,
+			});
+	}
 }
 
 /**
@@ -729,6 +1041,8 @@ export function validateTextFile(file: File): void {
 			`Unsupported text file type: ${file.name}. Only common text and code files are allowed.`,
 		);
 	}
+	if (!Number.isSafeInteger(file.size) || file.size < 0)
+		throw new ValidationError("Invalid text file size");
 	if (file.size > MAX_TEXT_FILE_SIZE) {
 		throw new ValidationError(
 			`Text file too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Max: 100MB`,
@@ -759,13 +1073,23 @@ export function isFileWithinWorktree(cwd: string, filePath: string): boolean {
  * Save a text file into the worktree's `.narrafork/attached/` directory
  * using the original filename. Returns the absolute path.
  */
-export async function saveTextFileToWorktree(cwd: string, file: File): Promise<TextFileRef> {
+export async function saveTextFileToWorktree(
+	cwd: string,
+	file: File,
+	access?: WorkspaceAttachmentAccess,
+): Promise<TextFileRef> {
+	if (access) {
+		assertAttachmentWorkspace(cwd, access);
+		return saveTextFileToWorkspace(file, access);
+	}
+	validateTextFile(file);
 	const filePath = allocateWorktreeAttachmentPath(cwd, file.name);
 	try {
-		const buffer = await file.arrayBuffer();
-		await Bun.write(filePath, buffer);
+		await Bun.write(filePath, file);
 	} catch (error) {
-		rmSync(filePath, { force: true });
+		logger.warn("Legacy attachment partial retained without conditional creation proof", {
+			filePath,
+		});
 		throw error;
 	}
 
@@ -776,14 +1100,161 @@ export async function saveTextFileToWorktree(cwd: string, file: File): Promise<T
 		size: file.size,
 	});
 
-	return { filename: file.name, filePath, size: file.size };
+	return {
+		filename: file.name,
+		filePath,
+		size: file.size,
+		attachmentCleanupUnavailableReason:
+			"Legacy attachment has no conditional creation proof; automatic cleanup is refused.",
+	};
+}
+
+/** Best-effort cleanup for device-qualified attachments; never pass their paths to host rm. */
+export async function deleteWorkspaceAttachmentFiles(
+	refs: Iterable<TextFileRef>,
+	access: WorkspaceAttachmentAccess,
+): Promise<void> {
+	assertAttachmentWorkspace(access.workspaceContext.cwd, access);
+	const { backend, workspaceContext } = access;
+	const signal = AbortSignal.timeout(10_000);
+	for (const ref of refs) {
+		const proof = ref.attachmentCreationProof;
+		if (
+			!isWorkspaceAttachmentProof(proof) ||
+			!(access.withAttachmentTarget || access.attachmentTarget)
+		) {
+			ref.attachmentCleanupUnavailableReason =
+				"No original conditional creation proof/native primitive is available; automatic cleanup is refused and the file is retained.";
+			continue;
+		}
+		const canonicalPath = backend.paths.resolve(proof.binding.root, proof.path);
+		if (
+			ref.deviceId !== backend.deviceId ||
+			ref.contextKey !== workspaceContext.contextKey ||
+			ref.attachmentId !== proof.operationId ||
+			ref.size !== proof.sizeBytes ||
+			!backend.paths.equals(canonicalPath, ref.filePath) ||
+			!backend.paths.equals(proof.binding.root, workspaceContext.cwd)
+		) {
+			ref.attachmentCleanupUnavailableReason =
+				"Attachment creation proof does not match this original device/context/object; file retained.";
+			continue;
+		}
+		try {
+			const result = await withTrustedAttachmentTarget(
+				access,
+				signal,
+				async (target) => {
+					if (target.deviceId !== ref.deviceId)
+						throw new ValidationError("Conditional cleanup device changed");
+					return await cleanupWorkspaceAttachmentByProof({
+						target,
+						proof,
+						operationId: `cleanup-${proof.operationId}`,
+						signal,
+						authorize: async () => {
+							if ((await access.authorizeWrite(canonicalPath, backend, signal)) !== true)
+								throw new ValidationError("Conditional attachment cleanup denied");
+						},
+					});
+				},
+				{ lexicalPath: ref.filePath, canonicalPath, operationId: `cleanup-${proof.operationId}` },
+			);
+			if (result.outcome === "deleted" || result.outcome === "already_deleted")
+				delete ref.attachmentCleanupUnavailableReason;
+			else
+				ref.attachmentCleanupUnavailableReason =
+					result.reason ?? `Conditional attachment cleanup ${result.outcome}; file retained.`;
+		} catch (error) {
+			ref.attachmentCleanupUnavailableReason = `Conditional attachment cleanup could not be proven: ${error instanceof Error ? error.message : String(error)}. File retained.`;
+		}
+	}
 }
 
 /** Copy a modern text attachment into the active worktree without loading it all into JS memory. */
 export async function copyTextFileToWorktree(
 	cwd: string,
 	source: TextFileRef,
+	access?: WorkspaceAttachmentAccess,
 ): Promise<TextFileRef> {
+	if (access) {
+		assertAttachmentWorkspace(cwd, access);
+		const readAccess = access.sourceAccess;
+		if (!readAccess || readAccess.backend.deviceId !== (source.deviceId ?? "local"))
+			throw new ValidationError(
+				"Copying a workspace attachment requires its original read authorization",
+			);
+		const signal = access.signal
+			? AbortSignal.any([access.signal, AbortSignal.timeout(WORKSPACE_ATTACHMENT_TIMEOUT_MS)])
+			: AbortSignal.timeout(WORKSPACE_ATTACHMENT_TIMEOUT_MS);
+		const backend = readAccess.backend;
+		const generation = readAccess.runtimeGeneration ?? backend.runtimeGeneration;
+		const identity = await backend.resolvePathIdentity(source.filePath, { signal });
+		if (
+			identity.runtimeGeneration !== generation ||
+			backend.runtimeGeneration !== generation ||
+			(await readAccess.authorizeRead(identity.canonicalPath, backend, signal)) === false
+		)
+			throw new ValidationError("Attachment source identity changed or read denied");
+		const info = await backend.statFile(identity.canonicalPath, { signal });
+		if (
+			!info?.isFile ||
+			!Number.isSafeInteger(info.size) ||
+			info.size < 0 ||
+			info.size > MAX_TEXT_FILE_SIZE
+		)
+			throw new ValidationError("Attachment source is missing, unsupported, or too large");
+		if (backend.kind === "local") {
+			return saveTextFileToWorkspace(
+				new File([Bun.file(identity.canonicalPath)], source.filename),
+				{ ...access, signal },
+			);
+		}
+		const stagingRoot = resolve(getUploadsDir(), ".workspace-staging");
+		await mkdir(stagingRoot, { recursive: true, mode: 0o700 });
+		const stage = await mkdtemp(resolve(stagingRoot, "copy-"));
+		try {
+			const { downloadFile, statRemote } = await import("../services/device-transfer-service");
+			const remote = await statRemote(backend.deviceId, identity.canonicalPath, {
+				remotePlatformOs: backend.platform?.os,
+				signal,
+			});
+			if (
+				!remote.exists ||
+				remote.isDirectory ||
+				remote.size !== info.size ||
+				remote.size > MAX_TEXT_FILE_SIZE
+			)
+				throw new ValidationError("Attachment source changed before transfer");
+			const staged = resolve(stage, "source");
+			await downloadFile({
+				deviceId: backend.deviceId,
+				remotePath: identity.canonicalPath,
+				localDest: staged,
+				remoteSize: remote.size,
+				remoteMtimeMs: remote.mtimeMs,
+				remotePlatformOs: backend.platform?.os,
+				signal,
+			});
+			const after = await backend.resolvePathIdentity(identity.canonicalPath, { signal });
+			if (
+				after.runtimeGeneration !== generation ||
+				backend.runtimeGeneration !== generation ||
+				!backend.paths.equals(after.canonicalPath, identity.canonicalPath)
+			)
+				throw new ValidationError("Attachment source changed during transfer");
+			if ((await readAccess.authorizeRead(identity.canonicalPath, backend, signal)) === false)
+				throw new ValidationError("Attachment source read authority changed");
+			return await saveTextFileToWorkspace(new File([Bun.file(staged)], source.filename), {
+				...access,
+				signal,
+			});
+		} finally {
+			await rm(stage, { recursive: true, force: true });
+		}
+	}
+	if (source.deviceId && source.deviceId !== "local")
+		throw new ValidationError("Remote attachment cannot be interpreted as a host pathname");
 	const sourceFile = Bun.file(source.filePath);
 	if (!(await sourceFile.exists())) {
 		throw new ValidationError(`Attached file not found: ${source.filename}`);
@@ -792,10 +1263,16 @@ export async function copyTextFileToWorktree(
 	try {
 		await Bun.write(filePath, sourceFile);
 	} catch (error) {
-		rmSync(filePath, { force: true });
+		logger.warn("Legacy attachment copy retained without conditional creation proof", { filePath });
 		throw error;
 	}
-	return { filename: source.filename, filePath, size: source.size };
+	return {
+		filename: source.filename,
+		filePath,
+		size: source.size,
+		attachmentCleanupUnavailableReason:
+			"Legacy attachment copy has no conditional creation proof; automatic cleanup is refused.",
+	};
 }
 
 export async function deleteNarratorUploads(narratorId: string): Promise<void> {

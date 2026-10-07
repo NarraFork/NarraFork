@@ -20,6 +20,37 @@ const headerToolbarHook = () => read("./header/use-header-toolbar.tsx");
 const headerLayout = () => read("./header/NarratorHeaderLayout.tsx");
 const titleWidth = () => read("./header/header-title-width.ts");
 
+describe("production workspace target confirmation wiring", () => {
+	it("inline and bottom callers carry narrator identity and cannot invoke legacy immediate device switching", async () => {
+		const caller = await read("./header/NarratorToolbarItem.tsx");
+		const device = caller.slice(
+			caller.indexOf('if (def.id === "device")'),
+			caller.indexOf('if (def.id === "lodlevel")'),
+		);
+		expect(device).toContain("<ExecutionDeviceMenu");
+		expect(device).toContain("narratorId={narratorId}");
+		expect(device).not.toContain("updateExecutionDeviceMutation.mutate");
+	});
+	it("overflow closes only its menu and hosts directory confirmation in the persistent panel overlay", async () => {
+		const hook = await headerToolbarHook();
+		const start = hook.indexOf("const renderToolbarInlineOptions");
+		const rows = hook.slice(
+			hook.indexOf('case "device":', start),
+			hook.indexOf('case "lodlevel":', start),
+		);
+		expect(rows).toContain("setWorkspaceTargetId");
+		expect(rows).not.toContain("updateExecutionDeviceMutation.mutate");
+		expect(rows).not.toContain("<WorkspaceTargetPickerModal");
+		const overlay = hook.slice(hook.indexOf("toolbarOverlays:"));
+		expect(overlay).toContain("<WorkspaceTargetPickerModal");
+		expect(overlay).toContain("narratorId={narratorId}");
+		const panel = await narratorPanel();
+		expect(panel).toContain("{toolbarController.toolbarOverlays}");
+		const header = await headerToolbar();
+		expect(header).toContain("renderInlineOptions={renderToolbarInlineOptions}");
+	});
+});
+
 describe("header layout: pretext title width + right-hand tools", () => {
 	it("measures title width with pretext canvas, not DOM toolbar capacity", async () => {
 		const widthSrc = await titleWidth();

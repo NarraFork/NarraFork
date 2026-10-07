@@ -4,6 +4,7 @@ import { api } from "../lib/api";
 import type { ApiEntity } from "../lib/api/types";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 import { useTerminalCapability } from "./usePlatform";
+import { useWorkspaceContext } from "./useWorkspaceContext";
 
 const TERMINALS_QUERY_GC_TIME_MS = 60_000;
 
@@ -89,16 +90,33 @@ export function useCreateTerminal(chapterId: string) {
 export function useCreateNarratorTerminal(narratorId: string) {
 	const qc = useQueryClient();
 	const terminalCapability = useTerminalCapability();
+	const workspace = useWorkspaceContext(narratorId);
 	const queryKey = ["terminals", { narratorId }] as const;
 	return useMutation({
 		mutationFn: (data?: { name?: string; cols?: number; rows?: number; deviceId?: string }) => {
-			if (!terminalCapability.supported) {
+			const context = workspace.data;
+			const targetCapability = context?.capabilities.terminal;
+			const supported =
+				context?.deviceId === "local"
+					? terminalCapability.supported && targetCapability?.available !== false
+					: targetCapability?.available === true;
+			if (!context || workspace.transitioning || !supported) {
 				return Promise.reject(
-					new Error(terminalCapability.reason ?? "Terminal runtime is not supported"),
+					new Error(
+						targetCapability?.reason ??
+							terminalCapability.reason ??
+							"Terminal workspace is unavailable",
+					),
 				);
 			}
-			return api.createTerminal({ narratorId, ...data });
+			return api.createTerminal({
+				narratorId,
+				...data,
+				expectedRevision: context.revision,
+				contextKey: context.contextKey,
+			});
 		},
+		retry: false,
 		onSuccess: (terminal) => {
 			appendTerminalToCache(qc, queryKey, terminal);
 			qc.invalidateQueries({ queryKey });

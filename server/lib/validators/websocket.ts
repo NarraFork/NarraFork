@@ -164,6 +164,8 @@ export const terminalWsMessageSchema = z.preprocess(
 			chapterId: z.string().min(1).optional(),
 			narratorId: z.string().min(1).optional(),
 			deviceId: z.string().min(1).optional(),
+			expectedRevision: z.number().int().nonnegative().optional(),
+			contextKey: z.string().min(1).max(128).optional(),
 			name: z.string().max(100).optional(),
 			cols: z.number().int().min(10).max(500).optional(),
 			rows: z.number().int().min(2).max(200).optional(),

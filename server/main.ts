@@ -186,6 +186,10 @@ const {
 	startWorkspaceStartupReconciliation,
 	stopWorkspaceStartupReconciliation,
 } = await import("./services/workspace-startup-reconciliation");
+const { startRemoteHistoryRecoveryDispatcher } = await import(
+	"./services/remote-history-recovery-dispatcher"
+);
+let stopRemoteHistoryRecoveryDispatcher: () => void | Promise<void> = () => undefined;
 if (activeDatabaseBackend === "sqlite") {
 	try {
 		await initializeWorkspaceOwnerOnStartup();
@@ -1350,6 +1354,11 @@ if (activeDatabaseBackend === "sqlite") {
 // Start WebSocket heartbeat (ping/pong) to detect stale connections
 startHeartbeat();
 
+// Subscribe before device authentication can publish online events. Recovery is
+// metadata-bounded, asynchronous, and never infers authority from a local PID/TTL.
+if (activeDatabaseBackend === "sqlite") {
+	stopRemoteHistoryRecoveryDispatcher = startRemoteHistoryRecoveryDispatcher();
+}
 // Wire the remote-executor backend resolver + device lifecycle listeners.
 initDeviceConnectionService();
 // Wire the file-transfer chunk-frame receiver.
@@ -1737,6 +1746,12 @@ async function performGracefulShutdown(
 			tracker,
 			"workspaceReconciliation.stop",
 			stopWorkspaceStartupReconciliation,
+			5_000,
+		);
+		await shutdownStep(
+			tracker,
+			"remoteHistoryRecovery.stop",
+			stopRemoteHistoryRecoveryDispatcher,
 			5_000,
 		);
 		const shutdownRequestId = httpRequestContext.getStore();

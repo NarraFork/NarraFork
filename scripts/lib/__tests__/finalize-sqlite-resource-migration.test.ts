@@ -492,14 +492,25 @@ test("rebuild never inserts an existing generated source column into a generated
 		sqlite.close();
 	}
 });
-test("real 0189 remains valid with both pre-existing generated expressions preserved", () => {
+test("real 0191 ownership upgrade preserves both pre-existing generated expressions", () => {
 	const read = (path: string) => readFileSync(resolve(import.meta.dir, "../../..", path), "utf8");
-	const previous = JSON.parse(read("drizzle/meta/0188_snapshot.json")) as ResourceMigrationSnapshot;
-	const next = JSON.parse(read("drizzle/meta/0189_snapshot.json")) as ResourceMigrationSnapshot;
-	expect(next.tables.narrator_messages.columns.compact_pending.generated?.type).toBe("virtual");
-	expect(next.tables.narrator_tool_calls.columns.started_at.generated?.type).toBe("virtual");
+	const previous = JSON.parse(read("drizzle/meta/0190_snapshot.json")) as ResourceMigrationSnapshot;
+	const next = JSON.parse(read("drizzle/meta/0191_snapshot.json")) as ResourceMigrationSnapshot;
+	for (const [table, column] of [
+		["narrator_messages", "compact_pending"],
+		["narrator_tool_calls", "started_at"],
+	]) {
+		const generated = next.tables[table].columns[column].generated;
+		expect(generated?.type).toBe("virtual");
+		expect(generated?.as).toBeTruthy();
+		expect(generated).toEqual(previous.tables[table].columns[column].generated);
+	}
 	expect(() =>
-		assertResourceMigrationValidated(read("drizzle/0189_pale_red_ghost.sql"), previous, next),
+		assertResourceMigrationValidated(
+			read("drizzle/0191_worktree_resource_ownership.sql"),
+			previous,
+			next,
+		),
 	).not.toThrow();
 });
 test("PG maps exact UTC text defaults and byte rather than character budgets", () => {

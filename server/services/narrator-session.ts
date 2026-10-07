@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { isAbsolute } from "node:path";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
@@ -37,7 +36,6 @@ import {
 	grantBehaviorFenceEdit,
 } from "../lib/agent/tools/behavior-fence-grant";
 import { OPTIONAL_TOOLS } from "../lib/agent/tools/index";
-import { buildAttachedFilesHint } from "../lib/attached-files";
 import {
 	type BooleanOverride,
 	type DangerReflectionOverride,
@@ -81,15 +79,16 @@ import {
 	settings,
 } from "../lib/settings";
 import { sideCarBodyWithText } from "../lib/sidecar-templates";
-import type { ImageRef, PersistedUserImageBlock, TextFileRef } from "../lib/uploads";
+import type {
+	ImageRef,
+	PersistedUserImageBlock,
+	TextFileRef,
+	WorkspaceAttachmentAccess,
+} from "../lib/uploads";
 import {
-	copyTextFileToWorktree,
-	deleteCreatedAttachmentFiles,
 	deleteUploadedImage,
 	getUploadedImageInfo,
 	imageRefToContentBlock,
-	isFileWithinWorktree,
-	saveTextFileToWorktree,
 	saveUploadedImage,
 	validateTextFile,
 	validateUploadedImage,
@@ -161,6 +160,19 @@ import {
 	narratorService,
 	truncateToolIO,
 } from "./narrator-service";
+import {
+	buildNarratorTextAttachmentHint,
+	cleanupKnownNarratorTextFiles,
+	copyRetainedNarratorTextFile,
+	type PersistedTextAttachment,
+	prepareNarratorTextAttachmentAccess,
+	prepareRetainedNarratorTextFile,
+	type RetainedTextAttachment,
+	saveAcceptedNarratorTextFiles,
+	textAttachmentBlock,
+	textAttachmentKey,
+	textAttachmentRef,
+} from "./narrator-text-attachments";
 import { generateQuickTitle, setProvisionalTitleFromUserMessage } from "./narrator-title";
 import { resolveContinueTurnTiming } from "./narrator-turn-timing";
 import {
@@ -1034,6 +1046,7 @@ async function ensureNarratorUnlocked(
 	narratorId: string,
 	locale: Locale,
 	replyInUserLanguage = false,
+	actorUserId?: string | null,
 ): Promise<ActiveNarrator> {
 	const existing = activeNarrators.get(narratorId);
 	if (existing?.alive && !existing.abortController.signal.aborted) return existing;
@@ -1041,7 +1054,7 @@ async function ensureNarratorUnlocked(
 	const pending = narratorCreationLocks.get(narratorId);
 	if (pending) return pending;
 
-	const creation = createNarrator(narratorId, locale, replyInUserLanguage);
+	const creation = createNarrator(narratorId, locale, replyInUserLanguage, actorUserId);
 	narratorCreationLocks.set(narratorId, creation);
 	try {
 		return await creation;
@@ -1066,6 +1079,10 @@ export async function buildSystemPrompt(
 		devices?: import("./narrator-prompt").BuildPromptOptions["devices"];
 		defaultDeviceId?: string | null;
 		allowLocalExecution?: boolean;
+		workspaceContext?: import("@shared/workspace-context").WorkspaceContext;
+		fileAccess?: import("../lib/plan-file-path").WorkspaceFileAccess;
+		planFileAccess?: import("../lib/plan-file-path").WorkspaceFileAccess;
+		planFileBinding?: import("../lib/plan-file-path").PlanFileBinding;
 	},
 	planFilePath?: string,
 ): Promise<import("./narrator-prompt").BuildPromptResult> {
@@ -1083,6 +1100,11 @@ export async function buildSystemPrompt(
 		devices: deviceContext?.devices,
 		defaultDeviceId: deviceContext?.defaultDeviceId,
 		allowLocalExecution: deviceContext?.allowLocalExecution,
+		workspaceContext: deviceContext?.workspaceContext,
+		backend: deviceContext?.fileAccess?.backend,
+		fileAccess: deviceContext?.fileAccess,
+		planFileAccess: deviceContext?.planFileAccess,
+		planFileBinding: deviceContext?.planFileBinding,
 	});
 }
 
@@ -1090,6 +1112,7 @@ async function createNarrator(
 	narratorId: string,
 	locale: Locale,
 	replyInUserLanguage = false,
+	actorUserId?: string | null,
 ): Promise<ActiveNarrator> {
 	const existing = activeNarrators.get(narratorId);
 	if (existing) {
@@ -1166,6 +1189,22 @@ async function createNarrator(
 		narratorCwd = resolveNarratorSessionCwd(narrator.cwd, null, null, getHome());
 	}
 
+	// Resolve physical identity before any plan/skill/project instruction filesystem read.
+	const { workspaceContextService } = await import("./workspace-context-service");
+	const initialWorkspace = await workspaceContextService.get(narratorId, {
+		userId: actorUserId ?? null,
+	});
+	// Conversation/control-plane operations remain possible while a remote workspace
+	// is unconfigured or offline. Engineering IO must still fail closed, never use host cwd.
+	narratorCwd = initialWorkspace.cwd;
+	const { createNarratorWorkspaceFileAccess } = await import("./workspace-file-access");
+	const workspaceFileAccess =
+		initialWorkspace.cwd && initialWorkspace.availability === "ready"
+			? createNarratorWorkspaceFileAccess(narratorId, initialWorkspace, {
+					userId: actorUserId ?? null,
+				})
+			: undefined;
+
 	// Restore or create the persistent plan file ID if the narrator is already in plan mode
 	// (e.g. server restart recovery). Keeping this stable prevents file-based plans from
 	// becoming orphaned when the active narrator is recreated.
@@ -1173,7 +1212,44 @@ async function createNarrator(
 	const planFileId = isPlanMode
 		? await ensureNarratorPlanFileId(narratorId, narrator.planFileId)
 		: undefined;
-	const planFilePath = await resolveExistingPlanFileRelPath(narratorCwd, planFileId);
+	const savedPlanBinding =
+		narrator.planFileBinding?.planFileId === planFileId ? narrator.planFileBinding : undefined;
+	let planFileAccess = workspaceFileAccess;
+	if (savedPlanBinding) {
+		try {
+			planFileAccess = createNarratorWorkspaceFileAccess(
+				narratorId,
+				savedPlanBinding.workspaceContext,
+				{ userId: actorUserId ?? null },
+			);
+		} catch {
+			planFileAccess =
+				undefined; /* Original plan remains bound; never read a same-named host file. */
+		}
+	}
+	const planFilePath =
+		savedPlanBinding?.planFilePath ??
+		(planFileId
+			? workspaceFileAccess
+				? await resolveExistingPlanFileRelPath(narratorCwd, planFileId, workspaceFileAccess)
+				: (await import("../lib/plan-file-path")).buildPlanFileRelPath(planFileId)
+			: undefined);
+	const planFileBinding =
+		planFileId && planFilePath
+			? (savedPlanBinding ?? {
+					workspaceContext: initialWorkspace,
+					planFileId,
+					planFilePath,
+				})
+			: undefined;
+	if (planFileBinding && !savedPlanBinding && initialWorkspace.cwd) {
+		await db
+			.update(narrators)
+			.set({ planFileBinding })
+			.where(
+				and(eq(narrators.id, narratorId), eq(narrators.planFileId, planFileBinding.planFileId)),
+			);
+	}
 
 	// Layered traits: user → project → narrator. Resolved here so the cached
 	// `_disabledTools`/`_blockedSkills` reflect the upper layers. The acting user is
@@ -1186,7 +1262,8 @@ async function createNarrator(
 	});
 
 	// OAuth narrators may only see devices frozen into their provision snapshot.
-	const resolvedSessionDevices = (await resolveSessionDevices(narratorProjectId ?? null)) ?? [];
+	const resolvedSessionDevices =
+		(await resolveSessionDevices(narratorProjectId ?? null, actorUserId ?? null)) ?? [];
 	const authorizedSessionDevices = initialOAuthRuntime
 		? filterOAuthSessionDevices(resolvedSessionDevices, initialOAuthRuntime)
 		: resolvedSessionDevices;
@@ -1214,8 +1291,12 @@ async function createNarrator(
 		settings.agent.defaultSystemPrompt,
 		{
 			devices: sessionDevices,
-			defaultDeviceId: initialOAuthRuntime?.defaultDeviceId ?? narrator.defaultDeviceId ?? null,
+			defaultDeviceId: initialWorkspace.deviceId === "local" ? null : initialWorkspace.deviceId,
 			allowLocalExecution: initialOAuthRuntime?.allowLocalExecution ?? true,
+			workspaceContext: initialWorkspace,
+			fileAccess: workspaceFileAccess,
+			planFileAccess,
+			planFileBinding,
 		},
 		planFilePath,
 	);
@@ -1225,10 +1306,20 @@ async function createNarrator(
 	let skillRoot: string | null = projectGitPath;
 	let skillScopeKey: string | null = null;
 	try {
+		if (initialWorkspace.deviceId !== "local" && !workspaceFileAccess)
+			throw new Error("Remote workspace file access is unavailable");
 		const { resolveSkillRoot } = await import("./skill-service");
-		skillRoot = await resolveSkillRoot(projectGitPath, narratorCwd);
+		skillRoot = await resolveSkillRoot(projectGitPath, narratorCwd, {
+			workspaceContext: initialWorkspace,
+			fileAccess: workspaceFileAccess,
+		});
 		const { warmSkillCacheForContext } = await import("../lib/agent/tools/skill");
-		skillScopeKey = await warmSkillCacheForContext({ projectGitPath, cwd: narratorCwd });
+		skillScopeKey = await warmSkillCacheForContext({
+			projectGitPath,
+			cwd: narratorCwd,
+			workspaceContext: initialWorkspace,
+			fileAccess: workspaceFileAccess,
+		});
 	} catch {
 		// Skill root resolution failure is non-fatal
 	}
@@ -1236,7 +1327,8 @@ async function createNarrator(
 	// For standalone narrators, only enable Bash git-status-based file tracking
 	// if cwd is inside a git repo. This prevents running `git status` on non-repo dirs.
 	let narratorIsInGitRepo = !!narratorChapterId;
-	if (!narratorChapterId) {
+	if (initialWorkspace.deviceId !== "local") narratorIsInGitRepo = !!initialWorkspace.git;
+	else if (!narratorChapterId) {
 		try {
 			narratorIsInGitRepo = await gitService.isGitRepo(narratorCwd);
 		} catch {
@@ -1261,6 +1353,9 @@ async function createNarrator(
 		_resetUpstreamSessionOnNextRequest: effectiveConversationId == null,
 		_persistedConversationId: effectiveConversationId ?? null,
 		cwd: narratorCwd,
+		_workspaceContext: initialWorkspace,
+		_workspaceFileAccess: workspaceFileAccess,
+		_planFileBinding: planFileBinding,
 		_modelRef: narratorModelRef,
 		_modelSelectionRef: narrator.model ?? FOLLOW_DEFAULT_MODEL,
 		_followParentNarratorId:
@@ -1303,10 +1398,10 @@ async function createNarrator(
 		_substatus: new Set(),
 		// Explicitly null so a rebuilt active never carries a stale/undefined user.
 		// Set per-trigger by feedMessage / continue / retry / re-execute paths.
-		_currentUserId: null,
+		_currentUserId: actorUserId ?? null,
 		// Session default execution device (null → local). Restored from the
 		// narrator record; mutated by the SwitchDevice tool.
-		_defaultDeviceId: initialOAuthRuntime?.defaultDeviceId ?? narrator.defaultDeviceId ?? null,
+		_defaultDeviceId: initialWorkspace.deviceId === "local" ? null : initialWorkspace.deviceId,
 	};
 
 	if (initialOAuthRuntime) {
@@ -1613,9 +1708,12 @@ export async function ensureSkillCacheFreshForActiveNarrator(
 ): Promise<void> {
 	try {
 		const { warmSkillCacheForContext } = await import("../lib/agent/tools/skill");
+		active._skillScopeKey = null;
 		active._skillScopeKey = await warmSkillCacheForContext({
 			projectGitPath: active._projectGitPath ?? null,
 			cwd: active.cwd,
+			workspaceContext: active._workspaceContext,
+			fileAccess: active._workspaceFileAccess,
 		});
 	} catch (err) {
 		logger.debug("Failed to refresh skill cache for active narrator", {
@@ -1632,13 +1730,25 @@ export async function updateActiveNarratorCwdAndSkillContext(
 	const active = activeNarrators.get(narratorId);
 	if (!active?.alive) return;
 	active.cwd = cwd;
+	const workspace = active._workspaceContext;
+	if (workspace) {
+		const { createNarratorWorkspaceFileAccess } = await import("./workspace-file-access");
+		active._workspaceFileAccess = createNarratorWorkspaceFileAccess(narratorId, workspace, {
+			userId: active._currentUserId,
+			signal: active.abortController.signal,
+		});
+	}
 	try {
 		const { resolveSkillRoot } = await import("./skill-service");
-		active._skillRoot = await resolveSkillRoot(active._projectGitPath, cwd);
+		active._skillRoot = await resolveSkillRoot(active._projectGitPath, cwd, {
+			workspaceContext: workspace,
+			fileAccess: active._workspaceFileAccess,
+		});
 	} catch {
-		active._skillRoot = active._projectGitPath ?? null;
+		active._skillRoot = workspace?.deviceId !== "local" ? cwd : (active._projectGitPath ?? null);
 	}
-	if (!active._chapterId) {
+	if (workspace?.deviceId && workspace.deviceId !== "local") active._isInGitRepo = !!workspace.git;
+	else if (!active._chapterId) {
 		try {
 			active._isInGitRepo = await gitService.isGitRepo(cwd);
 		} catch {
@@ -2911,7 +3021,7 @@ async function feedMessageUnlocked(
 	postCommitError?: unknown;
 }> {
 	let acceptedReferences = freezeFileReferenceSnapshots(fileReferences);
-	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage, userId);
 	// Final guard against a concurrent loop slipping past the route-level admission
 	// check (which should have buffered this message). ensureNarrator reuses the live
 	// `active`, so starting a second runAgentLoop here would corrupt the shared session.
@@ -2943,6 +3053,9 @@ async function feedMessageUnlocked(
 	let stagingId: string | undefined;
 	let userMsg: typeof narratorMessages.$inferSelect;
 	let effectivePrompt: string;
+	let textAttachmentAccess: WorkspaceAttachmentAccess | undefined;
+	let savedTextFiles: TextFileRef[] = [];
+	let textPersistenceStarted = false;
 	try {
 		// Materialize publication outbox entries before claiming the mailbox head. A pending
 		// publication is an ordering barrier; without flushing it here, an idle user send can
@@ -2998,19 +3111,27 @@ async function feedMessageUnlocked(
 		acceptedReferences = accepted.fileReferences ?? [];
 		stagingId = accepted._stagingId;
 		active._currentUserId = userId ?? null;
-		// Save text files to worktree only after the durable claim freezes accepted bytes.
-		const savedTextFiles: TextFileRef[] = [];
+		// Accepted bytes AND the actual accepted actor are frozen before target materialization.
 		if (rawTextFiles?.length) {
-			for (const file of rawTextFiles) {
-				savedTextFiles.push(await saveTextFileToWorktree(active.cwd, file));
-			}
+			textAttachmentAccess = await prepareNarratorTextAttachmentAccess(narratorId, {
+				userId,
+				workspaceContext: active._workspaceContext,
+				authorizationGuard: async () => {
+					if (!inputOwner.isCurrent()) throw new ValidationError("Attachment input owner changed");
+				},
+			});
+			savedTextFiles = await saveAcceptedNarratorTextFiles(
+				narratorId,
+				rawTextFiles,
+				textAttachmentAccess,
+			);
 		}
 
 		const persistBlocks: Array<
 			| { type: "text"; text: string }
 			| PersistedUserImageBlock
 			| FileReferenceSnapshot
-			| { type: "text_file"; filename: string; size: number; filePath: string }
+			| PersistedTextAttachment
 		> = [];
 		if (images?.length) {
 			for (const img of images) {
@@ -3019,12 +3140,7 @@ async function feedMessageUnlocked(
 		}
 		if (savedTextFiles.length > 0) {
 			for (const tf of savedTextFiles) {
-				persistBlocks.push({
-					type: "text_file",
-					filename: tf.filename,
-					size: tf.size,
-					filePath: tf.filePath,
-				});
+				persistBlocks.push(textAttachmentBlock(tf));
 			}
 		}
 		// NOTE: persistBlocks stores the raw user text (without attached_files hint) so that
@@ -3039,8 +3155,9 @@ async function feedMessageUnlocked(
 		const effectiveText = !prompt.trim() && images?.length ? "[user sent image(s)]" : prompt;
 
 		// Build the effective prompt with attached file hints
-		effectivePrompt = effectiveText + buildAttachedFilesHint(savedTextFiles);
+		effectivePrompt = effectiveText + buildNarratorTextAttachmentHint(savedTextFiles);
 
+		textPersistenceStarted = true;
 		userMsg = (await persistClaimedUserInput({
 			claim: inboxClaim(claimedInput),
 			reservedMessageId: claimedInput.recipientMessageId,
@@ -3055,6 +3172,9 @@ async function feedMessageUnlocked(
 			await applyAcceptedModelOverride(narratorId, accepted.executionIntent.modelOverride);
 		}
 	} catch (error) {
+		// A persistence response may be lost after commit; unknown outcomes retain their files.
+		if (!textPersistenceStarted && textAttachmentAccess)
+			await cleanupKnownNarratorTextFiles(savedTextFiles, textAttachmentAccess);
 		if (claimedInput) await releaseInboxClaim(claimedInput, error);
 		throw error;
 	} finally {
@@ -3487,7 +3607,7 @@ async function executeQueuedControlCommand(
 	} else if ("unloadTool" in result || "unloadToolNotFound" in result) {
 		await handlers.handleUnloadToolCommand(narratorId, result, locale);
 	} else if ("blockSkill" in result) {
-		await handlers.handleBlockSkillCommand(narratorId, result, locale);
+		await handlers.handleBlockSkillCommand(narratorId, result, locale, { userId, signal });
 	} else if ("blockAllSkills" in result) {
 		await handlers.handleBlockAllSkillsCommand(narratorId, result, locale);
 	} else if ("unblockSkill" in result) {
@@ -3566,7 +3686,12 @@ export async function acceptUserMessage(
 					}
 					if (busy) await reconcileRunningStatus(narratorId);
 					if (inputOwner?.isCurrent()) {
-						const active = await ensureNarrator(narratorId, locale, options.replyInUserLanguage);
+						const active = await ensureNarrator(
+							narratorId,
+							locale,
+							options.replyInUserLanguage,
+							options.userId,
+						);
 						await flushInboxPublicationBarrier(narratorId);
 						await drainAndPersistPendingInjections(active);
 						// A command queued while busy may reach admission after the old loop
@@ -4071,7 +4196,7 @@ export async function startSpecContinuationIfPossible(
 			return { started: false };
 		}
 
-		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage, userId);
 		if (active._loopRunning) return { started: false };
 		active._continuationSuppressed = false;
 		active._continuationStallCount = 0;
@@ -5005,7 +5130,7 @@ async function retryLastMessageUnlocked(
 
 	const imageRefs = extractImageRefs(lastMsg.contentJson, lastMsg.narratorId);
 
-	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage, userId);
 	// Restore the triggering user so knowledge-base ACL works after a rebuild.
 	active._currentUserId = userId ?? active._currentUserId ?? null;
 	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
@@ -5144,7 +5269,7 @@ async function continueNarratorUnlocked(
 		return { ok: true };
 	}
 
-	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage, userId);
 	// Restore the triggering user so knowledge-base ACL works after a rebuild
 	// (interrupt may have destroyed the prior active, leaving _currentUserId unset).
 	active._currentUserId = userId ?? active._currentUserId ?? null;
@@ -5484,7 +5609,7 @@ async function reExecuteDeniedToolCallUnlocked(
 					toolUseId,
 					toolCall.id,
 				);
-				const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+				const active = await ensureNarrator(narratorId, locale, replyInUserLanguage, userId);
 				// Restore the triggering user so knowledge-base ACL works after a rebuild.
 				// The active may have been freshly recreated (interrupt destroyed the old one),
 				// in which case _currentUserId would otherwise be undefined → null.
@@ -6010,7 +6135,7 @@ type EditableUserContentBlock =
 	// ~/.narrafork/uploads/<narratorId>/text/<fileId>.ext with a relative
 	// filePath, while newer uploads live in the worktree and omit fileId.
 	// Preserve it verbatim so legacy attachments survive an edit round-trip.
-	| { type: "text_file"; filename: string; size: number; filePath: string; fileId?: string };
+	| PersistedTextAttachment;
 
 /**
  * Extract persisted text-file attachment blocks as TextFileRefs so the edited
@@ -6027,11 +6152,8 @@ function extractTextFileRefs(contentJson: unknown): TextFileRef[] {
 			typeof block.filePath === "string" &&
 			typeof block.size === "number"
 		) {
-			refs.push({
-				filename: block.filename,
-				filePath: block.filePath,
-				size: block.size,
-			});
+			const ref = textAttachmentRef(block);
+			if (ref) refs.push(ref);
 		}
 	}
 	return refs;
@@ -6117,17 +6239,18 @@ function buildEditedUserContentJson(
 		) {
 			// Drop removed text files and collapse duplicate persisted blocks.
 			if (keepTextFileSet && !keepTextFileSet.has(block.filePath)) continue;
-			if (seenTextFilePaths.has(block.filePath)) continue;
-			seenTextFilePaths.add(block.filePath);
-			textFileBlocks.push({
-				type: "text_file",
-				filename: block.filename,
-				size: block.size,
+			const identity = textAttachmentKey({
+				deviceId: typeof block.deviceId === "string" ? block.deviceId : undefined,
 				filePath: block.filePath,
-				// Preserve legacy fileId so older uploads-based attachments keep
-				// resolving after an edit round-trip.
-				...(typeof block.fileId === "string" ? { fileId: block.fileId } : {}),
 			});
+			if (seenTextFilePaths.has(identity)) continue;
+			seenTextFilePaths.add(identity);
+			const retained = textAttachmentRef(block);
+			if (retained)
+				textFileBlocks.push({
+					...textAttachmentBlock(retained),
+					...(typeof block.fileId === "string" ? { fileId: block.fileId } : {}),
+				});
 		}
 	}
 
@@ -6143,12 +6266,7 @@ function buildEditedUserContentJson(
 	// Newly uploaded text files during editing — appended after existing ones.
 	if (opts?.newTextFiles?.length) {
 		for (const tf of opts.newTextFiles) {
-			textFileBlocks.push({
-				type: "text_file",
-				filename: tf.filename,
-				size: tf.size,
-				filePath: tf.filePath,
-			});
+			textFileBlocks.push(textAttachmentBlock(tf));
 		}
 	}
 
@@ -6299,14 +6417,21 @@ async function editAndRegenerateUnlocked(
 	// must not create a generic narrator session; resumeSubagent starts its dedicated runner.
 	const active = opts?.deferContinuation
 		? undefined
-		: await ensureNarrator(narratorId, locale, replyInUserLanguage);
-	const executionCwd = active?.cwd ?? narrator.cwd ?? ".";
+		: await ensureNarrator(narratorId, locale, replyInUserLanguage, opts?.userId);
+	const textAttachmentAccess =
+		keepTextFilePaths.length || opts?.newTextFiles?.length
+			? await prepareNarratorTextAttachmentAccess(narratorId, {
+					userId: opts?.userId,
+					workspaceContext: active?._workspaceContext,
+				})
+			: undefined;
 	const keepImageSet = new Set(keepImageIds);
 	const keepTextFileSet = new Set(keepTextFilePaths);
 	const countedImageIds = new Set<string>();
 	const countedTextFilePaths = new Set<string>();
 	let retainedAttachmentBytes = 0;
-	const textFilesToCopy = new Map<string, TextFileRef>();
+	const textFilesToCopy = new Map<string, RetainedTextAttachment>();
+	const retainedTextFiles = new Map<string, TextFileRef>();
 	for (const block of originalBlocks) {
 		if (
 			block.type === "image" &&
@@ -6332,34 +6457,32 @@ async function editAndRegenerateUnlocked(
 			typeof block.filePath === "string" &&
 			keepTextFileSet.has(block.filePath)
 		) {
-			const sourceFile = isAbsolute(block.filePath) ? Bun.file(block.filePath) : null;
-			if (sourceFile && !(await sourceFile.exists())) {
-				throw new ValidationError(
-					`Attached file not found: ${String(block.filename ?? block.filePath)}`,
-				);
+			const original = textAttachmentRef(block);
+			if (!original || !Number.isSafeInteger(original.size) || original.size < 0)
+				throw new ValidationError("Attached file size is unavailable");
+			const key = textAttachmentKey(original);
+			if (!textAttachmentAccess) throw new ValidationError("Attachment workspace is unavailable");
+			const retained =
+				typeof block.fileId === "string"
+					? {
+							ref: {
+								...original,
+								attachmentUnavailableReason:
+									"Legacy server-upload source cannot be copied automatically; reattach it to the current workspace.",
+							},
+							copy: false,
+						}
+					: await prepareRetainedNarratorTextFile(original, textAttachmentAccess, {
+							narratorId,
+							sourceNarratorId: targetMsg.narratorId,
+							userId: opts?.userId,
+						});
+			retainedTextFiles.set(key, retained.ref);
+			if (!countedTextFilePaths.has(key)) {
+				countedTextFilePaths.add(key);
+				retainedAttachmentBytes += retained.ref.size;
 			}
-			const actualSize = sourceFile?.size ?? (typeof block.size === "number" ? block.size : null);
-			if (actualSize == null || actualSize < 0) {
-				throw new ValidationError(
-					`Attached file size is unavailable: ${String(block.filename ?? block.filePath)}`,
-				);
-			}
-			if (!countedTextFilePaths.has(block.filePath)) {
-				countedTextFilePaths.add(block.filePath);
-				retainedAttachmentBytes += actualSize;
-			}
-			if (
-				typeof block.fileId !== "string" &&
-				sourceFile &&
-				!isFileWithinWorktree(executionCwd, block.filePath) &&
-				!textFilesToCopy.has(block.filePath)
-			) {
-				textFilesToCopy.set(block.filePath, {
-					filename: String(block.filename ?? "attachment"),
-					filePath: block.filePath,
-					size: actualSize,
-				});
-			}
+			if (retained.copy && !textFilesToCopy.has(key)) textFilesToCopy.set(key, retained);
 		}
 	}
 	const finalAttachmentBytes = uploadBytes + retainedAttachmentBytes;
@@ -6367,7 +6490,7 @@ async function editAndRegenerateUnlocked(
 		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
 	}
 	const materializedBytes =
-		uploadBytes + [...textFilesToCopy.values()].reduce((total, file) => total + file.size, 0);
+		uploadBytes + [...textFilesToCopy.values()].reduce((total, file) => total + file.ref.size, 0);
 	if (materializedBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 		throw new ValidationError("Combined materialized attachments exceed the 128 MiB limit");
 	}
@@ -6405,8 +6528,9 @@ async function editAndRegenerateUnlocked(
 	}
 
 	const createdImageIds: string[] = [];
-	const createdFilePaths: string[] = [];
+	const createdTextFiles: TextFileRef[] = [];
 	let copyOnWriteSucceeded = false;
+	let textCopyOnWriteStarted = false;
 	let privateMessageId: string;
 	let newContentJson: EditableUserContentBlock[];
 	let existingImages: ImageRef[];
@@ -6420,28 +6544,40 @@ async function editAndRegenerateUnlocked(
 			savedNewImages.push({ ...ref, uploadNarratorId: narratorId });
 		}
 
-		const savedNewTextFiles: TextFileRef[] = [];
-		for (const file of opts?.newTextFiles ?? []) {
-			const ref = await saveTextFileToWorktree(executionCwd, file);
-			createdFilePaths.push(ref.filePath);
-			savedNewTextFiles.push(ref);
-		}
-
+		const savedNewTextFiles =
+			opts?.newTextFiles?.length && textAttachmentAccess
+				? await saveAcceptedNarratorTextFiles(narratorId, opts.newTextFiles, textAttachmentAccess)
+				: [];
+		createdTextFiles.push(...savedNewTextFiles);
 		const copiedTextFiles = new Map<string, TextFileRef>();
-		for (const [sourcePath, source] of textFilesToCopy) {
-			const ref = await copyTextFileToWorktree(executionCwd, source);
-			createdFilePaths.push(ref.filePath);
-			copiedTextFiles.set(sourcePath, ref);
+		for (const [sourceKey, source] of textFilesToCopy) {
+			if (!textAttachmentAccess) throw new ValidationError("Attachment workspace is unavailable");
+			const ref = await copyRetainedNarratorTextFile(narratorId, source, textAttachmentAccess);
+			createdTextFiles.push(ref);
+			copiedTextFiles.set(sourceKey, ref);
 		}
 
 		const relocatedBlocks = originalBlocks.map((block) => {
 			if (block.type !== "text_file" || typeof block.filePath !== "string") return block;
-			const copied = copiedTextFiles.get(block.filePath);
-			return copied ? { ...block, filePath: copied.filePath, size: copied.size } : block;
+			const original = textAttachmentRef(block);
+			if (!original) return block;
+			const key = textAttachmentKey(original);
+			const ref = copiedTextFiles.get(key) ?? retainedTextFiles.get(key);
+			return ref ? { ...block, ...textAttachmentBlock(ref) } : block;
 		});
-		const relocatedKeepTextFilePaths = keepTextFilePaths.map(
-			(filePath) => copiedTextFiles.get(filePath)?.filePath ?? filePath,
-		);
+		const relocatedKeepTextFilePaths = originalBlocks
+			.filter(
+				(block) =>
+					block.type === "text_file" &&
+					typeof block.filePath === "string" &&
+					keepTextFileSet.has(block.filePath),
+			)
+			.map((block) => {
+				const ref = textAttachmentRef(block);
+				return ref
+					? (copiedTextFiles.get(textAttachmentKey(ref))?.filePath ?? ref.filePath)
+					: String(block.filePath);
+			});
 		newContentJson = buildEditedUserContentJson(relocatedBlocks, newContent, {
 			fallbackUploadNarratorId: targetMsg.narratorId,
 			keepImageIds,
@@ -6454,7 +6590,7 @@ async function editAndRegenerateUnlocked(
 		existingTextFiles = extractTextFileRefs(newContentJson);
 		const effectiveText =
 			!newContent.trim() && existingImages.length > 0 ? "[user sent image(s)]" : newContent;
-		effectivePrompt = effectiveText + buildAttachedFilesHint(existingTextFiles);
+		effectivePrompt = effectiveText + buildNarratorTextAttachmentHint(existingTextFiles);
 
 		// A loop may have started while the files were being materialized (the route
 		// already cleared the way once, but that was several awaits ago). Stop it the
@@ -6466,6 +6602,7 @@ async function editAndRegenerateUnlocked(
 				"This narrator did not stop after being interrupted; try again in a moment",
 			);
 		}
+		textCopyOnWriteStarted = true;
 		privateMessageId = await narratorService.copyOnWriteMessage(narratorId, messageId, {
 			contentText: effectivePrompt,
 			contentJson: newContentJson,
@@ -6474,7 +6611,8 @@ async function editAndRegenerateUnlocked(
 	} catch (error) {
 		if (!copyOnWriteSucceeded) {
 			for (const imageId of createdImageIds) deleteUploadedImage(narratorId, imageId);
-			deleteCreatedAttachmentFiles(createdFilePaths);
+			if (!textCopyOnWriteStarted && textAttachmentAccess)
+				await cleanupKnownNarratorTextFiles(createdTextFiles, textAttachmentAccess);
 		}
 		throw error;
 	}

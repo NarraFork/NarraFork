@@ -1,6 +1,9 @@
 import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import { eq } from "drizzle-orm";
 import { narratorMessages, narrators, narratorToolCalls } from "../../../server/db/schema";
+import type { ExecutionBackend } from "../../../server/lib/agent/execution/backend";
+import { targetPathSemantics } from "../../../server/lib/agent/execution/path-semantics";
 import {
 	enterPlanModeTool,
 	shouldDisablePlanReflectionReview,
@@ -124,6 +127,168 @@ describe("enterNarratorPlanMode", () => {
 		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
 		expect(row?.planMode).toBe(true);
 		expect(row?.relaxedPlan).toBe(true);
+	});
+});
+
+describe("manual plan workspace binding", () => {
+	function workspace(cwd = "D:\\original\\repo", revision = 4): WorkspaceContext {
+		return {
+			deviceId: "remote-plan",
+			cwd,
+			pathFlavor: "windows",
+			revision,
+			contextKey: `remote-plan:${cwd}`,
+			capabilities: { switchDirectory: true },
+		};
+	}
+
+	it("freezes a manual remote cycle and re-entry preserves the original legacy path after switching", async () => {
+		seedNarrator("remote");
+		const old = workspace();
+		await db
+			.update(narrators)
+			.set({
+				workspaceContext: old,
+				workspaceRevision: 4,
+				cwd: "/host-decoy",
+				defaultDeviceId: "wrong-mirror",
+			})
+			.where(eq(narrators.id, "remote"));
+		const first = await enterNarratorPlanMode("remote", "manual", undefined, { userId: null });
+		expect(first.planFileBinding?.workspaceContext).toMatchObject({
+			deviceId: "remote-plan",
+			cwd: old.cwd,
+			revision: 4,
+		});
+		const legacy = `.narrafork/plan-${first.planFileId}.md`;
+		if (!first.planFileBinding) throw new Error("Expected persistent plan binding");
+		const binding = { ...first.planFileBinding, planFilePath: legacy };
+		const next = workspace("D:\\later\\repo", 5);
+		await db
+			.update(narrators)
+			.set({
+				workspaceContext: next,
+				workspaceRevision: 5,
+				cwd: next.cwd,
+				planFileBinding: binding,
+			})
+			.where(eq(narrators.id, "remote"));
+		const reentered = await enterNarratorPlanMode("remote");
+		expect(reentered.planFileId).toBe(first.planFileId);
+		expect(reentered.planFilePath).toBe(legacy);
+		expect(reentered.planFileBinding).toEqual(binding);
+		seedPlanToolCall("remote", "reenter-call", "reenter-use");
+		const prepared = await prepareNarratorPlanMode("remote", "reenter-call", "reenter-use");
+		expect(prepared.planFilePath).toBe(legacy);
+		expect(prepared.planFileBinding).toEqual(binding);
+		await exitNarratorPlanMode("remote");
+		expect(
+			(await db.query.narrators.findFirst({ where: eq(narrators.id, "remote") }))?.planFileBinding,
+		).toBeNull();
+		const restarted = await enterNarratorPlanMode("remote");
+		expect(restarted.planFileId).not.toBe(first.planFileId);
+		expect(restarted.planFileBinding?.workspaceContext.cwd).toBe(next.cwd);
+	});
+
+	it("refuses to reinterpret an unbound legacy cycle after a workspace switch", async () => {
+		seedNarrator("unbound");
+		const current = workspace();
+		await db
+			.update(narrators)
+			.set({
+				workspaceContext: current,
+				workspaceRevision: 4,
+				planMode: true,
+				traits: ["plan"],
+				planFileId: "legacy",
+				planFileBinding: null,
+			})
+			.where(eq(narrators.id, "unbound"));
+		await expect(enterNarratorPlanMode("unbound")).rejects.toThrow(
+			"Original plan source is unknown",
+		);
+		expect(
+			(await db.query.narrators.findFirst({ where: eq(narrators.id, "unbound") }))?.planFileBinding,
+		).toBeNull();
+	});
+
+	it("legacy recovery probes the supplied remote backend and retains its old filename", async () => {
+		seedNarrator("legacy-remote");
+		const current = workspace("D:\\unchanged", 0);
+		await db
+			.update(narrators)
+			.set({
+				workspaceContext: current,
+				workspaceRevision: 0,
+				planMode: true,
+				traits: ["plan"],
+				planFileId: "legacy",
+			})
+			.where(eq(narrators.id, "legacy-remote"));
+		const paths = targetPathSemantics("windows");
+		const stats: string[] = [];
+		const backend = {
+			deviceId: "remote-plan",
+			kind: "remote",
+			paths,
+			runtimeGeneration: 1,
+			resolvePathIdentity: async (path: string) => ({
+				lexicalPath: path,
+				canonicalPath: path,
+				exists: true,
+				runtimeGeneration: 1,
+			}),
+			statFile: async (path: string) => {
+				stats.push(path);
+				return path.endsWith("\\.narrafork\\plan-legacy.md")
+					? { isFile: true, isDirectory: false, size: 10, resolvedPath: path }
+					: null;
+			},
+		} as unknown as ExecutionBackend;
+		const result = await enterNarratorPlanMode("legacy-remote", undefined, undefined, {
+			workspaceContext: current,
+			fileAccess: { backend, workspaceContext: current, authorizeRead: async () => true },
+		});
+		expect(result.planFilePath).toBe(".narrafork/plan-legacy.md");
+		expect(result.planFileBinding?.workspaceContext.deviceId).toBe("remote-plan");
+		expect(stats).toEqual([
+			"D:\\unchanged\\.narrafork\\plans\\plan-legacy.md",
+			"D:\\unchanged\\.narrafork\\plan-legacy.md",
+		]);
+	});
+
+	it("stale frozen scope cannot install a new manual plan cycle", async () => {
+		seedNarrator("stale");
+		await db
+			.update(narrators)
+			.set({ workspaceContext: workspace("D:\\new", 5), workspaceRevision: 5 })
+			.where(eq(narrators.id, "stale"));
+		await expect(
+			enterNarratorPlanMode("stale", undefined, undefined, { workspaceContext: workspace() }),
+		).rejects.toThrow("Workspace changed");
+		expect(
+			(await db.query.narrators.findFirst({ where: eq(narrators.id, "stale") }))?.planMode,
+		).toBe(false);
+	});
+
+	it("exit clears an orphaned source binding even when mode/id were already reset", async () => {
+		seedNarrator("orphan");
+		await db
+			.update(narrators)
+			.set({
+				planMode: false,
+				planFileId: null,
+				planFileBinding: {
+					workspaceContext: workspace(),
+					planFileId: "orphan-cycle",
+					planFilePath: ".narrafork/plans/plan-orphan-cycle.md",
+				},
+			})
+			.where(eq(narrators.id, "orphan"));
+		expect((await exitNarratorPlanMode("orphan")).changed).toBe(true);
+		expect(
+			(await db.query.narrators.findFirst({ where: eq(narrators.id, "orphan") }))?.planFileBinding,
+		).toBeNull();
 	});
 });
 

@@ -49,7 +49,9 @@ const {
 	interruptAndWaitForIdle,
 } = await import("../narrator-session");
 const { setUploadsDirForTests } = await import("../../lib/uploads");
-const { narratorMessages, narratorMessageRefs, narrators } = schema;
+const { narratorMessages, narratorMessageRefs, narrators, users } = schema;
+const EDITOR_ID = "attachment-editor";
+const { workspaceContextService } = await import("../workspace-context-service");
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
@@ -67,6 +69,16 @@ const now = new Date().toISOString();
 type Block = Record<string, unknown>;
 
 function seed(cwd: string, blocks: Block[]) {
+	db.insert(users)
+		.values({
+			id: EDITOR_ID,
+			username: EDITOR_ID,
+			passwordHash: "test-only",
+			role: "admin",
+			createdAt: now,
+		})
+		.onConflictDoNothing()
+		.run();
 	sqlite.run("DELETE FROM narrator_message_refs");
 	sqlite.run("DELETE FROM narrator_messages");
 	sqlite.run("DELETE FROM narrators");
@@ -98,6 +110,28 @@ function seed(cwd: string, blocks: Block[]) {
 		.run();
 }
 
+async function bindOriginalTextSource(sourceNarratorId = "n1") {
+	const workspace = await workspaceContextService.get(sourceNarratorId, { userId: EDITOR_ID });
+	const message = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, "m1"),
+	});
+	const blocks = (message?.contentJson as Block[]).map((block) =>
+		block.type === "text_file"
+			? {
+					...block,
+					deviceId: workspace.deviceId,
+					contextKey: workspace.contextKey,
+					attachmentWorkspace: workspace,
+					sourceNarratorId,
+				}
+			: block,
+	);
+	db.update(narratorMessages)
+		.set({ contentJson: blocks })
+		.where(eq(narratorMessages.id, "m1"))
+		.run();
+}
+
 function createPngFile(name: string, width: number, height: number): File {
 	const bytes = new Uint8Array(24);
 	bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -112,7 +146,10 @@ async function runEdit(opts: Parameters<typeof editAndRegenerate>[5]) {
 	// editAndRegenerate persists the rebuilt contentJson before the (failing in
 	// this bare harness) agent loop runs, so we can inspect the persisted result.
 	try {
-		await editAndRegenerate("n1", "m1", "new", "en", false, opts);
+		await editAndRegenerate("n1", "m1", "new", "en", false, {
+			...opts,
+			userId: opts?.userId ?? EDITOR_ID,
+		});
 	} catch {
 		/* expected: agent loop cannot run without a real provider */
 	}
@@ -263,6 +300,7 @@ describe("editAndRegenerate text_file management", () => {
 		);
 		await expect(
 			editAndRegenerate("n1", "m1", "new", "en", false, {
+				userId: EDITOR_ID,
 				keepTextFilePaths: ["legacy/a", "legacy/b"],
 				newTextFiles,
 			}),
@@ -277,14 +315,18 @@ describe("editAndRegenerate text_file management", () => {
 		const image = createPngFile("new.png", 1, 1);
 		const firstText = new File(["created"], "created.txt", { type: "text/plain" });
 		const failingText = new File(["fail"], "fail.txt", { type: "text/plain" });
-		Object.defineProperty(failingText, "arrayBuffer", {
-			value: async () => {
-				throw new Error("synthetic write failure");
-			},
+		Object.defineProperty(failingText, "stream", {
+			value: () =>
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.error(new Error("synthetic write failure"));
+					},
+				}),
 		});
 
 		await expect(
 			editAndRegenerate("n1", "m1", "new", "en", false, {
+				userId: EDITOR_ID,
 				keepImageIds: [],
 				keepTextFilePaths: [],
 				newImages: [image],
@@ -294,7 +336,13 @@ describe("editAndRegenerate text_file management", () => {
 		const imageDir = join(uploadsRoot, "n1");
 		expect(existsSync(imageDir) ? readdirSync(imageDir) : []).toHaveLength(0);
 		const attachedDir = join(cwd, ".narrafork", "attached");
-		expect(existsSync(attachedDir) ? readdirSync(attachedDir) : []).toHaveLength(0);
+		expect(
+			existsSync(attachedDir)
+				? Array.from(
+						new Bun.Glob("**/*").scanSync({ cwd: attachedDir, onlyFiles: true, dot: true }),
+					)
+				: [],
+		).toHaveLength(0);
 	});
 
 	test("serializes concurrent edits before materializing the second upload", async () => {
@@ -312,27 +360,37 @@ describe("editAndRegenerate text_file management", () => {
 			markSecondEntered = resolve;
 		});
 		const firstFile = new File(["first"], "first.txt", { type: "text/plain" });
-		Object.defineProperty(firstFile, "arrayBuffer", {
-			value: async () => {
-				markFirstEntered();
-				await firstGate;
-				return new TextEncoder().encode("first").buffer;
-			},
+		Object.defineProperty(firstFile, "stream", {
+			value: () =>
+				new ReadableStream<Uint8Array>({
+					async start(controller) {
+						markFirstEntered();
+						await firstGate;
+						controller.enqueue(new TextEncoder().encode("first"));
+						controller.close();
+					},
+				}),
 		});
 		const secondFile = new File(["second"], "second.txt", { type: "text/plain" });
-		Object.defineProperty(secondFile, "arrayBuffer", {
-			value: async () => {
-				markSecondEntered();
-				return new TextEncoder().encode("second").buffer;
-			},
+		Object.defineProperty(secondFile, "stream", {
+			value: () =>
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						markSecondEntered();
+						controller.enqueue(new TextEncoder().encode("second"));
+						controller.close();
+					},
+				}),
 		});
 
 		const firstEdit = editAndRegenerate("n1", "m1", "first edit", "en", false, {
+			userId: EDITOR_ID,
 			keepTextFilePaths: [],
 			newTextFiles: [firstFile],
 		});
 		await firstEntered;
 		const secondEdit = editAndRegenerate("n1", "m1", "second edit", "en", false, {
+			userId: EDITOR_ID,
 			keepTextFilePaths: [],
 			newTextFiles: [secondFile],
 		});
@@ -355,6 +413,7 @@ describe("editAndRegenerate text_file management", () => {
 			{ type: "text_file", filename: "shared.txt", size: 14, filePath: sourcePath },
 			{ type: "text", text: "old" },
 		]);
+		await bindOriginalTextSource();
 		db.insert(narrators)
 			.values({
 				id: "n2",
@@ -373,6 +432,7 @@ describe("editAndRegenerate text_file management", () => {
 			.run();
 
 		const result = await editAndRegenerate("n2", "m1", "new", "en", false, {
+			userId: EDITOR_ID,
 			keepTextFilePaths: [sourcePath],
 		});
 		expect(result.ok).toBe(true);
@@ -399,8 +459,22 @@ describe("editAndRegenerate text_file management", () => {
 			{ type: "text_file", filename: "large.bin", size: 1, filePath: sourcePath },
 			{ type: "text", text: "old" },
 		]);
+		db.insert(narrators)
+			.values({
+				id: "source-owner",
+				type: "primary",
+				variant: "primary",
+				inheritMode: "fresh",
+				cwd: parentCwd,
+				status: "idle",
+				createdAt: now,
+				updatedAt: now,
+			})
+			.run();
+		await bindOriginalTextSource("source-owner");
 		await expect(
 			editAndRegenerate("n1", "m1", "new", "en", false, {
+				userId: EDITOR_ID,
 				keepTextFilePaths: [sourcePath],
 			}),
 		).rejects.toThrow("attachments exceed the 128 MiB limit");

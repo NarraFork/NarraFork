@@ -1,0 +1,6 @@
+DROP INDEX "idx_whitelist_dirs_narrator_path_unscoped";--> statement-breakpoint
+DROP INDEX "idx_whitelist_dirs_narrator_path_scoped";--> statement-breakpoint
+CREATE UNIQUE INDEX "idx_whitelist_dirs_narrator_path_target_null" ON "narrator_whitelist_dirs" USING btree ("narrator_id","path","target_kind") WHERE "target_kind" is not null and "target_value" is null;--> statement-breakpoint
+CREATE UNIQUE INDEX "idx_whitelist_dirs_narrator_path_target_value" ON "narrator_whitelist_dirs" USING btree ("narrator_id","path","target_kind","target_value") WHERE "target_kind" is not null and "target_value" is not null;--> statement-breakpoint
+CREATE UNIQUE INDEX "idx_whitelist_dirs_narrator_path_unscoped" ON "narrator_whitelist_dirs" USING btree ("narrator_id","path") WHERE "target_kind" is null and "device_scope" is null;--> statement-breakpoint
+CREATE UNIQUE INDEX "idx_whitelist_dirs_narrator_path_scoped" ON "narrator_whitelist_dirs" USING btree ("narrator_id","path","device_scope") WHERE "target_kind" is null and "device_scope" is not null;

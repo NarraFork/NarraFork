@@ -72,6 +72,8 @@ type Config struct {
 	PathRules []PathRule `json:"pathRules"`
 	// DefaultCwd is reported to the server at handshake.
 	DefaultCwd string `json:"defaultCwd"`
+	// StateDir holds private history/worktree journals, never a user repository.
+	StateDir string `json:"stateDir"`
 	// InsecureSkipVerify disables reverse-dial TLS certificate verification.
 	InsecureSkipVerify bool `json:"insecureSkipVerify"`
 	// CAFile adds PEM trust anchors to the system roots for reverse wss only.
@@ -109,6 +111,7 @@ func Load() (*Config, error) {
 	var pathRuleFlags pathRuleList
 	fs.Var(&pathRuleFlags, "path-rule", `Ordered path rule "allow:/dir" or "deny:/dir" (repeatable; last match wins)`)
 	defaultCwd := fs.String("cwd", "", "Default working directory reported to the server")
+	stateDir := fs.String("state-dir", "", "Private executor state directory outside repositories")
 	insecure := fs.Bool("insecure", false, "Skip reverse-dial TLS certificate verification")
 	caFile := fs.String("ca-file", "", "Additional trusted CA certificate PEM file for reverse wss (incompatible with --insecure)")
 	listenAddr := fs.String("listen", "", "Direct mode: listen on this address (e.g. 127.0.0.1:7900) instead of dialing out")
@@ -212,7 +215,13 @@ func Load() (*Config, error) {
 		tokenChoiceSet = true
 	}
 
+	if value := os.Getenv("NARRAFORK_EXECUTOR_STATE_DIR"); value != "" {
+		cfg.StateDir = value
+	}
 	// 3. Flags (highest precedence).
+	if *stateDir != "" {
+		cfg.StateDir = *stateDir
+	}
 	if *serverURL != "" {
 		cfg.ServerURL = *serverURL
 	}
@@ -275,6 +284,16 @@ func Load() (*Config, error) {
 		}
 	}
 
+	if cfg.StateDir == "" {
+		base, err := os.UserConfigDir()
+		if err != nil {
+			return nil, fmt.Errorf("resolve private state directory: %w", err)
+		}
+		cfg.StateDir = filepath.Join(base, "narrafork-executor", "state")
+	}
+	if !filepath.IsAbs(cfg.StateDir) {
+		return nil, fmt.Errorf("stateDir must be absolute")
+	}
 	if cfg.DefaultCwd == "" {
 		if wd, err := os.Getwd(); err == nil {
 			cfg.DefaultCwd = wd

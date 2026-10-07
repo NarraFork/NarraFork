@@ -15,6 +15,7 @@ import {
 	createEditorDocumentSchema,
 	createEditorUploadSchema,
 } from "../lib/validators/editor-documents";
+import { remoteRecoveryProvenance } from "../middleware/remote-recovery-provenance";
 import {
 	editorRuntimeUnavailable,
 	getEditorDocumentService,
@@ -27,6 +28,7 @@ import {
 import { rejectEditorSymlinks } from "../services/editor-document-worker";
 import { authorizeEditorReferenceTarget } from "../services/file-reference-service";
 import { resolveNarratorSessionCwd } from "../services/narrator-cwd";
+import { authorizeRemoteEditorBinding } from "../services/remote-editor-access";
 
 /** Bounded raw metadata reading also covers chunked requests with no Content-Length. */
 export async function readEditorMetadata<T>(request: Request, schema: z.ZodType<T>): Promise<T> {
@@ -60,19 +62,44 @@ export async function readEditorMetadata<T>(request: Request, schema: z.ZodType<
 	return parsed.data;
 }
 export function editorActor(c: Context): EditorActor {
-	return {
+	const actor: EditorActor = {
 		userId: c.get("user").sub,
 		narratorId: c.req.param("id") ?? "",
 		locale: c.req.header("accept-language")?.startsWith("zh") ? "zh-CN" : "en",
 		async authorize(input, need) {
 			const narrator = await requireNarratorAccess(c, c.req.param("id") ?? "", need);
 			const device = input.deviceId ?? narrator.defaultDeviceId ?? "local";
-			if (device !== "local")
-				throw new AppError(
-					"Remote editor transfers are unsupported; use the existing read-only entry",
-					422,
-					"EDITOR_REMOTE_UNSUPPORTED",
-				);
+			if (device !== "local") {
+				const workspace = narrator.workspaceContext;
+				if (
+					!workspace ||
+					workspace.deviceId !== device ||
+					workspace.revision !== narrator.workspaceRevision
+				)
+					throw new EditorDocumentError(
+						"EDITOR_REMOTE_UNSUPPORTED",
+						"Remote editor requires an initialized workspace binding",
+						422,
+					);
+				return authorizeRemoteEditorBinding(actor, workspace, input, need, {
+					signal: AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(30_000)]),
+					async authorizationGuard(required) {
+						const live = await requireNarratorAccess(c, narrator.id, required);
+						if (
+							!live.workspaceContext ||
+							live.workspaceRevision !== workspace.revision ||
+							live.workspaceContext.contextKey !== workspace.contextKey ||
+							live.workspaceContext.deviceId !== workspace.deviceId ||
+							live.workspaceContext.cwd !== workspace.cwd
+						)
+							throw new EditorDocumentError(
+								"EDITOR_IDENTITY_CHANGED",
+								"Remote editor workspace changed",
+								403,
+							);
+					},
+				});
+			}
 			// cwd is an optional override: chapter narrators normally inherit their worktree.
 			// Resolve it on every request so moving/dormant worktrees invalidate old bindings.
 			const chapter = narrator.chapterId
@@ -134,6 +161,7 @@ export function editorActor(c: Context): EditorActor {
 			};
 		},
 	};
+	return actor;
 }
 export function createEditorDocumentRoutes(
 	getService: () => EditorDocumentService = getEditorDocumentService,
@@ -146,6 +174,8 @@ export function createEditorDocumentRoutes(
 		await requireNarratorAccess(c, c.req.param("id") ?? "", "read");
 	};
 	const base = "/:id/editor-documents";
+	routes.use(base, remoteRecoveryProvenance);
+	routes.use(`${base}/*`, remoteRecoveryProvenance);
 	routes.use(`${base}/*`, async (c, next) => {
 		await protect(c);
 		await next();

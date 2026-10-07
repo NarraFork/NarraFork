@@ -1,85 +1,125 @@
 {
-  "version": 1,
-  "entries": [
-    {
-      "idx": 0,
-      "tag": "0000_elite_unus",
-      "id": "b1ffaee9-51db-4a93-9203-011de14e544c",
-      "prevId": "00000000-0000-0000-0000-000000000000",
-      "version": "7",
-      "snapshotDigest": "2c9c2ae34157d357b5895c897b505f62177a94b2ca3d2054231b1202d9dfed03"
-    },
-    {
-      "idx": 1,
-      "tag": "0001_seq_counters",
-      "id": "827d79d0-8075-493f-954b-2003153f491d",
-      "prevId": "b1ffaee9-51db-4a93-9203-011de14e544c",
-      "version": "7",
-      "snapshotDigest": "bd188584c1056d5c09f0a162a67987eac022cdb0848d7d186a42d362064ece9a"
-    },
-    {
-      "idx": 2,
-      "tag": "0002_slippery_masked_marvel",
-      "id": "082531c2-a64e-410c-ac83-31c94eed92c7",
-      "prevId": "827d79d0-8075-493f-954b-2003153f491d",
-      "version": "7",
-      "snapshotDigest": "5c37a63f297e1d116293ac58c386f44c7c2a952a53ebb0ec43ff3e9f9ca62de7"
-    },
-    {
-      "idx": 3,
-      "tag": "0003_reference_cost_status",
-      "id": "aa438b18-5896-4fd3-ba76-75cf0cf43231",
-      "prevId": "082531c2-a64e-410c-ac83-31c94eed92c7",
-      "version": "7",
-      "snapshotDigest": "226a84854db3eb32548aa056ec5e50b0d1884d3637288430d7aa94418e16c303"
-    },
-    {
-      "idx": 4,
-      "tag": "0004_chunky_cardiac",
-      "id": "af828d9d-aae1-4751-92f4-5165e3b24664",
-      "prevId": "aa438b18-5896-4fd3-ba76-75cf0cf43231",
-      "version": "7",
-      "snapshotDigest": "991e4dbbe596f833d39ff10fbc891df856b502614199e001ebf9efa1d60c7aec"
-    },
-    {
-      "idx": 5,
-      "tag": "0005_goofy_siren",
-      "id": "b0b71c6c-aed3-4844-af30-c38d98292ee8",
-      "prevId": "af828d9d-aae1-4751-92f4-5165e3b24664",
-      "version": "7",
-      "snapshotDigest": "72f87dffd6c81ebc7e023fb3e8000cef9cc8e94e9689cb7c53fcba4262fa76c7"
-    },
-    {
-      "idx": 6,
-      "tag": "0006_fuzzy_morph",
-      "id": "f7348311-fe0f-4093-8b35-5383a390a856",
-      "prevId": "b0b71c6c-aed3-4844-af30-c38d98292ee8",
-      "version": "7",
-      "snapshotDigest": "9395383e55a547986fb7e5ea2b6375ee57ff0edd85a4b984be6808d6b8e9a356"
-    },
-    {
-      "idx": 7,
-      "tag": "0007_main_context_characters",
-      "id": "6d7ada2f-a9f7-4386-935a-ea7984c1004e",
-      "prevId": "f7348311-fe0f-4093-8b35-5383a390a856",
-      "version": "7",
-      "snapshotDigest": "53b0853ae08be2f620be9422a2f3b38435e7101bee3ed3f4763e99e9ef1d671b"
-    },
-    {
-      "idx": 8,
-      "tag": "0008_context_usage_snapshots",
-      "id": "597872b5-9bc6-43a6-b2f0-7bc9b3e18b6b",
-      "prevId": "6d7ada2f-a9f7-4386-935a-ea7984c1004e",
-      "version": "7",
-      "snapshotDigest": "851301c97156f355ac09c2e782bf0fe7ecce7e279bca3f046aab41dc4a518815"
-    },
-    {
-      "idx": 9,
-      "tag": "0009_context_character_cache_indexes",
-      "id": "c8907ecc-6d49-49f5-bd69-203edaa083fb",
-      "prevId": "597872b5-9bc6-43a6-b2f0-7bc9b3e18b6b",
-      "version": "7",
-      "snapshotDigest": "d1c060ab167d5d5b58baa6513b5f10e33e75811ec8b160015c306708a2a86e8e"
-    }
-  ]
+	"version": 1,
+	"entries": [
+		{
+			"idx": 0,
+			"tag": "0000_elite_unus",
+			"id": "b1ffaee9-51db-4a93-9203-011de14e544c",
+			"prevId": "00000000-0000-0000-0000-000000000000",
+			"version": "7",
+			"snapshotDigest": "2c9c2ae34157d357b5895c897b505f62177a94b2ca3d2054231b1202d9dfed03"
+		},
+		{
+			"idx": 1,
+			"tag": "0001_seq_counters",
+			"id": "827d79d0-8075-493f-954b-2003153f491d",
+			"prevId": "b1ffaee9-51db-4a93-9203-011de14e544c",
+			"version": "7",
+			"snapshotDigest": "bd188584c1056d5c09f0a162a67987eac022cdb0848d7d186a42d362064ece9a"
+		},
+		{
+			"idx": 2,
+			"tag": "0002_slippery_masked_marvel",
+			"id": "082531c2-a64e-410c-ac83-31c94eed92c7",
+			"prevId": "827d79d0-8075-493f-954b-2003153f491d",
+			"version": "7",
+			"snapshotDigest": "5c37a63f297e1d116293ac58c386f44c7c2a952a53ebb0ec43ff3e9f9ca62de7"
+		},
+		{
+			"idx": 3,
+			"tag": "0003_reference_cost_status",
+			"id": "aa438b18-5896-4fd3-ba76-75cf0cf43231",
+			"prevId": "082531c2-a64e-410c-ac83-31c94eed92c7",
+			"version": "7",
+			"snapshotDigest": "226a84854db3eb32548aa056ec5e50b0d1884d3637288430d7aa94418e16c303"
+		},
+		{
+			"idx": 4,
+			"tag": "0004_chunky_cardiac",
+			"id": "af828d9d-aae1-4751-92f4-5165e3b24664",
+			"prevId": "aa438b18-5896-4fd3-ba76-75cf0cf43231",
+			"version": "7",
+			"snapshotDigest": "991e4dbbe596f833d39ff10fbc891df856b502614199e001ebf9efa1d60c7aec"
+		},
+		{
+			"idx": 5,
+			"tag": "0005_goofy_siren",
+			"id": "b0b71c6c-aed3-4844-af30-c38d98292ee8",
+			"prevId": "af828d9d-aae1-4751-92f4-5165e3b24664",
+			"version": "7",
+			"snapshotDigest": "72f87dffd6c81ebc7e023fb3e8000cef9cc8e94e9689cb7c53fcba4262fa76c7"
+		},
+		{
+			"idx": 6,
+			"tag": "0006_fuzzy_morph",
+			"id": "f7348311-fe0f-4093-8b35-5383a390a856",
+			"prevId": "b0b71c6c-aed3-4844-af30-c38d98292ee8",
+			"version": "7",
+			"snapshotDigest": "9395383e55a547986fb7e5ea2b6375ee57ff0edd85a4b984be6808d6b8e9a356"
+		},
+		{
+			"idx": 7,
+			"tag": "0007_main_context_characters",
+			"id": "6d7ada2f-a9f7-4386-935a-ea7984c1004e",
+			"prevId": "f7348311-fe0f-4093-8b35-5383a390a856",
+			"version": "7",
+			"snapshotDigest": "53b0853ae08be2f620be9422a2f3b38435e7101bee3ed3f4763e99e9ef1d671b"
+		},
+		{
+			"idx": 8,
+			"tag": "0008_context_usage_snapshots",
+			"id": "597872b5-9bc6-43a6-b2f0-7bc9b3e18b6b",
+			"prevId": "6d7ada2f-a9f7-4386-935a-ea7984c1004e",
+			"version": "7",
+			"snapshotDigest": "851301c97156f355ac09c2e782bf0fe7ecce7e279bca3f046aab41dc4a518815"
+		},
+		{
+			"idx": 9,
+			"tag": "0009_context_character_cache_indexes",
+			"id": "c8907ecc-6d49-49f5-bd69-203edaa083fb",
+			"prevId": "597872b5-9bc6-43a6-b2f0-7bc9b3e18b6b",
+			"version": "7",
+			"snapshotDigest": "d1c060ab167d5d5b58baa6513b5f10e33e75811ec8b160015c306708a2a86e8e"
+		},
+		{
+			"idx": 10,
+			"tag": "0010_remote_workspace",
+			"id": "0c4e067d-e5b1-4321-b81b-d1630b345b5a",
+			"prevId": "c8907ecc-6d49-49f5-bd69-203edaa083fb",
+			"version": "7",
+			"snapshotDigest": "d15ae4e4177e58cd773d1251340b5fca293887a666d5ccd5a3710fdc2577bedf"
+		},
+		{
+			"idx": 11,
+			"tag": "0011_remote_tree_capture_receipts",
+			"id": "d656f09f-6156-42f1-9052-6d221642562c",
+			"prevId": "0c4e067d-e5b1-4321-b81b-d1630b345b5a",
+			"version": "7",
+			"snapshotDigest": "bcad7221527fdc50de6458984e092a51d7df7e6bed89ed585a05d975060731e7"
+		},
+		{
+			"idx": 12,
+			"tag": "0012_pack_target_binding",
+			"id": "2af44bcf-c52d-4407-8ba0-58dc123ae0dc",
+			"prevId": "d656f09f-6156-42f1-9052-6d221642562c",
+			"version": "7",
+			"snapshotDigest": "0e178f8ea5ab616913e6db81fe1c0347fb1445503990501044e95368c92224e6"
+		},
+		{
+			"idx": 13,
+			"tag": "0013_whitelist_target_identity",
+			"id": "9a6cc3fb-d617-4dda-8102-e4df044a4605",
+			"prevId": "2af44bcf-c52d-4407-8ba0-58dc123ae0dc",
+			"version": "7",
+			"snapshotDigest": "1e8e75197cf022b450db5f49deb5b148b0b3d09c425a9299a3a0883552e894b3"
+		},
+		{
+			"idx": 14,
+			"tag": "0014_tree_capture_origin",
+			"id": "53e025e9-8481-4811-bb4e-87436f8c5ca6",
+			"prevId": "9a6cc3fb-d617-4dda-8102-e4df044a4605",
+			"version": "7",
+			"snapshotDigest": "c1817d01f566af4372144e24ccbfd2faece719c5d8db7016cbf3cee5324a0010"
+		}
+	]
 }

@@ -1,9 +1,10 @@
 import { REASONING_EFFORT_VALUES, type ReasoningEffort } from "@shared/reasoning-effort";
 import { isSubagentReasoningEffort, SUBAGENT_POOL_TYPES } from "@shared/subagent-model-policy";
 import { z } from "zod/v4";
-import { resolvePath } from "../../platform-path";
 import { shouldUseNativeSearch } from "../../search/native";
 import { expandAllowedPoolForDisplay, getSubagentVisibleModels, settings } from "../../settings";
+import { localPathSemantics, targetPathSemantics } from "../execution/path-semantics";
+import { getToolBackend } from "../execution/tool-backend";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
 
@@ -264,6 +265,24 @@ async function resolveArchiveTargetId(callerNarratorId: string, selector: string
 
 export const agentTool: ToolDefinition = {
 	name: "Agent",
+	executionRouting: {
+		kind: "single",
+		resolve(input, config) {
+			if ([input.stop, input.archive, input.unarchive].some((value) => typeof value === "string")) {
+				return { key: "primary", operation: "control", hostOnly: true };
+			}
+			return {
+				key: "primary",
+				operation: "control",
+				deviceId: config.workspaceContext?.deviceId ?? config.defaultDeviceId ?? "local",
+				...(typeof input.workdir === "string" && input.workdir.trim()
+					? { workdir: input.workdir }
+					: {}),
+				// Freeze the selected directory itself without applying workdir twice.
+				path: ".",
+			};
+		},
+	},
 	description(config: AgentConfig) {
 		if (usesNativeWebSearch(config)) {
 			return baseDescription.replaceAll("WebSearch", "web_search (native)");
@@ -456,7 +475,20 @@ export const agentTool: ToolDefinition = {
 		const run_in_background = raw.run_in_background ?? raw.background;
 
 		// Resolve effective cwd: use workdir if provided, otherwise parent's cwd
-		const resolvedWorkdir = workdir ? resolvePath(ctx.cwd, workdir) : ctx.cwd;
+		const workspaceContext = ctx.workspaceContext
+			? structuredClone(ctx.workspaceContext)
+			: undefined;
+		const backend = getToolBackend(ctx);
+		const paths =
+			backend.paths ??
+			(workspaceContext ? targetPathSemantics(workspaceContext.pathFlavor) : localPathSemantics);
+		const parentCwd = workspaceContext?.cwd ?? ctx.cwd;
+		const resolvedWorkdir =
+			ctx.executionTarget?.deviceId === backend.deviceId
+				? ctx.executionTarget.cwd
+				: workdir
+					? paths.resolve(parentCwd, workdir)
+					: parentCwd;
 
 		const toolUseId = ctx.currentToolUseId;
 		if (!toolUseId) {
@@ -490,6 +522,10 @@ export const agentTool: ToolDefinition = {
 				prompt,
 				title: description || undefined,
 				cwd: resolvedWorkdir,
+				workspaceContext,
+				executionTarget: ctx.executionTarget,
+				fileAccess: ctx.workspaceFileAccess,
+				assertWorkspaceCurrent: ctx.assertWorkspaceCurrent,
 				signal: ctx.signal,
 				updateExecutionLease,
 				locale: ctx.locale,

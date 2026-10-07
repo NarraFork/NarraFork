@@ -14,7 +14,7 @@ Object.assign(globalThis, {
 	navigator: window.navigator,
 	IS_REACT_ACT_ENVIRONMENT: true,
 });
-const { act, useEffect } = await import("react");
+const { act, useEffect, useMemo } = await import("react");
 const { createRoot } = await import("react-dom/client");
 const { api } = await import("../../../lib/api");
 const { useFileTree } = await import("./useFileTree");
@@ -26,8 +26,30 @@ let frames: Array<{ contextKey: string; rows: string[]; loading: string[]; error
 async function flush() {
 	for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 }
-function Probe({ path, contextKey = path }: { path: string; contextKey?: string }) {
-	const tree = useFileTree(path, false, contextKey);
+function Probe({
+	path,
+	contextKey = path,
+	narratorId = "n",
+}: {
+	path: string;
+	contextKey?: string;
+	narratorId?: string;
+}) {
+	const workspace = useMemo(
+		() => ({
+			narratorId,
+			context: {
+				cwd: path,
+				deviceId: "remote",
+				revision: 1,
+				contextKey,
+				pathFlavor: "posix" as const,
+				capabilities: { switchDirectory: true },
+			},
+		}),
+		[path, contextKey, narratorId],
+	);
+	const tree = useFileTree(path, false, contextKey, workspace);
 	latest = tree;
 	frames.push({
 		contextKey,
@@ -78,6 +100,37 @@ function reply(path: string, names: string[], directories: string[] = []) {
 		})),
 	};
 }
+function mockBrowse() {
+	const reads = mock<(path?: string) => Promise<ReturnType<typeof reply>>>();
+	spyOn(api, "browseNarratorWorkspace").mockImplementation(async (_id, context, relative) => ({
+		...(await reads(relative ? `${context.cwd}/${relative}` : context.cwd)),
+		deviceId: context.deviceId,
+		contextKey: context.contextKey,
+		revision: context.revision,
+		truncated: false,
+		scanned: 1,
+	}));
+	return reads;
+}
+
+test("same device/path/context revision in another narrator cannot reuse a different read ACL's cache", async () => {
+	let count = 0;
+	mockBrowse().mockImplementation(async (path) =>
+		reply(path ?? "", [++count === 1 ? "acl-a" : "acl-b"]),
+	);
+	await act(async () => root.render(<Probe path="/same" narratorId="a" />));
+	await act(async () => {
+		await flush();
+	});
+	expect(container.textContent).toBe("acl-a");
+	await act(async () => root.render(<Probe path="/same" narratorId="b" />));
+	await act(async () => {
+		await flush();
+	});
+	expect(container.textContent).toBe("acl-b");
+	expect(count).toBe(2);
+});
+
 test("A mutations, loading and refresh cannot leak into B or be reused by B mutations", async () => {
 	let releaseA: (() => void) | undefined;
 	let releaseB: (() => void) | undefined;
@@ -89,7 +142,7 @@ test("A mutations, loading and refresh cannot leak into B or be reused by B muta
 	});
 	let aRootReads = 0;
 	let bFolderReads = 0;
-	const reads = spyOn(api, "fsBrowse").mockImplementation(async (path) => {
+	const reads = mockBrowse().mockImplementation(async (path) => {
 		if (path === "/A") {
 			if (++aRootReads > 1) await gateA;
 			return reply(path, ["a-only.txt", "folder", "bad"], ["folder", "bad"]);
@@ -169,7 +222,7 @@ test("A→B→A does not revive A's first pending response", async () => {
 		release = resolve;
 	});
 	let aReads = 0;
-	spyOn(api, "fsBrowse").mockImplementation(async (path) => {
+	mockBrowse().mockImplementation(async (path) => {
 		if (path === "/A" && ++aReads === 1) {
 			await oldRead;
 			return reply(path, ["a-obsolete"]);
@@ -197,7 +250,7 @@ test("A→B→A does not revive A's first pending response", async () => {
 });
 test("same physical path with a new context revision clears all tree state before render", async () => {
 	let count = 0;
-	spyOn(api, "fsBrowse").mockImplementation(async (path) =>
+	mockBrowse().mockImplementation(async (path) =>
 		reply(path ?? "", [++count === 1 ? "revision-1" : "revision-2"]),
 	);
 	await act(async () => {
@@ -224,7 +277,7 @@ test("a late directory response from the previous root cannot populate the new r
 	const gate = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	spyOn(api, "fsBrowse").mockImplementation(async (path) => {
+	mockBrowse().mockImplementation(async (path) => {
 		if (path === "/old") await gate;
 		return {
 			path: path ?? "",

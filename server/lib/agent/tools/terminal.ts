@@ -4,7 +4,7 @@ import { db } from "../../../db";
 import { narrators, terminals } from "../../../db/schema";
 import { terminalService } from "../../../services/terminal-service";
 import { truncateOutput } from "../truncate";
-import type { ToolDefinition, ToolResult } from "../types";
+import type { ToolContext, ToolDefinition, ToolResult } from "../types";
 
 /**
  * Per-narrator per-terminal read cursor.
@@ -241,7 +241,8 @@ export const terminalTool: ToolDefinition = {
 			case "list":
 				return await listTerminals(ctx.narratorId);
 			case "create":
-				return await createTerminal(ctx.narratorId, ctx.chapterId, name);
+				ctx.assertWorkspaceCurrent?.();
+				return await createTerminal(ctx, name);
 			case "rename": {
 				if (!terminal_id) {
 					return {
@@ -262,6 +263,14 @@ export const terminalTool: ToolDefinition = {
 				if ("error" in resolved) {
 					return { output: resolved.error, isError: true };
 				}
+				const { narratorWorktreePrincipalForTool } = await import(
+					"../../../services/narrator-worktree-runtime"
+				);
+				await terminalService.authorizeTargetAccess(
+					resolved.id,
+					await narratorWorktreePrincipalForTool(ctx),
+					"read",
+				);
 				// Treat last_n_lines < 1 as unset (AI models sometimes pass 0 or floats)
 				const effectiveLastN =
 					last_n_lines !== undefined && last_n_lines >= 1 ? Math.round(last_n_lines) : undefined;
@@ -285,6 +294,14 @@ export const terminalTool: ToolDefinition = {
 				if ("error" in resolved) {
 					return { output: resolved.error, isError: true };
 				}
+				const { narratorWorktreePrincipalForTool } = await import(
+					"../../../services/narrator-worktree-runtime"
+				);
+				await terminalService.authorizeTargetAccess(
+					resolved.id,
+					await narratorWorktreePrincipalForTool(ctx),
+					"write",
+				);
 				return await writeInput(resolved.id, ctx.narratorId, ctx.chapterId, ctx.signal, input);
 			}
 
@@ -298,7 +315,15 @@ async function listTerminals(narratorId: string): Promise<ToolResult> {
 	// Find terminals associated with this narrator
 	const narratorTerminals = await db.query.terminals.findMany({
 		where: eq(terminals.narratorId, narratorId),
-		columns: { id: true, name: true, status: true, cwd: true, createdAt: true },
+		columns: {
+			id: true,
+			name: true,
+			status: true,
+			cwd: true,
+			deviceId: true,
+			workspaceRevision: true,
+			createdAt: true,
+		},
 	});
 
 	// Also find terminals associated with the narrator's chapter
@@ -311,7 +336,15 @@ async function listTerminals(narratorId: string): Promise<ToolResult> {
 	if (narrator?.chapterId) {
 		chapterTerminals = await db.query.terminals.findMany({
 			where: eq(terminals.chapterId, narrator.chapterId),
-			columns: { id: true, name: true, status: true, cwd: true, createdAt: true },
+			columns: {
+				id: true,
+				name: true,
+				status: true,
+				cwd: true,
+				deviceId: true,
+				workspaceRevision: true,
+				createdAt: true,
+			},
 		});
 	}
 
@@ -331,7 +364,7 @@ async function listTerminals(narratorId: string): Promise<ToolResult> {
 
 	const lines = all.map(
 		(t) =>
-			`- ${t.id} | ${t.name} | ${t.status} | cwd: ${t.cwd ?? "unknown"} | created: ${t.createdAt}`,
+			`- ${t.id} | ${t.name} | ${t.status} | device: ${t.deviceId ?? "local"} | cwd: ${t.cwd ?? "unknown"} | revision: ${t.workspaceRevision ?? "legacy"} | created: ${t.createdAt}`,
 	);
 	return {
 		output: `Found ${all.length} terminal(s):\n${lines.join("\n")}`,
@@ -339,15 +372,18 @@ async function listTerminals(narratorId: string): Promise<ToolResult> {
 	};
 }
 
-async function createTerminal(
-	narratorId: string,
-	cachedChapterId?: string,
-	name?: string,
-): Promise<ToolResult> {
+async function createTerminal(ctx: ToolContext, name?: string): Promise<ToolResult> {
 	try {
-		const terminal = cachedChapterId
-			? await terminalService.create({ chapterId: cachedChapterId, narratorId, name })
-			: await terminalService.create({ narratorId, name });
+		const { narratorWorktreePrincipalForTool } = await import(
+			"../../../services/narrator-worktree-runtime"
+		);
+		const terminal = await terminalService.create({
+			narratorId: ctx.narratorId,
+			name,
+			expectedRevision: ctx.workspaceContext?.revision,
+			contextKey: ctx.workspaceContext?.contextKey,
+			principal: await narratorWorktreePrincipalForTool(ctx),
+		});
 		return {
 			output:
 				`Terminal created successfully.\n` +

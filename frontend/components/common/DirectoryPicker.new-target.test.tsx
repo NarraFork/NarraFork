@@ -83,6 +83,7 @@ mock.module("@mantine/core", () => {
 	);
 	return {
 		ActionIcon: Button,
+		Alert: Wrapper,
 		Button,
 		UnstyledButton: Button,
 		Divider: Wrapper,
@@ -120,6 +121,7 @@ const { act } = await import("react");
 const { createRoot } = await import("react-dom/client");
 const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
 const { DirectoryBrowser } = await import("./DirectoryPicker");
+const { TargetDirectoryBrowser } = await import("./TargetDirectoryBrowser");
 let root: Root;
 let container: HTMLElement;
 let client: InstanceType<typeof QueryClient>;
@@ -185,6 +187,61 @@ afterAll(() => {
 		else Reflect.deleteProperty(globalThis, key);
 	}
 });
+async function renderRemote(mode: "existing" | "newTarget" = "existing", available = true) {
+	const lister = mock(async (path?: string) => ({
+		path: path ?? "\\\\host\\share",
+		parent: null,
+		sep: "\\",
+		entries: [],
+		truncated: true,
+	}));
+	const check = mock(async () => available);
+	await act(async () =>
+		root.render(
+			<QueryClientProvider client={client}>
+				<TargetDirectoryBrowser
+					deviceLabel="Remote only"
+					initialPath={"\\\\host\\share"}
+					queryKey={["target", "remote"]}
+					listDirectory={lister}
+					checkNewTarget={check}
+					mode={mode}
+					onSelect={selected}
+					onCancel={() => {}}
+				/>
+			</QueryClientProvider>,
+		),
+	);
+	await act(async () => {
+		await flush();
+	});
+	return { lister, check };
+}
+
+test("remote picker returns target UNC path, reports truncation and never browses host", async () => {
+	await renderRemote();
+	await select();
+	expect(selected.mock.calls[0]?.[0]).toBe("\\\\host\\share");
+	expect(container.textContent).toContain("directoryListingTruncated");
+	expect(browse).not.toHaveBeenCalled();
+	expect(mkdir).not.toHaveBeenCalled();
+});
+test("remote new target validates nonexistence on target device before selecting", async () => {
+	const { check } = await renderRemote("newTarget", false);
+	await act(async () => {
+		const field = container.querySelector<HTMLInputElement>('input[aria-label="newDirectoryName"]');
+		if (!field) throw new Error("missing remote leaf");
+		field.value = "new-tree";
+		field.dispatchEvent(new window.Event("input", { bubbles: true }));
+	});
+	await select();
+	expect(check).toHaveBeenCalledWith("\\\\host\\share\\new-tree");
+	expect(selected).not.toHaveBeenCalled();
+	expect(container.textContent).toContain("directoryTargetExists");
+	expect(browse).not.toHaveBeenCalled();
+	expect(mkdir).not.toHaveBeenCalled();
+});
+
 test("new target picks parent + leaf without mkdir and can be passed to a rejecting-existing service fixture", async () => {
 	await render();
 	await input("new-worktree");

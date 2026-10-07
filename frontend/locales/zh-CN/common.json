@@ -1,4 +1,8 @@
 {
+	"directoryTargetExists": "目标已存在，请选择新名称。",
+	"directoryPath": "目录路径",
+	"newDirectoryName": "新目录名称",
+	"directoryListingTruncated": "此列表仅包含有界前缀，可能还有更多条目。",
 	"dataDirectorySecurity": {
 		"check": "检查数据目录权限",
 		"handle": "处理",

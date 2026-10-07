@@ -1,4 +1,4 @@
-/** Local narrator worktree management. No remote cwd, removal, pruning or implicit switching. */
+/** Device-qualified narrator worktree management. No removal, pruning or implicit switching. */
 export interface WorktreeEntry {
 	path: string;
 	head: string | null;
@@ -21,6 +21,10 @@ export interface WorktreeCreateRequest {
 	baseRef?: string;
 }
 export interface WorktreeCreateResult {
+	deviceId?: string;
+	workspaceKey?: string;
+	repositoryKey?: string;
+	workspaceRevision?: number;
 	outcome: "created" | "failed" | "unknown";
 	worktree: WorktreeEntry | null;
 	residuals: { destinationExists: boolean | null; branchExists: boolean | null };
@@ -45,6 +49,9 @@ export interface WorktreePrepareResult {
 	destinationPath: string;
 }
 export interface WorktreeListResult {
+	deviceId?: string;
+	workspaceKey?: string;
+	workspaceRevision?: number;
 	repositoryKey: string | null;
 	entries: WorktreeEntry[];
 	truncated: boolean;
@@ -54,7 +61,7 @@ export interface WorktreeListResult {
 		switch: false;
 		delete: false;
 		prune: false;
-		remote: false;
+		remote: boolean;
 		reason?: string;
 	};
 }

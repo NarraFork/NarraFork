@@ -182,6 +182,7 @@ export interface ExternalNarratorDto {
 	status: "idle" | "working" | "waiting" | "archived";
 	permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "readOnly" | "dontAsk" | null;
 	defaultDeviceId: string | null;
+	workspaceTarget?: { deviceId: string; cwd: string };
 	projectId: string | null;
 	lastMessageAt: string | null;
 	createdAt: string;
@@ -291,6 +292,7 @@ function narratorProvisionIdentity(input: {
 	permissionMode: ExternalPermissionMode;
 	systemPrompt: string | undefined;
 	dangerReflectionPrompt: string | undefined;
+	workspaceTarget?: { deviceId: string; cwd: string };
 }): ProvisionIdentity {
 	const base = {
 		version: 2,
@@ -300,6 +302,7 @@ function narratorProvisionIdentity(input: {
 		deviceIds: [...input.deviceIds].sort(),
 		permissionMode: input.permissionMode,
 		systemPrompt: input.systemPrompt ?? null,
+		...(input.workspaceTarget ? { workspaceTarget: input.workspaceTarget } : {}),
 	};
 	if (input.dangerReflectionPrompt === undefined) return hashProvisionIdentity(base);
 	return hashProvisionIdentity({
@@ -572,6 +575,14 @@ function toExternalNarratorDto(row: typeof narrators.$inferSelect): ExternalNarr
 		status: row.status,
 		permissionMode: row.permissionMode,
 		defaultDeviceId: row.defaultDeviceId,
+		...(row.workspaceContext
+			? {
+					workspaceTarget: {
+						deviceId: row.workspaceContext.deviceId,
+						cwd: row.workspaceContext.cwd,
+					},
+				}
+			: {}),
 		projectId: row.contextProjectId,
 		lastMessageAt: row.lastMessageAt,
 		createdAt: row.createdAt,
@@ -1031,6 +1042,13 @@ export async function provisionExternalNarrator(
 	);
 	const defaultDevice = devices.find((device) => device.id === input.deviceId);
 	if (!defaultDevice) throw new ValidationError("deviceIds must include deviceId");
+	if (
+		input.workspaceTarget?.deviceId !== undefined &&
+		input.workspaceTarget.deviceId !== defaultDevice.id
+	)
+		throw new ValidationError("workspaceTarget must use the initial deviceId");
+	if (input.workspaceTarget && ctx.policy.deviceAccess.selfRegistered === "denied")
+		throw externalPolicyForbidden("The selected workspace exceeds the device read policy");
 	const permissionMode = resolvePermissionMode(ctx, input.permissionMode);
 	const systemPrompt = resolveSystemPrompt(ctx, input.systemPrompt);
 	const dangerReflectionPrompt = resolveDangerReflectionPrompt(ctx, input.dangerReflectionPrompt);
@@ -1041,6 +1059,7 @@ export async function provisionExternalNarrator(
 		permissionMode,
 		systemPrompt,
 		dangerReflectionPrompt,
+		workspaceTarget: input.workspaceTarget,
 	});
 
 	return provisionLock.acquire(`narrator:${ctx.grantId}:${provisionKey}`, async () => {
@@ -1073,6 +1092,7 @@ export async function provisionExternalNarrator(
 					deviceIds,
 				),
 				defaultDeviceId: defaultDevice.id,
+				workspaceTarget: input.workspaceTarget,
 				// The user who consented to the OAuth grant owns the provisioned narrator,
 				// so it appears in their UI like any other session of theirs. The external
 				// surface itself keeps authorizing purely on the integration binding —

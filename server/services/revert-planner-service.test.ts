@@ -25,6 +25,10 @@ import {
 	withLocalFileChangeRuntime,
 } from "./file-change-runtime";
 import type { NarratorAclRow, NarratorPrincipal } from "./narrator-acl";
+import {
+	type RemoteRecoveryAuthProvenance,
+	withRemoteRecoveryAuthProvenance,
+} from "./remote-history-recovery-auth";
 import { type RevertPlanFileCursor, RevertPlanService } from "./revert-plan-service";
 import {
 	type RevertPlannerAccess,
@@ -1296,4 +1300,64 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path)).toEqual(disk);
 	});
+});
+
+test("scoped selector binds original authenticated provenance without retry or owner backfill", async () => {
+	const path = join(workspace, "recovery-source.txt");
+	await writeFile(path, "original");
+	await write(path, "changed");
+	const issuedAtSeconds = Math.floor(Date.now() / 1000);
+	const original: RemoteRecoveryAuthProvenance = {
+		version: 1,
+		authentication: "session",
+		userId: principal.userId,
+		tokenVersion: 0,
+		issuedAtSeconds,
+		expiresAtSeconds: issuedAtSeconds + 3600,
+	};
+	const prepared = await withRemoteRecoveryAuthProvenance(original, () => prepare());
+	const operation = db
+		.select()
+		.from(schema.revertOperations)
+		.where(eq(schema.revertOperations.id, prepared.plan.id))
+		.get();
+	if (!operation) throw new Error("Missing original immutable plan");
+	const envelope = await rawManifest<{ recoveryAuth?: RemoteRecoveryAuthProvenance | null }>(
+		operation.selectorBlobDigest,
+	);
+	expect(envelope.recoveryAuth).toEqual(original);
+	const retry = await withRemoteRecoveryAuthProvenance(original, () => prepare());
+	expect(retry.plan.id).toBe(prepared.plan.id);
+	expect(retry.plan.planHash).toBe(prepared.plan.planHash);
+	(
+		await rejected(
+			withRemoteRecoveryAuthProvenance({ ...original, tokenVersion: 8 }, () => prepare()),
+		)
+	).toMatchObject({ code: "REVERT_PLAN_REQUEST_CONFLICT" });
+	expect(await rawManifest<typeof envelope>(operation.selectorBlobDigest)).toEqual(envelope);
+	const unmatched = await withRemoteRecoveryAuthProvenance(
+		{ ...original, userId: "not-the-requester" },
+		() => prepare({ idempotencyKey: "different-actor-context" }),
+	);
+	const unmatchedRow = db
+		.select()
+		.from(schema.revertOperations)
+		.where(eq(schema.revertOperations.id, unmatched.plan.id))
+		.get();
+	if (!unmatchedRow) throw new Error("Missing legacy/unproven plan");
+	const unmatchedEnvelope = await rawManifest<{
+		recoveryAuth?: RemoteRecoveryAuthProvenance | null;
+	}>(unmatchedRow.selectorBlobDigest);
+	expect(unmatchedEnvelope.recoveryAuth ?? null).toBeNull();
+	const absent = await prepare({ idempotencyKey: "no-auth-provenance" });
+	const absentRow = db
+		.select()
+		.from(schema.revertOperations)
+		.where(eq(schema.revertOperations.id, absent.plan.id))
+		.get();
+	if (!absentRow) throw new Error("Missing no-provenance plan");
+	const absentEnvelope = await rawManifest<{ recoveryAuth?: RemoteRecoveryAuthProvenance | null }>(
+		absentRow.selectorBlobDigest,
+	);
+	expect(absentEnvelope.recoveryAuth ?? null).toBeNull();
 });

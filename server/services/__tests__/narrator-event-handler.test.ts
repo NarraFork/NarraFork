@@ -1099,6 +1099,47 @@ describe("完成工具输入传递", () => {
 
 		expect(calls).toEqual([["Bash", "bash-completed", { command: "git status" }]]);
 	});
+	test("onGitTrack receives the completed tool's frozen endpoint rather than a later cwd", async () => {
+		const ctx = makeSubagentContext();
+		const target = {
+			deviceId: "remote-completed",
+			backendKind: "remote" as const,
+			cwd: "/original/repo",
+			pathFlavor: "posix" as const,
+			runtimeGeneration: 7,
+			selectionSource: "session_default" as const,
+		};
+		const workspace = {
+			revision: 1,
+			deviceId: target.deviceId,
+			cwd: target.cwd,
+			pathFlavor: "posix" as const,
+			contextKey: "original-revision",
+			capabilities: { switchDirectory: true },
+		};
+		let completedWorkspace: unknown;
+		let completedTarget: unknown;
+		await processEvent(
+			{
+				type: "tool_result",
+				toolUseId: "remote-completed",
+				toolName: "Bash",
+				input: { command: "git status" },
+				output: "",
+				isError: false,
+				metadata: { executionTarget: target, executionWorkspace: workspace },
+			},
+			ctx,
+			{
+				onGitTrack: (_tool, _id, _input, admitted, originalWorkspace) => {
+					completedWorkspace = originalWorkspace;
+					completedTarget = admitted;
+				},
+			},
+		);
+		expect(completedTarget).toEqual(target);
+		expect(completedWorkspace).toEqual(workspace);
+	});
 
 	test("retryable_error 只移除无内容的生图进度并重建其余快照", async () => {
 		const sseEmitter = new EventEmitter();

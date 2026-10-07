@@ -1,10 +1,18 @@
 import { stat } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
+import type { WorkspaceContext } from "@shared/workspace-context";
+import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { detectShell } from "../lib/agent/shell";
 import { BASH_TOOL_NAME } from "../lib/agent/tool-name";
 import { getGlobalPromptCandidates, PROJECT_PROMPT_FILENAMES } from "../lib/global-prompt-paths";
-import { buildPlanFileRelPath, isSafePlanFileIdForPath } from "../lib/plan-file-path";
+import {
+	buildPlanFileRelPath,
+	isSafePlanFileIdForPath,
+	readWorkspaceText,
+	statWorkspaceFile,
+	type WorkspaceFileAccess,
+} from "../lib/plan-file-path";
 import { IS_WINDOWS } from "../lib/platform";
 import {
 	getDynamicSpecSystemReminder,
@@ -19,6 +27,13 @@ export interface BuildPromptOptions {
 	basePrompt: string | null;
 	/** Working directory for CWD injection and AGENTS.md lookup */
 	cwd: string;
+	/** Frozen engineering endpoint; server global instructions remain server-side. */
+	workspaceContext?: WorkspaceContext;
+	backend?: ExecutionBackend;
+	fileAccess?: WorkspaceFileAccess;
+	/** Original source of an active plan cycle, retained across directory switches. */
+	planFileAccess?: WorkspaceFileAccess;
+	planFileBinding?: import("../lib/plan-file-path").PlanFileBinding;
 	/** Locale for language instruction */
 	locale: Locale;
 	/** Compact summary to inject (main narrator only) */
@@ -46,7 +61,7 @@ export interface BuildPromptOptions {
 		name: string;
 		description?: string | null;
 		online: boolean;
-		platform?: { os: string; arch: string };
+		platform?: import("../lib/agent/execution/backend").DevicePlatform;
 		defaultCwd?: string | null;
 	}>;
 	/** Current session default device id (null/undefined → local server). */
@@ -101,7 +116,6 @@ export async function buildEffectiveSystemPrompt(
 ): Promise<BuildPromptResult> {
 	const {
 		basePrompt,
-		cwd,
 		locale,
 		contextSummary,
 		planMode,
@@ -114,6 +128,15 @@ export async function buildEffectiveSystemPrompt(
 		defaultDeviceId,
 		allowLocalExecution = true,
 	} = options;
+
+	const workspace = options.workspaceContext ?? options.fileAccess?.workspaceContext;
+	const cwd = workspace?.cwd ?? options.cwd;
+	const backend = options.backend ?? options.fileAccess?.backend;
+	const effectiveDeviceId = workspace?.deviceId ?? backend?.deviceId ?? defaultDeviceId;
+	const isRemote = effectiveDeviceId != null && effectiveDeviceId !== "local";
+	if (backend && workspace && backend.deviceId !== workspace.deviceId) {
+		throw new Error("Prompt backend does not match workspace");
+	}
 
 	// Fall back to global default system prompt when basePrompt is null
 	let prompt = basePrompt ?? defaultSystemPrompt ?? null;
@@ -143,7 +166,16 @@ export async function buildEffectiveSystemPrompt(
 	{
 		const base = prompt ?? "";
 		const sep = base ? "\n\n" : "";
-		const shellInfo = detectShell();
+		const targetPlatform =
+			backend?.platform ?? devices?.find((d) => d.id === effectiveDeviceId)?.platform;
+		const localShell = !isRemote ? detectShell() : undefined;
+		const shellInfo = targetPlatform
+			? {
+					type: targetPlatform.shellType,
+					loginWrap: targetPlatform.shellLoginWrap,
+				}
+			: localShell;
+		const isWindows = targetPlatform ? targetPlatform.os === "windows" : !isRemote && IS_WINDOWS;
 		// The shell tool is named Bash on every platform (see BASH_TOOL_NAME). These
 		// sections used to say "Shell" whenever IS_WINDOWS, which contradicted the
 		// registered tool name on the common Windows setup (Git Bash) and made the
@@ -151,7 +183,7 @@ export async function buildEffectiveSystemPrompt(
 		let cwdSection = `## Current Working Directory\n\n\`${cwd}\`\n\nAll tools (${BASH_TOOL_NAME}, Read, Write, Edit, Glob, Grep) already use this as their default working directory. Do NOT \`cd\` into it in ${BASH_TOOL_NAME} commands — it is redundant.`;
 
 		// Windows Git Bash: warn about MSYS2 path mangling and forbid cmd builtins
-		if (IS_WINDOWS && shellInfo.loginWrap) {
+		if (isWindows && shellInfo?.loginWrap) {
 			cwdSection += `\n\nCRITICAL — Windows Git Bash Rules:
 - The ${BASH_TOOL_NAME} tool runs commands through Git Bash (MSYS2). MSYS2 automatically converts arguments that look like Unix paths: \`/S\` → \`S:/\`, \`/I\` → \`I:/\`, etc. This BREAKS any Windows cmd command that uses \`/flag\` syntax.
 - NEVER use Windows cmd builtins or utilities in the ${BASH_TOOL_NAME} tool: \`findstr\`, \`dir\`, \`type\`, \`copy\`, \`move\`, \`del\`, \`ren\`, \`cls\`, \`more\`, \`sort\`, \`fc\`, \`comp\`, \`xcopy\`, \`robocopy\`, \`attrib\`, \`icacls\`.
@@ -161,31 +193,45 @@ export async function buildEffectiveSystemPrompt(
 		}
 
 		// Windows PowerShell guidance
-		if (IS_WINDOWS && shellInfo.type === "powershell") {
+		if (isWindows && shellInfo?.type === "powershell") {
 			cwdSection += `\n\nCRITICAL — Windows PowerShell Rules:
 - The ${BASH_TOOL_NAME} tool uses PowerShell on this system (the tool name is still ${BASH_TOOL_NAME}). Use PowerShell cmdlets (e.g. Get-ChildItem, Select-String) or common cross-platform commands (e.g. git, node, npm, bun, python).
 - NEVER use Windows cmd builtins: \`findstr\`, \`dir\`, \`type\`, \`copy\`, \`move\`, \`del\`. They may behave unexpectedly in PowerShell.
 - Prefer the dedicated tools (Read, Write, Edit, Glob, Grep) over shell commands whenever possible.`;
 		}
 
+		if (isRemote) {
+			cwdSection += `\n\nWorkspace device: \`${effectiveDeviceId}\`. Server filesystem paths are NOT this workspace. Target platform: ${targetPlatform ? `${targetPlatform.os}/${targetPlatform.arch}` : "unknown"}; shell: ${backend?.platform?.shellPath ?? backend?.platform?.shellType ?? "unknown — do not assume the server shell"}.`;
+		}
 		prompt = `${base}${sep}${cwdSection}`;
 	}
 
 	// 2a. Inject the Execution Devices section when remote execution is available,
 	// or when a stale remote default needs an explicit recovery warning.
 	{
-		const allDevices = devices ?? [];
+		const allDevices: NonNullable<BuildPromptOptions["devices"]> =
+			devices ??
+			(backend?.kind === "remote"
+				? [
+						{
+							id: backend.deviceId,
+							name: backend.deviceId,
+							online: true,
+							platform: backend.platform,
+						},
+					]
+				: []);
 		const onlineDevices = allDevices.filter((d) => d.online);
-		const hasRemoteDefault = defaultDeviceId != null && defaultDeviceId !== "local";
+		const hasRemoteDefault = isRemote;
 		if (onlineDevices.length > 0 || hasRemoteDefault) {
 			const base = prompt ?? "";
 			const sep = base ? "\n\n" : "";
 			const defaultDevice = hasRemoteDefault
-				? allDevices.find((d) => d.id === defaultDeviceId)
+				? allDevices.find((d) => d.id === effectiveDeviceId)
 				: undefined;
 			const defaultUnavailable = hasRemoteDefault && !defaultDevice?.online;
 			const currentTarget = hasRemoteDefault
-				? `${defaultDevice?.name ?? defaultDeviceId} (remote${defaultUnavailable ? ", unavailable" : ""})`
+				? `${defaultDevice?.name ?? effectiveDeviceId} (remote${defaultUnavailable ? ", unavailable" : ""})`
 				: "local (the NarraFork server)";
 			const deviceLines = onlineDevices.map((d) => {
 				const platform = d.platform ? ` [${d.platform.os}/${d.platform.arch}]` : "";
@@ -198,7 +244,7 @@ export async function buildEffectiveSystemPrompt(
 					? `Available remote devices:\n${deviceLines.join("\n")}`
 					: "Available remote devices: none currently online.";
 			const unavailableWarning = defaultUnavailable
-				? `\n\nWARNING: The configured default remote device \`${defaultDeviceId}\` is unknown or offline. ` +
+				? `\n\nWARNING: The configured default remote device \`${effectiveDeviceId}\` is unknown or offline. ` +
 					`Tool calls that omit \`device\` will fail and will NOT fall back to local execution. ` +
 					(allowLocalExecution
 						? `Use SwitchDevice with \`device: "local"\` before running local file or command tools.`
@@ -208,7 +254,7 @@ export async function buildEffectiveSystemPrompt(
 			// offline) remote default, and only then to "local". When local execution
 			// is forbidden and no concrete device id is available, omit the id example
 			// entirely rather than interpolate a null/undefined placeholder.
-			const exampleDeviceId = onlineDevices[0]?.id ?? (hasRemoteDefault ? defaultDeviceId : null);
+			const exampleDeviceId = onlineDevices[0]?.id ?? (hasRemoteDefault ? effectiveDeviceId : null);
 			let perCallExample: string;
 			if (allowLocalExecution) {
 				perCallExample = exampleDeviceId
@@ -250,7 +296,22 @@ export async function buildEffectiveSystemPrompt(
 	{
 		let result: { content: string; truncated: boolean } | null = null;
 		for (const filename of PROJECT_PROMPT_FILENAMES) {
-			result = await readFileCapped(join(cwd, filename), MAX_PROJECT_INSTRUCTIONS_BYTES);
+			if (options.fileAccess) {
+				const access = options.fileAccess;
+				try {
+					result = await readWorkspaceText(
+						access,
+						access.backend.paths.resolve(cwd, filename),
+						MAX_PROJECT_INSTRUCTIONS_BYTES,
+					);
+				} catch (error) {
+					access.signal?.throwIfAborted();
+					// Denied/missing/unsupported instruction files are not silently read on host.
+					if (error instanceof Error && error.name === "AbortError") throw error;
+				}
+			} else if (!isRemote) {
+				result = await readFileCapped(join(cwd, filename), MAX_PROJECT_INSTRUCTIONS_BYTES);
+			}
 			if (result) break;
 		}
 		if (result) {
@@ -277,7 +338,7 @@ export async function buildEffectiveSystemPrompt(
 				: "";
 			const base = prompt ?? "";
 			const sep = base ? "\n\n" : "";
-			prompt = `${base}${sep}## Global Instructions\n\n${result.content}${suffix}`;
+			prompt = `${base}${sep}## Global Instructions\n\nSource: NarraFork server user/administrator configuration (not workspace files).\n\n${result.content}${suffix}`;
 		}
 	}
 
@@ -303,16 +364,50 @@ export async function buildEffectiveSystemPrompt(
 		// planFileId every turn), but the record of having written to it does not.
 		// Stat the file so the reminder can tell the model to Read + Edit instead
 		// of Write-truncating a half-finished plan it no longer remembers.
+		const planBinding = options.planFileBinding;
 		const effectivePlanFilePath =
+			planBinding?.planFilePath ??
 			planFilePath ??
 			(isSafePlanFileIdForPath(planFileId) ? buildPlanFileRelPath(planFileId) : undefined);
-		const planFileBytes = await statPlanFileBytes(cwd, effectivePlanFilePath);
+		const samePlanWorkspace =
+			!planBinding ||
+			(workspace?.deviceId === planBinding.workspaceContext.deviceId &&
+				workspace.contextKey === planBinding.workspaceContext.contextKey);
+		const planAccess =
+			options.planFileAccess ?? (samePlanWorkspace ? options.fileAccess : undefined);
+		if (
+			planAccess &&
+			planBinding &&
+			(planAccess.backend.deviceId !== planBinding.workspaceContext.deviceId ||
+				(planAccess.workspaceContext &&
+					planAccess.workspaceContext.contextKey !== planBinding.workspaceContext.contextKey))
+		) {
+			throw new Error("Plan file access does not match the original cycle source");
+		}
+		let planFileBytes: number | undefined;
+		if (planAccess && effectivePlanFilePath) {
+			try {
+				const planCwd = planAccess.workspaceContext?.cwd ?? cwd;
+				const info = await statWorkspaceFile(
+					planAccess,
+					planAccess.backend.paths.resolve(planCwd, effectivePlanFilePath),
+				);
+				if (info?.isFile && info.size > 0) planFileBytes = info.size;
+			} catch {
+				planAccess.signal?.throwIfAborted();
+			}
+		} else if (!isRemote && !planBinding) {
+			planFileBytes = await statPlanFileBytes(cwd, effectivePlanFilePath);
+		}
 		prompt = `${base}${sep}${getPlanModeSystemReminder(
 			locale,
 			effectivePlanFilePath,
 			planAllowInlinePlan !== false,
 			planFileBytes,
 		)}`;
+		if (planBinding) {
+			prompt += `\n\nPlan cycle source: device=${planBinding.workspaceContext.deviceId}, cwd=${planBinding.workspaceContext.cwd}, context=${planBinding.workspaceContext.contextKey}. This cycle does not move when the session workspace changes. Read/write this plan with its explicit device and original absolute path; ExitPlanMode stays bound to this source.`;
+		}
 	}
 
 	return { prompt, usedCompactSummary, ...(summaryRange ? { summaryRange } : {}) };

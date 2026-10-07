@@ -69,6 +69,9 @@ export const externalNarratorProvisionBodySchema = z
 		projectId: externalResourceIdSchema.optional(),
 		/** Initial default execution device; must also be present in deviceIds. */
 		deviceId: externalResourceIdSchema,
+		workspaceTarget: z
+			.strictObject({ deviceId: externalResourceIdSchema, cwd: z.string().trim().min(1).max(4096) })
+			.optional(),
 		deviceIds: z
 			.array(externalResourceIdSchema)
 			.min(1)
@@ -86,6 +89,13 @@ export const externalNarratorProvisionBodySchema = z
 	})
 	.strict()
 	.superRefine((input, ctx) => {
+		if (input.workspaceTarget && input.workspaceTarget.deviceId !== input.deviceId) {
+			ctx.addIssue({
+				code: "custom",
+				path: ["workspaceTarget", "deviceId"],
+				message: "workspaceTarget must use the initial deviceId",
+			});
+		}
 		if (!input.deviceIds.includes(input.deviceId)) {
 			ctx.addIssue({
 				code: "custom",

@@ -83,6 +83,15 @@ function makeNarrator(id: string) {
 		errorMessage: null,
 		model: "test-model",
 		cwd: ".",
+		workspaceRevision: 0,
+		workspaceContext: {
+			revision: 0,
+			deviceId: "local",
+			cwd: process.cwd(),
+			pathFlavor: "posix" as const,
+			contextKey: `test:${id}`,
+			capabilities: { switchDirectory: true },
+		},
 		contextSummary: null,
 	};
 }

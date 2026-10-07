@@ -11,6 +11,19 @@ import (
 
 const ProtocolVersion = 1
 
+// FeatureHistoryV1 covers source-qualified sparse capture, durable intent,
+// conditional target IO, paged inspection and proven-effect compensation.
+const FeatureHistoryV1 = "history.v1"
+const FeatureHistoryCaptureTreeV1 = "history.capture-tree.v1"
+const FeatureHistoryObjectStageV1 = "history.object-stage.v1"
+const FeatureHistoryNativeMetadataV1 = "history.native-metadata.v1"
+const FeatureWorkspaceAttachmentV1 = "workspace.attachment.v1"
+
+// Advertised only after private worktree journaling is configured.
+const FeatureGitWorktreeV1 = "git.worktree.v1"
+
+const FeatureShareArchiveV1 = "share.archive.v1"
+
 // FeatureFsStatResolvedPathV1 means fs.stat returns the canonical path approved
 // by PathGuard. It is negotiated independently of the protocol version so old
 // executors can remain connected for tools that do not need canonical paths.
@@ -31,6 +44,8 @@ const FeatureGlobBoundedV1 = "glob.bounded.v1"
 // FeatureFsReadBoundedV1 means fs.read enforces cancellation/deadlines between
 // bounded chunks and revalidates canonical identity and file size before returning.
 const FeatureFsReadBoundedV1 = "fs.read.bounded.v1"
+
+const FeatureFsListBoundedV1 = "fs.list.bounded.v1"
 
 // Executor-serialized check-and-replace; not an OS-level CAS against external writers.
 const FeatureFsConditionalWriteV1 = "fs.write.conditional.v1"
@@ -110,6 +125,7 @@ func (c Capabilities) MarshalJSON() ([]byte, error) {
 		FeatureFsWriteAtomicResolvedPathV1,
 		FeatureGlobBoundedV1,
 		FeatureFsReadBoundedV1,
+		FeatureFsListBoundedV1,
 		FeatureFsConditionalWriteV1,
 		FeatureGitWorkspaceV1,
 		FeatureGitWorkspaceWatchV1,

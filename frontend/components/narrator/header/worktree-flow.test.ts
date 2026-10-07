@@ -68,6 +68,26 @@ function setup(overrides: Partial<WorktreeFlowPorts> = {}) {
 	return { flow, prepare, create, reconcile, switchPath, calls, steps };
 }
 describe("quick worktree flow", () => {
+	test("created and recovered remote worktrees switch to their receipt device, never a later local target", async () => {
+		const remoteReceipt = { ...created, deviceId: "original-remote" };
+		const fresh = setup({ create: async () => remoteReceipt });
+		await fresh.flow.submit({ ...draft, name: "fix" }, { ...context, deviceId: "original-remote" });
+		expect(fresh.switchPath).toHaveBeenCalledWith("/worktrees/fix", "original-remote");
+		const recovered = setup({
+			create: async () => {
+				throw new Error("lost response");
+			},
+			reconcile: async () => remoteReceipt,
+		});
+		await recovered.flow.submit(
+			{ ...draft, name: "fix" },
+			{ ...context, deviceId: "original-remote" },
+		);
+		await recovered.flow.reconcile();
+		await recovered.flow.switchCreated();
+		expect(recovered.flow.state.createdDeviceId).toBe("original-remote");
+		expect(recovered.switchPath).toHaveBeenCalledWith("/worktrees/fix", "original-remote");
+	});
 	test.each([
 		"branch",
 		"destination",

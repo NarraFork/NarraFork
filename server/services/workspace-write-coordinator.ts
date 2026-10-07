@@ -48,6 +48,10 @@ import {
 	type FileChangeScopeIdentity,
 	fileChangeExecutionBindingMatches,
 } from "./file-change-identity";
+import {
+	assertRemoteLeaseRecoveryAttestation,
+	type RemoteLeaseRecoveryAttestation,
+} from "./remote-workspace-lease-recovery-authority";
 import { retryWorkspaceMetadata } from "./workspace-metadata-retry";
 
 export const WORKSPACE_WRITE_COORDINATOR_LIMITS = Object.freeze({
@@ -816,8 +820,12 @@ export class WorkspaceWriteCoordinator {
 	private inspectRecoveryWithAuthority(
 		input: WorkspaceRecoveryRequest,
 		maintenanceAuthority?: () => void,
+		remoteTerminalAuthority?: () => void,
 	): WorkspaceRecoveryInfo {
 		maintenanceAuthority?.();
+		remoteTerminalAuthority?.();
+		if (remoteTerminalAuthority && input.scope.deviceId === "local")
+			throw fail("recovery_conflict", "Remote terminal authority cannot release local work");
 		const scope = copyScope(input.scope);
 		if (maintenanceAuthority && scope.deviceId !== "local") {
 			throw fail("recovery_conflict", "Maintenance recovery requires a local workspace");
@@ -933,7 +941,10 @@ export class WorkspaceWriteCoordinator {
 		}
 		const epoch = lease?.ownerEpoch ?? current.activeLeaseEpoch;
 		const executionEnded =
-			initialRootVerification || !!lease?.executionEndedAt || epoch === this.state.ownerEpoch;
+			!!remoteTerminalAuthority ||
+			initialRootVerification ||
+			!!lease?.executionEndedAt ||
+			epoch === this.state.ownerEpoch;
 		if (!executionEnded && !maintenanceAuthority)
 			throw new WorkspaceWriteCoordinatorError(
 				"recovery_conflict",
@@ -978,6 +989,17 @@ export class WorkspaceWriteCoordinator {
 		return this.reserveRecoveryWithAuthority(input);
 	}
 
+	/** Only a server-minted original native terminal receipt can release remote unknown work.
+	 * Does not use local PID/epoch/TTL and cannot override live registered executions. */
+	reserveRemoteRecovery(
+		input: WorkspaceRecoveryRequest,
+		proof: RemoteLeaseRecoveryAttestation,
+	): WorkspaceRecoveryReservation {
+		const verify = () => assertRemoteLeaseRecoveryAttestation(proof, input, this.db);
+		verify();
+		return this.reserveRecoveryWithAuthority(input, undefined, verify);
+	}
+
 	/** Server-only maintenance capability. It cannot override a live execution or persistence hold. */
 	reserveMaintenance(
 		input: WorkspaceRecoveryRequest,
@@ -991,8 +1013,13 @@ export class WorkspaceWriteCoordinator {
 	private reserveRecoveryWithAuthority(
 		input: WorkspaceRecoveryRequest,
 		maintenanceAuthority?: () => void,
+		remoteTerminalAuthority?: () => void,
 	): WorkspaceRecoveryReservation {
-		const info = this.inspectRecoveryWithAuthority(input, maintenanceAuthority);
+		const info = this.inspectRecoveryWithAuthority(
+			input,
+			maintenanceAuthority,
+			remoteTerminalAuthority,
+		);
 		const scope = info.scope;
 		const recoveryRequest = Object.freeze({ scope, leaseId: info.leaseId ?? undefined });
 		this.state.recoveries ??= new Map();
@@ -1015,7 +1042,11 @@ export class WorkspaceWriteCoordinator {
 		const assertCurrent = () => {
 			if (!reservations.has(token))
 				throw fail("recovery_conflict", "Recovery reservation was released");
-			const fresh = this.inspectRecoveryWithAuthority(recoveryRequest, maintenanceAuthority);
+			const fresh = this.inspectRecoveryWithAuthority(
+				recoveryRequest,
+				maintenanceAuthority,
+				remoteTerminalAuthority,
+			);
 			if (fresh.generation !== info.generation) {
 				throw fail("recovery_conflict", "Recovery barrier changed since reservation");
 			}
@@ -1036,13 +1067,18 @@ export class WorkspaceWriteCoordinator {
 				if (!reservations.has(token))
 					throw fail("recovery_conflict", "Recovery reservation was released");
 				const result = this.transaction((tx) => {
-					const fresh = this.inspectRecoveryWithAuthority(recoveryRequest, maintenanceAuthority);
+					const fresh = this.inspectRecoveryWithAuthority(
+						recoveryRequest,
+						maintenanceAuthority,
+						remoteTerminalAuthority,
+					);
 					if (fresh.generation !== info.generation)
 						throw fail("recovery_conflict", "Recovery barrier changed since reservation");
 					const value = work(tx);
 					if (value instanceof Promise)
 						throw fail("invalid_input", "Recovery transaction callback must be synchronous");
 					maintenanceAuthority?.();
+					remoteTerminalAuthority?.();
 					if (info.lease) {
 						const recovered = tx
 							.update(durableLeases)

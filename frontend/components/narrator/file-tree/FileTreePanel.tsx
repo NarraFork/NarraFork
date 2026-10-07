@@ -13,6 +13,7 @@
  */
 
 import { Center, Text } from "@mantine/core";
+import type { FileTarget } from "@shared/file-reference";
 import { useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useFileTreeStatus } from "../../../hooks/useNarrator";
@@ -25,7 +26,7 @@ import { buildTreeLineStats } from "./tree-store";
 export interface FileTreePanelProps {
 	narratorId: string;
 	/** Open a file in the read-only viewer panel. */
-	onOpenFile: (absolutePath: string, fileName: string) => void;
+	onOpenFile: (absolutePath: string, fileName: string, target?: FileTarget) => void;
 	/** Include dotfiles. */
 	showHidden?: boolean;
 }
@@ -34,7 +35,13 @@ export function FileTreePanel({ narratorId, onOpenFile, showHidden = false }: Fi
 	const { t } = useTranslation("narrator");
 	const contextQuery = useWorkspaceContext(narratorId);
 	const context = contextQuery.data;
-	const root = context?.deviceId === "local" ? context.cwd.trim() : "";
+	const root =
+		context &&
+		(context.deviceId === "local"
+			? context.capabilities.browse?.available !== false
+			: context.capabilities.browse?.available === true)
+			? context.cwd.trim()
+			: "";
 	const treeIdentity = JSON.stringify([
 		narratorId,
 		context?.contextKey,
@@ -44,7 +51,7 @@ export function FileTreePanel({ narratorId, onOpenFile, showHidden = false }: Fi
 	]);
 	const { data: fileTreeStatus, refetch: refetchFileTreeStatus } = useFileTreeStatus(
 		narratorId,
-		!!root,
+		!!root && !!context?.git,
 		treeIdentity,
 	);
 	const lineStats = useMemo(
@@ -92,8 +99,11 @@ export function FileTreePanel({ narratorId, onOpenFile, showHidden = false }: Fi
 				<Text size="sm" c="dimmed" ta="center">
 					{contextQuery.error
 						? contextQuery.error.message
-						: context && context.deviceId !== "local"
-							? t("fileTree.remoteUnsupported")
+						: context &&
+								(context.deviceId !== "local" || context.capabilities.browse?.available === false)
+							? (context.capabilities.browse?.reason ??
+								context.capabilities.reason ??
+								t("fileTree.remoteUnsupported"))
 							: t("fileTree.noRoot")}
 				</Text>
 			</Center>
@@ -106,12 +116,18 @@ export function FileTreePanel({ narratorId, onOpenFile, showHidden = false }: Fi
 			// than patch entries that were relative to the previous root.
 			key={treeIdentity}
 			contextKey={treeIdentity}
+			narratorId={narratorId}
+			workspaceContext={context}
 			root={root}
 			showHidden={showHidden}
 			lineStats={lineStats}
 			lineStatsTruncated={fileTreeStatus?.truncated === true}
 			onRefreshLineStats={refreshLineStats}
-			onOpenFile={onOpenFile}
+			onOpenFile={(path, name) => {
+				if (!context) return;
+				const targetPath = context.pathFlavor === "windows" ? path.replaceAll("/", "\\") : path;
+				onOpenFile(targetPath, name, { deviceId: context.deviceId, path: targetPath });
+			}}
 			registerIngest={registerIngest}
 		/>
 	);

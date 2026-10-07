@@ -60,11 +60,15 @@ import {
 	DIRECTORY_BROWSER_ROOT_STYLE,
 } from "./directory-browser-modal";
 import { PathInput } from "./PathInput";
+import { TargetDirectoryBrowser } from "./TargetDirectoryBrowser";
 
 const MAX_DIRECTORY_ENTRIES = 1_000;
 const FS_SHORTCUTS_QUERY_GC_TIME_MS = 60_000;
 
 interface DirectoryPickerProps {
+	/** Remote navigation is device-qualified, without host favorites or suggestions. */
+	deviceId?: string;
+	deviceLabel?: string;
 	/** Select parent + an uncreated leaf; never mkdir or return an existing directory. */
 	mode?: "existing" | "newTarget";
 	newTargetError?: string;
@@ -83,6 +87,8 @@ interface DirectoryPickerProps {
 }
 
 export function DirectoryPicker({
+	deviceId = "local",
+	deviceLabel,
 	mode = "existing",
 	newTargetError,
 	value,
@@ -99,7 +105,8 @@ export function DirectoryPicker({
 }: DirectoryPickerProps) {
 	const { t } = useTranslation("common");
 	const fsCapability = useFileSystemCapability();
-	const browseSupported = fsCapability.browse.supported;
+	const isRemote = deviceId !== "local";
+	const browseSupported = isRemote || fsCapability.browse.supported;
 	const browseUnavailableReason = fsCapability.browse.reason ?? t("fileSystemBrowseUnavailable");
 	const [opened, { open, close }] = useDisclosure(false);
 	const [browsePath, setBrowsePath] = useState<string | undefined>(undefined);
@@ -148,20 +155,36 @@ export function DirectoryPicker({
 
 	return (
 		<>
-			<PathInput
-				label={label}
-				placeholder={placeholder}
-				description={description}
-				error={error}
-				required={required}
-				disabled={disabled}
-				value={value}
-				onChange={onChange}
-				leftSection={leftSection}
-				rightSection={rightContent}
-				rightSectionWidth={rightSectionExtra ? 64 : undefined}
-				dropdownPosition={dropdownPosition}
-			/>
+			{isRemote ? (
+				<TextInput
+					label={label}
+					placeholder={placeholder}
+					description={description}
+					error={error}
+					required={required}
+					disabled={disabled}
+					value={value}
+					onChange={(event) => onChange(event.currentTarget.value)}
+					leftSection={leftSection}
+					rightSection={rightContent}
+					rightSectionWidth={rightSectionExtra ? 64 : undefined}
+				/>
+			) : (
+				<PathInput
+					label={label}
+					placeholder={placeholder}
+					description={description}
+					error={error}
+					required={required}
+					disabled={disabled}
+					value={value}
+					onChange={onChange}
+					leftSection={leftSection}
+					rightSection={rightContent}
+					rightSectionWidth={rightSectionExtra ? 64 : undefined}
+					dropdownPosition={dropdownPosition}
+				/>
+			)}
 			<Modal
 				opened={opened}
 				onClose={close}
@@ -169,14 +192,30 @@ export function DirectoryPicker({
 				size={isWide ? 880 : "md"}
 				styles={DIRECTORY_BROWSER_MODAL_STYLES}
 			>
-				<DirectoryBrowser
-					mode={mode}
-					newTargetError={newTargetError}
-					initialPath={browsePath}
-					onSelect={handleSelect}
-					onCancel={close}
-					isWide={isWide}
-				/>
+				{isRemote ? (
+					<TargetDirectoryBrowser
+						key={deviceId}
+						mode={mode}
+						deviceLabel={deviceLabel ?? deviceId}
+						initialPath={browsePath}
+						queryKey={["deviceDirectory", deviceId]}
+						listDirectory={(path) =>
+							api.browseDevicePath(deviceId, path, { showHidden: mode === "newTarget" })
+						}
+						checkNewTarget={async (path) => !(await api.statDevicePath(deviceId, path)).exists}
+						onSelect={handleSelect}
+						onCancel={close}
+					/>
+				) : (
+					<DirectoryBrowser
+						mode={mode}
+						newTargetError={newTargetError}
+						initialPath={browsePath}
+						onSelect={handleSelect}
+						onCancel={close}
+						isWide={isWide}
+					/>
+				)}
 			</Modal>
 		</>
 	);

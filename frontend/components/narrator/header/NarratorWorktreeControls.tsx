@@ -4,6 +4,7 @@ import {
 	useWorkspaceContext,
 } from "@frontend/hooks/useWorkspaceContext";
 import { ApiError, api } from "@frontend/lib/api";
+import { formatLocaleDateTime } from "@frontend/lib/intl-format";
 import {
 	ActionIcon,
 	Alert,
@@ -110,8 +111,16 @@ function ScopedWorktreeControls({
 		original.current = { deviceId: context.deviceId, cwd: context.cwd };
 	const canSwitch = context?.capabilities.switchDirectory === true;
 	const canInspect = pendingReceipts.current.size > 0 || state.unknown || !!state.createdPath;
-	const canList = (canSwitch || canInspect) && context?.deviceId === "local" && !!context.git;
-	const disabledReason = context?.capabilities.reason ?? t("worktree.unsupported");
+	const canList =
+		(canSwitch || canInspect) &&
+		!!context?.git &&
+		(context.deviceId === "local"
+			? context.capabilities.worktree?.available !== false
+			: context.capabilities.worktree?.available === true);
+	const disabledReason =
+		context?.capabilities.worktree?.reason ??
+		context?.capabilities.reason ??
+		t("worktree.unsupported");
 	const current = useRef(context);
 	current.current = context;
 	const switcher = useRef(switchMutation.mutateAsync);
@@ -164,7 +173,7 @@ function ScopedWorktreeControls({
 					store.current?.remove(scope, id);
 				},
 				reconcile: (input) => api.reconcileNarratorWorktree(narratorId, input),
-				switch: (path) => switchTo(path, "local"),
+				switch: (path, deviceId) => switchTo(path, deviceId ?? scope.deviceId),
 				requestId: () => nanoid(),
 			},
 			(next) => {
@@ -265,7 +274,14 @@ function ScopedWorktreeControls({
 	const [sort, setSort] = useState<WorktreeSort>("lastCommitAt");
 	const [descending, setDescending] = useState(true);
 	const worktrees = useQuery({
-		queryKey: ["narratorWorktrees", narratorId, context?.git?.workspaceKey],
+		queryKey: [
+			"narratorWorktrees",
+			narratorId,
+			context?.deviceId,
+			context?.contextKey,
+			context?.revision,
+			context?.git?.workspaceKey,
+		],
 		queryFn: ({ signal }) =>
 			api.listNarratorWorktrees(narratorId, context?.git?.workspaceKey ?? "", signal),
 		enabled: canList,
@@ -282,7 +298,7 @@ function ScopedWorktreeControls({
 	const formatTime = (timestamp: number | null | undefined) =>
 		timestamp == null || !Number.isFinite(timestamp)
 			? t("worktree.unknownTime")
-			: new Date(timestamp).toLocaleString();
+			: formatLocaleDateTime(timestamp);
 	const pendingLimit = pendingReceipts.current.size >= RECEIPT_SCOPE_LIMIT;
 	const canCreate =
 		canSwitch &&
@@ -587,6 +603,7 @@ function ScopedWorktreeControls({
 									}
 								/>
 								<DirectoryPicker
+									deviceId={scope.deviceId}
 									mode="newTarget"
 									newTargetError={t("worktree.targetUnavailable")}
 									label={t("worktree.destination")}

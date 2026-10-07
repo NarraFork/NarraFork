@@ -86,7 +86,7 @@ function validateEntrypoint(input: Extract<TransactionManifestRequest, { action:
 	check(bytes.byteLength === ref.sizeBytes && hash(bytes) === ref.digest, "RAW_INTEGRITY");
 	const selector = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
 	bounded(selector);
-	keys(selector, ["version", "owner", "request", "fixedSelector", "boundary"]);
+	keys(selector, ["version", "owner", "request", "fixedSelector", "boundary"], ["recoveryAuth"]);
 	check(selector.version === 1, "SELECTOR_VERSION");
 	check(
 		equal(selector.owner, {
@@ -235,7 +235,7 @@ function validate(
 		"PLAN_HASH",
 	);
 
-	keys(selector, ["version", "owner", "request", "fixedSelector", "boundary"]);
+	keys(selector, ["version", "owner", "request", "fixedSelector", "boundary"], ["recoveryAuth"]);
 	check(selector.version === 1, "SELECTOR_VERSION");
 	check(
 		equal(selector.owner, {
@@ -433,10 +433,11 @@ function validate(
 					equal(file.desired, row?.desiredStateJson),
 				"FILE_METADATA",
 			);
-			// Filesystem grammars only. The caller's scopeIdentity() additionally binds
-			// every file to the live local backend's flavor before any target IO.
+			// Filesystem grammars only. The authorized IO provider additionally verifies
+			// source, workspace, canonical root and native fence before any target IO.
 			check(
-				file.identity.deviceId === "local" &&
+				typeof file.identity.deviceId === "string" &&
+					file.identity.deviceId.length > 0 &&
 					(file.identity.pathFlavor === "posix" || file.identity.pathFlavor === "windows") &&
 					file.identity.objectRole === "referent",
 				"UNSUPPORTED_TARGET",
@@ -448,7 +449,7 @@ function validate(
 				"fencingToken",
 			]);
 			check(
-				file.executionBinding.deviceId === "local" &&
+				file.executionBinding.deviceId === file.identity.deviceId &&
 					typeof file.executionBinding.runtimeEpoch === "string" &&
 					file.executionBinding.runtimeEpoch.length > 0,
 				"RUNTIME",

@@ -16,7 +16,7 @@ import { extname } from "node:path";
 import { z } from "zod/v4";
 import { toolSpecPathError } from "../../../spec-uri";
 import { withDeviceParam } from "../../execution/device-schema";
-import { resolveBackendPath, toolBaseCwd } from "../../execution/path-resolve";
+import { resolveBackendPath, toolExecutionCwd } from "../../execution/path-resolve";
 import { getToolBackend } from "../../execution/tool-backend";
 import { languageIdForExtension, resolveProvider, type StructDocument } from "../../structural";
 import type { ToolDefinition, ToolResult } from "../../types";
@@ -212,13 +212,13 @@ export const structViewTool: ToolDefinition = {
 		if (mode === "find") {
 			return runFind(args, {
 				backend,
-				baseCwd: toolBaseCwd(backend, ctx.cwd),
+				baseCwd: toolExecutionCwd(backend, ctx),
 				...(ctx.signal ? { signal: ctx.signal } : {}),
 			});
 		}
 		const resolvedPath =
 			ctx.executionTarget?.lexicalPath ??
-			resolveBackendPath(backend, toolBaseCwd(backend, ctx.cwd), filePath);
+			resolveBackendPath(backend, toolExecutionCwd(backend, ctx), filePath);
 		const canonicalPath = ctx.executionTarget?.canonicalPath;
 		const ioPath = canonicalPath ?? resolvedPath;
 
@@ -341,7 +341,7 @@ export const structViewTool: ToolDefinition = {
 			case "usages":
 				return runUsages(filePath, doc, resolved, args, notes, {
 					backend,
-					baseCwd: toolBaseCwd(backend, ctx.cwd),
+					baseCwd: toolExecutionCwd(backend, ctx),
 					ioPath,
 					signal: ctx.signal,
 				});

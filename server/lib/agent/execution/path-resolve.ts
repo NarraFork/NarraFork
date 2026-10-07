@@ -1,8 +1,14 @@
 /**
  * Compatibility helpers for callers that have not yet moved to backend.paths.
- * Path grammar lives on ExecutionBackend; these wrappers intentionally contain
- * no host-OS path logic.
+ * Engineering path grammar lives on ExecutionBackend. Only the explicitly local
+ * default directory uses the host resolver; remote paths never enter host path logic.
  */
+import { homedir } from "node:os";
+import { resolve } from "node:path";
+import { settings } from "@server/lib/settings";
+import { resolveStandaloneNarratorCwd } from "@server/services/standalone-narrator-cwd";
+import type { WorkspaceContext } from "@shared/workspace-context";
+import type { ToolContext } from "../types";
 import type { ExecutionBackend } from "./backend";
 
 export type { PathFlavor, TargetPathSemantics } from "./path-semantics";
@@ -15,9 +21,55 @@ export {
 	windowsPathSemantics,
 } from "./path-semantics";
 
-/** Effective base cwd for a routed tool call. */
-export function toolBaseCwd(backend: ExecutionBackend, localCwd: string): string {
-	return backend.kind === "remote" ? backend.defaultCwd || localCwd : localCwd;
+/** Pure local default resolution: selecting an endpoint must never create a directory. */
+export function localToolBaseCwd(): string {
+	return resolveStandaloneNarratorCwd(
+		{},
+		{
+			home: homedir(),
+			configuredDir: settings.paths.defaultProjectDir,
+			toAbsolute: resolve,
+			ensureDir: () => {},
+		},
+	) as string;
+}
+
+/** Same-device calls retain the selected directory; overrides never borrow another device's cwd. */
+export function toolBaseCwd(
+	backend: ExecutionBackend,
+	cwd: string,
+	workspaceContext?: WorkspaceContext,
+): string {
+	if (workspaceContext?.deviceId === backend.deviceId) {
+		if (
+			workspaceContext.pathFlavor !== backend.paths.flavor ||
+			!backend.paths.isAbsolute(workspaceContext.cwd)
+		) {
+			throw new Error(
+				"Frozen workspace path grammar or absolute directory no longer matches its backend.",
+			);
+		}
+		return workspaceContext.cwd;
+	}
+	if (backend.kind === "local") return workspaceContext ? localToolBaseCwd() : cwd;
+	if (backend.defaultCwd && backend.paths.isAbsolute(backend.defaultCwd)) return backend.defaultCwd;
+	throw new Error(
+		`Execution device "${backend.deviceId}" has no absolute default working directory; supply an absolute workdir.`,
+	);
+}
+
+/** Tools consume the admitted endpoint, not a fresh device default or a reapplied workdir. */
+export function toolExecutionCwd(
+	backend: ExecutionBackend,
+	ctx: Pick<ToolContext, "cwd" | "workspaceContext" | "executionTarget">,
+): string {
+	if (ctx.executionTarget) {
+		if (ctx.executionTarget.deviceId !== backend.deviceId) {
+			throw new Error("Tool backend does not match its frozen execution target.");
+		}
+		return ctx.executionTarget.cwd;
+	}
+	return toolBaseCwd(backend, ctx.cwd, ctx.workspaceContext);
 }
 
 /** Resolve a path using the target backend's lexical grammar. */

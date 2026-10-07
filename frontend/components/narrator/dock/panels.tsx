@@ -1082,14 +1082,16 @@ export function FileTreeDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 	}, [t, props.api]);
 
 	const handleOpenFile = useCallback(
-		(absolutePath: string, fileName: string) => {
-			// Routed through the dock's existing multi-instance file viewer rather than a
-			// viewer of our own: re-opening the same path must focus the panel that is
-			// already showing it, and that dedup lives in `openFilePanel`.
-			openFilePanel?.(absolutePath, fileName, {
+		(_absolutePath: string, fileName: string, target?: FileTarget) => {
+			// A tree row belongs to its frozen device, not the server's path namespace.
+			// Missing binding fails closed; even old local trees now provide a target.
+			if (!target) return;
+			openFilePanel?.(target.path, fileName, {
 				sourcePanelId: props.api.id,
 				fileNarratorId: narratorId,
-				deviceId: "local",
+				deviceId: target.deviceId,
+				selection: target.selection,
+				referenceOrigin: true,
 			});
 		},
 		[openFilePanel, props.api.id, narratorId],

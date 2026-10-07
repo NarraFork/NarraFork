@@ -16,7 +16,7 @@ import { toolSpecPathError } from "../../spec-uri";
 import { rethrowConfirmedToolDiskError } from "../disk-safety";
 import { readCompleteFileBytes } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
-import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
+import { resolveBackendPath, toolExecutionCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
 import { consumeBehaviorFenceEditGrant, isBehaviorFencePath } from "./behavior-fence-grant";
@@ -602,7 +602,7 @@ export const editTool: ToolDefinition = {
 		}
 
 		const backend = getToolBackend(ctx, (args as { device?: string }).device);
-		const baseCwd = toolBaseCwd(backend, ctx.cwd);
+		const baseCwd = toolExecutionCwd(backend, ctx);
 		const resolvedPath =
 			ctx.executionTarget?.lexicalPath ?? resolveBackendPath(backend, baseCwd, file_path);
 		const canonicalPath = ctx.executionTarget?.canonicalPath;

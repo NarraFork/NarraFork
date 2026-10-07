@@ -1512,7 +1512,7 @@ function normalizeOperation(input: BeginFileChangeOperation) {
 		requestDigest: input.requestDigest,
 		expectedEffectCount: input.expectedEffectCount,
 		actorSubjectKey: input.actor.subjectKey,
-		actorJson: normalizeActor(input.actor),
+		actorJson: normalizeActor(input.actor, input),
 		executionBindingJson: normalizeBinding(input.executionBinding),
 		toolCallId: nullableId(input.toolCallId),
 		toolUseId: nullableId(input.toolUseId),
@@ -1528,7 +1528,10 @@ function normalizeOperation(input: BeginFileChangeOperation) {
 	return values;
 }
 
-function normalizeActor(actor: FileChangeActor): FileChangeActor {
+function normalizeActor(
+	actor: FileChangeActor,
+	original: Pick<BeginFileChangeOperation, "ownerUserId" | "narratorId" | "projectId">,
+): FileChangeActor {
 	assertKeys(actor, [
 		"kind",
 		"subjectKey",
@@ -1537,6 +1540,8 @@ function normalizeActor(actor: FileChangeActor): FileChangeActor {
 		"label",
 		"deleted",
 		"parentSubjectKey",
+		"recoveryAuth",
+		"recoveryOrigin",
 	]);
 	if (
 		!["human", "primary", "subagent", "external_unknown"].includes(actor.kind) ||
@@ -1545,7 +1550,116 @@ function normalizeActor(actor: FileChangeActor): FileChangeActor {
 		throw fail("INVALID_INPUT", "Invalid actor snapshot");
 	assertString(actor.subjectKey, "actor subjectKey");
 	if (actor.label !== null) assertString(actor.label, "actor label", 512);
+	let recovery: Pick<FileChangeActor, "recoveryAuth" | "recoveryOrigin"> = {};
+	if (actor.recoveryAuth !== undefined || actor.recoveryOrigin !== undefined) {
+		const proof = actor.recoveryAuth;
+		const origin = actor.recoveryOrigin;
+		if (
+			!proof ||
+			!origin ||
+			actor.deleted ||
+			!original.ownerUserId ||
+			!original.narratorId ||
+			original.projectId === undefined
+		)
+			throw fail(
+				"INVALID_INPUT",
+				"Recovery authentication requires the original execution principal",
+			);
+		assertKeys(origin, ["narratorId", "projectId", "toolName"]);
+		assertString(origin.narratorId, "recovery narratorId");
+		if (
+			!("projectId" in origin) ||
+			(origin.projectId !== null && typeof origin.projectId !== "string") ||
+			origin.narratorId !== original.narratorId ||
+			nullableId(origin.projectId) !== nullableId(original.projectId) ||
+			proof.userId !== original.ownerUserId ||
+			(origin.toolName !== undefined && !["Write", "Edit", "StructSed"].includes(origin.toolName))
+		)
+			throw fail("INVALID_INPUT", "Recovery origin differs from original execution context");
+		if (
+			actor.kind === "human"
+				? actor.userId !== proof.userId || actor.subjectKey !== `human:${proof.userId}`
+				: !["primary", "subagent"].includes(actor.kind) ||
+					actor.narratorId !== origin.narratorId ||
+					actor.subjectKey !== `narrator:${origin.narratorId}`
+		)
+			throw fail("INVALID_INPUT", "Recovery actor differs from original authentication");
+		assertKeys(proof, [
+			"version",
+			"userId",
+			"issuedAtSeconds",
+			"expiresAtSeconds",
+			"authentication",
+			...(proof.authentication === "session" ? ["tokenVersion"] : ["oauth"]),
+		]);
+		if (proof.version !== 1 || !["session", "oauth"].includes(proof.authentication))
+			throw fail("INVALID_INPUT", "Unsupported recovery authentication version");
+		assertString(proof.userId, "recovery userId");
+		assertInteger(
+			proof.issuedAtSeconds,
+			"recovery issuedAtSeconds",
+			proof.authentication === "session" ? 1 : 0,
+		);
+		assertInteger(proof.expiresAtSeconds, "recovery expiresAtSeconds", proof.issuedAtSeconds + 1);
+		const common = {
+			version: 1 as const,
+			userId: proof.userId,
+			issuedAtSeconds: proof.issuedAtSeconds,
+			expiresAtSeconds: proof.expiresAtSeconds,
+		};
+		let fixed: NonNullable<FileChangeActor["recoveryAuth"]>;
+		if (proof.authentication === "session") {
+			assertInteger(proof.tokenVersion, "recovery tokenVersion");
+			fixed = { ...common, authentication: "session", tokenVersion: proof.tokenVersion };
+		} else {
+			assertKeys(proof.oauth, [
+				"tokenId",
+				"clientId",
+				"oauthClientId",
+				"grantId",
+				"refreshFamilyId",
+				"expiresAt",
+				"scopes",
+			]);
+			for (const key of ["tokenId", "clientId", "oauthClientId", "expiresAt"] as const)
+				assertString(proof.oauth[key], `recovery OAuth ${key}`);
+			if (
+				!("grantId" in proof.oauth) ||
+				!("refreshFamilyId" in proof.oauth) ||
+				(proof.oauth.grantId !== null && typeof proof.oauth.grantId !== "string") ||
+				(proof.oauth.refreshFamilyId !== null && typeof proof.oauth.refreshFamilyId !== "string") ||
+				!Array.isArray(proof.oauth.scopes) ||
+				proof.oauth.scopes.length > 128 ||
+				!Number.isFinite(Date.parse(proof.oauth.expiresAt))
+			)
+				throw fail("INVALID_INPUT", "Invalid original OAuth recovery provenance");
+			for (const scope of proof.oauth.scopes) assertString(scope, "recovery OAuth scope", 256);
+			fixed = {
+				...common,
+				authentication: "oauth",
+				oauth: {
+					tokenId: proof.oauth.tokenId,
+					clientId: proof.oauth.clientId,
+					oauthClientId: proof.oauth.oauthClientId,
+					grantId: nullableId(proof.oauth.grantId),
+					refreshFamilyId: nullableId(proof.oauth.refreshFamilyId),
+					expiresAt: proof.oauth.expiresAt,
+					scopes: [...proof.oauth.scopes],
+				},
+			};
+		}
+		recovery = {
+			recoveryAuth: fixed,
+			recoveryOrigin: {
+				narratorId: origin.narratorId,
+				projectId: origin.projectId,
+				...(origin.toolName ? { toolName: origin.toolName } : {}),
+			},
+		};
+	}
 	return {
+		...recovery,
 		kind: actor.kind,
 		subjectKey: actor.subjectKey,
 		narratorId: nullableId(actor.narratorId),

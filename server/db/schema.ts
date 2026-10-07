@@ -619,6 +619,10 @@ export const narrators = sqliteTable(
 		previousPermissionMode: text("previous_permission_mode"),
 		/** Persistent ID for the designated .narrafork/plans/plan-{id}.md file while in plan mode. */
 		planFileId: text("plan_file_id"),
+		/** Plan approval reads the original workspace, never a same-named file after a switch. */
+		planFileBinding: text("plan_file_binding", { mode: "json" }).$type<
+			import("../lib/plan-file-path").PlanFileBinding
+		>(),
 		reasoningEffort: text("reasoning_effort", {
 			enum: ["none", "low", "medium", "high", "xhigh", "max"],
 		}),
@@ -931,6 +935,33 @@ export const narrators = sqliteTable(
 		index("idx_narrators_background_parent_created")
 			.on(table.parentNarratorId, table.createdAt, table.id)
 			.where(sql`"is_background" = 1`),
+	],
+);
+
+/** Durable, actor-bound idempotency receipts for workspace selection. */
+export const workspaceSwitchRequests = sqliteTable(
+	"workspace_switch_requests",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		requestId: text("request_id").notNull(),
+		actorUserId: text("actor_user_id"),
+		requestDigest: text("request_digest").notNull(),
+		expectedRevision: integer("expected_revision").notNull(),
+		result: text("result_json", { mode: "json" })
+			.$type<import("@shared/workspace-context").SwitchWorkingDirectoryResult>()
+			.notNull(),
+		installState: text("install_state", { enum: ["pending", "installed", "superseded"] })
+			.notNull()
+			.default("pending"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_workspace_switch_request").on(table.narratorId, table.requestId),
+		index("idx_workspace_switch_request_created").on(table.createdAt),
 	],
 );
 
@@ -1972,6 +2003,13 @@ export const terminals = sqliteTable(
 		dtachSocket: text("dtach_socket"),
 		/** Remote executor device this terminal runs on. null → local server. */
 		deviceId: text("device_id"),
+		/** Owner of standalone terminals; narrator/chapter terminals retain their delegated ACL. */
+		ownerUserId: text("owner_user_id").references(() => users.id, { onDelete: "set null" }),
+		/** Frozen creation workspace; existing terminals never follow a later switch. */
+		workspaceContext: text("workspace_context", { mode: "json" }).$type<
+			import("@shared/workspace-context").WorkspaceContext
+		>(),
+		workspaceRevision: integer("workspace_revision"),
 		status: text("status", { enum: ["running", "exited"] })
 			.notNull()
 			.default("running"),
@@ -3060,17 +3098,20 @@ export const narratorWhitelistDirs = sqliteTable(
 	},
 	(table) => [
 		index("idx_whitelist_dirs_narrator").on(table.narratorId),
-		// SQLite treats NULLs as distinct in a unique index, so a single composite index
-		// on (narratorId, path, deviceScope) would silently allow duplicate NULL-scope
-		// rows for the same path. Two partial unique indexes preserve the original
-		// "one rule per path" invariant for unscoped rows while still preventing
-		// duplicate device-scoped rows for the same path.
+		// Canonical target identity, not the legacy mirror, owns rule uniqueness.
+		// Keep NULL-aware legacy constraints only for genuinely legacy rows.
 		uniqueIndex("idx_whitelist_dirs_narrator_path_unscoped")
 			.on(table.narratorId, table.path)
-			.where(sql`${table.deviceScope} is null`),
+			.where(sql`${table.targetKind} is null and ${table.deviceScope} is null`),
 		uniqueIndex("idx_whitelist_dirs_narrator_path_scoped")
 			.on(table.narratorId, table.path, table.deviceScope)
-			.where(sql`${table.deviceScope} is not null`),
+			.where(sql`${table.targetKind} is null and ${table.deviceScope} is not null`),
+		uniqueIndex("idx_whitelist_dirs_narrator_path_target_null")
+			.on(table.narratorId, table.path, table.targetKind)
+			.where(sql`${table.targetKind} is not null and ${table.targetValue} is null`),
+		uniqueIndex("idx_whitelist_dirs_narrator_path_target_value")
+			.on(table.narratorId, table.path, table.targetKind, table.targetValue)
+			.where(sql`${table.targetKind} is not null and ${table.targetValue} is not null`),
 	],
 );
 
@@ -4047,6 +4088,137 @@ export const fileChangeScopes = sqliteTable(
 		index("idx_fc_scope_root").on(table.sourceInstanceId, table.deviceId, table.canonicalRoot),
 		index("idx_fc_scope_status").on(table.status, table.updatedAt),
 		index("idx_fc_scope_active_lease").on(table.deviceId, table.activeLeaseId, table.canonicalRoot),
+	],
+);
+
+/** Metadata only. Objects remain in the executor's private, scope-qualified store. */
+export const remoteHistoryObjects = sqliteTable(
+	"remote_history_objects",
+	{
+		id: text("id").primaryKey(),
+		sourceInstanceId: text("source_instance_id").notNull(),
+		scopeId: text("scope_id").notNull(),
+		deviceId: text("device_id").notNull(),
+		workspaceInstanceId: text("workspace_instance_id").notNull(),
+		rootIdentity: text("root_identity").notNull(),
+		objectId: text("object_id").notNull(),
+		originPath: text("origin_path").notNull(),
+		kind: text("kind", { enum: ["blob", "tree"] }).notNull(),
+		algorithm: text("algorithm").notNull().default("sha256"),
+		digest: text("digest").notNull(),
+		sizeBytes: integer("size_bytes").notNull(),
+		placement: text("placement").notNull().default("remote"),
+		state: text("state", { enum: ["ready", "unavailable"] })
+			.notNull()
+			.default("ready"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_remote_history_object").on(
+			table.sourceInstanceId,
+			table.scopeId,
+			table.objectId,
+			table.kind,
+		),
+		index("idx_remote_history_object_scope").on(table.deviceId, table.scopeId),
+	],
+);
+
+/** Cross-network intents retain unknown outcomes until proven reconciled. No file bytes. */
+export const remoteHistoryReceipts = sqliteTable(
+	"remote_history_receipts",
+	{
+		id: text("id").primaryKey(),
+		sourceInstanceId: text("source_instance_id").notNull(),
+		scopeId: text("scope_id").notNull(),
+		deviceId: text("device_id").notNull(),
+		workspaceInstanceId: text("workspace_instance_id").notNull(),
+		rootIdentity: text("root_identity").notNull(),
+		operationId: text("operation_id").notNull(),
+		requestDigest: text("request_digest").notNull(),
+		intentDigest: text("intent_digest"),
+		/** Metadata projection only: every change.contentBase64 is removed by the journal adapter. */
+		intentJson: text("intent_json", { mode: "json" }).$type<
+			import("@shared/remote-history-protocol").RemoteHistoryRequest
+		>(),
+		fencingToken: integer("fencing_token").notNull(),
+		kind: text("kind", { enum: ["capture", "mutate", "restore", "compensate"] }).notNull(),
+		state: text("state", {
+			enum: [
+				"intent",
+				"applying",
+				"settled",
+				"finalized",
+				"compensated",
+				"rejected",
+				"recovery_required",
+				"unknown",
+			],
+		}).notNull(),
+		receiptJson: text("receipt_json", { mode: "json" }).$type<
+			import("@shared/remote-history-protocol").RemoteHistoryReceipt
+		>(),
+		serverCommitId: text("server_commit_id"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_remote_history_receipt").on(
+			table.sourceInstanceId,
+			table.scopeId,
+			table.operationId,
+		),
+		index("idx_remote_history_receipt_pending").on(table.deviceId, table.state, table.updatedAt),
+	],
+);
+
+/** Remote boundary receipts are source-qualified metadata, never host Git tree objects. */
+export const remoteTreeCaptures = sqliteTable(
+	"remote_tree_captures",
+	{
+		id: text("id").primaryKey(),
+		/** Immutable capture-time project identity; no FK may erase this historical source. */
+		originProjectId: text("origin_project_id"),
+		/** Version 1 records known project/null standalone; NULL means unknown legacy origin. */
+		originContextVersion: integer("origin_context_version"),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		toolCallId: text("tool_call_id")
+			.notNull()
+			.references(() => narratorToolCalls.id, { onDelete: "cascade" }),
+		attempt: integer("attempt").notNull(),
+		edge: text("edge", { enum: ["before", "after"] }).notNull(),
+		deviceId: text("device_id").notNull(),
+		contextKey: text("context_key").notNull(),
+		workspaceRevision: integer("workspace_revision").notNull(),
+		sourceInstanceId: text("source_instance_id").notNull(),
+		workspaceInstanceId: text("workspace_instance_id").notNull(),
+		scopeId: text("scope_id").notNull(),
+		rootIdentity: text("root_identity").notNull(),
+		remoteOperationId: text("remote_operation_id").notNull(),
+		requestDigest: text("request_digest").notNull(),
+		actorSubjectKey: text("actor_subject_key").notNull(),
+		state: text("state", {
+			enum: ["pending", "complete", "partial", "unknown", "failed"],
+		}).notNull(),
+		descriptorJson: text("descriptor_json", { mode: "json" }).$type<
+			import("@shared/remote-history-protocol").RemoteHistoryObject
+		>(),
+		receiptMetadataJson: text("receipt_metadata_json", { mode: "json" }).$type<
+			import("@shared/remote-history-protocol").RemoteHistoryReceipt
+		>(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_remote_tree_capture_operation").on(
+			table.sourceInstanceId,
+			table.scopeId,
+			table.remoteOperationId,
+		),
+		index("idx_remote_tree_capture_boundary").on(table.toolCallId, table.attempt, table.edge),
+		index("idx_remote_tree_capture_narrator").on(table.narratorId, table.createdAt),
 	],
 );
 
@@ -5199,12 +5371,25 @@ export const knowledgePackActivations = sqliteTable(
 			.references(() => narrators.id, { onDelete: "cascade" }),
 		// Absolute extraction dir (~/.narrafork/packs/<narratorId>/<packId>/).
 		extractDir: text("extract_dir").notNull(),
+		/** Null is a legacy host extraction, never interpreted under a later remote workspace. */
+		targetBindingJson: text("target_binding_json", { mode: "json" }).$type<{
+			version: 1;
+			workspace: import("@shared/workspace-context").WorkspaceContext;
+			extractDir: string;
+			runtimeGeneration: number;
+			actorUserId: string | null;
+			materializationState?: "complete" | "partial";
+			files: Array<{
+				relativePath: string;
+				receipt: import("@shared/workspace-attachment-protocol").WorkspaceAttachmentCreationProof;
+			}>;
+		}>(),
 		// The narrator_whitelist_dirs.id inserted for this activation, for precise removal.
 		whitelistDirId: text("whitelist_dir_id"),
 		// Archive hash at activation time — lets us detect a stale extract after the pack's
 		// archive is replaced (prompt re-activation).
 		archiveHash: text("archive_hash").notNull(),
-		status: text("status", { enum: ["active", "released"] })
+		status: text("status", { enum: ["active", "partial", "released"] })
 			.notNull()
 			.default("active"),
 		createdAt: text("created_at").notNull(),

@@ -112,6 +112,182 @@ function change(cwd: string, expectedRevision = 0) {
 	);
 }
 
+function remoteWorkspaceFixture() {
+	const directories = new Set(["/remote/default", "/remote/repo-a", "/remote/repo-b"]);
+	const backend = Object.assign(Object.create(localBackend), {
+		kind: "remote" as const,
+		deviceId: "remote-fixture",
+		defaultCwd: "/remote/default",
+		supportsGitWorkspace: false,
+		resolvePathIdentity: async (path: string) => ({
+			lexicalPath: path,
+			canonicalPath: path,
+			exists: directories.has(path),
+			runtimeGeneration: localBackend.runtimeGeneration,
+		}),
+		statFile: async (path: string) =>
+			directories.has(path)
+				? { isDirectory: true, isFile: false, size: 0, resolvedPath: path }
+				: null,
+		listDir: async () => [],
+		glob: async () => [],
+		fileExists: async () => false,
+		readFileBytes: async () => {
+			throw new Error("Unexpected host IO for remote workspace");
+		},
+	});
+	const devices = [
+		{
+			id: "remote-fixture",
+			name: "remote",
+			slug: "remote-fixture",
+			scope: "global" as const,
+			online: true,
+			defaultCwd: backend.defaultCwd,
+		},
+	];
+	const deviceSpy = spyOn(deviceConnections, "getSessionDevices").mockImplementation(
+		async (_project, actor) => (actor === owner ? devices : []),
+	);
+	setRemoteBackendResolver((deviceId) => (deviceId === backend.deviceId ? backend : null));
+	restorers.push(() => {
+		deviceSpy.mockRestore();
+		setRemoteBackendResolver(null);
+	});
+	return backend;
+}
+
+describe("selected remote workspace persistence", () => {
+	test("selected cwd survives reread, changed device defaults and conflicting legacy mirrors", async () => {
+		const backend = remoteWorkspaceFixture();
+		const request = {
+			expectedRevision: 0,
+			requestId: "selected-a",
+			target: { deviceId: backend.deviceId, cwd: "/remote/repo-a" },
+		};
+		const result = await workspaceContextService.switch(id, request, {
+			origin: "http",
+			userId: owner,
+		});
+		expect(result.current.cwd).toBe("/remote/repo-a");
+		backend.defaultCwd = "/remote/repo-b";
+		await db
+			.update(narrators)
+			.set({ cwd: join(root, "old"), defaultDeviceId: null })
+			.where(eq(narrators.id, id));
+		const restored = await workspaceContextService.get(id, { userId: owner });
+		expect(restored).toMatchObject({
+			cwd: "/remote/repo-a",
+			deviceId: backend.deviceId,
+			revision: 1,
+		});
+		const replay = await workspaceContextService.switch(id, request, {
+			origin: "http",
+			userId: owner,
+		});
+		expect(replay.current.revision).toBe(1);
+		await expect(
+			workspaceContextService.switch(
+				id,
+				{ ...request, target: { ...request.target, cwd: "/remote/repo-b" } },
+				{ origin: "http", userId: owner },
+			),
+		).rejects.toMatchObject({ code: "WORKSPACE_REQUEST_CONFLICT" });
+		setRemoteBackendResolver(null);
+		expect(await workspaceContextService.get(id, { userId: owner })).toMatchObject({
+			cwd: "/remote/repo-a",
+			deviceId: backend.deviceId,
+			availability: "offline",
+		});
+	});
+	test("unauthorized actors and nonexistent directories never replace the existing workspace", async () => {
+		const backend = remoteWorkspaceFixture();
+		const request = {
+			expectedRevision: 0,
+			requestId: "rejected",
+			target: { deviceId: backend.deviceId, cwd: "/remote/repo-a" },
+		};
+		await expect(
+			workspaceContextService.switch(id, request, { origin: "http", userId: "other-user" }),
+		).rejects.toMatchObject({ code: "WORKSPACE_ACCESS_DENIED" });
+		await expect(
+			workspaceContextService.switch(
+				id,
+				{ ...request, target: { ...request.target, cwd: "/remote/missing" } },
+				{ origin: "http", userId: owner },
+			),
+		).rejects.toThrow("does not exist");
+		expect(await workspaceContextService.get(id)).toMatchObject({
+			deviceId: "local",
+			revision: 0,
+			cwd: join(root, "old"),
+		});
+	});
+	test("same-id retry recovers a committed installation failure without a second revision", async () => {
+		const backend = remoteWorkspaceFixture();
+		const request = {
+			expectedRevision: 0,
+			requestId: "recover-selected",
+			target: { deviceId: backend.deviceId, cwd: "/remote/repo-a" },
+		};
+		const active = {
+			alive: true,
+			cwd: join(root, "old"),
+			_defaultDeviceId: null,
+			_loopRunning: false,
+			abortController: new AbortController(),
+		} as ActiveNarrator;
+		activeNarrators.set(id, active);
+		const session = await import("./narrator-session");
+		const install = spyOn(session, "updateActiveNarratorCwdAndSkillContext").mockRejectedValueOnce(
+			new Error("fixture installation failed"),
+		);
+		try {
+			await expect(
+				workspaceContextService.switch(id, request, { origin: "http", userId: owner }),
+			).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_INSTALL_FAILED" });
+			expect((await workspaceContextService.getRequest(id, request.requestId))?.installState).toBe(
+				"pending",
+			);
+			install.mockResolvedValue(undefined);
+			const recovered = await workspaceContextService.switch(id, request, {
+				origin: "http",
+				userId: owner,
+			});
+			expect(recovered.current).toMatchObject({ cwd: "/remote/repo-a", revision: 1 });
+			expect(active._workspaceInstallFailed).toBe(false);
+			expect((await workspaceContextService.getRequest(id, request.requestId))?.installState).toBe(
+				"installed",
+			);
+		} finally {
+			install.mockRestore();
+		}
+	});
+	test("creation API persists the selected remote target instead of a host or device default", async () => {
+		const backend = remoteWorkspaceFixture();
+		const router = app(owner);
+		const response = await router.request("/api/narrators", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				workspaceTarget: { deviceId: backend.deviceId, cwd: "/remote/repo-b" },
+			}),
+		});
+		expect(response.status).toBe(201);
+		const created = (await response.json()) as { id: string };
+		try {
+			const row = await db.query.narrators.findFirst({ where: eq(narrators.id, created.id) });
+			expect(row).toMatchObject({
+				cwd: "/remote/repo-b",
+				defaultDeviceId: backend.deviceId,
+				workspaceRevision: 0,
+				workspaceContext: { cwd: "/remote/repo-b", deviceId: backend.deviceId },
+			});
+		} finally {
+			await db.delete(narrators).where(eq(narrators.id, created.id));
+		}
+	});
+});
 describe("real SQLite workspace CAS", () => {
 	test("production HTTP and model device switches publish CAS identities and preserve frozen children", async () => {
 		const devices = [
@@ -131,6 +307,25 @@ describe("real SQLite workspace CAS", () => {
 						kind: "remote",
 						deviceId,
 						defaultCwd: "/remote/default",
+						supportsGitWorkspace: false,
+						resolvePathIdentity: async (path: string) => ({
+							lexicalPath: path,
+							canonicalPath: path,
+							exists: true,
+							runtimeGeneration: localBackend.runtimeGeneration,
+						}),
+						statFile: async (path: string) => ({
+							isDirectory: true,
+							isFile: false,
+							size: 0,
+							resolvedPath: path,
+						}),
+						listDir: async () => [],
+						glob: async () => [],
+						fileExists: async () => false,
+						readFileBytes: async () => {
+							throw new Error("Remote fixture must never read host bytes");
+						},
 					})
 				: null,
 		);
@@ -140,7 +335,7 @@ describe("real SQLite workspace CAS", () => {
 			cwd: initial.cwd,
 			_defaultDeviceId: null,
 			_workspaceContext: initial,
-			_loopRunning: true,
+			_loopRunning: false,
 			abortController: new AbortController(),
 		} as ActiveNarrator;
 		activeNarrators.set(id, active);
@@ -175,11 +370,11 @@ describe("real SQLite workspace CAS", () => {
 				revision: 1,
 				deviceId: "remote-fixture",
 				cwd: "/remote/default",
-				capabilities: { switchDirectory: false },
+				capabilities: { switchDirectory: true },
 			});
 			expect(remote.git).toBeUndefined();
 			expect(remote.contextKey).not.toBe(initial.contextKey);
-			expect(active._workspacePassInvalidated).toBe(true);
+			expect(active._workspacePassInvalidated).toBe(false);
 			expect(active._workspaceContext).toEqual(remote);
 			const local = await http(null);
 			expect(local).toMatchObject({ revision: 2, deviceId: "local", cwd: initial.cwd });
@@ -189,6 +384,7 @@ describe("real SQLite workspace CAS", () => {
 			] as const) {
 				// Mimic a rebuilt pass: the real SwitchDevice body calls the production hook.
 				active._workspacePassInvalidated = false;
+				active._loopRunning = true;
 				const result = await switchDeviceTool.execute({ device }, {
 					availableDevices: devices,
 					setDefaultDevice: (target) => applySessionDefaultDevice(id, active, target),
@@ -242,22 +438,36 @@ describe("real SQLite workspace CAS", () => {
 		setRemoteBackendResolver((deviceId) =>
 			Object.assign(Object.create(localBackend), { kind: "remote", deviceId, defaultCwd: "" }),
 		);
+		const deviceSpy = spyOn(deviceConnections, "getSessionDevices").mockResolvedValue([
+			{
+				id: "no-cwd",
+				name: "empty",
+				slug: "no-cwd",
+				online: true,
+				scope: "global",
+				defaultCwd: "",
+			},
+		]);
 		try {
 			await expect(
 				workspaceContextService.switchDevice(id, "no-cwd", { origin: "http" }),
-			).rejects.toThrow("default working directory");
+			).rejects.toThrow("default directory");
 			expect((await workspaceContextService.get(id)).revision).toBe(0);
-			await db.update(narrators).set({ defaultDeviceId: "offline" }).where(eq(narrators.id, id));
+			await db
+				.update(narrators)
+				.set({ defaultDeviceId: "offline", workspaceContext: null, cwd: null })
+				.where(eq(narrators.id, id));
 			setRemoteBackendResolver(null);
 			const context = await workspaceContextService.get(id);
 			expect(context.deviceId).toBe("offline");
 			expect(context.cwd).toBe("");
 			expect(context.git).toBeUndefined();
 			expect(context.capabilities).toEqual({
-				switchDirectory: false,
-				reason: "Remote device is unavailable; no local fallback",
+				switchDirectory: true,
+				reason: "Remote workspace needs initialization; no local fallback",
 			});
 		} finally {
+			deviceSpy.mockRestore();
 			setRemoteBackendResolver(null);
 		}
 	});
@@ -332,7 +542,13 @@ describe("real SQLite workspace CAS", () => {
 		const switched = await router.request(`/api/narrators/${id}/workspace-context/switch`, body);
 		expect(switched.status).toBe(200);
 		expect((await switched.json()).current.revision).toBe(1);
-		const stale = await router.request(`/api/narrators/${id}/workspace-context/switch`, body);
+		const replay = await router.request(`/api/narrators/${id}/workspace-context/switch`, body);
+		expect(replay.status).toBe(200);
+		expect((await replay.json()).current.revision).toBe(1);
+		const stale = await router.request(`/api/narrators/${id}/workspace-context/switch`, {
+			...body,
+			body: JSON.stringify({ ...request, requestId: "new-stale-request" }),
+		});
 		expect(stale.status).toBe(409);
 		const legacy = await router.request(`/api/narrators/${id}/cwd`, {
 			method: "PATCH",

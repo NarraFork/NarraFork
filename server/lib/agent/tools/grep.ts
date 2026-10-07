@@ -5,7 +5,7 @@ import { settings } from "../../settings";
 import { toolSpecPathError } from "../../spec-uri";
 import { vfsGrep } from "../../vfs-grep";
 import { withDeviceParam } from "../execution/device-schema";
-import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
+import { resolveBackendPath, toolExecutionCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
@@ -255,8 +255,11 @@ export const grepTool: ToolDefinition = {
 		}
 
 		const backend = getToolBackend(ctx, (args as { device?: string }).device);
-		const base = toolBaseCwd(backend, ctx.cwd);
-		const searchPath = resolveBackendPath(backend, base, searchPathArg ?? base);
+		const base = toolExecutionCwd(backend, ctx);
+		const searchPath =
+			ctx.executionTarget?.canonicalPath ??
+			ctx.executionTarget?.lexicalPath ??
+			resolveBackendPath(backend, base, searchPathArg ?? base);
 
 		try {
 			const grepResult = await backend.grep({

@@ -1,7 +1,7 @@
 import { z } from "zod/v4";
 import { toolSpecPathError } from "../../spec-uri";
 import { withDeviceParam } from "../execution/device-schema";
-import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
+import { resolveBackendPath, toolExecutionCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
 
@@ -71,10 +71,11 @@ export const globTool: ToolDefinition = {
 		} = args as { pattern: string; path?: string; dot?: boolean; device?: string };
 		try {
 			const backend = getToolBackend(ctx, device);
-			const base = toolBaseCwd(backend, ctx.cwd);
-			// Resolve relative paths against the backend's base cwd (device default
-			// cwd for remote, narrator cwd for local).
-			const cwd = pathArg ? resolveBackendPath(backend, base, pathArg) : base;
+			const base = toolExecutionCwd(backend, ctx);
+			const cwd =
+				ctx.executionTarget?.canonicalPath ??
+				ctx.executionTarget?.lexicalPath ??
+				(pathArg ? resolveBackendPath(backend, base, pathArg) : base);
 			const results = await backend.glob(pattern, {
 				cwd,
 				dot: dot ?? false,

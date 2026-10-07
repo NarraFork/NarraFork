@@ -9,8 +9,10 @@
 import { isAbsolute, relative } from "node:path";
 import { and, asc, eq, gte, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
-import { narratorMessageRefs, narratorMessages, narratorToolCalls } from "../db/schema";
+import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
+import type { NarratorPrincipal } from "./narrator-acl";
+import type { RevertPlannerResult } from "./revert-planner-service";
 import {
 	EMPTY_RESULT,
 	type RevertResult,
@@ -357,7 +359,16 @@ export interface ScopedRevertPreviewFile {
 	revertedContent?: string | null;
 }
 
+export interface ScopedRevertPreviewOptions {
+	withContents?: boolean;
+	/** Required for actual v2 preparation, never guessed from narrator ownership. */
+	principal?: NarratorPrincipal;
+	idempotencyKey?: string;
+	signal?: AbortSignal;
+}
+
 export interface ScopedRevertPreview {
+	plan?: RevertPlannerResult["plan"];
 	available: boolean;
 	reason?: ScopedRevertUnavailableReason;
 	files: ScopedRevertPreviewFile[];
@@ -370,8 +381,35 @@ export interface ScopedRevertPreview {
 export async function previewNarratorScopedRevert(
 	narratorId: string,
 	scope: ScopedRevertSelector,
-	_opts?: { withContents?: boolean },
+	opts?: ScopedRevertPreviewOptions,
 ): Promise<ScopedRevertPreview> {
+	if (opts?.principal) {
+		const signal = opts.signal ?? AbortSignal.timeout(60_000);
+		if (!opts.idempotencyKey)
+			throw new Error("A stable scoped preview idempotency key is required");
+		const prepared = await prepareNarratorScopedRevert(opts.principal, narratorId, scope, {
+			idempotencyKey: opts.idempotencyKey,
+			signal,
+		});
+		const { listLocalRevertPlanFiles } = await import("./revert-planner-local-access");
+		const page = await listLocalRevertPlanFiles(opts.principal, narratorId, prepared.plan.id, {
+			signal,
+			limit: 100,
+		});
+		return {
+			available: true,
+			plan: prepared.plan,
+			files: page.items.map((file) => ({
+				deviceId: file.identityJson.deviceId,
+				filePath: file.identityJson.canonicalPath,
+				relPath: file.identityJson.displayPath,
+				willBeDeleted: file.desiredStateJson.kind === "absent",
+			})),
+			totalFileCount: prepared.plan.expectedFileCount,
+			hasMore: page.hasMore,
+			conflicts: [],
+		};
+	}
 	const selection = await selectPairs(narratorId, scope, await resolveNarratorCwd(narratorId));
 	return {
 		available: selection.unavailable === "nothing_owned",
@@ -421,7 +459,7 @@ export function revertNarratorScopedForToolUses(
 export function previewNarratorScopedForToolUses(
 	narratorId: string,
 	toolUses: Array<{ messageId: string; toolUseId: string }>,
-	opts?: { withContents?: boolean },
+	opts?: ScopedRevertPreviewOptions,
 ): Promise<ScopedRevertPreview> {
 	return previewNarratorScopedRevert(narratorId, { toolUses }, opts);
 }
@@ -429,7 +467,7 @@ export function previewNarratorScopedForToolUses(
 export function previewNarratorScopedFromSeq(
 	narratorId: string,
 	minSeq: number,
-	opts?: { withContents?: boolean },
+	opts?: ScopedRevertPreviewOptions,
 ): Promise<ScopedRevertPreview> {
 	return previewNarratorScopedRevert(narratorId, { minSeq }, opts);
 }
@@ -437,7 +475,82 @@ export function previewNarratorScopedFromSeq(
 export function previewNarratorScopedForMessages(
 	narratorId: string,
 	messageIds: string[],
-	opts?: { withContents?: boolean },
+	opts?: ScopedRevertPreviewOptions,
 ): Promise<ScopedRevertPreview> {
 	return previewNarratorScopedRevert(narratorId, { messageIds }, opts);
+}
+
+/** Authenticated v2 preparation shared by local and remote record-qualified providers.
+ * Unlike legacy boundary pairs, a result contains a durable consent/hash-bound manifest. */
+export async function prepareNarratorScopedRevert(
+	principal: NarratorPrincipal,
+	narratorId: string,
+	scope: ScopedRevertSelector,
+	options: { idempotencyKey: string; signal: AbortSignal },
+): Promise<RevertPlannerResult> {
+	const { RevertPlannerLocalAccess, prepareLocalRevertPlan } = await import(
+		"./revert-planner-local-access"
+	);
+	await new RevertPlannerLocalAccess().owner(principal, narratorId, options.signal);
+	const row = db
+		.select({ version: narrators.messageVersion })
+		.from(narrators)
+		.where(eq(narrators.id, narratorId))
+		.get();
+	if (!row) throw new Error("Narrator no longer exists");
+	let selector: import("./revert-planner-service").RevertPlannerRequest["selector"];
+	if ("minSeq" in scope) selector = { kind: "from_seq", minSeq: scope.minSeq };
+	else if ("messageIds" in scope)
+		selector = { kind: "messages", messageIds: [...scope.messageIds] };
+	else {
+		if (!scope.toolUses.length || scope.toolUses.length > MAX_OPERATION_ROWS)
+			throw new Error("Scoped selection has no bounded tool identities");
+		const rows = await db
+			.select({
+				id: narratorToolCalls.id,
+				messageId: narratorToolCalls.messageId,
+				toolUseId: narratorToolCalls.toolUseId,
+			})
+			.from(narratorToolCalls)
+			.innerJoin(
+				narratorMessageRefs,
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+				),
+			)
+			.where(selectorCondition(scope))
+			.limit(MAX_OPERATION_ROWS + 1);
+		if (rows.length > MAX_OPERATION_ROWS || rows.length !== scope.toolUses.length)
+			throw new Error("Scoped selection has incomplete or ambiguous execution coverage");
+		selector = { kind: "tool_calls", toolCallIds: rows.map((tool) => tool.id) };
+	}
+	return prepareLocalRevertPlan({
+		principal,
+		narratorId,
+		expectedMessageVersion: row.version,
+		idempotencyKey: options.idempotencyKey,
+		kind: "revert",
+		revertScope: "narrator",
+		selector,
+		uiAction: "revert_files",
+		signal: options.signal,
+	});
+}
+
+/** Apply ONLY a previously prepared, explicitly consented plan; no replan/cwd fallback. */
+export async function applyNarratorScopedRevert(
+	principal: NarratorPrincipal,
+	narratorId: string,
+	input: { planId: string; planHash: string },
+	signal: AbortSignal,
+) {
+	const { applyLocalRevertPlan } = await import("./revert-planner-local-access");
+	return applyLocalRevertPlan(
+		principal,
+		narratorId,
+		input.planId,
+		{ planHash: input.planHash, action: "revert_files" },
+		signal,
+	);
 }

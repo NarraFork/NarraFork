@@ -27,7 +27,6 @@ import {
 	OPTIONAL_TOOLS,
 	REVIEW_TOOLS,
 } from "../../lib/agent/tools/index";
-import { buildAttachedFilesHint } from "../../lib/attached-files";
 import {
 	normalizeAutoContinuationMode,
 	normalizeBooleanOverride,
@@ -75,12 +74,7 @@ import {
 	usesStatefulModel,
 } from "../../lib/settings";
 import type { ImageRef, PersistedUserImageBlock, TextFileRef } from "../../lib/uploads";
-import {
-	getImagePath,
-	imageRefToContentBlock,
-	imageToBase64,
-	saveTextFileToWorktree,
-} from "../../lib/uploads";
+import { getImagePath, imageRefToContentBlock, imageToBase64 } from "../../lib/uploads";
 import { broadcastToNarrator } from "../../websocket/narrator-ws";
 import { consumeAgentMessageHistory } from "../agent-message-delivery";
 import {
@@ -192,6 +186,13 @@ import {
 	withNarratorMutationAdmission,
 } from "../narrator-session-state";
 import { clearAliasRegistry, clearTeamFileChanges } from "../narrator-subagent";
+import {
+	buildNarratorTextAttachmentHint,
+	type PersistedTextAttachment,
+	prepareNarratorTextAttachmentAccess,
+	saveAcceptedNarratorTextFiles,
+	textAttachmentBlock,
+} from "../narrator-text-attachments";
 import { generateAndSetTitle } from "../narrator-title";
 import { abandonSessionTreeSnapshots } from "../narrator-tree-snapshot-hooks";
 import { assertOAuthNarratorRuntimeActive } from "../oauth-narrator-runtime-policy";
@@ -606,7 +607,12 @@ export async function runAgentLoopUnlocked(
 				if (active._workspaceInstallFailed)
 					throw new Error("Workspace context installation requires session recovery");
 				const { workspaceContextService } = await import("../workspace-context-service");
-				active._workspaceContext = await workspaceContextService.get(narratorId);
+				active._workspaceContext = await workspaceContextService.get(narratorId, {
+					userId: active._currentUserId,
+				});
+				active.cwd = active._workspaceContext.cwd;
+				active._defaultDeviceId =
+					active._workspaceContext.deviceId === "local" ? null : active._workspaceContext.deviceId;
 				active._workspacePassInvalidated = false;
 			}
 			const oauthRuntime = await assertOAuthNarratorRuntimeActive(
@@ -620,6 +626,21 @@ export async function runAgentLoopUnlocked(
 			// The run entry froze execution authority. Neither a later parent-user change
 			// nor the author of an async answer may replace it; null stays anonymous.
 			const actingUserId = active._currentUserId ?? null;
+			active._workspaceFileAccess = undefined;
+			if (active._workspaceContext?.cwd && active._workspaceContext.availability === "ready") {
+				const { createNarratorWorkspaceFileAccess } = await import("../workspace-file-access");
+				active._workspaceFileAccess = createNarratorWorkspaceFileAccess(
+					narratorId,
+					active._workspaceContext,
+					{
+						userId: actingUserId,
+						signal: active.abortController.signal,
+						authorizationGuard: async () => {
+							await assertOAuthNarratorRuntimeActive(narratorId, actingUserId);
+						},
+					},
+				);
+			}
 			const resolvedTurnSessionDevices =
 				(await resolveSessionDevices(active._projectId ?? null, actingUserId)) ?? [];
 			let turnSessionDevices = oauthRuntime
@@ -784,6 +805,19 @@ export async function runAgentLoopUnlocked(
 					devices: turnSessionDevices,
 					defaultDeviceId: oauthRuntime?.defaultDeviceId ?? active._defaultDeviceId ?? null,
 					allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
+					workspaceContext: active._workspaceContext,
+					fileAccess: active._workspaceFileAccess,
+					planFileBinding: active._planFileBinding,
+					planFileAccess: active._planFileBinding
+						? (await import("../workspace-file-access")).createNarratorWorkspaceFileAccess(
+								narratorId,
+								active._planFileBinding.workspaceContext,
+								{
+									userId: actingUserId,
+									signal: active.abortController.signal,
+								},
+							)
+						: active._workspaceFileAccess,
 				},
 				// Same reason as in rebuildSystemPrompt: a legacy plan path cannot be rebuilt
 				// from the identity, and the reminder must name the file the gate allows.
@@ -909,7 +943,21 @@ export async function runAgentLoopUnlocked(
 						freshOAuthRuntime ? false : isPlanModeTrait(freshNarrator.traits),
 						active._planFileId,
 						settings.agent.defaultSystemPrompt,
-						undefined,
+						{
+							workspaceContext: active._workspaceContext,
+							fileAccess: active._workspaceFileAccess,
+							planFileBinding: active._planFileBinding,
+							planFileAccess: active._planFileBinding
+								? (await import("../workspace-file-access")).createNarratorWorkspaceFileAccess(
+										narratorId,
+										active._planFileBinding.workspaceContext,
+										{
+											userId: actingUserId,
+											signal: active.abortController.signal,
+										},
+									)
+								: active._workspaceFileAccess,
+						},
 						// The reminder, the Write/Edit gate and ExitPlanMode resolution must all
 						// name the SAME file. A cycle resumed from the pre-`plans/` layout keeps a
 						// legacy path in `_planFilePath` that `buildPlanFileRelPath` cannot
@@ -974,6 +1022,16 @@ export async function runAgentLoopUnlocked(
 					const prepared = pendingIdentity
 						? { ...pendingIdentity, toolCallId, toolUseId }
 						: await prepareNarratorPlanMode(narratorId, toolCallId, toolUseId, customPlanName);
+					if (!prepared.planFileBinding && active._workspaceContext) {
+						prepared.planFileBinding =
+							active._planFileBinding?.planFileId === prepared.planFileId
+								? active._planFileBinding
+								: {
+										workspaceContext: structuredClone(active._workspaceContext),
+										planFileId: prepared.planFileId,
+										planFilePath: prepared.planFilePath,
+									};
+					}
 					active._preparedPlanModes.set(toolCallId, prepared);
 					// All EnterPlanMode calls in one response share one ephemeral identity.
 					if (!active._planFileId) active._planFilePath = prepared.planFilePath;
@@ -986,6 +1044,7 @@ export async function runAgentLoopUnlocked(
 					const planState = await commitPreparedEnterPlanModeResult(narratorId, prepared, result);
 					active._planFileId = planState.planFileId;
 					active._planFilePath = planState.planFilePath;
+					active._planFileBinding = planState.planFileBinding;
 					active._previousPermissionMode = planState.previousPermissionMode;
 					// A manual toggle earlier in THIS pass may have left a live override behind.
 					// The DB now says plan mode is on, so the override has nothing left to
@@ -1029,6 +1088,7 @@ export async function runAgentLoopUnlocked(
 					active._preparedPlanModes?.clear();
 					active._planFileId = undefined;
 					active._planFilePath = undefined;
+					active._planFileBinding = undefined;
 					active._previousPermissionMode = undefined;
 					// Drop any live override from a manual toggle earlier in this pass. The DB is
 					// authoritative again from here, and this must not wait for the pass-start
@@ -1096,8 +1156,93 @@ export async function runAgentLoopUnlocked(
 				// gitTrackPathForSession decides per tool call, not per session: a
 				// mid-session cwd switch re-evaluates _isInGitRepo. Without this hook a
 				// standalone narrator's git bar never moved until a foreground refetch.
-				onGitTrack: (toolName, toolUseId, input) => {
+				onGitTrack: (toolName, toolUseId, input, target, workspace) => {
 					if (!FILE_MUTATING_TOOLS.has(toolName)) return;
+					if (target && workspace) {
+						const endpoint = structuredClone(target);
+						const original = structuredClone(workspace);
+						const userId = active._currentUserId;
+						if (!userId) return;
+						const command = typeof input?.command === "string" ? input.command : "";
+						const gitCommand =
+							toolName === SHELL_TOOL_NAME && /(?:^|[\s;&|])git(?:\s|$)/.test(command);
+						const refreshDiscovery =
+							gitCommand && /\bgit(?:\s+-[^\s]+)*\s+init(?:\s|$)/.test(command);
+						if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
+						active._gitTrackTimer = setTimeout(
+							() => {
+								active._gitTrackTimer = undefined;
+								void (async () => {
+									const current = () =>
+										active._workspaceContext?.contextKey === original.contextKey &&
+										active._workspaceContext.revision === original.revision &&
+										active._currentUserId === userId;
+									if (!current()) return;
+									const { users } = await import("../../db/schema");
+									const actor = await db.query.users.findFirst({
+										where: eq(users.id, userId),
+										columns: { role: true },
+									});
+									if (!actor || !current()) return;
+									const { getAdmittedGitTrackingSnapshot } = await import("../git-workspace-track");
+									const snapshot = await getAdmittedGitTrackingSnapshot({
+										narratorId,
+										principal: { userId, isAdmin: actor.role === "admin" },
+										endpoint,
+										workspaceContext: original,
+										refreshDiscovery,
+									});
+									if (!snapshot || !current()) return;
+									active._isInGitRepo = snapshot.workspace.state === "ready";
+									if (!snapshot.status) return;
+									const ahead =
+										endpoint.backendKind === "local" &&
+										snapshot.workspace.chapterId &&
+										active._baseBranch
+											? await gitService.getCommitsAhead(
+													snapshot.workspace.rootPath ?? endpoint.cwd,
+													active._baseBranch,
+												)
+											: endpoint.backendKind === "local"
+												? { count: 0, baseBranch: "" }
+												: undefined;
+									if (!current()) return;
+									const { files: _files, ...status } = snapshot.status;
+									broadcastToNarrator(narratorId, {
+										type: "git_status",
+										narratorId,
+										chapterId: snapshot.workspace.chapterId ?? null,
+										toolUseId,
+										deviceId: snapshot.workspace.deviceId,
+										workspaceKey: snapshot.workspace.workspaceKey,
+										repositoryKey: snapshot.workspace.repositoryKey,
+										contextKey: original.contextKey,
+										workspaceRevision: original.revision,
+										status: status as typeof snapshot.status,
+										...(ahead ? { commitsAhead: ahead.count, baseBranch: ahead.baseBranch } : {}),
+										linesAdded: snapshot.status.linesAdded,
+										linesRemoved: snapshot.status.linesRemoved,
+									});
+								})().catch((error) =>
+									logger.debug("Admitted Git tracking failed", {
+										narratorId,
+										error: String(error),
+									}),
+								);
+							},
+							gitCommand ? 0 : 800,
+						);
+						return;
+					}
+					// A remote endpoint without its original fifth-argument workspace cannot
+					// borrow the active local/remote context or invoke host Git as a fallback.
+					if (
+						target?.backendKind === "remote" ||
+						(active._workspaceContext?.deviceId &&
+							active._workspaceContext.deviceId !== LOCAL_DEVICE_ID)
+					)
+						return;
+					// Legacy events have no admitted endpoint: only the existing controlled local helper may run.
 					const chapterId = active._chapterId ?? null;
 					const worktreePath = gitTrackPathForSession(active);
 					if (!worktreePath) return;
@@ -1108,6 +1253,7 @@ export async function runAgentLoopUnlocked(
 						if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 						active._gitTrackTimer = setTimeout(() => {
 							active._gitTrackTimer = undefined;
+							if (gitTrackPathForSession(active) !== worktreePath) return;
 							// File changes just happened → invalidate then read through
 							// the shared cache so co-located narrators reuse one query.
 							invalidateStatus(worktreePath);
@@ -1118,6 +1264,7 @@ export async function runAgentLoopUnlocked(
 									: Promise.resolve({ count: 0, baseBranch: "" }),
 							]).then(
 								([gitStatus, ahead]) => {
+									if (gitTrackPathForSession(active) !== worktreePath) return;
 									// Strip files array from WS broadcast to avoid
 									// sending huge payloads when many files are changed.
 									// The Git panel fetches the full list via API.
@@ -1279,6 +1426,13 @@ export async function runAgentLoopUnlocked(
 				provider: resolved.provider,
 				cwd: active.cwd,
 				workspaceContext: passWorkspaceContext,
+				workspaceFileAccess: active._workspaceFileAccess,
+				get planFileBinding() {
+					return (
+						active._planFileBinding ??
+						active._preparedPlanModes?.values().next().value?.planFileBinding
+					);
+				},
 				assertWorkspaceCurrent: passWorkspaceContext
 					? () => {
 							if (
@@ -2847,23 +3001,28 @@ export async function runAgentLoopUnlocked(
 						}
 						break;
 					}
-					// Save buffered text files to worktree
-					const savedBufferedTextFiles: TextFileRef[] = [];
+					// The claimed human input's actor, not the previous pass actor, owns these writes.
+					let savedBufferedTextFiles: TextFileRef[] = [];
 					if (buffered.textFiles?.length) {
-						for (const file of buffered.textFiles) {
-							savedBufferedTextFiles.push(await saveTextFileToWorktree(active.cwd, file));
-						}
+						const attachmentAccess = await prepareNarratorTextAttachmentAccess(narratorId, {
+							userId: buffered.createdBy,
+							workspaceContext: active._workspaceContext,
+							signal: active.abortController.signal,
+							authorizationGuard: async () => {
+								if (!owner.isCurrent()) throw new Error("Buffered attachment owner changed");
+							},
+						});
+						savedBufferedTextFiles = await saveAcceptedNarratorTextFiles(
+							narratorId,
+							buffered.textFiles,
+							attachmentAccess,
+						);
 					}
 					const persistBlocks: Array<
 						| { type: "text"; text: string }
 						| PersistedUserImageBlock
 						| FileReferenceSnapshot
-						| {
-								type: "text_file";
-								filename: string;
-								size: number;
-								filePath: string;
-						  }
+						| PersistedTextAttachment
 					> = [];
 					if (buffered.images?.length) {
 						for (const img of buffered.images) {
@@ -2872,16 +3031,11 @@ export async function runAgentLoopUnlocked(
 					}
 					if (savedBufferedTextFiles.length > 0) {
 						for (const tf of savedBufferedTextFiles) {
-							persistBlocks.push({
-								type: "text_file",
-								filename: tf.filename,
-								size: tf.size,
-								filePath: tf.filePath,
-							});
+							persistBlocks.push(textAttachmentBlock(tf));
 						}
 					}
 					const effectiveBufferedText =
-						buffered.text + buildAttachedFilesHint(savedBufferedTextFiles);
+						buffered.text + buildNarratorTextAttachmentHint(savedBufferedTextFiles);
 					// Resolve spill-backed getters while the claim still leases staging files.
 					// Both values are needed after persistence permits staging cleanup.
 					const fileReferences = buffered.fileReferences;

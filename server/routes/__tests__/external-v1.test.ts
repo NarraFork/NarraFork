@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1648,6 +1648,51 @@ describe("External v1 narrator failure visibility", () => {
 			deviceId: device.body.device.id,
 		});
 		const narratorId = provisioned.body.narrator.id;
+		// Session activation now binds a real remote directory. A locale test must
+		// supply an online executor, not accidentally depend on the old host cwd.
+		const connections = await import("../../services/device-connection-service");
+		const { localBackend, setRemoteBackendResolver } = await import(
+			"../../lib/agent/execution/registry"
+		);
+		const remoteId = device.body.device.id;
+		const deviceSpy = spyOn(connections, "getSessionDevices").mockResolvedValue([
+			{
+				id: remoteId,
+				name: "locale executor",
+				slug: "locale-executor",
+				scope: "project",
+				online: true,
+				defaultCwd: "/remote/locale",
+			},
+		]);
+		setRemoteBackendResolver((id) =>
+			id === remoteId
+				? Object.assign(Object.create(localBackend), {
+						kind: "remote",
+						deviceId: remoteId,
+						defaultCwd: "/remote/locale",
+						supportsGitWorkspace: false,
+						resolvePathIdentity: async (path: string) => ({
+							lexicalPath: path,
+							canonicalPath: path,
+							exists: true,
+							runtimeGeneration: localBackend.runtimeGeneration,
+						}),
+						statFile: async (path: string) => ({
+							isDirectory: true,
+							isFile: false,
+							size: 0,
+							resolvedPath: path,
+						}),
+						listDir: async () => [],
+						glob: async () => [],
+						fileExists: async () => false,
+						readFileBytes: async () => {
+							throw new Error("Locale fixture cannot access host filesystem bytes");
+						},
+					})
+				: null,
+		);
 
 		// A provisioned narrator follows the instance default model, and accepting a
 		// message spins up its session — which resolves that model. There is no
@@ -1663,7 +1708,9 @@ describe("External v1 narrator failure visibility", () => {
 				headers: jsonHeaders(token),
 				body: JSON.stringify({ message: "查一下导航日志", locale: "zh-CN" }),
 			});
-			expect(accepted.status).toBe(202);
+			expect({ status: accepted.status, body: await accepted.clone().json() }).toMatchObject({
+				status: 202,
+			});
 
 			const rejected = await app.request(`/api/external/v1/narrators/${narratorId}/messages`, {
 				method: "POST",
@@ -1673,10 +1720,102 @@ describe("External v1 narrator failure visibility", () => {
 			expect(rejected.status).toBe(400);
 		} finally {
 			settings.agent.defaultModel = previousDefaultModel;
+			deviceSpy.mockRestore();
+			setRemoteBackendResolver(null);
 		}
 	});
 });
 
+describe("External v1 selected remote workspaces", () => {
+	test("binds a selected cwd and makes that target part of provisioning idempotency", async () => {
+		const projectId = await createProject("workspace-target");
+		const client = await createClient("workspace-target", {
+			deviceAccess: { host: "denied", global: "denied", selfRegistered: "readOnly" },
+		});
+		const grant = await createGrant({ client, label: "workspace-target", projectIds: [projectId] });
+		const token = await oauthToken(grant);
+		const device = await provisionDevice(token, "workspace-target-device", { projectId });
+		const deviceId = device.body.device.id;
+		const connections = await import("../../services/device-connection-service");
+		const { localBackend, setRemoteBackendResolver } = await import(
+			"../../lib/agent/execution/registry"
+		);
+		const devices = spyOn(connections, "getSessionDevices").mockResolvedValue([
+			{
+				id: deviceId,
+				name: "workspace",
+				slug: "workspace",
+				scope: "project",
+				online: true,
+				defaultCwd: "/remote/default",
+			},
+		]);
+		setRemoteBackendResolver((id) =>
+			id === deviceId
+				? Object.assign(Object.create(localBackend), {
+						kind: "remote",
+						deviceId,
+						defaultCwd: "/remote/default",
+						supportsGitWorkspace: false,
+						resolvePathIdentity: async (path: string) => ({
+							lexicalPath: path,
+							canonicalPath: path,
+							exists: true,
+							runtimeGeneration: localBackend.runtimeGeneration,
+						}),
+						statFile: async (path: string) => ({
+							isDirectory: true,
+							isFile: false,
+							size: 0,
+							resolvedPath: path,
+						}),
+					})
+				: null,
+		);
+		try {
+			const request = {
+				projectId,
+				deviceId,
+				workspaceTarget: { deviceId, cwd: "/remote/selected" },
+			};
+			const created = await provisionNarrator(token, "selected-workspace", request);
+			expect({ status: created.response.status, body: created.body }).toMatchObject({
+				status: 201,
+				body: { narrator: { workspaceTarget: request.workspaceTarget } },
+			});
+			const row = await db.query.narrators.findFirst({
+				where: drizzle.eq(schema.narrators.id, created.body.narrator.id),
+			});
+			expect(row).toMatchObject({
+				cwd: "/remote/selected",
+				defaultDeviceId: deviceId,
+				workspaceContext: { cwd: "/remote/selected", deviceId },
+			});
+			expect((await provisionNarrator(token, "selected-workspace", request)).response.status).toBe(
+				200,
+			);
+			expect(
+				(
+					await provisionNarrator(token, "selected-workspace", {
+						...request,
+						workspaceTarget: { deviceId, cwd: "/remote/other" },
+					})
+				).response.status,
+			).toBe(409);
+			expect(
+				(
+					await provisionNarrator(token, "wrong-workspace-device", {
+						...request,
+						workspaceTarget: { deviceId: "different-device", cwd: "/remote/selected" },
+					})
+				).response.status,
+			).toBe(400);
+		} finally {
+			devices.mockRestore();
+			setRemoteBackendResolver(null);
+		}
+	});
+});
 describe("External v1 narrator messages", () => {
 	test("uses bounded cursor pagination and never returns raw tool payloads", async () => {
 		const projectId = await createProject("messages");

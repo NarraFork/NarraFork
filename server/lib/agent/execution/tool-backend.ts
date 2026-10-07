@@ -24,7 +24,10 @@ export function getToolBackend(ctx: ToolContext, device?: string): ExecutionBack
 		return resolveBackend({ requested: frozenDevice });
 	}
 
-	return resolveBackend({ requested: device, sessionDefault: ctx.defaultDeviceId });
+	return resolveBackend({
+		requested: device,
+		sessionDefault: ctx.workspaceContext?.deviceId ?? ctx.defaultDeviceId,
+	});
 }
 
 /** True when the resolved backend is not the local server backend. */

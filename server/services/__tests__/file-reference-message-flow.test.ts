@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import type { FileReferenceSnapshot } from "@shared/file-reference";
@@ -76,6 +76,8 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 
 	mock.module("../../db", () => ({
 		sqlite,
+		activeDatabaseBackend: "sqlite",
+		postgresRuntime: null,
 		db: new Proxy(fixtureDb, {
 			get(target, key, receiver) {
 				if (key === "query")
@@ -87,6 +89,20 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 								variant: "primary",
 								status: "idle",
 								substatus: [],
+								traits: [],
+								cwd: import.meta.dir,
+								defaultDeviceId: null,
+								chapterId: null,
+								contextProjectId: null,
+								workspaceRevision: 0,
+								workspaceContext: {
+									revision: 0,
+									deviceId: "local",
+									cwd: import.meta.dir,
+									pathFlavor: "posix",
+									contextKey: "message-flow-fixture",
+									capabilities: { switchDirectory: true },
+								},
 							}),
 						},
 						narratorMessageRefs: {
@@ -445,7 +461,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 			expect(current.prompt).toContain(snapshot().snapshotText);
 			expect(current.initialHistory).toContainEqual({
 				role: "system",
-				content: "standing reminder",
+				content: '<sender kind="system" />\nstanding reminder',
 			});
 			expect(getFileReferenceSnapshots(allMessages()[0].contentJson)).toEqual([snapshot()]);
 		});
@@ -488,6 +504,126 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 	});
 
 	describe("subagent's existing queue", () => {
+		test("PG consume serialization preserves original attachment proof/source via the real shared helper", async () => {
+			// Only the outer DAL selector and an already-saved attachment projection
+			// are substituted. The PG consume branch and shared serializer are real;
+			// this is not a native proof validation or a PostgreSQL database test.
+			const refs = await import("../narrator-refs/store");
+			const uploads = await import("../../lib/uploads");
+			const originalWorkspace = {
+				revision: 4,
+				deviceId: "original-device",
+				cwd: "/original-root",
+				pathFlavor: "posix" as const,
+				contextKey: "original-context",
+				capabilities: { switchDirectory: true },
+			};
+			const proof = {
+				version: 1 as const,
+				state: "committed" as const,
+				binding: {
+					sourceInstanceId: "original-native-source",
+					workspaceInstanceId: "original-workspace",
+					scopeId: "original-scope",
+					root: "/original-root",
+					rootIdentity: "original-inode",
+					fence: 3,
+				},
+				operationId: "original-operation",
+				requestDigest: "a".repeat(64),
+				path: ".attachments/data.txt",
+				sizeBytes: 5,
+				digest: "b".repeat(64),
+				incarnation: "original-incarnation",
+				creationProof: "original-private-proof",
+				nativeMetadataDigest: "c".repeat(64),
+				createdAt: "2026-01-01T00:00:00.000Z",
+			};
+			const saved = {
+				filename: "data.txt",
+				size: 5,
+				filePath: "/original-root/.attachments/data.txt",
+				deviceId: "original-device",
+				contextKey: "original-context",
+				attachmentId: "original-attachment",
+				attachmentWorkspace: originalWorkspace,
+				attachmentCreationProof: proof,
+				sourceNarratorId: "original-source-narrator",
+				cleanupUnavailableReason: "retain original evidence",
+			};
+			const selector = spyOn(refs, "getNarratorMessageRefsPort").mockReturnValue({} as never);
+			const publisher = spyOn(uploads, "saveTextFileToWorktree").mockResolvedValue(saved);
+			const inbox = await import("../agent-runtime/inbox");
+			const placement = spyOn(inbox, "materializeClaimedInboxUserMessage").mockImplementation(
+				async (input) => {
+					let row: DbMessage | undefined;
+					mailboxStore.materialize(input.claim, (tx, claim) => {
+						row = saveRow({
+							id: claim.recipientMessageId as string,
+							narratorId: input.narratorId,
+							role: "user",
+							contentText: input.text,
+							contentJson: input.contentBlocks,
+							parentToolUseId: input.parentToolUseId ?? null,
+							messageUuid: null,
+						});
+						if (!row) throw new Error("Fixture placement did not create a message row");
+						tx.insert(schema.narratorMessages)
+							.values({
+								id: row.id,
+								narratorId: input.narratorId,
+								role: "user",
+								contentText: input.text,
+								contentJson: input.contentBlocks,
+								parentToolUseId: input.parentToolUseId ?? null,
+								createdAt: new Date().toISOString(),
+							})
+							.run();
+						const refId = `ref-${row.id}`;
+						tx.insert(schema.narratorMessageRefs)
+							.values({ id: refId, narratorId: input.narratorId, messageId: row.id, seq: ++idSeq })
+							.run();
+						return { messageId: row.id, refId };
+					});
+					return { ...row, creator: null, seq: 1 } as never;
+				},
+			);
+			try {
+				await subagent.pushSubagentBufferedMessage("child", "inspect", {
+					textFiles: [new File(["bytes"], "data.txt")],
+					createdBy: "original-actor",
+				});
+				const consumed = await subagent.consumeNextBufferedSubagentMessage({
+					narratorId: "child",
+					parentNarratorId: "n",
+					toolUseId: "origin",
+					model: "model",
+					provider: "refs",
+					cwd: import.meta.dir,
+				});
+				expect(consumed).not.toBeNull();
+				const block = allMessages()
+					.flatMap((message) => message.contentJson ?? [])
+					.find(
+						(value: unknown) =>
+							!!value &&
+							typeof value === "object" &&
+							(value as { type?: string }).type === "text_file",
+					);
+				expect(block).toMatchObject({ type: "text_file", ...saved });
+				expect((block as { attachmentCreationProof: unknown }).attachmentCreationProof).toEqual(
+					proof,
+				);
+				expect((block as { attachmentWorkspace: unknown }).attachmentWorkspace).toEqual(
+					originalWorkspace,
+				);
+			} finally {
+				selector.mockRestore();
+				publisher.mockRestore();
+				placement.mockRestore();
+			}
+		});
+
 		test("official queue consumption before sys includes accepted bytes exactly once", async () => {
 			includeTrailingSys = true;
 			settings.anthropicProviders = (settings.anthropicProviders ?? []).map((provider) => ({
@@ -507,7 +643,10 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 			});
 			expect(JSON.stringify(consumed?.history)).not.toContain(snapshot().snapshotText);
 			expect(consumed?.prompt.split(snapshot().snapshotText)).toHaveLength(2);
-			expect(consumed?.history).toContainEqual({ role: "system", content: "standing reminder" });
+			expect(consumed?.history).toContainEqual({
+				role: "system",
+				content: '<sender kind="system" />\nstanding reminder',
+			});
 			expect(getFileReferenceSnapshots(allMessages()[0].contentJson)).toEqual([snapshot()]);
 		});
 

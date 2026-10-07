@@ -23,12 +23,22 @@ export interface CreateEditorDocumentInput {
 export interface EditorDocumentDescriptor {
 	docId: string;
 	target: FileTarget;
+	/** Reopening an expired remote document must prove the same original root and revision. */
+	workspace?: {
+		revision: number;
+		contextKey: string;
+		cwd: string;
+		rootIdentity: string;
+	};
 	versionHandle: string;
 	baseHash: string;
 	encoding: string;
 	eol: "LF" | "CRLF" | "CR";
 	sourceBytes: number;
 	utf8Bytes: number;
+	/** Actual adapter capability; read-only previews must not advertise a save path. */
+	editable?: boolean;
+	readOnlyReason?: string;
 }
 
 export interface CreateEditorUploadInput {

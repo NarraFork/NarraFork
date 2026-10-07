@@ -98,6 +98,11 @@ export function beginBashCaptureWindow(
 
 export interface TreeSnapshotSession {
 	cwd: string;
+	/** Frozen pass identity used only by the remote execution adapter. */
+	_workspaceContext?: import("@shared/workspace-context").WorkspaceContext;
+	_currentUserId?: string | null;
+	_projectId?: string;
+	abortController?: AbortController;
 	/** Execution device for the session; only local workspaces can be snapshotted. */
 	_defaultDeviceId?: string | null;
 	/** Staged pre-execution hashes, keyed by toolUseId. */

@@ -750,6 +750,7 @@ export const narratorsApi = {
 		behaviorFenceIntervalOverride?: number | null;
 		behaviorFenceAttachOverride?: "inherit" | "on" | "off";
 		cwd?: string;
+		workspaceTarget?: { deviceId: string; cwd: string };
 		makeNamed?: boolean;
 		handle?: string;
 		kind?: "knowledge" | "setup";

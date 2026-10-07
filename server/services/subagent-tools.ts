@@ -92,6 +92,15 @@ export async function buildSubagentSystemPrompt(
 	customPrompt?: string | null,
 	canReportToParent = false,
 	runtimePolicy?: RuntimePolicy,
+	workspaceOptions?: Pick<
+		import("./narrator-prompt").BuildPromptOptions,
+		| "workspaceContext"
+		| "backend"
+		| "fileAccess"
+		| "devices"
+		| "defaultDeviceId"
+		| "allowLocalExecution"
+	>,
 ): Promise<string> {
 	// Try built-in prompt first
 	let basePrompt = getSubagentPrompt(subagentType, locale);
@@ -132,6 +141,7 @@ export async function buildSubagentSystemPrompt(
 		cwd,
 		locale,
 		contextSummary,
+		...workspaceOptions,
 	});
 	return prompt ?? basePrompt;
 }

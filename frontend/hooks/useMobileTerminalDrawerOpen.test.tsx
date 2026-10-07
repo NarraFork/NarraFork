@@ -131,7 +131,22 @@ test("real mutation keeps its action identity while requests follow the latest n
 	const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
 	const { api } = await import("../lib/api");
 	const { useCreateNarratorTerminal } = await import("./useTerminals");
-	const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+	const client = new QueryClient({
+		defaultOptions: { queries: { retry: false, staleTime: Infinity }, mutations: { retry: false } },
+	});
+	for (const [id, revision] of [
+		["first-narrator", 10],
+		["second-narrator", 11],
+	] as const) {
+		client.setQueryData(["workspaceContext", id], {
+			revision,
+			contextKey: `context:${id}`,
+			deviceId: "remote-fixture",
+			cwd: `/selected/${id}`,
+			pathFlavor: "posix",
+			capabilities: { switchDirectory: true, terminal: { available: true } },
+		});
+	}
 	const request = spyOn(api, "createTerminal").mockResolvedValue({ id: "test-terminal" });
 	let action: ReturnType<typeof useCreateNarratorTerminal>["mutate"] | undefined;
 	function RealRoute({ narratorId }: { narratorId: string }) {
@@ -165,7 +180,12 @@ test("real mutation keeps its action identity while requests follow the latest n
 			await new Promise((resolve) => setTimeout(resolve, 0));
 		});
 		expect(request).toHaveBeenCalledTimes(1);
-		expect(request).toHaveBeenCalledWith({ narratorId: "second-narrator", name: "Terminal 1" });
+		expect(request).toHaveBeenCalledWith({
+			narratorId: "second-narrator",
+			name: "Terminal 1",
+			expectedRevision: 11,
+			contextKey: "context:second-narrator",
+		});
 		expect(calls).toEqual(["open"]);
 	} finally {
 		request.mockRestore();

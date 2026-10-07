@@ -10,7 +10,26 @@ mock.module("../../../../db", () => ({ db: new Proxy({}, { get: databaseAccess }
 const scope = mock(() => {
 	throw new Error("Unexpected physical write scope");
 });
-mock.module("../../../../services/file-change-runtime", () => ({ executeLocalFileChange: scope }));
+mock.module("../../../../services/file-change-runtime", () => ({
+	executeLocalFileChange: scope,
+	FileNoDispatchEvidenceError: class extends Error {},
+	withFileToolNoDispatch:
+		(
+			_toolName: string,
+			body: (
+				args: Record<string, unknown>,
+				ctx: ToolContext,
+				control: { writing(): void; declined(): void; preview(): void; suppressEvidence(): void },
+			) => Promise<unknown>,
+		) =>
+		(args: Record<string, unknown>, ctx: ToolContext) =>
+			body(args, ctx, {
+				writing() {},
+				declined() {},
+				preview() {},
+				suppressEvidence() {},
+			}),
+}));
 mock.module("../../../../services/file-snapshot-service", () => ({ ensureFileSnapshot: scope }));
 mock.module("../../../../services/spec-broadcast", () => ({
 	broadcastSpecChanged: mock(() => {}),

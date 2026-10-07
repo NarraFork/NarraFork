@@ -26,7 +26,11 @@ import {
 } from "./narrator-session-state";
 import type { RevertScope, RevertWarning } from "./snapshot-revert";
 import { establishSubagentExecutionSegment } from "./subagent-execution-boundary";
-import { consumeNextBufferedSubagentMessage, loadSubagentHistory } from "./subagent-executor";
+import {
+	consumeNextBufferedSubagentMessage,
+	createSubagentWorkspaceAttachmentAccess,
+	loadSubagentHistory,
+} from "./subagent-executor";
 import {
 	claimManualOverride,
 	getManualOverrideRuntime,
@@ -43,6 +47,7 @@ import {
 	type SubagentUpdateExecutionLease,
 	startContinuedSubagent,
 } from "./subagent-runner";
+import { workspaceContextService } from "./workspace-context-service";
 
 export type SubagentResumeIntent =
 	| "follow_up"
@@ -188,6 +193,12 @@ function extractPromptText(contentText: string | null | undefined): string {
 
 async function prepareResumeTurn(input: ResumeSubagentInput) {
 	const narrator = await narratorService.getById(input.subagentId);
+	const workspaceContext =
+		narrator.workspaceContext?.revision === narrator.workspaceRevision && narrator.workspaceContext
+			? structuredClone(narrator.workspaceContext)
+			: await workspaceContextService.get(input.subagentId, {
+					userId: input.executionPrincipal ? input.executionPrincipal.userId : input.createdBy,
+				});
 	const { model: effectiveModel } = await resolveSubagentModelForRun(
 		narrator,
 		input.executionPrincipal ? input.executionPrincipal.userId : (input.createdBy ?? null),
@@ -265,6 +276,7 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 
 	return {
 		narrator,
+		workspaceContext,
 		effectiveModel,
 		provider,
 		prompt,
@@ -714,7 +726,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 					toolUseId: originToolUseId,
 					model: prepared.effectiveModel,
 					provider: prepared.provider,
-					cwd: prepared.narrator.cwd ?? ".",
+					cwd: prepared.workspaceContext.cwd,
 					locale: input.locale,
 				});
 				if (!queued) throw new ValidationError("Mailbox head is not available for this wake");
@@ -763,8 +775,18 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 				if (prepared.persistPrompt) {
 					const { saveTextFileToWorktree } = await import("../lib/uploads");
 					const savedTextFiles = [];
+					const attachmentAccess = input.textFiles?.length
+						? createSubagentWorkspaceAttachmentAccess(input.subagentId, prepared.workspaceContext, {
+								userId: input.executionPrincipal
+									? input.executionPrincipal.userId
+									: input.createdBy,
+								signal: input.signal,
+							})
+						: undefined;
 					for (const file of input.textFiles ?? []) {
-						savedTextFiles.push(await saveTextFileToWorktree(prepared.narrator.cwd ?? ".", file));
+						savedTextFiles.push(
+							await saveTextFileToWorktree(prepared.workspaceContext.cwd, file, attachmentAccess),
+						);
 					}
 					userMessage = await narratorService.persistSubagentUserMessage(
 						input.subagentId,

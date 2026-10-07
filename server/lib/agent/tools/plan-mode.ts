@@ -1,6 +1,7 @@
 import { z } from "zod/v4";
 import { PLAN_DIR_REL } from "../../plan-file-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../../prompt-i18n";
+import { targetPathSemantics } from "../execution/path-semantics";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 
 const DISABLE_REFLECTION_REVIEW_DESCRIPTION =
@@ -122,8 +123,13 @@ export const enterPlanModeTool: ToolDefinition = {
 		// Session layer injects the designated path; keep the receipt as a
 		// compact reminder rather than restating the tool description.
 		if (planFilePath) {
+			const source = ctx.planFileBinding?.workspaceContext ?? ctx.workspaceContext;
 			return {
-				output: getToolMessageWithParams("enterPlanModeOutputWithPath", locale, { planFilePath }),
+				output:
+					getToolMessageWithParams("enterPlanModeOutputWithPath", locale, { planFilePath }) +
+					(source
+						? `\nPlan cycle source: device=${source.deviceId}, cwd=${source.cwd}. This source remains bound if the session workspace changes.`
+						: ""),
 			};
 		}
 
@@ -330,6 +336,7 @@ export const exitPlanModeTool: ToolDefinition = {
 	executionRouting: {
 		kind: "single",
 		resolve(input, config) {
+			const binding = config.planFileBinding;
 			const path =
 				config.relaxedPlan === true &&
 				typeof input.plan_file_path === "string" &&
@@ -337,12 +344,23 @@ export const exitPlanModeTool: ToolDefinition = {
 					? input.plan_file_path.trim()
 					: typeof input._planFile === "string" && input._planFile.trim()
 						? input._planFile.trim()
-						: config.planFilePath;
+						: (binding?.planFilePath ?? config.planFilePath);
+			const boundPath =
+				binding && path
+					? targetPathSemantics(binding.workspaceContext.pathFlavor).resolve(
+							binding.workspaceContext.cwd,
+							path,
+						)
+					: path;
 			return {
 				key: "primary",
 				operation: path ? "read" : "control",
-				...(typeof input.device === "string" ? { deviceId: input.device } : {}),
-				...(path ? { path } : {}),
+				...(binding
+					? { deviceId: binding.workspaceContext.deviceId, workdir: binding.workspaceContext.cwd }
+					: typeof input.device === "string"
+						? { deviceId: input.device }
+						: {}),
+				...(boundPath ? { path: boundPath } : {}),
 				...(path?.startsWith("spec://") ? { hostOnly: true, pathFlavor: "spec" as const } : {}),
 			};
 		},

@@ -13,6 +13,8 @@ export interface GitWorkspace {
 	repositoryKey: string | null;
 	deviceId: string;
 	cwd: string;
+	contextKey?: string;
+	workspaceRevision?: number;
 	rootPath: string | null;
 	state: GitWorkspaceState;
 	/** Lightweight cached HEAD label; never used to authorize Git operations. */

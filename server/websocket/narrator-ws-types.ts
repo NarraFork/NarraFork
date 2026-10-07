@@ -760,6 +760,12 @@ export type NarratorServerMessage =
 	| {
 			type: "git_status";
 			narratorId: string;
+			/** Original execution/workspace identity; omitted only by legacy producers. */
+			deviceId?: string;
+			workspaceKey?: string | null;
+			repositoryKey?: string | null;
+			contextKey?: string;
+			workspaceRevision?: number;
 			/** Null for chapter-less narrators, whose tools still touch a local Git repo. */
 			chapterId: string | null;
 			toolUseId: string;

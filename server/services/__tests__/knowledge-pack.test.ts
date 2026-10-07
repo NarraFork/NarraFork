@@ -17,10 +17,18 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { eq } from "drizzle-orm";
 import { db } from "../../db";
-import { narrators, users } from "../../db/schema";
+import { knowledgePacks, narratorBlacklistDirs, narrators, users } from "../../db/schema";
+import type { ToolContext } from "../../lib/agent/types";
 import { generateId } from "../../lib/id";
-import { packActivationService } from "../knowledge-pack-activation-service";
+import { packArchivePath } from "../../lib/pack-archives";
+import { executionPolicyEngine } from "../execution-policy/engine";
+import {
+	createPublishedPackSourceAccess,
+	packActivationService,
+	stagePublishedPack,
+} from "../knowledge-pack-activation-service";
 import { knowledgePackService } from "../knowledge-pack-service";
 
 const TAG = Date.now();
@@ -88,6 +96,86 @@ beforeAll(async () => {
 	});
 	narratorId = generateId();
 	await db.insert(narrators).values({ id: narratorId, createdAt: now, updatedAt: now });
+});
+
+describe("published pack source staging", () => {
+	const context = () =>
+		({
+			narratorId,
+			userId,
+			signal: AbortSignal.timeout(60_000),
+			recheckAuthorization: async () => {},
+			assertWorkspaceCurrent: () => {},
+		}) as unknown as ToolContext;
+	test("real archive staging is bounded and gives no host whitelist; source version drift refuses later reads", async () => {
+		const archive = await fileFromPath(
+			buildTarGz("published-source", { "a.txt": "data", "sub/b.txt": "other" }),
+			"published-source.tar.gz",
+		);
+		const pack = await knowledgePackService.createPack({
+			name: `Published Pack ${TAG}`,
+			archive,
+			ownerUserId: userId,
+		});
+		const staged = await stagePublishedPack(context(), pack);
+		try {
+			expect(staged.files.map((file) => file.relativePath).sort()).toEqual(["a.txt", "sub/b.txt"]);
+			expect(
+				await db.query.narratorWhitelistDirs.findFirst({
+					where: (table, { eq }) => eq(table.path, staged.root),
+				}),
+			).toBeUndefined();
+			await db
+				.update(knowledgePacks)
+				.set({ archiveHash: "changed" })
+				.where(eq(knowledgePacks.id, pack.id));
+			await expect(
+				staged.access.authorizeRead?.(
+					staged.files[0].path,
+					staged.access.backend,
+					context().signal,
+				),
+			).rejects.toThrow("version changed");
+		} finally {
+			await staged.dispose();
+		}
+		expect(existsSync(staged.root)).toBe(false);
+	});
+	test("real host deny prevents archive read before staging; unknown actor cannot borrow an owner", async () => {
+		const archive = await fileFromPath(
+			buildTarGz("published-denied", { "a.txt": "data" }),
+			"published-denied.tar.gz",
+		);
+		const pack = await knowledgePackService.createPack({
+			name: `Denied Pack ${TAG}`,
+			archive,
+			ownerUserId: userId,
+		});
+		const denyId = generateId();
+		const now = new Date().toISOString();
+		await db.insert(narratorBlacklistDirs).values({
+			id: denyId,
+			narratorId,
+			path: packArchivePath(pack.id, "tar.gz"),
+			pathFlavor: "posix",
+			targetKind: "host",
+			targetValue: "local",
+			denyLevel: "denyAll",
+			enabled: true,
+			createdAt: now,
+			updatedAt: now,
+		});
+		executionPolicyEngine.invalidate(narratorId);
+		try {
+			await expect(stagePublishedPack(context(), pack)).rejects.toThrow("archive Read is denied");
+			await expect(
+				createPublishedPackSourceAccess({ ...context(), userId: null }, pack),
+			).rejects.toThrow("real actor");
+		} finally {
+			await db.delete(narratorBlacklistDirs).where(eq(narratorBlacklistDirs.id, denyId));
+			executionPolicyEngine.invalidate(narratorId);
+		}
+	});
 });
 
 describe("pack create + activate + cleanup", () => {

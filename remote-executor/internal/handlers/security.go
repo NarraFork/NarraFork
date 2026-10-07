@@ -50,6 +50,9 @@ type resolvedRule struct {
 type PathGuard struct {
 	rules      []resolvedRule
 	restricted bool
+	// Internal private namespaces are unconditional exclusions, independent of
+	// operator last-match-wins rules. Install before sharing the guard.
+	privatePaths []string
 }
 
 // NewPathGuard builds a guard from allow-only roots. Retained for callers (and
@@ -103,6 +106,57 @@ func NewPathGuardWithRules(rules []PathRule) *PathGuard {
 	return guard
 }
 
+// ExcludePrivateDirectories reserves executor-owned namespaces. Unlike configured
+// rules these cannot be reopened by a later allow. Ancestors remain usable.
+// Call only during startup, before serving requests; the guard is otherwise immutable.
+func (g *PathGuard) ExcludePrivateDirectories(paths ...string) error {
+	for _, path := range paths {
+		abs, err := absolutePath(path)
+		if err != nil {
+			return err
+		}
+		canonical := abs
+		ancestor := abs
+		missing := []string{}
+		for {
+			if _, err := os.Lstat(ancestor); err == nil {
+				resolved, err := filepath.EvalSymlinks(ancestor)
+				if err != nil {
+					return err
+				}
+				canonical = resolved
+				for i := len(missing) - 1; i >= 0; i-- {
+					canonical = filepath.Join(canonical, missing[i])
+				}
+				break
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+			parent := filepath.Dir(ancestor)
+			if parent == ancestor {
+				return fmt.Errorf("private namespace has no existing ancestor")
+			}
+			missing = append(missing, filepath.Base(ancestor))
+			ancestor = parent
+		}
+		g.privatePaths = append(g.privatePaths, filepath.Clean(abs), filepath.Clean(canonical))
+	}
+	return nil
+}
+
+func (g *PathGuard) checkPrivate(path string) error {
+	for _, private := range g.privatePaths {
+		if pathWithin(private, path) {
+			return fmt.Errorf("executor private state is excluded from structured IO")
+		}
+	}
+	return nil
+}
+
+// PrivateDirectories exposes a copy for bounded native scanners. It is not an
+// override or an authorization grant; every candidate still goes through the guard.
+func (g *PathGuard) PrivateDirectories() []string { return append([]string(nil), g.privatePaths...) }
+
 // UnresolvedDenyRules lists deny rules whose paths could not be canonicalized.
 // They still block their literal subtree, but a symlinked or later-created path
 // may bypass them, so startup should surface them to the operator.
@@ -124,6 +178,9 @@ func (g *PathGuard) CheckExisting(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if err := g.checkPrivate(abs); err != nil {
+		return "", err
+	}
 	resolved, err := filepath.EvalSymlinks(abs)
 	if err != nil {
 		return "", fmt.Errorf("resolve path %q: %w", abs, err)
@@ -138,6 +195,9 @@ func (g *PathGuard) CheckExisting(path string) (string, error) {
 func (g *PathGuard) CheckCreate(path string) (string, error) {
 	abs, err := absolutePath(path)
 	if err != nil {
+		return "", err
+	}
+	if err := g.checkPrivate(abs); err != nil {
 		return "", err
 	}
 
@@ -162,7 +222,7 @@ func (g *PathGuard) CheckCreate(path string) (string, error) {
 			for i := len(missing) - 1; i >= 0; i-- {
 				resolved = filepath.Join(resolved, missing[i])
 			}
-			return filepath.Clean(resolved), nil
+			return g.checkResolved(filepath.Clean(resolved))
 		} else if !errors.Is(statErr, fs.ErrNotExist) {
 			return "", fmt.Errorf("inspect path ancestor %q: %w", ancestor, statErr)
 		}
@@ -184,6 +244,9 @@ func (g *PathGuard) CheckRemove(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if err := g.checkPrivate(abs); err != nil {
+		return "", err
+	}
 	parent, err := g.CheckExisting(filepath.Dir(abs))
 	if err != nil {
 		return "", err
@@ -197,6 +260,9 @@ func (g *PathGuard) Check(path string) (string, error) {
 }
 
 func (g *PathGuard) checkResolved(path string) (string, error) {
+	if err := g.checkPrivate(path); err != nil {
+		return "", err
+	}
 	if !g.restricted {
 		return path, nil
 	}

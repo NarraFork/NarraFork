@@ -20,11 +20,17 @@ import {
 	type WorktreeJournalRecord,
 	worktreeProposalHash,
 } from "./narrator-worktree-journal";
-
 import type {
 	VerifiedWorktreeScope,
 	WorktreeResourceRegistry,
 } from "./narrator-worktree-resources";
+import {
+	createRemoteWorktree,
+	reconcileRemoteWorktree,
+	remoteWorktreeRequest,
+	supportsRemoteWorktree,
+	updateRemoteWorktreeResourceState,
+} from "./remote-worktree-service";
 
 export type { WorktreeCreateResult, WorktreeEntry } from "./narrator-worktree-journal";
 
@@ -353,8 +359,12 @@ function assertReady(target: WorktreeTarget, need: "read" | "write", workspaceKe
 		error("GIT_WORKSPACE_CHANGED", "Git workspace changed; refresh before retrying", 409);
 	if (workspace.state !== "ready" || !workspace.capabilities[need])
 		error("GIT_WORKSPACE_UNAVAILABLE", "Git workspace unavailable or access denied", 403);
-	if (!backend || backend.kind !== "local" || workspace.deviceId !== "local")
-		error("WORKTREE_UNSUPPORTED", "Remote worktree operations are not supported", 409);
+	if (
+		!backend ||
+		backend.deviceId !== workspace.deviceId ||
+		(backend.kind === "remote" && !supportsRemoteWorktree(backend))
+	)
+		error("WORKTREE_UNSUPPORTED", "Executor lacks structured worktree capability", 409);
 	if (!workspace.rootPath || !workspace.repositoryKey || !target.repositoryPath)
 		error("GIT_WORKSPACE_UNAVAILABLE", "Canonical Git identity unavailable", 409);
 }
@@ -443,6 +453,15 @@ export class NarratorWorktreeService<Principal> {
 		}
 	}
 	private async entries(target: WorktreeTarget, signal: AbortSignal) {
+		if (target.backend?.kind === "remote") {
+			const result = await remoteWorktreeRequest(target, { operation: "list" }, signal);
+			if (!Array.isArray(result.entries))
+				error("WORKTREE_LIST_FAILED", "Remote worktree inventory is incomplete", 409);
+			return {
+				entries: result.entries.slice(0, WORKTREE_MAX_ENTRIES),
+				truncated: !!result.truncated || result.entries.length > WORKTREE_MAX_ENTRIES,
+			};
+		}
 		let result = await this.run(target, ["worktree", "list", "--porcelain", "-z"], signal);
 		let legacy = false;
 		// Retry only an explicit unsupported -z diagnostic, never an ordinary Git failure.
@@ -542,17 +561,27 @@ export class NarratorWorktreeService<Principal> {
 		const target = await this.ports.authorize(principal, narratorId, "read", signal);
 		assertReady(target, "read", workspaceKey);
 		const result = await this.entries(target, signal);
-		await this.enrichListEntries(target, result.entries, signal);
+		if (target.backend?.kind === "local")
+			await this.enrichListEntries(target, result.entries, signal);
 		return {
+			...(target.backend?.kind === "remote"
+				? {
+						deviceId: target.workspace.deviceId,
+						workspaceKey: target.workspace.workspaceKey ?? undefined,
+						workspaceRevision: target.workspace.workspaceRevision,
+					}
+				: {}),
 			repositoryKey: target.workspace.repositoryKey,
 			...result,
 			capabilities: {
 				list: true,
-				create: target.workspace.capabilities.write,
+				create:
+					target.workspace.capabilities.write &&
+					(target.backend?.kind === "local" || supportsRemoteWorktree(target.backend)),
 				switch: false,
 				delete: false,
 				prune: false,
-				remote: false,
+				remote: target.backend?.kind === "remote",
 				reason:
 					"Create supports only existing, non-symlink parents inside the authorized repository root; switching and cleanup are separate operations",
 			},
@@ -635,6 +664,22 @@ export class NarratorWorktreeService<Principal> {
 				signal,
 			);
 			validateRef(branchName);
+			if (target.backend?.kind === "remote") {
+				const result = await remoteWorktreeRequest(
+					target,
+					{
+						operation: "prepare",
+						branchName,
+						branchKind: "new",
+						worktreeName: worktreeDirectoryName(branchName),
+						destinationPath: request.destinationPath,
+					},
+					signal,
+				);
+				if (!result.prepared)
+					error("WORKTREE_PREPARE_FAILED", "Incomplete remote worktree proposal", 409);
+				return result.prepared;
+			}
 			const valid = await this.run(
 				target,
 				["check-ref-format", `refs/heads/${branchName}`],
@@ -975,6 +1020,30 @@ export class NarratorWorktreeService<Principal> {
 				);
 			signal.throwIfAborted();
 			if (receipt.result && receipt.result.outcome !== "unknown") return receipt.result;
+			if (target.backend.kind === "remote") {
+				const result = await reconcileRemoteWorktree(
+					target,
+					narratorId,
+					request.requestId,
+					receipt,
+				);
+				await updateRemoteWorktreeResourceState(
+					this.ports,
+					narratorId,
+					request.requestId,
+					receipt,
+					result,
+				);
+				await this.ports.journal
+					.save(narratorId, request.requestId, { ...receipt, result })
+					.catch(() => {
+						logger.warn("Unable to persist remote worktree reconciliation", {
+							narratorId,
+							requestId: request.requestId,
+						});
+					});
+				return result;
+			}
 			return this.reconcile(target, receipt);
 		});
 	}
@@ -990,6 +1059,28 @@ export class NarratorWorktreeService<Principal> {
 		const target = await this.ports.authorize(principal, narratorId, "write", signal);
 		assertReady(target, "write", request.workspaceKey);
 		const actorKey = this.actorKey(principal);
+		if (target.backend?.kind === "remote")
+			return createRemoteWorktree(
+				this.ports,
+				principal,
+				narratorId,
+				request,
+				target,
+				actorKey,
+				signal,
+				() =>
+					this.resolveBranchName(
+						principal,
+						narratorId,
+						request.branch.name,
+						undefined,
+						createHash("sha256")
+							.update(JSON.stringify([narratorId, request.requestId]))
+							.digest("hex")
+							.slice(0, 10),
+						signal,
+					),
+			);
 		return this.ports.withRevision(narratorId, request.expectedRevision, async () => {
 			return this.ports.withRepositoryLock(target.workspace.repositoryKey ?? "", async () => {
 				let claim: Awaited<ReturnType<WorktreeJournal["claim"]>>;
