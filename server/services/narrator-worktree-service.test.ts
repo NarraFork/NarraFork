@@ -1,17 +1,26 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { LocalBackend } from "../lib/agent/execution/local-backend";
 import { resolveToolJsonSchema } from "../lib/agent/tool-registry";
-import { createWorktreeTool, worktreeToolSchema } from "../lib/agent/tools/worktree";
+import {
+	createAgentWorktreeTools,
+	createWorktreeTool,
+	worktreeToolSchema,
+} from "../lib/agent/tools/worktree";
 import type { ToolContext } from "../lib/agent/types";
 import { AppError } from "../lib/errors";
 import { safeSpawn } from "../lib/spawn";
 import type { WorktreeCreateRequest } from "../lib/validators/narrator-worktrees";
 import { createNarratorWorktreeRoutes } from "../routes/narrator-worktrees";
-import { FileWorktreeJournal } from "./narrator-worktree-journal";
+import {
+	FileWorktreeJournal,
+	type WorktreeJournalRecord,
+	worktreeProposalHash,
+} from "./narrator-worktree-journal";
 import {
 	boundWorktreeGitResult,
 	NarratorWorktreeService,
@@ -1707,5 +1716,411 @@ describe("local worktree list/create fixtures", () => {
 		expect(tool.executionRouting?.resolve({ action: "list" }, {} as never)).toMatchObject({
 			operation: "read",
 		});
+	});
+});
+
+describe("read-only worktree operation lookup", () => {
+	const operationId = `wt1_${"a".repeat(64)}`;
+	const query = (actor = "actor", id = operationId) =>
+		service.getOperation(actor, "narrator", id, signal());
+	const receiptPath = () =>
+		join(
+			temporary,
+			"receipts",
+			`${createHash("sha256")
+				.update(JSON.stringify(["narrator", operationId]))
+				.digest("hex")}.json`,
+		);
+	async function seed() {
+		const request = proposal(operationId);
+		const record: WorktreeJournalRecord = {
+			request,
+			proposalHash: worktreeProposalHash(request),
+			repositoryKey: "repository",
+			actorKey: "actor",
+			deviceId: "local",
+			destination: request.destinationPath,
+			expectedHead: await git(["rev-parse", "HEAD"]),
+			branchName: "feature",
+		};
+		await ports.journal.claim("narrator", operationId, record);
+		return record;
+	}
+	function forbidWrites() {
+		ports.withRevision = async () => {
+			throw new Error("Lookup must not admit a revision mutation");
+		};
+		ports.journal.claim = async () => {
+			throw new Error("Lookup must not claim a receipt");
+		};
+		ports.journal.save = async () => {
+			throw new Error("Lookup must not save a receipt");
+		};
+	}
+
+	test("intent tools use stable receipts across tool-call ids and recover with an old revision", async () => {
+		const tools = createAgentWorktreeTools(service, async (ctx) => ctx.userId ?? "");
+		const create = tools.find((tool) => tool.name === "CreateWorktree");
+		const get = tools.find((tool) => tool.name === "GetWorktreeOperation");
+		if (!create || !get) throw new Error("Missing intent tool definitions");
+		const context = {
+			narratorId: "narrator",
+			userId: "actor",
+			signal: signal(),
+			currentToolUseId: "first-call",
+			workspaceContext: {
+				revision: 4,
+				deviceId: "local",
+				cwd: source,
+				pathFlavor: "posix",
+				contextKey: "fixture-context",
+				git: { workspaceKey: "workspace", repositoryKey: "repository", rootPath: source },
+				capabilities: { switchDirectory: true },
+			},
+		} as ToolContext;
+		const intent = { branchName: "feature", destinationPath: proposal().destinationPath };
+		const first = JSON.parse((await create.execute(intent, context)).output);
+		expect(first.outcome).toBe("created");
+		expect(first.operationId).toMatch(/^wt1_[a-f0-9]{64}$/);
+		const second = JSON.parse(
+			(await create.execute(intent, { ...context, currentToolUseId: "second-call" })).output,
+		);
+		expect(second.operationId).toBe(first.operationId);
+		expect(second.outcome).toBe("created");
+		expect(writes).toBe(1);
+		const record = await ports.journal.read("narrator", first.operationId);
+		expect(record?.request.requestId).toBe(first.operationId);
+		expect(record?.request.expectedRevision).toBe(4);
+		if (!context.workspaceContext) throw new Error("Missing fixture workspace context");
+		revision = 5;
+		forbidWrites();
+		const recovered = JSON.parse(
+			(
+				await get.execute(
+					{ operationId: first.operationId },
+					{
+						...context,
+						workspaceContext: { ...context.workspaceContext, revision: 5 },
+						currentToolUseId: "recovery-call",
+					},
+				)
+			).output,
+		);
+		expect(recovered.outcome).toBe("created");
+		expect(recovered.operationId).toBe(first.operationId);
+		expect(writes).toBe(1);
+		expect(await ports.journal.read("narrator", first.operationId)).toEqual(record);
+	});
+
+	test("same-id creation replay rejects injected stored results and inconsistent proposals", async () => {
+		const record = await seed();
+		const corruptions = [
+			{ ...record, result: { outcome: "created", arbitrary: "payload" } },
+			{ ...record, request: { ...record.request, expectedRevision: 8 } },
+			{ ...record, expectedHead: "--injected-head" },
+			{ ...record, destination: join(source, "elsewhere") },
+		];
+		for (const corrupted of corruptions) {
+			await writeFile(receiptPath(), JSON.stringify(corrupted));
+			await expect(
+				service.create("actor", "narrator", record.request, signal()),
+			).rejects.toMatchObject({ code: "WORKTREE_RECEIPT_INVALID" });
+		}
+		expect(writes).toBe(0);
+	});
+
+	test("same-id creation replay checks the current proposal independently of journal claim", async () => {
+		const record = await seed();
+		ports.journal.claim = async () => ({ fresh: false, record });
+		await expect(
+			service.create(
+				"actor",
+				"narrator",
+				{ ...record.request, branch: { kind: "new", name: "different" } },
+				signal(),
+			),
+		).rejects.toMatchObject({ code: "WORKTREE_REQUEST_CONFLICT" });
+		expect(writes).toBe(0);
+	});
+
+	test("a 256-character multi-component branch survives query and same-id replay", async () => {
+		const branch = `${"a".repeat(120)}/${"b".repeat(135)}`;
+		expect(branch.length).toBe(256);
+		const request = proposal(operationId, branch);
+		const created = await service.create("actor", "narrator", request, signal());
+		expect(created.outcome).toBe("created");
+		expect(created.worktree?.branch).toBe(`refs/heads/${branch}`);
+		expect(await query()).toEqual(created);
+		expect(await service.create("actor", "narrator", request, signal())).toEqual(created);
+		expect(writes).toBe(1);
+	});
+
+	for (const failure of ["base-ref", "branch", "non-normalized-path", "outside-path"] as const) {
+		test(`a real ${failure} validation failure stays terminal with original receipt and scope`, async () => {
+			const request = proposal(operationId);
+			if (failure === "base-ref") request.baseRef = "-bad";
+			if (failure === "branch") request.branch.name = "-bad";
+			if (failure === "non-normalized-path")
+				request.destinationPath = `${source}/.worktrees/../.worktrees/failed-path`;
+			if (failure === "outside-path") request.destinationPath = join(temporary, "outside-path");
+			const failed = await service.create("actor", "narrator", request, signal());
+			expect(failed.outcome).toBe("failed");
+			const record = await ports.journal.read("narrator", operationId);
+			expect(record?.expectedHead).toBe("");
+			expect(record?.commandSucceeded).toBeUndefined();
+			const before = await readFile(receiptPath(), "utf8");
+			let probes = 0;
+			ports.runGit = async () => {
+				probes++;
+				throw new Error("Terminal validation failures must not probe Git");
+			};
+			if (failure === "outside-path") {
+				await expect(query()).rejects.toMatchObject({ code: "WORKTREE_RECOVERY_DENIED" });
+				await expect(service.create("actor", "narrator", request, signal())).rejects.toMatchObject({
+					code: "WORKTREE_RECOVERY_DENIED",
+				});
+			} else {
+				expect(await query()).toEqual(failed);
+				expect(await service.create("actor", "narrator", request, signal())).toEqual(failed);
+			}
+			expect(await readFile(receiptPath(), "utf8")).toBe(before);
+			expect(probes).toBe(0);
+			expect(writes).toBe(0);
+		});
+	}
+
+	test("unsafe failed proposals cannot become reconciliation evidence through result tampering", async () => {
+		const request = proposal(operationId, "-bad");
+		await service.create("actor", "narrator", request, signal());
+		const record = await ports.journal.read("narrator", operationId);
+		if (!record?.result) throw new Error("Missing failed fixture receipt");
+		const corruptions = [
+			{ ...record, result: { ...record.result, outcome: "unknown" } },
+			{ ...record, result: { ...record.result, outcome: "created" } },
+			{ ...record, result: undefined },
+			{ ...record, commandSucceeded: false },
+			{ ...record, expectedHead: "a".repeat(40) },
+			{
+				...record,
+				result: { ...record.result, residuals: { destinationExists: false, branchExists: null } },
+			},
+			{ ...record, result: { ...record.result, error: undefined } },
+		];
+		let probes = 0;
+		ports.runGit = async () => {
+			probes++;
+			throw new Error("Invalid receipt must not probe Git");
+		};
+		for (const corrupted of corruptions) {
+			await writeFile(receiptPath(), JSON.stringify(corrupted));
+			await expect(query()).rejects.toMatchObject({ code: "WORKTREE_RECEIPT_INVALID" });
+			await expect(service.create("actor", "narrator", request, signal())).rejects.toMatchObject({
+				code: "WORKTREE_RECEIPT_INVALID",
+			});
+		}
+		expect(probes).toBe(0);
+		expect(writes).toBe(0);
+	});
+
+	test("queries completed operation repeatedly with frozen old revision and zero writes", async () => {
+		const request = proposal(operationId);
+		const result = await service.create("actor", "narrator", request, signal());
+		expect(result.outcome).toBe("created");
+		const before = await readFile(receiptPath(), "utf8");
+		revision = 99;
+		target.workspace.workspaceKey = "new-workspace";
+		writes = 0;
+		forbidWrites();
+		authorizations = [];
+		expect(await query()).toEqual(result);
+		expect(await query()).toEqual(result);
+		expect(authorizations.every((need) => need === "read")).toBe(true);
+		expect(await readFile(receiptPath(), "utf8")).toBe(before);
+		expect(writes).toBe(0);
+	});
+
+	test("pending receipt uses bounded reconciliation and never dispatches create", async () => {
+		await seed();
+		const before = await readFile(receiptPath(), "utf8");
+		forbidWrites();
+		ports.runGit = async () => {
+			throw new Error("Lost repository runtime");
+		};
+		expect((await query()).outcome).toBe("unknown");
+		expect((await query()).outcome).toBe("unknown");
+		expect(await readFile(receiptPath(), "utf8")).toBe(before);
+		expect(writes).toBe(0);
+	});
+
+	test("lost final result reconciles to created under an old revision without rewriting receipt", async () => {
+		const request = proposal(operationId);
+		await service.create("actor", "narrator", request, signal());
+		const record = await ports.journal.read("narrator", operationId);
+		if (!record) throw new Error("Missing fixture receipt");
+		delete record.result;
+		await ports.journal.save("narrator", operationId, record);
+		const before = await readFile(receiptPath(), "utf8");
+		revision = 100;
+		target.workspace.rootPath = request.destinationPath;
+		target.workspace.workspaceKey = "created-workspace";
+		writes = 0;
+		forbidWrites();
+		const result = await query();
+		expect(result.outcome).toBe("created");
+		expect(result.worktree?.path).toBe(request.destinationPath);
+		expect(await readFile(receiptPath(), "utf8")).toBe(before);
+		expect(writes).toBe(0);
+	});
+
+	test("failed validation receipt remains queryable before resolving HEAD or branch", async () => {
+		const record = await seed();
+		record.expectedHead = "";
+		delete record.branchName;
+		record.result = {
+			outcome: "failed",
+			worktree: null,
+			residuals: { destinationExists: null, branchExists: null },
+			error: { code: "WORKTREE_VALIDATION_FAILED", message: "Validation failed" },
+		};
+		await ports.journal.save("narrator", operationId, record);
+		forbidWrites();
+		expect(await query()).toEqual(record.result);
+		expect(writes).toBe(0);
+	});
+
+	test("missing and invalid operation ids do not claim or create receipt directories", async () => {
+		forbidWrites();
+		await expect(query()).rejects.toMatchObject({
+			code: "WORKTREE_REQUEST_NOT_FOUND",
+			statusCode: 404,
+		});
+		for (const id of [
+			"request-one",
+			`wt1_${"A".repeat(64)}`,
+			`wt1_${"a".repeat(63)}`,
+			`${operationId}\n`,
+		])
+			await expect(query("actor", id)).rejects.toMatchObject({
+				code: "WORKTREE_INVALID_OPERATION",
+			});
+		await expect(lstat(join(temporary, "receipts"))).rejects.toMatchObject({ code: "ENOENT" });
+		expect(writes).toBe(0);
+	});
+
+	test("authorizes and validates actor before reading any receipt", async () => {
+		let reads = 0;
+		ports.journal.read = async () => {
+			reads++;
+			return null;
+		};
+		await expect(query("")).rejects.toMatchObject({ code: "WORKTREE_ACTOR_REQUIRED" });
+		ports.authorize = async () => {
+			throw new AppError("Denied", 403, "ACL_DENIED");
+		};
+		await expect(query()).rejects.toMatchObject({ code: "ACL_DENIED" });
+		expect(reads).toBe(0);
+	});
+
+	test("another actor, device, repository and narrow path scope cannot recover", async () => {
+		const record = await seed();
+		await expect(query("other")).rejects.toMatchObject({ code: "WORKTREE_RECOVERY_DENIED" });
+		target.workspace.repositoryKey = "other";
+		await expect(query()).rejects.toMatchObject({ code: "WORKTREE_RECOVERY_DENIED" });
+		target.workspace.repositoryKey = "repository";
+		await ports.journal.save("narrator", operationId, { ...record, deviceId: "other-device" });
+		await expect(query()).rejects.toMatchObject({ code: "WORKTREE_RECOVERY_DENIED" });
+		await ports.journal.save("narrator", operationId, record);
+		target.workspace.rootPath = join(source, "sibling");
+		await expect(query()).rejects.toMatchObject({ code: "WORKTREE_RECOVERY_DENIED" });
+		expect(writes).toBe(0);
+	});
+
+	test("repository lock and reauthorization still protect operation queries", async () => {
+		await seed();
+		lock = true;
+		await expect(query()).rejects.toMatchObject({ code: "GIT_WORKSPACE_BUSY" });
+		lock = false;
+		const authorize = ports.authorize;
+		let count = 0;
+		ports.authorize = async (...args) => {
+			if (++count === 3) target.workspace.repositoryKey = "changed-under-lock";
+			return authorize(...args);
+		};
+		await expect(query()).rejects.toMatchObject({ code: "WORKTREE_RECOVERY_DENIED" });
+		expect(writes).toBe(0);
+	});
+
+	test("malformed JSON and oversized real receipts fail closed", async () => {
+		await seed();
+		for (const content of ["{", " ".repeat(32 * 1024 + 1)]) {
+			await writeFile(receiptPath(), content);
+			await expect(query()).rejects.toMatchObject({ code: "WORKTREE_RECEIPT_UNAVAILABLE" });
+		}
+		expect(writes).toBe(0);
+	});
+
+	test("receipt structure, proposal, identities, refs and stored result are verified", async () => {
+		const record = await seed();
+		const corruptions: unknown[] = [
+			{},
+			[],
+			"invalid-record",
+			{ ...record, request: { ...record.request, requestId: "other" } },
+			{ ...record, request: { ...record.request, expectedRevision: -1 } },
+			{ ...record, request: { ...record.request, expectedRevision: 9 } },
+			{ ...record, proposalHash: "b".repeat(64) },
+			{ ...record, destination: join(source, "elsewhere") },
+			{ ...record, actorKey: "" },
+			{ ...record, deviceId: "" },
+			{ ...record, repositoryKey: "" },
+			{ ...record, expectedHead: "--option" },
+			{ ...record, branchName: "--option" },
+			{ ...record, branchName: "other-branch" },
+			{ ...record, result: { outcome: "created", arbitrary: "payload" } },
+			{
+				...record,
+				result: {
+					outcome: "created",
+					worktree: null,
+					residuals: { destinationExists: true, branchExists: true },
+				},
+			},
+		];
+		for (const corrupted of corruptions) {
+			await writeFile(receiptPath(), JSON.stringify(corrupted));
+			await expect(query()).rejects.toMatchObject({ code: "WORKTREE_RECEIPT_INVALID" });
+		}
+		expect(writes).toBe(0);
+	});
+
+	test("a receipt replaced between lookup and recovery is validated again", async () => {
+		await seed();
+		const read = ports.journal.read.bind(ports.journal);
+		let reads = 0;
+		ports.journal.read = async (...args) => {
+			if (++reads === 2) await writeFile(receiptPath(), JSON.stringify({ request: {} }));
+			return read(...args);
+		};
+		await expect(query()).rejects.toMatchObject({ code: "WORKTREE_RECEIPT_INVALID" });
+		expect(reads).toBe(2);
+		expect(writes).toBe(0);
+	});
+
+	test("a self-consistent replacement proposal cannot replace the original lookup request", async () => {
+		const record = await seed();
+		const read = ports.journal.read.bind(ports.journal);
+		let reads = 0;
+		ports.journal.read = async (...args) => {
+			if (++reads === 2) {
+				const request = { ...record.request, expectedRevision: 8 };
+				await writeFile(
+					receiptPath(),
+					JSON.stringify({ ...record, request, proposalHash: worktreeProposalHash(request) }),
+				);
+			}
+			return read(...args);
+		};
+		await expect(query()).rejects.toMatchObject({ code: "WORKTREE_REQUEST_CONFLICT" });
+		expect(writes).toBe(0);
 	});
 });

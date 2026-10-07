@@ -364,6 +364,8 @@ export function useVListLabels(): VListLabels {
 			// These prefixes wrap together with the answer text, so they are MEASURED
 			// (adapter labels) rather than substituted by the render layer.
 			workspaceCreate: t("workspaceCreate"),
+			workspaceAttach: t("workspaceAttach"),
+			workspaceOperation: t("workspaceOperation"),
 			workspaceList: t("workspaceList"),
 			workspaceSwitch: t("workspaceSwitch"),
 			workspaceDevice: t("workspaceDevice"),

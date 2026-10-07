@@ -1,8 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import { access, lstat, open, opendir, realpath } from "node:fs/promises";
+import { isAbsolute, normalize } from "node:path";
 import type { GitWorkspace } from "@shared/git-workspace";
 import type { WorktreeListResult, WorktreePrepareResult } from "@shared/narrator-worktrees";
+import { z } from "zod/v4";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
@@ -359,13 +361,149 @@ function assertReady(target: WorktreeTarget, need: "read" | "write", workspaceKe
 		error("GIT_WORKSPACE_UNAVAILABLE", "Canonical Git identity unavailable", 409);
 }
 
+// Receipts are untrusted filesystem data, not typed service responses. Parse into fresh,
+// bounded objects before using them for recovery or exposing a stored result.
+const receiptIdentity = z
+	.string()
+	.min(1)
+	.max(256)
+	.refine((value) => !hasControlCharacters(value));
+const receiptPath = z
+	.string()
+	.min(1)
+	.max(4096)
+	.refine(
+		(value) => isAbsolute(value) && normalize(value) === value && !hasControlCharacters(value),
+	);
+const receiptHead = z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/);
+const receiptBranch = z
+	.string()
+	.min(1)
+	.max(256)
+	.refine(
+		(value) =>
+			!value.startsWith("-") &&
+			!/[\s\\~^:?*[]/.test(value) &&
+			!hasControlCharacters(value) &&
+			!value.includes("..") &&
+			!value.includes("@{") &&
+			value !== "@" &&
+			!value.endsWith(".") &&
+			value
+				.split("/")
+				.every((part) => part !== "" && !part.startsWith(".") && !part.endsWith(".lock")),
+	);
+const receiptResultSchema = z
+	.object({
+		outcome: z.enum(["created", "failed", "unknown"]),
+		worktree: z
+			.object({
+				path: receiptPath,
+				head: receiptHead.nullable(),
+				branch: z
+					.string()
+					.max(267)
+					.refine(
+						(value) =>
+							value.startsWith("refs/heads/") &&
+							receiptBranch.safeParse(value.slice("refs/heads/".length)).success,
+					)
+					.nullable(),
+				detached: z.boolean(),
+				locked: z.boolean(),
+				prunable: z.boolean(),
+				createdAt: z.number().finite().nonnegative().nullable().optional(),
+				lastCommitAt: z.number().finite().nonnegative().nullable().optional(),
+			})
+			.strict()
+			.nullable(),
+		residuals: z
+			.object({ destinationExists: z.boolean().nullable(), branchExists: z.boolean().nullable() })
+			.strict(),
+		error: z
+			.object({ code: receiptIdentity, message: z.string().max(1024) })
+			.strict()
+			.optional(),
+	})
+	.strict();
+const receiptSchema = z
+	.object({
+		proposalHash: z.string().regex(/^[a-f0-9]{64}$/),
+		request: z.unknown(),
+		repositoryKey: receiptIdentity,
+		actorKey: receiptIdentity,
+		deviceId: receiptIdentity,
+		destination: z.string().min(1).max(4096),
+		// A claimed receipt can fail validation before resolving either HEAD or branch.
+		expectedHead: z.union([z.literal(""), receiptHead]),
+		branchName: z.string().min(1).max(256).optional(),
+		commandSucceeded: z.boolean().optional(),
+		result: receiptResultSchema.optional(),
+	})
+	.strict();
+function validateReceipt(input: unknown, requestId: string): WorktreeJournalRecord {
+	const parsed = receiptSchema.safeParse(input);
+	if (!parsed.success) error("WORKTREE_RECEIPT_INVALID", "Invalid worktree request receipt", 409);
+	const request = worktreeCreateSchema.safeParse(parsed.data.request);
+	if (!request.success)
+		error("WORKTREE_RECEIPT_INVALID", "Invalid original worktree proposal", 409);
+	const record = { ...parsed.data, request: request.data };
+	const branchName = record.branchName ?? record.request.branch.name;
+	// HEAD is persisted only after all Git/path validation succeeds and before dispatch.
+	// An empty HEAD therefore proves this terminal validation failure never ran worktree add.
+	// Keep its original typed proposal queryable, but never use it as reconciliation evidence.
+	const validationFailure =
+		record.result?.outcome === "failed" &&
+		record.expectedHead === "" &&
+		record.commandSucceeded === undefined &&
+		record.result.error !== undefined &&
+		record.result.residuals.destinationExists === null &&
+		record.result.residuals.branchExists === null;
+	if (
+		record.request.requestId !== requestId ||
+		record.proposalHash !== worktreeProposalHash(record.request) ||
+		record.destination !== record.request.destinationPath ||
+		(record.branchName !== undefined &&
+			record.request.branch.name !== undefined &&
+			record.branchName !== record.request.branch.name) ||
+		(!validationFailure &&
+			(!receiptPath.safeParse(record.destination).success ||
+				(record.branchName !== undefined && !receiptBranch.safeParse(record.branchName).success) ||
+				(record.request.branch.name !== undefined &&
+					!receiptBranch.safeParse(record.request.branch.name).success) ||
+				(record.request.baseRef !== undefined &&
+					(hasControlCharacters(record.request.baseRef) ||
+						/\s/.test(record.request.baseRef) ||
+						record.request.baseRef.startsWith("-"))))) ||
+		(record.commandSucceeded === true && (!branchName || !record.expectedHead))
+	)
+		error("WORKTREE_RECEIPT_INVALID", "Inconsistent worktree request receipt", 409);
+	const result = record.result;
+	if (
+		result &&
+		(result.outcome === "created"
+			? !result.worktree ||
+				!branchName ||
+				!record.expectedHead ||
+				result.worktree.path !== record.destination ||
+				result.worktree.head !== record.expectedHead ||
+				result.worktree.branch !== `refs/heads/${branchName}` ||
+				result.worktree.detached ||
+				result.worktree.prunable ||
+				result.residuals.destinationExists !== true
+			: result.worktree !== null)
+	)
+		error("WORKTREE_RECEIPT_INVALID", "Inconsistent stored worktree result", 409);
+	return record;
+}
+
 export class NarratorWorktreeService<Principal> {
 	constructor(private readonly ports: WorktreeServicePorts<Principal>) {}
 
 	private actorKey(principal: Principal): string {
 		const key =
 			this.ports.principalKey?.(principal) ?? (typeof principal === "string" ? principal : "");
-		if (!key || key.length > 256)
+		if (!key || key.length > 256 || hasControlCharacters(key))
 			error("WORKTREE_ACTOR_REQUIRED", "A stable authenticated actor is required", 403);
 		return key;
 	}
@@ -909,6 +1047,32 @@ export class NarratorWorktreeService<Principal> {
 		};
 	}
 
+	/** Operation lookup accepts only the tool's stable internal request identifier. */
+	async getOperation(
+		principal: Principal,
+		narratorId: string,
+		operationId: string,
+		signal: AbortSignal,
+	): Promise<WorktreeCreateResult> {
+		const target = await this.ports.authorize(principal, narratorId, "read", signal);
+		assertReady(target, "read", target.workspace.workspaceKey ?? "");
+		this.actorKey(principal);
+		if (typeof operationId !== "string" || !/^wt1_[a-f0-9]{64}$/.test(operationId))
+			error("WORKTREE_INVALID_OPERATION", "Invalid worktree operation identifier");
+		signal.throwIfAborted();
+		let record: WorktreeJournalRecord | null;
+		try {
+			record = await this.ports.journal.read(narratorId, operationId);
+		} catch {
+			error("WORKTREE_RECEIPT_UNAVAILABLE", "Cannot read the original worktree receipt", 409);
+		}
+		if (!record) error("WORKTREE_REQUEST_NOT_FOUND", "Worktree request receipt not found", 404);
+		const receipt = validateReceipt(record, operationId);
+		// Reuse recovery authorization, lock and path scope checks, with the frozen old revision.
+		// Recovery validates its independent read again: receipt replacement cannot bypass parsing.
+		return this.reconcileRequest(principal, narratorId, receipt.request, signal);
+	}
+
 	/** Read-only receipt recovery: old revisions/roots never admit another worktree add. */
 	async reconcileRequest(
 		principal: Principal,
@@ -936,6 +1100,7 @@ export class NarratorWorktreeService<Principal> {
 		}
 		if (!record)
 			throw new AppError("Worktree request receipt not found", 404, "WORKTREE_REQUEST_NOT_FOUND");
+		record = validateReceipt(record, request.requestId);
 		if (
 			record.actorKey !== actorKey ||
 			record.deviceId !== initial.workspace.deviceId ||
@@ -966,6 +1131,7 @@ export class NarratorWorktreeService<Principal> {
 			if (
 				!target.backend ||
 				!target.workspace.rootPath ||
+				!target.backend.paths.isAbsolute(receipt.destination) ||
 				!target.backend.paths.contains(target.workspace.rootPath, receipt.destination)
 			)
 				error(
@@ -1016,7 +1182,15 @@ export class NarratorWorktreeService<Principal> {
 						},
 					};
 				}
-				const record = claim.record;
+				const record = claim.fresh
+					? claim.record
+					: validateReceipt(claim.record, request.requestId);
+				if (!claim.fresh && record.proposalHash !== worktreeProposalHash(request))
+					error(
+						"WORKTREE_REQUEST_CONFLICT",
+						"Replay must use the exact original creation proposal",
+						409,
+					);
 				if (record.actorKey !== actorKey || record.deviceId !== target.workspace.deviceId)
 					error(
 						"WORKTREE_RECOVERY_DENIED",
@@ -1026,6 +1200,17 @@ export class NarratorWorktreeService<Principal> {
 				if (record.repositoryKey !== target.workspace.repositoryKey)
 					error("WORKTREE_REQUEST_CONFLICT", "Request receipt belongs to another repository", 409);
 				if (!claim.fresh) {
+					if (
+						!target.backend ||
+						!target.workspace.rootPath ||
+						!target.backend.paths.isAbsolute(record.destination) ||
+						!target.backend.paths.contains(target.workspace.rootPath, record.destination)
+					)
+						error(
+							"WORKTREE_RECOVERY_DENIED",
+							"Receipt replay requires the original authorized directory scope",
+							403,
+						);
 					if (record.result && record.result.outcome !== "unknown") return record.result;
 					const result = await this.reconcile(target, record);
 					await this.ports.journal

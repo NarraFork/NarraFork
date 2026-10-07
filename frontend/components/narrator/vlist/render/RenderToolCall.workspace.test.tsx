@@ -14,14 +14,20 @@ beforeAll(async () => {
 	RenderToolCall = (await import("./RenderToolCall")).RenderToolCall;
 });
 
-for (const toolName of ["Worktree", "SwitchWorkingDirectory"]) {
+for (const toolName of [
+	"Worktree",
+	"CreateWorktree",
+	"AttachWorktree",
+	"GetWorktreeOperation",
+	"SwitchWorkingDirectory",
+]) {
 	test(`${toolName} paints plain custom rows through the real measure/render chain`, () => {
 		const inputJson =
-			toolName === "Worktree"
+			toolName !== "SwitchWorkingDirectory"
 				? { action: "create", destinationPath: "/repo/new", branch: { name: "fix/new" } }
 				: { target: { cwd: "/repo/new" } };
 		const outputJson =
-			toolName === "Worktree"
+			toolName !== "SwitchWorkingDirectory"
 				? {
 						_text: JSON.stringify({
 							outcome: "created",

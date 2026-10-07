@@ -2,6 +2,8 @@ import { readLeafText } from "./tool-io-projection";
 
 export const WORKSPACE_LABELS = {
 	workspaceCreate: "Create worktree",
+	workspaceAttach: "Attach worktree",
+	workspaceOperation: "Get worktree operation",
 	workspaceList: "List worktrees",
 	workspaceSwitch: "Switch directory",
 	workspaceDevice: "Switch device",
@@ -27,11 +29,16 @@ export function workspaceObject(value: unknown): Record<string, unknown> | undef
 
 export function workspaceSummary(name: string, input: unknown, labels?: Record<string, string>) {
 	const args = workspaceObject(input);
-	if (name === "Worktree") {
-		if (readLeafText(args?.action) === "list") return workspaceText("workspaceList", labels);
-		const branch = readLeafText(workspaceObject(args?.branch)?.name);
+	if (name === "ListWorktrees" || (name === "Worktree" && readLeafText(args?.action) === "list")) {
+		return workspaceText("workspaceList", labels);
+	}
+	if (name === "GetWorktreeOperation") return workspaceText("workspaceOperation", labels);
+	if (["Worktree", "CreateWorktree", "AttachWorktree"].includes(name)) {
+		const branch =
+			readLeafText(args?.branchName) ?? readLeafText(workspaceObject(args?.branch)?.name);
 		const path = readLeafText(args?.destinationPath)?.split(/[\\/]/).filter(Boolean).at(-1);
-		return `${workspaceText("workspaceCreate", labels)}${branch || path ? ` · ${branch || path}` : ""}`;
+		const label = name === "AttachWorktree" ? "workspaceAttach" : "workspaceCreate";
+		return `${workspaceText(label, labels)}${branch || path ? ` · ${branch || path}` : ""}`;
 	}
 	if (name === "SwitchDevice") {
 		const device = readLeafText(args?.device);

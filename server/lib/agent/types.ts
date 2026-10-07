@@ -343,6 +343,8 @@ export interface ToolDefinition {
 	name: string;
 	description: string | ((config: AgentConfig) => string);
 	parameters: z.ZodType;
+	/** Optional bounded, actionable validation feedback; never includes raw tool input. */
+	formatValidationError?: (error: z.ZodError) => string;
 	/** Pre-built JSON Schema to send to providers, bypassing zodToJsonSchema conversion.
 	 *  Used by MCP tools to preserve the original inputSchema without lossy Zod round-tripping. */
 	rawJsonSchema?: Record<string, unknown>;

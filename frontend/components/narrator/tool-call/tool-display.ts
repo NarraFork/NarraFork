@@ -167,7 +167,18 @@ export function getCategory(name: string, input?: unknown): ToolCategory {
 	if (BROWSER_TOOLS.has(name)) return "browser";
 	if (KNOWLEDGE_TOOLS.has(name)) return "knowledge";
 	if (CONTEXT_ASK_TOOLS.has(name)) return "contextAsk";
-	if (["Worktree", "SwitchWorkingDirectory", "SwitchDevice"].includes(name)) return "workspace";
+	if (
+		[
+			"Worktree",
+			"ListWorktrees",
+			"CreateWorktree",
+			"AttachWorktree",
+			"GetWorktreeOperation",
+			"SwitchWorkingDirectory",
+			"SwitchDevice",
+		].includes(name)
+	)
+		return "workspace";
 	return "generic";
 }
 

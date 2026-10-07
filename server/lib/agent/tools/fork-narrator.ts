@@ -40,14 +40,14 @@ export const forkNarratorTool: ToolDefinition = {
 				.enum(FORK_WORKTREE_SOURCES)
 				.optional()
 				.describe(
-					"Deprecated and rejected. Use the explicit Worktree resource tool to create filesystem resources.",
+					"Deprecated and rejected. Use the explicit CreateWorktree resource tool to create filesystem resources.",
 				),
 			commitSha: z
 				.string()
 				.min(1)
 				.optional()
 				.describe(
-					"Deprecated and rejected. Use the explicit Worktree resource tool to select a commit.",
+					"Deprecated and rejected. Use the explicit CreateWorktree resource tool to select a commit.",
 				),
 			model: z
 				.string()
@@ -83,13 +83,13 @@ export const forkNarratorTool: ToolDefinition = {
 				},
 				worktreeSource: {
 					description:
-						"Deprecated and rejected. Use the explicit Worktree resource tool to create filesystem resources.",
+						"Deprecated and rejected. Use the explicit CreateWorktree resource tool to create filesystem resources.",
 					type: "string",
 					enum: [...FORK_WORKTREE_SOURCES],
 				},
 				commitSha: {
 					description:
-						"Deprecated and rejected. Use the explicit Worktree resource tool to select a commit.",
+						"Deprecated and rejected. Use the explicit CreateWorktree resource tool to select a commit.",
 					type: "string",
 				},
 				model: {
@@ -115,7 +115,7 @@ export const forkNarratorTool: ToolDefinition = {
 		if (worktreeSource !== undefined || commitSha !== undefined) {
 			return {
 				output:
-					"ForkNarrator creates an independent conversation, not files. Use the explicit Worktree resource tool for worktreeSource or commitSha.",
+					"ForkNarrator creates an independent conversation, not files. Use the explicit CreateWorktree resource tool for worktreeSource or commitSha.",
 				isError: true,
 			};
 		}

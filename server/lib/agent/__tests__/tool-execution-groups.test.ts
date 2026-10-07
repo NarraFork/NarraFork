@@ -15,6 +15,23 @@ function tool(name: string, input: Record<string, unknown> = {}) {
 }
 
 describe("tool execution grouping", () => {
+	test("explicit and legacy worktree tools remain strict serial barriers", () => {
+		for (const name of [
+			"Worktree",
+			"ListWorktrees",
+			"CreateWorktree",
+			"AttachWorktree",
+			"GetWorktreeOperation",
+		]) {
+			const item = tool(name, { parallel: true });
+			expect(isStrictSerialToolExecution(item)).toBe(true);
+			expect(
+				groupToolExecutions([tool("Read"), item, tool("Grep")]).map((group) =>
+					group.map((member) => member.name),
+				),
+			).toEqual([["Read"], [name], ["Grep"]]);
+		}
+	});
 	test("matches loop ordering, parallel runs, and serial barriers", () => {
 		const tools = [
 			tool("Write"),

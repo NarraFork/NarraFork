@@ -335,6 +335,8 @@
 	"contextAskOutputChars": "{{count}} 字符",
 	"contextAskQuestions": "{{count}} 个问题",
 	"workspaceCreate": "创建工作树",
+	"workspaceAttach": "挂载工作树",
+	"workspaceOperation": "查询工作树操作",
 	"workspaceList": "列出工作树",
 	"workspaceSwitch": "切换工作目录",
 	"workspaceDevice": "切换设备",
