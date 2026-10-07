@@ -38,6 +38,8 @@ interface TaskReflectionMeta {
 	mutations: unknown[];
 	toolCallId?: string;
 	abortController?: AbortController;
+	/** Original persisted start time when restoring this gate. */
+	restoredStartedAt?: string;
 }
 
 interface PendingTaskReflection extends TaskReflectionMeta {
@@ -341,7 +343,10 @@ export function createTaskReflectionDecision(
 		requestId,
 		resolve,
 		resolved: false,
-		startedAt: Date.now(),
+		startedAt:
+			meta.restoredStartedAt && Number.isFinite(Date.parse(meta.restoredStartedAt))
+				? Date.parse(meta.restoredStartedAt)
+				: Date.now(),
 	});
 	notifyHumanAttentionChanged();
 	return promise;

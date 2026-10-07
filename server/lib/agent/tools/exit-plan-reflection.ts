@@ -36,6 +36,8 @@ interface ExitPlanReflectionMeta {
 	inputJson: Record<string, unknown>;
 	toolCallId?: string;
 	abortController?: AbortController;
+	/** Original persisted start time when restoring this gate. */
+	restoredStartedAt?: string;
 }
 
 interface ExitPlanReflectionPending extends ExitPlanReflectionMeta {
@@ -259,7 +261,10 @@ export function createExitPlanReflectionDecision(
 		requestId,
 		resolve,
 		resolved: false,
-		startedAt: Date.now(),
+		startedAt:
+			meta.restoredStartedAt && Number.isFinite(Date.parse(meta.restoredStartedAt))
+				? Date.parse(meta.restoredStartedAt)
+				: Date.now(),
 	});
 	notifyHumanAttentionChanged();
 	return promise;

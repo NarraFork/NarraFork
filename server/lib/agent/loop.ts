@@ -66,6 +66,12 @@ import {
 import { type ContentLane, OutputContentAccumulator } from "./output-content";
 import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { projectQuestionModelInput } from "./question-model-input";
+import {
+	bindPermissionRecovery,
+	isRecoveredHumanPermission,
+	type PersistedRecoveryGate,
+	recoveryReflection,
+} from "./recovery-gate";
 import { ApiRequestDumpCollector } from "./request-dump";
 import { detectShell } from "./shell";
 import {
@@ -1807,6 +1813,7 @@ export async function resolveExitPlanModeReflection(
 	config: AgentConfig,
 	history: unknown[],
 	toolUse: AgentToolUse,
+	recoveryGate?: PersistedRecoveryGate,
 ): Promise<ExitPlanReflectionGateResult> {
 	const locale = (config.locale as Locale) ?? "en";
 	const { loadPlanFileReadPolicy, resolveExitPlanModeInputWithBackend } = await import(
@@ -1831,7 +1838,31 @@ export async function resolveExitPlanModeReflection(
 		};
 	}
 
-	const requestId = `exit_plan_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+	const restoredReflection = recoveryReflection(recoveryGate);
+	if (
+		restoredReflection?.type === "plan_reflection" &&
+		restoredReflection.status === "awaiting_user"
+	) {
+		// A taken-over plan gate is no longer AI-owned. The caller must re-register
+		// the real ExitPlanMode permission under the original tool-call identity.
+		// Do not create a synthetic running gate or launch an auxiliary model request.
+		if (typeof toolUse.input.plan === "string" && toolUse.input.plan !== resolvedInput.input.plan) {
+			return {
+				decision: {
+					action: "revise",
+					feedback: "Plan changed while its approval was awaiting a user",
+				},
+				input: toolUse.input,
+			};
+		}
+		return {
+			decision: { action: "manual", reason: "Restored user-owned plan approval" },
+			input: resolvedInput.input,
+		};
+	}
+	const requestId =
+		restoredReflection?.requestId ??
+		`exit_plan_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 	const reflectionAbort = new AbortController();
 	const decisionPromise = createExitPlanReflectionDecision(requestId, {
 		narratorId: config.narratorId,
@@ -1840,6 +1871,8 @@ export async function resolveExitPlanModeReflection(
 		toolUseId: toolUse.toolUseId,
 		toolName: toolUse.name,
 		inputJson: resolvedInput.input,
+		toolCallId: recoveryGate?.id ?? config.toolExecutionBindings?.get(toolUse)?.toolCallId,
+		restoredStartedAt: restoredReflection?.startedAt,
 		abortController: reflectionAbort,
 	});
 	const onPreparationAbort = () => {
@@ -2182,6 +2215,8 @@ async function resolveTaskReflection(
 	history: unknown[],
 	toolUse: AgentToolUse,
 	candidateContent: string,
+	recoveryGate?: PersistedRecoveryGate,
+	onRestoredHumanWait?: () => void,
 ): Promise<{
 	decision: TaskReflectionDecision;
 	checkFailed?: boolean;
@@ -2195,9 +2230,22 @@ async function resolveTaskReflection(
 		filePath,
 		candidateContent,
 	);
-	if (analysis.protectedMutations.length === 0) return null;
-
-	const requestId = `task_reflect_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+	const restoredReflection = recoveryReflection(recoveryGate);
+	if (
+		restoredReflection?.type === "task_reflection" &&
+		restoredReflection.status === "awaiting_user"
+	) {
+		// User takeover freezes the question they were shown, even if the spec changed
+		// while the server was down. The actual spec write still revalidates on execution.
+		if (!Array.isArray(restoredReflection.mutations))
+			throw new Error("Invalid persisted task reflection");
+		analysis.protectedMutations = restoredReflection.mutations as ProtectedTaskMutation[];
+	}
+	if (analysis.protectedMutations.length === 0 && restoredReflection?.status !== "awaiting_user")
+		return null;
+	const requestId =
+		restoredReflection?.requestId ??
+		`task_reflect_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 	const reflectionAbort = new AbortController();
 	const decisionPromise = createTaskReflectionDecision(requestId, {
 		narratorId: config.narratorId,
@@ -2207,6 +2255,8 @@ async function resolveTaskReflection(
 		toolName: toolUse.name,
 		inputJson: input,
 		mutations: analysis.protectedMutations,
+		toolCallId: recoveryGate?.id ?? config.toolExecutionBindings?.get(toolUse)?.toolCallId,
+		restoredStartedAt: restoredReflection?.startedAt,
 		abortController: reflectionAbort,
 	});
 	const onPreparationAbort = () => {
@@ -2215,6 +2265,18 @@ async function resolveTaskReflection(
 	};
 	if (config.signal.aborted) onPreparationAbort();
 	else config.signal.addEventListener("abort", onPreparationAbort, { once: true });
+	if (restoredReflection?.status === "awaiting_user") {
+		const { takeOverTaskReflection } = await import("./tools/task-reflection");
+		await takeOverTaskReflection(requestId, "Restored user-owned task reflection");
+		onRestoredHumanWait?.();
+		try {
+			const decision = await decisionPromise;
+			return { decision, input, mutations: analysis.protectedMutations };
+		} finally {
+			config.signal.removeEventListener("abort", onPreparationAbort);
+			cleanupTaskReflection(requestId);
+		}
+	}
 	await markTaskReflectionStarted(requestId);
 	let reflectionDone = false;
 	let failedCheckFeedback: string | undefined;
@@ -2296,6 +2358,86 @@ async function resolveTaskReflection(
 interface ExecuteToolAfterReflectionsOptions {
 	admissionState?: ToolAdmissionState;
 	preAdmissionComplete?: boolean;
+	executeOptions?: Parameters<typeof executeTool>[2];
+	recoveryGate?: PersistedRecoveryGate;
+}
+
+/** Recovery/retry uses the same gates as the live loop, never the bare executor. */
+export async function executePersistedToolAfterReflections(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	history: unknown[],
+	options: Parameters<typeof executeTool>[2] & { recoveryGate?: PersistedRecoveryGate } = {},
+): Promise<ToolExecResult> {
+	if (options.recoveryGate?.executionStartedAt) {
+		return {
+			output: "Recovery refused: tool execution already started",
+			isError: true,
+			durationMs: 0,
+		};
+	}
+	if (options.recoveryGate && options.toolCallBinding?.toolCallId !== options.recoveryGate.id) {
+		return {
+			output: "Recovery refused: mismatched tool-call identity",
+			isError: true,
+			durationMs: 0,
+		};
+	}
+	// Pending gates must enter permission again, even if a caller supplied an old grant.
+	if (options.recoveryGate?.status === "pending") {
+		options = { ...options, preGrantedPermission: undefined };
+	}
+	const originalPermissionHandler = config.permissionHandler;
+	const recoveredConfig: AgentConfig = {
+		...config,
+		toolExecutionBindings: new WeakMap(),
+		permissionHandler: async (name, input, toolUseId, permissionOptions) => {
+			if (options.recoveryGate && permissionOptions) {
+				bindPermissionRecovery(permissionOptions, options.recoveryGate);
+			}
+			const result = await originalPermissionHandler(name, input, toolUseId, permissionOptions);
+			if (result.behavior !== "dangerReflection") return result;
+			if (recoveryReflection(options.recoveryGate)?.status === "awaiting_user") {
+				return result.decision;
+			}
+			return resolveDangerReflectionDecision(recoveredConfig, history, result, {
+				name,
+				input: result.input,
+				toolUseId,
+			});
+		},
+	};
+	if (options.toolCallBinding) {
+		recoveredConfig.toolExecutionBindings?.set(tu, options.toolCallBinding);
+	}
+	if (options.preFrozenTarget) {
+		const deviceId = options.preFrozenTarget.deviceId;
+		if (
+			(deviceId === "local" && config.allowLocalExecution === false) ||
+			(deviceId !== "local" && !config.availableDevices?.some((device) => device.id === deviceId))
+		) {
+			return {
+				output: "Recovery refused: frozen device is no longer authorized",
+				isError: true,
+				durationMs: 0,
+			};
+		}
+		const { resolveBackend } = await import("./execution/registry");
+		recoveredConfig.executionTarget = options.preFrozenTarget;
+		recoveredConfig.executionBackend = resolveBackend({
+			requested: options.preFrozenTarget.deviceId,
+		});
+	}
+	return executeToolAfterReflections(
+		tu,
+		recoveredConfig,
+		history,
+		(config.locale as Locale) ?? "en",
+		{
+			executeOptions: options,
+			recoveryGate: options.recoveryGate,
+		},
+	);
 }
 
 async function executeToolAfterReflections(
@@ -2305,7 +2447,9 @@ async function executeToolAfterReflections(
 	locale: Locale,
 	options: ExecuteToolAfterReflectionsOptions = {},
 ): Promise<ToolExecResult> {
-	const admissionState = options.admissionState ?? {};
+	const admissionState = options.admissionState ?? {
+		toolCallBinding: options.executeOptions?.toolCallBinding,
+	};
 	const reflectionRejection = getReflectionToolRejection(tu, config);
 	if (reflectionRejection) {
 		releaseToolAdmissionState(admissionState);
@@ -2320,6 +2464,19 @@ async function executeToolAfterReflections(
 	let admissionHandedToExecutor = false;
 	try {
 		const freezeExecution = async (): Promise<void> => {
+			// Recovery already carries an immutable target. The executor revalidates it at
+			// final start; resolving it afresh here would change selectionSource before approval.
+			if (options.executeOptions?.preFrozenTarget) {
+				await config.runtimeAuthorizationGuard?.();
+				const frozen = options.executeOptions.preFrozenTarget;
+				if (
+					frozen.runtimeGeneration !== undefined &&
+					config.executionBackend?.runtimeGeneration !== frozen.runtimeGeneration
+				) {
+					throw new Error("Frozen device runtime generation changed before reflection");
+				}
+				return;
+			}
 			if (!preFrozenExecution) preFrozenExecution = await freezeToolExecution(tu, config);
 		};
 		if (tu.name === "ExitPlanMode") {
@@ -2342,6 +2499,7 @@ async function executeToolAfterReflections(
 		): Promise<ToolExecResult> => {
 			admissionHandedToExecutor = true;
 			const result = await executeTool(tu, config, {
+				...options.executeOptions,
 				...executeOptions,
 				admissionState,
 				preAdmissionComplete,
@@ -2354,7 +2512,12 @@ async function executeToolAfterReflections(
 
 		// Decision-time reload: the permission-menu "计划反思" switch must apply to a
 		// still-running pass, not only to the next AgentConfig snapshot.
-		if (tu.name === "ExitPlanMode" && (await shouldRunExitPlanModeReflectionLive(config))) {
+		if (
+			tu.name === "ExitPlanMode" &&
+			!isRecoveredHumanPermission(options.recoveryGate) &&
+			(recoveryReflection(options.recoveryGate)?.type === "plan_reflection" ||
+				(await shouldRunExitPlanModeReflectionLive(config)))
+		) {
 			const reflectionConfig = preFrozenExecution
 				? {
 						...config,
@@ -2362,7 +2525,12 @@ async function executeToolAfterReflections(
 						executionTarget: preFrozenExecution.target,
 					}
 				: config;
-			const reflected = await resolveExitPlanModeReflection(reflectionConfig, history, tu);
+			const reflected = await resolveExitPlanModeReflection(
+				reflectionConfig,
+				history,
+				tu,
+				options.recoveryGate,
+			);
 			if (reflected.decision.action === "manual") {
 				tu.input = reflected.input;
 				// User manually took over the plan reflection; the loop falls back to the
@@ -2417,7 +2585,14 @@ async function executeToolAfterReflections(
 					// taskReflection persists permission-like status on the original row. Admission
 					// already passed; now freeze the deterministic spec target before reflection.
 					await freezeExecution();
-					const reflected = await resolveTaskReflection(config, history, tu, candidateContent);
+					const reflected = await resolveTaskReflection(
+						config,
+						history,
+						tu,
+						candidateContent,
+						options.recoveryGate,
+						() => releaseToolAdmissionState(admissionState),
+					);
 					if (reflected) {
 						tu.input = reflected.input;
 						if (reflected.decision.action !== "confirm") {
@@ -2449,6 +2624,13 @@ async function executeToolAfterReflections(
 						}
 					}
 				} catch (err) {
+					if (recoveryReflection(options.recoveryGate)?.type === "task_reflection") {
+						return {
+							output: `Task reflection recovery failed: ${extractErrorMessage(err)}`,
+							isError: true,
+							durationMs: 0,
+						};
+					}
 					logger.debug("Skipping taskReflection preflight", {
 						toolUseId: tu.toolUseId,
 						error: err instanceof Error ? err.message : String(err),
@@ -6906,6 +7088,7 @@ async function* agentLoopInMetadataSnapshot(
 			// rely on this to finalize persistence, broadcast the message, run hooks, and update titles.
 			yield {
 				type: "assistant_message",
+				outputCompleted: !pendingResumableError,
 				onToolPersisted: (toolUseId, binding) => {
 					const tu = toolUses.find((tool) => tool.toolUseId === toolUseId);
 					if (tu) bindExecution(tu, binding);

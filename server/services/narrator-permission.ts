@@ -41,6 +41,11 @@ import {
 	FS_READ_ATOMIC_RESOLVED_PATH_FEATURE,
 	FS_STAT_RESOLVED_PATH_FEATURE,
 } from "../lib/agent/execution/rpc-types";
+import {
+	getPermissionRecovery,
+	isRecoveredHumanPermission,
+	recoveryReflection,
+} from "../lib/agent/recovery-gate";
 import { detectShell } from "../lib/agent/shell";
 import { isModelPlanReference } from "../lib/agent/strip-plan-body";
 import { isBashToolName } from "../lib/agent/tool-name";
@@ -4941,7 +4946,7 @@ export async function handlePermission(
 	// Deliberately decided BEFORE policy compilation: stop/await run no command and
 	// touch no path, so directory/command policy (and its compile failures) do not
 	// apply. OAuth-denied devices and review read-only mode are rejected above.
-	if (isBashControlOp) {
+	if (isBashControlOp && !isRecoveredHumanPermission(getPermissionRecovery(options))) {
 		await options?.onInputResolved?.(effectiveInput);
 		await db
 			.update(narratorToolCalls)
@@ -4985,6 +4990,13 @@ export async function handlePermission(
 			activeNarrators.get(narratorId)?._planFilePath,
 			{ narratorId, compiledPolicy },
 		);
+		if (
+			isRecoveredHumanPermission(getPermissionRecovery(options)) &&
+			typeof input.plan === "string" &&
+			input.plan !== resolved.input.plan
+		) {
+			return { behavior: "deny", message: "Plan changed while its approval was awaiting a user" };
+		}
 		effectiveInput = resolved.input;
 		exitPlanResolvedFromFile = resolved.resolvedFromFile;
 		exitPlanSource = resolved.ok ? resolved.planSource : undefined;
@@ -5050,6 +5062,12 @@ export async function handlePermission(
 		bashNonWhitelisted: bashAnalysis?.nonWhitelisted,
 		bashHasWrite: bashAnalysis?.hasWriteOperation,
 	});
+
+	const restoredGate = getPermissionRecovery(options);
+	const restoredReflection = recoveryReflection(restoredGate);
+	// A durable human wait is not a new permission decision. Policy expansion after
+	// restart must never silently approve it; hard deny/fatal decisions remain enforced.
+	if (isRecoveredHumanPermission(restoredGate) && decision === "allow") decision = "ask";
 
 	const effectiveMode = getEffectivePermissionMode(
 		decisionPermMode,
@@ -5242,6 +5260,29 @@ export async function handlePermission(
 			decision: decisionPromise,
 		};
 	};
+	if (
+		restoredReflection?.type === "danger_reflection" &&
+		["running", "awaiting_user"].includes(restoredReflection.status) &&
+		(decision === "allow" || decision === "ask")
+	) {
+		const restoredDanger = restoredReflection.danger as DangerInfo | undefined;
+		if (
+			!restoredDanger ||
+			typeof restoredDanger.summary !== "string" ||
+			typeof restoredReflection.fingerprint !== "string"
+		) {
+			return { behavior: "deny", message: "Invalid persisted danger reflection" };
+		}
+		const pause = await startDangerReflectionPause(restoredDanger, restoredReflection.fingerprint, {
+			skipConfirmationCache: true,
+			planModeSoftDeny: restoredReflection.planModeSoftDeny === true,
+		});
+		if (pause?.behavior === "dangerReflection" && restoredReflection.status === "awaiting_user") {
+			await stopDangerReflectionLoop(pause.requestId, "Restored user-owned danger reflection");
+			options?.onAwaitingUserDecision?.();
+		}
+		if (pause) return pause;
+	}
 	// An external narrator under bypassPermissions reaches here with decision "ask" as well:
 	// there is nobody to ask, so reflection is its review path rather than a denial.
 	const oauthDangerReflectionCandidate =
@@ -5535,7 +5576,9 @@ export async function handlePermission(
 	// deadline up front so the timer, the request broadcast, and later reconnects
 	// all agree on the same countdown target.
 	const questionReflectionDeadline =
-		toolName === "AskUserQuestion" && shouldScheduleQuestionReflection(effectiveMode)
+		toolName === "AskUserQuestion" &&
+		!isRecoveredHumanPermission(restoredGate) &&
+		shouldScheduleQuestionReflection(effectiveMode)
 			? Date.now() + getQuestionReflectionTimeoutMs()
 			: undefined;
 
@@ -5710,6 +5753,9 @@ async function handlePermissionRuleRequest(args: {
 			args.input,
 			context,
 		);
+		if (isRecoveredHumanPermission(getPermissionRecovery(options))) {
+			prepared = { ...prepared, automatic: false };
+		}
 		await options.onInputResolved?.(prepared.input);
 	} catch (error) {
 		return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
@@ -6456,6 +6502,44 @@ export async function resolvePermissionOrDangerReflection(
 	decision: "allow" | "deny",
 	opts: ResolvePermissionOpts = {},
 ): Promise<boolean> {
+	// --no-auto-resume leaves durable approvals intact, but mounts no executing owner.
+	// An explicit human decision may restore this one owner's subtree, never unrelated work.
+	if (
+		!pendingPermissions.has(requestId) &&
+		!pendingDangerReflections.has(requestId) &&
+		(opts.decidedBy ?? "user") === "user"
+	) {
+		const { manuallyResumeRestartRecovery, pausedRestartToolCallForRequest } = await import(
+			"./restart-recovery-service"
+		);
+		const stored = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, pausedRestartToolCallForRequest(requestId)),
+			columns: {
+				narratorId: true,
+				status: true,
+				executionStartedAt: true,
+				fileChangeOperationId: true,
+			},
+		});
+		if (
+			stored?.status === "pending" &&
+			stored.executionStartedAt == null &&
+			stored.fileChangeOperationId == null
+		) {
+			if (await manuallyResumeRestartRecovery(stored.narratorId)) {
+				const deadline = Date.now() + 2_000;
+				while (
+					!pendingPermissions.has(requestId) &&
+					!pendingDangerReflections.has(requestId) &&
+					Date.now() < deadline
+				) {
+					const { hasPendingTaskReflection } = await import("../lib/agent/tools/task-reflection");
+					if (hasPendingTaskReflection(requestId)) break;
+					await new Promise<void>((resolve) => setTimeout(resolve, 10));
+				}
+			}
+		}
+	}
 	if (pendingPermissions.has(requestId)) {
 		return resolvePermission(requestId, decision, opts);
 	}

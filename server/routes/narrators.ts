@@ -2501,6 +2501,15 @@ narratorRoutes.post("/:id/continue", async (c) => {
 			deletedMessageIds: [recoveryMessageId],
 		});
 	};
+	const { manuallyResumeRestartRecovery } = await import("../services/restart-recovery-service");
+	if (await manuallyResumeRestartRecovery(id)) {
+		await dismissRecoveryMessage();
+		return c.json({
+			ok: true,
+			recovering: true,
+			deletedMessageIds: recoveryMessageId ? [recoveryMessageId] : [],
+		});
+	}
 	if (isSubagentVariant(narrator.variant)) {
 		await resumeSubagent({
 			subagentId: id,

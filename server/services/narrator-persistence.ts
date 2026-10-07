@@ -2054,6 +2054,7 @@ const sqliteNarratorPersistence = {
 					id?: string;
 					revision?: number;
 					rawTextLength?: number;
+					completed?: boolean;
 			  }
 			| {
 					type: "reasoning";
@@ -2061,6 +2062,7 @@ const sqliteNarratorPersistence = {
 					id?: string;
 					revision?: number;
 					rawTextLength?: number;
+					completed?: boolean;
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
 			  }
@@ -2115,6 +2117,7 @@ const sqliteNarratorPersistence = {
 					id?: string;
 					revision?: number;
 					rawTextLength?: number;
+					completed?: boolean;
 			  }
 			| {
 					type: "reasoning";
@@ -2122,6 +2125,7 @@ const sqliteNarratorPersistence = {
 					id?: string;
 					revision?: number;
 					rawTextLength?: number;
+					completed?: boolean;
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
 			  }
@@ -3285,9 +3289,23 @@ const sqliteNarratorPersistence = {
 					"An already-started tool attempt requires reconciliation, not re-execution",
 				);
 			}
-			if (resume && !shared && source.narratorId === narratorId) {
+			if (resume && source.narratorId === narratorId) {
 				if (!["initializing", "pending", "running"].includes(source.status)) {
 					throw new ValidationError("Only an unstarted pending attempt can resume");
+				}
+				if (shared) {
+					const retainedId = await this.copyOnWriteMessage(
+						narratorId,
+						source.messageId,
+						undefined,
+						{
+							preserveExecutionOwner: true,
+						},
+					);
+					if (retainedId !== source.messageId)
+						throw new ValidationError(
+							"Only the actual execution owner can resume a shared attempt",
+						);
 				}
 				return { toolCall: source, requiresFreshPermission: false };
 			}
@@ -3758,6 +3776,7 @@ const sqliteNarratorPersistence = {
 		narratorId: string,
 		messageId: string,
 		overrides?: Partial<typeof narratorMessages.$inferInsert>,
+		options: { preserveExecutionOwner?: boolean } = {},
 	): Promise<string> {
 		const ref = await db.query.narratorMessageRefs.findFirst({
 			where: and(
@@ -3766,12 +3785,6 @@ const sqliteNarratorPersistence = {
 			),
 		});
 		if (!ref) throw new NotFoundError("Message", messageId);
-
-		const [refCount] = await db
-			.select({ count: sql<number>`count(*)` })
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.messageId, messageId));
-		const isShared = (refCount?.count ?? 0) > 1;
 		const semanticEdit =
 			overrides != null &&
 			(Object.hasOwn(overrides, "contentJson") || Object.hasOwn(overrides, "contentText"));
@@ -3789,105 +3802,131 @@ const sqliteNarratorPersistence = {
 				),
 			};
 		}
-		if (!isShared) {
-			if (overrides && Object.keys(overrides).length > 0) {
-				db.transaction((tx) => {
+		const now = new Date().toISOString();
+		const refreshedRecipients: string[] = [];
+		const result = db.transaction((tx) => {
+			const original = tx.query.narratorMessages
+				.findFirst({ where: eq(narratorMessages.id, messageId) })
+				.sync();
+			if (!original) throw new NotFoundError("Message", messageId);
+			// Read ref membership atomically with the rewrite, including forks made while the
+			// caller awaited context accounting. Never mutate a newly-shared row in place.
+			const recipients = tx
+				.select({ id: narratorMessageRefs.id, narratorId: narratorMessageRefs.narratorId })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.messageId, messageId))
+				.limit(1_001)
+				.all();
+			if (recipients.length > 1_000)
+				throw new ValidationError("Message COW exceeds the 1000-recipient limit");
+			const currentRef = recipients.find((recipient) => recipient.narratorId === narratorId);
+			if (!currentRef) throw new NotFoundError("Message", messageId);
+			const bumpVersion = (recipientId: string, replacementId: string) => {
+				const narrator = tx.query.narrators
+					.findFirst({ where: eq(narrators.id, recipientId), columns: { forkMessageId: true } })
+					.sync();
+				tx.update(narrators)
+					.set({
+						...(narrator?.forkMessageId === messageId ? { forkMessageId: replacementId } : {}),
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						updatedAt: now,
+					})
+					.where(eq(narrators.id, recipientId))
+					.run();
+			};
+			const updateOriginal = () => {
+				if (overrides && Object.keys(overrides).length > 0) {
 					tx.update(narratorMessages)
 						.set(overrides)
 						.where(eq(narratorMessages.id, messageId))
 						.run();
 					if (semanticEdit)
-						updateRecipientMessageRef(tx, narratorId, ref.id, {
+						updateRecipientMessageRef(tx, narratorId, currentRef.id, {
 							kind: "semantic_edit",
 							messageId,
 						});
-					tx.update(narrators)
-						.set({
-							messageVersion: sql`${narrators.messageVersion} + 1`,
-							updatedAt: new Date().toISOString(),
-						})
-						.where(eq(narrators.id, narratorId))
-						.run();
-				});
-			}
-			return messageId;
-		}
-
-		const newMessageId = generateId();
-		const now = new Date().toISOString();
-
-		db.transaction((tx) => {
-			const original = tx.query.narratorMessages
-				.findFirst({
-					where: eq(narratorMessages.id, messageId),
-				})
-				.sync();
-			if (!original) throw new NotFoundError("Message", messageId);
-
-			tx.insert(narratorMessages)
-				.values({
-					...original,
-					...overrides,
-					id: newMessageId,
-					narratorId,
-					createdAt: original.createdAt,
-				})
-				.run();
-
-			tx.update(narratorMessageRefs)
-				.set({ messageId: newMessageId })
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, messageId),
-					),
-				)
-				.run();
-
-			updateRecipientMessageRef(tx, narratorId, ref.id, {
-				kind: semanticEdit ? "semantic_edit" : "cow",
-				messageId: newMessageId,
-			});
-
+					bumpVersion(narratorId, messageId);
+				}
+				return messageId;
+			};
+			if (recipients.length === 1) return updateOriginal();
 			const originalToolCalls = tx.query.narratorToolCalls
-				.findMany({
-					where: eq(narratorToolCalls.messageId, messageId),
-				})
+				.findMany({ where: eq(narratorToolCalls.messageId, messageId), limit: 1_001 })
 				.sync();
-			if (originalToolCalls.length > 0) {
-				tx.insert(narratorToolCalls)
-					.values(
-						originalToolCalls.map((tc) => ({
-							...tc,
-							executionOriginToolCallId: tc.executionOriginToolCallId ?? tc.id,
-							id: generateId(),
-							narratorId,
-							messageId: newMessageId,
-							createdAt: now,
-						})),
-					)
+			if (originalToolCalls.length > 1_000)
+				throw new ValidationError("Message COW exceeds the 1000-tool limit");
+			const cloneRecipient = (
+				recipient: { id: string; narratorId: string },
+				changes: Partial<typeof narratorMessages.$inferInsert> | undefined,
+				kind: "semantic_edit" | "cow",
+			) => {
+				const replacementId = generateId();
+				tx.insert(narratorMessages)
+					.values({
+						...original,
+						...changes,
+						id: replacementId,
+						narratorId: recipient.narratorId,
+						createdAt: original.createdAt,
+					})
 					.run();
+				tx.update(narratorMessageRefs)
+					.set({ messageId: replacementId })
+					.where(eq(narratorMessageRefs.id, recipient.id))
+					.run();
+				updateRecipientMessageRef(tx, recipient.narratorId, recipient.id, {
+					kind,
+					messageId: replacementId,
+				});
+				if (originalToolCalls.length)
+					tx.insert(narratorToolCalls)
+						.values(
+							originalToolCalls.map((call) => ({
+								...call,
+								executionOriginToolCallId: call.executionOriginToolCallId ?? call.id,
+								id: generateId(),
+								narratorId: recipient.narratorId,
+								messageId: replacementId,
+								createdAt: now,
+							})),
+						)
+						.run();
+				bumpVersion(recipient.narratorId, replacementId);
+				refreshedRecipients.push(recipient.narratorId);
+				return replacementId;
+			};
+			if (
+				options.preserveExecutionOwner &&
+				original.narratorId === narratorId &&
+				originalToolCalls.some(
+					(call) =>
+						call.narratorId === narratorId &&
+						call.executionIdentityVersion === 1 &&
+						call.executionOriginToolCallId === null,
+				)
+			) {
+				// Output cleanup/finalization is not a new tool attempt. Isolate the historical
+				// recipients instead: keep the actual owner's message ID, tool PK, approval,
+				// continuation and Agent origin bindings intact. Copies remain history-only.
+				const copyCount = recipients.length - 1;
+				const snapshotBytes =
+					Buffer.byteLength(JSON.stringify(original)) +
+					Buffer.byteLength(JSON.stringify(originalToolCalls));
+				if (
+					copyCount * (originalToolCalls.length + 1) > 10_000 ||
+					copyCount * snapshotBytes > 8 * 1024 * 1024
+				)
+					throw new ValidationError(
+						"Execution-owner output COW exceeds the bounded snapshot budget",
+					);
+				for (const recipient of recipients)
+					if (recipient.narratorId !== narratorId) cloneRecipient(recipient, undefined, "cow");
+				return updateOriginal();
 			}
-
-			const narrator = tx.query.narrators
-				.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { forkMessageId: true },
-				})
-				.sync();
-			const narratorUpdates: Partial<typeof narrators.$inferInsert> = {};
-			if (narrator?.forkMessageId === messageId) narratorUpdates.forkMessageId = newMessageId;
-			tx.update(narrators)
-				.set({
-					...narratorUpdates,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					updatedAt: now,
-				})
-				.where(eq(narrators.id, narratorId))
-				.run();
+			return cloneRecipient(currentRef, overrides, semanticEdit ? "semantic_edit" : "cow");
 		});
-
-		return newMessageId;
+		for (const recipient of refreshedRecipients) queueContextCharacterRefresh(recipient);
+		return result;
 	},
 
 	async copyOnWriteToolCallMessage(

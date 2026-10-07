@@ -23,6 +23,7 @@ interface Lane {
 	citations: Map<string, ProviderTextCitation>;
 	revision: number;
 	publishedRevision: number;
+	completed: boolean;
 }
 
 function mergeMetadata(
@@ -114,6 +115,7 @@ export class OutputContentAccumulator {
 				citations: new Map(),
 				revision: 0,
 				publishedRevision: 0,
+				completed: false,
 			};
 			this.lanes.push(lane);
 		}
@@ -170,6 +172,8 @@ export class OutputContentAccumulator {
 			this.totalTextLength += text.length;
 		}
 		lane.text += text;
+		// A late delta reopens a previously completed native lane.
+		lane.completed = false;
 		if (metadata) lane.metadata = mergeMetadata(lane.metadata, metadata);
 		lane.revision++;
 		this.dirty.add(lane);
@@ -263,6 +267,12 @@ export class OutputContentAccumulator {
 			return;
 		}
 		const lane = this.resolve(event.kind, event, true);
+		if (event.phase === "complete" && !lane.completed) {
+			lane.completed = true;
+			// Completion is a durable state transition, even without new text.
+			lane.revision++;
+			this.dirty.add(lane);
+		}
 		yield* this.publish(lane);
 		if (event.phase === "complete") {
 			if (this.active === lane) this.active = undefined;
@@ -295,6 +305,7 @@ export class OutputContentAccumulator {
 		const identity = {
 			id: lane.id,
 			revision: lane.revision,
+			completed: lane.completed,
 			rawTextLength: lane.text.length,
 			outputIndex: lane.nativeIndex ?? lane.order,
 		};

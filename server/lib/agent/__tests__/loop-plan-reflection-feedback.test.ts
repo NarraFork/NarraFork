@@ -196,6 +196,76 @@ function assertCheckFailure(output: string, locale: Locale) {
 }
 
 describe("ExitPlanMode gate failure feedback", () => {
+	test("restored awaiting_user returns to the original permission without starting AI", async () => {
+		const result = await resolveExitPlanModeReflection(
+			{
+				narratorId: "n-plan-reflection-feedback",
+				conversationId: "conv-plan-reflection-feedback",
+				provider: "test",
+				model: "test:model",
+				cwd: "/tmp",
+				signal: new AbortController().signal,
+				permissionHandler: async () => ({ behavior: "allow" }),
+			},
+			[],
+			{
+				toolUseId: "plan-feedback-exit",
+				name: "ExitPlanMode",
+				input: { plan: "Add regression coverage, then run the isolated tests." },
+			},
+			{
+				id: "original-plan-call",
+				status: "pending",
+				permissionSuggestions: [
+					{
+						type: "plan_reflection",
+						status: "awaiting_user",
+						requestId: "original-plan-reflection",
+						startedAt: "2025-01-02T03:04:05.000Z",
+					},
+				],
+			},
+		);
+		expect(result.decision.action).toBe("manual");
+		expect(requests).toHaveLength(0);
+		expect(pending.size).toBe(0);
+		expect(failureOptions).toHaveLength(0);
+	});
+
+	test("restored user-owned plan refuses a changed plan without starting AI", async () => {
+		const result = await resolveExitPlanModeReflection(
+			{
+				narratorId: "n-plan-reflection-feedback",
+				conversationId: "conv-plan-reflection-feedback",
+				provider: "test",
+				model: "test:model",
+				cwd: "/tmp",
+				signal: new AbortController().signal,
+				permissionHandler: async () => ({ behavior: "allow" }),
+			},
+			[],
+			{
+				toolUseId: "plan-feedback-exit",
+				name: "ExitPlanMode",
+				input: { plan: "Original user-owned plan" },
+			},
+			{
+				id: "original-plan-call",
+				status: "pending",
+				permissionSuggestions: [
+					{
+						type: "plan_reflection",
+						status: "awaiting_user",
+						requestId: "original-plan-reflection",
+					},
+				],
+			},
+		);
+		expect(result.decision.action).toBe("revise");
+		expect(result.input.plan).toBe("Original user-owned plan");
+		expect(requests).toHaveLength(0);
+		expect(pending.size).toBe(0);
+	});
 	for (const locale of ["en", "zh-CN"] as const) {
 		test(`${locale}: two disallowed Edits report a failed check, not a rejected plan`, async () => {
 			const { result, output } = await runGate(locale);

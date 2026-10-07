@@ -7,6 +7,30 @@ function blocks(events: Iterable<AgentEvent>) {
 }
 
 describe("output content lifecycle", () => {
+	test("native complete persists a new revision even after an unchanged checkpoint", () => {
+		const content = new OutputContentAccumulator();
+		const lane = { blockId: "native", outputIndex: 0 };
+		content.append("text", "answer", lane);
+		expect(
+			blocks(content.boundary({ kind: "text", phase: "checkpoint", ...lane }))[0],
+		).toMatchObject({ text: "answer", revision: 1, completed: false });
+		expect(blocks(content.boundary({ kind: "text", phase: "complete", ...lane }))[0]).toMatchObject(
+			{ text: "answer", revision: 2, completed: true },
+		);
+		expect(blocks(content.boundary({ kind: "text", phase: "complete", ...lane }))).toEqual([]);
+		expect(blocks(content.flush())).toEqual([]);
+		content.append("text", " tail", lane);
+		expect(blocks(content.flush())[0]).toMatchObject({ revision: 3, completed: false });
+	});
+
+	test("abort/error flush does not promote checkpointed lanes to completed", () => {
+		const content = new OutputContentAccumulator();
+		content.append("reasoning", "unfinished thought");
+		expect(blocks(content.flush())[0]).toMatchObject({ completed: false });
+		expect(blocks(content.flush())).toEqual([]);
+		expect(content.orderedContent()[0]).toMatchObject({ completed: false });
+	});
+
 	test("a lane change commits the previous block before the next lane's delta", () => {
 		const content = new OutputContentAccumulator();
 		blocks(content.begin("reasoning"));
@@ -18,6 +42,7 @@ describe("output content lifecycle", () => {
 				revision: reasoning.blockRevision,
 				outputIndex: 0,
 				rawTextLength: 7,
+				completed: false,
 				text: "thought",
 				providerMetadata: undefined,
 			},
@@ -30,6 +55,7 @@ describe("output content lifecycle", () => {
 				revision: text.blockRevision,
 				outputIndex: 1,
 				rawTextLength: 6,
+				completed: false,
 				text: "answer",
 			},
 		]);

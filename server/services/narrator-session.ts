@@ -65,6 +65,7 @@ import {
 	isSubagentVariant,
 	parseSubstatus,
 	parseTraits,
+	redactDraftTraits,
 } from "../lib/narrator-utils";
 import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
 import { resolveExistingPlanFileRelPath } from "../lib/plan-file-path";
@@ -5505,8 +5506,15 @@ async function reExecuteDeniedToolCallUnlocked(
 					input: toolInput,
 				});
 
-				const { executeTool } = await import("../lib/agent/tool-executor");
+				const { executePersistedToolAfterReflections } = await import("../lib/agent/loop");
 				const toolName = toolCall.toolName;
+				const reflectionHistory = await buildRuntimeHistory({
+					narratorId,
+					model: active.model,
+					provider: active.provider,
+					profile: isSubagent ? "subagent" : "primary",
+					sourceMessages: await narratorService.getModelHistorySinceLastCompact(narratorId),
+				});
 
 				// Reuse the same runtime/device ACL ceiling as the ordinary loop, including recovery.
 				const oauthRuntime = await assertOAuthNarratorRuntimeActive(
@@ -5522,8 +5530,19 @@ async function reExecuteDeniedToolCallUnlocked(
 				const parentToolUseId = isSubagent
 					? (rerunMessage?.parentToolUseId ?? undefined)
 					: undefined;
+				const { resolveEffectiveRelaxedPlan } = await import("../lib/permission-modes");
 				const config: import("../lib/agent").AgentConfig = {
 					narratorId,
+					systemPrompt: active.systemPrompt ?? undefined,
+					permissionMode: oauthRuntime?.permissionMode ?? narrator.permissionMode ?? "default",
+					planMode: !oauthRuntime && isPlanModeTrait(narrator.traits),
+					relaxedPlan:
+						!oauthRuntime &&
+						resolveEffectiveRelaxedPlan(narrator.permissionMode, narrator.relaxedPlan),
+					planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
+					planReflectionAutoApproveOverride: normalizeBooleanOverride(
+						narrator.planReflectionAutoApproveOverride,
+					),
 					conversationId: active.conversationId,
 					model: active.model,
 					provider: active.provider,
@@ -5672,11 +5691,13 @@ async function reExecuteDeniedToolCallUnlocked(
 				const preFrozenTarget = reconstructToolExecutionTarget(sourceToolCall);
 
 				try {
-					const result = await executeTool(
+					const result = await executePersistedToolAfterReflections(
 						{ name: toolName, input: toolInput, toolUseId },
 						config,
+						reflectionHistory.history,
 						{
 							toolCallBinding,
+							recoveryGate: restoringPersistedCall ? sourceToolCall : undefined,
 							...(options?.permissionMode === "normal" ||
 							preparedAttempt.requiresFreshPermission ||
 							!!oauthRuntime ||
@@ -5687,6 +5708,37 @@ async function reExecuteDeniedToolCallUnlocked(
 						},
 					);
 
+					if (!result.isError && toolName === "ExitPlanMode") {
+						const { exitNarratorPlanMode } = await import("./narrator-plan-mode");
+						const planState = await exitNarratorPlanMode(narratorId);
+						active._preparedPlanModes?.clear();
+						active._planFileId = undefined;
+						active._planFilePath = undefined;
+						active._previousPermissionMode = undefined;
+						active._planModeLive = undefined;
+						active._relaxedPlanLive = undefined;
+						planModeAskedOnce.delete(narratorId);
+						if (planState.wasPlanMode)
+							broadcastToNarrator(narratorId, {
+								type: "plan_mode_changed",
+								narratorId,
+								planMode: false,
+								traits: redactDraftTraits(planState.traits),
+							});
+						if (pendingPlanCompact.delete(narratorId)) {
+							const planText =
+								typeof result.updatedInput?.plan === "string"
+									? result.updatedInput.plan
+									: typeof toolInput.plan === "string"
+										? toolInput.plan
+										: null;
+							if (planText) {
+								const { runPlanCompact } = await import("./narrator-compact");
+								await runPlanCompact(narratorId, planText);
+								broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+							}
+						}
+					}
 					await narratorService.updateToolCallResult(
 						toolUseId,
 						{

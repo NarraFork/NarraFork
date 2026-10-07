@@ -124,6 +124,13 @@ import {
 	type VerifiedPublicShare,
 	verifyPublicShare,
 } from "./services/public-narrator-share-service";
+import {
+	automaticResumeEnabled,
+	mergeStartupProtection,
+	prepareOrdinaryRestartRecovery,
+	prepareSignalRestartRecovery,
+	restoreOrdinaryRestartRecovery,
+} from "./services/restart-recovery-service";
 import { initReviewEventHandler } from "./services/review-event-handler";
 import { terminalService } from "./services/terminal-service";
 import {
@@ -1420,6 +1427,7 @@ pluginManager
 	});
 
 function startQuestionAnswerRecovery(): void {
+	if (!automaticResumeEnabled()) return;
 	void recoverPendingQuestionAnswerDeliveries().catch((error) => {
 		logger.error("Pending question answer recovery failed", { error: String(error) });
 	});
@@ -1429,14 +1437,16 @@ function startQuestionAnswerRecovery(): void {
 // admission barrier covers generic recovery, browser-session handoff restoration, and mounting the
 // ordered continuation queue; terminal Agent/Await work and interactive permissions continue in
 // the background after that queue is mounted.
-getPlannedUpdateStartupProtection()
+getPlannedUpdateStartupProtection({ claimAuthorization: automaticResumeEnabled() })
 	.then(async (plannedUpdate) => {
 		// The instance lock is already held. Release only previous-process mailbox claims
 		// before planned recovery mounts owners; hot reload preserves the process marker.
 		await import("./services/agent-runtime/inbox").then(({ recoverInboxClaimsOnColdStartup }) =>
 			recoverInboxClaimsOnColdStartup(),
 		);
-		await recoverNarrators(plannedUpdate.protection);
+		const ordinaryRestart = await prepareOrdinaryRestartRecovery(plannedUpdate.protection);
+		const protection = mergeStartupProtection(plannedUpdate.protection, ordinaryRestart.protection);
+		await recoverNarrators(protection);
 		await restorePendingModelOverrides();
 		// Browser-backed narrators must see their restored sessions before planned-update continuation
 		// starts. Keep failures non-fatal: affected narrators receive a persisted diagnostic instead.
@@ -1447,12 +1457,18 @@ getPlannedUpdateStartupProtection()
 					error: err instanceof Error ? err.message : String(err),
 				});
 			});
-		const plannedRecovery = await restoreNarratorsAfterPlannedUpdate(plannedUpdate);
-		if (plannedRecovery) startupReadiness.markRecovering();
+		const recoveryHandles = automaticResumeEnabled()
+			? await Promise.all([
+					restoreNarratorsAfterPlannedUpdate(plannedUpdate),
+					restoreOrdinaryRestartRecovery(ordinaryRestart),
+				])
+			: [];
+		const completions = recoveryHandles.flatMap((handle) => (handle ? [handle.completion] : []));
+		if (completions.length) startupReadiness.markRecovering();
 		else startupReadiness.markReady();
 		startupReadiness.settle({ ok: true });
-		if (plannedRecovery) {
-			plannedRecovery.completion
+		if (completions.length) {
+			Promise.all(completions)
 				.then(() => {
 					startupReadiness.markReady();
 					startQuestionAnswerRecovery();
@@ -1733,6 +1749,9 @@ async function performGracefulShutdown(
 		// steps below are what guarantee later teardown cannot race a handler that writes to SQLite
 		// after the clean marker.
 		acceptingHttpRequests = false;
+		if (options.reason === "signal") {
+			await shutdownStep(tracker, "restartRecovery.prepare", prepareSignalRestartRecovery, 5_000);
+		}
 		await shutdownStep(
 			tracker,
 			"workspaceReconciliation.stop",

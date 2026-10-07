@@ -48,6 +48,7 @@ import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
 import { FileReferenceContextTracker } from "./file-reference-context";
 import { storeNarratorContextUsage } from "./narrator-context-composition";
+import { completeAssistantOutput } from "./narrator-output-recovery";
 import { bumpNarratorMessageVersion, narratorPersistence } from "./narrator-persistence";
 import type { EnterPlanModeToolResultCommit } from "./narrator-plan-mode";
 import {
@@ -1756,6 +1757,7 @@ export async function processEvent(
 					...(textBlockId ? { id: textBlockId } : {}),
 					...(block.revision != null ? { revision: block.revision } : {}),
 					...(block.rawTextLength != null ? { rawTextLength: block.rawTextLength } : {}),
+					...(block.completed != null ? { completed: block.completed } : {}),
 					...(fileReferenceContext ? { fileReferenceContext } : {}),
 					...(block.citations ? { citations: block.citations } : {}),
 				});
@@ -1774,6 +1776,7 @@ export async function processEvent(
 					...(block.id ? { id: block.id } : {}),
 					...(block.revision != null ? { revision: block.revision } : {}),
 					...(block.rawTextLength != null ? { rawTextLength: block.rawTextLength } : {}),
+					...(block.completed != null ? { completed: block.completed } : {}),
 					providerMetadata: block.providerMetadata,
 					outputIndex: block.outputIndex,
 				});
@@ -1976,6 +1979,7 @@ export async function processEvent(
 					content.push({
 						type: "text",
 						text: event.text,
+						completed: event.outputCompleted !== false,
 						...(fileReferenceContext ? { fileReferenceContext } : {}),
 						...(event.citations?.length ? { citations: event.citations } : {}),
 					});
@@ -2034,6 +2038,13 @@ export async function processEvent(
 				if (usageData && ctx.provider && ctx.model) {
 					await updateMessageUsage(savedId, usageData, ctx.provider, ctx.model);
 				}
+			}
+
+			// A checkpoint/abort flush is not a completion boundary. Only this final
+			// successful event promotes remaining text/reasoning blocks to completed.
+			if (event.outputCompleted !== false) {
+				savedId = await completeAssistantOutput(narratorId, savedId);
+				if (partialId && savedId !== partialId) ctx.setPartialMessageId(savedId);
 			}
 
 			// Load full message with tool calls for broadcast and exact EnterPlanMode row identity.
