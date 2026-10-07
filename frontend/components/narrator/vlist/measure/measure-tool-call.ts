@@ -125,7 +125,7 @@ import {
 import type { ReflectionNoticeData } from "@shared/pretext-layout/reflection";
 import { BARE_ROW_GAP, BARE_ROW_ICON } from "@shared/pretext-layout/row-metrics";
 import { letterSpacingPxFor, scaleFontSize } from "@shared/pretext-layout/typography";
-import { resolveToolDisplayDurationMs } from "@shared/tool-display-duration";
+import { type FileChangeTiming, resolveToolDisplayDurationMs } from "@shared/tool-display-duration";
 import { MARKDOWN_CONSTANTS } from "../parse-markdown";
 import {
 	accumulateFrame,
@@ -618,8 +618,9 @@ export interface ToolCallData {
 	 * in the vlist card.
 	 */
 	durationMs?: number | null;
-	/** Pure execution time (bash `_metadata.execDurationMs`), preferred when set. */
+	/** Tool execution span (`_metadata.execDurationMs`), fallback when lifecycle stamps are absent. */
 	execDurationMs?: number | null;
+	fileChangeTiming?: FileChangeTiming | null;
 	/** Start epoch (ms) for the live elapsed timer. */
 	startedAt?: number | null;
 	/** Effective timeout (ms) shown after the duration. */
@@ -690,6 +691,8 @@ export interface ToolCallData {
  * HEIGHT-NEUTRAL — the popover is portaled.
  */
 export interface ToolTimingStamps {
+	execDurationMs?: number | null;
+	fileChangeTiming?: FileChangeTiming | null;
 	startedAt: number | null;
 	streamStartedAt: number | null;
 	streamCompletedAt?: number | null;
@@ -713,6 +716,8 @@ function stampOf(value: unknown): number | null {
  * under a different type) can reuse it without a cast at every call site.
  */
 export function resolveToolTimingStamps(source: {
+	execDurationMs?: number | null;
+	fileChangeTiming?: FileChangeTiming | null;
 	startedAt?: number | null;
 	streamStartedAt?: number | null;
 	streamCompletedAt?: number | null;
@@ -723,6 +728,8 @@ export function resolveToolTimingStamps(source: {
 	durationMs?: number | null;
 }): ToolTimingStamps {
 	return {
+		...(source.execDurationMs != null ? { execDurationMs: stampOf(source.execDurationMs) } : {}),
+		...(source.fileChangeTiming != null ? { fileChangeTiming: source.fileChangeTiming } : {}),
 		startedAt: stampOf(source.startedAt),
 		streamStartedAt: stampOf(source.streamStartedAt),
 		streamCompletedAt: stampOf(source.streamCompletedAt),

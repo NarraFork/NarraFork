@@ -8,6 +8,52 @@ import {
 import { LocalFileValidationError } from "./file-change-local-io";
 
 describe("bounded file-change diagnostics", () => {
+	test("separates coordinator, history, workspace and namespace admission from execution", () => {
+		let now = 0;
+		const trace = new FileChangeDiagnostics(() => now);
+		trace.enter("resolve_source");
+		now = 2;
+		for (const stage of [
+			"acquire_lease",
+			"acquire_history_lock",
+			"acquire_workspace_lock",
+			"acquire_namespace_lock",
+		] as const) {
+			trace.enter(stage);
+			now += 10;
+		}
+		trace.enter("io_write");
+		now += 8;
+		trace.finish();
+		expect(trace.timing()).toEqual({ waitMs: 40, executionMs: 10, totalMs: 50 });
+		now += 100;
+		expect(trace.timing()).toEqual({ waitMs: 40, executionMs: 10, totalMs: 50 });
+	});
+
+	test("failure metadata preserves measured lock waiting instead of labelling it execution", () => {
+		let now = 0;
+		const trace = new FileChangeDiagnostics(() => now);
+		trace.enter("acquire_namespace_lock");
+		now = 700;
+		trace.enter("io_write");
+		now = 715;
+		const error = new Error("failed IO");
+		trace.fail(error);
+		trace.finish();
+		trace.attach(error);
+		expect(fileChangeDiagnosticMetadata(error)?.fileChangeTiming).toEqual({
+			waitMs: 700,
+			executionMs: 15,
+			totalMs: 715,
+		});
+	});
+	test("zero-duration admission remains measured zero rather than missing", () => {
+		const trace = new FileChangeDiagnostics(() => 0);
+		trace.enter("acquire_namespace_lock");
+		trace.enter("io_write");
+		trace.finish();
+		expect(trace.timing()).toEqual({ waitMs: 0, executionMs: 0, totalMs: 0 });
+	});
 	test("aggregates repeated stages and freezes elapsed time on finish", () => {
 		let now = 10;
 		const trace = new FileChangeDiagnostics(() => now);

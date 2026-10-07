@@ -39,7 +39,12 @@ import {
 	FileChangeBlobStoreError,
 	type FileChangeBlobStoreOptions,
 } from "./file-change-blob-store";
-import { FileChangeDiagnostics, fileChangeDiagnosticSuffix } from "./file-change-diagnostics";
+import {
+	attachFileChangeTiming,
+	FileChangeDiagnostics,
+	fileChangeDiagnosticSuffix,
+	getFileChangeTiming,
+} from "./file-change-diagnostics";
 import {
 	type BeginFileChangeOperation,
 	type FileChangeEffectRecord,
@@ -57,8 +62,11 @@ import {
 	localDirectoryIdentity,
 } from "./file-change-local-io";
 import {
+	FileChangeNamespaceBusyError,
 	resetFileChangeNamespace,
 	retireLegacyNamespaceRecovery,
+	tryWithFileChangeNamespace,
+	waitForFileChangeNamespaceDrain,
 	withFileChangeNamespace,
 } from "./file-change-namespace-reset";
 import {
@@ -151,6 +159,7 @@ export interface EditorFileChangeRequest<Result> {
 
 export interface FileChangeCompletion<Result> {
 	result: Result;
+	fileChangeTiming?: { waitMs: number; executionMs: number; totalMs: number };
 	linesAdded: number | null;
 	linesRemoved: number | null;
 	fileChangeEvidence: {
@@ -194,6 +203,8 @@ type BoundFileChange<Result> = {
 	canonicalPath: string;
 	runtime: WorkspaceRuntimeBinding;
 	signal: AbortSignal;
+	/** Original cancellation source, before the shared admission deadline is added. */
+	callerSignal?: AbortSignal;
 	input: Record<string, unknown>;
 	sourceKind: "tool" | "editor";
 	sourceId: string;
@@ -300,10 +311,16 @@ export class LocalFileChangeRuntime {
 	}
 
 	/** Serialize cache IO across runtime instances, independently of workspace locks. */
-	withNamespaceAccess<T>(body: () => Promise<T>): Promise<T> {
-		return withFileChangeNamespace(this.options.privateRoot, body);
+	withNamespaceAccess<T>(body: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+		return withFileChangeNamespace(this.options.privateRoot, body, signal);
 	}
 
+	waitForNamespaceDrain(signal?: AbortSignal): Promise<void> {
+		return waitForFileChangeNamespaceDrain(signal);
+	}
+	tryWithNamespaceAccess<T>(body: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+		return tryWithFileChangeNamespace(this.options.privateRoot, body, signal);
+	}
 	initialize(): Promise<Namespace> {
 		return this.withNamespaceAccess(() => this.initializeLocked());
 	}
@@ -843,7 +860,11 @@ export class LocalFileChangeRuntime {
 		if (completed.linesRemoved !== null) metadata.linesRemoved = completed.linesRemoved;
 		return {
 			...completed.result,
-			metadata: { ...metadata, fileChangeEvidence: completed.fileChangeEvidence },
+			metadata: {
+				...metadata,
+				fileChangeEvidence: completed.fileChangeEvidence,
+				...(completed.fileChangeTiming ? { fileChangeTiming: completed.fileChangeTiming } : {}),
+			},
 		};
 	}
 
@@ -912,15 +933,8 @@ export class LocalFileChangeRuntime {
 		const signal = AbortSignal.any([request.signal, AbortSignal.timeout(30_000)]);
 		signal.throwIfAborted();
 		const source = await this.workspaceSource();
-		// Check history so identity damage schedules bounded background recovery,
-		// but failed history admission must not prevent starting the shell.
-		try {
-			await this.verifyNamespace(signal);
-		} catch {
-			this.initialization = undefined;
-			await this.initialize().catch(() => {});
-		}
-		// Blob admission must never be a prerequisite for starting a shell.
+		// Bash consumes no blobs. Do not acquire or repair the global cache here:
+		// unrelated file-history IO must never delay process dispatch.
 		const { scope, root } = await this.prepareWorkspaceScope(source, backend, cwd, signal);
 		signal.throwIfAborted();
 		const token = this.coordinator.registerActivity({ scope, runtime: frozenRuntime });
@@ -1039,6 +1053,13 @@ export class LocalFileChangeRuntime {
 		const signal = AbortSignal.any([request.signal, AbortSignal.timeout(30_000)]);
 		const diagnostics = new FileChangeDiagnostics();
 		diagnostics.identify({ sourceId: request.sourceId });
+		const priorTiming = getFileChangeTiming(cause);
+		const combinedTiming = () => {
+			const current = diagnostics.timing();
+			const waitMs = (priorTiming?.waitMs ?? 0) + current.waitMs;
+			const totalMs = (priorTiming?.totalMs ?? 0) + current.totalMs;
+			return { waitMs, executionMs: totalMs - waitMs, totalMs };
+		};
 		diagnostics.enter("prepare_scope");
 		try {
 			const { backend, lexicalPath, canonicalPath } = request;
@@ -1072,8 +1093,9 @@ export class LocalFileChangeRuntime {
 					diagnostics.enter("acquire_history_lock");
 					return withFileHistoryWrite(
 						{ deviceId: LOCAL_DEVICE_ID, pathFlavor, canonicalPath },
-						() =>
-							withWorkspaceWriteLock(
+						() => {
+							diagnostics.enter("acquire_workspace_lock");
+							return withWorkspaceWriteLock(
 								backend,
 								request.cwd,
 								async () => {
@@ -1181,11 +1203,13 @@ export class LocalFileChangeRuntime {
 											fileChangeHistoryUnavailable: true,
 											fileChangeHistoryReason: "blob_namespace_unavailable",
 											fileChangeLocalIo: execution.diagnostics,
+											fileChangeTiming: combinedTiming(),
 										},
 									};
 								},
 								signal,
-							),
+							);
+						},
 						signal,
 					);
 				},
@@ -1194,13 +1218,17 @@ export class LocalFileChangeRuntime {
 			if (!diagnostics.hasFailure(error)) diagnostics.fail(error);
 			if (signal.aborted)
 				diagnostics.identify({
-					abortSource: signal.reason === request.signal.reason ? "caller" : "operation_budget",
+					abortSource:
+						signal.reason === (request.callerSignal ?? request.signal).reason
+							? "caller"
+							: "operation_budget",
 				});
 			diagnostics.finish();
 			logger.warn("Local file-change without history failed", {
 				diagnostics: diagnostics.snapshot(),
 			});
-			throw diagnostics.attach(error);
+			diagnostics.attach(error);
+			throw attachFileChangeTiming(error, combinedTiming());
 		} finally {
 			diagnostics.finish();
 			if (diagnostics.snapshot().elapsedMs > 1_000)
@@ -1211,28 +1239,88 @@ export class LocalFileChangeRuntime {
 	}
 
 	/** One actual-byte journal/IO/receipt pipeline for tools and the human editor. */
-	private executeBound<Result>(
+	private async executeBound<Result>(
 		request: BoundFileChange<Result>,
 	): Promise<FileChangeCompletion<Result>> {
-		return this.withNamespaceAccess(async () => {
-			try {
-				return await this.executeBoundLocked(request);
-			} catch (error) {
-				// This sentinel is emitted only before intent/dispatch. Release all
-				// workspace leases first, reset the cache, then recapture this request.
-				// Never replay a request once an operation was made durable.
-				if (!(error instanceof BlobHistoryUnavailableBeforeDispatch)) throw error;
-				this.initialization = undefined;
+		const started = performance.now();
+		// One admission budget across drain races and cache recovery, not a fresh
+		// deadline every time an old namespace-first consumer wins the race.
+		request = {
+			...request,
+			callerSignal: request.callerSignal ?? request.signal,
+			signal: AbortSignal.any([request.signal, AbortSignal.timeout(30_000)]),
+		};
+		let priorWaitMs = 0;
+		const attempt = async () => {
+			for (;;) {
+				request.signal.throwIfAborted();
 				try {
-					await this.initialize();
-				} catch {
+					return await this.executeBoundLocked(request);
+				} catch (error) {
+					priorWaitMs += getFileChangeTiming(error)?.waitMs ?? 0;
+					// Only the direct no-dispatch busy result qualifies. A coordinator
+					// cleanup failure must keep its recovery barrier, never be retried.
+					if (error instanceof FileChangeNamespaceBusyError) continue;
 					throw error;
 				}
-				return this.executeBoundLocked(request);
 			}
-		});
+		};
+		try {
+			let completed: FileChangeCompletion<Result>;
+			try {
+				completed = await attempt();
+			} catch (error) {
+				// Retry only before durable dispatch, after releasing every admission lock.
+				if (!(error instanceof BlobHistoryUnavailableBeforeDispatch)) throw error;
+				this.initialization = undefined;
+				const recoveryStarted = performance.now();
+				let entered = false;
+				try {
+					await this.withNamespaceAccess(
+						async () => {
+							entered = true;
+							priorWaitMs += Math.round(performance.now() - recoveryStarted);
+							await this.initialize();
+						},
+						AbortSignal.any([request.signal, AbortSignal.timeout(30_000)]),
+					);
+				} catch {
+					if (!entered) priorWaitMs += Math.round(performance.now() - recoveryStarted);
+					request.signal.throwIfAborted();
+					throw error;
+				}
+				completed = await attempt();
+			}
+			const totalMs = Math.round(performance.now() - started);
+			const waitMs = Math.min(totalMs, priorWaitMs + (completed.fileChangeTiming?.waitMs ?? 0));
+			return { ...completed, fileChangeTiming: { waitMs, executionMs: totalMs - waitMs, totalMs } };
+		} catch (error) {
+			const totalMs = Math.round(performance.now() - started);
+			const waitMs = Math.min(totalMs, priorWaitMs);
+			throw attachFileChangeTiming(error, { waitMs, executionMs: totalMs - waitMs, totalMs });
+		}
 	}
 
+	private async initializeForDispatch(): Promise<Namespace> {
+		try {
+			let namespace = await this.initialize();
+			try {
+				await this.assertNamespaceDirectories(namespace);
+				const budget = namespace.catalog.getBudget();
+				if (budget?.generation !== namespace.generation || budget.status !== "ready")
+					throw new Error("Blob namespace generation changed");
+			} catch {
+				this.initialization = undefined;
+				namespace = await this.initialize();
+				await this.assertNamespaceDirectories(namespace);
+			}
+			return namespace;
+		} catch (error) {
+			throw new BlobHistoryUnavailableBeforeDispatch("Blob namespace unavailable before dispatch", {
+				cause: error,
+			});
+		}
+	}
 	private async executeBoundLocked<Result>(
 		request: BoundFileChange<Result>,
 	): Promise<FileChangeCompletion<Result>> {
@@ -1244,30 +1332,12 @@ export class LocalFileChangeRuntime {
 		const signal = AbortSignal.any([request.signal, operationBudget]);
 		const diagnostics = new FileChangeDiagnostics();
 		diagnostics.identify({ sourceId: request.sourceId });
-		diagnostics.enter("initialize");
+		diagnostics.enter("resolve_source");
 		try {
-			let namespace: Namespace;
-			try {
-				namespace = await this.initialize();
-				try {
-					await this.assertNamespaceDirectories(namespace);
-					const budget = namespace.catalog.getBudget();
-					if (budget?.generation !== namespace.generation || budget.status !== "ready")
-						throw new Error("Blob namespace generation changed");
-				} catch {
-					this.initialization = undefined;
-					namespace = await this.initialize();
-					await this.assertNamespaceDirectories(namespace);
-				}
-			} catch (error) {
-				throw new BlobHistoryUnavailableBeforeDispatch(
-					"Blob namespace unavailable before dispatch",
-					{
-						cause: error,
-					},
-				);
-			}
-			const existing = this.existingOperation(namespace.sourceInstanceId, request);
+			// Installation identity is independent of the resettable blob cache.
+			// Do not hold that cache while waiting for workspace admission.
+			const source = await this.workspaceSource();
+			const existing = this.existingOperation(source.sourceInstanceId, request);
 			if (existing) throw alreadyAttempted(existing);
 			signal.throwIfAborted();
 			diagnostics.enter("resolve_target");
@@ -1276,7 +1346,7 @@ export class LocalFileChangeRuntime {
 				throw new LocalFileValidationError("Authorized canonical path changed before capture");
 			diagnostics.enter("prepare_scope");
 			const { scope, root, rootIdentity } = await this.prepareWorkspaceScope(
-				namespace,
+				source,
 				backend,
 				request.cwd,
 				signal,
@@ -1302,6 +1372,10 @@ export class LocalFileChangeRuntime {
 				pathFlavor: backend.pathFlavor,
 				canonicalPath,
 			};
+			// Retained pre-hot-reload consumers may still own namespace before
+			// requesting coordinator. Drain them without holding a workspace lease.
+			diagnostics.enter("acquire_namespace_lock");
+			await this.waitForNamespaceDrain(signal);
 			diagnostics.enter("acquire_lease");
 			return await this.coordinator.withWrite(
 				{
@@ -1320,352 +1394,368 @@ export class LocalFileChangeRuntime {
 					diagnostics.enter("acquire_history_lock");
 					return withFileHistoryWrite(
 						historyTarget,
-						() =>
-							withWorkspaceWriteLock(
+						() => {
+							diagnostics.enter("acquire_workspace_lock");
+							return withWorkspaceWriteLock(
 								backend,
 								request.cwd,
 								async () => {
-									const repeated = this.existingOperation(namespace.sourceInstanceId, request);
-									if (repeated) throw alreadyAttempted(repeated);
-									const scopeRevision = this.evidence.getScope(scope.id)?.revision;
-									if (scopeRevision === undefined) throw new Error("Granted scope disappeared");
-									const operationInput: BeginFileChangeOperation = {
-										sourceInstanceId: namespace.sourceInstanceId,
-										sourceKind: request.sourceKind,
-										sourceId: request.sourceId,
-										toolCallId: request.sourceKind === "tool" ? request.sourceId : null,
-										toolUseId: request.toolUseId,
-										attempt: request.attempt,
-										requestDigest,
-										expectedEffectCount: 1,
-										actor: request.actor,
-										narratorId: request.narratorId,
-										projectId: request.projectId,
-										ownerUserId: request.userId,
-										executionBinding: lease.executionBinding,
-										executionSegmentId: request.executionSegmentId ?? null,
-									};
-									const settlePreparation = async (
-										operation: FileChangeOperationRecord,
-										effect?: FileChangeEffectRecord,
-									) => {
-										diagnostics.enter("settle_evidence");
-										const mutationId = effect?.mutationId ?? operation.id;
-										lease.registerMutation(mutationId, {
-											operationId: operation.id,
-											effectId: effect?.id,
-										});
-										await retryWorkspaceMetadata(() =>
-											lease.settleWith(mutationId, (tx) => ({
-												outcome: "not_applied",
-												value: this.evidence.finishPreparationWithoutDispatch(
-													operation.id,
-													{
-														targetDispatched: false,
-														reason: signal.aborted
-															? "cancelled_before_dispatch"
-															: "validation_rejected",
-													},
-													tx,
-												),
-											})),
-										);
-									};
-									const assertTarget = async (beforePreparation = false) => {
+									diagnostics.enter("acquire_namespace_lock");
+									// Close the drain/grant race without ever waiting for a legacy
+									// namespace-first consumer while this lease is held.
+									return this.tryWithNamespaceAccess(async () => {
+										diagnostics.enter("initialize");
+										const namespace = await this.initializeForDispatch();
+										signal.throwIfAborted();
+										if (namespace.sourceInstanceId !== source.sourceInstanceId)
+											throw new LocalFileValidationError(
+												"Installation identity changed during admission",
+											);
+										const repeated = this.existingOperation(namespace.sourceInstanceId, request);
+										if (repeated) throw alreadyAttempted(repeated);
+										const scopeRevision = this.evidence.getScope(scope.id)?.revision;
+										if (scopeRevision === undefined) throw new Error("Granted scope disappeared");
+										const operationInput: BeginFileChangeOperation = {
+											sourceInstanceId: namespace.sourceInstanceId,
+											sourceKind: request.sourceKind,
+											sourceId: request.sourceId,
+											toolCallId: request.sourceKind === "tool" ? request.sourceId : null,
+											toolUseId: request.toolUseId,
+											attempt: request.attempt,
+											requestDigest,
+											expectedEffectCount: 1,
+											actor: request.actor,
+											narratorId: request.narratorId,
+											projectId: request.projectId,
+											ownerUserId: request.userId,
+											executionBinding: lease.executionBinding,
+											executionSegmentId: request.executionSegmentId ?? null,
+										};
+										const settlePreparation = async (
+											operation: FileChangeOperationRecord,
+											effect?: FileChangeEffectRecord,
+										) => {
+											diagnostics.enter("settle_evidence");
+											const mutationId = effect?.mutationId ?? operation.id;
+											lease.registerMutation(mutationId, {
+												operationId: operation.id,
+												effectId: effect?.id,
+											});
+											await retryWorkspaceMetadata(() =>
+												lease.settleWith(mutationId, (tx) => ({
+													outcome: "not_applied",
+													value: this.evidence.finishPreparationWithoutDispatch(
+														operation.id,
+														{
+															targetDispatched: false,
+															reason: signal.aborted
+																? "cancelled_before_dispatch"
+																: "validation_rejected",
+														},
+														tx,
+													),
+												})),
+											);
+										};
+										const assertTarget = async (beforePreparation = false) => {
+											try {
+												await this.assertNamespaceDirectories(namespace);
+											} catch (error) {
+												if (beforePreparation)
+													throw new BlobHistoryUnavailableBeforeDispatch(
+														"Blob namespace unavailable before preparation",
+														{ cause: error },
+													);
+												throw error;
+											}
+											await request.assertBinding();
+											await assertLocalWriteFootprint(footprint);
+											lease.assertCurrent(lease.executionBinding);
+											const actual = await backend.resolvePathIdentity(lexicalPath);
+											if (
+												!backend.paths.equals(actual.canonicalPath, canonicalPath) ||
+												actual.runtimeGeneration !== request.runtime.runtimeGeneration ||
+												(await localDirectoryIdentity(root)) !== rootIdentity
+											)
+												throw new LocalFileValidationError("Frozen local target/root changed");
+											lease.assertCurrent(lease.executionBinding);
+										};
+										diagnostics.enter("validate_target");
+										await assertTarget(true);
+										let before: LocalFileObservation;
+										let prepared: PreparedFileChange<Result>;
 										try {
-											await this.assertNamespaceDirectories(namespace);
-										} catch (error) {
-											if (beforePreparation)
-												throw new BlobHistoryUnavailableBeforeDispatch(
-													"Blob namespace unavailable before preparation",
-													{ cause: error },
+											diagnostics.enter("read_before");
+											before = await this.io.read(canonicalPath, signal);
+											// Reading awaits IO too: do not return a conflict body after its ACL or
+											// canonical target changed while those bytes were being collected.
+											if (request.sourceKind === "editor") await assertTarget();
+											if (before.mode !== null && (before.mode & 0o222) === 0)
+												throw new LocalFileValidationError("File is read-only");
+											diagnostics.enter("construct");
+											prepared = await request.construct(before);
+											if (prepared.nextBytes.byteLength > FILE_CHANGE_LIMITS.blobBytes)
+												throw new LocalFileValidationError(
+													"Output exceeds the 32 MiB evidence limit",
 												);
+										} catch (error) {
+											// Only construction/known validation failures qualify. Infrastructure
+											// failures are not evidence of a no-change operation.
+											diagnostics.fail(error);
+											diagnostics.enter("settle_evidence");
+											await request.recordNoDispatch?.(operationInput, error);
 											throw error;
 										}
-										await request.assertBinding();
-										await assertLocalWriteFootprint(footprint);
-										lease.assertCurrent(lease.executionBinding);
-										const actual = await backend.resolvePathIdentity(lexicalPath);
-										if (
-											!backend.paths.equals(actual.canonicalPath, canonicalPath) ||
-											actual.runtimeGeneration !== request.runtime.runtimeGeneration ||
-											(await localDirectoryIdentity(root)) !== rootIdentity
-										)
-											throw new LocalFileValidationError("Frozen local target/root changed");
-										lease.assertCurrent(lease.executionBinding);
-									};
-									diagnostics.enter("validate_target");
-									await assertTarget(true);
-									let before: LocalFileObservation;
-									let prepared: PreparedFileChange<Result>;
-									try {
-										diagnostics.enter("read_before");
-										before = await this.io.read(canonicalPath, signal);
-										// Reading awaits IO too: do not return a conflict body after its ACL or
-										// canonical target changed while those bytes were being collected.
-										if (request.sourceKind === "editor") await assertTarget();
-										if (before.mode !== null && (before.mode & 0o222) === 0)
-											throw new LocalFileValidationError("File is read-only");
-										diagnostics.enter("construct");
-										prepared = await request.construct(before);
-										if (prepared.nextBytes.byteLength > FILE_CHANGE_LIMITS.blobBytes)
-											throw new LocalFileValidationError(
-												"Output exceeds the 32 MiB evidence limit",
+										let beforeState: FileChangeState;
+										let afterState: FileChangeState;
+										try {
+											diagnostics.enter("publish_before");
+											beforeState = await this.publish(namespace, before, signal, true);
+											diagnostics.enter("publish_intended");
+											afterState = await this.publish(
+												namespace,
+												{
+													bytes: prepared.nextBytes,
+													mode: before.mode ?? 0o666 & ~process.umask(),
+													identity: null,
+												},
+												signal,
+												true,
 											);
-									} catch (error) {
-										// Only construction/known validation failures qualify. Infrastructure
-										// failures are not evidence of a no-change operation.
-										diagnostics.fail(error);
-										diagnostics.enter("settle_evidence");
-										await request.recordNoDispatch?.(operationInput, error);
-										throw error;
-									}
-									let beforeState: FileChangeState;
-									let afterState: FileChangeState;
-									try {
-										diagnostics.enter("publish_before");
-										beforeState = await this.publish(namespace, before, signal, true);
-										diagnostics.enter("publish_intended");
-										afterState = await this.publish(
-											namespace,
-											{
-												bytes: prepared.nextBytes,
-												mode: before.mode ?? 0o666 & ~process.umask(),
-												identity: null,
-											},
-											signal,
-											true,
-										);
-									} catch (error) {
-										diagnostics.fail(error);
-										if (error instanceof BlobHistoryUnavailableBeforeDispatch) throw error;
-										// Quota and cancellation remain normal errors. Only unavailable
-										// namespace/content before journal dispatch permits degradation.
-										if (
-											(error instanceof FileChangeBlobCatalogError &&
-												[
-													"namespace_mismatch",
-													"namespace_unverified",
-													"generation_mismatch",
-													"reconciliation_required",
-												].includes(error.code)) ||
-											(error instanceof FileChangeBlobStoreError &&
-												[
-													"invalid_path",
-													"unsafe_object",
-													"not_found",
-													"hash_mismatch",
-													"size_mismatch",
-												].includes(error.code))
-										) {
-											if (error instanceof FileChangeBlobStoreError) {
-												// Content failure invalidates cached history too, not just this put.
-												try {
-													namespace.catalog.beginReconciliation({
-														expectedGeneration: namespace.generation,
-													});
-												} catch (fenceError) {
-													logger.warn("Could not fence unavailable blob content", {
-														error: String(fenceError),
-													});
+										} catch (error) {
+											diagnostics.fail(error);
+											if (error instanceof BlobHistoryUnavailableBeforeDispatch) throw error;
+											// Quota and cancellation remain normal errors. Only unavailable
+											// namespace/content before journal dispatch permits degradation.
+											if (
+												(error instanceof FileChangeBlobCatalogError &&
+													[
+														"namespace_mismatch",
+														"namespace_unverified",
+														"generation_mismatch",
+														"reconciliation_required",
+													].includes(error.code)) ||
+												(error instanceof FileChangeBlobStoreError &&
+													[
+														"invalid_path",
+														"unsafe_object",
+														"not_found",
+														"hash_mismatch",
+														"size_mismatch",
+													].includes(error.code))
+											) {
+												if (error instanceof FileChangeBlobStoreError) {
+													// Content failure invalidates cached history too, not just this put.
+													try {
+														namespace.catalog.beginReconciliation({
+															expectedGeneration: namespace.generation,
+														});
+													} catch (fenceError) {
+														logger.warn("Could not fence unavailable blob content", {
+															error: String(fenceError),
+														});
+													}
 												}
+												throw new BlobHistoryUnavailableBeforeDispatch(
+													"Blob publication unavailable before dispatch",
+													{ cause: error },
+												);
 											}
-											throw new BlobHistoryUnavailableBeforeDispatch(
-												"Blob publication unavailable before dispatch",
-												{ cause: error },
-											);
+											diagnostics.enter("prepare_evidence");
+											const rejected = this.evidence.beginOperation(operationInput);
+											diagnostics.identify({ operationId: rejected.id });
+											try {
+												request.linkOperation?.(rejected.id);
+											} finally {
+												await settlePreparation(rejected);
+											}
+											throw error;
 										}
 										diagnostics.enter("prepare_evidence");
-										const rejected = this.evidence.beginOperation(operationInput);
-										diagnostics.identify({ operationId: rejected.id });
+										const operation = this.evidence.beginOperation(operationInput);
+										diagnostics.identify({ operationId: operation.id });
+										let effect: FileChangeEffectRecord | undefined;
 										try {
-											request.linkOperation?.(rejected.id);
-										} finally {
-											await settlePreparation(rejected);
+											request.linkOperation?.(operation.id);
+											effect = this.evidence.prepareEffects(operation.id, [
+												{
+													identity,
+													scopeRevision,
+													requestDigest,
+													before: beforeState,
+													intendedAfter: afterState,
+												},
+											])[0];
+											await this.evidence.finalizePreparation(operation.id, { signal });
+											signal.throwIfAborted();
+											if (
+												!this.evidence.markApplying({
+													operationId: operation.id,
+													mutationId: effect.mutationId,
+													requestDigest,
+													executionBinding: lease.executionBinding,
+												}).mayExecute
+											)
+												throw alreadyAttempted(operation);
+										} catch (error) {
+											// No apply adapter has been called. Persist this positive fact,
+											// keeping the attempt identity as a durable replay barrier.
+											diagnostics.fail(error);
+											await settlePreparation(operation, effect);
+											throw error;
 										}
-										throw error;
-									}
-									diagnostics.enter("prepare_evidence");
-									const operation = this.evidence.beginOperation(operationInput);
-									diagnostics.identify({ operationId: operation.id });
-									let effect: FileChangeEffectRecord | undefined;
-									try {
-										request.linkOperation?.(operation.id);
-										effect = this.evidence.prepareEffects(operation.id, [
+										const selector = {
+											operationId: operation.id,
+											mutationId: effect.mutationId,
+											requestDigest,
+										};
+										lease.registerMutation(effect.mutationId, {
+											operationId: operation.id,
+											effectId: effect.id,
+										});
+										diagnostics.enter("apply_adapter");
+										const execution = await applyLocalFileChange(
+											this.io,
 											{
-												identity,
-												scopeRevision,
-												requestDigest,
-												before: beforeState,
-												intendedAfter: afterState,
+												backend,
+												lexicalPath,
+												canonicalPath,
+												before,
+												nextBytes: prepared.nextBytes,
+												signal,
+												assertTarget,
+												diagnostics,
+												onDispatch: () => request.onDispatch?.(),
 											},
-										])[0];
-										await this.evidence.finalizePreparation(operation.id, { signal });
-										signal.throwIfAborted();
+											footprint,
+										);
 										if (
-											!this.evidence.markApplying({
-												operationId: operation.id,
+											execution.result.error != null &&
+											!diagnostics.hasFailure(execution.result.error)
+										)
+											diagnostics.fail(execution.result.error);
+										const applied = execution.result.kind === "applied";
+										let ioError: unknown = execution.result.error;
+										let observed: LocalFileObservation | undefined;
+										// Cancellation cannot suppress the bounded after observation/settlement.
+										try {
+											diagnostics.enter("after_validate");
+											await assertTarget();
+											diagnostics.enter("after_read");
+											observed = await this.io.read(canonicalPath, AbortSignal.timeout(5_000));
+										} catch (error) {
+											diagnostics.fail(error);
+											ioError ??= error;
+										}
+										// Sample once at the IO boundary. Metadata callbacks never resample or
+										// downgrade the grade or line counts of an immutable settled receipt.
+										// The exact before/after observation remains reversible even when a nearby
+										// Bash activity is intentionally skipped or ambiguous. Ambiguity belongs to
+										// that Bash operation, not to this independently journaled file write.
+										const attributionCeiling = "measured";
+										try {
+											let observedAfter: FileChangeState;
+											if (!observed) {
+												observedAfter = { kind: "unknown", reason: "missing_after" };
+											} else if (
+												observed.bytes !== null &&
+												observed.mode === afterStateMode(afterState) &&
+												Buffer.from(observed.bytes).equals(prepared.nextBytes)
+											) {
+												observedAfter = afterState;
+											} else if (sameObservedBytes(observed, before)) {
+												observedAfter = beforeState;
+											} else {
+												diagnostics.enter("publish_observed");
+												observedAfter = await this.publish(
+													namespace,
+													observed,
+													AbortSignal.timeout(5_000),
+												);
+											}
+											const receipt: FileChangeExecutionReceipt = {
+												receiptId: generateId(),
 												mutationId: effect.mutationId,
 												requestDigest,
 												executionBinding: lease.executionBinding,
-											}).mayExecute
-										)
-											throw alreadyAttempted(operation);
-									} catch (error) {
-										// No apply adapter has been called. Persist this positive fact,
-										// keeping the attempt identity as a durable replay barrier.
-										diagnostics.fail(error);
-										await settlePreparation(operation, effect);
-										throw error;
-									}
-									const selector = {
-										operationId: operation.id,
-										mutationId: effect.mutationId,
-										requestDigest,
-									};
-									lease.registerMutation(effect.mutationId, {
-										operationId: operation.id,
-										effectId: effect.id,
-									});
-									diagnostics.enter("apply_adapter");
-									const execution = await applyLocalFileChange(
-										this.io,
-										{
-											backend,
-											lexicalPath,
-											canonicalPath,
-											before,
-											nextBytes: prepared.nextBytes,
-											signal,
-											assertTarget,
-											diagnostics,
-											onDispatch: () => request.onDispatch?.(),
-										},
-										footprint,
-									);
-									if (
-										execution.result.error != null &&
-										!diagnostics.hasFailure(execution.result.error)
-									)
-										diagnostics.fail(execution.result.error);
-									const applied = execution.result.kind === "applied";
-									let ioError: unknown = execution.result.error;
-									let observed: LocalFileObservation | undefined;
-									// Cancellation cannot suppress the bounded after observation/settlement.
-									try {
-										diagnostics.enter("after_validate");
-										await assertTarget();
-										diagnostics.enter("after_read");
-										observed = await this.io.read(canonicalPath, AbortSignal.timeout(5_000));
-									} catch (error) {
-										diagnostics.fail(error);
-										ioError ??= error;
-									}
-									// Sample once at the IO boundary. Metadata callbacks never resample or
-									// downgrade the grade or line counts of an immutable settled receipt.
-									// The exact before/after observation remains reversible even when a nearby
-									// Bash activity is intentionally skipped or ambiguous. Ambiguity belongs to
-									// that Bash operation, not to this independently journaled file write.
-									const attributionCeiling = "measured";
-									try {
-										let observedAfter: FileChangeState;
-										if (!observed) {
-											observedAfter = { kind: "unknown", reason: "missing_after" };
-										} else if (
-											observed.bytes !== null &&
-											observed.mode === afterStateMode(afterState) &&
-											Buffer.from(observed.bytes).equals(prepared.nextBytes)
-										) {
-											observedAfter = afterState;
-										} else if (sameObservedBytes(observed, before)) {
-											observedAfter = beforeState;
-										} else {
-											diagnostics.enter("publish_observed");
-											observedAfter = await this.publish(
-												namespace,
-												observed,
-												AbortSignal.timeout(5_000),
+												observedAfter,
+												outcome: execution.receiptOutcome,
+												confirmed: execution.confirmed,
+												localIo: execution.diagnostics,
+											};
+											const verified = applied && fileChangeStatesEqual(afterState, observedAfter);
+											diagnostics.enter("settle_evidence");
+											const settled = await retryWorkspaceMetadata(() =>
+												lease.settleWith(effect.mutationId, (tx) => {
+													const value = this.evidence.settleEffect(
+														{
+															...selector,
+															receipt,
+															attributionCeiling,
+															linesAdded: prepared.lineStats?.added,
+															linesRemoved: prepared.lineStats?.removed,
+														},
+														tx,
+													);
+													// A lock retry may outlive cancellation. The receipt stays
+													// fixed, but sample the tool outcome at the successful commit.
+													this.evidence.finishOperation(
+														operation.id,
+														signal.aborted
+															? "interrupted"
+															: ioError || !verified
+																? "failed"
+																: "succeeded",
+														tx,
+													);
+													return {
+														outcome:
+															value.settlement === "settled" ? execution.leaseOutcome : "unknown",
+														value,
+													};
+												}),
 											);
-										}
-										const receipt: FileChangeExecutionReceipt = {
-											receiptId: generateId(),
-											mutationId: effect.mutationId,
-											requestDigest,
-											executionBinding: lease.executionBinding,
-											observedAfter,
-											outcome: execution.receiptOutcome,
-											confirmed: execution.confirmed,
-											localIo: execution.diagnostics,
-										};
-										const verified = applied && fileChangeStatesEqual(afterState, observedAfter);
-										diagnostics.enter("settle_evidence");
-										const settled = await retryWorkspaceMetadata(() =>
-											lease.settleWith(effect.mutationId, (tx) => {
-												const value = this.evidence.settleEffect(
-													{
-														...selector,
-														receipt,
-														attributionCeiling,
-														linesAdded: prepared.lineStats?.added,
-														linesRemoved: prepared.lineStats?.removed,
-													},
-													tx,
+											// Unknown/failed-but-dispatched effects remain visible with unmeasured
+											// counts. A positively non-applied or identical rewrite is not a change.
+											if (settled.outcome !== "no_change")
+												this.project(request, operation, settled, scope);
+											diagnostics.enter("verify_result");
+											if (ioError) throw ioError;
+											signal.throwIfAborted();
+											if (!verified)
+												throw new Error(
+													"Local after state did not match the durable intent; reconciliation required",
 												);
-												// A lock retry may outlive cancellation. The receipt stays
-												// fixed, but sample the tool outcome at the successful commit.
-												this.evidence.finishOperation(
-													operation.id,
-													signal.aborted
-														? "interrupted"
-														: ioError || !verified
-															? "failed"
-															: "succeeded",
-													tx,
-												);
-												return {
-													outcome:
-														value.settlement === "settled" ? execution.leaseOutcome : "unknown",
-													value,
-												};
-											}),
-										);
-										// Unknown/failed-but-dispatched effects remain visible with unmeasured
-										// counts. A positively non-applied or identical rewrite is not a change.
-										if (settled.outcome !== "no_change")
-											this.project(request, operation, settled, scope);
-										diagnostics.enter("verify_result");
-										if (ioError) throw ioError;
-										signal.throwIfAborted();
-										if (!verified)
-											throw new Error(
-												"Local after state did not match the durable intent; reconciliation required",
-											);
-										return {
-											result: prepared.result,
-											linesAdded: settled.linesAdded,
-											linesRemoved: settled.linesRemoved,
-											fileChangeEvidence: {
-												version: 2,
-												operationId: operation.id,
-												effectId: effect.id,
-												grade: settled.attributionGrade,
-												settlement: settled.settlement,
-												outcome: settled.outcome,
-											},
-										};
-									} catch (error) {
-										// A settled receipt stays frozen. Only unsettled persistence/IO needs
-										// quarantine; never retry a mutation or write a before-state here.
-										if (!diagnostics.hasFailure(error)) diagnostics.fail(error);
-										if (lease.pendingMutationCount > 0) {
-											diagnostics.enter("quarantine");
-											lease.markUncertain();
+											diagnostics.finish();
+											return {
+												result: prepared.result,
+												fileChangeTiming: diagnostics.timing(),
+												linesAdded: settled.linesAdded,
+												linesRemoved: settled.linesRemoved,
+												fileChangeEvidence: {
+													version: 2,
+													operationId: operation.id,
+													effectId: effect.id,
+													grade: settled.attributionGrade,
+													settlement: settled.settlement,
+													outcome: settled.outcome,
+												},
+											};
+										} catch (error) {
+											// A settled receipt stays frozen. Only unsettled persistence/IO needs
+											// quarantine; never retry a mutation or write a before-state here.
+											if (!diagnostics.hasFailure(error)) diagnostics.fail(error);
+											if (lease.pendingMutationCount > 0) {
+												diagnostics.enter("quarantine");
+												lease.markUncertain();
+											}
+											throw error;
 										}
-										throw error;
-									}
+									}, signal);
 								},
 								signal,
-							),
+							);
+						},
 						signal,
 					);
 				},
@@ -1674,7 +1764,10 @@ export class LocalFileChangeRuntime {
 			if (!diagnostics.hasFailure(error)) diagnostics.fail(error);
 			if (signal.aborted)
 				diagnostics.identify({
-					abortSource: signal.reason === request.signal.reason ? "caller" : "operation_budget",
+					abortSource:
+						signal.reason === (request.callerSignal ?? request.signal).reason
+							? "caller"
+							: "operation_budget",
 				});
 			diagnostics.finish();
 			if (diagnostics.snapshot().operationId)

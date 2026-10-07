@@ -197,6 +197,30 @@ export class MeasureCache {
  * Returns true if the spec key represents a streaming/transient item whose
  * content is still changing (height would be stale on next measure).
  */
+function toolTimingRevision(source: Record<string, unknown>): string {
+	let revision = "";
+	for (const key of [
+		"durationMs",
+		"execDurationMs",
+		"streamStartedAt",
+		"streamCompletedAt",
+		"permissionStartedAt",
+		"executionStartedAt",
+		"completedAt",
+		"createdAt",
+		"startedAt",
+	]) {
+		if (typeof source[key] === "number") revision += `|timing:${key}:${source[key]}`;
+	}
+	if (source.fileChangeTiming != null && typeof source.fileChangeTiming === "object") {
+		const file = source.fileChangeTiming as Record<string, unknown>;
+		for (const key of ["waitMs", "executionMs", "totalMs"]) {
+			if (typeof file[key] === "number") revision += `|fileTiming:${key}:${file[key]}`;
+		}
+	}
+	return revision;
+}
+
 export function isStreamingKey(key: string): boolean {
 	return key.includes("__streaming__");
 }
@@ -288,6 +312,8 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// rebuild serves the pre-update measured payload and the header keeps showing
 	// the OLD timeout even though the server already applied the new one.
 	if (typeof d.timeoutMs === "number") rev += `|to:${d.timeoutMs}`;
+	// Timing corrections can land on terminal records without changing their body/status.
+	rev += toolTimingRevision(d);
 	// Truncated-payload state. Height-AFFECTING (a non-zero count reserves the
 	// truncation notice row) and, more importantly, the ONLY key component that
 	// moves when a fetched payload lands: `status` is already terminal, and the
@@ -551,8 +577,7 @@ function traceRevision(d: Record<string, unknown>): string {
 		// with it (running → success arrives together with `durationMs`); this keys the
 		// value directly so a duration-only correction cannot serve a stale row.
 		if (r.timing != null && typeof r.timing === "object") {
-			const duration = (r.timing as Record<string, unknown>).durationMs;
-			if (typeof duration === "number") rev += `|tm:${duration}`;
+			rev += toolTimingRevision(r.timing as Record<string, unknown>);
 		}
 		// The figure actually PAINTED, which for bash is the pure execution time rather
 		// than `timing.durationMs` (see `@shared/tool-display-duration`). Keyed

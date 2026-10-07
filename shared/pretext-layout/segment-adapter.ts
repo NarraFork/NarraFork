@@ -41,7 +41,23 @@ import {
 	verbatimOutputToMarkdown,
 } from "../sidecar-body";
 import { subagentResultText } from "../subagent-result-text";
-import { resolveToolDisplayDurationMs } from "../tool-display-duration";
+import { type FileChangeTiming, resolveToolDisplayDurationMs } from "../tool-display-duration";
+
+type ToolTimingRecord = Partial<
+	Record<
+		| "startedAt"
+		| "streamStartedAt"
+		| "streamCompletedAt"
+		| "permissionStartedAt"
+		| "executionStartedAt"
+		| "completedAt"
+		| "createdAt"
+		| "durationMs"
+		| "execDurationMs",
+		number
+	>
+> & { fileChangeTiming?: FileChangeTiming };
+
 import { isToolQueuedBehindUpstream, type ToolUpstreamPeer } from "../tool-shimmer";
 import {
 	type CommunicationState,
@@ -611,7 +627,7 @@ interface AdapterTraceItem {
 	 * is a single truncation-free span in the row's fixed-height flex line and the
 	 * popover is portaled.
 	 */
-	timing?: Record<string, number>;
+	timing?: ToolTimingRecord;
 	/**
 	 * The duration the row PAINTS, when it differs from `timing.durationMs`.
 	 *
@@ -3558,7 +3574,7 @@ export interface CommunicationBubbleData {
 	status: string;
 	error?: string;
 	warning?: string;
-	timing?: Record<string, number>;
+	timing?: ToolTimingRecord;
 	toolDetailRef?: AdapterToolDetailRef;
 }
 
@@ -4212,10 +4228,36 @@ function toolTimingStamps(source: Record<string, unknown>): Record<string, numbe
  * duration (explicit, else derived from the start/complete pair — same fallback
  * the tool header uses).
  */
-function cardTiming(tc: AdapterToolItem["tc"]): Record<string, number> {
+function toolTimingMetadata(
+	metadata: unknown,
+): Pick<ToolTimingRecord, "execDurationMs" | "fileChangeTiming"> {
+	const meta = asObject(metadata);
+	const execDurationMs = readFiniteNumber(meta.execDurationMs);
+	const file = asObject(meta.fileChangeTiming);
+	const waitMs = readFiniteNumber(file.waitMs);
+	const executionMs = readFiniteNumber(file.executionMs);
+	const totalMs = readFiniteNumber(file.totalMs);
+	return {
+		...(execDurationMs != null && execDurationMs >= 0 ? { execDurationMs } : {}),
+		...(waitMs != null &&
+		waitMs >= 0 &&
+		executionMs != null &&
+		executionMs >= 0 &&
+		totalMs != null &&
+		totalMs >= 0
+			? { fileChangeTiming: { waitMs, executionMs, totalMs } }
+			: {}),
+	};
+}
+
+function cardTiming(tc: AdapterToolItem["tc"]): ToolTimingRecord {
 	const stamps = toolTimingStamps(tc);
 	const durationMs = readFiniteNumber(tc.durationMs) ?? deriveDuration(tc);
-	return durationMs != null ? { ...stamps, durationMs } : stamps;
+	return {
+		...stamps,
+		...(durationMs != null ? { durationMs } : {}),
+		...toolTimingMetadata(resolveToolMetadata(tc)),
+	};
 }
 
 /**
@@ -4244,18 +4286,18 @@ function toolTimingFields(
 	tc: AdapterToolItem["tc"],
 	category: string,
 	metadata: unknown,
-): Record<string, number | undefined> {
-	const meta = asObject(metadata);
+): ToolTimingRecord & { timeoutMs?: number } {
 	const durationMs = readFiniteNumber(tc.durationMs) ?? deriveDuration(tc);
-	const execDurationMs = readFiniteNumber(meta.execDurationMs);
 	const stamps = toolTimingStamps(tc);
 	// `startedAt` keeps its historical precedence (explicit → execution → created)
 	// so the live elapsed counter is unaffected by the new stamp passthrough.
 	const startedAt = stamps.startedAt ?? stamps.executionStartedAt ?? stamps.createdAt;
 	const timeoutMs = effectiveTimeoutMs(tc, category);
-	const out: Record<string, number | undefined> = { ...stamps };
+	const out: ToolTimingRecord & { timeoutMs?: number } = {
+		...stamps,
+		...toolTimingMetadata(metadata),
+	};
 	if (durationMs != null) out.durationMs = durationMs;
-	if (execDurationMs != null) out.execDurationMs = execDurationMs;
 	if (startedAt != null) out.startedAt = startedAt;
 	if (timeoutMs != null) out.timeoutMs = timeoutMs;
 	return out;
@@ -4662,11 +4704,8 @@ function toolTraceItem(
 	// that field absorbs permission / reflection / queue waiting, and a 1.2s command
 	// that waited 19s on a gate read as a 20s command. Same shared rule the card
 	// header uses — the two must not disagree about one call. Height-neutral.
-	const displayDurationMs = resolveToolDisplayDurationMs({
-		category,
-		execDurationMs: readFiniteNumber(asObject(resolveToolMetadata(item.tc)).execDurationMs),
-		durationMs: readFiniteNumber(item.tc.durationMs) ?? deriveDuration(item.tc),
-	});
+	const timing = cardTiming(item.tc);
+	const displayDurationMs = resolveToolDisplayDurationMs({ category, ...timing });
 	return {
 		title: truncateTitle(rawTitle),
 		hasIcon: true,
@@ -4691,7 +4730,7 @@ function toolTraceItem(
 		...(reflectionStatus ? { reflectionStatus } : {}),
 		// Same stamp record a subagent card's header uses, so the row's timing popover
 		// reports the same phase breakdown the full card would. Height-neutral.
-		timing: cardTiming(item.tc),
+		timing,
 		...(displayDurationMs != null ? { displayDurationMs } : {}),
 		identity: toolRowIdentity(item),
 		// Same value the standalone card carries, so the two renderings of this tool
