@@ -29,7 +29,7 @@
  */
 
 import type { SerializedDockview } from "dockview-react";
-import { filePanelIdentity } from "../../narrator/dock/dock-panel-types";
+import { filePanelResourceKey } from "../../narrator/dock/dock-panel-types";
 import { removeRetiredFilemodPanels } from "../../narrator/panels/layout-envelope";
 import { filePanelResourceId, filePanelResourceParams } from "../../narrator/panels/panel-kind";
 import {
@@ -128,7 +128,7 @@ export function panelIdFor(kind: DetachablePanelKind, resourceId?: string): stri
 	if (kind === "file" && resourceId) {
 		const target = filePanelResourceParams(resourceId);
 		if (target.toolEdit || target.fileNarratorId) {
-			return `file:${filePanelIdentity(target.filePath, target.deviceId, target.toolEdit, target.fileNarratorId)}`;
+			return `file:${filePanelResourceKey(target)}`;
 		}
 		return `file:${filePanelResourceId(target.filePath, target.deviceId)}`;
 	}

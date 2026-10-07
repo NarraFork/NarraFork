@@ -102,30 +102,25 @@ export function readPanelSubject(
 }
 
 /**
- * Find which mounted surface owns `panelId`, and describe the panel.
+ * Find the native drag's mounted dockview instance, and describe its panel.
  *
- * The owner cannot come from the drag itself: dockview's `PanelTransfer` carries a
- * `viewId`, but that is dockview's own component id — our `surfaceId` is never
- * passed to `DockviewReact`, so the two are unrelated. Nor can it come from the
- * panel's params, which only carry `chapterId` for some kinds (it is optional on
- * narrator-bound panels and absent entirely on subagent / file ones).
- *
- * So every mounted surface is asked whether it holds the panel. Both kinds are
- * candidates — an expanded chapter's dock and a detached canvas node — because a
- * tab can be dragged out of either.
+ * `viewId` is dockview's api.id, not our surfaceId. The registry maps that
+ * instance to its surface and owning chapter. Bare panel ids are shared by
+ * different instances and cannot identify the source.
  */
 export function resolveTabDetachSubject(
 	panelId: string | null | undefined,
+	viewId: string | null | undefined,
 ): TabDetachSubject | null {
-	if (!panelId) return null;
-	for (const surfaceId of listSurfaceIds()) {
-		const panel = getChapterDock(surfaceId)?.apiRef.current?.getPanel(panelId);
-		if (!panel) continue;
-		const chapterId = getSurfaceChapterId(surfaceId);
-		if (!chapterId) return null;
-		const subject = readPanelSubject(panel.params);
-		if (!subject) return null; // found it, but it may not be detached
-		return { chapterId, surfaceId, panelId, ...subject };
-	}
-	return null;
+	if (!panelId || !viewId) return null;
+	const matches = listSurfaceIds().filter(
+		(surfaceId) => getChapterDock(surfaceId)?.apiRef.current?.id === viewId,
+	);
+	if (matches.length !== 1) return null;
+	const surfaceId = matches[0];
+	const panel = getChapterDock(surfaceId)?.apiRef.current?.getPanel(panelId);
+	const chapterId = getSurfaceChapterId(surfaceId);
+	if (!panel || !chapterId) return null;
+	const subject = readPanelSubject(panel.params);
+	return subject ? { chapterId, surfaceId, panelId, ...subject } : null;
 }

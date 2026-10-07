@@ -32,16 +32,21 @@ import {
 	dockPanelId,
 	fileDockPanelId,
 	NARRATOR_DOCK_COMPONENT,
+	resolveFilePanel,
 	subagentDockPanelId,
 } from "../../narrator/dock/dock-panel-types";
 import { useNarratorDockContext } from "../../narrator/dock/NarratorDockContext";
 import { narratorDockComponents, narratorDockTabComponents } from "../../narrator/dock/panels";
 import { stripIdentityFromLayout } from "../../narrator/panels/layout-envelope";
 import { filePanelResourceParams } from "../../narrator/panels/panel-kind";
-import { acceptForeignPanelDragOver, handleForeignPanelDrop } from "./cross-surface-drop";
+import {
+	acceptForeignPanelDragOver,
+	handleForeignPanelDrop,
+	releasePanelDragSource,
+} from "./cross-surface-drop";
 import { isDetachablePanelKind } from "./detachable";
 import type { DetachedPanelEntry } from "./detached-panels";
-import { getChapterDock, registerDetachedDock } from "./dock-registry";
+import { registerDetachedDock } from "./dock-registry";
 
 export interface DetachedNodeDockProps {
 	/** The canvas node's id; doubles as this surface's id. */
@@ -164,9 +169,18 @@ export const DetachedNodeDock = memo(function DetachedNodeDock({
 			}
 			if (!restored) {
 				for (const panel of pendingRef.current ?? []) {
-					const panelId = panelIdOf(panel);
-					if (!panelId) continue;
-					const existing = api.getPanel(panelId);
+					const canonicalId = panelIdOf(panel);
+					if (!canonicalId) continue;
+					const params = paramsOf(panel, narratorId, chapterId);
+					const { id: panelId, existing } =
+						params.panelType === "file"
+							? resolveFilePanel(
+									api.panels,
+									{ ...params, hostNarratorId: narratorId },
+									canonicalId,
+									"focus",
+								)
+							: { id: canonicalId, existing: api.getPanel(canonicalId) };
 					if (existing) {
 						if (panel.kind === "file" && (panel.referenceOrigin || panel.largeFileConfirmed)) {
 							existing.api.updateParameters({
@@ -180,7 +194,7 @@ export const DetachedNodeDock = memo(function DetachedNodeDock({
 					api.addPanel({
 						id: panelId,
 						component: NARRATOR_DOCK_COMPONENT[panel.kind],
-						params: paramsOf(panel, narratorId, chapterId),
+						params,
 					});
 				}
 			}
@@ -232,11 +246,13 @@ export const DetachedNodeDock = memo(function DetachedNodeDock({
 			const direction = target.intent === "swap" ? "within" : intentToDirection(target.intent);
 
 			if ((kind === "subagent" || kind === "file") && !drag.resourceId) return;
+			const subject = releasePanelDragSource(drag, api);
+			if (!subject) return;
 			const fileTarget = {
-				...filePanelResourceParams(drag.resourceId ?? ""),
-				...(drag.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
+				...filePanelResourceParams(subject.resourceId ?? ""),
+				...(subject.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
 			};
-			const panelId =
+			const canonicalId =
 				kind === "subagent"
 					? subagentDockPanelId(drag.resourceId as string)
 					: kind === "file"
@@ -248,15 +264,15 @@ export const DetachedNodeDock = memo(function DetachedNodeDock({
 							)
 						: dockPanelId(kind);
 
-			// Release the panel on the source surface FIRST. Done after adding, a failure
-			// in between would leave the same panel in two surfaces, each with its own
-			// live session.
-			if (drag.panelId && drag.surfaceId !== nodeId) {
-				getChapterDock(drag.surfaceId)?.apiRef.current?.getPanel(drag.panelId)?.api.close();
-			}
-
-			// Already here: focus it rather than adding a second.
-			const existing = api.getPanel(panelId);
+			const { id: panelId, existing } =
+				kind === "file"
+					? resolveFilePanel(
+							api.panels,
+							{ panelType: "file", ...fileTarget, hostNarratorId: narratorId },
+							canonicalId,
+							"focus",
+						)
+					: { id: canonicalId, existing: api.getPanel(canonicalId) };
 			if (existing) {
 				if (kind === "file" && (fileTarget.referenceOrigin || fileTarget.largeFileConfirmed)) {
 					existing.api.updateParameters({
@@ -275,14 +291,14 @@ export const DetachedNodeDock = memo(function DetachedNodeDock({
 				component: NARRATOR_DOCK_COMPONENT[kind],
 				params:
 					kind === "subagent"
-						? { panelType: "subagent" as const, subagentNarratorId: drag.resourceId ?? "" }
+						? { panelType: "subagent" as const, subagentNarratorId: subject.resourceId ?? "" }
 						: kind === "file"
 							? { panelType: "file" as const, ...fileTarget }
 							: { panelType: kind, narratorId, chapterId },
 				position: { referenceGroup: group, direction },
 			});
 		},
-		[chapterId, narratorId, nodeId],
+		[chapterId, narratorId],
 	);
 
 	/** Cross-surface TAB drop (native DnD); see `./cross-surface-drop`. */

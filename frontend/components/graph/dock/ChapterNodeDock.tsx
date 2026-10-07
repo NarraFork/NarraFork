@@ -35,6 +35,7 @@ import {
 	dockPanelId,
 	fileDockPanelId,
 	NARRATOR_DOCK_COMPONENT,
+	resolveFilePanel,
 	subagentDockPanelId,
 } from "../../narrator/dock/dock-panel-types";
 import {
@@ -44,9 +45,13 @@ import {
 import { narratorDockComponents, narratorDockTabComponents } from "../../narrator/dock/panels";
 import { NarratorPanelSkeleton } from "../../narrator/NarratorPanelSkeleton";
 import { filePanelResourceParams } from "../../narrator/panels/panel-kind";
-import { acceptForeignPanelDragOver, handleForeignPanelDrop } from "./cross-surface-drop";
+import {
+	acceptForeignPanelDragOver,
+	handleForeignPanelDrop,
+	releasePanelDragSource,
+} from "./cross-surface-drop";
 import { isDetachablePanelKind } from "./detachable";
-import { getChapterDock, isDetachedSurface, registerChapterDock } from "./dock-registry";
+import { isDetachedSurface, registerChapterDock } from "./dock-registry";
 import { applyChapterDockLayout, serializeChapterDockLayout } from "./graph-node-dock-layout";
 import { isInteractiveZoom } from "./inverse-scale";
 
@@ -219,11 +224,13 @@ const ChapterNodeDockSurface = memo(function ChapterNodeDockSurface({
 			// Multi-instance kinds are keyed by their resource; the rest are singletons
 			// per surface (`dockPanelId` deliberately does not accept the former).
 			if ((kind === "subagent" || kind === "file") && !drag.resourceId) return;
+			const subject = releasePanelDragSource(drag, api);
+			if (!subject) return;
 			const fileTarget = {
-				...filePanelResourceParams(drag.resourceId ?? ""),
-				...(drag.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
+				...filePanelResourceParams(subject.resourceId ?? ""),
+				...(subject.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
 			};
-			const panelId =
+			const canonicalId =
 				kind === "subagent"
 					? subagentDockPanelId(drag.resourceId as string)
 					: kind === "file"
@@ -235,19 +242,15 @@ const ChapterNodeDockSurface = memo(function ChapterNodeDockSurface({
 							)
 						: dockPanelId(kind);
 
-			// Release the panel on the source surface FIRST, when it is a live one. If
-			// this were done after adding, a failure in between would leave the same
-			// panel in two surfaces at once — and both would hold their own session.
-			// A detached surface that has already gone (node removed mid-drag) simply
-			// has nothing to close.
-			if (drag.panelId) {
-				getChapterDock(drag.surfaceId)?.apiRef.current?.getPanel(drag.panelId)?.api.close();
-			}
-
-			// Already open here (the user tore out one instance and dragged in another,
-			// or re-opened it from the toolbar meanwhile): focus it rather than adding a
-			// second, so the panel does not exist in two places.
-			const existing = api.getPanel(panelId);
+			const { id: panelId, existing } =
+				kind === "file"
+					? resolveFilePanel(
+							api.panels,
+							{ panelType: "file", ...fileTarget, hostNarratorId: narratorId },
+							canonicalId,
+							"focus",
+						)
+					: { id: canonicalId, existing: api.getPanel(canonicalId) };
 			if (existing) {
 				if (kind === "file" && (fileTarget.referenceOrigin || fileTarget.largeFileConfirmed)) {
 					existing.api.updateParameters({
@@ -263,7 +266,7 @@ const ChapterNodeDockSurface = memo(function ChapterNodeDockSurface({
 
 			const params =
 				kind === "subagent"
-					? { panelType: "subagent" as const, subagentNarratorId: drag.resourceId ?? "" }
+					? { panelType: "subagent" as const, subagentNarratorId: subject.resourceId ?? "" }
 					: kind === "file"
 						? { panelType: "file" as const, ...fileTarget }
 						: { panelType: kind, narratorId, chapterId };

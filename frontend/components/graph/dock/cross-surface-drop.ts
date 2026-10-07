@@ -23,15 +23,18 @@
 
 import type { DockviewApi, DockviewDidDropEvent, DockviewDndOverlayEvent } from "dockview-react";
 import { getPanelData } from "dockview-react";
+import type { PanelDragState } from "../../../lib/panel-drag";
 import {
 	dockPanelId,
 	fileDockPanelId,
 	NARRATOR_DOCK_COMPONENT,
+	resolveFilePanel,
 	subagentDockPanelId,
 } from "../../narrator/dock/dock-panel-types";
-import { filePanelResourceParams } from "../../narrator/panels/panel-kind";
+import { filePanelResourceId, filePanelResourceParams } from "../../narrator/panels/panel-kind";
+import { isDetachablePanelKind } from "./detachable";
 import { getChapterDock } from "./dock-registry";
-import { resolveTabDetachSubject } from "./tab-detach";
+import { readPanelSubject, resolveTabDetachSubject, type TabDetachSubject } from "./tab-detach";
 
 /**
  * Accept a tab dragged in from ANOTHER surface, so dockview draws a drop overlay.
@@ -41,7 +44,8 @@ import { resolveTabDetachSubject } from "./tab-detach";
  * of behaviour that already works.
  */
 export function acceptForeignPanelDragOver(event: DockviewDndOverlayEvent, api: DockviewApi): void {
-	if (shouldAcceptForeignPanel(getPanelData()?.panelId, api)) event.accept();
+	const transfer = getPanelData();
+	if (shouldAcceptForeignPanel(transfer?.panelId, api, transfer?.viewId)) event.accept();
 }
 
 /**
@@ -51,13 +55,82 @@ export function acceptForeignPanelDragOver(event: DockviewDndOverlayEvent, api: 
  */
 export function shouldAcceptForeignPanel(
 	panelId: string | null | undefined,
-	api: Pick<DockviewApi, "getPanel">,
+	api: Pick<DockviewApi, "id">,
+	viewId: string | null | undefined,
 ): boolean {
-	if (!panelId) return false;
+	if (!panelId || !viewId) return false;
 	// Already ours → let dockview handle it internally (reorder / split).
-	if (api.getPanel(panelId)) return false;
+	if (viewId === api.id) return false;
 	// Only panels some mounted surface holds and we know how to rebuild.
-	return resolveTabDetachSubject(panelId) !== null;
+	const subject = resolveTabDetachSubject(panelId, viewId);
+	return (
+		subject !== null &&
+		(!(subject.kind === "file" || subject.kind === "subagent") || !!subject.resourceId)
+	);
+}
+
+/** Read the live source, retaining implicit authority rather than a header fallback. */
+export function resolvePanelDragSource(
+	drag: Pick<
+		PanelDragState,
+		"toolKind" | "panelId" | "surfaceId" | "resourceId" | "largeFileConfirmed"
+	>,
+) {
+	if (!isDetachablePanelKind(drag.toolKind)) return null;
+	if (!drag.panelId) return null;
+	const dock = getChapterDock(drag.surfaceId);
+	const api = dock?.apiRef.current;
+	const panel = api?.getPanel(drag.panelId);
+	const subject = panel ? readPanelSubject(panel.params) : null;
+	if (!api || !panel || !dock || subject?.kind !== drag.toolKind) return null;
+	if ((subject.kind === "file" || subject.kind === "subagent") && !subject.resourceId) return null;
+	if (subject.kind === "file") {
+		if (!drag.resourceId || !subject.resourceId) return null;
+		const requested = filePanelResourceParams(drag.resourceId);
+		if (
+			!resolveFilePanel(
+				[panel],
+				{ panelType: "file", ...requested, hostNarratorId: dock.narratorId },
+				panel.id,
+				"focus",
+			).existing
+		)
+			return null;
+		// A live header carries its effective reader. Preserve the source's explicit
+		// reader field so implicit authority follows the target's narrator context.
+		const actual = filePanelResourceParams(subject.resourceId);
+		subject.resourceId = filePanelResourceId(
+			actual.filePath,
+			actual.deviceId,
+			actual.referenceOrigin || requested.referenceOrigin,
+			actual.toolEdit,
+			actual.fileNarratorId,
+		);
+	} else if (subject.kind === "subagent" && subject.resourceId !== drag.resourceId) {
+		return null;
+	}
+	if (drag.largeFileConfirmed === true && subject.kind === "file")
+		subject.largeFileConfirmed = true;
+	return { api, panel, subject };
+}
+
+/** Release a validated pointer source, leaving the target untouched on a close veto. */
+export function releasePanelDragSource(
+	drag: PanelDragState,
+	targetApi: Pick<DockviewApi, "id">,
+): Pick<TabDetachSubject, "kind" | "resourceId" | "largeFileConfirmed"> | null {
+	if (!isDetachablePanelKind(drag.toolKind)) return null;
+	if (!drag.panelId) {
+		return {
+			kind: drag.toolKind,
+			resourceId: drag.resourceId,
+			largeFileConfirmed: drag.largeFileConfirmed,
+		};
+	}
+	const source = resolvePanelDragSource(drag);
+	if (!source || source.api.id === targetApi.id) return null;
+	source.panel.api.close();
+	return source.api.getPanel(drag.panelId) ? null : source.subject;
 }
 
 /**
@@ -75,13 +148,16 @@ export function handleForeignPanelDrop(
 	// The event's own `getData()`, not the global `getPanelData()`: the drag payload is
 	// a module-level singleton that the drag source disposes on drag end, so reading it
 	// here races with that cleanup. The event captured it at drop time.
-	const panelId = event.getData()?.panelId;
-	if (!panelId) return false;
+	const transfer = event.getData();
+	const panelId = transfer?.panelId;
+	if (!panelId || !transfer.viewId) return false;
 	// A panel this surface already has is not a cross-surface move.
-	if (api.getPanel(panelId)) return false;
+	if (transfer.viewId === api.id) return false;
 
-	const subject = resolveTabDetachSubject(panelId);
+	const subject = resolveTabDetachSubject(panelId, transfer.viewId);
 	if (!subject) return false;
+	const { kind, resourceId } = subject;
+	if ((kind === "subagent" || kind === "file") && !resourceId) return false;
 
 	// Close on the source FIRST. Reversed, a failure in between would leave the same
 	// panel live in two surfaces at once.
@@ -89,13 +165,12 @@ export function handleForeignPanelDrop(
 	const sourcePanel = sourceApi?.getPanel(panelId);
 	if (!sourcePanel) return false;
 	sourcePanel.api.close();
+	if (sourceApi?.getPanel(panelId)) return false;
 
-	const { kind, resourceId } = subject;
 	// Multi-instance kinds are keyed by their resource; the rest are singletons per
 	// surface (`dockPanelId` deliberately does not accept the former).
-	if ((kind === "subagent" || kind === "file") && !resourceId) return false;
 	const fileTarget = filePanelResourceParams(resourceId ?? "");
-	const newPanelId =
+	const canonicalId =
 		kind === "subagent"
 			? subagentDockPanelId(resourceId as string)
 			: kind === "file"
@@ -106,6 +181,27 @@ export function handleForeignPanelDrop(
 						fileTarget.fileNarratorId,
 					)
 				: dockPanelId(kind);
+	const { id: newPanelId, existing } =
+		kind === "file"
+			? resolveFilePanel(
+					api.panels,
+					{ panelType: "file", ...fileTarget, hostNarratorId: target.narratorId },
+					canonicalId,
+					"focus",
+				)
+			: { id: canonicalId, existing: api.getPanel(canonicalId) };
+	if (existing) {
+		if (kind === "file" && (fileTarget.referenceOrigin || subject.largeFileConfirmed)) {
+			existing.api.updateParameters({
+				...existing.params,
+				...(fileTarget.referenceOrigin ? { referenceOrigin: true } : {}),
+				...(subject.largeFileConfirmed ? { largeFileConfirmed: true } : {}),
+			});
+		}
+		if (event.group) existing.api.moveTo({ group: event.group, position: "center" });
+		existing.api.setActive();
+		return true;
+	}
 
 	api.addPanel({
 		id: newPanelId,

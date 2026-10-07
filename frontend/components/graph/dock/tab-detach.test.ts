@@ -28,10 +28,11 @@ afterEach(() => {
 });
 
 /** A stand-in for the slice of NarratorDockContextValue this module touches. */
-function fakeDock(panels: Record<string, unknown>) {
+function fakeDock(panels: Record<string, unknown>, viewId = "source-view") {
 	return {
 		apiRef: {
 			current: {
+				id: viewId,
 				getPanel: (id: string) => (id in panels ? { id, params: panels[id] } : undefined),
 			},
 		},
@@ -144,10 +145,10 @@ describe("readPanelSubject", () => {
 
 describe("resolveTabDetachSubject", () => {
 	it("finds the surface that actually holds the panel", () => {
-		registerChapterDock("ch_a", fakeDock({ "ndock-git": { panelType: "git" } }));
+		registerChapterDock("ch_a", fakeDock({ "ndock-git": { panelType: "git" } }, "other-view"));
 		registerChapterDock("ch_b", fakeDock({ "ndock-terminal": { panelType: "terminal" } }));
 
-		expect(resolveTabDetachSubject("ndock-terminal")).toEqual({
+		expect(resolveTabDetachSubject("ndock-terminal", "source-view")).toEqual({
 			chapterId: "ch_b",
 			surfaceId: "ch_b",
 			panelId: "ndock-terminal",
@@ -160,7 +161,7 @@ describe("resolveTabDetachSubject", () => {
 		// (that is where the panel must be closed) while `chapterId` owns persistence;
 		// conflating them would close a panel on the wrong surface.
 		registerDetachedDock("dp_a", "ch_a", fakeDock({ "ndock-spec": { panelType: "spec" } }));
-		expect(resolveTabDetachSubject("ndock-spec")).toEqual({
+		expect(resolveTabDetachSubject("ndock-spec", "source-view")).toEqual({
 			chapterId: "ch_a",
 			surfaceId: "dp_a",
 			panelId: "ndock-spec",
@@ -170,12 +171,12 @@ describe("resolveTabDetachSubject", () => {
 
 	it("returns null when no mounted surface holds the panel", () => {
 		registerChapterDock("ch_a", fakeDock({ "ndock-git": { panelType: "git" } }));
-		expect(resolveTabDetachSubject("ndock-terminal")).toBeNull();
+		expect(resolveTabDetachSubject("ndock-terminal", "source-view")).toBeNull();
 	});
 
 	it("returns null for a panel that is found but not detachable", () => {
 		registerChapterDock("ch_a", fakeDock({ "ndock-chat": { panelType: "chat" } }));
-		expect(resolveTabDetachSubject("ndock-chat")).toBeNull();
+		expect(resolveTabDetachSubject("ndock-chat", "source-view")).toBeNull();
 	});
 
 	it("ignores surfaces that have been unregistered", () => {
@@ -186,10 +187,38 @@ describe("resolveTabDetachSubject", () => {
 			fakeDock({ "ndock-terminal": { panelType: "terminal" } }),
 		);
 		off();
-		expect(resolveTabDetachSubject("ndock-terminal")).toBeNull();
+		expect(resolveTabDetachSubject("ndock-terminal", "source-view")).toBeNull();
 	});
 
 	it("returns null without a panel id", () => {
-		expect(resolveTabDetachSubject(null)).toBeNull();
+		expect(resolveTabDetachSubject(null, "source-view")).toBeNull();
+	});
+
+	it("selects the native source view instead of the first surface with the same panel id", () => {
+		registerChapterDock(
+			"wrong",
+			fakeDock({ shared: { panelType: "file", filePath: "/wrong.ts" } }, "wrong-view"),
+		);
+		registerDetachedDock(
+			"requested",
+			"chapter",
+			fakeDock({ shared: { panelType: "file", filePath: "/requested.ts" } }),
+		);
+		expect(resolveTabDetachSubject("shared", "source-view")).toMatchObject({
+			surfaceId: "requested",
+			chapterId: "chapter",
+			resourceId: "/requested.ts",
+		});
+	});
+
+	it.each([undefined, "missing-view"])("refuses absent or unknown native viewId %s", (viewId) => {
+		registerChapterDock("chapter", fakeDock({ shared: { panelType: "terminal" } }));
+		expect(resolveTabDetachSubject("shared", viewId)).toBeNull();
+	});
+
+	it("refuses an ambiguous viewId rather than selecting a source by registration order", () => {
+		registerChapterDock("first", fakeDock({ shared: { panelType: "terminal" } }));
+		registerDetachedDock("second", "chapter", fakeDock({ shared: { panelType: "terminal" } }));
+		expect(resolveTabDetachSubject("shared", "source-view")).toBeNull();
 	});
 });

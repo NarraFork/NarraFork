@@ -42,7 +42,11 @@ import type { PluginContributionPick } from "../../plugins/PluginContributionPic
 import { buildPluginDockPanelOpenRequest } from "../../plugins/PluginContributionPicker";
 import type { PluginUiSessionContext } from "../../plugins/PluginUiSurfaceContext";
 import { PluginUiSurfaceProvider } from "../../plugins/PluginUiSurfaceContext";
-import { filePanelIdentity, type NarratorToolPanelType } from "../dock/dock-panel-types";
+import {
+	filePanelIdentity,
+	type NarratorToolPanelType,
+	resolveFilePanel,
+} from "../dock/dock-panel-types";
 import type { NarratorBrowserInfo, NarratorDockContextValue } from "../dock/NarratorDockContext";
 import type { NarratorDetailsPanelExternalProps } from "../narrator-panel-types";
 import { focusMessagePanel } from "../panels/focus-message-panel";
@@ -419,21 +423,41 @@ export class WorkspaceDockStore {
 		const api = this.apiRef.current;
 		if (!api) return;
 		const focusBeforeRestore = api.activePanel;
+		let restoredActivePreviewId: string | null = null;
 		for (const resource of resources) {
 			if (!this.narratorPanel(resource.origin.hostNarratorId)) continue;
+			let id = resource.id;
+			const params = resource.params as FilePanelParams | undefined;
+			if (params?.panelType === "file") {
+				id = resolveFilePanel(
+					api.panels,
+					{ ...params, hostNarratorId: resource.origin.hostNarratorId },
+					workspaceFilePanelId(
+						resource.origin.hostNarratorId,
+						params.filePath,
+						params.deviceId ?? "local",
+						params.toolEdit,
+						params.fileNarratorId,
+					),
+					"workspace",
+					resource.id,
+				).id;
+			}
 			this.openResource(
 				resource.origin.hostNarratorId,
 				{
-					id: resource.id,
+					id,
 					component: resource.component,
 					params: resource.params,
 					title: resource.title,
 				},
 				resource.origin.sourcePanelId,
 			);
+			if (resource.wasActive && restoredActivePreviewId === null && this.isTemporary(id)) {
+				restoredActivePreviewId = id;
+			}
 		}
-		this.activePreviewId =
-			resources.find((resource) => resource.wasActive && this.isTemporary(resource.id))?.id ?? null;
+		this.activePreviewId = restoredActivePreviewId;
 		this.syncTemporaryResourceChrome();
 		const focus = this.activePreviewId ? api.getPanel(this.activePreviewId) : focusBeforeRestore;
 		if (focus && (this.activePreviewId || !this.isTemporary(focus.id))) focus.api.setActive();
@@ -930,14 +954,22 @@ export class WorkspaceDockStore {
 		const deviceId = options.deviceId ?? "local";
 		const fileNarratorId =
 			options.fileNarratorId === hostNarratorId ? undefined : options.fileNarratorId;
-		const id = workspaceFilePanelId(
+		const canonicalId = workspaceFilePanelId(
 			hostNarratorId,
 			filePath,
 			deviceId,
 			options.toolEdit,
 			fileNarratorId,
 		);
-		const existing = api.getPanel(id);
+		const identity: FilePanelParams & { hostNarratorId: string } = {
+			panelType: "file",
+			hostNarratorId,
+			filePath,
+			deviceId,
+			fileNarratorId,
+			toolEdit: options.toolEdit,
+		};
+		const { id, existing } = resolveFilePanel(api.panels, identity, canonicalId, "workspace");
 		const params: WorkspacePanelParams = {
 			...(existing?.params as FilePanelParams | undefined),
 			panelType: "file",

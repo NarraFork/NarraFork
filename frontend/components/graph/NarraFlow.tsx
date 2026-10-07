@@ -54,6 +54,7 @@ import { useTranslation } from "react-i18next";
 import { ChapterNode, MIN_RESIZE_WIDTH as MIN_EXPANDED_NODE_WIDTH } from "./ChapterNode";
 import { CherryPickEdge } from "./CherryPickEdge";
 import { DRAFT_NODE_WIDTH, type DraftMode, DraftNode } from "./DraftNode";
+import { resolvePanelDragSource } from "./dock/cross-surface-drop";
 import { DETACHED_GRIP_CLASS, DetachedPanelNode } from "./dock/DetachedPanelNode";
 import { resolveCanvasDropTarget, toRect } from "./dock/detach-hit-test";
 import { isDetachablePanelKind } from "./dock/detachable";
@@ -67,7 +68,7 @@ import {
 	serializeDetachedNodes,
 	setDetachedLayout,
 } from "./dock/detached-panels";
-import { getChapterDock } from "./dock/dock-registry";
+import { getSurfaceChapterId } from "./dock/dock-registry";
 import { resolveExpandRequest } from "./dock/expand-limit";
 import { resolveTabDetachSubject } from "./dock/tab-detach";
 import { ForkEdge } from "./ForkEdge";
@@ -1665,6 +1666,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	const detachPanelToCanvas = useCallback(
 		(input: {
 			chapterId: string;
+			surfaceId: string;
 			panelId: string;
 			kind: string | undefined;
 			resourceId?: string;
@@ -1679,9 +1681,14 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			// dock through the registry. If that lookup fails — node collapsed mid-drag,
 			// panel already closed — abandon the tear-out entirely: placing the node
 			// anyway would leave the same panel both on the canvas and in the dock.
-			const sourceApi = getChapterDock(chapterId)?.apiRef.current;
-			const sourcePanel = sourceApi?.getPanel(panelId);
-			if (!sourcePanel) return;
+			const source = resolvePanelDragSource({
+				surfaceId: input.surfaceId,
+				panelId,
+				toolKind: kind,
+				resourceId,
+				largeFileConfirmed: input.largeFileConfirmed,
+			});
+			if (!source) return;
 
 			const position = reactFlowRef.current?.screenToFlowPosition({
 				x: input.screenX,
@@ -1698,7 +1705,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					w: 480,
 					h: 360,
 					// No layout yet: the surface builds one on first mount and persists it.
-					pendingPanels: [makePanelEntry(kind, resourceId, input)],
+					pendingPanels: [makePanelEntry(kind, source.subject.resourceId, source.subject)],
 				});
 				if (!result.ok) {
 					refusal = result.reason;
@@ -1708,7 +1715,8 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				// Close the dock panel BEFORE the node is placed. If this order were
 				// reversed and the close failed, the same panel would exist in both
 				// places. Inside the mutator so it only runs once the rules passed.
-				sourcePanel.api.close();
+				source.panel.api.close();
+				if (source.api.getPanel(panelId)) return null;
 				return result.nodes;
 			});
 
@@ -1765,12 +1773,13 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			// Otherwise a tear-out from a dock. Dragging INTO a dock is that dock's
 			// onDropSubject, so only a release over blank canvas reaches here.
 			if (!hint || !isDetachableDrag(final)) return;
-			// `surfaceId` is the chapter id for a header drag (stamped at drag start).
-			const chapterId = final.surfaceId;
+			const surfaceId = final.surfaceId;
+			const chapterId = getSurfaceChapterId(surfaceId);
 			const panelId = final.panelId;
-			if (!chapterId || !panelId) return;
+			if (!chapterId || !surfaceId || !panelId) return;
 			detachPanelToCanvas({
 				chapterId,
+				surfaceId,
 				panelId,
 				kind: final.toolKind,
 				...(final.resourceId ? { resourceId: final.resourceId } : {}),
@@ -1796,7 +1805,8 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 
 	/** The in-flight tab drag, when it is one we would accept. */
 	const tabDragSubject = useCallback(() => {
-		return resolveTabDetachSubject(getPanelData()?.panelId);
+		const transfer = getPanelData();
+		return resolveTabDetachSubject(transfer?.panelId, transfer?.viewId);
 	}, []);
 
 	const handleCanvasDragOver = useCallback(
@@ -1850,6 +1860,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			e.preventDefault();
 			detachPanelToCanvas({
 				chapterId: subject.chapterId,
+				surfaceId: subject.surfaceId,
 				panelId: subject.panelId,
 				kind: subject.kind,
 				...(subject.resourceId ? { resourceId: subject.resourceId } : {}),
