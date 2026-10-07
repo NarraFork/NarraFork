@@ -15,6 +15,20 @@
  * bar is — the row's `overflow:hidden` would clip it, and scroll-invariant
  * coordinates keep it from jittering.
  *
+ * Z-INDEX
+ *
+ * This button is only a navigation helper pinned to the content edge, so it
+ * must sit UNDER body-level chrome the reader is actively using — in particular
+ * Mantine `<Menu>` (toolbar overflow and its inlined device/plugin pickers) at
+ * the default 300. `Z.popover` (3000) covers those; `Z.stickyHeader` (100) does
+ * not, which is what makes an open menu paint over the button instead of under
+ * it. (Isolate-internal `Z` consumers, e.g. the multi-select toolbar inside the
+ * message column, are sealed in their own stacking context and never compete
+ * with this portal.)
+ *
+ * Same tier as the desktop floating action bar (`VListContentViewActions`):
+ * both are content-edge chrome, not selection popovers.
+ *
  * FLICKER CONTROL
  *
  * A fast fling walks bodies through their floating window in a few frames each;
@@ -66,7 +80,7 @@ function buttonStyle(top: number, right: number, shown: boolean): CSSProperties 
 		position: "fixed",
 		top,
 		right,
-		zIndex: Z.popover,
+		zIndex: Z.stickyHeader,
 		opacity: shown ? 1 : 0,
 		transition: `opacity ${FADE_MS}ms ease`,
 		animation: MOUNT_ANIMATION,

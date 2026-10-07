@@ -15,6 +15,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { Z } from "@frontend/lib/z-index";
 import { MantineProvider } from "@mantine/core";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
@@ -592,6 +593,23 @@ describe("VListContentViewHost — floating with the viewport", () => {
 		await hover();
 		expect(barMode()).toBeNull();
 	});
+
+	test("a floating bar sits below Mantine Menu's z-index", async () => {
+		// Same regression as the touch scroll button: the floating bar used
+		// Z.popover (3000) and covered body-level <Menu>s (toolbar overflow,
+		// context menus). Content-edge chrome must not outrank them.
+		const MANTINE_MENU_Z_INDEX = 300; // getDefaultZIndex().popover
+		const { controls } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		stubScrollGeometry({ above: 120, bodyHeight: 400 });
+		await hover();
+		expect(barMode()).toBe("floating");
+		const bar = barEl();
+		if (!bar) throw new Error("floating bar not found");
+		const zIndex = Number(bar.style.zIndex);
+		expect(zIndex).toBe(Z.stickyHeader);
+		expect(zIndex).toBeLessThan(MANTINE_MENU_Z_INDEX);
+	});
 });
 
 describe("VListContentViewHost — back to the start of this body", () => {
@@ -965,6 +983,25 @@ describe("VListContentViewHost — touch scroll-to-top", () => {
 		const second = touchButton();
 		expect(second).toBe(first);
 		expect(second?.getAttribute("data-vlist-touch-scroll-top-shown")).toBe("true");
+	});
+
+	test("sits below Mantine Menu's z-index", async () => {
+		// Regression: the button used Z.popover (3000) and covered an open Mantine
+		// <Menu> (toolbar overflow etc., default z-index 300). It is only a content
+		// navigation helper — chrome the reader is operating must win. Linkedom
+		// paints nothing, so this pins the style contract rather than stacking order.
+		const MANTINE_MENU_Z_INDEX = 300; // getDefaultZIndex().popover
+		touchPointerMatches = true;
+		isMobileViewport = true;
+		const { controls } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		stubScrollGeometry({ above: 120 });
+		await settleFloat();
+		const button = touchButton();
+		if (!button) throw new Error("touch button not found");
+		const zIndex = Number(button.style.zIndex);
+		expect(zIndex).toBe(Z.stickyHeader);
+		expect(zIndex).toBeLessThan(MANTINE_MENU_Z_INDEX);
 	});
 
 	test("a wide touch screen keeps the double-tap fullscreen route", async () => {
