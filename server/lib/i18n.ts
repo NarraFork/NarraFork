@@ -32,8 +32,9 @@ const messages: Messages = {
 		"zh-CN": "用户在此工具调用执行前中断了会话。",
 	},
 	"tool.interruptedByServerRestart": {
-		en: "Tool execution was interrupted by a server restart.",
-		"zh-CN": "工具执行因服务器重启而中断。",
+		en: "The server restarted before this tool's final result was saved. If execution had started, its outcome is unknown and side effects may already have occurred. The tool was not automatically retried; inspect the actual state before retrying.",
+		"zh-CN":
+			"服务器重启时，此工具的最终结果尚未保存。如果执行已经开始，结果未知，可能已产生副作用。此工具未自动重执行，请先检查实际状态再决定是否重试。",
 	},
 	"tool.browserSessionLostAfterUpdate": {
 		en: "Your browser session(s) {ids} were lost while switching to the new version and could not be restored ({reason}). Please launch a new browser session if you still need one.",

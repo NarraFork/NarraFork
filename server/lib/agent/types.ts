@@ -424,6 +424,8 @@ export type AllowPermissionResult = Extract<PermissionResult, { behavior: "allow
 export type AgentEvent =
 	| {
 			type: "assistant_message";
+			/** False when an errored/truncated response is retained for already-started tools. */
+			outputCompleted?: boolean;
 			text: string;
 			toolUses: AgentToolUse[];
 			/** Internal persistence receipt for tools missing an incremental block. */
@@ -819,6 +821,8 @@ export type ContentBlock =
 			/** Display/persistence identity, never an upstream replay credential. */
 			id?: string;
 			revision?: number;
+			/** False for durable checkpoints; true only at a successful completion boundary. */
+			completed?: boolean;
 			/** Raw stream length before citation-marker cleanup. */
 			rawTextLength?: number;
 			/**
@@ -835,6 +839,8 @@ export type ContentBlock =
 			outputIndex?: number;
 			id?: string;
 			revision?: number;
+			/** False for durable checkpoints; true only at a successful completion boundary. */
+			completed?: boolean;
 			/** Raw stream length before citation-marker cleanup. */
 			rawTextLength?: number;
 	  }

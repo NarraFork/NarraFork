@@ -682,7 +682,9 @@ async function loadUpdateSeveredNarrators(
 }
 
 /** Read the manifest epoch before generic startup cleanup mutates any protected row. */
-export async function getPlannedUpdateStartupProtection(): Promise<{
+export async function getPlannedUpdateStartupProtection(
+	options: { claimAuthorization?: boolean } = {},
+): Promise<{
 	snapshot: PlannedUpdateRecoverySnapshot | null;
 	protection: ToolContinuationProtectionSets;
 	/** Manifest narrators observed mid-turn before generic recovery rewrote their status. */
@@ -709,7 +711,7 @@ export async function getPlannedUpdateStartupProtection(): Promise<{
 		return { snapshot: null, protection: EMPTY_PROTECTION, severedNarratorIds: new Set() };
 	}
 
-	if (snapshot.resumeOnNextStartup) {
+	if (snapshot.resumeOnNextStartup && options.claimAuthorization !== false) {
 		// Claim before mounting any owner. Keep evidence for this recovery pass, but a later
 		// ordinary boot must not replay the authorization if recovery crashes or fails.
 		writePlannedUpdateRecoverySnapshot(
@@ -812,6 +814,7 @@ type OwnerContinuationOutcome = "started" | "mounted" | "deferred";
 
 async function continueOwnerWhenReady(
 	record: ToolContinuationRecord,
+	recoveringToolCallIds?: ReadonlySet<string>,
 ): Promise<OwnerContinuationOutcome> {
 	const { narratorService } = await import("./narrator-service");
 	let owner: Awaited<ReturnType<typeof narratorService.getById>>;
@@ -829,7 +832,10 @@ async function continueOwnerWhenReady(
 				payloadString(row.payloadJson, "subagentId") === owner.id &&
 				row.state !== "cancelled",
 		);
-		if (owningAgentContinuation) {
+		if (
+			owningAgentContinuation &&
+			(!recoveringToolCallIds || recoveringToolCallIds.has(owningAgentContinuation.toolCallId))
+		) {
 			return hasPersistedToolContinuationResult(owningAgentContinuation) ? "mounted" : "deferred";
 		}
 		const { resumeSubagent } = await import("./subagent-resume");
@@ -842,6 +848,8 @@ async function continueOwnerWhenReady(
 				locale: "en",
 				allowRunningRestart: true,
 				skipStaleAttach: true,
+				skipConclusionDelivery:
+					record.payloadJson?.ordinaryRestart === true && !owningAgentContinuation,
 			});
 			if (resumed.started) return "started";
 		} catch (error) {
@@ -1197,10 +1205,12 @@ async function writeRecoveryToolError(
 ): Promise<boolean> {
 	const toolCall = await db.query.narratorToolCalls.findFirst({
 		where: eq(narratorToolCalls.id, record.toolCallId),
+		columns: { id: true, toolUseId: true, messageId: true, status: true },
 	});
 	if (!toolCall) return false;
-	const { narratorService } = await import("./narrator-service");
-	await narratorService.updateToolCallResult(
+	if (toolCall.status === "success" || toolCall.status === "fail") return true;
+	const { narratorPersistence } = await import("./narrator-persistence");
+	await narratorPersistence.updateToolCallResultIfActive(
 		toolCall.toolUseId,
 		{
 			output: {
@@ -1298,6 +1308,40 @@ async function claimAndRestoreExecution(
 	if (hasPersistedToolContinuationResult(current)) {
 		onMounted();
 		return current;
+	}
+	// A prior process may have persisted the actual result and died before advancing the
+	// continuation phase. Terminal tool rows win over expired non-idempotent claims.
+	// Background Agent success is only its start receipt, so its child still needs mounting.
+	const persistedCall = await db.query.narratorToolCalls.findFirst({
+		where: eq(narratorToolCalls.id, current.toolCallId),
+		columns: { status: true },
+	});
+	if (
+		current.kind !== "background_agent" &&
+		(persistedCall?.status === "success" || persistedCall?.status === "fail")
+	) {
+		const resultClaim =
+			current.state === "resuming" && current.claimToken
+				? current
+				: await toolContinuationService.claim(current.toolCallId, {
+						claimToken: generateId(),
+						deadlineAt: new Date(Date.now() + CLAIM_LEASE_MS).toISOString(),
+					});
+		if (resultClaim?.claimToken) {
+			const written = await toolContinuationService.markResultWritten(current.toolCallId, {
+				claimToken: resultClaim.claimToken,
+			});
+			if (written) {
+				onMounted();
+				return written;
+			}
+		}
+		const latest = await toolContinuationService.getByToolCallId(current.toolCallId);
+		if (latest?.state === "cancelled" || (latest && hasPersistedToolContinuationResult(latest))) {
+			onMounted();
+			return latest;
+		}
+		throw new Error(`Could not reconcile persisted terminal result for ${current.toolCallId}`);
 	}
 	const repaired = await repairPendingRecoveryFailure(current);
 	if (repaired) {
@@ -1442,6 +1486,7 @@ async function deliverRecoveredMessageOwner(
 	record: ToolContinuationRecord,
 	messageId: string,
 	parentInterrupt?: ParentRecoveryInterrupt,
+	recoveringToolCallIds?: ReadonlySet<string>,
 ): Promise<void> {
 	const rows = await toolContinuationService.markOwnerContinuationPendingForMessage(
 		messageId,
@@ -1467,7 +1512,7 @@ async function deliverRecoveredMessageOwner(
 
 	const onlyBackgroundAgents = rows.every((row) => row.kind === "background_agent");
 	if (!onlyBackgroundAgents) {
-		const outcome = await continueOwnerWhenReady(record);
+		const outcome = await continueOwnerWhenReady(record, recoveringToolCallIds);
 		// An interrupt can land after continueNarrator's admission check but before its active loop
 		// becomes visible to interruptNarrator. Abort that newly-started loop without recursively
 		// re-triggering planned-update control, then join the token's durable finalizer.
@@ -1587,6 +1632,10 @@ function restoreRecoveryQueue(
 					},
 				};
 				runs.set(item, scheduled);
+				// Ordinary restart has installed a durable queued owner already. Its HTTP readiness
+				// must not wait for a child's human gate, while executionMounted still keeps
+				// Agent-dependent Await/Send behind the actual child/alias registration.
+				if (snapshot.updateEpoch.startsWith("restart-")) markReady();
 				// Later groups are queued behind an earlier barrier and count as safely mounted,
 				// except Send await and an Agent-dependent Await/Send group: both need their real
 				// responder/waiter setup to exist before planned-update recovery becomes ready.
@@ -1661,6 +1710,7 @@ function restoreRecoveryQueue(
 				plan.messageItems[0].record,
 				plan.messageItems[0].messageId,
 				parentInterrupts.get(plan.messageItems[0].record.narratorId),
+				new Set(queue.map((item) => item.record.toolCallId)),
 			);
 		})(),
 	);
@@ -1779,11 +1829,18 @@ export interface PlannedUpdateRecoveryHandle {
  * permission, or AskUserQuestion terminal completion. The returned completion drives readiness
  * failure reporting and manifest cleanup in the background.
  */
-export async function restoreNarratorsAfterPlannedUpdate(prepared?: {
-	snapshot: PlannedUpdateRecoverySnapshot | null;
-	protection: ToolContinuationProtectionSets;
-	severedNarratorIds?: ReadonlySet<string>;
-}): Promise<PlannedUpdateRecoveryHandle | null> {
+export async function restoreNarratorsAfterPlannedUpdate(
+	prepared?: {
+		snapshot: PlannedUpdateRecoverySnapshot | null;
+		protection: ToolContinuationProtectionSets;
+		severedNarratorIds?: ReadonlySet<string>;
+	},
+	options: {
+		/** Ordinary restart owns a separate manifest, never the update handoff authorization. */
+		onQueueCompleted?: () => Promise<void>;
+		includedNarratorIds?: ReadonlySet<string>;
+	} = {},
+): Promise<PlannedUpdateRecoveryHandle | null> {
 	const startup = prepared ?? (await getPlannedUpdateStartupProtection());
 	const { snapshot, protection } = startup;
 	const severedNarratorIds = startup.severedNarratorIds ?? new Set<string>();
@@ -1793,7 +1850,12 @@ export async function restoreNarratorsAfterPlannedUpdate(prepared?: {
 	}
 	const queue = (
 		await toolContinuationService.listRecoveryQueueByEpoch(snapshot.updateEpoch)
-	).filter(({ record }) => record.state !== "cancelled" && !isToolContinuationOwnerMounted(record));
+	).filter(
+		({ record }) =>
+			record.state !== "cancelled" &&
+			!isToolContinuationOwnerMounted(record) &&
+			(!options.includedNarratorIds || options.includedNarratorIds.has(record.narratorId)),
+	);
 	const { registerPlannedUpdateRecoveryController } = await import("./narrator-session");
 	const parentControls = new Map<
 		string,
@@ -1864,15 +1926,20 @@ export async function restoreNarratorsAfterPlannedUpdate(prepared?: {
 		try {
 			await queueRecovery.completion;
 			const unfinished = (await toolContinuationService.listByEpoch(snapshot.updateEpoch)).filter(
-				(row) => !isToolContinuationOwnerMounted(row),
+				(row) =>
+					!isToolContinuationOwnerMounted(row) &&
+					(!options.includedNarratorIds || options.includedNarratorIds.has(row.narratorId)),
 			);
 			if (unfinished.length > 0) {
 				throw new Error(`${unfinished.length} continuation owner deliveries remain unfinished`);
 			}
-			await restoreLegacyNarrators(snapshot, protection, severedNarratorIds);
-			// Only clear the manifest this recovery pass owns. If a newer update already replaced it,
-			// the epoch guard keeps the newer manifest intact.
-			removePlannedUpdateRecoverySnapshot({ expectedEpoch: snapshot.updateEpoch });
+			if (options.onQueueCompleted) {
+				await options.onQueueCompleted();
+			} else {
+				await restoreLegacyNarrators(snapshot, protection, severedNarratorIds);
+				// Only clear the manifest this recovery pass owns, never a newer update's epoch.
+				removePlannedUpdateRecoverySnapshot({ expectedEpoch: snapshot.updateEpoch });
+			}
 		} finally {
 			for (const control of parentControls.values()) control.registration.unregister();
 			// Only now, with every runtime claim released, can queued input be judged

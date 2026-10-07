@@ -160,6 +160,7 @@ const {
 	CriticalEventPersistenceError,
 } = await import("../narrator-event-handler");
 const { executeAgentLoop } = await import("../narrator-executor");
+const { handlePermission } = await import("../narrator-permission");
 toolRegistry.register({
 	name: "PublicationHold",
 	description: "Hold the first actual execution while the second tool is streamed",
@@ -183,13 +184,14 @@ function seed(subagent: boolean) {
 	for (const id of subagent ? ["parent", "child"] : ["main"]) {
 		sqlite
 			.prepare(
-				"INSERT INTO narrators (id, type, variant, parent_narrator_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+				"INSERT INTO narrators (id, type, variant, parent_narrator_id, permission_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				id,
 				id === "child" ? "subagent" : "primary",
 				id === "child" ? "subagent:general" : "primary",
 				id === "child" ? "parent" : null,
+				"bypassPermissions",
 				now,
 				now,
 			);
@@ -219,15 +221,31 @@ function makeContext(subagent: boolean): EventHandlerContext {
 }
 
 function makeConfig(ctx: EventHandlerContext): AgentConfig {
+	const signal = new AbortController().signal;
+	const cwd = process.env.NARRAFORK_HOME as string;
 	return {
 		narratorId: ctx.narratorId,
 		conversationId: ctx.conversationId,
 		provider: "test",
 		model: "test:model",
-		cwd: process.env.NARRAFORK_HOME as string,
-		signal: new AbortController().signal,
+		cwd,
+		signal,
 		silentToolCallThreshold: -1,
-		permissionHandler: async () => ({ behavior: "allow" }),
+		// An in-memory `allow` is not an approval receipt. Exercise the real
+		// permission writer so the real final-start gate can validate this attempt.
+		permissionHandler: (name, input, id, options) =>
+			handlePermission(
+				ctx.narratorId,
+				signal,
+				name,
+				input,
+				id,
+				cwd,
+				"en",
+				ctx.broadcastTargetId,
+				options,
+				ctx.parentToolUseId,
+			),
 		onToolExecutionStarting: (toolUseId, binding, startedAt) =>
 			narratorPersistence.claimToolCallExecution(ctx.narratorId, toolUseId, binding, startedAt),
 	};
@@ -317,6 +335,7 @@ describe("real loop content publication before tools", () => {
 					for (const block of committed.blocks.slice(0, 2)) {
 						expect(block.id).toBeString();
 						expect(block.revision).toBeNumber();
+						expect(block.completed).toBe(route === "native-metadata");
 					}
 					if (route === "native-metadata")
 						expect(committed.blocks[0]).toMatchObject({
@@ -361,6 +380,7 @@ describe("real loop content publication before tools", () => {
 					const result = await bounded(running);
 					expect(result.hasError).toBe(false);
 					const final = readMessage(messageId as string);
+					expect(final.blocks.slice(0, 2).every((block) => block.completed === true)).toBe(true);
 					expect(final.seq).toBe(committed.seq);
 					expect(final.blocks.map((block) => block.type)).toEqual([
 						"reasoning",
