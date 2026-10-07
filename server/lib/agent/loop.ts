@@ -3232,7 +3232,7 @@ async function* agentLoopInMetadataSnapshot(
 		}
 		// A reflection sub-loop runs inside the parent's tool admission, so it must not be
 		// parked behind the update gate — see beginNarratorResponseActivity for the deadlock.
-		const responseActivity = await beginNarratorResponseActivity(config.narratorId, config.signal, {
+		let responseActivity = await beginNarratorResponseActivity(config.narratorId, config.signal, {
 			isReflection: !!config.reflectionLoop,
 		});
 		try {
@@ -4391,6 +4391,7 @@ async function* agentLoopInMetadataSnapshot(
 				outputContent.reset();
 				textOutputIndex = undefined;
 				reasoningBlockMap.clear();
+				redactedThinkingBlocks.length = 0;
 				toolUses.length = 0;
 				toolOrderIdentities.clear();
 				nextToolArrivalOrder = 0;
@@ -4463,6 +4464,8 @@ async function* agentLoopInMetadataSnapshot(
 					: undefined;
 
 				const attemptAbort = new AbortController();
+				let updateReasoningInterrupted = false;
+				const updateReasoningStop = new Error("Reasoning paused for graceful restart");
 				const guidanceStop = new Error("Stopped for immediate guidance");
 				const onGuidanceAbort = () => {
 					observeSoftStopForTurn();
@@ -4562,7 +4565,12 @@ async function* agentLoopInMetadataSnapshot(
 					config.signal.addEventListener("abort", onParentAbort, { once: true });
 				}
 
+				responseActivity.setReasoningAbort(() => {
+					updateReasoningInterrupted = true;
+					attemptAbort.abort(updateReasoningStop);
+				});
 				try {
+					if (updateReasoningInterrupted) throw updateReasoningStop;
 					const resetUpstreamSession = resetUpstreamSessionOnNextRequest;
 					resetUpstreamSessionOnNextRequest = false;
 					if (config.runtimeAuthorizationGuard) await config.runtimeAuthorizationGuard();
@@ -4652,6 +4660,17 @@ async function* agentLoopInMetadataSnapshot(
 
 					streamExecutionOpen = true;
 					for await (const parsed of stream) {
+						if (updateReasoningInterrupted) throw updateReasoningStop;
+						// Once visible text or a tool starts, drain the whole response safely.
+						if (
+							parsed.text ||
+							parsed.toolUseChunk ||
+							parsed.toolUses?.length ||
+							parsed.webSearch ||
+							parsed.imageGeneration
+						) {
+							responseActivity.setReasoningAbort(null);
+						}
 						if (guidanceSignal?.aborted) throw guidanceStop;
 						throwIfUserAborted();
 						// Stop dispatch before yielding/awaiting error publication. A finishing
@@ -5782,6 +5801,7 @@ async function* agentLoopInMetadataSnapshot(
 						}
 					}
 					streamExecutionOpen = false;
+					if (updateReasoningInterrupted) throw updateReasoningStop;
 					throwIfUserAborted();
 					yield* flushRequestStart();
 				} catch (err) {
@@ -5816,6 +5836,20 @@ async function* agentLoopInMetadataSnapshot(
 						yield* finishRequest("Aborted");
 						yield { type: "error", message: "Aborted" };
 						return;
+					}
+					if (updateReasoningInterrupted) {
+						// Request-local abort: preserve the narrator/user input and retry budget.
+						// Consume cleanup before opening the durable checkpoint fence.
+						clearFirstTokenTimer();
+						clearStreamIdleTimer();
+						yield* abandonAttemptForReplay(updateReasoningStop.message);
+						responseActivity.release();
+						responseActivity = await beginNarratorResponseActivity(
+							config.narratorId,
+							config.signal,
+							{ isReflection: !!config.reflectionLoop },
+						);
+						continue;
 					}
 					if (guidanceSignal?.aborted) {
 						observeSoftStopForTurn();
@@ -6325,6 +6359,7 @@ async function* agentLoopInMetadataSnapshot(
 					yield { type: "error", message: msg, diagnostics: requestDiagnostics };
 					return;
 				} finally {
+					responseActivity.setReasoningAbort(null);
 					streamExecutionOpen = false;
 					clearFirstTokenTimer();
 					clearStreamIdleTimer();

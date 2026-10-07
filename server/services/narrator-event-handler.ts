@@ -958,7 +958,7 @@ async function discardAttemptPersistedBlocks(
 	});
 	ctx.sseEmitter?.emit("event", { type: "streaming_reset" });
 
-	const partialId = ctx.getPartialMessageId();
+	let partialId = ctx.getPartialMessageId();
 	// Correlated by requestId, not by "the most recent api_request_start": that event
 	// is flushed lazily, so an attempt that produced nothing emits its discard first.
 	// Recording here (idempotently) yields this attempt's own starting block count.
@@ -979,6 +979,12 @@ async function discardAttemptPersistedBlocks(
 			: [];
 		if (blocks.length <= baseline) return;
 
+		// An in-flight partial may have been forked. Keep execution/approval identity
+		// on the real owner while isolating sibling snapshots before any mutation.
+		partialId = await narratorPersistence.copyOnWriteMessage(narratorId, partialId, undefined, {
+			preserveExecutionOwner: true,
+		});
+		ctx.setPartialMessageId(partialId);
 		const discarded = blocks.slice(baseline);
 		const discardedToolUseIds = discarded.flatMap((block) =>
 			block.type === "tool_use" && typeof block.id === "string" ? [block.id] : [],
@@ -1028,14 +1034,19 @@ async function discardAttemptPersistedBlocks(
 			)
 			.join("\n");
 
-		await db
-			.update(narratorMessages)
-			.set({
+		// A fork can acquire a ref after the earlier tool-isolation COW returned.
+		// Recheck membership and truncate atomically, never in a separate UPDATE.
+		partialId = await narratorPersistence.copyOnWriteMessage(
+			narratorId,
+			partialId,
+			{
 				contentJson: nextBlocks,
 				contentText: contentText || null,
 				contextCharsJson: measureMessageCharacters("assistant", nextBlocks, contentText),
-			})
-			.where(eq(narratorMessages.id, partialId));
+			},
+			{ preserveExecutionOwner: true },
+		);
+		ctx.setPartialMessageId(partialId);
 
 		logger.info("Discarded persisted blocks of a replayed attempt", {
 			narratorId,
