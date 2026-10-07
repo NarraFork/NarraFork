@@ -1,161 +1,256 @@
 /**
- * streaming-block-cache.ts — Incremental preparation of a LIVE streaming markdown
- * body, using the LEXER's own block boundaries.
+ * Pane-owned incremental Markdown preparation, using the lexer's block boundaries.
  *
- * Why the boundaries must come from the lexer
- * ------------------------------------------
- * The first version of this module guessed them: it froze the prepared blocks of
- * everything before the last blank line and re-parsed only the tail. A blank line is
- * not a markdown block boundary, so that was wrong in several common shapes —
- * decisively inside a fenced code block, where a blank line is ordinary content. The
- * freeze tore one code block into several PERMANENTLY, and the reader watched earlier
- * output change and disappear as the stream continued.
+ * Retain one current source, its settled blocks and the last two live units' offsets,
+ * never a map of previous streaming prefixes. Growing live units are re-lexed; unchanged
+ * units reuse prepared handles. A blank line is NOT a safe Markdown boundary (it
+ * can belong to a fence or a loose list), so only lexer offsets advance settling.
  *
- * No smarter guess works either: a fence-aware, list-aware scan still diverged on 725
- * of the prefixes tested, because whether an earlier construct is closed can depend on
- * text that has not arrived yet (a blank line between list items makes the whole list
- * loose, retroactively re-spacing items already emitted).
- *
- * `parseMarkdownUnits` removes the guessing. `marked.lexer` decides where top-level
- * blocks begin and end — correct by definition — and reports each one's source slice.
- * A growing body changes only its final token(s), so every earlier unit is
- * byte-identical frame to frame and its prepared blocks are reused verbatim.
- *
- * Two layers of reuse
- * -------------------
- * 1. **Preparation** — the dominant cost, since pretext pre-measures every inline
- *    fragment — is memoised per unit, keyed on `(isFirst, raw)`.
- * 2. **Lexing** resumes from a settled token boundary: tokens before the last two are
- *    closed, so only the live remainder is re-lexed.
- *
- * The result is exact (never an approximation of the current text) and roughly ten
- * times cheaper than re-preparing the whole body every frame.
+ * Source characters and unit counts are retention proxies, NOT heap bytes. Limits
+ * apply across the whole instance. Oversized bodies still return complete results;
+ * they simply do not stay cached. Returned prepared blocks must not be mutated.
  */
 
-import { parseMarkdownUnits } from "@shared/pretext-layout/parse-markdown";
+import {
+	parseMarkdownToPreparedBlocks,
+	parseMarkdownUnits,
+} from "@shared/pretext-layout/parse-markdown";
 import type { PreparedBlock } from "@shared/pretext-layout/prepared-block";
+import { getPreparedFontRevision } from "@shared/pretext-layout/prepared-markdown-cache";
+import { getTypographyRevision } from "@shared/pretext-layout/typography";
 import { getKatexRevision } from "./katex-runtime";
 import { markdownMathSupport } from "./measure/math-support";
 
-/**
- * Tokens kept live at the tail, i.e. NOT treated as settled.
- *
- * The final token is obviously still growing. The one before it is held back too
- * because arriving text can still merge into it — a blank line plus another list item
- * turns the preceding list loose; a closing fence turns preceding lines into one code
- * block. Two is the smallest window that covers those.
- */
+// Keep the preceding unit live too: another list item can make its whole list loose.
 const LIVE_TAIL_TOKENS = 2;
+const DEFAULT_MAX_ENTRIES = 64;
+const DEFAULT_MAX_SOURCE_CHARS = 256 * 1024;
+const MAX_UNITS = 512;
 
-/**
- * Cap on memoised units per row. A long turn produces many blocks and only the current
- * body's units are ever needed, so passing the cap clears the memo wholesale: the next
- * frame re-prepares once and repopulates. Bounded memory, amortised cost.
- */
-const MAX_UNITS_PER_ROW = 512;
+interface LiveUnit {
+	/** Offsets in this entry's current lastText; no separately retained raw string. */
+	rawStart: number;
+	rawEnd: number;
+	isFirst: boolean;
+	blocks: PreparedBlock[];
+}
 
 interface StreamingEntry {
-	/** Prepared blocks by `(isFirst, raw)` — the memo that skips pretext work. */
-	memo: Map<string, PreparedBlock[]>;
-	/** Source prefix whose tokens are closed; the lexing resume point. */
-	settledText: string;
-	/** Prepared blocks of `settledText`, in order. */
+	/** Only CURRENT live units, not old versions or already-settled raw keys. */
+	memo: LiveUnit[];
+	/** Exactly one current full source, needed to distinguish append from replacement. */
+	lastText: string;
+	settledLength: number;
 	settledBlocks: PreparedBlock[];
-	/**
-	 * KaTeX revision the entry's blocks were prepared under.
-	 *
-	 * This cache is a SECOND, independent memo layer: it keeps its own settled blocks
-	 * rather than going through `prepared-markdown-cache` (whose key already carries
-	 * the revision). So the revision has to be tracked here too — otherwise a body
-	 * that settled BEFORE the runtime arrived keeps serving blocks in which the
-	 * formula is literal text, forever. That is the streaming half of the "formulas
-	 * only render after a page reload" bug: bumping the revision invalidated every
-	 * other layer and this one silently held the stale answer.
-	 */
-	mathRevision: number;
+	settledUnits: number;
+	sourceChars: number;
+	build: number;
 }
 
-const entries = new Map<string, StreamingEntry>();
-
-function unitKey(raw: string, isFirst: boolean): string {
-	return `${isFirst ? "F" : "M"}:${raw}`;
+export interface StreamingBlockCacheOptions {
+	maxEntries?: number;
+	/** UTF-16 source characters, not bytes or a measured heap-size limit. */
+	maxSourceChars?: number;
+	/** Aggregate top-level lexer units; capped at 512 even for a larger option. */
+	maxUnits?: number;
 }
 
-function freshEntry(mathRevision: number): StreamingEntry {
-	return { memo: new Map(), settledText: "", settledBlocks: [], mathRevision };
+export interface StreamingBlockCacheStats {
+	entries: number;
+	memoUnits: number;
+	settledUnits: number;
+	retainedUnits: number;
+	/** Raw characters in the current live tail only. */
+	memoSourceChars: number;
+	/** Current full sources, including whitespace; excludes prepared object/heap sizes. */
+	retainedSourceChars: number;
+	maxEntries: number;
+	maxSourceChars: number;
+	maxUnits: number;
 }
 
-/**
- * Prepared blocks for a streaming markdown body.
- *
- * Always a complete, internally consistent preparation of exactly `text` — never a
- * concatenation of independently guessed spans — so earlier content can never be torn
- * or dropped. Cost is proportional to the part of the body still changing.
- */
-export function getStreamingPreparedBlocks(key: string, text: string): PreparedBlock[] {
-	if (text.length === 0) {
-		entries.delete(key);
-		return [];
-	}
-	const mathRevision = getKatexRevision();
-	const existing = entries.get(key);
-	// Reuse requires append-only growth AND the same math support. A rewritten body
-	// (a retry, or the front-truncation `appendStreamingTextPreview` applies past its
-	// 120k cap) shares no prefix, so the settled boundary is void; a revision change
-	// means the settled blocks were prepared without KaTeX and must be redone.
-	let entry: StreamingEntry;
-	if (existing && existing.mathRevision === mathRevision && text.startsWith(existing.settledText)) {
-		entry = existing;
-	} else {
-		entry = freshEntry(mathRevision);
-		entries.set(key, entry);
-	}
-	if (entry.memo.size > MAX_UNITS_PER_ROW) entry.memo.clear();
+function limit(value: number | undefined, fallback: number): number {
+	return value !== undefined && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : fallback;
+}
 
-	const settledLength = entry.settledText.length;
-	// Lex and prepare ONLY the live remainder. Units whose `raw` is unchanged come back
-	// from the memo without touching pretext.
-	const liveUnits = parseMarkdownUnits(text.slice(settledLength), markdownMathSupport(), {
-		// Anything settled before it makes the live slice a continuation, so its first
-		// unit keeps its contextual top margin instead of the document-start zero.
-		continuation: settledLength > 0,
-		reuse: (raw, isFirst) => entry.memo.get(unitKey(raw, isFirst)),
-	});
+function preparationRevision(): string {
+	return `${getPreparedFontRevision()}:${getTypographyRevision()}:${getKatexRevision()}`;
+}
 
-	const blocks = [...entry.settledBlocks];
-	for (const unit of liveUnits) {
-		entry.memo.set(unitKey(unit.raw, unit.isFirst), unit.blocks);
-		blocks.push(...unit.blocks);
+export class StreamingBlockCache {
+	private readonly entries = new Map<string, StreamingEntry>();
+	private readonly maxEntries: number;
+	private readonly maxSourceChars: number;
+	private readonly maxUnits: number;
+	private sourceChars = 0;
+	private units = 0;
+	private revision = preparationRevision();
+	private build = 0;
+	private building = false;
+
+	constructor(options: StreamingBlockCacheOptions = {}) {
+		this.maxEntries = limit(options.maxEntries, DEFAULT_MAX_ENTRIES);
+		this.maxSourceChars = limit(options.maxSourceChars, DEFAULT_MAX_SOURCE_CHARS);
+		this.maxUnits = Math.min(MAX_UNITS, limit(options.maxUnits, MAX_UNITS));
 	}
 
-	// Advance the settled boundary over units that can no longer change. `consumedLength`
-	// includes the inter-block whitespace (which lives in separate `space` tokens), so
-	// slicing at it lands exactly where the next unit begins.
-	const settleUpTo = liveUnits.length - LIVE_TAIL_TOKENS;
-	if (settleUpTo > 0) {
-		const boundary = liveUnits[settleUpTo - 1]?.consumedLength ?? 0;
-		if (boundary > 0) {
-			entry.settledText = text.slice(0, settledLength + boundary);
-			entry.settledBlocks = blocks.slice(
-				0,
-				entry.settledBlocks.length +
-					liveUnits.slice(0, settleUpTo).reduce((sum, unit) => sum + unit.blocks.length, 0),
-			);
+	get(key: string, text: string): PreparedBlock[] {
+		const revision = preparationRevision();
+		if (revision !== this.revision) {
+			// Drop every row, including settled blocks prepared with old font metrics.
+			this.clear();
+			this.revision = revision;
 		}
+		if (text.length === 0) {
+			this.clear(key);
+			return [];
+		}
+
+		const math = markdownMathSupport();
+		if (
+			this.maxEntries === 0 ||
+			this.maxUnits === 0 ||
+			text.length > this.maxSourceChars ||
+			// Definitions can retroactively change references ANYWHERE in the body.
+			// A suffix lexer cannot carry that global context. Conservatively use the
+			// full parser for possible definitions (also safe for false positives).
+			text.includes("]:")
+		) {
+			this.clear(key);
+			return parseMarkdownToPreparedBlocks(text, math);
+		}
+
+		const previous = this.entries.get(key);
+		// Matching only the settled prefix is insufficient: replacing "abc\n\n..."
+		// with "abcDEF" merges that settled paragraph back into the new live text.
+		const entry =
+			previous && text.startsWith(previous.lastText)
+				? previous
+				: { memo: [], lastText: "", settledLength: 0, settledBlocks: [], settledUnits: 0 };
+		const settledLength = entry.settledLength;
+		const liveUnits = parseMarkdownUnits(text.slice(settledLength), math, {
+			continuation: settledLength > 0,
+			reuse: (raw, isFirst) =>
+				entry.memo.find(
+					(unit) =>
+						unit.isFirst === isFirst && entry.lastText.slice(unit.rawStart, unit.rawEnd) === raw,
+				)?.blocks,
+		});
+		const blocks = [...entry.settledBlocks];
+		for (const unit of liveUnits) {
+			for (const block of unit.blocks) blocks.push(block);
+		}
+
+		// Replace the old entry, rather than adding a new raw key on every frame.
+		// The previous object is not mutated: its accounting is removed exactly once.
+		this.clear(key);
+		const retainedUnits = entry.settledUnits + liveUnits.length;
+		if (retainedUnits > this.maxUnits) return blocks;
+
+		const settleCount = Math.max(0, liveUnits.length - LIVE_TAIL_TOKENS);
+		const boundary = liveUnits[settleCount - 1]?.consumedLength ?? 0;
+		const settledBlockCount =
+			entry.settledBlocks.length +
+			liveUnits.slice(0, settleCount).reduce((sum, unit) => sum + unit.blocks.length, 0);
+		const memo = liveUnits.slice(settleCount).map(({ raw, isFirst, blocks, consumedLength }) => ({
+			rawStart: settledLength + consumedLength - raw.length,
+			rawEnd: settledLength + consumedLength,
+			isFirst,
+			blocks,
+		}));
+		// The only retained source is lastText. Tail memo and settled boundary refer
+		// to offsets in it, so source accounting includes all whitespace exactly once.
+		const sourceChars = text.length;
+
+		// LRU across rows. A single oversized row never evicts another pane/row.
+		while (
+			this.entries.size >= this.maxEntries ||
+			this.sourceChars + sourceChars > this.maxSourceChars ||
+			this.units + retainedUnits > this.maxUnits
+		) {
+			const oldest = this.entries.keys().next().value;
+			if (oldest === undefined) break;
+			this.clear(oldest);
+		}
+		this.entries.set(key, {
+			memo,
+			lastText: text,
+			settledLength: settledLength + boundary,
+			settledBlocks: blocks.slice(0, settledBlockCount),
+			settledUnits: entry.settledUnits + settleCount,
+			sourceChars,
+			build: this.build,
+		});
+		this.sourceChars += sourceChars;
+		this.units += retainedUnits;
+		return blocks;
 	}
-	return blocks;
+
+	clear(key?: string): void {
+		if (key === undefined) {
+			this.entries.clear();
+			this.sourceChars = 0;
+			this.units = 0;
+			return;
+		}
+		const entry = this.entries.get(key);
+		if (!entry) return;
+		this.entries.delete(key);
+		this.sourceChars -= entry.sourceChars;
+		this.units -= entry.settledUnits + entry.memo.length;
+	}
+
+	/** Start one full data build. Width-only resize must NOT bracket reads with this. */
+	beginBuild(): void {
+		this.build++;
+		this.building = true;
+	}
+
+	/** Drop rows not read during this build, without retaining a separate key set. */
+	endBuild(): void {
+		if (!this.building) return;
+		for (const [key, entry] of this.entries) {
+			if (entry.build !== this.build) this.clear(key);
+		}
+		this.building = false;
+	}
+
+	get size(): number {
+		return this.entries.size;
+	}
+
+	getStats(): StreamingBlockCacheStats {
+		let memoUnits = 0;
+		let memoSourceChars = 0;
+		for (const entry of this.entries.values()) {
+			memoUnits += entry.memo.length;
+			for (const unit of entry.memo) memoSourceChars += unit.rawEnd - unit.rawStart;
+		}
+		return {
+			entries: this.size,
+			memoUnits,
+			settledUnits: this.units - memoUnits,
+			retainedUnits: this.units,
+			memoSourceChars,
+			retainedSourceChars: this.sourceChars,
+			maxEntries: this.maxEntries,
+			maxSourceChars: this.maxSourceChars,
+			maxUnits: this.maxUnits,
+		};
+	}
 }
 
-/**
- * Drop cached units. Called with a key when one streaming row retires, and with no
- * argument on narrator switch / teardown.
- */
+// Compatibility for standalone callers. Production panes should own an instance.
+const defaultCache = new StreamingBlockCache();
+
+export function getStreamingPreparedBlocks(key: string, text: string): PreparedBlock[] {
+	return defaultCache.get(key, text);
+}
+
 export function resetStreamingBlockCache(key?: string): void {
-	if (key === undefined) entries.clear();
-	else entries.delete(key);
+	defaultCache.clear(key);
 }
 
-/** Number of cached streaming rows (diagnostics + leak assertions in tests). */
 export function streamingBlockCacheSize(): number {
-	return entries.size;
+	return defaultCache.size;
 }

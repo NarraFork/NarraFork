@@ -43,7 +43,6 @@ import {
 	applyExactStreamingSnapshotUpdate,
 	type StreamDeltaEvent,
 } from "./exact-streaming-accumulator";
-import { resetStreamingBlockCache } from "./streaming-block-cache";
 import { type HandoffMessage, projectStreamingMessage } from "./streaming-handoff";
 import {
 	applyStreamingSendDelivery,
@@ -205,13 +204,6 @@ export function useVListStreamingMessage(
 		ownerRef.current = narratorId;
 		clearBlocks();
 	}, [narratorId, clearBlocks]);
-
-	// Release the incremental markdown prefixes tied to this narrator's streaming
-	// rows, so a long session does not retain prepared blocks per turn.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: narrator-scoped cache reset
-	useEffect(() => {
-		return () => resetStreamingBlockCache();
-	}, [narratorId]);
 
 	// Per-tool hand-off: retire each synthetic card exactly when a persisted message
 	// carrying its tool-use id lands. Independent of the row-level hand-off because a

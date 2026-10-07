@@ -496,7 +496,7 @@ describe("vlist loaded-history cost", () => {
 				expect(actual.items).toEqual(expected.items);
 				expect(calls).toEqual({
 					segment: 1,
-					group: 2,
+					group: lod <= 2 ? 1 : 2,
 					adapt: 1,
 					compute: 1,
 					manifest: 1,

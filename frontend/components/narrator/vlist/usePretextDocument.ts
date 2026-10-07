@@ -633,7 +633,10 @@ export function usePretextDocument(
 	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId drives the cleanup that publishes the outgoing narrator's document
 	useEffect(() => {
 		if (!coordinator) return;
-		return () => coordinator.publishDocumentSnapshot();
+		return () => {
+			coordinator.publishDocumentSnapshot();
+			coordinator.releaseTransientCaches();
+		};
 	}, [coordinator, narratorId]);
 	// A font face resolving mid-session invalidates every baked fragment width, so
 	// the prepared blocks AND the heights derived from them must be dropped and the

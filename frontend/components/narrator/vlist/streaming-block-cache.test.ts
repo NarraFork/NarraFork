@@ -66,6 +66,10 @@ const FIXTURES: Record<string, string> = {
 	table: "数据：\n\n| 列A | 列B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\n表后文字",
 	blockquote: "引用：\n\n> 被引用的内容\n>\n> 第二段引用\n\n引用之后",
 	"horizontal rule": "上半部分\n\n---\n\n下半部分内容",
+	"forward link definition":
+		"[链接][target]\n\n第二段\n\n第三段\n\n第四段\n\n[target]: https://example.com",
+	"backward link definition":
+		"[target]: https://example.com\n\n首段\n\n第二段\n\n第三段\n\n[链接][target]",
 	math: "公式：\n\n$$a^2+b^2=c^2$$\n\n之后 $x$ 行内",
 	mixed: [
 		"# 报告",
@@ -230,7 +234,205 @@ describe("getStreamingPreparedBlocks — reuse actually happens", () => {
 	});
 });
 
+describe("StreamingBlockCache — bounded pane-local retention", () => {
+	it("retains only the current raw tail through 600 growing-paragraph frames", async () => {
+		const { StreamingBlockCache, parseMarkdownToPreparedBlocks, markdownMathSupport } =
+			await load();
+		const cache = new StreamingBlockCache();
+		let text = "";
+		for (let frame = 0; frame < 600; frame++) {
+			text += "长段落增长内容 ";
+			const blocks = cache.get("live", text);
+			if (frame % 100 === 0 || frame === 599) {
+				expect(blocks).toEqual(parseMarkdownToPreparedBlocks(text, markdownMathSupport()));
+			}
+			expect(cache.getStats()).toMatchObject({
+				entries: 1,
+				memoUnits: 1,
+				memoSourceChars: text.length,
+				retainedSourceChars: text.length,
+				retainedUnits: 1,
+			});
+		}
+	}, 30_000);
+
+	it("retains settled blocks but memoizes only the two current live units", async () => {
+		const { StreamingBlockCache, parseMarkdownUnits } = await load();
+		const cache = new StreamingBlockCache();
+		let text = "";
+		for (let frame = 0; frame < 90; frame++) {
+			text += `段落 ${frame}\n\n`;
+			cache.get("live", text);
+			const units = parseMarkdownUnits(text);
+			expect(cache.getStats()).toMatchObject({
+				memoUnits: Math.min(2, units.length),
+				memoSourceChars: units.slice(-2).reduce((sum, unit) => sum + unit.raw.length, 0),
+				retainedUnits: units.length,
+			});
+			expect(cache.getStats().retainedSourceChars).toBeLessThanOrEqual(text.length);
+		}
+	});
+
+	it("isolates same-key reuse, clear and build pruning across pane instances", async () => {
+		const { StreamingBlockCache } = await load();
+		const a = new StreamingBlockCache();
+		const b = new StreamingBlockCache();
+		const text = "开头\n\n中间\n\n末段";
+		const aFirst = a.get("same", text);
+		const bFirst = b.get("same", text);
+		expect(aFirst[0]).not.toBe(bFirst[0]);
+		expect(a.get("same", text)[0]).toBe(aFirst[0]);
+		expect(b.get("same", text)[0]).toBe(bFirst[0]);
+		a.get("unused", "unused");
+		a.beginBuild();
+		a.get("same", text);
+		a.endBuild();
+		expect(a.size).toBe(1);
+		expect(b.size).toBe(1);
+		a.clear("same");
+		expect(a.size).toBe(0);
+		expect(b.get("same", text)[0]).toBe(bFirst[0]);
+		a.get("same", text);
+		a.clear();
+		expect(b.size).toBe(1);
+		b.beginBuild();
+		b.endBuild();
+		expect(b.size).toBe(0);
+	});
+
+	it("keeps rows across reads outside a build and safely ignores an unmatched end", async () => {
+		const { StreamingBlockCache } = await load();
+		const cache = new StreamingBlockCache();
+		cache.get("a", "first");
+		cache.get("b", "second");
+		cache.endBuild();
+		cache.get("a", "first");
+		expect(cache.size).toBe(2);
+	});
+
+	it("bounds entries and aggregate source/units while oversized rows remain exact", async () => {
+		const { StreamingBlockCache, parseMarkdownToPreparedBlocks, markdownMathSupport } =
+			await load();
+		for (const options of [{ maxEntries: 0 }, { maxSourceChars: 10 }, { maxUnits: 2 }]) {
+			const cache = new StreamingBlockCache(options);
+			cache.get("large", "short");
+			const text = "第一段\n\n第二段\n\n第三段\n\n第四段";
+			expect(cache.get("large", text)).toEqual(
+				parseMarkdownToPreparedBlocks(text, markdownMathSupport()),
+			);
+			expect(cache.getStats()).toMatchObject({
+				entries: 0,
+				memoUnits: 0,
+				retainedUnits: 0,
+				retainedSourceChars: 0,
+			});
+		}
+		const cache = new StreamingBlockCache({ maxEntries: 2, maxSourceChars: 15, maxUnits: 3 });
+		const a = cache.get("a", "first");
+		cache.get("b", "second");
+		expect(cache.get("a", "first")[0]).toBe(a[0]);
+		cache.get("c", "third");
+		expect(cache.size).toBe(2);
+		expect(cache.getStats().retainedSourceChars).toBeLessThanOrEqual(15);
+		expect(cache.get("a", "first")[0]).toBe(a[0]);
+		for (let i = 0; i < 10; i++) cache.get(`row-${i}`, "字\n\n字");
+		expect(cache.getStats().retainedUnits).toBeLessThanOrEqual(3);
+		expect(cache.getStats().retainedSourceChars).toBeLessThanOrEqual(15);
+	});
+
+	it("accounts for exactly one current full source including whitespace and replacements", async () => {
+		const { StreamingBlockCache, parseMarkdownToPreparedBlocks, markdownMathSupport } =
+			await load();
+		const cache = new StreamingBlockCache({ maxSourceChars: 24 });
+		const initial = "abc\n\nsecond\n\nthird\n\n";
+		cache.get("same", initial);
+		expect(cache.getStats().retainedSourceChars).toBe(initial.length);
+		cache.get("same", "abcDEF");
+		expect(cache.getStats().retainedSourceChars).toBe(6);
+		const padded = "\n\nother\n\n";
+		cache.get("other", padded);
+		expect(cache.getStats().retainedSourceChars).toBe(6 + padded.length);
+		const oversized = `${"abcDEF"}${"x".repeat(25)}`;
+		expect(cache.get("same", oversized)).toEqual(
+			parseMarkdownToPreparedBlocks(oversized, markdownMathSupport()),
+		);
+		expect(cache.getStats().retainedSourceChars).toBe(padded.length);
+		expect(cache.size).toBe(1);
+	});
+
+	it("enforces default row and source ceilings", async () => {
+		const { StreamingBlockCache, parseMarkdownToPreparedBlocks, markdownMathSupport } =
+			await load();
+		const cache = new StreamingBlockCache();
+		for (let i = 0; i < 80; i++) cache.get(`row-${i}`, "small");
+		expect(cache.size).toBe(64);
+		const oversized = "x".repeat(256 * 1024 + 1);
+		expect(cache.get("oversized", oversized)).toEqual(
+			parseMarkdownToPreparedBlocks(oversized, markdownMathSupport()),
+		);
+		expect(cache.size).toBe(64);
+		expect(cache.getStats().retainedSourceChars).toBeLessThanOrEqual(256 * 1024);
+	});
+
+	it("invalidates all rows on font and typography revisions, including settled blocks", async () => {
+		const { StreamingBlockCache, parseMarkdownToPreparedBlocks, markdownMathSupport } =
+			await load();
+		const fonts = await import("@shared/pretext-layout/prepared-markdown-cache");
+		const typography = await import("@shared/pretext-layout/typography");
+		const oldFont = fonts.getPreparedFontRevision();
+		const oldTypography = { ...typography.getTypography() };
+		const cache = new StreamingBlockCache();
+		const text = "# 标题\n\n第二段\n\n第三段\n\n第四段";
+		try {
+			for (const invalidate of [
+				() => fonts.setPreparedFontRevision(oldFont + 1),
+				() => typography.setTypography({ fontScalePercent: oldTypography.fontScalePercent + 1 }),
+			]) {
+				const beforeA = cache.get("a", text);
+				const beforeB = cache.get("b", text);
+				invalidate();
+				const afterA = cache.get("a", text);
+				const afterB = cache.get("b", text);
+				expect(afterA[0]).not.toBe(beforeA[0]);
+				expect(afterB[0]).not.toBe(beforeB[0]);
+				expect(afterA).toEqual(parseMarkdownToPreparedBlocks(text, markdownMathSupport()));
+				expect(afterB).toEqual(parseMarkdownToPreparedBlocks(text, markdownMathSupport()));
+			}
+		} finally {
+			fonts.setPreparedFontRevision(oldFont);
+			typography.setTypography(oldTypography);
+		}
+	});
+});
+
 describe("getStreamingPreparedBlocks — cache lifecycle", () => {
+	for (const [name, before, after] of [
+		["retry shares a settled prefix", "abc\n\nsecond\n\nthird", "abcDEF"],
+		["translation replaces the same key", "原文\n\n第二段\n\n第三段", "原文的翻译结果"],
+		[
+			"retry is longer but not append-only",
+			"abc\n\nsecond\n\nthird",
+			"abc rewritten as a much longer single paragraph",
+		],
+		["tail truncation to a settled boundary", "abc\n\nsecond\n\nthird", "abc"],
+		["tail truncation inside a live block", "abc\n\nsecond\n\nthird", "abc\n\nsec"],
+	] as const) {
+		it(`matches a cold full parse after ${name}`, async () => {
+			const { StreamingBlockCache, parseMarkdownToPreparedBlocks, markdownMathSupport } =
+				await load();
+			const hot = new StreamingBlockCache();
+			const cold = new StreamingBlockCache();
+			hot.get("same-key", before);
+			const actual = hot.get("same-key", after);
+			expect(actual).toEqual(cold.get("same-key", after));
+			expect(actual).toEqual(parseMarkdownToPreparedBlocks(after, markdownMathSupport()));
+			// A later append must continue from the replacement, never the older source.
+			expect(hot.get("same-key", `${after}新增`)).toEqual(
+				parseMarkdownToPreparedBlocks(`${after}新增`, markdownMathSupport()),
+			);
+		});
+	}
+
 	it("rebuilds when the text is front-truncated (not an append-only extension)", async () => {
 		const { measureMarkdown, getStreamingPreparedBlocks, resetStreamingBlockCache } = await load();
 		resetStreamingBlockCache("truncate");
@@ -330,11 +532,11 @@ describe("getStreamingPreparedBlocks — cache lifecycle", () => {
 		resetStreamingBlockCache("math-rev");
 	});
 
-	it("stays correct after the unit memo is evicted by its cap", async () => {
+	it("stays correct after the retained-unit budget falls back to uncached preparation", async () => {
 		const { measureMarkdown, getStreamingPreparedBlocks, resetStreamingBlockCache } = await load();
 		resetStreamingBlockCache("evict");
-		// Enough distinct blocks to push past MAX_UNITS_PER_ROW, so the wholesale-clear
-		// fallback path is exercised mid-stream.
+		// Beyond the default 512 retained units, no streaming entry is kept; every
+		// subsequent result must still contain the complete prepared document.
 		let text = "";
 		for (let index = 0; index < 700; index++) {
 			text += `段落 ${index}\n\n`;
@@ -353,5 +555,5 @@ describe("getStreamingPreparedBlocks — cache lifecycle", () => {
 				preparedBlocks: getStreamingPreparedBlocks("evict", text),
 			}).height,
 		).toBeCloseTo(measureMarkdown(text, WIDTH).height, 5);
-	});
+	}, 30_000);
 });

@@ -117,6 +117,23 @@ describe("renderLabelsForKind — every chrome-painting kind is localizable", ()
 });
 
 describe("adapter chrome keys — every fallback has an injected translation", () => {
+	it("keeps translation out of the per-tool summary resolver", () => {
+		// This integration shell also owns queries, scrolling and subscriptions; the
+		// real hook/summary behavior is exercised in useVListLabels.hook.test.tsx.
+		const source = readFileSync(join(import.meta.dir, "PretextExactMessageList.tsx"), "utf8");
+		const start = source.indexOf("const resolveExactToolSummary = useCallback(");
+		const end = source.indexOf("const resolveExactSubagentRecentSummary", start);
+		expect(start).toBeGreaterThan(0);
+		expect(end).toBeGreaterThan(start);
+		const resolver = source.slice(start, end);
+		expect(resolver).not.toMatch(/\bt\(/);
+		expect(resolver).toContain(
+			"getSummary(call.toolName, call.inputJson, summaryMetadata, vlistLabels)",
+		);
+		expect(resolver).toContain("[vlistLabels]");
+		expect(source.indexOf("= useVListLabels()")).toBeLessThan(start);
+	});
+
 	it("forwards communication chrome and receipt labels through adapter data", () => {
 		const keys = [
 			"sendAwaitReply",
