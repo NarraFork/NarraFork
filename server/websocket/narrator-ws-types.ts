@@ -760,7 +760,8 @@ export type NarratorServerMessage =
 	| {
 			type: "git_status";
 			narratorId: string;
-			chapterId: string;
+			/** Null for chapter-less narrators, whose tools still touch a local Git repo. */
+			chapterId: string | null;
 			toolUseId: string;
 			status: GitStatusSummary;
 			commitsAhead?: number;

@@ -5,7 +5,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useApplyAsyncQuestionChange } from "../../hooks/useAsyncQuestions";
-import { invalidateWorkspaceQueries } from "../../hooks/useGit";
+import { invalidateGitStatusPushQueries, invalidateWorkspaceQueries } from "../../hooks/useGit";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { api, type BufferMessageSummary } from "../../lib/api";
@@ -1304,14 +1304,20 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setBrowserVisualChange((prev) => ({ sessionId, seq: (prev?.seq ?? 0) + 1 }));
 			},
 			onGitStatus: (data) => {
-				qc.setQueryData(["chapterGitStatus", data.chapterId], {
-					commitsAhead: data.commitsAhead,
-					baseBranch: data.baseBranch,
-					linesAdded: data.linesAdded,
-					linesRemoved: data.linesRemoved,
-				});
-				// Open Git panels have a workspace-scoped subscription. The legacy status
-				// event updates the chapter badge only; it must not reload every Git log.
+				if (data.chapterId) {
+					qc.setQueryData(["chapterGitStatus", data.chapterId], {
+						commitsAhead: data.commitsAhead,
+						baseBranch: data.baseBranch,
+						linesAdded: data.linesAdded,
+						linesRemoved: data.linesRemoved,
+					});
+				}
+				// The workspace bars (NarratorGitBar / ChapterBar with a narrator) read
+				// workspace-keyed gitStatus queries, which the chapter badge patch above
+				// never touches — without this the bar kept pre-session numbers until a
+				// foreground/reconnect refetch. Open Git panels additionally have their
+				// own workspace subscription; double invalidation is idempotent.
+				invalidateGitStatusPushQueries(qc, narratorId, data.chapterId);
 			},
 			onCommitSyncError: (event) => {
 				qc.invalidateQueries({ queryKey: ["chapterGitStatus", event.chapterId] });

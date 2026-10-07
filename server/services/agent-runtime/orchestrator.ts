@@ -11,6 +11,7 @@ import { db } from "../../db";
 import { narrators } from "../../db/schema";
 import { resolveProviderAndModel } from "../../lib/agent";
 import { analyzeShellCommand } from "../../lib/agent/bash-analyze";
+import { LOCAL_DEVICE_ID } from "../../lib/agent/execution/backend";
 import { projectFileReferenceText } from "../../lib/agent/file-reference-projection";
 import {
 	acknowledgePipelineExitConfirmation,
@@ -243,6 +244,35 @@ import { resolveRuntimePolicy } from "./policy";
 import { countRuntimeSystemCharacters } from "./prompt-characters";
 import type { RuntimeRecoveryState, RuntimeRecoveryTransition } from "./transition";
 import { selectRuntimeInterruption, selectRuntimeRecovery } from "./transition";
+
+/**
+ * Where a narrator's file-mutating tool calls should be git-tracked, or null.
+ *
+ * Chapter narrators track their worktree. Chapter-less narrators track their
+ * cwd, but only a local Git repo — gitService spawns local git, so a remote
+ * device would report the host's state. Evaluated per tool call rather than
+ * per session so a mid-session cwd switch re-evaluates `_isInGitRepo`.
+ *
+ * Known gap: `_isInGitRepo` is probed at session creation and cwd switches
+ * only, so a `git init` inside the current directory activates the push path
+ * no sooner than the next session/cwd change; the client-side `not_git`
+ * workspace re-probe interval covers the bar in the meantime.
+ */
+export function gitTrackPathForSession(
+	session: Pick<
+		ActiveNarrator,
+		"_worktreePath" | "_chapterId" | "_isInGitRepo" | "_defaultDeviceId" | "cwd"
+	>,
+): string | null {
+	if (session._worktreePath && session._chapterId) return session._worktreePath;
+	if (
+		!session._chapterId &&
+		session._isInGitRepo === true &&
+		(session._defaultDeviceId ?? LOCAL_DEVICE_ID) === LOCAL_DEVICE_ID
+	)
+		return session.cwd;
+	return null;
+}
 
 /** Return whether a completed Bash input contains a parsed Git command. */
 export async function isGitCommandToolResult(
@@ -1063,76 +1093,75 @@ export async function runAgentLoopUnlocked(
 						suggestedCwd: recovery.suggestedCwd,
 					};
 				},
-				onGitTrack:
-					active._worktreePath && active._chapterId
-						? (toolName, toolUseId, input) => {
-								if (!FILE_MUTATING_TOOLS.has(toolName)) return;
-								const chapterId = active._chapterId as string;
-								const worktreePath = active._worktreePath as string;
-								const baseBranch = active._baseBranch as string | undefined;
-								const scheduleRefresh = (delayMs: number) => {
-									// Collapse rapid successive calls into one trailing query. Git commands
-									// use delay 0 so branch/commit-only changes are visible immediately.
-									if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
-									active._gitTrackTimer = setTimeout(() => {
-										active._gitTrackTimer = undefined;
-										// File changes just happened → invalidate then read through
-										// the shared cache so co-located narrators reuse one query.
-										invalidateStatus(worktreePath);
-										Promise.all([
-											getStatusSummaryCached(worktreePath, { ttlMs: 0 }),
-											baseBranch
-												? gitService.getCommitsAhead(worktreePath, baseBranch)
-												: Promise.resolve({ count: 0, baseBranch: "" }),
-										]).then(
-											([gitStatus, ahead]) => {
-												// Strip files array from WS broadcast to avoid
-												// sending huge payloads when many files are changed.
-												// The Git panel fetches the full list via API.
-												const { files: _files, ...statusWithoutFiles } = gitStatus;
-												broadcastToNarrator(narratorId, {
-													type: "git_status",
-													narratorId,
-													chapterId,
-													toolUseId,
-													status: statusWithoutFiles as typeof gitStatus,
-													commitsAhead: ahead.count,
-													baseBranch: ahead.baseBranch,
-													linesAdded: gitStatus.linesAdded,
-													linesRemoved: gitStatus.linesRemoved,
-												});
-											},
-											(err) => {
-												logger.debug("Git status tracking failed", {
-													narratorId,
-													error: String(err),
-												});
-											},
-										);
-									}, delayMs);
-								};
+				// gitTrackPathForSession decides per tool call, not per session: a
+				// mid-session cwd switch re-evaluates _isInGitRepo. Without this hook a
+				// standalone narrator's git bar never moved until a foreground refetch.
+				onGitTrack: (toolName, toolUseId, input) => {
+					if (!FILE_MUTATING_TOOLS.has(toolName)) return;
+					const chapterId = active._chapterId ?? null;
+					const worktreePath = gitTrackPathForSession(active);
+					if (!worktreePath) return;
+					const baseBranch = active._baseBranch as string | undefined;
+					const scheduleRefresh = (delayMs: number) => {
+						// Collapse rapid successive calls into one trailing query. Git commands
+						// use delay 0 so branch/commit-only changes are visible immediately.
+						if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
+						active._gitTrackTimer = setTimeout(() => {
+							active._gitTrackTimer = undefined;
+							// File changes just happened → invalidate then read through
+							// the shared cache so co-located narrators reuse one query.
+							invalidateStatus(worktreePath);
+							Promise.all([
+								getStatusSummaryCached(worktreePath, { ttlMs: 0 }),
+								baseBranch
+									? gitService.getCommitsAhead(worktreePath, baseBranch)
+									: Promise.resolve({ count: 0, baseBranch: "" }),
+							]).then(
+								([gitStatus, ahead]) => {
+									// Strip files array from WS broadcast to avoid
+									// sending huge payloads when many files are changed.
+									// The Git panel fetches the full list via API.
+									const { files: _files, ...statusWithoutFiles } = gitStatus;
+									broadcastToNarrator(narratorId, {
+										type: "git_status",
+										narratorId,
+										chapterId,
+										toolUseId,
+										status: statusWithoutFiles as typeof gitStatus,
+										commitsAhead: ahead.count,
+										baseBranch: ahead.baseBranch,
+										linesAdded: gitStatus.linesAdded,
+										linesRemoved: gitStatus.linesRemoved,
+									});
+								},
+								(err) => {
+									logger.debug("Git status tracking failed", {
+										narratorId,
+										error: String(err),
+									});
+								},
+							);
+						}, delayMs);
+					};
 
-								if (toolName !== SHELL_TOOL_NAME) {
-									scheduleRefresh(800);
-									return;
-								}
+					if (toolName !== SHELL_TOOL_NAME) {
+						scheduleRefresh(800);
+						return;
+					}
 
-								const shellCwd =
-									typeof input?.workdir === "string"
-										? resolve(active.cwd, input.workdir)
-										: active.cwd;
-								void isGitCommandToolResult(toolName, input, shellCwd).then(
-									(hasGitCommand) => scheduleRefresh(hasGitCommand ? 0 : 800),
-									(error) => {
-										logger.debug("Git command detection failed; using normal status tracking", {
-											narratorId,
-											error: String(error),
-										});
-										scheduleRefresh(800);
-									},
-								);
-							}
-						: undefined,
+					const shellCwd =
+						typeof input?.workdir === "string" ? resolve(active.cwd, input.workdir) : active.cwd;
+					void isGitCommandToolResult(toolName, input, shellCwd).then(
+						(hasGitCommand) => scheduleRefresh(hasGitCommand ? 0 : 800),
+						(error) => {
+							logger.debug("Git command detection failed; using normal status tracking", {
+								narratorId,
+								error: String(error),
+							});
+							scheduleRefresh(800);
+						},
+					);
+				},
 
 				onContextUsage: ctxMgmt.onContextUsage,
 				onErrorCleanup: async (message, diagnostics) => {

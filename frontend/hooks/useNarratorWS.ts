@@ -675,7 +675,8 @@ export interface NarratorWSCallbacks {
 		snapshot?: import("@shared/context-usage").ContextUsageSnapshot,
 	) => void;
 	onGitStatus?: (data: {
-		chapterId: string;
+		/** Null for chapter-less narrators; workspace-keyed queries still apply. */
+		chapterId: string | null;
 		commitsAhead: number;
 		baseBranch: string;
 		linesAdded: number;
@@ -1440,15 +1441,13 @@ export function useNarratorWS(
 						}
 						break;
 					case "git_status":
-						if (data.chapterId) {
-							callbackOwner.callbacks.onGitStatus?.({
-								chapterId: data.chapterId as string,
-								commitsAhead: (data.commitsAhead as number) ?? 0,
-								baseBranch: (data.baseBranch as string) ?? "",
-								linesAdded: (data.linesAdded as number) ?? 0,
-								linesRemoved: (data.linesRemoved as number) ?? 0,
-							});
-						}
+						callbackOwner.callbacks.onGitStatus?.({
+							chapterId: (data.chapterId as string | null) ?? null,
+							commitsAhead: (data.commitsAhead as number) ?? 0,
+							baseBranch: (data.baseBranch as string) ?? "",
+							linesAdded: (data.linesAdded as number) ?? 0,
+							linesRemoved: (data.linesRemoved as number) ?? 0,
+						});
 						break;
 					case "workspace_paths_changed": {
 						// An empty `changes` with `truncated` set is meaningful (everything is

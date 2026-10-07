@@ -145,6 +145,15 @@ export const GIT_FACT_QUERIES = [
 	"gitCommitDiff",
 ];
 
+/**
+ * Live facts invalidated by a WS `git_status` push. Derived from
+ * GIT_FACT_QUERIES so a new live fact cannot drift out of the push path;
+ * commit previews are immutable and excluded.
+ */
+export const GIT_LIVE_FACT_QUERIES = GIT_FACT_QUERIES.filter(
+	(prefix) => prefix !== "gitCommitDetail" && prefix !== "gitCommitDiff",
+);
+
 export function gitWorkspaceTarget(narratorId: string, workspace?: GitWorkspace): GitTarget | null {
 	if (workspace?.state !== "ready" || !workspace.capabilities.read || !workspace.workspaceKey)
 		return null;
@@ -424,6 +433,32 @@ export function invalidateWorkspaceQueries(
 	// Re-probe after success AND failure: remote writes may have completed before disconnecting.
 	if (typeof target !== "string")
 		qc.invalidateQueries({ queryKey: ["gitWorkspace", target.narratorId] });
+}
+
+/**
+ * A WS `git_status` push marks the badge/fact queries stale so active observers
+ * refetch. Unlike {@link invalidateWorkspaceQueries} this never re-probes the
+ * workspace itself: pushes arrive up to ~1/s during tool bursts, and a
+ * discovery probe per push would be pure waste. Commit previews are immutable,
+ * so only the live facts are invalidated.
+ */
+export function invalidateGitStatusPushQueries(
+	qc: ReturnType<typeof useQueryClient>,
+	narratorId: string,
+	chapterId: string | null,
+): void {
+	const keys = new Set<string>();
+	if (chapterId) keys.add(chapterId);
+	for (const [, workspace] of qc.getQueriesData<GitWorkspace>({
+		queryKey: ["gitWorkspace", narratorId],
+	})) {
+		if (workspace?.workspaceKey) keys.add(workspace.workspaceKey);
+		if (workspace?.chapterId) keys.add(workspace.chapterId);
+	}
+	for (const key of keys) {
+		for (const prefix of GIT_LIVE_FACT_QUERIES)
+			void qc.invalidateQueries({ queryKey: [prefix, key] });
+	}
 }
 
 export function useGitStatus(target: GitTarget | undefined | null) {
