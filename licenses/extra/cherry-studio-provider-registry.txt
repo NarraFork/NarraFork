@@ -1,0 +1,73 @@
+Cherry Studio provider registry data
+
+Component: @cherrystudio/provider-registry 0.0.1-alpha.1
+Author / attribution: Cherry Studio
+Upstream repository: https://github.com/CherryHQ/cherry-studio
+Fixed commit: 4edb3b85630469e1a784577ec47540cb646d9781
+Data source: packages/provider-registry/data/providers.json
+License declaration source: packages/provider-registry/package.json
+Source URL: https://github.com/CherryHQ/cherry-studio/blob/4edb3b85630469e1a784577ec47540cb646d9781/packages/provider-registry/data/providers.json
+Declaration URL: https://github.com/CherryHQ/cherry-studio/blob/4edb3b85630469e1a784577ec47540cb646d9781/packages/provider-registry/package.json
+
+The upstream subpackage declares "license": "MIT" and "author": "Cherry Studio".
+It provides a package declaration, not a separate MIT license text. The text below
+is a standard MIT template, NOT a verbatim license file supplied by Cherry Studio.
+Its permission and disclaimer paragraphs were copied verbatim from the installed
+node_modules/normalize-path/LICENSE. The copyright holder is attributed using the
+upstream package author; no copyright year is inferred.
+The upstream repository root uses AGPL; this reuse is limited to the MIT-declared
+provider-registry subpackage data. No upstream main src implementation is copied.
+
+Data mapping (frontend/components/providers/provider-presets.ts):
+- Keep only provider id, name, compatible API base URLs and default chat protocol.
+- anthropic-messages maps to anthropic-messages; openai-responses maps to
+  openai-responses; openai-chat-completions maps to completions-compatible;
+  google-generate-content maps to gemini-compatible.
+- Keep concrete URLs for adapter families anthropic, openai-compatible, openai,
+  open-responses and google. The ordinary API-key compatible families deepseek,
+  openrouter, groq, togetherai, xai, xai-responses and cerebras are mapped onto
+  the corresponding generic protocols, without copying their adapter code.
+- Remove trailing slashes. Anthropic bases end in /v1; Gemini bases end in
+  /v1beta. OpenAI bases receive /v1 unless they already contain a versioned
+  path segment (for example /api/v3, /api/paas/v4, /v3/openai or /api/v1).
+  NarraFork appends /messages, /responses, /chat/completions or /models/...;
+  therefore these URLs do not depend on SDK-specific prefix handling.
+- Keep the upstream default when included; otherwise use the first compatible
+  endpoint. Ollama is an explicit local compatibility override: only its
+  OpenAI-compatible http://localhost:11434/v1 is exposed, not native /api/chat.
+  A second local compatibility override adds OpenAI Chat Completions at
+  https://api.openai.com/v1; upstream lists only Responses for this provider,
+  and Responses remains the default.
+- Add NarraFork-authored Chinese search aliases (for example SiliconFlow,
+  ZhiPu, DeepSeek, Bailian, Doubao, Moonshot and StepFun Chinese names) and
+  common English aliases. These aliases are local usability metadata, not
+  copied upstream fields; original provider ids and display names are retained.
+- Exclude Azure, Bedrock, Vertex AI, Copilot, OpenAI Codex, Claude Code, Grok CLI,
+  native Ollama, ComfyUI, missing URLs, and unapproved specialized adapter
+  families (cherryin, aihubmix, dmxapi, newapi, mistral, perplexity, voyage,
+  gateway). NUG and the custom option are UI actions, not registry records.
+- Do not carry model data, website metadata, referral links or promotion URLs.
+
+Standard MIT license template (attribution adjusted as explained above):
+
+The MIT License (MIT)
+
+Copyright (c) Cherry Studio
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
