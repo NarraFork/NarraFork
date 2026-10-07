@@ -317,6 +317,12 @@ export const batchUpsertRecentTabsSchema = z.object({
 export const removeRecentTabSchema = z.object({
 	type: z.enum(["chapter", "narrator", "session", "project", "workspace", "subagent", "group"]),
 	id: z.string().min(1).max(50),
+	/**
+	 * Entity-teardown cleanup (chapter deleted, narrator archived). When set, no undo
+	 * token is minted — a cascade must not overwrite the user's pending undo slot with
+	 * a snapshot that points at entities that are already gone.
+	 */
+	cascade: z.boolean().optional(),
 });
 
 export const moveRecentTabSchema = z

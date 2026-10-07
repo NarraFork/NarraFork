@@ -569,6 +569,68 @@ describe("recent-tabs capacity and undo", () => {
 		expect(storedKeys()).toEqual(["narrator:n-1", "narrator:n-2"]);
 	});
 
+	it("restores a single-tab remove from the bounded undo token", async () => {
+		seedLegacyTabs([makeTab("n-1"), makeTab("n-2"), makeTab("n-3")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		const removed = await recentTabs.removeRecentTab("user-1", "narrator", "n-2", {
+			storeUndo: true,
+		});
+		expect(removed).toMatchObject({ changed: true, revision: 1, removedCount: 1 });
+		expect(removed.undoToken).toBeString();
+		expect(storedKeys()).toEqual(["narrator:n-1", "narrator:n-3"]);
+
+		const restored = await recentTabs.restoreRecentTabs("user-1", {
+			token: removed.undoToken,
+		});
+		expect(restored).toMatchObject({ changed: true, baseRevision: 1, revision: 2 });
+		expect(storedKeys()).toEqual(["narrator:n-1", "narrator:n-2", "narrator:n-3"]);
+	});
+
+	it("stores no undo token when removing a missing tab", async () => {
+		seedLegacyTabs([makeTab("n-1")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		const removed = await recentTabs.removeRecentTab("user-1", "narrator", "ghost", {
+			storeUndo: true,
+		});
+		expect(removed).toMatchObject({ changed: false });
+		expect(removed.undoToken).toBeUndefined();
+	});
+
+	it("stores no undo token for cascade removes or workspace dissolve", async () => {
+		seedLegacyTabs([
+			makeTab("n-1"),
+			makeTab("n-2"),
+			makeTab("ws-1", { type: "workspace", title: "WS" }),
+			makeTab("n-child", { workspaceId: "ws-1" }),
+		]);
+		db.insert(workspaces)
+			.values({
+				id: "ws-1",
+				userId: "user-1",
+				title: "WS",
+				tree: "{}",
+				createdAt: new Date(NOW),
+				updatedAt: new Date(NOW),
+			})
+			.run();
+		await recentTabs.ensureMigrated("user-1");
+
+		// Cascade / internal path (no storeUndo): must not mint an undo token.
+		const cascaded = await recentTabs.removeRecentTab("user-1", "narrator", "n-1");
+		expect(cascaded).toMatchObject({ changed: true, removedCount: 1 });
+		expect(cascaded.undoToken).toBeUndefined();
+
+		// Workspace dissolve never stores undo — the entity and panels are torn down too.
+		const dissolved = await recentTabs.removeRecentTab("user-1", "workspace", "ws-1", {
+			storeUndo: true,
+		});
+		expect(dissolved).toMatchObject({ changed: true });
+		expect(dissolved.undoToken).toBeUndefined();
+		expect(storedKeys()).toEqual(["narrator:n-2", "narrator:n-child"]);
+	});
+
 	it("rejects an undo token after another mutation advances revision", async () => {
 		seedLegacyTabs([makeTab("n-1"), makeTab("n-2")]);
 		const cleared = await recentTabs.clearRecentTabs("user-1", "all");

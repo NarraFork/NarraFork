@@ -75,8 +75,8 @@ const loadedWindowRefreshes = new WeakMap<
 >();
 const loadedWindowRefreshGenerations = new WeakMap<QueryClient, number>();
 
-const CLEAR_UNDO_NOTIFICATION_ID = "recent-tabs-clear-undo";
-const CLEAR_UNDO_AUTO_CLOSE_MS = 6_000;
+const UNDO_NOTIFICATION_ID = "recent-tabs-undo";
+const UNDO_AUTO_CLOSE_MS = 6_000;
 
 export type RecentTabsInfiniteData = InfiniteData<RecentTabsPageResponse>;
 export type RecentTabApiMoveTarget = ApiRecentTabMoveTarget;
@@ -984,6 +984,78 @@ export function useRecentTabs() {
 		[qc],
 	);
 
+	const restoreMutation = useMutation({
+		mutationFn: (input: { snapshot?: RecentTab[]; token?: string }) => {
+			// Refuse an empty full-list replace: a missing snapshot must never wipe the
+			// user's recent tabs. Token restore is the only path that needs no snapshot.
+			if (!input.token && (!input.snapshot || input.snapshot.length === 0)) {
+				return Promise.reject(new Error("recent-tabs undo needs a token or a non-empty snapshot"));
+			}
+			return api.restoreRecentTabs({
+				...(input.token ? { token: input.token } : {}),
+				...(input.snapshot ? { tabs: input.snapshot.map(toPersistedRecentTab) } : {}),
+			});
+		},
+		onSuccess: applyAuthoritativeResult,
+		onError: () => {
+			void qc.invalidateQueries({ queryKey: RECENT_TABS_QUERY_KEY });
+			notifications.show({ color: "red", message: t("undoFailed") });
+		},
+	});
+
+	/**
+	 * Shared undo toast for destructive recent-tab mutations (clear, single-tab close).
+	 * Only one undo affordance is offered at a time — later mutations replace the toast,
+	 * matching the server's single pending undo token per user.
+	 */
+	const showUndoNotification = useCallback(
+		(message: string, undo: { undoToken?: string; snapshot?: RecentTab[] }) => {
+			const snapshot = undo.snapshot && undo.snapshot.length > 0 ? undo.snapshot : undefined;
+			// Nothing to restore with — showing an undo button would only fail.
+			if (!undo.undoToken && !snapshot) return;
+			notifications.show({
+				id: UNDO_NOTIFICATION_ID,
+				color: "gray",
+				autoClose: UNDO_AUTO_CLOSE_MS,
+				withCloseButton: true,
+				withBorder: true,
+				message: createElement(
+					"div",
+					{
+						style: {
+							display: "flex",
+							alignItems: "center",
+							justifyContent: "space-between",
+							gap: 12,
+						},
+					},
+					createElement("span", null, message),
+					createElement(
+						Button as ComponentType<{
+							size?: string;
+							variant?: string;
+							onClick?: () => void;
+							children?: React.ReactNode;
+						}>,
+						{
+							size: "compact-xs",
+							variant: "light",
+							onClick: () => {
+								// Hide immediately so a second click cannot fire a duplicate restore.
+								// Failure feedback is a separate `undoFailed` toast.
+								notifications.hide(UNDO_NOTIFICATION_ID);
+								if (undo.undoToken) restoreMutation.mutate({ token: undo.undoToken });
+								else if (snapshot) restoreMutation.mutate({ snapshot });
+							},
+						},
+						t("undo"),
+					),
+				),
+			});
+		},
+		[restoreMutation, t],
+	);
+
 	const removeMutation = useMutation({
 		mutationFn: ({ type, id }: { type: RecentTab["type"]; id: string }) =>
 			api.removeRecentTab(type, id),
@@ -1000,7 +1072,18 @@ export function useRecentTabs() {
 		onError: (_error, _variables, context) => {
 			if (context) restoreSectionSnapshots(qc, context.snapshots);
 		},
-		onSuccess: applyAuthoritativeResult,
+		onSuccess: (result, variables) => {
+			applyAuthoritativeResult(result);
+			// Single-tab close via swipe / context menu / middle-click — same undo affordance
+			// as one-click clear. Workspace dissolve is excluded: it also tears down the
+			// workspace entity and its panels, which a tab-list restore cannot bring back.
+			// Token-only: a loaded-window snapshot would wipe unloaded pages if used as a
+			// full-list restore fallback.
+			if (variables.type === "workspace" || result.removedCount !== 1 || !result.undoToken) {
+				return;
+			}
+			showUndoNotification(t("tabClosed"), { undoToken: result.undoToken });
+		},
 	});
 
 	const moveMutation = useMutation({
@@ -1046,18 +1129,6 @@ export function useRecentTabs() {
 		onSuccess: applyAuthoritativeResult,
 	});
 
-	const restoreMutation = useMutation({
-		mutationFn: (input: { snapshot?: RecentTab[]; token?: string }) =>
-			api.restoreRecentTabs({
-				...(input.token ? { token: input.token } : {}),
-				...(input.snapshot ? { tabs: input.snapshot.map(toPersistedRecentTab) } : {}),
-			}),
-		onSuccess: applyAuthoritativeResult,
-		onError: () => {
-			void qc.invalidateQueries({ queryKey: RECENT_TABS_QUERY_KEY });
-		},
-	});
-
 	const clearMutation = useMutation({
 		mutationFn: ({
 			scope,
@@ -1088,43 +1159,9 @@ export function useRecentTabs() {
 			applyAuthoritativeResult(result);
 			const removedCount = result.removedCount ?? context?.removedCount ?? 0;
 			if (!context || removedCount <= 0) return;
-			notifications.show({
-				id: CLEAR_UNDO_NOTIFICATION_ID,
-				color: "gray",
-				autoClose: CLEAR_UNDO_AUTO_CLOSE_MS,
-				withCloseButton: true,
-				withBorder: true,
-				message: createElement(
-					"div",
-					{
-						style: {
-							display: "flex",
-							alignItems: "center",
-							justifyContent: "space-between",
-							gap: 12,
-						},
-					},
-					createElement("span", null, t("tabsCleared", { count: removedCount })),
-					createElement(
-						Button as ComponentType<{
-							size?: string;
-							variant?: string;
-							onClick?: () => void;
-							children?: React.ReactNode;
-						}>,
-						{
-							size: "compact-xs",
-							variant: "light",
-							onClick: () => {
-								notifications.hide(CLEAR_UNDO_NOTIFICATION_ID);
-								restoreMutation.mutate(
-									result.undoToken ? { token: result.undoToken } : { snapshot: context.snapshot },
-								);
-							},
-						},
-						t("undo"),
-					),
-				),
+			showUndoNotification(t("tabsCleared", { count: removedCount }), {
+				...(result.undoToken ? { undoToken: result.undoToken } : {}),
+				snapshot: context.snapshot,
 			});
 		},
 	});

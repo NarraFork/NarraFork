@@ -24,7 +24,6 @@ import {
 	useFsRevealCapability,
 	useNarratorReviewToolsCapability,
 } from "@frontend/hooks/usePlatform";
-import { useRecentTabs } from "@frontend/hooks/useRecentTabs";
 
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { api } from "@frontend/lib/api";
@@ -348,8 +347,6 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	});
 
 	const deleteChapter = useDeleteChapter();
-	const { removeTab } = useRecentTabs();
-
 	const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
 	// `hasWorktree` decides which confirmation text is shown. The server only reaches its
 	// `deleteBranch` call inside an `if (chapter.worktreePath)` block, so a chapter
@@ -2312,12 +2309,13 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			onSuccess: () => {
 				queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
 				queryClient.invalidateQueries({ queryKey: ["narrators"] });
-				// Remove the chapter tab from recent tabs to prevent ghost entries
-				removeTab("chapter", deleteTarget.id);
+				// Cascade cleanup after the chapter entity is gone. Bypasses removeTab and
+				// marks `cascade` so no undo token is minted for a ghost entry.
+				api.removeRecentTab("chapter", deleteTarget.id, { cascade: true }).catch(() => {});
 				setDeleteTarget(null);
 			},
 		});
-	}, [deleteTarget, deleteChapter, queryClient, removeTab]);
+	}, [deleteTarget, deleteChapter, queryClient]);
 
 	if (isLoading) {
 		return (
