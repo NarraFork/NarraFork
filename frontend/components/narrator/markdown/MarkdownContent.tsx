@@ -27,6 +27,7 @@ import type { Pluggable, PluggableList } from "unified";
 import { hasUnclosedFence, splitStableAndTail } from "../streaming/streaming-markdown-split";
 import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
 import classes from "./MarkdownContent.module.css";
+import { MarkdownImage } from "./MarkdownImage";
 import { MarkdownLink } from "./MarkdownLink";
 import { MermaidDiagram } from "./MermaidDiagram";
 import {
@@ -238,6 +239,9 @@ function createMdComponents(animateText?: AnimateTextFn, sourceLines = false): C
 					{at(children)}
 				</MarkdownContentListItem>
 			);
+		},
+		img({ src, alt, title }) {
+			return <MarkdownImage src={src} alt={alt} title={title} />;
 		},
 		a({ href, children, title }) {
 			return (

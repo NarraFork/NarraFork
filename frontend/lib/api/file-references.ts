@@ -92,7 +92,27 @@ async function boundedRequest<T>(
 	}
 }
 
-/** Metadata-only search/resolve. Only the file viewer requests preview; no client creates snapshots. */
+function decodeImage(buffer: Uint8Array<ArrayBuffer>, response: Response): Blob {
+	const mime = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
+	if (!mime || !Object.values(FILE_REFERENCE_IMAGE_MIME_TYPES).some((value) => value === mime))
+		throw new Error("Unsupported file reference image MIME type");
+	return new Blob([buffer], { type: mime });
+}
+
+/** Legacy local file panels only; scoped/remote readers must use imagePreview instead. */
+export function localFileImagePreview(path: string, signal?: AbortSignal): Promise<Blob> {
+	if (path.length > MAX_FILE_REFERENCE_PATH_CHARS)
+		return Promise.reject(new Error("File path exceeds the limit"));
+	return boundedRequest(
+		`/api/fs/preview?${new URLSearchParams({ path })}`,
+		MAX_FILE_REFERENCE_IMAGE_BYTES,
+		FILE_REFERENCE_READ_TIMEOUT_MS,
+		{ signal },
+		decodeImage,
+	);
+}
+
+/** Metadata-only search/resolve. Preview readers never create snapshots. */
 export const fileReferenceApi = {
 	search(
 		narratorId: string,
@@ -151,15 +171,7 @@ export const fileReferenceApi = {
 			MAX_FILE_REFERENCE_IMAGE_BYTES,
 			FILE_REFERENCE_READ_TIMEOUT_MS,
 			{ signal },
-			(buffer, response) => {
-				const mime = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
-				if (
-					!mime ||
-					!Object.values(FILE_REFERENCE_IMAGE_MIME_TYPES).some((value) => value === mime)
-				)
-					throw new Error("Unsupported file reference image MIME type");
-				return new Blob([buffer], { type: mime });
-			},
+			decodeImage,
 		);
 	},
 	preview(
