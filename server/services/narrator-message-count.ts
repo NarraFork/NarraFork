@@ -71,6 +71,13 @@ export async function countNarratorMessageRefsBatch(
  * false as soon as the first turn makes a tool call, so the question is asked
  * directly instead: exactly one user-role message exists.
  *
+ * Only messages authored by THIS session count. A fork inherits the parent's
+ * prefix as shared refs whose message rows still belong to the parent
+ * (`narrator_messages.narrator_id` stays the parent's id — forking copies refs,
+ * never message rows, and lazy backfill adds more of the same). Without the
+ * ownership filter a forked narrator never looks like it is on its first turn,
+ * so its first post-fork message would never trigger title generation.
+ *
  * Bounded by `LIMIT 2` — the answer only depends on whether a second user
  * message exists, and stopping there keeps a long conversation cheap (1ms rather
  * than 79ms on a 31k-ref narrator).
@@ -80,7 +87,13 @@ export async function isFirstUserTurn(narratorId: string): Promise<boolean> {
 		.select({ id: narratorMessageRefs.id })
 		.from(narratorMessageRefs)
 		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
-		.where(and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessages.role, "user")))
+		.where(
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessages.role, "user"),
+				eq(narratorMessages.narratorId, narratorId),
+			),
+		)
 		.limit(2);
 	return rows.length <= 1;
 }
