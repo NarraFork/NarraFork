@@ -142,5 +142,15 @@
 		"repository": "https://github.com/parcel-bundler/watcher",
 		"textFile": "parcel-watcher.txt",
 		"distributedVia": "Eight platform `watcher.node` binaries embedded by scripts/download-parcel-watcher.ts, which fetches them straight from the npm registry — they never appear in node_modules, so the dependency scan cannot see them."
+	},
+	{
+		"name": "@cherrystudio/provider-registry (provider preset data)",
+		"version": "0.0.1-alpha.1 (commit 4edb3b85630469e1a784577ec47540cb646d9781)",
+		"license": "MIT",
+		"author": "Cherry Studio",
+		"repository": "https://github.com/CherryHQ/cherry-studio/tree/4edb3b85630469e1a784577ec47540cb646d9781/packages/provider-registry",
+		"textFile": "cherry-studio-provider-registry.txt",
+		"distributedVia": "Compatible provider names and API endpoints adapted from packages/provider-registry/data/providers.json into frontend/components/providers/provider-presets.ts and bundled in the frontend.",
+		"note": "The fixed-commit subpackage package.json declares MIT and Cherry Studio authorship; the root is AGPL. No main src code is copied. The accompanying disclosure explains protocol/URL mapping and includes a standard MIT template copied from installed normalize-path/LICENSE, not a verbatim license file supplied by upstream."
 	}
 ]

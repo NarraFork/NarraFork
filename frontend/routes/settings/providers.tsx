@@ -19,10 +19,12 @@ import { getModelDefaultContextWindow } from "../../components/providers/model-c
 import { NUGProvidersSection } from "../../components/providers/NUGProvidersSection";
 import { PluginProviderSection } from "../../components/providers/PluginProviderSection";
 import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
+import { ProviderOverviewView } from "../../components/providers/ProviderOverviewView";
 import {
-	type AddProviderType,
-	ProviderOverviewView,
-} from "../../components/providers/ProviderOverviewView";
+	type AddProviderDraft,
+	customProviderFromDraft,
+	nugProviderFromDraft,
+} from "../../components/providers/provider-add-draft";
 import {
 	createSnapshot,
 	initialProvidersState,
@@ -302,47 +304,17 @@ function SettingsProvidersPage() {
 
 	// ── Add provider ──
 	const handleAddProvider = useCallback(
-		(type: AddProviderType) => {
+		(draft: AddProviderDraft) => {
 			const id = Math.random().toString(36).slice(2, 10);
-			switch (type) {
-				case "nug":
-					dispatchers.setNugProviders((prev) => [
-						...prev,
-						{ id, name: "NUG", prefix: "", apiKey: "", baseUrl: "", defaultModel: "" },
-					]);
-					break;
-				default: {
-					const defaultNameByProtocol: Record<Exclude<AddProviderType, "nug">, string> = {
-						"anthropic-messages": t("addProviderAnthropicMessages"),
-						"openai-responses": t("addProviderOpenAIResponses"),
-						"completions-compatible": t("addProviderCompletions"),
-						"gemini-compatible": t("addProviderGemini"),
-					};
-					// Gemini defaults to Google's endpoint; others start blank.
-					const isGemini = type === "gemini-compatible";
-					dispatchers.setCustomApiProviders((prev) => [
-						...prev,
-						{
-							id,
-							name: defaultNameByProtocol[type],
-							prefix: "",
-							apiKey: "",
-							baseUrl: isGemini ? "https://generativelanguage.googleapis.com/v1beta" : "",
-							defaultModel: isGemini ? "gemini-3-flash-preview" : "",
-							protocol: type,
-							...(isGemini ? { geminiTransport: "generate-content" as const } : {}),
-							codexAccountId: "",
-							codexWebSocket: false,
-							tlsRejectUnauthorized: true,
-						},
-					]);
-					break;
-				}
+			if (draft.protocol === "nug") {
+				dispatchers.setNugProviders((prev) => [...prev, nugProviderFromDraft(id, draft)]);
+			} else {
+				const provider = customProviderFromDraft(id, { ...draft, protocol: draft.protocol });
+				dispatchers.setCustomApiProviders((prev) => [...prev, provider]);
 			}
-			// Route to new provider by its immutable ID
 			setSelectedProvider(id);
 		},
-		[dispatchers, t],
+		[dispatchers],
 	);
 
 	// ── Server-side context window merge (e.g. after a provider model add) ──
