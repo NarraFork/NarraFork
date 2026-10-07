@@ -539,7 +539,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					cwd: currentCwd,
 				});
 
-				if (initialMessage) {
+				if (initialMessage || images.length > 0 || textFiles.length > 0) {
 					await api.sendNarratorMessage(
 						newNarrator.id,
 						initialMessage,
