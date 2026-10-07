@@ -264,7 +264,20 @@ export async function runEditorWorker(request: EditorWorkerRequest): Promise<Edi
 		"\n",
 		ending === "CRLF" ? "\r\n" : ending === "CR" ? "\r" : "\n",
 	);
-	const nextBytes = encodeFileBytesAs(nextText, request.encoding);
+	let nextBytes = encodeFileBytesAs(nextText, request.encoding);
+	const bom =
+		request.encoding === "utf-8"
+			? [0xef, 0xbb, 0xbf]
+			: request.encoding === "utf-16le"
+				? [0xff, 0xfe]
+				: request.encoding === "utf-16be"
+					? [0xfe, 0xff]
+					: null;
+	const before = request.before;
+	if (before && bom?.every((byte, index) => before[index] === byte)) {
+		// Normalized editor snapshots omit the original file's encoding signature.
+		nextBytes = Buffer.concat([before.subarray(0, bom.length), nextBytes]);
+	}
 	if (nextBytes.byteLength > EDITOR_FILE_MAX_BYTES) fail("Final encoded file exceeds 20 MiB");
 	const persisted = decodeFileBytesAs(nextBytes, request.encoding);
 	if (persisted !== nextText)
