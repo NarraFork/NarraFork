@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
@@ -1739,6 +1739,95 @@ describe("narrator event handler persistence", () => {
 		expect(discards).toEqual(["tool-row-atomic-failure"]);
 		expect(ctx.preparedPlanModeToolCalls.size).toBe(0);
 	});
+});
+
+test.each([
+	false,
+	true,
+])("discarded restart reasoning preserves fork (created after COW=%s)", async (lateFork) => {
+	const owner = `restart-owner-${Date.now()}`;
+	const fork = `${owner}-fork`;
+	const now = new Date().toISOString();
+	await db.insert(narrators).values([
+		{ id: owner, createdAt: now, updatedAt: now },
+		{ id: fork, createdAt: now, updatedAt: now },
+	]);
+	let partialId: string | undefined;
+	const ctx: EventHandlerContext = {
+		...makeMainContext(),
+		narratorId: owner,
+		broadcastTargetId: owner,
+		conversationId: owner,
+		provider: "test",
+		model: "test",
+		getPartialMessageId: () => partialId,
+		setPartialMessageId: (id) => {
+			partialId = id;
+		},
+	};
+	try {
+		await processEvent(
+			{ type: "block_complete", block: { type: "text", text: "historical prefix" } },
+			ctx,
+		);
+		await processEvent(
+			{ type: "api_request_start", requestId: "restart-attempt", provider: "test", model: "test" },
+			ctx,
+		);
+		await processEvent(
+			{
+				type: "block_complete",
+				block: { type: "reasoning", text: "current thought", completed: true },
+			},
+			ctx,
+		);
+		if (!partialId) throw new Error("Missing persisted partial");
+		const sharedId = partialId;
+		const createFork = () =>
+			db.insert(narratorMessageRefs).values({
+				id: `${fork}-ref`,
+				narratorId: fork,
+				messageId: sharedId,
+				seq: 1,
+			});
+		const { narratorPersistence } = await import("../narrator-persistence");
+		const originalCOW = narratorPersistence.copyOnWriteMessage.bind(narratorPersistence);
+		let forkCreated = false;
+		const cowSpy = lateFork
+			? spyOn(narratorPersistence, "copyOnWriteMessage").mockImplementation(async (...args) => {
+					const result = await originalCOW(...args);
+					if (!forkCreated) {
+						forkCreated = true;
+						await createFork();
+					}
+					return result;
+				})
+			: undefined;
+		try {
+			if (!lateFork) await createFork();
+			await processEvent({ type: "attempt_discarded", requestId: "restart-attempt" }, ctx);
+		} finally {
+			cowSpy?.mockRestore();
+		}
+		const current = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, partialId),
+		});
+		const snapshot = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, sharedId),
+		});
+		expect(current?.contentJson).toEqual([{ type: "text", text: "historical prefix" }]);
+		expect(JSON.stringify(snapshot?.contentJson)).toContain("current thought");
+		expect(partialId).not.toBe(sharedId);
+		expect(
+			broadcastMessages.some((message) => (message as { type: string }).type === "streaming_reset"),
+		).toBe(true);
+		expect(
+			broadcastMessages.some((message) => (message as { type: string }).type === "message_updated"),
+		).toBe(true);
+	} finally {
+		await cleanupFileContextNarrator(fork);
+		await cleanupFileContextNarrator(owner);
+	}
 });
 
 /**

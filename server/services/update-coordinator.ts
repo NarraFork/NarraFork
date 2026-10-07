@@ -112,6 +112,11 @@ export interface UpdateCheckpointActivityLease {
 	release(): void;
 }
 
+export interface NarratorResponseActivityLease extends UpdateCheckpointActivityLease {
+	/** Only the current request may be stopped; null protects text/tool output. */
+	setReasoningAbort(abort: (() => void) | null): void;
+}
+
 interface CoordinatorState {
 	phase: UpdatePhase;
 	targetVersion?: string;
@@ -181,6 +186,7 @@ interface CheckpointActivityRecord {
 	toolUseId?: string;
 	updateEpoch?: string;
 	startedAt: number;
+	reasoningAbort?: (() => void) | null;
 }
 
 const UPDATE_DIR = getNarraforkPath("updates");
@@ -539,8 +545,8 @@ function waitForCoordination(
 }
 
 /**
- * Track one provider response that may still produce tool rows. Phase two prevents new
- * responses from entering while allowing a response already in flight to reach persistence.
+ * Track one provider response that may still produce tool rows. Scheduled updates park
+ * new responses and stop reasoning-only requests; text/tool responses drain to persistence.
  *
  * A REFLECTION request is exempt, and must be: a reflection gate (danger / plan / task /
  * question) runs inside tool admission, so by the time it issues its request the parent
@@ -560,14 +566,28 @@ export async function beginNarratorResponseActivity(
 	narratorId: string,
 	signal?: AbortSignal,
 	options: { isReflection?: boolean } = {},
-): Promise<UpdateCheckpointActivityLease> {
+): Promise<NarratorResponseActivityLease> {
 	if (options.isReflection) {
-		return { token: generateToken("reflection_response"), release() {} };
+		return { token: generateToken("reflection_response"), release() {}, setReasoningAbort() {} };
 	}
-	while (state.phase === "quiescing_tools" || state.phase === "restarting") {
+	while (state.phase !== "idle") {
 		await waitUntilUpdateGateOpens(signal);
 	}
-	return registerCheckpointActivity(responseActivities, "response", { narratorId });
+	const activity = registerCheckpointActivity(responseActivities, "response", { narratorId });
+	return {
+		...activity,
+		setReasoningAbort(abort) {
+			const record = responseActivities.get(activity.token);
+			if (!record) return;
+			record.reasoningAbort = abort;
+			if (state.phase !== "idle") abort?.();
+		},
+	};
+}
+
+/** Do not release the fence until the event consumer has removed this attempt's output. */
+function interruptReasoningResponses(): void {
+	for (const record of responseActivities.values()) record.reasoningAbort?.();
 }
 
 /** Track a rejected tool admission until its durable continuation row is stable. */
@@ -774,6 +794,7 @@ export function scheduleUpdate(
 	state.errorKind = undefined;
 	// A cancellation belongs to the epoch that was cancelled; never inherit it.
 	state.cancelRequestedEpoch = undefined;
+	interruptReasoningResponses();
 	logger.info("Update scheduled; draining background Bash executions", {
 		targetVersion,
 		updateEpoch: state.updateEpoch,
@@ -796,6 +817,7 @@ export async function waitForBackgroundBashDrain(): Promise<void> {
 export function beginQuiescingTools(): UpdateCoordinationStatus {
 	if (state.phase === "draining_background_bash") {
 		state.phase = "quiescing_tools";
+		interruptReasoningResponses();
 		logger.info("Background Bash drained; closing the checkpoint fence", {
 			updateEpoch: state.updateEpoch,
 			pendingOrdinaryExecutionCount: countExecutions("ordinary"),
