@@ -33,7 +33,7 @@ import { decodeFileBytes } from "../lib/agent/tools/encoding";
 import { previewStructSedChange, structSedTool } from "../lib/agent/tools/struct-sed";
 import { MAX_BATCH_OPERATIONS } from "../lib/agent/tools/struct-sed/commands";
 import { writeTool } from "../lib/agent/tools/write";
-import { withBashWriteLock, withWorkspaceWriteLock } from "../lib/agent/tools/write-serialization";
+import { withWorkspaceWriteLock } from "../lib/agent/tools/write-serialization";
 import type {
 	AgentConfig,
 	AgentToolUse,
@@ -52,6 +52,7 @@ import {
 	type FileChangeLocalIo,
 	fileChangeLocalIo,
 } from "./file-change-local-io";
+import { FileChangeNamespaceBusyError } from "./file-change-namespace-reset";
 import {
 	FileChangeReversalCalculator,
 	type FileChangeReversalEffect,
@@ -63,7 +64,10 @@ import {
 	localFileChangeRuntimeBinding,
 	withLocalFileChangeRuntime,
 } from "./file-change-runtime";
-import { createWorkspaceWriteCoordinatorState } from "./workspace-write-coordinator";
+import {
+	acquireFileHistoryCapture,
+	createWorkspaceWriteCoordinatorState,
+} from "./workspace-write-coordinator";
 
 let root: string;
 let workspace: string;
@@ -2045,7 +2049,7 @@ describe("application data directory compatibility", () => {
 });
 
 describe("legacy workspace lock interoperability", () => {
-	function bashInput() {
+	function legacyInput() {
 		return {
 			cwd: `${workspace}/./`,
 			filePaths: [],
@@ -2055,6 +2059,394 @@ describe("legacy workspace lock interoperability", () => {
 		};
 	}
 
+	async function withLegacyWriteLock<T>(
+		backend: typeof localBackend,
+		input: { cwd: string },
+		body: () => Promise<T>,
+	) {
+		return { value: await withWorkspaceWriteLock(backend, input.cwd, body), serialized: true };
+	}
+
+	test("workspace admission never holds the global namespace or blocks another workspace", async () => {
+		const path = join(workspace, "queued.txt");
+		const other = join(root, "other-workspace");
+		await mkdir(other);
+		await runtime.initialize();
+		const gate = deferred();
+		const entered = deferred();
+		const holder = withWorkspaceWriteLock(localBackend, workspace, async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await entered.promise;
+		const waiter = observeLegacyWaiter();
+		const pending = write(path, "queued");
+		try {
+			await Promise.race([
+				waiter.requested,
+				pending.then(() => {
+					throw new Error("write bypassed holder");
+				}),
+			]);
+			const otherPath = join(other, "free.txt");
+			const result = await write(otherPath, "free", await callContext("Write", otherPath, other));
+			expect(result.isError).toBeUndefined();
+			expect(await readFile(otherPath, "utf8")).toBe("free");
+			await runtime.verifyNamespace();
+			expect(await readFile(path, "utf8").catch(() => null)).toBeNull();
+		} finally {
+			waiter.restore();
+			gate.resolve();
+			await Promise.all([holder, pending]);
+		}
+		const timing = (await pending).metadata?.fileChangeTiming as {
+			waitMs: number;
+			executionMs: number;
+			totalMs: number;
+		};
+		expect(timing.waitMs).toBeGreaterThan(0);
+		expect(timing.waitMs + timing.executionMs).toBe(timing.totalMs);
+	});
+
+	test("namespace admission cancellation drains its slot without releasing its predecessor", async () => {
+		const gate = deferred();
+		const entered = deferred();
+		const holder = runtime.withNamespaceAccess(async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await entered.promise;
+		const controller = new AbortController();
+		let cancelledEntered = false;
+		const cancelled = runtime.withNamespaceAccess(async () => {
+			cancelledEntered = true;
+		}, controller.signal);
+		controller.abort(new Error("cancel admission"));
+		await expect(cancelled).rejects.toThrow("cancel admission");
+		let followerEntered = false;
+		const follower = runtime.withNamespaceAccess(async () => {
+			followerEntered = true;
+		});
+		try {
+			await Promise.resolve();
+			expect(cancelledEntered).toBe(false);
+			expect(followerEntered).toBe(false);
+		} finally {
+			gate.resolve();
+			await Promise.all([holder, follower]);
+		}
+		expect(followerEntered).toBe(true);
+	});
+
+	test("Bash dispatch does not wait for the blob namespace even when it is unavailable", async () => {
+		await runtime.initialize();
+		const gate = deferred();
+		const entered = deferred();
+		const holder = runtime.withNamespaceAccess(async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await entered.promise;
+		await rm(join(privateRoot, "file-change-blobs"), { recursive: true, force: true });
+		try {
+			const activity = await runtime.registerBashActivity({
+				backend: localBackend,
+				cwd: workspace,
+				signal: new AbortController().signal,
+			});
+			activity.end("finished");
+		} finally {
+			gate.resolve();
+			await holder;
+		}
+	});
+	test("history admission does not hold the namespace while another workspace writes", async () => {
+		const path = join(workspace, "history-queued.txt");
+		const other = join(root, "history-other");
+		await mkdir(other);
+		await runtime.initialize();
+		const release = await acquireFileHistoryCapture({
+			deviceId: "local",
+			pathFlavor: localBackend.pathFlavor as "posix" | "windows",
+			canonicalPath: path,
+		});
+		const requested = deferred();
+		const original = runtime.coordinator.withWrite.bind(runtime.coordinator);
+		const spy = spyOn(runtime.coordinator, "withWrite").mockImplementation((input, body) => {
+			requested.resolve();
+			return original(input, body);
+		});
+		const pending = write(path, "queued");
+		try {
+			await requested.promise;
+			const otherPath = join(other, "independent.txt");
+			expect(
+				(await write(otherPath, "independent", await callContext("Write", otherPath, other)))
+					.isError,
+			).toBeUndefined();
+			await runtime.verifyNamespace();
+			expect(operations()).toHaveLength(1);
+		} finally {
+			spy.mockRestore();
+			release();
+			await pending;
+		}
+		expect((await pending).isError).toBeUndefined();
+	});
+
+	test("queued write revalidates a namespace reset rather than using stale blob references", async () => {
+		const oldPath = join(workspace, "prior-generation.txt");
+		await write(oldPath, "old generation");
+		const generation = (await runtime.initialize()).generation;
+		const path = join(workspace, "after-reset.txt");
+		const gate = deferred();
+		const entered = deferred();
+		const holder = withWorkspaceWriteLock(localBackend, workspace, async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await entered.promise;
+		const waiter = observeLegacyWaiter();
+		const pending = write(path, "new generation");
+		try {
+			await waiter.requested;
+			await rm(join(privateRoot, "file-change-blobs"), { recursive: true, force: true });
+			// A fresh cache consumer detects and resets the missing namespace while
+			// this writer is still waiting outside the global fence.
+			expect((await makeRuntime().initialize()).generation).toBeGreaterThan(generation);
+		} finally {
+			waiter.restore();
+			gate.resolve();
+			await Promise.all([holder, pending]);
+		}
+		expect((await pending).isError).toBeUndefined();
+		const effect = effects().find((row) => row.identityJson.canonicalPath === path);
+		expect(effect).toBeDefined();
+		if (!effect) throw new Error("Queued write did not settle a new-generation effect");
+		expect(await bytesFor(effect.observedAfterStateJson)).toEqual(Buffer.from("new generation"));
+	});
+	test("coordinator admission never holds namespace while an independent workspace executes", async () => {
+		const path = join(workspace, "coordinator-queued.txt");
+		await write(path, "original");
+		const scope = pendingScope();
+		if (!scope) throw new Error("Missing admitted workspace");
+		const gate = deferred();
+		const entered = deferred();
+		const holder = runtime.coordinator.withWrite(
+			{ scope, runtime: processRuntime(), executionClass: "local_file_io" },
+			async () => {
+				entered.resolve();
+				await gate.promise;
+			},
+		);
+		await entered.promise;
+		const requested = deferred();
+		const original = runtime.coordinator.withWrite.bind(runtime.coordinator);
+		const spy = spyOn(runtime.coordinator, "withWrite").mockImplementation((input, body) => {
+			requested.resolve();
+			return original(input, body);
+		});
+		const pending = edit(path, "original", "queued");
+		try {
+			await requested.promise;
+			const other = join(root, "coordinator-other");
+			await mkdir(other);
+			const otherPath = join(other, "free.txt");
+			expect(
+				(await write(otherPath, "free", await callContext("Write", otherPath, other))).isError,
+			).toBeUndefined();
+			await runtime.verifyNamespace();
+			expect(await readFile(path, "utf8")).toBe("original");
+		} finally {
+			spy.mockRestore();
+			gate.resolve();
+			await Promise.all([holder, pending]);
+		}
+		expect((await pending).isError).toBeUndefined();
+	});
+	test("retained namespace-first consumer drains before a new write takes coordinator", async () => {
+		const path = join(workspace, "legacy-namespace.txt");
+		await write(path, "before");
+		const scope = pendingScope();
+		if (!scope) throw new Error("Missing scope");
+		const gate = deferred();
+		const entered = deferred();
+		// Retained HEAD executeBound ordering: namespace, async preparation, coordinator.
+		const legacyClosure = () =>
+			runtime.withNamespaceAccess(async () => {
+				entered.resolve();
+				await gate.promise;
+				return runtime.coordinator.withWrite(
+					{ scope, runtime: processRuntime(), executionClass: "local_file_io", waitTimeoutMs: 500 },
+					async () => {},
+				);
+			});
+		const legacy = legacyClosure();
+		await entered.promise;
+		const draining = deferred();
+		const originalDrain = runtime.waitForNamespaceDrain.bind(runtime);
+		const drain = spyOn(runtime, "waitForNamespaceDrain").mockImplementation((signal) => {
+			draining.resolve();
+			return originalDrain(signal);
+		});
+		const grant = spyOn(runtime.coordinator, "withWrite");
+		const pending = write(path, "after");
+		try {
+			await draining.promise;
+			expect(grant).not.toHaveBeenCalled();
+			expect(operations()).toHaveLength(1);
+		} finally {
+			gate.resolve();
+			await Promise.all([legacy, pending]);
+			drain.mockRestore();
+			grant.mockRestore();
+		}
+		expect((await pending).isError).toBeUndefined();
+		expect(await readFile(path, "utf8")).toBe("after");
+		expect(operations()).toHaveLength(2);
+	});
+
+	test("legacy consumer racing after drain cannot deadlock a coordinator-first write", async () => {
+		const path = join(workspace, "legacy-race.txt");
+		await write(path, "before");
+		const scope = pendingScope();
+		if (!scope) throw new Error("Missing scope");
+		const gate = deferred();
+		const entered = deferred();
+		const holder = withWorkspaceWriteLock(localBackend, workspace, async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await entered.promise;
+		const waiter = observeLegacyWaiter();
+		const pending = write(path, "after");
+		await waiter.requested; // New caller drained namespace and owns coordinator already.
+		const legacyEntered = deferred();
+		const legacy = runtime.withNamespaceAccess(async () => {
+			legacyEntered.resolve();
+			return runtime.coordinator.withWrite(
+				{ scope, runtime: processRuntime(), executionClass: "local_file_io", waitTimeoutMs: 500 },
+				async () => {},
+			);
+		});
+		await legacyEntered.promise;
+		let busy = 0;
+		const originalTry = runtime.tryWithNamespaceAccess.bind(runtime);
+		const attempt = spyOn(runtime, "tryWithNamespaceAccess").mockImplementation((body, signal) =>
+			originalTry(body, signal).catch((error) => {
+				if (error instanceof FileChangeNamespaceBusyError) busy++;
+				throw error;
+			}),
+		);
+		try {
+			gate.resolve();
+			await Promise.all([holder, legacy, pending]);
+		} finally {
+			gate.resolve();
+			waiter.restore();
+			attempt.mockRestore();
+		}
+		expect(busy).toBe(1);
+		expect((await pending).isError).toBeUndefined();
+		expect(operations()).toHaveLength(2); // busy admission never begins an intent.
+		expect(await readFile(path, "utf8")).toBe("after");
+		expect(
+			db
+				.select()
+				.from(schema.workspaceWriteLeases)
+				.all()
+				.every((row) => row.status === "settled"),
+		).toBe(true);
+	});
+
+	test("cancelling compatibility drain creates no new lease and leaves the old consumer intact", async () => {
+		await write(join(workspace, "seed.txt"), "seed");
+		const gate = deferred();
+		const entered = deferred();
+		const legacy = runtime.withNamespaceAccess(async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await entered.promise;
+		const ctx = await callContext("Write", join(workspace, "cancel-drain.txt"));
+		const controller = new AbortController();
+		ctx.signal = controller.signal;
+		const draining = deferred();
+		const original = runtime.waitForNamespaceDrain.bind(runtime);
+		const spy = spyOn(runtime, "waitForNamespaceDrain").mockImplementation((signal) => {
+			draining.resolve();
+			return original(signal);
+		});
+		const pending = write(join(workspace, "cancel-drain.txt"), "cancelled", ctx);
+		try {
+			await draining.promise;
+			controller.abort(new Error("cancel drain"));
+			expect((await pending).isError).toBe(true);
+			expect(operations()).toHaveLength(1);
+			expect(db.select().from(schema.workspaceWriteLeases).all()).toHaveLength(1);
+			await expect(runtime.tryWithNamespaceAccess(async () => {})).rejects.toBeInstanceOf(
+				FileChangeNamespaceBusyError,
+			);
+		} finally {
+			spy.mockRestore();
+			gate.resolve();
+			await legacy;
+			await pending;
+		}
+	});
+	test("namespace busy never retries when coordinator lease cleanup cannot be persisted", async () => {
+		const path = join(workspace, "cleanup-busy.txt");
+		await write(path, "before");
+		const gate = deferred();
+		const entered = deferred();
+		const holder = withWorkspaceWriteLock(localBackend, workspace, async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await entered.promise;
+		const waiter = observeLegacyWaiter();
+		const pending = write(path, "must not write");
+		await waiter.requested;
+		const legacyGate = deferred();
+		const legacyEntered = deferred();
+		const legacy = runtime.withNamespaceAccess(async () => {
+			legacyEntered.resolve();
+			await legacyGate.promise;
+		});
+		await legacyEntered.promise;
+		let attempts = 0;
+		const originalTry = runtime.tryWithNamespaceAccess.bind(runtime);
+		const spy = spyOn(runtime, "tryWithNamespaceAccess").mockImplementation((body, signal) => {
+			attempts++;
+			return originalTry(body, signal);
+		});
+		sqlite.exec(
+			"CREATE TRIGGER fail_busy_cleanup BEFORE UPDATE ON workspace_write_leases WHEN NEW.status = 'settled' BEGIN SELECT RAISE(ABORT, 'busy cleanup rejected'); END",
+		);
+		try {
+			gate.resolve();
+			const result = await pending;
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("Durable finalization failed");
+			expect(attempts).toBe(1);
+			expect(operations()).toHaveLength(1);
+			expect(await readFile(path, "utf8")).toBe("before");
+			expect(
+				db
+					.select()
+					.from(schema.workspaceWriteLeases)
+					.all()
+					.some((row) => row.status !== "settled"),
+			).toBe(true);
+		} finally {
+			sqlite.exec("DROP TRIGGER fail_busy_cleanup");
+			spy.mockRestore();
+			waiter.restore();
+			gate.resolve();
+			legacyGate.resolve();
+			await Promise.all([holder, legacy, pending]);
+		}
+	});
 	function observeLegacyWaiter() {
 		const requested = deferred();
 		const acquire = worktreeWriteLock.acquire.bind(worktreeWriteLock);
@@ -2066,12 +2458,12 @@ describe("legacy workspace lock interoperability", () => {
 	}
 
 	for (const tool of ["Write", "Edit"] as const) {
-		test(`Bash's old lock blocks v2 ${tool} before capture, including normalized cwd`, async () => {
+		test(`the legacy writer lock blocks v2 ${tool} before capture, including normalized cwd`, async () => {
 			const path = join(workspace, "shared.txt");
 			await writeFile(path, "original");
 			const gate = deferred();
 			const entered = deferred();
-			const bash = withBashWriteLock(localBackend, bashInput(), async () => {
+			const bash = withLegacyWriteLock(localBackend, legacyInput(), async () => {
 				entered.resolve();
 				await gate.promise;
 				await writeFile(path, "bash");
@@ -2104,7 +2496,7 @@ describe("legacy workspace lock interoperability", () => {
 	}
 
 	for (const outcome of ["success", "error", "abort"] as const) {
-		test(`v2 holds Bash's old lock through receipt settlement and releases on ${outcome}`, async () => {
+		test(`v2 holds the legacy writer lock through receipt settlement and releases on ${outcome}`, async () => {
 			const path = join(workspace, "reverse.txt");
 			await writeFile(path, "original");
 			const gate = deferred();
@@ -2131,7 +2523,7 @@ describe("legacy workspace lock interoperability", () => {
 			await entered.promise;
 			if (outcome === "abort") controller.abort(new Error("cancel during IO"));
 			let bashEntered = false;
-			const bash = withBashWriteLock(localBackend, bashInput(), async () => {
+			const bash = withLegacyWriteLock(localBackend, legacyInput(), async () => {
 				bashEntered = true;
 				expect(effects()[0].settlement).toBe("settled");
 				await writeFile(path, `${await readFile(path, "utf8")}+bash`);
@@ -2152,12 +2544,12 @@ describe("legacy workspace lock interoperability", () => {
 		});
 	}
 
-	test("cancelled v2 admission drains without IO and never unlocks the Bash holder early", async () => {
+	test("cancelled v2 admission drains without IO and never unlocks the legacy writer holder early", async () => {
 		const path = join(workspace, "cancel-legacy.txt");
 		await writeFile(path, "original");
 		const gate = deferred();
 		const entered = deferred();
-		const bash = withBashWriteLock(localBackend, bashInput(), async () => {
+		const bash = withLegacyWriteLock(localBackend, legacyInput(), async () => {
 			entered.resolve();
 			await gate.promise;
 		});
@@ -2213,7 +2605,7 @@ describe("legacy workspace lock interoperability", () => {
 			.run();
 		const gate = deferred();
 		const entered = deferred();
-		const bash = withBashWriteLock(localBackend, { ...bashInput(), cwd: alias }, async () => {
+		const bash = withLegacyWriteLock(localBackend, { ...legacyInput(), cwd: alias }, async () => {
 			entered.resolve();
 			await gate.promise;
 			await writeFile(path, "bash");
@@ -2430,7 +2822,15 @@ describe("lazy namespace, coordination and cancellation", () => {
 		expect(await readFile(path, "utf8")).toBe("new");
 		expect(operations()[0].executionOutcome).toBe("interrupted");
 		expect(effects()).toHaveLength(0);
-		expect(db.select().from(schema.workspaceWriteLeases).get()).toMatchObject({
+		const binding = failed.metadata?.fileChangeDiagnostics as FileChangeDiagnosticSnapshot;
+		expect(binding.leaseId).toBeDefined();
+		expect(
+			db
+				.select()
+				.from(schema.workspaceWriteLeases)
+				.where(eq(schema.workspaceWriteLeases.leaseId, binding?.leaseId ?? "missing"))
+				.get(),
+		).toMatchObject({
 			status: "settled",
 			executionClass: "local_file_io",
 			mutationManifestJson: { mutations: [{ outcome: "applied" }] },

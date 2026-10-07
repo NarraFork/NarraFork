@@ -25,6 +25,7 @@ import {
 	localObjectIdentity,
 } from "./file-change-local-io";
 import { restoreLocalFile } from "./file-change-local-restore";
+import { resetFileChangeNamespace } from "./file-change-namespace-reset";
 import { FileChangeReversalCalculator } from "./file-change-reversal";
 import {
 	LocalFileChangeRuntime,
@@ -2058,6 +2059,50 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 			apply: { receipt: { confirmed: true, outcome: "not_applied" } },
 		});
 	});
+	test("bounded response keeps namespace until compensation IO settlement", async () => {
+		const { a, b, plan } = await twoFiles();
+		const before = history();
+		const entered = hold();
+		const release = hold();
+		const controller = new AbortController();
+		let held = false;
+		let namespaceAcquired = false;
+		service = new RevertTransactionService(db, { ...options, cleanupTimeoutMs: 50 });
+		fileHook = async (path) => {
+			if (
+				path === b &&
+				operation(plan)?.status === "applying" &&
+				journalFiles(plan)[1].status === "applying"
+			)
+				controller.abort();
+			if (
+				!held &&
+				path === a &&
+				operation(plan)?.status === "compensating" &&
+				(await fs.readFile(a, "utf8")) === "changed"
+			) {
+				held = true;
+				entered.release();
+				await release.promise;
+			}
+		};
+		const attempt = execution(plan, controller.signal);
+		await entered.promise;
+		const namespaceWait = runtime.withNamespaceAccess(async () => {
+			namespaceAcquired = true;
+		});
+		try {
+			expect(await attempt.result).toMatchObject({ status: "recovery_required", settling: true });
+			expect(namespaceAcquired).toBe(false);
+			expect(operation(plan)?.status).toBe("compensating");
+		} finally {
+			release.release();
+		}
+		expect((await attempt.whenSettled).settling).toBe(false);
+		await namespaceWait;
+		expect(namespaceAcquired).toBe(true);
+		expect(history()).toBe(before);
+	});
 	test("cancel during post-dispatch guard returns bounded response but retains lease until real lifetime settles", async () => {
 		const { a, plan } = await twoFiles();
 		const before = history();
@@ -2080,6 +2125,8 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 			}
 		};
 		const attempt = execution(plan, controller.signal);
+		let namespaceAcquired = false;
+		let namespaceWait: Promise<void> | undefined;
 		try {
 			await entered.promise;
 			controller.abort();
@@ -2088,6 +2135,9 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 				status: "recovery_required",
 				settling: true,
 				journalStatus: "applying",
+			});
+			namespaceWait = runtime.withNamespaceAccess(async () => {
+				namespaceAcquired = true;
 			});
 			const row = journalFiles(plan)[0];
 			const scope = runtime.evidence.getScope(row.scopeId);
@@ -2107,10 +2157,13 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 					() => {},
 				),
 			).rejects.toThrow();
+			expect(namespaceAcquired).toBe(false);
 		} finally {
 			release.release();
 		}
 		const final = await attempt.whenSettled;
+		await namespaceWait;
+		expect(namespaceAcquired).toBe(true);
 		expect(final).toMatchObject({ status: "recovery_required", settling: false });
 		expect(journalFiles(plan)[0].receiptJson).toMatchObject({
 			apply: { receipt: { confirmed: false, outcome: "unknown" } },
@@ -2138,6 +2191,269 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		expect(await fs.readFile(a, "utf8")).toBe("changed");
 		expect(history()).toBe(before);
 		expect(operation(plan)?.status).toBe("prepared");
+	});
+	test("waiting rollback releases namespace so a coordinator-owned writer can finish", async () => {
+		const { a, plan } = await twoFiles();
+		const waiting = hold();
+		const release = hold();
+		const original = runtime.coordinator.withRollbackMany.bind(runtime.coordinator);
+		const delay = spyOn(runtime.coordinator, "withRollbackMany").mockImplementation(
+			async (request, body) => {
+				waiting.release();
+				await release.promise;
+				return original(request, body);
+			},
+		);
+		restores.push(() => delay.mockRestore());
+		const attempt = execution(plan);
+		try {
+			await waiting.promise;
+			const scope = runtime.evidence.getScope(journalFiles(plan)[0].scopeId);
+			if (!scope) throw new Error("Missing scope");
+			const writer = runtime.coordinator.withWrite(
+				{
+					scope,
+					runtime: localFileChangeRuntimeBinding("local") as NonNullable<
+						ReturnType<typeof localFileChangeRuntimeBinding>
+					>,
+				},
+				() => runtime.withNamespaceAccess(async () => "namespace acquired"),
+			);
+			// The deadline is a deadlock guard, not the sequencing mechanism.
+			await expect(
+				Promise.race([
+					writer,
+					new Promise((_, reject) => {
+						const timer = setTimeout(() => reject(new Error("Lock order deadlock")), 1000);
+						void writer.finally(() => clearTimeout(timer));
+					}),
+				]),
+			).resolves.toBe("namespace acquired");
+		} finally {
+			release.release();
+			await attempt.whenSettled;
+		}
+		expect(operation(plan)?.status).toBe("committed");
+		expect(await fs.readFile(a, "utf8")).toBe("original");
+	});
+	test("hot-loaded namespace-first writer finishes after rollback loses atomic namespace admission", async () => {
+		const { a, plan } = await twoFiles();
+		const entered = hold();
+		const queued = hold();
+		const original = runtime.coordinator.withRollbackMany.bind(runtime.coordinator);
+		let legacy: Promise<void> | undefined;
+		let attempts = 0;
+		const admission = spyOn(runtime.coordinator, "withRollbackMany").mockImplementation(
+			(request, body) =>
+				original(request, async (batch) => {
+					if (++attempts === 1) {
+						// Simulate retained HEAD code: namespace first, then coordinator. The
+						// new rollback already owns coordinator, so waiting for namespace deadlocks.
+						legacy = coordinatorState.executionContext.exit(() =>
+							runtime.withNamespaceAccess(async () => {
+								entered.release();
+								const { activityPolicy: _policy, ...target } = request.scopes[0];
+								const write = runtime.coordinator.withWrite(target, () => {});
+								queued.release();
+								await write;
+							}),
+						);
+						await entered.promise;
+						await queued.promise;
+					}
+					return body(batch);
+				}),
+		);
+		const previews = spyOn(access, "resolveFile");
+		const claims = spyOn(RevertMutationJournal.prototype, "startExecution");
+		restores.push(
+			() => admission.mockRestore(),
+			() => previews.mockRestore(),
+			() => claims.mockRestore(),
+		);
+		service = new RevertTransactionService(db, { ...options, timeoutMs: 2000 });
+		const attempt = execution(plan);
+		expect((await attempt.whenSettled).status).toBe("committed");
+		await legacy;
+		expect(attempts).toBe(2);
+		expect(previews).toHaveBeenCalledTimes(journalFiles(plan).length);
+		expect(claims).toHaveBeenCalledTimes(1);
+		expect(await fs.readFile(a, "utf8")).toBe("original");
+		expect(journalFiles(plan)).toHaveLength(2);
+	});
+	test("cancelled namespace drain never acquires rollback leases or interrupts its owner", async () => {
+		const { a, plan } = await twoFiles();
+		const entered = hold();
+		const release = hold();
+		const draining = hold();
+		const controller = new AbortController();
+		const original = runtime.waitForNamespaceDrain.bind(runtime);
+		let holder: Promise<void> | undefined;
+		const drain = spyOn(runtime, "waitForNamespaceDrain").mockImplementation(async (signal) => {
+			holder = runtime.withNamespaceAccess(async () => {
+				entered.release();
+				await release.promise;
+			});
+			await entered.promise;
+			draining.release();
+			return original(signal);
+		});
+		const admission = spyOn(runtime.coordinator, "withRollbackMany");
+		const claims = spyOn(RevertMutationJournal.prototype, "startExecution");
+		restores.push(
+			() => drain.mockRestore(),
+			() => admission.mockRestore(),
+			() => claims.mockRestore(),
+		);
+		const attempt = execution(plan, controller.signal);
+		try {
+			await draining.promise;
+			controller.abort();
+			await expect(attempt.whenSettled).rejects.toThrow("CANCELLED");
+			expect(admission).not.toHaveBeenCalled();
+			expect(claims).not.toHaveBeenCalled();
+			expect(operation(plan)?.status).toBe("prepared");
+		} finally {
+			release.release();
+			await holder;
+		}
+		expect(await fs.readFile(a, "utf8")).toBe("changed");
+	});
+	test("namespace busy with failed coordinator release is not retried through its cause", async () => {
+		const { plan } = await twoFiles();
+		const entered = hold();
+		const release = hold();
+		let holder: Promise<void> | undefined;
+		const original = runtime.coordinator.withRollbackMany.bind(runtime.coordinator);
+		const admission = spyOn(runtime.coordinator, "withRollbackMany").mockImplementation(
+			(request, body) =>
+				original(request, async (batch) => {
+					holder = runtime.withNamespaceAccess(async () => {
+						entered.release();
+						await release.promise;
+					});
+					await entered.promise;
+					sqlite.exec(`CREATE TRIGGER reject_busy_scope_release BEFORE UPDATE OF active_lease_id ON file_change_scopes
+					WHEN NEW.active_lease_id IS NULL AND OLD.active_lease_id IS NOT NULL
+					BEGIN SELECT RAISE(ABORT, 'busy-scope-release-failed'); END;`);
+					return body(batch);
+				}),
+		);
+		const claims = spyOn(RevertMutationJournal.prototype, "startExecution");
+		restores.push(
+			() => admission.mockRestore(),
+			() => claims.mockRestore(),
+		);
+		try {
+			await expect(execution(plan).whenSettled).rejects.toThrow(
+				"Durable batch finalization failed",
+			);
+			expect(admission).toHaveBeenCalledTimes(1);
+			expect(claims).not.toHaveBeenCalled();
+			expect(operation(plan)?.status).toBe("prepared");
+			expect(
+				runtime.evidence.getScope(journalFiles(plan)[0].scopeId)?.activeLeaseId,
+			).not.toBeNull();
+		} finally {
+			sqlite.exec("DROP TRIGGER IF EXISTS reject_busy_scope_release");
+			release.release();
+			await holder;
+		}
+	});
+	test("cancelled rollback namespace admission releases its leases but not the current namespace owner", async () => {
+		const { a, plan } = await twoFiles();
+		const waiting = hold();
+		const admit = hold();
+		const namespaceEntered = hold();
+		const namespaceRelease = hold();
+		const callbackEntered = hold();
+		const controller = new AbortController();
+		const original = runtime.coordinator.withRollbackMany.bind(runtime.coordinator);
+		const delay = spyOn(runtime.coordinator, "withRollbackMany").mockImplementation(
+			async (request, body) => {
+				waiting.release();
+				await admit.promise;
+				return original(request, (batch) => {
+					callbackEntered.release();
+					return body(batch);
+				});
+			},
+		);
+		const claims = spyOn(RevertMutationJournal.prototype, "startExecution");
+		restores.push(
+			() => delay.mockRestore(),
+			() => claims.mockRestore(),
+		);
+		const attempt = execution(plan, controller.signal);
+		await waiting.promise;
+		const holder = runtime.withNamespaceAccess(async () => {
+			namespaceEntered.release();
+			await namespaceRelease.promise;
+		});
+		let successorEntered = false;
+		let successor: Promise<void> | undefined;
+		try {
+			await namespaceEntered.promise;
+			admit.release();
+			await callbackEntered.promise;
+			controller.abort();
+			await expect(attempt.whenSettled).rejects.toThrow("CANCELLED");
+			const scope = runtime.evidence.getScope(journalFiles(plan)[0].scopeId);
+			expect(scope?.activeLeaseId).toBeNull();
+			expect(claims).not.toHaveBeenCalled();
+			expect(operation(plan)?.status).toBe("prepared");
+			successor = runtime.withNamespaceAccess(async () => {
+				successorEntered = true;
+			});
+			await Promise.resolve();
+			expect(successorEntered).toBe(false);
+		} finally {
+			admit.release();
+			namespaceRelease.release();
+			await holder;
+			await successor;
+		}
+		expect(successorEntered).toBe(true);
+		expect(await fs.readFile(a, "utf8")).toBe("changed");
+	});
+	test("namespace reset while rollback waits refuses its old plan before target IO", async () => {
+		const { a, plan } = await twoFiles();
+		const before = history();
+		const waiting = hold();
+		const release = hold();
+		const original = runtime.coordinator.withRollbackMany.bind(runtime.coordinator);
+		const delay = spyOn(runtime.coordinator, "withRollbackMany").mockImplementation(
+			async (request, body) => {
+				waiting.release();
+				await release.promise;
+				return original(request, body);
+			},
+		);
+		const claims = spyOn(RevertMutationJournal.prototype, "startExecution");
+		restores.push(
+			() => delay.mockRestore(),
+			() => claims.mockRestore(),
+		);
+		const attempt = execution(plan);
+		await waiting.promise;
+		const reset = runtime.withNamespaceAccess(() =>
+			resetFileChangeNamespace({
+				db,
+				privateRoot: join(root, "private"),
+				assertBoundary: async () => {},
+			}),
+		);
+		// Gate release remains deferred until reset has actually invalidated old facts.
+		await reset;
+		const opens = spyOn(fileChangeLocalIo, "read");
+		restores.push(() => opens.mockRestore());
+		release.release();
+		await expect(attempt.whenSettled).rejects.toThrow();
+		expect(opens).not.toHaveBeenCalled();
+		expect(claims).not.toHaveBeenCalled();
+		expect(operation(plan)?.status).toBe("expired");
+		expect(await fs.readFile(a, "utf8")).toBe("changed");
+		expect(history()).toBe(before);
 	});
 	test("lease admission accepts unrelated coordinator revision/fence advancement", async () => {
 		const { a, plan } = await twoFiles();
@@ -2300,6 +2616,50 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_PLANNER_EVIDENCE_INCOMPLETE" });
 		expect(history()).toBe(before);
 		expect(await fs.readFile(path, "utf8")).toBe("unchanged\n");
+	});
+	test("zero-file rollback rechecks namespace after reset queued during preview", async () => {
+		const path = join(workspace, "no-dispatch-reset.txt");
+		await fs.writeFile(path, "unchanged");
+		await edit(path, "missing", "new", true);
+		const plan = await prepare();
+		expect(plan.expectedFileCount).toBe(0);
+		const before = history();
+		const entered = hold();
+		const release = hold();
+		const readBytes = namespace.store.readBytes.bind(namespace.store);
+		let held = false;
+		const reads = spyOn(namespace.store, "readBytes").mockImplementation(async (ref, options) => {
+			if (!held) {
+				held = true;
+				entered.release();
+				await release.promise;
+			}
+			return readBytes(ref, options);
+		});
+		const claims = spyOn(RevertMutationJournal.prototype, "startExecution");
+		const admission = spyOn(runtime.coordinator, "withRollbackMany");
+		restores.push(
+			() => reads.mockRestore(),
+			() => claims.mockRestore(),
+			() => admission.mockRestore(),
+		);
+		const attempt = execution(plan);
+		await entered.promise;
+		const reset = runtime.withNamespaceAccess(() =>
+			resetFileChangeNamespace({
+				db,
+				privateRoot: join(root, "private"),
+				assertBoundary: async () => {},
+			}),
+		);
+		release.release();
+		await reset;
+		await expect(attempt.whenSettled).rejects.toThrow();
+		expect(claims).not.toHaveBeenCalled();
+		expect(admission).not.toHaveBeenCalled();
+		expect(operation(plan)?.status).toBe("expired");
+		expect(history()).toBe(before);
+		expect(await fs.readFile(path, "utf8")).toBe("unchanged");
 	});
 	test("positive no_dispatch zero-file history deletion uses no fabricated workspace lease", async () => {
 		const path = join(workspace, "no-dispatch.txt");

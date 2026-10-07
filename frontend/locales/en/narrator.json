@@ -1772,7 +1772,9 @@
 			"execution": "Execution {{duration}}",
 			"streamCompleted": "Tool streaming completed",
 			"streaming": "Streaming duration: {{duration}}",
-			"postStreamingWait": "Wait after streaming: {{duration}}"
+			"postStreamingWait": "Wait after streaming: {{duration}}",
+			"wait": "Waiting {{duration}}",
+			"executionSpan": "Execution span (includes unmeasured waits) {{duration}}"
 		}
 	},
 	"toolbar": {

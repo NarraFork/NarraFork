@@ -1,63 +1,101 @@
-/**
- * tool-display-duration.ts — WHICH number a tool call shows as "how long it took".
- *
- * A finished call has TWO defensible durations, and the difference is not small:
- *
- *   `durationMs`     — the whole span the loop attributes to this call. For a tool
- *                      with a `streamStartedAt` it is `now - streamStartedAt` minus
- *                      the execution time of preceding tools in the turn (see
- *                      `loop.ts`'s tool_result branch). So it INCLUDES the time the
- *                      call spent waiting on a permission gate, a reflection gate,
- *                      or simply queued behind an earlier sibling.
- *   `execDurationMs` — the tool's own `execute()` span, stashed in
- *                      `_metadata.execDurationMs` whenever the two differ.
- *
- * For bash the gap is routinely 10-20x: a `git diff` that runs in 1.2s but sat
- * behind a danger-reflection gate for 19s reports 20s. "20s" next to a shell
- * command reads as a slow command, which sends the reader looking for a
- * performance problem that does not exist. The waiting is real and worth seeing —
- * it lives in the timing popover's phase breakdown, where it is labelled as
- * waiting rather than silently folded into one figure.
- *
- * ⚠️ WHY THIS IS A SHARED MODULE. The rule used to be an inline ternary inside
- * `measure-tool-call.ts`, so only the expanded CARD applied it. The folded trace
- * row painted raw `durationMs`, and one call therefore reported two different
- * durations depending on the LOD the reader happened to be at — the card said 1s
- * and the row beside it said 20s. One function, two call sites.
- *
- * Pure + framework-free.
- */
+/** Lifecycle and measured-operation timing shared by every tool surface. */
 
-/**
- * Tool categories whose `durationMs` is known to absorb waiting time.
- *
- * Restricted to `bash` deliberately, matching the chunked card's original
- * `getBashExecDurationMs`: bash is where the two figures diverge by enough to
- * mislead, and it is the category whose `execDurationMs` is reliably written.
- * Widening this is a behaviour change for every other tool's displayed duration,
- * so it should be a deliberate decision with its own evidence, not a side effect.
- */
-const EXEC_DURATION_PREFERRED_CATEGORIES: ReadonlySet<string> = new Set(["bash"]);
+/** Old records retain their total without inventing a lock wait. */
+export function resolveToolDisplayDurationMs(source: ToolTimingSource): number | null {
+	return resolveToolCallTiming(source).executionMs ?? duration(source.durationMs);
+}
+export interface FileChangeTiming {
+	waitMs: number;
+	executionMs: number;
+	totalMs: number;
+}
 
-/**
- * The duration to PAINT for a tool call, or null when none is known.
- *
- * Callers pass the raw fields; the precedence is:
- *   1. `execDurationMs`, for a category where it is the honest figure;
- *   2. `durationMs`, the full attributed span;
- *   3. null — no duration at all. Never 0: a fabricated "0ms" reads as a real
- *      measurement of an instant call.
- *
- * The lifecycle stamps are untouched by this: the popover's "Total" still reports
- * the complete span, because that is what it claims to report.
- */
-export function resolveToolDisplayDurationMs(source: {
+export interface ToolTimingSource {
 	category?: string | null;
-	execDurationMs?: number | null;
+	startedAt?: string | number | null;
+	createdAt?: string | number | null;
+	streamStartedAt?: string | number | null;
+	streamCompletedAt?: string | number | null;
+	permissionStartedAt?: string | number | null;
+	executionStartedAt?: string | number | null;
+	completedAt?: string | number | null;
 	durationMs?: number | null;
-}): number | null {
-	const preferExec =
-		source.category != null && EXEC_DURATION_PREFERRED_CATEGORIES.has(source.category);
-	if (preferExec && source.execDurationMs != null) return source.execDurationMs;
-	return source.durationMs ?? null;
+	execDurationMs?: number | null;
+	fileChangeTiming?: FileChangeTiming | null;
+	outputJson?: unknown;
+}
+
+export function parseToolTime(value: string | number | null | undefined): number | null {
+	if (value == null) return null;
+	const time = typeof value === "number" ? value : Date.parse(value);
+	return Number.isFinite(time) ? time : null;
+}
+
+function record(value: unknown): Record<string, unknown> {
+	return value != null && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+function duration(value: unknown): number | null {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function span(start: number | null, end: number | null): number | null {
+	return start != null && end != null && end >= start ? end - start : null;
+}
+
+export function resolveToolCallTiming(source: ToolTimingSource) {
+	const metadata = record(record(source.outputJson)._metadata);
+	const fileTiming = record(source.fileChangeTiming ?? metadata.fileChangeTiming);
+	const fileWaitMs = duration(fileTiming.waitMs);
+	const fileExecutionMs = duration(fileTiming.executionMs);
+	const streamStarted = parseToolTime(source.streamStartedAt);
+	const streamCompleted = parseToolTime(source.streamCompletedAt);
+	const permissionStarted = parseToolTime(source.permissionStartedAt);
+	const executionStarted = parseToolTime(source.executionStartedAt);
+	const completed = parseToolTime(source.completedAt);
+	const starts = [
+		streamStarted,
+		parseToolTime(source.createdAt),
+		parseToolTime(source.startedAt),
+		permissionStarted,
+		executionStarted,
+	].filter((value): value is number => value != null);
+	const started = starts.length ? Math.min(...starts) : null;
+	const executionSpanMs = span(executionStarted, completed);
+	const knownExecutionSpanMs =
+		executionSpanMs ?? duration(source.execDurationMs) ?? duration(metadata.execDurationMs);
+	// Invalid receipts (including waits longer than the real execution span) must
+	// not manufacture a zero-duration operation or an impossible phase breakdown.
+	const hasFileTiming =
+		fileWaitMs != null &&
+		fileExecutionMs != null &&
+		duration(fileTiming.totalMs) != null &&
+		(knownExecutionSpanMs == null || fileWaitMs <= knownExecutionSpanMs);
+	const executionMs = hasFileTiming
+		? knownExecutionSpanMs != null
+			? knownExecutionSpanMs - fileWaitMs
+			: fileExecutionMs
+		: knownExecutionSpanMs;
+	const preExecutionWaitMs = span(streamCompleted ?? permissionStarted, executionStarted);
+	return {
+		started,
+		streamStarted,
+		streamCompleted,
+		permissionStarted,
+		executionStarted,
+		// Never invent a completion stamp from durationMs: it may include streaming
+		// and may have had preceding tools' execution time subtracted by the loop.
+		completed,
+		streamingMs: span(streamStarted, streamCompleted),
+		permissionWaitMs: span(permissionStarted, executionStarted),
+		preExecutionWaitMs,
+		waitMs:
+			preExecutionWaitMs != null || hasFileTiming
+				? (preExecutionWaitMs ?? 0) + (hasFileTiming ? fileWaitMs : 0)
+				: null,
+		executionSpanMs,
+		executionMs,
+		fileWaitMs: hasFileTiming ? fileWaitMs : null,
+		totalMs: duration(source.durationMs) ?? span(started, completed),
+	};
 }

@@ -1770,7 +1770,9 @@
 			"execution": "执行 {{duration}}",
 			"streamCompleted": "流式输出完毕",
 			"streaming": "流式耗时：{{duration}}",
-			"postStreamingWait": "流式结束后等待：{{duration}}"
+			"postStreamingWait": "流式结束后等待：{{duration}}",
+			"wait": "等待 {{duration}}",
+			"executionSpan": "执行跨度（含未单独计量的等待）{{duration}}"
 		}
 	},
 	"toolbar": {

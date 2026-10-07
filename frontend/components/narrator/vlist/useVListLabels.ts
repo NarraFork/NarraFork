@@ -87,6 +87,9 @@ export interface VListTimingLabels {
 	completed: string;
 	total: string;
 	permissionWait: string;
+	streaming?: string;
+	wait?: string;
+	executionSpan?: string;
 	execution: string;
 	startedAt: string;
 	timeoutSeconds: string;
@@ -523,6 +526,11 @@ export function useVListLabels(): VListLabels {
 			completed: t("toolCallInspector.timing.completed"),
 			total: t("toolCallInspector.timing.total", { duration: DURATION_PLACEHOLDER }),
 			permissionWait: t("toolCallInspector.timing.permissionWait", {
+				duration: DURATION_PLACEHOLDER,
+			}),
+			streaming: t("toolCallInspector.timing.streaming", { duration: DURATION_PLACEHOLDER }),
+			wait: t("toolCallInspector.timing.wait", { duration: DURATION_PLACEHOLDER }),
+			executionSpan: t("toolCallInspector.timing.executionSpan", {
 				duration: DURATION_PLACEHOLDER,
 			}),
 			execution: t("toolCallInspector.timing.execution", { duration: DURATION_PLACEHOLDER }),

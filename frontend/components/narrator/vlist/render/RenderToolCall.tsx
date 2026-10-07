@@ -87,6 +87,7 @@ import { resolveToolRowStatusMark, TraceRowStatusGlyph } from "./trace-row-statu
 import "../vlist-markdown.css";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
+import { resolveToolCallTiming } from "@shared/tool-display-duration";
 import { DocumentCodeBody } from "../../content/DocumentCodeBody";
 import { DocumentSourceStatus } from "../../content/DocumentSourceStatus";
 import { queueDocumentFind } from "../../content/document-find-intent";
@@ -791,6 +792,9 @@ export interface ToolTimingLabels {
 	/** Carries a literal `{duration}` placeholder. */
 	total: string;
 	permissionWait: string;
+	streaming?: string;
+	wait?: string;
+	executionSpan?: string;
 	execution: string;
 	/** Carries a literal `{time}` placeholder (aria-label / group tooltip). */
 	startedAt: string;
@@ -809,6 +813,9 @@ const DEFAULT_TIMING_LABELS: ToolTimingLabels = {
 	completed: "Execution completed",
 	total: "Total {duration}",
 	permissionWait: "Permission wait {duration}",
+	streaming: "Streaming duration: {duration}",
+	wait: "Waiting {duration}",
+	executionSpan: "Execution span (includes unmeasured waits) {duration}",
 	execution: "Execution {duration}",
 	startedAt: "Started at {time}",
 	timeoutSeconds: "Timeout (seconds)",
@@ -833,7 +840,9 @@ function hasTimingDetails(timing: ToolTimingStamps | null | undefined): boolean 
 		timing.streamCompletedAt != null ||
 		timing.permissionStartedAt != null ||
 		timing.executionStartedAt != null ||
-		timing.completedAt != null
+		timing.completedAt != null ||
+		timing.fileChangeTiming != null ||
+		timing.execDurationMs != null
 	);
 }
 
@@ -844,33 +853,25 @@ function hasTimingDetails(timing: ToolTimingStamps | null | undefined): boolean 
  * the chunked version readable:
  *   - the generic "Started" row is SUPPRESSED when it coincides with one of the
  *     named phases (otherwise every card shows the same timestamp twice), and
- *   - `completed` falls back through executionStarted + displayed duration, then
- *     earliest start + final duration, so a card whose completion stamp never
- *     persisted still closes out its timeline.
+ *   - completion stamps are never inferred from an attributed duration: it can
+ *     include streaming/waits and exclude preceding sibling execution. Summaries
+ *     use the same measured phases as the inspector without moving timestamps.
  */
 function ToolTimingBreakdown({
 	timing,
-	displayDurationMs,
 	labels,
 }: {
 	timing: ToolTimingStamps;
 	displayDurationMs?: number | null;
 	labels: ToolTimingLabels;
 }) {
-	const resolvedStart = earliestToolStartMs(timing);
 	const explicitCandidates = [timing.startedAt, timing.createdAt].filter(
 		(value): value is number => value != null,
 	);
 	const explicitStarted = explicitCandidates.length > 0 ? Math.min(...explicitCandidates) : null;
 	const { streamStartedAt, streamCompletedAt, permissionStartedAt, executionStartedAt } = timing;
-	const finalDurationMs = timing.durationMs ?? displayDurationMs ?? null;
-	const completed =
-		timing.completedAt ??
-		(executionStartedAt != null && displayDurationMs != null
-			? executionStartedAt + displayDurationMs
-			: resolvedStart != null && finalDurationMs != null
-				? resolvedStart + finalDurationMs
-				: null);
+	const phases = resolveToolCallTiming(timing);
+	const completed = phases.completed;
 	const genericStarted =
 		explicitStarted != null &&
 		explicitStarted !== streamStartedAt &&
@@ -898,7 +899,13 @@ function ToolTimingBreakdown({
 		] as Array<{ key: string; label: string; time: number | null }>
 	).filter((step): step is { key: string; label: string; time: number } => step.time != null);
 
-	if (steps.length === 0) return null;
+	if (
+		steps.length === 0 &&
+		phases.totalMs == null &&
+		phases.executionMs == null &&
+		phases.waitMs == null
+	)
+		return null;
 
 	const precise = (ms: number) => formatDurationText(ms, { style: "precise" });
 
@@ -926,9 +933,23 @@ function ToolTimingBreakdown({
 					</Group>
 				);
 			})}
-			{resolvedStart != null && completed != null ? (
+			{phases.totalMs != null ? (
 				<Text size="xs" c="dimmed">
-					{fillLabel(labels.total, "duration", precise(Math.max(0, completed - resolvedStart)))}
+					{fillLabel(labels.total, "duration", precise(phases.totalMs))}
+				</Text>
+			) : null}
+			{phases.streamingMs != null ? (
+				<Text size="xs" c="dimmed">
+					{fillLabel(
+						labels.streaming ?? "Streaming duration: {duration}",
+						"duration",
+						precise(phases.streamingMs),
+					)}
+				</Text>
+			) : null}
+			{phases.waitMs != null ? (
+				<Text size="xs" c="dimmed">
+					{fillLabel(labels.wait ?? "Waiting {duration}", "duration", precise(phases.waitMs))}
 				</Text>
 			) : null}
 			{permissionStartedAt != null && executionStartedAt != null ? (
@@ -940,12 +961,14 @@ function ToolTimingBreakdown({
 					)}
 				</Text>
 			) : null}
-			{executionStartedAt != null && completed != null ? (
+			{phases.executionMs != null ? (
 				<Text size="xs" c="dimmed">
 					{fillLabel(
-						labels.execution,
+						phases.fileWaitMs != null
+							? labels.execution
+							: (labels.executionSpan ?? labels.execution),
 						"duration",
-						precise(Math.max(0, completed - executionStartedAt)),
+						precise(phases.executionMs),
 					)}
 				</Text>
 			) : null}

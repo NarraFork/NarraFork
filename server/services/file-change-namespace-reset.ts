@@ -33,16 +33,80 @@ const held = hotSafe(
 	() => new AsyncLocalStorage<ReadonlyMap<string, { active: boolean }>>(),
 );
 
-/** All blob consumers hold this for their entire IO lifetime, not just admission.
+const NAMESPACE_LOCK_KEY = "local-file-change-blob-cache";
+
+/** No consumer or mutation was admitted; callers must release workspace leases
+ * before waiting and retrying. Never reinterpret this as missing blob history. */
+export const FileChangeNamespaceBusyError = hotSafe(
+	"narrafork.file-change-namespace-busy-error.v1",
+	() =>
+		class FileChangeNamespaceBusyError extends Error {
+			constructor() {
+				super("File-change namespace admission is busy");
+				this.name = "FileChangeNamespaceBusyError";
+			}
+		},
+);
+
+async function waitForNamespaceTail(tail: Promise<void>, signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
+	if (!signal) return tail;
+	let abort: (() => void) | undefined;
+	try {
+		await Promise.race([
+			tail,
+			new Promise<never>((_, reject) => {
+				abort = () => reject(signal.reason);
+				signal.addEventListener("abort", abort, { once: true });
+				if (signal.aborted) abort();
+			}),
+		]);
+		signal.throwIfAborted();
+	} finally {
+		if (abort) signal.removeEventListener("abort", abort);
+	}
+}
+
+/** Lock-free admission barrier, including tails registered by retained old
+ * namespace-first closures. Does not reserve a FIFO slot or block consumers. */
+export async function waitForFileChangeNamespaceDrain(signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
+	if (held.getStore()?.get(NAMESPACE_LOCK_KEY)?.active) return;
+	for (;;) {
+		const tail = locks.get(NAMESPACE_LOCK_KEY);
+		if (!tail) return;
+		await waitForNamespaceTail(tail, signal);
+	}
+}
+
+/** Atomic no-wait admission closes the drain -> workspace grant race. A new
+ * coordinator-first consumer must never wait for a legacy namespace-first one. */
+export async function tryWithFileChangeNamespace<T>(
+	root: string,
+	body: () => Promise<T>,
+	signal?: AbortSignal,
+): Promise<T> {
+	signal?.throwIfAborted();
+	if (!held.getStore()?.get(NAMESPACE_LOCK_KEY)?.active && locks.has(NAMESPACE_LOCK_KEY))
+		return Promise.reject(new FileChangeNamespaceBusyError());
+	// withFileChangeNamespace registers its slot synchronously, before its first await.
+	return withFileChangeNamespace(root, body, signal);
+}
+/** Protect the entire actual blob-consumer IO/settlement lifetime against reset.
+ * Acquire workspace/coordinator/history admission BEFORE this fence, never while
+ * holding it. Previews release it before rollback admission and revalidate after.
  * Reentrant for initialize/verify called inside a writer or revert transaction.
  * Bash deliberately does not participate: this lock protects caches, not files. */
 export async function withFileChangeNamespace<T>(
 	_root: string,
 	body: () => Promise<T>,
+	/** Cancellation applies to admission only; a running consumer retains its fence. */
+	signal?: AbortSignal,
 ): Promise<T> {
 	// The application has exactly one catalog. Different root spellings/copies or
 	// freshly opened DB handles must still fence consumers of its former root.
-	const key = "local-file-change-blob-cache";
+	const key = NAMESPACE_LOCK_KEY;
+	signal?.throwIfAborted();
 	if (held.getStore()?.get(key)?.active) return body();
 	const previous = locks.get(key) ?? Promise.resolve();
 	let release!: () => void;
@@ -50,7 +114,29 @@ export async function withFileChangeNamespace<T>(
 		release = done;
 	});
 	locks.set(key, current);
-	await previous;
+	let onAbort: (() => void) | undefined;
+	try {
+		if (signal) {
+			await Promise.race([
+				previous,
+				new Promise<never>((_, reject) => {
+					onAbort = () => reject(signal.reason);
+					signal.addEventListener("abort", onAbort, { once: true });
+					if (signal.aborted) onAbort();
+				}),
+			]);
+			signal.throwIfAborted();
+		} else await previous;
+	} catch (error) {
+		// Preserve FIFO ownership: cancellation must not release the predecessor.
+		void previous.finally(() => {
+			release();
+			if (locks.get(key) === current) locks.delete(key);
+		});
+		throw error;
+	} finally {
+		if (onAbort) signal?.removeEventListener("abort", onAbort);
+	}
 	const token = { active: true };
 	try {
 		return await held.run(new Map([...(held.getStore() ?? []), [key, token]]), body);

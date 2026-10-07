@@ -172,6 +172,57 @@ async function render(props: Props | Props[]) {
 	await flush();
 }
 
+describe("ToolCallInspector timing", () => {
+	test("separates streaming, pre-execution wait and measured file operation", async () => {
+		i18n.addResourceBundle(
+			"en",
+			"narrator",
+			{
+				toolCallInspector: {
+					timing: {
+						streaming: "STREAM {{duration}}",
+						wait: "WAIT {{duration}}",
+						execution: "OPERATION {{duration}}",
+						executionSpan: "SPAN {{duration}}",
+						total: "TOTAL {{duration}}",
+					},
+				},
+			},
+			true,
+			true,
+		);
+		const detail = {
+			toolName: "Edit",
+			streamStartedAt: 35_417,
+			streamCompletedAt: 40_192,
+			executionStartedAt: 40_259,
+			completedAt: 48_625,
+			durationMs: 13_209,
+			outputJson: { _metadata: { execDurationMs: 8_366 } },
+		};
+		await render({ ...base, detail });
+		expect(document.body.textContent).toContain("STREAM 4.8s");
+		expect(document.body.textContent).toContain("WAIT 67ms");
+		expect(document.body.textContent).toContain("SPAN 8.4s");
+		expect(document.body.textContent).toContain("TOTAL 13s");
+		await render({
+			...base,
+			detail: {
+				...detail,
+				outputJson: {
+					_metadata: {
+						execDurationMs: 8_366,
+						fileChangeTiming: { waitMs: 8_000, executionMs: 300, totalMs: 8_300 },
+					},
+				},
+			},
+		});
+		expect(document.body.textContent).toContain("WAIT 8.1s");
+		expect(document.body.textContent).toContain("OPERATION 366ms");
+		expect(document.body.textContent).not.toContain("SPAN 8.4s");
+	});
+});
+
 describe("ToolCallInspector exact refs", () => {
 	test("simultaneous identical provider IDs each render their own initial row's full payload", async () => {
 		await render([

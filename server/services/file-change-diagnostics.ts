@@ -2,12 +2,15 @@
  * or release a lease. No paths, file bytes, error messages or stacks are retained. */
 const STAGES = [
 	"initialize",
+	"resolve_source",
 	"resolve_target",
 	"prepare_scope",
 	"capture_footprint",
 	"hash_request",
 	"acquire_lease",
 	"acquire_history_lock",
+	"acquire_workspace_lock",
+	"acquire_namespace_lock",
 	"validate_target",
 	"read_before",
 	"construct",
@@ -63,7 +66,35 @@ export interface FileChangeDiagnosticSnapshot extends Context {
 	droppedFailures: number;
 }
 
+export interface FileChangeTiming {
+	waitMs: number;
+	executionMs: number;
+	totalMs: number;
+}
 const attached = new WeakMap<object, FileChangeDiagnosticSnapshot>();
+const attachedTiming = new WeakMap<object, FileChangeTiming>();
+
+export function attachFileChangeTiming(error: unknown, timing: FileChangeTiming): unknown {
+	if (error !== null && (typeof error === "object" || typeof error === "function"))
+		attachedTiming.set(error, { ...timing });
+	return error;
+}
+export function getFileChangeTiming(error: unknown): FileChangeTiming | undefined {
+	if (error === null || (typeof error !== "object" && typeof error !== "function"))
+		return undefined;
+	const timing = attachedTiming.get(error);
+	if (timing) return { ...timing };
+	const details = attached.get(error);
+	if (!details) return undefined;
+	const waitMs = Math.min(
+		details.elapsedMs,
+		details.phases.reduce(
+			(sum, phase) => sum + (phase.stage.startsWith("acquire_") ? phase.elapsedMs : 0),
+			0,
+		),
+	);
+	return { waitMs, executionMs: details.elapsedMs - waitMs, totalMs: details.elapsedMs };
+}
 function duration(value: number): number {
 	return Number.isFinite(value) ? Math.max(0, Math.min(MAX_DURATION_MS, Math.round(value))) : 0;
 }
@@ -206,6 +237,22 @@ export class FileChangeDiagnostics {
 		return this.errors.includes(error);
 	}
 
+	/** Measured admission waits, separate from the actual protected IO window. */
+	timing(): { waitMs: number; executionMs: number; totalMs: number } {
+		const snapshot = this.snapshot();
+		const waitMs = Math.min(
+			snapshot.elapsedMs,
+			snapshot.phases.reduce(
+				(sum, phase) => sum + (phase.stage.startsWith("acquire_") ? phase.elapsedMs : 0),
+				0,
+			),
+		);
+		return {
+			waitMs,
+			executionMs: Math.max(0, snapshot.elapsedMs - waitMs),
+			totalMs: snapshot.elapsedMs,
+		};
+	}
 	finish(): void {
 		if (this.ended !== undefined) return;
 		this.ended = this.clock();
@@ -265,5 +312,11 @@ export function fileChangeDiagnosticSuffix(error: unknown): string {
 
 export function fileChangeDiagnosticMetadata(error: unknown): Record<string, unknown> | undefined {
 	const details = getFileChangeDiagnostics(error);
-	return details ? { fileChangeDiagnostics: details } : undefined;
+	const timing = getFileChangeTiming(error);
+	return details || timing
+		? {
+				...(details ? { fileChangeDiagnostics: details } : {}),
+				...(timing ? { fileChangeTiming: timing } : {}),
+			}
+		: undefined;
 }

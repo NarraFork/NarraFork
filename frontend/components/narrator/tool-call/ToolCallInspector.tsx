@@ -12,6 +12,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { readLeafText, stringifyForDisplay } from "@shared/pretext-layout/tool-io-projection";
+import { resolveToolCallTiming } from "@shared/tool-display-duration";
 import { IconCheck, IconCopy } from "@tabler/icons-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -169,12 +170,6 @@ function formatJsonPreview(value: unknown, maxChars: number): { text: string; tr
 	return { text: parts.join(""), truncated };
 }
 
-function parseTime(value: string | number | null | undefined): number | null {
-	if (value == null) return null;
-	const time = typeof value === "number" ? value : new Date(value).getTime();
-	return Number.isFinite(time) ? time : null;
-}
-
 function statusColor(status?: string): string {
 	switch (status) {
 		case "success":
@@ -242,16 +237,8 @@ function LazyCopyJsonIconButton({ value, label }: { value: unknown; label: strin
 
 function TimingTimeline({ toolCall }: { toolCall: ToolCallLike }) {
 	const { t } = useTranslation("narrator");
-	const streamStarted = parseTime(toolCall.streamStartedAt) ?? parseTime(toolCall.createdAt);
-	const streamCompleted = parseTime(toolCall.streamCompletedAt);
-	const permissionStarted = parseTime(toolCall.permissionStartedAt);
-	const executionStarted = parseTime(toolCall.executionStartedAt);
-	const completed = parseTime(toolCall.completedAt);
-	const totalEnd =
-		completed ??
-		(executionStarted != null && toolCall.durationMs != null
-			? executionStarted + toolCall.durationMs
-			: null);
+	const phases = resolveToolCallTiming(toolCall);
+	const { streamStarted, streamCompleted, permissionStarted, executionStarted, completed } = phases;
 	const steps = [
 		{ key: "stream", label: t("toolCallInspector.timing.streamStarted"), time: streamStarted },
 		{
@@ -269,10 +256,16 @@ function TimingTimeline({ toolCall }: { toolCall: ToolCallLike }) {
 			label: t("toolCallInspector.timing.executionStarted"),
 			time: executionStarted,
 		},
-		{ key: "completed", label: t("toolCallInspector.timing.completed"), time: totalEnd },
+		{ key: "completed", label: t("toolCallInspector.timing.completed"), time: completed },
 	].filter((step) => step.time != null) as Array<{ key: string; label: string; time: number }>;
 
-	if (steps.length === 0) return null;
+	if (
+		steps.length === 0 &&
+		phases.totalMs == null &&
+		phases.executionMs == null &&
+		phases.waitMs == null
+	)
+		return null;
 
 	return (
 		<Stack gap={6}>
@@ -300,27 +293,24 @@ function TimingTimeline({ toolCall }: { toolCall: ToolCallLike }) {
 				})}
 			</Timeline>
 			<Group gap="xs" wrap="wrap">
-				{streamStarted != null && streamCompleted != null && (
+				{phases.streamingMs != null && (
 					<Badge size="sm" variant="light" color="green">
 						{t("toolCallInspector.timing.streaming", {
-							duration: formatDurationText(streamCompleted - streamStarted, { style: "precise" }),
+							duration: formatDurationText(phases.streamingMs, { style: "precise" }),
 						})}
 					</Badge>
 				)}
-				{streamStarted != null && totalEnd != null && (
+				{phases.totalMs != null && (
 					<Badge size="sm" variant="light">
 						{t("toolCallInspector.timing.total", {
-							duration: formatDurationText(totalEnd - streamStarted, { style: "precise" }),
+							duration: formatDurationText(phases.totalMs, { style: "precise" }),
 						})}
 					</Badge>
 				)}
-				{streamCompleted != null && (permissionStarted != null || executionStarted != null) && (
+				{phases.waitMs != null && (
 					<Badge size="sm" variant="light" color="orange">
-						{t("toolCallInspector.timing.postStreamingWait", {
-							duration: formatDurationText(
-								(permissionStarted ?? executionStarted ?? streamCompleted) - streamCompleted,
-								{ style: "precise" },
-							),
+						{t("toolCallInspector.timing.wait", {
+							duration: formatDurationText(phases.waitMs, { style: "precise" }),
 						})}
 					</Badge>
 				)}
@@ -333,11 +323,16 @@ function TimingTimeline({ toolCall }: { toolCall: ToolCallLike }) {
 						})}
 					</Badge>
 				)}
-				{executionStarted != null && totalEnd != null && (
+				{phases.executionMs != null && (
 					<Badge size="sm" variant="light" color="blue">
-						{t("toolCallInspector.timing.execution", {
-							duration: formatDurationText(totalEnd - executionStarted, { style: "precise" }),
-						})}
+						{t(
+							phases.fileWaitMs != null
+								? "toolCallInspector.timing.execution"
+								: "toolCallInspector.timing.executionSpan",
+							{
+								duration: formatDurationText(phases.executionMs, { style: "precise" }),
+							},
+						)}
 					</Badge>
 				)}
 			</Group>

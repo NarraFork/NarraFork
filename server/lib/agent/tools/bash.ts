@@ -24,7 +24,6 @@ import {
 	createInvalidWorkdirArgumentResult,
 	createMissingWorkingDirectoryResult,
 } from "./working-directory-recovery";
-import { resolveBashSerializationInput, withBashWriteLock } from "./write-serialization";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_BACKGROUND_TIMEOUT_MS = 5 * 60 * 60 * 1000;
@@ -554,14 +553,6 @@ export const bashTool: ToolDefinition = {
 		}
 
 		try {
-			// Legacy attribution remains bounded/heuristic. Its timeout fallback does
-			// NOT bypass the separately registered coordinator activity above.
-			const serializationInput = await resolveBashSerializationInput({
-				command,
-				cwd,
-				isBackground: false,
-				isChapter: !!ctx.chapterId,
-			});
 			let releaseDetachedLease: (() => Promise<void>) | undefined;
 			let resolveDetached!: (result: ToolResult) => void;
 			const detachedResult = new Promise<ToolResult>((resolve) => {
@@ -918,10 +909,9 @@ export const bashTool: ToolDefinition = {
 				};
 			};
 
-			// Race only the HTTP/tool result, not the write-lock callback or process
-			// collector. They continue until the original execution really settles.
-			const lifecycle = withBashWriteLock(backend, serializationInput, runForeground)
-				.then((outcome) => outcome.value)
+			// Race only the HTTP/tool result, not the process collector. Bash never
+			// holds a workspace write lock; activity protection lasts until settlement.
+			const lifecycle = runForeground()
 				// Release after terminal output/status publication, just like Bash
 				// started in background mode, not immediately upon process exit.
 				.finally(() => releaseDetachedLease?.());

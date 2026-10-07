@@ -1299,6 +1299,33 @@ describe("extractDataRevision", () => {
 			expect(extractDataRevision(rowWith(1_500))).not.toBe(exec);
 		});
 
+		it("keys terminal timing corrections on cards and rows even with unchanged displayed duration", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			const base = {
+				status: "success",
+				durationMs: 1000,
+				executionStartedAt: 0,
+				completedAt: 1000,
+			};
+			const changed = {
+				...base,
+				fileChangeTiming: { waitMs: 200, executionMs: 800, totalMs: 1000 },
+			};
+			expect(extractDataRevision(changed)).not.toBe(extractDataRevision(base));
+			expect(extractDataRevision({ ...changed, completedAt: 1100 })).not.toBe(
+				extractDataRevision(changed),
+			);
+			const trace = (timing: unknown) => ({
+				items: [{ key: "tool-tu-1", timing, displayDurationMs: 800 }],
+			});
+			expect(extractDataRevision(trace(changed))).not.toBe(extractDataRevision(trace(base)));
+			expect(
+				extractDataRevision(
+					trace({ ...changed, fileChangeTiming: { waitMs: 300, executionMs: 800, totalMs: 1100 } }),
+				),
+			).not.toBe(extractDataRevision(trace(changed)));
+		});
+
 		it("a collapsed fold pays nothing (no card → no card component)", async () => {
 			const { extractDataRevision } = await import("./measure-cache");
 			const rev = extractDataRevision(traceWith());

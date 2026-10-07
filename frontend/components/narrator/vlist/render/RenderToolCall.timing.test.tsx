@@ -139,7 +139,10 @@ describe("timing breakdown — phase rows and summaries", () => {
 		durationMs: 7_000,
 	};
 
-	function breakdown(timing: Partial<typeof FULL>, displayDurationMs?: number) {
+	function breakdown(
+		timing: Parameters<typeof measureMod.resolveToolTimingStamps>[0],
+		displayDurationMs?: number,
+	) {
 		return render(
 			<renderMod.__TEST__ToolTimingBreakdown
 				timing={measureMod.resolveToolTimingStamps(timing)}
@@ -148,6 +151,25 @@ describe("timing breakdown — phase rows and summaries", () => {
 			/>,
 		).textContent;
 	}
+
+	it("uses the same file timing phases as the inspector without changing completion", () => {
+		const text =
+			breakdown({
+				streamStartedAt: 35_417,
+				streamCompletedAt: 40_192,
+				executionStartedAt: 40_259,
+				completedAt: 48_625,
+				durationMs: 13_209,
+				execDurationMs: 8_366,
+				fileChangeTiming: { waitMs: 8_000, executionMs: 300, totalMs: 8_300 },
+			}) ?? "";
+		expect(text).toContain("Streaming duration: 4.8s");
+		expect(text).toContain("Waiting 8.1s");
+		expect(text).toContain("RUN 366ms");
+		expect(text).toContain("TOTAL 13s");
+		expect(text).toContain("DONE");
+		expect(text).toContain("+8.4s");
+	});
 
 	it("lists every phase the card recorded", () => {
 		const text = breakdown(FULL) ?? "";
@@ -181,16 +203,16 @@ describe("timing breakdown — phase rows and summaries", () => {
 		expect(distinct).toContain("STARTED");
 	});
 
-	it("derives the completion row from execution start + displayed duration", () => {
-		// A card whose completedAt never persisted still closes out its timeline.
+	it("does not invent completion from execution start plus a displayed duration", () => {
 		const text = breakdown({ executionStartedAt: 2_000 }, 4_000) ?? "";
-		expect(text).toContain("DONE");
-		expect(text).toContain("RUN 4.0s");
+		expect(text).not.toContain("DONE");
+		expect(text).not.toContain("RUN 4.0s");
 	});
 
-	it("falls back to earliest start + final duration when execution is unknown", () => {
+	it("reports an old attributed total without inventing completion or lock wait", () => {
 		const text = breakdown({ createdAt: 1_000, durationMs: 2_500 }) ?? "";
-		expect(text).toContain("DONE");
+		expect(text).not.toContain("DONE");
+		expect(text).not.toContain("WAIT");
 		expect(text).toContain("TOTAL 2.5s");
 	});
 
@@ -304,9 +326,8 @@ describe("the live counter measures EXECUTION, not the wait before it", () => {
 		expect(timingCell(root)).toMatch(/^[78]s/);
 	});
 
-	it("leaves a FINISHED card's duration untouched", () => {
-		// The counter origin is about live calls only. A settled card paints
-		// `displayDurationMs`, which no part of this change reroutes.
+	it("shows the FINISHED execution span instead of the attributed total", () => {
+		// completedAt is the real end; durationMs may include streaming and waiting.
 		const root = render(
 			<renderMod.RenderToolCall
 				measured={card({
@@ -319,7 +340,7 @@ describe("the live counter measures EXECUTION, not the wait before it", () => {
 				labels={{ timing: LABELS }}
 			/>,
 		);
-		expect(timingCell(root)).toContain("7s");
+		expect(timingCell(root)).toContain("1s");
 	});
 });
 

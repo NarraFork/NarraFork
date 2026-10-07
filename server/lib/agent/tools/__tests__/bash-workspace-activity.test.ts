@@ -586,8 +586,9 @@ await Bun.write("bash.txt", "finished");`;
 			expect(lease.release).toHaveBeenCalledTimes(1);
 		});
 
-		test("retains the legacy write lock until the detached process settles", async () => {
+		test("detached Bash releases no write lock but retains activity until settlement", async () => {
 			const { withWorkspaceWriteLock } = await import("../write-serialization");
+			const scope = await scopeFromWrite();
 			const gate = program();
 			const executable = join(workspace, "touch");
 			await Bun.write(executable, `#!/bin/sh\n${gate.command}\n`);
@@ -598,15 +599,13 @@ await Bun.write("bash.txt", "finished");`;
 			const detached = await detachBashProcess(ctx.currentToolUseId, ctx.narratorId);
 			expect(detached).not.toBeNull();
 			await result;
-			let admitted = false;
-			const competing = withWorkspaceWriteLock(localBackend, workspace, async () => {
-				admitted = true;
-			});
-			await Promise.resolve();
-			expect(admitted).toBe(false);
+			expect(await withWorkspaceWriteLock(localBackend, workspace, async () => "entered")).toBe(
+				"entered",
+			);
+			await blocked(scope);
 			gate.release.resolve();
-			await competing;
-			expect(admitted).toBe(true);
+			await finished();
+			expect(await rollback(scope)).toBe("granted");
 		});
 
 		test("retains the updated timeout and marks the background task timed out", async () => {
@@ -740,22 +739,14 @@ await Bun.write("bash.txt", "finished");`;
 			});
 		}
 
-		test("the real two-second legacy lock fallback cannot bypass activity protection", async () => {
-			const { withWorkspaceWriteLock, resolveBashSerializationInput, decideBashSerialization } =
-				await import("../write-serialization");
+		test("Bash bypasses the write lock immediately while retaining activity protection", async () => {
+			const { withWorkspaceWriteLock } = await import("../write-serialization");
 			const scope = await scopeFromWrite();
 			const gate = program();
 			const executable = join(workspace, "touch");
 			await Bun.write(executable, `#!/bin/sh\n${gate.command}\n`);
 			await chmod(executable, 0o700);
 			const command = "./touch bash.txt";
-			const policy = await resolveBashSerializationInput({
-				command,
-				cwd: workspace,
-				isBackground: false,
-				isChapter: false,
-			});
-			expect(decideBashSerialization(policy).shouldSerialize).toBe(true);
 			const entered = deferred();
 			const release = deferred();
 			const legacy = withWorkspaceWriteLock(localBackend, workspace, async () => {
@@ -765,8 +756,28 @@ await Bun.write("bash.txt", "finished");`;
 			try {
 				await entered.promise;
 				const result = run(command);
-				// Only the actual bounded-mutex fallback can dispatch while legacy stays held.
-				await gate.ready.promise;
+				// A held write window must not impose the former two-second lock deadline.
+				let deadline: ReturnType<typeof setTimeout> | undefined;
+				try {
+					await Promise.race([
+						gate.ready.promise,
+						new Promise<never>((_, reject) => {
+							deadline = setTimeout(
+								() => reject(new Error("Bash waited for the write lock")),
+								1000,
+							);
+						}),
+					]);
+				} finally {
+					clearTimeout(deadline);
+				}
+				await blocked(scope);
+				release.resolve();
+				await legacy;
+				// Conversely, a running Bash process must not hold the write lock.
+				expect(await withWorkspaceWriteLock(localBackend, workspace, async () => "entered")).toBe(
+					"entered",
+				);
 				await blocked(scope);
 				gate.release.resolve();
 				await result;
