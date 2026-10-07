@@ -13,7 +13,7 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
 - `server/lib/agent/codex-websocket.ts` — Responses WebSocket 连接与 session cache
 - `server/lib/agent/codex-provider.ts` — Codex provider，负责在 WS / HTTP 之间切换
 - `server/lib/agent/openai-provider.ts` — 复用 Responses request 构建与事件解析
-- `scripts/test-codex-websocket.ts` — 手动验证脚本
+- 单元测试：`server/lib/agent/__tests__/codex-websocket*.test.ts`
 
 ## 协议特征
 
@@ -179,18 +179,6 @@ RFC 6455 限制 close reason 最长 123 字节，而上游放进去的 JSON 约 
 看起来像模型选择了什么都不说。
 
 ## 测试
-
-### 手动测试
-
-```bash
-bun scripts/test-codex-websocket.ts
-```
-
-可选代理：
-
-```bash
-bun scripts/test-codex-websocket.ts --proxy=http://proxy.example.com:8080
-```
 
 ### 单元测试
 

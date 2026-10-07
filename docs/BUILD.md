@@ -10,35 +10,40 @@
 bun run build:cross
 ```
 
-这会生成以下可执行文件：
-- `dist/narrafork-macos-arm64` - macOS Apple Silicon (M1/M2/M3)
-- `dist/narrafork-macos-x64` - macOS Intel
-- `dist/narrafork-linux-x64` - Linux x86_64
-- `dist/narrafork-linux-arm64` - Linux ARM64
+产物文件名带版本号（`narrafork-${VERSION}-...`），覆盖 8 个平台：
+
+- `dist/narrafork-${VERSION}-macos-arm64` — macOS Apple Silicon
+- `dist/narrafork-${VERSION}-macos-x64` — macOS Intel
+- `dist/narrafork-${VERSION}-linux-x64` / `-linux-x64-baseline` / `-linux-arm64`
+- `dist/narrafork-${VERSION}-windows-x64.exe` / `-windows-x64-baseline.exe` / `-windows-arm64.exe`
 
 ### 按平台构建
 
 ```bash
-# 构建所有 macOS 版本
+# 构建所有 macOS / Linux / Windows 版本
 bun run build:macos
-
-# 构建所有 Linux 版本
 bun run build:linux
+bun run build:windows
 
 # 单独构建特定平台
-bun run build:macos-arm64    # macOS ARM64
-bun run build:macos-x64      # macOS x64
-bun run build:linux-x64      # Linux x64
-bun run build:linux-arm64    # Linux ARM64
+bun run build:macos-arm64
+bun run build:macos-x64
+bun run build:linux-x64
+bun run build:linux-x64-baseline
+bun run build:linux-arm64
 ```
+
+`--platform=` 过滤按 target 后缀精确匹配（如 `darwin-arm64`、`linux-x64`、`windows`）；裸 `arm64` 不会命中。
 
 ## 构建流程
 
 构建脚本 `scripts/build-cross-platform.ts` 执行以下步骤：
 
-1. **构建前端** - 使用 Vite 将 React 应用构建到 `dist/frontend/`
-2. **生成嵌入清单** - 扫描前端资源并生成 `server/generated/embedded-frontend.ts`
-3. **编译可执行文件** - 使用 `bun build --compile` 为每个目标平台生成独立二进制文件
+1. **构建前端** — Vite 构建到 `dist/frontend/`
+2. **生成嵌入清单/数据** — embedded-frontend、embedded-migrations、embedded-postgres-migrations、build-info、embedded-changelog、embedded-licenses
+3. **下载 `@parcel/watcher` 原生二进制** — 8 个平台的 `.node`，绕过 node_modules
+4. **编译可执行文件** — `bun build --compile` 为每个目标平台生成独立二进制
+5. **生成校验和** — SHA256SUMS / checksums，以及更新服务器用的 `latest.yml`
 
 ## 高级用法
 
@@ -56,8 +61,8 @@ bun run build:cross --skip-frontend
 # 仅构建 Linux 版本
 bun scripts/build-cross-platform.ts --platform=linux
 
-# 仅构建 ARM64 版本
-bun scripts/build-cross-platform.ts --platform=arm64
+# 仅构建某一平台（用完整后缀，如 linux-arm64 / darwin-arm64 / windows）
+bun scripts/build-cross-platform.ts --platform=linux-arm64
 ```
 
 ## 交叉编译说明
@@ -92,7 +97,7 @@ bun run build:macos
 用户只需：
 1. 下载对应平台的可执行文件
 2. 添加执行权限（macOS/Linux）：`chmod +x narrafork-*`
-3. 运行：`./narrafork-macos-arm64`
+3. 运行：`./narrafork-${VERSION}-macos-arm64`（文件名含版本号）
 
 首次运行会自动：
 - 创建 `~/.narrafork/` 目录
@@ -107,7 +112,7 @@ macOS 可能会阻止未签名的应用。用户需要：
 
 ```bash
 # 移除隔离属性
-xattr -d com.apple.quarantine narrafork-macos-arm64
+xattr -d com.apple.quarantine narrafork-${VERSION}-macos-arm64
 
 # 或在系统设置中允许运行
 ```
@@ -145,7 +150,9 @@ chmod +x dist/narrafork-*
 
 ## 相关命令
 
-- `bun run build` - 仅构建前端
-- `bun run build:cross` - 构建所有平台
-- `bun run build:cross --platform=linux-x64` - 构建指定平台
-- `bun run start` - 开发模式运行（不编译）
+- `bun run build` — 仅构建前端
+- `bun run build:cross` — 构建所有平台
+- `bun run build:cross --platform=linux-x64` — 构建指定平台
+- `bun run build:update-server` — 构建更新服务器
+- `bun run build:android-rootfs` — 构建 Android rootfs
+- `bun run start` — 生产模式运行（跑迁移 + 后端 + 静态前端，不编译独立二进制）

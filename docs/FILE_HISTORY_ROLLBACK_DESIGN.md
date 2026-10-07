@@ -1,6 +1,6 @@
 # 全实例文件版本与会话回退设计
 
-状态：设计稿，尚未实现。本文确定新模式的产品语义、核心模型和实施边界。
+状态：**主体已实现**（提交 `a78b5166` 起）。本文为设计基线；设计符号与实现名对照：`InstanceFileWriter` → `LocalFileChangeRuntime`（`server/services/file-change-runtime.ts`），`FileRestoreService` → `file-change-local-restore.ts` + revert 服务簇。§10–12 的改造/验收清单反映目标态，实施进度见 `evidenceVersion=2` 与相关服务。
 
 ## 1. 决策与约束
 

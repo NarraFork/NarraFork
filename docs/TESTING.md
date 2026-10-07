@@ -9,13 +9,13 @@
 诊断特征：**单个文件跑全绿、混在一起跑失败**。遇到这种就先加 `--isolate` 复跑，再判断是否真回归。
 
 - `bun run test` 已默认带 `--isolate`（等价于 `bun test --isolate`）；CI 中的 `bun test` 也已加上。
-- `--isolate` 让每个文件拿到全新 global 并清空 module registry，代价是全仓耗时约 2.5 倍（本机 136s → 346s）。赶时间且只关心自己那几个文件时可用 `bun run test:fast`（无隔离），但**判断"是否有回归"必须以 `--isolate` 的结果为准**。
+- `--isolate` 让每个文件拿到全新 global 并清空 module registry，代价是全仓耗时约 2.5 倍（量级示意：本机 136s → 346s，随仓库规模变化）。赶时间且只关心自己那几个文件时可用 `bun run test:fast`（无隔离），但**判断"是否有回归"必须以 `--isolate` 的结果为准**。
 - `bunfig.toml` 不支持 `isolate` 键，只能通过 CLI 传入；`--parallel` 隐含 `--isolate`，不要与 `--no-isolate` 并用。
 - 隔离不是万能：它救不了"文件路径写错"这类问题（见下方"源码文本守卫"）。
 
 ## 源码文本守卫（`readFileSync` 类测试）
 
-约 140 个测试文件用 `readFileSync` / `Bun.file` 把**源码当纯文本**读进来做断言（其中 18 个显式命名 `*.guard.test.ts`）。存在的理由是真实的：`NarratorPanel` 这类组件挂着 query、WS 订阅和滚动容器，单元测试挂载不起来；而"某段代码**不存在**"（如 vlist 之外不得静态 import vlist）本就是模块图性质，运行时观察不到。
+约 250+ 个测试文件用 `readFileSync` / `Bun.file` 把**源码当纯文本**读进来做断言（其中约 20 个显式命名 `*.guard.test.ts`）。存在的理由是真实的：`NarratorPanel` 这类组件挂着 query、WS 订阅和滚动容器，单元测试挂载不起来；而"某段代码**不存在**"（如 vlist 之外不得静态 import vlist）本就是模块图性质，运行时观察不到。
 
 代价是**这些路径对 TypeScript 和打包器完全不可见**——它们只是字符串。移动或重命名文件时：
 

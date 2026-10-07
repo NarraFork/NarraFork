@@ -331,7 +331,7 @@ interval 语义：`> 0` 每 N 次触发；`-1` 关闭；`0` 也当关闭（"每�
 
 - `frontend/locales/{en,zh-CN}/narrator.json` 中 `sidecar.*` 下 6 个键引用数为 0：`unknownSource`、`copy`、`copied`、`truncated`、`showAll`、`attachedCount`（全是被删尾注卡片的 UI chrome）。⚠️ 注意 `sidecar.truncated` 与仍在使用的 `sidecar.body.tasksDoneTruncated` 是**两个不同的键**，前者是尾注的"预览被截断"、后者是后台任务输出被裁的说明，删前者不影响后者
 - `SIDECAR_PRESENTATION_FALLBACKS` 现在只被 `sidecar-body.ts` 内部的 `label()` 使用，不再是跨层契约，可降为模块私有
-- `spec-edit-interject.ts` 的 `SpecEditDelivery = "interjected" | "sidecar"`：`"sidecar"` 这个字面量现在名不副实，实际含义是"进了空闲队列等下次读取"
+- ~~`spec-edit-interject.ts` 的 `SpecEditDelivery = "interjected" | "sidecar"`：`"sidecar"` 这个字面量现在名不副实~~ **已改名**：现为 `SpecEditDelivery = "interjected" | "queued"`，`queued` 表示"进了空闲队列等下次读取"
 
 ---
 

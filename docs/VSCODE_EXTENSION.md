@@ -14,7 +14,7 @@
 
 ### code-server 的端口代理会剥离前缀
 
-`asExternalUri` 在 code-server 中返回 **`<root>/proxy/<port>/`**，来源是 `patches/proxy-uri.diff`：
+`asExternalUri` 在 code-server 中返回 **`<root>/proxy/<port>/`**，来源是 code-server 仓库的 `patches/proxy-uri.diff`（上游补丁，不在本仓）：
 
 ```
 proxyEndpointTemplate: process.env.VSCODE_PROXY_URI ?? rootBase + '/proxy/{{port}}/'
@@ -59,7 +59,7 @@ if (t) return { address: t[1], port: +t[2] };
 
 ### code-server 的 webview 与主窗口同源
 
-`patches/webview.diff` 标题即 "Serve webviews from the same origin"：`webviewEndpoint` 指向 code-server 自身静态路由，并绕过 `parentOriginHash` 校验。
+code-server 仓库的 `patches/webview.diff`（上游补丁，不在本仓）标题即 "Serve webviews from the same origin"：`webviewEndpoint` 指向 code-server 自身静态路由，并绕过 `parentOriginHash` 校验。
 
 推论：
 

@@ -173,17 +173,19 @@ frontend/
 
 - 跑测试/改测试基建、移动被守卫测试引用的文件 → `docs/TESTING.md`
 - 发布、changelog、stable 增量包、更新服务器（含个人测试服务器） → `docs/RELEASE.md`
+- 构建跨平台可执行文件 → `docs/BUILD.md`
 - 新增第三方/非 npm 二进制依赖、改 licenses 页面 → `docs/LICENSES.md`
 - 改 API request dump 存储/下载 → `docs/REQUEST_DUMPS.md`
 - 改 agent provider 历史构造、图片处理、NUG 网关事件 → `docs/AGENT_PROVIDERS.md`
+- 注入机制（服务端把内容放进叙述者对话） → `docs/INJECTION.md`
 - 知识库（分级 + 分 tag 双轴授权、写时复制版本、知识图谱链接） → `docs/KNOWLEDGE_BASE.md`
 - OAuth 2.0 + External API v1 接入 → `docs/OPEN_API.md`
+- VS Code 插件 → `docs/VSCODE_EXTENSION.md`
+- Codex Responses WebSocket → `docs/codex-websocket.md`
+
+其余文档按性质：`docs/plugin-system/` 为插件系统设计与验收记录；`docs/*-DESIGN.md`、`docs/CODEX_CLIENT_RELAY.md`、`docs/DYNAMIC_SPEC_TEAM_TASKS.md` 为领域设计；`docs/HANDOUT-agent-control.md` / `docs/TALK-agent-control.md` 为培训讲义；`docs/task-call-challenges/` 为评测存档，不是产品文档。
 
 > 新增表/路由/校验遵循既有范式：`schema.ts` → `bun run db:generate` → `bun run db:migrate`，FTS5 改 `server/db/fts.ts`，Zod schema 进 `server/lib/validators/`（按资源拆分目录），路由 `new Hono()` + `app.route`。
-
-## DESIGN.md
-
-`DESIGN.md` 文件（中文编写）包含完整的项目规格说明，涵盖全部 5 个开发阶段、详细的数据库 schema、API 契约和 UI 线框图。需求和架构决策请参阅该文件。
 
 ## 国际化（i18n）
 

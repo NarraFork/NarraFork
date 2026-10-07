@@ -1,6 +1,6 @@
 # Codex 客户端出口中继（Client Egress Relay）设计
 
-> 状态：阶段 1（NUG 侧）与阶段 2（nf 侧 relay client + provider 接线）已实现；阶段 3+（错误分类打磨已含在阶段 1，WS 上游过中继、多 channel 选择策略、admin 面板、前端设置 UI）未实现
+> 状态：阶段 1（NUG 侧）、阶段 2（nf 侧 relay client + provider 接线）与阶段 2.5（前端设置 UI 与生命周期，见 §0.2）已实现；阶段 3 部分（egress 落库等）、阶段 4（WS 上游过中继）、阶段 5（多 channel 选择策略、admin 面板）未实现。错误分类提炼已含在阶段 1。
 > 涉及仓库：narrafork（请求方 nf）、narrafork-unified-gateway（NUG）
 
 ## 0. 阶段 1 实现纪要（与本文其余章节的偏差）

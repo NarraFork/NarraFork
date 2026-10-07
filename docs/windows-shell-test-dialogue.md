@@ -33,7 +33,7 @@ bun run dev -- --wsl=true
 ```
 
 检查点：
-- [ ] 工具名显示为 "Shell"（不是 "Bash"）
+- [ ] 工具名显示为 "Bash"（全平台统一；`"Shell"` 仅作 legacy 别名归一到 `"Bash"`）
 - [ ] 命令正常执行，输出 `hello`
 - [ ] 如果是 Git Bash：通过 `--login -c` 包装执行
 - [ ] 如果是 PowerShell：通过 `-NoProfile -NonInteractive -Command` 执行

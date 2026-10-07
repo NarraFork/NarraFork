@@ -17,7 +17,7 @@ NarraFork 可作为 OAuth 2.0 Authorization Server。外部应用通过 Authoriz
 | 身份 | 用途 | 可访问范围 |
 |---|---|---|
 | Session JWT | NarraFork 第一方 Web UI 和管理操作 | 普通 `/api/*`、管理员路由、内部 WebSocket |
-| OAuth access token | 第三方应用 | `/api/external/v1/*` 和已废弃的兼容 provisioning 端点 |
+| OAuth access token | 第三方应用 | `/api/external/v1/*` |
 
 OAuth token 不能访问普通项目、管理员、设置或内部叙述者 API，也不能用于同意新的 OAuth 授权。Session JWT 不能调用 External API v1。
 
@@ -419,9 +419,7 @@ GET /api/external/v1/narrators/<id>/messages?limit=50&cursor=<opaque-cursor>
   ],
   "nextCursor": null,
   "documentRevision": 41,
-  "detail": "text",
-  "pruneBoundaryMessageId": null,
-  "prunedPercent": null
+  "detail": "text"
 }
 ```
 
@@ -510,9 +508,7 @@ GET /api/external/v1/narrators/<id>/messages?detail=skeleton&order=desc&limit=50
   "nextCursor": null,
   "documentRevision": 41,
   "detail": "summary",
-  "detailRequested": "full",
-  "pruneBoundaryMessageId": null,
-  "prunedPercent": null
+  "detailRequested": "full"
 }
 ```
 

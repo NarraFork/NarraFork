@@ -1,8 +1,8 @@
 # NarraFork 插件系统设计总览
 
-> 状态：设计基线（Design Baseline）
+> 状态：**已实现（阶段 0–4）**。本目录为设计基线与实现对照；09-roadmap / task-breakdown 反映设计期任务拆分，完成状态见 `验收记录.md` 与代码（`server/services/plugin-*.ts`、`server/routes/plugins.ts`、`frontend/components/plugins*`）。
 >
-> 本目录由多个独立设计任务协作产出，本文是主叙述者整合后的入口。它冻结当前推荐方向，但不代表插件系统已经实现。
+> 本目录由多个独立设计任务协作产出，本文是主叙述者整合后的入口。
 
 ## 1. 一句话结论
 
