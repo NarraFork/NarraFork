@@ -39,7 +39,16 @@ export function contextTokenShare(
 	totalChars: number,
 	totalTokens?: number | null,
 ): number | null {
-	if (totalTokens == null || !Number.isFinite(totalTokens) || totalTokens < 0) return null;
+	if (
+		totalTokens == null ||
+		!Number.isFinite(totalTokens) ||
+		totalTokens < 0 ||
+		!Number.isFinite(totalChars) ||
+		totalChars <= 0 ||
+		!Number.isFinite(chars) ||
+		chars < 0
+	)
+		return null;
 	return (totalTokens * contextCharacterPercent(chars, totalChars)) / 100;
 }
 
@@ -82,19 +91,40 @@ export function ContextCompositionView({
 			offset += segment.chars;
 			return { ...segment, key };
 		});
-	const usage = snapshot ?? data.usage;
-	const occupiedTokens = usage ? usage.occupiedTokens : totalTokens;
-	const calibrated =
-		usage?.composition?.generation === data.generation &&
+	// The API pins classification to a request. A matching WS snapshot carries
+	// newer occupancy; another request must never replace the API calibration.
+	const validTokens = (tokens?: number | null): tokens is number =>
+		tokens != null && Number.isFinite(tokens) && tokens >= 0;
+	const matches = (usage?: ContextUsageSnapshot | null) =>
+		usage != null &&
+		validTokens(usage.occupiedTokens) &&
 		data.generation != null &&
-		(!snapshot || snapshot.requestId === data.usage?.requestId) &&
-		usage?.inputCharacters != null &&
-		usage.inputCharacters.totalChars > 0;
-	const totalChars = calibrated
-		? (usage.inputCharacters?.totalChars ?? data.totalChars)
-		: data.totalChars;
-	const describe = (category: ContextCategory, chars: number) =>
-		`${t(`contextComposition.categories.${category}`)} · ${formatContextTokens(calibrated ? contextTokenShare(chars, totalChars, usage.occupiedTokens) : null)} · ${contextCharacterPercent(chars, totalChars).toFixed(1)}%`;
+		usage.composition?.generation === data.generation &&
+		usage.composition.totalChars === data.totalChars &&
+		usage.inputCharacters != null &&
+		Number.isFinite(usage.inputCharacters.totalChars) &&
+		usage.inputCharacters.totalChars > 0 &&
+		usage.inputCharacters.totalChars >= data.totalChars;
+	const matchedUsage =
+		snapshot?.requestId === data.usage?.requestId && matches(snapshot)
+			? snapshot
+			: matches(data.usage)
+				? data.usage
+				: null;
+	const occupiedTokens = matchedUsage
+		? matchedUsage.occupiedTokens
+		: [data.usage?.occupiedTokens, snapshot?.occupiedTokens, totalTokens].find(validTokens);
+	const calibrated = matchedUsage != null;
+	const totalChars = matchedUsage?.inputCharacters?.totalChars ?? data.totalChars;
+	const hasEstimate = contextTokenShare(1, totalChars, occupiedTokens) != null;
+	const estimateHint = t(
+		calibrated ? "contextComposition.calibratedHint" : "contextComposition.historyEstimateHint",
+	);
+	const describe = (category: ContextCategory, chars: number) => {
+		const tokens = contextTokenShare(chars, totalChars, occupiedTokens);
+		return `${t(`contextComposition.categories.${category}`)} · ${tokens == null ? "—" : `≈${formatContextTokens(tokens)}`} · ${contextCharacterPercent(chars, totalChars).toFixed(1)}%`;
+	};
+	const tooltip = (label: string) => (hasEstimate ? `${label} · ${estimateHint}` : label);
 	const unloadedChars =
 		mode === "sequence" && data.nextCursor ? Math.max(0, data.totalChars - offset) : 0;
 	return (
@@ -134,7 +164,7 @@ export function ContextCompositionView({
 				{segments.map((segment) => {
 					const label = describe(segment.category, segment.chars);
 					return (
-						<Tooltip key={segment.key} label={label} withArrow>
+						<Tooltip key={segment.key} label={tooltip(label)} withArrow>
 							<Box
 								component="button"
 								type="button"
@@ -176,9 +206,14 @@ export function ContextCompositionView({
 					</Tooltip>
 				)}
 			</Box>
+			{!calibrated && hasEstimate && segments.length > 0 && (
+				<Text size="xs" c="dimmed" data-testid="context-composition-estimate-hint">
+					{estimateHint}
+				</Text>
+			)}
 			{selected && (
 				<Text size="xs" role="status">
-					{describe(selected.category, selected.chars)}
+					{tooltip(describe(selected.category, selected.chars))}
 				</Text>
 			)}
 			<Group gap="xs">
@@ -187,15 +222,16 @@ export function ContextCompositionView({
 					if (!item || item.chars <= 0) return null;
 					const label = describe(category, item.chars);
 					return (
-						<Button
-							key={category}
-							variant="light"
-							size="compact-xs"
-							color={CONTEXT_COLORS[category]}
-							onClick={() => setSelected({ category, chars: item.chars })}
-						>
-							{label}
-						</Button>
+						<Tooltip key={category} label={tooltip(label)} withArrow>
+							<Button
+								variant="light"
+								size="compact-xs"
+								color={CONTEXT_COLORS[category]}
+								onClick={() => setSelected({ category, chars: item.chars })}
+							>
+								{label}
+							</Button>
+						</Tooltip>
 					);
 				})}
 			</Group>

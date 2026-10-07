@@ -284,7 +284,27 @@ describe("RemoteProviderAdapter", () => {
 
 	test("chat bridges only remote final-input counts and old plugins report unknown", async () => {
 		const counts = { totalChars: 120, systemChars: 20, toolsChars: 40 };
-		for (const reported of [counts, undefined]) {
+		const classified = {
+			...counts,
+			compositionSegments: [
+				{ category: "system", chars: 15 },
+				{ category: "summary", chars: 5 },
+				{ category: "toolDefinition", chars: 40 },
+				{ category: "user", chars: 20 },
+				{ category: "assistant", chars: 10 },
+				{ category: "toolCall", chars: 5 },
+				{ category: "toolResult", chars: 10 },
+				{ category: "attachment", chars: 10 },
+				{ category: "other", chars: 5 },
+			],
+		};
+		for (const reported of [
+			classified,
+			{ ...counts, compositionSegments: null },
+			counts,
+			undefined,
+			null,
+		]) {
 			const snapshots: unknown[] = [];
 			const rpc = makeRpc([
 				event("request_started", {

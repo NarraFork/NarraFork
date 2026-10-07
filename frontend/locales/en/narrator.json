@@ -38,6 +38,8 @@
 		"byCategory": "Categories",
 		"bySequence": "Sequence",
 		"characters": "characters",
+		"calibratedHint": "Category tokens are estimated by character share of the complete input for the same request, not measured per category.",
+		"historyEstimateHint": "Category tokens are estimated from historical character proportions and total context occupancy; they are not a same-request measurement.",
 		"refresh": "Refresh",
 		"retry": "Retry",
 		"loadMore": "Load more",

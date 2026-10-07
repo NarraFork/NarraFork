@@ -10,6 +10,7 @@ import {
 import {
 	type ContextInputCharacters,
 	type ContextUsageSnapshot,
+	MAX_INPUT_COMPOSITION_SEGMENTS,
 	parseContextUsageSnapshot,
 } from "@shared/context-usage";
 import { eq } from "drizzle-orm";
@@ -645,6 +646,87 @@ export function createContextCharacterService(
 			if (disposed || signal?.aborted || preparations.has(id)) return null;
 			const initial = metadata(id);
 			if (!initial) return null;
+			const requestCounts = validInputCharacters(counts);
+			if (requestCounts?.compositionSegments) {
+				// Final provider input is already classified. Never substitute today's
+				// transcript or wait for historical cache rebuilds to pin this request.
+				// Runtime supplies the actual summary's numeric contribution, not a
+				// historical estimate. Attribute it within the fixed system prefix only.
+				let summaryRemaining =
+					Number.isSafeInteger(runtimeSummaryChars) &&
+					runtimeSummaryChars >= 0 &&
+					runtimeSummaryChars <= requestCounts.systemChars &&
+					requestCounts.compositionSegments.length < MAX_INPUT_COMPOSITION_SEGMENTS &&
+					!requestCounts.compositionSegments.some((s) => s.category === "summary")
+						? runtimeSummaryChars
+						: 0;
+				const segments: ContextSegment[] = [];
+				for (const segment of requestCounts.compositionSegments) {
+					if (segment.category === "system" && summaryRemaining > 0) {
+						const summaryChars = Math.min(summaryRemaining, segment.chars);
+						if (segment.chars > summaryChars)
+							segments.push({ category: "system", chars: segment.chars - summaryChars });
+						segments.push({ category: "summary", chars: summaryChars });
+						summaryRemaining -= summaryChars;
+					} else segments.push(segment);
+				}
+				const generation = crypto.randomUUID();
+				const composition: ContextCharCache = {
+					generation,
+					revision: `request:${requestId}`,
+					pageCount: Math.ceil(segments.length / CONTEXT_COMPOSITION_LIMITS.pageSegments),
+					totalChars: requestCounts.totalChars,
+					totals: groupContextSegments(segments),
+				};
+				const snapshot = boundedContextSnapshot({
+					requestId,
+					startedAt,
+					source: "estimate",
+					percentage: null,
+					contextWindow: null,
+					occupiedTokens: null,
+					inputCharacters: requestCounts,
+					composition,
+				});
+				if (!snapshot) return null;
+				// At most 2048 numeric segments / 16 small pages. Publish atomically
+				// so asynchronous orphan cleanup cannot delete unpublished pages.
+				const publicationStarted = performance.now();
+				database.transaction(() => {
+					signal?.throwIfAborted();
+					const insert = database.query(
+						"INSERT INTO narrator_context_char_pages (id,narrator_id,generation,page,segments_json) VALUES (?,?,?,?,?)",
+					);
+					for (let page = 0; page < composition.pageCount; page++) {
+						insert.run(
+							crypto.randomUUID(),
+							id,
+							generation,
+							page,
+							JSON.stringify(
+								segments.slice(
+									page * CONTEXT_COMPOSITION_LIMITS.pageSegments,
+									(page + 1) * CONTEXT_COMPOSITION_LIMITS.pageSegments,
+								),
+							),
+						);
+					}
+					database
+						.query("UPDATE narrators SET context_usage_snapshot_json = ? WHERE id = ?")
+						.run(JSON.stringify(snapshot), id);
+				})();
+				const publicationMs = performance.now() - publicationStarted;
+				if (publicationMs >= 25 && performance.now() - preparationLoggedAt >= 60_000) {
+					preparationLoggedAt = performance.now();
+					logger.warn("Context request classification publication slow", {
+						narratorId: id,
+						pages: composition.pageCount,
+						durationMs: Math.round(publicationMs),
+					});
+				}
+				queueCleanup(id);
+				return composition;
+			}
 			const unknown = () => {
 				if (disposed || signal?.aborted || preparations.get(id)?.signal.aborted) return null;
 				const snapshot = boundedContextSnapshot({
@@ -666,6 +748,11 @@ export function createContextCharacterService(
 				} else queueCleanup(id);
 				return null;
 			};
+			if (
+				counts?.compositionSegments === null ||
+				(counts?.compositionSegments !== undefined && !requestCounts?.compositionSegments)
+			)
+				return unknown();
 			if (!counts || !validInputCharacters(counts) || preparations.size >= MAX_REQUEST_PREPARATIONS)
 				return unknown();
 			const controller = new AbortController();

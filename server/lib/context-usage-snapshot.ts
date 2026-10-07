@@ -4,6 +4,7 @@ import {
 	type ContextInputCharacters,
 	type ContextUsageSnapshot,
 	parseContextUsageSnapshot,
+	readInputCompositionSegments,
 } from "@shared/context-usage";
 
 export function validInputCharacters(
@@ -18,10 +19,22 @@ export function validInputCharacters(
 		value.systemChars + value.toolsChars > value.totalChars
 	)
 		return null;
+	let segments = readInputCompositionSegments(value.compositionSegments, value.totalChars);
+	if (
+		segments &&
+		(segments.reduce(
+			(sum, s) => sum + (s.category === "system" || s.category === "summary" ? s.chars : 0),
+			0,
+		) !== value.systemChars ||
+			segments.reduce((sum, s) => sum + (s.category === "toolDefinition" ? s.chars : 0), 0) !==
+				value.toolsChars)
+	)
+		segments = null;
 	return {
 		totalChars: value.totalChars,
 		systemChars: value.systemChars,
 		toolsChars: value.toolsChars,
+		...(value.compositionSegments !== undefined ? { compositionSegments: segments } : {}),
 	};
 }
 

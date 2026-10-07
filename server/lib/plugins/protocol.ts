@@ -1,4 +1,9 @@
 import { CITATION_LIMITS } from "@shared/citations";
+import { CONTEXT_CATEGORIES } from "@shared/context-composition";
+import {
+	MAX_INPUT_COMPOSITION_SEGMENTS,
+	readInputCompositionSegments,
+} from "@shared/context-usage";
 import { z } from "zod";
 import { capabilityListSchema, invocationScopeSchema } from "./permissions";
 
@@ -544,6 +549,22 @@ const dumpHeadersSchema = z
 	})
 	.optional();
 
+// Reject oversized arrays before Zod traverses their entries. Only numeric classification
+// crosses this boundary: message bodies and write-time tool IDs are not wire metadata.
+const inputCompositionSegmentsSchema = z.preprocess(
+	(value) => (Array.isArray(value) && value.length > MAX_INPUT_COMPOSITION_SEGMENTS ? null : value),
+	z
+		.array(
+			z
+				.object({
+					category: z.enum(CONTEXT_CATEGORIES),
+					chars: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+				})
+				.strict(),
+		)
+		.max(MAX_INPUT_COMPOSITION_SEGMENTS),
+);
+
 export const providerStreamEventSchema = z.discriminatedUnion("type", [
 	z
 		.object({
@@ -557,9 +578,28 @@ export const providerStreamEventSchema = z.discriminatedUnion("type", [
 					totalChars: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 					systemChars: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 					toolsChars: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+					compositionSegments: inputCompositionSegmentsSchema.nullable().optional(),
 				})
 				.strict()
 				.refine((counts) => counts.systemChars + counts.toolsChars <= counts.totalChars)
+				.refine((counts) => {
+					if (counts.compositionSegments == null) return true;
+					const segments = readInputCompositionSegments(
+						counts.compositionSegments,
+						counts.totalChars,
+					);
+					if (!segments) return false;
+					let systemChars = 0;
+					let toolsChars = 0;
+					for (const segment of segments) {
+						if (segment.category === "system" || segment.category === "summary") {
+							systemChars += segment.chars;
+						} else if (segment.category === "toolDefinition") {
+							toolsChars += segment.chars;
+						}
+					}
+					return systemChars === counts.systemChars && toolsChars === counts.toolsChars;
+				}, "Input composition must match total and fixed-prefix character counts")
 				.nullable()
 				.optional(),
 		})

@@ -44,7 +44,8 @@ mock.module("@mantine/core", () => ({
 	Loader: element,
 	Button: (props: Record<string, unknown>) => element({ ...props, component: "button" }),
 	Menu: Object.assign(element, { Target: element, Dropdown: element, Divider: element }),
-	Tooltip: ({ children }: { children: ReactNode }) => children,
+	Tooltip: ({ children, label }: { children: ReactNode; label: string }) =>
+		createElement("div", { "data-tooltip": label }, children),
 	SegmentedControl: ({
 		data,
 		onChange,
@@ -210,7 +211,7 @@ test("分页不改变完整分类汇总和百分比分母", async () => {
 	expect(more.getAttribute("style")).toContain("width:75%");
 	await act(() => more.click());
 	expect(loads).toBe(1);
-	expect(container.textContent).toContain("contextComposition.categories.assistant · 80K");
+	expect(container.textContent).toContain("contextComposition.categories.assistant · ≈80K");
 });
 test("校准后的分页仅补齐已知分类，未知输入不成为加载更多区块", async () => {
 	let loads = 0;
@@ -229,7 +230,7 @@ test("校准后的分页仅补齐已知分类，未知输入不成为加载更�
 	expect(more.getAttribute("style")).toContain("width:7.5%");
 	await act(() => more.click());
 	expect(loads).toBe(1);
-	expect(container.textContent).toContain("contextComposition.categories.assistant · 8K · 5.0%");
+	expect(container.textContent).toContain("contextComposition.categories.assistant · ≈8K · 5.0%");
 	await render(data, onLoadMore, usage);
 	expect(bar().querySelectorAll("button").length).toBe(3);
 	expect(bar().querySelector("button")?.getAttribute("style")).toContain("width:2.5%");
@@ -261,14 +262,14 @@ test("已知系统和工具只占完整输入的一部分，剩余背景留空�
 	await render(partial, undefined, usage);
 	const buttons = bar().querySelectorAll("button");
 	expect(buttons.length).toBe(2);
-	expect(buttons[0]?.getAttribute("aria-label")).toContain("system · 32K · 20.0%");
+	expect(buttons[0]?.getAttribute("aria-label")).toContain("system · ≈32K · 20.0%");
 	expect(buttons[0]?.getAttribute("style")).toContain("width:20%");
-	expect(buttons[1]?.getAttribute("aria-label")).toContain("toolDefinition · 8K · 5.0%");
+	expect(buttons[1]?.getAttribute("aria-label")).toContain("toolDefinition · ≈8K · 5.0%");
 	expect(buttons[1]?.getAttribute("style")).toContain("width:5%");
 	expect(bar().getAttribute("style")).toContain("background:var(--mantine-color-default-hover)");
-	expect(container.textContent).toContain("contextComposition.categories.system · 32K · 20.0%");
+	expect(container.textContent).toContain("contextComposition.categories.system · ≈32K · 20.0%");
 	expect(container.textContent).toContain(
-		"contextComposition.categories.toolDefinition · 8K · 5.0%",
+		"contextComposition.categories.toolDefinition · ≈8K · 5.0%",
 	);
 	await act(() => {
 		(buttons[0] as HTMLElement).click();
@@ -302,7 +303,7 @@ test("工具定义作为独立分类", async () => {
 		segments: values,
 		totals: groupContextSegments(values),
 	});
-	expect(container.textContent).toContain("contextComposition.categories.toolDefinition · 128K");
+	expect(container.textContent).toContain("contextComposition.categories.toolDefinition · ≈128K");
 	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("80.0%");
 });
 test("跨世代分页不会混合展示旧新缓存", async () => {
@@ -368,7 +369,10 @@ test("完整字符分母校准，不将少量已缓存字符inflate为整桶", a
 	};
 	await act(() =>
 		root.render(
-			createElement(ContextCompositionView, { data: { ...data, usage }, snapshot: calibrated }),
+			createElement(ContextCompositionView, {
+				data: { ...data, usage },
+				snapshot: calibrated,
+			}),
 		),
 	);
 	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("25.5K · 5.0%");
@@ -378,38 +382,49 @@ test("完整字符分母校准，不将少量已缓存字符inflate为整桶", a
 	);
 });
 
-test("刷新旧响应和跨世代不能校准新请求，估计有值不显示横杠", async () => {
-	const old = snapshot();
-	for (const live of [
-		{ ...snapshot(926_000, 4_000), requestId: "new" },
-		snapshot(926_000, 4_000, "new-generation"),
-		{ ...snapshot(926_000, 4_000), inputCharacters: null },
-		snapshot(926_000, 0),
+test("API匹配快照作后备，外部其他请求或不匹配分类不污染总量", async () => {
+	const current = snapshot(160_000, 4_000);
+	for (const external of [
+		{ ...snapshot(926_000, 8_000), requestId: "old-request" },
+		snapshot(926_000, 8_000, "old-generation"),
+		{ ...snapshot(926_000), inputCharacters: null },
 	]) {
 		await act(() =>
 			root.render(
-				createElement(ContextCompositionView, { data: { ...data, usage: old }, snapshot: live }),
+				createElement(ContextCompositionView, {
+					data: { ...data, usage: current },
+					snapshot: external,
+				}),
 			),
 		);
-		expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain(" · — · 50.0%");
-		expect(bar().querySelector("button")?.getAttribute("style")).toContain("width:50%");
+		expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("≈8K · 5.0%");
+		expect(bar().querySelector("button")?.getAttribute("style")).toContain("width:5%");
 		expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
-			"~926K",
+			"~160K",
+		);
+		expect(container.querySelector('[data-testid="context-composition-estimate-hint"]')).toBeNull();
+	}
+});
+
+test("不匹配分类、缺完整输入或缺generation时按历史字符估算", async () => {
+	for (const value of [
+		{ ...data, usage: snapshot(926_000, 4_000, "other") },
+		{ ...data, generation: null, usage: snapshot(926_000, 4_000) },
+		{ ...data, usage: { ...snapshot(926_000), inputCharacters: null } },
+		{ ...data, usage: { ...snapshot(926_000), composition: null } },
+		{ ...data, usage: snapshot(926_000, 0) },
+	]) {
+		await act(() => root.render(createElement(ContextCompositionView, { data: value })));
+		expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("≈463K · 50.0%");
+		expect(bar().querySelector("button")?.getAttribute("style")).toContain("width:50%");
+		expect(
+			container.querySelector('[data-testid="context-composition-estimate-hint"]')?.textContent,
+		).toBe("contextComposition.historyEstimateHint");
+		await act(() => (bar().querySelector("button") as HTMLElement).click());
+		expect(container.querySelector('[role="status"]')?.textContent).toContain(
+			"contextComposition.historyEstimateHint",
 		);
 	}
-	const estimated = { ...snapshot(926_000), source: "estimate" as const };
-	await act(() =>
-		root.render(
-			createElement(ContextCompositionView, {
-				data: { ...data, usage: estimated },
-				snapshot: estimated,
-			}),
-		),
-	);
-	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
-		"~926K",
-	);
-	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("463K · 50.0%");
 });
 
 test("live有full chars但API尚无匹配usage时，不为旧条图跨请求校准", async () => {
@@ -418,17 +433,23 @@ test("live有full chars但API尚无匹配usage时，不为旧条图跨请求校�
 			createElement(ContextCompositionView, { data, snapshot: snapshot(926_000, 4_000) }),
 		),
 	);
-	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain(" · — · 50.0%");
+	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain(" · ≈463K · 50.0%");
+	expect(
+		container.querySelector('[data-testid="context-composition-estimate-hint"]')?.textContent,
+	).toBe("contextComposition.historyEstimateHint");
 	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
 		"~926K",
 	);
 });
 
-test("遗留缺完整字符分母不使用缓存总数回退", async () => {
+test("遗留只有总量时按历史分类字符占比回退", async () => {
 	await act(() =>
 		root.render(createElement(ContextCompositionView, { data, totalTokens: 160_000 })),
 	);
-	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain(" · — · 50.0%");
+	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain(" · ≈80K · 50.0%");
+	expect(
+		container.querySelector('[data-testid="context-composition-estimate-hint"]')?.textContent,
+	).toBe("contextComposition.historyEstimateHint");
 });
 
 test("用当前上游总量乘字符占比，并统一显示K/M/B", () => {
@@ -438,8 +459,89 @@ test("用当前上游总量乘字符占比，并统一显示K/M/B", () => {
 	expect(formatContextTokens(2_500_000_000)).toBe("2.5B");
 	expect(formatContextTokens(12)).toBe("12");
 	expect(formatContextTokens(0)).toBe("0");
-	expect(contextTokenShare(0, 0, 1_000)).toBe(0);
+	expect(contextTokenShare(0, 0, 1_000)).toBeNull();
+	expect(contextTokenShare(100, 400, 0)).toBe(0);
 });
+test("NaN或缺少总量时分类未知，不用字符数伪造token", async () => {
+	for (const totalTokens of [undefined, null, Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+		await act(() => root.render(createElement(ContextCompositionView, { data, totalTokens })));
+		expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain(" · — · 50.0%");
+		expect(container.querySelector('[data-testid="context-composition-estimate-hint"]')).toBeNull();
+		expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
+			"—",
+		);
+	}
+});
+
+test("零占用仍是有效总量，分类估算为零", async () => {
+	await act(() => root.render(createElement(ContextCompositionView, { data, totalTokens: 0 })));
+	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
+		"~0",
+	);
+	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("≈0 · 50.0%");
+});
+
+test("API无占用时使用同请求外部快照校准，其他请求只作历史估算", async () => {
+	const api = { ...snapshot(160_000, 4_000), occupiedTokens: null };
+	const live = snapshot(926_000, 4_000);
+	for (const [external, label, hint] of [
+		[live, "≈46.3K · 5.0%", "contextComposition.calibratedHint"],
+		[
+			{ ...live, requestId: "different" },
+			"≈463K · 50.0%",
+			"contextComposition.historyEstimateHint",
+		],
+	] as const) {
+		await act(() =>
+			root.render(
+				createElement(ContextCompositionView, {
+					data: { ...data, usage: api },
+					snapshot: external,
+				}),
+			),
+		);
+		expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
+			"~926K",
+		);
+		expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain(label);
+		expect(container.querySelector("[data-tooltip]")?.getAttribute("data-tooltip")).toContain(hint);
+	}
+	await act(() =>
+		root.render(
+			createElement(ContextCompositionView, {
+				data: { ...data, usage: api },
+				totalTokens: 160_000,
+			}),
+		),
+	);
+	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("≈80K · 50.0%");
+});
+
+test("无有效分类字符分母时保留总量但分类未知", async () => {
+	for (const totalChars of [0, Number.NaN]) {
+		await act(() =>
+			root.render(
+				createElement(ContextCompositionView, {
+					data: { ...data, totalChars },
+					totalTokens: 160_000,
+				}),
+			),
+		);
+		expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain(" · — · 0.0%");
+		expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
+			"~160K",
+		);
+	}
+});
+
+test("分类tooltip明确同请求字符估算，并非实测分类token", async () => {
+	await render();
+	expect(container.querySelector("[data-tooltip]")?.getAttribute("data-tooltip")).toContain(
+		"contextComposition.calibratedHint",
+	);
+	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("≈80K");
+});
+
 test("没有上游token时只显示横杠，不回退显示字符数", async () => {
 	await act(() => root.render(createElement(ContextCompositionView, { data, totalTokens: null })));
 	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
@@ -452,7 +554,7 @@ test("没有上游token时只显示横杠，不回退显示字符数", async () 
 		expect(contextTokenShare(100, 400, invalid)).toBeNull();
 	}
 });
-test("占用和完整字符分母动态更新时，已选分类同步更新且只显示一个波浪号", async () => {
+test("同请求WS占用与完整字符分母优先更新，已选分类同步更新", async () => {
 	await render(data, undefined, snapshot(160_000, 4_000));
 	await act(() => {
 		(bar().querySelector("button") as HTMLElement).click();
@@ -479,7 +581,7 @@ test("占用和完整字符分母动态更新时，已选分类同步更新且�
 	expect(container.querySelector('[role="status"]')?.textContent).toContain("50K · 2.5%");
 	expect(bar().querySelector("button")?.getAttribute("aria-label")).toContain("50K · 2.5%");
 	expect(bar().querySelector("button")?.getAttribute("style")).toContain("width:2.5%");
-	expect(container.textContent).toContain("contextComposition.categories.assistant · 50K · 2.5%");
+	expect(container.textContent).toContain("contextComposition.categories.assistant · ≈50K · 2.5%");
 	expect(container.querySelector('[data-testid="context-composition-total"]')?.textContent).toBe(
 		"~2M",
 	);

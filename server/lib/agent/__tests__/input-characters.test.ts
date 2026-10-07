@@ -3,6 +3,137 @@ import { logger } from "../../logger";
 import { countInputCharacters, reportInputCharacters } from "../input-characters";
 
 describe("complete logical input characters", () => {
+	test("composition follows final wire text and protocol ownership in traversal order", async () => {
+		const wireText = 'line\n"quoted"😀';
+		const call = { name: "tool", arguments: { _text: wireText } };
+		const result = { _text: wireText };
+		const tool = { name: "tool", parameters: { type: "object" } };
+		const counts = await countInputCharacters(
+			{
+				instructions: "fixed\n\nhistory",
+				input: [
+					{ role: "user", content: wireText },
+					{ type: "function_call", ...call },
+					{ type: "function_call_output", output: result },
+					{
+						type: "reasoning",
+						summary: [{ type: "summary_text", text: "kept" }],
+						encrypted_content: "excluded",
+					},
+					{ role: "assistant", content: "reply" },
+					{ role: "system", content: "old" },
+					{ type: "input_text", text: "unknown owner" },
+				],
+				tools: [tool],
+			},
+			undefined,
+			{ includeComposition: true, instructionsFixedChars: 5 },
+		);
+		expect(counts?.compositionSegments).toEqual([
+			{ category: "system", chars: 5 },
+			{ category: "other", chars: "\n\nhistory".length },
+			{ category: "user", chars: wireText.length },
+			{ category: "toolCall", chars: JSON.stringify(call).length },
+			{ category: "toolResult", chars: JSON.stringify(result).length },
+			{ category: "assistant", chars: "keptreply".length },
+			{ category: "other", chars: "oldunknown owner".length },
+			{ category: "toolDefinition", chars: JSON.stringify(tool).length },
+		]);
+		expect(counts?.compositionSegments?.reduce((sum, item) => sum + item.chars, 0)).toBe(
+			counts?.totalChars,
+		);
+	});
+
+	test("Anthropic and Gemini tool blocks override their enclosing wire role", async () => {
+		for (const body of [
+			{
+				system: "sys",
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{ type: "thinking", thinking: "kept", signature: "excluded" },
+							{ type: "tool_use", name: "tool", input: { _text: 'a\n"b' } },
+						],
+					},
+					{
+						role: "user",
+						content: [
+							{ type: "tool_result", content: "result" },
+							{ type: "text", text: "user" },
+						],
+					},
+				],
+			},
+			{
+				systemInstruction: { parts: [{ text: "sys" }] },
+				contents: [
+					{
+						role: "model",
+						parts: [
+							{ text: "kept", thought: true, thoughtSignature: "excluded" },
+							{ functionCall: { name: "tool", args: { _text: 'a\n"b' } } },
+						],
+					},
+					{
+						role: "user",
+						parts: [
+							{
+								functionResponse: {
+									name: "tool",
+									response: { _text: "result" },
+									parts: [{ text: "native result" }],
+								},
+							},
+							{ text: "user" },
+						],
+					},
+				],
+			},
+		]) {
+			const counts = await countInputCharacters(body, undefined, { includeComposition: true });
+			expect(counts?.compositionSegments?.map((item) => item.category)).toEqual([
+				"system",
+				"assistant",
+				"toolCall",
+				"toolResult",
+				"user",
+			]);
+			expect(counts?.compositionSegments?.reduce((sum, item) => sum + item.chars, 0)).toBe(
+				counts?.totalChars,
+			);
+			expect(counts?.compositionSegments?.[1].chars).toBe(4);
+		}
+	});
+
+	test("composition hard cap discards only classification and does not publish partial counts", async () => {
+		for (const size of [2048, 2049]) {
+			const messages = Array.from({ length: size }, (_, index) => ({
+				role: index % 2 ? "assistant" : "user",
+				content: "x",
+			}));
+			const counts = await countInputCharacters({ messages }, undefined, {
+				includeComposition: true,
+				maxMilliseconds: 2000,
+			});
+			expect(counts?.totalChars).toBe(size);
+			if (size === 2048) expect(counts?.compositionSegments).toHaveLength(size);
+			else expect(counts?.compositionSegments).toBeNull();
+		}
+		expect(
+			await countInputCharacters(
+				{
+					messages: [
+						{ role: "user", content: "valid" },
+						{ role: "assistant", content: [{ type: "unknown_new_type", text: "not counted" }] },
+					],
+				},
+				undefined,
+				{ includeComposition: true },
+			),
+		).toBeNull();
+	});
+
 	test("Anthropic counts UTF-16 text, schema/calls/results but not binary or signatures", async () => {
 		const args = {
 			signature: "legal",
@@ -276,7 +407,14 @@ describe("complete logical input characters", () => {
 		try {
 			await reportInputCharacters(params, { input: "text" }, { maxMilliseconds: 1000 });
 			await reportInputCharacters(params, { input: "text" }, { maxMilliseconds: 1000 });
-			expect(snapshots).toEqual(Array(2).fill({ totalChars: 4, systemChars: 0, toolsChars: 0 }));
+			expect(snapshots).toEqual(
+				Array(2).fill({
+					totalChars: 4,
+					systemChars: 0,
+					toolsChars: 0,
+					compositionSegments: [{ category: "other", chars: 4 }],
+				}),
+			);
 			expect(warn).toHaveBeenCalledTimes(1);
 			expect(warn.mock.calls[0]?.[1]?.reason).toBe("slow");
 			expect(warn.mock.calls[0]?.[1]?.durationMs).toBeGreaterThanOrEqual(25);
@@ -435,13 +573,45 @@ describe("complete logical input characters", () => {
 				snapshots.push(value);
 			},
 		};
-		await reportInputCharacters(params, { input: "first" });
+		await reportInputCharacters(params, { input: "first" }, { includeComposition: false });
 		await reportInputCharacters(params, { input: "second" });
 		expect(snapshots).toEqual([
-			{ totalChars: 5, systemChars: 0, toolsChars: 0 },
-			{ totalChars: 6, systemChars: 0, toolsChars: 0 },
+			{
+				totalChars: 5,
+				systemChars: 0,
+				toolsChars: 0,
+				compositionSegments: [{ category: "other", chars: 5 }],
+			},
+			{
+				totalChars: 6,
+				systemChars: 0,
+				toolsChars: 0,
+				compositionSegments: [{ category: "other", chars: 6 }],
+			},
 		]);
 	});
+});
+
+test("report preserves complete totals but marks classification unavailable above the hard cap", async () => {
+	const snapshots: unknown[] = [];
+	await reportInputCharacters(
+		{
+			signal: new AbortController().signal,
+			onInputCharacters: (counts) => {
+				snapshots.push(counts);
+			},
+		},
+		{
+			messages: Array.from({ length: 2049 }, (_, index) => ({
+				role: index % 2 ? "assistant" : "user",
+				content: "x",
+			})),
+		},
+		{ maxMilliseconds: 2000 },
+	);
+	expect(snapshots).toEqual([
+		{ totalChars: 2049, systemChars: 0, toolsChars: 0, compositionSegments: null },
+	]);
 });
 
 test("report awaits asynchronous numeric preparation before returning to provider transport", async () => {

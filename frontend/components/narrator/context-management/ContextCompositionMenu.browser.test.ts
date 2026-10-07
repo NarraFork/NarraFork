@@ -158,7 +158,7 @@ const data: ContextComposition = {
 					expect(layout.noCharacters).toBe(true);
 					expect(layout.oneWave).toBe(true);
 					expect(layout.headerTokens).toBe("~400K");
-					expect(layout.firstTokens).toContain("100K · 25.0%");
+					expect(layout.firstTokens).toContain("≈100K · 25.0%");
 					const sequenceId = await page.$eval('input[value="sequence"]', (input) => input.id);
 					await page.click(`label[for="${sequenceId}"]`);
 					await page.waitForFunction(
@@ -169,6 +169,11 @@ const data: ContextComposition = {
 					await page.focus('[data-testid="context-composition-bar"] button');
 					await page.keyboard.press("Enter");
 					await page.waitForSelector('[role="status"]', { visible: true, timeout: 5000 });
+					const selection = await page.$eval('[role="status"]', (node) => node.textContent);
+					expect(selection).toContain("≈100K");
+					expect(selection).toContain(
+						language === "zh-CN" ? "并非各分类的实测 token" : "not measured per category",
+					);
 					await page.waitForSelector('[data-testid="context-composition-menu"]', { visible: true });
 					await page.waitForFunction(
 						() =>
@@ -228,10 +233,10 @@ const data: ContextComposition = {
 						);
 						expect(calibratedBar.firstTokens).toContain(
 							source === "upstream"
-								? "23.2K · 2.5%"
+								? "≈23.2K · 2.5%"
 								: source === "usage"
-									? "12.8K · 2.5%"
-									: "10K · 2.5%",
+									? "≈12.8K · 2.5%"
+									: "≈10K · 2.5%",
 						);
 						expect(calibratedBar.firstWidth).toBeCloseTo(0.025, 3);
 						expect(calibratedBar.filled).toBeCloseTo(0.1, 3);

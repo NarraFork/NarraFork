@@ -1,4 +1,9 @@
-import type { ContextInputCharacters } from "@shared/context-usage";
+import type { ContextCategory, ContextSegment } from "@shared/context-composition";
+import {
+	type ContextInputCharacters,
+	MAX_INPUT_COMPOSITION_SEGMENTS,
+	readInputCompositionSegments,
+} from "@shared/context-usage";
 import { logger } from "../logger";
 
 type CountFailure =
@@ -24,6 +29,8 @@ export interface InputCharacterBudget {
 }
 
 export interface InputCharacterOptions extends InputCharacterBudget {
+	/** Collect bounded final-wire classification; public counting defaults remain unchanged. */
+	includeComposition?: boolean;
 	/** Completions only: first messages[] entry is the known injected runtime prefix. */
 	firstMessageIsRuntimeSystem?: boolean;
 	/** Responses may concatenate historical system turns into instructions; only this prefix is fixed. */
@@ -93,13 +100,22 @@ async function measureInputCharacters(
 			check();
 		}
 	};
-	const add = (length: number, category: "system" | "tools" | "content") => {
+	let compositionSegments: ContextSegment[] | undefined = budget.includeComposition
+		? []
+		: undefined;
+	const add = (length: number, category: ContextCategory) => {
 		totalChars += length;
 		if (totalChars > maxChars) fail("character_budget");
 		if (category === "system") systemChars += length;
-		if (category === "tools") toolsChars += length;
+		if (category === "toolDefinition") toolsChars += length;
+		if (!length || !compositionSegments) return;
+		const previous = compositionSegments.at(-1);
+		if (previous?.category === category) previous.chars += length;
+		else if (compositionSegments.length < MAX_INPUT_COMPOSITION_SEGMENTS)
+			compositionSegments.push({ category, chars: length });
+		else compositionSegments = undefined;
 	};
-	const text = (value: unknown, category: "system" | "content") => {
+	const text = (value: unknown, category: ContextCategory) => {
 		check();
 		if (typeof value === "string") add(value.length, category);
 	};
@@ -124,7 +140,7 @@ async function measureInputCharacters(
 		}
 		return length;
 	};
-	const json = async (value: unknown, category: "tools" | "content", depth = 0): Promise<void> => {
+	const json = async (value: unknown, category: ContextCategory, depth = 0): Promise<void> => {
 		await tick();
 		if (depth > 128) fail("depth_budget");
 		if (typeof value === "string") {
@@ -161,11 +177,7 @@ async function measureInputCharacters(
 		}
 		ancestors.delete(value);
 	};
-	const content = async (
-		value: unknown,
-		category: "system" | "content",
-		depth = 0,
-	): Promise<void> => {
+	const content = async (value: unknown, category: ContextCategory, depth = 0): Promise<void> => {
 		await tick();
 		if (depth > 128) fail("depth_budget");
 		if (typeof value === "string") {
@@ -179,6 +191,19 @@ async function measureInputCharacters(
 		if (value === undefined || value === null) return;
 		if (typeof value !== "object") fail("unsupported_input");
 		const part = object(value);
+		if (category !== "system") {
+			if (part.role === "user") category = "user";
+			else if (part.role === "assistant" || part.role === "model") category = "assistant";
+			else if (part.role === "tool" || part.role === "function") category = "toolResult";
+			else if (part.role) category = "other";
+			if (
+				part.type === "reasoning" ||
+				part.type === "thinking" ||
+				part.type === "reasoning_text" ||
+				part.type === "thought"
+			)
+				category = "assistant";
+		}
 		// Explicit protocol discriminants. Never inspect image/data/signature/encrypted blobs.
 		switch (part.type) {
 			case "text":
@@ -201,11 +226,11 @@ async function measureInputCharacters(
 				for (const field of ["type", "query", "queries", "url", "pattern"]) {
 					if (action[field] !== undefined) selected[field] = action[field];
 				}
-				await json(selected, "content");
+				await json(selected, "toolCall");
 				return;
 			}
 			case "image_generation_call":
-				text(part.revised_prompt, category);
+				text(part.revised_prompt, "toolCall");
 				return;
 			case "refusal":
 				text(part.refusal, category);
@@ -216,28 +241,32 @@ async function measureInputCharacters(
 			case "redacted_thinking":
 				return;
 			case "tool_use":
-				await json({ name: part.name, input: part.input }, "content");
+				await json({ name: part.name, input: part.input }, "toolCall");
 				return;
 			case "function_call":
-				await json({ name: part.name, arguments: part.arguments }, "content");
+				await json({ name: part.name, arguments: part.arguments }, "toolCall");
 				return;
 			case "function_call_output":
 				if (part.output && typeof part.output === "object" && !Array.isArray(part.output)) {
-					await json(part.output, "content");
-				} else await content(part.output, category, depth + 1);
+					await json(part.output, "toolResult");
+				} else await content(part.output, "toolResult", depth + 1);
 				return;
 			case "tool_result":
+				await content(part.content, "toolResult", depth + 1);
+				return;
 			case "user_input":
+				await content(part.content, "user", depth + 1);
+				return;
 			case "model_output":
-				await content(part.content, category, depth + 1);
+				await content(part.content, "assistant", depth + 1);
 				return;
 			case "thought":
 				await content(part.summary, category, depth + 1);
 				return;
 			case "function_result":
 				if (typeof part.result === "string" || Array.isArray(part.result)) {
-					await content(part.result, category, depth + 1);
-				} else await json(part.result, "content");
+					await content(part.result, "toolResult", depth + 1);
+				} else await json(part.result, "toolResult");
 				return;
 		}
 		if (part.role || part.type === "message") {
@@ -249,7 +278,7 @@ async function measureInputCharacters(
 				for (const call of part.tool_calls) {
 					await tick();
 					const fn = object(object(call).function);
-					await json({ name: fn.name, arguments: fn.arguments }, "content");
+					await json({ name: fn.name, arguments: fn.arguments }, "toolCall");
 				}
 			}
 			text(part.reasoning_content, category);
@@ -271,12 +300,15 @@ async function measureInputCharacters(
 		)
 			fail("unsupported_input");
 		text(part.text, category);
-		if (part.functionCall) await json(part.functionCall, "content");
+		if (part.functionCall) await json(part.functionCall, "toolCall");
 		if (part.functionResponse) {
 			const response = object(part.functionResponse);
 			// response is arbitrary user JSON; only sibling native parts are multimodal protocol.
-			await json({ name: response.name, id: response.id, response: response.response }, "content");
-			await content(response.parts, category, depth + 1);
+			await json(
+				{ name: response.name, id: response.id, response: response.response },
+				"toolResult",
+			);
+			await content(response.parts, "toolResult", depth + 1);
 		}
 		if (part.parts) await content(part.parts, category, depth + 1);
 	};
@@ -314,11 +346,11 @@ async function measureInputCharacters(
 		if (request.previous_interaction_id != null) fail("upstream_only_history");
 		text(request.system_instruction, "system");
 		if (typeof request.instructions === "string") {
-			text(request.instructions, "content");
 			const fixed = budget.instructionsFixedChars ?? request.instructions.length;
 			if (!Number.isSafeInteger(fixed) || fixed < 0 || fixed > request.instructions.length)
 				fail("unsupported_input");
-			systemChars += fixed;
+			add(fixed, "system");
+			add(request.instructions.length - fixed, "other");
 		}
 		await content(request.system, "system");
 		await content(request.systemInstruction, "system");
@@ -329,10 +361,10 @@ async function measureInputCharacters(
 					budget.firstMessageIsRuntimeSystem &&
 					index === 0 &&
 					(role === "system" || role === "developer");
-				await content(message, fixed ? "system" : "content");
+				await content(message, fixed ? "system" : "other");
 			}
 		}
-		for (const field of ["input", "contents"]) await content(request[field], "content");
+		for (const field of ["input", "contents"]) await content(request[field], "other");
 		if (request.tools) {
 			// Tool declarations are model inputs; only transport/cache annotations are omitted.
 			if (!Array.isArray(request.tools)) fail("unsupported_input");
@@ -384,11 +416,21 @@ async function measureInputCharacters(
 					)
 						fail("unsupported_input");
 				}
-				await json(selected, "tools");
+				await json(selected, "toolDefinition");
 			}
 		}
 		check();
-		return { totalChars, systemChars, toolsChars };
+		const completeSegments = compositionSegments
+			? readInputCompositionSegments(compositionSegments, totalChars)
+			: null;
+		check();
+		return {
+			totalChars,
+			systemChars,
+			toolsChars,
+			// Explicit null marks final-wire classification unavailable, not legacy provenance.
+			...(budget.includeComposition ? { compositionSegments: completeSegments } : {}),
+		};
 	} catch {
 		diagnostic.reason ??= "unsupported_input";
 		return null;
@@ -407,7 +449,7 @@ export async function reportInputCharacters(
 	if (!params.onInputCharacters) return;
 	const diagnostic: CountDiagnostic = {};
 	const startedAt = performance.now();
-	const options: InputCharacterOptions = { ...budget };
+	const options: InputCharacterOptions = { ...budget, includeComposition: true };
 	const request = object(body);
 	const first = params.history?.[0];
 	const synthetic = !!first && typeof first === "object" && runtimeSystemMessages.has(first);

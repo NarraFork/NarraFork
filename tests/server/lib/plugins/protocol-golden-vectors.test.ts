@@ -18,12 +18,110 @@ import {
 	pluginToHostNotificationSchema,
 	pluginToHostRequestSchema,
 	providerStreamAckSchema,
+	providerStreamEventSchema,
 	RPC_CANCEL_REQUEST_METHOD,
 	RPC_CREDIT_METHOD,
 	rpcCancelRequestNotificationSchema,
 	rpcCreditNotificationSchema,
 	SNAPSHOT_LIVE_UNAVAILABLE,
 } from "@server/lib/plugins/protocol";
+import type { ContextSegment } from "@shared/context-composition";
+
+describe("Provider final-input composition wire metadata", () => {
+	const counts = { totalChars: 120, systemChars: 20, toolsChars: 40 };
+	const segments = [
+		{ category: "system", chars: 15 },
+		{ category: "summary", chars: 5 },
+		{ category: "toolDefinition", chars: 40 },
+		{ category: "user", chars: 60 },
+	] satisfies ContextSegment[];
+	function parseSegments(compositionSegments: unknown) {
+		return providerStreamEventSchema.safeParse({
+			type: "request_started",
+			inputCharacters: { ...counts, compositionSegments },
+		});
+	}
+
+	test("preserves classified counts and supports legacy absent or null counts", () => {
+		const result = parseSegments(segments);
+		expect(result.success).toBe(true);
+		if (result.success) {
+			expect(result.data).toEqual({
+				type: "request_started",
+				inputCharacters: { ...counts, compositionSegments: segments },
+			});
+		}
+		for (const inputCharacters of [counts, null, undefined]) {
+			expect(
+				providerStreamEventSchema.safeParse({ type: "request_started", inputCharacters }).success,
+			).toBe(true);
+		}
+	});
+
+	test("preserves explicit unknown classification instead of treating it as legacy absent", () => {
+		const result = parseSegments(null);
+		expect(result.success).toBe(true);
+		if (result.success) {
+			expect(result.data).toEqual({
+				type: "request_started",
+				inputCharacters: { ...counts, compositionSegments: null },
+			});
+		}
+	});
+
+	test("rejects invalid categories, noninteger counts, bodies, and classification IDs", () => {
+		for (const invalid of [
+			[{ category: "secret", chars: 120 }],
+			[{ category: "user", chars: Infinity }],
+			[{ category: "user", chars: NaN }],
+			[{ category: "user", chars: -1 }],
+			[{ category: "user", chars: 120.5 }],
+			[{ category: "user", chars: Number.MAX_SAFE_INTEGER + 1 }],
+			[{ ...segments[0], body: "secret request text" }, ...segments.slice(1)],
+			[{ ...segments[0], toolUseId: "private-id" }, ...segments.slice(1)],
+			{},
+		]) {
+			expect(parseSegments(invalid).success).toBe(false);
+		}
+	});
+
+	test("rejects denominator mismatch and fixed system/tool category miscalibration", () => {
+		for (const invalid of [
+			[],
+			[...segments.slice(0, 3), { category: "user", chars: 59 }],
+			[...segments.slice(0, 3), { category: "user", chars: 61 }],
+			[{ category: "user", chars: 120 }],
+			[
+				{ category: "system", chars: 40 },
+				{ category: "toolDefinition", chars: 20 },
+				{ category: "user", chars: 60 },
+			],
+			[
+				{ category: "summary", chars: 21 },
+				{ category: "toolDefinition", chars: 40 },
+				{ category: "user", chars: 59 },
+			],
+		]) {
+			expect(parseSegments(invalid).success).toBe(false);
+		}
+	});
+
+	test("accepts the segment ceiling and rejects oversized input without entry traversal", () => {
+		const bounded = [
+			...segments,
+			...Array.from({ length: 2048 - segments.length }, () => ({ category: "other", chars: 0 })),
+		];
+		expect(parseSegments(bounded).success).toBe(true);
+		const oversized = new Array(2049);
+		Object.defineProperty(oversized, 0, {
+			get: () => {
+				throw new Error("Oversized classifications must not be traversed");
+			},
+		});
+		expect(parseSegments(oversized).success).toBe(false);
+		expect(parseSegments([...bounded, { category: "other", chars: 0 }]).success).toBe(false);
+	});
+});
 
 describe("Plugin JSON payload validation", () => {
 	test("accepts long provider histories and large individual text blocks", () => {

@@ -51,3 +51,32 @@ test("snapshot bounds apply after allowlisting, never after copying a giant fore
 		}),
 	).toEqual(snapshot);
 });
+
+test("transient final classification is numeric, conserved and excluded from snapshots", () => {
+	const counts = {
+		totalChars: 100,
+		systemChars: 10,
+		toolsChars: 20,
+		compositionSegments: [
+			{ category: "system" as const, chars: 10 },
+			{ category: "toolDefinition" as const, chars: 20 },
+			{ category: "user" as const, chars: 70 },
+		],
+	};
+	expect(validInputCharacters(counts)?.compositionSegments).toEqual(counts.compositionSegments);
+	expect(boundedContextSnapshot({ ...snapshot, inputCharacters: counts })?.inputCharacters).toEqual(
+		{ totalChars: 100, systemChars: 10, toolsChars: 20 },
+	);
+	for (const segments of [
+		[{ category: "user" as const, chars: 100 }],
+		[{ category: "system" as const, chars: 101 }],
+		Array.from({ length: 2049 }, () => ({ category: "user" as const, chars: 0 })),
+	]) {
+		expect(
+			validInputCharacters({ ...counts, compositionSegments: segments })?.compositionSegments,
+		).toBeNull();
+	}
+	expect(
+		validInputCharacters({ ...counts, compositionSegments: null })?.compositionSegments,
+	).toBeNull();
+});

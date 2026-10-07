@@ -38,6 +38,8 @@
 		"byCategory": "分类",
 		"bySequence": "顺序",
 		"characters": "字符",
+		"calibratedHint": "分类 token 按同一请求完整输入的字符占比分摊估算，并非各分类的实测 token。",
+		"historyEstimateHint": "分类 token 按历史字符占比与上下文占用总量估算，并非同一请求的实测分类用量。",
 		"refresh": "刷新",
 		"retry": "重试",
 		"loadMore": "加载更多",

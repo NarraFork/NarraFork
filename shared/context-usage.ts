@@ -9,6 +9,38 @@ export interface ContextInputCharacters {
 	totalChars: number;
 	systemChars: number;
 	toolsChars: number;
+	/** Transient final-request classification; snapshots retain only its paginated pin. */
+	compositionSegments?: ContextSegment[] | null;
+}
+
+export const MAX_INPUT_COMPOSITION_SEGMENTS = 2048;
+
+/** Allowlist bounded numeric metadata and require exact denominator conservation. */
+export function readInputCompositionSegments(
+	value: unknown,
+	totalChars: number,
+): ContextSegment[] | null {
+	if (!Array.isArray(value) || value.length > MAX_INPUT_COMPOSITION_SEGMENTS) return null;
+	const segments: ContextSegment[] = [];
+	let sum = 0;
+	for (const item of value) {
+		const segment = record(item);
+		if (
+			!segment ||
+			typeof segment.category !== "string" ||
+			!CONTEXT_CATEGORIES.includes(segment.category as ContextSegment["category"]) ||
+			!characterCount(segment.chars)
+		)
+			return null;
+		sum += segment.chars;
+		if (!Number.isSafeInteger(sum) || sum > totalChars) return null;
+		if (segment.chars > 0)
+			segments.push({
+				category: segment.category as ContextSegment["category"],
+				chars: segment.chars,
+			});
+	}
+	return sum === totalChars ? segments : null;
 }
 
 export type ContextUsageSource = "upstream" | "usage" | "estimate";

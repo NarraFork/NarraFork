@@ -471,7 +471,9 @@ test("real Anthropic formatter and final body callback project legacy fixed coun
 			const counts = received as ContextInputCharacters | null;
 			expect(counts).not.toBeNull();
 			if (!counts) throw new Error("final provider callback missing");
-			expect(await countInputCharacters(sent)).toEqual(counts);
+			expect(await countInputCharacters(sent, undefined, { includeComposition: true })).toEqual(
+				counts,
+			);
 			expect((await countInputCharacters({ tools }))?.toolsChars).toBe(counts.toolsChars);
 			expect(counts.toolsChars).not.toBe(oldToolsChars);
 			const projected = await service.get("n");
@@ -498,9 +500,9 @@ test("real Anthropic formatter and final body callback project legacy fixed coun
 				cursor = next.nextCursor;
 			}
 			expect(all.reduce((sum, item) => sum + item.chars, 0)).toBe(projected.totalChars);
+			// Adjacent wire text is coalesced; the final input, not DB rows, owns the pin.
 			expect(all.filter((item) => item.category === "user")).toEqual([
-				{ category: "user", chars: 5 },
-				{ category: "user", chars: 7 },
+				{ category: "user", chars: 12 },
 			]);
 		}
 	} finally {
@@ -1291,4 +1293,163 @@ test("unrelated in-flight shared-holder fanout cannot block an already warm requ
 	);
 	expect(pin?.totalChars).toBe(29);
 	await fanout;
+});
+
+test("final request classification pins independently of oversized historical JSON counts", async () => {
+	message("oversized", 1, [{ category: "toolResult", chars: 9000 }]);
+	database.run("UPDATE narrators SET context_system_chars=5000 WHERE id='n'");
+	const counts: ContextInputCharacters = {
+		totalChars: 30,
+		systemChars: 10,
+		toolsChars: 5,
+		compositionSegments: [
+			{ category: "system", chars: 10 },
+			{ category: "toolDefinition", chars: 5 },
+			{ category: "user", chars: 3 },
+			{ category: "toolResult", chars: 12 },
+		],
+	};
+	const pin = await service.freezeForRequest("n", counts, "wire-request", "2026-10-07T00:00:00Z");
+	expect(pin?.totalChars).toBe(30);
+	const response = await service.get("n");
+	expect(response.generation).toBe(pin?.generation ?? null);
+	expect(response.segments).toEqual(counts.compositionSegments ?? []);
+	expect(response.usage?.requestId).toBe("wire-request");
+	expect(response.usage?.inputCharacters).toEqual({
+		totalChars: 30,
+		systemChars: 10,
+		toolsChars: 5,
+	});
+	await service.settled();
+	expect((await service.get("n")).segments).toEqual(counts.compositionSegments ?? []);
+});
+
+test("final request pages survive historical rebuilds and new pins release old pages", async () => {
+	const segments: NonNullable<ContextInputCharacters["compositionSegments"]> = Array.from(
+		{ length: 300 },
+		(_, i) => ({ category: i % 2 ? "assistant" : "user", chars: 1 }),
+	);
+	const counts = { totalChars: 300, systemChars: 0, toolsChars: 0, compositionSegments: segments };
+	const first = await service.freezeForRequest("n", counts, "wire-one", "2026-10-07T00:00:00Z");
+	expect(first?.pageCount).toBe(3);
+	message("new-transcript", 1, [{ category: "assistant", chars: 5000 }]);
+	await service.invalidate("n");
+	await service.settled();
+	let page = await service.get("n");
+	const all = [...page.segments];
+	while (page.nextCursor) {
+		page = await service.get("n", undefined, page.nextCursor);
+		all.push(...page.segments);
+	}
+	expect(all).toEqual(segments);
+	const second = await service.freezeForRequest("n", counts, "wire-two", "2026-10-07T00:00:01Z");
+	expect(second?.generation).not.toBe(first?.generation ?? null);
+	await service.settled();
+	const old = database
+		.query<{ count: number }, [string]>(
+			"SELECT count(*) AS count FROM narrator_context_char_pages WHERE generation = ?",
+		)
+		.get(first?.generation ?? "");
+	expect(old?.count).toBe(0);
+	expect((await service.get("n")).generation).toBe(second?.generation ?? null);
+});
+
+test("aborted final request publication leaves the previous snapshot untouched", async () => {
+	const counts: ContextInputCharacters = {
+		totalChars: 3,
+		systemChars: 0,
+		toolsChars: 0,
+		compositionSegments: [{ category: "user", chars: 3 }],
+	};
+	const first = await service.freezeForRequest("n", counts, "wire-good", "2026-10-07T00:00:00Z");
+	const abort = new AbortController();
+	abort.abort();
+	expect(
+		await service.freezeForRequest(
+			"n",
+			counts,
+			"wire-abort",
+			"2026-10-07T00:00:01Z",
+			0,
+			abort.signal,
+		),
+	).toBeNull();
+	expect((await service.get("n")).generation).toBe(first?.generation ?? null);
+});
+
+test("unavailable final classification never masquerades as a matching historical cache", async () => {
+	message("small-history", 1, [{ category: "user", chars: 3 }]);
+	await ready();
+	const counts = { totalChars: 30, systemChars: 0, toolsChars: 0, compositionSegments: null };
+	expect(
+		await service.freezeForRequest("n", counts, "wire-unknown", "2026-10-07T00:00:00Z"),
+	).toBeNull();
+	const response = await service.get("n");
+	expect(response.totalChars).toBe(3);
+	expect(response.usage?.composition).toBeNull();
+});
+
+test("summary attribution cannot exceed the final classification segment ceiling", async () => {
+	const segments: NonNullable<ContextInputCharacters["compositionSegments"]> = [
+		{ category: "system", chars: 2 },
+		...Array.from({ length: 2047 }, (_, i) => ({
+			category: i % 2 ? ("assistant" as const) : ("user" as const),
+			chars: 1,
+		})),
+	];
+	const pin = await service.freezeForRequest(
+		"n",
+		{
+			totalChars: 2049,
+			systemChars: 2,
+			toolsChars: 0,
+			compositionSegments: segments,
+		},
+		"wire-ceiling",
+		"2026-10-07T00:00:00Z",
+		1,
+	);
+	expect(pin?.pageCount).toBe(16);
+	expect(pin?.totalChars).toBe(2049);
+	expect(pin?.totals.find((s) => s.category === "system")?.chars).toBe(2);
+});
+
+test("failed final page publication rolls back both pages and the snapshot pointer", async () => {
+	const initial = await service.freezeForRequest(
+		"n",
+		{
+			totalChars: 3,
+			systemChars: 0,
+			toolsChars: 0,
+			compositionSegments: [{ category: "user", chars: 3 }],
+		},
+		"wire-initial",
+		"2026-10-07T00:00:00Z",
+	);
+	await service.settled();
+	database.run(`CREATE TRIGGER fail_second_page BEFORE INSERT ON narrator_context_char_pages
+		WHEN NEW.page = 1 BEGIN SELECT RAISE(ABORT, 'controlled page failure'); END;`);
+	const segments: NonNullable<ContextInputCharacters["compositionSegments"]> = Array.from(
+		{ length: 129 },
+		(_, i) => ({ category: i % 2 ? "assistant" : "user", chars: 1 }),
+	);
+	await expect(
+		service.freezeForRequest(
+			"n",
+			{
+				totalChars: 129,
+				systemChars: 0,
+				toolsChars: 0,
+				compositionSegments: segments,
+			},
+			"wire-failed",
+			"2026-10-07T00:00:01Z",
+		),
+	).rejects.toThrow("controlled page failure");
+	expect((await service.get("n")).generation).toBe(initial?.generation ?? null);
+	expect(
+		database
+			.query<{ count: number }, []>("SELECT count(*) AS count FROM narrator_context_char_pages")
+			.get()?.count,
+	).toBe(1);
 });

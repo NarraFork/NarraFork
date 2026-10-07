@@ -58,6 +58,66 @@ async function drive(provider: ProviderAdapter, chat: ChatParams): Promise<void>
 }
 
 describe("providers report their final logical inputs", () => {
+	test("strict completions counts final quoted/newline text, not stripped reasoning history", async () => {
+		const provider = new OpenAIProvider({
+			id: "input",
+			name: "input",
+			prefix: "input",
+			apiKey: "test",
+			baseUrl: "https://example.invalid/v1",
+			defaultModel: "gpt-4.1",
+			apiMode: "completions",
+		});
+		const reply = 'reply\n"quoted"😀';
+		const { history } = await provider.buildHistory(
+			[
+				{
+					id: "history",
+					role: "assistant",
+					contentJson: [
+						{ type: "thinking", thinking: "STRIPPED REASONING" },
+						{ type: "text", text: reply },
+					],
+					contentText: null,
+					parentToolUseId: null,
+					messageUuid: null,
+					toolCalls: [],
+				},
+			],
+			"input:gpt-4.1",
+		);
+		const snapshots: Array<ContextInputCharacters | null> = [];
+		let sent: unknown;
+		globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+			sent = JSON.parse(String(init?.body));
+			return new Response("test failure", { status: 500 });
+		}) as unknown as typeof fetch;
+		try {
+			await drive(
+				provider,
+				params({
+					model: "input:gpt-4.1",
+					history,
+					onInputCharacters: (counts) => {
+						snapshots.push(counts);
+					},
+				}),
+			);
+		} catch {
+			/* Mocked upstream failure. */
+		}
+		expect(JSON.stringify(sent)).not.toContain("STRIPPED REASONING");
+		expect(snapshots[0]).toEqual({
+			totalChars: reply.length + "current😀".length,
+			systemChars: 0,
+			toolsChars: 0,
+			compositionSegments: [
+				{ category: "assistant", chars: reply.length },
+				{ category: "user", chars: "current😀".length },
+			],
+		});
+	});
+
 	test("Anthropic, OpenAI Responses/completions and Gemini report before HTTP transport", async () => {
 		const cases: Array<{
 			provider: ProviderAdapter;
@@ -153,6 +213,7 @@ describe("providers report their final logical inputs", () => {
 			expect(sent).toBeDefined();
 			expect(snapshots).toEqual([
 				await countInputCharacters(sent, undefined, {
+					includeComposition: true,
 					firstMessageIsRuntimeSystem: item.completions,
 					instructionsFixedChars: item.responses
 						? (item.history[0] as { content: string }).content.length
@@ -216,7 +277,15 @@ describe("providers report their final logical inputs", () => {
 				/* Mocked failure. */
 			}
 			expect(snapshots).toEqual([
-				{ systemChars: 0, toolsChars: 0, totalChars: "historical prefixold usercurrent😀".length },
+				{
+					systemChars: 0,
+					toolsChars: 0,
+					totalChars: "historical prefixold usercurrent😀".length,
+					compositionSegments: [
+						{ category: "other", chars: "historical prefix".length },
+						{ category: "user", chars: "old usercurrent😀".length },
+					],
+				},
 			]);
 		}
 	});
@@ -365,6 +434,15 @@ describe("providers report their final logical inputs", () => {
 					"attached textcurrent😀".length,
 				systemChars: 0,
 				toolsChars: 0,
+				compositionSegments: [
+					{
+						category: "toolResult",
+						chars:
+							JSON.stringify({ name: "Read", id: "call-1", response }).length +
+							"attached text".length,
+					},
+					{ category: "user", chars: "current😀".length },
+				],
 			},
 		]);
 	});
@@ -430,6 +508,16 @@ describe("providers report their final logical inputs", () => {
 		expect(sent.previous_interaction_id).toBeUndefined();
 		expect(sent.store).toBe(false);
 		expect(snapshots[0]).toEqual({
+			compositionSegments: [
+				{ category: "system", chars: systemChars },
+				{ category: "user", chars: "history".length },
+				{ category: "assistant", chars: "thought".length },
+				{ category: "toolCall", chars: JSON.stringify({ name: "Read", arguments: args }).length },
+				{ category: "assistant", chars: "reply".length },
+				{ category: "toolResult", chars: "result".length },
+				{ category: "user", chars: "current😀".length },
+				{ category: "toolDefinition", chars: toolsChars },
+			],
 			systemChars,
 			toolsChars,
 			totalChars:
