@@ -93,7 +93,15 @@ export function categoryIcon(cat: ToolCategory, toolName?: string): ComponentTyp
 		case "taskOutput":
 			return IconRobot;
 		case "workspace":
-			return toolName === "Worktree" ? IconGitFork : IconTransfer;
+			return [
+				"Worktree",
+				"ListWorktrees",
+				"CreateWorktree",
+				"AttachWorktree",
+				"GetWorktreeOperation",
+			].includes(toolName ?? "")
+				? IconGitFork
+				: IconTransfer;
 		case "agent":
 			return IconGitFork;
 		case "await":

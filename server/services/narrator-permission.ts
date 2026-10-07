@@ -226,6 +226,9 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 		case "StructSed":
 		case "StructView":
 			return typeof input.file_path === "string" ? [input.file_path] : [];
+		case "CreateWorktree":
+		case "AttachWorktree":
+			return typeof input.destinationPath === "string" ? [input.destinationPath] : [];
 		case "ShareFile":
 			return typeof input.path === "string" ? [input.path] : [];
 		case "Glob":
@@ -786,6 +789,10 @@ export function resolvePermissionDecision(
 			return "deny";
 		}
 	}
+	if (reviewReadOnlyBash && (toolName === "CreateWorktree" || toolName === "AttachWorktree")) {
+		if (meta) meta.blacklistReason = `Review mode: ${toolName} modifies worktree resources.`;
+		return "deny";
+	}
 	const compiledPolicy = compiledPolicyForDecision(opts);
 	const context = executionContext ?? compiledPolicy.targetContext;
 	const effectiveMode = planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;
@@ -1240,6 +1247,8 @@ const ACCEPT_EDITS_AUTO_ALLOW = [
 
 /** Tools that don't modify the project worktree — safe to auto-allow in readOnly mode. */
 const READ_ONLY_TOOLS = [
+	"ListWorktrees",
+	"GetWorktreeOperation",
 	"Read",
 	"Grep",
 	"Glob",
@@ -1508,13 +1517,20 @@ function areUnsafeCommandsWhitelistedForDanger(
 // ── Protected path checks (hard-deny, no bypass) ─────────
 
 /**
- * Tools whose `file_path` input is a write target.
+ * Tools whose extracted path input is a write target (including worktree destinations).
  *
  * Membership is SECURITY-RELEVANT in two places, and in both an omission fails open:
  * the `.git` write ban below, and the OAuth read-only device policy. A file-modifying
  * tool missing from this set gets neither check and is silently allowed through.
  */
-const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "StructSed"]);
+const WRITE_TOOLS = new Set([
+	"Write",
+	"Edit",
+	"NotebookEdit",
+	"StructSed",
+	"CreateWorktree",
+	"AttachWorktree",
+]);
 const DESTRUCTIVE_COMMANDS = new Set(["rm", "rmdir", "shred"]);
 
 function executionPathOS(backend?: ExecutionBackend): string {
@@ -1603,7 +1619,7 @@ function resolveProtectedPathDeny(
 		toolBaseCwd(backend ?? localBackend, cwd);
 	const targetPaths = executionContext?.paths ?? backend?.paths ?? localPathSemantics;
 	if (WRITE_TOOLS.has(toolName) || toolName === "Browser") {
-		const filePath = typeof input.file_path === "string" ? input.file_path : "";
+		const filePath = extractToolPaths(toolName, input)[0] ?? "";
 		if (!filePath || (toolName === "Browser" && input.action !== "screenshot")) return null;
 		const absPath = resolveProtectedTargetPath(
 			filePath,

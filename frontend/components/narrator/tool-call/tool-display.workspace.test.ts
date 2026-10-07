@@ -3,7 +3,15 @@ import { getCategory, getSummary, traceRowTitle } from "./tool-display";
 
 describe("workspace tool summaries", () => {
 	test("all workspace tools select custom detail", () => {
-		for (const name of ["Worktree", "SwitchWorkingDirectory", "SwitchDevice"]) {
+		for (const name of [
+			"Worktree",
+			"ListWorktrees",
+			"CreateWorktree",
+			"AttachWorktree",
+			"GetWorktreeOperation",
+			"SwitchWorkingDirectory",
+			"SwitchDevice",
+		]) {
 			expect(getCategory(name)).toBe("workspace");
 			expect(getSummary(name, {})).not.toBe(name);
 		}
@@ -20,6 +28,24 @@ describe("workspace tool summaries", () => {
 			"Create worktree · new",
 		);
 		expect(getSummary("Worktree", { action: "list" })).toBe("List worktrees");
+	});
+	test("explicit worktree tools use flat inputs and localized labels", () => {
+		expect(getSummary("ListWorktrees", {})).toBe("List worktrees");
+		expect(
+			getSummary("CreateWorktree", { branchName: "fix/new", destinationPath: "/repo/new" }),
+		).toBe("Create worktree · fix/new");
+		expect(getSummary("AttachWorktree", { branchName: "existing" })).toBe(
+			"Attach worktree · existing",
+		);
+		expect(getSummary("GetWorktreeOperation", { operationId: "private-id" })).toBe(
+			"Get worktree operation",
+		);
+		expect(getSummary("AttachWorktree", {}, undefined, { workspaceAttach: "挂载工作树" })).toBe(
+			"挂载工作树",
+		);
+		expect(
+			getSummary("GetWorktreeOperation", {}, undefined, { workspaceOperation: "查询工作树操作" }),
+		).toBe("查询工作树操作");
 	});
 	test("directory target and localization survive folded rows", () => {
 		const summary = getSummary(

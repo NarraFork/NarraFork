@@ -3336,8 +3336,19 @@ function classifyWorkspace(
 		rows.push({ text: name ? `${name} · ${value}` : value, mono: true });
 	};
 	let handled = false;
-	if (toolName === "Worktree") {
-		if (readLeafText(args?.action) === "list") {
+	if (
+		[
+			"Worktree",
+			"ListWorktrees",
+			"CreateWorktree",
+			"AttachWorktree",
+			"GetWorktreeOperation",
+		].includes(toolName)
+	) {
+		if (
+			toolName === "ListWorktrees" ||
+			(toolName === "Worktree" && readLeafText(args?.action) === "list")
+		) {
 			const list = workspaceObject(metadata?.workspaceWorktrees) ?? result;
 			if (Array.isArray(list?.entries)) {
 				rows.push({ text: text("workspaceList") });
@@ -3363,11 +3374,17 @@ function classifyWorkspace(
 							? text("workspaceFailed")
 							: outcome === "unknown"
 								? text("workspaceUnknown")
-								: text("workspaceCreate"),
+								: text(
+										toolName === "AttachWorktree"
+											? "workspaceAttach"
+											: toolName === "GetWorktreeOperation"
+												? "workspaceOperation"
+												: "workspaceCreate",
+									),
 			});
 			pathRow(
 				worktree?.path ?? args?.destinationPath,
-				worktree?.branch ?? workspaceObject(args?.branch)?.name,
+				worktree?.branch ?? args?.branchName ?? workspaceObject(args?.branch)?.name,
 			);
 			handled = ["created", "failed", "unknown"].includes(outcome ?? "");
 		}

@@ -42,6 +42,31 @@ describe("workspace details", () => {
 			expect(row.actions).toBeUndefined();
 		}
 	});
+	test("explicit create, attach and operation query render compatible outcomes", () => {
+		for (const name of ["CreateWorktree", "AttachWorktree", "GetWorktreeOperation"]) {
+			const value = detail(
+				name,
+				{ branchName: "fix/new", destinationPath: "/repo/new", operationId: "private-id" },
+				{
+					outcome: "created",
+					operationId: "private-id",
+					worktree: { path: "/repo/new", branch: "refs/heads/fix/new" },
+				},
+			);
+			expect(rows(value).map((row) => row.text)).toEqual(["Created", "fix/new · /repo/new"]);
+			expect(value?.sections).toHaveLength(1);
+		}
+		expect(
+			rows(
+				detail("AttachWorktree", { branchName: "existing", destinationPath: "/repo/attached" }),
+			).map((row) => row.text),
+		).toEqual(["Attach worktree", "existing · /repo/attached"]);
+		expect(rows(detail("GetWorktreeOperation", {}))[0]?.text).toBe("Get worktree operation");
+		expect(rows(detail("ListWorktrees", {}, { entries: [] })).map((row) => row.text)).toEqual([
+			"List worktrees",
+			"No worktrees",
+		]);
+	});
 	test("listing handles detached entries and truncation", () => {
 		expect(
 			rows(

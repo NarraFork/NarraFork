@@ -51,6 +51,10 @@ const ALWAYS_STRICT_SERIAL_TOOL_NAMES = new Set([
 	"SwitchWorkingDirectory",
 	"SwitchDevice",
 	"Worktree",
+	"ListWorktrees",
+	"CreateWorktree",
+	"AttachWorktree",
+	"GetWorktreeOperation",
 	"RequestPermissionRule",
 ]);
 

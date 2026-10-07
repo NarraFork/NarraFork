@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { getTableConfig, SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
+import { z } from "zod/v4";
 import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
 import type { ExecutionBackend } from "../../lib/agent/execution/backend";
@@ -84,6 +85,92 @@ mock.module("../narrator-service", () => ({
 }));
 const service = await import("../permission-rule-request-service");
 const permission = await import("../narrator-permission");
+test("explicit worktree tools enforce destination write ACLs without expanding receipt paths", () => {
+	for (const toolName of ["ListWorktrees", "GetWorktreeOperation"]) {
+		const input = toolName === "ListWorktrees" ? {} : { operationId: "receipt" };
+		expect(permission.extractToolPaths(toolName, input)).toEqual([]);
+		for (const permMode of ["default", "readOnly"] as const) {
+			expect(
+				permission.resolvePermissionDecision({ toolName, input, permMode, cwd: "/local/work" }),
+			).toBe("allow");
+		}
+		expect(
+			permission.resolvePermissionDecision({
+				toolName,
+				input,
+				permMode: "bypassPermissions",
+				planMode: true,
+				cwd: "/local/work",
+			}),
+		).toBe("allow");
+	}
+	for (const toolName of ["CreateWorktree", "AttachWorktree"]) {
+		const opts = {
+			toolName,
+			input: { branchName: "feature", destinationPath: "/outside/worktree" },
+			cwd: "/local/work",
+		};
+		expect(permission.extractToolPaths(toolName, opts.input)).toEqual(["/outside/worktree"]);
+		expect(
+			permission.resolvePermissionDecision({
+				...opts,
+				permMode: "bypassPermissions",
+				blacklistDirs: [{ path: "/outside", denyLevel: "denyWrite", enabled: true }],
+			}),
+		).toBe("deny");
+		expect(
+			permission.resolvePermissionDecision({
+				...opts,
+				permMode: "default",
+				whitelistDirs: [{ path: "/outside", accessLevel: "readOnly", enabled: true }],
+			}),
+		).toBe("ask");
+		expect(
+			permission.resolvePermissionDecision({
+				...opts,
+				permMode: "default",
+				whitelistDirs: [{ path: "/outside", accessLevel: "readWrite", enabled: true }],
+			}),
+		).toBe("allow");
+		expect(
+			permission.resolvePermissionDecision({
+				...opts,
+				input: { ...opts.input, destinationPath: "/local/work/.git/new" },
+				permMode: "bypassPermissions",
+			}),
+		).toBe("deny");
+		for (const permMode of [
+			"default",
+			"acceptEdits",
+			"readOnly",
+			"dontAsk",
+			"bypassPermissions",
+		] as const) {
+			expect(permission.resolvePermissionDecision({ ...opts, permMode })).toBe(
+				permission.resolvePermissionDecision({
+					...opts,
+					toolName: "Worktree",
+					input: { action: "create" },
+					permMode,
+				}),
+			);
+		}
+		expect(
+			permission.resolvePermissionDecision({
+				...opts,
+				permMode: "bypassPermissions",
+				reviewReadOnlyBash: true,
+			}),
+		).toBe("deny");
+		expect(
+			permission.resolvePermissionDecision({
+				...opts,
+				permMode: "bypassPermissions",
+				planMode: true,
+			}),
+		).toBe("deny");
+	}
+});
 const { requestPermissionRuleTool } = await import("../../lib/agent/tools/request-permission-rule");
 const { toolRegistry, resolveToolJsonSchema, zodToJsonSchema } = await import(
 	"../../lib/agent/tool-registry"
@@ -155,6 +242,105 @@ const { executeTool } = await import("../../lib/agent/tool-executor");
 const { buildFinalToolStartAuthorization } = await import("../tool-final-start-authorization");
 const { narratorPersistence } = await import("../narrator-persistence");
 const finalTestDirectories: string[] = [];
+for (const withHook of [true, false]) {
+	test(`real executor validation ${withHook ? "uses tool feedback hook" : "retains default feedback"} without dispatch`, async () => {
+		const name = withHook
+			? "__ValidationFeedbackFixtureHook"
+			: "__ValidationFeedbackFixtureDefault";
+		const execute = mock(async () => ({ output: "must not run" }));
+		const formatValidationError = mock(() => "Concrete branchName correction required");
+		toolRegistry.register({
+			name,
+			description: "Validation feedback regression fixture",
+			parameters: z.strictObject({ branchName: z.string() }),
+			...(withHook ? { formatValidationError } : {}),
+			execute,
+		});
+		try {
+			const fixture = await finalExecutionFixture(name, false, undefined, {});
+			fixture.config.permissionHandler = async () => ({ behavior: "allow" });
+			const result = await executeTool(fixture.tu, fixture.config, {
+				toolCallBinding: fixture.binding,
+			});
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain(
+				withHook ? "Concrete branchName correction required" : "Invalid parameters:",
+			);
+			expect(execute).toHaveBeenCalledTimes(0);
+			expect(formatValidationError).toHaveBeenCalledTimes(withHook ? 1 : 0);
+		} finally {
+			toolRegistry.unregister(name);
+		}
+	});
+}
+test("provider public tool set exposes four explicit worktree tools and retains hidden legacy execution", () => {
+	const names = toolRegistry
+		.all()
+		.filter((tool) => !tool.isAvailable || tool.isAvailable())
+		.map((tool) => tool.name);
+	for (const name of ["ListWorktrees", "CreateWorktree", "AttachWorktree", "GetWorktreeOperation"])
+		expect(names).toContain(name);
+	expect(names).not.toContain("Worktree");
+	expect(toolRegistry.get("Worktree")).toBeDefined();
+});
+test("real provider formatters preserve flat worktree parameters and required fields", async () => {
+	const { OpenAIProvider } = await import("../../lib/agent/openai-provider");
+	const { AnthropicProvider } = await import("../../lib/agent/anthropic-provider");
+	const { GeminiProvider } = await import("../../lib/agent/gemini-provider");
+	const config = {
+		id: "worktree-schema",
+		name: "worktree-schema",
+		prefix: "fixture",
+		apiKey: "unused",
+		baseUrl: "https://example.invalid",
+		defaultModel: "fixture",
+	};
+	const definitions = [
+		// Compatibility-only no-op placeholder is advertised for providers requiring parameters.
+		{ name: "ListWorktrees", required: ["confirm"], properties: ["confirm"] },
+		{
+			name: "CreateWorktree",
+			required: ["branchName", "destinationPath"],
+			properties: ["branchName", "destinationPath", "baseRef"],
+		},
+		{
+			name: "AttachWorktree",
+			required: ["branchName", "destinationPath"],
+			properties: ["branchName", "destinationPath"],
+		},
+		{ name: "GetWorktreeOperation", required: ["operationId"], properties: ["operationId"] },
+	];
+	const tools = definitions.map(({ name }) => {
+		const tool = toolRegistry.get(name);
+		if (!tool || typeof tool.description !== "string") throw new Error(`Missing tool ${name}`);
+		return { ...tool, description: tool.description };
+	});
+	for (const provider of [
+		new OpenAIProvider({ ...config, apiMode: "responses" }),
+		new OpenAIProvider({ ...config, apiMode: "completions" }),
+		new AnthropicProvider(config),
+		new GeminiProvider(config),
+	]) {
+		const formatted = provider.formatTools(tools) as Record<string, unknown>[];
+		const declarations = (formatted[0]?.functionDeclarations ?? formatted) as Record<
+			string,
+			unknown
+		>[];
+		for (const [index, expected] of definitions.entries()) {
+			const entry = declarations[index];
+			const declaration = (entry?.function ?? entry) as Record<string, unknown>;
+			expect(declaration.name).toBe(expected.name);
+			const schema = (declaration.parameters ?? declaration.input_schema ?? {}) as Record<
+				string,
+				unknown
+			>;
+			expect(schema.required ?? []).toEqual(expected.required);
+			expect(Object.keys((schema.properties ?? {}) as object)).toEqual(expected.properties);
+			expect(schema.oneOf).toBeUndefined();
+			expect(schema.anyOf).toBeUndefined();
+		}
+	}
+});
 const now = () => new Date().toISOString();
 let seq = 0;
 async function seed(
@@ -207,7 +393,16 @@ async function call(narratorId: string) {
 	return { narratorId, toolUseId, binding, context };
 }
 async function finalExecutionFixture(
-	kind: "Write" | "Bash" | "Edit" | "StructSed" | "Read" | "RequestPermissionRule" | "Worktree",
+	kind:
+		| "Write"
+		| "Bash"
+		| "Edit"
+		| "StructSed"
+		| "Read"
+		| "RequestPermissionRule"
+		| "Worktree"
+		| "__ValidationFeedbackFixtureHook"
+		| "__ValidationFeedbackFixtureDefault",
 	child: boolean,
 	before?: () => Promise<void>,
 	overrideInput?: Record<string, unknown>,

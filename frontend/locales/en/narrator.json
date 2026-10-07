@@ -335,6 +335,8 @@
 	"contextAskOutputChars": "{{count}} chars",
 	"contextAskQuestions": "{{count}} questions",
 	"workspaceCreate": "Create worktree",
+	"workspaceAttach": "Attach worktree",
+	"workspaceOperation": "Get worktree operation",
 	"workspaceList": "List worktrees",
 	"workspaceSwitch": "Switch directory",
 	"workspaceDevice": "Switch device",

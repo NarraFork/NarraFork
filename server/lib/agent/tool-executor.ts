@@ -1180,7 +1180,9 @@ export async function executeTool(
 		const parsed = tool.parameters.safeParse(effectiveInput);
 		if (!parsed.success) {
 			return {
-				output: `Invalid parameters: ${parsed.error.message}`,
+				output: tool.formatValidationError
+					? tool.formatValidationError(parsed.error)
+					: `Invalid parameters: ${parsed.error.message}`,
 				isError: true,
 				durationMs: Date.now() - start,
 				permissionStartedAt,

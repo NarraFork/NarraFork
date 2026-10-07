@@ -1053,6 +1053,8 @@ export const PretextExactMessageList = memo(
 						contextAskQuestions: t("contextAskQuestions", { count: "{count}" }),
 						contextAskStatusSummary: t("contextAskStatusSummary"),
 						workspaceCreate: t("workspaceCreate"),
+						workspaceAttach: t("workspaceAttach"),
+						workspaceOperation: t("workspaceOperation"),
 						workspaceList: t("workspaceList"),
 						workspaceSwitch: t("workspaceSwitch"),
 						workspaceDevice: t("workspaceDevice"),

@@ -50,7 +50,7 @@ import { terminalTool } from "./terminal";
 import { transferFileTool } from "./transfer-file";
 import { webFetchTool } from "./web-fetch";
 import { webSearchTool } from "./web-search";
-import { worktreeTool } from "./worktree";
+import { agentWorktreeTools, worktreeTool } from "./worktree";
 import { writeTool } from "./write";
 
 /**
@@ -147,6 +147,7 @@ const coreProvider: ToolProvider = {
 			switchDeviceTool,
 			switchWorkingDirectoryTool,
 			worktreeTool,
+			...agentWorktreeTools,
 			requestPermissionRuleTool,
 			transferFileTool,
 			dangerConfirmTool,
