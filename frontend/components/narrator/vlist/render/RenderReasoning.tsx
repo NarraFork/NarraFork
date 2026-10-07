@@ -247,7 +247,14 @@ function ReasoningHeaderRow({
 			<Text size="xs" c="dimmed" style={{ lineHeight: `${typographyMetrics().line.xs}px` }}>
 				{reasoning}
 			</Text>
-			<Text size="xs" c="dimmed" style={{ lineHeight: `${typographyMetrics().line.xs}px` }}>
+			{/* Monospace keeps digit advances equal, so a growing count does not
+			    reflow the preview on every digit-width change (streaming jitter). */}
+			<Text
+				size="xs"
+				c="dimmed"
+				ff="monospace"
+				style={{ lineHeight: `${typographyMetrics().line.xs}px` }}
+			>
 				{charsLabel}
 			</Text>
 			{preview ? (

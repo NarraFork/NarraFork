@@ -199,7 +199,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "spec":
 					return specToolOpened;
 				case "git":
-					return dock?.openToolTypes.has("git") ?? false;
+					return dock ? dock.openToolTypes.has("git") : mobileToolPanel === "git";
 				case "search":
 					return dock ? dock.openToolTypes.has("search") : mobileToolPanel === "search";
 				case "browser":
@@ -207,7 +207,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "userchat":
 					return dock ? dock.openToolTypes.has("userchat") : mobileToolPanel === "userchat";
 				case "filetree":
-					return dock?.openToolTypes.has("filetree") ?? false;
+					return dock ? dock.openToolTypes.has("filetree") : mobileToolPanel === "filetree";
 				default:
 					return false;
 			}
@@ -245,14 +245,12 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "search":
 				case "browser":
 				case "userchat":
+				case "filetree":
 					if (dock) dock.toggleToolPanel(id);
 					else {
 						const kind = id as MobileToolPanelKind;
 						setMobileToolPanel((current) => (current === kind ? null : kind));
 					}
-					return;
-				case "filetree":
-					dock?.toggleToolPanel("filetree");
 					return;
 				// Dock-only (registry `hosts: ["dock"]`): the panel exists to sit beside the
 				// transcript while a slider moves, so there is no drawer fallback to offer.

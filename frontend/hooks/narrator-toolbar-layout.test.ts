@@ -386,7 +386,9 @@ describe("partitionToolbar", () => {
 				visibleLimit: 2,
 				entryEnabled: (id) => id !== "tasks",
 			});
-			expect(visible.map((d) => d.id)).toEqual(["details", "spec"]);
+			// filetree is drawer-capable since MobileToolPanelHost grew a tree drawer,
+			// so on this host it legitimately takes the first capped slot.
+			expect(visible.map((d) => d.id)).toEqual(["filetree", "details"]);
 		});
 
 		it("drops disabled entries from both lists on an uncapped host", () => {

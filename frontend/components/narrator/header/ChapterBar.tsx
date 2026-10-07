@@ -21,7 +21,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import type React from "react";
 import { lazy, Suspense, useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { NarratorCompatibilityEntry } from "../../project/NarratorCompatibilityEntry";
+import { NarratorCompatibilityModal } from "../../project/NarratorCompatibilityEntry";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import classes from "./ChapterBar.module.css";
 import { isActivationKey, isTextSelectionGesture } from "./chapter-bar-git-trigger";
@@ -184,6 +184,7 @@ export function ChapterBar({
 	const { t } = useTranslation("chapters");
 	const { t: tn } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
+	const { t: tp } = useTranslation("projects");
 	const { data: chapter } = useChapter(chapterId);
 	const { data: executionContext } = useWorkspaceContext(narratorId ?? "");
 	const workspaceQuery = useGitWorkspace(narratorId);
@@ -223,6 +224,7 @@ export function ChapterBar({
 	});
 
 	const [forkModalOpen, setForkModalOpen] = useState(false);
+	const [compatibilityOpen, setCompatibilityOpen] = useState(false);
 	const [mergeModalOpen, setMergeModalOpen] = useState(false);
 	const [containerConfigOpen, setContainerConfigOpen] = useState(false);
 	const [podmanInstallOpen, setPodmanInstallOpen] = useState(false);
@@ -467,9 +469,17 @@ export function ChapterBar({
 									{t("wake")}
 								</Menu.Item>
 							)}
-							<Suspense fallback={null}>
-								<NarratorCompatibilityEntry projectId={chapter.projectId} />
-							</Suspense>
+							{/*
+								The modal lives outside this dropdown (see "Modals" below): nested
+								here it would unmount with the menu and render under the open
+								dropdown on a phone.
+							*/}
+							<Menu.Item
+								leftSection={<IconSettings size={14} />}
+								onClick={() => setCompatibilityOpen(true)}
+							>
+								{tp("compatibility.title")}
+							</Menu.Item>
 						</Menu.Dropdown>
 					</Menu>
 				</Group>
@@ -523,6 +533,11 @@ export function ChapterBar({
 					/>
 				</Suspense>
 			)}
+			<NarratorCompatibilityModal
+				projectId={chapter.projectId}
+				opened={compatibilityOpen}
+				onClose={() => setCompatibilityOpen(false)}
+			/>
 			{containerCapability.supported && containerConfigOpen && (
 				<Suspense fallback={null}>
 					<ContainerConfigModal

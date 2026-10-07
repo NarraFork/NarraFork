@@ -817,8 +817,16 @@ function LiveTailText({
 		<>
 			{/* The size readout. `flexShrink: 0` keeps it intact while the tail absorbs
 			    the width pressure — it is the one part of the label that must never be
-			    clipped, since it is what tells the reader the run is still growing. */}
-			<Text size="xs" c="dimmed" className={fade} style={{ flexShrink: 0, opacity: 0.6 }}>
+			    clipped, since it is what tells the reader the run is still growing.
+			    Monospace keeps digit advances equal so a growing count does not shove
+			    the tail on every digit-width change (streaming jitter). */}
+			<Text
+				size="xs"
+				c="dimmed"
+				ff="monospace"
+				className={fade}
+				style={{ flexShrink: 0, opacity: 0.6 }}
+			>
 				{prefix}…
 			</Text>
 			<Text

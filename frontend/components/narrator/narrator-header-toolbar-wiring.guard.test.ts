@@ -200,22 +200,30 @@ describe("self-contained controls are reachable from the overflow menu", () => {
 	});
 });
 
-describe("the file-tree toolbar entry is wired to Dockview", () => {
-	it("tracks the Dockview panel's active state", async () => {
+describe("the file-tree toolbar entry is wired to Dockview and the mobile drawer", () => {
+	it("tracks the open state on both hosts", async () => {
 		const source = await headerToolbarHook();
 		const start = source.indexOf("const toolbarEntryActive");
 		const end = source.indexOf("/**\n\t * Activate an entry", start);
 		const body = source.slice(start, end);
 		expect(body).toContain('case "filetree":');
-		expect(body).toContain('dock?.openToolTypes.has("filetree")');
+		expect(body).toContain('dock.openToolTypes.has("filetree")');
+		expect(body).toContain('mobileToolPanel === "filetree"');
 	});
 
-	it("activates the file-tree panel instead of falling through", async () => {
+	it("activates the dock panel and falls back to the mobile drawer", async () => {
 		const source = await headerToolbarHook();
 		const start = source.indexOf("const activateToolbarEntry");
 		const end = source.indexOf("/**\n\t * Options the overflow menu", start);
 		const body = source.slice(start, end);
 		expect(body).toContain('case "filetree":');
-		expect(body).toContain('dock?.toggleToolPanel("filetree")');
+		expect(body).toContain("dock.toggleToolPanel(id)");
+		expect(body).toContain("setMobileToolPanel");
+	});
+
+	it("the drawer host can actually render a file tree", async () => {
+		const host = await read("./MobileToolPanelHost.tsx");
+		expect(host).toContain('"filetree"');
+		expect(host).toContain("FileTreePanel");
 	});
 });

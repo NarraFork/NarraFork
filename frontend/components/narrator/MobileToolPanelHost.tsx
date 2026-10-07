@@ -40,13 +40,16 @@ const BrowserPanel = lazy(() =>
 const NarratorUserChatPanel = lazy(() =>
 	import("../chat/NarratorUserChatPanel").then((m) => ({ default: m.NarratorUserChatPanel })),
 );
+const FileTreePanel = lazy(() =>
+	import("./file-tree/FileTreePanel").then((m) => ({ default: m.FileTreePanel })),
+);
 
 /**
  * Tool panels this host can present. A subset of the dock's panel kinds on
  * purpose — `details` already has its own drawer in
  * `NarratorPanel`, and `terminal` / `spec` are hosted by the route.
  */
-export type MobileToolPanelKind = "git" | "search" | "browser" | "userchat";
+export type MobileToolPanelKind = "git" | "search" | "browser" | "userchat" | "filetree";
 
 const MOBILE_DRAWER_HEADER_HEIGHT = 45;
 
@@ -103,6 +106,12 @@ export interface MobileToolPanelHostProps {
 	onJumpToMessage?: (messageId: string) => void;
 	/** Submit text to the narrator's composer, replacing the dock's submit bridge. */
 	onForwardToNarrator?: (text: string) => void;
+	/**
+	 * Open a file picked in the file tree. Off-dock this is the panel's internal
+	 * file-viewer Drawer, which sits UNDER this one — so the tree drawer closes
+	 * first, same contract as `onJumpToMessage`.
+	 */
+	onOpenFile?: (absolutePath: string, fileName: string) => void;
 }
 
 export function MobileToolPanelHost({
@@ -113,6 +122,7 @@ export function MobileToolPanelHost({
 	browserVisualChange,
 	onJumpToMessage,
 	onForwardToNarrator,
+	onOpenFile,
 }: MobileToolPanelHostProps) {
 	const { t } = useTranslation("narrator");
 	const { t: tGit } = useTranslation("git");
@@ -128,7 +138,9 @@ export function MobileToolPanelHost({
 					? t("browser.title")
 					: kind === "userchat"
 						? tChat("panelTitle")
-						: "";
+						: kind === "filetree"
+							? t("fileTree.title")
+							: "";
 
 	return (
 		<Drawer
@@ -186,6 +198,20 @@ export function MobileToolPanelHost({
 					<NarratorUserChatPanel
 						narratorId={narratorId}
 						onForwardToNarrator={onForwardToNarrator}
+					/>
+				</PanelBoundary>
+			) : null}
+			{kind === "filetree" ? (
+				<PanelBoundary>
+					<FileTreePanel
+						narratorId={narratorId}
+						onOpenFile={(absolutePath, fileName) => {
+							// No viewer to land on: keep the tree open rather than close into nothing.
+							if (!onOpenFile) return;
+							// The viewer drawer is underneath this one; see onOpenFile's contract.
+							onClose();
+							onOpenFile(absolutePath, fileName);
+						}}
 					/>
 				</PanelBoundary>
 			) : null}

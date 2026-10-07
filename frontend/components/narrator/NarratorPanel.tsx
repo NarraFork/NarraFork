@@ -111,7 +111,7 @@ import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
-import { NarratorCompatibilityEntry } from "../project/NarratorCompatibilityEntry";
+import { NarratorCompatibilityModal } from "../project/NarratorCompatibilityEntry";
 import {
 	BackgroundTasksDrawerHost,
 	useBackgroundTasksButton,
@@ -1794,6 +1794,19 @@ function NarratorPanelBody({
 	const [mobileToolPanel, setMobileToolPanel] = useState<MobileToolPanelKind | null>(null);
 	/** Off-dock host state for the background-tasks drawer. */
 	const [mobileTasksOpen, setMobileTasksOpen] = useState(false);
+	/**
+	 * Compatibility modal state lives here, not in the overflow menu: the menu's
+	 * dropdown unmounts on close and would take a nested modal down with it.
+	 */
+	const [compatibilityOpen, setCompatibilityOpen] = useState(false);
+	/**
+	 * Only an explicit project context gets the menu entry: without one the modal
+	 * is just a directory of links, which is noise in the toolbar menu.
+	 */
+	const compatibilityProjectId =
+		workspaceContext?.contextProjectId ?? projectId ?? narrator?.contextProjectId;
+	/** Stable identity so HeaderToolbar's memo is not busted every render. */
+	const openCompatibility = useCallback(() => setCompatibilityOpen(true), []);
 	useMobileDrawerHistory(useInternalSpec && internalSpecOpen, () => setInternalSpecOpen(false));
 
 	// File opening (dock file panel when hosted in a dock, else an off-dock right
@@ -2962,17 +2975,7 @@ function NarratorPanelBody({
 										archiveMutation={archiveMutation}
 										dock={dock}
 										mockStreamEnabled={mockStreamEnabled}
-										compatibilityEntry={
-											<Suspense fallback={null}>
-												<NarratorCompatibilityEntry
-													projectId={
-														workspaceContext?.contextProjectId ??
-														projectId ??
-														narrator?.contextProjectId
-													}
-												/>
-											</Suspense>
-										}
+										onOpenCompatibility={compatibilityProjectId ? openCompatibility : undefined}
 										onClose={onClose}
 										visibleToolCount={headerLayout.visibleToolCount}
 										unmeasured={headerLayout.unmeasured}
@@ -3028,6 +3031,12 @@ function NarratorPanelBody({
 					<CompactSummaryModal
 						target={compactSummaryModalTarget}
 						onClose={closeCompactSummaryModal}
+					/>
+
+					<NarratorCompatibilityModal
+						projectId={compatibilityProjectId}
+						opened={compatibilityOpen}
+						onClose={() => setCompatibilityOpen(false)}
 					/>
 
 					<ContextThresholdSettingsModal
@@ -3572,6 +3581,9 @@ function NarratorPanelBody({
 									});
 								}}
 								onForwardToNarrator={forwardTextToNarrator}
+								// Off-dock the tree's files open in this panel's internal
+								// viewer Drawer (defined whenever !dock && !isWorkspacePreview).
+								onOpenFile={handleOpenFilePanel}
 							/>
 							<BackgroundTasksDrawerHost
 								narratorId={narratorId}

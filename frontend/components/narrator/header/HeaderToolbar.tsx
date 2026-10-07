@@ -1,6 +1,6 @@
 import { ActionIcon, Box, Group, Tooltip } from "@mantine/core";
 import { IconFlask, IconX } from "@tabler/icons-react";
-import { memo, type ReactNode, useMemo } from "react";
+import { memo, useMemo } from "react";
 import type { NarratorDockContextValue } from "../dock/NarratorDockContext";
 import { usePanelHeaderControls } from "../panels/panel-header-controls";
 import { NarratorToolbarItem, type NarratorToolbarItemProps } from "./NarratorToolbarItem";
@@ -17,7 +17,8 @@ export interface HeaderToolbarProps extends Omit<NarratorToolbarItemProps, "def"
 	archiveMutation: { isPending: boolean };
 	dock: NarratorDockContextValue | null;
 	mockStreamEnabled: boolean;
-	compatibilityEntry?: ReactNode;
+	/** Opens the compatibility modal, which the caller renders outside the menu. */
+	onOpenCompatibility?: () => void;
 	onClose?: () => void;
 	/**
 	 * How many surfaced tools fit AFTER the full pretext-measured title reserved
@@ -102,7 +103,7 @@ export const HeaderToolbar = memo(function HeaderToolbar(props: HeaderToolbarPro
 				renderInlineOptions={renderToolbarInlineOptions}
 				onArchive={openArchiveConfirm}
 				archiveLoading={archiveMutation.isPending}
-				compatibilityEntry={props.compatibilityEntry}
+				onOpenCompatibility={props.onOpenCompatibility}
 			/>
 			{onClose && controls?.pinAction && (
 				<Box

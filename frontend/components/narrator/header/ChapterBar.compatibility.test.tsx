@@ -89,9 +89,14 @@ mock.module("./NarratorWorktreeControls", () => ({
 	),
 }));
 mock.module("../../project/NarratorCompatibilityEntry", () => ({
-	NarratorCompatibilityEntry: ({ projectId }: { projectId: string }) => (
-		<button type="button">compatibility:{projectId}</button>
-	),
+	NarratorCompatibilityModal: ({
+		projectId,
+		opened,
+	}: {
+		projectId: string;
+		opened: boolean;
+		onClose: () => void;
+	}) => (opened ? <div data-compatibility-modal>compatibility:{projectId}</div> : null),
 }));
 mock.module("@frontend/components/chapter/ChapterForkModal", () => ({
 	ChapterForkModal: () => <div data-legacy-fork />,
@@ -309,7 +314,12 @@ for (const variant of ["chapter", "standalone"] as const) {
 
 test("old fork, merge, containers and project compatibility remain reachable beside quick worktree", async () => {
 	expect(container.textContent).toContain("quick-worktree");
-	expect(container.textContent).toContain("compatibility:project");
+	// The menu row is a plain item; the modal marker only appears after activation.
+	expect(container.querySelector("[data-compatibility-modal]")).toBeNull();
+	await click("compatibility.title");
+	expect(container.querySelector("[data-compatibility-modal]")?.textContent).toContain(
+		"compatibility:project",
+	);
 	await click("fork");
 	expect(container.querySelector("[data-legacy-fork]")).not.toBeNull();
 	await click("merge");
