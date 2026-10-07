@@ -114,7 +114,11 @@ export function handleForeignPanelDrop(
 			kind === "subagent"
 				? { panelType: "subagent" as const, subagentNarratorId: resourceId ?? "" }
 				: kind === "file"
-					? { panelType: "file" as const, ...fileTarget }
+					? {
+							panelType: "file" as const,
+							...fileTarget,
+							...(subject.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
+						}
 					: { panelType: kind, narratorId: target.narratorId, chapterId: target.chapterId },
 		// Dropped position: dockview reports which group and edge the pointer was
 		// over; `position` is absent for a plain tab-strip drop.

@@ -57,6 +57,13 @@ features.add("fs.read.bounded.v1"); assert.equal(backend.supportsFsReadBounded, 
 await backend.readFileBytes("/work/file.ts", {expectedResolvedPath: "/work/file.ts", timeoutMs: 1000, signal: abort.signal, maxBytes: 1048576});
 sent = calls.at(-1); assert.equal(sent.opts.timeoutMs, 1000); assert.equal(sent.params.timeoutMs, 1000);
 assert.deepEqual(sent.opts.requiredFeatures, ["fs.read.atomic-resolved-path.v1", "fs.read.bounded.v1"]);
+await assert.rejects(backend.readFileBytes("/work/file.ts", { offset: 0, maxBytes: 262144, timeoutMs: 1000 }), /unsupported fs.read.offset.v1/);
+features.add("fs.read.offset.v1");
+await backend.readFileBytes("/work/file.ts", { offset: 262144, maxBytes: 262144, expectedResolvedPath: "/work/file.ts", timeoutMs: 1000, signal: abort.signal });
+sent = calls.at(-1);
+assert.equal(sent.params.offset, 262144);
+assert.equal(sent.params.maxBytes, 262144);
+assert.deepEqual(sent.opts.requiredFeatures, ["fs.read.atomic-resolved-path.v1", "fs.read.bounded.v1", "fs.read.offset.v1"]);
 const writeOpts = { expectedBytes: Buffer.from("ok"), expectedResolvedPath: "/work/file.ts", signal: abort.signal, timeoutMs: 800 };
 await assert.rejects(backend.conditionalWriteFileBytes("/work/file.ts", Buffer.from("next"), writeOpts), /upgrade/);
 features.add("fs.write.conditional.v1");

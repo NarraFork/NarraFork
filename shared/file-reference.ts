@@ -5,6 +5,9 @@ export const MAX_FILE_REFERENCE_PATH_CHARS = 4096;
 export const MAX_FILE_REFERENCE_POSITION = 1_000_000;
 export const MAX_FILE_REFERENCE_METADATA_BYTES = 64 * 1024;
 export const MAX_FILE_REFERENCE_SOURCE_BYTES = 1024 * 1024;
+/** Read-only panel limits, independent of immutable reference snapshot limits. */
+export const MAX_FILE_PANEL_BYTES = 1024 ** 3;
+export const FILE_PANEL_PAGE_BYTES = 256 * 1024;
 export const MAX_FILE_REFERENCE_TEXT_BYTES = 32 * 1024;
 export const MAX_FILE_REFERENCE_TOTAL_TEXT_BYTES = 128 * 1024;
 export const MAX_FILE_REFERENCE_QUERY_CHARS = 256;
@@ -69,6 +72,19 @@ export interface FileReferenceCandidate extends FileTarget {
 export interface FileReferenceSearchResult {
 	entries: FileReferenceCandidate[];
 	truncated: boolean;
+}
+
+export interface FilePanelInfo {
+	target: FileTarget;
+	fileName: string;
+	size: number;
+}
+
+export interface FilePanelPage extends FilePanelInfo {
+	/** Actual UTF-8-aligned start; may precede a requested jump by up to three bytes. */
+	offset: number;
+	nextOffset: number | null;
+	content: string;
 }
 
 export interface FileReferencePreview {

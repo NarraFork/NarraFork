@@ -48,6 +48,7 @@ import {
 	type FilePanelOpener,
 	useFilePanelSourceOpener,
 } from "../file-panel/file-panel-navigation";
+import { LargeFileGate } from "../file-panel/LargeFileGate";
 import { usePanelHeaderControls } from "../panels/panel-header-controls";
 import {
 	type FilePanelParams,
@@ -242,7 +243,15 @@ export function ToolPanelShell({
 		props,
 		subjectId,
 		"tool",
-		detachKind ? { toolKind: detachKind, ...(resourceId ? { resourceId } : {}) } : undefined,
+		detachKind
+			? {
+					toolKind: detachKind,
+					...(resourceId ? { resourceId } : {}),
+					...(detachKind === "file" && props.params.largeFileConfirmed === true
+						? { largeFileConfirmed: true }
+						: {}),
+				}
+			: undefined,
 	);
 	const close = useCallback(() => props.api.close(), [props.api]);
 	const guardedPointerDown = useCallback(
@@ -1041,16 +1050,25 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 							navigationRequestId={highlightRequestId}
 						/>
 					) : isText ? (
-						<FileEditorContent
-							key={`edit:${fileNarratorId}:${deviceId}:${filePath}`}
-							filePath={filePath}
+						<LargeFileGate
 							narratorId={fileNarratorId}
 							deviceId={deviceId}
 							referenceOrigin={referenceOrigin}
-							selection={selection}
-							navigationRequestId={highlightRequestId}
-							onDirtyChange={onDirtyChange}
-						/>
+							filePath={filePath}
+							confirmed={props.params.largeFileConfirmed}
+							onConfirm={() => props.api.updateParameters({ largeFileConfirmed: true })}
+						>
+							<FileEditorContent
+								key={`edit:${fileNarratorId}:${deviceId}:${filePath}`}
+								filePath={filePath}
+								narratorId={fileNarratorId}
+								deviceId={deviceId}
+								referenceOrigin={referenceOrigin}
+								selection={selection}
+								navigationRequestId={highlightRequestId}
+								onDirtyChange={onDirtyChange}
+							/>
+						</LargeFileGate>
 					) : (
 						<FileViewerContent
 							key={`${fileNarratorId}:${deviceId}:${filePath}`}

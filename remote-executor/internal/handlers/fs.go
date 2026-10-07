@@ -194,6 +194,16 @@ func (h *Handlers) FsReadContext(parent context.Context, params map[string]any) 
 		}
 		return ctx.Err()
 	}
+	offset := intParam(params, "offset", 0)
+	if raw, exists := params["offset"]; exists {
+		n, ok := raw.(float64)
+		if !ok || n < 0 || n > 9007199254740991 || float64(offset) != n {
+			return nil, fmt.Errorf("invalid read offset")
+		}
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return nil, err
+	}
 	buf, probeTruncated, err := readFileChunks(ctx, f, maxBytes, check)
 	if err != nil {
 		return nil, err
@@ -230,7 +240,7 @@ func (h *Handlers) FsReadContext(parent context.Context, params map[string]any) 
 	}
 	return map[string]any{
 		"dataB64":      base64.StdEncoding.EncodeToString(buf),
-		"truncated":    probeTruncated || totalSize > int64(len(buf)),
+		"truncated":    probeTruncated || totalSize > offset+int64(len(buf)),
 		"totalSize":    totalSize,
 		"resolvedPath": resolvedPath,
 	}, nil

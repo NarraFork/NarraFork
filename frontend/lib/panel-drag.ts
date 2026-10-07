@@ -78,6 +78,8 @@ export interface PanelDragState {
 	 * panels leave it unset.
 	 */
 	resourceId?: string;
+	/** Panel-local loading state, separate from the drag's resource identity. */
+	largeFileConfirmed?: boolean;
 }
 
 type MoveListener = (state: PanelDragState) => void;
@@ -204,6 +206,8 @@ export function startPanelDrag(args: {
 	surfaceId?: string;
 	toolKind?: string;
 	resourceId?: string;
+	/** Panel-local loading state, separate from the drag's resource identity. */
+	largeFileConfirmed?: boolean;
 	x: number;
 	y: number;
 }) {
@@ -217,6 +221,7 @@ export function startPanelDrag(args: {
 		...(args.surfaceId ? { surfaceId: args.surfaceId } : {}),
 		...(args.toolKind ? { toolKind: args.toolKind } : {}),
 		...(args.resourceId ? { resourceId: args.resourceId } : {}),
+		...(args.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
 		// Fall back to id-shape inference when the caller didn't classify.
 		subjectKind: args.subjectKind ?? (isSyntheticSubjectId(args.id) ? "tool" : "narrator"),
 	});
@@ -248,6 +253,8 @@ export function startDetachedPanelDrag(args: {
 	 */
 	toolKind?: string;
 	resourceId?: string;
+	/** Panel-local loading state, separate from the drag's resource identity. */
+	largeFileConfirmed?: boolean;
 	x: number;
 	y: number;
 }) {
@@ -258,6 +265,7 @@ export function startDetachedPanelDrag(args: {
 		y: args.y,
 		...(args.toolKind ? { toolKind: args.toolKind } : {}),
 		...(args.resourceId ? { resourceId: args.resourceId } : {}),
+		...(args.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
 		subjectKind: "tool",
 	});
 }

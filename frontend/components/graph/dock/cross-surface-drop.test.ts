@@ -115,6 +115,7 @@ it("drops a child reader beside the host's same-path editor without rebinding au
 		deviceId: "local",
 		referenceOrigin: true,
 		fileNarratorId: "child",
+		largeFileConfirmed: true,
 	};
 	const source = { id: childId, params, api: { close() {} } };
 	registerDetachedDock("source", "chapter", {

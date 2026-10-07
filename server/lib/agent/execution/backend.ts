@@ -119,6 +119,8 @@ export interface DirEntry {
 
 /** Options for reading raw file bytes. */
 export interface ReadBytesOptions {
+	/** Byte offset; remote executors must negotiate fs.read.offset.v1. */
+	offset?: number;
 	/** Maximum number of bytes to return. Backend truncates beyond this. */
 	maxBytes?: number;
 	/**

@@ -28,6 +28,86 @@ function mockFetch(fn: (url: string, options?: RequestInit) => Response | Promis
 }
 
 describe("file reference API contracts and budgets", () => {
+	test("only explicit ordinary local panels use the legacy editor authorizer", async () => {
+		const urls: string[] = [];
+		mockFetch((url) => {
+			urls.push(url);
+			return Response.json({ size: 100, content: "page" });
+		});
+		const local = { deviceId: "local", path: "/outside/a.txt" };
+		await fileReferenceApi.info("n", local, undefined, "legacy");
+		await fileReferenceApi.page("n", local, 0, undefined, "legacy");
+		await fileReferenceApi.info("n", local, undefined, "reference");
+		await fileReferenceApi.page("n", local, 0, undefined, "reference");
+		await fileReferenceApi.info("n", { ...local, deviceId: "remote" }, undefined, "legacy");
+		await fileReferenceApi.page("n", { ...local, deviceId: "remote" }, 0, undefined, "legacy");
+		expect(urls.map((url) => new URL(url, "http://test").pathname)).toEqual([
+			"/api/narrators/n/editor-documents/info",
+			"/api/narrators/n/editor-documents/page",
+			"/api/narrators/n/file-references/info",
+			"/api/narrators/n/file-references/page",
+			"/api/narrators/n/file-references/info",
+			"/api/narrators/n/file-references/page",
+		]);
+	});
+	test("only ordinary local viewers retain the fs preview authorizer", async () => {
+		const urls: string[] = [];
+		mockFetch((url) => {
+			urls.push(url);
+			return Response.json({ size: 100, content: "page" });
+		});
+		await fileReferenceApi.info(
+			"n",
+			{ deviceId: "local", path: "/alias.txt" },
+			undefined,
+			"preview",
+		);
+		await fileReferenceApi.page(
+			"n",
+			{ deviceId: "local", path: "/alias.txt" },
+			0,
+			undefined,
+			"preview",
+		);
+		await fileReferenceApi.info(
+			"n",
+			{ deviceId: "remote", path: "/alias.txt" },
+			undefined,
+			"preview",
+		);
+		await fileReferenceApi.page(
+			"n",
+			{ deviceId: "remote", path: "/alias.txt" },
+			0,
+			undefined,
+			"preview",
+		);
+		expect(urls.map((url) => new URL(url, "http://test").pathname)).toEqual([
+			"/api/fs/panel-info",
+			"/api/fs/panel-page",
+			"/api/narrators/n/file-references/info",
+			"/api/narrators/n/file-references/page",
+		]);
+	});
+	test("panel info and page encode explicit device paths and byte offsets", async () => {
+		const urls: string[] = [];
+		mockFetch((url) => {
+			urls.push(url);
+			return Response.json({ size: 100, content: "page" });
+		});
+		const target = { deviceId: "RemoteCase", path: "C:\\中文 files\\a.txt" };
+		await fileReferenceApi.info("a/b", target);
+		await fileReferenceApi.page("a/b", target, 262144);
+		const info = new URL(urls[0], "http://test");
+		const page = new URL(urls[1], "http://test");
+		expect(info.pathname).toBe("/api/narrators/a%2Fb/file-references/info");
+		expect(Object.fromEntries(page.searchParams)).toEqual({ ...target, offset: "262144" });
+		for (const offset of [-1, 0.1, 1073741825])
+			await expect(fileReferenceApi.page("n", target, offset)).rejects.toThrow(
+				"Invalid file panel",
+			);
+		expect(urls).toHaveLength(2);
+	});
 	test("imagePreview encodes explicit targets and returns a typed binary Blob", async () => {
 		let sentUrl = "";
 		mockFetch((url) => {

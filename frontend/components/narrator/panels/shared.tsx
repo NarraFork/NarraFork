@@ -109,7 +109,7 @@ export function usePanelHeaderDrag(
 	 * this panel elsewhere (e.g. tear it out onto the story-network canvas) without
 	 * parsing `panelId`'s `ndock-<kind>` shape.
 	 */
-	detach?: { toolKind: string; resourceId?: string },
+	detach?: { toolKind: string; resourceId?: string; largeFileConfirmed?: boolean },
 ): (e: React.PointerEvent) => void {
 	// Stamped onto the drag so a surface receiving the drop can tell "my own panel
 	// being rearranged" from "a panel belonging to another surface" — panel ids are
@@ -118,6 +118,7 @@ export function usePanelHeaderDrag(
 	const surfaceId = useDockviewSurfaceId();
 	const toolKind = detach?.toolKind;
 	const resourceId = detach?.resourceId;
+	const largeFileConfirmed = detach?.largeFileConfirmed === true;
 	return useCallback(
 		(e: React.PointerEvent) => {
 			if (controls?.onPointerDown?.(e)) return;
@@ -130,10 +131,20 @@ export function usePanelHeaderDrag(
 				...(surfaceId ? { surfaceId } : {}),
 				...(toolKind ? { toolKind } : {}),
 				...(resourceId ? { resourceId } : {}),
+				...(largeFileConfirmed ? { largeFileConfirmed: true } : {}),
 				x: e.clientX,
 				y: e.clientY,
 			});
 		},
-		[controls, props.api, subjectId, subjectKind, surfaceId, toolKind, resourceId],
+		[
+			controls,
+			props.api,
+			subjectId,
+			subjectKind,
+			surfaceId,
+			toolKind,
+			resourceId,
+			largeFileConfirmed,
+		],
 	);
 }

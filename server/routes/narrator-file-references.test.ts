@@ -11,6 +11,21 @@ function appFor(userId: string | null = "requesting-user", failure?: AppError) {
 		if (failure) throw failure;
 	};
 	const service: FileReferenceService = {
+		async filePanelInfo(...args) {
+			record("info", args);
+			return { target: args[2], fileName: "a.ts", size: 100 };
+		},
+		async filePanelPage(...args) {
+			record("page", args);
+			return {
+				target: args[2],
+				fileName: "a.ts",
+				size: 100,
+				offset: args[3],
+				nextOffset: null,
+				content: "saved",
+			};
+		},
 		async captureFileReferences(...args) {
 			record("capture", args);
 			return [];
@@ -73,6 +88,24 @@ function appFor(userId: string | null = "requesting-user", failure?: AppError) {
 const base = "/narrators/narrator-123/file-references";
 
 describe("narrator file-reference routes", () => {
+	test("panel routes preserve principal, target, offset and cancellation", async () => {
+		const { app, calls } = appFor();
+		const query = "deviceId=ExplicitDevice&path=%2Fwork%2Fa.ts";
+		expect((await app.request(`${base}/info?${query}`)).status).toBe(200);
+		const page = await app.request(`${base}/page?${query}&offset=262144`);
+		expect(page.status).toBe(200);
+		expect(calls[1].args.slice(0, 4)).toEqual([
+			"narrator-123",
+			"requesting-user",
+			{ deviceId: "ExplicitDevice", path: "/work/a.ts" },
+			262144,
+		]);
+		expect(calls[1].args[4]).toBeInstanceOf(AbortSignal);
+		expect(page.headers.get("Cache-Control")).toBe("no-store");
+		for (const offset of ["-1", "1.5", "1073741825", "Infinity", ""])
+			expect((await app.request(`${base}/page?${query}&offset=${offset}`)).status).toBe(400);
+		expect((await appFor(null).app.request(`${base}/info?${query}`)).status).toBe(401);
+	});
 	test("uses the verified HTTP principal and forwards optional search fields and cancellation", async () => {
 		const { app, calls } = appFor();
 		const response = await app.request(`${base}/search?q=a.ts&directory=%2Fworkspace`);

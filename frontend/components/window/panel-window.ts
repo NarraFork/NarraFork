@@ -86,6 +86,8 @@ export type PanelWindowDescriptor =
 			fileNarratorId?: string;
 			hostNarratorId?: string;
 			referenceOrigin?: boolean;
+			/** Confirmation belongs to this panel, not the file's resource identity. */
+			largeFileConfirmed?: boolean;
 			toolEdit?: ToolEditReference;
 	  }
 	| {
@@ -177,6 +179,7 @@ function normalizeDescriptor(value: unknown): PanelWindowDescriptor | null {
 				...(str(value.fileNarratorId) ? { fileNarratorId: str(value.fileNarratorId) } : {}),
 				...(str(value.hostNarratorId) ? { hostNarratorId: str(value.hostNarratorId) } : {}),
 				...(value.referenceOrigin === true ? { referenceOrigin: true } : {}),
+				...(value.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
 				...(isToolEditReference(value.toolEdit) ? { toolEdit: value.toolEdit } : {}),
 			};
 		}

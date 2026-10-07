@@ -1671,6 +1671,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			panelId: string;
 			kind: string | undefined;
 			resourceId?: string;
+			largeFileConfirmed?: boolean;
 			screenX: number;
 			screenY: number;
 		}) => {
@@ -1700,7 +1701,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					w: 480,
 					h: 360,
 					// No layout yet: the surface builds one on first mount and persists it.
-					pendingPanels: [makePanelEntry(kind, resourceId)],
+					pendingPanels: [makePanelEntry(kind, resourceId, input)],
 				});
 				if (!result.ok) {
 					refusal = result.reason;
@@ -1776,6 +1777,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				panelId,
 				kind: final.toolKind,
 				...(final.resourceId ? { resourceId: final.resourceId } : {}),
+				...(final.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
 				screenX: hint.x,
 				screenY: hint.y,
 			});
@@ -1854,6 +1856,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				panelId: subject.panelId,
 				kind: subject.kind,
 				...(subject.resourceId ? { resourceId: subject.resourceId } : {}),
+				...(subject.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
 				screenX: e.clientX,
 				screenY: e.clientY,
 			});

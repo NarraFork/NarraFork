@@ -40,7 +40,12 @@ export interface EditorActor {
 	userId: string;
 	narratorId: string;
 	locale?: "en" | "zh-CN";
-	authorize(input: CreateEditorDocumentInput, need: "read" | "write"): Promise<EditorBinding>;
+	authorize(
+		input: CreateEditorDocumentInput,
+		need: "read" | "write",
+		signal?: AbortSignal,
+		timeoutMs?: number,
+	): Promise<EditorBinding>;
 }
 export class EditorDocumentError extends AppError {
 	constructor(

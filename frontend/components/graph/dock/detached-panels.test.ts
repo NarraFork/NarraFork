@@ -53,6 +53,22 @@ function mounted(over: Partial<DetachedNode> = {}): DetachedNode {
 }
 
 describe("device-scoped pending file panels", () => {
+	test("round-trips panel consent without changing detached deduplication identity", () => {
+		const original = makePanelEntry("file", "/large.ts");
+		const confirmed = makePanelEntry("file", "/large.ts", { largeFileConfirmed: true });
+		expect(confirmed).toEqual({ ...original, largeFileConfirmed: true });
+		expect(resourceIdOf(confirmed)).toBe(resourceIdOf(original));
+		const nodes = [pending({ pendingPanels: [confirmed] })];
+		expect(parseDetachedNodes(serializeDetachedNodes(nodes))).toEqual(nodes);
+		expect(hasPendingPanel(nodes, original.panelId)).toBe(true);
+		for (const largeFileConfirmed of [false, "true", 1]) {
+			const raw = JSON.stringify({
+				nodes: [pending({ pendingPanels: [{ ...original, largeFileConfirmed } as never] })],
+			});
+			expect(parseDetachedNodes(raw)[0].pendingPanels?.[0]).toEqual(original);
+		}
+	});
+
 	test("historical pending panels survive persistence and remain distinct from live files", () => {
 		const toolEdit = { narratorId: "origin", toolUseId: "sdk-id", executionAttempt: 2 };
 		const resourceId = JSON.stringify(["DeviceA", "/repo/a.ts", true, toolEdit]);

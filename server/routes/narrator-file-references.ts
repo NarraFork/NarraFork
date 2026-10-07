@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { AppError, zodValidationError } from "../lib/errors";
 import {
+	filePanelPageSchema,
 	previewFileReferenceSchema,
 	resolveFileReferencesSchema,
 	searchFileReferencesSchema,
@@ -69,6 +70,32 @@ export function createFileReferenceRoutes(service: FileReferenceService = fileRe
 			});
 		},
 	);
+	routes.get("/info", async (c) => {
+		const parsed = previewFileReferenceSchema.safeParse(c.req.query());
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		return c.json(
+			await service.filePanelInfo(
+				c.req.param("id") ?? "",
+				c.get("user").sub,
+				parsed.data,
+				c.req.raw.signal,
+			),
+		);
+	});
+	routes.get("/page", async (c) => {
+		const parsed = filePanelPageSchema.safeParse(c.req.query());
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		const { offset, ...target } = parsed.data;
+		return c.json(
+			await service.filePanelPage(
+				c.req.param("id") ?? "",
+				c.get("user").sub,
+				target,
+				offset,
+				c.req.raw.signal,
+			),
+		);
+	});
 	routes.get("/preview", async (c) => {
 		const parsed = previewFileReferenceSchema.safeParse(c.req.query());
 		if (!parsed.success) throw zodValidationError(parsed.error);

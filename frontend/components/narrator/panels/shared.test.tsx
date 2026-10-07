@@ -90,7 +90,14 @@ async function installDom(): Promise<() => void> {
  * past a 5px threshold, so the state under test is read after a
  * threshold-crossing pointermove.
  */
-async function captureDrag(opts: { toolKind?: string; surfaceId?: string } = {}) {
+async function captureDrag(
+	opts: {
+		toolKind?: string;
+		surfaceId?: string;
+		resourceId?: string;
+		largeFileConfirmed?: boolean;
+	} = {},
+) {
 	const React = await import("react");
 	const { createRoot } = await import("react-dom/client");
 	const { flushSync } = await import("react-dom");
@@ -108,7 +115,13 @@ async function captureDrag(opts: { toolKind?: string; surfaceId?: string } = {})
 			props,
 			"__terminal__",
 			"tool",
-			opts.toolKind ? { toolKind: opts.toolKind } : undefined,
+			opts.toolKind
+				? {
+						toolKind: opts.toolKind,
+						resourceId: opts.resourceId,
+						largeFileConfirmed: opts.largeFileConfirmed,
+					}
+				: undefined,
 		);
 		return null;
 	}
@@ -264,6 +277,29 @@ describe("usePanelGeometryReady", () => {
 });
 
 describe("usePanelHeaderDrag", () => {
+	it("preserves panel consent through a header tear-out and detached persistence", async () => {
+		const { makePanelEntry, parseDetachedNodes, serializeDetachedNodes } = await import(
+			"../../graph/dock/detached-panels"
+		);
+		for (const largeFileConfirmed of [true, false, undefined]) {
+			const state = await captureDrag({
+				toolKind: "file",
+				resourceId: "/large.ts",
+				largeFileConfirmed,
+			});
+			if (!state) throw new Error("drag state missing");
+			expect(state.resourceId).toBe("/large.ts");
+			const entry = makePanelEntry("file", state.resourceId, state);
+			const raw = serializeDetachedNodes([
+				{ id: "detached", x: 0, y: 0, w: 480, h: 360, pendingPanels: [entry] },
+			]);
+			const restored = parseDetachedNodes(raw)[0].pendingPanels?.[0];
+			expect(restored?.panelId).toBe("file:/large.ts");
+			if (largeFileConfirmed) expect(restored?.largeFileConfirmed).toBe(true);
+			else expect(restored).not.toHaveProperty("largeFileConfirmed");
+		}
+	});
+
 	it("carries panelId so the surface treats the drop as moving THIS panel", async () => {
 		const state = await captureDrag({ toolKind: "terminal" });
 		expect(state?.panelId).toBe("ndock-terminal");

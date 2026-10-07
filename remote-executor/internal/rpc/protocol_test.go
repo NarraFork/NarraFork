@@ -28,6 +28,7 @@ func TestCapabilitiesAdvertiseSafePlanReadFeatures(t *testing.T) {
 		FeatureFsWriteAtomicResolvedPathV1,
 		FeatureGlobBoundedV1,
 		FeatureFsReadBoundedV1,
+		FeatureFsReadOffsetV1,
 		FeatureGitWorkspaceV1,
 		FeatureGitWorkspaceWatchV1,
 		FeatureGitCommitPreviewV1,

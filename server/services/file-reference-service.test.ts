@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { FileReference, FileSelection } from "@shared/file-reference";
-import { MAX_FILE_REFERENCE_POSITION } from "@shared/file-reference";
+import {
+	FILE_PANEL_PAGE_BYTES,
+	MAX_FILE_PANEL_BYTES,
+	MAX_FILE_REFERENCE_POSITION,
+} from "@shared/file-reference";
 import { MAX_FILE_REFERENCE_IMAGE_BYTES } from "@shared/file-reference-image";
 import type {
 	ExecutionBackend,
@@ -122,9 +126,12 @@ function fixture(
 			if (readHook) return readHook(path, opts);
 			const bytes = new TextEncoder().encode(files.get(canonical(path)) ?? "");
 			return {
-				bytes,
+				bytes: bytes.subarray(
+					opts?.offset ?? 0,
+					(opts?.offset ?? 0) + (opts?.maxBytes ?? bytes.byteLength),
+				),
 				totalSize: bytes.byteLength,
-				truncated: false,
+				truncated: (opts?.offset ?? 0) + (opts?.maxBytes ?? bytes.byteLength) < bytes.byteLength,
 				resolvedPath: canonical(path),
 			};
 		},
@@ -206,6 +213,192 @@ function fixture(
 		},
 	};
 }
+
+describe("read-only large file panels", () => {
+	for (const remote of [false, true]) {
+		test(`metadata and UTF-8 pages are bounded (${remote ? "remote" : "local"})`, async () => {
+			const f = fixture({ remote });
+			const target = { deviceId: f.id, path: "/work/file.ts" };
+			const text = `${"a".repeat(FILE_PANEL_PAGE_BYTES - 1)}\u{1F600}中文`;
+			f.files.set(target.path, text);
+			const info = await f.service.filePanelInfo("n", "visitor", target);
+			expect(info.size).toBe(Buffer.byteLength(text));
+			expect(f.reads).toHaveLength(0);
+			const first = await f.service.filePanelPage("n", "visitor", target, 0);
+			expect(first.content).toBe("a".repeat(FILE_PANEL_PAGE_BYTES - 1));
+			expect(first.nextOffset).toBe(FILE_PANEL_PAGE_BYTES - 1);
+			const second = await f.service.filePanelPage(
+				"n",
+				"visitor",
+				target,
+				first.nextOffset as number,
+			);
+			expect(first.content + second.content).toBe(text);
+			expect(second.nextOffset).toBeNull();
+			expect(
+				f.reads.every(
+					(r) =>
+						(r.opts?.maxBytes ?? Infinity) <= FILE_PANEL_PAGE_BYTES + 3 &&
+						r.opts?.timeoutMs &&
+						r.opts?.signal,
+				),
+			).toBe(true);
+			for (const continuation of [1, 2, 3]) {
+				const jumped = await f.service.filePanelPage(
+					"n",
+					"visitor",
+					target,
+					FILE_PANEL_PAGE_BYTES - 1 + continuation,
+				);
+				expect(jumped.offset).toBe(FILE_PANEL_PAGE_BYTES - 1);
+				expect(jumped.content).toBe("\u{1F600}中文");
+				expect(jumped.nextOffset).toBeNull();
+			}
+			const eof = await f.service.filePanelPage("n", "visitor", target, info.size);
+			expect(eof.offset).toBe(info.size);
+			expect(eof.content).toBe("");
+			expect(eof.nextOffset).toBeNull();
+		});
+	}
+	test("aligned jumps stay within a page and sequential browsing loses no UTF-8 bytes", async () => {
+		const f = fixture();
+		const target = { deviceId: f.id, path: "/work/file.ts" };
+		const text = "中文\u{1F600}".repeat(FILE_PANEL_PAGE_BYTES / 2);
+		f.files.set(target.path, text);
+		let offset = 0;
+		let joined = "";
+		while (true) {
+			const page = await f.service.filePanelPage("n", "visitor", target, offset);
+			expect(page.offset).toBe(offset);
+			expect(Buffer.byteLength(page.content)).toBeLessThanOrEqual(FILE_PANEL_PAGE_BYTES);
+			joined += page.content;
+			if (page.nextOffset === null) break;
+			offset = page.nextOffset;
+		}
+		expect(joined).toBe(text);
+		for (const offset of [
+			FILE_PANEL_PAGE_BYTES,
+			2 * FILE_PANEL_PAGE_BYTES,
+			3 * FILE_PANEL_PAGE_BYTES,
+		]) {
+			const page = await f.service.filePanelPage("n", "visitor", target, offset);
+			expect(page.offset).toBeLessThanOrEqual(offset);
+			expect(page.offset).toBeGreaterThanOrEqual(offset - 3);
+			expect(Buffer.byteLength(page.content)).toBeLessThanOrEqual(FILE_PANEL_PAGE_BYTES);
+		}
+		expect(
+			f.reads.every((read) => (read.opts?.maxBytes ?? Infinity) <= FILE_PANEL_PAGE_BYTES + 3),
+		).toBe(true);
+	});
+	test("large selections resolve without reads while snapshots retain 1 MiB limit", async () => {
+		const f = fixture();
+		f.files.set("/work/file.ts", "a".repeat(1024 * 1024 + 1));
+		const target = {
+			deviceId: f.id,
+			path: "/work/file.ts",
+			selection: selection(999999, 1, 999999, 2),
+		};
+		expect(await f.service.resolveFileReferences("n", "visitor", [target])).toEqual([target]);
+		expect(f.reads).toHaveLength(0);
+		await expect(
+			f.service.captureFileReferences("n", "visitor", [
+				ref(target.path, { selection: target.selection }),
+			]),
+		).rejects.toMatchObject({ code: "FILE_REFERENCE_SOURCE_TOO_LARGE" });
+	});
+	test("permissions, secret aliases, invalid offsets and binary data fail closed", async () => {
+		const f = fixture();
+		const target = { deviceId: f.id, path: "/work/file.ts" };
+		f.setDecision("ask");
+		await expect(f.service.filePanelInfo("n", "visitor", target)).rejects.toMatchObject({
+			statusCode: 403,
+		});
+		await expect(f.service.filePanelPage("n", "visitor", target, 0)).rejects.toMatchObject({
+			statusCode: 403,
+		});
+		f.setDecision("allow");
+		f.aliases.set("/work/secret-alias", target.path);
+		await expect(
+			f.service.filePanelInfo("n", "visitor", { ...target, path: "/work/secret-alias" }),
+		).rejects.toMatchObject({ statusCode: 403 });
+		for (const offset of [-1, 0.5, MAX_FILE_PANEL_BYTES + 1, 100])
+			await expect(f.service.filePanelPage("n", "visitor", target, offset)).rejects.toMatchObject({
+				code: "FILE_REFERENCE_INVALID_OFFSET",
+			});
+		f.files.set(target.path, "a\0b");
+		await expect(f.service.filePanelPage("n", "visitor", target, 0)).rejects.toMatchObject({
+			statusCode: 415,
+		});
+	});
+	test("metadata reports over-limit files without reading but page rejects them", async () => {
+		const f = fixture();
+		const original = f.backend.statFile;
+		let size = MAX_FILE_PANEL_BYTES;
+		f.backend.statFile = async (path) => {
+			const stat = await original(path);
+			return stat ? { ...stat, size } : null;
+		};
+		const target = { deviceId: f.id, path: "/work/file.ts" };
+		expect((await f.service.filePanelInfo("n", "visitor", target)).size).toBe(MAX_FILE_PANEL_BYTES);
+		size++;
+		expect(await f.service.filePanelInfo("n", "visitor", target)).toMatchObject({
+			fileName: "file.ts",
+			size: MAX_FILE_PANEL_BYTES + 1,
+		});
+		await expect(f.service.filePanelPage("n", "visitor", target, 0)).rejects.toMatchObject({
+			statusCode: 413,
+		});
+		expect(f.reads).toHaveLength(0);
+	});
+	test("page cancellation and shared deadline abort reads and report failure", async () => {
+		for (const cancel of [false, true]) {
+			const f = fixture({ readTimeoutMs: 20 });
+			f.setReadHook(
+				async (_path, opts) =>
+					new Promise((_resolve, reject) => {
+						opts?.signal?.addEventListener("abort", () => reject(opts.signal?.reason), {
+							once: true,
+						});
+					}),
+			);
+			const controller = new AbortController();
+			const pending = f.service.filePanelPage(
+				"n",
+				"visitor",
+				{ deviceId: f.id, path: "/work/file.ts" },
+				0,
+				controller.signal,
+			);
+			if (cancel) controller.abort();
+			await expect(pending).rejects.toMatchObject({
+				code: cancel ? "FILE_REFERENCE_CANCELLED" : "FILE_REFERENCE_TIMEOUT",
+			});
+			expect(f.events.at(-1)?.failed).toBe(true);
+		}
+	});
+	test("post-open growth beyond 1 GiB and changed identity are rejected", async () => {
+		const f = fixture();
+		const target = { deviceId: f.id, path: "/work/file.ts" };
+		f.setReadHook(async () => ({
+			bytes: new Uint8Array([97]),
+			totalSize: MAX_FILE_PANEL_BYTES + 1,
+			truncated: true,
+			resolvedPath: target.path,
+		}));
+		await expect(f.service.filePanelPage("n", "visitor", target, 0)).rejects.toMatchObject({
+			statusCode: 413,
+		});
+		f.setReadHook(async () => ({
+			bytes: new Uint8Array([97]),
+			totalSize: 1,
+			truncated: false,
+			resolvedPath: "/work/other",
+		}));
+		await expect(f.service.filePanelPage("n", "visitor", target, 0)).rejects.toMatchObject({
+			statusCode: 409,
+		});
+	});
+});
 
 describe("image file reference previews", () => {
 	for (const remote of [false, true]) {

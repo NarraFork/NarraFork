@@ -232,6 +232,26 @@ describe("startPanelDrag subject classification", () => {
 		offEnd();
 	});
 
+	test("detached file consent is carried separately from its resource identity", () => {
+		for (const largeFileConfirmed of [true, false, undefined]) {
+			startDetachedPanelDrag({
+				id: "detached_1",
+				title: "large.ts",
+				toolKind: "file",
+				resourceId: "/repo/large.ts",
+				largeFileConfirmed,
+				x: 0,
+				y: 0,
+			});
+			dispatch("pointermove", 40, 0);
+			const final = getPanelDrag();
+			dispatch("pointerup", 40, 0);
+			expect(final?.resourceId).toBe("/repo/large.ts");
+			if (largeFileConfirmed) expect(final?.largeFileConfirmed).toBe(true);
+			else expect(final).not.toHaveProperty("largeFileConfirmed");
+		}
+	});
+
 	test("surfaceId / toolKind / resourceId are carried through", () => {
 		let final: PanelDragState | null = null;
 		const offEnd = onPanelDragEnd((s) => {
@@ -245,6 +265,7 @@ describe("startPanelDrag subject classification", () => {
 			surfaceId: "chap_1",
 			toolKind: "file",
 			resourceId: "/repo/a.ts",
+			largeFileConfirmed: true,
 			x: 0,
 			y: 0,
 		});
@@ -254,6 +275,7 @@ describe("startPanelDrag subject classification", () => {
 			surfaceId: "chap_1",
 			toolKind: "file",
 			resourceId: "/repo/a.ts",
+			largeFileConfirmed: true,
 		});
 		offEnd();
 	});

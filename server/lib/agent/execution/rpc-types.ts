@@ -27,6 +27,8 @@ export const FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE = FEATURE_FS_WRITE_ATOMIC_RES
 export const FEATURE_GLOB_BOUNDED_V1 = "glob.bounded.v1";
 /** Reads check cancellation between chunks and revalidate identity/size after reading. */
 export const FEATURE_FS_READ_BOUNDED_V1 = "fs.read.bounded.v1";
+/** Bounded positional reads; older executors must never silently return the prefix. */
+export const FEATURE_FS_READ_OFFSET_V1 = "fs.read.offset.v1";
 /** Serialized content check + replacement; does not exclude external filesystem writers. */
 export const FEATURE_FS_CONDITIONAL_WRITE_V1 = "fs.write.conditional.v1";
 

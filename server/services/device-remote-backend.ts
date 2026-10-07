@@ -49,6 +49,7 @@ import type {
 import {
 	FEATURE_FS_CONDITIONAL_WRITE_V1,
 	FEATURE_FS_READ_BOUNDED_V1,
+	FEATURE_FS_READ_OFFSET_V1,
 	FEATURE_GLOB_BOUNDED_V1,
 	FS_READ_ATOMIC_RESOLVED_PATH_FEATURE,
 	FS_STAT_RESOLVED_PATH_FEATURE,
@@ -260,6 +261,11 @@ export class RemoteBackend implements ExecutionBackend {
 	}
 
 	async readFileBytes(path: string, opts?: ReadBytesOptions): Promise<ReadBytesResult> {
+		if (
+			opts?.offset !== undefined &&
+			(!Number.isSafeInteger(opts.offset) || opts.offset < 0 || opts.maxBytes === undefined)
+		)
+			throw new RangeError("Positional reads require a nonnegative safe offset and maxBytes");
 		const expectedResolvedPath = opts?.expectedResolvedPath;
 		if (expectedResolvedPath && !this.supportsFsReadAtomicResolvedPath) {
 			throw new Error(`Remote device ${this.deviceId} does not support atomic resolved-path reads`);
@@ -269,6 +275,7 @@ export class RemoteBackend implements ExecutionBackend {
 			{
 				path,
 				maxBytes: opts?.maxBytes ?? this.maxBytes,
+				...(opts?.offset !== undefined ? { offset: opts.offset } : {}),
 				timeoutMs: opts?.timeoutMs,
 				...(expectedResolvedPath ? { expectedResolvedPath } : {}),
 			},
@@ -278,6 +285,7 @@ export class RemoteBackend implements ExecutionBackend {
 				requiredFeatures: [
 					...(expectedResolvedPath ? [FS_READ_ATOMIC_RESOLVED_PATH_FEATURE] : []),
 					...(opts?.timeoutMs !== undefined ? [FEATURE_FS_READ_BOUNDED_V1] : []),
+					...(opts?.offset !== undefined ? [FEATURE_FS_READ_OFFSET_V1] : []),
 				],
 			},
 		)) as FsReadResult;

@@ -219,7 +219,10 @@ const ChapterNodeDockSurface = memo(function ChapterNodeDockSurface({
 			// Multi-instance kinds are keyed by their resource; the rest are singletons
 			// per surface (`dockPanelId` deliberately does not accept the former).
 			if ((kind === "subagent" || kind === "file") && !drag.resourceId) return;
-			const fileTarget = filePanelResourceParams(drag.resourceId ?? "");
+			const fileTarget = {
+				...filePanelResourceParams(drag.resourceId ?? ""),
+				...(drag.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
+			};
 			const panelId =
 				kind === "subagent"
 					? subagentDockPanelId(drag.resourceId as string)
@@ -246,8 +249,12 @@ const ChapterNodeDockSurface = memo(function ChapterNodeDockSurface({
 			// second, so the panel does not exist in two places.
 			const existing = api.getPanel(panelId);
 			if (existing) {
-				if (kind === "file" && fileTarget.referenceOrigin) {
-					existing.api.updateParameters({ ...existing.params, referenceOrigin: true });
+				if (kind === "file" && (fileTarget.referenceOrigin || fileTarget.largeFileConfirmed)) {
+					existing.api.updateParameters({
+						...existing.params,
+						...(fileTarget.referenceOrigin ? { referenceOrigin: true } : {}),
+						...(fileTarget.largeFileConfirmed ? { largeFileConfirmed: true } : {}),
+					});
 				}
 				existing.api.moveTo({ group, position });
 				existing.api.setActive();
