@@ -551,7 +551,7 @@ export function AuthenticatedLayout() {
 								variant="subtle"
 								color="gray"
 								component="a"
-								href="https://github.com/Narrafork/narrafork-issue/issues"
+								href="https://github.com/NarraFork/NarraFork/issues"
 								target="_blank"
 								rel="noopener noreferrer"
 							>
