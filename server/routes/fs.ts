@@ -38,6 +38,8 @@ import { requireNarratorAccess } from "../lib/narrator-access";
 import { IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
 import { settings } from "../lib/settings";
 import { fsWriteSchema } from "../lib/validators/fs";
+import { readLegacyFilePanel } from "../services/editor-document-panel";
+import type { EditorActor } from "../services/editor-document-service";
 import { LocalFileValidationError } from "../services/file-change-local-io";
 import {
 	EditorFileChangeUncertainError,
@@ -283,6 +285,50 @@ class ForbiddenPathError extends AppError {
 	constructor() {
 		super(SECRET_PATH_REFUSAL, 403, "FORBIDDEN_PATH");
 	}
+}
+
+/** Broad local preview authorization, deliberately distinct from the editor's symlink denial. */
+const previewPanelActor: EditorActor = {
+	userId: "",
+	narratorId: "",
+	async authorize(input, _need, signal, timeoutMs) {
+		const lexicalPath = resolve(input.path);
+		assertReadableThroughFileApi(lexicalPath);
+		const identity = await localBackend.resolvePathIdentity(lexicalPath, { signal, timeoutMs });
+		// Aliases to credentials remain forbidden, even though ordinary symlinks are readable.
+		assertReadableThroughFileApi(identity.canonicalPath);
+		return {
+			cwd: resolve("."),
+			projectId: null,
+			lexicalPath,
+			canonicalPath: identity.canonicalPath,
+			outsideRoots: false,
+		};
+	},
+};
+for (const endpoint of ["panel-info", "panel-page"] as const) {
+	fsRoutes.get(`/${endpoint}`, async (c) => {
+		const deviceId = c.req.query("deviceId");
+		if (deviceId !== undefined && deviceId !== LOCAL_DEVICE_ID)
+			throw new AppError("Preview panels are local only", 422, "EDITOR_REMOTE_UNSUPPORTED");
+		let offset: number | undefined;
+		if (endpoint === "panel-page") {
+			const rawOffset = c.req.query("offset");
+			if (!rawOffset || !/^\d+$/.test(rawOffset))
+				throw new ValidationError("Byte offset is required");
+			offset = Number(rawOffset);
+		}
+		c.header("Cache-Control", "no-store");
+		return c.json(
+			await readLegacyFilePanel(
+				previewPanelActor,
+				c.req.query("path"),
+				offset,
+				c.req.raw.signal,
+				localBackend,
+			),
+		);
+	});
 }
 
 /**

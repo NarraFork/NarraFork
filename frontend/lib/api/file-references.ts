@@ -1,9 +1,13 @@
 import {
+	FILE_PANEL_PAGE_BYTES,
 	FILE_REFERENCE_READ_TIMEOUT_MS,
 	FILE_REFERENCE_SEARCH_TIMEOUT_MS,
+	type FilePanelInfo,
+	type FilePanelPage,
 	type FileReferencePreview,
 	type FileReferenceSearchResult,
 	type FileTarget,
+	MAX_FILE_PANEL_BYTES,
 	MAX_FILE_REFERENCE_COUNT,
 	MAX_FILE_REFERENCE_METADATA_BYTES,
 	MAX_FILE_REFERENCE_PATH_CHARS,
@@ -19,6 +23,23 @@ import { ApiError, authorizedFetch, readFetchError } from "./client";
 
 function basePath(narratorId: string): string {
 	return `/api/narrators/${encodeURIComponent(narratorId)}/file-references`;
+}
+
+export type FilePanelReadOrigin = "legacy" | "reference" | "preview";
+
+/** Local editor and preview entries retain their own authorizers; remote never falls back. */
+function panelReadPath(
+	narratorId: string,
+	target: FileTarget,
+	origin: FilePanelReadOrigin,
+	action: "info" | "page",
+): string {
+	if (target.deviceId === "local") {
+		if (origin === "preview") return `/api/fs/panel-${action}`;
+		if (origin === "legacy")
+			return `/api/narrators/${encodeURIComponent(narratorId)}/editor-documents/${action}`;
+	}
+	return `${basePath(narratorId)}/${action}`;
 }
 
 /** Abort and reject over-budget bodies during streaming, before JSON.parse can allocate them. */
@@ -114,6 +135,49 @@ export function localFileImagePreview(path: string, signal?: AbortSignal): Promi
 
 /** Metadata-only search/resolve. Preview readers never create snapshots. */
 export const fileReferenceApi = {
+	info(
+		narratorId: string,
+		target: FileTarget,
+		signal?: AbortSignal,
+		origin: FilePanelReadOrigin = "reference",
+	): Promise<FilePanelInfo> {
+		if (target.path.length > MAX_FILE_REFERENCE_PATH_CHARS)
+			return Promise.reject(new Error("File path exceeds the limit"));
+		const query = new URLSearchParams({ deviceId: target.deviceId, path: target.path });
+		return boundedRequest(
+			`${panelReadPath(narratorId, target, origin, "info")}?${query}`,
+			MAX_FILE_REFERENCE_METADATA_BYTES,
+			FILE_REFERENCE_READ_TIMEOUT_MS,
+			{ signal },
+		);
+	},
+	page(
+		narratorId: string,
+		target: FileTarget,
+		offset: number,
+		signal?: AbortSignal,
+		origin: FilePanelReadOrigin = "reference",
+	): Promise<FilePanelPage> {
+		if (
+			target.path.length > MAX_FILE_REFERENCE_PATH_CHARS ||
+			!Number.isSafeInteger(offset) ||
+			offset < 0 ||
+			offset > MAX_FILE_PANEL_BYTES
+		)
+			return Promise.reject(new Error("Invalid file panel target or offset"));
+		const query = new URLSearchParams({
+			deviceId: target.deviceId,
+			path: target.path,
+			offset: String(offset),
+		});
+		// JSON may escape every source byte as six bytes (e.g. control characters).
+		return boundedRequest(
+			`${panelReadPath(narratorId, target, origin, "page")}?${query}`,
+			FILE_PANEL_PAGE_BYTES * 6 + MAX_FILE_REFERENCE_METADATA_BYTES,
+			FILE_REFERENCE_READ_TIMEOUT_MS,
+			{ signal },
+		);
+	},
 	search(
 		narratorId: string,
 		options: { q: string; deviceId?: string; directory?: string },

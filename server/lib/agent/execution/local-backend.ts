@@ -238,6 +238,7 @@ async function readOpenedFileWithLimit(
 	file: FileHandle,
 	maxBytes: number | undefined,
 	signal?: AbortSignal,
+	startOffset = 0,
 ): Promise<{ bytes: Uint8Array; probeTruncated: boolean }> {
 	if (maxBytes !== undefined) {
 		// Keep one probe byte beyond the caller-visible cap. This detects growth and
@@ -247,7 +248,7 @@ async function readOpenedFileWithLimit(
 		while (offset < buffer.byteLength) {
 			throwIfReadAborted(signal);
 			const length = Math.min(FILE_READ_CHUNK_BYTES, buffer.byteLength - offset);
-			const { bytesRead } = await file.read(buffer, offset, length, offset);
+			const { bytesRead } = await file.read(buffer, offset, length, startOffset + offset);
 			if (bytesRead === 0) break;
 			offset += bytesRead;
 		}
@@ -262,7 +263,7 @@ async function readOpenedFileWithLimit(
 	while (true) {
 		throwIfReadAborted(signal);
 		const chunk = new Uint8Array(FILE_READ_CHUNK_BYTES);
-		const { bytesRead } = await file.read(chunk, 0, chunk.byteLength, total);
+		const { bytesRead } = await file.read(chunk, 0, chunk.byteLength, startOffset + total);
 		if (bytesRead === 0) break;
 		chunks.push(bytesRead === chunk.byteLength ? chunk : chunk.subarray(0, bytesRead));
 		total += bytesRead;
@@ -422,6 +423,13 @@ export class LocalBackend implements ExecutionBackend {
 	async readFileBytes(path: string, opts?: ReadBytesOptions): Promise<ReadBytesResult> {
 		throwIfReadAborted(opts?.signal);
 		const maxBytes = normalizeMaxBytes(opts?.maxBytes);
+		const offset = opts?.offset ?? 0;
+		if (
+			!Number.isSafeInteger(offset) ||
+			offset < 0 ||
+			(opts?.offset !== undefined && maxBytes === undefined)
+		)
+			throw new RangeError("Positional reads require a nonnegative safe offset and maxBytes");
 		const resolvedPath = await resolveCanonicalPath(path);
 		const expectedResolvedPath = opts?.expectedResolvedPath ?? resolvedPath;
 		if (!pathsEqualForOS(resolvedPath, expectedResolvedPath, process.platform)) {
@@ -436,14 +444,14 @@ export class LocalBackend implements ExecutionBackend {
 		const file = await open(resolvedPath, flags);
 		try {
 			const openedStat = await verifyOpenedFileIdentity(file, path, expectedResolvedPath);
-			const read = await readOpenedFileWithLimit(file, maxBytes, opts?.signal);
+			const read = await readOpenedFileWithLimit(file, maxBytes, opts?.signal, offset);
 			// Revalidate after the read so a final-entry or parent-directory swap that
 			// happened while bytes were in flight cannot be returned to the caller.
 			const finalStat = await verifyOpenedFileIdentity(file, path, expectedResolvedPath);
 			const totalSize = Math.max(openedStat.size, finalStat.size, read.bytes.byteLength);
 			return {
 				bytes: read.bytes,
-				truncated: read.probeTruncated || (maxBytes !== undefined && totalSize > maxBytes),
+				truncated: read.probeTruncated || (maxBytes !== undefined && totalSize > offset + maxBytes),
 				totalSize,
 				resolvedPath: expectedResolvedPath,
 			};

@@ -15,6 +15,7 @@ import {
 	createEditorDocumentSchema,
 	createEditorUploadSchema,
 } from "../lib/validators/editor-documents";
+import { readLegacyFilePanel } from "../services/editor-document-panel";
 import {
 	editorRuntimeUnavailable,
 	getEditorDocumentService,
@@ -147,7 +148,11 @@ export function createEditorDocumentRoutes(
 	};
 	const base = "/:id/editor-documents";
 	routes.use(`${base}/*`, async (c, next) => {
-		await protect(c);
+		if (c.req.method === "GET" && /\/editor-documents\/(info|page)$/.test(c.req.path)) {
+			// The panel operation budgets access checks together with metadata/IO.
+			if (!c.get("user")?.sub) throw new AppError("Authentication required", 401, "UNAUTHORIZED");
+			c.header("Cache-Control", "no-store");
+		} else await protect(c);
 		await next();
 	});
 	routes.use(base, async (c, next) => {
@@ -163,6 +168,31 @@ export function createEditorDocumentRoutes(
 		if (error instanceof AppError)
 			return c.json({ error: error.message, code: error.code }, error.statusCode as 400);
 		throw error;
+	});
+	const localPanelDevice = (c: Context) => {
+		const deviceId = c.req.query("deviceId");
+		if (deviceId !== undefined && deviceId !== "local")
+			throw new AppError("Legacy panels are local only", 422, "EDITOR_REMOTE_UNSUPPORTED");
+	};
+	routes.get(`${base}/info`, async (c) => {
+		localPanelDevice(c);
+		return c.json(
+			await readLegacyFilePanel(editorActor(c), c.req.query("path"), undefined, c.req.raw.signal),
+		);
+	});
+	routes.get(`${base}/page`, async (c) => {
+		localPanelDevice(c);
+		const rawOffset = c.req.query("offset");
+		if (!rawOffset || !/^\d+$/.test(rawOffset))
+			throw new AppError("Byte offset is required", 400, "VALIDATION_ERROR");
+		return c.json(
+			await readLegacyFilePanel(
+				editorActor(c),
+				c.req.query("path"),
+				Number(rawOffset),
+				c.req.raw.signal,
+			),
+		);
 	});
 	routes.post(base, async (c) =>
 		c.json(

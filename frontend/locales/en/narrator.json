@@ -1,5 +1,18 @@
 {
 	"you": "You",
+	"largeFile": {
+		"size": "File size: {{size}} ({{bytes}} bytes)",
+		"deferred": "This file exceeds 1 MiB. Content has not been loaded. Continue to view it in read-only pages; your choice is saved for this pane only.",
+		"blocked": "This file exceeds the 1 GiB viewing limit.",
+		"viewAnyway": "View anyway",
+		"pagedReadOnly": "Large file: read-only pages of up to 256 KiB. Full-document editing, highlighting and line navigation are unavailable.",
+		"retry": "Retry",
+		"previous": "Previous",
+		"next": "Next",
+		"byteRange": "Bytes {{start}}–{{end}}",
+		"pageNumber": "Page number",
+		"go": "Go"
+	},
 	"asyncQuestionResolved": "Agent responded",
 	"asyncQuestionPending": "Answered · awaiting Agent response",
 	"asyncQuestionLater": "You can answer later",

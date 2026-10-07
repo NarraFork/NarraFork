@@ -93,6 +93,17 @@ describe("buildPanelWindowHref + parsePanelWindowDescriptor", () => {
 		});
 	});
 
+	test("preserves only explicit panel-local large file consent in the window descriptor", () => {
+		const file = { panelType: "file", filePath: "/large.ts", deviceId: "Remote" } as const;
+		expect(roundtrip({ ...file, largeFileConfirmed: true })).toEqual({
+			...file,
+			largeFileConfirmed: true,
+		});
+		for (const largeFileConfirmed of [false, "true", 1, undefined]) {
+			expect(normalizePanelWindowDescriptor({ ...file, largeFileConfirmed })).toEqual(file);
+		}
+	});
+
 	test("strips transient and surface-bookkeeping fields", () => {
 		// highlightMessageId/highlightRequestId are one-shot jump requests — a window
 		// opened from a layout restore must not re-run them.

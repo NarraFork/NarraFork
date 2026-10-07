@@ -128,6 +128,8 @@ import {
 	DEFAULT_CONTEXT_THRESHOLDS_DRAFT,
 } from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
+import { getFilePreviewType } from "./file-panel/FilePreviewModal";
+import { LargeFileGate } from "./file-panel/LargeFileGate";
 import { HeaderToolbar } from "./header/HeaderToolbar";
 import { showHeaderLeadingChrome } from "./header/header-leading-chrome";
 import { HEADER_LEADING_GAP_PX, headerTitleLayoutWidth } from "./header/header-title-width";
@@ -3540,16 +3542,26 @@ function NarratorPanelBody({
 									</Center>
 								}
 							>
-								<FileViewerContent
-									key={internalFileViewerPath}
-									filePath={internalFileViewerPath}
+								<LargeFileGate
 									narratorId={narratorId}
 									deviceId={internalFileViewerTarget?.deviceId ?? "local"}
 									referenceOrigin={!!internalFileViewerTarget}
-									selection={internalFileViewerTarget?.selection}
-									highlightRequestId={internalFileViewerTarget?.highlightRequestId}
-									onOpenFileTarget={handleOpenReferencedFile}
-								/>
+									legacyViewer
+									filePath={internalFileViewerPath}
+									enabled={getFilePreviewType(internalFileViewerPath) === "text"}
+									persistenceKey={`narrafork:large-file-drawer:${narratorId}`}
+								>
+									<FileViewerContent
+										key={internalFileViewerPath}
+										filePath={internalFileViewerPath}
+										narratorId={narratorId}
+										deviceId={internalFileViewerTarget?.deviceId ?? "local"}
+										referenceOrigin={!!internalFileViewerTarget}
+										selection={internalFileViewerTarget?.selection}
+										highlightRequestId={internalFileViewerTarget?.highlightRequestId}
+										onOpenFileTarget={handleOpenReferencedFile}
+									/>
+								</LargeFileGate>
 							</Suspense>
 						</Drawer>
 					)}

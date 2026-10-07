@@ -84,7 +84,12 @@ describe("serialize / parse round-trip", () => {
 			toJSON: fakeLayout(["chat", "sub", "file"], {
 				chat: { panelType: "chat", narratorId: "narr_1", chapterId: "chap_1" },
 				sub: { panelType: "subagent", subagentNarratorId: "narr_child", narratorId: "narr_1" },
-				file: { panelType: "file", filePath: "/repo/a.ts", chapterId: "chap_1" },
+				file: {
+					panelType: "file",
+					filePath: "/repo/a.ts",
+					chapterId: "chap_1",
+					largeFileConfirmed: true,
+				},
 			}),
 		});
 		const parsed = parseChapterDockLayout(serializeChapterDockLayout(api)) as SerializedDockview;
@@ -98,6 +103,7 @@ describe("serialize / parse round-trip", () => {
 		// Resource identity survives — without it these panels point at nothing.
 		expect(panels.sub.params.subagentNarratorId).toBe("narr_child");
 		expect(panels.file.params.filePath).toBe("/repo/a.ts");
+		expect(panels.file.params.largeFileConfirmed).toBe(true);
 		// Panel kind survives too.
 		expect(panels.chat.params.panelType).toBe("chat");
 	});

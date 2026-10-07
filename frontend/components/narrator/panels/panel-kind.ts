@@ -144,6 +144,8 @@ export interface FileOpenOptions {
 
 export interface FilePanelParams extends FileOpenOptions {
 	panelType: "file";
+	/** Panel-local loading consent; never part of the resource/deduplication identity. */
+	largeFileConfirmed?: boolean;
 	/** Absolute path of the file being viewed. */
 	filePath: string;
 	/** Optional display-name override (defaults to the path's basename). */

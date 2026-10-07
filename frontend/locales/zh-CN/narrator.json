@@ -1,5 +1,18 @@
 {
 	"you": "你",
+	"largeFile": {
+		"size": "文件大小：{{size}}（{{bytes}} 字节）",
+		"deferred": "文件超过 1 MiB，尚未加载内容。确认后将以只读分页方式查看；该选择仅对当前窗格保存。",
+		"blocked": "文件超过 1 GiB，无法在窗格内查看。",
+		"viewAnyway": "仍要查看",
+		"pagedReadOnly": "大文件只读分页查看，每页最多 256 KiB。不提供全文编辑、高亮或行号定位。",
+		"retry": "重试",
+		"previous": "上一页",
+		"next": "下一页",
+		"byteRange": "字节 {{start}}–{{end}}",
+		"pageNumber": "页码",
+		"go": "跳转"
+	},
 	"asyncQuestionResolved": "Agent 已回应",
 	"asyncQuestionPending": "已回答，待 Agent 回应",
 	"asyncQuestionLater": "可稍后回答",

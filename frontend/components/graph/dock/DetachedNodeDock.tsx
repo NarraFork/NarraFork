@@ -87,6 +87,7 @@ function paramsOf(panel: DetachedPanelEntry, narratorId: string, chapterId: stri
 			filePath: panel.filePath ?? "",
 			deviceId: panel.deviceId ?? "local",
 			referenceOrigin: panel.referenceOrigin === true,
+			...(panel.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
 			...(panel.toolEdit ? { toolEdit: panel.toolEdit } : {}),
 			...(panel.fileNarratorId ? { fileNarratorId: panel.fileNarratorId } : {}),
 		};
@@ -167,8 +168,12 @@ export const DetachedNodeDock = memo(function DetachedNodeDock({
 					if (!panelId) continue;
 					const existing = api.getPanel(panelId);
 					if (existing) {
-						if (panel.kind === "file" && panel.referenceOrigin) {
-							existing.api.updateParameters({ ...existing.params, referenceOrigin: true });
+						if (panel.kind === "file" && (panel.referenceOrigin || panel.largeFileConfirmed)) {
+							existing.api.updateParameters({
+								...existing.params,
+								...(panel.referenceOrigin ? { referenceOrigin: true } : {}),
+								...(panel.largeFileConfirmed ? { largeFileConfirmed: true } : {}),
+							});
 						}
 						continue;
 					}
@@ -227,7 +232,10 @@ export const DetachedNodeDock = memo(function DetachedNodeDock({
 			const direction = target.intent === "swap" ? "within" : intentToDirection(target.intent);
 
 			if ((kind === "subagent" || kind === "file") && !drag.resourceId) return;
-			const fileTarget = filePanelResourceParams(drag.resourceId ?? "");
+			const fileTarget = {
+				...filePanelResourceParams(drag.resourceId ?? ""),
+				...(drag.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
+			};
 			const panelId =
 				kind === "subagent"
 					? subagentDockPanelId(drag.resourceId as string)
@@ -250,8 +258,12 @@ export const DetachedNodeDock = memo(function DetachedNodeDock({
 			// Already here: focus it rather than adding a second.
 			const existing = api.getPanel(panelId);
 			if (existing) {
-				if (kind === "file" && fileTarget.referenceOrigin) {
-					existing.api.updateParameters({ ...existing.params, referenceOrigin: true });
+				if (kind === "file" && (fileTarget.referenceOrigin || fileTarget.largeFileConfirmed)) {
+					existing.api.updateParameters({
+						...existing.params,
+						...(fileTarget.referenceOrigin ? { referenceOrigin: true } : {}),
+						...(fileTarget.largeFileConfirmed ? { largeFileConfirmed: true } : {}),
+					});
 				}
 				existing.api.moveTo({ group, position });
 				existing.api.setActive();

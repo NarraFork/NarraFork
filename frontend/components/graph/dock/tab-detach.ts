@@ -50,6 +50,8 @@ export interface TabDetachSubject {
 	kind: DetachablePanelKind;
 	/** Resource identity for multi-instance kinds (subagent narrator, file path). */
 	resourceId?: string;
+	/** Panel-local loading state, intentionally separate from resource identity. */
+	largeFileConfirmed?: boolean;
 }
 
 /**
@@ -62,7 +64,7 @@ export interface TabDetachSubject {
  */
 export function readPanelSubject(
 	params: unknown,
-): { kind: DetachablePanelKind; resourceId?: string } | null {
+): Pick<TabDetachSubject, "kind" | "resourceId" | "largeFileConfirmed"> | null {
 	if (!params || typeof params !== "object") return null;
 	const p = params as {
 		panelType?: unknown;
@@ -71,6 +73,7 @@ export function readPanelSubject(
 		fileNarratorId?: unknown;
 		deviceId?: unknown;
 		referenceOrigin?: unknown;
+		largeFileConfirmed?: unknown;
 		toolEdit?: unknown;
 	};
 	if (!isDetachablePanelKind(p.panelType)) return null;
@@ -91,7 +94,11 @@ export function readPanelSubject(
 						typeof p.fileNarratorId === "string" ? p.fileNarratorId : undefined,
 					)
 				: undefined;
-	return resourceId ? { kind, resourceId } : { kind };
+	return {
+		kind,
+		...(resourceId ? { resourceId } : {}),
+		...(kind === "file" && p.largeFileConfirmed === true ? { largeFileConfirmed: true } : {}),
+	};
 }
 
 /**

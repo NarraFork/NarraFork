@@ -41,7 +41,33 @@ mock.module("../narrator/NarratorPanel", () => ({ NarratorPanel: ChatProbe }));
 mock.module("../terminal/NarratorTerminal", () => ({
 	NarratorTerminal: () => <div data-terminal style={{ height: "100%", minHeight: 0 }} />,
 }));
-// Load the real view before mounting so the first assertion is not a lazy-import race.
+mock.module("../narrator/file-panel/LargeFileGate", () => ({
+	LargeFileGate: (props: {
+		confirmed?: boolean;
+		onConfirm?: () => void;
+		children: React.ReactNode;
+	}) =>
+		props.confirmed ? (
+			props.children
+		) : (
+			<button type="button" data-confirm-large onClick={props.onConfirm}>
+				confirm
+			</button>
+		),
+}));
+mock.module("../narrator/file-editor/FileEditorContent", () => ({
+	FileEditorContent: () => <div data-file-editor />,
+}));
+mock.module("../narrator/file-viewer/FileViewerContent", () => ({
+	FileViewerContent: () => <div data-file-preview />,
+}));
+mock.module("../narrator/tool-call/ToolEditFileViewer", () => ({
+	ToolEditFileViewer: () => <div data-tool-edit />,
+}));
+// Load the views before mounting so the first assertion is not a lazy-import race.
+await import("../narrator/file-editor/FileEditorContent");
+await import("../narrator/file-viewer/FileViewerContent");
+await import("../narrator/tool-call/ToolEditFileViewer");
 await import("../plugins/PluginDockPanel");
 const { StandalonePanelWindow } = await import("./StandalonePanelWindow");
 const { SubagentSessionPanelContent } = await import("../narrator/dock/panels");
@@ -152,6 +178,70 @@ const plugin: PluginDockPanelParams = {
 	panelInstanceId: "i1",
 	binding: { kind: "focus-current-narrator", narratorId: "n1" },
 };
+
+describe("standalone file loading consent", () => {
+	test("blocks the editor until consent, persists only this window URL and restores on reload", async () => {
+		const descriptor = {
+			panelType: "file",
+			filePath: "/large.ts",
+			deviceId: "Remote",
+			fileNarratorId: "n1",
+		} as const;
+		let href = `https://example.test/mount/windows/panel?keep=yes&d=${encodeURIComponent(JSON.stringify(descriptor))}#anchor`;
+		const state = { router: "state" };
+		const replaceState = mock((nextState: unknown, _title: string, url: string) => {
+			expect(nextState).toBe(state);
+			href = url;
+		});
+		Object.assign(window, {
+			location: {
+				get href() {
+					return href;
+				},
+			},
+			history: { state, replaceState },
+		});
+		await render(<StandalonePanelWindow descriptor={descriptor} />);
+		expect(container.querySelector("[data-file-editor]")).toBeNull();
+		await act(async () => {
+			container
+				.querySelector("[data-confirm-large]")
+				?.dispatchEvent(new window.Event("click", { bubbles: true }));
+		});
+		expect(container.querySelector("[data-file-editor]")).not.toBeNull();
+		expect(replaceState).toHaveBeenCalledTimes(1);
+		const url = new URL(href);
+		expect(url.pathname).toBe("/mount/windows/panel");
+		expect(url.searchParams.get("keep")).toBe("yes");
+		expect(url.hash).toBe("#anchor");
+		const restored = JSON.parse(url.searchParams.get("d") ?? "null");
+		expect(restored).toEqual({ ...descriptor, largeFileConfirmed: true });
+		await render(<StandalonePanelWindow descriptor={restored} />);
+		expect(container.querySelector("[data-file-editor]")).not.toBeNull();
+		expect(container.querySelector("[data-confirm-large]")).toBeNull();
+		await render(<StandalonePanelWindow descriptor={{ ...descriptor, filePath: "/other.ts" }} />);
+		expect(container.querySelector("[data-file-editor]")).toBeNull();
+		expect(container.querySelector("[data-confirm-large]")).not.toBeNull();
+		expect(replaceState).toHaveBeenCalledTimes(1);
+	});
+
+	test("leaves binary previews and historical edit viewers outside the text gate", async () => {
+		await render(<StandalonePanelWindow descriptor={{ panelType: "file", filePath: "/a.png" }} />);
+		expect(container.querySelector("[data-file-preview]")).not.toBeNull();
+		expect(container.querySelector("[data-confirm-large]")).toBeNull();
+		await render(
+			<StandalonePanelWindow
+				descriptor={{
+					panelType: "file",
+					filePath: "/a.ts",
+					toolEdit: { narratorId: "n1", toolUseId: "tool", executionAttempt: 1 },
+				}}
+			/>,
+		);
+		expect(container.querySelector("[data-tool-edit]")).not.toBeNull();
+		expect(container.querySelector("[data-confirm-large]")).toBeNull();
+	});
+});
 
 describe("standalone window DOM height contract (not visual layout)", () => {
 	test.each(["0px", "32px"])("bounds chat and terminal under a %s WCO strip", async (strip) => {

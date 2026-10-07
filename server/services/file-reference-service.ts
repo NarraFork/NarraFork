@@ -1,8 +1,11 @@
 import { createHash } from "node:crypto";
 import {
+	FILE_PANEL_PAGE_BYTES,
 	FILE_REFERENCE_READ_CONCURRENCY,
 	FILE_REFERENCE_READ_TIMEOUT_MS,
 	FILE_REFERENCE_SEARCH_TIMEOUT_MS,
+	type FilePanelInfo,
+	type FilePanelPage,
 	type FileReference,
 	type FileReferenceCandidate,
 	type FileReferencePreview,
@@ -10,6 +13,7 @@ import {
 	type FileReferenceSnapshot,
 	type FileSelection,
 	type FileTarget,
+	MAX_FILE_PANEL_BYTES,
 	MAX_FILE_REFERENCE_PATH_CHARS,
 	MAX_FILE_REFERENCE_SEARCH_BYTES,
 	MAX_FILE_REFERENCE_SEARCH_RESULTS,
@@ -42,6 +46,19 @@ export interface FileReferenceSearchInput {
 	directory?: string;
 }
 export interface FileReferenceService {
+	filePanelInfo(
+		narratorId: string,
+		userId: string,
+		target: FileTarget,
+		signal?: AbortSignal,
+	): Promise<FilePanelInfo>;
+	filePanelPage(
+		narratorId: string,
+		userId: string,
+		target: FileTarget,
+		offset: number,
+		signal?: AbortSignal,
+	): Promise<FilePanelPage>;
 	captureFileReferences(
 		narratorId: string,
 		userId: string,
@@ -211,7 +228,33 @@ export function selectFileReferenceText(
 	return { text: text.slice(start, end), selection: resolved };
 }
 
-class Operation {
+/** Shared bounded UTF-8 decoding for reference and legacy read-only panels. */
+export function decodeFilePanelPage(
+	info: FilePanelInfo,
+	bytes: Uint8Array,
+	offset: number,
+	readOffset: number,
+): FilePanelPage {
+	let start = offset - readOffset;
+	while (start > 0 && (bytes[start] & 0xc0) === 0x80) start--;
+	const actualOffset = readOffset + start;
+	const pageBytes = bytes.subarray(start, start + FILE_PANEL_PAGE_BYTES);
+	let content: string;
+	try {
+		content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(pageBytes, {
+			stream: actualOffset + pageBytes.byteLength < info.size,
+		});
+	} catch {
+		throw failure("BINARY", "File panels require valid UTF-8 text", 415);
+	}
+	if (content.includes("\0")) throw failure("BINARY", "Only text files can be paged", 415);
+	const next = actualOffset + Buffer.byteLength(content, "utf8");
+	if (next <= offset && offset < info.size)
+		throw failure("UNAVAILABLE", "Page read made no progress", 422);
+	return { ...info, offset: actualOffset, nextOffset: next < info.size ? next : null, content };
+}
+
+export class Operation {
 	readonly controller = new AbortController();
 	readonly authorizedContexts = new Map<string, ExecutionTargetContext>();
 	readonly startedAt = Date.now();
@@ -616,7 +659,59 @@ export function createFileReferenceService(
 		);
 		return results;
 	}
+	function panelInfo(file: AuthorizedFile, size = file.stat.size): FilePanelInfo {
+		if (!Number.isSafeInteger(size) || size < 0)
+			throw failure("UNAVAILABLE", "Invalid file panel source size", 422);
+		return { target: file.target, fileName: file.context.paths.basename(file.target.path), size };
+	}
 	return {
+		async filePanelInfo(narratorId, userId, target, signal) {
+			const parsed = fileTargetSchema.safeParse(target);
+			if (!parsed.success) throw zodValidationError(parsed.error);
+			return run("panel-info", narratorId, userId, "read", signal, async (scope, op, devices) =>
+				panelInfo(await authorize(scope, parsed.data, op, devices)),
+			);
+		},
+		async filePanelPage(narratorId, userId, target, offset, signal) {
+			const parsed = fileTargetSchema.safeParse(target);
+			if (!parsed.success) throw zodValidationError(parsed.error);
+			if (!Number.isSafeInteger(offset) || offset < 0 || offset > MAX_FILE_PANEL_BYTES)
+				throw failure("INVALID_OFFSET", "Invalid file panel byte offset");
+			return run("panel-page", narratorId, userId, "read", signal, async (scope, op, devices) => {
+				const file = await authorize(scope, parsed.data, op, devices);
+				panelInfo(file);
+				if (file.stat.size > MAX_FILE_PANEL_BYTES)
+					throw failure("SOURCE_TOO_LARGE", "File panel source exceeds 1 GiB", 413);
+				if (offset > file.stat.size) throw failure("INVALID_OFFSET", "Offset is beyond EOF");
+				const readOffset = Math.max(0, offset - 3);
+				const readLimit = FILE_PANEL_PAGE_BYTES + (offset - readOffset);
+				const result = await op.wait(() =>
+					file.device.backend.readFileBytes(file.context.target.lexicalPath as string, {
+						offset: readOffset,
+						maxBytes: readLimit,
+						expectedResolvedPath: file.target.path,
+						signal: op.signal,
+						timeoutMs: op.remaining,
+					}),
+				);
+				if (
+					!result.resolvedPath ||
+					!file.context.paths.equals(result.resolvedPath, file.target.path) ||
+					file.device.backend.runtimeGeneration !== file.device.generation
+				)
+					throw failure("IDENTITY_CHANGED", "Atomic page read identity changed", 409);
+				const info = panelInfo(file, result.totalSize);
+				if (info.size > MAX_FILE_PANEL_BYTES)
+					throw failure("SOURCE_TOO_LARGE", "File panel source exceeds 1 GiB", 413);
+				if (
+					result.bytes.byteLength > readLimit ||
+					offset > info.size ||
+					readOffset + result.bytes.byteLength > info.size
+				)
+					throw failure("UNAVAILABLE", "Invalid bounded page response", 422);
+				return decodeFilePanelPage(info, result.bytes, offset, readOffset);
+			});
+		},
 		async captureFileReferences(narratorId, userId, references, signal) {
 			const parsed = fileReferencesSchema.safeParse(references);
 			if (!parsed.success) throw zodValidationError(parsed.error);
@@ -659,9 +754,11 @@ export function createFileReferenceService(
 			if (!parsed.success) throw zodValidationError(parsed.error);
 			return run("resolve", narratorId, userId, "read", signal, async (scope, op, devices) => {
 				const targets = await mapBounded(parsed.data.targets, op, async (target) => {
-					// Coordinates require a bounded saved-text read, but the response never contains it.
-					if (target.selection) return (await read(scope, target, op, devices)).target;
-					return (await authorize(scope, target, op, devices)).target;
+					const file = await authorize(scope, target, op, devices);
+					// Large panels retain coordinate hints without reading/hash-decoding the document.
+					if (target.selection && file.stat.size <= MAX_FILE_REFERENCE_SOURCE_BYTES)
+						return (await read(scope, target, op, devices)).target;
+					return file.target;
 				});
 				const canonicalMetadata = resolveFileReferencesSchema.safeParse({ targets });
 				if (!canonicalMetadata.success) throw zodValidationError(canonicalMetadata.error);

@@ -40,6 +40,22 @@ function fakeDock(panels: Record<string, unknown>) {
 }
 
 describe("readPanelSubject", () => {
+	it("carries loading consent separately without changing the resource identity", () => {
+		const file = { panelType: "file", filePath: "/large.ts", deviceId: "Remote" };
+		const original = readPanelSubject(file);
+		if (!original) throw new Error("file subject missing");
+		expect(readPanelSubject({ ...file, largeFileConfirmed: true })).toEqual({
+			...original,
+			largeFileConfirmed: true,
+		});
+		for (const largeFileConfirmed of [false, "true", 1]) {
+			expect(readPanelSubject({ ...file, largeFileConfirmed })).toEqual(original);
+		}
+		expect(readPanelSubject({ panelType: "spec", largeFileConfirmed: true })).toEqual({
+			kind: "spec",
+		});
+	});
+
 	it("reads the kind from params", () => {
 		expect(readPanelSubject({ panelType: "terminal" })).toEqual({ kind: "terminal" });
 	});

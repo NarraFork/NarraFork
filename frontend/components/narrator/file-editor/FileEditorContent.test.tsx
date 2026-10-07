@@ -153,6 +153,12 @@ beforeEach(async () => {
 	publish.mockClear();
 	confirmReload.mockReset();
 	confirmReload.mockReturnValue(true);
+	const info = spyOn(fileReferenceApi, "info").mockImplementation(async (_narrator, target) => ({
+		target,
+		fileName: "a.txt",
+		size: 12,
+	}));
+	restores.push(() => info.mockRestore());
 	preview = spyOn(fileReferenceApi, "preview").mockResolvedValue(source);
 	create = spyOn(editorDocumentApi, "create").mockImplementation(async (_narrator, input) => ({
 		...descriptor,
@@ -419,13 +425,23 @@ for (const surface of ["focus", "workspace"] as const)
 				current: {
 					getPanel: (id: string) => panels.get(id),
 					get panels() {
-						return [...panels.values()];
+						return [
+							// Workspace resources need their owning narrator cell to exist.
+							{
+								id: "parent-cell",
+								params: { panelType: "narrator", narratorId: "parent" },
+								api: { location: { type: "grid" } },
+							},
+							...panels.values(),
+						];
 					},
+					groups: [],
 					addPanel: ({ id, params }: { id: string; params: FilePanelParams }) => {
 						const panel = {
 							id,
 							params,
 							api: {
+								location: { type: "grid" },
 								setActive() {},
 								updateParameters(next: FilePanelParams) {
 									panel.params = next;

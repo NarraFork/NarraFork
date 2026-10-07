@@ -1,4 +1,5 @@
 import {
+	MAX_FILE_PANEL_BYTES,
 	MAX_FILE_REFERENCE_COUNT,
 	MAX_FILE_REFERENCE_METADATA_BYTES,
 	MAX_FILE_REFERENCE_PATH_CHARS,
@@ -75,3 +76,10 @@ export const searchFileReferencesSchema = z.strictObject({
 	directory: path.optional(),
 });
 export const previewFileReferenceSchema = z.strictObject({ deviceId, path });
+export const filePanelPageSchema = previewFileReferenceSchema.extend({
+	offset: z
+		.string()
+		.regex(/^\d+$/)
+		.transform(Number)
+		.pipe(z.number().int().min(0).max(MAX_FILE_PANEL_BYTES)),
+});

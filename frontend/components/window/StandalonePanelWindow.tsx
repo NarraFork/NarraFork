@@ -25,6 +25,7 @@ import { FileReferenceScopeProvider } from "../narrator/composer/FileReferenceSc
 import { NarratorDockContext } from "../narrator/dock/NarratorDockContext";
 import { SubagentSessionPanelContent } from "../narrator/dock/panels";
 import { getFilePreviewType } from "../narrator/file-panel/FilePreviewModal";
+import { LargeFileGate } from "../narrator/file-panel/LargeFileGate";
 import type { TerminalLeafConfig, WebviewLeafConfig } from "../narrator/split-tree";
 import {
 	type PluginUiSessionContext,
@@ -365,6 +366,19 @@ function FileWindow({
 	const { filePath, deviceId = "local", referenceOrigin, toolEdit } = descriptor;
 	const fileNarratorId = descriptor.fileNarratorId ?? descriptor.hostNarratorId;
 	const [dirty, setDirty] = useState(false);
+	const [largeFileConfirmed, setLargeFileConfirmed] = useState(
+		descriptor.largeFileConfirmed === true,
+	);
+	const confirmLargeFile = useCallback(() => {
+		const confirmed = normalizePanelWindowDescriptor({ ...descriptor, largeFileConfirmed: true });
+		if (!confirmed) return;
+		const url = new URL(window.location.href);
+		url.searchParams.set("d", JSON.stringify(confirmed));
+		// Keep consent private to this window and survive reload without granting
+		// another panel (or another file opened from a reference) permission.
+		window.history.replaceState(window.history.state, "", url.toString());
+		setLargeFileConfirmed(true);
+	}, [descriptor]);
 	useEffect(() => {
 		if (!dirty) return;
 		const handler = (event: BeforeUnloadEvent) => event.preventDefault();
@@ -397,14 +411,23 @@ function FileWindow({
 				{toolEdit ? (
 					<ToolEditFileViewer key={filePath} reference={toolEdit} filePath={filePath} />
 				) : isText ? (
-					<FileEditorContent
-						key={`edit:${fileNarratorId}:${deviceId}:${filePath}`}
-						filePath={filePath}
+					<LargeFileGate
 						narratorId={fileNarratorId}
 						deviceId={deviceId}
 						referenceOrigin={referenceOrigin}
-						onDirtyChange={setDirty}
-					/>
+						filePath={filePath}
+						confirmed={largeFileConfirmed}
+						onConfirm={confirmLargeFile}
+					>
+						<FileEditorContent
+							key={`edit:${fileNarratorId}:${deviceId}:${filePath}`}
+							filePath={filePath}
+							narratorId={fileNarratorId}
+							deviceId={deviceId}
+							referenceOrigin={referenceOrigin}
+							onDirtyChange={setDirty}
+						/>
+					</LargeFileGate>
 				) : (
 					<FileViewerContent
 						key={`${fileNarratorId}:${deviceId}:${filePath}`}
