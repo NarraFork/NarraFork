@@ -20,6 +20,7 @@
  */
 
 import type { VListElementKind } from "@shared/pretext-layout/element-kinds";
+import type { MeasureElement } from "@shared/pretext-layout/layout-pipeline";
 import { TEXT_PREVIEW_MAX_CHARS } from "@shared/pretext-layout/text-preview";
 import { measureAskInPassing } from "./measure/measure-ask-in-passing";
 import { measureCommunicationBubble } from "./measure/measure-communication-bubble";
@@ -51,7 +52,12 @@ import { measureTurnUsage } from "./measure/measure-turn-usage";
 import { measureWebSearch } from "./measure/measure-web-search";
 import { buildCacheKey, extractDataRevision, isStreamingKey, measureCache } from "./measure-cache";
 import type { MeasuredElement, RenderLod } from "./prepared-block";
-import { getStreamingPreparedBlocks } from "./streaming-block-cache";
+import { getStreamingPreparedBlocks, type StreamingBlockCache } from "./streaming-block-cache";
+
+/** Capture only this document's cache, never the coordinator or a React render context. */
+export function createScopedMeasureElement(cache: StreamingBlockCache): MeasureElement {
+	return (...args) => measureElementCached(...args, cache);
+}
 
 export type { VListElementKind } from "@shared/pretext-layout/element-kinds";
 
@@ -300,6 +306,7 @@ export function measureElementCached(
 	opts?: Record<string, unknown>,
 	specKey?: string,
 	documentRevision?: string | number,
+	streamingCache?: StreamingBlockCache,
 ): MeasuredElement {
 	// Skip cache for streaming items or when no stable key is available.
 	//
@@ -309,7 +316,15 @@ export function measureElementCached(
 	// through the incremental prepared-block path, which freezes completed markdown
 	// blocks and only re-parses the still-open trailing one.
 	if (!specKey || isStreamingKey(specKey) || opts?.streamingContent === true) {
-		const streamed = measureStreamingElement(kind, data, contentWidth, lod, opts, specKey);
+		const streamed = measureStreamingElement(
+			kind,
+			data,
+			contentWidth,
+			lod,
+			opts,
+			specKey,
+			streamingCache,
+		);
 		if (streamed !== undefined) return streamed;
 		return VLIST_REGISTRY[kind].measure(data, contentWidth, lod, opts);
 	}
@@ -346,6 +361,7 @@ function measureStreamingElement(
 	lod: RenderLod,
 	opts: Record<string, unknown> | undefined,
 	specKey: string | undefined,
+	streamingCache?: StreamingBlockCache,
 ): MeasuredElement | undefined {
 	if (!specKey) return undefined;
 	if (kind === "markdown") {
@@ -353,7 +369,9 @@ function measureStreamingElement(
 		// Exact preparation of exactly this text — the incremental path reuses per-block
 		// work but never approximates, so no text substitution is needed here.
 		return measureMarkdown(data, contentWidth, {
-			preparedBlocks: getStreamingPreparedBlocks(specKey, data),
+			preparedBlocks: streamingCache
+				? streamingCache.get(specKey, data)
+				: getStreamingPreparedBlocks(specKey, data),
 		});
 	}
 	if (kind === "reasoning") {
@@ -375,10 +393,12 @@ function measureStreamingElement(
 			...expandState,
 			// Scope the cache per body: the translation toggle flips between two
 			// independently growing texts, which must not share an entry.
-			preparedBlocks: getStreamingPreparedBlocks(
-				`${specKey}|${expandState.showOriginal ? "orig" : "shown"}`,
-				text,
-			),
+			preparedBlocks: streamingCache
+				? streamingCache.get(`${specKey}|${expandState.showOriginal ? "orig" : "shown"}`, text)
+				: getStreamingPreparedBlocks(
+						`${specKey}|${expandState.showOriginal ? "orig" : "shown"}`,
+						text,
+					),
 		});
 	}
 	return undefined;

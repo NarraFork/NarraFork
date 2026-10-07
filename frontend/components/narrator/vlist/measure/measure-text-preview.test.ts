@@ -25,8 +25,20 @@ describe("shared body budgets", () => {
 		expect(live.frame).toEqual(direct.frame);
 		expect(live.textPreview).toEqual(direct.textPreview);
 		expect(streamingBlockCacheSize()).toBe(0);
-		measureElementCached("reasoning", data, 600, 4, { textExpanded: true }, "__streaming__-full");
-		expect(streamingBlockCacheSize()).toBe(1);
+		const full = measureElementCached(
+			"reasoning",
+			data,
+			600,
+			4,
+			{ textExpanded: true },
+			"__streaming__-full",
+		);
+		const fullDirect = measureReasoning(data, 600, 4, { textExpanded: true });
+		expect(full.frame).toEqual(fullDirect.frame);
+		expect(full.blocks).toHaveLength(fullDirect.blocks.length);
+		// This 1,000-paragraph body exceeds the 512-unit retention budget. Expansion
+		// must stay complete and exact without retaining it in the incremental cache.
+		expect(streamingBlockCacheSize()).toBe(0);
 		resetStreamingBlockCache();
 	});
 	test("registry short live reasoning retains its existing incremental path", async () => {

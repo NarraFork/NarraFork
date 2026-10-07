@@ -993,6 +993,12 @@ export const PretextExactMessageList = memo(
 			// Edit/Read rows showed just the tool name while their expanded detail (which
 			// fetches the full payload) looked fine.
 			const { t, i18n } = useTranslation("narrator");
+			// Every localized string the vlist paints comes from one place (the vlist
+			// layers themselves import no i18n — see CONTRACT.md §0). `adapterLabels` feeds
+			// the pure adapter's measured card / trace text and exact tool summaries;
+			// `renderLabels` supplies each RenderXxx's chrome. Reuse the memoized labels
+			// without translating every historical tool again on each streaming frame.
+			const { adapterLabels: vlistLabels, renderLabels } = useVListLabels();
 			const resolveExactToolSummary = useCallback(
 				(tc: unknown) => {
 					const call = (tc ?? {}) as {
@@ -1039,26 +1045,9 @@ export const PretextExactMessageList = memo(
 									targetCount: call._sendDeliveryTargetCount ?? metadata?.targetCount,
 								}
 							: baseMetadata;
-					return getSummary(call.toolName, call.inputJson, summaryMetadata, {
-						communicationRunning: t("communicationRunning"),
-						communicationNoRecipients: t("communicationNoRecipients"),
-						communicationSuccess: t("communicationSuccess"),
-						communicationReceived: t("communicationReceived"),
-						communicationWaiting: t("communicationWaiting"),
-						communicationReplyReceived: t("communicationReplyReceived"),
-						communicationTimeout: t("communicationTimeout"),
-						communicationCancelled: t("communicationCancelled"),
-						communicationError: t("communicationError"),
-						contextAskOutputChars: t("contextAskOutputChars", { count: "{count}" }),
-						contextAskQuestions: t("contextAskQuestions", { count: "{count}" }),
-						contextAskStatusSummary: t("contextAskStatusSummary"),
-						workspaceCreate: t("workspaceCreate"),
-						workspaceList: t("workspaceList"),
-						workspaceSwitch: t("workspaceSwitch"),
-						workspaceDevice: t("workspaceDevice"),
-					});
+					return getSummary(call.toolName, call.inputJson, summaryMetadata, vlistLabels);
 				},
-				[t],
+				[vlistLabels],
 			);
 			// A subagent recent-call row's label detail. Same shared helper the chunked
 			// `SubagentActivityRow` calls, so one child call is worded identically in both
@@ -1635,11 +1624,6 @@ export const PretextExactMessageList = memo(
 			// content fixed while the reserved space changes off-screen above it.
 			const [olderHeaderHeight, setOlderHeaderHeight] = useState(0);
 			const { t: tCommon } = useTranslation("common");
-			// Every localized string the vlist paints comes from one place (the vlist
-			// layers themselves import no i18n — see CONTRACT.md §0). `adapterLabels` feeds
-			// the pure adapter's measured card / trace text; `renderLabels` supplies each
-			// RenderXxx's chrome (buttons, badges, section titles, placeholders).
-			const { adapterLabels: vlistLabels, renderLabels } = useVListLabels();
 			// Tooltip / aria label for a clickable text-file attachment. Height-neutral
 			// chrome, so it does NOT participate in the measurement cache key.
 			const openAttachmentLabel = t("contextMenu_openFilePanel");

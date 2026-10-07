@@ -200,7 +200,8 @@ describe("resize inputs cannot reach the full layout at pixel resolution", () =>
 		const preview = region(source.slice(start), "): boolean {");
 		expect(preview).toContain("previewResize({");
 		expect(preview).toMatch(/items:\s*current\.items/);
-		expect(preview).toMatch(/measure:\s*measureElementCached/);
+		expect(preview).toMatch(/measure:\s*this\.measure/);
+		expect(source).toContain("createScopedMeasureElement(this.streamingBlockCache)");
 		const paths = [preview, readVlistFile("vlist-resize-preview.ts")].join("\n");
 		expect(paths).not.toMatch(
 			/\b(?:buildPretext(?:DocumentLayout|LayoutManifest|EngineLayout)|compute(?:Pretext)?VListLayout|buildLayout|rebuild|adaptSegments|segmentMessages|groupRenderUnits)\s*\(/,

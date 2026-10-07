@@ -1,7 +1,10 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
+import type { MessageSegmentationCache } from "../message/message-segments";
+import type { NarratorMsg } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { captureCoordinatorAnchor, PretextLayoutCoordinator } from "./pretext-layout-coordinator";
+import type { StreamingBlockCache } from "./streaming-block-cache";
 
 beforeAll(() => {
 	installCanvasStub();
@@ -983,5 +986,108 @@ describe("PretextLayoutCoordinator — scrollTopSmoothFollow stamping", () => {
 		const removed = coordinator.removeMessages(["m-1"], pinnedView);
 		expect(removed).toBe(true);
 		expect(coordinator.getSnapshot().scrollTopSmoothFollow).toBeUndefined();
+	});
+});
+
+describe("streaming preparation ownership", () => {
+	it("reuses each pane's settled blocks when synthetic row keys collide", async () => {
+		const a = new PretextLayoutCoordinator();
+		const b = new PretextLayoutCoordinator();
+		const emptyPage = async (): Promise<PretextDocumentPageResult> => ({
+			messages: [],
+			minSeq: -1,
+			maxSeq: -1,
+			hasNext: false,
+			hasPrev: false,
+			messageVersion: 0,
+		});
+		await a.load("stream-pane-a", buildOptions, { fetchPage: emptyPage });
+		await b.load("stream-pane-b", buildOptions, { fetchPage: emptyPage });
+		const live = (narratorId: string, text: string): TreeMessage => ({
+			...message(0, text),
+			id: "__streaming__",
+			narratorId,
+		});
+		const firstBlock = (coordinator: PretextLayoutCoordinator) =>
+			coordinator.getSnapshot().items?.find((item) => item.spec.kind === "markdown")?.measured
+				.blocks[0];
+		a.setStreamingMessage(live("stream-pane-a", "A首段\n\n中间段\n\n末段"));
+		const initial = firstBlock(a);
+		expect(initial).toBeDefined();
+		b.setStreamingMessage(live("stream-pane-b", "B首段\n\n不同中间段\n\n不同末段"));
+		a.setStreamingMessage(live("stream-pane-a", "A首段\n\n中间段\n\n末段追加"));
+		expect(firstBlock(a)).toBe(initial);
+		b.reset();
+		a.setStreamingMessage(live("stream-pane-a", "A首段\n\n中间段\n\n末段追加继续"));
+		expect(firstBlock(a)).toBe(initial);
+		a.reset();
+	});
+});
+
+describe("transient preparation lifecycle", () => {
+	function caches(coordinator: PretextLayoutCoordinator) {
+		// Inspect the actual owned instances: a separate standalone cache would
+		// not prove that the production build/resize/teardown path uses them.
+		return {
+			streaming: Reflect.get(coordinator, "streamingBlockCache") as StreamingBlockCache,
+			segments: Reflect.get(coordinator, "segmentationCache") as MessageSegmentationCache,
+		};
+	}
+
+	it("keeps resize scoped and retires rows on handoff, release and narrator switch", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("cache-lifecycle", buildOptions, { fetchPage: async () => page() });
+		const live = { ...message(2, "settled first\n\nmiddle\n\nlive tail"), id: "__streaming__" };
+		coordinator.setStreamingMessage(live);
+		const owned = caches(coordinator);
+		expect(owned.streaming.size).toBe(1);
+		expect(owned.segments.size).toBe(2);
+		const first = coordinator
+			.getSnapshot()
+			.items?.find((item) => item.spec.key.includes("__streaming__"))?.measured.blocks[0];
+		expect(first).toBeDefined();
+		coordinator.previewWidth(420, () => ({
+			scrollTop: 0,
+			viewportHeight: 720,
+			pinnedToBottom: false,
+		}));
+		const resized = coordinator
+			.getSnapshot()
+			.items?.find((item) => item.spec.key.includes("__streaming__"))?.measured.blocks[0];
+		expect(resized).toBe(first);
+		expect(owned.streaming.size).toBe(1);
+		coordinator.setStreamingMessage(null);
+		expect(owned.streaming.size).toBe(0);
+		coordinator.setStreamingMessage(live);
+		coordinator.releaseTransientCaches();
+		expect(owned.streaming.size).toBe(0);
+		expect(owned.segments.size).toBe(0);
+		// Cleanup is idempotent and does not dispose the loaded document.
+		coordinator.releaseTransientCaches();
+		expect(coordinator.getSnapshot().status).toBe("ready");
+		coordinator.setStreamingMessage({ ...live });
+		expect(owned.streaming.size).toBe(1);
+		coordinator.reset();
+		expect(owned.streaming.size).toBe(0);
+		expect(owned.segments.size).toBe(0);
+	});
+
+	it("reuses historical materials only for stream updates and invalidates for rebuilds", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("segment-lifecycle", buildOptions, { fetchPage: async () => page() });
+		const owned = caches(coordinator);
+		const historical = coordinator.getSnapshot().input?.messages[0] as unknown as NarratorMsg;
+		const initial = owned.segments.getMaterials(historical);
+		for (let i = 0; i < 5; i++) {
+			coordinator.setStreamingMessage({ ...message(2, `stream ${i}`), id: "__streaming__" });
+			expect(owned.segments.getMaterials(historical)).toBe(initial);
+		}
+		expect(owned.segments.size).toBe(2);
+		// An in-place edit keeps the message/array identity; a non-stream rebuild
+		// must invalidate rather than trusting reference equality.
+		(historical.contentJson as { text: string }[])[0].text = "edited historical text";
+		coordinator.rebuild(buildOptions);
+		expect(owned.segments.getMaterials(historical)).not.toBe(initial);
+		coordinator.reset();
 	});
 });

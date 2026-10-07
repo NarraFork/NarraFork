@@ -1,9 +1,10 @@
 import type { PretextLayoutIndex, PretextLayoutManifest } from "@shared/pretext-layout";
+import type { MeasureElement } from "@shared/pretext-layout/layout-pipeline";
 import {
 	type ContentBlockLike,
 	groupReasoningRuns,
 } from "@shared/pretext-layout/reasoning-segments";
-import { segmentMessages } from "../message/message-segments";
+import { type MessageSegmentationCache, segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { groupRenderUnits, type RenderUnit } from "../trace/render-units";
 import type { RenderLod } from "./prepared-block";
@@ -19,6 +20,9 @@ import type { VListItem } from "./vlist-pipeline";
 import { findLatestSpecTasksToolUseIdInMessages } from "./vlist-spec-tasks-pin";
 
 export interface BuildPretextDocumentLayoutOptions {
+	/** Transient document-owned caches/providers, not part of the persisted snapshot. */
+	segmentationCache?: MessageSegmentationCache;
+	measure?: MeasureElement;
 	layoutRevision: string;
 	documentRevision: string | number;
 	lod: RenderLod;
@@ -330,7 +334,7 @@ export function buildPretextDocumentLayout(
 	options: BuildPretextDocumentLayoutOptions,
 ): BuiltPretextDocumentLayout {
 	const sourceMessages = messages as readonly SourceMessage[];
-	const segments = segmentMessages(messages as NarratorMsg[], {});
+	const segments = segmentMessages(messages as NarratorMsg[], { cache: options.segmentationCache });
 	// The pinned tasks card: one id, derived HERE — once per build, over the SAME
 	// message list being laid out (persisted window + live streaming row). It drives
 	// both fold gates below and the adapter's per-card forceExpanded flag, so the
@@ -349,10 +353,11 @@ export function buildPretextDocumentLayout(
 	// did, via message ids — pushed its sibling calls into a `tool-run-count`, i.e.
 	// a bare "tool calls ×N" line that names none of them. Their named rows are
 	// exactly what a reader at a low LOD still has (see splitToolRunForActivity).
-	const renderUnits = groupRenderUnits(segments, options.lod <= 2, {
+	const groupingOptions = {
 		keepToolUseIds:
 			latestSpecTasksToolUseId != null ? new Set([latestSpecTasksToolUseId]) : undefined,
-	});
+	};
+	const renderUnits = groupRenderUnits(segments, options.lod <= 2, groupingOptions);
 	const adapterUnits: AdapterRenderUnit[] = renderUnits.map((unit, index) =>
 		unit.kind === "activity"
 			? {
@@ -374,18 +379,13 @@ export function buildPretextDocumentLayout(
 	 * over the same segments, and its output is used ONLY to label specs, never to
 	 * render.
 	 *
-	 * At L1/L2 this repeats work `renderUnits` already did. That is a small cost (the
-	 * grouper is a linear pass over segments, no measurement) paid to keep one code path
-	 * for both levels: deriving the labels from `renderUnits` when grouped and from this
-	 * when not would be two implementations that must agree, which is the shape of bug
-	 * this whole change exists to remove.
+	 * At L1/L2 `renderUnits` already is that exact folded result. Reuse it for this
+	 * read-only membership scan instead of allocating a second identical group tree.
 	 */
 	const morphGroupIdByUnitId = new Map<string, string>();
 	{
-		const foldedUnits = groupRenderUnits(segments, true, {
-			keepToolUseIds:
-				latestSpecTasksToolUseId != null ? new Set([latestSpecTasksToolUseId]) : undefined,
-		});
+		const foldedUnits =
+			options.lod <= 2 ? renderUnits : groupRenderUnits(segments, true, groupingOptions);
 		for (const [index, unit] of foldedUnits.entries()) {
 			if (unit.kind !== "activity") continue;
 			// A group of one has nothing to co-admit, and labelling it would only make the

@@ -8,6 +8,7 @@ import {
 } from "@shared/pretext-layout";
 import { resetPreparedMarkdownCache } from "@shared/pretext-layout/prepared-markdown-cache";
 import { getTypographyRevision } from "@shared/pretext-layout/typography";
+import { MessageSegmentationCache } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import {
 	ensureKatexLoaded,
@@ -40,7 +41,8 @@ import {
 	type PretextDocumentLoadOptions,
 	refreshPretextDocumentWindow,
 } from "./pretext-document-loader";
-import { measureElementCached } from "./registry";
+import { createScopedMeasureElement } from "./registry";
+import { StreamingBlockCache } from "./streaming-block-cache";
 import { projectPendingEmptyReasoning, projectStreamingDocument } from "./streaming-handoff";
 import { askInPassingBlock, syncAskInPassingMessage } from "./vlist-ask-in-passing-sync";
 import { trimClockNow, trimLoadedHead } from "./vlist-head-trim";
@@ -161,6 +163,9 @@ export function captureCoordinatorAnchor(
 }
 
 export class PretextLayoutCoordinator {
+	private readonly streamingBlockCache = new StreamingBlockCache();
+	private readonly segmentationCache = new MessageSegmentationCache();
+	private readonly measure = createScopedMeasureElement(this.streamingBlockCache);
 	private generation = 0;
 	private input: PretextDocumentInput | undefined;
 	private deletedMessageIds = new Set<string>();
@@ -266,7 +271,10 @@ export class PretextLayoutCoordinator {
 		}
 
 		const generation = ++this.generation;
-		if (this.narratorId !== narratorId) this.mathScanCursor = createMathScanCursor();
+		if (this.narratorId !== narratorId) {
+			this.mathScanCursor = createMathScanCursor();
+			this.releaseTransientCaches();
+		}
 		this.narratorId = narratorId;
 		this.loadOptions = loadOptions;
 		this.current = { ...this.current, status: "loading", error: undefined };
@@ -500,7 +508,7 @@ export class PretextLayoutCoordinator {
 			dirtyKeys: options?.dirtyKeys,
 			resolvePermissionForm: options?.resolvePermissionForm,
 			compactUsageLines: options?.compactUsageLines,
-			measure: measureElementCached,
+			measure: this.measure,
 		});
 		const targetWidth = Math.max(1, Math.round(width));
 		if (result.changedKeys.size === 0) {
@@ -1082,8 +1090,17 @@ export class PretextLayoutCoordinator {
 			view?.viewportHeight ?? this.lastViewportHeight,
 			generation,
 			true,
+			"ready",
+			undefined,
+			true,
 		);
 		return true;
+	}
+
+	/** Drop only this surface's transient preparation, preserving its published window. */
+	releaseTransientCaches(): void {
+		this.streamingBlockCache.clear();
+		this.segmentationCache.clear();
 	}
 
 	cancel(): void {
@@ -1113,6 +1130,7 @@ export class PretextLayoutCoordinator {
 	 */
 	reset(): void {
 		this.publishDocumentSnapshot();
+		this.releaseTransientCaches();
 		this.generation++;
 		this.pendingLoad = null;
 		this.input = undefined;
@@ -1166,7 +1184,10 @@ export class PretextLayoutCoordinator {
 		this.generation++;
 		const generation = this.generation;
 		this.pendingLoad = null;
-		if (this.narratorId !== narratorId) this.mathScanCursor = createMathScanCursor();
+		if (this.narratorId !== narratorId) {
+			this.mathScanCursor = createMathScanCursor();
+			this.releaseTransientCaches();
+		}
 		this.narratorId = narratorId;
 		this.loadOptions = loadOptions;
 		this.loadingOlder = false;
@@ -1257,17 +1278,33 @@ export class PretextLayoutCoordinator {
 	private lastTrimAt = 0;
 
 	/** Build the exact layout for the loaded input (shared by every commit path). */
-	private buildLayout(input: PretextDocumentInput, buildOptions: PretextLayoutBuildOptions) {
+	private buildLayout(
+		input: PretextDocumentInput,
+		buildOptions: PretextLayoutBuildOptions,
+		reuseMessageSegments = false,
+	) {
+		// Only a streaming-only update can promise the historical inputs were not
+		// edited in place. Other mutation/rebuild entries explicitly invalidate.
+		if (!reuseMessageSegments) this.segmentationCache.invalidate();
 		const startedAt = now();
-		const built = this.buildLayoutInner(input, buildOptions);
-		this.lastBuildMs = now() - startedAt;
-		return built;
+		this.streamingBlockCache.beginBuild();
+		try {
+			const built = this.buildLayoutInner(input, buildOptions);
+			this.lastBuildMs = now() - startedAt;
+			return built;
+		} finally {
+			// Prune retired/hidden streaming rows only after a full build. A resize
+			// preview measures a subset and must not sweep the other active rows.
+			this.streamingBlockCache.endBuild();
+		}
 	}
 
 	private buildLayoutInner(input: PretextDocumentInput, buildOptions: PretextLayoutBuildOptions) {
 		const messages = this.layoutMessages(input, buildOptions);
 		return buildPretextDocumentLayout(messages as unknown as NarratorMsg[], {
 			...buildOptions,
+			segmentationCache: this.segmentationCache,
+			measure: this.measure,
 			// The loaded-message count keeps the revision distinct as the window
 			// grows upward within one document version (prepended older pages).
 			layoutRevision: `${input.messageVersion}:${input.messages.length}:${buildOptions.widthBucket}:${buildOptions.lod}:k${getKatexRevision()}:f${getFontRevision()}:t${getTypographyRevision()}`,
@@ -1395,12 +1432,13 @@ export class PretextLayoutCoordinator {
 		smoothFollow?: boolean,
 		status: "ready" | "loading" = "ready",
 		restoreOverrides?: ReadonlyMap<string, number>,
+		reuseMessageSegments = false,
 	): PretextLayoutCoordinatorSnapshot {
 		if (generation !== this.generation) return this.current;
 		try {
 			this.lastBuildOptions = buildOptions;
 			this.lastViewportHeight = viewportHeight;
-			const built = this.buildLayout(input, buildOptions);
+			const built = this.buildLayout(input, buildOptions, reuseMessageSegments);
 			if (generation !== this.generation) return this.current;
 			const previous = this.current.index;
 			let scrollTop: number | undefined;

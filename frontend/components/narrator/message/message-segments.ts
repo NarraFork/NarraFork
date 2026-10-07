@@ -219,6 +219,119 @@ export function filterChildrenByToolUse(
 
 export interface SegmentOptions {
 	streamingMsg?: NarratorMsg | null;
+	cache?: MessageSegmentationCache;
+}
+
+type MessageAtom =
+	| { lane: "content"; msg: NarratorMsg; blockIndex: number }
+	| { lane: "content-whole"; msg: NarratorMsg }
+	| { lane: "tool"; msg: NarratorMsg; blockIndex: number; item?: ToolRunItem };
+
+type MessageMaterials = {
+	atoms: MessageAtom[];
+	toolCalls: ToolCallData[];
+};
+
+type CachedMessageMaterials = {
+	msg: NarratorMsg;
+	role: NarratorMsg["role"];
+	contentJson: NarratorMsg["contentJson"];
+	toolCalls: NarratorMsg["toolCalls"];
+	children: NarratorMsg["children"];
+	materials: MessageMaterials;
+};
+
+/**
+ * Owned by one message-list coordinator, never shared globally. Direct message/
+ * role/contentJson/toolCalls/children replacement invalidates automatically.
+ * Nested in-place edits require invalidate(id), or invalidate()/clear() for all.
+ * Only per-message materials are retained: runs are assembled afresh each time.
+ */
+export class MessageSegmentationCache {
+	private readonly entries = new Map<string, CachedMessageMaterials>();
+	private readonly maxMessages: number;
+	private readonly maxAtoms: number;
+	private retainedAtoms = 0;
+
+	constructor(options: { maxMessages?: number; maxAtoms?: number } = {}) {
+		this.maxMessages = options.maxMessages ?? 1024;
+		this.maxAtoms = options.maxAtoms ?? 8192;
+		if (
+			!Number.isSafeInteger(this.maxMessages) ||
+			this.maxMessages < 0 ||
+			!Number.isSafeInteger(this.maxAtoms) ||
+			this.maxAtoms < 0
+		) {
+			throw new RangeError("Message segmentation cache limits must be non-negative safe integers");
+		}
+	}
+
+	get size(): number {
+		return this.entries.size;
+	}
+
+	get atomCount(): number {
+		return this.retainedAtoms;
+	}
+
+	clear(): void {
+		this.entries.clear();
+		this.retainedAtoms = 0;
+	}
+
+	invalidate(messageId?: string): void {
+		if (messageId === undefined) {
+			this.clear();
+			return;
+		}
+		const entry = this.entries.get(messageId);
+		if (!entry) return;
+		this.retainedAtoms -= entry.materials.atoms.length;
+		this.entries.delete(messageId);
+	}
+
+	/** Internal to segmentMessages; exposed for coordinator-independent ownership. */
+	getMaterials(msg: NarratorMsg): MessageMaterials {
+		const entry = this.entries.get(msg.id);
+		if (
+			entry &&
+			entry.msg === msg &&
+			entry.role === msg.role &&
+			entry.contentJson === msg.contentJson &&
+			entry.toolCalls === msg.toolCalls &&
+			entry.children === msg.children
+		) {
+			return entry.materials;
+		}
+
+		// A same-id replacement must release the previous version even if the new
+		// materials exceed the budget and therefore cannot be retained.
+		this.invalidate(msg.id);
+		const materials = buildMessageMaterials(msg);
+		if (
+			msg.id !== "__streaming__" &&
+			this.entries.size < this.maxMessages &&
+			this.retainedAtoms + materials.atoms.length <= this.maxAtoms
+		) {
+			this.entries.set(msg.id, {
+				msg,
+				role: msg.role,
+				contentJson: msg.contentJson,
+				toolCalls: msg.toolCalls,
+				children: msg.children,
+				materials,
+			});
+			this.retainedAtoms += materials.atoms.length;
+		}
+		return materials;
+	}
+
+	prune(messages: NarratorMsg[]): void {
+		const activeIds = new Set(messages.map((msg) => msg.id));
+		for (const id of this.entries.keys()) {
+			if (!activeIds.has(id)) this.invalidate(id);
+		}
+	}
 }
 
 type VisualLane = "content" | "tool";
@@ -229,39 +342,67 @@ function classifyBlock(b: ContentBlock): VisualLane | null {
 	return null;
 }
 
+function buildMessageMaterials(msg: NarratorMsg): MessageMaterials {
+	const atoms: MessageAtom[] = [];
+	const materials: MessageMaterials = { atoms, toolCalls: [] };
+	if (msg.role !== "assistant") {
+		atoms.push({ lane: "content-whole", msg });
+		return materials;
+	}
+
+	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	let hasTools = false;
+	for (let bi = 0; bi < blocks.length; bi++) {
+		const lane = classifyBlock(blocks[bi]);
+		if (lane === "content") atoms.push({ lane: "content", msg, blockIndex: bi });
+		else if (lane === "tool") {
+			atoms.push({ lane: "tool", msg, blockIndex: bi });
+			hasTools = true;
+		}
+	}
+	if (atoms.length === 0 && blocks.length > 0) {
+		atoms.push({ lane: "content-whole", msg });
+	}
+
+	if (hasTools) {
+		materials.toolCalls = resolveAllToolCallsFromMsg(msg);
+		for (const atom of atoms) {
+			if (atom.lane !== "tool") continue;
+			const block = blocks[atom.blockIndex];
+			// Preserve first-match behavior for repeated toolUseIds (retry blocks).
+			const tc = materials.toolCalls.find((tool) => tool.toolUseId === block.id);
+			if (!tc) continue;
+			const children = filterChildrenByToolUse(msg.children ?? [], tc.toolUseId);
+			atom.item = {
+				kind: "tool",
+				msg,
+				blockIndex: atom.blockIndex,
+				tc,
+				children,
+				isSubagent:
+					tc.toolName === "Agent" ||
+					tc.toolName === "Task" ||
+					tc.toolName === "Send" ||
+					!!tc._subagentActivity ||
+					children.length > 0,
+			};
+		}
+	}
+	return materials;
+}
+
 export function segmentMessages(
 	messages: NarratorMsg[],
 	opts: SegmentOptions = {},
 ): RenderSegment[] {
-	const { streamingMsg } = opts;
+	const { streamingMsg, cache } = opts;
 
 	const effectiveMessages = streamingMsg != null ? [...messages, streamingMsg] : messages;
-
-	type Atom =
-		| { lane: "content"; msg: NarratorMsg; blockIndex: number }
-		| { lane: "content-whole"; msg: NarratorMsg }
-		| { lane: "tool"; msg: NarratorMsg; blockIndex: number };
-
-	const atoms: Atom[] = [];
-
+	const atoms: MessageAtom[] = [];
 	for (const msg of effectiveMessages) {
-		const atomStartIdx = atoms.length;
-
-		if (msg.role !== "assistant") {
-			atoms.push({ lane: "content-whole", msg });
-		} else {
-			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-
-			for (let bi = 0; bi < blocks.length; bi++) {
-				const lane = classifyBlock(blocks[bi]);
-				if (lane === "content") atoms.push({ lane: "content", msg, blockIndex: bi });
-				else if (lane === "tool") atoms.push({ lane: "tool", msg, blockIndex: bi });
-			}
-
-			if (atoms.length === atomStartIdx && blocks.length > 0) {
-				atoms.push({ lane: "content-whole", msg });
-			}
-		}
+		const materials = cache ? cache.getMaterials(msg) : buildMessageMaterials(msg);
+		// Do not spread arbitrarily large block lists into a function call.
+		for (const atom of materials.atoms) atoms.push(atom);
 	}
 
 	const segments: RenderSegment[] = [];
@@ -297,41 +438,12 @@ export function segmentMessages(
 		// tool → start a tool-run
 		const items: ToolRunItem[] = [];
 		const sourceMessagesSet = new Set<NarratorMsg>();
-		const allTcsCache = new Map<NarratorMsg, ToolCallData[]>();
-
-		const getTcs = (msg: NarratorMsg) => {
-			let tcs = allTcsCache.get(msg);
-			if (!tcs) {
-				tcs = resolveAllToolCallsFromMsg(msg);
-				allTcsCache.set(msg, tcs);
-			}
-			return tcs;
-		};
 
 		while (ai < atoms.length) {
 			const cur = atoms[ai];
 			if (cur.lane === "tool") {
-				const tcs = getTcs(cur.msg);
-				const block = (Array.isArray(cur.msg.contentJson) ? cur.msg.contentJson : [])[
-					cur.blockIndex
-				];
-				const tc = block ? tcs.find((t) => t.toolUseId === block.id) : undefined;
-				if (tc) {
-					const children = filterChildrenByToolUse(cur.msg.children ?? [], tc.toolUseId);
-					const isSubagent =
-						tc.toolName === "Agent" ||
-						tc.toolName === "Task" ||
-						tc.toolName === "Send" ||
-						!!tc._subagentActivity ||
-						children.length > 0;
-					items.push({
-						kind: "tool",
-						msg: cur.msg,
-						blockIndex: cur.blockIndex,
-						tc,
-						children,
-						isSubagent,
-					});
+				if (cur.item) {
+					items.push(cur.item);
 					sourceMessagesSet.add(cur.msg);
 				}
 				ai++;
@@ -349,6 +461,7 @@ export function segmentMessages(
 		}
 	}
 
+	cache?.prune(effectiveMessages);
 	return segments;
 }
 
