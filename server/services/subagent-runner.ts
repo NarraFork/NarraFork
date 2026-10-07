@@ -2652,7 +2652,7 @@ async function startContinuedSubagentUnlocked(
 						history: input.initialHistory,
 						trailingToolResults: input.initialTrailingToolResults,
 					}
-				: await loadSubagentHistory(subagentId, model, provider, currentInput));
+				: await loadSubagentHistory(subagentId, model, provider, currentInput, cwd));
 
 		// 6. Run via the structured foreground handle (same subagentId).
 		if (priorTaskVersion) {

@@ -1,5 +1,6 @@
 import { modelTextFromContentBlocks } from "@shared/native-injection";
 import { buildHistory } from "../../lib/agent";
+import { projectAttachmentLocations } from "../../lib/agent/attachment-projection";
 import {
 	getFileReferenceSnapshots,
 	projectFileReferenceText,
@@ -28,6 +29,9 @@ export interface RuntimeHistoryOptions {
 	sourceMessages?: readonly RuntimeHistoryMessage[];
 	/** Already accepted current input, with its original principal/attachment barrier. */
 	currentInput?: string;
+	/** Explicit server-local cwd only; never a remote workspace path. */
+	attachmentCwd?: string;
+	attachmentSignal?: AbortSignal;
 }
 
 export interface PreparedRuntimeHistory extends BuiltHistory {
@@ -143,7 +147,7 @@ export function projectQuestionFallbackToolResults(messages: RuntimeHistoryMessa
 	}
 }
 
-/** No principal changes, attachment reads, mailbox draining, persistence or adoption happen here. */
+/** No principal changes, mailbox draining or persistence; attachment copies require explicit cwd. */
 export async function buildRuntimeHistory(
 	options: RuntimeHistoryOptions,
 ): Promise<PreparedRuntimeHistory> {
@@ -154,7 +158,7 @@ export async function buildRuntimeHistory(
 		).narratorService.getModelHistorySinceLastCompact(options.narratorId));
 	// Detach mutable row arrays and block metadata, not huge text payloads,
 	// so shared/COW source rows remain unchanged during provider projection.
-	const modelMessages = sourceMessages
+	let modelMessages = sourceMessages
 		.filter((message) => message.role !== "disp")
 		.map((message) => ({
 			...message,
@@ -166,6 +170,17 @@ export async function buildRuntimeHistory(
 				: message.contentJson,
 			toolCalls: message.toolCalls?.map((call) => ({ ...call })),
 		}));
+	let currentInput = options.currentInput;
+	if (options.attachmentCwd) {
+		const prepared = await projectAttachmentLocations(modelMessages, {
+			cwd: options.attachmentCwd,
+			narratorId: options.narratorId,
+			currentInput,
+			signal: options.attachmentSignal,
+		});
+		modelMessages = prepared.messages;
+		currentInput = prepared.currentInput;
+	}
 	// Full Await outputs remain intact until the actual provider-input boundary.
 	// A builder may omit/move a user receipt (or a prebuilt child may replace
 	// this history), so row presence alone is not a safe deduplication decision.
@@ -175,7 +190,7 @@ export async function buildRuntimeHistory(
 		options.provider,
 		options.narratorId,
 		{
-			currentInput: options.currentInput,
+			currentInput,
 		},
 	);
 	// The WeakMap key MUST stay the builder's actual history array. A copied array loses
@@ -188,7 +203,7 @@ export async function buildRuntimeHistory(
 		modelMessages.map(projectMessageSenderForModel),
 		built.trailingUserText,
 	);
-	const input = projectCurrentInput(modelMessages, options.currentInput ?? "");
+	const input = projectCurrentInput(modelMessages, currentInput ?? "");
 	const combined = built.trailingUserText?.trim()
 		? input.trim()
 			? `${built.trailingUserText}\n\n${input}`

@@ -825,6 +825,7 @@ export async function loadSubagentHistory(
 	model: string,
 	provider: string,
 	currentInput?: string,
+	attachmentCwd?: string,
 ): Promise<import("../lib/agent/provider").BuiltHistory & { currentText?: string }> {
 	return buildRuntimeHistory({
 		narratorId,
@@ -832,6 +833,7 @@ export async function loadSubagentHistory(
 		provider,
 		profile: "subagent",
 		currentInput,
+		attachmentCwd,
 	});
 }
 
@@ -1114,6 +1116,7 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 			opts.model,
 			opts.provider,
 			consumed.text ?? undefined,
+			opts.cwd,
 		);
 		return {
 			prompt: rebuilt.trailingUserText ?? consumed.text ?? "",
@@ -1148,7 +1151,7 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 		userMsg.contentText ?? buffered.text,
 		buffered.fileReferences,
 	);
-	const rebuilt = await loadSubagentHistory(narratorId, model, provider, modelText);
+	const rebuilt = await loadSubagentHistory(narratorId, model, provider, modelText, opts.cwd);
 	// Match the primary loop's currentTurnText: only prepend context the builder
 	// extracted. Official Anthropic keeps sys as system history, so replaying the
 	// persisted hint itself here would inject it twice.

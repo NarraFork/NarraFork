@@ -181,8 +181,11 @@ function stripSubagentResultPrefix(output: string): string {
 }
 
 function extractPromptText(contentText: string | null | undefined): string {
-	const text = contentText?.trim() ?? "";
-	if (!text) throw new ValidationError("The last subagent user message has no text to retry");
+	const text = contentText ?? "";
+	if (!text.trim())
+		throw new ValidationError("The last subagent user message has no text to retry");
+	// Keep accepted bytes exact: sender/attachment projections match this packet,
+	// including leading whitespace and the separator before attached_files.
 	return text;
 }
 
@@ -236,12 +239,24 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 				});
 			}
 		}
-		const rebuilt = await loadSubagentHistory(input.subagentId, effectiveModel, provider, prompt);
+		const rebuilt = await loadSubagentHistory(
+			input.subagentId,
+			effectiveModel,
+			provider,
+			prompt,
+			narrator.cwd ?? undefined,
+		);
 		initialHistory = rebuilt.history;
 		initialTrailingToolResults = rebuilt.trailingToolResults;
 		persistPrompt = false;
 	} else if (input.intent === "continue_tool_results") {
-		const rebuilt = await loadSubagentHistory(input.subagentId, effectiveModel, provider);
+		const rebuilt = await loadSubagentHistory(
+			input.subagentId,
+			effectiveModel,
+			provider,
+			undefined,
+			narrator.cwd ?? undefined,
+		);
 		if (rebuilt.trailingToolResults.length > 0) {
 			prompt = "";
 			persistPrompt = false;
@@ -795,6 +810,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 								prepared.effectiveModel,
 								prepared.provider,
 								currentInput,
+								prepared.narrator.cwd ?? undefined,
 							);
 
 				const runtime = getManualOverrideRuntime(input.subagentId);

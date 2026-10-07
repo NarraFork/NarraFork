@@ -1,8 +1,13 @@
 import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessageRefs, narrators } from "../../db/schema";
+import { buildLegacyAttachedFilesHint } from "../../lib/attached-files";
 import { settings } from "../../lib/settings";
+import { setUploadsDirForTests } from "../../lib/uploads";
 import type { RuntimeHistoryMessage } from "../agent-runtime/history";
 
 const { db, sqlite } = getTestDb();
@@ -343,4 +348,92 @@ test("an already prepared initial packet is not attributed or extracted twice", 
 	});
 	expect(resumed.currentInputText).toBe(first.currentText);
 	expect(resumed.currentInputText.match(/<sender /g)).toHaveLength(1);
+});
+
+// Exercise the real provider adapters, not just the attachment formatter.
+test.each([
+	"relay",
+	"official",
+	"responses",
+	"chat",
+] as const)("%s prepares image/file locators for current input and historical replay", async (mode) => {
+	const root = mkdtempSync(join(tmpdir(), "nf-runtime-attachments-"));
+	const cwd = join(root, "worktree");
+	const oldOpenAI = settings.openaiProviders;
+	try {
+		mkdirSync(cwd);
+		mkdirSync(join(root, "uploads", "primary"), { recursive: true });
+		writeFileSync(
+			join(root, "uploads", "primary", "logo.png"),
+			Buffer.from(
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aG1cAAAAASUVORK5CYII=",
+				"base64",
+			),
+		);
+		setUploadsDirForTests(join(root, "uploads"));
+		settings.openaiProviders = [
+			{
+				id: "history-openai",
+				name: "History OpenAI",
+				prefix: "history-openai",
+				apiKey: "isolated-test-no-network",
+				baseUrl: "https://example.invalid/v1",
+				defaultModel: "gpt-5",
+				apiMode: mode === "chat" ? "completions" : "responses",
+			},
+		];
+		const file = { filename: "notes.txt", filePath: join(cwd, "notes.txt"), size: 12 };
+		const user = message("image-user", "user", "use logo");
+		user.createdBy = "alice";
+		user.creator = { username: "Alice" };
+		user.contentJson = [
+			{ type: "image", imageId: "logo", filename: "logo.png", uploadNarratorId: "primary" },
+			{ type: "text_file", ...file },
+			{ type: "text", text: "use logo" },
+		];
+		user.contentText = `use logo${buildLegacyAttachedFilesHint([file])}`;
+		const original = JSON.stringify(user);
+		const runtimeOptions = {
+			...options("primary", mode === "official"),
+			...(mode === "chat" || mode === "responses"
+				? { provider: "history-openai", model: "gpt-5" }
+				: {}),
+			attachmentCwd: cwd,
+		};
+		const current = await buildRuntimeHistory({
+			...runtimeOptions,
+			sourceMessages: [user],
+			currentInput: user.contentText,
+		});
+		expect(current.currentInputText).toContain('<sender kind="human" id="alice" name="Alice" />');
+		expect(current.currentInputText).toContain('image: "logo.png"');
+		expect(current.currentInputText).toContain('file: "notes.txt"');
+		expect(current.currentInputText.match(/<attached_files>/g)).toHaveLength(1);
+		expect(current.currentInputText).not.toContain(join(root, "uploads"));
+		expect(JSON.stringify(user)).toBe(original);
+		const historical = await buildRuntimeHistory({
+			...runtimeOptions,
+			sourceMessages: [user, message("reply", "assistant", "done")],
+		});
+		const history = JSON.stringify(historical.history);
+		expect(history).toContain("logo.png");
+		expect(history).toContain("device: local");
+		expect(history).toContain(join(cwd, ".narrafork", "attached"));
+		expect(history).toContain(mode === "relay" || mode === "official" ? '"type":"image"' : "image");
+		expect(readdirSync(join(cwd, ".narrafork", "attached"))).toHaveLength(1);
+		const recovered = await buildRuntimeHistory({ ...runtimeOptions, sourceMessages: [user] });
+		// Relay builders pop the final user row; locators must survive that recovery.
+		if (mode === "relay") expect(recovered.currentText).toContain('image: "logo.png"');
+		const child = await buildRuntimeHistory({
+			...runtimeOptions,
+			profile: "subagent",
+			sourceMessages: [{ ...user, parentToolUseId: "origin" }],
+			currentInput: user.contentText,
+		});
+		expect(child.currentInputText).toContain('image: "logo.png"');
+	} finally {
+		settings.openaiProviders = oldOpenAI;
+		setUploadsDirForTests(null);
+		rmSync(root, { recursive: true, force: true });
+	}
 });

@@ -709,6 +709,8 @@ export async function runAgentLoopUnlocked(
 				profile: isSubagentNarrator ? "subagent" : "primary",
 				sourceMessages: dbMessages,
 				currentInput: runState.input.text,
+				attachmentCwd: active.cwd,
+				attachmentSignal: active.abortController.signal,
 			});
 			let { history, trailingToolResults } = preparedHistory;
 			let initialQuestionReceiptText = "";
@@ -869,6 +871,8 @@ export async function runAgentLoopUnlocked(
 				isSubagent: isSubagentNarrator,
 				getModel: () => resolveProviderAndModel(active.model, active.provider).model,
 				getProvider: () => resolveProviderAndModel(active.model, active.provider).provider,
+				getAttachmentCwd: () => active.cwd,
+				attachmentSignal: active.abortController.signal,
 				onCompactDone: () => {
 					compactDoneFlag = true;
 				},
