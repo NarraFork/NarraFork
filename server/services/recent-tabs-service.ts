@@ -1182,18 +1182,37 @@ export async function applyWorkspaceMembershipProjection(
 	});
 }
 
+/**
+ * Remove one recent tab.
+ *
+ * `storeUndo` is opt-in and must only be set for a user-initiated close (the
+ * DELETE route behind swipe / context-menu / middle-click). Cascade cleanups
+ * (`removeTabFromAllUsers`, unreadable-project purge, archive) must leave it
+ * false: they would otherwise overwrite the user's pending undo token with a
+ * snapshot that points at already-deleted entities.
+ */
 export async function removeRecentTab(
 	userId: string,
 	type: RecentTabType,
 	id: string,
+	options: { storeUndo?: boolean } = {},
 ): Promise<RecentTabsMutationResult> {
 	return mutate(userId, (tabs) => {
 		const key = `${type}:${id}`;
 		const index = tabs.findIndex((tab) => tabKey(tab) === key);
 		if (index < 0) return { tabs };
 		if (type !== "workspace") {
+			// Snapshot BEFORE the splice — after it the removed tab is gone and the
+			// undo entry would restore an already-empty slot.
+			const undoTabs = options.storeUndo ? tabs.map(cloneTab) : undefined;
 			tabs.splice(index, 1);
-			return { tabs };
+			return {
+				tabs,
+				options: {
+					removedCount: 1,
+					...(undoTabs ? { undoTabs } : {}),
+				},
+			};
 		}
 		const range = workspaceGroupRange(tabs, index);
 		const children = tabs.slice(range.start + 1, range.end + 1).map((child) => {
@@ -1202,6 +1221,8 @@ export async function removeRecentTab(
 			return released;
 		});
 		tabs.splice(range.start, range.end - range.start + 1, ...children);
+		// Workspace dissolve also tears down the workspace entity and its panels, which a
+		// tab-list undo cannot restore — so no undo token is stored here.
 		return { tabs, options: { workspaceIdsToDelete: [id] } };
 	});
 }
@@ -1440,7 +1461,7 @@ export async function restoreRecentTabs(
 			if (baseRevision !== entry.revision) {
 				undoByUser.delete(userId);
 				throw new AppError(
-					"Recent-tabs changed after clear; the undo snapshot can no longer be restored",
+					"Recent-tabs changed after the removal; the undo snapshot can no longer be restored",
 					409,
 					RECENT_TABS_UNDO_CONFLICT_CODE,
 				);

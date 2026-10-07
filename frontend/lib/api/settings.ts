@@ -453,10 +453,20 @@ export const settingsApi = {
 			method: "POST",
 			body: JSON.stringify({ tabs }),
 		}),
-	removeRecentTab: (type: PersistedRecentTab["type"], id: string) =>
-		request<RecentTabsMutationResponse>(`/user-preferences/recent-tabs/${type}/${id}`, {
-			method: "DELETE",
-		}),
+	/**
+	 * Remove one recent tab. `cascade` is for entity-teardown cleanups (chapter deleted,
+	 * narrator archived) — it skips minting an undo token so it cannot clobber a pending
+	 * user undo with a snapshot that points at already-deleted entities.
+	 */
+	removeRecentTab: (
+		type: PersistedRecentTab["type"],
+		id: string,
+		options?: { cascade?: boolean },
+	) =>
+		request<RecentTabsMutationResponse>(
+			`/user-preferences/recent-tabs/${type}/${id}${options?.cascade ? "?cascade=1" : ""}`,
+			{ method: "DELETE" },
+		),
 	moveRecentTab: (key: string, target: RecentTabMoveTarget, signal?: AbortSignal) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/move", {
 			method: "PATCH",

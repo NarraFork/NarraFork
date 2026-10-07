@@ -575,10 +575,16 @@ userPreferencesRoutes.delete("/recent-tabs/:type/:id", async (c) => {
 	const parsed = removeRecentTabSchema.safeParse({
 		type: c.req.param("type"),
 		id: c.req.param("id"),
+		// `?cascade=1` marks entity-teardown cleanups (chapter deleted, narrator archived).
+		cascade: c.req.query("cascade") === "1" ? true : undefined,
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const type = parsed.data.type === "session" ? "narrator" : parsed.data.type;
-	return c.json(await removeRecentTab(userId, type, parsed.data.id));
+	// User-initiated close (swipe / context menu / middle-click) mints an undo token;
+	// cascade cleanups must not (they would clobber a pending user undo).
+	return c.json(
+		await removeRecentTab(userId, type, parsed.data.id, { storeUndo: !parsed.data.cascade }),
+	);
 });
 
 userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {

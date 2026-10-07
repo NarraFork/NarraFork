@@ -838,7 +838,8 @@ export function useArchiveNarrator() {
 			const matched = tabs.filter(isMatch);
 			if (matched.length > 0) {
 				for (const tab of matched) {
-					api.removeRecentTab(tab.type, tab.id).catch(() => {});
+					// Cascade cleanup after archive — no undo token for entities that are gone.
+					api.removeRecentTab(tab.type, tab.id, { cascade: true }).catch(() => {});
 				}
 				qc.setQueryData(
 					RECENT_TABS_QUERY_KEY,
