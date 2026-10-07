@@ -1,6 +1,11 @@
 /** One human-decision center. List queries carry summaries; expanded rows own their forms. */
 
 import type { ExecutionTargetIdentity } from "@frontend/lib/api/types";
+import {
+	localizeDangerDetailText,
+	localizeDangerText,
+	localizeDangerTexts,
+} from "@frontend/lib/localize-danger-copy";
 import type { AsyncQuestion, PendingPermission } from "@frontend/types/narrator";
 import {
 	Alert,
@@ -618,7 +623,12 @@ function ReflectionReviewCard({
 	);
 	// The server already promotes the reflection reason to `decisionReason`; showing
 	// the identical sentence twice reads as two separate findings.
-	const reason = reflection.reason === decisionReason ? undefined : reflection.reason;
+	const rawReason = reflection.reason === decisionReason ? undefined : reflection.reason;
+	const summary = reflection.summary ? localizeDangerText(reflection.summary, t) : undefined;
+	const reason = rawReason ? localizeDangerText(rawReason, t) : undefined;
+	const consequences = localizeDangerTexts(reflection.consequences, t);
+	const alternatives = localizeDangerTexts(reflection.alternatives, t);
+	const details = reflection.details.map((detail) => localizeDangerDetailText(detail, t));
 	return (
 		<Paper withBorder p="xs" radius="sm">
 			<Stack gap={4}>
@@ -634,20 +644,14 @@ function ReflectionReviewCard({
 						</Badge>
 					)}
 				</Group>
-				{reflection.summary && <ReviewLine value={reflection.summary} />}
+				{summary && <ReviewLine value={summary} />}
 				{reason && <ReviewLine value={reason} />}
 				{reflection.nextSteps && (
 					<ReviewLine value={t("reflectionNextSteps", { nextSteps: reflection.nextSteps })} />
 				)}
-				<ReviewBullets
-					label={t("humanAttentionDangerConsequences")}
-					items={reflection.consequences}
-				/>
-				<ReviewBullets
-					label={t("humanAttentionDangerAlternatives")}
-					items={reflection.alternatives}
-				/>
-				<ReviewBullets label={t("humanAttentionDangerDetails")} items={reflection.details} />
+				<ReviewBullets label={t("humanAttentionDangerConsequences")} items={consequences} />
+				<ReviewBullets label={t("humanAttentionDangerAlternatives")} items={alternatives} />
+				<ReviewBullets label={t("humanAttentionDangerDetails")} items={details} />
 				{reflection.mutations.length > 0 && (
 					<Stack gap={2}>
 						<Text size="xs" fw={600}>
