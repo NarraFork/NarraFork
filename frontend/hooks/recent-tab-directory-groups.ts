@@ -60,8 +60,8 @@ export type RecentTabRow =
  */
 export const MIN_DIRECTORY_GROUP_SIZE = 2;
 
-/** Tab types whose `subtitle` is a working directory. */
-function hasDirectorySubtitle(tab: RecentTab): boolean {
+/** Tab types whose `subtitle` is a working directory (not a chapter title). */
+export function hasDirectorySubtitle(tab: Pick<RecentTab, "type">): boolean {
 	return tab.type === "narrator" || tab.type === "subagent";
 }
 

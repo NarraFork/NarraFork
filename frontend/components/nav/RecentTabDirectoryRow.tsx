@@ -16,6 +16,7 @@ import type { RecentTab } from "@frontend/hooks/recent-tabs-utils";
 import { Badge, Group, NavLink, Text, Tooltip } from "@mantine/core";
 import { IconChevronDown, IconChevronRight, IconFolder, IconFolderOpen } from "@tabler/icons-react";
 import { useMemo } from "react";
+import { LeftTruncatedPathText } from "../common/TruncatedPath";
 
 export interface RecentTabDirectoryRowProps {
 	path: string;
@@ -66,16 +67,10 @@ export function RecentTabDirectoryRow({
 					</Group>
 				}
 				description={
-					<Text
-						size="xs"
-						c="dimmed"
-						truncate
-						// Same `rtl` trick the narrator rows use for cwd: long paths keep their
-						// tail (the part that identifies the directory) instead of their root.
-						style={{ direction: "rtl", textAlign: "left" }}
-					>
-						{path}
-					</Text>
+					// Left-ellipsis + LTR isolation (`LeftTruncatedPathText`): long paths keep
+					// their tail (the part that identifies the directory) without reordering
+					// the leading "/" out of the visual start.
+					<LeftTruncatedPathText path={path} size="xs" c="dimmed" />
 				}
 				leftSection={
 					<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>

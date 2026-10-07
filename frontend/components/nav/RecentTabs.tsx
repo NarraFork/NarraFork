@@ -2,6 +2,7 @@ import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
 import {
 	directoryRowId,
 	groupRecentTabsByDirectory,
+	hasDirectorySubtitle,
 	type RecentTabRow,
 } from "@frontend/hooks/recent-tab-directory-groups";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
@@ -99,6 +100,7 @@ import {
 	triggerNotification,
 	updateAsyncQuestionAttention,
 } from "../../lib/notification";
+import { LeftTruncatedPathText } from "../common/TruncatedPath";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { UserAvatar } from "../UserAvatar";
 import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
@@ -1804,19 +1806,15 @@ function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }
 				}
 				description={
 					<>
-						{tab.subtitle && (
-							<Text
-								size="xs"
-								c="dimmed"
-								truncate
-								style={{
-									direction: tab.type === "narrator" ? "rtl" : undefined,
-									textAlign: "left",
-								}}
-							>
-								{tab.subtitle}
-							</Text>
-						)}
+						{tab.subtitle &&
+							(hasDirectorySubtitle(tab) ? (
+								// cwd: left-ellipsis + LTR isolation so the leading "/" stays put.
+								<LeftTruncatedPathText path={tab.subtitle} size="xs" c="dimmed" />
+							) : (
+								<Text size="xs" c="dimmed" truncate>
+									{tab.subtitle}
+								</Text>
+							))}
 						{tab.type !== "project" && <TabIndicators tab={tab} t={t} />}
 					</>
 				}
@@ -2086,19 +2084,16 @@ function TabItemBody({
 					}
 					description={
 						<>
-							{tab.subtitle && !hideSubtitle && (
-								<Text
-									size="xs"
-									c="dimmed"
-									truncate
-									style={{
-										direction: tab.type === "narrator" ? "rtl" : undefined,
-										textAlign: "left",
-									}}
-								>
-									{tab.subtitle}
-								</Text>
-							)}
+							{tab.subtitle &&
+								!hideSubtitle &&
+								(hasDirectorySubtitle(tab) ? (
+									// cwd: left-ellipsis + LTR isolation so the leading "/" stays put.
+									<LeftTruncatedPathText path={tab.subtitle} size="xs" c="dimmed" />
+								) : (
+									<Text size="xs" c="dimmed" truncate>
+										{tab.subtitle}
+									</Text>
+								))}
 							{tab.type !== "project" && <TabIndicators tab={tab} t={t} />}
 						</>
 					}
