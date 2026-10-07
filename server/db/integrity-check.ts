@@ -22,6 +22,7 @@
  */
 
 import { existsSync } from "node:fs";
+import { sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
@@ -55,10 +56,33 @@ function isCompiledRuntime(): boolean {
 	return import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
 }
 
+/**
+ * True when this module was loaded from a pre-bundled entrypoint rather than from source.
+ *
+ * Three shapes reach this code and each needs a different probe argv:
+ *   - source (`bun run server/index.ts`): siblings resolve, so `../index.ts` is correct;
+ *   - `bun build --compile`: every module reports `$bunfs`, and the binary re-dispatches on argv;
+ *   - Electrobun/desktop bundle: modules report a REAL path like `.../app/bun/index.js`, so the
+ *     compiled check says "not compiled" while `../index.ts` does not exist on disk. Deriving a
+ *     source path there turns every probe into `unavailable`.
+ *
+ * The bundle collapses the whole server into its own entry file, which already dispatches on
+ * {@link DB_INTEGRITY_WORKER_FLAG}, so that file is the entry to re-invoke.
+ */
+function bundledEntrypoint(): string | null {
+	const url = import.meta.url;
+	if (!url.endsWith(".js")) return null;
+	const path = fileURLToPath(url);
+	// A bundle is a single emitted file; source trees keep this module at server/db/…
+	return path.includes(`${sep}server${sep}db${sep}`) ? null : path;
+}
+
 function buildProbeCommand(): string[] {
 	// The compiled binary embeds server/index.ts, which dispatches on the flag; in dev we point Bun
 	// at the same entry file so both runtimes share one code path.
 	if (isCompiledRuntime()) return [process.execPath, DB_INTEGRITY_WORKER_FLAG];
+	const bundled = bundledEntrypoint();
+	if (bundled) return [process.execPath, bundled, DB_INTEGRITY_WORKER_FLAG];
 	// Resolve the entry from THIS module's URL, never from the process cwd: the server may be
 	// started from a subdirectory or by a service manager with a different WorkingDirectory, and a
 	// relative path would silently turn every probe into `unavailable`.

@@ -11,14 +11,30 @@
  * database, runs migrations and builds the whole service graph, which takes tens of seconds.
  * Showing a loading state is the difference between "starting up" and "the app is broken".
  */
+import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
-
-import { BrowserWindow, Utils } from "electrobun/main";
+import { promisify } from "node:util";
+import { DB_INTEGRITY_WORKER_FLAG } from "../server/db/integrity-protocol";
+import { WATCHER_WORKER_FLAG } from "../server/lib/watcher/worker-protocol";
+import { createDesktopLifecycle, desktopServerOrigin } from "./lifecycle";
 
 /** Bundle layout: this module is bundled to `Resources/app/bun/`, copied assets go to `Resources/app/`. */
 const BUNDLE_DIR = import.meta.dir;
 const APP_ROOT = resolve(BUNDLE_DIR, "..");
+
+/**
+ * Flags that mean "this process is a worker, not the app".
+ *
+ * The server spawns helper processes (the read-only integrity probe, the file watcher) by
+ * re-invoking its own entrypoint with a flag. In a packaged desktop build that entrypoint is
+ * THIS file, so those children must never reach the window code — see the dynamic import below.
+ */
+const WORKER_FLAGS = [DB_INTEGRITY_WORKER_FLAG, WATCHER_WORKER_FLAG];
+
+function isWorkerInvocation(): boolean {
+	return WORKER_FLAGS.some((flag) => process.argv.includes(flag));
+}
 
 const HEALTH_TIMEOUT_MS = 120_000;
 const HEALTH_POLL_INTERVAL_MS = 250;
@@ -33,8 +49,7 @@ const HEALTH_POLL_INTERVAL_MS = 250;
  * Set before importing the server: `narrafork-home.ts` reads this lazily, but every module that
  * derives a path from it captures the value on first use.
  */
-function configureDesktopPaths(): string {
-	const userData = Utils.paths.userData;
+function configureDesktopPaths(userData: string): string {
 	process.env.NARRAFORK_HOME ??= userData;
 
 	// The server serves the frontend from `<server module dir>/../dist/frontend` and looks up
@@ -128,9 +143,7 @@ async function waitForServer(
 	while (Date.now() < deadline) {
 		const address = getAddress();
 		if (address) {
-			// Always talk to the loopback interface: the server may be bound to 0.0.0.0, which is
-			// not a connectable destination on every platform.
-			const origin = `${address.protocol}://127.0.0.1:${address.port}`;
+			const origin = desktopServerOrigin(address);
 			try {
 				const response = await fetch(`${origin}/api/health`, {
 					signal: AbortSignal.timeout(5_000),
@@ -150,28 +163,124 @@ async function waitForServer(
 	);
 }
 
-const userDataDir = configureDesktopPaths();
-const logPath = join(userDataDir, "server.log");
+if (isWorkerInvocation()) {
+	// A helper subprocess, not the app. `electrobun/main` must NOT be imported here: it opens the
+	// window during module evaluation (its `BrowserWindow` module calls `setExitOnLastWindowClosed`
+	// through FFI at import time), which in a worker either dies on a missing native library or
+	// leaves a stray window behind. Both shapes break the parent, which is waiting on this
+	// process's stdout for a report.
+	//
+	// The worker cannot ask Electrobun for the userData path for the same reason, so it inherits
+	// NARRAFORK_HOME from the parent that spawned it.
+	const inheritedHome = process.env.NARRAFORK_HOME;
+	if (inheritedHome) configureDesktopPaths(inheritedHome);
+	else process.chdir(APP_ROOT);
 
-const window = new BrowserWindow({
-	title: "NarraFork",
-	url: "views://mainview/index.html",
-	frame: { width: 1440, height: 900, x: 80, y: 60 },
-});
-
-window.webview.loadHTML(loadingPageHtml());
-
-try {
-	// Importing the server starts it: server/index.ts and server/main.ts are top-level
-	// side-effect modules, matching how `bun run start` boots.
-	const [{ getRuntimeAddress }] = await Promise.all([
-		import("../server/lib/server-restart"),
-		import("../server/index"),
-	]);
-
-	const origin = await waitForServer(getRuntimeAddress);
-	window.webview.loadURL(origin);
-} catch (err) {
-	const message = err instanceof Error ? (err.stack ?? err.message) : String(err);
-	window.webview.loadHTML(errorPageHtml(message, logPath));
+	// server/index.ts dispatches on the same flags and runs the matching worker.
+	await import("../server/index");
+} else {
+	const { BrowserWindow, Tray, Utils } = await import("electrobun/main");
+	const userDataDir = configureDesktopPaths(Utils.paths.userData);
+	const logPath = join(userDataDir, "server.log");
+	const zh = /^zh/i.test(process.env.LC_ALL || process.env.LC_MESSAGES || process.env.LANG || "en");
+	const labels = zh
+		? {
+				open: "打开主窗口",
+				quit: "退出 NarraFork",
+				unavailable: "系统托盘不可用，关闭窗口将退出应用。",
+			}
+		: {
+				open: "Open main window",
+				quit: "Quit NarraFork",
+				unavailable: "System tray unavailable. Closing the window will quit the app.",
+			};
+	let tray: InstanceType<typeof Tray> | undefined;
+	let serverBoot: Promise<unknown> | undefined;
+	const lifecycle = createDesktopLifecycle({
+		createWindow: () =>
+			new BrowserWindow({
+				title: "NarraFork",
+				url: "views://mainview/index.html",
+				frame: { width: 1440, height: 900, x: 80, y: 60 },
+			}),
+		loadingHtml: loadingPageHtml(),
+		shutdown: async () => {
+			// Do not exit while startup may still acquire the database lock.
+			await serverBoot?.catch(() => {});
+			const { shutdownDesktopServer } = await import("../server/lib/server-restart");
+			await shutdownDesktopServer();
+		},
+		disposeTray: () => tray?.remove(),
+		exit: () => Utils.quit(),
+		onError: (error) => {
+			lifecycle.setError(errorPageHtml(String(error), logPath));
+			lifecycle.openWindow();
+		},
+	});
+	lifecycle.openWindow();
+	serverBoot = import("../server/index");
+	// Observe early rejection while the tray host probe is in flight.
+	void serverBoot.catch(() => {});
+	// On Linux, a successful native createTray does not prove a tray host exists.
+	// Fail closed rather than leave an invisible process with no way to reopen it.
+	let trayHost = process.platform !== "linux";
+	if (process.platform === "linux") {
+		try {
+			const { stdout } = await promisify(execFile)(
+				"gdbus",
+				[
+					"call",
+					"--session",
+					"--dest",
+					"org.kde.StatusNotifierWatcher",
+					"--object-path",
+					"/StatusNotifierWatcher",
+					"--method",
+					"org.freedesktop.DBus.Properties.Get",
+					"org.kde.StatusNotifierWatcher",
+					"IsStatusNotifierHostRegistered",
+				],
+				{ timeout: 2000, maxBuffer: 4096 },
+			);
+			trayHost = stdout.includes("true");
+		} catch {
+			/* Missing session bus or gdbus: keep normal close-to-quit behavior. */
+		}
+	}
+	if (trayHost) {
+		tray = new Tray({
+			title: "NarraFork",
+			image: join(APP_ROOT, "dist/frontend/pwa-192x192.png"),
+			template: false,
+		});
+		tray.setMenu([
+			{ label: labels.open, action: "open" },
+			{ type: "separator" },
+			{ label: labels.quit, action: "quit" },
+		]);
+		tray.on("tray-clicked", (event) => {
+			const action = (event as { data?: { action?: string } }).data?.action;
+			if (action === "quit")
+				void lifecycle.quit().catch((error) => {
+					lifecycle.setError(errorPageHtml(String(error), logPath));
+					lifecycle.openWindow();
+				});
+			else lifecycle.openWindow();
+		});
+	}
+	lifecycle.setBackgroundAvailable(Boolean(tray?.visible));
+	if (!tray?.visible) {
+		console.warn(labels.unavailable);
+		// Native modal dialogs may block the JS thread while the server is booting.
+		// A visible title warning preserves both startup and the normal close-to-quit path.
+		const window = lifecycle.openWindow() as InstanceType<typeof BrowserWindow> | null;
+		window?.setTitle(`NarraFork — ${labels.unavailable}`);
+	}
+	try {
+		await serverBoot;
+		const { getRuntimeAddress } = await import("../server/lib/server-restart");
+		lifecycle.setReady(await waitForServer(getRuntimeAddress));
+	} catch (error) {
+		lifecycle.setError(errorPageHtml(String(error), logPath));
+	}
 }

@@ -1,3 +1,5 @@
+import { sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { logger } from "../logger";
 import { envWithAmbientProxy } from "../net/proxy-env";
 import type { IFileChange } from "./types";
@@ -41,15 +43,18 @@ function nextRequestId(prefix: string): string {
 	return `${prefix}-${Date.now().toString(36)}-${requestCounter.toString(36)}`;
 }
 
-function isCompiledRuntime(): boolean {
-	return import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
-}
-
-function buildWorkerCommand(): string[] {
-	if (isCompiledRuntime()) {
-		return [process.execPath, WATCHER_WORKER_FLAG];
+export function buildWorkerCommand(
+	moduleUrl = import.meta.url,
+	execPath = process.execPath,
+): string[] {
+	if (moduleUrl.includes("$bunfs/") || moduleUrl.includes("%7EBUN/")) {
+		return [execPath, WATCHER_WORKER_FLAG];
 	}
-	return [process.execPath, "server/index.ts", WATCHER_WORKER_FLAG];
+	const path = fileURLToPath(moduleUrl);
+	if (path.endsWith(".js") && !path.includes(`${sep}server${sep}lib${sep}watcher${sep}`)) {
+		return [execPath, path, WATCHER_WORKER_FLAG];
+	}
+	return [execPath, fileURLToPath(new URL("../../index.ts", moduleUrl)), WATCHER_WORKER_FLAG];
 }
 
 /**

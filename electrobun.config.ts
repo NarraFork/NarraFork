@@ -1,4 +1,5 @@
 import type { ElectrobunConfig } from "electrobun";
+import { version } from "./package.json";
 
 /**
  * Electrobun desktop shell configuration.
@@ -31,9 +32,10 @@ export default {
 	app: {
 		name: "NarraFork",
 		identifier: "sh.narrafork.desktop",
-		// Keep in sync with package.json's version.
-		version: "0.5.23",
+		// A single version source for server and desktop release metadata.
+		version,
 	},
+	runtime: { exitOnLastWindowClosed: false },
 	build: {
 		mainProcess: "bun",
 		bun: {

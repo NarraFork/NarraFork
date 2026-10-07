@@ -65,6 +65,7 @@ let _runtimeAddressGetter: RuntimeAddressGetter | null = null;
 let _gracefulShutdownFn: GracefulShutdownFn | null = null;
 let _operatorShutdownFn: OperatorShutdownFn | null = null;
 let _operatorShutdownPending = false;
+let _operatorShutdownPromise: Promise<void> | null = null;
 let _gracefulRestartSession: GracefulRestartSession | null = null;
 
 /** Called by server/main.ts to register the in-process restart implementation. */
@@ -101,7 +102,41 @@ export function registerGracefulShutdownHandler(fn: GracefulShutdownFn): void {
  */
 export function registerOperatorShutdownHandler(fn: OperatorShutdownFn | null): void {
 	_operatorShutdownFn = fn;
-	if (!fn) _operatorShutdownPending = false;
+	if (!fn) {
+		_operatorShutdownPending = false;
+		_operatorShutdownPromise = null;
+	}
+}
+
+function startOperatorShutdown(options: { reason: string }, delayMs: number): Promise<void> {
+	const fn = _operatorShutdownFn;
+	if (!fn) return Promise.resolve();
+	_operatorShutdownPending = true;
+	const run = async () => {
+		const result = await fn(options);
+		if (!result.success) throw new Error(result.reason);
+	};
+	const promise = delayMs
+		? new Promise<void>((resolve, reject) => {
+				const timer = setTimeout(() => {
+					void run().then(resolve, reject);
+				}, delayMs);
+				timer.unref?.();
+			})
+		: Promise.resolve().then(run);
+	_operatorShutdownPromise = promise;
+	void promise.catch(() => {
+		if (_operatorShutdownPromise === promise) {
+			_operatorShutdownPending = false;
+			_operatorShutdownPromise = null;
+		}
+	});
+	return promise;
+}
+
+/** Wait for scheduled/in-flight teardown; no handler means server boot never completed. */
+export async function shutdownDesktopServer(): Promise<void> {
+	await (_operatorShutdownPromise ?? startOperatorShutdown({ reason: "desktop_quit" }, 0));
 }
 
 /**
@@ -148,16 +183,12 @@ export function scheduleOperatorShutdown(options: { reason: string }): boolean {
 		reason: options.reason,
 		graceMs: OPERATOR_SHUTDOWN_RESPONSE_GRACE_MS,
 	});
-	const timer = setTimeout(() => {
-		void fn(options).catch((err) => {
-			logger.error("Operator shutdown failed", {
-				reason: options.reason,
-				error: err instanceof Error ? err.message : String(err),
-			});
+	void startOperatorShutdown(options, OPERATOR_SHUTDOWN_RESPONSE_GRACE_MS).catch((err) => {
+		logger.error("Operator shutdown failed", {
+			reason: options.reason,
+			error: err instanceof Error ? err.message : String(err),
 		});
-	}, OPERATOR_SHUTDOWN_RESPONSE_GRACE_MS);
-	// Never let the grace timer be the reason the process lingers if it exits another way first.
-	(timer as { unref?: () => void }).unref?.();
+	});
 	return true;
 }
 

@@ -14,6 +14,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { ParcelRecursiveWatcher } from "../parcel-watcher";
 import {
 	asWorkerStdinSink,
+	buildWorkerCommand,
 	encodeWorkerCommand,
 	endWorkerStdin,
 	isNativeWatcherEnabled,
@@ -490,6 +491,34 @@ describe("coordinator fallback after retries", () => {
 			collector.stop();
 			spawn.mockRestore();
 			await client.shutdown().catch(() => {});
+		}
+	});
+});
+
+describe("worker entrypoint resolution", () => {
+	test("source resolves its entrypoint independently of cwd", () => {
+		expect(
+			buildWorkerCommand("file:///repo/server/lib/watcher/parcel-worker-client.ts", "/bun"),
+		).toEqual(["/bun", "/repo/server/index.ts", "--narrafork-watcher-worker"]);
+	});
+	test("desktop bundle re-executes its real emitted entrypoint", () => {
+		expect(buildWorkerCommand("file:///app%20root/bun/index.js", "/bun")).toEqual([
+			"/bun",
+			"/app root/bun/index.js",
+			"--narrafork-watcher-worker",
+		]);
+	});
+	test("unbundled JavaScript still uses the server entrypoint", () => {
+		expect(
+			buildWorkerCommand("file:///repo/server/lib/watcher/parcel-worker-client.js", "/bun"),
+		).toEqual(["/bun", "/repo/server/index.ts", "--narrafork-watcher-worker"]);
+	});
+	test("compiled executables dispatch without a source filename", () => {
+		for (const url of ["file:///$bunfs/root/index.js", "file:///%7EBUN/root/index.js"]) {
+			expect(buildWorkerCommand(url, "/narrafork")).toEqual([
+				"/narrafork",
+				"--narrafork-watcher-worker",
+			]);
 		}
 	});
 });

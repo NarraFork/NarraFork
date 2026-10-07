@@ -53,6 +53,7 @@ import {
 } from "./lib/server-restart";
 import { settings } from "./lib/settings";
 import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
+import { createShutdownTask } from "./lib/shutdown-task";
 import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
 import {
 	buildHealthPayload,
@@ -1664,7 +1665,6 @@ type GracefulShutdownResult = {
 	durationMs: number;
 };
 
-let shutdownPromise: Promise<GracefulShutdownResult> | null = null;
 let killWindowsProcessTreeOnExit = true;
 
 /**
@@ -1704,16 +1704,13 @@ async function shutdownStep(
 	}
 }
 
-async function performGracefulShutdown(
-	options: GracefulShutdownOptions,
-): Promise<GracefulShutdownResult> {
-	if (shutdownPromise) return shutdownPromise;
-	const startedAt = Date.now();
-	if (options.skipWindowsProcessTreeKill) {
-		killWindowsProcessTreeOnExit = false;
-	}
+const performGracefulShutdown = createShutdownTask(
+	async (options: GracefulShutdownOptions): Promise<GracefulShutdownResult> => {
+		const startedAt = Date.now();
+		if (options.skipWindowsProcessTreeKill) {
+			killWindowsProcessTreeOnExit = false;
+		}
 
-	shutdownPromise = (async () => {
 		logger.info("Graceful shutdown started", { reason: options.reason });
 		stopHeartbeat();
 
@@ -1842,10 +1839,8 @@ async function performGracefulShutdown(
 		};
 		logger.info("Graceful shutdown completed", { ...result, cleanMarked });
 		return result;
-	})();
-
-	return shutdownPromise;
-}
+	},
+);
 
 registerGracefulShutdownHandler(async (request) => {
 	logger.info("Replacement server requested graceful shutdown", {
