@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
 	chmodSync,
 	existsSync,
@@ -7,6 +7,9 @@ import {
 	readdirSync,
 	rmSync,
 	statSync,
+	symlinkSync,
+	truncateSync,
+	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -14,13 +17,17 @@ import { getNarraforkPath } from "../narrafork-home";
 import {
 	contentJsonHasImageBlocks,
 	deleteAvatarImage,
+	ensureImageWorktreeCopy,
 	getAvatarPath,
+	getImagePath,
 	getUploadedImageInfo,
 	getUploadsDir,
+	type ImageRef,
 	MAX_IMAGE_DIMENSION,
 	MAX_IMAGE_HEADER_SIZE,
 	MAX_IMAGE_PIXELS,
 	MAX_IMAGE_SEGMENT_SCANS,
+	MAX_IMAGE_SIZE,
 	parseImageDimensions,
 	sanitizeParsedDimensions,
 	saveAvatarImage,
@@ -124,6 +131,237 @@ function jpegHeader(width: number, height: number, orientation?: number): Buffer
 
 afterEach(() => {
 	setUploadsDirForTests(null);
+});
+
+describe("image worktree copies", () => {
+	let testRoot: string;
+	let cwd: string;
+	let uploadRoot: string;
+	const image: ImageRef = {
+		imageId: "image_1",
+		uploadNarratorId: "owner-1",
+		filename: "../../fake.jpg",
+		mediaType: "image/jpeg",
+	};
+
+	function setup(owner = "owner-1", imageId = "image_1", extension = ".jpg"): string {
+		testRoot = mkdtempSync(resolve(tmpdir(), "narrafork-image-copy-"));
+		cwd = resolve(testRoot, "worktree");
+		uploadRoot = resolve(testRoot, "uploads");
+		mkdirSync(cwd);
+		const sourceDir = resolve(uploadRoot, owner);
+		mkdirSync(sourceDir, { recursive: true });
+		setUploadsDirForTests(uploadRoot);
+		const source = resolve(sourceDir, `${imageId}${extension}`);
+		writeFileSync(source, pngHeader(4, 4));
+		return source;
+	}
+
+	afterEach(() => {
+		if (testRoot) rmSync(testRoot, { recursive: true, force: true });
+	});
+
+	test("uses owning narrator and real format, never the original filename as a path", async () => {
+		setup();
+		const copy = await ensureImageWorktreeCopy(cwd, image, "wrong-owner");
+		expect(copy).toEqual({
+			filename: image.filename,
+			filePath: resolve(cwd, ".narrafork/attached/7-owner-1-image_1.png"),
+			size: 24,
+		});
+		expect(await Bun.file(copy?.filePath ?? "").bytes()).toEqual(fileBytes(pngHeader(4, 4)));
+	});
+
+	test("cancels before touching the worktree when its session was interrupted", async () => {
+		setup();
+		const controller = new AbortController();
+		controller.abort(new Error("session interrupted"));
+		await expect(ensureImageWorktreeCopy(cwd, image, undefined, controller.signal)).rejects.toThrow(
+			"session interrupted",
+		);
+		expect(existsSync(resolve(cwd, ".narrafork"))).toBe(false);
+	});
+
+	test("shared budgets cap new copies but never hide a reusable copy", async () => {
+		setup();
+		const budget = { remainingCopies: 1, remainingBytes: 23, deadlineAt: Date.now() + 10_000 };
+		expect(await ensureImageWorktreeCopy(cwd, image, undefined, undefined, budget)).toBeNull();
+		budget.remainingBytes = 24;
+		const first = await ensureImageWorktreeCopy(cwd, image, undefined, undefined, budget);
+		expect(first?.size).toBe(24);
+		expect(budget.remainingCopies).toBe(0);
+		expect(budget.remainingBytes).toBe(0);
+		budget.deadlineAt = 0;
+		expect(await ensureImageWorktreeCopy(cwd, image, undefined, undefined, budget)).toEqual(first);
+	});
+
+	test("uses fallback owner for legacy images", async () => {
+		setup();
+		const copy = await ensureImageWorktreeCopy(
+			cwd,
+			{ ...image, uploadNarratorId: undefined },
+			"owner-1",
+		);
+		expect(copy?.size).toBe(24);
+	});
+
+	test("keeps user changes and reuses copies after uploads have disappeared", async () => {
+		const source = setup();
+		const first = await ensureImageWorktreeCopy(cwd, image);
+		if (!first) throw new Error("Missing copy");
+		writeFileSync(first.filePath, "user edits");
+		expect((await ensureImageWorktreeCopy(cwd, image))?.size).toBe(10);
+		rmSync(source);
+		rmSync(uploadRoot, { recursive: true });
+		expect(await ensureImageWorktreeCopy(cwd, image)).toEqual({ ...first, size: 10 });
+		expect(await Bun.file(first.filePath).text()).toBe("user edits");
+	});
+
+	test("returns null when both source and copy are absent, without prefix matching", async () => {
+		setup("owner-1", "image_1-other");
+		expect(getImagePath("owner-1", "image_1")).toBeNull();
+		expect(getImagePath("owner-1", "image_1-other")).not.toBeNull();
+		expect(await ensureImageWorktreeCopy(cwd, image)).toBeNull();
+		rmSync(uploadRoot, { recursive: true });
+		expect(await ensureImageWorktreeCopy(cwd, image)).toBeNull();
+	});
+
+	test("rejects traversal and missing identifiers", async () => {
+		setup();
+		for (const invalid of ["", "..", "../owner-1", "a/b", "a\\b", "/absolute", "a.b"]) {
+			expect(getImagePath(invalid, "image_1")).toBeNull();
+			expect(getImagePath("owner-1", invalid)).toBeNull();
+			await expect(
+				ensureImageWorktreeCopy(cwd, { ...image, uploadNarratorId: invalid }),
+			).rejects.toThrow("Invalid image owner or ID");
+			await expect(ensureImageWorktreeCopy(cwd, { ...image, imageId: invalid })).rejects.toThrow(
+				"Invalid image owner or ID",
+			);
+		}
+		await expect(
+			ensureImageWorktreeCopy(cwd, { ...image, uploadNarratorId: undefined }),
+		).rejects.toThrow("Invalid image owner or ID");
+	});
+
+	for (const component of [".narrafork", ".narrafork/attached"]) {
+		test(`rejects symlink directory ${component}`, async () => {
+			setup();
+			const outside = resolve(testRoot, "outside");
+			mkdirSync(outside);
+			if (component.includes("/")) mkdirSync(resolve(cwd, ".narrafork"));
+			symlinkSync(outside, resolve(cwd, component));
+			await expect(ensureImageWorktreeCopy(cwd, image)).rejects.toThrow(
+				"Unsafe image attachment directory",
+			);
+			expect(readdirSync(outside)).toEqual([]);
+		});
+	}
+
+	test("rejects existing target symlinks including dangling ones", async () => {
+		setup();
+		const dir = resolve(cwd, ".narrafork/attached");
+		mkdirSync(dir, { recursive: true });
+		const target = resolve(dir, "7-owner-1-image_1.png");
+		const outside = resolve(testRoot, "outside.png");
+		writeFileSync(outside, "unchanged");
+		symlinkSync(outside, target);
+		await expect(ensureImageWorktreeCopy(cwd, image)).rejects.toThrow("Unsafe image");
+		expect(await Bun.file(outside).text()).toBe("unchanged");
+		rmSync(outside);
+		await expect(ensureImageWorktreeCopy(cwd, image)).rejects.toThrow("Unsafe image");
+	});
+
+	test("rejects symlink sources and source narrator directories", async () => {
+		const source = setup();
+		const outside = resolve(testRoot, "outside.png");
+		writeFileSync(outside, pngHeader(4, 4));
+		rmSync(source);
+		symlinkSync(outside, source);
+		await expect(ensureImageWorktreeCopy(cwd, image)).rejects.toThrow("Unsafe image upload");
+		rmSync(resolve(uploadRoot, "owner-1"), { recursive: true });
+		symlinkSync(testRoot, resolve(uploadRoot, "owner-1"));
+		await expect(ensureImageWorktreeCopy(cwd, image)).rejects.toThrow("Unsafe image upload");
+	});
+
+	test("rejects oversized uploads before copying and invalid magic bytes", async () => {
+		const source = setup();
+		truncateSync(source, MAX_IMAGE_SIZE + 1);
+		await expect(ensureImageWorktreeCopy(cwd, image)).rejects.toThrow("too large");
+		expect(readdirSync(resolve(cwd, ".narrafork/attached"))).toEqual([]);
+		writeFileSync(source, "not an image");
+		await expect(ensureImageWorktreeCopy(cwd, image)).rejects.toThrow("Unrecognized");
+		expect(readdirSync(resolve(cwd, ".narrafork/attached"))).toEqual([]);
+	});
+
+	test("rejects oversized existing copies without overwriting them", async () => {
+		setup();
+		const first = await ensureImageWorktreeCopy(cwd, image);
+		if (!first) throw new Error("Missing copy");
+		truncateSync(first.filePath, MAX_IMAGE_SIZE + 1);
+		await expect(ensureImageWorktreeCopy(cwd, image)).rejects.toThrow("too large");
+		expect(statSync(first.filePath).size).toBe(MAX_IMAGE_SIZE + 1);
+	});
+
+	test("concurrent requests publish one complete stable file with no temporary leftovers", async () => {
+		setup();
+		const copies = await Promise.all(
+			Array.from({ length: 6 }, () => ensureImageWorktreeCopy(cwd, image)),
+		);
+		for (const copy of copies) expect(copy).toEqual(copies[0]);
+		expect(readdirSync(resolve(cwd, ".narrafork/attached"))).toEqual(["7-owner-1-image_1.png"]);
+	});
+
+	test("copies multiple bounded chunks completely", async () => {
+		const source = setup();
+		const bytes = Buffer.alloc(150_000, 42);
+		pngHeader(4, 4).copy(bytes);
+		writeFileSync(source, bytes);
+		const copy = await ensureImageWorktreeCopy(cwd, image);
+		expect(copy?.size).toBe(bytes.length);
+		expect(await Bun.file(copy?.filePath ?? "").bytes()).toEqual(fileBytes(bytes));
+	});
+
+	test("cooperative timeout cleans temporary files without publishing a partial copy", async () => {
+		setup();
+		const clock = spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValue(20_000);
+		try {
+			await expect(ensureImageWorktreeCopy(cwd, image)).rejects.toThrow("timed out");
+			expect(readdirSync(resolve(cwd, ".narrafork/attached"))).toEqual([]);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	for (const [mediaType, bytes, extension] of [
+		["image/jpeg", jpegHeader(4, 4), ".jpg"],
+		["image/gif", gifHeader(4, 4), ".gif"],
+		["image/webp", webpVp8xHeader(4, 4), ".webp"],
+	] as const) {
+		test(`chooses the real ${mediaType} extension from magic bytes`, async () => {
+			const source = setup();
+			writeFileSync(source, bytes);
+			const copy = await ensureImageWorktreeCopy(cwd, image);
+			expect(copy?.filePath.endsWith(extension)).toBe(true);
+			expect(copy?.size).toBe(bytes.length);
+		});
+	}
+
+	test("owner and image combinations with hyphens cannot collide", async () => {
+		setup("a-b", "c", ".png");
+		mkdirSync(resolve(uploadRoot, "a"));
+		writeFileSync(resolve(uploadRoot, "a/b-c.png"), pngHeader(2, 2));
+		const first = await ensureImageWorktreeCopy(cwd, {
+			...image,
+			uploadNarratorId: "a-b",
+			imageId: "c",
+		});
+		const second = await ensureImageWorktreeCopy(cwd, {
+			...image,
+			uploadNarratorId: "a",
+			imageId: "b-c",
+		});
+		expect(first?.filePath).not.toBe(second?.filePath);
+	});
 });
 
 describe("uploads helpers", () => {

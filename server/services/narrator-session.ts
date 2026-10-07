@@ -2614,6 +2614,9 @@ export interface ContextManagementOptions {
 	getModel: () => string;
 	/** Dynamic getter for the current provider (supports mid-loop model switching) */
 	getProvider: () => string;
+	/** Server-local cwd for restoring model-visible attachment copies. */
+	getAttachmentCwd?: () => string | undefined;
+	attachmentSignal?: AbortSignal;
 	/** Whether this narrator is a subagent (all messages have parentToolUseId) */
 	isSubagent?: boolean;
 	/** Called after compact completes (e.g. reset conversationId, set restart flag) */
@@ -2689,6 +2692,8 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			provider: getProvider(),
 			profile: isSubagentNarrator ? "subagent" : "primary",
 			sourceMessages: rawMsgs,
+			attachmentCwd: opts.getAttachmentCwd?.(),
+			attachmentSignal: opts.attachmentSignal,
 		});
 		const systemPrompt = includeSystemPrompt
 			? ((await rebuildSystemPrompt?.()) ?? undefined)
