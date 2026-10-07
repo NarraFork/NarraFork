@@ -1,10 +1,8 @@
 import {
-	Alert,
 	Badge,
 	Box,
 	Button,
 	Group,
-	Modal,
 	PasswordInput,
 	Select,
 	Stack,
@@ -16,13 +14,6 @@ import {
 import { IconArrowLeft, IconSearch } from "@tabler/icons-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import {
-	APP_VIEWPORT_BOTTOM,
-	SAFE_AREA_INSET_BOTTOM,
-	SAFE_AREA_INSET_LEFT,
-	SAFE_AREA_INSET_RIGHT,
-	SAFE_AREA_INSET_TOP,
-} from "../../lib/safe-area";
 import classes from "./AddProviderPage.module.css";
 import {
 	type AddProviderDraft,
@@ -32,6 +23,7 @@ import {
 } from "./provider-add-draft";
 import {
 	type AddProviderType,
+	getProviderPresetName,
 	type ProviderPreset,
 	searchProviderPresets,
 } from "./provider-presets";
@@ -64,13 +56,11 @@ export function AddProviderPage({
 		if (showConfig) headingRef.current?.focus();
 		else catalogRef.current?.focus();
 	}, [showConfig, preset]);
-	const presets = useMemo(() => searchProviderPresets(query), [query]);
-	const protocolOptions = (
-		preset ? Object.keys(preset.endpoints) : Object.keys(PROTOCOL_KEYS)
-	) as AddProviderType[];
+	const presets = useMemo(() => searchProviderPresets(query, t), [query, t]);
+	const protocolOptions = preset ? (Object.keys(preset.endpoints) as AddProviderType[]) : [];
 	const choose = (next: ProviderPreset) => {
 		setPreset(next);
-		setDraft(draftFromPreset(next));
+		setDraft(draftFromPreset({ ...next, name: getProviderPresetName(next, t) }));
 		setShowConfig(true);
 	};
 	const chooseCustom = (protocol: AddProviderType) =>
@@ -89,23 +79,13 @@ export function AddProviderPage({
 		setDraft((prev) => (prev ? { ...prev, ...values } : prev));
 
 	return (
-		<Modal
-			opened
-			fullScreen
-			onClose={onClose}
-			title={t("addProvider")}
-			padding={0}
-			classNames={{ content: classes.content, body: classes.body, header: classes.header }}
-			styles={{
-				content: {
-					height: APP_VIEWPORT_BOTTOM,
-					maxHeight: APP_VIEWPORT_BOTTOM,
-					paddingLeft: SAFE_AREA_INSET_LEFT,
-					paddingRight: SAFE_AREA_INSET_RIGHT,
-				},
-				header: { paddingTop: `max(12px, ${SAFE_AREA_INSET_TOP})` },
-			}}
-		>
+		<Stack gap="md" className={classes.page}>
+			<Group gap="sm">
+				<Button variant="subtle" leftSection={<IconArrowLeft size={16} />} onClick={onClose}>
+					{t("addProviderCancel")}
+				</Button>
+				<Title order={2}>{t("addProvider")}</Title>
+			</Group>
 			<div className={classes.layout} data-config={showConfig || undefined}>
 				<section
 					ref={catalogRef}
@@ -114,9 +94,6 @@ export function AddProviderPage({
 					aria-label={t("addProviderCatalog")}
 				>
 					<Stack gap="sm" p="md">
-						<Text size="sm" c="dimmed">
-							{t("addProviderIntro")}
-						</Text>
 						<TextInput
 							label={t("addProviderSearch")}
 							placeholder={t("addProviderSearchPlaceholder")}
@@ -142,44 +119,42 @@ export function AddProviderPage({
 						<Text fw={600} size="sm">
 							{t("addProviderCatalog")} · {presets.length}
 						</Text>
-						{presets.length === 0 && (
-							<Text c="dimmed" size="sm">
-								{t("addProviderNoResults")}
-							</Text>
-						)}
-						{presets.map((item) => (
-							<UnstyledButton
-								key={item.id}
-								className={classes.preset}
-								data-selected={preset?.id === item.id || undefined}
-								onClick={() => choose(item)}
-								aria-pressed={preset?.id === item.id}
-							>
-								<Text fw={600}>{item.name}</Text>
-								<Group gap={4} mt={4}>
-									{(Object.keys(item.endpoints) as AddProviderType[]).map((protocol) => (
-										<Badge key={protocol} size="xs" variant="light">
-											{t(PROTOCOL_KEYS[protocol])}
-										</Badge>
-									))}
-								</Group>
-							</UnstyledButton>
-						))}
-						<Text size="xs" c="dimmed">
-							{t("addProviderAttribution")}
-						</Text>
+						<div className={classes.catalogList}>
+							{presets.length === 0 && (
+								<Text c="dimmed" size="sm">
+									{t("addProviderNoResults")}
+								</Text>
+							)}
+							{presets.map((item) => (
+								<UnstyledButton
+									key={item.id}
+									className={classes.preset}
+									data-selected={preset?.id === item.id || undefined}
+									onClick={() => choose(item)}
+									aria-pressed={preset?.id === item.id}
+								>
+									<Text fw={600}>{getProviderPresetName(item, t)}</Text>
+									<Group gap={4} mt={4}>
+										{(Object.keys(item.endpoints) as AddProviderType[]).map((protocol) => (
+											<Badge key={protocol} size="xs" variant="light">
+												{t(PROTOCOL_KEYS[protocol])}
+											</Badge>
+										))}
+									</Group>
+								</UnstyledButton>
+							))}
+						</div>
 					</Stack>
 				</section>
 				<section className={classes.configuration} aria-label={t("addProviderConfigure")}>
 					{draft ? (
 						<form
-							className={classes.form}
 							onSubmit={(event) => {
 								event.preventDefault();
 								if (isValidProviderDraft(draft)) onAdd(draft);
 							}}
 						>
-							<Stack gap="md" p="md" className={classes.fields}>
+							<Stack gap="md" p="md">
 								<Button
 									className={classes.back}
 									variant="subtle"
@@ -211,13 +186,9 @@ export function AddProviderPage({
 											});
 									}}
 								/>
-								<Text size="xs" c="dimmed">
-									{t(`${PROTOCOL_KEYS[draft.protocol]}Desc`)}
-								</Text>
 								<TextInput
 									required
 									label={t("addProviderBaseUrl")}
-									description={t("addProviderBaseUrlHint")}
 									placeholder="https://api.example.com/v1"
 									value={draft.baseUrl}
 									onChange={(event) => update({ baseUrl: event.currentTarget.value })}
@@ -227,14 +198,12 @@ export function AddProviderPage({
 								/>
 								<PasswordInput
 									label={t("addProviderApiKey")}
-									description={t("addProviderApiKeyHint")}
 									value={draft.apiKey}
 									onChange={(event) => update({ apiKey: event.currentTarget.value })}
 									autoComplete="off"
 								/>
 								<TextInput
 									label={t("providerPrefix")}
-									description={t("addProviderPrefixHint")}
 									value={draft.prefix}
 									onChange={(event) =>
 										update({ prefix: sanitizeProviderPrefix(event.currentTarget.value) })
@@ -242,32 +211,23 @@ export function AddProviderPage({
 									autoCapitalize="none"
 									spellCheck={false}
 								/>
-								<Alert variant="light">{t("addProviderDraftNotice")}</Alert>
+								<Group justify="space-between" className={classes.actions}>
+									<Text size="xs" c="dimmed">
+										{t("addProviderDraftNotice")}
+									</Text>
+									<Button type="submit" disabled={!isValidProviderDraft(draft)}>
+										{t("addProviderContinue")}
+									</Button>
+								</Group>
 							</Stack>
-							<Group
-								justify="flex-end"
-								p="md"
-								className={classes.actions}
-								style={{ paddingBottom: `max(16px, ${SAFE_AREA_INSET_BOTTOM})` }}
-							>
-								<Button variant="default" onClick={onClose}>
-									{t("addProviderCancel")}
-								</Button>
-								<Button type="submit" disabled={!isValidProviderDraft(draft)}>
-									{t("addProviderContinue")}
-								</Button>
-							</Group>
 						</form>
 					) : (
 						<Box p="xl">
-							<Title order={3}>{t("addProviderChoose")}</Title>
-							<Text mt="sm" c="dimmed">
-								{t("addProviderChooseHint")}
-							</Text>
+							<Text c="dimmed">{t("addProviderChoose")}</Text>
 						</Box>
 					)}
 				</section>
 			</div>
-		</Modal>
+		</Stack>
 	);
 }

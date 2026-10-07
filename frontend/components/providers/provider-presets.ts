@@ -5,6 +5,7 @@ export type AddProviderType = "nug" | CustomApiProtocol;
 export interface ProviderPreset {
 	id: string;
 	name: string;
+	nameKey?: string;
 	endpoints: Partial<Record<AddProviderType, string>>;
 	defaultProtocol: AddProviderType;
 }
@@ -22,7 +23,7 @@ function preset(
 	endpoints: ProviderPreset["endpoints"],
 	defaultProtocol: AddProviderType = "completions-compatible",
 ): ProviderPreset {
-	return { id, name, endpoints, defaultProtocol };
+	return { id, name, nameKey: `providerNames.${id}`, endpoints, defaultProtocol };
 }
 
 export const PROVIDER_PRESETS: ProviderPreset[] = [
@@ -246,13 +247,24 @@ const PROVIDER_SEARCH_ALIASES: Record<string, string[]> = {
 	zai: ["智谱", "GLM"],
 };
 
-/** Match all terms against the name, id, local aliases, protocols and API URLs. */
-export function searchProviderPresets(query: string): ProviderPreset[] {
+export function getProviderPresetName(
+	provider: ProviderPreset,
+	translate: (key: string) => string,
+): string {
+	return provider.nameKey ? translate(provider.nameKey) : provider.name;
+}
+
+/** Match all terms against raw/localized names, id, aliases, protocols and API URLs. */
+export function searchProviderPresets(
+	query: string,
+	translate?: (key: string) => string,
+): ProviderPreset[] {
 	const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
 	return PROVIDER_PRESETS.filter((provider) => {
 		const haystack = [
 			provider.id,
 			provider.name,
+			...(translate ? [getProviderPresetName(provider, translate)] : []),
 			...(PROVIDER_SEARCH_ALIASES[provider.id] ?? []),
 			...Object.keys(provider.endpoints),
 			...Object.values(provider.endpoints),

@@ -2,7 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildLicenseManifestFromDisk } from "../../../server/lib/licenses/manifest";
-import { PROVIDER_PRESETS, searchProviderPresets } from "./provider-presets";
+import enSettings from "../../locales/en/settings.json";
+import zhSettings from "../../locales/zh-CN/settings.json";
+import {
+	getProviderPresetName,
+	PROVIDER_PRESETS,
+	type ProviderPreset,
+	searchProviderPresets,
+} from "./provider-presets";
 
 const root = join(import.meta.dir, "../../..");
 const commit = "4edb3b85630469e1a784577ec47540cb646d9781";
@@ -123,7 +130,57 @@ describe("provider presets", () => {
 	});
 });
 
+describe("localized preset names", () => {
+	for (const [locale, names] of [
+		["en", enSettings.providerNames],
+		["zh-CN", zhSettings.providerNames],
+	] as const) {
+		test(`${locale} translates every built-in provider name`, () => {
+			expect(Object.keys(names).sort()).toEqual(PROVIDER_PRESETS.map((entry) => entry.id).sort());
+			const translate = (key: string) =>
+				names[key.slice("providerNames.".length) as keyof typeof names];
+			for (const entry of PROVIDER_PRESETS) {
+				expect(entry.nameKey).toBe(`providerNames.${entry.id}`);
+				expect(getProviderPresetName(entry, translate)).toBe(names[entry.id as keyof typeof names]);
+				expect(getProviderPresetName(entry, translate).trim()).not.toBe("");
+			}
+		});
+	}
+
+	test("custom names without a translation key bypass translation", () => {
+		const custom: ProviderPreset = {
+			id: "custom",
+			name: "My custom gateway",
+			endpoints: {},
+			defaultProtocol: "completions-compatible",
+		};
+		expect(
+			getProviderPresetName(custom, () => {
+				throw new Error("Custom names must not be translated");
+			}),
+		).toBe("My custom gateway");
+	});
+});
+
 describe("preset search", () => {
+	test("localized names participate in search while raw names remain searchable", () => {
+		const names = zhSettings.providerNames;
+		const translate = (key: string) =>
+			names[key.slice("providerNames.".length) as keyof typeof names];
+		expect(searchProviderPresets("天翼云息壤")).toEqual([]);
+		expect(searchProviderPresets("天翼云息壤", translate).map((entry) => entry.id)).toEqual([
+			"xirang",
+		]);
+		expect(searchProviderPresets("腾讯TokenHub", translate).map((entry) => entry.id)).toEqual([
+			"tokenhub",
+		]);
+		expect(searchProviderPresets("Xirang", translate).map((entry) => entry.id)).toEqual(["xirang"]);
+		expect(searchProviderPresets("", translate)).toEqual(PROVIDER_PRESETS);
+		const uniqueName = (key: string) => (key === "providerNames.openai" ? "LOCALIZED BRAND" : key);
+		expect(searchProviderPresets("localized brand", uniqueName).map((entry) => entry.id)).toEqual([
+			"openai",
+		]);
+	});
 	test("empty or whitespace returns the full list without sharing the array", () => {
 		for (const query of ["", " \t\n "]) {
 			expect(searchProviderPresets(query)).toEqual(PROVIDER_PRESETS);

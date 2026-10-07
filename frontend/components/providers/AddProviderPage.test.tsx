@@ -3,7 +3,10 @@ import { createInstance } from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import type { Root } from "react-dom/client";
+import settingsEn from "../../locales/en/settings.json";
+import settingsZhCn from "../../locales/zh-CN/settings.json";
 import type { AddProviderDraft } from "./provider-add-draft";
+import { PROVIDER_PRESETS } from "./provider-presets";
 
 // Install before loading React DOM so its native input-event support is detected.
 // Mantine's test environment keeps real controls but removes portals/transitions.
@@ -69,7 +72,13 @@ const { MantineProvider } = await import("@mantine/core");
 const { I18nextProvider } = await import("react-i18next");
 const { AddProviderPage } = await import("./AddProviderPage");
 const i18n = createInstance();
-await i18n.init({ lng: "en", fallbackLng: "en", resources: {}, initImmediate: false });
+await i18n.init({
+	lng: "en",
+	fallbackLng: "en",
+	defaultNS: "settings",
+	resources: { en: { settings: settingsEn }, "zh-CN": { settings: settingsZhCn } },
+	initImmediate: false,
+});
 
 let root: Root | undefined;
 let container: HTMLDivElement;
@@ -78,6 +87,7 @@ let closeCount: number;
 
 beforeEach(async () => {
 	installDom();
+	await i18n.changeLanguage("en");
 	added = [];
 	closeCount = 0;
 	container = document.createElement("div");
@@ -117,7 +127,7 @@ function restoreDom() {
 
 function button(text: string): HTMLButtonElement {
 	const result = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
-		(item) => item.textContent?.trim() === text,
+		(item) => item.textContent?.trim() === i18n.t(text),
 	);
 	if (!result) throw new Error(`Missing button: ${text}`);
 	return result;
@@ -125,7 +135,7 @@ function button(text: string): HTMLButtonElement {
 
 function field(label: string): HTMLInputElement {
 	const element = [...container.querySelectorAll("label")].find((item) =>
-		item.textContent?.startsWith(label),
+		item.textContent?.startsWith(i18n.t(label)),
 	);
 	const id = element?.getAttribute("for");
 	const input = id ? document.getElementById(id) : null;
@@ -136,8 +146,10 @@ function field(label: string): HTMLInputElement {
 }
 
 function preset(name: string): HTMLButtonElement {
+	const provider = PROVIDER_PRESETS.find((item) => item.name === name || item.id === name);
+	const displayName = provider?.nameKey ? i18n.t(provider.nameKey) : name;
 	const result = [...container.querySelectorAll<HTMLButtonElement>("button[aria-pressed]")].find(
-		(item) => item.querySelector("p")?.textContent === name,
+		(item) => item.querySelector("p")?.textContent === displayName,
 	);
 	if (!result) throw new Error(`Missing preset: ${name}`);
 	return result;
@@ -160,7 +172,7 @@ async function type(label: string, value: string) {
 async function selectProtocol(label: string) {
 	await click(field("addProviderProtocol"));
 	const option = [...container.querySelectorAll('[role="option"]')].find(
-		(item) => item.textContent === label,
+		(item) => item.textContent === i18n.t(label),
 	);
 	if (!option) throw new Error(`Missing protocol option: ${label}`);
 	await click(option);
@@ -177,9 +189,42 @@ async function submit() {
 }
 
 describe("AddProviderPage interactions", () => {
+	test("renders in the route content without a modal or explanatory paragraphs", async () => {
+		expect(container.querySelector('[role="dialog"]')).toBeNull();
+		await click(preset("ZhiPu"));
+		for (const key of [
+			"addProviderIntro",
+			"addProviderAttribution",
+			"addProviderBaseUrlHint",
+			"addProviderApiKeyHint",
+			"addProviderPrefixHint",
+			"addProviderCompletionsDesc",
+		]) {
+			expect(container.textContent).not.toContain(i18n.t(key));
+		}
+		expect(container.textContent).toContain(i18n.t("addProviderDraftNotice"));
+	});
+
+	test("uses localized platform names for the catalog, search and initial form name", async () => {
+		await act(async () => {
+			await i18n.changeLanguage("zh-CN");
+		});
+		expect(preset("ZhiPu").textContent).toContain("智谱");
+		await type("addProviderSearch", "硅基流动");
+		expect(container.querySelectorAll("button[aria-pressed]").length).toBe(1);
+		await click(preset("silicon"));
+		expect(field("addProviderName").value).toBe(settingsZhCn.providerNames.silicon);
+		await type("addProviderName", "我的接入");
+		await act(async () => {
+			await i18n.changeLanguage("en");
+		});
+		expect(preset("silicon").textContent).toContain(settingsEn.providerNames.silicon);
+		expect(field("addProviderName").value).toBe("我的接入");
+	});
+
 	test("selects a preset without adding it, and cancellation only closes", async () => {
 		await click(preset("ZhiPu"));
-		expect(field("addProviderName").value).toBe("ZhiPu");
+		expect(field("addProviderName").value).toBe(settingsEn.providerNames.zhipu);
 		expect(field("addProviderBaseUrl").value).toBe("https://open.bigmodel.cn/api/paas/v4");
 		expect(added).toEqual([]);
 		await type("addProviderApiKey", "discarded-key");
@@ -203,7 +248,7 @@ describe("AddProviderPage interactions", () => {
 		expect(preset("ZhiPu")).toBeDefined();
 		await type("addProviderSearch", "no-provider-matches-this");
 		expect(container.querySelectorAll("button[aria-pressed]").length).toBe(0);
-		expect(container.textContent).toContain("addProviderNoResults");
+		expect(container.textContent).toContain(i18n.t("addProviderNoResults"));
 		await type("addProviderSearch", "");
 		expect(container.querySelectorAll("button[aria-pressed]").length).toBeGreaterThan(1);
 	});

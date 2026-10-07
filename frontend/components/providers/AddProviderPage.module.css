@@ -1,33 +1,27 @@
-.content {
-	display: flex;
-	flex-direction: column;
-	overflow: hidden;
-}
-
-.header {
-	flex: 0 0 auto;
-	padding-inline: var(--mantine-spacing-md);
-}
-
-.body {
-	flex: 1;
-	min-height: 0;
-	display: flex;
-	overflow: hidden;
+.page {
+	container-type: inline-size;
+	container-name: provider-add;
+	min-width: 0;
 }
 
 .layout {
 	display: grid;
-	grid-template-columns: minmax(260px, 36%) minmax(0, 1fr);
+	grid-template-columns: minmax(240px, 36%) minmax(0, 1fr);
 	width: 100%;
-	min-height: 0;
+	border: 1px solid var(--mantine-color-default-border);
+	border-radius: var(--mantine-radius-md);
 }
 
 .catalog {
-	overflow-y: auto;
 	min-width: 0;
 	border-right: 1px solid var(--mantine-color-default-border);
-	padding-bottom: max(16px, env(safe-area-inset-bottom, 0px));
+}
+
+.catalogList {
+	display: grid;
+	gap: var(--mantine-spacing-xs);
+	max-height: 36rem;
+	overflow-y: auto;
 }
 
 .preset {
@@ -47,27 +41,10 @@
 
 .configuration {
 	min-width: 0;
-	min-height: 0;
-	overflow-y: auto;
-}
-
-.form {
-	height: 100%;
-	display: flex;
-	flex-direction: column;
-	min-height: 0;
-}
-
-.fields {
-	flex: 1;
-	min-height: 0;
-	overflow-y: auto;
 }
 
 .actions {
-	flex-shrink: 0;
-	border-top: 1px solid var(--mantine-color-default-border);
-	background: var(--mantine-color-body);
+	padding-bottom: max(0px, env(safe-area-inset-bottom, 0px));
 }
 
 .back {
@@ -80,7 +57,7 @@
 	min-height: 44px;
 }
 
-@media (max-width: 47.99em) {
+@container provider-add (max-width: 44rem) {
 	.layout {
 		grid-template-columns: minmax(0, 1fr);
 	}

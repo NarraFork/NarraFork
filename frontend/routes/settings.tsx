@@ -66,7 +66,7 @@ function SettingsLayout() {
 			to={item.to}
 			label={t(item.labelKey)}
 			leftSection={<item.Icon size={18} />}
-			active={pathname === item.to}
+			active={pathname === item.to || pathname.startsWith(`${item.to}/`)}
 			variant="light"
 		/>
 	);
