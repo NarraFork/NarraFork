@@ -231,7 +231,7 @@ export const splitChapterSchema = z.object({
 // route to parse with it, nor a `chapterFork` method behind one, and the frontend client
 // that named the endpoint has been removed too. A validator for a request nothing accepts
 // is indistinguishable from one for a request that works, which is how the whole feature
-// came to look implemented in DESIGN.md.
+// came to look like a working feature.
 //
 // Reviving it means a service method plus a route; write the schema then. Note the
 // per-fork `crossOffset` question in `chapter-fork.ts` — a batch is the one caller that

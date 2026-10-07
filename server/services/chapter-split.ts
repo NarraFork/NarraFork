@@ -10,7 +10,8 @@
  *   - **newFork** — an ordinary fork of prefix at C, which is what the user was
  *     actually asking for when they said "branch off from this old commit".
  *
- * Two decisions here deviate from DESIGN.md, both deliberately:
+ * Two decisions here are deliberate (they deviate from earlier design notes
+ * that no longer live in this repo):
  *
  * 1. The narrator history is cut by `narrator_message_refs.seq`, never by
  *    comparing the commit's timestamp against message `createdAt`. Commit dates
@@ -123,9 +124,11 @@ export interface TruncationPoint {
  * Resolution order, cheapest and most exact first:
  *
  *  1. `chapter_commits` (unique index on chapterId+sha) → `narratorMessageId`.
- *     This is the authoritative mapping: `recordCommit` writes that column and
- *     `narrator_messages.commit_sha` in the same call, so a commit made by the
- *     narrator always lands here.
+ *     When present this is the authoritative mapping. `recordCommit` can write
+ *     that column (and `narrator_messages.commit_sha`) when callers pass
+ *     `narratorMessageId`, but the production call sites (manual git commit,
+ *     pre-merge auto-commit, merge commit) currently do not pass it — so many
+ *     rows have a null association and fall through to the ancestry path below.
  *  2. The same row's message may not be materialized in a lazily-forked
  *     narrator's refs, so the ref is backfilled on demand before concluding it
  *     is absent.

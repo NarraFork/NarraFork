@@ -152,7 +152,7 @@ export const chaptersApi = {
 	// What remains on the server is deliberate and harmless: the `exploration_groups`
 	// table, its validators, its project-database sync, and the `exploration:*` event
 	// types. Reviving the feature means adding a service plus routes, then a client
-	// again — see the notes in DESIGN.md.
+	// again. The `exploration_groups` table and `exploration:*` events remain.
 
 	// Reviews
 	createReview: (
