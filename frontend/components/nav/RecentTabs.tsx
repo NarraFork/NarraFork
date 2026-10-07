@@ -104,6 +104,7 @@ import { LeftTruncatedPathText } from "../common/TruncatedPath";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { UserAvatar } from "../UserAvatar";
 import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
+import { RecentTabBackgroundBubble } from "./RecentTabBackgroundBubble";
 import { RecentTabDirectoryRow, type RecentTabDirectoryRowProps } from "./RecentTabDirectoryRow";
 import { RecentTabDropIndicator } from "./RecentTabDropIndicator";
 import type { RecentTabDropTarget } from "./recent-tab-drop-target";
@@ -1420,36 +1421,6 @@ export function RecentTabList({
 	);
 }
 
-/**
- * Diagonally half-filled narrator bubble: FOREGROUND idle + background tasks running.
- *
- * The outline keeps the tab's foreground state colour; the filled upper-left triangle
- * uses working blue, because that is what the filled half means — work is still in
- * flight, just not in the foreground. Two stacked Tabler icons with a CSS clip-path:
- * Tabler ships no diagonal half glyph, and a rotated `IconCircleHalf2` would lose the
- * message-bubble shape this surface's whole state language is built on.
- */
-function HalfFilledNarratorBubble({ size, color }: { size: number; color?: string }) {
-	const fillColor = statusRegistry.accentVar(getEffectiveNarratorDisplay("working"), 6);
-	return (
-		<Box component="span" pos="relative" style={{ display: "inline-flex", lineHeight: 0 }}>
-			<IconMessageCircle size={size} color={color} />
-			<Box
-				component="span"
-				data-tab-background-active="true"
-				style={{
-					position: "absolute",
-					inset: 0,
-					clipPath: "polygon(0 0, 100% 0, 0 100%)",
-					pointerEvents: "none",
-				}}
-			>
-				<IconMessageCircleFilled size={size} color={fillColor} />
-			</Box>
-		</Box>
-	);
-}
-
 /** Shared icon component for recent tabs — avoids duplicating icon logic across 4 components. */
 function TabIcon({
 	tab,
@@ -1476,10 +1447,10 @@ function TabIcon({
 		// the outline keeps the foreground state, the filled half (working blue) says
 		// the work has not actually stopped.
 		const backgroundActive = isRecentTabBackgroundActive(tab, filledStatus);
-		icon = filledStatus ? (
+		icon = backgroundActive ? (
+			<RecentTabBackgroundBubble size={size} color={iconColor} foregroundFilled={filledStatus} />
+		) : filledStatus ? (
 			<IconMessageCircleFilled size={size} color={iconColor} />
-		) : backgroundActive ? (
-			<HalfFilledNarratorBubble size={size} color={iconColor} />
 		) : (
 			<IconMessageCircle size={size} color={iconColor} />
 		);

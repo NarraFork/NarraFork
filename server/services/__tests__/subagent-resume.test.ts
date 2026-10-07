@@ -13,6 +13,7 @@ const persistedCalls: Array<Record<string, unknown>> = [];
 const conclusionCalls: Array<Record<string, unknown>> = [];
 const retriedToolCalls: Array<Record<string, unknown>> = [];
 let beforeDeniedRetryIo: (() => Promise<void>) | undefined;
+let deniedRetryShouldContinue = true;
 const editedMessageCalls: Array<Record<string, unknown>> = [];
 const deleteMessagesAfterCalls: Array<Record<string, unknown>> = [];
 const foregroundResolvers = new Map<string, (output: string) => void>();
@@ -481,7 +482,7 @@ beforeAll(async () => {
 					userId,
 					options,
 				});
-				return { ok: true, shouldContinue: true };
+				return { ok: true, shouldContinue: deniedRetryShouldContinue };
 			},
 		),
 		updateToolCallConclusion: mock(async (input: Record<string, unknown>) => {
@@ -627,6 +628,7 @@ describe("resume lifecycle shares the root's file-revert admission", () => {
 
 afterEach(async () => {
 	beforeDeniedRetryIo = undefined;
+	deniedRetryShouldContinue = true;
 	for (const subagentId of [...terminalResolvers.keys()]) {
 		await finishRun(subagentId);
 	}
@@ -1324,6 +1326,93 @@ describe("resumeSubagent", () => {
 		});
 		await finishRun(subagentId);
 	});
+
+	for (const failure of ["stopped", "thrown"] as const) {
+		test(`publishes background denied-tool retry states after persistence (${failure})`, async () => {
+			const subagentId = `resume-background-denied-${failure}`;
+			const { db } = await import("../../db");
+			const { narrators, backgroundTasks } = await import("../../db/schema");
+			const { backgroundTaskService } = await import("../background-task-service");
+			const now = new Date().toISOString();
+			databaseNarratorIds.add(subagentId);
+			await db.insert(narrators).values([
+				{ id: parentNarratorId, createdAt: now, updatedAt: now },
+				{
+					id: subagentId,
+					parentNarratorId,
+					variant: "subagent:general",
+					type: "subagent",
+					isBackground: true,
+					backgroundStatus: "failed",
+					backgroundResult: "old failure",
+					backgroundCompletedAt: now,
+					logicalRunId: "previous-run",
+					createdAt: now,
+					updatedAt: now,
+				},
+			]);
+			await db.insert(backgroundTasks).values({
+				id: subagentId,
+				parentNarratorId,
+				subagentNarratorId: subagentId,
+				type: "agent",
+				status: "failed",
+				output: "old failure",
+				completedAt: now,
+				logicalRunId: "previous-run",
+				startedAt: now,
+				createdAt: now,
+				updatedAt: now,
+			});
+			const statuses: string[] = [];
+			const notification = spyOn(
+				backgroundTaskService,
+				"notifyDerivedStatusChanged",
+			).mockImplementation((parentId, taskId) => {
+				expect(parentId).toBe(parentNarratorId);
+				expect(taskId).toBe(subagentId);
+				const narrator = db.select().from(narrators).where(eq(narrators.id, taskId)).get();
+				const task = db.select().from(backgroundTasks).where(eq(backgroundTasks.id, taskId)).get();
+				expect<string | null | undefined>(task?.status).toBe(narrator?.backgroundStatus);
+				expect(task?.logicalRunId).toBe(narrator?.logicalRunId);
+				expect(task?.logicalRunId).not.toBe("previous-run");
+				expect(task?.output).toBe(narrator?.backgroundResult);
+				expect(task?.completedAt).toBe(narrator?.backgroundCompletedAt);
+				if (task?.status === "running") {
+					expect(task.output).toBeNull();
+					expect(task.completedAt).toBeNull();
+				} else {
+					expect(task?.output).toStartWith("Re-execution failed:");
+					expect(task?.completedAt).toBeString();
+				}
+				statuses.push(task?.status ?? "missing");
+			});
+			beforeDeniedRetryIo = async () => {
+				expect(statuses).toEqual(["running"]);
+				if (failure === "thrown") throw new Error("retry I/O failed");
+			};
+			deniedRetryShouldContinue = false;
+			try {
+				const resume = resumeSubagent({
+					subagentId,
+					intent: "retry_denied_tool",
+					actor: "user",
+					retryToolUseId: "denied-tool-use",
+					locale: "en",
+				});
+				if (failure === "thrown") {
+					await expect(resume).rejects.toThrow("retry I/O failed");
+				} else {
+					expect((await resume).started).toBe(false);
+				}
+				expect(statuses).toEqual(["running", "failed"]);
+				expect(notification).toHaveBeenCalledTimes(2);
+				expect(startCalls).toHaveLength(0);
+			} finally {
+				notification.mockRestore();
+			}
+		});
+	}
 
 	test("edits and regenerates a subagent without creating a generic narrator session", async () => {
 		const subagentId = "resume-edited-message";

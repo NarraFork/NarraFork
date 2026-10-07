@@ -73,8 +73,46 @@ describe("isRecentTabBackgroundActive", () => {
 		expect(isRecentTabBackgroundActive(tab(1), false)).toBeTrue();
 	});
 
-	test("filled tab keeps its solid state regardless of background work", () => {
+	test("filled foreground states keep their solid appearance except idle unread", () => {
 		expect(isRecentTabBackgroundActive(tab(2), true)).toBeFalse();
+		for (const status of ["working", "waiting", "archived"]) {
+			expect(
+				isRecentTabBackgroundActive({ ...tab(2), status, substatus: ["unread"] }, true),
+			).toBeFalse();
+		}
+		for (const tag of ["error", "planning", "taken_over", "queued"]) {
+			expect(
+				isRecentTabBackgroundActive(
+					{ ...tab(2), status: "idle", substatus: ["unread", tag] },
+					true,
+				),
+			).toBeFalse();
+		}
+	});
+
+	test("idle unread with background work splits unread green and working blue", () => {
+		expect(isRecentTabBackgroundActive({ ...tab(1), substatus: ["unread"] }, true)).toBeTrue();
+		for (const substatus of [["unread"], ["unread", "reasoning"]]) {
+			const unread = { ...tab(1), status: "idle", substatus };
+			expect(isRecentTabBackgroundActive(unread, true)).toBeTrue();
+			expect(
+				isRecentTabBackgroundActive({ ...unread, activeBackgroundTaskCount: 0 }, true),
+			).toBeFalse();
+		}
+	});
+
+	test("working to idle preserves background occupancy until an explicit zero arrives", () => {
+		const working = { ...tab(2), status: "working", substatus: [] };
+		const idle = mergeRecentTabPatch(working, { status: "idle", substatus: [] });
+		expect(idle.activeBackgroundTaskCount).toBe(2);
+		expect(isRecentTabBackgroundActive(idle, false)).toBeTrue();
+		const persisted = mergeRecentTabRuntime(
+			{ type: "narrator", id: "n1", title: "tab", status: "idle", lastVisitedAt: 1 },
+			idle,
+		);
+		expect(isRecentTabBackgroundActive(persisted, false)).toBeTrue();
+		const finished = mergeRecentTabPatch(persisted, { activeBackgroundTaskCount: 0 });
+		expect(isRecentTabBackgroundActive(finished, false)).toBeFalse();
 	});
 
 	test("no background work means the ordinary hollow icon", () => {
@@ -924,6 +962,31 @@ describe("recent tabs runtime races", () => {
 		expect(snapshot.get("n1")).toEqual(new Map([["status", 1]]));
 		expect(snapshot.get("n2")).toEqual(new Map());
 		expect(versions.get("n1")).toEqual(new Map([["status", 2]]));
+	});
+
+	test("a stale runtime zero cannot erase background occupancy delivered over WS", () => {
+		const versions = new Map();
+		const snapshot = snapshotRecentTabRuntimeVersions(versions, ["n1"]);
+		bumpRecentTabRuntimeVersions(versions, "n1", ["activeBackgroundTaskCount"]);
+		const patches = reconcileRecentTabsRuntimePatches(
+			[{ key: "narrator:n1", patch: { status: "idle", activeBackgroundTaskCount: 0 } }],
+			new Map([["narrator:n1", "n1"]]),
+			snapshot,
+			versions,
+		);
+		expect(patches).toEqual([{ key: "narrator:n1", patch: { status: "idle" } }]);
+		const idle = mergeRecentTabPatch(
+			{
+				type: "narrator",
+				id: "n1",
+				title: "tab",
+				status: "working",
+				activeBackgroundTaskCount: 1,
+				lastVisitedAt: 1,
+			},
+			patches[0]?.patch ?? {},
+		);
+		expect(isRecentTabBackgroundActive(idle, false)).toBeTrue();
 	});
 
 	test("drops only a stale terminal count after a newer WS update", () => {
