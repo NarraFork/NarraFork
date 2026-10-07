@@ -336,25 +336,79 @@ describe("Git summary layout readiness", () => {
 		await flush();
 		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("branch-second");
 	});
-	test.each([
-		"revision",
-		"cwd",
-		"device",
-	])("%s change cannot borrow the previous summary", async (change) => {
+	test("device change cannot borrow the previous summary", async () => {
 		seedSummary("narrator");
 		spyOn(api, "getGitWorkspace").mockReturnValue(deferred<GitWorkspace>().promise);
 		await mount();
+		client.setQueryData<Record<string, unknown>>(["narrators", "narrator"], (old) => ({
+			...old,
+			defaultDeviceId: "changed",
+		}));
+		await flush();
+		expect(container.textContent).toBe("pending");
+		expect(container.querySelector("output")?.getAttribute("data-layout-ready")).toBe("false");
+	});
+	test.each([
+		"revision",
+		"cwd",
+	])("%s switch carries the previous workspace until the new context is probed", async (change) => {
+		seedSummary("narrator");
+		const probe = deferred<GitWorkspace>();
+		const request = spyOn(api, "getGitWorkspace").mockReturnValue(probe.promise);
+		await mount("narrator", false);
 		if (change === "revision")
 			client.setQueryData(["workspaceContext", "narrator"], { revision: 4, contextKey: "new" });
 		else
 			client.setQueryData<Record<string, unknown>>(["narrators", "narrator"], (old) => ({
 				...old,
-				[change === "cwd" ? "cwd" : "defaultDeviceId"]: "changed",
-				...(change === "cwd" ? { workspaceRevision: 4 } : {}),
+				cwd: "changed",
+				workspaceRevision: 4,
 			}));
+		await flush();
+		// The switch window must not collapse the panel layout (NarratorPanel
+		// skeleton), and the carried branch is presentation-only…
+		expect(container.querySelector("output")?.getAttribute("data-layout-ready")).toBe("true");
+		expect(container.textContent).toBe("ready");
+		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("branch-narrator");
+		// …but the new context is still probed, and its answer replaces the carryover.
+		expect(request).toHaveBeenCalledTimes(1);
+		probe.resolve({ ...workspace("ready"), branch: "after-switch" });
+		await flush();
+		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("after-switch");
+	});
+	test("a fresh detail summary upgrades the carried workspace before the probe lands", async () => {
+		seedSummary("narrator");
+		const probe = deferred<GitWorkspace>();
+		spyOn(api, "getGitWorkspace").mockReturnValue(probe.promise);
+		await mount("narrator", false);
+		client.setQueryData(["workspaceContext", "narrator"], { revision: 4, contextKey: "new" });
+		await flush();
+		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("branch-narrator");
+		// The narrators detail refetch lands with a summary for the new revision.
+		client.setQueryData(["narrators", "narrator"], {
+			id: "narrator",
+			cwd: "/repo",
+			defaultDeviceId: "remote",
+			workspaceRevision: 4,
+			gitSummary: { revision: 4, branch: "branch-new", workspace: workspace("ready") },
+		});
+		await flush();
+		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("branch-new");
+		probe.resolve({ ...workspace("ready"), branch: "probed" });
+		await flush();
+		expect(container.querySelector("output")?.getAttribute("data-branch")).toBe("probed");
+	});
+	test("switching narrators never carries the previous narrator's workspace", async () => {
+		seedSummary("first");
+		client.setQueryData(["narrators", "second"], { id: "second" });
+		spyOn(api, "getGitWorkspace").mockReturnValue(deferred<GitWorkspace>().promise);
+		await mount("first");
+		expect(container.textContent).toBe("ready");
+		switchTo("second");
 		await flush();
 		expect(container.textContent).toBe("pending");
 		expect(container.querySelector("output")?.getAttribute("data-layout-ready")).toBe("false");
+		expect(container.querySelector("output")?.hasAttribute("data-branch")).toBe(false);
 	});
 	test("list-only detail waits for layout but a non-Git summary does not reserve a row", async () => {
 		client.setQueryData(["narrators", "narrator"], { id: "narrator" });

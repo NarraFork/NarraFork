@@ -1,5 +1,5 @@
 import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useCallback, useEffect } from "react";
 import type { CurrentDiffView } from "../../server/services/git-current-diff-view";
 import type {
 	FileChangeActorKind,
@@ -310,9 +310,27 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 	// narrator metadata must not replace an already authorized workspace query.
 	const context = revision ?? workspaceRevision;
 	const summaryWorkspace = gitSummaryWorkspace(narrator, workspaceRevision);
+	// Rotating the revision-keyed query starts the new context empty; carrying
+	// the previous workspace as placeholder keeps the panel layout (and the Git
+	// strip) mounted while the new context is probed. Scoped to this narrator —
+	// switching panels must never borrow another narrator's workspace. Access
+	// resets clear the recorded data before placeholder reads it, and the denied
+	// check below blocks a carried workspace outright, so revoked facts cannot
+	// reappear through the carryover.
+	const carryPreviousWorkspace = useCallback(
+		(
+			previousData: GitWorkspace | undefined,
+			previousQuery: { queryKey: readonly unknown[] } | undefined,
+		): GitWorkspace | undefined =>
+			previousQuery?.queryKey[0] === "gitWorkspace" && previousQuery.queryKey[1] === narratorId
+				? previousData
+				: undefined,
+		[narratorId],
+	);
 	const query = useQuery({
 		queryKey: ["gitWorkspace", narratorId, context],
 		queryFn: ({ signal }) => api.getGitWorkspace(narratorId as string, signal),
+		placeholderData: carryPreviousWorkspace,
 		initialData: () => {
 			if (!narratorId || deniedGitSummaries.get(qc)?.has(narratorId)) return undefined;
 			// resetQueries may call this again: re-read the source rather than capture
@@ -347,7 +365,9 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 		},
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
-	const isSummarySeed = !!query.data && gitSummarySeeds.has(query.data);
+	// A carried placeholder may itself be a summary seed object; it is still the
+	// previous context's presentation data, never this revision's seed.
+	const isSummarySeed = !!query.data && !query.isPlaceholderData && gitSummarySeeds.has(query.data);
 	// Do not leave private facts visible after an authorization/capability failure.
 	useEffect(() => {
 		if (narratorId) {
@@ -356,7 +376,14 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 				query.data?.state === "access_denied"
 			)
 				blockGitSummary(qc, narratorId);
-			else if (!isSummarySeed && query.isSuccess && query.data?.capabilities.read)
+			// Only an authoritative read clears a known denial — neither a summary
+			// seed nor a carried placeholder proves access on the new context.
+			else if (
+				!isSummarySeed &&
+				!query.isPlaceholderData &&
+				query.isSuccess &&
+				query.data?.capabilities.read
+			)
 				deniedGitSummaries.get(qc)?.delete(narratorId);
 		}
 		if (!query.isError && query.data?.capabilities.read !== false) return;
@@ -368,18 +395,20 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 		query.isError,
 		query.error,
 		query.isSuccess,
+		query.isPlaceholderData,
 		query.data?.state,
 		query.data?.capabilities.read,
 	]);
 	// Synchronous fallback also works when a pending query already existed before
 	// the detail arrived (initialData cannot seed that existing query).
-	let data = query.isError
-		? undefined
-		: query.isPending || isSummarySeed
-			? narratorId && deniedGitSummaries.get(qc)?.has(narratorId)
-				? undefined
-				: summaryWorkspace
-			: query.data;
+	const denied = !!narratorId && !!deniedGitSummaries.get(qc)?.has(narratorId);
+	let data: GitWorkspace | undefined;
+	if (query.isError) data = undefined;
+	else if (query.isPending || isSummarySeed) data = denied ? undefined : summaryWorkspace;
+	// Carried over from the previous context: a known denial must not borrow it,
+	// and a summary already matching this revision is fresher than the carryover.
+	else if (query.isPlaceholderData) data = denied ? undefined : (summaryWorkspace ?? query.data);
+	else data = query.data;
 	// Old executors and the authority-only probe may omit branch. Preserve only
 	// the label from a same-version summary of this exact device/worktree.
 	if (
