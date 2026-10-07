@@ -44,6 +44,11 @@ function SettingsServerPage() {
 				setTlsPassphrase={is.setTlsPassphrase}
 				tlsCaFile={is.tlsCaFile}
 				setTlsCaFile={is.setTlsCaFile}
+				updateSource={is.updateSource}
+				setUpdateSource={is.setUpdateSource}
+				updateGithubRepository={is.updateGithubRepository}
+				setUpdateGithubRepository={is.setUpdateGithubRepository}
+				savedUpdateSettings={is.settings?.update}
 				updateServerUrl={is.updateServerUrl}
 				setUpdateServerUrl={is.setUpdateServerUrl}
 				updateChannel={is.updateChannel}

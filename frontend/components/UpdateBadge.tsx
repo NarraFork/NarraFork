@@ -2,7 +2,7 @@ import { Badge, Loader, Tooltip } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconClock, IconRocket } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../hooks/useAuth";
 import { useUpdateCheck } from "../hooks/useUpdateCheck";
@@ -12,6 +12,7 @@ import {
 	type PreparedUpdateStatus,
 	resolveScheduledUpdatePill,
 } from "../lib/update-state";
+import type { UpdateModalData } from "./UpdateModal";
 
 const UpdateModal = lazy(() =>
 	import("./UpdateModal").then((m) => ({
@@ -49,9 +50,23 @@ export function UpdateBadge() {
 		releaseDate,
 		downloadSize,
 		totalSize,
+		strategy,
+		settingsKey,
 	} = useUpdateCheck();
-
-	const targetVersion = releaseInfo?.version ?? latestVersion;
+	const [modalData, setModalData] = useState<UpdateModalData>({});
+	// Source changes clear the recommendation query, but not a prepared/scheduled binary.
+	const previousTarget = useRef<string | undefined>(undefined);
+	const checkedTarget = releaseInfo?.version ?? latestVersion;
+	const previousStatus = queryClient.getQueryData<PreparedUpdateStatus>([
+		UPDATE_STATUS_QUERY_KEY,
+		previousTarget.current,
+	]);
+	const preservePreviousTarget =
+		hasActiveUpdateSchedule(previousStatus) ||
+		(previousStatus?.ready === true && previousTarget.current !== currentVersion);
+	if (checkedTarget && !preservePreviousTarget) previousTarget.current = checkedTarget;
+	const targetVersion = previousTarget.current ?? checkedTarget;
+	const recommendationMatchesTarget = checkedTarget === targetVersion;
 	// `useUpdateCheck` reports `updateAvailable: false` for any check failure, including a
 	// transient one. Gating the query and the pill on it alone means a single failed re-check
 	// during the drain would hide the only ambient signal and stop polling entirely. Reading the
@@ -63,11 +78,14 @@ export function UpdateBadge() {
 	]);
 	const { data: scheduleStatus } = useUpdateScheduleStatus({
 		targetVersion,
-		enabled: isAdmin && (updateAvailable || hasActiveUpdateSchedule(cachedStatus)),
+		enabled:
+			isAdmin &&
+			(updateAvailable || cachedStatus?.ready === true || hasActiveUpdateSchedule(cachedStatus)),
 	});
 	const pill = resolveScheduledUpdatePill(scheduleStatus);
 
-	if (!updateAvailable && !pill) return null;
+	const prepared = scheduleStatus?.ready === true;
+	if (!updateAvailable && !pill && !prepared) return null;
 
 	return (
 		<>
@@ -75,7 +93,7 @@ export function UpdateBadge() {
 				label={
 					pill
 						? t(pill.tooltipKey, {
-								version: scheduleStatus?.targetVersion ?? latestVersion,
+								version: scheduleStatus?.targetVersion ?? targetVersion,
 							})
 						: t("updateViewDetails")
 				}
@@ -98,27 +116,34 @@ export function UpdateBadge() {
 						)
 					}
 					style={{ cursor: "pointer" }}
-					onClick={open}
+					onClick={() => {
+						setModalData({
+							latestVersion: targetVersion,
+							currentVersion,
+							...(recommendationMatchesTarget && {
+								releaseInfo,
+								releaseNotes,
+								releaseNotesPerVersion,
+								releaseDate,
+								downloadSize,
+								totalSize,
+								strategy,
+								settingsKey,
+							}),
+						});
+						open();
+					}}
 				>
-					{pill ? t(pill.labelKey) : t("updateBadge", { from: currentVersion, to: latestVersion })}
+					{pill
+						? t(pill.labelKey)
+						: (!updateAvailable || !recommendationMatchesTarget) && prepared
+							? t("updateReadyBadge", { version: targetVersion })
+							: t("updateBadge", { from: currentVersion, to: latestVersion })}
 				</Badge>
 			</Tooltip>
 
 			<Suspense fallback={null}>
-				<UpdateModal
-					opened={opened}
-					onClose={close}
-					data={{
-						latestVersion,
-						currentVersion,
-						releaseInfo,
-						releaseNotes,
-						releaseNotesPerVersion,
-						releaseDate,
-						downloadSize,
-						totalSize,
-					}}
-				/>
+				<UpdateModal opened={opened} onClose={close} data={modalData} />
 			</Suspense>
 		</>
 	);

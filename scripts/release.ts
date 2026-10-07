@@ -1,5 +1,6 @@
 /**
- * Release script: bump version, tag, build, and upload to update server.
+ * Release script: bump version, commit, build, tag, then publish.
+ * Defaults to update-server; GitHub full-binary releases require --target=github.
  *
  * When the version publishes as stable (x.y.0), an extra direct patch from the previous
  * stable release is generated and uploaded so stable users upgrade in a single step.
@@ -15,7 +16,7 @@
  *   NF_UPDATE_SERVER  — update server URL (default: https://narrafork-update.b.domexie.cn)
  *   NF_UPDATE_TOKEN   — admin token for upload API
  */
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -23,9 +24,15 @@ import { basename, isAbsolute, join, relative } from "node:path";
 import {
 	computeFileIdentity,
 	getBaselineMismatch,
-	requirePublishedBaseline,
 	type PublishedBaselineCandidate,
+	requirePublishedBaseline,
 } from "../server/lib/release-baseline";
+import { isValidReleaseVersion } from "../shared/release-version";
+import {
+	DEFAULT_GITHUB_REPOSITORY,
+	publishGitHubRelease,
+	validateGitHubRepository,
+} from "./lib/github-release";
 import { getUnexpectedReleaseChanges, resolveGitCommit } from "./lib/release-git";
 import {
 	ensureStableBaselinePatches,
@@ -51,10 +58,45 @@ const version = args.find((a) => !a.startsWith("--"));
 const dryRun = args.includes("--dry-run");
 const skipBuild = args.includes("--skip-build");
 const uploadOnly = args.includes("--upload-only");
-const changelogArg = args.find((a) => a.startsWith("--changelog="))?.split("=").slice(1).join("=");
-const platformArg = args.find((a) => a.startsWith("--platform="))?.split("=").slice(1).join("=");
-const patchFromArg = args.find((a) => a.startsWith("--patch-from="))?.split("=").slice(1).join("=");
+const changelogArg = args
+	.find((a) => a.startsWith("--changelog="))
+	?.split("=")
+	.slice(1)
+	.join("=");
+const platformArg = args
+	.find((a) => a.startsWith("--platform="))
+	?.split("=")
+	.slice(1)
+	.join("=");
+const patchFromArg = args
+	.find((a) => a.startsWith("--patch-from="))
+	?.split("=")
+	.slice(1)
+	.join("=");
 const skipStablePatch = args.includes("--skip-stable-patch");
+const target =
+	args.find((a) => a.startsWith("--target="))?.slice("--target=".length) ?? "update-server";
+const githubRepository =
+	args.find((a) => a.startsWith("--github-repository="))?.slice("--github-repository=".length) ??
+	DEFAULT_GITHUB_REPOSITORY;
+if (target !== "github" && target !== "update-server") {
+	console.error("Invalid release target; expected github or update-server");
+	process.exit(1);
+}
+if (target === "github") {
+	try {
+		validateGitHubRepository(githubRepository);
+	} catch (error) {
+		console.error(error instanceof Error ? error.message : String(error));
+		process.exit(1);
+	}
+	if (patchFromArg) {
+		console.error(
+			"GitHub releases contain full binaries; --patch-from requires --target=update-server",
+		);
+		process.exit(1);
+	}
+}
 const patchFromVersions = patchFromArg
 	?.split(",")
 	.map((value) => value.trim())
@@ -64,6 +106,8 @@ if (!version) {
 	console.error("Usage: bun scripts/release.ts <version> [options]");
 	console.error("");
 	console.error("Options:");
+	console.error("  --target=<target>     update-server (default) or github");
+	console.error("  --github-repository=<owner/repo>  Default: NarraFork/NarraFork");
 	console.error("  --changelog=<file>    JSON file with localized release notes");
 	console.error("  --platform=<target>   Build and upload only this platform (e.g. windows-x64)");
 	console.error("  --patch-from=<v,...>  Upload direct patches for the listed base versions");
@@ -78,7 +122,7 @@ if (!version) {
 
 // Allow semver with optional pre-release suffix: 0.1.0, 0.1.0-fix1, 0.2.0-beta.3, etc.
 const VERSION_RE = /^\d+\.\d+\.\d+(-[a-zA-Z0-9._-]+)?$/;
-if (!VERSION_RE.test(version)) {
+if (!VERSION_RE.test(version) || (target === "github" && !isValidReleaseVersion(version))) {
 	console.error(`❌ Invalid version format: ${version} (expected: x.y.z or x.y.z-prerelease)`);
 	process.exit(1);
 }
@@ -102,14 +146,18 @@ function loadUpdateServerConfig(): { serverUrl: string; token: string } {
 	}
 	return {
 		serverUrl:
-			process.env.NF_UPDATE_SERVER ?? fileConfig.serverUrl ?? "https://narrafork-update.b.domexie.cn",
+			process.env.NF_UPDATE_SERVER ??
+			fileConfig.serverUrl ??
+			"https://narrafork-update.b.domexie.cn",
 		token: process.env.NF_UPDATE_TOKEN ?? fileConfig.token ?? "",
 	};
 }
 
-const { serverUrl: SERVER, token: TOKEN } = loadUpdateServerConfig();
+// GitHub publishing must never read update-server credentials.
+const { serverUrl: SERVER, token: TOKEN } =
+	target === "update-server" ? loadUpdateServerConfig() : { serverUrl: "", token: "" };
 
-if (!dryRun && !TOKEN) {
+if (target === "update-server" && !dryRun && !TOKEN) {
 	console.error("❌ Update server token not found");
 	console.error("   Set NF_UPDATE_TOKEN env var or create ~/.narrafork/update-server.json:");
 	console.error('   { "token": "nfup_..." }');
@@ -139,7 +187,9 @@ class BaselineIntegrityError extends Error {}
 const publishedMetadataCache = new Map<string, Promise<PublishedReleaseMetadata | null>>();
 const latestPublishedCache = new Map<string, Promise<PublishedBaselineCandidate | null>>();
 
-function getPublishedReleaseMetadata(releaseVersion: string): Promise<PublishedReleaseMetadata | null> {
+function getPublishedReleaseMetadata(
+	releaseVersion: string,
+): Promise<PublishedReleaseMetadata | null> {
 	let pending = publishedMetadataCache.get(releaseVersion);
 	if (!pending) {
 		pending = (async () => {
@@ -250,12 +300,7 @@ async function verifyLocalPublishedBaselines(): Promise<void> {
 		).filter((candidate): candidate is PublishedBaselineCandidate => candidate !== null);
 		let baseline: PublishedBaselineCandidate | null;
 		try {
-			baseline = requirePublishedBaseline(
-				version,
-				currentName,
-				candidates,
-				availableFilenames,
-			);
+			baseline = requirePublishedBaseline(version, currentName, candidates, availableFilenames);
 		} catch (error) {
 			mismatches.push(`${platform}: ${error instanceof Error ? error.message : String(error)}`);
 			continue;
@@ -278,7 +323,7 @@ async function verifyLocalPublishedBaselines(): Promise<void> {
 	console.log("✓ Published release baselines verified against latest stable/beta releases");
 }
 
-if (!uploadOnly) {
+if (target === "update-server" && !uploadOnly) {
 	try {
 		await verifyLocalPublishedBaselines();
 	} catch (error) {
@@ -328,9 +373,28 @@ if (existsSync(changelogPath)) {
 if (!uploadOnly && !dryRun) {
 	const unexpectedChanges = getUnexpectedReleaseChanges(ROOT, releaseCommitPaths);
 	if (unexpectedChanges.length > 0) {
-		console.error("❌ Release worktree contains changes outside package.json and the version changelog:");
+		console.error(
+			"❌ Release worktree contains changes outside package.json and the version changelog:",
+		);
 		for (const change of unexpectedChanges) console.error(`   ${change}`);
-		console.error("   Commit or stash those changes before publishing so the binary matches its tag.");
+		console.error(
+			"   Commit or stash those changes before publishing so the binary matches its tag.",
+		);
+		process.exit(1);
+	}
+}
+
+// GitHub release operations must run in the primary checkout, never an isolated worktree.
+if (target === "github" && !dryRun) {
+	const gitDirectories = execFileSync(
+		"git",
+		["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+		{ cwd: ROOT, encoding: "utf8", timeout: 10_000, maxBuffer: 16 * 1024 },
+	)
+		.trim()
+		.split("\n");
+	if (gitDirectories.length !== 2 || gitDirectories[0] !== gitDirectories[1]) {
+		console.error("GitHub releases must run in the primary repository checkout, not a worktree");
 		process.exit(1);
 	}
 }
@@ -360,6 +424,8 @@ if (!uploadOnly && !dryRun) {
 			{
 				cwd: ROOT,
 				encoding: "utf8",
+				timeout: 10_000,
+				maxBuffer: 1024 * 1024,
 			},
 		).trim();
 
@@ -367,10 +433,12 @@ if (!uploadOnly && !dryRun) {
 			execFileSync("git", ["add", "--", ...releaseCommitPaths], {
 				cwd: ROOT,
 				stdio: "inherit",
+				timeout: 120_000,
 			});
 			execFileSync("git", ["commit", "-m", `release: v${version}`], {
 				cwd: ROOT,
 				stdio: "inherit",
+				timeout: 120_000,
 			});
 			console.log(`✓ Committed release: v${version}`);
 		}
@@ -392,13 +460,15 @@ if (!uploadOnly && !dryRun) {
 if (!skipBuild && !uploadOnly) {
 	const buildLabel = platformArg ? `platform ${platformArg}` : "all platforms";
 	console.log(`\n→ Building ${buildLabel}...\n`);
-	const buildCmd = platformArg
-		? `bun scripts/build-cross-platform.ts --platform=${platformArg}`
-		: "bun scripts/build-cross-platform.ts";
+	const buildArgs = [
+		"scripts/build-cross-platform.ts",
+		...(platformArg ? [`--platform=${platformArg}`] : []),
+	];
 	try {
-		execSync(buildCmd, {
+		execFileSync("bun", buildArgs, {
 			cwd: ROOT,
 			stdio: "inherit",
+			timeout: 600_000,
 		});
 	} catch {
 		console.error("❌ Build failed");
@@ -431,7 +501,7 @@ if (!uploadOnly && !dryRun) {
 		if (taggedCommit) {
 			console.log(`ℹ Tag v${version} already points to HEAD, skipping`);
 		} else {
-			execFileSync("git", ["tag", `v${version}`], { cwd: ROOT, stdio: "inherit" });
+			execFileSync("git", ["tag", `v${version}`], { cwd: ROOT, stdio: "inherit", timeout: 10_000 });
 			console.log(`✓ Tagged: v${version}`);
 		}
 	} catch (err) {
@@ -441,6 +511,35 @@ if (!uploadOnly && !dryRun) {
 }
 
 // ── Step 5: Upload ──────────────────────────────────────────────────────────
+
+if (target === "github") {
+	try {
+		const commit =
+			resolveGitCommit(ROOT, `refs/tags/v${version}`) ??
+			(dryRun ? resolveGitCommit(ROOT, "HEAD") : null);
+		if (!commit) throw new Error(`Missing local release tag v${version}`);
+		const result = await publishGitHubRelease({
+			distDir: DIST_DIR,
+			version,
+			repository: githubRepository,
+			platformSuffixes: resolvePlatformSuffixes(platformArg),
+			commit,
+			changelog,
+			dryRun,
+		});
+		console.log(
+			result.dryRun
+				? `Dry run complete — validated ${result.assets.length} GitHub assets; no GitHub calls made`
+				: `GitHub release v${version}: ${result.alreadyPublished ? "already published and verified" : "published"}`,
+		);
+		process.exit(0);
+	} catch (error) {
+		console.error(
+			`GitHub release failed (any draft is retained): ${error instanceof Error ? error.message : String(error)}`,
+		);
+		process.exit(1);
+	}
+}
 
 if (dryRun) {
 	console.log("\n✅ Dry run complete — skipping upload");
@@ -467,9 +566,7 @@ interface PatchArtifact {
 function loadPatchArtifact(filename: string, fromVersion?: string): PatchArtifact | null {
 	const patchPath = join(
 		DIST_DIR,
-		fromVersion
-			? `${filename}.from-${fromVersion}.zstd-patch`
-			: `${filename}.zstd-patch`,
+		fromVersion ? `${filename}.from-${fromVersion}.zstd-patch` : `${filename}.zstd-patch`,
 	);
 	const metaPath = `${patchPath}.meta.json`;
 	if (!existsSync(patchPath) || !existsSync(metaPath)) return null;
@@ -506,15 +603,12 @@ async function validatePatchSource(
 	if (!expected) {
 		return `published source metadata is missing for ${platform} v${artifact.fromVersion}`;
 	}
-	return getBaselineMismatch(
-		{ size: meta.oldFileSize, sha512: meta.oldFileSha512 },
-		expected,
-	);
+	return getBaselineMismatch({ size: meta.oldFileSize, sha512: meta.oldFileSha512 }, expected);
 }
 
 async function validateTargetIdentity(
 	platform: string,
-	filename: string,
+	_filename: string,
 	size: number,
 	sha512: string,
 ): Promise<string | null> {

@@ -1,8 +1,12 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import i18n from "i18next";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, authorizedFetch, readFetchError } from "../lib/api";
+import { sameUpdateSource, updateCheckErrorKey, updateSettingsKey } from "../lib/update-source";
 import type { UpdateCoordinationPhase } from "../lib/update-state";
+
+type UpdateReleaseInfo = NonNullable<Awaited<ReturnType<typeof api.checkUpdate>>["releaseInfo"]>;
+
 import { useCurrentUser } from "./useAuth";
 import { useUpdateCapability } from "./usePlatform";
 
@@ -90,6 +94,8 @@ async function enforceSseResidualLimit(
 }
 
 export interface UpdateProgress {
+	strategy?: "full" | "zstd";
+	fallback?: boolean;
 	phase: "checking" | "downloading" | "applying" | "complete" | "error";
 	bytesDownloaded: number;
 	totalBytes: number;
@@ -186,14 +192,31 @@ export function extractUpdateFailureDiagnostic(
 			(typeof payload.error === "string" && payload.error) ||
 			(typeof payload.code === "string" && payload.code) ||
 			fallback,
-		code: typeof payload.code === "string" ? payload.code : undefined,
+		code:
+			typeof payload.code === "string"
+				? payload.code
+				: typeof payload.errorCode === "string"
+					? payload.errorCode
+					: undefined,
 		reason: typeof payload.reason === "string" ? payload.reason : undefined,
 		message: typeof payload.message === "string" ? payload.message : undefined,
 	};
 }
 
+async function checkWithSavedSettings(queryClient: QueryClient, signal?: AbortSignal) {
+	const settings = await queryClient.ensureQueryData({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+	});
+	signal?.throwIfAborted();
+	const settingsKey = updateSettingsKey(settings.update);
+	const checked = await api.checkUpdate();
+	signal?.throwIfAborted();
+	return { ...checked, settingsKey };
+}
+
 /**
- * Poll the configured update server for a newer release.
+ * Poll the configured update source for a newer release.
  *
  * `GET /api/update/check` is admin-only: it makes the deployment emit an outbound request and
  * replies with release metadata and download URLs. The admin gate therefore lives HERE rather
@@ -208,16 +231,18 @@ export function extractUpdateFailureDiagnostic(
  */
 export function useUpdateCheck(intervalMs = 60 * 60_000) {
 	const [dismissed, setDismissed] = useState(false);
+	const queryClient = useQueryClient();
 	const { data: user } = useCurrentUser();
 	const isAdmin = user?.role === "admin";
 
 	const {
 		data,
 		isLoading,
+		error: queryError,
 		refetch: refetchQuery,
 	} = useQuery({
 		queryKey: ["update-check"],
-		queryFn: () => api.checkUpdate(),
+		queryFn: ({ signal }) => checkWithSavedSettings(queryClient, signal),
 		refetchInterval: intervalMs,
 		staleTime: intervalMs,
 		enabled: isAdmin && intervalMs > 0,
@@ -230,19 +255,28 @@ export function useUpdateCheck(intervalMs = 60 * 60_000) {
 		await refetchQuery();
 	}, [isAdmin, refetchQuery]);
 
-	const updateAvailable = !dismissed && data?.updateAvailable === true;
+	const checkFailed = !!queryError || !!data?.error || !!data?.errorCode;
+	const updateAvailable = !dismissed && !checkFailed && data?.updateAvailable === true;
 
 	// Auto-reset dismissed flag when version changes
 	// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally re-run when latestVersion changes
 	useEffect(() => {
 		setDismissed(false);
-	}, [data?.latestVersion]);
+	}, [data?.latestVersion, data?.source, data?.repository]);
 
 	const dismiss = useCallback(() => setDismissed(true), []);
 
 	return {
 		updateAvailable,
 		isLoading,
+		checkFailed,
+		error: data?.error ?? queryError?.message,
+		errorCode: data?.errorCode,
+		errorKey: checkFailed ? updateCheckErrorKey(data?.errorCode) : undefined,
+		retryAfter: data?.retryAfter,
+		source: data?.source,
+		repository: data?.repository,
+		settingsKey: data?.settingsKey,
 		currentVersion: data?.currentVersion,
 		latestVersion: data?.latestVersion,
 		releaseInfo: data?.releaseInfo,
@@ -263,15 +297,16 @@ export function useUpdateDownload() {
 	const [progress, setProgress] = useState<UpdateProgress | null>(null);
 	const [result, setResult] = useState<UpdateDownloadResult | null>(null);
 	const abortControllerRef = useRef<AbortController | null>(null);
+	useEffect(
+		() => () => {
+			abortControllerRef.current?.abort();
+			abortControllerRef.current = null;
+		},
+		[],
+	);
 	const downloadRef = useRef<
 		| ((
-				info: {
-					version: string;
-					releaseDate: string;
-					path: string;
-					sha512: string;
-					files: Array<{ url: string; size: number; sha512: string }>;
-				},
+				info: UpdateReleaseInfo,
 				options?: { retry?: boolean; autoRetried?: boolean },
 		  ) => Promise<void>)
 		| null
@@ -279,13 +314,7 @@ export function useUpdateDownload() {
 
 	const download = useCallback(
 		async (
-			releaseInfo: {
-				version: string;
-				releaseDate: string;
-				path: string;
-				sha512: string;
-				files: Array<{ url: string; size: number; sha512: string }>;
-			},
+			releaseInfo: UpdateReleaseInfo,
 			options?: { retry?: boolean; autoRetried?: boolean },
 		) => {
 			const failBeforeRequest = (error: string) => {
@@ -319,6 +348,7 @@ export function useUpdateDownload() {
 			setProgress({ phase: "checking", bytesDownloaded: 0, totalBytes: 0, percent: 0 });
 			setResult(null);
 
+			abortControllerRef.current?.abort();
 			const controller = new AbortController();
 			abortControllerRef.current = controller;
 
@@ -326,22 +356,40 @@ export function useUpdateDownload() {
 				const response = await authorizedFetch("/api/update/download", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({ releaseInfo, retry: options?.retry === true }),
+					body: JSON.stringify({
+						releaseInfo: { version: releaseInfo.version },
+						source: releaseInfo.source ?? "update-server",
+						repository: releaseInfo.repository,
+						retry: options?.retry === true,
+					}),
 					signal: controller.signal,
 				});
+				controller.signal.throwIfAborted();
 
 				if (!response.ok) {
 					const failure = await readFetchError(response, "Download failed");
+					controller.signal.throwIfAborted();
 					// 409 means the requested version no longer matches the server's latest
 					// metadata (a new release was published between check and download). Re-check
 					// once to get the fresh releaseInfo, then retry the download with it.
-					if (response.status === 409 && !options?.autoRetried) {
+					if (
+						response.status === 409 &&
+						(failure.data.code ?? failure.data.errorCode) !== "UPDATE_SOURCE_CHANGED" &&
+						!options?.autoRetried
+					) {
 						try {
 							const rechecked = await queryClient.fetchQuery({
 								queryKey: ["update-check"],
-								queryFn: () => api.checkUpdate(),
+								queryFn: () => checkWithSavedSettings(queryClient, controller.signal),
 							});
-							if (rechecked.updateAvailable && rechecked.releaseInfo) {
+							controller.signal.throwIfAborted();
+							if (
+								!rechecked.error &&
+								!rechecked.errorCode &&
+								rechecked.updateAvailable &&
+								rechecked.releaseInfo &&
+								sameUpdateSource(releaseInfo, rechecked.releaseInfo)
+							) {
 								await downloadRef.current?.(rechecked.releaseInfo, {
 									retry: options?.retry,
 									autoRetried: true,
@@ -352,6 +400,7 @@ export function useUpdateDownload() {
 							// Fall through to surface the original 409 failure below.
 						}
 					}
+					controller.signal.throwIfAborted();
 					const diagnostic = extractUpdateFailureDiagnostic(failure.data, failure.message);
 					setProgress(createErrorProgress(diagnostic.error, diagnostic));
 					setResult(createFailureResult(diagnostic.error, releaseInfo.version, diagnostic));
@@ -369,7 +418,11 @@ export function useUpdateDownload() {
 				const markFailure = (failure: UpdateFailureDiagnostic | string) => {
 					const diagnostic = typeof failure === "string" ? { error: failure } : failure;
 					receivedTerminalResult = true;
-					setProgress(createErrorProgress(diagnostic.error, diagnostic));
+					setProgress((current) => ({
+						...createErrorProgress(diagnostic.error, diagnostic),
+						strategy: current?.strategy,
+						fallback: current?.fallback,
+					}));
 					setResult(createFailureResult(diagnostic.error, releaseInfo.version, diagnostic));
 				};
 
@@ -379,6 +432,8 @@ export function useUpdateDownload() {
 					setProgress((current) => {
 						if (current?.phase === "complete") return current;
 						return {
+							strategy: current?.strategy,
+							fallback: current?.fallback,
 							phase: "complete",
 							bytesDownloaded: current?.bytesDownloaded ?? 0,
 							totalBytes: current?.totalBytes ?? 0,
@@ -413,7 +468,11 @@ export function useUpdateDownload() {
 					const payload = parsed as Partial<UpdateProgress & UpdateDownloadResult>;
 					const payloadRecord = payload as Record<string, unknown>;
 					if (payload.phase) {
-						setProgress(payload as UpdateProgress);
+						setProgress((current) => ({
+							...(payload as UpdateProgress),
+							strategy: payload.strategy ?? current?.strategy,
+							fallback: payload.fallback ?? current?.fallback,
+						}));
 					}
 
 					const diagnostic = extractUpdateFailureDiagnostic(payloadRecord);
@@ -450,6 +509,7 @@ export function useUpdateDownload() {
 
 				while (true) {
 					const { done, value } = await reader.read();
+					controller.signal.throwIfAborted();
 					if (done) break;
 
 					buffer += decoder.decode(value, { stream: true });
@@ -463,15 +523,21 @@ export function useUpdateDownload() {
 					markFailure(i18n.t("common:updateStreamNoResult"));
 				}
 			} catch (err) {
-				if ((err as Error).name === "AbortError") {
-					setProgress(null);
+				if (controller.signal.aborted || (err as Error).name === "AbortError") {
+					if (abortControllerRef.current === controller) setProgress(null);
 					return;
 				}
+				// Malformed/failed streams must not leave a server-side patch download running.
+				controller.abort();
 				const error = errorToMessage(err);
-				setProgress(createErrorProgress(error));
+				setProgress((current) => ({
+					...createErrorProgress(error),
+					strategy: current?.strategy,
+					fallback: current?.fallback,
+				}));
 				setResult(createFailureResult(error, releaseInfo.version));
 			} finally {
-				abortControllerRef.current = null;
+				if (abortControllerRef.current === controller) abortControllerRef.current = null;
 			}
 		},
 		[

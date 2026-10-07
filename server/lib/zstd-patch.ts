@@ -9,7 +9,7 @@
  */
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { open, readFile, writeFile } from "node:fs/promises";
 import { zstdDecompress, zstdDecompressSync } from "node:zlib";
 
 /** Default block size: 64KB (same as electron-builder) */
@@ -158,8 +158,8 @@ export async function generateZstdPatchToFile(
 		Bun.file(options.patchOutputPath).stat(),
 	]);
 	const [oldFileSha512, newFileSha512] = await Promise.all([
-		streamFileSha512(options.oldFilePath),
-		streamFileSha512(options.newFilePath),
+		streamFileSha512(options.oldFilePath, options.signal),
+		streamFileSha512(options.newFilePath, options.signal),
 	]);
 
 	return {
@@ -344,6 +344,7 @@ export async function applyZstdPatchToFile(
 	options: ApplyZstdPatchToFileOptions,
 ): Promise<{ sizeBytes: number; sha512: string }> {
 	const { meta, maxOutputBytes } = options;
+	options.signal?.throwIfAborted();
 	if (maxOutputBytes !== undefined && meta.newFileSize > maxOutputBytes) {
 		throw new Error(
 			`Zstd patch target size ${meta.newFileSize} exceeds the ${maxOutputBytes}-byte limit`,
@@ -356,13 +357,16 @@ export async function applyZstdPatchToFile(
 		await applyLegacyDictionaryPatchToFile(options);
 	}
 
+	options.signal?.throwIfAborted();
 	const stat = await Bun.file(options.outputFilePath).stat();
+	options.signal?.throwIfAborted();
 	if (stat.size !== meta.newFileSize) {
 		throw new Error(
 			`Zstd patch file size mismatch: expected ${meta.newFileSize}, got ${stat.size}`,
 		);
 	}
-	const sha512 = await streamFileSha512(options.outputFilePath);
+	const sha512 = await streamFileSha512(options.outputFilePath, options.signal);
+	options.signal?.throwIfAborted();
 	if (sha512 !== meta.newFileSha512) {
 		throw new Error(
 			`Zstd patch SHA512 mismatch: expected ${meta.newFileSha512.slice(0, 16)}..., got ${sha512.slice(0, 16)}...`,
@@ -371,21 +375,89 @@ export async function applyZstdPatchToFile(
 	return { sizeBytes: stat.size, sha512 };
 }
 
-function runZstdCliDecompress(options: ApplyZstdPatchToFileOptions): Promise<void> {
-	return runZstdCli(
-		[
-			options.zstdPath ?? "zstd",
-			"-d",
-			`--patch-from=${options.oldFilePath}`,
-			options.patchFilePath,
-			"-o",
-			options.outputFilePath,
-			"--force",
-			"--long=31",
-		],
-		"decompression",
-		options,
+async function runZstdCliDecompress(options: ApplyZstdPatchToFileOptions): Promise<void> {
+	const maximum = Math.min(
+		options.meta.newFileSize,
+		options.maxOutputBytes ?? options.meta.newFileSize,
 	);
+	if (!Number.isSafeInteger(maximum) || maximum < 0) throw new Error("Invalid zstd output ceiling");
+	const timeoutMs = Math.max(1, options.timeoutMs ?? DEFAULT_CLI_TIMEOUT_MS);
+	options.signal?.throwIfAborted();
+	const deadline = AbortSignal.any([
+		AbortSignal.timeout(timeoutMs),
+		...(options.signal ? [options.signal] : []),
+	]);
+	const handle = await open(options.outputFilePath, "w");
+	let proc: ReturnType<typeof Bun.spawn<"ignore", "pipe", "pipe">> | undefined;
+	const onAbort = () => {
+		proc?.kill("SIGKILL");
+	};
+	let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+	try {
+		deadline.throwIfAborted();
+		proc = Bun.spawn(
+			[
+				options.zstdPath ?? "zstd",
+				"-d",
+				`--patch-from=${options.oldFilePath}`,
+				options.patchFilePath,
+				"--stdout",
+				"--long=31",
+				"--memory=2048MB",
+			],
+			{ stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+		);
+		deadline.addEventListener("abort", onAbort, { once: true });
+		const stderr = readCappedStream(proc.stderr).catch(() => new Uint8Array());
+		const outputReader = proc.stdout.getReader();
+		reader = outputReader;
+		let size = 0;
+		while (true) {
+			deadline.throwIfAborted();
+			const chunk = await new Promise<{ done: boolean; value?: Uint8Array }>(
+				(resolveChunk, reject) => {
+					const onReadAbort = () => reject(deadline.reason);
+					deadline.addEventListener("abort", onReadAbort, { once: true });
+					outputReader
+						.read()
+						.then(resolveChunk, reject)
+						.finally(() => deadline.removeEventListener("abort", onReadAbort));
+				},
+			);
+			if (chunk.done) break;
+			if (!chunk.value) throw new Error("zstd output stream produced no bytes");
+			size += chunk.value.byteLength;
+			if (size > maximum)
+				throw new Error(`zstd CLI decompression output exceeds the ${maximum}-byte limit`);
+			let offset = 0;
+			while (offset < chunk.value.byteLength) {
+				deadline.throwIfAborted();
+				const { bytesWritten } = await handle.write(
+					chunk.value,
+					offset,
+					chunk.value.byteLength - offset,
+				);
+				if (!bytesWritten) throw new Error("zstd output write made no progress");
+				offset += bytesWritten;
+			}
+		}
+		const [diagnostic, exitCode] = await Promise.all([stderr, proc.exited]);
+		deadline.throwIfAborted();
+		if (exitCode !== 0)
+			throw new Error(
+				`zstd CLI decompression failed (exit ${exitCode}): ${formatProcessOutput(new Uint8Array(), diagnostic)}`,
+			);
+	} catch (error) {
+		proc?.kill("SIGKILL");
+		if (deadline.aborted && !options.signal?.aborted)
+			throw new Error(`zstd CLI decompression timed out after ${timeoutMs}ms`);
+		throw error;
+	} finally {
+		deadline.removeEventListener("abort", onAbort);
+		void reader?.cancel().catch(() => {});
+		if (proc) await proc.exited;
+		await handle.close();
+	}
 }
 
 /**
@@ -447,7 +519,11 @@ async function applyLegacyDictionaryPatchToFile(
 	options.signal?.throwIfAborted();
 
 	const oldTail = oldBuf.subarray(meta.stableEnd);
-	const restoredTail = await decompressZstd(patch, oldTail.length > 0 ? oldTail : undefined);
+	const restoredTail = await decompressZstd(
+		patch,
+		oldTail.length > 0 ? oldTail : undefined,
+		meta.newTailSize,
+	);
 	if (restoredTail.length !== meta.newTailSize) {
 		throw new Error(
 			`Zstd patch tail size mismatch: expected ${meta.newTailSize}, got ${restoredTail.length}`,
@@ -460,14 +536,22 @@ async function applyLegacyDictionaryPatchToFile(
 	);
 }
 
-function decompressZstd(patch: Buffer, dictionary?: Buffer): Promise<Buffer> {
+function decompressZstd(
+	patch: Buffer,
+	dictionary?: Buffer,
+	maxOutputLength?: number,
+): Promise<Buffer> {
 	return new Promise((resolveBuffer, reject) => {
 		const done = (error: Error | null, result?: Buffer) => {
 			if (error) reject(error);
 			else resolveBuffer(result as Buffer);
 		};
-		if (dictionary) zstdDecompress(patch, { dictionary }, done);
-		else zstdDecompress(patch, done);
+		// Bound the native allocation before decoding, not only after producing the buffer.
+		const options = {
+			...(dictionary ? { dictionary } : {}),
+			...(maxOutputLength !== undefined ? { maxOutputLength: Math.max(1, maxOutputLength) } : {}),
+		};
+		zstdDecompress(patch, options, done);
 	});
 }
 
@@ -499,14 +583,16 @@ async function readCappedStream(
 	return merged;
 }
 
-function streamFileSha512(filePath: string): Promise<string> {
-	return new Promise((resolveHash, reject) => {
-		const hash = createHash("sha512");
-		const stream = createReadStream(filePath);
-		stream.on("data", (chunk) => hash.update(chunk));
-		stream.on("end", () => resolveHash(hash.digest("base64")));
-		stream.on("error", reject);
-	});
+async function streamFileSha512(filePath: string, signal?: AbortSignal): Promise<string> {
+	signal?.throwIfAborted();
+	const hash = createHash("sha512");
+	// The decoder's caller owns the overall deadline; include this IO in that same signal.
+	for await (const chunk of createReadStream(filePath, { signal })) {
+		signal?.throwIfAborted();
+		hash.update(chunk);
+	}
+	signal?.throwIfAborted();
+	return hash.digest("base64");
 }
 
 /**

@@ -1135,8 +1135,15 @@ export const miscApi = {
 		request<{
 			updateAvailable: boolean;
 			currentVersion: string;
+			source?: "github" | "update-server";
+			repository?: string;
+			error?: string;
+			errorCode?: string;
+			retryAfter?: number;
 			latestVersion?: string;
 			releaseInfo?: {
+				source?: "github" | "update-server";
+				repository?: string;
 				version: string;
 				releaseDate: string;
 				releaseNotes?: string | Record<string, string>;
@@ -1152,7 +1159,7 @@ export const miscApi = {
 			downloadSize?: number;
 			totalSize?: number;
 			zstdPatchSize?: number;
-			strategy?: "zstd";
+			strategy?: "full" | "zstd";
 			patchChain?: Array<{
 				fromVersion: string;
 				toVersion: string;

@@ -4,7 +4,8 @@ dist/
 !shared/model-catalog/dist/
 shared/model-catalog/dist/*
 !shared/model-catalog/dist/catalog.json
-drizzle/
+# Includes read-only migration-directory symlinks used by development worktrees.
+drizzle
 # NOTE: `drizzle-postgres/` is deliberately NOT ignored. The generated PG migration and its
 # meta/ snapshot are tracked so the PostgreSQL test suite runs in a fresh clone without a
 # generation step, matching the `!**/drizzle-postgres/**` entries in biome.json. The rule
@@ -39,6 +40,8 @@ scripts/*
 scripts/lib/*
 !scripts/lib/latest-yml.ts
 !scripts/lib/release-git.ts
+# GitHub Release publisher imported by the release entry point and behavioral tests.
+!scripts/lib/github-release.ts
 # Imported by scripts/release.ts and tests/scripts/stable-baseline-patch*.test.ts, so it has
 # to be in the repo or both the release script and `bun test` break in a fresh clone.
 !scripts/lib/stable-baseline-patch.ts

@@ -13,11 +13,17 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconAlertTriangle, IconRefresh, IconSearch } from "@tabler/icons-react";
-import { lazy, Suspense, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AUTO_LAN_HOST } from "../../../shared/server-host";
 import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
+import {
+	type UpdateSource,
+	type UpdateSourceSettings,
+	updateCheckErrorKey,
+	updateSettingsKey,
+} from "../../lib/update-source";
 import { PathInput } from "../common/PathInput";
 import type { UpdateModalData } from "../UpdateModal";
 import { BrandingSection } from "./BrandingSection";
@@ -55,7 +61,12 @@ export interface ServerSystemSectionProps {
 	setTlsPassphrase: (v: string) => void;
 	tlsCaFile: string;
 	setTlsCaFile: (v: string) => void;
-	// Update server
+	// Main-program update source (helper/executor keep their existing tool service).
+	updateSource: UpdateSource;
+	setUpdateSource: (v: UpdateSource) => void;
+	updateGithubRepository: string;
+	setUpdateGithubRepository: (v: string) => void;
+	savedUpdateSettings?: UpdateSourceSettings;
 	updateServerUrl: string;
 	setUpdateServerUrl: (v: string) => void;
 	updateChannel: "stable" | "beta";
@@ -90,6 +101,11 @@ export function ServerSystemSection({
 	setTlsPassphrase,
 	tlsCaFile,
 	setTlsCaFile,
+	updateSource,
+	setUpdateSource,
+	updateGithubRepository,
+	setUpdateGithubRepository,
+	savedUpdateSettings,
 	updateServerUrl,
 	setUpdateServerUrl,
 	updateChannel,
@@ -106,6 +122,24 @@ export function ServerSystemSection({
 	const tlsGenerationDisabledReason = t("tlsGenerationUnsupported");
 	const [checking, setChecking] = useState(false);
 	const [checkResult, setCheckResult] = useState<string | null>(null);
+	const [checkFailed, setCheckFailed] = useState(false);
+	const savedUpdateKey = updateSettingsKey(savedUpdateSettings);
+	const savedUpdateKeyRef = useRef(savedUpdateKey);
+	savedUpdateKeyRef.current = savedUpdateKey;
+	const updateSourceDirty =
+		!savedUpdateSettings ||
+		savedUpdateKey !==
+			updateSettingsKey({
+				source: updateSource,
+				githubRepository: updateGithubRepository,
+				serverUrl: updateServerUrl,
+				product: savedUpdateSettings?.product,
+				channel: updateChannel,
+			});
+	// biome-ignore lint/correctness/useExhaustiveDependencies: clear the result whenever saved update settings change
+	useEffect(() => {
+		setCheckResult(null);
+	}, [savedUpdateKey]);
 	const [updateModalOpened, { open: openUpdateModal, close: closeUpdateModal }] =
 		useDisclosure(false);
 	const [updateData, setUpdateData] = useState<UpdateModalData>({});
@@ -233,15 +267,37 @@ export function ServerSystemSection({
 			<Title order={5} mt="sm">
 				{t("updateServerSubSection") ?? "Update Server"}
 			</Title>
-			<TextInput
-				label={t("updateServerUrl") ?? "Update Server URL"}
-				description={
-					t("updateServerUrlDesc") ?? "URL of the update server (e.g., https://updates.example.com)"
-				}
-				placeholder="https://updates.example.com"
-				value={updateServerUrl}
-				onChange={(e) => setUpdateServerUrl(e.currentTarget.value)}
+			<Text size="sm" fw={500}>
+				{t("updateSource")}
+			</Text>
+			<Text size="xs" c="dimmed">
+				{t("updateSourceDesc")}
+			</Text>
+			<SegmentedControl
+				value={updateSource}
+				onChange={(v) => setUpdateSource(v as UpdateSource)}
+				data={[
+					{ label: t("updateSourceGithub"), value: "github" },
+					{ label: t("updateSourceServer"), value: "update-server" },
+				]}
 			/>
+			{updateSource === "github" ? (
+				<TextInput
+					label={t("updateGithubRepository")}
+					description={t("updateGithubRepositoryDesc")}
+					placeholder="NarraFork/NarraFork"
+					value={updateGithubRepository}
+					onChange={(e) => setUpdateGithubRepository(e.currentTarget.value)}
+				/>
+			) : (
+				<TextInput
+					label={t("updateServerUrl")}
+					description={t("updateServerUrlDesc")}
+					placeholder="https://updates.example.com"
+					value={updateServerUrl}
+					onChange={(e) => setUpdateServerUrl(e.currentTarget.value)}
+				/>
+			)}
 			<div>
 				<Text size="sm" fw={500} mb={4}>
 					{t("updateChannel") ?? "Update Channel"}
@@ -256,22 +312,38 @@ export function ServerSystemSection({
 				/>
 			</div>
 			<Switch
-				label={t("updateAutoDownload") ?? "Auto-download updates"}
-				description={t("updateAutoDownloadDesc") ?? "Automatically download updates when available"}
+				label={t("updateAutoDownload")}
+				description={t("updateAutoDownloadDesc")}
 				checked={updateAutoDownload}
 				onChange={(e) => setUpdateAutoDownload(e.currentTarget.checked)}
 			/>
+			<Text size="xs" c={updateSourceDirty ? "orange" : "dimmed"}>
+				{t(updateSourceDirty ? "updateSaveBeforeCheck" : "updateCheckSavedConfig")}
+			</Text>
 			<Group gap="sm">
 				<Button
 					leftSection={<IconSearch size={16} />}
 					variant="default"
 					loading={checking}
+					disabled={updateSourceDirty}
 					onClick={async () => {
+						if (updateSourceDirty) return;
+						const checkedSettingsKey = savedUpdateKey;
 						setChecking(true);
 						setCheckResult(null);
+						setCheckFailed(false);
 						try {
 							const result = await api.checkUpdate();
-							if (result.updateAvailable && result.latestVersion) {
+							if (checkedSettingsKey !== savedUpdateKeyRef.current) return;
+							if (result.error || result.errorCode) {
+								setCheckFailed(true);
+								setCheckResult(
+									t(`common:${updateCheckErrorKey(result.errorCode)}`) +
+										(result.retryAfter != null
+											? ` ${t("common:updateCheckRetryAfter", { seconds: result.retryAfter })}`
+											: ""),
+								);
+							} else if (result.updateAvailable && result.latestVersion) {
 								setUpdateData({
 									latestVersion: result.latestVersion,
 									currentVersion: result.currentVersion,
@@ -281,12 +353,16 @@ export function ServerSystemSection({
 									releaseDate: result.releaseInfo?.releaseDate,
 									downloadSize: result.downloadSize,
 									totalSize: result.totalSize,
+									strategy: result.strategy,
+									settingsKey: checkedSettingsKey,
 								});
 								openUpdateModal();
 							} else {
 								setCheckResult(t("noUpdateAvailable"));
 							}
 						} catch {
+							if (checkedSettingsKey !== savedUpdateKeyRef.current) return;
+							setCheckFailed(true);
 							setCheckResult(t("updateCheckFailed"));
 						} finally {
 							setChecking(false);
@@ -296,7 +372,7 @@ export function ServerSystemSection({
 					{checking ? t("checkingForUpdate") : t("checkForUpdate")}
 				</Button>
 				{checkResult && (
-					<Text size="sm" c="dimmed">
+					<Text size="sm" c={checkFailed ? "red" : "dimmed"}>
 						{checkResult}
 					</Text>
 				)}
