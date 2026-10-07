@@ -26,6 +26,7 @@
  * titles) flow through the adapter instead, where they are measured.
  */
 
+import { dangerCopyLabels } from "@shared/danger-copy";
 import type { ToolRowStatusMark } from "@shared/tool-row-status";
 import type { ToolShimmerKind } from "@shared/tool-shimmer";
 import { useMemo } from "react";
@@ -457,6 +458,20 @@ export function useVListLabels(): VListLabels {
 			// through the adapter rather than the render layer.
 			...reflectionTitleLabels(t),
 			reflectionNextSteps: t("reflectionNextSteps", { nextSteps: "{nextSteps}" }),
+			// System reflection reasons that are not status restatements (see
+			// shared/pretext-layout/reflection-reason.ts). The summary wraps, so these
+			// are measured adapter labels rather than render-layer strings.
+			reflectionReasonNarratorAborted: t("reflectionReasonNarratorAborted"),
+			reflectionReasonDangerCancelledByUser: t("reflectionReasonDangerCancelledByUser"),
+			reflectionReasonDangerCancelledByLoop: t("reflectionReasonDangerCancelledByLoop"),
+			reflectionReasonDangerInterrupted: t("reflectionReasonDangerInterrupted"),
+			reflectionReasonDangerAlreadyResolved: t("reflectionReasonDangerAlreadyResolved"),
+			reflectionReasonTaskApprovedByUser: t("reflectionReasonTaskApprovedByUser"),
+			reflectionReasonTaskRejectedByUser: t("reflectionReasonTaskRejectedByUser"),
+			reflectionReasonTaskDeclinedNextSteps: t("reflectionReasonTaskDeclinedNextSteps"),
+			// Danger assessment copy. Generated matrix, same contract as the
+			// reflection titles above — a dropped key still fails the coverage guard.
+			...dangerCopyLabels(t),
 			// ── side-car footnotes (one per system injection) ──────────────────────
 			// All of these are MEASURED text — the source name sits in the header row and
 			// the body lines are wrapped by the measure pass — so they flow through the

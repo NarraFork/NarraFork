@@ -19,6 +19,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { DANGER_COPY_KEYS } from "@shared/danger-copy";
 import {
 	reflectionTitleKeyPrefix,
 	reflectionTitleKeySuffix,
@@ -203,14 +204,19 @@ describe("adapter chrome keys — every fallback has an injected translation", (
 			hookSrc.indexOf("const adapterLabels"),
 			hookSrc.indexOf("const renderLabels"),
 		);
-		// The reflection titles are injected as a generated MATRIX rather than 24
-		// literal entries, so ask the real generator which keys it covers. A kind or
-		// status dropped from that matrix still fails this guard.
+		// The reflection titles and danger assessment copy are injected as generated
+		// matrices rather than one literal entry each, so ask the real generators
+		// which keys they cover. A key dropped from those matrices still fails this
+		// guard via the literal-entry check below.
 		const generated = new Set(Object.keys(reflectionTitleLabels((key) => key)));
+		for (const key of DANGER_COPY_KEYS) generated.add(key);
 		const missing = fallbackKeys.filter(
 			(key) => !generated.has(key) && !new RegExp(`\\b${key}:`).test(injected),
 		);
 		expect(missing).toEqual([]);
+		// Generated matrices must actually be spread into the hook, not merely defined.
+		expect(hookSrc).toContain("...dangerCopyLabels(t)");
+		expect(hookSrc).toContain("...reflectionTitleLabels(t)");
 	});
 
 	it("generates a title for every reflection kind × status the adapter can request", () => {

@@ -58,6 +58,7 @@ type ToolTimingRecord = Partial<
 	>
 > & { fileChangeTiming?: FileChangeTiming };
 
+import { dangerCopyEnglishFallbacks } from "../danger-copy";
 import { isToolQueuedBehindUpstream, type ToolUpstreamPeer } from "../tool-shimmer";
 import {
 	type CommunicationState,
@@ -90,6 +91,7 @@ import {
 	reflectionTitleKeyPrefix,
 	reflectionTitleKeySuffix,
 } from "./reflection";
+import { classifyReflectionReasonSummary } from "./reflection-reason";
 import { reconcileSourceText } from "./source-text";
 import {
 	isLiveStreamingBlock,
@@ -2208,6 +2210,22 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	taskReflectionAborted: "Task review interrupted",
 	taskReflectionResolved: "Task review finished",
 	reflectionNextSteps: "Next: {nextSteps}",
+	// Distinct system facts that are NOT status restatements (see
+	// reflection-reason.ts). Measured like every other summary line.
+	reflectionReasonNarratorAborted: "Narrator aborted",
+	reflectionReasonDangerCancelledByUser: "Danger reflection pause cancelled by user",
+	reflectionReasonDangerCancelledByLoop: "Danger reflection pause cancelled by reflection loop",
+	reflectionReasonDangerInterrupted:
+		"Danger reflection was interrupted before manual takeover; no live reflection loop remains",
+	reflectionReasonDangerAlreadyResolved:
+		"The danger reflection pause was already resolved by another decision path.",
+	reflectionReasonTaskApprovedByUser: "User approved the protected task change via takeover.",
+	reflectionReasonTaskRejectedByUser: "User rejected the protected task change.",
+	reflectionReasonTaskDeclinedNextSteps:
+		"The user declined this protected task change. Do not retry it without new instructions.",
+	// Danger assessment copy (summaries / consequences / detail chrome). English
+	// fallbacks come from the shared catalog so measure stays self-contained.
+	...dangerCopyEnglishFallbacks(),
 	// ── sidecar cards (one collapsible card per system injection) ─────────────
 	// The source badge text is measured into the card's single-line header, so it
 	// flows through the adapter like every other composed chrome string. Keys map
@@ -2232,6 +2250,17 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 /** Resolve a system-card chrome label (injected i18n → English fallback). */
 function sysLabel(ctx: AdapterContext, key: string): string {
 	return ctx.labels?.[key] ?? SYSTEM_LABEL_FALLBACKS[key] ?? key;
+}
+
+/** Resolve a chrome label and interpolate `{param}` placeholders. */
+function formatSysLabel(ctx: AdapterContext, key: string, params?: Record<string, string>): string {
+	const template = sysLabel(ctx, key);
+	if (!params) return template;
+	let out = template;
+	for (const [name, value] of Object.entries(params)) {
+		out = out.replaceAll(`{${name}}`, value);
+	}
+	return out;
 }
 
 /** Stable compact labels carried to the renderer for fixed-height live repainting. */
@@ -4506,6 +4535,26 @@ function resolveToolReflection(
 		// id, exactly like the chunked notice's fallback chain.
 		readNonEmptyString(item.tc, "tcId") ?? readNonEmptyString(item.tc, "id"),
 	);
+	// System defaults written by the gate are English chrome that would otherwise
+	// sit under the localized title. Classify them: omit status restatements,
+	// re-label distinct system facts, pass custom content through.
+	if (data.summary) {
+		const classified = classifyReflectionReasonSummary(data.summary);
+		if (classified?.kind === "omit") {
+			delete data.summary;
+		} else if (classified?.kind === "label") {
+			data.summary = formatSysLabel(ctx, classified.key, classified.params);
+			if (classified.nextSteps && !data.nextSteps) {
+				data.nextSteps = classified.nextSteps;
+			}
+		} else if (classified?.kind === "content") {
+			if (classified.text) data.summary = classified.text;
+			else delete data.summary;
+			if (classified.nextSteps && !data.nextSteps) {
+				data.nextSteps = classified.nextSteps;
+			}
+		}
+	}
 	// The advisory line is a template with a {nextSteps} placeholder.
 	if (data.nextSteps) {
 		data.nextSteps = sysLabel(ctx, "reflectionNextSteps").replace("{nextSteps}", data.nextSteps);
