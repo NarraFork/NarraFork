@@ -1,0 +1,1 @@
+ALTER TABLE `narrator_buffered_messages` ADD `priority` integer DEFAULT false NOT NULL;

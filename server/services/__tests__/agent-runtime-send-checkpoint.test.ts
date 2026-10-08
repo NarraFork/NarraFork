@@ -8,7 +8,7 @@ import type {
 } from "../agent-reply-waiter";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({ ...ws, broadcastToNarrator: () => {} }));
 const waiter = await import("../agent-reply-waiter");

@@ -1,7 +1,7 @@
 {
 	"schemaVersion": 1,
 	"pluginId": "com.example.tool-command",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"displayName": "Reference Tool RPC Fixture",
 	"description": "Runs the repository reference tool plugin through the production stdio runtime.",
 	"engine": {

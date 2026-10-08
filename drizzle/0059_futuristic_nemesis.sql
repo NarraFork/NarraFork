@@ -1,0 +1,1 @@
+ALTER TABLE `user_preferences` ADD `queue_mode` text DEFAULT 'turn' NOT NULL;

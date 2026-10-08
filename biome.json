@@ -30,5 +30,17 @@
 			"!**/drizzle-postgres/**/*.sql",
 			"!**/drizzle-postgres/meta/*.json"
 		]
-	}
+	},
+	"overrides": [
+		{
+			"includes": ["docs/task-call-challenges/results/**/*.json"],
+			"json": {
+				"formatter": {
+					"indentStyle": "space",
+					"indentWidth": 2,
+					"expand": "always"
+				}
+			}
+		}
+	]
 }

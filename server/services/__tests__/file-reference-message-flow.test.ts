@@ -75,6 +75,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 	}
 
 	mock.module("../../db", () => ({
+		activeDatabaseBackend: "sqlite",
 		sqlite,
 		db: new Proxy(fixtureDb, {
 			get(target, key, receiver) {
@@ -445,7 +446,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 			expect(current.prompt).toContain(snapshot().snapshotText);
 			expect(current.initialHistory).toContainEqual({
 				role: "system",
-				content: "standing reminder",
+				content: '<sender kind="system" />\nstanding reminder',
 			});
 			expect(getFileReferenceSnapshots(allMessages()[0].contentJson)).toEqual([snapshot()]);
 		});
@@ -507,7 +508,10 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 			});
 			expect(JSON.stringify(consumed?.history)).not.toContain(snapshot().snapshotText);
 			expect(consumed?.prompt.split(snapshot().snapshotText)).toHaveLength(2);
-			expect(consumed?.history).toContainEqual({ role: "system", content: "standing reminder" });
+			expect(consumed?.history).toContainEqual({
+				role: "system",
+				content: '<sender kind="system" />\nstanding reminder',
+			});
 			expect(getFileReferenceSnapshots(allMessages()[0].contentJson)).toEqual([snapshot()]);
 		});
 

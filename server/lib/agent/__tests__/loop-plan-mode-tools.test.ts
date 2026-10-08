@@ -44,8 +44,16 @@ const testProvider: ProviderAdapter = {
 				description: typeof tool.description === "string" ? tool.description : "",
 			})),
 		);
-		formattedToolCharacters.push(JSON.stringify(tools).length);
-		return tools;
+		const formatted = tools.map(({ name, description, parameters }) => ({
+			name,
+			description,
+			parameters: z.toJSONSchema(parameters),
+		}));
+		// Logical tool inputs count each declaration, not the transport array punctuation.
+		formattedToolCharacters.push(
+			formatted.reduce((sum, tool) => sum + JSON.stringify(tool).length, 0),
+		);
+		return formatted;
 	},
 	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
 	injectSystemPrompt: () => {},

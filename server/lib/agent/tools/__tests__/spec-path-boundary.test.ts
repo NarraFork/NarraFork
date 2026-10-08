@@ -6,11 +6,42 @@ import type { ToolContext, ToolDefinition } from "../../types";
 const databaseAccess = mock(() => {
 	throw new Error("Unexpected database access");
 });
-mock.module("../../../../db", () => ({ db: new Proxy({}, { get: databaseAccess }) }));
+mock.module("../../../../db", () => ({
+	activeDatabaseBackend: "sqlite",
+	db: new Proxy({}, { get: databaseAccess }),
+}));
 const scope = mock(() => {
 	throw new Error("Unexpected physical write scope");
 });
-mock.module("../../../../services/file-change-runtime", () => ({ executeLocalFileChange: scope }));
+const dispatchControl = mock(() => {});
+mock.module("../../../../services/file-change-runtime", () => ({
+	executeLocalFileChange: scope,
+	// The wrapper is registered at import time. Observe its control-flow markers,
+	// not a physical runtime; every actual dispatch remains a fail-fast mock.
+	withFileToolNoDispatch:
+		(
+			_name: string,
+			body: (
+				args: Record<string, unknown>,
+				ctx: ToolContext,
+				flow: {
+					writing: () => void;
+					declined: () => void;
+					preview: () => void;
+					suppressEvidence: () => void;
+				},
+			) => Promise<import("../../types").ToolResult>,
+		) =>
+		(args: Record<string, unknown>, ctx: ToolContext) =>
+			body(args, ctx, {
+				writing: dispatchControl,
+				declined: dispatchControl,
+				preview: dispatchControl,
+				suppressEvidence: dispatchControl,
+			}),
+	registerLocalBashActivity: scope,
+	FileNoDispatchEvidenceError: class extends Error {},
+}));
 mock.module("../../../../services/file-snapshot-service", () => ({ ensureFileSnapshot: scope }));
 mock.module("../../../../services/spec-broadcast", () => ({
 	broadcastSpecChanged: mock(() => {}),
@@ -95,6 +126,7 @@ afterEach(() => {
 	clearBehaviorFenceEditGrant(ctx.narratorId);
 	for (const fn of [
 		scope,
+		dispatchControl,
 		databaseAccess,
 		consumeGrant,
 		readSpec,
@@ -129,6 +161,7 @@ describe("direct file tools reject reserved Spec spelling before any effect", ()
 			}
 			for (const fn of [
 				scope,
+				dispatchControl,
 				databaseAccess,
 				consumeGrant,
 				readSpec,

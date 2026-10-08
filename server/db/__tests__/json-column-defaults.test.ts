@@ -17,7 +17,7 @@
  */
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { getTableColumns } from "drizzle-orm";
+import { getTableColumns, SQL, sql } from "drizzle-orm";
 import { applySqliteDataBackfills } from "../data-backfills";
 import { ensureColumns } from "../ensure-columns";
 import { runMigrations } from "../run-migrations";
@@ -48,11 +48,9 @@ function expectValidJsonLiteral(value: string | null): void {
 }
 
 describe("JSON-mode column defaults", () => {
-	test("every JSON column default in the schema is an array", () => {
-		// `formatJsonDefault` falls back to '[]' for a default it cannot serialize, which is
-		// only the right answer while every JSON default in this schema IS an array. If a
-		// non-array default is ever added, this fails and forces that pairing to be revisited
-		// rather than silently patching every existing row with the wrong shape.
+	test("every JSON column default is a serializable literal, including cleanup policy objects", () => {
+		// Literal objects and arrays must retain their declared shape. SQL expressions are
+		// unknown to ensureColumns and are tested separately for a safe, parseable fallback.
 		const offenders: string[] = [];
 		for (const [tableName, table] of Object.entries(schema)) {
 			if (table == null || typeof table !== "object" || !("getSQL" in table)) continue;
@@ -64,11 +62,59 @@ describe("JSON-mode column defaults", () => {
 			}
 			for (const [columnName, column] of Object.entries(columns)) {
 				if (column?.dataType !== "json" || !column.hasDefault) continue;
-				if (!Array.isArray(column.default))
-					offenders.push(`${tableName}.${columnName}=${JSON.stringify(column.default)}`);
+				if (column.default instanceof SQL) {
+					offenders.push(`${tableName}.${columnName}=unknown SQL default`);
+					continue;
+				}
+				const encoded = JSON.stringify(column.default);
+				if (encoded === undefined || JSON.stringify(JSON.parse(encoded)) !== encoded)
+					offenders.push(`${tableName}.${columnName}=${encoded}`);
 			}
 		}
 		expect(offenders).toEqual([]);
+		expect(schema.scheduledTasks.cleanupPolicy.default).toEqual({ mode: "none" });
+	});
+
+	test("an older table receives its declared JSON object default for existing and new rows", () => {
+		const database = openDatabase();
+		database.run("CREATE TABLE scheduled_tasks (id text PRIMARY KEY NOT NULL)");
+		database.run("INSERT INTO scheduled_tasks(id) VALUES ('existing')");
+		ensureColumns(database);
+		database.run("INSERT INTO scheduled_tasks(id) VALUES ('new')");
+		const info = database
+			.query<{ name: string; dflt_value: string }, []>("PRAGMA table_info('scheduled_tasks')")
+			.all();
+		expect(info.find((column) => column.name === "cleanup_policy")?.dflt_value).toBe(
+			'\'{"mode":"none"}\'',
+		);
+		const rows = database
+			.query<{ cleanup_policy: string }, []>(
+				"SELECT cleanup_policy FROM scheduled_tasks ORDER BY id",
+			)
+			.all();
+		expect(rows.map((row) => JSON.parse(row.cleanup_policy))).toEqual([
+			{ mode: "none" },
+			{ mode: "none" },
+		]);
+	});
+
+	test("an unknown SQL JSON default is not executed and falls back to a parseable array", () => {
+		const database = openDatabase();
+		database.run("CREATE TABLE projects (id text PRIMARY KEY NOT NULL, name text NOT NULL)");
+		database.run("INSERT INTO projects(id, name) VALUES ('existing', 'demo')");
+		const column = schema.projects.traits;
+		const previous = column.default;
+		try {
+			expect(Reflect.set(column, "default", sql`unrecognized_json_default('do not execute')`)).toBe(
+				true,
+			);
+			ensureColumns(database);
+		} finally {
+			expect(Reflect.set(column, "default", previous)).toBe(true);
+		}
+		const row = database.query<{ traits: string }, []>("SELECT traits FROM projects").get();
+		expect(row?.traits).toBe("[]");
+		expect(JSON.parse(row?.traits ?? "")).toEqual([]);
 	});
 
 	test("a column an older build never created is added with a parseable JSON default", () => {
@@ -115,7 +161,8 @@ describe("JSON-mode column defaults", () => {
 		);
 		database.run("UPDATE narrators SET traits = ''");
 		database.run("UPDATE projects SET traits = CAST('' AS TEXT)");
-		database.run("UPDATE user_preferences SET traits = '' WHERE user_id IN ('admin','bot')");
+		database.run("UPDATE user_preferences SET traits = '' WHERE user_id = 'admin'");
+		database.run("UPDATE user_preferences SET traits = 'broken-json' WHERE user_id = 'bot'");
 		database.run("UPDATE user_preferences SET traits = '[\"kept\"]' WHERE user_id = 'ok'");
 
 		await applySqliteDataBackfills(database);

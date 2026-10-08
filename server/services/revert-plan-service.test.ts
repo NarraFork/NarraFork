@@ -629,20 +629,23 @@ describe("complete preparation, bounds and failures", () => {
 		const files = [file()];
 		const input = plan(files);
 		const result = await appendAll(input, files);
-		for (const patch of [
-			{ computation: "partial" },
-			{ selectorCoverage: "unknown" },
-			{ historyCoverage: "unknown" },
-			{ omittedFiles: 1 },
-			{ unknownFiles: 1 },
-		])
+		const before = { operation: record(result.id), files: storedFiles(result.id) };
+		const rejectedProofs: Array<[Record<string, unknown>, string]> = [
+			// Valid protocol variants still cannot replace this already-published full proof.
+			[{ computation: "partial" }, "REQUEST_CONFLICT"],
+			[{ selectorCoverage: "unknown" }, "COVERAGE_UNPROVEN"],
+			[{ historyCoverage: "unknown" }, "COVERAGE_UNPROVEN"],
+			[{ omittedFiles: 1 }, "REQUEST_CONFLICT"],
+			[{ unknownFiles: 1 }, "REQUEST_CONFLICT"],
+		];
+		for (const [patch, failure] of rejectedProofs) {
 			await rejected(
-				service.finalize(owner, result.id, {
-					...input.manifestProof,
-					...patch,
-				} as RevertPlanManifestProof),
-				"COVERAGE_UNPROVEN",
+				service.finalize(owner, result.id, { ...input.manifestProof, ...patch }),
+				failure,
 			);
+			incomplete(result.id);
+			expect({ operation: record(result.id), files: storedFiles(result.id) }).toEqual(before);
+		}
 		await rejected(
 			service.finalize(owner, result.id, {
 				...input.manifestProof,
@@ -650,6 +653,7 @@ describe("complete preparation, bounds and failures", () => {
 			}),
 			"REQUEST_CONFLICT",
 		);
+		expect({ operation: record(result.id), files: storedFiles(result.id) }).toEqual(before);
 		await expect(
 			service.finalize(owner, result.id, undefined as unknown as RevertPlanManifestProof),
 		).rejects.toBeDefined();

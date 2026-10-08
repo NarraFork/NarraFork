@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as schema from "../db/schema";
-import { fixtureDatabase } from "./worktree-resource-fixture";
+import { fixtureDatabase } from "./__tests__/worktree-resource-fixture";
 import {
 	boundedMetadataJson,
 	createWorktreeResourceMetadataStore,

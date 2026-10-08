@@ -26,7 +26,12 @@ let chat: (params: ChatParams) => AsyncGenerator<ParsedStreamEvent> = async func
 	yield { text: "done" };
 };
 const adapter: ProviderAdapter = {
-	formatTools: (tools) => tools,
+	formatTools: (tools) =>
+		tools.map(({ name, description, parameters }) => ({
+			name,
+			description,
+			parameters: z.toJSONSchema(parameters),
+		})),
 	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
@@ -196,7 +201,9 @@ describe("asynchronous runtime settings at real provider request boundaries", ()
 		);
 		expect(requests.map((request) => request.model)).toEqual([B]);
 		expect(characters).toHaveLength(2);
-		expect(characters.at(-1)).toBe(JSON.stringify(requests[0].tools).length);
+		expect(characters.at(-1)).toBe(
+			requests[0].tools.reduce<number>((sum, tool) => sum + JSON.stringify(tool).length, 0),
+		);
 	});
 
 	test("a failing retry probe is treated as no pending switch instead of aborting the turn", async () => {

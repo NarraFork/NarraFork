@@ -17,8 +17,9 @@ const root = resolve(import.meta.dir, "../..");
 const journal = JSON.parse(readFileSync(join(root, "drizzle/meta/_journal.json"), "utf8")) as {
 	entries: { idx: number; tag: string }[];
 };
-const target = journal.entries.find((entry) => entry.idx === 189);
+const target = journal.entries.find((entry) => entry.tag === "0191_worktree_resource_ownership");
 if (!target) throw new Error("Missing generated resource migration");
+const targetIndex = target.idx;
 const migration = readFileSync(join(root, `drizzle/${target.tag}.sql`), "utf8");
 const fixtures: Database[] = [];
 const registration = {
@@ -34,7 +35,7 @@ function fixture(upgraded = true) {
 	const folder = mkdtempSync(join(tmpdir(), "nf-resource-schema-fixture-"));
 	try {
 		mkdirSync(join(folder, "meta"));
-		const entries = journal.entries.filter((entry) => entry.idx < 189);
+		const entries = journal.entries.filter((entry) => entry.idx < targetIndex);
 		writeFileSync(join(folder, "meta/_journal.json"), JSON.stringify({ ...journal, entries }));
 		for (const entry of entries)
 			writeFileSync(
@@ -63,7 +64,7 @@ afterEach(() => {
 });
 
 describe("resource schema real old-chain upgrade", () => {
-	test("0188 populated legacy data is preserved byte-for-byte; old inventory stays unknown", () => {
+	test("0190 populated legacy data is preserved byte-for-byte; old inventory stays unknown", () => {
 		const { sqlite } = fixture(false);
 		sqlite.exec(`INSERT INTO narrator_worktree_resources(id,owner_narrator_id,device_id,repository_key,worktree_path,state,create_request_id) VALUES ('historic','n','local','repo','/fixture/old','ready','old');
 			INSERT INTO container_instances(id,chapter_id,service_name,volume_name,created_at,updated_at) VALUES ('legacy-container','c','web','persistent-volume','now','now');

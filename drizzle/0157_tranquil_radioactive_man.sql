@@ -1,0 +1,1 @@
+ALTER TABLE `file_change_effects` ADD `attribution_ceiling` text;

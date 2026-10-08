@@ -158,7 +158,10 @@ describe("stripProviderMetadata", () => {
 				{
 					type: "reasoning",
 					text: "visible thinking",
-					providerMetadata: { anthropic: { signature, blockIndex: 2 }, signatureSource: "anthropic" },
+					providerMetadata: {
+						anthropic: { signature, blockIndex: 2 },
+						signatureSource: "anthropic",
+					},
 				},
 			]),
 		]);

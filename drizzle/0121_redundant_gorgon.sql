@@ -1,0 +1,2 @@
+ALTER TABLE `narrator_tool_calls` ADD `started_at` text GENERATED ALWAYS AS (coalesce("execution_started_at", "permission_started_at", "stream_started_at", "created_at")) VIRTUAL;--> statement-breakpoint
+CREATE INDEX `idx_toolcalls_started_at` ON `narrator_tool_calls` (`started_at`,`id`);

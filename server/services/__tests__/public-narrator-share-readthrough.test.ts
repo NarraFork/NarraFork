@@ -12,13 +12,16 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../../db";
-import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls, users } from "../../db/schema";
+import {
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	users,
+} from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { publicNarratorShareRoutes } from "../../routes/public-narrator-shares";
-import {
-	createPublicShare,
-	type VerifiedPublicShare,
-} from "../public-narrator-share-service";
+import { createPublicShare, type VerifiedPublicShare } from "../public-narrator-share-service";
 
 const now = "2026-09-08T00:00:00.000Z";
 const owner = generateId();
@@ -34,7 +37,13 @@ app.onError((error, c) =>
 beforeAll(() => {
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	db.insert(users)
-		.values({ id: owner, username: `readthrough-${generateId()}`, passwordHash: "x", role: "user", createdAt: now })
+		.values({
+			id: owner,
+			username: `readthrough-${generateId()}`,
+			passwordHash: "x",
+			role: "user",
+			createdAt: now,
+		})
 		.run();
 });
 
@@ -107,9 +116,13 @@ function tool(narratorId: string, messageId: string): string {
 }
 
 async function shared(narratorId: string) {
-	const created = await createPublicShare(narratorId, { userId: owner, isAdmin: false }, {
-		guestName: "Visitor",
-	});
+	const created = await createPublicShare(
+		narratorId,
+		{ userId: owner, isAdmin: false },
+		{
+			guestName: "Visitor",
+		},
+	);
 	return created;
 }
 
@@ -198,10 +211,17 @@ describe("public share read-through endpoints", () => {
 		const narratorId = narrator();
 		message(narratorId, 0, "hello");
 		const share = await shared(narratorId);
-		for (const authorization of [undefined, "Share wrong-token-wrong-token-wrong-token-wrong-tok", "Bearer x"]) {
-			const res = await app.request(`/api/public/narrator-shares/${share.share.id}/pretext-document`, {
-				...(authorization ? { headers: { Authorization: authorization } } : {}),
-			});
+		for (const authorization of [
+			undefined,
+			"Share wrong-token-wrong-token-wrong-token-wrong-tok",
+			"Bearer x",
+		]) {
+			const res = await app.request(
+				`/api/public/narrator-shares/${share.share.id}/pretext-document`,
+				{
+					...(authorization ? { headers: { Authorization: authorization } } : {}),
+				},
+			);
 			expect(res.status).toBe(404);
 		}
 	});

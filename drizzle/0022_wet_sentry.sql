@@ -1,0 +1,1 @@
+ALTER TABLE `gateway_session_mappings` ADD `app_user_id` text REFERENCES users(id);

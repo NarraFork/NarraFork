@@ -11,7 +11,7 @@ import { createMailboxStore } from "../agent-runtime/mailbox";
 import type { MailboxClaim, MailboxRow } from "../agent-runtime/mailbox-types";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({ ...ws, broadcastToNarrator: () => {} }));
 const { narratorPersistence } = await import("../narrator-persistence");

@@ -1,0 +1,1 @@
+ALTER TABLE `narrator_tool_calls` ADD `owned_paths_json` text;

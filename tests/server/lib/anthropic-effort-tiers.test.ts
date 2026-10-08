@@ -9,6 +9,14 @@ import {
 } from "../../../server/lib/agent/anthropic-provider";
 
 describe("Anthropic effort capability detection", () => {
+	test("Opus 4.5 accepts effort without newer tiers or adaptive beta flags", () => {
+		for (const model of ["claude-opus-4-5", "claude-opus-4.5", "claude-opus-4-5-20251101"]) {
+			expect(supportsEffort(model)).toBe(true);
+			expect(supportsXhighEffort(model)).toBe(false);
+			expect(declaresEffortBetaFlags(model)).toBe(false);
+		}
+	});
+
 	test("4.6 models accept effort but not the xhigh tier", () => {
 		for (const model of ["claude-opus-4-6", "claude-opus-4.6", "claude-sonnet-4.6"]) {
 			expect(supportsEffort(model)).toBe(true);
@@ -35,12 +43,12 @@ describe("Anthropic effort capability detection", () => {
 		}
 	});
 
-	test("pre-4.6 Claude is the built-in exclusion", () => {
-		// The one family known to hard 400 on output_config.effort. Everything
-		// else is opt-out via the user blocklist, not opt-in.
+	test("versions before each Claude family's effort support stay excluded", () => {
+		// Sonnet gains effort at 4.6, while Opus gains it at 4.5. Older
+		// generations remain excluded independently of catalog metadata.
 		for (const model of [
 			"claude-sonnet-4.5",
-			"claude-opus-4-5",
+			"claude-opus-4-1",
 			"claude-3-7-sonnet-20250219",
 			"claude-3-5-sonnet-20241022",
 		]) {
@@ -132,6 +140,17 @@ describe("Anthropic effort capability detection", () => {
 });
 
 describe("mapEffortParam", () => {
+	test("Opus 4.5 maps only its original three effort tiers", () => {
+		for (const model of ["claude-opus-4.5", "claude-opus-4-5-20251101"]) {
+			expect(mapEffortParam(model, "low")).toBe("low");
+			expect(mapEffortParam(model, "medium")).toBe("medium");
+			expect(mapEffortParam(model, "high")).toBe("high");
+			expect(mapEffortParam(model, "xhigh")).toBe("high");
+			expect(mapEffortParam(model, "max")).toBe("high");
+			expect(mapEffortParam(model, "none")).toBeUndefined();
+		}
+	});
+
 	test("passes every tier through on models with xhigh", () => {
 		expect(mapEffortParam("claude-opus-4.8", "low")).toBe("low");
 		expect(mapEffortParam("claude-opus-4.8", "medium")).toBe("medium");

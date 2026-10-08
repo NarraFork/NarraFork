@@ -1,0 +1,1 @@
+ALTER TABLE `narrator_message_refs` ADD `segment_compact_id` text;

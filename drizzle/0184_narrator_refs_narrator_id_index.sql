@@ -1,0 +1,1 @@
+CREATE INDEX `idx_narrator_refs_narrator_id` ON `narrator_message_refs` (`narrator_id`,`id`);

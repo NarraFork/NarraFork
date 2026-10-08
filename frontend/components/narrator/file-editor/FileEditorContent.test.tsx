@@ -420,10 +420,25 @@ for (const surface of ["focus", "workspace"] as const)
 				if (!input.path.startsWith(cwd)) throw new ApiError("Forbidden outside cwd", 403);
 				return { ...descriptor, target: { deviceId: "local", path: input.path } };
 			});
-			const panels = new Map<string, { id: string; params: FilePanelParams; api: object }>();
+			const panels = new Map<
+				string,
+				{
+					id: string;
+					params: FilePanelParams | { panelType: "narrator"; narratorId: string };
+					api: object;
+				}
+			>();
+			if (surface === "workspace")
+				panels.set("parent-host", {
+					id: "parent-host",
+					params: { panelType: "narrator", narratorId: "parent" },
+					api: { location: { type: "grid" }, setActive() {} },
+				});
+			const hostCount = panels.size;
 			const apiRef = {
 				current: {
 					getPanel: (id: string) => panels.get(id),
+					groups: [],
 					get panels() {
 						return [
 							// Workspace resources need their owning narrator cell to exist.
@@ -477,14 +492,17 @@ for (const surface of ["focus", "workspace"] as const)
 			}
 			renderToString(<Child />);
 			childOpen?.(filePath, undefined, { referenceOrigin: true, selection });
-			const panel = [...panels.values()][0];
+			const panel = [...panels.values()].find(
+				(candidate) =>
+					candidate.params.panelType === "file" && candidate.params.fileNarratorId === "child",
+			);
 			if (!panel) throw new Error("Missing child file panel");
 			childOpen?.(filePath, undefined, { referenceOrigin: true, selection });
-			expect(panels.size).toBe(1);
+			expect(panels.size).toBe(hostCount + 1);
 			open(filePath, undefined, { referenceOrigin: true });
-			expect(panels.size).toBe(2);
+			expect(panels.size).toBe(hostCount + 2);
 			expect(panel.params).toMatchObject({ hostNarratorId: "parent", fileNarratorId: "child" });
-			let params = panel.params;
+			let params = panel.params as unknown as FilePanelParams;
 			if (lifecycle === "restored") {
 				const layout = { panels: { file: { params } } } as unknown as SerializedDockview;
 				params = JSON.parse(

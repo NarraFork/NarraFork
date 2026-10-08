@@ -1,0 +1,1 @@
+ALTER TABLE `narrators` ADD `is_ask_in_passing` integer DEFAULT false NOT NULL;

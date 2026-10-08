@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import * as schema from "../db/schema";
-import { fixtureDatabase } from "./worktree-resource-fixture";
+import { fixtureDatabase } from "./__tests__/worktree-resource-fixture";
 import { createWorktreeResourceMetadataStore } from "./worktree-resource-metadata-store";
 import type { CurrentResourceAuthority } from "./worktree-resource-owner";
 

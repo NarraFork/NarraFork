@@ -1,0 +1,2 @@
+CREATE INDEX `idx_bg_tasks_parent_created` ON `background_tasks` (`parent_narrator_id`,`created_at`,`id`);--> statement-breakpoint
+CREATE INDEX `idx_narrators_background_parent_created` ON `narrators` (`parent_narrator_id`,`created_at`,`id`) WHERE "is_background" = 1;

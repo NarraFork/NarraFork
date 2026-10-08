@@ -1,5 +1,6 @@
-import { patchRawMetadata, validateRawMetadata, type RawCatalog, type RawMetadata } from "./card";
+import { patchRawMetadata, type RawCatalog, type RawMetadata, validateRawMetadata } from "./card";
 import type { RawLocalState } from "./card-resolver";
+
 type CardMetadataPatch = Parameters<typeof patchRawMetadata>[1];
 
 type Target = "model" | "variant" | "binding";

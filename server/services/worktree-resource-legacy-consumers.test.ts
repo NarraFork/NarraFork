@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { Hono } from "hono";
 import * as schema from "../db/schema";
 import { settings } from "../lib/settings";
-import { fixtureDatabase } from "./worktree-resource-fixture";
+import { fixtureDatabase } from "./__tests__/worktree-resource-fixture";
 
 let fixture: ReturnType<typeof fixtureDatabase>;
 let directory: string;

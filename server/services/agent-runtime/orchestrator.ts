@@ -368,6 +368,7 @@ export async function runAgentLoopUnlocked(
 	const messageWriters = createRuntimeMessageWriters(subagentPlacement?.parentToolUseId);
 	const continuationState = createSubagentContinuationState();
 	let continuationStopNote: string | null = null;
+	let abortedBeforeCleanup: boolean | undefined;
 
 	// Final guard against concurrent loops on the same ActiveNarrator. ensureNarrator
 	// reuses the same `active` object while it is alive, so a second runAgentLoop call
@@ -3317,6 +3318,9 @@ export async function runAgentLoopUnlocked(
 			if (activeNarrators.get(narratorId) === active) activeNarrators.delete(narratorId);
 			planModeAskedOnce.delete(narratorId);
 			clearStreamingSnapshot(narratorId);
+			// Finalization cancels leftover resources, not the completed user turn.
+			// Preserve real cancellation before the internal cleanup abort changes the signal.
+			abortedBeforeCleanup = active.abortController.signal.aborted;
 			active.abortController.abort();
 			active.events.emit("event", { type: "done", data: null });
 			active.events.removeAllListeners();
@@ -3459,16 +3463,12 @@ export async function runAgentLoopUnlocked(
 		}
 	}
 
+	const aborted =
+		runState.wasInterrupted || (abortedBeforeCleanup ?? active.abortController.signal.aborted);
 	let finalText = runState.finalText;
 	if (runState.lastPass?.paymentRequired)
 		finalText = `Payment required: ${runState.lastPass.paymentRequired.message}`;
-	if (
-		profile.kind === "subagent" &&
-		!finalText.trim() &&
-		!runState.hadError &&
-		!runState.wasInterrupted &&
-		!active.abortController.signal.aborted
-	) {
+	if (profile.kind === "subagent" && !finalText.trim() && !runState.hadError && !aborted) {
 		const latest = await narratorService.getLatestAssistantTextAndId(narratorId).catch(() => null);
 		if (latest?.text.trim()) finalText = latest.text;
 		else
@@ -3476,19 +3476,19 @@ export async function runAgentLoopUnlocked(
 				(await narratorService.getLatestSuccessfulCompactSummary(narratorId).catch(() => null))
 					?.summary ?? "";
 	}
-	if (continuationStopNote && !runState.wasInterrupted && !active.abortController.signal.aborted) {
+	if (continuationStopNote && !aborted) {
 		finalText = finalText.trim()
 			? `${finalText.trim()}\n\n${continuationStopNote}`
 			: continuationStopNote;
 	}
-	if (runState.hadError && !active.abortController.signal.aborted)
+	if (runState.hadError && !aborted)
 		db.update(narrators).set({ lastStopReason: "error" }).where(eq(narrators.id, narratorId)).run();
 	return {
 		started: true,
-		allowInboxWake: !runState.hadError && !active.abortController.signal.aborted,
+		allowInboxWake: !runState.hadError && !aborted,
 		finalText,
 		hasError: runState.hadError,
-		aborted: runState.wasInterrupted,
+		aborted,
 		contextLengthExceeded: runState.hadError && runState.lastPass?.contextLengthExceeded === true,
 		lastPass: runState.lastPass,
 	};

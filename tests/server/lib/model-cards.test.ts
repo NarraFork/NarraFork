@@ -16,6 +16,9 @@ import {
 	modelCardEffortLevels,
 	modelCardPricing,
 } from "../../../server/lib/model-cards";
+import { decodeCatalog } from "../../../server/lib/model-catalog/source";
+import { getBuiltinCodexModels } from "../../../server/lib/settings/provider";
+import catalog from "../../../shared/model-catalog/dist/catalog.json";
 
 afterEach(() => {
 	invalidateModelCardCache();
@@ -275,8 +278,11 @@ describe("pricing resolution", () => {
 });
 
 describe("builtin card data integrity", () => {
-	test("does not seed GPT/Codex models older than GPT-5.5", () => {
+	test("retains historical metadata without reintroducing retired callable Codex models", () => {
 		const keys = new Set(BUILTIN_MODEL_CARDS.map((card) => card.modelKey));
+		const catalogKeys = new Set(decodeCatalog(catalog).models.map((model) => model.id));
+		const callable = new Set(getBuiltinCodexModels());
+		expect([...keys].sort()).toEqual([...catalogKeys].sort());
 		for (const retired of [
 			"gpt-5-codex",
 			"gpt-5.1-codex",
@@ -289,7 +295,8 @@ describe("builtin card data integrity", () => {
 			"gpt-5.4",
 			"gpt-5.4-mini",
 		]) {
-			expect(keys.has(retired)).toBe(false);
+			expect(callable.has(retired)).toBe(false);
+			expect(keys.has(retired)).toBe(catalogKeys.has(retired));
 		}
 	});
 
@@ -308,6 +315,23 @@ describe("builtin card data integrity", () => {
 			for (const alias of card.aliases ?? []) {
 				expect(keys.has(alias)).toBe(false);
 			}
+		}
+	});
+
+	test.each([
+		"deepseek-chat",
+		"deepseek-reasoner",
+	])("%s resolves its exact card rather than a newer model alias", (model) => {
+		const match = lookupModelCard(model, BUILTIN_MODEL_CARDS);
+		expect(match?.matchedVia).toBe("exact");
+		expect(match?.card).toBe(builtinCard(model));
+	});
+
+	test("noncolliding catalog aliases remain reachable", () => {
+		const keys = new Set(BUILTIN_MODEL_CARDS.map((card) => card.modelKey));
+		for (const model of decodeCatalog(catalog).models) {
+			const aliases = model.matches?.aliases?.filter((alias) => !keys.has(alias));
+			expect(builtinCard(model.id).aliases).toEqual(aliases);
 		}
 	});
 

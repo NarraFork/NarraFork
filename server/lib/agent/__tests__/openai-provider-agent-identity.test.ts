@@ -159,11 +159,13 @@ describe("OpenAIProvider offline reflection request shape", () => {
 		});
 
 		for (const content of ["parent request", "danger reflection prompt"]) {
-			const iterator = provider.chat({
-				...base,
-				content,
-				requestDump: new ApiRequestDumpCollector(),
-			})[Symbol.asyncIterator]();
+			const iterator = provider
+				.chat({
+					...base,
+					content,
+					requestDump: new ApiRequestDumpCollector(),
+				})
+				[Symbol.asyncIterator]();
 			await expect(iterator.next()).rejects.toThrow("offline verification");
 		}
 

@@ -32,9 +32,12 @@ const originalStorageHealthApi = {
 	health: api.health,
 	getSettings: api.getSettings,
 	getCachedStorage: api.getCachedStorage,
+	me: api.me,
+	getWorkspaceBarriers: api.getWorkspaceBarriers,
 };
 const STORAGE_DOM_GLOBALS = [
 	"window",
+	"localStorage",
 	"document",
 	"navigator",
 	"Event",
@@ -91,7 +94,15 @@ function installStorageTestDom() {
 		dispatchEvent: () => false,
 	});
 
+	const values = new Map([["narrafork_token", "storage-test-session"]]);
+	const localStorage = {
+		getItem: (key: string) => values.get(key) ?? null,
+		setItem: (key: string, value: string) => values.set(key, value),
+		removeItem: (key: string) => values.delete(key),
+		clear: () => values.clear(),
+	};
 	Object.assign(window, {
+		localStorage,
 		ResizeObserver: StorageTestResizeObserver,
 		matchMedia,
 		requestAnimationFrame: (callback: FrameRequestCallback) => setTimeout(callback, 0),
@@ -99,6 +110,7 @@ function installStorageTestDom() {
 	});
 	Object.assign(globalThis, {
 		window,
+		localStorage,
 		document: window.document,
 		navigator: window.navigator,
 		Event: window.Event,
@@ -200,6 +212,11 @@ describe("StorageSection health states", () => {
 		api.getSettings = async () =>
 			({}) as Awaited<ReturnType<typeof originalStorageHealthApi.getSettings>>;
 		api.getCachedStorage = async () => ({ cached: false });
+		api.me = async () =>
+			({ id: "storage-admin", username: "admin", role: "admin" }) as Awaited<
+				ReturnType<typeof api.me>
+			>;
+		api.getWorkspaceBarriers = async () => ({ items: [], nextCursor: null });
 		storageContainer = document.createElement("div");
 		document.body.appendChild(storageContainer);
 		storageRoot = createRoot(storageContainer);
@@ -218,6 +235,8 @@ describe("StorageSection health states", () => {
 		api.health = originalStorageHealthApi.health;
 		api.getSettings = originalStorageHealthApi.getSettings;
 		api.getCachedStorage = originalStorageHealthApi.getCachedStorage;
+		api.me = originalStorageHealthApi.me;
+		api.getWorkspaceBarriers = originalStorageHealthApi.getWorkspaceBarriers;
 		restoreStorageTestDom();
 	});
 

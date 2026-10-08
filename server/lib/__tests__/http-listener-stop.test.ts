@@ -10,16 +10,17 @@ type TestServer = ReturnType<typeof Bun.serve>;
  * `Graceful shutdown degraded — releasing lock without clean marker`, so the clean-shutdown marker
  * was never written and every startup paid for an integrity check + FTS probe.
  *
- * Cause: `Bun.Server.stop(true)`'s promise resolves only once Bun's internal `pendingWebSockets`
- * counter drains, but the counter is not decremented when the SERVER closes a socket
+ * Historical cause: `Bun.Server.stop(true)`'s promise resolved only once Bun's internal
+ * `pendingWebSockets` counter drained, but old runtimes did not decrement it when the SERVER closed a socket
  * (`ws.close()` / `ws.terminate()`) — the `close` callback fires, the peer disconnects, and the
  * counter stays stuck for the rest of the process's life. NarraFork closes sockets server-side both
  * at runtime (heartbeat timeout, expired session) and in `closeAllConnections()` during shutdown,
  * so the promise could never settle.
  *
- * These tests pin the two Bun behaviours the fix relies on. If a future Bun release fixes the
- * counter leak, `stopPromiseStillPending` starts failing — at which point awaiting the promise
- * becomes safe again and this file should be revisited.
+ * Older Bun versions exhibited the counter leak above; the pinned runtime has fixed it.
+ * Test the recovered counter/settled promise and the actual listener safety contract rather
+ * than requiring a historical runtime defect to remain. Production shutdown still stops
+ * accepting requests synchronously without awaiting a promise, protecting older runtimes.
  */
 
 const servers: TestServer[] = [];
@@ -148,7 +149,7 @@ describe("Bun.Server.stop() behaviour that graceful shutdown depends on", () => 
 		expect(await isAccepting(port)).toBe(false);
 	});
 
-	test("a server-initiated ws.close() leaves stop()'s promise pending forever", async () => {
+	test("a server-initiated ws.close() drains the counter and permits shutdown", async () => {
 		const { server, live } = startServer();
 		const ws = await connect(server);
 		const closed = new Promise<void>((resolve) => {
@@ -162,9 +163,8 @@ describe("Bun.Server.stop() behaviour that graceful shutdown depends on", () => 
 
 		// The connection is fully gone as far as the application can tell...
 		expect(live.size).toBe(0);
-		// ...yet Bun's counter never drops, even given the same settle window that a
-		// client-initiated close needs, which is why stop()'s promise cannot settle.
-		expect(await waitForPendingWebSockets(server, 0)).toBe(1);
+		// The repaired runtime must count that close, rather than keeping a ghost socket.
+		expect(await waitForPendingWebSockets(server, 0)).toBe(0);
 
 		let settled = false;
 		void Promise.resolve(server.stop(true))
@@ -175,7 +175,7 @@ describe("Bun.Server.stop() behaviour that graceful shutdown depends on", () => 
 				settled = true;
 			});
 		await Bun.sleep(750);
-		expect(settled).toBe(false);
+		expect(settled).toBe(true);
 	});
 
 	test("without a server-initiated close, stop()'s promise settles normally", async () => {
@@ -201,7 +201,7 @@ describe("Bun.Server.stop() behaviour that graceful shutdown depends on", () => 
 		expect(settled).toBe(true);
 	});
 
-	test("the port is rebindable after stop(true) even with the counter leaked", async () => {
+	test("the port is rebindable immediately after server-side close and stop(true)", async () => {
 		const { server, live } = startServer();
 		const port = boundPort(server);
 		const ws = await connect(server);
@@ -210,12 +210,12 @@ describe("Bun.Server.stop() behaviour that graceful shutdown depends on", () => 
 		});
 		for (const socket of live) socket.close(1001, "server shutting down");
 		await closed;
-		expect(server.pendingWebSockets).toBe(1);
+		expect(await waitForPendingWebSockets(server, 0)).toBe(0);
 
 		void Promise.resolve(server.stop(true)).catch(() => {});
 
-		// The settings-driven host/port restart rebinds immediately after stopping; that has to work
-		// despite the leaked counter, otherwise the server would be left with no listener at all.
+		// A host/port restart must rebind without waiting on the stop promise, including
+		// on older runtimes where the websocket counter could leak.
 		const replacement = Bun.serve({
 			hostname: "127.0.0.1",
 			port,

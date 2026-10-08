@@ -4,7 +4,13 @@ import { apiRequests } from "@server/db/schema";
 import type { LocalCatalogState, ModelMetadata } from "@shared/model-catalog/schema/catalog";
 import { eq } from "drizzle-orm";
 import { finishApiRequest, startApiRequest, trackApiRequest } from "../api-request-tracker";
-import { bindModelCatalogSettings, getEffectiveModelMetadata, withModelMetadataSnapshotIterator } from "../model-catalog";
+import {
+	bindModelCatalogSettings,
+	getEffectiveModelMetadata,
+	getModelCatalogSnapshot,
+	mutateModelCatalog,
+	withModelMetadataSnapshotIterator,
+} from "../model-catalog";
 import { captureReferencePricingSnapshot, resolveModelPricing } from "../model-pricing";
 import { saveSettings, settings } from "../settings";
 import type { NarraForkSettings } from "../settings/types";
@@ -40,7 +46,15 @@ function install(
 		} as NarraForkSettings,
 		() => {},
 	);
-	return local;
+}
+function patchFixture(set: Record<string, string | number | boolean | null>, reset?: string[]) {
+	return mutateModelCatalog({
+		baseRevision: getModelCatalogSnapshot().local.revision,
+		action: "patch",
+		target: "model",
+		targetId: "cost-fixture",
+		patch: { set, reset },
+	});
 }
 function usage(partial: Partial<UsageData> = {}): UsageData {
 	return { inputTokens: 1_000_000, outputTokens: 1_000_000, ...partial };
@@ -51,22 +65,39 @@ const estimate = (data = usage(), provider = "openai", model = "cost-fixture") =
 
 describe("reference costs use effective catalog metadata", () => {
 	test("stream start price snapshots survive external consumers and preserve captured unknown", async () => {
-		const cases: Array<{ pricing?: ModelMetadata["referencePricing"]; status: string; cost: number | null }> = [
+		const cases: Array<{
+			pricing?: ModelMetadata["referencePricing"];
+			status: string;
+			cost: number | null;
+		}> = [
 			{ pricing: allPrices, status: "complete", cost: 10 },
 			{ pricing: { input: "2" }, status: "partial", cost: 2 },
 			{ status: "unknown", cost: null },
-			{ pricing: { input: "0", output: "0", cacheRead: "0", cacheWrite: "0" }, status: "complete", cost: 0 },
+			{
+				pricing: { input: "0", output: "0", cacheRead: "0", cacheWrite: "0" },
+				status: "complete",
+				cost: 0,
+			},
 		];
 		for (const fixture of cases) {
-			const local = install(fixture.pricing);
+			install(fixture.pricing);
 			const producer = withModelMetadataSnapshotIterator(async function* () {
-				yield { type: "api_request_start" as const, provider: "openai", model: "cost-fixture", referencePricingSnapshot: captureReferencePricingSnapshot("cost-fixture") };
+				yield {
+					type: "api_request_start" as const,
+					provider: "openai",
+					model: "cost-fixture",
+					referencePricingSnapshot: captureReferencePricingSnapshot("cost-fixture"),
+				};
 			});
 			const event = (await producer.next()).value;
 			if (!event) throw new Error("Missing start event");
 			// The consumer runs outside producer ALS, after a concurrent settings edit.
-			local.models = [{ id: "cost-fixture", metadata: { referencePricing: { ...allPrices, input: "20" } } }];
-			local.revision++;
+			patchFixture({
+				"referencePricing.input": "20",
+				"referencePricing.output": "8",
+				"referencePricing.cacheRead": "0.5",
+				"referencePricing.cacheWrite": "2.5",
+			});
 			expect(estimate().knownCost).toBe(28);
 			const handle = startApiRequest(event);
 			const next = startApiRequest({ provider: "openai", model: "cost-fixture" });
@@ -75,8 +106,12 @@ describe("reference costs use effective catalog metadata", () => {
 				expect(handle.referencePricingSnapshot.localRevision).toBe(1);
 				await finishApiRequest(handle, { usage: usage() });
 				await finishApiRequest(next, { usage: usage() });
-				expect(db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get()).toMatchObject({ costStatus: fixture.status, costUsd: fixture.cost });
-				expect(db.select().from(apiRequests).where(eq(apiRequests.id, next.id)).get()).toMatchObject({ costStatus: "complete", costUsd: 28 });
+				expect(
+					db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get(),
+				).toMatchObject({ costStatus: fixture.status, costUsd: fixture.cost });
+				expect(
+					db.select().from(apiRequests).where(eq(apiRequests.id, next.id)).get(),
+				).toMatchObject({ costStatus: "complete", costUsd: 28 });
 			} finally {
 				db.delete(apiRequests).where(eq(apiRequests.id, handle.id)).run();
 				db.delete(apiRequests).where(eq(apiRequests.id, next.id)).run();
@@ -85,10 +120,8 @@ describe("reference costs use effective catalog metadata", () => {
 		}
 	});
 	test("tracked request and completion pricing share one snapshot across deferred edits", async () => {
-		const local = install(allPrices);
-		const model = local.models?.[0];
-		if (!model) throw new Error("Missing fixture model");
-		model.metadata.limits = { contextWindow: 100_000 };
+		install(allPrices);
+		patchFixture({ "limits.contextWindow": 100_000 });
 		let release = () => {};
 		let entered = () => {};
 		const deferred = new Promise<void>((resolve) => {
@@ -108,11 +141,7 @@ describe("reference costs use effective catalog metadata", () => {
 		});
 		try {
 			await started;
-			model.metadata = {
-				referencePricing: { ...allPrices, input: "20" },
-				limits: { contextWindow: 200_000 },
-			};
-			local.revision++;
+			patchFixture({ "referencePricing.input": "20", "limits.contextWindow": 200_000 });
 			expect(getEffectiveModelMetadata(options.model).metadata.limits?.contextWindow).toBe(200_000);
 			release();
 			await pending;
@@ -191,8 +220,8 @@ describe("reference costs use effective catalog metadata", () => {
 		).toMatchObject({ status: "complete", knownCost: 0, missingFields: [] });
 		expect(calculateCost(usage(), "openai", "cost-fixture")?.totalCost).toBe(0);
 	});
-	test("alias inherits custom override; deleting override restores base", () => {
-		const local = install(allPrices, {
+	test("alias inherits custom override; reset clears it and republishing restores base", () => {
+		install(allPrices, {
 			overrides: [
 				{
 					target: "model",
@@ -205,14 +234,38 @@ describe("reference costs use effective catalog metadata", () => {
 			status: "complete",
 			knownCost: 17,
 		});
-		local.overrides = [];
+		const reset = patchFixture({}, ["referencePricing.input"]);
+		expect(reset.local.overrides).toEqual([]);
+		// Reset means inheritance even for creation-time fields; a local-only model has no input base.
+		expect(estimate(usage(), "openai", "cost-alias")).toMatchObject({
+			status: "partial",
+			knownCost: 8,
+			missingFields: ["input"],
+		});
+		const model = reset.local.models?.find((entry) => entry.id === "cost-fixture");
+		if (!model) throw new Error("Missing fixture model");
+		mutateModelCatalog({
+			baseRevision: reset.local.revision,
+			action: "upsert-model",
+			model: { ...model, metadata: { referencePricing: allPrices } },
+		});
 		expect(estimate(usage(), "openai", "cost-alias").knownCost).toBe(10);
 	});
 	test("tombstone suppresses pricing immediately and restoration recovers it", () => {
-		const local = install(allPrices);
-		local.hiddenModelIds = ["cost-fixture"];
+		install(allPrices);
+		mutateModelCatalog({
+			baseRevision: getModelCatalogSnapshot().local.revision,
+			action: "hide",
+			target: "model",
+			targetId: "cost-fixture",
+		});
 		expect(estimate(usage(), "openai", "cost-alias").status).toBe("unknown");
-		local.hiddenModelIds = [];
+		mutateModelCatalog({
+			baseRevision: getModelCatalogSnapshot().local.revision,
+			action: "restore",
+			target: "model",
+			targetId: "cost-fixture",
+		});
 		expect(estimate(usage(), "openai", "cost-alias").knownCost).toBe(10);
 	});
 	test("variant price and explicit zero override are consumed", () => {
@@ -256,7 +309,7 @@ describe("reference costs use effective catalog metadata", () => {
 		expect(estimate(usage({ inputTokens: 0, outputTokens: 0 })).status).toBe("unknown");
 	});
 	test("long context full mode uses prompt threshold and respects sparse/unknown/zero tiers", () => {
-		const local = install({
+		install({
 			...allPrices,
 			longContext: {
 				thresholdTokens: 1_000_000,
@@ -268,10 +321,10 @@ describe("reference costs use effective catalog metadata", () => {
 		});
 		expect(estimate().knownCost).toBe(10); // exactly threshold stays base
 		expect(estimate(usage({ inputTokens: 1_000_001 })).knownCost).toBeCloseTo(20.000004);
-		const tier = local.models?.[0]?.metadata.referencePricing?.longContext;
-		if (!tier) throw new Error("Missing test tier");
-		tier.input = null;
-		tier.output = "0";
+		patchFixture({
+			"referencePricing.longContext.input": null,
+			"referencePricing.longContext.output": "0",
+		});
 		expect(estimate(usage({ inputTokens: 1_000_001 }))).toMatchObject({
 			status: "partial",
 			knownCost: 0,

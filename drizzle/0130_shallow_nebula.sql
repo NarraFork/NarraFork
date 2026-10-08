@@ -1,0 +1,1 @@
+ALTER TABLE `chapters` ADD `detached_panels_json` text;

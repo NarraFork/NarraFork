@@ -769,7 +769,10 @@ globalThis.fetch = async () => { throw new Error("FORBIDDEN_LEGACY_BASELINE_FETC
 		);
 		const output = `${result.stdout.toString()}${result.stderr.toString()}`;
 		expect(output).not.toContain("FORBIDDEN_");
-		expect(output).not.toContain("baseline");
+		// An author's checkout directory may be named ci-baseline. Only diagnostics,
+		// not the project-path prefix, can indicate an attempted legacy baseline query.
+		const diagnostics = output.replaceAll(join(import.meta.dir, "../.."), "<project>");
+		expect(diagnostics).not.toContain("baseline");
 		expect(output).toMatch(/GitHub release failed|Dry run complete/);
 	});
 

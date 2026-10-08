@@ -1,0 +1,1 @@
+ALTER TABLE `narrators` ADD `pending_model_restore` text;

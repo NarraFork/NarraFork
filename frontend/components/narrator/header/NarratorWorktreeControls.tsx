@@ -4,6 +4,7 @@ import {
 	useWorkspaceContext,
 } from "@frontend/hooks/useWorkspaceContext";
 import { ApiError, api } from "@frontend/lib/api";
+import { formatLocaleDateTime } from "@frontend/lib/intl-format";
 import {
 	ActionIcon,
 	Alert,
@@ -282,7 +283,7 @@ function ScopedWorktreeControls({
 	const formatTime = (timestamp: number | null | undefined) =>
 		timestamp == null || !Number.isFinite(timestamp)
 			? t("worktree.unknownTime")
-			: new Date(timestamp).toLocaleString();
+			: formatLocaleDateTime(timestamp);
 	const pendingLimit = pendingReceipts.current.size >= RECEIPT_SCOPE_LIMIT;
 	const canCreate =
 		canSwitch &&

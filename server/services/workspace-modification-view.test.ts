@@ -69,47 +69,47 @@ async function record(params: {
 	narratorId: string | null;
 	userId?: string;
 	subagentType?: string;
-		action: "write" | "edit" | "bash" | "external" | "human";
-		toolName?: string | null;
-		treeHashAfter?: string;
-		lineStats?: { added: number; removed: number } | null;
-	}): Promise<void> {
-		let toolUseId: string | undefined;
-		if (params.narratorId && params.treeHashAfter) {
-			toolUseId = generateId();
-			const messageId = generateId();
-			const now = new Date().toISOString();
-			// narrator_tool_calls.messageId is a real FK, so the owning message must exist.
-			await db.insert(narratorMessages).values({
-				id: messageId,
-				narratorId: params.narratorId,
-				role: "assistant",
-				contentJson: [],
-				createdAt: now,
-			});
-			await db.insert(narratorToolCalls).values({
-				id: generateId(),
-				narratorId: params.narratorId,
-				messageId,
-				toolUseId,
-				toolName: params.toolName ?? "Write",
-				status: "success",
-				treeHashAfter: params.treeHashAfter,
-				createdAt: now,
-			});
-		}
-		await recordAttribution({
-			deviceId: "local",
-			workspacePath: params.workspacePath,
-			filePath: params.filePath,
+	action: "write" | "edit" | "bash" | "external" | "human";
+	toolName?: string | null;
+	treeHashAfter?: string;
+	lineStats?: { added: number; removed: number } | null;
+}): Promise<void> {
+	let toolUseId: string | undefined;
+	if (params.narratorId && params.treeHashAfter) {
+		toolUseId = generateId();
+		const messageId = generateId();
+		const now = new Date().toISOString();
+		// narrator_tool_calls.messageId is a real FK, so the owning message must exist.
+		await db.insert(narratorMessages).values({
+			id: messageId,
 			narratorId: params.narratorId,
-			userId: params.userId,
-			subagentType: params.subagentType,
-			action: params.action,
-			toolName: params.toolName ?? null,
-			toolUseId: toolUseId ?? null,
-			lineStats: params.lineStats ?? null,
+			role: "assistant",
+			contentJson: [],
+			createdAt: now,
 		});
+		await db.insert(narratorToolCalls).values({
+			id: generateId(),
+			narratorId: params.narratorId,
+			messageId,
+			toolUseId,
+			toolName: params.toolName ?? "Write",
+			status: "success",
+			treeHashAfter: params.treeHashAfter,
+			createdAt: now,
+		});
+	}
+	await recordAttribution({
+		deviceId: "local",
+		workspacePath: params.workspacePath,
+		filePath: params.filePath,
+		narratorId: params.narratorId,
+		userId: params.userId,
+		subagentType: params.subagentType,
+		action: params.action,
+		toolName: params.toolName ?? null,
+		toolUseId: toolUseId ?? null,
+		lineStats: params.lineStats ?? null,
+	});
 	// Timestamps are ISO strings at millisecond resolution; separate the rows so the
 	// newest-first ordering is deterministic.
 	await new Promise((r) => setTimeout(r, 2));

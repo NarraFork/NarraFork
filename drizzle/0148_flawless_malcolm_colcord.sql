@@ -1,0 +1,1 @@
+ALTER TABLE `api_requests` ADD `agent_label` text;

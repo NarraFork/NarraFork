@@ -158,8 +158,8 @@ describe("normalizeSearchSettings channel order", () => {
 			channels: [{ id: SEARCH_NATIVE_CHANNEL_ID, kind: "native", enabled: true }],
 		});
 		normalizeSearchSettings(withSaved, { codex: { useWebSearch: false } });
-		expect(
-			withSaved.search?.channels.find((c) => c.id === SEARCH_NATIVE_CHANNEL_ID)?.enabled,
-		).toBe(true);
+		expect(withSaved.search?.channels.find((c) => c.id === SEARCH_NATIVE_CHANNEL_ID)?.enabled).toBe(
+			true,
+		);
 	});
 });

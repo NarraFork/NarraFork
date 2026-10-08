@@ -312,10 +312,19 @@ describeWithTsx("regression: the file that motivated these modes", () => {
 	// the temp dir these tests run in, not the repo root.
 	const realFile = join(process.cwd(), "frontend/components/narrator/NarratorPanel.tsx");
 
-	test("the dominant-symbol callout names the giant component", async () => {
-		const result = await run({ file_path: realFile, mode: "outline", depth: 1 });
-		// One function spans 92% of the file; that fact belongs at the top.
-		expect(result.output).toMatch(/largest: function NarratorPanel L\d+-\d+ \(9\d% of file\)/);
+	test("the dominant-symbol callout reports the exact stable TSX declaration", async () => {
+		const fixture = join(workDir, "dominant.tsx");
+		const source = [
+			...Array.from({ length: 10 }, (_, index) => `export const marker${index} = ${index};`),
+			"export function DominantPanel() {",
+			...Array.from({ length: 200 }, (_, index) => `  const value${index} = ${index};`),
+			"  return <Shell><Content /></Shell>;",
+			"}",
+		].join("\n");
+		writeFileSync(fixture, source, "utf8");
+		const result = await run({ file_path: fixture, mode: "outline", depth: 1 });
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("largest: function DominantPanel L11-213 (95% of file)");
 	});
 
 	test("report covers structure, calls, dead code and the render tree together", async () => {

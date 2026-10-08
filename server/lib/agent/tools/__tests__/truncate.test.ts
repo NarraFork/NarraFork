@@ -23,7 +23,10 @@ describe("truncateOutput", () => {
 		expect(result.truncated).toBe(true);
 		expect(result.outputPath).toBeDefined();
 		expect(result.content).toContain("truncated");
-		expect(result.content).toContain("Read with offset/limit");
+		expect(result.content).toContain("You MUST use Read (path: the file above)");
+		expect(result.content).toContain("then use Read with a small offset/limit range");
+		expect(result.content).toContain(result.outputPath as string);
+		expect(readFileSync(result.outputPath as string, "utf-8")).toBe(text);
 
 		// The kept portion (between the "...N truncated..." header and the "⚠️" hint)
 		// should not exceed MAX_LINES lines.
@@ -44,6 +47,12 @@ describe("truncateOutput", () => {
 		expect(result.truncated).toBe(true);
 		expect(result.outputPath).toBeDefined();
 		expect(result.content).toContain("bytes truncated");
+		const preview = result.content.split("\n\n")[1];
+		expect(Buffer.byteLength(preview, "utf-8")).toBeLessThanOrEqual(MAX_BYTES);
+		expect(preview.split("\n").length).toBeLessThanOrEqual(MAX_LINES);
+		const outputPath = result.outputPath;
+		if (!outputPath) throw new Error("Byte-truncated output has no saved file");
+		expect(readFileSync(outputPath, "utf-8")).toBe(text);
 	});
 
 	test("persists full output to a file when truncated", () => {
@@ -81,11 +90,9 @@ describe("truncateOutput", () => {
 		// Exactly MAX_LINES lines, each short enough to stay under MAX_BYTES
 		const lines = Array.from({ length: MAX_LINES }, (_, i) => `${i}`);
 		const text = lines.join("\n");
-		// Only test if total bytes are within limit
-		if (Buffer.byteLength(text, "utf-8") <= MAX_BYTES) {
-			const result = truncateOutput(text);
-			expect(result.truncated).toBe(false);
-		}
+		expect(Buffer.byteLength(text, "utf-8")).toBeLessThanOrEqual(MAX_BYTES);
+		const result = truncateOutput(text);
+		expect(result.truncated).toBe(false);
 	});
 
 	test("empty string is not truncated", () => {

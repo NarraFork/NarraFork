@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { MD_HEADING_SLUG_ATTR } from "@frontend/lib/markdown-anchor-scroll";
+import { streamAnimDurationMs } from "@frontend/lib/stream-anim-duration";
 import { MantineProvider } from "@mantine/core";
 import type { FileTarget } from "@shared/file-reference";
 import { fileTargetFromHref } from "@shared/markdown-file-path";
@@ -328,7 +329,7 @@ for (const renderer of ["flowing", "prepared"] as const) {
 			expect(opened).toEqual([]);
 		});
 
-		test("opens repeated streaming references without dropping animation", async () => {
+		test("opens repeated streaming references and animates a real visible append after closure", async () => {
 			const opened: FileTarget[] = [];
 			const options = {
 				streaming: true,
@@ -357,6 +358,14 @@ for (const renderer of ["flowing", "prepared"] as const) {
 					selection: { startLineNumber: 4, startColumn: 1, endLineNumber: 5, endColumn: 1 },
 				}),
 			);
+			// Closing an incomplete link rewrites visible text, so prepared rendering
+			// correctly seals that frame. A subsequent visible append is a new birth.
+			if (renderer === "prepared") expect(container.querySelector(".vlist-anim-token")).toBeNull();
+			await render(
+				renderer,
+				"## Files\n\nStable [src/stable.ts](src/stable.ts#L2)\n\nTail [src/live.ts](src/live.ts#L4) more",
+				options,
+			);
 			expect(
 				container.querySelector(
 					renderer === "flowing" ? "[data-markdown-segment-id]" : ".vlist-anim-token",
@@ -365,6 +374,48 @@ for (const renderer of ["flowing", "prepared"] as const) {
 		});
 	});
 }
+
+test("prepared visible appends after a complete file link preserve span identity and original birth until expiry", async () => {
+	let now = 1000;
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	const options = { streaming: true, scope: { context, openFile() {} } };
+	const base = "Tail [src/live.ts](src/live.ts#L4) ";
+	try {
+		await render("prepared", base, options);
+		expect(container.querySelector(".vlist-anim-token")).toBeNull();
+		now += 32;
+		await render("prepared", `${base}一`, options);
+		const tracked = container.querySelector<HTMLSpanElement>("span.vlist-anim-token");
+		expect(tracked?.textContent).toBe("一");
+		if (!tracked) throw new Error("Missing appended animation span");
+		const birth = now;
+		now += 64;
+		await render("prepared", `${base}一二`, options);
+		expect(tracked.isConnected).toBe(true);
+		expect(container.querySelector("span.vlist-anim-token")).toBe(tracked);
+		expect(tracked.style.animationDelay).toBe("-64ms");
+		// An unrelated rebuild with unchanged visible text must not restamp birth.
+		now += 64;
+		await render("prepared", `${base}一二`, options);
+		expect(container.querySelector("span.vlist-anim-token")).toBe(tracked);
+		expect(tracked.style.animationDelay).toBe("-128ms");
+		now = birth + streamAnimDurationMs();
+		await render("prepared", `${base}一二`, options);
+		expect(tracked.isConnected).toBe(false);
+		expect(
+			Array.from(container.querySelectorAll(".vlist-anim-token"), (span) => span.textContent).join(
+				"",
+			),
+		).toBe("二");
+		now += 64;
+		await render("prepared", `${base}一二`, options);
+		expect(container.querySelector(".vlist-anim-token")).toBeNull();
+		expect(anchors()[0]?.textContent).toBe("src/live.ts:4");
+		expect(container.textContent).toContain("一二");
+	} finally {
+		clock.mockRestore();
+	}
+});
 
 test("every prepared wrapped link fragment preserves the target and measured geometry", async () => {
 	const opened: FileTarget[] = [];

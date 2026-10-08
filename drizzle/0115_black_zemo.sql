@@ -1,0 +1,1 @@
+CREATE INDEX `idx_chapters_worktree_path` ON `chapters` (`worktree_path`);

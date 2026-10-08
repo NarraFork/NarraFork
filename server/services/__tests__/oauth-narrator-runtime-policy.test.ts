@@ -653,7 +653,13 @@ describe("OAuth narrator runtime policy", () => {
 		const buffered = await db.query.narratorBufferedMessages.findMany({
 			where: eq(narratorBufferedMessages.narratorId, ids.narrator),
 		});
-		expect(buffered).toHaveLength(0);
+		expect(buffered).toHaveLength(1);
+		expect(buffered[0]?.state).toBe("cancelled");
+		expect(
+			buffered.filter((row) => row.state === "queued" || row.state === "claimed"),
+		).toHaveLength(0);
+		// Cancellation retains the audit state but clears the resumable payload.
+		expect(buffered[0]?.text).toBe("");
 		const stopped = await db.query.narrators.findFirst({
 			where: eq(narrators.id, ids.narrator),
 			columns: { status: true, substatus: true },

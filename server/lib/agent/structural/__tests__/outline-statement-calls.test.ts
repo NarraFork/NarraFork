@@ -123,7 +123,34 @@ bus.on("event", () => handle());
 const describeWithTsx = hasTsx ? describe : describe.skip;
 
 describeWithTsx("regression: the real NarratorPanel component", () => {
-	test("its 14 effects are no longer invisible", async () => {
+	test("a stable TSX fixture reports every effect and exact dependency/line semantics", async () => {
+		const deps = Array.from({ length: 14 }, (_, index) => `[value${index}, enabled]`);
+		const source = [
+			"export function StablePanel() {",
+			...deps.map((dep) => `\tuseEffect(() => { subscribe(); }, ${dep});`),
+			"\treturn <Shell><Content /></Shell>;",
+			"}",
+		].join("\n");
+		const effects = (await outlineOf(source, "tsx")).filter((node) => node.name === "useEffect");
+		expect(effects).toHaveLength(14);
+		expect(
+			effects.map(({ kind, signature, startLine, endLine }) => ({
+				kind,
+				signature,
+				startLine,
+				endLine,
+			})),
+		).toEqual(
+			deps.map((signature, index) => ({
+				kind: "call",
+				signature,
+				startLine: index + 2,
+				endLine: index + 2,
+			})),
+		);
+	});
+
+	test("the real component remains parseable after effects move into hooks", async () => {
 		const text = await Bun.file("frontend/components/narrator/NarratorPanel.tsx").text();
 		clearOutlineCache();
 		const nodes = flatten(
@@ -134,9 +161,9 @@ describeWithTsx("regression: the real NarratorPanel component", () => {
 			}),
 		);
 		const effects = nodes.filter((n) => n.name === "useEffect");
-		// The file contains 14 statement-level useEffect calls (a 15th mention is the
-		// import). Before this change the outline reported zero.
-		expect(effects.length).toBe(14);
+		// Production refactors may extract hooks; exact effect counts belong to the stable fixture.
+		expect(effects.length).toBeGreaterThan(0);
+		expect(nodes.some((node) => node.name === "NarratorPanel")).toBe(true);
 		// Every one should carry a dependency array.
 		expect(effects.every((e) => typeof e.signature === "string")).toBe(true);
 	});

@@ -1,0 +1,1 @@
+ALTER TABLE `narrators` ADD `substatus` text DEFAULT '[]' NOT NULL;

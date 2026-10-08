@@ -1,0 +1,1 @@
+ALTER TABLE `narrators` ADD `enabled_tools` text;

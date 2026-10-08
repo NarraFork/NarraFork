@@ -177,10 +177,7 @@ export function commitProviderPrefixMigration(
 }
 
 function providerPrefixForId(config: NarraForkSettings, id: string): string | null {
-	for (const provider of [
-		...(config.customApiProviders ?? []),
-		...(config.nugProviders ?? []),
-	]) {
+	for (const provider of [...(config.customApiProviders ?? []), ...(config.nugProviders ?? [])]) {
 		if (provider.id === id) return provider.prefix ?? null;
 	}
 	return null;

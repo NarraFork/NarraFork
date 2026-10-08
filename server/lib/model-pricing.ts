@@ -1,6 +1,7 @@
 /** Reference prices only: these amounts never configure or replace NUG billing. */
-import type { ModelMetadata, ResolvedModelMetadata } from "@shared/model-catalog/schema/catalog";
+
 import type { ReferencePricingSnapshot } from "@shared/agent-protocol/types";
+import type { ModelMetadata, ResolvedModelMetadata } from "@shared/model-catalog/schema/catalog";
 import { getEffectiveModelMetadata } from "./model-catalog";
 
 export type PriceField = "input" | "output" | "cacheRead" | "cacheWrite";
@@ -21,7 +22,9 @@ export function referencePriceNumber(value: unknown): number | null {
 }
 
 /** Clone and freeze the price-only boundary value; null is an explicit captured unknown. */
-export function cloneReferencePricingSnapshot(snapshot: ReferencePricingSnapshot): ReferencePricingSnapshot {
+export function cloneReferencePricingSnapshot(
+	snapshot: ReferencePricingSnapshot,
+): ReferencePricingSnapshot {
 	const copy = structuredClone(snapshot);
 	if (copy.referencePricing?.longContext) Object.freeze(copy.referencePricing.longContext);
 	if (copy.referencePricing) Object.freeze(copy.referencePricing);
@@ -38,13 +41,16 @@ export function captureReferencePricingSnapshot(model: string): ReferencePricing
 	});
 }
 
-export function pricingFromReferenceSnapshot(snapshot: ReferencePricingSnapshot):
-	(ModelPricing & Pick<ResolvedModelPricing, "longContext">) | null {
+export function pricingFromReferenceSnapshot(
+	snapshot: ReferencePricingSnapshot,
+): (ModelPricing & Pick<ResolvedModelPricing, "longContext">) | null {
 	const prices = snapshot.referencePricing;
 	if (!prices) return null;
 	return {
-		input: referencePriceNumber(prices.input), output: referencePriceNumber(prices.output),
-		cacheRead: referencePriceNumber(prices.cacheRead), cacheWrite: referencePriceNumber(prices.cacheWrite),
+		input: referencePriceNumber(prices.input),
+		output: referencePriceNumber(prices.output),
+		cacheRead: referencePriceNumber(prices.cacheRead),
+		cacheWrite: referencePriceNumber(prices.cacheWrite),
 		longContext: prices.longContext,
 	};
 }

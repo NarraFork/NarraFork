@@ -53,7 +53,12 @@ describe("nugAvailabilityPoller", () => {
 		// No matching provider config in settings → poll can't recover it; we only
 		// exercise the waiter lifecycle + abort here.
 		setNugCachedModels(providerId, [
-			{ id: "antigravity:claude-opus-4.6", channel: "antigravity", model: "claude-opus-4.6", available: false },
+			{
+				id: "antigravity:claude-opus-4.6",
+				channel: "antigravity",
+				model: "claude-opus-4.6",
+				available: false,
+			},
 		]);
 		const controller = new AbortController();
 		const promise = nugAvailabilityPoller.waitForModelAvailable({
@@ -95,7 +100,14 @@ describe("nugAvailabilityPoller", () => {
 		const providerId = "prov-avail-stale";
 		setNugCachedModels(
 			providerId,
-			[{ id: "antigravity:claude-opus-5", channel: "antigravity", model: "claude-opus-5", available: true }],
+			[
+				{
+					id: "antigravity:claude-opus-5",
+					channel: "antigravity",
+					model: "claude-opus-5",
+					available: true,
+				},
+			],
 			"sha256:pre-outage",
 		);
 
@@ -123,7 +135,12 @@ describe("nugAvailabilityPoller", () => {
 		// back without a restart.
 		const providerId = "prov-avail-refresh";
 		const models = [
-			{ id: "antigravity:claude-opus-5", channel: "antigravity", model: "claude-opus-5", available: true },
+			{
+				id: "antigravity:claude-opus-5",
+				channel: "antigravity",
+				model: "claude-opus-5",
+				available: true,
+			},
 		];
 		setNugCachedModels(providerId, models, "sha256:before");
 		expect(markNugCachedModelUnavailable(providerId, "antigravity:claude-opus-5")).toBe(true);
@@ -147,7 +164,11 @@ describe("nugAvailabilityPoller", () => {
 	test("marking an uncached model or provider is a no-op", () => {
 		expect(markNugCachedModelUnavailable("prov-absent", "antigravity:claude-opus-5")).toBe(false);
 		const providerId = "prov-avail-partial";
-		setNugCachedModels(providerId, [{ id: "antigravity:claude-opus-5", channel: "antigravity" }], "sha256:p");
+		setNugCachedModels(
+			providerId,
+			[{ id: "antigravity:claude-opus-5", channel: "antigravity" }],
+			"sha256:p",
+		);
 		expect(markNugCachedModelUnavailable(providerId, "antigravity:not-listed")).toBe(false);
 		expect(isNugCachedModelAvailable(providerId, "antigravity:not-listed")).toBeUndefined();
 	});

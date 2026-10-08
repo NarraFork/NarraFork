@@ -1,0 +1,1 @@
+ALTER TABLE `narrator_tool_calls` ADD `result_message_id` text;

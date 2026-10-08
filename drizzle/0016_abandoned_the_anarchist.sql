@@ -1,0 +1,1 @@
+ALTER TABLE `api_requests` ADD `raw_dump_json` text;

@@ -58,9 +58,7 @@ async function downloadAndExtract(pkgName: string, outPath: string): Promise<boo
 
 		// Decompress gzip
 		const ds = new DecompressionStream("gzip");
-		const decompressed = new Response(
-			new Blob([tarGz]).stream().pipeThrough(ds),
-		);
+		const decompressed = new Response(new Blob([tarGz]).stream().pipeThrough(ds));
 		const tarBuf = new Uint8Array(await decompressed.arrayBuffer());
 
 		// Simple tar extraction — find watcher.node in the tar

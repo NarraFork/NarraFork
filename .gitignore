@@ -4,12 +4,15 @@ dist/
 !shared/model-catalog/dist/
 shared/model-catalog/dist/*
 !shared/model-catalog/dist/catalog.json
-# Includes read-only migration-directory symlinks used by development worktrees.
-drizzle
-# NOTE: `drizzle-postgres/` is deliberately NOT ignored. The generated PG migration and its
-# meta/ snapshot are tracked so the PostgreSQL test suite runs in a fresh clone without a
-# generation step, matching the `!**/drizzle-postgres/**` entries in biome.json. The rule
-# above is scoped to the SQLite `drizzle/` directory only; do not widen it to a prefix glob.
+# SQLite migration history is required by fresh-clone tests and production upgrades.
+# Keep generated SQL, snapshots and journal; never publish local generation receipts/locks.
+drizzle/*
+!drizzle/*.sql
+!drizzle/meta/
+drizzle/meta/*
+!drizzle/meta/_journal.json
+!drizzle/meta/*_snapshot.json
+# PostgreSQL keeps its incremental SQL, journal and single current snapshot tracked too.
 
 frontend/routeTree.gen.ts
 server/generated/
@@ -86,6 +89,7 @@ drizzle-postgres/meta/_generation.lock/
 drizzle-postgres/meta/_generation_pending.json
 # Canonical SQLite schema generation must be reproducible in fresh clones.
 !scripts/generate-sqlite-migrations.ts
+!scripts/check-sqlite-migration-assets.ts
 !scripts/finalize-sqlite-resource-migration.ts
 !scripts/lib/__tests__/finalize-sqlite-resource-migration.test.ts
 !scripts/lib/__tests__/generate-sqlite-migrations.test.ts

@@ -396,3 +396,77 @@ describe("subagent transient-retry recovery notifies the parent", () => {
 		});
 	});
 });
+
+describe("runtime outcome distinguishes resource cleanup from user cancellation", () => {
+	for (const kind of ["primary", "subagent"] as const) {
+		for (const ending of ["success", "error", "interrupted"] as const) {
+			test(`${kind}: ${ending} retains its real outcome after cleanup`, async () => {
+				const prefix = "runtime_finalization";
+				const model = `${prefix}:gpt-5`;
+				settings.openaiProviders = [
+					{
+						id: prefix,
+						name: prefix,
+						prefix,
+						apiKey: "test-only",
+						baseUrl: "https://example.invalid/v1",
+						defaultModel: "gpt-5",
+						apiMode: "responses",
+					},
+				];
+				const id = kind === "primary" ? "retry-primary" : "retry-child";
+				const now = new Date().toISOString();
+				for (const target of ["retry-parent", id]) {
+					await db.insert(narrators).values({
+						id: target,
+						type: target === "retry-child" ? "subagent" : "primary",
+						variant: target === "retry-child" ? "subagent:general" : "primary",
+						parentNarratorId: target === "retry-child" ? "retry-parent" : null,
+						model,
+						autoContinuationOverride: "off",
+						cwd: process.env.HOME,
+						createdAt: now,
+						updatedAt: now,
+					});
+				}
+				const profile: RuntimeProfile =
+					kind === "primary"
+						? { kind }
+						: {
+								kind,
+								parentNarratorId: "retry-parent",
+								parentToolUseId: "origin-tool",
+								subagentType: "general",
+								systemPrompt: "finalization contract",
+								initialHistory: [],
+							};
+				const active = session(id, model, prefix);
+				activeNarrators.set(id, active);
+				const owner = tryClaimExecution(id, kind);
+				if (!owner) throw new Error("Missing finalization owner");
+				spyOn(executor, "executeAgentLoop").mockImplementation(async () => {
+					if (ending === "interrupted") active.abortController.abort();
+					return {
+						finalText: ending === "error" ? "provider failed" : "final response",
+						hasError: ending === "error",
+						interrupted: ending === "interrupted",
+						shouldUpdateTitle: false,
+						completedNaturally: ending === "success",
+						completedAssistantTurn: ending === "success",
+					};
+				});
+				const outcome = await runAgentLoopUnlocked(active, owner, "input", undefined, profile);
+				expect(outcome.started).toBe(true);
+				expect(outcome.allowInboxWake).toBe(ending === "success");
+				expect(outcome.aborted).toBe(ending === "interrupted");
+				expect(outcome.hasError).toBe(ending === "error");
+				if (kind === "primary") expect(active.abortController.signal.aborted).toBe(true);
+				if (ending === "success") expect(outcome.finalText).toBe("final response");
+				if (ending === "error") {
+					expect(outcome.finalText).toBe("provider failed");
+					expect((await narratorService.getById(id)).lastStopReason).toBe("error");
+				}
+			});
+		}
+	}
+});

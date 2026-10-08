@@ -1,0 +1,1 @@
+ALTER TABLE `device_transfer_tasks` ADD `alias` text;

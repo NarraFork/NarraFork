@@ -1,0 +1,1 @@
+ALTER TABLE `chapters` ADD `dock_layout_json` text;

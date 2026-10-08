@@ -1,0 +1,1 @@
+DROP INDEX `idx_credential_usage_totals_last_seen`;

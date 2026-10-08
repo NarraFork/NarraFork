@@ -61,7 +61,7 @@ import {
 	WORKSPACE_WRITE_COORDINATOR_LIMITS,
 	type WorkspaceRuntimeBinding,
 	WorkspaceWriteCoordinatorError,
-} from "./workspace-write-coordinator";
+} from "./workspace-lease-contract";
 
 import {
 	WORKSPACE_LEASE_LIMITS,

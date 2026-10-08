@@ -153,6 +153,7 @@ const { toolRegistry } = await import("../../lib/agent/tool-registry");
 const { agentLoop } = await import("../../lib/agent/loop");
 await import("../narrator-service");
 const { narratorPersistence } = await import("../narrator-persistence");
+const { handlePermission } = await import("../narrator-permission");
 const {
 	processEvent,
 	clearStreamingSnapshot,
@@ -160,7 +161,6 @@ const {
 	CriticalEventPersistenceError,
 } = await import("../narrator-event-handler");
 const { executeAgentLoop } = await import("../narrator-executor");
-const { handlePermission } = await import("../narrator-permission");
 toolRegistry.register({
 	name: "PublicationHold",
 	description: "Hold the first actual execution while the second tool is streamed",
@@ -184,7 +184,7 @@ function seed(subagent: boolean) {
 	for (const id of subagent ? ["parent", "child"] : ["main"]) {
 		sqlite
 			.prepare(
-				"INSERT INTO narrators (id, type, variant, parent_narrator_id, permission_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+"INSERT INTO narrators (id, type, variant, parent_narrator_id, permission_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				id,

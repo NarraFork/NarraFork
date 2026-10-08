@@ -21,8 +21,8 @@
  *   - no test here starts, stops, or contacts a running NarraFork (ports 7778/7779 are
  *     never bound; `server/main.ts` is never imported).
  */
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { describe, expect, spyOn, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { withPostgres } from "../../../tests/db/pg-test-harness";
@@ -51,6 +51,12 @@ const DB_MODULE = resolve(REPO_ROOT, "server/db/index.ts");
 const SECRET = "integration-secret-pw";
 
 type BootResult = { code: number; stdout: string; stderr: string };
+type BootChild = ReturnType<typeof Bun.spawn>;
+interface BootTestOptions {
+	/** Private test seam only: callers may shorten, never extend, the production fixture deadline. */
+	timeoutMs?: number;
+	onChild?: (child: BootChild, ownedHome: string) => void;
+}
 
 /**
  * Boot a subprocess against an isolated home with bounded output. The child never inherits
@@ -60,7 +66,11 @@ type BootResult = { code: number; stdout: string; stderr: string };
 async function bootSubprocess(
 	args: string[],
 	databaseEnv: Record<string, string>,
+	options: BootTestOptions = {},
 ): Promise<BootResult> {
+	const timeoutMs = options.timeoutMs ?? BOOT_TIMEOUT_MS;
+	if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > BOOT_TIMEOUT_MS)
+		throw new Error("Invalid shortened boot deadline");
 	const home = mkdtempSync(join(tmpdir(), "nf-pg-boot-"));
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(process.env)) {
@@ -70,13 +80,24 @@ async function bootSubprocess(
 	}
 	Object.assign(env, { NARRAFORK_HOME: home, NODE_ENV: "test" }, databaseEnv);
 
-	const child = Bun.spawn([process.execPath, ...args], {
-		cwd: REPO_ROOT,
-		env,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
+	let child: BootChild | undefined;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let terminationRequested = false;
+	const terminateOwnedChild = () => {
+		if (child && child.exitCode === null && !terminationRequested) {
+			terminationRequested = true;
+			child.kill("SIGKILL");
+		}
+	};
 	try {
+		const ownedChild = Bun.spawn([process.execPath, ...args], {
+			cwd: REPO_ROOT,
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		child = ownedChild;
+		options.onChild?.(ownedChild, home);
 		const readCapped = async (stream: ReadableStream<Uint8Array>, cap = 64 * 1024) => {
 			const reader = stream.getReader();
 			const chunks: Uint8Array[] = [];
@@ -85,7 +106,7 @@ async function bootSubprocess(
 				const { done, value } = await reader.read();
 				if (done) break;
 				if (length + value.byteLength > cap) {
-					child.kill("SIGKILL");
+					terminateOwnedChild();
 					throw new Error("subprocess output exceeded the cap");
 				}
 				length += value.byteLength;
@@ -99,19 +120,137 @@ async function bootSubprocess(
 			}
 			return new TextDecoder().decode(bytes);
 		};
-		const timeout = Bun.sleep(BOOT_TIMEOUT_MS).then(() => {
-			child.kill("SIGKILL");
-			throw new Error("subprocess boot timed out");
+		const timeout = new Promise<never>((_resolve, reject) => {
+			timer = setTimeout(() => {
+				try {
+					terminateOwnedChild();
+				} catch (error) {
+					reject(error);
+					return;
+				}
+				reject(new Error("subprocess boot timed out"));
+			}, timeoutMs);
 		});
-		const [code, stdout, stderr] = (await Promise.race([
-			Promise.all([child.exited, readCapped(child.stdout), readCapped(child.stderr)]),
+		const [code, stdout, stderr] = await Promise.race([
+			Promise.all([
+				ownedChild.exited,
+				readCapped(ownedChild.stdout),
+				readCapped(ownedChild.stderr),
+			]),
 			timeout,
-		])) as [number, string, string];
+		]);
 		return { code, stdout, stderr };
 	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+		if (child) {
+			terminateOwnedChild();
+			await child.exited;
+		}
+		// A failed/timeout reader must not remove the home while its owned child is live.
 		rmSync(home, { recursive: true, force: true });
 	}
 }
+
+describe("owned boot subprocess deadline lifecycle", () => {
+	const shortDeadlineMs = 500;
+	function observeChild() {
+		let child: BootChild | undefined;
+		let home: string | undefined;
+		let countKills = () => 0;
+		let restoreKill = () => {};
+		return {
+			options: {
+				timeoutMs: shortDeadlineMs,
+				onChild(ownedChild: BootChild, ownedHome: string) {
+					child = ownedChild;
+					home = ownedHome;
+					// Observe only this real child's method; no global Bun.spawn mock.
+					const kill = spyOn(ownedChild, "kill");
+					countKills = () => kill.mock.calls.length;
+					restoreKill = () => kill.mockRestore();
+				},
+			} satisfies BootTestOptions,
+			get() {
+				if (!child || !home) throw new Error("Missing owned boot child observation");
+				return { child, home, killCount: countKills() };
+			},
+			restore: () => restoreKill(),
+		};
+	}
+
+	test("a fast real child receives no late kill after its cancelled deadline", async () => {
+		const observed = observeChild();
+		try {
+			const result = await bootSubprocess(
+				["--eval", 'console.log("fast boot complete")'],
+				{},
+				observed.options,
+			);
+			expect(result.code).toBe(0);
+			expect(result.stdout.trim()).toBe("fast boot complete");
+			expect(result.stderr).toBe("");
+			// The former uncancelled Bun.sleep deadline would call this child's kill here.
+			await Bun.sleep(shortDeadlineMs + 150);
+			const receipt = observed.get();
+			expect(receipt.child.exitCode).toBe(0);
+			expect(receipt.killCount).toBe(0);
+			expect(existsSync(receipt.home)).toBe(false);
+		} finally {
+			observed.restore();
+		}
+	});
+
+	test("a real stalled child is killed and reaped before timeout cleanup deletes its home", async () => {
+		const observed = observeChild();
+		try {
+			let failure: unknown;
+			try {
+				await bootSubprocess(["--eval", "await Bun.sleep(60000)"], {}, observed.options);
+			} catch (error) {
+				failure = error;
+			}
+			if (!(failure instanceof Error)) throw new Error("Stalled boot did not reject");
+			expect(failure.message).toBe("subprocess boot timed out");
+			const receipt = observed.get();
+			expect(receipt.killCount).toBe(1);
+			// Signal termination leaves exitCode null; exited is the reaped numeric result.
+			const reapedCode = await receipt.child.exited;
+			expect(reapedCode).toBeNumber();
+			expect(reapedCode).not.toBe(0);
+			expect(existsSync(receipt.home)).toBe(false);
+		} finally {
+			observed.restore();
+		}
+	});
+
+	test("a real stdout cap error reaps its child and retires the pending deadline", async () => {
+		const observed = observeChild();
+		try {
+			let failure: unknown;
+			try {
+				await bootSubprocess(
+					["--eval", 'process.stdout.write("x".repeat(128 * 1024)); await Bun.sleep(60000)'],
+					{},
+					observed.options,
+				);
+			} catch (error) {
+				failure = error;
+			}
+			if (!(failure instanceof Error)) throw new Error("Oversized stdout did not reject");
+			expect(failure.message).toBe("subprocess output exceeded the cap");
+			await Bun.sleep(shortDeadlineMs + 150);
+			const receipt = observed.get();
+			expect(receipt.killCount).toBe(1);
+			// Signal termination leaves exitCode null; exited is the reaped numeric result.
+			const reapedCode = await receipt.child.exited;
+			expect(reapedCode).toBeNumber();
+			expect(reapedCode).not.toBe(0);
+			expect(existsSync(receipt.home)).toBe(false);
+		} finally {
+			observed.restore();
+		}
+	});
+});
 
 function postgresConfig(
 	port: number,

@@ -1177,12 +1177,12 @@ describe("mobile safe-area layout contract", () => {
 			safeArea,
 		] = await Promise.all([
 			Bun.file(new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url)).text(),
-		Bun.file(new URL("../routes/narrators/$narratorId.tsx", import.meta.url)).text(),
-		// The route file is a thin shell; the workspace surface (and its full-bleed
-		// branches) lives in WorkspacePage so the standalone window route can reuse it.
-		Bun.file(
-			new URL("../components/narrator/workspace/WorkspacePage.tsx", import.meta.url),
-		).text(),
+			Bun.file(new URL("../routes/narrators/$narratorId.tsx", import.meta.url)).text(),
+			// The route file is a thin shell; the workspace surface (and its full-bleed
+			// branches) lives in WorkspacePage so the standalone window route can reuse it.
+			Bun.file(
+				new URL("../components/narrator/workspace/WorkspacePage.tsx", import.meta.url),
+			).text(),
 			Bun.file(new URL("../routes/projects/$projectId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../components/terminal/TerminalPanel.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../components/narrator/NarratorPanel.tsx", import.meta.url)).text(),

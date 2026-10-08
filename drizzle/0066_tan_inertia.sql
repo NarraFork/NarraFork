@@ -1,0 +1,1 @@
+ALTER TABLE `narrators` ADD `tasks_reminder_interval_override` integer;

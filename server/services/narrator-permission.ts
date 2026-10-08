@@ -7,6 +7,7 @@ import type { ProgressSnapshot } from "@shared/progress-phase";
 import { and, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
+	fileChangeExecutionSegments,
 	integrationAuthorities,
 	integrationCapabilityGrants,
 	integrationResourceBindings,
@@ -4205,6 +4206,122 @@ function captureFinalOAuthAuthority(check: FinalToolPermissionCheck) {
 	}
 	return { authority, client, provenance, snapshot, grants, devices, bindings };
 }
+/** Server-owned audit metadata is not execution input, but only real Eval children may omit it. */
+function captureFinalInternalReadAuthority(call: {
+	id: string;
+	narratorId: string;
+	messageId: string;
+	toolUseId: string;
+	toolName: string;
+	attempt: number;
+	executionSegmentId: string | null;
+	persistedInput: string | null;
+}) {
+	if (call.toolName !== "Read") return null;
+	let input: Record<string, unknown> | undefined;
+	if (call.persistedInput !== null) {
+		try {
+			input = JSON.parse(call.persistedInput);
+		} catch {
+			finalPermissionDeny("invalid persisted input");
+		}
+	}
+	const internalId = /^internal_read_[A-Za-z0-9_-]{21}$/.test(call.toolUseId);
+	const hasMetadata = !!input && Object.hasOwn(input, "__internalRead");
+	if (!internalId && !hasMetadata) return null;
+	const metadata = input?.__internalRead;
+	if (
+		!internalId ||
+		!metadata ||
+		typeof metadata !== "object" ||
+		Array.isArray(metadata) ||
+		Object.keys(metadata).sort().join(",") !== "parentAttempt,parentToolCallId,sequence" ||
+		!("parentToolCallId" in metadata) ||
+		typeof metadata.parentToolCallId !== "string" ||
+		!("parentAttempt" in metadata) ||
+		!Number.isSafeInteger(metadata.parentAttempt) ||
+		(metadata.parentAttempt as number) < 1 ||
+		!("sequence" in metadata) ||
+		!Number.isSafeInteger(metadata.sequence) ||
+		(metadata.sequence as number) < 1 ||
+		!call.executionSegmentId
+	) {
+		finalPermissionDeny("untrusted internal Read audit metadata");
+	}
+	// Three indexed single-row reads, no parent input/output body and no unbounded lineage walk.
+	const childSegment = db
+		.select({
+			id: fileChangeExecutionSegments.id,
+			narratorId: fileChangeExecutionSegments.narratorId,
+			parentSegmentId: fileChangeExecutionSegments.parentSegmentId,
+			sourceToolCallId: fileChangeExecutionSegments.sourceToolCallId,
+			sourceExecutionAttempt: fileChangeExecutionSegments.sourceExecutionAttempt,
+		})
+		.from(fileChangeExecutionSegments)
+		.where(eq(fileChangeExecutionSegments.id, call.executionSegmentId))
+		.get();
+	const parent = db
+		.select({
+			id: narratorToolCalls.id,
+			narratorId: narratorToolCalls.narratorId,
+			messageId: narratorToolCalls.messageId,
+			toolName: narratorToolCalls.toolName,
+			attempt: narratorToolCalls.executionAttempt,
+			version: narratorToolCalls.executionIdentityVersion,
+			origin: narratorToolCalls.executionOriginToolCallId,
+			executionSegmentId: narratorToolCalls.executionSegmentId,
+			status: narratorToolCalls.status,
+			startedAt: narratorToolCalls.executionStartedAt,
+			operationId: narratorToolCalls.fileChangeOperationId,
+			decidedBy: narratorToolCalls.permissionDecidedBy,
+			decidedAt: narratorToolCalls.permissionDecidedAt,
+		})
+		.from(narratorToolCalls)
+		.where(eq(narratorToolCalls.id, metadata.parentToolCallId))
+		.get();
+	if (
+		!childSegment ||
+		childSegment.narratorId !== call.narratorId ||
+		childSegment.sourceToolCallId !== call.id ||
+		childSegment.sourceExecutionAttempt !== call.attempt ||
+		!parent ||
+		parent.narratorId !== call.narratorId ||
+		parent.messageId !== call.messageId ||
+		parent.toolName !== "Eval" ||
+		parent.attempt !== metadata.parentAttempt ||
+		parent.version !== 1 ||
+		parent.origin !== null ||
+		parent.status !== "running" ||
+		!parent.startedAt ||
+		parent.operationId !== null ||
+		!parent.decidedAt ||
+		!["auto", "user", "reflection"].includes(parent.decidedBy ?? "") ||
+		!parent.executionSegmentId ||
+		childSegment.parentSegmentId !== parent.executionSegmentId
+	) {
+		finalPermissionDeny("internal Read parent execution receipt is stale or untrusted");
+	}
+	const parentSegment = db
+		.select({
+			id: fileChangeExecutionSegments.id,
+			narratorId: fileChangeExecutionSegments.narratorId,
+			sourceToolCallId: fileChangeExecutionSegments.sourceToolCallId,
+			sourceExecutionAttempt: fileChangeExecutionSegments.sourceExecutionAttempt,
+		})
+		.from(fileChangeExecutionSegments)
+		.where(eq(fileChangeExecutionSegments.id, parent.executionSegmentId))
+		.get();
+	if (
+		!parentSegment ||
+		parentSegment.narratorId !== call.narratorId ||
+		parentSegment.sourceToolCallId !== parent.id ||
+		parentSegment.sourceExecutionAttempt !== parent.attempt
+	) {
+		finalPermissionDeny("internal Read parent segment does not prove the Eval attempt");
+	}
+	// Recapture this whole receipt on every synchronous final fence assertion.
+	return { metadata, childSegment, parent, parentSegment };
+}
 function finalPermissionSnapshot(check: FinalToolPermissionCheck) {
 	const narrator = db
 		.select({
@@ -4229,8 +4346,10 @@ function finalPermissionSnapshot(check: FinalToolPermissionCheck) {
 		.select({
 			id: narratorToolCalls.id,
 			narratorId: narratorToolCalls.narratorId,
+			messageId: narratorToolCalls.messageId,
 			toolUseId: narratorToolCalls.toolUseId,
 			toolName: narratorToolCalls.toolName,
+			executionSegmentId: narratorToolCalls.executionSegmentId,
 			attempt: narratorToolCalls.executionAttempt,
 			version: narratorToolCalls.executionIdentityVersion,
 			origin: narratorToolCalls.executionOriginToolCallId,
@@ -4277,13 +4396,14 @@ function finalPermissionSnapshot(check: FinalToolPermissionCheck) {
 	) {
 		finalPermissionDeny("the exact tool attempt has no persisted approval");
 	}
+	const internalReadAuthority = captureFinalInternalReadAuthority(call);
 	const policy = executionPolicyRepository.loadNow(check.narratorId);
 	const policyRevision = executionPolicyRevision(policy);
 	const oauthAuthority = captureFinalOAuthAuthority(check);
 	const revision = createHash("sha256")
-		.update(stableJson({ narrator, call, policyRevision, oauthAuthority }))
+		.update(stableJson({ narrator, call, internalReadAuthority, policyRevision, oauthAuthority }))
 		.digest("hex");
-	return { narrator, call, policy, policyRevision, revision };
+	return { narrator, call, internalReadAuthority, policy, policyRevision, revision };
 }
 
 /** Read-only authorization gate. It never prompts, writes permission decisions or consumes receipts. */
@@ -4384,6 +4504,11 @@ export async function recheckFinalToolExecutionPermission(
 			persisted = JSON.parse(before.call.persistedInput);
 		} catch {
 			finalPermissionDeny("invalid persisted input");
+		}
+		if (before.internalReadAuthority) {
+			// Only the authenticated server audit field is omitted; every execution field stays bound.
+			const { __internalRead: _audit, ...executionInput } = persisted as Record<string, unknown>;
+			persisted = executionInput;
 		}
 		if (stableJson(persisted) !== stableJson(check.input))
 			finalPermissionDeny("approved input changed");

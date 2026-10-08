@@ -64,7 +64,10 @@ export function sourceMetadata(value: unknown): unknown {
 		return value;
 	const metadata: Record<string, Record<string, unknown>> = {};
 	const set = (group: string, field: string, source: string) => {
-		if (Object.hasOwn(raw, source)) (metadata[group] ??= {})[field] = raw[source];
+		if (Object.hasOwn(raw, source)) {
+			metadata[group] ??= {};
+			metadata[group][field] = raw[source];
+		}
 	};
 	set("limits", "contextWindow", "max_input_tokens");
 	set("limits", "maxOutputTokens", "max_output_tokens");
@@ -78,8 +81,10 @@ export function sourceMetadata(value: unknown): unknown {
 		delete metadata.limits!.contextWindow;
 	set("modalities", "input", "supported_modalities");
 	set("modalities", "output", "supported_output_modalities");
-	if (!("supported_modalities" in raw) && raw.supports_vision === true)
-		(metadata.modalities ??= {}).input = ["text", "image"];
+	if (!("supported_modalities" in raw) && raw.supports_vision === true) {
+		metadata.modalities ??= {};
+		metadata.modalities.input = ["text", "image"];
+	}
 	set("nativeSearch", "supported", "supports_web_search");
 	set("reasoning", "supported", "supports_reasoning");
 	set("reasoning", "mode", "reasoning_mode");
@@ -88,7 +93,10 @@ export function sourceMetadata(value: unknown): unknown {
 	set("reasoning", "canDisable", "supports_none_reasoning_effort");
 	set("reasoning", "canDisable", "can_disable_reasoning");
 	for (const [field, key] of Object.entries(sourcePrices)) {
-		if (Object.hasOwn(raw, key)) (metadata.referencePricing ??= {})[field] = sourcePrice(raw[key]);
+		if (Object.hasOwn(raw, key)) {
+			metadata.referencePricing ??= {};
+			metadata.referencePricing[field] = sourcePrice(raw[key]);
+		}
 	}
 	if (metadata.referencePricing)
 		Object.assign(metadata.referencePricing, { currency: "USD", unit: "perMillionTokens" });
@@ -137,10 +145,13 @@ export function sourceMetadata(value: unknown): unknown {
 					field === "output" ? outputMultiplier : inputMultiplier,
 				);
 		}
-		(metadata.referencePricing ??= {}).longContext = tier;
+		metadata.referencePricing ??= {};
+		metadata.referencePricing.longContext = tier;
 	}
-	if (Object.hasOwn(raw, "reference_pricing_long_context"))
-		(metadata.referencePricing ??= {}).longContext = raw.reference_pricing_long_context;
+	if (Object.hasOwn(raw, "reference_pricing_long_context")) {
+		metadata.referencePricing ??= {};
+		metadata.referencePricing.longContext = raw.reference_pricing_long_context;
+	}
 	return metadata;
 }
 export function catalogFromModelFiles(

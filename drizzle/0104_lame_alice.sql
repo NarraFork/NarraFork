@@ -1,0 +1,1 @@
+ALTER TABLE `narrators` ADD `fast_mode_override` text DEFAULT 'inherit' NOT NULL;

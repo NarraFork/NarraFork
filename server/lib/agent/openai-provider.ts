@@ -4,7 +4,10 @@ import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-sou
 import { outputToText } from "@shared/agent-protocol/tool-output";
 import { modelTextFromContentBlocks } from "@shared/native-injection";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
-import { mapGenericReasoningEffort } from "@shared/reasoning-effort-support";
+import {
+	mapGenericReasoningEffort,
+	modelAcceptsReasoningEffort,
+} from "@shared/reasoning-effort-support";
 import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
 import { applyProxyExemptions, resolveProxyForUrl } from "../net/proxy";
@@ -289,6 +292,7 @@ function applyGenericReasoningEffort(
 	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort);
 	if (!reasoningEffort) return;
 	const bareModel = parseModelId(model).model;
+	const acceptsEffort = modelAcceptsReasoningEffort(bareModel, getReasoningEffortBlocklist());
 
 	// DeepSeek keeps its own wire shape (thinking block + two effective tiers).
 	if (!usesResponsesEndpoint(apiMode) && isDeepSeekModel(bareModel)) {
@@ -298,10 +302,11 @@ function applyGenericReasoningEffort(
 		}
 		body.thinking = { type: "enabled" };
 		const effort = mapDeepSeekEffort(reasoningEffort);
-		if (effort) body.reasoning_effort = effort;
+		if (effort && acceptsEffort) body.reasoning_effort = effort;
 		return;
 	}
 
+	if (!acceptsEffort) return;
 	const effort = metadata.reasoning?.levels?.length
 		? reasoningEffort
 		: mapGenericReasoningEffort(bareModel, reasoningEffort, getReasoningEffortBlocklist());

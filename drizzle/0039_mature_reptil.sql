@@ -1,0 +1,2 @@
+ALTER TABLE `narrators` ADD `plan_reflection_auto_approve_override` text DEFAULT 'inherit' NOT NULL;--> statement-breakpoint
+ALTER TABLE `narrators` ADD `danger_reflection_override` text DEFAULT 'inherit' NOT NULL;

@@ -16,7 +16,7 @@ import { narrators } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
 /** Frames the service pushed, in order, so version continuity is observable. */
 const broadcasts: Array<{ narratorId: string; message: Record<string, unknown> }> = [];
@@ -46,6 +46,36 @@ const {
 const { BACKGROUND_TASK_LIST_OUTPUT_PREVIEW_CHARS, BACKGROUND_TASK_LIST_PAGE_SIZE } = await import(
 	"@shared/background-task-list"
 );
+const { getRuntimePublicationService, runtimePublication } = await import(
+	"../agent-runtime/publication"
+);
+const { wakeInboxIfEligible, runtimeInbox, claimInboxHead, inboxClaim } = await import(
+	"../agent-runtime/inbox"
+);
+const { tryClaimExecution } = await import("../agent-runtime/ownership");
+const { projectPendingInjection } = await import("../parent-injection-queue");
+const publicationWakes = new Set<string>();
+async function consumeTerminal(taskId: string, expectedPendingSource = false) {
+	const result = await backgroundTaskService.waitForCompletion(taskId, 100);
+	expect(result.terminalResultReceived).toBe(true);
+	if (!result.publicationRun) throw new Error("Missing terminal publication run");
+	await getRuntimePublicationService().consumeAwaitedTerminal(result.publicationRun);
+	expect(
+		sqlite
+			.query(
+				"SELECT task_id, logical_run_id, recipient_id FROM runtime_awaited_terminal_consumptions WHERE task_id = ? AND logical_run_id = ? AND recipient_id = ?",
+			)
+			.get(taskId, result.publicationRun.logicalRunId, result.publicationRun.recipientId),
+	).toEqual({
+		task_id: taskId,
+		logical_run_id: result.publicationRun.logicalRunId,
+		recipient_id: result.publicationRun.recipientId,
+	});
+	expect(await getRuntimePublicationService().hasPendingSource(result.publicationRun)).toBe(
+		expectedPendingSource,
+	);
+	return result.publicationRun;
+}
 const { narratorRoutes } = await import("../../routes/narrators");
 const app = new Hono();
 app.use("*", async (c, next) => {
@@ -55,6 +85,10 @@ app.use("*", async (c, next) => {
 app.route("/api/narrators", narratorRoutes);
 
 afterAll(() => {
+	runtimePublication.stop();
+	runtimePublication.setWake(async (narratorId) => {
+		await wakeInboxIfEligible(narratorId);
+	});
 	mock.module("../../db", () => realDbModule);
 	mock.module("../../websocket/narrator-ws", () => realNarratorWs);
 	mock.module("../narrator-session", () => realNarratorSession);
@@ -62,6 +96,12 @@ afterAll(() => {
 });
 
 beforeEach(() => {
+	// List/delta tests have no configured model. Keep durable delivery real, but
+	// observe the production wake seam instead of accidentally starting an AI loop.
+	publicationWakes.clear();
+	runtimePublication.setWake((recipientId) => {
+		publicationWakes.add(recipientId);
+	});
 	broadcasts.length = 0;
 	liveLoops.clear();
 	backgroundTaskService.resetListVersionsForTests();
@@ -69,6 +109,8 @@ beforeEach(() => {
 
 afterEach(() => {
 	cleanDb(sqlite);
+	// An emptied case cannot leave an outbox page cursor positioned in the next case.
+	runtimePublication.flushPage();
 });
 
 const PARENT = "list-parent";
@@ -396,12 +438,17 @@ describe("background task list row size", () => {
 			);
 			// The true size is still reported, so the UI can offer the full text.
 			expect(task.outputBytes).toBeGreaterThanOrEqual(40_000);
-			expect(task.outputPreviewTruncated).toBe(true);
+			// Legacy full rows need list slicing; Bash already spilled at 5120 bytes.
+			expect(task.outputPreviewTruncated).toBe(task.id === "big-legacy");
+			if (task.id === "big-unified") {
+				expect(task.output).not.toContain(huge);
+				expect(task.output).toContain("file");
+			}
 		}
-		// `outputTruncated` is a different claim — bytes lost at STORAGE time (the
-		// 512 KB cap). 40 KB is nowhere near it, so conflating the two flags would
-		// tell the user the full text is unrecoverable when it is one request away.
-		expect(page.tasks.every((t) => t.outputTruncated === false)).toBe(true);
+		// Storage projection is shortened for a spilled Bash result, independently
+		// of list-preview slicing. Legacy 40KB output is only sliced at list time.
+		expect(page.tasks.find((task) => task.id === "big-unified")?.outputTruncated).toBe(true);
+		expect(page.tasks.find((task) => task.id === "big-legacy")?.outputTruncated).toBe(false);
 	});
 
 	// Every background subagent alive TODAY writes both records under one id:
@@ -1094,6 +1141,9 @@ describe("background task list deltas", () => {
 		await flushDeltas();
 		broadcasts.length = 0;
 
+		// Unconsumed terminal publication must prevent premature deletion.
+		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(0);
+		await consumeTerminal("reap-1");
 		// olderThanMs: -1 makes every completed row older than the cutoff.
 		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(1);
 		await flushDeltas();
@@ -1109,15 +1159,98 @@ describe("background task list deltas", () => {
 			const id = `bulk-${String(i).padStart(2, "0")}`;
 			await seedBashTaskAt(id, `2026-08-01T00:00:${String(i).padStart(2, "0")}.000Z`, "done");
 		}
+		// Explicitly transfer across bounded publication pages before Await consumption.
+		// This pins the formerly timing-dependent delivery phase without starting a model.
+		for (let page = 0; page < 3; page++)
+			await getRuntimePublicationService().flushRecipient(PARENT);
+		expect(
+			sqlite
+				.query(
+					"SELECT state, count(*) AS count FROM narrator_buffered_messages WHERE narrator_id = ? AND kind = 'task_notice' GROUP BY state",
+				)
+				.all(PARENT),
+		).toEqual([{ state: "queued", count: 60 }]);
+		expect(publicationWakes.has(PARENT)).toBe(true);
 		await flushDeltas();
 		broadcasts.length = 0;
 
+		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(0);
+		for (let i = 0; i < 60; i++) await consumeTerminal(`bulk-${String(i).padStart(2, "0")}`);
+		expect(
+			sqlite.query("SELECT count(*) AS count FROM runtime_awaited_terminal_consumptions").get(),
+		).toEqual({ count: 60 });
+		expect(
+			sqlite
+				.query(
+					"SELECT state, count(*) AS count FROM narrator_buffered_messages WHERE narrator_id = ? AND kind = 'task_notice' GROUP BY state ORDER BY state",
+				)
+				.all(PARENT),
+		).toEqual([{ state: "cancelled", count: 60 }]);
+		expect(
+			sqlite
+				.query(
+					"SELECT count(*) AS count FROM narrator_buffered_messages WHERE narrator_id = ? AND state = 'materialized' AND adopted_at IS NULL",
+				)
+				.get(PARENT),
+		).toEqual({ count: 0 });
 		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(60);
 		await flushDeltas();
 
 		const delta = listDeltas().at(-1);
 		expect(delta?.invalidate).toBe(true);
 		expect(delta?.removeIds).toBeUndefined();
+	});
+
+	test("Await consumption cannot reap a materialized notice until its real adoption receipt", async () => {
+		await seedParent();
+		const taskId = "materialized-retention";
+		await seedBashTaskAt(taskId, "2026-08-02T00:00:00.000Z", "done");
+		await getRuntimePublicationService().flushRecipient(PARENT);
+		const owner = tryClaimExecution(PARENT, "primary");
+		if (!owner) throw new Error("Cannot claim isolated notice consumer");
+		try {
+			const row = await claimInboxHead(PARENT, (candidate) => candidate.kind === "task_notice");
+			if (!row) throw new Error("No real task notice delivered");
+			await realNarratorSession.deliverPendingInjection(PARENT, "en", "idle", "none", {
+				...projectPendingInjection(row),
+				mailboxClaim: inboxClaim(row),
+				recipientMessageId: row.recipientMessageId ?? undefined,
+			});
+			const persisted = sqlite
+				.query(
+					"SELECT delivery_id, recipient_ref_id, content_revision, state, adopted_at FROM narrator_buffered_messages WHERE id = ?",
+				)
+				.get(row.id) as {
+				delivery_id: string | null;
+				recipient_ref_id: string | null;
+				content_revision: number;
+				state: string;
+				adopted_at: string | null;
+			};
+			expect(persisted).toMatchObject({ state: "materialized", adopted_at: null });
+			const run = await consumeTerminal(taskId, true);
+			expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(0);
+			expect(await backgroundTaskService.getById(taskId)).not.toBeNull();
+			if (!persisted.delivery_id || !persisted.recipient_ref_id)
+				throw new Error("Missing durable materialization receipt");
+			expect(
+				await runtimeInbox.ackAdopted(
+					persisted.delivery_id,
+					PARENT,
+					persisted.recipient_ref_id,
+					persisted.content_revision,
+				),
+			).toBe(true);
+			expect(await getRuntimePublicationService().hasPendingSource(run)).toBe(false);
+			expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(1);
+			expect(
+				sqlite
+					.query("SELECT injection_consumed_at FROM narrator_message_refs WHERE id = ?")
+					.get(persisted.recipient_ref_id),
+			).toMatchObject({ injection_consumed_at: expect.any(Number) });
+		} finally {
+			owner.release();
+		}
 	});
 
 	test("restart recovery invalidates rather than upserting each rewritten row", async () => {

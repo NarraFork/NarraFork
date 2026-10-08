@@ -1,0 +1,1 @@
+ALTER TABLE `narrator_sidecars` ADD `body_json` text;

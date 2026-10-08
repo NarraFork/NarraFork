@@ -1,0 +1,1 @@
+ALTER TABLE `user_preferences` ADD `narrator_line_height_scale_percent` integer DEFAULT 100 NOT NULL;

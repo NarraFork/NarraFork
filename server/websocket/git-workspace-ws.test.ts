@@ -1,12 +1,31 @@
 import { afterAll, afterEach, expect, mock, test } from "bun:test";
 import type { GitWorkspaceCategory } from "@shared/git-workspace-events";
+import { posixPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
+
+async function waitForState(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+	const deadline = performance.now() + timeoutMs;
+	while (!predicate()) {
+		if (performance.now() >= deadline)
+			throw new Error("Timed out waiting for observable Git watch state");
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+	}
+}
+
 import type { GitWorkspaceTarget } from "../services/git-workspace";
 
 const accessModule = await import("../services/git-workspace-access");
 const watchModule = await import("../services/git-workspace-watch");
 const managementModule = await import("../services/git-management-service");
-const realPool = new watchModule.GitWorkspaceWatchPool(watchModule.probeGitWatch, 5);
+const completedSamples: Array<{ generation: number; worktree?: string }> = [];
+const realPool = new watchModule.GitWorkspaceWatchPool(async (target, signal) => {
+	const sample = await watchModule.probeGitWatch(target, signal);
+	completedSamples.push({
+		generation: target.backend?.runtimeGeneration ?? 0,
+		worktree: sample.fingerprints.worktree,
+	});
+	return sample;
+}, 5);
 let integrationTarget: GitWorkspaceTarget | undefined;
 const integrationCallbacks = new Set<(categories: GitWorkspaceCategory[]) => Promise<void>>();
 let denied = false;
@@ -83,6 +102,7 @@ afterEach(() => {
 	hold = undefined;
 	integrationTarget = undefined;
 	integrationCallbacks.clear();
+	completedSamples.length = 0;
 	frames.length = 0;
 	stops = 0;
 });
@@ -152,7 +172,12 @@ test("temporary device outage retries the subscription without browser polling",
 	expect(frames.map((frame) => frame.type)).toEqual(["git_workspace_subscribed"]);
 	expect(stops).toBe(1);
 	failure = undefined;
-	await new Promise((resolve) => setTimeout(resolve, 3100));
+	await waitForState(
+		() =>
+			frames.filter((frame) => frame.type === "git_workspace_subscribed").length === 2 &&
+			frames.at(-1)?.type === "git_workspace_changed",
+		4000,
+	);
 	expect(frames.filter((frame) => frame.type === "git_workspace_subscribed")).toHaveLength(2);
 	expect(frames.at(-1)?.type).toBe("git_workspace_changed");
 }, 10_000);
@@ -181,6 +206,9 @@ test("two sockets rebind a real shared watch pool after a generation change with
 			},
 			backend: {
 				kind: "remote",
+				deviceId: "remote",
+				pathFlavor: "posix",
+				paths: posixPathSemantics,
 				runtimeGeneration: boundGeneration,
 				supportsGitWorkspaceWatch: true,
 				gitWorkspace: async () => {
@@ -192,10 +220,15 @@ test("two sockets rebind a real shared watch pool after a generation change with
 		} as unknown as GitWorkspaceTarget;
 	};
 	integrationTarget = makeTarget();
+	let disposedCallbacks: Array<(categories: GitWorkspaceCategory[]) => Promise<void>> = [];
 	try {
 		await handleGitWorkspaceMessage(ws, message);
 		await handleGitWorkspaceMessage(other, message);
-		await Bun.sleep(20);
+		await waitForState(
+			() =>
+				integrationCallbacks.size === 2 &&
+				completedSamples.filter((sample) => sample.generation === 1).length >= 2,
+		);
 		expect(integrationCallbacks.size).toBe(2);
 		generation = 2;
 		integrationTarget = makeTarget();
@@ -203,7 +236,15 @@ test("two sockets rebind a real shared watch pool after a generation change with
 		// fresh A / stop B / subscribe fresh B, while the pool remains shared.
 		await Promise.all([...integrationCallbacks].map((callback) => callback(["worktree"])));
 		const before = rpcGenerations.length;
-		await Bun.sleep(30);
+		await waitForState(
+			() =>
+				completedSamples.filter((sample) => sample.generation === 2).length >= 2 &&
+				rpcGenerations.length > before &&
+				[frames, otherFrames].every(
+					(messages) =>
+						messages.filter((frame) => frame.type === "git_workspace_subscribed").length === 2,
+				),
+		);
 		expect(rpcGenerations.length).toBeGreaterThan(before);
 		expect(rpcGenerations.slice(before).every((value) => value === 2)).toBe(true);
 		for (const messages of [frames, otherFrames]) {
@@ -212,16 +253,27 @@ test("two sockets rebind a real shared watch pool after a generation change with
 			messages.length = 0;
 		}
 		content = "edited after reconnect";
-		await Bun.sleep(30);
+		await waitForState(
+			() =>
+				frames.some((frame) => frame.type === "git_workspace_changed") &&
+				otherFrames.some((frame) => frame.type === "git_workspace_changed"),
+		);
 		expect(frames.some((frame) => frame.type === "git_workspace_changed")).toBe(true);
 		expect(otherFrames.some((frame) => frame.type === "git_workspace_changed")).toBe(true);
+		disposedCallbacks = [...integrationCallbacks];
 	} finally {
 		releaseGitWorkspaceSubscriptions(ws);
 		releaseGitWorkspaceSubscriptions(other);
 	}
+	await waitForState(() => integrationCallbacks.size === 0);
 	const before = rpcGenerations.length;
-	await Bun.sleep(20);
+	const beforeAuthorization = authorizations;
+	const beforeFrames = JSON.stringify([frames, otherFrames]);
+	await Promise.all(disposedCallbacks.map((callback) => callback(["worktree"])));
+	await new Promise<void>((resolve) => setImmediate(resolve));
 	expect(rpcGenerations).toHaveLength(before);
+	expect(authorizations).toBe(beforeAuthorization);
+	expect(JSON.stringify([frames, otherFrames])).toBe(beforeFrames);
 });
 
 test("backpressure closes the socket instead of silently losing its only change", async () => {

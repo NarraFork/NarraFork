@@ -18,13 +18,13 @@ describe("utf8Bytes", () => {
 		}
 	});
 
-	test("matches the encoder on a LONE surrogate, which Buffer.byteLength under-reports", () => {
-		// Bun 1.3 charges a lone surrogate 2 bytes while every encoder writes the 3-byte
-		// U+FFFD replacement. Under-reporting is the dangerous direction: it admits more
-		// than the ceiling allows.
-		expect(Buffer.byteLength("\ud83d", "utf8")).toBe(2);
+	test("charges the encoded replacement bytes for a lone surrogate on every runtime", () => {
+		// Older Bun versions under-reported Buffer.byteLength here. The budget must
+		// match the actual encoder whether or not the runtime still has that bug.
 		expect(encodedBytes("\ud83d")).toBe(3);
 		expect(utf8Bytes("\ud83d")).toBe(3);
+		expect(withinUtf8Budget("\ud83d", 2)).toBe(false);
+		expect(withinUtf8Budget("\ud83d", 3)).toBe(true);
 
 		for (const value of ["\udc00", "a\ud83db", "\ud83d".repeat(3)]) {
 			expect(utf8Bytes(value)).toBe(encodedBytes(value));

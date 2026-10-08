@@ -41,7 +41,7 @@ function put(overrides: Partial<Parameters<typeof putStash>[0]> = {}) {
 describe("put and read", () => {
 	test("returns a handle and the range's own metadata", () => {
 		const entry = put();
-		expect(entry.handle).toMatch(/^stash_\w{8}$/);
+		expect(entry.handle).toMatch(/^stash_[A-Za-z0-9_-]{8}$/);
 		expect(entry.filePath).toBe("src.ts");
 		expect(entry.startLine).toBe(10);
 		expect(entry.endLine).toBe(11);

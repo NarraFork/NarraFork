@@ -1220,6 +1220,8 @@ describe("detached eager tool results after interruption", () => {
 					signal: ac.signal,
 					requireToolCallBinding: true,
 					onToolExecutionStarting: async (_id, binding) => binding,
+					// Observer-order fixture has no DB actor; real authorization is covered separately.
+					onToolExecutionFinalAuthorization: async () => ({ assertStillCurrent() {} }),
 					onToolExecutionAfter: async ({ toolUse, result }) => {
 						if (toolUse.toolUseId !== "write") return;
 						expect(result?.output).toBe("ok:write");
@@ -1275,6 +1277,8 @@ describe("detached eager tool results after interruption", () => {
 						signal: ac.signal,
 						requireToolCallBinding: true,
 						onToolExecutionStarting: async (_id, binding) => binding,
+						// Observer-order fixture has no DB actor; real authorization is covered separately.
+						onToolExecutionFinalAuthorization: async () => ({ assertStillCurrent() {} }),
 						onDetachedToolResult: async (event) => {
 							detached.push(event);
 							persisted.resolve();

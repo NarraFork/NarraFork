@@ -1,0 +1,1 @@
+ALTER TABLE `narrator_tool_calls` ADD `is_file_history_checkpoint` integer DEFAULT false NOT NULL;

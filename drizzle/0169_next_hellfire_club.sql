@@ -1,0 +1,1 @@
+ALTER TABLE `narrator_questions` ADD `execution_principal_json` text;

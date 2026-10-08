@@ -36,6 +36,10 @@
 			var m;
 			var o = localStorage.getItem("narrafork_oled") === "true";
 			var tc;
+			var bn;
+			var bc;
+			var fi;
+			var ati;
 			try {
 				if (d === "light" || d === "dark") {
 					m = d;
@@ -63,15 +67,15 @@
 				they are asserted to match in tests/frontend/branding-boot.test.ts.
 			*/
 			try {
-				var bn = localStorage.getItem("narrafork_brand_name");
+				bn = localStorage.getItem("narrafork_brand_name");
 				if (bn) document.title = bn;
-				var bc = localStorage.getItem("narrafork_brand_icon_color");
+				bc = localStorage.getItem("narrafork_brand_icon_color");
 				// The mirror only holds a colour when it differs from the default, so its
 				// mere presence means the recolouring endpoints are worth requesting.
 				if (bc) {
-					var fi = document.querySelector('link[rel="icon"]');
+					fi = document.querySelector('link[rel="icon"]');
 					if (fi) fi.setAttribute("href", "api/branding/favicon.svg");
-					var ati = document.querySelector('link[rel="apple-touch-icon"]');
+					ati = document.querySelector('link[rel="apple-touch-icon"]');
 					if (ati) ati.setAttribute("href", "api/branding/apple-touch-icon.png");
 				}
 			} catch (_e) {}

@@ -1,29 +1,27 @@
-import { Database } from "bun:sqlite";
-import { afterAll, describe, expect, it, mock } from "bun:test";
-import { drizzle } from "drizzle-orm/bun-sqlite";
-import * as relations from "../../../server/db/relations";
-import * as schema from "../../../server/db/schema";
+import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
+import { cleanDb, getTestDb } from "../../setup";
 
-// narrator-session.ts touches the db module at import time via its dependency
-// graph, so provide an in-memory stub before importing (mirrors narrator-tool-rerun).
-// The function under test is pure and does not hit the DB.
-const sqlite = new Database(":memory:");
-const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
+// The function is pure, but its import graph initializes the durable runtime outbox.
+// Use the full migration fixture rather than an empty handle that cannot load the module.
+const { db, sqlite } = getTestDb();
 // Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
 const realDbModule = { ...(await import("../../../server/db")) };
-mock.module("../../../server/db", () => ({ db, sqlite }));
+mock.module("../../../server/db", () => ({ ...realDbModule, db, sqlite }));
 
 const { resolveRetryTarget } = await import("../../../server/services/narrator-session");
 
+afterEach(() => cleanDb(sqlite));
 afterAll(() => {
 	mock.module("../../../server/db", () => realDbModule);
 	mock.restore();
+	sqlite.close();
 });
 
 interface Msg {
 	id: string;
 	role: string;
 	contentJson?: unknown;
+	contentText?: string | null;
 	toolCalls?: Array<unknown> | null;
 }
 
@@ -81,10 +79,72 @@ describe("resolveRetryTarget", () => {
 		expect(result.target === null && result.reason).toBe("not_user");
 	});
 
-	it("contentJson 非数组（null/未初始化）且无工具调用时视为占位行", () => {
-		const nullContent: Msg = { id: "a1", role: "assistant", contentJson: null, toolCalls: null };
-		const result = resolveRetryTarget([user("u1"), nullContent]);
+	for (const contentJson of [null, undefined, { text: "unrecognized persisted output" }]) {
+		it(`contentJson 非数组（${contentJson === null ? "null" : contentJson === undefined ? "未初始化" : "未知结构"}）不得被当作空占位行删除`, () => {
+			const now = "2026-01-01T00:00:00.000Z";
+			sqlite
+				.prepare(
+					"INSERT INTO narrators (id, message_version, created_at, updated_at) VALUES ('n1', 7, ?, ?)",
+				)
+				.run(now, now);
+			sqlite
+				.prepare(
+					"INSERT INTO narrator_messages (id, narrator_id, role, content_json, content_text, created_at) VALUES ('u1', 'n1', 'user', ?, 'hi', ?)",
+				)
+				.run(JSON.stringify(user("u1").contentJson), now);
+			sqlite
+				.prepare(
+					"INSERT INTO narrator_messages (id, narrator_id, role, content_json, created_at) VALUES ('a1', 'n1', 'assistant', ?, ?)",
+				)
+				.run(JSON.stringify(contentJson ?? null), now);
+			sqlite.run(
+				"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES ('ref-u1', 'n1', 'u1', 0), ('ref-a1', 'n1', 'a1', 1)",
+			);
+			sqlite
+				.prepare(
+					"INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, status, output_json, created_at) VALUES ('audit', 'n1', 'a1', 'audit-use', 'Read', 'success', ?, ?)",
+				)
+				.run(JSON.stringify({ output: "must preserve completed tool output" }), now);
+			const snapshot = () => ({
+				messages: sqlite
+					.query("SELECT id, content_json, content_text FROM narrator_messages ORDER BY id")
+					.all(),
+				refs: sqlite
+					.query("SELECT id, message_id, seq FROM narrator_message_refs ORDER BY seq")
+					.all(),
+				version: sqlite.query("SELECT message_version FROM narrators WHERE id = 'n1'").get(),
+				tools: sqlite
+					.query("SELECT id, status, output_json FROM narrator_tool_calls ORDER BY id")
+					.all(),
+			});
+			const before = snapshot();
+			const unknownContent: Msg = { id: "a1", role: "assistant", contentJson, toolCalls: null };
+			const result = resolveRetryTarget([user("u1"), unknownContent]);
+			expect(result).toEqual({ target: null, reason: "not_user" });
+			expect(result).not.toHaveProperty("emptyAssistantIds");
+			expect(snapshot()).toEqual(before);
+			expect(before.messages).toHaveLength(2);
+			expect(before.refs).toHaveLength(2);
+			expect(before.tools).toHaveLength(1);
+			expect(before.version).toEqual({ message_version: 7 });
+		});
+	}
+
+	it("已知空 contentJson 且 toolCalls 为 null 时仍可重试", () => {
+		const result = resolveRetryTarget([
+			user("u1"),
+			{ id: "a1", role: "assistant", contentJson: [], toolCalls: null },
+		]);
 		expect(result.target?.id).toBe("u1");
+		expect(result.target && result.emptyAssistantIds).toEqual(["a1"]);
+	});
+
+	it("即使 blocks 为空，已有正文的 assistant 也不得被当作占位行", () => {
+		const result = resolveRetryTarget([
+			user("u1"),
+			{ ...emptyAssistant("a1"), contentText: "persisted answer" },
+		]);
+		expect(result).toEqual({ target: null, reason: "not_user" });
 	});
 
 	it("有 reasoning 块的 assistant 不算占位行", () => {

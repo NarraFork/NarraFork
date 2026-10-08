@@ -377,5 +377,3 @@ describe("OpenAI — an injected sys row", () => {
 		expect(answered).toEqual(["tool_1"]);
 	});
 });
-
-

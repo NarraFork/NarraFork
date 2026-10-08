@@ -6,16 +6,10 @@
  * Communication: parentPort.postMessage({ type: "log" | "done", ... })
  */
 import { createHash } from "node:crypto";
-import {
-	existsSync,
-	readFileSync,
-	readdirSync,
-	statSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, relative } from "node:path";
-import { workerData, parentPort } from "node:worker_threads";
+import { parentPort, workerData } from "node:worker_threads";
 import { generateZstdPatch } from "../server/lib/zstd-patch";
 import {
 	type BinaryMetadata,

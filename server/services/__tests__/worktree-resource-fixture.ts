@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { getTableName, is, SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { getTableConfig, SQLiteSyncDialect, type SQLiteTable } from "drizzle-orm/sqlite-core";
-import * as schema from "../db/schema";
+import * as schema from "../../db/schema";
 
 /** TEST ONLY: actual schema columns, FKs/checks/indexes in memory; no live singleton/migrations. */
 export function fixtureDatabase() {

@@ -14,26 +14,41 @@ import {
 	SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX,
 	upsertEncodedTrait,
 } from "../../../server/lib/narrator-custom-traits";
-import { resolveEffectiveModel, settings } from "../../../server/lib/settings";
+import {
+	getSubagentVisibleModels,
+	resolveEffectiveModel,
+	settings,
+} from "../../../server/lib/settings";
 import type { SubagentModelUse } from "../../../shared/subagent-model-policy";
 
-const originalPools = {
-	explore: [...settings.agent.subagentAllowedModels.explore],
-	plan: [...settings.agent.subagentAllowedModels.plan],
-	general: [...settings.agent.subagentAllowedModels.general],
-	search: [...(settings.agent.subagentAllowedModels.search ?? [])],
-	review: [...(settings.agent.subagentAllowedModels.review ?? [])],
-};
+const originalAgent = structuredClone(settings.agent);
+const originalOpenaiProviders = structuredClone(settings.openaiProviders);
 
 afterEach(() => {
-	settings.agent.subagentAllowedModels = {
-		explore: [...originalPools.explore],
-		plan: [...originalPools.plan],
-		general: [...originalPools.general],
-		search: [...originalPools.search],
-		review: [...originalPools.review],
-	};
+	settings.agent = structuredClone(originalAgent);
+	settings.openaiProviders = structuredClone(originalOpenaiProviders);
 });
+
+function useDescriptionModelFixture(): void {
+	settings.openaiProviders = [
+		{
+			id: "trait-description",
+			name: "Trait description",
+			prefix: "trait-description",
+			baseUrl: "https://example.invalid/v1",
+			apiKey: "test-key",
+			defaultModel: "a",
+		},
+	];
+	settings.agent.customModels = ["a", "b"].map((model) => ({
+		value: `trait-description:${model}`,
+		label: model,
+		provider: "trait-description",
+	}));
+	settings.agent.hiddenModels = [];
+	expect(getSubagentVisibleModels()).toContain("trait-description:a");
+	expect(getSubagentVisibleModels()).toContain("trait-description:b");
+}
 
 describe("narrator custom subagent model traits", () => {
 	test("falls back to global pools when a custom trait omits a subagent type", () => {
@@ -370,15 +385,45 @@ describe("optional fixed subagent reasoning effort", () => {
 	});
 
 	test("descriptions only annotate configured entries and retain purpose", () => {
+		useDescriptionModelFixture();
 		const traits = upsertEncodedTrait([], SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX, {
 			version: 1,
 			pools: {
-				review: [{ model: "a", reasoningEffort: "high", purpose: "audit" }, { model: "b" }],
+				review: [
+					{ model: "trait-description:a", reasoningEffort: "high", purpose: "audit" },
+					{ model: "trait-description:b" },
+				],
 			},
 		});
 		const description = formatSubagentModelRestrictionDescription(traits);
-		expect(description).toContain("a [fixed reasoning_effort=high] — audit; b");
-		expect(description).not.toContain("b [fixed");
+		expect(description).toContain(
+			"trait-description:a [fixed reasoning_effort=high] — audit; trait-description:b",
+		);
+		expect(description).not.toContain("trait-description:b [fixed");
+	});
+
+	test.each([
+		"unlisted",
+		"hidden",
+		"disabled",
+	] as const)("descriptions exclude %s models without leaking fixed effort or purpose", (state) => {
+		useDescriptionModelFixture();
+		const model = state === "unlisted" ? "trait-description:missing" : "trait-description:a";
+		if (state === "hidden") settings.agent.hiddenModels = [model];
+		if (state === "disabled") {
+			const provider = settings.openaiProviders?.[0];
+			if (!provider) throw new Error("Missing description provider fixture");
+			provider.disabled = true;
+		}
+		expect(getSubagentVisibleModels()).not.toContain(model);
+		const traits = upsertEncodedTrait([], SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX, {
+			version: 1,
+			pools: { review: [{ model, reasoningEffort: "high", purpose: "audit" }] },
+		});
+		const description = formatSubagentModelRestrictionDescription(traits);
+		expect(description).toContain("review: (no models allowed)");
+		expect(description).not.toContain("fixed reasoning_effort");
+		expect(description).not.toContain("audit");
 	});
 });
 

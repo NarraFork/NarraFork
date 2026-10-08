@@ -44,7 +44,7 @@ const testProvider: ProviderAdapter = {
 	async *chat(params) {
 		providerCalls.push(params.content);
 		params.onRequestStart?.();
-		if (disableContinuationNarratorId && params.content === "disable auto continuation") {
+		if (disableContinuationNarratorId && params.content.endsWith("\ndisable auto continuation")) {
 			await db
 				.update(narrators)
 				.set({ autoContinuationOverride: "off" })

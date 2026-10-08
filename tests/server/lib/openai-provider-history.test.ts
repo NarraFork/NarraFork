@@ -70,7 +70,7 @@ describe("OpenAIProvider history builder", () => {
 });
 
 describe("OpenAIProvider chat request formatting", () => {
-	it("uses a fresh connection for non-idempotent model requests", async () => {
+	it("does not force a fresh connection for every non-idempotent model request", async () => {
 		const originalFetch = globalThis.fetch;
 		const captured = { connectionHeader: null as string | null };
 
@@ -99,7 +99,7 @@ describe("OpenAIProvider chat request formatting", () => {
 			globalThis.fetch = originalFetch;
 		}
 
-		expect(captured.connectionHeader).toBe("close");
+		expect(captured.connectionHeader).toBeNull();
 	});
 
 	it("converts user image payload to Responses API input_* content types", async () => {

@@ -1,51 +1,22 @@
-import { Database } from "bun:sqlite";
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { eq, is, SQL } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/bun-sqlite";
-import { getTableConfig, SQLiteSyncDialect, SQLiteTable } from "drizzle-orm/sqlite-core";
-import * as relations from "../../db/relations";
+import { eq } from "drizzle-orm";
+import { cleanDb, getTestDb } from "../../../tests/setup";
 import * as schema from "../../db/schema";
 
-// Build an isolated fixture from actual column definitions, with no foreign keys
-// or migration dependency (schema-first worktrees intentionally omit migrations).
-const sqlite = new Database(":memory:");
-const dialect = new SQLiteSyncDialect();
-for (const table of Object.values(schema).filter((value) => is(value, SQLiteTable))) {
-	const config = getTableConfig(table);
-	const columns = config.columns.map((column) => {
-		const value = column.default;
-		const defaultSql =
-			value instanceof SQL
-				? dialect.sqlToQuery(value).sql
-				: typeof value === "string"
-					? `'${value.replaceAll("'", "''")}'`
-					: typeof value === "number"
-						? String(value)
-						: undefined;
-		return `"${column.name}" ${column.getSQLType()}${column.primary ? " PRIMARY KEY" : ""}${defaultSql ? ` DEFAULT ${defaultSql}` : ""}`;
-	});
-	sqlite.run(`CREATE TABLE "${config.name}" (${columns.join(", ")})`);
-}
-const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
+const { db, sqlite } = getTestDb();
 mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+const realCharacters = { ...(await import("../../lib/context-characters")) };
 mock.module("../../lib/context-characters", () => ({
+	...realCharacters,
 	measureMessageCharacters: () => null,
-	measureSerializedCharacters: (value: unknown) => JSON.stringify(value)?.length ?? 0,
-	measureSummaryCharacters: (value: string) => value.length,
 	queueContextCharacterRefresh: () => {},
+	hasPendingContextCharacterRefresh: () => false,
 }));
 await import("../narrator-service");
 const { narratorPersistence } = await import("../narrator-persistence");
 const now = "2026-10-04T00:00:00Z";
 beforeEach(async () => {
-	for (const table of [
-		"narrator_tool_calls",
-		"narrator_message_refs",
-		"narrator_messages",
-		"narrators",
-		"file_change_execution_segments",
-	])
-		sqlite.run(`DELETE FROM "${table}"`);
+	cleanDb(sqlite);
 	await db.insert(schema.narrators).values({ id: "n", createdAt: now, updatedAt: now });
 });
 afterAll(() => {

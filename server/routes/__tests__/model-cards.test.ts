@@ -89,9 +89,7 @@ describe("PUT /api/model-cards/:key stores only the difference", () => {
 		expect(status).toBe(200);
 
 		// Only that one field may reach settings.json.
-		expect(settings.agent.modelCards).toEqual([
-			{ modelKey: "gpt-5.5", contextWindow: 123_456 },
-		]);
+		expect(settings.agent.modelCards).toEqual([{ modelKey: "gpt-5.5", contextWindow: 123_456 }]);
 	});
 
 	test("the edited value and the inherited ones both come back", async () => {
@@ -107,9 +105,7 @@ describe("PUT /api/model-cards/:key stores only the difference", () => {
 		);
 		expect(card?.contextWindow).toBe(123_456);
 		expect(card?.maxCompletionTokens).toBe(original?.maxCompletionTokens);
-		expect((after.provenance as Record<string, string[]>)["gpt-5.5"]).toEqual([
-			"contextWindow",
-		]);
+		expect((after.provenance as Record<string, string[]>)["gpt-5.5"]).toEqual(["contextWindow"]);
 	});
 
 	test("submitting an unchanged card stores nothing", async () => {

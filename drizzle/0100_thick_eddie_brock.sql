@@ -1,0 +1,2 @@
+ALTER TABLE `narrator_messages` ADD `compact_pending` integer GENERATED ALWAYS AS ((CASE WHEN json_extract("content_json", '$[0].type') = 'compact' AND (json_extract("content_json", '$[0].status') IN ('compacting', 'running') OR json_extract("content_json", '$[0].attempts[#-1].status') = 'running') THEN 1 ELSE 0 END)) VIRTUAL;--> statement-breakpoint
+CREATE INDEX `idx_messages_compact_pending` ON `narrator_messages` (`compact_pending`) WHERE "compact_pending" = 1;

@@ -1,0 +1,1 @@
+ALTER TABLE `narrators` ADD `auto_continuation_override` text DEFAULT 'inherit' NOT NULL;

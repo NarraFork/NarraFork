@@ -1,0 +1,1 @@
+ALTER TABLE `background_tasks` ADD `logical_run_id` text;

@@ -578,7 +578,11 @@ describe("Send exact delivery receipts", () => {
 		expect(envelope.deliveryId).toBeString();
 		expect(envelope?.recipientMessageId).toBe(id as string);
 		const consumed = await consume();
-		expect(consumed?.prompt).toBe("[Message from the parent narrator]\nsame words");
+		expect(consumed?.prompt).toBe(
+			'<sender kind="agent" id="parent" name="parent" />\n[Message from the parent narrator]\nsame words',
+		);
+		expect(row(id)?.content_text).toBe("[Message from the parent narrator]\nsame words");
+		expect(consumed?.prompt.match(/same words/g)).toHaveLength(1);
 		expect(row(id)?.role).toBe("user");
 		expect(JSON.parse(row(id)?.content_json ?? "[]")[1]).toEqual({
 			type: "system_injection",
@@ -708,7 +712,9 @@ describe("Send exact delivery receipts", () => {
 		expect(row(id)?.role).toBe("sys");
 		const nativeBlocks = JSON.parse(row(id)?.content_json ?? "[]");
 		expect(nativeBlocks).toHaveLength(1);
-		expect(nativeBlocks[0].modelText).toBe(injected.turnText);
+		expect(nativeBlocks[0].modelText).toBe("same words");
+		expect(injected.turnText).toBe('<sender kind="agent" id="child" name="child" />\nsame words');
+		expect(injected.turnText?.match(/same words/g)).toHaveLength(1);
 		expect(consumedAt(id, "parent")).toBeNull();
 		const source = row(id);
 		const history: unknown[] = [];
@@ -854,14 +860,18 @@ describe("Send exact delivery receipts", () => {
 					"SELECT id, origin, content_text, created_by FROM narrator_messages WHERE narrator_id = 'child'",
 				)
 				.all();
-		const consumeInPass = () =>
-			inPass({
+		const restart = consume;
+		// Explicit turn/pass input must wait for restart, never inject into this pass.
+		expect(
+			await inPass({
 				narratorId: "child",
 				parentNarratorId: "parent",
 				toolUseId: "origin",
 				cwd: ".",
 				currentUserId: "editor",
-			});
+			}),
+		).toBeNull();
+		expect(getSubagentBufferedMessages("child")).toHaveLength(1);
 		const restores: Array<() => void> = [];
 		let rowsAtCreatorFailure = 0;
 		if (failure === "parent lookup") {
@@ -888,9 +898,13 @@ describe("Send exact delivery receipts", () => {
 			restores.push(() => lookup.mockRestore());
 		}
 		try {
-			expect((await consumeInPass())?.text).toBe("human correction");
+			const consumed = await restart();
+			expect(consumed?.currentInput).toBe("human correction");
+			expect(consumed?.prompt).toBe(
+				'<sender kind="human" id="editor" name="Editor" />\nhuman correction',
+			);
 			expect(getSubagentBufferedMessages("child")).toHaveLength(0);
-			expect(await consumeInPass()).toBeNull();
+			expect(await restart()).toBeNull();
 			expect(await consume()).toBeNull();
 			expect(row(result.targets[0].deliveryMessageId)).toBeNull();
 			expect(childRows()).toEqual([
@@ -933,17 +947,19 @@ describe("Send exact delivery receipts", () => {
 			true,
 		);
 		const edited = getSubagentBufferedMessages("child")[0];
-		const consumeInPass = () =>
-			inPass({
+		const restart = consume;
+		expect(
+			await inPass({
 				narratorId: "child",
 				parentNarratorId: "parent",
 				toolUseId: "origin",
 				cwd: ".",
-			});
+			}),
+		).toBeNull();
 		sqlite.run(`CREATE TEMP TRIGGER fail_message_ref BEFORE INSERT ON narrator_message_refs
 			BEGIN SELECT RAISE(ABORT, 'ref insertion unavailable'); END`);
 		try {
-			expect(await consumeInPass()).toBeNull();
+			await expect(restart()).rejects.toThrow("ref insertion unavailable");
 			expect(getSubagentBufferedMessages("child")).toEqual([
 				{ ...edited, error: expect.stringContaining("ref insertion unavailable") },
 			]);
@@ -960,8 +976,10 @@ describe("Send exact delivery receipts", () => {
 		} finally {
 			sqlite.run("DROP TRIGGER fail_message_ref");
 		}
-		expect((await consumeInPass())?.text).toBe("retry human correction");
-		expect(await consumeInPass()).toBeNull();
+		const consumed = await restart();
+		expect(consumed?.currentInput).toBe("retry human correction");
+		expect(consumed?.prompt).toBe('<sender kind="human" />\nretry human correction');
+		expect(await restart()).toBeNull();
 		expect(getSubagentBufferedMessages("child")).toHaveLength(0);
 		expect(row(result.targets[0].deliveryMessageId)).toBeNull();
 		expect(
@@ -1046,7 +1064,9 @@ describe("Send exact delivery receipts", () => {
 			expect(firstText ?? "").not.toContain("same words");
 			expect(persistedAtFirstBoundary).toBe(false);
 			expect(queuedAfterFailure).toBe(1);
-			expect(secondText).toBe("[Message from the parent narrator]\nsame words");
+			expect(secondText).toBe(
+				'<sender kind="agent" id="parent" name="parent" />\n[Message from the parent narrator]\nsame words',
+			);
 			expect(thirdText ?? "").not.toContain("same words");
 			expect(row(reserved)?.role).toBe("user");
 			expect(consumedAt(reserved)).toBeNumber();
@@ -1183,7 +1203,8 @@ describe("Send exact delivery receipts", () => {
 		expect(consumedAt(first)).toBeNull();
 		const teamBlocks = JSON.parse(row(first)?.content_json ?? "[]");
 		expect(teamBlocks).toHaveLength(1);
-		expect(teamBlocks[0].modelText).toBe(injection.turnText);
+		expect(teamBlocks[0].modelText).toBe("same");
+		expect(injection.turnText).toBe('<sender kind="agent" id="parent" name="parent" />\nsame');
 		const history: unknown[] = [];
 		trackAgentMessageHistory(
 			"child",

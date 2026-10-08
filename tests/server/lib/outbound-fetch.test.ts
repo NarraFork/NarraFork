@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createServer, request as httpRequest, type Server } from "node:http";
-import { connect } from "node:net";
+import { connect, type Socket } from "node:net";
 import { GeminiProvider } from "@server/lib/agent/gemini-provider";
 import { closeOutboundFetchDispatchers, outboundFetch } from "@server/lib/net/outbound-fetch";
 
@@ -51,7 +51,10 @@ async function listen(server: Server): Promise<number> {
 	});
 	const address = server.address();
 	if (!address || typeof address === "string") throw new Error("Expected TCP address");
-	closers.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+	closers.push(() => {
+		server.closeAllConnections();
+		return new Promise<void>((resolve) => server.close(() => resolve()));
+	});
 	return address.port;
 }
 
@@ -98,7 +101,7 @@ async function within<T>(promise: Promise<T>, timeoutMs = 1000): Promise<T> {
 }
 
 describe("outbound fetch", () => {
-	test("direct mode ignores process proxies and avoids connection reuse", async () => {
+	test("direct mode ignores process proxies and preserves the requested connection policy", async () => {
 		process.env.HTTP_PROXY = "socks5://127.0.0.1:1";
 		process.env.http_proxy = "socks5://127.0.0.1:1";
 		const captured = { connectionHeader: null as string | null };
@@ -112,16 +115,18 @@ describe("outbound fetch", () => {
 		});
 
 		expect(await response.text()).toBe("direct-ok");
-		expect(captured.connectionHeader).toBe("close");
+		expect(captured.connectionHeader).toBe("keep-alive");
 	});
 
 	test("always retries one replayable pre-response transport reset with a fresh connection", async () => {
 		let hits = 0;
 		const connectionHeaders: Array<string | undefined> = [];
+		const connections = new Set<Socket>();
 		const requestBodies: string[] = [];
 		const server = createServer((request, response) => {
 			const hit = ++hits;
 			connectionHeaders.push(request.headers.connection);
+			connections.add(request.socket);
 			let body = "";
 			request.setEncoding("utf8");
 			request.on("data", (chunk) => {
@@ -148,7 +153,9 @@ describe("outbound fetch", () => {
 
 		expect(await response.text()).toBe("retry-ok");
 		expect(hits).toBe(2);
-		expect(connectionHeaders).toEqual(["close", "close"]);
+		expect(connectionHeaders.every((header) => header !== "close")).toBe(true);
+		// The reset socket must not be reused even though normal calls remain poolable.
+		expect(connections.size).toBe(2);
 		expect(requestBodies).toEqual(["payload", "payload"]);
 	});
 
@@ -411,6 +418,6 @@ describe("outbound fetch", () => {
 		}
 
 		expect(captured.url).toContain(":streamGenerateContent?alt=sse");
-		expect(captured.connectionHeader).toBe("close");
+		expect(captured.connectionHeader).toBeNull();
 	});
 });

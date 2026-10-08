@@ -17,7 +17,6 @@ import {
 	unlink,
 	writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FileChangeBlobRef } from "@shared/file-change-protocol";
 import { drizzle } from "drizzle-orm/bun-sqlite";
@@ -58,7 +57,10 @@ beforeAll(() => {
 	migrated.sqlite.close();
 });
 beforeEach(async () => {
-	sandbox = await mkdtemp(join(await realpath(tmpdir()), "physical-audit-test-"));
+	// The worker pins every absolute ancestor. Parallel suites legitimately mutate
+	// shared /tmp, so valid-state fixtures need a parent owned by this checkout.
+	// This preserves the production object_changed guard instead of retrying it.
+	sandbox = await mkdtemp(join(await realpath(process.cwd()), ".physical-audit-test-"));
 	databasePath = join(sandbox, "source.sqlite");
 	blobRoot = join(sandbox, "blobs");
 	await writeFile(databasePath, template, { mode: 0o600 });
@@ -575,18 +577,31 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 	}, 10_000);
 
 	test("generation changes during a scan are fenced without updating the catalog", async () => {
-		await put(Buffer.alloc(512 * 1024, 7));
+		// A bounded streamed hash spans progress publication; the generation change
+		// is triggered by observed physical work, never by a guessed timer.
+		await put(Buffer.alloc(2 * 1024 * 1024, 7));
 		let changed = false;
+		let mutationObservedAt: number | undefined;
+		let generationBeforeMutation: number | undefined;
 		const summary = await auditFileChangePhysical(
 			await options({
-				budget: { chunkBytes: 1024 },
-				onProgress() {
-					if (changed) return;
+				budget: { chunkBytes: 128 },
+				onProgress(progress) {
+					if (changed || progress.phase !== "physical" || progress.readBytes === 0) return;
 					changed = true;
+					mutationObservedAt = progress.readBytes;
+					const currentBudget = catalog.getBudget();
+					if (!currentBudget) throw new Error("Observed hash progress has no catalog budget");
+					generationBeforeMutation = currentBudget.generation;
 					catalog.beginReconciliation({ expectedGeneration: generation });
 				},
 			}),
 		);
+		expect(changed).toBe(true);
+		expect(mutationObservedAt).toBeGreaterThan(0);
+		expect(generationBeforeMutation).toBe(1);
+		expect(summary.start?.generation).toBe(1);
+		expect(summary.full).toBe(false);
 		expect(codes(summary)).toContain("generation_changed");
 		expect(summary.end?.generation).toBe(2);
 		expect(catalog.getBudget()).toMatchObject({ status: "reconciling", generation: 2 });

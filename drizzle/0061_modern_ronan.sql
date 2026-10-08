@@ -1,0 +1,1 @@
+ALTER TABLE `user_preferences` ADD `ctrl_enter_queue_mode` text DEFAULT 'tool' NOT NULL;

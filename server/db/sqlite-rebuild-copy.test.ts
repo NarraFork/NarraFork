@@ -231,7 +231,10 @@ describe("canonical Drizzle rebuild-copy compatibility", () => {
 		};
 		expect(created.sql).not.toMatch(/"__new_x"\s*\.\s*"added"/);
 		expect(created.sql).toContain("ck_own");
-		expect(db.query("SELECT id FROM x ORDER BY id").all()).toEqual([{ id: "row-1" }, { id: "row-2" }]);
+		expect(db.query("SELECT id FROM x ORDER BY id").all()).toEqual([
+			{ id: "row-1" },
+			{ id: "row-2" },
+		]);
 	});
 
 	test("omits new columns so text, numeric and expression defaults apply to every copied row", () => {

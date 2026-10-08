@@ -6,12 +6,12 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import type { VNetClientMessage } from "../lib/vnet/types";
-import type { VerifiedPublicShare } from "../services/public-narrator-share-service";
 import {
 	type DeviceWSData,
 	getDeviceConnections,
 	handleDeviceWS,
 } from "../services/device-connection-service";
+import type { VerifiedPublicShare } from "../services/public-narrator-share-service";
 import {
 	handleExternalNarratorWS,
 	rejectOversizedExternalNarratorFrame,

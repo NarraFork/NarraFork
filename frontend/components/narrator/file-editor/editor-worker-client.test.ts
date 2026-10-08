@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import type { editor } from "monaco-editor";
 import { EditorWorkerRuntime } from "./editor-text.worker";
@@ -234,16 +234,42 @@ describe("real Worker search and immutable snapshot export", () => {
 			client.dispose();
 		}
 	}, 10000);
-	test("pathological regex is terminated at two seconds, next query rebuilds the mirror", async () => {
-		const model = new Model(`${"a".repeat(100)}!`);
+	test("stalled search transport is terminated at two seconds, next query rebuilds the mirror", async () => {
+		const model = new Model("abc!");
 		const client = new EditorSearchClient(model.asModel());
+		const postMessage = Worker.prototype.postMessage as (
+			this: Worker,
+			message: unknown,
+			transfer?: Transferable[] | StructuredSerializeOptions,
+		) => void;
+		let stalledWorker: Worker | undefined;
+		const transport = spyOn(Worker.prototype, "postMessage").mockImplementation(function (
+			this: Worker,
+			message: unknown,
+			transfer?: Transferable[] | StructuredSerializeOptions,
+		) {
+			// Engine regex optimizations are not a deadline contract. Withhold exactly
+			// one search from the real transport; initialization and recovery stay real.
+			if (!stalledWorker && (message as WorkerRequest).type === "search") {
+				stalledWorker = this;
+				return;
+			}
+			return postMessage.call(this, message, transfer);
+		});
+		const terminate = spyOn(Worker.prototype, "terminate");
 		try {
 			const start = performance.now();
-			await expect(client.search(query("(a*)*$", true))).rejects.toThrow("EDITOR_SEARCH_TIMEOUT");
-			expect(performance.now() - start).toBeLessThan(3500);
+			await expect(client.search(query("!"))).rejects.toThrow("EDITOR_SEARCH_TIMEOUT");
+			const elapsed = performance.now() - start;
+			expect(elapsed).toBeGreaterThanOrEqual(L.searchTimeout);
+			expect(elapsed).toBeLessThan(3500);
+			expect(stalledWorker).toBeDefined();
+			expect(terminate.mock.contexts).toContain(stalledWorker);
 			expect((await client.search(query("!"))).count).toBe(1);
 			expect(model.snapshots).toBe(2);
 		} finally {
+			transport.mockRestore();
+			terminate.mockRestore();
 			client.dispose();
 		}
 	}, 8000);

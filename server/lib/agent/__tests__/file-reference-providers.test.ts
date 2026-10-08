@@ -1,9 +1,7 @@
-import { Database } from "bun:sqlite";
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import type { FileReferenceSnapshot } from "@shared/file-reference";
-import { drizzle } from "drizzle-orm/bun-sqlite";
-import * as schema from "../../../db/schema";
+import { getTestDb } from "../../../../tests/setup";
 import { setNugCachedModels } from "../../nug-model-cache";
 import { settings } from "../../settings";
 import { projectFileReferenceText } from "../file-reference-projection";
@@ -30,9 +28,10 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "providers") {
 	// Exercise real adapters through the unified buildHistory entry point. Their
 	// history builders need no DB/network; importing the server must never open the
 	// application's database just to run these tests.
-	const sqlite = new Database(":memory:");
-	const db = drizzle({ client: sqlite, schema });
-	mock.module("../../../db", () => ({ db, sqlite }));
+	// The unified import graph initializes durable runtime tables. Keep it isolated
+	// but complete, rather than an empty schema handle with a stale module contract.
+	const { db, sqlite } = getTestDb();
+	mock.module("../../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 	const { buildHistory } = await import("../index");
 	afterAll(() => sqlite.close());
 
@@ -194,11 +193,17 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "providers") {
 					1,
 				);
 				if (mode === "official") {
-					expect(built.history).toContainEqual({ role: "system", content: "standing reminder" });
-					expect(built.history).toContainEqual({ role: "user", content: "inspect" });
+					expect(built.history).toContainEqual({
+						role: "system",
+						content: '<sender kind="system" />\nstanding reminder',
+					});
+					expect(built.history).toContainEqual({
+						role: "user",
+						content: '<sender kind="human" />\ninspect',
+					});
 					expect(built.trailingUserText).toBeUndefined();
 				} else if (mode === "anthropic" || mode === "nug-anthropic") {
-					expect(built.trailingUserText).toBe("standing reminder");
+					expect(built.trailingUserText).toBe('<sender kind="system" />\nstanding reminder');
 				} else {
 					const baseline = await buildHistory(messages, `refs:${model}`, "refs");
 					expect(built.trailingUserText).toBe(baseline.trailingUserText);
@@ -207,6 +212,8 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "providers") {
 					);
 				}
 				expect(messages).toEqual(saved);
+				expect(sys.contentText).toBe("standing reminder");
+				expect(occurrences([built.history, built.trailingUserText], "standing reminder")).toBe(1);
 			});
 		});
 	}
@@ -247,14 +254,17 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "providers") {
 		const original = [user("user"), sys];
 		const official = await buildHistory(original, "refs:model", "refs");
 		expect(occurrences(official.history, "const x")).toBe(1);
-		expect(official.history).toContainEqual({ role: "system", content: "standing reminder" });
+		expect(official.history).toContainEqual({
+			role: "system",
+			content: '<sender kind="system" />\nstanding reminder',
+		});
 		expect(official.trailingUserText).toBeUndefined();
 		// This no-options path is also used by summaries: its history must retain
 		// every snapshot even when a live caller could supply an exact current input.
 		expect(projectFileReferenceText("inspect", [reference])).toContain("const x");
 		configure("anthropic");
 		const compatible = await buildHistory(original, "refs:model", "refs");
-		expect(compatible.trailingUserText).toBe("standing reminder");
+		expect(compatible.trailingUserText).toBe('<sender kind="system" />\nstanding reminder');
 		expect(occurrences(compatible.history, "const x")).toBe(0);
 	});
 }

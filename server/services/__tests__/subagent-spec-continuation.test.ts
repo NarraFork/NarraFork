@@ -22,6 +22,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import { narrators, narratorToolCalls } from "../../db/schema";
+import { projectSenderText } from "../../lib/agent/sender-projection";
 import { generateId } from "../../lib/id";
 import { deleteNugCachedModels, setNugCachedModels } from "../../lib/nug-model-cache";
 import { settings, usesStatefulModel } from "../../lib/settings";
@@ -860,19 +861,30 @@ describe("persisted continuation reaches the next executor request", () => {
 			const content = injection?.contentText;
 			if (!content) throw new Error("expected the persisted continuation sys row");
 			expect(content).toContain("Self-continuations left");
+			// Stored audit text stays raw; the provider gets authenticated system identity.
+			expect(content).not.toContain("<sender");
+			const source = options.blocked ? "spec_blocked_continuation" : "spec_continuation";
+			const modelContent = projectSenderText(content, { kind: "system", id: source, name: source });
+			const freshHint = projectSenderText("FRESH_SYS_HINT", {
+				kind: "system",
+				id: "knowledge_base_hint",
+				name: "knowledge_base_hint",
+			});
 			for (const request of requests.slice(1)) {
 				// Assert the ACTUAL next pass input, not a manually concatenated BuiltHistory.
 				if (route === "responses") {
 					expect(request.userText).toBe("");
 					expect(request.history).toContainEqual({
 						role: "user",
-						content: [{ type: "input_text", text: content }],
+						content: [{ type: "input_text", text: modelContent }],
 					});
 				} else if (route === "official") {
 					expect(request.userText).toBe("");
-					expect(request.history).toContainEqual({ role: "system", content });
+					expect(request.history).toContainEqual({ role: "system", content: modelContent });
 				} else {
-					expect(request.userText).toBe(options.hints ? `FRESH_SYS_HINT\n\n${content}` : content);
+					expect(request.userText).toBe(
+						options.hints ? `${freshHint}\n\n${modelContent}` : modelContent,
+					);
 					expect(request.trailingToolResults).toEqual(
 						options.noTools
 							? []

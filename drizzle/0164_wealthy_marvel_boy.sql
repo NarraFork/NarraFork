@@ -1,0 +1,1 @@
+ALTER TABLE `narrator_message_refs` ADD `injection_consumed_at` integer;

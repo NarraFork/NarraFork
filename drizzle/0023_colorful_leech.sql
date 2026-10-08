@@ -1,0 +1,1 @@
+CREATE INDEX `idx_gsm_app_user` ON `gateway_session_mappings` (`app_user_id`);

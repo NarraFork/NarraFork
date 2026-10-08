@@ -68,7 +68,9 @@ function makeBaseChannel(
 }
 
 export function buildSearchChannelCatalog(settings: NarraForkSettings): SearchChannelConfig[] {
-	const catalog: SearchChannelConfig[] = [makeBaseChannel(SEARCH_NATIVE_CHANNEL_ID, "native", true)];
+	const catalog: SearchChannelConfig[] = [
+		makeBaseChannel(SEARCH_NATIVE_CHANNEL_ID, "native", true),
+	];
 
 	for (const provider of settings.nugProviders ?? []) {
 		catalog.push(makeBaseChannel(nugSearchChannelId(provider.id), "nug-mcp", true, provider.id));

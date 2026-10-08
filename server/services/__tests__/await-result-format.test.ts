@@ -29,6 +29,7 @@ const {
 	resolveSubagentExecutionTiming,
 } = await import("../subagent-runner");
 const updateCoordinator = await import("../update-coordinator");
+const { getRuntimePublicationService } = await import("../agent-runtime/publication");
 
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
@@ -620,6 +621,12 @@ describe("background agent task lifecycle", () => {
 		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(0);
 		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.not.toBeNull();
 		backgroundTaskService.endAgentContinuation(subagentNarratorId);
+		// Publication retention is independent of the foreground-continuation guard.
+		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(0);
+		const terminal = await backgroundTaskService.waitForCompletion(subagentNarratorId, 100);
+		expect(terminal.terminalResultReceived).toBe(true);
+		if (!terminal.publicationRun) throw new Error("Missing exact terminal run");
+		await getRuntimePublicationService().consumeAwaitedTerminal(terminal.publicationRun);
 		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(1);
 	});
 
@@ -727,7 +734,8 @@ describe("background agent task lifecycle", () => {
 
 		expect(await backgroundTaskService.recoverStaleTasksAfterRestart()).toBe(1);
 		await expect(backgroundTaskService.getById(taskId)).resolves.toMatchObject({
-			status: "cancelled",
+			status: "failed",
+			output: "Execution outcome unknown after restart; the command was not rerun.",
 			type: "bash",
 		});
 	});
@@ -748,7 +756,8 @@ describe("background agent task lifecycle", () => {
 
 		expect(await backgroundTaskService.recoverStaleTasksAfterRestart(new Set([taskId]))).toBe(1);
 		await expect(backgroundTaskService.getById(taskId)).resolves.toMatchObject({
-			status: "cancelled",
+			status: "failed",
+			output: "Execution outcome unknown after restart; the command was not rerun.",
 		});
 	});
 
@@ -767,7 +776,11 @@ describe("background agent task lifecycle", () => {
 
 		const waiting = backgroundTaskService.waitForCompletion(taskId, 5_000);
 		await backgroundTaskService.recoverStaleTasksAfterRestart();
-		await expect(waiting).resolves.toMatchObject({ status: "cancelled" });
+		await expect(waiting).resolves.toMatchObject({
+			status: "failed",
+			terminalResultReceived: true,
+			output: "Execution outcome unknown after restart; the command was not rerun.",
+		});
 	});
 
 	test("a reaped bash row satisfies the predicate cleanupCompleted reaps on", async () => {

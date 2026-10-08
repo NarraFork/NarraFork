@@ -1,9 +1,30 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as crypto from "node:crypto";
 import { type BinaryLike, createHash, type Encoding, type Hash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyZstdPatchToFile, generateZstdPatch, type ZstdPatchMeta } from "../zstd-patch";
+
+// Capture native references once, before either cancellation case installs a factory spy.
+const nativeCreateHash = crypto.createHash;
+const nativeHashUpdate = nativeCreateHash("sha512").update;
+
+// Await the I/O promise directly; rejection assertions run synchronously after it settles.
+async function expectPatchRejected(promise: Promise<unknown>, message?: RegExp): Promise<void> {
+	let rejected = false;
+	let rejection: unknown;
+	try {
+		await promise;
+	} catch (error) {
+		rejected = true;
+		rejection = error;
+	}
+	expect(rejected).toBe(true);
+	expect(rejection).toBeInstanceOf(Error);
+	if (!(rejection instanceof Error)) throw new Error("Expected patch rejection to be an Error");
+	if (message) expect(rejection.message).toMatch(message);
+}
 
 /**
  * The server applies patches file-to-file so a ~100MB binary never becomes synchronous work on
@@ -42,7 +63,7 @@ describe("file-based zstd patch application", () => {
 		const patchFilePath = join(dir, "oversized.zst");
 		const patch = Bun.zstdCompressSync(Buffer.alloc(4096));
 		writeFileSync(patchFilePath, patch);
-		await expect(
+		await expectPatchRejected(
 			applyZstdPatchToFile({
 				oldFilePath: oldPath,
 				patchFilePath,
@@ -58,7 +79,8 @@ describe("file-based zstd patch application", () => {
 					mode: "dictionary",
 				},
 			}),
-		).rejects.toThrow(/larger than 8 bytes/);
+			/larger than 8 bytes/,
+		);
 	});
 	test("legacy empty tail remains valid under the native output ceiling", async () => {
 		const bytes = Buffer.alloc(8, 7);
@@ -103,7 +125,7 @@ describe("file-based zstd patch application", () => {
 
 	test("refuses a target larger than the caller's byte ceiling before doing any work", async () => {
 		const { oldPath, meta } = makeBinaries();
-		await expect(
+		await expectPatchRejected(
 			applyZstdPatchToFile({
 				oldFilePath: oldPath,
 				patchFilePath: join(dir, "patch.zst"),
@@ -111,25 +133,27 @@ describe("file-based zstd patch application", () => {
 				meta,
 				maxOutputBytes: 1024,
 			}),
-		).rejects.toThrow(/exceeds the 1024-byte limit/);
+			/exceeds the 1024-byte limit/,
+		);
 	});
 
 	test("rejects a size mismatch between the produced file and the declared metadata", async () => {
 		const { oldPath, meta } = makeBinaries();
-		await expect(
+		await expectPatchRejected(
 			applyZstdPatchToFile({
 				oldFilePath: oldPath,
 				patchFilePath: join(dir, "patch.zst"),
 				outputFilePath: join(dir, "out.bin"),
 				meta: { ...meta, newFileSize: meta.newFileSize + 1 },
 			}),
-		).rejects.toThrow(/file size mismatch/);
+			/file size mismatch/,
+		);
 	});
 
 	test("CLI decompression stops before its output can exceed the declared binary size", async () => {
 		const { oldPath, meta } = makeBinaries();
 		const outputFilePath = join(dir, "bounded.bin");
-		await expect(
+		await expectPatchRejected(
 			applyZstdPatchToFile({
 				oldFilePath: oldPath,
 				patchFilePath: join(dir, "patch.zst"),
@@ -137,19 +161,21 @@ describe("file-based zstd patch application", () => {
 				meta: { ...meta, newFileSize: 8, newTailSize: 8, stableEnd: 0, mode: "patch-from" },
 				maxOutputBytes: 16 * 1024 * 1024,
 			}),
-		).rejects.toThrow(/exceeds the 8-byte limit/);
+			/exceeds the 8-byte limit/,
+		);
 		expect(readFileSync(outputFilePath).length).toBeLessThanOrEqual(8);
 	});
 	test("rejects a digest mismatch so a tampered payload is never placed", async () => {
 		const { oldPath, meta } = makeBinaries();
-		await expect(
+		await expectPatchRejected(
 			applyZstdPatchToFile({
 				oldFilePath: oldPath,
 				patchFilePath: join(dir, "patch.zst"),
 				outputFilePath: join(dir, "out.bin"),
 				meta: { ...meta, newFileSha512: Buffer.alloc(64, 9).toString("base64") },
 			}),
-		).rejects.toThrow(/SHA512 mismatch/);
+			/SHA512 mismatch/,
+		);
 	});
 
 	test("an aborted signal stops the work instead of running to completion", async () => {
@@ -157,7 +183,7 @@ describe("file-based zstd patch application", () => {
 		const controller = new AbortController();
 		controller.abort();
 
-		await expect(
+		await expectPatchRejected(
 			applyZstdPatchToFile({
 				oldFilePath: oldPath,
 				patchFilePath: join(dir, "patch.zst"),
@@ -165,7 +191,7 @@ describe("file-based zstd patch application", () => {
 				meta,
 				signal: controller.signal,
 			}),
-		).rejects.toThrow();
+		);
 	});
 
 	test.each([
@@ -174,27 +200,40 @@ describe("file-based zstd patch application", () => {
 	])("stops reading during reconstructed-file hashing: %s", async (reason) => {
 		const { oldPath, meta } = makeBinaries();
 		const controller = new AbortController();
-		const prototype = Object.getPrototypeOf(createHash("sha512")) as Hash;
-		const originalUpdate = prototype.update;
 		let chunksHashed = 0;
-		const update = spyOn(prototype, "update").mockImplementation(function (
-			this: Hash,
-			data: BinaryLike,
-			inputEncoding?: Encoding,
-		) {
-			chunksHashed++;
-			if (chunksHashed === 1)
-				controller.abort(
-					new DOMException(reason, reason === "overall deadline" ? "TimeoutError" : "AbortError"),
-				);
-			return Reflect.apply(
-				originalUpdate,
-				this,
-				inputEncoding === undefined ? [data] : [data, inputEncoding],
-			) as Hash;
+		let factoryHits = 0;
+		const instrumentedHashes: Hash[] = [];
+		const factory = spyOn(crypto, "createHash").mockImplementation((algorithm, options) => {
+			factoryHits++;
+			const hash = nativeCreateHash(algorithm, options);
+			// Only this operation's real hash is instrumented. Never mutate Hash.prototype
+			// or run a Bun mock from the stream's native update continuation.
+			Object.defineProperty(hash, "update", {
+				configurable: true,
+				writable: true,
+				value: function (this: Hash, data: BinaryLike, inputEncoding?: Encoding) {
+					chunksHashed++;
+					if (chunksHashed === 1)
+						controller.abort(
+							new DOMException(
+								reason,
+								reason === "overall deadline" ? "TimeoutError" : "AbortError",
+							),
+						);
+					return Reflect.apply(
+						nativeHashUpdate,
+						this,
+						inputEncoding === undefined ? [data] : [data, inputEncoding],
+					) as Hash;
+				},
+			});
+			instrumentedHashes.push(hash);
+			// Later I/O can only reach the own method above, never a process-global spy.
+			factory.mockRestore();
+			return hash;
 		});
 		try {
-			await expect(
+			await expectPatchRejected(
 				applyZstdPatchToFile({
 					oldFilePath: oldPath,
 					patchFilePath: join(dir, "patch.zst"),
@@ -203,23 +242,36 @@ describe("file-based zstd patch application", () => {
 					signal: controller.signal,
 					maxOutputBytes: 16 * 1024 * 1024,
 				}),
-			).rejects.toThrow();
+			);
+			// A missing named-import live binding must fail, never fall back to a prototype spy.
+			expect(factoryHits).toBe(1);
+			expect(instrumentedHashes).toHaveLength(1);
+			const hash = instrumentedHashes[0];
+			if (!hash) throw new Error("Production did not use the instrumented hash factory");
+			expect(Object.hasOwn(hash, "update")).toBe(true);
+			expect(Object.getPrototypeOf(hash).update).toBe(nativeHashUpdate);
 			expect(controller.signal.aborted).toBe(true);
+			expect(controller.signal.reason).toBeInstanceOf(DOMException);
+			expect(controller.signal.reason.name).toBe(
+				reason === "overall deadline" ? "TimeoutError" : "AbortError",
+			);
+			expect(controller.signal.reason.message).toBe(reason);
 			// The fixture spans several stream chunks: the former signal-less hash read all of them.
 			expect(chunksHashed).toBe(1);
 		} finally {
-			update.mockRestore();
+			factory.mockRestore();
 		}
 	});
 	test("surfaces a bounded diagnostic when the CLI cannot read its inputs", async () => {
 		const { meta } = makeBinaries();
-		await expect(
+		await expectPatchRejected(
 			applyZstdPatchToFile({
 				oldFilePath: join(dir, "missing-old.bin"),
 				patchFilePath: join(dir, "missing-patch.zst"),
 				outputFilePath: join(dir, "out.bin"),
 				meta,
 			}),
-		).rejects.toThrow(/zstd CLI decompression failed/);
+			/zstd CLI decompression failed/,
+		);
 	});
 });

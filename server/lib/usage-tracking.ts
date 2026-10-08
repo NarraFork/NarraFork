@@ -1,9 +1,14 @@
 import { db } from "@server/db";
 import { narratorMessages, narratorToolCalls } from "@server/db/schema";
+import type { ReferencePricingSnapshot } from "@shared/agent-protocol/types";
 import { eq } from "drizzle-orm";
 import type { CostEstimate } from "./cost-estimate";
-import type { ReferencePricingSnapshot } from "@shared/agent-protocol/types";
-import { type PriceField, referencePriceNumber, resolveModelPricing, pricingFromReferenceSnapshot } from "./model-pricing";
+import {
+	type PriceField,
+	pricingFromReferenceSnapshot,
+	referencePriceNumber,
+	resolveModelPricing,
+} from "./model-pricing";
 
 export type { CostData, CostEstimate, CostStatus } from "./cost-estimate";
 
@@ -87,7 +92,8 @@ export function calculateCostDetailed(
 	snapshot?: ReferencePricingSnapshot,
 ): CostEstimate {
 	// An explicit unknown snapshot must never fall back to a newly published price.
-	const pricing = snapshot === undefined ? resolveModelPricing(model) : pricingFromReferenceSnapshot(snapshot);
+	const pricing =
+		snapshot === undefined ? resolveModelPricing(model) : pricingFromReferenceSnapshot(snapshot);
 	const tokens = (value?: number) =>
 		typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
 	const cacheRead = tokens(usage.cachedInputTokens);

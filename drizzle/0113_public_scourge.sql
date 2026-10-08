@@ -1,0 +1,2 @@
+ALTER TABLE `user_preferences` ADD `notify_sound_volume` integer DEFAULT 100 NOT NULL;--> statement-breakpoint
+ALTER TABLE `user_preferences` ADD `notify_sound_max_concurrent` integer DEFAULT 2 NOT NULL;

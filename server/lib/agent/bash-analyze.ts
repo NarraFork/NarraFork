@@ -12,10 +12,7 @@
 import embeddedBashWasm from "tree-sitter-bash/tree-sitter-bash.wasm" with { type: "file" };
 import { toForwardSlash } from "../platform-path";
 import { localPathSemantics, type TargetPathSemantics } from "./execution/path-semantics";
-import {
-	createTreeSitterParser,
-	loadTreeSitterLanguage,
-} from "./structural/tree-sitter-runtime";
+import { createTreeSitterParser, loadTreeSitterLanguage } from "./structural/tree-sitter-runtime";
 
 // ── 类型定义 ──────────────────────────────────────────────
 

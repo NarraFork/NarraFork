@@ -354,40 +354,74 @@ describe("current Git targets matched against actual v2 writes", () => {
 		snapshot.mockRestore();
 	});
 
-	test("missing raw/receipt and over-budget file can never become a matching actor", async () => {
+	// Each gate gets its own real write/store/snapshot fixture and only two view queries.
+	// Combining all gates made their worker queries share one default 5000ms test budget.
+	async function matchingRawFixture() {
 		await aiWrite("raw evidence\n");
-		const match = (await view()).byFile[0]?.worktree.effectId;
+		const current = (await view()).byFile[0]?.worktree;
+		expect(current).toMatchObject({
+			status: "matching_evidence",
+			actor: { narratorId, kind: "primary" },
+		});
+		const match = current?.effectId;
 		expect(match).not.toBeNull();
+		if (!match) throw new Error("missing matched effect identity");
 		const effect = await db
 			.select()
 			.from(fileChangeEffects)
-			.where(eq(fileChangeEffects.id, match as string))
+			.where(eq(fileChangeEffects.id, match))
 			.get();
 		if (!effect) throw new Error("missing actual effect");
+		const { store } = await runtime.initialize();
+		const observed = effect.observedAfterStateJson;
+		if (observed.kind !== "regular") throw new Error("expected regular after");
+		expect(await store.readBytes(observed.blob)).toBeDefined();
+		return { effect, store, observed };
+	}
+
+	test("missing execution receipt can never become a matching actor", async () => {
+		const { effect } = await matchingRawFixture();
 		await db
 			.update(fileChangeEffects)
 			.set({ executionReceiptJson: null })
 			.where(eq(fileChangeEffects.id, effect.id));
-		expect((await view()).byFile[0]?.worktree.status).toBe("unknown");
-		await db
-			.update(fileChangeEffects)
-			.set({ executionReceiptJson: effect.executionReceiptJson })
-			.where(eq(fileChangeEffects.id, effect.id));
-		const { store } = await runtime.initialize();
-		const observed = effect.observedAfterStateJson;
-		if (observed.kind !== "regular") throw new Error("expected regular after");
+		try {
+			expect((await view()).byFile[0]?.worktree).toMatchObject({
+				status: "unknown",
+				actor: null,
+			});
+		} finally {
+			await db
+				.update(fileChangeEffects)
+				.set({ executionReceiptJson: effect.executionReceiptJson })
+				.where(eq(fileChangeEffects.id, effect.id));
+		}
+	});
+
+	test("missing raw catalog metadata can never become a matching actor", async () => {
+		const { store, observed } = await matchingRawFixture();
 		// Mark the exact raw object missing; metadata alone cannot satisfy the read gate.
 		const catalog = await import("../db/schema");
 		await db
 			.update(catalog.fileChangeBlobs)
 			.set({ status: "missing" })
 			.where(eq(catalog.fileChangeBlobs.digest, observed.blob.digest));
-		expect((await view()).byFile[0]?.worktree.status).toBe("unknown");
-		await db
-			.update(catalog.fileChangeBlobs)
-			.set({ status: "ready" })
-			.where(eq(catalog.fileChangeBlobs.digest, observed.blob.digest));
+		try {
+			expect((await view()).byFile[0]?.worktree).toMatchObject({
+				status: "unknown",
+				actor: null,
+			});
+		} finally {
+			await db
+				.update(catalog.fileChangeBlobs)
+				.set({ status: "ready" })
+				.where(eq(catalog.fileChangeBlobs.digest, observed.blob.digest));
+		}
 		expect(await store.readBytes(observed.blob)).toBeDefined();
+	});
+
+	test("missing physical raw object is unknown rather than a matching actor", async () => {
+		const { observed } = await matchingRawFixture();
 		const rawPath = join(
 			getNarraforkHome(),
 			"file-change-blobs",
@@ -397,17 +431,29 @@ describe("current Git targets matched against actual v2 writes", () => {
 		);
 		await rename(rawPath, `${rawPath}.test-held`);
 		try {
-			expect((await view()).byFile[0]?.worktree.reason).toBe("missing_raw");
+			expect((await view()).byFile[0]?.worktree).toMatchObject({
+				status: "unknown",
+				reason: "missing_raw",
+				actor: null,
+			});
 		} finally {
 			await rename(`${rawPath}.test-held`, rawPath);
 		}
+	});
+
+	test("a real 5MiB file exceeding the source budget can never name a matching actor", async () => {
+		await matchingRawFixture();
 		const file = await open(join(workspace, "a.txt"), "r+");
 		try {
 			await file.truncate(5 * 1024 * 1024);
 		} finally {
 			await file.close();
 		}
-		expect((await view()).byFile[0]?.worktree.reason).toBe("budget_exceeded");
+		expect((await view()).byFile[0]?.worktree).toMatchObject({
+			status: "unknown",
+			reason: "budget_exceeded",
+			actor: null,
+		});
 	});
 
 	test("an effect beyond the bounded sample remains unknown rather than silently complete", async () => {

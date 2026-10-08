@@ -1,0 +1,1 @@
+CREATE INDEX `idx_revert_operation_owner_pending` ON `revert_operations` (`requested_by_subject_key`,`narrator_id`,`project_id`,`status`,`updated_at`,`id`);

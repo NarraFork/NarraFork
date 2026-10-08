@@ -39,6 +39,7 @@ const ROOT = join(import.meta.dir, "../../..");
 
 /** Every PostgreSQL counterpart module shipped by batch E. */
 const PG_MODULES: ReadonlyArray<readonly [path: string, ownVocabulary: string]> = [
+	["server/services/workspace-lease-contract.ts", "WorkspaceWriteCoordinatorError"],
 	["server/services/postgres-revert-plan-store.ts", "PostgresRevertPlanStore"],
 	["server/services/postgres-revert-journal-store.ts", "PostgresRevertMutationJournal"],
 	["server/services/postgres-file-change-evidence-store.ts", "PostgresFileChangeEvidenceStore"],
@@ -85,6 +86,28 @@ async function bundle(relativePath: string): Promise<string> {
 }
 
 describe("the PostgreSQL write path never touches bun:sqlite", () => {
+	test("shared lease errors retain coordinator identity across SQLite and PostgreSQL", async () => {
+		const [coordinator, contract, postgres] = await Promise.all([
+			import("../workspace-write-coordinator"),
+			import("../workspace-lease-contract"),
+			import("../postgres-workspace-lease-store"),
+		]);
+		expect(coordinator.WorkspaceWriteCoordinatorError).toBe(
+			contract.WorkspaceWriteCoordinatorError,
+		);
+		expect(coordinator.workspaceLeaseInternals).toBe(contract.workspaceLeaseInternals);
+		expect(coordinator.WORKSPACE_WRITE_COORDINATOR_LIMITS).toBe(
+			contract.WORKSPACE_WRITE_COORDINATOR_LIMITS,
+		);
+		let caught: unknown;
+		try {
+			postgres.parsePostgresWorkspaceMutationManifest({});
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(coordinator.WorkspaceWriteCoordinatorError);
+		expect(caught).toMatchObject({ code: "needs_verification" });
+	});
 	for (const [module, ownVocabulary] of PG_MODULES) {
 		test(`${module} bundles free of the SQLite driver, the raw-handle vocabulary and the bootstrap`, async () => {
 			const bundled = await bundle(module);

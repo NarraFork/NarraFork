@@ -1,0 +1,2 @@
+CREATE INDEX `idx_narrator_refs_compact_seq` ON `narrator_message_refs` (`narrator_id`,`is_compact`,`seq`);--> statement-breakpoint
+CREATE INDEX `idx_toolcalls_status_narrator_created` ON `narrator_tool_calls` (`status`,`narrator_id`,`created_at`);

@@ -1,3 +1,16 @@
+import {
+	decimalValue,
+	isRawPriceField,
+	type JSONValue,
+	type ModelCard,
+	modelCardView,
+	type RawCatalog,
+	type RawMetadata,
+	type RawModel,
+	type RawVariant,
+	validateRawMetadata,
+} from "./card";
+import { normalizeRawLocalState } from "./card-local";
 import type {
 	FieldSource,
 	LocalCatalogState,
@@ -6,19 +19,6 @@ import type {
 	ModelQuery,
 } from "./schema/catalog";
 import { createModelMetadataResolver } from "./src/index";
-import { normalizeRawLocalState } from "./card-local";
-import {
-	decimalValue,
-	isRawPriceField,
-	modelCardView,
-	validateRawMetadata,
-	type JSONValue,
-	type ModelCard,
-	type RawCatalog,
-	type RawMetadata,
-	type RawModel,
-	type RawVariant,
-} from "./card";
 
 export interface RawLocalState {
 	revision: number;

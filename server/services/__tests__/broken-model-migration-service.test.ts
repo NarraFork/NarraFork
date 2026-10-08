@@ -10,8 +10,13 @@ import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:tes
 import { inArray } from "drizzle-orm";
 import { db } from "../../db";
 import { narrators } from "../../db/schema";
+import { resolveProviderAndModel } from "../../lib/agent/provider";
 import { ValidationError } from "../../lib/errors";
-import { deleteNugCachedModels, setNugCachedModels } from "../../lib/nug-model-cache";
+import {
+	deleteNugCachedModels,
+	isNugCachedModelAvailable,
+	setNugCachedModels,
+} from "../../lib/nug-model-cache";
 import { settings } from "../../lib/settings";
 import {
 	applyModelMigration,
@@ -184,11 +189,52 @@ describe("broken model scan classification", () => {
 		];
 		settings.agent.customModels = [];
 		setNugCachedModels("nug-test-id", [
-			{ id: "antigravity:down-model", channel: "antigravity", model: "down-model", available: false },
+			{
+				id: "antigravity:down-model",
+				channel: "antigravity",
+				// Channel identity is not a wire protocol; the gateway declares the supported delegate type.
+				channelType: "openai",
+				model: "down-model",
+				available: false,
+			},
 		]);
-		await createNarrator({ suffix: "nug-down", model: "nugtest:antigravity:down-model" });
+		const model = "nugtest:antigravity:down-model";
+		expect(isNugCachedModelAvailable("nug-test-id", "antigravity:down-model")).toBe(false);
+		expect(() => resolveProviderAndModel(model)).not.toThrow();
+		await createNarrator({ suffix: "nug-down", model });
 
 		expect((await scanOurs()).groups).toHaveLength(0);
+	});
+
+	test("unavailable NUG models with an unsupported protocol remain broken", async () => {
+		settings.nugProviders = [
+			{
+				id: "nug-test-id",
+				name: "nug-test",
+				prefix: "nugtest",
+				baseUrl: "https://example.invalid",
+				apiKey: "test-key",
+				defaultModel: "unsupported:down-model",
+			},
+		];
+		settings.agent.customModels = [];
+		setNugCachedModels("nug-test-id", [
+			{
+				id: "unsupported:down-model",
+				channel: "unsupported",
+				channelType: "unsupported",
+				model: "down-model",
+				available: false,
+			},
+		]);
+		const model = "nugtest:unsupported:down-model";
+		expect(isNugCachedModelAvailable("nug-test-id", "unsupported:down-model")).toBe(false);
+		expect(() => resolveProviderAndModel(model)).toThrow("unsupported channelType");
+		const id = await createNarrator({ suffix: "nug-invalid-protocol", model });
+		const scan = await scanOurs();
+		expect(scan.groups).toHaveLength(1);
+		expect(scan.groups[0].reason).toBe("provider_missing");
+		expect(scan.groups[0].narrators.map((entry) => entry.id)).toEqual([id]);
 	});
 
 	test("excludes subagents, whose model is a derived task snapshot", async () => {

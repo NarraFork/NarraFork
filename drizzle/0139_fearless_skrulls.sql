@@ -1,0 +1,1 @@
+ALTER TABLE `user_preferences` ADD `tutorial_progress` text DEFAULT '{}' NOT NULL;

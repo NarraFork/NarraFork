@@ -1,0 +1,1 @@
+ALTER TABLE `narrators` ADD `avatar_image_id` text;

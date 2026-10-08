@@ -802,11 +802,11 @@ describe("protocol receipts stay out of displayed tool output", () => {
 				_text:
 					"<background_task_id>tests</background_task_id>\n\nBackground bash task started. Use Await...",
 			},
-		labels: { backgroundTaskStarted: "已在后台启动" },
-	});
-	expect(metaBadgeLabels(d)).toEqual([]);
-	expect(metaTexts(d)).toContain("已在后台启动");
-	expect(metaTexts(d)).not.toContain("tests");
+			labels: { backgroundTaskStarted: "已在后台启动" },
+		});
+		expect(metaBadgeLabels(d)).toEqual([]);
+		expect(metaTexts(d)).toContain("已在后台启动");
+		expect(metaTexts(d)).not.toContain("tests");
 		expect(asSections(d).sections.some((part) => part.key === "output.main")).toBe(false);
 		expect((sectionBody(d, "command") as ToolCappedDetail).text).toBe("$ bun test");
 	});

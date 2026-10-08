@@ -128,7 +128,27 @@ describeWithTsx("element tree", () => {
 });
 
 describeWithTsx("regression: the real NarratorPanel render tree", () => {
-	test("the 851-line return is no longer invisible", async () => {
+	test("stable early-return and main JSX trees preserve exact roots, nesting and ranges", async () => {
+		const tree = await treeOf(`export function StablePanel({ ready }) {
+	if (!ready) return <PanelSkeleton />;
+	return (
+		<Ctx.Provider>
+			<Shell>
+				{ready && <Content />}
+			</Shell>
+		</Ctx.Provider>
+	);
+}
+`);
+		expect(tree.map(({ name, line, endLine }) => ({ name, line, endLine }))).toEqual([
+			{ name: "PanelSkeleton", line: 2, endLine: 2 },
+			{ name: "Ctx.Provider", line: 4, endLine: 8 },
+		]);
+		expect(names(tree)).toEqual(["PanelSkeleton", "Ctx.Provider", "Shell", "Content"]);
+		expect(find(tree, "Content")?.condition).toBe("and");
+	});
+
+	test("the real component render tree remains visible after its loading wrapper changes", async () => {
 		const text = await Bun.file("frontend/components/narrator/NarratorPanel.tsx").text();
 		clearOutlineCache();
 		const tree =
@@ -140,13 +160,8 @@ describeWithTsx("regression: the real NarratorPanel render tree", () => {
 		expect(tree.length).toBeGreaterThan(0);
 		const all = names(tree);
 		expect(all.length).toBeGreaterThan(20);
-		// The first root is an early-return guard (`if (!narrator) return <Skeleton/>`),
-		// which is itself structure the outline never showed.
-		expect(tree[0]?.name).toBe("NarratorPanelSkeleton");
-		// The main render tree lives past L2600, where the outline stopped producing
-		// anything at all (its last entry was L2628).
-		const deepest = Math.max(...tree.map((n) => n.line));
-		expect(deepest).toBeGreaterThan(2600);
+		// Root names and absolute offsets belong to the stable fixture, not component layout.
+		expect(tree.every((node) => node.line > 0 && node.endLine >= node.line)).toBe(true);
 		expect(find(tree, "PermEnterHintCtx.Provider")).toBeDefined();
 	});
 });

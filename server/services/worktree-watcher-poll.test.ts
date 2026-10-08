@@ -28,6 +28,7 @@ import { MAX_SKIPPED_POLLS, worktreeWatcher } from "./worktree-watcher";
 
 const tempDirs: string[] = [];
 const snapshotPaths: string[] = [];
+const capturedTrees = new Map<string, string>();
 
 async function createRepo(prefix: string): Promise<string> {
 	const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -60,24 +61,28 @@ function registerEntry(worktreePath: string): void {
 	});
 }
 
-/** Count `tryCapture` calls for the duration of `run`, keeping the real behaviour. */
+/** Count `tryCaptureHot` calls for the duration of `run`, keeping the real behaviour. */
 async function countCaptures(run: () => Promise<void>): Promise<number> {
-	const original = worktreeTreeSnapshot.tryCapture;
+	const original = worktreeTreeSnapshot.tryCaptureHot;
 	let calls = 0;
-	worktreeTreeSnapshot.tryCapture = async function (...args) {
+	worktreeTreeSnapshot.tryCaptureHot = async function (...args) {
 		calls += 1;
-		return original.apply(this, args);
+		const tree = await original.apply(this, args);
+		expect(tree).toBeString();
+		if (tree) capturedTrees.set(args[0], tree);
+		return tree;
 	};
 	try {
 		await run();
 	} finally {
-		worktreeTreeSnapshot.tryCapture = original;
+		worktreeTreeSnapshot.tryCaptureHot = original;
 	}
 	return calls;
 }
 
 afterEach(async () => {
 	clearStatusCache();
+	capturedTrees.clear();
 	for (const dir of tempDirs.splice(0)) {
 		worktreeWatcher.unwatchAll(dir);
 		await worktreeTreeSnapshot.destroy(dir, undefined, { force: true }).catch(() => {});
@@ -128,6 +133,11 @@ describe("watcher polling ticks", () => {
 			await worktreeWatcher._processChange(repo, entry, true);
 		});
 		expect(captures).toBe(1);
+		const captured = capturedTrees.get(repo);
+		if (!captured) throw new Error("No actual watcher capture");
+		expect(await worktreeTreeSnapshot.readFileAtTree(repo, captured, "seed.txt")).toBe(
+			"edited outside the tool path\n",
+		);
 	});
 
 	test("a watcher event captures even when git status is unchanged", async () => {
@@ -170,6 +180,11 @@ describe("watcher polling ticks", () => {
 			await worktreeWatcher._processChange(repo, entry, true);
 		});
 		expect(captures).toBe(1);
+		const captured = capturedTrees.get(repo);
+		if (!captured) throw new Error("No tracked-ignored watcher capture");
+		expect(await worktreeTreeSnapshot.readFileAtTree(repo, captured, ".env")).toBe(
+			"SECRET=rotated\n",
+		);
 	});
 
 	test("an equal-sized in-place edit is eventually captured by the tick sweep", async () => {
@@ -212,7 +227,8 @@ describe("watcher polling ticks", () => {
 		expect(eventual).toBeGreaterThan(0);
 		// And the captured tree holds the new bytes, which is the property the boundary
 		// exists for — a capture of stale content would satisfy the count and nothing else.
-		const tree = await worktreeTreeSnapshot.capture(repo);
+		const tree = capturedTrees.get(repo);
+		if (!tree) throw new Error("Sweep did not publish an actual captured tree");
 		expect(await worktreeTreeSnapshot.readFileAtTree(repo, tree, "seed.txt")).toBe("bbbb\n");
 	});
 

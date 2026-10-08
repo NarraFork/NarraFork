@@ -1,0 +1,1 @@
+ALTER TABLE `users` ADD `mfa_enabled` integer DEFAULT false NOT NULL;

@@ -106,23 +106,55 @@ describe("ask-in-passing canonical document mutations", () => {
 			const { PretextLayoutCoordinator } = await import("./pretext-layout-coordinator");
 			const coordinator = new PretextLayoutCoordinator();
 			const base = [message(0), message(1)];
-			const pending = { ...message(1), id: "epoch-A", role: "system", contentJson: [{ type: "ask_in_passing", status: "pending", sourceMessageId: "insert-m0" }] } as unknown as TreeMessage;
-			const later = eventKind === "insert"
-				? { ...pending, id: "epoch-B" }
-				: { ...pending, contentJson: [{ type: "ask_in_passing", status: "resolved", sourceMessageId: "insert-m0", targetNarratorId: "target" }] } as unknown as TreeMessage;
+			const pending = {
+				...message(1),
+				id: "epoch-A",
+				role: "system",
+				contentJson: [{ type: "ask_in_passing", status: "pending", sourceMessageId: "insert-m0" }],
+			} as unknown as TreeMessage;
+			const later =
+				eventKind === "insert"
+					? { ...pending, id: "epoch-B" }
+					: ({
+							...pending,
+							contentJson: [
+								{
+									type: "ask_in_passing",
+									status: "resolved",
+									sourceMessageId: "insert-m0",
+									targetNarratorId: "target",
+								},
+							],
+						} as unknown as TreeMessage);
 			const deferred = Promise.withResolvers<void>();
 			const started = Promise.withResolvers<void>();
 			let fetches = 0;
-			const canonical = eventKind === "insert"
-				? [base[0], later, { ...pending, seq: 2 }, { ...base[1], seq: 3 }]
-				: [base[0], later, { ...base[1], seq: 2 }];
+			const canonical =
+				eventKind === "insert"
+					? [base[0], later, { ...pending, seq: 2 }, { ...base[1], seq: 3 }]
+					: [base[0], later, { ...base[1], seq: 2 }];
 			await coordinator.load("n1", BUILD, {
 				locateMessage: async () => ({ seq: 0 }),
 				fetchPage: async () => {
 					fetches++;
-					if (fetches === 2) { started.resolve(); await deferred.promise; }
-					const messages = fetches === 1 ? base : fetches === 2 ? [base[0], pending, { ...base[1], seq: 2 }] : canonical;
-					return { messages, minSeq: 0, maxSeq: messages.length - 1, hasNext: false, hasPrev: false, messageVersion: fetches === 1 ? 7 : fetches === 2 ? 8 : 9 };
+					if (fetches === 2) {
+						started.resolve();
+						await deferred.promise;
+					}
+					const messages =
+						fetches === 1
+							? base
+							: fetches === 2
+								? [base[0], pending, { ...base[1], seq: 2 }]
+								: canonical;
+					return {
+						messages,
+						minSeq: 0,
+						maxSeq: messages.length - 1,
+						hasNext: false,
+						hasPrev: false,
+						messageVersion: fetches === 1 ? 7 : fetches === 2 ? 8 : 9,
+					};
 				},
 			});
 			expect(coordinator.upsertMessage(pending, false, scrolledUp)).toBe(false);
@@ -140,7 +172,10 @@ describe("ask-in-passing canonical document mutations", () => {
 			if (eventKind === "resolved") {
 				expect(rows.find((row) => row.id === pending.id)?.contentJson[0]?.status).toBe("resolved");
 				coordinator.upsertMessage(pending, false, scrolledUp);
-				expect(coordinator.getSnapshot().input?.messages.find((row) => row.id === pending.id)?.contentJson[0]?.status).toBe("resolved");
+				expect(
+					coordinator.getSnapshot().input?.messages.find((row) => row.id === pending.id)
+						?.contentJson[0]?.status,
+				).toBe("resolved");
 			}
 		});
 	}

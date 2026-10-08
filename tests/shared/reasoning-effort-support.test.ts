@@ -82,10 +82,11 @@ describe("claudeVersionAtLeast", () => {
 });
 
 describe("isPreEffortClaudeModel", () => {
-	test("excludes Sonnet/Opus below 4.6", () => {
+	test("excludes Sonnet below 4.6 and Opus below 4.5", () => {
 		for (const model of [
 			"claude-sonnet-4.5",
-			"claude-opus-4-5",
+			"claude-opus-4-0",
+			"claude-opus-4.1",
 			"claude-sonnet-4-20250514",
 			"claude-3-7-sonnet-20250219",
 			"claude-3-5-sonnet-20241022",
@@ -179,6 +180,30 @@ describe("modelAcceptsReasoningEffort", () => {
 		}
 	});
 
+	test.each([
+		"claude-opus-4-5",
+		"claude-opus-4.5",
+		"claude-opus-4-5-20251101",
+		"anthropic:claude-opus-4-5",
+		"anthropic:claude-opus-4.5",
+		"anthropic:claude-opus-4-5-20251101",
+	])("accepts Opus 4.5 effort without losing id normalization: %s", (model) => {
+		expect(parseClaudeModel(model)).toEqual({ family: "opus", major: 4, minor: 5 });
+		expect(isPreEffortClaudeModel(model)).toBe(false);
+		expect(modelAcceptsReasoningEffort(model)).toBe(true);
+		expect(mapGenericReasoningEffort(model, "low")).toBe("low");
+		expect(mapGenericReasoningEffort(model, "medium")).toBe("medium");
+	});
+
+	test("an explicit blocklist still overrides Opus 4.5 support", () => {
+		const blocklist = [{ pattern: "/^claude-opus-4[.-]5/" }];
+		for (const model of ["claude-opus-4-5", "anthropic:claude-opus-4.5"]) {
+			expect(modelAcceptsReasoningEffort(model, blocklist)).toBe(false);
+			expect(mapGenericReasoningEffort(model, "low", blocklist)).toBeUndefined();
+			expect(modelAcceptsReasoningEffort(model, [{ ...blocklist[0], enabled: false }])).toBe(true);
+		}
+	});
+
 	test("respects the built-in pre-effort Claude rule", () => {
 		expect(modelAcceptsReasoningEffort("claude-sonnet-4.5")).toBe(false);
 		expect(modelAcceptsReasoningEffort("claude-opus-4-6")).toBe(true);
@@ -201,10 +226,9 @@ describe("modelAcceptsReasoningEffort", () => {
 	});
 
 	test("applies the built-in Claude rule through a channel prefix too", () => {
-		// A pre-4.6 Claude routed through a channel must stay excluded, or the
-		// official API 400s on output_config.effort.
+		// Unsupported Claude generations must stay excluded through a channel.
 		expect(modelAcceptsReasoningEffort("anthropic:claude-sonnet-4.5")).toBe(false);
-		expect(modelAcceptsReasoningEffort("anthropic:claude-sonnet-4.5")).toBe(false);
+		expect(modelAcceptsReasoningEffort("anthropic:claude-opus-4-20250514")).toBe(false);
 		expect(modelAcceptsReasoningEffort("anthropic:claude-opus-4-6")).toBe(true);
 	});
 

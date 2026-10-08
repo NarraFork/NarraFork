@@ -4,9 +4,9 @@ import {
 	modelCardView,
 	multiplyDecimal,
 	patchRawMetadata,
+	type RawMetadata,
 	rawCatalogFromModelFiles,
 	validateRawMetadata,
-	type RawMetadata,
 } from "./card";
 
 const samples: Record<string, RawMetadata> = {

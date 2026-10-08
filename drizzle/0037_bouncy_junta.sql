@@ -1,0 +1,1 @@
+ALTER TABLE `narrators` ADD `plan_file_id` text;

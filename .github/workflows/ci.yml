@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  static-checks:
+    name: Static checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Check SQLite migration assets
+        run: bun scripts/check-sqlite-migration-assets.ts
+      - name: Check formatting and lint
+        run: bunx @biomejs/biome check .
+      - name: Check translations
+        run: bun run i18n:check
+
+  build:
+    name: Build and typecheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      # Vite generates the route tree; a clean checkout must build before typecheck.
+      - name: Build frontend
+        run: bun run build
+      - name: Verify build outputs
+        run: |
+          test -f dist/frontend/index.html
+          test -f frontend/routeTree.gen.ts
+      # Root tests import the extension's type-only API; its vscode types live here.
+      - name: Install VS Code extension type dependencies
+        run: bun install --cwd vscode-extension --frozen-lockfile
+      - name: Check TypeScript
+        run: bunx tsgo --noEmit
+      - name: Upload frontend build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-frontend
+          path: dist/frontend/
+          if-no-files-found: error
+          retention-days: 7
+
+  tests:
+    name: Tests (${{ matrix.shard }}/4)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Download frontend build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ci-frontend
+          path: dist/frontend/
+      - name: Verify downloaded build
+        run: test -f dist/frontend/index.html
+      - name: Install test system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes zstd podman git ripgrep
+          command -v zstd
+          zstd --version
+          command -v podman
+          podman --version
+          command -v git
+          git --version
+          command -v rg
+          rg --version
+          mkdir -p .narrafork artifacts
+      - name: Prepare PostgreSQL test image
+        # Match the PG harness's original HOME and rootless storage, not sudo's storage.
+        run: |
+          podman info
+          podman pull docker.io/library/postgres:17-alpine
+          podman image inspect docker.io/library/postgres:17-alpine
+      - name: Locate and verify Chrome
+        run: |
+          CHROME_PATH="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium)"
+          test -n "$CHROME_PATH"
+          "$CHROME_PATH" --version
+          printf 'NF_TEST_CHROMIUM_PATH=%s\n' "$CHROME_PATH" >> "$GITHUB_ENV"
+          printf 'PUPPETEER_EXECUTABLE_PATH=%s\n' "$CHROME_PATH" >> "$GITHUB_ENV"
+      - name: Probe headless Chrome
+        run: |
+          bun --eval '
+            import puppeteer from "puppeteer-core";
+            const browser = await puppeteer.launch({
+              executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
+              headless: true,
+              args: ["--no-sandbox", "--disable-setuid-sandbox"],
+              timeout: 15000,
+            });
+            try {
+              const page = await browser.newPage();
+              await page.goto("data:text/html,<title>CI Chrome probe</title>");
+              if (await page.title() !== "CI Chrome probe") throw new Error("Chrome probe failed");
+            } finally {
+              await browser.close();
+            }
+          '
+      - name: Verify test preload isolation
+        run: bun test --isolate tests/preload-isolation.test.ts
+      - name: Run repository tests
+        run: >-
+          bun scripts/run-ci-tests.ts --isolate --only-failures --shard=${{ matrix.shard }}/4
+          --reporter=junit --reporter-outfile=artifacts/ci-tests.xml
+      - name: Verify test report
+        run: test -s artifacts/ci-tests.xml
+      - name: Upload test report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-test-results-${{ matrix.shard }}
+          path: |
+            artifacts/ci-tests.xml
+            artifacts/native-tests*.log
+          if-no-files-found: error
+          retention-days: 7
+
+  gate:
+    name: CI Gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: ${{ always() }}
+    needs: [static-checks, build, tests]
+    steps:
+      - name: Require every CI job to succeed
+        env:
+          STATIC_RESULT: ${{ needs.static-checks.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          TEST_RESULT: ${{ needs.tests.result }}
+        run: |
+          for result in "$STATIC_RESULT" "$BUILD_RESULT" "$TEST_RESULT"; do
+            if [[ "$result" != success ]]; then
+              printf 'CI dependency did not succeed: %s\n' "$result" >&2
+              exit 1
+            fi
+          done

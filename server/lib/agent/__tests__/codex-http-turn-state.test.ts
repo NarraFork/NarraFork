@@ -76,7 +76,10 @@ describe("codex HTTP turn-state", () => {
 				// token this response hands back.
 				return new Response(
 					JSON.stringify({
-						error: { message: "Unsupported parameter: prompt_cache_key", type: "invalid_request_error" },
+						error: {
+							message: "Unsupported parameter: prompt_cache_key",
+							type: "invalid_request_error",
+						},
 					}),
 					{
 						status: 400,

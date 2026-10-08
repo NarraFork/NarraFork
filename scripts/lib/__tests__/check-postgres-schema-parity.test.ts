@@ -404,10 +404,10 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 115 tables and 1661 columns including resource inventory and context snapshots", () => {
-		expect(target.tables.length).toBe(115);
-		// 1658 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1661);
+	test("covers 116 tables and 1671 columns including question events and context snapshots", () => {
+		expect(target.tables.length).toBe(116);
+		// 1668 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1671);
 		for (const name of ["narrators", "api_requests"]) {
 			expect(
 				target.tables
@@ -420,6 +420,23 @@ describe("real schema parity", () => {
 				.find((table) => table.name === "narrator_worktree_resources")
 				?.columns.map((column) => column.property),
 		).toContain("scopeOwnerUserId");
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_question_events")
+				?.columns.map((column) => column.property),
+		).toEqual(["questionId", "messageId", "kind", "resolutionJson", "createdAt"]);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_questions")
+				?.columns.map((column) => column.property),
+		).toEqual(
+			expect.arrayContaining(["context", "resolutionJson", "withdrawReason", "summaryJson"]),
+		);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrators")
+				?.columns.map((column) => column.property),
+		).toContain("lastStopReason");
 	});
 
 	test("the PG-only insert_seq identity columns are present on exactly the three ordinal tables", () => {

@@ -60,7 +60,7 @@ import ReactDOM from "react-dom/client";
  * bootstrap concerns.
  */
 import { App } from "./App";
-import { cleanupStaleNarratorDockLayouts } from "./components/narrator/dock/narrator-dock-layout";
+import { cleanupStaleNarratorDockLayouts } from "./components/narrator/dock/narrator-dock-storage-cleanup";
 import { isPublicNarratorSharePath } from "./lib/app-path-classify";
 import { getRouterBasepath } from "./lib/base-path";
 import { installHostBridge } from "./lib/host-bridge";

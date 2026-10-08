@@ -1,0 +1,1 @@
+ALTER TABLE `user_recent_tabs` ADD `dir_sort_order` integer;

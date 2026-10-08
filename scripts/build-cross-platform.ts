@@ -7,14 +7,7 @@
  *   bun scripts/build-cross-platform.ts --skip-frontend    # skip Vite build
  */
 import { execSync } from "node:child_process";
-import {
-	existsSync,
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	statSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { Worker } from "node:worker_threads";
 import { buildLicenseManifestFromDisk } from "../server/lib/licenses/manifest";
@@ -57,14 +50,38 @@ const platformArg = args.find((a) => a.startsWith("--platform="))?.split("=")[1]
 // NOTE: platformId must match the format returned by getPlatform() in update-service.ts
 // (e.g. "darwin-arm64", "win-x64", "linux-x64-baseline")
 const PLATFORMS = [
-	{ target: "bun-darwin-arm64", platformId: "darwin-arm64", name: `narrafork-${VERSION}-macos-arm64` },
+	{
+		target: "bun-darwin-arm64",
+		platformId: "darwin-arm64",
+		name: `narrafork-${VERSION}-macos-arm64`,
+	},
 	{ target: "bun-darwin-x64", platformId: "darwin-x64", name: `narrafork-${VERSION}-macos-x64` },
 	{ target: "bun-linux-x64", platformId: "linux-x64", name: `narrafork-${VERSION}-linux-x64` },
-	{ target: "bun-linux-x64-baseline", platformId: "linux-x64-baseline", name: `narrafork-${VERSION}-linux-x64-baseline` },
-	{ target: "bun-linux-arm64", platformId: "linux-arm64", name: `narrafork-${VERSION}-linux-arm64` },
-	{ target: "bun-windows-x64", platformId: "win-x64", name: `narrafork-${VERSION}-windows-x64.exe` },
-	{ target: "bun-windows-x64-baseline", platformId: "win-x64-baseline", name: `narrafork-${VERSION}-windows-x64-baseline.exe` },
-	{ target: "bun-windows-arm64", platformId: "win-arm64", name: `narrafork-${VERSION}-windows-arm64.exe` },
+	{
+		target: "bun-linux-x64-baseline",
+		platformId: "linux-x64-baseline",
+		name: `narrafork-${VERSION}-linux-x64-baseline`,
+	},
+	{
+		target: "bun-linux-arm64",
+		platformId: "linux-arm64",
+		name: `narrafork-${VERSION}-linux-arm64`,
+	},
+	{
+		target: "bun-windows-x64",
+		platformId: "win-x64",
+		name: `narrafork-${VERSION}-windows-x64.exe`,
+	},
+	{
+		target: "bun-windows-x64-baseline",
+		platformId: "win-x64-baseline",
+		name: `narrafork-${VERSION}-windows-x64-baseline.exe`,
+	},
+	{
+		target: "bun-windows-arm64",
+		platformId: "win-arm64",
+		name: `narrafork-${VERSION}-windows-arm64.exe`,
+	},
 ];
 
 const selectedPlatforms = platformArg
@@ -419,9 +436,7 @@ interface WorkerResult {
 	metadata?: BinaryMetadata;
 }
 
-function runPostProcessWorker(
-	platform: (typeof selectedPlatforms)[number],
-): Promise<WorkerResult> {
+function runPostProcessWorker(platform: (typeof selectedPlatforms)[number]): Promise<WorkerResult> {
 	return new Promise((resolve, reject) => {
 		const worker = new Worker(join(import.meta.dir, "post-process-worker.ts"), {
 			workerData: {
@@ -445,7 +460,9 @@ function runPostProcessWorker(
 					console.log(`  [${platform.platformId}] ${msg.message}`);
 				} else if (msg.type === "done") {
 					if (!msg.latestYml) {
-						reject(new Error(`Worker for ${platform.platformId} completed without latest.yml data`));
+						reject(
+							new Error(`Worker for ${platform.platformId} completed without latest.yml data`),
+						);
 						return;
 					}
 					resolve({ latestYml: msg.latestYml, metadata: msg.metadata });
@@ -455,7 +472,8 @@ function runPostProcessWorker(
 
 		worker.on("error", reject);
 		worker.on("exit", (code) => {
-			if (code !== 0) reject(new Error(`Worker for ${platform.platformId} exited with code ${code}`));
+			if (code !== 0)
+				reject(new Error(`Worker for ${platform.platformId} exited with code ${code}`));
 		});
 	});
 }

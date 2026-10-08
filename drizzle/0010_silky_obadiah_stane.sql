@@ -1,0 +1,1 @@
+CREATE INDEX `idx_narrator_refs_segment_compact` ON `narrator_message_refs` (`segment_compact_id`);

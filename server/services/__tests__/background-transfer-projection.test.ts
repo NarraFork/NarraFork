@@ -271,7 +271,7 @@ describe("restart recovery keeps the two halves in agreement", () => {
 		expect(row?.output).toBe(TRANSFER_RESTART_PAUSE_NOTICE);
 	});
 
-	test("a bash task still recovers as cancelled", async () => {
+	test("a bash task recovers as failed with unknown outcome and is not rerun", async () => {
 		// The transfer carve-out must not soften recovery for the kinds that really
 		// are destroyed by a restart: a dead child process has no resume path.
 		await seedParent();
@@ -281,7 +281,10 @@ describe("restart recovery keeps the two halves in agreement", () => {
 			command: "sleep 100",
 		});
 		await backgroundTaskService.recoverStaleTasksAfterRestart();
-		expect((await backgroundTaskService.getById("bash-restart"))?.status).toBe("cancelled");
+		expect(await backgroundTaskService.getById("bash-restart")).toMatchObject({
+			status: "failed",
+			output: "Execution outcome unknown after restart; the command was not rerun.",
+		});
 	});
 
 	test("recovery does not emit a cancellation event for a paused transfer", async () => {

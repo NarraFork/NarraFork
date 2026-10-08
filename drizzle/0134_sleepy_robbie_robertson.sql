@@ -1,0 +1,1 @@
+ALTER TABLE `user_preferences` ADD `recent_tabs_group_mode` text DEFAULT 'flat' NOT NULL;

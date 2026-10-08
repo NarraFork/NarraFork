@@ -1,0 +1,1 @@
+ALTER TABLE `user_preferences` ADD `add_subagent_to_recent_tabs` integer DEFAULT true NOT NULL;

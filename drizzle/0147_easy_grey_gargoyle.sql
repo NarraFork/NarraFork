@@ -1,0 +1,1 @@
+ALTER TABLE `file_attributions` ADD `user_id` text REFERENCES users(id);

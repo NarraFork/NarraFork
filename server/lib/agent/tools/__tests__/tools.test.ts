@@ -1390,20 +1390,78 @@ describe("rawJsonSchema parity for all tools", () => {
 			}
 		});
 
-		(skip ? test.skip : test)(`${tool.name}: rawJsonSchema.required matches Zod required`, () => {
-			const zodSchema = zodToJsonSchema(tool.parameters);
-			const zodRequired = new Set((zodSchema.required as string[]) ?? []);
-			const rawRequired = new Set(requireRawJsonSchema(tool).required ?? []);
-			// rawJsonSchema must not require fields that Zod considers optional
-			for (const key of rawRequired) {
-				expect(zodRequired).toContain(key);
-			}
-			// Zod required fields must also be required in rawJsonSchema
-			for (const key of zodRequired) {
-				expect(rawRequired).toContain(key);
-			}
-		});
+		(skip ? test.skip : test)(
+			`${tool.name}: required fields honor the advertised/runtime contract`,
+			() => {
+				const zodSchema = zodToJsonSchema(tool.parameters);
+				const zodRequired = new Set((zodSchema.required as string[]) ?? []);
+				const rawRequired = new Set(requireRawJsonSchema(tool).required ?? []);
+				if (tool.name === "AskUserQuestion") {
+					// Model-facing calls advertise asking. Runtime maintenance may withdraw
+					// an existing question without presenting any new question (tested below).
+					expect([...rawRequired]).toEqual(["questions"]);
+					expect([...zodRequired]).toEqual([]);
+					return;
+				}
+				// rawJsonSchema must not require fields that Zod considers optional
+				for (const key of rawRequired) {
+					expect(zodRequired).toContain(key);
+				}
+				// Zod required fields must also be required in rawJsonSchema
+				for (const key of zodRequired) {
+					expect(rawRequired).toContain(key);
+				}
+			},
+		);
 	}
+});
+
+describe("AskUserQuestion advertised/maintenance contract (intentional)", () => {
+	test("advertises questions as required without requiring maintenance-only fields", () => {
+		const raw = requireRawJsonSchema(askUserQuestionTool);
+		expect(raw.required).toEqual(["questions"]);
+		expect(raw.properties?.questions).toBeDefined();
+		expect(raw.properties?.withdraw).toBeDefined();
+		expect(raw.required).not.toContain("withdraw");
+		expect(raw.required).not.toContain("async");
+	});
+
+	test("runtime accepts a withdraw-only maintenance call with no new questions", () => {
+		const input = { withdraw: ["own-question-id"] };
+		const parsed = askUserQuestionTool.parameters.safeParse(input);
+		expect(parsed.success).toBe(true);
+		if (!parsed.success) throw new Error("Valid withdrawal failed schema validation");
+		expect(parsed.data).toEqual(input);
+		expect(parsed.data).not.toHaveProperty("questions");
+	});
+
+	test("runtime rejects empty operations instead of silently accepting missing questions", () => {
+		for (const input of [
+			{},
+			{ async: true },
+			{ questions: [] },
+			{ withdraw: [] },
+			{ questions: [], withdraw: [] },
+		]) {
+			expect(askUserQuestionTool.parameters.safeParse(input).success).toBe(false);
+		}
+	});
+
+	test("new questions still require a nonempty header and options, including combined maintenance", () => {
+		const question = { header: "Choose", options: [] };
+		expect(askUserQuestionTool.parameters.safeParse({ questions: [question] }).success).toBe(true);
+		expect(
+			askUserQuestionTool.parameters.safeParse({
+				questions: [question],
+				withdraw: ["own-question-id"],
+			}).success,
+		).toBe(true);
+		for (const invalid of [{ options: [] }, { header: " " }, { header: "Choose" }]) {
+			expect(askUserQuestionTool.parameters.safeParse({ questions: [invalid] }).success).toBe(
+				false,
+			);
+		}
+	});
 });
 
 describe("ExitPlanMode schema divergence (intentional)", () => {

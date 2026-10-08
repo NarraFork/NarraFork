@@ -4,7 +4,7 @@ import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorBufferedMessages, narratorMessages, narrators } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({ ...ws, broadcastToNarrator: () => {} }));
 const { resumeNextBufferedMessage } = await import("../narrator-session");

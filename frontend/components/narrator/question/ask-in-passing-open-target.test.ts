@@ -17,9 +17,19 @@
  *      takes for the sibling "prefer the dock" rule.
  */
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import * as router from "@tanstack/react-router";
+import { createElement } from "react";
+import { renderToString } from "react-dom/server";
+import { NarratorDockContext, type NarratorDockContextValue } from "../dock/NarratorDockContext";
+import {
+	type UseVListAskInPassingArgs,
+	useVListAskInPassing,
+	type VListAskInPassingActions,
+} from "../vlist/vlist-ask-in-passing-bridge";
 import { resolveAskInPassingOpenPlan } from "./ask-in-passing-open-target";
 
 const CARD = readFileSync(join(import.meta.dir, "AskInPassingCard.tsx"), "utf8");
@@ -88,10 +98,69 @@ describe("wiring — every path to the answer goes through the shared opener", (
 	});
 
 	it("the vlist bridge shares the opener rather than routing on its own", () => {
-		// The virtual list is the default renderer, so a divergence here means most
-		// readers get the old leave-the-page behaviour while the chunked path is fixed.
 		expect(BRIDGE).toContain("useOpenAskInPassingNarrator");
-		expect(BRIDGE).toContain("map.set(key, () => openAnswer(targetNarratorId));");
 		expect(BRIDGE).not.toContain("useNavigate");
 	});
+
+	for (const dockAvailable of [true, false])
+		it(`openByKey resolves the row's own answer using the real shared opener (dock=${dockAvailable})`, () => {
+			const navigate = mock((_input: unknown) => Promise.resolve());
+			const openSubagentPanel = mock((_id: string) => {});
+			const routeSpy = spyOn(router, "useNavigate").mockReturnValue(navigate);
+			const qc = new QueryClient();
+			let actions: VListAskInPassingActions | undefined;
+			const args: UseVListAskInPassingArgs = {
+				narratorId: "parent-conversation",
+				renderItems: ["first", "second", "legacy"].map((key) => ({
+					spec: { key, kind: "ask-in-passing", data: { kind: "resolved" } },
+				})) as unknown as UseVListAskInPassingArgs["renderItems"],
+				sourceIdsByKey: new Map([
+					["first", ["m1"]],
+					["second", ["m2"]],
+					["legacy", ["old"]],
+				]),
+				messages: [
+					{ id: "m1", contentJson: [{ type: "ask_in_passing", targetNarratorId: "answer-one" }] },
+					{ id: "m2", contentJson: [{ type: "ask_in_passing", targetNarratorId: "answer-two" }] },
+					{ id: "old", contentJson: [{ type: "ask_in_passing" }] },
+				],
+			};
+			function Probe() {
+				actions = useVListAskInPassing(args);
+				return null;
+			}
+			try {
+				renderToString(
+					createElement(
+						QueryClientProvider,
+						{ client: qc },
+						createElement(
+							NarratorDockContext.Provider,
+							{
+								value: dockAvailable
+									? ({ openSubagentPanel } as unknown as NarratorDockContextValue)
+									: null,
+							},
+							createElement(Probe),
+						),
+					),
+				);
+				expect(actions?.openByKey.has("legacy")).toBe(false);
+				actions?.openByKey.get("second")?.();
+				actions?.openByKey.get("first")?.();
+				if (dockAvailable) {
+					expect(openSubagentPanel.mock.calls).toEqual([["answer-two"], ["answer-one"]]);
+					expect(navigate).not.toHaveBeenCalled();
+				} else {
+					expect(openSubagentPanel).not.toHaveBeenCalled();
+					expect(navigate.mock.calls).toEqual([
+						[{ to: "/narrators/$narratorId", params: { narratorId: "answer-two" } }],
+						[{ to: "/narrators/$narratorId", params: { narratorId: "answer-one" } }],
+					]);
+				}
+			} finally {
+				routeSpy.mockRestore();
+				qc.clear();
+			}
+		});
 });

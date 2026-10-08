@@ -492,14 +492,23 @@ test("rebuild never inserts an existing generated source column into a generated
 		sqlite.close();
 	}
 });
-test("real 0189 remains valid with both pre-existing generated expressions preserved", () => {
+test("real ownership migration remains valid with both pre-existing generated expressions preserved", () => {
 	const read = (path: string) => readFileSync(resolve(import.meta.dir, "../../..", path), "utf8");
-	const previous = JSON.parse(read("drizzle/meta/0188_snapshot.json")) as ResourceMigrationSnapshot;
-	const next = JSON.parse(read("drizzle/meta/0189_snapshot.json")) as ResourceMigrationSnapshot;
+	const journal = JSON.parse(read("drizzle/meta/_journal.json")) as {
+		entries: { idx: number; tag: string }[];
+	};
+	const target = journal.entries.find((entry) => entry.tag === "0191_worktree_resource_ownership");
+	if (!target) throw new Error("Missing generated ownership migration");
+	const snapshot = (idx: number) =>
+		JSON.parse(
+			read(`drizzle/meta/${String(idx).padStart(4, "0")}_snapshot.json`),
+		) as ResourceMigrationSnapshot;
+	const previous = snapshot(target.idx - 1);
+	const next = snapshot(target.idx);
 	expect(next.tables.narrator_messages.columns.compact_pending.generated?.type).toBe("virtual");
 	expect(next.tables.narrator_tool_calls.columns.started_at.generated?.type).toBe("virtual");
 	expect(() =>
-		assertResourceMigrationValidated(read("drizzle/0189_pale_red_ghost.sql"), previous, next),
+		assertResourceMigrationValidated(read(`drizzle/${target.tag}.sql`), previous, next),
 	).not.toThrow();
 });
 test("PG maps exact UTC text defaults and byte rather than character budgets", () => {

@@ -1,0 +1,2 @@
+ALTER TABLE `background_tasks` ADD `transfer_task_id` text REFERENCES device_transfer_tasks(id);--> statement-breakpoint
+CREATE INDEX `idx_bg_tasks_transfer` ON `background_tasks` (`transfer_task_id`);

@@ -1,0 +1,1 @@
+ALTER TABLE `narrator_tool_calls` ADD `stream_completed_at` text;

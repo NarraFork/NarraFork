@@ -23,9 +23,11 @@
  * ordinary arguments, and Bun's module mocks are process-wide.
  */
 import { beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { eq } from "drizzle-orm";
 import { knowledgeGrantRows } from "../../../tests/fixtures/knowledge-grants";
 import { db } from "../../db";
 import { aclGrants, knowledgeTags, narrators, users } from "../../db/schema";
+import { projectSenderText } from "../../lib/agent/sender-projection";
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
 import { knowledgeService } from "../knowledge-service";
@@ -425,6 +427,12 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 		});
 		const text = `BUFFERED_REQUEST_MARKER inspect ${keyword}`;
 		const userId = authorized ? clearedUserId : unclearedUserId;
+		const creator = await db.query.users.findFirst({ where: eq(users.id, userId) });
+		const modelText = projectSenderText(text, {
+			kind: "human",
+			id: userId,
+			name: creator?.username,
+		});
 		await pushSubagentBufferedMessage(narratorId, text, { createdBy: userId });
 		const requests: Pick<ExecuteLoopOptions, "userText" | "history" | "trailingToolResults">[] = [];
 		const executor = spyOn(narratorExecutor, "executeAgentLoop").mockImplementation(
@@ -477,11 +485,20 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 			if (authorized) {
 				expect(hint?.contentText).toContain(secretEntryId);
 				expect(hint?.parentToolUseId).toBe(toolUseId);
+				const modelHint = projectSenderText(hint?.contentText ?? "", {
+					kind: "system",
+					id: "knowledge_base_hint",
+					name: "knowledge_base_hint",
+				});
+				expect(hint?.contentText).not.toContain("<sender");
 				if (officialApi) {
-					expect(request.userText).toBe(text);
-					expect(request.history).toContainEqual({ role: "system", content: hint?.contentText });
+					expect(request.userText).toBe(modelText);
+					expect(request.history).toContainEqual({ role: "system", content: modelHint });
 				} else {
-					expect(request.userText).toBe(`${hint?.contentText}\n\n${text}`);
+					const combined = `${modelHint}\n\n${modelText}`;
+					expect(request.userText).toBe(
+						drainInExecutor ? combined : projectSenderText(combined, { kind: "system" }),
+					);
 					expect(JSON.stringify(request.history)).not.toContain(secretEntryId);
 					expect(JSON.stringify(request).match(/BUFFERED_REQUEST_MARKER/g)).toHaveLength(1);
 				}
@@ -489,7 +506,7 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 			} else {
 				// A denied/no-hit scan must not invent current-turn text or replay old input.
 				expect(hint).toBeUndefined();
-				expect(request.userText).toBe(text);
+				expect(request.userText).toBe(modelText);
 				expect(JSON.stringify(request)).not.toContain(secretEntryId);
 			}
 		} finally {

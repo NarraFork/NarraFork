@@ -1,0 +1,1 @@
+ALTER TABLE `narrator_messages` ADD `credential_id` text;

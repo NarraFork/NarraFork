@@ -8,8 +8,8 @@
  * relay (GLM, Kimi, MiniMax, ...) whose ids can never match a Claude version.
  *
  * Two exclusion sources, both applied here so frontend and backend agree:
- *   1. A built-in rule for pre-4.6 Claude, where the official Anthropic API
- *      returns 400 on `output_config.effort`.
+ *   1. Built-in family-specific rules for Claude generations without effort:
+ *      Opus before 4.5, Sonnet before 4.6, and Haiku 3.x.
  *   2. A user-configurable pattern list (`agent.reasoningEffortBlocklist`), so
  *      a strict relay can be excluded without waiting for a release.
  */
@@ -105,13 +105,13 @@ export function claudeVersionAtLeast(
 }
 
 /**
- * Whether an id names a Claude model released before the effort parameter
- * existed (3.x and the 4.0–4.5 era). Those are the models known to hard 400 on
- * `output_config.effort`, and they are the built-in blacklist entry.
+ * Whether an id names a Claude generation that predates effort support.
+ * These family-specific generations are the built-in blacklist entries.
  *
- * Version-gated by family rather than globally, because the families arrived at
+ * Version-gated by family rather than globally, because effort arrived at
  * different times:
- *   - Sonnet/Opus: effort lands in 4.6, so anything below that is excluded.
+ *   - Opus: effort lands in 4.5, so anything below that is excluded.
+ *   - Sonnet: effort lands in 4.6, so anything below that is excluded.
  *   - Haiku: never listed in Anthropic's effort docs at any version. Left OUT
  *     of the blacklist on purpose — the docs omission is not a documented
  *     rejection, a relay may well accept it, and the whitelist era already
@@ -121,9 +121,8 @@ export function claudeVersionAtLeast(
 export function isPreEffortClaudeModel(model: string): boolean {
 	const parsed = parseClaudeModel(model);
 	if (!parsed) return false;
-	if (parsed.family === "sonnet" || parsed.family === "opus") {
-		return !claudeVersionAtLeast(parsed, 4, 6);
-	}
+	if (parsed.family === "opus") return !claudeVersionAtLeast(parsed, 4, 5);
+	if (parsed.family === "sonnet") return !claudeVersionAtLeast(parsed, 4, 6);
 	// Haiku 3.x predates extended thinking entirely, so it cannot take effort;
 	// 4.x+ Haiku is left enabled per the note above.
 	if (parsed.family === "haiku") return parsed.major < 4;

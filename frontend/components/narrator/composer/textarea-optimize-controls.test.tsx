@@ -76,11 +76,7 @@ function renderTextarea(width: number | string | undefined): CSSStyleDeclaration
 	act(() => {
 		root.render(
 			<MantineProvider>
-				<Textarea
-					rightSection={<span />}
-					rightSectionWidth={width as never}
-					label="composer"
-				/>
+				<Textarea rightSection={<span />} rightSectionWidth={width as never} label="composer" />
 			</MantineProvider>,
 		);
 	});
@@ -126,7 +122,7 @@ describe("the width Mantine actually applies to the input", () => {
 		expect(applied).not.toBe("auto");
 	});
 
-	test("the literal \"auto\" is what made the padding disappear", () => {
+	test('the literal "auto" is what made the padding disappear', () => {
 		// Documents WHY the call sites cannot pass "auto": Mantine passes it through verbatim, and
 		// `padding-inline-end: auto` is not a valid length, so the declaration is dropped while the
 		// section keeps its content width. Asserted rather than described because this is the exact

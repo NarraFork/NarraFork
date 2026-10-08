@@ -6,6 +6,7 @@ import {
 	replaceFileReferenceSnapshots,
 } from "@server/lib/file-reference-input";
 import {
+	bufferQueueModeSchema,
 	editAndRegenerateJsonSchema,
 	editAssistantMessageSchema,
 	sendMessageSchema,
@@ -44,12 +45,19 @@ const routeCode = [
 	section("async function resolveEditedFileReferences(", "// Edit an assistant message's text"),
 	section(
 		'narratorRoutes.post("/:id/edit-message/:messageId"',
-		"/**\n * Resolve the authoritative buffer queue",
+		"/** Primary and subagent user queues are projections of the same durable mailbox. */",
 	),
-	section("interface LocatedBufferedMessage", "// Remove a single queued buffered message"),
+	section("interface LocatedBufferedMessage", "/** Called under start admission"),
 ]
 	.join("\n")
-	.replaceAll('import("../services/narrator-subagent")', "Promise.resolve(subagentQueue)")
+	.replace(
+		/import\(\s*["']\.\.\/services\/narrator-subagent["']\s*,?\s*\)/g,
+		"Promise.resolve(subagentQueue)",
+	)
+	.replace(
+		/import\(\s*["']\.\.\/services\/subagent-executor["']\s*\)/g,
+		"Promise.resolve(subagentQueue)",
+	)
 	.replaceAll("export async function", "async function");
 const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(routeCode);
 
@@ -80,7 +88,8 @@ function fixture(
 	options: { busy?: boolean; subagent?: boolean; compact?: boolean; user?: string } = {},
 ) {
 	const queue: QueueItem[] = [];
-	const subqueue: QueueItem[] = [];
+	// Actor policy differs, but both projections share one authoritative mailbox.
+	const subqueue = queue;
 	const captures: Array<{
 		narratorId: string;
 		userId: string;
@@ -111,8 +120,13 @@ function fixture(
 		storedMessages.push(message);
 		return message;
 	}
-	const send = mock(async (...args: unknown[]) =>
-		storedMessage("sent", args[1] as string, args[10] as FileReferenceSnapshot[] | undefined),
+	interface AcceptedInput {
+		fileReferences?: FileReferenceSnapshot[];
+		images?: Array<{ imageId: string }>;
+		queueOnly?: boolean;
+	}
+	const send = mock(async (_id: string, text: string, input: AcceptedInput) =>
+		storedMessage("sent", text, input.fileReferences),
 	);
 	// Simulate additional internal fields so the route's summary-only contract is
 	// tested against accidental future additions to a service result.
@@ -152,12 +166,12 @@ function fixture(
 		if (signal.aborted) throw new ValidationError("Reference capture aborted");
 		return refs.map((ref) => snapshot(ref, state.sourceText));
 	};
-	const push = mock(async (...args: unknown[]) => {
-		if (state.queueFull) return { ok: false, full: true };
+	const push = mock(async (_id: string, text: string, input: AcceptedInput) => {
+		if (state.queueFull) throw new ValidationError("Buffer queue full");
 		queue.push({
 			id: "queued",
-			text: args[1] as string,
-			fileReferences: (args[9] ?? []) as FileReferenceSnapshot[],
+			text,
+			fileReferences: input.fileReferences ?? [],
 		});
 		return { ok: true, id: "queued", bufferedAt: "now" };
 	});
@@ -175,20 +189,7 @@ function fixture(
 			return true;
 		},
 	);
-	const updateSub = mock(
-		(
-			_id: string,
-			mid: string,
-			text: string,
-			opts: { fileReferences?: FileReferenceSnapshot[] },
-		) => {
-			const item = subqueue.find((entry) => entry.id === mid);
-			if (!item) return false;
-			item.text = text;
-			if (opts.fileReferences !== undefined) item.fileReferences = opts.fileReferences;
-			return true;
-		},
-	);
+
 	const pushSub = mock(
 		(_id: string, text: string, opts: { fileReferences?: FileReferenceSnapshot[] }) => {
 			subqueue.push({ id: "sub-queued", text, fileReferences: opts.fileReferences ?? [] });
@@ -230,6 +231,7 @@ function fixture(
 		getFileReferenceSnapshots,
 		fileReferenceMessageForDisplay,
 		sendMessageSchema,
+		bufferQueueModeSchema,
 		updateBufferedMessageSchema,
 		editAndRegenerateJsonSchema,
 		editAssistantMessageSchema,
@@ -254,6 +256,7 @@ function fixture(
 		isCompactInProgress: () => !!options.compact,
 		isSubagentVariant: (variant: string) => variant === "subagent",
 		isLoopRunning: () => !!options.busy,
+		isExecutionSuspended: () => false,
 		isNarratorRuntimeBusy: () => !!options.busy,
 		reconcileRunningStatus: async () => {},
 		awaitCompactCompletion: async () => {},
@@ -273,20 +276,25 @@ function fixture(
 			skillName: "sample",
 			content: "skill instructions",
 		}),
-		sendMessage: send,
+		acceptUserMessage: async (id: string, text: string, input: AcceptedInput) => {
+			if (options.busy || input.queueOnly) {
+				const queued = await push(id, text, input);
+				return { buffered: true, ...queued };
+			}
+			return { buffered: false, userMsg: await send(id, text, input) };
+		},
 		editAndRegenerate: edit,
 		editAssistantMessage: edit,
 		restoreAssistantMessage: edit,
 		resumeSubagent: resume,
 		prepareHistoryRewrite: mock(async () => {}),
-		pushBufferedMessage: push,
 		updateBufferedMessage: update,
-		getBufferedMessages: () => queue,
+		getBufferedMessagesAsync: async () => queue,
+		withNarratorWorkAdmission: async (_id: string, work: () => Promise<unknown>) => work(),
 		subagentQueue: {
 			bufferSubagentUserMessage: pushSub,
-			getSubagentBufferedMessages: () => subqueue,
+			getSubagentBufferedMessagesAsync: async () => queue,
 			isTakenOver: () => true,
-			updateSubagentBufferedMessage: updateSub,
 		},
 		toBufferSummary: (items: QueueItem[]) =>
 			items.map((item) => ({
@@ -339,12 +347,11 @@ function fixture(
 		c.set("user", { sub: options.user ?? "actual-sender", role: "user", iat: 0, exp: 9999999999 });
 		await next();
 	});
-	app.onError((error) =>
-		Response.json(
-			{ error: error.message },
-			{ status: error instanceof AppError ? error.statusCode : 500 },
-		),
-	);
+	app.onError((error) => {
+		// Missing injected bindings are harness bugs, not expected HTTP failures.
+		if (!(error instanceof AppError)) throw error;
+		return Response.json({ error: error.message }, { status: error.statusCode });
+	});
 	app.route("/api/narrators", routes);
 	const request = (path: string, body: unknown, method = "POST", signal?: AbortSignal) =>
 		app.request(`/api/narrators/session/${path}`, {
@@ -371,7 +378,6 @@ function fixture(
 		push,
 		pushSub,
 		update,
-		updateSub,
 		draftUpdate,
 		acl,
 		rewrite: bindings.prepareHistoryRewrite,
@@ -391,8 +397,10 @@ describe("file reference HTTP sends", () => {
 		const form = new FormData();
 		form.set("fileReferences", JSON.stringify([reference]));
 		expect((await f.request("messages", form)).status).toBe(201);
-		expect(f.send.mock.calls[0][2]).toEqual([]);
-		expect(f.send.mock.calls[0][10]).toEqual([snapshot(reference, "freshly read bytes")]);
+		expect(f.send.mock.calls[0][2].images).toEqual([]);
+		expect(f.send.mock.calls[0][2].fileReferences).toEqual([
+			snapshot(reference, "freshly read bytes"),
+		]);
 	});
 	test.each([
 		false,
@@ -411,7 +419,9 @@ describe("file reference HTTP sends", () => {
 			refs: [reference],
 		});
 		expect(f.captures[0].signal).toBeInstanceOf(AbortSignal);
-		expect(f.send.mock.calls[0][10]).toEqual([snapshot(reference, "freshly read bytes")]);
+		expect(f.send.mock.calls[0][2].fileReferences).toEqual([
+			snapshot(reference, "freshly read bytes"),
+		]);
 		expect(f.deletedImages).toEqual([]);
 	});
 	test.each([
@@ -422,7 +432,9 @@ describe("file reference HTTP sends", () => {
 		expect((await f.request("messages", { message: "", fileReferences: [reference] })).status).toBe(
 			202,
 		);
-		expect(f.push.mock.calls[0][9]).toEqual([snapshot(reference, "freshly read bytes")]);
+		expect(f.push.mock.calls[0][2].fileReferences).toEqual([
+			snapshot(reference, "freshly read bytes"),
+		]);
 		f.state.sourceText = "changed after acceptance";
 		expect(f.queue[0].fileReferences[0].snapshotText).toBe("freshly read bytes");
 		expect(f.captures).toHaveLength(1);
@@ -456,7 +468,9 @@ describe("file reference HTTP sends", () => {
 		expect((await f.request("messages", { message, fileReferences: [reference] })).status).toBe(
 			201,
 		);
-		expect(f.send.mock.calls[0][10]).toEqual([snapshot(reference, "freshly read bytes")]);
+		expect(f.send.mock.calls[0][2].fileReferences).toEqual([
+			snapshot(reference, "freshly read bytes"),
+		]);
 	});
 	test.each([
 		false,
@@ -527,7 +541,7 @@ describe("HTTP file reference display boundaries", () => {
 				const accepted = subagent
 					? (f.resume.mock.calls[0][0] as { fileReferences: FileReferenceSnapshot[] })
 							.fileReferences
-					: f.send.mock.calls[0][10];
+					: f.send.mock.calls[0][2].fileReferences;
 				expect(accepted).toEqual(internalSnapshots);
 			});
 		}
@@ -626,7 +640,7 @@ describe("file reference edits", () => {
 		false,
 		true,
 	])("queue edit uses actual snapshots and permits reference-only text (subagent=%s)", async (subagent) => {
-		const f = fixture();
+		const f = fixture({ subagent });
 		const queue = subagent ? f.subqueue : f.queue;
 		queue.push({ id: "queued", text: "old", fileReferences: [snapshot()] });
 		f.state.captureError = new ValidationError("offline");

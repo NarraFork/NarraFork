@@ -32,6 +32,7 @@
 import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
+import { parse } from "@babel/parser";
 
 const FRONTEND_ROOT = join(import.meta.dir, "..");
 const REPO_ROOT = join(FRONTEND_ROOT, "..");
@@ -159,6 +160,65 @@ function resolveLocalSpecifier(specifier: string, importer: string): string | nu
  * Static imports only — a dynamic `import()` creates its own boundary, so it does not
  * put the target on the entry's propagation path.
  */
+function runtimeStaticSpecifiers(source: string): string[] {
+	const ast = parse(source, { sourceType: "module", plugins: ["typescript", "jsx"] });
+	const specifiers: string[] = [];
+	for (const node of ast.program.body) {
+		if (node.type === "ImportDeclaration") {
+			if (node.importKind === "type") continue;
+			if (
+				node.specifiers.length > 0 &&
+				node.specifiers.every(
+					(entry) => entry.type === "ImportSpecifier" && entry.importKind === "type",
+				)
+			)
+				continue;
+			specifiers.push(node.source.value);
+		} else if (node.type === "ExportAllDeclaration") {
+			if (node.exportKind !== "type") specifiers.push(node.source.value);
+		} else if (node.type === "ExportNamedDeclaration" && node.source) {
+			if (node.exportKind === "type") continue;
+			if (
+				node.specifiers.length > 0 &&
+				node.specifiers.every(
+					(entry) => entry.type === "ExportSpecifier" && entry.exportKind === "type",
+				)
+			)
+				continue;
+			specifiers.push(node.source.value);
+		}
+	}
+	return specifiers;
+}
+
+describe("runtime static import graph parser", () => {
+	it("follows multiline values, mixed specifiers, side effects and barrel exports", () => {
+		expect(
+			runtimeStaticSpecifiers(`
+			import {\n value,\n type Shape\n } from "./multiline";
+			import "./side-effect";
+			export {\n value as other,\n type Shape\n } from "./barrel";
+			export * from "./all";
+			import Default from "./default";
+		`),
+		).toEqual(["./multiline", "./side-effect", "./barrel", "./all", "./default"]);
+	});
+	it("ignores erased type dependencies, dynamic imports and source-like strings/comments", () => {
+		expect(
+			runtimeStaticSpecifiers(`
+			import type { Shape } from "./type";
+			import { type Shape as InlineShape, type Other } from "./inline-type";
+			export type { Shape } from "./export-type";
+			export { type Shape as InlineExportShape } from "./inline-export-type";
+			export type * from "./type-star";
+			const lazy = import("./lazy");
+			const text = 'import value from "./string"';
+			// import value from "./comment"
+		`),
+		).toEqual([]);
+	});
+});
+
 function modulesReachableFromEntry(): string[] {
 	const appTsx = resolve(FRONTEND_ROOT, "App.tsx");
 	const seen = new Set<string>();
@@ -175,17 +235,9 @@ function modulesReachableFromEntry(): string[] {
 			return;
 		}
 
-		// `import x from "y"` / `export … from "y"` (barrels re-export, which counts), and
-		// bare side-effect `import "y"`.
-		const patterns = [
-			/(?:^|\n)\s*(?:import|export)\b[^;\n]*?from\s+["']([^"']+)["']/g,
-			/(?:^|\n)\s*import\s+["']([^"']+)["']/g,
-		];
-		for (const pattern of patterns) {
-			for (const match of source.matchAll(pattern)) {
-				const resolved = resolveLocalSpecifier(match[1], file);
-				if (resolved && resolved !== appTsx) walk(resolved);
-			}
+		for (const specifier of runtimeStaticSpecifiers(source)) {
+			const resolved = resolveLocalSpecifier(specifier, file);
+			if (resolved && resolved !== appTsx) walk(resolved);
 		}
 	};
 

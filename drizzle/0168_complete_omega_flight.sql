@@ -1,0 +1,1 @@
+CREATE INDEX `idx_nbm_claim_recovery` ON `narrator_buffered_messages` (`state`,`id`);

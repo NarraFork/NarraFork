@@ -1,0 +1,1 @@
+ALTER TABLE `narrator_buffered_messages` ADD `bash_command` text;

@@ -7,13 +7,15 @@ import {
 	invalidateModelCardCache,
 	mergeModelCards,
 } from "../lib/model-cards";
-import { saveSettings, settings } from "../lib/settings";
 import { getEffectiveModelMetadata, saveLegacyModelCard } from "../lib/model-catalog";
+import { saveSettings, settings } from "../lib/settings";
 import { modelCardSchema } from "../lib/validators";
 import { requireAdmin } from "../middleware/auth";
 
 export const modelCardRoutes = new Hono();
-modelCardRoutes.get("/resolve", c => c.json(getEffectiveModelMetadata(c.req.query("model") ?? "")));
+modelCardRoutes.get("/resolve", (c) =>
+	c.json(getEffectiveModelMetadata(c.req.query("model") ?? "")),
+);
 
 /**
  * Read the effective cards.
@@ -74,7 +76,7 @@ modelCardRoutes.put("/:key", requireAdmin, async (c) => {
 	const next = current.filter((card) => card.modelKey !== key);
 	next.push(incoming);
 
-	const delta = diffModelCards(next).find(card => card.modelKey === key);
+	const delta = diffModelCards(next).find((card) => card.modelKey === key);
 	if (settings.agent.modelCatalog) saveLegacyModelCard(key, delta ?? null, !delta);
 	const effective = persistEffectiveCards(next);
 	const saved = effective.find((card) => card.modelKey === key);

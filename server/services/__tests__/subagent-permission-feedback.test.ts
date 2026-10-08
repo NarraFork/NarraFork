@@ -273,13 +273,14 @@ describe("approval feedback for a subagent permission request", () => {
 			provider: TEST_PROVIDER,
 			cwd: ".",
 		});
-		expect(consumed?.prompt).toBe("记得同时更新迁移");
+		const modelText =
+			'<sender kind="human" id="feedback-approver-user" name="feedback-approver" />\n记得同时更新迁移';
+		expect(consumed?.prompt).toBe(modelText);
+		expect(consumed?.prompt?.match(/记得同时更新迁移/g)).toHaveLength(1);
 		// And it is present in the rebuilt model history, not just in the prompt: a
 		// drain that returned the text but rebuilt a history without it would still
 		// lose the feedback on any later pass.
-		expect(consumed?.history).toEqual(
-			expect.arrayContaining([{ role: "user", text: "记得同时更新迁移" }]),
-		);
+		expect(consumed?.history).toEqual(expect.arrayContaining([{ role: "user", text: modelText }]));
 
 		const rows = await db.query.narratorMessages.findMany({
 			where: eq(narratorMessages.narratorId, SUBAGENT_ID),

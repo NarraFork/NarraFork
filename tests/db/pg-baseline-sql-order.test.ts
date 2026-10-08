@@ -336,15 +336,27 @@ describe("bounds, real committed assets, and source AST guard", () => {
 		const sqls = metadata.journal.entries.map((entry) =>
 			readBounded(join(folder, `${entry.tag}.sql`), 1024 * 1024),
 		);
-		const result = physicalColumnOrderFromSql(sqls, metadata.snapshot as unknown as Snapshot);
+		const currentSnapshot = metadata.snapshot as unknown as Snapshot;
+		const result = physicalColumnOrderFromSql(sqls, currentSnapshot);
 		expect(result.problems).toEqual([]);
-		expect(result.order.size).toBe(
-			Object.keys((metadata.snapshot as unknown as Snapshot).tables).length,
-		);
+		expect(result.order.size).toBe(Object.keys(currentSnapshot.tables).length);
+		for (const table of Object.values(currentSnapshot.tables)) {
+			const physicalColumns = result.order.get(table.name);
+			expect(physicalColumns, `${table.name} has a complete SQL-derived order`).toBeDefined();
+			expect(physicalColumns?.length).toBe(Object.keys(table.columns).length);
+			expect([...(physicalColumns ?? [])].sort()).toEqual(
+				Object.values(table.columns)
+					.map((column) => column.name)
+					.sort(),
+			);
+		}
 		const narrators = result.order.get("narrators");
-		expect(narrators?.slice(-2)).toEqual([
+		// 0010 appends stop reason after both context columns; schema declaration order
+		// cannot substitute for physical order reconstructed from the full journal.
+		expect(narrators?.slice(-3)).toEqual([
 			"context_char_cache_json",
 			"context_usage_snapshot_json",
+			"last_stop_reason",
 		]);
 		expect(narrators?.indexOf("next_seq")).toBeLessThan(narrators?.indexOf("insert_seq") ?? -1);
 		expect(result.order.get("background_tasks")?.at(-1)).toBe("insert_seq");

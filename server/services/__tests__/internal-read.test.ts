@@ -14,8 +14,13 @@ const { db, sqlite } = getTestDb();
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { executeTool } = await import("../../lib/agent/tool-executor");
+const { handlePermission } = await import("../narrator-permission");
 await import("../narrator-service");
 const { narratorPersistence: persistence } = await import("../narrator-persistence");
+const { createFileChangeExecutionSegmentsService } = await import(
+	"../file-change-execution-segments"
+);
+const segments = createFileChangeExecutionSegmentsService(db);
 const { toolRegistry } = await import("../../lib/agent/tool-registry");
 const { scheduleUpdate, beginQuiescingTools, resetUpdateCoordinationForTests } = await import(
 	"../update-coordinator"
@@ -35,7 +40,18 @@ function config(): AgentConfig {
 		cwd: process.cwd(),
 		signal: new AbortController().signal,
 		requireToolCallBinding: true,
-		permissionHandler: async () => ({ behavior: "allow" }),
+		permissionHandler: (name, input, id, options) =>
+			handlePermission(
+				"n",
+				options?.signal ?? new AbortController().signal,
+				name,
+				input,
+				id,
+				process.cwd(),
+				"en",
+				undefined,
+				options,
+			),
 		onInternalReadAuthorization: async (id, receipt) => {
 			await persistence.validateToolCallBinding("n", id, receipt);
 		},
@@ -61,15 +77,23 @@ beforeEach(async () => {
 	cleanDb(sqlite);
 	readCount = 0;
 	const now = new Date().toISOString();
-	await db.insert(narrators).values({ id: "n", createdAt: now, updatedAt: now });
+	await db
+		.insert(narrators)
+		.values({ id: "n", permissionMode: "bypassPermissions", createdAt: now, updatedAt: now });
 	await db
 		.insert(narratorMessages)
 		.values({ id: "m", narratorId: "n", role: "assistant", contentJson: content, createdAt: now });
 	await db
 		.insert(narratorMessageRefs)
 		.values({ id: "ref", narratorId: "n", messageId: "m", seq: 1 });
+	const parentSegment = await segments.create({
+		narratorId: "n",
+		sourceToolCallId: binding.toolCallId,
+		sourceExecutionAttempt: binding.attempt,
+	});
 	await db.insert(narratorToolCalls).values({
 		id: binding.toolCallId,
+		executionSegmentId: parentSegment.id,
 		narratorId: "n",
 		messageId: "m",
 		toolUseId: "eval",
@@ -114,6 +138,7 @@ afterAll(() => {
 
 test("内部Read持久行关联真实父attempt，不修改模型消息", async () => {
 	const result = await run();
+	expect(result.output).toBe("complete text");
 	expect(result.isError).not.toBe(true);
 	expect(readCount).toBe(1);
 	const child = await childRow();
@@ -144,13 +169,14 @@ test("外层绑定错误拒绝且不创建子行", async () => {
 test("子Read独立权限拒绝也落结果", async () => {
 	const cfg = config();
 	const permissions: string[] = [];
-	cfg.permissionHandler = async (name, _input, _id, options) => {
+	const authorize = cfg.permissionHandler;
+	cfg.permissionHandler = async (name, input, id, options) => {
 		permissions.push(name);
 		if (name === "Read") {
 			expect(options?.toolCallBinding?.toolCallId).not.toBe(binding.toolCallId);
 			return { behavior: "deny", message: "read denied" };
 		}
-		return { behavior: "allow" };
+		return authorize(name, input, id, options);
 	};
 	expect((await run(cfg)).isError).toBe(true);
 	expect(permissions).toEqual(["Eval", "Read"]);
@@ -200,9 +226,11 @@ test("子权限批准后发现取消仍不得执行Read", async () => {
 	const cfg = config();
 	const controller = new AbortController();
 	cfg.signal = controller.signal;
-	cfg.permissionHandler = async (name) => {
+	const authorize = cfg.permissionHandler;
+	cfg.permissionHandler = async (name, input, id, options) => {
+		const result = await authorize(name, input, id, options);
 		if (name === "Read") controller.abort(new Error("cancelled during permission"));
-		return { behavior: "allow" };
+		return result;
 	};
 	expect((await run(cfg)).isError).toBe(true);
 	expect(readCount).toBe(0);

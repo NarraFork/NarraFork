@@ -1,0 +1,1 @@
+ALTER TABLE `narrator_drafts` ADD `revision` integer DEFAULT 1 NOT NULL;

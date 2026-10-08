@@ -417,11 +417,11 @@ describe("GitChangesTab attribution hover card", () => {
 		expect(row.textContent).not.toContain("Refactor auth");
 
 		const hoverText = await hoverAttribution(container);
-			expect(hoverText).toContain("Current diff evidence");
-			expect(hoverText).toContain("Refactor auth");
-			expect(hoverText).toContain("Recent changes");
-			expect(hoverText).toContain("External");
-		});
+		expect(hoverText).toContain("Current diff evidence");
+		expect(hoverText).toContain("Refactor auth");
+		expect(hoverText).toContain("Recent changes");
+		expect(hoverText).toContain("External");
+	});
 
 	test("unknown attribution shows one short reason instead of a text dump", async () => {
 		const unknown = currentTarget({ status: "unknown", actor: null, reason: "state_mismatch" });

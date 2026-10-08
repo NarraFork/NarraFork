@@ -1,13 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { createModelCardResolver, legacyLocalToRaw, type RawLocalState } from "./card-resolver";
-import { normalizeRawLocalState, patchLocalCardMetadata } from "./card-local";
-import { rawCatalogFromModelFiles, type RawMetadata } from "./card";
 import {
 	catalogFromModelFiles,
 	catalogToRaw,
 	decodeCatalog,
 	encodeCatalog,
 } from "../../server/lib/model-catalog/source";
+import { type RawMetadata, rawCatalogFromModelFiles } from "./card";
+import { normalizeRawLocalState, patchLocalCardMetadata } from "./card-local";
+import { createModelCardResolver, legacyLocalToRaw, type RawLocalState } from "./card-resolver";
 
 const sourceVersion = "a".repeat(40);
 const date = "2026-01-01T00:00:00Z";

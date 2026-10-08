@@ -1,0 +1,1 @@
+ALTER TABLE `chapters` ADD `dormant_snapshot_commit_sha` text;

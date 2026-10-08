@@ -179,11 +179,57 @@ describe("AnthropicProvider /v1 fallback error surfacing", () => {
 
 		expect(requestBodies[0]).toMatchObject({ stream: true, max_tokens: 4_096 });
 		expect(requestBodies[1]).toMatchObject({ stream: true, max_tokens: 64_000 });
-		expect(requestBodies[2]).toMatchObject({ stream: true, max_tokens: 64_000 });
+		// No catalog ceiling is declared for this unknown id; never invent a 64k cap.
+		expect(requestBodies[2]).toMatchObject({ stream: true, max_tokens: 128_000 });
 		expect(String(acceptHeader)).toBe("text/event-stream");
 		expect(deltas).toEqual(["hello", " world"]);
 		expect(result.text).toBe("hello world");
 		expect(result.usage).toMatchObject({ inputTokens: 3, outputTokens: 2 });
+	});
+
+	test("declared output limits clip large requests without raising small requests", async () => {
+		const { bindModelCatalogSettings, getModelCatalogSnapshot, mutateModelCatalog } = await import(
+			"../../model-catalog"
+		);
+		const { settings, saveSettings } = await import("../../settings");
+		const bodies: Array<Record<string, unknown>> = [];
+		const local = {
+			agent: {
+				modelCatalog: {
+					schemaVersion: 1,
+					migrationVersion: 1,
+					local: { revision: 0 },
+					autoApply: false,
+					pinnedVersion: null,
+				},
+			},
+		};
+		bindModelCatalogSettings(local as typeof settings, () => {});
+		try {
+			mutateModelCatalog({
+				baseRevision: getModelCatalogSnapshot().local.revision,
+				action: "upsert-model",
+				model: { id: "output-fixture", metadata: { limits: { maxOutputTokens: 64_000 } } },
+			});
+			setOutboundFetchOverrideForTest(async (_input, init) => {
+				bodies.push(JSON.parse(String(init?.body)));
+				return new Response(JSON.stringify({ content: [{ type: "text", text: "ok" }] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			});
+			for (const maxOutputTokens of [undefined, 128_000, 1_024]) {
+				await makeProvider("output-limit").generateWithMeta(
+					"hi",
+					"anthropic:output-fixture",
+					undefined,
+					{ maxOutputTokens },
+				);
+			}
+			expect(bodies.map((body) => body.max_tokens)).toEqual([4_096, 64_000, 1_024]);
+		} finally {
+			bindModelCatalogSettings(settings, () => saveSettings(settings));
+		}
 	});
 
 	test("surfaces the ORIGINAL error when the /v1 fallback drops the connection", async () => {

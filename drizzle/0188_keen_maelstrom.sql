@@ -1,0 +1,1 @@
+ALTER TABLE `user_preferences` ADD `treat_as_local_access` integer DEFAULT false NOT NULL;

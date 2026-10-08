@@ -21,7 +21,7 @@ import {
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { aclGrants, narrators, users } from "../db/schema";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
@@ -29,7 +29,13 @@ import {
 	dropNarratorSubscriptionsForUnauthorizedUsers,
 } from "../websocket/narrator-ws";
 import { recordAclEvent } from "./acl/acl-audit";
-import { canManageNarratorAcl, type NarratorPrincipal, resolveAclRootId } from "./narrator-acl";
+import {
+	canManageNarratorAcl,
+	NARRATOR_ACL_COLUMNS,
+	type NarratorAclRow,
+	type NarratorPrincipal,
+	resolveAclRootId,
+} from "./narrator-acl";
 
 export interface NarratorGrantView {
 	id: string;
@@ -66,7 +72,42 @@ export interface NarratorAccessView {
 	delegatesToNarratorId: string | null;
 }
 
-type NarratorRow = typeof narrators.$inferSelect;
+type NarratorRow = NarratorAclRow;
+type DbTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/** Recheck the first authorized owner snapshot under the synchronous SQLite write lock. */
+function assertCurrentManager(
+	tx: DbTransaction,
+	snapshot: NarratorRow,
+	principal: NarratorPrincipal,
+) {
+	const row = tx
+		.select({
+			id: narrators.id,
+			type: narrators.type,
+			ownerUserId: narrators.ownerUserId,
+			visibility: narrators.visibility,
+			writeAudience: narrators.writeAudience,
+		})
+		.from(narrators)
+		.where(eq(narrators.id, snapshot.id))
+		.get();
+	if (
+		!row ||
+		row.type !== "primary" ||
+		row.ownerUserId !== snapshot.ownerUserId ||
+		(!principal.isAdmin && row.ownerUserId !== principal.userId)
+	) {
+		// Even admins compare their original owner, including null. No access read or
+		// announcement may follow a conflict (including an otherwise harmless no-op).
+		throw new AppError(
+			"Narrator ownership changed while sharing; reload and try again",
+			409,
+			"NARRATOR_OWNERSHIP_CONFLICT",
+		);
+	}
+	return row;
+}
 
 /**
  * The `acl_grants` rows that represent "a person was given access to this
@@ -87,7 +128,10 @@ function narratorUserGrantScope(narratorId: string) {
 
 /** Load the narrator or 404. Callers have already passed the route access gate. */
 async function loadNarrator(narratorId: string): Promise<NarratorRow> {
-	const row = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+	const row = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: NARRATOR_ACL_COLUMNS,
+	});
 	if (!row) throw new NotFoundError("Narrator", narratorId);
 	return row;
 }
@@ -200,19 +244,31 @@ export async function setNarratorVisibility(
 	visibility: NarratorVisibility,
 	principal: NarratorPrincipal,
 ): Promise<NarratorAccessView> {
-	const row = await loadNarrator(narratorId);
-	await assertCanManage(row, principal);
-	const clampedWriteAudience = clampWriteAudience(visibility, row.writeAudience);
-	const writeAudienceChanged = clampedWriteAudience !== row.writeAudience;
-	if (row.visibility !== visibility || writeAudienceChanged) {
-		await db
-			.update(narrators)
-			.set({
-				visibility,
-				writeAudience: clampedWriteAudience,
-				updatedAt: new Date().toISOString(),
-			})
-			.where(eq(narrators.id, narratorId));
+	const snapshot = await loadNarrator(narratorId);
+	await assertCanManage(snapshot, principal);
+	// SQLite-only handle (fail-closed when PostgreSQL is active). Never await in
+	// this callback: the current policy check and update share one short write lock.
+	const { row, clampedWriteAudience, writeAudienceChanged, changed } = db.transaction(
+		(tx) => {
+			const row = assertCurrentManager(tx, snapshot, principal);
+			const clampedWriteAudience = clampWriteAudience(visibility, row.writeAudience);
+			const writeAudienceChanged = clampedWriteAudience !== row.writeAudience;
+			const changed = row.visibility !== visibility || writeAudienceChanged;
+			if (changed) {
+				tx.update(narrators)
+					.set({
+						visibility,
+						writeAudience: clampedWriteAudience,
+						updatedAt: new Date().toISOString(),
+					})
+					.where(eq(narrators.id, narratorId))
+					.run();
+			}
+			return { row, clampedWriteAudience, writeAudienceChanged, changed };
+		},
+		{ behavior: "immediate" },
+	);
+	if (changed) {
 		recordAclEvent({
 			actor: principal,
 			eventType: "narrator_visibility_changed",
@@ -256,24 +312,32 @@ export async function setNarratorWriteAudience(
 	writeAudience: NarratorWriteAudience,
 	principal: NarratorPrincipal,
 ): Promise<NarratorAccessView> {
-	const row = await loadNarrator(narratorId);
-	await assertCanManage(row, principal);
-	// The opposite of the clamp in `setNarratorVisibility`: widening the write audience
-	// past the read audience is REFUSED rather than silently pulling visibility up with
-	// it, because that would enlarge an audience the user did not ask to enlarge. The
-	// message names the next step, since "invalid combination" leaves them guessing.
-	if (!isWriteAudienceAllowed(row.visibility, writeAudience)) {
-		throw new ValidationError(
-			writeAudience === "public"
-				? "This session is not visible to everyone yet; set visibility to everyone before letting everyone drive it"
-				: "This session is only visible to you; set visibility to the project before letting project members drive it",
-		);
-	}
-	if (row.writeAudience !== writeAudience) {
-		await db
-			.update(narrators)
-			.set({ writeAudience, updatedAt: new Date().toISOString() })
-			.where(eq(narrators.id, narratorId));
+	const snapshot = await loadNarrator(narratorId);
+	await assertCanManage(snapshot, principal);
+	const { row, changed } = db.transaction(
+		(tx) => {
+			const row = assertCurrentManager(tx, snapshot, principal);
+			// Do not widen visibility implicitly. Judge the legal pair against the
+			// CURRENT read audience, not a policy loaded before authorization awaited.
+			if (!isWriteAudienceAllowed(row.visibility, writeAudience)) {
+				throw new ValidationError(
+					writeAudience === "public"
+						? "This session is not visible to everyone yet; set visibility to everyone before letting everyone drive it"
+						: "This session is only visible to you; set visibility to the project before letting project members drive it",
+				);
+			}
+			const changed = row.writeAudience !== writeAudience;
+			if (changed) {
+				tx.update(narrators)
+					.set({ writeAudience, updatedAt: new Date().toISOString() })
+					.where(eq(narrators.id, narratorId))
+					.run();
+			}
+			return { row, changed };
+		},
+		{ behavior: "immediate" },
+	);
+	if (changed) {
 		recordAclEvent({
 			actor: principal,
 			eventType: "narrator_write_audience_changed",
@@ -310,57 +374,73 @@ export async function grantNarratorAccess(
 	access: "read" | "write",
 	principal: NarratorPrincipal,
 ): Promise<BulkGrantOutcome> {
-	const row = await loadNarrator(narratorId);
-	await assertCanManage(row, principal);
-
-	// Preserve caller order while collapsing duplicates, so a repeated id cannot
-	// attempt the same insert twice.
+	const snapshot = await loadNarrator(narratorId);
+	await assertCanManage(snapshot, principal);
+	// Match the HTTP batch cap even for direct callers; keep the lock bounded.
+	if (userIds.length > 50) throw new ValidationError("Share with at most 50 users at once");
+	// Preserve caller order while collapsing duplicates.
 	const wanted = [...new Set(userIds)];
-	const known = new Set(
-		(await db.select({ id: users.id }).from(users).where(inArray(users.id, wanted))).map(
-			(user) => user.id,
-		),
+	const outcome = db.transaction(
+		(tx) => {
+			const row = assertCurrentManager(tx, snapshot, principal);
+			const known = new Set(
+				tx
+					.select({ id: users.id })
+					.from(users)
+					.where(inArray(users.id, wanted))
+					.limit(50)
+					.all()
+					.map((user) => user.id),
+			);
+			const outcome: BulkGrantOutcome = { granted: [], skipped: [], failed: [] };
+			const now = new Date().toISOString();
+			for (const userId of wanted) {
+				if (!known.has(userId) || userId === row.ownerUserId) {
+					outcome.failed.push(userId);
+					continue;
+				}
+				const scope = and(narratorUserGrantScope(narratorId), eq(aclGrants.principalId, userId));
+				// Canonical grants have at most read/write/manage. The fourth row is
+				// only an overflow sentinel: reject malformed state rather than silently
+				// truncating it. Preserve the legacy Map's last-row choice otherwise.
+				const heldRows = tx
+					.select({ access: aclGrants.capability })
+					.from(aclGrants)
+					.where(scope)
+					.limit(4)
+					.all();
+				if (heldRows.length > 3) {
+					throw new ValidationError(
+						"Narrator grant data is inconsistent; repair it before sharing",
+					);
+				}
+				const held = heldRows.at(-1);
+				if (held?.access === access) {
+					outcome.skipped.push(userId);
+					continue;
+				}
+				if (held) {
+					tx.update(aclGrants).set({ capability: access }).where(scope).run();
+				} else {
+					tx.insert(aclGrants)
+						.values({
+							id: generateId(),
+							scopeType: "narrator",
+							scopeId: narratorId,
+							principalType: "user",
+							principalId: userId,
+							capability: access,
+							grantedBy: principal.userId,
+							createdAt: now,
+						})
+						.run();
+				}
+				outcome.granted.push(userId);
+			}
+			return outcome;
+		},
+		{ behavior: "immediate" },
 	);
-	const held = new Map(
-		(
-			await db
-				.select({ principalId: aclGrants.principalId, access: aclGrants.capability })
-				.from(aclGrants)
-				.where(and(narratorUserGrantScope(narratorId), inArray(aclGrants.principalId, wanted)))
-		).map((grant) => [grant.principalId, grant.access]),
-	);
-
-	const outcome: BulkGrantOutcome = { granted: [], skipped: [], failed: [] };
-	const now = new Date().toISOString();
-	for (const userId of wanted) {
-		if (!known.has(userId) || userId === row.ownerUserId) {
-			outcome.failed.push(userId);
-			continue;
-		}
-		const existing = held.get(userId);
-		if (existing === access) {
-			outcome.skipped.push(userId);
-			continue;
-		}
-		if (existing) {
-			await db
-				.update(aclGrants)
-				.set({ capability: access })
-				.where(and(narratorUserGrantScope(narratorId), eq(aclGrants.principalId, userId)));
-		} else {
-			await db.insert(aclGrants).values({
-				id: generateId(),
-				scopeType: "narrator",
-				scopeId: narratorId,
-				principalType: "user",
-				principalId: userId,
-				capability: access,
-				grantedBy: principal.userId,
-				createdAt: now,
-			});
-		}
-		outcome.granted.push(userId);
-	}
 
 	if (outcome.granted.length > 0) {
 		await announceAccessChange(narratorId, "shared", outcome.granted);
@@ -374,14 +454,23 @@ export async function updateNarratorGrant(
 	access: "read" | "write",
 	principal: NarratorPrincipal,
 ): Promise<NarratorGrantView[]> {
-	const row = await loadNarrator(narratorId);
-	await assertCanManage(row, principal);
-	const grant = await db.query.aclGrants.findFirst({
-		where: and(eq(aclGrants.id, grantId), narratorUserGrantScope(narratorId)),
-	});
-	if (!grant) throw new NotFoundError("Narrator grant", grantId);
-
-	await db.update(aclGrants).set({ capability: access }).where(eq(aclGrants.id, grantId));
+	const snapshot = await loadNarrator(narratorId);
+	await assertCanManage(snapshot, principal);
+	const grant = db.transaction(
+		(tx) => {
+			assertCurrentManager(tx, snapshot, principal);
+			const scope = and(eq(aclGrants.id, grantId), narratorUserGrantScope(narratorId));
+			const grant = tx
+				.select({ principalId: aclGrants.principalId })
+				.from(aclGrants)
+				.where(scope)
+				.get();
+			if (!grant) throw new NotFoundError("Narrator grant", grantId);
+			tx.update(aclGrants).set({ capability: access }).where(scope).run();
+			return grant;
+		},
+		{ behavior: "immediate" },
+	);
 	// Downgrading write → read must also end any in-flight authority the viewer has.
 	await announceAccessChange(narratorId, "grant_changed", [grant.principalId]);
 	return (await getNarratorAccess(narratorId, principal)).grants;
@@ -392,14 +481,23 @@ export async function revokeNarratorGrant(
 	grantId: string,
 	principal: NarratorPrincipal,
 ): Promise<void> {
-	const row = await loadNarrator(narratorId);
-	await assertCanManage(row, principal);
-	const grant = await db.query.aclGrants.findFirst({
-		where: and(eq(aclGrants.id, grantId), narratorUserGrantScope(narratorId)),
-	});
-	if (!grant) throw new NotFoundError("Narrator grant", grantId);
-
-	await db.delete(aclGrants).where(eq(aclGrants.id, grantId));
+	const snapshot = await loadNarrator(narratorId);
+	await assertCanManage(snapshot, principal);
+	const grant = db.transaction(
+		(tx) => {
+			assertCurrentManager(tx, snapshot, principal);
+			const scope = and(eq(aclGrants.id, grantId), narratorUserGrantScope(narratorId));
+			const grant = tx
+				.select({ principalId: aclGrants.principalId })
+				.from(aclGrants)
+				.where(scope)
+				.get();
+			if (!grant) throw new NotFoundError("Narrator grant", grantId);
+			tx.delete(aclGrants).where(scope).run();
+			return grant;
+		},
+		{ behavior: "immediate" },
+	);
 	await announceAccessChange(narratorId, "unshared", [grant.principalId]);
 }
 
@@ -427,10 +525,28 @@ export async function transferNarratorOwner(
 		if (!target) throw new NotFoundError("User", newOwnerUserId);
 	}
 
-	await db
+	// Shared work admission allows concurrent transfers. Revalidate the authority
+	// in this single-row write, rather than trusting the pre-await owner snapshot.
+	// Admins also compare the loaded owner (including null), so a stale admin
+	// operation cannot overwrite another completed reassignment.
+	const ownerMatches = principal.isAdmin
+		? row.ownerUserId === null
+			? isNull(narrators.ownerUserId)
+			: eq(narrators.ownerUserId, row.ownerUserId)
+		: eq(narrators.ownerUserId, principal.userId);
+	const changed = await db
 		.update(narrators)
 		.set({ ownerUserId: newOwnerUserId, updatedAt: new Date().toISOString() })
-		.where(eq(narrators.id, narratorId));
+		.where(and(eq(narrators.id, narratorId), eq(narrators.type, "primary"), ownerMatches))
+		.returning({ id: narrators.id });
+	if (changed.length !== 1) {
+		// No announcement or access-view read on failure; disclose no new owner.
+		throw new AppError(
+			"Narrator ownership changed during transfer; reload and try again",
+			409,
+			"NARRATOR_OWNERSHIP_CONFLICT",
+		);
+	}
 
 	// The previous owner keeps no implicit access, so they are told to re-read too.
 	const affected = [row.ownerUserId, newOwnerUserId].filter((id): id is string => id !== null);

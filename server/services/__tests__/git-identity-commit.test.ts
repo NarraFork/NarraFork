@@ -11,7 +11,7 @@
  * back to, so each test can distinguish "attributed to the acting user" from
  * "attributed to the host" instead of merely observing that a commit happened.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +20,23 @@ import { safeSpawn } from "../../lib/spawn";
 import { gitService } from "../git-service";
 
 const tempDirs: string[] = [];
+const IDENTITY_ENV_KEYS = [
+	"GIT_AUTHOR_NAME",
+	"GIT_AUTHOR_EMAIL",
+	"GIT_COMMITTER_NAME",
+	"GIT_COMMITTER_EMAIL",
+] as const;
+let savedIdentityEnv: Record<string, string | undefined>;
+
+beforeEach(() => {
+	// The caller running CI/tools may already carry an acting-user identity. These
+	// fixtures deliberately test repository-config fallback, not that ambient user.
+	savedIdentityEnv = {};
+	for (const key of IDENTITY_ENV_KEYS) {
+		savedIdentityEnv[key] = process.env[key];
+		delete process.env[key];
+	}
+});
 
 const HOST_NAME = "Host Machine";
 const HOST_EMAIL = "host@example.invalid";
@@ -59,220 +76,249 @@ async function createRepo(prefix: string): Promise<string> {
 }
 
 afterEach(() => {
+	for (const key of IDENTITY_ENV_KEYS) {
+		const value = savedIdentityEnv[key];
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
 	for (const dir of tempDirs.splice(0)) {
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
 
-describe("gitService.commit identity", () => {
-	test("an identity overrides the repo config for BOTH author and committer", async () => {
-		const dir = await createRepo("commit-identity");
-		writeFileSync(join(dir, "work.txt"), "work\n");
-		await git(["add", "-A"], dir);
-
-		await gitService.commit(dir, "alice work", ALICE);
-
-		expect(await identityOf(dir)).toBe(
-			"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
+// Bun's env:undefined spawn inherits the process-start environment, not later deletes
+// from process.env. Execute the complete suite in a clean child when the tool/CI caller
+// injected identity variables; no production environment/config behavior is changed.
+if (IDENTITY_ENV_KEYS.some((key) => process.env[key] !== undefined)) {
+	test("the complete attribution suite is isolated from the caller's Git identity", () => {
+		const env = { ...process.env };
+		for (const key of IDENTITY_ENV_KEYS) delete env[key];
+		if (env.NARRAFORK_ORIGINAL_HOME) env.HOME = env.NARRAFORK_ORIGINAL_HOME;
+		delete env.NARRAFORK_HOME;
+		delete env.NARRAFORK_TEST;
+		delete env.NARRAFORK_ORIGINAL_HOME;
+		const result = Bun.spawnSync(
+			[process.execPath, "test", "--isolate", "--only-failures", import.meta.path],
+			{ env, stdout: "pipe", stderr: "pipe", timeout: 60_000, maxBuffer: 128 * 1024 },
 		);
+		if (result.exitCode !== 0) {
+			throw new Error(
+				`Isolated Git attribution failed: ${result.stdout.toString()}${result.stderr.toString()}`,
+			);
+		}
+		expect(result.exitCode).toBe(0);
 	});
+} else {
+	describe("gitService.commit identity", () => {
+		test("an identity overrides the repo config for BOTH author and committer", async () => {
+			const dir = await createRepo("commit-identity");
+			writeFileSync(join(dir, "work.txt"), "work\n");
+			await git(["add", "-A"], dir);
 
-	test("no identity inherits the host config, unchanged from before this existed", async () => {
-		// The regression guard for the no-identity path: `exec` must pass no env at
-		// all rather than an env it assembled, or every commit on a machine whose
-		// PATH/HOME matter would behave differently than it used to.
-		const dir = await createRepo("commit-host");
-		writeFileSync(join(dir, "work.txt"), "work\n");
-		await git(["add", "-A"], dir);
+			await gitService.commit(dir, "alice work", ALICE);
 
-		await gitService.commit(dir, "host work");
-
-		expect(await identityOf(dir)).toBe(
-			`author=${HOST_NAME} <${HOST_EMAIL}> committer=${HOST_NAME} <${HOST_EMAIL}>`,
-		);
-	});
-
-	test("two users committing in one repo produce two distinct authors", async () => {
-		// The actual multi-user requirement: the same worktree, driven by different
-		// people, must not collapse into a single author.
-		const dir = await createRepo("commit-two-users");
-
-		writeFileSync(join(dir, "a.txt"), "a\n");
-		await git(["add", "-A"], dir);
-		await gitService.commit(dir, "alice change", ALICE);
-
-		writeFileSync(join(dir, "b.txt"), "b\n");
-		await git(["add", "-A"], dir);
-		await gitService.commit(dir, "bob change", BOB);
-
-		expect(await git(["log", "-2", "--format=%an"], dir)).toBe("Bob\nAlice");
-	});
-
-	test("passing an env still leaves git runnable, i.e. PATH/HOME were not stripped", async () => {
-		// `Bun.spawn`'s env REPLACES the parent environment. Handing git only the four
-		// GIT_* variables would leave it without PATH/HOME; the failure mode is not a
-		// wrong author but git failing or behaving oddly, so this asserts the commit
-		// actually succeeded and is readable.
-		const dir = await createRepo("commit-env-merge");
-		writeFileSync(join(dir, "work.txt"), "work\n");
-		await git(["add", "-A"], dir);
-
-		const sha = await gitService.commit(dir, "env sanity", ALICE);
-
-		expect(sha).toMatch(/^[0-9a-f]{40}$/);
-		expect(await git(["log", "-1", "--format=%s"], dir)).toBe("env sanity");
-	});
-});
-
-describe("gitService.autoCommit identity", () => {
-	test("the dormant/pre-merge auto-save is attributed to the acting user", async () => {
-		const dir = await createRepo("autocommit-identity");
-		writeFileSync(join(dir, "dirty.txt"), "uncommitted\n");
-
-		const sha = await gitService.autoCommit(dir, "auto-save before dormant", ALICE);
-
-		expect(sha).toMatch(/^[0-9a-f]{40}$/);
-		expect(await identityOf(dir)).toBe(
-			"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
-		);
-	});
-
-	test("an unattended auto-save with no identity falls back to the host", async () => {
-		// The scheduled dormant sweep passes no user on purpose: a timer firing is
-		// nobody's authored change.
-		const dir = await createRepo("autocommit-host");
-		writeFileSync(join(dir, "dirty.txt"), "uncommitted\n");
-
-		await gitService.autoCommit(dir, "auto-save before dormant");
-
-		expect(await identityOf(dir)).toBe(
-			`author=${HOST_NAME} <${HOST_EMAIL}> committer=${HOST_NAME} <${HOST_EMAIL}>`,
-		);
-	});
-});
-
-describe("gitService.merge identity", () => {
-	test("the merge commit belongs to whoever asked for the merge", async () => {
-		const dir = await createRepo("merge-identity");
-		await git(["checkout", "-b", "feature"], dir);
-		writeFileSync(join(dir, "feature.txt"), "feature\n");
-		await git(["add", "-A"], dir);
-		await gitService.commit(dir, "feature work", BOB);
-
-		await git(["checkout", "main"], dir);
-		writeFileSync(join(dir, "trunk.txt"), "trunk\n");
-		await git(["add", "-A"], dir);
-		await gitService.commit(dir, "trunk work", BOB);
-
-		const result = await gitService.merge(dir, "feature", "merge", "merge feature", {
-			identity: ALICE,
+			expect(await identityOf(dir)).toBe(
+				"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
+			);
 		});
 
-		expect(result.success).toBe(true);
-		expect(await identityOf(dir)).toBe(
-			"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
-		);
-	});
+		test("no identity inherits the host config, unchanged from before this existed", async () => {
+			// The regression guard for the no-identity path: `exec` must pass no env at
+			// all rather than an env it assembled, or every commit on a machine whose
+			// PATH/HOME matter would behave differently than it used to.
+			const dir = await createRepo("commit-host");
+			writeFileSync(join(dir, "work.txt"), "work\n");
+			await git(["add", "-A"], dir);
 
-	test("a squash merge's synthesized commit is attributed too", async () => {
-		// The squash path commits in a SECOND git invocation after the merge, which is
-		// easy to leave un-threaded: the merge would carry the identity and the commit
-		// that actually lands would not.
-		const dir = await createRepo("merge-squash-identity");
-		await git(["checkout", "-b", "feature"], dir);
-		writeFileSync(join(dir, "feature.txt"), "feature\n");
-		await git(["add", "-A"], dir);
-		await gitService.commit(dir, "feature work", BOB);
-		await git(["checkout", "main"], dir);
+			await gitService.commit(dir, "host work");
 
-		const result = await gitService.merge(dir, "feature", "squash", "squashed feature", {
-			identity: ALICE,
+			expect(await identityOf(dir)).toBe(
+				`author=${HOST_NAME} <${HOST_EMAIL}> committer=${HOST_NAME} <${HOST_EMAIL}>`,
+			);
 		});
 
-		expect(result.success).toBe(true);
-		expect(await identityOf(dir)).toBe(
-			"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
-		);
-	});
-});
+		test("two users committing in one repo produce two distinct authors", async () => {
+			// The actual multi-user requirement: the same worktree, driven by different
+			// people, must not collapse into a single author.
+			const dir = await createRepo("commit-two-users");
 
-describe("gitService.cherryPick identity", () => {
-	test("keeps the original author and records the acting user as committer", async () => {
-		// git's own semantics, kept deliberately: Alice transplanted Bob's change, she
-		// did not write it. Rewriting the author would misattribute Bob's work.
-		const dir = await createRepo("cherry-pick-identity");
-		const baseSha = await git(["rev-parse", "HEAD"], dir);
+			writeFileSync(join(dir, "a.txt"), "a\n");
+			await git(["add", "-A"], dir);
+			await gitService.commit(dir, "alice change", ALICE);
 
-		await git(["checkout", "-b", "feature"], dir);
-		writeFileSync(join(dir, "feature.txt"), "feature\n");
-		await git(["add", "-A"], dir);
-		await gitService.commit(dir, "bob work", BOB);
-		await git(["checkout", "main"], dir);
+			writeFileSync(join(dir, "b.txt"), "b\n");
+			await git(["add", "-A"], dir);
+			await gitService.commit(dir, "bob change", BOB);
 
-		const result = await gitService.cherryPick(dir, dir, "feature", baseSha, ALICE);
-
-		expect(result.success).toBe(true);
-		expect(await identityOf(dir)).toBe(
-			"author=Bob <bob@example.com> committer=Alice <alice@example.com>",
-		);
-	});
-});
-
-describe("gitService.revertCommit identity", () => {
-	test("the revert is a new commit authored by whoever undid the change", async () => {
-		const dir = await createRepo("revert-identity");
-		writeFileSync(join(dir, "work.txt"), "work\n");
-		await git(["add", "-A"], dir);
-		const target = await gitService.commit(dir, "bob work", BOB);
-
-		await gitService.revertCommit(dir, target, ALICE);
-
-		expect(await identityOf(dir)).toBe(
-			"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
-		);
-	});
-});
-
-describe("gitService.initRepo / stageAndCommit identity", () => {
-	test("project setup commits belong to the project creator", async () => {
-		const parent = mkdtempSync(join(tmpdir(), "nf-init-identity-"));
-		tempDirs.push(parent);
-		const dir = join(parent, "repo");
-
-		await gitService.initRepo(dir, ALICE);
-
-		// A repo created this way has NO user.name/user.email of its own, so the
-		// initial commit would fail outright without a usable identity — which is
-		// exactly why buildGitIdentityEnv must never emit a half-filled env.
-		expect(await identityOf(dir)).toBe(
-			"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
-		);
-
-		writeFileSync(join(dir, ".gitignore"), "node_modules\n");
-		await gitService.stageAndCommit(dir, [".gitignore"], "Add .gitignore", ALICE);
-
-		expect(await identityOf(dir)).toBe(
-			"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
-		);
-	});
-});
-
-describe("git's own identity contract", () => {
-	test("an empty ident name is fatal, so a partial env cannot be a fallback", async () => {
-		// The fact that makes buildGitIdentityEnv's atomicity load-bearing. If this
-		// ever stopped being true, half-filled identities would merely mis-attribute
-		// instead of breaking every commit — a much quieter bug.
-		const dir = await createRepo("empty-ident");
-		writeFileSync(join(dir, "work.txt"), "work\n");
-		await git(["add", "-A"], dir);
-
-		const result = await safeSpawn({
-			cmd: ["git", "commit", "-m", "empty ident"],
-			cwd: dir,
-			timeout: 15_000,
-			env: { ...process.env, GIT_AUTHOR_NAME: "", GIT_AUTHOR_EMAIL: "x@example.com" },
+			expect(await git(["log", "-2", "--format=%an"], dir)).toBe("Bob\nAlice");
 		});
 
-		expect(result.exitCode).not.toBe(0);
+		test("passing an env still leaves git runnable, i.e. PATH/HOME were not stripped", async () => {
+			// `Bun.spawn`'s env REPLACES the parent environment. Handing git only the four
+			// GIT_* variables would leave it without PATH/HOME; the failure mode is not a
+			// wrong author but git failing or behaving oddly, so this asserts the commit
+			// actually succeeded and is readable.
+			const dir = await createRepo("commit-env-merge");
+			writeFileSync(join(dir, "work.txt"), "work\n");
+			await git(["add", "-A"], dir);
+
+			const sha = await gitService.commit(dir, "env sanity", ALICE);
+
+			expect(sha).toMatch(/^[0-9a-f]{40}$/);
+			expect(await git(["log", "-1", "--format=%s"], dir)).toBe("env sanity");
+		});
 	});
-});
+
+	describe("gitService.autoCommit identity", () => {
+		test("the dormant/pre-merge auto-save is attributed to the acting user", async () => {
+			const dir = await createRepo("autocommit-identity");
+			writeFileSync(join(dir, "dirty.txt"), "uncommitted\n");
+
+			const sha = await gitService.autoCommit(dir, "auto-save before dormant", ALICE);
+
+			expect(sha).toMatch(/^[0-9a-f]{40}$/);
+			expect(await identityOf(dir)).toBe(
+				"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
+			);
+		});
+
+		test("an unattended auto-save with no identity falls back to the host", async () => {
+			// The scheduled dormant sweep passes no user on purpose: a timer firing is
+			// nobody's authored change.
+			const dir = await createRepo("autocommit-host");
+			writeFileSync(join(dir, "dirty.txt"), "uncommitted\n");
+
+			await gitService.autoCommit(dir, "auto-save before dormant");
+
+			expect(await identityOf(dir)).toBe(
+				`author=${HOST_NAME} <${HOST_EMAIL}> committer=${HOST_NAME} <${HOST_EMAIL}>`,
+			);
+		});
+	});
+
+	describe("gitService.merge identity", () => {
+		test("the merge commit belongs to whoever asked for the merge", async () => {
+			const dir = await createRepo("merge-identity");
+			await git(["checkout", "-b", "feature"], dir);
+			writeFileSync(join(dir, "feature.txt"), "feature\n");
+			await git(["add", "-A"], dir);
+			await gitService.commit(dir, "feature work", BOB);
+
+			await git(["checkout", "main"], dir);
+			writeFileSync(join(dir, "trunk.txt"), "trunk\n");
+			await git(["add", "-A"], dir);
+			await gitService.commit(dir, "trunk work", BOB);
+
+			const result = await gitService.merge(dir, "feature", "merge", "merge feature", {
+				identity: ALICE,
+			});
+
+			expect(result.success).toBe(true);
+			expect(await identityOf(dir)).toBe(
+				"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
+			);
+		});
+
+		test("a squash merge's synthesized commit is attributed too", async () => {
+			// The squash path commits in a SECOND git invocation after the merge, which is
+			// easy to leave un-threaded: the merge would carry the identity and the commit
+			// that actually lands would not.
+			const dir = await createRepo("merge-squash-identity");
+			await git(["checkout", "-b", "feature"], dir);
+			writeFileSync(join(dir, "feature.txt"), "feature\n");
+			await git(["add", "-A"], dir);
+			await gitService.commit(dir, "feature work", BOB);
+			await git(["checkout", "main"], dir);
+
+			const result = await gitService.merge(dir, "feature", "squash", "squashed feature", {
+				identity: ALICE,
+			});
+
+			expect(result.success).toBe(true);
+			expect(await identityOf(dir)).toBe(
+				"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
+			);
+		});
+	});
+
+	describe("gitService.cherryPick identity", () => {
+		test("keeps the original author and records the acting user as committer", async () => {
+			// git's own semantics, kept deliberately: Alice transplanted Bob's change, she
+			// did not write it. Rewriting the author would misattribute Bob's work.
+			const dir = await createRepo("cherry-pick-identity");
+			const baseSha = await git(["rev-parse", "HEAD"], dir);
+
+			await git(["checkout", "-b", "feature"], dir);
+			writeFileSync(join(dir, "feature.txt"), "feature\n");
+			await git(["add", "-A"], dir);
+			await gitService.commit(dir, "bob work", BOB);
+			await git(["checkout", "main"], dir);
+
+			const result = await gitService.cherryPick(dir, dir, "feature", baseSha, ALICE);
+
+			expect(result.success).toBe(true);
+			expect(await identityOf(dir)).toBe(
+				"author=Bob <bob@example.com> committer=Alice <alice@example.com>",
+			);
+		});
+	});
+
+	describe("gitService.revertCommit identity", () => {
+		test("the revert is a new commit authored by whoever undid the change", async () => {
+			const dir = await createRepo("revert-identity");
+			writeFileSync(join(dir, "work.txt"), "work\n");
+			await git(["add", "-A"], dir);
+			const target = await gitService.commit(dir, "bob work", BOB);
+
+			await gitService.revertCommit(dir, target, ALICE);
+
+			expect(await identityOf(dir)).toBe(
+				"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
+			);
+		});
+	});
+
+	describe("gitService.initRepo / stageAndCommit identity", () => {
+		test("project setup commits belong to the project creator", async () => {
+			const parent = mkdtempSync(join(tmpdir(), "nf-init-identity-"));
+			tempDirs.push(parent);
+			const dir = join(parent, "repo");
+
+			await gitService.initRepo(dir, ALICE);
+
+			// A repo created this way has NO user.name/user.email of its own, so the
+			// initial commit would fail outright without a usable identity — which is
+			// exactly why buildGitIdentityEnv must never emit a half-filled env.
+			expect(await identityOf(dir)).toBe(
+				"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
+			);
+
+			writeFileSync(join(dir, ".gitignore"), "node_modules\n");
+			await gitService.stageAndCommit(dir, [".gitignore"], "Add .gitignore", ALICE);
+
+			expect(await identityOf(dir)).toBe(
+				"author=Alice <alice@example.com> committer=Alice <alice@example.com>",
+			);
+		});
+	});
+
+	describe("git's own identity contract", () => {
+		test("an empty ident name is fatal, so a partial env cannot be a fallback", async () => {
+			// The fact that makes buildGitIdentityEnv's atomicity load-bearing. If this
+			// ever stopped being true, half-filled identities would merely mis-attribute
+			// instead of breaking every commit — a much quieter bug.
+			const dir = await createRepo("empty-ident");
+			writeFileSync(join(dir, "work.txt"), "work\n");
+			await git(["add", "-A"], dir);
+
+			const result = await safeSpawn({
+				cmd: ["git", "commit", "-m", "empty ident"],
+				cwd: dir,
+				timeout: 15_000,
+				env: { ...process.env, GIT_AUTHOR_NAME: "", GIT_AUTHOR_EMAIL: "x@example.com" },
+			});
+
+			expect(result.exitCode).not.toBe(0);
+		});
+	});
+}

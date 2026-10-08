@@ -1,166 +1,19 @@
-import { Database } from "bun:sqlite";
 import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
 import { and, eq } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/bun-sqlite";
-import * as relations from "../../../server/db/relations";
-import * as schema from "../../../server/db/schema";
 import {
 	narratorMessageRefs,
 	narratorMessages,
+	narrators,
 	narratorToolCalls,
 } from "../../../server/db/schema";
+import { cleanDb, getTestDb } from "../../setup";
 
-const sqlite = new Database(":memory:");
-sqlite.exec(`
-	CREATE TABLE narrators (
-		id TEXT PRIMARY KEY,
-		chapter_id TEXT,
-		api_conversation_id TEXT,
-		fork_message_id TEXT,
-		type TEXT NOT NULL DEFAULT 'primary',
-		subagent_type TEXT,
-		title TEXT,
-		inherit_mode TEXT NOT NULL DEFAULT 'fresh',
-		parent_narrator_id TEXT,
-		context_summary TEXT,
-		model TEXT DEFAULT 'claude-sonnet-4.5',
-		pending_model_restore TEXT,
-		system_prompt TEXT,
-		permission_mode TEXT DEFAULT 'default',
-		previous_permission_mode TEXT,
-		plan_file_id TEXT,
-		reasoning_effort TEXT,
-		fast_mode INTEGER NOT NULL DEFAULT 0,
-		relaxed_plan INTEGER NOT NULL DEFAULT 0,
-		message_count INTEGER DEFAULT 0,
-		total_cost_usd REAL DEFAULT 0,
-		last_message_at TEXT,
-		status TEXT NOT NULL DEFAULT 'idle',
-		substatus TEXT NOT NULL DEFAULT '[]',
-		plan_mode INTEGER NOT NULL DEFAULT 0,
-		cwd TEXT,
-		error_message TEXT,
-		todos_json TEXT,
-		todos_tool_use_id TEXT,
-		prune_boundary_message_id TEXT,
-		pruned_percent INTEGER,
-		prune_enabled INTEGER NOT NULL DEFAULT 1,
-		enabled_tools TEXT,
-		variant TEXT NOT NULL DEFAULT 'primary',
-		traits TEXT NOT NULL DEFAULT '[]',
-		is_background INTEGER NOT NULL DEFAULT 0,
-		background_status TEXT,
-		background_result TEXT,
-		background_completed_at TEXT,
-		is_ask_in_passing INTEGER NOT NULL DEFAULT 0,
-		turn_started_at TEXT,
-		message_version INTEGER NOT NULL DEFAULT 0,
-		message_structure_version INTEGER NOT NULL DEFAULT 0,
-		created_at TEXT NOT NULL,
-		updated_at TEXT NOT NULL
-	);
-	CREATE TABLE narrator_messages (
-		id TEXT PRIMARY KEY,
-		narrator_id TEXT NOT NULL,
-		sdk_message_uuid TEXT,
-		parent_tool_use_id TEXT,
-		role TEXT NOT NULL,
-		content_json TEXT NOT NULL,
-		content_text TEXT,
-		tokens_in INTEGER,
-		cost_usd REAL,
-		turn_usage_json TEXT,
-		provider TEXT,
-		credential_id TEXT,
-		model TEXT,
-		output_tokens INTEGER,
-		cached_input_tokens INTEGER,
-		cache_creation_input_tokens INTEGER,
-		cache_creation_5m_tokens INTEGER,
-		cache_creation_1h_tokens INTEGER,
-		reasoning_tokens INTEGER,
-		ttft_ms INTEGER,
-		duration_ms INTEGER,
-		context_percent REAL,
-		meter_usage REAL,
-		meter_unit TEXT,
-		commit_sha TEXT,
-		command_text TEXT,
-		created_by TEXT,
-		origin TEXT,
-		origin_label TEXT,
-		edited_at TEXT,
-		edited_by TEXT,
-		original_content_json TEXT,
-		tree_hash_after TEXT,
-		snapshot_commit_sha TEXT,
-		created_at TEXT NOT NULL
-	);
-	CREATE TABLE narrator_message_refs (
-		id TEXT PRIMARY KEY,
-		narrator_id TEXT NOT NULL,
-		message_id TEXT NOT NULL,
-		seq INTEGER NOT NULL,
-		is_compact INTEGER NOT NULL DEFAULT 0,
-		pruned_percent INTEGER,
-		segment_compact_id TEXT
-	);
-	CREATE TABLE narrator_tool_calls (
-		id TEXT PRIMARY KEY,
-		narrator_id TEXT NOT NULL,
-		message_id TEXT NOT NULL,
-		tool_use_id TEXT NOT NULL,
-		tool_name TEXT NOT NULL,
-		input_json TEXT,
-		output_json TEXT,
-		execution_device_id TEXT,
-		execution_cwd TEXT,
-		execution_path_flavor TEXT,
-		resolved_file_path TEXT,
-		canonical_file_path TEXT,
-		runtime_generation INTEGER,
-		execution_targets_json TEXT,
-		device_selection_source TEXT,
-		status TEXT NOT NULL DEFAULT 'initializing',
-		duration_ms INTEGER,
-		stream_started_at TEXT,
-		permission_started_at TEXT,
-		execution_started_at TEXT,
-		completed_at TEXT,
-		error_message TEXT,
-		permission_decided_by TEXT,
-		permission_decided_at TEXT,
-		permission_deny_message TEXT,
-		permission_decision_reason TEXT,
-		permission_suggestions TEXT,
-		is_background INTEGER NOT NULL DEFAULT 0,
-		is_file_history_checkpoint INTEGER NOT NULL DEFAULT 0,
-		tree_hash_before TEXT,
-		tree_hash_after TEXT,
-		owned_paths_json TEXT,
-		input_tokens INTEGER NOT NULL DEFAULT 0,
-		output_tokens INTEGER NOT NULL DEFAULT 0,
-		cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
-		cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-		cache_creation_5m_tokens INTEGER NOT NULL DEFAULT 0,
-		cache_creation_1h_tokens INTEGER NOT NULL DEFAULT 0,
-		input_cost REAL NOT NULL DEFAULT 0,
-		output_cost REAL NOT NULL DEFAULT 0,
-		cache_creation_cost REAL NOT NULL DEFAULT 0,
-		cache_read_cost REAL NOT NULL DEFAULT 0,
-		total_cost REAL NOT NULL DEFAULT 0,
-		provider TEXT,
-		model TEXT,
-		result_message_id TEXT,
-		created_at TEXT NOT NULL
-	);
-`);
-
-const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
+// Replay the complete production migration chain, including import-time runtime outbox tables.
+const { db, sqlite } = getTestDb();
 
 // Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
 const realDbModule = { ...(await import("../../../server/db")) };
-mock.module("../../../server/db", () => ({ db, sqlite }));
+mock.module("../../../server/db", () => ({ ...realDbModule, db, sqlite }));
 
 const { finalizeOrCleanupPartialMessage, markInterruptedToolCallsForMessage } = await import(
 	"../../../server/services/narrator-session"
@@ -170,6 +23,10 @@ const now = new Date("2026-01-01T00:00:00.000Z").toISOString();
 
 function seedAssistantMessage(params: { id: string; narratorId?: string; contentJson: unknown[] }) {
 	const narratorId = params.narratorId ?? "n1";
+	db.insert(narrators)
+		.values({ id: narratorId, createdAt: now, updatedAt: now })
+		.onConflictDoNothing()
+		.run();
 	db.insert(narratorMessages)
 		.values({
 			id: params.id,
@@ -214,19 +71,14 @@ function seedToolCall(params: {
 		.run();
 }
 
-function clearTables() {
-	for (const table of ["narrator_tool_calls", "narrator_message_refs", "narrator_messages"]) {
-		sqlite.run(`DELETE FROM ${table}`);
-	}
-}
-
 afterEach(() => {
-	clearTables();
+	cleanDb(sqlite);
 });
 
 afterAll(() => {
 	mock.module("../../../server/db", () => realDbModule);
 	mock.restore();
+	sqlite.close();
 });
 
 describe("interrupted narrator partial message finalization", () => {

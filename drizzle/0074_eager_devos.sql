@@ -1,0 +1,1 @@
+ALTER TABLE `device_transfer_tasks` ADD `run_generation` integer DEFAULT 0 NOT NULL;

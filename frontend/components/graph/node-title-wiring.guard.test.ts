@@ -18,12 +18,18 @@
  *     stay visible and simply stop working, or worse, drag the node instead. No
  *     error, no warning.
  *
- * Zero-runtime, filesystem-only.
+ * Upstream wiring guards plus real behavior tests for the extracted title owner.
  */
 
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { MantineProvider } from "@mantine/core";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { parseHTML } from "linkedom";
+import { act, createElement } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { NarratorPanelHeaderTitle } from "../narrator/header/NarratorPanelHeaderTitle";
 
 const GRAPH_DIR = import.meta.dir;
 const FRONTEND_ROOT = resolve(GRAPH_DIR, "..", "..");
@@ -70,14 +76,109 @@ describe("node title ownership", () => {
 		expect(source).toMatch(/\n\t\thostOwnsTitle,/);
 	});
 
-	it("the chat panel gates its whole title block on hostOwnsTitle", () => {
+	it("the chat panel forwards host title ownership and preview mode to the extracted title block", () => {
 		const source = narratorPanel();
 		expect(source).toContain("const hostOwnsTitle = dock?.hostOwnsTitle === true;");
-		// The title element itself...
-		expect(source).toContain("{hostOwnsTitle ? null : editingTitle && !isWorkspacePreview ? (");
-		// ...and the pencil / sparkles pair beside it. Leaving these would keep two
-		// title buttons in a node header that already has its own.
-		expect(source).toContain("{!isWorkspacePreview && !hostOwnsTitle && (");
+		const start = source.indexOf("<NarratorPanelHeaderTitle\n");
+		expect(start).toBeGreaterThan(-1);
+		const props = source.slice(start, source.indexOf("/>", start));
+		expect(props).toContain("hostOwnsTitle={hostOwnsTitle}");
+		expect(props).toContain("isWorkspacePreview={isWorkspacePreview}");
+	});
+});
+
+describe("extracted narrator title ownership behavior", () => {
+	let root: Root;
+	let host: HTMLDivElement;
+	let qc: QueryClient;
+	let globals: Map<string, PropertyDescriptor | undefined>;
+	let inputSelect: PropertyDescriptor | undefined;
+	beforeEach(() => {
+		const { window } = parseHTML("<!doctype html><html><body></body></html>");
+		const overrides = {
+			window,
+			document: window.document,
+			navigator: window.navigator,
+			HTMLElement: window.HTMLElement,
+			Element: window.Element,
+			Node: window.Node,
+			Text: window.Text,
+			Event: window.Event,
+			matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
+			getComputedStyle: () => ({ getPropertyValue: () => "" }),
+			requestAnimationFrame: (callback: FrameRequestCallback) => setTimeout(callback, 0),
+			cancelAnimationFrame: (id: number) => clearTimeout(id),
+			IS_REACT_ACT_ENVIRONMENT: true,
+		};
+		globals = new Map(
+			Object.keys(overrides).map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]),
+		);
+		Object.assign(globalThis, overrides);
+		inputSelect = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "select");
+		Object.defineProperty(window.HTMLInputElement.prototype, "select", {
+			configurable: true,
+			value() {},
+		});
+		host = document.createElement("div");
+		document.body.appendChild(host);
+		root = createRoot(host);
+		qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+	});
+	afterEach(() => {
+		act(() => root.unmount());
+		qc.clear();
+		host.remove();
+		if (inputSelect)
+			Object.defineProperty(window.HTMLInputElement.prototype, "select", inputSelect);
+		else Reflect.deleteProperty(window.HTMLInputElement.prototype, "select");
+		for (const [key, descriptor] of globals) {
+			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+			else Reflect.deleteProperty(globalThis, key);
+		}
+	});
+	async function renderTitle(hostOwnsTitle: boolean, isWorkspacePreview: boolean) {
+		await act(async () =>
+			root.render(
+				createElement(
+					MantineProvider,
+					{ env: "test" },
+					createElement(
+						QueryClientProvider,
+						{ client: qc },
+						createElement(NarratorPanelHeaderTitle, {
+							narratorId: "narrator",
+							narrator: { title: "Owned title" },
+							hostOwnsTitle,
+							isWorkspacePreview,
+							titleFullWidth: 180,
+						}),
+					),
+				),
+			),
+		);
+	}
+	it("host ownership removes the duplicate title and all editing controls", async () => {
+		await renderTitle(true, false);
+		expect(host.textContent).not.toContain("Owned title");
+		expect(host.querySelectorAll("button,input")).toHaveLength(0);
+	});
+	it("a standalone title remains visible and the pencil enters real edit mode", async () => {
+		await renderTitle(false, false);
+		expect(host.textContent).toContain("Owned title");
+		expect(host.querySelectorAll("button")).toHaveLength(2);
+		await act(async () => host.querySelector<HTMLButtonElement>("button")?.click());
+		expect(host.querySelector("input")?.value).toBe("Owned title");
+	});
+	it("preview renders only the title and double-click cannot enter editing", async () => {
+		await renderTitle(false, true);
+		expect(host.textContent).toContain("Owned title");
+		expect(host.querySelectorAll("button,input")).toHaveLength(0);
+		await act(async () =>
+			host
+				.querySelector('[title="Owned title"]')
+				?.dispatchEvent(new Event("dblclick", { bubbles: true })),
+		);
+		expect(host.querySelector("input")).toBeNull();
 	});
 });
 

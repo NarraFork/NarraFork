@@ -1,0 +1,1 @@
+ALTER TABLE `user_preferences` ADD `fast_mode_default` integer DEFAULT false NOT NULL;

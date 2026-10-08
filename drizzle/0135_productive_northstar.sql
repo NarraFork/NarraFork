@@ -1,0 +1,1 @@
+ALTER TABLE `user_preferences` ADD `narrator_toolbar_layout` text DEFAULT '{}' NOT NULL;

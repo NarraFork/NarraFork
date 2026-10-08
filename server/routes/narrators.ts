@@ -188,6 +188,7 @@ import {
 	narratorExportQuerySchema,
 	narratorGrantCreateSchema,
 	narratorGrantUpdateSchema,
+	narratorTransferOwnerSchema,
 	narratorVisibilitySchema,
 	narratorWriteAudienceSchema,
 	permissionDecisionSchema,
@@ -406,6 +407,7 @@ import {
 	revokeNarratorGrant,
 	setNarratorVisibility,
 	setNarratorWriteAudience,
+	transferNarratorOwner,
 	updateNarratorGrant,
 } from "../services/narrator-sharing";
 import {
@@ -1653,6 +1655,15 @@ narratorRoutes.patch("/:id/grants/:grantId", async (c) => {
 narratorRoutes.delete("/:id/grants/:grantId", async (c) => {
 	await revokeNarratorGrant(c.req.param("id"), c.req.param("grantId"), narratorPrincipalOf(c));
 	return c.json({ ok: true });
+});
+
+// Owner-or-admin is enforced by the sharing service, including legacy ownerless rows.
+narratorRoutes.post("/:id/transfer-owner", async (c) => {
+	const parsed = narratorTransferOwnerSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(
+		await transferNarratorOwner(c.req.param("id"), parsed.data.userId, narratorPrincipalOf(c)),
+	);
 });
 
 /**
