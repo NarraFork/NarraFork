@@ -145,6 +145,7 @@ const cases: [string, ProviderRegion, ProviderBilling, string, string, string?][
 describe("provider connection metadata", () => {
 	test("popular providers use the exact stable order without international duplicates", () => {
 		expect(POPULAR_PROVIDER_IDS).toEqual([
+			"tokendance",
 			"deepseek",
 			"zhipu",
 			"moonshot",

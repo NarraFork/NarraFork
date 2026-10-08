@@ -24,6 +24,7 @@ import {
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
+import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
@@ -162,14 +163,22 @@ function truncateUtf8ToBytes(
 export class GeminiProvider implements ProviderAdapter {
 	private config: GeminiProviderConfig;
 
-	constructor(config: GeminiProviderConfig) {
+	constructor(
+		config: GeminiProviderConfig,
+		private transport?: ProviderTransport,
+	) {
 		this.config = config;
 	}
 
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
 		const proxy = resolveProxyForUrl(target, this.config.proxy);
-		return fetchWithNetworkDiagnostics(input, init, { proxy });
+		return runProviderTransport(this.transport, input, init, (target, options) =>
+			fetchWithNetworkDiagnostics(target, options, {
+				proxy,
+				redactText: this.transport?.redactText,
+			}),
+		);
 	}
 
 	private getApiKey(): string {
@@ -226,8 +235,14 @@ export class GeminiProvider implements ProviderAdapter {
 		h.unshift({ role: "system", text });
 	}
 
+	private reasoningSourceOverride?: string;
+
+	setReasoningSourceOverride(source: string | undefined): void {
+		this.reasoningSourceOverride = source;
+	}
+
 	getActiveReasoningSource(): string | undefined {
-		return `gemini:${this.config.prefix}:generate-content`;
+		return this.reasoningSourceOverride ?? `gemini:${this.config.prefix}:generate-content`;
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {

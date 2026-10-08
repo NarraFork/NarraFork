@@ -11,6 +11,7 @@ export interface ProviderConnectionSelection {
 }
 
 export const POPULAR_PROVIDER_IDS = [
+	"tokendance",
 	"deepseek",
 	"zhipu",
 	"moonshot",

@@ -52,6 +52,7 @@ import {
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
+import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { BoundedUtf8Capture, captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
 import { finalToolInput, ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
@@ -566,7 +567,11 @@ export class OpenAIProvider implements ProviderAdapter {
 	/** Reasoning-source identity override (NUG injects its channel identity). */
 	private reasoningSourceOverride?: string;
 
-	constructor(config: OpenAIProviderConfig, proxy?: string) {
+	constructor(
+		config: OpenAIProviderConfig,
+		proxy?: string,
+		private transport?: ProviderTransport,
+	) {
 		this.config = config;
 		this.apiMode = resolveApiMode(config);
 		this.proxy = proxy;
@@ -619,7 +624,12 @@ export class OpenAIProvider implements ProviderAdapter {
 		const proxy = this.proxy
 			? applyProxyExemptions(this.proxy, target)
 			: resolveProxyForUrl(target, this.config.proxy);
-		return fetchWithNetworkDiagnostics(input, init, { proxy });
+		return runProviderTransport(this.transport, input, init, (target, options) =>
+			fetchWithNetworkDiagnostics(target, options, {
+				proxy,
+				redactText: this.transport?.redactText,
+			}),
+		);
 	}
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		if (this.responsesFormat) {

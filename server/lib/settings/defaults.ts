@@ -11,6 +11,7 @@ import type { FieldDoc, NarraForkSettings } from "./types";
 import { DEFAULT_UPDATE_SETTINGS } from "./update-source";
 
 export const DEFAULTS: NarraForkSettings = {
+	tokendance: { apiKey: "", disabled: false, generation: 0 },
 	diskSafety: { ...DEFAULT_DISK_SAFETY },
 	server: { port: 7778, host: "localhost", openBrowser: "browser", allowedOrigins: [] },
 	proxy: { mode: "direct" },
@@ -226,6 +227,12 @@ export const DEFAULTS: NarraForkSettings = {
  * Kept alongside DEFAULTS so changes stay in sync.
  */
 export const SETTING_DOCS: Record<string, FieldDoc> = {
+	"tokendance.apiKey": {
+		desc: "TokenDance 后端专用凭证，仅通过平台授权写入，不在设置 API 返回。",
+		type: "string",
+	},
+	"tokendance.disabled": { desc: "暂停 TokenDance 模型使用但保留连接。", type: "boolean" },
+	"tokendance.generation": { desc: "TokenDance 连接版本，用于取消旧代请求。", type: "number" },
 	"diskSafety.mode": {
 		desc: "磁盘安全策略：enforce 拒绝危险写入；warn 仅提示；off 关闭。管理员可临时覆盖，普通工具权限不会绕过。",
 		type: "string",

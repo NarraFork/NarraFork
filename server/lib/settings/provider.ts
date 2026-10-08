@@ -7,11 +7,13 @@ import { ERROR_CATALOG } from "@shared/error-catalog";
 import type { ModelCard } from "@shared/model-card";
 import { parseModelId } from "@shared/model-id";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import { selectTokenDanceProtocol } from "@shared/tokendance";
 import { getCodexManager } from "../codex-manager";
 import { AppError, ValidationError } from "../errors";
 import { modelCardContextWindow, modelCardMaxCompletionTokens } from "../model-cards";
 import { getEffectiveModelMetadata } from "../model-catalog";
 import { isNugCachedModelAvailable, resolveNugModelMeta } from "../nug-model-cache";
+import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../tokendance-runtime";
 import type {
 	AnthropicProviderConfig,
 	GeminiProviderConfig,
@@ -123,6 +125,17 @@ function resolveExtraProvider(bareModel: string): string | undefined {
 	}
 	return undefined;
 }
+
+registerExtraModelSource("tokendance", {
+	listModels: () => {
+		const config = getTokenDanceRuntimeConfig();
+		return config && !config.disabled
+			? getTokenDanceCatalogModels()
+					.filter((m) => selectTokenDanceProtocol(m.supported_protocols))
+					.map((m) => `tokendance:${m.id}`)
+			: [];
+	},
+});
 
 // Register codex model checker and lister immediately
 registerCodexModelChecker((model) => BUILTIN_CODEX_MODELS.includes(model));
@@ -252,6 +265,8 @@ export function getAggregation(aggId: string): ModelAggregation | undefined {
 
 function getDisabledProviderPrefixes(): Set<string> {
 	const disabled = new Set(s().agent.disabledProviders ?? []);
+	const tokenDance = getTokenDanceRuntimeConfig();
+	if (tokenDance?.disabled) disabled.add("tokendance");
 	for (const provider of [
 		...(s().customApiProviders ?? []),
 		...(s().openaiProviders ?? []),
@@ -677,6 +692,13 @@ export function usesStatefulApi(prefix?: string): boolean {
 }
 
 export function usesStatefulModel(prefix?: string, model?: string): boolean {
+	if (prefix === "tokendance" && getTokenDanceRuntimeConfig()) {
+		const rawModel = model?.startsWith("tokendance:") ? model.slice("tokendance:".length) : model;
+		const catalog = getTokenDanceCatalogModels().find((m) => m.id === rawModel);
+		return (
+			!!catalog && selectTokenDanceProtocol(catalog.supported_protocols) === "openai-responses"
+		);
+	}
 	if (usesStatefulApi(prefix)) return true;
 	if (usesCodexModel(prefix, model)) return true;
 	// NUG "responses" channel models use the stateful /responses endpoint too.
@@ -794,6 +816,8 @@ export function getFirstNugProvider(): NUGProviderConfig | undefined {
 
 function getConfiguredProviderCandidates(): string[] {
 	const available = new Set<string>();
+	const tokenDance = getTokenDanceRuntimeConfig();
+	if (tokenDance && !tokenDance.disabled) available.add("tokendance");
 	if (hasConfiguredOpenaiProvider()) {
 		for (const p of s().openaiProviders ?? []) {
 			if (!p.disabled && p.apiKey) available.add(p.prefix || "openai");
@@ -1048,8 +1072,22 @@ export function resolveModelContextWindow(
 		}
 	}
 
-	const bareModel = parseModelId(model).model;
+	const bareModel =
+		provider === "tokendance" && getTokenDanceRuntimeConfig()
+			? model.startsWith("tokendance:")
+				? model.slice("tokendance:".length)
+				: model
+			: parseModelId(model).model;
 	const fullModelValue = provider ? `${provider}:${bareModel}` : model;
+
+	if (provider === "tokendance" && getTokenDanceRuntimeConfig()) {
+		const userWindow = s().agent.modelContextWindows?.[fullModelValue];
+		if (userWindow && userWindow > 0) return { contextWindow: userWindow, source: "user" };
+		const catalog = getTokenDanceCatalogModels().find((m) => m.id === bareModel);
+		if (catalog && catalog.context_length > 0)
+			return { contextWindow: catalog.context_length, source: "catalog" };
+		return { contextWindow: DEFAULT_CONTEXT_WINDOW, source: "fallback" };
+	}
 
 	if (s().agent.modelCatalog) {
 		const metadataModel =

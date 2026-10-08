@@ -18,6 +18,7 @@ import {
 } from "@shared/recent-tabs";
 import { getToken } from "./api";
 import { observePageLifecycle } from "./page-lifecycle";
+import { dispatchTokenDanceRecovery } from "./tokendance-recovery";
 import { buildWsUrl, safeCloseWs } from "./ws";
 import { removeWSStatus, setWSStatus } from "./ws-status";
 
@@ -1523,6 +1524,7 @@ export class NarratorWSManager {
 					);
 					return;
 				}
+				dispatchTokenDanceRecovery(data);
 				this._dispatch(data);
 			} catch {
 				if (import.meta.env.DEV) {

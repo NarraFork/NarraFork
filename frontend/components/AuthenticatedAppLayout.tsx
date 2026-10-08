@@ -110,6 +110,7 @@ import { SystemMaintenanceBadge } from "./SystemMaintenanceBadge";
 import { BrokenModelMigrationHost } from "./settings/BrokenModelMigrationHost";
 import { ProviderBaseUrlFixHost } from "./settings/ProviderBaseUrlFixHost";
 import { SummaryModelPickerHost } from "./settings/SummaryModelPickerHost";
+import { TokenDanceRecoveryHost } from "./settings/TokenDanceRecoveryHost";
 import { UpdateBadge } from "./UpdateBadge";
 import { VersionUpdateBanner } from "./VersionUpdateBanner";
 import { WSConnectionAlert } from "./WSConnectionAlert";
@@ -888,6 +889,7 @@ export function AuthenticatedLayout() {
 
 			<SummaryModelPickerHost />
 			<ProviderBaseUrlFixHost />
+			<TokenDanceRecoveryHost />
 			<BrokenModelMigrationHost />
 			<PluginPermissionRequestHost />
 

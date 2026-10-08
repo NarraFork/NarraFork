@@ -8,7 +8,6 @@ import { agentGenerateWithMetaResolved } from "../lib/agent";
 import { serializeDiagnosticError } from "../lib/agent/diagnostic-fetch";
 import { resolveProviderAndModel } from "../lib/agent/provider";
 import { type CapturedRequest, createUrlCapture } from "../lib/agent/request-url-tracker";
-import { AsyncMutex } from "../lib/async-mutex";
 import { maskAuthSettings, maskSecret } from "../lib/auth-settings";
 import { normalizeBrandingSettings } from "../lib/branding";
 import { isValidTrustedProxyCidr } from "../lib/client-ip";
@@ -56,7 +55,9 @@ import {
 	settings,
 	stripObsoleteSettingsKeys,
 } from "../lib/settings";
+import { isLegacyTokenDancePrefixAllowed } from "../lib/settings/tokendance-prefix";
 import { updateSourceSettingsSchema } from "../lib/settings/update-source";
+import { settingsUpdateLock } from "../lib/settings/write-lock";
 import {
 	blacklistDirEntrySchema,
 	codexTierOrderSchema,
@@ -85,6 +86,7 @@ import {
 	commitProviderPrefixMigration,
 	planProviderPrefixNarratorMigration,
 } from "../services/provider-prefix-migration-service";
+import { getTokenDanceConnection } from "../services/tokendance-service";
 import { closeAllExternalNarratorConnections } from "../websocket/oauth-connection-registry";
 import { closeVNetConnections } from "../websocket/vnet-ws";
 import { getAnthropicCachedModelsGrouped, purgeAnthropicProviderCache } from "./anthropic";
@@ -96,8 +98,6 @@ import {
 	getOpenaiCachedModelsGrouped,
 	purgeOpenaiProviderCache,
 } from "./openai";
-
-const settingsUpdateLock = new AsyncMutex();
 
 const modelOptionSchema = z.object({
 	value: z.string().min(1),
@@ -866,6 +866,8 @@ function buildSettingsResponse(
 	stripObsoleteSettingsKeys(safeSource);
 	return {
 		...safeSource,
+		// Explicit override prevents backend credentials leaking through the spread.
+		tokendance: getTokenDanceConnection(),
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -1359,19 +1361,42 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 
 		// Validate provider prefix conflicts — reserved prefixes and cross-provider duplicates
 		{
-			const RESERVED_PREFIXES = new Set(["codex"]);
-			const allPrefixes: Array<{ prefix: string; source: string }> = [];
+			const RESERVED_PREFIXES = new Set(["codex", "tokendance"]);
+			const allPrefixes: Array<{ prefix: string; source: string; legacyTokenDance?: boolean }> = [];
+			const previousCustomProviders = [
+				...(current.customApiProviders ?? []),
+				...(current.openaiProviders ?? []),
+				...(current.anthropicProviders ?? []),
+				...(current.geminiProviders ?? []),
+			];
 			for (const p of effectiveCustomApiProviders) {
 				if (p.prefix) {
-					allPrefixes.push({ prefix: p.prefix, source: `Custom API "${p.name || p.id}"` });
+					allPrefixes.push({
+						prefix: p.prefix,
+						source: `Custom API "${p.name || p.id}"`,
+						legacyTokenDance: isLegacyTokenDancePrefixAllowed(
+							p,
+							previousCustomProviders,
+							!!current.tokendance?.apiKey,
+						),
+					});
 				}
 			}
 			for (const p of validated.nugProviders ?? current.nugProviders ?? []) {
-				if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `NUG "${p.name || p.id}"` });
+				if (p.prefix)
+					allPrefixes.push({
+						prefix: p.prefix,
+						source: `NUG "${p.name || p.id}"`,
+						legacyTokenDance: isLegacyTokenDancePrefixAllowed(
+							p,
+							current.nugProviders ?? [],
+							!!current.tokendance?.apiKey,
+						),
+					});
 			}
 			// Check reserved prefix conflicts
-			for (const { prefix, source } of allPrefixes) {
-				if (RESERVED_PREFIXES.has(prefix)) {
+			for (const { prefix, source, legacyTokenDance } of allPrefixes) {
+				if (RESERVED_PREFIXES.has(prefix) && !legacyTokenDance) {
 					throw new ValidationError(
 						`Provider prefix "${prefix}" is reserved (built-in provider). ` +
 							`Please choose a different prefix for ${source}.`,

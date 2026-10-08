@@ -20,6 +20,7 @@ import { settingsApi } from "./settings";
 import { specApi } from "./spec";
 import { systemLifecycleApi } from "./system-lifecycle";
 import { terminalsApi } from "./terminals";
+import { tokendanceApi } from "./tokendance";
 import { traitLayersApi } from "./trait-layers";
 import { workspaceContextApi } from "./workspace-context";
 
@@ -47,6 +48,7 @@ export const api = {
 	...systemLifecycleApi,
 	...devicesApi,
 	...traitLayersApi,
+	...tokendanceApi,
 	...oauthAppsApi,
 	...oauthGrantsApi,
 	...scheduledTasksApi,

@@ -1,4 +1,12 @@
 {
+	"tokendanceRecoveryTitle": "词元跳动需要处理",
+	"tokendanceRecoveryTopUp": "词元跳动账户余额不足。请为此连接使用的账户充值后重试，当前 Key 仍然有效。",
+	"tokendanceRecoveryReauthorize": "此词元跳动 Key 已不可用，请重新授权平台连接后重试。",
+	"tokendanceRecoveryQuota": "此 Key 的周期额度已用完。可等待额度刷新，或重新授权连接；不会自动重试或付款。",
+	"tokendanceRecoveryAdminRequired": "请联系管理员处理此平台连接。",
+	"tokendanceRecoveryOpenWebsite": "前往词元跳动充值",
+	"tokendanceRecoveryManage": "管理平台连接",
+	"tokendanceRecoveryDismiss": "稍后处理",
 	"RESOURCE_NOT_FOUND": "未找到{{entity}}：{{id}}",
 	"VALIDATION_FAILED": "请求校验失败：{{detail}}",
 	"FORBIDDEN_ACTION": "你没有权限执行此操作",
