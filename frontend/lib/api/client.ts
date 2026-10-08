@@ -277,15 +277,64 @@ async function readResponseTextPreview(
 	return { text, truncated };
 }
 
+async function readBoundedResponseText(
+	response: Response,
+	maxResponseBytes: number,
+	onResponseBytes?: (bytes: number) => void,
+): Promise<string> {
+	const limit = Math.max(0, Math.trunc(maxResponseBytes));
+	const tooLarge = () =>
+		new ApiError("Response exceeds byte budget", 413, { code: "RESPONSE_TOO_LARGE" });
+	if (Number(response.headers.get("content-length")) > limit) {
+		void response.body?.cancel().catch(() => {});
+		throw tooLarge();
+	}
+	const reader = response.body?.getReader();
+	if (!reader) {
+		onResponseBytes?.(0);
+		return "";
+	}
+	const decoder = new TextDecoder();
+	let bytes = 0;
+	let text = "";
+	try {
+		while (true) {
+			const chunk = await reader.read();
+			if (chunk.done) break;
+			bytes += chunk.value.byteLength;
+			if (bytes > limit) {
+				void reader.cancel().catch(() => {});
+				throw tooLarge();
+			}
+			text += decoder.decode(chunk.value, { stream: true });
+		}
+		text += decoder.decode();
+	} finally {
+		reader.releaseLock();
+	}
+	onResponseBytes?.(bytes);
+	return text;
+}
+
 async function readErrorData(
 	response: Response,
 	fallback: string,
+	boundedText?: string,
 ): Promise<Record<string, unknown>> {
 	if (isJsonResponse(response)) {
-		const parsed = await response.json().catch(() => null);
+		const parsed =
+			boundedText === undefined
+				? await response.json().catch(() => null)
+				: tryParseJson(boundedText);
 		return toErrorData(parsed, fallback);
 	}
-	const { text, truncated } = await readResponseTextPreview(response);
+	const { text, truncated } =
+		boundedText === undefined
+			? await readResponseTextPreview(response)
+			: {
+					text: boundedText.slice(0, MAX_RESPONSE_TEXT_PREVIEW_CHARS),
+					truncated: boundedText.length > MAX_RESPONSE_TEXT_PREVIEW_CHARS,
+				};
 	const value = truncated ? `${text}\n…` : (tryParseJson(text) ?? text);
 	return toErrorData(value, fallback);
 }
@@ -310,6 +359,25 @@ export async function readFetchErrorMessage(
 	return (await readFetchError(response, fallback)).message;
 }
 
+export interface RequestOptions {
+	signal?: AbortSignal;
+	maxResponseBytes?: number;
+}
+
+/** Accept React Query contexts too, but forward only supported transport options. */
+export function pickRequestOptions(opts?: object): RequestOptions {
+	const candidate = opts as { signal?: unknown; maxResponseBytes?: unknown } | undefined;
+	const options: RequestOptions = {};
+	if (candidate?.signal instanceof AbortSignal) options.signal = candidate.signal;
+	if (
+		typeof candidate?.maxResponseBytes === "number" &&
+		Number.isFinite(candidate.maxResponseBytes)
+	) {
+		options.maxResponseBytes = candidate.maxResponseBytes;
+	}
+	return options;
+}
+
 export async function request<T>(
 	path: string,
 	options?: RequestInit & {
@@ -329,45 +397,26 @@ export async function request<T>(
 	}
 	const response = await fetch(apiUrl(path), { ...fetchOptions, headers });
 	absorbRenewedToken(response, token);
+	// Apply the same byte budget before parsing either success or error bodies.
+	const boundedText =
+		maxResponseBytes == null
+			? undefined
+			: await readBoundedResponseText(response, maxResponseBytes, onResponseBytes);
 	if (response.status === 401) {
-		const error = await readErrorData(response, "Unauthorized");
+		const error = await readErrorData(response, "Unauthorized", boundedText);
 		clearTokenIfSessionInvalid(error);
 		throw new ApiError(getErrorMessage(error, "Unauthorized"), 401, error);
 	}
 	if (!response.ok) {
-		const error = await readErrorData(response, response.statusText || "Request failed");
+		const error = await readErrorData(
+			response,
+			response.statusText || "Request failed",
+			boundedText,
+		);
 		throw new ApiError(getErrorMessage(error, "Request failed"), response.status, error);
 	}
-	if (maxResponseBytes != null) {
-		const limit = Math.max(0, Math.trunc(maxResponseBytes));
-		const tooLarge = () =>
-			new ApiError("Response exceeds byte budget", 413, { code: "RESPONSE_TOO_LARGE" });
-		if (Number(response.headers.get("content-length")) > limit) {
-			void response.body?.cancel().catch(() => {});
-			throw tooLarge();
-		}
-		const reader = response.body?.getReader();
-		if (!reader) throw new ApiError("Invalid response", response.status);
-		const decoder = new TextDecoder();
-		let bytes = 0;
-		let text = "";
-		try {
-			while (true) {
-				const chunk = await reader.read();
-				if (chunk.done) break;
-				bytes += chunk.value.byteLength;
-				if (bytes > limit) {
-					void reader.cancel().catch(() => {});
-					throw tooLarge();
-				}
-				text += decoder.decode(chunk.value, { stream: true });
-			}
-			text += decoder.decode();
-		} finally {
-			reader.releaseLock();
-		}
-		onResponseBytes?.(bytes);
-		const parsed = tryParseJson(text);
+	if (boundedText !== undefined) {
+		const parsed = tryParseJson(boundedText);
 		if (parsed !== null) return parsed as T;
 		throw new ApiError("Invalid response", response.status);
 	}

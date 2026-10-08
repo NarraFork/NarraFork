@@ -1,4 +1,5 @@
 import {
+	Alert,
 	Badge,
 	Box,
 	Button,
@@ -20,7 +21,18 @@ import {
 	draftFromPreset,
 	isValidProviderDraft,
 	sanitizeProviderPrefix,
+	updateDraftConnection,
 } from "./provider-add-draft";
+import {
+	getConnectionFamily,
+	getInitialConnectionSelection,
+	getPopularProviderPresets,
+	type ProviderBilling,
+	type ProviderCluster,
+	type ProviderConnectionSelection,
+	type ProviderRegion,
+	resolveProviderConnection,
+} from "./provider-connection-presets";
 import {
 	type AddProviderType,
 	getProviderPresetName,
@@ -41,13 +53,26 @@ export function AddProviderPage({
 	onAdd,
 }: {
 	onClose: () => void;
-	onAdd: (draft: AddProviderDraft) => void;
+	onAdd: (draft: AddProviderDraft) => void | Promise<void>;
 }) {
-	const { t } = useTranslation("settings");
+	const { t, i18n } = useTranslation("settings");
 	const [query, setQuery] = useState("");
+	const [category, setCategory] = useState<"popular" | "all">("popular");
+	const [connectionSelection, setConnectionSelection] =
+		useState<ProviderConnectionSelection | null>(null);
 	const [preset, setPreset] = useState<ProviderPreset | null>(null);
 	const [draft, setDraft] = useState<AddProviderDraft | null>(null);
 	const [showConfig, setShowConfig] = useState(false);
+	const [submitting, setSubmitting] = useState(false);
+	const [submitError, setSubmitError] = useState<string | null>(null);
+	const submittingRef = useRef(false);
+	const mountedRef = useRef(true);
+	useEffect(() => {
+		mountedRef.current = true;
+		return () => {
+			mountedRef.current = false;
+		};
+	}, []);
 	const catalogRef = useRef<HTMLElement>(null);
 	const headingRef = useRef<HTMLHeadingElement>(null);
 	useEffect(() => {
@@ -56,12 +81,54 @@ export function AddProviderPage({
 		if (showConfig) headingRef.current?.focus();
 		else catalogRef.current?.focus();
 	}, [showConfig, preset]);
-	const presets = useMemo(() => searchProviderPresets(query, t), [query, t]);
-	const protocolOptions = preset ? (Object.keys(preset.endpoints) as AddProviderType[]) : [];
+	const presets = useMemo(
+		() =>
+			category === "popular" && !query.trim()
+				? getPopularProviderPresets()
+				: searchProviderPresets(query, t),
+		[category, query, t],
+	);
+	const connection =
+		preset && connectionSelection
+			? resolveProviderConnection(preset, connectionSelection)
+			: preset
+				? { preset }
+				: null;
+	const activePreset = connection?.preset ?? null;
+	const protocolOptions = activePreset
+		? (Object.keys(activePreset.endpoints) as AddProviderType[])
+		: [];
+	const requiresCluster =
+		preset &&
+		getConnectionFamily(preset.id) === "mimo" &&
+		connectionSelection?.region === "international" &&
+		connectionSelection.billing === "token-plan";
 	const choose = (next: ProviderPreset) => {
+		if (submittingRef.current) return;
+		setSubmitError(null);
+		const selection = getConnectionFamily(next.id)
+			? getInitialConnectionSelection(next.id, i18n.resolvedLanguage ?? i18n.language)
+			: null;
+		const resolved = selection
+			? resolveProviderConnection(next, selection)
+			: { preset: next, userAgentMode: undefined };
 		setPreset(next);
-		setDraft(draftFromPreset({ ...next, name: getProviderPresetName(next, t) }));
+		setConnectionSelection(selection);
+		setDraft((prev) => ({
+			...draftFromPreset({ ...(resolved?.preset ?? next), name: getProviderPresetName(next, t) }),
+			apiKey: prev?.apiKey ?? "",
+			...(resolved?.userAgentMode ? { userAgentMode: resolved.userAgentMode } : {}),
+		}));
 		setShowConfig(true);
+	};
+	const changeConnection = (selection: ProviderConnectionSelection) => {
+		if (!preset || submittingRef.current) return;
+		setSubmitError(null);
+		const resolved = resolveProviderConnection(preset, selection);
+		setConnectionSelection(selection);
+		setDraft((prev) =>
+			prev ? updateDraftConnection(prev, resolved?.preset ?? null, resolved?.userAgentMode) : prev,
+		);
 	};
 	const chooseCustom = (protocol: AddProviderType) =>
 		choose({
@@ -75,18 +142,47 @@ export function AddProviderPage({
 						: "",
 			},
 		});
-	const update = (values: Partial<AddProviderDraft>) =>
+	const update = (values: Partial<AddProviderDraft>) => {
+		if (submittingRef.current) return;
+		setSubmitError(null);
 		setDraft((prev) => (prev ? { ...prev, ...values } : prev));
+	};
+	const submit = async () => {
+		if (submittingRef.current || !activePreset || !draft || !isValidProviderDraft(draft)) return;
+		submittingRef.current = true;
+		setSubmitting(true);
+		setSubmitError(null);
+		try {
+			await onAdd(draft);
+		} catch (error) {
+			if (mountedRef.current)
+				setSubmitError(
+					error instanceof Error && error.message ? error.message : t("addProviderSaveFailed"),
+				);
+		} finally {
+			submittingRef.current = false;
+			if (mountedRef.current) setSubmitting(false);
+		}
+	};
 
 	return (
 		<Stack gap="md" className={classes.page}>
 			<Group gap="sm">
-				<Button variant="subtle" leftSection={<IconArrowLeft size={16} />} onClick={onClose}>
+				<Button
+					variant="subtle"
+					leftSection={<IconArrowLeft size={16} />}
+					onClick={onClose}
+					disabled={submitting}
+				>
 					{t("addProviderCancel")}
 				</Button>
 				<Title order={2}>{t("addProvider")}</Title>
 			</Group>
-			<div className={classes.layout} data-config={showConfig || undefined}>
+			<fieldset
+				disabled={submitting}
+				className={classes.layout}
+				data-config={showConfig || undefined}
+			>
 				<section
 					ref={catalogRef}
 					tabIndex={-1}
@@ -101,23 +197,28 @@ export function AddProviderPage({
 							onChange={(event) => setQuery(event.currentTarget.value)}
 							leftSection={<IconSearch size={16} />}
 						/>
-						<Text fw={600} size="sm">
-							{t("addProviderCustom")}
-						</Text>
-						<Group gap="xs">
-							{(Object.keys(PROTOCOL_KEYS) as AddProviderType[]).map((protocol) => (
+						<Group gap="xs" grow>
+							{(["popular", "all"] as const).map((value) => (
 								<Button
-									key={protocol}
-									variant="light"
+									key={value}
+									variant={category === value ? "light" : "subtle"}
 									size="xs"
-									onClick={() => chooseCustom(protocol)}
+									aria-pressed={category === value}
+									onClick={() => setCategory(value)}
 								>
-									{t(PROTOCOL_KEYS[protocol])}
+									{t(value === "popular" ? "addProviderCategoryPopular" : "addProviderCategoryAll")}
 								</Button>
 							))}
 						</Group>
 						<Text fw={600} size="sm">
-							{t("addProviderCatalog")} · {presets.length}
+							{t(
+								query.trim()
+									? "addProviderSearch"
+									: category === "popular"
+										? "addProviderCategoryPopular"
+										: "addProviderCategoryAll",
+							)}{" "}
+							· {presets.length}
 						</Text>
 						<div className={classes.catalogList}>
 							{presets.length === 0 && (
@@ -128,6 +229,7 @@ export function AddProviderPage({
 							{presets.map((item) => (
 								<UnstyledButton
 									key={item.id}
+									data-provider-preset={item.id}
 									className={classes.preset}
 									data-selected={preset?.id === item.id || undefined}
 									onClick={() => choose(item)}
@@ -144,6 +246,21 @@ export function AddProviderPage({
 								</UnstyledButton>
 							))}
 						</div>
+						<Text fw={600} size="sm">
+							{t("addProviderCustom")}
+						</Text>
+						<Group gap="xs">
+							{(Object.keys(PROTOCOL_KEYS) as AddProviderType[]).map((protocol) => (
+								<Button
+									key={protocol}
+									variant="light"
+									size="xs"
+									onClick={() => chooseCustom(protocol)}
+								>
+									{t(PROTOCOL_KEYS[protocol])}
+								</Button>
+							))}
+						</Group>
 					</Stack>
 				</section>
 				<section className={classes.configuration} aria-label={t("addProviderConfigure")}>
@@ -151,7 +268,7 @@ export function AddProviderPage({
 						<form
 							onSubmit={(event) => {
 								event.preventDefault();
-								if (isValidProviderDraft(draft)) onAdd(draft);
+								void submit();
 							}}
 						>
 							<Stack gap="md" p="md">
@@ -172,17 +289,78 @@ export function AddProviderPage({
 									value={draft.name}
 									onChange={(event) => update({ name: event.currentTarget.value })}
 								/>
+								{connectionSelection && (
+									<Group grow align="flex-start">
+										<Select
+											required
+											allowDeselect={false}
+											label={t("addProviderRegion")}
+											value={connectionSelection.region}
+											data={[
+												{ value: "china", label: t("addProviderRegionChina") },
+												{ value: "international", label: t("addProviderRegionInternational") },
+											]}
+											onChange={(value) => {
+												if (value && value !== connectionSelection.region)
+													changeConnection({
+														...connectionSelection,
+														region: value as ProviderRegion,
+														cluster: undefined,
+													});
+											}}
+										/>
+										<Select
+											required
+											allowDeselect={false}
+											label={t("addProviderBilling")}
+											value={connectionSelection.billing}
+											data={[
+												{ value: "payg", label: t("addProviderBillingPayg") },
+												{ value: "token-plan", label: t("addProviderBillingTokenPlan") },
+											]}
+											onChange={(value) => {
+												if (value && value !== connectionSelection.billing)
+													changeConnection({
+														...connectionSelection,
+														billing: value as ProviderBilling,
+														cluster: undefined,
+													});
+											}}
+										/>
+									</Group>
+								)}
+								{requiresCluster && connectionSelection && (
+									<Select
+										required
+										allowDeselect={false}
+										label={t("addProviderCluster")}
+										placeholder={t("addProviderClusterPlaceholder")}
+										value={connectionSelection.cluster ?? null}
+										data={[
+											{ value: "sgp", label: t("addProviderClusterSgp") },
+											{ value: "ams", label: t("addProviderClusterAms") },
+										]}
+										onChange={(value) => {
+											if (value && value !== connectionSelection.cluster)
+												changeConnection({
+													...connectionSelection,
+													cluster: value as ProviderCluster,
+												});
+										}}
+									/>
+								)}
 								<Select
 									required
+									disabled={!activePreset}
 									allowDeselect={false}
 									label={t("addProviderProtocol")}
-									value={draft.protocol}
+									value={activePreset ? draft.protocol : null}
 									data={protocolOptions.map((value) => ({ value, label: t(PROTOCOL_KEYS[value]) }))}
 									onChange={(value) => {
-										if (value && preset)
+										if (value && activePreset)
 											update({
 												protocol: value as AddProviderType,
-												baseUrl: preset.endpoints[value as AddProviderType] ?? "",
+												baseUrl: activePreset.endpoints[value as AddProviderType] ?? "",
 											});
 									}}
 								/>
@@ -198,12 +376,18 @@ export function AddProviderPage({
 								/>
 								<PasswordInput
 									label={t("addProviderApiKey")}
+									description={
+										connectionSelection?.billing === "token-plan"
+											? t("addProviderTokenPlanHint")
+											: undefined
+									}
 									value={draft.apiKey}
 									onChange={(event) => update({ apiKey: event.currentTarget.value })}
 									autoComplete="off"
 								/>
 								<TextInput
 									label={t("providerPrefix")}
+									placeholder={t("addProviderPrefixAuto")}
 									value={draft.prefix}
 									onChange={(event) =>
 										update({ prefix: sanitizeProviderPrefix(event.currentTarget.value) })
@@ -211,11 +395,17 @@ export function AddProviderPage({
 									autoCapitalize="none"
 									spellCheck={false}
 								/>
-								<Group justify="space-between" className={classes.actions}>
-									<Text size="xs" c="dimmed">
-										{t("addProviderDraftNotice")}
-									</Text>
-									<Button type="submit" disabled={!isValidProviderDraft(draft)}>
+								{submitError && (
+									<Alert color="red" role="alert" title={t("addProviderSaveFailed")}>
+										{submitError}
+									</Alert>
+								)}
+								<Group justify="flex-end" className={classes.actions}>
+									<Button
+										type="submit"
+										loading={submitting}
+										disabled={submitting || !activePreset || !isValidProviderDraft(draft)}
+									>
 										{t("addProviderContinue")}
 									</Button>
 								</Group>
@@ -227,7 +417,7 @@ export function AddProviderPage({
 						</Box>
 					)}
 				</section>
-			</div>
+			</fieldset>
 		</Stack>
 	);
 }

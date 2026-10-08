@@ -84,12 +84,16 @@ let root: Root | undefined;
 let container: HTMLDivElement;
 let added: AddProviderDraft[];
 let closeCount: number;
+let addHandler: (draft: AddProviderDraft) => void | Promise<void>;
 
 beforeEach(async () => {
 	installDom();
 	await i18n.changeLanguage("en");
 	added = [];
 	closeCount = 0;
+	addHandler = (draft) => {
+		added.push(draft);
+	};
 	container = document.createElement("div");
 	document.body.appendChild(container);
 	root = createRoot(container);
@@ -97,7 +101,7 @@ beforeEach(async () => {
 		root?.render(
 			<I18nextProvider i18n={i18n}>
 				<MantineProvider env="test">
-					<AddProviderPage onClose={() => closeCount++} onAdd={(draft) => added.push(draft)} />
+					<AddProviderPage onClose={() => closeCount++} onAdd={(draft) => addHandler(draft)} />
 				</MantineProvider>
 			</I18nextProvider>,
 		);
@@ -148,9 +152,9 @@ function field(label: string): HTMLInputElement {
 function preset(name: string): HTMLButtonElement {
 	const provider = PROVIDER_PRESETS.find((item) => item.name === name || item.id === name);
 	const displayName = provider?.nameKey ? i18n.t(provider.nameKey) : name;
-	const result = [...container.querySelectorAll<HTMLButtonElement>("button[aria-pressed]")].find(
-		(item) => item.querySelector("p")?.textContent === displayName,
-	);
+	const result = [
+		...container.querySelectorAll<HTMLButtonElement>("button[data-provider-preset]"),
+	].find((item) => item.querySelector("p")?.textContent === displayName);
 	if (!result) throw new Error(`Missing preset: ${name}`);
 	return result;
 }
@@ -169,13 +173,17 @@ async function type(label: string, value: string) {
 	});
 }
 
-async function selectProtocol(label: string) {
-	await click(field("addProviderProtocol"));
+async function selectOption(fieldKey: string, label: string) {
+	await click(field(fieldKey));
 	const option = [...container.querySelectorAll('[role="option"]')].find(
 		(item) => item.textContent === i18n.t(label),
 	);
 	if (!option) throw new Error(`Missing protocol option: ${label}`);
 	await click(option);
+}
+
+async function selectProtocol(label: string) {
+	await selectOption("addProviderProtocol", label);
 }
 
 async function submit() {
@@ -189,6 +197,187 @@ async function submit() {
 }
 
 describe("AddProviderPage interactions", () => {
+	test("a save rejection keeps the form and key available for a successful retry", async () => {
+		await click(preset("OpenAI"));
+		await type("addProviderApiKey", "retained-on-error");
+		addHandler = async () => {
+			throw new Error("save refused");
+		};
+		await submit();
+		expect(container.querySelector('[role="alert"]')?.textContent).toContain("save refused");
+		expect(field("addProviderApiKey").value).toBe("retained-on-error");
+		expect(closeCount).toBe(0);
+		addHandler = (draft) => {
+			added.push(draft);
+		};
+		await submit();
+		expect(added).toHaveLength(1);
+		expect(added[0]?.apiKey).toBe("retained-on-error");
+	});
+
+	test("pending creation blocks repeated form submission and preserves its captured inputs", async () => {
+		await click(preset("OpenAI"));
+		await type("addProviderApiKey", "captured-key");
+		let release!: () => void;
+		const pending = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		addHandler = (draft) => {
+			added.push(draft);
+			return pending;
+		};
+		await act(async () => {
+			const form = container.querySelector("form");
+			form?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+			form?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+		});
+		expect(added).toHaveLength(1);
+		expect(button("addProviderContinue").disabled).toBe(true);
+		await type("addProviderApiKey", "must-not-change-in-flight");
+		expect(field("addProviderApiKey").value).toBe("captured-key");
+		await act(async () => {
+			release();
+			await pending;
+		});
+		expect(button("addProviderContinue").disabled).toBe(false);
+	});
+
+	test("popular shows the seven requested providers in order and search spans the full catalog", async () => {
+		const ids = () =>
+			[...container.querySelectorAll("button[data-provider-preset]")].map((node) =>
+				node.getAttribute("data-provider-preset"),
+			);
+		expect(ids()).toEqual([
+			"deepseek",
+			"zhipu",
+			"moonshot",
+			"minimax",
+			"mimo",
+			"openai",
+			"anthropic",
+		]);
+		await click(button("addProviderCategoryAll"));
+		expect(ids().length).toBe(PROVIDER_PRESETS.length);
+		await click(button("addProviderCategoryPopular"));
+		await type("addProviderSearch", "Groq");
+		expect(ids()).toEqual(["groq"]);
+		await type("addProviderSearch", "");
+		expect(ids().length).toBe(7);
+	});
+
+	test("Chinese defaults the four configurable platforms to China without overriding manual choices", async () => {
+		await act(async () => {
+			await i18n.changeLanguage("zh-CN");
+		});
+		for (const id of ["moonshot", "minimax", "mimo", "zhipu"]) {
+			await click(preset(id));
+			expect(field("addProviderRegion").value).toBe(i18n.t("addProviderRegionChina"));
+			expect(field("addProviderBilling").value).toBe(i18n.t("addProviderBillingPayg"));
+		}
+		await selectOption("addProviderRegion", "addProviderRegionInternational");
+		await act(async () => {
+			await i18n.changeLanguage("en");
+		});
+		expect(field("addProviderRegion").value).toBe(i18n.t("addProviderRegionInternational"));
+		await act(async () => {
+			await i18n.changeLanguage("zh-CN");
+		});
+		expect(field("addProviderRegion").value).toBe(i18n.t("addProviderRegionInternational"));
+	});
+
+	test("region and plan update the exact URLs for KIMI, MiniMax and Zhipu", async () => {
+		for (const [id, internationalPayg, internationalPlan, chinaPayg, chinaPlan] of [
+			[
+				"moonshot",
+				"https://api.moonshot.ai/v1",
+				"https://api.kimi.ai/coding/v1",
+				"https://api.moonshot.cn/v1",
+				"https://api.kimi.com/coding/v1",
+			],
+			[
+				"minimax",
+				"https://api.minimax.io/anthropic/v1",
+				"https://api.minimax.io/anthropic/v1",
+				"https://api.minimax.cn/anthropic/v1",
+				"https://api.minimax.cn/anthropic/v1",
+			],
+			[
+				"zhipu",
+				"https://api.z.ai/api/anthropic/v1",
+				"https://api.z.ai/api/v1",
+				"https://open.bigmodel.cn/api/v1",
+				"https://open.bigmodel.cn/api/v1",
+			],
+		] as const) {
+			await click(preset(id));
+			expect(field("addProviderRegion").value).toBe(i18n.t("addProviderRegionInternational"));
+			expect(field("addProviderBaseUrl").value).toBe(internationalPayg);
+			await selectOption("addProviderBilling", "addProviderBillingTokenPlan");
+			expect(field("addProviderBaseUrl").value).toBe(internationalPlan);
+			await selectOption("addProviderRegion", "addProviderRegionChina");
+			expect(field("addProviderBaseUrl").value).toBe(chinaPlan);
+			await selectOption("addProviderBilling", "addProviderBillingPayg");
+			expect(field("addProviderBaseUrl").value).toBe(chinaPayg);
+		}
+	});
+
+	test("switching plans retains keys, name and prefix even with identical URLs", async () => {
+		await click(preset("minimax"));
+		await type("addProviderName", "My MiniMax");
+		await type("providerPrefix", "my-minimax");
+		await type("addProviderApiKey", "payg-account-key");
+		const paygUrl = field("addProviderBaseUrl").value;
+		await selectOption("addProviderBilling", "addProviderBillingTokenPlan");
+		expect(field("addProviderApiKey").value).toBe("payg-account-key");
+		expect(field("addProviderBaseUrl").value).toBe(paygUrl);
+		expect(field("addProviderName").value).toBe("My MiniMax");
+		expect(field("providerPrefix").value).toBe("my-minimax");
+		await type("addProviderApiKey", "subscription-account-key");
+		await selectOption("addProviderBilling", "addProviderBillingTokenPlan");
+		expect(field("addProviderApiKey").value).toBe("subscription-account-key");
+		await submit();
+		expect(added[0]).toMatchObject({
+			apiKey: "subscription-account-key",
+			userAgentMode: "narrafork",
+			name: "My MiniMax",
+			prefix: "my-minimax",
+		});
+		await selectOption("addProviderBilling", "addProviderBillingPayg");
+		expect(field("addProviderApiKey").value).toBe("subscription-account-key");
+		await submit();
+		expect(added[1]?.userAgentMode).toBeUndefined();
+	});
+
+	test("MiMo international Token Plan requires its assigned cluster while retaining the entered key", async () => {
+		await click(preset("mimo"));
+		expect(field("addProviderBaseUrl").value).toBe("https://api.xiaomimimo.com/v1");
+		await type("addProviderApiKey", "sk-payg-account");
+		await selectOption("addProviderBilling", "addProviderBillingTokenPlan");
+		expect(field("addProviderApiKey").value).toBe("sk-payg-account");
+		expect(field("addProviderBaseUrl").value).toBe("");
+		expect(button("addProviderContinue").disabled).toBe(true);
+		await type("addProviderBaseUrl", "https://manual.example.test/v1");
+		await submit();
+		expect(added).toEqual([]);
+		await selectOption("addProviderCluster", "addProviderClusterSgp");
+		expect(field("addProviderBaseUrl").value).toBe(
+			"https://token-plan-sgp.xiaomimimo.com/anthropic/v1",
+		);
+		expect(field("addProviderProtocol").value).toBe(i18n.t("addProviderAnthropicMessages"));
+		await type("addProviderApiKey", "tp-sgp-account");
+		await selectOption("addProviderCluster", "addProviderClusterAms");
+		expect(field("addProviderApiKey").value).toBe("tp-sgp-account");
+		expect(field("addProviderBaseUrl").value).toBe(
+			"https://token-plan-ams.xiaomimimo.com/anthropic/v1",
+		);
+		await selectOption("addProviderRegion", "addProviderRegionChina");
+		expect(field("addProviderBaseUrl").value).toBe("https://token-plan-cn.xiaomimimo.com/v1");
+		expect(field("addProviderProtocol").value).toBe(i18n.t("addProviderOpenAIResponses"));
+		await selectOption("addProviderRegion", "addProviderRegionInternational");
+		expect(field("addProviderCluster").value).toBe("");
+		expect(button("addProviderContinue").disabled).toBe(true);
+	});
+
 	test("renders in the route content without a modal or explanatory paragraphs", async () => {
 		expect(container.querySelector('[role="dialog"]')).toBeNull();
 		await click(preset("ZhiPu"));
@@ -202,7 +391,7 @@ describe("AddProviderPage interactions", () => {
 		]) {
 			expect(container.textContent).not.toContain(i18n.t(key));
 		}
-		expect(container.textContent).toContain(i18n.t("addProviderDraftNotice"));
+		expect(container.textContent).not.toContain(i18n.t("addProviderDraftNotice"));
 	});
 
 	test("uses localized platform names for the catalog, search and initial form name", async () => {
@@ -211,7 +400,7 @@ describe("AddProviderPage interactions", () => {
 		});
 		expect(preset("ZhiPu").textContent).toContain("智谱");
 		await type("addProviderSearch", "硅基流动");
-		expect(container.querySelectorAll("button[aria-pressed]").length).toBe(1);
+		expect(container.querySelectorAll("button[data-provider-preset]").length).toBe(1);
 		await click(preset("silicon"));
 		expect(field("addProviderName").value).toBe(settingsZhCn.providerNames.silicon);
 		await type("addProviderName", "我的接入");
@@ -225,7 +414,8 @@ describe("AddProviderPage interactions", () => {
 	test("selects a preset without adding it, and cancellation only closes", async () => {
 		await click(preset("ZhiPu"));
 		expect(field("addProviderName").value).toBe(settingsEn.providerNames.zhipu);
-		expect(field("addProviderBaseUrl").value).toBe("https://open.bigmodel.cn/api/paas/v4");
+		expect(field("addProviderProtocol").value).toBe(i18n.t("addProviderAnthropicMessages"));
+		expect(field("addProviderBaseUrl").value).toBe("https://api.z.ai/api/anthropic/v1");
 		expect(added).toEqual([]);
 		await type("addProviderApiKey", "discarded-key");
 		await click(button("addProviderCancel"));
@@ -233,24 +423,39 @@ describe("AddProviderPage interactions", () => {
 		expect(added).toEqual([]);
 	});
 
+	test("preset selection prioritizes Responses, Messages and then Completions", async () => {
+		await click(button("addProviderCategoryAll"));
+		for (const [name, label] of [
+			["deepseek", "addProviderOpenAIResponses"],
+			["zhipu", "addProviderAnthropicMessages"],
+			["groq", "addProviderCompletions"],
+			["gemini", "addProviderGemini"],
+		] as const) {
+			await click(preset(name));
+			expect(field("addProviderProtocol").value).toBe(i18n.t(label));
+		}
+	});
+
 	test("switching a real Select updates the protocol endpoint", async () => {
 		await click(preset("ZhiPu"));
-		await selectProtocol("addProviderAnthropicMessages");
-		expect(field("addProviderBaseUrl").value).toBe("https://open.bigmodel.cn/api/anthropic/v1");
 		await selectProtocol("addProviderCompletions");
-		expect(field("addProviderBaseUrl").value).toBe("https://open.bigmodel.cn/api/paas/v4");
+		expect(field("addProviderBaseUrl").value).toBe("https://api.z.ai/api/paas/v4");
+		await selectProtocol("addProviderAnthropicMessages");
+		expect(field("addProviderBaseUrl").value).toBe("https://api.z.ai/api/anthropic/v1");
+		await selectProtocol("addProviderCompletions");
+		expect(field("addProviderBaseUrl").value).toBe("https://api.z.ai/api/paas/v4");
 		expect(added).toEqual([]);
 	});
 
 	test("search filters presets and shows the empty state", async () => {
 		await type("addProviderSearch", "ZhiPu");
-		expect(container.querySelectorAll("button[aria-pressed]").length).toBe(1);
+		expect(container.querySelectorAll("button[data-provider-preset]").length).toBe(1);
 		expect(preset("ZhiPu")).toBeDefined();
 		await type("addProviderSearch", "no-provider-matches-this");
-		expect(container.querySelectorAll("button[aria-pressed]").length).toBe(0);
+		expect(container.querySelectorAll("button[data-provider-preset]").length).toBe(0);
 		expect(container.textContent).toContain(i18n.t("addProviderNoResults"));
 		await type("addProviderSearch", "");
-		expect(container.querySelectorAll("button[aria-pressed]").length).toBeGreaterThan(1);
+		expect(container.querySelectorAll("button[data-provider-preset]").length).toBeGreaterThan(1);
 	});
 
 	test("invalid URLs disable submission and cannot emit a draft", async () => {
@@ -275,7 +480,7 @@ describe("AddProviderPage interactions", () => {
 		await submit();
 		expect(added).toEqual([
 			{
-				protocol: "completions-compatible",
+				protocol: "anthropic-messages",
 				name: "My provider",
 				baseUrl: "https://proxy.example.test/v1",
 				apiKey: "test-secret-key",
@@ -301,16 +506,16 @@ describe("AddProviderPage interactions", () => {
 		expect(added[1]).toMatchObject({ protocol: "nug", prefix: "nugteam" });
 	});
 
-	test("returning to the catalog and reselecting a preset clears credentials", async () => {
+	test("returning to the catalog and reselecting a preset retains the entered credentials", async () => {
 		await click(preset("ZhiPu"));
-		await type("addProviderApiKey", "must-not-leak");
+		await type("addProviderApiKey", "entered-key");
 		await type("providerPrefix", "old-prefix");
 		await click(button("addProviderBack"));
 		expect(container.querySelector("[data-config]")).toBeNull();
 		await click(preset("OpenAI"));
 		expect(field("addProviderName").value).toBe("OpenAI");
 		expect(field("addProviderBaseUrl").value).toBe("https://api.openai.com/v1");
-		expect(field("addProviderApiKey").value).toBe("");
+		expect(field("addProviderApiKey").value).toBe("entered-key");
 		expect(field("providerPrefix").value).toBe("");
 		expect(added).toEqual([]);
 	});

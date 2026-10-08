@@ -7,7 +7,9 @@ import {
 	isValidProviderDraft,
 	nugProviderFromDraft,
 	sanitizeProviderPrefix,
+	updateDraftConnection,
 } from "./provider-add-draft";
+import { PROVIDER_PRESETS, type ProviderPreset } from "./provider-presets";
 import { providersStateFromSettings } from "./providers-reducer";
 
 const draft: AddProviderDraft = {
@@ -51,6 +53,116 @@ describe("provider addition draft", () => {
 			apiKey: "",
 			prefix: "",
 		});
+	});
+
+	test("prefers Responses, then Messages, then Completions over the registry default", () => {
+		const preset: ProviderPreset = {
+			id: "priority",
+			name: "Priority",
+			defaultProtocol: "completions-compatible",
+			endpoints: {
+				"completions-compatible": "https://example.com/chat/v1",
+				"anthropic-messages": "https://example.com/anthropic/v1",
+				"openai-responses": "https://example.com/responses/v1",
+			},
+		};
+		expect(draftFromPreset(preset)).toMatchObject({
+			protocol: "openai-responses",
+			baseUrl: "https://example.com/responses/v1",
+		});
+		delete preset.endpoints["openai-responses"];
+		expect(draftFromPreset(preset)).toMatchObject({
+			protocol: "anthropic-messages",
+			baseUrl: "https://example.com/anthropic/v1",
+		});
+		delete preset.endpoints["anthropic-messages"];
+		expect(draftFromPreset(preset)).toMatchObject({
+			protocol: "completions-compatible",
+			baseUrl: "https://example.com/chat/v1",
+		});
+	});
+
+	test("built-in selections choose only supported protocols using the preferred priority", () => {
+		for (const [id, protocol] of [
+			["deepseek", "openai-responses"],
+			["zhipu", "anthropic-messages"],
+			["groq", "completions-compatible"],
+			["gemini", "gemini-compatible"],
+		] as const) {
+			const preset = PROVIDER_PRESETS.find((item) => item.id === id);
+			if (!preset) throw new Error(`Missing preset ${id}`);
+			expect(draftFromPreset(preset)).toMatchObject({
+				protocol,
+				baseUrl: preset.endpoints[protocol],
+			});
+		}
+	});
+
+	test("explicit single-protocol custom choices stay unchanged, including empty URLs", () => {
+		for (const protocol of [
+			"openai-responses",
+			"anthropic-messages",
+			"completions-compatible",
+			"gemini-compatible",
+			"nug",
+		] as const) {
+			expect(
+				draftFromPreset({
+					id: "custom",
+					name: "Custom",
+					defaultProtocol: protocol,
+					endpoints: { [protocol]: "" },
+				}),
+			).toMatchObject({ protocol, baseUrl: "" });
+		}
+	});
+
+	test("switching connection retains credentials and replaces only connection-derived fields", () => {
+		const previous = {
+			...draft,
+			name: "My name",
+			prefix: "team",
+			apiKey: "old-account-key",
+			baseUrl: "https://my-proxy.example.test/v1",
+		};
+		const next = updateDraftConnection(
+			previous,
+			{
+				id: "subscription",
+				name: "Generated name",
+				defaultProtocol: "completions-compatible",
+				endpoints: {
+					"openai-responses": "https://subscription.example.test/v1",
+					"completions-compatible": "https://subscription.example.test/v1",
+				},
+			},
+			"narrafork",
+		);
+		expect(next).toMatchObject({
+			name: "My name",
+			prefix: "team",
+			apiKey: "old-account-key",
+			baseUrl: "https://subscription.example.test/v1",
+			protocol: "openai-responses",
+			userAgentMode: "narrafork",
+		});
+		expect(previous.apiKey).toBe("old-account-key");
+		const pending = updateDraftConnection(next, null);
+		expect(pending.baseUrl).toBe("");
+		expect(pending.name).toBe("My name");
+		expect(isValidProviderDraft(pending)).toBe(false);
+	});
+
+	test("saving a subscription draft retains the real client identity without duplicating the key", () => {
+		const provider = customProviderFromDraft("subscription", {
+			...draft,
+			protocol: "openai-responses",
+			apiKey: "subscription-key",
+			userAgentMode: "narrafork",
+		});
+		expect(provider.userAgentMode).toBe("narrafork");
+		expect(provider.apiKey).toBe("subscription-key");
+		expect(provider.extraHeaders).toBeUndefined();
 	});
 
 	test("creation retains edited values without claiming a connection or inventing models", () => {

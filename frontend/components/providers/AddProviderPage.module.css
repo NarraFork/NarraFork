@@ -5,6 +5,9 @@
 }
 
 .layout {
+	margin: 0;
+	padding: 0;
+	min-width: 0;
 	display: grid;
 	grid-template-columns: minmax(240px, 36%) minmax(0, 1fr);
 	width: 100%;

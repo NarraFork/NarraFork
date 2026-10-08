@@ -4,6 +4,7 @@ import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Outlet, useRouterState, useSearch } from "@tanstack/react-router";
+import { nanoid } from "nanoid";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
@@ -21,11 +22,9 @@ import { PluginProviderSection } from "../../components/providers/PluginProvider
 import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
 import { ProviderOverviewView } from "../../components/providers/ProviderOverviewView";
 import { ProviderAddContext } from "../../components/providers/provider-add-context";
-import {
-	type AddProviderDraft,
-	customProviderFromDraft,
-	nugProviderFromDraft,
-} from "../../components/providers/provider-add-draft";
+import type { AddProviderDraft } from "../../components/providers/provider-add-draft";
+import { createProviderAndRefresh } from "../../components/providers/provider-create-flow";
+import { rebaseProviderState } from "../../components/providers/provider-settings-rebase";
 import {
 	createSnapshot,
 	initialProvidersState,
@@ -154,6 +153,21 @@ function SettingsProvidersPage() {
 	// ── Single reducer ──
 	const [state, dispatch] = useReducer(providersReducer, initialProvidersState);
 	const dispatchers = useProvidersDispatch(dispatch);
+	const stateRef = useRef(state);
+	stateRef.current = state;
+	const providerPageMountedRef = useRef(true);
+	const isAddingRef = useRef(isAddingProvider);
+	isAddingRef.current = isAddingProvider;
+	const creationIdRef = useRef<string | null>(null);
+	useEffect(() => {
+		providerPageMountedRef.current = true;
+		return () => {
+			providerPageMountedRef.current = false;
+		};
+	}, []);
+	useEffect(() => {
+		if (!isAddingProvider) creationIdRef.current = null;
+	}, [isAddingProvider]);
 
 	const savedSnapshot = useRef(createSnapshot(initialProvidersState));
 
@@ -308,17 +322,80 @@ function SettingsProvidersPage() {
 
 	// ── Add provider ──
 	const handleAddProvider = useCallback(
-		(draft: AddProviderDraft) => {
-			const id = Math.random().toString(36).slice(2, 10);
-			if (draft.protocol === "nug") {
-				dispatchers.setNugProviders((prev) => [...prev, nugProviderFromDraft(id, draft)]);
+		async (draft: AddProviderDraft) => {
+			if (!settingsFeatureCapability.patchSupported)
+				throw new Error(t("settingsPatchUnsupportedWarningDesc"));
+			const id = creationIdRef.current ?? nanoid();
+			creationIdRef.current = id;
+			const bounded = async <T,>(
+				execute: (options: { signal: AbortSignal; maxResponseBytes: number }) => Promise<T>,
+			): Promise<T> => {
+				const controller = new AbortController();
+				const timer = setTimeout(
+					() => controller.abort(new Error(t("addProviderRequestTimeout"))),
+					30_000,
+				);
+				try {
+					return await execute({ signal: controller.signal, maxResponseBytes: 8 * 1024 * 1024 });
+				} finally {
+					clearTimeout(timer);
+				}
+			};
+			const applyServerSettings = (response: Record<string, unknown>) => {
+				if (providerPageMountedRef.current) {
+					const next = rebaseProviderState(stateRef.current, savedSnapshot.current, response);
+					savedSnapshot.current = createSnapshot(providersStateFromSettings(response));
+					stateRef.current = next;
+					dispatch({ type: "RESTORE_FROM_SNAPSHOT", snapshot: createSnapshot(next) });
+				}
+				qc.setQueryData(["admin", "settings"], response);
+				qc.setQueryData(["settings"], response);
+			};
+			const result = await createProviderAndRefresh(id, draft, stateRef.current, {
+				getSettings: () => bounded((options) => api.getSettings(options)),
+				updateSettings: (payload) => bounded((options) => api.updateSettings(payload, options)),
+				refreshModels: (providerId, protocol) =>
+					bounded<unknown>((options) => {
+						switch (protocol) {
+							case "nug":
+								return api.nugRefreshProviderModels(providerId, options);
+							case "gemini-compatible":
+								return api.geminiRefreshProviderModels(providerId, options);
+							case "anthropic-messages":
+								return api.anthropicRefreshProviderModels(providerId, options);
+							default:
+								return api.openaiRefreshProviderModels(providerId, options);
+						}
+					}),
+				onSaved: applyServerSettings,
+				onRefreshed: applyServerSettings,
+				messages: {
+					invalidDraft: t("addProviderInvalidDraft"),
+					prefixConflict: (prefix) =>
+						t(prefix === "codex" ? "prefixReserved" : "prefixDuplicate", { prefix }),
+					unconfirmedSave: t("addProviderSaveUnconfirmed"),
+				},
+			});
+			if (providerPageMountedRef.current && isAddingRef.current && creationIdRef.current === id)
+				setSelectedProvider(result.providerId);
+			if ("refreshError" in result) {
+				notifications.show({
+					title: t("addProviderSavedRefreshFailed"),
+					message:
+						result.refreshError instanceof Error
+							? result.refreshError.message
+							: tc("unexpectedError"),
+					color: "yellow",
+				});
 			} else {
-				const provider = customProviderFromDraft(id, { ...draft, protocol: draft.protocol });
-				dispatchers.setCustomApiProviders((prev) => [...prev, provider]);
+				notifications.show({
+					title: t("addProviderSaved"),
+					message: t("addProviderModelsRefreshed"),
+					color: "green",
+				});
 			}
-			setSelectedProvider(id);
 		},
-		[dispatchers],
+		[settingsFeatureCapability.patchSupported, qc, t, tc],
 	);
 
 	// ── Server-side context window merge (e.g. after a provider model add) ──
