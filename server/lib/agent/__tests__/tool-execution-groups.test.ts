@@ -72,6 +72,21 @@ describe("tool execution grouping", () => {
 		expect(isStrictSerialToolExecution(recoveryItems[3])).toBe(true);
 	});
 
+	test("ContextAsk calls share a parallel group with each other and read-only peers", () => {
+		// ContextAsk is read-only against persisted subagent context; several lookups
+		// against different subagents in one turn must start together instead of
+		// queueing behind each other.
+		expect(
+			groupToolExecutions([
+				tool("ContextAsk", { id: "one", questions: ["q1"] }),
+				tool("ContextAsk", { id: "two", questions: ["q2"] }),
+				tool("Read"),
+			]).map((group) => group.map(({ name }) => name)),
+		).toEqual([["ContextAsk", "ContextAsk", "Read"]]);
+		expect(isParallelSafeToolExecution(tool("ContextAsk", { id: "one" }))).toBe(true);
+		expect(isStrictSerialToolExecution(tool("ContextAsk", { id: "one" }))).toBe(false);
+	});
+
 	describe("Bash defaults to serial", () => {
 		test("consecutive default Bash calls do not join a parallel group", () => {
 			expect(

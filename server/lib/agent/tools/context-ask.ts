@@ -24,7 +24,9 @@ export const contextAskTool: ToolDefinition = {
 		"may query siblings in the same team. This is read-only: it does not Send a message, wake, " +
 		"interrupt, or otherwise modify the target's context. Use ContextAsk when you only need " +
 		"information already present in another subagent's context; use Send only to deliver new " +
-		"information, requirements, or corrections. Omit questions to request a focused status summary.",
+		"information, requirements, or corrections. Omit questions to request a focused status summary. " +
+		"Independent lookups against different subagents can be issued as consecutive calls in the " +
+		"same turn — they run in parallel.",
 	parameters: z.object({
 		id: z
 			.string()

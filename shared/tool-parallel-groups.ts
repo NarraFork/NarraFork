@@ -30,6 +30,8 @@
  * Tools that may share a parallel execution group by default.
  * Bash is intentionally absent: consecutive Bash calls are serial unless each
  * call opts in with `parallel: true`.
+ * ContextAsk is read-only against persisted subagent context, so independent
+ * lookups against different subagents are meant to start together.
  */
 const PARALLEL_SAFE_TOOL_NAMES = new Set([
 	"Agent",
@@ -41,6 +43,7 @@ const PARALLEL_SAFE_TOOL_NAMES = new Set([
 	"WebFetch",
 	"Await",
 	"Send",
+	"ContextAsk",
 ]);
 
 const ALWAYS_STRICT_SERIAL_TOOL_NAMES = new Set([
