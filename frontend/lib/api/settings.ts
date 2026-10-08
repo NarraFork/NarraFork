@@ -7,7 +7,14 @@ import type {
 	RecentTabsRuntimeResult,
 	RecentTabsSection,
 } from "@shared/recent-tabs";
-import { ApiError, apiBase, authorizedFetch, readFetchError, request } from "./client";
+import {
+	ApiError,
+	apiBase,
+	authorizedFetch,
+	pickRequestOptions,
+	readFetchError,
+	request,
+} from "./client";
 import { parseContentDispositionFileName } from "./narrators";
 import type { ApiEntity } from "./types";
 
@@ -151,13 +158,17 @@ export const settingsApi = {
 			method: "POST",
 			body: JSON.stringify({ confirmed: true }),
 		}),
-	getSettings: () => request<ApiEntity>("/settings"),
+	getSettings: (options?: object) => request<ApiEntity>("/settings", pickRequestOptions(options)),
 	getContextThresholds: (model: string, provider: string) =>
 		request<{ compactStart: number }>(
 			`/settings/context-thresholds?model=${encodeURIComponent(model)}&provider=${encodeURIComponent(provider)}`,
 		),
-	updateSettings: (data: Record<string, unknown>) =>
-		request<ApiEntity>("/settings", { method: "PATCH", body: JSON.stringify(data) }),
+	updateSettings: (data: Record<string, unknown>, options?: object) =>
+		request<ApiEntity>("/settings", {
+			method: "PATCH",
+			body: JSON.stringify(data),
+			...pickRequestOptions(options),
+		}),
 	generateTlsCert: () =>
 		request<{
 			certPath: string;

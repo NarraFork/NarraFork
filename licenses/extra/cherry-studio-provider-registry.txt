@@ -51,6 +51,56 @@ Data mapping (frontend/components/providers/provider-presets.ts):
   gateway). NUG and the custom option are UI actions, not registry records.
 - Do not carry model data, website metadata, referral links or promotion URLs.
 
+Local connection selection (provider-connection-presets.ts), not upstream data:
+- NarraFork-authored region/billing mapping contains factual API addresses only;
+  no vendor code or documentation excerpts are copied. Registry data above and
+  its attribution/license text below remain unchanged.
+- KIMI payg: China api.moonshot.cn, international api.moonshot.ai; C/R /v1,
+  A /anthropic/v1. Code: api.kimi.com (China), api.kimi.ai (international),
+  A/C/R /coding/v1. Code keys and payg keys are independent.
+  Sources: https://platform.kimi.com/docs/api/messages
+  https://platform.kimi.ai/docs/api/messages
+  https://www.kimi.ai/resources/codex-api
+  https://www.kimi.com/code/docs/en/third-party-tools/codex.html
+  https://www.kimi.com/code/docs/en/
+- MiniMax China api.minimax.cn, international api.minimax.io, both billing
+  modes: A /anthropic/v1, C /v1. Subscription keys are NOT payg keys;
+  sharing a hostname does not mean falling back to payg. Responses is omitted
+  because these sources do not confirm it.
+  Sources: https://platform.minimaxi.com/docs/coding-plan/quickstart.md
+  https://platform.minimax.io/docs/coding-plan/quickstart.md
+  https://platform.minimaxi.com/docs/api-reference/text-openai-api.md
+  https://platform.minimax.io/docs/api-reference/text-openai-api.md
+  https://platform.minimax.io/docs/token-plan/other-tools.md
+- MiMo payg (both regions): api.xiaomimimo.com, A /anthropic/v1, C/R /v1.
+  Token Plan: token-plan-{cn,sgp,ams}.xiaomimimo.com, A /anthropic/v1, C /v1;
+  R /v1 is confirmed for cn. The international SGP/AMS selection must match
+  subscription management. No regional Responses examples were found for
+  SGP/AMS, so those selections expose A/C only, not inferred Responses.
+  Payg sk- keys and Token Plan tp- keys are independent; no key is copied to
+  extra headers. These addresses are documentation-derived, not live-tested.
+  Official XiaomiMiMo/awesome-mimo-agent commit:
+  9b84a73ac88ca2bbe5fc560d073a7767abb87dc8
+  Sources: https://github.com/XiaomiMiMo/awesome-mimo-agent/blob/9b84a73ac88ca2bbe5fc560d073a7767abb87dc8/docs/codex.md
+  https://github.com/XiaomiMiMo/awesome-mimo-agent/blob/9b84a73ac88ca2bbe5fc560d073a7767abb87dc8/docs/claude_code.md
+  https://github.com/XiaomiMiMo/awesome-mimo-agent/blob/9b84a73ac88ca2bbe5fc560d073a7767abb87dc8/docs/cline.md
+- Zhipu China open.bigmodel.cn; international api.z.ai: A /api/anthropic/v1,
+  payg C /api/paas/v4, Token Plan C /api/coding/paas/v4. Token Plan R
+  /api/v1 for both regions. Ordinary China R /api/v1 is separately confirmed
+  by the Response API compatibility guide. Ordinary international R is omitted
+  because Z.ai's ordinary API index does not document its availability.
+  Sources: https://docs.bigmodel.cn/cn/coding-plan/quick-start
+  https://docs.bigmodel.cn/cn/guide/develop/responses/introduction.md
+  https://docs.z.ai/devpack/quick-start.md
+  https://docs.z.ai/devpack/tool/codex.md
+  https://docs.z.ai/llms.txt
+- A means Anthropic Messages, C means Chat Completions, R means Responses.
+  A bases include /v1 for NarraFork's direct /messages append; vendor SDK
+  examples omit that version because their SDK adds it automatically.
+- Token Plan mappings select NarraFork's real User-Agent, never impersonate
+  Claude Code/Codex or promise that NarraFork is an approved client. Keys and
+  provider tool/usage restrictions must be respected; no automatic fallback.
+
 Standard MIT license template (attribution adjusted as explained above):
 
 The MIT License (MIT)
