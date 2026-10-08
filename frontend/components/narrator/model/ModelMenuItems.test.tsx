@@ -203,9 +203,13 @@ describe("follow parent selection", () => {
 			},
 		});
 		const follow = button(label);
-		expect(follow.disabled).toBe(true);
+		// Current state renders as a selected row (checkmark + bold), not a disabled one.
+		expect(follow.disabled).toBe(false);
 		expect(follow.querySelector('[role="button"]')).toBeNull();
 		expect(host.textContent).not.toContain(FOLLOW_PARENT_MODEL);
+		// Clicking the already-current follow row is a no-op; concrete selection still works.
+		await act(async () => follow.click());
+		expect(selected).toEqual([]);
 		await act(async () => button("One").click());
 		expect(selected).toEqual(["a:one"]);
 	});
@@ -229,7 +233,7 @@ describe("follow parent selection", () => {
 		expect(host.textContent).toContain("Follow parent");
 		expect(host.textContent).toContain("One");
 		const follow = button("aOne");
-		expect(follow.disabled).toBe(true);
+		expect(follow.disabled).toBe(false);
 		expect(host.textContent).not.toContain(narratorLocale["inheritance.fallbackReason"]);
 	});
 

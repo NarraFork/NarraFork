@@ -221,10 +221,15 @@ export function ModelMenuItems({
 				<span>
 					<Menu.Label>{t("followParent")}</Menu.Label>
 					<Menu.Item
-						disabled={followsParent}
 						ref={followsParent ? selectedItemRef : undefined}
-						rightSection={followsParent ? <IconCheck size={14} /> : undefined}
-						onClick={() => onSelect(FOLLOW_PARENT_MODEL)}
+						rightSection={
+							<IconCheck size={14} style={{ visibility: followsParent ? "visible" : "hidden" }} />
+						}
+						fw={followsParent ? 600 : 400}
+						onClick={() => {
+							// Already following: this row is the current state, re-selecting is a no-op.
+							if (!followsParent) onSelect(FOLLOW_PARENT_MODEL);
+						}}
 					>
 						{followModelLabel ? (
 							<Box>
