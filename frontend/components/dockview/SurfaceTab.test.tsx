@@ -17,7 +17,12 @@ import {
 	usePluginUiSurface,
 } from "../plugins/PluginUiSurfaceContext";
 import { parsePanelWindowDescriptor } from "../window/panel-window";
-import { DefaultSurfaceTab, fileTabRevealDirectory, withSurfaceTabMenu } from "./SurfaceTab";
+import {
+	DefaultSurfaceTab,
+	fileTabRevealDirectory,
+	narratorPanelTabId,
+	withSurfaceTabMenu,
+} from "./SurfaceTab";
 
 function queryClient(platform = "windows") {
 	const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -206,6 +211,36 @@ function revealItem() {
 		(item) => item.textContent?.trim() === commonLocale.dockTabs.revealInExplorer,
 	);
 }
+
+function gitIdentityItem() {
+	return Array.from(document.querySelectorAll("[role=menuitem]")).find(
+		(item) => item.textContent?.trim() === commonLocale.dockTabs.gitIdentity,
+	);
+}
+
+describe("narrator git identity menu", () => {
+	it("recognizes only narrator panels", () => {
+		expect(narratorPanelTabId({ panelType: "narrator", narratorId: "n1" })).toBe("n1");
+		// A tool or subagent panel carries a narrator id too, but it is not the
+		// narrator's own surface, and a nameless/absent id has nothing to act on.
+		expect(narratorPanelTabId({ panelType: "narrator-tool", narratorId: "n1" })).toBeNull();
+		expect(narratorPanelTabId({ panelType: "subagent", narratorId: "n1" })).toBeNull();
+		expect(narratorPanelTabId({ panelType: "narrator" })).toBeNull();
+		expect(narratorPanelTabId({ panelType: "narrator", narratorId: "" })).toBeNull();
+		expect(narratorPanelTabId({ panelType: "file", filePath: "/workspace/a.ts" })).toBeNull();
+		expect(narratorPanelTabId(undefined)).toBeNull();
+	});
+
+	it("offers the identity submenu on a narrator tab", async () => {
+		await mountTab({ params: { panelType: "narrator", narratorId: "n1" } });
+		expect(gitIdentityItem()).toBeDefined();
+	});
+
+	it("omits the identity submenu on a non-narrator tab", async () => {
+		await mountTab({ params: { panelType: "file", filePath: "/workspace/a.ts" } });
+		expect(gitIdentityItem()).toBeUndefined();
+	});
+});
 
 describe("plugin tab window context", () => {
 	const plugin = {

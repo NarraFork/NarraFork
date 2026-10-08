@@ -468,7 +468,17 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/db/integrity-probe-worker.ts": ["driver", "pragma"],
 	"server/db/migrate-narrator-drafts.ts": ["driver"],
 	"server/db/migrate.ts": ["connectionModule"],
-	"server/db/run-migrations.ts": ["driver", "pragma", "pragmaFn", "sqliteCatalog", "insertOr"],
+	"server/db/run-migrations.ts": [
+		"driver",
+		"pragma",
+		"pragmaFn",
+		"sqliteCatalog",
+		"insertOr",
+		// The `user_git_identities` backfill generates ids inside its INSERT…SELECT, the same
+		// way `narrator-service.ts` does for forked transcripts, rather than round-tripping
+		// every user row through JS during startup.
+		"blobFn",
+	],
 	"server/db/schema.ts": ["drizzleDialect", "json1"],
 	// Recall's FTS5/rowid statements moved to `services/search/sqlite-store.ts`; what remains is
 	// the raw-handle access path for its non-search reads.

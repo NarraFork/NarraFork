@@ -2329,6 +2329,69 @@ export const users = sqliteTable("users", {
 	createdAt: text("created_at").notNull(),
 });
 
+// === user_git_identities ===
+// A user's reusable git commit identities (a `user.name` / `user.email` pair).
+// Commits are attributed through `GIT_AUTHOR_*`/`GIT_COMMITTER_*` (see
+// `lib/git-identity.ts`). Which of them applies to a given commit is decided per
+// turn: the acting user's pick for that narrator, else their default row here,
+// else nothing — which inherits the host machine's git config, the original
+// behaviour. `users.git_username`/`git_email` are the legacy single-identity
+// columns: kept for compatibility, no longer read as an identity source.
+export const userGitIdentities = sqliteTable(
+	"user_git_identities",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		/** git `user.name`. Free text, but rejected at write time if it could corrupt an ident line. */
+		name: text("name").notNull(),
+		/** git `user.email`. Same validation as `name`. */
+		email: text("email").notNull(),
+		/**
+		 * The identity used when no per-narrator pick applies. Maintained by the service layer,
+		 * which keeps exactly one default while the user has any row ("only one row" is therefore
+		 * always the default too).
+		 */
+		isDefault: integer("is_default", { mode: "boolean" }).notNull().default(false),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [index("idx_user_git_identities_user").on(table.userId, table.createdAt)],
+);
+
+// === narrator_git_identity_bindings ===
+// Per (user × narrator) choice of which of that user's identities to commit under.
+// Deliberately not a column on `narrators`: the choice is personal. Several people
+// driving one narrator each keep their own — A picking identity "b" and B picking
+// "f" must not overwrite one another, and neither may see the other's pick.
+// No row means "no pick", which falls back to the user's default identity.
+export const narratorGitIdentityBindings = sqliteTable(
+	"narrator_git_identity_bindings",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		/**
+		 * The picked identity, which must belong to the same `userId` (enforced by the service).
+		 * `cascade` is the correct delete action rather than `set null`: a dangling pick is
+		 * meaningless, and "no row" already means "use my default".
+		 */
+		identityId: text("identity_id")
+			.notNull()
+			.references(() => userGitIdentities.id, { onDelete: "cascade" }),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_narrator_git_identity_unique").on(table.narratorId, table.userId),
+		// FK covering index for user deletion and identity cleanup.
+		index("idx_narrator_git_identity_user").on(table.userId),
+	],
+);
+
 // === user_recent_tabs ===
 // Authoritative, bounded recent-tab storage. user_preferences.recent_tabs is retained only as a
 // legacy shadow containing the first RECENT_TABS_LEGACY_LIMIT entries.

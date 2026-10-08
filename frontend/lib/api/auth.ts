@@ -48,6 +48,15 @@ export interface PasskeySummary {
 	createdAt: string;
 }
 
+/** One of a user's git commit identities. Several may exist, exactly one of them is the default. */
+export interface GitIdentity {
+	id: string;
+	name: string;
+	email: string;
+	isDefault: boolean;
+	createdAt: string;
+}
+
 /** A configured SSO provider exposed on the login page. */
 export interface SsoProvider {
 	id: string;
@@ -290,6 +299,28 @@ export const authApi = {
 	deleteAvatar: () => request<{ ok: boolean }>("/auth/me/avatar", { method: "DELETE" }),
 	updateProfile: (data: { gitUsername?: string; gitEmail?: string }) =>
 		request<{ ok: boolean }>("/auth/me", { method: "PATCH", body: JSON.stringify(data) }),
+
+	// === Git commit identities ===
+	// A user keeps several; each narrator turn commits under the acting user's pick
+	// for that narrator, else their default identity, else the host git config.
+
+	listGitIdentities: () => request<GitIdentity[]>("/auth/git-identities"),
+
+	createGitIdentity: (data: { name: string; email: string }) =>
+		request<GitIdentity>("/auth/git-identities", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+
+	/** Promote an identity to default (`isDefault` is promote-only; demotion is refused). */
+	updateGitIdentity: (id: string, data: { name?: string; email?: string; isDefault?: true }) =>
+		request<GitIdentity>(`/auth/git-identities/${id}`, {
+			method: "PATCH",
+			body: JSON.stringify(data),
+		}),
+
+	deleteGitIdentity: (id: string) =>
+		request<{ ok: boolean }>(`/auth/git-identities/${id}`, { method: "DELETE" }),
 
 	// Admin
 	listUsers: () => request<ApiEntity[]>("/admin/users"),

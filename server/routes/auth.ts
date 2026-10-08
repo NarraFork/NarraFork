@@ -16,6 +16,7 @@ import {
 import { buildTotpUri } from "../lib/totp";
 import { deleteAvatarImage, saveAvatarImage } from "../lib/uploads";
 import {
+	createGitIdentitySchema,
 	loginSchema,
 	mfaToggleSchema,
 	mfaVerifySchema,
@@ -27,10 +28,17 @@ import {
 	registerSchema,
 	totpActivateSchema,
 	totpDisableSchema,
+	updateGitIdentitySchema,
 	updateProfileSchema,
 } from "../lib/validators";
 import { requireSessionAuth } from "../middleware/auth";
 import { authSessionStore } from "../services/auth/store";
+import {
+	createUserGitIdentity,
+	deleteUserGitIdentity,
+	listUserGitIdentities,
+	updateUserGitIdentity,
+} from "../services/git-identities";
 import { mfaService } from "../services/mfa-service";
 import { passkeyService } from "../services/passkey-service";
 import { registrationAccountStore } from "../services/registration/store";
@@ -303,6 +311,36 @@ authRoutes.patch("/me", requireSessionAuth, async (c) => {
 		// old one, with nothing to indicate why.
 		invalidateGitIdentityCache(payload.sub);
 	}
+	return c.json({ ok: true });
+});
+
+// === Git commit identities ===
+// The identities a user commits under, and the per-narrator pick that chooses
+// between them (see `services/git-identities.ts`). Every route here acts on the
+// caller's own rows only — no id in a URL can reach another user's identity.
+
+authRoutes.get("/git-identities", requireSessionAuth, async (c) => {
+	return c.json(await listUserGitIdentities(c.get("user").sub));
+});
+
+authRoutes.post("/git-identities", requireSessionAuth, async (c) => {
+	const parsed = createGitIdentitySchema.safeParse(await c.req.json());
+	if (!parsed.success) throw zodValidationError(parsed.error);
+	return c.json(await createUserGitIdentity(c.get("user").sub, parsed.data), 201);
+});
+
+authRoutes.patch("/git-identities/:id", requireSessionAuth, async (c) => {
+	const id = c.req.param("id");
+	if (!id) throw new ValidationError("Git identity id is required");
+	const parsed = updateGitIdentitySchema.safeParse(await c.req.json());
+	if (!parsed.success) throw zodValidationError(parsed.error);
+	return c.json(await updateUserGitIdentity(c.get("user").sub, id, parsed.data));
+});
+
+authRoutes.delete("/git-identities/:id", requireSessionAuth, async (c) => {
+	const id = c.req.param("id");
+	if (!id) throw new ValidationError("Git identity id is required");
+	await deleteUserGitIdentity(c.get("user").sub, id);
 	return c.json({ ok: true });
 });
 

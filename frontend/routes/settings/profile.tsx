@@ -4,13 +4,9 @@ import { createFileRoute } from "@tanstack/react-router";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
+import { GitIdentitiesSection } from "../../components/settings/GitIdentitiesSection";
 import { ProfileSection } from "../../components/settings/ProfileSection";
-import {
-	useCurrentUser,
-	useDeleteAvatar,
-	useUpdateProfile,
-	useUploadAvatar,
-} from "../../hooks/useAuth";
+import { useCurrentUser, useDeleteAvatar, useUploadAvatar } from "../../hooks/useAuth";
 
 const AvatarCropModal = lazy(() =>
 	import("../../components/AvatarCropModal").then((m) => ({ default: m.AvatarCropModal })),
@@ -28,19 +24,8 @@ function SettingsProfilePage() {
 	const { data: currentUser, isLoading } = useCurrentUser();
 	const uploadAvatar = useUploadAvatar();
 	const deleteAvatar = useDeleteAvatar();
-	const updateProfile = useUpdateProfile();
 	const [cropSrc, setCropSrc] = useState<string | null>(null);
 	const cropSrcRef = useRef<string | null>(null);
-	const [gitUsername, setGitUsername] = useState("");
-	const [gitEmail, setGitEmail] = useState("");
-	const [gitDirty, setGitDirty] = useState(false);
-
-	useEffect(() => {
-		if (currentUser) {
-			setGitUsername(currentUser.gitUsername ?? "");
-			setGitEmail(currentUser.gitEmail ?? "");
-		}
-	}, [currentUser]);
 
 	useEffect(() => {
 		return () => {
@@ -84,10 +69,6 @@ function SettingsProfilePage() {
 		}
 	};
 
-	const handleGitSave = () => {
-		updateProfile.mutate({ gitUsername, gitEmail }, { onSuccess: () => setGitDirty(false) });
-	};
-
 	if (isLoading) return <Loader />;
 
 	return (
@@ -95,19 +76,11 @@ function SettingsProfilePage() {
 			<Title order={3}>{t("profileSection")}</Title>
 			<ProfileSection
 				currentUser={currentUser}
-				gitUsername={gitUsername}
-				setGitUsername={setGitUsername}
-				gitEmail={gitEmail}
-				setGitEmail={setGitEmail}
-				gitDirty={gitDirty}
-				setGitDirty={setGitDirty}
 				handleAvatarFileSelected={handleAvatarFileSelected}
 				handleDeleteAvatar={handleDeleteAvatar}
-				handleGitSave={handleGitSave}
-				uploadAvatar={uploadAvatar}
 				deleteAvatar={deleteAvatar}
-				updateProfile={updateProfile}
 			/>
+			<GitIdentitiesSection />
 			{cropSrc && (
 				<Suspense fallback={null}>
 					<AvatarCropModal

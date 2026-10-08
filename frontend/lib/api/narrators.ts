@@ -13,6 +13,7 @@ import {
 import type { SubagentModelPools, SubagentModelUse } from "@shared/subagent-model-policy";
 import type { ToolEditPreview } from "@shared/tool-edit-preview";
 import type { WorkspaceContext } from "@shared/workspace-context";
+import type { GitIdentity } from "./auth";
 import {
 	ApiError,
 	absorbRenewedToken,
@@ -1316,6 +1317,22 @@ export const narratorsApi = {
 				body: JSON.stringify({ deviceId }),
 			},
 		),
+
+	// === Git commit identity pick ===
+	// Which of MY identities this narrator commits under, plus my identities to
+	// choose from. Keyed by (user × narrator), so another user's pick is never
+	// returned here and cannot be changed through these calls.
+
+	getNarratorGitIdentity: (id: string) =>
+		request<{ identities: GitIdentity[]; selectedId: string | null }>(
+			`/narrators/${id}/git-identity`,
+		),
+	setNarratorGitIdentity: (id: string, identityId: string | null) =>
+		request<{ ok: boolean }>(`/narrators/${id}/git-identity`, {
+			method: "PUT",
+			body: JSON.stringify({ identityId }),
+		}),
+
 	updateNarratorPermissionMode: (id: string, permissionMode: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/permission-mode`, {
 			method: "PATCH",

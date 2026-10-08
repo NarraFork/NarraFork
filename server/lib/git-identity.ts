@@ -15,6 +15,14 @@
  * the resulting commits. `narrators.ownerUserId` is only a fallback for turns
  * with no triggering user (background continuations, scheduled tasks).
  *
+ * A user keeps several identities (`user_git_identities`) and may pick, per
+ * narrator, which one their own turns commit under
+ * (`narrator_git_identity_bindings`). Resolution is: the acting user's pick for
+ * that narrator → that user's default identity → nothing, which inherits the
+ * host config. The pick is keyed by (user × narrator) on purpose: two people
+ * driving the same narrator each keep their own pick, and neither can see or
+ * overwrite the other's.
+ *
  * Deliberately NOT used by `worktree-tree-snapshot.ts`: those commits are
  * NarraFork's own bookkeeping and must stay a pure function of their content,
  * so they keep a fixed synthetic identity.
@@ -39,7 +47,14 @@ export type GitIdentityEnv = Record<string, string>;
  */
 const INVALID_IDENT_CHARS = /[<>\n\r]/;
 
-function normalizeIdentPart(value: string | null | undefined): string | null {
+/**
+ * Trim and validate one half of an identity, or null when it cannot be used.
+ *
+ * Shared by the read path here and by the write path
+ * (`services/git-identities.ts`), so "what counts as a usable half" has exactly
+ * one definition: everything that reaches git has already been through this.
+ */
+export function normalizeGitIdentPart(value: string | null | undefined): string | null {
 	if (typeof value !== "string") return null;
 	const trimmed = value.trim();
 	if (!trimmed) return null;
@@ -67,8 +82,8 @@ export function buildGitIdentityEnv(
 	identity: Partial<GitIdentity> | null | undefined,
 ): GitIdentityEnv | null {
 	if (!identity) return null;
-	const name = normalizeIdentPart(identity.name);
-	const email = normalizeIdentPart(identity.email);
+	const name = normalizeGitIdentPart(identity.name);
+	const email = normalizeGitIdentPart(identity.email);
 	if (!name || !email) return null;
 	return {
 		GIT_AUTHOR_NAME: name,
@@ -98,12 +113,12 @@ export function resolveActingGitUserId(
  * never opens a database connection. Mirrors `lib/fast-mode.ts`.
  */
 async function createIdentityQueryDependencies() {
-	const [{ eq }, { db }, { narrators, users }] = await Promise.all([
-		import("drizzle-orm"),
-		import("../db"),
-		import("../db/schema"),
-	]);
-	return { db, eq, narrators, users };
+	const [
+		{ and, asc, desc, eq },
+		{ db },
+		{ narratorGitIdentityBindings, narrators, userGitIdentities },
+	] = await Promise.all([import("drizzle-orm"), import("../db"), import("../db/schema")]);
+	return { db, eq, and, asc, desc, narrators, narratorGitIdentityBindings, userGitIdentities };
 }
 
 let identityQueryDependencies: ReturnType<typeof createIdentityQueryDependencies> | undefined;
@@ -114,54 +129,72 @@ function loadIdentityQueryDependencies() {
 }
 
 /**
- * Short-lived memo of userId → identity.
+ * Short-lived memo of resolved identities.
  *
  * The Bash tool resolves an identity on every single call, and this runs on the
- * server's one JS thread. The query itself is a primary-key lookup of two
- * columns — well inside what the main thread should do — but a burst of tool
- * calls turns it into needless repeated reads. A 30 s TTL keeps that flat while
- * staying short enough that a stale entry is never surprising; profile edits
- * evict their own entry immediately (see {@link invalidateGitIdentityCache}).
+ * server's one JS thread. Each entry is a primary-key-shaped lookup — well
+ * inside what the main thread should do — but a burst of tool calls turns it
+ * into needless repeated reads. A 30 s TTL keeps that flat while staying short
+ * enough that a stale entry is never surprising; edits evict their own entries
+ * immediately (see {@link invalidateGitIdentityCache}).
  *
- * `null` is cached too: "this user has not configured an identity" is the common
- * case and must not re-query on every command.
+ * Two kinds of entries share the map: `user:<id>` for the user's default
+ * identity and `pick:<narratorId>:<userId>` for one user's choice of identity
+ * for one narrator. `null` is cached in both: "nothing configured" and "no
+ * pick" are common cases and must not re-query on every command.
  */
 const IDENTITY_CACHE_TTL_MS = 30_000;
 const identityCache = new Map<string, { identity: GitIdentity | null; expiresAt: number }>();
 
-/** Drop a user's cached identity. Called when the profile is updated. */
+const userCacheKey = (userId: string) => `user:${userId}`;
+// Narrator ids are nanoid-derived and never contain the separator.
+const pickCacheKey = (narratorId: string, userId: string) => `pick:${narratorId}:${userId}`;
+
+/**
+ * Drop one user's cached default identity and every pick they made, or the whole
+ * cache when no user is named. Called whenever their identities or picks change:
+ * a user who just fixed their name must not keep committing under the old one.
+ */
 export function invalidateGitIdentityCache(userId?: string | null): void {
 	if (!userId) {
 		identityCache.clear();
 		return;
 	}
-	identityCache.delete(userId);
+	identityCache.delete(userCacheKey(userId));
+	const suffix = `:${userId}`;
+	for (const key of identityCache.keys()) {
+		if (key.startsWith("pick:") && key.endsWith(suffix)) identityCache.delete(key);
+	}
+}
+
+/** Drop one user's narrated pick. Called when that pick (not their identities) changes. */
+export function invalidateNarratorGitIdentityPickCache(narratorId: string, userId: string): void {
+	identityCache.delete(pickCacheKey(narratorId, userId));
 }
 
 /**
- * Read a user's configured git identity, or null when either half is missing.
+ * Read a user's default git identity, or null when they have none.
  *
- * The columns are user-editable free text (`PATCH /api/auth/me`), so the result
- * still goes through {@link buildGitIdentityEnv}'s validation before reaching git.
+ * The default row is the `is_default` flag the service layer maintains, with
+ * "oldest first" as the tie-break so a user whose flag was never set (restored
+ * or seeded database) still resolves to something stable — and a user with a
+ * single identity is their own default by construction.
+ *
+ * Rows are user-editable free text, so the result still goes through
+ * {@link buildGitIdentityEnv}'s validation before reaching git.
  */
 export async function resolveGitIdentityForUser(
 	userId: string | null | undefined,
 ): Promise<GitIdentity | null> {
 	if (!userId) return null;
 
-	const cached = identityCache.get(userId);
+	const key = userCacheKey(userId);
+	const cached = identityCache.get(key);
 	if (cached && cached.expiresAt > Date.now()) return cached.identity;
 
 	let identity: GitIdentity | null = null;
 	try {
-		const { db, eq, users } = await loadIdentityQueryDependencies();
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { gitUsername: true, gitEmail: true },
-		});
-		const name = normalizeIdentPart(row?.gitUsername);
-		const email = normalizeIdentPart(row?.gitEmail);
-		if (name && email) identity = { name, email };
+		identity = await fetchDefaultIdentity(userId);
 	} catch {
 		// A failed lookup must not fail the git operation. Falling back to the host
 		// identity is the documented behaviour for "no identity configured", and it
@@ -169,8 +202,78 @@ export async function resolveGitIdentityForUser(
 		return null;
 	}
 
-	identityCache.set(userId, { identity, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS });
+	identityCache.set(key, { identity, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS });
 	return identity;
+}
+
+/**
+ * The identity a user commits under for a given narrator.
+ *
+ * The pick is the more specific choice, so it wins over the default; a missing
+ * pick — or no narrator at all, which is how the user-scoped call sites resolve
+ * (manual commits, project init, chapter merge/cleanup) — falls back to the
+ * default. `null` means "this user configured nothing", which the callers turn
+ * into "inherit the host config".
+ */
+export async function resolveGitIdentityForTurn(
+	narratorId: string | null | undefined,
+	userId: string,
+): Promise<GitIdentity | null> {
+	if (narratorId) {
+		const key = pickCacheKey(narratorId, userId);
+		const cached = identityCache.get(key);
+		if (cached && cached.expiresAt > Date.now()) {
+			return cached.identity ?? resolveGitIdentityForUser(userId);
+		}
+		const picked = await fetchPickedIdentity(narratorId, userId).catch(() => null);
+		identityCache.set(key, { identity: picked, expiresAt: Date.now() + IDENTITY_CACHE_TTL_MS });
+		if (picked) return picked;
+	}
+	return resolveGitIdentityForUser(userId);
+}
+
+/** The default row (see {@link resolveGitIdentityForUser} for what "default" means). */
+async function fetchDefaultIdentity(userId: string): Promise<GitIdentity | null> {
+	const { asc, db, desc, eq, userGitIdentities } = await loadIdentityQueryDependencies();
+	const rows = await db
+		.select({ name: userGitIdentities.name, email: userGitIdentities.email })
+		.from(userGitIdentities)
+		.where(eq(userGitIdentities.userId, userId))
+		.orderBy(
+			desc(userGitIdentities.isDefault),
+			asc(userGitIdentities.createdAt),
+			asc(userGitIdentities.id),
+		)
+		.limit(1);
+	return toIdentity(rows[0]);
+}
+
+/** The identity one user picked for one narrator, or null when they made no pick. */
+async function fetchPickedIdentity(
+	narratorId: string,
+	userId: string,
+): Promise<GitIdentity | null> {
+	const { and, db, eq, narratorGitIdentityBindings, userGitIdentities } =
+		await loadIdentityQueryDependencies();
+	const rows = await db
+		.select({ name: userGitIdentities.name, email: userGitIdentities.email })
+		.from(narratorGitIdentityBindings)
+		.innerJoin(userGitIdentities, eq(userGitIdentities.id, narratorGitIdentityBindings.identityId))
+		.where(
+			and(
+				eq(narratorGitIdentityBindings.narratorId, narratorId),
+				eq(narratorGitIdentityBindings.userId, userId),
+			),
+		)
+		.limit(1);
+	return toIdentity(rows[0]);
+}
+
+/** Re-validate a stored row through the shared identifier rules. */
+function toIdentity(row: { name: string; email: string } | undefined): GitIdentity | null {
+	const name = normalizeGitIdentPart(row?.name);
+	const email = normalizeGitIdentPart(row?.email);
+	return name && email ? { name, email } : null;
 }
 
 /** The env overrides for a single user, or null to inherit the host identity. */
@@ -185,21 +288,24 @@ export async function resolveUserGitIdentityEnv(
  *
  * Prefers the triggering user and falls back to the narrator's owner, so a
  * background continuation still attributes its commits to the person whose
- * session it is rather than to the host machine.
+ * session it is rather than to the host machine. Whichever of the two applies,
+ * their pick for this narrator beats their default identity
+ * ({@link resolveGitIdentityForTurn}).
  */
 export async function resolveNarratorGitIdentityEnv(input: {
 	turnUserId?: string | null;
 	narratorId?: string | null;
 }): Promise<GitIdentityEnv | null> {
 	if (input.turnUserId) {
-		const env = await resolveUserGitIdentityEnv(input.turnUserId);
+		const identity = await resolveGitIdentityForTurn(input.narratorId, input.turnUserId);
 		// A triggering user who configured no identity does NOT hand authorship to
 		// the narrator's owner: the owner did not make this change.
-		if (env) return env;
-		return null;
+		return buildGitIdentityEnv(identity);
 	}
 	if (!input.narratorId) return null;
-	return resolveUserGitIdentityEnv(await resolveNarratorOwnerUserId(input.narratorId));
+	const ownerUserId = await resolveNarratorOwnerUserId(input.narratorId);
+	if (!ownerUserId) return null;
+	return buildGitIdentityEnv(await resolveGitIdentityForTurn(input.narratorId, ownerUserId));
 }
 
 /** The owner of a narrator, used only as the no-triggering-user fallback. */

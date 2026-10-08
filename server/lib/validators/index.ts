@@ -6,6 +6,7 @@ export {
 	adminCreateUserSchema,
 	adminUpdateSettingsSchema,
 	adminUpdateUserSchema,
+	createGitIdentitySchema,
 	loginSchema,
 	mfaToggleSchema,
 	mfaVerifySchema,
@@ -19,6 +20,7 @@ export {
 	registerSchema,
 	totpActivateSchema,
 	totpDisableSchema,
+	updateGitIdentitySchema,
 	updateProfileSchema,
 } from "./auth";
 export {
@@ -181,6 +183,7 @@ export {
 	rollbackToBlockSchema,
 	segmentCompactSchema,
 	sendMessageSchema,
+	setNarratorGitIdentitySchema,
 	subagentRecoverySchema,
 	suggestAnswersSchema,
 	updateBlacklistCmdSchema,
