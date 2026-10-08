@@ -773,6 +773,196 @@ describe("derived status notification identity", () => {
 	});
 });
 
+describe("background service classification", () => {
+	test("first page derives classified counts from its active snapshot without a second async count", async () => {
+		await seedParent();
+		await backgroundTaskService.createBashTask({
+			id: "snapshot-work",
+			parentNarratorId: PARENT,
+			command: "build",
+		});
+		await backgroundTaskService.createBashTask({
+			id: "snapshot-service",
+			parentNarratorId: PARENT,
+			command: "serve",
+			backgroundKind: "service",
+		});
+		await flushDeltas();
+		const original = backgroundTaskService.countActiveKindsByParent;
+		let rereads = 0;
+		backgroundTaskService.countActiveKindsByParent = async () => {
+			rereads++;
+			// Simulate a newer count snapshot overtaking the already-read rows.
+			await Promise.resolve();
+			return { activeCount: 1, activeWorkCount: 1, activeServiceCount: 0 };
+		};
+		try {
+			const page = await backgroundTaskService.listPageByParent(PARENT);
+			expect(rereads).toBe(0);
+			expect(page.activeTasks).toHaveLength(2);
+			expect(page).toMatchObject({ activeCount: 2, activeWorkCount: 1, activeServiceCount: 1 });
+			expect(page.activeTasks?.filter((item) => item.backgroundKind === "service")).toHaveLength(
+				page.activeServiceCount ?? 0,
+			);
+		} finally {
+			backgroundTaskService.countActiveKindsByParent = original;
+		}
+	});
+	test("services remain active and paged, while old rows and legacy agents default to task", async () => {
+		await seedParent();
+		await seedBashTaskAt("default-task", "2026-01-01T00:00:00.000Z");
+		await seedLegacyTask({
+			id: "default-legacy",
+			createdAt: "2026-01-02T00:00:00.000Z",
+			backgroundStatus: "running",
+		});
+		await backgroundTaskService.createBashTask({
+			id: "service",
+			parentNarratorId: PARENT,
+			command: "serve",
+			backgroundKind: "service",
+		});
+		await flushDeltas();
+		const expected = { activeCount: 3, activeWorkCount: 2, activeServiceCount: 1 };
+		expect(await backgroundTaskService.countActiveKindsByParent(PARENT)).toEqual(expected);
+		expect(
+			(await backgroundTaskService.countActiveKindsByParentBatch([PARENT])).get(PARENT),
+		).toEqual(expected);
+		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(3);
+		const first = await backgroundTaskService.listPageByParent(PARENT, { limit: 1 });
+		expect(first).toMatchObject(expected);
+		expect(first.activeTasks).toHaveLength(3);
+		expect(first.activeTasks?.find((item) => item.id === "service")).toMatchObject({
+			backgroundKind: "service",
+			effectiveStatus: "running",
+		});
+		for (const id of ["default-task", "default-legacy"]) {
+			expect(first.activeTasks?.find((item) => item.id === id)?.backgroundKind).toBe("task");
+		}
+		const next = await backgroundTaskService.listPageByParent(PARENT, {
+			limit: 1,
+			cursor: first.nextCursor ?? undefined,
+		});
+		expect(next).toMatchObject(expected);
+		expect(listDeltas().at(-1)).toMatchObject(expected);
+		expect(
+			broadcasts.filter((frame) => frame.message.type === "background_task_count_changed").at(-1)
+				?.message,
+		).toMatchObject({
+			activeBackgroundTaskCount: 3,
+			activeBackgroundWorkCount: 2,
+			activeBackgroundServiceCount: 1,
+		});
+	});
+
+	test.each([
+		false,
+		true,
+	])("service-only descendants do not occupy a %s unified ancestor; mixed work does", async (unified) => {
+		await seedParent();
+		const now = new Date().toISOString();
+		await seedLegacyTask({ id: "service-child", createdAt: now });
+		if (unified) {
+			const { backgroundTasks } = await import("../../db/schema");
+			await db.insert(backgroundTasks).values({
+				id: "service-child-projection",
+				parentNarratorId: PARENT,
+				type: "agent",
+				status: "completed",
+				subagentNarratorId: "service-child",
+				subagentType: "general",
+				startedAt: now,
+				completedAt: now,
+				createdAt: now,
+				updatedAt: now,
+			});
+		}
+		await backgroundTaskService.createBashTask({
+			id: "child-service",
+			parentNarratorId: "service-child",
+			command: "serve",
+			backgroundKind: "service",
+		});
+		await flushDeltas();
+		expect(await backgroundTaskService.countActiveKindsByParent(PARENT)).toEqual({
+			activeCount: 0,
+			activeWorkCount: 0,
+			activeServiceCount: 0,
+		});
+		expect((await backgroundTaskService.listPageByParent(PARENT)).tasks[0]?.effectiveStatus).toBe(
+			"completed",
+		);
+		expect(await backgroundTaskService.countActiveKindsByParent("service-child")).toEqual({
+			activeCount: 1,
+			activeWorkCount: 0,
+			activeServiceCount: 1,
+		});
+		await backgroundTaskService.createBashTask({
+			id: "child-work",
+			parentNarratorId: "service-child",
+			command: "build",
+		});
+		await flushDeltas();
+		expect((await backgroundTaskService.listPageByParent(PARENT)).tasks[0]?.effectiveStatus).toBe(
+			"child_running",
+		);
+		expect(await backgroundTaskService.countActiveKindsByParent(PARENT)).toEqual({
+			activeCount: 1,
+			activeWorkCount: 1,
+			activeServiceCount: 0,
+		});
+		await backgroundTaskService.markCompleted("child-work", "done");
+		await flushDeltas();
+		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(0);
+		expect((await backgroundTaskService.getById("child-service"))?.status).toBe("running");
+	});
+
+	test("a large service collection cannot exhaust descendant work or work candidate budgets", async () => {
+		await seedParent();
+		await seedLegacyTask({ id: "many-services-child", createdAt: "2026-01-01T00:00:00.000Z" });
+		const { backgroundTasks } = await import("../../db/schema");
+		const now = new Date().toISOString();
+		// Exceeds the occupancy row budget, but services must never enter that graph.
+		for (let offset = 0; offset < 8_300; offset += 100) {
+			await db.insert(backgroundTasks).values(
+				Array.from({ length: 100 }, (_, index) => ({
+					id: `many-service-${offset + index}`,
+					parentNarratorId: "many-services-child",
+					type: "bash" as const,
+					backgroundKind: "service" as const,
+					status: "running" as const,
+					startedAt: now,
+					createdAt: now,
+					updatedAt: now,
+				})),
+			);
+		}
+		await db.insert(backgroundTasks).values({
+			id: "older-work",
+			parentNarratorId: "many-services-child",
+			type: "bash",
+			status: "running",
+			startedAt: now,
+			createdAt: "2020-01-01T00:00:00.000Z",
+			updatedAt: now,
+		});
+		const expected = { activeCount: 201, activeWorkCount: 1, activeServiceCount: 200 };
+		expect(await backgroundTaskService.countActiveKindsByParent("many-services-child")).toEqual(
+			expected,
+		);
+		expect(
+			(
+				await backgroundTaskService.countActiveKindsByParentBatch([PARENT, "many-services-child"])
+			).get("many-services-child"),
+		).toEqual(expected);
+		const page = await backgroundTaskService.listPageByParent("many-services-child");
+		expect(page).toMatchObject({ ...expected, activeTruncated: true });
+		expect(page.activeTasks?.some((item) => item.id === "older-work")).toBe(true);
+		expect(page.activeTasks).toHaveLength(201);
+		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(1);
+	});
+});
+
 describe("background task count frames", () => {
 	test.each([
 		["unified", true, false],
@@ -1012,8 +1202,8 @@ describe("background task count frames", () => {
 		await flushDeltas();
 		broadcasts.length = 0;
 		const version = backgroundTaskService.getListVersion(PARENT);
-		const original = backgroundTaskService.countActiveByParent;
-		backgroundTaskService.countActiveByParent = async () => {
+		const original = backgroundTaskService.countActiveKindsByParent;
+		backgroundTaskService.countActiveKindsByParent = async () => {
 			throw new Error("count unavailable");
 		};
 		try {
@@ -1022,7 +1212,7 @@ describe("background task count frames", () => {
 			expect(broadcasts).toHaveLength(0);
 			expect(backgroundTaskService.getListVersion(PARENT)).toBe(version);
 		} finally {
-			backgroundTaskService.countActiveByParent = original;
+			backgroundTaskService.countActiveKindsByParent = original;
 		}
 	});
 

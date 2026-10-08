@@ -347,6 +347,8 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 					status: "idle",
 					substatus: [],
 					activeBackgroundTaskCount: 0,
+					activeBackgroundWorkCount: 0,
+					activeBackgroundServiceCount: 0,
 				},
 				{
 					narratorId: "narrator-working",
@@ -354,6 +356,8 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 					substatus: ["reasoning"],
 					turnStartedAt: "2026-07-19T00:00:00.000Z",
 					activeBackgroundTaskCount: 0,
+					activeBackgroundWorkCount: 0,
+					activeBackgroundServiceCount: 0,
 				},
 			],
 		});
@@ -393,7 +397,7 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 	it("an in-flight old count snapshot cannot overwrite a delivered live count", async () => {
 		seedNarrators();
 		const { backgroundTaskService } = await import("../services/background-task-service");
-		const original = backgroundTaskService.countActiveByParentBatch;
+		const original = backgroundTaskService.countActiveKindsByParentBatch;
 		let releaseRead = () => {};
 		let readStarted = () => {};
 		let liveDelivered = () => {};
@@ -406,10 +410,15 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 		const delivered = new Promise<void>((resolve) => {
 			liveDelivered = resolve;
 		});
-		backgroundTaskService.countActiveByParentBatch = async (ids) => {
+		let firstRead = true;
+		backgroundTaskService.countActiveKindsByParentBatch = async (ids) => {
+			const block = firstRead;
+			firstRead = false;
 			const oldCounts = await original.call(backgroundTaskService, ids);
-			readStarted();
-			await blockedRead;
+			if (block) {
+				readStarted();
+				await blockedRead;
+			}
 			return oldCounts;
 		};
 		backgroundTaskService.setBroadcastFnForTests((id, message) => {
@@ -453,16 +462,49 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 		} finally {
 			releaseRead();
 			await subscription;
-			backgroundTaskService.countActiveByParentBatch = original;
+			backgroundTaskService.countActiveKindsByParentBatch = original;
 			backgroundTaskService.setBroadcastFnForTests(null);
 		}
+	});
+
+	it("restores service and work counts together without treating a service as unfinished work", async () => {
+		seedNarrators();
+		const { backgroundTasks } = await import("../db/schema");
+		const now = new Date().toISOString();
+		await db.insert(backgroundTasks).values({
+			id: "snapshot-service",
+			parentNarratorId: "narrator-idle",
+			type: "bash",
+			backgroundKind: "service",
+			status: "running",
+			startedAt: now,
+			createdAt: now,
+			updatedAt: now,
+		});
+		const { ws, sent } = openFakeWs();
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "list",
+			narratorIds: ["narrator-idle"],
+		});
+		expect(sent[0]).toMatchObject({
+			type: "list_state_snapshot",
+			items: [
+				{
+					narratorId: "narrator-idle",
+					activeBackgroundTaskCount: 1,
+					activeBackgroundWorkCount: 0,
+					activeBackgroundServiceCount: 1,
+				},
+			],
+		});
 	});
 
 	it("keeps basic list status and omits unknown counts when occupancy loading fails", async () => {
 		seedNarrators();
 		const { backgroundTaskService } = await import("../services/background-task-service");
-		const original = backgroundTaskService.countActiveByParentBatch;
-		backgroundTaskService.countActiveByParentBatch = async () => {
+		const original = backgroundTaskService.countActiveKindsByParentBatch;
+		backgroundTaskService.countActiveKindsByParentBatch = async () => {
 			throw new Error("occupancy unavailable");
 		};
 		try {
@@ -482,9 +524,11 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 			});
 			for (const item of sent[0]?.items as Record<string, unknown>[]) {
 				expect(item).not.toHaveProperty("activeBackgroundTaskCount");
+				expect(item).not.toHaveProperty("activeBackgroundWorkCount");
+				expect(item).not.toHaveProperty("activeBackgroundServiceCount");
 			}
 		} finally {
-			backgroundTaskService.countActiveByParentBatch = original;
+			backgroundTaskService.countActiveKindsByParentBatch = original;
 		}
 	});
 

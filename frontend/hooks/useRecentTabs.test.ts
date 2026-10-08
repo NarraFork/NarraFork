@@ -68,6 +68,52 @@ describe("isRecentTabBackgroundActive", () => {
 	const tab = (activeBackgroundTaskCount?: number): RecentTab =>
 		({ type: "narrator", id: "n1", activeBackgroundTaskCount }) as RecentTab;
 
+	test("services do not paint idle or unread tabs blue, mixed work still does", () => {
+		const service: RecentTab = {
+			...tab(2),
+			status: "idle",
+			substatus: ["unread"],
+			activeBackgroundWorkCount: 0,
+			activeBackgroundServiceCount: 2,
+		};
+		expect(isRecentTabBackgroundActive(service, true)).toBeFalse();
+		expect(isRecentTabBackgroundActive(service, false)).toBeFalse();
+		expect(
+			isRecentTabBackgroundActive({ ...service, activeBackgroundWorkCount: 1 }, true),
+		).toBeTrue();
+	});
+
+	test("classification survives persisted merges and stale HTTP responses", () => {
+		const service: RecentTab = {
+			...tab(2),
+			activeBackgroundWorkCount: 0,
+			activeBackgroundServiceCount: 2,
+		};
+		expect(mergeRecentTabRuntime(tab(), service)).toMatchObject(service);
+		const versions = new Map<string, Map<string, number>>();
+		const before = snapshotRecentTabRuntimeVersions(versions, ["n1"]);
+		bumpRecentTabRuntimeVersions(versions, "n1", [
+			"activeBackgroundWorkCount",
+			"activeBackgroundServiceCount",
+		]);
+		const patches = reconcileRecentTabsRuntimePatches(
+			[
+				{
+					key: "narrator:n1",
+					patch: {
+						activeBackgroundWorkCount: 9,
+						activeBackgroundServiceCount: 0,
+						activeTerminalCount: 3,
+					},
+				},
+			],
+			new Map([["narrator:n1", "n1"]]),
+			before,
+			versions,
+		);
+		expect(patches).toEqual([{ key: "narrator:n1", patch: { activeTerminalCount: 3 } }]);
+	});
+
 	test("hollow tab with running background tasks renders half-filled", () => {
 		expect(isRecentTabBackgroundActive(tab(2), false)).toBeTrue();
 		expect(isRecentTabBackgroundActive(tab(1), false)).toBeTrue();

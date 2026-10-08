@@ -290,15 +290,22 @@ export function NarratorStatusBar({
 /** Reuses the toolbar's live count without starting another task-list subscription. */
 export function BackgroundTasksStatusButton({
 	runningCount,
+	workCount = runningCount,
+	serviceCount = 0,
 	onOpen,
 }: {
 	runningCount: number;
+	workCount?: number;
+	serviceCount?: number;
 	onOpen: () => void;
 }) {
 	const { t } = useTranslation("narrator");
 	if (runningCount <= 0) return null;
 
-	const label = t("backgroundTasks.activeCount", { count: runningCount });
+	const label =
+		serviceCount > 0
+			? t("backgroundTasks.activeKinds", { work: workCount, services: serviceCount })
+			: t("backgroundTasks.activeCount", { count: runningCount });
 	return (
 		<Tooltip label={t("backgroundTasks.openPanel")} withinPortal>
 			{/*
@@ -320,7 +327,7 @@ export function BackgroundTasksStatusButton({
 					alignItems: "center",
 				}}
 			>
-				<Text component="span" size="xs" c="blue">
+				<Text component="span" size="xs" c={workCount > 0 ? "blue" : "teal"}>
 					<span aria-hidden="true">· </span>
 					{label}
 				</Text>

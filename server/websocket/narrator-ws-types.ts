@@ -39,6 +39,8 @@ export interface NarratorListStateSnapshotItem {
 	substatus?: string[];
 	turnStartedAt?: string;
 	activeBackgroundTaskCount?: number;
+	activeBackgroundWorkCount?: number;
+	activeBackgroundServiceCount?: number;
 }
 
 /** Reflection gate families that report live progress. */
@@ -879,6 +881,8 @@ export type NarratorServerMessage =
 			type: "background_task_count_changed";
 			narratorId: string;
 			activeBackgroundTaskCount: number;
+			activeBackgroundWorkCount?: number;
+			activeBackgroundServiceCount?: number;
 	  }
 	| {
 			type: "browser_session_count";

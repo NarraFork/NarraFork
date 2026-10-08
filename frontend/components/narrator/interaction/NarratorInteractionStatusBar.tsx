@@ -131,6 +131,8 @@ export interface NarratorInteractionStatusBarProps {
 		supported: boolean;
 		buttonEnabled: boolean;
 		runningCount: number;
+		workCount?: number;
+		serviceCount?: number;
 		onOpenPanel: () => void;
 	};
 
@@ -441,6 +443,8 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 							{tasks.supported && tasks.buttonEnabled && (
 								<BackgroundTasksStatusButton
 									runningCount={tasks.runningCount}
+									workCount={tasks.workCount}
+									serviceCount={tasks.serviceCount}
 									onOpen={tasks.onOpenPanel}
 								/>
 							)}

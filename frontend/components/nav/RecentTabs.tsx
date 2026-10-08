@@ -51,6 +51,7 @@ import {
 	IconPinnedOff,
 	IconPlus,
 	IconRobot,
+	IconServer,
 	IconShield,
 	IconSubtask,
 	IconTerminal2,
@@ -417,6 +418,8 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				event.activeBackgroundTaskCount !== undefined
 			) {
 				patch.activeBackgroundTaskCount = event.activeBackgroundTaskCount;
+				patch.activeBackgroundWorkCount = event.activeBackgroundWorkCount;
+				patch.activeBackgroundServiceCount = event.activeBackgroundServiceCount;
 			} else if (event.type === "containerStatus") patch.containerStatus = event.containerStatus;
 			else if (event.type === "draft") patch.hasDraft = !!event.hasDraft;
 			else if (event.type === "awaitedQuestion") {
@@ -2200,9 +2203,12 @@ function TabIndicators({ tab, t }: TabIndicatorsProps) {
 	const hasViewers = viewerCount >= 2;
 	const hasContainer = tab.type === "chapter" && tab.containerStatus;
 	const hasTerminals = (tab.activeTerminalCount ?? 0) > 0;
-	const hasBackgroundTasks = (tab.activeBackgroundTaskCount ?? 0) > 0;
+	const workCount = tab.activeBackgroundWorkCount ?? tab.activeBackgroundTaskCount ?? 0;
+	const serviceCount = tab.activeBackgroundServiceCount ?? 0;
+	const hasBackgroundTasks = workCount > 0;
 
-	if (!hasViewers && !hasContainer && !hasTerminals && !hasBackgroundTasks) return null;
+	if (!hasViewers && !hasContainer && !hasTerminals && !hasBackgroundTasks && !serviceCount)
+		return null;
 
 	return (
 		<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
@@ -2241,14 +2247,28 @@ function TabIndicators({ tab, t }: TabIndicatorsProps) {
 			)}
 			{hasBackgroundTasks && (
 				<Tooltip
-					label={t("activeBackgroundTasks", { count: tab.activeBackgroundTaskCount })}
+					label={t("activeBackgroundTasks", { count: workCount })}
 					withArrow
 					position="right"
 				>
 					<Group gap={1} wrap="nowrap">
 						<IconSubtask size={11} style={{ opacity: 0.6, transform: "translateY(-1px)" }} />
 						<Text size="xs" c="dimmed" lh={1}>
-							{tab.activeBackgroundTaskCount}
+							{workCount}
+						</Text>
+					</Group>
+				</Tooltip>
+			)}
+			{serviceCount > 0 && (
+				<Tooltip
+					label={t("activeBackgroundServices", { count: serviceCount })}
+					withArrow
+					position="right"
+				>
+					<Group gap={1} wrap="nowrap">
+						<IconServer size={11} style={{ opacity: 0.6 }} />
+						<Text size="xs" c="dimmed" lh={1}>
+							{serviceCount}
 						</Text>
 					</Group>
 				</Tooltip>

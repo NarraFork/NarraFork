@@ -71,6 +71,13 @@
       "when": 1791196409136,
       "tag": "0009_context_character_cache_indexes",
       "breakpoints": true
-    }
+    },
+		{
+			"idx": 10,
+			"version": "7",
+			"when": 1791435301885,
+			"tag": "0010_background_bash_kind",
+			"breakpoints": true
+		}
   ]
 }

@@ -18,6 +18,8 @@ import type { NarratorToolbarItemDef } from "./narrator-toolbar-items";
 export interface NarratorToolbarBadgeCounts {
 	/** Background tasks currently running. */
 	backgroundTasks: number;
+	backgroundWork?: number;
+	backgroundServices?: number;
 	/** Live browser sessions. */
 	browserSessions: number;
 	/** Unread messages in the human discussion room. */
@@ -60,7 +62,7 @@ export function resolveNarratorToolbarBadge(
 ): NarratorToolbarBadgeValue {
 	switch (badge) {
 		case "backgroundTasks":
-			return format(counts.backgroundTasks, true);
+			return format(counts.backgroundTasks, (counts.backgroundWork ?? counts.backgroundTasks) > 0);
 		case "browserSessions":
 			return format(counts.browserSessions);
 		case "userChatUnread":

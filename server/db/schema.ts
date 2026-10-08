@@ -3840,6 +3840,9 @@ export const backgroundTasks = sqliteTable(
 			.notNull()
 			.references(() => narrators.id, { onDelete: "cascade" }),
 		type: text("type", { enum: ["bash", "agent", "transfer"] }).notNull(),
+		backgroundKind: text("background_kind", { enum: ["task", "service"] })
+			.notNull()
+			.default("task"),
 		/** Durable publication run identity. NULL marks legacy tasks awaiting explicit registration. */
 		logicalRunId: text("logical_run_id"),
 		status: text("status", {

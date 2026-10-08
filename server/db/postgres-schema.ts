@@ -352,6 +352,7 @@ export const narrators = pgTable(
 		messageCount: integer("message_count").default(0),
 		totalCostUsd: doublePrecision("total_cost_usd").default(0),
 		lastMessageAt: text("last_message_at"),
+		lastStopReason: text("last_stop_reason"),
 		status: text("status").notNull().default("idle"),
 		substatus: text("substatus").notNull().default("[]"),
 		planMode: boolean("plan_mode").notNull().default(false),
@@ -938,6 +939,10 @@ export const narratorQuestions = pgTable(
 			.references((): PgColumn => narratorToolCalls.id, { onDelete: "cascade" }),
 		toolUseId: text("tool_use_id").notNull(),
 		questionsJson: jsonText("questions_json").notNull(),
+		context: text("context"),
+		resolutionJson: jsonText("resolution_json"),
+		withdrawReason: text("withdraw_reason"),
+		summaryJson: jsonText("summary_json"),
 		executionPrincipalJson: jsonText("execution_principal_json"),
 		answersJson: jsonText("answers_json"),
 		annotationsJson: jsonText("annotations_json"),
@@ -951,6 +956,32 @@ export const narratorQuestions = pgTable(
 	(table) => [
 		uniqueIndex("idx_narrator_questions_tool_call").on(table.toolCallId),
 		index("idx_narrator_questions_narrator_status").on(table.narratorId, table.status),
+		index("idx_narrator_questions_answer_message").on(table.answerMessageId),
+		index("idx_narrator_questions_created").on(table.createdAt, table.id),
+	],
+);
+
+export const narratorQuestionEvents = pgTable(
+	"narrator_question_events",
+	{
+		questionId: text("question_id")
+			.notNull()
+			.references((): PgColumn => narratorQuestions.id, { onDelete: "cascade" }),
+		messageId: text("message_id")
+			.primaryKey()
+			.notNull()
+			.references((): PgColumn => narratorMessages.id, { onDelete: "cascade" }),
+		kind: text("kind").notNull(),
+		resolutionJson: jsonText("resolution_json"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_question_events_question_rowid").on(table.questionId),
+		index("idx_question_events_question_created").on(
+			table.questionId,
+			table.createdAt,
+			table.messageId,
+		),
 	],
 );
 
@@ -2229,6 +2260,7 @@ export const backgroundTasks = pgTable(
 			.notNull()
 			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
 		type: text("type").notNull(),
+		backgroundKind: text("background_kind").notNull().default("task"),
 		logicalRunId: text("logical_run_id"),
 		status: text("status").notNull(),
 		command: text("command"),
@@ -3687,8 +3719,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 115,
-  "columnCount": 1661,
+  "tableCount": 116,
+  "columnCount": 1672,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -5875,6 +5907,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "lastMessageAt",
           "name": "last_message_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "lastStopReason",
+          "name": "last_stop_reason",
           "kind": "text",
           "pgType": "text",
           "notNull": false,
@@ -9403,6 +9444,44 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "context",
+          "name": "context",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "resolutionJson",
+          "name": "resolution_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "withdrawReason",
+          "name": "withdraw_reason",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "summaryJson",
+          "name": "summary_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "executionPrincipalJson",
           "name": "execution_principal_json",
           "kind": "text",
@@ -9504,6 +9583,110 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "columns": [
             "narratorId",
             "status"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrator_questions_answer_message",
+          "columns": [
+            "answerMessageId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrator_questions_created",
+          "columns": [
+            "createdAt",
+            "id"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorQuestionEvents",
+      "name": "narrator_question_events",
+      "columns": [
+        {
+          "property": "questionId",
+          "name": "question_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narratorQuestions",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_question_events_question_id_narrator_questions_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "messageId",
+          "name": "message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narratorMessages",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_question_events_message_id_narrator_messages_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "resolutionJson",
+          "name": "resolution_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_question_events_question_rowid",
+          "columns": [
+            "questionId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_question_events_question_created",
+          "columns": [
+            "questionId",
+            "createdAt",
+            "messageId"
           ],
           "unique": false
         }
@@ -17196,6 +17379,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": true,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "backgroundKind",
+          "name": "background_kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"task\"",
+          "defaultExpression": "\"task\""
         },
         {
           "property": "logicalRunId",

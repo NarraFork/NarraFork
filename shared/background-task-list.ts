@@ -16,7 +16,8 @@ export const BACKGROUND_TASK_LIST_PAGE_SIZE = 30;
 /** Hard cap for a client-requested page size. */
 export const BACKGROUND_TASK_LIST_MAX_PAGE_SIZE = 50;
 /**
- * Cap for the first page's `activeTasks` set.
+ * Per-kind cap for the first page's `activeTasks` set (work and services each).
+ * Separate budgets prevent long-lived services from crowding out work.
  *
  * Active tasks are returned in full (not paged) because the panel's whole job is
  * to show what is still running, and "still running" cannot be expressed as a
@@ -46,6 +47,13 @@ export const BACKGROUND_TASK_DELTA_MAX_REMOVE_IDS = 50;
  * drawer, and completion notifications.
  */
 export type BackgroundTaskType = "bash" | "agent" | "transfer";
+export type BackgroundTaskKind = "task" | "service";
+
+export interface BackgroundTaskActiveCounts {
+	activeCount: number;
+	activeWorkCount: number;
+	activeServiceCount: number;
+}
 
 /**
  * One row of the task list, normalized so the unified `background_tasks` table
@@ -56,6 +64,8 @@ export type BackgroundTaskType = "bash" | "agent" | "transfer";
 export interface BackgroundTaskListItem {
 	id: string;
 	type: BackgroundTaskType;
+	/** Always supplied by the server; absent older fixtures mean task. */
+	backgroundKind?: BackgroundTaskKind;
 	/** Raw persisted status of the row. */
 	status: string;
 	/**
@@ -117,8 +127,10 @@ export interface BackgroundTaskListPage {
 	listEpoch: string;
 	/** Monotonic per-parent list version; deltas carry the next value. */
 	version: number;
-	/** Count of tasks still doing work (includes derived continued/child_running). */
+	/** Total active work and services (includes derived continued/child_running). */
 	activeCount: number;
+	activeWorkCount?: number;
+	activeServiceCount?: number;
 	/** First page only: the full active set, capped at BACKGROUND_TASK_ACTIVE_LIMIT. */
 	activeTasks?: BackgroundTaskListItem[];
 	/** True when `activeTasks` hit the cap. */
@@ -139,6 +151,8 @@ export interface BackgroundTaskListDelta {
 	listEpoch: string;
 	version: number;
 	activeCount: number;
+	activeWorkCount?: number;
+	activeServiceCount?: number;
 	upsert?: BackgroundTaskListItem;
 	removeIds?: string[];
 	/**

@@ -1,6 +1,6 @@
 {
-  "id": "c8907ecc-6d49-49f5-bd69-203edaa083fb",
-  "prevId": "597872b5-9bc6-43a6-b2f0-7bc9b3e18b6b",
+  "id": "392deb77-0f97-42e8-a021-b68bd6a75a2b",
+  "prevId": "c8907ecc-6d49-49f5-bd69-203edaa083fb",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -864,6 +864,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true
+        },
+        "background_kind": {
+          "name": "background_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'task'"
         },
         "logical_run_id": {
           "name": "logical_run_id",
@@ -12589,6 +12596,119 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.narrator_question_events": {
+      "name": "narrator_question_events",
+      "schema": "",
+      "columns": {
+        "question_id": {
+          "name": "question_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "message_id": {
+          "name": "message_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "resolution_json": {
+          "name": "resolution_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_question_events_question_rowid": {
+          "name": "idx_question_events_question_rowid",
+          "columns": [
+            {
+              "expression": "question_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_question_events_question_created": {
+          "name": "idx_question_events_question_created",
+          "columns": [
+            {
+              "expression": "question_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "message_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "narrator_question_events_question_id_narrator_questions_id_fk": {
+          "name": "narrator_question_events_question_id_narrator_questions_id_fk",
+          "tableFrom": "narrator_question_events",
+          "tableTo": "narrator_questions",
+          "columnsFrom": [
+            "question_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "narrator_question_events_message_id_narrator_messages_id_fk": {
+          "name": "narrator_question_events_message_id_narrator_messages_id_fk",
+          "tableFrom": "narrator_question_events",
+          "tableTo": "narrator_messages",
+          "columnsFrom": [
+            "message_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.narrator_questions": {
       "name": "narrator_questions",
       "schema": "",
@@ -12622,6 +12742,30 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true
+        },
+        "context": {
+          "name": "context",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "resolution_json": {
+          "name": "resolution_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "withdraw_reason": {
+          "name": "withdraw_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "summary_json": {
+          "name": "summary_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
         },
         "execution_principal_json": {
           "name": "execution_principal_json",
@@ -12707,6 +12851,42 @@
             },
             {
               "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrator_questions_answer_message": {
+          "name": "idx_narrator_questions_answer_message",
+          "columns": [
+            {
+              "expression": "answer_message_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrator_questions_created": {
+          "name": "idx_narrator_questions_created",
+          "columns": [
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -14457,6 +14637,12 @@
         },
         "last_message_at": {
           "name": "last_message_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_stop_reason": {
+          "name": "last_stop_reason",
           "type": "text",
           "primaryKey": false,
           "notNull": false
