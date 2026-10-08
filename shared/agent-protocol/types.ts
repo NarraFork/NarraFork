@@ -31,6 +31,8 @@ export type ApiRequestDiagnosticSource =
 	| "parser";
 
 export interface ApiRequestDiagnostics {
+	/** Present only for the first-party TokenDance connection, never inferred from model names. */
+	tokendanceRecoveryAction?: import("../tokendance").TokenDanceRecoveryAction;
 	schema: "narrafork.error-diagnostics.v1";
 	source?: ApiRequestDiagnosticSource | string;
 	phase?: string;

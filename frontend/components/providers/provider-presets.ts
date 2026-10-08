@@ -7,7 +7,8 @@ export interface ProviderPreset {
 	name: string;
 	nameKey?: string;
 	endpoints: Partial<Record<AddProviderType, string>>;
-	defaultProtocol: AddProviderType;
+	category?: "api" | "platform-login";
+	defaultProtocol?: AddProviderType;
 }
 
 // Data only, adapted from @cherrystudio/provider-registry (MIT), Cherry Studio.
@@ -72,12 +73,13 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
 	preset("radeon-cloud", "AMD GPU Cloud", {
 		"completions-compatible": "https://developer.amd.com.cn/radeon/v1",
 	}),
-	preset("tokendance", "TokenDance", {
-		"anthropic-messages": "https://tokendance.space/gateway/v1",
-		"gemini-compatible": "https://tokendance.space/gateway/v1beta",
-		"completions-compatible": "https://tokendance.space/gateway/v1",
-		"openai-responses": "https://tokendance.space/gateway/v1",
-	}),
+	{
+		id: "tokendance",
+		name: "TokenDance",
+		nameKey: "providerNames.tokendance",
+		category: "platform-login",
+		endpoints: {},
+	},
 	preset("lmstudio", "LM Studio", {
 		"anthropic-messages": "http://localhost:1234/v1",
 		"completions-compatible": "http://localhost:1234/v1",

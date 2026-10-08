@@ -1,3 +1,4 @@
+import { parseTokenDanceRecoveryAction } from "../tokendance";
 import type { ApiRequestDiagnostics } from "./types";
 
 export const ERROR_DIAGNOSTICS_SCHEMA = "narrafork.error-diagnostics.v1" as const;
@@ -121,6 +122,10 @@ export function normalizeApiRequestDiagnostics(
 ): ApiRequestDiagnostics | undefined {
 	if (!input) return undefined;
 	const result: ApiRequestDiagnostics = { schema: ERROR_DIAGNOSTICS_SCHEMA };
+	if (input.provider === "tokendance") {
+		const action = parseTokenDanceRecoveryAction(input.tokendanceRecoveryAction);
+		if (action) result.tokendanceRecoveryAction = action;
+	}
 
 	const stringFields = [
 		"source",

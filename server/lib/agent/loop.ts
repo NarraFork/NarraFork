@@ -6030,6 +6030,13 @@ async function* agentLoopInMetadataSnapshot(
 						provider: effectiveProvider,
 						model: effectiveModel,
 					});
+					// TokenDance recovery requires human action: no automatic repair, replay or failover.
+					if (requestDiagnostics?.tokendanceRecoveryAction) {
+						yield* outputContent.flush();
+						yield* finishRequest(msg);
+						yield { type: "error", message: msg, diagnostics: requestDiagnostics };
+						return;
+					}
 					// Opaque upstream "malformed request body" rejection: capture the exact
 					// request before any retry/classification path can discard it.
 					if (isMalformedRequestBodyError(err)) {

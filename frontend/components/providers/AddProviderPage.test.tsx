@@ -248,6 +248,7 @@ describe("AddProviderPage interactions", () => {
 				node.getAttribute("data-provider-preset"),
 			);
 		expect(ids()).toEqual([
+			"tokendance",
 			"deepseek",
 			"zhipu",
 			"moonshot",
@@ -262,7 +263,7 @@ describe("AddProviderPage interactions", () => {
 		await type("addProviderSearch", "Groq");
 		expect(ids()).toEqual(["groq"]);
 		await type("addProviderSearch", "");
-		expect(ids().length).toBe(7);
+		expect(ids().length).toBe(8);
 	});
 
 	test("Chinese defaults the four configurable platforms to China without overriding manual choices", async () => {

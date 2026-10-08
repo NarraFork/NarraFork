@@ -15,7 +15,9 @@ import {
 import { IconArrowLeft, IconSearch } from "@tabler/icons-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { ApiError } from "../../lib/api";
 import classes from "./AddProviderPage.module.css";
+import { useTokenDanceAdd } from "./provider-add-context";
 import {
 	type AddProviderDraft,
 	draftFromPreset,
@@ -36,6 +38,7 @@ import {
 import {
 	type AddProviderType,
 	getProviderPresetName,
+	PROVIDER_PRESETS,
 	type ProviderPreset,
 	searchProviderPresets,
 } from "./provider-presets";
@@ -56,6 +59,23 @@ export function AddProviderPage({
 	onAdd: (draft: AddProviderDraft) => void | Promise<void>;
 }) {
 	const { t, i18n } = useTranslation("settings");
+	const tokenDance = useTokenDanceAdd();
+	const restoredRef = useRef(false);
+	const locallyEditedRef = useRef(false);
+	useEffect(() => {
+		const restored = tokenDance?.restoredAddPage;
+		if (!restored || restoredRef.current || locallyEditedRef.current) return;
+		restoredRef.current = true;
+		setQuery(String(restored.query ?? ""));
+		setCategory(restored.category === "all" ? "all" : "popular");
+		setPreset(PROVIDER_PRESETS.find((p) => p.id === restored.presetId) ?? null);
+		setDraft((restored.draft as AddProviderDraft | null) ?? null);
+		setConnectionSelection(
+			(restored.connectionSelection as ProviderConnectionSelection | null) ?? null,
+		);
+		setShowConfig(!!restored.showConfig);
+		tokenDance?.consumeRestoredAddPage?.();
+	}, [tokenDance?.restoredAddPage, tokenDance?.consumeRestoredAddPage]);
 	const [query, setQuery] = useState("");
 	const [category, setCategory] = useState<"popular" | "all">("popular");
 	const [connectionSelection, setConnectionSelection] =
@@ -105,7 +125,13 @@ export function AddProviderPage({
 		connectionSelection.billing === "token-plan";
 	const choose = (next: ProviderPreset) => {
 		if (submittingRef.current) return;
+		locallyEditedRef.current = true;
 		setSubmitError(null);
+		if (next.category === "platform-login") {
+			setPreset(next);
+			setShowConfig(true);
+			return;
+		}
 		const selection = getConnectionFamily(next.id)
 			? getInitialConnectionSelection(next.id, i18n.resolvedLanguage ?? i18n.language)
 			: null;
@@ -144,6 +170,7 @@ export function AddProviderPage({
 		});
 	const update = (values: Partial<AddProviderDraft>) => {
 		if (submittingRef.current) return;
+		locallyEditedRef.current = true;
 		setSubmitError(null);
 		setDraft((prev) => (prev ? { ...prev, ...values } : prev));
 	};
@@ -264,7 +291,52 @@ export function AddProviderPage({
 					</Stack>
 				</section>
 				<section className={classes.configuration} aria-label={t("addProviderConfigure")}>
-					{draft ? (
+					{preset?.category === "platform-login" ? (
+						<Stack p="md">
+							<Title order={3}>TokenDance</Title>
+							<Text>{t("tokendance.loginDescription")}</Text>
+							{submitError && <Alert color="red">{submitError}</Alert>}
+							<Button
+								loading={submitting}
+								disabled={submitting || !tokenDance}
+								onClick={() => {
+									if (submittingRef.current || !tokenDance) return;
+									submittingRef.current = true;
+									setSubmitting(true);
+									setSubmitError(null);
+									void tokenDance
+										.login({
+											query,
+											category,
+											presetId: preset.id,
+											draft,
+											connectionSelection,
+											showConfig,
+										})
+										.catch((cause) => {
+											if (mountedRef.current)
+												setSubmitError(
+													t(
+														cause instanceof ApiError &&
+															cause.data?.code === "TOKENDANCE_PREFIX_CONFLICT"
+															? "tokendance.prefixConflict"
+															: "tokendance.loginFailed",
+													),
+												);
+										})
+										.finally(() => {
+											submittingRef.current = false;
+											if (mountedRef.current) setSubmitting(false);
+										});
+								}}
+							>
+								{t("tokendance.login")}
+							</Button>
+							<Button variant="subtle" disabled={submitting} onClick={() => setShowConfig(false)}>
+								{t("addProviderBack")}
+							</Button>
+						</Stack>
+					) : draft ? (
 						<form
 							onSubmit={(event) => {
 								event.preventDefault();

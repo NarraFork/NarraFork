@@ -3,13 +3,23 @@ import {
 	isPolicyViolationCode,
 } from "@shared/agent-protocol/policy-violation";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
+import { parseTokenDanceRecoveryAction } from "@shared/tokendance";
 import {
 	isTransientTlsHandshakeError,
 	TRANSIENT_TLS_HANDSHAKE_CODE,
 } from "../net/tls-transport-error";
 import { settings } from "../settings";
 import { StreamStaleError } from "../stream-timeout";
+import { diagnosticsFromError } from "./error-diagnostics";
 import type { ApiRequestDiagnostics } from "./types";
+
+function needsTokenDanceRecovery(err: unknown): boolean {
+	const diagnostics = diagnosticsFromError(err);
+	return (
+		diagnostics?.provider === "tokendance" &&
+		!!parseTokenDanceRecoveryAction(diagnostics.tokendanceRecoveryAction)
+	);
+}
 
 /**
  * Hard cap on retry attempts for auxiliary (non-primary) AI calls — summaries,
@@ -418,10 +428,24 @@ function isContentFilterMessage(message: string): boolean {
 export function classifyInvalidState(
 	reason: string,
 	message?: string,
-	diagnostics?: Pick<ApiRequestDiagnostics, "statusCode" | "retryable" | "resumable">,
+	diagnostics?: Pick<
+		ApiRequestDiagnostics,
+		"statusCode" | "retryable" | "resumable" | "provider" | "tokendanceRecoveryAction"
+	>,
 	customRetryRules = settings.agent.customRetryRules,
 	providerRetryable?: boolean,
 ): InvalidStateClassification {
+	if (
+		diagnostics?.provider === "tokendance" &&
+		parseTokenDanceRecoveryAction(diagnostics.tokendanceRecoveryAction)
+	) {
+		return {
+			category: "non_retryable",
+			retryable: false,
+			resumable: false,
+			statusCode: diagnostics.statusCode,
+		};
+	}
 	const normalizedReason = reason.toLowerCase().trim();
 	const normalizedMessage = message?.toLowerCase() ?? "";
 	const statusCode = inferInvalidStateStatus(reason, diagnostics);
@@ -733,7 +757,7 @@ export function getPaymentRequiredErrorInfo(err: unknown): PaymentRequiredErrorI
 export function isResumableError(err: unknown): boolean {
 	// A policy violation vetoes resumability the same way it vetoes retryability:
 	// continuing from partial output would replay the violating prompt context.
-	if (extractPolicyViolationCode(err)) return false;
+	if (needsTokenDanceRecovery(err) || extractPolicyViolationCode(err)) return false;
 	if (err instanceof ProviderInvalidStateError) return err.resumable;
 	if (!err || typeof err !== "object") return false;
 	const obj = err as Record<string, unknown>;
@@ -910,7 +934,7 @@ export function isRetryableError(
 	// content itself, so auto-retry is force-disabled here — ahead of EVERY other
 	// heuristic, including user-authored custom retry rules: replaying the prompt
 	// against the same or another account is how upstream bans propagate.
-	if (extractPolicyViolationCode(err)) return false;
+	if (needsTokenDanceRecovery(err) || extractPolicyViolationCode(err)) return false;
 	// Stream stale timeout is always retryable
 	if (err instanceof StreamStaleError) return true;
 	if (err instanceof ProviderInvalidStateError) return err.retryable;
