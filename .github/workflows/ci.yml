@@ -5,12 +5,18 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      checkout-ref:
+        description: Exact source commit supplied by the release workflow
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ inputs.checkout-ref && 'release-call' || 'standalone' }}-${{ github.workflow }}-${{ inputs.checkout-ref || github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
@@ -23,9 +29,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      - name: Validate checkout reference
+        env:
+          SOURCE_REF: ${{ inputs.checkout-ref }}
+        run: |
+          if [[ -n "$SOURCE_REF" && ! "$SOURCE_REF" =~ ^[a-f0-9]{40}$ ]]; then
+            printf 'Expected a full source commit SHA\n' >&2
+            exit 1
+          fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+          ref: ${{ inputs.checkout-ref || github.sha }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.2
@@ -43,9 +58,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
+      - name: Validate checkout reference
+        env:
+          SOURCE_REF: ${{ inputs.checkout-ref }}
+        run: |
+          if [[ -n "$SOURCE_REF" && ! "$SOURCE_REF" =~ ^[a-f0-9]{40}$ ]]; then
+            printf 'Expected a full source commit SHA\n' >&2
+            exit 1
+          fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+          ref: ${{ inputs.checkout-ref || github.sha }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.2
@@ -81,9 +105,18 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4]
     steps:
+      - name: Validate checkout reference
+        env:
+          SOURCE_REF: ${{ inputs.checkout-ref }}
+        run: |
+          if [[ -n "$SOURCE_REF" && ! "$SOURCE_REF" =~ ^[a-f0-9]{40}$ ]]; then
+            printf 'Expected a full source commit SHA\n' >&2
+            exit 1
+          fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+          ref: ${{ inputs.checkout-ref || github.sha }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.2

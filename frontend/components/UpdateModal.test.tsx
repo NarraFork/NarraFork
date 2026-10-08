@@ -28,6 +28,19 @@ let container: HTMLElement;
 let client: QueryClient;
 let ready = false;
 let appliedVersion: string | undefined;
+let appliedPreparedId: string | undefined;
+const originalIdentity = {
+	id: "artifact-a",
+	version: "1.1.0",
+	sha512: "hash-a",
+	sizeBytes: 1024,
+	sourceIdentity: {
+		source: "github" as const,
+		repository: "fork/project",
+		channel: "stable" as const,
+		platform: "linux-x64",
+	},
+};
 const translation = i18next.createInstance();
 await translation
 	.use(initReactI18next)
@@ -76,6 +89,7 @@ beforeEach(() => {
 	install("localStorage", { getItem: () => null, setItem() {}, removeItem() {} });
 	ready = false;
 	appliedVersion = undefined;
+	appliedPreparedId = undefined;
 	client = new QueryClient({
 		defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
 	});
@@ -85,13 +99,15 @@ beforeEach(() => {
 	});
 	api.getUpdateStatus = async () => ({
 		ready,
+		preparedIdentity: ready ? originalIdentity : undefined,
 		version: "1.1.0",
 		canAutoRestart: true,
 		newBinaryPath: "/binary",
 		instructions: { manual: false, message: "ready" },
 	});
-	api.applyUpdate = async (version) => {
+	api.applyUpdate = async (version, preparedId) => {
 		appliedVersion = version;
+		appliedPreparedId = preparedId;
 		return { success: false, error: "test stops before restart" };
 	};
 	container = window.document.createElement("div") as unknown as HTMLElement;
@@ -262,6 +278,271 @@ function successfulCheck() {
 }
 
 describe("UpdateModal saved source changes", () => {
+	test.each([
+		"repository",
+		"hash",
+		"size",
+	])("same-version prepared artifact never adopts new %s notes", async (changed) => {
+		ready = true;
+		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		const recommendation = successfulCheck();
+		const repository = changed === "repository" ? "other/project" : "fork/project";
+		const sourceIdentity = { ...originalIdentity.sourceIdentity, repository };
+		client.setQueryData(["settings"], {
+			update: { source: "github", githubRepository: repository },
+		});
+		api.checkUpdate = async () => ({
+			...recommendation,
+			repository,
+			releaseInfo: {
+				...recommendation.releaseInfo,
+				repository,
+				sourceIdentity,
+				sha512: changed === "hash" ? "hash-b" : "hash-a",
+				files: [{ url: "unused", size: changed === "size" ? 2048 : 1024, sha512: "unused" }],
+				releaseNotes: "Wrong artifact B notes",
+			},
+		});
+		await renderBadge();
+		await openBadge();
+		expect(document.body.textContent).not.toContain("Wrong artifact B notes");
+		expect(document.body.textContent).toContain("GitHub: fork/project");
+		expect(document.body.textContent).toContain("hash-a");
+		expect(findButton(common.updateSchedule)).toBeDefined();
+		await act(async () => findButton(common.updateSchedule)?.click());
+		expect(appliedPreparedId).toBe("artifact-a");
+	});
+
+	test("an existing schedule retains its artifact after a new recommendation and a failed check", async () => {
+		const status = {
+			ready: true,
+			version: "1.1.0",
+			canAutoRestart: true,
+			preparedIdentity: originalIdentity,
+			scheduled: true,
+			targetVersion: "1.1.0",
+			phase: "draining_background_bash" as const,
+			pendingBackgroundBashCount: 1,
+			instructions: { manual: false, message: "ready" },
+		};
+		api.getUpdateStatus = async () => status;
+		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		client.setQueryData(["update-status", "1.1.0"], status);
+		const recommendation = successfulCheck();
+		api.checkUpdate = async () => ({
+			...recommendation,
+			releaseInfo: { ...recommendation.releaseInfo, releaseNotes: "Unrelated B notes" },
+		});
+		await renderBadge();
+		await openBadge();
+		expect(document.body.textContent).toContain("hash-a");
+		expect(document.body.textContent).not.toContain("Unrelated B notes");
+		expect(findButton(common.updateSchedule)).toBeUndefined();
+		api.checkUpdate = async () => {
+			throw new Error("offline");
+		};
+		await act(async () => {
+			await client.invalidateQueries({ queryKey: ["update-check"] });
+		});
+		await settle();
+		expect(document.body.textContent).toContain(common.updatePillWaiting);
+		expect(document.body.textContent).toContain("hash-a");
+		expect(client.getQueryData(["update-status", "1.1.0"])).toMatchObject({
+			scheduled: true,
+			preparedIdentity: originalIdentity,
+		});
+	});
+
+	test("legacy prepared metadata stays explicitly applicable without borrowing the current source", async () => {
+		ready = true;
+		api.getUpdateStatus = async () => ({
+			ready: true,
+			version: "1.1.0",
+			canAutoRestart: true,
+			preparedIdentity: { ...originalIdentity, sourceIdentity: null },
+			instructions: { manual: false, message: "ready" },
+		});
+		await render();
+		expect(document.body.textContent).toContain(common.updatePreparedUnknownSource);
+		expect(document.body.textContent).not.toContain("GitHub: fork/project");
+		expect(document.body.textContent).not.toContain("Old recommendation notes");
+		await act(async () => findButton(common.updateSchedule)?.click());
+		expect(appliedPreparedId).toBe("artifact-a");
+	});
+
+	test("a verified full identity match may show release notes for the prepared artifact", async () => {
+		ready = true;
+		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		const recommendation = successfulCheck();
+		api.checkUpdate = async () => ({
+			...recommendation,
+			releaseInfo: {
+				...recommendation.releaseInfo,
+				sourceIdentity: originalIdentity.sourceIdentity,
+				sha512: originalIdentity.sha512,
+				files: [
+					{ url: "unused", size: originalIdentity.sizeBytes, sha512: originalIdentity.sha512 },
+				],
+				releaseNotes: "Correct artifact A notes",
+			},
+		});
+		await renderBadge();
+		await openBadge();
+		expect(document.body.textContent).toContain("Correct artifact A notes");
+		await act(async () => findButton(common.updateSchedule)?.click());
+		expect(appliedPreparedId).toBe("artifact-a");
+	});
+
+	test("a status replacement cannot silently retarget the selected same-version artifact", async () => {
+		ready = true;
+		await render();
+		await act(async () => {
+			client.setQueryData(["update-status", "1.1.0"], {
+				ready: true,
+				version: "1.1.0",
+				canAutoRestart: true,
+				preparedIdentity: { ...originalIdentity, id: "artifact-b", sha512: "hash-b" },
+				instructions: { manual: false, message: "ready" },
+			});
+		});
+		await settle();
+		expect(document.body.textContent).toContain("hash-a");
+		await act(async () => findButton(common.updateSchedule)?.click());
+		expect(appliedPreparedId).toBe("artifact-a");
+	});
+
+	test("reopening reviews the current artifact instead of a previous SSE download result", async () => {
+		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		api.checkUpdate = async () => successfulCheck();
+		const previousFetch = globalThis.fetch;
+		install(
+			"fetch",
+			Object.assign(
+				async () =>
+					new Response(
+						`data: ${JSON.stringify({ success: true, version: "1.1.0", preparedIdentity: originalIdentity, instructions: { manual: false, message: "ready" } })}\n\n`,
+					),
+				{ preconnect: previousFetch.preconnect },
+			),
+		);
+		await renderBadge();
+		await openBadge();
+		await act(async () => findButton("Download")?.click());
+		await settle();
+		expect(document.body.textContent).toContain("hash-a");
+		const replacement = {
+			ready: true,
+			version: "1.1.0",
+			canAutoRestart: true,
+			preparedIdentity: { ...originalIdentity, id: "artifact-b", sha512: "hash-b" },
+			instructions: { manual: false, message: "ready" },
+		};
+		api.getUpdateStatus = async () => replacement;
+		await act(async () => {
+			client.setQueryData(["update-status", "1.1.0"], replacement);
+		});
+		await settle();
+		await act(async () => findButton(common.updateSchedule)?.click());
+		expect(appliedPreparedId).toBe("artifact-a");
+		await act(async () => findButton(common.close)?.click());
+		await settle();
+		await openBadge();
+		expect(document.body.textContent).toContain("hash-b");
+		expect(document.body.textContent).not.toContain("hash-a");
+		await act(async () => findButton(common.updateSchedule)?.click());
+		expect(appliedPreparedId).toBe("artifact-b");
+	});
+
+	test.each([
+		"version",
+		"repository",
+	])("a completed download cannot block a fresh %s selection", async (change) => {
+		const first = {
+			latestVersion: "1.1.0",
+			settingsKey: updateSettingsKey(githubSettings),
+			releaseInfo: {
+				...successfulCheck().releaseInfo,
+				sourceIdentity: originalIdentity.sourceIdentity,
+				sha512: originalIdentity.sha512,
+				files: [{ url: "unused", sha512: originalIdentity.sha512, size: 1024 }],
+			},
+		};
+		const version = change === "version" ? "1.2.0" : "1.1.0";
+		const repository = change === "repository" ? "other/project" : "fork/project";
+		const nextSettings = { ...githubSettings, githubRepository: repository };
+		const second = {
+			latestVersion: version,
+			settingsKey: updateSettingsKey(nextSettings),
+			releaseInfo: {
+				...first.releaseInfo,
+				version,
+				repository,
+				sha512: "hash-b",
+				sourceIdentity: { ...originalIdentity.sourceIdentity, repository },
+				files: [{ url: "unused", sha512: "hash-b", size: 1024 }],
+			},
+		};
+		let downloads = 0;
+		const previousFetch = globalThis.fetch;
+		install(
+			"fetch",
+			Object.assign(
+				async () => {
+					downloads++;
+					return new Response(
+						`data: ${JSON.stringify({
+							success: true,
+							version: downloads === 1 ? "1.1.0" : version,
+							preparedIdentity:
+								downloads === 1
+									? originalIdentity
+									: {
+											...originalIdentity,
+											id: "artifact-b",
+											version,
+											sha512: "hash-b",
+											sourceIdentity: second.releaseInfo.sourceIdentity,
+										},
+							instructions: { manual: false, message: "ready" },
+						})}\n\n`,
+					);
+				},
+				{ preconnect: previousFetch.preconnect },
+			),
+		);
+		root = createRoot(container);
+		const show = async (data: typeof first, opened: boolean) => {
+			await act(async () =>
+				root?.render(
+					<MantineProvider env="test">
+						<I18nextProvider i18n={translation}>
+							<QueryClientProvider client={client}>
+								<UpdateModal opened={opened} onClose={() => {}} data={data} />
+							</QueryClientProvider>
+						</I18nextProvider>
+					</MantineProvider>,
+				),
+			);
+			await settle();
+		};
+		await show(first, true);
+		await act(async () => findButton("Download")?.click());
+		await settle();
+		expect(downloads).toBe(1);
+		expect(document.body.textContent).toContain("hash-a");
+		await show(first, false);
+		await act(async () => {
+			client.setQueryData(["settings"], { update: nextSettings });
+		});
+		await show(second, true);
+		expect(findButton("Download")).toBeDefined();
+		expect(document.body.textContent).not.toContain(common.updatePhaseComplete);
+		await act(async () => findButton("Download")?.click());
+		await settle();
+		expect(downloads).toBe(2);
+		expect(document.body.textContent).toContain("hash-b");
+	});
+
 	test("the badge waits for saved settings, then opens a downloadable recommendation", async () => {
 		client.removeQueries({ queryKey: ["settings"] });
 		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });

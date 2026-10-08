@@ -45,6 +45,13 @@ scripts/lib/*
 !scripts/lib/release-git.ts
 # GitHub Release publisher imported by the release entry point and behavioral tests.
 !scripts/lib/github-release.ts
+# Release CI control, immutable bundles, strict native inputs and native smoke.
+!scripts/ci-release.ts
+!scripts/smoke-release-binary.ts
+!scripts/lib/ci-release-*.ts
+!scripts/lib/ci-build-*.ts
+!scripts/lib/github-release-baseline.ts
+.ci-release/
 # Imported by scripts/release.ts and tests/scripts/stable-baseline-patch*.test.ts, so it has
 # to be in the repo or both the release script and `bun test` break in a fresh clone.
 !scripts/lib/stable-baseline-patch.ts

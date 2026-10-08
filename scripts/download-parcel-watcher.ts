@@ -10,9 +10,25 @@
  * Usage:
  *   bun scripts/download-parcel-watcher.ts
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
-import { Glob } from "bun";
+import {
+	downloadWatcher,
+	lockedWatcherIdentity,
+	nativeTarget,
+	validateNativeBytes,
+	WATCHER_PACKAGES,
+	watcherCacheMatches,
+} from "./lib/ci-build-native";
 
 const ROOT = join(import.meta.dir, "..");
 const OUT_DIR = join(ROOT, "server", "generated", "parcel-watcher-binaries");
@@ -30,88 +46,61 @@ const PARCEL_VERSION: string = parcelPkg.version;
  * Key = identifier used in generated loader (also matches Bun compile targets).
  * Value = npm package name containing the `watcher.node` binary.
  */
-const PLATFORMS: Record<string, string> = {
-	"darwin-arm64": `@parcel/watcher-darwin-arm64`,
-	"darwin-x64": `@parcel/watcher-darwin-x64`,
-	"linux-x64-glibc": `@parcel/watcher-linux-x64-glibc`,
-	"linux-x64-musl": `@parcel/watcher-linux-x64-musl`,
-	"linux-arm64-glibc": `@parcel/watcher-linux-arm64-glibc`,
-	"linux-arm64-musl": `@parcel/watcher-linux-arm64-musl`,
-	"win32-x64": `@parcel/watcher-win32-x64`,
-	"win32-arm64": `@parcel/watcher-win32-arm64`,
-};
+const requestedTargets = process.argv
+	.slice(2)
+	.filter((arg) => arg.startsWith("--target="))
+	.map((arg) => arg.slice("--target=".length));
+const selectedKeys = requestedTargets.length
+	? [...new Set(requestedTargets.map((target) => nativeTarget(target).watcher))]
+	: Object.keys(WATCHER_PACKAGES);
+const PLATFORMS = Object.fromEntries(selectedKeys.map((key) => [key, WATCHER_PACKAGES[key]]));
+const lock = readFileSync(join(ROOT, "bun.lock"), "utf8");
+// Validate the installed watcher itself, not just the platform tarballs.
+lockedWatcherIdentity(lock, "@parcel/watcher", PARCEL_VERSION);
 
 // ── Download helpers ────────────────────────────────────────────────────────
 
-async function downloadAndExtract(pkgName: string, outPath: string): Promise<boolean> {
-	const tarballUrl = `https://registry.npmjs.org/${pkgName}/-/${pkgName.split("/")[1]}-${PARCEL_VERSION}.tgz`;
-
+async function downloadAndExtract(key: string, pkgName: string, outPath: string): Promise<void> {
+	const integrity = lockedWatcherIdentity(lock, pkgName, PARCEL_VERSION);
+	if (await watcherCacheMatches(outPath, key, pkgName, PARCEL_VERSION, integrity)) {
+		console.log(`  Cached native binary verified: ${key}`);
+		return;
+	}
+	console.log(`  Downloading ${pkgName}@${PARCEL_VERSION}`);
+	let tarball: Uint8Array | undefined;
+	const nodeFile = await downloadWatcher(
+		pkgName,
+		PARCEL_VERSION,
+		integrity,
+		undefined,
+		undefined,
+		(bytes) => {
+			tarball = bytes;
+		},
+	);
+	validateNativeBytes(nodeFile, key);
+	if (!tarball) throw new Error("Missing verified watcher tarball");
+	const temporary = `${outPath}.${randomUUID()}.tmp`;
 	try {
-		console.log(`  ↓ ${pkgName}@${PARCEL_VERSION}`);
-		const resp = await fetch(tarballUrl);
-		if (!resp.ok) {
-			console.warn(`  ⚠ Failed to fetch ${tarballUrl}: ${resp.status}`);
-			return false;
-		}
-
-		const tarGz = await resp.arrayBuffer();
-
-		// Decompress gzip
-		const ds = new DecompressionStream("gzip");
-		const decompressed = new Response(new Blob([tarGz]).stream().pipeThrough(ds));
-		const tarBuf = new Uint8Array(await decompressed.arrayBuffer());
-
-		// Simple tar extraction — find watcher.node in the tar
-		const nodeFile = extractFileFromTar(tarBuf, "watcher.node");
-		if (!nodeFile) {
-			console.warn(`  ⚠ watcher.node not found in ${pkgName}`);
-			return false;
-		}
-
-		writeFileSync(outPath, nodeFile);
-		console.log(`  ✓ ${outPath} (${(nodeFile.length / 1024).toFixed(0)}KB)`);
-		return true;
-	} catch (err) {
-		console.warn(`  ⚠ Error downloading ${pkgName}: ${err}`);
-		return false;
+		writeFileSync(temporary, nodeFile, { flag: "wx" });
+		renameSync(temporary, outPath);
+		writeFileSync(temporary, tarball, { flag: "wx" });
+		renameSync(temporary, `${outPath}.tgz`);
+		writeFileSync(
+			temporary,
+			JSON.stringify({
+				name: pkgName,
+				version: PARCEL_VERSION,
+				integrity,
+				sha256: createHash("sha256").update(nodeFile).digest("hex"),
+			}),
+			{ flag: "wx" },
+		);
+		renameSync(temporary, `${outPath}.json`);
+	} finally {
+		rmSync(temporary, { force: true });
 	}
-}
-
-/**
- * Extract a file from a tar archive (uncompressed).
- * Simple implementation that handles POSIX tar format.
- */
-function extractFileFromTar(tar: Uint8Array, targetName: string): Uint8Array | null {
-	let offset = 0;
-	const decoder = new TextDecoder();
-
-	while (offset < tar.length - 512) {
-		// Read header
-		const header = tar.slice(offset, offset + 512);
-
-		// Check for empty block (end of archive)
-		if (header.every((b) => b === 0)) break;
-
-		// File name: bytes 0-99
-		const nameRaw = decoder.decode(header.slice(0, 100)).replace(/\0/g, "");
-		// Size: bytes 124-135 (octal)
-		const sizeStr = decoder.decode(header.slice(124, 136)).replace(/\0/g, "").trim();
-		const size = Number.parseInt(sizeStr, 8) || 0;
-
-		// Data starts after header
-		const dataStart = offset + 512;
-		const dataEnd = dataStart + size;
-
-		// Check if this is the file we want (may be prefixed with "package/")
-		if (nameRaw.endsWith(targetName) || nameRaw === targetName) {
-			return tar.slice(dataStart, dataEnd);
-		}
-
-		// Move to next entry (data is padded to 512-byte blocks)
-		offset = dataStart + Math.ceil(size / 512) * 512;
-	}
-
-	return null;
+	console.log(`  Verified ${key} (${nodeFile.length} bytes)`);
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -122,29 +111,17 @@ if (!existsSync(OUT_DIR)) {
 
 console.log(`Downloading @parcel/watcher v${PARCEL_VERSION} native binaries...\n`);
 
-const results: Array<{ key: string; success: boolean }> = [];
-
+if (!lstatSync(OUT_DIR).isDirectory() || lstatSync(OUT_DIR).isSymbolicLink()) {
+	throw new Error("Watcher cache must be a real directory");
+}
+const succeeded: Array<{ key: string }> = [];
 for (const [key, pkgName] of Object.entries(PLATFORMS)) {
 	const outPath = join(OUT_DIR, `watcher-${key}.node`);
-
-	// Skip if already downloaded (same version)
-	if (existsSync(outPath)) {
-		console.log(`  ✓ ${key} (cached)`);
-		results.push({ key, success: true });
-		continue;
-	}
-
-	const success = await downloadAndExtract(pkgName, outPath);
-	results.push({ key, success });
+	// A missing required dependency must never produce a partial loader.
+	await downloadAndExtract(key, pkgName, outPath);
+	succeeded.push({ key });
 }
-
-const succeeded = results.filter((r) => r.success);
-const failed = results.filter((r) => !r.success);
-
-console.log(`\n✅ Downloaded ${succeeded.length}/${results.length} platform binaries`);
-if (failed.length > 0) {
-	console.warn(`⚠ Failed: ${failed.map((r) => r.key).join(", ")}`);
-}
+console.log(`\nVerified ${succeeded.length}/${selectedKeys.length} platform binaries`);
 
 // ── Generate loader file ────────────────────────────────────────────────────
 

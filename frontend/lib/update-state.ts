@@ -1,3 +1,5 @@
+import type { PreparedUpdateIdentity } from "@shared/update-identity";
+
 export type UpdateCoordinationPhase =
 	| "idle"
 	| "draining"
@@ -72,6 +74,7 @@ export interface UpdateInstructions {
  */
 export interface PreparedUpdateStatus {
 	ready: boolean;
+	preparedIdentity?: PreparedUpdateIdentity;
 	updateFile?: string;
 	canAutoRestart: boolean;
 	newBinaryPath?: string;

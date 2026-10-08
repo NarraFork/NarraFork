@@ -6,45 +6,23 @@ const PROVIDER_PROTOCOL = "1.0";
 const MAX_HEADER_BYTES = 8 * 1024;
 // Provider requests carry full histories; inbound host responses share this bounded parser.
 const MAX_FRAME_BYTES = 64 * 1024 * 1024;
-const MAX_BUFFER_BYTES = MAX_HEADER_BYTES + MAX_FRAME_BYTES + 4;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
-let buffer = new Uint8Array(0);
+const headerBuffer = new Uint8Array(MAX_HEADER_BYTES + 4);
+let headerLength = 0;
+let bodyBuffer;
+let bodyReceived = 0;
+let framingPhase = "idle";
 let initialized = false;
 let active = false;
 let runtimeId;
 let generation;
 
 function append(left, right) {
-	const length = left.byteLength + right.byteLength;
-	if (left.buffer instanceof ArrayBuffer && left.byteOffset + length <= left.buffer.byteLength) {
-		const next = new Uint8Array(left.buffer, left.byteOffset, length);
-		next.set(right, left.byteLength);
-		return next;
-	}
-	// Geometric growth avoids repeatedly copying a multi-MiB history for each stdin chunk.
-	const capacity = Math.max(
-		length,
-		Math.min(MAX_BUFFER_BYTES, Math.max(64 * 1024, left.buffer.byteLength * 2)),
-	);
-	const next = new Uint8Array(capacity);
+	const next = new Uint8Array(left.byteLength + right.byteLength);
 	next.set(left);
 	next.set(right, left.byteLength);
-	return next.subarray(0, length);
-}
-
-function delimiterIndex(bytes) {
-	for (let index = 0; index <= bytes.byteLength - 4; index += 1) {
-		if (
-			bytes[index] === 13 &&
-			bytes[index + 1] === 10 &&
-			bytes[index + 2] === 13 &&
-			bytes[index + 3] === 10
-		) {
-			return index;
-		}
-	}
-	return -1;
+	return next;
 }
 
 function contentLength(header) {
@@ -453,34 +431,56 @@ function handleMessage(message) {
 	handleRequest(message);
 }
 
-function parseFrames() {
-	while (buffer.byteLength > 0) {
-		const delimiter = delimiterIndex(buffer);
-		if (delimiter < 0) {
-			if (buffer.byteLength > MAX_HEADER_BYTES) throw new Error("RPC header exceeds limit");
-			return;
+function parseFrames(chunk) {
+	let offset = 0;
+	while (offset < chunk.byteLength) {
+		if (bodyBuffer === undefined) {
+			framingPhase = "header";
+			headerBuffer[headerLength++] = chunk[offset++];
+			const delimiter = headerLength - 4;
+			if (
+				delimiter < 0 ||
+				headerBuffer[delimiter] !== 13 ||
+				headerBuffer[delimiter + 1] !== 10 ||
+				headerBuffer[delimiter + 2] !== 13 ||
+				headerBuffer[delimiter + 3] !== 10
+			) {
+				if (headerLength === headerBuffer.byteLength) throw new Error("RPC header exceeds limit");
+				continue;
+			}
+			const length = contentLength(decoder.decode(headerBuffer.subarray(0, delimiter)));
+			if (length > MAX_FRAME_BYTES) throw new Error("RPC frame exceeds limit");
+			// Allocate exactly once, after validating Content-Length. Geometric growth,
+			// per-chunk copies and a final body slice amplify large requests and can
+			// exhaust the production runner's address-space limit before decoding.
+			framingPhase = "body-allocation";
+			bodyBuffer = new Uint8Array(length);
+			headerLength = 0;
 		}
-		if (delimiter > MAX_HEADER_BYTES) throw new Error("RPC header exceeds limit");
-		const length = contentLength(decoder.decode(buffer.slice(0, delimiter)));
-		if (length > MAX_FRAME_BYTES) throw new Error("RPC frame exceeds limit");
-		const bodyStart = delimiter + 4;
-		const frameEnd = bodyStart + length;
-		if (buffer.byteLength < frameEnd) return;
-		const message = JSON.parse(decoder.decode(buffer.slice(bodyStart, frameEnd)));
-		buffer = buffer.slice(frameEnd);
+		framingPhase = "body-copy";
+		const count = Math.min(bodyBuffer.byteLength - bodyReceived, chunk.byteLength - offset);
+		bodyBuffer.set(chunk.subarray(offset, offset + count), bodyReceived);
+		offset += count;
+		bodyReceived += count;
+		if (bodyReceived < bodyBuffer.byteLength) continue;
+		framingPhase = "body-decode";
+		const json = decoder.decode(bodyBuffer);
+		framingPhase = "json-parse";
+		const message = JSON.parse(json);
+		bodyBuffer = undefined;
+		bodyReceived = 0;
+		framingPhase = "dispatch";
 		handleMessage(message);
 	}
 }
 
 process.stdin.on("data", (chunk) => {
 	try {
-		buffer = append(buffer, new Uint8Array(chunk));
-		parseFrames();
-		if (buffer.byteLength > MAX_BUFFER_BYTES) throw new Error("RPC input buffer exceeds limit");
+		parseFrames(chunk);
 	} catch (error) {
-		// Diagnostics only; never log request content.
+		// Diagnostics only; never log request content or JSON parse error messages.
 		process.stderr.write(
-			`RPC framing failure (${error instanceof Error ? error.name : "unknown"}, buffered=${buffer.byteLength})\n`,
+			`RPC framing failure (${error instanceof Error ? error.name : "unknown"}, phase=${framingPhase}, buffered=${headerLength + bodyReceived})\n`,
 		);
 		process.exit(2);
 	}

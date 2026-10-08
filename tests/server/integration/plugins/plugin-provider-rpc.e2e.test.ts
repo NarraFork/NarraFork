@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { runInNewContext } from "node:vm";
 import { parseManifest } from "@server/lib/plugins/manifest";
 import { PROVIDER_REQUEST_MAX_BYTES } from "@server/lib/plugins/protocol";
 import { PluginManager } from "@server/services/plugin-manager";
@@ -124,7 +125,122 @@ function chatParams(model: string) {
 	};
 }
 
+// Exercise the shipped stdin callback with controlled chunk boundaries and count its
+// byte-buffer allocations, independently of nondeterministic subprocess GC timing.
+async function framingHarness() {
+	let receive: (chunk: Uint8Array) => void = () => {
+		throw new Error("stdin handler not installed");
+	};
+	let allocatedBytes = 0;
+	let stderr = "";
+	const messages: { id?: number; result?: unknown }[] = [];
+	const TrackedBytes = new Proxy(Uint8Array, {
+		construct(target, args) {
+			const bytes = Reflect.construct(target, args) as Uint8Array;
+			// ArrayBuffer overloads are views, not allocations. Input chunks are made
+			// outside this realm so the counter measures only receiver-owned copies.
+			if (!(args[0] instanceof ArrayBuffer)) allocatedBytes += bytes.byteLength;
+			// Keep slice/subarray species in this instrumentation too; views remain
+			// free, whereas a final whole-body slice must count as a second body.
+			Object.defineProperty(bytes, "constructor", { value: TrackedBytes });
+			return bytes;
+		},
+	});
+	runInNewContext(await readFile(join(exampleRoot, "server/index.js"), "utf8"), {
+		Uint8Array: TrackedBytes,
+		ArrayBuffer,
+		TextEncoder,
+		TextDecoder,
+		process: {
+			env: {},
+			stdin: {
+				on(event: string, callback: (chunk: Uint8Array) => void) {
+					if (event === "data") receive = callback;
+				},
+			},
+			stdout: {
+				write(bytes: Uint8Array, callback?: () => void) {
+					const text = new TextDecoder().decode(bytes);
+					messages.push(JSON.parse(text.slice(text.indexOf("\r\n\r\n") + 4)));
+					callback?.();
+				},
+			},
+			stderr: {
+				write(text: string) {
+					stderr += text;
+				},
+			},
+			exit(code: number) {
+				throw new Error(`Example provider exited ${code}: ${stderr}`);
+			},
+		},
+	});
+	return { receive, messages, allocatedBytes: () => allocatedBytes, stderr: () => stderr };
+}
+
+function rpcFrame(id: number, text = "") {
+	const body = new TextEncoder().encode(
+		JSON.stringify({ jsonrpc: "2.0", id, method: "health", params: { text } }),
+	);
+	return Buffer.concat([Buffer.from(`Content-Length: ${body.byteLength}\r\n\r\n`), body]);
+}
+
 describe("provider plugin over real stdio RPC", () => {
+	test("receiver allocates one body buffer for a fragmented 36 MiB payload", async () => {
+		const harness = await framingHarness();
+		const frame = rpcFrame(1, "AAAA".repeat(9 * 1024 * 1024));
+		for (let offset = 0; offset < frame.byteLength; offset += 64 * 1024) {
+			harness.receive(frame.subarray(offset, offset + 64 * 1024));
+		}
+		expect(harness.messages.filter((message) => message.id === 1)).toHaveLength(1);
+		// Header bookkeeping and small replies get 512 KiB, but neither geometric
+		// body growth nor copying each chunk may allocate another full payload.
+		expect(harness.allocatedBytes()).toBeLessThan(frame.byteLength + 512 * 1024);
+	});
+
+	test("receiver handles split UTF-8, delimiters and coalesced frames", async () => {
+		const harness = await framingHarness();
+		const first = rpcFrame(1, "文");
+		for (const byte of first) harness.receive(Uint8Array.of(byte));
+		harness.receive(Buffer.concat([rpcFrame(2), rpcFrame(3)]));
+		expect(harness.messages.filter((message) => message.id !== undefined).map((m) => m.id)).toEqual(
+			[1, 2, 3],
+		);
+	});
+
+	test.each([
+		`Content-Length: ${PROVIDER_REQUEST_MAX_BYTES + 1}\r\n\r\n`,
+		"Content-Length: -1\r\n\r\n",
+		"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}",
+		"X".repeat(8 * 1024 + 4),
+	])("receiver rejects an invalid header before body allocation (%#)", async (header) => {
+		const harness = await framingHarness();
+		expect(() => harness.receive(Buffer.from(header))).toThrow("Example provider exited 2");
+		expect(harness.allocatedBytes()).toBeLessThan(32 * 1024);
+	});
+
+	test.each([
+		[Buffer.from([0xff]), "body-decode"],
+		[Buffer.from("request-secret-not-json"), "json-parse"],
+		[Buffer.alloc(0), "json-parse"],
+	] as const)("receiver rejects malformed bodies without logging their contents (%#)", async (body, phase) => {
+		const harness = await framingHarness();
+		const frame = Buffer.concat([Buffer.from(`Content-Length: ${body.byteLength}\r\n\r\n`), body]);
+		expect(() => harness.receive(frame)).toThrow("Example provider exited 2");
+		expect(harness.stderr()).toContain(`phase=${phase}`);
+		expect(harness.stderr()).not.toContain("request-secret");
+	});
+
+	test("receiver accepts the maximum header split across the final delimiter", async () => {
+		const harness = await framingHarness();
+		const body = Buffer.from('{"jsonrpc":"2.0","id":1,"method":"health"}');
+		const prefix = `Content-Length: ${body.byteLength}\r\nX-Padding: `;
+		const header = Buffer.from(`${prefix}${"x".repeat(8 * 1024 - prefix.length)}\r\n\r\n`);
+		harness.receive(header.subarray(0, header.byteLength - 1));
+		harness.receive(Buffer.concat([header.subarray(-1), body]));
+		expect(harness.messages.filter((message) => message.id === 1)).toHaveLength(1);
+	});
+
 	test("e2e fixture stays in sync with the shipped example plugin", async () => {
 		// The fixture exists so the test does not depend on the examples tree layout,
 		// but a drift between them would mean this test stops covering what we ship.

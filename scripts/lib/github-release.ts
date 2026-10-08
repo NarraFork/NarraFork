@@ -11,7 +11,7 @@ import {
 	parseReleasePatchName,
 	validateReleasePatchMetadata,
 } from "../../shared/release-patch";
-import { isValidReleaseVersion } from "../../shared/release-version";
+import { compareReleaseVersions, isValidReleaseVersion } from "../../shared/release-version";
 import { type BinaryMetadata, formatChecksumsReport, formatSha256Sums } from "./binary-metadata";
 
 const MAX_BINARY_BYTES = MAX_RELEASE_BINARY_BYTES;
@@ -88,6 +88,8 @@ export interface GitHubReleaseOptions {
 	commit: string;
 	changelog?: string | Record<string, string>;
 	dryRun?: boolean;
+	/** CI opt-in; local publishing keeps its existing behavior. */
+	preventStableLatestRollback?: boolean;
 	run?: GhRunner;
 }
 
@@ -430,6 +432,55 @@ async function verifyAsset(
 	await rm(path);
 }
 
+/** Run immediately before draft creation and again before changing latest. */
+async function assertStableLatestDoesNotRegress(
+	run: GhRunner,
+	repository: string,
+	version: string,
+): Promise<void> {
+	for (let page = 1; page <= 10; page++) {
+		const output = await run([
+			"api",
+			`repos/${repository}/releases?per_page=100&page=${page}`,
+			"--jq",
+			"[.[] | {tag_name, draft, prerelease}]",
+		]);
+		if (Buffer.byteLength(output) > GH_MAX_OUTPUT_BYTES)
+			throw new Error("Release listing exceeds output limit");
+		const releases = JSON.parse(output) as {
+			tag_name: string;
+			draft: boolean;
+			prerelease: boolean;
+		}[];
+		if (
+			!Array.isArray(releases) ||
+			releases.length > 100 ||
+			releases.some(
+				(release) =>
+					typeof release?.tag_name !== "string" ||
+					typeof release.draft !== "boolean" ||
+					typeof release.prerelease !== "boolean",
+			)
+		) {
+			throw new Error("Invalid release listing for stable latest guard");
+		}
+		for (const release of releases) {
+			const previous = release.tag_name.startsWith("v") ? release.tag_name.slice(1) : "";
+			if (
+				!release.draft &&
+				!release.prerelease &&
+				isValidReleaseVersion(previous) &&
+				releaseChannel(previous) === "stable" &&
+				compareReleaseVersions(previous, version) > 0
+			) {
+				throw new Error(`Refusing stable latest rollback from ${previous} to ${version}`);
+			}
+		}
+		if (releases.length < 100) return;
+	}
+	throw new Error("Stable latest guard pagination limit reached");
+}
+
 /** Drafts remain on any failure; public releases are immutable and must match exactly. */
 export async function publishGitHubRelease(
 	options: GitHubReleaseOptions,
@@ -449,6 +500,9 @@ export async function publishGitHubRelease(
 		// Require an explicitly pushed tag rather than silently using GitHub's default branch.
 		await verifyRemoteTag(run, repository, tag, options.commit);
 		let release = await getRelease(run, repository, tag);
+		if (options.preventStableLatestRollback && !prerelease && (!release || release.draft)) {
+			await assertStableLatestDoesNotRegress(run, repository, options.version);
+		}
 		if (!release) {
 			const notesPath = join(directory, "release-notes.txt");
 			await writeFile(notesPath, body);
@@ -504,6 +558,9 @@ export async function publishGitHubRelease(
 		}
 		await verifyRemoteTag(run, repository, tag, options.commit);
 		if (!alreadyPublished) {
+			if (options.preventStableLatestRollback && !prerelease) {
+				await assertStableLatestDoesNotRegress(run, repository, options.version);
+			}
 			await run([
 				"release",
 				"edit",

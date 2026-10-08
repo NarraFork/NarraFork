@@ -23,6 +23,8 @@
 - **客户端默认来源是 GitHub**（仓库 `NarraFork/NarraFork`，须由仓库所有者在上线前公开）；设置页可二选一使用 GitHub Release 或自部署更新服务器，不自动跨源回退。**发布脚本默认仍是 `update-server`**，不因客户端默认来源改变而自动切换。
 - **旧配置迁移**：已有显式来源优先；旧自定义服务器地址或非默认 product 保留 `update-server`；未配置、空地址或原内置官方地址且默认 product 迁移为 GitHub。切换来源保留另一种来源的配置，检查使用已保存配置。rg/zstd/executor 仍读取保留的工具服务器地址。
 - **检测与下载**：stable 排除 draft/prerelease，beta 同时考虑 stable 与 prerelease，按语义版本排序；精确匹配平台（包括 x64-baseline），校验 sidecar 中的 SHA512 和大小。检测失败、限流、无 Release 和平台缺失不会显示为“已经最新”；元数据单请求 10 秒、检测总预算 30 秒，最多 5 页，每页 100 条。完整二进制流式下载最大 1 GiB、最长 15 分钟，可取消；下载前重新检查可信元数据，源/仓库或版本改变要求重新检测。
+- **配置与准备包身份**：检测开始时冻结生效的来源、仓库或服务器/product、channel、platform；下载前及写入准备记录前再次核对。变化要求重新检测，不能把旧通道/产品的结果下载成新配置的包。保存来源设置不删除旧准备包或取消已有调度；界面按来源、版本、SHA512 和大小匹配推荐，旧元数据缺来源时明确显示“未知来源”，不从当前设置反推。
+- **应用 API**：`GET /api/update/status` 的 `preparedIdentity.id` 绑定已验证文件及其来源；`POST /api/update/apply` 必须提交该 `preparedId`（可同时提交 `version`）。缺失或过期选择器返回 409，不再仅凭版本号选择文件。旧包仍可通过查询所得的选择器显式应用；已进入调度的准备包不能被另一次下载替换。选择器不是授权令牌，接口仍要求管理员权限。
 - `--target=github|update-server` 选择发布目标；GitHub 仓库可用 `--github-repository=owner/repo` 覆盖，默认 `NarraFork/NarraFork`。GitHub 认证使用已登录的 `gh` / `GH_TOKEN`；GitHub 路径不会读取旧更新服务器令牌或查询其基线。
 - **真实发布只能在主仓库工作区原地执行**，不能使用隔离 worktree。GitHub 路径额外检查这一点；本工作区只能开发代码和做模拟测试，不得真实发布。
 - GitHub 使用**完整主程序二进制 + 可选 zstd patch 对**；缺少 patch 时仍可发布并全量升级。旧更新服务器继续支持原有增量升级。helper / executor 仍走原有分发，不迁移到主程序 GitHub Release。
@@ -51,9 +53,56 @@ bun scripts/release.ts 0.6.1 --target=github --platform=windows-x64
 bun scripts/release.ts 0.6.1 --target=github --platform=windows-x64 --upload-only --dry-run
 ```
 
-## GitHub / 未来 CI 的增量资产约定
+## GitHub Release CI
 
-客户端不依赖发布方式：本地 CLI 或未来 GitHub CI 只需发布相同的资产集合，无需旧更新服务器参与。启用 CI 后可不再运行本地发布脚本；本文约定资产格式与验收，不要求现在新增 workflow。
+`.github/workflows/release.yml` 是主程序专用入口，仅支持从本仓库 `main` 手动触发。先把版本号和双语 `changelogs/v<version>.json` 提交到 main，再由维护者显式创建和推送 tag。CI 不 bump、commit、tag 或 push，不改变本地发布脚本默认的旧更新服务器目标。
+
+输入为 `tag`、默认 `false` 的 `publish`、可选 `source_run_id`。默认流程只构建验收，不创建 draft，也不公开 Release：
+
+```text
+preflight（固定 tag SHA、版本、changelog、基线）
+  → 可复用 CI（静态、build/typecheck、前后端全仓四片、CI Gate）
+  → 八平台严格构建 → 八平台原生 smoke
+  → 基线 patch、统一 checksum、离线 publisher 校验 → 不可变 bundle
+  → publish=true 时等待 release Environment 审批
+  → 再验 tag 与 bundle → draft → 上传 → 远端完整校验 → publish
+```
+
+### 平台与严格构建
+
+Linux/Windows 三种 target（x64、x64-baseline、arm64）在 Ubuntu 24.04 交叉编译；macOS x64/arm64 在对应 macOS runner 编译并使用系统 codesign。每个平台独立 checkout。使用 `--release-ci` 构建时，Bun/commit、原生库完整性、macOS 签名、sidecar/checksum 都必须有效，并禁止隐式从旧 `dist/` 寻找 patch 基线。
+
+原生 smoke 运行下载的原始二进制，不重编、不补签；临时 HOME/数据库、loopback 端口、`--no-auto-resume`，关闭隔离实例的 VNet/UDP，验证启动、内嵌前端、数据库、watcher 和 PTY。smoke runner 的 PATH 不应包含 dtach，否则为避免派生守护进程越出本次进程树而预检失败；本地复现可用临时 PATH 排除它，不要卸载全局工具或停止既有服务。baseline target 在现代 x64 runner 上运行成功不等于已在无 AVX2 的旧 CPU 上验证。macOS 仅 ad-hoc 签名，不包含 Developer ID/公证；Windows 不包含 Authenticode。
+
+### 启用与发布
+
+维护者必须先创建 `release` Environment，配置 required reviewers 和仅允许 `main` 的分支规则。预检不能确认保护规则时会失败；workflow 不自动创建无保护环境。允许维护者自审以适配单维护者仓库。仅 publish job 获得 `contents: write`；其余 job 不持有发布写权限，publisher 不安装依赖、不执行 bundle 内程序。
+
+示例（以下命令会触发远端任务，应由维护者按实际版本明确执行）：
+
+```bash
+# 首先只构建验收
+gh workflow run release.yml --ref main -f tag=v0.9.0 -F publish=false
+
+# 使用上一步成功封存的原始 bundle 发布，run ID 替换为实际值
+gh workflow run release.yml --ref main -f tag=v0.9.0 -F publish=true -f source_run_id=123456789
+```
+
+版本规则不变：`x.y.0` 为 stable，其余为 beta/prerelease；新 stable 不得把 latest 回退到更旧版本。发布作业跨版本串行，不主动取消运行中的发布；这不承诺 FIFO 队列。
+
+### 资产与恢复
+
+每个平台只上传 binary + sidecar，统一汇总时重验八个平台，再生成版本化 `SHA256SUMS` 和 `checksums.txt`，不会用矩阵局部 checksum 相互覆盖。首发没有基线时允许 full-only；已有基线时按精确 Release/asset ID 下载原始 binary，核对 sidecar/hash 后生成 patch 并实际重建验 hash。网络错误、限流、分页截断或损坏基线不能当作“没有基线”；patch 不小于 full 时明确省略。
+
+bundle artifact 命名为 `release-bundle-<runId>-<runAttempt>`，保留 30 天，包含 `manifest.json` 和 `dist/`。CI manifest 记录控制 workflow SHA、目标 SHA、工具链、基线、每文件 hash/size 与八平台 smoke 结果；它不是公开 Release 的额外资产。
+
+失败恢复请**新建一次 dispatch，传原始构建的 `source_run_id`**，不要依赖 Re-run failed jobs 混合不同 attempt 的 artifact。恢复会验证原 run 的仓库、main workflow、逐项 job 结果、精确 artifact ID/digest 和完整文件内容；源 run 的发布步骤失败不妨碍恢复已验收的 bundle。恢复不重新编译、签名、选基线或生成 checksum。artifact 过期、证据不完整或内容不一致即失败，不自动重编替代。失败 draft 保留；公开版本不可覆盖、补传或删除。
+
+旧更新服务器桥接、executor/helper 分发、自动版本准备、自动推送与签名证书管理不在此 workflow 范围。上线报告必须区分本地测试、在线 `publish=false` 验收和真实发布，不能把模拟测试称为在线发布成功。
+
+## GitHub / CI 的增量资产约定
+
+客户端不依赖发布方式：本地 CLI 和 GitHub CI 发布相同的资产集合，无需旧更新服务器参与。启用 CI 后可不再运行本地发布脚本。
 
 - 保留每个平台完整二进制、`.metadata.json` 和两份版本化聚合 checksum；仅有 patch 而没有 full 不构成可用 Release。
 - 紧邻基线 patch 为 `<binary>.zstd-patch` + `<binary>.zstd-patch.meta.json`；其他基线直达 patch 为 `<binary>.from-<fromVersion>.zstd-patch` + 同名 `.meta.json`。`<binary>` 含目标版本与精确平台后缀（Windows 保留 `.exe`）；同一目标可上传多个源版本，不覆盖已有命名。
@@ -68,7 +117,7 @@ bun scripts/release.ts 0.6.1 --target=github --platform=windows-x64 --upload-onl
 
 ## 正式版（stable）直达增量包（旧更新服务器）
 
-以下自动补包逻辑仅属于 `--target=update-server`；GitHub 发布器只上传本地已准备的 patch 对，不向旧服务器寻找基线。GitHub stable 直达包可由构建或未来 CI 按上述 `.from-<version>` 约定生成。
+以下自动补包逻辑仅属于 `--target=update-server`；GitHub 发布器只上传本地已准备的 patch 对，不向旧服务器寻找基线。GitHub Release CI 按上述 `.from-<version>` 约定生成 stable 直达包，不访问旧更新服务器。
 
 构建只会生成「紧邻上一个版本 → 当前版本」这一条 patch，这对逐版本跟进的 beta 用户是对的，但正式版用户只跟 stable，中间隔着一堆 beta 版本时会被迫连续应用多个 patch。因此**一个版本成为正式版时，额外生成并上传「上一个正式版 → 该版本」的直达 patch**：
 

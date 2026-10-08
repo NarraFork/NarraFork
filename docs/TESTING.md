@@ -84,3 +84,12 @@ bun server/index.ts --no-auto-resume
 在绝对路径包含 `.worktrees` 的本地 worktree 中，Biome 的 `!**/.worktrees` 排除可能使根目录检查处理 0 文件，不能把它当作通过。本地验证可使用临时配置，仅移除该路径排除并关闭 VCS 忽略，保留全部代码检查规则和其余排除；必须核对实际处理文件数大于零。正式 CI 的普通 checkout 使用原配置。
 
 如果在工作区内建立临时干净检出，先完成外层全仓测试，副本存在期间只从副本根目录运行测试，清理本次创建的副本后再运行外层测试，避免递归发现重复测试。存量检查/测试失败必须记录并修复，不能靠自动重试、缩小扫描范围或跳过断言把门禁染绿。
+
+## Release CI 与默认 CI 的区别
+
+- `ci.yml` 同时支持 `workflow_call`。发布调用传入固定的完整 commit SHA，三类源任务使用相同 SHA；普通 PR 仍检查 GitHub 提供的 merge SHA，不因为发布复用而改为 PR head。两种调用并发组隔离。
+- `release.yml` 默认手动 build-only，先运行同样的静态检查、build/typecheck 和完整四分片，再对八个平台构建最终二进制并进行原生 smoke。后端测试没有被二进制 smoke 替代。
+- smoke 不在源码开发目录运行应用，不依赖项目 node_modules；独立 HOME/数据库、loopback 端口、`--no-auto-resume`。必须真实完成启动、前端、数据库、watcher 和 PTY 检查，才能产生成功 `smoke.json`。失败日志可保留，但不能代替成功结果。
+- 发布恢复依赖源 run 的逐项成功 job 与精确 artifact digest，并重新核对 bundle 内容。仅“有 artifact”或“有 JUnit”都不是成功证明。构建失败、smoke 失败、取消、必需 job 跳过不能发布。
+- 新测试入口为 `tests/scripts/release-ci-*.test.ts` 和 `tests/scripts/ci-build-*.test.ts`。本地 fixture/mock 测试不证明托管 runner 原生二进制可运行；上线前仍需完整的 `publish=false` 运行。所有测试子集均加 `--isolate`。
+- 原生 smoke 不证明 x64-baseline 已在无 AVX2 CPU 验证，也不包含 macOS Developer ID/公证或 Windows Authenticode。默认 CI 的 opt-in 数据库/专用镜像边界保持不变。

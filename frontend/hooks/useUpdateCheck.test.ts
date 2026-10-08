@@ -1,15 +1,18 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import type { UpdateSourceIdentity } from "@shared/update-identity";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import i18n from "i18next";
 import { parseHTML } from "linkedom";
 import { createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { api } from "../lib/api";
-import { updateCheckErrorKey, updateSettingsKey } from "../lib/update-source";
+import { ApiError, api } from "../lib/api";
+import { sameUpdateSource, updateCheckErrorKey, updateSettingsKey } from "../lib/update-source";
 import commonEn from "../locales/en/common.json";
 import commonZh from "../locales/zh-CN/common.json";
 import { useInstanceSettings } from "./useInstanceSettings";
 import {
 	extractUpdateFailureDiagnostic,
+	useUpdateApply,
 	useUpdateCheck,
 	useUpdateDownload,
 } from "./useUpdateCheck";
@@ -141,6 +144,8 @@ const originalCheckUpdate = api.checkUpdate;
 const originalGetSettings = api.getSettings;
 const originalUpdateSettings = api.updateSettings;
 const originalFetch = globalThis.fetch;
+const originalApplyUpdate = api.applyUpdate;
+let applyState: ReturnType<typeof useUpdateApply> | undefined;
 let downloadState: ReturnType<typeof useUpdateDownload> | undefined;
 let settingsState: ReturnType<typeof useInstanceSettings> | undefined;
 
@@ -149,12 +154,19 @@ function DownloadHarness() {
 	return null;
 }
 
+function ApplyHarness() {
+	applyState = useUpdateApply();
+	return null;
+}
+
 function SettingsHarness() {
 	settingsState = useInstanceSettings();
 	return null;
 }
 
-async function mountHarness(component: typeof DownloadHarness | typeof SettingsHarness) {
+async function mountHarness(
+	component: typeof DownloadHarness | typeof SettingsHarness | typeof ApplyHarness,
+) {
 	if (!queryClient || !root) throw new Error("harness is not initialized");
 	root.render(
 		createElement(QueryClientProvider, { client: queryClient }, createElement(component)),
@@ -216,6 +228,8 @@ afterEach(async () => {
 	api.checkUpdate = originalCheckUpdate;
 	api.getSettings = originalGetSettings;
 	api.updateSettings = originalUpdateSettings;
+	api.applyUpdate = originalApplyUpdate;
+	applyState = undefined;
 	globalThis.fetch = originalFetch;
 	downloadState = undefined;
 	settingsState = undefined;
@@ -254,6 +268,7 @@ describe("update source behavior", () => {
 			"NO_RELEASE",
 			"SCAN_LIMIT_REACHED",
 			"UPDATE_SOURCE_CHANGED",
+			"UPDATE_ARTIFACT_CHANGED",
 		]) {
 			const key = updateCheckErrorKey(code) as keyof typeof commonEn;
 			expect(key).not.toBe("updateCheckFailed");
@@ -334,7 +349,7 @@ describe("update source behavior", () => {
 		files: [{ url: "untrusted", size: 1, sha512: "hash" }],
 	};
 
-	test("download sends expected source/repository beside the legacy version payload", async () => {
+	test("download sends the release hash beside the legacy source/version payload", async () => {
 		let body: unknown;
 		globalThis.fetch = (async (_url: Parameters<typeof fetch>[0], init?: RequestInit) => {
 			body = JSON.parse(String(init?.body));
@@ -344,7 +359,7 @@ describe("update source behavior", () => {
 		await downloadState?.download(releaseInfo);
 		await settle();
 		expect(body).toEqual({
-			releaseInfo: { version: releaseInfo.version },
+			releaseInfo: { version: releaseInfo.version, sha512: releaseInfo.sha512 },
 			source: "github",
 			repository: "fork/project",
 			retry: false,
@@ -373,21 +388,139 @@ describe("update source behavior", () => {
 		expect(downloadState?.result?.success).toBe(false);
 	});
 
-	test("a source-changed errorCode never rechecks or automatically downloads", async () => {
+	test.each([
+		{ source: "github", repository: "fork/project", channel: "beta", platform: "linux-x64" },
+		{ source: "github", repository: "fork/project", channel: "stable", platform: "linux-arm64" },
+		{
+			source: "update-server",
+			serverUrl: "https://updates.example",
+			product: "other",
+			channel: "stable",
+			platform: "linux-x64",
+		},
+	] satisfies UpdateSourceIdentity[])("full source identity prevents cross-configuration retry: %j", async (next) => {
+		const initial: UpdateSourceIdentity =
+			next.source === "github"
+				? { ...next, channel: "stable", platform: "linux-x64" }
+				: { ...next, product: "narrafork" };
+		const original = { ...releaseInfo, source: initial.source, sourceIdentity: initial };
+		expect(sameUpdateSource(original, { ...original, sourceIdentity: next })).toBe(false);
+		expect(sameUpdateSource(original, releaseInfo)).toBe(false);
 		let calls = 0;
 		globalThis.fetch = (async () => {
 			calls++;
-			return Response.json(
-				{ errorCode: "UPDATE_SOURCE_CHANGED", error: "source changed" },
-				{ status: 409 },
+			return Response.json({ code: "VERSION_CHANGED", error: "stale" }, { status: 409 });
+		}) as unknown as typeof fetch;
+		api.checkUpdate = async () => ({
+			updateAvailable: true,
+			currentVersion: "1.0.0",
+			releaseInfo: { ...original, version: "1.2.0", sourceIdentity: next },
+		});
+		await mountHarness(DownloadHarness);
+		await downloadState?.download(original);
+		await settle();
+		expect(calls).toBe(1);
+		expect(downloadState?.result?.success).toBe(false);
+	});
+
+	test("legacy retry is also blocked when saved configuration changes during the request", async () => {
+		let calls = 0;
+		globalThis.fetch = (async () => {
+			calls++;
+			queryClient?.setQueryData(["settings"], {
+				update: { source: "github", githubRepository: "fork/project", channel: "beta" },
+			});
+			return Response.json({ code: "VERSION_CHANGED", error: "stale" }, { status: 409 });
+		}) as unknown as typeof fetch;
+		api.checkUpdate = async () => ({
+			updateAvailable: true,
+			currentVersion: "1.0.0",
+			releaseInfo: { ...releaseInfo, version: "1.2.0" },
+		});
+		await mountHarness(DownloadHarness);
+		await downloadState?.download(releaseInfo);
+		expect(calls).toBe(1);
+	});
+
+	test("download sends full identity and retains the SSE verified selector", async () => {
+		const sourceIdentity: UpdateSourceIdentity = {
+			source: "github",
+			repository: "fork/project",
+			channel: "stable",
+			platform: "linux-x64",
+		};
+		const preparedIdentity = {
+			id: "verified",
+			sourceIdentity,
+			version: "1.1.0",
+			sha512: "hash",
+			sizeBytes: 1,
+		};
+		let body: unknown;
+		globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+			body = JSON.parse(String(init?.body));
+			return new Response(
+				`data: ${JSON.stringify({ success: true, ready: true, preparedIdentity })}\n\n`,
 			);
+		}) as unknown as typeof fetch;
+		await mountHarness(DownloadHarness);
+		await downloadState?.download({ ...releaseInfo, sourceIdentity });
+		await settle();
+		expect(body).toMatchObject({ releaseInfo: { sourceIdentity, sha512: "hash" } });
+		expect(downloadState?.result?.preparedIdentity).toEqual(preparedIdentity);
+	});
+
+	test.each([
+		["PREPARED_UPDATE_IDENTITY_REQUIRED", "updateApplyIdentityRequired"],
+		["PREPARED_UPDATE_CHANGED", "updatePreparedChanged"],
+	] as const)("apply sends the chosen selector and localizes HTTP 409 %s", async (code, key) => {
+		await i18n.init({
+			lng: "en",
+			resources: { en: { common: commonEn }, "zh-CN": { common: commonZh } },
+		});
+		let selected: unknown;
+		api.applyUpdate = async (version, preparedId) => {
+			selected = { version, preparedId };
+			throw new ApiError("conflict", 409, { code });
+		};
+		await mountHarness(ApplyHarness);
+		await applyState?.apply("1.1.0", "artifact-a");
+		await settle();
+		expect(selected).toEqual({ version: "1.1.0", preparedId: "artifact-a" });
+		expect(applyState?.applyResult?.error).toBe(commonEn[key]);
+		await i18n.changeLanguage("zh-CN");
+		await applyState?.apply("1.1.0", "artifact-a");
+		await settle();
+		expect(applyState?.applyResult?.error).toBe(commonZh[key]);
+		await i18n.changeLanguage("en");
+	});
+
+	test("the update API serializes version and preparedId in the apply body", async () => {
+		let body: unknown;
+		globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+			body = JSON.parse(String(init?.body));
+			return Response.json({ success: false, code: "PREPARED_UPDATE_CHANGED" });
+		}) as unknown as typeof fetch;
+		await originalApplyUpdate("1.1.0", "artifact-a");
+		expect(body).toEqual({ version: "1.1.0", preparedId: "artifact-a" });
+	});
+
+	test.each([
+		{ code: "UPDATE_SOURCE_CHANGED", field: "errorCode" },
+		{ code: "UPDATE_ARTIFACT_CHANGED", field: "errorCode" },
+		{ code: "UPDATE_ARTIFACT_CHANGED", field: "code" },
+	])("identity conflict never rechecks or automatically downloads: %j", async ({ code, field }) => {
+		let calls = 0;
+		globalThis.fetch = (async () => {
+			calls++;
+			return Response.json({ [field]: code, error: "identity changed" }, { status: 409 });
 		}) as unknown as typeof fetch;
 		await mountHarness(DownloadHarness);
 		await downloadState?.download(releaseInfo);
 		await settle();
 		expect(calls).toBe(1);
 		expect(checkUpdateCalls).toBe(0);
-		expect(downloadState?.result?.code).toBe("UPDATE_SOURCE_CHANGED");
+		expect(downloadState?.result?.code).toBe(code);
 	});
 
 	test("unmount during a 409 re-check prevents a detached download retry and cache overwrite", async () => {
@@ -492,6 +625,23 @@ describe("update source behavior", () => {
 });
 
 describe("useUpdateCheck saved settings", () => {
+	test("a check started before a channel change never gets labeled with the new configuration", async () => {
+		let finish!: (value: CheckUpdateResult) => void;
+		api.checkUpdate = () =>
+			new Promise((resolve) => {
+				finish = resolve;
+			});
+		await mountAs("admin");
+		queryClient?.setQueryData(["settings"], {
+			update: { source: "github", githubRepository: "fork/project", channel: "beta" },
+		});
+		finish({ updateAvailable: true, currentVersion: "1.0.0", latestVersion: "1.1.0" });
+		await settle();
+		expect(latest().checkFailed).toBe(true);
+		expect(latest().updateAvailable).toBe(false);
+		expect(latest().errorCode).toBe("UPDATE_SOURCE_CHANGED");
+	});
+
 	test("waits for the deduplicated settings request before checking", async () => {
 		let resolveSettings!: (value: Awaited<ReturnType<typeof api.getSettings>>) => void;
 		let settingsCalls = 0;

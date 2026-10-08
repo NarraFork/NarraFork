@@ -126,6 +126,9 @@ export async function runPostgresKit(opts: PostgresKitOptions): Promise<Postgres
 	};
 	const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
 	const append = (target: "stdout" | "stderr", chunk: Uint8Array | string) => {
+		// The pipes can still deliver queued bytes after a cutoff kills the child.
+		// Never feed those bytes into a decoder holding a truncated UTF-8 prefix.
+		if (failure) return;
 		const data = Buffer.from(chunk);
 		// Reserve bounded room for fail-closed diagnostics inside the combined 256 KiB cap.
 		const remaining = OUTPUT_LIMIT - 512 - bytes;

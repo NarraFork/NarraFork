@@ -25,6 +25,7 @@ const uploads = await import("../../lib/uploads");
 const { pushBufferedMessage } = await import("../narrator-buffer");
 const { getBackgroundAbortControllers } = await import("../subagent-detach");
 const executor = await import("../../lib/agent/tool-executor");
+const agent = await import("../../lib/agent");
 const { narratorPersistence } = await import("../narrator-persistence");
 const prepareToolCallAttempt = narratorPersistence.prepareToolCallAttempt.bind(narratorPersistence);
 const { sendSubagentMessageDetailed } = await import("../agent-communication");
@@ -67,6 +68,9 @@ function makeActive(alive = true): import("../narrator-session-state").ActiveNar
 
 beforeEach(() => {
 	cleanDb(sqlite);
+	// Reexecution now prepares provider history before dispatching the tool. Keep
+	// the real runtime/admission path, but do not require a configured upstream.
+	spyOn(agent, "buildHistory").mockResolvedValue({ history: [], trailingToolResults: [] });
 	const now = new Date().toISOString();
 	for (const id of [ROOT, OTHER]) {
 		db.insert(narrators)
@@ -554,15 +558,15 @@ test("successful retry hands its foreground slot to automatic continuation", asy
 		durationMs: 1,
 	});
 	const history = narratorService.getModelHistorySinceLastCompact.bind(narratorService);
-	const continuation = spyOn(narratorService, "getModelHistorySinceLastCompact").mockImplementation(
-		async (...args) => {
-			// This is the continuation's initial history read, still inside the handoff lock.
-			expect(state.hasNarratorRuntimeClaim(ROOT)).toBe(false);
-			return history(...args);
-		},
-	);
+	const claimsAtHistoryRead: boolean[] = [];
+	spyOn(narratorService, "getModelHistorySinceLastCompact").mockImplementation(async (...args) => {
+		claimsAtHistoryRead.push(state.hasNarratorRuntimeClaim(ROOT));
+		return history(...args);
+	});
 	expect(await session.reExecuteDeniedToolCall(ROOT, row.toolUseId)).toEqual({ ok: true });
-	expect(continuation).toHaveBeenCalled();
+	// Reflection history belongs to the live retry; continuation history is read
+	// after releasing that slot, still inside the handoff lock.
+	expect(claimsAtHistoryRead).toEqual([true, false]);
 	await state.waitForNarratorAdmissionWork(ROOT, AbortSignal.timeout(5_000));
 	expect(state.hasNarratorRuntimeClaim(ROOT)).toBe(false);
 });

@@ -289,6 +289,9 @@ describe("permission forms reflow through real card measurements", () => {
 			inputJson: input,
 			outputJson: output,
 			detailPayload: { items: input, card: output },
+			durationMs: 150,
+			execDurationMs: 100,
+			fileChangeTiming: { waitMs: 80, executionMs: 20, totalMs: 100 },
 		};
 		const result = reflowPermissionForms(data, 420, base.resolve) as typeof data;
 		expect(result.inputJson).toBe(input);
@@ -297,7 +300,7 @@ describe("permission forms reflow through real card measurements", () => {
 		expect(reads).toBe(0);
 		expect(data.permissionForm?.height).toBe(900);
 		expect(result.permissionForm?.height).toBeUndefined();
-		measureToolCall(result, 420);
+		expect(measureToolCall(result, 420).displayDurationMs).toBe(20);
 		expect(reads).toBe(0);
 	});
 

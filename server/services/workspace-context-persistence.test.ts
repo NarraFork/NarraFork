@@ -497,7 +497,17 @@ describe("history-only HTTP actions after a workspace switch", () => {
 			createdAt: new Date().toISOString(),
 		});
 		await change(join(root, "new"));
-		return { user, answer, later, oldFile, newFile };
+		const afterSwitch = await refs();
+		expect(afterSwitch.slice(0, 3)).toEqual([user, answer, later]);
+		expect(afterSwitch).toHaveLength(4);
+		const workspaceReminder = afterSwitch[3];
+		if (!workspaceReminder) throw new Error("Missing workspace switch reminder");
+		const reminder = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, workspaceReminder),
+			columns: { role: true },
+		});
+		expect(reminder?.role).toBe("disp");
+		return { user, answer, later, oldFile, newFile, workspaceReminder };
 	}
 
 	type Fixture = Awaited<ReturnType<typeof fixture>>;
@@ -582,8 +592,11 @@ describe("history-only HTTP actions after a workspace switch", () => {
 		expect(body.ok).toBe(true);
 		if (action === "rollback" || action === "message") expect(await refs()).toEqual([f.user]);
 		else {
+			// Deleting selected blocks must retain the unrelated manual-switch reminder.
 			expect(await refs()).toEqual(
-				action === "block" ? [f.user, f.answer, f.later] : [f.user, f.answer],
+				action === "block"
+					? [f.user, f.answer, f.later, f.workspaceReminder]
+					: [f.user, f.answer, f.workspaceReminder],
 			);
 			const remaining = await db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, f.answer),

@@ -438,7 +438,6 @@ for (const surface of ["focus", "workspace"] as const)
 			const apiRef = {
 				current: {
 					getPanel: (id: string) => panels.get(id),
-					groups: [],
 					get panels() {
 						return [
 							// Workspace resources need their owning narrator cell to exist.

@@ -104,7 +104,12 @@ function shell(script: string, env: Record<string, string> = {}, cwd?: string) {
 
 describe("generic CI workflow", () => {
 	test("runs for every PR, main push and manual dispatch without paths or branch exclusions", () => {
-		expect(Object.keys(workflow.on).sort()).toEqual(["pull_request", "push", "workflow_dispatch"]);
+		expect(Object.keys(workflow.on).sort()).toEqual([
+			"pull_request",
+			"push",
+			"workflow_call",
+			"workflow_dispatch",
+		]);
 		expect(workflow.on.pull_request ?? {}).toEqual({});
 		expect(workflow.on.push).toEqual({ branches: ["main"] });
 		expect(workflow.on.workflow_dispatch ?? {}).toEqual({});
@@ -153,7 +158,10 @@ describe("generic CI workflow", () => {
 			expect(setup.with?.["bun-version"]).toBe(packageManager.slice(4));
 			expect(steps.indexOf(checkout)).toBeLessThan(steps.indexOf(setup));
 			expect(steps.indexOf(setup)).toBeLessThan(steps.indexOf(install));
-			expect(steps.findIndex((value) => !!value.run)).toBe(steps.indexOf(install));
+			const validate = step(id, (value) => value.name === "Validate checkout reference");
+			expect(steps.findIndex((value) => !!value.run)).toBe(steps.indexOf(validate));
+			expect(steps.indexOf(validate)).toBeLessThan(steps.indexOf(checkout));
+			expect(checkout.with?.ref).toBe(expression("inputs.checkout-ref || github.sha"));
 		}
 	});
 

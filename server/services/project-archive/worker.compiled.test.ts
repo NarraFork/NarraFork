@@ -50,11 +50,20 @@ console.log(JSON.stringify(output));
 
 test("production compile explicitly includes both project archive workers", async () => {
 	const source = await readFile(join(root, "scripts/build-cross-platform.ts"), "utf8");
-	const command = source.match(/const compile = Bun\.spawnSync\(\s*\[([\s\S]*?)\],\s*\{/);
+	const command = source.match(/const compile = await runBuildStep\(\s*\[([\s\S]*?)\]\s*,?\s*\)/);
 	if (!command) throw new Error("Production compile arguments unavailable");
+	const withoutComments = command[1].replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, "");
+	expect(withoutComments).toMatch(/^\s*process\.execPath\s*,/);
+	const { stdout } = await exec(process.execPath, ["--eval", "process.stdout.write(Bun.version)"], {
+		timeout: 10_000,
+		maxBuffer: 1024,
+	});
+	expect(stdout).toBe(Bun.version);
 	const args = [
-		...command[1].replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, "").matchAll(/"([^"\r\n]+)"/g),
-	].map((match) => match[1]);
+		process.execPath,
+		...[...withoutComments.matchAll(/"([^"\r\n]+)"/g)].map((match) => match[1]),
+	];
+	expect(args.slice(0, 3)).toEqual([process.execPath, "build", "./server/index.ts"]);
 	const actual = args.slice(2, args.indexOf("--compile"));
 	for (const entry of entries) expect(actual).toContain(entry);
 });

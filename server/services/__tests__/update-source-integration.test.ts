@@ -5,9 +5,11 @@ import { join } from "node:path";
 import type { GithubPatchStep } from "../../../shared/release-patch";
 import { settings } from "../../lib/settings";
 import { APP_VERSION } from "../../lib/version";
+import { resetUpdateCoordinationForTests, scheduleUpdate } from "../update-coordinator";
 import {
 	checkForUpdate,
 	downloadUpdate,
+	getCurrentUpdateSourceIdentity,
 	getUpdateDirectory,
 	getUpdateStatus,
 	isUpdateSourceCurrent,
@@ -61,6 +63,7 @@ const release = {
 function fixtureReleaseInfo(patchChain?: GithubPatchStep[]): ReleaseInfo {
 	return {
 		source: "github",
+		sourceIdentity: getCurrentUpdateSourceIdentity() ?? undefined,
 		repository,
 		version,
 		path: filename,
@@ -81,6 +84,7 @@ function selectGithub() {
 		checkIntervalMinutes: 60,
 		autoDownload: false,
 	};
+	return settings.update;
 }
 function expectNoTemporaryArtifacts() {
 	expect(
@@ -102,12 +106,66 @@ function installFetch(handler: (url: string) => Response | Promise<Response>) {
 }
 beforeEach(() => {
 	requested = [];
+	resetUpdateCoordinationForTests();
 });
 afterEach(() => {
 	globalThis.fetch = originalFetch;
+	resetUpdateCoordinationForTests();
 });
 
 describe("selected update source integration", () => {
+	test("beta-to-stable change during forced GitHub detection refuses the captured result", async () => {
+		const update = selectGithub();
+		update.channel = "beta";
+		installFetch((url) => {
+			if (url.startsWith(`https://api.github.com/repos/${repository}/`)) {
+				update.channel = "stable";
+				return Response.json([{ ...release, prerelease: true }]);
+			}
+			if (url === sidecarUrl) return new Response(metadata);
+			throw new Error(`Unexpected payload download after settings change: ${url}`);
+		});
+		const checked = await checkForUpdate({ force: true });
+		if (!checked.releaseInfo) throw new Error("Missing checked beta release");
+		expect(isUpdateSourceCurrent(checked.releaseInfo)).toBe(false);
+		const before = [...requested];
+		expect((await downloadUpdate(checked.releaseInfo)).success).toBe(false);
+		expect(requested).toEqual(before);
+	});
+
+	test.each([
+		"product",
+		"channel",
+	] as const)("legacy %s change during detection refuses the captured result", async (field) => {
+		const serverUrl = "https://updates.integration.example";
+		settings.update = {
+			...settings.update,
+			source: "update-server",
+			serverUrl,
+			product: "first",
+			channel: "stable",
+			checkIntervalMinutes: 60,
+			autoDownload: false,
+		};
+		const update = settings.update;
+		installFetch((url) => {
+			expect(url).toContain(`${serverUrl}/api/v2/products/first/releases/latest`);
+			if (field === "product") update.product = "second";
+			else update.channel = "beta";
+			return Response.json({
+				updateAvailable: true,
+				version,
+				releaseDate: "2026-10-06",
+				file: { filename, size: payload.length, sha512 },
+			});
+		});
+		const checked = await checkForUpdate({ force: true });
+		if (!checked.releaseInfo) throw new Error("Missing checked legacy release");
+		expect(isUpdateSourceCurrent(checked.releaseInfo)).toBe(false);
+		const before = [...requested];
+		expect((await downloadUpdate(checked.releaseInfo)).success).toBe(false);
+		expect(requested).toEqual(before);
+	});
 	test("GitHub prepares a verified full binary without contacting update-server or helpers", async () => {
 		settings.update = {
 			...settings.update,
@@ -300,6 +358,32 @@ describe("selected update source integration", () => {
 		expect(isUpdateSourceCurrent(result.releaseInfo)).toBe(true);
 		settings.update.serverUrl = "https://other.integration.example";
 		expect(isUpdateSourceCurrent(result.releaseInfo)).toBe(false);
+	});
+	test.each([
+		"source-policy",
+		"scheduled",
+	] as const)("a %s change during payload transfer cannot replace the prepared artifact", async (change) => {
+		const update = selectGithub();
+		installFetch(() => new Response(payload));
+		const initial = await downloadUpdate(fixtureReleaseInfo());
+		expect(initial.success).toBe(true);
+		if (!initial.preparedIdentity) throw new Error("Missing original prepared selector");
+		const manifest = join(getUpdateDirectory(), "placed-update.json");
+		const originalMetadata = readFileSync(manifest, "utf8");
+		let changed = false;
+		const next = await downloadUpdate(fixtureReleaseInfo(), (progress) => {
+			if (!changed && progress.phase === "downloading" && progress.bytesDownloaded > 0) {
+				changed = true;
+				if (change === "source-policy") update.channel = "beta";
+				else scheduleUpdate(version);
+			}
+		});
+		expect(changed).toBe(true);
+		expect(next.success).toBe(false);
+		expect(readFileSync(manifest, "utf8")).toBe(originalMetadata);
+		expect((await getUpdateStatus(version)).preparedIdentity?.id).toBe(initial.preparedIdentity.id);
+		expect(readFileSync(initial.updatePath as string)).toEqual(payload);
+		expectNoTemporaryArtifacts();
 	});
 	test("failed GitHub checks never fall back to the configured legacy server", async () => {
 		settings.update = {

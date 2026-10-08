@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
 	cpSync,
 	existsSync,
@@ -386,6 +386,51 @@ describe("real installed Drizzle Kit 0.31.10 (no database)", () => {
 		expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(256 * 1024);
 		assertDead(Number(readFileSync(pidPath, "utf8")));
 	}, 15_000);
+
+	test("ignores queued chunks after cutoff without corrupting a buffered UTF-8 prefix", async () => {
+		const { root, stage } = fixture();
+		delete process.env[PG_SCHEMA_ENV];
+		const prefix = "a".repeat(256 * 1024 - 512 - 3);
+		let kills = 0;
+		const child = {
+			pid: undefined,
+			exited: Promise.resolve(0),
+			kill: () => {
+				kills++;
+			},
+			stdout: new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(Buffer.from(prefix));
+					// Only three of the emoji's four bytes fit. A later queued chunk
+					// must not be decoded as a continuation of that discarded frame.
+					controller.enqueue(Buffer.from("🙂"));
+					controller.enqueue(Buffer.from("queued after cutoff"));
+					controller.close();
+				},
+			}),
+			stderr: new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.close();
+				},
+			}),
+		};
+		const spawn = spyOn(Bun, "spawn").mockImplementation((() => child) as typeof Bun.spawn);
+		try {
+			const result = await runPostgresKit({
+				root,
+				stageOut: stage("queued cap"),
+				operation: "generate",
+			});
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdoutTruncated).toBe(true);
+			expect(result.stderr).toContain("exceeded 256 KiB");
+			expect(result.stdout.length).toBe(prefix.length);
+			expect(result.stdout.endsWith("�")).toBe(false);
+			expect(kills).toBe(1);
+		} finally {
+			spawn.mockRestore();
+		}
+	});
 
 	test("stderr and multibyte output share the combined 256 KiB cap", async () => {
 		const { root, stage } = fixture();

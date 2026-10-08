@@ -7,6 +7,7 @@ import {
 import { type ReactNode, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type FilePanelReadOrigin, fileReferenceApi } from "../../../lib/api/file-references";
+import { formatLocaleNumber } from "../../../lib/intl-format";
 
 export const FILE_PANEL_AUTO_LOAD_BYTES = 1024 * 1024;
 
@@ -60,7 +61,7 @@ function LargeFileResource({
 	children,
 	persistenceKey,
 }: Props) {
-	const { t } = useTranslation("narrator");
+	const { t, i18n } = useTranslation("narrator");
 	const [allowed, setAllowed] = useState(() => {
 		if (confirmed === true) return true;
 		try {
@@ -134,7 +135,7 @@ function LargeFileResource({
 				<Text size="sm" c="dimmed">
 					{t("largeFile.size", {
 						size: filePanelSizeLabel(info.size),
-						bytes: info.size.toLocaleString(),
+						bytes: formatLocaleNumber(info.size, {}, i18n.language),
 					})}
 				</Text>
 				<Text size="sm" ta="center">
@@ -175,7 +176,7 @@ function LargeFilePages({
 	info: { fileName: string; size: number };
 	origin: FilePanelReadOrigin;
 }) {
-	const { t } = useTranslation("narrator");
+	const { t, i18n } = useTranslation("narrator");
 	const [offset, setOffset] = useState(0);
 	const [previous, setPrevious] = useState<number[]>([]);
 	const [jump, setJump] = useState<string | number>(1);
@@ -234,8 +235,12 @@ function LargeFilePages({
 					</Button>
 					<Text size="xs">
 						{t("largeFile.byteRange", {
-							start: (page?.offset ?? offset).toLocaleString(),
-							end: (page?.nextOffset ?? (page ? size : offset)).toLocaleString(),
+							start: formatLocaleNumber(page?.offset ?? offset, {}, i18n.language),
+							end: formatLocaleNumber(
+								page?.nextOffset ?? (page ? size : offset),
+								{},
+								i18n.language,
+							),
 						})}
 					</Text>
 					<NumberInput

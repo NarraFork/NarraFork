@@ -184,7 +184,7 @@ function seed(subagent: boolean) {
 	for (const id of subagent ? ["parent", "child"] : ["main"]) {
 		sqlite
 			.prepare(
-"INSERT INTO narrators (id, type, variant, parent_narrator_id, permission_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+				"INSERT INTO narrators (id, type, variant, parent_narrator_id, permission_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				id,

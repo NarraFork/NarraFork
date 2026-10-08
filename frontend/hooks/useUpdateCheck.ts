@@ -1,8 +1,14 @@
+import { type PreparedUpdateIdentity, sameUpdateSourceIdentity } from "@shared/update-identity";
 import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import i18n from "i18next";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, authorizedFetch, readFetchError } from "../lib/api";
-import { sameUpdateSource, updateCheckErrorKey, updateSettingsKey } from "../lib/update-source";
+import { ApiError, api, authorizedFetch, readFetchError } from "../lib/api";
+import {
+	sameUpdateSource,
+	settingsSourceIdentity,
+	updateCheckErrorKey,
+	updateSettingsKey,
+} from "../lib/update-source";
 import type { UpdateCoordinationPhase } from "../lib/update-state";
 
 type UpdateReleaseInfo = NonNullable<Awaited<ReturnType<typeof api.checkUpdate>>["releaseInfo"]>;
@@ -116,6 +122,7 @@ export interface UpdateInstructions {
 
 export interface UpdateDownloadResult {
 	success: boolean;
+	preparedIdentity?: PreparedUpdateIdentity;
 	version?: string;
 	ready?: boolean;
 	updatePath?: string;
@@ -212,6 +219,27 @@ async function checkWithSavedSettings(queryClient: QueryClient, signal?: AbortSi
 	const settingsKey = updateSettingsKey(settings.update);
 	const checked = await api.checkUpdate();
 	signal?.throwIfAborted();
+	const currentSettings = queryClient.getQueryData<Awaited<ReturnType<typeof api.getSettings>>>([
+		"settings",
+	]);
+	const identity = checked.sourceIdentity ?? checked.releaseInfo?.sourceIdentity;
+	if (
+		(currentSettings && updateSettingsKey(currentSettings.update) !== settingsKey) ||
+		(identity &&
+			!sameUpdateSourceIdentity(
+				identity,
+				settingsSourceIdentity(settings.update, identity.platform),
+			))
+	) {
+		return {
+			...checked,
+			updateAvailable: false,
+			releaseInfo: undefined,
+			errorCode: "UPDATE_SOURCE_CHANGED",
+			error: i18n.t("common:updateSourceChanged"),
+			settingsKey,
+		};
+	}
 	return { ...checked, settingsKey };
 }
 
@@ -262,7 +290,7 @@ export function useUpdateCheck(intervalMs = 60 * 60_000) {
 	// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally re-run when latestVersion changes
 	useEffect(() => {
 		setDismissed(false);
-	}, [data?.latestVersion, data?.source, data?.repository]);
+	}, [data?.latestVersion, data?.source, data?.repository, data?.settingsKey]);
 
 	const dismiss = useCallback(() => setDismissed(true), []);
 
@@ -277,6 +305,7 @@ export function useUpdateCheck(intervalMs = 60 * 60_000) {
 		source: data?.source,
 		repository: data?.repository,
 		settingsKey: data?.settingsKey,
+		sourceIdentity: data?.sourceIdentity,
 		currentVersion: data?.currentVersion,
 		latestVersion: data?.latestVersion,
 		releaseInfo: data?.releaseInfo,
@@ -353,11 +382,21 @@ export function useUpdateDownload() {
 			abortControllerRef.current = controller;
 
 			try {
+				const settingsAtStart = await queryClient.ensureQueryData({
+					queryKey: ["settings"],
+					queryFn: api.getSettings,
+				});
+				controller.signal.throwIfAborted();
+				const requestSettingsKey = updateSettingsKey(settingsAtStart.update);
 				const response = await authorizedFetch("/api/update/download", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify({
-						releaseInfo: { version: releaseInfo.version },
+						releaseInfo: {
+							version: releaseInfo.version,
+							sha512: releaseInfo.sha512,
+							sourceIdentity: releaseInfo.sourceIdentity,
+						},
 						source: releaseInfo.source ?? "update-server",
 						repository: releaseInfo.repository,
 						retry: options?.retry === true,
@@ -369,12 +408,13 @@ export function useUpdateDownload() {
 				if (!response.ok) {
 					const failure = await readFetchError(response, "Download failed");
 					controller.signal.throwIfAborted();
-					// 409 means the requested version no longer matches the server's latest
-					// metadata (a new release was published between check and download). Re-check
-					// once to get the fresh releaseInfo, then retry the download with it.
+					// A version conflict may be rechecked once, but a source or artifact identity
+					// change requires a new explicit selection, never a transparent download.
+					const conflictCode = failure.data.code ?? failure.data.errorCode;
 					if (
 						response.status === 409 &&
-						(failure.data.code ?? failure.data.errorCode) !== "UPDATE_SOURCE_CHANGED" &&
+						conflictCode !== "UPDATE_SOURCE_CHANGED" &&
+						conflictCode !== "UPDATE_ARTIFACT_CHANGED" &&
 						!options?.autoRetried
 					) {
 						try {
@@ -388,6 +428,7 @@ export function useUpdateDownload() {
 								!rechecked.errorCode &&
 								rechecked.updateAvailable &&
 								rechecked.releaseInfo &&
+								rechecked.settingsKey === requestSettingsKey &&
 								sameUpdateSource(releaseInfo, rechecked.releaseInfo)
 							) {
 								await downloadRef.current?.(rechecked.releaseInfo, {
@@ -587,6 +628,8 @@ const UPDATE_APPLY_ERROR_KEYS: Record<string, string> = {
 	NOT_COMPILED_BINARY: "common:updateApplyErrorNotCompiledBinary",
 	NO_PREPARED_UPDATE: "common:updateApplyErrorNoPreparedUpdate",
 	PREPARED_UPDATE_NOT_PLACED: "common:updateApplyErrorNotPlaced",
+	PREPARED_UPDATE_IDENTITY_REQUIRED: "common:updateApplyIdentityRequired",
+	PREPARED_UPDATE_CHANGED: "common:updatePreparedChanged",
 };
 
 /** Translate the fixed apply pre-flight codes, keeping unknown server text as-is. */
@@ -625,7 +668,7 @@ export function useUpdateApply() {
 	} | null>(null);
 
 	const apply = useCallback(
-		async (version?: string) => {
+		async (version?: string, preparedId?: string) => {
 			if (!autoApplyAvailable) {
 				const result = {
 					success: false,
@@ -637,7 +680,7 @@ export function useUpdateApply() {
 			setIsApplying(true);
 			setApplyResult(null);
 			try {
-				const response = await api.applyUpdate(version);
+				const response = await api.applyUpdate(version, preparedId);
 				const result = {
 					...response,
 					error: localizeUpdateApplyError(response.error, response.code),
@@ -649,7 +692,15 @@ export function useUpdateApply() {
 				// If successful, the server will exit — isApplying stays true
 				return result;
 			} catch (err) {
-				const result = { success: false, error: errorToMessage(err) };
+				const diagnostic =
+					err instanceof ApiError
+						? extractUpdateFailureDiagnostic(err.data ?? {}, err.message)
+						: { error: errorToMessage(err), code: undefined };
+				const result = {
+					success: false,
+					code: diagnostic.code,
+					error: localizeUpdateApplyError(diagnostic.error, diagnostic.code),
+				};
 				setApplyResult(result);
 				setIsApplying(false);
 				return result;

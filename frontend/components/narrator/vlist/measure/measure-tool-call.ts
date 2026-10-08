@@ -2101,11 +2101,9 @@ export function measureToolCall(
 		diffStats: data.diffStats ?? null,
 		isRemoteTarget: data.isRemoteTarget === true,
 		isTakenOver: data.isTakenOver === true,
-		// Bash prefers pure execution time. The rule lives in
-		// `@shared/tool-display-duration` so the folded trace row applies the SAME one —
-		// it used to paint raw `durationMs`, and one call reported 1s as a card and 20s
-		// as a row.
-		displayDurationMs: resolveToolDisplayDurationMs(data),
+		// The adapter already projects the small timing fields. Do not let the shared
+		// legacy metadata fallback inspect arbitrary output payloads during measurement.
+		displayDurationMs: resolveToolDisplayDurationMs(resolveToolTimingStamps(data)),
 		startedAt: data.startedAt ?? null,
 		timeoutMs: data.timeoutMs ?? null,
 		timing: resolveToolTimingStamps(data),

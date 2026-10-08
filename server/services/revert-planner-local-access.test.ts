@@ -2115,7 +2115,12 @@ describe("backend scope and namespace guards", () => {
 		await switchWorkspace(other, 0);
 		await switchWorkspace(workspace, 1);
 		const before = history();
-		expect((await prepared()).expectedFileCount).toBe(1);
+		// Workspace switches publish history; an old selection must stay stale.
+		expect(messageVersion()).toBeGreaterThan(7);
+		await refused(await prepare(), "REVERT_SELECTION_STALE");
+		expect((await prepared({ expectedMessageVersion: messageVersion() })).expectedFileCount).toBe(
+			1,
+		);
 		const plan = await actionPrepared("revert_files");
 		const response = await http(`revert-plans/${plan.id}/files`);
 		expect(response.status).toBe(200);
@@ -2157,7 +2162,12 @@ describe("backend scope and namespace guards", () => {
 		await writeFile(sameName, "different workspace\n");
 		await switchWorkspace(other, 0);
 		const before = history();
-		await refused(await prepare(), "REVERT_PREVIEW_FILE_ACCESS_DENIED");
+		expect(messageVersion()).toBeGreaterThan(7);
+		await refused(await prepare(), "REVERT_SELECTION_STALE");
+		await refused(
+			await prepare({ expectedMessageVersion: messageVersion() }),
+			"REVERT_PREVIEW_FILE_ACCESS_DENIED",
+		);
 		const response = await actionPreview("revert_files");
 		expect(response.status).toBe(403);
 		expect((await response.json()).code).toBe("REVERT_PREVIEW_FILE_ACCESS_DENIED");

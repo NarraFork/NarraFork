@@ -1154,6 +1154,7 @@ export const miscApi = {
 		request<{
 			updateAvailable: boolean;
 			currentVersion: string;
+			sourceIdentity?: import("@shared/update-identity").UpdateSourceIdentity;
 			source?: "github" | "update-server";
 			repository?: string;
 			error?: string;
@@ -1161,6 +1162,7 @@ export const miscApi = {
 			retryAfter?: number;
 			latestVersion?: string;
 			releaseInfo?: {
+				sourceIdentity?: import("@shared/update-identity").UpdateSourceIdentity;
 				source?: "github" | "update-server";
 				repository?: string;
 				version: string;
@@ -1219,7 +1221,7 @@ export const miscApi = {
 			cancelledSchedule: boolean;
 			newBinaryPath?: string;
 		}>("/update/shutdown", { method: "POST" }),
-	applyUpdate: (version?: string) =>
+	applyUpdate: (version?: string, preparedId?: string) =>
 		request<{
 			success: boolean;
 			error?: string;
@@ -1238,7 +1240,7 @@ export const miscApi = {
 			replacementPid?: number;
 		}>("/update/apply", {
 			method: "POST",
-			body: version ? JSON.stringify({ version }) : undefined,
+			body: JSON.stringify({ version, preparedId }),
 		}),
 
 	// Workspaces

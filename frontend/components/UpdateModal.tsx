@@ -13,6 +13,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { getLocaleFallbackChain } from "@shared/i18n-locales";
+import { preparedMatchesRelease, type UpdateSourceIdentity } from "@shared/update-identity";
 import {
 	IconAlertTriangle,
 	IconCheck,
@@ -36,8 +37,14 @@ import { api } from "../lib/api";
 import { normalizeLanguage } from "../lib/i18n";
 import { formatLocaleDate } from "../lib/intl-format";
 import { clearPwaCache, waitForUpdatedServerAndReload } from "../lib/pwa";
-import { sameUpdateSource, updateCheckErrorKey, updateSettingsKey } from "../lib/update-source";
 import {
+	sameUpdateSource,
+	settingsSourceIdentity,
+	updateCheckErrorKey,
+	updateSettingsKey,
+} from "../lib/update-source";
+import {
+	type PreparedUpdateStatus,
 	resolveUpdateCoordinationCounts,
 	shouldAssumeLocalSchedule,
 	shouldShowUpdateScheduleButton,
@@ -67,9 +74,11 @@ function resolveNotes(
 }
 
 export interface UpdateModalData {
+	preparedStatus?: PreparedUpdateStatus;
 	latestVersion?: string;
 	currentVersion?: string;
 	releaseInfo?: {
+		sourceIdentity?: UpdateSourceIdentity;
 		source?: "github" | "update-server";
 		repository?: string;
 		version: string;
@@ -105,7 +114,14 @@ export interface UpdateModalProps {
 
 export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	const { t, i18n } = useTranslation("common");
-	const { download, cancel, reset, progress, result, isDownloading } = useUpdateDownload();
+	const {
+		download,
+		cancel,
+		reset,
+		progress: downloadProgress,
+		result,
+		isDownloading,
+	} = useUpdateDownload();
 	const { apply, isApplying, applyResult } = useUpdateApply();
 	const restartWaitRef = useRef<{ targetVersion?: string; controller: AbortController } | null>(
 		null,
@@ -167,16 +183,35 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 				!sameUpdateSource(releaseInfo, {
 					source: savedSettings.update?.source ?? "github",
 					repository: savedSettings.update?.githubRepository ?? "NarraFork/NarraFork",
+					sourceIdentity: releaseInfo.sourceIdentity
+						? (settingsSourceIdentity(savedSettings.update, releaseInfo.sourceIdentity.platform) ??
+							undefined)
+						: undefined,
 				})));
 	// Switching back does not revive an old recommendation; only a fresh check replaces data.
 	if (savedConfigurationChanged) recommendationState.current.invalidated = true;
 	const recommendationInvalidated = recommendationState.current.invalidated;
-	const requestedTargetVersion = releaseInfo?.version ?? latestVersion;
+	// Bind the artifact the user saw, not whichever same-version file the next poll returns.
+	const selectedPrepared = useRef<{
+		data: UpdateModalData;
+		status?: PreparedUpdateStatus;
+		previousResult: UpdateDownloadResult | null;
+	}>({ data, status: data.preparedStatus, previousResult: result });
+	if (selectedPrepared.current.data !== data) {
+		selectedPrepared.current = { data, status: data.preparedStatus, previousResult: result };
+	}
+	// Reopening explicitly selects the badge's current artifact; an old successful download
+	// must not override that fresh selection. An in-flight download still finishes normally.
+	const selectedDownloadResult = result !== selectedPrepared.current.previousResult ? result : null;
+	// The old terminal progress belongs to the ignored result too. Keep live progress intact.
+	const progress = result && !selectedDownloadResult ? null : downloadProgress;
+	const requestedTargetVersion =
+		selectedPrepared.current.status?.version ?? releaseInfo?.version ?? latestVersion;
 	// A 409 download response can transparently re-check and switch to a newer release.
 	// From that point onward, status polling, apply scheduling, and reload readiness must
 	// follow the version actually downloaded rather than the modal's stale check payload.
-	const targetVersion = result?.success
-		? (result.version ?? requestedTargetVersion)
+	const targetVersion = selectedDownloadResult?.success
+		? (selectedDownloadResult.version ?? requestedTargetVersion)
 		: requestedTargetVersion;
 
 	const assumeScheduled = shouldAssumeLocalSchedule({
@@ -207,6 +242,10 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		errorSinceMs: applyAttemptStartedAt,
 		assumeScheduled,
 	});
+
+	if (!selectedPrepared.current.status && preparedStatus?.ready) {
+		selectedPrepared.current.status = preparedStatus;
+	}
 
 	const handleDownload = (options?: { retry?: boolean }) => {
 		if (!downloadAvailable || !releaseInfo || recommendationInvalidated) return;
@@ -242,7 +281,10 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		setScheduleAbandonedLocally(false);
 		setServerConfirmedSchedule(false);
 		setScheduleClaimedAt(null);
-		const applyResponse = await apply(targetVersion);
+		const applyResponse = await apply(
+			effectiveResult?.version ?? targetVersion,
+			effectiveResult?.preparedIdentity?.id,
+		);
 		if (!applyResponse.success) return;
 		if ("scheduled" in applyResponse && applyResponse.scheduled) {
 			setScheduleClaimedAt(Date.now());
@@ -339,17 +381,16 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 
 	const savingsPercent =
 		downloadSize && totalSize ? Math.round((1 - downloadSize / totalSize) * 100) : 0;
-	const preparedStatusDetails = preparedStatus;
-	const preparedStatusMatches =
-		preparedStatusDetails?.ready &&
-		!!targetVersion &&
-		preparedStatusDetails.version === targetVersion;
+	const preparedStatusDetails = selectedPrepared.current.status;
+	// A mismatching artifact may still be explicitly applied, but must not borrow release metadata.
+	const hasSelectedPreparedArtifact = preparedStatusDetails?.ready === true;
 	const restoredInstructions = preparedStatusDetails?.instructions;
 	const restoredResult: UpdateDownloadResult | null =
-		preparedStatusMatches && preparedStatusDetails
+		hasSelectedPreparedArtifact && preparedStatusDetails
 			? {
 					success: true,
 					version: preparedStatusDetails.version,
+					preparedIdentity: preparedStatusDetails.preparedIdentity,
 					ready: preparedStatusDetails.ready,
 					updatePath: preparedStatusDetails.updatePath ?? preparedStatusDetails.newBinaryPath,
 					newBinaryPath: preparedStatusDetails.newBinaryPath,
@@ -376,7 +417,19 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 					},
 				}
 			: null;
-	const effectiveResult = result ?? restoredResult;
+	const effectiveResult = selectedDownloadResult?.success
+		? selectedDownloadResult
+		: (restoredResult ?? selectedDownloadResult);
+	const selectedIdentity = effectiveResult?.preparedIdentity;
+	const preparedSource = selectedIdentity?.sourceIdentity;
+	const recommendationMatchesPrepared =
+		!effectiveResult?.success || preparedMatchesRelease(selectedIdentity, releaseInfo);
+	const showRecommendation = !recommendationInvalidated && recommendationMatchesPrepared;
+	const preparedChanged =
+		!!selectedIdentity &&
+		!!preparedStatus?.preparedIdentity &&
+		selectedIdentity.id !== preparedStatus.preparedIdentity.id;
+	const displayedVersion = effectiveResult?.version ?? targetVersion;
 
 	const preparedBinaryPath =
 		effectiveResult?.instructions?.newBinaryPath ??
@@ -392,31 +445,30 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		!!preparedCommand &&
 		(!preparedBinaryPath || stripQuotes(preparedCommand) !== stripQuotes(preparedBinaryPath));
 	const statusErrorIsCurrent =
-		!!preparedStatusDetails?.error &&
+		!!preparedStatus?.error &&
 		(applyAttemptStartedAt === null || preparedStatusUpdatedAt >= applyAttemptStartedAt);
-	const coordinationFailed = statusErrorIsCurrent && preparedStatusDetails?.scheduled !== true;
+	const coordinationFailed = statusErrorIsCurrent && preparedStatus?.scheduled !== true;
 	// An operator cancellation lands in the same error field as a genuine failure, but it is an
 	// expected outcome rather than something that went wrong.
-	const coordinationCancelled =
-		coordinationFailed && preparedStatusDetails?.errorKind === "cancelled";
+	const coordinationCancelled = coordinationFailed && preparedStatus?.errorKind === "cancelled";
 	const updateScheduled = coordinationFailed
 		? false
-		: applyResult?.scheduled === true || preparedStatusDetails?.scheduled === true;
+		: applyResult?.scheduled === true || preparedStatus?.scheduled === true;
 	const coordinationPhase =
-		preparedStatusDetails?.scheduled || coordinationFailed
-			? preparedStatusDetails.phase
-			: (applyResult?.phase ?? preparedStatusDetails?.phase);
-	const coordinationCountsSource = preparedStatusDetails?.scheduled
-		? preparedStatusDetails
-		: (applyResult ?? preparedStatusDetails ?? {});
+		preparedStatus?.scheduled || coordinationFailed
+			? preparedStatus?.phase
+			: (applyResult?.phase ?? preparedStatus?.phase);
+	const coordinationCountsSource = preparedStatus?.scheduled
+		? preparedStatus
+		: (applyResult ?? preparedStatus ?? {});
 	const {
 		pendingBackgroundBashCount,
 		pendingOrdinaryExecutionCount,
 		resumableExecutionCount,
 		pausedToolCount,
 	} = resolveUpdateCoordinationCounts(coordinationCountsSource);
-	const waitBlockers = updateScheduled ? (preparedStatusDetails?.blockers ?? []) : [];
-	const cancelRequested = updateScheduled && preparedStatusDetails?.cancelRequested === true;
+	const waitBlockers = updateScheduled ? (preparedStatus?.blockers ?? []) : [];
+	const cancelRequested = updateScheduled && preparedStatus?.cancelRequested === true;
 	const canRestartIntoUpdate =
 		autoApplyAvailable &&
 		!updateScheduled &&
@@ -450,7 +502,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		cancelError ??
 		restartWaitError ??
 		(applyResult && !applyResult.success ? applyResult.error : null) ??
-		(statusErrorIsCurrent ? preparedStatusDetails?.error : null) ??
+		(statusErrorIsCurrent ? preparedStatus?.error : null) ??
 		null;
 
 	// Once the coordinator has confirmed a schedule, its own reports drive the poll and the local
@@ -475,7 +527,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		<Modal
 			opened={opened}
 			onClose={handleClose}
-			title={t("updateDownloadTitle", { version: targetVersion ?? latestVersion })}
+			title={t("updateDownloadTitle", { version: displayedVersion ?? latestVersion })}
 			size="lg"
 			centered
 		>
@@ -485,7 +537,31 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 						{t("updateSourceChanged")}
 					</Alert>
 				)}
-				{releaseInfo && (!recommendationInvalidated || effectiveResult?.success) && (
+				{effectiveResult?.success && (
+					<Stack gap="xs">
+						<Text size="sm">
+							{preparedSource?.source === "github"
+								? t("updateSourceGithub", { repository: preparedSource.repository })
+								: preparedSource?.source === "update-server"
+									? `${t("updateSourceServer")}: ${preparedSource.serverUrl} / ${preparedSource.product}`
+									: t("updatePreparedUnknownSource")}
+							{preparedSource && ` · ${preparedSource.channel} · ${preparedSource.platform}`}
+						</Text>
+						{selectedIdentity && (
+							<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+								SHA-512: {selectedIdentity.sha512} · {formatBytes(selectedIdentity.sizeBytes)}
+							</Text>
+						)}
+						{preparedChanged && <Alert color="orange">{t("updatePreparedChanged")}</Alert>}
+						{!selectedIdentity && <Alert color="orange">{t("updateApplyIdentityRequired")}</Alert>}
+					</Stack>
+				)}
+				{!showRecommendation && progress?.strategy && (
+					<Badge variant="outline">
+						{t(progress.strategy === "zstd" ? "updateStrategyZstd" : "updateStrategyFull")}
+					</Badge>
+				)}
+				{releaseInfo && showRecommendation && (
 					<Group gap="xs">
 						<Badge variant="light">
 							{releaseInfo.source === "github"
@@ -501,7 +577,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 						</Badge>
 					</Group>
 				)}
-				{releaseDate && !recommendationInvalidated && (
+				{releaseDate && showRecommendation && (
 					<Text size="xs" c="dimmed">
 						{formatLocaleDate(releaseDate, {
 							year: "numeric",
@@ -512,7 +588,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 				)}
 
 				{/* Release notes */}
-				{!recommendationInvalidated && (
+				{showRecommendation && (
 					<div>
 						<Text size="sm" fw={500} mb={4}>
 							{t("updateReleaseNotes")}

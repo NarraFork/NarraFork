@@ -15,9 +15,20 @@ const workerEntry = "./server/lib/browser/memory-profile-worker.ts";
 
 test("production compile command includes the profile worker entry", async () => {
 	const source = await readFile(join(root, "scripts/build-cross-platform.ts"), "utf8");
-	const command = source.match(/const compile = Bun\.spawnSync\(\s*\[([\s\S]*?)\],\s*\{/);
+	const command = source.match(/const compile = await runBuildStep\(\s*\[([\s\S]*?)\]\s*,?\s*\)/);
 	expect(command).not.toBeNull();
-	expect(command?.[1].replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, "")).toContain(`"${workerEntry}"`);
+	const args = command?.[1].replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, "") ?? "";
+	expect(args).toMatch(/^\s*process\.execPath\s*,\s*"build"\s*,/);
+	const { stdout } = await execute(
+		process.execPath,
+		["--eval", "process.stdout.write(Bun.version)"],
+		{
+			timeout: 10_000,
+			maxBuffer: 1024,
+		},
+	);
+	expect(stdout).toBe(Bun.version);
+	expect(args).toContain(`"${workerEntry}"`);
 });
 
 test("minified compiled worker is present outside source cwd, closes port; omission fails safely", async () => {
@@ -34,14 +45,20 @@ const request = JSON.parse(process.argv[2]);
 async function spawn(specifier) {
  return new Promise((resolve) => {
   const worker = new Worker(new URL(specifier, import.meta.url));
-  let reply, ready = false;
-  const timer = setTimeout(() => { worker.terminate(); resolve({ kind: "failed", stage: "startup_timeout" }); }, 25000);
-  worker.on("error", () => {});
+  let reply, ready = false, workerError = false;
+  const started = performance.now();
+  const phases = [];
+  const diagnostics = () => ({ workerError, phases, elapsedMs: Math.round(performance.now() - started) });
+  const timer = setTimeout(() => { worker.terminate(); resolve({ kind: "failed", stage: "startup_timeout", diagnostics: diagnostics() }); }, 25000);
+  worker.on("error", () => { workerError = true; });
   worker.on("message", (message) => {
+   // Only fixed lifecycle names and timings: never CDP data, errors, or endpoints.
+   if (["ready", "recording", "finalizing", "result", "failed", "cancelled"].includes(message.kind) && phases.length < 8)
+    phases.push({ kind: message.kind, elapsedMs: Math.round(performance.now() - started) });
    if (message.kind === "ready") { ready = true; worker.postMessage({ kind: "start", request }); }
    if (["result", "failed", "cancelled"].includes(message.kind)) reply = message;
   });
-  worker.on("exit", (code) => { clearTimeout(timer); resolve(reply ? { ...reply, exitCode: code } : { kind: "failed", stage: "startup", ready }); });
+  worker.on("exit", (code) => { clearTimeout(timer); resolve({ ...(reply ? { ...reply, exitCode: code } : { kind: "failed", stage: "startup", ready }), diagnostics: diagnostics() }); });
  });
 }
 let result;
@@ -145,7 +162,22 @@ console.log(JSON.stringify({ compiled: isCompiledRuntime(), ...result }));
 			const reply = JSON.parse(stdout.trim()) as MemoryProfileWorkerReply & {
 				compiled: boolean;
 				exitCode: number;
+				diagnostics: {
+					workerError: boolean;
+					phases: Array<{ kind: string; elapsedMs: number }>;
+					elapsedMs: number;
+				};
 			};
+			if (reply.kind === "failed" || reply.kind === "cancelled") {
+				console.error("Compiled profile worker failed", {
+					kind: reply.kind,
+					stage: reply.stage,
+					traceStopped: reply.traceStopped,
+					compiled: reply.compiled,
+					exitCode: reply.exitCode,
+					diagnostics: reply.diagnostics,
+				});
+			}
 			expect(reply.kind).toBe("result");
 			if (reply.kind !== "result") throw new Error("Expected compiled real worker result");
 			expect(reply.traceStopped).toBe(true);

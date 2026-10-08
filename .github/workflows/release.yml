@@ -1,0 +1,323 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag reachable from main (vX.Y.Z)
+        required: true
+        type: string
+      publish:
+        description: Publish after verification and release Environment approval
+        required: true
+        type: boolean
+        default: false
+      source_run_id:
+        description: Optional original build run ID to resume without rebuilding
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+# Serialize versions as well as retries: an older stable must never race a newer latest.
+concurrency:
+  group: main-program-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  preflight:
+    name: Release preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      commit: ${{ steps.plan.outputs.commit }}
+      version: ${{ steps.plan.outputs.version }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      restore-mode: ${{ steps.plan.outputs.restore-mode }}
+      source-run-id: ${{ steps.plan.outputs.source-run-id }}
+    steps:
+      - name: Require the trusted dispatch entry
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_REF: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          test "$EVENT_NAME" = workflow_dispatch
+          test "$WORKFLOW_REF" = refs/heads/main
+          test "$REPOSITORY" = NarraFork/NarraFork
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+      - name: Install control dependencies without lifecycle scripts
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Resolve immutable release plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: >-
+          bun scripts/ci-release.ts preflight --tag="$RELEASE_TAG"
+          --publish="$PUBLISH_REQUESTED" --source-run-id="$SOURCE_RUN_ID"
+          --plan=.ci-release/control/plan.json
+      - name: Bundle trusted control code for jobs without dependency installation
+        run: bun build scripts/ci-release.ts --target=bun --outfile=.ci-release/control/control.js
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/control/
+          if-no-files-found: error
+          retention-days: 30
+
+  verify:
+    name: Verify release source
+    needs: [preflight]
+    if: ${{ needs.preflight.outputs.restore-mode == 'false' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      checkout-ref: ${{ needs.preflight.outputs.commit }}
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: [preflight, verify]
+    runs-on: ${{ matrix.buildRunner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ci-frontend
+          path: dist/frontend/
+      - name: Strict target build
+        env:
+          TARGET: ${{ matrix.target }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.commit }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          bun scripts/build-cross-platform.ts --platform="$TARGET" --skip-frontend --release-ci
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-platform-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/${{ matrix.binary }}
+            dist/${{ matrix.binary }}.metadata.json
+          if-no-files-found: error
+          retention-days: 30
+
+  smoke:
+    name: Smoke (${{ matrix.target }})
+    needs: [preflight, build]
+    runs-on: ${{ matrix.smokeRunner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-platform-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/platform/
+      - name: Run the downloaded binary on its native platform
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: >-
+          bun scripts/smoke-release-binary.ts --target="$TARGET"
+          --binary=".ci-release/platform/$BINARY" --metadata=".ci-release/platform/$BINARY.metadata.json"
+          --commit="$SOURCE_COMMIT" --version="$RELEASE_VERSION" --output=.ci-release/smoke/smoke.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ always() }}
+        with:
+          name: release-smoke-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/smoke/
+          if-no-files-found: error
+          retention-days: 30
+
+  assemble:
+    name: Assemble release bundle
+    needs: [preflight, verify, build, smoke]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/control/
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-platform-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/platforms/
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-smoke-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/smoke-results/
+      - name: Prepare patch tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes zstd
+          zstd --version
+      - name: Assemble and verify immutable bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          bun .ci-release/control/control.js assemble --plan=.ci-release/control/plan.json
+          --platforms-dir=.ci-release/platforms --smoke-dir=.ci-release/smoke-results
+          --bundle-dir=.ci-release/bundle
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        id: bundle
+        with:
+          name: release-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/bundle/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Record immutable artifact identity
+        env:
+          ARTIFACT_ID: ${{ steps.bundle.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.bundle.outputs.artifact-digest }}
+        run: |
+          test -n "$ARTIFACT_ID"
+          test -n "$ARTIFACT_DIGEST"
+          printf 'Bundle artifact: %s; digest: %s\n' "$ARTIFACT_ID" "$ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+  restore:
+    name: Verify original release bundle
+    needs: [preflight]
+    if: ${{ needs.preflight.outputs.restore-mode == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/control/
+      - name: Verify original run, exact artifact digest and full bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ needs.preflight.outputs.source-run-id }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: >-
+          bun .ci-release/control/control.js restore --source-run-id="$SOURCE_RUN_ID"
+          --tag="$RELEASE_TAG" --bundle-dir=.ci-release/restored
+
+  publish:
+    name: Publish verified release
+    needs: [preflight, verify, build, smoke, assemble, restore]
+    if: >-
+      ${{ always() && !cancelled() && inputs.publish && needs.preflight.result == 'success' &&
+      ((needs.preflight.outputs.restore-mode == 'true' && needs.restore.result == 'success') ||
+      (needs.preflight.outputs.restore-mode == 'false' && needs.verify.result == 'success' &&
+      needs.build.result == 'success' && needs.smoke.result == 'success' && needs.assemble.result == 'success')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/control/
+      - name: Revalidate original bundle and publish without rebuilding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          SOURCE_RUN_ID: ${{ needs.preflight.outputs.source-run-id }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: >-
+          bun .ci-release/control/control.js publish --source-run-id="$SOURCE_RUN_ID"
+          --tag="$RELEASE_TAG" --bundle-dir=.ci-release/publish-bundle
+
+  gate:
+    name: Release Gate
+    if: ${{ always() }}
+    needs: [preflight, verify, build, smoke, assemble, restore, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Reject failed preflight before consuming artifacts
+        env:
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+        run: test "$PREFLIGHT_RESULT" = success
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/control/
+      - name: Require every mode-specific release dependency
+        env:
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          RESTORE_MODE: ${{ needs.preflight.outputs.restore-mode }}
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          SMOKE_RESULT: ${{ needs.smoke.result }}
+          ASSEMBLE_RESULT: ${{ needs.assemble.result }}
+          RESTORE_RESULT: ${{ needs.restore.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+        run: bun .ci-release/control/control.js gate

@@ -40,14 +40,22 @@ mock.module("../../services/update-service", () => ({
 }));
 const { updateRoutes } = await import("../update");
 const app = new Hono().route("/update", updateRoutes);
+const trustedHash = new Bun.CryptoHasher("sha512").update("trusted").digest("base64");
+const sourceIdentity = {
+	source: "github" as const,
+	repository: "narrafork/narrafork",
+	channel: "stable" as const,
+	platform: "linux-x64",
+};
 const release: ReleaseInfo = {
+	sourceIdentity,
 	source: "github",
 	repository: "NarraFork/NarraFork",
 	version: "2.0.0",
 	releaseDate: "2026-10-06",
 	path: "narrafork-2.0.0-linux-x64",
-	sha512: "trusted",
-	files: [{ url: "trusted", size: 1000, sha512: "trusted" }],
+	sha512: trustedHash,
+	files: [{ url: "trusted", size: 1000, sha512: trustedHash }],
 	_github: { repository: "NarraFork/NarraFork", downloadUrl: "https://github.com/trusted/asset" },
 };
 const post = (body: unknown) =>
@@ -91,7 +99,6 @@ describe("update source download boundary", () => {
 			repository: "narrafork/narrafork",
 			releaseInfo: {
 				...release,
-				sha512: "attacker",
 				_github: { downloadUrl: "https://evil.example/payload" },
 			},
 		});
@@ -102,6 +109,45 @@ describe("update source download boundary", () => {
 		expect(events).toContain("event: complete");
 		expect(events.match(/event: progress/g)?.length).toBeLessThan(10);
 		expect(events).toContain('"percent":100');
+	});
+	test("malformed expected digest is refused before detection rather than forwarded", async () => {
+		const response = await post({
+			releaseInfo: {
+				...release,
+				sha512: "attacker",
+				_github: { downloadUrl: "https://evil.example/payload" },
+			},
+		});
+		expect(response.status).toBe(400);
+		expect(checks).toEqual([]);
+		expect(downloads).toEqual([]);
+	});
+	test("same version with a changed hash requires explicit rechecking", async () => {
+		const otherHash = new Bun.CryptoHasher("sha512").update("other").digest("base64");
+		const response = await post({
+			releaseInfo: { version: release.version, sha512: otherHash, sourceIdentity },
+		});
+		expect(response.status).toBe(409);
+		expect((await response.json()).errorCode).toBe("UPDATE_ARTIFACT_CHANGED");
+		expect(downloads).toEqual([]);
+	});
+	test.each([
+		{ ...sourceIdentity, channel: "beta" },
+		{ ...sourceIdentity, platform: "linux-arm64" },
+		{
+			source: "update-server",
+			serverUrl: "https://updates.example",
+			product: "other",
+			channel: "stable",
+			platform: "linux-x64",
+		},
+	])("the request must still match the complete checked policy %j", async (identity) => {
+		const response = await post({
+			releaseInfo: { version: release.version, sourceIdentity: identity },
+		});
+		expect(response.status).toBe(409);
+		expect((await response.json()).errorCode).toBe("UPDATE_SOURCE_CHANGED");
+		expect(downloads).toEqual([]);
 	});
 	test("settings changed during the outbound check fail with JSON 409 before SSE", async () => {
 		currentSource = false;

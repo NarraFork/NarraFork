@@ -16,6 +16,7 @@ import {
 	computeBinaryMetadata,
 	formatMetadataJson,
 } from "./lib/binary-metadata";
+import { computeCiBinaryMetadata, runCiBuildCommand, signCiBinary } from "./lib/ci-build-strict";
 
 interface WorkerInput {
 	platform: { target: string; platformId: string; name: string };
@@ -23,12 +24,15 @@ interface WorkerInput {
 	root: string;
 	version: string;
 	commit: string;
+	releaseCi?: boolean;
 }
 
-const { platform, distDir, root, version, commit } = workerData as WorkerInput;
+const { platform, distDir, root, version, commit, releaseCi = false } = workerData as WorkerInput;
 
+if (!parentPort) throw new Error("Post-processing must run inside a worker");
+const port = parentPort;
 function log(message: string) {
-	parentPort!.postMessage({ type: "log", message });
+	port.postMessage({ type: "log", message });
 }
 
 // ---------------------------------------------------------------------------
@@ -147,7 +151,9 @@ const outfile = join(distDir, platform.name);
 const buildDate = new Date().toISOString();
 
 // 1. macOS signing (must happen before hashing so digests match the final file)
-if (platform.target.includes("darwin")) {
+if (releaseCi) {
+	await signCiBinary(platform.target, process.platform, outfile, runCiBuildCommand);
+} else if (platform.target.includes("darwin")) {
 	if (!adHocSign(outfile)) {
 		log(
 			`⚠ Ad-hoc signing failed — users may need to run: codesign --force --sign - ${relative(root, outfile)}`,
@@ -156,28 +162,35 @@ if (platform.target.includes("darwin")) {
 }
 
 // 2. SHA-512 (kept for latest*.yml) + verifiable sidecar metadata
-const fileSha512 = createHash("sha512").update(readFileSync(outfile)).digest("base64");
-const fileSize = statSync(outfile).size;
+const metadataInput = {
+	version,
+	platformId: platform.platformId,
+	target: platform.target,
+	commit,
+	buildDate,
+};
+const strictMetadata = releaseCi
+	? await computeCiBinaryMetadata(outfile, metadataInput)
+	: undefined;
+const fileSha512 =
+	strictMetadata?.sha512 ?? createHash("sha512").update(readFileSync(outfile)).digest("base64");
+const fileSize = strictMetadata?.size ?? statSync(outfile).size;
 
 let metadata: BinaryMetadata | undefined;
 try {
-	metadata = computeBinaryMetadata(outfile, {
-		version,
-		platformId: platform.platformId,
-		target: platform.target,
-		commit,
-		buildDate,
-	});
+	metadata = strictMetadata ?? computeBinaryMetadata(outfile, metadataInput);
 	const metadataPath = `${outfile}.metadata.json`;
 	writeFileSync(metadataPath, formatMetadataJson(metadata));
 	log(`✓ Metadata: ${relative(root, metadataPath)} (sha256 ${metadata.sha256.slice(0, 12)}…)`);
 } catch (err) {
+	if (releaseCi) throw err;
 	const message = err instanceof Error ? err.message : String(err);
 	log(`⚠ Metadata generation failed for ${platform.platformId}: ${message}`);
 }
 
 // 3. Zstd patch
-const prevBinary = findPreviousVersionBinary(platform.name, version);
+// Release CI assembles patches separately from explicitly verified release baselines.
+const prevBinary = releaseCi ? null : findPreviousVersionBinary(platform.name, version);
 if (prevBinary) {
 	log(`→ Generating zstd patch from ${relative(root, prevBinary.path)}...`);
 	try {
@@ -220,4 +233,4 @@ const latestYml = {
 	file: { url: platform.name, size: fileSize, sha512: fileSha512 },
 };
 
-parentPort!.postMessage({ type: "done", latestYml, metadata });
+port.postMessage({ type: "done", latestYml, metadata });

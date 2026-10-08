@@ -117,6 +117,84 @@ function addPatch(
 	return { name, path, metadataPath, meta, bytes, base };
 }
 
+describe("CI stable latest rollback guard", () => {
+	test("refuses older stable before creating a draft", async () => {
+		const { options } = fixture("1.2.0");
+		const gh = fakeGitHub(options);
+		const run = (args: string[]) =>
+			args.includes("[.[] | {tag_name, draft, prerelease}]")
+				? JSON.stringify([{ tag_name: "v1.10.0", draft: false, prerelease: false }])
+				: gh.run(args);
+		await expect(
+			publishGitHubRelease({ ...options, run, preventStableLatestRollback: true }),
+		).rejects.toThrow("rollback");
+		expect(gh.calls.some((args) => args[1] === "create")).toBe(false);
+	});
+	test("checks again immediately before publishing", async () => {
+		const { options } = fixture("1.2.0");
+		const gh = fakeGitHub(options);
+		let checks = 0;
+		const run = (args: string[]) => {
+			if (args.includes("[.[] | {tag_name, draft, prerelease}]")) {
+				checks++;
+				return JSON.stringify(
+					checks === 1 ? [] : [{ tag_name: "v2.0.0", draft: false, prerelease: false }],
+				);
+			}
+			return gh.run(args);
+		};
+		await expect(
+			publishGitHubRelease({ ...options, run, preventStableLatestRollback: true }),
+		).rejects.toThrow("rollback");
+		expect(checks).toBe(2);
+		expect(gh.release?.draft).toBe(true);
+		expect(gh.calls.some((args) => args[1] === "edit")).toBe(false);
+	});
+	test("ignores drafts, betas and semantically lower stable versions", async () => {
+		const { options } = fixture("1.10.0");
+		const gh = fakeGitHub(options);
+		const run = (args: string[]) =>
+			args.includes("[.[] | {tag_name, draft, prerelease}]")
+				? JSON.stringify([
+						{ tag_name: "v9.0.0", draft: true, prerelease: false },
+						{ tag_name: "v2.0.1", draft: false, prerelease: true },
+						{ tag_name: "v1.9.0", draft: false, prerelease: false },
+					])
+				: gh.run(args);
+		await expect(
+			publishGitHubRelease({ ...options, run, preventStableLatestRollback: true }),
+		).resolves.toMatchObject({ alreadyPublished: false });
+	});
+	test("identical public version is read-only even when a newer stable exists", async () => {
+		const { options } = fixture();
+		const gh = fakeGitHub(options);
+		await publishGitHubRelease({ ...options, run: gh.run });
+		gh.calls.length = 0;
+		await expect(
+			publishGitHubRelease({ ...options, run: gh.run, preventStableLatestRollback: true }),
+		).resolves.toMatchObject({ alreadyPublished: true });
+		expect(gh.calls.some((args) => ["create", "upload", "edit"].includes(args[1]))).toBe(false);
+	});
+	test("guard pagination failure is not interpreted as no newer stable", async () => {
+		const { options } = fixture();
+		const gh = fakeGitHub(options);
+		let pages = 0;
+		const run = (args: string[]) => {
+			if (args.includes("[.[] | {tag_name, draft, prerelease}]")) {
+				pages++;
+				return JSON.stringify(
+					Array(100).fill({ tag_name: "v1.0.0", draft: false, prerelease: false }),
+				);
+			}
+			return gh.run(args);
+		};
+		await expect(
+			publishGitHubRelease({ ...options, run, preventStableLatestRollback: true }),
+		).rejects.toThrow("pagination");
+		expect(pages).toBe(10);
+	});
+});
+
 interface FakeAsset {
 	name: string;
 	size: number;

@@ -1,5 +1,6 @@
 import { Badge, Loader, Tooltip } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
+import { preparedMatchesRelease } from "@shared/update-identity";
 import { IconClock, IconRocket } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { lazy, Suspense, useRef, useState } from "react";
@@ -66,7 +67,6 @@ export function UpdateBadge() {
 		(previousStatus?.ready === true && previousTarget.current !== currentVersion);
 	if (checkedTarget && !preservePreviousTarget) previousTarget.current = checkedTarget;
 	const targetVersion = previousTarget.current ?? checkedTarget;
-	const recommendationMatchesTarget = checkedTarget === targetVersion;
 	// `useUpdateCheck` reports `updateAvailable: false` for any check failure, including a
 	// transient one. Gating the query and the pill on it alone means a single failed re-check
 	// during the drain would hide the only ambient signal and stop polling entirely. Reading the
@@ -85,6 +85,9 @@ export function UpdateBadge() {
 	const pill = resolveScheduledUpdatePill(scheduleStatus);
 
 	const prepared = scheduleStatus?.ready === true;
+	const recommendationMatchesTarget =
+		checkedTarget === targetVersion &&
+		(!(prepared || pill) || preparedMatchesRelease(scheduleStatus?.preparedIdentity, releaseInfo));
 	if (!updateAvailable && !pill && !prepared) return null;
 
 	return (
@@ -120,6 +123,7 @@ export function UpdateBadge() {
 						setModalData({
 							latestVersion: targetVersion,
 							currentVersion,
+							preparedStatus: prepared || pill ? scheduleStatus : undefined,
 							...(recommendationMatchesTarget && {
 								releaseInfo,
 								releaseNotes,
