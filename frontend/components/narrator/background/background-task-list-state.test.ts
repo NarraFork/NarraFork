@@ -61,6 +61,25 @@ function delta(overrides: Partial<BackgroundTaskListDelta> = {}): BackgroundTask
 }
 
 describe("applyBackgroundTaskDelta", () => {
+	test("service classification and counts survive delta/cache round trips without hiding stoppable services", () => {
+		const task = item("1");
+		const service = item("1", { backgroundKind: "service" });
+		const state = toBackgroundTaskListState([
+			page([task], { activeWorkCount: 1, activeServiceCount: 0 }),
+		]);
+		const result = applyBackgroundTaskDelta(
+			state,
+			delta({ upsert: service, activeWorkCount: 0, activeServiceCount: 1 }),
+		);
+		expect(result.kind).toBe("applied");
+		if (result.kind !== "applied") return;
+		const restored = toBackgroundTaskListState(result.state.pages);
+		expect(restored).toMatchObject({ activeCount: 1, activeWorkCount: 0, activeServiceCount: 1 });
+		expect(restored?.activeTasks).toEqual([service]);
+		expect(flattenBackgroundTaskList(restored)).toEqual([service]);
+		expect(restored?.activeTasks[0]?.canCancelActiveWork).toBeTrue();
+	});
+
 	// A restart mints a new epoch, and versions from two processes are not
 	// comparable. Applying such a frame would silently mix two servers' views.
 	test("refetches when the server epoch differs", () => {

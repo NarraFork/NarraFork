@@ -1328,10 +1328,12 @@ function NarratorPanelBody({
 	// for pushed subagent views so the badge and opened panel never disagree.
 	const tasksPanelMatchesCurrentNarrator = !dock || dock.narratorId === narratorId;
 	const tasksButtonEnabled = !isWorkspacePreview && tasksPanelMatchesCurrentNarrator;
-	const { supported: tasksSupported, runningCount: tasksRunningCount } = useBackgroundTasksButton(
-		narratorId,
-		tasksButtonEnabled,
-	);
+	const {
+		supported: tasksSupported,
+		runningCount: tasksRunningCount,
+		workCount: tasksWorkCount,
+		serviceCount: tasksServiceCount,
+	} = useBackgroundTasksButton(narratorId, tasksButtonEnabled);
 	// Open state and toggling for the tasks entry now live in the registry-driven
 	// header (`toolbarEntryActive` / `activateToolbarEntry`), which also handles the
 	// off-dock drawer fallback.
@@ -2527,11 +2529,20 @@ function NarratorPanelBody({
 	const toolbarBadgeCounts = useMemo<NarratorToolbarBadgeCounts>(
 		() => ({
 			backgroundTasks: tasksRunningCount,
+			backgroundWork: tasksWorkCount,
+			backgroundServices: tasksServiceCount,
 			browserSessions: wsState.browserSessionCount,
 			userChatUnread,
 			terminals: activeTerminalCount,
 		}),
-		[tasksRunningCount, wsState.browserSessionCount, userChatUnread, activeTerminalCount],
+		[
+			tasksRunningCount,
+			tasksWorkCount,
+			tasksServiceCount,
+			wsState.browserSessionCount,
+			userChatUnread,
+			activeTerminalCount,
+		],
 	);
 
 	const toolbarController = useHeaderToolbar({
@@ -2826,6 +2837,8 @@ function NarratorPanelBody({
 	const mobileToolbarMeasurementKey = [
 		i18n.resolvedLanguage,
 		toolbarBadgeCounts.backgroundTasks,
+		toolbarBadgeCounts.backgroundWork,
+		toolbarBadgeCounts.backgroundServices,
 		toolbarBadgeCounts.browserSessions,
 		toolbarBadgeCounts.userChatUnread,
 		toolbarBadgeCounts.terminals,
@@ -3329,6 +3342,8 @@ function NarratorPanelBody({
 								supported: tasksSupported,
 								buttonEnabled: tasksButtonEnabled,
 								runningCount: tasksRunningCount,
+								workCount: tasksWorkCount,
+								serviceCount: tasksServiceCount,
 								onOpenPanel: () => {
 									if (dock) dock.openToolPanel("tasks");
 									else setMobileTasksOpen(true);

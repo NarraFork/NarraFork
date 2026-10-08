@@ -64,6 +64,7 @@ const TAIL_POLL_INTERVAL_MS = 1_500;
 interface UnifiedTask {
 	id: string;
 	kind: BackgroundTaskType;
+	backgroundKind: "task" | "service";
 	status: string;
 	label: string;
 	command: string | null;
@@ -85,6 +86,7 @@ function toUnifiedTask(task: BackgroundTaskListItem): UnifiedTask {
 	return {
 		id: task.id,
 		kind: task.type,
+		backgroundKind: task.backgroundKind ?? "task",
 		status: task.effectiveStatus || task.status,
 		label: task.title || task.alias || task.command || task.subagentType || "Task",
 		command: task.command,
@@ -205,11 +207,21 @@ export function useBackgroundTasksButton(
 ): {
 	supported: boolean;
 	runningCount: number;
+	workCount: number;
+	serviceCount: number;
 } {
 	const subagentsCapability = useNarratorSubagentsCapability();
 	const supported = enabled && subagentsCapability.supported && subagentsCapability.background;
-	const { activeCount } = useBackgroundTaskList(narratorId, supported);
-	return { supported, runningCount: activeCount };
+	const { activeCount, activeWorkCount, activeServiceCount } = useBackgroundTaskList(
+		narratorId,
+		supported,
+	);
+	return {
+		supported,
+		runningCount: activeCount,
+		workCount: activeWorkCount,
+		serviceCount: activeServiceCount,
+	};
 }
 
 /**
@@ -461,6 +473,17 @@ export function BackgroundTasksPanel({
 									{canExpand &&
 										(expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />)}
 									<Icon size={14} />
+									<Badge
+										size="xs"
+										variant="light"
+										color={task.backgroundKind === "service" ? "teal" : "blue"}
+									>
+										{t(
+											task.backgroundKind === "service"
+												? "backgroundTasks.kindService"
+												: "backgroundTasks.kindTask",
+										)}
+									</Badge>
 									{task.kind === "bash" && task.command ? (
 										<Code
 											style={{
@@ -673,19 +696,22 @@ interface BackgroundTasksDrawerProps {
 export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps) {
 	const { t } = useTranslation("narrator");
 	const [opened, { open, close }] = useDisclosure(false);
-	const { supported, runningCount } = useBackgroundTasksButton(narratorId);
+	const { supported, runningCount, workCount, serviceCount } = useBackgroundTasksButton(narratorId);
 	useMobileDrawerHistory(opened, close);
 
 	if (!supported) return null;
 
 	return (
 		<>
-			<Tooltip label={t("backgroundTasks.title")}>
+			<Tooltip
+				label={t("backgroundTasks.activeKinds", { work: workCount, services: serviceCount })}
+			>
 				<Indicator
 					inline
-					size={8}
-					color="blue"
-					processing
+					size={workCount > 0 ? 8 : 14}
+					color={workCount > 0 ? "blue" : "teal"}
+					label={workCount > 0 ? undefined : serviceCount}
+					processing={workCount > 0}
 					disabled={runningCount === 0}
 					offset={3}
 					zIndex={1}

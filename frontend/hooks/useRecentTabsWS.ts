@@ -65,6 +65,8 @@ function dispatchListStateItem(
 		onUpdate(narratorId, {
 			type: "backgroundTaskCount",
 			activeBackgroundTaskCount: state.activeBackgroundTaskCount,
+			activeBackgroundWorkCount: state.activeBackgroundWorkCount as number | undefined,
+			activeBackgroundServiceCount: state.activeBackgroundServiceCount as number | undefined,
 		});
 	}
 	if ("containerStatus" in state) {
@@ -167,6 +169,8 @@ export function useRecentTabsWS(
 					onUpdateRef.current(narratorId, {
 						type: "backgroundTaskCount",
 						activeBackgroundTaskCount: data.activeBackgroundTaskCount as number,
+						activeBackgroundWorkCount: data.activeBackgroundWorkCount as number | undefined,
+						activeBackgroundServiceCount: data.activeBackgroundServiceCount as number | undefined,
 					});
 				} else if (data.type === "container_status_changed") {
 					onUpdateRef.current(narratorId, {

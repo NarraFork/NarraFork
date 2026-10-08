@@ -2,6 +2,47 @@ import { describe, expect, test } from "bun:test";
 import { dispatchRecentTabsListStateSnapshot } from "./useRecentTabsWS";
 
 describe("RecentTabs list-state snapshots", () => {
+	test("forwards service-only and mixed classified snapshots including explicit zero", () => {
+		const events: unknown[] = [];
+		dispatchRecentTabsListStateSnapshot(
+			{
+				items: [
+					{
+						narratorId: "services",
+						activeBackgroundTaskCount: 2,
+						activeBackgroundWorkCount: 0,
+						activeBackgroundServiceCount: 2,
+					},
+					{
+						narratorId: "mixed",
+						state: {
+							activeBackgroundTaskCount: 3,
+							activeBackgroundWorkCount: 1,
+							activeBackgroundServiceCount: 2,
+						},
+					},
+				],
+			},
+			(id, event) => events.push({ id, ...event }),
+		);
+		expect(events).toEqual([
+			{
+				id: "services",
+				type: "backgroundTaskCount",
+				activeBackgroundTaskCount: 2,
+				activeBackgroundWorkCount: 0,
+				activeBackgroundServiceCount: 2,
+			},
+			{
+				id: "mixed",
+				type: "backgroundTaskCount",
+				activeBackgroundTaskCount: 3,
+				activeBackgroundWorkCount: 1,
+				activeBackgroundServiceCount: 2,
+			},
+		]);
+	});
+
 	test("fans a batched list snapshot into narrator updates", () => {
 		const updates: Array<{
 			narratorId: string;

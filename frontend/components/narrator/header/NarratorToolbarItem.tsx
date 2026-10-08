@@ -43,7 +43,11 @@ export function NarratorToolbarItem({
 	mode = "inline",
 }: NarratorToolbarItemProps) {
 	const Icon = def.icon;
-	const label = t(def.labelKey, { ns: def.namespace ?? "narrator" });
+	const title = t(def.labelKey, { ns: def.namespace ?? "narrator" });
+	const label =
+		def.badge === "backgroundTasks"
+			? `${title}: ${t("backgroundTasks.activeKinds", { ns: "narrator", work: toolbarBadgeCounts.backgroundWork ?? toolbarBadgeCounts.backgroundTasks, services: toolbarBadgeCounts.backgroundServices ?? 0 })}`
+			: title;
 	const active = controller.toolbarEntryActive(def.id);
 	const badge = resolveNarratorToolbarBadge(def.badge, toolbarBadgeCounts);
 	if (def.id === "path-rules" && mode === "inline") {

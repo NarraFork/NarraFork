@@ -1773,6 +1773,8 @@ export function useNarratorWS(
 								listEpoch: data.listEpoch as string,
 								version: data.version as number,
 								activeCount: data.activeCount as number,
+								activeWorkCount: data.activeWorkCount as number | undefined,
+								activeServiceCount: data.activeServiceCount as number | undefined,
 								upsert: data.upsert as BackgroundTaskListDelta["upsert"],
 								removeIds: data.removeIds as string[] | undefined,
 								invalidate: data.invalidate as boolean | undefined,
@@ -1986,6 +1988,8 @@ export interface NarratorListWSEvent {
 	}>;
 	activeTerminalCount?: number;
 	activeBackgroundTaskCount?: number;
+	activeBackgroundWorkCount?: number;
+	activeBackgroundServiceCount?: number;
 	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
 	hasDraft?: boolean;
 	/** `awaitedQuestion` only: true when an agent just started blocking on a question. */

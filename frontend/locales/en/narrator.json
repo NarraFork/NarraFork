@@ -1625,7 +1625,10 @@
 	"openSubagentSession": "Open session",
 	"openStandalonePage": "Open in standalone page",
 	"backgroundTasks": {
-		"title": "Background Tasks",
+		"title": "Background Tasks & Services",
+		"kindService": "Service",
+		"kindTask": "Task",
+		"activeKinds": "{{work}} task(s), {{services}} service(s) running",
 		"activeCount": "Background tasks: {{count}}",
 		"openPanel": "Open background tasks panel",
 		"cancel": "Cancel task",

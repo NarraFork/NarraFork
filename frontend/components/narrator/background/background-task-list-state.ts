@@ -23,6 +23,8 @@ export interface BackgroundTaskListState {
 	listEpoch: string;
 	version: number;
 	activeCount: number;
+	activeWorkCount?: number;
+	activeServiceCount?: number;
 	activeTasks: BackgroundTaskListItem[];
 	activeTruncated: boolean;
 	/** Cursor pages in load order (page 0 is newest). */
@@ -45,6 +47,8 @@ export function toBackgroundTaskListState(
 		listEpoch: first.listEpoch,
 		version: first.version,
 		activeCount: first.activeCount,
+		activeWorkCount: first.activeWorkCount,
+		activeServiceCount: first.activeServiceCount,
 		activeTasks: first.activeTasks ?? [],
 		activeTruncated: first.activeTruncated ?? false,
 		pages,
@@ -178,6 +182,8 @@ export function applyBackgroundTaskDelta(
 					...page,
 					version: delta.version,
 					activeCount: delta.activeCount,
+					activeWorkCount: delta.activeWorkCount,
+					activeServiceCount: delta.activeServiceCount,
 					activeTasks,
 					activeTruncated: state.activeTruncated,
 				}
@@ -190,6 +196,8 @@ export function applyBackgroundTaskDelta(
 			...state,
 			version: delta.version,
 			activeCount: delta.activeCount,
+			activeWorkCount: delta.activeWorkCount,
+			activeServiceCount: delta.activeServiceCount,
 			activeTasks,
 			pages: nextPages,
 		},

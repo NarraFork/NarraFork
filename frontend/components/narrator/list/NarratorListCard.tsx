@@ -13,6 +13,7 @@ import {
 	IconArchive,
 	IconArchiveOff,
 	IconBox,
+	IconServer,
 	IconSubtask,
 	IconTerminal2,
 	IconTrash,
@@ -97,6 +98,8 @@ export interface NarratorListItem {
 	lastMessageAt?: string | null;
 	activeTerminalCount?: number | null;
 	activeBackgroundTaskCount?: number | null;
+	activeBackgroundWorkCount?: number | null;
+	activeBackgroundServiceCount?: number | null;
 	containerCount?: number | null;
 	runningContainerCount?: number | null;
 	chapter?: NarratorListChapter | null;
@@ -200,7 +203,10 @@ function NarratorBadges({
 	mobile?: boolean;
 }) {
 	const activeTerminals = narrator.activeTerminalCount ?? 0;
-	const activeBackgroundTasks = narrator.activeBackgroundTaskCount ?? 0;
+	const { t } = useTranslation("common");
+	const activeBackgroundTasks =
+		narrator.activeBackgroundWorkCount ?? narrator.activeBackgroundTaskCount ?? 0;
+	const activeServices = narrator.activeBackgroundServiceCount ?? 0;
 	const containers = narrator.containerCount ?? 0;
 	const runningContainers = narrator.runningContainerCount ?? 0;
 	return (
@@ -226,6 +232,19 @@ function NarratorBadges({
 				>
 					{activeBackgroundTasks}
 				</Badge>
+			)}
+			{activeServices > 0 && (
+				<Tooltip label={t("activeBackgroundServices", { count: activeServices })}>
+					<Badge
+						size="xs"
+						variant="light"
+						color="teal"
+						leftSection={<IconServer size={10} />}
+						style={mobile ? { flexShrink: 0 } : undefined}
+					>
+						{activeServices}
+					</Badge>
+				</Tooltip>
 			)}
 			{containers > 0 && (
 				<Badge
