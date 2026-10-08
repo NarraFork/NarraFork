@@ -32,6 +32,38 @@ function commit(sha: string, parents?: string[], extra?: Partial<GitGraphCommit>
 }
 
 describe("layoutCommitGraph", () => {
+	test.each([
+		{ from: 22, to: 11, sweep1: 1, sweep2: 0 },
+		{ from: 33, to: 11, sweep1: 1, sweep2: 0 },
+		{ from: 11, to: 22, sweep1: 0, sweep2: 1 },
+		{ from: 11, to: 33, sweep1: 0, sweep2: 1 },
+	])("through-lane curves remain tangent when moving $from → $to", ({
+		from,
+		to,
+		sweep1,
+		sweep2,
+	}) => {
+		const lane = { id: "parent", color: GRAPH_COLORS[0] as string };
+		const lanes = (x: number) =>
+			Array.from({ length: x / GRAPH_LANE_WIDTH }, (_, i) =>
+				i === x / GRAPH_LANE_WIDTH - 1 ? lane : { id: `other-${i}`, color: lane.color },
+			);
+		const paths = buildRowSvgPaths({
+			commit: commit("root", []),
+			input: lanes(from),
+			output: lanes(to),
+			laneIndex: 0,
+			color: lane.color,
+			isHead: false,
+			topologyKnown: true,
+		});
+		const dir = to > from ? 1 : -1;
+		expect(paths).toContainEqual({
+			d: `M ${from} 0 V 6 A 5 5 0 0 ${sweep1} ${from + dir * 5} 11 H ${to - dir * 5} A 5 5 0 0 ${sweep2} ${to} 16 V 22`,
+			stroke: lane.color,
+		});
+	});
+
 	test("1. empty commit list yields no rows", () => {
 		expect(layoutCommitGraph([])).toEqual([]);
 		expect(layoutCommitGraph([], "HEAD")).toEqual([]);

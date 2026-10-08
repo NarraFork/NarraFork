@@ -96,8 +96,9 @@ function sCurvePath(x1: number, x2: number): string {
 	const y0 = 6;
 	const midY = y0 + r;
 	const y2 = midY + r;
-	const sweep1 = dir > 0 ? 1 : 0;
-	const sweep2 = dir > 0 ? 0 : 1;
+	// Keep both quarter-arcs tangent to the adjoining vertical/horizontal segments.
+	const sweep1 = dir > 0 ? 0 : 1;
+	const sweep2 = dir > 0 ? 1 : 0;
 	return (
 		`M ${x1} 0 V ${y0} ` +
 		`A ${r} ${r} 0 0 ${sweep1} ${x1 + dir * r} ${midY} ` +
