@@ -17,7 +17,7 @@
  * session. It must degrade to a null boundary and let the tool proceed.
  */
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
@@ -124,6 +124,54 @@ afterEach(async () => {
 });
 
 describe("execution-owned snapshot boundaries", () => {
+	test("IntelligentUI create records a generated file boundary while show records none", async () => {
+		const repo = await createRepo("nf-ui-snapshot-");
+		const narratorId = await createSubagent(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		const hooks = buildTreeSnapshotExecutionHooks({ session, narratorId, isInGitRepo: true });
+		const directory = join(repo, ".narrafork/intelligent_ui/demo-unique");
+		for (const [seq, action] of [
+			[1, "create"],
+			[2, "show"],
+		] as const) {
+			const call = await seedToolCall(narratorId, "IntelligentUI", seq);
+			const row = await db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.messageId, call.messageId),
+			});
+			if (!row) throw new Error("Missing UI tool fixture");
+			await db
+				.update(narratorToolCalls)
+				.set({ executionAttempt: 1 })
+				.where(eq(narratorToolCalls.id, row.id));
+			const input = action === "create" ? { action, prefix: "demo" } : { action, path: directory };
+			const context = {
+				toolUse: { name: "IntelligentUI", toolUseId: call.toolUseId, input },
+				effectiveInput: input,
+				binding: { toolCallId: row.id, attempt: 1 },
+				executionTarget: {
+					deviceId: "local",
+					backendKind: "local" as const,
+					cwd: repo,
+					selectionSource: "local_default" as const,
+				},
+			};
+			await hooks.onToolExecutionBefore?.(context);
+			if (action === "create") {
+				mkdirSync(directory, { recursive: true });
+				writeFileSync(join(directory, "App.tsx"), "export default () => null");
+			}
+			await hooks.onToolExecutionAfter?.({ ...context, result: { output: "ok" } });
+			const boundary = await readToolCallBoundaries(call.toolUseId);
+			if (action === "create") {
+				expect(boundary?.treeHashBefore).toMatch(/^[0-9a-f]{40}$/);
+				expect(boundary?.treeHashAfter).toMatch(/^[0-9a-f]{40}$/);
+				expect(boundary?.treeHashAfter).not.toBe(boundary?.treeHashBefore);
+			} else {
+				expect(boundary?.treeHashBefore).toBeNull();
+				expect(boundary?.treeHashAfter).toBeNull();
+			}
+		}
+	});
 	test("uses redirected inputs and updates only the bound row among repeated provider ids", async () => {
 		const repo = await createRepo("nf-lifecycle-binding-");
 		const narratorId = await createSubagent(repo);

@@ -4145,6 +4145,7 @@ function buildToolCardData(
 		// Expanded detail region height model (line counts / body lines / px).
 		// null when the tool call has no meaningful detail body.
 		detail: classifyToolDetail({
+			toolCallId: resolveToolDetailRef(item).toolCallId,
 			...(item.dedupeSuffix ? { occurrence: item.dedupeSuffix } : {}),
 			...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : { previewId: toolItemKey(item) }),
 			toolName: item.tc.toolName,

@@ -1748,6 +1748,8 @@ export function measureToolBody(
 	viewportHeight?: number,
 ): MeasuredToolBody {
 	switch (detail.kind) {
+		case "intelligent-ui":
+			return finishRegion(detail, [makeFixed(88, "intelligent-ui", 0)], innerWidth, null);
 		case "meta-rows": {
 			const rows = detail.rows.slice(0, META_ROWS_MAX);
 			const blocks: PreparedBlock[] = [];

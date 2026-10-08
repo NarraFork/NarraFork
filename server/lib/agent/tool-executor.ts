@@ -1527,6 +1527,12 @@ export async function executeTool(
 					: undefined;
 				if (authorizeFinalStart && typeof finalTicket?.assertStillCurrent !== "function")
 					throw new Error("Final authorization did not return a synchronous policy fence");
+				ctx.assertFinalExecutionPermission = () => {
+					config.signal.throwIfAborted();
+					config.assertWorkspaceCurrent?.();
+					if (!finalTicket) throw new Error("A final execution permission fence is required");
+					finalTicket.assertStillCurrent();
+				};
 				config.signal.throwIfAborted();
 				config.assertWorkspaceCurrent?.();
 				// Only actual execution is painted as running; captures are preparation.

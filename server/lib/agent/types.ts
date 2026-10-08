@@ -109,6 +109,8 @@ export interface ToolContext {
 	/** Eval-only audited Read bridge; never exposes the runner configuration. */
 	executeRead?: (input: Record<string, unknown>, signal: AbortSignal) => Promise<ToolResult>;
 	recheckAuthorization?: () => Promise<void>;
+	/** Trusted synchronous policy fence; invoke after awaits, immediately before a deferred side effect. */
+	assertFinalExecutionPermission?: () => void;
 	narratorId: string;
 	cwd: string;
 	signal: AbortSignal;
@@ -906,6 +908,8 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Question",
 	"Skill",
 	"LearningGuide",
+	// Visibility only: narrator-permission admits show, never create.
+	"IntelligentUI",
 ]);
 
 // === Agent config ===

@@ -3173,6 +3173,21 @@ describe("device-aware snapshot revert", () => {
  * old nor the new revision.
  */
 describe("replay divergence is never silently absorbed", () => {
+	test("IntelligentUI creates require the ordinary byte journal, not legacy input replay", () => {
+		const call: OrderedToolCall = {
+			toolUseId: "ui-create",
+			toolName: "IntelligentUI",
+			inputJson: { action: "create", prefix: "demo" },
+			status: "success",
+			messageId: "message",
+			seq: 1,
+			createdAt: new Date().toISOString(),
+		};
+		expect(() => applyToolCall(null, call)).toThrow(ReplayDivergedError);
+		expect(applyToolCall("unchanged", { ...call, inputJson: { action: "show" } })).toBe(
+			"unchanged",
+		);
+	});
 	test("an Edit whose old_string is gone fails instead of returning stale content", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "nf-replay-diverge-"));
 		tempDirs.push(cwd);

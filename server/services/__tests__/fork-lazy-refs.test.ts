@@ -459,7 +459,7 @@ describe("detaching lazy forks before their ancestor disappears", () => {
 		expect(refs).toEqual(await refsOf("parent"));
 	});
 
-	test("removing a parent still cascades into its fork children", async () => {
+	test("removing a parent preserves independent fork children and their materialized refs", async () => {
 		const { tailMessageId } = await seedParentWithCompact();
 		const child = await narratorService.forkNarrator("parent", null, {
 			inheritMode: "full",
@@ -469,10 +469,11 @@ describe("detaching lazy forks before their ancestor disappears", () => {
 
 		await narratorService.remove("parent");
 
-		// Unchanged behaviour: the child is a fork child, so it goes with the parent.
-		expect(
-			await db.query.narrators.findFirst({ where: eq(narrators.id, child.id) }),
-		).toBeUndefined();
+		// Primary forks are independent owners; only actual subagents cascade.
+		expect(await db.query.narrators.findFirst({ where: eq(narrators.id, child.id) })).toMatchObject(
+			{ parentNarratorId: null, refsInheritedFrom: null, refsBackfillCursor: null },
+		);
+		expect((await refsOf(child.id)).map((row) => row.messageId)).toContain("parent-old-0");
 		expect(
 			await db.query.narrators.findFirst({ where: eq(narrators.id, "parent") }),
 		).toBeUndefined();

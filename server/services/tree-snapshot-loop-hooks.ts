@@ -34,6 +34,10 @@
  *   `chapters.treeSnapshotsEnabled` escape hatch is honoured inside
  *   `captureSessionTree`, so it applies to every caller of this module.
  */
+import {
+	INTELLIGENT_UI_TOOL_NAME,
+	isIntelligentUiReadAction,
+} from "@shared/intelligent-ui-tool-policy";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import type {
@@ -63,7 +67,23 @@ import { specVfsService } from "./spec-vfs-service";
  * `incomplete_coverage` for the whole range. That fails closed rather than pretending a
  * revert succeeded, but the capability is simply absent until the name is listed here.
  */
-export const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", "StructSed", SHELL_TOOL_NAME]);
+export const FILE_MUTATING_TOOLS = new Set([
+	"Write",
+	"Edit",
+	"StructSed",
+	SHELL_TOOL_NAME,
+	INTELLIGENT_UI_TOOL_NAME,
+]);
+
+function isFileMutation(toolName: string, input: unknown): boolean {
+	return (
+		FILE_MUTATING_TOOLS.has(toolName) &&
+		!(
+			toolName === INTELLIGENT_UI_TOOL_NAME &&
+			isIntelligentUiReadAction((input as Record<string, unknown> | null)?.action)
+		)
+	);
+}
 
 /**
  * Build the snapshot hook pair for one agent loop.
@@ -97,12 +117,14 @@ export function buildTreeSnapshotEventHooks(
 		// content-addressed git tree of the whole worktree, so it also covers
 		// writes the tool inputs do not describe (Bash, build scripts, editors).
 		onSnapshotBefore: async (toolUseId, toolName, input) => {
-			if (!FILE_MUTATING_TOOLS.has(toolName)) return;
+			if (!isFileMutation(toolName, input)) return;
 			// Write/Edit can name their target up front, which is what lets the
 			// resulting tree delta be attributed in a shared worktree. Bash cannot,
 			// so it declares nothing and its set is derived instead.
 			const declared =
-				toolName === SHELL_TOOL_NAME ? null : declaredWorktreePaths(session.cwd, input);
+				toolName === SHELL_TOOL_NAME || toolName === INTELLIGENT_UI_TOOL_NAME
+					? null // create allocates its unique directory at execution time.
+					: declaredWorktreePaths(session.cwd, input);
 			localCalls.delete(toolUseId);
 			const args = input as Record<string, unknown> | null;
 			const defaultDeviceId = session._defaultDeviceId ?? LOCAL_DEVICE_ID;
@@ -170,6 +192,8 @@ export function buildTreeSnapshotEventHooks(
 		// files Bash changed using the authoritative tree diff.
 		onSnapshotAfter: async (toolUseId, toolName) => {
 			if (!FILE_MUTATING_TOOLS.has(toolName)) return;
+			// show never admitted a before boundary; do not manufacture an unavailable after.
+			if (toolName === INTELLIGENT_UI_TOOL_NAME && !localCalls.has(toolUseId)) return;
 			const capturedCwd = localCalls.get(toolUseId);
 			localCalls.delete(toolUseId);
 			const bashWindow =
@@ -244,7 +268,7 @@ export function buildTreeSnapshotExecutionHooks(
 	const calls = new WeakMap<AgentToolUse, ReturnType<typeof buildTreeSnapshotEventHooks>>();
 	return {
 		onToolExecutionBefore: async (context) => {
-			if (!FILE_MUTATING_TOOLS.has(context.toolUse.name)) return;
+			if (!isFileMutation(context.toolUse.name, context.effectiveInput)) return;
 			const hooks = buildTreeSnapshotEventHooks({
 				...opts,
 				session: {

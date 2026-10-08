@@ -92,6 +92,17 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 		},
 	},
 	{
+		id: "intelligent_ui",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "IntelligentUI",
+			descriptionEn:
+				"Intelligent UI — create workspace UI files and preview them with NarraFork components and theme",
+			descriptionZh: "智能 UI — 创建真实 UI 文件，使用 NF 组件和主题预览",
+		},
+	},
+	{
 		id: "notification",
 		type: "tool",
 		category: "tools",

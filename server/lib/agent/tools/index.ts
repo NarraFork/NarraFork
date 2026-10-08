@@ -18,6 +18,7 @@ import { forkNarratorTool } from "./fork-narrator";
 import { globTool } from "./glob";
 import { grepTool } from "./grep";
 import { hookAdminTool } from "./hook-admin";
+import { intelligentUiTool } from "./intelligent-ui";
 import { knowledgeLibraryTool, knowledgeReadTool, knowledgeSearchTool } from "./knowledge";
 import { knowledgeAdminTool } from "./knowledge-admin";
 import { knowledgeCreateTool, knowledgeEditTool } from "./knowledge-edit";
@@ -64,6 +65,7 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Eval", evalTool],
 	["Terminal", terminalTool],
 	["ShareFile", shareFileTool],
+	["IntelligentUI", intelligentUiTool],
 	["Notification", notificationTool],
 	["Recall", recallTool],
 	["Browser", browserTool],

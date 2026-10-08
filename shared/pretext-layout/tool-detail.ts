@@ -13,6 +13,14 @@
  * Shared types are the single source for classification, measurement and paint.
  */
 
+import {
+	type IntelligentUiFileReference,
+	readIntelligentUiFileReference,
+} from "../intelligent-ui-files";
+import {
+	INTELLIGENT_UI_PUBLIC_SUMMARY,
+	INTELLIGENT_UI_PUBLIC_SUMMARY_CODE,
+} from "../intelligent-ui-public";
 import { hasUsablePlanBody } from "../plan-reference";
 import { classifySharePreview, type SharePreviewRef, sharePreviewHeight } from "../share-preview";
 import { readBackgroundTaskId, stripAwaitAgentEnvelope } from "../subagent-result-text";
@@ -484,6 +492,13 @@ export type ToolSectionLabel =
 	| "plan"
 	| "error";
 
+export interface ToolIntelligentUiDetail {
+	kind: "intelligent-ui";
+	file: IntelligentUiFileReference | null;
+	publicSummary?: boolean;
+	historyUnavailable?: boolean;
+}
+
 /** A body a section can host: every leaf kind EXCEPT `sections` (no nesting). */
 export type ToolSectionBody =
 	| ToolCappedDetail
@@ -491,7 +506,8 @@ export type ToolSectionBody =
 	| ToolErrorDetail
 	| ToolSpecTasksDetail
 	| ToolMetaRowsDetail
-	| ToolAskDetail;
+	| ToolAskDetail
+	| ToolIntelligentUiDetail;
 
 /** One labelled section inside a multi-part detail. */
 export interface ToolDetailSection {
@@ -771,10 +787,13 @@ export type ClassifyToolDetailInput = ClassifyToolDetailFields &
 	({ toolUseId: string; previewId?: never } | { previewId: string; toolUseId?: never });
 
 interface ClassifyToolDetailFields {
+	/** Actual visible historical row; COW copies have a new PK but unchanged output metadata. */
+	toolCallId?: string;
 	/** Explicit producer-supplied attempt identity; never inferred from a viewport index. */
 	occurrence?: string | number;
 	toolName: string;
 	category: string;
+	publicSummary?: string;
 	status?: string | null;
 	inputJson?: unknown;
 	outputJson?: unknown;
@@ -844,8 +863,34 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 			? toolInputFieldView(input.inputJson)
 			: input.inputJson;
 	const output = toolOutputValue(input.outputJson, metadata);
+	if (
+		toolName === "IntelligentUI" &&
+		(input.publicSummary === INTELLIGENT_UI_PUBLIC_SUMMARY_CODE ||
+			output === INTELLIGENT_UI_PUBLIC_SUMMARY ||
+			asObject(output)?.text === INTELLIGENT_UI_PUBLIC_SUMMARY)
+	) {
+		return single("intelligent-ui", {
+			kind: "intelligent-ui",
+			file: null,
+			publicSummary: true,
+		});
+	}
+	// Only host-owned metadata is a file reference; never promote tool input or output text.
+	const uiRef = toolName === "IntelligentUI" ? metadata?.intelligentUi : null;
+	const uiFile = readIntelligentUiFileReference(uiRef);
+	const uiDetail: ToolDetailData | null = uiRef
+		? single("intelligent-ui", {
+				kind: "intelligent-ui",
+				// Select the visible copy, not an origin PK retained in immutable tool output.
+				// The server checks both visibility and the copy's trusted provenance column.
+				file: uiFile && input.toolCallId ? { ...uiFile, toolCallId: input.toolCallId } : uiFile,
+				...(metadata?.fileChangeHistoryUnavailable === true ? { historyUnavailable: true } : {}),
+			})
+		: null;
 	const base = withErrorSection(
-		classifyByCategory(toolName, category, status, fields, output, metadata, input),
+		toolName === "IntelligentUI"
+			? (uiDetail ?? sections([textSection("output.main", output, "output")]))
+			: classifyByCategory(toolName, category, status, fields, output, metadata, input),
 		input.errorMessage,
 		input.outputJson,
 	);

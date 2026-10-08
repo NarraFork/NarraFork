@@ -1,3 +1,4 @@
+import { isIntelligentUiToolName } from "@shared/intelligent-ui-public";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
@@ -10,6 +11,10 @@ import {
 } from "../lib/validators/public-narrator-shares";
 import { listPublicDiscussion, postPublicDiscussion } from "../services/chat-service";
 import { narratorService } from "../services/narrator-service";
+import {
+	isPublicToolSourceAllowed,
+	projectPublicNarratorPayload,
+} from "../services/public-narrator-share-intelligent-ui";
 import { PUBLIC_SHARE_LIMITS as L } from "../services/public-narrator-share-limits";
 import { publicShareRateLimiter } from "../services/public-narrator-share-rate-limit";
 import {
@@ -165,10 +170,10 @@ publicNarratorShareRoutes.get("/:shareId/session", (c) =>
 );
 
 // ── Narrator document read-through ──────────────────────────────────────────
-// The share link IS the grant: these forward verbatim to the narrator read
-// services (no projection), so a share reader sees exactly what the session
-// owner sees. Parameter parsing mirrors the authenticated routes in
-// `server/routes/narrators.ts` — keep them in sync.
+// The share link grants existing narrator reads unchanged, except IntelligentUI
+// tool cards: preview references/results become a static server-authored summary.
+// Ordinary Read/Write/Edit file history is unchanged, including UI source files.
+// Parameter parsing mirrors `server/routes/narrators.ts` — keep them in sync.
 publicNarratorShareRoutes.get("/:shareId/pretext-document", async (c) => {
 	const auth = c.get("publicShare");
 	const afterSeqRaw = c.req.query("afterSeq");
@@ -208,11 +213,17 @@ publicNarratorShareRoutes.get("/:shareId/pretext-document", async (c) => {
 			"PRETEXT_DOCUMENT_CHANGED",
 		);
 	revalidatePublicShare(auth);
-	return c.json(result);
+	return c.json(projectPublicNarratorPayload(auth.narratorId, result));
 });
 publicNarratorShareRoutes.get("/:shareId/tool-calls/:toolUseId/input-document", async (c) => {
 	const auth = c.get("publicShare");
 	const reference = parseHistoricalWriteDocumentReference(c.req.query());
+	const metadata = await narratorService.getToolCallPreviewMetadata(
+		auth.narratorId,
+		c.req.param("toolUseId"),
+		reference,
+	);
+	if (isIntelligentUiToolName(metadata.toolName)) throw unavailablePublicShare();
 	const ref = await toolInputStreamSource.ensureWriteDocumentSource(
 		auth.narratorId,
 		c.req.param("toolUseId"),
@@ -226,6 +237,14 @@ publicNarratorShareRoutes.get("/:shareId/tool-calls/:toolUseId/input-document", 
 publicNarratorShareRoutes.get("/:shareId/text-documents/:refId", async (c) => {
 	const auth = c.get("publicShare");
 	const { offset, limit } = parseTextDocumentRangeQuery(c.req.query());
+	// Descriptor metadata is server-owned. Classify BEFORE reading source bytes,
+	// including refs learned from an authenticated tab or a prior WS connection.
+	const descriptor = toolInputStreamSource.descriptor(c.req.param("refId"));
+	if (
+		descriptor.source?.narratorId !== auth.narratorId ||
+		!isPublicToolSourceAllowed(auth.narratorId, descriptor.source)
+	)
+		throw unavailablePublicShare();
 	const range = await toolInputStreamSource.getTextDocumentRange(
 		auth.narratorId,
 		c.req.param("refId"),
@@ -249,14 +268,24 @@ publicNarratorShareRoutes.get("/:shareId/message-location/:messageId", async (c)
 });
 publicNarratorShareRoutes.get("/:shareId/tool-calls/:toolUseId", async (c) => {
 	const auth = c.get("publicShare");
+	const reference = {
+		toolCallId: c.req.query("toolCallId"),
+		messageId: c.req.query("messageId"),
+	};
+	const metadata = await narratorService.getToolCallPreviewMetadata(
+		auth.narratorId,
+		c.req.param("toolUseId"),
+		reference,
+	);
+	// The existing selector handles shared refs/COW/subagent ancestry. Do not load
+	// private input/output/error bodies just to discover that access is forbidden.
+	if (isIntelligentUiToolName(metadata.toolName)) throw unavailablePublicShare();
 	const detail = await narratorService.getToolCallDetail(
 		auth.narratorId,
 		c.req.param("toolUseId"),
-		{
-			toolCallId: c.req.query("toolCallId"),
-			messageId: c.req.query("messageId"),
-		},
+		{ toolCallId: metadata.id, messageId: metadata.messageId },
 	);
+	if (isIntelligentUiToolName(detail.toolName)) throw unavailablePublicShare();
 	revalidatePublicShare(auth);
 	return c.json(detail);
 });

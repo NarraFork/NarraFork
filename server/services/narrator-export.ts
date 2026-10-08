@@ -33,12 +33,20 @@
  */
 
 import { parseCompactMessageBlock } from "@shared/compact-message";
+import {
+	INTELLIGENT_UI_PUBLIC_SUMMARY,
+	INTELLIGENT_UI_PUBLIC_SUMMARY_CODE,
+	INTELLIGENT_UI_TOOL_NAME,
+	isIntelligentUiToolName,
+	publicIntelligentUiSummary,
+} from "@shared/intelligent-ui-public";
 import { and, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
 import { logger } from "../lib/logger";
 import { isSubagentVariant } from "../lib/narrator-utils";
 import { resolveLazyLineage } from "./narrator-refs-backfill";
+import { projectPublicNarratorPayload } from "./public-narrator-share-intelligent-ui";
 
 // ── Tunables ───────────────────────────────────────────────────────────────
 
@@ -201,6 +209,8 @@ interface ExportMessageRow {
 	costStatus?: "complete" | "partial" | "unknown" | null;
 	costMissingFields?: string[] | null;
 	parentToolUseId: string | null;
+	/** Indexed server-owned identity, also available when a child's JSON is clamped. */
+	hasPrivateUi?: number;
 	/**
 	 * Only set on child (subagent) rows: their content is clamped in SQL, so a
 	 * reader has to be told when what they see is an excerpt. Top-level rows are
@@ -436,7 +446,16 @@ async function loadRefPage(
 	}));
 }
 
+// No body reads/JSON parsing: the message index establishes the trusted tool identity.
+const messageHasPrivateUi = sql<number>`EXISTS (
+	SELECT 1 FROM narrator_tool_calls AS private_ui_call
+	WHERE private_ui_call.message_id = narrator_messages.id
+	AND private_ui_call.tool_name = ${INTELLIGENT_UI_TOOL_NAME}
+	LIMIT 1
+)`;
+
 const MESSAGE_COLUMNS = {
+	hasPrivateUi: messageHasPrivateUi,
 	id: narratorMessages.id,
 	role: narratorMessages.role,
 	contentJson: narratorMessages.contentJson,
@@ -498,22 +517,24 @@ async function loadToolCallMeta(messageIds: string[]) {
 			status: narratorToolCalls.status,
 			durationMs: narratorToolCalls.durationMs,
 			createdAt: narratorToolCalls.createdAt,
-			errorMessage: sql<
-				string | null
-			>`substr(${narratorToolCalls.errorMessage}, 1, ${EXPORT_TOOL_ERROR_LIMIT})`.as(
-				"error_excerpt",
+			// A private UI contributes no source, error excerpt or source-length side channel.
+			errorMessage: sql<string | null>`CASE
+				WHEN ${narratorToolCalls.toolName} = ${INTELLIGENT_UI_TOOL_NAME} THEN NULL
+				ELSE substr(${narratorToolCalls.errorMessage}, 1, ${EXPORT_TOOL_ERROR_LIMIT})
+				END`.as("error_excerpt"),
+			errorBytes: sql<number>`CASE
+				WHEN ${narratorToolCalls.toolName} = ${INTELLIGENT_UI_TOOL_NAME} THEN 0
+				ELSE length(COALESCE(${narratorToolCalls.errorMessage}, '')) END`.as("error_bytes"),
+			inputBytes: sql<number>`CASE
+				WHEN ${narratorToolCalls.toolName} = ${INTELLIGENT_UI_TOOL_NAME} THEN 0
+				ELSE length(COALESCE(CAST(${narratorToolCalls.inputJson} AS TEXT), '')) END`.as(
+				"input_bytes",
 			),
-			errorBytes: sql<number>`length(COALESCE(${narratorToolCalls.errorMessage}, ''))`.as(
-				"error_bytes",
+			outputBytes: sql<number>`CASE
+				WHEN ${narratorToolCalls.toolName} = ${INTELLIGENT_UI_TOOL_NAME} THEN 0
+				ELSE length(COALESCE(CAST(${narratorToolCalls.outputJson} AS TEXT), '')) END`.as(
+				"output_bytes",
 			),
-			inputBytes:
-				sql<number>`length(COALESCE(CAST(${narratorToolCalls.inputJson} AS TEXT), ''))`.as(
-					"input_bytes",
-				),
-			outputBytes:
-				sql<number>`length(COALESCE(CAST(${narratorToolCalls.outputJson} AS TEXT), ''))`.as(
-					"output_bytes",
-				),
 			rank: sql<number>`row_number() OVER (
 					PARTITION BY ${narratorToolCalls.messageId}
 					ORDER BY ${narratorToolCalls.createdAt}, ${narratorToolCalls.id}
@@ -555,6 +576,8 @@ function selectToolBodyIds(rows: Awaited<ReturnType<typeof loadToolCallMeta>>): 
 	const allowed = new Set<string>();
 	let spent = 0;
 	for (const row of rows) {
+		// Excluded BEFORE the body query, even when includeToolIO was requested.
+		if (isIntelligentUiToolName(row.toolName)) continue;
 		const projected =
 			Math.min(row.inputBytes, EXPORT_TOOL_FIELD_LIMIT) +
 			Math.min(row.outputBytes, EXPORT_TOOL_FIELD_LIMIT);
@@ -639,6 +662,7 @@ async function loadToolCalls(
 }
 
 const CHILD_MESSAGE_COLUMNS = {
+	hasPrivateUi: messageHasPrivateUi,
 	id: narratorMessages.id,
 	role: narratorMessages.role,
 	model: narratorMessages.model,
@@ -819,6 +843,76 @@ export function assemblePage(
 
 	if (pageOmittedIO) stats.pagesWithIoOmitted += 1;
 	return page;
+}
+
+/**
+ * IntelligentUI cards have the same static boundary as an anonymous share;
+ * clamped child JSON must not resurrect preview references via contentText.
+ * Ordinary file-tool history, including UI source, is not classified as private.
+ * Metadata is batched by indexed message IDs and bounded independently of IO.
+ */
+async function projectExportMessages(
+	narratorId: string,
+	rows: ExportMessageRow[],
+): Promise<ExportMessageRow[]> {
+	const privateByMessage = new Map<string, Set<string>>();
+	const ids = rows.filter((row) => row.hasPrivateUi).map((row) => row.id);
+	const maxIdentities = 4096;
+	let count = 0;
+	for (let start = 0; start < ids.length; start += 128) {
+		const identities = await db
+			.select({ messageId: narratorToolCalls.messageId, toolUseId: narratorToolCalls.toolUseId })
+			.from(narratorToolCalls)
+			.where(
+				and(
+					inArray(narratorToolCalls.messageId, ids.slice(start, start + 128)),
+					eq(narratorToolCalls.toolName, INTELLIGENT_UI_TOOL_NAME),
+				),
+			)
+			.limit(maxIdentities - count + 1);
+		count += identities.length;
+		if (count > maxIdentities) throw new Error("Export private-tool identity limit exceeded");
+		for (const identity of identities) {
+			const set = privateByMessage.get(identity.messageId) ?? new Set<string>();
+			set.add(identity.toolUseId);
+			privateByMessage.set(identity.messageId, set);
+		}
+	}
+	const prepared = rows.map((row) => {
+		if (!row.hasPrivateUi) return row;
+		if (!Array.isArray(row.contentJson)) {
+			return {
+				...row,
+				contentJson: [
+					{
+						type: "text",
+						text: INTELLIGENT_UI_PUBLIC_SUMMARY,
+						publicSummary: INTELLIGENT_UI_PUBLIC_SUMMARY_CODE,
+					},
+				],
+				contentText: null,
+				contentTruncated: false,
+				contentBytes: 0,
+			};
+		}
+		const privateIds = privateByMessage.get(row.id);
+		return {
+			...row,
+			contentText: null,
+			contentJson: row.contentJson.map((block: Record<string, unknown>) => {
+				const id =
+					block?.type === "tool_use"
+						? block.id
+						: block?.type === "tool_result"
+							? block.tool_use_id
+							: undefined;
+				return typeof id === "string" && privateIds?.has(id)
+					? publicIntelligentUiSummary(block)
+					: block;
+			}),
+		};
+	});
+	return projectPublicNarratorPayload(narratorId, { messages: prepared }).messages;
 }
 
 // ── Labels ─────────────────────────────────────────────────────────────────
@@ -1029,10 +1123,18 @@ function contentBlocks(contentJson: any): any[] {
 	return Array.isArray(contentJson) ? contentJson : [];
 }
 
+function privateUiSummaryLabel(lang: NarratorExportLang): string {
+	return lang === "zh-CN" ? "此会话导出不提供交互式预览。" : INTELLIGENT_UI_PUBLIC_SUMMARY;
+}
+
 function renderMessageBody(row: ExportMessageRow, lang: NarratorExportLang): string {
 	const parts: string[] = [];
 	for (const block of contentBlocks(row.contentJson)) {
 		if (!block || typeof block !== "object") continue;
+		if (block.publicSummary === INTELLIGENT_UI_PUBLIC_SUMMARY_CODE) {
+			parts.push(`_${privateUiSummaryLabel(lang)}_`);
+			continue;
+		}
 		const compact = parseCompactMessageBlock(block);
 		if (compact) {
 			const summary = compact.summary?.trim();
@@ -1072,6 +1174,8 @@ function renderMessageBody(row: ExportMessageRow, lang: NarratorExportLang): str
 }
 
 function renderToolCall(tool: ExportToolCall, lang: NarratorExportLang): string {
+	if (isIntelligentUiToolName(tool.toolName))
+		return details(INTELLIGENT_UI_TOOL_NAME, privateUiSummaryLabel(lang));
 	const heading = [
 		tool.toolName,
 		tool.status,
@@ -1162,38 +1266,42 @@ function jsonMessage(message: ExportMessage, includeToolIO: boolean) {
 		isCompactMarker: message.isCompactMarker,
 		folded: message.folded,
 		content: contentBlocks(message.row.contentJson),
-		toolCalls: message.toolCalls.map((tool) => ({
-			toolUseId: tool.toolUseId,
-			toolName: tool.toolName,
-			status: tool.status,
-			durationMs: tool.durationMs,
-			errorMessage: tool.errorMessage,
-			errorTruncated: tool.errorTruncated,
-			errorBytes: tool.errorBytes,
-			...(includeToolIO
-				? {
-						input: tool.input,
-						output: tool.output,
-						inputTruncated: tool.inputTruncated,
-						outputTruncated: tool.outputTruncated,
-						inputBytes: tool.inputBytes,
-						outputBytes: tool.outputBytes,
-						ioOmitted: tool.ioOmitted,
-					}
-				: {}),
-			subagentMessages: tool.children.map((child) => ({
-				id: child.id,
-				role: child.role,
-				createdAt: child.createdAt,
-				model: child.model,
-				// A clamped `content_json` did not survive as blocks, so the excerpt
-				// travels as text and the flags say which one a reader is holding.
-				content: contentBlocks(child.contentJson),
-				contentText: child.contentText,
-				contentTruncated: child.contentTruncated === true,
-				contentBytes: child.contentBytes ?? 0,
-			})),
-		})),
+		toolCalls: message.toolCalls.map((tool) =>
+			isIntelligentUiToolName(tool.toolName)
+				? { ...publicIntelligentUiSummary({ ...tool }), subagentMessages: [] }
+				: {
+						toolUseId: tool.toolUseId,
+						toolName: tool.toolName,
+						status: tool.status,
+						durationMs: tool.durationMs,
+						errorMessage: tool.errorMessage,
+						errorTruncated: tool.errorTruncated,
+						errorBytes: tool.errorBytes,
+						...(includeToolIO
+							? {
+									input: tool.input,
+									output: tool.output,
+									inputTruncated: tool.inputTruncated,
+									outputTruncated: tool.outputTruncated,
+									inputBytes: tool.inputBytes,
+									outputBytes: tool.outputBytes,
+									ioOmitted: tool.ioOmitted,
+								}
+							: {}),
+						subagentMessages: tool.children.map((child) => ({
+							id: child.id,
+							role: child.role,
+							createdAt: child.createdAt,
+							model: child.model,
+							// A clamped `content_json` did not survive as blocks, so the excerpt
+							// travels as text and the flags say which one a reader is holding.
+							content: contentBlocks(child.contentJson),
+							contentText: child.contentText,
+							contentTruncated: child.contentTruncated === true,
+							contentBytes: child.contentBytes ?? 0,
+						})),
+					},
+		),
 		toolCallsOmitted: message.toolCallsOmitted,
 	};
 }
@@ -1481,11 +1589,14 @@ export async function* streamNarratorExport(
 					childRows.length = EXPORT_CHILD_MESSAGES_PER_PAGE;
 				}
 
+				const topRows = [...messages.values()];
+				const safeRows = await projectExportMessages(narratorId, [...topRows, ...childRows]);
+				const safeMessages = new Map(safeRows.slice(0, topRows.length).map((row) => [row.id, row]));
 				const page = assemblePage(
 					fresh,
-					messages,
+					safeMessages,
 					toolRows,
-					childRows,
+					safeRows.slice(topRows.length),
 					options.includeToolIO,
 					stats,
 				);

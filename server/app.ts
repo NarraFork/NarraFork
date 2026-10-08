@@ -43,6 +43,7 @@ import { grammarRoutes } from "./routes/grammars";
 import { graphRoutes } from "./routes/graph";
 import { hookRoutes } from "./routes/hooks";
 import { integrationRoutes } from "./routes/integrations";
+import { intelligentUiRoutes } from "./routes/intelligent-ui";
 import { kimiRoutes } from "./routes/kimi";
 import { knowledgeRoutes } from "./routes/knowledge";
 import { knowledgePackRoutes } from "./routes/knowledge-packs";
@@ -366,6 +367,7 @@ app.route("/api/chapter-edges", chapterEdgeRoutes);
 app.route("/api/chat", chatRoutes);
 app.route("/api/narrators", publicNarratorShareManagementRoutes);
 app.route("/api/narrators", editorDocumentRoutes);
+app.route("/api/narrators", intelligentUiRoutes);
 // Worktree paths must precede the generic Git router's workspace middleware.
 app.route(
 	"/api/narrators",

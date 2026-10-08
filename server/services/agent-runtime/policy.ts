@@ -47,6 +47,8 @@ const READ_TOOLS = Object.freeze([
 	"Question",
 	"ContextAsk",
 	"Send",
+	// Only show passes a read-only execution policy; create remains gated.
+	"IntelligentUI",
 ]);
 const GENERAL_TOOLS = Object.freeze([...READ_TOOLS, "Write", "Edit", "Skill"]);
 const SEARCH_TOOLS = Object.freeze([

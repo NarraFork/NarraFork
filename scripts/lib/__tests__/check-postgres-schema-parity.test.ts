@@ -404,10 +404,12 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 115 tables and 1661 columns including resource inventory and context snapshots", () => {
-		expect(target.tables.length).toBe(115);
-		// 1658 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1661);
+	test("covers 116 tables and 1671 columns including question events, without UI storage", () => {
+		expect(target.tables.length).toBe(116);
+		// 1668 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1671);
+		expect(target.tables.some((table) => table.name === "narrator_question_events")).toBe(true);
+		expect(target.tables.some((table) => table.name.startsWith("intelligent_ui_"))).toBe(false);
 		for (const name of ["narrators", "api_requests"]) {
 			expect(
 				target.tables

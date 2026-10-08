@@ -1,4 +1,18 @@
 {
+	"intelligentUi": {
+		"title": "智能 UI",
+		"staticPreview": "共享记录不提供交互式预览。",
+		"unavailable": "旧版 UI 引用不可用，请重新展示当前文件以预览。",
+		"currentFiles": "当前文件 · 非历史快照",
+		"open": "打开预览",
+		"reload": "重新读取文件",
+		"loading": "正在构建当前文件…",
+		"loadFailed": "无法构建此预览",
+		"renderFailed": "无法渲染此预览，请修复源码文件后刷新。",
+		"untrustedPreview": "预览代码及输入内容可能通过外部导航外传。请勿预览含秘密的文件或输入密码、令牌。",
+		"navigationStopped": "预览已跳转并被关闭；导航请求可能已经发出。",
+		"historyUnavailable": "当前文件 · 此创建无法随消息回退"
+	},
 	"you": "你",
 	"largeFile": {
 		"size": "文件大小：{{size}}（{{bytes}} 字节）",

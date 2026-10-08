@@ -682,6 +682,23 @@ test("spec writes and real read-only tools are excluded independently of unknown
 	]);
 	expect(result.issues).toContainEqual({ code: "FILE_JOURNAL_MISSING", toolCallId: disk.id });
 });
+test("IntelligentUI show is read-only while create without a journal is an explicit gap", async () => {
+	const show = tool(1, "IntelligentUI");
+	const create = tool(2, "IntelligentUI");
+	sqlite
+		.query("UPDATE narrator_tool_calls SET input_json=? WHERE id=?")
+		.run(JSON.stringify({ action: "show", path: "/repo/ui" }), show.id);
+	sqlite
+		.query("UPDATE narrator_tool_calls SET input_json=? WHERE id=?")
+		.run(JSON.stringify({ action: "create", prefix: "demo" }), create.id);
+	const result = await collect();
+	expect(result.noDiskTools).toContainEqual({ toolCallId: show.id, reason: "read_only" });
+	expect(result.issues).toContainEqual({ code: "FILE_JOURNAL_MISSING", toolCallId: create.id });
+	expect(result.noDiskTools).not.toContainEqual({
+		toolCallId: create.id,
+		reason: "non_file_change",
+	});
+});
 test("Bash background initial success does not settle a live or missing background task", async () => {
 	const t = tool(1, "Bash");
 	sqlite.query("UPDATE narrator_tool_calls SET is_background=1 WHERE id=?").run(t.id);

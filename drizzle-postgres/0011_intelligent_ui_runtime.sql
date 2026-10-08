@@ -1,0 +1,2 @@
+ALTER TABLE "intelligent_ui_kits" ADD COLUMN "config_json" text DEFAULT '{}' NOT NULL;--> statement-breakpoint
+CREATE INDEX "idx_ui_interactions_delivery" ON "intelligent_ui_interactions" USING btree ("delivery_status","id");

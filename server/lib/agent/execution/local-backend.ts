@@ -47,6 +47,11 @@ import type {
 	WriteBytesOptions,
 } from "./backend";
 import { LOCAL_DEVICE_ID } from "./backend";
+import {
+	exclusiveCreateOptions,
+	exclusiveLocalIo,
+	validateExclusiveCreateInput,
+} from "./exclusive-create";
 import { localPathSemantics } from "./path-semantics";
 
 // Inline source works in both development and compiled Bun binaries without a filesystem worker.
@@ -461,9 +466,20 @@ export class LocalBackend implements ExecutionBackend {
 	}
 
 	async writeFileBytes(path: string, bytes: Uint8Array, opts?: WriteBytesOptions): Promise<void> {
-		// Legacy tools also need a last-mile budget before Bun.write can truncate a target.
-		await guardDiskWrite(opts?.expectedResolvedPath ?? path, bytes.byteLength);
 		const expectedResolvedPath = opts?.expectedResolvedPath;
+		if (opts?.exclusive) {
+			validateExclusiveCreateInput(path, bytes);
+			validateExclusiveCreateInput(expectedResolvedPath);
+			const budget = exclusiveCreateOptions(opts);
+			const identity = await this.resolvePathIdentity(path, budget);
+			if (!this.paths.equals(identity.canonicalPath, expectedResolvedPath))
+				throw new Error("File canonical identity changed before exclusive creation");
+			await guardDiskWrite(expectedResolvedPath, bytes.byteLength);
+			await exclusiveLocalIo.write(expectedResolvedPath, bytes, budget.signal);
+			return;
+		}
+		// Preserve ordinary Write semantics; only exclusive creates use the stricter primitive.
+		await guardDiskWrite(expectedResolvedPath ?? path, bytes.byteLength);
 		if (!expectedResolvedPath) {
 			await Bun.write(path, bytes);
 			return;
@@ -492,6 +508,19 @@ export class LocalBackend implements ExecutionBackend {
 
 	async mkdirp(path: string): Promise<void> {
 		mkdirSync(path, { recursive: true });
+	}
+
+	async mkdirExclusive(
+		path: string,
+		opts: FileMetadataOptions & { expectedResolvedPath: string },
+	): Promise<boolean> {
+		validateExclusiveCreateInput(path);
+		validateExclusiveCreateInput(opts.expectedResolvedPath);
+		const budget = exclusiveCreateOptions(opts);
+		const identity = await this.resolvePathIdentity(path, budget);
+		if (!this.paths.equals(identity.canonicalPath, opts.expectedResolvedPath))
+			throw new Error("Directory canonical identity changed before exclusive creation");
+		return exclusiveLocalIo.mkdir(opts.expectedResolvedPath, budget.signal);
 	}
 
 	/**

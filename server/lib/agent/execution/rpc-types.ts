@@ -31,6 +31,10 @@ export const FEATURE_FS_READ_BOUNDED_V1 = "fs.read.bounded.v1";
 export const FEATURE_FS_READ_OFFSET_V1 = "fs.read.offset.v1";
 /** Serialized content check + replacement; does not exclude external filesystem writers. */
 export const FEATURE_FS_CONDITIONAL_WRITE_V1 = "fs.write.conditional.v1";
+/** Non-recursive exclusive mkdir with canonical path verification (legacy capability). */
+export const FEATURE_FS_MKDIR_EXCLUSIVE_V1 = "fs.mkdir.exclusive.v1";
+/** Exclusive mkdir/write bind canonical parent handles, preventing parent-link replacement races. */
+export const FEATURE_FS_CREATE_BOUND_PARENT_V1 = "fs.create.bound-parent.v1";
 
 // ── Handshake ────────────────────────────────────────────────────────────────
 
@@ -127,6 +131,7 @@ export type RpcMethod =
 	| "fs.writeConditional"
 	| "fs.remove"
 	| "fs.mkdirp"
+	| "fs.mkdirExclusive"
 	| "fs.list"
 	| "fs.exists"
 	| "glob"
@@ -262,6 +267,9 @@ export interface FsWriteParams {
 	dataB64: string;
 	/** Canonical create/existing path returned by fs.stat and approved by policy. */
 	expectedResolvedPath?: string;
+	/** Requires fs.mkdir.exclusive.v1 plus fs.create.bound-parent.v1; no implicit mkdirp. */
+	exclusive?: boolean;
+	timeoutMs?: number;
 }
 
 export interface FsRemoveParams {

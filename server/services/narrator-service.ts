@@ -2225,10 +2225,15 @@ export const narratorService = {
 	async remove(narratorId: string) {
 		const children = await db.query.narrators.findMany({
 			where: eq(narrators.parentNarratorId, narratorId),
-			columns: { id: true },
+			columns: { id: true, type: true, variant: true },
 		});
+		// A primary fork is an independent history owner, not a disposable subagent.
+		// Preserve its shared history before severing the ancestry FK.
+		const survivingForks = children.filter(
+			(child) => child.type !== "subagent" && !isSubagentVariant(child.variant),
+		);
 		for (const child of children) {
-			await this.remove(child.id);
+			if (!survivingForks.some((fork) => fork.id === child.id)) await this.remove(child.id);
 		}
 
 		// Any surviving narrator that still borrows pre-compact refs from this one must
@@ -2239,6 +2244,16 @@ export const narratorService = {
 		const preserveUploads = await hasSharedOwnedImageMessages(narratorId);
 
 		const bindingTransition = db.transaction((tx) => {
+			if (survivingForks.length)
+				tx.update(narrators)
+					.set({ parentNarratorId: null })
+					.where(
+						inArray(
+							narrators.id,
+							survivingForks.map((child) => child.id),
+						),
+					)
+					.run();
 			const transition = integrationResourceBindingService.markDeletedInTransaction(
 				tx,
 				"narrator",
@@ -2279,7 +2294,6 @@ export const narratorService = {
 				.run();
 			tx.delete(backgroundTasks).where(eq(backgroundTasks.subagentNarratorId, narratorId)).run();
 			tx.delete(backgroundTasks).where(eq(backgroundTasks.parentNarratorId, narratorId)).run();
-			tx.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId)).run();
 			deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.narratorId, narratorId)).run();
 
 			const sharedRows = tx
@@ -2288,7 +2302,7 @@ export const narratorService = {
 					contentJson: narratorMessages.contentJson,
 					newOwnerId: sql<string>`(
 						SELECT nmr.narrator_id FROM narrator_message_refs nmr
-						WHERE nmr.message_id = ${narratorMessages.id}
+						WHERE nmr.message_id = narrator_messages.id
 						ORDER BY nmr.seq ASC
 						LIMIT 1
 					)`,
@@ -2311,7 +2325,22 @@ export const narratorService = {
 					.set({ narratorId: row.newOwnerId, contentJson })
 					.where(eq(narratorMessages.id, row.id))
 					.run();
+				// Keep the shared card's exact historical tool rows, but do not transfer
+				// execution authority: a retained provenance clone is never resumable.
+				tx.update(narratorToolCalls)
+					.set({
+						narratorId: row.newOwnerId,
+						executionOriginToolCallId: sql`coalesce(${narratorToolCalls.executionOriginToolCallId},${narratorToolCalls.id})`,
+					})
+					.where(
+						and(
+							eq(narratorToolCalls.messageId, row.id),
+							eq(narratorToolCalls.narratorId, narratorId),
+						),
+					)
+					.run();
 			}
+			tx.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId)).run();
 
 			const orphanRows = tx
 				.select({ id: narratorMessages.id })
@@ -2897,7 +2926,12 @@ export const narratorService = {
 								)
 								.limit(1)
 								.all();
-							if (parentHasOlder.length > 0) {
+							if (
+								parentHasOlder.length > 0 ||
+								(parent.refsInheritedFrom &&
+									parent.refsBackfillCursor != null &&
+									parent.refsBackfillCursor <= firstSeq)
+							) {
 								tx.update(narrators)
 									.set({
 										refsInheritedFrom: parentNarratorId,

@@ -4595,7 +4595,7 @@ export async function startInjectionContinuationIfPossible(
 		if (executionPrincipal && !(await canWakeQuestionAnswer(narrator))) return { started: false };
 
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-		if (active._loopRunning) return { started: false };
+		if (active._loopRunning || getExecutionOwner(narratorId)) return { started: false };
 		if (
 			executionPrincipal &&
 			db

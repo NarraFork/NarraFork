@@ -122,6 +122,8 @@ export interface LocalFileApplyInput {
 	canonicalPath: string;
 	before: LocalFileObservation;
 	nextBytes: Uint8Array;
+	/** Generated files must use the backend's race-safe O_EXCL path, not generic IO. */
+	exclusiveCreate?: boolean;
 	signal: AbortSignal;
 	diagnostics?: FileChangeDiagnostics;
 	/** Includes the frozen runtime, workspace incarnation and coordinator fence.
@@ -236,6 +238,7 @@ export function createFileChangeLocalIo(
 			return observed;
 		},
 		async apply(input) {
+			if (input.exclusiveCreate) return applyExclusiveFileCreate(this, input);
 			const { before, canonicalPath, nextBytes, signal } = input;
 			const parentEffects: LocalFileParentEffects = { createdPaths: [], possiblePaths: [] };
 			let targetMutation = false;
@@ -436,6 +439,43 @@ export function createFileChangeLocalIo(
 			};
 		},
 	};
+}
+
+/** Preserve the backend's directory-identity guards as well as O_EXCL. A backend
+ * rejection is conservatively uncertain: its exception alone is not a syscall receipt. */
+async function applyExclusiveFileCreate(
+	io: FileChangeLocalIo,
+	input: LocalFileApplyInput,
+): Promise<LocalFileApplyResult> {
+	const parentEffects: LocalFileParentEffects = { createdPaths: [], possiblePaths: [] };
+	let dispatched = false;
+	try {
+		input.signal.throwIfAborted();
+		if (input.before.bytes !== null || input.nextBytes.byteLength > FILE_CHANGE_LIMITS.blobBytes)
+			throw new LocalFileValidationError("Exclusive creation requires an absent bounded file");
+		await input.assertTarget();
+		await guardDiskWrite(input.canonicalPath, input.nextBytes.byteLength);
+		if (!equal(input.before, await io.read(input.canonicalPath, input.signal)))
+			throw new LocalFileValidationError("Exclusive create target changed before dispatch");
+		await input.assertTarget();
+		input.signal.throwIfAborted();
+		input.onDispatch();
+		dispatched = true;
+		await input.backend.writeFileBytes(input.canonicalPath, input.nextBytes, {
+			expectedResolvedPath: input.canonicalPath,
+			exclusive: true,
+			signal: input.signal,
+			timeoutMs: 30_000,
+		});
+		await input.assertTarget();
+		return { kind: "applied", error: null, parentEffects };
+	} catch (error) {
+		return {
+			kind: dispatched ? "target_mutation_unknown" : "not_applied",
+			error,
+			parentEffects,
+		};
+	}
 }
 
 export const fileChangeLocalIo: FileChangeLocalIo = createFileChangeLocalIo();

@@ -290,6 +290,15 @@ func (h *Handlers) FsWrite(params map[string]any) (any, error) {
 }
 
 func (h *Handlers) FsWriteContext(ctx context.Context, params map[string]any) (any, error) {
+	if raw, present := params["exclusive"]; present {
+		exclusive, ok := raw.(bool)
+		if !ok {
+			return nil, fmt.Errorf("invalid exclusive flag")
+		}
+		if exclusive {
+			return h.fsWriteExclusive(ctx, params)
+		}
+	}
 	release, err := acquireFileMutation(ctx)
 	if err != nil {
 		return nil, err
@@ -574,6 +583,38 @@ func (h *Handlers) FsRemoveContext(ctx context.Context, params map[string]any) (
 		return nil, err
 	}
 	return map[string]any{}, nil
+}
+
+// FsMkdirExclusive never accepts an existing directory as a successful creation.
+func (h *Handlers) FsMkdirExclusive(parent context.Context, params map[string]any) (any, error) {
+	return h.fsMkdirExclusiveWithParent(parent, params, openExclusiveParent)
+}
+
+func (h *Handlers) fsMkdirExclusiveWithParent(parent context.Context, params map[string]any, bind exclusiveParentOpener) (any, error) {
+	ctx, cancel, err := exclusiveCreateContext(parent, params)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	path, err := h.exclusiveCreatePath(params)
+	if err != nil {
+		return nil, err
+	}
+	root, leaf, err := bind(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := root.Mkdir(leaf, 0o700); err != nil {
+		if os.IsExist(err) {
+			return map[string]any{"created": false}, nil
+		}
+		return nil, err
+	}
+	return map[string]any{"created": true}, nil
 }
 
 func (h *Handlers) FsMkdirp(params map[string]any) (any, error) {

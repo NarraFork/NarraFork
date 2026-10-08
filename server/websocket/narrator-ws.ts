@@ -82,6 +82,11 @@ import { permissionPolicyChanges } from "../services/permission-rule-service";
 import { assertChapterProjectAccess, canReadProject } from "../services/project-acl";
 import type { PublicShareConnectionLease } from "../services/public-narrator-share-connections";
 import {
+	isPublicToolSourceAllowed,
+	projectPublicNarratorEvent,
+	rememberPublicToolIdentity,
+} from "../services/public-narrator-share-intelligent-ui";
+import {
 	onPublicShareRevoked,
 	revalidatePublicShare,
 	type VerifiedPublicShare,
@@ -617,6 +622,10 @@ export async function revalidateQueuedToolInputFrame(
 		if (ws.data.publicShare.narratorId !== identity.narratorId) return false;
 		try {
 			revalidatePublicShare(ws.data.publicShare);
+			const source = toolInputStreamSource.descriptor(identity.refId).source;
+			const toolUseId = (source as { toolUseId?: string } | undefined)?.toolUseId;
+			if (!toolUseId || !isPublicToolSourceAllowed(identity.narratorId, { toolUseId }))
+				return false;
 		} catch {
 			return false;
 		}
@@ -649,7 +658,16 @@ function sendToolInputLane(ws: NarratorWS, message: ToolInputChunkMessage): bool
 			!toolInputStreamSource.isCurrentInputLane(identity.narratorId, identity.refId, identity.epoch)
 		)
 			return true;
-		if (ws.data.publicShare) revalidatePublicShare(ws.data.publicShare);
+		if (ws.data.publicShare) {
+			revalidatePublicShare(ws.data.publicShare);
+			if (
+				!isPublicToolSourceAllowed(message.narratorId, {
+					toolUseId: message.toolUseId,
+					toolName: message.toolName,
+				})
+			)
+				return true;
+		}
 		for (const payload of toolInputFrames(message)) {
 			if (!toolInputLaneSender.send(ws, payload, identity)) return false;
 		}
@@ -661,35 +679,56 @@ function sendToolInputLane(ws: NarratorWS, message: ToolInputChunkMessage): bool
 }
 
 export function broadcastToNarrator(narratorId: string, message: NarratorServerMessage): void {
+	if (
+		"toolUseId" in message &&
+		typeof message.toolUseId === "string" &&
+		"toolName" in message &&
+		typeof message.toolName === "string"
+	) {
+		rememberPublicToolIdentity(narratorId, {
+			toolUseId: message.toolUseId,
+			toolName: message.toolName,
+		});
+	}
 	if (message.type === "tool_use_chunk" && message.inputDocument) {
 		for (const ws of connections) {
 			if (ws.data.publicShare && ws.data.publicShare.narratorId !== narratorId) continue;
 			if (!ws.data.subscribedNarrators.has(narratorId)) continue;
-			// Offset-aware, source-backed frames can cross REST catch-up without an unbounded body buffer.
+			if (ws.data.publicShare && !projectPublicNarratorEvent(narratorId, message)) continue;
 			if (!sendToolInputLane(ws, message)) removeConnection(ws);
 		}
 		eventBus.emit({ type: "narrator:message_broadcast", narratorId, message });
 		return;
 	}
 	const payload = JSON.stringify(message);
+	let publicMessage: NarratorServerMessage | null | undefined;
+	let publicPayload: string | undefined;
 	for (const ws of connections) {
 		if (ws.data.publicShare && ws.data.publicShare.narratorId !== narratorId) continue;
-		if (ws.data.subscribedNarrators.has(narratorId)) {
-			if (ws.data.catchingUpNarrators.has(narratorId)) {
-				const buffer = ws.data.catchUpBuffers.get(narratorId);
-				if (buffer) {
-					bufferRealtimeMessage(buffer, message, payload.length);
-					continue;
-				}
-			}
-			try {
-				ws.send(payload);
-			} catch {
-				removeConnection(ws);
+		if (!ws.data.subscribedNarrators.has(narratorId)) continue;
+		let outgoing = message;
+		let outgoingPayload = payload;
+		if (ws.data.publicShare) {
+			if (publicMessage === undefined)
+				publicMessage = projectPublicNarratorEvent(narratorId, message);
+			if (!publicMessage) continue;
+			publicPayload ??= JSON.stringify(publicMessage);
+			outgoing = publicMessage;
+			outgoingPayload = publicPayload;
+		}
+		if (ws.data.catchingUpNarrators.has(narratorId)) {
+			const buffer = ws.data.catchUpBuffers.get(narratorId);
+			if (buffer) {
+				bufferRealtimeMessage(buffer, outgoing, outgoingPayload.length);
+				continue;
 			}
 		}
+		try {
+			ws.send(outgoingPayload);
+		} catch {
+			removeConnection(ws);
+		}
 	}
-	// Mirror to eventBus so non-WS consumers (e.g. IM gateway) can react.
 	eventBus.emit({ type: "narrator:message_broadcast", narratorId, message });
 }
 
@@ -711,10 +750,20 @@ function withSubscriptionRequestId<T extends Record<string, unknown>>(
 }
 
 function safeSend(ws: NarratorWS, message: Record<string, unknown>): boolean {
-	if (message.type === "tool_use_chunk" && message.inputDocument)
-		return sendToolInputLane(ws, message as unknown as ToolInputChunkMessage);
+	let outgoing = message;
+	if (ws.data.publicShare) {
+		if (typeof message.type !== "string") return true;
+		const projected = projectPublicNarratorEvent(
+			ws.data.publicShare.narratorId,
+			message as Record<string, unknown> & { type: string },
+		);
+		if (!projected) return true;
+		outgoing = projected;
+	}
+	if (outgoing.type === "tool_use_chunk" && outgoing.inputDocument)
+		return sendToolInputLane(ws, outgoing as unknown as ToolInputChunkMessage);
 	try {
-		ws.send(JSON.stringify(message));
+		ws.send(JSON.stringify(outgoing));
 		return true;
 	} catch {
 		removeConnection(ws);

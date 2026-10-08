@@ -14,7 +14,11 @@
  *     produces a parseable file that says it is incomplete
  *   - lazily-forked history is reachable without materializing (writing) refs
  */
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import {
+	INTELLIGENT_UI_PUBLIC_SUMMARY,
+	INTELLIGENT_UI_PUBLIC_SUMMARY_CODE,
+} from "@shared/intelligent-ui-public";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narratorToolCalls } from "../../db/schema";
@@ -1054,6 +1058,206 @@ describe("cancellation", () => {
 		expect(raw).not.toContain("should-not-appear");
 		// Aborting is a disconnect, so no tail is written: the file is detectably partial.
 		expect(() => JSON.parse(raw)).toThrow();
+	});
+});
+
+describe("IntelligentUI portable export privacy", () => {
+	const secret = "PRIVATE_UI_EXPORT_SOURCE_<script>capability-secret</script>";
+
+	async function seedPrivateUi(messageId = "ui-message", toolUseId = "ui-use") {
+		await seedToolCall({
+			id: `${toolUseId}-row`,
+			narratorId: "n1",
+			messageId,
+			toolUseId,
+			toolName: "IntelligentUI",
+			input: { source: secret, privacy: "public" },
+			output: {
+				text: secret.repeat(EXPORT_TOOL_FIELD_LIMIT / secret.length + 2),
+				_metadata: {
+					intelligentUi: { version: 1, path: `${secret}/index.tsx`, title: secret },
+					capability: secret,
+				},
+			},
+		});
+		await db
+			.update(narratorToolCalls)
+			.set({ errorMessage: secret })
+			.where(eq(narratorToolCalls.id, `${toolUseId}-row`));
+	}
+
+	test("JSON and Markdown redact server-known UI blocks, IO, errors and text fallback", async () => {
+		seedNarrator("n1");
+		await seedMessage({
+			id: "ui-message",
+			narratorId: "n1",
+			seq: 1,
+			contentJson: [{ type: "tool_use", id: "ui-use", name: "Bash", input: { source: secret } }],
+			contentText: secret,
+		});
+		await seedPrivateUi();
+		for (const format of ["json", "markdown"] as const) {
+			for (const includeToolIO of [true, false]) {
+				const exported = await collect("n1", { format, includeToolIO, lang: "en" });
+				expect(exported).not.toContain(secret);
+				expect(exported).not.toContain('"intelligentUi"');
+				expect(exported).not.toContain('"uiId"');
+				expect(exported).toContain(INTELLIGENT_UI_PUBLIC_SUMMARY);
+				if (format === "json") {
+					const parsed = JSON.parse(exported);
+					expect(parsed.complete).toBe(true);
+					expect(parsed.messages[0].toolCalls[0].publicSummary).toBe(
+						INTELLIGENT_UI_PUBLIC_SUMMARY_CODE,
+					);
+					expect(parsed.messages[0].content[0].publicSummary).toBe(
+						INTELLIGENT_UI_PUBLIC_SUMMARY_CODE,
+					);
+				}
+			}
+		}
+		const original = await db
+			.select({ input: narratorToolCalls.inputJson })
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.id, "ui-use-row"));
+		expect(JSON.stringify(original)).toContain(secret);
+	});
+
+	test("private UI bodies are not selected even when includeToolIO is true", async () => {
+		seedNarrator("n1");
+		await seedMessage({ id: "ui-message", narratorId: "n1", seq: 1 });
+		await seedPrivateUi();
+		const select = spyOn(db, "select");
+		try {
+			const parsed = JSON.parse(await collect("n1", { format: "json", includeToolIO: true }));
+			expect(parsed.complete).toBe(true);
+			expect(
+				select.mock.calls.some(([columns]) => columns && "input" in columns && "output" in columns),
+			).toBe(false);
+			expect(parsed.truncation.toolFieldsTruncated).toBe(0);
+			expect(parsed.truncation.pagesWithIoOmitted).toBe(0);
+		} finally {
+			select.mockRestore();
+		}
+	});
+
+	test("ordinary tools keep raw blocks and similarly named metadata unchanged", async () => {
+		seedNarrator("n1");
+		const input = { command: "printf example", privacy: "private", intelligentUi: secret };
+		const blocks = [{ type: "tool_use", id: "bash-use", name: "Bash", input }];
+		await seedMessage({ id: "bash-message", narratorId: "n1", seq: 1, contentJson: blocks });
+		await seedToolCall({
+			id: "bash-row",
+			narratorId: "n1",
+			messageId: "bash-message",
+			toolUseId: "bash-use",
+			toolName: "Bash",
+			input,
+			output: secret,
+		});
+		const parsed = JSON.parse(await collect("n1", { format: "json" }));
+		expect(parsed.messages[0].content).toEqual(blocks);
+		expect(JSON.parse(parsed.messages[0].toolCalls[0].input)).toEqual(input);
+		expect(JSON.parse(parsed.messages[0].toolCalls[0].output)).toBe(secret);
+	});
+
+	for (const toolName of ["Read", "Write", "Edit"]) {
+		test(`${toolName} exports UI source like ordinary file history`, async () => {
+			seedNarrator("n1");
+			const input = {
+				file_path: ".narrafork/intelligent_ui/demo-abc123/App.tsx",
+				content: "export default function App() { return <p>ordinary UI source</p>; }",
+			};
+			const blocks = [{ type: "tool_use", id: "file-use", name: toolName, input }];
+			await seedMessage({ id: "file-message", narratorId: "n1", seq: 1, contentJson: blocks });
+			await seedToolCall({
+				id: "file-row",
+				narratorId: "n1",
+				messageId: "file-message",
+				toolUseId: "file-use",
+				toolName,
+				input,
+				output: input.content,
+			});
+			for (const format of ["json", "markdown"] as const) {
+				const text = await collect("n1", { format, includeToolIO: true });
+				expect(text).toContain(input.file_path);
+				expect(text).toContain("ordinary UI source");
+				expect(text).not.toContain(INTELLIGENT_UI_PUBLIC_SUMMARY_CODE);
+			}
+		});
+	}
+
+	async function seedUiChild(clamped: boolean) {
+		seedNarrator("n1");
+		await seedMessage({ id: "parent", narratorId: "n1", seq: 1, contentText: "public parent" });
+		await seedToolCall({
+			id: "agent-row",
+			narratorId: "n1",
+			messageId: "parent",
+			toolUseId: "agent-use",
+			toolName: "Agent",
+		});
+		await seedMessage({
+			id: "ui-child",
+			narratorId: "n1",
+			seq: 0,
+			parentToolUseId: "agent-use",
+			contentJson: [
+				{ type: "text", text: "public child text" },
+				{
+					type: "tool_use",
+					id: "child-ui-use",
+					name: "Bash",
+					input: {
+						padding: clamped ? "p".repeat(EXPORT_CHILD_CONTENT_LIMIT * 2) : "",
+						source: secret,
+					},
+				},
+			],
+			contentText: secret,
+		});
+		await seedPrivateUi("ui-child", "child-ui-use");
+	}
+
+	test("small nested UI messages redact blocks and denormalized contentText", async () => {
+		await seedUiChild(false);
+		const raw = await collect("n1", { format: "json" });
+		expect(raw).not.toContain(secret);
+		const child = JSON.parse(raw).messages[0].toolCalls[0].subagentMessages[0];
+		expect(child.content[0].text).toBe("public child text");
+		expect(child.content[1].publicSummary).toBe(INTELLIGENT_UI_PUBLIC_SUMMARY_CODE);
+		expect(child.contentText).toBeNull();
+		const markdown = await collect("n1", { lang: "zh-CN" });
+		expect(markdown).not.toContain(secret);
+		expect(markdown).toContain("此会话导出不提供交互式预览");
+	});
+
+	test("clamped nested JSON cannot expose a private contentText fallback", async () => {
+		await seedUiChild(true);
+		for (const format of ["json", "markdown"] as const) {
+			const exported = await collect("n1", { format, lang: "en" });
+			expect(exported).not.toContain(secret);
+			expect(exported).toContain(INTELLIGENT_UI_PUBLIC_SUMMARY);
+		}
+	});
+
+	test("UI tool_result blocks in a later message are static too", async () => {
+		seedNarrator("n1");
+		await seedMessage({ id: "ui-message", narratorId: "n1", seq: 1 });
+		await seedPrivateUi();
+		await seedMessage({
+			id: "ui-result",
+			narratorId: "n1",
+			seq: 2,
+			role: "user",
+			contentText: secret,
+			contentJson: [{ type: "tool_result", tool_use_id: "ui-use", content: secret }],
+		});
+		for (const format of ["json", "markdown"] as const) {
+			const exported = await collect("n1", { format, lang: "en" });
+			expect(exported).not.toContain(secret);
+			expect(exported).toContain(INTELLIGENT_UI_PUBLIC_SUMMARY);
+		}
 	});
 });
 

@@ -1,4 +1,18 @@
 {
+	"intelligentUi": {
+		"title": "Intelligent UI",
+		"staticPreview": "Interactive previews are unavailable in this shared transcript.",
+		"unavailable": "This older UI reference is unavailable. Show the current file to preview it.",
+		"currentFiles": "Current files · not a historical snapshot",
+		"open": "Open preview",
+		"reload": "Refresh from files",
+		"loading": "Building current files…",
+		"loadFailed": "Unable to build this preview",
+		"renderFailed": "Unable to render this preview. Fix the source files and refresh.",
+		"untrustedPreview": "Preview code and input may be sent out through external navigation. Do not preview files containing secrets or enter passwords or tokens.",
+		"navigationStopped": "The preview navigated away and has been closed. A navigation request may already have been sent.",
+		"historyUnavailable": "Current files · history rollback unavailable"
+	},
 	"you": "You",
 	"largeFile": {
 		"size": "File size: {{size}} ({{bytes}} bytes)",

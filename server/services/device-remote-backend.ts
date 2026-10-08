@@ -25,6 +25,10 @@ import type {
 	WriteBytesOptions,
 } from "../lib/agent/execution/backend";
 import {
+	exclusiveCreateOptions,
+	validateExclusiveCreateInput,
+} from "../lib/agent/execution/exclusive-create";
+import {
 	FEATURE_GIT_COMMIT_PREVIEW_V1,
 	FEATURE_GIT_WORKSPACE_V1,
 	FEATURE_GIT_WORKSPACE_WATCH_V1,
@@ -48,6 +52,8 @@ import type {
 } from "../lib/agent/execution/rpc-types";
 import {
 	FEATURE_FS_CONDITIONAL_WRITE_V1,
+	FEATURE_FS_CREATE_BOUND_PARENT_V1,
+	FEATURE_FS_MKDIR_EXCLUSIVE_V1,
 	FEATURE_FS_READ_BOUNDED_V1,
 	FEATURE_FS_READ_OFFSET_V1,
 	FEATURE_GLOB_BOUNDED_V1,
@@ -315,14 +321,35 @@ export class RemoteBackend implements ExecutionBackend {
 				`Remote device ${this.deviceId} does not support atomic resolved-path writes; upgrade the executor`,
 			);
 		}
+		if (
+			opts?.exclusive &&
+			(!hasDeviceProtocolFeature(this.deviceId, FEATURE_FS_MKDIR_EXCLUSIVE_V1) ||
+				!hasDeviceProtocolFeature(this.deviceId, FEATURE_FS_CREATE_BOUND_PARENT_V1))
+		)
+			throw new Error(
+				`Device ${this.deviceId} requires an executor upgrade for bound-parent exclusive file creation`,
+			);
+		let budget: ReturnType<typeof exclusiveCreateOptions> | undefined;
+		if (opts?.exclusive) {
+			validateExclusiveCreateInput(path, bytes);
+			validateExclusiveCreateInput(expectedResolvedPath);
+			budget = exclusiveCreateOptions(opts);
+		}
+		const requiredFeatures = [
+			...(expectedResolvedPath ? [FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE] : []),
+			...(opts?.exclusive
+				? [FEATURE_FS_MKDIR_EXCLUSIVE_V1, FEATURE_FS_CREATE_BOUND_PARENT_V1]
+				: []),
+		];
 		await this.rpc(
 			"fs.write",
 			{
 				path,
 				dataB64: toBase64(bytes),
 				...(expectedResolvedPath ? { expectedResolvedPath } : {}),
+				...(opts?.exclusive ? { exclusive: true, timeoutMs: budget?.timeoutMs } : {}),
 			},
-			expectedResolvedPath ? { requiredFeatures: [FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE] } : {},
+			{ ...budget, requiredFeatures },
 		);
 	}
 
@@ -376,6 +403,36 @@ export class RemoteBackend implements ExecutionBackend {
 
 	async mkdirp(path: string): Promise<void> {
 		await this.rpc("fs.mkdirp", { path });
+	}
+
+	async mkdirExclusive(
+		path: string,
+		opts: FileMetadataOptions & { expectedResolvedPath: string },
+	): Promise<boolean> {
+		if (
+			!hasDeviceProtocolFeature(this.deviceId, FEATURE_FS_MKDIR_EXCLUSIVE_V1) ||
+			!hasDeviceProtocolFeature(this.deviceId, FEATURE_FS_CREATE_BOUND_PARENT_V1)
+		)
+			throw new Error(
+				`Device ${this.deviceId} requires an executor upgrade for bound-parent exclusive directory creation; no local fallback`,
+			);
+		validateExclusiveCreateInput(path);
+		validateExclusiveCreateInput(opts.expectedResolvedPath);
+		const budget = exclusiveCreateOptions(opts);
+		const result = (await this.rpc(
+			"fs.mkdirExclusive",
+			{
+				path,
+				expectedResolvedPath: opts.expectedResolvedPath,
+				timeoutMs: budget.timeoutMs,
+			},
+			{
+				...budget,
+				requiredFeatures: [FEATURE_FS_MKDIR_EXCLUSIVE_V1, FEATURE_FS_CREATE_BOUND_PARENT_V1],
+			},
+		)) as { created: boolean };
+		if (typeof result.created !== "boolean") throw new Error("Invalid exclusive mkdir response");
+		return result.created;
 	}
 
 	async listDir(path: string): Promise<DirEntry[]> {

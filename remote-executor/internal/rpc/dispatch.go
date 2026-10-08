@@ -61,6 +61,8 @@ func (d *Dispatcher) Dispatch(
 		return d.h.FsRemoveContext(ctx, params)
 	case "fs.mkdirp":
 		return d.h.FsMkdirp(params)
+	case "fs.mkdirExclusive":
+		return d.h.FsMkdirExclusive(ctx, params)
 	case "fs.list":
 		return d.h.FsList(params)
 	case "glob":
