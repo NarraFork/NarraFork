@@ -357,3 +357,189 @@ describe("control slash commands", () => {
 		expect(options.composerRef.current?.commitDraftAfterSend).toHaveBeenCalledTimes(1);
 	});
 });
+
+describe("new narrator attachments", () => {
+	function attachments(kind: "image" | "text file" | "mixed") {
+		const attachedImages =
+			kind === "text file" ? [] : [new File(["image"], "screenshot.png", { type: "image/png" })];
+		const attachedTextFiles = kind === "image" ? [] : [new File(["note"], "note.txt")];
+		return {
+			attachedImages,
+			attachedTextFiles,
+			attachedImagesRef: { current: attachedImages },
+			attachedTextFilesRef: { current: attachedTextFiles },
+		};
+	}
+
+	async function renderCommand(command: string, overrides: Partial<UseNarratorSendOptions> = {}) {
+		const composer = options.composerRef.current as NarratorComposerHandle;
+		composer.getText = () => command;
+		composer.getFileReferences = () => [];
+		await render({ isActive: false, ...overrides });
+	}
+
+	test.each([
+		"image",
+		"text file",
+	] as const)("should send %s-only content as the first message when idle /new has no text", async (kind) => {
+		const files = attachments(kind);
+		await renderCommand("/new", files);
+		await act(async () => actions.handleSend());
+		expect(options.createNarrator.mutateAsync).toHaveBeenCalledTimes(1);
+		expect(send).toHaveBeenCalledTimes(1);
+		expect(send.mock.calls[0]).toEqual([
+			"created",
+			"",
+			files.attachedImages.length ? files.attachedImages : undefined,
+			files.attachedTextFiles.length ? files.attachedTextFiles : undefined,
+			undefined,
+			expect.any(Function),
+			expect.any(AbortSignal),
+		]);
+		expect(options.composerRef.current?.commitDraftAfterSend).toHaveBeenCalledTimes(1);
+		expect(options.clearAttachedFilesAndDraft).toHaveBeenCalledTimes(1);
+		expect(options.navigateToNarrator).toHaveBeenCalledWith("created");
+		expect(notify).not.toHaveBeenCalled();
+		expect(options.sendingRef.current).toBe(false);
+	});
+
+	test("should wait for attachment acceptance before clearing input or navigating", async () => {
+		const pending = Promise.withResolvers<{ id: string }>();
+		send.mockReturnValue(pending.promise);
+		const files = attachments("mixed");
+		await renderCommand("/new   ", files);
+		let sending: Promise<void> | undefined;
+		try {
+			await act(async () => {
+				sending = actions.handleSend();
+				await Promise.resolve();
+			});
+			expect(send).toHaveBeenCalledTimes(1);
+			expect(send.mock.calls[0]?.slice(0, 4)).toEqual([
+				"created",
+				"",
+				files.attachedImages,
+				files.attachedTextFiles,
+			]);
+			expect(options.composerRef.current?.commitDraftAfterSend).not.toHaveBeenCalled();
+			expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+			expect(options.navigateToNarrator).not.toHaveBeenCalled();
+			expect(options.sendingRef.current).toBe(true);
+			await act(async () => actions.handleSend());
+			expect(options.createNarrator.mutateAsync).toHaveBeenCalledTimes(1);
+			expect(send).toHaveBeenCalledTimes(1);
+		} finally {
+			await act(async () => {
+				pending.resolve({ id: "first-message" });
+				await sending;
+			});
+		}
+		expect(options.composerRef.current?.commitDraftAfterSend).toHaveBeenCalledTimes(1);
+		expect(options.clearAttachedFilesAndDraft).toHaveBeenCalledTimes(1);
+		expect(options.navigateToNarrator).toHaveBeenCalledWith("created");
+		expect(options.sendingRef.current).toBe(false);
+	});
+
+	test.each([
+		"image",
+		"text file",
+	] as const)("should keep %s attachments with the trimmed initial text when idle /new has text", async (kind) => {
+		const files = attachments(kind);
+		await renderCommand("/new  describe these files  ", files);
+		await act(async () => actions.handleSend());
+		expect(send).toHaveBeenCalledTimes(1);
+		expect(send.mock.calls[0]?.slice(0, 4)).toEqual([
+			"created",
+			"describe these files",
+			files.attachedImages.length ? files.attachedImages : undefined,
+			files.attachedTextFiles.length ? files.attachedTextFiles : undefined,
+		]);
+		expect(options.composerRef.current?.commitDraftAfterSend).toHaveBeenCalledTimes(1);
+		expect(options.clearAttachedFilesAndDraft).toHaveBeenCalledTimes(1);
+		expect(options.navigateToNarrator).toHaveBeenCalledWith("created");
+	});
+
+	test("should only create a narrator when idle /new has neither text nor attachments", async () => {
+		await renderCommand("/new");
+		await act(async () => actions.handleSend());
+		expect(options.createNarrator.mutateAsync).toHaveBeenCalledTimes(1);
+		expect(send).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.commitDraftAfterSend).toHaveBeenCalledTimes(1);
+		expect(options.clearAttachedFilesAndDraft).toHaveBeenCalledTimes(1);
+		expect(options.navigateToNarrator).toHaveBeenCalledWith("created");
+	});
+
+	test.each([
+		"create",
+		"send",
+	] as const)("should restore the command and both attachment types when %s fails", async (failure) => {
+		const files = attachments("mixed");
+		const create = mock(async () => {
+			if (failure === "create") throw new Error("fixture create failed");
+			return { id: "created" };
+		});
+		if (failure === "send") send.mockRejectedValue(new Error("fixture send failed"));
+		await renderCommand("/new", { ...files, createNarrator: { mutateAsync: create } });
+		await act(async () => actions.handleSend());
+		expect(create).toHaveBeenCalledTimes(1);
+		expect(send).toHaveBeenCalledTimes(failure === "send" ? 1 : 0);
+		expect(options.composerRef.current?.restoreInput).toHaveBeenCalledWith("/new", []);
+		expect(options.updateAttachedImages).toHaveBeenCalledWith(files.attachedImages);
+		expect(options.updateAttachedTextFiles).toHaveBeenCalledWith(files.attachedTextFiles);
+		expect(options.composerRef.current?.commitDraftAfterSend).not.toHaveBeenCalled();
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+		expect(options.navigateToNarrator).not.toHaveBeenCalled();
+		expect(notify).toHaveBeenCalledWith(
+			expect.objectContaining({
+				title: "sendFailed",
+				message: `fixture ${failure} failed`,
+				color: "red",
+			}),
+		);
+		expect(options.sendingRef.current).toBe(false);
+	});
+
+	test.each([
+		"turn",
+		"tool",
+		"interrupt",
+	] as const)("should queue /new with its attachments without spawning when active in %s mode", async (mode) => {
+		const files = attachments("mixed");
+		await renderCommand("/new", { ...files, isActive: true });
+		await act(async () => actions.handleSendWithModeRef.current(mode));
+		expect(options.createNarrator.mutateAsync).not.toHaveBeenCalled();
+		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
+		expect(send).toHaveBeenCalledTimes(1);
+		expect(send.mock.calls[0]?.slice(0, 5)).toEqual([
+			"n",
+			"/new",
+			files.attachedImages,
+			files.attachedTextFiles,
+			undefined,
+		]);
+		expect(send.mock.calls[0]?.[8]).toBeUndefined();
+		expect(send.mock.calls[0]?.[9]).toBe("turn");
+		expect(options.clearAttachedFilesAndDraft).toHaveBeenCalledTimes(1);
+	});
+
+	test.each([
+		false,
+		true,
+	])("should reject /new file references while retaining the input (active=%s)", async (isActive) => {
+		await renderCommand("/new", { ...attachments("mixed"), isActive });
+		const composer = options.composerRef.current as NarratorComposerHandle;
+		composer.getFileReferences = () => [reference];
+		await act(async () => actions.handleSend());
+		expect(options.createNarrator.mutateAsync).not.toHaveBeenCalled();
+		expect(send).not.toHaveBeenCalled();
+		expect(composer.hideTextForSend).not.toHaveBeenCalled();
+		expect(composer.commitDraftAfterSend).not.toHaveBeenCalled();
+		expect(options.hideAttachedFilesForSend).not.toHaveBeenCalled();
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+		expect(options.navigateToNarrator).not.toHaveBeenCalled();
+		expect(notify).toHaveBeenCalledWith(
+			expect.objectContaining({ message: "fileReferences.newSessionFirst", color: "red" }),
+		);
+		expect(options.sendingRef.current).toBe(false);
+	});
+});
