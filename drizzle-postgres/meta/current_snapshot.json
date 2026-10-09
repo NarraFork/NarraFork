@@ -1,5 +1,5 @@
 {
-  "id": "d670e861-76d9-408e-b472-2b21e8fac3d1",
+  "id": "392deb77-0f97-42e8-a021-b68bd6a75a2b",
   "prevId": "c8907ecc-6d49-49f5-bd69-203edaa083fb",
   "version": "7",
   "dialect": "postgresql",
@@ -864,6 +864,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true
+        },
+        "background_kind": {
+          "name": "background_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'task'"
         },
         "logical_run_id": {
           "name": "logical_run_id",

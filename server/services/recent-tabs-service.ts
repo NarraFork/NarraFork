@@ -1653,6 +1653,8 @@ export async function getRuntimePatches(
 			hasDraft: tab.hasDraft ?? false,
 			activeTerminalCount: tab.activeTerminalCount ?? 0,
 			activeBackgroundTaskCount: tab.activeBackgroundTaskCount ?? 0,
+			activeBackgroundWorkCount: tab.activeBackgroundWorkCount ?? 0,
+			activeBackgroundServiceCount: tab.activeBackgroundServiceCount ?? 0,
 			viewers: tab.viewers ?? [],
 			viewerCount: tab.viewerCount ?? 0,
 			containerStatus: tab.containerStatus ?? null,

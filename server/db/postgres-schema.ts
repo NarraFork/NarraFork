@@ -2260,6 +2260,7 @@ export const backgroundTasks = pgTable(
 			.notNull()
 			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
 		type: text("type").notNull(),
+		backgroundKind: text("background_kind").notNull().default("task"),
 		logicalRunId: text("logical_run_id"),
 		status: text("status").notNull(),
 		command: text("command"),
@@ -3719,7 +3720,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 116,
-  "columnCount": 1671,
+  "columnCount": 1672,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -17378,6 +17379,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": true,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "backgroundKind",
+          "name": "background_kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"task\"",
+          "defaultExpression": "\"task\""
         },
         {
           "property": "logicalRunId",

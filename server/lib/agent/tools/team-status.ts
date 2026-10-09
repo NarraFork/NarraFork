@@ -109,7 +109,7 @@ export const teamStatusTool: ToolDefinition = {
 		"Query background agents and bash tasks in the current team/session, see which files " +
 		"subagents modified, and send messages within the team.\n\n" +
 		"Actions:\n" +
-		'- "list": List background agents and background bash tasks (kind=agent|bash)\n' +
+		'- "list": List background agents and background bash tasks (kind=agent|bash; bash includes background_kind=task|service)\n' +
 		'- "list_agents": List sibling subagents only\n' +
 		'- "list_bash": List background bash tasks only\n' +
 		'- "file_changes": Show files modified by each subagent (or a specific one via target_id)\n' +
@@ -251,7 +251,7 @@ export const teamStatusTool: ToolDefinition = {
 					const alias = task.alias ? ` | alias=${task.alias}` : "";
 					const cancel = task.canCancelActiveWork ? " | canCancel=true" : "";
 					lines.push(
-						`- kind=bash | id=${task.id}${alias} | status=${status}${cancel} | title=${bashLabel(task.title, task.command)}`,
+						`- kind=bash | background_kind=${task.backgroundKind ?? "task"} | id=${task.id}${alias} | status=${status}${cancel} | title=${bashLabel(task.title, task.command)}`,
 					);
 				}
 				const note = omissionNote(

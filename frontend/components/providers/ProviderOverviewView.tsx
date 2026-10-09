@@ -13,6 +13,7 @@ export interface ProviderOverviewViewProps {
 	onToggleProviderDisabled: (prefix: string) => void;
 	onOpenProviderConfig: (prefix: string) => void;
 	selectedProvider: string | null;
+	pendingProvider?: string;
 }
 
 export const ProviderOverviewView = React.memo(function ProviderOverviewView({
@@ -21,6 +22,7 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 	onToggleProviderDisabled,
 	onOpenProviderConfig,
 	selectedProvider,
+	pendingProvider,
 }: ProviderOverviewViewProps) {
 	const { t } = useTranslation("settings");
 
@@ -40,6 +42,7 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 
 	const getProviderStatus = (group: ProviderGroup): ProviderStatus => {
 		if (group.disabled) return "disabled";
+		if (group.prefix === "tokendance" && group.isPlatform) return "connected";
 		if (group.models.length === 0) return "unverified";
 		return "connected";
 	};
@@ -70,6 +73,7 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 					hiddenCount={hiddenCount}
 					previewModels={previewModels}
 					disabled={group.disabled}
+					controlsDisabled={pendingProvider === group.prefix}
 					onToggleDisabled={() => onToggleProviderDisabled(group.prefix)}
 					onOpenConfig={() => onOpenProviderConfig(group.providerId ?? group.prefix)}
 					isSelected={selectedProvider === (group.providerId ?? group.prefix)}

@@ -440,6 +440,27 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			});
 		});
 
+		test("service kind is persisted without changing execution provenance", async () => {
+			const binding = await seedCall();
+			const result = await backgroundTaskService.createBashTask({
+				id: "service-bound",
+				parentNarratorId: PARENT,
+				command: "serve",
+				backgroundKind: "service",
+				toolCallBinding: binding,
+				executionTarget: target,
+			});
+			expect(result.backgroundKind).toBe("service");
+			expect(
+				db.select().from(backgroundTasks).where(eq(backgroundTasks.id, "service-bound")).get(),
+			).toMatchObject({
+				backgroundKind: "service",
+				status: "running",
+				toolCallId: binding.toolCallId,
+				executionAttempt: binding.attempt,
+			});
+		});
+
 		test("unbound legacy/direct callers remain valid and store both evidence columns as NULL", async () => {
 			await seedCall();
 			await create(undefined, "legacy-direct-1");
@@ -447,6 +468,7 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			await bounded(run(context()));
 			const rows = db.select().from(backgroundTasks).all();
 			expect(rows).toHaveLength(3);
+			expect(rows.every((row) => row.backgroundKind === "task")).toBe(true);
 			expect(rows.every((row) => row.toolCallId === null && row.executionAttempt === null)).toBe(
 				true,
 			);

@@ -2,8 +2,15 @@ import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Affix, Alert, Box, Button, Group, Loader, Stack, Title, Transition } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import type { TokenDancePublicConnection } from "@shared/tokendance";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute, Outlet, useRouterState, useSearch } from "@tanstack/react-router";
+import {
+	createFileRoute,
+	Outlet,
+	useNavigate,
+	useRouterState,
+	useSearch,
+} from "@tanstack/react-router";
 import { nanoid } from "nanoid";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -21,7 +28,10 @@ import { NUGProvidersSection } from "../../components/providers/NUGProvidersSect
 import { PluginProviderSection } from "../../components/providers/PluginProviderSection";
 import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
 import { ProviderOverviewView } from "../../components/providers/ProviderOverviewView";
-import { ProviderAddContext } from "../../components/providers/provider-add-context";
+import {
+	ProviderAddContext,
+	TokenDanceAddContext,
+} from "../../components/providers/provider-add-context";
 import type { AddProviderDraft } from "../../components/providers/provider-add-draft";
 import { createProviderAndRefresh } from "../../components/providers/provider-create-flow";
 import { rebaseProviderState } from "../../components/providers/provider-settings-rebase";
@@ -35,6 +45,17 @@ import {
 	useIsDirty,
 	useProvidersDispatch,
 } from "../../components/providers/providers-reducer";
+import { TokenDanceSection } from "../../components/providers/TokenDanceSection";
+import {
+	claimTokenDanceDraft,
+	clearTokenDanceFlow,
+	restoreTokenDanceDraft,
+	setTokenDanceDraftOwner,
+	startTokenDanceLogin,
+	TOKENDANCE_FLOW_MARKER,
+	TokenDanceFreshSettingsError,
+	tokenDanceDraftSnapshot,
+} from "../../components/providers/tokendance-flow";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useAllModels } from "../../hooks/useModels";
 import {
@@ -185,6 +206,100 @@ function SettingsProvidersPage() {
 		}
 	}, [state.initialized, state]);
 
+	const navigate = useNavigate();
+	const isTokenDanceCallback = useRouterState({
+		select: (router) =>
+			router.matches.some((match) => match.routeId === "/settings/providers/tokendance/callback"),
+	});
+	const [restoredAddPage, setRestoredAddPage] = useState<Record<string, unknown>>();
+	const consumeRestoredAddPage = useCallback(() => setRestoredAddPage(undefined), []);
+	const [restoreError, setRestoreError] = useState(false);
+	const [restoreFetchError, setRestoreFetchError] = useState(false);
+	const [returnEpoch, setReturnEpoch] = useState(0);
+	const draftActorRef = useRef(user?.id);
+	draftActorRef.current = user?.id;
+	useEffect(() => {
+		setTokenDanceDraftOwner(user?.id);
+	}, [user?.id]);
+	useEffect(() => {
+		const onReturn = () => setReturnEpoch((value) => value + 1);
+		window.addEventListener("pageshow", onReturn);
+		return () => window.removeEventListener("pageshow", onReturn);
+	}, []);
+	useEffect(() => {
+		// A pageshow epoch reruns restoration after a bfcache browser return.
+		void returnEpoch;
+		void user?.id;
+		if (!state.initialized || isTokenDanceCallback || user?.role !== "admin" || !user?.id) return;
+		let flowId: string | null = null;
+		try {
+			flowId =
+				typeof sessionStorage === "undefined"
+					? null
+					: sessionStorage.getItem(TOKENDANCE_FLOW_MARKER);
+		} catch {
+			setRestoreError(true);
+			return;
+		}
+		if (!flowId) return;
+		let active = true;
+		void claimTokenDanceDraft(flowId, user.id)
+			.then(({ restore, fresh }) => {
+				if (!active || draftActorRef.current !== user.id) return;
+				setRestoreFetchError(false);
+				if (restore.status !== "completed")
+					notifications.show({ message: t("tokendance.loginFailed"), color: "yellow" });
+				const freshState = providersStateFromSettings(fresh);
+				if (restore.draftSnapshot) {
+					const recovered = restoreTokenDanceDraft(restore.draftSnapshot, fresh);
+					// Edits made after this parent mounted take precedence over late restoration.
+					const latest = rebaseProviderState(stateRef.current, savedSnapshot.current, {
+						...fresh,
+						customApiProviders: recovered.customApiProviders,
+						nugProviders: recovered.nugProviders,
+						agent: { ...(fresh.agent as Record<string, unknown>), ...createSnapshot(recovered) },
+					});
+					savedSnapshot.current = createSnapshot(freshState);
+					dispatch({ type: "RESTORE_FROM_SNAPSHOT", snapshot: createSnapshot(latest) });
+					if (restore.draftSnapshot.addPage) {
+						setRestoredAddPage(restore.draftSnapshot.addPage);
+						if (restore.status !== "completed")
+							void navigate({ to: "/settings/providers/add", replace: true });
+					}
+				} else setRestoreError(true);
+				qc.setQueryData(["settings"], fresh);
+				qc.setQueryData(["admin", "settings"], fresh);
+				clearTokenDanceFlow(flowId);
+			})
+			.catch((cause) => {
+				if (!active || draftActorRef.current !== user.id) return;
+				if (cause instanceof TokenDanceFreshSettingsError) {
+					setRestoreFetchError(true);
+					return;
+				}
+				setRestoreError(true);
+				clearTokenDanceFlow(flowId);
+			});
+		return () => {
+			active = false;
+		};
+	}, [state.initialized, isTokenDanceCallback, user?.role, user?.id, navigate, qc, returnEpoch, t]);
+	const tokenDanceLogin = useCallback(
+		(addPage?: Record<string, unknown>) =>
+			startTokenDanceLogin(
+				tokenDanceDraftSnapshot(stateRef.current, savedSnapshot.current, addPage),
+			),
+		[],
+	);
+	const tokenDanceToggleRef = useRef(false);
+	const [tokenDanceToggling, setTokenDanceToggling] = useState(false);
+	const tokenDance = settings?.tokendance as TokenDancePublicConnection | undefined;
+	const refreshTokenDanceSettings = useCallback(async () => {
+		const fresh = await api.getSettings();
+		qc.setQueryData(["settings"], fresh);
+		qc.setQueryData(["admin", "settings"], fresh);
+	}, [qc]);
+
 	const savedProviderSnapshot = savedSnapshot.current;
 	const isDirty = useIsDirty(state, savedProviderSnapshot);
 
@@ -310,7 +425,9 @@ function SettingsProvidersPage() {
 
 	useEffect(() => {
 		if (search.provider === "codex") setSelectedProvider("codex");
-	}, [search.provider]);
+		if (search.provider === "tokendance" && tokenDance?.connected)
+			setSelectedProvider("tokendance");
+	}, [search.provider, tokenDance?.connected]);
 
 	useEffect(() => {
 		if (isDirty) {
@@ -641,6 +758,7 @@ function SettingsProvidersPage() {
 	const providerGroups = useMemo(() => {
 		const byPrefix = new Map<string, ModelOption[]>();
 		const platformPrefixes = new Set(["codex"]);
+		if (tokenDance?.connected) platformPrefixes.add("tokendance");
 		// Executable-plugin providers, keyed by prefix. They are presented like platform
 		// providers (single instance, not user-addable) but need their own lookup because
 		// the detail area has to reach the owning plugin rather than a builtin section.
@@ -680,6 +798,13 @@ function SettingsProvidersPage() {
 			if (!byPrefix.has(prefix)) byPrefix.set(prefix, []);
 		};
 
+		if (tokenDance?.connected)
+			for (const m of tokenDance.models)
+				addModel("tokendance", {
+					value: `tokendance:${m.id}`,
+					label: m.name || m.id,
+					provider: "tokendance",
+				});
 		for (const m of codexModels) addModel("codex", m);
 		for (const g of openaiByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of anthropicByProvider) for (const m of g.models) addModel(g.prefix, m);
@@ -722,12 +847,18 @@ function SettingsProvidersPage() {
 			// governs plugin providers without any extra wiring. Turning one off hides its
 			// models; it deliberately does NOT stop the plugin, which may also contribute
 			// tools and views.
-			const disabled = state.disabledProviders.has(prefix) || !!match?.disabled;
+			const disabled =
+				prefix === "tokendance"
+					? !!tokenDance?.disabled
+					: state.disabledProviders.has(prefix) || !!match?.disabled;
 
 			return {
 				prefix,
 				providerId,
-				label: providerLabels[prefix] ?? prefix,
+				label:
+					prefix === "tokendance" && tokenDance?.connected
+						? tokenDance.name || "TokenDance"
+						: (providerLabels[prefix] ?? prefix),
 				badgeLabel: plugin
 					? t("providerBadgePlugin")
 					: isPlatform
@@ -747,6 +878,7 @@ function SettingsProvidersPage() {
 		geminiByProvider,
 		nugByProvider,
 		pluginProviderGroups,
+		tokenDance,
 		state.customModels,
 		providerLabels,
 		state.disabledProviders,
@@ -786,7 +918,7 @@ function SettingsProvidersPage() {
 	const selectedProviderLabel = useMemo(() => {
 		if (!selectedProvider) return "";
 		// Platform providers: selectedProvider is the prefix
-		if (["codex"].includes(selectedProvider)) {
+		if (["codex", "tokendance"].includes(selectedProvider)) {
 			return providerLabels[selectedProvider] ?? selectedProvider;
 		}
 		// Plugin providers are also addressed by prefix; without this they would fall
@@ -903,13 +1035,34 @@ function SettingsProvidersPage() {
 
 	autoFetchAndFillRef.current = autoFetchAndFill;
 
+	if (isTokenDanceCallback) return <Outlet />;
 	if (isLoading) return <Loader />;
 
 	if (isAddingProvider) {
 		return (
-			<ProviderAddContext value={handleAddProvider}>
-				<Outlet />
-			</ProviderAddContext>
+			<TokenDanceAddContext
+				value={
+					user?.role === "admin"
+						? { login: tokenDanceLogin, restoredAddPage, consumeRestoredAddPage }
+						: null
+				}
+			>
+				<ProviderAddContext value={handleAddProvider}>
+					{restoreFetchError && (
+						<Alert color="yellow">
+							{t("tokendance.settingsUnavailable")}
+							<Button
+								size="xs"
+								variant="light"
+								onClick={() => setReturnEpoch((value) => value + 1)}
+							>
+								{t("tokendance.retryRestore")}
+							</Button>
+						</Alert>
+					)}
+					<Outlet />
+				</ProviderAddContext>
+			</TokenDanceAddContext>
 		);
 	}
 
@@ -921,26 +1074,35 @@ function SettingsProvidersPage() {
 					providerLabel={selectedProviderLabel}
 					onClose={() => setSelectedProvider(null)}
 				>
-					<ProviderSectionContent
-						providerKey={selectedProvider}
-						pluginProvider={selectedPluginProvider}
-						state={state}
-						dispatchers={dispatchers}
-						providerModelsMap={providerModelsMap}
-						pluginModelsByPrefix={pluginModelsByPrefix}
-						anthropicModelsMap={anthropicModelsMap}
-						nugModelsMap={nugModelsMap}
-						geminiModelsMap={geminiModelsMap}
-						isCustomApiProviderDirty={isCustomApiProviderDirty}
-						isNugProviderDirty={isNugProviderDirty}
-						getPrefixError={getPrefixError}
-						getUniquePrefix={getUniquePrefix}
-						onTestModel={setTestingModel}
-						onServerContextWindowsMerge={handleServerContextWindowsMerge}
-						onSaveBeforeRefresh={confirmSaveBeforeRefresh}
-						onSaveBeforeNugAction={saveBeforeNugAction}
-						onNugLoginSuccess={saveNugLoginResult}
-					/>
+					{selectedProvider === "tokendance" && tokenDance?.connected ? (
+						<TokenDanceSection
+							connection={tokenDance}
+							onLogin={() => tokenDanceLogin()}
+							onChanged={refreshTokenDanceSettings}
+							onDeleted={() => setSelectedProvider(null)}
+						/>
+					) : (
+						<ProviderSectionContent
+							providerKey={selectedProvider}
+							pluginProvider={selectedPluginProvider}
+							state={state}
+							dispatchers={dispatchers}
+							providerModelsMap={providerModelsMap}
+							pluginModelsByPrefix={pluginModelsByPrefix}
+							anthropicModelsMap={anthropicModelsMap}
+							nugModelsMap={nugModelsMap}
+							geminiModelsMap={geminiModelsMap}
+							isCustomApiProviderDirty={isCustomApiProviderDirty}
+							isNugProviderDirty={isNugProviderDirty}
+							getPrefixError={getPrefixError}
+							getUniquePrefix={getUniquePrefix}
+							onTestModel={setTestingModel}
+							onServerContextWindowsMerge={handleServerContextWindowsMerge}
+							onSaveBeforeRefresh={confirmSaveBeforeRefresh}
+							onSaveBeforeNugAction={saveBeforeNugAction}
+							onNugLoginSuccess={saveNugLoginResult}
+						/>
+					)}
 				</ProviderConfigView>
 			);
 		}
@@ -949,7 +1111,24 @@ function SettingsProvidersPage() {
 			<ProviderOverviewView
 				groups={providerGroups}
 				hiddenModels={state.hiddenModels}
-				onToggleProviderDisabled={dispatchers.toggleProviderDisabled}
+				pendingProvider={tokenDanceToggling ? "tokendance" : undefined}
+				onToggleProviderDisabled={(prefix) => {
+					if (prefix === "tokendance") {
+						if (tokenDanceToggleRef.current) return;
+						tokenDanceToggleRef.current = true;
+						setTokenDanceToggling(true);
+						void api
+							.tokenDanceUpdateConnection(!tokenDance?.disabled)
+							.then(refreshTokenDanceSettings)
+							.catch(() =>
+								notifications.show({ message: t("tokendance.operationFailed"), color: "red" }),
+							)
+							.finally(() => {
+								tokenDanceToggleRef.current = false;
+								setTokenDanceToggling(false);
+							});
+					} else dispatchers.toggleProviderDisabled(prefix);
+				}}
 				onOpenProviderConfig={setSelectedProvider}
 				selectedProvider={selectedProvider}
 			/>
@@ -958,6 +1137,19 @@ function SettingsProvidersPage() {
 
 	return (
 		<>
+			{restoreFetchError && (
+				<Alert color="yellow">
+					{t("tokendance.settingsUnavailable")}
+					<Button size="xs" variant="light" onClick={() => setReturnEpoch((value) => value + 1)}>
+						{t("tokendance.retryRestore")}
+					</Button>
+				</Alert>
+			)}
+			{restoreError && (
+				<Alert color="yellow" onClose={() => setRestoreError(false)} withCloseButton>
+					{t("tokendance.draftUnavailable")}
+				</Alert>
+			)}
 			<Box
 				style={{
 					height: isMobile ? undefined : "calc(100vh - 80px)",

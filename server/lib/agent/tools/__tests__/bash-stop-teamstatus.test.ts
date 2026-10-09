@@ -1,9 +1,11 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
 
+import type { ExecHandle, ExecutionBackend } from "../../execution/backend";
+import { localBackend } from "../../execution/local-backend";
 import { toolRegistry } from "../../tool-registry";
-import { PLAN_MODE_ALLOWED_TOOLS, type ToolContext } from "../../types";
+import { type AgentConfig, PLAN_MODE_ALLOWED_TOOLS, type ToolContext } from "../../types";
 import "../index";
-import { bashTool } from "../bash";
+import { bashTool, resolveBashTimeoutMs } from "../bash";
 import { teamStatusTool } from "../team-status";
 
 // --- Background task service stub (drives list/cancel behaviour) ---
@@ -12,6 +14,8 @@ type FakeTask = {
 	id: string;
 	parentNarratorId: string;
 	type: "bash" | "agent";
+	backgroundKind?: "task" | "service";
+	error?: string;
 	status: string;
 	effectiveStatus?: string;
 	command: string | null;
@@ -23,6 +27,8 @@ type FakeTask = {
 const tasks = new Map<string, FakeTask>();
 const cancelled: string[] = [];
 const taskOutput = new Map<string, string>();
+const abortControllers = new Map<string, AbortController>();
+const killHandlers = new Map<string, () => void>();
 
 const realBackgroundTaskServiceModule = {
 	...(await import("@server/services/background-task-service")),
@@ -88,6 +94,10 @@ const fakeBackgroundTaskService = {
 	async cancel(id: string) {
 		const task = tasks.get(id);
 		if (!task || task.status !== "running") return false;
+		abortControllers.get(id)?.abort();
+		killHandlers.get(id)?.();
+		// Let process-exit callbacks race the durable cancellation update.
+		await Promise.resolve();
 		task.status = "cancelled";
 		cancelled.push(id);
 		return true;
@@ -96,6 +106,7 @@ const fakeBackgroundTaskService = {
 		id: string;
 		parentNarratorId: string;
 		command: string;
+		backgroundKind?: "task" | "service";
 		alias?: string;
 		title?: string;
 	}) {
@@ -105,14 +116,26 @@ const fakeBackgroundTaskService = {
 			type: "bash",
 			status: "running",
 			command: input.command,
+			backgroundKind: input.backgroundKind ?? "task",
 			alias: input.alias ?? null,
 			title: input.title ?? null,
 			canCancelActiveWork: true,
 		});
 		return tasks.get(input.id);
 	},
-	registerAbortController() {},
-	registerKillHandler() {},
+	registerAbortController(id: string, controller: AbortController) {
+		abortControllers.set(id, controller);
+	},
+	registerKillHandler(id: string, kill: () => void) {
+		killHandlers.set(id, kill);
+	},
+	isCancellationRequested(id: string) {
+		return abortControllers.get(id)?.signal.aborted ?? false;
+	},
+	async markCancelled(id: string) {
+		const task = tasks.get(id);
+		if (task) task.status = "cancelled";
+	},
 	appendOutput(id: string, output: string) {
 		taskOutput.set(id, (taskOutput.get(id) ?? "") + output);
 	},
@@ -123,9 +146,12 @@ const fakeBackgroundTaskService = {
 		const task = tasks.get(id);
 		if (task) task.status = "completed";
 	},
-	async markFailed(id: string) {
+	async markFailed(id: string, error: string) {
 		const task = tasks.get(id);
-		if (task) task.status = "failed";
+		if (task) {
+			task.status = "failed";
+			task.error = error;
+		}
 	},
 	async markTimedOut(id: string) {
 		const task = tasks.get(id);
@@ -308,12 +334,201 @@ function makeCtx(narratorId: string, parentNarratorId?: string): ToolContext {
 function seed() {
 	tasks.clear();
 	taskOutput.clear();
+	abortControllers.clear();
+	killHandlers.clear();
 	cancelled.length = 0;
 	narrators.clear();
 	teamFileChanges.clear();
 	deliveredMessages.length = 0;
 	deliveryHook = undefined;
 }
+
+describe("Bash background kinds", () => {
+	test("public and normal-session raw schemas expose background_kind", () => {
+		for (const schema of [bashTool.rawJsonSchema, bashTool.getRawJsonSchema?.({} as AgentConfig)]) {
+			expect(schema?.additionalProperties).toBe(false);
+			const properties = schema?.properties as Record<string, unknown>;
+			expect(properties.background_kind).toMatchObject({
+				type: "string",
+				enum: ["task", "service"],
+				default: "task",
+			});
+			expect(properties.background_kind).toHaveProperty(
+				"description",
+				expect.stringContaining("dev/preview/watch"),
+			);
+		}
+	});
+
+	test("read-only raw schema retains kind metadata but forbids background execution", () => {
+		const schema = bashTool.getRawJsonSchema?.({ reviewReadOnlyBash: true } as AgentConfig);
+		const properties = schema?.properties as Record<string, { description: string }>;
+		expect(properties.background_kind).toMatchObject({
+			type: "string",
+			enum: ["task", "service"],
+			default: "task",
+		});
+		expect(properties.background_kind.description).toContain("forbidden");
+		expect(properties.run_in_background.description).toContain("Forbidden");
+		expect(properties.stop.description).toContain("Forbidden");
+	});
+	test("services do not implicitly opt out of the background timeout", () => {
+		const args = bashTool.parameters.parse({
+			command: "dev-server",
+			run_in_background: true,
+			background_kind: "service",
+		}) as { run_in_background: boolean; timeout?: number };
+		expect(resolveBashTimeoutMs(args.run_in_background, args.timeout)).toBe(5 * 60 * 60 * 1_000);
+		expect(resolveBashTimeoutMs(true, 0)).toBeUndefined();
+	});
+
+	test("aborted service admission is cancelled rather than failed", async () => {
+		seed();
+		const controller = new AbortController();
+		const ctx = makeCtx("parent");
+		ctx.signal = controller.signal;
+		ctx.updateExecutionLease = {
+			kind: "background_bash",
+			setNarratorId() {},
+			transfer() {
+				controller.abort();
+				return true;
+			},
+			release() {},
+		};
+		await bashTool.execute(
+			{ command: "true", run_in_background: true, background_kind: "service" },
+			ctx,
+		);
+		const task = [...tasks.values()][0];
+		expect(task.status).toBe("cancelled");
+		expect(task.error).toBeUndefined();
+	});
+	test("remote service uses shared metadata and cancellation beats an exit-zero callback", async () => {
+		seed();
+		let finish!: (code: number) => void;
+		const exited = new Promise<number>((resolve) => {
+			finish = resolve;
+		});
+		const handle: ExecHandle = {
+			exited,
+			onData() {},
+			isExited: () => false,
+			kill: async () => {
+				finish(0);
+			},
+		};
+		const execCommand = mock(async () => handle);
+		const backend: ExecutionBackend = Object.assign(Object.create(localBackend), {
+			kind: "remote",
+			deviceId: "remote-fixture",
+			defaultCwd: "/workspace",
+			execCommand,
+		});
+		const ctx = makeCtx("parent");
+		ctx.resolveBackend = () => backend;
+		ctx.executionTarget = {
+			deviceId: "remote-fixture",
+			backendKind: "remote",
+			cwd: "/workspace",
+			pathFlavor: backend.pathFlavor,
+			runtimeGeneration: backend.runtimeGeneration,
+			selectionSource: "explicit",
+		};
+		await bashTool.execute(
+			{ command: "dev-server", run_in_background: true, background_kind: "service" },
+			ctx,
+		);
+		const task = [...tasks.values()][0];
+		expect(task.backgroundKind).toBe("service");
+		const deadline = Date.now() + 2_000;
+		while (!killHandlers.has(task.id) && Date.now() < deadline) await Bun.sleep(1);
+		expect(execCommand).toHaveBeenCalledTimes(1);
+		expect(execCommand.mock.calls[0]).not.toContainEqual(
+			expect.objectContaining({ backgroundKind: "service" }),
+		);
+		const listing = await teamStatusTool.execute({ action: "list_bash" }, ctx);
+		expect(listing.output).toContain("kind=bash | background_kind=service");
+		// Simulate a cancel controller owned by another generation/runtime: only
+		// the synchronous service signal is available to the exit callback.
+		abortControllers.set(task.id, new AbortController());
+		abortControllers.get(task.id)?.abort();
+		finish(0);
+		while (task.status === "running" && Date.now() < deadline) await Bun.sleep(1);
+		expect(task.status).toBe("cancelled");
+		expect(task.error).toBeUndefined();
+	});
+
+	test("schema defaults commands to task, but preserves stop without a kind", () => {
+		expect(bashTool.parameters.parse({ command: "true" })).toMatchObject({
+			background_kind: "task",
+		});
+		expect(bashTool.parameters.parse({ stop: "id" })).not.toHaveProperty("background_kind");
+		expect(
+			bashTool.parameters.safeParse({ command: "true", background_kind: "service" }).success,
+		).toBe(false);
+		expect(bashTool.parameters.safeParse({ stop: "id", background_kind: "task" }).success).toBe(
+			false,
+		);
+		expect(
+			bashTool.parameters.safeParse({
+				command: "true",
+				run_in_background: true,
+				background_kind: "service",
+			}).success,
+		).toBe(true);
+	});
+
+	test("direct execution rejects invalid kind combinations before permissions", async () => {
+		const ctx = makeCtx("parent");
+		let permissions = 0;
+		ctx.requestPermission = async () => {
+			permissions++;
+			return { behavior: "allow" };
+		};
+		for (const args of [
+			{ command: "true", background_kind: "other" },
+			{ command: "true", background_kind: "service" },
+			{ stop: "id", background_kind: "task" },
+		])
+			expect((await bashTool.execute(args, ctx)).isError).toBe(true);
+		expect(permissions).toBe(0);
+	});
+
+	for (const backgroundKind of ["task", "service"] as const) {
+		test(`${backgroundKind} exit zero has the correct terminal outcome`, async () => {
+			seed();
+			const result = await bashTool.execute(
+				{ command: "true", run_in_background: true, background_kind: backgroundKind },
+				makeCtx("parent"),
+			);
+			expect(result.isError).toBeFalsy();
+			expect(result.output).toContain(`Background bash ${backgroundKind} started`);
+			const task = [...tasks.values()][0];
+			expect(task.backgroundKind).toBe(backgroundKind);
+			const deadline = Date.now() + 2_000;
+			while (task.status === "running" && Date.now() < deadline) await Bun.sleep(1);
+			expect(task.status).toBe(backgroundKind === "service" ? "failed" : "completed");
+			if (backgroundKind === "service")
+				expect(task.error).toContain("exited unexpectedly (exit code: 0)");
+		});
+	}
+
+	test("explicit service stop cancels rather than reporting an unexpected exit", async () => {
+		seed();
+		await bashTool.execute(
+			{ command: "sleep 20", run_in_background: true, background_kind: "service" },
+			makeCtx("parent"),
+		);
+		const task = [...tasks.values()][0];
+		const deadline = Date.now() + 2_000;
+		while (!killHandlers.has(task.id) && Date.now() < deadline) await Bun.sleep(1);
+		expect((await bashTool.execute({ stop: task.id }, makeCtx("parent"))).isError).toBeFalsy();
+		await Bun.sleep(20);
+		expect(task.status).toBe("cancelled");
+		expect(task.error).toBeUndefined();
+	});
+});
 
 describe("Bash stop mode", () => {
 	test("schema: command is optional and stop is exposed as mutually exclusive", () => {
@@ -483,6 +698,7 @@ describe("TeamStatus actions", () => {
 		const result = await teamStatusTool.execute({ action: "list" }, makeCtx("sub-1", "parent"));
 		expect(result.output).toContain("kind=agent");
 		expect(result.output).toContain("kind=bash");
+		expect(result.output).toContain("background_kind=task");
 		expect(result.output).toContain("(you)");
 		expect(result.output).toContain("alias=tests");
 		expect(result.output).toContain("canCancel=true");
@@ -512,6 +728,7 @@ describe("TeamStatus actions", () => {
 			makeCtx("sub-1", "parent"),
 		);
 		expect(result.output).toContain("kind=bash");
+		expect(result.output).toContain("background_kind=task");
 		expect(result.output).toContain("id=bash_self");
 		expect(result.output).toContain("alias=self-task");
 	});
@@ -567,6 +784,7 @@ describe("TeamStatus actions", () => {
 			makeCtx("sub-1", "parent"),
 		);
 		expect(result.output).toContain("kind=bash");
+		expect(result.output).toContain("background_kind=task");
 		expect(result.output).toContain("git log --oneline -5");
 		expect(result.output).not.toContain("kind=agent");
 	});
@@ -585,6 +803,7 @@ describe("TeamStatus actions", () => {
 		});
 		const result = await teamStatusTool.execute({ action: "list" }, makeCtx("primary"));
 		expect(result.output).toContain("kind=bash");
+		expect(result.output).toContain("background_kind=task");
 		expect(result.output).toContain("alias=build");
 	});
 

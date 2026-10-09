@@ -54,6 +54,7 @@ import {
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
+import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { sanitizeHeaders } from "./request-dump";
 import { parseJsonResponseWithBody } from "./response-body";
@@ -1128,7 +1129,10 @@ export class AnthropicProvider implements ProviderAdapter {
 	 * `nug:anthropic`) rather than a bare `anthropic`.
 	 */
 	private reasoningSourceOverride?: string;
-	constructor(config: AnthropicProviderConfig) {
+	constructor(
+		config: AnthropicProviderConfig,
+		private transport?: ProviderTransport,
+	) {
 		this.config = config;
 		this.tlsRejectUnauthorized = config.tlsRejectUnauthorized !== false;
 	}
@@ -1147,10 +1151,13 @@ export class AnthropicProvider implements ProviderAdapter {
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
 		const proxy = resolveProxyForUrl(target, this.config.proxy);
-		return fetchWithNetworkDiagnostics(input, init, {
-			proxy,
-			tls: this.tlsRejectUnauthorized === false ? { rejectUnauthorized: false } : undefined,
-		});
+		return runProviderTransport(this.transport, input, init, (target, options) =>
+			fetchWithNetworkDiagnostics(target, options, {
+				proxy,
+				redactText: this.transport?.redactText,
+				tls: this.tlsRejectUnauthorized === false ? { rejectUnauthorized: false } : undefined,
+			}),
+		);
 	}
 
 	/**

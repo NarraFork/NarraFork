@@ -6,6 +6,7 @@
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
 import type { ModelCard } from "@shared/model-card";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
+import type { TokenDanceCatalogModel } from "@shared/tokendance";
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
 import type { DiskSafetySettings } from "../disk-safety-config";
@@ -493,7 +494,17 @@ export interface OidcProviderConfig {
 	enabled?: boolean;
 }
 
+export interface TokenDanceSettings {
+	apiKey: string;
+	disabled: boolean;
+	generation: number;
+	/** Bounded last successful catalog; available after service restart. */
+	models?: TokenDanceCatalogModel[];
+}
+
 export interface NarraForkSettings {
+	/** Backend-only singleton credentials; never return this object to clients. */
+	tokendance?: TokenDanceSettings;
 	/** Tool-triggered local filesystem safety; absent older settings use safe defaults. */
 	diskSafety?: DiskSafetySettings;
 	/** Instance-wide, monotonic setup completion; absent until legacy preferences are migrated. */

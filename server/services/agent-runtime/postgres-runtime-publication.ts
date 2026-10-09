@@ -1522,6 +1522,7 @@ export function createPostgresRuntimePublication(
 			const result = await runComposite("publication.cancelTask", async (tx) => {
 				const [existing] = await tx
 					.select({
+						backgroundKind: backgroundTasks.backgroundKind,
 						id: backgroundTasks.id,
 						type: backgroundTasks.type,
 						status: backgroundTasks.status,
@@ -1588,6 +1589,12 @@ export function createPostgresRuntimePublication(
 					);
 					if (section.needsSeqFloorMark) {
 						raisedFloorNarratorIds.add(run.producerKind === "agent" ? run.taskId : run.recipientId);
+					}
+					if (existing.type === "bash" && existing.backgroundKind === "service") {
+						// Match foreground delivery: retain the durable result while consuming
+						// terminal publication and revoking any undelivered mailbox notice.
+						await primitives.consumeAwaitedTerminal(tx, run);
+						return updated;
 					}
 					await primitives.commitIntent(tx, {
 						...run,

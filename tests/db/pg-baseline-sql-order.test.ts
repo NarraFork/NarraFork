@@ -359,7 +359,11 @@ describe("bounds, real committed assets, and source AST guard", () => {
 			"last_stop_reason",
 		]);
 		expect(narrators?.indexOf("next_seq")).toBeLessThan(narrators?.indexOf("insert_seq") ?? -1);
-		expect(result.order.get("background_tasks")?.at(-1)).toBe("insert_seq");
+		// The main-branch 0010 migration appends background_kind after insert_seq.
+		expect(result.order.get("background_tasks")?.slice(-2)).toEqual([
+			"insert_seq",
+			"background_kind",
+		]);
 	});
 
 	test("AST pins a pure SQL helper with no catalog access or snapshot-order writes", () => {

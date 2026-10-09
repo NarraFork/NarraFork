@@ -27,7 +27,13 @@ describe("provider presets", () => {
 		for (const entry of PROVIDER_PRESETS) {
 			expect(entry.id).toBeTruthy();
 			expect(entry.name).toBeTruthy();
-			expect(entry.endpoints[entry.defaultProtocol]).toBeTruthy();
+			if (entry.category === "platform-login") {
+				expect(entry.defaultProtocol).toBeUndefined();
+				expect(entry.endpoints).toEqual({});
+			} else {
+				expect(entry.defaultProtocol).toBeDefined();
+				if (entry.defaultProtocol) expect(entry.endpoints[entry.defaultProtocol]).toBeTruthy();
+			}
 		}
 	});
 
@@ -197,10 +203,7 @@ describe("preset search", () => {
 		expect(searchProviderPresets("radeon-cloud").map((entry) => entry.id)).toEqual([
 			"radeon-cloud",
 		]);
-		expect(searchProviderPresets("gemini-compatible").map((entry) => entry.id)).toEqual([
-			"tokendance",
-			"gemini",
-		]);
+		expect(searchProviderPresets("gemini-compatible").map((entry) => entry.id)).toEqual(["gemini"]);
 	});
 
 	test("Chinese and English local aliases match without changing original display names", () => {

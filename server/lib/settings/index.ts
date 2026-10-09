@@ -5,7 +5,15 @@
  * because this index re-exports everything from the sub-modules.
  */
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { resolve } from "node:path";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
 import { generateShortId } from "../id";
@@ -246,6 +254,7 @@ export function reloadSettings(): NarraForkSettings {
 
 function loadSettingsFromDisk(): NarraForkSettings {
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
+	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
 	if (!existsSync(settingsPath)) {
 		writeFileSync(settingsPath, JSON.stringify(DEFAULTS, null, 2), { mode: 0o600 });
 	}
@@ -792,6 +801,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	normalizeMcpServerIds(newSettings);
 	reconcileLegacyWindowSettings(newSettings);
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
+	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
 	const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
 	try {
 		writeFileSync(tempPath, JSON.stringify(settingsWithRawModelCatalog(newSettings), null, 2), {

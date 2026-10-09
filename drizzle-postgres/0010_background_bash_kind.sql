@@ -6,6 +6,7 @@ CREATE TABLE "narrator_question_events" (
 	"created_at" text NOT NULL
 );
 --> statement-breakpoint
+ALTER TABLE "background_tasks" ADD COLUMN "background_kind" text DEFAULT 'task' NOT NULL;--> statement-breakpoint
 ALTER TABLE "narrator_questions" ADD COLUMN "context" text;--> statement-breakpoint
 ALTER TABLE "narrator_questions" ADD COLUMN "resolution_json" text;--> statement-breakpoint
 ALTER TABLE "narrator_questions" ADD COLUMN "withdraw_reason" text;--> statement-breakpoint

@@ -26,6 +26,8 @@ const NETWORK_ERROR_CATEGORIES = new Set<NetworkErrorCategory>([
 	"network",
 ]);
 export interface DiagnosticFetchOptions {
+	/** Runtime-only connection-specific secret masking, before capture and verbose logging. */
+	redactText?: (text: string) => string;
 	proxy?: string;
 	tls?: {
 		rejectUnauthorized?: boolean;
@@ -315,8 +317,9 @@ export async function fetchWithNetworkDiagnostics(
 	init?: RequestInit,
 	options: DiagnosticFetchOptions = {},
 ): Promise<Response> {
+	const redact = options.redactText ?? ((text: string) => text);
 	const rawUrl = input instanceof Request ? input.url : String(input);
-	const url = sanitizeDiagnosticUrl(rawUrl);
+	const url = redact(sanitizeDiagnosticUrl(rawUrl));
 	const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
 	const proxyUrl = options.proxy ? sanitizeDiagnosticUrl(options.proxy) : undefined;
 	const verbose = isVerboseRequestCaptureEnabled();
@@ -336,7 +339,7 @@ export async function fetchWithNetworkDiagnostics(
 		const requestHeaders = init?.headers ?? (input instanceof Request ? input.headers : undefined);
 		writeSafeVerboseBlock([
 			`> ${method} ${url}`,
-			...redactDiagnosticHeaders(requestHeaders).map((header) => `> ${header}`),
+			...redactDiagnosticHeaders(requestHeaders).map((header) => `> ${redact(header)}`),
 		]);
 	}
 	try {
@@ -348,21 +351,25 @@ export async function fetchWithNetworkDiagnostics(
 
 		const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
 		const responseHeaders = selectSafeDiagnosticHeaders(response.headers);
+		if (responseHeaders) {
+			for (const name of Object.keys(responseHeaders))
+				responseHeaders[name] = redact(responseHeaders[name]);
+		}
 		// Only when it differs from the requested URL: an equal value is noise,
 		// while a different one means a redirect took us somewhere else.
-		const finalUrl = response.url ? sanitizeDiagnosticUrl(response.url) : undefined;
+		const finalUrl = response.url ? redact(sanitizeDiagnosticUrl(response.url)) : undefined;
 		finishCapture?.({
 			outcome: response.ok ? "success" : "http_error",
 			category: response.ok ? undefined : "http",
 			durationMs,
 			status: response.status,
-			statusText: sanitizeDiagnosticText(response.statusText),
+			statusText: redact(sanitizeDiagnosticText(response.statusText)),
 			...(finalUrl && finalUrl !== url && { responseUrl: finalUrl }),
 			responseHeaders,
 		});
 		if (verbose) {
 			writeSafeVerboseBlock([
-				`< HTTP ${response.status} ${sanitizeDiagnosticText(response.statusText)}`,
+				`< HTTP ${response.status} ${redact(sanitizeDiagnosticText(response.statusText))}`,
 				...(finalUrl && finalUrl !== url ? [`< (redirected to ${finalUrl})`] : []),
 				...Object.entries(responseHeaders ?? {}).map(([name, value]) => `< ${name}: ${value}`),
 			]);
@@ -370,7 +377,11 @@ export async function fetchWithNetworkDiagnostics(
 		return response;
 	} catch (error) {
 		const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
-		const diagnostic = serializeDiagnosticError(error);
+		const diagnostic = options.redactText
+			? (JSON.parse(
+					redact(JSON.stringify(serializeDiagnosticError(error))),
+				) as CapturedErrorDetails)
+			: serializeDiagnosticError(error);
 		const category = classifyNetworkError(diagnostic);
 		if (verbose) {
 			writeSafeVerboseBlock([

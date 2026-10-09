@@ -28,6 +28,8 @@ export function nugProviderFromDraft(id: string, draft: AddProviderDraft): NUGPr
 }
 
 export function draftFromPreset(preset: ProviderPreset): AddProviderDraft {
+	if (preset.category === "platform-login" || !preset.defaultProtocol)
+		throw new Error("Platform providers require login");
 	const protocol =
 		(["openai-responses", "anthropic-messages", "completions-compatible"] as const).find(
 			(candidate) => Object.hasOwn(preset.endpoints, candidate),

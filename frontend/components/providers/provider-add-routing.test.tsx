@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import type { TokenDanceDraftSnapshot } from "@shared/tokendance";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	createMemoryHistory,
@@ -15,6 +16,8 @@ import { act, type ComponentProps } from "react";
 import type { Root } from "react-dom/client";
 import commonLocale from "../../locales/en/common.json";
 import settingsLocale from "../../locales/en/settings.json";
+import { createSnapshot, providersStateFromSettings } from "./providers-reducer";
+import { TOKENDANCE_FLOW_MARKER, tokenDanceDraftSnapshot } from "./tokendance-flow";
 
 // Real parent reducer, file-route components, overview Link, and add form. Only
 // authentication/API I/O and the unrelated provider-detail editors are substituted.
@@ -61,6 +64,11 @@ function installDom() {
 		Node: window.Node,
 		Text: window.Text,
 		location: new URL("https://example.test/settings/providers"),
+		sessionStorage: {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => storage.set(key, value),
+			removeItem: (key: string) => storage.delete(key),
+		},
 		localStorage: {
 			getItem: (key: string) => storage.get(key) ?? null,
 			setItem: (key: string, value: string) => storage.set(key, value),
@@ -115,7 +123,7 @@ const auth = await import("../../hooks/useAuth");
 const models = await import("../../hooks/useModels");
 const customSection = await import("./CustomApiProviderSection");
 const nugSection = await import("./NUGProvidersSection");
-const { api } = await import("../../lib/api");
+const { api, ApiError } = await import("../../lib/api");
 const { Route: parentFileRoute } = await import("../../routes/settings/providers");
 const { Route: addFileRoute } = await import("../../routes/settings/providers.add");
 restoreDom();
@@ -150,6 +158,7 @@ let router: ReturnType<typeof makeRouter>;
 let customDetail: ComponentProps<typeof customSection.CustomApiProviderSection> | undefined;
 let nugDetail: ComponentProps<typeof nugSection.NUGProvidersSection> | undefined;
 let saveCalls = 0;
+let confirmAnswer = false;
 let serverSettings: Record<string, unknown>;
 let savedPayloads: Record<string, unknown>[];
 let refreshCalls: Array<{ method: string; id: string }>;
@@ -211,6 +220,7 @@ function makeRouter(href: string) {
 beforeEach(() => {
 	installDom();
 	saveCalls = 0;
+	confirmAnswer = false;
 	serverSettings = clone(initialSettings);
 	savedPayloads = [];
 	refreshCalls = [];
@@ -235,7 +245,7 @@ beforeEach(() => {
 	customDetail = undefined;
 	nugDetail = undefined;
 	const authSpy = spyOn(auth, "useCurrentUser").mockReturnValue({
-		data: { role: "admin" },
+		data: { role: "admin", id: "admin-test" },
 	} as ReturnType<typeof auth.useCurrentUser>);
 	const modelsSpy = spyOn(models, "useAllModels").mockReturnValue({
 		providerLabels: { existing: "Existing provider", draft: "New draft" },
@@ -314,7 +324,7 @@ async function mount(href = "/settings/providers") {
 			<I18nextProvider i18n={i18n}>
 				<MantineProvider env="test">
 					<QueryClientProvider client={queryClient}>
-						<ConfirmDialogContext value={{ confirm: async () => false }}>
+						<ConfirmDialogContext value={{ confirm: async () => confirmAnswer }}>
 							<RouterProvider router={router} />
 						</ConfirmDialogContext>
 					</QueryClientProvider>
@@ -649,6 +659,306 @@ describe("provider add nested route", () => {
 		expect(container.querySelector("[data-custom-detail]")).toBeNull();
 		expect(container.textContent).toContain("New draft");
 		expect(saveCalls).toBe(1);
+	});
+
+	for (const status of [
+		"completed",
+		"failed",
+		"cancelled",
+		"pending",
+		"pending-cancel-failure",
+	] as const)
+		test(`TokenDance whole-page remount restores dirty key/sets and add form (${status})`, async () => {
+			await mount();
+			const baseline = providersStateFromSettings(initialSettings);
+			const local = structuredClone(baseline);
+			local.customApiProviders[0] = {
+				...baseline.customApiProviders[0],
+				name: "Recovered dirty edit",
+				apiKey: "unsaved-other-key",
+			};
+			local.hiddenModels.add("existing:hidden");
+			const snapshot: TokenDanceDraftSnapshot = tokenDanceDraftSnapshot(
+				local,
+				createSnapshot(baseline),
+				{
+					query: "",
+					category: "all",
+					presetId: "deepseek",
+					showConfig: true,
+					draft: {
+						protocol: "openai-responses",
+						name: "Unsubmitted API",
+						baseUrl: "https://api.deepseek.com/v1",
+						prefix: "new",
+						apiKey: "new-unsaved-key",
+					},
+				},
+			);
+			await act(async () => root?.unmount());
+			root = createRoot(container);
+			serverSettings = {
+				...clone(initialSettings),
+				tokendance: {
+					connected: true,
+					name: "TokenDance fresh",
+					disabled: false,
+					generation: 9,
+					models: [
+						{
+							id: "raw:model",
+							name: "Fresh platform model",
+							context_length: 64000,
+							supported_protocols: ["openai:responses"],
+						},
+					],
+				},
+			};
+			queryClient.setQueryData(["admin", "settings"], serverSettings);
+			sessionStorage.setItem(TOKENDANCE_FLOW_MARKER, `remount-${status}`);
+			const serverStatus = status === "pending-cancel-failure" ? "pending" : status;
+			const restoreSpy = spyOn(api, "tokenDanceDraftRestore").mockResolvedValue({
+				status: serverStatus,
+				draftSnapshot: snapshot,
+			});
+			const cancelSpy = spyOn(api, "tokenDanceOAuthCancel").mockImplementation(async () => {
+				if (status === "pending-cancel-failure")
+					throw new Error("server restarted after successful claim");
+				return { ok: true };
+			});
+			restorers.push(
+				() => restoreSpy.mockRestore(),
+				() => cancelSpy.mockRestore(),
+			);
+			await mount();
+			await act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 30));
+			});
+			expect(restoreSpy).toHaveBeenCalledTimes(1);
+			expect(cancelSpy).toHaveBeenCalledTimes(serverStatus === "pending" ? 1 : 0);
+			expect(sessionStorage.getItem(TOKENDANCE_FLOW_MARKER)).toBeNull();
+			if (status === "completed") {
+				expect(router.state.location.pathname).toBe("/settings/providers");
+				await openAdd();
+			}
+			expect(router.state.location.pathname).toBe("/settings/providers/add");
+			const password = container.querySelector<HTMLInputElement>('input[type="password"]');
+			expect(password?.value).toBe("new-unsaved-key");
+			await click(button("addProviderCancel"));
+			const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
+				node.textContent?.includes("Existing provider"),
+			);
+			if (!card) throw new Error("Missing recovered provider");
+			await click(card);
+			expect(customDetail?.provider.name).toBe("Recovered dirty edit");
+			expect(customDetail?.provider.apiKey).toBe("unsaved-other-key");
+			expect(customDetail?.hiddenModels.has("existing:hidden")).toBe(true);
+			expect((serverSettings.tokendance as { generation: number }).generation).toBe(9);
+			expect(saveCalls).toBe(0);
+		});
+
+	for (const reason of ["expired", "actor mismatch", "server restarted"])
+		test(`TokenDance ${reason} clears marker and shows draft recovery warning`, async () => {
+			sessionStorage.setItem(TOKENDANCE_FLOW_MARKER, `failure-${reason}`);
+			const restoreSpy = spyOn(api, "tokenDanceDraftRestore").mockRejectedValue(new Error(reason));
+			restorers.push(() => restoreSpy.mockRestore());
+			await mount();
+			await act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 30));
+			});
+			expect(restoreSpy).toHaveBeenCalledTimes(1);
+			expect(sessionStorage.getItem(TOKENDANCE_FLOW_MARKER)).toBeNull();
+			expect(container.textContent).toContain(text("tokendance.draftUnavailable"));
+			expect(saveCalls).toBe(0);
+		});
+
+	test("fresh settings failure leaves snapshot unclaimed and marker retryable", async () => {
+		const baseline = providersStateFromSettings(initialSettings);
+		const local = structuredClone(baseline);
+		local.customApiProviders[0] = {
+			...baseline.customApiProviders[0],
+			apiKey: "retry-preserved-key",
+		};
+		const snapshot = tokenDanceDraftSnapshot(local, createSnapshot(baseline));
+		sessionStorage.setItem(TOKENDANCE_FLOW_MARKER, "fresh-retry-flow");
+		const freshSpy = spyOn(api, "getSettings").mockRejectedValue(
+			new Error("temporary network failure"),
+		);
+		const restoreSpy = spyOn(api, "tokenDanceDraftRestore").mockResolvedValue({
+			status: "completed",
+			draftSnapshot: snapshot,
+		});
+		restorers.push(
+			() => freshSpy.mockRestore(),
+			() => restoreSpy.mockRestore(),
+		);
+		await mount();
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		});
+		expect(restoreSpy).not.toHaveBeenCalled();
+		expect(sessionStorage.getItem(TOKENDANCE_FLOW_MARKER)).toBe("fresh-retry-flow");
+		expect(container.textContent).toContain(text("tokendance.settingsUnavailable"));
+		freshSpy.mockResolvedValue(clone(serverSettings));
+		await click(button("tokendance.retryRestore"));
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		});
+		expect(restoreSpy).toHaveBeenCalledTimes(1);
+		expect(sessionStorage.getItem(TOKENDANCE_FLOW_MARKER)).toBeNull();
+		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
+			node.textContent?.includes("Existing provider"),
+		);
+		if (!card) throw new Error("Missing recovered existing provider");
+		await click(card);
+		expect(customDetail?.provider.apiKey).toBe("retry-preserved-key");
+	});
+
+	test("TokenDance appears only when connected in platform and local-only delete is guarded", async () => {
+		await mount();
+		expect(container.textContent).not.toContain("TokenDance fresh");
+		await act(async () => root?.unmount());
+		root = createRoot(container);
+		serverSettings = {
+			...clone(initialSettings),
+			tokendance: {
+				connected: true,
+				name: "TokenDance fresh",
+				disabled: false,
+				generation: 1,
+				models: [],
+			},
+		};
+		queryClient.setQueryData(["admin", "settings"], serverSettings);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const deleteSpy = spyOn(api, "tokenDanceDeleteConnection").mockImplementation(async () => {
+			await gate;
+			serverSettings = {
+				...serverSettings,
+				tokendance: {
+					connected: false,
+					name: "TokenDance",
+					disabled: false,
+					generation: 2,
+					models: [],
+				},
+			};
+		});
+		restorers.push(() => deleteSpy.mockRestore());
+		await mount();
+		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
+			node.textContent?.includes("TokenDance fresh"),
+		);
+		if (!card) throw new Error("Missing connected TokenDance");
+		expect(card.textContent).toContain(text("providerTypePlatform"));
+		await click(card);
+		await click(button("tokendance.delete"));
+		expect(deleteSpy).not.toHaveBeenCalled();
+		confirmAnswer = true;
+		const remove = button("tokendance.delete");
+		await click(remove);
+		expect(remove.disabled).toBe(true);
+		await click(remove);
+		expect(deleteSpy).toHaveBeenCalledTimes(1);
+		await act(async () => {
+			release();
+		});
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		});
+		expect(container.textContent).not.toContain("TokenDance fresh");
+		expect(container.textContent).toContain("Existing provider");
+		expect(saveCalls).toBe(0);
+	});
+
+	test("successful TokenDance refresh clears transient recovery action at the same generation", async () => {
+		serverSettings = {
+			...clone(initialSettings),
+			tokendance: {
+				connected: true,
+				name: "TokenDance fresh",
+				disabled: false,
+				generation: 1,
+				models: [],
+			},
+		};
+		queryClient.setQueryData(["admin", "settings"], serverSettings);
+		const refreshSpy = spyOn(api, "tokenDanceRefreshModels")
+			.mockRejectedValueOnce(new ApiError("redacted", 402, { recoveryAction: "top_up_balance" }))
+			.mockResolvedValue({ models: [] });
+		restorers.push(() => refreshSpy.mockRestore());
+		await mount();
+		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
+			node.textContent?.includes("TokenDance fresh"),
+		);
+		if (!card) throw new Error("Missing TokenDance card");
+		await click(card);
+		await click(button("tokendance.refresh"));
+		expect(container.textContent).toContain(text("tokendance.top_up_balance"));
+		await click(button("tokendance.refresh"));
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		});
+		expect(container.textContent).not.toContain(text("tokendance.top_up_balance"));
+		expect(refreshSpy).toHaveBeenCalledTimes(2);
+	});
+
+	test("TokenDance overview disable has no duplicate request during pending operation", async () => {
+		serverSettings = {
+			...clone(initialSettings),
+			tokendance: {
+				connected: true,
+				name: "TokenDance fresh",
+				disabled: false,
+				generation: 1,
+				models: [],
+			},
+		};
+		queryClient.setQueryData(["admin", "settings"], serverSettings);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const updateSpy = spyOn(api, "tokenDanceUpdateConnection").mockImplementation(
+			async (disabled) => {
+				await gate;
+				const connection = {
+					...(serverSettings.tokendance as {
+						connected: boolean;
+						name: string;
+						disabled: boolean;
+						generation: number;
+						models: [];
+					}),
+					disabled,
+				};
+				serverSettings = { ...serverSettings, tokendance: connection };
+				return connection;
+			},
+		);
+		restorers.push(() => updateSpy.mockRestore());
+		await mount();
+		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
+			node.textContent?.includes("TokenDance fresh"),
+		);
+		const toggle = card?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+		if (!toggle) throw new Error("Missing platform switch");
+		await act(async () => {
+			toggle.dispatchEvent(new Event("click", { bubbles: true }));
+		});
+		expect(updateSpy).toHaveBeenCalledTimes(1);
+		expect(toggle.disabled).toBe(true);
+		await act(async () => {
+			toggle.dispatchEvent(new Event("click", { bubbles: true }));
+		});
+		expect(updateSpy).toHaveBeenCalledTimes(1);
+		await act(async () => {
+			release();
+		});
+		expect(saveCalls).toBe(0);
 	});
 
 	test("direct entry to add initializes the parent and cancellation returns to providers", async () => {

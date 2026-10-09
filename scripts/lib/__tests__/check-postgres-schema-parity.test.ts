@@ -404,10 +404,15 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 116 tables and 1671 columns including question events and context snapshots", () => {
+	test("covers 116 tables and 1672 columns including question events and background kind", () => {
 		expect(target.tables.length).toBe(116);
-		// 1668 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1671);
+		// 1669 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1672);
+		expect(
+			target.tables
+				.find((table) => table.name === "background_tasks")
+				?.columns.find((column) => column.property === "backgroundKind"),
+		).toMatchObject({ name: "background_kind", notNull: true, defaultExpression: '"task"' });
 		for (const name of ["narrators", "api_requests"]) {
 			expect(
 				target.tables

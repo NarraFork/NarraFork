@@ -59,6 +59,27 @@ function elementOf(
 }
 
 describe("shared bottom toolbar actions", () => {
+	test("service-only toolbar remains visible without processing pulse and mixed work pulses", () => {
+		const props = makeProps();
+		props.toolbarBadgeCounts = {
+			...props.toolbarBadgeCounts,
+			backgroundTasks: 2,
+			backgroundWork: 0,
+			backgroundServices: 2,
+		};
+		props.t = (key, opts) =>
+			key === "backgroundTasks.activeKinds"
+				? `${opts?.work} tasks, ${opts?.services} services`
+				: key;
+		const service = NarratorToolbarItem({ ...props, def: def("tasks") });
+		expect(elementOf(service, Indicator)?.props.processing).toBeFalse();
+		expect(elementOf(service, Indicator)?.props.label).toBe("2");
+		expect(elementOf(service, ActionIcon)?.props["aria-label"]).toContain("0 tasks, 2 services");
+		props.toolbarBadgeCounts.backgroundWork = 1;
+		const mixed = NarratorToolbarItem({ ...props, def: def("tasks") });
+		expect(elementOf(mixed, Indicator)?.props.processing).toBeTrue();
+	});
+
 	test("preserves saved order and delegates both presentations to one controller", () => {
 		const props = makeProps();
 		const actions = buildBottomToolbarActions({

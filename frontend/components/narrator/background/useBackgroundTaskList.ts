@@ -54,6 +54,8 @@ const SUBAGENT_STATUS_REFETCH_DEBOUNCE_MS = 5_000;
 export interface BackgroundTaskListResult {
 	tasks: BackgroundTaskListItem[];
 	activeCount: number;
+	activeWorkCount: number;
+	activeServiceCount: number;
 	activeTruncated: boolean;
 	isLoading: boolean;
 	hasNextPage: boolean;
@@ -239,6 +241,8 @@ export function useBackgroundTaskList(
 					listEpoch: data.listEpoch as string,
 					version: data.version as number,
 					activeCount: data.activeCount as number,
+					activeWorkCount: data.activeWorkCount as number | undefined,
+					activeServiceCount: data.activeServiceCount as number | undefined,
 					upsert: data.upsert as BackgroundTaskListDelta["upsert"],
 					removeIds: data.removeIds as string[] | undefined,
 					invalidate: data.invalidate as boolean | undefined,
@@ -277,6 +281,8 @@ export function useBackgroundTaskList(
 	return {
 		tasks,
 		activeCount: state?.activeCount ?? 0,
+		activeWorkCount: state?.activeWorkCount ?? state?.activeCount ?? 0,
+		activeServiceCount: state?.activeServiceCount ?? 0,
 		activeTruncated: state?.activeTruncated ?? false,
 		isLoading: query.isLoading,
 		hasNextPage: !!query.hasNextPage,

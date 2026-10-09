@@ -1142,6 +1142,7 @@ function createSqliteAsyncPublicationService(
 			const task = runAtomicWrite(db, "publication.cancelTask", (tx) => {
 				const existing = tx
 					.select({
+						backgroundKind: backgroundTasks.backgroundKind,
 						id: backgroundTasks.id,
 						type: backgroundTasks.type,
 						status: backgroundTasks.status,
@@ -1192,11 +1193,18 @@ function createSqliteAsyncPublicationService(
 				if (!updated) return undefined;
 				if (updated.type !== "transfer" && existing.logicalRunId) {
 					const run = taskPublicationRun({ ...updated, logicalRunId: existing.logicalRunId });
+					const resultRef = legacy.persistResult(run, input.capturedOutput ?? "(cancelled)", tx);
+					if (existing.type === "bash" && existing.backgroundKind === "service") {
+						// Explicit service stop settles the durable result, not a new parent turn.
+						// Consume atomically: suppress retries AND revoke undelivered mailbox notices.
+						legacy.store.consumeAwaitedTerminal(run, tx);
+						return updated;
+					}
 					legacy.commit(
 						{
 							...run,
 							eventKind: "cancelled",
-							resultRef: legacy.persistResult(run, input.capturedOutput ?? "(cancelled)", tx),
+							resultRef,
 							summary: `[System] Background ${existing.type} cancelled. Use Await({ type: "${existing.type}", id: "${existing.alias ?? existing.id}" }) to read the stored result.`,
 						},
 						tx,

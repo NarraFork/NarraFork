@@ -1646,7 +1646,10 @@
 	"openSubagentSession": "打开会话",
 	"openStandalonePage": "在独立页面打开",
 	"backgroundTasks": {
-		"title": "后台任务",
+		"title": "后台任务与服务",
+		"kindService": "服务",
+		"kindTask": "任务",
+		"activeKinds": "{{work}} 个任务、{{services}} 个服务正在运行",
 		"activeCount": "后台任务 {{count}}",
 		"openPanel": "打开后台任务窗格",
 		"cancel": "取消任务",

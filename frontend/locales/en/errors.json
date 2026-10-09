@@ -1,4 +1,12 @@
 {
+	"tokendanceRecoveryTitle": "TokenDance needs attention",
+	"tokendanceRecoveryTopUp": "Your TokenDance balance is insufficient. Top up the account used for this connection, then retry. The current key remains valid.",
+	"tokendanceRecoveryReauthorize": "This TokenDance key is no longer usable. Reauthorize the platform connection, then retry.",
+	"tokendanceRecoveryQuota": "This key has reached its periodic quota. Wait for the quota to reset, or reauthorize the connection. No automatic retry or payment will be made.",
+	"tokendanceRecoveryAdminRequired": "Contact your administrator to manage this platform connection.",
+	"tokendanceRecoveryOpenWebsite": "Top up on TokenDance",
+	"tokendanceRecoveryManage": "Manage platform connection",
+	"tokendanceRecoveryDismiss": "Later",
 	"RESOURCE_NOT_FOUND": "{{entity}} not found: {{id}}",
 	"VALIDATION_FAILED": "Request validation failed: {{detail}}",
 	"FORBIDDEN_ACTION": "You are not allowed to perform this action",

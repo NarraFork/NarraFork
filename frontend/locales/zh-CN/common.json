@@ -252,6 +252,7 @@
 	"containerRecheckFailed": "重新检查容器环境失败",
 	"activeTerminals": "{{count}} 个活跃终端",
 	"activeBackgroundTasks": "{{count}} 个后台任务正在运行",
+	"activeBackgroundServices": "{{count}} 个后台服务正在运行",
 	"viewersWatching": "{{count}} 人正在查看",
 	"swipePin": "置顶",
 	"swipeUnpin": "取消置顶",

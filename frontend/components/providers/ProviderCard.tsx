@@ -26,6 +26,7 @@ export interface ProviderCardProps {
 	previewModels: string[];
 	disabled: boolean;
 	isRefreshing?: boolean;
+	controlsDisabled?: boolean;
 	onToggleDisabled: () => void;
 	onRefresh?: () => void;
 	onOpenConfig: () => void;
@@ -43,6 +44,7 @@ export const ProviderCard = React.memo(function ProviderCard({
 	previewModels,
 	disabled,
 	isRefreshing,
+	controlsDisabled,
 	onToggleDisabled,
 	onRefresh,
 	onOpenConfig,
@@ -110,6 +112,7 @@ export const ProviderCard = React.memo(function ProviderCard({
 						}}
 					>
 						<Switch
+							disabled={controlsDisabled}
 							size="xs"
 							checked={!disabled}
 							onChange={(event) => {

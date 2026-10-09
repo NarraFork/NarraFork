@@ -4,6 +4,8 @@ import {
 	BACKGROUND_TASK_LIST_MAX_PAGE_SIZE,
 	BACKGROUND_TASK_LIST_OUTPUT_PREVIEW_CHARS,
 	BACKGROUND_TASK_LIST_PAGE_SIZE,
+	type BackgroundTaskActiveCounts,
+	type BackgroundTaskKind,
 	type BackgroundTaskListDelta,
 	type BackgroundTaskListItem,
 	type BackgroundTaskListPage,
@@ -476,9 +478,9 @@ class BackgroundTaskService {
 	): Promise<void> {
 		const fn = await this.getBroadcastFn();
 		if (!fn) return;
-		let activeCount = 0;
+		let counts: BackgroundTaskActiveCounts;
 		try {
-			activeCount = await this.countActiveByParent(parentNarratorId);
+			counts = await this.countActiveKindsByParent(parentNarratorId);
 		} catch (err) {
 			logger.warn("Failed to count active background tasks for list delta", {
 				parentNarratorId,
@@ -492,7 +494,7 @@ class BackgroundTaskService {
 			narratorId: parentNarratorId,
 			listEpoch: BACKGROUND_TASK_LIST_EPOCH,
 			version: this.bumpListVersion(parentNarratorId),
-			activeCount,
+			...counts,
 			...delta,
 		});
 		// Separate tiny frame for count-only consumers (sidebar badges, narrator
@@ -501,7 +503,9 @@ class BackgroundTaskService {
 		fn(parentNarratorId, {
 			type: "background_task_count_changed",
 			narratorId: parentNarratorId,
-			activeBackgroundTaskCount: activeCount,
+			activeBackgroundTaskCount: counts.activeCount,
+			activeBackgroundWorkCount: counts.activeWorkCount,
+			activeBackgroundServiceCount: counts.activeServiceCount,
 		});
 		if (refreshAncestors) await this.refreshAncestorTaskLists(parentNarratorId);
 	}
@@ -708,6 +712,7 @@ class BackgroundTaskService {
 		id: string;
 		parentNarratorId: string;
 		command: string;
+		backgroundKind?: BackgroundTaskKind;
 		toolUseId?: string;
 		/** Exact, already-claimed execution. Omitted by legacy/direct callers. */
 		toolCallBinding?: ToolCallBinding;
@@ -734,6 +739,7 @@ class BackgroundTaskService {
 				id: opts.id,
 				parentNarratorId: opts.parentNarratorId,
 				type: "bash",
+				backgroundKind: opts.backgroundKind ?? "task",
 				status: "running",
 				command: opts.command,
 				toolUseId: opts.toolUseId ?? null,
@@ -770,6 +776,7 @@ class BackgroundTaskService {
 			logicalRunId: publicationRun.logicalRunId,
 			parentNarratorId: opts.parentNarratorId,
 			type: "bash",
+			backgroundKind: opts.backgroundKind ?? "task",
 			status: "running",
 			command: opts.command,
 			toolUseId: opts.toolUseId ?? null,
@@ -1241,15 +1248,25 @@ class BackgroundTaskService {
 			const task = write(tx);
 			if (!task || task.type === "transfer" || deferPublication) return task;
 			const run = taskPublicationRun(task);
+			const resultRef = runtimePublication.persistResult(
+				run,
+				fullOutput ?? task.output ?? "(no output)",
+				tx,
+			);
+			if (
+				task.type === "bash" &&
+				task.backgroundKind === "service" &&
+				task.status === "cancelled"
+			) {
+				// Explicit service stop settles Await and the list without scheduling a new parent turn.
+				runtimePublication.store.consumeAwaitedTerminal(run, tx);
+				return task;
+			}
 			runtimePublication.commit(
 				{
 					...run,
 					eventKind: publicationEvent(task.status),
-					resultRef: runtimePublication.persistResult(
-						run,
-						fullOutput ?? task.output ?? "(no output)",
-						tx,
-					),
+					resultRef,
 					summary: `[System] Background ${task.type} "${task.title ?? task.alias ?? task.id}" (ID: ${task.alias ?? task.id}) ${task.status}. Use Await({ type: "${task.type}", id: "${task.alias ?? task.id}" }) to read the stored result.`,
 				},
 				tx,
@@ -2026,7 +2043,8 @@ class BackgroundTaskService {
 			and occupancy_child.type = 'subagent')`;
 		const hasActiveTasks = sql<boolean>`exists(select 1 from ${backgroundTasks}
 			where ${backgroundTasks.parentNarratorId} = ${narrators.id}
-			and ${backgroundTasks.status} in ('running', 'paused'))`;
+			and ${backgroundTasks.status} in ('running', 'paused')
+			and not (${backgroundTasks.type} = 'bash' and coalesce(${backgroundTasks.backgroundKind}, 'task') = 'service'))`;
 		let frontier = [...visited];
 		for (let depth = 0; frontier.length > 0; depth++) {
 			checkBudget();
@@ -2116,6 +2134,7 @@ class BackgroundTaskService {
 						and(
 							inArray(backgroundTasks.parentNarratorId, batch),
 							inArray(backgroundTasks.status, ["running", "paused"]),
+							sql`not (${backgroundTasks.type} = 'bash' and coalesce(${backgroundTasks.backgroundKind}, 'task') = 'service')`,
 						),
 					)
 					.limit(maxRows - rowCount + 1)
@@ -2369,6 +2388,7 @@ class BackgroundTaskService {
 		return {
 			id: summary.id,
 			type: summary.type,
+			backgroundKind: summary.type === "bash" ? (summary.backgroundKind ?? "task") : "task",
 			status: summary.status,
 			effectiveStatus: summary.effectiveStatus,
 			currentNarratorStatus: summary.currentNarratorStatus,
@@ -2533,6 +2553,7 @@ class BackgroundTaskService {
 				return {
 					id: row.id,
 					type: "agent" as const,
+					backgroundKind: "task" as const,
 					status,
 					effectiveStatus,
 					currentNarratorStatus: row.status,
@@ -2565,10 +2586,22 @@ class BackgroundTaskService {
 
 	private async listUnifiedItems(
 		parentNarratorId: string,
-		opts: { cursor?: BackgroundTaskListCursor; limit: number; activeOnly?: boolean },
+		opts: {
+			cursor?: BackgroundTaskListCursor;
+			limit: number;
+			activeOnly?: boolean;
+			serviceOnly?: boolean;
+			omitOutput?: boolean;
+		},
 	): Promise<BackgroundTaskListItem[]> {
 		const conditions = [eq(backgroundTasks.parentNarratorId, parentNarratorId)];
-		if (opts.activeOnly) conditions.push(eq(backgroundTasks.status, "running"));
+		if (opts.activeOnly) conditions.push(inArray(backgroundTasks.status, ["running", "paused"]));
+		if (opts.serviceOnly) {
+			conditions.push(
+				eq(backgroundTasks.type, "bash"),
+				eq(backgroundTasks.backgroundKind, "service"),
+			);
+		}
 		const cursorCondition = opts.cursor
 			? listCursorCondition(opts.cursor, backgroundTasks.createdAt, backgroundTasks.id)
 			: undefined;
@@ -2576,9 +2609,11 @@ class BackgroundTaskService {
 		const rows = await db
 			.select({
 				...columns,
-				output: sql<
-					string | null
-				>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
+				output: opts.omitOutput
+					? sql<string | null>`null`
+					: sql<
+							string | null
+						>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
 			})
 			.from(backgroundTasks)
 			.where(cursorCondition ? and(...conditions, cursorCondition) : and(...conditions))
@@ -2604,8 +2639,17 @@ class BackgroundTaskService {
 	 * per frame only to return their count.
 	 */
 	async countActiveByParent(parentNarratorId: string): Promise<number> {
-		const active = await this.listActiveItems(parentNarratorId, { omitOutput: true });
-		return active.items.length;
+		return (await this.countActiveKindsByParent(parentNarratorId)).activeCount;
+	}
+
+	async countActiveKindsByParent(parentNarratorId: string): Promise<BackgroundTaskActiveCounts> {
+		return (
+			(await this.countActiveKindsByParentBatch([parentNarratorId])).get(parentNarratorId) ?? {
+				activeCount: 0,
+				activeWorkCount: 0,
+				activeServiceCount: 0,
+			}
+		);
 	}
 
 	/**
@@ -2621,9 +2665,22 @@ class BackgroundTaskService {
 	 * per parent for the same reason `listActiveItems` truncates.
 	 */
 	async countActiveByParentBatch(parentNarratorIds: string[]): Promise<Map<string, number>> {
+		const counts = await this.countActiveKindsByParentBatch(parentNarratorIds);
+		return new Map(
+			[...counts]
+				.filter(([, value]) => value.activeCount > 0)
+				.map(([id, value]) => [id, value.activeCount]),
+		);
+	}
+
+	async countActiveKindsByParentBatch(
+		parentNarratorIds: string[],
+	): Promise<Map<string, BackgroundTaskActiveCounts>> {
+		const result = new Map<string, BackgroundTaskActiveCounts>();
 		const counts = new Map<string, number>();
+		const services = new Map<string, number>();
 		const ids = [...new Set(parentNarratorIds.filter((id) => typeof id === "string" && id))];
-		if (ids.length === 0) return counts;
+		if (ids.length === 0) return result;
 		if (ids.length > 4_096) {
 			logger.warn("Background task batch count root limit exceeded", { roots: ids.length });
 			throw new Error("Background task batch count incomplete: root limit");
@@ -2637,7 +2694,8 @@ class BackgroundTaskService {
 				type: backgroundTasks.type,
 				status: backgroundTasks.status,
 				subagentNarratorId: backgroundTasks.subagentNarratorId,
-				rn: sql<number>`ROW_NUMBER() OVER (PARTITION BY ${backgroundTasks.parentNarratorId} ORDER BY ${backgroundTasks.createdAt} DESC, ${backgroundTasks.id} DESC)`.as(
+				backgroundKind: backgroundTasks.backgroundKind,
+				rn: sql<number>`ROW_NUMBER() OVER (PARTITION BY ${backgroundTasks.parentNarratorId}, (${backgroundTasks.type} = 'bash' and coalesce(${backgroundTasks.backgroundKind}, 'task') = 'service') ORDER BY ${backgroundTasks.createdAt} DESC, ${backgroundTasks.id} DESC)`.as(
 					"rn",
 				),
 			})
@@ -2658,14 +2716,18 @@ class BackgroundTaskService {
 				id: candidateSq.id,
 				parentNarratorId: candidateSq.parentNarratorId,
 				type: candidateSq.type,
+				backgroundKind: candidateSq.backgroundKind,
 				status: candidateSq.status,
 				subagentNarratorId: candidateSq.subagentNarratorId,
 			})
 			.from(candidateSq)
 			.where(lte(candidateSq.rn, cap))
-			.limit(8_193)
+			.limit(16_385)
 			.all();
-		if (candidateRows.length > 8_192) {
+		const serviceCandidateCount = candidateRows.filter(
+			(row) => row.type === "bash" && row.backgroundKind === "service",
+		).length;
+		if (serviceCandidateCount > 8_192 || candidateRows.length - serviceCandidateCount > 8_192) {
 			logger.warn("Background task batch count candidate limit exceeded", {
 				roots: ids.length,
 				rows: candidateRows.length,
@@ -2743,7 +2805,8 @@ class BackgroundTaskService {
 				}),
 			});
 			if (isBackgroundTaskActiveStatus(effectiveStatus as BackgroundTaskEffectiveStatus)) {
-				counts.set(row.parentNarratorId, (counts.get(row.parentNarratorId) ?? 0) + 1);
+				const bucket = row.type === "bash" && row.backgroundKind === "service" ? services : counts;
+				bucket.set(row.parentNarratorId, (bucket.get(row.parentNarratorId) ?? 0) + 1);
 			}
 		}
 
@@ -2817,11 +2880,20 @@ class BackgroundTaskService {
 			}
 		}
 
-		// Match listActiveItems truncation: the badge never exceeds the active limit.
-		for (const [parentId, value] of counts) {
-			if (value > BACKGROUND_TASK_ACTIVE_LIMIT) counts.set(parentId, BACKGROUND_TASK_ACTIVE_LIMIT);
+		// Independent caps prevent long-lived services from hiding active work.
+		for (const parentId of ids) {
+			const activeWorkCount = Math.min(counts.get(parentId) ?? 0, BACKGROUND_TASK_ACTIVE_LIMIT);
+			const activeServiceCount = Math.min(
+				services.get(parentId) ?? 0,
+				BACKGROUND_TASK_ACTIVE_LIMIT,
+			);
+			result.set(parentId, {
+				activeCount: activeWorkCount + activeServiceCount,
+				activeWorkCount,
+				activeServiceCount,
+			});
 		}
-		return counts;
+		return result;
 	}
 
 	/**
@@ -2840,7 +2912,7 @@ class BackgroundTaskService {
 	): Promise<{ items: BackgroundTaskListItem[]; truncated: boolean }> {
 		const limit = BACKGROUND_TASK_ACTIVE_LIMIT + 1;
 		const { output: _output, ...columns } = getTableColumns(backgroundTasks);
-		const [candidateRows, legacyActive] = await Promise.all([
+		const [candidateRows, legacyActive, serviceActive] = await Promise.all([
 			db
 				.select({
 					...columns,
@@ -2854,6 +2926,7 @@ class BackgroundTaskService {
 				.where(
 					and(
 						eq(backgroundTasks.parentNarratorId, parentNarratorId),
+						sql`not (${backgroundTasks.type} = 'bash' and coalesce(${backgroundTasks.backgroundKind}, 'task') = 'service')`,
 						or(
 							eq(backgroundTasks.status, "running"),
 							// A paused transfer is still active work (see
@@ -2873,6 +2946,12 @@ class BackgroundTaskService {
 				activeOnly: true,
 				omitOutput: opts?.omitOutput,
 			}),
+			this.listUnifiedItems(parentNarratorId, {
+				limit,
+				activeOnly: true,
+				serviceOnly: true,
+				omitOutput: opts?.omitOutput,
+			}),
 		]);
 		const summaries = await this.reconcileSummaries(candidateRows);
 		// Liveness BEFORE the filter: a terminal row whose loop is running again is
@@ -2885,9 +2964,14 @@ class BackgroundTaskService {
 			.filter((item) => isBackgroundTaskActiveStatus(item.effectiveStatus))
 			.concat(legacyActive.filter((item) => isBackgroundTaskActiveStatus(item.effectiveStatus)))
 			.sort(compareBackgroundTaskListItemsDesc);
-		const truncated = items.length > BACKGROUND_TASK_ACTIVE_LIMIT;
+		const truncated =
+			items.length > BACKGROUND_TASK_ACTIVE_LIMIT ||
+			serviceActive.length > BACKGROUND_TASK_ACTIVE_LIMIT;
 		return {
-			items: truncated ? items.slice(0, BACKGROUND_TASK_ACTIVE_LIMIT) : items,
+			items: [
+				...items.slice(0, BACKGROUND_TASK_ACTIVE_LIMIT),
+				...serviceActive.slice(0, BACKGROUND_TASK_ACTIVE_LIMIT),
+			].sort(compareBackgroundTaskListItemsDesc),
 			truncated,
 		};
 	}
@@ -2928,12 +3012,22 @@ class BackgroundTaskService {
 		const tasks = hasMore ? merged.slice(0, limit) : merged;
 		const last = tasks.at(-1);
 
+		// The first page already has the bounded active snapshot. A second async
+		// count read could combine newer counts with older rows and a stale version.
+		const serviceCount = active.items.filter(
+			(item) => item.type === "bash" && item.backgroundKind === "service",
+		).length;
+		const counts = isFirstPage
+			? {
+					activeCount: active.items.length,
+					activeWorkCount: active.items.length - serviceCount,
+					activeServiceCount: serviceCount,
+				}
+			: await this.countActiveKindsByParent(parentNarratorId);
 		return {
 			listEpoch: BACKGROUND_TASK_LIST_EPOCH,
 			version: this.getListVersion(parentNarratorId),
-			activeCount: isFirstPage
-				? active.items.length
-				: await this.countActiveByParent(parentNarratorId),
+			...counts,
 			...(isFirstPage ? { activeTasks: active.items, activeTruncated: active.truncated } : {}),
 			tasks,
 			nextCursor:
@@ -3013,6 +3107,11 @@ class BackgroundTaskService {
 	}
 
 	// ── Operations ──────────────────────────────────────────────────────
+
+	/** Synchronous signal for process-exit handlers racing with cancellation publication. */
+	isCancellationRequested(taskId: string): boolean {
+		return this.abortControllers.get(taskId)?.signal.aborted ?? false;
+	}
 
 	async cancel(taskId: string): Promise<boolean> {
 		const task = await this.getById(taskId);
