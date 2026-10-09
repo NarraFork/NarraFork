@@ -1,119 +1,194 @@
-/**
- * Provider compatibility for tool input schemas.
- *
- * Anthropic's Messages API rejects `oneOf`/`allOf`/`anyOf` at the top level of a tool's
- * `input_schema` — nested inside `properties` they are fine — and it rejects the entire
- * request rather than just the offending tool, so one bad definition stops the agent loop
- * from starting at all. Tool schemas reach a provider from plugins, MCP servers and user
- * configuration as much as from this codebase, so the shape is normalized at the provider
- * boundary instead of at each definition site.
- *
- * Kept in its own module because it is pure — no provider state, no database — which is what
- * makes the merge rules testable on their own.
- */
-
+/** Provider-boundary projection of object unions; nested combinators remain supported. */
 import { logger } from "../logger";
 
-/**
- * One property as it appears across the branches of a flattened union.
- *
- * A discriminator — the same property carrying a different `const`/`enum` per branch, e.g.
- * `ruleType` — collapses into the enum of those values. Anything that cannot be merged that
- * simply keeps the first definition: every branch describes the same property name, so the
- * first one is as wide as any, and inventing a narrower shape risks describing arguments the
- * tool does not accept.
- */
-function mergePropertyVariants(definitions: unknown[]): unknown {
+type Schema = Record<string, unknown>;
+const combinators = ["anyOf", "oneOf", "allOf"] as const;
+const annotations = [
+	"title",
+	"description",
+	"$comment",
+	"default",
+	"examples",
+	"deprecated",
+	"readOnly",
+	"writeOnly",
+];
+
+function isRecord(value: unknown): value is Schema {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function combine(definitions: unknown[], keyword: "anyOf" | "allOf"): unknown {
 	if (definitions.length === 1) return definitions[0];
-	const literals = new Set<string>();
-	for (const definition of definitions) {
-		if (typeof definition !== "object" || definition === null) return definitions[0];
-		const record = definition as Record<string, unknown>;
-		if (typeof record.const === "string") {
-			literals.add(record.const);
-			continue;
-		}
-		if (Array.isArray(record.enum) && record.enum.every((value) => typeof value === "string")) {
-			for (const value of record.enum) literals.add(value as string);
-			continue;
-		}
+	if (
+		definitions.every((definition) => JSON.stringify(definition) === JSON.stringify(definitions[0]))
+	) {
 		return definitions[0];
 	}
-	if (literals.size === 0) return definitions[0];
-	const { const: _const, enum: _enum, ...rest } = definitions[0] as Record<string, unknown>;
-	return { ...rest, enum: [...literals] };
+	// Only collapse literals when ALL other constraints agree (including type and metadata).
+	if (keyword === "anyOf" && definitions.every(isRecord)) {
+		const records = definitions as Schema[];
+		const rest = records.map(({ const: _const, enum: _enum, ...constraints }) => constraints);
+		if (
+			rest.every((constraints) => JSON.stringify(constraints) === JSON.stringify(rest[0])) &&
+			records.every(
+				(record) =>
+					Object.hasOwn(record, "const") !== Object.hasOwn(record, "enum") &&
+					(Object.hasOwn(record, "const") || Array.isArray(record.enum)),
+			)
+		) {
+			const values = records.flatMap((record) =>
+				Object.hasOwn(record, "const") ? [record.const] : (record.enum as unknown[]),
+			);
+			return {
+				...rest[0],
+				enum: [...new Map(values.map((value) => [JSON.stringify(value), value])).values()],
+			};
+		}
+	}
+	return { [keyword]: definitions };
+}
+
+// Do not rewrite JSON Pointers: combination removal and property wrapping can relocate targets.
+function hasRelocatedReference(value: unknown): boolean {
+	if (Array.isArray(value)) return value.some(hasRelocatedReference);
+	if (!isRecord(value)) return false;
+	for (const key of ["$ref", "$dynamicRef", "$recursiveRef"]) {
+		const reference = value[key];
+		if (typeof reference !== "string" || !reference.startsWith("#")) continue;
+		let fragment: string;
+		try {
+			fragment = decodeURIComponent(reference.slice(1));
+		} catch {
+			return true;
+		}
+		if (fragment === "") return true;
+		if (!fragment.startsWith("/")) continue;
+		const first = fragment.split("/")[1].replace(/~1/g, "/").replace(/~0/g, "~");
+		if (first === "properties" || combinators.some((key) => key === first)) return true;
+	}
+	return Object.values(value).some(hasRelocatedReference);
 }
 
 /**
- * Flatten a top-level `oneOf`/`allOf`/`anyOf` into a single object schema.
- *
- * Anthropic rejects those keywords at the TOP level of a tool `input_schema` — nested inside
- * `properties` they are fine — and it rejects the entire request rather than the one tool, so
- * a single offending definition stops the agent loop from starting at all. Tool schemas reach
- * this provider from plugins, MCP servers and user configuration as much as from this
- * codebase, which is why the shape is enforced here rather than at each definition site.
- *
- * The merge is deliberately conservative and returns the schema untouched whenever it cannot
- * be done confidently: a schema the API refuses is better than one describing the wrong
- * arguments. It applies only when every branch is an object schema, and then:
- *   - `properties` is the union of the branches' properties;
- *   - `required` is their INTERSECTION, so a field that only some branches need does not
- *     become mandatory for all of them;
- *   - the discriminator collapses through {@link mergePropertyVariants}.
+ * Union projection intentionally loses cross-property correlations (and oneOf exclusivity),
+ * but never picks an arbitrary property's first variant. allOf remains conjunctive.
+ * Unsupported object-level constraints are left untouched with a diagnostic instead of guessed.
  */
-export function flattenTopLevelUnion(schema: Record<string, unknown>): Record<string, unknown> {
-	const keyword = (["anyOf", "oneOf", "allOf"] as const).find((key) => Array.isArray(schema[key]));
-	if (!keyword) return schema;
-	const raw = schema[keyword] as unknown[];
-	const branches = raw.filter(
-		(branch): branch is Record<string, unknown> =>
-			typeof branch === "object" && branch !== null && !Array.isArray(branch),
-	);
-	if (
-		branches.length !== raw.length ||
-		branches.length === 0 ||
-		branches.some((branch) => branch.type !== "object")
-	) {
-		// Reported rather than silently sent: the API will reject this shape with a message
-		// that names neither the tool nor the keyword, which is why the issue that prompted
-		// this function was hard to diagnose.
+export function flattenTopLevelUnion(schema: Schema): Schema {
+	const keywords = combinators.filter((key) => Object.hasOwn(schema, key));
+	if (keywords.length === 0) return schema;
+	const refuse = (reason: string): Schema => {
 		logger.warn("Tool input_schema has a top-level union that could not be flattened", {
-			keyword,
-			branches: raw.length,
+			keywords,
+			reason,
 		});
 		return schema;
+	};
+	if (keywords.length !== 1) return refuse("multiple top-level combinators");
+	if (hasRelocatedReference(schema)) return refuse("local reference target may be relocated");
+	const keyword = keywords[0];
+	const raw = schema[keyword];
+	if (!Array.isArray(raw) || raw.length === 0) return refuse("invalid branches");
+	if (schema.type !== undefined && schema.type !== "object") return refuse("non-object root");
+	const branches: Schema[] = [];
+	for (const branch of raw) {
+		if (!isRecord(branch) || branch.type !== "object") return refuse("non-object branch");
+		if (
+			Object.keys(branch).some(
+				(key) =>
+					!["type", "properties", "required", "additionalProperties", ...annotations].includes(key),
+			) ||
+			(branch.properties !== undefined && !isRecord(branch.properties)) ||
+			(branch.required !== undefined &&
+				(!Array.isArray(branch.required) ||
+					!branch.required.every((name) => typeof name === "string"))) ||
+			(branch.additionalProperties !== undefined &&
+				typeof branch.additionalProperties !== "boolean")
+		)
+			return refuse("unsupported branch constraints");
+		branches.push(branch);
+	}
+	if (
+		(schema.properties !== undefined && !isRecord(schema.properties)) ||
+		(schema.required !== undefined &&
+			(!Array.isArray(schema.required) ||
+				!schema.required.every((name) => typeof name === "string")))
+	)
+		return refuse("invalid root properties or required");
+
+	const flattened = { ...schema };
+	delete flattened[keyword];
+	flattened.type = "object";
+	// Object annotations can be hoisted only when every branch agrees with the root.
+	for (const key of annotations) {
+		const values = branches.map((branch) => branch[key]);
+		if (values.every((value) => value === undefined)) continue;
+		if (!values.every((value) => JSON.stringify(value) === JSON.stringify(values[0])))
+			return refuse("conflicting branch metadata");
+		if (schema[key] !== undefined && JSON.stringify(schema[key]) !== JSON.stringify(values[0]))
+			return refuse("conflicting root metadata");
+		flattened[key] = values[0];
 	}
 
-	const variants = new Map<string, unknown[]>();
-	const requiredPerBranch: Set<string>[] = [];
-	for (const branch of branches) {
-		const properties = branch.properties;
-		if (typeof properties === "object" && properties !== null) {
-			for (const [name, definition] of Object.entries(properties as Record<string, unknown>)) {
-				const seen = variants.get(name);
-				if (seen) seen.push(definition);
-				else variants.set(name, [definition]);
-			}
+	const rootProperties = (schema.properties ?? {}) as Schema;
+	const names = [
+		...new Set(branches.flatMap((branch) => Object.keys((branch.properties ?? {}) as Schema))),
+	];
+	const addsProperties = names.some((name) => !Object.hasOwn(rootProperties, name));
+	if (
+		addsProperties &&
+		schema.additionalProperties !== undefined &&
+		schema.additionalProperties !== true
+	)
+		return refuse("root additionalProperties constrains introduced properties");
+	if (
+		addsProperties &&
+		["$ref", "patternProperties", "unevaluatedProperties", "dependentSchemas"].some((key) =>
+			Object.hasOwn(schema, key),
+		)
+	)
+		return refuse("root constraints depend on property coverage");
+	const closed = branches.map((branch) => branch.additionalProperties === false);
+	if (closed.some(Boolean) && !closed.every(Boolean))
+		return refuse("conflicting additionalProperties");
+	if (closed.every(Boolean)) {
+		if (
+			keyword === "allOf" &&
+			names.some((name) =>
+				branches.some((branch) => !Object.hasOwn((branch.properties ?? {}) as Schema, name)),
+			)
+		)
+			return refuse("closed allOf branches have different properties");
+		if (Object.keys(rootProperties).some((name) => !names.includes(name)))
+			return refuse("closed branches exclude root properties");
+		flattened.additionalProperties = false;
+	}
+
+	const properties: Schema = { ...rootProperties };
+	for (const name of names) {
+		const definitions: unknown[] = [];
+		for (const branch of branches) {
+			const branchProperties = (branch.properties ?? {}) as Schema;
+			if (Object.hasOwn(branchProperties, name)) definitions.push(branchProperties[name]);
+			else if (keyword !== "allOf" && branch.additionalProperties !== false) definitions.push(true);
 		}
-		requiredPerBranch.push(
-			new Set(Array.isArray(branch.required) ? (branch.required as string[]) : []),
-		);
+		const merged = combine(definitions, keyword === "allOf" ? "allOf" : "anyOf");
+		properties[name] = Object.hasOwn(rootProperties, name)
+			? combine([rootProperties[name], merged], "allOf")
+			: merged;
 	}
-
-	const properties: Record<string, unknown> = {};
-	for (const [name, definitions] of variants) {
-		properties[name] = mergePropertyVariants(definitions);
-	}
-	const required = [...(requiredPerBranch[0] ?? [])].filter((name) =>
-		requiredPerBranch.every((set) => set.has(name)),
-	);
-
-	const flattened: Record<string, unknown> = { type: "object", properties };
-	if (required.length > 0) flattened.required = required;
+	flattened.properties = properties;
+	const requiredPerBranch = branches.map((branch) => new Set((branch.required ?? []) as string[]));
+	const branchRequired =
+		keyword === "allOf"
+			? requiredPerBranch.flatMap((set) => [...set])
+			: [...requiredPerBranch[0]].filter((name) => requiredPerBranch.every((set) => set.has(name)));
+	const required = [...new Set([...((schema.required ?? []) as string[]), ...branchRequired])];
+	if (required.length > 0 || schema.required !== undefined) flattened.required = required;
 	logger.debug("Flattened a top-level tool schema union for Anthropic", {
 		keyword,
 		branches: branches.length,
-		properties: Object.keys(properties).length,
 	});
 	return flattened;
 }
